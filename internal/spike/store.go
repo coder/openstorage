@@ -35,14 +35,21 @@ func OpenStore(ctx context.Context, pgURL string) (*Store, error) {
 
 func (s *Store) Close() { s.pool.Close() }
 
-// InitSchema creates the spike tables (idempotent).
+// InitSchema creates the spike tables (idempotent). The advisory lock
+// serializes concurrent node startups: two racing CREATE TABLE IF NOT EXISTS
+// can fail with a duplicate pg_type key error (found via dogfooding).
 func (s *Store) InitSchema(ctx context.Context) error {
-	_, err := s.pool.Exec(ctx, `
+	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(0x5350494B45)`); err != nil { // "SPIKE"
+			return err
+		}
+		_, err := tx.Exec(ctx, `
 CREATE TABLE IF NOT EXISTS refs  (repo text, name text, sha text NOT NULL, PRIMARY KEY (repo, name));
 CREATE TABLE IF NOT EXISTS packs (repo text, id text, s3_key text NOT NULL,
                                   created_at timestamptz DEFAULT now(), PRIMARY KEY (repo, id));
 `)
-	return err
+		return err
+	})
 }
 
 // ListRefs returns all refs for repo as name -> sha.
