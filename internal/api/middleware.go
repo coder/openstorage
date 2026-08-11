@@ -57,6 +57,14 @@ func (r *statusRecorder) Write(b []byte) (int, error) {
 	return r.ResponseWriter.Write(b)
 }
 
+// Unwrap exposes the wrapped ResponseWriter to http.ResponseController so
+// optional interfaces (Flusher, deadlines) reach the underlying writer.
+// Load-bearing for git smart HTTP, which streams through this wrapper and
+// must flush pack data mid-response.
+func (r *statusRecorder) Unwrap() http.ResponseWriter {
+	return r.ResponseWriter
+}
+
 // logRequests logs one line per request: method, path, status, duration.
 func logRequests(logger *slog.Logger) middleware {
 	assertf(logger != nil, "logRequests: nil logger")
