@@ -21,7 +21,23 @@ export const meta = {
         "p4-write-api",
         "p5-eventing-sync",
         "p6-lfs-polish",
+        "custom",
       ]),
+      // Required when phase = "custom": a one-off phase spec with the same
+      // shape as a PHASES entry, plus an id used for evidence paths/reports.
+      spec: s.optional(
+        s.object(
+          {
+            id: s.string(),
+            title: s.string(),
+            specRefs: s.string(),
+            deliverables: s.string(),
+            acceptance: s.array(s.string(), { minItems: 1 }),
+            dogfood: s.string(),
+          },
+          { additionalProperties: false }
+        )
+      ),
       brief: s.optional(s.string()),
       maxFixRounds: s.optional(s.number()),
       isolated: s.optional(s.boolean()),
@@ -248,7 +264,9 @@ function dogfoodSchema() {
 }
 
 export default function workflow({ args, phase, log, agent, parallel, applyPatch }) {
-  const spec = PHASES[args.phase];
+  const spec = args.phase === "custom" ? args.spec : PHASES[args.phase];
+  if (args.phase === "custom" && !spec) throw new Error("phase 'custom' requires args.spec");
+  const phaseId = args.phase === "custom" ? args.spec.id : args.phase;
   const maxFix = Math.max(1, Math.min(args.maxFixRounds ?? 2, 4));
   // isolated=false (default): local/shared-working-tree runtime. Child agents write directly
   // into this checkout, so patch fan-in is a no-op (skipped) and write fan-out is serialized.
@@ -268,14 +286,14 @@ export default function workflow({ args, phase, log, agent, parallel, applyPatch
     : "";
 
   // ---- Plan ----
-  phase("plan", { phase: args.phase, title: spec.title });
+  phase("plan", { phase: phaseId, title: spec.title });
   const plan = agent(
     `Plan this phase of the open-source code.storage backend (Go, Postgres, S3/MinIO).\n\n` +
       `Phase: ${spec.title}\nSpec references (read them): ${spec.specRefs}\n${SPEC_POINTER}\n\n` +
       `Deliverables: ${spec.deliverables}\n\nAcceptance criteria the plan MUST cover:\n- ${spec.acceptance.join("\n- ")}\n\n` +
       `The plan must include a dedicated dogfooding section (environment setup + exact commands + evidence capture): ${spec.dogfood}\n` +
       `Survey the existing code in the workspace first and build on it; keep the plan minimal and reviewable.${operatorBrief}`,
-    { id: "plan", agentId: "plan", title: `Plan ${args.phase}` }
+    { id: "plan", agentId: "plan", title: `Plan ${phaseId}` }
   );
 
   // ---- Slice the plan for parallel implementation ----
@@ -380,7 +398,7 @@ export default function workflow({ args, phase, log, agent, parallel, applyPatch
     applyChildPatch(`apply-fix-${round}`, `fix-${round}`);
   }
   if (!verify.passed) {
-    return gateReport(agent, phase, args.phase, spec, {
+    return gateReport(agent, phase, phaseId, spec, {
       go: false,
       reason: "validation still failing after fix rounds",
       verify,
@@ -436,12 +454,12 @@ export default function workflow({ args, phase, log, agent, parallel, applyPatch
     `Dogfood this phase end-to-end as a real user. ${spec.dogfood}\n` +
       `Bring up the environment (docker compose with Postgres + MinIO), run the real flows, and capture evidence: ` +
       `terminal recordings/transcripts via agent-tty (mise use npm:agent-tty) or util-linux script; save evidence under ` +
-      `/tmp/codestorage-evidence/${args.phase}/ and report the paths. Evaluate each acceptance criterion:\n- ${spec.acceptance.join("\n- ")}\n` +
+      `/tmp/codestorage-evidence/${phaseId}/ and report the paths. Evaluate each acceptance criterion:\n- ${spec.acceptance.join("\n- ")}\n` +
       `Report honestly; a criterion without captured evidence counts as failed.`,
     {
       id: "dogfood",
       schema: dogfoodSchema(),
-      title: `Dogfood ${args.phase}`,
+      title: `Dogfood ${phaseId}`,
       timeout: { softMs: 45 * 60_000, graceMs: 5 * 60_000, finalInstructions: "Report per-criterion results with whatever evidence exists so far." },
     }
   );
@@ -459,7 +477,7 @@ export default function workflow({ args, phase, log, agent, parallel, applyPatch
   // ---- Gate ----
   const unresolvedBlocking = recheck ? recheck.unresolved.length : 0;
   const go = verify.passed && dogfood.passed && unresolvedBlocking === 0;
-  return gateReport(agent, phase, args.phase, spec, {
+  return gateReport(agent, phase, phaseId, spec, {
     go,
     reason: go ? "all gates green" : "see failed gates",
     verify,
