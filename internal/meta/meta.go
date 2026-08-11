@@ -1,0 +1,93 @@
+// Package meta declares the metadata-store contract for organizations, org
+// public keys, and repositories (docs/01 domain model, docs/03 HTTP API).
+//
+// FROZEN CONTRACT: parallel phase-1 slices implement Store against Postgres
+// (schema: orgs / org_public_keys / repos with UNIQUE(org_id, url) spanning
+// soft-deleted rows) and build HTTP handlers on top of these exact
+// signatures. Do not change them without coordinating across slices.
+package meta
+
+import (
+	"context"
+	"errors"
+	"time"
+)
+
+// Sentinel errors implementations must return (possibly wrapped; callers
+// match with errors.Is) so HTTP handlers can map storage outcomes onto the
+// docs/03 status contract.
+var (
+	// ErrNotFound: unknown org, or repo absent/soft-deleted → 404.
+	ErrNotFound = errors.New("not found")
+	// ErrAlreadyExists: CreateRepo unique violation on (org, url), including
+	// against a soft-deleted row → 409.
+	ErrAlreadyExists = errors.New("repository already exists")
+	// ErrAlreadyDeleted: SoftDeleteRepo on an already soft-deleted repo → 409.
+	ErrAlreadyDeleted = errors.New("repository already deleted")
+	// ErrInvalidCursor: ListRepos received an undecodable cursor → 400.
+	ErrInvalidCursor = errors.New("invalid cursor")
+)
+
+// Org is one registered organization (single-org self-host mode seeds
+// exactly one at startup).
+type Org struct {
+	ID        int64
+	Name      string // JWT `iss` claim value; unique
+	CreatedAt time.Time
+}
+
+// Repo is one repository row.
+type Repo struct {
+	RepoID        string // server-generated "repo_<12 hex>"
+	OrgID         int64
+	URL           string     // JWT `repo` claim value at create time
+	DefaultBranch string     // validated ref component, default "main"
+	CreatedAt     time.Time  // UTC; rendered as RFC 3339 in responses
+	DeletedAt     *time.Time // nil while live (soft delete per docs/01)
+}
+
+// ListParams are the GET /repos query parameters after handler-side
+// validation: handlers reject bad `limit` with 400 and pass the resolved
+// value here (default 20, max 100); the opaque cursor is validated by the
+// store (ErrInvalidCursor).
+type ListParams struct {
+	Q      string // case-insensitive substring filter on URL, pre-trimmed; "" = no filter
+	Cursor string // opaque cursor from a previous ListResult; "" = first page
+	Limit  int    // page size, already clamped/validated by the caller
+}
+
+// ListResult is one page of repos ordered by (created_at DESC, repo_id DESC).
+type ListResult struct {
+	Repos      []Repo // never nil; empty slice when no matches
+	NextCursor string // opaque; "" when exhausted
+	HasMore    bool
+}
+
+// Store is the metadata persistence contract. All org-scoped methods key by
+// org name (the JWT `iss` claim); implementations resolve it internally and
+// return ErrNotFound for unknown orgs.
+type Store interface {
+	// UpsertOrgWithKeys idempotently creates the org and replaces its
+	// registered PEM public keys (startup bootstrap in single-org mode).
+	UpsertOrgWithKeys(ctx context.Context, name string, pemPublicKeys []string) (Org, error)
+
+	// PublicKeysForOrg returns the org's registered PEM public key blocks
+	// for JWT verification.
+	PublicKeysForOrg(ctx context.Context, name string) ([]string, error)
+
+	// CreateRepo inserts a live repo with a server-generated RepoID.
+	// ErrAlreadyExists when (org, url) is taken — even by a soft-deleted row.
+	CreateRepo(ctx context.Context, org, url, defaultBranch string) (Repo, error)
+
+	// GetRepoByURL returns the live repo with the given url;
+	// ErrNotFound when absent or soft-deleted.
+	GetRepoByURL(ctx context.Context, org, url string) (Repo, error)
+
+	// SoftDeleteRepo sets deleted_at and returns the affected repo.
+	// ErrNotFound when no row exists; ErrAlreadyDeleted when already
+	// soft-deleted.
+	SoftDeleteRepo(ctx context.Context, org, url string) (Repo, error)
+
+	// ListRepos pages live repos for the org per ListParams.
+	ListRepos(ctx context.Context, org string, params ListParams) (ListResult, error)
+}
