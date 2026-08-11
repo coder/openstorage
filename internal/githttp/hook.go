@@ -223,7 +223,7 @@ func enforceRefPolicy(ctx context.Context, repo, refName, old, new string) error
 	// namespaced pattern. `+import` and persistent pushes match verbatim.
 	matchRef := refName
 	if strings.HasSuffix(repo, "+ephemeral") {
-		matchRef = "refs/namespaces/ephemeral/" + refName
+		matchRef = auth.EphemeralRefName(refName)
 	}
 
 	rule, ok := auth.MatchPolicy(policies, matchRef)
