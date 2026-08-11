@@ -89,10 +89,14 @@ the container-based acceptance suites gained zero-container lanes (api `/sqlite`
    conformance against `docs/upstream/openapi.yaml`, and dual-backend live dogfood
    transcripts.* Decisions are recorded in
    [12-phase3-implementation-notes.md](12-phase3-implementation-notes.md).
-4. **Write API.** commit-pack + diff-commit NDJSON streaming (incremental parse, 4 MiB
-   chunks), restore-commit, branch create/delete (+default-branch protection), merge +
-   preview (scratch worktree or in-memory merge), tags, notes (+CAS `expected_ref_sha`).
-   All CAS + ref-policy checks; `result` envelope on the documented status list.
+4. **Write API — done.** commit-pack + diff-commit NDJSON streaming (incremental parse,
+   4 MiB chunks), restore-commit, branch create/delete (+default-branch protection), merge +
+   preview (`git merge-tree --write-tree` in a per-request scratch odb), tags, notes (+CAS
+   `expected_ref_sha`). All CAS + ref-policy checks; `result` envelope on the documented
+   status list. Includes the repo-key-split fix (repos keyed by `repo_id` on both surfaces)
+   and the p3 read-API burn-down. *Gate: vendor SDK full-workflow + just-code-storage
+   consumer drives, both backend lanes, live dogfood transcripts.* Decisions are recorded in
+   [13-phase4-implementation-notes.md](13-phase4-implementation-notes.md).
 5. **Eventing & sync.** `push` webhooks with HMAC signatures; upstream `base_repo` sync
    workers (clone/mirror from github and other providers, pull-upstream 202, sync webhooks,
    git-credentials CRUD); forking (`provider: "code"`).

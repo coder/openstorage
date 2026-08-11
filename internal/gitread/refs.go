@@ -18,9 +18,12 @@ type Tag struct {
 
 // PeeledTags lists all tags of the repo at repoPath in lexical refname
 // order (for-each-ref's default — the docs/03 GET /repos/tags order).
+// Invariant 10 wants the peeled COMMIT sha, so tags that reference (or
+// peel to) a non-commit object — trees or blobs, pushable with plain git —
+// are skipped rather than surfaced with a non-commit sha.
 func PeeledTags(ctx context.Context, repoPath string) ([]Tag, error) {
 	out, err := runGit(ctx, repoPath, "for-each-ref",
-		"--format=%(refname:short)%00%(objectname)%00%(*objectname)", "refs/tags")
+		"--format=%(refname:short)%00%(objectname)%00%(objecttype)%00%(*objectname)%00%(*objecttype)", "refs/tags")
 	if err != nil {
 		return nil, err
 	}
@@ -30,17 +33,23 @@ func PeeledTags(ctx context.Context, repoPath string) ([]Tag, error) {
 			continue
 		}
 		fields := strings.Split(line, "\x00")
-		if len(fields) != 3 || fields[0] == "" {
+		if len(fields) != 5 || fields[0] == "" {
 			return nil, fmt.Errorf("for-each-ref emitted %q", line)
 		}
-		sha := fields[2] // %(*objectname): peeled target, empty for lightweight tags
-		if sha == "" {
-			sha = fields[1]
+		name, sha, objType, peeledSHA, peeledType := fields[0], fields[1], fields[2], fields[3], fields[4]
+		switch {
+		case objType == "commit":
+			// Lightweight tag directly on a commit.
+		case objType == "tag" && peeledType == "commit":
+			// Annotated tag: %(*objectname) peels (nested tags included).
+			sha = peeledSHA
+		default:
+			continue // tag on a tree/blob: no commit to report
 		}
 		if !ref.ValidSHA(sha) {
 			return nil, fmt.Errorf("for-each-ref emitted malformed sha in %q", line)
 		}
-		tags = append(tags, Tag{Name: fields[0], SHA: sha})
+		tags = append(tags, Tag{Name: name, SHA: sha})
 	}
 	return tags, nil
 }

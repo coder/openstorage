@@ -13,6 +13,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -736,6 +737,17 @@ func testQueryGrep(t *testing.T, e *testEnv) {
 		if len(out.Matches) != 1 || out.Matches[0].Path != "docs/intro.md" {
 			t.Errorf("paths=docs matches = %+v", out.Matches)
 		}
+		// Trailing-slash prefixes and literal wildcard characters: paths
+		// are plain prefixes (openapi), never a glob dialect — the git-side
+		// pathspec narrowing must not change that.
+		out = grep(t, map[string]any{"query": pattern, "paths": []string{"docs/"}})
+		if len(out.Matches) != 1 || out.Matches[0].Path != "docs/intro.md" {
+			t.Errorf("paths=docs/ matches = %+v", out.Matches)
+		}
+		out = grep(t, map[string]any{"query": pattern, "paths": []string{"src/*"}})
+		if len(out.Matches) != 0 {
+			t.Errorf("paths=src/* matches = %+v, want none (literal prefix semantics)", out.Matches)
+		}
 		out = grep(t, map[string]any{"query": pattern, "paths": []string{"src/main.go"}})
 		if len(out.Matches) != 1 || out.Matches[0].Path != "src/main.go" {
 			t.Errorf("paths=src/main.go matches = %+v", out.Matches)
@@ -845,6 +857,35 @@ func testQueryGrep(t *testing.T, e *testEnv) {
 		rqExpectErr(t, resp, body, http.StatusBadRequest)
 		resp, body = post(rqGrepBody(t, map[string]any{"query": map[string]any{"pattern": "x"}, "ref": "no-such-ref"}))
 		rqExpectErr(t, resp, body, http.StatusNotFound)
+		// An invalid regex is client input: git's exit-128 fatal maps to a
+		// 400, never a 500.
+		resp, body = post(rqGrepBody(t, map[string]any{"query": map[string]any{"pattern": "["}}))
+		rqExpectErr(t, resp, body, http.StatusBadRequest)
+	})
+
+	t.Run("malformed cursors are 400s", func(t *testing.T) {
+		post := func(cursor string) (*http.Response, []byte) {
+			return e.doReq(t, http.MethodPost, "/api/v1/repos/grep", tok, rqGrepBody(t, map[string]any{
+				"query":      map[string]any{"pattern": "TODO"},
+				"pagination": map[string]any{"cursor": cursor},
+			}), "")
+		}
+		encode := func(raw string) string { return base64.RawURLEncoding.EncodeToString([]byte(raw)) }
+		cases := map[string]string{
+			"wrong field count":  encode("just-one-field"),
+			"non-hex commit":     encode("zzzz\x00path\x003"),
+			"empty path":         encode(fx.c4 + "\x00\x003"),
+			"line zero":          encode(fx.c4 + "\x00docs/intro.md\x000"),
+			"non-numeric line":   encode(fx.c4 + "\x00docs/intro.md\x00abc"),
+			"unknown commit":     encodeGrepCursor("00000000000000000000000000000000000000ff", "docs/intro.md", 3),
+			"position not found": encodeGrepCursor(fx.c4, "no/such/file.txt", 1),
+		}
+		for name, cursor := range cases {
+			t.Run(name, func(t *testing.T) {
+				resp, body := post(cursor)
+				rqExpectErr(t, resp, body, http.StatusBadRequest)
+			})
+		}
 	})
 }
 
@@ -935,6 +976,21 @@ func testQueryArchive(t *testing.T, e *testEnv) {
 		}
 		if link := entries["snap/link.md"]; link.typeflag != tar.TypeSymlink || link.linkname != "docs/readme.md" {
 			t.Errorf("link.md entry = %+v, want symlink to docs/readme.md", link)
+		}
+	})
+
+	t.Run("prefix without trailing slash is normalized", func(t *testing.T) {
+		body := []byte(`{"ref": "feature", "archive": {"prefix": "snap"}}`)
+		resp, respBody := e.doReq(t, http.MethodPost, "/api/v1/repos/archive", tok, body, "")
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d, want 200 (%s)", resp.StatusCode, respBody)
+		}
+		entries := rqReadArchive(t, respBody)
+		if _, ok := entries["snap/notes.txt"]; !ok {
+			t.Errorf(`prefix "snap" entries = %v, want snap/ folder entries`, entries)
+		}
+		if _, ok := entries["snapnotes.txt"]; ok {
+			t.Errorf(`prefix "snap" glued onto entry names: %v`, entries)
 		}
 	})
 

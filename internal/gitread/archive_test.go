@@ -78,6 +78,36 @@ func TestArchiveFullTree(t *testing.T) {
 	}
 }
 
+// TestPrepareArchiveResolvesBeforeStreaming pins the two-stage contract the
+// archive handler relies on: resolution failures surface from
+// PrepareArchive (before any response bytes exist), and Stream reproduces
+// the one-shot Archive output byte for byte.
+func TestPrepareArchiveResolvesBeforeStreaming(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+
+	// A well-formed sha that names no object fails at prepare time.
+	if _, err := PrepareArchive(ctx, f.dir, "1111111111111111111111111111111111111111", ArchiveOptions{}); err == nil {
+		t.Fatal("PrepareArchive resolved a missing commit")
+	}
+
+	prepared, err := PrepareArchive(ctx, f.dir, f.c1, ArchiveOptions{Prefix: "repo-main/"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var streamed bytes.Buffer
+	if err := prepared.Stream(ctx, &streamed); err != nil {
+		t.Fatal(err)
+	}
+	var oneShot bytes.Buffer
+	if err := Archive(ctx, f.dir, f.c1, ArchiveOptions{Prefix: "repo-main/"}, &oneShot); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(streamed.Bytes(), oneShot.Bytes()) {
+		t.Error("Prepare+Stream output differs from one-shot Archive")
+	}
+}
+
 func TestArchiveFilters(t *testing.T) {
 	f := newFixture(t)
 	ctx := context.Background()

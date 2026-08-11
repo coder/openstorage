@@ -716,8 +716,10 @@ func (s *server) handleFilesMetadata(w http.ResponseWriter, r *http.Request) {
 			Type:          e.Type,
 		})
 		commitsMap[last[0].SHA] = fileMetaCommit{
-			Author:  last[0].AuthorName,
-			Date:    last[0].CommitterDate.UTC().Format(time.RFC3339),
+			Author: last[0].AuthorName,
+			// openapi: "RFC 3339 author date for the commit" — author, not
+			// committer, date (unlike commitInfo.Date / invariant 9 ordering).
+			Date:    last[0].AuthorDate.UTC().Format(time.RFC3339),
 			Message: strings.TrimRight(last[0].Message, "\n"),
 		}
 	}
@@ -806,8 +808,10 @@ func (s *server) handleGetFile(w http.ResponseWriter, r *http.Request) {
 	h.Set("X-Blob-Sha", info.SHA)
 	h.Set("X-Last-Commit-Sha", info.LastCommit.SHA)
 	h.Set("ETag", `"`+info.SHA+`"`)
-	// ServeContent fills Last-Modified/Accept-Ranges/Content-* and evaluates
-	// the conditional headers; the path base gives it the extension for
-	// Content-Type detection (content sniffing is the fallback).
+	// openapi pins Content-Type to "Always `application/octet-stream`";
+	// setting it up front stops ServeContent's extension/sniffing detection.
+	h.Set("Content-Type", "application/octet-stream")
+	// ServeContent fills Last-Modified/Accept-Ranges/Content-Length/-Range
+	// and evaluates the conditional and range header matrix.
 	http.ServeContent(w, r, path.Base(filePath), info.LastCommit.CommitterDate, tmp)
 }

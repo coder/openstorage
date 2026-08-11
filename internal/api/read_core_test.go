@@ -61,6 +61,11 @@ func coreGit(t *testing.T, dir string, args ...string) string {
 		"GIT_AUTHOR_EMAIL=core@test.invalid",
 		"GIT_COMMITTER_NAME=core-test",
 		"GIT_COMMITTER_EMAIL=core@test.invalid",
+		// Distinct pinned dates so author-vs-committer date wiring is
+		// assertable (files/metadata reports the AUTHOR date, commit
+		// listings the COMMITTER date).
+		"GIT_AUTHOR_DATE="+coreAuthorDate,
+		"GIT_COMMITTER_DATE="+coreCommitterDate,
 	)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -137,6 +142,13 @@ const (
 	coreReadmeV2       = "hello readme v2\n"
 	coreSymlinkTarget  = "README.md"
 	coreFeatureContent = "feature work\n"
+
+	// Pinned distinct author/committer dates (see coreGit) and their
+	// RFC 3339 UTC wire forms.
+	coreAuthorDate       = "2024-01-02T03:04:05+00:00"
+	coreCommitterDate    = "2024-02-03T04:05:06+00:00"
+	coreAuthorDateUTC    = "2024-01-02T03:04:05Z"
+	coreCommitterDateUTC = "2024-02-03T04:05:06Z"
 )
 
 // coreSeedFixture builds the shared multi-shape history:
@@ -496,8 +508,10 @@ func TestReadCoreCommits(t *testing.T) {
 					c.CommitterName != "core-test" || c.CommitterEmail != "core@test.invalid" {
 					t.Errorf("commits[%d] identity = %+v", i, c)
 				}
-				if _, err := time.Parse(time.RFC3339, c.Date); err != nil {
-					t.Errorf("commits[%d].date %q: %v", i, c.Date, err)
+				// commitInfo.date is the COMMITTER date (invariant 9 orders
+				// history by commit date).
+				if c.Date != coreCommitterDateUTC {
+					t.Errorf("commits[%d].date = %q, want committer date %q", i, c.Date, coreCommitterDateUTC)
 				}
 			}
 			if got.Commits[0].Message != "c3: modes, symlink, submodule" {
@@ -802,8 +816,9 @@ func TestReadCoreFiles(t *testing.T) {
 				if meta.Author != "core-test" || meta.Message == "" {
 					t.Errorf("commit meta = %+v", meta)
 				}
-				if _, err := time.Parse(time.RFC3339, meta.Date); err != nil {
-					t.Errorf("commit date %q: %v", meta.Date, err)
+				// openapi: files/metadata `date` is the AUTHOR date.
+				if meta.Date != coreAuthorDateUTC {
+					t.Errorf("commit date = %q, want author date %q", meta.Date, coreAuthorDateUTC)
 				}
 			}
 			if len(got.Commits) != 3 {
@@ -859,6 +874,10 @@ func TestReadCoreFileStreaming(t *testing.T) {
 			if h.Get("Content-Length") != fmt.Sprint(len(coreRangeContent)) {
 				t.Errorf("Content-Length = %q", h.Get("Content-Length"))
 			}
+			// openapi: "Always `application/octet-stream`" — never sniffed.
+			if ct := h.Get("Content-Type"); ct != "application/octet-stream" {
+				t.Errorf("Content-Type = %q, want application/octet-stream", ct)
+			}
 			if _, err := time.Parse(http.TimeFormat, h.Get("Last-Modified")); err != nil {
 				t.Errorf("Last-Modified %q: %v", h.Get("Last-Modified"), err)
 			}
@@ -872,6 +891,9 @@ func TestReadCoreFileStreaming(t *testing.T) {
 			}
 			if cr := resp.Header.Get("Content-Range"); cr != "bytes 5-9/20" {
 				t.Errorf("Content-Range = %q", cr)
+			}
+			if ct := resp.Header.Get("Content-Type"); ct != "application/octet-stream" {
+				t.Errorf("206 Content-Type = %q, want application/octet-stream", ct)
 			}
 		})
 
@@ -942,6 +964,11 @@ func TestReadCoreFileStreaming(t *testing.T) {
 			coreRequireStatus(t, resp, body, 200)
 			if string(body) != coreFeatureContent {
 				t.Errorf("feature.txt = %q", body)
+			}
+			// Extension-based detection stays off: .txt is still served as
+			// application/octet-stream ("Always", per openapi).
+			if ct := resp.Header.Get("Content-Type"); ct != "application/octet-stream" {
+				t.Errorf(".txt Content-Type = %q, want application/octet-stream", ct)
 			}
 			// Symlink blobs stream the link target bytes.
 			resp, body = coreGet(t, e, "GET", "/api/v1/repos/file?path=link.txt", fx.token, nil)

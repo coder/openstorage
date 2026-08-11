@@ -151,19 +151,30 @@ func TestResolveRef(t *testing.T) {
 
 func TestPeeledTags(t *testing.T) {
 	f := newFixture(t)
+	// Tags plain git can push but invariant 10 cannot list: a lightweight
+	// tag on a blob, an annotated tag on a tree — both must be skipped —
+	// and a nested annotated tag (tag -> tag -> commit), which must peel
+	// all the way to the commit.
+	mustGit(t, f.dir, "tag", "a-blob-tag", f.c1+":README.md")
+	mustGit(t, f.dir, "tag", "-a", "-m", "tree tag", "b-tree-tag", f.c1+"^{tree}")
+	mustGit(t, f.dir, "tag", "-a", "-m", "nested", "c-nested", "v1")
+
 	tags, err := PeeledTags(context.Background(), f.dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(tags) != 2 {
-		t.Fatalf("got %d tags, want 2: %+v", len(tags), tags)
+	if len(tags) != 3 {
+		t.Fatalf("got %d tags, want 3 (non-commit tags skipped): %+v", len(tags), tags)
 	}
-	// Lexical order; annotated v1 peels to c1, lightweight points at c2.
-	if tags[0].Name != "v1" || tags[0].SHA != f.c1 {
-		t.Errorf("tags[0] = %+v, want v1 -> %s (peeled)", tags[0], f.c1)
+	// Lexical order; nested + annotated peel to c1, lightweight points at c2.
+	if tags[0].Name != "c-nested" || tags[0].SHA != f.c1 {
+		t.Errorf("tags[0] = %+v, want c-nested -> %s (peeled through the tag chain)", tags[0], f.c1)
 	}
-	if tags[1].Name != "v2-light" || tags[1].SHA != f.c2 {
-		t.Errorf("tags[1] = %+v, want v2-light -> %s", tags[1], f.c2)
+	if tags[1].Name != "v1" || tags[1].SHA != f.c1 {
+		t.Errorf("tags[1] = %+v, want v1 -> %s (peeled)", tags[1], f.c1)
+	}
+	if tags[2].Name != "v2-light" || tags[2].SHA != f.c2 {
+		t.Errorf("tags[2] = %+v, want v2-light -> %s", tags[2], f.c2)
 	}
 }
 

@@ -2,6 +2,8 @@ package gitread
 
 import (
 	"context"
+	"errors"
+	"os/exec"
 	"testing"
 )
 
@@ -95,6 +97,40 @@ func TestGrepCaseAndPathspecs(t *testing.T) {
 	}
 	if len(files) != 0 {
 		t.Fatalf("exclude pathspec grep = %+v", files)
+	}
+
+	// :(literal) pathspecs (the /repos/grep `paths` mapping): directory
+	// prefixes narrow the search, wildcards stay literal characters, and a
+	// pathspec matching nothing is an empty result — not a git fatal.
+	files, err = Grep(ctx, f.dir, f.c2, GrepOptions{
+		Pattern:   "data",
+		Pathspecs: []string{":(literal)dir"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) != 1 || files[0].Path != "dir/renamed.txt" {
+		t.Fatalf("literal dir pathspec grep = %+v", files)
+	}
+	for _, spec := range []string{":(literal)dir/*", ":(literal)no-such-path"} {
+		files, err = Grep(ctx, f.dir, f.c2, GrepOptions{Pattern: "data", Pathspecs: []string{spec}})
+		if err != nil {
+			t.Fatalf("pathspec %q: %v", spec, err)
+		}
+		if len(files) != 0 {
+			t.Fatalf("pathspec %q grep = %+v, want empty", spec, files)
+		}
+	}
+}
+
+// TestGrepBadPattern pins the exit-128 contract the handler maps to a 400:
+// an invalid regex surfaces as an *exec.ExitError with code 128.
+func TestGrepBadPattern(t *testing.T) {
+	f := newFixture(t)
+	_, err := Grep(context.Background(), f.dir, f.c2, GrepOptions{Pattern: "["})
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 128 {
+		t.Fatalf("bad-pattern grep err = %v, want exit status 128", err)
 	}
 }
 

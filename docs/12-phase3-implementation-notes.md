@@ -113,6 +113,22 @@ solely on these are accepted:
    `Server error` findings against a pre-integration build are the stub, not a conformance
    bug). At the integrated HEAD no read route answers 501.
 
+Phase-4 additions (details in [13-phase4-implementation-notes.md](13-phase4-implementation-notes.md)):
+
+4. **Repo keying clarification.** Git URLs address repos by `repo_id` (docs/05), but the
+   path element is resolved through the metadata store (`GetRepoByID`, then
+   `GetRepoByURL`), so name-style URLs from README §6 work too; `RepoID` is the only
+   storage key. Path elements resolving to no repo record are 404 on both the git and API
+   surfaces (ADR-21).
+5. **200 vs 201 on write endpoints (reaffirmed).** docs/03 (`200/201 | success (201
+   accepted by SDKs on create endpoints)`) + docs/04 win over openapi's 201: writes return
+   200 (ADR-22).
+6. **`POST /repos/restore-commit` takes plain JSON** per docs/03+04; openapi models it as
+   NDJSON with a `reset-commits` alias — accepted deviation (ADR-26).
+7. **499 `client closed request` is not emittable.** Listed in the docs/04 status table,
+   but Go's `net/http` cannot write a status to a connection the client abandoned
+   (ADR-26).
+
 ## Acceptance evidence index
 
 Evidence root: `/tmp/codestorage-evidence/p3-read-api/` (transcripts are **never

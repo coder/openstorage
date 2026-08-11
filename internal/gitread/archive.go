@@ -8,6 +8,7 @@ import (
 	"io"
 	"path"
 	"strings"
+	"time"
 
 	"codestorage/internal/ref"
 )
@@ -28,35 +29,45 @@ type ArchiveOptions struct {
 	MaxBlobSize int64
 }
 
-// Archive streams a tar.gz of the tree at commit (a resolved full SHA) into
-// w: regular blobs (mode 0644, or 0755 for git mode 100755) and symlinks
-// (target = blob content); submodules are skipped. Entry mtimes are the
-// commit's committer time. Errors after bytes were written can only
-// truncate the stream — HTTP callers have already sent headers.
-func Archive(ctx context.Context, repoPath, commit string, opts ArchiveOptions, w io.Writer) error {
-	assertf(ref.ValidSHA(commit), "Archive: unresolved commit %q", commit)
-	assertf(w != nil, "Archive: nil writer")
-	assertf(ValidArchivePrefix(opts.Prefix), "Archive: unsafe prefix %q", opts.Prefix)
+// PreparedArchive is a resolved, filtered archive plan. Everything that can
+// fail without touching the output stream (commit lookup, tree walk, entry
+// filtering) happens in PrepareArchive, so HTTP callers can commit response
+// headers only after resolution succeeded and mid-stream failures are
+// limited to blob streaming.
+type PreparedArchive struct {
+	repoPath string
+	opts     ArchiveOptions
+	mtime    time.Time
+	entries  []TreeEntry // filtered blob/symlink entries, tree order
+}
+
+// PrepareArchive resolves the tree at commit (a resolved full SHA) and
+// applies the include/exclude globs and MaxBlobSize filters up front.
+func PrepareArchive(ctx context.Context, repoPath, commit string, opts ArchiveOptions) (*PreparedArchive, error) {
+	assertf(ref.ValidSHA(commit), "PrepareArchive: unresolved commit %q", commit)
+	assertf(ValidArchivePrefix(opts.Prefix), "PrepareArchive: unsafe prefix %q", opts.Prefix)
 
 	commits, err := Log(ctx, repoPath, commit, LogOptions{MaxCount: 1})
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if len(commits) != 1 {
-		return fmt.Errorf("archive: commit %s not found", commit)
+		return nil, fmt.Errorf("archive: commit %s not found", commit)
 	}
-	mtime := commits[0].CommitterDate
 
 	entries, err := LsTree(ctx, repoPath, commit, "", true)
 	if err != nil {
-		return err
+		return nil, err
 	}
-
-	gz := gzip.NewWriter(w)
-	tw := tar.NewWriter(gz)
+	kept := []TreeEntry{}
 	for _, e := range entries {
-		if e.Type == EntrySubmodule || e.Type == EntryTree {
+		switch e.Type {
+		case EntrySubmodule, EntryTree:
 			continue
+		case EntrySymlink, EntryBlob:
+			// archivable
+		default:
+			return nil, fmt.Errorf("archive: unexpected entry type %q for %s", e.Type, e.Path)
 		}
 		if !archiveWants(e.Path, opts) {
 			continue
@@ -64,13 +75,34 @@ func Archive(ctx context.Context, repoPath, commit string, opts ArchiveOptions, 
 		if opts.MaxBlobSize > 0 && e.Type == EntryBlob && e.Size > opts.MaxBlobSize {
 			continue
 		}
+		kept = append(kept, e)
+	}
+	return &PreparedArchive{
+		repoPath: repoPath,
+		opts:     opts,
+		mtime:    commits[0].CommitterDate,
+		entries:  kept,
+	}, nil
+}
+
+// Stream writes the prepared entries as a tar.gz into w: regular blobs
+// (mode 0644, or 0755 for git mode 100755) and symlinks (target = blob
+// content); entry mtimes are the commit's committer time. Errors here can
+// only truncate the stream — HTTP callers have already sent headers.
+func (p *PreparedArchive) Stream(ctx context.Context, w io.Writer) error {
+	assertf(p != nil && p.repoPath != "", "Stream: unprepared archive")
+	assertf(w != nil, "Stream: nil writer")
+
+	gz := gzip.NewWriter(w)
+	tw := tar.NewWriter(gz)
+	for _, e := range p.entries {
 		hdr := &tar.Header{
-			Name:    opts.Prefix + e.Path,
-			ModTime: mtime,
+			Name:    p.opts.Prefix + e.Path,
+			ModTime: p.mtime,
 		}
 		switch e.Type {
 		case EntrySymlink:
-			target, err := ReadBlob(ctx, repoPath, e.SHA)
+			target, err := ReadBlob(ctx, p.repoPath, e.SHA)
 			if err != nil {
 				return err
 			}
@@ -92,17 +124,29 @@ func Archive(ctx context.Context, repoPath, commit string, opts ArchiveOptions, 
 			}
 			// Stream blob bytes straight into the tar entry; a size
 			// mismatch surfaces as a tar write error.
-			if err := CatBlobTo(ctx, repoPath, e.SHA, tw); err != nil {
+			if err := CatBlobTo(ctx, p.repoPath, e.SHA, tw); err != nil {
 				return err
 			}
 		default:
-			return fmt.Errorf("archive: unexpected entry type %q for %s", e.Type, e.Path)
+			// PrepareArchive admits only blobs and symlinks.
+			assertf(false, "Stream: unexpected entry type %q for %s", e.Type, e.Path)
 		}
 	}
 	if err := tw.Close(); err != nil {
 		return err
 	}
 	return gz.Close()
+}
+
+// Archive is PrepareArchive + Stream in one call, for callers that do not
+// need the resolve-before-stream split.
+func Archive(ctx context.Context, repoPath, commit string, opts ArchiveOptions, w io.Writer) error {
+	assertf(w != nil, "Archive: nil writer")
+	prepared, err := PrepareArchive(ctx, repoPath, commit, opts)
+	if err != nil {
+		return err
+	}
+	return prepared.Stream(ctx, w)
 }
 
 // ValidArchivePrefix reports whether prefix is safe to prepend to tar entry

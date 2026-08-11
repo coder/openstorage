@@ -6,6 +6,12 @@ package api
 // throwaway harness module `replace`s the SDK to that copy, and the harness
 // binary (testdata/sdkharness/main.go.tmpl) runs against the live in-process
 // server. ES256 keys are generated at runtime and never committed.
+//
+// p4 follow-up (docs/13): once the write endpoints (commit-pack/diff-commit/
+// restore-commit/merge/branches/tags/notes) land, extend the harness template
+// to drive the SDK write methods and assert the docs/04 result-envelope
+// statuses (ok/precondition_failed/conflict) round-trip through the SDK —
+// including envelope-shaped 401/403 on write routes.
 
 import (
 	"crypto/x509"

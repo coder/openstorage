@@ -16,7 +16,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -72,17 +71,8 @@ func (s *server) resolveQueryRepo(w http.ResponseWriter, r *http.Request) (meta.
 	return repo, repoPath, true
 }
 
-// queryFlag parses a literal "true"/"false" boolean query param (docs/03:
-// booleans in query strings are literal strings; absent means false).
-func queryFlag(q url.Values, name string) (bool, error) {
-	switch q.Get(name) {
-	case "", "false":
-		return false, nil
-	case "true":
-		return true, nil
-	}
-	return false, fmt.Errorf("invalid %s (want \"true\" or \"false\")", name)
-}
+// Boolean query params are parsed via coreBoolParam (handlers_read_core.go)
+// — one literal "true"/"false" dialect for the whole read surface.
 
 // cleanPathParams validates repeatable `path` filters: no empties, no NULs.
 func cleanPathParams(paths []string) ([]string, error) {
@@ -97,7 +87,11 @@ func cleanPathParams(paths []string) ([]string, error) {
 // mergeBaseSHA returns the merge base of a and b in the repo at repoPath;
 // ok=false (no error) when the histories are unrelated.
 func mergeBaseSHA(ctx context.Context, repoPath, a, b string) (string, bool, error) {
-	assertf(ref.ValidSHA(a) && ref.ValidSHA(b), "mergeBaseSHA: unresolved inputs %q/%q", a, b)
+	// Callers pass ResolveRef outputs, so non-SHA inputs are a programming
+	// error — but returning it (500) beats a panic that kills the process.
+	if !ref.ValidSHA(a) || !ref.ValidSHA(b) {
+		return "", false, fmt.Errorf("mergeBaseSHA: unresolved inputs %q/%q", a, b)
+	}
 	cmd := exec.CommandContext(ctx, "git", "merge-base", a, b)
 	cmd.Dir = repoPath
 	out, err := cmd.Output()
@@ -214,7 +208,9 @@ func buildDiffPayload(ctx context.Context, repoPath, base, target string, paths 
 	for _, f := range fileDiffs {
 		statCommit := target
 		if f.Status == "D" {
-			assertf(base != gitread.EmptyTreeSHA, "deletion %q in a root diff", f.Path)
+			// Deletions stat the pre-image side. A root diff (base ==
+			// EmptyTreeSHA) has no pre-image; statDiffBlob then reports the
+			// missing path as an error (500), never a process-killing panic.
 			statCommit = base
 		}
 		size, isEOF, err := statDiffBlob(ctx, repoPath, statCommit, f.Path)
@@ -272,7 +268,7 @@ func (s *server) handleDiff(w http.ResponseWriter, r *http.Request) {
 	// Validated for shape only: raw output is byte-exact `git diff` patches
 	// in both modes, which already satisfies the apply-compatibility
 	// invariant (see fileDiffEntry).
-	if _, err := queryFlag(q, "gitApplyCompatible"); err != nil {
+	if _, err := coreBoolParam(q, "gitApplyCompatible"); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -365,12 +361,12 @@ func (s *server) handleBranchesDiff(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "branch is required")
 		return
 	}
-	ephemeral, err := queryFlag(q, "ephemeral")
+	ephemeral, err := coreBoolParam(q, "ephemeral")
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	ephemeralBase, err := queryFlag(q, "ephemeral_base")
+	ephemeralBase, err := coreBoolParam(q, "ephemeral_base")
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
@@ -463,12 +459,12 @@ func (s *server) handleBlame(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "path is required")
 		return
 	}
-	ephemeral, err := queryFlag(q, "ephemeral")
+	ephemeral, err := coreBoolParam(q, "ephemeral")
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	detectMoves, err := queryFlag(q, "detect_moves")
+	detectMoves, err := coreBoolParam(q, "detect_moves")
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
@@ -740,6 +736,17 @@ func (s *server) handleGrep(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// Narrow the git-side search to the requested path prefixes (openapi:
+	// "path prefixes used to narrow the search before pattern matching").
+	// `:(literal)` magic keeps the documented plain-prefix semantics (no
+	// glob dialect) and stops request input from smuggling other pathspec
+	// magic. grepFileWanted below stays as the authoritative output filter.
+	pathspecs := make([]string, 0, len(body.Paths))
+	for _, p := range body.Paths {
+		if trimmed := strings.TrimSuffix(p, "/"); trimmed != "" {
+			pathspecs = append(pathspecs, ":(literal)"+trimmed)
+		}
+	}
 
 	repo, repoPath, ok := s.resolveQueryRepo(w, r)
 	if !ok {
@@ -781,10 +788,19 @@ func (s *server) handleGrep(w http.ResponseWriter, r *http.Request) {
 	files, err := gitread.Grep(r.Context(), repoPath, commit, gitread.GrepOptions{
 		Pattern:         pattern,
 		CaseInsensitive: !caseSensitive,
+		Pathspecs:       pathspecs,
 		BeforeContext:   before,
 		AfterContext:    after,
 	})
-	if err != nil {
+	var grepExitErr *exec.ExitError
+	switch {
+	case errors.As(err, &grepExitErr) && grepExitErr.ExitCode() == 128:
+		// The commit is a resolved SHA and pathspecs carry only :(literal)
+		// magic, so a git usage failure (exit 128) means the request's
+		// pattern is not a valid regex — client input, not a server fault.
+		writeErr(w, http.StatusBadRequest, "invalid query.pattern")
+		return
+	case err != nil:
 		s.internalErr(w, r, "run grep", err)
 		return
 	}
@@ -923,6 +939,12 @@ func (s *server) handleArchive(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, fmt.Sprintf("invalid archive.prefix %q", body.Archive.Prefix))
 		return
 	}
+	// The prefix is a folder name (openapi example "sdk-docs/"); normalize
+	// a missing trailing slash so "snap" cannot glue onto entry names.
+	prefix := body.Archive.Prefix
+	if prefix != "" && !strings.HasSuffix(prefix, "/") {
+		prefix += "/"
+	}
 
 	repo, repoPath, ok := s.resolveQueryRepo(w, r)
 	if !ok {
@@ -954,17 +976,26 @@ func (s *server) handleArchive(w http.ResponseWriter, r *http.Request) {
 	}
 	filename := archiveFilenamePart(repoBase) + "-" + archiveFilenamePart(refName) + ".tar.gz"
 
+	// Resolve the commit and walk the tree BEFORE committing a 200:
+	// resolution failures still get a clean error response instead of a
+	// mid-stream abort.
+	prepared, err := gitread.PrepareArchive(r.Context(), repoPath, commit, gitread.ArchiveOptions{
+		Prefix:       prefix,
+		IncludeGlobs: body.IncludeGlobs,
+		ExcludeGlobs: body.ExcludeGlobs,
+		MaxBlobSize:  maxBlobSize,
+	})
+	if err != nil {
+		s.internalErr(w, r, "prepare archive", err)
+		return
+	}
+
 	w.Header().Set("Content-Type", "application/gzip")
 	w.Header().Set("Content-Disposition", `attachment; filename="`+filename+`"`)
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusOK)
 
-	if err := gitread.Archive(r.Context(), repoPath, commit, gitread.ArchiveOptions{
-		Prefix:       body.Archive.Prefix,
-		IncludeGlobs: body.IncludeGlobs,
-		ExcludeGlobs: body.ExcludeGlobs,
-		MaxBlobSize:  maxBlobSize,
-	}, w); err != nil {
+	if err := prepared.Stream(r.Context(), w); err != nil {
 		// Headers are gone; a clean error response is impossible. Abort the
 		// connection so the client sees a hard failure instead of silently
 		// truncated (checksum-broken) gzip output.
