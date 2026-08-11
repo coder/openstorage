@@ -129,6 +129,14 @@ assumption made during the parallel build.
   org-level sentinel repo claim passed the git repo gate for a repo whose path element is
   literally `org` (`BaseRepo("org") == claims.Repo`). Git endpoints are always repo-scoped
   (docs/02), so both claims now map to 403, mirroring the API middleware's repo-scope gate.
+- **Ephemeral policy matching normalizes shorthand refs.** The update hook built the
+  ADR-11 match name by string concatenation (`refs/namespaces/ephemeral/` + refname),
+  bypassing the docs/02 shorthand rule: a shorthand ref (`main`) became
+  `refs/namespaces/ephemeral/main`, which `NormalizeRefName` leaves alone (leading
+  `refs/`), so `refs/namespaces/ephemeral/refs/heads/*` rules never fired and enforcement
+  could be bypassed. The hook now uses `auth.EphemeralRefName`, which normalizes before
+  prefixing and is idempotent for fully-qualified refs. (Caught during the
+  local-backends integration review.)
 - **Ref policies apply to the API write endpoints.** docs/02 makes JWT ref policies bind
   every write surface, but the API handlers ignored `refs`/`ops`. Both write handlers now
   parse the policy claims exactly like the git update hook (including the fold-once `ops`
