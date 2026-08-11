@@ -192,7 +192,11 @@ func (s *Server) handleInfoRefs(w http.ResponseWriter, r *http.Request, repo str
 	}
 	service := strings.TrimPrefix(svcParam, "git-")
 	if _, status, err := s.authenticate(r, repo, serviceScope(service)); err != nil {
-		w.Header().Set("WWW-Authenticate", `Basic realm="codestorage"`)
+		// RFC 9110 §11.6.1: the challenge belongs to 401 only; a 403 means
+		// the presented credentials were understood but denied.
+		if status == http.StatusUnauthorized {
+			w.Header().Set("WWW-Authenticate", `Basic realm="codestorage"`)
+		}
 		httpError(w, status, err.Error())
 		return
 	}
@@ -218,7 +222,10 @@ func (s *Server) handleInfoRefs(w http.ResponseWriter, r *http.Request, repo str
 func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, service string) {
 	claims, status, err := s.authenticate(r, repo, serviceScope(service))
 	if err != nil {
-		w.Header().Set("WWW-Authenticate", `Basic realm="codestorage"`)
+		// RFC 9110 §11.6.1: challenge on 401 only (see handleInfoRefs).
+		if status == http.StatusUnauthorized {
+			w.Header().Set("WWW-Authenticate", `Basic realm="codestorage"`)
+		}
 		httpError(w, status, err.Error())
 		return
 	}

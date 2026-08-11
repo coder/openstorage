@@ -92,10 +92,11 @@ func TestEnsureCacheRepo_RepairsHooksAndConfig(t *testing.T) {
 	}
 }
 
-// Regression for the index-pack fix: a corrupt pack file left on disk must be
-// deleted on failure so a retry re-downloads it (previously the corrupt file
-// suppressed the download forever).
-func TestHydratePacks_RedownloadsAfterCorruptPack(t *testing.T) {
+// Regression for the corrupt-pack race: a corrupt pack file left at the
+// hydration target (crashed downloader, partial write) must never wedge
+// hydration. The temp-file + rename scheme downloads fresh bytes beside it
+// and atomically replaces it, so hydrate succeeds on the FIRST attempt.
+func TestHydratePacks_ReplacesCorruptPack(t *testing.T) {
 	ctx := context.Background()
 	repo := "t-hydrate-corrupt"
 	work := initWorkRepo(t)
@@ -121,20 +122,64 @@ func TestHydratePacks_RedownloadsAfterCorruptPack(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := HydratePacks(ctx, testStore, testBlob, repoPath, repo); err == nil {
-		t.Fatal("first hydrate succeeded despite corrupt pack")
-	}
-	if _, err := os.Stat(corrupt); !os.IsNotExist(err) {
-		t.Fatalf("corrupt pack not removed after failed index-pack (stat err: %v)", err)
-	}
-
 	if err := HydratePacks(ctx, testStore, testBlob, repoPath, repo); err != nil {
-		t.Fatalf("second hydrate (re-download) failed: %v", err)
+		t.Fatalf("hydrate with corrupt pre-placed pack failed: %v", err)
 	}
 	for _, p := range packs {
 		idx := filepath.Join(packDir, "pack-"+p.ID+".idx")
 		if _, err := os.Stat(idx); err != nil {
-			t.Fatalf("pack %s not indexed after retry: %v", p.ID, err)
+			t.Fatalf("pack %s not indexed: %v", p.ID, err)
+		}
+	}
+	// The corrupt bytes were replaced by the real pack.
+	if out := mustGit(t, repoPath, "verify-pack", "-v", corrupt); out == "" {
+		t.Fatal("verify-pack produced no output for replaced pack")
+	}
+	// No stray temp files survive a successful hydrate.
+	leftovers, err := filepath.Glob(filepath.Join(packDir, "*.tmp-*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(leftovers) != 0 {
+		t.Fatalf("temp files left behind: %v", leftovers)
+	}
+}
+
+// Concurrent hydrators of the same pack must serialize on the per-pack lock
+// and both succeed (no partial-file os.Remove race, no double index-pack
+// failure).
+func TestHydratePacks_ConcurrentHydratorsSerialize(t *testing.T) {
+	ctx := context.Background()
+	repo := "t-hydrate-concurrent"
+	work := initWorkRepo(t)
+	token := mintTestToken(t, repo, "git:read,git:write", "")
+	mustGit(t, work, "push", remoteURL(nodeA, repo, token), "HEAD:refs/heads/main")
+
+	repoPath, err := EnsureCacheRepo(t.TempDir(), repo)
+	if err != nil {
+		t.Fatalf("ensure cache repo: %v", err)
+	}
+
+	const n = 4
+	errs := make(chan error, n)
+	for i := 0; i < n; i++ {
+		go func() {
+			errs <- HydratePacks(ctx, testStore, testBlob, repoPath, repo)
+		}()
+	}
+	for i := 0; i < n; i++ {
+		if err := <-errs; err != nil {
+			t.Fatalf("concurrent hydrate failed: %v", err)
+		}
+	}
+	packs := pgPacks(t, repo)
+	if len(packs) == 0 {
+		t.Fatal("push registered no packs")
+	}
+	for _, p := range packs {
+		idx := filepath.Join(repoPath, "objects", "pack", "pack-"+p.ID+".idx")
+		if _, err := os.Stat(idx); err != nil {
+			t.Fatalf("pack %s not indexed: %v", p.ID, err)
 		}
 	}
 }

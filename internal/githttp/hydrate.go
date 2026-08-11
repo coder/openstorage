@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"codestorage/internal/blob"
@@ -146,6 +147,12 @@ func ensureHook(path, script string) error {
 // already present in the cache repo. Packs are self-contained (index-pack
 // --fix-thin ran on the receiving node before upload), so each is
 // independently indexable.
+//
+// Concurrent hydrators (serve requests, re-exec'd hooks) race on the same
+// cache dir, so each pack is materialized under a per-pack flock: download
+// to a uniquely-named temp file, index the temp, then rename pack+idx into
+// place. Only our own temp names are ever removed, and "idx appeared while
+// waiting for the lock" counts as success.
 func HydratePacks(ctx context.Context, st ref.RefStore, bl blob.BlobStore, repoPath, repo string) error {
 	packs, err := st.ListPacks(ctx, repo)
 	if err != nil {
@@ -160,22 +167,87 @@ func HydratePacks(ctx context.Context, st ref.RefStore, bl blob.BlobStore, repoP
 		if _, err := os.Stat(base + ".idx"); err == nil {
 			continue // already hydrated
 		}
-		packFile := base + ".pack"
-		if _, err := os.Stat(packFile); err != nil {
-			if err := bl.DownloadFile(ctx, p.Key, packFile); err != nil {
-				return err
-			}
-		}
-		if out, err := runGit(repoPath, "index-pack", packFile); err != nil {
-			// A failed index-pack means the on-disk pack is corrupt/partial.
-			// Remove it (and any partial idx) so a retry re-downloads instead
-			// of tripping over the same bad bytes forever.
-			_ = os.Remove(packFile)
-			_ = os.Remove(base + ".idx")
-			return fmt.Errorf("index-pack %s: %w (%s)", p.ID, err, strings.TrimSpace(out))
+		if err := hydrateOnePack(ctx, bl, repoPath, base, p); err != nil {
+			return err
 		}
 	}
 	return nil
+}
+
+// hydrateOnePack materializes one registered pack (pack + idx) at base under
+// an exclusive flock on <base>.pack.lock. The lock file is left in place:
+// removing it would race a concurrent locker onto a deleted inode.
+func hydrateOnePack(ctx context.Context, bl blob.BlobStore, repoPath, base string, p ref.Pack) error {
+	unlock, err := flockExclusive(base + ".pack.lock")
+	if err != nil {
+		return fmt.Errorf("lock pack %s: %w", p.ID, err)
+	}
+	defer unlock()
+	// Re-check under the lock: a concurrent hydrator may have finished the
+	// job while we were waiting.
+	if _, err := os.Stat(base + ".idx"); err == nil {
+		return nil
+	}
+	// index-pack derives the idx name by replacing the .pack suffix, so the
+	// temp file must end in .pack.
+	tmp, err := os.CreateTemp(filepath.Dir(base), filepath.Base(base)+".tmp-*.pack")
+	if err != nil {
+		return err
+	}
+	tmpPack := tmp.Name()
+	tmpBase := strings.TrimSuffix(tmpPack, ".pack")
+	tmpIdx := tmpBase + ".idx"
+	tmpRev := tmpBase + ".rev" // reverse index, emitted by modern git
+	_ = tmp.Close()            // DownloadFile writes by path (tmp + rename)
+	defer func() {
+		// Best-effort cleanup of OUR temp names only; no-ops after the
+		// renames below succeeded.
+		_ = os.Remove(tmpPack)
+		_ = os.Remove(tmpIdx)
+		_ = os.Remove(tmpRev)
+	}()
+	if err := bl.DownloadFile(ctx, p.Key, tmpPack); err != nil {
+		return err
+	}
+	if out, err := runGit(repoPath, "index-pack", tmpPack); err != nil {
+		// Corrupt/partial download: the deferred cleanup removes the temp
+		// files, so a retry re-downloads fresh bytes.
+		return fmt.Errorf("index-pack %s: %w (%s)", p.ID, err, strings.TrimSpace(out))
+	}
+	// Pack first, idx LAST: the "already hydrated" probe keys on the idx,
+	// so a visible idx implies a complete pack. A crash in between leaves
+	// partial files the next hydrator overwrites under the lock.
+	if err := os.Rename(tmpPack, base+".pack"); err != nil {
+		return err
+	}
+	// The reverse index is optional (config/version dependent); move it
+	// along when present.
+	if _, err := os.Stat(tmpRev); err == nil {
+		if err := os.Rename(tmpRev, base+".rev"); err != nil {
+			return err
+		}
+	}
+	if err := os.Rename(tmpIdx, base+".idx"); err != nil {
+		return err
+	}
+	return nil
+}
+
+// flockExclusive takes a blocking exclusive flock on path (creating it if
+// needed) and returns the release func.
+func flockExclusive(path string) (unlock func(), err error) {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, err
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	return func() {
+		// Close releases the flock with the descriptor.
+		_ = f.Close()
+	}, nil
 }
 
 // SyncRefs makes the local ref store match PG exactly (PG wins): updates

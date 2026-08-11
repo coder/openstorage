@@ -57,9 +57,13 @@ func mustEnv(names ...string) string {
 }
 
 // RunHook dispatches `codestorage hook <pre-receive|update> [args...]`,
-// invoked by git via the scripts EnsureCacheRepo installs.
+// invoked by git via the scripts EnsureCacheRepo installs. Arguments and
+// stdin come from outside this process, so malformed input must produce an
+// error (stderr message + non-zero exit denies the push), never a panic.
 func RunHook(ctx context.Context, args []string) error {
-	assertf(len(args) >= 1, "hook: missing hook name argument")
+	if len(args) < 1 {
+		return errors.New("hook: missing hook name argument")
+	}
 	switch args[0] {
 	case "pre-receive":
 		return preReceive(ctx)
@@ -84,6 +88,8 @@ func preReceive(ctx context.Context) error {
 	// delete-only pushes invoke pre-receive without it.
 	quarantine := os.Getenv("GIT_QUARANTINE_PATH")
 
+	// Stdin is external input (git relays it from the client connection):
+	// malformed lines deny the push with an error, never a panic.
 	var commands []refCommand
 	sc := bufio.NewScanner(os.Stdin)
 	for sc.Scan() {
@@ -92,11 +98,21 @@ func preReceive(ctx context.Context) error {
 			continue
 		}
 		parts := strings.Fields(line)
-		assertf(len(parts) == 3, "pre-receive: malformed stdin line %q", line)
-		commands = append(commands, refCommand{old: parts[0], new: parts[1], ref: parts[2]})
+		if len(parts) != 3 {
+			return fmt.Errorf("pre-receive: malformed stdin line %q", line)
+		}
+		cmd := refCommand{old: parts[0], new: parts[1], ref: parts[2]}
+		if !ref.ValidSHA(cmd.old) || !ref.ValidSHA(cmd.new) {
+			return fmt.Errorf("pre-receive: malformed sha in stdin line %q", line)
+		}
+		commands = append(commands, cmd)
 	}
-	assertf(sc.Err() == nil, "pre-receive: reading stdin: %v", sc.Err())
-	assertf(len(commands) > 0, "pre-receive: git invoked hook with no commands")
+	if err := sc.Err(); err != nil {
+		return fmt.Errorf("pre-receive: reading stdin: %w", err)
+	}
+	if len(commands) == 0 {
+		return errors.New("pre-receive: git invoked hook with no commands")
+	}
 
 	var packFiles []string
 	if quarantine != "" {
@@ -111,11 +127,13 @@ func preReceive(ctx context.Context) error {
 		// updates targeting objects the server already has (e.g. a branch
 		// created from an existing commit). Whether git sends an empty pack
 		// in the latter case is version/client dependent, so both paths must
-		// work. receive-pack verified connectivity before invoking us;
-		// assert that invariant rather than rejecting the push.
+		// work. receive-pack verified connectivity before invoking us, but
+		// the SHAs come from client stdin: a violation denies the push with
+		// an error instead of crashing receive-pack.
 		for _, c := range commands {
-			assertf(c.new == ref.ZeroSHA || objectExists(c.new),
-				"pre-receive: no quarantined pack and unknown object %s for %s", c.new, c.ref)
+			if c.new != ref.ZeroSHA && !objectExists(c.new) {
+				return fmt.Errorf("pre-receive: no quarantined pack and unknown object %s for %s", c.new, c.ref)
+			}
 		}
 		return nil
 	}
@@ -130,7 +148,11 @@ func preReceive(ctx context.Context) error {
 	for _, pf := range packFiles {
 		base := filepath.Base(pf) // pack-<hash>.pack
 		id := strings.TrimSuffix(strings.TrimPrefix(base, "pack-"), ".pack")
-		assertf(id != "" && id != base, "pre-receive: unexpected pack file name %q", base)
+		if id == "" || id == base {
+			// Quarantine contents are produced by git, but fail closed on a
+			// surprising name instead of crashing receive-pack.
+			return fmt.Errorf("pre-receive: unexpected pack file name %q", base)
+		}
 		key := blob.PackKey(repo, id)
 		if err := bl.UploadFile(ctx, key, pf); err != nil {
 			return fmt.Errorf("pre-receive: upload %s: %w", key, err)
@@ -159,8 +181,19 @@ func preReceive(ctx context.Context) error {
 // the PG CAS. Exit != 0 makes git report a per-ref `ng` with our stderr
 // message; git only updates the local cache ref for winners.
 func updateHook(ctx context.Context, args []string) error {
-	assertf(len(args) == 3, "update: want 3 args (ref old new), got %v", args)
+	// Hook args are handed over by git per ref update; validate instead of
+	// asserting so a malformed invocation denies the update, never panics
+	// (CASRef below asserts well-formed SHAs).
+	if len(args) != 3 {
+		return fmt.Errorf("update: want 3 args (ref old new), got %d", len(args))
+	}
 	refName, old, new := args[0], args[1], args[2]
+	if refName == "" {
+		return errors.New("update: empty ref name")
+	}
+	if !ref.ValidSHA(old) || !ref.ValidSHA(new) {
+		return fmt.Errorf("update: malformed sha for %s", refName)
+	}
 	repo := mustEnv(EnvRepo)
 
 	if err := enforceRefPolicy(ctx, repo, refName, old, new); err != nil {
@@ -316,7 +349,9 @@ func verifySigDenied(refName, sha, reason string) error {
 // (branch creation: old is ZeroSHA, so everything reachable from new).
 // Runs in the bare repo git put us in (cwd, GIT_DIR set by receive-pack).
 func introducedCommits(ctx context.Context, old, new string) ([]string, error) {
-	assertf(ref.ValidSHA(new) && new != ref.ZeroSHA, "introducedCommits: bad new sha %q", new)
+	if !ref.ValidSHA(new) || new == ref.ZeroSHA {
+		return nil, fmt.Errorf("introducedCommits: bad new sha %q", new)
+	}
 	args := []string{"rev-list", new}
 	if old != ref.ZeroSHA {
 		args = append(args, "^"+old)
@@ -330,7 +365,10 @@ func introducedCommits(ctx context.Context, old, new string) ([]string, error) {
 		if line == "" {
 			continue
 		}
-		assertf(ref.ValidSHA(line), "rev-list emitted %q", line)
+		// Subprocess output: fail closed on surprises, never panic mid-push.
+		if !ref.ValidSHA(line) {
+			return nil, fmt.Errorf("rev-list emitted %q", line)
+		}
 		shas = append(shas, line)
 	}
 	return shas, nil
@@ -409,9 +447,10 @@ func newSigVerifier(keys []meta.SigningKey) (*sigVerifier, func(), error) {
 }
 
 // looksLikeSSHPublicKey is a defensive shape check for one authorized-keys
-// style line ("<type> <base64> [comment]").
+// style line ("<type> <base64> [comment]"). Embedded CR/LF would corrupt the
+// allowed_signers file, so any multi-line text fails the check.
 func looksLikeSSHPublicKey(line string) bool {
-	if strings.ContainsRune(line, '\n') {
+	if strings.ContainsAny(line, "\r\n") {
 		return false
 	}
 	fields := strings.Fields(line)
@@ -430,7 +469,11 @@ func looksLikeSSHPublicKey(line string) bool {
 // materialized keyring, else a short human-readable reason. Delegates to
 // `git verify-commit`, which picks gpg or ssh-keygen by signature type.
 func (v *sigVerifier) verifyCommit(ctx context.Context, sha string) (reason string) {
-	assertf(ref.ValidSHA(sha), "verifyCommit: bad sha %q", sha)
+	if !ref.ValidSHA(sha) {
+		// Callers feed rev-list output; a malformed sha fails closed as a
+		// denial reason instead of crashing receive-pack.
+		return fmt.Sprintf("malformed commit sha %q", sha)
+	}
 	cmd := exec.CommandContext(ctx, "git",
 		"-c", "gpg.ssh.allowedSignersFile="+v.allowedSigners,
 		"verify-commit", sha)
