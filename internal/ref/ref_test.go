@@ -2,6 +2,7 @@ package ref
 
 import (
 	"context"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -30,4 +31,13 @@ func TestOpenSchemeDispatch(t *testing.T) {
 	if err == nil || strings.Contains(err.Error(), "unsupported") {
 		t.Fatalf("postgres:// must dispatch to OpenPG, got %v", err)
 	}
+
+	st, err := Open(ctx, "sqlite://"+filepath.Join(t.TempDir(), "refs.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := st.(*SQLite); !ok {
+		t.Fatalf("sqlite:// must open the SQLite backend, got %T", st)
+	}
+	st.Close()
 }

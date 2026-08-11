@@ -6,10 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"net/url"
-	"os"
-	"path/filepath"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
@@ -74,7 +71,7 @@ func Open(ctx context.Context, blobURL string) (BlobStore, error) {
 	case "s3":
 		return OpenS3(ctx, blobURL)
 	case "file":
-		return nil, fmt.Errorf("blob URL scheme %q not implemented yet", u.Scheme)
+		return OpenFile(blobURL)
 	default:
 		return nil, fmt.Errorf("blob URL scheme %q unsupported (want s3 or file)", u.Scheme)
 	}
@@ -154,60 +151,15 @@ func (b *S3) EnsureBucket(ctx context.Context) error {
 
 // UploadFile streams a local file to key.
 func (b *S3) UploadFile(ctx context.Context, key, path string) error {
-	f, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	w, err := b.bucket.NewWriter(ctx, key, nil)
-	if err != nil {
-		return err
-	}
-	if _, err := io.Copy(w, f); err != nil {
-		_ = w.Close()
-		return fmt.Errorf("upload %s: %w", key, err)
-	}
-	return w.Close()
+	return bucketUploadFile(ctx, b.bucket, key, path)
 }
 
-// DownloadFile fetches key into destPath (via tmp + rename so a partially
-// downloaded pack is never visible under objects/pack).
+// DownloadFile fetches key into destPath atomically (tmp + rename).
 func (b *S3) DownloadFile(ctx context.Context, key, destPath string) error {
-	r, err := b.bucket.NewReader(ctx, key, nil)
-	if err != nil {
-		return fmt.Errorf("download %s: %w", key, err)
-	}
-	defer r.Close()
-	// filepath.Dir handles relative and bare-filename paths ("." for the
-	// latter); the tmp file must live in the destination directory so the
-	// final rename is atomic (same filesystem).
-	tmp, err := os.CreateTemp(filepath.Dir(destPath), ".blob-download-*")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(tmp.Name())
-	if _, err := io.Copy(tmp, r); err != nil {
-		tmp.Close()
-		return fmt.Errorf("download %s: %w", key, err)
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmp.Name(), destPath)
+	return bucketDownloadFile(ctx, b.bucket, key, destPath)
 }
 
 // List returns all objects under prefix.
 func (b *S3) List(ctx context.Context, prefix string) ([]ListedObject, error) {
-	iter := b.bucket.List(&gcblob.ListOptions{Prefix: prefix})
-	var out []ListedObject
-	for {
-		obj, err := iter.Next(ctx)
-		if err == io.EOF {
-			return out, nil
-		}
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, ListedObject{Key: obj.Key, Size: obj.Size})
-	}
+	return bucketList(ctx, b.bucket, prefix)
 }

@@ -93,6 +93,17 @@ func TestOpenSchemeDispatch(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	bl, err = Open(ctx, "file://"+t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := bl.(*File); !ok {
+		t.Fatalf("file:// must open the File backend, got %T", bl)
+	}
+	if err := bl.Close(); err != nil {
+		t.Fatal(err)
+	}
+
 	_, err = Open(ctx, "gs://bucket")
 	if err == nil || !strings.Contains(err.Error(), `scheme "gs" unsupported`) {
 		t.Fatalf("want unsupported-scheme error, got %v", err)

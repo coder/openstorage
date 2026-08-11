@@ -83,7 +83,7 @@ func Open(ctx context.Context, dbURL string) (Store, error) {
 	case "postgres", "postgresql":
 		return OpenPG(ctx, dbURL)
 	case "sqlite":
-		return nil, fmt.Errorf("ref store scheme %q not implemented yet", u.Scheme)
+		return OpenSQLite(ctx, dbURL)
 	default:
 		return nil, fmt.Errorf("ref store URL scheme %q unsupported (want postgres, postgresql, or sqlite)", u.Scheme)
 	}
