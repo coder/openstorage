@@ -21,9 +21,9 @@ import (
 
 	"codestorage/internal/auth"
 	"codestorage/internal/blob"
+	"codestorage/internal/githttp"
 	"codestorage/internal/meta"
 	"codestorage/internal/ref"
-	"codestorage/internal/githttp"
 )
 
 func main() {
