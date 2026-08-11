@@ -1,8 +1,8 @@
 package api
 
-// Scaffolding tests for the p3 git:read surface: every route is registered
-// under requireAuth with scope git:read and currently answers 501 (endpoint
-// slices replace the stubs and these expectations with real contract tests).
+// Auth-wiring tests for the p3 git:read surface: every route is registered
+// under requireAuth with scope git:read. Handler behavior is covered by the
+// contract tests in read_core_test.go / read_query_test.go.
 
 import (
 	"net/http"
@@ -59,10 +59,12 @@ func TestReadRoutesAuthWiring(t *testing.T) {
 				t.Errorf("%s %s with org token = %d, want 403", route.method, route.path, resp.StatusCode)
 			}
 
-			// Proper git:read token reaches the (stub) handler -> 501.
+			// Proper git:read token passes auth and reaches the handler
+			// (the 401-without-token check above already proves the route is
+			// registered; an unregistered path would 404 before auth).
 			resp, _ = e.doReq(t, route.method, route.path, readToken, nil, "")
-			if resp.StatusCode != http.StatusNotImplemented {
-				t.Errorf("%s %s with read token = %d, want 501 stub", route.method, route.path, resp.StatusCode)
+			if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+				t.Errorf("%s %s with read token = %d, want auth to pass", route.method, route.path, resp.StatusCode)
 			}
 		}
 	})

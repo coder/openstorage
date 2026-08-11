@@ -23,12 +23,6 @@ import (
 	"codestorage/internal/ref"
 )
 
-// notImplemented is the shared 501 stub body (docs/03 {"error"} envelope)
-// for read routes whose endpoint slice has not landed yet.
-func notImplemented(w http.ResponseWriter) {
-	writeErr(w, http.StatusNotImplemented, "not implemented")
-}
-
 // ---------------------------------------------------------------------------
 // Shared read plumbing: repo resolution, cache materialization, params,
 // cursors. Helpers deliberately carry a "core" prefix: sibling endpoint
