@@ -101,12 +101,16 @@ func cmdServe(ctx context.Context, args []string) error {
 
 	// Listen before building handlers: the default listen address uses an
 	// ephemeral port (127.0.0.1:0), and the API needs the bound address to
-	// build the `http_url` values it returns.
+	// build the `http_url` values it returns. $CODESTORAGE_BASE_URL
+	// overrides the derived base, which is unroutable when binding 0.0.0.0.
 	ln, err := net.Listen("tcp", cfg.listen)
 	if err != nil {
 		return err
 	}
-	httpBaseURL := "http://" + ln.Addr().String()
+	httpBaseURL := cfg.baseURL
+	if httpBaseURL == "" {
+		httpBaseURL = "http://" + ln.Addr().String()
+	}
 
 	mux := http.NewServeMux()
 	mounted := 0

@@ -136,6 +136,48 @@ func TestResolveServeConfigErrors(t *testing.T) {
 	}
 }
 
+func TestResolveServeConfigBaseURL(t *testing.T) {
+	base := map[string]string{"PG_URL": "p", "BLOB_URL": "b"}
+	env := func(baseURL string) func(string) string {
+		m := map[string]string{"CODESTORAGE_BASE_URL": baseURL}
+		for k, v := range base {
+			m[k] = v
+		}
+		return mapEnv(m)
+	}
+
+	// Unset: derive from the bound listener (cmdServe).
+	cfg, err := resolveServeConfig(mapEnv(base), "", "", "", "/k")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.baseURL != "" {
+		t.Fatalf("baseURL should default to empty, got %q", cfg.baseURL)
+	}
+
+	// Valid values, trailing slash trimmed.
+	for raw, want := range map[string]string{
+		"http://127.0.0.1:8081":       "http://127.0.0.1:8081",
+		"https://git.example.com/":    "https://git.example.com",
+		"https://git.example.com:443": "https://git.example.com:443",
+	} {
+		cfg, err := resolveServeConfig(env(raw), "", "", "", "/k")
+		if err != nil {
+			t.Fatalf("%q: %v", raw, err)
+		}
+		if cfg.baseURL != want {
+			t.Fatalf("%q: baseURL = %q, want %q", raw, cfg.baseURL, want)
+		}
+	}
+
+	// Invalid values fail fast at startup, naming the env var.
+	for _, raw := range []string{"not-a-url", "ftp://x", "http://", "http://h?x=1", "http://h#frag"} {
+		if _, err := resolveServeConfig(env(raw), "", "", "", "/k"); err == nil || !strings.Contains(err.Error(), "CODESTORAGE_BASE_URL") {
+			t.Fatalf("%q: want CODESTORAGE_BASE_URL error, got %v", raw, err)
+		}
+	}
+}
+
 // rsaPEM returns one PKIX "PUBLIC KEY" PEM block for a fresh RSA key.
 func rsaPEM(t *testing.T) []byte {
 	t.Helper()

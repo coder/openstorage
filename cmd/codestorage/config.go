@@ -8,8 +8,10 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"codestorage/internal/auth"
 )
@@ -24,6 +26,7 @@ const (
 	envListen     = "CODESTORAGE_LISTEN"
 	envOrg        = "CODESTORAGE_ORG"
 	envOrgPubKeys = "CODESTORAGE_ORG_PUBKEYS"
+	envBaseURL    = "CODESTORAGE_BASE_URL"
 
 	defaultListen = "127.0.0.1:0"
 )
@@ -56,6 +59,12 @@ type serveConfig struct {
 	// mode). Both must be set together, or neither.
 	org         string
 	orgKeysPath string
+
+	// baseURL, when non-empty, is the externally reachable base
+	// (scheme://host[:port], no trailing slash) used for `http_url` values
+	// in API responses. Empty means derive it from the bound listen
+	// address — which is unroutable when listening on 0.0.0.0.
+	baseURL string
 }
 
 // resolveServeConfig merges flags and environment into a validated config.
@@ -82,7 +91,30 @@ func resolveServeConfig(getenv func(string) string, flagListen, flagAddr, flagCa
 	if cfg.org == "" && cfg.gitPubKeyPath == "" {
 		return serveConfig{}, fmt.Errorf("nothing to serve: set --jwt-pubkey for the git path and/or %s + %s for the HTTP API", envOrg, envOrgPubKeys)
 	}
+	if raw := getenv(envBaseURL); raw != "" {
+		baseURL, err := normalizeBaseURL(raw)
+		if err != nil {
+			return serveConfig{}, fmt.Errorf("%s: %w", envBaseURL, err)
+		}
+		cfg.baseURL = baseURL
+	}
 	return cfg, nil
+}
+
+// normalizeBaseURL validates an externally reachable http(s) base URL and
+// strips any trailing slash (http_url values append "/<repo_id>.git").
+func normalizeBaseURL(raw string) (string, error) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "", err
+	}
+	if (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return "", fmt.Errorf("want http(s)://host[:port], got %q", raw)
+	}
+	if u.RawQuery != "" || u.Fragment != "" {
+		return "", fmt.Errorf("base URL must not carry a query or fragment: %q", raw)
+	}
+	return strings.TrimRight(u.String(), "/"), nil
 }
 
 func firstNonEmpty(values ...string) string {
