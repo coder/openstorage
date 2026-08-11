@@ -50,7 +50,7 @@ func New(cfg Config) http.Handler {
 		logger = slog.Default()
 	}
 
-	s := &server{store: cfg.Store, httpBaseURL: strings.TrimRight(cfg.HTTPBaseURL, "/")}
+	s := &server{store: cfg.Store, httpBaseURL: strings.TrimRight(cfg.HTTPBaseURL, "/"), logger: logger}
 
 	mux := http.NewServeMux()
 	route := func(pattern, scope string, orgLevel bool, h http.HandlerFunc) {

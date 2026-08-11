@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -17,7 +18,8 @@ import (
 // server holds handler dependencies; one instance backs all routes.
 type server struct {
 	store       meta.Store
-	httpBaseURL string // no trailing slash (normalized in New)
+	httpBaseURL string       // no trailing slash (normalized in New)
+	logger      *slog.Logger // never nil (defaulted in New)
 }
 
 // maxBodyBytes caps request bodies; the only JSON body we accept
@@ -113,7 +115,7 @@ func (s *server) handleCreateRepo(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "organization not found")
 		return
 	case err != nil:
-		writeErr(w, http.StatusInternalServerError, "create repository: "+err.Error())
+		s.internalErr(w, r, "create repository", err)
 		return
 	}
 	assertf(repo.RepoID != "", "store returned repo with empty RepoID")
@@ -136,7 +138,7 @@ func (s *server) handleGetRepo(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "repository not found")
 		return
 	case err != nil:
-		writeErr(w, http.StatusInternalServerError, "get repository: "+err.Error())
+		s.internalErr(w, r, "get repository", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, repoEntry{
@@ -194,7 +196,7 @@ func (s *server) handleListRepos(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "organization not found")
 		return
 	case err != nil:
-		writeErr(w, http.StatusInternalServerError, "list repositories: "+err.Error())
+		s.internalErr(w, r, "list repositories", err)
 		return
 	}
 	assertf(res.Repos != nil, "store returned nil Repos slice")
@@ -234,7 +236,7 @@ func (s *server) handleDeleteRepo(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusConflict, "repository already deleted")
 		return
 	case err != nil:
-		writeErr(w, http.StatusInternalServerError, "delete repository: "+err.Error())
+		s.internalErr(w, r, "delete repository", err)
 		return
 	}
 	assertf(repo.RepoID != "", "store returned deleted repo with empty RepoID")

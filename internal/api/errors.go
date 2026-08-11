@@ -5,6 +5,20 @@ import (
 	"net/http"
 )
 
+// internalErrorMsg is the only 500 body clients ever see: raw error strings
+// (often verbatim DB/driver output) are logged server-side, never leaked
+// onto the wire (docs/03: clients branch on status codes only).
+const internalErrorMsg = "internal error"
+
+// internalErr logs the real error with request context and writes the
+// generic {"error":"internal error"} envelope with status 500.
+func (s *server) internalErr(w http.ResponseWriter, r *http.Request, op string, err error) {
+	assertf(err != nil, "internalErr called with nil error")
+	assertf(op != "", "internalErr called with empty op")
+	s.logger.Error("internal error", "op", op, "method", r.Method, "path", r.URL.Path, "err", err)
+	writeErr(w, http.StatusInternalServerError, internalErrorMsg)
+}
+
 // errorEnvelope is the wire error shape: {"error": "<unstable human string>"}
 // (docs/03). Clients branch on status codes only, never on the message.
 type errorEnvelope struct {
