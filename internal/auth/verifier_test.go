@@ -200,6 +200,49 @@ func TestVerify_Negatives(t *testing.T) {
 	}
 }
 
+// TestVerify_NonCompactSerializations feeds JWS JSON (flattened and general
+// multi-signature) serializations crafted to contain exactly two '.'
+// characters, so they slip past the compact-form pre-check and exercise
+// jws.Parse's JSON auto-detection. Verify must return an error for every
+// variant — never panic (verifier.go once assertf'd on the signature count,
+// turning an attacker-controlled token into a crash).
+func TestVerify_NonCompactSerializations(t *testing.T) {
+	key := mustGenerateKey(t, "ES256")
+	v := NewVerifier(fakeKeySource{"acme": {mustPublicPEM(t, key)}})
+
+	claimsJSON, err := json.Marshal(validClaims("acme"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := b64seg(claimsJSON)
+	protected := b64seg([]byte(`{"alg":"ES256"}`))
+	sig := b64seg([]byte("not-a-real-signature"))
+
+	// The unprotected header value ".." supplies the exactly-two dots the
+	// compact-form pre-check looks for; base64url segments contain none.
+	multiSig := `{"payload":"` + payload + `","signatures":[` +
+		`{"protected":"` + protected + `","header":{"kid":".."},"signature":"` + sig + `"},` +
+		`{"protected":"` + protected + `","signature":"` + sig + `"}]}`
+	flattened := `{"payload":"` + payload + `","protected":"` + protected +
+		`","header":{"kid":".."},"signature":"` + sig + `"}`
+
+	for name, token := range map[string]string{
+		"general multi-signature": multiSig,
+		"flattened":               flattened,
+	} {
+		t.Run(name, func(t *testing.T) {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("Verify panicked on attacker-controlled token: %v", r)
+				}
+			}()
+			if _, err := v.Verify(context.Background(), token); err == nil {
+				t.Error("Verify accepted a non-compact JWS")
+			}
+		})
+	}
+}
+
 // TestVerify_RefsAndOpsPassthrough checks the git-path claims survive
 // verification byte-for-byte (parsing them is the git path's job).
 func TestVerify_RefsAndOpsPassthrough(t *testing.T) {

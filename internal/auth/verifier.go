@@ -83,8 +83,14 @@ func (v *OrgKeyVerifier) Verify(ctx context.Context, token string) (*Claims, err
 	if err != nil {
 		return nil, fmt.Errorf("malformed jwt: %w", err)
 	}
+	// jws.Parse auto-detects JSON serializations, and a JSON-serialized JWS
+	// can contain exactly two '.' characters (e.g. in an unprotected header),
+	// slipping past the compact-form pre-check. Signature count is therefore
+	// attacker-controlled input, not an invariant: reject, never assert.
 	sigs := msg.Signatures()
-	assertf(len(sigs) == 1, "compact JWS parsed to %d signatures", len(sigs))
+	if len(sigs) != 1 {
+		return nil, fmt.Errorf("jwt must have exactly one signature, got %d", len(sigs))
+	}
 	alg, ok := sigs[0].ProtectedHeaders().Algorithm()
 	if !ok {
 		return nil, errors.New("jwt missing alg header")
