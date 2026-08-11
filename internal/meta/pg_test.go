@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -103,6 +104,89 @@ func TestUpsertOrgWithKeys(t *testing.T) {
 	}
 	if !slices.Equal(keys, []string{"pem-c"}) {
 		t.Errorf("keys after replace = %q, want [pem-c]", keys)
+	}
+}
+
+// TestUpsertOrgWithKeysConcurrent is the regression test for the
+// DELETE/INSERT race in UpsertOrgWithKeys: without SELECT ... FOR UPDATE on
+// the org row, two racing upserts can commit a union of their key sets
+// (a blocked DELETE's statement snapshot misses the winner's fresh rows).
+// Writers churn full replacements while readers assert the keyring is always
+// exactly one writer's complete set — never empty, never a union.
+func TestUpsertOrgWithKeysConcurrent(t *testing.T) {
+	ctx := t.Context()
+	const workers = 8
+	const rounds = 5
+
+	keysFor := func(w int) []string {
+		return []string{fmt.Sprintf("pem-%d-a", w), fmt.Sprintf("pem-%d-b", w)}
+	}
+	isOneWriterSet := func(keys []string) bool {
+		for w := range workers {
+			if slices.Equal(keys, keysFor(w)) {
+				return true
+			}
+		}
+		return false
+	}
+
+	// Seed so concurrent readers never hit ErrNotFound.
+	if _, err := testStore.UpsertOrgWithKeys(ctx, t.Name(), keysFor(0)); err != nil {
+		t.Fatalf("seed upsert: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	errs := make(chan error, workers*rounds)
+	for w := range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range rounds {
+				if _, err := testStore.UpsertOrgWithKeys(ctx, t.Name(), keysFor(w)); err != nil {
+					errs <- fmt.Errorf("worker %d: %w", w, err)
+				}
+			}
+		}()
+	}
+
+	done := make(chan struct{})
+	readerErr := make(chan error, 1)
+	go func() {
+		defer close(readerErr)
+		for {
+			select {
+			case <-done:
+				return
+			default:
+			}
+			keys, err := testStore.PublicKeysForOrg(ctx, t.Name())
+			if err != nil {
+				readerErr <- fmt.Errorf("concurrent PublicKeysForOrg: %w", err)
+				return
+			}
+			if !isOneWriterSet(keys) {
+				readerErr <- fmt.Errorf("concurrent reader observed keyring %q, want exactly one writer's set", keys)
+				return
+			}
+		}
+	}()
+
+	wg.Wait()
+	close(errs)
+	close(done)
+	for err := range errs {
+		t.Fatalf("concurrent upsert: %v", err)
+	}
+	if err := <-readerErr; err != nil {
+		t.Fatal(err)
+	}
+
+	keys, err := testStore.PublicKeysForOrg(ctx, t.Name())
+	if err != nil {
+		t.Fatalf("PublicKeysForOrg after churn: %v", err)
+	}
+	if !isOneWriterSet(keys) {
+		t.Fatalf("final keyring = %q, want exactly one writer's set (no union/duplicates)", keys)
 	}
 }
 

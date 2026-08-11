@@ -142,6 +142,12 @@ func scanRepo(row pgx.Row) (Repo, error) {
 
 // UpsertOrgWithKeys idempotently creates the org and replaces its registered
 // PEM public keys (startup bootstrap in single-org mode).
+//
+// The org row is locked (SELECT ... FOR UPDATE) before the DELETE/INSERT of
+// org_public_keys so concurrent upserts (e.g. two replicas booting) serialize:
+// without the lock, a blocked DELETE re-evaluates against a statement snapshot
+// that misses the winner's freshly inserted rows, committing a union of both
+// key sets instead of last-writer-wins replacement.
 func (s *PG) UpsertOrgWithKeys(ctx context.Context, name string, pemPublicKeys []string) (Org, error) {
 	assertf(name != "", "UpsertOrgWithKeys: empty org name")
 	assertf(len(pemPublicKeys) > 0, "UpsertOrgWithKeys: org %q needs at least one public key", name)
@@ -155,7 +161,7 @@ func (s *PG) UpsertOrgWithKeys(ctx context.Context, name string, pemPublicKeys [
 			return err
 		}
 		if err := tx.QueryRow(ctx,
-			`SELECT id, name, created_at FROM orgs WHERE name = $1`, name).
+			`SELECT id, name, created_at FROM orgs WHERE name = $1 FOR UPDATE`, name).
 			Scan(&org.ID, &org.Name, &org.CreatedAt); err != nil {
 			return err
 		}
