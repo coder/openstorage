@@ -1,6 +1,11 @@
-// codestorage is the de-risk spike binary: `serve` runs a stateless git
-// smart-HTTP node; `hook` is re-exec'd by git as pre-receive/update hooks;
-// keygen/mint/list-packs are throwaway dogfooding helpers.
+// codestorage is the service binary: `serve` runs a stateless node exposing
+// the /api/v1 HTTP API (single-org self-host mode) and the git smart-HTTP
+// path; `hook` is re-exec'd by git as pre-receive/update hooks;
+// keygen/mint/list-packs are local dogfooding helpers.
+//
+// Configuration comes from CODESTORAGE_* environment variables, with the
+// phase-0 spike names (SPIKE_*, PG_URL, BLOB_URL) kept as fallback aliases —
+// see config.go.
 package main
 
 import (
@@ -13,6 +18,7 @@ import (
 	"strings"
 	"time"
 
+	"codestorage/internal/auth"
 	"codestorage/internal/blob"
 	"codestorage/internal/ref"
 	"codestorage/internal/spike"
@@ -48,41 +54,37 @@ func fatalf(format string, args ...any) {
 	os.Exit(1)
 }
 
-func mustEnv(name string) string {
-	v := os.Getenv(name)
-	if v == "" {
-		fatalf("required env %s is empty", name)
-	}
-	return v
-}
-
 func cmdServe(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
-	addr := fs.String("addr", "127.0.0.1:0", "listen address (prints 'listening on <addr>')")
-	cacheDir := fs.String("cache-dir", "", "rebuildable cache directory for bare repos")
-	pubKeyPath := fs.String("jwt-pubkey", "", "PEM path of the org's JWT public key")
+	listen := fs.String("listen", "", "listen address (falls back to --addr, then $"+envListen+", then "+defaultListen+")")
+	addr := fs.String("addr", "", "spike-compat alias for --listen")
+	cacheDir := fs.String("cache-dir", "", "rebuildable cache directory for bare repos (default: $TMPDIR/codestorage-cache)")
+	pubKeyPath := fs.String("jwt-pubkey", "", "PEM path of the ES256 public key for the git smart-HTTP path (default: first ECDSA key in $"+envOrgPubKeys+")")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if *cacheDir == "" || *pubKeyPath == "" {
-		return fmt.Errorf("--cache-dir and --jwt-pubkey are required")
-	}
-	if err := os.MkdirAll(*cacheDir, 0o755); err != nil {
-		return err
-	}
-	pub, err := spike.LoadPublicKeyPEM(*pubKeyPath)
+	cfg, err := resolveServeConfig(os.Getenv, *listen, *addr, *cacheDir, *pubKeyPath)
 	if err != nil {
 		return err
 	}
-	st, err := ref.OpenPG(ctx, mustEnv("PG_URL"))
+	// The pre-receive/update hooks re-exec this binary with the server's
+	// inherited environment and read the legacy names (internal/spike/hook.go),
+	// so propagate the resolved values regardless of which alias set them.
+	for _, kv := range [][2]string{{"PG_URL", cfg.pgURL}, {"BLOB_URL", cfg.blobURL}} {
+		if err := os.Setenv(kv[0], kv[1]); err != nil {
+			return err
+		}
+	}
+
+	st, err := ref.OpenPG(ctx, cfg.pgURL)
 	if err != nil {
 		return err
 	}
 	defer st.Close()
 	if err := st.InitSchema(ctx); err != nil {
-		return fmt.Errorf("init schema: %w", err)
+		return fmt.Errorf("init ref schema: %w", err)
 	}
-	bl, err := blob.OpenS3(ctx, mustEnv("BLOB_URL"))
+	bl, err := blob.OpenS3(ctx, cfg.blobURL)
 	if err != nil {
 		return err
 	}
@@ -91,13 +93,59 @@ func cmdServe(ctx context.Context, args []string) error {
 		return err
 	}
 
-	srv := spike.NewServer(st, bl, *cacheDir, pub)
-	ln, err := net.Listen("tcp", *addr)
+	mux := http.NewServeMux()
+	mounted := 0
+
+	// HTTP API (single-org self-host mode), enabled by CODESTORAGE_ORG.
+	var orgPEMBlocks []string
+	if cfg.org != "" {
+		pemData, err := os.ReadFile(cfg.orgKeysPath)
+		if err != nil {
+			return err
+		}
+		// Validate every block up front (crash early on bad key material).
+		if _, err := auth.ParsePublicKeysPEM(pemData); err != nil {
+			return fmt.Errorf("%s: %w", cfg.orgKeysPath, err)
+		}
+		orgPEMBlocks, err = splitPEMBlocks(pemData)
+		if err != nil {
+			return fmt.Errorf("%s: %w", cfg.orgKeysPath, err)
+		}
+		apiHandler, cleanup, err := buildAPIHandler(ctx, cfg.pgURL, cfg.org, orgPEMBlocks)
+		if err != nil {
+			return err
+		}
+		defer cleanup()
+		mux.Handle("/api/v1/", apiHandler)
+		mounted++
+	}
+
+	// Git smart-HTTP path (spike fallback), mounted when an ECDSA key is
+	// available from --jwt-pubkey or the org key set.
+	gitPub, err := resolveGitPublicKey(cfg.gitPubKeyPath, orgPEMBlocks)
+	if err != nil {
+		return err
+	}
+	if gitPub != nil {
+		if err := os.MkdirAll(cfg.cacheDir, 0o755); err != nil {
+			return err
+		}
+		srv := spike.NewServer(st, bl, cfg.cacheDir, gitPub)
+		mux.Handle("/", srv.Handler())
+		mounted++
+	} else {
+		fmt.Fprintln(os.Stderr, "git smart-HTTP path disabled: no ECDSA public key (pass --jwt-pubkey or include one in $"+envOrgPubKeys+")")
+	}
+	// resolveServeConfig guarantees at least one of org/gitPubKeyPath, and an
+	// explicit --jwt-pubkey either loads or errors above.
+	assertf(mounted > 0, "serve resolved a config with nothing mounted")
+
+	ln, err := net.Listen("tcp", cfg.listen)
 	if err != nil {
 		return err
 	}
 	fmt.Printf("listening on %s\n", ln.Addr())
-	return http.Serve(ln, srv.Handler())
+	return http.Serve(ln, mux)
 }
 
 func cmdKeygen(args []string) error {
@@ -156,7 +204,11 @@ func cmdListPacks(ctx context.Context, args []string) error {
 	if *repo == "" {
 		return fmt.Errorf("--repo is required")
 	}
-	bl, err := blob.OpenS3(ctx, mustEnv("BLOB_URL"))
+	blobURL := envFirst(os.Getenv, envBlobURL...)
+	if blobURL == "" {
+		return fmt.Errorf("blob URL required: set %s (or legacy %s)", envBlobURL[0], envBlobURL[2])
+	}
+	bl, err := blob.OpenS3(ctx, blobURL)
 	if err != nil {
 		return err
 	}
