@@ -1,0 +1,521 @@
+// SQLite implementation of Backend for local mode: the serve process and
+// re-exec'd hook processes share one DB file on the same host, so the DSN
+// forces WAL + busy_timeout, and _txlock=immediate turns every explicit
+// transaction into BEGIN IMMEDIATE (no deferred→write lock upgrade
+// deadlocks) — that write-serialization is what replaces PG's
+// SELECT ... FOR UPDATE row lock in UpsertOrgWithKeys.
+//
+// Semantics mirror pg.go 1:1: same sentinels, soft delete with the 404/409
+// distinction, UNIQUE(org_id, url) spanning soft-deleted rows, and the same
+// opaque cursors. Timestamps are stored as INTEGER unixnano set Go-side (not
+// SQL defaults) so the "<unixnano>|<repo_id>" cursor round-trips exactly and
+// the keyset (created_at, repo_id) < (?, ?) row-value comparison maps onto
+// the stored integers with no precision loss.
+
+package meta
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"modernc.org/sqlite"
+	sqlite3 "modernc.org/sqlite/lib"
+)
+
+// sqliteDSN builds the modernc.org/sqlite DSN for a DB file path. The
+// _pragma values apply to every pooled connection, so serve and hook
+// processes all agree on WAL + a 5s busy handler.
+func sqliteDSN(path string) string {
+	return "file:" + path +
+		"?_pragma=journal_mode(WAL)" +
+		"&_pragma=busy_timeout(5000)" +
+		"&_pragma=foreign_keys(1)" +
+		"&_txlock=immediate"
+}
+
+// SQLite implements Backend on one local SQLite file via the pure-Go
+// modernc.org/sqlite driver (cgo-free cross-compiled single binaries).
+type SQLite struct {
+	db *sql.DB
+}
+
+var _ Backend = (*SQLite)(nil)
+
+// OpenSQLite opens sqlite:///abs/path/db.sqlite. The path is everything
+// after "sqlite://" (relative paths are tolerated; --data-dir always derives
+// absolute ones). Parent directories are created; the DB file itself is
+// created by the driver on first open.
+func OpenSQLite(ctx context.Context, sqliteURL string) (*SQLite, error) {
+	assertf(sqliteURL != "", "OpenSQLite: empty sqlite URL")
+	path, ok := strings.CutPrefix(sqliteURL, "sqlite://")
+	if !ok || path == "" {
+		return nil, fmt.Errorf("sqlite URL %q: want sqlite:///path/to/db.sqlite", sqliteURL)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return nil, fmt.Errorf("sqlite mkdir for %s: %w", path, err)
+	}
+	db, err := sql.Open("sqlite", sqliteDSN(path))
+	if err != nil {
+		return nil, fmt.Errorf("sqlite open %s: %w", path, err)
+	}
+	if err := db.PingContext(ctx); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("sqlite ping %s: %w", path, err)
+	}
+	return &SQLite{db: db}, nil
+}
+
+func (s *SQLite) Close() { _ = s.db.Close() }
+
+// InitSchema creates the metadata tables (idempotent). No advisory lock
+// (unlike PG): SQLite's file lock + busy_timeout serialize concurrent
+// startups, and CREATE TABLE IF NOT EXISTS is race-free under that lock.
+func (s *SQLite) InitSchema(ctx context.Context) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("sqlite init begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	// Column names match pg.go so the row SQL stays byte-comparable; all
+	// timestamps are INTEGER unixnano written Go-side (see file comment).
+	// AUTOINCREMENT keeps ids monotonic like PG identity columns, so
+	// ORDER BY id remains registration order even after deletes.
+	for _, stmt := range []string{
+		`CREATE TABLE IF NOT EXISTS orgs (
+		    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+		    name       TEXT NOT NULL UNIQUE,
+		    created_at INTEGER NOT NULL
+		)`,
+		`CREATE TABLE IF NOT EXISTS org_public_keys (
+		    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+		    org_id     INTEGER NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
+		    pem        TEXT NOT NULL,
+		    created_at INTEGER NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS org_public_keys_org_idx ON org_public_keys (org_id)`,
+		// Commit-signing keys for verify-sig (docs/02): SSH public key lines
+		// or ASCII-armored PGP public key blocks, read fresh on every push.
+		`CREATE TABLE IF NOT EXISTS org_signing_keys (
+		    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+		    org_id     INTEGER NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
+		    key_text   TEXT NOT NULL,
+		    created_at INTEGER NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS org_signing_keys_org_idx ON org_signing_keys (org_id)`,
+		`CREATE TABLE IF NOT EXISTS repos (
+		    repo_id        TEXT PRIMARY KEY,
+		    org_id         INTEGER NOT NULL REFERENCES orgs(id),
+		    url            TEXT NOT NULL,
+		    default_branch TEXT NOT NULL,
+		    created_at     INTEGER NOT NULL,
+		    deleted_at     INTEGER,
+		    CONSTRAINT repos_org_id_url_key UNIQUE (org_id, url)
+		)`,
+		// Keyset pagination index for ListRepos (live rows only).
+		`CREATE INDEX IF NOT EXISTS repos_org_created_idx
+		    ON repos (org_id, created_at DESC, repo_id DESC) WHERE deleted_at IS NULL`,
+	} {
+		if _, err := tx.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("sqlite init schema: %w", err)
+		}
+	}
+	return tx.Commit()
+}
+
+// nowNano returns the current instant as stored (unixnano) plus its exact
+// time.Time rendering, so returned rows byte-match later reads.
+func nowNano() (int64, time.Time) {
+	nanos := time.Now().UnixNano()
+	return nanos, time.Unix(0, nanos).UTC()
+}
+
+// isUniqueViolation reports whether err is SQLITE_CONSTRAINT_UNIQUE (the
+// modernc analogue of PG SQLSTATE 23505).
+func isUniqueViolation(err error) bool {
+	var serr *sqlite.Error
+	return errors.As(err, &serr) && serr.Code() == sqlite3.SQLITE_CONSTRAINT_UNIQUE
+}
+
+// lookupOrgID resolves an org name to its id; ErrNotFound for unknown orgs.
+func (s *SQLite) lookupOrgID(ctx context.Context, name string) (int64, error) {
+	assertf(name != "", "lookupOrgID: empty org name")
+	var id int64
+	err := s.db.QueryRowContext(ctx, `SELECT id FROM orgs WHERE name = ?`, name).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, fmt.Errorf("org %q: %w", name, ErrNotFound)
+	}
+	if err != nil {
+		return 0, fmt.Errorf("lookup org %q: %w", name, err)
+	}
+	assertf(id > 0, "org %q resolved to non-positive id %d", name, id)
+	return id, nil
+}
+
+// sqlRow is the shared Scan surface of *sql.Row and *sql.Rows.
+type sqlRow interface{ Scan(dest ...any) error }
+
+// scanRepoSQLite scans one row of repoCols, converting the INTEGER unixnano
+// timestamps back to UTC time.Time per the Repo contract.
+func scanRepoSQLite(row sqlRow) (Repo, error) {
+	var r Repo
+	var createdAt int64
+	var deletedAt sql.NullInt64
+	if err := row.Scan(&r.RepoID, &r.OrgID, &r.URL, &r.DefaultBranch, &createdAt, &deletedAt); err != nil {
+		return Repo{}, err
+	}
+	r.CreatedAt = time.Unix(0, createdAt).UTC()
+	if deletedAt.Valid {
+		utc := time.Unix(0, deletedAt.Int64).UTC()
+		r.DeletedAt = &utc
+	}
+	return r, nil
+}
+
+// UpsertOrgWithKeys idempotently creates the org and replaces its registered
+// PEM public keys (startup bootstrap in single-org mode).
+//
+// PG locks the org row (SELECT ... FOR UPDATE) so concurrent upserts
+// serialize; here _txlock=immediate makes the whole transaction a write
+// transaction from BEGIN, and SQLite allows only one writer at a time, so
+// the DELETE/INSERT replacement is last-writer-wins by construction.
+func (s *SQLite) UpsertOrgWithKeys(ctx context.Context, name string, pemPublicKeys []string) (Org, error) {
+	assertf(name != "", "UpsertOrgWithKeys: empty org name")
+	assertf(len(pemPublicKeys) > 0, "UpsertOrgWithKeys: org %q needs at least one public key", name)
+	for i, pem := range pemPublicKeys {
+		assertf(strings.TrimSpace(pem) != "", "UpsertOrgWithKeys: blank PEM block %d for org %q", i, name)
+	}
+	nanos, _ := nowNano()
+	var org Org
+	err := s.inTx(ctx, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO orgs (name, created_at) VALUES (?, ?) ON CONFLICT (name) DO NOTHING`,
+			name, nanos); err != nil {
+			return err
+		}
+		var createdAt int64
+		if err := tx.QueryRowContext(ctx,
+			`SELECT id, name, created_at FROM orgs WHERE name = ?`, name).
+			Scan(&org.ID, &org.Name, &createdAt); err != nil {
+			return err
+		}
+		org.CreatedAt = time.Unix(0, createdAt).UTC()
+		if _, err := tx.ExecContext(ctx, `DELETE FROM org_public_keys WHERE org_id = ?`, org.ID); err != nil {
+			return err
+		}
+		for _, pem := range pemPublicKeys {
+			if _, err := tx.ExecContext(ctx,
+				`INSERT INTO org_public_keys (org_id, pem, created_at) VALUES (?, ?, ?)`,
+				org.ID, pem, nanos); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return Org{}, fmt.Errorf("upsert org %q: %w", name, err)
+	}
+	return org, nil
+}
+
+// inTx runs fn inside one BEGIN IMMEDIATE transaction (via _txlock),
+// committing on nil and rolling back on error.
+func (s *SQLite) inTx(ctx context.Context, fn func(tx *sql.Tx) error) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := fn(tx); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// PublicKeysForOrg returns the org's registered PEM public key blocks in
+// registration order.
+func (s *SQLite) PublicKeysForOrg(ctx context.Context, name string) ([]string, error) {
+	orgID, err := s.lookupOrgID(ctx, name)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT pem FROM org_public_keys WHERE org_id = ? ORDER BY id`, orgID)
+	if err != nil {
+		return nil, fmt.Errorf("keys for org %q: %w", name, err)
+	}
+	defer rows.Close()
+	var pems []string
+	for rows.Next() {
+		var pem string
+		if err := rows.Scan(&pem); err != nil {
+			return nil, err
+		}
+		pems = append(pems, pem)
+	}
+	return pems, rows.Err()
+}
+
+// CreateRepo inserts a live repo with a server-generated RepoID.
+// ErrAlreadyExists when (org, url) is taken — even by a soft-deleted row.
+func (s *SQLite) CreateRepo(ctx context.Context, org, url, defaultBranch string) (Repo, error) {
+	assertf(url != "", "CreateRepo: empty url for org %q", org)
+	assertf(defaultBranch != "", "CreateRepo: empty default branch for %q (caller defaults to main)", url)
+	orgID, err := s.lookupOrgID(ctx, org)
+	if err != nil {
+		return Repo{}, err
+	}
+	nanos, createdAt := nowNano()
+	r := Repo{RepoID: newRepoID(), OrgID: orgID, URL: url, DefaultBranch: defaultBranch, CreatedAt: createdAt}
+	_, err = s.db.ExecContext(ctx,
+		`INSERT INTO repos (repo_id, org_id, url, default_branch, created_at) VALUES (?, ?, ?, ?, ?)`,
+		r.RepoID, orgID, url, defaultBranch, nanos)
+	// A unique violation here can only be (org_id, url): a repo_id collision
+	// would be SQLITE_CONSTRAINT_PRIMARYKEY, a different extended code.
+	if isUniqueViolation(err) {
+		return Repo{}, fmt.Errorf("repo %q in org %q: %w", url, org, ErrAlreadyExists)
+	}
+	if err != nil {
+		return Repo{}, fmt.Errorf("create repo %q in org %q: %w", url, org, err)
+	}
+	return r, nil
+}
+
+// GetRepoByURL returns the live repo with the given url; ErrNotFound when
+// absent or soft-deleted.
+func (s *SQLite) GetRepoByURL(ctx context.Context, org, url string) (Repo, error) {
+	assertf(url != "", "GetRepoByURL: empty url for org %q", org)
+	orgID, err := s.lookupOrgID(ctx, org)
+	if err != nil {
+		return Repo{}, err
+	}
+	r, err := scanRepoSQLite(s.db.QueryRowContext(ctx,
+		`SELECT `+repoCols+` FROM repos WHERE org_id = ? AND url = ? AND deleted_at IS NULL`,
+		orgID, url))
+	if errors.Is(err, sql.ErrNoRows) {
+		return Repo{}, fmt.Errorf("repo %q in org %q: %w", url, org, ErrNotFound)
+	}
+	if err != nil {
+		return Repo{}, fmt.Errorf("get repo %q in org %q: %w", url, org, err)
+	}
+	assertf(r.DeletedAt == nil, "live-repo query returned soft-deleted row %q", r.RepoID)
+	return r, nil
+}
+
+// GetRepoByID returns the live repo with the given RepoID; ErrNotFound when
+// absent or soft-deleted.
+func (s *SQLite) GetRepoByID(ctx context.Context, org, repoID string) (Repo, error) {
+	assertf(repoID != "", "GetRepoByID: empty repoID for org %q", org)
+	orgID, err := s.lookupOrgID(ctx, org)
+	if err != nil {
+		return Repo{}, err
+	}
+	r, err := scanRepoSQLite(s.db.QueryRowContext(ctx,
+		`SELECT `+repoCols+` FROM repos WHERE org_id = ? AND repo_id = ? AND deleted_at IS NULL`,
+		orgID, repoID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return Repo{}, fmt.Errorf("repo id %q in org %q: %w", repoID, org, ErrNotFound)
+	}
+	if err != nil {
+		return Repo{}, fmt.Errorf("get repo id %q in org %q: %w", repoID, org, err)
+	}
+	assertf(r.DeletedAt == nil, "live-repo query returned soft-deleted row %q", r.RepoID)
+	return r, nil
+}
+
+// SoftDeleteRepo sets deleted_at and returns the affected repo. ErrNotFound
+// when no row exists; ErrAlreadyDeleted when already soft-deleted.
+func (s *SQLite) SoftDeleteRepo(ctx context.Context, org, url string) (Repo, error) {
+	assertf(url != "", "SoftDeleteRepo: empty url for org %q", org)
+	orgID, err := s.lookupOrgID(ctx, org)
+	if err != nil {
+		return Repo{}, err
+	}
+	nanos, _ := nowNano()
+	var repo Repo
+	err = s.inTx(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx,
+			`UPDATE repos SET deleted_at = ?
+			 WHERE org_id = ? AND url = ? AND deleted_at IS NULL`, nanos, orgID, url)
+		if err != nil {
+			return err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		assertf(n == 0 || n == 1, "soft delete of %q/%q affected %d rows", org, url, n)
+		if n == 1 {
+			r, err := scanRepoSQLite(tx.QueryRowContext(ctx,
+				`SELECT `+repoCols+` FROM repos WHERE org_id = ? AND url = ?`, orgID, url))
+			if err != nil {
+				return err
+			}
+			assertf(r.DeletedAt != nil, "soft delete of %q returned nil deleted_at", r.RepoID)
+			repo = r
+			return nil
+		}
+		// No live row matched: distinguish already-deleted (409) from absent
+		// (404). The transaction is a write transaction (BEGIN IMMEDIATE), so
+		// no live row can appear between the two statements.
+		var deletedAt sql.NullInt64
+		err = tx.QueryRowContext(ctx,
+			`SELECT deleted_at FROM repos WHERE org_id = ? AND url = ?`, orgID, url).Scan(&deletedAt)
+		if errors.Is(err, sql.ErrNoRows) || (err == nil && !deletedAt.Valid) {
+			return ErrNotFound
+		}
+		if err != nil {
+			return err
+		}
+		return ErrAlreadyDeleted
+	})
+	if err != nil {
+		return Repo{}, fmt.Errorf("delete repo %q in org %q: %w", url, org, err)
+	}
+	return repo, nil
+}
+
+// AddSigningKey registers a commit-signing key for the org and returns the
+// stored row. Format validation (SSH line / armored PGP block) is the
+// caller's responsibility per the Store contract; the text is stored
+// verbatim.
+func (s *SQLite) AddSigningKey(ctx context.Context, org, keyText string) (SigningKey, error) {
+	assertf(strings.TrimSpace(keyText) != "", "AddSigningKey: blank key text for org %q", org)
+	orgID, err := s.lookupOrgID(ctx, org)
+	if err != nil {
+		return SigningKey{}, err
+	}
+	nanos, createdAt := nowNano()
+	k := SigningKey{OrgID: orgID, KeyText: keyText, CreatedAt: createdAt}
+	res, err := s.db.ExecContext(ctx,
+		`INSERT INTO org_signing_keys (org_id, key_text, created_at) VALUES (?, ?, ?)`,
+		orgID, keyText, nanos)
+	if err != nil {
+		return SigningKey{}, fmt.Errorf("add signing key for org %q: %w", org, err)
+	}
+	k.ID, err = res.LastInsertId()
+	if err != nil {
+		return SigningKey{}, fmt.Errorf("add signing key for org %q: %w", org, err)
+	}
+	assertf(k.ID > 0, "signing key insert returned non-positive id %d", k.ID)
+	return k, nil
+}
+
+// SigningKeysForOrg returns the org's registered signing keys in
+// registration order; empty slice when none are registered.
+func (s *SQLite) SigningKeysForOrg(ctx context.Context, org string) ([]SigningKey, error) {
+	orgID, err := s.lookupOrgID(ctx, org)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, org_id, key_text, created_at FROM org_signing_keys
+		 WHERE org_id = ? ORDER BY id`, orgID)
+	if err != nil {
+		return nil, fmt.Errorf("signing keys for org %q: %w", org, err)
+	}
+	defer rows.Close()
+	keys := []SigningKey{}
+	for rows.Next() {
+		var k SigningKey
+		var createdAt int64
+		if err := rows.Scan(&k.ID, &k.OrgID, &k.KeyText, &createdAt); err != nil {
+			return nil, err
+		}
+		k.CreatedAt = time.Unix(0, createdAt).UTC()
+		keys = append(keys, k)
+	}
+	return keys, rows.Err()
+}
+
+// RemoveSigningKey deletes the signing key with the given ID. ErrNotFound
+// when the org is unknown or the ID does not belong to it.
+func (s *SQLite) RemoveSigningKey(ctx context.Context, org string, id int64) error {
+	assertf(id > 0, "RemoveSigningKey: non-positive id %d for org %q", id, org)
+	orgID, err := s.lookupOrgID(ctx, org)
+	if err != nil {
+		return err
+	}
+	res, err := s.db.ExecContext(ctx,
+		`DELETE FROM org_signing_keys WHERE org_id = ? AND id = ?`, orgID, id)
+	if err != nil {
+		return fmt.Errorf("remove signing key %d for org %q: %w", id, org, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("remove signing key %d for org %q: %w", id, org, err)
+	}
+	if n == 0 {
+		return fmt.Errorf("signing key %d for org %q: %w", id, org, ErrNotFound)
+	}
+	assertf(n == 1, "DELETE by primary key affected %d rows", n)
+	return nil
+}
+
+// ListRepos pages live repos for the org, keyset-ordered by
+// (created_at DESC, repo_id DESC).
+//
+// PG's `url ILIKE ?` becomes `lower(url) LIKE lower(?) ESCAPE '\'`. SQLite's
+// lower() only folds ASCII, so non-ASCII urls match case-sensitively here
+// while PG ILIKE folds per locale — an accepted divergence for local mode.
+func (s *SQLite) ListRepos(ctx context.Context, org string, params ListParams) (ListResult, error) {
+	// Limit is validated/clamped by the HTTP handler per the Store contract
+	// (default 20, max 100); a value outside [1,100] is a caller bug.
+	assertf(params.Limit >= 1 && params.Limit <= 100,
+		"ListRepos: limit %d outside contract range [1,100]", params.Limit)
+	orgID, err := s.lookupOrgID(ctx, org)
+	if err != nil {
+		return ListResult{}, err
+	}
+
+	query := `SELECT ` + repoCols + ` FROM repos WHERE org_id = ? AND deleted_at IS NULL`
+	args := []any{orgID}
+	if params.Q != "" {
+		args = append(args, "%"+escapeLike(params.Q)+"%")
+		query += ` AND lower(url) LIKE lower(?) ESCAPE '\'`
+	}
+	if params.Cursor != "" {
+		createdAt, repoID, err := decodeCursor(params.Cursor)
+		if err != nil {
+			return ListResult{}, err
+		}
+		// The cursor's unixnano compares exactly against the stored INTEGER.
+		args = append(args, createdAt.UnixNano(), repoID)
+		query += ` AND (created_at, repo_id) < (?, ?)`
+	}
+	// Fetch one extra row to compute HasMore without a second query.
+	args = append(args, params.Limit+1)
+	query += ` ORDER BY created_at DESC, repo_id DESC LIMIT ?`
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return ListResult{}, fmt.Errorf("list repos for org %q: %w", org, err)
+	}
+	defer rows.Close()
+	repos := make([]Repo, 0, params.Limit+1)
+	for rows.Next() {
+		r, err := scanRepoSQLite(rows)
+		if err != nil {
+			return ListResult{}, err
+		}
+		repos = append(repos, r)
+	}
+	if err := rows.Err(); err != nil {
+		return ListResult{}, err
+	}
+	assertf(len(repos) <= params.Limit+1, "LIMIT %d query returned %d rows", params.Limit+1, len(repos))
+
+	res := ListResult{Repos: repos}
+	if len(repos) > params.Limit {
+		res.Repos = repos[:params.Limit]
+		last := res.Repos[params.Limit-1]
+		res.NextCursor = encodeCursor(last.CreatedAt, last.RepoID)
+		res.HasMore = true
+	}
+	return res, nil
+}

@@ -13,10 +13,6 @@ import (
 	"fmt"
 	"net/url"
 	"time"
-
-	// Registers the pure-Go "sqlite" database/sql driver the sqlite backend
-	// opens (cgo-free cross-compiled single binaries).
-	_ "modernc.org/sqlite"
 )
 
 // Sentinel errors implementations must return (possibly wrapped; callers
@@ -159,7 +155,7 @@ func Open(ctx context.Context, dbURL string) (Backend, error) {
 	case "postgres", "postgresql":
 		return OpenPG(ctx, dbURL)
 	case "sqlite":
-		return nil, fmt.Errorf("metadata store scheme %q not implemented yet", u.Scheme)
+		return OpenSQLite(ctx, dbURL)
 	default:
 		return nil, fmt.Errorf("metadata store URL scheme %q unsupported (want postgres, postgresql, or sqlite)", u.Scheme)
 	}

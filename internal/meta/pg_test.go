@@ -1,5 +1,8 @@
-// Containerized store tests: testcontainers-go boots one real Postgres for
-// the package; each test isolates itself with a unique org name (t.Name()).
+// Backend conformance tests: every test body takes a Backend and fans out
+// over both implementations via runBackends (pg/sqlite subtests). The PG
+// lane boots one testcontainers-go Postgres for the whole package — lazily,
+// so sqlite-filtered runs (-run '/sqlite') boot zero containers. Each test
+// isolates itself with a unique org name (t.Name() is subtest-unique).
 package meta
 
 import (
@@ -17,64 +20,97 @@ import (
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 )
 
-var testStore *PG
+var (
+	pgOnce    sync.Once
+	pgErr     error
+	pgStore   *PG
+	pgCleanup []func()
+)
 
-func TestMain(m *testing.M) {
-	os.Exit(testMainInner(m))
+// pgBackend lazily boots the package-wide Postgres container and store.
+// The concurrent InitSchema exercise lives here (not in TestMain) so it
+// only runs when a pg lane actually executes.
+func pgBackend(t *testing.T) Backend {
+	t.Helper()
+	pgOnce.Do(func() {
+		ctx := context.Background()
+
+		pgC, err := tcpostgres.Run(ctx, "postgres:17-alpine",
+			tcpostgres.WithDatabase("postgres"),
+			tcpostgres.WithUsername("postgres"),
+			tcpostgres.WithPassword("postgres"),
+			tcpostgres.BasicWaitStrategies(),
+		)
+		if err != nil {
+			pgErr = fmt.Errorf("start postgres container: %w", err)
+			return
+		}
+		pgCleanup = append(pgCleanup, func() { _ = pgC.Terminate(ctx) })
+
+		pgURL, err := pgC.ConnectionString(ctx, "sslmode=disable")
+		if err != nil {
+			pgErr = err
+			return
+		}
+		store, err := OpenPG(ctx, pgURL)
+		if err != nil {
+			pgErr = err
+			return
+		}
+		pgCleanup = append(pgCleanup, store.Close)
+
+		// Concurrent InitSchema on a fresh database exercises the
+		// advisory-lock serialization (and idempotency: every call runs the
+		// full DDL).
+		errs := make(chan error, 4)
+		for range 4 {
+			go func() { errs <- store.InitSchema(ctx) }()
+		}
+		for range 4 {
+			if err := <-errs; err != nil {
+				pgErr = fmt.Errorf("concurrent InitSchema: %w", err)
+				return
+			}
+		}
+		pgStore = store
+	})
+	if pgErr != nil {
+		t.Fatalf("pg backend: %v", pgErr)
+	}
+	return pgStore
 }
 
-func testMainInner(m *testing.M) int {
-	ctx := context.Background()
+func TestMain(m *testing.M) {
+	code := m.Run()
+	for i := len(pgCleanup) - 1; i >= 0; i-- {
+		pgCleanup[i]()
+	}
+	os.Exit(code)
+}
 
-	pgC, err := tcpostgres.Run(ctx, "postgres:17-alpine",
-		tcpostgres.WithDatabase("postgres"),
-		tcpostgres.WithUsername("postgres"),
-		tcpostgres.WithPassword("postgres"),
-		tcpostgres.BasicWaitStrategies(),
-	)
-	if err != nil {
-		panic("start postgres container: " + err.Error())
-	}
-	defer func() { _ = pgC.Terminate(ctx) }()
-	pgURL, err := pgC.ConnectionString(ctx, "sslmode=disable")
-	if err != nil {
-		panic(err)
-	}
-
-	testStore, err = OpenPG(ctx, pgURL)
-	if err != nil {
-		panic(err)
-	}
-	defer testStore.Close()
-
-	// Concurrent InitSchema on a fresh database exercises the advisory-lock
-	// serialization (and idempotency: every call runs the full DDL).
-	errs := make(chan error, 4)
-	for range 4 {
-		go func() { errs <- testStore.InitSchema(ctx) }()
-	}
-	for range 4 {
-		if err := <-errs; err != nil {
-			panic("concurrent InitSchema: " + err.Error())
-		}
-	}
-
-	return m.Run()
+// runBackends fans one conformance test body out over both Backend
+// implementations. The pg lane shares one container-wide store (tests
+// isolate by org name); the sqlite lane gets a fresh DB file per subtest.
+func runBackends(t *testing.T, fn func(t *testing.T, s Backend)) {
+	t.Run("pg", func(t *testing.T) { fn(t, pgBackend(t)) })
+	t.Run("sqlite", func(t *testing.T) { fn(t, sqliteBackend(t)) })
 }
 
 // seedOrg registers a test-unique org with one dummy key and returns its name.
-func seedOrg(t *testing.T) string {
+func seedOrg(t *testing.T, s Backend) string {
 	t.Helper()
 	name := t.Name()
-	if _, err := testStore.UpsertOrgWithKeys(t.Context(), name, []string{"-----BEGIN PUBLIC KEY-----\ndummy\n-----END PUBLIC KEY-----\n"}); err != nil {
+	if _, err := s.UpsertOrgWithKeys(t.Context(), name, []string{"-----BEGIN PUBLIC KEY-----\ndummy\n-----END PUBLIC KEY-----\n"}); err != nil {
 		t.Fatalf("seed org %q: %v", name, err)
 	}
 	return name
 }
 
-func TestUpsertOrgWithKeys(t *testing.T) {
+func TestUpsertOrgWithKeys(t *testing.T) { runBackends(t, testUpsertOrgWithKeys) }
+
+func testUpsertOrgWithKeys(t *testing.T, s Backend) {
 	ctx := t.Context()
-	org1, err := testStore.UpsertOrgWithKeys(ctx, t.Name(), []string{"pem-a", "pem-b"})
+	org1, err := s.UpsertOrgWithKeys(ctx, t.Name(), []string{"pem-a", "pem-b"})
 	if err != nil {
 		t.Fatalf("first upsert: %v", err)
 	}
@@ -82,7 +118,7 @@ func TestUpsertOrgWithKeys(t *testing.T) {
 		t.Fatalf("bad org row: %+v", org1)
 	}
 
-	keys, err := testStore.PublicKeysForOrg(ctx, t.Name())
+	keys, err := s.PublicKeysForOrg(ctx, t.Name())
 	if err != nil {
 		t.Fatalf("PublicKeysForOrg: %v", err)
 	}
@@ -91,14 +127,14 @@ func TestUpsertOrgWithKeys(t *testing.T) {
 	}
 
 	// Re-upsert: same org id, keys fully replaced.
-	org2, err := testStore.UpsertOrgWithKeys(ctx, t.Name(), []string{"pem-c"})
+	org2, err := s.UpsertOrgWithKeys(ctx, t.Name(), []string{"pem-c"})
 	if err != nil {
 		t.Fatalf("second upsert: %v", err)
 	}
 	if org2.ID != org1.ID {
 		t.Errorf("upsert changed org id: %d -> %d", org1.ID, org2.ID)
 	}
-	keys, err = testStore.PublicKeysForOrg(ctx, t.Name())
+	keys, err = s.PublicKeysForOrg(ctx, t.Name())
 	if err != nil {
 		t.Fatalf("PublicKeysForOrg after replace: %v", err)
 	}
@@ -108,12 +144,15 @@ func TestUpsertOrgWithKeys(t *testing.T) {
 }
 
 // TestUpsertOrgWithKeysConcurrent is the regression test for the
-// DELETE/INSERT race in UpsertOrgWithKeys: without SELECT ... FOR UPDATE on
-// the org row, two racing upserts can commit a union of their key sets
-// (a blocked DELETE's statement snapshot misses the winner's fresh rows).
-// Writers churn full replacements while readers assert the keyring is always
-// exactly one writer's complete set — never empty, never a union.
-func TestUpsertOrgWithKeysConcurrent(t *testing.T) {
+// DELETE/INSERT race in UpsertOrgWithKeys: without write-transaction
+// serialization (PG: SELECT ... FOR UPDATE on the org row; SQLite: BEGIN
+// IMMEDIATE via _txlock), two racing upserts can commit a union of their key
+// sets (a blocked DELETE's statement snapshot misses the winner's fresh
+// rows). Writers churn full replacements while readers assert the keyring is
+// always exactly one writer's complete set — never empty, never a union.
+func TestUpsertOrgWithKeysConcurrent(t *testing.T) { runBackends(t, testUpsertOrgWithKeysConcurrent) }
+
+func testUpsertOrgWithKeysConcurrent(t *testing.T, s Backend) {
 	ctx := t.Context()
 	const workers = 8
 	const rounds = 5
@@ -131,7 +170,7 @@ func TestUpsertOrgWithKeysConcurrent(t *testing.T) {
 	}
 
 	// Seed so concurrent readers never hit ErrNotFound.
-	if _, err := testStore.UpsertOrgWithKeys(ctx, t.Name(), keysFor(0)); err != nil {
+	if _, err := s.UpsertOrgWithKeys(ctx, t.Name(), keysFor(0)); err != nil {
 		t.Fatalf("seed upsert: %v", err)
 	}
 
@@ -142,7 +181,7 @@ func TestUpsertOrgWithKeysConcurrent(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for range rounds {
-				if _, err := testStore.UpsertOrgWithKeys(ctx, t.Name(), keysFor(w)); err != nil {
+				if _, err := s.UpsertOrgWithKeys(ctx, t.Name(), keysFor(w)); err != nil {
 					errs <- fmt.Errorf("worker %d: %w", w, err)
 				}
 			}
@@ -159,7 +198,7 @@ func TestUpsertOrgWithKeysConcurrent(t *testing.T) {
 				return
 			default:
 			}
-			keys, err := testStore.PublicKeysForOrg(ctx, t.Name())
+			keys, err := s.PublicKeysForOrg(ctx, t.Name())
 			if err != nil {
 				readerErr <- fmt.Errorf("concurrent PublicKeysForOrg: %w", err)
 				return
@@ -181,7 +220,7 @@ func TestUpsertOrgWithKeysConcurrent(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	keys, err := testStore.PublicKeysForOrg(ctx, t.Name())
+	keys, err := s.PublicKeysForOrg(ctx, t.Name())
 	if err != nil {
 		t.Fatalf("PublicKeysForOrg after churn: %v", err)
 	}
@@ -190,19 +229,23 @@ func TestUpsertOrgWithKeysConcurrent(t *testing.T) {
 	}
 }
 
-func TestPublicKeysForOrgUnknown(t *testing.T) {
-	_, err := testStore.PublicKeysForOrg(t.Context(), "no-such-org-"+t.Name())
+func TestPublicKeysForOrgUnknown(t *testing.T) { runBackends(t, testPublicKeysForOrgUnknown) }
+
+func testPublicKeysForOrgUnknown(t *testing.T, s Backend) {
+	_, err := s.PublicKeysForOrg(t.Context(), "no-such-org-"+t.Name())
 	if !errors.Is(err, ErrNotFound) {
 		t.Errorf("err = %v, want ErrNotFound", err)
 	}
 }
 
-func TestSigningKeys(t *testing.T) {
+func TestSigningKeys(t *testing.T) { runBackends(t, testSigningKeys) }
+
+func testSigningKeys(t *testing.T, s Backend) {
 	ctx := t.Context()
-	org := seedOrg(t)
+	org := seedOrg(t, s)
 
 	// Fresh org: empty keyring, no error.
-	keys, err := testStore.SigningKeysForOrg(ctx, org)
+	keys, err := s.SigningKeysForOrg(ctx, org)
 	if err != nil {
 		t.Fatalf("SigningKeysForOrg on fresh org: %v", err)
 	}
@@ -210,19 +253,19 @@ func TestSigningKeys(t *testing.T) {
 		t.Fatalf("fresh org has %d signing keys, want 0", len(keys))
 	}
 
-	k1, err := testStore.AddSigningKey(ctx, org, "ssh-ed25519 AAAAtest key-one")
+	k1, err := s.AddSigningKey(ctx, org, "ssh-ed25519 AAAAtest key-one")
 	if err != nil {
 		t.Fatalf("AddSigningKey #1: %v", err)
 	}
 	if k1.ID <= 0 || k1.OrgID <= 0 || k1.CreatedAt.IsZero() {
 		t.Fatalf("bad signing key row: %+v", k1)
 	}
-	k2, err := testStore.AddSigningKey(ctx, org, "ssh-ed25519 AAAAtest key-two")
+	k2, err := s.AddSigningKey(ctx, org, "ssh-ed25519 AAAAtest key-two")
 	if err != nil {
 		t.Fatalf("AddSigningKey #2: %v", err)
 	}
 
-	keys, err = testStore.SigningKeysForOrg(ctx, org)
+	keys, err = s.SigningKeysForOrg(ctx, org)
 	if err != nil {
 		t.Fatalf("SigningKeysForOrg: %v", err)
 	}
@@ -234,10 +277,10 @@ func TestSigningKeys(t *testing.T) {
 		t.Errorf("keys = %q, want both in registration order", texts)
 	}
 
-	if err := testStore.RemoveSigningKey(ctx, org, k1.ID); err != nil {
+	if err := s.RemoveSigningKey(ctx, org, k1.ID); err != nil {
 		t.Fatalf("RemoveSigningKey: %v", err)
 	}
-	keys, err = testStore.SigningKeysForOrg(ctx, org)
+	keys, err = s.SigningKeysForOrg(ctx, org)
 	if err != nil {
 		t.Fatalf("SigningKeysForOrg after remove: %v", err)
 	}
@@ -246,28 +289,30 @@ func TestSigningKeys(t *testing.T) {
 	}
 
 	// Removing again (or a foreign id): ErrNotFound.
-	if err := testStore.RemoveSigningKey(ctx, org, k1.ID); !errors.Is(err, ErrNotFound) {
+	if err := s.RemoveSigningKey(ctx, org, k1.ID); !errors.Is(err, ErrNotFound) {
 		t.Errorf("double remove err = %v, want ErrNotFound", err)
 	}
 
 	// Unknown org: ErrNotFound on all three methods.
 	unknown := "no-such-org-" + t.Name()
-	if _, err := testStore.AddSigningKey(ctx, unknown, "ssh-ed25519 AAAAtest"); !errors.Is(err, ErrNotFound) {
+	if _, err := s.AddSigningKey(ctx, unknown, "ssh-ed25519 AAAAtest"); !errors.Is(err, ErrNotFound) {
 		t.Errorf("AddSigningKey unknown org err = %v, want ErrNotFound", err)
 	}
-	if _, err := testStore.SigningKeysForOrg(ctx, unknown); !errors.Is(err, ErrNotFound) {
+	if _, err := s.SigningKeysForOrg(ctx, unknown); !errors.Is(err, ErrNotFound) {
 		t.Errorf("SigningKeysForOrg unknown org err = %v, want ErrNotFound", err)
 	}
-	if err := testStore.RemoveSigningKey(ctx, unknown, k2.ID); !errors.Is(err, ErrNotFound) {
+	if err := s.RemoveSigningKey(ctx, unknown, k2.ID); !errors.Is(err, ErrNotFound) {
 		t.Errorf("RemoveSigningKey unknown org err = %v, want ErrNotFound", err)
 	}
 }
 
-func TestCreateAndGetRepo(t *testing.T) {
-	ctx := t.Context()
-	org := seedOrg(t)
+func TestCreateAndGetRepo(t *testing.T) { runBackends(t, testCreateAndGetRepo) }
 
-	created, err := testStore.CreateRepo(ctx, org, "github.com/acme/demo", "main")
+func testCreateAndGetRepo(t *testing.T, s Backend) {
+	ctx := t.Context()
+	org := seedOrg(t, s)
+
+	created, err := s.CreateRepo(ctx, org, "github.com/acme/demo", "main")
 	if err != nil {
 		t.Fatalf("CreateRepo: %v", err)
 	}
@@ -284,7 +329,7 @@ func TestCreateAndGetRepo(t *testing.T) {
 		t.Errorf("new repo has DeletedAt = %v", created.DeletedAt)
 	}
 
-	got, err := testStore.GetRepoByURL(ctx, org, "github.com/acme/demo")
+	got, err := s.GetRepoByURL(ctx, org, "github.com/acme/demo")
 	if err != nil {
 		t.Fatalf("GetRepoByURL: %v", err)
 	}
@@ -292,54 +337,56 @@ func TestCreateAndGetRepo(t *testing.T) {
 		t.Errorf("get = %+v, want %+v", got, created)
 	}
 
-	byID, err := testStore.GetRepoByID(ctx, org, created.RepoID)
+	byID, err := s.GetRepoByID(ctx, org, created.RepoID)
 	if err != nil {
 		t.Fatalf("GetRepoByID: %v", err)
 	}
 	if byID.URL != created.URL || byID.RepoID != created.RepoID {
 		t.Errorf("get by id = %+v, want %+v", byID, created)
 	}
-	if _, err := testStore.GetRepoByID(ctx, org, "repo_000000000000"); !errors.Is(err, ErrNotFound) {
+	if _, err := s.GetRepoByID(ctx, org, "repo_000000000000"); !errors.Is(err, ErrNotFound) {
 		t.Errorf("get absent id err = %v, want ErrNotFound", err)
 	}
 
 	// Duplicate url in the same org -> 409.
-	if _, err := testStore.CreateRepo(ctx, org, "github.com/acme/demo", "main"); !errors.Is(err, ErrAlreadyExists) {
+	if _, err := s.CreateRepo(ctx, org, "github.com/acme/demo", "main"); !errors.Is(err, ErrAlreadyExists) {
 		t.Errorf("duplicate create err = %v, want ErrAlreadyExists", err)
 	}
 
 	// Same url in ANOTHER org is fine (uniqueness is per org).
-	other, err := testStore.UpsertOrgWithKeys(ctx, t.Name()+"-other", []string{"pem"})
+	other, err := s.UpsertOrgWithKeys(ctx, t.Name()+"-other", []string{"pem"})
 	if err != nil {
 		t.Fatalf("seed other org: %v", err)
 	}
-	if _, err := testStore.CreateRepo(ctx, other.Name, "github.com/acme/demo", "main"); err != nil {
+	if _, err := s.CreateRepo(ctx, other.Name, "github.com/acme/demo", "main"); err != nil {
 		t.Errorf("cross-org create err = %v, want nil", err)
 	}
 
 	// Unknown repo / unknown org -> 404.
-	if _, err := testStore.GetRepoByURL(ctx, org, "github.com/acme/absent"); !errors.Is(err, ErrNotFound) {
+	if _, err := s.GetRepoByURL(ctx, org, "github.com/acme/absent"); !errors.Is(err, ErrNotFound) {
 		t.Errorf("get absent err = %v, want ErrNotFound", err)
 	}
-	if _, err := testStore.GetRepoByURL(ctx, "no-such-org", "github.com/acme/demo"); !errors.Is(err, ErrNotFound) {
+	if _, err := s.GetRepoByURL(ctx, "no-such-org", "github.com/acme/demo"); !errors.Is(err, ErrNotFound) {
 		t.Errorf("get unknown-org err = %v, want ErrNotFound", err)
 	}
-	if _, err := testStore.CreateRepo(ctx, "no-such-org", "u", "main"); !errors.Is(err, ErrNotFound) {
+	if _, err := s.CreateRepo(ctx, "no-such-org", "u", "main"); !errors.Is(err, ErrNotFound) {
 		t.Errorf("create unknown-org err = %v, want ErrNotFound", err)
 	}
 }
 
-func TestSoftDeleteRepo(t *testing.T) {
+func TestSoftDeleteRepo(t *testing.T) { runBackends(t, testSoftDeleteRepo) }
+
+func testSoftDeleteRepo(t *testing.T, s Backend) {
 	ctx := t.Context()
-	org := seedOrg(t)
+	org := seedOrg(t, s)
 	const url = "github.com/acme/doomed"
 
-	created, err := testStore.CreateRepo(ctx, org, url, "main")
+	created, err := s.CreateRepo(ctx, org, url, "main")
 	if err != nil {
 		t.Fatalf("CreateRepo: %v", err)
 	}
 
-	deleted, err := testStore.SoftDeleteRepo(ctx, org, url)
+	deleted, err := s.SoftDeleteRepo(ctx, org, url)
 	if err != nil {
 		t.Fatalf("SoftDeleteRepo: %v", err)
 	}
@@ -351,34 +398,34 @@ func TestSoftDeleteRepo(t *testing.T) {
 	}
 
 	// Soft-deleted -> GET 404, re-delete 409, re-create same url 409.
-	if _, err := testStore.GetRepoByURL(ctx, org, url); !errors.Is(err, ErrNotFound) {
+	if _, err := s.GetRepoByURL(ctx, org, url); !errors.Is(err, ErrNotFound) {
 		t.Errorf("get deleted err = %v, want ErrNotFound", err)
 	}
-	if _, err := testStore.SoftDeleteRepo(ctx, org, url); !errors.Is(err, ErrAlreadyDeleted) {
+	if _, err := s.SoftDeleteRepo(ctx, org, url); !errors.Is(err, ErrAlreadyDeleted) {
 		t.Errorf("re-delete err = %v, want ErrAlreadyDeleted", err)
 	}
-	if _, err := testStore.CreateRepo(ctx, org, url, "main"); !errors.Is(err, ErrAlreadyExists) {
+	if _, err := s.CreateRepo(ctx, org, url, "main"); !errors.Is(err, ErrAlreadyExists) {
 		t.Errorf("re-create deleted url err = %v, want ErrAlreadyExists", err)
 	}
 
 	// Absent repo / unknown org -> 404.
-	if _, err := testStore.SoftDeleteRepo(ctx, org, "github.com/acme/absent"); !errors.Is(err, ErrNotFound) {
+	if _, err := s.SoftDeleteRepo(ctx, org, "github.com/acme/absent"); !errors.Is(err, ErrNotFound) {
 		t.Errorf("delete absent err = %v, want ErrNotFound", err)
 	}
-	if _, err := testStore.SoftDeleteRepo(ctx, "no-such-org", url); !errors.Is(err, ErrNotFound) {
+	if _, err := s.SoftDeleteRepo(ctx, "no-such-org", url); !errors.Is(err, ErrNotFound) {
 		t.Errorf("delete unknown-org err = %v, want ErrNotFound", err)
 	}
 }
 
 // listAll walks pages of pageSize until exhaustion, asserting cursor/HasMore
 // invariants, and returns every row seen plus the page sizes.
-func listAll(t *testing.T, org, q string, pageSize int) ([]Repo, []int) {
+func listAll(t *testing.T, s Backend, org, q string, pageSize int) ([]Repo, []int) {
 	t.Helper()
 	var all []Repo
 	var pages []int
 	cursor := ""
 	for range 100 { // hard stop: a cursor bug must not loop forever
-		res, err := testStore.ListRepos(t.Context(), org, ListParams{Q: q, Cursor: cursor, Limit: pageSize})
+		res, err := s.ListRepos(t.Context(), org, ListParams{Q: q, Cursor: cursor, Limit: pageSize})
 		if err != nil {
 			t.Fatalf("ListRepos(q=%q, cursor=%q): %v", q, cursor, err)
 		}
@@ -402,27 +449,29 @@ func listAll(t *testing.T, org, q string, pageSize int) ([]Repo, []int) {
 	return nil, nil
 }
 
-func TestListReposPagination(t *testing.T) {
+func TestListReposPagination(t *testing.T) { runBackends(t, testListReposPagination) }
+
+func testListReposPagination(t *testing.T, s Backend) {
 	ctx := t.Context()
-	org := seedOrg(t)
+	org := seedOrg(t, s)
 
 	created := make(map[string]bool, 25)
 	for i := range 25 {
 		url := fmt.Sprintf("github.com/acme/list-%02d", i)
-		if _, err := testStore.CreateRepo(ctx, org, url, "main"); err != nil {
+		if _, err := s.CreateRepo(ctx, org, url, "main"); err != nil {
 			t.Fatalf("create %s: %v", url, err)
 		}
 		created[url] = true
 	}
 	// A soft-deleted repo must never appear in any page.
-	if _, err := testStore.CreateRepo(ctx, org, "github.com/acme/list-deleted", "main"); err != nil {
+	if _, err := s.CreateRepo(ctx, org, "github.com/acme/list-deleted", "main"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := testStore.SoftDeleteRepo(ctx, org, "github.com/acme/list-deleted"); err != nil {
+	if _, err := s.SoftDeleteRepo(ctx, org, "github.com/acme/list-deleted"); err != nil {
 		t.Fatal(err)
 	}
 
-	all, pages := listAll(t, org, "", 10)
+	all, pages := listAll(t, s, org, "", 10)
 	if !slices.Equal(pages, []int{10, 10, 5}) {
 		t.Errorf("page sizes = %v, want [10 10 5]", pages)
 	}
@@ -454,7 +503,7 @@ func TestListReposPagination(t *testing.T) {
 	}
 
 	// One big page: no next cursor.
-	res, err := testStore.ListRepos(ctx, org, ListParams{Limit: 100})
+	res, err := s.ListRepos(ctx, org, ListParams{Limit: 100})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -464,7 +513,7 @@ func TestListReposPagination(t *testing.T) {
 
 	// Cursor at the very last row: empty page, not an error.
 	last := res.Repos[len(res.Repos)-1]
-	tail, err := testStore.ListRepos(ctx, org, ListParams{Cursor: encodeCursor(last.CreatedAt, last.RepoID), Limit: 10})
+	tail, err := s.ListRepos(ctx, org, ListParams{Cursor: encodeCursor(last.CreatedAt, last.RepoID), Limit: 10})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -473,14 +522,16 @@ func TestListReposPagination(t *testing.T) {
 	}
 
 	// Exact multiple of the page size terminates cleanly (25 = 5*5).
-	if _, pages := listAll(t, org, "", 5); !slices.Equal(pages, []int{5, 5, 5, 5, 5}) {
+	if _, pages := listAll(t, s, org, "", 5); !slices.Equal(pages, []int{5, 5, 5, 5, 5}) {
 		t.Errorf("page sizes = %v, want five pages of 5", pages)
 	}
 }
 
-func TestListReposQFilter(t *testing.T) {
+func TestListReposQFilter(t *testing.T) { runBackends(t, testListReposQFilter) }
+
+func testListReposQFilter(t *testing.T, s Backend) {
 	ctx := t.Context()
-	org := seedOrg(t)
+	org := seedOrg(t, s)
 	for _, url := range []string{
 		"github.com/acme/Alpha",
 		"github.com/acme/beta-ALPHA",
@@ -490,7 +541,7 @@ func TestListReposQFilter(t *testing.T) {
 		"github.com/acme/rXs-decoy", // matches ILIKE 'r_s' only if _ is unescaped
 		`github.com/acme/back\slash`,
 	} {
-		if _, err := testStore.CreateRepo(ctx, org, url, "main"); err != nil {
+		if _, err := s.CreateRepo(ctx, org, url, "main"); err != nil {
 			t.Fatalf("create %s: %v", url, err)
 		}
 	}
@@ -505,27 +556,27 @@ func TestListReposQFilter(t *testing.T) {
 	}
 
 	// Case-insensitive substring match.
-	all, _ := listAll(t, org, "alpha", 2) // page size 2 also exercises cursor+q together
+	all, _ := listAll(t, s, org, "alpha", 2) // page size 2 also exercises cursor+q together
 	if got := urls(all); !slices.Equal(got, []string{"github.com/acme/Alpha", "github.com/acme/beta-ALPHA"}) {
 		t.Errorf("q=alpha -> %v", got)
 	}
 
 	// LIKE metacharacters in q are literals, not wildcards.
-	all, _ = listAll(t, org, "%", 10)
+	all, _ = listAll(t, s, org, "%", 10)
 	if got := urls(all); !slices.Equal(got, []string{"github.com/acme/50%off"}) {
 		t.Errorf("q=%% -> %v, want just the literal-percent url", got)
 	}
-	all, _ = listAll(t, org, "r_s", 10)
+	all, _ = listAll(t, s, org, "r_s", 10)
 	if got := urls(all); !slices.Equal(got, []string{"github.com/acme/under_score"}) {
 		t.Errorf("q=r_s -> %v, want just the literal-underscore url (not the rXs decoy)", got)
 	}
-	all, _ = listAll(t, org, `\`, 10)
+	all, _ = listAll(t, s, org, `\`, 10)
 	if got := urls(all); !slices.Equal(got, []string{`github.com/acme/back\slash`}) {
 		t.Errorf(`q=\ -> %v, want just the literal-backslash url`, got)
 	}
 
 	// No match: empty non-nil page.
-	res, err := testStore.ListRepos(ctx, org, ListParams{Q: "zzz-no-match", Limit: 10})
+	res, err := s.ListRepos(ctx, org, ListParams{Q: "zzz-no-match", Limit: 10})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -534,17 +585,19 @@ func TestListReposQFilter(t *testing.T) {
 	}
 }
 
-func TestListReposErrors(t *testing.T) {
+func TestListReposErrors(t *testing.T) { runBackends(t, testListReposErrors) }
+
+func testListReposErrors(t *testing.T, s Backend) {
 	ctx := t.Context()
-	org := seedOrg(t)
+	org := seedOrg(t, s)
 
 	for _, cursor := range []string{"!!!", "AAAA", "bm9waXBl" /* "nopipe" */} {
-		if _, err := testStore.ListRepos(ctx, org, ListParams{Cursor: cursor, Limit: 10}); !errors.Is(err, ErrInvalidCursor) {
+		if _, err := s.ListRepos(ctx, org, ListParams{Cursor: cursor, Limit: 10}); !errors.Is(err, ErrInvalidCursor) {
 			t.Errorf("cursor %q err = %v, want ErrInvalidCursor", cursor, err)
 		}
 	}
 
-	if _, err := testStore.ListRepos(ctx, "no-such-org", ListParams{Limit: 10}); !errors.Is(err, ErrNotFound) {
+	if _, err := s.ListRepos(ctx, "no-such-org", ListParams{Limit: 10}); !errors.Is(err, ErrNotFound) {
 		t.Errorf("unknown org err = %v, want ErrNotFound", err)
 	}
 
@@ -554,5 +607,5 @@ func TestListReposErrors(t *testing.T) {
 			t.Error("ListRepos(limit=0) did not panic")
 		}
 	}()
-	_, _ = testStore.ListRepos(ctx, org, ListParams{Limit: 0})
+	_, _ = s.ListRepos(ctx, org, ListParams{Limit: 0})
 }
