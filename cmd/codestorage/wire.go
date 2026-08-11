@@ -26,22 +26,23 @@ import (
 
 // buildAPIHandler opens the metadata store, bootstraps the single org with
 // its PEM public key blocks (idempotent upsert), and returns the /api/v1
-// handler, the store (for the git path's repo_id->url resolution), and a
-// cleanup func. The handler registers full "/api/v1/..." paths, so serve
-// mounts it un-stripped at mux.Handle("/api/v1/", h).
-func buildAPIHandler(ctx context.Context, pgURL, org, httpBaseURL string, orgPEMBlocks []string) (http.Handler, meta.Store, func(), error) {
+// handler, the store (for the git path's repo_id->url resolution), the
+// verifier (shared with the git path per ADR-8), and a cleanup func. The
+// handler registers full "/api/v1/..." paths, so serve mounts it un-stripped
+// at mux.Handle("/api/v1/", h).
+func buildAPIHandler(ctx context.Context, pgURL, org, httpBaseURL string, orgPEMBlocks []string) (http.Handler, meta.Store, auth.Verifier, func(), error) {
 	assertf(pgURL != "" && org != "" && httpBaseURL != "" && len(orgPEMBlocks) > 0, "buildAPIHandler: missing pgURL/org/httpBaseURL/keys")
 	ms, cleanup, err := openMetaStore(ctx, pgURL)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 	if _, err := ms.UpsertOrgWithKeys(ctx, org, orgPEMBlocks); err != nil {
 		cleanup()
-		return nil, nil, nil, fmt.Errorf("bootstrap org %q: %w", org, err)
+		return nil, nil, nil, nil, fmt.Errorf("bootstrap org %q: %w", org, err)
 	}
 	verifier := auth.NewVerifier(ms)
 	h := api.New(api.Config{Store: ms, Verifier: verifier, HTTPBaseURL: httpBaseURL})
-	return h, ms, cleanup, nil
+	return h, ms, verifier, cleanup, nil
 }
 
 // openMetaStore opens the metadata store and ensures its schema exists

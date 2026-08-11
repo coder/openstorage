@@ -4,7 +4,6 @@
 package main
 
 import (
-	"crypto/ecdsa"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -12,8 +11,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-
-	"codestorage/internal/auth"
 )
 
 // Environment variable names, canonical first; envFirst scans left to right.
@@ -50,13 +47,9 @@ type serveConfig struct {
 	pgURL    string
 	blobURL  string
 
-	// gitPubKeyPath enables the git smart-HTTP path when set (spike compat,
-	// --jwt-pubkey). When empty, the git path falls back to the first ECDSA
-	// key found in orgKeysPath (see resolveGitPublicKey).
-	gitPubKeyPath string
-
-	// org/orgKeysPath enable the /api/v1 HTTP API (single-org self-host
-	// mode). Both must be set together, or neither.
+	// org/orgKeysPath configure single-org serve mode (ADR-8): the /api/v1
+	// HTTP API and the git smart-HTTP path both authenticate against the
+	// org's registered keys. Both are required.
 	org         string
 	orgKeysPath string
 
@@ -68,16 +61,15 @@ type serveConfig struct {
 }
 
 // resolveServeConfig merges flags and environment into a validated config.
-func resolveServeConfig(getenv func(string) string, flagListen, flagAddr, flagCacheDir, flagPubKey string) (serveConfig, error) {
+func resolveServeConfig(getenv func(string) string, flagListen, flagAddr, flagCacheDir string) (serveConfig, error) {
 	assertf(getenv != nil, "resolveServeConfig: nil getenv")
 	cfg := serveConfig{
-		listen:        firstNonEmpty(flagListen, flagAddr, getenv(envListen), defaultListen),
-		cacheDir:      firstNonEmpty(flagCacheDir, filepath.Join(os.TempDir(), "codestorage-cache")),
-		pgURL:         envFirst(getenv, envPGURL...),
-		blobURL:       envFirst(getenv, envBlobURL...),
-		gitPubKeyPath: flagPubKey,
-		org:           getenv(envOrg),
-		orgKeysPath:   getenv(envOrgPubKeys),
+		listen:      firstNonEmpty(flagListen, flagAddr, getenv(envListen), defaultListen),
+		cacheDir:    firstNonEmpty(flagCacheDir, filepath.Join(os.TempDir(), "codestorage-cache")),
+		pgURL:       envFirst(getenv, envPGURL...),
+		blobURL:     envFirst(getenv, envBlobURL...),
+		org:         getenv(envOrg),
+		orgKeysPath: getenv(envOrgPubKeys),
 	}
 	if cfg.pgURL == "" {
 		return serveConfig{}, fmt.Errorf("postgres URL required: set %s (or legacy %s)", envPGURL[0], envPGURL[2])
@@ -85,11 +77,8 @@ func resolveServeConfig(getenv func(string) string, flagListen, flagAddr, flagCa
 	if cfg.blobURL == "" {
 		return serveConfig{}, fmt.Errorf("blob URL required: set %s (or legacy %s)", envBlobURL[0], envBlobURL[2])
 	}
-	if (cfg.org == "") != (cfg.orgKeysPath == "") {
-		return serveConfig{}, fmt.Errorf("%s and %s must be set together", envOrg, envOrgPubKeys)
-	}
-	if cfg.org == "" && cfg.gitPubKeyPath == "" {
-		return serveConfig{}, fmt.Errorf("nothing to serve: set --jwt-pubkey for the git path and/or %s + %s for the HTTP API", envOrg, envOrgPubKeys)
+	if cfg.org == "" || cfg.orgKeysPath == "" {
+		return serveConfig{}, fmt.Errorf("%s and %s must both be set (single-org serve mode)", envOrg, envOrgPubKeys)
 	}
 	if raw := getenv(envBaseURL); raw != "" {
 		baseURL, err := normalizeBaseURL(raw)
@@ -142,39 +131,6 @@ func splitPEMBlocks(data []byte) ([]string, error) {
 		return nil, errors.New("no PEM blocks found")
 	}
 	return blocks, nil
-}
-
-// resolveGitPublicKey picks the ES256 verification key for the spike git
-// smart-HTTP path: the explicit --jwt-pubkey file when given, otherwise the
-// first ECDSA key among the org's registered PEM blocks. Returns (nil, nil)
-// when no ECDSA key is available — the git path is then left unmounted.
-func resolveGitPublicKey(pubKeyPath string, orgPEMBlocks []string) (*ecdsa.PublicKey, error) {
-	if pubKeyPath != "" {
-		pemData, err := os.ReadFile(pubKeyPath)
-		if err != nil {
-			return nil, err
-		}
-		keys, err := auth.ParsePublicKeysPEM(pemData)
-		if err != nil {
-			return nil, fmt.Errorf("%s: %w", pubKeyPath, err)
-		}
-		ec, ok := keys[0].(*ecdsa.PublicKey)
-		if !ok {
-			return nil, fmt.Errorf("%s: git path needs an ECDSA public key, got %T", pubKeyPath, keys[0])
-		}
-		return ec, nil
-	}
-	for _, block := range orgPEMBlocks {
-		keys, err := auth.ParsePublicKeysPEM([]byte(block))
-		if err != nil {
-			return nil, fmt.Errorf("org public key block: %w", err)
-		}
-		assertf(len(keys) == 1, "splitPEMBlocks produced a block with %d keys", len(keys))
-		if ec, ok := keys[0].(*ecdsa.PublicKey); ok {
-			return ec, nil
-		}
-	}
-	return nil, nil
 }
 
 // assertf is a fail-fast invariant check (matches the internal packages'

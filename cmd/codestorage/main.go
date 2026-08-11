@@ -65,11 +65,10 @@ func cmdServe(ctx context.Context, args []string) error {
 	listen := fs.String("listen", "", "listen address (falls back to --addr, then $"+envListen+", then "+defaultListen+")")
 	addr := fs.String("addr", "", "spike-compat alias for --listen")
 	cacheDir := fs.String("cache-dir", "", "rebuildable cache directory for bare repos (default: $TMPDIR/codestorage-cache)")
-	pubKeyPath := fs.String("jwt-pubkey", "", "PEM path of the ES256 public key for the git smart-HTTP path (default: first ECDSA key in $"+envOrgPubKeys+")")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	cfg, err := resolveServeConfig(os.Getenv, *listen, *addr, *cacheDir, *pubKeyPath)
+	cfg, err := resolveServeConfig(os.Getenv, *listen, *addr, *cacheDir)
 	if err != nil {
 		return err
 	}
@@ -113,68 +112,49 @@ func cmdServe(ctx context.Context, args []string) error {
 	}
 
 	mux := http.NewServeMux()
-	mounted := 0
 
-	// HTTP API (single-org self-host mode), enabled by CODESTORAGE_ORG.
-	var orgPEMBlocks []string
-	var metaStore meta.Store
-	if cfg.org != "" {
-		pemData, err := os.ReadFile(cfg.orgKeysPath)
-		if err != nil {
-			return err
-		}
-		// Validate every block up front (crash early on bad key material).
-		if _, err := auth.ParsePublicKeysPEM(pemData); err != nil {
-			return fmt.Errorf("%s: %w", cfg.orgKeysPath, err)
-		}
-		orgPEMBlocks, err = splitPEMBlocks(pemData)
-		if err != nil {
-			return fmt.Errorf("%s: %w", cfg.orgKeysPath, err)
-		}
-		apiHandler, ms, cleanup, err := buildAPIHandler(ctx, cfg.pgURL, cfg.org, httpBaseURL, orgPEMBlocks)
-		if err != nil {
-			return err
-		}
-		defer cleanup()
-		metaStore = ms
-		mux.Handle("/api/v1/", apiHandler)
-		mounted++
-	}
-
-	// Git smart-HTTP path (spike fallback), mounted when an ECDSA key is
-	// available from --jwt-pubkey or the org key set.
-	gitPub, err := resolveGitPublicKey(cfg.gitPubKeyPath, orgPEMBlocks)
+	// Load the org's public keys, validating every block up front (crash
+	// early on bad key material). Single-org mode is mandatory (ADR-8).
+	pemData, err := os.ReadFile(cfg.orgKeysPath)
 	if err != nil {
 		return err
 	}
-	if gitPub != nil {
-		if err := os.MkdirAll(cfg.cacheDir, 0o755); err != nil {
-			return err
-		}
-		srv := githttp.NewServer(st, bl, cfg.cacheDir, gitPub)
-		if metaStore != nil {
-			// docs/05 git URLs address repos by repo_id while JWT repo
-			// claims carry the url (docs/02): resolve id->url for auth.
-			org := cfg.org
-			srv.ResolveRepoURL = func(ctx context.Context, repoID string) (string, bool) {
-				repo, err := metaStore.GetRepoByID(ctx, org, repoID)
-				if err != nil {
-					if !errors.Is(err, meta.ErrNotFound) {
-						fmt.Fprintf(os.Stderr, "resolve repo id %q: %v\n", repoID, err)
-					}
-					return "", false
-				}
-				return repo.URL, true
-			}
-		}
-		mux.Handle("/", srv.Handler())
-		mounted++
-	} else {
-		fmt.Fprintln(os.Stderr, "git smart-HTTP path disabled: no ECDSA public key (pass --jwt-pubkey or include one in $"+envOrgPubKeys+")")
+	if _, err := auth.ParsePublicKeysPEM(pemData); err != nil {
+		return fmt.Errorf("%s: %w", cfg.orgKeysPath, err)
 	}
-	// resolveServeConfig guarantees at least one of org/gitPubKeyPath, and an
-	// explicit --jwt-pubkey either loads or errors above.
-	assertf(mounted > 0, "serve resolved a config with nothing mounted")
+	orgPEMBlocks, err := splitPEMBlocks(pemData)
+	if err != nil {
+		return fmt.Errorf("%s: %w", cfg.orgKeysPath, err)
+	}
+
+	// HTTP API (single-org self-host mode).
+	apiHandler, metaStore, verifier, cleanup, err := buildAPIHandler(ctx, cfg.pgURL, cfg.org, httpBaseURL, orgPEMBlocks)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+	mux.Handle("/api/v1/", apiHandler)
+
+	// Git smart-HTTP path, authenticated with the same verifier as the API
+	// (ADR-8: iss-resolved org keys; the spike's single-key mode is gone).
+	if err := os.MkdirAll(cfg.cacheDir, 0o755); err != nil {
+		return err
+	}
+	srv := githttp.NewServer(st, bl, cfg.cacheDir, verifier, cfg.org)
+	// docs/05 git URLs address repos by repo_id while JWT repo claims carry
+	// the url (docs/02): resolve id->url for auth.
+	org := cfg.org
+	srv.ResolveRepoURL = func(ctx context.Context, repoID string) (string, bool) {
+		repo, err := metaStore.GetRepoByID(ctx, org, repoID)
+		if err != nil {
+			if !errors.Is(err, meta.ErrNotFound) {
+				fmt.Fprintf(os.Stderr, "resolve repo id %q: %v\n", repoID, err)
+			}
+			return "", false
+		}
+		return repo.URL, true
+	}
+	mux.Handle("/", srv.Handler())
 
 	fmt.Printf("listening on %s\n", ln.Addr())
 	return http.Serve(ln, mux)
