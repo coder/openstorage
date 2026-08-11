@@ -39,7 +39,9 @@ import (
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 
 	"codestorage/internal/auth"
+	"codestorage/internal/blob"
 	"codestorage/internal/meta"
+	"codestorage/internal/ref"
 )
 
 const testHTTPBaseURL = "https://selfhost.code.storage"
@@ -58,6 +60,13 @@ type testEnv struct {
 	store meta.Store
 	srv   *httptest.Server
 	keys  *testKeys
+
+	// Read-endpoint dependencies (same backend DB as store, file:// blobs,
+	// temp cache dir) so git:read integration tests can seed repos by real
+	// git push through a githttp fallback and read them back over HTTP.
+	refStore  ref.Store
+	blobStore blob.BlobStore
+	cacheDir  string
 }
 
 // backendState lazily boots one backend lane exactly once; the boot error
@@ -182,15 +191,61 @@ func testEnvironment(t *testing.T, backend string) *testEnv {
 			return
 		}
 
+		// Read-endpoint dependencies: the ref store shares the lane's DB
+		// (both schemas coexist, exactly like production), blobs live in a
+		// temp file:// bucket, and the cache dir is a temp dir.
+		refStore, err := ref.Open(ctx, metaURL)
+		if err != nil {
+			state.err = err
+			return
+		}
+		envCleanup = append(envCleanup, refStore.Close)
+		if err := refStore.InitSchema(ctx); err != nil {
+			state.err = err
+			return
+		}
+		blobDir, err := os.MkdirTemp("", "codestorage-api-blobs-*")
+		if err != nil {
+			state.err = err
+			return
+		}
+		envCleanup = append(envCleanup, func() { _ = os.RemoveAll(blobDir) })
+		blobStore, err := blob.Open(ctx, "file://"+blobDir)
+		if err != nil {
+			state.err = err
+			return
+		}
+		envCleanup = append(envCleanup, func() { _ = blobStore.Close() })
+		if err := blobStore.EnsureBucket(ctx); err != nil {
+			state.err = err
+			return
+		}
+		cacheDir, err := os.MkdirTemp("", "codestorage-api-cache-*")
+		if err != nil {
+			state.err = err
+			return
+		}
+		envCleanup = append(envCleanup, func() { _ = os.RemoveAll(cacheDir) })
+
 		srv := httptest.NewServer(New(Config{
 			Store:       store,
 			Verifier:    verifier,
 			Logger:      discardLogger(),
 			HTTPBaseURL: testHTTPBaseURL,
+			RefStore:    refStore,
+			BlobStore:   blobStore,
+			CacheDir:    cacheDir,
 		}))
 		envCleanup = append(envCleanup, srv.Close)
 
-		state.env = &testEnv{store: store, srv: srv, keys: keys}
+		state.env = &testEnv{
+			store:     store,
+			srv:       srv,
+			keys:      keys,
+			refStore:  refStore,
+			blobStore: blobStore,
+			cacheDir:  cacheDir,
+		}
 	})
 	if state.err != nil {
 		t.Fatalf("%s test environment: %v", backend, state.err)

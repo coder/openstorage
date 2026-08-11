@@ -128,8 +128,13 @@ func cmdServe(ctx context.Context, args []string) error {
 		return fmt.Errorf("%s: %w", cfg.orgKeysPath, err)
 	}
 
-	// HTTP API (single-org self-host mode).
-	apiHandler, metaStore, verifier, cleanup, err := buildAPIHandler(ctx, cfg.dbURL, cfg.org, httpBaseURL, orgPEMBlocks)
+	if err := os.MkdirAll(cfg.cacheDir, 0o755); err != nil {
+		return err
+	}
+
+	// HTTP API (single-org self-host mode). The read endpoints share the
+	// ref/blob stores and cache dir with the githttp fallback below.
+	apiHandler, metaStore, verifier, cleanup, err := buildAPIHandler(ctx, cfg.dbURL, cfg.org, httpBaseURL, orgPEMBlocks, st, bl, cfg.cacheDir)
 	if err != nil {
 		return err
 	}
@@ -138,9 +143,6 @@ func cmdServe(ctx context.Context, args []string) error {
 
 	// Git smart-HTTP path, authenticated with the same verifier as the API
 	// (ADR-8: iss-resolved org keys; the spike's single-key mode is gone).
-	if err := os.MkdirAll(cfg.cacheDir, 0o755); err != nil {
-		return err
-	}
 	srv := githttp.NewServer(st, bl, cfg.cacheDir, verifier, cfg.org)
 	// docs/05 git URLs address repos by repo_id while JWT repo claims carry
 	// the url (docs/02): resolve id->url for auth.

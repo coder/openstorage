@@ -12,7 +12,9 @@ import (
 	"time"
 
 	"codestorage/internal/auth"
+	"codestorage/internal/blob"
 	"codestorage/internal/meta"
+	"codestorage/internal/ref"
 )
 
 // server holds handler dependencies; one instance backs all routes.
@@ -20,6 +22,13 @@ type server struct {
 	store       meta.Store
 	httpBaseURL string       // no trailing slash (normalized in New)
 	logger      *slog.Logger // never nil (defaulted in New)
+
+	// Read-plumbing dependencies for the git:read endpoints (all required,
+	// validated in New): handlers call gitread.Materialize(refStore,
+	// blobStore, cacheDir, repo) and run plumbing over the returned path.
+	refStore  ref.RefStore
+	blobStore blob.BlobStore
+	cacheDir  string
 }
 
 // maxBodyBytes caps request bodies; the only JSON body we accept

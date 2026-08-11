@@ -21,7 +21,9 @@ import (
 
 	"codestorage/internal/api"
 	"codestorage/internal/auth"
+	"codestorage/internal/blob"
 	"codestorage/internal/meta"
+	"codestorage/internal/ref"
 )
 
 // buildAPIHandler opens the metadata store, bootstraps the single org with
@@ -29,9 +31,12 @@ import (
 // handler, the store (for the git path's repo_id->url resolution), the
 // verifier (shared with the git path per ADR-8), and a cleanup func. The
 // handler registers full "/api/v1/..." paths, so serve mounts it un-stripped
-// at mux.Handle("/api/v1/", h).
-func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL string, orgPEMBlocks []string) (http.Handler, meta.Store, auth.Verifier, func(), error) {
+// at mux.Handle("/api/v1/", h). refStore/blobStore/cacheDir back the
+// git:read endpoints — serve passes the same instances the githttp fallback
+// uses so both surfaces share one cache.
+func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL string, orgPEMBlocks []string, refStore ref.RefStore, blobStore blob.BlobStore, cacheDir string) (http.Handler, meta.Store, auth.Verifier, func(), error) {
 	assertf(dbURL != "" && org != "" && httpBaseURL != "" && len(orgPEMBlocks) > 0, "buildAPIHandler: missing dbURL/org/httpBaseURL/keys")
+	assertf(refStore != nil && blobStore != nil && cacheDir != "", "buildAPIHandler: missing refStore/blobStore/cacheDir")
 	ms, cleanup, err := openMetaStore(ctx, dbURL)
 	if err != nil {
 		return nil, nil, nil, nil, err
@@ -41,7 +46,14 @@ func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL string, orgPEM
 		return nil, nil, nil, nil, fmt.Errorf("bootstrap org %q: %w", org, err)
 	}
 	verifier := auth.NewVerifier(ms)
-	h := api.New(api.Config{Store: ms, Verifier: verifier, HTTPBaseURL: httpBaseURL})
+	h := api.New(api.Config{
+		Store:       ms,
+		Verifier:    verifier,
+		HTTPBaseURL: httpBaseURL,
+		RefStore:    refStore,
+		BlobStore:   blobStore,
+		CacheDir:    cacheDir,
+	})
 	return h, ms, verifier, cleanup, nil
 }
 
