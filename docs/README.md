@@ -35,6 +35,7 @@ signature scheme), which gives high confidence that the extracted spec is correc
 9. [09-phase1-implementation-notes.md](09-phase1-implementation-notes.md) — ADRs from phase 1 (skeleton + auth)
 10. [10-phase2-implementation-notes.md](10-phase2-implementation-notes.md) — ADRs from phase 2 (git smart HTTP promotion)
 11. [11-local-backends-implementation-notes.md](11-local-backends-implementation-notes.md) — ADRs from the pluggable-storage interlude (local mode: SQLite + file blobs)
+12. [12-phase3-implementation-notes.md](12-phase3-implementation-notes.md) — ADRs from phase 3 (read API)
 
 `upstream/` contains verbatim copies of the official OpenAPI spec and doc pages for reference.
 

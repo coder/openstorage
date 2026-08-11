@@ -58,7 +58,10 @@ per-path `git log -1` (O(page) subprocesses at ≤ page-size limits).
 streams `cat-file blob` per entry into a tar.gz with the requested prefix
 (`internal/gitread/archive.go`). Modes map 100755 → 0755, symlink entries come from blob
 content, submodules are skipped. Response is `Content-Type: application/gzip` with
-`Content-Disposition` and `Cache-Control: no-store`.
+`Content-Disposition` and `Cache-Control: no-store`. Because the prefix is prepended to
+every tar entry name, the untrusted `archive.prefix` is validated at the API boundary
+(400 for absolute paths, `.`/`..` segments, backslashes, and NUL bytes) and the same
+invariant is asserted in `gitread.Archive`, so no caller can produce tar-slip entry names.
 
 ## ADR-19: Hydrate serializes per pack with an flock; temp-download + atomic rename
 

@@ -3,12 +3,13 @@
 An open-source, wire-compatible backend for [code.storage](https://code.storage), built from
 the specification in [`docs/`](docs/README.md).
 
-Current state: **phase 2 (git smart HTTP) + pluggable storage backends done**. One Go binary
-(`codestorage serve`) exposes the `/api/v1` repo CRUD API and the production git smart-HTTP
-path (clone/push, ref-policy enforcement, commit-signature verification) behind the same
-per-org JWT verifier; nodes are stateless. Storage is selected by URL scheme: Postgres +
-S3 (MinIO) for multi-node deployments, or zero-dependency local mode (SQLite + plain files
-via `serve --data-dir`). Next: phase 3 (read API) — see
+Current state: **phase 3 (read API) done**. One Go binary (`codestorage serve`) exposes the
+`/api/v1` repo CRUD API, the full `git:read` surface (files, branches, tags, commits, diff,
+blame, grep, archive — cursor pagination, conditional/range file streaming), and the
+production git smart-HTTP path (clone/push, ref-policy enforcement, commit-signature
+verification) behind the same per-org JWT verifier; nodes are stateless. Storage is selected
+by URL scheme: Postgres + S3 (MinIO) for multi-node deployments, or zero-dependency local
+mode (SQLite + plain files via `serve --data-dir`). Next: phase 4 (write API) — see
 [docs/07-implementation-roadmap.md](docs/07-implementation-roadmap.md).
 
 ## Layout
@@ -22,6 +23,7 @@ via `serve --data-dir`). Next: phase 3 (read API) — see
 | `internal/meta` | Metadata store: orgs, org public keys, repos (soft delete, pagination) |
 | `internal/blob` | `BlobStore` contract + S3/MinIO and local-file implementations (immutable packs) |
 | `internal/ref` | `RefStore` contract + Postgres and SQLite implementations (CAS ref authority) |
+| `internal/gitread` | Read-side git plumbing (ls-tree, log, diff, blame, grep, archive) over the hydrated cache repo |
 | `internal/githttp` | Git smart-HTTP server + policy/verify-sig hooks, cache hydration, e2e suite |
 | `docker-compose.yml` | Postgres + MinIO for local dogfooding |
 
