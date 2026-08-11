@@ -64,7 +64,7 @@ semantics, the deprecated `ops` fallback, the ephemeral policy quirk, and `verif
 backed by an org signing-key registry (`codestorage signing-key`, keyring read fresh from
 Postgres each push). `CODESTORAGE_BASE_URL` makes `http_url` routable behind 0.0.0.0
 binds. Decisions are recorded in
-[10-phase2-implementation-notes.md](10-phase2-implementation-notes.md). Phases 3–6 below
+[10-phase2-implementation-notes.md](10-phase2-implementation-notes.md). Phases 4–6 below
 are not started.
 
 **Interlude — pluggable storage backends (local mode): done.** Before phase 3, the storage
@@ -82,9 +82,13 @@ the container-based acceptance suites gained zero-container lanes (api `/sqlite`
 2. **Git smart HTTP — done.** upload-pack/receive-pack with JWT basic auth, ref-policy
    enforcement hooks, ephemeral/import namespace routing. *Gate: real `git clone/push`
    round-trip.*
-3. **Read API.** files, files/metadata (incl. unborn-branch 404), file stream with
+3. **Read API — done.** files, files/metadata (incl. unborn-branch 404), file stream with
    conditional/range headers, branches, tags, commits, commit, diff, branches/diff, blame,
-   archive, grep (synchronous `git grep` is fine). Cursor pagination everywhere.
+   archive, grep (synchronous `git grep` is fine). Cursor pagination everywhere. *Gate:
+   endpoint contract tests on both backend lanes, vendor Go-SDK read drive, schemathesis
+   conformance against `docs/upstream/openapi.yaml`, and dual-backend live dogfood
+   transcripts.* Decisions are recorded in
+   [12-phase3-implementation-notes.md](12-phase3-implementation-notes.md).
 4. **Write API.** commit-pack + diff-commit NDJSON streaming (incremental parse, 4 MiB
    chunks), restore-commit, branch create/delete (+default-branch protection), merge +
    preview (scratch worktree or in-memory merge), tags, notes (+CAS `expected_ref_sha`).
