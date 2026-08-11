@@ -1,4 +1,4 @@
-package spike
+package githttp
 
 // Unit tests for Server.authenticate's repo-claim matching: docs/05 git URLs
 // address repos by repo_id while docs/02 JWT repo claims carry the url, so

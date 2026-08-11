@@ -1,4 +1,4 @@
-package spike
+package githttp
 
 // Acceptance tests for the de-risk spike. Real containers only (no fakes):
 // testcontainers-go boots Postgres + MinIO, TestMain builds the codestorage

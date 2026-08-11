@@ -12,7 +12,7 @@ import (
 	"path/filepath"
 
 	"codestorage/internal/auth"
-	"codestorage/internal/spike"
+	"codestorage/internal/githttp"
 )
 
 // Environment variable names, canonical first; envFirst scans left to right.
@@ -119,7 +119,7 @@ func splitPEMBlocks(data []byte) ([]string, error) {
 // when no ECDSA key is available — the git path is then left unmounted.
 func resolveGitPublicKey(pubKeyPath string, orgPEMBlocks []string) (*ecdsa.PublicKey, error) {
 	if pubKeyPath != "" {
-		return spike.LoadPublicKeyPEM(pubKeyPath)
+		return githttp.LoadPublicKeyPEM(pubKeyPath)
 	}
 	for _, block := range orgPEMBlocks {
 		keys, err := auth.ParsePublicKeysPEM([]byte(block))

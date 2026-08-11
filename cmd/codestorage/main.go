@@ -23,7 +23,7 @@ import (
 	"codestorage/internal/blob"
 	"codestorage/internal/meta"
 	"codestorage/internal/ref"
-	"codestorage/internal/spike"
+	"codestorage/internal/githttp"
 )
 
 func main() {
@@ -36,7 +36,7 @@ func main() {
 	case "serve":
 		err = cmdServe(ctx, os.Args[2:])
 	case "hook":
-		err = spike.RunHook(ctx, os.Args[2:])
+		err = githttp.RunHook(ctx, os.Args[2:])
 	case "keygen":
 		err = cmdKeygen(os.Args[2:])
 	case "mint":
@@ -70,7 +70,7 @@ func cmdServe(ctx context.Context, args []string) error {
 		return err
 	}
 	// The pre-receive/update hooks re-exec this binary with the server's
-	// inherited environment and read the legacy names (internal/spike/hook.go),
+	// inherited environment and read the legacy names (internal/githttp/hook.go),
 	// so propagate the resolved values regardless of which alias set them.
 	for _, kv := range [][2]string{{"PG_URL", cfg.pgURL}, {"BLOB_URL", cfg.blobURL}} {
 		if err := os.Setenv(kv[0], kv[1]); err != nil {
@@ -143,7 +143,7 @@ func cmdServe(ctx context.Context, args []string) error {
 		if err := os.MkdirAll(cfg.cacheDir, 0o755); err != nil {
 			return err
 		}
-		srv := spike.NewServer(st, bl, cfg.cacheDir, gitPub)
+		srv := githttp.NewServer(st, bl, cfg.cacheDir, gitPub)
 		if metaStore != nil {
 			// docs/05 git URLs address repos by repo_id while JWT repo
 			// claims carry the url (docs/02): resolve id->url for auth.
@@ -181,11 +181,11 @@ func cmdKeygen(args []string) error {
 	if *out == "" {
 		return fmt.Errorf("--out is required")
 	}
-	priv, err := spike.GenerateKeyPair()
+	priv, err := githttp.GenerateKeyPair()
 	if err != nil {
 		return err
 	}
-	privPath, pubPath, err := spike.WriteKeyPairPEM(priv, *out)
+	privPath, pubPath, err := githttp.WriteKeyPairPEM(priv, *out)
 	if err != nil {
 		return err
 	}
@@ -207,11 +207,11 @@ func cmdMint(args []string) error {
 	if *keyPath == "" || *repo == "" {
 		return fmt.Errorf("--key and --repo are required")
 	}
-	priv, err := spike.LoadPrivateKeyPEM(*keyPath)
+	priv, err := githttp.LoadPrivateKeyPEM(*keyPath)
 	if err != nil {
 		return err
 	}
-	token, err := spike.MintToken(priv, *iss, *repo, strings.Split(*scopes, ","), *refs, *ttl)
+	token, err := githttp.MintToken(priv, *iss, *repo, strings.Split(*scopes, ","), *refs, *ttl)
 	if err != nil {
 		return err
 	}

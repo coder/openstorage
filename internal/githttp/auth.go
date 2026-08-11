@@ -1,7 +1,8 @@
-// Package spike is a throwaway de-risk spike: git smart HTTP nodes with
+// Package githttp is the git smart HTTP surface (promoted from the p0/p1
+// de-risk spike): git smart HTTP nodes with
 // Postgres as ref authority, S3/MinIO as immutable pack storage, and local
 // disk as a rebuildable cache. Spike-local decisions are flagged in comments.
-package spike
+package githttp
 
 import (
 	"crypto/ecdsa"

@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"codestorage/internal/spike"
+	"codestorage/internal/githttp"
 )
 
 // mapEnv builds a getenv func from a fixed map (no process env mutation).
@@ -40,7 +40,7 @@ func TestEnvFirstPrecedence(t *testing.T) {
 }
 
 func TestResolveServeConfigSpikeCompat(t *testing.T) {
-	// Exactly how internal/spike/spike_test.go invokes serve.
+	// Exactly how internal/githttp/spike_test.go invokes serve.
 	cfg, err := resolveServeConfig(mapEnv(spikeEnv), "", "127.0.0.1:0", "/tmp/cache", "/tmp/key.pub.pem")
 	if err != nil {
 		t.Fatal(err)
@@ -152,7 +152,7 @@ func rsaPEM(t *testing.T) []byte {
 // ecdsaKeyPEM generates an ES256 keypair and returns the public PEM bytes.
 func ecdsaKeyPEM(t *testing.T) (pubPath string, pubPEM []byte) {
 	t.Helper()
-	priv, err := spike.GenerateKeyPair()
+	priv, err := githttp.GenerateKeyPair()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -162,7 +162,7 @@ func ecdsaKeyPEM(t *testing.T) (pubPath string, pubPEM []byte) {
 	}
 	pubPEM = pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: der})
 	pubPath = filepath.Join(t.TempDir(), "key.pub.pem")
-	if _, pubPath0, err := spike.WriteKeyPairPEM(priv, strings.TrimSuffix(pubPath, ".pub.pem")); err != nil {
+	if _, pubPath0, err := githttp.WriteKeyPairPEM(priv, strings.TrimSuffix(pubPath, ".pub.pem")); err != nil {
 		t.Fatal(err)
 	} else {
 		pubPath = pubPath0

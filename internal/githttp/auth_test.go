@@ -1,4 +1,4 @@
-package spike
+package githttp
 
 import (
 	"encoding/json"
