@@ -68,7 +68,7 @@ func removeSigningKey(t *testing.T, id int64) {
 // TestVerifySig_SSHMatrix walks the whole verify-sig decision table with a
 // real SSH-signed history (branch-protection.md "What gets rejected").
 func TestVerifySig_SSHMatrix(t *testing.T) {
-	repo := "t-verify-sig-ssh"
+	repo := registerRepo(t, "t-verify-sig-ssh")
 	work := initWorkRepo(t)
 	plain := mintTestToken(t, repo, "git:read,git:write", "")
 	vsToken := mintTestToken(t, repo, "git:read,git:write", verifySigMainRefs)
@@ -183,7 +183,7 @@ func TestVerifySig_GPG(t *testing.T) {
 	key := registerSigningKey(t, armored)
 	t.Cleanup(func() { removeSigningKey(t, key.ID) })
 
-	repo := "t-verify-sig-gpg"
+	repo := registerRepo(t, "t-verify-sig-gpg")
 	work := initWorkRepo(t)
 	plain := mintTestToken(t, repo, "git:read,git:write", "")
 	vsToken := mintTestToken(t, repo, "git:read,git:write", verifySigMainRefs)
@@ -212,7 +212,7 @@ func TestVerifySig_GPG(t *testing.T) {
 // standalone it acts as a catch-all rule; combined with `refs` it only fills
 // the gap left by refs (fold, not additive), preserving first-match-wins.
 func TestOpsFallback(t *testing.T) {
-	repo := "t-ops-fallback"
+	repo := registerRepo(t, "t-ops-fallback")
 	work := initWorkRepo(t)
 	plain := mintTestToken(t, repo, "git:read,git:write", "")
 	mustGit(t, work, "push", remoteURL(nodeA, repo, plain), "HEAD:refs/heads/main")
@@ -259,7 +259,7 @@ func TestOpsFallback(t *testing.T) {
 // end-to-end: a trailing `*` after `/` is a prefix match (covers nested
 // segments), and it does not bleed past the prefix boundary.
 func TestRefPolicy_TrailingGlob(t *testing.T) {
-	repo := "t-trailing-glob"
+	repo := registerRepo(t, "t-trailing-glob")
 	work := initWorkRepo(t)
 	plain := mintTestToken(t, repo, "git:read,git:write", "")
 	mustGit(t, work, "push", remoteURL(nodeA, repo, plain), "HEAD:refs/heads/main")
@@ -290,7 +290,7 @@ func TestRefPolicy_TrailingGlob(t *testing.T) {
 // `refs/namespaces/ephemeral/<refname>`, so persistent-branch rules do not
 // police the ephemeral copy — only `*` or explicit namespaced patterns do.
 func TestEphemeralPolicyQuirk(t *testing.T) {
-	repo := "t-eph-quirk"
+	repo := registerRepo(t, "t-eph-quirk")
 	work := initWorkRepo(t)
 	plain := mintTestToken(t, repo, "git:read,git:write", "")
 	mustGit(t, work, "push", remoteURL(nodeA, repo, plain), "HEAD:refs/heads/main")

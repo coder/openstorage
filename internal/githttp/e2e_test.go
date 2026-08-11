@@ -386,6 +386,47 @@ func remoteURL(n *testNode, repo, token string) string {
 	return fmt.Sprintf("http://t:%s@%s/%s.git", token, n.addr, repo)
 }
 
+// registerRepo creates the repo record in meta and returns its RepoID — the
+// canonical storage key (ADR-21: unregistered path elements are 404 on the
+// git surface, and pg/blob state is keyed by RepoID only). Tests push via
+// the returned RepoID so their storage assertions read the same key;
+// name-style URL resolution is pinned by TestRepoKeySplit_CrossSurface.
+func registerRepo(t *testing.T, url string) string {
+	t.Helper()
+	repo, err := testMeta.CreateRepo(context.Background(), testOrg, url, "main")
+	if err != nil {
+		t.Fatalf("register repo %q: %v", url, err)
+	}
+	return repo.RepoID
+}
+
+// apiGet hits the node's HTTP API with a Bearer token, decodes a 200 JSON
+// body into out (unless nil), and returns the status code (cross-surface
+// assertions against the read API).
+func apiGet(t *testing.T, n *testNode, token, path string, out any) int {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodGet, "http://"+n.addr+path, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out != nil && resp.StatusCode == http.StatusOK {
+		if err := json.Unmarshal(body, out); err != nil {
+			t.Fatalf("decode %s: %v\n%s", path, err, body)
+		}
+	}
+	return resp.StatusCode
+}
+
 func pgRefs(t *testing.T, repo string) map[string]string {
 	t.Helper()
 	refs, err := testStore.ListRefs(context.Background(), repo)
@@ -416,7 +457,7 @@ func minioPacks(t *testing.T, repo string) []blob.ListedObject {
 // --- acceptance criterion 1 ------------------------------------------------
 
 func TestPush_RefsInPG_PacksInMinIO(t *testing.T) {
-	repo := "t1-push"
+	repo := registerRepo(t, "t1-push")
 	work := initWorkRepo(t)
 	token := mintTestToken(t, repo, "git:read,git:write", "")
 
@@ -439,7 +480,7 @@ func TestPush_RefsInPG_PacksInMinIO(t *testing.T) {
 // --- acceptance criterion 2 ------------------------------------------------
 
 func TestCloneFromNodeB_FreshCache(t *testing.T) {
-	repo := "t2-clone"
+	repo := registerRepo(t, "t2-clone")
 	work := initWorkRepo(t)
 	token := mintTestToken(t, repo, "git:read,git:write", "")
 
@@ -467,7 +508,7 @@ func TestCloneFromNodeB_FreshCache(t *testing.T) {
 // --- acceptance criterion 3 ------------------------------------------------
 
 func TestConcurrentPush_OneWinsCAS(t *testing.T) {
-	repo := "t3-race"
+	repo := registerRepo(t, "t3-race")
 	work := initWorkRepo(t)
 	token := mintTestToken(t, repo, "git:read,git:write", "")
 	mustGit(t, work, "push", remoteURL(nodeA, repo, token), "HEAD:refs/heads/main")
@@ -528,7 +569,7 @@ func TestConcurrentPush_OneWinsCAS(t *testing.T) {
 // --- acceptance criterion 4 ------------------------------------------------
 
 func TestCrash_AfterS3_BeforePGCommit(t *testing.T) {
-	repo := "t4-crash"
+	repo := registerRepo(t, "t4-crash")
 	work := initWorkRepo(t)
 	token := mintTestToken(t, repo, "git:read,git:write", "")
 	mustGit(t, work, "push", remoteURL(nodeA, repo, token), "HEAD:refs/heads/main")
@@ -585,7 +626,7 @@ func TestCrash_AfterS3_BeforePGCommit(t *testing.T) {
 // The crash knob is a test-only fault injection: a node NOT running in test
 // mode must refuse the header outright (403) without touching PG or S3.
 func TestCrashHeader_RefusedOutsideTestMode(t *testing.T) {
-	repo := "t4b-crash-refused"
+	repo := registerRepo(t, "t4b-crash-refused")
 	work := initWorkRepo(t)
 	token := mintTestToken(t, repo, "git:read,git:write", "")
 	prodNode := startNodeT(t, "CODESTORAGE_TEST_MODE=") // later duplicate wins
@@ -619,7 +660,7 @@ func TestCrashHeader_RefusedOutsideTestMode(t *testing.T) {
 // TestAuth_Matrix drives the failure mapping end-to-end over real HTTP:
 // 401 for anything the Verifier rejects, 403 for valid-but-wrong tokens.
 func TestAuth_Matrix(t *testing.T) {
-	repo := "t-auth-matrix"
+	repo := registerRepo(t, "t-auth-matrix")
 	work := initWorkRepo(t)
 	setup := mintTestToken(t, repo, "git:read,git:write", "")
 	mustGit(t, work, "push", remoteURL(nodeA, repo, setup), "HEAD:refs/heads/main")
@@ -716,7 +757,7 @@ func TestSplitRepoPath_Namespaces(t *testing.T) {
 // commit) must succeed: depending on git version/client it carries an empty
 // pack or no pack at all, and neither may be rejected by pre-receive.
 func TestBranchCreate_NoNewObjects(t *testing.T) {
-	repo := "t6-branch-create"
+	repo := registerRepo(t, "t6-branch-create")
 	work := initWorkRepo(t)
 	token := mintTestToken(t, repo, "git:read,git:write", "")
 	mustGit(t, work, "push", remoteURL(nodeA, repo, token), "HEAD:refs/heads/main")
@@ -738,7 +779,7 @@ func TestBranchCreate_NoNewObjects(t *testing.T) {
 }
 
 func TestRefPolicy_NoPushWildcard(t *testing.T) {
-	repo := "t7-no-push"
+	repo := registerRepo(t, "t7-no-push")
 	work := initWorkRepo(t)
 	setupToken := mintTestToken(t, repo, "git:read,git:write", "")
 	mustGit(t, work, "push", remoteURL(nodeA, repo, setupToken), "HEAD:refs/heads/main")
@@ -768,7 +809,7 @@ func TestRefPolicy_NoPushWildcard(t *testing.T) {
 // Extended with promotion prep: fetching from `+ephemeral` and pushing the
 // same objects to a persistent branch is the client-side promotion flow.
 func TestNamespace_EphemeralIsolated(t *testing.T) {
-	repo := "t9-ns"
+	repo := registerRepo(t, "t9-ns")
 	work := initWorkRepo(t)
 	token := mintTestToken(t, repo, "git:read,git:write", "") // minted for the base repo id
 	mustGit(t, work, "push", remoteURL(nodeA, repo, token), "HEAD:refs/heads/main")
@@ -828,7 +869,7 @@ func TestNamespace_EphemeralIsolated(t *testing.T) {
 // isolated ref space (clone/push/fetch), invisible from the persistent
 // remote.
 func TestNamespace_ImportRoundTrip(t *testing.T) {
-	repo := "t10-import"
+	repo := registerRepo(t, "t10-import")
 	work := initWorkRepo(t)
 	token := mintTestToken(t, repo, "git:read,git:write", "")
 
@@ -883,7 +924,7 @@ func mapsEqual(a, b map[string]string) bool {
 // --- acceptance criterion 5 ------------------------------------------------
 
 func TestForcePush_RejectedPerRef(t *testing.T) {
-	repo := "t5-policy"
+	repo := registerRepo(t, "t5-policy")
 	work := initWorkRepo(t)
 	token := mintTestToken(t, repo, "git:read,git:write", "")
 	mustGit(t, work, "push", remoteURL(nodeA, repo, token), "HEAD:refs/heads/main")
@@ -931,7 +972,7 @@ func TestForcePush_RejectedPerRef(t *testing.T) {
 // The policed ref is deliberately NOT the repo HEAD: deleting HEAD is
 // rejected by git's own receive.denyDeleteCurrent before hooks run.
 func TestRefPolicy_NoForcePushDeniesDeletion(t *testing.T) {
-	repo := "t8-delete-policy"
+	repo := registerRepo(t, "t8-delete-policy")
 	work := initWorkRepo(t)
 	setupToken := mintTestToken(t, repo, "git:read,git:write", "")
 	mustGit(t, work, "push", remoteURL(nodeA, repo, setupToken),
@@ -974,7 +1015,7 @@ func TestLocalMode_PacksOnDiskAndStatelessCache(t *testing.T) {
 		t.Skipf("local-mode-only test (running the %s lane; set CODESTORAGE_TEST_BACKEND=local)", testBackend)
 	}
 
-	repo := "t-local-mode"
+	repo := registerRepo(t, "t-local-mode")
 	work := initWorkRepo(t)
 	token := mintTestToken(t, repo, "git:read,git:write", "")
 
@@ -1022,5 +1063,90 @@ func TestLocalMode_PacksOnDiskAndStatelessCache(t *testing.T) {
 	}
 	if out, err := tryGit(cloneDir, "fsck", "--strict"); err != nil {
 		t.Fatalf("git fsck: %v\n%s", err, out)
+	}
+}
+
+// --- repo-key-split regression (ADR-21) --------------------------------------
+
+// TestRepoKeySplit_CrossSurface pins the p3 gate blocker fix end-to-end:
+// a push to the name-style /{url}.git URL lands under the RepoID storage
+// key (never the raw path element) and is immediately visible to the read
+// API; the repo_id-style URL addresses the same repo; unregistered names
+// are 404 on the git surface even for authenticated callers.
+func TestRepoKeySplit_CrossSurface(t *testing.T) {
+	const url = "t-keysplit"
+	repoID := registerRepo(t, url)
+	work := initWorkRepo(t)
+	token := mintTestToken(t, url, "git:read,git:write", "") // claim carries the url
+
+	// (a) Push via the name-style URL (README §6).
+	mustGit(t, work, "push", remoteURL(nodeA, url, token), "HEAD:refs/heads/main")
+	head := revParse(t, work, "HEAD")
+
+	// Storage is keyed by RepoID only.
+	if got := pgRefs(t, repoID)["refs/heads/main"]; got != head {
+		t.Fatalf("refs under RepoID key = %v, want main=%s", pgRefs(t, repoID), head)
+	}
+	if refs := pgRefs(t, url); len(refs) != 0 {
+		t.Fatalf("raw url path element must not key ref storage, found: %v", refs)
+	}
+	if objs := minioPacks(t, url); len(objs) != 0 {
+		t.Fatalf("raw url path element must not key pack storage, found: %v", objs)
+	}
+	if objs := minioPacks(t, repoID); len(objs) < 1 {
+		t.Fatal("no pack objects under the RepoID key")
+	}
+
+	// Cross-surface: the read API (keyed by RepoID since p3) sees the push.
+	var branches struct {
+		Branches []struct {
+			Name    string `json:"name"`
+			HeadSHA string `json:"head_sha"`
+		} `json:"branches"`
+	}
+	if status := apiGet(t, nodeA, token, "/api/v1/repos/branches", &branches); status != http.StatusOK {
+		t.Fatalf("GET /repos/branches = %d", status)
+	}
+	foundMain := false
+	for _, b := range branches.Branches {
+		if b.Name == "main" && b.HeadSHA == head {
+			foundMain = true
+		}
+	}
+	if !foundMain {
+		t.Fatalf("read API branches missing main@%s: %+v", head, branches.Branches)
+	}
+	var commits struct {
+		Commits []struct {
+			SHA string `json:"sha"`
+		} `json:"commits"`
+	}
+	if status := apiGet(t, nodeA, token, "/api/v1/repos/commits?branch=main", &commits); status != http.StatusOK {
+		t.Fatalf("GET /repos/commits = %d", status)
+	}
+	if len(commits.Commits) == 0 || commits.Commits[0].SHA != head {
+		t.Fatalf("read API commits missing pushed head %s: %+v", head, commits.Commits)
+	}
+
+	// (c) The repo_id-style URL addresses the same repo.
+	cloneDir := filepath.Join(t.TempDir(), "clone")
+	mustGit(t, "", "clone", remoteURL(nodeA, repoID, token), cloneDir)
+	if got := revParse(t, cloneDir, "HEAD"); got != head {
+		t.Fatalf("repo_id-style clone HEAD = %q, want %q", got, head)
+	}
+
+	// (b) Unregistered names are 404 for authenticated callers (repos must
+	// be created via POST /api/v1/repos first). git surfaces the 404 as a
+	// "repository ... not found" fatal.
+	ghost := mintTestToken(t, "t-keysplit-ghost", "git:read,git:write", "")
+	out, err := tryGit(work, "push", remoteURL(nodeA, "t-keysplit-ghost", ghost), "HEAD:refs/heads/main")
+	if err == nil {
+		t.Fatalf("push to unregistered repo should fail:\n%s", out)
+	}
+	if !strings.Contains(out, "not found") && !strings.Contains(out, "404") {
+		t.Fatalf("expected a 404/not-found rejection, got:\n%s", out)
+	}
+	if refs := pgRefs(t, "t-keysplit-ghost"); len(refs) != 0 {
+		t.Fatalf("unregistered push must not create refs: %v", refs)
 	}
 }

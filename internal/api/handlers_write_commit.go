@@ -150,16 +150,13 @@ func (s *server) wcInternal(w http.ResponseWriter, r *http.Request, op string, e
 
 // wcResolveRepo maps the JWT repo claim to its live repo row with envelope
 // errors. The claim may carry the repo url or the server-generated repo_id
-// (docs/02: auth accepts both) — try url first (the read-path convention),
-// then repo_id.
+// (docs/02: auth accepts both), resolved through the shared
+// meta.ResolveRepoKey (ADR-21: repo_id first, then url).
 func (s *server) wcResolveRepo(w http.ResponseWriter, r *http.Request) (meta.Repo, bool) {
 	claims := mustClaims(r)
 	// requireAuth(orgLevel=false) rejects empty/"org" repo claims with 403.
 	assertf(claims.Repo != "" && claims.Repo != auth.RepoClaimOrg, "write: repo claim %q passed requireAuth", claims.Repo)
-	repo, err := s.store.GetRepoByURL(r.Context(), claims.Iss, claims.Repo)
-	if errors.Is(err, meta.ErrNotFound) {
-		repo, err = s.store.GetRepoByID(r.Context(), claims.Iss, claims.Repo)
-	}
+	repo, err := meta.ResolveRepoKey(r.Context(), s.store, claims.Iss, claims.Repo)
 	switch {
 	case errors.Is(err, meta.ErrNotFound):
 		wcFail(w, http.StatusNotFound, "not_found", "repository not found", "", "")

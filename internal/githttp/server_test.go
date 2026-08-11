@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"codestorage/internal/auth"
+	"codestorage/internal/meta"
 )
 
 // memKeys is an in-memory auth.KeySource: org name -> PEM public key blocks.
@@ -158,6 +159,7 @@ func TestAuthenticate_ResolvesRepoIDToURLClaim(t *testing.T) {
 		repoID  = "repo_abc123def456"
 		repoURL = "team/project-alpha"
 	)
+	rec := meta.Repo{RepoID: repoID, URL: repoURL}
 	token := mintUnitToken(t, key, "ES256", unitClaims("org1", repoURL, auth.ScopeGitRead))
 	newReq := func() *http.Request { return authReq("/"+repoID+".git/info/refs", "t", token) }
 	srv := &Server{Verifier: verifier, Org: "org1"}
@@ -167,14 +169,15 @@ func TestAuthenticate_ResolvesRepoIDToURLClaim(t *testing.T) {
 		t.Fatalf("no resolver: status = %d, err = %v; want 403", status, err)
 	}
 
-	srv.ResolveRepoURL = func(_ context.Context, id string) (string, bool) {
-		if id == repoID {
-			return repoURL, true
+	srv.ResolveRepo = func(_ context.Context, base string) (meta.Repo, bool) {
+		if base == repoID {
+			return rec, true
 		}
-		return "", false
+		return meta.Repo{}, false
 	}
 
-	// Resolver maps the repo_id to the claimed url: authenticated.
+	// Resolver maps the repo_id path to a record whose url matches the
+	// claim: authenticated.
 	claims, status, err := srv.authenticate(newReq(), repoID, auth.ScopeGitRead)
 	if err != nil {
 		t.Fatalf("resolved auth failed: status = %d, err = %v", status, err)
@@ -193,11 +196,67 @@ func TestAuthenticate_ResolvesRepoIDToURLClaim(t *testing.T) {
 		t.Fatalf("unknown id: status = %d, err = %v; want 403", status, err)
 	}
 
+	// The reverse direction: a repo_id claim matches a url-style path
+	// element through the same record (ADR-21 accepts both key forms).
+	idToken := mintUnitToken(t, key, "ES256", unitClaims("org1", repoID, auth.ScopeGitRead))
+	srvByURL := &Server{Verifier: verifier, Org: "org1", ResolveRepo: func(_ context.Context, base string) (meta.Repo, bool) {
+		if base == "project-alpha" {
+			return rec, true
+		}
+		return meta.Repo{}, false
+	}}
+	req := authReq("/project-alpha.git/info/refs", "t", idToken)
+	if _, status, err := srvByURL.authenticate(req, "project-alpha", auth.ScopeGitRead); err != nil {
+		t.Fatalf("id-claim/url-path auth failed: status = %d, err = %v", status, err)
+	}
+
 	// Verbatim claim==path matching still works without a resolver.
 	verbatim := mintUnitToken(t, key, "ES256", unitClaims("org1", "plainrepo", auth.ScopeGitRead))
-	req := authReq("/plainrepo.git/info/refs", "t", verbatim)
+	req = authReq("/plainrepo.git/info/refs", "t", verbatim)
 	if _, status, err := (&Server{Verifier: verifier, Org: "org1"}).authenticate(req, "plainrepo", auth.ScopeGitRead); err != nil {
 		t.Fatalf("verbatim auth failed: status = %d, err = %v", status, err)
+	}
+}
+
+// TestAuthenticate_ResolveRepoCanonicalizes pins the repo-key-split fix
+// (ADR-21): resolveTarget maps any accepted path element to the canonical
+// RepoID(+suffix) storage key, and unresolvable elements (including every
+// element when no resolver is wired) are not targets at all — the handlers
+// answer 404 instead of keying storage by the raw path element.
+func TestAuthenticate_ResolveRepoCanonicalizes(t *testing.T) {
+	rec := meta.Repo{RepoID: "repo_abc123def456", URL: "project-alpha"}
+	srv := &Server{ResolveRepo: func(_ context.Context, base string) (meta.Repo, bool) {
+		if base == rec.RepoID || base == rec.URL {
+			return rec, true
+		}
+		return meta.Repo{}, false
+	}}
+
+	for pathElem, wantKey := range map[string]string{
+		rec.URL:                   rec.RepoID,
+		rec.RepoID:                rec.RepoID,
+		rec.URL + "+ephemeral":    rec.RepoID + "+ephemeral",
+		rec.RepoID + "+import":    rec.RepoID + "+import",
+		rec.URL + "+import":       rec.RepoID + "+import",
+		rec.RepoID + "+ephemeral": rec.RepoID + "+ephemeral",
+	} {
+		target, ok := srv.resolveTarget(context.Background(), pathElem)
+		if !ok {
+			t.Fatalf("resolveTarget(%q): not resolved", pathElem)
+		}
+		if target.key != wantKey {
+			t.Fatalf("resolveTarget(%q).key = %q, want %q", pathElem, target.key, wantKey)
+		}
+		if target.repo.RepoID != rec.RepoID {
+			t.Fatalf("resolveTarget(%q).repo = %+v, want %+v", pathElem, target.repo, rec)
+		}
+	}
+
+	if _, ok := srv.resolveTarget(context.Background(), "unregistered"); ok {
+		t.Fatal("unregistered element must not resolve")
+	}
+	if _, ok := (&Server{}).resolveTarget(context.Background(), "anything"); ok {
+		t.Fatal("nil resolver must resolve nothing")
 	}
 }
 

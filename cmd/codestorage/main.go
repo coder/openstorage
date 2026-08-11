@@ -144,18 +144,19 @@ func cmdServe(ctx context.Context, args []string) error {
 	// Git smart-HTTP path, authenticated with the same verifier as the API
 	// (ADR-8: iss-resolved org keys; the spike's single-key mode is gone).
 	srv := githttp.NewServer(st, bl, cfg.cacheDir, verifier, cfg.org)
-	// docs/05 git URLs address repos by repo_id while JWT repo claims carry
-	// the url (docs/02): resolve id->url for auth.
+	// docs/05 git URLs address repos by repo_id (name-style urls accepted
+	// too, ADR-21); the resolved RepoID is the only storage key, and the
+	// record backs claim matching for url- or id-carrying tokens (docs/02).
 	org := cfg.org
-	srv.ResolveRepoURL = func(ctx context.Context, repoID string) (string, bool) {
-		repo, err := metaStore.GetRepoByID(ctx, org, repoID)
+	srv.ResolveRepo = func(ctx context.Context, base string) (meta.Repo, bool) {
+		repo, err := meta.ResolveRepoKey(ctx, metaStore, org, base)
 		if err != nil {
 			if !errors.Is(err, meta.ErrNotFound) {
-				fmt.Fprintf(os.Stderr, "resolve repo id %q: %v\n", repoID, err)
+				fmt.Fprintf(os.Stderr, "resolve repo %q: %v\n", base, err)
 			}
-			return "", false
+			return meta.Repo{}, false
 		}
-		return repo.URL, true
+		return repo, true
 	}
 	mux.Handle("/", srv.Handler())
 

@@ -18,6 +18,7 @@ import (
 
 	"codestorage/internal/auth"
 	"codestorage/internal/blob"
+	"codestorage/internal/meta"
 	"codestorage/internal/ref"
 )
 
@@ -46,11 +47,41 @@ type Server struct {
 	// TestMode gates fault-injection knobs (crash header). Only ever set
 	// from CODESTORAGE_TEST_MODE=1; the crash header is refused otherwise.
 	TestMode bool
-	// ResolveRepoURL (optional) maps the repo_id path element (docs/05 URL
-	// style) to the repo's url value so tokens carrying the url claim
-	// (docs/02) authenticate. ok=false when the repo_id is unknown. When
-	// nil, only tokens whose claim equals the path element verbatim match.
-	ResolveRepoURL func(ctx context.Context, repoID string) (url string, ok bool)
+	// ResolveRepo maps a base path element (docs/05: repo_id, but ADR-21
+	// accepts name-style urls too) to its live repo record. ok=false when
+	// no live repo matches — both handlers then answer 404 (repos must be
+	// created via POST /api/v1/repos first). The record's RepoID is the
+	// only storage key (repo-key-split fix); it also lets tokens carrying
+	// either the url or the repo_id claim (docs/02) authenticate. When
+	// nil, every path element is unresolvable.
+	ResolveRepo func(ctx context.Context, base string) (meta.Repo, bool)
+}
+
+// repoTarget is a resolved request target: the live repo record plus the
+// canonical storage key — RepoID with the URL element's namespace suffix
+// (`+ephemeral`/`+import`) reattached. The key is the ONLY value handed to
+// hydrate, the pack/ref stores, and the update hook env; the raw path
+// element must never key storage (ADR-21).
+type repoTarget struct {
+	repo meta.Repo
+	key  string
+}
+
+// resolveTarget canonicalizes a validated path element to its repoTarget.
+// ok=false means no live repo record matches the base element.
+func (s *Server) resolveTarget(ctx context.Context, pathElem string) (repoTarget, bool) {
+	assertf(ValidRepoName(pathElem), "resolveTarget: invalid path element %q", pathElem)
+	if s.ResolveRepo == nil {
+		return repoTarget{}, false
+	}
+	base := BaseRepo(pathElem)
+	repo, ok := s.ResolveRepo(ctx, base)
+	if !ok {
+		return repoTarget{}, false
+	}
+	assertf(repo.RepoID != "", "resolveTarget: resolver returned empty RepoID for %q", base)
+	suffix := strings.TrimPrefix(pathElem, base) // "" | "+ephemeral" | "+import"
+	return repoTarget{repo: repo, key: repo.RepoID + suffix}, true
 }
 
 func NewServer(st ref.RefStore, bl blob.BlobStore, cacheDir string, verifier auth.Verifier, org string) *Server {
@@ -134,13 +165,16 @@ func (s *Server) authenticate(r *http.Request, repo, scope string) (*auth.Claims
 		return nil, http.StatusForbidden, fmt.Errorf("token is not repo-scoped")
 	}
 	// docs/02: the repo claim carries the repo url (or id); docs/05 paths
-	// address repos by repo_id. Accept a verbatim match, else resolve the
-	// path element to its url and compare.
+	// address repos by repo_id but name-style urls resolve too (ADR-21).
+	// Accept a verbatim match, else resolve the path element and compare
+	// against both the record's repo_id and url. Auth stays before the
+	// existence check: an unresolvable element with a mismatched claim is
+	// a 403 here, never a repo-existence oracle.
 	target := BaseRepo(repo)
 	if claims.Repo != target {
 		matched := false
-		if s.ResolveRepoURL != nil {
-			if url, ok := s.ResolveRepoURL(r.Context(), target); ok && claims.Repo == url {
+		if s.ResolveRepo != nil {
+			if rec, ok := s.ResolveRepo(r.Context(), target); ok && (claims.Repo == rec.RepoID || claims.Repo == rec.URL) {
 				matched = true
 			}
 		}
@@ -200,9 +234,16 @@ func (s *Server) handleInfoRefs(w http.ResponseWriter, r *http.Request, repo str
 		httpError(w, status, err.Error())
 		return
 	}
-	repoPath, err := s.hydrate(r.Context(), repo, service)
+	// Auth before existence: only authenticated callers learn whether the
+	// repo is registered (ADR-21: unregistered path elements are 404).
+	target, ok := s.resolveTarget(r.Context(), repo)
+	if !ok {
+		httpError(w, http.StatusNotFound, "repository not found")
+		return
+	}
+	repoPath, err := s.hydrate(r.Context(), target.key, service)
 	if err != nil {
-		log.Printf("hydrate %s: %v", repo, err)
+		log.Printf("hydrate %s: %v", target.key, err)
 		httpError(w, http.StatusInternalServerError, "hydration failed")
 		return
 	}
@@ -236,9 +277,16 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 		httpError(w, http.StatusForbidden, CrashHeader+" refused: server not in test mode")
 		return
 	}
-	repoPath, err := s.hydrate(r.Context(), repo, service)
+	// Auth before existence (see handleInfoRefs); target.key is the only
+	// storage key from here on (hydrate + hook env).
+	target, ok := s.resolveTarget(r.Context(), repo)
+	if !ok {
+		httpError(w, http.StatusNotFound, "repository not found")
+		return
+	}
+	repoPath, err := s.hydrate(r.Context(), target.key, service)
 	if err != nil {
-		log.Printf("hydrate %s: %v", repo, err)
+		log.Printf("hydrate %s: %v", target.key, err)
 		httpError(w, http.StatusInternalServerError, "hydration failed")
 		return
 	}
@@ -259,7 +307,7 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 	cmd.Env = os.Environ()
 	if service == "receive-pack" {
 		cmd.Env = append(cmd.Env,
-			EnvRepo+"="+repo,
+			EnvRepo+"="+target.key,
 			EnvOrg+"="+s.Org,
 		)
 		// The refs claim is passed through raw (docs/02 tuple encoding);

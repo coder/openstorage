@@ -98,7 +98,7 @@ func TestEnsureCacheRepo_RepairsHooksAndConfig(t *testing.T) {
 // and atomically replaces it, so hydrate succeeds on the FIRST attempt.
 func TestHydratePacks_ReplacesCorruptPack(t *testing.T) {
 	ctx := context.Background()
-	repo := "t-hydrate-corrupt"
+	repo := registerRepo(t, "t-hydrate-corrupt")
 	work := initWorkRepo(t)
 	token := mintTestToken(t, repo, "git:read,git:write", "")
 	mustGit(t, work, "push", remoteURL(nodeA, repo, token), "HEAD:refs/heads/main")
@@ -150,7 +150,7 @@ func TestHydratePacks_ReplacesCorruptPack(t *testing.T) {
 // failure).
 func TestHydratePacks_ConcurrentHydratorsSerialize(t *testing.T) {
 	ctx := context.Background()
-	repo := "t-hydrate-concurrent"
+	repo := registerRepo(t, "t-hydrate-concurrent")
 	work := initWorkRepo(t)
 	token := mintTestToken(t, repo, "git:read,git:write", "")
 	mustGit(t, work, "push", remoteURL(nodeA, repo, token), "HEAD:refs/heads/main")

@@ -28,14 +28,17 @@ import (
 // cursors. Helpers deliberately carry a "core" prefix: sibling endpoint
 // files add their own helpers and must not collide in this package.
 
-// resolveReadRepo maps the JWT repo claim to its live repo row; a repo that
-// never existed (or is soft-deleted) is a 404 for every read endpoint.
-// Writes the error response and returns ok=false on failure.
-func (s *server) resolveReadRepo(w http.ResponseWriter, r *http.Request) (meta.Repo, bool) {
+// resolveRepo maps the JWT repo claim — url or repo_id (docs/02) — to its
+// live repo row via meta.ResolveRepoKey (ADR-21); a repo that never existed
+// (or is soft-deleted) is a 404. Writes the {"error"} response and returns
+// ok=false on failure. Shared by the read and write surfaces; write
+// handlers that must answer with the docs/04 result envelope instead wrap
+// it (wcResolveRepo).
+func (s *server) resolveRepo(w http.ResponseWriter, r *http.Request) (meta.Repo, bool) {
 	claims := mustClaims(r)
 	// requireAuth(orgLevel=false) rejects empty/"org" repo claims with 403.
-	assertf(claims.Repo != "" && claims.Repo != auth.RepoClaimOrg, "read: repo claim %q passed requireAuth", claims.Repo)
-	repo, err := s.store.GetRepoByURL(r.Context(), claims.Iss, claims.Repo)
+	assertf(claims.Repo != "" && claims.Repo != auth.RepoClaimOrg, "repo claim %q passed requireAuth", claims.Repo)
+	repo, err := meta.ResolveRepoKey(r.Context(), s.store, claims.Iss, claims.Repo)
 	switch {
 	case errors.Is(err, meta.ErrNotFound):
 		writeErr(w, http.StatusNotFound, "repository not found")
@@ -46,6 +49,11 @@ func (s *server) resolveReadRepo(w http.ResponseWriter, r *http.Request) (meta.R
 	}
 	assertf(repo.RepoID != "", "store returned repo with empty RepoID")
 	return repo, true
+}
+
+// resolveReadRepo is the read surface's name for the shared resolution.
+func (s *server) resolveReadRepo(w http.ResponseWriter, r *http.Request) (meta.Repo, bool) {
+	return s.resolveRepo(w, r)
 }
 
 // materializeReadRepo rebuilds the repo's bare cache from the ref/blob
