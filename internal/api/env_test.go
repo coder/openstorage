@@ -210,6 +210,8 @@ type tokenSpec struct {
 	sub    string // default auth.SubjectLiteral
 	repo   string
 	scopes []string
+	refs   string        // raw `refs` claim JSON (docs/02 policy tuples); "" omits
+	ops    []string      // deprecated repo-wide `ops` claim; nil omits
 	expIn  time.Duration // default 1h; negative mints an expired token
 	key    any           // signing key override (default: env key for alg)
 }
@@ -252,14 +254,21 @@ func (e *testEnv) mint(t *testing.T, spec tokenSpec) string {
 		}
 	}
 	now := time.Now()
-	payload, err := json.Marshal(map[string]any{
+	claims := map[string]any{
 		"iss":    spec.iss,
 		"sub":    spec.sub,
 		"repo":   spec.repo,
 		"scopes": spec.scopes,
 		"iat":    now.Unix(),
 		"exp":    now.Add(spec.expIn).Unix(),
-	})
+	}
+	if spec.refs != "" {
+		claims["refs"] = json.RawMessage(spec.refs)
+	}
+	if spec.ops != nil {
+		claims["ops"] = spec.ops
+	}
+	payload, err := json.Marshal(claims)
 	if err != nil {
 		t.Fatal(err)
 	}

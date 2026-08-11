@@ -217,6 +217,62 @@ func TestPerRepoRoutesRejectNonRepoClaims(t *testing.T) {
 	}
 }
 
+// TestRefPolicyOnWriteEndpoints covers docs/02 ref-policy enforcement on
+// the API write path: repo deletion destroys every ref, so a token whose
+// policies could deny deleting some ref must not delete the repo; malformed
+// policy claims fail closed on both write endpoints; verify-sig-only and
+// empty-ops policies never block (deletion introduces no commits).
+func TestRefPolicyOnWriteEndpoints(t *testing.T) {
+	e := testEnvironment(t)
+	org := e.newOrg(t)
+
+	deleteRepo := func(t *testing.T, spec tokenSpec, wantStatus int) {
+		t.Helper()
+		tok := e.mint(t, spec)
+		resp, body := e.doReq(t, http.MethodDelete, "/api/v1/repos/delete", tok, nil, "")
+		if resp.StatusCode != wantStatus {
+			t.Fatalf("DELETE status = %d, want %d (body %s)", resp.StatusCode, wantStatus, body)
+		}
+		if wantStatus != http.StatusOK {
+			requireEnvelope(t, resp, body)
+		}
+	}
+
+	repoURL := "repo-" + randomHex(t, 8)
+	createRepo(t, e, org, repoURL, nil, http.StatusOK)
+
+	// Malformed policy claims fail closed (403) on both write endpoints.
+	badTok := e.mint(t, tokenSpec{iss: org, repo: "repo-" + randomHex(t, 8),
+		scopes: []string{auth.ScopeRepoWrite}, refs: `["not-a-tuple"]`})
+	resp, body := e.doReq(t, http.MethodPost, "/api/v1/repos", badTok, nil, "")
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("create with malformed refs claim: status = %d, want 403 (body %s)", resp.StatusCode, body)
+	}
+	requireEnvelope(t, resp, body)
+	deleteRepo(t, tokenSpec{iss: org, repo: repoURL,
+		scopes: []string{auth.ScopeRepoWrite}, refs: `["not-a-tuple"]`}, http.StatusForbidden)
+
+	// Any rule that could deny a ref deletion denies whole-repo deletion:
+	// an explicit no-push rule, and the deprecated repo-wide ops fallback.
+	deleteRepo(t, tokenSpec{iss: org, repo: repoURL,
+		scopes: []string{auth.ScopeRepoWrite}, refs: `[["main", ["no-push"]]]`}, http.StatusForbidden)
+	deleteRepo(t, tokenSpec{iss: org, repo: repoURL,
+		scopes: []string{auth.ScopeRepoWrite}, ops: []string{"no-force-push"}}, http.StatusForbidden)
+
+	// A restrictive-but-well-formed policy does not block repo creation
+	// (a new repo has no refs to protect).
+	createTok := e.mint(t, tokenSpec{iss: org, repo: "repo-" + randomHex(t, 8),
+		scopes: []string{auth.ScopeRepoWrite}, refs: `[["*", ["no-push"]]]`})
+	resp, body = e.doReq(t, http.MethodPost, "/api/v1/repos", createTok, nil, "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("create with no-push policy: status = %d, want 200 (body %s)", resp.StatusCode, body)
+	}
+
+	// verify-sig and empty ops never deny deletions.
+	deleteRepo(t, tokenSpec{iss: org, repo: repoURL,
+		scopes: []string{auth.ScopeRepoWrite}, refs: `[["main", ["verify-sig"]], ["*", []]]`}, http.StatusOK)
+}
+
 // TestCreateRepoDefaultBranchQueryParam covers the openapi.yaml POST /repos
 // `default_branch` query parameter: used when the body does not specify a
 // branch; the body wins when both are present.

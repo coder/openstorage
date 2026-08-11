@@ -34,6 +34,38 @@ func mustClaims(r *http.Request) *auth.Claims {
 	return claims
 }
 
+// refPolicies parses the token's ref-policy claims the same way the git
+// update hook does (docs/02): the ordered `refs` tuples with the deprecated
+// repo-wide `ops` claim folded in exactly once. Malformed claims fail
+// closed — callers must map the error to 403.
+func refPolicies(claims *auth.Claims) ([]auth.RefPolicy, error) {
+	var policies []auth.RefPolicy
+	if len(claims.Refs) > 0 {
+		var err error
+		policies, err = auth.ParseRefPolicies(string(claims.Refs))
+		if err != nil {
+			return nil, err
+		}
+	}
+	return auth.FoldOps(policies, claims.Ops), nil
+}
+
+// policyDeniesRepoDelete reports whether any policy rule carries an op that
+// denies deleting a matching ref: no-push denies every update, no-force-push
+// denies deletions (hook semantics), and unknown ops fail closed. Only
+// verify-sig never denies a deletion — it polices introduced commits, and
+// deletions introduce none.
+func policyDeniesRepoDelete(policies []auth.RefPolicy) (string, bool) {
+	for _, rule := range policies {
+		for _, op := range rule.Ops {
+			if op != auth.OpVerifySig {
+				return op, true
+			}
+		}
+	}
+	return "", false
+}
+
 // branchComponentRe matches one conservative git ref component: leading
 // alphanumeric, then alphanumerics plus . _ - (docs/03: invalid input -> 400).
 var branchComponentRe = regexp.MustCompile(`\A[A-Za-z0-9][A-Za-z0-9._-]*\z`)
@@ -71,6 +103,14 @@ func (s *server) handleCreateRepo(w http.ResponseWriter, r *http.Request) {
 	url := claims.Repo
 	// requireAuth(orgLevel=false) rejects empty/"org" repo claims with 403.
 	assertf(url != "" && url != auth.RepoClaimOrg, "create: repo claim %q passed requireAuth", url)
+
+	// docs/02: ref policies apply to every HTTP write endpoint. A new repo
+	// has no refs, so any well-formed policy allows creation — but a
+	// malformed policy claim fails closed, matching the git hook.
+	if _, err := refPolicies(claims); err != nil {
+		writeErr(w, http.StatusForbidden, err.Error())
+		return
+	}
 
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBodyBytes))
 	if err != nil {
@@ -227,6 +267,20 @@ type deleteRepoResponse struct {
 // repo never existed, 409 when already soft-deleted (docs/01, docs/03).
 func (s *server) handleDeleteRepo(w http.ResponseWriter, r *http.Request) {
 	claims := mustClaims(r)
+	// docs/02: ref policies apply to every HTTP write endpoint, and deleting
+	// a repository destroys every ref in it. The API has no ref inventory
+	// (meta.Store carries no refs), so this fails closed: any rule that
+	// could deny deleting some ref denies the whole-repo delete, even when
+	// an earlier rule would shadow it for every existing ref.
+	policies, err := refPolicies(claims)
+	if err != nil {
+		writeErr(w, http.StatusForbidden, err.Error())
+		return
+	}
+	if op, denied := policyDeniesRepoDelete(policies); denied {
+		writeErr(w, http.StatusForbidden, "ref policy op "+strconv.Quote(op)+" denies repository deletion")
+		return
+	}
 	repo, err := s.store.SoftDeleteRepo(r.Context(), claims.Iss, claims.Repo)
 	switch {
 	case errors.Is(err, meta.ErrNotFound):
