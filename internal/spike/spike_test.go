@@ -22,6 +22,9 @@ import (
 
 	tcminio "github.com/testcontainers/testcontainers-go/modules/minio"
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
+
+	"codestorage/internal/blob"
+	"codestorage/internal/ref"
 )
 
 var (
@@ -30,8 +33,8 @@ var (
 	blobURL    string
 	pubKeyPath string
 	privKey    *ecdsa.PrivateKey
-	testStore  *Store
-	testBlob   *Blob
+	testStore  *ref.PG
+	testBlob   *blob.S3
 	nodeA      *testNode
 )
 
@@ -95,7 +98,7 @@ func testMainInner(m *testing.M) int {
 	}
 
 	// Direct PG/S3 handles for assertions; also prepares schema + bucket.
-	testStore, err = OpenStore(ctx, pgURL)
+	testStore, err = ref.OpenPG(ctx, pgURL)
 	if err != nil {
 		panic(err)
 	}
@@ -103,7 +106,7 @@ func testMainInner(m *testing.M) int {
 	if err := testStore.InitSchema(ctx); err != nil {
 		panic(err)
 	}
-	testBlob, err = OpenBlob(ctx, blobURL)
+	testBlob, err = blob.OpenS3(ctx, blobURL)
 	if err != nil {
 		panic(err)
 	}
@@ -258,7 +261,7 @@ func pgRefs(t *testing.T, repo string) map[string]string {
 	return refs
 }
 
-func pgPacks(t *testing.T, repo string) []Pack {
+func pgPacks(t *testing.T, repo string) []ref.Pack {
 	t.Helper()
 	packs, err := testStore.ListPacks(context.Background(), repo)
 	if err != nil {
@@ -267,9 +270,9 @@ func pgPacks(t *testing.T, repo string) []Pack {
 	return packs
 }
 
-func minioPacks(t *testing.T, repo string) []ListedObject {
+func minioPacks(t *testing.T, repo string) []blob.ListedObject {
 	t.Helper()
-	objs, err := testBlob.List(context.Background(), PackPrefix(repo))
+	objs, err := testBlob.List(context.Background(), blob.PackPrefix(repo))
 	if err != nil {
 		t.Fatalf("list minio objects: %v", err)
 	}
@@ -292,7 +295,7 @@ func TestPush_RefsInPG_PacksInMinIO(t *testing.T) {
 		t.Fatalf("PG refs/heads/main = %q, want client HEAD %q (refs: %v)", got, head, refs)
 	}
 	if objs := minioPacks(t, repo); len(objs) < 1 {
-		t.Fatalf("expected >=1 pack object in MinIO under %s, got %v", PackPrefix(repo), objs)
+		t.Fatalf("expected >=1 pack object in MinIO under %s, got %v", blob.PackPrefix(repo), objs)
 	}
 	if packs := pgPacks(t, repo); len(packs) < 1 {
 		t.Fatalf("expected >=1 pack row in PG, got %v", packs)

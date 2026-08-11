@@ -13,6 +13,8 @@ import (
 	"strings"
 	"time"
 
+	"codestorage/internal/blob"
+	"codestorage/internal/ref"
 	"codestorage/internal/spike"
 )
 
@@ -72,7 +74,7 @@ func cmdServe(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	st, err := spike.OpenStore(ctx, mustEnv("PG_URL"))
+	st, err := ref.OpenPG(ctx, mustEnv("PG_URL"))
 	if err != nil {
 		return err
 	}
@@ -80,7 +82,7 @@ func cmdServe(ctx context.Context, args []string) error {
 	if err := st.InitSchema(ctx); err != nil {
 		return fmt.Errorf("init schema: %w", err)
 	}
-	bl, err := spike.OpenBlob(ctx, mustEnv("BLOB_URL"))
+	bl, err := blob.OpenS3(ctx, mustEnv("BLOB_URL"))
 	if err != nil {
 		return err
 	}
@@ -154,12 +156,12 @@ func cmdListPacks(ctx context.Context, args []string) error {
 	if *repo == "" {
 		return fmt.Errorf("--repo is required")
 	}
-	bl, err := spike.OpenBlob(ctx, mustEnv("BLOB_URL"))
+	bl, err := blob.OpenS3(ctx, mustEnv("BLOB_URL"))
 	if err != nil {
 		return err
 	}
 	defer bl.Close()
-	objs, err := bl.List(ctx, spike.PackPrefix(*repo))
+	objs, err := bl.List(ctx, blob.PackPrefix(*repo))
 	if err != nil {
 		return err
 	}

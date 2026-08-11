@@ -1,4 +1,6 @@
-package spike
+// Package ref provides the ref authority + pack registry: the RefStore
+// contract plus the Postgres implementation (pgx).
+package ref
 
 import (
 	"context"
@@ -14,14 +16,48 @@ const ZeroSHA = "0000000000000000000000000000000000000000"
 
 var shaRe = regexp.MustCompile(`\A[0-9a-f]{40}\z`)
 
-// Store is the Postgres ref authority + pack registry (spike-local schema;
-// the docs deliberately do not specify one).
-type Store struct {
+// ValidSHA reports whether s is a well-formed 40-hex git object id.
+func ValidSHA(s string) bool { return shaRe.MatchString(s) }
+
+// assertf is a fail-fast invariant check (crash-and-burn style).
+func assertf(cond bool, format string, args ...any) {
+	if !cond {
+		panic(fmt.Sprintf("ref assertion failed: "+format, args...))
+	}
+}
+
+// Pack is one registered pack for a repo.
+type Pack struct {
+	ID    string
+	S3Key string
+}
+
+// RefStore is the ref-authority contract: refs only ever change through
+// CASRef, and packs are registered strictly after their bytes are durable
+// in blob storage.
+type RefStore interface {
+	// ListRefs returns all refs for repo as name -> sha.
+	ListRefs(ctx context.Context, repo string) (map[string]string, error)
+	// CASRef performs a compare-and-swap ref update (old/new = ZeroSHA for
+	// create/delete). Returns won=false (no error) when the precondition
+	// failed, i.e. someone else won the race.
+	CASRef(ctx context.Context, repo, name, old, new string) (won bool, err error)
+	// RegisterPacks records packs for repo atomically; idempotent on retry.
+	RegisterPacks(ctx context.Context, repo string, packs []Pack) error
+	// ListPacks returns all registered packs for repo, oldest first.
+	ListPacks(ctx context.Context, repo string) ([]Pack, error)
+}
+
+// PG implements RefStore on Postgres.
+type PG struct {
 	pool *pgxpool.Pool
 }
 
-func OpenStore(ctx context.Context, pgURL string) (*Store, error) {
-	assertf(pgURL != "", "OpenStore: empty PG_URL")
+var _ RefStore = (*PG)(nil)
+
+// OpenPG connects to pgURL and pings the database.
+func OpenPG(ctx context.Context, pgURL string) (*PG, error) {
+	assertf(pgURL != "", "OpenPG: empty PG URL")
 	pool, err := pgxpool.New(ctx, pgURL)
 	if err != nil {
 		return nil, fmt.Errorf("pg connect: %w", err)
@@ -30,15 +66,15 @@ func OpenStore(ctx context.Context, pgURL string) (*Store, error) {
 		pool.Close()
 		return nil, fmt.Errorf("pg ping: %w", err)
 	}
-	return &Store{pool: pool}, nil
+	return &PG{pool: pool}, nil
 }
 
-func (s *Store) Close() { s.pool.Close() }
+func (s *PG) Close() { s.pool.Close() }
 
-// InitSchema creates the spike tables (idempotent). The advisory lock
+// InitSchema creates the ref/pack tables (idempotent). The advisory lock
 // serializes concurrent node startups: two racing CREATE TABLE IF NOT EXISTS
 // can fail with a duplicate pg_type key error (found via dogfooding).
-func (s *Store) InitSchema(ctx context.Context) error {
+func (s *PG) InitSchema(ctx context.Context) error {
 	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
 		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(0x5350494B45)`); err != nil { // "SPIKE"
 			return err
@@ -53,7 +89,7 @@ CREATE TABLE IF NOT EXISTS packs (repo text, id text, s3_key text NOT NULL,
 }
 
 // ListRefs returns all refs for repo as name -> sha.
-func (s *Store) ListRefs(ctx context.Context, repo string) (map[string]string, error) {
+func (s *PG) ListRefs(ctx context.Context, repo string) (map[string]string, error) {
 	rows, err := s.pool.Query(ctx, `SELECT name, sha FROM refs WHERE repo = $1`, repo)
 	if err != nil {
 		return nil, err
@@ -65,7 +101,7 @@ func (s *Store) ListRefs(ctx context.Context, repo string) (map[string]string, e
 		if err := rows.Scan(&name, &sha); err != nil {
 			return nil, err
 		}
-		assertf(shaRe.MatchString(sha), "refs table holds malformed sha %q for %s/%s", sha, repo, name)
+		assertf(ValidSHA(sha), "refs table holds malformed sha %q for %s/%s", sha, repo, name)
 		refs[name] = sha
 	}
 	return refs, rows.Err()
@@ -75,9 +111,9 @@ func (s *Store) ListRefs(ctx context.Context, repo string) (map[string]string, e
 // error) when the precondition failed, i.e. someone else won the race.
 // Refs only ever change inside these single statements, so a broken/partial
 // ref state is impossible by construction.
-func (s *Store) CASRef(ctx context.Context, repo, name, old, new string) (won bool, err error) {
-	assertf(shaRe.MatchString(old), "CASRef: malformed old sha %q", old)
-	assertf(shaRe.MatchString(new), "CASRef: malformed new sha %q", new)
+func (s *PG) CASRef(ctx context.Context, repo, name, old, new string) (won bool, err error) {
+	assertf(ValidSHA(old), "CASRef: malformed old sha %q", old)
+	assertf(ValidSHA(new), "CASRef: malformed new sha %q", new)
 	assertf(old != ZeroSHA || new != ZeroSHA, "CASRef: zero -> zero update for %s/%s", repo, name)
 
 	var tag string
@@ -107,16 +143,10 @@ func (s *Store) CASRef(ctx context.Context, repo, name, old, new string) (won bo
 	return n == 1, nil
 }
 
-// Pack is one registered pack for a repo.
-type Pack struct {
-	ID    string
-	S3Key string
-}
-
 // RegisterPacks inserts pack rows in ONE transaction (crash-ordering: this
-// runs strictly after the S3 upload succeeded). Idempotent on retry: a
+// runs strictly after the blob upload succeeded). Idempotent on retry: a
 // re-pushed identical pack has the same id.
-func (s *Store) RegisterPacks(ctx context.Context, repo string, packs []Pack) error {
+func (s *PG) RegisterPacks(ctx context.Context, repo string, packs []Pack) error {
 	assertf(len(packs) > 0, "RegisterPacks called with no packs")
 	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
 		for _, p := range packs {
@@ -132,7 +162,7 @@ func (s *Store) RegisterPacks(ctx context.Context, repo string, packs []Pack) er
 }
 
 // ListPacks returns all registered packs for repo, oldest first.
-func (s *Store) ListPacks(ctx context.Context, repo string) ([]Pack, error) {
+func (s *PG) ListPacks(ctx context.Context, repo string) ([]Pack, error) {
 	rows, err := s.pool.Query(ctx,
 		`SELECT id, s3_key FROM packs WHERE repo = $1 ORDER BY created_at, id`, repo)
 	if err != nil {

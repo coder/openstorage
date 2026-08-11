@@ -12,19 +12,22 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+
+	"codestorage/internal/blob"
+	"codestorage/internal/ref"
 )
 
 // Server is one stateless HTTP node: all durable truth lives in PG (refs,
 // pack registry) and S3 (pack bytes); CacheDir is rebuildable at any time.
 type Server struct {
-	Store    *Store
-	Blob     *Blob
+	Store    ref.RefStore
+	Blob     blob.BlobStore
 	CacheDir string
 	PubKey   *ecdsa.PublicKey
 	TestMode bool
 }
 
-func NewServer(st *Store, bl *Blob, cacheDir string, pub *ecdsa.PublicKey) *Server {
+func NewServer(st ref.RefStore, bl blob.BlobStore, cacheDir string, pub *ecdsa.PublicKey) *Server {
 	assertf(st != nil && bl != nil && pub != nil && cacheDir != "", "NewServer: missing dependency")
 	return &Server{
 		Store:    st,

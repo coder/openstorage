@@ -10,6 +10,9 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"codestorage/internal/blob"
+	"codestorage/internal/ref"
 )
 
 // A repo URL element is a base repo name optionally followed by one
@@ -97,7 +100,7 @@ func EnsureCacheRepo(cacheDir, repo string) (string, error) {
 // already present in the cache repo. Packs are self-contained (index-pack
 // --fix-thin ran on the receiving node before upload), so each is
 // independently indexable.
-func HydratePacks(ctx context.Context, st *Store, bl *Blob, repoPath, repo string) error {
+func HydratePacks(ctx context.Context, st ref.RefStore, bl blob.BlobStore, repoPath, repo string) error {
 	packs, err := st.ListPacks(ctx, repo)
 	if err != nil {
 		return err
@@ -138,7 +141,7 @@ func SyncRefs(repoPath string, want map[string]string) error {
 			continue
 		}
 		name, sha, ok := strings.Cut(line, " ")
-		assertf(ok && shaRe.MatchString(sha), "for-each-ref emitted %q", line)
+		assertf(ok && ref.ValidSHA(sha), "for-each-ref emitted %q", line)
 		have[name] = sha
 	}
 	var b strings.Builder
@@ -179,7 +182,7 @@ func SyncRefs(repoPath string, want map[string]string) error {
 // sync; retry briefly, and let the caller decide whether a residual failure
 // is fatal (upload path) or tolerable staleness (receive path, where git
 // re-validates old SHAs itself).
-func Hydrate(ctx context.Context, st *Store, bl *Blob, cacheDir, repo string) (repoPath string, refsErr error, err error) {
+func Hydrate(ctx context.Context, st ref.RefStore, bl blob.BlobStore, cacheDir, repo string) (repoPath string, refsErr error, err error) {
 	repoPath, err = EnsureCacheRepo(cacheDir, repo)
 	if err != nil {
 		return "", nil, err

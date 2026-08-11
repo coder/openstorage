@@ -11,6 +11,9 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"codestorage/internal/blob"
+	"codestorage/internal/ref"
 )
 
 // Env names used to route request context from the HTTP handler into the
@@ -83,28 +86,28 @@ func preReceive(ctx context.Context) error {
 		// work. receive-pack verified connectivity before invoking us;
 		// assert that invariant rather than rejecting the push.
 		for _, c := range commands {
-			assertf(c.new == ZeroSHA || objectExists(c.new),
+			assertf(c.new == ref.ZeroSHA || objectExists(c.new),
 				"pre-receive: no quarantined pack and unknown object %s for %s", c.new, c.ref)
 		}
 		return nil
 	}
 
-	bl, err := OpenBlob(ctx, mustEnv("BLOB_URL"))
+	bl, err := blob.OpenS3(ctx, mustEnv("BLOB_URL"))
 	if err != nil {
 		return err
 	}
 	defer bl.Close()
 
-	var packs []Pack
+	var packs []ref.Pack
 	for _, pf := range packFiles {
 		base := filepath.Base(pf) // pack-<hash>.pack
 		id := strings.TrimSuffix(strings.TrimPrefix(base, "pack-"), ".pack")
 		assertf(id != "" && id != base, "pre-receive: unexpected pack file name %q", base)
-		key := PackKey(repo, id)
+		key := blob.PackKey(repo, id)
 		if err := bl.UploadFile(ctx, key, pf); err != nil {
 			return fmt.Errorf("pre-receive: upload %s: %w", key, err)
 		}
-		packs = append(packs, Pack{ID: id, S3Key: key})
+		packs = append(packs, ref.Pack{ID: id, S3Key: key})
 	}
 
 	// Test knob: crash between S3 upload and PG commit.
@@ -113,7 +116,7 @@ func preReceive(ctx context.Context) error {
 		os.Exit(42)
 	}
 
-	st, err := OpenStore(ctx, mustEnv("PG_URL"))
+	st, err := ref.OpenPG(ctx, mustEnv("PG_URL"))
 	if err != nil {
 		return err
 	}
@@ -129,7 +132,7 @@ func preReceive(ctx context.Context) error {
 // message; git only updates the local cache ref for winners.
 func updateHook(ctx context.Context, args []string) error {
 	assertf(len(args) == 3, "update: want 3 args (ref old new), got %v", args)
-	ref, old, new := args[0], args[1], args[2]
+	refName, old, new := args[0], args[1], args[2]
 	repo := mustEnv(EnvRepo)
 
 	if policyJSON := os.Getenv(EnvRefsPolicy); policyJSON != "" {
@@ -137,24 +140,24 @@ func updateHook(ctx context.Context, args []string) error {
 		if err != nil {
 			return fmt.Errorf("update: %w", err)
 		}
-		if rule, ok := MatchPolicy(policies, ref); ok {
+		if rule, ok := MatchPolicy(policies, refName); ok {
 			for _, op := range rule.Ops {
 				switch op {
 				case "no-push":
-					return fmt.Errorf("policy no-push denies update to %s", ref)
+					return fmt.Errorf("policy no-push denies update to %s", refName)
 				case "no-force-push":
 					// Non-fast-forward = old exists, new exists, old is not an
 					// ancestor of new. Deletions are allowed (matches git's
 					// receive.denyNonFastForwards semantics). Safe to check
 					// here: quarantined objects were migrated into the main
 					// store after pre-receive, before update hooks run.
-					if old != ZeroSHA && new != ZeroSHA && !isAncestor(old, new) {
-						return fmt.Errorf("policy no-force-push denies non-fast-forward update to %s", ref)
+					if old != ref.ZeroSHA && new != ref.ZeroSHA && !isAncestor(old, new) {
+						return fmt.Errorf("policy no-force-push denies non-fast-forward update to %s", refName)
 					}
 				case "verify-sig":
-					return fmt.Errorf("policy verify-sig is not supported by the spike (ref %s)", ref)
+					return fmt.Errorf("policy verify-sig is not supported by the spike (ref %s)", refName)
 				default:
-					return fmt.Errorf("unknown policy op %q for %s", op, ref)
+					return fmt.Errorf("unknown policy op %q for %s", op, refName)
 				}
 			}
 		}
@@ -169,17 +172,17 @@ func updateHook(ctx context.Context, args []string) error {
 		}
 	}
 
-	st, err := OpenStore(ctx, mustEnv("PG_URL"))
+	st, err := ref.OpenPG(ctx, mustEnv("PG_URL"))
 	if err != nil {
 		return err
 	}
 	defer st.Close()
-	won, err := st.CASRef(ctx, repo, ref, old, new)
+	won, err := st.CASRef(ctx, repo, refName, old, new)
 	if err != nil {
 		return err
 	}
 	if !won {
-		return fmt.Errorf("CAS conflict: %s moved concurrently (expected %.8s)", ref, old)
+		return fmt.Errorf("CAS conflict: %s moved concurrently (expected %.8s)", refName, old)
 	}
 	return nil
 }
