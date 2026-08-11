@@ -1,10 +1,17 @@
 package githttp
 
-// End-to-end acceptance tests for the git smart HTTP surface. Real
-// containers only (no fakes): testcontainers-go boots Postgres + MinIO,
-// TestMain builds the codestorage binary once and runs nodes as separate OS
-// processes, exactly like production would. All keys (JWT org keys, SSH and
-// PGP signing keys) are generated at runtime and never committed.
+// End-to-end acceptance tests for the git smart HTTP surface, over two
+// backend lanes selected by CODESTORAGE_TEST_BACKEND:
+//
+//   - "" / "pg" (default): real containers only (no fakes) — testcontainers-go
+//     boots Postgres + MinIO, exactly like production would.
+//   - "local": zero containers — sqlite:// + file:// URLs derived from a
+//     temp data dir, the way `serve --data-dir` derives them.
+//
+// Either way TestMain builds the codestorage binary once and runs nodes as
+// separate OS processes, so the hook re-exec path crosses a real process
+// boundary on both lanes. All keys (JWT org keys, SSH and PGP signing keys)
+// are generated at runtime and never committed.
 
 import (
 	"bufio"
@@ -40,18 +47,26 @@ const (
 	secondOrg = "org2"
 )
 
+// Backend lanes for CODESTORAGE_TEST_BACKEND.
+const (
+	backendPG    = "pg"
+	backendLocal = "local"
+)
+
 var (
-	binPath     string
-	pgURL       string
-	blobURL     string
-	orgKeysPath string        // PEM file with testOrg's public keys (ES256 + Ed25519)
-	orgES256Key crypto.Signer // default token-signing key for testOrg
-	orgEdKey    crypto.Signer // second registered key (EdDSA)
-	org2Key     crypto.Signer // secondOrg's registered key
-	testStore   *ref.PG
-	testBlob    *blob.S3
-	testMeta    *meta.PG
-	nodeA       *testNode
+	binPath      string
+	testBackend  string // resolved CODESTORAGE_TEST_BACKEND (backendPG or backendLocal)
+	localDataDir string // local lane only: the --data-dir-style directory holding codestorage.db + blobs/
+	dbURL        string
+	blobURL      string
+	orgKeysPath  string        // PEM file with testOrg's public keys (ES256 + Ed25519)
+	orgES256Key  crypto.Signer // default token-signing key for testOrg
+	orgEdKey     crypto.Signer // second registered key (EdDSA)
+	org2Key      crypto.Signer // secondOrg's registered key
+	testStore    ref.Store
+	testBlob     blob.BlobStore
+	testMeta     meta.Backend
+	nodeA        *testNode
 )
 
 func TestMain(m *testing.M) {
@@ -75,34 +90,47 @@ func testMainInner(m *testing.M) int {
 		panic(fmt.Sprintf("go build: %v: %s", err, out))
 	}
 
-	// Real containers.
-	pgC, err := tcpostgres.Run(ctx, "postgres:17-alpine",
-		tcpostgres.WithDatabase("postgres"),
-		tcpostgres.WithUsername("postgres"),
-		tcpostgres.WithPassword("postgres"),
-		tcpostgres.BasicWaitStrategies(),
-	)
-	if err != nil {
-		panic("start postgres container: " + err.Error())
-	}
-	defer func() { _ = pgC.Terminate(ctx) }()
-	pgURL, err = pgC.ConnectionString(ctx, "sslmode=disable")
-	if err != nil {
-		panic(err)
-	}
+	// Backend lane: pg (default) boots real containers; local derives
+	// sqlite:// + file:// URLs from a temp data dir (zero containers).
+	switch v := os.Getenv("CODESTORAGE_TEST_BACKEND"); v {
+	case "", backendPG:
+		testBackend = backendPG
 
-	minioC, err := tcminio.Run(ctx, "minio/minio:RELEASE.2024-01-16T16-07-38Z")
-	if err != nil {
-		panic("start minio container: " + err.Error())
+		pgC, err := tcpostgres.Run(ctx, "postgres:17-alpine",
+			tcpostgres.WithDatabase("postgres"),
+			tcpostgres.WithUsername("postgres"),
+			tcpostgres.WithPassword("postgres"),
+			tcpostgres.BasicWaitStrategies(),
+		)
+		if err != nil {
+			panic("start postgres container: " + err.Error())
+		}
+		defer func() { _ = pgC.Terminate(ctx) }()
+		dbURL, err = pgC.ConnectionString(ctx, "sslmode=disable")
+		if err != nil {
+			panic(err)
+		}
+
+		minioC, err := tcminio.Run(ctx, "minio/minio:RELEASE.2024-01-16T16-07-38Z")
+		if err != nil {
+			panic("start minio container: " + err.Error())
+		}
+		defer func() { _ = minioC.Terminate(ctx) }()
+		minioAddr, err := minioC.ConnectionString(ctx)
+		if err != nil {
+			panic(err)
+		}
+		blobURL = fmt.Sprintf("s3://githttp-test?endpoint=http://%s&s3ForcePathStyle=true&region=us-east-1", minioAddr)
+		os.Setenv("AWS_ACCESS_KEY_ID", minioC.Username)
+		os.Setenv("AWS_SECRET_ACCESS_KEY", minioC.Password)
+	case backendLocal:
+		testBackend = backendLocal
+		localDataDir = filepath.Join(scratch, "data")
+		dbURL = "sqlite://" + filepath.Join(localDataDir, "codestorage.db")
+		blobURL = "file://" + filepath.Join(localDataDir, "blobs")
+	default:
+		panic(fmt.Sprintf("CODESTORAGE_TEST_BACKEND=%q: unknown backend (want %q, %q, or unset)", v, backendPG, backendLocal))
 	}
-	defer func() { _ = minioC.Terminate(ctx) }()
-	minioAddr, err := minioC.ConnectionString(ctx)
-	if err != nil {
-		panic(err)
-	}
-	blobURL = fmt.Sprintf("s3://githttp-test?endpoint=http://%s&s3ForcePathStyle=true&region=us-east-1", minioAddr)
-	os.Setenv("AWS_ACCESS_KEY_ID", minioC.Username)
-	os.Setenv("AWS_SECRET_ACCESS_KEY", minioC.Password)
 
 	// Runtime-generated org keys (never committed). testOrg registers two
 	// keys with different algorithms to prove multi-alg verification on the
@@ -115,8 +143,10 @@ func testMainInner(m *testing.M) int {
 		panic(err)
 	}
 
-	// Direct PG/S3/meta handles for assertions; also prepares schema + bucket.
-	testStore, err = ref.OpenPG(ctx, pgURL)
+	// Direct store/blob/meta handles for assertions, opened through the
+	// URL-scheme factories so the lane picks the backend; also prepares
+	// schema + bucket.
+	testStore, err = ref.Open(ctx, dbURL)
 	if err != nil {
 		panic(err)
 	}
@@ -124,7 +154,7 @@ func testMainInner(m *testing.M) int {
 	if err := testStore.InitSchema(ctx); err != nil {
 		panic(err)
 	}
-	testBlob, err = blob.OpenS3(ctx, blobURL)
+	testBlob, err = blob.Open(ctx, blobURL)
 	if err != nil {
 		panic(err)
 	}
@@ -132,7 +162,7 @@ func testMainInner(m *testing.M) int {
 	if err := testBlob.EnsureBucket(ctx); err != nil {
 		panic(err)
 	}
-	testMeta, err = meta.OpenPG(ctx, pgURL)
+	testMeta, err = meta.Open(ctx, dbURL)
 	if err != nil {
 		panic(err)
 	}
@@ -192,7 +222,7 @@ func startNode(cacheDir string, extraEnv ...string) (*testNode, error) {
 		"--cache-dir", cacheDir,
 	)
 	cmd.Env = append(os.Environ(),
-		"CODESTORAGE_PG_URL="+pgURL,
+		"CODESTORAGE_PG_URL="+dbURL,
 		"CODESTORAGE_S3_URL="+blobURL,
 		"CODESTORAGE_ORG="+testOrg,
 		"CODESTORAGE_ORG_PUBKEYS="+orgKeysPath,
@@ -929,5 +959,68 @@ func TestRefPolicy_NoForcePushDeniesDeletion(t *testing.T) {
 	}
 	if _, exists := refs["refs/heads/scratch"]; exists {
 		t.Fatal("PG still holds refs/heads/scratch after allowed deletion")
+	}
+}
+
+// --- local mode (zero containers) --------------------------------------------
+
+// TestLocalMode_PacksOnDiskAndStatelessCache proves the local lane's on-disk
+// contract: pushed packs are plain files under <data-dir>/blobs/packs/<repo>/,
+// the ref/meta authority is one <data-dir>/codestorage.db file, and the cache
+// dir stays a rebuildable cache — wiping it and restarting the node loses
+// nothing. Skips on the pg lane, where durable state lives in containers.
+func TestLocalMode_PacksOnDiskAndStatelessCache(t *testing.T) {
+	if testBackend != backendLocal {
+		t.Skipf("local-mode-only test (running the %s lane; set CODESTORAGE_TEST_BACKEND=local)", testBackend)
+	}
+
+	repo := "t-local-mode"
+	work := initWorkRepo(t)
+	token := mintTestToken(t, repo, "git:read,git:write", "")
+
+	cacheDir := filepath.Join(t.TempDir(), "cache")
+	node, err := startNode(cacheDir)
+	if err != nil {
+		t.Fatalf("start node: %v", err)
+	}
+	defer node.stop()
+	mustGit(t, work, "push", remoteURL(node, repo, token), "HEAD:refs/heads/main")
+	head := revParse(t, work, "HEAD")
+
+	// Pack bytes are plain files under the derived blob dir.
+	pattern := filepath.Join(localDataDir, "blobs", "packs", repo, "*.pack")
+	packFiles, err := filepath.Glob(pattern)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(packFiles) < 1 {
+		t.Fatalf("expected >=1 pack file matching %s", pattern)
+	}
+	// The ref/meta authority is one SQLite file in the data dir.
+	if _, err := os.Stat(filepath.Join(localDataDir, "codestorage.db")); err != nil {
+		t.Fatalf("codestorage.db missing from the data dir: %v", err)
+	}
+	// The ref flip landed in that file (factory-opened store handle).
+	if got := pgRefs(t, repo)["refs/heads/main"]; got != head {
+		t.Fatalf("sqlite refs/heads/main = %q, want client HEAD %q", got, head)
+	}
+
+	// Stateless cache: wipe it, restart the node, clone — identical history.
+	node.stop()
+	if err := os.RemoveAll(cacheDir); err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := startNode(cacheDir)
+	if err != nil {
+		t.Fatalf("restart node after cache wipe: %v", err)
+	}
+	defer restarted.stop()
+	cloneDir := filepath.Join(t.TempDir(), "clone")
+	mustGit(t, "", "clone", remoteURL(restarted, repo, token), cloneDir)
+	if got := revParse(t, cloneDir, "HEAD"); got != head {
+		t.Fatalf("clone HEAD after cache wipe = %q, want %q", got, head)
+	}
+	if out, err := tryGit(cloneDir, "fsck", "--strict"); err != nil {
+		t.Fatalf("git fsck: %v\n%s", err, out)
 	}
 }
