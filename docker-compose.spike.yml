@@ -1,0 +1,29 @@
+# Dogfooding infra for the de-risk spike: Postgres (ref authority) + MinIO
+# (immutable pack storage). Host ports are env-overridable because sibling
+# agents share the docker daemon:
+#   PGPORT=15432 MINIOPORT=19000 docker compose -p cs-spike-$(whoami) -f docker-compose.spike.yml up -d --wait
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "${PGPORT:-15432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+  minio:
+    image: minio/minio:latest
+    command: server /data
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "${MINIOPORT:-19000}:9000"
+    healthcheck:
+      test: ["CMD-SHELL", "mc ready local || curl -sf http://127.0.0.1:9000/minio/health/live"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
