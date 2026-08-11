@@ -445,6 +445,162 @@ func TestCrash_AfterS3_BeforePGCommit(t *testing.T) {
 	}
 }
 
+// --- review-finding regressions: unit --------------------------------------
+
+func TestGlobMatch(t *testing.T) {
+	cases := []struct {
+		pattern, s string
+		want       bool
+	}{
+		{"*", "refs/heads/main", true}, // leading `*` (regression: never matched)
+		{"*", "", true},
+		{"*-wip", "refs/heads/foo-wip", true},
+		{"refs/heads/*", "refs/heads/a/b", true}, // `*` crosses `/` (spike-local)
+		{"refs/heads/*", "refs/tags/v1", false},
+		{"refs/heads/main", "refs/heads/main", true},
+		{"refs/heads/ma.n", "refs/heads/maXn", false}, // regexp metachars quoted
+	}
+	for _, c := range cases {
+		if got := globMatch(c.pattern, c.s); got != c.want {
+			t.Errorf("globMatch(%q, %q) = %v, want %v", c.pattern, c.s, got, c.want)
+		}
+	}
+}
+
+func TestSplitRepoPath_Namespaces(t *testing.T) {
+	cases := []struct {
+		path, repo, rest string
+		ok               bool
+	}{
+		{"/r1.git/info/refs", "r1", "info/refs", true},
+		{"/r1+ephemeral.git/info/refs", "r1+ephemeral", "info/refs", true},
+		{"/r1+import.git/git-receive-pack", "r1+import", "git-receive-pack", true},
+		{"/r1+bogus.git/info/refs", "", "", false},
+		{"/+ephemeral.git/info/refs", "", "", false},
+		{"/r1+ephemeral+import.git/info/refs", "", "", false},
+	}
+	for _, c := range cases {
+		repo, rest, ok := splitRepoPath(c.path)
+		if repo != c.repo || rest != c.rest || ok != c.ok {
+			t.Errorf("splitRepoPath(%q) = (%q, %q, %v), want (%q, %q, %v)",
+				c.path, repo, rest, ok, c.repo, c.rest, c.ok)
+		}
+	}
+}
+
+// --- review-finding regressions: acceptance ---------------------------------
+
+// A push that transfers no new objects (branch created from an already-pushed
+// commit) must succeed: depending on git version/client it carries an empty
+// pack or no pack at all, and neither may be rejected by pre-receive.
+func TestBranchCreate_NoNewObjects(t *testing.T) {
+	repo := "t6-branch-create"
+	work := initWorkRepo(t)
+	token := mintTestToken(t, repo, "git:read,git:write", "")
+	mustGit(t, work, "push", remoteURL(nodeA, repo, token), "HEAD:refs/heads/main")
+	head := revParse(t, work, "HEAD")
+
+	mustGit(t, work, "push", remoteURL(nodeA, repo, token), "HEAD:refs/heads/copy")
+	if got := pgRefs(t, repo)["refs/heads/copy"]; got != head {
+		t.Fatalf("PG refs/heads/copy = %q, want %q", got, head)
+	}
+
+	// A fresh node must rehydrate cleanly (an empty pack, if registered,
+	// must not break index-pack) and serve both branches.
+	nodeB := startNodeT(t)
+	cloneDir := filepath.Join(t.TempDir(), "clone")
+	mustGit(t, "", "clone", remoteURL(nodeB, repo, token), cloneDir)
+	if got := revParse(t, cloneDir, "origin/copy"); got != head {
+		t.Fatalf("clone origin/copy = %q, want %q", got, head)
+	}
+}
+
+func TestRefPolicy_NoPushWildcard(t *testing.T) {
+	repo := "t7-no-push"
+	work := initWorkRepo(t)
+	setupToken := mintTestToken(t, repo, "git:read,git:write", "")
+	mustGit(t, work, "push", remoteURL(nodeA, repo, setupToken), "HEAD:refs/heads/main")
+	mainHead := revParse(t, work, "HEAD")
+
+	writeFile(t, work, "b.txt", "two\n")
+	mustGit(t, work, "add", ".")
+	mustGit(t, work, "commit", "-m", "two")
+
+	// Leading-`*` wildcard (regression) combined with the no-push op.
+	noPushToken := mintTestToken(t, repo, "git:read,git:write", `[["*",["no-push"]]]`)
+	out, err := tryGit(work, "push", remoteURL(nodeA, repo, noPushToken), "HEAD:refs/heads/main")
+	if err == nil {
+		t.Fatalf("push should be rejected by no-push policy:\n%s", out)
+	}
+	t.Logf("no-push output:\n%s", out)
+	if !regexp.MustCompile(`\[remote rejected\].*(no-push|hook declined)`).MatchString(out) {
+		t.Fatalf("push was not remote-rejected with a no-push message:\n%s", out)
+	}
+	if got := pgRefs(t, repo)["refs/heads/main"]; got != mainHead {
+		t.Fatalf("PG main = %q, want unchanged %q", got, mainHead)
+	}
+}
+
+func TestRefPolicy_VerifySigFailsClosed(t *testing.T) {
+	repo := "t8-verify-sig"
+	work := initWorkRepo(t)
+	setupToken := mintTestToken(t, repo, "git:read,git:write", "")
+	mustGit(t, work, "push", remoteURL(nodeA, repo, setupToken), "HEAD:refs/heads/main")
+	mainHead := revParse(t, work, "HEAD")
+
+	writeFile(t, work, "b.txt", "two\n")
+	mustGit(t, work, "add", ".")
+	mustGit(t, work, "commit", "-m", "two")
+
+	// verify-sig is not implemented by the spike; it must fail closed.
+	token := mintTestToken(t, repo, "git:read,git:write", `[["refs/heads/main",["verify-sig"]]]`)
+	out, err := tryGit(work, "push", remoteURL(nodeA, repo, token), "HEAD:refs/heads/main")
+	if err == nil {
+		t.Fatalf("push should be rejected by verify-sig policy:\n%s", out)
+	}
+	t.Logf("verify-sig output:\n%s", out)
+	if !regexp.MustCompile(`\[remote rejected\].*(verify-sig|hook declined)`).MatchString(out) {
+		t.Fatalf("push was not remote-rejected with a verify-sig message:\n%s", out)
+	}
+	if got := pgRefs(t, repo)["refs/heads/main"]; got != mainHead {
+		t.Fatalf("PG main = %q, want unchanged %q", got, mainHead)
+	}
+}
+
+// docs/05: `+ephemeral` remotes see/update only the ephemeral ref space and
+// persistent remotes must not see ephemeral refs (separate ref stores).
+func TestNamespace_EphemeralIsolated(t *testing.T) {
+	repo := "t9-ns"
+	work := initWorkRepo(t)
+	token := mintTestToken(t, repo, "git:read,git:write", "") // minted for the base repo id
+	mustGit(t, work, "push", remoteURL(nodeA, repo, token), "HEAD:refs/heads/main")
+
+	writeFile(t, work, "eph.txt", "scratch\n")
+	mustGit(t, work, "add", ".")
+	mustGit(t, work, "commit", "-m", "scratch")
+	ephHead := revParse(t, work, "HEAD")
+	mustGit(t, work, "push", remoteURL(nodeA, repo+"+ephemeral", token), "HEAD:refs/heads/scratch")
+
+	if got := pgRefs(t, repo+"+ephemeral")["refs/heads/scratch"]; got != ephHead {
+		t.Fatalf("PG ephemeral scratch = %q, want %q", got, ephHead)
+	}
+	if refs := pgRefs(t, repo); refs["refs/heads/scratch"] != "" {
+		t.Fatalf("persistent ref store leaked ephemeral ref: %v", refs)
+	}
+	if refs := pgRefs(t, repo+"+ephemeral"); refs["refs/heads/main"] != "" {
+		t.Fatalf("ephemeral ref store leaked persistent ref: %v", refs)
+	}
+
+	// The smart-HTTP advertisement shows the same isolation.
+	if out := mustGit(t, "", "ls-remote", remoteURL(nodeA, repo, token)); strings.Contains(out, "scratch") {
+		t.Fatalf("persistent advertisement leaked ephemeral ref:\n%s", out)
+	}
+	out := mustGit(t, "", "ls-remote", remoteURL(nodeA, repo+"+ephemeral", token))
+	if !strings.Contains(out, "refs/heads/scratch") || strings.Contains(out, "refs/heads/main") {
+		t.Fatalf("ephemeral advertisement wrong:\n%s", out)
+	}
+}
+
 func mapsEqual(a, b map[string]string) bool {
 	if len(a) != len(b) {
 		return false

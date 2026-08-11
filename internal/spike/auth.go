@@ -113,8 +113,8 @@ func globMatch(pattern, s string) bool {
 	// Translate glob to an anchored regexp; `*` matches any run including `/`.
 	var b strings.Builder
 	b.WriteString(`\A`)
-	for _, part := range strings.Split(pattern, "*") {
-		if b.Len() > 2 {
+	for i, part := range strings.Split(pattern, "*") {
+		if i > 0 {
 			b.WriteString(`.*`)
 		}
 		b.WriteString(regexp.QuoteMeta(part))

@@ -76,11 +76,15 @@ func preReceive(ctx context.Context) error {
 		return err
 	}
 	if len(packFiles) == 0 {
-		// Only a delete-only push legitimately carries no pack.
+		// No pack means git received no new objects: a delete-only push or
+		// updates targeting objects the server already has (e.g. a branch
+		// created from an existing commit). Whether git sends an empty pack
+		// in the latter case is version/client dependent, so both paths must
+		// work. receive-pack verified connectivity before invoking us;
+		// assert that invariant rather than rejecting the push.
 		for _, c := range commands {
-			if c.new != ZeroSHA {
-				return fmt.Errorf("pre-receive: no quarantined pack but non-delete command for %s", c.ref)
-			}
+			assertf(c.new == ZeroSHA || objectExists(c.new),
+				"pre-receive: no quarantined pack and unknown object %s for %s", c.new, c.ref)
 		}
 		return nil
 	}
@@ -178,6 +182,21 @@ func updateHook(ctx context.Context, args []string) error {
 		return fmt.Errorf("CAS conflict: %s moved concurrently (expected %.8s)", ref, old)
 	}
 	return nil
+}
+
+// objectExists reports whether sha names an object in the repo git put us
+// in (during pre-receive the quarantine is visible via git's alternates).
+func objectExists(sha string) bool {
+	err := exec.Command("git", "cat-file", "-e", sha).Run()
+	if err == nil {
+		return true
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		return false
+	}
+	// Not an exit status (git missing, spawn failure): a bug, fail fast.
+	panic(fmt.Sprintf("spike assertion failed: cat-file -e %s: %v", sha, err))
 }
 
 // isAncestor reports whether old is an ancestor of new in the repo git put

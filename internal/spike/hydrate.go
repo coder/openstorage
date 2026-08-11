@@ -12,11 +12,23 @@ import (
 	"time"
 )
 
-var repoNameRe = regexp.MustCompile(`\A[A-Za-z0-9][A-Za-z0-9._-]*\z`)
+// A repo URL element is a base repo name optionally followed by one
+// namespace suffix, `+ephemeral` or `+import` (docs/05). Namespaced repos
+// use fully separate ref stores, pack spaces, and cache dirs keyed by the
+// full name — docs/05 allows "git namespaces or separate ref stores", and
+// separate stores give the required isolation for free (spike-local choice).
+var repoNameRe = regexp.MustCompile(`\A[A-Za-z0-9][A-Za-z0-9._-]*(\+(ephemeral|import))?\z`)
 
 // ValidRepoName guards against path traversal via the URL repo element.
 func ValidRepoName(repo string) bool {
 	return repoNameRe.MatchString(repo) && !strings.Contains(repo, "..")
+}
+
+// BaseRepo strips the optional namespace suffix: JWTs carry the base repo id
+// in the `repo` claim and are valid for its namespaces (docs/05 URL scheme).
+func BaseRepo(repo string) string {
+	base, _, _ := strings.Cut(repo, "+")
+	return base
 }
 
 // RepoPath maps a repo name to its bare cache repo directory.

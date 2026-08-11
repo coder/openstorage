@@ -63,7 +63,8 @@ func (s *Server) Handler() http.Handler {
 	})
 }
 
-// splitRepoPath parses "/{repo}.git/{rest}" and validates the repo element.
+// splitRepoPath parses "/{repo}.git/{rest}" and validates the repo element,
+// which may carry a `+ephemeral`/`+import` namespace suffix (docs/05).
 func splitRepoPath(path string) (repo, rest string, ok bool) {
 	path = strings.TrimPrefix(path, "/")
 	elem, rest, found := strings.Cut(path, "/")
@@ -88,7 +89,7 @@ func (s *Server) authenticate(r *http.Request, repo, scope string) (*Claims, int
 	if err != nil {
 		return nil, http.StatusUnauthorized, err
 	}
-	if claims.Repo != repo {
+	if claims.Repo != BaseRepo(repo) {
 		return nil, http.StatusForbidden, fmt.Errorf("jwt repo claim mismatch")
 	}
 	if !claims.HasScope(scope) {
