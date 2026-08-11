@@ -1,0 +1,434 @@
+package api
+
+// Acceptance tests for the repo CRUD surface against real Postgres
+// (testcontainers) with the server in-process on 127.0.0.1:0: the docs/03
+// status-code matrix (401/403/404/409/200), pagination/q, and per-algorithm
+// JWT positives. Keys are generated at runtime and never committed.
+
+import (
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/url"
+	"regexp"
+	"strings"
+	"testing"
+	"time"
+
+	"codestorage/internal/auth"
+)
+
+var repoIDRe = regexp.MustCompile(`\Arepo_[0-9a-f]{12}\z`)
+
+// createRepo POSTs /api/v1/repos for org/urlClaim and returns the decoded
+// response, failing the test unless the status is wantStatus.
+func createRepo(t *testing.T, e *testEnv, org, urlClaim string, body []byte, wantStatus int) createRepoResponse {
+	t.Helper()
+	tok := e.mint(t, tokenSpec{iss: org, repo: urlClaim, scopes: []string{auth.ScopeRepoWrite}})
+	resp, respBody := e.doReq(t, http.MethodPost, "/api/v1/repos", tok, body, "")
+	if resp.StatusCode != wantStatus {
+		t.Fatalf("POST /repos (%s) status = %d, want %d (body %s)", urlClaim, resp.StatusCode, wantStatus, respBody)
+	}
+	var out createRepoResponse
+	if wantStatus == http.StatusOK {
+		if err := json.Unmarshal(respBody, &out); err != nil {
+			t.Fatalf("decode create response %q: %v", respBody, err)
+		}
+	} else {
+		requireEnvelope(t, resp, respBody)
+	}
+	return out
+}
+
+func TestCRUDHappyPath(t *testing.T) {
+	e := testEnvironment(t)
+	org := e.newOrg(t)
+	repoURL := "repo-" + randomHex(t, 8)
+
+	// Create.
+	created := createRepo(t, e, org, repoURL, []byte(`{"default_branch":"main"}`), http.StatusOK)
+	if !repoIDRe.MatchString(created.RepoID) {
+		t.Fatalf("repo_id %q does not match %v", created.RepoID, repoIDRe)
+	}
+	if want := testHTTPBaseURL + "/" + created.RepoID + ".git"; created.HTTPURL != want {
+		t.Fatalf("http_url = %q, want %q", created.HTTPURL, want)
+	}
+	if created.Message == "" {
+		t.Fatal("create response has empty message")
+	}
+
+	// Get.
+	readTok := e.mint(t, tokenSpec{iss: org, repo: repoURL, scopes: []string{auth.ScopeGitRead}})
+	resp, body := e.doReq(t, http.MethodGet, "/api/v1/repo", readTok, nil, "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /repo status = %d (body %s)", resp.StatusCode, body)
+	}
+	var got getRepoResponse
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.DefaultBranch != "main" {
+		t.Fatalf("default_branch = %q, want main", got.DefaultBranch)
+	}
+	createdAt, err := time.Parse(time.RFC3339, got.CreatedAt)
+	if err != nil {
+		t.Fatalf("created_at %q is not RFC 3339: %v", got.CreatedAt, err)
+	}
+	if loc := createdAt.Location(); loc != time.UTC {
+		t.Fatalf("created_at %q not rendered in UTC (zone %v)", got.CreatedAt, loc)
+	}
+
+	// List (org-scoped token).
+	orgTok := e.mint(t, tokenSpec{iss: org, repo: auth.RepoClaimOrg, scopes: []string{auth.ScopeOrgRead}})
+	resp, body = e.doReq(t, http.MethodGet, "/api/v1/repos", orgTok, nil, "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /repos status = %d (body %s)", resp.StatusCode, body)
+	}
+	var list listReposResponse
+	if err := json.Unmarshal(body, &list); err != nil {
+		t.Fatal(err)
+	}
+	if len(list.Repos) != 1 || list.Repos[0].URL != repoURL || list.Repos[0].RepoID != created.RepoID {
+		t.Fatalf("list = %+v, want exactly the created repo", list)
+	}
+	if list.HasMore || list.NextCursor != "" {
+		t.Fatalf("single-page list claims more: %+v", list)
+	}
+
+	// Delete.
+	writeTok := e.mint(t, tokenSpec{iss: org, repo: repoURL, scopes: []string{auth.ScopeRepoWrite}})
+	resp, body = e.doReq(t, http.MethodDelete, "/api/v1/repos/delete", writeTok, nil, "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("DELETE status = %d (body %s)", resp.StatusCode, body)
+	}
+	var deleted deleteRepoResponse
+	if err := json.Unmarshal(body, &deleted); err != nil {
+		t.Fatal(err)
+	}
+	if deleted.RepoID != created.RepoID || deleted.Message == "" {
+		t.Fatalf("delete response = %+v", deleted)
+	}
+
+	// Soft-deleted: GET -> 404, hidden from list, re-delete -> 409,
+	// re-create same url -> 409.
+	resp, body = e.doReq(t, http.MethodGet, "/api/v1/repo", readTok, nil, "")
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("GET after delete status = %d, want 404", resp.StatusCode)
+	}
+	requireEnvelope(t, resp, body)
+
+	resp, body = e.doReq(t, http.MethodGet, "/api/v1/repos", orgTok, nil, "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /repos status = %d", resp.StatusCode)
+	}
+	list = listReposResponse{NextCursor: "sentinel"}
+	if err := json.Unmarshal(body, &list); err != nil {
+		t.Fatal(err)
+	}
+	if list.Repos == nil {
+		t.Fatalf("repos must be [] (never null) when empty: %s", body)
+	}
+	if len(list.Repos) != 0 {
+		t.Fatalf("deleted repo still listed: %+v", list)
+	}
+
+	resp, body = e.doReq(t, http.MethodDelete, "/api/v1/repos/delete", writeTok, nil, "")
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("re-delete status = %d, want 409 (body %s)", resp.StatusCode, body)
+	}
+	if msg := requireEnvelope(t, resp, body); msg != "repository already deleted" {
+		t.Fatalf("re-delete error = %q", msg)
+	}
+
+	createRepo(t, e, org, repoURL, nil, http.StatusConflict)
+}
+
+func TestCreateRepoValidation(t *testing.T) {
+	e := testEnvironment(t)
+	org := e.newOrg(t)
+
+	// repo claim "org" is not a creatable url.
+	createRepo(t, e, org, auth.RepoClaimOrg, nil, http.StatusBadRequest)
+	// Empty repo claim.
+	createRepo(t, e, org, "", nil, http.StatusBadRequest)
+	// Malformed JSON.
+	createRepo(t, e, org, "v-"+randomHex(t, 4), []byte(`{not json`), http.StatusBadRequest)
+	// Invalid default branch.
+	createRepo(t, e, org, "v-"+randomHex(t, 4), []byte(`{"default_branch":"bad branch"}`), http.StatusBadRequest)
+	// base_repo is a later phase: reject instead of silently dropping.
+	createRepo(t, e, org, "v-"+randomHex(t, 4),
+		[]byte(`{"base_repo":{"provider":"github","owner":"o","name":"n"}}`), http.StatusBadRequest)
+
+	// Empty body defaults the branch to main.
+	repoURL := "v-" + randomHex(t, 4)
+	createRepo(t, e, org, repoURL, nil, http.StatusOK)
+	readTok := e.mint(t, tokenSpec{iss: org, repo: repoURL, scopes: []string{auth.ScopeGitRead}})
+	resp, body := e.doReq(t, http.MethodGet, "/api/v1/repo", readTok, nil, "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /repo status = %d", resp.StatusCode)
+	}
+	var got getRepoResponse
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.DefaultBranch != "main" {
+		t.Fatalf("default_branch = %q, want main", got.DefaultBranch)
+	}
+}
+
+func TestListPaginationAndQ(t *testing.T) {
+	e := testEnvironment(t)
+	org := e.newOrg(t) // fresh org => deterministic counts
+
+	const total = 25
+	urls := make(map[string]bool, total)
+	for i := 0; i < total; i++ {
+		// Mixed case to exercise the case-insensitive q filter.
+		u := fmt.Sprintf("PgN-%02d-%s", i, randomHex(t, 3))
+		createRepo(t, e, org, u, nil, http.StatusOK)
+		urls[strings.ToLower(u)] = true
+	}
+	orgTok := e.mint(t, tokenSpec{iss: org, repo: auth.RepoClaimOrg, scopes: []string{auth.ScopeOrgRead}})
+
+	listPage := func(params url.Values, wantStatus int) listReposResponse {
+		t.Helper()
+		resp, body := e.doReq(t, http.MethodGet, "/api/v1/repos?"+params.Encode(), orgTok, nil, "")
+		if resp.StatusCode != wantStatus {
+			t.Fatalf("GET /repos?%s status = %d, want %d (body %s)", params.Encode(), resp.StatusCode, wantStatus, body)
+		}
+		var list listReposResponse
+		if wantStatus == http.StatusOK {
+			if err := json.Unmarshal(body, &list); err != nil {
+				t.Fatal(err)
+			}
+		} else {
+			requireEnvelope(t, resp, body)
+		}
+		return list
+	}
+
+	// Walk 25 repos with limit 10: pages of 10/10/5.
+	seen := make(map[string]bool)
+	cursor := ""
+	wantPages := []struct {
+		count   int
+		hasMore bool
+	}{{10, true}, {10, true}, {5, false}}
+	for i, want := range wantPages {
+		params := url.Values{"limit": {"10"}}
+		if cursor != "" {
+			params.Set("cursor", cursor)
+		}
+		page := listPage(params, http.StatusOK)
+		if len(page.Repos) != want.count || page.HasMore != want.hasMore {
+			t.Fatalf("page %d: got %d repos hasMore=%v, want %d/%v",
+				i, len(page.Repos), page.HasMore, want.count, want.hasMore)
+		}
+		if want.hasMore && page.NextCursor == "" {
+			t.Fatalf("page %d: hasMore without next_cursor", i)
+		}
+		if !want.hasMore && page.NextCursor != "" {
+			t.Fatalf("page %d: exhausted but next_cursor = %q", i, page.NextCursor)
+		}
+		if i == 0 && cursor == "" {
+			// Cursor stability: re-fetching the same page yields identical rows.
+			again := listPage(url.Values{"limit": {"10"}}, http.StatusOK)
+			for j := range page.Repos {
+				if again.Repos[j] != page.Repos[j] {
+					t.Fatalf("page 0 not stable across fetches: %+v vs %+v", page.Repos[j], again.Repos[j])
+				}
+			}
+		}
+		for _, r := range page.Repos {
+			if seen[r.RepoID] {
+				t.Fatalf("repo %s returned on two pages", r.RepoID)
+			}
+			seen[r.RepoID] = true
+			if !urls[strings.ToLower(r.URL)] {
+				t.Fatalf("unexpected repo url %q in listing", r.URL)
+			}
+		}
+		cursor = page.NextCursor
+	}
+	if len(seen) != total {
+		t.Fatalf("walk saw %d repos, want %d", len(seen), total)
+	}
+
+	// Case-insensitive substring q: "pgn-0" matches PgN-00..PgN-09.
+	page := listPage(url.Values{"q": {"pgn-0"}, "limit": {"100"}}, http.StatusOK)
+	if len(page.Repos) != 10 || page.HasMore {
+		t.Fatalf("q=pgn-0: got %d repos hasMore=%v, want 10/false", len(page.Repos), page.HasMore)
+	}
+	// LIKE metacharacters in q must not act as wildcards.
+	page = listPage(url.Values{"q": {"%"}}, http.StatusOK)
+	if len(page.Repos) != 0 {
+		t.Fatalf("q=%%: matched %d repos, want 0", len(page.Repos))
+	}
+	// No match.
+	page = listPage(url.Values{"q": {"no-such-repo"}}, http.StatusOK)
+	if page.Repos == nil || len(page.Repos) != 0 {
+		t.Fatalf("q miss: repos = %#v, want []", page.Repos)
+	}
+
+	// Invalid cursor / limit -> 400.
+	listPage(url.Values{"cursor": {"!!!not-base64!!!"}}, http.StatusBadRequest)
+	listPage(url.Values{"cursor": {base64.RawURLEncoding.EncodeToString([]byte("garbage"))}}, http.StatusBadRequest)
+	listPage(url.Values{"limit": {"0"}}, http.StatusBadRequest)
+	listPage(url.Values{"limit": {"101"}}, http.StatusBadRequest)
+	listPage(url.Values{"limit": {"abc"}}, http.StatusBadRequest)
+}
+
+// TestAuthMatrix drives the docs/03 401/403 failure map across all four
+// endpoints, asserting status, envelope shape, and WWW-Authenticate on 401.
+func TestAuthMatrix(t *testing.T) {
+	e := testEnvironment(t)
+	org := e.newOrg(t)
+	repoURL := "matrix-" + randomHex(t, 6)
+	createRepo(t, e, org, repoURL, nil, http.StatusOK)
+
+	endpoints := []struct {
+		name     string
+		method   string
+		path     string
+		scope    string
+		orgLevel bool
+	}{
+		{"create", http.MethodPost, "/api/v1/repos", auth.ScopeRepoWrite, false},
+		{"get", http.MethodGet, "/api/v1/repo", auth.ScopeGitRead, false},
+		{"list", http.MethodGet, "/api/v1/repos", auth.ScopeOrgRead, true},
+		{"delete", http.MethodDelete, "/api/v1/repos/delete", auth.ScopeRepoWrite, false},
+	}
+
+	// repoClaim returns the claim an endpoint's happy-path token would use.
+	repoClaim := func(orgLevel bool) string {
+		if orgLevel {
+			return auth.RepoClaimOrg
+		}
+		return repoURL
+	}
+
+	// algNone builds an unsigned token (alg: none) with plausible claims.
+	algNone := func(iss, repo string, scopes []string) string {
+		header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none","typ":"JWT"}`))
+		payload, err := json.Marshal(map[string]any{
+			"iss": iss, "sub": auth.SubjectLiteral, "repo": repo, "scopes": scopes,
+			"iat": time.Now().Unix(), "exp": time.Now().Add(time.Hour).Unix(),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return header + "." + base64.RawURLEncoding.EncodeToString(payload) + "."
+	}
+
+	for _, ep := range endpoints {
+		claim := repoClaim(ep.orgLevel)
+		goodScopes := []string{ep.scope}
+
+		cases := []struct {
+			name       string
+			token      string // "" = none
+			authHeader string // verbatim override
+			wantStatus int
+		}{
+			{name: "no authorization header", wantStatus: http.StatusUnauthorized},
+			{name: "basic auth header", authHeader: "Basic dXNlcjpwYXNz", wantStatus: http.StatusUnauthorized},
+			{name: "garbage token", token: "garbage.token.value", wantStatus: http.StatusUnauthorized},
+			{
+				name:       "expired token",
+				token:      e.mint(t, tokenSpec{iss: org, repo: claim, scopes: goodScopes, expIn: -time.Minute}),
+				wantStatus: http.StatusUnauthorized,
+			},
+			{
+				name:       "alg none",
+				token:      algNone(org, claim, goodScopes),
+				wantStatus: http.StatusUnauthorized,
+			},
+			{
+				name:       "HS256 signed",
+				token:      e.mint(t, tokenSpec{alg: "HS256", iss: org, repo: claim, scopes: goodScopes}),
+				wantStatus: http.StatusUnauthorized,
+			},
+			{
+				name:       "signed by unregistered key",
+				token:      e.mint(t, tokenSpec{iss: org, repo: claim, scopes: goodScopes, key: newUnregisteredES256Key(t)}),
+				wantStatus: http.StatusUnauthorized,
+			},
+			{
+				name:       "unknown issuer",
+				token:      e.mint(t, tokenSpec{iss: "no-such-org", repo: claim, scopes: goodScopes}),
+				wantStatus: http.StatusUnauthorized,
+			},
+			{
+				name:       "wrong sub literal",
+				token:      e.mint(t, tokenSpec{iss: org, sub: "someone-else", repo: claim, scopes: goodScopes}),
+				wantStatus: http.StatusUnauthorized,
+			},
+			{
+				name:       "missing required scope",
+				token:      e.mint(t, tokenSpec{iss: org, repo: claim, scopes: []string{auth.ScopeGitWrite}}),
+				wantStatus: http.StatusForbidden,
+			},
+		}
+		if ep.orgLevel {
+			cases = append(cases, struct {
+				name       string
+				token      string
+				authHeader string
+				wantStatus int
+			}{
+				name:       "repo claim not org",
+				token:      e.mint(t, tokenSpec{iss: org, repo: repoURL, scopes: goodScopes}),
+				wantStatus: http.StatusForbidden,
+			})
+		}
+
+		for _, tc := range cases {
+			t.Run(ep.name+"/"+tc.name, func(t *testing.T) {
+				resp, body := e.doReq(t, ep.method, ep.path, tc.token, nil, tc.authHeader)
+				if resp.StatusCode != tc.wantStatus {
+					t.Fatalf("status = %d, want %d (body %s)", resp.StatusCode, tc.wantStatus, body)
+				}
+				requireEnvelope(t, resp, body)
+			})
+		}
+	}
+
+	// 404s: valid tokens for a repo that does not exist.
+	missing := "never-created-" + randomHex(t, 6)
+	for _, tc := range []struct {
+		name, method, path string
+		scopes             []string
+	}{
+		{"get nonexistent", http.MethodGet, "/api/v1/repo", []string{auth.ScopeGitRead}},
+		{"delete nonexistent", http.MethodDelete, "/api/v1/repos/delete", []string{auth.ScopeRepoWrite}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tok := e.mint(t, tokenSpec{iss: org, repo: missing, scopes: tc.scopes})
+			resp, body := e.doReq(t, tc.method, tc.path, tok, nil, "")
+			if resp.StatusCode != http.StatusNotFound {
+				t.Fatalf("status = %d, want 404 (body %s)", resp.StatusCode, body)
+			}
+			requireEnvelope(t, resp, body)
+		})
+	}
+}
+
+// TestJWTPerAlgorithmPositive proves a token signed with each allowed
+// algorithm's registered key authenticates (docs/02 allow-list).
+func TestJWTPerAlgorithmPositive(t *testing.T) {
+	e := testEnvironment(t)
+	org := e.newOrg(t)
+	repoURL := "alg-" + randomHex(t, 6)
+	createRepo(t, e, org, repoURL, nil, http.StatusOK)
+
+	for _, alg := range auth.AllowedAlgorithms {
+		t.Run(alg, func(t *testing.T) {
+			tok := e.mint(t, tokenSpec{alg: alg, iss: org, repo: repoURL, scopes: []string{auth.ScopeGitRead}})
+			resp, body := e.doReq(t, http.MethodGet, "/api/v1/repo", tok, nil, "")
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("%s token rejected: status = %d (body %s)", alg, resp.StatusCode, body)
+			}
+		})
+	}
+}
