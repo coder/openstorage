@@ -275,17 +275,23 @@ func mintToken(keyPath, iss, repo, scopes, refsJSON, alg string, ttl time.Durati
 func cmdListPacks(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("list-packs", flag.ExitOnError)
 	repo := fs.String("repo", "", "repo whose packs to list")
+	dataDir := fs.String("data-dir", "", "local-mode data directory (falls back to $"+envDataDir+"); derives the blob location when no URL is set")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if *repo == "" {
 		return fmt.Errorf("--repo is required")
 	}
-	blobURL := envFirst(os.Getenv, envBlobURL...)
-	if blobURL == "" {
-		return fmt.Errorf("blob URL required: set %s (or legacy %s)", envBlobURL[0], envBlobURL[2])
+	// Shared derivation with serve/signing-key: env URLs win, local mode
+	// (--data-dir / $CODESTORAGE_DATA_DIR) derives the fileblob location.
+	urls, err := resolveStorageURLs(os.Getenv, *dataDir)
+	if err != nil {
+		return err
 	}
-	bl, err := blob.Open(ctx, blobURL)
+	if urls.blobURL == "" {
+		return errBlobURLRequired()
+	}
+	bl, err := blob.Open(ctx, urls.blobURL)
 	if err != nil {
 		return err
 	}

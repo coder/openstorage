@@ -213,6 +213,70 @@ func TestResolveServeConfigDataDir(t *testing.T) {
 	})
 }
 
+// resolveStorageURLs is the derivation shared by serve, signing-key, and
+// list-packs: env URLs win, --data-dir fills the empty slots, and missing
+// slots stay empty (each subcommand validates only what it needs).
+func TestResolveStorageURLs(t *testing.T) {
+	t.Run("data dir fills empty slots", func(t *testing.T) {
+		u, err := resolveStorageURLs(mapEnv(nil), "/data")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if want := "sqlite://" + filepath.Join("/data", "codestorage.db"); u.dbURL != want {
+			t.Fatalf("dbURL = %q, want %q", u.dbURL, want)
+		}
+		if want := "file://" + filepath.Join("/data", "blobs"); u.blobURL != want {
+			t.Fatalf("blobURL = %q, want %q", u.blobURL, want)
+		}
+		if want := filepath.Join("/data", "cache"); u.cacheDir != want {
+			t.Fatalf("cacheDir = %q, want %q", u.cacheDir, want)
+		}
+	})
+
+	t.Run("env urls beat derivation", func(t *testing.T) {
+		u, err := resolveStorageURLs(mapEnv(map[string]string{
+			"CODESTORAGE_PG_URL": "postgres://explicit",
+			"CODESTORAGE_S3_URL": "s3://explicit",
+		}), "/data")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if u.dbURL != "postgres://explicit" || u.blobURL != "s3://explicit" {
+			t.Fatalf("explicit env URLs must win: %+v", u)
+		}
+	})
+
+	t.Run("env data dir honored without flag", func(t *testing.T) {
+		u, err := resolveStorageURLs(mapEnv(map[string]string{"CODESTORAGE_DATA_DIR": "/envdata"}), "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if u.dataDir != "/envdata" {
+			t.Fatalf("dataDir = %q, want /envdata", u.dataDir)
+		}
+	})
+
+	t.Run("relative data dir becomes absolute", func(t *testing.T) {
+		u, err := resolveStorageURLs(mapEnv(nil), "rel-data")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !filepath.IsAbs(u.dataDir) {
+			t.Fatalf("dataDir %q must be absolute (hook re-exec safety)", u.dataDir)
+		}
+	})
+
+	t.Run("nothing set leaves slots empty", func(t *testing.T) {
+		u, err := resolveStorageURLs(mapEnv(nil), "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if u.dbURL != "" || u.blobURL != "" || u.dataDir != "" || u.cacheDir != "" {
+			t.Fatalf("want all slots empty, got %+v", u)
+		}
+	})
+}
+
 func TestResolveServeConfigErrors(t *testing.T) {
 	cases := []struct {
 		name    string

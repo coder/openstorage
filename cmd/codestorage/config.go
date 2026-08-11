@@ -67,47 +67,85 @@ type serveConfig struct {
 	baseURL string
 }
 
+// storageURLs is the resolved storage location set shared by every
+// subcommand that opens the stores (serve, signing-key, list-packs):
+// explicit env URLs win, then --data-dir/$CODESTORAGE_DATA_DIR derivation
+// (local mode) fills the empty slots. Callers validate the slots they need.
+type storageURLs struct {
+	dataDir string // absolute when set; "" outside local mode
+	dbURL   string // "" when neither env nor data-dir provided one
+	blobURL string // "" when neither env nor data-dir provided one
+	// cacheDir is derived from dataDir only ("" otherwise); serve applies
+	// its own flag/default precedence on top.
+	cacheDir string
+}
+
+// resolveStorageURLs merges the storage env vars with the local-mode data
+// dir (flag > env). The data dir is made absolute up front: hooks re-exec
+// this binary from a different working directory (the bare cache repo), so
+// relative sqlite/file URLs would silently point somewhere else across the
+// re-exec.
+func resolveStorageURLs(getenv func(string) string, flagDataDir string) (storageURLs, error) {
+	assertf(getenv != nil, "resolveStorageURLs: nil getenv")
+	u := storageURLs{
+		dbURL:   envFirst(getenv, envPGURL...),
+		blobURL: envFirst(getenv, envBlobURL...),
+		dataDir: firstNonEmpty(flagDataDir, getenv(envDataDir)),
+	}
+	if u.dataDir != "" {
+		abs, err := filepath.Abs(u.dataDir)
+		if err != nil {
+			return storageURLs{}, fmt.Errorf("--data-dir %q: %w", u.dataDir, err)
+		}
+		u.dataDir = abs
+		if u.dbURL == "" {
+			u.dbURL = "sqlite://" + filepath.Join(abs, "codestorage.db")
+		}
+		if u.blobURL == "" {
+			u.blobURL = "file://" + filepath.Join(abs, "blobs")
+		}
+		u.cacheDir = filepath.Join(abs, "cache")
+	}
+	assertf(u.dataDir == "" || filepath.IsAbs(u.dataDir), "resolveStorageURLs: dataDir %q not absolute", u.dataDir)
+	return u, nil
+}
+
+// errDBURLRequired/errBlobURLRequired are the shared missing-slot errors so
+// every subcommand names the same remediation (env URL or local mode).
+func errDBURLRequired() error {
+	return fmt.Errorf("database URL required: set %s (or legacy %s), or pass --data-dir / set %s for local mode", envPGURL[0], envPGURL[2], envDataDir)
+}
+
+func errBlobURLRequired() error {
+	return fmt.Errorf("blob URL required: set %s (or legacy %s), or pass --data-dir / set %s for local mode", envBlobURL[0], envBlobURL[2], envDataDir)
+}
+
 // resolveServeConfig merges flags and environment into a validated config.
 // Precedence per slot: explicit flag > explicit env > --data-dir derivation
 // (local mode) > built-in default (cacheDir only).
 func resolveServeConfig(getenv func(string) string, flagListen, flagAddr, flagCacheDir, flagDataDir string) (serveConfig, error) {
 	assertf(getenv != nil, "resolveServeConfig: nil getenv")
+	urls, err := resolveStorageURLs(getenv, flagDataDir)
+	if err != nil {
+		return serveConfig{}, err
+	}
 	cfg := serveConfig{
 		listen:      firstNonEmpty(flagListen, flagAddr, getenv(envListen), defaultListen),
-		cacheDir:    flagCacheDir,
-		dbURL:       envFirst(getenv, envPGURL...),
-		blobURL:     envFirst(getenv, envBlobURL...),
-		dataDir:     firstNonEmpty(flagDataDir, getenv(envDataDir)),
+		cacheDir:    firstNonEmpty(flagCacheDir, urls.cacheDir),
+		dbURL:       urls.dbURL,
+		blobURL:     urls.blobURL,
+		dataDir:     urls.dataDir,
 		org:         getenv(envOrg),
 		orgKeysPath: getenv(envOrgPubKeys),
-	}
-	if cfg.dataDir != "" {
-		// Absolute up front: hooks re-exec this binary from a different
-		// working directory (the bare cache repo), so relative sqlite/file
-		// URLs would silently point somewhere else across the re-exec.
-		abs, err := filepath.Abs(cfg.dataDir)
-		if err != nil {
-			return serveConfig{}, fmt.Errorf("--data-dir %q: %w", cfg.dataDir, err)
-		}
-		cfg.dataDir = abs
-		if cfg.dbURL == "" {
-			cfg.dbURL = "sqlite://" + filepath.Join(abs, "codestorage.db")
-		}
-		if cfg.blobURL == "" {
-			cfg.blobURL = "file://" + filepath.Join(abs, "blobs")
-		}
-		if cfg.cacheDir == "" {
-			cfg.cacheDir = filepath.Join(abs, "cache")
-		}
 	}
 	if cfg.cacheDir == "" {
 		cfg.cacheDir = filepath.Join(os.TempDir(), "codestorage-cache")
 	}
 	if cfg.dbURL == "" {
-		return serveConfig{}, fmt.Errorf("database URL required: set %s (or legacy %s), or pass --data-dir / set %s for local mode", envPGURL[0], envPGURL[2], envDataDir)
+		return serveConfig{}, errDBURLRequired()
 	}
 	if cfg.blobURL == "" {
-		return serveConfig{}, fmt.Errorf("blob URL required: set %s (or legacy %s), or pass --data-dir / set %s for local mode", envBlobURL[0], envBlobURL[2], envDataDir)
+		return serveConfig{}, errBlobURLRequired()
 	}
 	if cfg.org == "" || cfg.orgKeysPath == "" {
 		return serveConfig{}, fmt.Errorf("%s and %s must both be set (single-org serve mode)", envOrg, envOrgPubKeys)

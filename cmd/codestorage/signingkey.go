@@ -45,6 +45,7 @@ func cmdSigningKey(ctx context.Context, args []string) error {
 
 	fs := flag.NewFlagSet("signing-key "+sub, flag.ExitOnError)
 	org := fs.String("org", "", "organization name (the JWT iss claim)")
+	dataDir := fs.String("data-dir", "", "local-mode data directory (falls back to $"+envDataDir+"); derives the database location when no URL is set")
 	var keyPath *string
 	var id *int64
 	switch sub {
@@ -63,11 +64,16 @@ func cmdSigningKey(ctx context.Context, args []string) error {
 		return errors.New("--org is required")
 	}
 
-	pgURL := envFirst(os.Getenv, envPGURL...)
-	if pgURL == "" {
-		return fmt.Errorf("postgres URL required: set %s (or legacy %s)", envPGURL[0], envPGURL[2])
+	// Shared derivation with serve/list-packs: env URLs win, local mode
+	// (--data-dir / $CODESTORAGE_DATA_DIR) derives the sqlite location.
+	urls, err := resolveStorageURLs(os.Getenv, *dataDir)
+	if err != nil {
+		return err
 	}
-	ms, cleanup, err := openMetaStore(ctx, pgURL)
+	if urls.dbURL == "" {
+		return errDBURLRequired()
+	}
+	ms, cleanup, err := openMetaStore(ctx, urls.dbURL)
 	if err != nil {
 		return err
 	}
