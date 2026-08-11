@@ -260,6 +260,12 @@ export default function workflow({ args, phase, log, agent, parallel, applyPatch
     if (!res.success) log(`patch not applied cleanly: ${agentId}`, { status: res.status ?? res.error });
   };
   const operatorBrief = args.brief ? `\n\nOperator guidance for this phase:\n${args.brief}` : "";
+  // In isolated mode, fan-in uses git-format-patch artifacts: only COMMITTED child work survives.
+  const commitRule = isolated
+    ? "\n\nIMPORTANT: You work in an isolated fork of the parent workspace; only COMMITTED changes are " +
+      "integrated back (patch fan-in drops uncommitted files). Before finishing, commit ALL your changes " +
+      "on the current branch with descriptive messages (git add -A && git commit). Never push."
+    : "";
 
   // ---- Plan ----
   phase("plan", { phase: args.phase, title: spec.title });
@@ -296,7 +302,7 @@ export default function workflow({ args, phase, log, agent, parallel, applyPatch
       `Implement ONLY the shared foundation for this plan: ${slicing.foundation}\n\n` +
         `This is contract-first work: interfaces, types, migrations, wiring, shared test helpers. Parallel slice ` +
         `agents will build on top of it and treat it as frozen — make signatures deliberate. It must compile and ` +
-        `pass go vet. Do NOT implement the slices themselves.\n\nFull plan for context:\n${plan.reportMarkdown}${operatorBrief}`,
+        `pass go vet. Do NOT implement the slices themselves.\n\nFull plan for context:\n${plan.reportMarkdown}${operatorBrief}${commitRule}`,
       {
         id: "implement-foundation",
         title: "Implement foundation",
@@ -321,7 +327,7 @@ export default function workflow({ args, phase, log, agent, parallel, applyPatch
           `contracts — if your slice seems to require changing them, do NOT change them; implement what you can and ` +
           `report the constraint conflict explicitly in your final summary.\n\n` +
           `Write tests alongside code within your owned paths. Make minimal, correct, reviewable changes with ` +
-          `defensive asserts.\n\nFull plan for context:\n${plan.reportMarkdown}${operatorBrief}`,
+          `defensive asserts.\n\nFull plan for context:\n${plan.reportMarkdown}${operatorBrief}${commitRule}`,
         {
           id: `implement-slice-${sliceIds[i]}`,
           title: `Implement slice: ${sl.name}`,
@@ -342,7 +348,8 @@ export default function workflow({ args, phase, log, agent, parallel, applyPatch
       `signature drift between slices, duplicate helpers, and any constraint conflicts the slice agents reported. ` +
       `You may touch any file. Do NOT add new features beyond the plan. Finish with the full build green ` +
       `(go build ./... && go vet ./...).\n\nFoundation summary:\n${foundationSummary || "(none)"}\n\nSlice summaries:\n` +
-      sliceSummaries.map((summary, i) => `--- ${slicing.slices[i].name} ---\n${summary}`).join("\n\n"),
+      sliceSummaries.map((summary, i) => `--- ${slicing.slices[i].name} ---\n${summary}`).join("\n\n") +
+      commitRule,
     {
       id: "integrate-slices",
       title: "Integrate slices",
@@ -366,7 +373,8 @@ export default function workflow({ args, phase, log, agent, parallel, applyPatch
     phase(`fix-round-${round + 1}`, { failures: verify.failures.length });
     agent(
       `Fix these validation failures with minimal changes. Do not suppress or skip tests; fix root causes.\n\n` +
-        JSON.stringify(verify.failures, null, 2),
+        JSON.stringify(verify.failures, null, 2) +
+        commitRule,
       { id: `fix-${round}`, title: `Fix round ${round + 1}` }
     );
     applyChildPatch(`apply-fix-${round}`, `fix-${round}`);
@@ -405,7 +413,8 @@ export default function workflow({ args, phase, log, agent, parallel, applyPatch
     phase("fix-review-findings", { blocking: blocking.length });
     agent(
       `Fix these blocking code-review findings with minimal changes (root causes, not band-aids):\n\n` +
-        JSON.stringify(blocking, null, 2),
+        JSON.stringify(blocking, null, 2) +
+        commitRule,
       { id: "fix-findings", title: "Fix review findings" }
     );
     applyChildPatch("apply-fix-findings", "fix-findings");
@@ -442,7 +451,7 @@ export default function workflow({ args, phase, log, agent, parallel, applyPatch
   agent(
     `Update project documentation for this phase: implementation notes / ADRs for non-obvious decisions ` +
       `(ref-authority-in-PG, S3-before-ref-flip, namespace mapping), README quickstart if setup changed, and ` +
-      `docs/07-implementation-roadmap.md phase status. Match existing docs tone; no marketing fluff.\n\nWhat was built:\n${implementSummary}`,
+      `docs/07-implementation-roadmap.md phase status. Match existing docs tone; no marketing fluff.\n\nWhat was built:\n${implementSummary}${commitRule}`,
     { id: "document", title: "Document phase" }
   );
   applyChildPatch("apply-document", "document");
