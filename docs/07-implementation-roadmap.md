@@ -67,6 +67,15 @@ binds. Decisions are recorded in
 [10-phase2-implementation-notes.md](10-phase2-implementation-notes.md). Phases 3–6 below
 are not started.
 
+**Interlude — pluggable storage backends (local mode): done.** Before phase 3, the storage
+layer went behind URL-scheme factories (`ref.Open` / `blob.Open` / `meta.Open`) with two
+stacks: the production `postgres://` + `s3://` pair, and a zero-dependency local pair —
+`sqlite://` (pure-Go driver, one `codestorage.db` for refs + metadata) and `file://` pack
+storage — derived from a single `serve --data-dir` flag. Nodes stay stateless either way;
+the container-based acceptance suites gained zero-container lanes (api `/sqlite` subtests,
+`CODESTORAGE_TEST_BACKEND=local` e2e). Decisions are recorded in
+[11-local-backends-implementation-notes.md](11-local-backends-implementation-notes.md).
+
 1. **Skeleton + auth — done.** Org registry with public keys; JWT middleware (ES256/RS256/EdDSA,
    claims/scope checks); error envelope; `POST /repos`, `GET /repo`, `GET /repos`,
    `DELETE /repos/delete` on the phase-0 core + metadata DB.

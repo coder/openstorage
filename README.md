@@ -3,11 +3,12 @@
 An open-source, wire-compatible backend for [code.storage](https://code.storage), built from
 the specification in [`docs/`](docs/README.md).
 
-Current state: **phase 2 (git smart HTTP) done**. One Go binary (`codestorage serve`) exposes
-the `/api/v1` repo CRUD API and the production git smart-HTTP path (clone/push, ref-policy
-enforcement, commit-signature verification) behind the same per-org JWT verifier, with
-Postgres as the ref/metadata authority and S3 (MinIO) as immutable pack storage; nodes are
-stateless. Next: phase 3 (read API) — see
+Current state: **phase 2 (git smart HTTP) + pluggable storage backends done**. One Go binary
+(`codestorage serve`) exposes the `/api/v1` repo CRUD API and the production git smart-HTTP
+path (clone/push, ref-policy enforcement, commit-signature verification) behind the same
+per-org JWT verifier; nodes are stateless. Storage is selected by URL scheme: Postgres +
+S3 (MinIO) for multi-node deployments, or zero-dependency local mode (SQLite + plain files
+via `serve --data-dir`). Next: phase 3 (read API) — see
 [docs/07-implementation-roadmap.md](docs/07-implementation-roadmap.md).
 
 ## Layout
@@ -19,8 +20,8 @@ stateless. Next: phase 3 (read API) — see
 | `internal/api` | `/api/v1` HTTP handlers, JWT middleware, `{"error"}` envelope |
 | `internal/auth` | JWT verification contract (per-org public keys, allowed algorithms) |
 | `internal/meta` | Metadata store: orgs, org public keys, repos (soft delete, pagination) |
-| `internal/blob` | `BlobStore` contract + S3/MinIO implementation (immutable packs) |
-| `internal/ref` | `RefStore` contract + Postgres implementation (CAS ref authority) |
+| `internal/blob` | `BlobStore` contract + S3/MinIO and local-file implementations (immutable packs) |
+| `internal/ref` | `RefStore` contract + Postgres and SQLite implementations (CAS ref authority) |
 | `internal/githttp` | Git smart-HTTP server + policy/verify-sig hooks, cache hydration, e2e suite |
 | `docker-compose.yml` | Postgres + MinIO for local dogfooding |
 
@@ -68,6 +69,37 @@ cd demo && git commit --allow-empty -m init && git push origin HEAD:main
 
 Host ports are env-overridable (`PGPORT`, `MINIOPORT`) — see the compose file header.
 
+### Local mode quickstart
+
+Zero external dependencies — no Docker, no Postgres, no MinIO. One flag derives the whole
+storage stack: `sqlite://<dir>/codestorage.db` (refs + metadata), `file://<dir>/blobs`
+(packs as plain files), and `<dir>/cache` (rebuildable cache).
+
+```sh
+# 1. Build and generate an org keypair (keys stay in /tmp, never commit them).
+go build ./cmd/codestorage
+./codestorage keygen --out /tmp/cs-key    # writes /tmp/cs-key.pem + /tmp/cs-key.pub.pem
+
+# 2. Start a node: same /api/v1 + git smart-HTTP surface as the container stack.
+CODESTORAGE_ORG=selfhost CODESTORAGE_ORG_PUBKEYS=/tmp/cs-key.pub.pem \
+  ./codestorage serve --listen 127.0.0.1:8080 --data-dir /tmp/cs-data &
+
+# 3. Mint a token and create a repo.
+TOK_CREATE=$(./codestorage mint --key /tmp/cs-key.pem --iss selfhost --repo demo --scopes repo:write)
+curl -s -X POST http://127.0.0.1:8080/api/v1/repos -H "Authorization: Bearer $TOK_CREATE" \
+  -d '{"default_branch":"main"}'                                    # {"repo_id":...}
+
+# 4. Plain git against the same node.
+TOKEN=$(./codestorage mint --key /tmp/cs-key.pem --iss selfhost --repo demo --scopes git:read,git:write)
+git clone "http://t:${TOKEN}@127.0.0.1:8080/demo.git"
+cd demo && git commit --allow-empty -m init && git push origin HEAD:main
+```
+
+The derivation fills only slots not set explicitly — `CODESTORAGE_PG_URL`,
+`CODESTORAGE_S3_URL`, and `--cache-dir` always win. Local mode is intentionally
+single-node (ADR-13 in
+[docs/11-local-backends-implementation-notes.md](docs/11-local-backends-implementation-notes.md)).
+
 ### Configuration
 
 `serve` reads `CODESTORAGE_*` environment variables; the phase-0 spike names are kept as
@@ -75,8 +107,9 @@ fallback aliases so old invocations keep working.
 
 | Variable (canonical) | Fallback aliases | Meaning |
 |---|---|---|
-| `CODESTORAGE_PG_URL` | `SPIKE_PG_URL`, `PG_URL` | Postgres URL (refs + metadata) |
-| `CODESTORAGE_S3_URL` | `SPIKE_S3_URL`, `BLOB_URL` | gocloud.dev s3 bucket URL for packs |
+| `CODESTORAGE_PG_URL` | `SPIKE_PG_URL`, `PG_URL` | Database URL for refs + metadata: `postgres://` or `sqlite://` |
+| `CODESTORAGE_S3_URL` | `SPIKE_S3_URL`, `BLOB_URL` | Pack storage URL: gocloud.dev `s3://` bucket or `file://` directory |
+| `CODESTORAGE_DATA_DIR` | `--data-dir` flag wins | Local-mode data directory; derives `sqlite://<dir>/codestorage.db`, `file://<dir>/blobs`, and `<dir>/cache` for slots not set explicitly |
 | `CODESTORAGE_LISTEN` | `--listen` / `--addr` flags win | Listen address (default `127.0.0.1:0`) |
 | `CODESTORAGE_ORG` | — | **Required.** Org name (JWT `iss`) |
 | `CODESTORAGE_ORG_PUBKEYS` | — | **Required.** PEM file with 1..n org public key blocks |
@@ -91,3 +124,8 @@ are gone (ADR-8 in [docs/10-phase2-implementation-notes.md](docs/10-phase2-imple
 ```sh
 go test ./...   # needs Docker: boots real Postgres + MinIO via testcontainers
 ```
+
+Zero-container lanes cover the same surfaces on the local backends: the api integration
+tests fan out into `/pg` + `/sqlite` subtests, and
+`CODESTORAGE_TEST_BACKEND=local go test ./internal/githttp` runs the full git e2e suite on
+`sqlite://` + `file://` (see docs/11 for the lane table).
