@@ -191,12 +191,13 @@ func MintToken(priv *ecdsa.PrivateKey, iss, repo string, scopes []string, refsJS
 		"exp":    now.Add(ttl).Unix(),
 	}
 	if refsJSON != "" {
-		var refs json.RawMessage = []byte(refsJSON)
-		// Validate the tuple encoding before embedding it.
-		if _, err := ParseRefPolicies(refsJSON); err != nil {
+		// Parse (validates + normalizes) and re-marshal through RefPolicy's
+		// tuple encoding instead of embedding the caller's raw JSON.
+		policies, err := ParseRefPolicies(refsJSON)
+		if err != nil {
 			return "", err
 		}
-		claims["refs"] = refs
+		claims["refs"] = policies
 	}
 	payload, err := json.Marshal(claims)
 	if err != nil {

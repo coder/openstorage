@@ -1,6 +1,7 @@
 package spike
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -40,15 +41,19 @@ func RepoPath(cacheDir, repo string) string {
 	return filepath.Join(cacheDir, repo+".git")
 }
 
-// runGit executes git with args, returning combined output for diagnostics.
+// runGit executes git with args, returning stdout only. Stderr is captured
+// separately and surfaced in the error text: git warnings on stderr must
+// never contaminate parsed stdout (e.g. for-each-ref in SyncRefs).
 func runGit(dir string, args ...string) (string, error) {
 	cmd := exec.Command("git", args...)
 	if dir != "" {
 		cmd.Dir = dir
 	}
-	out, err := cmd.CombinedOutput()
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
 	if err != nil {
-		return string(out), fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
+		return string(out), fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
 	}
 	return string(out), nil
 }
@@ -121,6 +126,11 @@ func HydratePacks(ctx context.Context, st ref.RefStore, bl blob.BlobStore, repoP
 			}
 		}
 		if out, err := runGit(repoPath, "index-pack", packFile); err != nil {
+			// A failed index-pack means the on-disk pack is corrupt/partial.
+			// Remove it (and any partial idx) so a retry re-downloads instead
+			// of tripping over the same bad bytes forever.
+			_ = os.Remove(packFile)
+			_ = os.Remove(base + ".idx")
 			return fmt.Errorf("index-pack %s: %w (%s)", p.ID, err, strings.TrimSpace(out))
 		}
 	}

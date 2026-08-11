@@ -165,6 +165,7 @@ func (s *Server) handleInfoRefs(w http.ResponseWriter, r *http.Request, repo str
 func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, service string) {
 	claims, status, err := s.authenticate(r, repo, serviceScope(service))
 	if err != nil {
+		w.Header().Set("WWW-Authenticate", `Basic realm="codestorage"`)
 		httpError(w, status, err.Error())
 		return
 	}
@@ -180,7 +181,7 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 	if r.Header.Get("Content-Encoding") == "gzip" {
 		gz, err := gzip.NewReader(r.Body)
 		if err != nil {
-			httpError(w, http.StatusBadRequest, "bad gzip body")
+			httpError(w, http.StatusBadRequest, "bad gzip body: "+err.Error())
 			return
 		}
 		defer gz.Close()

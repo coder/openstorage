@@ -9,7 +9,7 @@ import (
 	"io"
 	"net/url"
 	"os"
-	"strings"
+	"path/filepath"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
@@ -154,7 +154,10 @@ func (b *S3) DownloadFile(ctx context.Context, key, destPath string) error {
 		return fmt.Errorf("download %s: %w", key, err)
 	}
 	defer r.Close()
-	tmp, err := os.CreateTemp(dirOf(destPath), ".blob-download-*")
+	// filepath.Dir handles relative and bare-filename paths ("." for the
+	// latter); the tmp file must live in the destination directory so the
+	// final rename is atomic (same filesystem).
+	tmp, err := os.CreateTemp(filepath.Dir(destPath), ".blob-download-*")
 	if err != nil {
 		return err
 	}
@@ -167,12 +170,6 @@ func (b *S3) DownloadFile(ctx context.Context, key, destPath string) error {
 		return err
 	}
 	return os.Rename(tmp.Name(), destPath)
-}
-
-func dirOf(p string) string {
-	i := strings.LastIndexByte(p, '/')
-	assertf(i > 0, "dirOf(%q): need an absolute-ish path", p)
-	return p[:i]
 }
 
 // List returns all objects under prefix.
