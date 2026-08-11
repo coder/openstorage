@@ -16,7 +16,8 @@ import (
 // tree with no prefix.
 type ArchiveOptions struct {
 	// Prefix is prepended verbatim to every entry name (callers include the
-	// trailing "/", e.g. "repo-main/").
+	// trailing "/", e.g. "repo-main/"). It must satisfy ValidArchivePrefix;
+	// callers accepting untrusted input must validate it first.
 	Prefix string
 	// IncludeGlobs whitelists paths when non-empty; ExcludeGlobs always
 	// wins. See MatchGlob for the dialect.
@@ -35,6 +36,7 @@ type ArchiveOptions struct {
 func Archive(ctx context.Context, repoPath, commit string, opts ArchiveOptions, w io.Writer) error {
 	assertf(ref.ValidSHA(commit), "Archive: unresolved commit %q", commit)
 	assertf(w != nil, "Archive: nil writer")
+	assertf(ValidArchivePrefix(opts.Prefix), "Archive: unsafe prefix %q", opts.Prefix)
 
 	commits, err := Log(ctx, repoPath, commit, LogOptions{MaxCount: 1})
 	if err != nil {
@@ -101,6 +103,22 @@ func Archive(ctx context.Context, repoPath, commit string, opts ArchiveOptions, 
 		return err
 	}
 	return gz.Close()
+}
+
+// ValidArchivePrefix reports whether prefix is safe to prepend to tar entry
+// names: no NUL bytes, no backslashes (Windows extractors treat them as
+// separators), not absolute, and no "." or ".." segments — so extracted
+// entries cannot escape the destination root (tar slip).
+func ValidArchivePrefix(prefix string) bool {
+	if strings.ContainsAny(prefix, "\x00\\") || strings.HasPrefix(prefix, "/") {
+		return false
+	}
+	for _, seg := range strings.Split(prefix, "/") {
+		if seg == "." || seg == ".." {
+			return false
+		}
+	}
+	return true
 }
 
 // archiveWants applies include (any-of, when present) then exclude (always

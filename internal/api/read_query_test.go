@@ -988,6 +988,15 @@ func testQueryArchive(t *testing.T, e *testEnv) {
 		rqExpectErr(t, resp, body, http.StatusNotFound)
 		resp, body = e.doReq(t, http.MethodPost, "/api/v1/repos/archive", tok, []byte(`{"max_blob_size": -1}`), "")
 		rqExpectErr(t, resp, body, http.StatusBadRequest)
+		// Tar-slip prefixes must be rejected before any archive bytes flow.
+		for _, prefix := range []string{"../", "/abs/", "a/../b/", "..\\evil\\"} {
+			payload, err := json.Marshal(map[string]any{"archive": map[string]string{"prefix": prefix}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp, body = e.doReq(t, http.MethodPost, "/api/v1/repos/archive", tok, payload, "")
+			rqExpectErr(t, resp, body, http.StatusBadRequest)
+		}
 		resp, body = e.doReq(t, http.MethodPost, "/api/v1/repos/archive", tok, []byte(`{`), "")
 		rqExpectErr(t, resp, body, http.StatusBadRequest)
 	})

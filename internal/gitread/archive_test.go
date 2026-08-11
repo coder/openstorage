@@ -125,3 +125,18 @@ func TestArchiveFilters(t *testing.T) {
 		t.Errorf("size filter dropped symlink: %v", headers)
 	}
 }
+
+func TestValidArchivePrefix(t *testing.T) {
+	valid := []string{"", "repo-main/", "a/b/", "..hidden/", "a..b/"}
+	for _, p := range valid {
+		if !ValidArchivePrefix(p) {
+			t.Errorf("ValidArchivePrefix(%q) = false, want true", p)
+		}
+	}
+	invalid := []string{"/abs/", "../", "..", "a/../", "./", "a/./b/", "..\\evil\\", "a\x00b/"}
+	for _, p := range invalid {
+		if ValidArchivePrefix(p) {
+			t.Errorf("ValidArchivePrefix(%q) = true, want false", p)
+		}
+	}
+}

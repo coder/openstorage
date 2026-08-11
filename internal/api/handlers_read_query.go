@@ -916,6 +916,13 @@ func (s *server) handleArchive(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// Reject prefixes that could make extracted entries escape the
+	// destination root (tar slip): absolute paths, "."/".." segments,
+	// NUL bytes, backslashes.
+	if !gitread.ValidArchivePrefix(body.Archive.Prefix) {
+		writeErr(w, http.StatusBadRequest, fmt.Sprintf("invalid archive.prefix %q", body.Archive.Prefix))
+		return
+	}
 
 	repo, repoPath, ok := s.resolveQueryRepo(w, r)
 	if !ok {
