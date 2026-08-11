@@ -101,14 +101,18 @@ func bearerToken(r *http.Request) (string, bool) {
 
 // requireAuth enforces the docs/02 failure map for one route: missing or
 // unverifiable token -> 401 (+WWW-Authenticate via writeErr); verified token
-// missing the required scope, a non-"org" repo claim on an org-level route,
-// or an empty/"org" repo claim on a per-repo route -> 403 (claim mismatch
-// with target). On success the verified claims are injected into the
-// request context; per-repo handlers can rely on a non-empty, non-"org"
-// repo claim.
-func requireAuth(verifier auth.Verifier, requiredScope string, orgLevel bool) middleware {
+// missing ANY of the required scopes (docs/02: e.g. DELETE /repos/tags
+// demands both git:read and git:write), a non-"org" repo claim on an
+// org-level route, or an empty/"org" repo claim on a per-repo route -> 403
+// (claim mismatch with target). On success the verified claims are injected
+// into the request context; per-repo handlers can rely on a non-empty,
+// non-"org" repo claim.
+func requireAuth(verifier auth.Verifier, orgLevel bool, requiredScopes ...string) middleware {
 	assertf(verifier != nil, "requireAuth: nil verifier")
-	assertf(requiredScope != "", "requireAuth: empty required scope")
+	assertf(len(requiredScopes) > 0, "requireAuth: no required scopes")
+	for _, s := range requiredScopes {
+		assertf(s != "", "requireAuth: empty required scope")
+	}
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			token, ok := bearerToken(r)
@@ -122,9 +126,11 @@ func requireAuth(verifier auth.Verifier, requiredScope string, orgLevel bool) mi
 				return
 			}
 			assertf(claims != nil, "Verifier returned nil claims without error")
-			if !claims.HasScope(requiredScope) {
-				writeErr(w, http.StatusForbidden, "missing required scope "+requiredScope)
-				return
+			for _, scope := range requiredScopes {
+				if !claims.HasScope(scope) {
+					writeErr(w, http.StatusForbidden, "missing required scope "+scope)
+					return
+				}
 			}
 			if orgLevel && claims.Repo != auth.RepoClaimOrg {
 				writeErr(w, http.StatusForbidden, "token is not org-scoped")

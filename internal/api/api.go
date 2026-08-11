@@ -54,7 +54,7 @@ func New(cfg Config) http.Handler {
 
 	mux := http.NewServeMux()
 	route := func(pattern, scope string, orgLevel bool, h http.HandlerFunc) {
-		mux.Handle(pattern, requireAuth(cfg.Verifier, scope, orgLevel)(h))
+		mux.Handle(pattern, requireAuth(cfg.Verifier, orgLevel, scope)(h))
 	}
 	route("POST /api/v1/repos", auth.ScopeRepoWrite, false, s.handleCreateRepo)
 	route("GET /api/v1/repo", auth.ScopeGitRead, false, s.handleGetRepo)

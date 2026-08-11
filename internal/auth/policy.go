@@ -79,8 +79,14 @@ func NormalizeRefName(s string) string {
 // targeting a `+ephemeral` repo are matched against this rewritten name,
 // so persistent-branch rules don't police ephemeral pushes unless the
 // token uses `*` or an explicit namespaced pattern.
+//
+// An empty ref (malformed external input) yields "", which never names a
+// real ref and never matches a policy pattern (MatchPolicy treats "" as
+// no-match) — callers validate emptiness where it matters.
 func EphemeralRefName(ref string) string {
-	assertf(ref != "", "EphemeralRefName called with empty ref")
+	if ref == "" {
+		return ""
+	}
 	return EphemeralNamespacePrefix + NormalizeRefName(ref)
 }
 
@@ -108,6 +114,11 @@ func ParseRefPolicies(raw string) ([]RefPolicy, error) {
 // `refs/heads/feature/*` matches nested `feature/a/b`). No mid-pattern
 // globs, no segment matching.
 func MatchPolicy(policies []RefPolicy, ref string) (RefPolicy, bool) {
+	if ref == "" {
+		// Malformed external input: explicit no-match instead of a crash.
+		// Callers (the update hook) reject empty ref names up front.
+		return RefPolicy{}, false
+	}
 	ref = NormalizeRefName(ref)
 	for _, p := range policies {
 		if patternMatch(NormalizeRefName(p.Pattern), ref) {
@@ -123,7 +134,9 @@ func MatchPolicy(policies []RefPolicy, ref string) (RefPolicy, bool) {
 // which never matches because git forbids `*` in ref names — the rule is
 // dead rather than over-matching.
 func patternMatch(pattern, ref string) bool {
-	assertf(ref != "", "patternMatch called with empty ref")
+	if ref == "" {
+		return false // empty ref never matches any pattern
+	}
 	if pattern == "*" {
 		return true
 	}
