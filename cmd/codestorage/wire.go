@@ -31,19 +31,32 @@ import (
 // mounts it un-stripped at mux.Handle("/api/v1/", h).
 func buildAPIHandler(ctx context.Context, pgURL, org, httpBaseURL string, orgPEMBlocks []string) (http.Handler, meta.Store, func(), error) {
 	assertf(pgURL != "" && org != "" && httpBaseURL != "" && len(orgPEMBlocks) > 0, "buildAPIHandler: missing pgURL/org/httpBaseURL/keys")
-	ms, err := meta.OpenPG(ctx, pgURL)
+	ms, cleanup, err := openMetaStore(ctx, pgURL)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("open metadata store: %w", err)
-	}
-	if err := ms.InitSchema(ctx); err != nil {
-		ms.Close()
-		return nil, nil, nil, fmt.Errorf("init metadata schema: %w", err)
+		return nil, nil, nil, err
 	}
 	if _, err := ms.UpsertOrgWithKeys(ctx, org, orgPEMBlocks); err != nil {
-		ms.Close()
+		cleanup()
 		return nil, nil, nil, fmt.Errorf("bootstrap org %q: %w", org, err)
 	}
 	verifier := auth.NewVerifier(ms)
 	h := api.New(api.Config{Store: ms, Verifier: verifier, HTTPBaseURL: httpBaseURL})
-	return h, ms, func() { ms.Close() }, nil
+	return h, ms, cleanup, nil
+}
+
+// openMetaStore opens the metadata store and ensures its schema exists
+// (idempotent). Shared by serve (via buildAPIHandler) and the signing-key
+// CLI, which talks to Postgres directly — there is no HTTP surface for the
+// signing-key registry (docs/02: upstream manages keys in its dashboard).
+func openMetaStore(ctx context.Context, pgURL string) (meta.Store, func(), error) {
+	assertf(pgURL != "", "openMetaStore: empty pgURL")
+	ms, err := meta.OpenPG(ctx, pgURL)
+	if err != nil {
+		return nil, nil, fmt.Errorf("open metadata store: %w", err)
+	}
+	if err := ms.InitSchema(ctx); err != nil {
+		ms.Close()
+		return nil, nil, fmt.Errorf("init metadata schema: %w", err)
+	}
+	return ms, func() { ms.Close() }, nil
 }

@@ -1,7 +1,8 @@
 // codestorage is the service binary: `serve` runs a stateless node exposing
 // the /api/v1 HTTP API (single-org self-host mode) and the git smart-HTTP
 // path; `hook` is re-exec'd by git as pre-receive/update hooks;
-// keygen/mint/list-packs are local dogfooding helpers.
+// `signing-key` manages the org's commit-signing key registry (docs/02
+// verify-sig); keygen/mint/list-packs are local dogfooding helpers.
 //
 // Configuration comes from CODESTORAGE_* environment variables, with the
 // phase-0 spike names (SPIKE_*, PG_URL, BLOB_URL) kept as fallback aliases —
@@ -29,7 +30,7 @@ import (
 
 func main() {
 	if len(os.Args) < 2 {
-		fatalf("usage: codestorage <serve|hook|keygen|mint|list-packs> ...")
+		fatalf("usage: codestorage <serve|hook|keygen|mint|signing-key|list-packs> ...")
 	}
 	ctx := context.Background()
 	var err error
@@ -42,6 +43,8 @@ func main() {
 		err = cmdKeygen(os.Args[2:])
 	case "mint":
 		err = cmdMint(os.Args[2:])
+	case "signing-key":
+		err = cmdSigningKey(ctx, os.Args[2:])
 	case "list-packs":
 		err = cmdListPacks(ctx, os.Args[2:])
 	default:
