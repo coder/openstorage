@@ -43,12 +43,21 @@ stateless node, with JWT ref-policy enforcement and `+ephemeral`/`+import` names
 routing. This replaces the "bare git repositories on disk" core sketched above with
 **PG as ref authority + S3 as immutable pack storage + rebuildable disk caches**; decisions
 and crash-ordering analysis are recorded in
-[08-spike-implementation-notes.md](08-spike-implementation-notes.md). Phases 1–6 below are
-not started.
+[08-spike-implementation-notes.md](08-spike-implementation-notes.md).
 
-1. **Skeleton + auth.** Org registry with public keys; JWT middleware (ES256/RS256/EdDSA,
+**Phase 1 — skeleton + auth: done.** `internal/meta` (Postgres metadata store),
+`internal/auth` (multi-algorithm JWT verification), and `internal/api` (repo CRUD,
+middleware, `{"error"}` envelope) implement the phase-1 surface behind frozen contracts;
+`codestorage serve` mounts `/api/v1` alongside the phase-0 git path in single-org
+self-host mode (quickstart in the top-level README). Conformance is already SDK-driven:
+the api tests run the vendor's unmodified TypeScript SDK against the in-process server,
+plus a 401/403/404/409 matrix on real Postgres. Decisions are recorded in
+[09-phase1-implementation-notes.md](09-phase1-implementation-notes.md). Phases 2–6 below
+are not started.
+
+1. **Skeleton + auth — done.** Org registry with public keys; JWT middleware (ES256/RS256/EdDSA,
    claims/scope checks); error envelope; `POST /repos`, `GET /repo`, `GET /repos`,
-   `DELETE /repos/delete` on bare-repo storage + metadata DB.
+   `DELETE /repos/delete` on the phase-0 core + metadata DB.
 2. **Git smart HTTP.** upload-pack/receive-pack with JWT basic auth, ref-policy enforcement
    hooks, ephemeral/import namespace routing. *Gate: real `git clone/push` round-trip.*
 3. **Read API.** files, files/metadata (incl. unborn-branch 404), file stream with
@@ -96,9 +105,11 @@ The vendor's SDKs are the conformance suite:
 
 - Repo ID/url scheme: vendor distinguishes internal `repo_id` from `url` (JWT claim). An
   OSS backend can use one identifier for both as long as `GET /api/repo-urls/{repo_id}`
-  and `listRepos` stay coherent.
+  and `listRepos` stay coherent. *Settled in phase 1:* kept distinct — `repo_id` is
+  server-generated, `url` comes from the JWT `repo` claim.
 - Ephemeral ref storage: separate bare repo vs ref-prefix namespace (ref-prefix recommended:
   shared objects make promotion O(1)). The spike used fully separate ref stores keyed by
   the namespaced name (see ADR-3 in 08); the promotion-cost question is still open.
-- Cursor encoding: opaque to clients; base64(JSON{offset|last-key}) is fine.
+- Cursor encoding: opaque to clients; base64(JSON{offset|last-key}) is fine. *Settled in
+  phase 1:* unpadded base64url keyset cursor (see 09).
 - Webhook endpoint management API (not publicly specified — design freely).

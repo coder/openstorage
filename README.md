@@ -3,11 +3,11 @@
 An open-source, wire-compatible backend for [code.storage](https://code.storage), built from
 the specification in [`docs/`](docs/README.md).
 
-Current state: **phase 1 — skeleton + auth**. One Go binary (`codestorage serve`) exposes the
-`/api/v1` repo CRUD API (JWT auth, single-org self-host mode) alongside the phase-0 git
+Current state: **phase 1 (skeleton + auth) done**. One Go binary (`codestorage serve`) exposes
+the `/api/v1` repo CRUD API (JWT auth, single-org self-host mode) alongside the phase-0 git
 smart-HTTP path, with Postgres as the ref/metadata authority and S3 (MinIO) as immutable
-pack storage; nodes are stateless. See
-[docs/07-implementation-roadmap.md](docs/07-implementation-roadmap.md) for what comes next.
+pack storage; nodes are stateless. Next: phase 2 (git smart HTTP) — see
+[docs/07-implementation-roadmap.md](docs/07-implementation-roadmap.md).
 
 ## Layout
 
