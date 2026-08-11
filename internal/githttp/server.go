@@ -126,6 +126,13 @@ func (s *Server) authenticate(r *http.Request, repo, scope string) (*auth.Claims
 	if claims.Iss != s.Org {
 		return nil, http.StatusForbidden, fmt.Errorf("token issued for org %q, not served here", claims.Iss)
 	}
+	// Git endpoints are always repo-scoped (docs/02): an org-level or empty
+	// `repo` claim never grants git access — not even to a repo literally
+	// named "org", which would otherwise satisfy the verbatim compare
+	// below. Mirrors the API middleware's repo-scope gate.
+	if claims.Repo == "" || claims.Repo == auth.RepoClaimOrg {
+		return nil, http.StatusForbidden, fmt.Errorf("token is not repo-scoped")
+	}
 	// docs/02: the repo claim carries the repo url (or id); docs/05 paths
 	// address repos by repo_id. Accept a verbatim match, else resolve the
 	// path element to its url and compare.

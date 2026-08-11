@@ -121,6 +121,21 @@ func TestAuthenticate_FailureMapping(t *testing.T) {
 	}
 }
 
+// A token with the org-level sentinel (or an empty) `repo` claim must never
+// pass the git repo gate — not even for a repo literally named "org", which
+// would otherwise satisfy the verbatim claim/target compare.
+func TestAuthenticate_RejectsNonRepoScopedClaims(t *testing.T) {
+	key, pemBlock := genKeyPEM(t, "ES256")
+	srv := &Server{Verifier: auth.NewVerifier(memKeys{"org1": {pemBlock}}), Org: "org1"}
+	for _, claim := range []string{auth.RepoClaimOrg, ""} {
+		token := mintUnitToken(t, key, "ES256", unitClaims("org1", claim, auth.ScopeGitRead))
+		_, status, err := srv.authenticate(authReq("/org.git/info/refs", "t", token), "org", auth.ScopeGitRead)
+		if err == nil || status != http.StatusForbidden {
+			t.Fatalf("repo claim %q: status = %d, err = %v; want 403", claim, status, err)
+		}
+	}
+}
+
 // The git path must accept every allowed signature algorithm the org
 // registered keys for, not just ES256 (docs/02 multi-alg requirement).
 func TestAuthenticate_MultiAlgorithm(t *testing.T) {
