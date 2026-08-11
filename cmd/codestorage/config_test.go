@@ -5,11 +5,12 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/pem"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
-	"codestorage/internal/githttp"
+	"codestorage/internal/auth"
 )
 
 // mapEnv builds a getenv func from a fixed map (no process env mutation).
@@ -152,20 +153,17 @@ func rsaPEM(t *testing.T) []byte {
 // ecdsaKeyPEM generates an ES256 keypair and returns the public PEM bytes.
 func ecdsaKeyPEM(t *testing.T) (pubPath string, pubPEM []byte) {
 	t.Helper()
-	priv, err := githttp.GenerateKeyPair()
+	priv, err := auth.GenerateKey("ES256")
 	if err != nil {
 		t.Fatal(err)
 	}
-	der, err := x509.MarshalPKIXPublicKey(&priv.PublicKey)
+	pubPEM, err = auth.MarshalPublicKeyPEM(priv.Public())
 	if err != nil {
 		t.Fatal(err)
 	}
-	pubPEM = pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: der})
 	pubPath = filepath.Join(t.TempDir(), "key.pub.pem")
-	if _, pubPath0, err := githttp.WriteKeyPairPEM(priv, strings.TrimSuffix(pubPath, ".pub.pem")); err != nil {
+	if err := os.WriteFile(pubPath, pubPEM, 0o644); err != nil {
 		t.Fatal(err)
-	} else {
-		pubPath = pubPath0
 	}
 	return pubPath, pubPEM
 }

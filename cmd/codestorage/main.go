@@ -10,6 +10,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -175,17 +176,14 @@ func cmdServe(ctx context.Context, args []string) error {
 func cmdKeygen(args []string) error {
 	fs := flag.NewFlagSet("keygen", flag.ExitOnError)
 	out := fs.String("out", "", "output path prefix (writes <out>.pem and <out>.pub.pem)")
+	alg := fs.String("alg", "ES256", "key algorithm: one of "+strings.Join(auth.AllowedAlgorithms, ", "))
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if *out == "" {
 		return fmt.Errorf("--out is required")
 	}
-	priv, err := githttp.GenerateKeyPair()
-	if err != nil {
-		return err
-	}
-	privPath, pubPath, err := githttp.WriteKeyPairPEM(priv, *out)
+	privPath, pubPath, err := generateKeyPEMFiles(*alg, *out)
 	if err != nil {
 		return err
 	}
@@ -193,30 +191,97 @@ func cmdKeygen(args []string) error {
 	return nil
 }
 
+// generateKeyPEMFiles creates a fresh keypair for alg and writes
+// <outPrefix>.pem (PKCS#8 private, 0600) and <outPrefix>.pub.pem (PKIX
+// public — the format the org key registry accepts). Never commit either.
+func generateKeyPEMFiles(alg, outPrefix string) (privPath, pubPath string, err error) {
+	assertf(outPrefix != "", "generateKeyPEMFiles: empty output prefix")
+	priv, err := auth.GenerateKey(alg)
+	if err != nil {
+		return "", "", err
+	}
+	privPEM, err := auth.MarshalPrivateKeyPEM(priv)
+	if err != nil {
+		return "", "", err
+	}
+	pubPEM, err := auth.MarshalPublicKeyPEM(priv.Public())
+	if err != nil {
+		return "", "", err
+	}
+	privPath, pubPath = outPrefix+".pem", outPrefix+".pub.pem"
+	if err := os.WriteFile(privPath, privPEM, 0o600); err != nil {
+		return "", "", err
+	}
+	if err := os.WriteFile(pubPath, pubPEM, 0o644); err != nil {
+		return "", "", err
+	}
+	return privPath, pubPath, nil
+}
+
 func cmdMint(args []string) error {
 	fs := flag.NewFlagSet("mint", flag.ExitOnError)
-	keyPath := fs.String("key", "", "PEM path of the ES256 private key")
-	repo := fs.String("repo", "", "repo claim")
+	keyPath := fs.String("key", "", "PEM path of the org private key (PKCS#8 or SEC1)")
+	repo := fs.String("repo", "", `repo claim (repo url, or "org" for org-level operations)`)
 	scopes := fs.String("scopes", "git:read,git:write", "comma-separated scopes")
 	refs := fs.String("refs", "", `optional refs policy JSON, e.g. [["refs/heads/main",["no-force-push"]],["*",[]]]`)
-	iss := fs.String("iss", "spike", "issuer (org) claim")
+	iss := fs.String("iss", "", "issuer (org) claim — required")
+	alg := fs.String("alg", "", "signature algorithm (default: inferred from the key type)")
 	ttl := fs.Duration("ttl", time.Hour, "token lifetime")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if *keyPath == "" || *repo == "" {
-		return fmt.Errorf("--key and --repo are required")
+	if *keyPath == "" || *repo == "" || *iss == "" {
+		return fmt.Errorf("--key, --repo, and --iss are required")
 	}
-	priv, err := githttp.LoadPrivateKeyPEM(*keyPath)
-	if err != nil {
-		return err
-	}
-	token, err := githttp.MintToken(priv, *iss, *repo, strings.Split(*scopes, ","), *refs, *ttl)
+	token, err := mintToken(*keyPath, *iss, *repo, *scopes, *refs, *alg, *ttl)
 	if err != nil {
 		return err
 	}
 	fmt.Println(token)
 	return nil
+}
+
+// mintToken signs a docs/02 claim set with the private key at keyPath.
+// alg == "" infers the algorithm from the key type; refsJSON, when given,
+// must decode as ordered [pattern, ops] tuples (validated here so a typo
+// fails at mint time, not as a mid-push policy error).
+func mintToken(keyPath, iss, repo, scopes, refsJSON, alg string, ttl time.Duration) (string, error) {
+	assertf(keyPath != "" && iss != "" && repo != "", "mintToken: missing keyPath/iss/repo")
+	if ttl <= 0 {
+		return "", fmt.Errorf("--ttl must be positive, got %v", ttl)
+	}
+	pemData, err := os.ReadFile(keyPath)
+	if err != nil {
+		return "", err
+	}
+	priv, err := auth.ParsePrivateKeyPEM(pemData)
+	if err != nil {
+		return "", fmt.Errorf("%s: %w", keyPath, err)
+	}
+	if alg == "" {
+		alg, err = auth.DefaultAlgorithm(priv)
+		if err != nil {
+			return "", err
+		}
+	}
+	var refsRaw json.RawMessage
+	if refsJSON != "" {
+		var policies []auth.RefPolicy
+		if err := json.Unmarshal([]byte(refsJSON), &policies); err != nil {
+			return "", fmt.Errorf("--refs: %w", err)
+		}
+		refsRaw = json.RawMessage(refsJSON)
+	}
+	now := time.Now()
+	return auth.MintToken(priv, alg, auth.Claims{
+		Iss:    iss,
+		Sub:    auth.SubjectLiteral,
+		Repo:   repo,
+		Scopes: strings.Split(scopes, ","),
+		Iat:    now.Unix(),
+		Exp:    now.Add(ttl).Unix(),
+		Refs:   refsRaw,
+	})
 }
 
 func cmdListPacks(ctx context.Context, args []string) error {
