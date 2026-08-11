@@ -37,6 +37,15 @@ git-protocol layers. Everything else (diff, blame, grep, archive, merge) can she
 
 Each phase ends with a dogfooding gate (below) before moving on.
 
+**Phase 0 — de-risk spike: done.** `cmd/codestorage` + `internal/spike` prove the storage
+core end-to-end: git push → packs in S3 → ref CAS in Postgres → clone from a second
+stateless node, with JWT ref-policy enforcement and `+ephemeral`/`+import` namespace
+routing. This replaces the "bare git repositories on disk" core sketched above with
+**PG as ref authority + S3 as immutable pack storage + rebuildable disk caches**; decisions
+and crash-ordering analysis are recorded in
+[08-spike-implementation-notes.md](08-spike-implementation-notes.md). Phases 1–6 below are
+not started.
+
 1. **Skeleton + auth.** Org registry with public keys; JWT middleware (ES256/RS256/EdDSA,
    claims/scope checks); error envelope; `POST /repos`, `GET /repo`, `GET /repos`,
    `DELETE /repos/delete` on bare-repo storage + metadata DB.
@@ -89,6 +98,7 @@ The vendor's SDKs are the conformance suite:
   OSS backend can use one identifier for both as long as `GET /api/repo-urls/{repo_id}`
   and `listRepos` stay coherent.
 - Ephemeral ref storage: separate bare repo vs ref-prefix namespace (ref-prefix recommended:
-  shared objects make promotion O(1)).
+  shared objects make promotion O(1)). The spike used fully separate ref stores keyed by
+  the namespaced name (see ADR-3 in 08); the promotion-cost question is still open.
 - Cursor encoding: opaque to clients; base64(JSON{offset|last-key}) is fine.
 - Webhook endpoint management API (not publicly specified — design freely).

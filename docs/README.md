@@ -31,6 +31,7 @@ signature scheme), which gives high confidence that the extracted spec is correc
 5. [05-git-protocol-and-namespaces.md](05-git-protocol-and-namespaces.md) — Smart HTTP, `+ephemeral` / `+import` namespaces, LFS
 6. [06-webhooks.md](06-webhooks.md) — Outbound events, HMAC signatures
 7. [07-implementation-roadmap.md](07-implementation-roadmap.md) — Phased build plan + conformance testing strategy
+8. [08-spike-implementation-notes.md](08-spike-implementation-notes.md) — ADRs from the phase-0 de-risk spike
 
 `upstream/` contains verbatim copies of the official OpenAPI spec and doc pages for reference.
 
