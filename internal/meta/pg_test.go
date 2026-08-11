@@ -113,6 +113,72 @@ func TestPublicKeysForOrgUnknown(t *testing.T) {
 	}
 }
 
+func TestSigningKeys(t *testing.T) {
+	ctx := t.Context()
+	org := seedOrg(t)
+
+	// Fresh org: empty keyring, no error.
+	keys, err := testStore.SigningKeysForOrg(ctx, org)
+	if err != nil {
+		t.Fatalf("SigningKeysForOrg on fresh org: %v", err)
+	}
+	if len(keys) != 0 {
+		t.Fatalf("fresh org has %d signing keys, want 0", len(keys))
+	}
+
+	k1, err := testStore.AddSigningKey(ctx, org, "ssh-ed25519 AAAAtest key-one")
+	if err != nil {
+		t.Fatalf("AddSigningKey #1: %v", err)
+	}
+	if k1.ID <= 0 || k1.OrgID <= 0 || k1.CreatedAt.IsZero() {
+		t.Fatalf("bad signing key row: %+v", k1)
+	}
+	k2, err := testStore.AddSigningKey(ctx, org, "ssh-ed25519 AAAAtest key-two")
+	if err != nil {
+		t.Fatalf("AddSigningKey #2: %v", err)
+	}
+
+	keys, err = testStore.SigningKeysForOrg(ctx, org)
+	if err != nil {
+		t.Fatalf("SigningKeysForOrg: %v", err)
+	}
+	var texts []string
+	for _, k := range keys {
+		texts = append(texts, k.KeyText)
+	}
+	if !slices.Equal(texts, []string{"ssh-ed25519 AAAAtest key-one", "ssh-ed25519 AAAAtest key-two"}) {
+		t.Errorf("keys = %q, want both in registration order", texts)
+	}
+
+	if err := testStore.RemoveSigningKey(ctx, org, k1.ID); err != nil {
+		t.Fatalf("RemoveSigningKey: %v", err)
+	}
+	keys, err = testStore.SigningKeysForOrg(ctx, org)
+	if err != nil {
+		t.Fatalf("SigningKeysForOrg after remove: %v", err)
+	}
+	if len(keys) != 1 || keys[0].ID != k2.ID {
+		t.Errorf("keys after remove = %+v, want only id %d", keys, k2.ID)
+	}
+
+	// Removing again (or a foreign id): ErrNotFound.
+	if err := testStore.RemoveSigningKey(ctx, org, k1.ID); !errors.Is(err, ErrNotFound) {
+		t.Errorf("double remove err = %v, want ErrNotFound", err)
+	}
+
+	// Unknown org: ErrNotFound on all three methods.
+	unknown := "no-such-org-" + t.Name()
+	if _, err := testStore.AddSigningKey(ctx, unknown, "ssh-ed25519 AAAAtest"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("AddSigningKey unknown org err = %v, want ErrNotFound", err)
+	}
+	if _, err := testStore.SigningKeysForOrg(ctx, unknown); !errors.Is(err, ErrNotFound) {
+		t.Errorf("SigningKeysForOrg unknown org err = %v, want ErrNotFound", err)
+	}
+	if err := testStore.RemoveSigningKey(ctx, unknown, k2.ID); !errors.Is(err, ErrNotFound) {
+		t.Errorf("RemoveSigningKey unknown org err = %v, want ErrNotFound", err)
+	}
+}
+
 func TestCreateAndGetRepo(t *testing.T) {
 	ctx := t.Context()
 	org := seedOrg(t)

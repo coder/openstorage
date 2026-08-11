@@ -63,6 +63,18 @@ type ListResult struct {
 	HasMore    bool
 }
 
+// SigningKey is one registered commit-signing key for an org (docs/02
+// verify-sig; the OSS stand-in for the upstream dashboard key registry).
+// KeyText is either a single SSH public key line ("ssh-ed25519 AAAA...")
+// or an ASCII-armored PGP public key block; callers validate the format
+// before AddSigningKey — the store persists the text verbatim.
+type SigningKey struct {
+	ID        int64
+	OrgID     int64
+	KeyText   string
+	CreatedAt time.Time // UTC
+}
+
 // Store is the metadata persistence contract. All org-scoped methods key by
 // org name (the JWT `iss` claim); implementations resolve it internally and
 // return ErrNotFound for unknown orgs.
@@ -96,4 +108,19 @@ type Store interface {
 
 	// ListRepos pages live repos for the org per ListParams.
 	ListRepos(ctx context.Context, org string, params ListParams) (ListResult, error)
+
+	// AddSigningKey registers a commit-signing key for the org and returns
+	// the stored row (ID for later removal). keyText must be non-blank; see
+	// SigningKey for the accepted formats (callers validate before adding).
+	AddSigningKey(ctx context.Context, org, keyText string) (SigningKey, error)
+
+	// SigningKeysForOrg returns the org's registered signing keys in
+	// registration order. Empty slice when none are registered — the
+	// verify-sig hook reads this fresh from the store on every push and
+	// rejects on an empty keyring.
+	SigningKeysForOrg(ctx context.Context, org string) ([]SigningKey, error)
+
+	// RemoveSigningKey deletes the signing key with the given ID.
+	// ErrNotFound when the org is unknown or the ID does not belong to it.
+	RemoveSigningKey(ctx context.Context, org string, id int64) error
 }

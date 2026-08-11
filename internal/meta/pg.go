@@ -76,6 +76,15 @@ CREATE TABLE IF NOT EXISTS org_public_keys (
     created_at timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS org_public_keys_org_idx ON org_public_keys (org_id);
+-- Commit-signing keys for verify-sig (docs/02): SSH public key lines or
+-- ASCII-armored PGP public key blocks, read fresh from PG on every push.
+CREATE TABLE IF NOT EXISTS org_signing_keys (
+    id         bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    org_id     bigint NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
+    key_text   text NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS org_signing_keys_org_idx ON org_signing_keys (org_id);
 CREATE TABLE IF NOT EXISTS repos (
     repo_id        text PRIMARY KEY,
     org_id         bigint NOT NULL REFERENCES orgs(id),
@@ -300,6 +309,73 @@ func (s *PG) SoftDeleteRepo(ctx context.Context, org, url string) (Repo, error) 
 		return Repo{}, fmt.Errorf("delete repo %q in org %q: %w", url, org, err)
 	}
 	return repo, nil
+}
+
+// AddSigningKey registers a commit-signing key for the org and returns the
+// stored row. Format validation (SSH line / armored PGP block) is the
+// caller's responsibility per the Store contract; the text is stored
+// verbatim.
+func (s *PG) AddSigningKey(ctx context.Context, org, keyText string) (SigningKey, error) {
+	assertf(strings.TrimSpace(keyText) != "", "AddSigningKey: blank key text for org %q", org)
+	orgID, err := s.lookupOrgID(ctx, org)
+	if err != nil {
+		return SigningKey{}, err
+	}
+	k := SigningKey{OrgID: orgID, KeyText: keyText}
+	err = s.pool.QueryRow(ctx,
+		`INSERT INTO org_signing_keys (org_id, key_text) VALUES ($1, $2)
+		 RETURNING id, created_at`, orgID, keyText).Scan(&k.ID, &k.CreatedAt)
+	if err != nil {
+		return SigningKey{}, fmt.Errorf("add signing key for org %q: %w", org, err)
+	}
+	k.CreatedAt = k.CreatedAt.UTC()
+	return k, nil
+}
+
+// SigningKeysForOrg returns the org's registered signing keys in
+// registration order; empty slice when none are registered.
+func (s *PG) SigningKeysForOrg(ctx context.Context, org string) ([]SigningKey, error) {
+	orgID, err := s.lookupOrgID(ctx, org)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := s.pool.Query(ctx,
+		`SELECT id, org_id, key_text, created_at FROM org_signing_keys
+		 WHERE org_id = $1 ORDER BY id`, orgID)
+	if err != nil {
+		return nil, fmt.Errorf("signing keys for org %q: %w", org, err)
+	}
+	defer rows.Close()
+	keys := []SigningKey{}
+	for rows.Next() {
+		var k SigningKey
+		if err := rows.Scan(&k.ID, &k.OrgID, &k.KeyText, &k.CreatedAt); err != nil {
+			return nil, err
+		}
+		k.CreatedAt = k.CreatedAt.UTC()
+		keys = append(keys, k)
+	}
+	return keys, rows.Err()
+}
+
+// RemoveSigningKey deletes the signing key with the given ID. ErrNotFound
+// when the org is unknown or the ID does not belong to it.
+func (s *PG) RemoveSigningKey(ctx context.Context, org string, id int64) error {
+	assertf(id > 0, "RemoveSigningKey: non-positive id %d for org %q", id, org)
+	orgID, err := s.lookupOrgID(ctx, org)
+	if err != nil {
+		return err
+	}
+	tag, err := s.pool.Exec(ctx,
+		`DELETE FROM org_signing_keys WHERE org_id = $1 AND id = $2`, orgID, id)
+	if err != nil {
+		return fmt.Errorf("remove signing key %d for org %q: %w", id, org, err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("signing key %d for org %q: %w", id, org, ErrNotFound)
+	}
+	assertf(tag.RowsAffected() == 1, "DELETE by primary key affected %d rows", tag.RowsAffected())
+	return nil
 }
 
 // escapeLike backslash-escapes LIKE/ILIKE metacharacters so q matches as a
