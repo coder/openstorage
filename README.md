@@ -3,10 +3,11 @@
 An open-source, wire-compatible backend for [code.storage](https://code.storage), built from
 the specification in [`docs/`](docs/README.md).
 
-Current state: **phase 1 (skeleton + auth) done**. One Go binary (`codestorage serve`) exposes
-the `/api/v1` repo CRUD API (JWT auth, single-org self-host mode) alongside the phase-0 git
-smart-HTTP path, with Postgres as the ref/metadata authority and S3 (MinIO) as immutable
-pack storage; nodes are stateless. Next: phase 2 (git smart HTTP) — see
+Current state: **phase 2 (git smart HTTP) done**. One Go binary (`codestorage serve`) exposes
+the `/api/v1` repo CRUD API and the production git smart-HTTP path (clone/push, ref-policy
+enforcement, commit-signature verification) behind the same per-org JWT verifier, with
+Postgres as the ref/metadata authority and S3 (MinIO) as immutable pack storage; nodes are
+stateless. Next: phase 3 (read API) — see
 [docs/07-implementation-roadmap.md](docs/07-implementation-roadmap.md).
 
 ## Layout
@@ -14,13 +15,13 @@ pack storage; nodes are stateless. Next: phase 2 (git smart HTTP) — see
 | Path | Contents |
 |---|---|
 | `docs/` | Backend specification (wire formats, auth, protocols) + roadmap + ADRs |
-| `cmd/codestorage` | Service binary: `serve`, `hook`, `keygen`, `mint`, `list-packs` |
+| `cmd/codestorage` | Service binary: `serve`, `hook`, `keygen`, `mint`, `signing-key`, `list-packs` |
 | `internal/api` | `/api/v1` HTTP handlers, JWT middleware, `{"error"}` envelope |
 | `internal/auth` | JWT verification contract (per-org public keys, allowed algorithms) |
 | `internal/meta` | Metadata store: orgs, org public keys, repos (soft delete, pagination) |
 | `internal/blob` | `BlobStore` contract + S3/MinIO implementation (immutable packs) |
 | `internal/ref` | `RefStore` contract + Postgres implementation (CAS ref authority) |
-| `internal/spike` | Phase-0 git smart-HTTP node + container-based acceptance tests |
+| `internal/githttp` | Git smart-HTTP server + policy/verify-sig hooks, cache hydration, e2e suite |
 | `docker-compose.yml` | Postgres + MinIO for local dogfooding |
 
 ## Quickstart
@@ -58,6 +59,11 @@ curl -s -X DELETE http://127.0.0.1:8080/api/v1/repos/delete -H "Authorization: B
 TOKEN=$(./codestorage mint --key /tmp/cs-key.pem --iss selfhost --repo demo --scopes git:read,git:write)
 git clone "http://t:${TOKEN}@127.0.0.1:8080/demo.git"
 cd demo && git commit --allow-empty -m init && git push origin HEAD:main
+
+# 7. Optional: register commit-signing keys (SSH public key line or armored PGP
+#    block) for the `verify-sig` ref-policy op; hooks read them fresh per push.
+./codestorage signing-key add --org selfhost --key ~/.ssh/id_ed25519.pub
+./codestorage signing-key list --org selfhost
 ```
 
 Host ports are env-overridable (`PGPORT`, `MINIOPORT`) — see the compose file header.
@@ -72,12 +78,13 @@ fallback aliases so old invocations keep working.
 | `CODESTORAGE_PG_URL` | `SPIKE_PG_URL`, `PG_URL` | Postgres URL (refs + metadata) |
 | `CODESTORAGE_S3_URL` | `SPIKE_S3_URL`, `BLOB_URL` | gocloud.dev s3 bucket URL for packs |
 | `CODESTORAGE_LISTEN` | `--listen` / `--addr` flags win | Listen address (default `127.0.0.1:0`) |
-| `CODESTORAGE_ORG` | — | Org name (JWT `iss`); enables `/api/v1` |
-| `CODESTORAGE_ORG_PUBKEYS` | — | PEM file with 1..n org public key blocks |
+| `CODESTORAGE_ORG` | — | **Required.** Org name (JWT `iss`) |
+| `CODESTORAGE_ORG_PUBKEYS` | — | **Required.** PEM file with 1..n org public key blocks |
+| `CODESTORAGE_BASE_URL` | — | External base for `http_url` in API responses (set it behind `0.0.0.0` binds) |
 
-Without `CODESTORAGE_ORG`, `serve` runs the git smart-HTTP path only (spike mode,
-`--jwt-pubkey` required). With it, `/api/v1` is served and the git path uses the first
-ECDSA key from `CODESTORAGE_ORG_PUBKEYS` unless `--jwt-pubkey` overrides it.
+`serve` always runs single-org mode: `/api/v1` and the git smart-HTTP path authenticate
+against the same org-key verifier. The phase-0 git-only mode and its `--jwt-pubkey` flag
+are gone (ADR-8 in [docs/10-phase2-implementation-notes.md](docs/10-phase2-implementation-notes.md)).
 
 ## Tests
 

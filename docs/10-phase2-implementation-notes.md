@@ -107,6 +107,37 @@ are not additive), applied once at parse time.
   keyring mid-replace (spurious 401s under two-replica load).
 - **CLI `keygen`/`mint` migration** — see ADR-8.
 
+## Post-integration hardening
+
+A review pass after the slices merged closed the phase; each item corrects a non-obvious
+assumption made during the parallel build.
+
+- **Cache repos are repaired on every hydrate, not only at init.** `EnsureCacheRepo`
+  returned early once HEAD existed, so a crash between `git init` and hook installation
+  (or a deleted hook file) left a repo whose receive-pack ran *without* the hooks that own
+  S3 upload, PG-CAS, policy enforcement, and verify-sig. Config and hooks are now verified
+  on every call — config via read-check-then-set (no `config.lock` contention in steady
+  state), hooks via content/mode compare with temp-file+rename writes so a concurrent
+  receive-pack never execs a partial script. The hook script embeds the binary path, so
+  this also picks up redeployments.
+- **`SyncRefs` runs deletions first, deterministically.** Updates-before-deletions broke
+  when PG replaced `refs/heads/foo` with `refs/heads/foo/bar`: git's files backend rejects
+  the directory/file conflict even within a single `update-ref --stdin` transaction.
+  Deletions now run first in their own sorted invocation; partial application is safe
+  because `SyncRefs` is idempotent over a rebuildable cache and callers retry.
+- **Git endpoints reject empty and `"org"` repo claims.** A token minted with the
+  org-level sentinel repo claim passed the git repo gate for a repo whose path element is
+  literally `org` (`BaseRepo("org") == claims.Repo`). Git endpoints are always repo-scoped
+  (docs/02), so both claims now map to 403, mirroring the API middleware's repo-scope gate.
+- **Ref policies apply to the API write endpoints.** docs/02 makes JWT ref policies bind
+  every write surface, but the API handlers ignored `refs`/`ops`. Both write handlers now
+  parse the policy claims exactly like the git update hook (including the fold-once `ops`
+  fallback) and fail closed with 403 on malformed claims. Repo deletion destroys every ref
+  and the API has no ref inventory, so any rule carrying an op that could deny a ref
+  deletion (`no-push`, `no-force-push`, unknown ops) denies the whole-repo delete;
+  `verify-sig` alone never does (deletions introduce no commits). Creating an empty repo
+  touches no refs, so any well-formed policy allows it.
+
 ## Still deferred
 
 - **S3 orphan GC**: packs uploaded by pushes that later lose the PG CAS race (or crash
