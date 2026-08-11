@@ -9,8 +9,9 @@
 //   - api.New(api.Config{Store, Verifier, HTTPBaseURL})       (internal/api)
 //
 // If a slice landed different names/signatures, fix the drift HERE only.
-// The `codestorage_stub` build tag swaps in wire_stub.go so the rest of the
-// CLI builds and tests in isolation before those slices are integrated.
+// The `codestorage_stub` build tag (constraint above) used to swap in a
+// wire_stub.go stub so the CLI could build in isolation before the slices
+// landed; the stub was deleted once they did.
 package main
 
 import (

@@ -18,8 +18,9 @@ wiring) that could not see each other's code while in flight.
 mapping onto the docs/03 status contract and the docs/02 scope/claim constants — were
 declared and frozen *before* implementation started. `cmd/codestorage/wire.go` is the
 single integration seam: the only file referencing sibling-slice constructors. An opt-in
-`codestorage_stub` build tag swaps in `wire_stub.go` so the CLI builds and tests before the
-slices land.
+`codestorage_stub` build tag swapped in `wire_stub.go` so the CLI could build and test
+before the slices landed; the stub was deleted once they did — it was scaffolding for the
+parallel build, not a supported mode.
 
 **Consequences.** The frozen interfaces held and the slices merged without cross-slice
 edits. The one drift was on the *unfrozen* constructor surface — the API slice shipped
@@ -76,3 +77,30 @@ docs/01 prescribes after a soft delete is what will free names for reuse.
   unmodified TypeScript SDK end-to-end against the in-process server (skipping loudly when
   the SDK checkout or module proxy is unavailable) — the docs/07 conformance strategy
   applied from the first phase.
+
+## Post-integration hardening
+
+A review pass after the slices merged closed the phase; each item below corrects a
+non-obvious assumption made during the parallel build.
+
+- **Repo-claim checks completed in the middleware.** Per-repo routes reject tokens whose
+  `repo` claim is empty or `"org"` with 403 `token is not repo-scoped`; the handler-level
+  400 on create became an assert (unreachable behind the gate). Together with "all verifier
+  failures are 401" above, each half of the docs/02 failure map now lives in exactly one
+  layer.
+- **Multi-signature JWS is input, not an invariant.** `jws.Parse` auto-detects JSON
+  serializations, and a JSON-serialized JWS can contain exactly two `.` characters —
+  slipping past the compact-form pre-check — so the signature count is attacker-controlled.
+  Verification returns a 401-mapped error for multi-signature tokens instead of asserting
+  (regression-tested for the flattened and general JSON forms).
+- **`default_branch` precedence: body → query → `"main"`.** Upstream's `create_repo` takes
+  an optional `?default_branch=` query parameter used only when the body omits one; the
+  query value goes through the same branch-name validation as the body value.
+- **`GET /repo` returns the full upstream schema.** `{repo_id, url, default_branch,
+  created_at}` — the docs/03 summary table listed only the last two and was corrected
+  against `upstream/openapi.yaml`.
+- **Log outside recover.** Middleware order is `logRequests(recoverPanics(mux))` so a
+  panicked (500-mapped) request still produces a request log line.
+- **API tests run the production constructors.** The `internal/api` test env is built
+  through `meta.OpenPG` + `InitSchema` + `auth.NewVerifier` — the same wiring as `wire.go`
+  — replacing package-local doubles; the duplicated stub-backed test files were deleted.

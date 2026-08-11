@@ -51,7 +51,8 @@ middleware, `{"error"}` envelope) implement the phase-1 surface behind frozen co
 `codestorage serve` mounts `/api/v1` alongside the phase-0 git path in single-org
 self-host mode (quickstart in the top-level README). Conformance is already SDK-driven:
 the api tests run the vendor's unmodified TypeScript SDK against the in-process server,
-plus a 401/403/404/409 matrix on real Postgres. Decisions are recorded in
+plus a 401/403/404/409 matrix on real Postgres, wired through the production constructors
+rather than test doubles. Decisions are recorded in
 [09-phase1-implementation-notes.md](09-phase1-implementation-notes.md). Phases 2–6 below
 are not started.
 

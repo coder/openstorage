@@ -32,9 +32,9 @@ contract with implementation notes the spec lacks.
 
 | Method & path | Scope | Notes |
 |---|---|---|
-| `POST /repos` | repo:write (repo=new id) | Body optional: `{default_branch?, base_repo?}`. `base_repo`: `{provider, owner, name, operation?: "fork", auth?: {token}\|{auth_type:"public"}, ref?, sha?, default_branch?, upstream_host?}`. Providers: `code, github, gitlab, bitbucket, gitea, forgejo, codeberg, sr.ht` (+generic w/ `upstream_host`). 409 = exists. |
+| `POST /repos` | repo:write (repo=new id) | Body optional: `{default_branch?, base_repo?}`. Query `default_branch` is a fallback used only when the body omits it. `base_repo`: `{provider, owner, name, operation?: "fork", auth?: {token}\|{auth_type:"public"}, ref?, sha?, default_branch?, upstream_host?}`. Providers: `code, github, gitlab, bitbucket, gitea, forgejo, codeberg, sr.ht` (+generic w/ `upstream_host`). 409 = exists. |
 | `GET /repos` | org:read (repo="org") | Query `cursor, limit, q` (case-insensitive substring on repo `url`). → `{repos: [{repo_id, url, default_branch, created_at, base_repo?}], next_cursor, has_more}` |
-| `GET /repo` | git:read (repo from JWT) | → `{default_branch, created_at}`; 404 → SDK returns null |
+| `GET /repo` | git:read (repo from JWT) | → `{repo_id, url, default_branch, created_at}`; 404 → SDK returns null |
 | `DELETE /repos/delete` | repo:write | Soft delete + async cleanup. → `{repo_id, message}`; 404 not found; 409 already deleted |
 | `GET /api/repo-urls/{repo_id}` | org:read | (No /v1 prefix; from OpenAPI.) Resolve internal id → `{repo_id, url}`; `url` is the JWT `repo` claim value |
 | `DELETE /repos/base` | repo:write | Detach upstream provider; idempotent (from official docs/OpenAPI, not in SDKs) |
