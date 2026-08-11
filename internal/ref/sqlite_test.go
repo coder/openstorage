@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // testSHA returns a deterministic well-formed 40-hex sha for b.
@@ -305,5 +306,105 @@ func TestSQLiteConcurrentCAS(t *testing.T) {
 	}
 	if refs[name] != updated {
 		t.Fatalf("second handle sees %q, want update winner %q", refs[name], updated)
+	}
+}
+
+// TestSQLiteRefCreatedAt pins the refs.created_at contract: set on create,
+// preserved across SHA updates, reset by delete + recreate, and surfaced by
+// ListRefsWithMeta sorted by name.
+func TestSQLiteRefCreatedAt(t *testing.T) {
+	ctx := context.Background()
+	s, _ := openTestSQLite(t)
+	const repo = "org/repo"
+	a, b := testSHA(0xaa), testSHA(0xbb)
+
+	mustCAS := func(name, old, new string) {
+		t.Helper()
+		won, err := s.CASRef(ctx, repo, name, old, new)
+		if err != nil || !won {
+			t.Fatalf("CASRef(%s, %.8s -> %.8s) = won=%v err=%v", name, old, new, won, err)
+		}
+	}
+
+	mustCAS("refs/heads/zeta", ZeroSHA, a)
+	mustCAS("refs/heads/alpha", ZeroSHA, a)
+
+	refs, err := s.ListRefsWithMeta(ctx, repo)
+	if err != nil {
+		t.Fatalf("ListRefsWithMeta: %v", err)
+	}
+	if len(refs) != 2 || refs[0].Name != "refs/heads/alpha" || refs[1].Name != "refs/heads/zeta" {
+		t.Fatalf("want [alpha zeta] sorted by name, got %+v", refs)
+	}
+	for _, r := range refs {
+		if r.SHA != a {
+			t.Fatalf("%s sha = %q, want %q", r.Name, r.SHA, a)
+		}
+		if r.CreatedAt.IsZero() || time.Since(r.CreatedAt) > time.Minute {
+			t.Fatalf("%s created_at = %v, want ~now", r.Name, r.CreatedAt)
+		}
+	}
+	created := refs[1].CreatedAt
+
+	// SHA update preserves the creation time.
+	mustCAS("refs/heads/zeta", a, b)
+	refs, err = s.ListRefsWithMeta(ctx, repo)
+	if err != nil {
+		t.Fatalf("ListRefsWithMeta after update: %v", err)
+	}
+	if refs[1].SHA != b {
+		t.Fatalf("zeta sha = %q, want %q after update", refs[1].SHA, b)
+	}
+	if !refs[1].CreatedAt.Equal(created) {
+		t.Fatalf("created_at changed on SHA update: %v != %v", refs[1].CreatedAt, created)
+	}
+
+	// Delete + recreate resets it (a new ref row is a new creation). The
+	// second-granularity clock may not tick, so only assert non-zero.
+	mustCAS("refs/heads/zeta", b, ZeroSHA)
+	mustCAS("refs/heads/zeta", ZeroSHA, a)
+	refs, err = s.ListRefsWithMeta(ctx, repo)
+	if err != nil {
+		t.Fatalf("ListRefsWithMeta after recreate: %v", err)
+	}
+	if len(refs) != 2 || refs[1].CreatedAt.IsZero() {
+		t.Fatalf("recreated ref missing/zero created_at: %+v", refs)
+	}
+}
+
+// TestSQLiteInitSchemaAddsCreatedAt covers the additive migration: a pre-p3
+// refs table (no created_at) gains the column and a backfill on InitSchema.
+func TestSQLiteInitSchemaAddsCreatedAt(t *testing.T) {
+	ctx := context.Background()
+	dbURL := "sqlite://" + filepath.Join(t.TempDir(), "old.sqlite")
+	s, err := OpenSQLite(ctx, dbURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	// Old-shape schema with one existing row.
+	if _, err := s.db.ExecContext(ctx,
+		`CREATE TABLE refs (repo TEXT, name TEXT, sha TEXT NOT NULL, PRIMARY KEY (repo, name))`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.ExecContext(ctx,
+		`INSERT INTO refs (repo, name, sha) VALUES ('r', 'refs/heads/main', ?)`, testSHA(0xaa)); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.InitSchema(ctx); err != nil {
+		t.Fatalf("InitSchema on old-shape DB: %v", err)
+	}
+	refs, err := s.ListRefsWithMeta(ctx, "r")
+	if err != nil {
+		t.Fatalf("ListRefsWithMeta after migration: %v", err)
+	}
+	if len(refs) != 1 || refs[0].CreatedAt.IsZero() {
+		t.Fatalf("migration must backfill created_at, got %+v", refs)
+	}
+	// Idempotent: running it again must not fail or duplicate the column.
+	if err := s.InitSchema(ctx); err != nil {
+		t.Fatalf("second InitSchema: %v", err)
 	}
 }

@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // sqliteDSN builds the modernc.org/sqlite DSN for a DB file path. The
@@ -71,7 +72,12 @@ func (s *SQLite) InitSchema(ctx context.Context) error {
 	}
 	defer func() { _ = tx.Rollback() }()
 	for _, stmt := range []string{
-		`CREATE TABLE IF NOT EXISTS refs  (repo TEXT, name TEXT, sha TEXT NOT NULL, PRIMARY KEY (repo, name))`,
+		// refs.created_at is INTEGER unix seconds (docs/03
+		// branches[].created_at); CASRef sets it explicitly on insert so
+		// rows are correct even on databases migrated by the ALTER below
+		// (SQLite cannot ADD COLUMN with a non-constant default).
+		`CREATE TABLE IF NOT EXISTS refs  (repo TEXT, name TEXT, sha TEXT NOT NULL,
+		                                   created_at INTEGER NOT NULL DEFAULT (unixepoch()), PRIMARY KEY (repo, name))`,
 		// The pack key column stays named s3_key so the pack SQL is
 		// byte-comparable with the PG backend (see Pack). created_at is
 		// INTEGER unix seconds; ORDER BY created_at, id keeps the tie-break.
@@ -80,6 +86,23 @@ func (s *SQLite) InitSchema(ctx context.Context) error {
 	} {
 		if _, err := tx.ExecContext(ctx, stmt); err != nil {
 			return fmt.Errorf("sqlite init schema: %w", err)
+		}
+	}
+	// Idempotent additive migration for pre-p3 dev databases. SQLite lacks
+	// ADD COLUMN IF NOT EXISTS, so probe the table info first.
+	var haveCreatedAt int
+	if err := tx.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM pragma_table_info('refs') WHERE name = 'created_at'`).Scan(&haveCreatedAt); err != nil {
+		return fmt.Errorf("sqlite init schema: probe refs.created_at: %w", err)
+	}
+	if haveCreatedAt == 0 {
+		for _, stmt := range []string{
+			`ALTER TABLE refs ADD COLUMN created_at INTEGER`,
+			`UPDATE refs SET created_at = unixepoch() WHERE created_at IS NULL`,
+		} {
+			if _, err := tx.ExecContext(ctx, stmt); err != nil {
+				return fmt.Errorf("sqlite init schema: add refs.created_at: %w", err)
+			}
 		}
 	}
 	return tx.Commit()
@@ -104,6 +127,28 @@ func (s *SQLite) ListRefs(ctx context.Context, repo string) (map[string]string, 
 	return refs, rows.Err()
 }
 
+// ListRefsWithMeta returns all refs for repo sorted by name ascending.
+func (s *SQLite) ListRefsWithMeta(ctx context.Context, repo string) ([]RefInfo, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT name, sha, created_at FROM refs WHERE repo = ? ORDER BY name`, repo)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var refs []RefInfo
+	for rows.Next() {
+		var r RefInfo
+		var sec int64 // unix seconds; NULL is impossible after InitSchema's backfill
+		if err := rows.Scan(&r.Name, &r.SHA, &sec); err != nil {
+			return nil, err
+		}
+		assertf(ValidSHA(r.SHA), "refs table holds malformed sha %q for %s/%s", r.SHA, repo, r.Name)
+		r.CreatedAt = time.Unix(sec, 0).UTC()
+		refs = append(refs, r)
+	}
+	return refs, rows.Err()
+}
+
 // CASRef performs the compare-and-swap ref update. Returns won=false (no
 // error) when the precondition failed, i.e. someone else won the race.
 // Refs only ever change inside these single statements, so a broken/partial
@@ -117,8 +162,11 @@ func (s *SQLite) CASRef(ctx context.Context, repo, name, old, new string) (won b
 	var res sql.Result
 	switch {
 	case old == ZeroSHA: // create
+		// created_at set explicitly (not via column default): databases
+		// migrated by the InitSchema ALTER have no default on the column.
+		// SHA updates below never touch it.
 		res, err = s.db.ExecContext(ctx,
-			`INSERT INTO refs (repo, name, sha) VALUES (?, ?, ?) ON CONFLICT DO NOTHING`,
+			`INSERT INTO refs (repo, name, sha, created_at) VALUES (?, ?, ?, unixepoch()) ON CONFLICT DO NOTHING`,
 			repo, name, new)
 		tag = "create"
 	case new == ZeroSHA: // delete

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/url"
 	"regexp"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -39,12 +40,24 @@ type Pack struct {
 	Key string
 }
 
+// RefInfo is one ref row with its metadata. CreatedAt is the row's creation
+// time (docs/03 branches[].created_at): set on first insert, preserved
+// across SHA updates, and reset when a ref is deleted and recreated.
+type RefInfo struct {
+	Name      string
+	SHA       string
+	CreatedAt time.Time // UTC
+}
+
 // RefStore is the ref-authority contract: refs only ever change through
 // CASRef, and packs are registered strictly after their bytes are durable
 // in blob storage.
 type RefStore interface {
 	// ListRefs returns all refs for repo as name -> sha.
 	ListRefs(ctx context.Context, repo string) (map[string]string, error)
+	// ListRefsWithMeta returns all refs for repo sorted by name ascending,
+	// including creation timestamps (the read API's branches/tags source).
+	ListRefsWithMeta(ctx context.Context, repo string) ([]RefInfo, error)
 	// CASRef performs a compare-and-swap ref update (old/new = ZeroSHA for
 	// create/delete). Returns won=false (no error) when the precondition
 	// failed, i.e. someone else won the race.
@@ -121,9 +134,13 @@ func (s *PG) InitSchema(ctx context.Context) error {
 			return err
 		}
 		_, err := tx.Exec(ctx, `
-CREATE TABLE IF NOT EXISTS refs  (repo text, name text, sha text NOT NULL, PRIMARY KEY (repo, name));
+CREATE TABLE IF NOT EXISTS refs  (repo text, name text, sha text NOT NULL,
+                                  created_at timestamptz NOT NULL DEFAULT now(), PRIMARY KEY (repo, name));
 CREATE TABLE IF NOT EXISTS packs (repo text, id text, s3_key text NOT NULL,
                                   created_at timestamptz DEFAULT now(), PRIMARY KEY (repo, id));
+-- Idempotent additive migration for pre-p3 dev databases (backfills
+-- existing rows via the NOT NULL DEFAULT).
+ALTER TABLE refs ADD COLUMN IF NOT EXISTS created_at timestamptz NOT NULL DEFAULT now();
 `)
 		return err
 	})
@@ -148,6 +165,27 @@ func (s *PG) ListRefs(ctx context.Context, repo string) (map[string]string, erro
 	return refs, rows.Err()
 }
 
+// ListRefsWithMeta returns all refs for repo sorted by name ascending.
+func (s *PG) ListRefsWithMeta(ctx context.Context, repo string) ([]RefInfo, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT name, sha, created_at FROM refs WHERE repo = $1 ORDER BY name`, repo)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var refs []RefInfo
+	for rows.Next() {
+		var r RefInfo
+		if err := rows.Scan(&r.Name, &r.SHA, &r.CreatedAt); err != nil {
+			return nil, err
+		}
+		assertf(ValidSHA(r.SHA), "refs table holds malformed sha %q for %s/%s", r.SHA, repo, r.Name)
+		r.CreatedAt = r.CreatedAt.UTC()
+		refs = append(refs, r)
+	}
+	return refs, rows.Err()
+}
+
 // CASRef performs the compare-and-swap ref update. Returns won=false (no
 // error) when the precondition failed, i.e. someone else won the race.
 // Refs only ever change inside these single statements, so a broken/partial
@@ -161,8 +199,9 @@ func (s *PG) CASRef(ctx context.Context, repo, name, old, new string) (won bool,
 	var ct interface{ RowsAffected() int64 }
 	switch {
 	case old == ZeroSHA: // create
+		// created_at is set here once; SHA updates below never touch it.
 		c, cerr := s.pool.Exec(ctx,
-			`INSERT INTO refs (repo, name, sha) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
+			`INSERT INTO refs (repo, name, sha, created_at) VALUES ($1, $2, $3, now()) ON CONFLICT DO NOTHING`,
 			repo, name, new)
 		ct, err, tag = c, cerr, "create"
 	case new == ZeroSHA: // delete
