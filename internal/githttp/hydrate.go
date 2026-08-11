@@ -64,22 +64,34 @@ exec %q hook %s "$@"
 
 // EnsureCacheRepo idempotently creates the bare cache repo with the server
 // config and hooks that re-exec this binary (no shell/psql deps in hooks).
+//
+// Config and hooks are verified on every call, not only at init time: a
+// crash between `git init` and hook installation (or a deleted/tampered
+// hook file) must never leave a repo whose receive-pack silently runs
+// without the hooks that own S3 upload, PG pack/ref registration, and
+// policy enforcement. The hook script also embeds this binary's path,
+// which changes across deployments.
 func EnsureCacheRepo(cacheDir, repo string) (string, error) {
 	path := RepoPath(cacheDir, repo)
-	if _, err := os.Stat(filepath.Join(path, "HEAD")); err == nil {
-		return path, nil
-	}
-	if err := os.MkdirAll(path, 0o755); err != nil {
-		return "", err
-	}
-	if _, err := runGit("", "init", "--bare", "--initial-branch=main", path); err != nil {
-		return "", err
+	if _, err := os.Stat(filepath.Join(path, "HEAD")); err != nil {
+		if err := os.MkdirAll(path, 0o755); err != nil {
+			return "", err
+		}
+		if _, err := runGit("", "init", "--bare", "--initial-branch=main", path); err != nil {
+			return "", err
+		}
 	}
 	// Every push must yield a pack file (>= 0 received objects keeps the pack).
 	for _, kv := range [][2]string{
 		{"receive.unpackLimit", "0"},
 		{"gc.auto", "0"},
 	} {
+		// Read-check first: config writes take config.lock, and concurrent
+		// hydrates of the same repo must not fail on lock contention in the
+		// steady-state already-configured case.
+		if cur, err := runGit(path, "config", "--get", kv[0]); err == nil && strings.TrimSpace(cur) == kv[1] {
+			continue
+		}
 		if _, err := runGit(path, "config", kv[0], kv[1]); err != nil {
 			return "", err
 		}
@@ -94,11 +106,40 @@ func EnsureCacheRepo(cacheDir, repo string) (string, error) {
 	}
 	for _, name := range []string{"pre-receive", "update"} {
 		script := fmt.Sprintf(hookScript, self, name)
-		if err := os.WriteFile(filepath.Join(hooksDir, name), []byte(script), 0o755); err != nil {
+		if err := ensureHook(filepath.Join(hooksDir, name), script); err != nil {
 			return "", err
 		}
 	}
 	return path, nil
+}
+
+// ensureHook installs the hook script unless it is already current and
+// executable (git silently skips non-executable hooks, which would bypass
+// enforcement). Writes go through a temp file + rename so a concurrent
+// receive-pack never execs a partially written script.
+func ensureHook(path, script string) error {
+	if cur, err := os.ReadFile(path); err == nil && string(cur) == script {
+		if fi, err := os.Stat(path); err == nil && fi.Mode().Perm() == 0o755 {
+			return nil
+		}
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name())
+	if _, err := tmp.WriteString(script); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Chmod(0o755); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp.Name(), path)
 }
 
 // HydratePacks downloads and indexes every registered pack that is not

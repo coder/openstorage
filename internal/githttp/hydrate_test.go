@@ -27,6 +27,46 @@ func TestSyncRefs_DeletesStaleLocalRef(t *testing.T) {
 	}
 }
 
+// EnsureCacheRepo must repair hooks and config even when HEAD already
+// exists: a crash between `git init` and hook installation (or a deleted
+// hook file) must not yield a receive-pack that bypasses the S3 upload, PG
+// registration, and policy hooks.
+func TestEnsureCacheRepo_RepairsHooksAndConfig(t *testing.T) {
+	cacheDir := t.TempDir()
+	repoPath, err := EnsureCacheRepo(cacheDir, "t-ensure-repair")
+	if err != nil {
+		t.Fatalf("EnsureCacheRepo: %v", err)
+	}
+
+	// Simulate a crash right after `git init`: hooks gone, config reverted.
+	for _, name := range []string{"pre-receive", "update"} {
+		if err := os.Remove(filepath.Join(repoPath, "hooks", name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mustGit(t, repoPath, "config", "--unset", "receive.unpackLimit")
+
+	again, err := EnsureCacheRepo(cacheDir, "t-ensure-repair")
+	if err != nil {
+		t.Fatalf("EnsureCacheRepo (repair): %v", err)
+	}
+	if again != repoPath {
+		t.Fatalf("repo path changed on repair: %q != %q", again, repoPath)
+	}
+	for _, name := range []string{"pre-receive", "update"} {
+		fi, err := os.Stat(filepath.Join(repoPath, "hooks", name))
+		if err != nil {
+			t.Fatalf("hook %s not reinstalled: %v", name, err)
+		}
+		if fi.Mode().Perm() != 0o755 {
+			t.Fatalf("hook %s not executable: %v", name, fi.Mode())
+		}
+	}
+	if got := strings.TrimSpace(mustGit(t, repoPath, "config", "--get", "receive.unpackLimit")); got != "0" {
+		t.Fatalf("receive.unpackLimit = %q, want 0", got)
+	}
+}
+
 // Regression for the index-pack fix: a corrupt pack file left on disk must be
 // deleted on failure so a retry re-downloads it (previously the corrupt file
 // suppressed the download forever).
