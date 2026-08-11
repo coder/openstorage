@@ -20,7 +20,7 @@ import (
 // namespace suffix, `+ephemeral` or `+import` (docs/05). Namespaced repos
 // use fully separate ref stores, pack spaces, and cache dirs keyed by the
 // full name — docs/05 allows "git namespaces or separate ref stores", and
-// separate stores give the required isolation for free (spike-local choice).
+// separate stores give the required isolation for free.
 var repoNameRe = regexp.MustCompile(`\A[A-Za-z0-9][A-Za-z0-9._-]*(\+(ephemeral|import))?\z`)
 
 // ValidRepoName guards against path traversal via the URL repo element.
@@ -62,8 +62,8 @@ const hookScript = `#!/bin/sh
 exec %q hook %s "$@"
 `
 
-// EnsureCacheRepo idempotently creates the bare cache repo with spike config
-// and hooks that re-exec this binary (no shell/psql deps in hooks).
+// EnsureCacheRepo idempotently creates the bare cache repo with the server
+// config and hooks that re-exec this binary (no shell/psql deps in hooks).
 func EnsureCacheRepo(cacheDir, repo string) (string, error) {
 	path := RepoPath(cacheDir, repo)
 	if _, err := os.Stat(filepath.Join(path, "HEAD")); err == nil {
@@ -179,7 +179,7 @@ func SyncRefs(repoPath string, want map[string]string) error {
 			return fmt.Errorf("update-ref --stdin: %w: %s", err, strings.TrimSpace(string(out)))
 		}
 	}
-	// Spike-local: HEAD always points at main.
+	// HEAD always points at main (default branch handling is a later phase).
 	if _, err := runGit(repoPath, "symbolic-ref", "HEAD", "refs/heads/main"); err != nil {
 		return err
 	}

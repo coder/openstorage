@@ -1,9 +1,12 @@
+// Package githttp is the git smart HTTP surface (docs/05): stateless HTTP
+// nodes with Postgres as ref authority, S3/MinIO as immutable pack storage,
+// and local disk as a rebuildable cache. Authentication follows docs/02:
+// customer-signed JWTs verified against the issuing org's registered keys.
 package githttp
 
 import (
 	"compress/gzip"
 	"context"
-	"crypto/ecdsa"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -13,9 +16,19 @@ import (
 	"os/exec"
 	"strings"
 
+	"codestorage/internal/auth"
 	"codestorage/internal/blob"
 	"codestorage/internal/ref"
 )
+
+// assertf is a fail-fast invariant check for conditions that indicate a
+// programming error (never for request-dependent failures, which must map
+// to 4xx responses).
+func assertf(cond bool, format string, args ...any) {
+	if !cond {
+		panic(fmt.Sprintf("githttp assertion failed: "+format, args...))
+	}
+}
 
 // Server is one stateless HTTP node: all durable truth lives in PG (refs,
 // pack registry) and S3 (pack bytes); CacheDir is rebuildable at any time.
@@ -23,7 +36,15 @@ type Server struct {
 	Store    ref.RefStore
 	Blob     blob.BlobStore
 	CacheDir string
-	PubKey   *ecdsa.PublicKey
+	// Verifier authenticates docs/02 JWTs (multi-algorithm, iss-resolved
+	// org keys, exp/sub checks). Any Verify failure maps to 401.
+	Verifier auth.Verifier
+	// Org is the single organization this node serves. A valid token from a
+	// *different* registered org must not grant access (403); unknown orgs
+	// already fail key resolution inside Verifier (401).
+	Org string
+	// TestMode gates fault-injection knobs (crash header). Only ever set
+	// from CODESTORAGE_TEST_MODE=1; the crash header is refused otherwise.
 	TestMode bool
 	// ResolveRepoURL (optional) maps the repo_id path element (docs/05 URL
 	// style) to the repo's url value so tokens carrying the url claim
@@ -32,13 +53,14 @@ type Server struct {
 	ResolveRepoURL func(ctx context.Context, repoID string) (url string, ok bool)
 }
 
-func NewServer(st ref.RefStore, bl blob.BlobStore, cacheDir string, pub *ecdsa.PublicKey) *Server {
-	assertf(st != nil && bl != nil && pub != nil && cacheDir != "", "NewServer: missing dependency")
+func NewServer(st ref.RefStore, bl blob.BlobStore, cacheDir string, verifier auth.Verifier, org string) *Server {
+	assertf(st != nil && bl != nil && verifier != nil && cacheDir != "" && org != "", "NewServer: missing dependency")
 	return &Server{
 		Store:    st,
 		Blob:     bl,
 		CacheDir: cacheDir,
-		PubKey:   pub,
+		Verifier: verifier,
+		Org:      org,
 		TestMode: os.Getenv(EnvTestMode) == "1",
 	}
 }
@@ -86,16 +108,23 @@ func splitRepoPath(path string) (repo, rest string, ok bool) {
 	return repo, rest, true
 }
 
-// authenticate enforces docs/02 failure mapping: 401 for missing/invalid
-// token, 403 for scope or repo mismatch.
-func (s *Server) authenticate(r *http.Request, repo, scope string) (*Claims, int, error) {
+// authenticate enforces the docs/02 failure mapping on the git path: 401 for
+// a missing/invalid token (any Verifier failure), 403 for a valid token that
+// does not fit this org, repo, or scope.
+func (s *Server) authenticate(r *http.Request, repo, scope string) (*auth.Claims, int, error) {
+	assertf(s.Verifier != nil && s.Org != "", "Server used without Verifier/Org")
 	user, pass, ok := r.BasicAuth()
 	if !ok || user != "t" {
 		return nil, http.StatusUnauthorized, fmt.Errorf("basic auth with username 't' required")
 	}
-	claims, err := VerifyToken(s.PubKey, pass)
+	claims, err := s.Verifier.Verify(r.Context(), pass)
 	if err != nil {
 		return nil, http.StatusUnauthorized, err
+	}
+	// A signature valid for some *other* registered org must not grant
+	// access to this org's repos.
+	if claims.Iss != s.Org {
+		return nil, http.StatusForbidden, fmt.Errorf("token issued for org %q, not served here", claims.Iss)
 	}
 	// docs/02: the repo claim carries the repo url (or id); docs/05 paths
 	// address repos by repo_id. Accept a verbatim match, else resolve the
@@ -121,11 +150,11 @@ func (s *Server) authenticate(r *http.Request, repo, scope string) (*Claims, int
 func serviceScope(service string) string {
 	switch service {
 	case "upload-pack":
-		return ScopeGitRead
+		return auth.ScopeGitRead
 	case "receive-pack":
-		return ScopeGitWrite
+		return auth.ScopeGitWrite
 	}
-	panic("spike assertion failed: unknown service " + service)
+	panic("githttp assertion failed: unknown service " + service)
 }
 
 // hydrate rebuilds cache state for the request. Ref-sync failures are fatal
@@ -186,6 +215,13 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 		httpError(w, status, err.Error())
 		return
 	}
+	// Fault-injection is only ever honored under CODESTORAGE_TEST_MODE=1;
+	// otherwise the request is refused loudly rather than silently ignored.
+	crash := r.Header.Get(CrashHeader)
+	if crash != "" && !s.TestMode {
+		httpError(w, http.StatusForbidden, CrashHeader+" refused: server not in test mode")
+		return
+	}
 	repoPath, err := s.hydrate(r.Context(), repo, service)
 	if err != nil {
 		log.Printf("hydrate %s: %v", repo, err)
@@ -210,13 +246,22 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 	if service == "receive-pack" {
 		cmd.Env = append(cmd.Env,
 			EnvRepo+"="+repo,
-			EnvRefsPolicy+"="+claims.RefsPolicyJSON(),
+			EnvOrg+"="+s.Org,
 		)
-		// Crash knob is honored only under SPIKE_TEST_MODE=1.
-		if s.TestMode {
-			if crash := r.Header.Get("X-Spike-Crash"); crash != "" {
-				cmd.Env = append(cmd.Env, EnvCrash+"="+crash)
-			}
+		// The refs claim is passed through raw (docs/02 tuple encoding);
+		// the update hook owns parsing and fails closed on malformed JSON.
+		if len(claims.Refs) > 0 {
+			cmd.Env = append(cmd.Env, EnvRefsPolicy+"="+string(claims.Refs))
+		}
+		// Deprecated repo-wide ops claim: folded into the ref policies by
+		// the hook (docs/02 fallback semantics).
+		if len(claims.Ops) > 0 {
+			ops, err := json.Marshal(claims.Ops)
+			assertf(err == nil, "marshal ops claim: %v", err)
+			cmd.Env = append(cmd.Env, EnvOps+"="+string(ops))
+		}
+		if s.TestMode && crash != "" {
+			cmd.Env = append(cmd.Env, EnvCrash+"="+crash)
 		}
 	}
 	cmd.Stdin = body

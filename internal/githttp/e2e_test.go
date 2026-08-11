@@ -1,16 +1,19 @@
 package githttp
 
-// Acceptance tests for the de-risk spike. Real containers only (no fakes):
-// testcontainers-go boots Postgres + MinIO, TestMain builds the codestorage
-// binary once and runs nodes as separate OS processes, exactly like
-// production would. ES256 keys are generated at runtime and never committed.
+// End-to-end acceptance tests for the git smart HTTP surface. Real
+// containers only (no fakes): testcontainers-go boots Postgres + MinIO,
+// TestMain builds the codestorage binary once and runs nodes as separate OS
+// processes, exactly like production would. All keys (JWT org keys, SSH and
+// PGP signing keys) are generated at runtime and never committed.
 
 import (
 	"bufio"
 	"context"
-	"crypto/ecdsa"
+	"crypto"
+	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -23,19 +26,32 @@ import (
 	tcminio "github.com/testcontainers/testcontainers-go/modules/minio"
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 
+	"codestorage/internal/auth"
 	"codestorage/internal/blob"
+	"codestorage/internal/meta"
 	"codestorage/internal/ref"
 )
 
+// testOrg is the org the serve nodes are configured for; secondOrg is
+// registered directly in meta so its (valid) tokens can prove the 403
+// cross-org mapping.
+const (
+	testOrg   = "org1"
+	secondOrg = "org2"
+)
+
 var (
-	binPath    string
-	pgURL      string
-	blobURL    string
-	pubKeyPath string
-	privKey    *ecdsa.PrivateKey
-	testStore  *ref.PG
-	testBlob   *blob.S3
-	nodeA      *testNode
+	binPath     string
+	pgURL       string
+	blobURL     string
+	orgKeysPath string        // PEM file with testOrg's public keys (ES256 + Ed25519)
+	orgES256Key crypto.Signer // default token-signing key for testOrg
+	orgEdKey    crypto.Signer // second registered key (EdDSA)
+	org2Key     crypto.Signer // secondOrg's registered key
+	testStore   *ref.PG
+	testBlob    *blob.S3
+	testMeta    *meta.PG
+	nodeA       *testNode
 )
 
 func TestMain(m *testing.M) {
@@ -45,7 +61,7 @@ func TestMain(m *testing.M) {
 func testMainInner(m *testing.M) int {
 	ctx := context.Background()
 
-	scratch, err := os.MkdirTemp("", "spike-accept-*")
+	scratch, err := os.MkdirTemp("", "githttp-accept-*")
 	if err != nil {
 		panic(err)
 	}
@@ -84,20 +100,22 @@ func testMainInner(m *testing.M) int {
 	if err != nil {
 		panic(err)
 	}
-	blobURL = fmt.Sprintf("s3://spike-test?endpoint=http://%s&s3ForcePathStyle=true&region=us-east-1", minioAddr)
+	blobURL = fmt.Sprintf("s3://githttp-test?endpoint=http://%s&s3ForcePathStyle=true&region=us-east-1", minioAddr)
 	os.Setenv("AWS_ACCESS_KEY_ID", minioC.Username)
 	os.Setenv("AWS_SECRET_ACCESS_KEY", minioC.Password)
 
-	// Runtime-generated ES256 keypair (never committed).
-	privKey, err = GenerateKeyPair()
-	if err != nil {
-		panic(err)
-	}
-	if _, pubKeyPath, err = WriteKeyPairPEM(privKey, filepath.Join(scratch, "key")); err != nil {
+	// Runtime-generated org keys (never committed). testOrg registers two
+	// keys with different algorithms to prove multi-alg verification on the
+	// git path; secondOrg exists to prove the cross-org 403.
+	orgES256Key = mustGenKey("ES256")
+	orgEdKey = mustGenKey("EdDSA")
+	org2Key = mustGenKey("ES256")
+	orgKeysPath = filepath.Join(scratch, "org1-keys.pub.pem")
+	if err := os.WriteFile(orgKeysPath, append(mustPubPEM(orgES256Key), mustPubPEM(orgEdKey)...), 0o644); err != nil {
 		panic(err)
 	}
 
-	// Direct PG/S3 handles for assertions; also prepares schema + bucket.
+	// Direct PG/S3/meta handles for assertions; also prepares schema + bucket.
 	testStore, err = ref.OpenPG(ctx, pgURL)
 	if err != nil {
 		panic(err)
@@ -114,6 +132,17 @@ func testMainInner(m *testing.M) int {
 	if err := testBlob.EnsureBucket(ctx); err != nil {
 		panic(err)
 	}
+	testMeta, err = meta.OpenPG(ctx, pgURL)
+	if err != nil {
+		panic(err)
+	}
+	defer testMeta.Close()
+	if err := testMeta.InitSchema(ctx); err != nil {
+		panic(err)
+	}
+	if _, err := testMeta.UpsertOrgWithKeys(ctx, secondOrg, []string{string(mustPubPEM(org2Key))}); err != nil {
+		panic(err)
+	}
 
 	// Shared push node A. Nodes with special needs (fresh cache, delay knob)
 	// are started per-test.
@@ -124,6 +153,22 @@ func testMainInner(m *testing.M) int {
 	defer nodeA.stop()
 
 	return m.Run()
+}
+
+func mustGenKey(alg string) crypto.Signer {
+	key, err := auth.GenerateKey(alg)
+	if err != nil {
+		panic(err)
+	}
+	return key
+}
+
+func mustPubPEM(key crypto.Signer) []byte {
+	pemBytes, err := auth.MarshalPublicKeyPEM(key.Public())
+	if err != nil {
+		panic(err)
+	}
+	return pemBytes
 }
 
 type testNode struct {
@@ -138,16 +183,20 @@ func (n *testNode) stop() {
 	}
 }
 
+// startNode runs `codestorage serve` in single-org mode. Later duplicate
+// env entries win (os/exec dedups), so tests can override the defaults —
+// e.g. `CODESTORAGE_TEST_MODE=` to prove knobs are refused in production.
 func startNode(cacheDir string, extraEnv ...string) (*testNode, error) {
 	cmd := exec.Command(binPath, "serve",
-		"--addr", "127.0.0.1:0",
+		"--listen", "127.0.0.1:0",
 		"--cache-dir", cacheDir,
-		"--jwt-pubkey", pubKeyPath,
 	)
 	cmd.Env = append(os.Environ(),
-		"PG_URL="+pgURL,
-		"BLOB_URL="+blobURL,
-		"SPIKE_TEST_MODE=1",
+		"CODESTORAGE_PG_URL="+pgURL,
+		"CODESTORAGE_S3_URL="+blobURL,
+		"CODESTORAGE_ORG="+testOrg,
+		"CODESTORAGE_ORG_PUBKEYS="+orgKeysPath,
+		"CODESTORAGE_TEST_MODE=1",
 	)
 	cmd.Env = append(cmd.Env, extraEnv...)
 	cmd.Stderr = os.Stderr
@@ -193,16 +242,25 @@ func startNodeT(t *testing.T, extraEnv ...string) *testNode {
 // --- git helpers -----------------------------------------------------------
 
 var gitIdentity = []string{
-	"-c", "user.email=spike@test.invalid",
-	"-c", "user.name=spike",
+	"-c", "user.email=githttp@test.invalid",
+	"-c", "user.name=githttp",
 	"-c", "init.defaultBranch=main",
 	"-c", "advice.detachedHead=false",
 }
 
 func tryGit(dir string, args ...string) (string, error) {
+	return tryGitEnv(dir, nil, args...)
+}
+
+// tryGitEnv runs git with extra environment entries (e.g. GNUPGHOME for
+// OpenPGP signing).
+func tryGitEnv(dir string, env []string, args ...string) (string, error) {
 	full := append(append([]string{}, gitIdentity...), args...)
 	cmd := exec.Command("git", full...)
 	cmd.Dir = dir
+	if len(env) > 0 {
+		cmd.Env = append(os.Environ(), env...)
+	}
 	out, err := cmd.CombinedOutput()
 	return string(out), err
 }
@@ -210,6 +268,15 @@ func tryGit(dir string, args ...string) (string, error) {
 func mustGit(t *testing.T, dir string, args ...string) string {
 	t.Helper()
 	out, err := tryGit(dir, args...)
+	if err != nil {
+		t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+	}
+	return out
+}
+
+func mustGitEnv(t *testing.T, dir string, env []string, args ...string) string {
+	t.Helper()
+	out, err := tryGitEnv(dir, env, args...)
 	if err != nil {
 		t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
 	}
@@ -239,13 +306,50 @@ func writeFile(t *testing.T, dir, name, content string) {
 	}
 }
 
-func mintTestToken(t *testing.T, repo, scopes, refsJSON string) string {
+// commitFile stages a new file and commits it; extra global git -c flags
+// (e.g. SSH/PGP signing config) come from gitFlags.
+func commitFile(t *testing.T, dir, name, content, msg string, env []string, gitFlags ...string) string {
 	t.Helper()
-	token, err := MintToken(privKey, "spike", repo, strings.Split(scopes, ","), refsJSON, time.Hour)
+	writeFile(t, dir, name, content)
+	mustGit(t, dir, "add", ".")
+	args := append(append([]string{}, gitFlags...), "commit", "-m", msg)
+	mustGitEnv(t, dir, env, args...)
+	return revParse(t, dir, "HEAD")
+}
+
+// --- token helpers ---------------------------------------------------------
+
+// testClaims returns a fully populated docs/02 claim set for testOrg.
+func testClaims(repo, scopes string) auth.Claims {
+	now := time.Now()
+	return auth.Claims{
+		Iss:    testOrg,
+		Sub:    auth.SubjectLiteral,
+		Repo:   repo,
+		Scopes: strings.Split(scopes, ","),
+		Iat:    now.Unix(),
+		Exp:    now.Add(time.Hour).Unix(),
+	}
+}
+
+func mintWith(t *testing.T, key crypto.Signer, alg string, c auth.Claims) string {
+	t.Helper()
+	token, err := auth.MintToken(key, alg, c)
 	if err != nil {
 		t.Fatalf("mint token: %v", err)
 	}
 	return token
+}
+
+// mintTestToken mints a testOrg ES256 token; refsJSON is the raw docs/02
+// tuple encoding ("" for no ref policies).
+func mintTestToken(t *testing.T, repo, scopes, refsJSON string) string {
+	t.Helper()
+	c := testClaims(repo, scopes)
+	if refsJSON != "" {
+		c.Refs = json.RawMessage(refsJSON)
+	}
+	return mintWith(t, orgES256Key, "ES256", c)
 }
 
 func remoteURL(n *testNode, repo, token string) string {
@@ -340,7 +444,7 @@ func TestConcurrentPush_OneWinsCAS(t *testing.T) {
 
 	// Dedicated node with the delay knob so both update hooks overlap and the
 	// loser is deterministically rejected at the PG CAS.
-	raceNode := startNodeT(t, "SPIKE_HOOK_DELAY_MS=1500")
+	raceNode := startNodeT(t, EnvHookDelay+"=1500")
 
 	clones := make([]string, 2)
 	heads := make([]string, 2)
@@ -411,7 +515,7 @@ func TestCrash_AfterS3_BeforePGCommit(t *testing.T) {
 
 	// Crash the pre-receive hook between S3 upload and PG commit.
 	out, err := tryGit(work,
-		"-c", "http.extraHeader=X-Spike-Crash: after-s3",
+		"-c", "http.extraHeader="+CrashHeader+": after-s3",
 		"push", remoteURL(nodeA, repo, token), "HEAD:refs/heads/main")
 	if err == nil {
 		t.Fatalf("push should have failed under crash knob:\n%s", out)
@@ -448,27 +552,112 @@ func TestCrash_AfterS3_BeforePGCommit(t *testing.T) {
 	}
 }
 
-// --- review-finding regressions: unit --------------------------------------
+// The crash knob is a test-only fault injection: a node NOT running in test
+// mode must refuse the header outright (403) without touching PG or S3.
+func TestCrashHeader_RefusedOutsideTestMode(t *testing.T) {
+	repo := "t4b-crash-refused"
+	work := initWorkRepo(t)
+	token := mintTestToken(t, repo, "git:read,git:write", "")
+	prodNode := startNodeT(t, "CODESTORAGE_TEST_MODE=") // later duplicate wins
+	mustGit(t, work, "push", remoteURL(prodNode, repo, token), "HEAD:refs/heads/main")
 
-func TestGlobMatch(t *testing.T) {
-	cases := []struct {
-		pattern, s string
-		want       bool
-	}{
-		{"*", "refs/heads/main", true}, // leading `*` (regression: never matched)
-		{"*", "", true},
-		{"*-wip", "refs/heads/foo-wip", true},
-		{"refs/heads/*", "refs/heads/a/b", true}, // `*` crosses `/` (spike-local)
-		{"refs/heads/*", "refs/tags/v1", false},
-		{"refs/heads/main", "refs/heads/main", true},
-		{"refs/heads/ma.n", "refs/heads/maXn", false}, // regexp metachars quoted
+	objsBefore := minioPacks(t, repo)
+	refsBefore := pgRefs(t, repo)
+	writeFile(t, work, "b.txt", "two\n")
+	mustGit(t, work, "add", ".")
+	mustGit(t, work, "commit", "-m", "two")
+
+	out, err := tryGit(work,
+		"-c", "http.extraHeader="+CrashHeader+": after-s3",
+		"push", remoteURL(prodNode, repo, token), "HEAD:refs/heads/main")
+	if err == nil {
+		t.Fatalf("push with crash header should be refused outside test mode:\n%s", out)
 	}
-	for _, c := range cases {
-		if got := globMatch(c.pattern, c.s); got != c.want {
-			t.Errorf("globMatch(%q, %q) = %v, want %v", c.pattern, c.s, got, c.want)
-		}
+	if !strings.Contains(out, "403") {
+		t.Fatalf("expected a 403 refusal, got:\n%s", out)
+	}
+	if got := minioPacks(t, repo); len(got) != len(objsBefore) {
+		t.Fatalf("refused push still wrote to S3: %d -> %d objects", len(objsBefore), len(got))
+	}
+	if got := pgRefs(t, repo); !mapsEqual(got, refsBefore) {
+		t.Fatalf("refused push changed PG refs: %v -> %v", refsBefore, got)
 	}
 }
+
+// --- docs/02 auth matrix (e2e) ----------------------------------------------
+
+// TestAuth_Matrix drives the failure mapping end-to-end over real HTTP:
+// 401 for anything the Verifier rejects, 403 for valid-but-wrong tokens.
+func TestAuth_Matrix(t *testing.T) {
+	repo := "t-auth-matrix"
+	work := initWorkRepo(t)
+	setup := mintTestToken(t, repo, "git:read,git:write", "")
+	mustGit(t, work, "push", remoteURL(nodeA, repo, setup), "HEAD:refs/heads/main")
+
+	infoRefs := func(user, token, service string) int {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodGet,
+			"http://"+nodeA.addr+"/"+repo+".git/info/refs?service=git-"+service, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.SetBasicAuth(user, token)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		_, _ = io.Copy(io.Discard, resp.Body)
+		return resp.StatusCode
+	}
+
+	expired := testClaims(repo, "git:read")
+	expired.Exp = time.Now().Add(-time.Minute).Unix()
+	unknownIss := testClaims(repo, "git:read")
+	unknownIss.Iss = "ghost-org"
+	org2Claims := testClaims(repo, "git:read")
+	org2Claims.Iss = secondOrg
+
+	cases := []struct {
+		name    string
+		user    string
+		token   string
+		service string
+		want    int
+	}{
+		{"ES256 org key read", "t", mintWith(t, orgES256Key, "ES256", testClaims(repo, "git:read")), "upload-pack", 200},
+		{"EdDSA org key read", "t", mintWith(t, orgEdKey, "EdDSA", testClaims(repo, "git:read")), "upload-pack", 200},
+		{"expired token", "t", mintWith(t, orgES256Key, "ES256", expired), "upload-pack", 401},
+		{"unknown issuer", "t", mintWith(t, orgES256Key, "ES256", unknownIss), "upload-pack", 401},
+		{"second org's valid token", "t", mintWith(t, org2Key, "ES256", org2Claims), "upload-pack", 403},
+		{"wrong repo claim", "t", mintTestToken(t, "some-other-repo", "git:read", ""), "upload-pack", 403},
+		{"read scope on receive-pack", "t", mintWith(t, orgES256Key, "ES256", testClaims(repo, "git:read")), "receive-pack", 403},
+		{"bad basic user", "x", setup, "upload-pack", 401},
+		{"garbage token", "t", "eyJhbGciOiJub25lIn0.e30.", "upload-pack", 401},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := infoRefs(c.user, c.token, c.service); got != c.want {
+				t.Fatalf("info/refs status = %d, want %d", got, c.want)
+			}
+		})
+	}
+
+	// A read-only token must not be able to push (whole-push 403).
+	writeFile(t, work, "b.txt", "two\n")
+	mustGit(t, work, "add", ".")
+	mustGit(t, work, "commit", "-m", "two")
+	readOnly := mintTestToken(t, repo, "git:read", "")
+	out, err := tryGit(work, "push", remoteURL(nodeA, repo, readOnly), "HEAD:refs/heads/main")
+	if err == nil {
+		t.Fatalf("push with git:read-only token should fail:\n%s", out)
+	}
+	if !strings.Contains(out, "403") {
+		t.Fatalf("read-only push should be a 403, got:\n%s", out)
+	}
+}
+
+// --- unit: path parsing ------------------------------------------------------
 
 func TestSplitRepoPath_Namespaces(t *testing.T) {
 	cases := []struct {
@@ -491,7 +680,7 @@ func TestSplitRepoPath_Namespaces(t *testing.T) {
 	}
 }
 
-// --- review-finding regressions: acceptance ---------------------------------
+// --- push-path regressions ---------------------------------------------------
 
 // A push that transfers no new objects (branch created from an already-pushed
 // commit) must succeed: depending on git version/client it carries an empty
@@ -529,7 +718,7 @@ func TestRefPolicy_NoPushWildcard(t *testing.T) {
 	mustGit(t, work, "add", ".")
 	mustGit(t, work, "commit", "-m", "two")
 
-	// Leading-`*` wildcard (regression) combined with the no-push op.
+	// Standalone `*` catch-all combined with the no-push op.
 	noPushToken := mintTestToken(t, repo, "git:read,git:write", `[["*",["no-push"]]]`)
 	out, err := tryGit(work, "push", remoteURL(nodeA, repo, noPushToken), "HEAD:refs/heads/main")
 	if err == nil {
@@ -544,34 +733,10 @@ func TestRefPolicy_NoPushWildcard(t *testing.T) {
 	}
 }
 
-func TestRefPolicy_VerifySigFailsClosed(t *testing.T) {
-	repo := "t8-verify-sig"
-	work := initWorkRepo(t)
-	setupToken := mintTestToken(t, repo, "git:read,git:write", "")
-	mustGit(t, work, "push", remoteURL(nodeA, repo, setupToken), "HEAD:refs/heads/main")
-	mainHead := revParse(t, work, "HEAD")
-
-	writeFile(t, work, "b.txt", "two\n")
-	mustGit(t, work, "add", ".")
-	mustGit(t, work, "commit", "-m", "two")
-
-	// verify-sig is not implemented by the spike; it must fail closed.
-	token := mintTestToken(t, repo, "git:read,git:write", `[["refs/heads/main",["verify-sig"]]]`)
-	out, err := tryGit(work, "push", remoteURL(nodeA, repo, token), "HEAD:refs/heads/main")
-	if err == nil {
-		t.Fatalf("push should be rejected by verify-sig policy:\n%s", out)
-	}
-	t.Logf("verify-sig output:\n%s", out)
-	if !regexp.MustCompile(`\[remote rejected\].*(verify-sig|hook declined)`).MatchString(out) {
-		t.Fatalf("push was not remote-rejected with a verify-sig message:\n%s", out)
-	}
-	if got := pgRefs(t, repo)["refs/heads/main"]; got != mainHead {
-		t.Fatalf("PG main = %q, want unchanged %q", got, mainHead)
-	}
-}
-
 // docs/05: `+ephemeral` remotes see/update only the ephemeral ref space and
 // persistent remotes must not see ephemeral refs (separate ref stores).
+// Extended with promotion prep: fetching from `+ephemeral` and pushing the
+// same objects to a persistent branch is the client-side promotion flow.
 func TestNamespace_EphemeralIsolated(t *testing.T) {
 	repo := "t9-ns"
 	work := initWorkRepo(t)
@@ -601,6 +766,75 @@ func TestNamespace_EphemeralIsolated(t *testing.T) {
 	out := mustGit(t, "", "ls-remote", remoteURL(nodeA, repo+"+ephemeral", token))
 	if !strings.Contains(out, "refs/heads/scratch") || strings.Contains(out, "refs/heads/main") {
 		t.Fatalf("ephemeral advertisement wrong:\n%s", out)
+	}
+
+	// Promotion prep, from a second replica with a cold cache: fetch the
+	// scratch branch back out of `+ephemeral`, push those same objects to a
+	// persistent branch, and prove the persistent remote gains ONLY the
+	// promoted ref while `+ephemeral` keeps isolating.
+	nodeB := startNodeT(t)
+	promoDir := filepath.Join(t.TempDir(), "promo")
+	mustGit(t, "", "clone", remoteURL(nodeB, repo, token), promoDir)
+	mustGit(t, promoDir, "fetch", remoteURL(nodeB, repo+"+ephemeral", token), "refs/heads/scratch")
+	if got := revParse(t, promoDir, "FETCH_HEAD"); got != ephHead {
+		t.Fatalf("fetched ephemeral scratch = %q, want %q", got, ephHead)
+	}
+	mustGit(t, promoDir, "push", remoteURL(nodeB, repo, token), "FETCH_HEAD:refs/heads/promoted")
+
+	persistent := mustGit(t, "", "ls-remote", remoteURL(nodeA, repo, token))
+	if !strings.Contains(persistent, ephHead+"\trefs/heads/promoted") {
+		t.Fatalf("persistent remote missing promoted branch:\n%s", persistent)
+	}
+	if strings.Contains(persistent, "refs/heads/scratch") {
+		t.Fatalf("persistent remote leaked the ephemeral scratch ref:\n%s", persistent)
+	}
+	ephOut := mustGit(t, "", "ls-remote", remoteURL(nodeA, repo+"+ephemeral", token))
+	if !strings.Contains(ephOut, "refs/heads/scratch") || strings.Contains(ephOut, "refs/heads/promoted") {
+		t.Fatalf("ephemeral namespace lost isolation after promotion:\n%s", ephOut)
+	}
+}
+
+// docs/05 `+import` namespace: bulk history round-trips through its own
+// isolated ref space (clone/push/fetch), invisible from the persistent
+// remote.
+func TestNamespace_ImportRoundTrip(t *testing.T) {
+	repo := "t10-import"
+	work := initWorkRepo(t)
+	token := mintTestToken(t, repo, "git:read,git:write", "")
+
+	mustGit(t, work, "tag", "v1")
+	mustGit(t, work, "push", remoteURL(nodeA, repo+"+import", token), "HEAD:refs/heads/main", "refs/tags/v1")
+	head := revParse(t, work, "HEAD")
+
+	importOut := mustGit(t, "", "ls-remote", remoteURL(nodeA, repo+"+import", token))
+	if !strings.Contains(importOut, "refs/heads/main") || !strings.Contains(importOut, "refs/tags/v1") {
+		t.Fatalf("import advertisement missing pushed refs:\n%s", importOut)
+	}
+	if persistent := mustGit(t, "", "ls-remote", remoteURL(nodeA, repo, token)); strings.Contains(persistent, "refs/heads/main") {
+		t.Fatalf("persistent remote sees import refs:\n%s", persistent)
+	}
+
+	// Clone the import namespace (fresh replica, cold cache), verify
+	// integrity, extend it, and fetch the extension back in the original
+	// working repo.
+	nodeB := startNodeT(t)
+	cloneDir := filepath.Join(t.TempDir(), "clone")
+	mustGit(t, "", "clone", remoteURL(nodeB, repo+"+import", token), cloneDir)
+	if got := revParse(t, cloneDir, "HEAD"); got != head {
+		t.Fatalf("import clone HEAD = %q, want %q", got, head)
+	}
+	if out, err := tryGit(cloneDir, "fsck", "--strict"); err != nil {
+		t.Fatalf("git fsck: %v\n%s", err, out)
+	}
+	writeFile(t, cloneDir, "bulk.txt", "imported\n")
+	mustGit(t, cloneDir, "add", ".")
+	mustGit(t, cloneDir, "commit", "-m", "bulk")
+	newHead := revParse(t, cloneDir, "HEAD")
+	mustGit(t, cloneDir, "push", remoteURL(nodeB, repo+"+import", token), "HEAD:refs/heads/main")
+
+	mustGit(t, work, "fetch", remoteURL(nodeA, repo+"+import", token), "refs/heads/main")
+	if got := revParse(t, work, "FETCH_HEAD"); got != newHead {
+		t.Fatalf("fetched import main = %q, want %q", got, newHead)
 	}
 }
 
