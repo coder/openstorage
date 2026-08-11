@@ -1,0 +1,20 @@
+# golangci-lint configuration (v1 schema; CI + local gate is `golangci-lint run`).
+# Keep this modest: the default linter set (errcheck, gosimple, govet,
+# ineffassign, staticcheck, unused) plus a few low-noise style linters.
+run:
+  timeout: 5m
+
+linters:
+  enable:
+    - gofmt
+    - goimports
+    - misspell
+    - unconvert
+    - nolintlint
+
+linters-settings:
+  goimports:
+    local-prefixes: codestorage
+
+issues:
+  exclude-use-default: true
