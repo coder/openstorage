@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"gocloud.dev/blob/memblob"
@@ -62,5 +63,33 @@ func TestPackKeyHelpers(t *testing.T) {
 	}
 	if got, want := PackPrefix("r1"), "packs/r1/"; got != want {
 		t.Fatalf("PackPrefix = %q, want %q", got, want)
+	}
+}
+
+// TestOpenSchemeDispatch covers the factory's container-free paths: s3://
+// dispatches to OpenS3 (opening a bucket handle needs no network) and
+// unknown schemes fail fast listing the supported set.
+func TestOpenSchemeDispatch(t *testing.T) {
+	ctx := context.Background()
+
+	bl, err := Open(ctx, "s3://some-bucket?region=us-east-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := bl.(*S3); !ok {
+		t.Fatalf("s3:// must open the S3 backend, got %T", bl)
+	}
+	if err := bl.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = Open(ctx, "gs://bucket")
+	if err == nil || !strings.Contains(err.Error(), `scheme "gs" unsupported`) {
+		t.Fatalf("want unsupported-scheme error, got %v", err)
+	}
+	for _, scheme := range []string{"s3", "file"} {
+		if !strings.Contains(err.Error(), scheme) {
+			t.Fatalf("unsupported-scheme error must list %q, got %v", scheme, err)
+		}
 	}
 }

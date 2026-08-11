@@ -32,12 +32,12 @@ const (
 	repoCols = "repo_id, org_id, url, default_branch, created_at, deleted_at"
 )
 
-// PG implements Store on Postgres.
+// PG implements Backend on Postgres.
 type PG struct {
 	pool *pgxpool.Pool
 }
 
-var _ Store = (*PG)(nil)
+var _ Backend = (*PG)(nil)
 
 // OpenPG connects to pgURL and pings the database.
 func OpenPG(ctx context.Context, pgURL string) (*PG, error) {

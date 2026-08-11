@@ -10,7 +10,13 @@ package meta
 import (
 	"context"
 	"errors"
+	"fmt"
+	"net/url"
 	"time"
+
+	// Registers the pure-Go "sqlite" database/sql driver the sqlite backend
+	// opens (cgo-free cross-compiled single binaries).
+	_ "modernc.org/sqlite"
 )
 
 // Sentinel errors implementations must return (possibly wrapped; callers
@@ -123,4 +129,38 @@ type Store interface {
 	// RemoveSigningKey deletes the signing key with the given ID.
 	// ErrNotFound when the org is unknown or the ID does not belong to it.
 	RemoveSigningKey(ctx context.Context, org string, id int64) error
+}
+
+// Backend extends Store with the lifecycle the wire seam needs: serve runs
+// InitSchema once at startup and Close on shutdown. Consumers keep coding
+// against Store; hooks never run DDL.
+type Backend interface {
+	Store
+	// InitSchema creates the metadata tables (idempotent, safe under
+	// concurrent startups).
+	InitSchema(ctx context.Context) error
+	Close()
+}
+
+// Open dispatches on the URL scheme to the matching Backend:
+//
+//	postgres:// or postgresql://  → OpenPG
+//	sqlite:///abs/path/db.sqlite  → pure-Go SQLite store
+//
+// Open never runs InitSchema: hooks reconstruct stores from env URLs and
+// must not run DDL — the serve/wire seam owns schema init.
+func Open(ctx context.Context, dbURL string) (Backend, error) {
+	assertf(dbURL != "", "Open: empty metadata store URL")
+	u, err := url.Parse(dbURL)
+	if err != nil {
+		return nil, fmt.Errorf("parse metadata store URL: %w", err)
+	}
+	switch u.Scheme {
+	case "postgres", "postgresql":
+		return OpenPG(ctx, dbURL)
+	case "sqlite":
+		return nil, fmt.Errorf("metadata store scheme %q not implemented yet", u.Scheme)
+	default:
+		return nil, fmt.Errorf("metadata store URL scheme %q unsupported (want postgres, postgresql, or sqlite)", u.Scheme)
+	}
 }

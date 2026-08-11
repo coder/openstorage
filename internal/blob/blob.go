@@ -56,6 +56,30 @@ func PackKey(repo, id string) string {
 // PackPrefix is the listing prefix for a repo's packs.
 func PackPrefix(repo string) string { return "packs/" + repo + "/" }
 
+// Open dispatches on the URL scheme to the matching BlobStore backend:
+//
+//	s3://bucket?region=&endpoint=  → OpenS3
+//	file:///abs/dir                → local filesystem bucket
+//
+// BlobStore already carries the lifecycle (EnsureBucket/Close), so there is
+// no separate lifecycle interface. Open never calls EnsureBucket: hooks
+// reconstruct stores from env URLs; the serve seam owns bucket creation.
+func Open(ctx context.Context, blobURL string) (BlobStore, error) {
+	assertf(blobURL != "", "Open: empty blob URL")
+	u, err := url.Parse(blobURL)
+	if err != nil {
+		return nil, fmt.Errorf("parse blob URL: %w", err)
+	}
+	switch u.Scheme {
+	case "s3":
+		return OpenS3(ctx, blobURL)
+	case "file":
+		return nil, fmt.Errorf("blob URL scheme %q not implemented yet", u.Scheme)
+	default:
+		return nil, fmt.Errorf("blob URL scheme %q unsupported (want s3 or file)", u.Scheme)
+	}
+}
+
 // S3 implements BlobStore on a gocloud S3 bucket plus the raw client
 // (needed for EnsureBucket at serve startup).
 type S3 struct {

@@ -120,7 +120,7 @@ func preReceive(ctx context.Context) error {
 		return nil
 	}
 
-	bl, err := blob.OpenS3(ctx, mustEnv(envHookBlobURL...))
+	bl, err := blob.Open(ctx, mustEnv(envHookBlobURL...))
 	if err != nil {
 		return err
 	}
@@ -135,7 +135,7 @@ func preReceive(ctx context.Context) error {
 		if err := bl.UploadFile(ctx, key, pf); err != nil {
 			return fmt.Errorf("pre-receive: upload %s: %w", key, err)
 		}
-		packs = append(packs, ref.Pack{ID: id, S3Key: key})
+		packs = append(packs, ref.Pack{ID: id, Key: key})
 	}
 
 	// Test knob: crash between S3 upload and PG commit.
@@ -144,7 +144,7 @@ func preReceive(ctx context.Context) error {
 		os.Exit(42)
 	}
 
-	st, err := ref.OpenPG(ctx, mustEnv(envHookPGURL...))
+	st, err := ref.Open(ctx, mustEnv(envHookPGURL...))
 	if err != nil {
 		return err
 	}
@@ -176,7 +176,7 @@ func updateHook(ctx context.Context, args []string) error {
 		}
 	}
 
-	st, err := ref.OpenPG(ctx, mustEnv(envHookPGURL...))
+	st, err := ref.Open(ctx, mustEnv(envHookPGURL...))
 	if err != nil {
 		return err
 	}
@@ -274,7 +274,7 @@ func verifySig(ctx context.Context, refName, old, new string) error {
 	}
 	org := mustEnv(EnvOrg)
 
-	ms, err := meta.OpenPG(ctx, mustEnv(envHookPGURL...))
+	ms, err := meta.Open(ctx, mustEnv(envHookPGURL...))
 	if err != nil {
 		return fmt.Errorf("verify-sig: open metadata store: %w", err)
 	}

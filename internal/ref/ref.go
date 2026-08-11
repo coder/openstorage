@@ -5,10 +5,15 @@ package ref
 import (
 	"context"
 	"fmt"
+	"net/url"
 	"regexp"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	// Registers the pure-Go "sqlite" database/sql driver the sqlite backend
+	// opens (cgo-free cross-compiled single binaries).
+	_ "modernc.org/sqlite"
 )
 
 // ZeroSHA is git's null object id (40 zeros) marking ref create/delete.
@@ -26,10 +31,12 @@ func assertf(cond bool, format string, args ...any) {
 	}
 }
 
-// Pack is one registered pack for a repo.
+// Pack is one registered pack for a repo. Key is the blob-store object key
+// (blob.PackKey); the backing SQL column stays named s3_key in every backend
+// so the pack SQL is byte-comparable across them (no PG migration).
 type Pack struct {
-	ID    string
-	S3Key string
+	ID  string
+	Key string
 }
 
 // RefStore is the ref-authority contract: refs only ever change through
@@ -48,12 +55,46 @@ type RefStore interface {
 	ListPacks(ctx context.Context, repo string) ([]Pack, error)
 }
 
-// PG implements RefStore on Postgres.
+// Store extends RefStore with the lifecycle the wire seam needs: serve runs
+// InitSchema once at startup and Close on shutdown. Consumers keep coding
+// against RefStore; hooks never run DDL.
+type Store interface {
+	RefStore
+	// InitSchema creates the ref/pack tables (idempotent, safe under
+	// concurrent startups).
+	InitSchema(ctx context.Context) error
+	Close()
+}
+
+// Open dispatches on the URL scheme to the matching Store backend:
+//
+//	postgres:// or postgresql://  → OpenPG
+//	sqlite:///abs/path/db.sqlite  → pure-Go SQLite store
+//
+// Open never runs InitSchema: hooks reconstruct stores from env URLs and
+// must not run DDL — the serve/wire seam owns schema init.
+func Open(ctx context.Context, dbURL string) (Store, error) {
+	assertf(dbURL != "", "Open: empty ref store URL")
+	u, err := url.Parse(dbURL)
+	if err != nil {
+		return nil, fmt.Errorf("parse ref store URL: %w", err)
+	}
+	switch u.Scheme {
+	case "postgres", "postgresql":
+		return OpenPG(ctx, dbURL)
+	case "sqlite":
+		return nil, fmt.Errorf("ref store scheme %q not implemented yet", u.Scheme)
+	default:
+		return nil, fmt.Errorf("ref store URL scheme %q unsupported (want postgres, postgresql, or sqlite)", u.Scheme)
+	}
+}
+
+// PG implements Store on Postgres.
 type PG struct {
 	pool *pgxpool.Pool
 }
 
-var _ RefStore = (*PG)(nil)
+var _ Store = (*PG)(nil)
 
 // OpenPG connects to pgURL and pings the database.
 func OpenPG(ctx context.Context, pgURL string) (*PG, error) {
@@ -150,10 +191,10 @@ func (s *PG) RegisterPacks(ctx context.Context, repo string, packs []Pack) error
 	assertf(len(packs) > 0, "RegisterPacks called with no packs")
 	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
 		for _, p := range packs {
-			assertf(p.ID != "" && p.S3Key != "", "RegisterPacks: empty pack id/key %+v", p)
+			assertf(p.ID != "" && p.Key != "", "RegisterPacks: empty pack id/key %+v", p)
 			if _, err := tx.Exec(ctx,
 				`INSERT INTO packs (repo, id, s3_key) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
-				repo, p.ID, p.S3Key); err != nil {
+				repo, p.ID, p.Key); err != nil {
 				return err
 			}
 		}
@@ -172,7 +213,7 @@ func (s *PG) ListPacks(ctx context.Context, repo string) ([]Pack, error) {
 	var packs []Pack
 	for rows.Next() {
 		var p Pack
-		if err := rows.Scan(&p.ID, &p.S3Key); err != nil {
+		if err := rows.Scan(&p.ID, &p.Key); err != nil {
 			return nil, err
 		}
 		packs = append(packs, p)

@@ -162,7 +162,7 @@ func HydratePacks(ctx context.Context, st ref.RefStore, bl blob.BlobStore, repoP
 		}
 		packFile := base + ".pack"
 		if _, err := os.Stat(packFile); err != nil {
-			if err := bl.DownloadFile(ctx, p.S3Key, packFile); err != nil {
+			if err := bl.DownloadFile(ctx, p.Key, packFile); err != nil {
 				return err
 			}
 		}

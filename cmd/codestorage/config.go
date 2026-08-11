@@ -47,6 +47,11 @@ type serveConfig struct {
 	pgURL    string
 	blobURL  string
 
+	// dataDir, when set, is the local-mode data directory. Deriving
+	// database/blob/cache locations from it (for slots not set explicitly)
+	// lands with the local backends; until then explicit URLs are required.
+	dataDir string
+
 	// org/orgKeysPath configure single-org serve mode (ADR-8): the /api/v1
 	// HTTP API and the git smart-HTTP path both authenticate against the
 	// org's registered keys. Both are required.
@@ -61,13 +66,14 @@ type serveConfig struct {
 }
 
 // resolveServeConfig merges flags and environment into a validated config.
-func resolveServeConfig(getenv func(string) string, flagListen, flagAddr, flagCacheDir string) (serveConfig, error) {
+func resolveServeConfig(getenv func(string) string, flagListen, flagAddr, flagCacheDir, flagDataDir string) (serveConfig, error) {
 	assertf(getenv != nil, "resolveServeConfig: nil getenv")
 	cfg := serveConfig{
 		listen:      firstNonEmpty(flagListen, flagAddr, getenv(envListen), defaultListen),
 		cacheDir:    firstNonEmpty(flagCacheDir, filepath.Join(os.TempDir(), "codestorage-cache")),
 		pgURL:       envFirst(getenv, envPGURL...),
 		blobURL:     envFirst(getenv, envBlobURL...),
+		dataDir:     flagDataDir,
 		org:         getenv(envOrg),
 		orgKeysPath: getenv(envOrgPubKeys),
 	}

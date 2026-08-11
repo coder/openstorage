@@ -65,10 +65,11 @@ func cmdServe(ctx context.Context, args []string) error {
 	listen := fs.String("listen", "", "listen address (falls back to --addr, then $"+envListen+", then "+defaultListen+")")
 	addr := fs.String("addr", "", "spike-compat alias for --listen")
 	cacheDir := fs.String("cache-dir", "", "rebuildable cache directory for bare repos (default: $TMPDIR/codestorage-cache)")
+	dataDir := fs.String("data-dir", "", "local-mode data directory; derives the database/blob/cache locations for slots not set explicitly")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	cfg, err := resolveServeConfig(os.Getenv, *listen, *addr, *cacheDir)
+	cfg, err := resolveServeConfig(os.Getenv, *listen, *addr, *cacheDir, *dataDir)
 	if err != nil {
 		return err
 	}
@@ -81,7 +82,7 @@ func cmdServe(ctx context.Context, args []string) error {
 		}
 	}
 
-	st, err := ref.OpenPG(ctx, cfg.pgURL)
+	st, err := ref.Open(ctx, cfg.pgURL)
 	if err != nil {
 		return err
 	}
@@ -89,7 +90,7 @@ func cmdServe(ctx context.Context, args []string) error {
 	if err := st.InitSchema(ctx); err != nil {
 		return fmt.Errorf("init ref schema: %w", err)
 	}
-	bl, err := blob.OpenS3(ctx, cfg.blobURL)
+	bl, err := blob.Open(ctx, cfg.blobURL)
 	if err != nil {
 		return err
 	}
@@ -284,7 +285,7 @@ func cmdListPacks(ctx context.Context, args []string) error {
 	if blobURL == "" {
 		return fmt.Errorf("blob URL required: set %s (or legacy %s)", envBlobURL[0], envBlobURL[2])
 	}
-	bl, err := blob.OpenS3(ctx, blobURL)
+	bl, err := blob.Open(ctx, blobURL)
 	if err != nil {
 		return err
 	}
