@@ -24,34 +24,44 @@ func memS3(t *testing.T, key, content string) *S3 {
 
 // Regression for the spike dirOf helper, which panicked on relative and
 // bare-filename destination paths: DownloadFile must handle any dest path.
+// Runs against every gocloud-backed store (mem-backed S3 and file) since the
+// atomic tmp+rename contract is shared.
 func TestDownloadFile_DestPathShapes(t *testing.T) {
 	ctx := context.Background()
 	const content = "pack-bytes"
 
-	tmp := t.TempDir()
-	t.Chdir(tmp)
+	backends := map[string]func(t *testing.T, key, content string) BlobStore{
+		"s3-mem": func(t *testing.T, key, content string) BlobStore { return memS3(t, key, content) },
+		"file":   seededFile,
+	}
+	for backend, seeded := range backends {
+		t.Run(backend, func(t *testing.T) {
+			tmp := t.TempDir()
+			t.Chdir(tmp)
 
-	cases := map[string]string{
-		"absolute":      filepath.Join(tmp, "abs.pack"),
-		"bare filename": "bare.pack",
-		"dot relative":  "./dotrel.pack",
-		"subdirectory":  "sub/nested.pack",
-	}
-	if err := os.Mkdir("sub", 0o755); err != nil {
-		t.Fatal(err)
-	}
-	for name, dest := range cases {
-		t.Run(name, func(t *testing.T) {
-			b := memS3(t, "packs/r/pack-x.pack", content)
-			if err := b.DownloadFile(ctx, "packs/r/pack-x.pack", dest); err != nil {
-				t.Fatalf("DownloadFile(%q): %v", dest, err)
+			cases := map[string]string{
+				"absolute":      filepath.Join(tmp, "abs.pack"),
+				"bare filename": "bare.pack",
+				"dot relative":  "./dotrel.pack",
+				"subdirectory":  "sub/nested.pack",
 			}
-			got, err := os.ReadFile(dest)
-			if err != nil {
+			if err := os.Mkdir("sub", 0o755); err != nil {
 				t.Fatal(err)
 			}
-			if string(got) != content {
-				t.Fatalf("content = %q, want %q", got, content)
+			for name, dest := range cases {
+				t.Run(name, func(t *testing.T) {
+					b := seeded(t, "packs/r/pack-x.pack", content)
+					if err := b.DownloadFile(ctx, "packs/r/pack-x.pack", dest); err != nil {
+						t.Fatalf("DownloadFile(%q): %v", dest, err)
+					}
+					got, err := os.ReadFile(dest)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if string(got) != content {
+						t.Fatalf("content = %q, want %q", got, content)
+					}
+				})
 			}
 		})
 	}
