@@ -41,8 +41,9 @@ func createRepo(t *testing.T, e *testEnv, org, urlClaim string, body []byte, wan
 	return out
 }
 
-func TestCRUDHappyPath(t *testing.T) {
-	e := testEnvironment(t)
+func TestCRUDHappyPath(t *testing.T) { runBackends(t, testCRUDHappyPath) }
+
+func testCRUDHappyPath(t *testing.T, e *testEnv) {
 	org := e.newOrg(t)
 	repoURL := "repo-" + randomHex(t, 8)
 
@@ -152,8 +153,9 @@ func TestCRUDHappyPath(t *testing.T) {
 	createRepo(t, e, org, repoURL, nil, http.StatusConflict)
 }
 
-func TestCreateRepoValidation(t *testing.T) {
-	e := testEnvironment(t)
+func TestCreateRepoValidation(t *testing.T) { runBackends(t, testCreateRepoValidation) }
+
+func testCreateRepoValidation(t *testing.T, e *testEnv) {
 	org := e.newOrg(t)
 
 	// repo claim "org" / "" are not repo-scoped: requireAuth rejects them
@@ -190,7 +192,10 @@ func TestCreateRepoValidation(t *testing.T) {
 // per-repo routes: tokens whose repo claim is empty or "org" get 403 — never
 // a 500 (regression: empty claims previously reached the store and panicked).
 func TestPerRepoRoutesRejectNonRepoClaims(t *testing.T) {
-	e := testEnvironment(t)
+	runBackends(t, testPerRepoRoutesRejectNonRepoClaims)
+}
+
+func testPerRepoRoutesRejectNonRepoClaims(t *testing.T, e *testEnv) {
 	org := e.newOrg(t)
 
 	routes := []struct {
@@ -222,8 +227,9 @@ func TestPerRepoRoutesRejectNonRepoClaims(t *testing.T) {
 // policies could deny deleting some ref must not delete the repo; malformed
 // policy claims fail closed on both write endpoints; verify-sig-only and
 // empty-ops policies never block (deletion introduces no commits).
-func TestRefPolicyOnWriteEndpoints(t *testing.T) {
-	e := testEnvironment(t)
+func TestRefPolicyOnWriteEndpoints(t *testing.T) { runBackends(t, testRefPolicyOnWriteEndpoints) }
+
+func testRefPolicyOnWriteEndpoints(t *testing.T, e *testEnv) {
 	org := e.newOrg(t)
 
 	deleteRepo := func(t *testing.T, spec tokenSpec, wantStatus int) {
@@ -277,7 +283,10 @@ func TestRefPolicyOnWriteEndpoints(t *testing.T) {
 // `default_branch` query parameter: used when the body does not specify a
 // branch; the body wins when both are present.
 func TestCreateRepoDefaultBranchQueryParam(t *testing.T) {
-	e := testEnvironment(t)
+	runBackends(t, testCreateRepoDefaultBranchQueryParam)
+}
+
+func testCreateRepoDefaultBranchQueryParam(t *testing.T, e *testEnv) {
 	org := e.newOrg(t)
 
 	getBranch := func(repoURL string) string {
@@ -316,8 +325,9 @@ func TestCreateRepoDefaultBranchQueryParam(t *testing.T) {
 	}
 }
 
-func TestListPaginationAndQ(t *testing.T) {
-	e := testEnvironment(t)
+func TestListPaginationAndQ(t *testing.T) { runBackends(t, testListPaginationAndQ) }
+
+func testListPaginationAndQ(t *testing.T, e *testEnv) {
 	org := e.newOrg(t) // fresh org => deterministic counts
 
 	const total = 25
@@ -420,8 +430,9 @@ func TestListPaginationAndQ(t *testing.T) {
 
 // TestAuthMatrix drives the docs/03 401/403 failure map across all four
 // endpoints, asserting status, envelope shape, and WWW-Authenticate on 401.
-func TestAuthMatrix(t *testing.T) {
-	e := testEnvironment(t)
+func TestAuthMatrix(t *testing.T) { runBackends(t, testAuthMatrix) }
+
+func testAuthMatrix(t *testing.T, e *testEnv) {
 	org := e.newOrg(t)
 	repoURL := "matrix-" + randomHex(t, 6)
 	createRepo(t, e, org, repoURL, nil, http.StatusOK)
@@ -555,8 +566,9 @@ func TestAuthMatrix(t *testing.T) {
 
 // TestJWTPerAlgorithmPositive proves a token signed with each allowed
 // algorithm's registered key authenticates (docs/02 allow-list).
-func TestJWTPerAlgorithmPositive(t *testing.T) {
-	e := testEnvironment(t)
+func TestJWTPerAlgorithmPositive(t *testing.T) { runBackends(t, testJWTPerAlgorithmPositive) }
+
+func testJWTPerAlgorithmPositive(t *testing.T, e *testEnv) {
 	org := e.newOrg(t)
 	repoURL := "alg-" + randomHex(t, 6)
 	createRepo(t, e, org, repoURL, nil, http.StatusOK)

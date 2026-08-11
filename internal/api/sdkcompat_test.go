@@ -83,7 +83,10 @@ func TestVendorSDKCompat(t *testing.T) {
 		t.Skipf("vendor Go SDK not found at %s (set CODESTORAGE_SDK_DIR to run the compatibility test): %v", sdkDir, err)
 	}
 
-	e := testEnvironment(t)
+	runBackends(t, func(t *testing.T, e *testEnv) { testVendorSDKCompat(t, e, sdkDir) })
+}
+
+func testVendorSDKCompat(t *testing.T, e *testEnv, sdkDir string) {
 	org := e.newOrg(t)
 	tmp := t.TempDir()
 

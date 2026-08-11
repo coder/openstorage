@@ -1,12 +1,16 @@
 package api
 
-// Shared integration-test environment: one Postgres testcontainer (started
-// lazily so container-free unit tests run without Docker), one in-process
-// API server on 127.0.0.1:0, and runtime-generated signing keys for every
-// allowed JWT algorithm (never committed).
+// Shared integration-test environments, one per storage backend lane:
+// the pg lane boots one Postgres testcontainer (started lazily so
+// container-free lanes run without Docker), the sqlite lane opens a
+// temp-dir DB file (zero containers). Each lane gets an in-process API
+// server on 127.0.0.1:0 and runtime-generated signing keys for every
+// allowed JWT algorithm (never committed); integration tests fan out over
+// both lanes via runBackends.
 //
-// newTestDeps wires the PRODUCTION implementations (meta.OpenPG,
-// auth.NewVerifier) so the integration matrix covers the code that ships.
+// newTestDeps wires the PRODUCTION implementations (meta.Open scheme
+// dispatch, auth.NewVerifier) so the integration matrix covers the code
+// that ships.
 
 import (
 	"bytes"
@@ -25,6 +29,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -55,18 +60,26 @@ type testEnv struct {
 	keys  *testKeys
 }
 
-var (
-	envOnce sync.Once
-	envErr  error
-	env     *testEnv
+// backendState lazily boots one backend lane exactly once; the boot error
+// is sticky so every subtest of a broken lane fails with the same cause.
+type backendState struct {
+	once sync.Once
+	env  *testEnv
+	err  error
+}
 
-	envCleanup []func()
-)
+// backendStates holds the per-lane singletons keyed by backend name.
+var backendStates = map[string]*backendState{
+	"pg":     {},
+	"sqlite": {},
+}
 
-// newTestDeps builds the production meta.Store and auth.Verifier driving
-// the integration matrix.
-func newTestDeps(ctx context.Context, pgURL string) (meta.Store, auth.Verifier, error) {
-	store, err := meta.OpenPG(ctx, pgURL)
+var envCleanup []func()
+
+// newTestDeps builds the production meta backend (URL-scheme dispatch via
+// meta.Open) and auth.Verifier driving the integration matrix.
+func newTestDeps(ctx context.Context, metaURL string) (meta.Store, auth.Verifier, error) {
+	store, err := meta.Open(ctx, metaURL)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -76,6 +89,35 @@ func newTestDeps(ctx context.Context, pgURL string) (meta.Store, auth.Verifier, 
 	}
 	envCleanup = append(envCleanup, store.Close)
 	return store, auth.NewVerifier(store), nil
+}
+
+// backendMetaURL resolves the metadata store URL for one backend lane:
+// pg boots a Postgres testcontainer exactly as before, sqlite derives a
+// temp-dir DB file URL (zero containers).
+func backendMetaURL(ctx context.Context, backend string) (string, error) {
+	switch backend {
+	case "pg":
+		pgC, err := tcpostgres.Run(ctx, "postgres:17-alpine",
+			tcpostgres.WithDatabase("postgres"),
+			tcpostgres.WithUsername("postgres"),
+			tcpostgres.WithPassword("postgres"),
+			tcpostgres.BasicWaitStrategies(),
+		)
+		if err != nil {
+			return "", fmt.Errorf("start postgres container: %w", err)
+		}
+		envCleanup = append(envCleanup, func() { _ = pgC.Terminate(ctx) })
+		return pgC.ConnectionString(ctx, "sslmode=disable")
+	case "sqlite":
+		dir, err := os.MkdirTemp("", "codestorage-api-sqlite-*")
+		if err != nil {
+			return "", err
+		}
+		envCleanup = append(envCleanup, func() { _ = os.RemoveAll(dir) })
+		return "sqlite://" + filepath.Join(dir, "meta.db"), nil
+	default:
+		panic("backendMetaURL: unknown backend " + backend)
+	}
 }
 
 func generateTestKeys() (*testKeys, error) {
@@ -111,39 +153,32 @@ func generateTestKeys() (*testKeys, error) {
 	return keys, nil
 }
 
-// testEnvironment lazily boots the PG container + in-process server.
-func testEnvironment(t *testing.T) *testEnv {
+// testEnvironment lazily boots the named backend lane (PG container or
+// temp-dir sqlite DB) + in-process server, once per lane.
+func testEnvironment(t *testing.T, backend string) *testEnv {
 	t.Helper()
-	envOnce.Do(func() {
+	state, ok := backendStates[backend]
+	if !ok {
+		t.Fatalf("unknown backend %q", backend)
+	}
+	state.once.Do(func() {
 		ctx := context.Background()
 
-		pgC, err := tcpostgres.Run(ctx, "postgres:17-alpine",
-			tcpostgres.WithDatabase("postgres"),
-			tcpostgres.WithUsername("postgres"),
-			tcpostgres.WithPassword("postgres"),
-			tcpostgres.BasicWaitStrategies(),
-		)
+		metaURL, err := backendMetaURL(ctx, backend)
 		if err != nil {
-			envErr = fmt.Errorf("start postgres container: %w", err)
-			return
-		}
-		envCleanup = append(envCleanup, func() { _ = pgC.Terminate(ctx) })
-
-		pgURL, err := pgC.ConnectionString(ctx, "sslmode=disable")
-		if err != nil {
-			envErr = err
+			state.err = err
 			return
 		}
 
-		store, verifier, err := newTestDeps(ctx, pgURL)
+		store, verifier, err := newTestDeps(ctx, metaURL)
 		if err != nil {
-			envErr = err
+			state.err = err
 			return
 		}
 
 		keys, err := generateTestKeys()
 		if err != nil {
-			envErr = err
+			state.err = err
 			return
 		}
 
@@ -155,12 +190,23 @@ func testEnvironment(t *testing.T) *testEnv {
 		}))
 		envCleanup = append(envCleanup, srv.Close)
 
-		env = &testEnv{store: store, srv: srv, keys: keys}
+		state.env = &testEnv{store: store, srv: srv, keys: keys}
 	})
-	if envErr != nil {
-		t.Fatalf("test environment: %v", envErr)
+	if state.err != nil {
+		t.Fatalf("%s test environment: %v", backend, state.err)
 	}
-	return env
+	return state.env
+}
+
+// runBackends fans an integration test out over every storage backend lane:
+// t.Run("pg") (lazy testcontainer) and t.Run("sqlite") (temp-dir DB, zero
+// containers). Each lane environment boots on first use.
+func runBackends(t *testing.T, fn func(t *testing.T, e *testEnv)) {
+	for _, backend := range []string{"pg", "sqlite"} {
+		t.Run(backend, func(t *testing.T) {
+			fn(t, testEnvironment(t, backend))
+		})
+	}
 }
 
 func TestMain(m *testing.M) {
