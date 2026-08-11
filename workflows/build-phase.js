@@ -24,6 +24,7 @@ export const meta = {
       ]),
       brief: s.optional(s.string()),
       maxFixRounds: s.optional(s.number()),
+      isolated: s.optional(s.boolean()),
     },
     { additionalProperties: false }
   ),
@@ -249,6 +250,15 @@ function dogfoodSchema() {
 export default function workflow({ args, phase, log, agent, parallel, applyPatch }) {
   const spec = PHASES[args.phase];
   const maxFix = Math.max(1, Math.min(args.maxFixRounds ?? 2, 4));
+  // isolated=false (default): local/shared-working-tree runtime. Child agents write directly
+  // into this checkout, so patch fan-in is a no-op (skipped) and write fan-out is serialized.
+  // Set isolated=true only in a worktree-isolated workspace to enable true parallel implement.
+  const isolated = args.isolated ?? false;
+  const applyChildPatch = (id, agentId) => {
+    if (!isolated) return; // shared working tree: child changes are already on disk
+    const res = applyPatch({ id, agentId });
+    if (!res.success) log(`patch not applied cleanly: ${agentId}`, { status: res.status ?? res.error });
+  };
   const operatorBrief = args.brief ? `\n\nOperator guidance for this phase:\n${args.brief}` : "";
 
   // ---- Plan ----
@@ -293,8 +303,7 @@ export default function workflow({ args, phase, log, agent, parallel, applyPatch
         timeout: { softMs: 45 * 60_000, graceMs: 5 * 60_000, finalInstructions: "Ensure what exists compiles; list unfinished contracts explicitly." },
       }
     );
-    const foundationApplied = applyPatch({ id: "apply-foundation", agentId: "implement-foundation" });
-    if (!foundationApplied.success) log("foundation patch not applied cleanly", { status: foundationApplied.status ?? foundationApplied.error });
+    applyChildPatch("apply-foundation", "implement-foundation");
   }
 
   // ---- Parallel slice implementation (fan-out) ----
@@ -302,7 +311,11 @@ export default function workflow({ args, phase, log, agent, parallel, applyPatch
   const sliceSummaries = parallel(
     slicing.slices.map((sl, i) => () =>
       agent(
-        `Implement ONE slice of a larger plan. Sibling agents are implementing other slices CONCURRENTLY.\n\n` +
+        `Implement ONE slice of a larger plan. ` +
+          (isolated
+            ? `Sibling agents are implementing other slices CONCURRENTLY in isolated worktrees.\n\n`
+            : `Slices run SEQUENTIALLY in a SHARED working tree; earlier slices' changes are already present. ` +
+              `Stay on the current branch — never git reset, rebase, or switch branches; keep scratch files in /tmp.\n\n`) +
           `Your slice: ${sl.name}\n${sl.description}\n\nFile ownership (STRICT): you may create/modify ONLY files ` +
           `under: ${sl.ownedPaths.join(", ")}. Foundation code and files owned by other slices are read-only frozen ` +
           `contracts — if your slice seems to require changing them, do NOT change them; implement what you can and ` +
@@ -316,14 +329,13 @@ export default function workflow({ args, phase, log, agent, parallel, applyPatch
         }
       )
     ),
-    { maxParallel: 4 }
+    { maxParallel: isolated ? 4 : 1 }
   );
 
   // ---- Fan-in: apply slice patches sequentially, then integrate ----
   phase("integrate-slices", { slices: sliceIds });
   for (let i = 0; i < sliceIds.length; i++) {
-    const sliceApplied = applyPatch({ id: `apply-slice-${sliceIds[i]}`, agentId: `implement-slice-${sliceIds[i]}` });
-    if (!sliceApplied.success) log(`slice patch not applied cleanly: ${sliceIds[i]}`, { status: sliceApplied.status ?? sliceApplied.error });
+    applyChildPatch(`apply-slice-${sliceIds[i]}`, `implement-slice-${sliceIds[i]}`);
   }
   const implementSummary = agent(
     `Integrate the just-applied parallel implementation slices into a coherent whole. Fix compile errors, import/` +
@@ -337,8 +349,7 @@ export default function workflow({ args, phase, log, agent, parallel, applyPatch
       timeout: { softMs: 45 * 60_000, graceMs: 5 * 60_000, finalInstructions: "Prioritize a green build; list any unresolved integration issues explicitly." },
     }
   );
-  const integrationApplied = applyPatch({ id: "apply-integrate", agentId: "integrate-slices" });
-  if (!integrationApplied.success) log("integration patch not applied cleanly", { status: integrationApplied.status ?? integrationApplied.error });
+  applyChildPatch("apply-integrate", "integrate-slices");
 
   // ---- Verify loop (verify and fix are separate agents; bounded rounds) ----
   let verify = null;
@@ -358,8 +369,7 @@ export default function workflow({ args, phase, log, agent, parallel, applyPatch
         JSON.stringify(verify.failures, null, 2),
       { id: `fix-${round}`, title: `Fix round ${round + 1}` }
     );
-    const fixApplied = applyPatch({ id: `apply-fix-${round}`, agentId: `fix-${round}` });
-    if (!fixApplied.success) log(`fix round ${round + 1} patch not applied cleanly`, { status: fixApplied.status ?? fixApplied.error });
+    applyChildPatch(`apply-fix-${round}`, `fix-${round}`);
   }
   if (!verify.passed) {
     return gateReport(agent, phase, args.phase, spec, {
@@ -398,8 +408,7 @@ export default function workflow({ args, phase, log, agent, parallel, applyPatch
         JSON.stringify(blocking, null, 2),
       { id: "fix-findings", title: "Fix review findings" }
     );
-    const findingsApplied = applyPatch({ id: "apply-fix-findings", agentId: "fix-findings" });
-    if (!findingsApplied.success) log("findings patch not applied cleanly", { status: findingsApplied.status ?? findingsApplied.error });
+    applyChildPatch("apply-fix-findings", "fix-findings");
     verify = agent(
       `Re-run the full validation suite after review fixes. Do NOT fix anything; report honestly with all commands run.`,
       { id: "verify-after-findings", schema: verifySchema(), title: "Re-verify after review fixes" }
@@ -436,8 +445,7 @@ export default function workflow({ args, phase, log, agent, parallel, applyPatch
       `docs/07-implementation-roadmap.md phase status. Match existing docs tone; no marketing fluff.\n\nWhat was built:\n${implementSummary}`,
     { id: "document", title: "Document phase" }
   );
-  const docsApplied = applyPatch({ id: "apply-document", agentId: "document" });
-  if (!docsApplied.success) log("docs patch not applied cleanly", { status: docsApplied.status ?? docsApplied.error });
+  applyChildPatch("apply-document", "document");
 
   // ---- Gate ----
   const unresolvedBlocking = recheck ? recheck.unresolved.length : 0;
