@@ -25,6 +25,11 @@ type Server struct {
 	CacheDir string
 	PubKey   *ecdsa.PublicKey
 	TestMode bool
+	// ResolveRepoURL (optional) maps the repo_id path element (docs/05 URL
+	// style) to the repo's url value so tokens carrying the url claim
+	// (docs/02) authenticate. ok=false when the repo_id is unknown. When
+	// nil, only tokens whose claim equals the path element verbatim match.
+	ResolveRepoURL func(ctx context.Context, repoID string) (url string, ok bool)
 }
 
 func NewServer(st ref.RefStore, bl blob.BlobStore, cacheDir string, pub *ecdsa.PublicKey) *Server {
@@ -92,8 +97,20 @@ func (s *Server) authenticate(r *http.Request, repo, scope string) (*Claims, int
 	if err != nil {
 		return nil, http.StatusUnauthorized, err
 	}
-	if claims.Repo != BaseRepo(repo) {
-		return nil, http.StatusForbidden, fmt.Errorf("jwt repo claim mismatch")
+	// docs/02: the repo claim carries the repo url (or id); docs/05 paths
+	// address repos by repo_id. Accept a verbatim match, else resolve the
+	// path element to its url and compare.
+	target := BaseRepo(repo)
+	if claims.Repo != target {
+		matched := false
+		if s.ResolveRepoURL != nil {
+			if url, ok := s.ResolveRepoURL(r.Context(), target); ok && claims.Repo == url {
+				matched = true
+			}
+		}
+		if !matched {
+			return nil, http.StatusForbidden, fmt.Errorf("jwt repo claim mismatch")
+		}
 	}
 	if !claims.HasScope(scope) {
 		return nil, http.StatusForbidden, fmt.Errorf("missing scope %s", scope)

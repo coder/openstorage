@@ -58,7 +58,9 @@ type refCommand struct{ old, new, ref string }
 // Refs are never touched here, so a broken ref is impossible.
 func preReceive(ctx context.Context) error {
 	repo := mustEnv(EnvRepo)
-	quarantine := mustEnv("GIT_QUARANTINE_PATH") // fail fast: git guarantees this for pre-receive
+	// git sets GIT_QUARANTINE_PATH only when the client transfers objects;
+	// delete-only pushes invoke pre-receive without it.
+	quarantine := os.Getenv("GIT_QUARANTINE_PATH")
 
 	var commands []refCommand
 	sc := bufio.NewScanner(os.Stdin)
@@ -74,9 +76,13 @@ func preReceive(ctx context.Context) error {
 	assertf(sc.Err() == nil, "pre-receive: reading stdin: %v", sc.Err())
 	assertf(len(commands) > 0, "pre-receive: git invoked hook with no commands")
 
-	packFiles, err := filepath.Glob(filepath.Join(quarantine, "pack", "pack-*.pack"))
-	if err != nil {
-		return err
+	var packFiles []string
+	if quarantine != "" {
+		var err error
+		packFiles, err = filepath.Glob(filepath.Join(quarantine, "pack", "pack-*.pack"))
+		if err != nil {
+			return err
+		}
 	}
 	if len(packFiles) == 0 {
 		// No pack means git received no new objects: a delete-only push or
@@ -146,13 +152,20 @@ func updateHook(ctx context.Context, args []string) error {
 				case "no-push":
 					return fmt.Errorf("policy no-push denies update to %s", refName)
 				case "no-force-push":
-					// Non-fast-forward = old exists, new exists, old is not an
-					// ancestor of new. Deletions are allowed (matches git's
-					// receive.denyNonFastForwards semantics). Safe to check
-					// here: quarantined objects were migrated into the main
-					// store after pre-receive, before update hooks run.
-					if old != ref.ZeroSHA && new != ref.ZeroSHA && !isAncestor(old, new) {
-						return fmt.Errorf("policy no-force-push denies non-fast-forward update to %s", refName)
+					// Rejects any rewind of an existing ref: non-fast-forward
+					// updates AND deletions. docs/02: ref policies are the
+					// only branch-protection mechanism, so allowing deletion
+					// would make the policy trivially bypassable
+					// (delete + re-push = force push). Safe to check here:
+					// quarantined objects were migrated into the main store
+					// after pre-receive, before update hooks run.
+					if old != ref.ZeroSHA {
+						if new == ref.ZeroSHA {
+							return fmt.Errorf("policy no-force-push denies deletion of %s", refName)
+						}
+						if !isAncestor(old, new) {
+							return fmt.Errorf("policy no-force-push denies non-fast-forward update to %s", refName)
+						}
 					}
 				case "verify-sig":
 					return fmt.Errorf("policy verify-sig is not supported by the spike (ref %s)", refName)

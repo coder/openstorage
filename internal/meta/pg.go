@@ -238,6 +238,27 @@ func (s *PG) GetRepoByURL(ctx context.Context, org, url string) (Repo, error) {
 	return r, nil
 }
 
+// GetRepoByID returns the live repo with the given RepoID; ErrNotFound when
+// absent or soft-deleted.
+func (s *PG) GetRepoByID(ctx context.Context, org, repoID string) (Repo, error) {
+	assertf(repoID != "", "GetRepoByID: empty repoID for org %q", org)
+	orgID, err := s.lookupOrgID(ctx, org)
+	if err != nil {
+		return Repo{}, err
+	}
+	r, err := scanRepo(s.pool.QueryRow(ctx,
+		`SELECT `+repoCols+` FROM repos WHERE org_id = $1 AND repo_id = $2 AND deleted_at IS NULL`,
+		orgID, repoID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Repo{}, fmt.Errorf("repo id %q in org %q: %w", repoID, org, ErrNotFound)
+	}
+	if err != nil {
+		return Repo{}, fmt.Errorf("get repo id %q in org %q: %w", repoID, org, err)
+	}
+	assertf(r.DeletedAt == nil, "live-repo query returned soft-deleted row %q", r.RepoID)
+	return r, nil
+}
+
 // SoftDeleteRepo sets deleted_at and returns the affected repo. ErrNotFound
 // when no row exists; ErrAlreadyDeleted when already soft-deleted.
 func (s *PG) SoftDeleteRepo(ctx context.Context, org, url string) (Repo, error) {

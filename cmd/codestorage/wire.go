@@ -26,23 +26,24 @@ import (
 
 // buildAPIHandler opens the metadata store, bootstraps the single org with
 // its PEM public key blocks (idempotent upsert), and returns the /api/v1
-// handler plus a cleanup func. The handler registers full "/api/v1/..."
-// paths, so serve mounts it un-stripped at mux.Handle("/api/v1/", h).
-func buildAPIHandler(ctx context.Context, pgURL, org, httpBaseURL string, orgPEMBlocks []string) (http.Handler, func(), error) {
+// handler, the store (for the git path's repo_id->url resolution), and a
+// cleanup func. The handler registers full "/api/v1/..." paths, so serve
+// mounts it un-stripped at mux.Handle("/api/v1/", h).
+func buildAPIHandler(ctx context.Context, pgURL, org, httpBaseURL string, orgPEMBlocks []string) (http.Handler, meta.Store, func(), error) {
 	assertf(pgURL != "" && org != "" && httpBaseURL != "" && len(orgPEMBlocks) > 0, "buildAPIHandler: missing pgURL/org/httpBaseURL/keys")
 	ms, err := meta.OpenPG(ctx, pgURL)
 	if err != nil {
-		return nil, nil, fmt.Errorf("open metadata store: %w", err)
+		return nil, nil, nil, fmt.Errorf("open metadata store: %w", err)
 	}
 	if err := ms.InitSchema(ctx); err != nil {
 		ms.Close()
-		return nil, nil, fmt.Errorf("init metadata schema: %w", err)
+		return nil, nil, nil, fmt.Errorf("init metadata schema: %w", err)
 	}
 	if _, err := ms.UpsertOrgWithKeys(ctx, org, orgPEMBlocks); err != nil {
 		ms.Close()
-		return nil, nil, fmt.Errorf("bootstrap org %q: %w", org, err)
+		return nil, nil, nil, fmt.Errorf("bootstrap org %q: %w", org, err)
 	}
 	verifier := auth.NewVerifier(ms)
 	h := api.New(api.Config{Store: ms, Verifier: verifier, HTTPBaseURL: httpBaseURL})
-	return h, func() { ms.Close() }, nil
+	return h, ms, func() { ms.Close() }, nil
 }

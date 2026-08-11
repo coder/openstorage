@@ -5,9 +5,8 @@ package api
 // API server on 127.0.0.1:0, and runtime-generated signing keys for every
 // allowed JWT algorithm (never committed).
 //
-// INTEGRATION NOTE: newTestDeps is the single seam wiring the frozen
-// meta.Store/auth.Verifier contracts into these tests; swap in the sibling
-// slice's production constructors here when they land.
+// newTestDeps wires the PRODUCTION implementations (meta.OpenPG,
+// auth.NewVerifier) so the integration matrix covers the code that ships.
 
 import (
 	"bytes"
@@ -64,16 +63,19 @@ var (
 	envCleanup []func()
 )
 
-// newTestDeps builds the meta.Store and auth.Verifier driving the matrix.
-// Currently backed by the test-scoped implementations in this package; see
-// the INTEGRATION NOTE above.
+// newTestDeps builds the production meta.Store and auth.Verifier driving
+// the integration matrix.
 func newTestDeps(ctx context.Context, pgURL string) (meta.Store, auth.Verifier, error) {
-	store, err := openPGMetaStore(ctx, pgURL)
+	store, err := meta.OpenPG(ctx, pgURL)
 	if err != nil {
 		return nil, nil, err
 	}
+	if err := store.InitSchema(ctx); err != nil {
+		store.Close()
+		return nil, nil, err
+	}
 	envCleanup = append(envCleanup, store.Close)
-	return store, &storeVerifier{store: store}, nil
+	return store, auth.NewVerifier(store), nil
 }
 
 func generateTestKeys() (*testKeys, error) {

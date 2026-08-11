@@ -83,6 +83,12 @@ type Store interface {
 	// ErrNotFound when absent or soft-deleted.
 	GetRepoByURL(ctx context.Context, org, url string) (Repo, error)
 
+	// GetRepoByID returns the live repo with the given server-generated
+	// RepoID; ErrNotFound when absent or soft-deleted. Used by the git
+	// smart-HTTP path, whose URLs address repos by repo_id (docs/05) while
+	// JWT `repo` claims carry the url (docs/02).
+	GetRepoByID(ctx context.Context, org, repoID string) (Repo, error)
+
 	// SoftDeleteRepo sets deleted_at and returns the affected repo.
 	// ErrNotFound when no row exists; ErrAlreadyDeleted when already
 	// soft-deleted.

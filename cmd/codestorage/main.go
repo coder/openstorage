@@ -10,6 +10,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"net"
@@ -20,6 +21,7 @@ import (
 
 	"codestorage/internal/auth"
 	"codestorage/internal/blob"
+	"codestorage/internal/meta"
 	"codestorage/internal/ref"
 	"codestorage/internal/spike"
 )
@@ -107,6 +109,7 @@ func cmdServe(ctx context.Context, args []string) error {
 
 	// HTTP API (single-org self-host mode), enabled by CODESTORAGE_ORG.
 	var orgPEMBlocks []string
+	var metaStore meta.Store
 	if cfg.org != "" {
 		pemData, err := os.ReadFile(cfg.orgKeysPath)
 		if err != nil {
@@ -120,11 +123,12 @@ func cmdServe(ctx context.Context, args []string) error {
 		if err != nil {
 			return fmt.Errorf("%s: %w", cfg.orgKeysPath, err)
 		}
-		apiHandler, cleanup, err := buildAPIHandler(ctx, cfg.pgURL, cfg.org, httpBaseURL, orgPEMBlocks)
+		apiHandler, ms, cleanup, err := buildAPIHandler(ctx, cfg.pgURL, cfg.org, httpBaseURL, orgPEMBlocks)
 		if err != nil {
 			return err
 		}
 		defer cleanup()
+		metaStore = ms
 		mux.Handle("/api/v1/", apiHandler)
 		mounted++
 	}
@@ -140,6 +144,21 @@ func cmdServe(ctx context.Context, args []string) error {
 			return err
 		}
 		srv := spike.NewServer(st, bl, cfg.cacheDir, gitPub)
+		if metaStore != nil {
+			// docs/05 git URLs address repos by repo_id while JWT repo
+			// claims carry the url (docs/02): resolve id->url for auth.
+			org := cfg.org
+			srv.ResolveRepoURL = func(ctx context.Context, repoID string) (string, bool) {
+				repo, err := metaStore.GetRepoByID(ctx, org, repoID)
+				if err != nil {
+					if !errors.Is(err, meta.ErrNotFound) {
+						fmt.Fprintf(os.Stderr, "resolve repo id %q: %v\n", repoID, err)
+					}
+					return "", false
+				}
+				return repo.URL, true
+			}
+		}
 		mux.Handle("/", srv.Handler())
 		mounted++
 	} else {

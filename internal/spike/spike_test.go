@@ -659,3 +659,41 @@ func TestForcePush_RejectedPerRef(t *testing.T) {
 		t.Fatalf("PG feature = %q, want %q", got, forcedHead)
 	}
 }
+
+// TestRefPolicy_NoForcePushDeniesDeletion: no-force-push must also reject
+// branch DELETION — ref policies are the only branch-protection mechanism
+// (docs/02), so allowing deletion would make the policy trivially
+// bypassable (delete + re-push = force push). Unpoliced refs stay deletable.
+// The policed ref is deliberately NOT the repo HEAD: deleting HEAD is
+// rejected by git's own receive.denyDeleteCurrent before hooks run.
+func TestRefPolicy_NoForcePushDeniesDeletion(t *testing.T) {
+	repo := "t8-delete-policy"
+	work := initWorkRepo(t)
+	setupToken := mintTestToken(t, repo, "git:read,git:write", "")
+	mustGit(t, work, "push", remoteURL(nodeA, repo, setupToken),
+		"HEAD:refs/heads/main", "HEAD:refs/heads/protected", "HEAD:refs/heads/scratch")
+	head := revParse(t, work, "HEAD")
+
+	nfToken := mintTestToken(t, repo, "git:read,git:write",
+		`[["refs/heads/protected",["no-force-push"]],["*",[]]]`)
+
+	// Deleting the policed branch must be rejected by the policy hook.
+	out, err := tryGit(work, "push", remoteURL(nodeA, repo, nfToken), ":refs/heads/protected")
+	if err == nil {
+		t.Fatalf("deletion of policed branch should be rejected:\n%s", out)
+	}
+	if !regexp.MustCompile(`\[remote rejected\].*(no-force-push|hook declined)`).MatchString(out) {
+		t.Fatalf("protected deletion was not remote-rejected with a policy message:\n%s", out)
+	}
+
+	// Deleting an unpoliced branch with the SAME token must succeed.
+	mustGit(t, work, "push", remoteURL(nodeA, repo, nfToken), ":refs/heads/scratch")
+
+	refs := pgRefs(t, repo)
+	if got := refs["refs/heads/protected"]; got != head {
+		t.Fatalf("PG protected = %q, want unchanged %q", got, head)
+	}
+	if _, exists := refs["refs/heads/scratch"]; exists {
+		t.Fatal("PG still holds refs/heads/scratch after allowed deletion")
+	}
+}

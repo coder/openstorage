@@ -93,9 +93,11 @@ func bearerToken(r *http.Request) (string, bool) {
 
 // requireAuth enforces the docs/02 failure map for one route: missing or
 // unverifiable token -> 401 (+WWW-Authenticate via writeErr); verified token
-// missing the required scope, or a non-"org" repo claim on an org-level
-// route -> 403. On success the verified claims are injected into the
-// request context.
+// missing the required scope, a non-"org" repo claim on an org-level route,
+// or an empty/"org" repo claim on a per-repo route -> 403 (claim mismatch
+// with target). On success the verified claims are injected into the
+// request context; per-repo handlers can rely on a non-empty, non-"org"
+// repo claim.
 func requireAuth(verifier auth.Verifier, requiredScope string, orgLevel bool) middleware {
 	assertf(verifier != nil, "requireAuth: nil verifier")
 	assertf(requiredScope != "", "requireAuth: empty required scope")
@@ -118,6 +120,10 @@ func requireAuth(verifier auth.Verifier, requiredScope string, orgLevel bool) mi
 			}
 			if orgLevel && claims.Repo != auth.RepoClaimOrg {
 				writeErr(w, http.StatusForbidden, "token is not org-scoped")
+				return
+			}
+			if !orgLevel && (claims.Repo == "" || claims.Repo == auth.RepoClaimOrg) {
+				writeErr(w, http.StatusForbidden, "token is not repo-scoped")
 				return
 			}
 			next.ServeHTTP(w, r.WithContext(auth.WithClaims(r.Context(), claims)))

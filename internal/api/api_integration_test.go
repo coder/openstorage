@@ -64,9 +64,17 @@ func TestCRUDHappyPath(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("GET /repo status = %d (body %s)", resp.StatusCode, body)
 	}
-	var got getRepoResponse
+	var got repoEntry
 	if err := json.Unmarshal(body, &got); err != nil {
 		t.Fatal(err)
+	}
+	// openapi.yaml GET /api/v1/repo response schema requires repo_id, url,
+	// default_branch, created_at.
+	if got.RepoID != created.RepoID {
+		t.Fatalf("repo_id = %q, want %q", got.RepoID, created.RepoID)
+	}
+	if got.URL != repoURL {
+		t.Fatalf("url = %q, want %q", got.URL, repoURL)
 	}
 	if got.DefaultBranch != "main" {
 		t.Fatalf("default_branch = %q, want main", got.DefaultBranch)
@@ -148,10 +156,11 @@ func TestCreateRepoValidation(t *testing.T) {
 	e := testEnvironment(t)
 	org := e.newOrg(t)
 
-	// repo claim "org" is not a creatable url.
-	createRepo(t, e, org, auth.RepoClaimOrg, nil, http.StatusBadRequest)
+	// repo claim "org" / "" are not repo-scoped: requireAuth rejects them
+	// with 403 per docs/02 (claim mismatch with target).
+	createRepo(t, e, org, auth.RepoClaimOrg, nil, http.StatusForbidden)
 	// Empty repo claim.
-	createRepo(t, e, org, "", nil, http.StatusBadRequest)
+	createRepo(t, e, org, "", nil, http.StatusForbidden)
 	// Malformed JSON.
 	createRepo(t, e, org, "v-"+randomHex(t, 4), []byte(`{not json`), http.StatusBadRequest)
 	// Invalid default branch.
@@ -168,12 +177,86 @@ func TestCreateRepoValidation(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("GET /repo status = %d", resp.StatusCode)
 	}
-	var got getRepoResponse
+	var got repoEntry
 	if err := json.Unmarshal(body, &got); err != nil {
 		t.Fatal(err)
 	}
 	if got.DefaultBranch != "main" {
 		t.Fatalf("default_branch = %q, want main", got.DefaultBranch)
+	}
+}
+
+// TestPerRepoRoutesRejectNonRepoClaims locks in the docs/02 failure map for
+// per-repo routes: tokens whose repo claim is empty or "org" get 403 — never
+// a 500 (regression: empty claims previously reached the store and panicked).
+func TestPerRepoRoutesRejectNonRepoClaims(t *testing.T) {
+	e := testEnvironment(t)
+	org := e.newOrg(t)
+
+	routes := []struct {
+		name   string
+		method string
+		path   string
+		scope  string
+	}{
+		{"create", http.MethodPost, "/api/v1/repos", auth.ScopeRepoWrite},
+		{"get", http.MethodGet, "/api/v1/repo", auth.ScopeGitRead},
+		{"delete", http.MethodDelete, "/api/v1/repos/delete", auth.ScopeRepoWrite},
+	}
+	for _, rt := range routes {
+		for _, claim := range []string{"", auth.RepoClaimOrg} {
+			name := rt.name + "/claim=" + claim
+			tok := e.mint(t, tokenSpec{iss: org, repo: claim, scopes: []string{rt.scope}})
+			resp, body := e.doReq(t, rt.method, rt.path, tok, nil, "")
+			if resp.StatusCode != http.StatusForbidden {
+				t.Errorf("%s: status = %d, want 403 (body %s)", name, resp.StatusCode, body)
+				continue
+			}
+			requireEnvelope(t, resp, body)
+		}
+	}
+}
+
+// TestCreateRepoDefaultBranchQueryParam covers the openapi.yaml POST /repos
+// `default_branch` query parameter: used when the body does not specify a
+// branch; the body wins when both are present.
+func TestCreateRepoDefaultBranchQueryParam(t *testing.T) {
+	e := testEnvironment(t)
+	org := e.newOrg(t)
+
+	getBranch := func(repoURL string) string {
+		t.Helper()
+		readTok := e.mint(t, tokenSpec{iss: org, repo: repoURL, scopes: []string{auth.ScopeGitRead}})
+		resp, body := e.doReq(t, http.MethodGet, "/api/v1/repo", readTok, nil, "")
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("GET /repo status = %d (body %s)", resp.StatusCode, body)
+		}
+		var got repoEntry
+		if err := json.Unmarshal(body, &got); err != nil {
+			t.Fatal(err)
+		}
+		return got.DefaultBranch
+	}
+	create := func(repoURL, query string, body []byte) {
+		t.Helper()
+		tok := e.mint(t, tokenSpec{iss: org, repo: repoURL, scopes: []string{auth.ScopeRepoWrite}})
+		resp, respBody := e.doReq(t, http.MethodPost, "/api/v1/repos"+query, tok, body, "")
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("create %s status = %d (body %s)", repoURL, resp.StatusCode, respBody)
+		}
+	}
+
+	// Query param alone sets the branch.
+	fromQuery := "q-" + randomHex(t, 4)
+	create(fromQuery, "?default_branch=develop", nil)
+	if got := getBranch(fromQuery); got != "develop" {
+		t.Fatalf("query-only default_branch = %q, want develop", got)
+	}
+	// Body takes precedence over the query param.
+	fromBody := "q-" + randomHex(t, 4)
+	create(fromBody, "?default_branch=develop", []byte(`{"default_branch":"trunk"}`))
+	if got := getBranch(fromBody); got != "trunk" {
+		t.Fatalf("body-vs-query default_branch = %q, want trunk", got)
 	}
 }
 

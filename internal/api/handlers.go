@@ -67,10 +67,8 @@ type createRepoResponse struct {
 func (s *server) handleCreateRepo(w http.ResponseWriter, r *http.Request) {
 	claims := mustClaims(r)
 	url := claims.Repo
-	if url == "" || url == auth.RepoClaimOrg {
-		writeErr(w, http.StatusBadRequest, "repo claim must name the repository to create")
-		return
-	}
+	// requireAuth(orgLevel=false) rejects empty/"org" repo claims with 403.
+	assertf(url != "" && url != auth.RepoClaimOrg, "create: repo claim %q passed requireAuth", url)
 
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBodyBytes))
 	if err != nil {
@@ -91,6 +89,11 @@ func (s *server) handleCreateRepo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	branch := req.DefaultBranch
+	if branch == "" {
+		// openapi.yaml: optional query override, used only when the body
+		// does not already specify a default branch.
+		branch = r.URL.Query().Get("default_branch")
+	}
 	if branch == "" {
 		branch = "main"
 	}
@@ -121,13 +124,10 @@ func (s *server) handleCreateRepo(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-type getRepoResponse struct {
-	DefaultBranch string `json:"default_branch"`
-	CreatedAt     string `json:"created_at"`
-}
-
 // handleGetRepo implements GET /api/v1/repo (scope git:read). The target
-// repo is the JWT `repo` claim; 404 when absent or soft-deleted.
+// repo is the JWT `repo` claim; 404 when absent or soft-deleted. The
+// response schema (openapi.yaml) requires repo_id, url, default_branch,
+// created_at — repoEntry carries exactly those.
 func (s *server) handleGetRepo(w http.ResponseWriter, r *http.Request) {
 	claims := mustClaims(r)
 	repo, err := s.store.GetRepoByURL(r.Context(), claims.Iss, claims.Repo)
@@ -139,7 +139,9 @@ func (s *server) handleGetRepo(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "get repository: "+err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, getRepoResponse{
+	writeJSON(w, http.StatusOK, repoEntry{
+		RepoID:        repo.RepoID,
+		URL:           repo.URL,
 		DefaultBranch: repo.DefaultBranch,
 		CreatedAt:     repo.CreatedAt.UTC().Format(time.RFC3339),
 	})

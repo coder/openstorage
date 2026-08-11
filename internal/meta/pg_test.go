@@ -142,6 +142,17 @@ func TestCreateAndGetRepo(t *testing.T) {
 		t.Errorf("get = %+v, want %+v", got, created)
 	}
 
+	byID, err := testStore.GetRepoByID(ctx, org, created.RepoID)
+	if err != nil {
+		t.Fatalf("GetRepoByID: %v", err)
+	}
+	if byID.URL != created.URL || byID.RepoID != created.RepoID {
+		t.Errorf("get by id = %+v, want %+v", byID, created)
+	}
+	if _, err := testStore.GetRepoByID(ctx, org, "repo_000000000000"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("get absent id err = %v, want ErrNotFound", err)
+	}
+
 	// Duplicate url in the same org -> 409.
 	if _, err := testStore.CreateRepo(ctx, org, "github.com/acme/demo", "main"); !errors.Is(err, ErrAlreadyExists) {
 		t.Errorf("duplicate create err = %v, want ErrAlreadyExists", err)
