@@ -1,0 +1,130 @@
+# HTTP API Reference (v1, SDK-compatible surface)
+
+Base: `https://api.{org}.code.storage/api/v1` (SDKs build `{apiBaseUrl}/api/v{version}`,
+version fixed at 1). All endpoints require `Authorization: Bearer <jwt>` (see
+02-authentication.md). SDKs send a `Code-Storage-Agent` header — `code-storage-sdk/<ver>`
+(TypeScript), `code-storage-py-sdk/<ver>` (Python), `code-storage-go-sdk/<ver>` (Go);
+treat it as informational.
+
+For exhaustive request/response schemas see `upstream/openapi.yaml` (official; also defines
+the parallel `/api/repos/{repo_name}/...` path style). This document is the SDK-verified
+contract with implementation notes the spec lacks.
+
+## Conventions
+
+- **Pagination** (all list endpoints): request `cursor` + `limit` query params (or
+  `pagination: {cursor, limit}` in grep's body); response `next_cursor` (opaque string, null/
+  empty when exhausted) + `has_more` (bool). Docs default limit 20, max 100; SDK-observed
+  server defaults differ per endpoint (files 1000/max 5000, files/metadata 200/max 1000,
+  notes refs 20).
+- **Errors**: `{"error": "<unstable human string>"}` + status code. Write endpoints that move
+  refs return the richer `result` envelope (04-streaming-commit-protocols.md) even on
+  4xx/5xx statuses `[400,401,403,404,408,409,412,422,429,499,500,502,503,504]`.
+- **Booleans in query strings** are literal `"true"` / `"false"`.
+- **Repeated params**: `path` may repeat on diff endpoints; `range` may repeat on blame.
+- **No client retries**: none of the SDKs retry; every error surfaces immediately. Timeouts
+  observed client-side (Python): 30s default, 60s diff/grep, 180s branch-create/merge/
+  merge-preview/commit/tag/restore-commit.
+
+## Endpoint catalog
+
+### Repository lifecycle (`repo:write` / `org:read`)
+
+| Method & path | Scope | Notes |
+|---|---|---|
+| `POST /repos` | repo:write (repo=new id) | Body optional: `{default_branch?, base_repo?}`. `base_repo`: `{provider, owner, name, operation?: "fork", auth?: {token}\|{auth_type:"public"}, ref?, sha?, default_branch?, upstream_host?}`. Providers: `code, github, gitlab, bitbucket, gitea, forgejo, codeberg, sr.ht` (+generic w/ `upstream_host`). 409 = exists. |
+| `GET /repos` | org:read (repo="org") | Query `cursor, limit, q` (case-insensitive substring on repo `url`). → `{repos: [{repo_id, url, default_branch, created_at, base_repo?}], next_cursor, has_more}` |
+| `GET /repo` | git:read (repo from JWT) | → `{default_branch, created_at}`; 404 → SDK returns null |
+| `DELETE /repos/delete` | repo:write | Soft delete + async cleanup. → `{repo_id, message}`; 404 not found; 409 already deleted |
+| `GET /api/repo-urls/{repo_id}` | org:read | (No /v1 prefix; from OpenAPI.) Resolve internal id → `{repo_id, url}`; `url` is the JWT `repo` claim value |
+| `DELETE /repos/base` | repo:write | Detach upstream provider; idempotent (from official docs/OpenAPI, not in SDKs) |
+
+### Git credentials (generic HTTPS upstreams)
+
+| Method & path | Scope | Body → Response |
+|---|---|---|
+| `POST /repos/git-credentials` | repo:write (repo=repoId) | `{repo_id, password, username?}` → `{id}`; 409 = exists |
+| `PUT /repos/git-credentials` | repo:write (repo="org") | `{id, password, username?}` → `{id, created_at}`; 404 |
+| `DELETE /repos/git-credentials` | repo:write (repo="org") | `{id}` → 200/204; 404 |
+
+### Files & trees (`git:read`)
+
+| Method & path | Query/body | Response |
+|---|---|---|
+| `GET /repos/file` | `path` (req), `ref`, `ephemeral`, `ephemeral_base`; headers `Range`, `If-Match`, `If-None-Match`, `If-Modified-Since`, `If-Unmodified-Since`, `If-Range` | Raw blob stream. Status 200/206/304/412/416. Headers: `X-Blob-Sha`, `X-Last-Commit-Sha`, `ETag`, `Last-Modified`, `Accept-Ranges`, `Content-Range`, `Content-Type`, `Content-Length` |
+| `HEAD /repos/file` | same | headers only |
+| `GET /repos/files` | `ref, ephemeral, path, recursive, cursor, limit` | `{paths: [..], ref, entries: [{path, type: blob\|tree\|symlink\|submodule, mode}], next_cursor, has_more}` — trees have no trailing `/`; branch on `type` |
+| `GET /repos/files/metadata` | same | `{files: [{path, mode, size, last_commit_sha, type}], commits: {<sha>: {author, date, message}}, ref, next_cursor, has_more}`. **404 on unborn branch** |
+| `POST /repos/archive` | body `{ref?, include_globs?, exclude_globs?, max_blob_size?, archive?: {prefix}}` | tar.gz stream |
+| `POST /repos/grep` | body `{query: {pattern, case_sensitive?}, ref?, ephemeral?, paths?, file_filters?: {include_globs, exclude_globs, extension_filters}, context?: {before, after}, limits?: {max_lines, max_matches_per_file}, pagination?: {cursor, limit}}` | `{query, repo: {ref, commit}, matches: [{path, lines: [{line_number, text, type: "match"\|context}]}], next_cursor, has_more}` |
+| `GET /repos/blame` | `path` (req), `ref`, `ephemeral`, `range` (repeatable, `git blame -L` specs like `1,10`), `detect_moves` | `{ref, path, commit_sha, lines: [{line_number, commit_sha, original_line_number, original_path, previous_commit_sha?, author_name, author_email, author_time, committer_name, committer_email, committer_time, summary}]}` |
+
+### Branches
+
+| Method & path | Scope | Body/query → Response |
+|---|---|---|
+| `GET /repos/branches` | git:read | `cursor, limit, ephemeral` → `{branches: [{cursor, name, head_sha, created_at}], next_cursor, has_more}` |
+| `POST /repos/branches/create` | git:write | `{target_branch, base_ref?\|base_branch?(deprecated), base_is_ephemeral?, target_is_ephemeral?}` → `{message, target_branch, target_is_ephemeral, commit_sha?}` |
+| `DELETE /repos/branches` | git:write | `{name, ephemeral?}` → `{name, message, ephemeral}`. Refuses default branch (persistent) |
+| `GET /repos/branches/diff` | git:read | `branch` (req), `base?`, `ephemeral?`, `ephemeral_base?`, `path` (repeatable) → `{branch, base, stats: {files, additions, deletions, changes}, files: [FileDiff], filtered_files}` |
+| `POST /repos/merge` | git:write | `{source_branch, target_branch, strategy: merge\|ff_only\|ff_prefer, source_is_ephemeral?, target_is_ephemeral?, expected_target_sha?, commit_message?, author?, committer?, allow_unrelated_histories?, squash?}` → `{result: merge_commit\|fast_forward\|no_op\|squash, commit_sha, tree_sha, source: {branch, ephemeral, sha}, target: {branch, ephemeral, old_sha, new_sha}, merge_base_sha?, promoted_commits}`. Conflict → 409 (+`conflict_paths`, `merge_base_sha`) |
+| `GET /repos/merge/preview` | git:read | `source_branch, target_branch, include_content?` → `{status: clean\|conflicted, result, source_branch, target_branch, source_tip_sha, target_tip_sha, merge_base_sha?, conflict_paths, conflicts: [{path, result\|base\|ours\|theirs: {oid?, content?, truncated, binary}}], filtered_conflicts: [{path, reason}]}`. Read-only |
+
+`FileDiff` = `{path, state (raw letter; SDKs normalize A/M/D/R/C/T/U), old_path?, raw
+(unified diff text), bytes, is_eof, additions, deletions}`; `filtered_files` entries omit
+`raw`/counts (large files filtered unless explicitly requested via `path`).
+
+### Commits
+
+| Method & path | Scope | Notes |
+|---|---|---|
+| `GET /repos/commits` | git:read | `branch?, cursor?, limit?, ephemeral?, path?` → `{commits: [CommitInfo], next_cursor, has_more}`, newest first; defaults to default branch |
+| `GET /repos/commit` | git:read | `sha` (branch name, short or full SHA) → `{commit: CommitInfo & {signature?, payload?}}` (signed commits: armored sig + exact signed payload bytes) |
+| `GET /repos/diff` | git:read | `sha` (req), `baseSha?`, `gitApplyCompatible?`, `path` (repeatable) → `{sha, stats, files: [FileDiff], filtered_files}`. NB: camelCase query params here |
+| `POST /repos/commit-pack` | git:write | NDJSON stream — see 04 |
+| `POST /repos/diff-commit` | git:write | NDJSON stream — see 04 |
+| `POST /repos/restore-commit` | git:write | JSON `{metadata: {target_branch, target_commit_sha, author, commit_message?, expected_head_sha?, committer?}}` → commit ack (04). Creates a *new* commit restoring old tree (history preserved) |
+| `POST /repos/reset-commits` | git:write | In OpenAPI only (not in SDKs): NDJSON metadata stream; same restore-commit family |
+
+`CommitInfo` = `{sha, parent_shas[], message, author_name, author_email, committer_name,
+committer_email, date (RFC3339)}`.
+
+### Tags
+
+| Method & path | Scope | Body/query |
+|---|---|---|
+| `GET /repos/tags` | git:read | `cursor, limit` → `{tags: [{cursor, name, sha}], next_cursor, has_more}` — lexical order; `sha` dereferenced to commit |
+| `POST /repos/tags` | git:write | `{name, target}` → `{name, sha, message}` — lightweight only; name must not start with `refs/` |
+| `DELETE /repos/tags` | git:read+git:write | `{name}` → `{name, message}` — resolves stored ref for lightweight & annotated |
+
+### Notes
+
+| Method & path | Scope | Body/query |
+|---|---|---|
+| `GET /repos/notes` | git:read | `sha` (req), `ref?` → `{sha, note, ref_sha}` |
+| `POST /repos/notes` | git:write | `{sha, action: "add"\|"append", note, ref?, expected_ref_sha?, author?}` → `{sha, target_ref, base_commit?, new_ref_sha, result: {success, status, message?}}`. `add` fails if note exists; `append` creates or appends |
+| `DELETE /repos/notes` | git:write | `{sha, ref?, expected_ref_sha?, author?}` → same envelope |
+| `GET /repos/notes/refs` | git:read | `prefix?` (default `refs/notes/`), `cursor, limit` → `{refs: [{cursor, ref, sha}], prefix, next_cursor, has_more}`. 400 if custom notes refs disabled server-side |
+
+Default notes ref `refs/notes/commits`; bare names resolve to `refs/notes/<name>`.
+
+### Upstream sync
+
+| Method & path | Scope | Notes |
+|---|---|---|
+| `POST /repos/pull-upstream` | git:write | `{ref?}` → **202 Accepted** (async); only for repos with `base_repo` |
+
+## Status-code contract (what clients key on)
+
+| Status | Meaning to clients |
+|---|---|
+| 200/201 | success (201 accepted by SDKs on create endpoints) |
+| 202 | pull-upstream accepted |
+| 206/304/412/416 | file conditional/range results (passed through) |
+| 400 | invalid input; also "custom notes refs not enabled" |
+| 401 / 403 | auth failed / permission or ref-policy denied |
+| 404 | repo/object/branch not found; unborn-branch file metadata |
+| 409 | repo exists, repo already deleted, credential exists, merge conflict, CAS conflict |
+| 412 | CAS precondition failed |
+| 429 | rate limit ("unavailable" to ref-update clients) |
+| 5xx | internal/unavailable; 503 documented for cold-storage warmup on grep/archive |
