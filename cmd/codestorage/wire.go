@@ -6,7 +6,7 @@
 //
 //   - meta.OpenPG / (*meta.PG).InitSchema / (*meta.PG).Close  (internal/meta)
 //   - auth.NewVerifier(store)                                 (internal/auth)
-//   - api.NewHandler(store, verifier)                         (internal/api)
+//   - api.New(api.Config{Store, Verifier, HTTPBaseURL})       (internal/api)
 //
 // If a slice landed different names/signatures, fix the drift HERE only.
 // The `codestorage_stub` build tag swaps in wire_stub.go so the rest of the
@@ -27,8 +27,8 @@ import (
 // its PEM public key blocks (idempotent upsert), and returns the /api/v1
 // handler plus a cleanup func. The handler registers full "/api/v1/..."
 // paths, so serve mounts it un-stripped at mux.Handle("/api/v1/", h).
-func buildAPIHandler(ctx context.Context, pgURL, org string, orgPEMBlocks []string) (http.Handler, func(), error) {
-	assertf(pgURL != "" && org != "" && len(orgPEMBlocks) > 0, "buildAPIHandler: missing pgURL/org/keys")
+func buildAPIHandler(ctx context.Context, pgURL, org, httpBaseURL string, orgPEMBlocks []string) (http.Handler, func(), error) {
+	assertf(pgURL != "" && org != "" && httpBaseURL != "" && len(orgPEMBlocks) > 0, "buildAPIHandler: missing pgURL/org/httpBaseURL/keys")
 	ms, err := meta.OpenPG(ctx, pgURL)
 	if err != nil {
 		return nil, nil, fmt.Errorf("open metadata store: %w", err)
@@ -42,5 +42,6 @@ func buildAPIHandler(ctx context.Context, pgURL, org string, orgPEMBlocks []stri
 		return nil, nil, fmt.Errorf("bootstrap org %q: %w", org, err)
 	}
 	verifier := auth.NewVerifier(ms)
-	return api.NewHandler(ms, verifier), func() { ms.Close() }, nil
+	h := api.New(api.Config{Store: ms, Verifier: verifier, HTTPBaseURL: httpBaseURL})
+	return h, func() { ms.Close() }, nil
 }

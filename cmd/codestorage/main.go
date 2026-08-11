@@ -93,6 +93,15 @@ func cmdServe(ctx context.Context, args []string) error {
 		return err
 	}
 
+	// Listen before building handlers: the default listen address uses an
+	// ephemeral port (127.0.0.1:0), and the API needs the bound address to
+	// build the `http_url` values it returns.
+	ln, err := net.Listen("tcp", cfg.listen)
+	if err != nil {
+		return err
+	}
+	httpBaseURL := "http://" + ln.Addr().String()
+
 	mux := http.NewServeMux()
 	mounted := 0
 
@@ -111,7 +120,7 @@ func cmdServe(ctx context.Context, args []string) error {
 		if err != nil {
 			return fmt.Errorf("%s: %w", cfg.orgKeysPath, err)
 		}
-		apiHandler, cleanup, err := buildAPIHandler(ctx, cfg.pgURL, cfg.org, orgPEMBlocks)
+		apiHandler, cleanup, err := buildAPIHandler(ctx, cfg.pgURL, cfg.org, httpBaseURL, orgPEMBlocks)
 		if err != nil {
 			return err
 		}
@@ -140,10 +149,6 @@ func cmdServe(ctx context.Context, args []string) error {
 	// explicit --jwt-pubkey either loads or errors above.
 	assertf(mounted > 0, "serve resolved a config with nothing mounted")
 
-	ln, err := net.Listen("tcp", cfg.listen)
-	if err != nil {
-		return err
-	}
 	fmt.Printf("listening on %s\n", ln.Addr())
 	return http.Serve(ln, mux)
 }
