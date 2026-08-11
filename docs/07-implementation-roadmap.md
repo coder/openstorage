@@ -37,10 +37,11 @@ git-protocol layers. Everything else (diff, blame, grep, archive, merge) can she
 
 Each phase ends with a dogfooding gate (below) before moving on.
 
-**Phase 0 — de-risk spike: done.** `cmd/codestorage` + `internal/spike` prove the storage
-core end-to-end: git push → packs in S3 → ref CAS in Postgres → clone from a second
-stateless node, with JWT ref-policy enforcement and `+ephemeral`/`+import` namespace
-routing. This replaces the "bare git repositories on disk" core sketched above with
+**Phase 0 — de-risk spike: done.** `cmd/codestorage` + `internal/spike` (promoted to
+`internal/githttp` in phase 2) prove the storage core end-to-end: git push → packs in S3 →
+ref CAS in Postgres → clone from a second stateless node, with JWT ref-policy enforcement
+and `+ephemeral`/`+import` namespace routing. This replaces the "bare git repositories on
+disk" core sketched above with
 **PG as ref authority + S3 as immutable pack storage + rebuildable disk caches**; decisions
 and crash-ordering analysis are recorded in
 [08-spike-implementation-notes.md](08-spike-implementation-notes.md).
@@ -53,14 +54,25 @@ self-host mode (quickstart in the top-level README). Conformance is already SDK-
 the api tests run the vendor's unmodified TypeScript SDK against the in-process server,
 plus a 401/403/404/409 matrix on real Postgres, wired through the production constructors
 rather than test doubles. Decisions are recorded in
-[09-phase1-implementation-notes.md](09-phase1-implementation-notes.md). Phases 2–6 below
+[09-phase1-implementation-notes.md](09-phase1-implementation-notes.md).
+
+**Phase 2 — git smart HTTP: done.** The spike git path was promoted to `internal/githttp`
+and completed as the production surface: git-path auth moved onto the production org-key
+verifier (multi-algorithm, iss-validated; git-only serve mode dropped — `serve` requires
+`CODESTORAGE_ORG` + `CODESTORAGE_ORG_PUBKEYS`), the ref-policy engine gained upstream glob
+semantics, the deprecated `ops` fallback, the ephemeral policy quirk, and `verify-sig`
+backed by an org signing-key registry (`codestorage signing-key`, keyring read fresh from
+Postgres each push). `CODESTORAGE_BASE_URL` makes `http_url` routable behind 0.0.0.0
+binds. Decisions are recorded in
+[10-phase2-implementation-notes.md](10-phase2-implementation-notes.md). Phases 3–6 below
 are not started.
 
 1. **Skeleton + auth — done.** Org registry with public keys; JWT middleware (ES256/RS256/EdDSA,
    claims/scope checks); error envelope; `POST /repos`, `GET /repo`, `GET /repos`,
    `DELETE /repos/delete` on the phase-0 core + metadata DB.
-2. **Git smart HTTP.** upload-pack/receive-pack with JWT basic auth, ref-policy enforcement
-   hooks, ephemeral/import namespace routing. *Gate: real `git clone/push` round-trip.*
+2. **Git smart HTTP — done.** upload-pack/receive-pack with JWT basic auth, ref-policy
+   enforcement hooks, ephemeral/import namespace routing. *Gate: real `git clone/push`
+   round-trip.*
 3. **Read API.** files, files/metadata (incl. unborn-branch 404), file stream with
    conditional/range headers, branches, tags, commits, commit, diff, branches/diff, blame,
    archive, grep (synchronous `git grep` is fine). Cursor pagination everywhere.

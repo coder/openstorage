@@ -33,6 +33,7 @@ signature scheme), which gives high confidence that the extracted spec is correc
 7. [07-implementation-roadmap.md](07-implementation-roadmap.md) — Phased build plan + conformance testing strategy
 8. [08-spike-implementation-notes.md](08-spike-implementation-notes.md) — ADRs from the phase-0 de-risk spike
 9. [09-phase1-implementation-notes.md](09-phase1-implementation-notes.md) — ADRs from phase 1 (skeleton + auth)
+10. [10-phase2-implementation-notes.md](10-phase2-implementation-notes.md) — ADRs from phase 2 (git smart HTTP promotion)
 
 `upstream/` contains verbatim copies of the official OpenAPI spec and doc pages for reference.
 
