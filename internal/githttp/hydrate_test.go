@@ -27,6 +27,31 @@ func TestSyncRefs_DeletesStaleLocalRef(t *testing.T) {
 	}
 }
 
+// A ref replaced across a directory/file boundary (refs/heads/foo deleted,
+// refs/heads/foo/bar created in PG) must sync: deletions have to run before
+// updates and in their own update-ref transaction, because git's files
+// backend rejects the delete+create pair in one transaction.
+func TestSyncRefs_DirectoryFileConflict(t *testing.T) {
+	dir := initWorkRepo(t)
+	head := revParse(t, dir, "HEAD")
+	mustGit(t, dir, "branch", "foo")
+
+	if err := SyncRefs(dir, map[string]string{
+		"refs/heads/main":    head,
+		"refs/heads/foo/bar": head,
+	}); err != nil {
+		t.Fatalf("SyncRefs: %v", err)
+	}
+
+	out := mustGit(t, dir, "for-each-ref", "--format=%(refname) %(objectname)")
+	if strings.Contains(out, "refs/heads/foo "+head) {
+		t.Fatalf("refs/heads/foo survived sync:\n%s", out)
+	}
+	if !strings.Contains(out, "refs/heads/foo/bar "+head) {
+		t.Fatalf("refs/heads/foo/bar missing:\n%s", out)
+	}
+}
+
 // EnsureCacheRepo must repair hooks and config even when HEAD already
 // exists: a crash between `git init` and hook installation (or a deleted
 // hook file) must not yield a receive-pack that bypasses the S3 upload, PG

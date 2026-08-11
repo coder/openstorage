@@ -195,6 +195,28 @@ func SyncRefs(repoPath string, want map[string]string) error {
 		assertf(ok && ref.ValidSHA(sha), "for-each-ref emitted %q", line)
 		have[name] = sha
 	}
+	// Deletions run first, in their own update-ref transaction: git's files
+	// backend cannot delete refs/heads/foo and create refs/heads/foo/bar in
+	// one transaction (the doomed loose ref still blocks the new ref's lock
+	// file), so a D/F rename in PG would wedge local sync forever otherwise.
+	// Partial application is fine — SyncRefs is idempotent over a
+	// rebuildable cache and callers retry. Sorted for deterministic order.
+	var dels []string
+	for name := range have {
+		if _, ok := want[name]; !ok {
+			dels = append(dels, name)
+		}
+	}
+	sort.Strings(dels)
+	if len(dels) > 0 {
+		var b strings.Builder
+		for _, name := range dels {
+			fmt.Fprintf(&b, "delete %s\n", name)
+		}
+		if err := updateRefStdin(repoPath, b.String()); err != nil {
+			return err
+		}
+	}
 	var b strings.Builder
 	// Deterministic order for debuggability.
 	names := make([]string, 0, len(want))
@@ -207,22 +229,25 @@ func SyncRefs(repoPath string, want map[string]string) error {
 			fmt.Fprintf(&b, "update %s %s\n", name, want[name])
 		}
 	}
-	for name := range have {
-		if _, ok := want[name]; !ok {
-			fmt.Fprintf(&b, "delete %s\n", name)
-		}
-	}
 	if b.Len() > 0 {
-		cmd := exec.Command("git", "update-ref", "--stdin")
-		cmd.Dir = repoPath
-		cmd.Stdin = strings.NewReader(b.String())
-		if out, err := cmd.CombinedOutput(); err != nil {
-			return fmt.Errorf("update-ref --stdin: %w: %s", err, strings.TrimSpace(string(out)))
+		if err := updateRefStdin(repoPath, b.String()); err != nil {
+			return err
 		}
 	}
 	// HEAD always points at main (default branch handling is a later phase).
 	if _, err := runGit(repoPath, "symbolic-ref", "HEAD", "refs/heads/main"); err != nil {
 		return err
+	}
+	return nil
+}
+
+// updateRefStdin feeds commands to one `git update-ref --stdin` transaction.
+func updateRefStdin(repoPath, commands string) error {
+	cmd := exec.Command("git", "update-ref", "--stdin")
+	cmd.Dir = repoPath
+	cmd.Stdin = strings.NewReader(commands)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("update-ref --stdin: %w: %s", err, strings.TrimSpace(string(out)))
 	}
 	return nil
 }
