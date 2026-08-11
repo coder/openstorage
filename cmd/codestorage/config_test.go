@@ -57,7 +57,7 @@ func TestResolveServeConfigLegacyEnvCompat(t *testing.T) {
 	if cfg.listen != "127.0.0.1:0" || cfg.cacheDir != "/tmp/cache" {
 		t.Fatalf("spike flags not honored: %+v", cfg)
 	}
-	if cfg.pgURL != "postgres://legacy" || cfg.blobURL != "s3://legacy" {
+	if cfg.dbURL != "postgres://legacy" || cfg.blobURL != "s3://legacy" {
 		t.Fatalf("legacy env not honored: %+v", cfg)
 	}
 }
@@ -76,7 +76,7 @@ func TestResolveServeConfigCanonicalEnv(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.pgURL != "postgres://new" || cfg.blobURL != "s3://new" {
+	if cfg.dbURL != "postgres://new" || cfg.blobURL != "s3://new" {
 		t.Fatalf("CODESTORAGE_* must beat legacy names: %+v", cfg)
 	}
 	if cfg.listen != "127.0.0.1:8199" {
@@ -120,17 +120,97 @@ func TestResolveServeConfigListenPrecedence(t *testing.T) {
 }
 
 func TestResolveServeConfigDataDir(t *testing.T) {
-	env := map[string]string{
-		"PG_URL": "p", "BLOB_URL": "b",
+	orgEnv := map[string]string{
 		"CODESTORAGE_ORG": "o", "CODESTORAGE_ORG_PUBKEYS": "/k",
 	}
-	cfg, err := resolveServeConfig(mapEnv(env), "", "", "", "/data")
-	if err != nil {
-		t.Fatal(err)
+	withOrg := func(extra map[string]string) func(string) string {
+		m := map[string]string{}
+		for k, v := range orgEnv {
+			m[k] = v
+		}
+		for k, v := range extra {
+			m[k] = v
+		}
+		return mapEnv(m)
 	}
-	if cfg.dataDir != "/data" {
-		t.Fatalf("--data-dir must thread through, got %q", cfg.dataDir)
-	}
+
+	t.Run("derives db, blob, and cache slots", func(t *testing.T) {
+		cfg, err := resolveServeConfig(withOrg(nil), "", "", "", "/data")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.dataDir != "/data" {
+			t.Fatalf("--data-dir must thread through, got %q", cfg.dataDir)
+		}
+		if want := "sqlite://" + filepath.Join("/data", "codestorage.db"); cfg.dbURL != want {
+			t.Fatalf("dbURL = %q, want %q", cfg.dbURL, want)
+		}
+		if want := "file://" + filepath.Join("/data", "blobs"); cfg.blobURL != want {
+			t.Fatalf("blobURL = %q, want %q", cfg.blobURL, want)
+		}
+		if want := filepath.Join("/data", "cache"); cfg.cacheDir != want {
+			t.Fatalf("cacheDir = %q, want %q", cfg.cacheDir, want)
+		}
+	})
+
+	t.Run("env sets the data dir", func(t *testing.T) {
+		cfg, err := resolveServeConfig(withOrg(map[string]string{"CODESTORAGE_DATA_DIR": "/envdata"}), "", "", "", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.dataDir != "/envdata" {
+			t.Fatalf("dataDir = %q, want /envdata", cfg.dataDir)
+		}
+		if want := "sqlite://" + filepath.Join("/envdata", "codestorage.db"); cfg.dbURL != want {
+			t.Fatalf("dbURL = %q, want %q", cfg.dbURL, want)
+		}
+	})
+
+	t.Run("flag beats env", func(t *testing.T) {
+		cfg, err := resolveServeConfig(withOrg(map[string]string{"CODESTORAGE_DATA_DIR": "/envdata"}), "", "", "", "/flagdata")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.dataDir != "/flagdata" {
+			t.Fatalf("dataDir = %q, want /flagdata (flag beats env)", cfg.dataDir)
+		}
+	})
+
+	t.Run("explicit slots win over derivation", func(t *testing.T) {
+		cfg, err := resolveServeConfig(withOrg(map[string]string{
+			"CODESTORAGE_PG_URL": "postgres://explicit",
+			"CODESTORAGE_S3_URL": "s3://explicit",
+		}), "", "", "/explicit-cache", "/data")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.dbURL != "postgres://explicit" || cfg.blobURL != "s3://explicit" || cfg.cacheDir != "/explicit-cache" {
+			t.Fatalf("explicit slots must beat derivation: %+v", cfg)
+		}
+		if cfg.dataDir != "/data" {
+			t.Fatalf("dataDir = %q, want /data", cfg.dataDir)
+		}
+	})
+
+	t.Run("relative dir becomes absolute", func(t *testing.T) {
+		cfg, err := resolveServeConfig(withOrg(nil), "", "", "", "rel-data")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !filepath.IsAbs(cfg.dataDir) {
+			t.Fatalf("dataDir %q must be absolute (hook re-exec safety)", cfg.dataDir)
+		}
+		if want := "sqlite://" + filepath.Join(cfg.dataDir, "codestorage.db"); cfg.dbURL != want {
+			t.Fatalf("dbURL = %q, want %q (derived from the absolute dir)", cfg.dbURL, want)
+		}
+	})
+
+	t.Run("no urls and no data dir errors mentioning --data-dir", func(t *testing.T) {
+		_, err := resolveServeConfig(withOrg(nil), "", "", "", "")
+		if err == nil || !strings.Contains(err.Error(), "--data-dir") || !strings.Contains(err.Error(), "CODESTORAGE_DATA_DIR") {
+			t.Fatalf("want error naming --data-dir/CODESTORAGE_DATA_DIR as the local-mode alternative, got %v", err)
+		}
+	})
 }
 
 func TestResolveServeConfigErrors(t *testing.T) {

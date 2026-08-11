@@ -30,9 +30,9 @@ import (
 // verifier (shared with the git path per ADR-8), and a cleanup func. The
 // handler registers full "/api/v1/..." paths, so serve mounts it un-stripped
 // at mux.Handle("/api/v1/", h).
-func buildAPIHandler(ctx context.Context, pgURL, org, httpBaseURL string, orgPEMBlocks []string) (http.Handler, meta.Store, auth.Verifier, func(), error) {
-	assertf(pgURL != "" && org != "" && httpBaseURL != "" && len(orgPEMBlocks) > 0, "buildAPIHandler: missing pgURL/org/httpBaseURL/keys")
-	ms, cleanup, err := openMetaStore(ctx, pgURL)
+func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL string, orgPEMBlocks []string) (http.Handler, meta.Store, auth.Verifier, func(), error) {
+	assertf(dbURL != "" && org != "" && httpBaseURL != "" && len(orgPEMBlocks) > 0, "buildAPIHandler: missing dbURL/org/httpBaseURL/keys")
+	ms, cleanup, err := openMetaStore(ctx, dbURL)
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}
@@ -50,9 +50,9 @@ func buildAPIHandler(ctx context.Context, pgURL, org, httpBaseURL string, orgPEM
 // buildAPIHandler) and the signing-key CLI, which talks to the database
 // directly — there is no HTTP surface for the signing-key registry
 // (docs/02: upstream manages keys in its dashboard).
-func openMetaStore(ctx context.Context, pgURL string) (meta.Store, func(), error) {
-	assertf(pgURL != "", "openMetaStore: empty pgURL")
-	ms, err := meta.Open(ctx, pgURL)
+func openMetaStore(ctx context.Context, dbURL string) (meta.Store, func(), error) {
+	assertf(dbURL != "", "openMetaStore: empty dbURL")
+	ms, err := meta.Open(ctx, dbURL)
 	if err != nil {
 		return nil, nil, fmt.Errorf("open metadata store: %w", err)
 	}

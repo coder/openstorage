@@ -65,7 +65,7 @@ func cmdServe(ctx context.Context, args []string) error {
 	listen := fs.String("listen", "", "listen address (falls back to --addr, then $"+envListen+", then "+defaultListen+")")
 	addr := fs.String("addr", "", "spike-compat alias for --listen")
 	cacheDir := fs.String("cache-dir", "", "rebuildable cache directory for bare repos (default: $TMPDIR/codestorage-cache)")
-	dataDir := fs.String("data-dir", "", "local-mode data directory; derives the database/blob/cache locations for slots not set explicitly")
+	dataDir := fs.String("data-dir", "", "local-mode data directory (falls back to $"+envDataDir+"); derives the database/blob/cache locations for slots not set explicitly")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -76,13 +76,13 @@ func cmdServe(ctx context.Context, args []string) error {
 	// The pre-receive/update hooks re-exec this binary with the server's
 	// inherited environment and read the legacy names (internal/githttp/hook.go),
 	// so propagate the resolved values regardless of which alias set them.
-	for _, kv := range [][2]string{{"PG_URL", cfg.pgURL}, {"BLOB_URL", cfg.blobURL}} {
+	for _, kv := range [][2]string{{"PG_URL", cfg.dbURL}, {"BLOB_URL", cfg.blobURL}} {
 		if err := os.Setenv(kv[0], kv[1]); err != nil {
 			return err
 		}
 	}
 
-	st, err := ref.Open(ctx, cfg.pgURL)
+	st, err := ref.Open(ctx, cfg.dbURL)
 	if err != nil {
 		return err
 	}
@@ -129,7 +129,7 @@ func cmdServe(ctx context.Context, args []string) error {
 	}
 
 	// HTTP API (single-org self-host mode).
-	apiHandler, metaStore, verifier, cleanup, err := buildAPIHandler(ctx, cfg.pgURL, cfg.org, httpBaseURL, orgPEMBlocks)
+	apiHandler, metaStore, verifier, cleanup, err := buildAPIHandler(ctx, cfg.dbURL, cfg.org, httpBaseURL, orgPEMBlocks)
 	if err != nil {
 		return err
 	}

@@ -24,6 +24,7 @@ const (
 	envOrg        = "CODESTORAGE_ORG"
 	envOrgPubKeys = "CODESTORAGE_ORG_PUBKEYS"
 	envBaseURL    = "CODESTORAGE_BASE_URL"
+	envDataDir    = "CODESTORAGE_DATA_DIR"
 
 	defaultListen = "127.0.0.1:0"
 )
@@ -44,12 +45,13 @@ func envFirst(getenv func(string) string, names ...string) string {
 type serveConfig struct {
 	listen   string
 	cacheDir string
-	pgURL    string
+	dbURL    string
 	blobURL  string
 
-	// dataDir, when set, is the local-mode data directory. Deriving
-	// database/blob/cache locations from it (for slots not set explicitly)
-	// lands with the local backends; until then explicit URLs are required.
+	// dataDir, when set, is the local-mode data directory (always absolute):
+	// database/blob/cache locations are derived from it for slots not set
+	// explicitly (sqlite://<dir>/codestorage.db, file://<dir>/blobs,
+	// <dir>/cache). Explicit URLs/flags always win.
 	dataDir string
 
 	// org/orgKeysPath configure single-org serve mode (ADR-8): the /api/v1
@@ -66,22 +68,46 @@ type serveConfig struct {
 }
 
 // resolveServeConfig merges flags and environment into a validated config.
+// Precedence per slot: explicit flag > explicit env > --data-dir derivation
+// (local mode) > built-in default (cacheDir only).
 func resolveServeConfig(getenv func(string) string, flagListen, flagAddr, flagCacheDir, flagDataDir string) (serveConfig, error) {
 	assertf(getenv != nil, "resolveServeConfig: nil getenv")
 	cfg := serveConfig{
 		listen:      firstNonEmpty(flagListen, flagAddr, getenv(envListen), defaultListen),
-		cacheDir:    firstNonEmpty(flagCacheDir, filepath.Join(os.TempDir(), "codestorage-cache")),
-		pgURL:       envFirst(getenv, envPGURL...),
+		cacheDir:    flagCacheDir,
+		dbURL:       envFirst(getenv, envPGURL...),
 		blobURL:     envFirst(getenv, envBlobURL...),
-		dataDir:     flagDataDir,
+		dataDir:     firstNonEmpty(flagDataDir, getenv(envDataDir)),
 		org:         getenv(envOrg),
 		orgKeysPath: getenv(envOrgPubKeys),
 	}
-	if cfg.pgURL == "" {
-		return serveConfig{}, fmt.Errorf("postgres URL required: set %s (or legacy %s)", envPGURL[0], envPGURL[2])
+	if cfg.dataDir != "" {
+		// Absolute up front: hooks re-exec this binary from a different
+		// working directory (the bare cache repo), so relative sqlite/file
+		// URLs would silently point somewhere else across the re-exec.
+		abs, err := filepath.Abs(cfg.dataDir)
+		if err != nil {
+			return serveConfig{}, fmt.Errorf("--data-dir %q: %w", cfg.dataDir, err)
+		}
+		cfg.dataDir = abs
+		if cfg.dbURL == "" {
+			cfg.dbURL = "sqlite://" + filepath.Join(abs, "codestorage.db")
+		}
+		if cfg.blobURL == "" {
+			cfg.blobURL = "file://" + filepath.Join(abs, "blobs")
+		}
+		if cfg.cacheDir == "" {
+			cfg.cacheDir = filepath.Join(abs, "cache")
+		}
+	}
+	if cfg.cacheDir == "" {
+		cfg.cacheDir = filepath.Join(os.TempDir(), "codestorage-cache")
+	}
+	if cfg.dbURL == "" {
+		return serveConfig{}, fmt.Errorf("database URL required: set %s (or legacy %s), or pass --data-dir / set %s for local mode", envPGURL[0], envPGURL[2], envDataDir)
 	}
 	if cfg.blobURL == "" {
-		return serveConfig{}, fmt.Errorf("blob URL required: set %s (or legacy %s)", envBlobURL[0], envBlobURL[2])
+		return serveConfig{}, fmt.Errorf("blob URL required: set %s (or legacy %s), or pass --data-dir / set %s for local mode", envBlobURL[0], envBlobURL[2], envDataDir)
 	}
 	if cfg.org == "" || cfg.orgKeysPath == "" {
 		return serveConfig{}, fmt.Errorf("%s and %s must both be set (single-org serve mode)", envOrg, envOrgPubKeys)
@@ -93,6 +119,8 @@ func resolveServeConfig(getenv func(string) string, flagListen, flagAddr, flagCa
 		}
 		cfg.baseURL = baseURL
 	}
+	assertf(cfg.dbURL != "" && cfg.blobURL != "" && cfg.cacheDir != "", "resolveServeConfig: unresolved slot in %+v", cfg)
+	assertf(cfg.dataDir == "" || filepath.IsAbs(cfg.dataDir), "resolveServeConfig: dataDir %q not absolute", cfg.dataDir)
 	return cfg, nil
 }
 
