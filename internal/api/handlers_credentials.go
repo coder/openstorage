@@ -2,7 +2,7 @@ package api
 
 // git-credentials CRUD (docs/03 "Git credentials", phase-5 workstream C):
 //
-//	POST   /api/v1/repos/git-credentials  repo:write (repo=repoId)  {repo_id, password, username?} -> {id}
+//	POST   /api/v1/repos/git-credentials  repo:write (repo=repoId)  {repo_id?, password, username?} -> {id}
 //	PUT    /api/v1/repos/git-credentials  repo:write (repo="org")   {id, password, username?}      -> {id, created_at}; 404
 //	DELETE /api/v1/repos/git-credentials  repo:write (repo="org")   {id}                           -> 204; 404
 //
@@ -112,22 +112,28 @@ type gcredCreateRequest struct {
 // handleCreateCredential implements POST /api/v1/repos/git-credentials:
 // store one HTTPS credential for the repo's generic upstream. The JWT repo
 // claim must target the same repo as body repo_id (docs/03: repo=repoId).
-// Success is 201 {id} (openapi.yaml; docs/14 deferred #4).
+// The alias POST /api/repos/{repo_name}/git-credentials (openapi.yaml)
+// re-dispatches here with a body that carries NO repo_id, so an absent
+// repo_id falls back to the token's repo claim — requireAuth(orgLevel=false)
+// guarantees it is non-empty and non-"org", and aliasHandler has already
+// matched it against the path name. Success is 201 {id} (openapi.yaml;
+// docs/14 deferred #4).
 func (s *syncServer) handleCreateCredential(w http.ResponseWriter, r *http.Request) {
 	claims := mustClaims(r)
 	var req gcredCreateRequest
 	if !gcredDecodeBody(w, r, &req) {
 		return
 	}
-	if req.RepoID == "" {
-		writeErr(w, http.StatusBadRequest, "repo_id is required")
-		return
-	}
 	if req.Password == "" {
 		writeErr(w, http.StatusBadRequest, "password is required")
 		return
 	}
-	repo, err := meta.ResolveRepoKey(r.Context(), s.store, claims.Iss, req.RepoID)
+	repoKey := req.RepoID
+	if repoKey == "" {
+		repoKey = claims.Repo
+	}
+	assertf(repoKey != "" && repoKey != auth.RepoClaimOrg, "handleCreateCredential: unusable repo key %q", repoKey)
+	repo, err := meta.ResolveRepoKey(r.Context(), s.store, claims.Iss, repoKey)
 	switch {
 	case errors.Is(err, meta.ErrNotFound):
 		writeErr(w, http.StatusNotFound, "repository not found")

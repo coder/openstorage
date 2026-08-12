@@ -42,10 +42,11 @@ func TestCredentialCreate(t *testing.T) {
 		repoID := s.createRepo(t, repoURL, nil)
 		repoToken := s.e.mint(t, tokenSpec{iss: s.org, repo: repoURL, scopes: []string{auth.ScopeRepoWrite}})
 
-		// Validation failures: missing body, missing fields.
+		// Validation failures: missing body, missing fields. (A missing
+		// repo_id is NOT one: it falls back to the token's repo claim,
+		// covered by TestCredentialCreateByPathName.)
 		for name, body := range map[string][]byte{
 			"no body":     nil,
-			"no repo_id":  []byte(`{"password":"p"}`),
 			"no password": []byte(`{"repo_id":"` + repoID + `"}`),
 			"bad JSON":    []byte(`{`),
 		} {
@@ -376,6 +377,32 @@ func TestCredentialPathIDNegatives(t *testing.T) {
 		resp, body = e.doReq(t, http.MethodDelete, putPath, writeTok, nil, "")
 		if resp.StatusCode != http.StatusNoContent {
 			t.Fatalf("final DELETE status %d: %s", resp.StatusCode, body)
+		}
+	})
+}
+
+// TestCredentialCreateByPathName covers POST
+// /api/repos/{repo_name}/git-credentials (openapi.yaml): the body carries
+// {username?, password} and NO repo_id — the alias re-dispatch reaches
+// handleCreateCredential, which falls back to the token's repo claim.
+func TestCredentialCreateByPathName(t *testing.T) {
+	runBackends(t, func(t *testing.T, e *testEnv) {
+		org := e.newOrg(t)
+		repoURL := "team/credalias-" + randomHex(t, 4)
+		createRepo(t, e, org, repoURL, nil, http.StatusOK)
+		writeTok := e.mint(t, tokenSpec{iss: org, repo: repoURL, scopes: []string{auth.ScopeRepoWrite}})
+
+		resp, body := e.doReq(t, http.MethodPost, "/api/repos/"+url.PathEscape(repoURL)+"/git-credentials",
+			writeTok, []byte(`{"username":"git","password":"tok-1"}`), "")
+		if resp.StatusCode != http.StatusCreated {
+			t.Fatalf("alias POST status %d, want 201: %s", resp.StatusCode, body)
+		}
+		var out map[string]string
+		if err := json.Unmarshal(body, &out); err != nil {
+			t.Fatal(err)
+		}
+		if out["id"] == "" {
+			t.Fatalf("alias POST body = %s, want {id}", body)
 		}
 	})
 }

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -146,9 +147,18 @@ func NewRiver(ctx context.Context, pgURL string, deliverer *events.Deliverer, ru
 		return nil, fmt.Errorf("jobs: river migration lock: %w", err)
 	}
 	_, migrateErr := migrator.Migrate(ctx, rivermigrate.DirectionUp, nil)
-	if _, err := lockConn.Exec(ctx, `SELECT pg_advisory_unlock(0x5249564552)`); err != nil {
-		logger.Warn("river migration unlock failed (released with the session)", "err", err)
+	// The unlock must survive ctx cancellation (the very case where Migrate
+	// just failed): releasing a conn that still holds the session lock back
+	// into the pool would poison it — the next boot's pg_advisory_lock on
+	// that pooled conn blocks forever. Unlock on a cancel-free deadline, and
+	// if even that fails, close the conn so Release destroys it instead of
+	// pooling it (the server drops the advisory lock with the session).
+	unlockCtx, cancelUnlock := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	if _, err := lockConn.Exec(unlockCtx, `SELECT pg_advisory_unlock(0x5249564552)`); err != nil {
+		logger.Warn("river migration unlock failed; destroying lock connection", "err", err)
+		_ = lockConn.Conn().Close(unlockCtx)
 	}
+	cancelUnlock()
 	lockConn.Release()
 	if migrateErr != nil {
 		pool.Close()
