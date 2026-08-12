@@ -132,10 +132,12 @@ func TestCASRefEmitsOnePushPerWebhook(t *testing.T) {
 		t.Fatalf("repository object = %v, want {id, url}", got["repository"])
 	}
 	for field, want := range map[string]string{
-		"ref":         "refs/heads/main",
-		"before":      shaA,
-		"after":       shaB,
-		"customer_id": "42",
+		"ref":    "refs/heads/main",
+		"before": shaA,
+		"after":  shaB,
+		// docs/14 deferred #3: customer_id is the org-name string matching
+		// the JWT `iss` claim, not the internal integer org ID.
+		"customer_id": "acme",
 		"pushed_at":   "2026-01-20T10:30:00Z",
 	} {
 		if got[field] != want {

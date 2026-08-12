@@ -288,14 +288,16 @@ func (s *PG) TryBeginSync(ctx context.Context, repoID string) (RepoUpstream, boo
 
 // FinishSync completes the claimed run: increments RunCount (and
 // SuccessCount when success), clears Syncing, returns the updated row.
-// ErrNotFound when the repo was detached mid-run.
+// ErrNotFound when the repo was detached mid-run — or when no run is in
+// flight: the `AND syncing` guard keeps a stale finisher (detached mid-run,
+// then re-attached) from polluting the fresh row's counters.
 func (s *PG) FinishSync(ctx context.Context, repoID string, success bool) (RepoUpstream, error) {
 	assertf(repoID != "", "FinishSync: empty repo id")
 	up, err := scanRepoUpstream(s.pool.QueryRow(ctx,
 		`UPDATE repo_upstreams
 		 SET syncing = false, run_count = run_count + 1,
 		     success_count = success_count + CASE WHEN $2 THEN 1 ELSE 0 END
-		 WHERE repo_id = $1
+		 WHERE repo_id = $1 AND syncing = true
 		 RETURNING `+repoUpstreamCols, repoID, success))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return RepoUpstream{}, fmt.Errorf("upstream for repo %q: %w", repoID, ErrNotFound)

@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -178,7 +179,8 @@ func (s *server) handleCreateRepo(w http.ResponseWriter, r *http.Request) {
 // handleGetRepo implements GET /api/v1/repo (scope git:read). The target
 // repo is the JWT `repo` claim; 404 when absent or soft-deleted. The
 // response schema (openapi.yaml) requires repo_id, url, default_branch,
-// created_at — repoEntry carries exactly those.
+// created_at — repoEntry carries exactly those, plus base_repo when the
+// repo has an upstream link (docs/03, docs/14 deferred #2).
 func (s *server) handleGetRepo(w http.ResponseWriter, r *http.Request) {
 	claims := mustClaims(r)
 	repo, err := s.store.GetRepoByURL(r.Context(), claims.Iss, claims.Repo)
@@ -190,19 +192,50 @@ func (s *server) handleGetRepo(w http.ResponseWriter, r *http.Request) {
 		s.internalErr(w, r, "get repository", err)
 		return
 	}
+	base, err := s.baseRepoOf(r.Context(), repo.RepoID)
+	if err != nil {
+		s.internalErr(w, r, "resolve base_repo", err)
+		return
+	}
 	writeJSON(w, http.StatusOK, repoEntry{
 		RepoID:        repo.RepoID,
 		URL:           repo.URL,
 		DefaultBranch: repo.DefaultBranch,
 		CreatedAt:     repo.CreatedAt.UTC().Format(time.RFC3339),
+		BaseRepo:      base,
 	})
 }
 
+// baseRepoEntry is the GET-response `base_repo` object (docs/03): the
+// upstream coordinates a synced repo mirrors.
+type baseRepoEntry struct {
+	Provider string `json:"provider"`
+	Owner    string `json:"owner"`
+	Name     string `json:"name"`
+}
+
+// baseRepoOf resolves the repo's repo_upstreams row to the response
+// base_repo object; nil (field omitted) when the repo has no upstream.
+func (s *server) baseRepoOf(ctx context.Context, repoID string) (*baseRepoEntry, error) {
+	assertf(repoID != "", "baseRepoOf: empty repo id")
+	up, err := s.store.GetRepoUpstream(ctx, repoID)
+	if errors.Is(err, meta.ErrNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	assertf(up.Provider != "" && up.Owner != "" && up.Name != "",
+		"upstream row for %q has empty coordinates: %+v", repoID, up)
+	return &baseRepoEntry{Provider: up.Provider, Owner: up.Owner, Name: up.Name}, nil
+}
+
 type repoEntry struct {
-	RepoID        string `json:"repo_id"`
-	URL           string `json:"url"`
-	DefaultBranch string `json:"default_branch"`
-	CreatedAt     string `json:"created_at"`
+	RepoID        string         `json:"repo_id"`
+	URL           string         `json:"url"`
+	DefaultBranch string         `json:"default_branch"`
+	CreatedAt     string         `json:"created_at"`
+	BaseRepo      *baseRepoEntry `json:"base_repo,omitempty"`
 }
 
 type listReposResponse struct {
@@ -252,11 +285,19 @@ func (s *server) handleListRepos(w http.ResponseWriter, r *http.Request) {
 
 	entries := make([]repoEntry, 0, len(res.Repos))
 	for _, repo := range res.Repos {
+		// Per-repo upstream lookup (docs/14 deferred #2); pages are capped
+		// at 100 entries, keeping the N+1 bounded.
+		base, err := s.baseRepoOf(r.Context(), repo.RepoID)
+		if err != nil {
+			s.internalErr(w, r, "resolve base_repo", err)
+			return
+		}
 		entries = append(entries, repoEntry{
 			RepoID:        repo.RepoID,
 			URL:           repo.URL,
 			DefaultBranch: repo.DefaultBranch,
 			CreatedAt:     repo.CreatedAt.UTC().Format(time.RFC3339),
+			BaseRepo:      base,
 		})
 	}
 	writeJSON(w, http.StatusOK, listReposResponse{

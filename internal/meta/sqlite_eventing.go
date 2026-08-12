@@ -337,7 +337,9 @@ func (s *SQLite) TryBeginSync(ctx context.Context, repoID string) (RepoUpstream,
 
 // FinishSync completes the claimed run: increments RunCount (and
 // SuccessCount when success), clears Syncing, returns the updated row.
-// ErrNotFound when the repo was detached mid-run.
+// ErrNotFound when the repo was detached mid-run — or when no run is in
+// flight: the `AND syncing` guard keeps a stale finisher (detached mid-run,
+// then re-attached) from polluting the fresh row's counters.
 func (s *SQLite) FinishSync(ctx context.Context, repoID string, success bool) (RepoUpstream, error) {
 	assertf(repoID != "", "FinishSync: empty repo id")
 	successInc := 0
@@ -349,7 +351,7 @@ func (s *SQLite) FinishSync(ctx context.Context, repoID string, success bool) (R
 		res, err := tx.ExecContext(ctx,
 			`UPDATE repo_upstreams
 			 SET syncing = 0, run_count = run_count + 1, success_count = success_count + ?
-			 WHERE repo_id = ?`, successInc, repoID)
+			 WHERE repo_id = ? AND syncing = 1`, successInc, repoID)
 		if err != nil {
 			return err
 		}

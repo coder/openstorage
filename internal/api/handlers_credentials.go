@@ -112,6 +112,7 @@ type gcredCreateRequest struct {
 // handleCreateCredential implements POST /api/v1/repos/git-credentials:
 // store one HTTPS credential for the repo's generic upstream. The JWT repo
 // claim must target the same repo as body repo_id (docs/03: repo=repoId).
+// Success is 201 {id} (openapi.yaml; docs/14 deferred #4).
 func (s *syncServer) handleCreateCredential(w http.ResponseWriter, r *http.Request) {
 	claims := mustClaims(r)
 	var req gcredCreateRequest
@@ -155,7 +156,7 @@ func (s *syncServer) handleCreateCredential(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	assertf(cred.ID != "", "credential store returned empty ID")
-	writeJSON(w, http.StatusOK, map[string]string{"id": cred.ID})
+	writeJSON(w, http.StatusCreated, map[string]string{"id": cred.ID})
 }
 
 type gcredUpdateRequest struct {

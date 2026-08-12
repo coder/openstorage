@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
-	"strconv"
 	"strings"
 	"time"
 
@@ -127,7 +126,7 @@ func (s *RefStore) emitPush(ctx context.Context, repoKey, refName, before, after
 			// can be built; the update itself already succeeded.
 			s.logger.Error("push event lost: resolve repo", "repo", repoID, "ref", refName, "err", err)
 		} else {
-			payload := NewPushPayload(repo, refName, before, after, s.now())
+			payload := NewPushPayload(s.org, repo, refName, before, after, s.now())
 			body, err := json.Marshal(payload)
 			assertf(err == nil, "marshal push payload: %v", err)
 			for _, wh := range hooks {
@@ -188,8 +187,10 @@ type PushPayload struct {
 // NewPushPayload builds the push body for one won CAS. before/after come
 // straight from CASRef's old/new, which already use ref.ZeroSHA for
 // create/delete — exactly the docs/06 wire convention. customer_id is the
-// owning org's ID (docs/06: "org/customer id").
-func NewPushPayload(repo meta.Repo, refName, before, after string, pushedAt time.Time) PushPayload {
+// owning org's name — the same string the JWT `iss` claim carries (docs/06
+// "org/customer id"; vendor SDKs compare it against iss).
+func NewPushPayload(org string, repo meta.Repo, refName, before, after string, pushedAt time.Time) PushPayload {
+	assertf(org != "", "NewPushPayload: empty org")
 	assertf(repo.RepoID != "", "NewPushPayload: empty RepoID")
 	assertf(repo.URL != "", "NewPushPayload: repo %s has empty URL", repo.RepoID)
 	assertf(refName != "", "NewPushPayload: empty ref name")
@@ -201,7 +202,7 @@ func NewPushPayload(repo meta.Repo, refName, before, after string, pushedAt time
 		Ref:        refName,
 		Before:     before,
 		After:      after,
-		CustomerID: strconv.FormatInt(repo.OrgID, 10),
+		CustomerID: org,
 		PushedAt:   pushedAt.UTC().Format(time.RFC3339),
 	}
 }

@@ -16,6 +16,7 @@ package api
 // requests for providers the dispatcher does not own.
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -23,6 +24,7 @@ import (
 	neturl "net/url"
 	"strconv"
 	"strings"
+	"time"
 
 	"codestorage/internal/auth"
 	"codestorage/internal/meta"
@@ -202,12 +204,16 @@ func (s *syncServer) handleCreateRepo(w http.ResponseWriter, r *http.Request) {
 
 	if spec != nil {
 		// Order matters: the credential must exist before the first sync
-		// run can start (the queue spawns the worker immediately).
+		// run can start (the queue spawns the worker immediately). Each
+		// post-create failure abandons the fresh repo row (docs/14
+		// deferred #5): without the soft-delete a half-linked live repo
+		// would remain behind a 500.
 		if spec.Auth != nil && spec.Auth.Token != "" {
 			if _, err := s.creds.CreateCredential(r.Context(), upsync.Credential{
 				RepoID:   repo.RepoID,
 				Password: spec.Auth.Token,
 			}); err != nil {
+				s.createAbandon(r.Context(), claims.Iss, url)
 				s.internalErr(w, r, "store base_repo credential", err)
 				return
 			}
@@ -219,6 +225,7 @@ func (s *syncServer) handleCreateRepo(w http.ResponseWriter, r *http.Request) {
 			Name:         spec.Name,
 			UpstreamHost: upstreamHost,
 		}); err != nil {
+			s.createAbandon(r.Context(), claims.Iss, url)
 			s.internalErr(w, r, "store base_repo upstream", err)
 			return
 		}
@@ -227,6 +234,7 @@ func (s *syncServer) handleCreateRepo(w http.ResponseWriter, r *http.Request) {
 			RepoID: repo.RepoID,
 			Ref:    spec.Ref,
 		}); err != nil {
+			s.createAbandon(r.Context(), claims.Iss, url)
 			s.internalErr(w, r, "enqueue first sync", err)
 			return
 		}
@@ -237,6 +245,19 @@ func (s *syncServer) handleCreateRepo(w http.ResponseWriter, r *http.Request) {
 		HTTPURL: s.httpBaseURL + "/" + repo.RepoID + ".git",
 		Message: "repository created",
 	})
+}
+
+// createAbandon soft-deletes the repo row a failed post-CreateRepo step
+// left behind, mirroring (*server).forkAbandon: the failure may BE the
+// request context's cancellation, so detach from it (bounded) instead of
+// orphaning the row with a context.Canceled soft-delete.
+func (s *syncServer) createAbandon(ctx context.Context, org, url string) {
+	assertf(org != "" && url != "", "createAbandon: empty org/url")
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
+	if _, err := s.store.SoftDeleteRepo(ctx, org, url); err != nil {
+		s.logger.Error("abandon failed create", "org", org, "url", url, "err", err)
+	}
 }
 
 type usyncPullUpstreamRequest struct {
@@ -316,10 +337,17 @@ func (s *syncServer) handlePullUpstream(w http.ResponseWriter, r *http.Request) 
 		s.internalErr(w, r, "load upstream", err)
 		return
 	}
+	syncRef := req.Ref
+	if syncRef == "" {
+		// docs/14 deferred #8: an omitted ref targets the repo's default
+		// branch instead of flowing empty into the sync job.
+		syncRef = repo.DefaultBranch
+		assertf(syncRef != "", "repo %s has empty default branch", repo.RepoID)
+	}
 	if err := s.queue.EnqueueSync(r.Context(), upsync.Job{
 		Org:    claims.Iss,
 		RepoID: repo.RepoID,
-		Ref:    req.Ref,
+		Ref:    syncRef,
 	}); err != nil {
 		s.internalErr(w, r, "enqueue sync", err)
 		return

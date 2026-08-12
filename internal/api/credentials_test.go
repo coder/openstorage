@@ -20,8 +20,9 @@ func gcredCreate(t *testing.T, s *usyncStack, repoURL, repoID string) string {
 	token := s.e.mint(t, tokenSpec{iss: s.org, repo: repoURL, scopes: []string{auth.ScopeRepoWrite}})
 	body := []byte(`{"repo_id":"` + repoID + `","username":"git","password":"tok-1"}`)
 	resp, respBody := s.req(t, http.MethodPost, "/api/v1/repos/git-credentials", token, body)
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("create credential status %d: %s", resp.StatusCode, respBody)
+	// 201 per openapi.yaml (docs/14 deferred #4).
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create credential status %d, want 201: %s", resp.StatusCode, respBody)
 	}
 	var out map[string]string
 	if err := json.Unmarshal(respBody, &out); err != nil {

@@ -90,6 +90,7 @@ var providerHosts = map[string]string{
 	"bitbucket": "bitbucket.org",
 	"codeberg":  "codeberg.org",
 	"sr.ht":     "git.sr.ht",
+	"sourcehut": "git.sr.ht", // openapi enum alias for sr.ht (docs/14 deferred #1)
 	"gitea":     "",
 	"forgejo":   "",
 }
