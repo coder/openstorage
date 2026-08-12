@@ -541,4 +541,3 @@ func TestPullUpstreamAndDetachWithoutBase(t *testing.T) {
 		}
 	})
 }
-
