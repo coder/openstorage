@@ -44,6 +44,8 @@ import (
 // fallback, which stays the single source of truth for its own validation
 // and error mapping.
 func (s *server) forkAwareCreateRepo(verifier auth.Verifier, fallback http.HandlerFunc) http.HandlerFunc {
+	assertf(s != nil && s.store != nil && s.refStore != nil && s.blobStore != nil && s.logger != nil,
+		"forkAwareCreateRepo: nil server deps")
 	assertf(verifier != nil, "forkAwareCreateRepo: nil verifier")
 	assertf(fallback != nil, "forkAwareCreateRepo: nil fallback")
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -89,6 +91,8 @@ func (s *server) forkAwareCreateRepo(verifier auth.Verifier, fallback http.Handl
 // after the repo row exists soft-delete it (forkAbandon) so no orphaned
 // live repo remains.
 func (s *server) handleForkRepo(w http.ResponseWriter, r *http.Request, verifier auth.Verifier, req *createRepoRequest, spec *usyncBaseRepo) {
+	assertf(s != nil && s.store != nil && s.refStore != nil && s.blobStore != nil && s.cacheDir != "",
+		"handleForkRepo: nil server deps")
 	assertf(verifier != nil && req != nil && spec != nil, "handleForkRepo: nil inputs")
 	assertf(spec.Operation == "fork" && (spec.Provider == "code" || spec.Provider == "code.storage"),
 		"handleForkRepo: mis-dispatched base_repo provider %q operation %q", spec.Provider, spec.Operation)
@@ -285,6 +289,7 @@ func (s *server) handleForkRepo(w http.ResponseWriter, r *http.Request, verifier
 // original failure is what the client sees; a second fault here is only
 // logged.
 func (s *server) forkAbandon(ctx context.Context, org, url string) {
+	assertf(s != nil && s.store != nil && s.logger != nil, "forkAbandon: nil server deps")
 	assertf(org != "" && url != "", "forkAbandon: empty org/url")
 	// The post-create failure may BE the request context's cancellation or
 	// timeout; detach from it (bounded) so the soft-delete still executes

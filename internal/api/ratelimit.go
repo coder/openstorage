@@ -15,6 +15,7 @@ package api
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"net"
 	"net/http"
@@ -71,17 +72,22 @@ type rateLimiter struct {
 	lastSweep time.Time
 }
 
-// newRateLimiter returns nil (disabled) when cfg.RPS <= 0, else a limiter
-// after fail-fast config validation.
-func newRateLimiter(cfg RateLimitConfig) *rateLimiter {
-	assertf(!math.IsNaN(cfg.RPS) && !math.IsInf(cfg.RPS, 0), "RateLimitConfig: RPS must be finite (got %v)", cfg.RPS)
-	if cfg.RPS <= 0 {
-		return nil
+// newRateLimiter returns (nil, nil) (disabled) when cfg.RPS <= 0, else a
+// limiter. Invalid config is an operator input error, so it returns a clean
+// startup error instead of panicking (docs/15 deferred #4).
+func newRateLimiter(cfg RateLimitConfig) (*rateLimiter, error) {
+	if math.IsNaN(cfg.RPS) || math.IsInf(cfg.RPS, 0) {
+		return nil, fmt.Errorf("rate limit config: RPS must be finite (got %v)", cfg.RPS)
 	}
-	assertf(cfg.Burst >= 1, "RateLimitConfig: Burst must be >= 1 when RPS > 0 (got %d)", cfg.Burst)
+	if cfg.RPS <= 0 {
+		return nil, nil
+	}
+	if cfg.Burst < 1 {
+		return nil, fmt.Errorf("rate limit config: Burst must be >= 1 when RPS > 0 (got %d)", cfg.Burst)
+	}
 	l := &rateLimiter{cfg: cfg, now: time.Now, buckets: make(map[string]*bucket)}
 	l.lastSweep = l.now()
-	return l
+	return l, nil
 }
 
 // rlExemptKey marks a request that already paid the rate-limit toll at an
@@ -188,10 +194,16 @@ func (l *rateLimiter) sweepLocked(now time.Time) {
 // clientKey extracts the bucket key for a request: the RemoteAddr host
 // (IPv4/IPv6), falling back to the raw RemoteAddr when it carries no port.
 // X-Forwarded-For is deliberately ignored (no proxy trust model here).
+// An empty RemoteAddr (possible for exotic listeners/in-process handlers)
+// maps to the shared "unknown" bucket so admit's non-empty-key invariant
+// holds (docs/15 deferred #3).
 func clientKey(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil || host == "" {
-		return r.RemoteAddr
+		host = r.RemoteAddr
+	}
+	if host == "" {
+		return "unknown"
 	}
 	return host
 }

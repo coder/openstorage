@@ -76,6 +76,8 @@ type webhookSink struct {
 }
 
 func (s webhookSink) Emit(ctx context.Context, org, eventType string, payload []byte) {
+	assertf(s.webhooks != nil && s.enqueue != nil && s.logger != nil, "webhookSink.Emit: nil deps")
+	assertf(org != "" && eventType != "", "webhookSink.Emit: empty org/eventType")
 	hooks, err := s.webhooks.ListWebhooks(ctx, org)
 	if err != nil {
 		s.logger.Error("sync event lost: list webhooks", "org", org, "event", eventType, "err", err)

@@ -235,7 +235,7 @@ func testEnvironment(t *testing.T, backend string) *testEnv {
 		}
 		envCleanup = append(envCleanup, func() { _ = os.RemoveAll(cacheDir) })
 
-		srv := httptest.NewServer(New(Config{
+		handler, err := New(Config{
 			Store:       store,
 			Verifier:    verifier,
 			Logger:      discardLogger(),
@@ -244,7 +244,12 @@ func testEnvironment(t *testing.T, backend string) *testEnv {
 			BlobStore:   blobStore,
 			CacheDir:    cacheDir,
 			SyncQueue:   envSyncQueue{},
-		}))
+		})
+		if err != nil {
+			state.err = err
+			return
+		}
+		srv := httptest.NewServer(handler)
 		envCleanup = append(envCleanup, srv.Close)
 
 		state.env = &testEnv{

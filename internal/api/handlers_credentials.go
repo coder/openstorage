@@ -255,3 +255,150 @@ func (s *syncServer) handleDeleteCredential(w http.ResponseWriter, r *http.Reque
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
+
+// Path-id git-credentials routes (openapi.yaml, docs/15 deferred #1):
+//
+//	PUT    /api/repos/{repo_name}/git-credentials/{git_credential_id}  repo:write (per repo)  {username?, password} -> {id, created_at}
+//	DELETE /api/repos/{repo_name}/git-credentials/{git_credential_id}  repo:write (per repo)  -> 204
+//
+// Registered by registerAliasRoutes (alias.go) as direct routes — there is
+// no v1 twin to re-dispatch to. Auth is requireAuthWrite (per-repo
+// repo:write, ADR-26 result envelopes), so every failure here carries the
+// write flavor; the success bodies match the v1 PUT/DELETE exactly.
+
+// internalErrResult mirrors internalErr with the docs/04 result envelope
+// (the path-id credential routes are write-flavored, ADR-26).
+func (s *syncServer) internalErrResult(w http.ResponseWriter, r *http.Request, op string, err error) {
+	assertf(s != nil && s.logger != nil, "internalErrResult: nil syncServer deps")
+	assertf(err != nil && op != "", "internalErrResult: nil error or empty op")
+	s.logger.Error("internal error", "op", op, "method", r.Method, "path", r.URL.Path, "err", err)
+	aliasFail(w, routeWrite, http.StatusInternalServerError, internalErrorMsg)
+}
+
+// gcredByPath resolves the {repo_name} and {git_credential_id} path values:
+// the name must resolve in the token's org AND match the token's repo claim
+// (aliasHandler's 404-on-mismatch rule, so foreign tokens cannot probe name
+// existence), and the credential must exist and be attached to that repo
+// (404 otherwise — no cross-repo existence oracle). false = a failure
+// envelope was already written.
+func (s *syncServer) gcredByPath(w http.ResponseWriter, r *http.Request) (upsync.Credential, bool) {
+	assertf(s != nil && s.store != nil && s.creds != nil, "gcredByPath: nil syncServer deps")
+	name := r.PathValue("repo_name")
+	credID := r.PathValue("git_credential_id")
+	// Path wildcards never match an empty segment.
+	assertf(name != "" && credID != "", "gcredByPath: empty path values")
+	claims := mustClaims(r)
+
+	repo, err := meta.ResolveRepoKey(r.Context(), s.store, claims.Iss, name)
+	switch {
+	case errors.Is(err, meta.ErrNotFound):
+		aliasFail(w, routeWrite, http.StatusNotFound, "repository not found")
+		return upsync.Credential{}, false
+	case err != nil:
+		s.internalErrResult(w, r, "resolve credential repo name", err)
+		return upsync.Credential{}, false
+	}
+
+	// requireAuthWrite(orgLevel=false) guarantees a non-empty, non-"org"
+	// repo claim; it may carry the repo url or the repo_id (docs/02).
+	claimRepo, err := meta.ResolveRepoKey(r.Context(), s.store, claims.Iss, claims.Repo)
+	switch {
+	case errors.Is(err, meta.ErrNotFound):
+		aliasFail(w, routeWrite, http.StatusNotFound, "repository not found")
+		return upsync.Credential{}, false
+	case err != nil:
+		s.internalErrResult(w, r, "resolve credential repo claim", err)
+		return upsync.Credential{}, false
+	}
+	if claimRepo.RepoID != repo.RepoID {
+		aliasFail(w, routeWrite, http.StatusNotFound, "repository not found")
+		return upsync.Credential{}, false
+	}
+
+	cred, err := s.creds.GetCredential(r.Context(), credID)
+	switch {
+	case errors.Is(err, upsync.ErrNotFound):
+		aliasFail(w, routeWrite, http.StatusNotFound, "credential not found")
+		return upsync.Credential{}, false
+	case err != nil:
+		s.internalErrResult(w, r, "load credential", err)
+		return upsync.Credential{}, false
+	}
+	if cred.RepoID != repo.RepoID {
+		// Another repo's credential answers exactly like a missing one.
+		aliasFail(w, routeWrite, http.StatusNotFound, "credential not found")
+		return upsync.Credential{}, false
+	}
+	return cred, true
+}
+
+type gcredPathUpdateRequest struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+}
+
+// handleUpdateCredentialByPath implements
+// PUT /api/repos/{repo_name}/git-credentials/{git_credential_id}: rotate
+// username/password -> 200 {id, created_at}, the exact v1 PUT body shape.
+// openapi marks `username` required yet describes it as "omit for
+// token-only providers"; the v1 semantics (optional username, required
+// password) are the compatible superset and are used here.
+func (s *syncServer) handleUpdateCredentialByPath(w http.ResponseWriter, r *http.Request) {
+	cred, ok := s.gcredByPath(w, r)
+	if !ok {
+		return
+	}
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBodyBytes))
+	if err != nil {
+		aliasFail(w, routeWrite, http.StatusBadRequest, "read request body: "+err.Error())
+		return
+	}
+	if len(body) == 0 {
+		aliasFail(w, routeWrite, http.StatusBadRequest, "request body is required")
+		return
+	}
+	var req gcredPathUpdateRequest
+	if err := json.Unmarshal(body, &req); err != nil {
+		aliasFail(w, routeWrite, http.StatusBadRequest, "invalid JSON body: "+err.Error())
+		return
+	}
+	if req.Password == "" {
+		aliasFail(w, routeWrite, http.StatusBadRequest, "password is required")
+		return
+	}
+	updated, err := s.creds.UpdateCredential(r.Context(), cred.ID, req.Username, req.Password)
+	switch {
+	case errors.Is(err, upsync.ErrNotFound):
+		// Deleted between the path resolution and the update.
+		aliasFail(w, routeWrite, http.StatusNotFound, "credential not found")
+		return
+	case err != nil:
+		s.internalErrResult(w, r, "update credential", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{
+		"id":         updated.ID,
+		"created_at": updated.CreatedAt.UTC().Format(time.RFC3339),
+	})
+}
+
+// handleDeleteCredentialByPath implements
+// DELETE /api/repos/{repo_name}/git-credentials/{git_credential_id}: no
+// body -> 204 empty, exactly like the v1 DELETE.
+func (s *syncServer) handleDeleteCredentialByPath(w http.ResponseWriter, r *http.Request) {
+	cred, ok := s.gcredByPath(w, r)
+	if !ok {
+		return
+	}
+	err := s.creds.DeleteCredential(r.Context(), cred.ID)
+	switch {
+	case errors.Is(err, upsync.ErrNotFound):
+		// Deleted between the path resolution and this delete.
+		aliasFail(w, routeWrite, http.StatusNotFound, "credential not found")
+		return
+	case err != nil:
+		s.internalErrResult(w, r, "delete credential", err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}

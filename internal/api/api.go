@@ -63,8 +63,11 @@ type Config struct {
 }
 
 // New builds the full HTTP handler: recover -> request log -> router, with
-// per-route JWT auth (scope + org-level enforcement per docs/02).
-func New(cfg Config) http.Handler {
+// per-route JWT auth (scope + org-level enforcement per docs/02). Invalid
+// operator-supplied config (RateLimit) returns an error instead of
+// panicking (docs/15 deferred #4); nil required dependencies are still
+// programming errors and assert.
+func New(cfg Config) (http.Handler, error) {
 	assertf(cfg.Store != nil, "Config.Store is required")
 	assertf(cfg.Verifier != nil, "Config.Verifier is required")
 	assertf(strings.TrimSpace(cfg.HTTPBaseURL) != "", "Config.HTTPBaseURL is required")
@@ -96,7 +99,10 @@ func New(cfg Config) http.Handler {
 	// Pre-auth rate limiting (docs/03; ratelimit.go). rl is nil when
 	// disabled; rl.limit(...) is valid either way and wraps every REST
 	// route registered below (v1, aliases, repo-urls) before auth.
-	rl := newRateLimiter(cfg.RateLimit)
+	rl, err := newRateLimiter(cfg.RateLimit)
+	if err != nil {
+		return nil, err
+	}
 
 	mux := http.NewServeMux()
 	route := func(pattern string, orgLevel bool, h http.HandlerFunc, scopes ...string) {
@@ -147,12 +153,12 @@ func New(cfg Config) http.Handler {
 	// (alias.go) and GET /api/repo-urls/{repo_id} (repourls.go). Both are
 	// registered last so their patterns cannot shadow the v1 surface they
 	// dispatch to.
-	registerAliasRoutes(mux, s, cfg.Verifier, rl)
+	registerAliasRoutes(mux, s, ss, cfg.Verifier, rl)
 	registerRepoURLRoutes(mux, s, cfg.Verifier, rl)
 
 	if cfg.Fallback != nil {
 		mux.Handle("/", cfg.Fallback)
 	}
 
-	return recoverPanics(logger)(logRequests(logger)(mux))
+	return recoverPanics(logger)(logRequests(logger)(mux)), nil
 }

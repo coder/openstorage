@@ -7,6 +7,7 @@ package api
 import (
 	"encoding/json"
 	"net/http"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -200,5 +201,181 @@ func TestCredentialDelete(t *testing.T) {
 
 		// The repo slot frees up: a new credential can be stored.
 		gcredCreate(t, s, repoURL, repoID)
+	})
+}
+
+// Path-id route tests (docs/15 deferred #1): PUT/DELETE
+// /api/repos/{repo_name}/git-credentials/{git_credential_id} per
+// openapi.yaml, served by the FULL api.New server (testEnv) so the
+// registration in registerAliasRoutes is what is exercised.
+
+// gcredCreateEnv stores a credential for repoID through the shared full
+// server (durable meta-backed stores) and returns its id.
+func gcredCreateEnv(t *testing.T, e *testEnv, org, repoURL, repoID string) string {
+	t.Helper()
+	token := e.mint(t, tokenSpec{iss: org, repo: repoURL, scopes: []string{auth.ScopeRepoWrite}})
+	body := []byte(`{"repo_id":"` + repoID + `","username":"git","password":"tok-1"}`)
+	resp, respBody := e.doReq(t, http.MethodPost, "/api/v1/repos/git-credentials", token, body, "")
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create credential status %d, want 201: %s", resp.StatusCode, respBody)
+	}
+	var out map[string]string
+	if err := json.Unmarshal(respBody, &out); err != nil {
+		t.Fatal(err)
+	}
+	if out["id"] == "" {
+		t.Fatalf("create credential body = %s", respBody)
+	}
+	return out["id"]
+}
+
+// requireGcredPutBody asserts the exact v1-PUT response shape
+// {id, created_at} with a parseable RFC 3339 timestamp.
+func requireGcredPutBody(t *testing.T, body []byte, wantID string) {
+	t.Helper()
+	var out map[string]string
+	if err := json.Unmarshal(body, &out); err != nil {
+		t.Fatal(err)
+	}
+	if out["id"] != wantID || len(out) != 2 {
+		t.Fatalf("PUT body = %s, want exactly {id: %q, created_at}", body, wantID)
+	}
+	if _, err := time.Parse(time.RFC3339, out["created_at"]); err != nil {
+		t.Fatalf("created_at %q: %v", out["created_at"], err)
+	}
+}
+
+func TestCredentialPathIDRoundTrip(t *testing.T) {
+	runBackends(t, func(t *testing.T, e *testEnv) {
+		org := e.newOrg(t)
+		repoURL := "team/credpath-" + randomHex(t, 4)
+		repo := createRepo(t, e, org, repoURL, nil, http.StatusOK)
+		credID := gcredCreateEnv(t, e, org, repoURL, repo.RepoID)
+		esc := url.PathEscape(repoURL) // the name spans a slash: %2F handling included
+		writeTok := e.mint(t, tokenSpec{iss: org, repo: repoURL, scopes: []string{auth.ScopeRepoWrite}})
+
+		// PUT rotate -> 200 {id, created_at} (identical to the v1 PUT shape).
+		resp, body := e.doReq(t, http.MethodPut, "/api/repos/"+esc+"/git-credentials/"+credID, writeTok,
+			[]byte(`{"username":"git","password":"tok-2"}`), "")
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("PUT status %d: %s", resp.StatusCode, body)
+		}
+		requireGcredPutBody(t, body, credID)
+
+		// Username is optional (token-only providers), and the path also
+		// resolves by repo_id (meta.ResolveRepoKey ByID branch).
+		resp, body = e.doReq(t, http.MethodPut,
+			"/api/repos/"+url.PathEscape(repo.RepoID)+"/git-credentials/"+credID, writeTok,
+			[]byte(`{"password":"tok-3"}`), "")
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("PUT by repo_id status %d: %s", resp.StatusCode, body)
+		}
+		requireGcredPutBody(t, body, credID)
+
+		// DELETE -> 204 with empty body (identical to the v1 DELETE).
+		resp, body = e.doReq(t, http.MethodDelete, "/api/repos/"+esc+"/git-credentials/"+credID, writeTok, nil, "")
+		if resp.StatusCode != http.StatusNoContent {
+			t.Fatalf("DELETE status %d: %s", resp.StatusCode, body)
+		}
+		if len(body) != 0 {
+			t.Fatalf("204 body = %q, want empty", body)
+		}
+
+		// Repeat DELETE -> 404 (write-flavor result envelope, ADR-26).
+		resp, body = e.doReq(t, http.MethodDelete, "/api/repos/"+esc+"/git-credentials/"+credID, writeTok, nil, "")
+		if resp.StatusCode != http.StatusNotFound {
+			t.Fatalf("second DELETE status %d: %s", resp.StatusCode, body)
+		}
+		requireAuthResultEnvelope(t, body, "not_found")
+
+		// The repo slot frees up: a new credential can be stored.
+		gcredCreateEnv(t, e, org, repoURL, repo.RepoID)
+	})
+}
+
+func TestCredentialPathIDNegatives(t *testing.T) {
+	runBackends(t, func(t *testing.T, e *testEnv) {
+		org := e.newOrg(t)
+		repoURL := "team/credpath-" + randomHex(t, 4)
+		repo := createRepo(t, e, org, repoURL, nil, http.StatusOK)
+		credID := gcredCreateEnv(t, e, org, repoURL, repo.RepoID)
+		esc := url.PathEscape(repoURL)
+		writeTok := e.mint(t, tokenSpec{iss: org, repo: repoURL, scopes: []string{auth.ScopeRepoWrite}})
+		putBody := []byte(`{"username":"git","password":"p2"}`)
+		putPath := "/api/repos/" + esc + "/git-credentials/" + credID
+
+		// Unknown repo_name -> 404.
+		resp, body := e.doReq(t, http.MethodPut, "/api/repos/no-such-repo/git-credentials/"+credID, writeTok, putBody, "")
+		if resp.StatusCode != http.StatusNotFound {
+			t.Errorf("unknown repo_name = %d (%s), want 404", resp.StatusCode, body)
+		}
+		requireAuthResultEnvelope(t, body, "not_found")
+
+		// Unknown credential id -> 404.
+		resp, body = e.doReq(t, http.MethodPut, "/api/repos/"+esc+"/git-credentials/ggc_0000000000000000", writeTok, putBody, "")
+		if resp.StatusCode != http.StatusNotFound {
+			t.Errorf("unknown credential id = %d (%s), want 404", resp.StatusCode, body)
+		}
+
+		// A credential attached to ANOTHER repo answers 404 like a missing
+		// one (no cross-repo existence oracle).
+		otherURL := "team/credpath-other-" + randomHex(t, 4)
+		other := createRepo(t, e, org, otherURL, nil, http.StatusOK)
+		otherCred := gcredCreateEnv(t, e, org, otherURL, other.RepoID)
+		resp, body = e.doReq(t, http.MethodPut, "/api/repos/"+esc+"/git-credentials/"+otherCred, writeTok, putBody, "")
+		if resp.StatusCode != http.StatusNotFound {
+			t.Errorf("foreign credential = %d (%s), want 404", resp.StatusCode, body)
+		}
+
+		// Claim repo != path repo -> 404 (alias rule: mismatches answer 404,
+		// not 403, so foreign tokens cannot probe which names exist).
+		otherTok := e.mint(t, tokenSpec{iss: org, repo: otherURL, scopes: []string{auth.ScopeRepoWrite}})
+		for _, method := range []string{http.MethodPut, http.MethodDelete} {
+			resp, body = e.doReq(t, method, putPath, otherTok, putBody, "")
+			if resp.StatusCode != http.StatusNotFound {
+				t.Errorf("%s claim mismatch = %d (%s), want 404", method, resp.StatusCode, body)
+			}
+			requireAuthResultEnvelope(t, body, "not_found")
+		}
+
+		// Missing password / missing body -> 400 (result envelope).
+		resp, body = e.doReq(t, http.MethodPut, putPath, writeTok, []byte(`{"username":"git"}`), "")
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("missing password = %d (%s), want 400", resp.StatusCode, body)
+		}
+		requireAuthResultEnvelope(t, body, "invalid")
+		resp, body = e.doReq(t, http.MethodPut, putPath, writeTok, nil, "")
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("missing body = %d (%s), want 400", resp.StatusCode, body)
+		}
+
+		// Org token on the per-repo route -> 403 (middleware, ADR-26).
+		orgTok := e.mint(t, tokenSpec{iss: org, repo: auth.RepoClaimOrg, scopes: []string{auth.ScopeRepoWrite}})
+		resp, body = e.doReq(t, http.MethodPut, putPath, orgTok, putBody, "")
+		if resp.StatusCode != http.StatusForbidden {
+			t.Errorf("org token = %d (%s), want 403", resp.StatusCode, body)
+		}
+		requireAuthResultEnvelope(t, body, "forbidden")
+
+		// No token -> 401 result envelope with WWW-Authenticate: Bearer.
+		resp, body = e.doReq(t, http.MethodPut, putPath, "", putBody, "")
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Errorf("no token = %d (%s), want 401", resp.StatusCode, body)
+		}
+		if got := resp.Header.Get("WWW-Authenticate"); got != "Bearer" {
+			t.Errorf("401 WWW-Authenticate = %q, want Bearer", got)
+		}
+		requireAuthResultEnvelope(t, body, "unauthorized")
+
+		// None of the negatives touched the credential: rotate + delete
+		// still succeed with the right token.
+		resp, body = e.doReq(t, http.MethodPut, putPath, writeTok, putBody, "")
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("final PUT status %d: %s", resp.StatusCode, body)
+		}
+		resp, body = e.doReq(t, http.MethodDelete, putPath, writeTok, nil, "")
+		if resp.StatusCode != http.StatusNoContent {
+			t.Fatalf("final DELETE status %d: %s", resp.StatusCode, body)
+		}
 	})
 }

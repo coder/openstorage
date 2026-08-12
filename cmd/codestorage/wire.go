@@ -71,7 +71,7 @@ func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL string, orgPEM
 		return fail(err)
 	}
 
-	h := api.New(api.Config{
+	h, err := api.New(api.Config{
 		Store:       ms,
 		Verifier:    verifier,
 		HTTPBaseURL: httpBaseURL,
@@ -81,6 +81,10 @@ func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL string, orgPEM
 		SyncQueue:   queue,
 		RateLimit:   rate,
 	})
+	if err != nil {
+		queueCleanup() // stop workers before closing their meta store
+		return fail(err)
+	}
 	cleanup := func() {
 		queueCleanup() // stop workers before closing their meta store
 		msCleanup()

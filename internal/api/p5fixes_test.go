@@ -226,3 +226,47 @@ func testPullUpstreamDefaultsRefToDefaultBranch(t *testing.T, e *testEnv) {
 		t.Errorf("explicit job ref = %q, want %q", job.Ref, "feature-x")
 	}
 }
+
+// TestCreateAbandonCleansSiblingRows seeds the durable rows a base_repo
+// create produces (repo + credential + upstream) and asserts createAbandon
+// removes all three, not just the repo row (docs/15 deferred #2).
+func TestCreateAbandonCleansSiblingRows(t *testing.T) {
+	runBackends(t, testCreateAbandonCleansSiblingRows)
+}
+
+func testCreateAbandonCleansSiblingRows(t *testing.T, e *testEnv) {
+	ctx := context.Background()
+	org := e.newOrg(t)
+	repoURL := "team/abandon-rows-" + randomHex(t, 4)
+	repo, err := e.store.CreateRepo(ctx, org, repoURL, "main")
+	if err != nil {
+		t.Fatalf("CreateRepo: %v", err)
+	}
+	creds, ups := upsync.MetaStores(e.store)
+	cred, err := creds.CreateCredential(ctx, upsync.Credential{RepoID: repo.RepoID, Password: "tok"})
+	if err != nil {
+		t.Fatalf("CreateCredential: %v", err)
+	}
+	if _, err := ups.PutUpstream(ctx, upsync.Upstream{
+		RepoID: repo.RepoID, Provider: "github", Owner: "acme", Name: "demo", UpstreamHost: "github.com",
+	}); err != nil {
+		t.Fatalf("PutUpstream: %v", err)
+	}
+
+	ss := newSyncServer(e.store, creds, ups, envSyncQueue{}, testHTTPBaseURL, discardLogger())
+	ss.createAbandon(ctx, org, repoURL, repo.RepoID)
+
+	if _, err := e.store.GetRepoByURL(ctx, org, repoURL); !errors.Is(err, meta.ErrNotFound) {
+		t.Errorf("repo row after createAbandon: err = %v, want ErrNotFound (soft-deleted)", err)
+	}
+	if _, err := creds.GetCredential(ctx, cred.ID); !errors.Is(err, upsync.ErrNotFound) {
+		t.Errorf("credential row after createAbandon: err = %v, want ErrNotFound", err)
+	}
+	if _, err := ups.GetUpstream(ctx, repo.RepoID); !errors.Is(err, upsync.ErrNotFound) {
+		t.Errorf("upstream row after createAbandon: err = %v, want ErrNotFound", err)
+	}
+
+	// Best-effort semantics: a second run over already-missing rows only
+	// logs, never fails or panics.
+	ss.createAbandon(ctx, org, repoURL, repo.RepoID)
+}

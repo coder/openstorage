@@ -8,6 +8,8 @@ package api
 
 import (
 	"encoding/json"
+	"fmt"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -32,9 +34,9 @@ func rlRequest(t *testing.T, h http.Handler, remoteAddr string) *httptest.Respon
 }
 
 func TestRateLimitDisabledPassthrough(t *testing.T) {
-	rl := newRateLimiter(RateLimitConfig{})
-	if rl != nil {
-		t.Fatalf("newRateLimiter(zero) = %v, want nil (disabled)", rl)
+	rl, err := newRateLimiter(RateLimitConfig{})
+	if rl != nil || err != nil {
+		t.Fatalf("newRateLimiter(zero) = (%v, %v), want (nil, nil) (disabled)", rl, err)
 	}
 	h := rl.limit(routeRead)(okHandler())
 	for i := 0; i < 10; i++ {
@@ -44,18 +46,36 @@ func TestRateLimitDisabledPassthrough(t *testing.T) {
 	}
 }
 
-func TestRateLimitBurstValidationPanics(t *testing.T) {
-	defer func() {
-		if recover() == nil {
-			t.Fatal("newRateLimiter(RPS>0, Burst=0) did not panic")
-		}
-	}()
-	newRateLimiter(RateLimitConfig{RPS: 1})
+// TestRateLimitInvalidConfigError asserts invalid operator config is a clean
+// startup error, never a panic (docs/15 deferred #4).
+func TestRateLimitInvalidConfigError(t *testing.T) {
+	cases := map[string]RateLimitConfig{
+		"burst zero": {RPS: 1},
+		"burst neg":  {RPS: 1, Burst: -3},
+		"nan rps":    {RPS: math.NaN(), Burst: 1},
+		"inf rps":    {RPS: math.Inf(1), Burst: 1},
+	}
+	for name, cfg := range cases {
+		t.Run(name, func(t *testing.T) {
+			defer func() {
+				if p := recover(); p != nil {
+					t.Fatalf("newRateLimiter(%+v) panicked: %v", cfg, p)
+				}
+			}()
+			rl, err := newRateLimiter(cfg)
+			if err == nil || rl != nil {
+				t.Fatalf("newRateLimiter(%+v) = (%v, %v), want (nil, error)", cfg, rl, err)
+			}
+		})
+	}
 }
 
 // newTestLimiter returns a limiter on a manual clock starting at base.
 func newTestLimiter(cfg RateLimitConfig, base time.Time) (*rateLimiter, *time.Time) {
-	rl := newRateLimiter(cfg)
+	rl, err := newRateLimiter(cfg)
+	if err != nil || rl == nil {
+		panic(fmt.Sprintf("newTestLimiter(%+v) = (%v, %v), want a limiter", cfg, rl, err))
+	}
 	now := base
 	rl.now = func() time.Time { return now }
 	rl.lastSweep = base
@@ -193,6 +213,9 @@ func TestClientKey(t *testing.T) {
 		{"ipv6", "[2001:db8::1]:443", "", "2001:db8::1"},
 		{"no-port", "10.1.2.3", "", "10.1.2.3"},
 		{"xff-ignored", "10.1.2.3:5555", "203.0.113.9", "10.1.2.3"},
+		// docs/15 deferred #3: an empty RemoteAddr falls back to the
+		// shared sentinel bucket instead of tripping admit's assert.
+		{"empty", "", "", "unknown"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

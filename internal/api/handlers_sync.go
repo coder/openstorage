@@ -130,6 +130,8 @@ func validUpstreamHost(host string) bool {
 // optional credential from auth.token, insert the repo_upstreams row, and
 // enqueue the first sync (docs/01 invariant 11).
 func (s *syncServer) handleCreateRepo(w http.ResponseWriter, r *http.Request) {
+	assertf(s != nil && s.store != nil && s.creds != nil && s.ups != nil && s.queue != nil,
+		"handleCreateRepo: nil syncServer deps")
 	claims := mustClaims(r)
 	url := claims.Repo
 	// requireAuth(orgLevel=false) rejects empty/"org" repo claims with 403.
@@ -213,7 +215,7 @@ func (s *syncServer) handleCreateRepo(w http.ResponseWriter, r *http.Request) {
 				RepoID:   repo.RepoID,
 				Password: spec.Auth.Token,
 			}); err != nil {
-				s.createAbandon(r.Context(), claims.Iss, url)
+				s.createAbandon(r.Context(), claims.Iss, url, repo.RepoID)
 				s.internalErr(w, r, "store base_repo credential", err)
 				return
 			}
@@ -225,7 +227,7 @@ func (s *syncServer) handleCreateRepo(w http.ResponseWriter, r *http.Request) {
 			Name:         spec.Name,
 			UpstreamHost: upstreamHost,
 		}); err != nil {
-			s.createAbandon(r.Context(), claims.Iss, url)
+			s.createAbandon(r.Context(), claims.Iss, url, repo.RepoID)
 			s.internalErr(w, r, "store base_repo upstream", err)
 			return
 		}
@@ -234,7 +236,7 @@ func (s *syncServer) handleCreateRepo(w http.ResponseWriter, r *http.Request) {
 			RepoID: repo.RepoID,
 			Ref:    spec.Ref,
 		}); err != nil {
-			s.createAbandon(r.Context(), claims.Iss, url)
+			s.createAbandon(r.Context(), claims.Iss, url, repo.RepoID)
 			s.internalErr(w, r, "enqueue first sync", err)
 			return
 		}
@@ -247,14 +249,32 @@ func (s *syncServer) handleCreateRepo(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// createAbandon soft-deletes the repo row a failed post-CreateRepo step
-// left behind, mirroring (*server).forkAbandon: the failure may BE the
-// request context's cancellation, so detach from it (bounded) instead of
-// orphaning the row with a context.Canceled soft-delete.
-func (s *syncServer) createAbandon(ctx context.Context, org, url string) {
-	assertf(org != "" && url != "", "createAbandon: empty org/url")
+// createAbandon undoes the rows a failed post-CreateRepo step left behind,
+// mirroring (*server).forkAbandon: the failure may BE the request context's
+// cancellation, so detach from it (bounded) instead of orphaning the rows
+// with a context.Canceled cleanup. Besides soft-deleting the repo row it
+// best-effort deletes the upstream and credential rows created alongside it
+// (docs/15 deferred #2); each step logs its own failure and not-found is
+// fine (the step that failed determines which rows exist).
+func (s *syncServer) createAbandon(ctx context.Context, org, url, repoID string) {
+	assertf(s != nil && s.store != nil && s.creds != nil && s.ups != nil && s.logger != nil,
+		"createAbandon: nil syncServer deps")
+	assertf(org != "" && url != "" && repoID != "", "createAbandon: empty org/url/repoID")
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 	defer cancel()
+	if err := s.ups.DeleteUpstream(ctx, repoID); err != nil && !errors.Is(err, upsync.ErrNotFound) {
+		s.logger.Error("abandon failed create: delete upstream", "org", org, "repo_id", repoID, "err", err)
+	}
+	switch cred, err := s.creds.CredentialForRepo(ctx, repoID); {
+	case errors.Is(err, upsync.ErrNotFound):
+		// No credential was stored (e.g. token-less base_repo).
+	case err != nil:
+		s.logger.Error("abandon failed create: load credential", "org", org, "repo_id", repoID, "err", err)
+	default:
+		if err := s.creds.DeleteCredential(ctx, cred.ID); err != nil && !errors.Is(err, upsync.ErrNotFound) {
+			s.logger.Error("abandon failed create: delete credential", "org", org, "repo_id", repoID, "err", err)
+		}
+	}
 	if _, err := s.store.SoftDeleteRepo(ctx, org, url); err != nil {
 		s.logger.Error("abandon failed create", "org", org, "url", url, "err", err)
 	}
@@ -280,6 +300,10 @@ const pullUpstreamAcceptedMsg = "Repository sync initiated successfully"
 // be satisfied, and unknown ops fail closed (same coarseness as
 // policyDeniesRepoDelete: the pattern is not consulted because the sync
 // may touch any synced ref).
+//
+// A nil/empty policies slice is valid input by design (an unpoliced token);
+// the tuples themselves come from parsed JWT claims (user input), so there
+// is deliberately no entry assert on their contents.
 func policyDeniesPullUpstream(policies []auth.RefPolicy) (string, bool) {
 	for _, rule := range policies {
 		if len(rule.Ops) > 0 {
@@ -293,6 +317,8 @@ func policyDeniesPullUpstream(policies []auth.RefPolicy) (string, bool) {
 // git:write): enqueue a sync for the JWT repo claim target. 400 when the
 // repo has no upstream base_repo (docs/03: "only for repos with base_repo").
 func (s *syncServer) handlePullUpstream(w http.ResponseWriter, r *http.Request) {
+	assertf(s != nil && s.store != nil && s.ups != nil && s.queue != nil,
+		"handlePullUpstream: nil syncServer deps")
 	claims := mustClaims(r)
 	// docs/02: ref policies apply to every HTTP write endpoint. The
 	// loopback push runs with an unpoliced internal token, so the caller's
@@ -359,6 +385,7 @@ func (s *syncServer) handlePullUpstream(w http.ResponseWriter, r *http.Request) 
 // idempotent upstream detach. In-flight or queued syncs observe the missing
 // row and end silently — the documented cancellation semantics (docs/06).
 func (s *syncServer) handleDetachBase(w http.ResponseWriter, r *http.Request) {
+	assertf(s != nil && s.store != nil && s.ups != nil, "handleDetachBase: nil syncServer deps")
 	claims := mustClaims(r)
 	// Malformed ref-policy claims fail closed on write endpoints (docs/02).
 	if _, err := refPolicies(claims); err != nil {

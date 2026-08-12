@@ -107,9 +107,9 @@ func aliasRoutes() []aliasRoute {
 
 // registerAliasRoutes wires the alias surface onto mux, which is both the
 // registration target and the re-dispatch target for the rewritten v1
-// requests.
-func registerAliasRoutes(mux *http.ServeMux, s *server, verifier auth.Verifier, rl *rateLimiter) {
-	assertf(mux != nil && s != nil && verifier != nil, "registerAliasRoutes: nil dependency")
+// requests. ss backs the path-id git-credentials routes registered below.
+func registerAliasRoutes(mux *http.ServeMux, s *server, ss *syncServer, verifier auth.Verifier, rl *rateLimiter) {
+	assertf(mux != nil && s != nil && ss != nil && verifier != nil, "registerAliasRoutes: nil dependency")
 	seen := make(map[string]bool)
 	for _, ar := range aliasRoutes() {
 		assertf(ar.method != "", "alias route %q: empty method", ar.suffix)
@@ -126,6 +126,22 @@ func registerAliasRoutes(mux *http.ServeMux, s *server, verifier auth.Verifier, 
 			authMW = requireAuthWrite
 		}
 		mux.Handle(pattern, rl.limit(ar.flavor)(authMW(verifier, ar.orgLevel, ar.scopes...)(s.aliasHandler(mux, ar))))
+	}
+
+	// Path-id git-credentials routes (openapi.yaml; docs/15 deferred #1):
+	// direct routes with NO v1 twin to re-dispatch to — the handlers own
+	// the alias-layer repo_name resolution themselves
+	// (handlers_credentials.go). Auth is per-repo repo:write with ADR-26
+	// result envelopes (requireAuthWrite) behind rl.limit(routeWrite).
+	for _, route := range []struct {
+		method  string
+		handler http.HandlerFunc
+	}{
+		{http.MethodPut, ss.handleUpdateCredentialByPath},
+		{http.MethodDelete, ss.handleDeleteCredentialByPath},
+	} {
+		mux.Handle(route.method+" /api/repos/{repo_name}/git-credentials/{git_credential_id}",
+			rl.limit(routeWrite)(requireAuthWrite(verifier, false, auth.ScopeRepoWrite)(route.handler)))
 	}
 }
 
