@@ -54,6 +54,12 @@ type Config struct {
 	// passes the jobs seam (River on pg, in-process in local mode); tests
 	// may pass a recorder/no-op.
 	SyncQueue upsync.Queue
+
+	// RateLimit enables the pre-auth per-client-IP token bucket on every
+	// REST route (docs/03 gateway-level 429; see ratelimit.go). The zero
+	// value disables limiting. The serve command plumbs it from
+	// CODESTORAGE_RATE_RPS / CODESTORAGE_RATE_BURST.
+	RateLimit RateLimitConfig
 }
 
 // New builds the full HTTP handler: recover -> request log -> router, with
@@ -87,9 +93,14 @@ func New(cfg Config) http.Handler {
 	creds, ups := upsync.MetaStores(cfg.Store)
 	ss := newSyncServer(cfg.Store, creds, ups, cfg.SyncQueue, strings.TrimRight(cfg.HTTPBaseURL, "/"), logger)
 
+	// Pre-auth rate limiting (docs/03; ratelimit.go). rl is nil when
+	// disabled; rl.limit(...) is valid either way and wraps every REST
+	// route registered below (v1, aliases, repo-urls) before auth.
+	rl := newRateLimiter(cfg.RateLimit)
+
 	mux := http.NewServeMux()
 	route := func(pattern string, orgLevel bool, h http.HandlerFunc, scopes ...string) {
-		mux.Handle(pattern, requireAuth(cfg.Verifier, orgLevel, scopes...)(h))
+		mux.Handle(pattern, rl.limit(routeRead)(requireAuth(cfg.Verifier, orgLevel, scopes...)(h)))
 	}
 	// POST /repos is the base_repo-aware create: code/code.storage fork
 	// specs dispatch to the synchronous fork (handlers_fork.go); everything
@@ -122,15 +133,22 @@ func New(cfg Config) http.Handler {
 
 	// git:write surface (docs/07 p4). The route/scope tables live next to
 	// the handlers (handlers_write_commit.go, handlers_write_refs.go).
-	registerWriteCommitRoutes(mux, s, cfg.Verifier)
-	s.registerWriteRefRoutes(mux, cfg.Verifier)
-	s.registerWriteMergeRoutes(mux, cfg.Verifier)
+	registerWriteCommitRoutes(mux, s, cfg.Verifier, rl)
+	s.registerWriteRefRoutes(mux, cfg.Verifier, rl)
+	s.registerWriteMergeRoutes(mux, cfg.Verifier, rl)
 
 	// Phase-5 routes: webhook CRUD (docs/06), git-credentials CRUD and
 	// upstream sync (docs/03).
-	RegisterWebhookRoutes(mux, cfg.Verifier, events.MetaWebhookStore{Store: cfg.Store}, logger)
-	registerCredentialRoutes(mux, cfg.Verifier, ss)
-	registerSyncRoutes(mux, cfg.Verifier, ss)
+	RegisterWebhookRoutes(mux, cfg.Verifier, events.MetaWebhookStore{Store: cfg.Store}, logger, rl)
+	registerCredentialRoutes(mux, cfg.Verifier, ss, rl)
+	registerSyncRoutes(mux, cfg.Verifier, ss, rl)
+
+	// Phase-6 routes: named-repo aliases /api/repos/{repo_name}/...
+	// (alias.go) and GET /api/repo-urls/{repo_id} (repourls.go). Both are
+	// registered last so their patterns cannot shadow the v1 surface they
+	// dispatch to.
+	registerAliasRoutes(mux, s, cfg.Verifier, rl)
+	registerRepoURLRoutes(mux, s, cfg.Verifier, rl)
 
 	if cfg.Fallback != nil {
 		mux.Handle("/", cfg.Fallback)

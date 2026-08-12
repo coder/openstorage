@@ -42,7 +42,7 @@ func wmServer(t *testing.T, e *testEnv) *httptest.Server {
 		cacheDir:    e.cacheDir,
 	}
 	mux := http.NewServeMux()
-	s.registerWriteMergeRoutes(mux, auth.NewVerifier(e.store))
+	s.registerWriteMergeRoutes(mux, auth.NewVerifier(e.store), nil)
 	srv := httptest.NewServer(recoverPanics(s.logger)(mux))
 	t.Cleanup(srv.Close)
 	return srv

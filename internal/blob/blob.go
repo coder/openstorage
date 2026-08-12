@@ -6,7 +6,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"net/url"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
@@ -15,6 +17,16 @@ import (
 	gcblob "gocloud.dev/blob"
 	"gocloud.dev/blob/s3blob"
 )
+
+// ErrSignedURLUnsupported is returned by SignedURL on backends without
+// presign support (fileblob). Callers (the LFS batch handler) fall back to
+// proxying the transfer through the server.
+var ErrSignedURLUnsupported = errors.New("blob: signed URLs unsupported by this backend")
+
+// ErrNotFound is returned (wrapped, match with errors.Is) by Stat for
+// missing objects, so callers can distinguish absence from transport
+// failures without depending on gocloud error codes.
+var ErrNotFound = errors.New("blob: object not found")
 
 // assertf is a fail-fast invariant check (crash-and-burn style).
 func assertf(cond bool, format string, args ...any) {
@@ -33,9 +45,26 @@ type BlobStore interface {
 	DownloadFile(ctx context.Context, key, destPath string) error
 	// List returns all objects under prefix.
 	List(ctx context.Context, prefix string) ([]ListedObject, error)
+	// SignedURL returns a presigned URL for the given HTTP method
+	// (http.MethodGet or http.MethodPut) on key, valid for expiry.
+	// Backends without presign support return ErrSignedURLUnsupported.
+	SignedURL(ctx context.Context, key, method string, expiry time.Duration) (string, error)
+	// Stat returns the size of the object at key; missing objects yield an
+	// error matching ErrNotFound via errors.Is.
+	Stat(ctx context.Context, key string) (int64, error)
 	// EnsureBucket idempotently creates the backing bucket.
 	EnsureBucket(ctx context.Context) error
 	Close() error
+}
+
+// assertSignedURLArgs fail-fast-validates the shared SignedURL contract:
+// non-empty key, GET or PUT (the only methods LFS transfers need), and a
+// positive expiry.
+func assertSignedURLArgs(key, method string, expiry time.Duration) {
+	assertf(key != "", "SignedURL: empty key")
+	assertf(method == http.MethodGet || method == http.MethodPut,
+		"SignedURL(%q): method %q (want GET or PUT)", key, method)
+	assertf(expiry > 0, "SignedURL(%s %s): non-positive expiry %v", method, key, expiry)
 }
 
 // ListedObject is one blob under a prefix.
@@ -52,6 +81,14 @@ func PackKey(repo, id string) string {
 
 // PackPrefix is the listing prefix for a repo's packs.
 func PackPrefix(repo string) string { return "packs/" + repo + "/" }
+
+// LFSKey is the immutable object key for a repo's LFS object with the given
+// sha256 oid. Keys are repo-scoped (docs/05): forks inherit LFS pointers
+// only, never the objects, which this keying yields automatically.
+func LFSKey(repoID, oid string) string {
+	assertf(repoID != "" && oid != "", "LFSKey(%q, %q)", repoID, oid)
+	return "lfs/" + repoID + "/" + oid
+}
 
 // Open dispatches on the URL scheme to the matching BlobStore backend:
 //
@@ -162,4 +199,20 @@ func (b *S3) DownloadFile(ctx context.Context, key, destPath string) error {
 // List returns all objects under prefix.
 func (b *S3) List(ctx context.Context, prefix string) ([]ListedObject, error) {
 	return bucketList(ctx, b.bucket, prefix)
+}
+
+// SignedURL returns a presigned S3 URL for method (GET or PUT) on key.
+// ContentType is deliberately left unset in the options: gocloud's
+// aws-sdk-go-v2 presigner returns Unimplemented when asked to sign a
+// Content-Type for PUT, and an unsigned Content-Type means git-lfs's
+// `Content-Type: application/octet-stream` PUT verifies against MinIO/S3
+// SigV4 without extra configuration.
+func (b *S3) SignedURL(ctx context.Context, key, method string, expiry time.Duration) (string, error) {
+	assertSignedURLArgs(key, method, expiry)
+	return b.bucket.SignedURL(ctx, key, &gcblob.SignedURLOptions{Method: method, Expiry: expiry})
+}
+
+// Stat returns the size of the object at key (ErrNotFound when absent).
+func (b *S3) Stat(ctx context.Context, key string) (int64, error) {
+	return bucketStat(ctx, b.bucket, key)
 }

@@ -2,10 +2,13 @@ package blob
 
 import (
 	"context"
+	"errors"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // openFile opens a File store rooted at a fresh temp dir. Zero containers.
@@ -167,6 +170,32 @@ func TestFile_PackKeyRoundTrip(t *testing.T) {
 		if entries[i] != want {
 			t.Fatalf("on-disk entries = %v, want %v", entries, wantFiles)
 		}
+	}
+}
+
+// TestFile_StatAndSignedURL pins the phase-6 LFS foundation contract on the
+// filesystem backend: Stat reports the exact size, missing keys match
+// ErrNotFound via errors.Is, and SignedURL yields ErrSignedURLUnsupported
+// (the proxy-fallback trigger).
+func TestFile_StatAndSignedURL(t *testing.T) {
+	ctx := context.Background()
+	key := LFSKey("r1", strings.Repeat("a", 64))
+	b := seededFile(t, key, "hello lfs")
+
+	size, err := b.Stat(ctx, key)
+	if err != nil {
+		t.Fatalf("Stat: %v", err)
+	}
+	if want := int64(len("hello lfs")); size != want {
+		t.Fatalf("Stat size = %d, want %d", size, want)
+	}
+
+	if _, err := b.Stat(ctx, LFSKey("r1", strings.Repeat("b", 64))); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Stat of missing key = %v, want ErrNotFound", err)
+	}
+
+	if _, err := b.SignedURL(ctx, key, http.MethodGet, time.Hour); !errors.Is(err, ErrSignedURLUnsupported) {
+		t.Fatalf("SignedURL on fileblob = %v, want ErrSignedURLUnsupported", err)
 	}
 }
 

@@ -44,11 +44,11 @@ import (
 // registerWriteRefRoutes registers the W3 write endpoints on mux with the
 // same per-route auth middleware api.New uses. DELETE /repos/tags demands
 // BOTH git:read and git:write (docs/03, docs/12).
-func (s *server) registerWriteRefRoutes(mux *http.ServeMux, verifier auth.Verifier) {
+func (s *server) registerWriteRefRoutes(mux *http.ServeMux, verifier auth.Verifier, rl *rateLimiter) {
 	assertf(mux != nil, "registerWriteRefRoutes: nil mux")
 	assertf(verifier != nil, "registerWriteRefRoutes: nil verifier")
 	route := func(pattern string, h http.HandlerFunc, scopes ...string) {
-		mux.Handle(pattern, requireAuthWrite(verifier, false, scopes...)(h))
+		mux.Handle(pattern, rl.limit(routeWrite)(requireAuthWrite(verifier, false, scopes...)(h)))
 	}
 	route("POST /api/v1/repos/branches/create", s.handleCreateBranch, auth.ScopeGitWrite)
 	route("DELETE /api/v1/repos/branches", s.handleDeleteBranch, auth.ScopeGitWrite)

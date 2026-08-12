@@ -46,7 +46,7 @@ func newForkServer(t *testing.T, e *testEnv) *httptest.Server {
 	mux := http.NewServeMux()
 	mux.Handle("POST /api/v1/repos",
 		requireAuth(verifier, false, auth.ScopeRepoWrite)(s.forkAwareCreateRepo(verifier, s.handleCreateRepo)))
-	s.registerWriteRefRoutes(mux, verifier)
+	s.registerWriteRefRoutes(mux, verifier, nil)
 	srv := httptest.NewServer(recoverPanics(s.logger)(mux))
 	t.Cleanup(srv.Close)
 	return srv

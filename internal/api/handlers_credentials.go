@@ -72,16 +72,16 @@ func (s *syncServer) internalErr(w http.ResponseWriter, r *http.Request, op stri
 
 // registerCredentialRoutes registers the git-credentials CRUD routes.
 // POST is repo-scoped (repo=repoId); PUT/DELETE are org-scoped (docs/03).
-func registerCredentialRoutes(mux *http.ServeMux, verifier auth.Verifier, s *syncServer) {
+func registerCredentialRoutes(mux *http.ServeMux, verifier auth.Verifier, s *syncServer, rl *rateLimiter) {
 	assertf(mux != nil, "registerCredentialRoutes: nil mux")
 	assertf(verifier != nil, "registerCredentialRoutes: nil verifier")
 	assertf(s != nil, "registerCredentialRoutes: nil syncServer")
 	mux.Handle("POST /api/v1/repos/git-credentials",
-		requireAuth(verifier, false, auth.ScopeRepoWrite)(http.HandlerFunc(s.handleCreateCredential)))
+		rl.limit(routeRead)(requireAuth(verifier, false, auth.ScopeRepoWrite)(http.HandlerFunc(s.handleCreateCredential))))
 	mux.Handle("PUT /api/v1/repos/git-credentials",
-		requireAuth(verifier, true, auth.ScopeRepoWrite)(http.HandlerFunc(s.handleUpdateCredential)))
+		rl.limit(routeRead)(requireAuth(verifier, true, auth.ScopeRepoWrite)(http.HandlerFunc(s.handleUpdateCredential))))
 	mux.Handle("DELETE /api/v1/repos/git-credentials",
-		requireAuth(verifier, true, auth.ScopeRepoWrite)(http.HandlerFunc(s.handleDeleteCredential)))
+		rl.limit(routeRead)(requireAuth(verifier, true, auth.ScopeRepoWrite)(http.HandlerFunc(s.handleDeleteCredential))))
 }
 
 // gcredDecodeBody reads and unmarshals a bounded JSON body. false = a 400

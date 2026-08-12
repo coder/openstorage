@@ -221,8 +221,8 @@ func newUsyncStack(t *testing.T, e *testEnv) *usyncStack {
 	// the test mux registers the same shape.
 	mux.Handle("POST /api/v1/repos",
 		requireAuth(s.verifier, false, auth.ScopeRepoWrite)(http.HandlerFunc(ss.handleCreateRepo)))
-	registerCredentialRoutes(mux, s.verifier, ss)
-	registerSyncRoutes(mux, s.verifier, ss)
+	registerCredentialRoutes(mux, s.verifier, ss, nil)
+	registerSyncRoutes(mux, s.verifier, ss, nil)
 	s.api = httptest.NewServer(mux)
 	t.Cleanup(s.api.Close)
 	return s

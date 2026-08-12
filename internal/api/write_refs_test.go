@@ -38,7 +38,7 @@ func newWrefServer(t *testing.T, e *testEnv) *httptest.Server {
 		cacheDir:    e.cacheDir,
 	}
 	mux := http.NewServeMux()
-	s.registerWriteRefRoutes(mux, auth.NewVerifier(e.store))
+	s.registerWriteRefRoutes(mux, auth.NewVerifier(e.store), nil)
 	srv := httptest.NewServer(recoverPanics(s.logger)(mux))
 	t.Cleanup(srv.Close)
 	return srv

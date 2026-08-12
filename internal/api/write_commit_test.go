@@ -48,7 +48,7 @@ func wctServer(t *testing.T, e *testEnv) *httptest.Server {
 		cacheDir:    e.cacheDir,
 	}
 	mux := http.NewServeMux()
-	registerWriteCommitRoutes(mux, s, auth.NewVerifier(e.store))
+	registerWriteCommitRoutes(mux, s, auth.NewVerifier(e.store), nil)
 	srv := httptest.NewServer(recoverPanics(discardLogger())(mux))
 	t.Cleanup(srv.Close)
 	return srv

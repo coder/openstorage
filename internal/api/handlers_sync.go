@@ -32,14 +32,14 @@ import (
 // registerSyncRoutes registers pull-upstream + upstream detach. Scopes per
 // docs/02: pull-upstream is a ref mutation (git:write); detach is repo
 // lifecycle (repo:write). Both are repo-scoped.
-func registerSyncRoutes(mux *http.ServeMux, verifier auth.Verifier, s *syncServer) {
+func registerSyncRoutes(mux *http.ServeMux, verifier auth.Verifier, s *syncServer, rl *rateLimiter) {
 	assertf(mux != nil, "registerSyncRoutes: nil mux")
 	assertf(verifier != nil, "registerSyncRoutes: nil verifier")
 	assertf(s != nil, "registerSyncRoutes: nil syncServer")
 	mux.Handle("POST /api/v1/repos/pull-upstream",
-		requireAuth(verifier, false, auth.ScopeGitWrite)(http.HandlerFunc(s.handlePullUpstream)))
+		rl.limit(routeRead)(requireAuth(verifier, false, auth.ScopeGitWrite)(http.HandlerFunc(s.handlePullUpstream))))
 	mux.Handle("DELETE /api/v1/repos/base",
-		requireAuth(verifier, false, auth.ScopeRepoWrite)(http.HandlerFunc(s.handleDetachBase)))
+		rl.limit(routeRead)(requireAuth(verifier, false, auth.ScopeRepoWrite)(http.HandlerFunc(s.handleDetachBase))))
 }
 
 // usyncBaseRepo is the POST /repos base_repo object (docs/03).

@@ -74,6 +74,9 @@ func TestPackKeyHelpers(t *testing.T) {
 	if got, want := PackPrefix("r1"), "packs/r1/"; got != want {
 		t.Fatalf("PackPrefix = %q, want %q", got, want)
 	}
+	if got, want := LFSKey("r1", "abc"), "lfs/r1/abc"; got != want {
+		t.Fatalf("LFSKey = %q, want %q", got, want)
+	}
 }
 
 // TestOpenSchemeDispatch covers the factory's container-free paths: s3://

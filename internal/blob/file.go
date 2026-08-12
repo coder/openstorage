@@ -13,9 +13,11 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"time"
 
 	gcblob "gocloud.dev/blob"
 	"gocloud.dev/blob/fileblob"
+	"gocloud.dev/gcerrors"
 )
 
 // File implements BlobStore on a local directory via gocloud fileblob.
@@ -87,6 +89,19 @@ func (b *File) List(ctx context.Context, prefix string) ([]ListedObject, error) 
 	return bucketList(ctx, b.bucket, prefix)
 }
 
+// SignedURL is unsupported on the filesystem backend: it returns
+// ErrSignedURLUnsupported so callers fall back to proxying transfers
+// through the server (docs/05 local mode).
+func (b *File) SignedURL(_ context.Context, key, method string, expiry time.Duration) (string, error) {
+	assertSignedURLArgs(key, method, expiry)
+	return "", ErrSignedURLUnsupported
+}
+
+// Stat returns the size of the object at key (ErrNotFound when absent).
+func (b *File) Stat(ctx context.Context, key string) (int64, error) {
+	return bucketStat(ctx, b.bucket, key)
+}
+
 // bucketUploadFile streams the local file at path into bucket under key. It
 // is the single upload implementation for gocloud-backed BlobStores.
 func bucketUploadFile(ctx context.Context, bucket *gcblob.Bucket, key, path string) error {
@@ -132,6 +147,21 @@ func bucketDownloadFile(ctx context.Context, bucket *gcblob.Bucket, key, destPat
 		return err
 	}
 	return os.Rename(tmp.Name(), destPath)
+}
+
+// bucketStat returns the size of the object at key, mapping gocloud's
+// NotFound code onto the package-level ErrNotFound sentinel. It is the
+// single Stat implementation for gocloud-backed BlobStores.
+func bucketStat(ctx context.Context, bucket *gcblob.Bucket, key string) (int64, error) {
+	assertf(bucket != nil && key != "", "bucketStat(%q)", key)
+	attrs, err := bucket.Attributes(ctx, key)
+	if err != nil {
+		if gcerrors.Code(err) == gcerrors.NotFound {
+			return 0, fmt.Errorf("stat %s: %w", key, ErrNotFound)
+		}
+		return 0, fmt.Errorf("stat %s: %w", key, err)
+	}
+	return attrs.Size, nil
 }
 
 // bucketList returns all objects under prefix.
