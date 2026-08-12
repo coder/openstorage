@@ -201,6 +201,12 @@ type wrefCreateBranchRequest struct {
 	BaseBranch        string `json:"base_branch"` // deprecated; base_ref wins
 	BaseIsEphemeral   bool   `json:"base_is_ephemeral"`
 	TargetIsEphemeral bool   `json:"target_is_ephemeral"`
+	// Force CAS-recreates an existing target branch. Non-fast-forward moves
+	// stay subject to the no-force-push ref-policy op (real ancestry check).
+	Force bool `json:"force"`
+	// PreferredBase is the fallback base: used when no base_ref/base_branch
+	// is given, or when the primary base does not resolve.
+	PreferredBase string `json:"preferred_base"`
 }
 
 type wrefCreateBranchResponse struct {
@@ -211,8 +217,12 @@ type wrefCreateBranchResponse struct {
 }
 
 // handleCreateBranch resolves the base to a commit (branch, tag — peeled —
-// or hex sha via gitread.ResolveRef), policy-checks the new ref, and CAS
-// creates it. No new objects are created, so there is nothing to publish.
+// or hex sha via gitread.ResolveRef; preferred_base is the fallback when
+// the primary base is absent or unresolvable), policy-checks the new ref,
+// and CAS creates it. With force, an existing target is CAS-recreated at
+// the base — no-force-push policies still deny non-fast-forward moves via a
+// real ancestry check. No new objects are created, so there is nothing to
+// publish.
 func (s *server) handleCreateBranch(w http.ResponseWriter, r *http.Request) {
 	repo, ok := s.resolveReadRepo(w, r)
 	if !ok {
@@ -230,25 +240,60 @@ func (s *server) handleCreateBranch(w http.ResponseWriter, r *http.Request) {
 	if base == "" {
 		base = req.BaseBranch
 	}
-	if base == "" {
-		writeErr(w, http.StatusBadRequest, "base_ref or base_branch is required")
+	if base == "" && req.PreferredBase == "" {
+		writeErr(w, http.StatusBadRequest, "base_ref, base_branch, or preferred_base is required")
 		return
 	}
 	repoPath, ok := s.materializeReadRepo(w, r, repo.RepoID)
 	if !ok {
 		return
 	}
-	baseSHA, err := gitread.ResolveRef(r.Context(), repoPath, base, req.BaseIsEphemeral)
-	switch {
-	case errors.Is(err, gitread.ErrNotFound):
+	ctx := r.Context()
+	baseSHA := ""
+	if base != "" {
+		sha, err := gitread.ResolveRef(ctx, repoPath, base, req.BaseIsEphemeral)
+		switch {
+		case errors.Is(err, gitread.ErrNotFound):
+			// Fall through to preferred_base below (when given).
+		case err != nil:
+			s.internalErr(w, r, "resolve base ref", err)
+			return
+		default:
+			baseSHA = sha
+		}
+	}
+	if baseSHA == "" && req.PreferredBase != "" {
+		sha, err := gitread.ResolveRef(ctx, repoPath, req.PreferredBase, req.BaseIsEphemeral)
+		switch {
+		case errors.Is(err, gitread.ErrNotFound):
+			// Report below with the primary-base message.
+		case err != nil:
+			s.internalErr(w, r, "resolve preferred base ref", err)
+			return
+		default:
+			baseSHA = sha
+		}
+	}
+	if baseSHA == "" {
 		writeErr(w, http.StatusNotFound, "base ref not found")
-		return
-	case err != nil:
-		s.internalErr(w, r, "resolve base ref", err)
 		return
 	}
 	targetRef := wrefRefName(req.TargetBranch, req.TargetIsEphemeral)
-	deny, err := wrefPolicyCheck(mustClaims(r), targetRef, ref.ZeroSHA, baseSHA, nil)
+	// The CAS precondition: zero for plain create, the current tip when
+	// force re-creates an existing branch.
+	oldSHA := ref.ZeroSHA
+	if req.Force {
+		refs, ok := s.wrefListRefs(w, r, repo.RepoID)
+		if !ok {
+			return
+		}
+		if cur, exists := refs[targetRef]; exists {
+			oldSHA = cur
+		}
+	}
+	deny, err := wrefPolicyCheck(mustClaims(r), targetRef, oldSHA, baseSHA, func(a, b string) (bool, error) {
+		return wrefIsAncestor(ctx, repoPath, nil, a, b)
+	})
 	if err != nil {
 		s.internalErr(w, r, "evaluate ref policy", err)
 		return
@@ -257,17 +302,25 @@ func (s *server) handleCreateBranch(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusForbidden, deny)
 		return
 	}
-	won, err := s.refStore.CASRef(r.Context(), repo.RepoID, targetRef, ref.ZeroSHA, baseSHA)
+	won, err := s.refStore.CASRef(ctx, repo.RepoID, targetRef, oldSHA, baseSHA)
 	if err != nil {
 		s.internalErr(w, r, "create branch ref", err)
 		return
 	}
 	if !won {
+		if req.Force {
+			writeErr(w, http.StatusConflict, "branch moved concurrently")
+			return
+		}
 		writeErr(w, http.StatusConflict, "branch already exists")
 		return
 	}
+	message := "branch created"
+	if oldSHA != ref.ZeroSHA {
+		message = "branch updated"
+	}
 	writeJSON(w, http.StatusOK, wrefCreateBranchResponse{
-		Message:           "branch created",
+		Message:           message,
 		TargetBranch:      req.TargetBranch,
 		TargetIsEphemeral: req.TargetIsEphemeral,
 		CommitSHA:         baseSHA,

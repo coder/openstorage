@@ -267,6 +267,129 @@ func TestWriteRefsBranches(t *testing.T) {
 	})
 }
 
+// TestWriteRefsBranchForcePreferredBase covers the phase-5 carry-overs on
+// POST /repos/branches/create: force CAS-recreation of an existing branch
+// (with the no-force-push interaction backed by a real ancestry check) and
+// the preferred_base fallback.
+func TestWriteRefsBranchForcePreferredBase(t *testing.T) {
+	runBackends(t, func(t *testing.T, e *testEnv) {
+		srv := newWrefServer(t, e)
+		fx := wrefSeedFixture(t, e)
+
+		t.Run("force recreates an existing branch", func(t *testing.T) {
+			// Without force, an existing target conflicts.
+			resp, _ := wrefDo(t, srv, "POST", "/api/v1/repos/branches/create", fx.token,
+				map[string]any{"target_branch": "feature", "base_branch": "main"})
+			if resp.StatusCode != http.StatusConflict {
+				t.Fatalf("no-force recreate: status = %d, want 409", resp.StatusCode)
+			}
+			// force moves feature (c1) to the main tip (c2): fast-forward.
+			resp, body := wrefDo(t, srv, "POST", "/api/v1/repos/branches/create", fx.token,
+				map[string]any{"target_branch": "feature", "base_branch": "main", "force": true})
+			if resp.StatusCode != http.StatusOK || body["commit_sha"] != fx.c2 || body["message"] != "branch updated" {
+				t.Fatalf("force ff: status %d body %v", resp.StatusCode, body)
+			}
+			if got := wrefRefs(t, e, fx.repoID)["refs/heads/feature"]; got != fx.c2 {
+				t.Fatalf("refs/heads/feature = %q, want %s", got, fx.c2)
+			}
+			// force moves it back to c1: non-fast-forward, allowed without a
+			// no-force-push policy.
+			resp, body = wrefDo(t, srv, "POST", "/api/v1/repos/branches/create", fx.token,
+				map[string]any{"target_branch": "feature", "base_ref": fx.c1, "force": true})
+			if resp.StatusCode != http.StatusOK || body["commit_sha"] != fx.c1 {
+				t.Fatalf("force non-ff: status %d body %v", resp.StatusCode, body)
+			}
+			if got := wrefRefs(t, e, fx.repoID)["refs/heads/feature"]; got != fx.c1 {
+				t.Fatalf("refs/heads/feature = %q, want %s", got, fx.c1)
+			}
+		})
+
+		t.Run("force create of a missing branch behaves like create", func(t *testing.T) {
+			resp, body := wrefDo(t, srv, "POST", "/api/v1/repos/branches/create", fx.token,
+				map[string]any{"target_branch": "force-new", "base_branch": "main", "force": true})
+			if resp.StatusCode != http.StatusOK || body["message"] != "branch created" || body["commit_sha"] != fx.c2 {
+				t.Fatalf("status %d body %v", resp.StatusCode, body)
+			}
+		})
+
+		t.Run("no-force-push denies non-fast-forward force move", func(t *testing.T) {
+			tok := e.mint(t, tokenSpec{iss: fx.org, repo: fx.url,
+				scopes: []string{auth.ScopeGitRead, auth.ScopeGitWrite},
+				refs:   `[["refs/heads/guarded", ["no-force-push"]]]`})
+			// Creation is always fast-forward: allowed under the policy.
+			resp, body := wrefDo(t, srv, "POST", "/api/v1/repos/branches/create", tok,
+				map[string]any{"target_branch": "guarded", "base_branch": "main"})
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("guarded create: status %d body %v", resp.StatusCode, body)
+			}
+			// Non-fast-forward force move (c2 -> c1): denied 403.
+			resp, body = wrefDo(t, srv, "POST", "/api/v1/repos/branches/create", tok,
+				map[string]any{"target_branch": "guarded", "base_ref": fx.c1, "force": true})
+			if resp.StatusCode != http.StatusForbidden {
+				t.Fatalf("guarded non-ff force: status %d body %v, want 403", resp.StatusCode, body)
+			}
+			if got := wrefRefs(t, e, fx.repoID)["refs/heads/guarded"]; got != fx.c2 {
+				t.Fatalf("refs/heads/guarded = %q after denied force, want %s", got, fx.c2)
+			}
+			// Fast-forward force moves stay allowed: rewind with the
+			// unpoliced token, then force-forward under the policy.
+			resp, _ = wrefDo(t, srv, "POST", "/api/v1/repos/branches/create", fx.token,
+				map[string]any{"target_branch": "guarded", "base_ref": fx.c1, "force": true})
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("rewind guarded: status %d", resp.StatusCode)
+			}
+			resp, body = wrefDo(t, srv, "POST", "/api/v1/repos/branches/create", tok,
+				map[string]any{"target_branch": "guarded", "base_ref": fx.c2, "force": true})
+			if resp.StatusCode != http.StatusOK || body["commit_sha"] != fx.c2 {
+				t.Fatalf("guarded ff force: status %d body %v", resp.StatusCode, body)
+			}
+		})
+
+		t.Run("preferred_base backs an unresolvable primary base", func(t *testing.T) {
+			resp, body := wrefDo(t, srv, "POST", "/api/v1/repos/branches/create", fx.token,
+				map[string]any{"target_branch": "pb-fallback", "base_branch": "no-such-branch", "preferred_base": "main"})
+			if resp.StatusCode != http.StatusOK || body["commit_sha"] != fx.c2 {
+				t.Fatalf("status %d body %v", resp.StatusCode, body)
+			}
+			if got := wrefRefs(t, e, fx.repoID)["refs/heads/pb-fallback"]; got != fx.c2 {
+				t.Fatalf("refs/heads/pb-fallback = %q, want %s", got, fx.c2)
+			}
+		})
+
+		t.Run("preferred_base alone is a valid base", func(t *testing.T) {
+			resp, body := wrefDo(t, srv, "POST", "/api/v1/repos/branches/create", fx.token,
+				map[string]any{"target_branch": "pb-only", "preferred_base": fx.c1})
+			if resp.StatusCode != http.StatusOK || body["commit_sha"] != fx.c1 {
+				t.Fatalf("status %d body %v", resp.StatusCode, body)
+			}
+		})
+
+		t.Run("primary base wins over preferred_base", func(t *testing.T) {
+			resp, body := wrefDo(t, srv, "POST", "/api/v1/repos/branches/create", fx.token,
+				map[string]any{"target_branch": "pb-loses", "base_ref": fx.c1, "preferred_base": "main"})
+			if resp.StatusCode != http.StatusOK || body["commit_sha"] != fx.c1 {
+				t.Fatalf("status %d body %v", resp.StatusCode, body)
+			}
+		})
+
+		t.Run("unresolvable primary and preferred base is 404", func(t *testing.T) {
+			resp, _ := wrefDo(t, srv, "POST", "/api/v1/repos/branches/create", fx.token,
+				map[string]any{"target_branch": "pb-none", "base_branch": "nope", "preferred_base": "also-nope"})
+			if resp.StatusCode != http.StatusNotFound {
+				t.Fatalf("status = %d, want 404", resp.StatusCode)
+			}
+		})
+
+		t.Run("missing base and preferred_base is 400", func(t *testing.T) {
+			resp, _ := wrefDo(t, srv, "POST", "/api/v1/repos/branches/create", fx.token,
+				map[string]any{"target_branch": "pb-missing"})
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400", resp.StatusCode)
+			}
+		})
+	})
+}
+
 func TestWriteRefsTags(t *testing.T) {
 	runBackends(t, func(t *testing.T, e *testEnv) {
 		srv := newWrefServer(t, e)
