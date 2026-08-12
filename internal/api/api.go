@@ -100,6 +100,7 @@ func New(cfg Config) http.Handler {
 	// the handlers (handlers_write_commit.go, handlers_write_refs.go).
 	registerWriteCommitRoutes(mux, s, cfg.Verifier)
 	s.registerWriteRefRoutes(mux, cfg.Verifier)
+	s.registerWriteMergeRoutes(mux, cfg.Verifier)
 
 	if cfg.Fallback != nil {
 		mux.Handle("/", cfg.Fallback)

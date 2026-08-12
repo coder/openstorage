@@ -72,12 +72,9 @@ const wmMaxConflictSideBytes = 1 << 20
 // a conflict side above wmMaxConflictSideBytes.
 const wmFilteredReasonTooLarge = "max_content_bytes_exceeded"
 
-// registerWriteMergeRoutes mounts the merge endpoints with the per-route
-// auth middleware (scope table docs/02: merge needs git:write, the
-// read-only preview needs git:read). INTEGRATION NOTE: api.New does not
-// call this yet — the api.go route table is owned by the foundation slice;
-// adding `s.registerWriteMergeRoutes(mux, cfg.Verifier)` there completes
-// wiring.
+// registerWriteMergeRoutes mounts the merge endpoints (called from api.New)
+// with the per-route auth middleware (scope table docs/02: merge needs
+// git:write, the read-only preview needs git:read).
 func (s *server) registerWriteMergeRoutes(mux *http.ServeMux, verifier auth.Verifier) {
 	assertf(mux != nil && s != nil && verifier != nil, "registerWriteMergeRoutes: nil dependency")
 	mux.Handle("POST /api/v1/repos/merge",
