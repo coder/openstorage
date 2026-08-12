@@ -37,6 +37,7 @@ signature scheme), which gives high confidence that the extracted spec is correc
 11. [11-local-backends-implementation-notes.md](11-local-backends-implementation-notes.md) — ADRs from the pluggable-storage interlude (local mode: SQLite + file blobs)
 12. [12-phase3-implementation-notes.md](12-phase3-implementation-notes.md) — ADRs from phase 3 (read API)
 13. [13-phase4-implementation-notes.md](13-phase4-implementation-notes.md) — ADRs from phase 4 (write API + p3 read burn-down)
+14. [14-phase5-implementation-notes.md](14-phase5-implementation-notes.md) — ADRs from phase 5 (eventing, upstream sync, credentials, fork)
 
 `upstream/` contains verbatim copies of the official OpenAPI spec and doc pages for reference.
 

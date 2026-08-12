@@ -64,8 +64,8 @@ semantics, the deprecated `ops` fallback, the ephemeral policy quirk, and `verif
 backed by an org signing-key registry (`codestorage signing-key`, keyring read fresh from
 Postgres each push). `CODESTORAGE_BASE_URL` makes `http_url` routable behind 0.0.0.0
 binds. Decisions are recorded in
-[10-phase2-implementation-notes.md](10-phase2-implementation-notes.md). Phases 5–6 below
-are not started.
+[10-phase2-implementation-notes.md](10-phase2-implementation-notes.md). Phase 6 below
+is not started.
 
 **Interlude — pluggable storage backends (local mode): done.** Before phase 3, the storage
 layer went behind URL-scheme factories (`ref.Open` / `blob.Open` / `meta.Open`) with two
@@ -102,9 +102,17 @@ the container-based acceptance suites gained zero-container lanes (api `/sqlite`
    just-code-storage consumer drives, both backend lanes, live dogfood transcripts — still
    to be produced.* Decisions are recorded in
    [13-phase4-implementation-notes.md](13-phase4-implementation-notes.md).
-5. **Eventing & sync.** `push` webhooks with HMAC signatures; upstream `base_repo` sync
-   workers (clone/mirror from github and other providers, pull-upstream 202, sync webhooks,
-   git-credentials CRUD); forking (`provider: "code"`).
+5. **Eventing & sync — done.** `push` webhooks with HMAC signatures, emitted by a CASRef
+   decorator on the ref authority; upstream `base_repo` sync workers (mirror fetch +
+   loopback push through our own git endpoint, pull-upstream 202, `repo.sync.*` webhooks,
+   git-credentials CRUD); webhook CRUD; synchronous forking (`provider: "code"`).
+   Background work goes through a queue seam: durable River jobs on Postgres, in-process
+   in local mode (local git pushes deliver synchronously and don't schedule syncs — ADR-33
+   in 14). *Gate: all test lanes green on both backends (incl. River against real
+   Postgres) plus a live local-mode dogfood — real `git push` → HMAC-verified `push`
+   webhook, fork through `POST /repos`, upstream mirror round-trip, pull-upstream 202
+   with signed `repo.sync.started/succeeded` events.* Decisions are recorded in
+   [14-phase5-implementation-notes.md](14-phase5-implementation-notes.md).
 6. **LFS + polish.** LFS batch API; named-repo path style (`/api/repos/{repo_name}/...`)
    as routing aliases; rate limiting; `GET /api/repo-urls/{repo_id}`.
 
@@ -147,4 +155,5 @@ The vendor's SDKs are the conformance suite:
   the namespaced name (see ADR-3 in 08); the promotion-cost question is still open.
 - Cursor encoding: opaque to clients; base64(JSON{offset|last-key}) is fine. *Settled in
   phase 1:* unpadded base64url keyset cursor (see 09).
-- Webhook endpoint management API (not publicly specified — design freely).
+- Webhook endpoint management API (not publicly specified — design freely). *Settled in
+  phase 5:* self-defined org-scoped CRUD, secret shown once at registration (ADR-29 in 14).

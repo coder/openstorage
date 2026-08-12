@@ -3,17 +3,21 @@
 An open-source, wire-compatible backend for [code.storage](https://code.storage), built from
 the specification in [`docs/`](docs/README.md).
 
-Current state: **phase 4 (write API) implemented** (review burn-down + dogfood-gate
-transcripts pending). One Go binary (`codestorage serve`) exposes the `/api/v1` repo CRUD
+Current state: **phase 5 (eventing & sync) implemented**. One Go binary
+(`codestorage serve`) exposes the `/api/v1` repo CRUD
 API, the full `git:read` surface (files, branches, tags, commits, diff, blame, grep, notes,
 archive — cursor pagination, conditional/range file streaming), the `git:write` surface
 (NDJSON commit-pack / diff-commit streaming, restore-commit, merge + read-only preview,
-branch / tag / notes writes — CAS and ref policies everywhere), and the production git
+branch / tag / notes writes — CAS and ref policies everywhere), the production git
 smart-HTTP path (clone/push, ref-policy enforcement, commit-signature verification) behind
-the same per-org JWT verifier; nodes are stateless. Storage is selected by URL scheme:
-Postgres + S3 (MinIO) for multi-node deployments, or zero-dependency local mode (SQLite +
-plain files via `serve --data-dir`). Next: the remaining p4 review fixes (burn-down list in
-docs/13) and the phase-4 gate evidence, then phase 5 (eventing & sync) — see
+the same per-org JWT verifier, and the eventing/sync surface: HMAC-signed `push` and
+`repo.sync.*` webhooks, webhook + git-credentials CRUD, upstream `base_repo` mirror sync
+with `pull-upstream`, and synchronous forking. Background jobs run through a queue seam —
+durable [River](https://riverqueue.com) jobs on Postgres (tables migrated automatically at
+startup) or in-process in local mode — and nodes stay stateless. Storage is selected by URL
+scheme: Postgres + S3 (MinIO) for multi-node deployments, or zero-dependency local mode
+(SQLite + plain files via `serve --data-dir`). Next: the remaining p4 review burn-down +
+gate evidence (docs/13), then phase 6 (LFS + polish) — see
 [docs/07-implementation-roadmap.md](docs/07-implementation-roadmap.md).
 
 ## Layout
@@ -24,11 +28,14 @@ docs/13) and the phase-4 gate evidence, then phase 5 (eventing & sync) — see
 | `cmd/codestorage` | Service binary: `serve`, `hook`, `keygen`, `mint`, `signing-key`, `list-packs` |
 | `internal/api` | `/api/v1` HTTP handlers, JWT middleware, `{"error"}` envelope |
 | `internal/auth` | JWT verification contract (per-org public keys, allowed algorithms) |
-| `internal/meta` | Metadata store: orgs, org public keys, repos (soft delete, pagination) |
+| `internal/meta` | Metadata store: orgs, org public keys, repos, webhooks, git credentials, upstream links |
 | `internal/blob` | `BlobStore` contract + S3/MinIO and local-file implementations (immutable packs) |
 | `internal/ref` | `RefStore` contract + Postgres and SQLite implementations (CAS ref authority) |
 | `internal/gitread` | Read-side git plumbing (ls-tree, log, diff, blame, grep, archive) over the hydrated cache repo |
 | `internal/githttp` | Git smart-HTTP server + policy/verify-sig hooks, cache hydration, e2e suite |
+| `internal/events` | Outbound webhooks: HMAC-signed delivery + the push-event `RefStore` decorator |
+| `internal/sync` | Upstream mirror sync worker (fetch + loopback push), credential/upstream contracts |
+| `internal/jobs` | Background queue seam: durable River jobs (Postgres) or in-process (local mode) |
 | `docker-compose.yml` | Postgres + MinIO for local dogfooding |
 
 ## Quickstart

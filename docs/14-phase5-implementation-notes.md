@@ -5,11 +5,15 @@ sync with the loopback-push worker (`internal/sync`, `internal/api/handlers_sync
 git-credential and webhook CRUD (`handlers_credentials.go`, `handlers_webhooks.go`), and
 synchronous repo forking (`handlers_fork.go`) — plus the workstream-F carry-over backlog
 recorded at the end. Contract sources: docs/01 invariants 11–12, docs/02, docs/03
-"Upstream sync"/"Git credentials", docs/06. `api.New` (api.go) stayed frozen this phase:
-route wiring for the new surfaces is the integrator's job, and the exact registration
-lines live in the seam comments of `handlers_credentials.go` (sync + credentials) and
-`handlers_fork.go` (fork-aware `POST /repos`). **Final wiring notes are appended to this
-document by the integrator once those routes land in `api.New`.**
+"Upstream sync"/"Git credentials", docs/06. Route registration and process assembly are
+described in "Integrator wiring" below; the cross-process queue story for git-push
+events is ADR-33.
+
+Every prior decision — PG as ref authority (ADR-1), blob upload strictly before the ref
+flip (ADR-2), namespace mapping via separate ref stores (ADR-3) — still holds and is
+load-bearing here: push events hang off a decorator on the ref authority (ADR-28), and
+the sync worker's loopback push reuses the S3-before-ref-flip write pipeline instead of
+growing a second one (ADR-30).
 
 ## ADR-27: Jobs are a queue seam — River on Postgres, in-process goroutines in local mode
 
@@ -67,6 +71,14 @@ Overlap is prevented by `BeginSync`'s atomic claim (`ErrSyncInProgress` → sile
 invariant 11), and the run lifecycle emits the documented `repo.sync.started/succeeded/
 failed` events with the exact docs/06 error strings.
 
+Two consequences of the loopback design are enforced explicitly. The loopback push runs
+with an internally minted token that carries no ref policies, so `handlePullUpstream`
+checks the *caller's* policies before enqueuing — any restrictive policy op denies
+pull-upstream fail-closed rather than letting the worker bypass it. And because
+`upstream_host` becomes a fetch URL, `validateSyncBaseRepo` accepts only a bare
+`hostname[:port]` or an http(s) base URL, and the worker pins `GIT_ALLOW_PROTOCOL`
+(default `http:https`) so `file://`/`ssh://` and friends cannot be smuggled in.
+
 ## ADR-31: Forking is synchronous — a one-shot deterministic clone inside POST /repos
 
 `base_repo: {provider: "code"|"code.storage", operation: "fork", auth: {token}}` forks an
@@ -82,7 +94,9 @@ would need either a lying response or a polling surface that docs/03 does not de
 Finally, the local-mode queue loses jobs on restart (ADR-27): an async fork could leave a
 permanently empty shell repo, while the synchronous flow is atomic-or-abandoned —
 everything up to and including packing happens *before* the repo row is created, and any
-failure after the row exists soft-deletes it (`forkAbandon`), so no orphaned live repo
+failure after the row exists soft-deletes it (`forkAbandon` — which detaches from the
+possibly-canceled request context via `context.WithoutCancel` plus a bounded timeout, so
+a client disconnect mid-failure still cleans up), so no orphaned live repo
 remains. A lost race or crash can strand at most an unreferenced immutable pack, the same
 debris every write pipeline may leave.
 
@@ -124,6 +138,63 @@ are never logged (worker and delivery code paths keep them out of errors and slo
 fields), webhook secrets are shown exactly once at registration (ADR-29), and credential
 reads are scoped to the sync worker. Revisit when a KMS/keystore seam exists.
 
+## ADR-33: Git-push eventing crosses processes — durable River inserts on pg, synchronous deliveries in local mode
+
+Git pushes mutate refs in the `codestorage hook` subprocess (the pre-receive/update
+re-exec), not in the serve process, so ADR-28's CASRef decorator needs a queue reachable
+*across processes* there. Decision: **queue construction dispatches on the metadata DB
+URL scheme** (the same dispatch as `meta.Open`/`ref.Open`), with asymmetric semantics:
+
+- **Postgres:** the hook builds an insert-only River client
+  (`jobs.NewRiverInsertOnly` — no migrations; hooks never run DDL) and inserts durable
+  delivery/sync jobs that the serve process's full River client works. Serve owns the
+  schema: `jobs.NewRiver` runs `rivermigrate` at startup, and sync jobs are unique per
+  repo across active job states (`river.UniqueOpts`), so duplicate enqueues collapse —
+  the durable twin of `InProcessQueue`'s coalescing (invariant 11).
+- **Local mode:** there is no shared durable queue, so the hook delivers webhooks
+  *synchronously* with bounded attempts (3) before the hook exits — the subprocess IS
+  the queue — and git-surface pushes do **not** schedule upstream syncs (API writes
+  still do). Accepted gap, consistent with ADR-27's durability trade-off: a missed sync
+  re-enqueues on the next API write or `pull-upstream`.
+
+Failure stance is fail-open: if the hook cannot open the meta store or build the queue,
+eventing is disabled for that push rather than the push denied — same reasoning as
+ADR-28, un-notified is recoverable while un-pushed work is a user-visible outage.
+
+## Integrator wiring
+
+The phase-5 routes landed in `api.New` (api.go) as follows:
+
+- `RegisterWebhookRoutes` — `POST/GET /api/v1/webhooks`, `DELETE /api/v1/webhooks/{id}`
+  (ADR-29), backed by `events.MetaWebhookStore{Store: cfg.Store}`.
+- `registerCredentialRoutes` + `registerSyncRoutes` on the `syncServer` —
+  git-credentials CRUD, `POST /api/v1/repos/pull-upstream`, `DELETE /api/v1/repos/base`.
+- `POST /api/v1/repos` is now `s.forkAwareCreateRepo(cfg.Verifier, ss.handleCreateRepo)`:
+  code/code.storage fork specs dispatch to the synchronous fork (ADR-31), everything
+  else replays to the sync-aware creator, which embeds the frozen phase-1 create flow.
+- `Config.SyncQueue` (a `sync.Queue`) is a new **required** field; the serve command
+  passes the jobs seam, tests may pass a recorder/no-op.
+
+Supporting pieces outside `internal/api`:
+
+- **Persistence:** `meta.EventingStore` (internal/meta/eventing.go) declares the
+  webhook / git-credential / repo-upstream rows plus the atomic
+  `TryBeginSync`/`FinishSync` claim, implemented on both Postgres and SQLite and
+  embedded into `meta.Store`. The thin adapters `events.MetaWebhookStore` and
+  `sync.MetaStores` map it onto the slice-owned store contracts (type and sentinel
+  drift stays at the boundary; the frozen packages did not change).
+- **Serve assembly** (cmd/codestorage/wire.go + wire_eventing.go):
+  `buildServeEventing` picks the queue by DB scheme (ADR-27/33), builds the webhook
+  deliverer and sync worker, and returns the `events.NewRefStore` decorate func that
+  wraps the API's `RefStore` — so API ref writes emit push events. The hook subprocess
+  gets the same decorator via `wireHookEventing` setting `githttp.WrapHookRefStore`
+  (ADR-33).
+- **Loopback signing key:** serve generates a per-process ES256 keypair and appends its
+  public half to the org's registered keys at bootstrap (`UpsertOrgWithKeys`), so the
+  sync worker's internally minted short-lived (15 min) `git:write` JWTs verify at our
+  own smart-HTTP endpoint (ADR-30). The key rotates every process start and the private
+  half never leaves memory.
+
 ## Workstream-F carry-over backlog (landed with this slice)
 
 Fix-where-touched items from the phase-5 plan that landed alongside workstream E:
@@ -141,9 +212,3 @@ Fix-where-touched items from the phase-5 plan that landed alongside workstream E
    `no-force-push` ref-policy op via a real `merge-base --is-ancestor` check;
    `preferred_base` is the fallback base when none is given or the primary base does not
    resolve (write_refs_test.go covers the force/no-force-push interaction).
-
-## Integrator wiring (to be appended)
-
-The registration lines for the phase-5 routes (credentials, webhooks, sync,
-fork-aware `POST /repos`) are documented next to their handlers; this section is
-completed by the integration slice once `api.New` picks them up.
