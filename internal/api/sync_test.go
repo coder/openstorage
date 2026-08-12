@@ -393,6 +393,21 @@ func TestUpstreamSyncLifecycle(t *testing.T) {
 			t.Fatalf("loopback main after pull = %q, want %q", got, newHead)
 		}
 
+		// A token carrying any restrictive ref policy must not trigger a
+		// sync: the loopback push runs with an unpoliced internal token,
+		// so pull-upstream would launder policed ref updates.
+		policedToken := s.e.mint(t, tokenSpec{iss: s.org, repo: repoURL,
+			scopes: []string{auth.ScopeGitWrite}, refs: `[["main", ["no-push"]]]`})
+		resp, respBody = s.req(t, http.MethodPost, "/api/v1/repos/pull-upstream", policedToken, nil)
+		if resp.StatusCode != http.StatusForbidden {
+			t.Fatalf("policed pull-upstream status %d: %s", resp.StatusCode, respBody)
+		}
+		var denied map[string]string
+		if err := json.Unmarshal(respBody, &denied); err != nil || denied["error"] != `ref policy op "no-push" denies pull-upstream` {
+			t.Fatalf("policed pull-upstream body = %s (err %v)", respBody, err)
+		}
+		s.assertNoEvent(t)
+
 		// Break the credential (org-scoped PUT), pull again: the exact
 		// documented failure string must surface.
 		cred, err := s.mem.CredentialForRepo(context.Background(), repoID)
@@ -477,6 +492,13 @@ func TestCreateRepoBaseRepoValidation(t *testing.T) {
 			{"bad operation", `{"provider":"github","owner":"o","name":"n","operation":"mirror"}`, `invalid base_repo operation "mirror"`},
 			{"gitea needs host", `{"provider":"gitea","owner":"o","name":"n"}`, `base_repo upstream_host is required for provider "gitea"`},
 			{"missing owner", `{"provider":"github","name":"n"}`, "base_repo owner and name are required"},
+			// upstream_host becomes a git fetch URL: only http(s) bases or
+			// bare hostname[:port] forms may reach the sync worker.
+			{"file upstream_host", `{"provider":"gitea","owner":"o","name":"n","upstream_host":"file:///srv/git"}`, `invalid base_repo upstream_host "file:///srv/git"`},
+			{"ssh upstream_host", `{"provider":"gitea","owner":"o","name":"n","upstream_host":"ssh://git@host/x"}`, `invalid base_repo upstream_host "ssh://git@host/x"`},
+			{"ext transport upstream_host", `{"provider":"gitea","owner":"o","name":"n","upstream_host":"ext::sh -c id"}`, `invalid base_repo upstream_host "ext::sh -c id"`},
+			{"userinfo upstream_host", `{"provider":"github","owner":"o","name":"n","upstream_host":"https://u:p@github.com"}`, `invalid base_repo upstream_host "https://u:p@github.com"`},
+			{"path in bare upstream_host", `{"provider":"gitea","owner":"o","name":"n","upstream_host":"host.example/../../etc"}`, `invalid base_repo upstream_host "host.example/../../etc"`},
 		}
 		for _, c := range cases {
 			t.Run(c.name, func(t *testing.T) {

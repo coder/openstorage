@@ -55,6 +55,19 @@ type Worker struct {
 	Logger      *slog.Logger
 	// Timeout caps one run; 0 means defaultRunTimeout.
 	Timeout time.Duration
+	// AllowProtocol overrides GIT_ALLOW_PROTOCOL for the run's git
+	// transfers; empty means "http:https". Only tests widen it (file://
+	// endpoints); production keeps the default so hostile upstream rows
+	// can never reach local files, ssh, or transport helpers (ext::).
+	AllowProtocol string
+}
+
+// allowProtocol resolves the effective GIT_ALLOW_PROTOCOL value.
+func (w *Worker) allowProtocol() string {
+	if w.AllowProtocol == "" {
+		return "http:https"
+	}
+	return w.AllowProtocol
 }
 
 func (w *Worker) assertReady() {
@@ -187,7 +200,7 @@ func (w *Worker) transfer(ctx context.Context, job Job, repo RepoInfo, up Upstre
 	defer os.RemoveAll(tmp)
 	mirror := filepath.Join(tmp, "mirror.git")
 
-	if stderr, err := runGit(ctx, tmp, hermeticGitEnv(), "init", "--bare", mirror); err != nil {
+	if stderr, err := runGit(ctx, tmp, hermeticGitEnv(w.allowProtocol()), "init", "--bare", mirror); err != nil {
 		return &syncFailure{code: FailInternal, cause: fmt.Errorf("git init: %w: %s", err, stderr)}
 	}
 
@@ -203,7 +216,7 @@ func (w *Worker) transfer(ctx context.Context, job Job, repo RepoInfo, up Upstre
 	if username == "" {
 		username = "git"
 	}
-	fetchEnv, err := authGitEnv(filepath.Join(tmp, "askpass-fetch.sh"), username, password)
+	fetchEnv, err := authGitEnv(filepath.Join(tmp, "askpass-fetch.sh"), username, password, w.allowProtocol())
 	if err != nil {
 		return &syncFailure{code: FailInternal, cause: err}
 	}
@@ -221,7 +234,7 @@ func (w *Worker) transfer(ctx context.Context, job Job, repo RepoInfo, up Upstre
 	}
 
 	// Empty upstream: nothing to push, the run still counts as a success.
-	refs, stderr, err := runGitOut(ctx, mirror, hermeticGitEnv(), "for-each-ref", "--count=1", "--format=%(refname)")
+	refs, stderr, err := runGitOut(ctx, mirror, hermeticGitEnv(w.allowProtocol()), "for-each-ref", "--count=1", "--format=%(refname)")
 	if err != nil {
 		return &syncFailure{code: FailInternal, cause: fmt.Errorf("git for-each-ref: %w: %s", err, stderr)}
 	}
@@ -234,7 +247,7 @@ func (w *Worker) transfer(ctx context.Context, job Job, repo RepoInfo, up Upstre
 		return &syncFailure{code: FailInternal, cause: fmt.Errorf("mint loopback token: %w", err)}
 	}
 	// docs/05: git basic auth is username "t", password = JWT.
-	pushEnv, err := authGitEnv(filepath.Join(tmp, "askpass-push.sh"), "t", token)
+	pushEnv, err := authGitEnv(filepath.Join(tmp, "askpass-push.sh"), "t", token, w.allowProtocol())
 	if err != nil {
 		return &syncFailure{code: FailInternal, cause: err}
 	}
@@ -284,12 +297,18 @@ func classifyFetchFailure(stderr string) string {
 
 // hermeticGitEnv is the base environment for worker git invocations:
 // prompts disabled, host/global git config masked out (credential helpers
-// or URL rewrites there must not leak into sync transfers).
-func hermeticGitEnv() []string {
+// or URL rewrites there must not leak into sync transfers), and transports
+// pinned via GIT_ALLOW_PROTOCOL — the fetch URL derives from an
+// attacker-controlled upstream_host, so file://, ssh://, and transport
+// helpers (ext::) must be unreachable even if a hostile row slips past the
+// API-layer validation.
+func hermeticGitEnv(allowProtocol string) []string {
+	assertf(allowProtocol != "", "hermeticGitEnv: empty allowProtocol")
 	return append(os.Environ(),
 		"GIT_TERMINAL_PROMPT=0",
 		"GIT_CONFIG_GLOBAL=/dev/null",
 		"GIT_CONFIG_SYSTEM=/dev/null",
+		"GIT_ALLOW_PROTOCOL="+allowProtocol,
 	)
 }
 
@@ -297,8 +316,8 @@ func hermeticGitEnv() []string {
 // given basic-auth credentials. Secrets travel via the child process
 // environment only — never argv (visible in ps) and never logs. An empty
 // password installs no helper (public upstream / file:// loopback).
-func authGitEnv(scriptPath, username, password string) ([]string, error) {
-	env := hermeticGitEnv()
+func authGitEnv(scriptPath, username, password, allowProtocol string) ([]string, error) {
+	env := hermeticGitEnv(allowProtocol)
 	if password == "" {
 		return env, nil
 	}

@@ -171,6 +171,20 @@ func testCreateRepoValidation(t *testing.T, e *testEnv) {
 	// rejected (valid providers are exercised by sync_test.go).
 	createRepo(t, e, org, "v-"+randomHex(t, 4),
 		[]byte(`{"base_repo":{"provider":"unknown-forge","owner":"o","name":"n"}}`), http.StatusBadRequest)
+	// The fork dispatcher is wired into api.New: a code-provider fork spec
+	// reaches handleForkRepo — whose 400 names the missing source token —
+	// never the sync creator's `operation "fork" not supported` envelope.
+	{
+		tok := e.mint(t, tokenSpec{iss: org, repo: "v-" + randomHex(t, 4), scopes: []string{auth.ScopeRepoWrite}})
+		resp, body := e.doReq(t, http.MethodPost, "/api/v1/repos", tok,
+			[]byte(`{"base_repo":{"provider":"code","operation":"fork"}}`), "")
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("fork without source token status = %d (body %s)", resp.StatusCode, body)
+		}
+		if msg := requireEnvelope(t, resp, body); msg != `base_repo.auth.token is required for provider "code"` {
+			t.Fatalf("fork dispatch error = %q, want the fork handler's missing-token message", msg)
+		}
+	}
 
 	// Empty body defaults the branch to main.
 	repoURL := "v-" + randomHex(t, 4)

@@ -6,20 +6,23 @@ package api
 //	POST   /api/v1/repos/pull-upstream  git:write   {ref?, after?} -> 202 {"message": "Repository sync initiated successfully"}
 //	DELETE /api/v1/repos/base           repo:write  idempotent detach -> 200 {"message": "repository detached"}
 //
-// See handlers_credentials.go for the integration seam: api.New (frozen)
-// must call registerSyncRoutes and swap its POST /repos route to
-// (*syncServer).handleCreateRepo, which extends the frozen
-// (*server).handleCreateRepo flow with base_repo support.
+// api.New calls registerSyncRoutes and wires (*syncServer).handleCreateRepo
+// — which extends the frozen (*server).handleCreateRepo flow with base_repo
+// support — as the POST /repos fallback of the fork dispatcher
+// (handlers_fork.go, workstream E).
 //
-// base_repo {operation: "fork"} is a separate slice (workstream E); this
-// handler rejects it with a 400 envelope until that lands.
+// base_repo {operation: "fork"} for code/code.storage is dispatched to the
+// fork handler before reaching this creator; the 400 below covers fork
+// requests for providers the dispatcher does not own.
 
 import (
 	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
+	neturl "net/url"
 	"strconv"
+	"strings"
 
 	"codestorage/internal/auth"
 	"codestorage/internal/meta"
@@ -82,6 +85,9 @@ func validateSyncBaseRepo(spec *usyncBaseRepo) (host, errMsg string) {
 		return "", "base_repo owner and name are required"
 	}
 	host = spec.UpstreamHost
+	if host != "" && !validUpstreamHost(host) {
+		return "", "invalid base_repo upstream_host " + strconv.Quote(spec.UpstreamHost)
+	}
 	if host == "" {
 		host = defaultHost
 	}
@@ -89,6 +95,30 @@ func validateSyncBaseRepo(spec *usyncBaseRepo) (host, errMsg string) {
 		return "", "base_repo upstream_host is required for provider " + strconv.Quote(spec.Provider)
 	}
 	return host, ""
+}
+
+// validUpstreamHost accepts the two documented upstream_host shapes — a
+// bare hostname[:port] or an http(s):// base URL — and nothing else.
+// upsync.CloneURL uses the value verbatim as the base of a git fetch URL,
+// so file://, ssh://, transport helpers (ext::), embedded credentials, and
+// query/fragment noise must be rejected here, where the attacker-controlled
+// value enters (the worker additionally pins GIT_ALLOW_PROTOCOL).
+func validUpstreamHost(host string) bool {
+	assertf(host != "", "validUpstreamHost: empty host")
+	if !strings.Contains(host, "://") {
+		// Bare host[:port]: must round-trip as exactly the authority
+		// component (no path, userinfo, or control characters).
+		u, err := neturl.Parse("https://" + host)
+		return err == nil && u.Host == host && u.User == nil &&
+			u.Path == "" && u.RawQuery == "" && u.Fragment == ""
+	}
+	u, err := neturl.Parse(host)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
+		return false
+	}
+	// A path is allowed (sub-path-hosted forges); credentials belong in
+	// the credential store, never in the URL.
+	return u.Host != "" && u.User == nil && u.RawQuery == "" && u.Fragment == ""
 }
 
 // handleCreateRepo is the base_repo-aware POST /api/v1/repos (scope
@@ -219,16 +249,41 @@ type usyncPullUpstreamRequest struct {
 // pullUpstreamAcceptedMsg is the exact documented 202 body message.
 const pullUpstreamAcceptedMsg = "Repository sync initiated successfully"
 
+// policyDeniesPullUpstream reports whether any policy rule carries an op
+// that denies triggering a sync. The worker mirror-pushes refs/heads/* and
+// refs/tags/* through a loopback token that carries NO ref policies, with
+// upstream state winning (force refspecs) and commits this server cannot
+// signature-verify — so a policed caller must not launder ref updates
+// through it. Every op fails closed: no-push denies all updates,
+// no-force-push denies the potential non-fast-forwards, verify-sig cannot
+// be satisfied, and unknown ops fail closed (same coarseness as
+// policyDeniesRepoDelete: the pattern is not consulted because the sync
+// may touch any synced ref).
+func policyDeniesPullUpstream(policies []auth.RefPolicy) (string, bool) {
+	for _, rule := range policies {
+		if len(rule.Ops) > 0 {
+			return rule.Ops[0], true
+		}
+	}
+	return "", false
+}
+
 // handlePullUpstream implements POST /api/v1/repos/pull-upstream (scope
 // git:write): enqueue a sync for the JWT repo claim target. 400 when the
 // repo has no upstream base_repo (docs/03: "only for repos with base_repo").
 func (s *syncServer) handlePullUpstream(w http.ResponseWriter, r *http.Request) {
 	claims := mustClaims(r)
-	// docs/02: ref policies apply to every HTTP write endpoint. The sync
-	// itself writes refs through the loopback push (policy-checked there);
-	// a malformed policy claim still fails closed here.
-	if _, err := refPolicies(claims); err != nil {
+	// docs/02: ref policies apply to every HTTP write endpoint. The
+	// loopback push runs with an unpoliced internal token, so the caller's
+	// policies are enforced here, before the sync is enqueued; malformed
+	// policy claims fail closed.
+	policies, err := refPolicies(claims)
+	if err != nil {
 		writeErr(w, http.StatusForbidden, err.Error())
+		return
+	}
+	if op, denied := policyDeniesPullUpstream(policies); denied {
+		writeErr(w, http.StatusForbidden, "ref policy op "+strconv.Quote(op)+" denies pull-upstream")
 		return
 	}
 	var req usyncPullUpstreamRequest

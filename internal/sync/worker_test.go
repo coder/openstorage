@@ -119,6 +119,9 @@ func newWorkerFixture(t *testing.T) *workerFixture {
 		},
 		Logger:  discardTestLogger(),
 		Timeout: time.Minute,
+		// The hermetic fixture endpoints are file:// URLs, which the
+		// production default ("http:https") deliberately blocks.
+		AllowProtocol: "http:https:file",
 	}
 	return f
 }
@@ -188,6 +191,27 @@ func TestWorkerFirstSyncSucceeds(t *testing.T) {
 	}
 	if up.RunCount != 1 || up.SuccessCount != 1 || up.Syncing {
 		t.Fatalf("bad upstream state after run: %+v", up)
+	}
+}
+
+// TestWorkerDefaultProtocolBlocksFile: under the production protocol
+// allowlist (AllowProtocol == "" -> http:https), a file:// upstream row —
+// however it got past API validation — must fail the fetch instead of
+// ingesting local repositories.
+func TestWorkerDefaultProtocolBlocksFile(t *testing.T) {
+	f := newWorkerFixture(t)
+	seedUpstream(t, f.upstreamDir, "own", "proj")
+	f.addLoopbackRepo(t, "repo_pp")
+	f.putUpstream(t, "repo_pp", "own", "proj", "file://"+f.upstreamDir)
+	f.worker.AllowProtocol = "" // production default
+
+	if err := f.worker.Run(context.Background(), Job{Org: "acme", RepoID: "repo_pp"}); err == nil {
+		t.Fatal("Run succeeded fetching a file:// upstream under the default protocol allowlist")
+	}
+	events := f.rec.list()
+	assertEventTypes(t, events, EventSyncStarted, EventSyncFailed)
+	if events[1].Error != FailClone {
+		t.Fatalf("error = %q, want %q", events[1].Error, FailClone)
 	}
 }
 

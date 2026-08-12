@@ -11,17 +11,10 @@
 // repo_upstreams row is written — a fork is one-shot and fully independent
 // of its source.
 //
-// INTEGRATION SEAM (frozen-contract constraint): api.New (api.go) is owned
-// by the foundation slice, so route wiring is the integrator's job. The
-// exact one-line registration inside api.New, replacing the current POST
-// /repos route, is:
-//
-//	mux.Handle("POST /api/v1/repos", requireAuth(cfg.Verifier, false, auth.ScopeRepoWrite)(s.forkAwareCreateRepo(cfg.Verifier, ss.handleCreateRepo)))
-//
-// where ss.handleCreateRepo is the base_repo-sync-aware creator from
-// handlers_sync.go ((*syncServer).handleCreateRepo). Until that wiring
-// lands, fork_test.go builds the same stack with the frozen
-// (*server).handleCreateRepo as the fallback.
+// api.New (api.go) wires this dispatcher on POST /api/v1/repos with the
+// base_repo-sync-aware creator from handlers_sync.go
+// ((*syncServer).handleCreateRepo) as the fallback; fork_test.go builds the
+// same stack with the frozen (*server).handleCreateRepo as the fallback.
 package api
 
 import (
@@ -35,6 +28,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"codestorage/internal/auth"
 	"codestorage/internal/blob"
@@ -292,6 +286,11 @@ func (s *server) handleForkRepo(w http.ResponseWriter, r *http.Request, verifier
 // logged.
 func (s *server) forkAbandon(ctx context.Context, org, url string) {
 	assertf(org != "" && url != "", "forkAbandon: empty org/url")
+	// The post-create failure may BE the request context's cancellation or
+	// timeout; detach from it (bounded) so the soft-delete still executes
+	// instead of failing with context.Canceled and orphaning the repo row.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
 	if _, err := s.store.SoftDeleteRepo(ctx, org, url); err != nil {
 		s.logger.Error("abandon failed fork", "org", org, "url", url, "err", err)
 	}

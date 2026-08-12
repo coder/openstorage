@@ -91,9 +91,11 @@ func New(cfg Config) http.Handler {
 	route := func(pattern string, orgLevel bool, h http.HandlerFunc, scopes ...string) {
 		mux.Handle(pattern, requireAuth(cfg.Verifier, orgLevel, scopes...)(h))
 	}
-	// POST /repos is the base_repo-aware create (sync links; the frozen
-	// (*server).handleCreateRepo flow is embedded in it).
-	route("POST /api/v1/repos", false, ss.handleCreateRepo, auth.ScopeRepoWrite)
+	// POST /repos is the base_repo-aware create: code/code.storage fork
+	// specs dispatch to the synchronous fork (handlers_fork.go); everything
+	// else falls back to the sync-aware creator (which embeds the frozen
+	// (*server).handleCreateRepo flow).
+	route("POST /api/v1/repos", false, s.forkAwareCreateRepo(cfg.Verifier, ss.handleCreateRepo), auth.ScopeRepoWrite)
 	route("GET /api/v1/repo", false, s.handleGetRepo, auth.ScopeGitRead)
 	route("GET /api/v1/repos", true, s.handleListRepos, auth.ScopeOrgRead)
 	route("DELETE /api/v1/repos/delete", false, s.handleDeleteRepo, auth.ScopeRepoWrite)
