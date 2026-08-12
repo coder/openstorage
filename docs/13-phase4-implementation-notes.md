@@ -116,6 +116,25 @@ tags on trees/blobs are skipped, nested tags peel through (invariant 10);
 inside `gitread`. `CatBlobTo` already wrapped errors with `%w`; files/metadata's
 `recursive` param stays accepted-and-ignored (openapi: "Accepted for API symmetry").
 
+## Integration notes (fan-in)
+
+- **API ephemeral keying follows the read surface, not the plan text.** The plan said the
+  write endpoints' `ephemeral` flags "select the `+ephemeral` storage key" (githttp
+  namespace parity), but the frozen p3 read surface stores ephemeral refs as
+  `refs/namespaces/ephemeral/…` (`auth.EphemeralRefName`) under the **base RepoID key**.
+  The write endpoints follow the read surface so API-created ephemeral refs are visible to
+  `GET /repos/branches?ephemeral=true` and merge promotion works cross-endpoint. The git
+  smart-HTTP `+ephemeral` URL namespace remains a fully separate storage key
+  (`RepoID+ephemeral`), so ephemeral state written over git push and over the API live in
+  different ref spaces — a known cross-surface split inherited from p2/p3.
+- **`GET /repos/merge/preview` has no `allow_unrelated_histories` parameter** (per the
+  upstream contract), so unrelated histories preview as if the flag were set; the actual
+  `POST /repos/merge` still rejects them without the flag.
+- **verify-sig on non-deletion API ref writes fails closed** (403): the API surface can
+  neither produce signed commits nor verify third-party signatures (the hook's keyring
+  verification is githttp-internal), so allowing the write would bypass the policy.
+  Deletions and pure fast-forwards (no server-created commit) pass — hook parity (ADR-25).
+
 ## Follow-ups
 
 - Extend the vendor-SDK compat harness (`internal/api/sdkcompat_test.go` +

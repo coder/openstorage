@@ -6,9 +6,7 @@
 // expected_ref_sha (invariant 1), and ref-policy enforcement on every
 // write (invariant 5).
 //
-// INTEGRATION NOTE (fan-in): api.New (api.go, owned by another slice) does
-// not register these routes yet. Wire them by calling
-// s.registerWriteRefRoutes(mux, cfg.Verifier) inside New — the tests in
+// Routes are registered by api.New via registerWriteRefRoutes; the tests in
 // write_refs_test.go build their own mux through the same helper.
 //
 // Ephemeral namespace: consistent with the frozen read surface

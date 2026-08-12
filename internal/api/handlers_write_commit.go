@@ -71,11 +71,9 @@ const (
 	wcMaxGitlinkBytes = 64
 )
 
-// registerWriteCommitRoutes mounts the three write-commit endpoints. All
-// require a repo-scoped token with git:write (docs/02 scope table).
-// INTEGRATION NOTE: api.New does not call this yet — the api.go route table
-// is owned by the foundation slice; adding
-// `registerWriteCommitRoutes(mux, s, cfg.Verifier)` there completes wiring.
+// registerWriteCommitRoutes mounts the three write-commit endpoints (called
+// from api.New). All require a repo-scoped token with git:write (docs/02
+// scope table).
 func registerWriteCommitRoutes(mux *http.ServeMux, s *server, verifier auth.Verifier) {
 	assertf(mux != nil && s != nil && verifier != nil, "registerWriteCommitRoutes: nil dependency")
 	route := func(pattern string, h http.HandlerFunc) {
