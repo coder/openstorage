@@ -351,6 +351,34 @@ func TestCommitPack(t *testing.T) {
 			}
 		})
 
+		t.Run("guarded branch creation checks base tip", func(t *testing.T) {
+			// The vendor SDK full-workflow drive creates a feature branch
+			// with expected_head_sha = the base branch head; the guard must
+			// compare against the base tip, not the unborn target (zero).
+			tip := wctBranchTip(t, e, readTok, "feature", false)
+			body := wctLines(t,
+				wctMeta("feature2", "f2", []map[string]any{
+					{"path": "feature2.txt", "content_id": "id-f2", "operation": "upsert"},
+				}, map[string]any{"base_branch": "feature", "expected_head_sha": tip}),
+				wctChunk("id-f2", []byte("feature2\n"), true),
+			)
+			resp, respBody := wctPost(t, srv, "/api/v1/repos/commit-pack", writeTok, bytes.NewReader(body))
+			env := wctRequireOK(t, resp, respBody)
+			if env.Result.OldSHA != ref.ZeroSHA {
+				t.Errorf("branch creation old_sha = %q, want 40 zeros", env.Result.OldSHA)
+			}
+
+			// A stale guard against the base tip is still a 412.
+			body = wctLines(t,
+				wctMeta("feature3", "f3", []map[string]any{
+					{"path": "feature3.txt", "content_id": "id-f3", "operation": "upsert"},
+				}, map[string]any{"base_branch": "feature", "expected_head_sha": tip1}),
+				wctChunk("id-f3", []byte("feature3\n"), true),
+			)
+			resp, respBody = wctPost(t, srv, "/api/v1/repos/commit-pack", writeTok, bytes.NewReader(body))
+			wctRequireFail(t, resp, respBody, http.StatusPreconditionFailed, "precondition_failed")
+		})
+
 		t.Run("ephemeral namespace write", func(t *testing.T) {
 			body := wctLines(t,
 				wctMeta("scratch", "eph1", []map[string]any{

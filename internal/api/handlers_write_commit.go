@@ -475,14 +475,13 @@ func (s *server) wcPlanCommit(w http.ResponseWriter, r *http.Request, repoID str
 	if plan.oldSHA == "" {
 		plan.oldSHA = ref.ZeroSHA
 	}
-	// CAS guard first (decision #2): a stale expected_head_sha is a 412
-	// regardless of what else the request carries.
-	if md.ExpectedHeadSHA != "" && strings.ToLower(md.ExpectedHeadSHA) != plan.oldSHA {
-		wcFail(w, http.StatusPreconditionFailed, "precondition_failed",
-			fmt.Sprintf("expected_head_sha %s does not match current tip %s", md.ExpectedHeadSHA, plan.oldSHA),
-			md.TargetBranch, plan.oldSHA)
-		return nil, false
-	}
+	// casTip is what expected_head_sha guards against: the target tip, or —
+	// when branching an unborn target from base_branch — the base tip. The
+	// vendor SDK's full-workflow conformance drive sends the base branch's
+	// head as expected_head_sha when creating a feature branch, so guarding
+	// against the (zero) unborn target would 412 every guarded branch
+	// creation.
+	casTip := plan.oldSHA
 	if plan.oldSHA != ref.ZeroSHA {
 		plan.parent = plan.oldSHA
 	} else if md.BaseBranch != "" {
@@ -493,6 +492,14 @@ func (s *server) wcPlanCommit(w http.ResponseWriter, r *http.Request, repoID str
 			return nil, false
 		}
 		plan.parent = baseTip
+		casTip = baseTip
+	}
+	// CAS guard (decision #2): a stale expected_head_sha is a 412.
+	if md.ExpectedHeadSHA != "" && strings.ToLower(md.ExpectedHeadSHA) != casTip {
+		wcFail(w, http.StatusPreconditionFailed, "precondition_failed",
+			fmt.Sprintf("expected_head_sha %s does not match current tip %s", md.ExpectedHeadSHA, casTip),
+			md.TargetBranch, plan.oldSHA)
+		return nil, false
 	}
 	if !wcCheckRefPolicy(w, mustClaims(r), plan.refName) {
 		return nil, false
