@@ -504,28 +504,6 @@ type wrefNoteResponse struct {
 	Result     wrefNoteResult `json:"result"`
 }
 
-// wrefNoteStatusForHTTP maps an HTTP failure code to the docs/04 result
-// status string the SDK converts into a typed RefUpdateError.
-func wrefNoteStatusForHTTP(httpStatus int) string {
-	switch httpStatus {
-	case http.StatusBadRequest, http.StatusUnprocessableEntity:
-		return "invalid"
-	case http.StatusForbidden:
-		return "forbidden"
-	case http.StatusNotFound:
-		return "not_found"
-	case http.StatusConflict:
-		return "conflict"
-	case http.StatusPreconditionFailed:
-		return "precondition_failed"
-	case http.StatusInternalServerError:
-		return "internal"
-	default:
-		assertf(false, "wrefNoteStatusForHTTP: unmapped status %d", httpStatus)
-		return ""
-	}
-}
-
 // wrefNoteFail writes the docs/03 note-write envelope with a failure result
 // (SDKs parse this body on every 4xx/5xx and raise typed RefUpdateErrors).
 // newRefSHA is the notes ref's current tip, or the zero sha when unborn.
@@ -537,7 +515,7 @@ func wrefNoteFail(w http.ResponseWriter, httpStatus int, msg, sha, targetRef, ba
 		TargetRef:  targetRef,
 		BaseCommit: baseCommit,
 		NewRefSHA:  newRefSHA,
-		Result:     wrefNoteResult{Success: false, Status: wrefNoteStatusForHTTP(httpStatus), Message: msg},
+		Result:     wrefNoteResult{Success: false, Status: statusForHTTP(httpStatus), Message: msg},
 	})
 }
 

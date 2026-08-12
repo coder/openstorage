@@ -126,17 +126,11 @@ func wmFail(w http.ResponseWriter, httpCode int, status, msg, branch, oldSHA str
 	wmFailConflict(w, httpCode, status, msg, branch, oldSHA, nil, "")
 }
 
-// wmFailConflict is wmFail plus the 409 merge-conflict extras.
+// wmFailConflict is wmFail plus the 409 merge-conflict extras. The
+// status/code pairing is checked against the shared docs/04 table
+// (statusForHTTP, errors.go).
 func wmFailConflict(w http.ResponseWriter, httpCode int, status, msg, branch, oldSHA string, conflictPaths []string, mergeBase string) {
-	valid := map[int]string{
-		http.StatusBadRequest:          "invalid",
-		http.StatusForbidden:           "forbidden",
-		http.StatusNotFound:            "not_found",
-		http.StatusConflict:            "conflict",
-		http.StatusPreconditionFailed:  "precondition_failed",
-		http.StatusInternalServerError: "internal",
-	}
-	assertf(valid[httpCode] == status, "wmFail: status %q does not map to HTTP %d", status, httpCode)
+	assertf(statusForHTTP(httpCode) == status, "wmFail: status %q does not map to HTTP %d", status, httpCode)
 	assertf(msg != "", "wmFail: empty message")
 	writeJSON(w, httpCode, wmFailBody{
 		Result:        wcResult{Branch: branch, OldSHA: oldSHA, Success: false, Status: status, Message: msg},
@@ -443,6 +437,7 @@ type wmMergeRequest struct {
 // actually creates a commit (openapi: required for merge-commit
 // strategies).
 func wmValidateMergeRequest(req *wmMergeRequest) error {
+	assertf(req != nil, "wmValidateMergeRequest: nil request")
 	if err := wcValidateBranchParam("source_branch", req.SourceBranch); err != nil {
 		return err
 	}

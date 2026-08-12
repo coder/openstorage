@@ -791,6 +791,18 @@ func TestDiffCommit(t *testing.T) {
 			resp, respBody := wctPost(t, srv, "/api/v1/repos/diff-commit", writeTok, bytes.NewReader(frames))
 			wctRequireFail(t, resp, respBody, http.StatusBadRequest, "invalid")
 		})
+
+		t.Run("malformed base64 diff chunk is 400", func(t *testing.T) {
+			frames := wctLines(t,
+				wctMeta("main", "m", nil, nil),
+				map[string]any{"diff_chunk": map[string]any{"data": "!!!", "eof": true}},
+			)
+			resp, respBody := wctPost(t, srv, "/api/v1/repos/diff-commit", writeTok, bytes.NewReader(frames))
+			env := wctRequireFail(t, resp, respBody, http.StatusBadRequest, "invalid")
+			if !strings.Contains(env.Result.Message, "base64") {
+				t.Errorf("message %q does not mention base64", env.Result.Message)
+			}
+		})
 	})
 }
 

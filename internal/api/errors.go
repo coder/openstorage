@@ -45,3 +45,27 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	// the client went away, which is not actionable here.
 	_ = json.NewEncoder(w).Encode(v)
 }
+
+// statusForHTTP maps an HTTP failure code onto the docs/04 result-envelope
+// status string the SDKs convert into typed RefUpdateErrors. This is the
+// single authoritative table for the write surface (wcFail, wmFailConflict,
+// wrefNoteFail); an unmapped code is a programming error and fails fast.
+func statusForHTTP(httpStatus int) string {
+	switch httpStatus {
+	case http.StatusBadRequest, http.StatusUnprocessableEntity:
+		return "invalid"
+	case http.StatusForbidden:
+		return "forbidden"
+	case http.StatusNotFound:
+		return "not_found"
+	case http.StatusConflict:
+		return "conflict"
+	case http.StatusPreconditionFailed:
+		return "precondition_failed"
+	case http.StatusInternalServerError:
+		return "internal"
+	default:
+		assertf(false, "statusForHTTP: unmapped status %d", httpStatus)
+		return ""
+	}
+}

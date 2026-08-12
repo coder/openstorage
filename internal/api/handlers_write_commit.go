@@ -116,19 +116,11 @@ type wcEnvelope struct {
 }
 
 // wcFail writes the failure envelope. The status string must agree with the
-// docs/04 HTTP mapping table — enforced here so a drifting call site fails
-// fast in tests instead of shipping a mismatched pair.
+// docs/04 HTTP mapping table (statusForHTTP, errors.go) — enforced here so a
+// drifting call site fails fast in tests instead of shipping a mismatched
+// pair.
 func wcFail(w http.ResponseWriter, httpCode int, status, msg, branch, oldSHA string) {
-	valid := map[int]string{
-		http.StatusBadRequest:          "invalid",
-		http.StatusUnprocessableEntity: "invalid",
-		http.StatusForbidden:           "forbidden",
-		http.StatusNotFound:            "not_found",
-		http.StatusConflict:            "conflict",
-		http.StatusPreconditionFailed:  "precondition_failed",
-		http.StatusInternalServerError: "internal",
-	}
-	assertf(valid[httpCode] == status, "wcFail: status %q does not map to HTTP %d", status, httpCode)
+	assertf(statusForHTTP(httpCode) == status, "wcFail: status %q does not map to HTTP %d", status, httpCode)
 	assertf(msg != "", "wcFail: empty message")
 	writeJSON(w, httpCode, wcEnvelope{Result: wcResult{
 		Branch: branch, OldSHA: oldSHA, Success: false, Status: status, Message: msg,
@@ -381,6 +373,7 @@ func wcValidateAuthor(field string, a wcAuthor) error {
 // diff-commit (docs/04 §1–2). File-op validation is commit-pack-specific
 // and handled by the caller.
 func wcValidateMetadata(md *wcMetadata) error {
+	assertf(md != nil, "wcValidateMetadata: nil metadata")
 	if err := wcValidateBranchParam("target_branch", md.TargetBranch); err != nil {
 		return err
 	}
