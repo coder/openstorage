@@ -40,7 +40,10 @@ export const meta = {
       ),
       brief: s.optional(s.string()),
       maxFixRounds: s.optional(s.number()),
-      isolated: s.optional(s.boolean()),
+      // REQUIRED (fail fast): true in worktree-isolated runtimes (patch fan-in via git am),
+      // false ONLY in shared-working-tree runtimes. Omitting this in a worktree runtime
+      // silently dropped an entire phase's implementation (p6, 2026-08-12).
+      isolated: s.boolean(),
     },
     { additionalProperties: false }
   ),
@@ -268,10 +271,17 @@ export default function workflow({ args, phase, log, agent, parallel, applyPatch
   if (args.phase === "custom" && !spec) throw new Error("phase 'custom' requires args.spec");
   const phaseId = args.phase === "custom" ? args.spec.id : args.phase;
   const maxFix = Math.max(1, Math.min(args.maxFixRounds ?? 2, 4));
-  // isolated=false (default): local/shared-working-tree runtime. Child agents write directly
+  // isolated=false: local/shared-working-tree runtime. Child agents write directly
   // into this checkout, so patch fan-in is a no-op (skipped) and write fan-out is serialized.
-  // Set isolated=true only in a worktree-isolated workspace to enable true parallel implement.
-  const isolated = args.isolated ?? false;
+  // isolated=true: worktree-isolated workspace; only COMMITTED child work survives patch fan-in.
+  // Explicitly required (no default): a wrong value here silently discards all child work.
+  if (typeof args.isolated !== "boolean") {
+    throw new Error(
+      "args.isolated must be explicitly true (worktree-isolated runtime, patch fan-in) or " +
+        "false (shared working tree). No default: a wrong guess drops the whole implementation."
+    );
+  }
+  const isolated = args.isolated;
   const applyChildPatch = (id, agentId) => {
     if (!isolated) return; // shared working tree: child changes are already on disk
     const res = applyPatch({ id, agentId });

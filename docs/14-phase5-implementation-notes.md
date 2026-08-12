@@ -240,3 +240,6 @@ tracked here for follow-up. Suggested bundling: one small spec-conformance PR
 7. **P3 — `FinishSync` race guard** (`internal/meta/pg_eventing.go`,
    `sqlite_eventing.go`): missing `AND syncing = true` predicate allows stats
    pollution if a detached run finishes after re-attach.
+8. **P3 — pull-upstream empty ref not defaulted** (`internal/api/handlers_sync.go`):
+   `POST /repos/pull-upstream` passes an empty `req.Ref` straight into the sync
+   job instead of defaulting to the repo's default branch.
