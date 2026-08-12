@@ -7,9 +7,11 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"math"
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 )
 
@@ -25,6 +27,8 @@ const (
 	envOrgPubKeys = "CODESTORAGE_ORG_PUBKEYS"
 	envBaseURL    = "CODESTORAGE_BASE_URL"
 	envDataDir    = "CODESTORAGE_DATA_DIR"
+	envRateRPS    = "CODESTORAGE_RATE_RPS"
+	envRateBurst  = "CODESTORAGE_RATE_BURST"
 
 	defaultListen = "127.0.0.1:0"
 )
@@ -65,6 +69,11 @@ type serveConfig struct {
 	// in API responses. Empty means derive it from the bound listen
 	// address — which is unroutable when listening on 0.0.0.0.
 	baseURL string
+
+	// rateRPS/rateBurst configure the per-client-IP REST rate limit
+	// (docs/03 gateway-level 429). Both zero means disabled.
+	rateRPS   float64
+	rateBurst int
 }
 
 // storageURLs is the resolved storage location set shared by every
@@ -157,9 +166,58 @@ func resolveServeConfig(getenv func(string) string, flagListen, flagAddr, flagCa
 		}
 		cfg.baseURL = baseURL
 	}
+	cfg.rateRPS, cfg.rateBurst, err = resolveRateLimit(getenv)
+	if err != nil {
+		return serveConfig{}, err
+	}
 	assertf(cfg.dbURL != "" && cfg.blobURL != "" && cfg.cacheDir != "", "resolveServeConfig: unresolved slot in %+v", cfg)
 	assertf(cfg.dataDir == "" || filepath.IsAbs(cfg.dataDir), "resolveServeConfig: dataDir %q not absolute", cfg.dataDir)
 	return cfg, nil
+}
+
+// resolveRateLimit parses CODESTORAGE_RATE_RPS / CODESTORAGE_RATE_BURST into
+// the (rps, burst) pair for api.RateLimitConfig. Fail-fast semantics:
+//
+//   - both unset, or RPS explicitly 0 with burst unset/0 → (0, 0) disabled
+//   - RPS > 0 requires BURST >= 1 (half-set pairs are misconfigurations)
+//   - BURST set without RPS is a misconfiguration
+//   - malformed, negative, NaN, or infinite values error naming the env var
+func resolveRateLimit(getenv func(string) string) (float64, int, error) {
+	assertf(getenv != nil, "resolveRateLimit: nil getenv")
+	rpsRaw, burstRaw := getenv(envRateRPS), getenv(envRateBurst)
+
+	var rps float64
+	if rpsRaw != "" {
+		v, err := strconv.ParseFloat(rpsRaw, 64)
+		if err != nil {
+			return 0, 0, fmt.Errorf("%s: %w", envRateRPS, err)
+		}
+		if math.IsNaN(v) || math.IsInf(v, 0) || v < 0 {
+			return 0, 0, fmt.Errorf("%s must be a non-negative finite number, got %q", envRateRPS, rpsRaw)
+		}
+		rps = v
+	}
+	var burst int
+	if burstRaw != "" {
+		v, err := strconv.Atoi(burstRaw)
+		if err != nil {
+			return 0, 0, fmt.Errorf("%s: %w", envRateBurst, err)
+		}
+		if v < 0 {
+			return 0, 0, fmt.Errorf("%s must be non-negative, got %q", envRateBurst, burstRaw)
+		}
+		burst = v
+	}
+
+	switch {
+	case rps == 0 && burst == 0:
+		return 0, 0, nil // disabled (unset or explicit zero)
+	case rps == 0:
+		return 0, 0, fmt.Errorf("%s must be set (> 0) when %s is set", envRateRPS, envRateBurst)
+	case burst == 0:
+		return 0, 0, fmt.Errorf("%s must be set (>= 1) when %s is set", envRateBurst, envRateRPS)
+	}
+	return rps, burst, nil
 }
 
 // normalizeBaseURL validates an externally reachable http(s) base URL and

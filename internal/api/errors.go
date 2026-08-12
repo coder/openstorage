@@ -62,6 +62,8 @@ func statusForHTTP(httpStatus int) string {
 		return "conflict"
 	case http.StatusPreconditionFailed:
 		return "precondition_failed"
+	case http.StatusTooManyRequests:
+		return "unavailable" // docs/03: rate limit ("unavailable" to ref-update clients)
 	case http.StatusInternalServerError:
 		return "internal"
 	default:

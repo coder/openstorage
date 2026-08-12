@@ -32,11 +32,12 @@ import (
 // its PEM public key blocks (idempotent upsert), and returns the /api/v1
 // handler, the store (for the git path's repo_id->url resolution), the
 // verifier (shared with the git path per ADR-8), and a cleanup func. The
-// handler registers full "/api/v1/..." paths, so serve mounts it un-stripped
-// at mux.Handle("/api/v1/", h). refStore/blobStore/cacheDir back the
+// handler registers full paths under /api (v1 routes, the /api/repos named
+// aliases, and /api/repo-urls), so serve mounts it un-stripped at
+// mux.Handle("/api/", h). refStore/blobStore/cacheDir back the
 // git:read endpoints — serve passes the same instances the githttp fallback
 // uses so both surfaces share one cache.
-func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL string, orgPEMBlocks []string, refStore ref.RefStore, blobStore blob.BlobStore, cacheDir string) (http.Handler, meta.Store, auth.Verifier, func(), error) {
+func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL string, orgPEMBlocks []string, refStore ref.RefStore, blobStore blob.BlobStore, cacheDir string, rate api.RateLimitConfig) (http.Handler, meta.Store, auth.Verifier, func(), error) {
 	assertf(dbURL != "" && org != "" && httpBaseURL != "" && len(orgPEMBlocks) > 0, "buildAPIHandler: missing dbURL/org/httpBaseURL/keys")
 	assertf(refStore != nil && blobStore != nil && cacheDir != "", "buildAPIHandler: missing refStore/blobStore/cacheDir")
 	ms, msCleanup, err := openMetaStore(ctx, dbURL)
@@ -78,6 +79,7 @@ func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL string, orgPEM
 		BlobStore:   blobStore,
 		CacheDir:    cacheDir,
 		SyncQueue:   queue,
+		RateLimit:   rate,
 	})
 	cleanup := func() {
 		queueCleanup() // stop workers before closing their meta store

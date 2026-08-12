@@ -14,10 +14,11 @@
 //     *http.Request to the v1 path (query preserved) and re-dispatch through
 //     mux. Double JWT verification is accepted.
 //   - Every alias is registered through rl.limit(flavor) BEFORE auth,
-//     exactly like the v1 routes. Note for workstream D: the re-dispatch
-//     runs the v1 chain again, so an aliased request passes rl.limit twice
-//     (alias route + v1 route) and is charged two tokens once limiting
-//     lands — accepted alongside the double JWT verification.
+//     exactly like the v1 routes. The re-dispatch runs the v1 chain again,
+//     so the rewritten request carries the rateLimitExempt context marker:
+//     the v1 twin's limiter passes it through and each aliased request is
+//     charged exactly one token (unlike the accepted double JWT
+//     verification, double-charging would halve the effective alias rate).
 package api
 
 import (
@@ -166,9 +167,11 @@ func (s *server) aliasHandler(mux *http.ServeMux, ar aliasRoute) http.HandlerFun
 		}
 
 		// Re-dispatch the rewritten request through the mux so the v1 route
-		// (its rate limit + auth + handler) serves it unchanged. The body is
-		// untouched above, so the v1 handler reads it from the start.
-		r2 := r.Clone(r.Context())
+		// (its auth + handler) serves it unchanged. The body is untouched
+		// above, so the v1 handler reads it from the start. The exempt
+		// marker stops the v1 limiter from charging a second token — this
+		// request already paid at the alias registration.
+		r2 := r.Clone(rateLimitExempt(r.Context()))
 		r2.URL.Path = ar.v1Path
 		r2.URL.RawPath = "" // v1 paths need no escaping; Path is canonical
 		r2.RequestURI = r2.URL.RequestURI()

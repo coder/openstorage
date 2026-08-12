@@ -393,3 +393,80 @@ func TestSplitPEMBlocks(t *testing.T) {
 		t.Fatal("want error on zero PEM blocks")
 	}
 }
+
+func TestResolveServeConfigRateLimit(t *testing.T) {
+	base := func(extra map[string]string) func(string) string {
+		env := map[string]string{
+			"CODESTORAGE_PG_URL":      "postgres://x",
+			"CODESTORAGE_S3_URL":      "s3://x",
+			"CODESTORAGE_ORG":         "org1",
+			"CODESTORAGE_ORG_PUBKEYS": "/tmp/org.pub.pem",
+		}
+		for k, v := range extra {
+			env[k] = v
+		}
+		return mapEnv(env)
+	}
+
+	t.Run("unset-disables", func(t *testing.T) {
+		cfg, err := resolveServeConfig(base(nil), "", "", "/tmp/cache", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.rateRPS != 0 || cfg.rateBurst != 0 {
+			t.Fatalf("unset rate env resolved to rps=%v burst=%d, want 0/0", cfg.rateRPS, cfg.rateBurst)
+		}
+	})
+
+	t.Run("parse-through", func(t *testing.T) {
+		cfg, err := resolveServeConfig(base(map[string]string{
+			envRateRPS: "2.5", envRateBurst: "7",
+		}), "", "", "/tmp/cache", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.rateRPS != 2.5 || cfg.rateBurst != 7 {
+			t.Fatalf("resolved rps=%v burst=%d, want 2.5/7", cfg.rateRPS, cfg.rateBurst)
+		}
+	})
+
+	t.Run("explicit-zero-disables", func(t *testing.T) {
+		cfg, err := resolveServeConfig(base(map[string]string{
+			envRateRPS: "0", envRateBurst: "0",
+		}), "", "", "/tmp/cache", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.rateRPS != 0 || cfg.rateBurst != 0 {
+			t.Fatalf("explicit zero resolved to rps=%v burst=%d, want 0/0", cfg.rateRPS, cfg.rateBurst)
+		}
+	})
+
+	errCases := []struct {
+		name string
+		env  map[string]string
+		want string // substring the error must name
+	}{
+		{"rps-without-burst", map[string]string{envRateRPS: "5"}, envRateBurst},
+		{"burst-without-rps", map[string]string{envRateBurst: "5"}, envRateRPS},
+		{"rps-zero-burst-set", map[string]string{envRateRPS: "0", envRateBurst: "5"}, envRateRPS},
+		{"rps-malformed", map[string]string{envRateRPS: "fast", envRateBurst: "5"}, envRateRPS},
+		{"rps-negative", map[string]string{envRateRPS: "-1", envRateBurst: "5"}, envRateRPS},
+		{"rps-nan", map[string]string{envRateRPS: "NaN", envRateBurst: "5"}, envRateRPS},
+		{"rps-inf", map[string]string{envRateRPS: "+Inf", envRateBurst: "5"}, envRateRPS},
+		{"burst-malformed", map[string]string{envRateRPS: "5", envRateBurst: "many"}, envRateBurst},
+		{"burst-negative", map[string]string{envRateRPS: "5", envRateBurst: "-2"}, envRateBurst},
+		{"burst-float", map[string]string{envRateRPS: "5", envRateBurst: "1.5"}, envRateBurst},
+	}
+	for _, tc := range errCases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := resolveServeConfig(base(tc.env), "", "", "/tmp/cache", "")
+			if err == nil {
+				t.Fatalf("env %v resolved without error", tc.env)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error %q does not name %s", err, tc.want)
+			}
+		})
+	}
+}

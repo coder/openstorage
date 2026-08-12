@@ -21,6 +21,7 @@ import (
 	"strings"
 	"time"
 
+	"codestorage/internal/api"
 	"codestorage/internal/auth"
 	"codestorage/internal/blob"
 	"codestorage/internal/githttp"
@@ -139,12 +140,17 @@ func cmdServe(ctx context.Context, args []string) error {
 
 	// HTTP API (single-org self-host mode). The read endpoints share the
 	// ref/blob stores and cache dir with the githttp fallback below.
-	apiHandler, metaStore, verifier, cleanup, err := buildAPIHandler(ctx, cfg.dbURL, cfg.org, httpBaseURL, orgPEMBlocks, st, bl, cfg.cacheDir)
+	apiHandler, metaStore, verifier, cleanup, err := buildAPIHandler(ctx, cfg.dbURL, cfg.org, httpBaseURL, orgPEMBlocks, st, bl, cfg.cacheDir,
+		api.RateLimitConfig{RPS: cfg.rateRPS, Burst: cfg.rateBurst})
 	if err != nil {
 		return err
 	}
 	defer cleanup()
-	mux.Handle("/api/v1/", apiHandler)
+	// The API handler owns the whole /api subtree: /api/v1/*, the named-repo
+	// aliases /api/repos/{repo_name}/*, and /api/repo-urls/{repo_id}.
+	// Mounting only /api/v1/ would strand the phase-6 routes on the git
+	// fallback handler below.
+	mux.Handle("/api/", apiHandler)
 
 	// Git smart-HTTP path, authenticated with the same verifier as the API
 	// (ADR-8: iss-resolved org keys; the spike's single-key mode is gone).
