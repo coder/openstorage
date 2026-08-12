@@ -213,11 +213,11 @@ Fix-where-touched items from the phase-5 plan that landed alongside workstream E
    `preferred_base` is the fallback base when none is given or the primary base does not
    resolve (write_refs_test.go covers the force/no-force-push interaction).
 
-## Deferred gate findings (open; non-blocking at the p5 gate)
+## Deferred gate findings (non-blocking at the p5 gate; burned down in phase 6)
 
-The p5 review gate closed GO with zero P0/P1 remaining. These P2/P3 findings are
-tracked here for follow-up. Suggested bundling: one small spec-conformance PR
-(items 1–4, each a sub-5-line change) and one robustness PR (items 5–7).
+The p5 review gate closed GO with zero P0/P1 remaining. These P2/P3 findings were
+tracked here for follow-up. *Status: items 1–5 and 7–8 were closed by the phase-6
+workstream-F burn-down (see 15); item 6 (assertf entry guards) remains open.*
 
 1. **P2 — `sourcehut` provider unmapped** (`internal/sync/sync.go`): the
    OpenAPI-allowed provider enum value is rejected with 400; add

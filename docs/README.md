@@ -38,6 +38,7 @@ signature scheme), which gives high confidence that the extracted spec is correc
 12. [12-phase3-implementation-notes.md](12-phase3-implementation-notes.md) — ADRs from phase 3 (read API)
 13. [13-phase4-implementation-notes.md](13-phase4-implementation-notes.md) — ADRs from phase 4 (write API + p3 read burn-down)
 14. [14-phase5-implementation-notes.md](14-phase5-implementation-notes.md) — ADRs from phase 5 (eventing, upstream sync, credentials, fork)
+15. [15-phase6-implementation-notes.md](15-phase6-implementation-notes.md) — ADRs from phase 6 (LFS, named-repo aliases, repo-urls, rate limiting)
 
 `upstream/` contains verbatim copies of the official OpenAPI spec and doc pages for reference.
 

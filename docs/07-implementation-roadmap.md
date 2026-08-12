@@ -64,8 +64,8 @@ semantics, the deprecated `ops` fallback, the ephemeral policy quirk, and `verif
 backed by an org signing-key registry (`codestorage signing-key`, keyring read fresh from
 Postgres each push). `CODESTORAGE_BASE_URL` makes `http_url` routable behind 0.0.0.0
 binds. Decisions are recorded in
-[10-phase2-implementation-notes.md](10-phase2-implementation-notes.md). Phase 6 below
-is not started.
+[10-phase2-implementation-notes.md](10-phase2-implementation-notes.md). Phase 6 later
+added the LFS batch API and rate limiting on this surface (see 15).
 
 **Interlude — pluggable storage backends (local mode): done.** Before phase 3, the storage
 layer went behind URL-scheme factories (`ref.Open` / `blob.Open` / `meta.Open`) with two
@@ -113,8 +113,17 @@ the container-based acceptance suites gained zero-container lanes (api `/sqlite`
    webhook, fork through `POST /repos`, upstream mirror round-trip, pull-upstream 202
    with signed `repo.sync.started/succeeded` events.* Decisions are recorded in
    [14-phase5-implementation-notes.md](14-phase5-implementation-notes.md).
-6. **LFS + polish.** LFS batch API; named-repo path style (`/api/repos/{repo_name}/...`)
-   as routing aliases; rate limiting; `GET /api/repo-urls/{repo_id}`.
+6. **LFS + polish — implemented; gate re-run pending.** LFS batch API on the smart-HTTP
+   host (presigned S3/MinIO transfers; server-proxied in local mode); named-repo path
+   style (`/api/repos/{repo_name}/...`) as re-dispatching routing aliases; per-client-IP
+   token-bucket rate limiting (pre-auth 429s, env-configured, off by default);
+   `GET /api/repo-urls/{repo_id}`; plus the p5 deferred-findings burn-down (7 of 8
+   closed, see 14). *Gate: the first run's P0 (batch endpoint unreachable behind the old
+   `/api/v1/` mount) is fixed and covered by unit + e2e tests incl. a real `git-lfs`
+   round-trip on both backend lanes; fresh live dogfood evidence and the multi-node
+   deployment packaging (Dockerfile, compose replicas) are still to be produced.*
+   Decisions are recorded in
+   [15-phase6-implementation-notes.md](15-phase6-implementation-notes.md).
 
 ## Conformance testing (the big advantage)
 

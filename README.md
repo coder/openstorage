@@ -3,22 +3,25 @@
 An open-source, wire-compatible backend for [code.storage](https://code.storage), built from
 the specification in [`docs/`](docs/README.md).
 
-Current state: **phase 5 (eventing & sync) implemented**. One Go binary
+Current state: **phase 6 (LFS + polish) implemented**. One Go binary
 (`codestorage serve`) exposes the `/api/v1` repo CRUD
 API, the full `git:read` surface (files, branches, tags, commits, diff, blame, grep, notes,
 archive — cursor pagination, conditional/range file streaming), the `git:write` surface
 (NDJSON commit-pack / diff-commit streaming, restore-commit, merge + read-only preview,
 branch / tag / notes writes — CAS and ref policies everywhere), the production git
 smart-HTTP path (clone/push, ref-policy enforcement, commit-signature verification) behind
-the same per-org JWT verifier, and the eventing/sync surface: HMAC-signed `push` and
+the same per-org JWT verifier, the eventing/sync surface (HMAC-signed `push` and
 `repo.sync.*` webhooks, webhook + git-credentials CRUD, upstream `base_repo` mirror sync
-with `pull-upstream`, and synchronous forking. Background jobs run through a queue seam —
-durable [River](https://riverqueue.com) jobs on Postgres (tables migrated automatically at
-startup) or in-process in local mode — and nodes stay stateless. Storage is selected by URL
-scheme: Postgres + S3 (MinIO) for multi-node deployments, or zero-dependency local mode
-(SQLite + plain files via `serve --data-dir`). Next: the remaining p4 review burn-down +
-gate evidence (docs/13), then phase 6 (LFS + polish) — see
-[docs/07-implementation-roadmap.md](docs/07-implementation-roadmap.md).
+with `pull-upstream`, synchronous forking), and the phase-6 additions: the Git LFS batch
+API on the same git remote (presigned S3/MinIO transfers, server-proxied in local mode),
+the named-repo path style `/api/repos/{repo_name}/...` as routing aliases,
+`GET /api/repo-urls/{repo_id}`, and optional per-client-IP rate limiting. Background jobs
+run through a queue seam — durable [River](https://riverqueue.com) jobs on Postgres
+(tables migrated automatically at startup) or in-process in local mode — and nodes stay
+stateless. Storage is selected by URL scheme: Postgres + S3 (MinIO) for multi-node
+deployments, or zero-dependency local mode (SQLite + plain files via `serve --data-dir`).
+Next: gate evidence for the p4 write surface (docs/13) and the p6 additions (docs/15) —
+see [docs/07-implementation-roadmap.md](docs/07-implementation-roadmap.md).
 
 ## Layout
 
@@ -32,7 +35,7 @@ gate evidence (docs/13), then phase 6 (LFS + polish) — see
 | `internal/blob` | `BlobStore` contract + S3/MinIO and local-file implementations (immutable packs) |
 | `internal/ref` | `RefStore` contract + Postgres and SQLite implementations (CAS ref authority) |
 | `internal/gitread` | Read-side git plumbing (ls-tree, log, diff, blame, grep, archive) over the hydrated cache repo |
-| `internal/githttp` | Git smart-HTTP server + policy/verify-sig hooks, cache hydration, e2e suite |
+| `internal/githttp` | Git smart-HTTP server + LFS batch API, policy/verify-sig hooks, cache hydration, e2e suite |
 | `internal/events` | Outbound webhooks: HMAC-signed delivery + the push-event `RefStore` decorator |
 | `internal/sync` | Upstream mirror sync worker (fetch + loopback push), credential/upstream contracts |
 | `internal/jobs` | Background queue seam: durable River jobs (Postgres) or in-process (local mode) |
@@ -74,7 +77,14 @@ TOKEN=$(./codestorage mint --key /tmp/cs-key.pem --iss selfhost --repo demo --sc
 git clone "http://t:${TOKEN}@127.0.0.1:8080/demo.git"
 cd demo && git commit --allow-empty -m init && git push origin HEAD:main
 
-# 7. Optional: register commit-signing keys (SSH public key line or armored PGP
+# 7. Optional: Git LFS on the same remote — no separate LFS server or config
+#    (requires git-lfs; transfers are presigned MinIO URLs on this stack,
+#    proxied through the server in local mode).
+git lfs install --local && git lfs track '*.bin'
+head -c 1M /dev/urandom > model.bin
+git add . && git commit -m 'lfs object' && git push origin HEAD:main
+
+# 8. Optional: register commit-signing keys (SSH public key line or armored PGP
 #    block) for the `verify-sig` ref-policy op; hooks read them fresh per push.
 ./codestorage signing-key add --org selfhost --key ~/.ssh/id_ed25519.pub
 ./codestorage signing-key list --org selfhost
@@ -127,6 +137,8 @@ fallback aliases so old invocations keep working.
 | `CODESTORAGE_ORG` | — | **Required.** Org name (JWT `iss`) |
 | `CODESTORAGE_ORG_PUBKEYS` | — | **Required.** PEM file with 1..n org public key blocks |
 | `CODESTORAGE_BASE_URL` | — | External base for `http_url` in API responses (set it behind `0.0.0.0` binds) |
+| `CODESTORAGE_RATE_RPS` | — | Per-client-IP REST rate limit: sustained requests/second (429 + `Retry-After` when exceeded). Set together with `CODESTORAGE_RATE_BURST`; unset disables limiting |
+| `CODESTORAGE_RATE_BURST` | — | Token-bucket depth (>= 1) for the rate limit; set together with `CODESTORAGE_RATE_RPS` |
 
 `serve` always runs single-org mode: `/api/v1` and the git smart-HTTP path authenticate
 against the same org-key verifier. The phase-0 git-only mode and its `--jwt-pubkey` flag
