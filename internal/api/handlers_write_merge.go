@@ -771,6 +771,20 @@ func (s *server) handleMergePreview(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	// Optional extension mirroring POST /repos/merge's source_is_ephemeral/
+	// target_is_ephemeral body flags (the vendor SDK never sends these, so
+	// defaults preserve its behavior): resolve either side in the ephemeral
+	// namespace, matching the ephemeral?/ephemeral_base? read-API pattern.
+	sourceEphemeral, err := coreBoolParam(q, "source_ephemeral")
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	targetEphemeral, err := coreBoolParam(q, "target_ephemeral")
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	ctx := r.Context()
 	tips, err := s.refStore.ListRefs(ctx, repo.RepoID)
@@ -778,12 +792,12 @@ func (s *server) handleMergePreview(w http.ResponseWriter, r *http.Request) {
 		s.internalErr(w, r, "list refs", err)
 		return
 	}
-	sourceSHA, ok := tips["refs/heads/"+source]
+	sourceSHA, ok := tips[wcRefName(source, sourceEphemeral)]
 	if !ok {
 		writeErr(w, http.StatusNotFound, "source branch "+source+" not found")
 		return
 	}
-	targetSHA, ok := tips["refs/heads/"+target]
+	targetSHA, ok := tips[wcRefName(target, targetEphemeral)]
 	if !ok {
 		writeErr(w, http.StatusNotFound, "target branch "+target+" not found")
 		return

@@ -4,10 +4,10 @@ package api
 // POST /repos/merge and GET /repos/merge/preview — fanned out over the pg
 // and sqlite lanes via runBackends.
 //
-// api.New (api.go, owned by a sibling slice) does not register these
-// routes yet, so each lane builds its own httptest server through
-// registerWriteMergeRoutes with the PRODUCTION requireAuth middleware, on
-// top of the SAME lane stores — reads through the lane's regular server
+// api.New registers these routes (api.go); each lane still builds a
+// dedicated httptest server through registerWriteMergeRoutes with the
+// PRODUCTION requireAuth middleware, on top of the SAME lane stores so the
+// merge surface is exercised in isolation — reads through the lane's regular server
 // (e.srv) therefore double as cross-surface assertions. Fixtures seed
 // durable state exactly like the read tests (coreGit + coreSeedStores).
 // All helpers carry a wm prefix.
@@ -863,6 +863,34 @@ func TestMergePreview(t *testing.T) {
 			resp, body := preview(t, "source_branch=main&target_branch=ffsrc")
 			if resp.StatusCode != http.StatusOK || body["status"] != "clean" || body["result"] != "no_op" {
 				t.Fatalf("status %d body %v", resp.StatusCode, body)
+			}
+		})
+
+		// Regression: preview previously hardcoded refs/heads/ lookups, so
+		// ephemeral branches 404'd even though POST /repos/merge resolves
+		// them (source_is_ephemeral/target_is_ephemeral).
+		t.Run("ephemeral source resolves", func(t *testing.T) {
+			resp, body := preview(t, "source_branch=scratch&target_branch=main&source_ephemeral=true")
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status = %d, body %v", resp.StatusCode, body)
+			}
+			if body["source_tip_sha"] != fx.scratchTip {
+				t.Fatalf("source_tip_sha = %v, want %v", body["source_tip_sha"], fx.scratchTip)
+			}
+		})
+		t.Run("ephemeral source without flag still 404s", func(t *testing.T) {
+			resp, _ := preview(t, "source_branch=scratch&target_branch=main")
+			if resp.StatusCode != http.StatusNotFound {
+				t.Fatalf("status = %d, want 404", resp.StatusCode)
+			}
+		})
+		t.Run("ephemeral target resolves", func(t *testing.T) {
+			resp, body := preview(t, "source_branch=feature&target_branch=et&target_ephemeral=true")
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status = %d, body %v", resp.StatusCode, body)
+			}
+			if body["target_tip_sha"] != fx.c2 {
+				t.Fatalf("target_tip_sha = %v, want %v", body["target_tip_sha"], fx.c2)
 			}
 		})
 

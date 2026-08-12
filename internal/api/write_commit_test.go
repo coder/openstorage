@@ -5,9 +5,9 @@ package api
 // Wired through runBackends so the pg and sqlite lanes assert identical
 // behavior.
 //
-// The write routes are mounted on a dedicated test server via
-// registerWriteCommitRoutes (api.New's route table is owned by the
-// foundation slice); cross-surface visibility is asserted against the
+// The write routes are registered in api.New (api.go) and additionally
+// mounted on a dedicated test server via registerWriteCommitRoutes so the
+// streaming surface is exercised in isolation; cross-surface visibility is asserted against the
 // environment's api.New server (e.srv) — the docs/05 interop invariant:
 // API-written commits must be immediately readable through the git:read
 // endpoints, since both surfaces share one ref/blob store and cache.

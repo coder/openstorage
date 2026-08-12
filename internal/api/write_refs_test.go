@@ -5,11 +5,11 @@ package api
 // /repos/tags, POST/DELETE /repos/notes — fanned out over the pg and
 // sqlite lanes via runBackends.
 //
-// api.New (api.go, owned by a sibling slice) does not register these
-// routes yet, so each lane builds its own httptest server through
-// registerWriteRefRoutes on top of the SAME lane stores — reads through
-// the lane's regular server (e.srv) therefore double as cross-surface
-// assertions. Fixtures seed durable state exactly like the read tests
+// api.New registers these routes (api.go); each lane still builds a
+// dedicated httptest server through registerWriteRefRoutes on top of the
+// SAME lane stores so the write surface is exercised in isolation — reads
+// through the lane's regular server (e.srv) therefore double as
+// cross-surface assertions. Fixtures seed durable state exactly like the read tests
 // (coreGit + coreSeedStores). All helpers carry a wref prefix.
 
 import (
@@ -609,6 +609,31 @@ func TestWriteRefsPolicies(t *testing.T) {
 			}
 		})
 
+		// Exercises the real wrefIsAncestor fast-forward evaluation on
+		// notes refs: every notes op (add/append/remove) advances
+		// refs/notes/commits by a child commit, so all must pass the
+		// no-force-push ancestry check. Non-fast-forward transitions are
+		// unreachable through this API by construction; that denial branch
+		// is covered by TestWrefPolicyCheckNotesNonFastForward.
+		t.Run("no-force-push allows fast-forward note ops", func(t *testing.T) {
+			tok := mintWith(`[["refs/notes/*", ["no-force-push"]]]`, nil)
+			for _, step := range []map[string]any{
+				{"sha": fx.c2, "action": "add", "note": "nfp v1"},
+				{"sha": fx.c2, "action": "append", "note": "nfp v2"},
+			} {
+				resp, body := wrefDo(t, srv, "POST", "/api/v1/repos/notes", tok, step)
+				if resp.StatusCode != http.StatusOK {
+					t.Fatalf("%v: status = %d body %v", step["action"], resp.StatusCode, body)
+				}
+			}
+			// remove also appends a notes commit: fast-forward, allowed.
+			resp, body := wrefDo(t, srv, "DELETE", "/api/v1/repos/notes", tok,
+				map[string]any{"sha": fx.c2})
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("remove: status = %d body %v", resp.StatusCode, body)
+			}
+		})
+
 		t.Run("deprecated ops claim folds in", func(t *testing.T) {
 			tok := mintWith("", []string{"no-push"})
 			resp, _ := wrefDo(t, srv, "POST", "/api/v1/repos/branches/create", tok,
@@ -652,6 +677,35 @@ func TestWriteRefsPolicies(t *testing.T) {
 			}
 		})
 	})
+}
+
+// TestWrefPolicyCheckNotesNonFastForward unit-tests the no-force-push
+// denial branch for notes refs. Non-fast-forward notes transitions are
+// unreachable through the HTTP API (every notes op appends a commit), so
+// the deny path is exercised directly with a stubbed ancestry check —
+// it still guards hypothetical future callers (e.g. a raw ref-set API).
+func TestWrefPolicyCheckNotesNonFastForward(t *testing.T) {
+	claims := &auth.Claims{Refs: json.RawMessage(`[["refs/notes/*", ["no-force-push"]]]`)}
+	oldSHA := strings.Repeat("a", 40)
+	newSHA := strings.Repeat("b", 40)
+
+	deny, err := wrefPolicyCheck(claims, "refs/notes/commits", oldSHA, newSHA,
+		func(_, _ string) (bool, error) { return false, nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(deny, "no-force-push denies non-fast-forward") {
+		t.Fatalf("deny = %q, want non-fast-forward denial", deny)
+	}
+
+	deny, err = wrefPolicyCheck(claims, "refs/notes/commits", oldSHA, newSHA,
+		func(_, _ string) (bool, error) { return true, nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deny != "" {
+		t.Fatalf("deny = %q, want allowed fast-forward", deny)
+	}
 }
 
 // TestWriteRefsAuth exercises the middleware wiring of the write routes:
