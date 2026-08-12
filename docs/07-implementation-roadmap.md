@@ -89,16 +89,19 @@ the container-based acceptance suites gained zero-container lanes (api `/sqlite`
    conformance against `docs/upstream/openapi.yaml`, and dual-backend live dogfood
    transcripts.* Decisions are recorded in
    [12-phase3-implementation-notes.md](12-phase3-implementation-notes.md).
-4. **Write API — implemented; gate evidence pending.** commit-pack + diff-commit NDJSON
-   streaming (incremental parse, 4 MiB chunks), restore-commit, branch create/delete
-   (+default-branch protection), merge + preview (`git merge-tree --write-tree` in a
-   per-request scratch odb), tags, notes (+CAS `expected_ref_sha`). All CAS + ref-policy
-   checks; `result` envelope on the documented status list. Includes the repo-key-split fix
-   (repos keyed by `repo_id` on both surfaces) and the p3 read-API burn-down. All 11 write
-   routes are wired into `api.New`; the full test suite passes on both backend lanes.
-   *Gate: vendor SDK full-workflow + just-code-storage consumer drives, both backend lanes,
-   live dogfood transcripts — transcripts still to be produced at this HEAD.* Decisions are
-   recorded in [13-phase4-implementation-notes.md](13-phase4-implementation-notes.md).
+4. **Write API — implemented; review burn-down + gate evidence pending.** commit-pack +
+   diff-commit NDJSON streaming (incremental parse, 4 MiB chunks), restore-commit, branch
+   create/delete (+default-branch protection), merge + preview (`git merge-tree
+   --write-tree` in a per-request scratch odb), tags, notes (+CAS `expected_ref_sha`). All
+   CAS + ref-policy checks; `result` envelope on the documented status list. Includes the
+   repo-key-split fix (repos keyed by `repo_id` on both surfaces) and the p3 read-API
+   burn-down. All 11 write routes are wired into `api.New`; the full test suite passes on
+   both backend lanes. The p4 review opened its own burn-down (list in 13): the missing
+   docs/03 notes read endpoints (`GET /repos/notes`, `GET /repos/notes/refs`) have landed;
+   six write-path fixes remain open ahead of the gate. *Gate: vendor SDK full-workflow +
+   just-code-storage consumer drives, both backend lanes, live dogfood transcripts — still
+   to be produced.* Decisions are recorded in
+   [13-phase4-implementation-notes.md](13-phase4-implementation-notes.md).
 5. **Eventing & sync.** `push` webhooks with HMAC signatures; upstream `base_repo` sync
    workers (clone/mirror from github and other providers, pull-upstream 202, sync webhooks,
    git-credentials CRUD); forking (`provider: "code"`).

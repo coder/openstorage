@@ -70,7 +70,8 @@ enforce loop) is shared with the write handlers, called with full ref names
 The write envelope implements the docs/04 status list (`ok, precondition_failed, conflict,
 not_found, invalid, timeout, unauthorized, forbidden, unavailable, internal, failed`) with
 its HTTP mapping table, including envelope-shaped 401/403 from the auth middleware on write
-routes. `499 client closed request` appears in the docs/04 table but is an nginx-ism: Go's
+routes (recorded here as the contract; not yet wired — see the p4 review burn-down below).
+`499 client closed request` appears in the docs/04 table but is an nginx-ism: Go's
 `net/http` cannot emit a status for a connection the client already abandoned, so 499 is
 recorded as non-emittable (docs/12 deviation 7). `POST /repos/restore-commit` takes plain
 JSON per docs/03+04; openapi's NDJSON `reset-commits` alias is a recorded deviation
@@ -145,6 +146,45 @@ inside `gitread`. `CatBlobTo` already wrapped errors with `%w`; files/metadata's
   validated lines for no behavior change — revisit if phase 5 adds another writer. The
   merge endpoints already reuse the commit pipeline's scratch/publish plumbing
   (`wcPublish`, scratch odb, `mergeBaseSHA`), so there is no third publish path.
+
+## p4 review burn-down (write path)
+
+The p4 review found seven externally visible P2s. Landed so far:
+
+1. **Notes read endpoints** (`GET /repos/notes`, `GET /repos/notes/refs`) — the docs/03
+   read surface the review flagged as missing entirely. Non-obvious choices
+   (`internal/api/handlers_read_notes.go`, `gitread.Note`):
+   - Notes refs are listed **from the ref authority** (`ListRefsWithMeta`, already in
+     lexical order), not the materialized repo — same source and keyset-cursor shape as
+     `GET /repos/branches`. `GET /repos/notes` also checks the notes-ref tip against the
+     ref authority first, so an unborn notes ref 404s without materializing anything;
+     `ref_sha` in the response is that authoritative tip.
+   - `git notes show` exits 1 for an unborn notes ref, an unknown object, and an object
+     without a note alike; `gitread.Note` collapses all three into `ErrNotFound` → 404
+     (any other failure is internal). Notes are stored stripspace'd by `git notes
+     add/append`, so the read echoes the posted text by trimming the one trailing newline.
+   - Custom notes refs are always enabled on this server (the write surface accepts
+     them), so upstream's "custom notes refs disabled" 400 has no equivalent. `sha` and
+     `ref` reuse the write path's validation and normalization (`ref.ValidSHA`,
+     `wrefNotesRefName`).
+
+Still open at this HEAD, ahead of the dogfood gate (fix + one regression test apiece):
+
+1. **Empty-pack publish 500s.** `wcPublish`/`wrefPublish` treat a zero-object
+   `pack-objects` result (empty pack id) as an internal error; a write whose objects are
+   all already reachable should skip the upload and proceed to the ref CAS.
+2. **Merge preview 500 on submodule conflicts.** `wmRenderConflicts` runs
+   `cat-file blob` on every conflict stage; mode-160000 (gitlink) stage OIDs are commit
+   SHAs and must be emitted without content.
+3. **Merge preview cannot see ephemeral branches.** `handleMergePreview` resolves
+   `refs/heads/<name>` only, missing `handleMerge`'s `auth.EphemeralRefName` fallback.
+4. **Note author CR/LF injection.** `wrefHandleNote` checks author name/email for
+   non-emptiness only before they flow into `GIT_AUTHOR_NAME` et al.; the commit-pack
+   path (`wcValidateAuthor`) already rejects `\n`/`\r`.
+5. **ADR-26's envelope-shaped 401/403 on write routes is not yet implemented.**
+   `requireAuth` emits plain `{"error"}` on every route; the write/read middleware split
+   the ADR records is still to be built.
+6. **No coverage of the `wrefIsAncestor` path** (note update under `no-force-push`).
 
 ## Follow-ups
 
