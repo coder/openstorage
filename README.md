@@ -3,7 +3,7 @@
 An open-source, wire-compatible backend for [code.storage](https://code.storage), built from
 the specification in [`docs/`](docs/README.md).
 
-Current state: **phase 6 (LFS + polish) implemented**. One Go binary
+Current state: **phase 7 (deployment packaging + p6 burn-down) implemented**. One Go binary
 (`codestorage serve`) exposes the `/api/v1` repo CRUD
 API, the full `git:read` surface (files, branches, tags, commits, diff, blame, grep, notes,
 archive — cursor pagination, conditional/range file streaming), the `git:write` surface
@@ -19,8 +19,10 @@ the named-repo path style `/api/repos/{repo_name}/...` as routing aliases,
 run through a queue seam — durable [River](https://riverqueue.com) jobs on Postgres
 (tables migrated automatically at startup) or in-process in local mode — and nodes stay
 stateless. Storage is selected by URL scheme: Postgres + S3 (MinIO) for multi-node
-deployments, or zero-dependency local mode (SQLite + plain files via `serve --data-dir`).
-Next: gate evidence for the p4 write surface (docs/13) and the p6 additions (docs/15) —
+deployments — packaged as a multi-stage `Dockerfile` plus a two-replica compose profile
+(quickstart below, decisions in docs/16) — or zero-dependency local mode (SQLite + plain
+files via `serve --data-dir`).
+Next: gate evidence for the p4 write surface (docs/13) —
 see [docs/07-implementation-roadmap.md](docs/07-implementation-roadmap.md).
 
 ## Layout

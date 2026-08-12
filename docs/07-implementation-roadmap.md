@@ -113,17 +113,28 @@ the container-based acceptance suites gained zero-container lanes (api `/sqlite`
    webhook, fork through `POST /repos`, upstream mirror round-trip, pull-upstream 202
    with signed `repo.sync.started/succeeded` events.* Decisions are recorded in
    [14-phase5-implementation-notes.md](14-phase5-implementation-notes.md).
-6. **LFS + polish — implemented; gate re-run pending.** LFS batch API on the smart-HTTP
+6. **LFS + polish — done.** LFS batch API on the smart-HTTP
    host (presigned S3/MinIO transfers; server-proxied in local mode); named-repo path
    style (`/api/repos/{repo_name}/...`) as re-dispatching routing aliases; per-client-IP
    token-bucket rate limiting (pre-auth 429s, env-configured, off by default);
    `GET /api/repo-urls/{repo_id}`; plus the p5 deferred-findings burn-down (7 of 8
-   closed, see 14). *Gate: the first run's P0 (batch endpoint unreachable behind the old
-   `/api/v1/` mount) is fixed and covered by unit + e2e tests incl. a real `git-lfs`
-   round-trip on both backend lanes; fresh live dogfood evidence and the multi-node
-   deployment packaging (Dockerfile, compose replicas) are still to be produced.*
-   Decisions are recorded in
+   closed, see 14). *Gate: closed GO on the re-run — the first run's P0 (batch endpoint
+   unreachable behind the old `/api/v1/` mount) fixed and covered by unit + e2e tests
+   incl. a real `git-lfs` round-trip on both backend lanes, plus live LFS + alias-matrix
+   dogfood against the compose Postgres+MinIO stack. The multi-node deployment packaging
+   (Dockerfile, compose replicas) carried forward to phase 7.* Decisions are recorded in
    [15-phase6-implementation-notes.md](15-phase6-implementation-notes.md).
+7. **Deployment packaging + p6 burn-down — implemented; phase-gate transcript pending.**
+   Multi-stage `Dockerfile` (static build; alpine runtime carrying the required external
+   `git`) and an opt-in two-replica compose `replicas` profile (symmetric
+   `node-a`/`node-b` on one Postgres+MinIO stack) with README quickstarts; river
+   migrations serialized under a pg advisory lock (concurrent fresh boot raced on
+   river's DDL); all five deferred p6 findings closed, plus the alias git-credentials
+   POST fix (burn-down record in 15). *Gate: from-scratch `--profile replicas up
+   --build` boots symmetric replicas with zero restarts and zero duplicate-key DDL
+   errors; push via node A == clone via node B; one API read per node (v1 + named
+   alias).* Decisions are recorded in
+   [16-phase7-implementation-notes.md](16-phase7-implementation-notes.md).
 
 ## Conformance testing (the big advantage)
 
