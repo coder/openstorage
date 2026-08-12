@@ -38,7 +38,12 @@ func main() {
 	case "serve":
 		err = cmdServe(ctx, os.Args[2:])
 	case "hook":
+		// Eventing wiring for the git surface (docs/06): decorate the
+		// update hook's ref store so won pushes emit push events. No-op
+		// (identity default) when the serve env is absent.
+		hookCleanup := wireHookEventing(ctx, slogForHook())
 		err = githttp.RunHook(ctx, os.Args[2:])
+		hookCleanup()
 	case "keygen":
 		err = cmdKeygen(os.Args[2:])
 	case "mint":

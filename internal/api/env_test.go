@@ -42,9 +42,17 @@ import (
 	"codestorage/internal/blob"
 	"codestorage/internal/meta"
 	"codestorage/internal/ref"
+	upsync "codestorage/internal/sync"
 )
 
 const testHTTPBaseURL = "https://selfhost.code.storage"
+
+// envSyncQueue satisfies the required Config.SyncQueue by dropping enqueued
+// syncs: shared-env tests never run sync workers (the sync lifecycle is
+// exercised by sync_test.go with its own recorders and queue).
+type envSyncQueue struct{}
+
+func (envSyncQueue) EnqueueSync(context.Context, upsync.Job) error { return nil }
 
 type testKeys struct {
 	es256 *ecdsa.PrivateKey
@@ -235,6 +243,7 @@ func testEnvironment(t *testing.T, backend string) *testEnv {
 			RefStore:    refStore,
 			BlobStore:   blobStore,
 			CacheDir:    cacheDir,
+			SyncQueue:   envSyncQueue{},
 		}))
 		envCleanup = append(envCleanup, srv.Close)
 

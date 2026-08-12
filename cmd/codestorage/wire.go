@@ -17,7 +17,9 @@ package main
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net/http"
+	"os"
 
 	"codestorage/internal/api"
 	"codestorage/internal/auth"
@@ -37,23 +39,50 @@ import (
 func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL string, orgPEMBlocks []string, refStore ref.RefStore, blobStore blob.BlobStore, cacheDir string) (http.Handler, meta.Store, auth.Verifier, func(), error) {
 	assertf(dbURL != "" && org != "" && httpBaseURL != "" && len(orgPEMBlocks) > 0, "buildAPIHandler: missing dbURL/org/httpBaseURL/keys")
 	assertf(refStore != nil && blobStore != nil && cacheDir != "", "buildAPIHandler: missing refStore/blobStore/cacheDir")
-	ms, cleanup, err := openMetaStore(ctx, dbURL)
+	ms, msCleanup, err := openMetaStore(ctx, dbURL)
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}
-	if _, err := ms.UpsertOrgWithKeys(ctx, org, orgPEMBlocks); err != nil {
-		cleanup()
-		return nil, nil, nil, nil, fmt.Errorf("bootstrap org %q: %w", org, err)
+	fail := func(err error) (http.Handler, meta.Store, auth.Verifier, func(), error) {
+		msCleanup()
+		return nil, nil, nil, nil, err
+	}
+
+	// Loopback sync-push key (docs/07 p5): per-process keypair whose public
+	// half joins the org's registered keys, so the sync worker's internally
+	// minted git:write JWTs verify on our own git endpoint.
+	key, loopbackPubPEM, err := newLoopbackKey()
+	if err != nil {
+		return fail(err)
+	}
+	if _, err := ms.UpsertOrgWithKeys(ctx, org, append(orgPEMBlocks, loopbackPubPEM)); err != nil {
+		return fail(fmt.Errorf("bootstrap org %q: %w", org, err))
 	}
 	verifier := auth.NewVerifier(ms)
+
+	// Eventing/sync stack (docs/06): jobs queue with delivery + sync
+	// workers, and the events.RefStore decorator so API ref writes emit
+	// push events. The git surface gets the same decorator in the hook
+	// subprocess via wireHookEventing.
+	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
+	queue, decorate, queueCleanup, err := buildServeEventing(ctx, ms, dbURL, org, httpBaseURL, key, logger)
+	if err != nil {
+		return fail(err)
+	}
+
 	h := api.New(api.Config{
 		Store:       ms,
 		Verifier:    verifier,
 		HTTPBaseURL: httpBaseURL,
-		RefStore:    refStore,
+		RefStore:    decorate(refStore),
 		BlobStore:   blobStore,
 		CacheDir:    cacheDir,
+		SyncQueue:   queue,
 	})
+	cleanup := func() {
+		queueCleanup() // stop workers before closing their meta store
+		msCleanup()
+	}
 	return h, ms, verifier, cleanup, nil
 }
 

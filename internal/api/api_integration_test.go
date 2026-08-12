@@ -167,9 +167,10 @@ func testCreateRepoValidation(t *testing.T, e *testEnv) {
 	createRepo(t, e, org, "v-"+randomHex(t, 4), []byte(`{not json`), http.StatusBadRequest)
 	// Invalid default branch.
 	createRepo(t, e, org, "v-"+randomHex(t, 4), []byte(`{"default_branch":"bad branch"}`), http.StatusBadRequest)
-	// base_repo is a later phase: reject instead of silently dropping.
+	// base_repo with a provider this backend cannot mirror-sync is
+	// rejected (valid providers are exercised by sync_test.go).
 	createRepo(t, e, org, "v-"+randomHex(t, 4),
-		[]byte(`{"base_repo":{"provider":"github","owner":"o","name":"n"}}`), http.StatusBadRequest)
+		[]byte(`{"base_repo":{"provider":"unknown-forge","owner":"o","name":"n"}}`), http.StatusBadRequest)
 
 	// Empty body defaults the branch to main.
 	repoURL := "v-" + randomHex(t, 4)

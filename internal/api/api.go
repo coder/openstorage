@@ -14,8 +14,10 @@ import (
 
 	"codestorage/internal/auth"
 	"codestorage/internal/blob"
+	"codestorage/internal/events"
 	"codestorage/internal/meta"
 	"codestorage/internal/ref"
+	upsync "codestorage/internal/sync"
 )
 
 // assertf is a fail-fast invariant check (crash-and-burn style).
@@ -46,6 +48,12 @@ type Config struct {
 	RefStore  ref.RefStore
 	BlobStore blob.BlobStore
 	CacheDir  string
+
+	// SyncQueue schedules upstream sync runs (docs/07 p5): base_repo
+	// creates and pull-upstream enqueue through it. The serve command
+	// passes the jobs seam (River on pg, in-process in local mode); tests
+	// may pass a recorder/no-op.
+	SyncQueue upsync.Queue
 }
 
 // New builds the full HTTP handler: recover -> request log -> router, with
@@ -57,6 +65,7 @@ func New(cfg Config) http.Handler {
 	assertf(cfg.RefStore != nil, "Config.RefStore is required")
 	assertf(cfg.BlobStore != nil, "Config.BlobStore is required")
 	assertf(cfg.CacheDir != "", "Config.CacheDir is required")
+	assertf(cfg.SyncQueue != nil, "Config.SyncQueue is required")
 
 	logger := cfg.Logger
 	if logger == nil {
@@ -72,11 +81,19 @@ func New(cfg Config) http.Handler {
 		cacheDir:    cfg.CacheDir,
 	}
 
+	// Phase-5 eventing/sync surface (docs/07 p5): the syncServer extends
+	// the frozen create flow with base_repo support, backed by the durable
+	// meta rows through the sync-package adapters.
+	creds, ups := upsync.MetaStores(cfg.Store)
+	ss := newSyncServer(cfg.Store, creds, ups, cfg.SyncQueue, strings.TrimRight(cfg.HTTPBaseURL, "/"), logger)
+
 	mux := http.NewServeMux()
 	route := func(pattern string, orgLevel bool, h http.HandlerFunc, scopes ...string) {
 		mux.Handle(pattern, requireAuth(cfg.Verifier, orgLevel, scopes...)(h))
 	}
-	route("POST /api/v1/repos", false, s.handleCreateRepo, auth.ScopeRepoWrite)
+	// POST /repos is the base_repo-aware create (sync links; the frozen
+	// (*server).handleCreateRepo flow is embedded in it).
+	route("POST /api/v1/repos", false, ss.handleCreateRepo, auth.ScopeRepoWrite)
 	route("GET /api/v1/repo", false, s.handleGetRepo, auth.ScopeGitRead)
 	route("GET /api/v1/repos", true, s.handleListRepos, auth.ScopeOrgRead)
 	route("DELETE /api/v1/repos/delete", false, s.handleDeleteRepo, auth.ScopeRepoWrite)
@@ -106,6 +123,12 @@ func New(cfg Config) http.Handler {
 	registerWriteCommitRoutes(mux, s, cfg.Verifier)
 	s.registerWriteRefRoutes(mux, cfg.Verifier)
 	s.registerWriteMergeRoutes(mux, cfg.Verifier)
+
+	// Phase-5 routes: webhook CRUD (docs/06), git-credentials CRUD and
+	// upstream sync (docs/03).
+	RegisterWebhookRoutes(mux, cfg.Verifier, events.MetaWebhookStore{Store: cfg.Store}, logger)
+	registerCredentialRoutes(mux, cfg.Verifier, ss)
+	registerSyncRoutes(mux, cfg.Verifier, ss)
 
 	if cfg.Fallback != nil {
 		mux.Handle("/", cfg.Fallback)
