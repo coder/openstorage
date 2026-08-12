@@ -144,11 +144,31 @@ branch. Item 6 (assertf entry guards on the p5 handlers/callbacks) remains open.
 
 ## Open items
 
+*Status: the p6 gate re-run closed **GO** at `1fdb11a` (LFS round-trip + alias matrix
+2/2 against the compose Postgres+MinIO stack; all P0 findings resolved and
+recheck-confirmed). The items below are what remains.*
+
+### Deliverable gap
+
 - **Deployment packaging did not land.** The planned `Dockerfile` and a compose
-  `replicas` profile (two stateless nodes on one Postgres+MinIO stack, for the
-  multi-node gate dogfood) are not in the tree; re-create before the gate re-run.
-- **Gate re-run pending.** The first p6 gate found the P0 above; the LFS/rate-limit/alias
-  surface has landed since (unit + e2e coverage, incl. a real git-lfs 1MiB
-  track/push/clone round-trip on both backend lanes), but fresh live dogfood evidence is
-  still to be produced.
-- docs/14 deferred finding 6 (assertf entry guards), carried over.
+  `replicas` profile (two stateless nodes on one Postgres+MinIO stack, proving
+  multi-node statelessness in the quickstart) are not in the tree. Acceptance at the
+  gate did not cover this deliverable, so it carries forward.
+
+### Deferred p6 gate findings (P2/P3, non-blocking)
+
+1. **P2 — alias git-credentials path-id routes 404** (`internal/api/alias.go`):
+   `PUT/DELETE /api/repos/{repo_name}/git-credentials/{git_credential_id}` are
+   documented in openapi.yaml but unrouted (the alias only mirrors the v1 body-id
+   form). Top-priority deferral: a documented vendor API surface currently 404s.
+2. **P2 — `createAbandon` leaves credential/upstream rows** (`internal/api/handlers_sync.go`):
+   post-`CreateRepo` failure cleanup soft-deletes the repo row but not git-credential
+   or upstream rows created alongside it.
+3. **P2 — `clientKey` empty-`RemoteAddr` fallback** (`internal/api/ratelimit.go`):
+   an empty `RemoteAddr` still trips `admit`'s assert; fall back to a sentinel key
+   (e.g. `"unknown"`) instead.
+4. **P3 — `newRateLimiter` startup validation** (`internal/api/ratelimit.go`):
+   invalid config panics via assertf rather than a clean startup error
+   (accepted-by-design; optional polish).
+5. **P2 — assertf entry guards on p5 handlers/callbacks** (`handlers_fork.go`,
+   `handlers_sync.go`, `wire_eventing.go`): carried over from docs/14 item 6.
