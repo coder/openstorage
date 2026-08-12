@@ -212,3 +212,31 @@ Fix-where-touched items from the phase-5 plan that landed alongside workstream E
    `no-force-push` ref-policy op via a real `merge-base --is-ancestor` check;
    `preferred_base` is the fallback base when none is given or the primary base does not
    resolve (write_refs_test.go covers the force/no-force-push interaction).
+
+## Deferred gate findings (open; non-blocking at the p5 gate)
+
+The p5 review gate closed GO with zero P0/P1 remaining. These P2/P3 findings are
+tracked here for follow-up. Suggested bundling: one small spec-conformance PR
+(items 1–4, each a sub-5-line change) and one robustness PR (items 5–7).
+
+1. **P2 — `sourcehut` provider unmapped** (`internal/sync/sync.go`): the
+   OpenAPI-allowed provider enum value is rejected with 400; add
+   `"sourcehut": "git.sr.ht"` to the provider→host map.
+2. **P2 — `base_repo` omitted from GET responses** (`internal/api/handlers.go`):
+   `GET /api/v1/repo` and `GET /api/v1/repos` never include the `base_repo`
+   object (docs/03, openapi.yaml).
+3. **P2 — `PushPayload.CustomerID` type** (`internal/events/refstore.go`): emits
+   the internal integer org ID; should be the org-name string matching the `iss`
+   claim.
+4. **P3 — git-credentials create status** (`internal/api/handlers_credentials.go`):
+   `POST /api/v1/repos/git-credentials` returns 200; spec says 201.
+5. **P2 — `handleCreateRepo` row cleanup** (`internal/api/handlers_sync.go`):
+   a failure after `CreateRepo` (e.g. credential validation, first-sync enqueue)
+   orphans the repo row, so retries hit 409; mirror `forkAbandon`'s
+   detached-context soft-delete.
+6. **P2 — missing `assertf` entry guards** (`handlers_fork.go`,
+   `handlers_sync.go`, `wire_eventing.go`): handlers/callbacks lack the
+   defensive nil-dependency asserts used elsewhere.
+7. **P3 — `FinishSync` race guard** (`internal/meta/pg_eventing.go`,
+   `sqlite_eventing.go`): missing `AND syncing = true` predicate allows stats
+   pollution if a detached run finishes after re-attach.
