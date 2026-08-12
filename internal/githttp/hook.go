@@ -47,6 +47,16 @@ var (
 
 func testMode() bool { return os.Getenv(EnvTestMode) == "1" }
 
+// WrapHookRefStore decorates the ref store the update hook opens for its
+// CAS. Hooks run in a fresh `codestorage hook` subprocess (git execs the
+// installed hook script), so the serve process's wired store cannot reach
+// them; instead the cmd wiring seam — which runs in the hook subprocess
+// too, it is the same binary — replaces this variable at startup with the
+// events.RefStore decorator so git pushes emit push events (docs/06)
+// exactly like API writes. The identity default keeps hooks working
+// before/without eventing wiring.
+var WrapHookRefStore = func(ctx context.Context, st ref.RefStore) ref.RefStore { return st }
+
 func mustEnv(names ...string) string {
 	for _, n := range names {
 		if v := os.Getenv(n); v != "" {
@@ -214,7 +224,9 @@ func updateHook(ctx context.Context, args []string) error {
 		return err
 	}
 	defer st.Close()
-	won, err := st.CASRef(ctx, repo, refName, old, new)
+	store := WrapHookRefStore(ctx, st)
+	assertf(store != nil, "WrapHookRefStore returned nil")
+	won, err := store.CASRef(ctx, repo, refName, old, new)
 	if err != nil {
 		return err
 	}
