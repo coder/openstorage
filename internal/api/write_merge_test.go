@@ -173,6 +173,8 @@ type wmFixture struct {
 	binSideTip  string // binside: c1 + different binary bin.dat change
 	bigMainTip  string // bigmain: c1 + small big.txt change
 	bigSideTip  string // bigside: c1 + >1MiB big.txt change
+	subMainTip  string // submain: c1 + gitlink vendor/dep -> 2222…
+	subSideTip  string // subside: c1 + gitlink vendor/dep -> 3333…
 }
 
 // wmSeedFixture builds the merge test zoo. Every t-* target branch points
@@ -232,6 +234,17 @@ func wmSeedFixture(t *testing.T, e *testEnv) wmFixture {
 	bigMainTip := commitOn("bigmain", c1, "big.txt", "big main\n", "big main")
 	bigSideTip := commitOn("bigside", c1, "big.txt", strings.Repeat("x", (1<<20)+64)+"\n", "big side")
 
+	// Gitlink (submodule) add/add conflict: both sides add vendor/dep with
+	// different commit oids that exist in no odb — the vendor scenario.
+	gitlinkOn := func(branch, sha string) string {
+		coreGit(t, dir, "checkout", "-qb", branch, c1)
+		coreGit(t, dir, "update-index", "--add", "--cacheinfo", "160000,"+sha+",vendor/dep")
+		coreGit(t, dir, "commit", "-q", "-m", branch)
+		return coreRevParse(t, dir, "HEAD")
+	}
+	subMainTip := gitlinkOn("submain", strings.Repeat("2", 40))
+	subSideTip := gitlinkOn("subside", strings.Repeat("3", 40))
+
 	refs := map[string]string{
 		"refs/heads/main":                 c2,
 		"refs/heads/feature":              featTip,
@@ -242,6 +255,8 @@ func wmSeedFixture(t *testing.T, e *testEnv) wmFixture {
 		"refs/heads/binside":              binSideTip,
 		"refs/heads/bigmain":              bigMainTip,
 		"refs/heads/bigside":              bigSideTip,
+		"refs/heads/submain":              subMainTip,
+		"refs/heads/subside":              subSideTip,
 		"refs/heads/t-noop":               ffTip,
 		auth.EphemeralRefName("scratch"):  scratchTip,
 		auth.EphemeralRefName("scratch2"): scratch2Tip,
@@ -271,6 +286,7 @@ func wmSeedFixture(t *testing.T, e *testEnv) wmFixture {
 		scratchTip: scratchTip, scratch2Tip: scratch2Tip, orphanTip: orphanTip,
 		binMainTip: binMainTip, binSideTip: binSideTip,
 		bigMainTip: bigMainTip, bigSideTip: bigSideTip,
+		subMainTip: subMainTip, subSideTip: subSideTip,
 	}
 }
 
@@ -895,6 +911,40 @@ func TestMergePreview(t *testing.T) {
 			content, _ := result["content"].(string)
 			if !strings.Contains(content, "<<<<<<<") || !strings.Contains(content, "main") || !strings.Contains(content, "other") {
 				t.Errorf("result content = %q, want conflict markers with both sides", content)
+			}
+		})
+
+		t.Run("gitlink conflict is 200 and never dereferenced", func(t *testing.T) {
+			// Submodule (160000) conflict sides name commits that exist in
+			// no odb; rendering them used to cat-file the oid and 500.
+			resp, body := preview(t, "source_branch=subside&target_branch=submain&include_content=true")
+			if resp.StatusCode != http.StatusOK || body["status"] != "conflicted" {
+				t.Fatalf("status %d body %v", resp.StatusCode, body)
+			}
+			if !reflect.DeepEqual(body["conflict_paths"], []any{"vendor/dep"}) {
+				t.Fatalf("conflict_paths = %v", body["conflict_paths"])
+			}
+			conflicts := body["conflicts"].([]any)
+			if len(conflicts) != 1 {
+				t.Fatalf("conflicts = %v", conflicts)
+			}
+			c := conflicts[0].(map[string]any)
+			wantSides := map[string]string{
+				"ours":   strings.Repeat("2", 40),
+				"theirs": strings.Repeat("3", 40),
+			}
+			for side, wantOID := range wantSides {
+				got := c[side].(map[string]any)
+				if got["oid"] != wantOID || got["binary"] != false || got["truncated"] != false {
+					t.Errorf("%s = %v, want oid %s without content", side, got, wantOID)
+				}
+				if _, hasContent := got["content"]; hasContent {
+					t.Errorf("%s carries content %v for a gitlink", side, got["content"])
+				}
+			}
+			base := c["base"].(map[string]any)
+			if _, hasOID := base["oid"]; hasOID {
+				t.Errorf("base = %v, want absent stage (add/add conflict)", base)
 			}
 		})
 

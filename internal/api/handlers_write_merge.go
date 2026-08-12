@@ -201,15 +201,24 @@ func wmCheckGitVersion(banner string) error {
 // ---------------------------------------------------------------------------
 // Merge-tree engine
 
+// wmStageEntry is one conflict side from the merge-tree records: the tree
+// entry's mode and oid. Gitlink (160000) oids name commits of another
+// repository and are usually absent from the odb, so renderers must never
+// dereference them.
+type wmStageEntry struct {
+	mode string
+	oid  string
+}
+
 // wmMergeTreeResult is the parsed `git merge-tree --write-tree -z` output.
 type wmMergeTreeResult struct {
 	tree  string
 	clean bool
 	// paths lists conflicted paths in merge-tree order (deduped); stages
 	// maps path -> index stage (1 base, 2 ours/target, 3 theirs/source)
-	// -> blob oid, exactly the `ls-files -u` shape of the output records.
+	// -> mode+oid, exactly the `ls-files -u` shape of the output records.
 	paths  []string
-	stages map[string]map[int]string
+	stages map[string]map[int]wmStageEntry
 }
 
 // wmRunMergeTree three-way-merges source into target inside the scratch
@@ -250,7 +259,7 @@ func wmParseMergeTreeZ(raw string, clean bool) (*wmMergeTreeResult, error) {
 		tree:   tokens[0],
 		clean:  clean,
 		paths:  []string{},
-		stages: map[string]map[int]string{},
+		stages: map[string]map[int]wmStageEntry{},
 	}
 	if clean {
 		return res, nil
@@ -273,9 +282,9 @@ func wmParseMergeTreeZ(raw string, clean bool) (*wmMergeTreeResult, error) {
 		}
 		if _, seen := res.stages[path]; !seen {
 			res.paths = append(res.paths, path)
-			res.stages[path] = map[int]string{}
+			res.stages[path] = map[int]wmStageEntry{}
 		}
-		res.stages[path][stage] = fields[1]
+		res.stages[path][stage] = wmStageEntry{mode: fields[0], oid: fields[1]}
 	}
 	return res, nil
 }
@@ -873,24 +882,24 @@ func wmRenderConflicts(ctx context.Context, sc *wcScratch, mt *wmMergeTreeResult
 	filtered := []wmPreviewFiltered{}
 	for _, path := range mt.paths {
 		stages := mt.stages[path]
-		resultOID, err := wmTreePathBlob(ctx, sc, mt.tree, path)
+		resultEntry, err := wmTreePathEntry(ctx, sc, mt.tree, path)
 		if err != nil {
 			return nil, nil, err
 		}
 		// Slot order matches the response shape: result, base, ours, theirs.
-		oids := [4]string{resultOID, stages[1], stages[2], stages[3]}
+		entries := [4]wmStageEntry{resultEntry, stages[1], stages[2], stages[3]}
 		tooLarge := false
-		for _, oid := range oids {
-			if oid == "" {
+		for _, entry := range entries {
+			if !wmBlobMode(entry.mode) {
 				continue
 			}
-			out, err := sc.git(ctx, nil, nil, "cat-file", "-s", oid)
+			out, err := sc.git(ctx, nil, nil, "cat-file", "-s", entry.oid)
 			if err != nil {
 				return nil, nil, err
 			}
 			size, err := strconv.ParseInt(strings.TrimSpace(out), 10, 64)
 			if err != nil {
-				return nil, nil, fmt.Errorf("cat-file -s %s emitted %q", oid, out)
+				return nil, nil, fmt.Errorf("cat-file -s %s emitted %q", entry.oid, out)
 			}
 			if size > wmMaxConflictSideBytes {
 				tooLarge = true
@@ -902,16 +911,26 @@ func wmRenderConflicts(ctx context.Context, sc *wcScratch, mt *wmMergeTreeResult
 			continue
 		}
 		var blobs [4]wmPreviewBlob
-		for i, oid := range oids {
-			if oid == "" {
+		for i, entry := range entries {
+			if entry.oid == "" {
 				continue // absent stage: {truncated:false, binary:false}
 			}
-			content, err := sc.git(ctx, nil, nil, "cat-file", "blob", oid)
+			if entry.mode == "160000" {
+				// Gitlink side: the oid names a commit that is usually not
+				// in this repository's odb at all, so report it without
+				// ever reading it.
+				blobs[i] = wmPreviewBlob{OID: entry.oid}
+				continue
+			}
+			if !wmBlobMode(entry.mode) {
+				continue // non-blob result entry (e.g. a D/F-conflict tree)
+			}
+			content, err := sc.git(ctx, nil, nil, "cat-file", "blob", entry.oid)
 			if err != nil {
 				return nil, nil, err
 			}
 			binary := strings.ContainsRune(content, 0) || !utf8.ValidString(content)
-			blobs[i] = wmPreviewBlob{OID: oid, Binary: binary}
+			blobs[i] = wmPreviewBlob{OID: entry.oid, Binary: binary}
 			if !binary {
 				blobs[i].Content = content
 			}
@@ -923,31 +942,39 @@ func wmRenderConflicts(ctx context.Context, sc *wcScratch, mt *wmMergeTreeResult
 	return conflicts, filtered, nil
 }
 
-// wmTreePathBlob resolves <tree>:<path> to a blob oid; "" when the merged
-// tree has no blob there (path absent — e.g. one side of a delete/modify
-// conflict — or a non-blob entry like a directory/file conflict).
-func wmTreePathBlob(ctx context.Context, sc *wcScratch, tree, path string) (string, error) {
-	assertf(ref.ValidSHA(tree) && path != "", "wmTreePathBlob: bad inputs %q %q", tree, path)
-	// NB: the ^{blob} peel suffix does not compose with <tree>:<path>
-	// expressions (verified empirically), so type-check separately.
-	out, err := sc.git(ctx, nil, nil, "rev-parse", "--verify", "--quiet", tree+":"+path)
+// wmBlobMode reports whether a tree-entry mode names a readable blob
+// (regular file, executable, or symlink). Gitlinks (160000) and trees
+// (040000) must never be cat-file'd: gitlink targets usually do not exist
+// in the odb (previously a 500 on submodule-conflict previews).
+func wmBlobMode(mode string) bool {
+	switch mode {
+	case "100644", "100755", "120000":
+		return true
+	}
+	return false
+}
+
+// wmTreePathEntry resolves the merged tree's entry at path via ls-tree —
+// mode+oid straight from the tree, never dereferencing the object, so
+// gitlink entries whose commits are absent from the odb resolve fine
+// (previously cat-file'd and 500'd). Zero value when the path is absent
+// (e.g. one side of a delete/modify conflict).
+func wmTreePathEntry(ctx context.Context, sc *wcScratch, tree, path string) (wmStageEntry, error) {
+	assertf(ref.ValidSHA(tree) && path != "", "wmTreePathEntry: bad inputs %q %q", tree, path)
+	out, err := sc.git(ctx, nil, nil, "ls-tree", "-z", tree, "--", path)
 	if err != nil {
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
-			return "", nil
-		}
-		return "", err
+		return wmStageEntry{}, err
 	}
-	sha := strings.TrimSpace(out)
-	if !ref.ValidSHA(sha) {
-		return "", fmt.Errorf("rev-parse emitted %q", sha)
+	record := strings.TrimSuffix(out, "\x00")
+	if record == "" {
+		return wmStageEntry{}, nil // path absent from the merged tree
 	}
-	typ, err := sc.git(ctx, nil, nil, "cat-file", "-t", sha)
-	if err != nil {
-		return "", err
+	// Record shape: `<mode> <type> <oid>\t<path>` (one entry: path is a
+	// full path, not a prefix, and ls-tree is not recursive).
+	head, _, found := strings.Cut(record, "\t")
+	fields := strings.Fields(head)
+	if !found || strings.Contains(record, "\x00") || len(fields) != 3 || !ref.ValidSHA(fields[2]) {
+		return wmStageEntry{}, fmt.Errorf("ls-tree %s -- %q emitted %q", tree, path, out)
 	}
-	if strings.TrimSpace(typ) != "blob" {
-		return "", nil
-	}
-	return sha, nil
+	return wmStageEntry{mode: fields[0], oid: fields[2]}, nil
 }
