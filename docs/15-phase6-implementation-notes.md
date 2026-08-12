@@ -146,7 +146,9 @@ branch. Item 6 (assertf entry guards on the p5 handlers/callbacks) remains open.
 
 *Status: the p6 gate re-run closed **GO** at `1fdb11a` (LFS round-trip + alias matrix
 2/2 against the compose Postgres+MinIO stack; all P0 findings resolved and
-recheck-confirmed). The items below are what remains.*
+recheck-confirmed). All items below — the deployment-packaging deliverable and the five
+deferred findings — were closed by the phase-7 burn-down; each entry carries its fix
+location inline. This section is the phase-7 burn-down record.*
 
 ### Deliverable gap
 
@@ -154,6 +156,10 @@ recheck-confirmed). The items below are what remains.*
   `replicas` profile (two stateless nodes on one Postgres+MinIO stack, proving
   multi-node statelessness in the quickstart) are not in the tree. Acceptance at the
   gate did not cover this deliverable, so it carries forward.
+  *Closed in phase 7: multi-stage `Dockerfile` (alpine runtime carrying the required
+  external `git`) + `.dockerignore` at the repo root; two-replica `replicas` profile
+  (`node-a`/`node-b`, differing only in port mapping) in `docker-compose.yml`;
+  "Two-replica compose profile" subsection in the root `README.md` quickstart.*
 
 ### Deferred p6 gate findings (P2/P3, non-blocking)
 
@@ -161,14 +167,31 @@ recheck-confirmed). The items below are what remains.*
    `PUT/DELETE /api/repos/{repo_name}/git-credentials/{git_credential_id}` are
    documented in openapi.yaml but unrouted (the alias only mirrors the v1 body-id
    form). Top-priority deferral: a documented vendor API surface currently 404s.
+   *Closed in phase 7: path-id PUT/DELETE handlers in `handlers_credentials.go`
+   (sharing the v1 store logic; `200 {id, created_at}` / `204`, v1-identical shapes),
+   registered as direct alias routes in `alias.go`; round-trip + negative cases in
+   `credentials_test.go` on both backends.*
 2. **P2 — `createAbandon` leaves credential/upstream rows** (`internal/api/handlers_sync.go`):
    post-`CreateRepo` failure cleanup soft-deletes the repo row but not git-credential
    or upstream rows created alongside it.
+   *Closed in phase 7: `createAbandon` now takes the RepoID and best-effort deletes the
+   upstream and credential rows alongside the repo soft-delete (failures logged,
+   not-found ignored); covered by a package-internal test on both backends.*
 3. **P2 — `clientKey` empty-`RemoteAddr` fallback** (`internal/api/ratelimit.go`):
    an empty `RemoteAddr` still trips `admit`'s assert; fall back to a sentinel key
    (e.g. `"unknown"`) instead.
+   *Closed in phase 7: `clientKey` returns the `"unknown"` sentinel for an empty
+   `RemoteAddr`; case added to `TestRateLimitClientKey`.*
 4. **P3 — `newRateLimiter` startup validation** (`internal/api/ratelimit.go`):
    invalid config panics via assertf rather than a clean startup error
    (accepted-by-design; optional polish).
+   *Closed in phase 7: `newRateLimiter` returns `(*rateLimiter, error)` with the config
+   checks as returned errors (`RPS <= 0` still disables the limiter); propagated as
+   `api.New(cfg) (http.Handler, error)` through `buildAPIHandler`
+   (`cmd/codestorage/wire.go`); invalid-config test asserts an error, not a panic.*
 5. **P2 — assertf entry guards on p5 handlers/callbacks** (`handlers_fork.go`,
    `handlers_sync.go`, `wire_eventing.go`): carried over from docs/14 item 6.
+   *Closed in phase 7: entry guards (nil receiver/deps/args only — never user input)
+   added to `forkAwareCreateRepo`/`handleForkRepo`/`forkAbandon` (`handlers_fork.go`),
+   `handleCreateRepo`/`createAbandon`/`policyDeniesPullUpstream`/`handlePullUpstream`/
+   `handleDetachBase` (`handlers_sync.go`), and `webhookSink.Emit` (`wire_eventing.go`).*
