@@ -96,6 +96,11 @@ func New(cfg Config) http.Handler {
 	route("POST /api/v1/repos/grep", false, s.handleGrep, auth.ScopeGitRead)
 	route("POST /api/v1/repos/archive", false, s.handleArchive, auth.ScopeGitRead)
 
+	// Notes read surface (docs/03 "Notes"; handlers_read_notes.go). The
+	// notes write routes live in registerWriteRefRoutes below.
+	route("GET /api/v1/repos/notes", false, s.handleGetNote, auth.ScopeGitRead)
+	route("GET /api/v1/repos/notes/refs", false, s.handleListNotesRefs, auth.ScopeGitRead)
+
 	// git:write surface (docs/07 p4). The route/scope tables live next to
 	// the handlers (handlers_write_commit.go, handlers_write_refs.go).
 	registerWriteCommitRoutes(mux, s, cfg.Verifier)

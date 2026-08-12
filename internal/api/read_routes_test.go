@@ -11,7 +11,8 @@ import (
 	"codestorage/internal/auth"
 )
 
-// readRoutes is the full docs/07 p3 route set (method + path).
+// readRoutes is the full docs/07 p3 route set plus the notes read routes
+// (method + path).
 var readRoutes = []struct{ method, path string }{
 	{http.MethodGet, "/api/v1/repos/file"},
 	{http.MethodHead, "/api/v1/repos/file"}, // GET patterns match HEAD too
@@ -26,6 +27,8 @@ var readRoutes = []struct{ method, path string }{
 	{http.MethodGet, "/api/v1/repos/blame"},
 	{http.MethodPost, "/api/v1/repos/grep"},
 	{http.MethodPost, "/api/v1/repos/archive"},
+	{http.MethodGet, "/api/v1/repos/notes"},
+	{http.MethodGet, "/api/v1/repos/notes/refs"},
 }
 
 func TestReadRoutesAuthWiring(t *testing.T) {
