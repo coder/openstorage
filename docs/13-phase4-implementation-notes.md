@@ -16,10 +16,11 @@ git URL path element verbatim while `internal/api` keyed by `RepoID`, so a push 
 `/{name}.git` was accepted but invisible to every read endpoint. Decision: **`RepoID` (plus
 the `+ephemeral`/`+import` namespace suffix) is the only storage key.** githttp resolves the
 path element (after stripping the namespace suffix) through the metadata store — try
-`GetRepoByID`, then `GetRepoByURL` — and canonicalizes before any pack/ref/hook-env use.
+`GetRepoByID`, then `GetRepoByURL` (`meta.ResolveRepoKey`, shared with the API's claim
+resolution) — and canonicalizes before any pack/ref/hook-env use.
 Path elements that resolve to no repo record are a **404 on both surfaces**: repos must be
 created via `POST /api/v1/repos` first (docs/05 addresses git URLs by `repo_id`; auth
-already accepted both spellings, and the API claim resolution shares the same helper).
+already accepted both spellings).
 
 ## ADR-22: CAS mismatch = 412, lost race / merge conflict = 409
 
@@ -134,11 +135,23 @@ inside `gitread`. `CatBlobTo` already wrapped errors with `%w`; files/metadata's
   neither produce signed commits nor verify third-party signatures (the hook's keyring
   verification is githttp-internal), so allowing the write would bypass the policy.
   Deletions and pure fast-forwards (no server-created commit) pass — hook parity (ADR-25).
+- **The write-path policy helpers are deliberately not consolidated.** The commit
+  pipeline's `wcCheckRefPolicy` and the ref/merge handlers' `wrefPolicyCheck` look like
+  duplicates but encode different call-site contracts: commit-pack/diff-commit build on the
+  current head, so their updates are fast-forward by construction (no old/new SHAs, no
+  ancestry callback, writes the response itself); the ref/merge helper must handle
+  creations, deletions, and non-fast-forward detection (zero-SHA conventions + is-ancestor
+  callback). Folding both into an `internal/gitwrite` package now would re-churn ~3000
+  validated lines for no behavior change — revisit if phase 5 adds another writer. The
+  merge endpoints already reuse the commit pipeline's scratch/publish plumbing
+  (`wcPublish`, scratch odb, `mergeBaseSHA`), so there is no third publish path.
 
 ## Follow-ups
 
 - Extend the vendor-SDK compat harness (`internal/api/sdkcompat_test.go` +
   `testdata/sdkharness`) to drive SDK write methods and assert envelope statuses
-  round-trip once the write handlers are integrated.
+  round-trip — unblocked now that the write routes are wired into `api.New`.
+- Produce the phase-4 gate evidence at this HEAD: the vendor `full-workflow.js` drive, a
+  `just-code-storage` consumer session, and the README quickstart transcript (docs/07 §4).
 - files-metadata per-path `git log -1` and the temp-file staging in `GET /repos/file`
   remain the known read-path perf follow-ups from p3 (ADR-17).
