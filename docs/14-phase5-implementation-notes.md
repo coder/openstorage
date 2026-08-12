@@ -217,7 +217,8 @@ Fix-where-touched items from the phase-5 plan that landed alongside workstream E
 
 The p5 review gate closed GO with zero P0/P1 remaining. These P2/P3 findings were
 tracked here for follow-up. *Status: items 1–5 and 7–8 were closed by the phase-6
-workstream-F burn-down (see 15); item 6 (assertf entry guards) remains open.*
+workstream-F burn-down (see 15); item 6 (assertf entry guards) was closed by the
+phase-7 burn-down (see 15, Open items).*
 
 1. **P2 — `sourcehut` provider unmapped** (`internal/sync/sync.go`): the
    OpenAPI-allowed provider enum value is rejected with 400; add

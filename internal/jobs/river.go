@@ -130,9 +130,29 @@ func NewRiver(ctx context.Context, pgURL string, deliverer *events.Deliverer, ru
 		pool.Close()
 		return nil, fmt.Errorf("jobs: river migrator: %w", err)
 	}
-	if _, err := migrator.Migrate(ctx, rivermigrate.DirectionUp, nil); err != nil {
+	// Serialize migrations across concurrently booting replicas, mirroring the
+	// advisory locks in meta/ref InitSchema: rivermigrate has no locking of its
+	// own, and two fresh boots race on creating river's tables (SQLSTATE 23505).
+	// Session-level lock on a dedicated conn because Migrate manages its own
+	// transactions internally.
+	lockConn, err := pool.Acquire(ctx)
+	if err != nil {
 		pool.Close()
-		return nil, fmt.Errorf("jobs: river migrations: %w", err)
+		return nil, fmt.Errorf("jobs: acquire migration lock conn: %w", err)
+	}
+	if _, err := lockConn.Exec(ctx, `SELECT pg_advisory_lock(0x5249564552)`); err != nil { // "RIVER"
+		lockConn.Release()
+		pool.Close()
+		return nil, fmt.Errorf("jobs: river migration lock: %w", err)
+	}
+	_, migrateErr := migrator.Migrate(ctx, rivermigrate.DirectionUp, nil)
+	if _, err := lockConn.Exec(ctx, `SELECT pg_advisory_unlock(0x5249564552)`); err != nil {
+		logger.Warn("river migration unlock failed (released with the session)", "err", err)
+	}
+	lockConn.Release()
+	if migrateErr != nil {
+		pool.Close()
+		return nil, fmt.Errorf("jobs: river migrations: %w", migrateErr)
 	}
 
 	workers := river.NewWorkers()

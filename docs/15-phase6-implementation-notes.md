@@ -140,7 +140,8 @@ claim predicate (pg + sqlite), `PushPayload.CustomerID` as the org-name string,
 `base_repo` included in repo GET responses, the `sourcehut` provider mapping,
 git-credentials create → 201, `createAbandon` cleanup of post-create failures in the
 sync-flavored creator, and pull-upstream defaulting an omitted ref to the default
-branch. Item 6 (assertf entry guards on the p5 handlers/callbacks) remains open.
+branch. Item 6 (assertf entry guards on the p5 handlers/callbacks) remained open
+at the p6 gate and was closed in phase 7 (see Open items below).
 
 ## Open items
 
@@ -159,7 +160,11 @@ location inline. This section is the phase-7 burn-down record.*
   *Closed in phase 7: multi-stage `Dockerfile` (alpine runtime carrying the required
   external `git`) + `.dockerignore` at the repo root; two-replica `replicas` profile
   (`node-a`/`node-b`, differing only in port mapping) in `docker-compose.yml`;
-  "Two-replica compose profile" subsection in the root `README.md` quickstart.*
+  "Two-replica compose profile" subsection in the root `README.md` quickstart. The
+  concurrent fresh boot surfaced a latent race — `rivermigrate` runs its DDL without
+  any locking, so two replicas migrating from scratch collide (SQLSTATE 23505) —
+  fixed by serializing river migrations under a pg advisory lock in
+  `internal/jobs/river.go`, mirroring the meta/ref `InitSchema` locks.*
 
 ### Deferred p6 gate findings (P2/P3, non-blocking)
 
