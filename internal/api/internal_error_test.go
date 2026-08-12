@@ -60,6 +60,56 @@ func (f failingStore) SigningKeysForOrg(context.Context, string) ([]meta.Signing
 
 func (f failingStore) RemoveSigningKey(context.Context, string, int64) error { return f.err }
 
+func (f failingStore) CreateWebhook(context.Context, string, string, string) (meta.Webhook, error) {
+	return meta.Webhook{}, f.err
+}
+
+func (f failingStore) ListWebhooks(context.Context, string) ([]meta.Webhook, error) {
+	return nil, f.err
+}
+
+func (f failingStore) GetWebhook(context.Context, string) (meta.Webhook, error) {
+	return meta.Webhook{}, f.err
+}
+
+func (f failingStore) DeleteWebhook(context.Context, string, string) error { return f.err }
+
+func (f failingStore) CreateGitCredential(context.Context, meta.GitCredential) (meta.GitCredential, error) {
+	return meta.GitCredential{}, f.err
+}
+
+func (f failingStore) GetGitCredential(context.Context, string) (meta.GitCredential, error) {
+	return meta.GitCredential{}, f.err
+}
+
+func (f failingStore) UpdateGitCredential(context.Context, string, string, string) (meta.GitCredential, error) {
+	return meta.GitCredential{}, f.err
+}
+
+func (f failingStore) DeleteGitCredential(context.Context, string) error { return f.err }
+
+func (f failingStore) GitCredentialForRepo(context.Context, string) (meta.GitCredential, error) {
+	return meta.GitCredential{}, f.err
+}
+
+func (f failingStore) SetRepoUpstream(context.Context, meta.RepoUpstream) (meta.RepoUpstream, error) {
+	return meta.RepoUpstream{}, f.err
+}
+
+func (f failingStore) GetRepoUpstream(context.Context, string) (meta.RepoUpstream, error) {
+	return meta.RepoUpstream{}, f.err
+}
+
+func (f failingStore) DeleteRepoUpstream(context.Context, string) error { return f.err }
+
+func (f failingStore) TryBeginSync(context.Context, string) (meta.RepoUpstream, bool, error) {
+	return meta.RepoUpstream{}, false, f.err
+}
+
+func (f failingStore) FinishSync(context.Context, string, bool) (meta.RepoUpstream, error) {
+	return meta.RepoUpstream{}, f.err
+}
+
 func TestInternalErrorsAreSanitized(t *testing.T) {
 	const secret = "SQLSTATE 28P01: password authentication failed"
 

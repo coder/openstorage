@@ -97,6 +97,35 @@ CREATE TABLE IF NOT EXISTS repos (
 -- Keyset pagination index for ListRepos (live rows only).
 CREATE INDEX IF NOT EXISTS repos_org_created_idx
     ON repos (org_id, created_at DESC, repo_id DESC) WHERE deleted_at IS NULL;
+-- Phase-5 eventing/sync tables (eventing.go): webhook registrations, git
+-- credentials, and repo upstream links.
+CREATE TABLE IF NOT EXISTS webhooks (
+    id         text PRIMARY KEY,
+    org_id     bigint NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
+    url        text NOT NULL,
+    secret     text NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS webhooks_org_idx ON webhooks (org_id);
+CREATE TABLE IF NOT EXISTS git_credentials (
+    id         text PRIMARY KEY,
+    repo_id    text NOT NULL,
+    username   text NOT NULL,
+    password   text NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT git_credentials_repo_id_key UNIQUE (repo_id)
+);
+CREATE TABLE IF NOT EXISTS repo_upstreams (
+    repo_id       text PRIMARY KEY,
+    provider      text NOT NULL,
+    owner         text NOT NULL,
+    name          text NOT NULL,
+    upstream_host text NOT NULL,
+    run_count     integer NOT NULL DEFAULT 0,
+    success_count integer NOT NULL DEFAULT 0,
+    syncing       boolean NOT NULL DEFAULT false,
+    created_at    timestamptz NOT NULL DEFAULT now()
+);
 `)
 		return err
 	})

@@ -125,6 +125,10 @@ type Store interface {
 	// RemoveSigningKey deletes the signing key with the given ID.
 	// ErrNotFound when the org is unknown or the ID does not belong to it.
 	RemoveSigningKey(ctx context.Context, org string, id int64) error
+
+	// EventingStore is the phase-5 webhook / git-credential / repo-upstream
+	// persistence surface (eventing.go).
+	EventingStore
 }
 
 // Backend extends Store with the lifecycle the wire seam needs: serve runs

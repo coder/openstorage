@@ -109,6 +109,62 @@ func (failingStore) ListRepos(context.Context, string, meta.ListParams) (meta.Li
 	panic("not used by signing-key CLI")
 }
 
+func (failingStore) CreateWebhook(context.Context, string, string, string) (meta.Webhook, error) {
+	panic("not used by signing-key CLI")
+}
+
+func (failingStore) ListWebhooks(context.Context, string) ([]meta.Webhook, error) {
+	panic("not used by signing-key CLI")
+}
+
+func (failingStore) GetWebhook(context.Context, string) (meta.Webhook, error) {
+	panic("not used by signing-key CLI")
+}
+
+func (failingStore) DeleteWebhook(context.Context, string, string) error {
+	panic("not used by signing-key CLI")
+}
+
+func (failingStore) CreateGitCredential(context.Context, meta.GitCredential) (meta.GitCredential, error) {
+	panic("not used by signing-key CLI")
+}
+
+func (failingStore) GetGitCredential(context.Context, string) (meta.GitCredential, error) {
+	panic("not used by signing-key CLI")
+}
+
+func (failingStore) UpdateGitCredential(context.Context, string, string, string) (meta.GitCredential, error) {
+	panic("not used by signing-key CLI")
+}
+
+func (failingStore) DeleteGitCredential(context.Context, string) error {
+	panic("not used by signing-key CLI")
+}
+
+func (failingStore) GitCredentialForRepo(context.Context, string) (meta.GitCredential, error) {
+	panic("not used by signing-key CLI")
+}
+
+func (failingStore) SetRepoUpstream(context.Context, meta.RepoUpstream) (meta.RepoUpstream, error) {
+	panic("not used by signing-key CLI")
+}
+
+func (failingStore) GetRepoUpstream(context.Context, string) (meta.RepoUpstream, error) {
+	panic("not used by signing-key CLI")
+}
+
+func (failingStore) DeleteRepoUpstream(context.Context, string) error {
+	panic("not used by signing-key CLI")
+}
+
+func (failingStore) TryBeginSync(context.Context, string) (meta.RepoUpstream, bool, error) {
+	panic("not used by signing-key CLI")
+}
+
+func (failingStore) FinishSync(context.Context, string, bool) (meta.RepoUpstream, error) {
+	panic("not used by signing-key CLI")
+}
+
 func (s *memSigningStore) AddSigningKey(_ context.Context, org, keyText string) (meta.SigningKey, error) {
 	if org != s.org {
 		return meta.SigningKey{}, meta.ErrNotFound

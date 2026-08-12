@@ -120,6 +120,37 @@ func (s *SQLite) InitSchema(ctx context.Context) error {
 		// Keyset pagination index for ListRepos (live rows only).
 		`CREATE INDEX IF NOT EXISTS repos_org_created_idx
 		    ON repos (org_id, created_at DESC, repo_id DESC) WHERE deleted_at IS NULL`,
+		// Phase-5 eventing/sync tables (eventing.go): webhook registrations,
+		// git credentials, and repo upstream links. syncing is an INTEGER
+		// 0/1 boolean; counters and flags are written Go-side like the
+		// timestamps.
+		`CREATE TABLE IF NOT EXISTS webhooks (
+		    id         TEXT PRIMARY KEY,
+		    org_id     INTEGER NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
+		    url        TEXT NOT NULL,
+		    secret     TEXT NOT NULL,
+		    created_at INTEGER NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS webhooks_org_idx ON webhooks (org_id)`,
+		`CREATE TABLE IF NOT EXISTS git_credentials (
+		    id         TEXT PRIMARY KEY,
+		    repo_id    TEXT NOT NULL,
+		    username   TEXT NOT NULL,
+		    password   TEXT NOT NULL,
+		    created_at INTEGER NOT NULL,
+		    CONSTRAINT git_credentials_repo_id_key UNIQUE (repo_id)
+		)`,
+		`CREATE TABLE IF NOT EXISTS repo_upstreams (
+		    repo_id       TEXT PRIMARY KEY,
+		    provider      TEXT NOT NULL,
+		    owner         TEXT NOT NULL,
+		    name          TEXT NOT NULL,
+		    upstream_host TEXT NOT NULL,
+		    run_count     INTEGER NOT NULL,
+		    success_count INTEGER NOT NULL,
+		    syncing       INTEGER NOT NULL,
+		    created_at    INTEGER NOT NULL
+		)`,
 	} {
 		if _, err := tx.ExecContext(ctx, stmt); err != nil {
 			return fmt.Errorf("sqlite init schema: %w", err)
