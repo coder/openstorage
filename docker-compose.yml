@@ -30,3 +30,46 @@ services:
       interval: 2s
       timeout: 3s
       retries: 15
+
+  # Opt-in two-replica app profile (`docker compose --profile replicas up`):
+  # two stateless nodes on the same Postgres+MinIO stack, proving multi-node
+  # statelessness in the README quickstart. Default `docker compose up` still
+  # boots only the backing services above. The nodes are identical except the
+  # host port mapping (and the base URL that embeds it). Keys come from the
+  # host (`./codestorage keygen --out ./compose-keys/cs-key`, see README).
+  node-a: &node
+    build: .
+    profiles: ["replicas"]
+    restart: on-failure
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    environment: &node-env
+      CODESTORAGE_PG_URL: postgres://postgres:postgres@postgres:5432/postgres
+      CODESTORAGE_S3_URL: "s3://codestorage?endpoint=http://minio:9000&s3ForcePathStyle=true&region=us-east-1"
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      CODESTORAGE_ORG: selfhost
+      CODESTORAGE_ORG_PUBKEYS: /keys/cs-key.pub.pem
+      CODESTORAGE_LISTEN: 0.0.0.0:8080
+      CODESTORAGE_BASE_URL: http://127.0.0.1:${NODEA_PORT:-8081}
+    ports:
+      - "${NODEA_PORT:-8081}:8080"
+    volumes:
+      - ${CS_KEYS_DIR:-./compose-keys}:/keys:ro
+    healthcheck:
+      # No unauthenticated HTTP endpoint exists, so probe the listener (nc is
+      # busybox, present in the alpine runtime image) — enough for `up --wait`.
+      test: ["CMD", "nc", "-z", "127.0.0.1", "8080"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+  node-b:
+    <<: *node
+    environment:
+      <<: *node-env
+      CODESTORAGE_BASE_URL: http://127.0.0.1:${NODEB_PORT:-8082}
+    ports:
+      - "${NODEB_PORT:-8082}:8080"

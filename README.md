@@ -39,7 +39,7 @@ see [docs/07-implementation-roadmap.md](docs/07-implementation-roadmap.md).
 | `internal/events` | Outbound webhooks: HMAC-signed delivery + the push-event `RefStore` decorator |
 | `internal/sync` | Upstream mirror sync worker (fetch + loopback push), credential/upstream contracts |
 | `internal/jobs` | Background queue seam: durable River jobs (Postgres) or in-process (local mode) |
-| `docker-compose.yml` | Postgres + MinIO for local dogfooding |
+| `docker-compose.yml` | Postgres + MinIO for local dogfooding, plus an opt-in two-replica `replicas` profile (`Dockerfile` image) |
 
 ## Quickstart
 
@@ -91,6 +91,42 @@ git add . && git commit -m 'lfs object' && git push origin HEAD:main
 ```
 
 Host ports are env-overridable (`PGPORT`, `MINIOPORT`) — see the compose file header.
+
+### Two-replica compose profile
+
+Two stateless server replicas (`node-a`, `node-b`) share one Postgres+MinIO stack,
+built from the repo `Dockerfile` — a push through one node is immediately visible
+through the other:
+
+```sh
+# 1. Keys on the host (the same binary also mints tokens below).
+go build ./cmd/codestorage
+mkdir -p compose-keys && ./codestorage keygen --out ./compose-keys/cs-key
+
+# 2. Boot backing services + both replicas (node A on :8081, node B on :8082).
+docker compose --profile replicas up -d --wait --build
+
+# 3. Mint tokens against the compose keypair.
+TOK_W=$(./codestorage mint --key ./compose-keys/cs-key.pem --iss selfhost --repo demo --scopes repo:write)
+TOK_GIT=$(./codestorage mint --key ./compose-keys/cs-key.pem --iss selfhost --repo demo --scopes git:read,git:write)
+
+# 4. Create + push via node A; clone via node B — same HEAD SHA.
+curl -s -X POST http://127.0.0.1:8081/api/v1/repos -H "Authorization: Bearer $TOK_W" \
+  -d '{"default_branch":"main"}'
+git clone "http://t:${TOK_GIT}@127.0.0.1:8081/demo.git" /tmp/demo-a
+(cd /tmp/demo-a && git commit --allow-empty -m two-nodes && git push origin HEAD:main)
+git clone "http://t:${TOK_GIT}@127.0.0.1:8082/demo.git" /tmp/demo-b
+
+# 5. One API read per node (repo reads take git:read): v1 on A, named alias on B.
+curl -s http://127.0.0.1:8081/api/v1/repo    -H "Authorization: Bearer $TOK_GIT"
+curl -s http://127.0.0.1:8082/api/repos/demo -H "Authorization: Bearer $TOK_GIT"
+
+# 6. Teardown (drops the Postgres/MinIO volumes too).
+docker compose --profile replicas down -v
+```
+
+Replica host ports are env-overridable like the backing services (`NODEA_PORT`,
+`NODEB_PORT`); keys are read from `./compose-keys` (override with `CS_KEYS_DIR`).
 
 ### Local mode quickstart
 

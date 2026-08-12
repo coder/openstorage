@@ -1,0 +1,7 @@
+# Keep the build context lean: reference clones, upstream doc snapshots, and
+# local key material are never needed inside the image.
+.git
+/sdk/
+/just-code-storage/
+docs/upstream/
+compose-keys/
