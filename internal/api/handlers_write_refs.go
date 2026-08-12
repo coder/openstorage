@@ -48,7 +48,7 @@ func (s *server) registerWriteRefRoutes(mux *http.ServeMux, verifier auth.Verifi
 	assertf(mux != nil, "registerWriteRefRoutes: nil mux")
 	assertf(verifier != nil, "registerWriteRefRoutes: nil verifier")
 	route := func(pattern string, h http.HandlerFunc, scopes ...string) {
-		mux.Handle(pattern, requireAuth(verifier, false, scopes...)(h))
+		mux.Handle(pattern, requireAuthWrite(verifier, false, scopes...)(h))
 	}
 	route("POST /api/v1/repos/branches/create", s.handleCreateBranch, auth.ScopeGitWrite)
 	route("DELETE /api/v1/repos/branches", s.handleDeleteBranch, auth.ScopeGitWrite)

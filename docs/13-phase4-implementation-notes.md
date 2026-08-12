@@ -168,23 +168,25 @@ The p4 review found seven externally visible P2s. Landed so far:
      `ref` reuse the write path's validation and normalization (`ref.ValidSHA`,
      `wrefNotesRefName`).
 
-Still open at this HEAD, ahead of the dogfood gate (fix + one regression test apiece):
+All items below are now closed (re-gate burn-down; regression tests apiece):
 
-1. **Empty-pack publish 500s.** `wcPublish`/`wrefPublish` treat a zero-object
-   `pack-objects` result (empty pack id) as an internal error; a write whose objects are
-   all already reachable should skip the upload and proceed to the ref CAS.
-2. **Merge preview 500 on submodule conflicts.** `wmRenderConflicts` runs
-   `cat-file blob` on every conflict stage; mode-160000 (gitlink) stage OIDs are commit
-   SHAs and must be emitted without content.
-3. **Merge preview cannot see ephemeral branches.** `handleMergePreview` resolves
-   `refs/heads/<name>` only, missing `handleMerge`'s `auth.EphemeralRefName` fallback.
-4. **Note author CR/LF injection.** `wrefHandleNote` checks author name/email for
-   non-emptiness only before they flow into `GIT_AUTHOR_NAME` et al.; the commit-pack
-   path (`wcValidateAuthor`) already rejects `\n`/`\r`.
-5. **ADR-26's envelope-shaped 401/403 on write routes is not yet implemented.**
-   `requireAuth` emits plain `{"error"}` on every route; the write/read middleware split
-   the ADR records is still to be built.
-6. **No coverage of the `wrefIsAncestor` path** (note update under `no-force-push`).
+1. **Empty-pack publish 500s** — fixed: `wcPublish`/`wrefPublish` skip the blob upload
+   for a zero-object `pack-objects` result and proceed to the ref CAS.
+2. **Merge preview 500 on submodule conflicts** — fixed: `wmRenderConflicts` carries
+   mode+oid from merge-tree records and never `cat-file blob`s gitlink (160000) stages.
+3. **Merge preview cannot see ephemeral branches** — fixed: optional
+   `source_ephemeral`/`target_ephemeral` query params (mirrors `handleMerge`'s body
+   flags; the vendor SDK sends neither, so its behavior is unchanged).
+4. **Note author CR/LF injection** — fixed: notes author fields go through the same
+   `\n`/`\r` rejection as the commit-pack path.
+5. **ADR-26's envelope-shaped 401/403 on write routes** — implemented:
+   `requireAuthWrite` (all docs/04 write routes) emits `{"result": {success:false,
+   status: unauthorized|forbidden, message}}` with `WWW-Authenticate: Bearer` on 401;
+   read routes keep the `{"error"}` body per docs/02.
+6. **`wrefIsAncestor` coverage** — added: fast-forward notes ops under `no-force-push`
+   run the real ancestry check end-to-end; the non-fast-forward denial branch (an
+   unreachable transition through the notes API) is unit-tested via `wrefPolicyCheck`
+   with a stubbed ancestry function.
 
 ## Follow-ups
 

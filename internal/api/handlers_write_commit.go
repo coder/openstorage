@@ -77,7 +77,7 @@ const (
 func registerWriteCommitRoutes(mux *http.ServeMux, s *server, verifier auth.Verifier) {
 	assertf(mux != nil && s != nil && verifier != nil, "registerWriteCommitRoutes: nil dependency")
 	route := func(pattern string, h http.HandlerFunc) {
-		mux.Handle(pattern, requireAuth(verifier, false, auth.ScopeGitWrite)(h))
+		mux.Handle(pattern, requireAuthWrite(verifier, false, auth.ScopeGitWrite)(h))
 	}
 	route("POST /api/v1/repos/commit-pack", s.handleCommitPack)
 	route("POST /api/v1/repos/diff-commit", s.handleDiffCommit)

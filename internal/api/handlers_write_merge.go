@@ -78,7 +78,8 @@ const wmFilteredReasonTooLarge = "max_content_bytes_exceeded"
 func (s *server) registerWriteMergeRoutes(mux *http.ServeMux, verifier auth.Verifier) {
 	assertf(mux != nil && s != nil && verifier != nil, "registerWriteMergeRoutes: nil dependency")
 	mux.Handle("POST /api/v1/repos/merge",
-		requireAuth(verifier, false, auth.ScopeGitWrite)(http.HandlerFunc(s.handleMerge)))
+		requireAuthWrite(verifier, false, auth.ScopeGitWrite)(http.HandlerFunc(s.handleMerge)))
+	// Preview is a read (docs/03: git:read) and keeps the {"error"} body.
 	mux.Handle("GET /api/v1/repos/merge/preview",
 		requireAuth(verifier, false, auth.ScopeGitRead)(http.HandlerFunc(s.handleMergePreview)))
 }

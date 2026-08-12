@@ -427,6 +427,26 @@ func (e *testEnv) doReq(t *testing.T, method, path, token string, body []byte, a
 	return resp, respBody
 }
 
+// requireAuthResultEnvelope asserts an auth failure from a write route
+// carries the docs/04 result envelope (ADR-26): {"result": {success:false,
+// status, message}}.
+func requireAuthResultEnvelope(t *testing.T, body []byte, wantStatus string) {
+	t.Helper()
+	var envlp struct {
+		Result struct {
+			Success bool   `json:"success"`
+			Status  string `json:"status"`
+			Message string `json:"message"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(body, &envlp); err != nil {
+		t.Fatalf("body %q is not a result envelope: %v", body, err)
+	}
+	if envlp.Result.Success || envlp.Result.Status != wantStatus || envlp.Result.Message == "" {
+		t.Fatalf("result = %+v, want success=false status=%q non-empty message", envlp.Result, wantStatus)
+	}
+}
+
 // requireEnvelope asserts an error response carries the {"error"} envelope
 // (and WWW-Authenticate on 401), returning the message.
 func requireEnvelope(t *testing.T, resp *http.Response, body []byte) string {

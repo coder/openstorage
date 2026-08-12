@@ -1090,8 +1090,8 @@ func TestMergePreview(t *testing.T) {
 			if resp.StatusCode != http.StatusNotFound {
 				t.Fatalf("unknown source: status = %d, body %s", resp.StatusCode, raw)
 			}
-			// Ephemeral refs are not addressable through the preview
-			// contract (no ephemeral params, docs/03).
+			// Without the opt-in source_ephemeral flag, ephemeral refs
+			// stay unaddressable (vendor-SDK default behavior preserved).
 			resp, raw = wmDo(t, srv, "GET",
 				"/api/v1/repos/merge/preview?source_branch=scratch&target_branch=main", fx.token, nil)
 			if resp.StatusCode != http.StatusNotFound {

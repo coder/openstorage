@@ -1,6 +1,7 @@
 package api
 
 import (
+	"fmt"
 	"log/slog"
 	"net/http"
 	"runtime/debug"
@@ -108,7 +109,46 @@ func bearerToken(r *http.Request) (string, bool) {
 // into the request context; per-repo handlers can rely on a non-empty,
 // non-"org" repo claim.
 func requireAuth(verifier auth.Verifier, orgLevel bool, requiredScopes ...string) middleware {
+	return requireAuthWith(verifier, orgLevel, writeErr, requiredScopes...)
+}
+
+// authFailStatus maps the two auth-failure HTTP codes onto the docs/04
+// result-envelope status strings.
+func authFailStatus(httpCode int) string {
+	switch httpCode {
+	case http.StatusUnauthorized:
+		return "unauthorized"
+	case http.StatusForbidden:
+		return "forbidden"
+	}
+	panic(fmt.Sprintf("api assertion failed: authFailStatus: unexpected code %d", httpCode))
+}
+
+// writeAuthEnvelope is the docs/04 §3 / ADR-26 failure writer for write
+// routes: auth failures carry the result envelope ({"result": {success,
+// status, message}}) instead of the plain {"error"} body, so SDKs can map
+// them onto typed RefUpdateErrors. 401 keeps WWW-Authenticate (RFC 9110).
+func writeAuthEnvelope(w http.ResponseWriter, httpCode int, msg string) {
+	assertf(msg != "", "writeAuthEnvelope: empty message")
+	if httpCode == http.StatusUnauthorized {
+		w.Header().Set("WWW-Authenticate", "Bearer")
+	}
+	writeJSON(w, httpCode, map[string]any{"result": map[string]any{
+		"success": false,
+		"status":  authFailStatus(httpCode),
+		"message": msg,
+	}})
+}
+
+// requireAuthWrite is requireAuth with ADR-26 envelope-shaped 401/403
+// bodies; every docs/04 write route must use it.
+func requireAuthWrite(verifier auth.Verifier, orgLevel bool, requiredScopes ...string) middleware {
+	return requireAuthWith(verifier, orgLevel, writeAuthEnvelope, requiredScopes...)
+}
+
+func requireAuthWith(verifier auth.Verifier, orgLevel bool, fail func(http.ResponseWriter, int, string), requiredScopes ...string) middleware {
 	assertf(verifier != nil, "requireAuth: nil verifier")
+	assertf(fail != nil, "requireAuth: nil failure writer")
 	assertf(len(requiredScopes) > 0, "requireAuth: no required scopes")
 	for _, s := range requiredScopes {
 		assertf(s != "", "requireAuth: empty required scope")
@@ -117,27 +157,27 @@ func requireAuth(verifier auth.Verifier, orgLevel bool, requiredScopes ...string
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			token, ok := bearerToken(r)
 			if !ok {
-				writeErr(w, http.StatusUnauthorized, "missing or malformed authorization header")
+				fail(w, http.StatusUnauthorized, "missing or malformed authorization header")
 				return
 			}
 			claims, err := verifier.Verify(r.Context(), token)
 			if err != nil {
-				writeErr(w, http.StatusUnauthorized, "invalid token")
+				fail(w, http.StatusUnauthorized, "invalid token")
 				return
 			}
 			assertf(claims != nil, "Verifier returned nil claims without error")
 			for _, scope := range requiredScopes {
 				if !claims.HasScope(scope) {
-					writeErr(w, http.StatusForbidden, "missing required scope "+scope)
+					fail(w, http.StatusForbidden, "missing required scope "+scope)
 					return
 				}
 			}
 			if orgLevel && claims.Repo != auth.RepoClaimOrg {
-				writeErr(w, http.StatusForbidden, "token is not org-scoped")
+				fail(w, http.StatusForbidden, "token is not org-scoped")
 				return
 			}
 			if !orgLevel && (claims.Repo == "" || claims.Repo == auth.RepoClaimOrg) {
-				writeErr(w, http.StatusForbidden, "token is not repo-scoped")
+				fail(w, http.StatusForbidden, "token is not repo-scoped")
 				return
 			}
 			next.ServeHTTP(w, r.WithContext(auth.WithClaims(r.Context(), claims)))
