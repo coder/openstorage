@@ -102,10 +102,13 @@ func httpError(w http.ResponseWriter, status int, msg string) {
 	_ = json.NewEncoder(w).Encode(map[string]string{"error": msg})
 }
 
-// Handler routes the two smart-HTTP endpoints per repo (docs/05):
+// Handler routes the smart-HTTP and LFS endpoints per repo (docs/05):
 //
 //	GET  /{repo}.git/info/refs?service=git-{upload|receive}-pack
 //	POST /{repo}.git/git-{upload|receive}-pack
+//	POST /{repo}.git/info/lfs/objects/batch
+//	GET  /{repo}.git/info/lfs/objects/{oid}   (proxy transfer, local mode)
+//	PUT  /{repo}.git/info/lfs/objects/{oid}   (proxy transfer, local mode)
 func (s *Server) Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		repo, rest, ok := splitRepoPath(r.URL.Path)
@@ -118,6 +121,8 @@ func (s *Server) Handler() http.Handler {
 			s.handleInfoRefs(w, r, repo)
 		case r.Method == http.MethodPost && (rest == "git-upload-pack" || rest == "git-receive-pack"):
 			s.handleServiceRPC(w, r, repo, strings.TrimPrefix(rest, "git-"))
+		case strings.HasPrefix(rest, "info/lfs/"):
+			s.handleLFS(w, r, repo, strings.TrimPrefix(rest, "info/lfs/"))
 		default:
 			httpError(w, http.StatusNotFound, "unsupported endpoint")
 		}
@@ -143,12 +148,20 @@ func splitRepoPath(path string) (repo, rest string, ok bool) {
 // a missing/invalid token (any Verifier failure), 403 for a valid token that
 // does not fit this org, repo, or scope.
 func (s *Server) authenticate(r *http.Request, repo, scope string) (*auth.Claims, int, error) {
-	assertf(s.Verifier != nil && s.Org != "", "Server used without Verifier/Org")
 	user, pass, ok := r.BasicAuth()
 	if !ok || user != "t" {
 		return nil, http.StatusUnauthorized, fmt.Errorf("basic auth with username 't' required")
 	}
-	claims, err := s.Verifier.Verify(r.Context(), pass)
+	return s.verifyClaims(r.Context(), pass, repo, scope)
+}
+
+// verifyClaims is the token-to-claims half of authenticate, shared with the
+// LFS endpoints (which also accept `Authorization: Bearer <jwt>` per the LFS
+// batch spec). Same failure mapping: 401 for Verifier failures, 403 for
+// org/repo/scope mismatch.
+func (s *Server) verifyClaims(ctx context.Context, token, repo, scope string) (*auth.Claims, int, error) {
+	assertf(s.Verifier != nil && s.Org != "", "Server used without Verifier/Org")
+	claims, err := s.Verifier.Verify(ctx, token)
 	if err != nil {
 		return nil, http.StatusUnauthorized, err
 	}
@@ -174,7 +187,7 @@ func (s *Server) authenticate(r *http.Request, repo, scope string) (*auth.Claims
 	if claims.Repo != target {
 		matched := false
 		if s.ResolveRepo != nil {
-			if rec, ok := s.ResolveRepo(r.Context(), target); ok && (claims.Repo == rec.RepoID || claims.Repo == rec.URL) {
+			if rec, ok := s.ResolveRepo(ctx, target); ok && (claims.Repo == rec.RepoID || claims.Repo == rec.URL) {
 				matched = true
 			}
 		}
