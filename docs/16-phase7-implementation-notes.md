@@ -87,3 +87,32 @@ token's `repo` claim. This is safe by construction: `requireAuth(orgLevel=false)
 guarantees the claim is non-empty and non-`"org"`, and `aliasHandler` has already
 matched it against the path name — the fallback can only name the repo the alias
 resolved. When both are present, body `repo_id` and claim must still agree.
+
+## Gate outcome and remaining deferrals
+
+The first p7 gate returned NO-GO solely for missing dogfood evidence (the dogfood run
+was interrupted after compose boot; all static gates were green at `68b1bf8`). The
+dogfood-only re-gate was executed against the still-running `cs-p7pkg` stack and
+**PASSED 2/2**:
+
+- **Flow 1 (multi-node statelessness):** repo created via node A, push via node A,
+  clone via node B — identical HEAD on both sides; one API read per node (v1 on A,
+  named alias on B). Zero `level=ERROR` lines in either replica log.
+- **Flow 2 (path-id git-credentials):** create via node A → PUT path-id via node B
+  (200, body shape identical to the v1 form) → DELETE path-id (204) → 404 result
+  envelopes for PUT/DELETE on the deleted id.
+- A live probe confirmed the alias POST returns **201** (spec-conformant status).
+
+Evidence: transcripts, replica logs, and flow scripts under
+`~/codestorage-evidence/p7-packaging-deferrals/`.
+
+**Remaining deferrals (non-blocking, end-of-roadmap backlog):**
+
+1. **P2 — alias git-credentials POST body omits `created_at`** (`handlers_credentials.go`):
+   openapi.yaml specifies `201 {id, created_at}`; live probe shows `201 {id}`.
+2. **P2 — test-coverage gaps**: no DELETE-by-repo-id (v1 body form) or malformed-JSON
+   PUT cases in `credentials_test.go`.
+3. **P3 ×5** (polish): negative-RPS silently disables rate limiting vs ADR-37 wording;
+   advisory-lock release on panic paths; redundant `ResolveRepoKey` lookup in the alias
+   path; `internalErrResult` duplication; compose healthchecks are TCP-only.
+
