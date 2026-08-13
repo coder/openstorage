@@ -60,9 +60,9 @@ services:
     volumes:
       - ${CS_KEYS_DIR:-./compose-keys}:/keys:ro
     healthcheck:
-      # No unauthenticated HTTP endpoint exists, so probe the listener (nc is
-      # busybox, present in the alpine runtime image) — enough for `up --wait`.
-      test: ["CMD", "nc", "-z", "127.0.0.1", "8080"]
+      # /healthz is unauthenticated; wget is busybox, present in the alpine
+      # runtime image.
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/healthz"]
       interval: 2s
       timeout: 3s
       retries: 15

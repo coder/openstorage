@@ -61,6 +61,10 @@ export CODESTORAGE_S3_URL='s3://codestorage?endpoint=http://127.0.0.1:19000&s3Fo
 export AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin
 CODESTORAGE_ORG=selfhost CODESTORAGE_ORG_PUBKEYS=/tmp/cs-key.pub.pem \
   ./codestorage serve --listen 127.0.0.1:8080 &
+sleep 1 && curl -sf http://127.0.0.1:8080/healthz && kill -0 $!
+# ^ catches a stale server squatting the port: serve exits with "address already
+#   in use" behind `&`, and every later command would silently talk to the old
+#   process (whose keys/repos don't match this shell's) — kill it first.
 
 # 4. Mint JWTs with the org's private key (iss = org, repo = target repo or "org").
 TOK_CREATE=$(./codestorage mint --key /tmp/cs-key.pem --iss selfhost --repo demo --scopes repo:write)
@@ -72,7 +76,6 @@ curl -s -X POST http://127.0.0.1:8080/api/v1/repos -H "Authorization: Bearer $TO
   -d '{"default_branch":"main"}'                                    # {"repo_id":...}
 curl -s http://127.0.0.1:8080/api/v1/repo  -H "Authorization: Bearer $TOK_READ"
 curl -s 'http://127.0.0.1:8080/api/v1/repos?limit=10&q=demo' -H "Authorization: Bearer $TOK_ORG"
-curl -s -X DELETE http://127.0.0.1:8080/api/v1/repos/delete -H "Authorization: Bearer $TOK_CREATE"
 
 # 6. Plain git against the same node.
 TOKEN=$(./codestorage mint --key /tmp/cs-key.pem --iss selfhost --repo demo --scopes git:read,git:write)
@@ -90,6 +93,11 @@ git add . && git commit -m 'lfs object' && git push origin HEAD:main
 #    block) for the `verify-sig` ref-policy op; hooks read them fresh per push.
 ./codestorage signing-key add --org selfhost --key ~/.ssh/id_ed25519.pub
 ./codestorage signing-key list --org selfhost
+
+# 9. Clean up: soft delete + async storage cleanup. Note: this is last for a
+#    reason — the name stays reserved (recreate → 409, clone → not found) until
+#    cleanup completes, so don't delete a repo you're about to clone.
+curl -s -X DELETE http://127.0.0.1:8080/api/v1/repos/delete -H "Authorization: Bearer $TOK_CREATE"
 ```
 
 Host ports are env-overridable (`PGPORT`, `MINIOPORT`) — see the compose file header.
@@ -144,6 +152,9 @@ go build ./cmd/codestorage
 # 2. Start a node: same /api/v1 + git smart-HTTP surface as the container stack.
 CODESTORAGE_ORG=selfhost CODESTORAGE_ORG_PUBKEYS=/tmp/cs-key.pub.pem \
   ./codestorage serve --listen 127.0.0.1:8080 --data-dir /tmp/cs-data &
+sleep 1 && curl -sf http://127.0.0.1:8080/healthz && kill -0 $!
+# ^ fails fast if the port was already taken by an older server (serve's
+#   "address already in use" exit is easy to miss behind `&`).
 
 # 3. Mint a token and create a repo.
 TOK_CREATE=$(./codestorage mint --key /tmp/cs-key.pem --iss selfhost --repo demo --scopes repo:write)

@@ -171,6 +171,14 @@ func cmdServe(ctx context.Context, args []string) error {
 	}
 	mux.Handle("/", srv.Handler())
 
+	// Unauthenticated liveness probe: lets quickstarts and compose
+	// healthchecks confirm this server (not a stale process squatting the
+	// port) is answering before any authenticated call.
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintln(w, `{"status":"ok"}`)
+	})
+
 	fmt.Printf("listening on %s\n", ln.Addr())
 	return http.Serve(ln, mux)
 }
