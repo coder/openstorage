@@ -7,3 +7,7 @@
 
 # Service binary built by the README quickstart (`go build ./cmd/codestorage`)
 /codestorage
+
+# Local quickstart scratch (cloned demo repo, serve --data-dir state)
+/demo/
+/tmp/
