@@ -55,6 +55,11 @@ func OpenFile(blobURL string) (*File, error) {
 	bucket, err := fileblob.OpenBucket(dir, &fileblob.Options{
 		CreateDir: true,
 		Metadata:  fileblob.MetadataDontWrite,
+		// Write temp files next to their destination, not in os.TempDir:
+		// the bucket dir (e.g. --data-dir on /home) and /tmp are often
+		// different mounts, and fileblob's publish rename would then fail
+		// with EXDEV "invalid cross-device link" on every pack upload.
+		NoTempDir: true,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("open file bucket %q: %w", dir, err)

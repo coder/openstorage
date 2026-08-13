@@ -210,3 +210,33 @@ func TestFile_DownloadMissingKey(t *testing.T) {
 		t.Fatalf("destPath must not exist after failed download, stat err = %v", err)
 	}
 }
+
+// TestFile_UploadNeverUsesOSTempDir: fileblob must stage upload temp files
+// next to their destination (NoTempDir), not in os.TempDir. When the bucket
+// dir and os.TempDir are different mounts (e.g. --data-dir on /home, tmpfs
+// /tmp), the publish rename otherwise fails with EXDEV "invalid cross-device
+// link" on every pack upload. Cross-device mounts can't be fabricated in a
+// unit test, so it pins the invariant portably: with TMPDIR pointing at an
+// unwritable directory, any writer that staged in os.TempDir would fail.
+func TestFile_UploadNeverUsesOSTempDir(t *testing.T) {
+	b, _ := openFile(t)
+	src := filepath.Join(t.TempDir(), "src")
+	if err := os.WriteFile(src, []byte("pack bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	unwritable := filepath.Join(t.TempDir(), "no-write")
+	if err := os.Mkdir(unwritable, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(unwritable, 0o700) })
+	t.Setenv("TMPDIR", unwritable)
+	if f, err := os.CreateTemp("", "probe-*"); err == nil {
+		f.Close()
+		t.Skip("os.TempDir still writable (running as root?); cannot pin the invariant")
+	}
+
+	if err := b.UploadFile(context.Background(), PackKey("r1", "exdev"), src); err != nil {
+		t.Fatalf("UploadFile must not depend on os.TempDir: %v", err)
+	}
+}
