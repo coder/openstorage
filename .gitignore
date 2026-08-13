@@ -4,3 +4,6 @@
 
 # Local key material for the compose `replicas` profile (README quickstart)
 /compose-keys/
+
+# Service binary built by the README quickstart (`go build ./cmd/codestorage`)
+/codestorage
