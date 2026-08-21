@@ -81,6 +81,34 @@ func coreBoolParam(q url.Values, name string) (bool, error) {
 	}
 }
 
+// coreAliasParam reads the current upstream query param name, falling back
+// to its deprecated alias when the current name is absent or empty. The live
+// spec deprecation notes ("Provide X or the deprecated Y") define no
+// precedence, so ours is fixed here: the current name wins when both carry
+// values. Only the winning value is validated downstream — the loser is a
+// deprecated duplicate, not an independent input.
+func coreAliasParam(q url.Values, current, deprecated string) string {
+	if v := q.Get(current); v != "" {
+		return v
+	}
+	return q.Get(deprecated)
+}
+
+// coreAliasBoolParam is coreAliasParam for coreBoolParam-shaped booleans.
+// Unlike string aliases, BOTH spellings are shape-validated (a request that
+// 400'd on a malformed bool before the alias existed must keep 400ing);
+// precedence still gives the current name the effective value.
+func coreAliasBoolParam(q url.Values, current, deprecated string) (bool, error) {
+	deprecatedVal, err := coreBoolParam(q, deprecated)
+	if err != nil {
+		return false, err
+	}
+	if q.Get(current) == "" {
+		return deprecatedVal, nil
+	}
+	return coreBoolParam(q, current)
+}
+
 // coreLimitParam parses the limit query param: absent/0 selects def
 // (openapi: minimum 0, "defaults to N"); negative, non-integer, or above
 // max is a 400.
@@ -332,7 +360,8 @@ type listCommitsResponse struct {
 }
 
 // handleListCommits implements GET /api/v1/repos/commits: newest-first from
-// the resolved branch tip (default branch when omitted). Pagination is
+// the resolved `ref` tip (deprecated alias `branch`; default branch when
+// omitted). Pagination is
 // anchored: page one resolves the branch to an anchor sha, the cursor
 // encodes (anchor, offset), and later pages walk `git log <anchor>` — so a
 // concurrent push never shifts a walk in progress. Unknown branch and
@@ -385,7 +414,7 @@ func (s *server) handleListCommits(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	} else {
-		branch := q.Get("branch")
+		branch := coreAliasParam(q, "ref", "branch")
 		if branch == "" {
 			branch = repo.DefaultBranch
 		}
@@ -433,17 +462,18 @@ type getCommitResponse struct {
 	Commit commitDetailEntry `json:"commit"`
 }
 
-// handleGetCommit implements GET /api/v1/repos/commit: `sha` accepts a
-// branch name, tag, short sha, or full sha; signed commits additionally
-// carry the armored signature and the exact signed payload bytes.
+// handleGetCommit implements GET /api/v1/repos/commit: `ref` (deprecated
+// alias `sha`) accepts a branch name, tag, short sha, or full sha; signed
+// commits additionally carry the armored signature and the exact signed
+// payload bytes.
 func (s *server) handleGetCommit(w http.ResponseWriter, r *http.Request) {
 	repo, ok := s.resolveReadRepo(w, r)
 	if !ok {
 		return
 	}
-	spec := r.URL.Query().Get("sha")
+	spec := coreAliasParam(r.URL.Query(), "ref", "sha")
 	if spec == "" {
-		writeErr(w, http.StatusBadRequest, "missing sha")
+		writeErr(w, http.StatusBadRequest, "missing ref")
 		return
 	}
 	repoPath, ok := s.materializeReadRepo(w, r, repo.RepoID)

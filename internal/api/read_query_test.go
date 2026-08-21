@@ -408,6 +408,61 @@ func testQueryCommitDiff(t *testing.T, e *testEnv) {
 		}
 	})
 
+	// Issue #15: upstream deprecated the camelCase params in favor of
+	// ref/base_ref/git_apply_compatible and added the *_is_ephemeral flags.
+	t.Run("ref and base_ref alias the deprecated camelCase params", func(t *testing.T) {
+		resp, body := e.doReq(t, http.MethodGet, "/api/v1/repos/diff?ref="+fx.c3+"&base_ref="+fx.c1, tok, nil, "")
+		var out commitDiffResponse
+		rqDecode(t, resp, body, &out)
+		if out.SHA != fx.c3 || out.MergeBaseSHA != fx.c1 || len(out.Files) != 4 {
+			t.Errorf("ref/base_ref: sha=%q merge_base=%q files=%d, want %q/%q/4", out.SHA, out.MergeBaseSHA, len(out.Files), fx.c3, fx.c1)
+		}
+		// Both styles at once: the current names win (sha=c1 would be a
+		// root diff, baseSha=c4 would move the merge base to c2).
+		resp, body = e.doReq(t, http.MethodGet,
+			"/api/v1/repos/diff?ref="+fx.c3+"&sha="+fx.c1+"&base_ref="+fx.c1+"&baseSha="+fx.c4, tok, nil, "")
+		rqDecode(t, resp, body, &out)
+		if out.SHA != fx.c3 || out.MergeBaseSHA != fx.c1 || len(out.Files) != 4 {
+			t.Errorf("alias conflict: sha=%q merge_base=%q files=%d, want current names to win (%q/%q/4)", out.SHA, out.MergeBaseSHA, len(out.Files), fx.c3, fx.c1)
+		}
+		// snake_case git_apply_compatible is accepted...
+		resp, body = e.doReq(t, http.MethodGet, "/api/v1/repos/diff?ref="+fx.c2+"&git_apply_compatible=true", tok, nil, "")
+		rqDecode(t, resp, body, &out)
+		if out.SHA != fx.c2 {
+			t.Errorf("git_apply_compatible: sha = %q, want %q", out.SHA, fx.c2)
+		}
+		// ...and both spellings stay shape-validated even when the winning
+		// one is well-formed (pre-alias requests that 400'd must keep 400ing).
+		resp, body = e.doReq(t, http.MethodGet, "/api/v1/repos/diff?ref="+fx.c2+"&git_apply_compatible=bogus", tok, nil, "")
+		rqExpectErr(t, resp, body, http.StatusBadRequest)
+		resp, body = e.doReq(t, http.MethodGet, "/api/v1/repos/diff?ref="+fx.c2+"&git_apply_compatible=true&gitApplyCompatible=bogus", tok, nil, "")
+		rqExpectErr(t, resp, body, http.StatusBadRequest)
+	})
+
+	t.Run("ref_is_ephemeral and base_is_ephemeral namespace flags", func(t *testing.T) {
+		// The fixture's ephemeral "eph" points at c3: with the flag the
+		// name resolves, without it the persistent namespace 404s.
+		resp, body := e.doReq(t, http.MethodGet, "/api/v1/repos/diff?ref=eph&ref_is_ephemeral=true", tok, nil, "")
+		var out commitDiffResponse
+		rqDecode(t, resp, body, &out)
+		if out.SHA != fx.c3 || len(out.Files) != 2 {
+			t.Errorf("ephemeral ref: sha=%q files=%d, want %q/2 (parent diff of c3)", out.SHA, len(out.Files), fx.c3)
+		}
+		resp, body = e.doReq(t, http.MethodGet, "/api/v1/repos/diff?ref=eph", tok, nil, "")
+		rqExpectErr(t, resp, body, http.StatusNotFound)
+		// base_is_ephemeral resolves the base side: base eph(=c3) against
+		// c4 is the same three-dot diff as baseSha=c3 (merge base c2).
+		resp, body = e.doReq(t, http.MethodGet, "/api/v1/repos/diff?ref="+fx.c4+"&base_ref=eph&base_is_ephemeral=true", tok, nil, "")
+		rqDecode(t, resp, body, &out)
+		if out.SHA != fx.c4 || out.MergeBaseSHA != fx.c2 {
+			t.Errorf("ephemeral base: sha=%q merge_base=%q, want %q/%q", out.SHA, out.MergeBaseSHA, fx.c4, fx.c2)
+		}
+		resp, body = e.doReq(t, http.MethodGet, "/api/v1/repos/diff?ref="+fx.c2+"&ref_is_ephemeral=bogus", tok, nil, "")
+		rqExpectErr(t, resp, body, http.StatusBadRequest)
+		resp, body = e.doReq(t, http.MethodGet, "/api/v1/repos/diff?ref="+fx.c2+"&base_is_ephemeral=bogus", tok, nil, "")
+		rqExpectErr(t, resp, body, http.StatusBadRequest)
+	})
+
 	t.Run("gitApplyCompatible concatenation passes git apply", func(t *testing.T) {
 		resp, body := e.doReq(t, http.MethodGet, "/api/v1/repos/diff?sha="+fx.c2+"&gitApplyCompatible=true", tok, nil, "")
 		var out commitDiffResponse

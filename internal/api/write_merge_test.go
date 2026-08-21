@@ -894,6 +894,55 @@ func TestMergePreview(t *testing.T) {
 			}
 		})
 
+		// Issue #15: source_is_ephemeral/target_is_ephemeral are the
+		// official upstream spellings; the historical source_ephemeral/
+		// target_ephemeral stay as deprecated aliases.
+		t.Run("official *_is_ephemeral spellings resolve", func(t *testing.T) {
+			resp, body := preview(t, "source_branch=scratch&target_branch=main&source_is_ephemeral=true")
+			if resp.StatusCode != http.StatusOK || body["source_tip_sha"] != fx.scratchTip {
+				t.Fatalf("status = %d, source_tip_sha = %v, want 200/%v", resp.StatusCode, body["source_tip_sha"], fx.scratchTip)
+			}
+			resp, body = preview(t, "source_branch=feature&target_branch=et&target_is_ephemeral=true")
+			if resp.StatusCode != http.StatusOK || body["target_tip_sha"] != fx.c2 {
+				t.Fatalf("status = %d, target_tip_sha = %v, want 200/%v", resp.StatusCode, body["target_tip_sha"], fx.c2)
+			}
+		})
+		t.Run("official spelling wins over the deprecated alias", func(t *testing.T) {
+			resp, body := preview(t, "source_branch=scratch&target_branch=main&source_is_ephemeral=true&source_ephemeral=false")
+			if resp.StatusCode != http.StatusOK || body["source_tip_sha"] != fx.scratchTip {
+				t.Fatalf("status = %d, body %v, want the official spelling to win", resp.StatusCode, body)
+			}
+			resp, _ = preview(t, "source_branch=scratch&target_branch=main&source_is_ephemeral=false&source_ephemeral=true")
+			if resp.StatusCode != http.StatusNotFound {
+				t.Fatalf("status = %d, want 404 (explicit official false beats deprecated true)", resp.StatusCode)
+			}
+		})
+		t.Run("both ephemeral spellings stay shape-validated", func(t *testing.T) {
+			for _, q := range []string{
+				"source_is_ephemeral=bogus", "target_is_ephemeral=bogus",
+				"source_ephemeral=bogus", "target_ephemeral=bogus",
+				"source_is_ephemeral=true&source_ephemeral=bogus",
+			} {
+				resp, body := preview(t, "source_branch=feature&target_branch=main&"+q)
+				if resp.StatusCode != http.StatusBadRequest {
+					t.Errorf("%s: status = %d, body %v, want 400", q, resp.StatusCode, body)
+				}
+			}
+		})
+		t.Run("absent ephemeral flags preserve vendor-SDK defaults", func(t *testing.T) {
+			// ADR: explicit flags must preserve default semantics when
+			// absent — a bare preview and an explicit-false preview must
+			// answer identically.
+			respBare, bare := preview(t, "source_branch=feature&target_branch=main")
+			respExplicit, explicit := preview(t, "source_branch=feature&target_branch=main&source_is_ephemeral=false&target_is_ephemeral=false")
+			if respBare.StatusCode != http.StatusOK || respExplicit.StatusCode != http.StatusOK {
+				t.Fatalf("statuses = %d/%d, want 200/200", respBare.StatusCode, respExplicit.StatusCode)
+			}
+			if !reflect.DeepEqual(bare, explicit) {
+				t.Fatalf("bare = %v, explicit false = %v, want identical", bare, explicit)
+			}
+		})
+
 		t.Run("conflicted without content", func(t *testing.T) {
 			resp, body := preview(t, "source_branch=conflict&target_branch=main")
 			if resp.StatusCode != http.StatusOK {

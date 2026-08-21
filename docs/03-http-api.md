@@ -68,7 +68,7 @@ contract with implementation notes the spec lacks.
 | `DELETE /repos/branches` | git:write | `{name, ephemeral?}` → `{name, message, ephemeral}`. Refuses default branch (persistent) |
 | `GET /repos/branches/diff` | git:read | `branch` (req), `base?`, `ephemeral?`, `ephemeral_base?`, `path` (repeatable) → `{branch, base, stats: {files, additions, deletions, changes}, files: [FileDiff], filtered_files}` |
 | `POST /repos/merge` | git:write | `{source_branch, target_branch, strategy: merge\|ff_only\|ff_prefer, source_is_ephemeral?, target_is_ephemeral?, expected_target_sha?, commit_message?, author?, committer?, allow_unrelated_histories?, squash?}` → `{result: merge_commit\|fast_forward\|no_op\|squash, commit_sha, tree_sha, source: {branch, ephemeral, sha}, target: {branch, ephemeral, old_sha, new_sha}, merge_base_sha?, promoted_commits}`. Conflict → 409 (+`conflict_paths`, `merge_base_sha`) |
-| `GET /repos/merge/preview` | git:read | `source_branch, target_branch, include_content?` → `{status: clean\|conflicted, result, source_branch, target_branch, source_tip_sha, target_tip_sha, merge_base_sha?, conflict_paths, conflicts: [{path, result\|base\|ours\|theirs: {oid?, content?, truncated, binary}}], filtered_conflicts: [{path, reason}]}`. Read-only |
+| `GET /repos/merge/preview` | git:read | `source_branch, target_branch, source_is_ephemeral?, target_is_ephemeral?` (deprecated aliases `source_ephemeral`/`target_ephemeral`), `include_content?` → `{status: clean\|conflicted, result, source_branch, target_branch, source_tip_sha, target_tip_sha, merge_base_sha?, conflict_paths, conflicts: [{path, result\|base\|ours\|theirs: {oid?, content?, truncated, binary}}], filtered_conflicts: [{path, reason}]}`. Read-only |
 
 `FileDiff` = `{path, state (raw letter; SDKs normalize A/M/D/R/C/T/U), old_path?, raw
 (unified diff text), bytes, is_eof, additions, deletions}`; `filtered_files` entries omit
@@ -78,9 +78,9 @@ contract with implementation notes the spec lacks.
 
 | Method & path | Scope | Notes |
 |---|---|---|
-| `GET /repos/commits` | git:read | `branch?, cursor?, limit?, ephemeral?, path?` → `{commits: [CommitInfo], next_cursor, has_more}`, newest first; defaults to default branch |
-| `GET /repos/commit` | git:read | `sha` (branch name, short or full SHA) → `{commit: CommitInfo & {signature?, payload?}}` (signed commits: armored sig + exact signed payload bytes) |
-| `GET /repos/diff` | git:read | `sha` (req), `baseSha?`, `gitApplyCompatible?`, `path` (repeatable) → `{sha, stats, files: [FileDiff], filtered_files}`. NB: camelCase query params here |
+| `GET /repos/commits` | git:read | `ref?` (deprecated alias `branch`), `cursor?, limit?, ephemeral?, path?` → `{commits: [CommitInfo], next_cursor, has_more}`, newest first; defaults to default branch |
+| `GET /repos/commit` | git:read | `ref` (req; deprecated alias `sha`; branch name, tag, short or full SHA) → `{commit: CommitInfo & {signature?, payload?}}` (signed commits: armored sig + exact signed payload bytes) |
+| `GET /repos/diff` | git:read | `ref` (req; deprecated alias `sha`), `base_ref?` (deprecated alias `baseSha`), `ref_is_ephemeral?`, `base_is_ephemeral?`, `git_apply_compatible?` (deprecated alias `gitApplyCompatible`), `path` (repeatable) → `{sha, stats, files: [FileDiff], filtered_files}`. On alias conflict the current name wins |
 | `POST /repos/commit-pack` | git:write | NDJSON stream — see 04 |
 | `POST /repos/diff-commit` | git:write | NDJSON stream — see 04 |
 | `POST /repos/restore-commit` | git:write | JSON `{metadata: {target_branch, target_commit_sha, author, commit_message?, expected_head_sha?, committer?}}` → commit ack (04). Creates a *new* commit restoring old tree (history preserved) |
@@ -101,7 +101,7 @@ committer_email, date (RFC3339)}`.
 
 | Method & path | Scope | Body/query |
 |---|---|---|
-| `GET /repos/notes` | git:read | `sha` (req), `ref?` → `{sha, note, ref_sha}` |
+| `GET /repos/notes` | git:read | `object_ref` (req; deprecated alias `sha`), `notes_ref?` (deprecated alias `ref`) → `{sha, note, ref_sha}` |
 | `POST /repos/notes` | git:write | `{sha, action: "add"\|"append", note, ref?, expected_ref_sha?, author?}` → `{sha, target_ref, base_commit?, new_ref_sha, result: {success, status, message?}}`. `add` fails if note exists; `append` creates or appends |
 | `DELETE /repos/notes` | git:write | `{sha, ref?, expected_ref_sha?, author?}` → same envelope |
 | `GET /repos/notes/refs` | git:read | `prefix?` (default `refs/notes/`), `cursor, limit` → `{refs: [{cursor, ref, sha}], prefix, next_cursor, has_more}`. 400 if custom notes refs disabled server-side |
