@@ -828,6 +828,99 @@ func (s *countingDownloadStore) count() int {
 	return s.n
 }
 
+// enqueueOnListPacks delegates ListPacks, but when armed the next call
+// first runs fire() — the deterministic stand-in for a trigger landing in
+// the gap between the local worker's follow-up recheck (whose ListPacks
+// this is) and its exit-decision lock.
+type enqueueOnListPacks struct {
+	ref.RefStore
+	mu    stdsync.Mutex
+	fire  func()
+	calls int
+}
+
+func (s *enqueueOnListPacks) arm(fire func()) {
+	s.mu.Lock()
+	s.fire = fire
+	s.mu.Unlock()
+}
+
+func (s *enqueueOnListPacks) ListPacks(ctx context.Context, repo string) ([]ref.Pack, error) {
+	s.mu.Lock()
+	s.calls++
+	fire := s.fire
+	s.fire = nil
+	s.mu.Unlock()
+	if fire != nil {
+		fire()
+	}
+	return s.RefStore.ListPacks(ctx, repo)
+}
+
+func (s *enqueueOnListPacks) listPacksCalls() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.calls
+}
+
+// TestLocalQueue_TriggerInExitWindowNotLost pins the round-7 race: a
+// trigger that lands after the worker's follow-up recheck computed false
+// but before it takes the queue lock must still earn a fold attempt — the
+// pending flag is consumed in the same critical section that decides exit,
+// so it can never be deleted unseen.
+func TestLocalQueue_TriggerInExitWindowNotLost(t *testing.T) {
+	f := newRepackFixture(t)
+	ctx := context.Background()
+	for range 2 {
+		f.push(t)
+	}
+
+	shim := &enqueueOnListPacks{RefStore: f.store}
+	r := NewRepacker(shim, f.blobs, fixtureMaterialize(f.blobs, t.TempDir()), slog.New(slog.DiscardHandler))
+	r.FollowUpThreshold = 2
+	deliverer := &events.Deliverer{Webhooks: stubWebhooks{}, Logger: slog.New(slog.DiscardHandler)}
+	q := NewLocal(deliverer, func(context.Context, sync.Job) error { return nil }, r, slog.New(slog.DiscardHandler))
+
+	r.BeforeSwap = func(context.Context, ref.Pack) error {
+		// Arm mid-fold: the NEXT ListPacks is the post-fold NeedsFollowUp
+		// read, and firing there lands the trigger exactly in the window
+		// between the recheck and the worker's lock.
+		shim.arm(func() { _ = q.EnqueueRepack(context.Background(), f.repo) })
+		return nil
+	}
+	if err := q.EnqueueRepack(ctx, f.repo); err != nil {
+		t.Fatalf("enqueue repack: %v", err)
+	}
+	// Wait for the worker to drain NATURALLY (Close would set closed and
+	// legitimately short-circuit the loop, masking the race under test).
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		q.mu.Lock()
+		busy := q.repacking[f.repo]
+		q.mu.Unlock()
+		if !busy {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("worker never drained")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	q.Close()
+
+	// Call ledger: fold-1 snapshot, NeedsFollowUp read (fires the racing
+	// trigger), and — only if the trigger was consumed correctly — the
+	// earned attempt's snapshot. Fewer than 3 means the pending flag was
+	// deleted unseen.
+	if got := shim.listPacksCalls(); got < 3 {
+		t.Fatalf("ListPacks called %d times; the exit-window trigger was dropped without a fold attempt", got)
+	}
+	if rows := f.packRows(t); len(rows) != 1 {
+		t.Fatalf("pack rows = %+v, want the fold", rows)
+	}
+	f.checkColdHydrate(t)
+}
+
 // TestRepack_RuntimeBudgetBoundsFold pins the security-round runtime
 // budget: the whole fold runs under MaxFoldDuration, so an
 // already-expired budget aborts before any mutation — compressed-size

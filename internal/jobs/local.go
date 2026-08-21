@@ -126,24 +126,27 @@ func (q *Local) runRepack(repo string) {
 		if err != nil {
 			q.logger.Warn("repack failed", "repo", repo, "err", err)
 		}
-		again := folded && (q.pendingRepack(repo) || q.repacker.NeedsFollowUp(context.Background(), repo))
+		// The follow-up recheck does I/O, so it runs outside the lock.
+		needMore := folded && q.repacker.NeedsFollowUp(context.Background(), repo)
+		// Consume the pending flag in the SAME critical section that
+		// decides exit: a trigger landing after the recheck above but
+		// before this lock must either be observed here (we loop) or
+		// arrive after we cleared repacking (EnqueueRepack starts a fresh
+		// worker) — there is no in-between where it could be deleted
+		// unseen. A consumed trigger always earns one more fold attempt,
+		// regardless of this attempt's outcome: it fired on a real
+		// threshold crossing, an extra attempt is at worst a cheap no-op,
+		// and consumption bounds the loop by trigger volume.
 		q.mu.Lock()
-		if q.closed || !again {
+		pending := q.repackPending[repo]
+		delete(q.repackPending, repo)
+		if q.closed || (!pending && !needMore) {
 			delete(q.repacking, repo)
-			delete(q.repackPending, repo)
 			q.mu.Unlock()
 			return
 		}
-		delete(q.repackPending, repo)
 		q.mu.Unlock()
 	}
-}
-
-// pendingRepack reports whether a trigger landed while repo's fold ran.
-func (q *Local) pendingRepack(repo string) bool {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	return q.repackPending[repo]
 }
 
 // Close stops accepting work and waits for in-flight deliveries and syncs.
