@@ -76,13 +76,15 @@ func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL string, orgPEM
 		// Versioned S3 buckets break delete-mode invariants: Delete only
 		// writes a delete marker while every pack and quarantine version
 		// stays stored and billed, so sweeps would report reclaimed bytes
-		// without reclaiming anything. Refuse on positive detection; an
-		// endpoint that cannot answer (some S3-compatibles) just logs.
+		// without reclaiming anything. Fail closed: delete mode requires
+		// the probe to definitively report an unversioned bucket — a role
+		// without s3:GetBucketVersioning must not silently run destructive
+		// sweeps against a possibly versioned bucket.
 		if s3store, ok := blobStore.(*blob.S3); ok {
 			versioned, err := s3store.VersioningEnabled(ctx)
 			switch {
 			case err != nil:
-				logger.Warn("cannot verify bucket versioning for sweep delete mode", "err", err)
+				return fail(fmt.Errorf("%s: cannot verify bucket versioning (grant s3:GetBucketVersioning, or keep the sweeper list-only): %w", envSweepDeleteEnabled, err))
 			case versioned:
 				return fail(fmt.Errorf("%s: bucket has S3 versioning enabled or suspended; delete-mode sweeps only write delete markers there (add a noncurrent-version lifecycle policy, or keep the sweeper list-only)", envSweepDeleteEnabled))
 			}

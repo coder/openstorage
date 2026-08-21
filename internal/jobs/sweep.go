@@ -199,6 +199,12 @@ var sweepListPageSize = 1000
 // can exercise the cap without minting thousands of objects.
 var maxOrphanSample = 100
 
+// sweepRecoveryTimeout bounds safeDelete's post-delete recovery phase
+// (registry recheck + quarantine restore) when it runs detached from a
+// canceled sweep. Restores are server-side copies, so this generously
+// covers even multipart copies of the largest supported packs.
+const sweepRecoveryTimeout = 15 * time.Minute
+
 // classify handles one listed pack blob: a point registry read, then the
 // age-threshold diff, then (delete mode only) the revalidate + quarantine
 // handshake. Registry errors abort the sweep (they would misclassify the
@@ -278,17 +284,34 @@ func quarantineKey(key string) string {
 // parseQuarantineKey recovers the original pack key from a nonce-layout
 // quarantine backup key (sweep/quarantine/<nonce>/packs/...). This is the
 // only layout any released sweeper has ever written; anything else under
-// the prefix is foreign and gets skipped loudly by the caller.
+// the prefix — including entries whose first segment is not exactly the
+// 16-hex-char nonce quarantineKey mints — is foreign: never a restore
+// source, never purged, skipped loudly by the caller.
 func parseQuarantineKey(qkey string) (orig string, ok bool) {
 	rest, found := strings.CutPrefix(qkey, quarantinePrefix)
 	if !found {
 		return "", false
 	}
-	_, orig, found = strings.Cut(rest, "/")
-	if !found {
+	nonce, orig, found := strings.Cut(rest, "/")
+	if !found || !isQuarantineNonce(nonce) {
 		return "", false
 	}
 	return orig, true
+}
+
+// isQuarantineNonce reports whether s is exactly the hex.EncodeToString
+// form of quarantineKey's 8 random bytes: 16 lowercase hex characters.
+func isQuarantineNonce(s string) bool {
+	if len(s) != 16 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 // splitPackKey validates that key has the exact shape blob.PackKey
@@ -330,6 +353,14 @@ func (s *Sweeper) safeDelete(ctx context.Context, repo, key string) (bool, error
 		}
 		return false, fmt.Errorf("sweep: quarantine %s: %w", key, err)
 	}
+	// Everything after the delete request is recovery: it must be able to
+	// finish even when the sweep itself is being canceled (server shutdown,
+	// job backend cancellation racing the delete's response), or a canceled
+	// sweep could end a handshake with the bytes missing and the recheck
+	// unread. Recovery therefore runs on a bounded context detached from
+	// the sweep's cancellation (Codex round 16).
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sweepRecoveryTimeout)
+	defer cancel()
 	if err := s.blobs.Delete(ctx, key); err != nil && !errors.Is(err, blob.ErrNotFound) {
 		// The delete outcome is unknown — the request may have executed
 		// with its response lost. Restore from quarantine unconditionally:
@@ -340,7 +371,7 @@ func (s *Sweeper) safeDelete(ctx context.Context, repo, key string) (bool, error
 		// even the restore fails, the retained backup plus the heal pass
 		// remain the backstop.
 		deleteErr := fmt.Errorf("sweep: delete %s: %w", key, err)
-		if rerr := s.blobs.Copy(ctx, key, qKey); rerr != nil {
+		if rerr := s.blobs.Copy(rctx, key, qKey); rerr != nil {
 			return false, errors.Join(deleteErr,
 				fmt.Errorf("sweep: restore after ambiguous delete %s: %w", key, rerr))
 		}
@@ -350,7 +381,7 @@ func (s *Sweeper) safeDelete(ctx context.Context, repo, key string) (bool, error
 	// push's RegisterPacks} lands last sees the other's state, so a
 	// registration this read observes gets its bytes restored here, and
 	// one it misses is healed from quarantine next sweep.
-	registered, err := s.packs.HasPack(ctx, repo, key)
+	registered, err := s.packs.HasPack(rctx, repo, key)
 	if err != nil {
 		// Deleted but unverifiable: a registration that landed before the
 		// delete (its EnsurePublished saw the key present) would be
@@ -358,14 +389,14 @@ func (s *Sweeper) safeDelete(ctx context.Context, repo, key string) (bool, error
 		// exactly like the ambiguous-delete path — a no-op if the key was
 		// truly orphaned, a repair if it was registered.
 		recheckErr := fmt.Errorf("sweep: post-delete recheck %s: %w", key, err)
-		if rerr := s.blobs.Copy(ctx, key, qKey); rerr != nil {
+		if rerr := s.blobs.Copy(rctx, key, qKey); rerr != nil {
 			return false, errors.Join(recheckErr,
 				fmt.Errorf("sweep: restore after failed recheck %s: %w", key, rerr))
 		}
 		return false, recheckErr
 	}
 	if registered {
-		if err := s.blobs.Copy(ctx, key, qKey); err != nil {
+		if err := s.blobs.Copy(rctx, key, qKey); err != nil {
 			return false, fmt.Errorf("sweep: restore %s registered mid-delete: %w", key, err)
 		}
 		// The backup is deliberately retained until the aged purge in

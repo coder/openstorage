@@ -384,13 +384,13 @@ func TestSweep_ListOnlyStillHealsQuarantine(t *testing.T) {
 
 	// Delete-enabled crash mid-handshake, then rollback to list-only.
 	lost := blob.PackKey("r1", "lost")
-	f.upload(quarantinePrefix+"n0/"+lost, "lost-bytes")
+	f.upload(quarantinePrefix+"00112233aabbccdd/"+lost, "lost-bytes")
 	f.register("r1", "lost", lost)
 
 	// An aged unregistered backup: list-only must NOT purge it.
 	stale := blob.PackKey("r1", "stale")
-	f.upload(quarantinePrefix+"n0/"+stale, "stale-bytes")
-	f.backdate(quarantinePrefix+"n0/"+stale, 25*time.Hour)
+	f.upload(quarantinePrefix+"00112233aabbccdd/"+stale, "stale-bytes")
+	f.backdate(quarantinePrefix+"00112233aabbccdd/"+stale, 25*time.Hour)
 
 	report, err := f.sweeper(SweepConfig{Threshold: 24 * time.Hour}).Sweep(context.Background())
 	if err != nil {
@@ -399,10 +399,10 @@ func TestSweep_ListOnlyStillHealsQuarantine(t *testing.T) {
 	if !f.exists(lost) {
 		t.Fatalf("list-only sweep did not heal registered-but-missing pack %q", lost)
 	}
-	if !f.exists(quarantinePrefix + "n0/" + lost) {
+	if !f.exists(quarantinePrefix + "00112233aabbccdd/" + lost) {
 		t.Fatalf("list-only heal purged fresh backup %q (purging is delete- and age-gated)", lost)
 	}
-	if !f.exists(quarantinePrefix + "n0/" + stale) {
+	if !f.exists(quarantinePrefix + "00112233aabbccdd/" + stale) {
 		t.Fatalf("list-only sweep purged %q (purging must stay delete-gated)", stale)
 	}
 	if report.Deleted != 0 || report.BytesReclaimed != 0 {
@@ -418,11 +418,11 @@ func TestSweep_ListOnlyStillHealsQuarantine(t *testing.T) {
 func TestSweeper_HealStandalone(t *testing.T) {
 	f := newSweepFixture(t)
 	lost := blob.PackKey("r1", "lost")
-	f.upload(quarantinePrefix+"n0/"+lost, "lost-bytes")
+	f.upload(quarantinePrefix+"00112233aabbccdd/"+lost, "lost-bytes")
 	f.register("r1", "lost", lost)
 	stale := blob.PackKey("r1", "stale")
-	f.upload(quarantinePrefix+"n0/"+stale, "stale-bytes")
-	f.backdate(quarantinePrefix+"n0/"+stale, 25*time.Hour)
+	f.upload(quarantinePrefix+"00112233aabbccdd/"+stale, "stale-bytes")
+	f.backdate(quarantinePrefix+"00112233aabbccdd/"+stale, 25*time.Hour)
 
 	// Delete=true on purpose: the standalone heal must force purging off.
 	if err := f.sweeper(SweepConfig{Threshold: 24 * time.Hour, Delete: true}).Heal(context.Background()); err != nil {
@@ -431,10 +431,10 @@ func TestSweeper_HealStandalone(t *testing.T) {
 	if !f.exists(lost) {
 		t.Fatalf("standalone heal did not restore %q", lost)
 	}
-	if !f.exists(quarantinePrefix + "n0/" + lost) {
+	if !f.exists(quarantinePrefix + "00112233aabbccdd/" + lost) {
 		t.Fatalf("standalone heal purged backup %q (must be strictly restorative)", lost)
 	}
-	if !f.exists(quarantinePrefix + "n0/" + stale) {
+	if !f.exists(quarantinePrefix + "00112233aabbccdd/" + stale) {
 		t.Fatalf("standalone heal purged %q despite Delete=true (must be strictly restorative)", stale)
 	}
 }
@@ -449,18 +449,18 @@ func TestSweep_HealQuarantine(t *testing.T) {
 	// Crashed handshake: registered pack, blob missing, backup present and
 	// aged (so this delete-mode sweep may purge it after restoring).
 	lost := blob.PackKey("r1", "lost")
-	f.upload(quarantinePrefix+"n0/"+lost, "lost-bytes")
-	f.backdate(quarantinePrefix+"n0/"+lost, 25*time.Hour)
+	f.upload(quarantinePrefix+"00112233aabbccdd/"+lost, "lost-bytes")
+	f.backdate(quarantinePrefix+"00112233aabbccdd/"+lost, 25*time.Hour)
 	f.register("r1", "lost", lost)
 
 	// Reaped long ago: unregistered, backup aged past the threshold.
 	stale := blob.PackKey("r1", "stale")
-	f.upload(quarantinePrefix+"n0/"+stale, "stale-bytes")
-	f.backdate(quarantinePrefix+"n0/"+stale, 25*time.Hour)
+	f.upload(quarantinePrefix+"00112233aabbccdd/"+stale, "stale-bytes")
+	f.backdate(quarantinePrefix+"00112233aabbccdd/"+stale, 25*time.Hour)
 
 	// In-flight sweep's backup: unregistered but fresh — must be kept.
 	inflight := blob.PackKey("r1", "inflight")
-	f.upload(quarantinePrefix+"n0/"+inflight, "inflight-bytes")
+	f.upload(quarantinePrefix+"00112233aabbccdd/"+inflight, "inflight-bytes")
 
 	report, err := f.sweeper(SweepConfig{Threshold: 24 * time.Hour, Delete: true}).Sweep(context.Background())
 	if err != nil {
@@ -469,13 +469,13 @@ func TestSweep_HealQuarantine(t *testing.T) {
 	if !f.exists(lost) {
 		t.Fatalf("registered-but-missing pack %q was not healed from quarantine", lost)
 	}
-	if f.exists(quarantinePrefix + "n0/" + lost) {
+	if f.exists(quarantinePrefix + "00112233aabbccdd/" + lost) {
 		t.Fatalf("aged healed backup %q was not purged", lost)
 	}
-	if f.exists(quarantinePrefix + "n0/" + stale) {
+	if f.exists(quarantinePrefix + "00112233aabbccdd/" + stale) {
 		t.Fatalf("aged unregistered backup %q was not purged", stale)
 	}
-	if !f.exists(quarantinePrefix + "n0/" + inflight) {
+	if !f.exists(quarantinePrefix + "00112233aabbccdd/" + inflight) {
 		t.Fatalf("fresh backup %q must be kept (possibly an in-flight sweep)", inflight)
 	}
 	// The healed pack is registered => live in the same sweep's report.
@@ -574,14 +574,58 @@ func TestQuarantineKey(t *testing.T) {
 			t.Fatalf("parseQuarantineKey(%q) = %q, %v; want %q, true", k, got, ok, orig)
 		}
 	}
-	for _, k := range []string{"other/key", quarantinePrefix + "junk", quarantinePrefix + orig} {
-		got, ok := parseQuarantineKey(k)
-		if !ok {
-			continue
+	for _, k := range []string{
+		"other/key",
+		quarantinePrefix + "junk",
+		quarantinePrefix + orig,                         // legacy shared-key layout: foreign
+		quarantinePrefix + "not-a-nonce/" + orig,        // non-hex first segment
+		quarantinePrefix + "00112233AABBCCDD/" + orig,   // uppercase hex: not ours
+		quarantinePrefix + "00112233aabbccdd42/" + orig, // wrong length
+	} {
+		if _, ok := parseQuarantineKey(k); ok {
+			t.Fatalf("parseQuarantineKey(%q) accepted a foreign key", k)
 		}
-		if _, packOK := splitPackKey(got); packOK {
-			t.Fatalf("parseQuarantineKey(%q) = %q resolves to a valid pack key; foreign layouts must not", k, got)
+	}
+}
+
+// cancelDuringDelete cancels the sweep's context while the delete request
+// is in flight and reports the delete as failed — the shutdown-races-the-
+// response class. Recovery (restore) must still complete (Codex round 16).
+type cancelDuringDelete struct {
+	blob.BlobStore
+	key    string
+	cancel context.CancelFunc
+}
+
+func (b *cancelDuringDelete) Delete(ctx context.Context, key string) error {
+	err := b.BlobStore.Delete(ctx, key)
+	if key == b.key {
+		b.cancel()
+		if err != nil {
+			return err
 		}
+		return errors.New("simulated: sweep canceled while delete response outstanding")
+	}
+	return err
+}
+
+// A sweep canceled mid-delete must still restore the deleted bytes: the
+// recovery phase runs detached from the sweep's cancellation.
+func TestSweep_CanceledSweepStillRestores(t *testing.T) {
+	f := newSweepFixture(t)
+	key := blob.PackKey("r1", "shutdown")
+	f.upload(key, "shutdown-bytes")
+	f.backdate(key, 25*time.Hour)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s := NewSweeper(&cancelDuringDelete{BlobStore: f.blobs, key: key, cancel: cancel}, f.store,
+		SweepConfig{Threshold: 24 * time.Hour, Delete: true}, slog.New(slog.DiscardHandler))
+	if _, err := s.Sweep(ctx); err == nil {
+		t.Fatal("Sweep: want the ambiguous-delete error, got nil")
+	}
+	if !f.exists(key) {
+		t.Fatalf("pack %q not restored after cancellation mid-delete", key)
 	}
 }
 
