@@ -199,12 +199,14 @@ func TestFile_StatAndSignedURL(t *testing.T) {
 	}
 }
 
-// A failed download must never leave anything at destPath (atomic contract).
+// A failed download must never leave anything at destPath (atomic contract),
+// and a missing key must match ErrNotFound via errors.Is — the hydration
+// missing-pack retry keys on it.
 func TestFile_DownloadMissingKey(t *testing.T) {
 	b, _ := openFile(t)
 	dest := filepath.Join(t.TempDir(), "missing.pack")
-	if err := b.DownloadFile(context.Background(), PackKey("r1", "nope"), dest); err == nil {
-		t.Fatal("DownloadFile of missing key must fail")
+	if err := b.DownloadFile(context.Background(), PackKey("r1", "nope"), dest); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("DownloadFile of missing key = %v, want ErrNotFound", err)
 	}
 	if _, err := os.Stat(dest); !os.IsNotExist(err) {
 		t.Fatalf("destPath must not exist after failed download, stat err = %v", err)
