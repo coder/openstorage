@@ -137,7 +137,7 @@ func (s *Sweeper) Sweep(ctx context.Context) (SweepReport, error) {
 	// must still be restored then. Only purging stays delete-gated.
 	var report SweepReport
 	var deleteErrs []error
-	if err := s.healQuarantine(ctx, &report); err != nil {
+	if err := s.healQuarantine(ctx, &report, s.cfg.Delete); err != nil {
 		deleteErrs = append(deleteErrs, err)
 	}
 	objs, err := s.blobs.List(ctx, blob.PacksRoot)
@@ -326,13 +326,14 @@ func (s *Sweeper) safeDelete(ctx context.Context, repo, key string) (bool, error
 // restored when the original is missing (identical bytes) and its backup
 // purged. The restorative pass runs in every sweep mode — a list-only
 // rollback must still repair a delete-enabled crash — while destructive
-// purging is delete-gated: an unregistered backup is purged only when
-// deletes are enabled AND it aged past the threshold, so an in-flight
-// sweep's backup is never touched. Purged backup bytes are credited to
-// report.BytesReclaimed — the point where storage consumption actually
-// drops (reaping only moves bytes into quarantine). Failures are joined;
-// each entry is independent.
-func (s *Sweeper) healQuarantine(ctx context.Context, report *SweepReport) error {
+// purging is gated on the caller's purge flag (the sweep passes its Delete
+// config; the standalone Heal forces it off): an unregistered backup is
+// purged only when purge is set AND it aged past the threshold, so an
+// in-flight sweep's backup is never touched. Purged backup bytes are
+// credited to report.BytesReclaimed — the point where storage consumption
+// actually drops (reaping only moves bytes into quarantine). Failures are
+// joined; each entry is independent.
+func (s *Sweeper) healQuarantine(ctx context.Context, report *SweepReport, purge bool) error {
 	entries, err := s.blobs.List(ctx, quarantinePrefix)
 	if err != nil {
 		return fmt.Errorf("sweep: list quarantine: %w", err)
@@ -369,7 +370,7 @@ func (s *Sweeper) healQuarantine(ctx context.Context, report *SweepReport) error
 				errs = append(errs, fmt.Errorf("sweep: heal %s: stat: %w", orig, err))
 				continue
 			}
-		} else if !s.cfg.Delete || q.ModTime.IsZero() || s.now().Sub(q.ModTime) < s.cfg.Threshold {
+		} else if !purge || q.ModTime.IsZero() || s.now().Sub(q.ModTime) < s.cfg.Threshold {
 			// Unregistered: purge only in delete mode once aged past the
 			// threshold (an in-flight sweep's backup is always fresh).
 			continue
@@ -422,18 +423,16 @@ func (s *Sweeper) revalidateOrphan(ctx context.Context, repo, key string) (bool,
 	return false, nil // gone already: nothing to delete
 }
 
-// Heal runs one standalone restorative quarantine pass. Serve calls it at
-// startup when periodic sweeping is disabled (CODESTORAGE_SWEEP_INTERVAL=0):
-// a delete-enabled process that crashed mid-handshake may have left a
-// registered pack's only copy in quarantine, and disabling the schedule
-// must not strand it.
+// Heal runs one standalone, strictly restorative quarantine pass. Serve
+// calls it at startup when periodic sweeping is disabled
+// (CODESTORAGE_SWEEP_INTERVAL=0): a delete-enabled process that crashed
+// mid-handshake may have left a registered pack's only copy in quarantine,
+// and disabling the schedule must not strand it. Purging is forced off
+// regardless of SweepConfig.Delete — interval zero documents "no sweeping",
+// so an emergency stop must never destroy anything.
 func (s *Sweeper) Heal(ctx context.Context) error {
 	var report SweepReport
-	err := s.healQuarantine(ctx, &report)
-	if report.BytesReclaimed > 0 {
-		s.logger.Info("standalone quarantine heal reclaimed bytes", "bytes", report.BytesReclaimed)
-	}
-	return err
+	return s.healQuarantine(ctx, &report, false)
 }
 
 // SweepSchedule configures the periodic orphan-pack sweep on a queue

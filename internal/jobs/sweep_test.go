@@ -394,7 +394,9 @@ func TestSweep_ListOnlyStillHealsQuarantine(t *testing.T) {
 
 // Heal is the standalone restorative pass serve runs at startup when the
 // periodic schedule is disabled (interval 0): registered-but-missing packs
-// are restored; nothing unregistered is purged in list-only config.
+// are restored, and nothing unregistered is ever purged — even with
+// Delete=true in the config, interval zero means "no sweeping", so an
+// emergency stop must never be destructive.
 func TestSweeper_HealStandalone(t *testing.T) {
 	f := newSweepFixture(t)
 	lost := blob.PackKey("r1", "lost")
@@ -404,14 +406,18 @@ func TestSweeper_HealStandalone(t *testing.T) {
 	f.upload("sweep/quarantine/"+stale, "stale-bytes")
 	f.backdate("sweep/quarantine/"+stale, 25*time.Hour)
 
-	if err := f.sweeper(SweepConfig{Threshold: 24 * time.Hour}).Heal(context.Background()); err != nil {
+	// Delete=true on purpose: the standalone heal must force purging off.
+	if err := f.sweeper(SweepConfig{Threshold: 24 * time.Hour, Delete: true}).Heal(context.Background()); err != nil {
 		t.Fatalf("Heal: %v", err)
 	}
 	if !f.exists(lost) {
 		t.Fatalf("standalone heal did not restore %q", lost)
 	}
+	if f.exists("sweep/quarantine/" + lost) {
+		t.Fatalf("restored backup %q not cleaned up (restore-purge is non-destructive)", lost)
+	}
 	if !f.exists("sweep/quarantine/" + stale) {
-		t.Fatalf("standalone list-only heal purged %q", stale)
+		t.Fatalf("standalone heal purged %q despite Delete=true (must be strictly restorative)", stale)
 	}
 }
 

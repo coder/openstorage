@@ -82,9 +82,11 @@ func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL string, orgPEM
 	} else if err := sweeper.Heal(ctx); err != nil {
 		// Disabling the schedule must not strand a registered pack whose
 		// only copy a crashed delete-enabled handshake left in quarantine:
-		// run one restorative heal pass at startup regardless. Failure is
-		// logged, not fatal — the pass re-runs on next boot.
-		logger.Warn("startup quarantine heal failed", "err", err)
+		// run one strictly restorative heal pass at startup regardless.
+		// With no ticker there is no retry, so a failure here is fatal —
+		// serving would otherwise fail hydrations of the stranded pack
+		// until another restart anyway (fail-fast beats limping).
+		return fail(fmt.Errorf("startup quarantine heal (sweeping disabled): %w", err))
 	}
 
 	queue, decorate, queueCleanup, err := buildServeEventing(ctx, ms, dbURL, org, httpBaseURL, key, schedule, logger)
