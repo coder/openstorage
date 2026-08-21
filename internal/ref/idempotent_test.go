@@ -3,7 +3,11 @@ package ref
 import (
 	"context"
 	"errors"
+	"fmt"
+	"io"
 	"testing"
+
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 const (
@@ -106,6 +110,82 @@ func TestIdempotentCASRetryHealsUnreportedWin(t *testing.T) {
 		if !won || err != nil {
 			t.Fatalf("attempt %d: CASRef = (%v, %v), want (true, nil)", attempt, won, err)
 		}
+	}
+}
+
+// failWith scripts a CASRef error WITHOUT executing the statement — the
+// definitive-failure shape (backend rejection / request never sent), where
+// any current == new state was put there by someone else.
+type failWith struct {
+	RefStore
+	err error
+}
+
+func (s *failWith) CASRef(context.Context, string, string, string, string) (bool, error) {
+	return false, s.err
+}
+
+// safeToRetryErr satisfies pgconn.SafeToRetry: the request provably never
+// reached the server.
+type safeToRetryErr struct{}
+
+func (safeToRetryErr) Error() string     { return "context canceled before send" }
+func (safeToRetryErr) SafeToRetry() bool { return true }
+
+// TestIdempotentCASDefinitiveErrorNeverRecovers: when the backend itself
+// rejected the statement (or the request never reached it), the statement
+// did not commit — current == new is someone else's write, and recovering
+// would fabricate a success (and a push event) for a transition this call
+// never committed. The error must propagate unchanged.
+func TestIdempotentCASDefinitiveErrorNeverRecovers(t *testing.T) {
+	ctx := context.Background()
+	for name, derr := range map[string]error{
+		"pg backend rejection": fmt.Errorf("cas update r1/refs/heads/main: %w",
+			&pgconn.PgError{Severity: "ERROR", Code: "40001", Message: "serialization failure"}),
+		"request never sent": fmt.Errorf("cas update r1/refs/heads/main: %w", safeToRetryErr{}),
+	} {
+		t.Run(name, func(t *testing.T) {
+			raw, _ := openTestSQLite(t)
+			seedRef(t, raw, "r1", "refs/heads/main", idemSHA2) // someone else's write, already at target
+			st := IdempotentCAS{RefStore: &failWith{RefStore: raw, err: derr}}
+
+			won, err := st.CASRef(ctx, "r1", "refs/heads/main", idemSHA1, idemSHA2)
+			if won || !errors.Is(err, derr) {
+				t.Fatalf("CASRef = (%v, %v), want (false, original error)", won, err)
+			}
+		})
+	}
+}
+
+// TestAmbiguousErrorClassification pins the boundary between definitive
+// failures (statement provably did not commit) and ambiguous ones (result
+// lost in transit; recovery applies).
+func TestAmbiguousErrorClassification(t *testing.T) {
+	// A real modernc.org/sqlite backend rejection, captured through the
+	// same driver the store uses.
+	raw, _ := openTestSQLite(t)
+	_, sqliteErr := raw.db.ExecContext(context.Background(), `INSERT INTO no_such_table VALUES (1)`)
+	if sqliteErr == nil {
+		t.Fatal("expected a sqlite backend error")
+	}
+
+	for name, tc := range map[string]struct {
+		err  error
+		want bool
+	}{
+		"pg backend rejection":  {&pgconn.PgError{Code: "42501"}, false},
+		"wrapped pg rejection":  {fmt.Errorf("cas: %w", &pgconn.PgError{Code: "40001"}), false},
+		"sqlite backend error":  {fmt.Errorf("cas: %w", sqliteErr), false},
+		"request never sent":    {safeToRetryErr{}, false},
+		"connection drop":       {fmt.Errorf("cas: %w", io.ErrUnexpectedEOF), true},
+		"mid-flight cancel":     {fmt.Errorf("cas: %w", context.Canceled), true},
+		"opaque driver failure": {errors.New("write: broken pipe"), true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := ambiguousError(tc.err); got != tc.want {
+				t.Fatalf("ambiguousError(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
 	}
 }
 

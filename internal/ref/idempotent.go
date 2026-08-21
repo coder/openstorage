@@ -11,7 +11,11 @@ package ref
 
 import (
 	"context"
+	"errors"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgconn"
+	"modernc.org/sqlite"
 )
 
 // recheckTimeout bounds the recovery point-read. The recheck runs on a
@@ -37,9 +41,16 @@ var _ RefStore = IdempotentCAS{}
 // operation shape (the same create/update/delete split CASRef itself
 // switches on):
 //
-//   - ambiguous error (err != nil), create or update: recheck; current ==
-//     new is a win — our statement may well have committed, and reporting
-//     the win emits the push webhook that would otherwise be dropped.
+//   - ambiguous error (see ambiguousError), create or update: recheck;
+//     current == new is a win — our statement may well have committed, and
+//     reporting the win emits the push webhook that would otherwise be
+//     dropped.
+//   - definitive error (the backend rejected the statement, or the request
+//     provably never reached it): NEVER recovered — the statement did not
+//     commit, so current == new only means someone else put the target
+//     there; recovering would fabricate a success (and a push event) for a
+//     transition this call never committed. The error propagates; a
+//     client's retry then converges through the clean-loss rules below.
 //   - clean loss (won=false, err=nil), update (old and new both non-zero):
 //     recheck; current == new is a win. This heals the client that retries
 //     an update whose first attempt committed but failed to report and
@@ -70,6 +81,9 @@ func (s IdempotentCAS) CASRef(ctx context.Context, repo, name, old, new string) 
 	if new == ZeroSHA {
 		return false, err
 	}
+	if err != nil && !ambiguousError(err) {
+		return false, err // definitive failure: the statement did not commit
+	}
 	if err == nil && old == ZeroSHA {
 		return false, nil // clean create conflict is authoritative
 	}
@@ -83,4 +97,26 @@ func (s IdempotentCAS) CASRef(ctx context.Context, repo, name, old, new string) 
 		return false, err
 	}
 	return true, nil
+}
+
+// ambiguousError reports whether a CASRef error leaves the statement's
+// commit status unknown. Definitive failures prove the statement did NOT
+// commit:
+//
+//   - *pgconn.PgError / *sqlite.Error: the backend itself rejected the
+//     statement (serialization abort, permission, constraint, busy) — it
+//     responded, so it did not silently commit first.
+//   - pgconn.SafeToRetry: the request never reached the server (e.g. a
+//     context canceled before send).
+//
+// Everything else — connection drops, unexpected EOFs, context
+// cancellation mid-flight after the request was sent — is ambiguous: the
+// statement may have committed with the result lost on the way back.
+func ambiguousError(err error) bool {
+	var pgErr *pgconn.PgError
+	var sqErr *sqlite.Error
+	if errors.As(err, &pgErr) || errors.As(err, &sqErr) {
+		return false
+	}
+	return !pgconn.SafeToRetry(err)
 }
