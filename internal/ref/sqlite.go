@@ -175,6 +175,15 @@ func (s *SQLite) CASRef(ctx context.Context, repo, name, old, new string) (won b
 	assertf(ValidSHA(new), "CASRef: malformed new sha %q", new)
 	assertf(old != ZeroSHA || new != ZeroSHA, "CASRef: zero -> zero update for %s/%s", repo, name)
 
+	// Acquire explicitly so acquisition failures are distinguishable from
+	// statement failures: the statement provably never executed, so
+	// IdempotentCAS must not recover such errors (see notExecuted).
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return false, fmt.Errorf("cas acquire %s/%s: %w", repo, name, notExecuted(err))
+	}
+	defer func() { _ = conn.Close() }()
+
 	var tag string
 	var res sql.Result
 	switch {
@@ -182,17 +191,17 @@ func (s *SQLite) CASRef(ctx context.Context, repo, name, old, new string) (won b
 		// created_at set explicitly (not via column default): databases
 		// migrated by the InitSchema ALTER have no default on the column.
 		// SHA updates below never touch it.
-		res, err = s.db.ExecContext(ctx,
+		res, err = conn.ExecContext(ctx,
 			`INSERT INTO refs (repo, name, sha, created_at) VALUES (?, ?, ?, unixepoch()) ON CONFLICT DO NOTHING`,
 			repo, name, new)
 		tag = "create"
 	case new == ZeroSHA: // delete
-		res, err = s.db.ExecContext(ctx,
+		res, err = conn.ExecContext(ctx,
 			`DELETE FROM refs WHERE repo = ? AND name = ? AND sha = ?`,
 			repo, name, old)
 		tag = "delete"
 	default: // update
-		res, err = s.db.ExecContext(ctx,
+		res, err = conn.ExecContext(ctx,
 			`UPDATE refs SET sha = ? WHERE repo = ? AND name = ? AND sha = ?`,
 			new, repo, name, old)
 		tag = "update"

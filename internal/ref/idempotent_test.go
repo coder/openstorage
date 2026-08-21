@@ -177,6 +177,7 @@ func TestAmbiguousErrorClassification(t *testing.T) {
 		"wrapped pg rejection":  {fmt.Errorf("cas: %w", &pgconn.PgError{Code: "40001"}), false},
 		"sqlite backend error":  {fmt.Errorf("cas: %w", sqliteErr), false},
 		"request never sent":    {safeToRetryErr{}, false},
+		"acquire-stage failure": {fmt.Errorf("cas acquire r/n: %w", notExecuted(context.DeadlineExceeded)), false},
 		"connection drop":       {fmt.Errorf("cas: %w", io.ErrUnexpectedEOF), true},
 		"mid-flight cancel":     {fmt.Errorf("cas: %w", context.Canceled), true},
 		"opaque driver failure": {errors.New("write: broken pipe"), true},
@@ -186,6 +187,28 @@ func TestAmbiguousErrorClassification(t *testing.T) {
 				t.Fatalf("ambiguousError(%v) = %v, want %v", tc.err, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestIdempotentCASAcquireFailureNeverRecovers pins the acquire-stage
+// classification end to end through a REAL store: a context that is already
+// dead when CASRef runs fails connection acquisition — before the statement
+// could possibly execute — so even with the ref already at the target
+// (someone else's write), the error must propagate instead of fabricating a
+// success.
+func TestIdempotentCASAcquireFailureNeverRecovers(t *testing.T) {
+	raw, _ := openTestSQLite(t)
+	seedRef(t, raw, "r1", "refs/heads/main", idemSHA2) // someone else's write, already at target
+	st := IdempotentCAS{RefStore: raw}
+
+	dead, cancel := context.WithCancel(context.Background())
+	cancel()
+	won, err := st.CASRef(dead, "r1", "refs/heads/main", idemSHA1, idemSHA2)
+	if won || err == nil {
+		t.Fatalf("CASRef = (%v, %v), want (false, acquire error)", won, err)
+	}
+	if ambiguousError(err) {
+		t.Fatalf("acquire-stage error %v classified ambiguous, want definitive", err)
 	}
 }
 

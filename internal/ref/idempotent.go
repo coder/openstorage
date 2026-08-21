@@ -106,8 +106,12 @@ func (s IdempotentCAS) CASRef(ctx context.Context, repo, name, old, new string) 
 //   - *pgconn.PgError / *sqlite.Error: the backend itself rejected the
 //     statement (serialization abort, permission, constraint, busy) — it
 //     responded, so it did not silently commit first.
-//   - pgconn.SafeToRetry: the request never reached the server (e.g. a
-//     context canceled before send).
+//   - pgconn.SafeToRetry: the request never reached the server. Both
+//     stores mark their acquire stage this way (see notExecuted): a
+//     pool/connection acquisition failure — e.g. a deadline expiring while
+//     the pool is exhausted — happens strictly before the statement is
+//     sent, so it must not be recovered even though it often surfaces as a
+//     bare context error.
 //
 // Everything else — connection drops, unexpected EOFs, context
 // cancellation mid-flight after the request was sent — is ambiguous: the
@@ -120,3 +124,19 @@ func ambiguousError(err error) bool {
 	}
 	return !pgconn.SafeToRetry(err)
 }
+
+// notExecutedError marks an error raised before the CAS statement was sent
+// to the backend (pool/connection acquisition): the statement provably did
+// not execute. It satisfies the SafeToRetry contract pgconn uses for
+// never-sent requests, so ambiguousError classifies it as definitive.
+type notExecutedError struct{ err error }
+
+// notExecuted wraps an acquire-stage error with the not-executed marker.
+func notExecuted(err error) error {
+	assertf(err != nil, "notExecuted: nil error")
+	return notExecutedError{err: err}
+}
+
+func (e notExecutedError) Error() string   { return e.err.Error() }
+func (e notExecutedError) Unwrap() error   { return e.err }
+func (notExecutedError) SafeToRetry() bool { return true }

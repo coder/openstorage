@@ -219,22 +219,32 @@ func (s *PG) CASRef(ctx context.Context, repo, name, old, new string) (won bool,
 	assertf(ValidSHA(new), "CASRef: malformed new sha %q", new)
 	assertf(old != ZeroSHA || new != ZeroSHA, "CASRef: zero -> zero update for %s/%s", repo, name)
 
+	// Acquire explicitly so acquisition failures (pool exhausted, deadline
+	// expired while waiting) are distinguishable from statement failures:
+	// the statement provably never executed, so IdempotentCAS must not
+	// recover such errors (see notExecuted).
+	conn, err := s.pool.Acquire(ctx)
+	if err != nil {
+		return false, fmt.Errorf("cas acquire %s/%s: %w", repo, name, notExecuted(err))
+	}
+	defer conn.Release()
+
 	var tag string
 	var ct interface{ RowsAffected() int64 }
 	switch {
 	case old == ZeroSHA: // create
 		// created_at is set here once; SHA updates below never touch it.
-		c, cerr := s.pool.Exec(ctx,
+		c, cerr := conn.Exec(ctx,
 			`INSERT INTO refs (repo, name, sha, created_at) VALUES ($1, $2, $3, now()) ON CONFLICT DO NOTHING`,
 			repo, name, new)
 		ct, err, tag = c, cerr, "create"
 	case new == ZeroSHA: // delete
-		c, cerr := s.pool.Exec(ctx,
+		c, cerr := conn.Exec(ctx,
 			`DELETE FROM refs WHERE repo = $1 AND name = $2 AND sha = $3`,
 			repo, name, old)
 		ct, err, tag = c, cerr, "delete"
 	default: // update
-		c, cerr := s.pool.Exec(ctx,
+		c, cerr := conn.Exec(ctx,
 			`UPDATE refs SET sha = $1 WHERE repo = $2 AND name = $3 AND sha = $4`,
 			new, repo, name, old)
 		ct, err, tag = c, cerr, "update"
