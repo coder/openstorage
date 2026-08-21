@@ -100,4 +100,13 @@ func TestS3_CopyMultipart(t *testing.T) {
 	if err := b.Copy(ctx, "x", PackKey("r1", "missing")); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("Copy of missing source = %v, want ErrNotFound", err)
 	}
+
+	// An unversioned bucket must not trip the delete-mode versioning guard.
+	versioned, err := b.VersioningEnabled(ctx)
+	if err != nil {
+		t.Fatalf("VersioningEnabled: %v", err)
+	}
+	if versioned {
+		t.Fatal("fresh MinIO bucket reported as versioned")
+	}
 }

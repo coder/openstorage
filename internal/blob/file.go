@@ -94,6 +94,11 @@ func (b *File) List(ctx context.Context, prefix string) ([]ListedObject, error) 
 	return bucketList(ctx, b.bucket, prefix)
 }
 
+// ListPages streams objects under prefix in key order, one page at a time.
+func (b *File) ListPages(ctx context.Context, prefix string, pageSize int, fn func([]ListedObject) error) error {
+	return bucketListPages(ctx, b.bucket, prefix, pageSize, fn)
+}
+
 // SignedURL is unsupported on the filesystem backend: it returns
 // ErrSignedURLUnsupported so callers fall back to proxying transfers
 // through the server (docs/05 local mode).
@@ -200,19 +205,49 @@ func bucketCopy(ctx context.Context, bucket *gcblob.Bucket, dstKey, srcKey strin
 
 // bucketList returns all objects under prefix.
 func bucketList(ctx context.Context, bucket *gcblob.Bucket, prefix string) ([]ListedObject, error) {
-	assertf(bucket != nil, "bucketList(%q): nil bucket", prefix)
-	iter := bucket.List(&gcblob.ListOptions{Prefix: prefix})
 	var out []ListedObject
+	err := bucketListPages(ctx, bucket, prefix, 1000, func(page []ListedObject) error {
+		out = append(out, page...)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// bucketListPages streams objects under prefix in key order (the gocloud
+// driver contract orders listings lexicographically), invoking fn per page
+// of at most pageSize objects. The page slice is reused between calls. It
+// is the single streaming-list implementation for gocloud-backed
+// BlobStores; the underlying iterator fetches provider pages lazily, so
+// memory stays bounded by pageSize regardless of prefix population.
+func bucketListPages(ctx context.Context, bucket *gcblob.Bucket, prefix string, pageSize int, fn func([]ListedObject) error) error {
+	assertf(bucket != nil, "bucketListPages(%q): nil bucket", prefix)
+	assertf(pageSize > 0, "bucketListPages(%q): non-positive page size %d", prefix, pageSize)
+	assertf(fn != nil, "bucketListPages(%q): nil fn", prefix)
+	iter := bucket.List(&gcblob.ListOptions{Prefix: prefix})
+	page := make([]ListedObject, 0, pageSize)
 	for {
 		obj, err := iter.Next(ctx)
 		if err == io.EOF {
-			return out, nil
+			break
 		}
 		if err != nil {
-			return nil, err
+			return err
 		}
-		out = append(out, ListedObject{Key: obj.Key, Size: obj.Size, ModTime: obj.ModTime})
+		page = append(page, ListedObject{Key: obj.Key, Size: obj.Size, ModTime: obj.ModTime})
+		if len(page) == pageSize {
+			if err := fn(page); err != nil {
+				return err
+			}
+			page = page[:0]
+		}
 	}
+	if len(page) > 0 {
+		return fn(page)
+	}
+	return nil
 }
 
 // bucketDelete removes the object at key, mapping gocloud's NotFound code

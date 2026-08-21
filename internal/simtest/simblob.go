@@ -89,6 +89,21 @@ func (s *SimBlobStore) List(ctx context.Context, prefix string) ([]blob.ListedOb
 	}
 }
 
+// ListPages delegates to the inner store unless a fault is injected; it
+// shares OpBlobList with List (one listing surface, one fault point).
+func (s *SimBlobStore) ListPages(ctx context.Context, prefix string, pageSize int, fn func([]blob.ListedObject) error) error {
+	switch class := s.inj.begin(OpBlobList); class {
+	case FaultClean:
+		return cleanFaultError{op: OpBlobList}
+	case FaultAmbiguous:
+		return ambiguousFaultError{op: OpBlobList}
+	case FaultNone:
+		return s.inner.ListPages(ctx, prefix, pageSize, fn)
+	default:
+		panic(fmt.Sprintf("simtest: fault class %v invalid for %s", class, OpBlobList))
+	}
+}
+
 // SignedURL delegates to the inner store unless a fault is injected.
 func (s *SimBlobStore) SignedURL(ctx context.Context, key, method string, expiry time.Duration) (string, error) {
 	switch class := s.inj.begin(OpBlobSignedURL); class {

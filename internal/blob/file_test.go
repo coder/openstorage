@@ -358,3 +358,53 @@ func TestEnsurePublished(t *testing.T) {
 		t.Fatalf("Stat after re-publish = %d, %v", size, err)
 	}
 }
+
+// ListPages streams in key order with bounded pages; the final short page
+// is delivered and fn errors abort the scan.
+func TestFile_ListPages(t *testing.T) {
+	ctx := context.Background()
+	b, _ := openFile(t)
+	src := filepath.Join(t.TempDir(), "src")
+	if err := os.WriteFile(src, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var want []string
+	for _, id := range []string{"a", "b", "c", "d", "e"} {
+		key := PackKey("r1", id)
+		if err := b.UploadFile(ctx, key, src); err != nil {
+			t.Fatal(err)
+		}
+		want = append(want, key)
+	}
+
+	var got []string
+	var pages []int
+	err := b.ListPages(ctx, PacksRoot, 2, func(page []ListedObject) error {
+		pages = append(pages, len(page))
+		for _, o := range page {
+			got = append(got, o.Key)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("ListPages: %v", err)
+	}
+	if len(pages) != 3 || pages[0] != 2 || pages[1] != 2 || pages[2] != 1 {
+		t.Fatalf("page sizes = %v, want [2 2 1]", pages)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("keys = %v, want lexicographic %v", got, want)
+		}
+	}
+
+	sentinel := errors.New("stop")
+	calls := 0
+	err = b.ListPages(ctx, PacksRoot, 2, func([]ListedObject) error {
+		calls++
+		return sentinel
+	})
+	if !errors.Is(err, sentinel) || calls != 1 {
+		t.Fatalf("fn error must abort the scan: err=%v calls=%d", err, calls)
+	}
+}

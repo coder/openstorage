@@ -25,7 +25,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"sort"
 	"strings"
 	"time"
 
@@ -140,83 +139,62 @@ func (s *Sweeper) Sweep(ctx context.Context) (SweepReport, error) {
 	if err := s.healQuarantine(ctx, &report, s.cfg.Delete); err != nil {
 		deleteErrs = append(deleteErrs, err)
 	}
-	objs, err := s.blobs.List(ctx, blob.PacksRoot)
+	// Stream packs/ page-wise instead of materializing the whole prefix:
+	// a git:write holder can grow packs/ without bound (pre-receive uploads
+	// happen before ref policy), so memory must stay bounded by page size
+	// plus one repo's run of keys, never by total bucket population. Each
+	// run of consecutive same-repo keys classifies against one registry
+	// read; backends that interleave repos (fileblob orders by basename,
+	// not full key) just split a repo into several runs, costing extra
+	// registry reads but never correctness — every key still classifies
+	// against its own repo's registered set. ReposScanned counts distinct
+	// repos (the seen-set grows with repos, a control-plane-bounded
+	// population, not with attacker-mintable packs). Keys not matching the
+	// exact blob.PackKey shape (packs/<repo>/pack-<id>.pack, no deeper
+	// nesting) were not written by this system — leave foreign objects
+	// alone, loudly.
+	var (
+		curRepo string
+		group   []blob.ListedObject
+		seen    = make(map[string]bool)
+	)
+	flush := func() error {
+		if curRepo == "" {
+			return nil
+		}
+		if err := s.sweepRepoGroup(ctx, curRepo, group, &report, &deleteErrs); err != nil {
+			return err
+		}
+		if !seen[curRepo] {
+			seen[curRepo] = true
+			report.ReposScanned++
+		}
+		group = group[:0]
+		return nil
+	}
+	err := s.blobs.ListPages(ctx, blob.PacksRoot, sweepListPageSize, func(page []blob.ListedObject) error {
+		for _, obj := range page {
+			repo, ok := splitPackKey(obj.Key)
+			if !ok {
+				s.logger.Warn("orphan pack sweep: skipping foreign key under packs/", "key", obj.Key)
+				continue
+			}
+			if repo != curRepo {
+				if err := flush(); err != nil {
+					return err
+				}
+				curRepo = repo
+			}
+			group = append(group, obj)
+		}
+		return nil
+	})
 	if err != nil {
 		return report, fmt.Errorf("sweep: list %s: %w", blob.PacksRoot, err)
 	}
-
-	// Group by the key's repo segment (packs/<repo>/<file>). Keys not
-	// matching the exact blob.PackKey shape (packs/<repo>/pack-<id>.pack,
-	// no deeper nesting) were not written by this system — leave foreign
-	// objects alone, loudly.
-	byRepo := make(map[string][]blob.ListedObject)
-	for _, obj := range objs {
-		repo, ok := splitPackKey(obj.Key)
-		if !ok {
-			s.logger.Warn("orphan pack sweep: skipping foreign key under packs/", "key", obj.Key)
-			continue
-		}
-		byRepo[repo] = append(byRepo[repo], obj)
+	if err := flush(); err != nil {
+		return report, fmt.Errorf("sweep: %w", err)
 	}
-	repos := make([]string, 0, len(byRepo))
-	for repo := range byRepo {
-		repos = append(repos, repo)
-	}
-	sort.Strings(repos) // deterministic logs and reports
-
-	for _, repo := range repos {
-		packs, err := s.packs.ListPacks(ctx, repo)
-		if err != nil {
-			return report, fmt.Errorf("sweep: list packs for %s: %w", repo, err)
-		}
-		live := make(map[string]bool, len(packs))
-		for _, p := range packs {
-			live[p.Key] = true
-		}
-		for _, obj := range byRepo[repo] {
-			if live[obj.Key] {
-				report.Live++
-				continue
-			}
-			if obj.ModTime.IsZero() {
-				// A backend that reports no mod time makes age
-				// unknowable; never treat unknowable as expired.
-				s.logger.Warn("orphan pack sweep: skipping key without mod time", "key", obj.Key)
-				continue
-			}
-			age := s.now().Sub(obj.ModTime)
-			if age < s.cfg.Threshold {
-				report.Fresh++
-				continue
-			}
-			report.Orphans = append(report.Orphans, OrphanPack{Key: obj.Key, Size: obj.Size, Age: age})
-			report.OrphanBytes += obj.Size
-			s.logger.Info("orphan pack candidate",
-				"key", obj.Key, "size_bytes", obj.Size, "age", age.Round(time.Second),
-				"delete_enabled", s.cfg.Delete)
-			if !s.cfg.Delete {
-				continue
-			}
-			stillOrphan, err := s.revalidateOrphan(ctx, repo, obj.Key)
-			if err != nil {
-				deleteErrs = append(deleteErrs, err)
-				continue
-			}
-			if !stillOrphan {
-				continue
-			}
-			reaped, err := s.safeDelete(ctx, repo, obj.Key)
-			if err != nil {
-				deleteErrs = append(deleteErrs, err)
-				continue
-			}
-			if !reaped {
-				continue
-			}
-			report.Deleted++
-		}
-	}
-	report.ReposScanned = len(repos)
 
 	s.logger.Info("orphan pack sweep finished",
 		"repos", report.ReposScanned, "live", report.Live, "fresh", report.Fresh,
@@ -225,6 +203,67 @@ func (s *Sweeper) Sweep(ctx context.Context) (SweepReport, error) {
 		"delete_enabled", s.cfg.Delete, "threshold", s.cfg.Threshold,
 		"duration", s.now().Sub(start).Round(time.Millisecond))
 	return report, errors.Join(deleteErrs...)
+}
+
+// sweepListPageSize bounds how many listed objects a sweep holds per page.
+// A var so tests can force multi-page scans with few objects.
+var sweepListPageSize = 1000
+
+// sweepRepoGroup classifies one repo's contiguous listing group against its
+// registered pack set and disposes of orphans per the config. Registry
+// errors abort the sweep (they would misclassify everything in the group);
+// per-key disposal errors accumulate into deleteErrs.
+func (s *Sweeper) sweepRepoGroup(ctx context.Context, repo string, group []blob.ListedObject, report *SweepReport, deleteErrs *[]error) error {
+	packs, err := s.packs.ListPacks(ctx, repo)
+	if err != nil {
+		return fmt.Errorf("list packs for %s: %w", repo, err)
+	}
+	live := make(map[string]bool, len(packs))
+	for _, p := range packs {
+		live[p.Key] = true
+	}
+	for _, obj := range group {
+		if live[obj.Key] {
+			report.Live++
+			continue
+		}
+		if obj.ModTime.IsZero() {
+			// A backend that reports no mod time makes age unknowable;
+			// never treat unknowable as expired.
+			s.logger.Warn("orphan pack sweep: skipping key without mod time", "key", obj.Key)
+			continue
+		}
+		age := s.now().Sub(obj.ModTime)
+		if age < s.cfg.Threshold {
+			report.Fresh++
+			continue
+		}
+		report.Orphans = append(report.Orphans, OrphanPack{Key: obj.Key, Size: obj.Size, Age: age})
+		report.OrphanBytes += obj.Size
+		s.logger.Info("orphan pack candidate",
+			"key", obj.Key, "size_bytes", obj.Size, "age", age.Round(time.Second),
+			"delete_enabled", s.cfg.Delete)
+		if !s.cfg.Delete {
+			continue
+		}
+		stillOrphan, err := s.revalidateOrphan(ctx, repo, obj.Key)
+		if err != nil {
+			*deleteErrs = append(*deleteErrs, err)
+			continue
+		}
+		if !stillOrphan {
+			continue
+		}
+		reaped, err := s.safeDelete(ctx, repo, obj.Key)
+		if err != nil {
+			*deleteErrs = append(*deleteErrs, err)
+			continue
+		}
+		if reaped {
+			report.Deleted++
+		}
+	}
+	return nil
 }
 
 // quarantinePrefix roots the sweeper's pre-delete backups: safeDelete
@@ -334,58 +373,68 @@ func (s *Sweeper) safeDelete(ctx context.Context, repo, key string) (bool, error
 // actually drops (reaping only moves bytes into quarantine). Failures are
 // joined; each entry is independent.
 func (s *Sweeper) healQuarantine(ctx context.Context, report *SweepReport, purge bool) error {
-	entries, err := s.blobs.List(ctx, quarantinePrefix)
-	if err != nil {
-		return fmt.Errorf("sweep: list quarantine: %w", err)
-	}
 	var errs []error
-	for _, q := range entries {
-		orig := strings.TrimPrefix(q.Key, quarantinePrefix)
-		repo, ok := splitPackKey(orig)
-		if !ok {
-			s.logger.Warn("orphan pack sweep: skipping foreign quarantine key", "key", q.Key)
-			continue
-		}
-		packs, err := s.packs.ListPacks(ctx, repo)
-		if err != nil {
-			errs = append(errs, fmt.Errorf("sweep: heal %s: list packs: %w", orig, err))
-			continue
-		}
-		registered := false
-		for _, p := range packs {
-			if p.Key == orig {
-				registered = true
-				break
+	// Streamed like the packs/ scan: quarantine grows with reaped orphans,
+	// which an attacker can mint, so this prefix must not be materialized
+	// whole either. Entries are independent, so per-page handling is exact.
+	listErr := s.blobs.ListPages(ctx, quarantinePrefix, sweepListPageSize, func(page []blob.ListedObject) error {
+		for _, q := range page {
+			if err := s.healQuarantineEntry(ctx, q, report, purge); err != nil {
+				errs = append(errs, err)
 			}
 		}
-		reclaims := false // restore-then-purge is net zero; only an aged-orphan purge frees bytes
-		if registered {
-			if _, err := s.blobs.Stat(ctx, orig); errors.Is(err, blob.ErrNotFound) {
-				if err := s.blobs.Copy(ctx, orig, q.Key); err != nil {
-					errs = append(errs, fmt.Errorf("sweep: heal %s: restore: %w", orig, err))
-					continue
-				}
-				s.logger.Warn("orphan pack sweep: healed registered pack from quarantine", "key", orig)
-			} else if err != nil {
-				errs = append(errs, fmt.Errorf("sweep: heal %s: stat: %w", orig, err))
-				continue
-			}
-		} else if !purge || q.ModTime.IsZero() || s.now().Sub(q.ModTime) < s.cfg.Threshold {
-			// Unregistered: purge only in delete mode once aged past the
-			// threshold (an in-flight sweep's backup is always fresh).
-			continue
-		} else {
-			reclaims = true
-		}
-		if err := s.blobs.Delete(ctx, q.Key); err != nil && !errors.Is(err, blob.ErrNotFound) {
-			errs = append(errs, fmt.Errorf("sweep: purge quarantine %s: %w", q.Key, err))
-			continue
-		}
-		if reclaims {
-			report.BytesReclaimed += q.Size
-		}
+		return nil
+	})
+	if listErr != nil {
+		errs = append(errs, fmt.Errorf("sweep: list quarantine: %w", listErr))
 	}
 	return errors.Join(errs...)
+}
+
+// healQuarantineEntry disposes of one quarantine backup per the
+// healQuarantine contract.
+func (s *Sweeper) healQuarantineEntry(ctx context.Context, q blob.ListedObject, report *SweepReport, purge bool) error {
+	orig := strings.TrimPrefix(q.Key, quarantinePrefix)
+	repo, ok := splitPackKey(orig)
+	if !ok {
+		s.logger.Warn("orphan pack sweep: skipping foreign quarantine key", "key", q.Key)
+		return nil
+	}
+	packs, err := s.packs.ListPacks(ctx, repo)
+	if err != nil {
+		return fmt.Errorf("sweep: heal %s: list packs: %w", orig, err)
+	}
+	registered := false
+	for _, p := range packs {
+		if p.Key == orig {
+			registered = true
+			break
+		}
+	}
+	reclaims := false // restore-then-purge is net zero; only an aged-orphan purge frees bytes
+	if registered {
+		if _, err := s.blobs.Stat(ctx, orig); errors.Is(err, blob.ErrNotFound) {
+			if err := s.blobs.Copy(ctx, orig, q.Key); err != nil {
+				return fmt.Errorf("sweep: heal %s: restore: %w", orig, err)
+			}
+			s.logger.Warn("orphan pack sweep: healed registered pack from quarantine", "key", orig)
+		} else if err != nil {
+			return fmt.Errorf("sweep: heal %s: stat: %w", orig, err)
+		}
+	} else if !purge || q.ModTime.IsZero() || s.now().Sub(q.ModTime) < s.cfg.Threshold {
+		// Unregistered: purge only in delete mode once aged past the
+		// threshold (an in-flight sweep's backup is always fresh).
+		return nil
+	} else {
+		reclaims = true
+	}
+	if err := s.blobs.Delete(ctx, q.Key); err != nil && !errors.Is(err, blob.ErrNotFound) {
+		return fmt.Errorf("sweep: purge quarantine %s: %w", q.Key, err)
+	}
+	if reclaims {
+		report.BytesReclaimed += q.Size
+	}
+	return nil
 }
 
 // revalidateOrphan re-checks one delete candidate against live state,

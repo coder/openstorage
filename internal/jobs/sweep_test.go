@@ -695,3 +695,42 @@ func TestRiverSweepPeriodic(t *testing.T) {
 		t.Fatalf("periodic sweep deleted the live pack %q", liveKey)
 	}
 }
+
+// The packs/ scan is streamed: with a page size smaller than any repo
+// group, contiguous keys still classify per repo exactly like the
+// materialized scan did (memory-bound fix from the security review).
+func TestSweep_StreamsAcrossPages(t *testing.T) {
+	f := newSweepFixture(t)
+	orig := sweepListPageSize
+	sweepListPageSize = 2
+	t.Cleanup(func() { sweepListPageSize = orig })
+
+	// Two repos, three packs each (so groups straddle page boundaries):
+	// one live, one aged orphan, one fresh per repo.
+	for _, repo := range []string{"ra", "rb"} {
+		live := blob.PackKey(repo, "alive")
+		f.upload(live, "live")
+		f.register(repo, "alive", live)
+		orphan := blob.PackKey(repo, "orphan")
+		f.upload(orphan, "orphan")
+		f.backdate(orphan, 25*time.Hour)
+		f.upload(blob.PackKey(repo, "zfresh"), "fresh")
+	}
+
+	report, err := f.sweeper(SweepConfig{Threshold: 24 * time.Hour, Delete: true}).Sweep(context.Background())
+	if err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if report.ReposScanned != 2 || report.Live != 2 || report.Fresh != 2 ||
+		len(report.Orphans) != 2 || report.Deleted != 2 {
+		t.Fatalf("report = %+v, want 2 repos / 2 live / 2 fresh / 2 orphans reaped", report)
+	}
+	for _, repo := range []string{"ra", "rb"} {
+		if f.exists(blob.PackKey(repo, "orphan")) {
+			t.Fatalf("orphan in %s survived", repo)
+		}
+		if !f.exists(blob.PackKey(repo, "alive")) || !f.exists(blob.PackKey(repo, "zfresh")) {
+			t.Fatalf("non-orphan in %s deleted", repo)
+		}
+	}
+}

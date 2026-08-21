@@ -72,6 +72,22 @@ func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL string, orgPEM
 	// listing is a read, no events to emit — and the shared blob store.
 	// interval 0 disables the periodic schedule; nil schedule keeps both
 	// queue backends inert.
+	if sweep.deleteEnabled {
+		// Versioned S3 buckets break delete-mode invariants: Delete only
+		// writes a delete marker while every pack and quarantine version
+		// stays stored and billed, so sweeps would report reclaimed bytes
+		// without reclaiming anything. Refuse on positive detection; an
+		// endpoint that cannot answer (some S3-compatibles) just logs.
+		if s3store, ok := blobStore.(*blob.S3); ok {
+			versioned, err := s3store.VersioningEnabled(ctx)
+			switch {
+			case err != nil:
+				logger.Warn("cannot verify bucket versioning for sweep delete mode", "err", err)
+			case versioned:
+				return fail(fmt.Errorf("%s: bucket has S3 versioning enabled; delete-mode sweeps only write delete markers there (add a noncurrent-version lifecycle policy and disable versioning, or keep the sweeper list-only)", envSweepDeleteEnabled))
+			}
+		}
+	}
 	sweeper := jobs.NewSweeper(blobStore, refStore, jobs.SweepConfig{
 		Threshold: sweep.ageThreshold,
 		Delete:    sweep.deleteEnabled,

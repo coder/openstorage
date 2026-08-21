@@ -49,6 +49,12 @@ type BlobStore interface {
 	DownloadFile(ctx context.Context, key, destPath string) error
 	// List returns all objects under prefix.
 	List(ctx context.Context, prefix string) ([]ListedObject, error)
+	// ListPages streams objects under prefix in lexicographic key order,
+	// invoking fn once per page of at most pageSize objects, so callers
+	// scanning large prefixes (the orphan-pack sweeper) hold one page at a
+	// time instead of the whole listing. fn must not retain the slice; a
+	// non-nil fn error aborts the scan and is returned unwrapped.
+	ListPages(ctx context.Context, prefix string, pageSize int, fn func([]ListedObject) error) error
 	// Delete removes the object at key; missing objects yield an error
 	// matching ErrNotFound via errors.Is. Objects are immutable, so Delete
 	// exists solely for the orphan-pack sweeper (issue #5): reaping blobs
@@ -245,6 +251,24 @@ func (b *S3) DownloadFile(ctx context.Context, key, destPath string) error {
 // List returns all objects under prefix.
 func (b *S3) List(ctx context.Context, prefix string) ([]ListedObject, error) {
 	return bucketList(ctx, b.bucket, prefix)
+}
+
+// ListPages streams objects under prefix in key order, one page at a time.
+func (b *S3) ListPages(ctx context.Context, prefix string, pageSize int, fn func([]ListedObject) error) error {
+	return bucketListPages(ctx, b.bucket, prefix, pageSize, fn)
+}
+
+// VersioningEnabled reports whether the backing bucket has S3 versioning
+// enabled. The orphan-pack sweeper's delete mode refuses versioned buckets:
+// deletes there only write delete markers, so sweeps would reclaim nothing
+// while reporting that they did.
+func (b *S3) VersioningEnabled(ctx context.Context) (bool, error) {
+	assertf(b.client != nil, "VersioningEnabled: S3 opened without a client")
+	out, err := b.client.GetBucketVersioning(ctx, &s3.GetBucketVersioningInput{Bucket: aws.String(b.name)})
+	if err != nil {
+		return false, fmt.Errorf("get bucket versioning %q: %w", b.name, err)
+	}
+	return out.Status == s3types.BucketVersioningStatusEnabled, nil
 }
 
 // SignedURL returns a presigned S3 URL for method (GET or PUT) on key.

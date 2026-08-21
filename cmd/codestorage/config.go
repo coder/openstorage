@@ -35,6 +35,14 @@ const (
 	// sweeping), minimum blob age before an unregistered pack counts as an
 	// orphan, and the explicit opt-in for actually deleting candidates
 	// (list-only by default).
+	//
+	// Upgrade ordering for delete mode: enable it only once EVERY node
+	// (serve replicas AND hook-running git nodes) runs a build with the
+	// post-registration publish verify (blob.EnsurePublished). A mixed
+	// fleet cannot lose data — quarantine plus the heal pass restore any
+	// mis-reaped registered pack — but an old writer racing a delete-mode
+	// sweep can see its freshly registered pack unavailable until the next
+	// sweep heals it. List-only mode is safe on any fleet.
 	envSweepInterval      = "CODESTORAGE_SWEEP_INTERVAL"
 	envSweepAgeThreshold  = "CODESTORAGE_SWEEP_AGE_THRESHOLD"
 	envSweepDeleteEnabled = "CODESTORAGE_SWEEP_DELETE_ENABLED"
