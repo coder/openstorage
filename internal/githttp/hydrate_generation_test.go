@@ -49,6 +49,10 @@ func (s *countingStore) ListPacks(context.Context, string) ([]ref.Pack, error) {
 	return nil, nil
 }
 
+func (s *countingStore) HasPack(context.Context, string, string) (bool, error) {
+	return false, nil
+}
+
 func (s *countingStore) ListRefs(context.Context, string) (map[string]string, error) {
 	s.mu.Lock()
 	s.listRefsCalls++

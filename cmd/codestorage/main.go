@@ -141,7 +141,7 @@ func cmdServe(ctx context.Context, args []string) error {
 	// HTTP API (single-org self-host mode). The read endpoints share the
 	// ref/blob stores and cache dir with the githttp fallback below.
 	apiHandler, metaStore, verifier, cleanup, err := buildAPIHandler(ctx, cfg.dbURL, cfg.org, httpBaseURL, orgPEMBlocks, st, bl, cfg.cacheDir,
-		api.RateLimitConfig{RPS: cfg.rateRPS, Burst: cfg.rateBurst})
+		api.RateLimitConfig{RPS: cfg.rateRPS, Burst: cfg.rateBurst}, cfg.sweep)
 	if err != nil {
 		return err
 	}

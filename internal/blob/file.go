@@ -94,6 +94,11 @@ func (b *File) List(ctx context.Context, prefix string) ([]ListedObject, error) 
 	return bucketList(ctx, b.bucket, prefix)
 }
 
+// ListPages streams objects under prefix in key order, one page at a time.
+func (b *File) ListPages(ctx context.Context, prefix string, pageSize int, fn func([]ListedObject) error) error {
+	return bucketListPages(ctx, b.bucket, prefix, pageSize, fn)
+}
+
 // SignedURL is unsupported on the filesystem backend: it returns
 // ErrSignedURLUnsupported so callers fall back to proxying transfers
 // through the server (docs/05 local mode).
@@ -105,6 +110,16 @@ func (b *File) SignedURL(_ context.Context, key, method string, expiry time.Dura
 // Stat returns the size of the object at key (ErrNotFound when absent).
 func (b *File) Stat(ctx context.Context, key string) (int64, error) {
 	return bucketStat(ctx, b.bucket, key)
+}
+
+// Delete removes the object at key (ErrNotFound when absent).
+func (b *File) Delete(ctx context.Context, key string) error {
+	return bucketDelete(ctx, b.bucket, key)
+}
+
+// Copy duplicates srcKey to dstKey (local file copy inside the bucket dir).
+func (b *File) Copy(ctx context.Context, dstKey, srcKey string) error {
+	return bucketCopy(ctx, b.bucket, dstKey, srcKey)
 }
 
 // bucketUploadFile streams the local file at path into bucket under key. It
@@ -174,19 +189,77 @@ func bucketStat(ctx context.Context, bucket *gcblob.Bucket, key string) (int64, 
 	return attrs.Size, nil
 }
 
+// bucketCopy duplicates srcKey to dstKey inside the bucket, mapping
+// gocloud's NotFound code onto ErrNotFound. It is the single Copy
+// implementation for gocloud-backed BlobStores.
+func bucketCopy(ctx context.Context, bucket *gcblob.Bucket, dstKey, srcKey string) error {
+	assertf(bucket != nil && dstKey != "" && srcKey != "", "bucketCopy(%q, %q)", dstKey, srcKey)
+	if err := bucket.Copy(ctx, dstKey, srcKey, nil); err != nil {
+		if gcerrors.Code(err) == gcerrors.NotFound {
+			return fmt.Errorf("copy %s -> %s: %w", srcKey, dstKey, ErrNotFound)
+		}
+		return fmt.Errorf("copy %s -> %s: %w", srcKey, dstKey, err)
+	}
+	return nil
+}
+
 // bucketList returns all objects under prefix.
 func bucketList(ctx context.Context, bucket *gcblob.Bucket, prefix string) ([]ListedObject, error) {
-	assertf(bucket != nil, "bucketList(%q): nil bucket", prefix)
-	iter := bucket.List(&gcblob.ListOptions{Prefix: prefix})
 	var out []ListedObject
+	err := bucketListPages(ctx, bucket, prefix, 1000, func(page []ListedObject) error {
+		out = append(out, page...)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// bucketListPages streams objects under prefix in key order (the gocloud
+// driver contract orders listings lexicographically), invoking fn per page
+// of at most pageSize objects. The page slice is reused between calls. It
+// is the single streaming-list implementation for gocloud-backed
+// BlobStores; the underlying iterator fetches provider pages lazily, so
+// memory stays bounded by pageSize regardless of prefix population.
+func bucketListPages(ctx context.Context, bucket *gcblob.Bucket, prefix string, pageSize int, fn func([]ListedObject) error) error {
+	assertf(bucket != nil, "bucketListPages(%q): nil bucket", prefix)
+	assertf(pageSize > 0, "bucketListPages(%q): non-positive page size %d", prefix, pageSize)
+	assertf(fn != nil, "bucketListPages(%q): nil fn", prefix)
+	iter := bucket.List(&gcblob.ListOptions{Prefix: prefix})
+	page := make([]ListedObject, 0, pageSize)
 	for {
 		obj, err := iter.Next(ctx)
 		if err == io.EOF {
-			return out, nil
+			break
 		}
 		if err != nil {
-			return nil, err
+			return err
 		}
-		out = append(out, ListedObject{Key: obj.Key, Size: obj.Size})
+		page = append(page, ListedObject{Key: obj.Key, Size: obj.Size, ModTime: obj.ModTime})
+		if len(page) == pageSize {
+			if err := fn(page); err != nil {
+				return err
+			}
+			page = page[:0]
+		}
 	}
+	if len(page) > 0 {
+		return fn(page)
+	}
+	return nil
+}
+
+// bucketDelete removes the object at key, mapping gocloud's NotFound code
+// onto the package-level ErrNotFound sentinel. It is the single Delete
+// implementation for gocloud-backed BlobStores.
+func bucketDelete(ctx context.Context, bucket *gcblob.Bucket, key string) error {
+	assertf(bucket != nil && key != "", "bucketDelete(%q)", key)
+	if err := bucket.Delete(ctx, key); err != nil {
+		if gcerrors.Code(err) == gcerrors.NotFound {
+			return fmt.Errorf("delete %s: %w", key, ErrNotFound)
+		}
+		return fmt.Errorf("delete %s: %w", key, err)
+	}
+	return nil
 }

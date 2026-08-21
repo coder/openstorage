@@ -89,6 +89,21 @@ func (s *SimBlobStore) List(ctx context.Context, prefix string) ([]blob.ListedOb
 	}
 }
 
+// ListPages delegates to the inner store unless a fault is injected; it
+// shares OpBlobList with List (one listing surface, one fault point).
+func (s *SimBlobStore) ListPages(ctx context.Context, prefix string, pageSize int, fn func([]blob.ListedObject) error) error {
+	switch class := s.inj.begin(OpBlobList); class {
+	case FaultClean:
+		return cleanFaultError{op: OpBlobList}
+	case FaultAmbiguous:
+		return ambiguousFaultError{op: OpBlobList}
+	case FaultNone:
+		return s.inner.ListPages(ctx, prefix, pageSize, fn)
+	default:
+		panic(fmt.Sprintf("simtest: fault class %v invalid for %s", class, OpBlobList))
+	}
+}
+
 // SignedURL delegates to the inner store unless a fault is injected.
 func (s *SimBlobStore) SignedURL(ctx context.Context, key, method string, expiry time.Duration) (string, error) {
 	switch class := s.inj.begin(OpBlobSignedURL); class {
@@ -117,6 +132,46 @@ func (s *SimBlobStore) Stat(ctx context.Context, key string) (int64, error) {
 		return s.inner.Stat(ctx, key)
 	default:
 		panic(fmt.Sprintf("simtest: fault class %v invalid for %s", class, OpBlobStat))
+	}
+}
+
+// Delete delegates unless a fault is injected; an ambiguous fault deletes
+// the object and then reports failure (the sweeper's delete outcome lost in
+// transit); FaultNotFound reports the object as already missing.
+func (s *SimBlobStore) Delete(ctx context.Context, key string) error {
+	switch class := s.inj.begin(OpBlobDelete); class {
+	case FaultClean:
+		return cleanFaultError{op: OpBlobDelete}
+	case FaultAmbiguous:
+		err := s.inner.Delete(ctx, key)
+		s.inj.noteInnerOutcome(OpBlobDelete, fmt.Sprintf("err=%v", err))
+		return ambiguousFaultError{op: OpBlobDelete}
+	case FaultNotFound:
+		return notFoundFaultError(OpBlobDelete)
+	case FaultNone:
+		return s.inner.Delete(ctx, key)
+	default:
+		panic(fmt.Sprintf("simtest: fault class %v invalid for %s", class, OpBlobDelete))
+	}
+}
+
+// Copy delegates unless a fault is injected; an ambiguous fault performs
+// the copy and then reports failure (a quarantine copy that landed but
+// whose result was lost); FaultNotFound reports a missing source.
+func (s *SimBlobStore) Copy(ctx context.Context, dstKey, srcKey string) error {
+	switch class := s.inj.begin(OpBlobCopy); class {
+	case FaultClean:
+		return cleanFaultError{op: OpBlobCopy}
+	case FaultAmbiguous:
+		err := s.inner.Copy(ctx, dstKey, srcKey)
+		s.inj.noteInnerOutcome(OpBlobCopy, fmt.Sprintf("err=%v", err))
+		return ambiguousFaultError{op: OpBlobCopy}
+	case FaultNotFound:
+		return notFoundFaultError(OpBlobCopy)
+	case FaultNone:
+		return s.inner.Copy(ctx, dstKey, srcKey)
+	default:
+		panic(fmt.Sprintf("simtest: fault class %v invalid for %s", class, OpBlobCopy))
 	}
 }
 

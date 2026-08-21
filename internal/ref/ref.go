@@ -74,6 +74,11 @@ type RefStore interface {
 	RegisterPacks(ctx context.Context, repo string, packs []Pack) error
 	// ListPacks returns all registered packs for repo, oldest first.
 	ListPacks(ctx context.Context, repo string) ([]Pack, error)
+	// HasPack reports whether repo has a registered pack with the given
+	// blob key (a point read: the orphan-pack sweeper classifies each
+	// listed blob individually so its memory never scales with a repo's
+	// registered-pack count, which pre-policy pushes can grow).
+	HasPack(ctx context.Context, repo, key string) (bool, error)
 	// GetGeneration returns repo's mutation generation: 0 for a repo no
 	// mutation ever touched, strictly positive and monotonically increasing
 	// afterwards. It is an invalidation token over committed row changes,
@@ -158,6 +163,11 @@ CREATE TABLE IF NOT EXISTS refs  (repo text, name text, sha text NOT NULL,
                                   created_at timestamptz NOT NULL DEFAULT now(), PRIMARY KEY (repo, name));
 CREATE TABLE IF NOT EXISTS packs (repo text, id text, s3_key text NOT NULL,
                                   created_at timestamptz DEFAULT now(), PRIMARY KEY (repo, id));
+-- The orphan sweeper's per-object membership check (HasPack, issue #5)
+-- filters on (repo, s3_key), which the (repo, id) primary key cannot serve:
+-- without this index each check scans the repo's rows, and a sweep over a
+-- repo with attacker-growable pack count turns O(N²).
+CREATE INDEX IF NOT EXISTS packs_repo_s3_key ON packs (repo, s3_key);
 -- Per-repo mutation generation (issue #4). No row means "never mutated"
 -- (GetGeneration reports 0); the first bump creates the row at 1, so a
 -- hydrate marker taken before the first mutation can never match the state
@@ -336,6 +346,15 @@ func (s *PG) RegisterPacks(ctx context.Context, repo string, packs []Pack) error
 		}
 		return nil
 	})
+}
+
+// HasPack reports whether repo has a registered pack with blob key.
+func (s *PG) HasPack(ctx context.Context, repo, key string) (bool, error) {
+	assertf(repo != "" && key != "", "HasPack(%q, %q)", repo, key)
+	var exists bool
+	err := s.pool.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM packs WHERE repo = $1 AND s3_key = $2)`, repo, key).Scan(&exists)
+	return exists, err
 }
 
 // GetGeneration returns repo's mutation generation (0 = never mutated).

@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/exec"
@@ -35,6 +36,7 @@ import (
 
 	"codestorage/internal/auth"
 	"codestorage/internal/blob"
+	"codestorage/internal/jobs"
 	"codestorage/internal/meta"
 	"codestorage/internal/ref"
 )
@@ -603,6 +605,63 @@ func TestCrash_AfterS3_BeforePGCommit(t *testing.T) {
 	}
 	if got := pgPacks(t, repo); len(got) != len(packsBefore) {
 		t.Fatalf("PG packs changed across crash: %v -> %v", packsBefore, got)
+	}
+
+	// The orphan-pack sweeper (issue #5) sees exactly this crash artifact.
+	// Object stores cannot be backdated, so age the orphan for real past a
+	// short threshold instead of injecting a clock.
+	orphanKey := ""
+	before := make(map[string]bool, len(objsBefore))
+	for _, o := range objsBefore {
+		before[o.Key] = true
+	}
+	for _, o := range objsAfter {
+		if !before[o.Key] {
+			orphanKey = o.Key
+		}
+	}
+	if orphanKey == "" {
+		t.Fatal("could not identify the orphan key")
+	}
+	sweepLogger := slog.New(slog.NewTextHandler(os.Stderr, nil))
+	threshold := time.Second
+	time.Sleep(threshold + 500*time.Millisecond)
+
+	// List-only (the default): the orphan is reported, nothing is deleted.
+	report, err := jobs.NewSweeper(testBlob, testStore, jobs.SweepConfig{Threshold: threshold}, sweepLogger).Sweep(t.Context())
+	if err != nil {
+		t.Fatalf("list-only sweep: %v", err)
+	}
+	foundOrphan := false
+	for _, o := range report.Orphans {
+		if o.Key == orphanKey {
+			foundOrphan = true
+		}
+	}
+	if !foundOrphan {
+		t.Fatalf("list-only sweep did not report the crash orphan %q: %+v", orphanKey, report.Orphans)
+	}
+	if got := minioPacks(t, repo); len(got) != len(objsAfter) {
+		t.Fatalf("list-only sweep deleted objects: %d -> %d", len(objsAfter), len(got))
+	}
+
+	// Delete enabled: the orphan is reaped; every registered pack survives.
+	if _, err := jobs.NewSweeper(testBlob, testStore, jobs.SweepConfig{Threshold: threshold, Delete: true}, sweepLogger).Sweep(t.Context()); err != nil {
+		t.Fatalf("delete sweep: %v", err)
+	}
+	objsSwept := minioPacks(t, repo)
+	if len(objsSwept) != len(objsBefore) {
+		t.Fatalf("objects after delete sweep = %d, want %d (orphan reaped)", len(objsSwept), len(objsBefore))
+	}
+	for _, o := range objsSwept {
+		if o.Key == orphanKey {
+			t.Fatalf("orphan %q survived the delete sweep", orphanKey)
+		}
+	}
+	for _, p := range pgPacks(t, repo) {
+		if _, err := testBlob.Stat(t.Context(), p.Key); err != nil {
+			t.Fatalf("registered pack %q lost after sweep: %v", p.Key, err)
+		}
 	}
 
 	// A fresh node still serves a healthy clone at the old HEAD.

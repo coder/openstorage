@@ -63,6 +63,42 @@ func (syncArgs) InsertOpts() river.InsertOpts {
 	}
 }
 
+// sweepArgs is one orphan-pack sweep run. No payload: the sweep always
+// covers the whole packs/ space. Unique across the active states so the
+// periodic schedulers of concurrently running replicas cannot pile up
+// overlapping sweeps; MaxAttempts 1 because the next periodic tick is the
+// retry.
+type sweepArgs struct{}
+
+func (sweepArgs) Kind() string { return "orphan_pack_sweep" }
+
+func (sweepArgs) InsertOpts() river.InsertOpts {
+	return river.InsertOpts{
+		MaxAttempts: 1,
+		UniqueOpts: river.UniqueOpts{
+			ByArgs: true,
+			ByState: []rivertype.JobState{
+				rivertype.JobStateAvailable,
+				rivertype.JobStatePending,
+				rivertype.JobStateRetryable,
+				rivertype.JobStateRunning,
+				rivertype.JobStateScheduled,
+			},
+		},
+	}
+}
+
+// sweepWorker runs one orphan-pack sweep; the Sweeper owns all reporting.
+type sweepWorker struct {
+	river.WorkerDefaults[sweepArgs]
+	sweeper *Sweeper
+}
+
+func (w *sweepWorker) Work(ctx context.Context, _ *river.Job[sweepArgs]) error {
+	_, err := w.sweeper.Sweep(ctx)
+	return err
+}
+
 // deliveryWorker performs one signed POST per job attempt; River owns the
 // backoff/attempt accounting (re-signing falls out of Deliverer.Attempt
 // reloading the webhook and signing with time.Now on every attempt).
@@ -114,10 +150,14 @@ var _ Queue = (*River)(nil)
 
 // NewRiver opens a dedicated pool on pgURL, applies the river migrations
 // (serve owns DDL, mirroring meta/ref InitSchema), and starts workers that
-// share the delivery/sync code with the local queue.
-func NewRiver(ctx context.Context, pgURL string, deliverer *events.Deliverer, runSync SyncRunner, logger *slog.Logger) (*River, error) {
+// share the delivery/sync code with the local queue. A non-nil sweep
+// schedules the periodic orphan-pack sweep (run once on start, then every
+// Interval); nil disables it (hook subprocesses, tests without storage).
+func NewRiver(ctx context.Context, pgURL string, deliverer *events.Deliverer, runSync SyncRunner, sweep *SweepSchedule, logger *slog.Logger) (*River, error) {
 	assertf(deliverer != nil, "NewRiver: nil deliverer")
 	assertf(runSync != nil, "NewRiver: nil sync runner")
+	assertf(sweep == nil || (sweep.Sweeper != nil && sweep.Interval > 0),
+		"NewRiver: sweep schedule missing sweeper or interval: %+v", sweep)
 	assertf(logger != nil, "NewRiver: nil logger")
 
 	pool, err := pgxpool.New(ctx, pgURL)
@@ -168,10 +208,24 @@ func NewRiver(ctx context.Context, pgURL string, deliverer *events.Deliverer, ru
 	workers := river.NewWorkers()
 	river.AddWorker(workers, &deliveryWorker{deliverer: deliverer})
 	river.AddWorker(workers, &syncWorker{run: runSync, logger: logger})
+	var periodic []*river.PeriodicJob
+	if sweep != nil {
+		river.AddWorker(workers, &sweepWorker{sweeper: sweep.Sweeper})
+		periodic = append(periodic, river.NewPeriodicJob(
+			river.PeriodicInterval(sweep.Interval),
+			func() (river.JobArgs, *river.InsertOpts) { return sweepArgs{}, nil },
+			// RunOnStart: every replica boot inserts one sweep; the
+			// unique opts coalesce concurrent inserts, and sweeps are
+			// idempotent and read-only by default, so the extra runs on
+			// rolling restarts are harmless.
+			&river.PeriodicJobOpts{RunOnStart: true},
+		))
+	}
 	client, err := river.NewClient(driver, &river.Config{
-		Queues:  map[string]river.QueueConfig{river.QueueDefault: {MaxWorkers: 8}},
-		Workers: workers,
-		Logger:  logger,
+		Queues:       map[string]river.QueueConfig{river.QueueDefault: {MaxWorkers: 8}},
+		Workers:      workers,
+		PeriodicJobs: periodic,
+		Logger:       logger,
 	})
 	if err != nil {
 		pool.Close()

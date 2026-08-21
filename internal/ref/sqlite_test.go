@@ -110,6 +110,17 @@ func TestSQLiteInitSchemaIdempotent(t *testing.T) {
 			t.Fatalf("concurrent InitSchema: %v", err)
 		}
 	}
+
+	// The sweeper's HasPack point read depends on this index (issue #5);
+	// losing it silently degrades sweeps to O(N²) repo scans.
+	var n int
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'packs_repo_s3_key'`).Scan(&n); err != nil {
+		t.Fatalf("query sqlite_master: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("packs_repo_s3_key index missing after InitSchema")
+	}
 }
 
 // TestSQLiteGetRef pins the point-read contract: the current sha for a

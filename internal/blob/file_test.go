@@ -242,3 +242,200 @@ func TestFile_UploadNeverUsesOSTempDir(t *testing.T) {
 		t.Fatalf("UploadFile must not depend on os.TempDir: %v", err)
 	}
 }
+
+// ModTime must be populated by List (the orphan-pack sweeper's age source)
+// and track the underlying object's last-modified time.
+func TestFile_ListModTime(t *testing.T) {
+	ctx := context.Background()
+	b, dir := openFile(t)
+	src := filepath.Join(t.TempDir(), "src")
+	if err := os.WriteFile(src, []byte("pack"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	key := PackKey("r1", "aged")
+	if err := b.UploadFile(ctx, key, src); err != nil {
+		t.Fatalf("UploadFile: %v", err)
+	}
+
+	listed, err := b.List(ctx, PackPrefix("r1"))
+	if err != nil || len(listed) != 1 {
+		t.Fatalf("List = %v, %v; want one object", listed, err)
+	}
+	if age := time.Since(listed[0].ModTime); listed[0].ModTime.IsZero() || age < 0 || age > time.Minute {
+		t.Fatalf("fresh upload ModTime = %v (age %v), want ~now", listed[0].ModTime, age)
+	}
+
+	// Backdating the underlying file must surface through List: that is
+	// exactly how sweeper tests age orphans.
+	past := time.Now().Add(-25 * time.Hour)
+	if err := os.Chtimes(filepath.Join(dir, "packs", "r1", "pack-aged.pack"), past, past); err != nil {
+		t.Fatal(err)
+	}
+	listed, err = b.List(ctx, PackPrefix("r1"))
+	if err != nil || len(listed) != 1 {
+		t.Fatalf("List after backdate = %v, %v", listed, err)
+	}
+	if got := listed[0].ModTime; got.After(past.Add(time.Second)) || got.Before(past.Add(-time.Second)) {
+		t.Fatalf("backdated ModTime = %v, want ~%v", got, past)
+	}
+}
+
+// Delete removes exactly the addressed object; a missing key yields
+// ErrNotFound (the sweeper tolerates concurrent deletion races via that
+// sentinel).
+func TestFile_Delete(t *testing.T) {
+	ctx := context.Background()
+	keep := PackKey("r1", "keep")
+	victim := PackKey("r1", "victim")
+	b := seededFile(t, keep, "keep-bytes")
+	src := filepath.Join(t.TempDir(), "src")
+	if err := os.WriteFile(src, []byte("victim-bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.UploadFile(ctx, victim, src); err != nil {
+		t.Fatalf("UploadFile: %v", err)
+	}
+
+	if err := b.Delete(ctx, victim); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if _, err := b.Stat(ctx, victim); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Stat after delete = %v, want ErrNotFound", err)
+	}
+	if _, err := b.Stat(ctx, keep); err != nil {
+		t.Fatalf("neighbor object must survive: %v", err)
+	}
+	if err := b.Delete(ctx, victim); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Delete of missing key = %v, want ErrNotFound", err)
+	}
+}
+
+// Copy duplicates objects inside the store without local staging; missing
+// sources map to ErrNotFound (the sweeper's gone-already signal).
+func TestFile_Copy(t *testing.T) {
+	ctx := context.Background()
+	src := PackKey("r1", "src")
+	b := seededFile(t, src, "copy-me")
+
+	dst := "sweep/quarantine/" + src
+	if err := b.Copy(ctx, dst, src); err != nil {
+		t.Fatalf("Copy: %v", err)
+	}
+	for _, key := range []string{src, dst} {
+		size, err := b.Stat(ctx, key)
+		if err != nil || size != int64(len("copy-me")) {
+			t.Fatalf("Stat(%q) = %d, %v; want %d", key, size, err, len("copy-me"))
+		}
+	}
+	if err := b.Copy(ctx, "x", PackKey("r1", "missing")); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Copy of missing source = %v, want ErrNotFound", err)
+	}
+}
+
+// EnsurePublished is the writer half of the orphan-sweep coordination:
+// no-op when the key exists, re-upload when a sweeper deleted it between
+// upload and registration commit.
+func TestEnsurePublished(t *testing.T) {
+	ctx := context.Background()
+	key := PackKey("r1", "verify")
+	b := seededFile(t, key, "pack-bytes")
+	src := filepath.Join(t.TempDir(), "src")
+	if err := os.WriteFile(src, []byte("pack-bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := EnsurePublished(ctx, b, key, src); err != nil {
+		t.Fatalf("EnsurePublished(present): %v", err)
+	}
+	if err := b.Delete(ctx, key); err != nil {
+		t.Fatal(err)
+	}
+	if err := EnsurePublished(ctx, b, key, src); err != nil {
+		t.Fatalf("EnsurePublished(missing): %v", err)
+	}
+	size, err := b.Stat(ctx, key)
+	if err != nil || size != int64(len("pack-bytes")) {
+		t.Fatalf("Stat after re-publish = %d, %v", size, err)
+	}
+
+	// A canceled request context must not skip the verification: the
+	// registration it covers already committed (Codex round 14).
+	if err := b.Delete(ctx, key); err != nil {
+		t.Fatal(err)
+	}
+	canceled, cancel := context.WithCancel(ctx)
+	cancel()
+	if err := EnsurePublished(canceled, b, key, src); err != nil {
+		t.Fatalf("EnsurePublished(canceled ctx): %v", err)
+	}
+	if _, err := b.Stat(ctx, key); err != nil {
+		t.Fatalf("Stat after canceled-ctx re-publish: %v", err)
+	}
+}
+
+// The verification deadline scales with pack size so a repair upload of a
+// supported large pack (S3 multipart copy handles >5 GiB) can finish
+// within it (Codex round 15).
+func TestEnsurePublishedTimeout(t *testing.T) {
+	if got := ensurePublishedTimeout(0); got != 5*time.Minute {
+		t.Fatalf("timeout(0) = %v, want the 5m floor", got)
+	}
+	const fiveGiB = 5 << 30
+	got := ensurePublishedTimeout(fiveGiB)
+	if want := 5*time.Minute + 5120*time.Second; got != want {
+		t.Fatalf("timeout(5GiB) = %v, want %v", got, want)
+	}
+	if got <= 6*time.Minute {
+		t.Fatalf("timeout(5GiB) = %v: cannot cover a 5 GiB re-upload", got)
+	}
+}
+
+// ListPages streams in key order with bounded pages; the final short page
+// is delivered and fn errors abort the scan.
+func TestFile_ListPages(t *testing.T) {
+	ctx := context.Background()
+	b, _ := openFile(t)
+	src := filepath.Join(t.TempDir(), "src")
+	if err := os.WriteFile(src, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var want []string
+	for _, id := range []string{"a", "b", "c", "d", "e"} {
+		key := PackKey("r1", id)
+		if err := b.UploadFile(ctx, key, src); err != nil {
+			t.Fatal(err)
+		}
+		want = append(want, key)
+	}
+
+	var got []string
+	var pages []int
+	err := b.ListPages(ctx, PacksRoot, 2, func(page []ListedObject) error {
+		pages = append(pages, len(page))
+		for _, o := range page {
+			got = append(got, o.Key)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("ListPages: %v", err)
+	}
+	if len(pages) != 3 || pages[0] != 2 || pages[1] != 2 || pages[2] != 1 {
+		t.Fatalf("page sizes = %v, want [2 2 1]", pages)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("keys = %v, want lexicographic %v", got, want)
+		}
+	}
+
+	sentinel := errors.New("stop")
+	calls := 0
+	err = b.ListPages(ctx, PacksRoot, 2, func([]ListedObject) error {
+		calls++
+		return sentinel
+	})
+	if !errors.Is(err, sentinel) || calls != 1 {
+		t.Fatalf("fn error must abort the scan: err=%v calls=%d", err, calls)
+	}
+}

@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Environment variable names, canonical first; envFirst scans left to right.
@@ -30,7 +31,28 @@ const (
 	envRateRPS    = "CODESTORAGE_RATE_RPS"
 	envRateBurst  = "CODESTORAGE_RATE_BURST"
 
+	// Orphan-pack sweep (issue #5): interval between sweeps ("0" disables
+	// sweeping), minimum blob age before an unregistered pack counts as an
+	// orphan, and the explicit opt-in for actually deleting candidates
+	// (list-only by default).
+	//
+	// Upgrade ordering for delete mode: enable it only once EVERY node
+	// (serve replicas AND hook-running git nodes) runs a build with the
+	// post-registration publish verify (blob.EnsurePublished). A mixed
+	// fleet cannot lose data — quarantine plus the heal pass restore any
+	// mis-reaped registered pack — but an old writer racing a delete-mode
+	// sweep can see its freshly registered pack unavailable until the next
+	// sweep heals it. List-only mode is safe on any fleet.
+	envSweepInterval      = "CODESTORAGE_SWEEP_INTERVAL"
+	envSweepAgeThreshold  = "CODESTORAGE_SWEEP_AGE_THRESHOLD"
+	envSweepDeleteEnabled = "CODESTORAGE_SWEEP_DELETE_ENABLED"
+
 	defaultListen = "127.0.0.1:0"
+)
+
+const (
+	defaultSweepInterval     = time.Hour
+	defaultSweepAgeThreshold = 24 * time.Hour
 )
 
 // envFirst returns the first non-empty value among names. getenv is injected
@@ -74,6 +96,16 @@ type serveConfig struct {
 	// (docs/03 gateway-level 429). Both zero means disabled.
 	rateRPS   float64
 	rateBurst int
+
+	// sweep configures the periodic orphan-pack sweep (issue #5).
+	sweep sweepSettings
+}
+
+// sweepSettings is the resolved orphan-pack sweep configuration.
+type sweepSettings struct {
+	interval      time.Duration // 0 = sweeping disabled
+	ageThreshold  time.Duration // > 0
+	deleteEnabled bool          // false = list-only (the default)
 }
 
 // storageURLs is the resolved storage location set shared by every
@@ -170,6 +202,10 @@ func resolveServeConfig(getenv func(string) string, flagListen, flagAddr, flagCa
 	if err != nil {
 		return serveConfig{}, err
 	}
+	cfg.sweep, err = resolveSweepSettings(getenv)
+	if err != nil {
+		return serveConfig{}, err
+	}
 	assertf(cfg.dbURL != "" && cfg.blobURL != "" && cfg.cacheDir != "", "resolveServeConfig: unresolved slot in %+v", cfg)
 	assertf(cfg.dataDir == "" || filepath.IsAbs(cfg.dataDir), "resolveServeConfig: dataDir %q not absolute", cfg.dataDir)
 	return cfg, nil
@@ -218,6 +254,43 @@ func resolveRateLimit(getenv func(string) string) (float64, int, error) {
 		return 0, 0, fmt.Errorf("%s must be set (>= 1) when %s is set", envRateBurst, envRateRPS)
 	}
 	return rps, burst, nil
+}
+
+// resolveSweepSettings parses the orphan-pack sweep env vars. Fail-fast
+// semantics matching resolveRateLimit: malformed or negative values error
+// naming the env var. Defaults: sweep hourly, 24h age threshold, list-only.
+// CODESTORAGE_SWEEP_INTERVAL=0 disables sweeping entirely.
+func resolveSweepSettings(getenv func(string) string) (sweepSettings, error) {
+	assertf(getenv != nil, "resolveSweepSettings: nil getenv")
+	s := sweepSettings{interval: defaultSweepInterval, ageThreshold: defaultSweepAgeThreshold}
+	if raw := getenv(envSweepInterval); raw != "" {
+		d, err := time.ParseDuration(raw)
+		if err != nil {
+			return sweepSettings{}, fmt.Errorf("%s: %w", envSweepInterval, err)
+		}
+		if d < 0 {
+			return sweepSettings{}, fmt.Errorf("%s must be non-negative (0 disables sweeping), got %q", envSweepInterval, raw)
+		}
+		s.interval = d
+	}
+	if raw := getenv(envSweepAgeThreshold); raw != "" {
+		d, err := time.ParseDuration(raw)
+		if err != nil {
+			return sweepSettings{}, fmt.Errorf("%s: %w", envSweepAgeThreshold, err)
+		}
+		if d <= 0 {
+			return sweepSettings{}, fmt.Errorf("%s must be positive, got %q", envSweepAgeThreshold, raw)
+		}
+		s.ageThreshold = d
+	}
+	if raw := getenv(envSweepDeleteEnabled); raw != "" {
+		v, err := strconv.ParseBool(raw)
+		if err != nil {
+			return sweepSettings{}, fmt.Errorf("%s: %w", envSweepDeleteEnabled, err)
+		}
+		s.deleteEnabled = v
+	}
+	return s, nil
 }
 
 // normalizeBaseURL validates an externally reachable http(s) base URL and
