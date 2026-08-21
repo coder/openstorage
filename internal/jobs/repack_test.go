@@ -157,9 +157,24 @@ func (f *repackFixture) pushEmptyPack(t *testing.T) string {
 
 // repacker builds a production Repacker over the fixture's stores and cache.
 func (f *repackFixture) repacker(cacheDir string) *Repacker {
-	return NewRepacker(f.store, f.blobs, func(ctx context.Context, repo string) (string, error, error) {
-		return githttp.Hydrate(ctx, f.store, f.blobs, cacheDir, repo, "main")
-	}, slog.New(slog.DiscardHandler))
+	return NewRepacker(f.store, f.blobs, fixtureMaterialize(f.blobs, cacheDir), slog.New(slog.DiscardHandler))
+}
+
+// fixtureMaterialize composes the production materialize seam over the
+// fixture's blob store and a cache dir.
+func fixtureMaterialize(bl blob.BlobStore, cacheDir string) MaterializeFunc {
+	return func(ctx context.Context, repo string, packs []ref.Pack) (string, error) {
+		repoPath, err := githttp.EnsureCacheRepo(cacheDir, repo)
+		if err != nil {
+			return "", err
+		}
+		for _, p := range packs {
+			if err := githttp.MaterializePack(ctx, bl, repoPath, p); err != nil {
+				return "", err
+			}
+		}
+		return repoPath, nil
+	}
 }
 
 func (f *repackFixture) packRows(t *testing.T) []ref.Pack {
@@ -356,9 +371,7 @@ func TestRepack_AmbiguousSwapKeepsBlob(t *testing.T) {
 		f.push(t)
 	}
 
-	r := NewRepacker(ambiguousReplaceStore{f.store}, f.blobs, func(ctx context.Context, repo string) (string, error, error) {
-		return githttp.Hydrate(ctx, f.store, f.blobs, f.cacheDir, repo, "main")
-	}, slog.New(slog.DiscardHandler))
+	r := NewRepacker(ambiguousReplaceStore{f.store}, f.blobs, fixtureMaterialize(f.blobs, f.cacheDir), slog.New(slog.DiscardHandler))
 	_, err := r.Repack(ctx, f.repo)
 	if !errors.Is(err, errAmbiguousReplace) {
 		t.Fatalf("repack error = %v, want the injected ambiguous drop", err)
@@ -504,9 +517,7 @@ func TestRepack_StaleSnapshotLosesCleanlyBeforePacking(t *testing.T) {
 		t.Fatalf("list blobs: %v", err)
 	}
 
-	loser := NewRepacker(stale, f.blobs, func(ctx context.Context, repo string) (string, error, error) {
-		return githttp.Hydrate(ctx, f.store, f.blobs, t.TempDir(), repo, "main") // cold cache
-	}, slog.New(slog.DiscardHandler))
+	loser := NewRepacker(stale, f.blobs, fixtureMaterialize(f.blobs, t.TempDir()), slog.New(slog.DiscardHandler)) // cold cache
 	if _, err := loser.Repack(ctx, f.repo); err != nil {
 		t.Fatalf("stale-snapshot repack must lose cleanly, got %v", err)
 	}
@@ -635,9 +646,7 @@ func TestRepack_LostIdenticalFoldKeepsLiveKey(t *testing.T) {
 	// union, same deterministic pack id, same blob key as the LIVE row —
 	// and its registration read (shim) says "unregistered", the worst case.
 	shim := &lostFoldShim{RefStore: f.store, stale: stale}
-	loser := NewRepacker(shim, f.blobs, func(ctx context.Context, repo string) (string, error, error) {
-		return githttp.Hydrate(ctx, f.store, f.blobs, warmDir, repo, "main")
-	}, slog.New(slog.DiscardHandler))
+	loser := NewRepacker(shim, f.blobs, fixtureMaterialize(f.blobs, warmDir), slog.New(slog.DiscardHandler))
 	if _, err := loser.Repack(ctx, f.repo); err != nil {
 		t.Fatalf("loser repack: %v", err)
 	}
@@ -691,6 +700,127 @@ func TestRepack_RepublishesBlobSweptMidSwap(t *testing.T) {
 		t.Fatalf("consolidated blob %s not re-published after mid-swap sweep", rows[0].Key)
 	}
 	f.checkColdHydrate(t)
+}
+
+// statOutageStore delegates until armed, then fails every Stat — the shape
+// of a blob-store outage hitting exactly the post-swap verification.
+type statOutageStore struct {
+	blob.BlobStore
+	mu     stdsync.Mutex
+	broken bool
+}
+
+func (s *statOutageStore) arm() { s.mu.Lock(); s.broken = true; s.mu.Unlock() }
+
+func (s *statOutageStore) Stat(ctx context.Context, key string) (int64, error) {
+	s.mu.Lock()
+	broken := s.broken
+	s.mu.Unlock()
+	if broken {
+		return 0, errors.New("injected stat outage")
+	}
+	return s.BlobStore.Stat(ctx, key)
+}
+
+// TestRepack_CommittedFoldReportsFoldedOnVerifyError pins the round-5
+// follow-up contract: when ReplacePacks commits but the post-swap
+// verification fails transiently, Repack must report folded=true alongside
+// the error — queue backends key their follow-up scheduling on it, and a
+// false report would strand mid-fold registrations whose triggers were
+// coalesced.
+func TestRepack_CommittedFoldReportsFoldedOnVerifyError(t *testing.T) {
+	f := newRepackFixture(t)
+	ctx := context.Background()
+	for range 3 {
+		f.push(t)
+	}
+
+	outage := &statOutageStore{BlobStore: f.blobs}
+	r := NewRepacker(f.store, outage, fixtureMaterialize(f.blobs, t.TempDir()), slog.New(slog.DiscardHandler))
+	r.BeforeSwap = func(context.Context, ref.Pack) error {
+		outage.arm() // the verify leg's Stat will fail; the swap still commits
+		return nil
+	}
+	folded, err := r.Repack(ctx, f.repo)
+	if !folded {
+		t.Fatalf("Repack = (folded %v, err %v): committed fold must report folded=true", folded, err)
+	}
+	if err == nil {
+		t.Fatal("Repack must surface the verification failure")
+	}
+	if rows := f.packRows(t); len(rows) != 1 {
+		t.Fatalf("pack rows = %+v, want the committed fold", rows)
+	}
+	// The blob itself is fine (only the verification read was injected).
+	f.checkColdHydrate(t)
+}
+
+// TestRepack_ColdWorkerDownloadsOnlyBudgetedPacks pins the round-5
+// select-before-materialize ordering: a cold worker must download only the
+// byte-budget-selected packs, never the whole repository.
+func TestRepack_ColdWorkerDownloadsOnlyBudgetedPacks(t *testing.T) {
+	f := newRepackFixture(t)
+	ctx := context.Background()
+	for range 4 {
+		f.push(t)
+	}
+	rows := f.packRows(t)
+	if len(rows) != 4 {
+		t.Fatalf("pack rows = %d, want 4", len(rows))
+	}
+
+	// Budget fits exactly the two oldest packs (fixture pushes produce
+	// near-identical sizes; 2x the first pack's size + slack < 3 packs).
+	var first int64
+	objs, err := f.blobs.List(ctx, blob.PackPrefix(f.repo))
+	if err != nil {
+		t.Fatalf("list blobs: %v", err)
+	}
+	for _, o := range objs {
+		if o.Key == rows[0].Key {
+			first = o.Size
+		}
+	}
+	if first == 0 {
+		t.Fatalf("first pack blob %s not found", rows[0].Key)
+	}
+
+	coldDir := t.TempDir()
+	counting := &countingDownloadStore{BlobStore: f.blobs}
+	r := NewRepacker(f.store, f.blobs, fixtureMaterialize(counting, coldDir), slog.New(slog.DiscardHandler))
+	r.MaxFoldBytes = first*2 + first/2
+	folded, err := r.Repack(ctx, f.repo)
+	if err != nil || !folded {
+		t.Fatalf("budgeted cold repack = (folded %v, err %v), want a fold", folded, err)
+	}
+	if got := counting.count(); got != 2 {
+		t.Fatalf("cold worker downloaded %d packs, want exactly the 2 byte-budgeted candidates", got)
+	}
+	if after := f.packRows(t); len(after) != 3 {
+		t.Fatalf("pack rows after budgeted fold = %+v, want 3 (fold + 2 leftovers)", after)
+	}
+	f.checkColdHydrate(t)
+}
+
+// countingDownloadStore counts DownloadFile calls (the materialization
+// seam's only download path).
+type countingDownloadStore struct {
+	blob.BlobStore
+	mu stdsync.Mutex
+	n  int
+}
+
+func (s *countingDownloadStore) DownloadFile(ctx context.Context, key, dest string) error {
+	s.mu.Lock()
+	s.n++
+	s.mu.Unlock()
+	return s.BlobStore.DownloadFile(ctx, key, dest)
+}
+
+func (s *countingDownloadStore) count() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.n
 }
 
 // TestRepack_RuntimeBudgetBoundsFold pins the security-round runtime

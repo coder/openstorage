@@ -48,7 +48,15 @@ func RepoPath(cacheDir, repo string) string {
 // separately and surfaced in the error text: git warnings on stderr must
 // never contaminate parsed stdout (e.g. for-each-ref in SyncRefs).
 func runGit(dir string, args ...string) (string, error) {
-	cmd := exec.Command("git", args...)
+	return runGitCtx(context.Background(), dir, args...)
+}
+
+// runGitCtx is runGit with cancellation: the subprocess is killed when ctx
+// expires. Pack materialization runs under callers' deadlines (the repack
+// fold's wall-clock budget, request contexts), and index-pack over a large
+// pack must not outlive them.
+func runGitCtx(ctx context.Context, dir string, args ...string) (string, error) {
+	cmd := exec.CommandContext(ctx, "git", args...)
 	if dir != "" {
 		cmd.Dir = dir
 	}
@@ -209,9 +217,12 @@ func HydratePacks(ctx context.Context, st ref.RefStore, bl blob.BlobStore, repoP
 
 // hydrateOnePack materializes one registered pack (pack + idx) at base under
 // an exclusive flock on <base>.pack.lock. The lock file is left in place:
-// removing it would race a concurrent locker onto a deleted inode.
+// removing it would race a concurrent locker onto a deleted inode. Both the
+// lock wait and the index-pack subprocess honor ctx: hydration runs under
+// request contexts and the repack fold's wall-clock budget, and neither a
+// peer's slow download nor indexing a large pack may outlive them.
 func hydrateOnePack(ctx context.Context, bl blob.BlobStore, repoPath, base string, p ref.Pack) error {
-	unlock, err := flockExclusive(base + ".pack.lock")
+	unlock, err := flockExclusiveCtx(ctx, base+".pack.lock")
 	if err != nil {
 		return fmt.Errorf("lock pack %s: %w", p.ID, err)
 	}
@@ -242,7 +253,7 @@ func hydrateOnePack(ctx context.Context, bl blob.BlobStore, repoPath, base strin
 	if err := bl.DownloadFile(ctx, p.Key, tmpPack); err != nil {
 		return err
 	}
-	if out, err := runGit(repoPath, "index-pack", tmpPack); err != nil {
+	if out, err := runGitCtx(ctx, repoPath, "index-pack", tmpPack); err != nil {
 		// Corrupt/partial download: the deferred cleanup removes the temp
 		// files, so a retry re-downloads fresh bytes.
 		return fmt.Errorf("index-pack %s: %w (%s)", p.ID, err, strings.TrimSpace(out))
@@ -264,6 +275,28 @@ func hydrateOnePack(ctx context.Context, bl blob.BlobStore, repoPath, base strin
 		return err
 	}
 	return nil
+}
+
+// MaterializePack materializes ONE registered pack into repoPath — the
+// bounded, cancelable alternative to HydratePacks for callers that must
+// not touch any other pack (the issue-#1 repack fold selects its input
+// under byte/object budgets BEFORE downloading; hydrating the whole repo
+// first would defeat them). Safe against concurrent hydrators of the same
+// cache repo: identical per-pack lock, temp naming, and rename ordering. A
+// download hitting blob.ErrNotFound propagates (wrapped, match with
+// errors.Is): for a fold it means a concurrent repack already replaced the
+// snapshotted rows.
+func MaterializePack(ctx context.Context, bl blob.BlobStore, repoPath string, p ref.Pack) error {
+	assertf(p.ID != "" && p.Key != "", "MaterializePack: empty pack id/key %+v", p)
+	packDir := filepath.Join(repoPath, "objects", "pack")
+	if err := os.MkdirAll(packDir, 0o755); err != nil {
+		return err
+	}
+	base := filepath.Join(packDir, "pack-"+p.ID)
+	if _, err := os.Stat(base + ".idx"); err == nil {
+		return nil // already materialized
+	}
+	return hydrateOnePack(ctx, bl, repoPath, base, p)
 }
 
 // flockExclusive takes a blocking exclusive flock on path (creating it if

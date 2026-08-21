@@ -132,17 +132,22 @@ func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL string, orgPEM
 	// store — ReplacePacks is a pack mutation, no ref events to emit — and
 	// the shared blob store and cache dir. Always constructed so durable
 	// jobs queued before a threshold change still run; the post-write
-	// TRIGGER below is what a zero threshold disables. The default branch
-	// is resolved fresh per fold from the base repo's meta row (issue #18;
-	// namespaced keys share the base repo's row); the fold itself packs
-	// idx-enumerated objects and only needs HEAD placement to be valid.
+	// TRIGGER below is what a zero threshold disables. The materialize
+	// seam fetches EXACTLY the budget-selected packs into the shared cache
+	// (never a full hydrate: the fold reads no refs, and materializing
+	// unselected packs would defeat its byte budget on cold workers).
 	repacker := jobs.NewRepacker(refStore, blobStore,
-		func(ctx context.Context, repo string) (string, error, error) {
-			rec, err := meta.ResolveRepoKey(ctx, ms, org, githttp.BaseRepo(repo))
+		func(ctx context.Context, repo string, packs []ref.Pack) (string, error) {
+			repoPath, err := githttp.EnsureCacheRepo(cacheDir, repo)
 			if err != nil {
-				return "", nil, fmt.Errorf("resolve default branch for %s: %w", repo, err)
+				return "", err
 			}
-			return githttp.Hydrate(ctx, refStore, blobStore, cacheDir, repo, rec.DefaultBranch)
+			for _, p := range packs {
+				if err := githttp.MaterializePack(ctx, blobStore, repoPath, p); err != nil {
+					return "", err
+				}
+			}
+			return repoPath, nil
 		}, logger)
 	// Post-fold follow-ups share the trigger threshold: packs registered
 	// while a fold ran survive its snapshot, and the queue backends

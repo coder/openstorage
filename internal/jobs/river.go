@@ -152,11 +152,18 @@ type repackWorker struct {
 // budget no-op a follow-up would no-op forever.
 func (w *repackWorker) Work(ctx context.Context, job *river.Job[repackArgs]) error {
 	folded, err := w.repacker.Repack(ctx, job.Args.Repo)
-	if err != nil {
-		return err
-	}
 	if !folded {
-		return nil
+		return err // real failures and clean no-ops/lost races (err == nil)
+	}
+	if err != nil {
+		// The fold COMMITTED but its post-swap verification failed
+		// transiently: the row swap is durable and the sweeper's
+		// quarantine heal backstops the bytes. Failing this
+		// MaxAttempts-1 job would skip the follow-up check and strand
+		// mid-fold registrations whose triggers were coalesced — log and
+		// continue to completion + follow-up.
+		w.repacker.logger.Warn("repack: fold committed but verification failed (sweeper heal is the backstop)",
+			"repo", job.Args.Repo, "err", err)
 	}
 	assertf(w.pool != nil, "repackWorker: pool not wired")
 	// Transactional self-completion. Failures roll back and fall through
