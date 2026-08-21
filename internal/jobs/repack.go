@@ -47,6 +47,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"codestorage/internal/blob"
 	"codestorage/internal/ref"
@@ -172,18 +173,26 @@ func (r *Repacker) Repack(ctx context.Context, repo string) error {
 	if err != nil {
 		// Ambiguous by construction (the transaction may have committed
 		// with the response lost), so the uploaded blob must NOT be
-		// deleted here: if the swap landed, rows reference it; if not, it
-		// ages into the sweeper's orphan diff like any crashed publish.
-		return fmt.Errorf("repack %s: replace packs: %w", repo, err)
+		// deleted here — and, like every registration path, the possibly
+		// committed row must be verified against the sweeper race below:
+		// a committed row must never point at missing bytes.
+		verr := verifyPublished(ctx, r.blobs, newPack.Key, packPath)
+		return errors.Join(fmt.Errorf("repack %s: replace packs: %w", repo, err), verr)
 	}
 	if !won {
 		// Cleanly lost fold: delete our own orphan — unless an identical
 		// pack id is registered (identity fold or a concurrent identical
-		// fold won), in which case the blob is live and must stay.
-		if has, herr := r.store.HasPack(ctx, repo, newPack.Key); herr != nil {
+		// fold won), in which case the blob is LIVE: keep it and verify
+		// its publication like the won path below.
+		switch has, herr := r.store.HasPack(ctx, repo, newPack.Key); {
+		case herr != nil:
 			r.logger.Warn("repack: lost fold; skipping blob cleanup (HasPack failed, sweeper will collect)",
 				"repo", repo, "key", newPack.Key, "err", herr)
-		} else if !has {
+		case has:
+			if verr := verifyPublished(ctx, r.blobs, newPack.Key, packPath); verr != nil {
+				return fmt.Errorf("repack %s: lost fold: %w", repo, verr)
+			}
+		default:
 			if derr := r.blobs.Delete(ctx, newPack.Key); derr != nil && !errors.Is(derr, blob.ErrNotFound) {
 				r.logger.Warn("repack: lost fold; blob cleanup failed (sweeper will collect)",
 					"repo", repo, "key", newPack.Key, "err", derr)
@@ -192,7 +201,26 @@ func (r *Repacker) Repack(ctx context.Context, repo string) error {
 		r.logger.Info("repack: lost fold-install race", "repo", repo, "folded", len(old))
 		return nil
 	}
+	// Writer half of the orphan-sweep coordination (issue #5), exactly like
+	// the paths that follow RegisterPacks: a delete-enabled sweeper may
+	// have reaped this content-addressed key between the upload above and
+	// the swap commit (an identical aged orphan from an earlier crashed
+	// fold makes the key look old), with its post-delete registration
+	// recheck racing the transaction. Re-verify — and re-upload from the
+	// local pack file if needed — now that the row is committed.
+	if verr := verifyPublished(ctx, r.blobs, newPack.Key, packPath); verr != nil {
+		return fmt.Errorf("repack %s: %w", repo, verr)
+	}
 	r.logger.Info("repack: folded packs", "repo", repo, "folded", len(old), "pack", id)
+	return nil
+}
+
+// verifyPublished re-checks (and if needed restores) the consolidated
+// pack's blob after a swap that may have committed a row referencing it.
+func verifyPublished(ctx context.Context, bl blob.BlobStore, key, packPath string) error {
+	if err := blob.EnsurePublished(ctx, bl, key, packPath); err != nil {
+		return fmt.Errorf("verify %s: %w", key, err)
+	}
 	return nil
 }
 
@@ -207,7 +235,15 @@ type RepackTrigger struct {
 	threshold int
 	enqueue   func(ctx context.Context, repo string) error
 	logger    *slog.Logger
+	timeout   time.Duration // bounds one MaybeEnqueue run (tests may lower)
 }
+
+// repackTriggerTimeout bounds one trigger check. Callers detach the trigger
+// from request cancellation (the enqueue must survive the client hanging up
+// right after its write), so this bound is what keeps a stalled store from
+// pinning a write handler — the check is one pack-count read plus at most
+// one job insert, normally milliseconds.
+const repackTriggerTimeout = 10 * time.Second
 
 // NewRepackTrigger builds the trigger. threshold is the registered-pack
 // count at which a fold is scheduled; enqueue is normally the jobs queue's
@@ -217,18 +253,24 @@ func NewRepackTrigger(store ref.RefStore, threshold int, enqueue func(ctx contex
 	assertf(threshold >= 2, "NewRepackTrigger: threshold %d below 2 (folding fewer than two packs is a no-op)", threshold)
 	assertf(enqueue != nil, "NewRepackTrigger: nil enqueue")
 	assertf(logger != nil, "NewRepackTrigger: nil logger")
-	return &RepackTrigger{store: store, threshold: threshold, enqueue: enqueue, logger: logger}
+	return &RepackTrigger{store: store, threshold: threshold, enqueue: enqueue, logger: logger, timeout: repackTriggerTimeout}
 }
 
 // MaybeEnqueue schedules one repack when repo's registered pack count
 // reached the threshold. Failures are logged, never propagated: the write
 // that prompted the check already succeeded, and the count only keeps
 // growing until a fold lands, so the next write retries the trigger.
-// (ListPacks materializes the row set — acceptable here because the trigger
-// is what keeps that set near one row in steady state, and the full-hydrate
-// path already lists it on every cache rebuild.)
+// Execution is time-bounded regardless of the caller's context — the
+// trigger runs synchronously inside write handlers (before the ref CAS in
+// the API commit pipeline) on a cancel-detached context, and a stalled
+// store must not pin them. (ListPacks materializes the row set —
+// acceptable here because the trigger is what keeps that set near one row
+// in steady state, and the full-hydrate path already lists it on every
+// cache rebuild.)
 func (t *RepackTrigger) MaybeEnqueue(ctx context.Context, repo string) {
 	assertf(repo != "", "MaybeEnqueue: empty repo")
+	ctx, cancel := context.WithTimeout(ctx, t.timeout)
+	defer cancel()
 	packs, err := t.store.ListPacks(ctx, repo)
 	if err != nil {
 		t.logger.Warn("repack trigger: list packs failed", "repo", repo, "err", err)

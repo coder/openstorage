@@ -504,6 +504,87 @@ func TestRepack_StaleSnapshotLosesCleanlyBeforePacking(t *testing.T) {
 	}
 }
 
+// TestRepack_RepublishesBlobSweptMidSwap pins the issue-#5 writer half on
+// the repack path: a delete-enabled sweeper reaping the freshly uploaded
+// consolidated blob between upload and swap commit (its content-addressed
+// key can look aged when an earlier crashed fold left an identical orphan)
+// must be healed by the post-swap EnsurePublished re-upload.
+func TestRepack_RepublishesBlobSweptMidSwap(t *testing.T) {
+	f := newRepackFixture(t)
+	ctx := context.Background()
+	for range 3 {
+		f.push(t)
+	}
+	before, err := f.blobs.List(ctx, blob.PackPrefix(f.repo))
+	if err != nil {
+		t.Fatalf("list blobs: %v", err)
+	}
+	beforeKeys := make(map[string]bool, len(before))
+	for _, o := range before {
+		beforeKeys[o.Key] = true
+	}
+
+	r := f.repacker(t.TempDir())
+	r.BeforeSwap = func(ctx context.Context) error {
+		// Simulate the sweeper reaping the just-uploaded consolidated
+		// blob (the only key not in the pre-fold listing) right before
+		// the swap commits.
+		objs, err := f.blobs.List(ctx, blob.PackPrefix(f.repo))
+		if err != nil {
+			return err
+		}
+		for _, o := range objs {
+			if !beforeKeys[o.Key] {
+				return f.blobs.Delete(ctx, o.Key)
+			}
+		}
+		return errors.New("consolidated blob not uploaded before swap")
+	}
+	if err := r.Repack(ctx, f.repo); err != nil {
+		t.Fatalf("repack: %v", err)
+	}
+
+	rows := f.packRows(t)
+	if len(rows) != 1 {
+		t.Fatalf("pack rows = %+v, want the fold", rows)
+	}
+	if !f.blobExists(t, rows[0].Key) {
+		t.Fatalf("consolidated blob %s not re-published after mid-swap sweep", rows[0].Key)
+	}
+	f.checkColdHydrate(t)
+}
+
+// TestRepackTrigger_BoundedExecution pins the P2 contract: MaybeEnqueue is
+// time-bounded regardless of the caller's context, so a stalled store
+// cannot pin the write handler that invoked the trigger.
+func TestRepackTrigger_BoundedExecution(t *testing.T) {
+	f := newRepackFixture(t)
+	trigger := NewRepackTrigger(&stallingStore{RefStore: f.store}, 2,
+		func(context.Context, string) error { return nil }, slog.New(slog.DiscardHandler))
+	trigger.timeout = 50 * time.Millisecond
+
+	done := make(chan struct{})
+	go func() {
+		trigger.MaybeEnqueue(context.Background(), f.repo)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("MaybeEnqueue not bounded: still running after 5s against a stalled store")
+	}
+}
+
+// stallingStore blocks ListPacks until the context is canceled.
+type stallingStore struct {
+	ref.RefStore
+}
+
+func (s *stallingStore) ListPacks(ctx context.Context, _ string) ([]ref.Pack, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
 func TestRepackTrigger_Threshold(t *testing.T) {
 	f := newRepackFixture(t)
 	ctx := context.Background()
