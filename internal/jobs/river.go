@@ -88,6 +88,45 @@ func (sweepArgs) InsertOpts() river.InsertOpts {
 	}
 }
 
+// repackArgs is one durable background-repack job, unique per repo across
+// the active states exactly like syncArgs: post-write triggers on every
+// node can fire concurrently, and River coalesces them into one queued
+// fold. MaxAttempts 1 — a lost fold-install race must not retry eagerly
+// (the next insert past the threshold is the retry), and a failed fold is
+// harmless to defer the same way.
+type repackArgs struct {
+	Repo string `json:"repo" river:"unique"`
+}
+
+func (repackArgs) Kind() string { return "repack" }
+
+func (repackArgs) InsertOpts() river.InsertOpts {
+	return river.InsertOpts{
+		MaxAttempts: 1,
+		UniqueOpts: river.UniqueOpts{
+			ByArgs: true,
+			ByState: []rivertype.JobState{
+				rivertype.JobStateAvailable,
+				rivertype.JobStatePending,
+				rivertype.JobStateRetryable,
+				rivertype.JobStateRunning,
+				rivertype.JobStateScheduled,
+			},
+		},
+	}
+}
+
+// repackWorker runs one fold attempt; the Repacker owns race handling and
+// reporting.
+type repackWorker struct {
+	river.WorkerDefaults[repackArgs]
+	repacker *Repacker
+}
+
+func (w *repackWorker) Work(ctx context.Context, job *river.Job[repackArgs]) error {
+	return w.repacker.Repack(ctx, job.Args.Repo)
+}
+
 // sweepWorker runs one orphan-pack sweep; the Sweeper owns all reporting.
 type sweepWorker struct {
 	river.WorkerDefaults[sweepArgs]
@@ -141,9 +180,10 @@ func (w *syncWorker) Work(ctx context.Context, job *river.Job[syncArgs]) error {
 // insert-only clients against the same database, which is how git-surface
 // events reach the server's workers across process boundaries.
 type River struct {
-	client  *river.Client[pgx.Tx]
-	pool    *pgxpool.Pool
-	started bool
+	client        *river.Client[pgx.Tx]
+	pool          *pgxpool.Pool
+	started       bool
+	repackEnabled bool
 }
 
 var _ Queue = (*River)(nil)
@@ -153,7 +193,10 @@ var _ Queue = (*River)(nil)
 // share the delivery/sync code with the local queue. A non-nil sweep
 // schedules the periodic orphan-pack sweep (run once on start, then every
 // Interval); nil disables it (hook subprocesses, tests without storage).
-func NewRiver(ctx context.Context, pgURL string, deliverer *events.Deliverer, runSync SyncRunner, sweep *SweepSchedule, logger *slog.Logger) (*River, error) {
+// A non-nil repack registers the background-repack worker; nil rejects
+// EnqueueRepack (repacking disabled or not wired, e.g. insert-only hook
+// clients that must never fold).
+func NewRiver(ctx context.Context, pgURL string, deliverer *events.Deliverer, runSync SyncRunner, sweep *SweepSchedule, repack *Repacker, logger *slog.Logger) (*River, error) {
 	assertf(deliverer != nil, "NewRiver: nil deliverer")
 	assertf(runSync != nil, "NewRiver: nil sync runner")
 	assertf(sweep == nil || (sweep.Sweeper != nil && sweep.Interval > 0),
@@ -208,6 +251,9 @@ func NewRiver(ctx context.Context, pgURL string, deliverer *events.Deliverer, ru
 	workers := river.NewWorkers()
 	river.AddWorker(workers, &deliveryWorker{deliverer: deliverer})
 	river.AddWorker(workers, &syncWorker{run: runSync, logger: logger})
+	if repack != nil {
+		river.AddWorker(workers, &repackWorker{repacker: repack})
+	}
 	var periodic []*river.PeriodicJob
 	if sweep != nil {
 		river.AddWorker(workers, &sweepWorker{sweeper: sweep.Sweeper})
@@ -235,7 +281,7 @@ func NewRiver(ctx context.Context, pgURL string, deliverer *events.Deliverer, ru
 		pool.Close()
 		return nil, fmt.Errorf("jobs: start river client: %w", err)
 	}
-	return &River{client: client, pool: pool, started: true}, nil
+	return &River{client: client, pool: pool, started: true, repackEnabled: repack != nil}, nil
 }
 
 // NewRiverInsertOnly connects an insert-only client (no migrations — hooks
@@ -266,6 +312,18 @@ func (q *River) EnqueueWebhookDelivery(ctx context.Context, d events.Delivery) e
 
 func (q *River) EnqueueSync(ctx context.Context, job sync.Job) error {
 	_, err := q.client.Insert(ctx, syncArgs{Org: job.Org, RepoID: job.RepoID, Ref: job.Ref}, nil)
+	return err
+}
+
+// EnqueueRepack inserts one unique-by-repo repack job. Refused when this
+// client has no repack worker registered: a durable job nobody works would
+// sit queued forever AND its uniqueness would swallow every later insert.
+func (q *River) EnqueueRepack(ctx context.Context, repo string) error {
+	assertf(repo != "", "EnqueueRepack: empty repo")
+	if !q.repackEnabled {
+		return errors.New("jobs: repack worker not registered on this queue")
+	}
+	_, err := q.client.Insert(ctx, repackArgs{Repo: repo}, nil)
 	return err
 }
 

@@ -1125,6 +1125,63 @@ func TestLocalMode_PacksOnDiskAndStatelessCache(t *testing.T) {
 	}
 }
 
+// --- issue #1: insert-triggered background repack ----------------------------
+
+// TestRepack_PushesFoldToOnePack drives the full trigger→job→fold pipeline
+// through the real binary on both backend lanes: pushes past the threshold
+// make the background repack consolidate the registered rows down to ONE
+// pack, superseded blobs linger for the sweeper, and a cold node clones the
+// byte-identical repo from the consolidated pack alone.
+func TestRepack_PushesFoldToOnePack(t *testing.T) {
+	node := startNodeT(t, "CODESTORAGE_REPACK_THRESHOLD=3")
+	repo := registerRepo(t, "t-repack")
+	work := initWorkRepo(t)
+	token := mintTestToken(t, repo, "git:read,git:write", "")
+
+	mustGit(t, work, "push", remoteURL(node, repo, token), "HEAD:refs/heads/main")
+	for i := range 4 {
+		writeFile(t, work, "f.txt", fmt.Sprintf("rev %d\n", i))
+		mustGit(t, work, "add", ".")
+		mustGit(t, work, "commit", "-m", fmt.Sprintf("rev %d", i))
+		mustGit(t, work, "push", remoteURL(node, repo, token), "HEAD:refs/heads/main")
+	}
+	head := revParse(t, work, "HEAD")
+
+	// Five pushes at threshold 3: the async fold must land and win.
+	deadline := time.Now().Add(60 * time.Second)
+	for len(pgPacks(t, repo)) != 1 {
+		if time.Now().After(deadline) {
+			t.Fatalf("pack rows never folded to 1: %+v", pgPacks(t, repo))
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	packs := pgPacks(t, repo)
+	objs := minioPacks(t, repo)
+	if len(objs) <= 1 {
+		t.Fatalf("superseded pack blobs were deleted synchronously: %v", objs)
+	}
+	foundFold := false
+	for _, o := range objs {
+		if o.Key == packs[0].Key {
+			foundFold = true
+		}
+	}
+	if !foundFold {
+		t.Fatalf("consolidated pack row %s has no blob among %v", packs[0].Key, objs)
+	}
+
+	// Cold node: clone must reproduce the exact history from the fold.
+	nodeB := startNodeT(t)
+	cloneDir := filepath.Join(t.TempDir(), "clone")
+	mustGit(t, "", "clone", remoteURL(nodeB, repo, token), cloneDir)
+	if got := revParse(t, cloneDir, "HEAD"); got != head {
+		t.Fatalf("clone HEAD after fold = %q, want %q", got, head)
+	}
+	if out, err := tryGit(cloneDir, "fsck", "--strict"); err != nil {
+		t.Fatalf("git fsck: %v\n%s", err, out)
+	}
+}
+
 // --- repo-key-split regression (ADR-21) --------------------------------------
 
 // TestRepoKeySplit_CrossSurface pins the p3 gate blocker fix end-to-end:

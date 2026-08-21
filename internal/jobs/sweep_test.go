@@ -990,7 +990,7 @@ func TestRiverSweepPeriodic(t *testing.T) {
 	deliverer := &events.Deliverer{Webhooks: stubWebhooks{}, Logger: slog.New(slog.DiscardHandler)}
 	sweeper := NewSweeper(blobs, store, SweepConfig{Threshold: 24 * time.Hour, Delete: true}, slog.New(slog.DiscardHandler))
 	q, err := NewRiver(ctx, pgURL, deliverer, func(context.Context, sync.Job) error { return nil },
-		&SweepSchedule{Sweeper: sweeper, Interval: time.Minute}, slog.New(slog.DiscardHandler))
+		&SweepSchedule{Sweeper: sweeper, Interval: time.Minute}, nil, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatalf("NewRiver: %v", err)
 	}

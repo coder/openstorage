@@ -766,6 +766,7 @@ func (s *server) wcPublish(ctx context.Context, sc *wcScratch, repoID string, pl
 	if regErr != nil {
 		return 0, false, regErr
 	}
+	s.triggerRepack(ctx, repoID) // post-RegisterPacks threshold check (issue #1)
 	won, err = s.refStore.CASRef(ctx, repoID, plan.refName, plan.oldSHA, newSHA)
 	if err != nil {
 		return 0, false, fmt.Errorf("cas %s: %w", plan.refName, err)

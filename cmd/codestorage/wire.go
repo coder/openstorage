@@ -24,6 +24,7 @@ import (
 	"codestorage/internal/api"
 	"codestorage/internal/auth"
 	"codestorage/internal/blob"
+	"codestorage/internal/githttp"
 	"codestorage/internal/jobs"
 	"codestorage/internal/meta"
 	"codestorage/internal/ref"
@@ -38,16 +39,16 @@ import (
 // mux.Handle("/api/", h). refStore/blobStore/cacheDir back the
 // git:read endpoints — serve passes the same instances the githttp fallback
 // uses so both surfaces share one cache.
-func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL string, orgPEMBlocks []string, refStore ref.RefStore, blobStore blob.BlobStore, cacheDir string, rate api.RateLimitConfig, sweep sweepSettings) (http.Handler, meta.Store, auth.Verifier, func(), error) {
+func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL string, orgPEMBlocks []string, refStore ref.RefStore, blobStore blob.BlobStore, cacheDir string, rate api.RateLimitConfig, sweep sweepSettings, repackThreshold int) (http.Handler, meta.Store, auth.Verifier, func(ctx context.Context, repo string), func(), error) {
 	assertf(dbURL != "" && org != "" && httpBaseURL != "" && len(orgPEMBlocks) > 0, "buildAPIHandler: missing dbURL/org/httpBaseURL/keys")
 	assertf(refStore != nil && blobStore != nil && cacheDir != "", "buildAPIHandler: missing refStore/blobStore/cacheDir")
 	ms, msCleanup, err := openMetaStore(ctx, dbURL)
 	if err != nil {
-		return nil, nil, nil, nil, err
+		return nil, nil, nil, nil, nil, err
 	}
-	fail := func(err error) (http.Handler, meta.Store, auth.Verifier, func(), error) {
+	fail := func(err error) (http.Handler, meta.Store, auth.Verifier, func(ctx context.Context, repo string), func(), error) {
 		msCleanup()
-		return nil, nil, nil, nil, err
+		return nil, nil, nil, nil, nil, err
 	}
 
 	// Loopback sync-push key (docs/07 p5): per-process keypair whose public
@@ -127,9 +128,27 @@ func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL string, orgPEM
 		return fail(fmt.Errorf("startup quarantine heal (sweeping disabled): %w", err))
 	}
 
-	queue, decorate, queueCleanup, err := buildServeEventing(ctx, ms, dbURL, org, httpBaseURL, key, schedule, logger)
+	// Background repack (issue #1): the worker folds over the RAW ref
+	// store — ReplacePacks is a pack mutation, no ref events to emit — and
+	// the shared blob store and cache dir. Always constructed so durable
+	// jobs queued before a threshold change still run; the post-write
+	// TRIGGER below is what a zero threshold disables.
+	repacker := jobs.NewRepacker(refStore, blobStore,
+		func(ctx context.Context, repo string) (string, error, error) {
+			return githttp.Hydrate(ctx, refStore, blobStore, cacheDir, repo)
+		}, logger)
+
+	queue, decorate, queueCleanup, err := buildServeEventing(ctx, ms, dbURL, org, httpBaseURL, key, schedule, repacker, logger)
 	if err != nil {
 		return fail(err)
+	}
+
+	// maybeRepack is handed to both write surfaces (API handlers here, the
+	// git receive path via cmdServe): after a write that registered packs,
+	// check the threshold and enqueue the unique-by-repo fold job.
+	var maybeRepack func(ctx context.Context, repo string)
+	if repackThreshold > 0 {
+		maybeRepack = jobs.NewRepackTrigger(refStore, repackThreshold, queue.EnqueueRepack, logger).MaybeEnqueue
 	}
 
 	h, err := api.New(api.Config{
@@ -141,6 +160,7 @@ func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL string, orgPEM
 		CacheDir:    cacheDir,
 		SyncQueue:   queue,
 		RateLimit:   rate,
+		MaybeRepack: maybeRepack,
 	})
 	if err != nil {
 		queueCleanup() // stop workers before closing their meta store
@@ -150,7 +170,7 @@ func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL string, orgPEM
 		queueCleanup() // stop workers before closing their meta store
 		msCleanup()
 	}
-	return h, ms, verifier, cleanup, nil
+	return h, ms, verifier, maybeRepack, cleanup, nil
 }
 
 // openMetaStore opens the metadata store (URL-scheme dispatch via meta.Open)

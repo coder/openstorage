@@ -926,5 +926,8 @@ func (s *server) wrefPublish(ctx context.Context, repoPath, repoID string, scrat
 	if err := blob.EnsurePublished(ctx, s.blobStore, key, packPath); err != nil {
 		return errors.Join(regErr, fmt.Errorf("verify pack %s: %w", key, err))
 	}
+	if regErr == nil {
+		s.triggerRepack(ctx, repoID) // post-RegisterPacks threshold check (issue #1)
+	}
 	return regErr
 }

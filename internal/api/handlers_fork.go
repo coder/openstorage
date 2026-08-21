@@ -277,6 +277,7 @@ func (s *server) handleForkRepo(w http.ResponseWriter, r *http.Request, verifier
 		s.internalErr(w, r, "register fork pack", regErr)
 		return
 	}
+	s.triggerRepack(ctx, repo.RepoID) // post-RegisterPacks threshold check (issue #1)
 	won, err := s.refStore.CASRef(ctx, repo.RepoID, forkRef, ref.ZeroSHA, forkSHA)
 	if err != nil {
 		s.forkAbandon(ctx, claims.Iss, url)

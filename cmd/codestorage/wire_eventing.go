@@ -125,10 +125,11 @@ func isPGURL(dbURL string) bool {
 // already-opened meta store: the jobs queue (with delivery + sync workers),
 // and the events.RefStore decorator the API's write handlers flow through.
 // A non-nil sweep schedules the periodic orphan-pack sweep on the queue
-// backend (River periodic job on pg, background ticker in local mode).
+// backend (River periodic job on pg, background ticker in local mode); a
+// non-nil repack registers the background-repack worker on both backends.
 // The returned cleanup stops the sweep and the queue (waiting for in-flight
 // local work).
-func buildServeEventing(ctx context.Context, ms meta.Store, dbURL, org, httpBaseURL string, key loopbackKey, sweep *jobs.SweepSchedule, logger *slog.Logger) (jobs.Queue, func(inner ref.RefStore) ref.RefStore, func(), error) {
+func buildServeEventing(ctx context.Context, ms meta.Store, dbURL, org, httpBaseURL string, key loopbackKey, sweep *jobs.SweepSchedule, repack *jobs.Repacker, logger *slog.Logger) (jobs.Queue, func(inner ref.RefStore) ref.RefStore, func(), error) {
 	assertf(ms != nil && dbURL != "" && org != "" && httpBaseURL != "", "buildServeEventing: missing deps")
 	assertf(logger != nil, "buildServeEventing: nil logger")
 
@@ -164,13 +165,13 @@ func buildServeEventing(ctx context.Context, ms meta.Store, dbURL, org, httpBase
 
 	cleanup := func() { queue.Close() }
 	if isPGURL(dbURL) {
-		q, err := jobs.NewRiver(ctx, dbURL, deliverer, worker.Run, sweep, logger)
+		q, err := jobs.NewRiver(ctx, dbURL, deliverer, worker.Run, sweep, repack, logger)
 		if err != nil {
 			return nil, nil, nil, err
 		}
 		queue = q
 	} else {
-		queue = jobs.NewLocal(deliverer, worker.Run, logger)
+		queue = jobs.NewLocal(deliverer, worker.Run, repack, logger)
 		if sweep != nil {
 			stopSweep := jobs.StartSweepTicker(sweep.Sweeper, sweep.Interval)
 			cleanup = func() {
@@ -261,7 +262,7 @@ func wireHookEventing(ctx context.Context, logger *slog.Logger) func() {
 		}
 		local := jobs.NewLocal(deliverer, func(context.Context, upsync.Job) error {
 			panic("local hook queue must never run sync jobs")
-		}, logger)
+		}, nil /* hook subprocesses never fold */, logger)
 		cleanups = append(cleanups, local.Close) // waits for in-flight deliveries
 		enqueueDelivery = local.EnqueueWebhookDelivery
 		enqueueSync = nil // documented local-mode gap (see doc comment)

@@ -49,9 +49,9 @@ func (f *fakeInner) RegisterPacks(context.Context, string, []ref.Pack) error { r
 func (f *fakeInner) ReplacePacks(context.Context, string, []ref.Pack, ref.Pack) (bool, error) {
 	return false, nil
 }
-func (f *fakeInner) ListPacks(context.Context, string) ([]ref.Pack, error)   { return nil, nil }
-func (f *fakeInner) HasPack(context.Context, string, string) (bool, error)   { return false, nil }
-func (f *fakeInner) GetGeneration(context.Context, string) (int64, error)    { return 0, nil }
+func (f *fakeInner) ListPacks(context.Context, string) ([]ref.Pack, error) { return nil, nil }
+func (f *fakeInner) HasPack(context.Context, string, string) (bool, error) { return false, nil }
+func (f *fakeInner) GetGeneration(context.Context, string) (int64, error)  { return 0, nil }
 
 type fakeRepos struct {
 	repo meta.Repo

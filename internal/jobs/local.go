@@ -18,25 +18,31 @@ import (
 type Local struct {
 	deliverer *events.Deliverer
 	syncq     *sync.InProcessQueue
+	repacker  *Repacker // nil: repack disabled on this queue
 	logger    *slog.Logger
 
-	mu     stdsync.Mutex
-	closed bool
-	wg     stdsync.WaitGroup
+	mu        stdsync.Mutex
+	closed    bool
+	repacking map[string]bool // repos with an in-flight repack goroutine
+	wg        stdsync.WaitGroup
 }
 
 var _ Queue = (*Local)(nil)
 
 // NewLocal builds the in-process queue. deliverer must be configured with
-// the webhook lookup; runSync is normally sync.(*Worker).Run.
-func NewLocal(deliverer *events.Deliverer, runSync SyncRunner, logger *slog.Logger) *Local {
+// the webhook lookup; runSync is normally sync.(*Worker).Run. repacker may
+// be nil (repack disabled or not wired, e.g. hook-subprocess queues that
+// must never fold); EnqueueRepack is then refused.
+func NewLocal(deliverer *events.Deliverer, runSync SyncRunner, repacker *Repacker, logger *slog.Logger) *Local {
 	assertf(deliverer != nil, "NewLocal: nil deliverer")
 	assertf(runSync != nil, "NewLocal: nil sync runner")
 	assertf(logger != nil, "NewLocal: nil logger")
 	return &Local{
 		deliverer: deliverer,
 		syncq:     sync.NewInProcessQueue(runSync, logger),
+		repacker:  repacker,
 		logger:    logger,
+		repacking: make(map[string]bool),
 	}
 }
 
@@ -67,6 +73,41 @@ func (q *Local) EnqueueSync(ctx context.Context, job sync.Job) error {
 		return errors.New("jobs queue is closed")
 	}
 	return q.syncq.EnqueueSync(ctx, job)
+}
+
+// EnqueueRepack runs one fold attempt on a background goroutine with a
+// fresh context (it must outlive the HTTP request that triggered it). At
+// most one repack per repo is in flight — a trigger landing while one runs
+// is dropped, mirroring River's unique-by-repo jobs: if the finished fold
+// left the repo above the threshold, the next write re-triggers. Queued
+// work is lost on process restart (the documented local-mode trade-off).
+func (q *Local) EnqueueRepack(_ context.Context, repo string) error {
+	assertf(repo != "", "EnqueueRepack: empty repo")
+	if q.repacker == nil {
+		return errors.New("jobs: repack not configured on this queue")
+	}
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.closed {
+		return errors.New("jobs queue is closed")
+	}
+	if q.repacking[repo] {
+		return nil // one in flight already: coalesce
+	}
+	q.repacking[repo] = true
+	q.wg.Add(1)
+	go func() {
+		defer q.wg.Done()
+		defer func() {
+			q.mu.Lock()
+			delete(q.repacking, repo)
+			q.mu.Unlock()
+		}()
+		if err := q.repacker.Repack(context.Background(), repo); err != nil {
+			q.logger.Warn("repack failed", "repo", repo, "err", err)
+		}
+	}()
+	return nil
 }
 
 // Close stops accepting work and waits for in-flight deliveries and syncs.

@@ -540,3 +540,62 @@ func TestResolveServeConfigSweep(t *testing.T) {
 		}
 	})
 }
+
+func TestResolveServeConfigRepackThreshold(t *testing.T) {
+	base := func(extra map[string]string) func(string) string {
+		env := map[string]string{
+			"CODESTORAGE_PG_URL":      "postgres://x",
+			"CODESTORAGE_S3_URL":      "s3://x",
+			"CODESTORAGE_ORG":         "org1",
+			"CODESTORAGE_ORG_PUBKEYS": "/tmp/org.pub.pem",
+		}
+		for k, v := range extra {
+			env[k] = v
+		}
+		return mapEnv(env)
+	}
+
+	t.Run("default", func(t *testing.T) {
+		cfg, err := resolveServeConfig(base(nil), "", "", "/tmp/cache", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.repackThreshold != defaultRepackThreshold {
+			t.Fatalf("repackThreshold = %d, want default %d", cfg.repackThreshold, defaultRepackThreshold)
+		}
+	})
+
+	t.Run("parse-through", func(t *testing.T) {
+		cfg, err := resolveServeConfig(base(map[string]string{envRepackThreshold: "3"}), "", "", "/tmp/cache", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.repackThreshold != 3 {
+			t.Fatalf("repackThreshold = %d, want 3", cfg.repackThreshold)
+		}
+	})
+
+	t.Run("zero-disables", func(t *testing.T) {
+		cfg, err := resolveServeConfig(base(map[string]string{envRepackThreshold: "0"}), "", "", "/tmp/cache", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.repackThreshold != 0 {
+			t.Fatalf("repackThreshold = %d, want 0 (disabled)", cfg.repackThreshold)
+		}
+	})
+
+	t.Run("errors", func(t *testing.T) {
+		for name, raw := range map[string]string{
+			"malformed": "many", "negative": "-1",
+			"one is a no-op fold": "1",
+		} {
+			t.Run(name, func(t *testing.T) {
+				_, err := resolveServeConfig(base(map[string]string{envRepackThreshold: raw}), "", "", "/tmp/cache", "")
+				if err == nil || !strings.Contains(err.Error(), envRepackThreshold) {
+					t.Fatalf("%s=%q: error %v must name the env var", envRepackThreshold, raw, err)
+				}
+			})
+		}
+	})
+}

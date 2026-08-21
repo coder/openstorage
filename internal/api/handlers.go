@@ -32,6 +32,21 @@ type server struct {
 	refStore  ref.RefStore
 	blobStore blob.BlobStore
 	cacheDir  string
+
+	// maybeRepack is the post-RegisterPacks repack-threshold trigger
+	// (issue #1); nil disables triggering. Write pipelines invoke it via
+	// triggerRepack after a successful pack registration.
+	maybeRepack func(ctx context.Context, repo string)
+}
+
+// triggerRepack runs the repack-threshold check after a successful pack
+// registration. Cancel-free context: the trigger enqueues background work
+// that must not be suppressed by the request ending right after its write.
+func (s *server) triggerRepack(ctx context.Context, repo string) {
+	if s.maybeRepack == nil {
+		return
+	}
+	s.maybeRepack(context.WithoutCancel(ctx), repo)
 }
 
 // maxBodyBytes caps request bodies; the only JSON body we accept

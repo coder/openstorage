@@ -47,12 +47,17 @@ const (
 	envSweepAgeThreshold  = "CODESTORAGE_SWEEP_AGE_THRESHOLD"
 	envSweepDeleteEnabled = "CODESTORAGE_SWEEP_DELETE_ENABLED"
 
+	// Background repack (issue #1): registered-pack count at which a
+	// post-write trigger schedules a fold ("0" disables triggering).
+	envRepackThreshold = "CODESTORAGE_REPACK_THRESHOLD"
+
 	defaultListen = "127.0.0.1:0"
 )
 
 const (
 	defaultSweepInterval     = time.Hour
 	defaultSweepAgeThreshold = 24 * time.Hour
+	defaultRepackThreshold   = 10
 )
 
 // envFirst returns the first non-empty value among names. getenv is injected
@@ -99,6 +104,11 @@ type serveConfig struct {
 
 	// sweep configures the periodic orphan-pack sweep (issue #5).
 	sweep sweepSettings
+
+	// repackThreshold is the registered-pack count at which a post-write
+	// trigger schedules a background repack (issue #1); 0 disables
+	// triggering (already-queued durable jobs still run).
+	repackThreshold int
 }
 
 // sweepSettings is the resolved orphan-pack sweep configuration.
@@ -206,6 +216,10 @@ func resolveServeConfig(getenv func(string) string, flagListen, flagAddr, flagCa
 	if err != nil {
 		return serveConfig{}, err
 	}
+	cfg.repackThreshold, err = resolveRepackThreshold(getenv)
+	if err != nil {
+		return serveConfig{}, err
+	}
 	assertf(cfg.dbURL != "" && cfg.blobURL != "" && cfg.cacheDir != "", "resolveServeConfig: unresolved slot in %+v", cfg)
 	assertf(cfg.dataDir == "" || filepath.IsAbs(cfg.dataDir), "resolveServeConfig: dataDir %q not absolute", cfg.dataDir)
 	return cfg, nil
@@ -291,6 +305,27 @@ func resolveSweepSettings(getenv func(string) string) (sweepSettings, error) {
 		s.deleteEnabled = v
 	}
 	return s, nil
+}
+
+// resolveRepackThreshold parses CODESTORAGE_REPACK_THRESHOLD. Fail-fast
+// semantics matching the sweep settings: malformed values error naming the
+// env var. 0 disables triggering; 1 is rejected (folding fewer than two
+// packs is a no-op, so a 1-threshold would busy-loop the trigger); unset
+// uses the default.
+func resolveRepackThreshold(getenv func(string) string) (int, error) {
+	assertf(getenv != nil, "resolveRepackThreshold: nil getenv")
+	raw := getenv(envRepackThreshold)
+	if raw == "" {
+		return defaultRepackThreshold, nil
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0, fmt.Errorf("%s: %w", envRepackThreshold, err)
+	}
+	if v < 0 || v == 1 {
+		return 0, fmt.Errorf("%s must be 0 (disabled) or >= 2, got %q", envRepackThreshold, raw)
+	}
+	return v, nil
 }
 
 // normalizeBaseURL validates an externally reachable http(s) base URL and

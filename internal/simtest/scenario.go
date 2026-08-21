@@ -82,6 +82,7 @@ type Result struct {
 func defaultFaultProfile(inj *Injector) {
 	inj.SetProbs(OpRefCASRef, Probs{Clean: 0.04, Ambiguous: 0.08})
 	inj.SetProbs(OpRefRegisterPacks, Probs{Clean: 0.02, Ambiguous: 0.04})
+	inj.SetProbs(OpRefReplacePacks, Probs{Clean: 0.02, Ambiguous: 0.04})
 	inj.SetProbs(OpRefGetRef, Probs{Clean: 0.02})
 	inj.SetProbs(OpRefListPacks, Probs{Clean: 0.02})
 	inj.SetProbs(OpRefListRefs, Probs{Clean: 0.02})
@@ -102,6 +103,8 @@ const (
 	opCrashCold
 	opPushCrashUpload
 	opPushCrashRegister
+	opRepack
+	opRepackRace
 )
 
 var opTable = []struct {
@@ -117,6 +120,8 @@ var opTable = []struct {
 	{opCrashCold, "crash-cold", 7},
 	{opPushCrashUpload, "push-crash-after-upload", 8},
 	{opPushCrashRegister, "push-crash-after-register", 7},
+	{opRepack, "repack", 8},
+	{opRepackRace, "repack-race", 4},
 }
 
 // simRepo is one simulated repository: its storage key plus the scratch
@@ -144,6 +149,12 @@ type sim struct {
 
 	observed     map[pushTransition]bool // ground-truth committed transitions
 	reportedWins []pushTransition        // transitions the writer saw won=true
+
+	// prevPacks is the per-repo pack-row baseline for the "rows only grow,
+	// modulo repack" oracle (checkPackRows): repo key -> pack id -> blob
+	// key as of the last check. The repack ops rewrite their repo's
+	// baseline in-op after pinning the exact fold transition.
+	prevPacks map[string]map[string]string
 }
 
 // Run executes one deterministic simulation and reports the outcome.
@@ -166,13 +177,14 @@ func Run(cfg Config) (Result, error) {
 	inj := NewInjector(cfg.Seed)
 	defaultFaultProfile(inj)
 	s := &sim{
-		cfg:      cfg,
-		rng:      rand.New(rand.NewPCG(cfg.Seed, 0x5C4E_D01E_5EED_0001)), //nolint:gosec // deterministic scheduler PRNG
-		inj:      inj,
-		dir:      dir,
-		tmpDir:   filepath.Join(dir, "tmp"),
-		hasher:   sha256.New(),
-		observed: make(map[pushTransition]bool),
+		cfg:       cfg,
+		rng:       rand.New(rand.NewPCG(cfg.Seed, 0x5C4E_D01E_5EED_0001)), //nolint:gosec // deterministic scheduler PRNG
+		inj:       inj,
+		dir:       dir,
+		tmpDir:    filepath.Join(dir, "tmp"),
+		hasher:    sha256.New(),
+		observed:  make(map[pushTransition]bool),
+		prevPacks: make(map[string]map[string]string),
 	}
 	if err := os.MkdirAll(s.tmpDir, 0o755); err != nil {
 		return Result{}, err
@@ -206,6 +218,12 @@ func Run(cfg Config) (Result, error) {
 			break
 		}
 		if err := s.checkPackBlobs(); err != nil {
+			return s.result(), err
+		}
+		if s.stopped {
+			break
+		}
+		if err := s.checkPackRows(); err != nil {
 			return s.result(), err
 		}
 		if !s.stopped && s.step%cfg.FullCheckEvery == 0 {
@@ -316,6 +334,10 @@ func (s *sim) doStep() error {
 		return s.doCrash(name, node, false)
 	case opCrashCold:
 		return s.doCrash(name, node, true)
+	case opRepack:
+		return s.doRepack(name, node, repo)
+	case opRepackRace:
+		return s.doRepackRace(name, node, repo, branch)
 	}
 	panic(fmt.Sprintf("simtest: unhandled op kind %d", kind))
 }
