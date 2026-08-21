@@ -82,14 +82,19 @@ func policyDeniesRepoDelete(policies []auth.RefPolicy) (string, bool) {
 // alphanumeric, then alphanumerics plus . _ - (docs/03: invalid input -> 400).
 var branchComponentRe = regexp.MustCompile(`\A[A-Za-z0-9][A-Za-z0-9._-]*\z`)
 
-// validBranchName reports whether name is an acceptable default branch:
-// slash-separated conservative ref components, no "..", no ".lock" suffix.
+// validBranchName reports whether name is an acceptable branch/tag name:
+// slash-separated conservative ref components, no "..", no ".lock" suffix,
+// no trailing dot. Within this charset those are exactly git's own
+// check-ref-format rules — every accepted name must survive as a real ref,
+// because stored default branches now drive `symbolic-ref HEAD` on every
+// hydrate (issue #18) and a git-rejected name would poison hydration.
 func validBranchName(name string) bool {
 	if name == "" || len(name) > 255 || strings.Contains(name, "..") {
 		return false
 	}
 	for _, comp := range strings.Split(name, "/") {
-		if !branchComponentRe.MatchString(comp) || strings.HasSuffix(comp, ".lock") {
+		if !branchComponentRe.MatchString(comp) ||
+			strings.HasSuffix(comp, ".lock") || strings.HasSuffix(comp, ".") {
 			return false
 		}
 	}

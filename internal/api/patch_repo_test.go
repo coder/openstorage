@@ -198,6 +198,22 @@ func TestPatchRepoDefaultBranchErrors(t *testing.T) {
 	})
 }
 
+// Create-time defaults get the same git-safe validation as PATCH (Codex
+// round 5, P1): a stored default git rejects (trailing dot) would poison
+// every hydration of the new repo, so POST /repos must refuse it up front.
+func TestCreateRepoRejectsGitInvalidDefault(t *testing.T) {
+	runBackends(t, func(t *testing.T, e *testEnv) {
+		org := e.newOrg(t)
+		repoURL := "https://example.com/" + org + "/create-dot-" + randomHex(t, 4)
+		tok := e.mint(t, tokenSpec{iss: org, repo: repoURL, scopes: []string{auth.ScopeRepoWrite}})
+		resp, body := e.doReq(t, http.MethodPost, "/api/v1/repos", tok,
+			[]byte(`{"default_branch":"main."}`), "")
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("POST /repos default_branch=main. = %d, want 400: %s", resp.StatusCode, body)
+		}
+	})
+}
+
 // The default-branch deletion protection must hold when the default is
 // stored in refs/-qualified form (PATCH stores such values verbatim): the
 // short-name DELETE must still be refused, comparing stored ref names.
