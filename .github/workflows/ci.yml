@@ -1,0 +1,61 @@
+# Merge gate for coder/code-storage (issue #7): lint, build, and the full
+# uncached race test suite. Postgres-dependent tests (river jobs, pg ref CAS,
+# githttp e2e pg lane) boot their own postgres/minio containers via
+# testcontainers, so they only need Docker on the runner — no service
+# containers. The local lane covers the zero-container sqlite+fileblob e2e
+# tests that are skipped in the default pg lane.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      # .golangci.yml is v1 schema; build the linter with the repo's Go
+      # toolchain (same as the local mise gate) instead of downloading a
+      # prebuilt binary compiled with an older Go.
+      - run: go install github.com/golangci/golangci-lint/cmd/golangci-lint@v1.64.8
+      - run: golangci-lint run
+
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      # The LFS e2e tests silently skip when git-lfs is missing; assert it is
+      # installed so the suite cannot quietly lose coverage.
+      - run: git lfs version
+      - run: go build ./...
+      - run: go test ./... -count=1 -race -timeout=30m
+
+  test-local:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - run: git lfs version
+      - run: go test ./internal/githttp -count=1 -race -timeout=15m
+        env:
+          CODESTORAGE_TEST_BACKEND: local
