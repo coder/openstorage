@@ -124,8 +124,11 @@ func isPGURL(dbURL string) bool {
 // buildServeEventing assembles the serve-side eventing stack on top of the
 // already-opened meta store: the jobs queue (with delivery + sync workers),
 // and the events.RefStore decorator the API's write handlers flow through.
-// The returned cleanup stops the queue (waiting for in-flight local work).
-func buildServeEventing(ctx context.Context, ms meta.Store, dbURL, org, httpBaseURL string, key loopbackKey, logger *slog.Logger) (jobs.Queue, func(inner ref.RefStore) ref.RefStore, func(), error) {
+// A non-nil sweep schedules the periodic orphan-pack sweep on the queue
+// backend (River periodic job on pg, background ticker in local mode).
+// The returned cleanup stops the sweep and the queue (waiting for in-flight
+// local work).
+func buildServeEventing(ctx context.Context, ms meta.Store, dbURL, org, httpBaseURL string, key loopbackKey, sweep *jobs.SweepSchedule, logger *slog.Logger) (jobs.Queue, func(inner ref.RefStore) ref.RefStore, func(), error) {
 	assertf(ms != nil && dbURL != "" && org != "" && httpBaseURL != "", "buildServeEventing: missing deps")
 	assertf(logger != nil, "buildServeEventing: nil logger")
 
@@ -159,14 +162,22 @@ func buildServeEventing(ctx context.Context, ms meta.Store, dbURL, org, httpBase
 		Logger:   logger,
 	}
 
+	cleanup := func() { queue.Close() }
 	if isPGURL(dbURL) {
-		q, err := jobs.NewRiver(ctx, dbURL, deliverer, worker.Run, logger)
+		q, err := jobs.NewRiver(ctx, dbURL, deliverer, worker.Run, sweep, logger)
 		if err != nil {
 			return nil, nil, nil, err
 		}
 		queue = q
 	} else {
 		queue = jobs.NewLocal(deliverer, worker.Run, logger)
+		if sweep != nil {
+			stopSweep := jobs.StartSweepTicker(sweep.Sweeper, sweep.Interval)
+			cleanup = func() {
+				stopSweep()
+				queue.Close()
+			}
+		}
 	}
 
 	decorate := func(inner ref.RefStore) ref.RefStore {
@@ -179,7 +190,7 @@ func buildServeEventing(ctx context.Context, ms meta.Store, dbURL, org, httpBase
 			Logger:          logger,
 		})
 	}
-	return queue, decorate, queue.Close, nil
+	return queue, decorate, cleanup, nil
 }
 
 // hookDeliveryAttempts bounds synchronous local-mode hook deliveries: the

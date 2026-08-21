@@ -47,6 +47,11 @@ type BlobStore interface {
 	DownloadFile(ctx context.Context, key, destPath string) error
 	// List returns all objects under prefix.
 	List(ctx context.Context, prefix string) ([]ListedObject, error)
+	// Delete removes the object at key; missing objects yield an error
+	// matching ErrNotFound via errors.Is. Objects are immutable, so Delete
+	// exists solely for the orphan-pack sweeper (issue #5): reaping blobs
+	// that were uploaded but never registered because of a crash.
+	Delete(ctx context.Context, key string) error
 	// SignedURL returns a presigned URL for the given HTTP method
 	// (http.MethodGet or http.MethodPut) on key, valid for expiry.
 	// Backends without presign support return ErrSignedURLUnsupported.
@@ -73,6 +78,10 @@ func assertSignedURLArgs(key, method string, expiry time.Duration) {
 type ListedObject struct {
 	Key  string
 	Size int64
+	// ModTime is the backend's last-modified time for the object (S3
+	// LastModified / file mtime). The orphan-pack sweeper uses it as the
+	// upload age: objects are immutable, so it never moves after publish.
+	ModTime time.Time
 }
 
 // PackKey is the immutable object key for a repo's pack with the given id.
@@ -81,8 +90,15 @@ func PackKey(repo, id string) string {
 	return "packs/" + repo + "/pack-" + id + ".pack"
 }
 
+// PacksRoot is the listing prefix covering every repo's packs (the
+// orphan-pack sweeper scans it in one listing instead of enumerating
+// repos). Namespaced repos (`<repo>+import`/`<repo>+ephemeral`) keep fully
+// separate pack spaces keyed by the full name, so each key's repo segment
+// identifies its authoritative pack registry row set.
+const PacksRoot = "packs/"
+
 // PackPrefix is the listing prefix for a repo's packs.
-func PackPrefix(repo string) string { return "packs/" + repo + "/" }
+func PackPrefix(repo string) string { return PacksRoot + repo + "/" }
 
 // LFSKey is the immutable object key for a repo's LFS object with the given
 // sha256 oid. Keys are repo-scoped (docs/05): forks inherit LFS pointers
@@ -217,4 +233,9 @@ func (b *S3) SignedURL(ctx context.Context, key, method string, expiry time.Dura
 // Stat returns the size of the object at key (ErrNotFound when absent).
 func (b *S3) Stat(ctx context.Context, key string) (int64, error) {
 	return bucketStat(ctx, b.bucket, key)
+}
+
+// Delete removes the object at key (ErrNotFound when absent).
+func (b *S3) Delete(ctx context.Context, key string) error {
+	return bucketDelete(ctx, b.bucket, key)
 }

@@ -107,6 +107,11 @@ func (b *File) Stat(ctx context.Context, key string) (int64, error) {
 	return bucketStat(ctx, b.bucket, key)
 }
 
+// Delete removes the object at key (ErrNotFound when absent).
+func (b *File) Delete(ctx context.Context, key string) error {
+	return bucketDelete(ctx, b.bucket, key)
+}
+
 // bucketUploadFile streams the local file at path into bucket under key. It
 // is the single upload implementation for gocloud-backed BlobStores.
 func bucketUploadFile(ctx context.Context, bucket *gcblob.Bucket, key, path string) error {
@@ -187,6 +192,20 @@ func bucketList(ctx context.Context, bucket *gcblob.Bucket, prefix string) ([]Li
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, ListedObject{Key: obj.Key, Size: obj.Size})
+		out = append(out, ListedObject{Key: obj.Key, Size: obj.Size, ModTime: obj.ModTime})
 	}
+}
+
+// bucketDelete removes the object at key, mapping gocloud's NotFound code
+// onto the package-level ErrNotFound sentinel. It is the single Delete
+// implementation for gocloud-backed BlobStores.
+func bucketDelete(ctx context.Context, bucket *gcblob.Bucket, key string) error {
+	assertf(bucket != nil && key != "", "bucketDelete(%q)", key)
+	if err := bucket.Delete(ctx, key); err != nil {
+		if gcerrors.Code(err) == gcerrors.NotFound {
+			return fmt.Errorf("delete %s: %w", key, ErrNotFound)
+		}
+		return fmt.Errorf("delete %s: %w", key, err)
+	}
+	return nil
 }

@@ -24,6 +24,7 @@ import (
 	"codestorage/internal/api"
 	"codestorage/internal/auth"
 	"codestorage/internal/blob"
+	"codestorage/internal/jobs"
 	"codestorage/internal/meta"
 	"codestorage/internal/ref"
 )
@@ -37,7 +38,7 @@ import (
 // mux.Handle("/api/", h). refStore/blobStore/cacheDir back the
 // git:read endpoints — serve passes the same instances the githttp fallback
 // uses so both surfaces share one cache.
-func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL string, orgPEMBlocks []string, refStore ref.RefStore, blobStore blob.BlobStore, cacheDir string, rate api.RateLimitConfig) (http.Handler, meta.Store, auth.Verifier, func(), error) {
+func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL string, orgPEMBlocks []string, refStore ref.RefStore, blobStore blob.BlobStore, cacheDir string, rate api.RateLimitConfig, sweep sweepSettings) (http.Handler, meta.Store, auth.Verifier, func(), error) {
 	assertf(dbURL != "" && org != "" && httpBaseURL != "" && len(orgPEMBlocks) > 0, "buildAPIHandler: missing dbURL/org/httpBaseURL/keys")
 	assertf(refStore != nil && blobStore != nil && cacheDir != "", "buildAPIHandler: missing refStore/blobStore/cacheDir")
 	ms, msCleanup, err := openMetaStore(ctx, dbURL)
@@ -66,7 +67,22 @@ func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL string, orgPEM
 	// push events. The git surface gets the same decorator in the hook
 	// subprocess via wireHookEventing.
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
-	queue, decorate, queueCleanup, err := buildServeEventing(ctx, ms, dbURL, org, httpBaseURL, key, logger)
+
+	// Orphan-pack sweep (issue #5): built over the RAW ref store — pack
+	// listing is a read, no events to emit — and the shared blob store.
+	// interval 0 disables it; nil schedule keeps both queue backends inert.
+	var schedule *jobs.SweepSchedule
+	if sweep.interval > 0 {
+		schedule = &jobs.SweepSchedule{
+			Sweeper: jobs.NewSweeper(blobStore, refStore, jobs.SweepConfig{
+				Threshold: sweep.ageThreshold,
+				Delete:    sweep.deleteEnabled,
+			}, logger),
+			Interval: sweep.interval,
+		}
+	}
+
+	queue, decorate, queueCleanup, err := buildServeEventing(ctx, ms, dbURL, org, httpBaseURL, key, schedule, logger)
 	if err != nil {
 		return fail(err)
 	}

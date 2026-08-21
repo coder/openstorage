@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"codestorage/internal/auth"
 )
@@ -469,4 +470,73 @@ func TestResolveServeConfigRateLimit(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestResolveServeConfigSweep(t *testing.T) {
+	base := func(extra map[string]string) func(string) string {
+		env := map[string]string{
+			"CODESTORAGE_PG_URL":      "postgres://x",
+			"CODESTORAGE_S3_URL":      "s3://x",
+			"CODESTORAGE_ORG":         "org1",
+			"CODESTORAGE_ORG_PUBKEYS": "/tmp/org.pub.pem",
+		}
+		for k, v := range extra {
+			env[k] = v
+		}
+		return mapEnv(env)
+	}
+
+	t.Run("defaults", func(t *testing.T) {
+		cfg, err := resolveServeConfig(base(nil), "", "", "/tmp/cache", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := sweepSettings{interval: defaultSweepInterval, ageThreshold: defaultSweepAgeThreshold}
+		if cfg.sweep != want {
+			t.Fatalf("default sweep = %+v, want %+v (hourly, 24h threshold, list-only)", cfg.sweep, want)
+		}
+	})
+
+	t.Run("parse-through", func(t *testing.T) {
+		cfg, err := resolveServeConfig(base(map[string]string{
+			envSweepInterval:      "30m",
+			envSweepAgeThreshold:  "48h",
+			envSweepDeleteEnabled: "true",
+		}), "", "", "/tmp/cache", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := sweepSettings{interval: 30 * time.Minute, ageThreshold: 48 * time.Hour, deleteEnabled: true}
+		if cfg.sweep != want {
+			t.Fatalf("sweep = %+v, want %+v", cfg.sweep, want)
+		}
+	})
+
+	t.Run("zero-interval-disables", func(t *testing.T) {
+		cfg, err := resolveServeConfig(base(map[string]string{envSweepInterval: "0"}), "", "", "/tmp/cache", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.sweep.interval != 0 {
+			t.Fatalf("interval = %v, want 0 (disabled)", cfg.sweep.interval)
+		}
+	})
+
+	t.Run("errors", func(t *testing.T) {
+		cases := map[string]map[string]string{
+			"malformed interval":  {envSweepInterval: "soon"},
+			"negative interval":   {envSweepInterval: "-1h"},
+			"malformed threshold": {envSweepAgeThreshold: "old"},
+			"zero threshold":      {envSweepAgeThreshold: "0"},
+			"negative threshold":  {envSweepAgeThreshold: "-24h"},
+			"malformed delete":    {envSweepDeleteEnabled: "yes please"},
+		}
+		for name, extra := range cases {
+			t.Run(name, func(t *testing.T) {
+				if _, err := resolveServeConfig(base(extra), "", "", "/tmp/cache", ""); err == nil {
+					t.Fatalf("%v must fail resolution", extra)
+				}
+			})
+		}
+	})
 }

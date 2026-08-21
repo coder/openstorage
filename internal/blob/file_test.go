@@ -242,3 +242,70 @@ func TestFile_UploadNeverUsesOSTempDir(t *testing.T) {
 		t.Fatalf("UploadFile must not depend on os.TempDir: %v", err)
 	}
 }
+
+// ModTime must be populated by List (the orphan-pack sweeper's age source)
+// and track the underlying object's last-modified time.
+func TestFile_ListModTime(t *testing.T) {
+	ctx := context.Background()
+	b, dir := openFile(t)
+	src := filepath.Join(t.TempDir(), "src")
+	if err := os.WriteFile(src, []byte("pack"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	key := PackKey("r1", "aged")
+	if err := b.UploadFile(ctx, key, src); err != nil {
+		t.Fatalf("UploadFile: %v", err)
+	}
+
+	listed, err := b.List(ctx, PackPrefix("r1"))
+	if err != nil || len(listed) != 1 {
+		t.Fatalf("List = %v, %v; want one object", listed, err)
+	}
+	if age := time.Since(listed[0].ModTime); listed[0].ModTime.IsZero() || age < 0 || age > time.Minute {
+		t.Fatalf("fresh upload ModTime = %v (age %v), want ~now", listed[0].ModTime, age)
+	}
+
+	// Backdating the underlying file must surface through List: that is
+	// exactly how sweeper tests age orphans.
+	past := time.Now().Add(-25 * time.Hour)
+	if err := os.Chtimes(filepath.Join(dir, "packs", "r1", "pack-aged.pack"), past, past); err != nil {
+		t.Fatal(err)
+	}
+	listed, err = b.List(ctx, PackPrefix("r1"))
+	if err != nil || len(listed) != 1 {
+		t.Fatalf("List after backdate = %v, %v", listed, err)
+	}
+	if got := listed[0].ModTime; got.After(past.Add(time.Second)) || got.Before(past.Add(-time.Second)) {
+		t.Fatalf("backdated ModTime = %v, want ~%v", got, past)
+	}
+}
+
+// Delete removes exactly the addressed object; a missing key yields
+// ErrNotFound (the sweeper tolerates concurrent deletion races via that
+// sentinel).
+func TestFile_Delete(t *testing.T) {
+	ctx := context.Background()
+	keep := PackKey("r1", "keep")
+	victim := PackKey("r1", "victim")
+	b := seededFile(t, keep, "keep-bytes")
+	src := filepath.Join(t.TempDir(), "src")
+	if err := os.WriteFile(src, []byte("victim-bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.UploadFile(ctx, victim, src); err != nil {
+		t.Fatalf("UploadFile: %v", err)
+	}
+
+	if err := b.Delete(ctx, victim); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if _, err := b.Stat(ctx, victim); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Stat after delete = %v, want ErrNotFound", err)
+	}
+	if _, err := b.Stat(ctx, keep); err != nil {
+		t.Fatalf("neighbor object must survive: %v", err)
+	}
+	if err := b.Delete(ctx, victim); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Delete of missing key = %v, want ErrNotFound", err)
+	}
+}
