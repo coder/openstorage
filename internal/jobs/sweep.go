@@ -272,7 +272,20 @@ func (s *Sweeper) safeDelete(ctx context.Context, repo, key string) (bool, error
 		return false, fmt.Errorf("sweep: quarantine %s: %w", key, err)
 	}
 	if err := s.blobs.Delete(ctx, key); err != nil && !errors.Is(err, blob.ErrNotFound) {
-		return false, fmt.Errorf("sweep: delete %s: %w", key, err)
+		// The delete outcome is unknown — the request may have executed
+		// with its response lost. Restore from quarantine unconditionally:
+		// identical bytes, so a no-op if the delete never happened and a
+		// repair if it did. Either way a registration racing this delete
+		// finds its bytes present. The candidate stays unreaped (its next
+		// classification restarts from the restore's fresh ModTime); if
+		// even the restore fails, the retained backup plus the heal pass
+		// remain the backstop.
+		deleteErr := fmt.Errorf("sweep: delete %s: %w", key, err)
+		if rerr := s.blobs.Copy(ctx, key, quarantinePrefix+key); rerr != nil {
+			return false, errors.Join(deleteErr,
+				fmt.Errorf("sweep: restore after ambiguous delete %s: %w", key, rerr))
+		}
+		return false, deleteErr
 	}
 	// Post-delete registry recheck: whichever of {our delete, a retried
 	// push's RegisterPacks} lands last sees the other's state, so a

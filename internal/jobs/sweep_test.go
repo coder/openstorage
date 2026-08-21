@@ -482,6 +482,55 @@ func TestSweep_DeleteSkipsKeyRefreshedMidSweep(t *testing.T) {
 	}
 }
 
+// ambiguousDelete executes deletes of the target key for real but reports
+// failure — the "delete executed, response lost" class (simtest's
+// FaultAmbiguous on blob.Delete).
+type ambiguousDelete struct {
+	blob.BlobStore
+	key string
+}
+
+func (b *ambiguousDelete) Delete(ctx context.Context, key string) error {
+	err := b.BlobStore.Delete(ctx, key)
+	if key == b.key {
+		if err != nil {
+			return err
+		}
+		return errors.New("simulated: delete executed, response lost")
+	}
+	return err
+}
+
+// An ambiguous delete outcome must not end the handshake early: safeDelete
+// restores the quarantined bytes unconditionally, so a racing registration
+// never finds its key missing (Codex round 7).
+func TestSweep_AmbiguousDeleteRestoresFromQuarantine(t *testing.T) {
+	f := newSweepFixture(t)
+	key := blob.PackKey("r1", "ambig")
+	f.upload(key, "ambig-bytes")
+	f.backdate(key, 25*time.Hour)
+
+	s := NewSweeper(&ambiguousDelete{BlobStore: f.blobs, key: key}, f.store,
+		SweepConfig{Threshold: 24 * time.Hour, Delete: true}, slog.New(slog.DiscardHandler))
+	report, err := s.Sweep(context.Background())
+	if err == nil {
+		t.Fatal("Sweep must surface the ambiguous delete error")
+	}
+	if report.Deleted != 0 {
+		t.Fatalf("report = %+v, want no reap counted on ambiguous delete", report)
+	}
+	if !f.exists(key) {
+		t.Fatalf("key %q not restored after ambiguous delete", key)
+	}
+	dest := filepath.Join(t.TempDir(), "restored.pack")
+	if err := f.blobs.DownloadFile(context.Background(), key, dest); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := os.ReadFile(dest); string(got) != "ambig-bytes" {
+		t.Fatalf("restored content = %q, want original bytes", got)
+	}
+}
+
 // The local-mode ticker is the real wiring: an aged orphan disappears
 // without any explicit Sweep call once the ticker is started.
 func TestStartSweepTicker_ReapsOrphan(t *testing.T) {
