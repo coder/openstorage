@@ -113,3 +113,13 @@ func (s *SimRefStore) ListPacks(ctx context.Context, repo string) ([]ref.Pack, e
 	}
 	return s.inner.ListPacks(ctx, repo)
 }
+
+// GetGeneration delegates to the inner store unless a fault is injected.
+// Faulting it starves the issue-#4 hydrate short-circuit, which must then
+// surface the error rather than serve from a stale marker.
+func (s *SimRefStore) GetGeneration(ctx context.Context, repo string) (int64, error) {
+	if class := s.inj.begin(OpRefGetGeneration); class != FaultNone {
+		return 0, refReadFault(OpRefGetGeneration, class)
+	}
+	return s.inner.GetGeneration(ctx, repo)
+}

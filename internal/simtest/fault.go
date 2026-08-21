@@ -71,6 +71,7 @@ const (
 	OpRefCASRef           = "ref.CASRef"
 	OpRefRegisterPacks    = "ref.RegisterPacks"
 	OpRefListPacks        = "ref.ListPacks"
+	OpRefGetGeneration    = "ref.GetGeneration"
 
 	OpBlobUploadFile   = "blob.UploadFile"
 	OpBlobDownloadFile = "blob.DownloadFile"
