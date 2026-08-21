@@ -63,11 +63,15 @@ type OrphanPack struct {
 
 // SweepReport summarizes one sweep run.
 type SweepReport struct {
-	ReposScanned   int
-	Live           int // blobs present in the pack registry
-	Fresh          int // unregistered but younger than the threshold
-	Orphans        []OrphanPack
-	OrphanBytes    int64
+	ReposScanned int
+	Live         int // blobs present in the pack registry
+	Fresh        int // unregistered but younger than the threshold
+	Orphans      []OrphanPack
+	OrphanBytes  int64
+	// Deleted counts orphans reaped this run. Their bytes move to a
+	// quarantine backup rather than disappearing, so reaping frees nothing
+	// by itself; BytesReclaimed counts only quarantine backups purged this
+	// run — the moment storage consumption actually decreases.
 	Deleted        int
 	BytesReclaimed int64
 }
@@ -124,15 +128,16 @@ func (s *Sweeper) Sweep(ctx context.Context) (SweepReport, error) {
 	start := s.now()
 	// Heal before classifying so a pack restored from quarantine is listed
 	// (and counted live) by the very sweep that healed it.
+	var report SweepReport
 	var deleteErrs []error
 	if s.cfg.Delete {
-		if err := s.healQuarantine(ctx); err != nil {
+		if err := s.healQuarantine(ctx, &report); err != nil {
 			deleteErrs = append(deleteErrs, err)
 		}
 	}
 	objs, err := s.blobs.List(ctx, blob.PacksRoot)
 	if err != nil {
-		return SweepReport{}, fmt.Errorf("sweep: list %s: %w", blob.PacksRoot, err)
+		return report, fmt.Errorf("sweep: list %s: %w", blob.PacksRoot, err)
 	}
 
 	// Group by the key's repo segment (packs/<repo>/<file>). Keys not
@@ -154,7 +159,6 @@ func (s *Sweeper) Sweep(ctx context.Context) (SweepReport, error) {
 	}
 	sort.Strings(repos) // deterministic logs and reports
 
-	var report SweepReport
 	for _, repo := range repos {
 		packs, err := s.packs.ListPacks(ctx, repo)
 		if err != nil {
@@ -205,7 +209,6 @@ func (s *Sweeper) Sweep(ctx context.Context) (SweepReport, error) {
 				continue
 			}
 			report.Deleted++
-			report.BytesReclaimed += obj.Size
 		}
 	}
 	report.ReposScanned = len(repos)
@@ -305,8 +308,10 @@ func (s *Sweeper) safeDelete(ctx context.Context, repo, key string) (bool, error
 // restored when the original is missing (identical bytes) and its backup
 // purged; an unregistered backup is purged only once it ages past the
 // threshold, so a concurrently running sweep's in-flight backup is never
-// touched. Failures are joined and reported; each entry is independent.
-func (s *Sweeper) healQuarantine(ctx context.Context) error {
+// touched. Purged backup bytes are credited to report.BytesReclaimed —
+// the point where storage consumption actually drops (reaping only moves
+// bytes into quarantine). Failures are joined; each entry is independent.
+func (s *Sweeper) healQuarantine(ctx context.Context, report *SweepReport) error {
 	entries, err := s.blobs.List(ctx, quarantinePrefix)
 	if err != nil {
 		return fmt.Errorf("sweep: list quarantine: %w", err)
@@ -331,6 +336,7 @@ func (s *Sweeper) healQuarantine(ctx context.Context) error {
 				break
 			}
 		}
+		reclaims := false // restore-then-purge is net zero; only an aged-orphan purge frees bytes
 		if registered {
 			if _, err := s.blobs.Stat(ctx, orig); errors.Is(err, blob.ErrNotFound) {
 				if err := s.restoreFromQuarantine(ctx, q.Key, orig); err != nil {
@@ -344,9 +350,15 @@ func (s *Sweeper) healQuarantine(ctx context.Context) error {
 			}
 		} else if q.ModTime.IsZero() || s.now().Sub(q.ModTime) < s.cfg.Threshold {
 			continue // possibly an in-flight sweep's backup: keep it
+		} else {
+			reclaims = true
 		}
 		if err := s.blobs.Delete(ctx, q.Key); err != nil && !errors.Is(err, blob.ErrNotFound) {
 			errs = append(errs, fmt.Errorf("sweep: purge quarantine %s: %w", q.Key, err))
+			continue
+		}
+		if reclaims {
+			report.BytesReclaimed += q.Size
 		}
 	}
 	return errors.Join(errs...)

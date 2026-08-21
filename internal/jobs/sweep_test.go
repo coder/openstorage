@@ -179,8 +179,9 @@ func TestSweep_DeleteReapsOrphansOnly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Sweep: %v", err)
 	}
-	if report.Deleted != 2 || report.BytesReclaimed != report.OrphanBytes {
-		t.Fatalf("report = %+v, want deleted=2 bytes_reclaimed=orphan_bytes", report)
+	// Reaping moves bytes into quarantine — nothing is reclaimed yet.
+	if report.Deleted != 2 || report.BytesReclaimed != 0 {
+		t.Fatalf("report = %+v, want deleted=2 bytes_reclaimed=0 (bytes still quarantined)", report)
 	}
 	for _, key := range []string{oldOrphan, nsOrphan} {
 		if f.exists(key) {
@@ -203,13 +204,32 @@ func TestSweep_DeleteReapsOrphansOnly(t *testing.T) {
 		}
 	}
 
-	// Idempotence: a second sweep finds nothing left to do.
+	// Idempotence: a second sweep finds nothing left to do (fresh backups
+	// are kept, so still nothing reclaimed).
 	again, err := f.sweeper(SweepConfig{Threshold: 24 * time.Hour, Delete: true}).Sweep(context.Background())
 	if err != nil {
 		t.Fatalf("second Sweep: %v", err)
 	}
-	if len(again.Orphans) != 0 || again.Deleted != 0 {
-		t.Fatalf("second sweep report = %+v, want no orphans", again)
+	if len(again.Orphans) != 0 || again.Deleted != 0 || again.BytesReclaimed != 0 {
+		t.Fatalf("second sweep report = %+v, want no orphans and nothing reclaimed", again)
+	}
+
+	// Once the backups age past the threshold, the purge reclaims exactly
+	// the orphans' bytes — the point storage consumption actually drops.
+	for _, key := range []string{oldOrphan, nsOrphan} {
+		f.backdate("sweep/quarantine/"+key, 25*time.Hour)
+	}
+	purged, err := f.sweeper(SweepConfig{Threshold: 24 * time.Hour, Delete: true}).Sweep(context.Background())
+	if err != nil {
+		t.Fatalf("purge Sweep: %v", err)
+	}
+	if purged.BytesReclaimed != report.OrphanBytes {
+		t.Fatalf("purge report = %+v, want bytes_reclaimed=%d", purged, report.OrphanBytes)
+	}
+	for _, key := range []string{oldOrphan, nsOrphan} {
+		if f.exists("sweep/quarantine/" + key) {
+			t.Fatalf("aged backup %q was not purged", key)
+		}
 	}
 }
 
@@ -378,6 +398,11 @@ func TestSweep_HealQuarantine(t *testing.T) {
 	// The healed pack is registered => live in the same sweep's report.
 	if report.Live != 1 {
 		t.Fatalf("report = %+v, want the healed pack counted live", report)
+	}
+	// Reclaimed = the aged unregistered purge only; the heal's
+	// restore-then-purge is net zero and must not be credited.
+	if want := int64(len("stale-bytes")); report.BytesReclaimed != want {
+		t.Fatalf("BytesReclaimed = %d, want %d (stale purge only)", report.BytesReclaimed, want)
 	}
 }
 
