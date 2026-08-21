@@ -105,7 +105,10 @@ func (s IdempotentCAS) CASRef(ctx context.Context, repo, name, old, new string) 
 //
 //   - *pgconn.PgError / *sqlite.Error: the backend itself rejected the
 //     statement (serialization abort, permission, constraint, busy) — it
-//     responded, so it did not silently commit first.
+//     responded, so it did not silently commit first. Exception: SQLSTATEs
+//     that explicitly encode an unknown outcome (40003
+//     statement_completion_unknown, 08007 transaction_resolution_unknown,
+//     as reported by servers or compatible proxies) stay ambiguous.
 //   - pgconn.SafeToRetry: the request never reached the server. Both
 //     stores mark their acquire stage this way (see notExecuted): a
 //     pool/connection acquisition failure — e.g. a deadline expiring while
@@ -118,8 +121,13 @@ func (s IdempotentCAS) CASRef(ctx context.Context, repo, name, old, new string) 
 // statement may have committed with the result lost on the way back.
 func ambiguousError(err error) bool {
 	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		// These SQLSTATEs are the backend SAYING the outcome is unknown:
+		// the statement/transaction may have committed.
+		return pgErr.Code == "40003" || pgErr.Code == "08007"
+	}
 	var sqErr *sqlite.Error
-	if errors.As(err, &pgErr) || errors.As(err, &sqErr) {
+	if errors.As(err, &sqErr) {
 		return false
 	}
 	return !pgconn.SafeToRetry(err)

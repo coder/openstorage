@@ -181,6 +181,10 @@ func TestAmbiguousErrorClassification(t *testing.T) {
 		"connection drop":       {fmt.Errorf("cas: %w", io.ErrUnexpectedEOF), true},
 		"mid-flight cancel":     {fmt.Errorf("cas: %w", context.Canceled), true},
 		"opaque driver failure": {errors.New("write: broken pipe"), true},
+		// SQLSTATEs that explicitly encode an unknown outcome are the
+		// backend itself reporting post-commit ambiguity.
+		"pg statement completion unknown":   {fmt.Errorf("cas: %w", &pgconn.PgError{Code: "40003"}), true},
+		"pg transaction resolution unknown": {fmt.Errorf("cas: %w", &pgconn.PgError{Code: "08007"}), true},
 	} {
 		t.Run(name, func(t *testing.T) {
 			if got := ambiguousError(tc.err); got != tc.want {
