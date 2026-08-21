@@ -278,9 +278,10 @@ func (s *server) handleForkRepo(w http.ResponseWriter, r *http.Request, verifier
 	}
 
 	writeJSON(w, http.StatusOK, createRepoResponse{
-		RepoID:  repo.RepoID,
-		HTTPURL: s.httpBaseURL + "/" + repo.RepoID + ".git",
-		Message: "repository created",
+		RepoID:   repo.RepoID,
+		RepoName: repo.URL,
+		HTTPURL:  s.httpBaseURL + "/" + repo.RepoID + ".git",
+		Message:  "repository created",
 	})
 }
 

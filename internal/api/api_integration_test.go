@@ -55,6 +55,9 @@ func testCRUDHappyPath(t *testing.T, e *testEnv) {
 	if want := testHTTPBaseURL + "/" + created.RepoID + ".git"; created.HTTPURL != want {
 		t.Fatalf("http_url = %q, want %q", created.HTTPURL, want)
 	}
+	if created.RepoName != repoURL {
+		t.Fatalf("repo_name = %q, want %q", created.RepoName, repoURL)
+	}
 	if created.Message == "" {
 		t.Fatal("create response has empty message")
 	}
@@ -69,10 +72,13 @@ func testCRUDHappyPath(t *testing.T, e *testEnv) {
 	if err := json.Unmarshal(body, &got); err != nil {
 		t.Fatal(err)
 	}
-	// openapi.yaml GET /api/v1/repo response schema requires repo_id, url,
-	// default_branch, created_at.
+	// openapi.yaml GET /api/v1/repo response schema requires repo_id,
+	// repo_name, url (deprecated mirror), default_branch, created_at.
 	if got.RepoID != created.RepoID {
 		t.Fatalf("repo_id = %q, want %q", got.RepoID, created.RepoID)
+	}
+	if got.RepoName != repoURL {
+		t.Fatalf("repo_name = %q, want %q", got.RepoName, repoURL)
 	}
 	if got.URL != repoURL {
 		t.Fatalf("url = %q, want %q", got.URL, repoURL)
@@ -100,6 +106,9 @@ func testCRUDHappyPath(t *testing.T, e *testEnv) {
 	}
 	if len(list.Repos) != 1 || list.Repos[0].URL != repoURL || list.Repos[0].RepoID != created.RepoID {
 		t.Fatalf("list = %+v, want exactly the created repo", list)
+	}
+	if list.Repos[0].RepoName != repoURL {
+		t.Fatalf("list repo_name = %q, want %q", list.Repos[0].RepoName, repoURL)
 	}
 	if list.HasMore || list.NextCursor != "" {
 		t.Fatalf("single-page list claims more: %+v", list)

@@ -88,7 +88,8 @@ func (s *server) registerWriteMergeRoutes(mux *http.ServeMux, verifier auth.Veri
 // Wire shapes (SDK mergeResponseSchema / previewMergeResponseSchema)
 
 type wmMergeSource struct {
-	Branch    string `json:"branch"`
+	Ref       string `json:"ref"`
+	Branch    string `json:"branch"` // deprecated: mirrors ref
 	Ephemeral bool   `json:"ephemeral"`
 	SHA       string `json:"sha"`
 }
@@ -419,7 +420,8 @@ func (s *server) wmCheckRefPolicy(w http.ResponseWriter, r *http.Request, sc *wc
 // POST /api/v1/repos/merge
 
 type wmMergeRequest struct {
-	SourceBranch            string    `json:"source_branch"`
+	SourceRef               string    `json:"source_ref"`
+	SourceBranch            string    `json:"source_branch"` // deprecated alias of source_ref
 	TargetBranch            string    `json:"target_branch"`
 	Strategy                string    `json:"strategy"` // merge|ff_only|ff_prefer
 	SourceIsEphemeral       bool      `json:"source_is_ephemeral"`
@@ -438,7 +440,15 @@ type wmMergeRequest struct {
 // strategies).
 func wmValidateMergeRequest(req *wmMergeRequest) error {
 	assertf(req != nil, "wmValidateMergeRequest: nil request")
-	if err := wcValidateBranchParam("source_branch", req.SourceBranch); err != nil {
+	// openapi (issue #17): source_ref — a branch name or its fully
+	// qualified refs/heads form — is the current field; source_branch
+	// stays as the deprecated bare-name alias, the current name winning
+	// on conflict. Canonicalize into SourceBranch so the merge flow and
+	// the response echo one bare branch name.
+	if req.SourceRef != "" {
+		req.SourceBranch = strings.TrimPrefix(req.SourceRef, "refs/heads/")
+	}
+	if err := wcValidateBranchParam("source_ref", req.SourceBranch); err != nil {
 		return err
 	}
 	if err := wcValidateBranchParam("target_branch", req.TargetBranch); err != nil {
@@ -555,7 +565,7 @@ func (s *server) handleMerge(w http.ResponseWriter, r *http.Request) {
 			Result:    outcome,
 			CommitSHA: commit,
 			TreeSHA:   tree,
-			Source:    wmMergeSource{Branch: req.SourceBranch, Ephemeral: req.SourceIsEphemeral, SHA: sourceSHA},
+			Source:    wmMergeSource{Ref: req.SourceBranch, Branch: req.SourceBranch, Ephemeral: req.SourceIsEphemeral, SHA: sourceSHA},
 			Target: wmMergeTarget{
 				Branch: req.TargetBranch, Ephemeral: req.TargetIsEphemeral,
 				OldSHA: targetSHA, NewSHA: newSHA,
