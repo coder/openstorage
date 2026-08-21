@@ -309,3 +309,25 @@ func TestFile_Delete(t *testing.T) {
 		t.Fatalf("Delete of missing key = %v, want ErrNotFound", err)
 	}
 }
+
+// Copy duplicates objects inside the store without local staging; missing
+// sources map to ErrNotFound (the sweeper's gone-already signal).
+func TestFile_Copy(t *testing.T) {
+	ctx := context.Background()
+	src := PackKey("r1", "src")
+	b := seededFile(t, src, "copy-me")
+
+	dst := "sweep/quarantine/" + src
+	if err := b.Copy(ctx, dst, src); err != nil {
+		t.Fatalf("Copy: %v", err)
+	}
+	for _, key := range []string{src, dst} {
+		size, err := b.Stat(ctx, key)
+		if err != nil || size != int64(len("copy-me")) {
+			t.Fatalf("Stat(%q) = %d, %v; want %d", key, size, err, len("copy-me"))
+		}
+	}
+	if err := b.Copy(ctx, "x", PackKey("r1", "missing")); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Copy of missing source = %v, want ErrNotFound", err)
+	}
+}

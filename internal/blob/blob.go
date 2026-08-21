@@ -52,6 +52,12 @@ type BlobStore interface {
 	// exists solely for the orphan-pack sweeper (issue #5): reaping blobs
 	// that were uploaded but never registered because of a crash.
 	Delete(ctx context.Context, key string) error
+	// Copy duplicates srcKey to dstKey inside the store (server-side S3
+	// CopyObject / local file copy — never staged through local disk, so
+	// pack-sized copies work regardless of temp-dir capacity). A missing
+	// srcKey yields an error matching ErrNotFound via errors.Is. Used by
+	// the orphan-pack sweeper's quarantine handshake.
+	Copy(ctx context.Context, dstKey, srcKey string) error
 	// SignedURL returns a presigned URL for the given HTTP method
 	// (http.MethodGet or http.MethodPut) on key, valid for expiry.
 	// Backends without presign support return ErrSignedURLUnsupported.
@@ -238,4 +244,9 @@ func (b *S3) Stat(ctx context.Context, key string) (int64, error) {
 // Delete removes the object at key (ErrNotFound when absent).
 func (b *S3) Delete(ctx context.Context, key string) error {
 	return bucketDelete(ctx, b.bucket, key)
+}
+
+// Copy duplicates srcKey to dstKey (server-side CopyObject).
+func (b *S3) Copy(ctx context.Context, dstKey, srcKey string) error {
+	return bucketCopy(ctx, b.bucket, dstKey, srcKey)
 }

@@ -25,8 +25,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"os"
-	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -250,28 +248,20 @@ func splitPackKey(key string) (repo string, ok bool) {
 }
 
 // safeDelete reaps one revalidated orphan candidate without ever being able
-// to lose registered bytes: it backs the object up to a quarantine key,
-// deletes, then re-reads the registry — a registration that landed
-// mid-delete is repaired immediately by re-uploading the identical bytes
-// (pack keys are content-addressed, so the restore is always correct).
-// The quarantine backup is kept after a successful reap; healQuarantine
-// purges it once it ages past the threshold, and until then it covers a
-// sweeper crash anywhere in this sequence. Returns whether the candidate
-// ended up reaped.
+// to lose registered bytes: it copies the object to a quarantine key
+// (server-side — never staged through local disk, so pack size and temp-dir
+// capacity are irrelevant), deletes, then re-reads the registry — a
+// registration that landed mid-delete is repaired immediately by copying
+// the identical bytes back (pack keys are content-addressed, so the restore
+// is always correct). The quarantine backup is kept after a successful
+// reap; healQuarantine purges it once it ages past the threshold, and until
+// then it covers a sweeper crash anywhere in this sequence. Returns whether
+// the candidate ended up reaped.
 func (s *Sweeper) safeDelete(ctx context.Context, repo, key string) (bool, error) {
-	tmpDir, err := os.MkdirTemp("", "orphan-sweep-*")
-	if err != nil {
-		return false, fmt.Errorf("sweep: delete %s: %w", key, err)
-	}
-	defer os.RemoveAll(tmpDir)
-	tmp := filepath.Join(tmpDir, "backup.pack")
-	if err := s.blobs.DownloadFile(ctx, key, tmp); err != nil {
+	if err := s.blobs.Copy(ctx, quarantinePrefix+key, key); err != nil {
 		if errors.Is(err, blob.ErrNotFound) {
 			return false, nil // gone already: nothing to delete
 		}
-		return false, fmt.Errorf("sweep: backup %s: %w", key, err)
-	}
-	if err := s.blobs.UploadFile(ctx, quarantinePrefix+key, tmp); err != nil {
 		return false, fmt.Errorf("sweep: quarantine %s: %w", key, err)
 	}
 	if err := s.blobs.Delete(ctx, key); err != nil && !errors.Is(err, blob.ErrNotFound) {
@@ -291,7 +281,7 @@ func (s *Sweeper) safeDelete(ctx context.Context, repo, key string) (bool, error
 		if p.Key != key {
 			continue
 		}
-		if err := s.blobs.UploadFile(ctx, key, tmp); err != nil {
+		if err := s.blobs.Copy(ctx, key, quarantinePrefix+key); err != nil {
 			return false, fmt.Errorf("sweep: restore %s registered mid-delete: %w", key, err)
 		}
 		s.logger.Warn("orphan pack sweep: restored pack registered mid-delete", "key", key)
@@ -339,8 +329,8 @@ func (s *Sweeper) healQuarantine(ctx context.Context, report *SweepReport) error
 		reclaims := false // restore-then-purge is net zero; only an aged-orphan purge frees bytes
 		if registered {
 			if _, err := s.blobs.Stat(ctx, orig); errors.Is(err, blob.ErrNotFound) {
-				if err := s.restoreFromQuarantine(ctx, q.Key, orig); err != nil {
-					errs = append(errs, err)
+				if err := s.blobs.Copy(ctx, orig, q.Key); err != nil {
+					errs = append(errs, fmt.Errorf("sweep: heal %s: restore: %w", orig, err))
 					continue
 				}
 				s.logger.Warn("orphan pack sweep: healed registered pack from quarantine", "key", orig)
@@ -362,25 +352,6 @@ func (s *Sweeper) healQuarantine(ctx context.Context, report *SweepReport) error
 		}
 	}
 	return errors.Join(errs...)
-}
-
-// restoreFromQuarantine copies the quarantined bytes back to the original
-// key through a local temp file (the BlobStore surface has no server-side
-// copy; sweeps are rare and packs are modest).
-func (s *Sweeper) restoreFromQuarantine(ctx context.Context, quarantineKey, orig string) error {
-	tmpDir, err := os.MkdirTemp("", "orphan-heal-*")
-	if err != nil {
-		return fmt.Errorf("sweep: heal %s: %w", orig, err)
-	}
-	defer os.RemoveAll(tmpDir)
-	tmp := filepath.Join(tmpDir, "restore.pack")
-	if err := s.blobs.DownloadFile(ctx, quarantineKey, tmp); err != nil {
-		return fmt.Errorf("sweep: heal %s: download quarantine: %w", orig, err)
-	}
-	if err := s.blobs.UploadFile(ctx, orig, tmp); err != nil {
-		return fmt.Errorf("sweep: heal %s: restore upload: %w", orig, err)
-	}
-	return nil
 }
 
 // revalidateOrphan re-checks one delete candidate against live state,

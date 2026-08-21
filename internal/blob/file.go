@@ -112,6 +112,11 @@ func (b *File) Delete(ctx context.Context, key string) error {
 	return bucketDelete(ctx, b.bucket, key)
 }
 
+// Copy duplicates srcKey to dstKey (local file copy inside the bucket dir).
+func (b *File) Copy(ctx context.Context, dstKey, srcKey string) error {
+	return bucketCopy(ctx, b.bucket, dstKey, srcKey)
+}
+
 // bucketUploadFile streams the local file at path into bucket under key. It
 // is the single upload implementation for gocloud-backed BlobStores.
 func bucketUploadFile(ctx context.Context, bucket *gcblob.Bucket, key, path string) error {
@@ -177,6 +182,20 @@ func bucketStat(ctx context.Context, bucket *gcblob.Bucket, key string) (int64, 
 		return 0, fmt.Errorf("stat %s: %w", key, err)
 	}
 	return attrs.Size, nil
+}
+
+// bucketCopy duplicates srcKey to dstKey inside the bucket, mapping
+// gocloud's NotFound code onto ErrNotFound. It is the single Copy
+// implementation for gocloud-backed BlobStores.
+func bucketCopy(ctx context.Context, bucket *gcblob.Bucket, dstKey, srcKey string) error {
+	assertf(bucket != nil && dstKey != "" && srcKey != "", "bucketCopy(%q, %q)", dstKey, srcKey)
+	if err := bucket.Copy(ctx, dstKey, srcKey, nil); err != nil {
+		if gcerrors.Code(err) == gcerrors.NotFound {
+			return fmt.Errorf("copy %s -> %s: %w", srcKey, dstKey, ErrNotFound)
+		}
+		return fmt.Errorf("copy %s -> %s: %w", srcKey, dstKey, err)
+	}
+	return nil
 }
 
 // bucketList returns all objects under prefix.
