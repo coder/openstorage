@@ -10,6 +10,7 @@ package ref
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -147,6 +148,22 @@ func (s *SQLite) ListRefsWithMeta(ctx context.Context, repo string) ([]RefInfo, 
 		refs = append(refs, r)
 	}
 	return refs, rows.Err()
+}
+
+// GetRef returns the current sha of one ref, or ErrNotFound.
+func (s *SQLite) GetRef(ctx context.Context, repo, name string) (string, error) {
+	assertf(repo != "" && name != "", "GetRef: empty repo %q or name %q", repo, name)
+	var sha string
+	err := s.db.QueryRowContext(ctx,
+		`SELECT sha FROM refs WHERE repo = ? AND name = ?`, repo, name).Scan(&sha)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", ErrNotFound
+	}
+	if err != nil {
+		return "", err
+	}
+	assertf(ValidSHA(sha), "refs table holds malformed sha %q for %s/%s", sha, repo, name)
+	return sha, nil
 }
 
 // CASRef performs the compare-and-swap ref update. Returns won=false (no

@@ -4,6 +4,7 @@ package ref
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/url"
 	"regexp"
@@ -24,6 +25,9 @@ var shaRe = regexp.MustCompile(`\A[0-9a-f]{40}\z`)
 
 // ValidSHA reports whether s is a well-formed 40-hex git object id.
 func ValidSHA(s string) bool { return shaRe.MatchString(s) }
+
+// ErrNotFound reports a GetRef miss: the ref does not currently exist.
+var ErrNotFound = errors.New("ref not found")
 
 // assertf is a fail-fast invariant check (crash-and-burn style).
 func assertf(cond bool, format string, args ...any) {
@@ -58,6 +62,10 @@ type RefStore interface {
 	// ListRefsWithMeta returns all refs for repo sorted by name ascending,
 	// including creation timestamps (the read API's branches/tags source).
 	ListRefsWithMeta(ctx context.Context, repo string) ([]RefInfo, error)
+	// GetRef returns the current sha of one ref (a point-read: the
+	// IdempotentCAS recovery recheck must not scan the repo's whole ref
+	// table). Returns ErrNotFound when the ref does not exist.
+	GetRef(ctx context.Context, repo, name string) (string, error)
 	// CASRef performs a compare-and-swap ref update (old/new = ZeroSHA for
 	// create/delete). Returns won=false (no error) when the precondition
 	// failed, i.e. someone else won the race.
@@ -184,6 +192,22 @@ func (s *PG) ListRefsWithMeta(ctx context.Context, repo string) ([]RefInfo, erro
 		refs = append(refs, r)
 	}
 	return refs, rows.Err()
+}
+
+// GetRef returns the current sha of one ref, or ErrNotFound.
+func (s *PG) GetRef(ctx context.Context, repo, name string) (string, error) {
+	assertf(repo != "" && name != "", "GetRef: empty repo %q or name %q", repo, name)
+	var sha string
+	err := s.pool.QueryRow(ctx,
+		`SELECT sha FROM refs WHERE repo = $1 AND name = $2`, repo, name).Scan(&sha)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", ErrNotFound
+	}
+	if err != nil {
+		return "", err
+	}
+	assertf(ValidSHA(sha), "refs table holds malformed sha %q for %s/%s", sha, repo, name)
+	return sha, nil
 }
 
 // CASRef performs the compare-and-swap ref update. Returns won=false (no

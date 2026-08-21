@@ -32,6 +32,13 @@ const (
 	EnvTestMode  = "CODESTORAGE_TEST_MODE"
 	EnvCrash     = "CODESTORAGE_TEST_CRASH"
 	EnvHookDelay = "CODESTORAGE_TEST_HOOK_DELAY_MS"
+	// EnvCASDrop/EnvCASDropHard hold a marker-file path; the first update
+	// hook to create the marker lets its CAS statement commit, then reports
+	// a synthetic connection-drop error (issue #2's ambiguous outcome).
+	// The hard variant also fails the recovery recheck read, as a truly
+	// dead connection would. Later invocations pass through untouched.
+	EnvCASDrop     = "CODESTORAGE_TEST_CAS_DROP"
+	EnvCASDropHard = "CODESTORAGE_TEST_CAS_DROP_HARD"
 	// CrashHeader lets tests request an EnvCrash injection per push; the
 	// server refuses it outside test mode.
 	CrashHeader = "X-Codestorage-Test-Crash"
@@ -53,9 +60,13 @@ func testMode() bool { return os.Getenv(EnvTestMode) == "1" }
 // them; instead the cmd wiring seam — which runs in the hook subprocess
 // too, it is the same binary — replaces this variable at startup with the
 // events.RefStore decorator so git pushes emit push events (docs/06)
-// exactly like API writes. The identity default keeps hooks working
-// before/without eventing wiring.
-var WrapHookRefStore = func(ctx context.Context, st ref.RefStore) ref.RefStore { return st }
+// exactly like API writes (that decorator wraps ref.IdempotentCAS itself).
+// The eventless default keeps hooks working before/without eventing wiring,
+// wrapping just the CAS-recovery decorator so ambiguous outcomes still
+// reconcile.
+var WrapHookRefStore = func(ctx context.Context, st ref.RefStore) ref.RefStore {
+	return ref.IdempotentCAS{RefStore: st}
+}
 
 func mustEnv(names ...string) string {
 	for _, n := range names {
@@ -224,7 +235,11 @@ func updateHook(ctx context.Context, args []string) error {
 		return err
 	}
 	defer st.Close()
-	store := WrapHookRefStore(ctx, st)
+	var inner ref.RefStore = st
+	if testMode() {
+		inner = injectCASDrop(inner)
+	}
+	store := WrapHookRefStore(ctx, inner)
 	assertf(store != nil, "WrapHookRefStore returned nil")
 	won, err := store.CASRef(ctx, repo, refName, old, new)
 	if err != nil {
@@ -234,6 +249,52 @@ func updateHook(ctx context.Context, args []string) error {
 		return fmt.Errorf("CAS conflict: %s moved concurrently (expected %.8s)", refName, old)
 	}
 	return nil
+}
+
+// errCASDrop is the synthetic post-commit connection-drop error the
+// EnvCASDrop knobs inject.
+var errCASDrop = errors.New("injected post-commit connection drop")
+
+// casDropStore simulates a DB connection dying after the CAS statement
+// commits: CASRef delegates (the write lands), then reports errCASDrop.
+// hard additionally fails GetRef, so the ref.IdempotentCAS recovery recheck
+// cannot run either — as with a truly dead connection.
+type casDropStore struct {
+	ref.RefStore
+	hard bool
+}
+
+func (s casDropStore) CASRef(ctx context.Context, repo, name, old, new string) (bool, error) {
+	if _, err := s.RefStore.CASRef(ctx, repo, name, old, new); err != nil {
+		return false, err
+	}
+	return false, errCASDrop
+}
+
+func (s casDropStore) GetRef(ctx context.Context, repo, name string) (string, error) {
+	if s.hard {
+		return "", errCASDrop
+	}
+	return s.RefStore.GetRef(ctx, repo, name)
+}
+
+// injectCASDrop consumes the EnvCASDrop/EnvCASDropHard marker knobs (test
+// mode only): the invocation that creates the marker file gets the faulty
+// store; every other invocation passes st through untouched.
+func injectCASDrop(st ref.RefStore) ref.RefStore {
+	marker, hard := os.Getenv(EnvCASDrop), false
+	if marker == "" {
+		marker, hard = os.Getenv(EnvCASDropHard), true
+	}
+	if marker == "" {
+		return st
+	}
+	f, err := os.OpenFile(marker, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+	if err != nil {
+		return st // marker exists: knob already consumed
+	}
+	_ = f.Close()
+	return casDropStore{RefStore: st, hard: hard}
 }
 
 // enforceRefPolicy evaluates the token's ref policies (docs/02, docs/upstream

@@ -21,10 +21,13 @@ const (
 )
 
 // fakeInner scripts CASRef outcomes; the other RefStore methods delegate
-// through the embedded interface by construction.
+// through the embedded interface by construction. sha scripts GetRef — the
+// ref.IdempotentCAS recovery recheck — and defaults to a not-found miss so
+// non-recovery tests keep their plain lost/failed semantics.
 type fakeInner struct {
 	won bool
 	err error
+	sha string
 }
 
 func (f *fakeInner) ListRefs(context.Context, string) (map[string]string, error) {
@@ -32,6 +35,12 @@ func (f *fakeInner) ListRefs(context.Context, string) (map[string]string, error)
 }
 func (f *fakeInner) ListRefsWithMeta(context.Context, string) ([]ref.RefInfo, error) {
 	return nil, nil
+}
+func (f *fakeInner) GetRef(context.Context, string, string) (string, error) {
+	if f.sha == "" {
+		return "", ref.ErrNotFound
+	}
+	return f.sha, nil
 }
 func (f *fakeInner) CASRef(_ context.Context, _, _, _, _ string) (bool, error) {
 	return f.won, f.err
@@ -198,6 +207,61 @@ func TestCASRefLostOrFailedEmitsNothing(t *testing.T) {
 			t.Errorf("failed CAS emitted %d deliveries, %d sync pokes", len(env.deliveries), len(env.syncPokes))
 		}
 	})
+}
+
+// TestCASRefAmbiguousRecoveryEmitsPush is issue #2's acceptance test at the
+// events seam: the inner store commits the update, then reports a connection
+// drop. The ref.IdempotentCAS wrap under this decorator re-reads the ref,
+// reconciles the outcome to a win, and the push webhook is emitted instead
+// of silently dropped.
+func TestCASRefAmbiguousRecoveryEmitsPush(t *testing.T) {
+	env := newEmitEnv(t, &fakeInner{err: errors.New("post-commit drop"), sha: shaB}, twoHooks())
+	won, err := env.store.CASRef(context.Background(), "repo_abc123", "refs/heads/main", shaA, shaB)
+	if !won || err != nil {
+		t.Fatalf("CASRef = (%v, %v), want recovered (true, nil)", won, err)
+	}
+	if len(env.deliveries) != 2 {
+		t.Fatalf("got %d deliveries, want 2 (one per webhook)", len(env.deliveries))
+	}
+	var got PushPayload
+	if err := json.Unmarshal(env.deliveries[0].Payload, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Before != shaA || got.After != shaB {
+		t.Errorf("payload before/after = %s/%s, want %s/%s", got.Before, got.After, shaA, shaB)
+	}
+	if len(env.syncPokes) != 1 {
+		t.Errorf("sync pokes = %v, want exactly one", env.syncPokes)
+	}
+}
+
+// TestCASRefLostToDifferentSHAEmitsNothing: a genuine conflict (the ref
+// holds someone else's sha) must stay a hard loss with zero emissions.
+func TestCASRefLostToDifferentSHAEmitsNothing(t *testing.T) {
+	const shaC = "cccccccccccccccccccccccccccccccccccccccc"
+	env := newEmitEnv(t, &fakeInner{won: false, sha: shaC}, twoHooks())
+	won, err := env.store.CASRef(context.Background(), "repo_abc123", "refs/heads/main", shaA, shaB)
+	if won || err != nil {
+		t.Fatalf("CASRef = (%v, %v), want (false, nil)", won, err)
+	}
+	if len(env.deliveries)+len(env.syncPokes) != 0 {
+		t.Errorf("genuine conflict emitted %d deliveries, %d sync pokes", len(env.deliveries), len(env.syncPokes))
+	}
+}
+
+// TestCASRefAmbiguousDeleteStaysFailed pins the delete decision: absence is
+// not positive evidence, so an ambiguous-error delete keeps its error and
+// emits nothing (no fabricated deletion webhook).
+func TestCASRefAmbiguousDeleteStaysFailed(t *testing.T) {
+	innerErr := errors.New("post-commit drop")
+	env := newEmitEnv(t, &fakeInner{err: innerErr}, twoHooks())
+	won, err := env.store.CASRef(context.Background(), "repo_abc123", "refs/heads/main", shaA, ref.ZeroSHA)
+	if won || !errors.Is(err, innerErr) {
+		t.Fatalf("CASRef = (%v, %v), want (false, inner error)", won, err)
+	}
+	if len(env.deliveries)+len(env.syncPokes) != 0 {
+		t.Errorf("ambiguous delete emitted %d deliveries, %d sync pokes", len(env.deliveries), len(env.syncPokes))
+	}
 }
 
 // TestEphemeralUpdatesEmitNothing covers invariant 7 on BOTH write

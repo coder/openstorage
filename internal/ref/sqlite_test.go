@@ -2,6 +2,7 @@ package ref
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -108,6 +109,28 @@ func TestSQLiteInitSchemaIdempotent(t *testing.T) {
 		if err != nil {
 			t.Fatalf("concurrent InitSchema: %v", err)
 		}
+	}
+}
+
+// TestSQLiteGetRef pins the point-read contract: the current sha for a
+// present ref, ErrNotFound for an absent one.
+func TestSQLiteGetRef(t *testing.T) {
+	ctx := context.Background()
+	s, _ := openTestSQLite(t)
+	const repo, name = "org/repo", "refs/heads/main"
+	a := testSHA(0xaa)
+
+	if _, err := s.GetRef(ctx, repo, name); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("GetRef(absent) = %v, want ErrNotFound", err)
+	}
+	if won, err := s.CASRef(ctx, repo, name, ZeroSHA, a); err != nil || !won {
+		t.Fatalf("create CASRef = (%v, %v)", won, err)
+	}
+	if sha, err := s.GetRef(ctx, repo, name); err != nil || sha != a {
+		t.Fatalf("GetRef = (%q, %v), want (%q, nil)", sha, err, a)
+	}
+	if _, err := s.GetRef(ctx, "other/repo", name); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("GetRef(other repo) = %v, want ErrNotFound (no cross-repo leak)", err)
 	}
 }
 
