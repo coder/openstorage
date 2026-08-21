@@ -148,13 +148,15 @@ func testGenerationBumpsOnEveryMutation(t *testing.T, s Store) {
 				t.Fatal(err)
 			}
 		}, true},
-		// A retried identical registration still bumps ("always" per the
-		// accepted scope): one spurious full hydrate, never a stale serve.
+		// The generation is an invalidation token over committed row
+		// changes, not a call counter: a retried identical registration
+		// changes no rows (ON CONFLICT DO NOTHING), fires no trigger, and
+		// must not invalidate hydrate markers — nothing changed.
 		{"RegisterPacks idempotent retry", func(t *testing.T) {
 			if err := s.RegisterPacks(ctx, repo, []Pack{{ID: "p1", Key: "k1"}}); err != nil {
 				t.Fatal(err)
 			}
-		}, true},
+		}, false},
 		{"CASRef create won", func(t *testing.T) { mustCAS(branch, ZeroSHA, testSHA(0x11), true) }, true},
 		{"CASRef create lost", func(t *testing.T) { mustCAS(branch, ZeroSHA, testSHA(0x22), false) }, false},
 		{"CASRef update won", func(t *testing.T) { mustCAS(branch, testSHA(0x11), testSHA(0x22), true) }, true},
@@ -176,6 +178,97 @@ func testGenerationBumpsOnEveryMutation(t *testing.T, s Store) {
 
 	if g := gen(other); g != 1 {
 		t.Fatalf("isolated repo generation moved to %d; mutations must only bump their own repo", g)
+	}
+
+	// Multi-pack registration: the triggers fire per changed row, so two
+	// new packs advance the generation by exactly two. Callers only rely on
+	// "strictly increases"; the exact delta pins the per-row granularity.
+	before := gen(repo)
+	if err := s.RegisterPacks(ctx, repo, []Pack{{ID: "m1", Key: "km1"}, {ID: "m2", Key: "km2"}}); err != nil {
+		t.Fatal(err)
+	}
+	if got := gen(repo); got != before+2 {
+		t.Fatalf("multi-pack registration: generation %d -> %d, want %d", before, got, before+2)
+	}
+}
+
+// TestGenerationLegacyWriterStillBumps pins the rollout-safety property the
+// schema triggers exist for (PR #14 review, P1): a writer running a binary
+// that predates the generation counter commits plain refs/packs DML with no
+// application-side bump — the INSERT/UPDATE/DELETE statements below are
+// exactly what such a binary executes. Once any upgraded node's InitSchema
+// installed the triggers, those legacy writes must bump the generation
+// anyway, on both backends.
+func TestGenerationLegacyWriterStillBumps(t *testing.T) {
+	runRefBackends(t, testGenerationLegacyWriterStillBumps)
+}
+
+func testGenerationLegacyWriterStillBumps(t *testing.T, s Store) {
+	ctx := context.Background()
+	repo := t.Name()
+
+	// Raw SQL, bypassing every store method — the legacy binary's writes.
+	exec := func(pgSQL, liteSQL string, args ...any) {
+		t.Helper()
+		var err error
+		switch b := s.(type) {
+		case *PG:
+			_, err = b.pool.Exec(ctx, pgSQL, args...)
+		case *SQLite:
+			_, err = b.db.ExecContext(ctx, liteSQL, args...)
+		default:
+			t.Fatalf("unexpected store type %T", s)
+		}
+		if err != nil {
+			t.Fatalf("legacy write: %v", err)
+		}
+	}
+	gen := func() int64 {
+		t.Helper()
+		g, err := s.GetGeneration(ctx, repo)
+		if err != nil {
+			t.Fatalf("GetGeneration: %v", err)
+		}
+		return g
+	}
+
+	steps := []struct {
+		name           string
+		pgSQL, liteSQL string
+		args           []any
+	}{
+		{
+			"legacy ref create",
+			`INSERT INTO refs (repo, name, sha, created_at) VALUES ($1, $2, $3, now()) ON CONFLICT DO NOTHING`,
+			`INSERT INTO refs (repo, name, sha, created_at) VALUES (?, ?, ?, unixepoch()) ON CONFLICT DO NOTHING`,
+			[]any{repo, "refs/heads/main", testSHA(0x41)},
+		},
+		{
+			"legacy ref update",
+			`UPDATE refs SET sha = $1 WHERE repo = $2 AND name = $3 AND sha = $4`,
+			`UPDATE refs SET sha = ? WHERE repo = ? AND name = ? AND sha = ?`,
+			[]any{testSHA(0x42), repo, "refs/heads/main", testSHA(0x41)},
+		},
+		{
+			"legacy pack insert",
+			`INSERT INTO packs (repo, id, s3_key) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
+			`INSERT INTO packs (repo, id, s3_key) VALUES (?, ?, ?) ON CONFLICT DO NOTHING`,
+			[]any{repo, "lp1", "lk1"},
+		},
+		{
+			"legacy ref delete",
+			`DELETE FROM refs WHERE repo = $1 AND name = $2 AND sha = $3`,
+			`DELETE FROM refs WHERE repo = ? AND name = ? AND sha = ?`,
+			[]any{repo, "refs/heads/main", testSHA(0x42)},
+		},
+	}
+	for _, step := range steps {
+		before := gen()
+		exec(step.pgSQL, step.liteSQL, step.args...)
+		if got := gen(); got != before+1 {
+			t.Fatalf("%s: generation %d -> %d, want %d (schema trigger must fire for legacy DML)",
+				step.name, before, got, before+1)
+		}
 	}
 }
 

@@ -2,10 +2,8 @@
 // re-exec'd hook processes share one DB file on the same host, so the DSN
 // forces WAL + busy_timeout, and _txlock=immediate turns every explicit
 // transaction into BEGIN IMMEDIATE (no deferred→write lock upgrade
-// deadlocks). CAS semantics match the PG contract: refs only ever change
-// atomically — PG through single statements (with a generation-bump CTE),
-// this backend through one BEGIN IMMEDIATE transaction per CAS (SQLite has
-// no data-modifying CTEs).
+// deadlocks). CAS semantics are byte-for-byte the PG contract: refs only
+// ever change through single statements.
 
 package ref
 
@@ -87,8 +85,8 @@ func (s *SQLite) InitSchema(ctx context.Context) error {
 		`CREATE TABLE IF NOT EXISTS packs (repo TEXT, id TEXT, s3_key TEXT NOT NULL,
 		                                   created_at INTEGER DEFAULT (unixepoch()), PRIMARY KEY (repo, id))`,
 		// Per-repo mutation generation (issue #4). No row means "never
-		// mutated" (GetGeneration reports 0); the first bump's upsert
-		// creates the row at the DEFAULT — same contract as PG.
+		// mutated" (GetGeneration reports 0); the first bump creates the
+		// row at 1 — same contract as PG.
 		`CREATE TABLE IF NOT EXISTS repo_generations (repo TEXT PRIMARY KEY,
 		                                              generation INTEGER NOT NULL DEFAULT 1)`,
 	} {
@@ -110,6 +108,33 @@ func (s *SQLite) InitSchema(ctx context.Context) error {
 		} {
 			if _, err := tx.ExecContext(ctx, stmt); err != nil {
 				return fmt.Errorf("sqlite init schema: add refs.created_at: %w", err)
+			}
+		}
+	}
+	// Generation-bump triggers (issue #4): in SCHEMA, not application code,
+	// so writers running older binaries (stale hook scripts re-execing a
+	// pre-upgrade binary) bump too — see the PG InitSchema rationale. SQLite
+	// has no multi-event triggers, so one trigger per (table, event); bodies
+	// use INSERT OR IGNORE + UPDATE (no UPSERT inside trigger bodies).
+	// Immediate per-row firing is deadlock-free here: SQLite has one writer
+	// at a time (BEGIN IMMEDIATE + busy_timeout). DROP + CREATE keeps future
+	// body changes effective on existing databases; the transaction plus
+	// SQLite's file lock make it safe under concurrent startups.
+	for _, table := range []string{"refs", "packs"} {
+		for _, ev := range []struct{ event, key string }{
+			{"INSERT", "NEW.repo"}, {"UPDATE", "NEW.repo"}, {"DELETE", "OLD.repo"},
+		} {
+			name := fmt.Sprintf("%s_bump_generation_%s", table, strings.ToLower(ev.event))
+			if _, err := tx.ExecContext(ctx,
+				fmt.Sprintf(`DROP TRIGGER IF EXISTS %s`, name)); err != nil {
+				return fmt.Errorf("sqlite init schema: drop trigger %s: %w", name, err)
+			}
+			if _, err := tx.ExecContext(ctx, fmt.Sprintf(`
+CREATE TRIGGER %s AFTER %s ON %s FOR EACH ROW BEGIN
+    INSERT OR IGNORE INTO repo_generations (repo, generation) VALUES (%s, 0);
+    UPDATE repo_generations SET generation = generation + 1 WHERE repo = %s;
+END`, name, ev.event, table, ev.key, ev.key)); err != nil {
+				return fmt.Errorf("sqlite init schema: create trigger %s: %w", name, err)
 			}
 		}
 	}
@@ -175,14 +200,12 @@ func (s *SQLite) GetRef(ctx context.Context, repo, name string) (string, error) 
 
 // CASRef performs the compare-and-swap ref update. Returns won=false (no
 // error) when the precondition failed, i.e. someone else won the race.
-//
-// The swap statement and the generation bump (issue #4, won swaps only) run
-// in one BEGIN IMMEDIATE transaction — SQLite has no data-modifying CTEs, so
-// atomicity comes from the transaction instead of PG's single statement. The
-// IdempotentCAS ambiguity classification (idempotent.go) is unaffected: a
-// BEGIN failure provably never executed the swap (notExecuted), and every
-// later failure rolls the transaction back, surfacing as a *sqlite.Error the
-// classifier already treats as definitive.
+// Refs only ever change inside these single statements, so a broken/partial
+// ref state is impossible by construction. A won swap also bumps the repo
+// generation via the InitSchema-installed triggers — inside the same
+// implicit transaction, so the statement stays the single unit of commit
+// and the IdempotentCAS ambiguity classification (idempotent.go) is
+// unchanged.
 func (s *SQLite) CASRef(ctx context.Context, repo, name, old, new string) (won bool, err error) {
 	assertf(ValidSHA(old), "CASRef: malformed old sha %q", old)
 	assertf(ValidSHA(new), "CASRef: malformed new sha %q", new)
@@ -205,12 +228,6 @@ func (s *SQLite) CASRef(ctx context.Context, repo, name, old, new string) (won b
 		return false, fmt.Errorf("cas %s/%s: %w", repo, name, notExecuted(cerr))
 	}
 
-	tx, err := conn.BeginTx(ctx, nil) // BEGIN IMMEDIATE via _txlock
-	if err != nil {
-		return false, fmt.Errorf("cas begin %s/%s: %w", repo, name, notExecuted(err))
-	}
-	defer func() { _ = tx.Rollback() }()
-
 	var tag string
 	var res sql.Result
 	switch {
@@ -218,17 +235,17 @@ func (s *SQLite) CASRef(ctx context.Context, repo, name, old, new string) (won b
 		// created_at set explicitly (not via column default): databases
 		// migrated by the InitSchema ALTER have no default on the column.
 		// SHA updates below never touch it.
-		res, err = tx.ExecContext(ctx,
+		res, err = conn.ExecContext(ctx,
 			`INSERT INTO refs (repo, name, sha, created_at) VALUES (?, ?, ?, unixepoch()) ON CONFLICT DO NOTHING`,
 			repo, name, new)
 		tag = "create"
 	case new == ZeroSHA: // delete
-		res, err = tx.ExecContext(ctx,
+		res, err = conn.ExecContext(ctx,
 			`DELETE FROM refs WHERE repo = ? AND name = ? AND sha = ?`,
 			repo, name, old)
 		tag = "delete"
 	default: // update
-		res, err = tx.ExecContext(ctx,
+		res, err = conn.ExecContext(ctx,
 			`UPDATE refs SET sha = ? WHERE repo = ? AND name = ? AND sha = ?`,
 			new, repo, name, old)
 		tag = "update"
@@ -241,18 +258,6 @@ func (s *SQLite) CASRef(ctx context.Context, repo, name, old, new string) (won b
 		return false, fmt.Errorf("cas %s %s/%s rows: %w", tag, repo, name, err)
 	}
 	assertf(n == 0 || n == 1, "cas %s %s/%s affected %d rows", tag, repo, name, n)
-	if n == 1 {
-		// Same-transaction generation bump on the won swap only: lost races
-		// change nothing, so they must not invalidate hydrate markers.
-		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO repo_generations (repo) VALUES (?)
-			 ON CONFLICT (repo) DO UPDATE SET generation = generation + 1`, repo); err != nil {
-			return false, fmt.Errorf("cas %s %s/%s bump generation: %w", tag, repo, name, err)
-		}
-	}
-	if err := tx.Commit(); err != nil {
-		return false, fmt.Errorf("cas %s %s/%s commit: %w", tag, repo, name, err)
-	}
 	return n == 1, nil
 }
 
@@ -273,15 +278,6 @@ func (s *SQLite) RegisterPacks(ctx context.Context, repo string, packs []Pack) e
 			repo, p.ID, p.Key); err != nil {
 			return err
 		}
-	}
-	// Same-transaction generation bump (issue #4): a committed pack
-	// registration must invalidate the hydrate short-circuit. Bumped
-	// unconditionally — a retried registration whose rows all already
-	// existed costs one spurious full hydrate, never a stale serve.
-	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO repo_generations (repo) VALUES (?)
-		 ON CONFLICT (repo) DO UPDATE SET generation = generation + 1`, repo); err != nil {
-		return err
 	}
 	return tx.Commit()
 }
