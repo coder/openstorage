@@ -258,17 +258,20 @@ func (b *S3) ListPages(ctx context.Context, prefix string, pageSize int, fn func
 	return bucketListPages(ctx, b.bucket, prefix, pageSize, fn)
 }
 
-// VersioningEnabled reports whether the backing bucket has S3 versioning
-// enabled. The orphan-pack sweeper's delete mode refuses versioned buckets:
-// deletes there only write delete markers, so sweeps would reclaim nothing
-// while reporting that they did.
+// VersioningEnabled reports whether the backing bucket has ever had S3
+// versioning turned on (status Enabled OR Suspended — suspension keeps all
+// previously stored versions, and unversioned deletes still only hide the
+// current version behind a delete marker). The orphan-pack sweeper's delete
+// mode refuses such buckets: its deletes would reclaim nothing while
+// reporting that they did.
 func (b *S3) VersioningEnabled(ctx context.Context) (bool, error) {
 	assertf(b.client != nil, "VersioningEnabled: S3 opened without a client")
 	out, err := b.client.GetBucketVersioning(ctx, &s3.GetBucketVersioningInput{Bucket: aws.String(b.name)})
 	if err != nil {
 		return false, fmt.Errorf("get bucket versioning %q: %w", b.name, err)
 	}
-	return out.Status == s3types.BucketVersioningStatusEnabled, nil
+	return out.Status == s3types.BucketVersioningStatusEnabled ||
+		out.Status == s3types.BucketVersioningStatusSuspended, nil
 }
 
 // SignedURL returns a presigned S3 URL for method (GET or PUT) on key.

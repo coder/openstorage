@@ -84,7 +84,7 @@ func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL string, orgPEM
 			case err != nil:
 				logger.Warn("cannot verify bucket versioning for sweep delete mode", "err", err)
 			case versioned:
-				return fail(fmt.Errorf("%s: bucket has S3 versioning enabled; delete-mode sweeps only write delete markers there (add a noncurrent-version lifecycle policy and disable versioning, or keep the sweeper list-only)", envSweepDeleteEnabled))
+				return fail(fmt.Errorf("%s: bucket has S3 versioning enabled or suspended; delete-mode sweeps only write delete markers there (add a noncurrent-version lifecycle policy, or keep the sweeper list-only)", envSweepDeleteEnabled))
 			}
 		}
 	}

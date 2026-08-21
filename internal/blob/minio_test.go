@@ -13,6 +13,9 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
+	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	tcminio "github.com/testcontainers/testcontainers-go/modules/minio"
 )
 
@@ -101,12 +104,32 @@ func TestS3_CopyMultipart(t *testing.T) {
 		t.Fatalf("Copy of missing source = %v, want ErrNotFound", err)
 	}
 
-	// An unversioned bucket must not trip the delete-mode versioning guard.
+	// Versioning guard states: a fresh bucket is unversioned; Enabled and
+	// then Suspended must BOTH report versioned (suspension retains every
+	// previously stored version).
 	versioned, err := b.VersioningEnabled(ctx)
 	if err != nil {
 		t.Fatalf("VersioningEnabled: %v", err)
 	}
 	if versioned {
 		t.Fatal("fresh MinIO bucket reported as versioned")
+	}
+	for _, status := range []s3types.BucketVersioningStatus{
+		s3types.BucketVersioningStatusEnabled,
+		s3types.BucketVersioningStatusSuspended,
+	} {
+		if _, err := b.client.PutBucketVersioning(ctx, &awss3.PutBucketVersioningInput{
+			Bucket:                  aws.String("copy-test"),
+			VersioningConfiguration: &s3types.VersioningConfiguration{Status: status},
+		}); err != nil {
+			t.Fatalf("PutBucketVersioning(%s): %v", status, err)
+		}
+		versioned, err := b.VersioningEnabled(ctx)
+		if err != nil {
+			t.Fatalf("VersioningEnabled after %s: %v", status, err)
+		}
+		if !versioned {
+			t.Fatalf("bucket with versioning %s must report versioned", status)
+		}
 	}
 }

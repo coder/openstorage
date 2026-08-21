@@ -260,20 +260,16 @@ func TestSweep_ThresholdBoundary(t *testing.T) {
 	}
 }
 
-// registeredMidSweep returns the empty snapshot on the first ListPacks call
-// and the registered set afterwards, simulating a pack whose RegisterPacks
-// commits between the sweep's classification snapshot and its delete.
+// registeredMidSweep reports unregistered on the first HasPack call and
+// registered afterwards, simulating a pack whose RegisterPacks commits
+// between the sweep's classification read and its delete.
 type registeredMidSweep struct {
-	packs []ref.Pack
 	calls int
 }
 
-func (p *registeredMidSweep) ListPacks(context.Context, string) ([]ref.Pack, error) {
+func (p *registeredMidSweep) HasPack(context.Context, string, string) (bool, error) {
 	p.calls++
-	if p.calls == 1 {
-		return nil, nil
-	}
-	return p.packs, nil
+	return p.calls > 1, nil
 }
 
 // A pack registered mid-sweep must survive: the delete-time revalidation
@@ -285,7 +281,7 @@ func TestSweep_DeleteSkipsPackRegisteredMidSweep(t *testing.T) {
 	f.upload(key, "racer-bytes")
 	f.backdate(key, 25*time.Hour)
 
-	packs := &registeredMidSweep{packs: []ref.Pack{{ID: "racer", Key: key}}}
+	packs := &registeredMidSweep{}
 	s := NewSweeper(f.blobs, packs, SweepConfig{Threshold: 24 * time.Hour, Delete: true}, slog.New(slog.DiscardHandler))
 	report, err := s.Sweep(context.Background())
 	if err != nil {
@@ -301,25 +297,21 @@ func TestSweep_DeleteSkipsPackRegisteredMidSweep(t *testing.T) {
 		t.Fatalf("mid-sweep-registered pack %q was deleted", key)
 	}
 	if packs.calls != 2 {
-		t.Fatalf("ListPacks calls = %d, want 2 (snapshot + revalidation)", packs.calls)
+		t.Fatalf("HasPack calls = %d, want 2 (classification + revalidation)", packs.calls)
 	}
 }
 
-// registeredAfterCall flips from empty to the registered set strictly after
-// the Nth ListPacks call, simulating a RegisterPacks landing at a chosen
+// registeredAfterCall flips from unregistered to registered strictly after
+// the Nth HasPack call, simulating a RegisterPacks landing at a chosen
 // point in the sweep.
 type registeredAfterCall struct {
-	packs []ref.Pack
 	after int
 	calls int
 }
 
-func (p *registeredAfterCall) ListPacks(context.Context, string) ([]ref.Pack, error) {
+func (p *registeredAfterCall) HasPack(context.Context, string, string) (bool, error) {
 	p.calls++
-	if p.calls <= p.after {
-		return nil, nil
-	}
-	return p.packs, nil
+	return p.calls > p.after, nil
 }
 
 // A registration landing between revalidation and the delete (the
@@ -332,9 +324,9 @@ func TestSweep_DeleteRestoresPackRegisteredMidDelete(t *testing.T) {
 	f.upload(key, content)
 	f.backdate(key, 25*time.Hour)
 
-	// Calls: 1 = classification snapshot, 2 = revalidateOrphan (both see
-	// it unregistered), 3 = safeDelete's post-delete recheck (registered).
-	packs := &registeredAfterCall{packs: []ref.Pack{{ID: "middelete", Key: key}}, after: 2}
+	// Calls: 1 = classification read, 2 = revalidateOrphan (both see it
+	// unregistered), 3 = safeDelete's post-delete recheck (registered).
+	packs := &registeredAfterCall{after: 2}
 	s := NewSweeper(f.blobs, packs, SweepConfig{Threshold: 24 * time.Hour, Delete: true}, slog.New(slog.DiscardHandler))
 	report, err := s.Sweep(context.Background())
 	if err != nil {
@@ -354,8 +346,10 @@ func TestSweep_DeleteRestoresPackRegisteredMidDelete(t *testing.T) {
 	if err != nil || string(got) != content {
 		t.Fatalf("restored content = %q (err %v), want %q", got, err, content)
 	}
-	if f.exists("sweep/quarantine/" + key) {
-		t.Fatalf("quarantine backup not purged after restore")
+	// Retained on purpose: purging is strictly age-based so a fresh entry
+	// can never be yanked out from under another replica's handshake.
+	if !f.exists("sweep/quarantine/" + key) {
+		t.Fatalf("quarantine backup must be retained after a mid-delete restore")
 	}
 }
 
@@ -381,8 +375,8 @@ func TestSweep_ListOnlyStillHealsQuarantine(t *testing.T) {
 	if !f.exists(lost) {
 		t.Fatalf("list-only sweep did not heal registered-but-missing pack %q", lost)
 	}
-	if f.exists("sweep/quarantine/" + lost) {
-		t.Fatalf("healed backup %q was not purged (restore-purge is not destructive)", lost)
+	if !f.exists("sweep/quarantine/" + lost) {
+		t.Fatalf("list-only heal purged fresh backup %q (purging is delete- and age-gated)", lost)
 	}
 	if !f.exists("sweep/quarantine/" + stale) {
 		t.Fatalf("list-only sweep purged %q (purging must stay delete-gated)", stale)
@@ -413,8 +407,8 @@ func TestSweeper_HealStandalone(t *testing.T) {
 	if !f.exists(lost) {
 		t.Fatalf("standalone heal did not restore %q", lost)
 	}
-	if f.exists("sweep/quarantine/" + lost) {
-		t.Fatalf("restored backup %q not cleaned up (restore-purge is non-destructive)", lost)
+	if !f.exists("sweep/quarantine/" + lost) {
+		t.Fatalf("standalone heal purged backup %q (must be strictly restorative)", lost)
 	}
 	if !f.exists("sweep/quarantine/" + stale) {
 		t.Fatalf("standalone heal purged %q despite Delete=true (must be strictly restorative)", stale)
@@ -422,14 +416,17 @@ func TestSweeper_HealStandalone(t *testing.T) {
 }
 
 // healQuarantine finishes a crashed handshake: a quarantine backup whose
-// original key is registered but missing is restored; an unregistered
-// backup is purged only once it ages past the threshold.
+// original key is registered but missing is restored; any backup is purged
+// only once it ages past the threshold (fresh entries may be another
+// handshake's restore source).
 func TestSweep_HealQuarantine(t *testing.T) {
 	f := newSweepFixture(t)
 
-	// Crashed handshake: registered pack, blob missing, backup present.
+	// Crashed handshake: registered pack, blob missing, backup present and
+	// aged (so this delete-mode sweep may purge it after restoring).
 	lost := blob.PackKey("r1", "lost")
 	f.upload("sweep/quarantine/"+lost, "lost-bytes")
+	f.backdate("sweep/quarantine/"+lost, 25*time.Hour)
 	f.register("r1", "lost", lost)
 
 	// Reaped long ago: unregistered, backup aged past the threshold.
@@ -449,7 +446,7 @@ func TestSweep_HealQuarantine(t *testing.T) {
 		t.Fatalf("registered-but-missing pack %q was not healed from quarantine", lost)
 	}
 	if f.exists("sweep/quarantine/" + lost) {
-		t.Fatalf("healed backup %q was not purged", lost)
+		t.Fatalf("aged healed backup %q was not purged", lost)
 	}
 	if f.exists("sweep/quarantine/" + stale) {
 		t.Fatalf("aged unregistered backup %q was not purged", stale)
@@ -560,18 +557,18 @@ func TestSweep_AmbiguousDeleteRestoresFromQuarantine(t *testing.T) {
 	}
 }
 
-// failRecheck serves the classification and revalidation ListPacks reads,
+// failRecheck serves the classification and revalidation HasPack reads,
 // then fails the post-delete recheck (call 3) with a transient error.
 type failRecheck struct {
 	calls int
 }
 
-func (p *failRecheck) ListPacks(context.Context, string) ([]ref.Pack, error) {
+func (p *failRecheck) HasPack(context.Context, string, string) (bool, error) {
 	p.calls++
 	if p.calls == 3 {
-		return nil, errors.New("simulated transient registry failure")
+		return false, errors.New("simulated transient registry failure")
 	}
-	return nil, nil
+	return false, nil
 }
 
 // A failed post-delete recheck must restore the key from quarantine before

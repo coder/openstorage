@@ -114,6 +114,15 @@ func (s *SimRefStore) ListPacks(ctx context.Context, repo string) ([]ref.Pack, e
 	return s.inner.ListPacks(ctx, repo)
 }
 
+// HasPack delegates to the inner store unless a fault is injected; it
+// shares OpRefListPacks with ListPacks (one registry-read fault point).
+func (s *SimRefStore) HasPack(ctx context.Context, repo, key string) (bool, error) {
+	if class := s.inj.begin(OpRefListPacks); class != FaultNone {
+		return false, refReadFault(OpRefListPacks, class)
+	}
+	return s.inner.HasPack(ctx, repo, key)
+}
+
 // GetGeneration delegates to the inner store unless a fault is injected.
 // Faulting it starves the issue-#4 hydrate short-circuit, which must then
 // surface the error rather than serve from a stale marker.

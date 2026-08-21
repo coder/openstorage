@@ -29,13 +29,15 @@ import (
 	"time"
 
 	"codestorage/internal/blob"
-	"codestorage/internal/ref"
 )
 
-// PackLister is the slice of ref.RefStore the sweeper needs: the
-// authoritative registered-pack set per repo.
-type PackLister interface {
-	ListPacks(ctx context.Context, repo string) ([]ref.Pack, error)
+// PackRegistry is the slice of ref.RefStore the sweeper needs: point
+// membership in the authoritative registered-pack set. Point reads, not
+// ListPacks: a repo's registered-pack count is attacker-growable
+// (pre-receive registers packs before ref policy), so the sweeper must
+// never materialize a repo's full pack set.
+type PackRegistry interface {
+	HasPack(ctx context.Context, repo, key string) (bool, error)
 }
 
 // SweepConfig controls one sweeper's classification and disposal.
@@ -78,14 +80,14 @@ type SweepReport struct {
 // (the age threshold is the guard) and is idempotent.
 type Sweeper struct {
 	blobs  blob.BlobStore
-	packs  PackLister
+	packs  PackRegistry
 	cfg    SweepConfig
 	logger *slog.Logger
 	now    func() time.Time // injectable clock for tests
 }
 
 // NewSweeper builds a Sweeper over the raw blob store and pack registry.
-func NewSweeper(blobs blob.BlobStore, packs PackLister, cfg SweepConfig, logger *slog.Logger) *Sweeper {
+func NewSweeper(blobs blob.BlobStore, packs PackRegistry, cfg SweepConfig, logger *slog.Logger) *Sweeper {
 	assertf(blobs != nil, "NewSweeper: nil blob store")
 	assertf(packs != nil, "NewSweeper: nil pack lister")
 	assertf(cfg.Threshold > 0, "NewSweeper: non-positive threshold %v", cfg.Threshold)
@@ -139,39 +141,18 @@ func (s *Sweeper) Sweep(ctx context.Context) (SweepReport, error) {
 	if err := s.healQuarantine(ctx, &report, s.cfg.Delete); err != nil {
 		deleteErrs = append(deleteErrs, err)
 	}
-	// Stream packs/ page-wise instead of materializing the whole prefix:
-	// a git:write holder can grow packs/ without bound (pre-receive uploads
-	// happen before ref policy), so memory must stay bounded by page size
-	// plus one repo's run of keys, never by total bucket population. Each
-	// run of consecutive same-repo keys classifies against one registry
-	// read; backends that interleave repos (fileblob orders by basename,
-	// not full key) just split a repo into several runs, costing extra
-	// registry reads but never correctness — every key still classifies
-	// against its own repo's registered set. ReposScanned counts distinct
-	// repos (the seen-set grows with repos, a control-plane-bounded
-	// population, not with attacker-mintable packs). Keys not matching the
-	// exact blob.PackKey shape (packs/<repo>/pack-<id>.pack, no deeper
+	// Stream packs/ page-wise and classify each object with a point
+	// registry read (PackRegistry.HasPack): both the blob population and a
+	// repo's registered-pack count are attacker-growable (pre-receive
+	// uploads and registers packs before ref policy), so the sweep must
+	// never materialize a prefix listing or a repo's pack set. Memory is
+	// bounded by one page, the distinct-repo seen-set (a control-plane-
+	// bounded population), and the orphan report (orphans require a server
+	// crash mid-push, not attacker-mintable traffic). Keys not matching
+	// the exact blob.PackKey shape (packs/<repo>/pack-<id>.pack, no deeper
 	// nesting) were not written by this system — leave foreign objects
 	// alone, loudly.
-	var (
-		curRepo string
-		group   []blob.ListedObject
-		seen    = make(map[string]bool)
-	)
-	flush := func() error {
-		if curRepo == "" {
-			return nil
-		}
-		if err := s.sweepRepoGroup(ctx, curRepo, group, &report, &deleteErrs); err != nil {
-			return err
-		}
-		if !seen[curRepo] {
-			seen[curRepo] = true
-			report.ReposScanned++
-		}
-		group = group[:0]
-		return nil
-	}
+	seen := make(map[string]bool)
 	err := s.blobs.ListPages(ctx, blob.PacksRoot, sweepListPageSize, func(page []blob.ListedObject) error {
 		for _, obj := range page {
 			repo, ok := splitPackKey(obj.Key)
@@ -179,21 +160,18 @@ func (s *Sweeper) Sweep(ctx context.Context) (SweepReport, error) {
 				s.logger.Warn("orphan pack sweep: skipping foreign key under packs/", "key", obj.Key)
 				continue
 			}
-			if repo != curRepo {
-				if err := flush(); err != nil {
-					return err
-				}
-				curRepo = repo
+			if !seen[repo] {
+				seen[repo] = true
+				report.ReposScanned++
 			}
-			group = append(group, obj)
+			if err := s.classify(ctx, repo, obj, &report, &deleteErrs); err != nil {
+				return err
+			}
 		}
 		return nil
 	})
 	if err != nil {
 		return report, fmt.Errorf("sweep: list %s: %w", blob.PacksRoot, err)
-	}
-	if err := flush(); err != nil {
-		return report, fmt.Errorf("sweep: %w", err)
 	}
 
 	s.logger.Info("orphan pack sweep finished",
@@ -209,59 +187,53 @@ func (s *Sweeper) Sweep(ctx context.Context) (SweepReport, error) {
 // A var so tests can force multi-page scans with few objects.
 var sweepListPageSize = 1000
 
-// sweepRepoGroup classifies one repo's contiguous listing group against its
-// registered pack set and disposes of orphans per the config. Registry
-// errors abort the sweep (they would misclassify everything in the group);
-// per-key disposal errors accumulate into deleteErrs.
-func (s *Sweeper) sweepRepoGroup(ctx context.Context, repo string, group []blob.ListedObject, report *SweepReport, deleteErrs *[]error) error {
-	packs, err := s.packs.ListPacks(ctx, repo)
+// classify handles one listed pack blob: a point registry read, then the
+// age-threshold diff, then (delete mode only) the revalidate + quarantine
+// handshake. Registry errors abort the sweep (they would misclassify the
+// object); disposal errors accumulate into deleteErrs.
+func (s *Sweeper) classify(ctx context.Context, repo string, obj blob.ListedObject, report *SweepReport, deleteErrs *[]error) error {
+	registered, err := s.packs.HasPack(ctx, repo, obj.Key)
 	if err != nil {
-		return fmt.Errorf("list packs for %s: %w", repo, err)
+		return fmt.Errorf("has pack %s: %w", obj.Key, err)
 	}
-	live := make(map[string]bool, len(packs))
-	for _, p := range packs {
-		live[p.Key] = true
+	if registered {
+		report.Live++
+		return nil
 	}
-	for _, obj := range group {
-		if live[obj.Key] {
-			report.Live++
-			continue
-		}
-		if obj.ModTime.IsZero() {
-			// A backend that reports no mod time makes age unknowable;
-			// never treat unknowable as expired.
-			s.logger.Warn("orphan pack sweep: skipping key without mod time", "key", obj.Key)
-			continue
-		}
-		age := s.now().Sub(obj.ModTime)
-		if age < s.cfg.Threshold {
-			report.Fresh++
-			continue
-		}
-		report.Orphans = append(report.Orphans, OrphanPack{Key: obj.Key, Size: obj.Size, Age: age})
-		report.OrphanBytes += obj.Size
-		s.logger.Info("orphan pack candidate",
-			"key", obj.Key, "size_bytes", obj.Size, "age", age.Round(time.Second),
-			"delete_enabled", s.cfg.Delete)
-		if !s.cfg.Delete {
-			continue
-		}
-		stillOrphan, err := s.revalidateOrphan(ctx, repo, obj.Key)
-		if err != nil {
-			*deleteErrs = append(*deleteErrs, err)
-			continue
-		}
-		if !stillOrphan {
-			continue
-		}
-		reaped, err := s.safeDelete(ctx, repo, obj.Key)
-		if err != nil {
-			*deleteErrs = append(*deleteErrs, err)
-			continue
-		}
-		if reaped {
-			report.Deleted++
-		}
+	if obj.ModTime.IsZero() {
+		// A backend that reports no mod time makes age unknowable; never
+		// treat unknowable as expired.
+		s.logger.Warn("orphan pack sweep: skipping key without mod time", "key", obj.Key)
+		return nil
+	}
+	age := s.now().Sub(obj.ModTime)
+	if age < s.cfg.Threshold {
+		report.Fresh++
+		return nil
+	}
+	report.Orphans = append(report.Orphans, OrphanPack{Key: obj.Key, Size: obj.Size, Age: age})
+	report.OrphanBytes += obj.Size
+	s.logger.Info("orphan pack candidate",
+		"key", obj.Key, "size_bytes", obj.Size, "age", age.Round(time.Second),
+		"delete_enabled", s.cfg.Delete)
+	if !s.cfg.Delete {
+		return nil
+	}
+	stillOrphan, err := s.revalidateOrphan(ctx, repo, obj.Key)
+	if err != nil {
+		*deleteErrs = append(*deleteErrs, err)
+		return nil
+	}
+	if !stillOrphan {
+		return nil
+	}
+	reaped, err := s.safeDelete(ctx, repo, obj.Key)
+	if err != nil {
+		*deleteErrs = append(*deleteErrs, err)
+		return nil
+	}
+	if reaped {
+		report.Deleted++
 	}
 	return nil
 }
@@ -330,7 +302,7 @@ func (s *Sweeper) safeDelete(ctx context.Context, repo, key string) (bool, error
 	// push's RegisterPacks} lands last sees the other's state, so a
 	// registration this read observes gets its bytes restored here, and
 	// one it misses is healed from quarantine next sweep.
-	packs, err := s.packs.ListPacks(ctx, repo)
+	registered, err := s.packs.HasPack(ctx, repo, key)
 	if err != nil {
 		// Deleted but unverifiable: a registration that landed before the
 		// delete (its EnsurePublished saw the key present) would be
@@ -344,17 +316,15 @@ func (s *Sweeper) safeDelete(ctx context.Context, repo, key string) (bool, error
 		}
 		return false, recheckErr
 	}
-	for _, p := range packs {
-		if p.Key != key {
-			continue
-		}
+	if registered {
 		if err := s.blobs.Copy(ctx, key, quarantinePrefix+key); err != nil {
 			return false, fmt.Errorf("sweep: restore %s registered mid-delete: %w", key, err)
 		}
+		// The backup is deliberately retained: quarantine entries are
+		// purged only by the aged path in healQuarantineEntry, because a
+		// fresh entry may be the restore source of ANOTHER replica's
+		// in-flight handshake on the same content-addressed key.
 		s.logger.Warn("orphan pack sweep: restored pack registered mid-delete", "key", key)
-		if err := s.blobs.Delete(ctx, quarantinePrefix+key); err != nil && !errors.Is(err, blob.ErrNotFound) {
-			s.logger.Warn("orphan pack sweep: purge quarantine after restore", "key", key, "err", err)
-		}
 		return false, nil
 	}
 	return true, nil
@@ -400,18 +370,10 @@ func (s *Sweeper) healQuarantineEntry(ctx context.Context, q blob.ListedObject, 
 		s.logger.Warn("orphan pack sweep: skipping foreign quarantine key", "key", q.Key)
 		return nil
 	}
-	packs, err := s.packs.ListPacks(ctx, repo)
+	registered, err := s.packs.HasPack(ctx, repo, orig)
 	if err != nil {
-		return fmt.Errorf("sweep: heal %s: list packs: %w", orig, err)
+		return fmt.Errorf("sweep: heal %s: has pack: %w", orig, err)
 	}
-	registered := false
-	for _, p := range packs {
-		if p.Key == orig {
-			registered = true
-			break
-		}
-	}
-	reclaims := false // restore-then-purge is net zero; only an aged-orphan purge frees bytes
 	if registered {
 		if _, err := s.blobs.Stat(ctx, orig); errors.Is(err, blob.ErrNotFound) {
 			if err := s.blobs.Copy(ctx, orig, q.Key); err != nil {
@@ -421,17 +383,23 @@ func (s *Sweeper) healQuarantineEntry(ctx context.Context, q blob.ListedObject, 
 		} else if err != nil {
 			return fmt.Errorf("sweep: heal %s: stat: %w", orig, err)
 		}
-	} else if !purge || q.ModTime.IsZero() || s.now().Sub(q.ModTime) < s.cfg.Threshold {
-		// Unregistered: purge only in delete mode once aged past the
-		// threshold (an in-flight sweep's backup is always fresh).
+	}
+	// Purge strictly by age, never as a restore side effect: a quarantine
+	// entry younger than the threshold may be the restore source of a
+	// concurrent replica's in-flight delete handshake on this same key
+	// (safeDelete re-creates the entry immediately before every delete),
+	// and purging it mid-handshake could strand a registered pack with no
+	// bytes anywhere. Entries older than the threshold cannot belong to a
+	// live handshake (handshakes run in seconds).
+	if !purge || q.ModTime.IsZero() || s.now().Sub(q.ModTime) < s.cfg.Threshold {
 		return nil
-	} else {
-		reclaims = true
 	}
 	if err := s.blobs.Delete(ctx, q.Key); err != nil && !errors.Is(err, blob.ErrNotFound) {
 		return fmt.Errorf("sweep: purge quarantine %s: %w", q.Key, err)
 	}
-	if reclaims {
+	if !registered {
+		// A registered entry's purge is net zero (its original is live);
+		// only orphan-backup purges actually reduce consumption.
 		report.BytesReclaimed += q.Size
 	}
 	return nil
@@ -445,15 +413,13 @@ func (s *Sweeper) healQuarantineEntry(ctx context.Context, q blob.ListedObject, 
 // checking the registry before the mod time means any registration the
 // registry read misses still refreshes the ModTime read after it.
 func (s *Sweeper) revalidateOrphan(ctx context.Context, repo, key string) (bool, error) {
-	packs, err := s.packs.ListPacks(ctx, repo)
+	registered, err := s.packs.HasPack(ctx, repo, key)
 	if err != nil {
-		return false, fmt.Errorf("sweep: revalidate %s: list packs: %w", key, err)
+		return false, fmt.Errorf("sweep: revalidate %s: has pack: %w", key, err)
 	}
-	for _, p := range packs {
-		if p.Key == key {
-			s.logger.Info("orphan pack sweep: skipping delete, pack registered mid-sweep", "key", key)
-			return false, nil
-		}
+	if registered {
+		s.logger.Info("orphan pack sweep: skipping delete, pack registered mid-sweep", "key", key)
+		return false, nil
 	}
 	objs, err := s.blobs.List(ctx, key)
 	if err != nil {

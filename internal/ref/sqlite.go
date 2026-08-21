@@ -282,6 +282,15 @@ func (s *SQLite) RegisterPacks(ctx context.Context, repo string, packs []Pack) e
 	return tx.Commit()
 }
 
+// HasPack reports whether repo has a registered pack with blob key.
+func (s *SQLite) HasPack(ctx context.Context, repo, key string) (bool, error) {
+	assertf(repo != "" && key != "", "HasPack(%q, %q)", repo, key)
+	var exists bool
+	err := s.db.QueryRowContext(ctx,
+		`SELECT EXISTS (SELECT 1 FROM packs WHERE repo = ? AND s3_key = ?)`, repo, key).Scan(&exists)
+	return exists, err
+}
+
 // GetGeneration returns repo's mutation generation (0 = never mutated).
 func (s *SQLite) GetGeneration(ctx context.Context, repo string) (int64, error) {
 	assertf(repo != "", "GetGeneration: empty repo")

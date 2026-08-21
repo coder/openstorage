@@ -74,6 +74,11 @@ type RefStore interface {
 	RegisterPacks(ctx context.Context, repo string, packs []Pack) error
 	// ListPacks returns all registered packs for repo, oldest first.
 	ListPacks(ctx context.Context, repo string) ([]Pack, error)
+	// HasPack reports whether repo has a registered pack with the given
+	// blob key (a point read: the orphan-pack sweeper classifies each
+	// listed blob individually so its memory never scales with a repo's
+	// registered-pack count, which pre-policy pushes can grow).
+	HasPack(ctx context.Context, repo, key string) (bool, error)
 	// GetGeneration returns repo's mutation generation: 0 for a repo no
 	// mutation ever touched, strictly positive and monotonically increasing
 	// afterwards. It is an invalidation token over committed row changes,
@@ -336,6 +341,15 @@ func (s *PG) RegisterPacks(ctx context.Context, repo string, packs []Pack) error
 		}
 		return nil
 	})
+}
+
+// HasPack reports whether repo has a registered pack with blob key.
+func (s *PG) HasPack(ctx context.Context, repo, key string) (bool, error) {
+	assertf(repo != "" && key != "", "HasPack(%q, %q)", repo, key)
+	var exists bool
+	err := s.pool.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM packs WHERE repo = $1 AND s3_key = $2)`, repo, key).Scan(&exists)
+	return exists, err
 }
 
 // GetGeneration returns repo's mutation generation (0 = never mutated).
