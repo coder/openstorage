@@ -128,9 +128,12 @@ type Repacker struct {
 
 	// BeforeSwap is a test seam: when set, it runs after the consolidated
 	// pack's blob upload and before ReplacePacks — the fold-install race
-	// window. Tests and the DST harness use it to interleave a competing
-	// fold deterministically. Never set in production wiring.
-	BeforeSwap func(ctx context.Context) error
+	// window — receiving the pending pack (its content-addressed blob key
+	// in particular; a listing diff cannot identify it when an identical
+	// orphan already exists). Tests and the DST harness use it to
+	// interleave competing folds deterministically. Never set in
+	// production wiring.
+	BeforeSwap func(ctx context.Context, pending ref.Pack) error
 }
 
 // NeedsFollowUp reports whether repo's registered pack count has reached
@@ -171,6 +174,12 @@ const (
 	defaultMaxFoldBytes    = 2 << 30
 	defaultMaxFoldDuration = 5 * time.Minute
 )
+
+// repackVerifyReserve is the fold-budget slice that must remain before the
+// swap may start: the post-swap publication verification (one Stat, rarely
+// a repair re-upload) runs under the same fold deadline, and a swap whose
+// verify leg gets zero time would leave the committed row unverified.
+const repackVerifyReserve = 30 * time.Second
 
 // Repack runs one fold attempt for repo, returning whether a fold was
 // installed. A no-op (fewer than two registered packs, or budgets selecting
@@ -257,9 +266,21 @@ func (r *Repacker) Repack(ctx context.Context, repo string) (folded bool, err er
 	}
 
 	if r.BeforeSwap != nil {
-		if err := r.BeforeSwap(ctx); err != nil {
+		if err := r.BeforeSwap(ctx, newPack); err != nil {
 			return false, fmt.Errorf("repack %s: before-swap hook: %w", repo, err)
 		}
+	}
+
+	// The swap commits a row that MUST then be verified against the
+	// sweeper race (below), and that verification runs under this same
+	// fold deadline — the budget bounds the fold end to end. Refuse to
+	// start the swap without enough budget left for the verify leg:
+	// aborting here is crash-equivalent (one unregistered uploaded blob,
+	// sweeper class), while a swap whose verification gets zero time
+	// would leave the committed row unverified until the sweeper's heal.
+	if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) < repackVerifyReserve {
+		return false, fmt.Errorf("repack %s: fold budget exhausted before swap (%v left < %v reserve): %w",
+			repo, time.Until(deadline).Round(time.Millisecond), repackVerifyReserve, context.DeadlineExceeded)
 	}
 
 	won, err := r.store.ReplacePacks(ctx, repo, old, newPack)
@@ -314,8 +335,24 @@ func (r *Repacker) Repack(ctx context.Context, repo string) (folded bool, err er
 
 // verifyPublished re-checks (and if needed restores) the consolidated
 // pack's blob after a swap that may have committed a row referencing it.
+// Unlike blob.EnsurePublished — whose detached, size-scaled timeout exists
+// because request-path registrations must survive their CLIENT hanging up —
+// this runs under the caller's fold deadline verbatim: repack has no client
+// to outlive, and the fold budget must bound the job end to end (a 2 GiB
+// pack's detached repair window would otherwise retain a river worker ~40
+// minutes past the advertised budget). The swap-side reserve
+// (repackVerifyReserve) guarantees this leg starts with budget in hand; if
+// the store stalls it out anyway, the sweeper's quarantine heal is the
+// durable backstop for a row whose bytes a racing sweep removed.
 func verifyPublished(ctx context.Context, bl blob.BlobStore, key, packPath string) error {
-	if err := blob.EnsurePublished(ctx, bl, key, packPath); err != nil {
+	_, err := bl.Stat(ctx, key)
+	if errors.Is(err, blob.ErrNotFound) {
+		if uerr := bl.UploadFile(ctx, key, packPath); uerr != nil {
+			return fmt.Errorf("verify %s: repair upload: %w", key, uerr)
+		}
+		return nil
+	}
+	if err != nil {
 		return fmt.Errorf("verify %s: %w", key, err)
 	}
 	return nil

@@ -268,20 +268,10 @@ func TestRepack_LostRaceLeavesOrphanForSweeper(t *testing.T) {
 	loser := f.repacker(t.TempDir())
 	winnerDir := t.TempDir()
 	var loserKey string
-	loser.BeforeSwap = func(ctx context.Context) error {
-		// The loser's consolidated blob is uploaded by now: it is the only
-		// key not present in the pre-race listing.
-		mid, err := f.blobs.List(ctx, blob.PackPrefix(f.repo))
-		if err != nil {
-			return err
-		}
-		for _, o := range mid {
-			if !beforeKeys[o.Key] {
-				loserKey = o.Key
-			}
-		}
-		if loserKey == "" {
-			return errors.New("loser blob not uploaded before swap")
+	loser.BeforeSwap = func(ctx context.Context, pending ref.Pack) error {
+		loserKey = pending.Key
+		if _, err := f.blobs.Stat(ctx, loserKey); err != nil {
+			return fmt.Errorf("loser blob not uploaded before swap: %w", err)
 		}
 		// Land a DIFFERENT competing fold: one more push changes the
 		// winner's input set, so the two consolidated packs differ and the
@@ -684,20 +674,10 @@ func TestRepack_RepublishesBlobSweptMidSwap(t *testing.T) {
 	}
 
 	r := f.repacker(t.TempDir())
-	r.BeforeSwap = func(ctx context.Context) error {
+	r.BeforeSwap = func(ctx context.Context, pending ref.Pack) error {
 		// Simulate the sweeper reaping the just-uploaded consolidated
-		// blob (the only key not in the pre-fold listing) right before
-		// the swap commits.
-		objs, err := f.blobs.List(ctx, blob.PackPrefix(f.repo))
-		if err != nil {
-			return err
-		}
-		for _, o := range objs {
-			if !beforeKeys[o.Key] {
-				return f.blobs.Delete(ctx, o.Key)
-			}
-		}
-		return errors.New("consolidated blob not uploaded before swap")
+		// blob right before the swap commits.
+		return f.blobs.Delete(ctx, pending.Key)
 	}
 	if _, err := r.Repack(ctx, f.repo); err != nil {
 		t.Fatalf("repack: %v", err)
@@ -855,7 +835,7 @@ func TestRiver_RepackUniqueByRepo(t *testing.T) {
 	}
 	defer release()
 	r := f.repacker(t.TempDir())
-	r.BeforeSwap = func(context.Context) error { <-gate; return nil }
+	r.BeforeSwap = func(context.Context, ref.Pack) error { <-gate; return nil }
 	r.FollowUpThreshold = 2 // post-fold recheck: mid-run rows demand a follow-up
 
 	deliverer := &events.Deliverer{Webhooks: stubWebhooks{}, Logger: slog.New(slog.DiscardHandler)}
@@ -962,7 +942,7 @@ func TestLocalQueue_RepackCoalescesPerRepo(t *testing.T) {
 	gate := make(chan struct{})
 	entered := make(chan struct{}, 8)
 	r := f.repacker(t.TempDir())
-	r.BeforeSwap = func(context.Context) error {
+	r.BeforeSwap = func(context.Context, ref.Pack) error {
 		entered <- struct{}{}
 		<-gate
 		return nil

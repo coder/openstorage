@@ -187,20 +187,6 @@ func (s *sim) doRepackRace(name string, node *simNode, repo *simRepo, branch str
 		return nil
 	}
 
-	// Snapshot the repo's blob KEY set before the race: the only upload
-	// between here and the loser's swap window is the loser's own
-	// consolidated pack, so a listing diff identifies it exactly (crashed
-	// pushes may have left unregistered orphans, but those predate this
-	// snapshot).
-	preObjs, err := s.cl.oracleBl.List(ctx, blob.PackPrefix(repo.key))
-	if err != nil {
-		return fmt.Errorf("step %d: list pre-race blobs: %w", s.step, err)
-	}
-	preKeys := make(map[string]bool, len(preObjs))
-	for _, o := range preObjs {
-		preKeys[o.Key] = true
-	}
-
 	raceDir := s.raceCacheDir(node)
 	winner := jobs.NewRepacker(s.cl.oracle, s.cl.oracleBl, func(ctx context.Context, repoKey string) (string, error, error) {
 		return githttp.Hydrate(ctx, s.cl.oracle, s.cl.oracleBl, raceDir+"-winner", repoKey, "main")
@@ -211,21 +197,16 @@ func (s *sim) doRepackRace(name string, node *simNode, repo *simRepo, branch str
 
 	var loserKey string
 	var winnerErr error
-	loser.BeforeSwap = func(ctx context.Context) error {
-		// The loser's consolidated blob is uploaded by now: it is the only
-		// key missing from the pre-race snapshot.
-		objs, err := s.cl.oracleBl.List(ctx, blob.PackPrefix(repo.key))
-		if err != nil {
-			return err
-		}
-		for _, o := range objs {
-			if !preKeys[o.Key] {
-				loserKey = o.Key
-			}
-		}
+	loser.BeforeSwap = func(ctx context.Context, pending ref.Pack) error {
+		// The seam hands over the loser's pending pack directly: a listing
+		// diff could not identify it when an identical unregistered orphan
+		// (an earlier faulted opRepack's upload of the same
+		// content-addressed key) already existed before the race.
+		loserKey = pending.Key
 		// A mid-race push changes the winner's fold input, so the two
-		// consolidated packs differ and the loser's cleanup must delete
-		// real bytes (identity folds would mask a cleanup bug).
+		// consolidated packs differ and the loser's blob becomes a genuine
+		// unregistered orphan (identity folds would mask a bookkeeping
+		// bug in the lost path).
 		if err := s.oraclePush(ctx, repo, branch); err != nil {
 			return err
 		}
