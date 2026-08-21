@@ -64,6 +64,7 @@ contract with implementation notes the spec lacks.
 | Method & path | Scope | Body/query → Response |
 |---|---|---|
 | `GET /repos/branches` | git:read | `cursor, limit, ephemeral` → `{branches: [{cursor, name, head_sha, created_at}], next_cursor, has_more}` |
+| `GET /repos/branch` | git:read | `name` (req), `ephemeral?` → `{branch: {name, head_sha, created_at}}` — one branch by exact short name (no pagination fields); 404 when absent |
 | `POST /repos/branches/create` | git:write | `{target_branch, base_ref?\|base_branch?(deprecated), base_is_ephemeral?, target_is_ephemeral?}` → `{message, target_branch, target_is_ephemeral, commit_sha?}` |
 | `DELETE /repos/branches` | git:write | `{name, ephemeral?}` → `{name, message, ephemeral}`. Refuses default branch (persistent) |
 | `GET /repos/branches/diff` | git:read | `branch` (req), `base?`, `ephemeral?`, `ephemeral_base?`, `path` (repeatable) → `{branch, base, stats: {files, additions, deletions, changes}, files: [FileDiff], filtered_files}` |
@@ -94,6 +95,7 @@ committer_email, date (RFC3339)}`.
 | Method & path | Scope | Body/query |
 |---|---|---|
 | `GET /repos/tags` | git:read | `cursor, limit` → `{tags: [{cursor, name, sha}], next_cursor, has_more}` — lexical order; `sha` dereferenced to commit |
+| `GET /repos/tag` | git:read | `name` (req) → `{tag: {name, sha}}` — one tag by exact short name, `sha` dereferenced to commit; 404 when absent |
 | `POST /repos/tags` | git:write | `{name, target}` → `{name, sha, message}` — lightweight only; name must not start with `refs/` |
 | `DELETE /repos/tags` | git:read+git:write | `{name}` → `{name, message}` — resolves stored ref for lightweight & annotated |
 

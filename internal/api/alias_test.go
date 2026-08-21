@@ -61,10 +61,14 @@ func TestAliasV1Equivalence(t *testing.T) {
 		}{
 			{"repo", http.MethodGet, "", "/api/v1/repo", fx.token, nil},
 			{"branches", http.MethodGet, "/branches", "/api/v1/repos/branches", fx.token, nil},
+			{"branch", http.MethodGet, "/branch?name=main", "/api/v1/repos/branch?name=main", fx.token, nil},
+			{"branch missing", http.MethodGet, "/branch?name=nope", "/api/v1/repos/branch?name=nope", fx.token, nil},
 			{"commits", http.MethodGet, "/commits?limit=2", "/api/v1/repos/commits?limit=2", fx.token, nil},
 			{"files", http.MethodGet, "/files?ref=main&recursive=true", "/api/v1/repos/files?ref=main&recursive=true", fx.token, nil},
 			{"file", http.MethodGet, "/file?path=README.md", "/api/v1/repos/file?path=README.md", fx.token, nil},
 			{"tags", http.MethodGet, "/tags", "/api/v1/repos/tags", fx.token, nil},
+			{"tag", http.MethodGet, "/tag?name=v1-annot", "/api/v1/repos/tag?name=v1-annot", fx.token, nil},
+			{"tag missing", http.MethodGet, "/tag?name=nope", "/api/v1/repos/tag?name=nope", fx.token, nil},
 			// Write route: {} deterministically 400s in the shared handler,
 			// so alias and v1 bodies must match without mutating state.
 			{"branches/create", http.MethodPost, "/branches/create", "/api/v1/repos/branches/create", writeToken, []byte(`{}`)},
@@ -198,25 +202,30 @@ func TestAliasAuthWiring(t *testing.T) {
 		orgToken := e.mint(t, tokenSpec{iss: org, repo: auth.RepoClaimOrg,
 			scopes: []string{auth.ScopeGitRead, auth.ScopeGitWrite, auth.ScopeRepoWrite}})
 
-		// Read-flavor alias: {"error"} envelopes.
-		readPath := "/api/repos/" + esc + "/branches"
-		resp, body := e.doReq(t, http.MethodGet, readPath, "", nil, "")
-		if resp.StatusCode != http.StatusUnauthorized {
-			t.Errorf("read alias no token = %d, want 401", resp.StatusCode)
-		}
-		requireEnvelope(t, resp, body)
-		resp, _ = e.doReq(t, http.MethodGet, readPath, writeToken, nil, "")
-		if resp.StatusCode != http.StatusForbidden {
-			t.Errorf("read alias wrong scope = %d, want 403", resp.StatusCode)
-		}
-		resp, _ = e.doReq(t, http.MethodGet, readPath, orgToken, nil, "")
-		if resp.StatusCode != http.StatusForbidden {
-			t.Errorf("read alias org token = %d, want 403", resp.StatusCode)
+		// Read-flavor aliases: {"error"} envelopes.
+		for _, readPath := range []string{
+			"/api/repos/" + esc + "/branches",
+			"/api/repos/" + esc + "/branch?name=main",
+			"/api/repos/" + esc + "/tag?name=v1-annot",
+		} {
+			resp, body := e.doReq(t, http.MethodGet, readPath, "", nil, "")
+			if resp.StatusCode != http.StatusUnauthorized {
+				t.Errorf("%s no token = %d, want 401", readPath, resp.StatusCode)
+			}
+			requireEnvelope(t, resp, body)
+			resp, _ = e.doReq(t, http.MethodGet, readPath, writeToken, nil, "")
+			if resp.StatusCode != http.StatusForbidden {
+				t.Errorf("%s wrong scope = %d, want 403", readPath, resp.StatusCode)
+			}
+			resp, _ = e.doReq(t, http.MethodGet, readPath, orgToken, nil, "")
+			if resp.StatusCode != http.StatusForbidden {
+				t.Errorf("%s org token = %d, want 403", readPath, resp.StatusCode)
+			}
 		}
 
 		// Write-flavor alias: docs/04 result envelopes (ADR-26).
 		writePath := "/api/repos/" + esc + "/tags"
-		resp, body = e.doReq(t, http.MethodPost, writePath, "", nil, "")
+		resp, body := e.doReq(t, http.MethodPost, writePath, "", nil, "")
 		if resp.StatusCode != http.StatusUnauthorized {
 			t.Errorf("write alias no token = %d, want 401", resp.StatusCode)
 		}
