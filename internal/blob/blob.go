@@ -23,9 +23,9 @@ import (
 // proxying the transfer through the server.
 var ErrSignedURLUnsupported = errors.New("blob: signed URLs unsupported by this backend")
 
-// ErrNotFound is returned (wrapped, match with errors.Is) by Stat for
-// missing objects, so callers can distinguish absence from transport
-// failures without depending on gocloud error codes.
+// ErrNotFound is returned (wrapped, match with errors.Is) by Stat and
+// DownloadFile for missing objects, so callers can distinguish absence from
+// transport failures without depending on gocloud error codes.
 var ErrNotFound = errors.New("blob: object not found")
 
 // assertf is a fail-fast invariant check (crash-and-burn style).
@@ -41,7 +41,9 @@ type BlobStore interface {
 	// UploadFile streams a local file to key.
 	UploadFile(ctx context.Context, key, path string) error
 	// DownloadFile fetches key into destPath atomically (tmp + rename), so a
-	// partially downloaded object is never visible at destPath.
+	// partially downloaded object is never visible at destPath. Missing keys
+	// yield an error matching ErrNotFound via errors.Is (the hydration
+	// missing-pack retry keys on it).
 	DownloadFile(ctx context.Context, key, destPath string) error
 	// List returns all objects under prefix.
 	List(ctx context.Context, prefix string) ([]ListedObject, error)

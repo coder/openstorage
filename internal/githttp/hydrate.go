@@ -3,6 +3,7 @@ package githttp
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -143,6 +144,19 @@ func ensureHook(path, script string) error {
 	return os.Rename(tmp.Name(), path)
 }
 
+// maxHydrateRaces bounds the "missing pack blob → re-ListPacks → retry"
+// loop: a listed pack can legitimately vanish from blob storage between
+// ListPacks and download (folded away by a repack), and the fresh listing
+// then carries its replacement. A blob still missing after the bound is
+// genuinely gone, not racing.
+const maxHydrateRaces = 8
+
+// ErrPackMissing is returned (wrapped, match with errors.Is) when a
+// registered pack's blob stays missing after maxHydrateRaces listing passes:
+// the ref store references bytes that do not exist, which is corruption
+// grade — refs may point at unreachable objects.
+var ErrPackMissing = errors.New("githttp: registered pack missing from blob store")
+
 // HydratePacks downloads and indexes every registered pack that is not
 // already present in the cache repo. Packs are self-contained (index-pack
 // --fix-thin ran on the receiving node before upload), so each is
@@ -153,25 +167,43 @@ func ensureHook(path, script string) error {
 // to a uniquely-named temp file, index the temp, then rename pack+idx into
 // place. Only our own temp names are ever removed, and "idx appeared while
 // waiting for the lock" counts as success.
+//
+// A download hitting blob.ErrNotFound restarts the pass on a fresh ListPacks
+// (bounded by maxHydrateRaces): the pack was folded away by a concurrent
+// repack and the new listing carries its replacement. Restarts are cheap and
+// idempotent — hydrated packs are skipped by the .idx probe. Transport
+// errors keep failing fast; on bound exhaustion the hydrate fails with
+// ErrPackMissing rather than looping.
 func HydratePacks(ctx context.Context, st ref.RefStore, bl blob.BlobStore, repoPath, repo string) error {
-	packs, err := st.ListPacks(ctx, repo)
-	if err != nil {
-		return err
-	}
 	packDir := filepath.Join(repoPath, "objects", "pack")
 	if err := os.MkdirAll(packDir, 0o755); err != nil {
 		return err
 	}
-	for _, p := range packs {
-		base := filepath.Join(packDir, "pack-"+p.ID)
-		if _, err := os.Stat(base + ".idx"); err == nil {
-			continue // already hydrated
-		}
-		if err := hydrateOnePack(ctx, bl, repoPath, base, p); err != nil {
+	var lastMissing error
+	for attempt := 0; attempt < maxHydrateRaces; attempt++ {
+		packs, err := st.ListPacks(ctx, repo)
+		if err != nil {
 			return err
 		}
+		lastMissing = nil
+		for _, p := range packs {
+			base := filepath.Join(packDir, "pack-"+p.ID)
+			if _, err := os.Stat(base + ".idx"); err == nil {
+				continue // already hydrated
+			}
+			if err := hydrateOnePack(ctx, bl, repoPath, base, p); err != nil {
+				if !errors.Is(err, blob.ErrNotFound) {
+					return err
+				}
+				lastMissing = fmt.Errorf("pack %s: %w", p.ID, err)
+				break
+			}
+		}
+		if lastMissing == nil {
+			return nil
+		}
 	}
-	return nil
+	return fmt.Errorf("hydrate %s: %w after %d attempts: %v", repo, ErrPackMissing, maxHydrateRaces, lastMissing)
 }
 
 // hydrateOnePack materializes one registered pack (pack + idx) at base under
