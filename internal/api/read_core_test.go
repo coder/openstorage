@@ -504,6 +504,35 @@ func TestReadCoreBranchesAndTags(t *testing.T) {
 			}
 		})
 
+		t.Run("tag lookup branch-name collision", func(t *testing.T) {
+			// A tag and a branch sharing one name: the tag must be
+			// retrievable by its plain short name (git's %(refname:short)
+			// would disambiguate it to "tags/<name>", which must NOT match).
+			repo, token := coreFreshRepo(t, e, org)
+			coreSeedStores(t, e, repo.RepoID, fx.work, map[string]string{
+				"refs/heads/release": fx.c2,
+				"refs/tags/release":  fx.c1,
+			})
+			resp, body := coreGet(t, e, "GET", "/api/v1/repos/tag?name=release", token, nil)
+			coreRequireStatus(t, resp, body, 200)
+			var got getTagResponse
+			coreDecode(t, body, &got)
+			if got.Tag.Name != "release" || got.Tag.SHA != fx.c1 {
+				t.Errorf("tag = %+v, want release@%s", got.Tag, fx.c1)
+			}
+			// The disambiguated spelling is not a tag name.
+			resp, body = coreGet(t, e, "GET", "/api/v1/repos/tag?name=tags/release", token, nil)
+			coreRequireStatus(t, resp, body, 404)
+			// The branch side resolves independently.
+			resp, body = coreGet(t, e, "GET", "/api/v1/repos/branch?name=release", token, nil)
+			coreRequireStatus(t, resp, body, 200)
+			var gotBranch getBranchResponse
+			coreDecode(t, body, &gotBranch)
+			if gotBranch.Branch.HeadSHA != fx.c2 {
+				t.Errorf("branch = %+v, want release@%s", gotBranch.Branch, fx.c2)
+			}
+		})
+
 		t.Run("tag lookup missing", func(t *testing.T) {
 			resp, body := coreGet(t, e, "GET", "/api/v1/repos/tag?name=nope", fx.token, nil)
 			coreRequireStatus(t, resp, body, 404)
