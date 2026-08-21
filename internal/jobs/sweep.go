@@ -112,26 +112,29 @@ func NewSweeper(blobs blob.BlobStore, packs PackLister, cfg SweepConfig, logger 
 //     re-reads the registry AFTER the delete: a registration that landed
 //     mid-delete is repaired on the spot by re-uploading the identical
 //     bytes (content-addressed keys make the restore always correct).
-//  3. healQuarantine, at the start of every delete-enabled sweep, restores
+//  3. healQuarantine, at the start of EVERY sweep (list-only included, so a
+//     rollback to list-only still repairs a delete-enabled crash), restores
 //     any quarantined pack whose key is registered but missing (covering a
 //     sweeper crash mid-handshake, or a registration that landed after
-//     safeDelete's recheck) and purges quarantine backups once they age
-//     past the threshold.
+//     safeDelete's recheck); in delete mode it also purges quarantine
+//     backups once they age past the threshold.
 //
 // The residual exposure is transient, not data loss: a registration landing
 // after safeDelete's recheck leaves that pack unavailable until the next
-// delete-enabled sweep heals it (hydration's bounded missing-pack retry
-// covers reads racing the restore itself).
+// sweep heals it (hydration's bounded missing-pack retry covers reads
+// racing the restore itself).
 func (s *Sweeper) Sweep(ctx context.Context) (SweepReport, error) {
 	start := s.now()
 	// Heal before classifying so a pack restored from quarantine is listed
-	// (and counted live) by the very sweep that healed it.
+	// (and counted live) by the very sweep that healed it. Healing runs in
+	// EVERY mode, list-only included: turning the delete flag off is the
+	// operator's rollback move after a scare, and a registered pack whose
+	// only copy sits in quarantine (delete-enabled crash mid-handshake)
+	// must still be restored then. Only purging stays delete-gated.
 	var report SweepReport
 	var deleteErrs []error
-	if s.cfg.Delete {
-		if err := s.healQuarantine(ctx, &report); err != nil {
-			deleteErrs = append(deleteErrs, err)
-		}
+	if err := s.healQuarantine(ctx, &report); err != nil {
+		deleteErrs = append(deleteErrs, err)
 	}
 	objs, err := s.blobs.List(ctx, blob.PacksRoot)
 	if err != nil {
@@ -296,11 +299,14 @@ func (s *Sweeper) safeDelete(ctx context.Context, repo, key string) (bool, error
 // healQuarantine finishes interrupted or lost-race safeDelete handshakes
 // from quarantine backups: a backup whose original key is registered gets
 // restored when the original is missing (identical bytes) and its backup
-// purged; an unregistered backup is purged only once it ages past the
-// threshold, so a concurrently running sweep's in-flight backup is never
-// touched. Purged backup bytes are credited to report.BytesReclaimed —
-// the point where storage consumption actually drops (reaping only moves
-// bytes into quarantine). Failures are joined; each entry is independent.
+// purged. The restorative pass runs in every sweep mode — a list-only
+// rollback must still repair a delete-enabled crash — while destructive
+// purging is delete-gated: an unregistered backup is purged only when
+// deletes are enabled AND it aged past the threshold, so an in-flight
+// sweep's backup is never touched. Purged backup bytes are credited to
+// report.BytesReclaimed — the point where storage consumption actually
+// drops (reaping only moves bytes into quarantine). Failures are joined;
+// each entry is independent.
 func (s *Sweeper) healQuarantine(ctx context.Context, report *SweepReport) error {
 	entries, err := s.blobs.List(ctx, quarantinePrefix)
 	if err != nil {
@@ -338,8 +344,10 @@ func (s *Sweeper) healQuarantine(ctx context.Context, report *SweepReport) error
 				errs = append(errs, fmt.Errorf("sweep: heal %s: stat: %w", orig, err))
 				continue
 			}
-		} else if q.ModTime.IsZero() || s.now().Sub(q.ModTime) < s.cfg.Threshold {
-			continue // possibly an in-flight sweep's backup: keep it
+		} else if !s.cfg.Delete || q.ModTime.IsZero() || s.now().Sub(q.ModTime) < s.cfg.Threshold {
+			// Unregistered: purge only in delete mode once aged past the
+			// threshold (an in-flight sweep's backup is always fresh).
+			continue
 		} else {
 			reclaims = true
 		}

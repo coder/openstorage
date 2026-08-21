@@ -359,6 +359,39 @@ func TestSweep_DeleteRestoresPackRegisteredMidDelete(t *testing.T) {
 	}
 }
 
+// A list-only sweep (the operator's rollback mode) must still heal a
+// registered-but-missing pack from quarantine — but never purge anything.
+func TestSweep_ListOnlyStillHealsQuarantine(t *testing.T) {
+	f := newSweepFixture(t)
+
+	// Delete-enabled crash mid-handshake, then rollback to list-only.
+	lost := blob.PackKey("r1", "lost")
+	f.upload("sweep/quarantine/"+lost, "lost-bytes")
+	f.register("r1", "lost", lost)
+
+	// An aged unregistered backup: list-only must NOT purge it.
+	stale := blob.PackKey("r1", "stale")
+	f.upload("sweep/quarantine/"+stale, "stale-bytes")
+	f.backdate("sweep/quarantine/"+stale, 25*time.Hour)
+
+	report, err := f.sweeper(SweepConfig{Threshold: 24 * time.Hour}).Sweep(context.Background())
+	if err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if !f.exists(lost) {
+		t.Fatalf("list-only sweep did not heal registered-but-missing pack %q", lost)
+	}
+	if f.exists("sweep/quarantine/" + lost) {
+		t.Fatalf("healed backup %q was not purged (restore-purge is not destructive)", lost)
+	}
+	if !f.exists("sweep/quarantine/" + stale) {
+		t.Fatalf("list-only sweep purged %q (purging must stay delete-gated)", stale)
+	}
+	if report.Deleted != 0 || report.BytesReclaimed != 0 {
+		t.Fatalf("report = %+v, want nothing deleted or reclaimed in list-only", report)
+	}
+}
+
 // healQuarantine finishes a crashed handshake: a quarantine backup whose
 // original key is registered but missing is restored; an unregistered
 // backup is purged only once it ages past the threshold.
