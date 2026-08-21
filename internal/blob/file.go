@@ -128,11 +128,16 @@ func bucketUploadFile(ctx context.Context, bucket *gcblob.Bucket, key, path stri
 }
 
 // bucketDownloadFile fetches key into destPath via tmp + rename, so a
-// partially downloaded pack is never visible at destPath.
+// partially downloaded pack is never visible at destPath. Missing keys map
+// onto ErrNotFound (like bucketStat), so callers can tell absence — a pack
+// folded away by a concurrent repack — from transport failures.
 func bucketDownloadFile(ctx context.Context, bucket *gcblob.Bucket, key, destPath string) error {
 	assertf(bucket != nil && key != "", "bucketDownloadFile(%q)", key)
 	r, err := bucket.NewReader(ctx, key, nil)
 	if err != nil {
+		if gcerrors.Code(err) == gcerrors.NotFound {
+			return fmt.Errorf("download %s: %w", key, ErrNotFound)
+		}
 		return fmt.Errorf("download %s: %w", key, err)
 	}
 	defer r.Close()

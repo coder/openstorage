@@ -2,6 +2,7 @@ package blob
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -64,6 +65,20 @@ func TestDownloadFile_DestPathShapes(t *testing.T) {
 				})
 			}
 		})
+	}
+}
+
+// A missing key must surface ErrNotFound through the S3 backend too: the
+// mem-backed bucket drives the same shared bucketDownloadFile mapping as
+// production s3blob (the file backend lane lives in file_test.go).
+func TestS3_DownloadMissingKeyIsErrNotFound(t *testing.T) {
+	b := memS3(t, PackKey("r", "present"), "bytes")
+	dest := filepath.Join(t.TempDir(), "missing.pack")
+	if err := b.DownloadFile(context.Background(), PackKey("r", "gone"), dest); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("DownloadFile of missing key = %v, want ErrNotFound", err)
+	}
+	if _, err := os.Stat(dest); !os.IsNotExist(err) {
+		t.Fatalf("destPath must not exist after failed download, stat err = %v", err)
 	}
 }
 
