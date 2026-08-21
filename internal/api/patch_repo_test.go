@@ -139,6 +139,8 @@ func TestPatchRepoDefaultBranchErrors(t *testing.T) {
 			{"invalid JSON", []byte(`{"default_branch":`), http.StatusBadRequest},
 			{"invalid name", []byte(`{"default_branch":"bad..name"}`), http.StatusBadRequest},
 			{"lock suffix", []byte(`{"default_branch":"dev.lock"}`), http.StatusBadRequest},
+			{"trailing dot", []byte(`{"default_branch":"main."}`), http.StatusBadRequest},
+			{"qualified trailing dot", []byte(`{"default_branch":"refs/heads/main."}`), http.StatusBadRequest},
 		}
 		for _, tc := range cases {
 			t.Run(tc.name, func(t *testing.T) {
@@ -193,6 +195,33 @@ func TestPatchRepoDefaultBranchErrors(t *testing.T) {
 	})
 }
 
+// The default-branch deletion protection must hold when the default is
+// stored in refs/-qualified form (PATCH stores such values verbatim): the
+// short-name DELETE must still be refused, comparing stored ref names.
+func TestPatchRepoQualifiedDefaultStillDeleteProtected(t *testing.T) {
+	runBackends(t, func(t *testing.T, e *testEnv) {
+		fx := wrefSeedFixture(t, e)
+		writeTok := e.mint(t, tokenSpec{iss: fx.org, repo: fx.url, scopes: []string{auth.ScopeRepoWrite}})
+
+		resp, body := e.doReq(t, http.MethodPatch, "/api/v1/repo", writeTok,
+			[]byte(`{"default_branch":"refs/heads/feature"}`), "")
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("PATCH qualified default = %d: %s", resp.StatusCode, body)
+		}
+
+		gitTok := e.mint(t, tokenSpec{iss: fx.org, repo: fx.url,
+			scopes: []string{auth.ScopeGitRead, auth.ScopeGitWrite}})
+		resp, body = e.doReq(t, http.MethodDelete, "/api/v1/repos/branches", gitTok,
+			[]byte(`{"target_branch":"feature"}`), "")
+		if resp.StatusCode != http.StatusForbidden {
+			t.Fatalf("DELETE default (qualified form) = %d, want 403: %s", resp.StatusCode, body)
+		}
+		if got := wrefRefs(t, e, fx.repoID)["refs/heads/feature"]; got == "" {
+			t.Fatal("refs/heads/feature was deleted despite being the default branch")
+		}
+	})
+}
+
 // Ref policies gate the HEAD repoint: no-push and unknown ops on a rule
 // covering HEAD or the new target deny with 403; no-force-push and
 // verify-sig (and rules covering only other refs) do not.
@@ -201,28 +230,36 @@ func TestPatchRepoDefaultBranchPolicies(t *testing.T) {
 		fx := wrefSeedFixture(t, e)
 
 		cases := []struct {
-			name string
-			refs string
-			want int
+			name   string
+			refs   string
+			branch string // PATCH target; "" means "feature"
+			want   int
 		}{
-			{"no-push wildcard", `[["*",["no-push"]]]`, http.StatusForbidden},
-			{"no-push on target", `[["refs/heads/feature",["no-push"]]]`, http.StatusForbidden},
-			{"no-push on HEAD", `[["HEAD",["no-push"]]]`, http.StatusForbidden},
-			{"unknown op", `[["*",["freeze"]]]`, http.StatusForbidden},
-			{"malformed claim", `[["*"]]`, http.StatusForbidden},
-			{"no-push elsewhere", `[["refs/heads/main",["no-push"]]]`, http.StatusOK},
-			{"no-force-push", `[["*",["no-force-push"]]]`, http.StatusOK},
-			{"verify-sig", `[["*",["verify-sig"]]]`, http.StatusOK},
-			{"empty rule", `[["*",[]]]`, http.StatusOK},
+			{"no-push wildcard", `[["*",["no-push"]]]`, "", http.StatusForbidden},
+			{"no-push on target", `[["refs/heads/feature",["no-push"]]]`, "", http.StatusForbidden},
+			{"no-push on HEAD", `[["HEAD",["no-push"]]]`, "", http.StatusForbidden},
+			// A branch literally named HEAD: the policy target must be the
+			// derived refs/heads/HEAD, not the NormalizeRefName pseudoref.
+			{"no-push on refs/heads/HEAD literal", `[["refs/heads/HEAD",["no-push"]]]`, "HEAD", http.StatusForbidden},
+			{"unknown op", `[["*",["freeze"]]]`, "", http.StatusForbidden},
+			{"malformed claim", `[["*"]]`, "", http.StatusForbidden},
+			{"no-push elsewhere", `[["refs/heads/main",["no-push"]]]`, "", http.StatusOK},
+			{"no-force-push", `[["*",["no-force-push"]]]`, "", http.StatusOK},
+			{"verify-sig", `[["*",["verify-sig"]]]`, "", http.StatusOK},
+			{"empty rule", `[["*",[]]]`, "", http.StatusOK},
 		}
 		for _, tc := range cases {
 			t.Run(tc.name, func(t *testing.T) {
+				branch := tc.branch
+				if branch == "" {
+					branch = "feature"
+				}
 				tok := e.mint(t, tokenSpec{iss: fx.org, repo: fx.url,
 					scopes: []string{auth.ScopeRepoWrite}, refs: tc.refs})
 				resp, body := e.doReq(t, http.MethodPatch, "/api/v1/repo", tok,
-					[]byte(`{"default_branch":"feature"}`), "")
+					[]byte(`{"default_branch":"`+branch+`"}`), "")
 				if resp.StatusCode != tc.want {
-					t.Fatalf("PATCH with refs=%s = %d, want %d: %s", tc.refs, resp.StatusCode, tc.want, body)
+					t.Fatalf("PATCH %s with refs=%s = %d, want %d: %s", branch, tc.refs, resp.StatusCode, tc.want, body)
 				}
 				if tc.want == http.StatusOK {
 					// Restore for the next case.

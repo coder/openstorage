@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"os/exec"
 	"regexp"
 	"strconv"
 	"strings"
@@ -14,6 +15,7 @@ import (
 
 	"codestorage/internal/auth"
 	"codestorage/internal/blob"
+	"codestorage/internal/githttp"
 	"codestorage/internal/meta"
 	"codestorage/internal/ref"
 )
@@ -210,14 +212,24 @@ func (s *server) handleGetRepo(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// validRefFormat reports whether git itself accepts target as a ref name
+// (`git check-ref-format`, no repository needed). validBranchName's
+// conservative charset is necessary but not sufficient — git additionally
+// rejects e.g. trailing dots — and only git's own verdict guarantees the
+// later `symbolic-ref HEAD <target>` succeeds.
+func validRefFormat(ctx context.Context, target string) bool {
+	assertf(strings.HasPrefix(target, "refs/"), "validRefFormat: unqualified target %q", target)
+	return exec.CommandContext(ctx, "git", "check-ref-format", target).Run() == nil
+}
+
 // policyDeniesDefaultBranchChange reports whether the token's ref policies
-// deny repointing HEAD at target (a normalized ref). The consulted rules
-// are the first match for HEAD itself and for the new target ref
-// (first-match-wins, like the update hook). Repointing HEAD moves no refs
-// and introduces no commits, so no-force-push (deletions/rewrites) and
-// verify-sig (introduced commits) never deny — but no-push denies every
-// update to a covered ref, including which ref default clones follow, and
-// unknown ops fail closed.
+// deny repointing HEAD at target (a fully qualified ref, HeadTarget form).
+// The consulted rules are the first match for the pseudoref HEAD and for
+// the new target ref (first-match-wins, like the update hook). Repointing
+// HEAD moves no refs and introduces no commits, so no-force-push
+// (deletions/rewrites) and verify-sig (introduced commits) never deny —
+// but no-push denies every update to a covered ref, including which ref
+// default clones follow, and unknown ops fail closed.
 func policyDeniesDefaultBranchChange(policies []auth.RefPolicy, target string) (string, bool) {
 	for _, ref := range []string{"HEAD", target} {
 		rule, ok := auth.MatchPolicy(policies, ref)
@@ -294,12 +306,23 @@ func (s *server) handlePatchRepo(w http.ResponseWriter, r *http.Request) {
 	}
 	// validBranchName vets the ref components either way; a refs/-prefixed
 	// value is otherwise stored and used verbatim (upstream contract), a
-	// plain name is qualified by HeadTarget at hydrate time.
-	if !validBranchName(branch) {
+	// plain name is qualified by HeadTarget at hydrate time. The derived
+	// HEAD target must additionally satisfy git's own ref-format rules
+	// (e.g. no trailing dot, which validBranchName's charset permits):
+	// hydration runs `symbolic-ref HEAD <target>` on every node, and a
+	// persisted target git rejects would break the repo's git/read
+	// surface until another PATCH repairs the row.
+	target := githttp.HeadTarget(branch)
+	if !validBranchName(branch) || !validRefFormat(r.Context(), target) {
 		writeErr(w, http.StatusBadRequest, "invalid default_branch")
 		return
 	}
-	if op, denied := policyDeniesDefaultBranchChange(policies, auth.NormalizeRefName(branch)); denied {
+	// The policy target is the derived HEAD symref target, not the
+	// NormalizeRefName shorthand: for the literal branch name "HEAD" the
+	// two disagree (refs/heads/HEAD vs the pseudoref), and rules written
+	// against refs/heads/HEAD must match. The pseudoref itself is checked
+	// separately inside the helper.
+	if op, denied := policyDeniesDefaultBranchChange(policies, target); denied {
 		writeErr(w, http.StatusForbidden, "ref policy op "+strconv.Quote(op)+" denies changing the default branch")
 		return
 	}
