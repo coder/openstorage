@@ -74,6 +74,14 @@ type RefStore interface {
 	RegisterPacks(ctx context.Context, repo string, packs []Pack) error
 	// ListPacks returns all registered packs for repo, oldest first.
 	ListPacks(ctx context.Context, repo string) ([]Pack, error)
+	// GetGeneration returns repo's mutation generation: 0 for a repo no
+	// mutation ever touched, strictly positive and monotonically increasing
+	// afterwards. Every mutation bumps it in the same atomic unit as the
+	// mutation itself — RegisterPacks always, CASRef exactly on a won swap,
+	// and future pack rewrites (issue #1's ReplacePacks) must do the same —
+	// so an unchanged value proves the repo's packs and refs are unchanged.
+	// The hydrate short-circuit relies on exactly that (issue #4).
+	GetGeneration(ctx context.Context, repo string) (int64, error)
 }
 
 // Store extends RefStore with the lifecycle the wire seam needs: serve runs
@@ -146,6 +154,12 @@ CREATE TABLE IF NOT EXISTS refs  (repo text, name text, sha text NOT NULL,
                                   created_at timestamptz NOT NULL DEFAULT now(), PRIMARY KEY (repo, name));
 CREATE TABLE IF NOT EXISTS packs (repo text, id text, s3_key text NOT NULL,
                                   created_at timestamptz DEFAULT now(), PRIMARY KEY (repo, id));
+-- Per-repo mutation generation (issue #4). No row means "never mutated"
+-- (GetGeneration reports 0); the first bump's upsert creates the row at the
+-- DEFAULT, so 0 and 1 stay distinguishable and a hydrate marker taken before
+-- the first mutation can never match the state after it.
+CREATE TABLE IF NOT EXISTS repo_generations (repo text PRIMARY KEY,
+                                             generation bigint NOT NULL DEFAULT 1);
 -- Idempotent additive migration for pre-p3 dev databases (backfills
 -- existing rows via the NOT NULL DEFAULT).
 ALTER TABLE refs ADD COLUMN IF NOT EXISTS created_at timestamptz NOT NULL DEFAULT now();
@@ -214,6 +228,15 @@ func (s *PG) GetRef(ctx context.Context, repo, name string) (string, error) {
 // error) when the precondition failed, i.e. someone else won the race.
 // Refs only ever change inside these single statements, so a broken/partial
 // ref state is impossible by construction.
+//
+// Each statement carries the ref mutation in a data-modifying CTE and bumps
+// the repo generation exactly when the CTE emitted a row (the swap matched):
+// mutation + bump commit atomically WITHOUT an explicit transaction, so the
+// statement stays the single unit of commit and the IdempotentCAS ambiguity
+// classification (idempotent.go) is unchanged. The outer upsert's row count
+// equals the CTE's, so RowsAffected still reports won 0/1. Lock order is
+// refs/packs row first, then the repo_generations row, everywhere — no
+// deadlock cycles.
 func (s *PG) CASRef(ctx context.Context, repo, name, old, new string) (won bool, err error) {
 	assertf(ValidSHA(old), "CASRef: malformed old sha %q", old)
 	assertf(ValidSHA(new), "CASRef: malformed new sha %q", new)
@@ -242,18 +265,37 @@ func (s *PG) CASRef(ctx context.Context, repo, name, old, new string) (won bool,
 	switch {
 	case old == ZeroSHA: // create
 		// created_at is set here once; SHA updates below never touch it.
-		c, cerr := conn.Exec(ctx,
-			`INSERT INTO refs (repo, name, sha, created_at) VALUES ($1, $2, $3, now()) ON CONFLICT DO NOTHING`,
+		c, cerr := conn.Exec(ctx, `
+WITH cas AS (
+    INSERT INTO refs (repo, name, sha, created_at) VALUES ($1, $2, $3, now())
+    ON CONFLICT DO NOTHING
+    RETURNING 1
+)
+INSERT INTO repo_generations (repo)
+SELECT $1::text FROM cas
+ON CONFLICT (repo) DO UPDATE SET generation = repo_generations.generation + 1`,
 			repo, name, new)
 		ct, err, tag = c, cerr, "create"
 	case new == ZeroSHA: // delete
-		c, cerr := conn.Exec(ctx,
-			`DELETE FROM refs WHERE repo = $1 AND name = $2 AND sha = $3`,
+		c, cerr := conn.Exec(ctx, `
+WITH cas AS (
+    DELETE FROM refs WHERE repo = $1 AND name = $2 AND sha = $3
+    RETURNING 1
+)
+INSERT INTO repo_generations (repo)
+SELECT $1::text FROM cas
+ON CONFLICT (repo) DO UPDATE SET generation = repo_generations.generation + 1`,
 			repo, name, old)
 		ct, err, tag = c, cerr, "delete"
 	default: // update
-		c, cerr := conn.Exec(ctx,
-			`UPDATE refs SET sha = $1 WHERE repo = $2 AND name = $3 AND sha = $4`,
+		c, cerr := conn.Exec(ctx, `
+WITH cas AS (
+    UPDATE refs SET sha = $1 WHERE repo = $2 AND name = $3 AND sha = $4
+    RETURNING 1
+)
+INSERT INTO repo_generations (repo)
+SELECT $2::text FROM cas
+ON CONFLICT (repo) DO UPDATE SET generation = repo_generations.generation + 1`,
 			new, repo, name, old)
 		ct, err, tag = c, cerr, "update"
 	}
@@ -279,8 +321,33 @@ func (s *PG) RegisterPacks(ctx context.Context, repo string, packs []Pack) error
 				return err
 			}
 		}
+		// Same-transaction generation bump (issue #4): a committed pack
+		// registration must invalidate the hydrate short-circuit. Bumped
+		// unconditionally — a retried registration whose rows all already
+		// existed costs one spurious full hydrate, never a stale serve.
+		if _, err := tx.Exec(ctx, `
+INSERT INTO repo_generations (repo) VALUES ($1)
+ON CONFLICT (repo) DO UPDATE SET generation = repo_generations.generation + 1`, repo); err != nil {
+			return err
+		}
 		return nil
 	})
+}
+
+// GetGeneration returns repo's mutation generation (0 = never mutated).
+func (s *PG) GetGeneration(ctx context.Context, repo string) (int64, error) {
+	assertf(repo != "", "GetGeneration: empty repo")
+	var gen int64
+	err := s.pool.QueryRow(ctx,
+		`SELECT generation FROM repo_generations WHERE repo = $1`, repo).Scan(&gen)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, nil // never mutated: the first bump creates the row at 1
+	}
+	if err != nil {
+		return 0, err
+	}
+	assertf(gen >= 1, "repo_generations holds non-positive generation %d for %s", gen, repo)
+	return gen, nil
 }
 
 // ListPacks returns all registered packs for repo, oldest first.

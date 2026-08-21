@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -324,16 +325,93 @@ func updateRefStdin(repoPath, commands string) error {
 	return nil
 }
 
+// Generation marker (issue #4): the store's per-repo mutation generation
+// the last fully successful hydrate ran at, persisted as a file inside the
+// bare cache repo. Every mutation bumps the generation in the same atomic
+// unit (ref.RefStore.GetGeneration), so an unchanged value proves packs and
+// refs are unchanged and Hydrate can skip pack listing and ref sync
+// entirely. The TTL forces a periodic full sync regardless, bounding the
+// staleness of any missed bump or lost marker-ordering race to one window.
+const (
+	generationMarker    = "codestorage.generation"
+	generationMarkerTTL = 5 * time.Minute
+)
+
+// readGenerationMarker returns the marker's recorded generation and whether
+// its mtime — refreshed only by full successful hydrates, never by
+// short-circuited ones — is still within the TTL window. ok=false means no
+// usable marker (missing, malformed, or unreadable): callers full-hydrate,
+// and the next success rewrites it.
+func readGenerationMarker(repoPath string) (gen int64, fresh bool, ok bool) {
+	path := filepath.Join(repoPath, generationMarker)
+	fi, err := os.Stat(path)
+	if err != nil {
+		return 0, false, false
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return 0, false, false
+	}
+	gen, perr := strconv.ParseInt(strings.TrimSpace(string(b)), 10, 64)
+	if perr != nil || gen < 0 {
+		return 0, false, false
+	}
+	return gen, time.Since(fi.ModTime()) < generationMarkerTTL, true
+}
+
+// writeGenerationMarker persists gen via temp file + rename: concurrent
+// hydrators and re-exec'd hook processes share the cache dir, and a reader
+// must never see a torn write (a crash mid-write leaves only a temp file).
+// Best-effort by design — on failure the marker is simply absent or stale
+// and the next hydrate does the full sync; a lost write can cost work but
+// never staleness.
+func writeGenerationMarker(repoPath string, gen int64) {
+	assertf(gen >= 0, "writeGenerationMarker: negative generation %d", gen)
+	tmp, err := os.CreateTemp(repoPath, generationMarker+".tmp-*")
+	if err != nil {
+		return
+	}
+	defer func() { _ = os.Remove(tmp.Name()) }() // no-op after a successful rename
+	if _, err := fmt.Fprintf(tmp, "%d\n", gen); err != nil {
+		_ = tmp.Close()
+		return
+	}
+	if err := tmp.Close(); err != nil {
+		return
+	}
+	_ = os.Rename(tmp.Name(), filepath.Join(repoPath, generationMarker))
+}
+
 // Hydrate rebuilds the cache repo state for repo from PG + S3 (the stateless
 // node property): ensure repo, hydrate packs, then sync refs.
 // On the receive path a concurrent receive-pack may hold ref locks while we
 // sync; retry briefly, and let the caller decide whether a residual failure
 // is fatal (upload path) or tolerable staleness (receive path, where git
 // re-validates old SHAs itself).
+//
+// Fast path (issue #4): when the store generation matches the local marker
+// written by the last fully successful hydrate — and the marker is within
+// its TTL — the packs and refs are provably unchanged and Hydrate returns
+// after one point-read, skipping ListPacks, per-pack stats, ListRefs, and
+// the for-each-ref/update-ref/symbolic-ref subprocesses. EnsureCacheRepo
+// still runs unconditionally: hook and config repair must stay verified on
+// every request (the hook script embeds this binary's path, which changes
+// across deployments), and it touches no DB state.
 func Hydrate(ctx context.Context, st ref.RefStore, bl blob.BlobStore, cacheDir, repo string) (repoPath string, refsErr error, err error) {
 	repoPath, err = EnsureCacheRepo(cacheDir, repo)
 	if err != nil {
 		return "", nil, err
+	}
+	// Generation read strictly BEFORE the pack/ref reads below: the marker
+	// this hydrate may write must never claim newer state than it actually
+	// synced. Mutations landing after this read leave marker < generation,
+	// which just forces the next hydrate down the full path.
+	gen, err := st.GetGeneration(ctx, repo)
+	if err != nil {
+		return "", nil, err
+	}
+	if markerGen, fresh, ok := readGenerationMarker(repoPath); ok && fresh && markerGen == gen {
+		return repoPath, nil, nil
 	}
 	if err := HydratePacks(ctx, st, bl, repoPath, repo); err != nil {
 		return "", nil, err
@@ -347,6 +425,15 @@ func Hydrate(ctx context.Context, st ref.RefStore, bl blob.BlobStore, cacheDir, 
 			break
 		}
 		time.Sleep(50 * time.Millisecond)
+	}
+	if refsErr == nil {
+		// Strictly after full success — a failed hydrate must never advance
+		// the marker. The rename also refreshes the mtime, restarting the
+		// TTL window. Residual race, TTL-bounded by construction: a
+		// hydrator that dies between SyncRefs and this write can strand a
+		// concurrent hydrator's newer marker over the older refs it just
+		// synced; the marker is a heuristic, the TTL is the staleness bound.
+		writeGenerationMarker(repoPath, gen)
 	}
 	return repoPath, refsErr, nil
 }
