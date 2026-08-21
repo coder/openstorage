@@ -70,6 +70,7 @@ const (
 	OpRefGetRef           = "ref.GetRef"
 	OpRefCASRef           = "ref.CASRef"
 	OpRefRegisterPacks    = "ref.RegisterPacks"
+	OpRefReplacePacks     = "ref.ReplacePacks"
 	OpRefListPacks        = "ref.ListPacks"
 	OpRefGetGeneration    = "ref.GetGeneration"
 
