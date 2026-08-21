@@ -29,7 +29,8 @@ type countingStore struct {
 	gen  int64
 	refs map[string]string
 
-	refsErr error // returned by ListRefs when set
+	refsErr  error         // returned by ListRefs when set
+	refsGate chan struct{} // when set, ListRefs blocks until it closes
 
 	listPacksCalls, listRefsCalls, getGenerationCalls int
 }
@@ -50,8 +51,14 @@ func (s *countingStore) ListPacks(context.Context, string) ([]ref.Pack, error) {
 
 func (s *countingStore) ListRefs(context.Context, string) (map[string]string, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.listRefsCalls++
+	gate := s.refsGate
+	s.mu.Unlock()
+	if gate != nil {
+		<-gate
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.refsErr != nil {
 		return nil, s.refsErr
 	}
@@ -144,9 +151,85 @@ func TestHydrate_ShortCircuitsOnUnchangedGeneration(t *testing.T) {
 	if lp != 1 || lr != 1 {
 		t.Fatalf("idle rehydrates hit the store: ListPacks=%d ListRefs=%d, want 1/1", lp, lr)
 	}
-	if gg != 4 {
-		t.Fatalf("GetGeneration calls = %d, want 4 (one per Hydrate)", gg)
+	// The full first hydrate reads the generation twice (pre-lock fast
+	// path + under-lock recheck); each short-circuit reads it once.
+	if gg != 5 {
+		t.Fatalf("GetGeneration calls = %d, want 5 (2 for the full hydrate + 1 per short-circuit)", gg)
 	}
+}
+
+// TestHydrate_ConcurrentFullSyncsSerialize pins the fix for the marker
+// ordering race (PR #14 review): overlapping full hydrates spanning a
+// mutation must serialize on the per-repo hydrate lock, so an older ref
+// sync can never land after a newer one whose marker survives. Hydrate A is
+// held mid-sync (blocked inside ListRefs, holding the lock) while B — at a
+// newer generation — must wait rather than sync-and-publish underneath it.
+func TestHydrate_ConcurrentFullSyncsSerialize(t *testing.T) {
+	st, bl, cacheDir := hydrateEnv(t)
+	const repo = "t-gen-serialize"
+	gate := make(chan struct{})
+	st.refsGate = gate
+
+	aDone := make(chan error, 1)
+	go func() {
+		_, refsErr, err := Hydrate(context.Background(), st, bl, cacheDir, repo)
+		if err == nil {
+			err = refsErr
+		}
+		aDone <- err
+	}()
+	// Wait until A is inside ListRefs — past its generation reads (gen 7),
+	// holding the hydrate lock.
+	waitFor(t, func() bool { _, lr, _ := st.counts(); return lr == 1 })
+
+	// The mutation lands, and B starts a hydrate at the new generation.
+	st.setGen(8)
+	bDone := make(chan error, 1)
+	go func() {
+		_, refsErr, err := Hydrate(context.Background(), st, bl, cacheDir, repo)
+		if err == nil {
+			err = refsErr
+		}
+		bDone <- err
+	}()
+	// B must park on the hydrate lock: its pre-lock GetGeneration runs (A's
+	// 2 + B's 1 = 3 calls) but it must not reach its under-lock re-read or
+	// ListRefs while A holds the lock.
+	waitFor(t, func() bool { _, _, gg := st.counts(); return gg == 3 })
+	time.Sleep(100 * time.Millisecond) // would be long enough for B to barge
+	if _, lr, gg := st.counts(); lr != 1 || gg != 3 {
+		t.Fatalf("B progressed under A's lock: ListRefs=%d GetGeneration=%d, want 1/3", lr, gg)
+	}
+
+	close(gate) // release A's sync
+	if err := <-aDone; err != nil {
+		t.Fatalf("hydrate A: %v", err)
+	}
+	if err := <-bDone; err != nil {
+		t.Fatalf("hydrate B: %v", err)
+	}
+
+	// B ran strictly after A: it re-read the generation under the lock (8),
+	// full-synced, and published last — marker must hold the NEWEST
+	// generation, matching the refs actually in the cache.
+	if got := markerContent(t, RepoPath(cacheDir, repo)); got != "8" {
+		t.Fatalf("marker = %q, want \"8\" (newest sync publishes last)", got)
+	}
+	if lp, lr, _ := st.counts(); lp != 2 || lr != 2 {
+		t.Fatalf("ListPacks=%d ListRefs=%d, want 2/2 (exactly one full sync each)", lp, lr)
+	}
+}
+
+// waitFor polls cond until it holds (test-scoped; fails after ~5s).
+func waitFor(t *testing.T, cond func() bool) {
+	t.Helper()
+	for i := 0; i < 500; i++ {
+		if cond() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("condition not reached within 5s")
 }
 
 func TestHydrate_MutationInvalidatesShortCircuit(t *testing.T) {
