@@ -64,9 +64,8 @@ type OrphanPack struct {
 
 // SweepReport summarizes one sweep run.
 type SweepReport struct {
-	ReposScanned int
-	Live         int // blobs present in the pack registry
-	Fresh        int // unregistered but younger than the threshold
+	Live  int // blobs present in the pack registry
+	Fresh int // unregistered but younger than the threshold
 	// Orphans is a bounded sample (maxOrphanSample) of the candidates:
 	// an orphan backlog after an outage can be arbitrarily large, and the
 	// report must not scale worker memory with it. OrphanCount and
@@ -145,32 +144,29 @@ func (s *Sweeper) Sweep(ctx context.Context) (SweepReport, error) {
 	// only copy sits in quarantine (delete-enabled crash mid-handshake)
 	// must still be restored then. Only purging stays delete-gated.
 	var report SweepReport
-	var deleteErrs []error
+	var deleteErrs boundedErrs
 	if err := s.healQuarantine(ctx, &report, s.cfg.Delete); err != nil {
-		deleteErrs = append(deleteErrs, err)
+		deleteErrs.add(err)
 	}
 	// Stream packs/ page-wise and classify each object with a point
 	// registry read (PackRegistry.HasPack): both the blob population and a
 	// repo's registered-pack count are attacker-growable (pre-receive
 	// uploads and registers packs before ref policy), so the sweep must
 	// never materialize a prefix listing or a repo's pack set. Memory is
-	// bounded by one page, the distinct-repo seen-set (a control-plane-
-	// bounded population), and the report's bounded orphan sample
-	// (maxOrphanSample; counts and bytes stay exact). Keys not matching
-	// the exact blob.PackKey shape (packs/<repo>/pack-<id>.pack, no deeper
-	// nesting) were not written by this system — leave foreign objects
-	// alone, loudly.
-	seen := make(map[string]bool)
+	// bounded by one page, the report's bounded orphan sample
+	// (maxOrphanSample; counts and bytes stay exact), and the bounded
+	// error sample — deliberately NO per-repo state: a repo-creation
+	// principal can grow the distinct-repo population without bound, and
+	// classification is per-object anyway. Keys not matching the exact
+	// blob.PackKey shape (packs/<repo>/pack-<id>.pack, no deeper nesting)
+	// were not written by this system — leave foreign objects alone,
+	// loudly.
 	err := s.blobs.ListPages(ctx, blob.PacksRoot, sweepListPageSize, func(page []blob.ListedObject) error {
 		for _, obj := range page {
 			repo, ok := splitPackKey(obj.Key)
 			if !ok {
 				s.logger.Warn("orphan pack sweep: skipping foreign key under packs/", "key", obj.Key)
 				continue
-			}
-			if !seen[repo] {
-				seen[repo] = true
-				report.ReposScanned++
 			}
 			if err := s.classify(ctx, repo, obj, &report, &deleteErrs); err != nil {
 				return err
@@ -183,17 +179,45 @@ func (s *Sweeper) Sweep(ctx context.Context) (SweepReport, error) {
 	}
 
 	s.logger.Info("orphan pack sweep finished",
-		"repos", report.ReposScanned, "live", report.Live, "fresh", report.Fresh,
+		"live", report.Live, "fresh", report.Fresh,
 		"orphans", report.OrphanCount, "orphan_bytes", report.OrphanBytes,
 		"deleted", report.Deleted, "bytes_reclaimed", report.BytesReclaimed,
 		"delete_enabled", s.cfg.Delete, "threshold", s.cfg.Threshold,
 		"duration", s.now().Sub(start).Round(time.Millisecond))
-	return report, errors.Join(deleteErrs...)
+	return report, deleteErrs.join()
 }
 
 // sweepListPageSize bounds how many listed objects a sweep holds per page.
 // A var so tests can force multi-page scans with few objects.
 var sweepListPageSize = 1000
+
+// maxSweepErrs bounds how many per-entry errors a sweep retains: an outage
+// can fail every entry of an attacker-growable population, and error
+// accumulation must not scale memory with it. A var so tests can exercise
+// the cap cheaply.
+var maxSweepErrs = 20
+
+// boundedErrs retains the first maxSweepErrs errors plus an exact count of
+// the overflow it elided.
+type boundedErrs struct {
+	errs   []error
+	elided int
+}
+
+func (b *boundedErrs) add(err error) {
+	if len(b.errs) < maxSweepErrs {
+		b.errs = append(b.errs, err)
+		return
+	}
+	b.elided++
+}
+
+func (b *boundedErrs) join() error {
+	if b.elided > 0 {
+		return errors.Join(append(b.errs, fmt.Errorf("sweep: %d additional errors elided", b.elided))...)
+	}
+	return errors.Join(b.errs...)
+}
 
 // maxOrphanSample bounds SweepReport.Orphans (see its doc). A var so tests
 // can exercise the cap without minting thousands of objects.
@@ -209,7 +233,7 @@ const sweepRecoveryTimeout = 15 * time.Minute
 // age-threshold diff, then (delete mode only) the revalidate + quarantine
 // handshake. Registry errors abort the sweep (they would misclassify the
 // object); disposal errors accumulate into deleteErrs.
-func (s *Sweeper) classify(ctx context.Context, repo string, obj blob.ListedObject, report *SweepReport, deleteErrs *[]error) error {
+func (s *Sweeper) classify(ctx context.Context, repo string, obj blob.ListedObject, report *SweepReport, deleteErrs *boundedErrs) error {
 	registered, err := s.packs.HasPack(ctx, repo, obj.Key)
 	if err != nil {
 		return fmt.Errorf("has pack %s: %w", obj.Key, err)
@@ -242,7 +266,7 @@ func (s *Sweeper) classify(ctx context.Context, repo string, obj blob.ListedObje
 	}
 	stillOrphan, err := s.revalidateOrphan(ctx, repo, obj.Key)
 	if err != nil {
-		*deleteErrs = append(*deleteErrs, err)
+		deleteErrs.add(err)
 		return nil
 	}
 	if !stillOrphan {
@@ -250,7 +274,7 @@ func (s *Sweeper) classify(ctx context.Context, repo string, obj blob.ListedObje
 	}
 	reaped, err := s.safeDelete(ctx, repo, obj.Key)
 	if err != nil {
-		*deleteErrs = append(*deleteErrs, err)
+		deleteErrs.add(err)
 		return nil
 	}
 	if reaped {
@@ -421,22 +445,24 @@ func (s *Sweeper) safeDelete(ctx context.Context, repo, key string) (bool, error
 // actually drops (reaping only moves bytes into quarantine). Failures are
 // joined; each entry is independent.
 func (s *Sweeper) healQuarantine(ctx context.Context, report *SweepReport, purge bool) error {
-	var errs []error
 	// Streamed like the packs/ scan: quarantine grows with reaped orphans,
 	// which an attacker can mint, so this prefix must not be materialized
-	// whole either. Entries are independent, so per-page handling is exact.
+	// whole either — and neither may its errors: an outage can fail every
+	// entry, so retention is bounded (boundedErrs) while the elided count
+	// stays exact. Entries are independent, so per-page handling is exact.
+	var errs boundedErrs
 	listErr := s.blobs.ListPages(ctx, quarantinePrefix, sweepListPageSize, func(page []blob.ListedObject) error {
 		for _, q := range page {
 			if err := s.healQuarantineEntry(ctx, q, report, purge); err != nil {
-				errs = append(errs, err)
+				errs.add(err)
 			}
 		}
 		return nil
 	})
 	if listErr != nil {
-		errs = append(errs, fmt.Errorf("sweep: list quarantine: %w", listErr))
+		errs.add(fmt.Errorf("sweep: list quarantine: %w", listErr))
 	}
-	return errors.Join(errs...)
+	return errs.join()
 }
 
 // healQuarantineEntry disposes of one quarantine backup per the
@@ -483,7 +509,12 @@ func (s *Sweeper) healQuarantineEntry(ctx context.Context, q blob.ListedObject, 
 	if !purge || q.ModTime.IsZero() || s.now().Sub(q.ModTime) < s.cfg.Threshold {
 		return nil
 	}
-	if err := s.blobs.Delete(ctx, q.Key); err != nil && !errors.Is(err, blob.ErrNotFound) {
+	switch err := s.blobs.Delete(ctx, q.Key); {
+	case errors.Is(err, blob.ErrNotFound):
+		// A concurrent sweep purged this entry first: it reclaimed the
+		// bytes and credited them; crediting here too would double-count.
+		return nil
+	case err != nil:
 		return fmt.Errorf("sweep: purge quarantine %s: %w", q.Key, err)
 	}
 	if !registered {

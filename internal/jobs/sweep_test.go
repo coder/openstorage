@@ -180,10 +180,6 @@ func TestSweep_ListOnlyReportsWithoutDeleting(t *testing.T) {
 	if report.Live != 2 || report.Fresh != 1 || report.Deleted != 0 || report.BytesReclaimed != 0 {
 		t.Fatalf("report = %+v, want live=2 fresh=1 deleted=0", report)
 	}
-	if report.ReposScanned != 2 { // r1 and r1+import
-		t.Fatalf("ReposScanned = %d, want 2", report.ReposScanned)
-	}
-
 	// List-only NEVER deletes, orphans included.
 	for _, key := range []string{liveKey, nsLiveKey, freshKey, oldOrphan, nsOrphan,
 		"packs/stray", "packs/r1/manifest.json", "packs/r1/archive/data"} {
@@ -588,6 +584,58 @@ func TestQuarantineKey(t *testing.T) {
 	}
 }
 
+// failingRegistry fails every HasPack, simulating a registry outage.
+type failingRegistry struct{}
+
+func (failingRegistry) HasPack(context.Context, string, string) (bool, error) {
+	return false, errors.New("simulated registry outage")
+}
+
+// A registry outage during a quarantine scan must not accumulate one error
+// per entry: retention is bounded while the elided count stays exact
+// (Codex round 17).
+func TestSweep_HealErrorsBounded(t *testing.T) {
+	orig := maxSweepErrs
+	maxSweepErrs = 1
+	t.Cleanup(func() { maxSweepErrs = orig })
+
+	f := newSweepFixture(t)
+	for _, id := range []string{"a", "b", "c"} {
+		f.upload(quarantinePrefix+"00112233aabbccdd/"+blob.PackKey("r1", id), "bytes")
+	}
+	s := NewSweeper(f.blobs, failingRegistry{}, SweepConfig{Threshold: 24 * time.Hour}, slog.New(slog.DiscardHandler))
+	_, err := s.Sweep(context.Background())
+	if err == nil {
+		t.Fatal("Sweep: want joined heal errors, got nil")
+	}
+	if !strings.Contains(err.Error(), "2 additional errors elided") {
+		t.Fatalf("error = %v, want exactly the elided-overflow count for 3 entries with cap 1", err)
+	}
+}
+
+// An aged quarantine entry purged by a concurrent sweep between this
+// sweep's listing and its delete must not be credited as reclaimed here:
+// the deleting sweep already counted those bytes (Codex round 17).
+func TestSweep_PurgeDoesNotCreditPeerDeletedEntry(t *testing.T) {
+	f := newSweepFixture(t)
+	orig := blob.PackKey("r1", "peer")
+	f.upload(orig, "peer-bytes")
+	f.register("r1", "peer", orig)
+	// Listed as aged and unregistered-looking, but never uploaded: the
+	// peer's purge already removed it.
+	qkey := quarantinePrefix + "dddddddddddddddd/" + blob.PackKey("r1", "gone")
+
+	s := NewSweeper(&peerPurged{BlobStore: f.blobs, orig: orig, qkey: qkey}, f.store,
+		SweepConfig{Threshold: 24 * time.Hour, Delete: true}, slog.New(slog.DiscardHandler))
+	report, err := s.Sweep(context.Background())
+	if err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if report.BytesReclaimed != 0 {
+		t.Fatalf("BytesReclaimed = %d, want 0 (peer's sweep already credited the purge)", report.BytesReclaimed)
+	}
+}
+
 // cancelDuringDelete cancels the sweep's context while the delete request
 // is in flight and reports the delete as failed — the shutdown-races-the-
 // response class. Recovery (restore) must still complete (Codex round 16).
@@ -914,9 +962,9 @@ func TestSweep_StreamsAcrossPages(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Sweep: %v", err)
 	}
-	if report.ReposScanned != 2 || report.Live != 2 || report.Fresh != 2 ||
+	if report.Live != 2 || report.Fresh != 2 ||
 		len(report.Orphans) != 2 || report.Deleted != 2 {
-		t.Fatalf("report = %+v, want 2 repos / 2 live / 2 fresh / 2 orphans reaped", report)
+		t.Fatalf("report = %+v, want 2 live / 2 fresh / 2 orphans reaped", report)
 	}
 	for _, repo := range []string{"ra", "rb"} {
 		if f.exists(blob.PackKey(repo, "orphan")) {
