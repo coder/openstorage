@@ -142,6 +142,8 @@ func TestPatchRepoDefaultBranchErrors(t *testing.T) {
 			{"lock suffix", []byte(`{"default_branch":"dev.lock"}`), http.StatusBadRequest},
 			{"trailing dot", []byte(`{"default_branch":"main."}`), http.StatusBadRequest},
 			{"qualified trailing dot", []byte(`{"default_branch":"refs/heads/main."}`), http.StatusBadRequest},
+			{"non-branch namespace", []byte(`{"default_branch":"refs/tags/annot"}`), http.StatusBadRequest},
+			{"notes namespace", []byte(`{"default_branch":"refs/notes/commits"}`), http.StatusBadRequest},
 		}
 		for _, tc := range cases {
 			t.Run(tc.name, func(t *testing.T) {

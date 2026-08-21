@@ -185,10 +185,9 @@ func (s *server) handleForkRepo(w http.ResponseWriter, r *http.Request, verifier
 	}
 	if branch == "" {
 		// The source's stored default may be refs/heads/-qualified (PATCH
-		// /repo stores such values verbatim); the fork inherits the branch
-		// NAME — forkRef below re-qualifies it. A source default outside
-		// refs/heads/ survives the trim and fails validBranchName: such a
-		// fork must name its default branch explicitly.
+		// /repo stores that spelling verbatim; both create and PATCH
+		// reject other ref namespaces); the fork inherits the branch
+		// NAME — forkRef below re-qualifies it.
 		branch = strings.TrimPrefix(srcRepo.DefaultBranch, "refs/heads/")
 	}
 	if !validBranchName(branch) {

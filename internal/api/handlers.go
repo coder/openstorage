@@ -304,16 +304,20 @@ func (s *server) handlePatchRepo(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "default_branch is required")
 		return
 	}
-	// validBranchName vets the ref components either way; a refs/-prefixed
-	// value is otherwise stored and used verbatim (upstream contract), a
-	// plain name is qualified by HeadTarget at hydrate time. The derived
+	// default_branch names a BRANCH: a plain name (validated with the same
+	// conservative validBranchName as POST /repos' identical field) or its
+	// refs/heads/-qualified spelling, stored verbatim (upstream contract).
+	// Other ref namespaces are rejected: a refs/tags/... HEAD would evade
+	// every default-deletion protection and dangle on tag deletion — and
+	// upstream's field is, by name and description, a branch. The derived
 	// HEAD target must additionally satisfy git's own ref-format rules
 	// (e.g. no trailing dot, which validBranchName's charset permits):
 	// hydration runs `symbolic-ref HEAD <target>` on every node, and a
 	// persisted target git rejects would break the repo's git/read
 	// surface until another PATCH repairs the row.
 	target := githttp.HeadTarget(branch)
-	if !validBranchName(branch) || !validRefFormat(r.Context(), target) {
+	shortName := strings.TrimPrefix(branch, "refs/heads/")
+	if strings.HasPrefix(shortName, "refs/") || !validBranchName(shortName) || !validRefFormat(r.Context(), target) {
 		writeErr(w, http.StatusBadRequest, "invalid default_branch")
 		return
 	}
