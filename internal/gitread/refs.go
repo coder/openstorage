@@ -12,9 +12,15 @@ import (
 // tags (invariant 10, docs/01:78-80) and the target itself for lightweight
 // tags.
 type Tag struct {
-	Name string // short tag name (refname:short)
+	Name string // short tag name (refs/tags/ stripped)
 	SHA  string // peeled commit sha
 }
+
+// tagRefPrefix is the fixed prefix stripped off %(refname) below. NOT
+// %(refname:short): short is a non-ambiguous ABBREVIATION, so a tag whose
+// name collides with a branch comes out as "tags/<name>" and exact-name
+// matching (GET /repos/tag) misses it.
+const tagRefPrefix = "refs/tags/"
 
 // PeeledTags lists all tags of the repo at repoPath in lexical refname
 // order (for-each-ref's default — the docs/03 GET /repos/tags order).
@@ -23,7 +29,7 @@ type Tag struct {
 // are skipped rather than surfaced with a non-commit sha.
 func PeeledTags(ctx context.Context, repoPath string) ([]Tag, error) {
 	out, err := runGit(ctx, repoPath, "for-each-ref",
-		"--format=%(refname:short)%00%(objectname)%00%(objecttype)%00%(*objectname)%00%(*objecttype)", "refs/tags")
+		"--format=%(refname)%00%(objectname)%00%(objecttype)%00%(*objectname)%00%(*objecttype)", "refs/tags")
 	if err != nil {
 		return nil, err
 	}
@@ -33,10 +39,11 @@ func PeeledTags(ctx context.Context, repoPath string) ([]Tag, error) {
 			continue
 		}
 		fields := strings.Split(line, "\x00")
-		if len(fields) != 5 || fields[0] == "" {
+		if len(fields) != 5 || !strings.HasPrefix(fields[0], tagRefPrefix) || fields[0] == tagRefPrefix {
 			return nil, fmt.Errorf("for-each-ref emitted %q", line)
 		}
-		name, sha, objType, peeledSHA, peeledType := fields[0], fields[1], fields[2], fields[3], fields[4]
+		name, sha, objType, peeledSHA, peeledType :=
+			strings.TrimPrefix(fields[0], tagRefPrefix), fields[1], fields[2], fields[3], fields[4]
 		switch {
 		case objType == "commit":
 			// Lightweight tag directly on a commit.

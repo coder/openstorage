@@ -158,23 +158,30 @@ func TestPeeledTags(t *testing.T) {
 	mustGit(t, f.dir, "tag", "a-blob-tag", f.c1+":README.md")
 	mustGit(t, f.dir, "tag", "-a", "-m", "tree tag", "b-tree-tag", f.c1+"^{tree}")
 	mustGit(t, f.dir, "tag", "-a", "-m", "nested", "c-nested", "v1")
+	// A tag whose name collides with a branch: %(refname:short) would
+	// disambiguate it as "tags/feature", but Tag.Name must be the plain
+	// short name for exact-name matching (GET /repos/tag).
+	mustGit(t, f.dir, "tag", "feature", f.c1)
 
 	tags, err := PeeledTags(context.Background(), f.dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(tags) != 3 {
-		t.Fatalf("got %d tags, want 3 (non-commit tags skipped): %+v", len(tags), tags)
+	if len(tags) != 4 {
+		t.Fatalf("got %d tags, want 4 (non-commit tags skipped): %+v", len(tags), tags)
 	}
 	// Lexical order; nested + annotated peel to c1, lightweight points at c2.
 	if tags[0].Name != "c-nested" || tags[0].SHA != f.c1 {
 		t.Errorf("tags[0] = %+v, want c-nested -> %s (peeled through the tag chain)", tags[0], f.c1)
 	}
-	if tags[1].Name != "v1" || tags[1].SHA != f.c1 {
-		t.Errorf("tags[1] = %+v, want v1 -> %s (peeled)", tags[1], f.c1)
+	if tags[1].Name != "feature" || tags[1].SHA != f.c1 {
+		t.Errorf("tags[1] = %+v, want feature -> %s (branch-name collision stays plain)", tags[1], f.c1)
 	}
-	if tags[2].Name != "v2-light" || tags[2].SHA != f.c2 {
-		t.Errorf("tags[2] = %+v, want v2-light -> %s", tags[2], f.c2)
+	if tags[2].Name != "v1" || tags[2].SHA != f.c1 {
+		t.Errorf("tags[2] = %+v, want v1 -> %s (peeled)", tags[2], f.c1)
+	}
+	if tags[3].Name != "v2-light" || tags[3].SHA != f.c2 {
+		t.Errorf("tags[3] = %+v, want v2-light -> %s", tags[3], f.c2)
 	}
 }
 

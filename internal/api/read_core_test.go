@@ -416,6 +416,57 @@ func TestReadCoreBranchesAndTags(t *testing.T) {
 			}
 		})
 
+		t.Run("branch lookup", func(t *testing.T) {
+			resp, body := coreGet(t, e, "GET", "/api/v1/repos/branch?name=main", fx.token, nil)
+			coreRequireStatus(t, resp, body, 200)
+			var got getBranchResponse
+			coreDecode(t, body, &got)
+			if got.Branch.Name != "main" || got.Branch.HeadSHA != fx.c3 {
+				t.Errorf("branch = %+v, want main@%s", got.Branch, fx.c3)
+			}
+			if _, err := time.Parse(time.RFC3339, got.Branch.CreatedAt); err != nil {
+				t.Errorf("created_at %q: %v", got.Branch.CreatedAt, err)
+			}
+			// Upstream get_branch omits the list pagination fields.
+			var raw map[string]map[string]any
+			coreDecode(t, body, &raw)
+			if _, ok := raw["branch"]["cursor"]; ok {
+				t.Errorf("branch lookup body %s carries a cursor field", body)
+			}
+		})
+
+		t.Run("branch lookup ephemeral", func(t *testing.T) {
+			resp, body := coreGet(t, e, "GET", "/api/v1/repos/branch?name=scratch&ephemeral=true", fx.token, nil)
+			coreRequireStatus(t, resp, body, 200)
+			var got getBranchResponse
+			coreDecode(t, body, &got)
+			if got.Branch.Name != "scratch" || got.Branch.HeadSHA != fx.c4 {
+				t.Errorf("ephemeral branch = %+v, want scratch@%s", got.Branch, fx.c4)
+			}
+			// The namespaces must not bleed into each other.
+			resp, body = coreGet(t, e, "GET", "/api/v1/repos/branch?name=scratch", fx.token, nil)
+			coreRequireStatus(t, resp, body, 404)
+			resp, body = coreGet(t, e, "GET", "/api/v1/repos/branch?name=main&ephemeral=true", fx.token, nil)
+			coreRequireStatus(t, resp, body, 404)
+		})
+
+		t.Run("branch lookup missing", func(t *testing.T) {
+			resp, body := coreGet(t, e, "GET", "/api/v1/repos/branch?name=nope", fx.token, nil)
+			coreRequireStatus(t, resp, body, 404)
+			requireEnvelope(t, resp, body)
+		})
+
+		t.Run("branch lookup bad params", func(t *testing.T) {
+			for _, u := range []string{
+				"/api/v1/repos/branch", // name is required
+				"/api/v1/repos/branch?name=main&ephemeral=yes",
+			} {
+				resp, body := coreGet(t, e, "GET", u, fx.token, nil)
+				coreRequireStatus(t, resp, body, 400)
+				requireEnvelope(t, resp, body)
+			}
+		})
+
 		t.Run("tags", func(t *testing.T) {
 			resp, body := coreGet(t, e, "GET", "/api/v1/repos/tags", fx.token, nil)
 			coreRequireStatus(t, resp, body, 200)
@@ -432,6 +483,66 @@ func TestReadCoreBranchesAndTags(t *testing.T) {
 			if got.Tags[1].Name != "v1-annot" || got.Tags[1].SHA != fx.c3 {
 				t.Errorf("tags[1] = %+v, want v1-annot@%s (peeled, tag obj %s)", got.Tags[1], fx.c3, fx.tagObj)
 			}
+		})
+
+		t.Run("tag lookup", func(t *testing.T) {
+			// Lightweight tag: sha is the commit itself.
+			resp, body := coreGet(t, e, "GET", "/api/v1/repos/tag?name=v0-light", fx.token, nil)
+			coreRequireStatus(t, resp, body, 200)
+			var got getTagResponse
+			coreDecode(t, body, &got)
+			if got.Tag.Name != "v0-light" || got.Tag.SHA != fx.c1 {
+				t.Errorf("tag = %+v, want v0-light@%s", got.Tag, fx.c1)
+			}
+			// Annotated tag: sha is the PEELED commit, never the tag object
+			// (invariant 10, matching the list endpoint).
+			resp, body = coreGet(t, e, "GET", "/api/v1/repos/tag?name=v1-annot", fx.token, nil)
+			coreRequireStatus(t, resp, body, 200)
+			coreDecode(t, body, &got)
+			if got.Tag.Name != "v1-annot" || got.Tag.SHA != fx.c3 {
+				t.Errorf("tag = %+v, want v1-annot@%s (peeled, tag obj %s)", got.Tag, fx.c3, fx.tagObj)
+			}
+		})
+
+		t.Run("tag lookup branch-name collision", func(t *testing.T) {
+			// A tag and a branch sharing one name: the tag must be
+			// retrievable by its plain short name (git's %(refname:short)
+			// would disambiguate it to "tags/<name>", which must NOT match).
+			repo, token := coreFreshRepo(t, e, org)
+			coreSeedStores(t, e, repo.RepoID, fx.work, map[string]string{
+				"refs/heads/release": fx.c2,
+				"refs/tags/release":  fx.c1,
+			})
+			resp, body := coreGet(t, e, "GET", "/api/v1/repos/tag?name=release", token, nil)
+			coreRequireStatus(t, resp, body, 200)
+			var got getTagResponse
+			coreDecode(t, body, &got)
+			if got.Tag.Name != "release" || got.Tag.SHA != fx.c1 {
+				t.Errorf("tag = %+v, want release@%s", got.Tag, fx.c1)
+			}
+			// The disambiguated spelling is not a tag name.
+			resp, body = coreGet(t, e, "GET", "/api/v1/repos/tag?name=tags/release", token, nil)
+			coreRequireStatus(t, resp, body, 404)
+			// The branch side resolves independently.
+			resp, body = coreGet(t, e, "GET", "/api/v1/repos/branch?name=release", token, nil)
+			coreRequireStatus(t, resp, body, 200)
+			var gotBranch getBranchResponse
+			coreDecode(t, body, &gotBranch)
+			if gotBranch.Branch.HeadSHA != fx.c2 {
+				t.Errorf("branch = %+v, want release@%s", gotBranch.Branch, fx.c2)
+			}
+		})
+
+		t.Run("tag lookup missing", func(t *testing.T) {
+			resp, body := coreGet(t, e, "GET", "/api/v1/repos/tag?name=nope", fx.token, nil)
+			coreRequireStatus(t, resp, body, 404)
+			requireEnvelope(t, resp, body)
+		})
+
+		t.Run("tag lookup bad params", func(t *testing.T) {
+			resp, body := coreGet(t, e, "GET", "/api/v1/repos/tag", fx.token, nil) // name is required
+			coreRequireStatus(t, resp, body, 400)
+			requireEnvelope(t, resp, body)
 		})
 
 		t.Run("tags pagination walk", func(t *testing.T) {

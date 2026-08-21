@@ -254,6 +254,67 @@ func (s *server) handleListBranches(w http.ResponseWriter, r *http.Request) {
 }
 
 // ---------------------------------------------------------------------------
+// GET /repos/branch (single-item lookup)
+
+// branchInfo is the upstream get_branch wire shape: the list entry fields
+// without the pagination cursor (the live spec's branch object is closed
+// over exactly name/head_sha/created_at).
+type branchInfo struct {
+	Name      string `json:"name"`
+	HeadSHA   string `json:"head_sha"`
+	CreatedAt string `json:"created_at"`
+}
+
+type getBranchResponse struct {
+	Branch branchInfo `json:"branch"`
+}
+
+// handleGetBranch implements GET /api/v1/repos/branch: one branch by its
+// exact short name (upstream get_branch). `ephemeral=true` looks in the
+// ephemeral namespace instead; an unknown name is a 404.
+func (s *server) handleGetBranch(w http.ResponseWriter, r *http.Request) {
+	repo, ok := s.resolveReadRepo(w, r)
+	if !ok {
+		return
+	}
+	q := r.URL.Query()
+	name := q.Get("name")
+	if name == "" {
+		writeErr(w, http.StatusBadRequest, "name is required")
+		return
+	}
+	ephemeral, err := coreBoolParam(q, "ephemeral")
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	refName := "refs/heads/" + name
+	if ephemeral {
+		refName = auth.EphemeralNamespacePrefix + refName
+	}
+	// ListRefsWithMeta rather than GetRef: the response needs created_at,
+	// which only the metadata listing carries (same source as the list
+	// endpoint, so both stay consistent by construction).
+	refs, err := s.refStore.ListRefsWithMeta(r.Context(), repo.RepoID)
+	if err != nil {
+		s.internalErr(w, r, "list refs", err)
+		return
+	}
+	for _, ri := range refs {
+		if ri.Name != refName {
+			continue
+		}
+		writeJSON(w, http.StatusOK, getBranchResponse{Branch: branchInfo{
+			Name:      name,
+			HeadSHA:   ri.SHA,
+			CreatedAt: ri.CreatedAt.UTC().Format(time.RFC3339),
+		}})
+		return
+	}
+	writeErr(w, http.StatusNotFound, "branch not found")
+}
+
+// ---------------------------------------------------------------------------
 // 2a: GET /repos/tags
 
 type tagEntry struct {
@@ -321,6 +382,51 @@ func (s *server) handleListTags(w http.ResponseWriter, r *http.Request) {
 		next = entries[len(entries)-1].Cursor
 	}
 	writeJSON(w, http.StatusOK, listTagsResponse{Tags: entries, NextCursor: next, HasMore: hasMore})
+}
+
+// ---------------------------------------------------------------------------
+// GET /repos/tag (single-item lookup)
+
+// tagInfo is the upstream get_tag wire shape: name plus the dereferenced
+// commit sha, without the list pagination cursor.
+type tagInfo struct {
+	Name string `json:"name"`
+	SHA  string `json:"sha"`
+}
+
+type getTagResponse struct {
+	Tag tagInfo `json:"tag"`
+}
+
+// handleGetTag implements GET /api/v1/repos/tag: one tag by its exact short
+// name (upstream get_tag). `sha` is the peeled commit for annotated tags
+// (invariant 10, same as the list endpoint); an unknown name is a 404.
+func (s *server) handleGetTag(w http.ResponseWriter, r *http.Request) {
+	repo, ok := s.resolveReadRepo(w, r)
+	if !ok {
+		return
+	}
+	name := r.URL.Query().Get("name")
+	if name == "" {
+		writeErr(w, http.StatusBadRequest, "name is required")
+		return
+	}
+	repoPath, ok := s.materializeReadRepo(w, r, repo.RepoID)
+	if !ok {
+		return
+	}
+	tags, err := gitread.PeeledTags(r.Context(), repoPath)
+	if err != nil {
+		s.internalErr(w, r, "list tags", err)
+		return
+	}
+	for _, t := range tags {
+		if t.Name == name {
+			writeJSON(w, http.StatusOK, getTagResponse{Tag: tagInfo{Name: t.Name, SHA: t.SHA}})
+			return
+		}
+	}
+	writeErr(w, http.StatusNotFound, "tag not found")
 }
 
 // ---------------------------------------------------------------------------
