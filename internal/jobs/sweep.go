@@ -293,9 +293,17 @@ func (s *Sweeper) safeDelete(ctx context.Context, repo, key string) (bool, error
 	// one it misses is healed from quarantine next sweep.
 	packs, err := s.packs.ListPacks(ctx, repo)
 	if err != nil {
-		// Deleted but unverified: the quarantine backup stays; the next
-		// sweep's heal pass restores it if it turns out registered.
-		return false, fmt.Errorf("sweep: post-delete recheck %s: %w", key, err)
+		// Deleted but unverifiable: a registration that landed before the
+		// delete (its EnsurePublished saw the key present) would be
+		// stranded until a heal. Restore from quarantine before returning,
+		// exactly like the ambiguous-delete path — a no-op if the key was
+		// truly orphaned, a repair if it was registered.
+		recheckErr := fmt.Errorf("sweep: post-delete recheck %s: %w", key, err)
+		if rerr := s.blobs.Copy(ctx, key, quarantinePrefix+key); rerr != nil {
+			return false, errors.Join(recheckErr,
+				fmt.Errorf("sweep: restore after failed recheck %s: %w", key, rerr))
+		}
+		return false, recheckErr
 	}
 	for _, p := range packs {
 		if p.Key != key {

@@ -531,6 +531,42 @@ func TestSweep_AmbiguousDeleteRestoresFromQuarantine(t *testing.T) {
 	}
 }
 
+// failRecheck serves the classification and revalidation ListPacks reads,
+// then fails the post-delete recheck (call 3) with a transient error.
+type failRecheck struct {
+	calls int
+}
+
+func (p *failRecheck) ListPacks(context.Context, string) ([]ref.Pack, error) {
+	p.calls++
+	if p.calls == 3 {
+		return nil, errors.New("simulated transient registry failure")
+	}
+	return nil, nil
+}
+
+// A failed post-delete recheck must restore the key from quarantine before
+// surfacing the error — a registration that landed just before the delete
+// must never be exposed as missing (Codex round 8).
+func TestSweep_FailedRecheckRestoresFromQuarantine(t *testing.T) {
+	f := newSweepFixture(t)
+	key := blob.PackKey("r1", "recheck")
+	f.upload(key, "recheck-bytes")
+	f.backdate(key, 25*time.Hour)
+
+	s := NewSweeper(f.blobs, &failRecheck{}, SweepConfig{Threshold: 24 * time.Hour, Delete: true}, slog.New(slog.DiscardHandler))
+	report, err := s.Sweep(context.Background())
+	if err == nil {
+		t.Fatal("Sweep must surface the recheck error")
+	}
+	if report.Deleted != 0 {
+		t.Fatalf("report = %+v, want no reap counted on failed recheck", report)
+	}
+	if !f.exists(key) {
+		t.Fatalf("key %q not restored after failed post-delete recheck", key)
+	}
+}
+
 // The local-mode ticker is the real wiring: an aged orphan disappears
 // without any explicit Sweep call once the ticker is started.
 func TestStartSweepTicker_ReapsOrphan(t *testing.T) {
