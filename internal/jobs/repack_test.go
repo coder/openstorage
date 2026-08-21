@@ -372,9 +372,14 @@ func TestRepack_AmbiguousSwapKeepsBlob(t *testing.T) {
 	}
 
 	r := NewRepacker(ambiguousReplaceStore{f.store}, f.blobs, fixtureMaterialize(f.blobs, f.cacheDir), slog.New(slog.DiscardHandler))
-	_, err := r.Repack(ctx, f.repo)
+	folded, err := r.Repack(ctx, f.repo)
 	if !errors.Is(err, errAmbiguousReplace) {
 		t.Fatalf("repack error = %v, want the injected ambiguous drop", err)
+	}
+	// The swap may have committed (here it did): folded must report true so
+	// queue backends still run their follow-up threshold recheck.
+	if !folded {
+		t.Fatal("ambiguous swap error must report folded=true (possibly committed)")
 	}
 
 	// The swap really committed; the consolidated blob must NOT have been
@@ -1116,6 +1121,43 @@ func TestLocalQueue_RepackCoalescesPerRepo(t *testing.T) {
 	if err := q.EnqueueRepack(ctx, f.repo); err == nil {
 		t.Fatal("EnqueueRepack after Close must fail")
 	}
+
+	// Backlog draining (round-6): with a follow-up threshold set, a
+	// budgeted fold that leaves the repo at/above it must keep folding
+	// WITHOUT any concurrent trigger. Four fresh pushes under an object
+	// budget of two 3-object packs per fold: one enqueue drains the
+	// backlog 4 → 3 → 2 rows via successive budgeted folds, stopping at
+	// the budget's steady state (two 6-object folds exceed the budget
+	// together — the documented O(size/budget) convergence).
+	f2 := newRepackFixture(t)
+	for range 4 {
+		f2.push(t)
+	}
+	// ListPacks orders by created_at (1-second resolution in SQLite) with
+	// an id tiebreak: give the folds a strictly later timestamp than the
+	// push packs, or a fold whose hex id sorts first would be selected
+	// ahead of the remaining pushes and (over budget with either) block
+	// them from pairing.
+	time.Sleep(1100 * time.Millisecond)
+	r2 := f2.repacker(t.TempDir())
+	r2.MaxFoldObjects = 7 // two 3-object push packs per fold
+	r2.FollowUpThreshold = 2
+	q2 := NewLocal(deliverer, func(context.Context, sync.Job) error { return nil }, r2, slog.New(slog.DiscardHandler))
+	if err := q2.EnqueueRepack(ctx, f2.repo); err != nil {
+		t.Fatalf("enqueue backlog repack: %v", err)
+	}
+	deadline = time.Now().Add(30 * time.Second)
+	for len(f2.packRows(t)) > 2 {
+		if time.Now().After(deadline) {
+			t.Fatalf("backlog never drained to the budget steady state: %+v", f2.packRows(t))
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	q2.Close()
+	if rows := f2.packRows(t); len(rows) != 2 {
+		t.Fatalf("backlog steady state = %+v, want 2 budget-limited folds", rows)
+	}
+	f2.checkColdHydrate(t)
 
 	// A queue without a repacker must refuse rather than silently drop.
 	bare := NewLocal(deliverer, func(context.Context, sync.Job) error { return nil }, nil, slog.New(slog.DiscardHandler))

@@ -109,11 +109,16 @@ func (q *Local) EnqueueRepack(_ context.Context, repo string) error {
 	return nil
 }
 
-// runRepack executes fold attempts for repo until no follow-up is pending
-// (or the queue is closing — pending local work dies with the process, the
-// documented trade-off). A rerun requires the previous attempt to have
-// actually folded: rerunning after a lost race would be the eager retry the
-// design rejects, and rerunning after a no-op would loop pointlessly.
+// runRepack executes fold attempts for repo until neither a pending trigger
+// nor the follow-up threshold demands another one (or the queue is closing
+// — pending local work dies with the process, the documented trade-off).
+// Reruns require the previous attempt to have (possibly) folded: rerunning
+// after a clean lost race would be the eager retry the design rejects, and
+// rerunning after a budget no-op would loop pointlessly. The NeedsFollowUp
+// recheck mirrors the river worker: a budgeted fold of a large backlog
+// (e.g. rows accumulated while local queued work was lost to a restart)
+// must keep folding until the configured bound is restored, not stop after
+// one slice because no concurrent trigger happened to land.
 func (q *Local) runRepack(repo string) {
 	defer q.wg.Done()
 	for {
@@ -121,8 +126,9 @@ func (q *Local) runRepack(repo string) {
 		if err != nil {
 			q.logger.Warn("repack failed", "repo", repo, "err", err)
 		}
+		again := folded && (q.pendingRepack(repo) || q.repacker.NeedsFollowUp(context.Background(), repo))
 		q.mu.Lock()
-		if q.closed || !q.repackPending[repo] || !folded {
+		if q.closed || !again {
 			delete(q.repacking, repo)
 			delete(q.repackPending, repo)
 			q.mu.Unlock()
@@ -131,6 +137,13 @@ func (q *Local) runRepack(repo string) {
 		delete(q.repackPending, repo)
 		q.mu.Unlock()
 	}
+}
+
+// pendingRepack reports whether a trigger landed while repo's fold ran.
+func (q *Local) pendingRepack(repo string) bool {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.repackPending[repo]
 }
 
 // Close stops accepting work and waits for in-flight deliveries and syncs.

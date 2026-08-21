@@ -187,11 +187,15 @@ const (
 // verify leg gets zero time would leave the committed row unverified.
 const repackVerifyReserve = 30 * time.Second
 
-// Repack runs one fold attempt for repo, returning whether a fold was
-// installed. A no-op (fewer than two registered packs, or budgets selecting
-// fewer than two) and a cleanly lost race both return (false, nil); only
-// infrastructure failures propagate (the river job records them, and the
-// next trigger retries).
+// Repack runs one fold attempt for repo. folded reports whether a fold WAS
+// OR MAY HAVE BEEN installed — true on a won swap even when its post-swap
+// verification fails, and true on an ambiguous swap error (committed with
+// the response lost): queue backends key their follow-up threshold recheck
+// on folded, and packs registered after the fold's snapshot must not
+// strand when the swap actually landed. A no-op (fewer than two registered
+// packs, or budgets selecting fewer than two) and a cleanly LOST race both
+// return (false, nil) — a loss proves a concurrent fold won, and in every
+// deployment shape that winner runs the same follow-up recheck.
 func (r *Repacker) Repack(ctx context.Context, repo string) (folded bool, err error) {
 	assertf(repo != "", "Repack: empty repo")
 	// Runtime budget: the fold's deadline covers everything below —
@@ -214,7 +218,7 @@ func (r *Repacker) Repack(ctx context.Context, repo string) (folded bool, err er
 	// bounded listing, so a cold worker never materializes more than the
 	// budget admits — and an individually oversized pack is skipped
 	// without ever being downloaded.
-	candidates, err := r.selectByBytes(ctx, repo, old)
+	candidates, err := r.selectByBytes(ctx, old)
 	if err != nil {
 		return false, fmt.Errorf("repack %s: %w", repo, err)
 	}
@@ -295,9 +299,15 @@ func (r *Repacker) Repack(ctx context.Context, repo string) (folded bool, err er
 		// with the response lost), so the uploaded blob must NOT be
 		// deleted here — and, like every registration path, the possibly
 		// committed row must be verified against the sweeper race below:
-		// a committed row must never point at missing bytes.
+		// a committed row must never point at missing bytes. folded
+		// reports TRUE for the same reason: the swap may have landed, and
+		// queue backends key their follow-up threshold recheck on it — a
+		// false report after a committed swap would strand coalesced
+		// mid-fold triggers. A spurious recheck after a genuinely failed
+		// swap costs one ListPacks (and any follow-up fold it schedules
+		// retries work the next trigger would have retried anyway).
 		verr := verifyPublished(ctx, r.blobs, newPack.Key, packPath)
-		return false, errors.Join(fmt.Errorf("repack %s: replace packs: %w", repo, err), verr)
+		return true, errors.Join(fmt.Errorf("repack %s: replace packs: %w", repo, err), verr)
 	}
 	if !won {
 		// Cleanly lost fold: the uploaded blob is NEVER deleted here — it
@@ -389,45 +399,34 @@ func (r *Repacker) durationBudget() time.Duration {
 	return defaultMaxFoldDuration
 }
 
-// selectByBytesPageSize bounds one blob-listing page during fold-input
-// selection (matches the sweeper's paging discipline: memory must not
-// scale with a repo's blob count).
-const selectByBytesPageSize = 1000
-
 // selectByBytes picks fold candidates greedily, oldest-first (ListPacks
-// order), under the cumulative byte budget — from BLOB sizes read out of
-// one paged listing, before anything is downloaded. Skipped packs stay
-// registered untouched: any subset of whole packs folds into a
-// self-contained pack (only reachability trimming was unsafe), so bounding
-// per-fold work never risks correctness, and repeated folds converge
-// oversized repos to O(size/budget) consolidated rows. A snapshotted row
-// whose blob is absent from the listing is skipped too — either a
-// concurrent fold removed it (our swap would lose) or its upload-verify
-// repair is in flight (the next fold picks it up).
-func (r *Repacker) selectByBytes(ctx context.Context, repo string, packs []ref.Pack) ([]ref.Pack, error) {
+// order), under the cumulative byte budget — from per-key blob Stats,
+// before anything is downloaded. Point reads, never a prefix listing: the
+// packs/ prefix accumulates every superseded blob until the sweeper
+// collects them (list-only by default), so its population grows with the
+// repo's write history while the registered row set this selection needs
+// stays bounded by the fold threshold. Skipped packs stay registered
+// untouched: any subset of whole packs folds into a self-contained pack
+// (only reachability trimming was unsafe), so bounding per-fold work never
+// risks correctness, and repeated folds converge oversized repos to
+// O(size/budget) consolidated rows. A snapshotted row whose blob Stat
+// reports not-found is skipped too — either a concurrent fold removed it
+// (our swap would lose) or its upload-verify repair is in flight (the next
+// fold picks it up).
+func (r *Repacker) selectByBytes(ctx context.Context, packs []ref.Pack) ([]ref.Pack, error) {
 	budget := r.byteBudget()
-	want := make(map[string]bool, len(packs))
-	for _, p := range packs {
-		want[p.Key] = true
-	}
-	sizes := make(map[string]int64, len(packs))
-	err := r.blobs.ListPages(ctx, blob.PackPrefix(repo), selectByBytesPageSize, func(objs []blob.ListedObject) error {
-		for _, o := range objs {
-			if want[o.Key] {
-				sizes[o.Key] = o.Size
-			}
-		}
-		return nil
-	})
-	if err != nil {
-		return nil, fmt.Errorf("list pack blobs: %w", err)
-	}
 	var selected []ref.Pack
 	var total int64
 	for _, p := range packs {
-		size, ok := sizes[p.Key]
-		if !ok || total+size > budget {
-			continue // absent or over budget: leave this pack registered as-is
+		size, err := r.blobs.Stat(ctx, p.Key)
+		if errors.Is(err, blob.ErrNotFound) {
+			continue // folded away or repair in flight: not a candidate
+		}
+		if err != nil {
+			return nil, fmt.Errorf("stat pack blob %s: %w", p.Key, err)
+		}
+		if total+size > budget {
+			continue // over budget: leave this pack registered as-is
 		}
 		selected = append(selected, p)
 		total += size
