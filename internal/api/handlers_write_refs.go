@@ -3,8 +3,10 @@
 // /repos/tags, POST/DELETE /repos/notes — with default-branch delete
 // protection (docs/01 invariant 4, ephemeral exemption per invariant 7),
 // lightweight-tag peeling (invariant 10), notes add/append CAS via
-// expected_ref_sha (invariant 1), and ref-policy enforcement on every
-// write (invariant 5).
+// expected_notes_ref_sha (invariant 1), and ref-policy enforcement on
+// every write (invariant 5). Aliased request-body fields (issue #17)
+// accept both the current upstream spelling and the deprecated one, the
+// current name winning on conflict.
 //
 // Routes are registered by api.New via registerWriteRefRoutes; the tests in
 // write_refs_test.go build their own mux through the same helper.
@@ -79,6 +81,16 @@ func wrefDecodeBody(w http.ResponseWriter, r *http.Request, dst any) bool {
 		return false
 	}
 	return true
+}
+
+// wrefAliasField resolves a request-body alias pair: the current upstream
+// field wins when both are set (the live spec defines no precedence, so
+// this mirrors the coreAliasParam query convention from issue #15).
+func wrefAliasField(current, deprecated string) string {
+	if current != "" {
+		return current
+	}
+	return deprecated
 }
 
 // wrefRefName maps a bare branch name to its stored ref name: the plain
@@ -331,14 +343,16 @@ func (s *server) handleCreateBranch(w http.ResponseWriter, r *http.Request) {
 // DELETE /api/v1/repos/branches (git:write)
 
 type wrefDeleteBranchRequest struct {
-	Name      string `json:"name"`
-	Ephemeral bool   `json:"ephemeral"`
+	TargetBranch string `json:"target_branch"`
+	Name         string `json:"name"` // deprecated alias of target_branch
+	Ephemeral    bool   `json:"ephemeral"`
 }
 
 type wrefDeleteBranchResponse struct {
-	Name      string `json:"name"`
-	Ephemeral bool   `json:"ephemeral"`
-	Message   string `json:"message"`
+	TargetBranch string `json:"target_branch"`
+	Name         string `json:"name"` // deprecated: mirrors target_branch
+	Ephemeral    bool   `json:"ephemeral"`
+	Message      string `json:"message"`
 }
 
 // handleDeleteBranch CAS-deletes a branch ref. The repo's default branch is
@@ -353,16 +367,19 @@ func (s *server) handleDeleteBranch(w http.ResponseWriter, r *http.Request) {
 	if !wrefDecodeBody(w, r, &req) {
 		return
 	}
-	if !wrefValidBranchInput(req.Name) {
+	// openapi (issue #17): target_branch is the current field, name the
+	// deprecated alias.
+	name := wrefAliasField(req.TargetBranch, req.Name)
+	if !wrefValidBranchInput(name) {
 		writeErr(w, http.StatusBadRequest, "invalid branch name")
 		return
 	}
 	assertf(repo.DefaultBranch != "", "repo %s has empty default branch", repo.RepoID)
-	if !req.Ephemeral && req.Name == repo.DefaultBranch {
+	if !req.Ephemeral && name == repo.DefaultBranch {
 		writeErr(w, http.StatusForbidden, "refusing to delete the default branch")
 		return
 	}
-	refName := wrefRefName(req.Name, req.Ephemeral)
+	refName := wrefRefName(name, req.Ephemeral)
 	refs, ok := s.wrefListRefs(w, r, repo.RepoID)
 	if !ok {
 		return
@@ -391,9 +408,10 @@ func (s *server) handleDeleteBranch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, wrefDeleteBranchResponse{
-		Name:      req.Name,
-		Ephemeral: req.Ephemeral,
-		Message:   "branch deleted",
+		TargetBranch: name,
+		Name:         name,
+		Ephemeral:    req.Ephemeral,
+		Message:      "branch deleted",
 	})
 }
 
@@ -402,7 +420,8 @@ func (s *server) handleDeleteBranch(w http.ResponseWriter, r *http.Request) {
 
 type wrefCreateTagRequest struct {
 	Name   string `json:"name"`
-	Target string `json:"target"`
+	Ref    string `json:"ref"`
+	Target string `json:"target"` // deprecated alias of ref
 }
 
 type wrefCreateTagResponse struct {
@@ -428,18 +447,22 @@ func (s *server) handleCreateTag(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "invalid tag name")
 		return
 	}
-	if req.Target == "" {
-		writeErr(w, http.StatusBadRequest, "target is required")
+	// openapi (issue #17): ref is the current field, target the deprecated
+	// alias; both have always accepted any revision (branch, tag, or
+	// commit) — ResolveRef peels to a commit either way.
+	target := wrefAliasField(req.Ref, req.Target)
+	if target == "" {
+		writeErr(w, http.StatusBadRequest, "ref is required")
 		return
 	}
 	repoPath, ok := s.materializeReadRepo(w, r, repo.RepoID)
 	if !ok {
 		return
 	}
-	sha, err := gitread.ResolveRef(r.Context(), repoPath, req.Target, false)
+	sha, err := gitread.ResolveRef(r.Context(), repoPath, target, false)
 	switch {
 	case errors.Is(err, gitread.ErrNotFound):
-		writeErr(w, http.StatusNotFound, "target does not resolve to a commit")
+		writeErr(w, http.StatusNotFound, "ref does not resolve to a commit")
 		return
 	case err != nil:
 		s.internalErr(w, r, "resolve tag target", err)
@@ -535,12 +558,15 @@ type wrefNoteAuthor struct {
 }
 
 type wrefNoteRequest struct {
-	SHA            string          `json:"sha"`
-	Action         string          `json:"action"` // add|append; POST only, default add
-	Note           string          `json:"note"`
-	Ref            string          `json:"ref"`
-	ExpectedRefSHA string          `json:"expected_ref_sha"`
-	Author         *wrefNoteAuthor `json:"author"`
+	ObjectRef           string          `json:"object_ref"`
+	SHA                 string          `json:"sha"`    // deprecated alias of object_ref
+	Action              string          `json:"action"` // add|append; POST only, default add
+	Note                string          `json:"note"`
+	NotesRef            string          `json:"notes_ref"`
+	Ref                 string          `json:"ref"` // deprecated alias of notes_ref
+	ExpectedNotesRefSHA string          `json:"expected_notes_ref_sha"`
+	ExpectedRefSHA      string          `json:"expected_ref_sha"` // deprecated alias of expected_notes_ref_sha
+	Author              *wrefNoteAuthor `json:"author"`
 }
 
 type wrefNoteResult struct {
@@ -551,7 +577,8 @@ type wrefNoteResult struct {
 
 type wrefNoteResponse struct {
 	SHA        string         `json:"sha"`
-	TargetRef  string         `json:"target_ref"`
+	NotesRef   string         `json:"notes_ref"`
+	TargetRef  string         `json:"target_ref"` // deprecated: mirrors notes_ref
 	BaseCommit string         `json:"base_commit,omitempty"`
 	NewRefSHA  string         `json:"new_ref_sha"`
 	Result     wrefNoteResult `json:"result"`
@@ -565,6 +592,7 @@ func wrefNoteFail(w http.ResponseWriter, httpStatus int, msg, sha, targetRef, ba
 	assertf(msg != "", "wrefNoteFail: empty message")
 	writeJSON(w, httpStatus, wrefNoteResponse{
 		SHA:        sha,
+		NotesRef:   targetRef,
 		TargetRef:  targetRef,
 		BaseCommit: baseCommit,
 		NewRefSHA:  newRefSHA,
@@ -572,9 +600,10 @@ func wrefNoteFail(w http.ResponseWriter, httpStatus int, msg, sha, targetRef, ba
 	})
 }
 
-// wrefNotesRefName resolves the request `ref` field to a full notes ref:
-// empty picks the default refs/notes/commits, a bare name goes under
-// refs/notes/, and a fully qualified name must already live there (docs/03).
+// wrefNotesRefName resolves the request `notes_ref` field (deprecated
+// alias `ref`) to a full notes ref: empty picks the default
+// refs/notes/commits, a bare name goes under refs/notes/, and a fully
+// qualified name must already live there (docs/03).
 func wrefNotesRefName(raw string) (string, error) {
 	if raw == "" {
 		return "refs/notes/commits", nil
@@ -601,7 +630,7 @@ func (s *server) handleDeleteNote(w http.ResponseWriter, r *http.Request) {
 }
 
 // wrefHandleNote implements the shared POST/DELETE notes flow: validate,
-// CAS-guard on expected_ref_sha (412), run the notes operation on a request-
+// CAS-guard on expected_notes_ref_sha (412), run the notes operation on a request-
 // scoped temp ref with a scratch object directory, policy-check, publish the
 // new objects (pack → upload → register), and CAS the notes ref (409 on a
 // lost race). Domain failures answer with the note-write envelope.
@@ -614,13 +643,19 @@ func (s *server) wrefHandleNote(w http.ResponseWriter, r *http.Request, deleteNo
 	if !wrefDecodeBody(w, r, &req) {
 		return
 	}
-	targetRef, err := wrefNotesRefName(req.Ref)
+	// openapi (issue #17): object_ref/notes_ref/expected_notes_ref_sha are
+	// the current fields; sha/ref/expected_ref_sha stay as deprecated
+	// aliases, the current name winning on conflict.
+	objectSHA := wrefAliasField(req.ObjectRef, req.SHA)
+	notesRefRaw := wrefAliasField(req.NotesRef, req.Ref)
+	expectedRefSHA := wrefAliasField(req.ExpectedNotesRefSHA, req.ExpectedRefSHA)
+	targetRef, err := wrefNotesRefName(notesRefRaw)
 	if err != nil {
-		wrefNoteFail(w, http.StatusBadRequest, err.Error(), req.SHA, req.Ref, "", ref.ZeroSHA)
+		wrefNoteFail(w, http.StatusBadRequest, err.Error(), objectSHA, notesRefRaw, "", ref.ZeroSHA)
 		return
 	}
-	if !ref.ValidSHA(req.SHA) {
-		wrefNoteFail(w, http.StatusBadRequest, "sha must be a full 40-hex object id", req.SHA, targetRef, "", ref.ZeroSHA)
+	if !ref.ValidSHA(objectSHA) {
+		wrefNoteFail(w, http.StatusBadRequest, "object_ref must be a full 40-hex object id", objectSHA, targetRef, "", ref.ZeroSHA)
 		return
 	}
 	action := "remove"
@@ -631,22 +666,22 @@ func (s *server) wrefHandleNote(w http.ResponseWriter, r *http.Request, deleteNo
 			action = "add"
 		}
 		if action != "add" && action != "append" {
-			wrefNoteFail(w, http.StatusBadRequest, "action must be add or append", req.SHA, targetRef, "", ref.ZeroSHA)
+			wrefNoteFail(w, http.StatusBadRequest, "action must be add or append", objectSHA, targetRef, "", ref.ZeroSHA)
 			return
 		}
 		if req.Note == "" {
-			wrefNoteFail(w, http.StatusBadRequest, "note is required", req.SHA, targetRef, "", ref.ZeroSHA)
+			wrefNoteFail(w, http.StatusBadRequest, "note is required", objectSHA, targetRef, "", ref.ZeroSHA)
 			return
 		}
 	}
-	if req.ExpectedRefSHA != "" && !ref.ValidSHA(req.ExpectedRefSHA) {
-		wrefNoteFail(w, http.StatusBadRequest, "expected_ref_sha must be a full 40-hex object id", req.SHA, targetRef, "", ref.ZeroSHA)
+	if expectedRefSHA != "" && !ref.ValidSHA(expectedRefSHA) {
+		wrefNoteFail(w, http.StatusBadRequest, "expected_notes_ref_sha must be a full 40-hex object id", objectSHA, targetRef, "", ref.ZeroSHA)
 		return
 	}
 	author := wrefNoteAuthor{Name: "codestorage", Email: "notes@codestorage.invalid"}
 	if req.Author != nil {
 		if req.Author.Name == "" || req.Author.Email == "" {
-			wrefNoteFail(w, http.StatusBadRequest, "author name and email are required when author is provided", req.SHA, targetRef, "", ref.ZeroSHA)
+			wrefNoteFail(w, http.StatusBadRequest, "author name and email are required when author is provided", objectSHA, targetRef, "", ref.ZeroSHA)
 			return
 		}
 		author = *req.Author
@@ -666,43 +701,43 @@ func (s *server) wrefHandleNote(w http.ResponseWriter, r *http.Request, deleteNo
 		oldOrZero = ref.ZeroSHA
 	}
 
-	// Invariant 1: expected_ref_sha is the notes-ref CAS guard; the zero sha
-	// asserts the ref is unborn.
-	if req.ExpectedRefSHA != "" && req.ExpectedRefSHA != oldOrZero {
+	// Invariant 1: expected_notes_ref_sha is the notes-ref CAS guard; the
+	// zero sha asserts the ref is unborn.
+	if expectedRefSHA != "" && expectedRefSHA != oldOrZero {
 		wrefNoteFail(w, http.StatusPreconditionFailed,
-			fmt.Sprintf("expected_ref_sha %.8s does not match %s tip %.8s", req.ExpectedRefSHA, targetRef, oldOrZero),
-			req.SHA, targetRef, old, oldOrZero)
+			fmt.Sprintf("expected_notes_ref_sha %.8s does not match %s tip %.8s", expectedRefSHA, targetRef, oldOrZero),
+			objectSHA, targetRef, old, oldOrZero)
 		return
 	}
 
 	ctx := r.Context()
 	// The note target must exist (any object kind, per git notes).
 	if _, err := wrefGit(ctx, repoPath, nil, nil,
-		"rev-parse", "--verify", "--quiet", "--end-of-options", req.SHA+"^{object}"); err != nil {
-		wrefNoteFail(w, http.StatusNotFound, "object not found: "+req.SHA, req.SHA, targetRef, old, oldOrZero)
+		"rev-parse", "--verify", "--quiet", "--end-of-options", objectSHA+"^{object}"); err != nil {
+		wrefNoteFail(w, http.StatusNotFound, "object not found: "+objectSHA, objectSHA, targetRef, old, oldOrZero)
 		return
 	}
 	// Existence check drives add-vs-existing (409) and delete-missing (404).
 	// The cache repo's notes ref was just synced from the ref authority.
 	noteExists := false
 	if old != "" {
-		if _, err := wrefGit(ctx, repoPath, nil, nil, "notes", "--ref", targetRef, "show", req.SHA); err == nil {
+		if _, err := wrefGit(ctx, repoPath, nil, nil, "notes", "--ref", targetRef, "show", objectSHA); err == nil {
 			noteExists = true
 		}
 	}
 	if action == "add" && noteExists {
-		wrefNoteFail(w, http.StatusConflict, "note already exists for "+req.SHA, req.SHA, targetRef, old, oldOrZero)
+		wrefNoteFail(w, http.StatusConflict, "note already exists for "+objectSHA, objectSHA, targetRef, old, oldOrZero)
 		return
 	}
 	if deleteNote && !noteExists {
-		wrefNoteFail(w, http.StatusNotFound, "no note found for "+req.SHA, req.SHA, targetRef, old, oldOrZero)
+		wrefNoteFail(w, http.StatusNotFound, "no note found for "+objectSHA, objectSHA, targetRef, old, oldOrZero)
 		return
 	}
 
 	// The scratch env stays alive (via the deferred cleanup) through the
 	// ancestry check and publish below: the new notes objects are visible
 	// only through it until the published pack is hydrated back.
-	newSHA, scratchEnv, cleanup, err := s.wrefRunNotesOp(ctx, repoPath, old, action, req.SHA, req.Note, author)
+	newSHA, scratchEnv, cleanup, err := s.wrefRunNotesOp(ctx, repoPath, old, action, objectSHA, req.Note, author)
 	if cleanup != nil {
 		defer cleanup()
 	}
@@ -719,7 +754,7 @@ func (s *server) wrefHandleNote(w http.ResponseWriter, r *http.Request, deleteNo
 		return
 	}
 	if deny != "" {
-		wrefNoteFail(w, http.StatusForbidden, deny, req.SHA, targetRef, old, oldOrZero)
+		wrefNoteFail(w, http.StatusForbidden, deny, objectSHA, targetRef, old, oldOrZero)
 		return
 	}
 
@@ -735,11 +770,12 @@ func (s *server) wrefHandleNote(w http.ResponseWriter, r *http.Request, deleteNo
 	if !won {
 		// Lost CAS race: the published pack stays registered but
 		// unreferenced (immutable, same as the push-hook pipeline).
-		wrefNoteFail(w, http.StatusConflict, targetRef+" moved concurrently", req.SHA, targetRef, old, oldOrZero)
+		wrefNoteFail(w, http.StatusConflict, targetRef+" moved concurrently", objectSHA, targetRef, old, oldOrZero)
 		return
 	}
 	writeJSON(w, http.StatusOK, wrefNoteResponse{
-		SHA:        req.SHA,
+		SHA:        objectSHA,
+		NotesRef:   targetRef,
 		TargetRef:  targetRef,
 		BaseCommit: old,
 		NewRefSHA:  newSHA,

@@ -32,11 +32,11 @@ contract with implementation notes the spec lacks.
 
 | Method & path | Scope | Notes |
 |---|---|---|
-| `POST /repos` | repo:write (repo=new id) | Body optional: `{default_branch?, base_repo?}`. Query `default_branch` is a fallback used only when the body omits it. `base_repo`: `{provider, owner, name, operation?: "fork", auth?: {token}\|{auth_type:"public"}, ref?, sha?, default_branch?, upstream_host?}`. Providers: `code, github, gitlab, bitbucket, gitea, forgejo, codeberg, sr.ht` (+generic w/ `upstream_host`). 409 = exists. |
-| `GET /repos` | org:read (repo="org") | Query `cursor, limit, q` (case-insensitive substring on repo `url`). → `{repos: [{repo_id, url, default_branch, created_at, base_repo?}], next_cursor, has_more}` |
-| `GET /repo` | git:read (repo from JWT) | → `{repo_id, url, default_branch, created_at}`; 404 → SDK returns null |
+| `POST /repos` | repo:write (repo=new id) | Body optional: `{default_branch?, base_repo?}`. Query `default_branch` is a fallback used only when the body omits it. `base_repo`: `{provider, owner, name, operation?: "fork", auth?: {token}\|{auth_type:"public"}, ref?, sha?, default_branch?, upstream_host?}`. Providers: `code, github, gitlab, bitbucket, gitea, forgejo, codeberg, sr.ht` (+generic w/ `upstream_host`). → `{repo_id, repo_name, http_url, message}`. 409 = exists. |
+| `GET /repos` | org:read (repo="org") | Query `cursor, limit, q` (case-insensitive substring on repo `url`). → `{repos: [{repo_id, repo_name, url (deprecated mirror), default_branch, created_at, base_repo?}], next_cursor, has_more}` |
+| `GET /repo` | git:read (repo from JWT) | → `{repo_id, repo_name, url (deprecated mirror), default_branch, created_at}`; 404 → SDK returns null |
 | `DELETE /repos/delete` | repo:write | Soft delete + async cleanup. → `{repo_id, message}`; 404 not found; 409 already deleted |
-| `GET /api/repo-urls/{repo_id}` | org:read | (No /v1 prefix; from OpenAPI.) Resolve internal id → `{repo_id, url}`; `url` is the JWT `repo` claim value |
+| `GET /api/repo-urls/{repo_id}` | org:read | (No /v1 prefix; from OpenAPI.) Resolve internal id → `{repo_id, repo_name, url (deprecated mirror)}`; `repo_name` is the JWT `repo` claim value |
 | `DELETE /repos/base` | repo:write | Detach upstream provider; idempotent (from official docs/OpenAPI, not in SDKs) |
 
 ### Git credentials (generic HTTPS upstreams)
@@ -66,9 +66,9 @@ contract with implementation notes the spec lacks.
 | `GET /repos/branches` | git:read | `cursor, limit, ephemeral` → `{branches: [{cursor, name, head_sha, created_at}], next_cursor, has_more}` |
 | `GET /repos/branch` | git:read | `name` (req), `ephemeral?` → `{branch: {name, head_sha, created_at}}` — one branch by exact short name (no pagination fields); 404 when absent |
 | `POST /repos/branches/create` | git:write | `{target_branch, base_ref?\|base_branch?(deprecated), base_is_ephemeral?, target_is_ephemeral?}` → `{message, target_branch, target_is_ephemeral, commit_sha?}` |
-| `DELETE /repos/branches` | git:write | `{name, ephemeral?}` → `{name, message, ephemeral}`. Refuses default branch (persistent) |
+| `DELETE /repos/branches` | git:write | `{target_branch (deprecated alias name), ephemeral?}` → `{target_branch, name (deprecated mirror), message, ephemeral}`. Refuses default branch (persistent) |
 | `GET /repos/branches/diff` | git:read | `branch` (req), `base?`, `ephemeral?`, `ephemeral_base?`, `path` (repeatable) → `{branch, base, stats: {files, additions, deletions, changes}, files: [FileDiff], filtered_files}` |
-| `POST /repos/merge` | git:write | `{source_branch, target_branch, strategy: merge\|ff_only\|ff_prefer, source_is_ephemeral?, target_is_ephemeral?, expected_target_sha?, commit_message?, author?, committer?, allow_unrelated_histories?, squash?}` → `{result: merge_commit\|fast_forward\|no_op\|squash, commit_sha, tree_sha, source: {branch, ephemeral, sha}, target: {branch, ephemeral, old_sha, new_sha}, merge_base_sha?, promoted_commits}`. Conflict → 409 (+`conflict_paths`, `merge_base_sha`) |
+| `POST /repos/merge` | git:write | `{source_ref (bare branch name or refs/heads form; deprecated alias source_branch), target_branch, strategy: merge\|ff_only\|ff_prefer, source_is_ephemeral?, target_is_ephemeral?, expected_target_sha?, commit_message?, author?, committer?, allow_unrelated_histories?, squash?}` → `{result: merge_commit\|fast_forward\|no_op\|squash, commit_sha, tree_sha, source: {ref, branch (deprecated mirror), ephemeral, sha}, target: {branch, ephemeral, old_sha, new_sha}, merge_base_sha?, promoted_commits}`. Conflict → 409 (+`conflict_paths`, `merge_base_sha`) |
 | `GET /repos/merge/preview` | git:read | `source_branch, target_branch, source_is_ephemeral?, target_is_ephemeral?` (deprecated aliases `source_ephemeral`/`target_ephemeral`), `include_content?` → `{status: clean\|conflicted, result, source_branch, target_branch, source_tip_sha, target_tip_sha, merge_base_sha?, conflict_paths, conflicts: [{path, result\|base\|ours\|theirs: {oid?, content?, truncated, binary}}], filtered_conflicts: [{path, reason}]}`. Read-only |
 
 `FileDiff` = `{path, state (raw letter; SDKs normalize A/M/D/R/C/T/U), old_path?, raw
@@ -96,7 +96,7 @@ committer_email, date (RFC3339)}`.
 |---|---|---|
 | `GET /repos/tags` | git:read | `cursor, limit` → `{tags: [{cursor, name, sha}], next_cursor, has_more}` — lexical order; `sha` dereferenced to commit |
 | `GET /repos/tag` | git:read | `name` (req) → `{tag: {name, sha}}` — one tag by exact short name, `sha` dereferenced to commit; 404 when absent |
-| `POST /repos/tags` | git:write | `{name, target}` → `{name, sha, message}` — lightweight only; name must not start with `refs/` |
+| `POST /repos/tags` | git:write | `{name, ref (deprecated alias target)}` → `{name, sha, message}` — lightweight only; name must not start with `refs/` |
 | `DELETE /repos/tags` | git:read+git:write | `{name}` → `{name, message}` — resolves stored ref for lightweight & annotated |
 
 ### Notes
@@ -104,8 +104,8 @@ committer_email, date (RFC3339)}`.
 | Method & path | Scope | Body/query |
 |---|---|---|
 | `GET /repos/notes` | git:read | `object_ref` (req; deprecated alias `sha`), `notes_ref?` (deprecated alias `ref`) → `{sha, note, ref_sha}` |
-| `POST /repos/notes` | git:write | `{sha, action: "add"\|"append", note, ref?, expected_ref_sha?, author?}` → `{sha, target_ref, base_commit?, new_ref_sha, result: {success, status, message?}}`. `add` fails if note exists; `append` creates or appends |
-| `DELETE /repos/notes` | git:write | `{sha, ref?, expected_ref_sha?, author?}` → same envelope |
+| `POST /repos/notes` | git:write | `{object_ref (deprecated alias sha), action: "add"\|"append", note, notes_ref? (deprecated alias ref), expected_notes_ref_sha? (deprecated alias expected_ref_sha), author?}` → `{sha, notes_ref, target_ref (deprecated mirror), base_commit?, new_ref_sha, result: {success, status, message?}}`. `add` fails if note exists; `append` creates or appends |
+| `DELETE /repos/notes` | git:write | `{object_ref (deprecated alias sha), notes_ref?, expected_notes_ref_sha?, author?}` → same envelope |
 | `GET /repos/notes/refs` | git:read | `prefix?` (default `refs/notes/`), `cursor, limit` → `{refs: [{cursor, ref, sha}], prefix, next_cursor, has_more}`. 400 if custom notes refs disabled server-side |
 
 Default notes ref `refs/notes/commits`; bare names resolve to `refs/notes/<name>`.

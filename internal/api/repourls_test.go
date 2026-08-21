@@ -1,9 +1,10 @@
 package api
 
 // Integration tests for GET /api/repo-urls/{repo_id} (docs/03, openapi
-// get_repo_url_by_id; note: no /v1 prefix): 200 {"repo_id","url"} shape,
-// 404 for unknown / cross-org / soft-deleted IDs, org-level auth (403 for
-// repo-scoped tokens and missing org:read scope), 401 without a token.
+// get_repo_url_by_id; note: no /v1 prefix): 200 {"repo_id","repo_name",
+// "url"} shape, 404 for unknown / cross-org / soft-deleted IDs, org-level
+// auth (403 for repo-scoped tokens and missing org:read scope), 401
+// without a token.
 
 import (
 	"context"
@@ -27,7 +28,8 @@ func TestRepoURLByID(t *testing.T) {
 		orgTok := e.mint(t, tokenSpec{iss: org, repo: auth.RepoClaimOrg, scopes: []string{auth.ScopeOrgRead}})
 		path := "/api/repo-urls/" + url.PathEscape(repo.RepoID)
 
-		// 200: exactly {"repo_id","url"} (openapi: additionalProperties false).
+		// 200: exactly {"repo_id","repo_name","url"} (openapi:
+		// additionalProperties false; url is the deprecated mirror).
 		resp, body := e.doReq(t, http.MethodGet, path, orgTok, nil, "")
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("GET %s = %d (%s), want 200", path, resp.StatusCode, body)
@@ -39,8 +41,8 @@ func TestRepoURLByID(t *testing.T) {
 		if err := json.Unmarshal(body, &got); err != nil {
 			t.Fatalf("unmarshal %q: %v", body, err)
 		}
-		if len(got) != 2 || got["repo_id"] != repo.RepoID || got["url"] != repoURL {
-			t.Fatalf("body = %q, want exactly {repo_id: %q, url: %q}", body, repo.RepoID, repoURL)
+		if len(got) != 3 || got["repo_id"] != repo.RepoID || got["repo_name"] != repoURL || got["url"] != repoURL {
+			t.Fatalf("body = %q, want exactly {repo_id: %q, repo_name: %q, url: %q}", body, repo.RepoID, repoURL, repoURL)
 		}
 
 		// 404: unknown id.

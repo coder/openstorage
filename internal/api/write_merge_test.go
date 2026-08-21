@@ -150,6 +150,7 @@ var wmTargets = []string{
 	"t-clean", "t-ffonly", "t-ffprefer-ff", "t-ffprefer-merge", "t-noff",
 	"t-squash", "t-eph-ff", "t-eph-merge", "t-unrel",
 	"t-pol-nopush", "t-pol-nff", "t-pol-vs-ff", "t-pol-vs-merge",
+	"t-alias-ref", "t-alias-refsheads", "t-alias-both",
 }
 
 // wmFixture is one seeded repo for the merge tests.
@@ -818,6 +819,92 @@ func TestMergeValidationAndAuth(t *testing.T) {
 				wmMergeBody("feature", "main", "merge", nil))
 			if resp.StatusCode != http.StatusNotFound {
 				t.Fatalf("unknown repo: status = %d, body %s", resp.StatusCode, raw)
+			}
+		})
+	})
+}
+
+// TestMergeSourceRefAlias covers issue #17: source_ref is the current
+// upstream merge-source field — accepting a bare branch name or its fully
+// qualified refs/heads form — with source_branch kept as the deprecated
+// bare-name alias, the current name winning on conflict. The 200 response
+// source object now carries ref alongside the deprecated branch mirror.
+func TestMergeSourceRefAlias(t *testing.T) {
+	runBackends(t, func(t *testing.T, e *testEnv) {
+		srv := wmServer(t, e)
+		fx := wmSeedFixture(t, e)
+
+		merge := func(t *testing.T, body map[string]any) (*http.Response, map[string]any) {
+			t.Helper()
+			resp, raw := wmDo(t, srv, "POST", "/api/v1/repos/merge", fx.token, body)
+			return resp, wmDecode(t, raw)
+		}
+
+		t.Run("source_ref-only fast-forwards", func(t *testing.T) {
+			resp, body := merge(t, map[string]any{
+				"source_ref": "ffsrc", "target_branch": "t-alias-ref", "strategy": "ff_only",
+			})
+			if resp.StatusCode != http.StatusOK || body["result"] != "fast_forward" || body["commit_sha"] != fx.ffTip {
+				t.Fatalf("status %d body %v", resp.StatusCode, body)
+			}
+			source := body["source"].(map[string]any)
+			if source["ref"] != "ffsrc" || source["branch"] != "ffsrc" || source["sha"] != fx.ffTip {
+				t.Fatalf("source = %v, want ref and branch both ffsrc", source)
+			}
+		})
+
+		t.Run("refs/heads form resolves to the bare branch", func(t *testing.T) {
+			resp, body := merge(t, map[string]any{
+				"source_ref": "refs/heads/ffsrc", "target_branch": "t-alias-refsheads", "strategy": "ff_only",
+			})
+			if resp.StatusCode != http.StatusOK || body["commit_sha"] != fx.ffTip {
+				t.Fatalf("status %d body %v", resp.StatusCode, body)
+			}
+			source := body["source"].(map[string]any)
+			if source["ref"] != "ffsrc" || source["branch"] != "ffsrc" {
+				t.Fatalf("source = %v, want the bare name echoed", source)
+			}
+		})
+
+		t.Run("current name wins over the deprecated alias", func(t *testing.T) {
+			// A losing source_ref must not fall back to source_branch.
+			resp, body := merge(t, map[string]any{
+				"source_ref": "no-such-branch", "source_branch": "ffsrc",
+				"target_branch": "t-alias-both", "strategy": "ff_only",
+			})
+			if resp.StatusCode != http.StatusNotFound {
+				t.Fatalf("status %d body %v, want 404 (source_ref wins)", resp.StatusCode, body)
+			}
+			if got := wmRefsSnapshot(t, e, fx.repoID)["refs/heads/t-alias-both"]; got != fx.c2 {
+				t.Fatalf("t-alias-both moved to %q on refused merge", got)
+			}
+			resp, body = merge(t, map[string]any{
+				"source_ref": "ffsrc", "source_branch": "no-such-branch",
+				"target_branch": "t-alias-both", "strategy": "ff_only",
+			})
+			if resp.StatusCode != http.StatusOK || body["commit_sha"] != fx.ffTip {
+				t.Fatalf("status %d body %v, want source_ref to win", resp.StatusCode, body)
+			}
+		})
+
+		t.Run("legacy-only body still works with enriched response", func(t *testing.T) {
+			// Repeatable no_op merge: t-noop already contains main.
+			resp, body := merge(t, wmMergeBody("main", "t-noop", "merge", nil))
+			if resp.StatusCode != http.StatusOK || body["result"] != "no_op" {
+				t.Fatalf("status %d body %v", resp.StatusCode, body)
+			}
+			source := body["source"].(map[string]any)
+			if source["ref"] != "main" || source["branch"] != "main" {
+				t.Fatalf("source = %v, want ref mirroring branch", source)
+			}
+		})
+
+		t.Run("non-refs/heads source_ref is 400", func(t *testing.T) {
+			resp, body := merge(t, map[string]any{
+				"source_ref": "refs/tags/v1", "target_branch": "t-alias-both", "strategy": "merge",
+			})
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Fatalf("status %d body %v, want 400", resp.StatusCode, body)
 			}
 		})
 	})

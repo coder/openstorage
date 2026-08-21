@@ -264,6 +264,45 @@ func TestWriteRefsBranches(t *testing.T) {
 				t.Fatalf("second delete: status = %d, want 404", resp.StatusCode)
 			}
 		})
+
+		// Issue #17: target_branch is the current delete-branch field with
+		// the legacy name kept as a deprecated alias; the response mirrors
+		// the deleted name in both spellings.
+		t.Run("delete branch body aliases", func(t *testing.T) {
+			for _, b := range []string{"alias-a", "alias-b"} {
+				resp, body := wrefDo(t, srv, "POST", "/api/v1/repos/branches/create", fx.token,
+					map[string]any{"target_branch": b, "base_branch": "main"})
+				if resp.StatusCode != http.StatusOK {
+					t.Fatalf("seed %s: status %d body %v", b, resp.StatusCode, body)
+				}
+			}
+			// Current-name-only body.
+			resp, body := wrefDo(t, srv, "DELETE", "/api/v1/repos/branches", fx.token,
+				map[string]any{"target_branch": "alias-a"})
+			if resp.StatusCode != http.StatusOK || body["target_branch"] != "alias-a" || body["name"] != "alias-a" {
+				t.Fatalf("target_branch-only delete: status %d body %v", resp.StatusCode, body)
+			}
+			if _, exists := wrefRefs(t, e, fx.repoID)["refs/heads/alias-a"]; exists {
+				t.Fatal("refs/heads/alias-a still present after alias delete")
+			}
+			// Both set: the current name wins, so the live branch named by
+			// the deprecated alias must survive the 404.
+			resp, body = wrefDo(t, srv, "DELETE", "/api/v1/repos/branches", fx.token,
+				map[string]any{"target_branch": "no-such-branch", "name": "alias-b"})
+			if resp.StatusCode != http.StatusNotFound {
+				t.Fatalf("precedence delete: status %d body %v, want 404", resp.StatusCode, body)
+			}
+			if _, exists := wrefRefs(t, e, fx.repoID)["refs/heads/alias-b"]; !exists {
+				t.Fatal("deprecated-name branch deleted although target_branch must win")
+			}
+			// Legacy-only body still works and the response now carries
+			// target_branch.
+			resp, body = wrefDo(t, srv, "DELETE", "/api/v1/repos/branches", fx.token,
+				map[string]any{"name": "alias-b"})
+			if resp.StatusCode != http.StatusOK || body["target_branch"] != "alias-b" || body["name"] != "alias-b" {
+				t.Fatalf("legacy delete: status %d body %v", resp.StatusCode, body)
+			}
+		})
 	})
 }
 
@@ -473,6 +512,36 @@ func TestWriteRefsTags(t *testing.T) {
 				}
 			}
 		})
+
+		// Issue #17: ref is the current create-tag field with target kept
+		// as the deprecated alias, the current name winning on conflict.
+		t.Run("create tag body aliases", func(t *testing.T) {
+			// Current-name-only body.
+			resp, body := wrefDo(t, srv, "POST", "/api/v1/repos/tags", fx.token,
+				map[string]any{"name": "t17-ref", "ref": fx.c1})
+			if resp.StatusCode != http.StatusOK || body["sha"] != fx.c1 {
+				t.Fatalf("ref-only: status %d body %v", resp.StatusCode, body)
+			}
+			// ref keeps resolving branch names (openapi: branch, tag, or
+			// commit), peeled to the branch tip.
+			resp, body = wrefDo(t, srv, "POST", "/api/v1/repos/tags", fx.token,
+				map[string]any{"name": "t17-branch", "ref": "main"})
+			if resp.StatusCode != http.StatusOK || body["sha"] != fx.c2 {
+				t.Fatalf("branch ref: status %d body %v, want main tip %s", resp.StatusCode, body, fx.c2)
+			}
+			// Both set: ref (c1) wins over the deprecated target (c2).
+			resp, body = wrefDo(t, srv, "POST", "/api/v1/repos/tags", fx.token,
+				map[string]any{"name": "t17-both", "ref": fx.c1, "target": fx.c2})
+			if resp.StatusCode != http.StatusOK || body["sha"] != fx.c1 {
+				t.Fatalf("precedence: status %d body %v, want ref to win with %s", resp.StatusCode, body, fx.c1)
+			}
+			// Neither spelling → 400.
+			resp, body = wrefDo(t, srv, "POST", "/api/v1/repos/tags", fx.token,
+				map[string]any{"name": "t17-none"})
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Fatalf("missing ref: status %d body %v, want 400", resp.StatusCode, body)
+			}
+		})
 	})
 }
 
@@ -676,6 +745,75 @@ func TestWriteRefsNotes(t *testing.T) {
 			out, err := wrefGit(ctx, repoPath, nil, nil, "log", "-1", "--format=%an <%ae>", "refs/notes/authored")
 			if err != nil || strings.TrimSpace(out) != "Review Bot <review@example.com>" {
 				t.Fatalf("notes commit author = %q err %v", out, err)
+			}
+		})
+
+		// Issue #17: object_ref/notes_ref/expected_notes_ref_sha are the
+		// current fields, aliasing the deprecated sha/ref/expected_ref_sha
+		// (current name wins on conflict); responses now carry notes_ref
+		// alongside the deprecated target_ref mirror.
+		t.Run("notes body aliases", func(t *testing.T) {
+			// Current-name-only body.
+			resp, body := wrefDo(t, srv, "POST", "/api/v1/repos/notes", fx.token,
+				map[string]any{"object_ref": fx.c2, "note": "alias add", "notes_ref": "alias-notes"})
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("current-name add: status %d body %v", resp.StatusCode, body)
+			}
+			if body["notes_ref"] != "refs/notes/alias-notes" || body["target_ref"] != "refs/notes/alias-notes" {
+				t.Fatalf("response refs = %v/%v, want both refs/notes/alias-notes", body["notes_ref"], body["target_ref"])
+			}
+			if body["sha"] != fx.c2 {
+				t.Fatalf("sha = %v, want %s", body["sha"], fx.c2)
+			}
+			out, err := showNote(t, "refs/notes/alias-notes", fx.c2)
+			if err != nil || !strings.Contains(out, "alias add") {
+				t.Fatalf("note show = %q err %v", out, err)
+			}
+
+			// expected_notes_ref_sha guards, winning over a stale value in
+			// the deprecated expected_ref_sha spelling.
+			tip := wrefRefs(t, e, fx.repoID)["refs/notes/alias-notes"]
+			if tip == "" {
+				t.Fatal("missing alias-notes ref")
+			}
+			resp, body = wrefDo(t, srv, "POST", "/api/v1/repos/notes", fx.token,
+				map[string]any{"object_ref": fx.c2, "action": "append", "note": "guarded",
+					"notes_ref": "alias-notes", "expected_notes_ref_sha": tip, "expected_ref_sha": fx.c1})
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("guarded append: status %d body %v, want expected_notes_ref_sha to win", resp.StatusCode, body)
+			}
+
+			// DELETE precedence: current names (c2 note on alias-notes)
+			// must win over deprecated values naming a noteless object on
+			// another live ref.
+			commitsTip := wrefRefs(t, e, fx.repoID)["refs/notes/commits"]
+			resp, body = wrefDo(t, srv, "DELETE", "/api/v1/repos/notes", fx.token,
+				map[string]any{"object_ref": fx.c2, "sha": fx.c1, "notes_ref": "alias-notes", "ref": "commits"})
+			if resp.StatusCode != http.StatusOK || body["notes_ref"] != "refs/notes/alias-notes" || body["sha"] != fx.c2 {
+				t.Fatalf("precedence delete: status %d body %v", resp.StatusCode, body)
+			}
+			if out, err := showNote(t, "refs/notes/alias-notes", fx.c2); err == nil {
+				t.Fatalf("alias-notes note still present after delete: %q", out)
+			}
+			if got := wrefRefs(t, e, fx.repoID)["refs/notes/commits"]; got != commitsTip {
+				t.Fatalf("refs/notes/commits moved to %q although notes_ref must win", got)
+			}
+
+			// Legacy-only body still works; its response carries notes_ref.
+			resp, body = wrefDo(t, srv, "POST", "/api/v1/repos/notes", fx.token,
+				map[string]any{"sha": fx.c1, "note": "legacy body", "ref": "alias-notes"})
+			if resp.StatusCode != http.StatusOK || body["notes_ref"] != "refs/notes/alias-notes" || body["sha"] != fx.c1 {
+				t.Fatalf("legacy add: status %d body %v", resp.StatusCode, body)
+			}
+
+			// Neither object spelling → 400 (result envelope).
+			resp, body = wrefDo(t, srv, "POST", "/api/v1/repos/notes", fx.token,
+				map[string]any{"note": "x", "notes_ref": "alias-notes"})
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Fatalf("missing object_ref: status %d body %v, want 400", resp.StatusCode, body)
+			}
+			if result := wrefNoteResultOf(t, body); result["status"] != "invalid" {
+				t.Fatalf("result = %v", result)
 			}
 		})
 	})

@@ -100,9 +100,10 @@ type createRepoRequest struct {
 }
 
 type createRepoResponse struct {
-	RepoID  string `json:"repo_id"`
-	HTTPURL string `json:"http_url"`
-	Message string `json:"message"`
+	RepoID   string `json:"repo_id"`
+	RepoName string `json:"repo_name"`
+	HTTPURL  string `json:"http_url"`
+	Message  string `json:"message"`
 }
 
 // handleCreateRepo implements POST /api/v1/repos (scope repo:write). The new
@@ -170,17 +171,19 @@ func (s *server) handleCreateRepo(w http.ResponseWriter, r *http.Request) {
 	}
 	assertf(repo.RepoID != "", "store returned repo with empty RepoID")
 	writeJSON(w, http.StatusOK, createRepoResponse{
-		RepoID:  repo.RepoID,
-		HTTPURL: s.httpBaseURL + "/" + repo.RepoID + ".git",
-		Message: "repository created",
+		RepoID:   repo.RepoID,
+		RepoName: repo.URL,
+		HTTPURL:  s.httpBaseURL + "/" + repo.RepoID + ".git",
+		Message:  "repository created",
 	})
 }
 
 // handleGetRepo implements GET /api/v1/repo (scope git:read). The target
 // repo is the JWT `repo` claim; 404 when absent or soft-deleted. The
-// response schema (openapi.yaml) requires repo_id, url, default_branch,
-// created_at — repoEntry carries exactly those, plus base_repo when the
-// repo has an upstream link (docs/03, docs/14 deferred #2).
+// response schema (openapi.yaml) requires repo_id, repo_name, url
+// (deprecated mirror of repo_name), default_branch, created_at —
+// repoEntry carries exactly those, plus base_repo when the repo has an
+// upstream link (docs/03, docs/14 deferred #2).
 func (s *server) handleGetRepo(w http.ResponseWriter, r *http.Request) {
 	claims := mustClaims(r)
 	repo, err := s.store.GetRepoByURL(r.Context(), claims.Iss, claims.Repo)
@@ -199,6 +202,7 @@ func (s *server) handleGetRepo(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, repoEntry{
 		RepoID:        repo.RepoID,
+		RepoName:      repo.URL,
 		URL:           repo.URL,
 		DefaultBranch: repo.DefaultBranch,
 		CreatedAt:     repo.CreatedAt.UTC().Format(time.RFC3339),
@@ -232,7 +236,8 @@ func (s *server) baseRepoOf(ctx context.Context, repoID string) (*baseRepoEntry,
 
 type repoEntry struct {
 	RepoID        string         `json:"repo_id"`
-	URL           string         `json:"url"`
+	RepoName      string         `json:"repo_name"`
+	URL           string         `json:"url"` // deprecated: mirrors repo_name
 	DefaultBranch string         `json:"default_branch"`
 	CreatedAt     string         `json:"created_at"`
 	BaseRepo      *baseRepoEntry `json:"base_repo,omitempty"`
@@ -294,6 +299,7 @@ func (s *server) handleListRepos(w http.ResponseWriter, r *http.Request) {
 		}
 		entries = append(entries, repoEntry{
 			RepoID:        repo.RepoID,
+			RepoName:      repo.URL,
 			URL:           repo.URL,
 			DefaultBranch: repo.DefaultBranch,
 			CreatedAt:     repo.CreatedAt.UTC().Format(time.RFC3339),
