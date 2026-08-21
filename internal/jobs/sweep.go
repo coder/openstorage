@@ -22,6 +22,8 @@ package jobs
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -239,10 +241,44 @@ func (s *Sweeper) classify(ctx context.Context, repo string, obj blob.ListedObje
 }
 
 // quarantinePrefix roots the sweeper's pre-delete backups: safeDelete
-// copies packs/<repo>/pack-<id>.pack to sweep/quarantine/packs/... before
+// copies packs/<repo>/pack-<id>.pack to a unique key under it before
 // deleting, and healQuarantine restores or purges the copies. Deliberately
 // outside blob.PacksRoot so quarantined bytes never re-enter classification.
 const quarantinePrefix = "sweep/quarantine/"
+
+// quarantineKey mints the WRITE-ONCE backup key for one safeDelete
+// handshake: sweep/quarantine/<nonce>/packs/<repo>/pack-<id>.pack. The
+// random nonce is the coordination between overlapping delete-mode sweeps
+// (Codex round 14): no handshake can ever overwrite another's backup, so an
+// aged entry is proof its handshake is dead and purging it can never
+// destroy a live handshake's restore source. (The pre-nonce layout wrote
+// all handshakes of one pack to the same shared key, where purging by any
+// age read — however fresh — raced a concurrent overwrite.)
+func quarantineKey(key string) string {
+	var nonce [8]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		panic(fmt.Sprintf("sweep: read nonce entropy: %v", err)) // crypto/rand never fails on supported platforms
+	}
+	return quarantinePrefix + hex.EncodeToString(nonce[:]) + "/" + key
+}
+
+// parseQuarantineKey recovers the original pack key from a quarantine
+// backup key, accepting both the nonce layout and the legacy shared-key
+// layout (sweep/quarantine/packs/..., written by pre-nonce sweepers).
+func parseQuarantineKey(qkey string) (orig string, ok bool) {
+	rest, found := strings.CutPrefix(qkey, quarantinePrefix)
+	if !found {
+		return "", false
+	}
+	if strings.HasPrefix(rest, blob.PacksRoot) {
+		return rest, true // legacy shared-key layout
+	}
+	_, orig, found = strings.Cut(rest, "/")
+	if !found {
+		return "", false
+	}
+	return orig, true
+}
 
 // splitPackKey validates that key has the exact shape blob.PackKey
 // produces — packs/<repo>/pack-<id>.pack with a non-empty id and no deeper
@@ -276,7 +312,8 @@ func splitPackKey(key string) (repo string, ok bool) {
 // then it covers a sweeper crash anywhere in this sequence. Returns whether
 // the candidate ended up reaped.
 func (s *Sweeper) safeDelete(ctx context.Context, repo, key string) (bool, error) {
-	if err := s.blobs.Copy(ctx, quarantinePrefix+key, key); err != nil {
+	qKey := quarantineKey(key)
+	if err := s.blobs.Copy(ctx, qKey, key); err != nil {
 		if errors.Is(err, blob.ErrNotFound) {
 			return false, nil // gone already: nothing to delete
 		}
@@ -292,7 +329,7 @@ func (s *Sweeper) safeDelete(ctx context.Context, repo, key string) (bool, error
 		// even the restore fails, the retained backup plus the heal pass
 		// remain the backstop.
 		deleteErr := fmt.Errorf("sweep: delete %s: %w", key, err)
-		if rerr := s.blobs.Copy(ctx, key, quarantinePrefix+key); rerr != nil {
+		if rerr := s.blobs.Copy(ctx, key, qKey); rerr != nil {
 			return false, errors.Join(deleteErr,
 				fmt.Errorf("sweep: restore after ambiguous delete %s: %w", key, rerr))
 		}
@@ -310,20 +347,19 @@ func (s *Sweeper) safeDelete(ctx context.Context, repo, key string) (bool, error
 		// exactly like the ambiguous-delete path — a no-op if the key was
 		// truly orphaned, a repair if it was registered.
 		recheckErr := fmt.Errorf("sweep: post-delete recheck %s: %w", key, err)
-		if rerr := s.blobs.Copy(ctx, key, quarantinePrefix+key); rerr != nil {
+		if rerr := s.blobs.Copy(ctx, key, qKey); rerr != nil {
 			return false, errors.Join(recheckErr,
 				fmt.Errorf("sweep: restore after failed recheck %s: %w", key, rerr))
 		}
 		return false, recheckErr
 	}
 	if registered {
-		if err := s.blobs.Copy(ctx, key, quarantinePrefix+key); err != nil {
+		if err := s.blobs.Copy(ctx, key, qKey); err != nil {
 			return false, fmt.Errorf("sweep: restore %s registered mid-delete: %w", key, err)
 		}
-		// The backup is deliberately retained: quarantine entries are
-		// purged only by the aged path in healQuarantineEntry, because a
-		// fresh entry may be the restore source of ANOTHER replica's
-		// in-flight handshake on the same content-addressed key.
+		// The backup is deliberately retained until the aged purge in
+		// healQuarantineEntry collects it; until then it covers a sweeper
+		// crash anywhere after this handshake.
 		s.logger.Warn("orphan pack sweep: restored pack registered mid-delete", "key", key)
 		return false, nil
 	}
@@ -332,8 +368,8 @@ func (s *Sweeper) safeDelete(ctx context.Context, repo, key string) (bool, error
 
 // healQuarantine finishes interrupted or lost-race safeDelete handshakes
 // from quarantine backups: a backup whose original key is registered gets
-// restored when the original is missing (identical bytes) and its backup
-// purged. The restorative pass runs in every sweep mode — a list-only
+// restored when the original is missing (identical bytes). The restorative
+// pass runs in every sweep mode — a list-only
 // rollback must still repair a delete-enabled crash — while destructive
 // purging is gated on the caller's purge flag (the sweep passes its Delete
 // config; the standalone Heal forces it off): an unregistered backup is
@@ -364,8 +400,11 @@ func (s *Sweeper) healQuarantine(ctx context.Context, report *SweepReport, purge
 // healQuarantineEntry disposes of one quarantine backup per the
 // healQuarantine contract.
 func (s *Sweeper) healQuarantineEntry(ctx context.Context, q blob.ListedObject, report *SweepReport, purge bool) error {
-	orig := strings.TrimPrefix(q.Key, quarantinePrefix)
-	repo, ok := splitPackKey(orig)
+	orig, ok := parseQuarantineKey(q.Key)
+	var repo string
+	if ok {
+		repo, ok = splitPackKey(orig)
+	}
 	if !ok {
 		s.logger.Warn("orphan pack sweep: skipping foreign quarantine key", "key", q.Key)
 		return nil
@@ -376,7 +415,19 @@ func (s *Sweeper) healQuarantineEntry(ctx context.Context, q blob.ListedObject, 
 	}
 	if registered {
 		if _, err := s.blobs.Stat(ctx, orig); errors.Is(err, blob.ErrNotFound) {
-			if err := s.blobs.Copy(ctx, orig, q.Key); err != nil {
+			switch err := s.blobs.Copy(ctx, orig, q.Key); {
+			case errors.Is(err, blob.ErrNotFound):
+				// The entry vanished between listing and restore: a
+				// concurrent replica healed this same entry and purged it —
+				// its restore strictly precedes its purge, so the original
+				// must exist now. Verify rather than assume.
+				if _, serr := s.blobs.Stat(ctx, orig); serr != nil {
+					return errors.Join(
+						fmt.Errorf("sweep: heal %s: restore source vanished: %w", orig, err),
+						fmt.Errorf("sweep: heal %s: re-stat: %w", orig, serr))
+				}
+				return nil // healed by a peer; the peer also owns the purge
+			case err != nil:
 				return fmt.Errorf("sweep: heal %s: restore: %w", orig, err)
 			}
 			s.logger.Warn("orphan pack sweep: healed registered pack from quarantine", "key", orig)
@@ -384,21 +435,18 @@ func (s *Sweeper) healQuarantineEntry(ctx context.Context, q blob.ListedObject, 
 			return fmt.Errorf("sweep: heal %s: stat: %w", orig, err)
 		}
 	}
-	// Purge strictly by age, never as a restore side effect: a quarantine
-	// entry younger than the threshold may be the restore source of a
-	// concurrent replica's in-flight delete handshake on this same key
-	// (safeDelete re-creates the entry immediately before every delete),
-	// and purging it mid-handshake could strand a registered pack with no
-	// bytes anywhere. Entries older than the threshold cannot belong to a
-	// live handshake (handshakes run in seconds).
+	// Purge strictly by age: nonce-keyed entries are write-once (see
+	// quarantineKey), so an aged listing ModTime is immutable proof the
+	// entry's handshake is dead and no live handshake can be relying on it.
 	if !purge || q.ModTime.IsZero() || s.now().Sub(q.ModTime) < s.cfg.Threshold {
 		return nil
 	}
-	// The scan's ModTime is a snapshot: a concurrent replica's safeDelete
-	// may have overwritten this quarantine key with a fresh backup since
-	// the listing, and purging that fresh backup could strand the
-	// handshake's registered pack with no bytes anywhere. Re-read the
-	// entry's age immediately before the delete (Codex round 13).
+	// Legacy shared-key entries (pre-nonce layout) are NOT write-once: a
+	// pre-upgrade replica's in-flight safeDelete could still overwrite one.
+	// Re-read the age immediately before the delete as defense in depth —
+	// the delete-mode fleet gate (all nodes upgraded before enabling
+	// CODESTORAGE_SWEEP_DELETE_ENABLED) is the actual guarantee, exactly as
+	// for EnsurePublished.
 	mod, found, err := s.freshModTime(ctx, q.Key)
 	if err != nil {
 		return fmt.Errorf("sweep: revalidate quarantine %s: %w", q.Key, err)

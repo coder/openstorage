@@ -357,6 +357,20 @@ func TestEnsurePublished(t *testing.T) {
 	if err != nil || size != int64(len("pack-bytes")) {
 		t.Fatalf("Stat after re-publish = %d, %v", size, err)
 	}
+
+	// A canceled request context must not skip the verification: the
+	// registration it covers already committed (Codex round 14).
+	if err := b.Delete(ctx, key); err != nil {
+		t.Fatal(err)
+	}
+	canceled, cancel := context.WithCancel(ctx)
+	cancel()
+	if err := EnsurePublished(canceled, b, key, src); err != nil {
+		t.Fatalf("EnsurePublished(canceled ctx): %v", err)
+	}
+	if _, err := b.Stat(ctx, key); err != nil {
+		t.Fatalf("Stat after canceled-ctx re-publish: %v", err)
+	}
 }
 
 // ListPages streams in key order with bounded pages; the final short page

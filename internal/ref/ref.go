@@ -163,6 +163,11 @@ CREATE TABLE IF NOT EXISTS refs  (repo text, name text, sha text NOT NULL,
                                   created_at timestamptz NOT NULL DEFAULT now(), PRIMARY KEY (repo, name));
 CREATE TABLE IF NOT EXISTS packs (repo text, id text, s3_key text NOT NULL,
                                   created_at timestamptz DEFAULT now(), PRIMARY KEY (repo, id));
+-- The orphan sweeper's per-object membership check (HasPack, issue #5)
+-- filters on (repo, s3_key), which the (repo, id) primary key cannot serve:
+-- without this index each check scans the repo's rows, and a sweep over a
+-- repo with attacker-growable pack count turns O(N²).
+CREATE INDEX IF NOT EXISTS packs_repo_s3_key ON packs (repo, s3_key);
 -- Per-repo mutation generation (issue #4). No row means "never mutated"
 -- (GetGeneration reports 0); the first bump creates the row at 1, so a
 -- hydrate marker taken before the first mutation can never match the state

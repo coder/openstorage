@@ -84,6 +84,9 @@ func (s *SQLite) InitSchema(ctx context.Context) error {
 		// INTEGER unix seconds; ORDER BY created_at, id keeps the tie-break.
 		`CREATE TABLE IF NOT EXISTS packs (repo TEXT, id TEXT, s3_key TEXT NOT NULL,
 		                                   created_at INTEGER DEFAULT (unixepoch()), PRIMARY KEY (repo, id))`,
+		// The orphan sweeper's HasPack filters on (repo, s3_key); the
+		// (repo, id) primary key cannot serve it (see the PG DDL).
+		`CREATE INDEX IF NOT EXISTS packs_repo_s3_key ON packs (repo, s3_key)`,
 		// Per-repo mutation generation (issue #4). No row means "never
 		// mutated" (GetGeneration reports 0); the first bump creates the
 		// row at 1 — same contract as PG.

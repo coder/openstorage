@@ -91,6 +91,28 @@ func (f *sweepFixture) exists(key string) bool {
 	return err == nil
 }
 
+// backupKeys returns the quarantine entries (any nonce) backing key.
+func (f *sweepFixture) backupKeys(key string) []string {
+	f.t.Helper()
+	entries, err := f.blobs.List(context.Background(), quarantinePrefix)
+	if err != nil {
+		f.t.Fatalf("List(%q): %v", quarantinePrefix, err)
+	}
+	var keys []string
+	for _, e := range entries {
+		if orig, ok := parseQuarantineKey(e.Key); ok && orig == key {
+			keys = append(keys, e.Key)
+		}
+	}
+	return keys
+}
+
+// hasBackup reports whether some quarantine entry (any nonce) backs key.
+func (f *sweepFixture) hasBackup(key string) bool {
+	f.t.Helper()
+	return len(f.backupKeys(key)) > 0
+}
+
 func (f *sweepFixture) sweeper(cfg SweepConfig) *Sweeper {
 	f.t.Helper()
 	return NewSweeper(f.blobs, f.store, cfg, slog.New(slog.DiscardHandler))
@@ -199,7 +221,7 @@ func TestSweep_DeleteReapsOrphansOnly(t *testing.T) {
 	// Reaped orphans leave quarantine backups behind (healQuarantine purges
 	// them once they age past the threshold).
 	for _, key := range []string{oldOrphan, nsOrphan} {
-		if !f.exists("sweep/quarantine/" + key) {
+		if !f.hasBackup(key) {
 			t.Fatalf("reaped orphan %q has no quarantine backup", key)
 		}
 	}
@@ -217,7 +239,9 @@ func TestSweep_DeleteReapsOrphansOnly(t *testing.T) {
 	// Once the backups age past the threshold, the purge reclaims exactly
 	// the orphans' bytes — the point storage consumption actually drops.
 	for _, key := range []string{oldOrphan, nsOrphan} {
-		f.backdate("sweep/quarantine/"+key, 25*time.Hour)
+		for _, qkey := range f.backupKeys(key) {
+			f.backdate(qkey, 25*time.Hour)
+		}
 	}
 	purged, err := f.sweeper(SweepConfig{Threshold: 24 * time.Hour, Delete: true}).Sweep(context.Background())
 	if err != nil {
@@ -227,7 +251,7 @@ func TestSweep_DeleteReapsOrphansOnly(t *testing.T) {
 		t.Fatalf("purge report = %+v, want bytes_reclaimed=%d", purged, report.OrphanBytes)
 	}
 	for _, key := range []string{oldOrphan, nsOrphan} {
-		if f.exists("sweep/quarantine/" + key) {
+		if f.hasBackup(key) {
 			t.Fatalf("aged backup %q was not purged", key)
 		}
 	}
@@ -348,7 +372,7 @@ func TestSweep_DeleteRestoresPackRegisteredMidDelete(t *testing.T) {
 	}
 	// Retained on purpose: purging is strictly age-based so a fresh entry
 	// can never be yanked out from under another replica's handshake.
-	if !f.exists("sweep/quarantine/" + key) {
+	if !f.hasBackup(key) {
 		t.Fatalf("quarantine backup must be retained after a mid-delete restore")
 	}
 }
@@ -508,9 +532,139 @@ func TestSweep_DeleteSkipsKeyRefreshedMidSweep(t *testing.T) {
 	}
 }
 
-// A quarantine backup overwritten by a concurrent replica's safeDelete
-// after the heal's listing must survive the purge: the age gate re-reads
-// the entry's ModTime at delete time, not list time (Codex round 13).
+// quarantineKey mints unique write-once backup keys that parse back to the
+// original pack key; the legacy shared-key layout still parses (Codex
+// round 14).
+func TestQuarantineKey(t *testing.T) {
+	orig := blob.PackKey("r1", "abc")
+	k1, k2 := quarantineKey(orig), quarantineKey(orig)
+	if k1 == k2 {
+		t.Fatalf("quarantineKey minted the same key twice: %q", k1)
+	}
+	for _, k := range []string{k1, k2, quarantinePrefix + orig /* legacy */} {
+		got, ok := parseQuarantineKey(k)
+		if !ok || got != orig {
+			t.Fatalf("parseQuarantineKey(%q) = %q, %v; want %q, true", k, got, ok, orig)
+		}
+	}
+	for _, k := range []string{"other/key", quarantinePrefix + "junk"} {
+		if _, ok := parseQuarantineKey(k); ok {
+			t.Fatalf("parseQuarantineKey(%q) accepted a foreign key", k)
+		}
+	}
+}
+
+// Two reaps of the same content-addressed key (reap, retried push
+// re-creates it, reap again) must keep BOTH backups: shared quarantine keys
+// let one handshake overwrite another's restore source, which was the root
+// of the round-13/14 purge races.
+func TestSweep_RepeatedReapsKeepDistinctBackups(t *testing.T) {
+	f := newSweepFixture(t)
+	key := blob.PackKey("r1", "twice")
+	s := f.sweeper(SweepConfig{Threshold: 24 * time.Hour, Delete: true})
+
+	for i, content := range []string{"bytes-one", "bytes-two"} {
+		f.upload(key, content)
+		f.backdate(key, 25*time.Hour)
+		report, err := s.Sweep(context.Background())
+		if err != nil {
+			t.Fatalf("Sweep %d: %v", i+1, err)
+		}
+		if report.Deleted != 1 {
+			t.Fatalf("Sweep %d report = %+v, want 1 deleted", i+1, report)
+		}
+	}
+	backups, err := f.blobs.List(context.Background(), quarantinePrefix)
+	if err != nil {
+		t.Fatalf("List quarantine: %v", err)
+	}
+	if len(backups) != 2 {
+		t.Fatalf("quarantine holds %d backups, want 2 distinct (write-once keys)", len(backups))
+	}
+}
+
+// healQuarantine handles nonce-layout entries: a registered pack with a
+// missing blob is restored from its aged backup, and aged backups are
+// purged with only the unregistered one credited as reclaimed.
+func TestSweep_HealNonceQuarantine(t *testing.T) {
+	f := newSweepFixture(t)
+	lost := blob.PackKey("r1", "lost")
+	qLost := quarantinePrefix + "aaaaaaaaaaaaaaaa/" + lost
+	f.upload(qLost, "lost-bytes")
+	f.backdate(qLost, 25*time.Hour)
+	f.register("r1", "lost", lost)
+
+	stale := blob.PackKey("r1", "stale")
+	qStale := quarantinePrefix + "bbbbbbbbbbbbbbbb/" + stale
+	f.upload(qStale, "stale-bytes")
+	f.backdate(qStale, 25*time.Hour)
+
+	report, err := f.sweeper(SweepConfig{Threshold: 24 * time.Hour, Delete: true}).Sweep(context.Background())
+	if err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if !f.exists(lost) {
+		t.Fatalf("registered-but-missing pack %q was not healed from nonce quarantine", lost)
+	}
+	if f.exists(qLost) || f.exists(qStale) {
+		t.Fatalf("aged nonce backups were not purged (lost=%v stale=%v)", f.exists(qLost), f.exists(qStale))
+	}
+	if want := int64(len("stale-bytes")); report.BytesReclaimed != want {
+		t.Fatalf("BytesReclaimed = %d, want %d (stale purge only)", report.BytesReclaimed, want)
+	}
+}
+
+// peerPurged simulates a concurrent replica healing the same aged entry
+// between this sweep's quarantine listing and its restore: the listed entry
+// no longer exists, the original was missing at the first stat and present
+// (peer-restored) at the re-stat.
+type peerPurged struct {
+	blob.BlobStore
+	orig    string
+	qkey    string
+	statted bool
+}
+
+func (b *peerPurged) ListPages(ctx context.Context, prefix string, pageSize int, fn func([]blob.ListedObject) error) error {
+	if prefix == quarantinePrefix {
+		return fn([]blob.ListedObject{{Key: b.qkey, Size: 1, ModTime: time.Now().Add(-25 * time.Hour)}})
+	}
+	return b.BlobStore.ListPages(ctx, prefix, pageSize, fn)
+}
+
+func (b *peerPurged) Stat(ctx context.Context, key string) (int64, error) {
+	if key == b.orig && !b.statted {
+		b.statted = true
+		return 0, blob.ErrNotFound
+	}
+	return b.BlobStore.Stat(ctx, key)
+}
+
+// A heal whose restore source vanished mid-sweep must verify the peer's
+// restore instead of failing: the peer purges only after restoring, so the
+// original existing again is the success condition (Codex round 14).
+func TestSweep_HealToleratesPeerPurgedBackup(t *testing.T) {
+	f := newSweepFixture(t)
+	orig := blob.PackKey("r1", "peer")
+	f.upload(orig, "peer-bytes")
+	f.register("r1", "peer", orig)
+	qkey := quarantinePrefix + "cccccccccccccccc/" + orig // never uploaded: peer already purged it
+
+	s := NewSweeper(&peerPurged{BlobStore: f.blobs, orig: orig, qkey: qkey}, f.store,
+		SweepConfig{Threshold: 24 * time.Hour, Delete: true}, slog.New(slog.DiscardHandler))
+	if _, err := s.Sweep(context.Background()); err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if !f.exists(orig) {
+		t.Fatalf("registered pack %q lost during peer-purged heal", orig)
+	}
+}
+
+// A LEGACY-layout quarantine backup overwritten by a pre-upgrade replica's
+// safeDelete after the heal's listing must survive the purge: the age gate
+// re-reads the entry's ModTime at delete time, not list time (Codex round
+// 13). Nonce-layout entries are write-once, so only legacy keys can be
+// refreshed at all.
 func TestSweep_PurgeSkipsQuarantineRefreshedMidSweep(t *testing.T) {
 	f := newSweepFixture(t)
 	qKey := quarantinePrefix + blob.PackKey("r1", "requeued")

@@ -133,14 +133,28 @@ func LFSKey(repoID, oid string) string {
 // before R then D happened before V, so V observes the missing key and
 // re-uploads. Both writers produce identical bytes (pack keys are
 // content-addressed), so the overlap is harmless either way.
+//
+// The verification runs on a bounded context detached from the caller's
+// cancellation: the registration it covers has already committed, so a
+// client hanging up right after the commit must not skip the check — a
+// skipped verification could leave the persistent pack row pointing at a
+// blob a concurrent sweep just deleted (Codex round 14).
 func EnsurePublished(ctx context.Context, b BlobStore, key, path string) error {
 	assertf(b != nil && key != "" && path != "", "EnsurePublished(%q, %q)", key, path)
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), ensurePublishedTimeout)
+	defer cancel()
 	_, err := b.Stat(ctx, key)
 	if errors.Is(err, ErrNotFound) {
 		return b.UploadFile(ctx, key, path)
 	}
 	return err
 }
+
+// ensurePublishedTimeout bounds EnsurePublished's detached verification:
+// generous enough to re-upload a pack that was just uploaded over the same
+// server→store link, small enough that a wedged store cannot pin request
+// goroutines indefinitely.
+const ensurePublishedTimeout = 5 * time.Minute
 
 // Open dispatches on the URL scheme to the matching BlobStore backend:
 //
