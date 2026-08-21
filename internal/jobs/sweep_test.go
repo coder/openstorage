@@ -384,13 +384,13 @@ func TestSweep_ListOnlyStillHealsQuarantine(t *testing.T) {
 
 	// Delete-enabled crash mid-handshake, then rollback to list-only.
 	lost := blob.PackKey("r1", "lost")
-	f.upload("sweep/quarantine/"+lost, "lost-bytes")
+	f.upload(quarantinePrefix+"n0/"+lost, "lost-bytes")
 	f.register("r1", "lost", lost)
 
 	// An aged unregistered backup: list-only must NOT purge it.
 	stale := blob.PackKey("r1", "stale")
-	f.upload("sweep/quarantine/"+stale, "stale-bytes")
-	f.backdate("sweep/quarantine/"+stale, 25*time.Hour)
+	f.upload(quarantinePrefix+"n0/"+stale, "stale-bytes")
+	f.backdate(quarantinePrefix+"n0/"+stale, 25*time.Hour)
 
 	report, err := f.sweeper(SweepConfig{Threshold: 24 * time.Hour}).Sweep(context.Background())
 	if err != nil {
@@ -399,10 +399,10 @@ func TestSweep_ListOnlyStillHealsQuarantine(t *testing.T) {
 	if !f.exists(lost) {
 		t.Fatalf("list-only sweep did not heal registered-but-missing pack %q", lost)
 	}
-	if !f.exists("sweep/quarantine/" + lost) {
+	if !f.exists(quarantinePrefix + "n0/" + lost) {
 		t.Fatalf("list-only heal purged fresh backup %q (purging is delete- and age-gated)", lost)
 	}
-	if !f.exists("sweep/quarantine/" + stale) {
+	if !f.exists(quarantinePrefix + "n0/" + stale) {
 		t.Fatalf("list-only sweep purged %q (purging must stay delete-gated)", stale)
 	}
 	if report.Deleted != 0 || report.BytesReclaimed != 0 {
@@ -418,11 +418,11 @@ func TestSweep_ListOnlyStillHealsQuarantine(t *testing.T) {
 func TestSweeper_HealStandalone(t *testing.T) {
 	f := newSweepFixture(t)
 	lost := blob.PackKey("r1", "lost")
-	f.upload("sweep/quarantine/"+lost, "lost-bytes")
+	f.upload(quarantinePrefix+"n0/"+lost, "lost-bytes")
 	f.register("r1", "lost", lost)
 	stale := blob.PackKey("r1", "stale")
-	f.upload("sweep/quarantine/"+stale, "stale-bytes")
-	f.backdate("sweep/quarantine/"+stale, 25*time.Hour)
+	f.upload(quarantinePrefix+"n0/"+stale, "stale-bytes")
+	f.backdate(quarantinePrefix+"n0/"+stale, 25*time.Hour)
 
 	// Delete=true on purpose: the standalone heal must force purging off.
 	if err := f.sweeper(SweepConfig{Threshold: 24 * time.Hour, Delete: true}).Heal(context.Background()); err != nil {
@@ -431,10 +431,10 @@ func TestSweeper_HealStandalone(t *testing.T) {
 	if !f.exists(lost) {
 		t.Fatalf("standalone heal did not restore %q", lost)
 	}
-	if !f.exists("sweep/quarantine/" + lost) {
+	if !f.exists(quarantinePrefix + "n0/" + lost) {
 		t.Fatalf("standalone heal purged backup %q (must be strictly restorative)", lost)
 	}
-	if !f.exists("sweep/quarantine/" + stale) {
+	if !f.exists(quarantinePrefix + "n0/" + stale) {
 		t.Fatalf("standalone heal purged %q despite Delete=true (must be strictly restorative)", stale)
 	}
 }
@@ -449,18 +449,18 @@ func TestSweep_HealQuarantine(t *testing.T) {
 	// Crashed handshake: registered pack, blob missing, backup present and
 	// aged (so this delete-mode sweep may purge it after restoring).
 	lost := blob.PackKey("r1", "lost")
-	f.upload("sweep/quarantine/"+lost, "lost-bytes")
-	f.backdate("sweep/quarantine/"+lost, 25*time.Hour)
+	f.upload(quarantinePrefix+"n0/"+lost, "lost-bytes")
+	f.backdate(quarantinePrefix+"n0/"+lost, 25*time.Hour)
 	f.register("r1", "lost", lost)
 
 	// Reaped long ago: unregistered, backup aged past the threshold.
 	stale := blob.PackKey("r1", "stale")
-	f.upload("sweep/quarantine/"+stale, "stale-bytes")
-	f.backdate("sweep/quarantine/"+stale, 25*time.Hour)
+	f.upload(quarantinePrefix+"n0/"+stale, "stale-bytes")
+	f.backdate(quarantinePrefix+"n0/"+stale, 25*time.Hour)
 
 	// In-flight sweep's backup: unregistered but fresh — must be kept.
 	inflight := blob.PackKey("r1", "inflight")
-	f.upload("sweep/quarantine/"+inflight, "inflight-bytes")
+	f.upload(quarantinePrefix+"n0/"+inflight, "inflight-bytes")
 
 	report, err := f.sweeper(SweepConfig{Threshold: 24 * time.Hour, Delete: true}).Sweep(context.Background())
 	if err != nil {
@@ -469,13 +469,13 @@ func TestSweep_HealQuarantine(t *testing.T) {
 	if !f.exists(lost) {
 		t.Fatalf("registered-but-missing pack %q was not healed from quarantine", lost)
 	}
-	if f.exists("sweep/quarantine/" + lost) {
+	if f.exists(quarantinePrefix + "n0/" + lost) {
 		t.Fatalf("aged healed backup %q was not purged", lost)
 	}
-	if f.exists("sweep/quarantine/" + stale) {
+	if f.exists(quarantinePrefix + "n0/" + stale) {
 		t.Fatalf("aged unregistered backup %q was not purged", stale)
 	}
-	if !f.exists("sweep/quarantine/" + inflight) {
+	if !f.exists(quarantinePrefix + "n0/" + inflight) {
 		t.Fatalf("fresh backup %q must be kept (possibly an in-flight sweep)", inflight)
 	}
 	// The healed pack is registered => live in the same sweep's report.
@@ -560,23 +560,27 @@ func TestSweep_OrphanSampleBounded(t *testing.T) {
 }
 
 // quarantineKey mints unique write-once backup keys that parse back to the
-// original pack key; the legacy shared-key layout still parses (Codex
-// round 14).
+// original pack key (Codex round 14); anything not in the nonce layout must
+// never resolve to a valid pack key (the heal skips it as foreign).
 func TestQuarantineKey(t *testing.T) {
 	orig := blob.PackKey("r1", "abc")
 	k1, k2 := quarantineKey(orig), quarantineKey(orig)
 	if k1 == k2 {
 		t.Fatalf("quarantineKey minted the same key twice: %q", k1)
 	}
-	for _, k := range []string{k1, k2, quarantinePrefix + orig /* legacy */} {
+	for _, k := range []string{k1, k2} {
 		got, ok := parseQuarantineKey(k)
 		if !ok || got != orig {
 			t.Fatalf("parseQuarantineKey(%q) = %q, %v; want %q, true", k, got, ok, orig)
 		}
 	}
-	for _, k := range []string{"other/key", quarantinePrefix + "junk"} {
-		if _, ok := parseQuarantineKey(k); ok {
-			t.Fatalf("parseQuarantineKey(%q) accepted a foreign key", k)
+	for _, k := range []string{"other/key", quarantinePrefix + "junk", quarantinePrefix + orig} {
+		got, ok := parseQuarantineKey(k)
+		if !ok {
+			continue
+		}
+		if _, packOK := splitPackKey(got); packOK {
+			t.Fatalf("parseQuarantineKey(%q) = %q resolves to a valid pack key; foreign layouts must not", k, got)
 		}
 	}
 }
@@ -607,37 +611,6 @@ func TestSweep_RepeatedReapsKeepDistinctBackups(t *testing.T) {
 	}
 	if len(backups) != 2 {
 		t.Fatalf("quarantine holds %d backups, want 2 distinct (write-once keys)", len(backups))
-	}
-}
-
-// healQuarantine handles nonce-layout entries: a registered pack with a
-// missing blob is restored from its aged backup, and aged backups are
-// purged with only the unregistered one credited as reclaimed.
-func TestSweep_HealNonceQuarantine(t *testing.T) {
-	f := newSweepFixture(t)
-	lost := blob.PackKey("r1", "lost")
-	qLost := quarantinePrefix + "aaaaaaaaaaaaaaaa/" + lost
-	f.upload(qLost, "lost-bytes")
-	f.backdate(qLost, 25*time.Hour)
-	f.register("r1", "lost", lost)
-
-	stale := blob.PackKey("r1", "stale")
-	qStale := quarantinePrefix + "bbbbbbbbbbbbbbbb/" + stale
-	f.upload(qStale, "stale-bytes")
-	f.backdate(qStale, 25*time.Hour)
-
-	report, err := f.sweeper(SweepConfig{Threshold: 24 * time.Hour, Delete: true}).Sweep(context.Background())
-	if err != nil {
-		t.Fatalf("Sweep: %v", err)
-	}
-	if !f.exists(lost) {
-		t.Fatalf("registered-but-missing pack %q was not healed from nonce quarantine", lost)
-	}
-	if f.exists(qLost) || f.exists(qStale) {
-		t.Fatalf("aged nonce backups were not purged (lost=%v stale=%v)", f.exists(qLost), f.exists(qStale))
-	}
-	if want := int64(len("stale-bytes")); report.BytesReclaimed != want {
-		t.Fatalf("BytesReclaimed = %d, want %d (stale purge only)", report.BytesReclaimed, want)
 	}
 }
 
@@ -684,31 +657,6 @@ func TestSweep_HealToleratesPeerPurgedBackup(t *testing.T) {
 	}
 	if !f.exists(orig) {
 		t.Fatalf("registered pack %q lost during peer-purged heal", orig)
-	}
-}
-
-// A LEGACY-layout quarantine backup overwritten by a pre-upgrade replica's
-// safeDelete after the heal's listing must survive the purge: the age gate
-// re-reads the entry's ModTime at delete time, not list time (Codex round
-// 13). Nonce-layout entries are write-once, so only legacy keys can be
-// refreshed at all.
-func TestSweep_PurgeSkipsQuarantineRefreshedMidSweep(t *testing.T) {
-	f := newSweepFixture(t)
-	qKey := quarantinePrefix + blob.PackKey("r1", "requeued")
-	f.upload(qKey, "backup-bytes")
-	f.backdate(qKey, 25*time.Hour) // aged in the heal's listing snapshot
-
-	s := NewSweeper(&refreshedMidSweep{BlobStore: f.blobs, key: qKey}, f.store,
-		SweepConfig{Threshold: 24 * time.Hour, Delete: true}, slog.New(slog.DiscardHandler))
-	report, err := s.Sweep(context.Background())
-	if err != nil {
-		t.Fatalf("Sweep: %v", err)
-	}
-	if !f.exists(qKey) {
-		t.Fatalf("mid-sweep-refreshed quarantine backup %q was purged", qKey)
-	}
-	if report.BytesReclaimed != 0 {
-		t.Fatalf("BytesReclaimed = %d, want 0 (purge skipped)", report.BytesReclaimed)
 	}
 }
 

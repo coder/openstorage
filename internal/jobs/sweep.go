@@ -275,16 +275,14 @@ func quarantineKey(key string) string {
 	return quarantinePrefix + hex.EncodeToString(nonce[:]) + "/" + key
 }
 
-// parseQuarantineKey recovers the original pack key from a quarantine
-// backup key, accepting both the nonce layout and the legacy shared-key
-// layout (sweep/quarantine/packs/..., written by pre-nonce sweepers).
+// parseQuarantineKey recovers the original pack key from a nonce-layout
+// quarantine backup key (sweep/quarantine/<nonce>/packs/...). This is the
+// only layout any released sweeper has ever written; anything else under
+// the prefix is foreign and gets skipped loudly by the caller.
 func parseQuarantineKey(qkey string) (orig string, ok bool) {
 	rest, found := strings.CutPrefix(qkey, quarantinePrefix)
 	if !found {
 		return "", false
-	}
-	if strings.HasPrefix(rest, blob.PacksRoot) {
-		return rest, true // legacy shared-key layout
 	}
 	_, orig, found = strings.Cut(rest, "/")
 	if !found {
@@ -448,27 +446,10 @@ func (s *Sweeper) healQuarantineEntry(ctx context.Context, q blob.ListedObject, 
 			return fmt.Errorf("sweep: heal %s: stat: %w", orig, err)
 		}
 	}
-	// Purge strictly by age: nonce-keyed entries are write-once (see
+	// Purge strictly by age: quarantine entries are write-once (see
 	// quarantineKey), so an aged listing ModTime is immutable proof the
 	// entry's handshake is dead and no live handshake can be relying on it.
 	if !purge || q.ModTime.IsZero() || s.now().Sub(q.ModTime) < s.cfg.Threshold {
-		return nil
-	}
-	// Legacy shared-key entries (pre-nonce layout) are NOT write-once: a
-	// pre-upgrade replica's in-flight safeDelete could still overwrite one.
-	// Re-read the age immediately before the delete as defense in depth —
-	// the delete-mode fleet gate (all nodes upgraded before enabling
-	// CODESTORAGE_SWEEP_DELETE_ENABLED) is the actual guarantee, exactly as
-	// for EnsurePublished.
-	mod, found, err := s.freshModTime(ctx, q.Key)
-	if err != nil {
-		return fmt.Errorf("sweep: revalidate quarantine %s: %w", q.Key, err)
-	}
-	if !found {
-		return nil // purged by a concurrent sweep: nothing left to do
-	}
-	if mod.IsZero() || s.now().Sub(mod) < s.cfg.Threshold {
-		s.logger.Info("orphan pack sweep: skipping quarantine purge, backup refreshed mid-sweep", "key", q.Key)
 		return nil
 	}
 	if err := s.blobs.Delete(ctx, q.Key); err != nil && !errors.Is(err, blob.ErrNotFound) {
