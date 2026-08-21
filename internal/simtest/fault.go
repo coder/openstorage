@@ -41,9 +41,9 @@ const (
 	FaultClean
 	// FaultAmbiguous executes the call, discards its result, and fails it.
 	FaultAmbiguous
-	// FaultNotFound fails a blob read with blob.ErrNotFound without
+	// FaultNotFound fails a blob op with blob.ErrNotFound without
 	// executing it (transient missing-object; only valid on
-	// OpBlobDownloadFile and OpBlobStat).
+	// OpBlobDownloadFile, OpBlobStat, OpBlobDelete, and OpBlobCopy).
 	FaultNotFound
 )
 
@@ -79,6 +79,8 @@ const (
 	OpBlobSignedURL    = "blob.SignedURL"
 	OpBlobStat         = "blob.Stat"
 	OpBlobEnsureBucket = "blob.EnsureBucket"
+	OpBlobDelete       = "blob.Delete"
+	OpBlobCopy         = "blob.Copy"
 )
 
 // Sentinel errors for injected faults; match with errors.Is. The concrete
