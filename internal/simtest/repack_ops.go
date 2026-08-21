@@ -111,7 +111,7 @@ func (s *sim) doRepack(name string, node *simNode, repo *simRepo) error {
 	}, discardLogger())
 
 	mark := s.inj.Seq()
-	rerr := r.Repack(ctx, repo.key)
+	_, rerr := r.Repack(ctx, repo.key)
 	evs, _ := s.inj.FiredSince(mark)
 
 	post, err := s.oraclePackSet(repo.key)
@@ -229,10 +229,10 @@ func (s *sim) doRepackRace(name string, node *simNode, repo *simRepo, branch str
 		if err := s.oraclePush(ctx, repo, branch); err != nil {
 			return err
 		}
-		winnerErr = winner.Repack(ctx, repo.key)
+		_, winnerErr = winner.Repack(ctx, repo.key)
 		return nil
 	}
-	if err := loser.Repack(ctx, repo.key); err != nil {
+	if _, err := loser.Repack(ctx, repo.key); err != nil {
 		return fmt.Errorf("step %d: loser repack: %w", s.step, err)
 	}
 	if winnerErr != nil {

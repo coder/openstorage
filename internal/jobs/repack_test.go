@@ -217,7 +217,7 @@ func TestRepack_FoldsToOnePack(t *testing.T) {
 		t.Fatalf("pack rows before fold = %d, want 6", got)
 	}
 
-	if err := f.repacker(t.TempDir()).Repack(ctx, f.repo); err != nil {
+	if _, err := f.repacker(t.TempDir()).Repack(ctx, f.repo); err != nil {
 		t.Fatalf("repack: %v", err)
 	}
 
@@ -242,7 +242,7 @@ func TestRepack_FoldsToOnePack(t *testing.T) {
 	f.checkColdHydrate(t)
 
 	// Idempotence: a second fold with one registered pack is a no-op.
-	if err := f.repacker(t.TempDir()).Repack(ctx, f.repo); err != nil {
+	if _, err := f.repacker(t.TempDir()).Repack(ctx, f.repo); err != nil {
 		t.Fatalf("second repack: %v", err)
 	}
 	if again := f.packRows(t); len(again) != 1 || again[0].ID != rows[0].ID {
@@ -287,9 +287,10 @@ func TestRepack_LostRaceDeletesOwnOrphan(t *testing.T) {
 		// winner's input set, so the two consolidated packs differ and the
 		// loser's own-orphan cleanup must actually delete bytes.
 		f.push(t)
-		return f.repacker(winnerDir).Repack(ctx, f.repo)
+		_, werr := f.repacker(winnerDir).Repack(ctx, f.repo)
+		return werr
 	}
-	if err := loser.Repack(ctx, f.repo); err != nil {
+	if _, err := loser.Repack(ctx, f.repo); err != nil {
 		t.Fatalf("loser repack: %v", err)
 	}
 
@@ -341,7 +342,7 @@ func TestRepack_AmbiguousSwapKeepsBlob(t *testing.T) {
 	r := NewRepacker(ambiguousReplaceStore{f.store}, f.blobs, func(ctx context.Context, repo string) (string, error, error) {
 		return githttp.Hydrate(ctx, f.store, f.blobs, f.cacheDir, repo, "main")
 	}, slog.New(slog.DiscardHandler))
-	err := r.Repack(ctx, f.repo)
+	_, err := r.Repack(ctx, f.repo)
 	if !errors.Is(err, errAmbiguousReplace) {
 		t.Fatalf("repack error = %v, want the injected ambiguous drop", err)
 	}
@@ -365,7 +366,7 @@ func TestRepack_SweeperCollectsSupersededBlobs(t *testing.T) {
 	for range 4 {
 		oldIDs = append(oldIDs, f.push(t))
 	}
-	if err := f.repacker(t.TempDir()).Repack(ctx, f.repo); err != nil {
+	if _, err := f.repacker(t.TempDir()).Repack(ctx, f.repo); err != nil {
 		t.Fatalf("repack: %v", err)
 	}
 	rows := f.packRows(t)
@@ -439,7 +440,7 @@ func TestRepack_ConcurrentHydratorRetriesOntoFold(t *testing.T) {
 	// blobs away (the worst case for a stale hydrator: rows gone, bytes
 	// gone).
 	stale := &staleListStore{RefStore: f.store, stale: f.packRows(t)}
-	if err := f.repacker(t.TempDir()).Repack(ctx, f.repo); err != nil {
+	if _, err := f.repacker(t.TempDir()).Repack(ctx, f.repo); err != nil {
 		t.Fatalf("repack: %v", err)
 	}
 	past := time.Now().Add(-25 * time.Hour)
@@ -477,7 +478,7 @@ func TestRepack_StaleSnapshotLosesCleanlyBeforePacking(t *testing.T) {
 	// finds no idx for the snapshotted packs. The fold must stop cleanly:
 	// no error, no upload, no DB change beyond the winner's fold.
 	stale := &staleListStore{RefStore: f.store, stale: f.packRows(t)}
-	if err := f.repacker(t.TempDir()).Repack(ctx, f.repo); err != nil {
+	if _, err := f.repacker(t.TempDir()).Repack(ctx, f.repo); err != nil {
 		t.Fatalf("winner repack: %v", err)
 	}
 	winner := f.packRows(t)
@@ -489,7 +490,7 @@ func TestRepack_StaleSnapshotLosesCleanlyBeforePacking(t *testing.T) {
 	loser := NewRepacker(stale, f.blobs, func(ctx context.Context, repo string) (string, error, error) {
 		return githttp.Hydrate(ctx, f.store, f.blobs, t.TempDir(), repo, "main") // cold cache
 	}, slog.New(slog.DiscardHandler))
-	if err := loser.Repack(ctx, f.repo); err != nil {
+	if _, err := loser.Repack(ctx, f.repo); err != nil {
 		t.Fatalf("stale-snapshot repack must lose cleanly, got %v", err)
 	}
 	if rows := f.packRows(t); len(rows) != 1 || rows[0].ID != winner[0].ID {
@@ -502,6 +503,55 @@ func TestRepack_StaleSnapshotLosesCleanlyBeforePacking(t *testing.T) {
 	if len(after) != len(before) {
 		t.Fatalf("stale fold changed the blob set: %d -> %d objects", len(before), len(after))
 	}
+}
+
+// TestRepack_BudgetsBoundFoldInput pins the fold's resource budgets
+// (security round): each fixture push pack holds exactly 3 objects
+// (blob + tree + commit), so small budgets steer the oldest-first
+// selection deterministically. Skipped packs stay registered untouched,
+// and a selection below two packs skips the fold entirely.
+func TestRepack_BudgetsBoundFoldInput(t *testing.T) {
+	f := newRepackFixture(t)
+	ctx := context.Background()
+	for range 3 {
+		f.push(t)
+	}
+
+	// Object budget 7 fits two 3-object packs, not three: the fold must
+	// consolidate exactly two and leave the third registered as-is.
+	r := f.repacker(t.TempDir())
+	r.MaxFoldObjects = 7
+	folded, err := r.Repack(ctx, f.repo)
+	if err != nil || !folded {
+		t.Fatalf("budgeted repack = (folded %v, err %v), want a fold", folded, err)
+	}
+	if rows := f.packRows(t); len(rows) != 2 {
+		t.Fatalf("pack rows after budgeted fold = %+v, want 2 (fold + over-budget leftover)", rows)
+	}
+	f.checkColdHydrate(t)
+
+	// The remaining pair (6-object fold + 3-object pack) exceeds the
+	// budget together; whichever lists first, fewer than two packs fit:
+	// no fold, no error, no changes.
+	folded, err = r.Repack(ctx, f.repo)
+	if err != nil || folded {
+		t.Fatalf("over-budget repack = (folded %v, err %v), want a clean no-op", folded, err)
+	}
+	if rows := f.packRows(t); len(rows) != 2 {
+		t.Fatalf("pack rows after no-op = %+v, want unchanged 2", rows)
+	}
+
+	// A byte budget of one selects nothing either.
+	rb := f.repacker(t.TempDir())
+	rb.MaxFoldBytes = 1
+	folded, err = rb.Repack(ctx, f.repo)
+	if err != nil || folded {
+		t.Fatalf("byte-budget repack = (folded %v, err %v), want a clean no-op", folded, err)
+	}
+	if rows := f.packRows(t); len(rows) != 2 {
+		t.Fatalf("pack rows after byte-budget no-op = %+v, want unchanged 2", rows)
+	}
+	f.checkColdHydrate(t)
 }
 
 // lostFoldShim models the P1 delete race deterministically: ListPacks
@@ -554,7 +604,7 @@ func TestRepack_LostFoldDeleteRaceRestoresLiveKey(t *testing.T) {
 
 	// Winner folds A,B into K; warmDir keeps A, B, and K materialized.
 	warmDir := t.TempDir()
-	if err := f.repacker(warmDir).Repack(ctx, f.repo); err != nil {
+	if _, err := f.repacker(warmDir).Repack(ctx, f.repo); err != nil {
 		t.Fatalf("winner repack: %v", err)
 	}
 	rows := f.packRows(t)
@@ -569,7 +619,7 @@ func TestRepack_LostFoldDeleteRaceRestoresLiveKey(t *testing.T) {
 	loser := NewRepacker(shim, f.blobs, func(ctx context.Context, repo string) (string, error, error) {
 		return githttp.Hydrate(ctx, f.store, f.blobs, warmDir, repo, "main")
 	}, slog.New(slog.DiscardHandler))
-	if err := loser.Repack(ctx, f.repo); err != nil {
+	if _, err := loser.Repack(ctx, f.repo); err != nil {
 		t.Fatalf("loser repack: %v", err)
 	}
 	if shim.hasPackCalls < 2 {
@@ -623,7 +673,7 @@ func TestRepack_RepublishesBlobSweptMidSwap(t *testing.T) {
 		}
 		return errors.New("consolidated blob not uploaded before swap")
 	}
-	if err := r.Repack(ctx, f.repo); err != nil {
+	if _, err := r.Repack(ctx, f.repo); err != nil {
 		t.Fatalf("repack: %v", err)
 	}
 

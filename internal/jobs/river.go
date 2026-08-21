@@ -141,10 +141,15 @@ type repackWorker struct {
 }
 
 func (w *repackWorker) Work(ctx context.Context, job *river.Job[repackArgs]) error {
-	if err := w.repacker.Repack(ctx, job.Args.Repo); err != nil {
+	folded, err := w.repacker.Repack(ctx, job.Args.Repo)
+	if err != nil {
 		return err
 	}
-	if w.repacker.NeedsFollowUp(ctx, job.Args.Repo) {
+	// Follow up only after an actual fold: snoozing after a lost race
+	// would be the eager retry the design rejects, and snoozing after a
+	// budget/no-op skip would loop forever on repos whose row count sits
+	// above the threshold without foldable work.
+	if folded && w.repacker.NeedsFollowUp(ctx, job.Args.Repo) {
 		return river.JobSnooze(repackFollowUpSnooze)
 	}
 	return nil

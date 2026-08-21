@@ -6,12 +6,15 @@
 //
 //  1. snapshot the registered pack rows (the fold input),
 //  2. hydrate the cache repo (materializes at least every snapshotted pack),
-//  3. write ONE self-contained pack holding the union of the snapshotted
+//  3. select the fold input under per-fold object/byte budgets (repack runs
+//     automatically on writes, so one fold's work must be bounded even
+//     against adversarial pack shapes; see selectFoldInput),
+//  4. write ONE self-contained pack holding the union of the selected
 //     packs' objects,
-//  4. upload the new pack blob (publish-before-flip: bytes must be durable
+//  5. upload the new pack blob (publish-before-flip: bytes must be durable
 //     before any row references them),
-//  5. install the fold with ref.RefStore.ReplacePacks — one transaction that
-//     deletes exactly the snapshotted rows and inserts the new one.
+//  6. install the fold with ref.RefStore.ReplacePacks — one transaction that
+//     deletes exactly the selected rows and inserts the new one.
 //
 // A lost install (another node folded first) deletes its own uploaded blob
 // and stops; there is no eager retry — the next write past the threshold
@@ -36,8 +39,10 @@
 package jobs
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -95,6 +100,17 @@ type Repacker struct {
 	// Wiring sets it to the trigger threshold; 0 disables follow-ups.
 	FollowUpThreshold int
 
+	// MaxFoldObjects/MaxFoldBytes bound ONE fold's input (0 = default):
+	// repack runs automatically on writes, and a git:write caller must not
+	// be able to make the service enumerate, recompress, and upload an
+	// unbounded object set on every threshold crossing. Packs are selected
+	// oldest-first under the cumulative budgets (see selectFoldInput);
+	// oversized leftovers stay registered as-is, so a huge repo converges
+	// to O(size/budget) consolidated rows instead of one — bounded work
+	// per fold beats one unbounded fold.
+	MaxFoldObjects int
+	MaxFoldBytes   int64
+
 	// BeforeSwap is a test seam: when set, it runs after the consolidated
 	// pack's blob upload and before ReplacePacks — the fold-install race
 	// window. Tests and the DST harness use it to interleave a competing
@@ -131,11 +147,20 @@ func NewRepacker(store ref.RefStore, blobs blob.BlobStore, hydrate HydrateFunc, 
 	return &Repacker{store: store, blobs: blobs, hydrate: hydrate, logger: logger}
 }
 
-// Repack runs one fold attempt for repo. A no-op (fewer than two registered
-// packs) and a cleanly lost race both return nil; only infrastructure
-// failures propagate (the river job records them, and the next trigger
-// retries).
-func (r *Repacker) Repack(ctx context.Context, repo string) error {
+// Default per-fold budgets (see Repacker.MaxFoldObjects/MaxFoldBytes): one
+// million objects bounds the in-memory union at tens of MB, and 2 GiB of
+// input pack bytes bounds one fold's recompression and upload work.
+const (
+	defaultMaxFoldObjects = 1 << 20
+	defaultMaxFoldBytes   = 2 << 30
+)
+
+// Repack runs one fold attempt for repo, returning whether a fold was
+// installed. A no-op (fewer than two registered packs, or budgets selecting
+// fewer than two) and a cleanly lost race both return (false, nil); only
+// infrastructure failures propagate (the river job records them, and the
+// next trigger retries).
+func (r *Repacker) Repack(ctx context.Context, repo string) (folded bool, err error) {
 	assertf(repo != "", "Repack: empty repo")
 
 	// Snapshot BEFORE hydrating: Hydrate materializes at least every pack
@@ -144,15 +169,15 @@ func (r *Repacker) Repack(ctx context.Context, repo string) error {
 	// simply not part of the fold and survive the swap untouched.
 	old, err := r.store.ListPacks(ctx, repo)
 	if err != nil {
-		return fmt.Errorf("repack %s: list packs: %w", repo, err)
+		return false, fmt.Errorf("repack %s: list packs: %w", repo, err)
 	}
 	if len(old) < 2 {
-		return nil // nothing to fold
+		return false, nil // nothing to fold
 	}
 
 	repoPath, refsErr, err := r.hydrate(ctx, repo)
 	if err != nil {
-		return fmt.Errorf("repack %s: hydrate: %w", repo, err)
+		return false, fmt.Errorf("repack %s: hydrate: %w", repo, err)
 	}
 	if refsErr != nil {
 		// Tolerable: the fold packs the snapshotted packs' OBJECTS, which
@@ -161,23 +186,44 @@ func (r *Repacker) Repack(ctx context.Context, repo string) error {
 		r.logger.Warn("repack: tolerated ref-sync failure", "repo", repo, "err", refsErr)
 	}
 
-	objs, err := packObjectUnion(repoPath, old)
-	if errors.Is(err, errFoldInputGone) {
+	lostBeforePacking := func(err error) bool {
+		if !errors.Is(err, errFoldInputGone) {
+			return false
+		}
 		// A snapshotted pack has no local idx even after Hydrate: a
 		// concurrent fold replaced the row set between our snapshot and
 		// Hydrate's own listing, so hydration (correctly) never
 		// materialized it into this cold cache. Our input is stale —
 		// ReplacePacks would lose anyway. Stop cleanly; nothing uploaded.
 		r.logger.Info("repack: lost fold race before packing", "repo", repo, "err", err)
-		return nil
+		return true
+	}
+
+	fold, err := selectFoldInput(repoPath, old, r.objectBudget(), r.byteBudget())
+	if lostBeforePacking(err) {
+		return false, nil
 	}
 	if err != nil {
-		return fmt.Errorf("repack %s: %w", repo, err)
+		return false, fmt.Errorf("repack %s: %w", repo, err)
+	}
+	if len(fold) < 2 {
+		r.logger.Info("repack: budgets select nothing to fold",
+			"repo", repo, "packs", len(old), "object_budget", r.objectBudget(), "byte_budget", r.byteBudget())
+		return false, nil
+	}
+	old = fold
+
+	objs, err := packObjectUnion(repoPath, old)
+	if lostBeforePacking(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("repack %s: %w", repo, err)
 	}
 
 	id, packPath, err := writeConsolidatedPack(repoPath, objs)
 	if err != nil {
-		return fmt.Errorf("repack %s: %w", repo, err)
+		return false, fmt.Errorf("repack %s: %w", repo, err)
 	}
 	newPack := ref.Pack{ID: id, Key: blob.PackKey(repo, id)}
 
@@ -185,12 +231,12 @@ func (r *Repacker) Repack(ctx context.Context, repo string) error {
 	// commit a row referencing it. A crash after this upload strands only
 	// an unregistered blob, which the orphan sweeper collects.
 	if err := r.blobs.UploadFile(ctx, newPack.Key, packPath); err != nil {
-		return fmt.Errorf("repack %s: upload %s: %w", repo, newPack.Key, err)
+		return false, fmt.Errorf("repack %s: upload %s: %w", repo, newPack.Key, err)
 	}
 
 	if r.BeforeSwap != nil {
 		if err := r.BeforeSwap(ctx); err != nil {
-			return fmt.Errorf("repack %s: before-swap hook: %w", repo, err)
+			return false, fmt.Errorf("repack %s: before-swap hook: %w", repo, err)
 		}
 	}
 
@@ -202,7 +248,7 @@ func (r *Repacker) Repack(ctx context.Context, repo string) error {
 		// committed row must be verified against the sweeper race below:
 		// a committed row must never point at missing bytes.
 		verr := verifyPublished(ctx, r.blobs, newPack.Key, packPath)
-		return errors.Join(fmt.Errorf("repack %s: replace packs: %w", repo, err), verr)
+		return false, errors.Join(fmt.Errorf("repack %s: replace packs: %w", repo, err), verr)
 	}
 	if !won {
 		// Cleanly lost fold: delete our own orphan — unless an identical
@@ -215,7 +261,7 @@ func (r *Repacker) Repack(ctx context.Context, repo string) error {
 				"repo", repo, "key", newPack.Key, "err", herr)
 		case has:
 			if verr := verifyPublished(ctx, r.blobs, newPack.Key, packPath); verr != nil {
-				return fmt.Errorf("repack %s: lost fold: %w", repo, verr)
+				return false, fmt.Errorf("repack %s: lost fold: %w", repo, verr)
 			}
 		default:
 			if derr := r.blobs.Delete(ctx, newPack.Key); derr != nil && !errors.Is(derr, blob.ErrNotFound) {
@@ -238,12 +284,12 @@ func (r *Repacker) Repack(ctx context.Context, repo string) error {
 			}
 			if has2 || herr2 != nil {
 				if verr := verifyPublished(ctx, r.blobs, newPack.Key, packPath); verr != nil {
-					return fmt.Errorf("repack %s: lost fold: restore after delete race: %w", repo, verr)
+					return false, fmt.Errorf("repack %s: lost fold: restore after delete race: %w", repo, verr)
 				}
 			}
 		}
 		r.logger.Info("repack: lost fold-install race", "repo", repo, "folded", len(old))
-		return nil
+		return false, nil
 	}
 	// Writer half of the orphan-sweep coordination (issue #5), exactly like
 	// the paths that follow RegisterPacks: a delete-enabled sweeper may
@@ -253,10 +299,10 @@ func (r *Repacker) Repack(ctx context.Context, repo string) error {
 	// recheck racing the transaction. Re-verify — and re-upload from the
 	// local pack file if needed — now that the row is committed.
 	if verr := verifyPublished(ctx, r.blobs, newPack.Key, packPath); verr != nil {
-		return fmt.Errorf("repack %s: %w", repo, verr)
+		return false, fmt.Errorf("repack %s: %w", repo, verr)
 	}
 	r.logger.Info("repack: folded packs", "repo", repo, "folded", len(old), "pack", id)
-	return nil
+	return true, nil
 }
 
 // verifyPublished re-checks (and if needed restores) the consolidated
@@ -266,6 +312,78 @@ func verifyPublished(ctx context.Context, bl blob.BlobStore, key, packPath strin
 		return fmt.Errorf("verify %s: %w", key, err)
 	}
 	return nil
+}
+
+func (r *Repacker) objectBudget() int {
+	if r.MaxFoldObjects > 0 {
+		return r.MaxFoldObjects
+	}
+	return defaultMaxFoldObjects
+}
+
+func (r *Repacker) byteBudget() int64 {
+	if r.MaxFoldBytes > 0 {
+		return r.MaxFoldBytes
+	}
+	return defaultMaxFoldBytes
+}
+
+// selectFoldInput picks the fold's input greedily, oldest-first (ListPacks
+// order), under cumulative object and byte budgets: each pack's exact
+// object count comes from its idx fanout table and its byte size from the
+// materialized .pack file. Skipped packs stay registered untouched — any
+// subset of whole packs folds into a self-contained pack (only
+// reachability trimming was unsafe), so bounding per-fold work never risks
+// correctness, and repeated folds converge oversized repos to
+// O(size/budget) consolidated rows. Cumulative counts overestimate the
+// union (shared objects count twice) — conservative in the safe direction.
+func selectFoldInput(repoPath string, packs []ref.Pack, maxObjects int, maxBytes int64) ([]ref.Pack, error) {
+	assertf(maxObjects > 0 && maxBytes > 0, "selectFoldInput: non-positive budgets %d/%d", maxObjects, maxBytes)
+	var selected []ref.Pack
+	var objects int
+	var size int64
+	for _, p := range packs {
+		base := filepath.Join(repoPath, "objects", "pack", "pack-"+p.ID)
+		count, err := packObjectCount(base + ".idx")
+		if err != nil {
+			return nil, fmt.Errorf("pack %s: %w: %w", p.ID, errFoldInputGone, err)
+		}
+		fi, err := os.Stat(base + ".pack")
+		if err != nil {
+			return nil, fmt.Errorf("pack %s: %w: %w", p.ID, errFoldInputGone, err)
+		}
+		if objects+count > maxObjects || size+fi.Size() > maxBytes {
+			continue // over budget: leave this pack registered as-is
+		}
+		selected = append(selected, p)
+		objects += count
+		size += fi.Size()
+	}
+	return selected, nil
+}
+
+// packObjectCount reads a pack's exact object count from its version-2 idx
+// fanout table (the 256th entry counts all objects) — constant work
+// regardless of pack size. index-pack has written v2 for every pack this
+// server materializes; an unexpected header fails the fold loudly.
+func packObjectCount(idxPath string) (int, error) {
+	f, err := os.Open(idxPath)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = f.Close() }()
+	var hdr [8]byte
+	if _, err := io.ReadFull(f, hdr[:]); err != nil {
+		return 0, fmt.Errorf("read idx header: %w", err)
+	}
+	if !bytes.Equal(hdr[:4], []byte{0xff, 0x74, 0x4f, 0x63}) || binary.BigEndian.Uint32(hdr[4:]) != 2 {
+		return 0, fmt.Errorf("unsupported pack idx format (want v2): header %x", hdr)
+	}
+	var last [4]byte
+	if _, err := f.ReadAt(last[:], 8+255*4); err != nil {
+		return 0, fmt.Errorf("read idx fanout: %w", err)
+	}
+	return int(binary.BigEndian.Uint32(last[:])), nil
 }
 
 // RepackTrigger runs the post-write threshold check (issue #1): callers
@@ -338,9 +456,12 @@ var errFoldInputGone = errors.New("jobs: snapshotted pack not materialized (fold
 
 // packObjectUnion enumerates the union of the snapshotted packs' objects
 // from their .idx files in the hydrated cache repo, sorted ascending (a
-// deterministic pack-objects input). Hydrate ran after the snapshot, so a
-// snapshotted pack can be missing locally only when a concurrent fold
-// removed its row before Hydrate listed — reported as errFoldInputGone.
+// deterministic pack-objects input). show-index output is STREAMED line by
+// line — never buffered whole — so the fold's memory is bounded by the
+// union itself, which selectFoldInput has already capped. Hydrate ran after
+// the snapshot, so a snapshotted pack can be missing locally only when a
+// concurrent fold removed its row before Hydrate listed — reported as
+// errFoldInputGone.
 func packObjectUnion(repoPath string, packs []ref.Pack) ([]string, error) {
 	seen := make(map[string]bool)
 	for _, p := range packs {
@@ -349,20 +470,10 @@ func packObjectUnion(repoPath string, packs []ref.Pack) ([]string, error) {
 		if err != nil {
 			return nil, fmt.Errorf("pack %s: %w: %w", p.ID, errFoldInputGone, err)
 		}
-		out, err := runGitStdin(repoPath, f, "show-index")
+		err = streamShowIndex(repoPath, f, func(sha string) { seen[sha] = true })
 		_ = f.Close()
 		if err != nil {
 			return nil, fmt.Errorf("show-index %s: %w", p.ID, err)
-		}
-		for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
-			if line == "" {
-				continue // empty pack (delete-only push): zero objects
-			}
-			fields := strings.Fields(line)
-			if len(fields) < 2 || !ref.ValidSHA(fields[1]) {
-				return nil, fmt.Errorf("show-index %s: unexpected line %q", p.ID, line)
-			}
-			seen[fields[1]] = true
 		}
 	}
 	objs := make([]string, 0, len(seen))
@@ -371,6 +482,48 @@ func packObjectUnion(repoPath string, packs []ref.Pack) ([]string, error) {
 	}
 	sort.Strings(objs)
 	return objs, nil
+}
+
+// streamShowIndex runs `git show-index` over one idx (fed via stdin) and
+// calls fn per object id, streaming stdout so memory never scales with the
+// pack's object count.
+func streamShowIndex(repoPath string, idx io.Reader, fn func(sha string)) error {
+	cmd := exec.Command("git", "show-index")
+	cmd.Dir = repoPath
+	cmd.Stdin = idx
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return err
+	}
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	sc := bufio.NewScanner(stdout)
+	var scanErr error
+	for sc.Scan() {
+		line := sc.Text()
+		if line == "" {
+			continue // empty pack (delete-only push): zero objects
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 2 || !ref.ValidSHA(fields[1]) {
+			scanErr = fmt.Errorf("unexpected show-index line %q", line)
+			break
+		}
+		fn(fields[1])
+	}
+	if scanErr == nil {
+		scanErr = sc.Err()
+	}
+	// Drain remaining output so Wait never blocks on a full pipe after an
+	// early scan abort, then surface the first failure.
+	_, _ = io.Copy(io.Discard, stdout)
+	if err := cmd.Wait(); err != nil {
+		return fmt.Errorf("git show-index: %w: %s", err, strings.TrimSpace(stderr.String()))
+	}
+	return scanErr
 }
 
 // writeConsolidatedPack writes one self-contained pack holding exactly objs

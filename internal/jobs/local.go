@@ -111,15 +111,18 @@ func (q *Local) EnqueueRepack(_ context.Context, repo string) error {
 
 // runRepack executes fold attempts for repo until no follow-up is pending
 // (or the queue is closing — pending local work dies with the process, the
-// documented trade-off).
+// documented trade-off). A rerun requires the previous attempt to have
+// actually folded: rerunning after a lost race would be the eager retry the
+// design rejects, and rerunning after a no-op would loop pointlessly.
 func (q *Local) runRepack(repo string) {
 	defer q.wg.Done()
 	for {
-		if err := q.repacker.Repack(context.Background(), repo); err != nil {
+		folded, err := q.repacker.Repack(context.Background(), repo)
+		if err != nil {
 			q.logger.Warn("repack failed", "repo", repo, "err", err)
 		}
 		q.mu.Lock()
-		if q.closed || !q.repackPending[repo] {
+		if q.closed || !q.repackPending[repo] || !folded {
 			delete(q.repacking, repo)
 			delete(q.repackPending, repo)
 			q.mu.Unlock()
