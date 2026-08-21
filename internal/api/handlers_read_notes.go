@@ -25,23 +25,24 @@ type rnotesGetResponse struct {
 	RefSHA string `json:"ref_sha"`
 }
 
-// handleGetNote implements GET /api/v1/repos/notes: `sha` (required, full
-// object id — same validation as the notes write surface) plus optional
-// `ref` with the write path's resolution (default refs/notes/commits, bare
-// names under refs/notes/). ref_sha is the notes ref tip from the ref
-// authority; an unborn notes ref or a sha without a note is a 404.
+// handleGetNote implements GET /api/v1/repos/notes: `object_ref` (required,
+// full object id today — same validation as the notes write surface;
+// deprecated alias `sha`) plus optional `notes_ref` (deprecated alias `ref`)
+// with the write path's resolution (default refs/notes/commits, bare names
+// under refs/notes/). ref_sha is the notes ref tip from the ref authority;
+// an unborn notes ref or an object without a note is a 404.
 func (s *server) handleGetNote(w http.ResponseWriter, r *http.Request) {
 	repo, ok := s.resolveReadRepo(w, r)
 	if !ok {
 		return
 	}
 	q := r.URL.Query()
-	sha := q.Get("sha")
+	sha := coreAliasParam(q, "object_ref", "sha")
 	if !ref.ValidSHA(sha) {
-		writeErr(w, http.StatusBadRequest, "sha must be a full 40-hex object id")
+		writeErr(w, http.StatusBadRequest, "object_ref must be a full 40-hex object id")
 		return
 	}
-	targetRef, err := wrefNotesRefName(q.Get("ref"))
+	targetRef, err := wrefNotesRefName(coreAliasParam(q, "notes_ref", "ref"))
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return

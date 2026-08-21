@@ -122,6 +122,42 @@ func TestReadNotesGet(t *testing.T) {
 			resp, body := get(t, "sha="+fx.c1+"&ref="+url.QueryEscape("refs/tags/v1"))
 			coreRequireStatus(t, resp, body, 400)
 		})
+		// Issue #15: upstream deprecated sha/ref in favor of
+		// object_ref/notes_ref; both spellings must work, current name wins.
+		t.Run("object_ref and notes_ref aliases", func(t *testing.T) {
+			resp, body := get(t, "object_ref="+fx.c1)
+			coreRequireStatus(t, resp, body, 200)
+			var got rnotesGetResponse
+			coreDecode(t, body, &got)
+			want := rnotesGetResponse{SHA: fx.c1, Note: "reviewed", RefSHA: fx.commitsTip}
+			if got != want {
+				t.Fatalf("object_ref body = %+v, want %+v", got, want)
+			}
+
+			resp, body = get(t, "object_ref="+fx.c1+"&notes_ref="+url.QueryEscape("reviews/session-a"))
+			coreRequireStatus(t, resp, body, 200)
+			coreDecode(t, body, &got)
+			want = rnotesGetResponse{SHA: fx.c1, Note: "session a", RefSHA: fx.sessionATip}
+			if got != want {
+				t.Fatalf("notes_ref body = %+v, want %+v", got, want)
+			}
+
+			// Both styles at once: the current name wins (the deprecated
+			// values would 404 — c2 has no refs/notes/commits note, and
+			// session-b holds no note for c1).
+			resp, body = get(t, "object_ref="+fx.c1+"&sha="+fx.c2+
+				"&notes_ref="+url.QueryEscape("reviews/session-a")+"&ref="+url.QueryEscape("reviews/session-b"))
+			coreRequireStatus(t, resp, body, 200)
+			coreDecode(t, body, &got)
+			if got != want {
+				t.Fatalf("alias-conflict body = %+v, want %+v (current names win)", got, want)
+			}
+
+			// The effective object_ref value keeps the write surface's
+			// full-40-hex validation.
+			resp, body = get(t, "object_ref="+fx.c1[:8])
+			coreRequireStatus(t, resp, body, 400)
+		})
 	})
 }
 

@@ -767,16 +767,17 @@ func (s *server) handleMergePreview(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	// Optional extension mirroring POST /repos/merge's source_is_ephemeral/
-	// target_is_ephemeral body flags (the vendor SDK never sends these, so
-	// defaults preserve its behavior): resolve either side in the ephemeral
-	// namespace, matching the ephemeral?/ephemeral_base? read-API pattern.
-	sourceEphemeral, err := coreBoolParam(q, "source_ephemeral")
+	// source_is_ephemeral/target_is_ephemeral are the official upstream
+	// query params (mirroring POST /repos/merge's body flags); this server
+	// historically spelled them source_ephemeral/target_ephemeral, kept as
+	// deprecated aliases. The vendor SDK never sends either spelling, so
+	// absent flags preserve its default (persistent-namespace) behavior.
+	sourceEphemeral, err := coreAliasBoolParam(q, "source_is_ephemeral", "source_ephemeral")
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	targetEphemeral, err := coreBoolParam(q, "target_ephemeral")
+	targetEphemeral, err := coreAliasBoolParam(q, "target_is_ephemeral", "target_ephemeral")
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return

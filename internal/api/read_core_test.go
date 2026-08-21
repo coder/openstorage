@@ -575,6 +575,25 @@ func TestReadCoreCommits(t *testing.T) {
 			}
 		})
 
+		// Issue #15: upstream deprecated `branch` in favor of `ref`.
+		t.Run("ref alias deprecates branch", func(t *testing.T) {
+			resp, body := coreGet(t, e, "GET", "/api/v1/repos/commits?ref=feature", fx.token, nil)
+			coreRequireStatus(t, resp, body, 200)
+			var got listCommitsResponse
+			coreDecode(t, body, &got)
+			if len(got.Commits) != 4 || got.Commits[0].SHA != fx.c4 {
+				t.Fatalf("ref=feature commits = %+v", got.Commits)
+			}
+			// Both styles at once: the current name wins (branch=main would
+			// list 3 commits from c3).
+			resp, body = coreGet(t, e, "GET", "/api/v1/repos/commits?ref=feature&branch=main", fx.token, nil)
+			coreRequireStatus(t, resp, body, 200)
+			coreDecode(t, body, &got)
+			if len(got.Commits) != 4 || got.Commits[0].SHA != fx.c4 {
+				t.Fatalf("ref=feature&branch=main commits = %+v (want ref to win)", got.Commits)
+			}
+		})
+
 		t.Run("ephemeral branch", func(t *testing.T) {
 			resp, body := coreGet(t, e, "GET", "/api/v1/repos/commits?branch=scratch&ephemeral=true", fx.token, nil)
 			coreRequireStatus(t, resp, body, 200)
@@ -618,6 +637,24 @@ func TestReadCoreCommits(t *testing.T) {
 			coreRequireStatus(t, resp, body, 404)
 			resp, body = coreGet(t, e, "GET", "/api/v1/repos/commit", fx.token, nil)
 			coreRequireStatus(t, resp, body, 400)
+		})
+
+		// Issue #15: upstream deprecated `sha` in favor of `ref`.
+		t.Run("get commit ref alias deprecates sha", func(t *testing.T) {
+			resp, body := coreGet(t, e, "GET", "/api/v1/repos/commit?ref=main", fx.token, nil)
+			coreRequireStatus(t, resp, body, 200)
+			var got getCommitResponse
+			coreDecode(t, body, &got)
+			if got.Commit.SHA != fx.c3 {
+				t.Errorf("ref=main resolved %s, want %s", got.Commit.SHA, fx.c3)
+			}
+			// Both styles at once: the current name wins.
+			resp, body = coreGet(t, e, "GET", "/api/v1/repos/commit?ref=feature&sha=main", fx.token, nil)
+			coreRequireStatus(t, resp, body, 200)
+			coreDecode(t, body, &got)
+			if got.Commit.SHA != fx.c4 {
+				t.Errorf("ref=feature&sha=main resolved %s, want %s (ref wins)", got.Commit.SHA, fx.c4)
+			}
 		})
 
 		t.Run("signed commit signature and payload", func(t *testing.T) {

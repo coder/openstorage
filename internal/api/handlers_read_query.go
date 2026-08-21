@@ -251,24 +251,36 @@ type commitDiffResponse struct {
 	FilteredFiles []filteredFileEntry `json:"filtered_files"`
 }
 
-// handleDiff implements GET /api/v1/repos/diff. NB: the query params are
-// camelCase (`sha`, `baseSha`, `gitApplyCompatible`, repeatable `path`) —
-// the endpoint's documented quirk; snake_case spellings are unknown params
-// and ignored. Explicit baseSha selects a three-dot comparison: the diff
-// runs from merge-base(baseSha, sha) to sha with merge_base_sha set; without
-// baseSha the diff is against the first parent (root commits: empty tree)
-// and merge_base_sha is empty (openapi: "Empty for single-commit diffs").
+// handleDiff implements GET /api/v1/repos/diff: `ref` and `base_ref` accept
+// any revision (deprecated camelCase aliases `sha`/`baseSha` — the
+// endpoint's historical quirk; note `base_sha` was never a param and stays
+// an ignored unknown). `ref_is_ephemeral`/`base_is_ephemeral` resolve either
+// side in the ephemeral namespace. Explicit base_ref selects a three-dot
+// comparison: the diff runs from merge-base(base_ref, ref) to ref with
+// merge_base_sha set; without base_ref the diff is against the first parent
+// (root commits: empty tree) and merge_base_sha is empty (openapi: "Empty
+// for single-commit diffs").
 func (s *server) handleDiff(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
-	shaParam := strings.TrimSpace(q.Get("sha"))
-	if shaParam == "" {
-		writeErr(w, http.StatusBadRequest, "sha is required")
+	refParam := strings.TrimSpace(coreAliasParam(q, "ref", "sha"))
+	if refParam == "" {
+		writeErr(w, http.StatusBadRequest, "ref is required")
+		return
+	}
+	refEphemeral, err := coreBoolParam(q, "ref_is_ephemeral")
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	baseEphemeral, err := coreBoolParam(q, "base_is_ephemeral")
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	// Validated for shape only: raw output is byte-exact `git diff` patches
 	// in both modes, which already satisfies the apply-compatibility
 	// invariant (see fileDiffEntry).
-	if _, err := coreBoolParam(q, "gitApplyCompatible"); err != nil {
+	if _, err := coreAliasBoolParam(q, "git_apply_compatible", "gitApplyCompatible"); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -282,24 +294,24 @@ func (s *server) handleDiff(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	target, err := gitread.ResolveRef(r.Context(), repoPath, shaParam, false)
+	target, err := gitread.ResolveRef(r.Context(), repoPath, refParam, refEphemeral)
 	if errors.Is(err, gitread.ErrNotFound) {
 		writeErr(w, http.StatusNotFound, "commit not found")
 		return
 	} else if err != nil {
-		s.internalErr(w, r, "resolve diff sha", err)
+		s.internalErr(w, r, "resolve diff ref", err)
 		return
 	}
 
 	base := gitread.EmptyTreeSHA
 	mergeBase := ""
-	if baseParam := strings.TrimSpace(q.Get("baseSha")); baseParam != "" {
-		baseCommit, err := gitread.ResolveRef(r.Context(), repoPath, baseParam, false)
+	if baseParam := strings.TrimSpace(coreAliasParam(q, "base_ref", "baseSha")); baseParam != "" {
+		baseCommit, err := gitread.ResolveRef(r.Context(), repoPath, baseParam, baseEphemeral)
 		if errors.Is(err, gitread.ErrNotFound) {
 			writeErr(w, http.StatusNotFound, "base commit not found")
 			return
 		} else if err != nil {
-			s.internalErr(w, r, "resolve diff baseSha", err)
+			s.internalErr(w, r, "resolve diff base_ref", err)
 			return
 		}
 		mb, found, err := mergeBaseSHA(r.Context(), repoPath, baseCommit, target)
