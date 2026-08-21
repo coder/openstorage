@@ -66,7 +66,10 @@ type RefStore struct {
 
 var _ ref.RefStore = (*RefStore)(nil)
 
-// NewRefStore wraps inner with push-event emission per opts.
+// NewRefStore wraps inner with push-event emission per opts. inner is
+// additionally wrapped in ref.IdempotentCAS, so an ambiguous CAS outcome
+// whose update actually committed is reconciled to a win BELOW this
+// decorator — the push event for it is emitted, not silently dropped.
 func NewRefStore(inner ref.RefStore, opts RefStoreOptions) *RefStore {
 	assertf(inner != nil, "NewRefStore: nil inner store")
 	assertf(opts.Org != "", "NewRefStore: empty org")
@@ -82,7 +85,7 @@ func NewRefStore(inner ref.RefStore, opts RefStoreOptions) *RefStore {
 		logger = slog.Default()
 	}
 	return &RefStore{
-		RefStore:        inner,
+		RefStore:        ref.IdempotentCAS{RefStore: inner},
 		org:             opts.Org,
 		repos:           opts.Repos,
 		webhooks:        opts.Webhooks,
@@ -96,7 +99,9 @@ func NewRefStore(inner ref.RefStore, opts RefStoreOptions) *RefStore {
 // CASRef delegates to the inner store and, on a won update outside the
 // ephemeral namespace, emits the push event + sync poke. Emission uses a
 // cancellation-detached context: the CAS already committed, so a client
-// hanging up mid-response must not lose the event.
+// hanging up mid-response must not lose the event. The inner store is
+// ref.IdempotentCAS-wrapped (see NewRefStore), so a returned error or lost
+// CAS here is already reconciled — skipping emission on it is safe.
 func (s *RefStore) CASRef(ctx context.Context, repo, name, old, new string) (bool, error) {
 	won, err := s.RefStore.CASRef(ctx, repo, name, old, new)
 	if err != nil || !won {

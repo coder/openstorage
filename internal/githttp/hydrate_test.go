@@ -2,10 +2,14 @@ package githttp
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"codestorage/internal/blob"
+	"codestorage/internal/ref"
 )
 
 // SyncRefs must delete local refs that PG does not know about (PG wins).
@@ -181,5 +185,137 @@ func TestHydratePacks_ConcurrentHydratorsSerialize(t *testing.T) {
 		if _, err := os.Stat(idx); err != nil {
 			t.Fatalf("pack %s not indexed: %v", p.ID, err)
 		}
+	}
+}
+
+// scriptedPacks is a RefStore stub whose ListPacks returns successive
+// scripted listings (the last one repeats). Unused RefStore methods panic
+// via the nil embedded interface.
+type scriptedPacks struct {
+	ref.RefStore
+	lists [][]ref.Pack
+	calls int
+}
+
+func (s *scriptedPacks) ListPacks(context.Context, string) ([]ref.Pack, error) {
+	s.calls++
+	if s.calls > len(s.lists) {
+		return s.lists[len(s.lists)-1], nil
+	}
+	return s.lists[s.calls-1], nil
+}
+
+// failDownloads fails every DownloadFile with err. Nothing else is called on
+// the nil embedded interface once the download path errors.
+type failDownloads struct {
+	blob.BlobStore
+	err error
+}
+
+func (f *failDownloads) DownloadFile(context.Context, string, string) error { return f.err }
+
+// buildTestPack repacks a fresh work repo into a single pack file and
+// returns its path (real, index-able pack bytes for hydration tests).
+func buildTestPack(t *testing.T) string {
+	t.Helper()
+	work := initWorkRepo(t)
+	mustGit(t, work, "repack", "-a", "-d")
+	packs, err := filepath.Glob(filepath.Join(work, ".git", "objects", "pack", "*.pack"))
+	if err != nil || len(packs) != 1 {
+		t.Fatalf("repack produced packs %v (err %v), want exactly one", packs, err)
+	}
+	return packs[0]
+}
+
+// A pack blob deleted between ListPacks and download (folded away by a
+// repack) must not fail hydration: the bounded retry re-lists and hydrates
+// the replacement pack (issue #6).
+func TestHydratePacks_RetriesOnMissingPackBlob(t *testing.T) {
+	ctx := context.Background()
+	const repo = "t-hydrate-race"
+
+	bl, err := blob.OpenFile("file://" + t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenFile: %v", err)
+	}
+	defer bl.Close()
+	replacement := ref.Pack{ID: "new", Key: blob.PackKey(repo, "new")}
+	if err := bl.UploadFile(ctx, replacement.Key, buildTestPack(t)); err != nil {
+		t.Fatalf("UploadFile: %v", err)
+	}
+	// The first listing names a pack whose blob no longer exists; the
+	// re-listing after the not-found download carries the replacement.
+	folded := ref.Pack{ID: "old", Key: blob.PackKey(repo, "old")}
+	st := &scriptedPacks{lists: [][]ref.Pack{{folded}, {replacement}}}
+
+	repoPath, err := EnsureCacheRepo(t.TempDir(), repo)
+	if err != nil {
+		t.Fatalf("EnsureCacheRepo: %v", err)
+	}
+	if err := HydratePacks(ctx, st, bl, repoPath, repo); err != nil {
+		t.Fatalf("hydrate across a pack fold failed: %v", err)
+	}
+	if st.calls != 2 {
+		t.Fatalf("ListPacks called %d times, want 2 (initial + one retry)", st.calls)
+	}
+	idx := filepath.Join(repoPath, "objects", "pack", "pack-"+replacement.ID+".idx")
+	if _, err := os.Stat(idx); err != nil {
+		t.Fatalf("replacement pack not indexed: %v", err)
+	}
+}
+
+// A registered pack whose blob is genuinely gone (still listed on every
+// retry) must exhaust the bound and fail with ErrPackMissing — never loop
+// forever, never surface as a generic download failure.
+func TestHydratePacks_MissingPackExhaustsBound(t *testing.T) {
+	ctx := context.Background()
+	const repo = "t-hydrate-gone"
+
+	bl, err := blob.OpenFile("file://" + t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenFile: %v", err)
+	}
+	defer bl.Close()
+	gone := ref.Pack{ID: "gone", Key: blob.PackKey(repo, "gone")}
+	st := &scriptedPacks{lists: [][]ref.Pack{{gone}}}
+
+	repoPath, err := EnsureCacheRepo(t.TempDir(), repo)
+	if err != nil {
+		t.Fatalf("EnsureCacheRepo: %v", err)
+	}
+	err = HydratePacks(ctx, st, bl, repoPath, repo)
+	if !errors.Is(err, ErrPackMissing) {
+		t.Fatalf("hydrate of permanently missing pack = %v, want ErrPackMissing", err)
+	}
+	if st.calls != maxHydrateRaces {
+		t.Fatalf("ListPacks called %d times, want %d (the bound)", st.calls, maxHydrateRaces)
+	}
+	if !strings.Contains(err.Error(), gone.ID) {
+		t.Fatalf("error must name the missing pack %q: %v", gone.ID, err)
+	}
+}
+
+// Transport errors must keep failing fast: no re-list, no retry, and no
+// misclassification as a missing pack.
+func TestHydratePacks_TransportErrorFailsFast(t *testing.T) {
+	ctx := context.Background()
+	const repo = "t-hydrate-transport"
+
+	transportErr := errors.New("connection reset by peer")
+	st := &scriptedPacks{lists: [][]ref.Pack{{{ID: "x", Key: blob.PackKey(repo, "x")}}}}
+
+	repoPath, err := EnsureCacheRepo(t.TempDir(), repo)
+	if err != nil {
+		t.Fatalf("EnsureCacheRepo: %v", err)
+	}
+	err = HydratePacks(ctx, st, &failDownloads{err: transportErr}, repoPath, repo)
+	if !errors.Is(err, transportErr) {
+		t.Fatalf("hydrate with failing transport = %v, want the transport error", err)
+	}
+	if errors.Is(err, ErrPackMissing) {
+		t.Fatalf("transport error misclassified as missing pack: %v", err)
+	}
+	if st.calls != 1 {
+		t.Fatalf("ListPacks called %d times, want 1 (transport errors are not retried)", st.calls)
 	}
 }
