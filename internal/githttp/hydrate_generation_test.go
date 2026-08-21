@@ -220,6 +220,62 @@ func TestHydrate_ConcurrentFullSyncsSerialize(t *testing.T) {
 	}
 }
 
+// TestHydrate_LockWaitHonorsCancellation pins the cancelable lock wait
+// (PR #14 review): a full hydrate parked on the repo-wide hydrate lock must
+// return promptly with the context's error when its client hangs up, not
+// stay pinned until the lock holder finishes.
+func TestHydrate_LockWaitHonorsCancellation(t *testing.T) {
+	st, bl, cacheDir := hydrateEnv(t)
+	const repo = "t-gen-cancel"
+
+	repoPath, err := EnsureCacheRepo(cacheDir, repo)
+	if err != nil {
+		t.Fatalf("EnsureCacheRepo: %v", err)
+	}
+	// Impersonate a stalled hydrate: hold the lock for the whole test.
+	unlock, err := flockExclusive(filepath.Join(repoPath, "codestorage.hydrate.lock"))
+	if err != nil {
+		t.Fatalf("hold hydrate lock: %v", err)
+	}
+	defer unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, refsErr, err := Hydrate(ctx, st, bl, cacheDir, repo)
+		if err == nil {
+			err = refsErr
+		}
+		done <- err
+	}()
+	// Hydrate is past its pre-lock generation read and parked on the lock
+	// (no marker exists, so it cannot short-circuit).
+	waitFor(t, func() bool { _, _, gg := st.counts(); return gg == 1 })
+	time.Sleep(50 * time.Millisecond)
+	select {
+	case err := <-done:
+		t.Fatalf("Hydrate returned before cancel: %v", err)
+	default:
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Hydrate = %v, want context.Canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Hydrate stayed parked on the hydrate lock after cancellation")
+	}
+	// The canceled waiter must not have synced or published anything.
+	if lp, lr, _ := st.counts(); lp != 0 || lr != 0 {
+		t.Fatalf("canceled waiter hit the store: ListPacks=%d ListRefs=%d, want 0/0", lp, lr)
+	}
+	if _, err := os.Stat(filepath.Join(repoPath, generationMarker)); !os.IsNotExist(err) {
+		t.Fatalf("canceled waiter left a marker (stat err %v)", err)
+	}
+}
+
 // waitFor polls cond until it holds (test-scoped; fails after ~5s).
 func waitFor(t *testing.T, cond func() bool) {
 	t.Helper()

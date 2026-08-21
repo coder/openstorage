@@ -251,6 +251,39 @@ func flockExclusive(path string) (unlock func(), err error) {
 	}, nil
 }
 
+// flockExclusiveCtx is flockExclusive with a cancelable wait: LOCK_NB
+// attempts polled against ctx. The repo-wide hydrate lock can be held
+// across slow blob downloads, and a blocking LOCK_EX would pin every
+// goroutine whose client already hung up behind it until the holder
+// finishes (PR #14 review). The per-pack locks stay blocking: their
+// critical sections are one pack's download, and their waiters overlap
+// that same work.
+func flockExclusiveCtx(ctx context.Context, path string) (unlock func(), err error) {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, err
+	}
+	for {
+		err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		if err == nil {
+			return func() { _ = f.Close() }, nil
+		}
+		// EWOULDBLOCK (== EAGAIN): held by someone else. EINTR: attempt
+		// interrupted by a signal. Both keep polling; anything else is a
+		// real failure.
+		if err != syscall.EWOULDBLOCK && err != syscall.EAGAIN && err != syscall.EINTR {
+			_ = f.Close()
+			return nil, err
+		}
+		select {
+		case <-ctx.Done():
+			_ = f.Close()
+			return nil, ctx.Err()
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
+
 // SyncRefs makes the local ref store match PG exactly (PG wins): updates
 // changed refs, deletes locals that PG does not know, and points HEAD at
 // refs/heads/main. Must run after HydratePacks so targets exist locally.
@@ -422,8 +455,10 @@ func Hydrate(ctx context.Context, st ref.RefStore, bl blob.BlobStore, cacheDir, 
 	// Full-sync critical section. The lock file is left in place, like the
 	// per-pack locks: removing it would race a concurrent locker onto a
 	// deleted inode. Lock order is repo hydrate lock -> per-pack locks;
-	// nothing acquires them in the opposite order.
-	unlock, err := flockExclusive(filepath.Join(repoPath, "codestorage.hydrate.lock"))
+	// nothing acquires them in the opposite order. The wait is cancelable:
+	// a request whose client hung up must not stay parked behind a slow
+	// hydrate holding the repo-wide lock.
+	unlock, err := flockExclusiveCtx(ctx, filepath.Join(repoPath, "codestorage.hydrate.lock"))
 	if err != nil {
 		return "", nil, fmt.Errorf("lock hydrate %s: %w", repo, err)
 	}
