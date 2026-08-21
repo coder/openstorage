@@ -158,7 +158,7 @@ func (f *repackFixture) pushEmptyPack(t *testing.T) string {
 // repacker builds a production Repacker over the fixture's stores and cache.
 func (f *repackFixture) repacker(cacheDir string) *Repacker {
 	return NewRepacker(f.store, f.blobs, func(ctx context.Context, repo string) (string, error, error) {
-		return githttp.Hydrate(ctx, f.store, f.blobs, cacheDir, repo)
+		return githttp.Hydrate(ctx, f.store, f.blobs, cacheDir, repo, "main")
 	}, slog.New(slog.DiscardHandler))
 }
 
@@ -178,7 +178,7 @@ func (f *repackFixture) checkColdHydrate(t *testing.T) {
 	t.Helper()
 	ctx := context.Background()
 	coldDir := t.TempDir()
-	repoPath, refsErr, err := githttp.Hydrate(ctx, f.store, f.blobs, coldDir, f.repo)
+	repoPath, refsErr, err := githttp.Hydrate(ctx, f.store, f.blobs, coldDir, f.repo, "main")
 	if err != nil || refsErr != nil {
 		t.Fatalf("cold hydrate: err=%v refsErr=%v", err, refsErr)
 	}
@@ -339,7 +339,7 @@ func TestRepack_AmbiguousSwapKeepsBlob(t *testing.T) {
 	}
 
 	r := NewRepacker(ambiguousReplaceStore{f.store}, f.blobs, func(ctx context.Context, repo string) (string, error, error) {
-		return githttp.Hydrate(ctx, f.store, f.blobs, f.cacheDir, repo)
+		return githttp.Hydrate(ctx, f.store, f.blobs, f.cacheDir, repo, "main")
 	}, slog.New(slog.DiscardHandler))
 	err := r.Repack(ctx, f.repo)
 	if !errors.Is(err, errAmbiguousReplace) {
@@ -457,7 +457,7 @@ func TestRepack_ConcurrentHydratorRetriesOntoFold(t *testing.T) {
 	// swept blobs and must recover via the bounded re-list retry (issue
 	// #6) onto the consolidated pack.
 	coldDir := t.TempDir()
-	repoPath, refsErr, err := githttp.Hydrate(ctx, stale, f.blobs, coldDir, f.repo)
+	repoPath, refsErr, err := githttp.Hydrate(ctx, stale, f.blobs, coldDir, f.repo, "main")
 	if err != nil || refsErr != nil {
 		t.Fatalf("stale-listing hydrate: err=%v refsErr=%v", err, refsErr)
 	}
@@ -487,7 +487,7 @@ func TestRepack_StaleSnapshotLosesCleanlyBeforePacking(t *testing.T) {
 	}
 
 	loser := NewRepacker(stale, f.blobs, func(ctx context.Context, repo string) (string, error, error) {
-		return githttp.Hydrate(ctx, f.store, f.blobs, t.TempDir(), repo) // cold cache
+		return githttp.Hydrate(ctx, f.store, f.blobs, t.TempDir(), repo, "main") // cold cache
 	}, slog.New(slog.DiscardHandler))
 	if err := loser.Repack(ctx, f.repo); err != nil {
 		t.Fatalf("stale-snapshot repack must lose cleanly, got %v", err)

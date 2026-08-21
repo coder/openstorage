@@ -132,10 +132,17 @@ func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL string, orgPEM
 	// store — ReplacePacks is a pack mutation, no ref events to emit — and
 	// the shared blob store and cache dir. Always constructed so durable
 	// jobs queued before a threshold change still run; the post-write
-	// TRIGGER below is what a zero threshold disables.
+	// TRIGGER below is what a zero threshold disables. The default branch
+	// is resolved fresh per fold from the base repo's meta row (issue #18;
+	// namespaced keys share the base repo's row); the fold itself packs
+	// idx-enumerated objects and only needs HEAD placement to be valid.
 	repacker := jobs.NewRepacker(refStore, blobStore,
 		func(ctx context.Context, repo string) (string, error, error) {
-			return githttp.Hydrate(ctx, refStore, blobStore, cacheDir, repo)
+			rec, err := meta.ResolveRepoKey(ctx, ms, org, githttp.BaseRepo(repo))
+			if err != nil {
+				return "", nil, fmt.Errorf("resolve default branch for %s: %w", repo, err)
+			}
+			return githttp.Hydrate(ctx, refStore, blobStore, cacheDir, repo, rec.DefaultBranch)
 		}, logger)
 
 	queue, decorate, queueCleanup, err := buildServeEventing(ctx, ms, dbURL, org, httpBaseURL, key, schedule, repacker, logger)

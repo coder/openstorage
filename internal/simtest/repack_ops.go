@@ -107,7 +107,7 @@ func (s *sim) doRepack(name string, node *simNode, repo *simRepo) error {
 	var swapNew ref.Pack
 	inner := &captureReplace{RefStore: node.simRef, old: &swapOld, new: &swapNew}
 	r := jobs.NewRepacker(inner, node.simBlob, func(ctx context.Context, repoKey string) (string, error, error) {
-		return githttp.Hydrate(ctx, node.simRef, node.simBlob, node.cacheDir, repoKey)
+		return githttp.Hydrate(ctx, node.simRef, node.simBlob, node.cacheDir, repoKey, "main")
 	}, discardLogger())
 
 	mark := s.inj.Seq()
@@ -203,10 +203,10 @@ func (s *sim) doRepackRace(name string, node *simNode, repo *simRepo, branch str
 
 	raceDir := s.raceCacheDir(node)
 	winner := jobs.NewRepacker(s.cl.oracle, s.cl.oracleBl, func(ctx context.Context, repoKey string) (string, error, error) {
-		return githttp.Hydrate(ctx, s.cl.oracle, s.cl.oracleBl, raceDir+"-winner", repoKey)
+		return githttp.Hydrate(ctx, s.cl.oracle, s.cl.oracleBl, raceDir+"-winner", repoKey, "main")
 	}, discardLogger())
 	loser := jobs.NewRepacker(s.cl.oracle, s.cl.oracleBl, func(ctx context.Context, repoKey string) (string, error, error) {
-		return githttp.Hydrate(ctx, s.cl.oracle, s.cl.oracleBl, raceDir+"-loser", repoKey)
+		return githttp.Hydrate(ctx, s.cl.oracle, s.cl.oracleBl, raceDir+"-loser", repoKey, "main")
 	}, discardLogger())
 
 	var loserKey string
