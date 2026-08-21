@@ -4,6 +4,7 @@ package ref
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/url"
 	"regexp"
@@ -24,6 +25,9 @@ var shaRe = regexp.MustCompile(`\A[0-9a-f]{40}\z`)
 
 // ValidSHA reports whether s is a well-formed 40-hex git object id.
 func ValidSHA(s string) bool { return shaRe.MatchString(s) }
+
+// ErrNotFound reports a GetRef miss: the ref does not currently exist.
+var ErrNotFound = errors.New("ref not found")
 
 // assertf is a fail-fast invariant check (crash-and-burn style).
 func assertf(cond bool, format string, args ...any) {
@@ -58,6 +62,10 @@ type RefStore interface {
 	// ListRefsWithMeta returns all refs for repo sorted by name ascending,
 	// including creation timestamps (the read API's branches/tags source).
 	ListRefsWithMeta(ctx context.Context, repo string) ([]RefInfo, error)
+	// GetRef returns the current sha of one ref (a point-read: the
+	// IdempotentCAS recovery recheck must not scan the repo's whole ref
+	// table). Returns ErrNotFound when the ref does not exist.
+	GetRef(ctx context.Context, repo, name string) (string, error)
 	// CASRef performs a compare-and-swap ref update (old/new = ZeroSHA for
 	// create/delete). Returns won=false (no error) when the precondition
 	// failed, i.e. someone else won the race.
@@ -186,6 +194,22 @@ func (s *PG) ListRefsWithMeta(ctx context.Context, repo string) ([]RefInfo, erro
 	return refs, rows.Err()
 }
 
+// GetRef returns the current sha of one ref, or ErrNotFound.
+func (s *PG) GetRef(ctx context.Context, repo, name string) (string, error) {
+	assertf(repo != "" && name != "", "GetRef: empty repo %q or name %q", repo, name)
+	var sha string
+	err := s.pool.QueryRow(ctx,
+		`SELECT sha FROM refs WHERE repo = $1 AND name = $2`, repo, name).Scan(&sha)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", ErrNotFound
+	}
+	if err != nil {
+		return "", err
+	}
+	assertf(ValidSHA(sha), "refs table holds malformed sha %q for %s/%s", sha, repo, name)
+	return sha, nil
+}
+
 // CASRef performs the compare-and-swap ref update. Returns won=false (no
 // error) when the precondition failed, i.e. someone else won the race.
 // Refs only ever change inside these single statements, so a broken/partial
@@ -195,22 +219,40 @@ func (s *PG) CASRef(ctx context.Context, repo, name, old, new string) (won bool,
 	assertf(ValidSHA(new), "CASRef: malformed new sha %q", new)
 	assertf(old != ZeroSHA || new != ZeroSHA, "CASRef: zero -> zero update for %s/%s", repo, name)
 
+	// Acquire explicitly so acquisition failures (pool exhausted, deadline
+	// expired while waiting) are distinguishable from statement failures:
+	// the statement provably never executed, so IdempotentCAS must not
+	// recover such errors (see notExecuted).
+	conn, err := s.pool.Acquire(ctx)
+	if err != nil {
+		return false, fmt.Errorf("cas acquire %s/%s: %w", repo, name, notExecuted(err))
+	}
+	defer conn.Release()
+	// Pre-dispatch guard: a context canceled after acquire but before Exec
+	// sends the statement is definitive non-execution too. (The residual
+	// race — cancellation between this check and the wire write — is
+	// covered by pgconn itself, whose pre-send check returns a
+	// SafeToRetry-tagged contextAlreadyDoneError.)
+	if cerr := ctx.Err(); cerr != nil {
+		return false, fmt.Errorf("cas %s/%s: %w", repo, name, notExecuted(cerr))
+	}
+
 	var tag string
 	var ct interface{ RowsAffected() int64 }
 	switch {
 	case old == ZeroSHA: // create
 		// created_at is set here once; SHA updates below never touch it.
-		c, cerr := s.pool.Exec(ctx,
+		c, cerr := conn.Exec(ctx,
 			`INSERT INTO refs (repo, name, sha, created_at) VALUES ($1, $2, $3, now()) ON CONFLICT DO NOTHING`,
 			repo, name, new)
 		ct, err, tag = c, cerr, "create"
 	case new == ZeroSHA: // delete
-		c, cerr := s.pool.Exec(ctx,
+		c, cerr := conn.Exec(ctx,
 			`DELETE FROM refs WHERE repo = $1 AND name = $2 AND sha = $3`,
 			repo, name, old)
 		ct, err, tag = c, cerr, "delete"
 	default: // update
-		c, cerr := s.pool.Exec(ctx,
+		c, cerr := conn.Exec(ctx,
 			`UPDATE refs SET sha = $1 WHERE repo = $2 AND name = $3 AND sha = $4`,
 			new, repo, name, old)
 		ct, err, tag = c, cerr, "update"
