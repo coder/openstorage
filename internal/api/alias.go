@@ -60,8 +60,9 @@ func aliasRoutes() []aliasRoute {
 		return aliasRoute{method: method, suffix: suffix, v1Path: v1Path, flavor: routeWrite, scopes: scopes}
 	}
 	return []aliasRoute{
-		// Repo root: GET /api/v1/repo and DELETE /api/v1/repos/delete.
+		// Repo root: GET/PATCH /api/v1/repo and DELETE /api/v1/repos/delete.
 		read(http.MethodGet, "", "/api/v1/repo", auth.ScopeGitRead),
+		read(http.MethodPatch, "", "/api/v1/repo", auth.ScopeRepoWrite),
 		read(http.MethodDelete, "", "/api/v1/repos/delete", auth.ScopeRepoWrite),
 
 		// git:read surface (api.go route table).

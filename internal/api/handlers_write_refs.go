@@ -256,7 +256,7 @@ func (s *server) handleCreateBranch(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "base_ref, base_branch, or preferred_base is required")
 		return
 	}
-	repoPath, ok := s.materializeReadRepo(w, r, repo.RepoID)
+	repoPath, ok := s.materializeReadRepo(w, r, repo)
 	if !ok {
 		return
 	}
@@ -455,7 +455,7 @@ func (s *server) handleCreateTag(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "ref is required")
 		return
 	}
-	repoPath, ok := s.materializeReadRepo(w, r, repo.RepoID)
+	repoPath, ok := s.materializeReadRepo(w, r, repo)
 	if !ok {
 		return
 	}
@@ -687,7 +687,7 @@ func (s *server) wrefHandleNote(w http.ResponseWriter, r *http.Request, deleteNo
 		author = *req.Author
 	}
 
-	repoPath, ok := s.materializeReadRepo(w, r, repo.RepoID)
+	repoPath, ok := s.materializeReadRepo(w, r, repo)
 	if !ok {
 		return
 	}

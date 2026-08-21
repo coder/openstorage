@@ -215,8 +215,8 @@ func serviceScope(service string) string {
 // on the read path (stale advertisement would break clone correctness) but
 // tolerated on the receive path, where a concurrent receive-pack may hold
 // ref locks and git re-validates client old-SHAs itself.
-func (s *Server) hydrate(ctx context.Context, repo, service string) (string, error) {
-	repoPath, refsErr, err := Hydrate(ctx, s.Store, s.Blob, s.CacheDir, repo)
+func (s *Server) hydrate(ctx context.Context, repo, service, defaultBranch string) (string, error) {
+	repoPath, refsErr, err := Hydrate(ctx, s.Store, s.Blob, s.CacheDir, repo, defaultBranch)
 	if err != nil {
 		return "", err
 	}
@@ -254,7 +254,7 @@ func (s *Server) handleInfoRefs(w http.ResponseWriter, r *http.Request, repo str
 		httpError(w, http.StatusNotFound, "repository not found")
 		return
 	}
-	repoPath, err := s.hydrate(r.Context(), target.key, service)
+	repoPath, err := s.hydrate(r.Context(), target.key, service, target.repo.DefaultBranch)
 	if err != nil {
 		log.Printf("hydrate %s: %v", target.key, err)
 		httpError(w, http.StatusInternalServerError, "hydration failed")
@@ -297,7 +297,7 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 		httpError(w, http.StatusNotFound, "repository not found")
 		return
 	}
-	repoPath, err := s.hydrate(r.Context(), target.key, service)
+	repoPath, err := s.hydrate(r.Context(), target.key, service, target.repo.DefaultBranch)
 	if err != nil {
 		log.Printf("hydrate %s: %v", target.key, err)
 		httpError(w, http.StatusInternalServerError, "hydration failed")

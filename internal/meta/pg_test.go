@@ -417,6 +417,58 @@ func testSoftDeleteRepo(t *testing.T, s Backend) {
 	}
 }
 
+func TestUpdateRepoDefaultBranch(t *testing.T) { runBackends(t, testUpdateRepoDefaultBranch) }
+
+func testUpdateRepoDefaultBranch(t *testing.T, s Backend) {
+	ctx := t.Context()
+	org := seedOrg(t, s)
+	const url = "github.com/acme/patched"
+
+	if _, err := s.CreateRepo(ctx, org, url, "main"); err != nil {
+		t.Fatalf("CreateRepo: %v", err)
+	}
+
+	// CAS win: the expected old value matches the row.
+	won, err := s.UpdateRepoDefaultBranch(ctx, org, url, "main", "dev")
+	if err != nil || !won {
+		t.Fatalf("UpdateRepoDefaultBranch(main->dev) = (won=%v, err=%v), want won", won, err)
+	}
+	got, err := s.GetRepoByURL(ctx, org, url)
+	if err != nil || got.DefaultBranch != "dev" {
+		t.Fatalf("after CAS: repo = %+v (err %v), want default_branch dev", got, err)
+	}
+
+	// CAS loss: the expected old value is stale — no error, no write.
+	won, err = s.UpdateRepoDefaultBranch(ctx, org, url, "main", "other")
+	if err != nil || won {
+		t.Fatalf("stale CAS = (won=%v, err=%v), want lost without error", won, err)
+	}
+	if got, _ := s.GetRepoByURL(ctx, org, url); got.DefaultBranch != "dev" {
+		t.Fatalf("lost CAS wrote: default_branch = %q, want dev", got.DefaultBranch)
+	}
+
+	// Idempotent same-value CAS wins (old == row == new).
+	if won, err := s.UpdateRepoDefaultBranch(ctx, org, url, "dev", "dev"); err != nil || !won {
+		t.Fatalf("same-value CAS = (won=%v, err=%v), want won", won, err)
+	}
+
+	// Absent repo / unknown org -> ErrNotFound.
+	if _, err := s.UpdateRepoDefaultBranch(ctx, org, "github.com/acme/absent", "main", "dev"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("absent repo err = %v, want ErrNotFound", err)
+	}
+	if _, err := s.UpdateRepoDefaultBranch(ctx, "no-such-org", url, "main", "dev"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("unknown org err = %v, want ErrNotFound", err)
+	}
+
+	// Soft-deleted repo -> ErrNotFound even when the old value matches.
+	if _, err := s.SoftDeleteRepo(ctx, org, url); err != nil {
+		t.Fatalf("SoftDeleteRepo: %v", err)
+	}
+	if _, err := s.UpdateRepoDefaultBranch(ctx, org, url, "dev", "main"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("deleted repo err = %v, want ErrNotFound", err)
+	}
+}
+
 // listAll walks pages of pageSize until exhaustion, asserting cursor/HasMore
 // invariants, and returns every row seen plus the page sizes.
 func listAll(t *testing.T, s Backend, org, q string, pageSize int) ([]Repo, []int) {

@@ -316,10 +316,25 @@ func flockExclusiveCtx(ctx context.Context, path string) (unlock func(), err err
 	}
 }
 
+// HeadTarget qualifies a repo's recorded default branch into the HEAD
+// symref target its cache repo advertises (openapi.yaml PATCH repo: `main`
+// becomes `refs/heads/main`; a value that already starts with `refs/` is
+// used verbatim).
+func HeadTarget(defaultBranch string) string {
+	assertf(defaultBranch != "", "HeadTarget: empty default branch")
+	assertf(!strings.ContainsAny(defaultBranch, " \t\n"), "HeadTarget: default branch %q contains whitespace", defaultBranch)
+	if strings.HasPrefix(defaultBranch, "refs/") {
+		return defaultBranch
+	}
+	return "refs/heads/" + defaultBranch
+}
+
 // SyncRefs makes the local ref store match PG exactly (PG wins): updates
 // changed refs, deletes locals that PG does not know, and points HEAD at
-// refs/heads/main. Must run after HydratePacks so targets exist locally.
-func SyncRefs(repoPath string, want map[string]string) error {
+// headTarget (the repo's default branch per the meta row, qualified by
+// HeadTarget). Must run after HydratePacks so targets exist locally.
+func SyncRefs(repoPath string, want map[string]string, headTarget string) error {
+	assertf(strings.HasPrefix(headTarget, "refs/"), "SyncRefs: unqualified HEAD target %q", headTarget)
 	out, err := runGit(repoPath, "for-each-ref", "--format=%(refname) %(objectname)")
 	if err != nil {
 		return err
@@ -372,8 +387,9 @@ func SyncRefs(repoPath string, want map[string]string) error {
 			return err
 		}
 	}
-	// HEAD always points at main (default branch handling is a later phase).
-	if _, err := runGit(repoPath, "symbolic-ref", "HEAD", "refs/heads/main"); err != nil {
+	// HEAD follows the meta row's default branch (issue #18). git tolerates
+	// a dangling target: an unborn default branch advertises no HEAD.
+	if _, err := runGit(repoPath, "symbolic-ref", "HEAD", headTarget); err != nil {
 		return err
 	}
 	return nil
@@ -397,31 +413,40 @@ func updateRefStdin(repoPath, commands string) error {
 // refs are unchanged and Hydrate can skip pack listing and ref sync
 // entirely. The TTL forces a periodic full sync regardless, bounding the
 // staleness of any missed bump or lost marker-ordering race to one window.
+//
+// The marker's second field is the HEAD symref target that hydrate synced
+// (issue #18): the default branch lives in the meta row, whose changes bump
+// no ref-store generation, so the short-circuit must additionally prove
+// HEAD is unchanged. A PATCH /repo therefore defeats the short-circuit on
+// every node the moment its next request compares the freshly resolved
+// default branch against the marker. Markers written by binaries that
+// predate the field fail parsing (ok=false) and cost exactly one full sync.
 const (
 	generationMarker    = "codestorage.generation"
 	generationMarkerTTL = 5 * time.Minute
 )
 
-// readGenerationMarker returns the marker's recorded generation and whether
-// its mtime — refreshed only by full successful hydrates, never by
-// short-circuited ones — is still within the TTL window. ok=false means no
-// usable marker (missing, malformed, or unreadable): callers full-hydrate,
-// and the next success rewrites it.
-func readGenerationMarker(repoPath string) (gen int64, fresh bool, ok bool) {
+// readGenerationMarker returns the marker's recorded generation and HEAD
+// target, and whether its mtime — refreshed only by full successful
+// hydrates, never by short-circuited ones — is still within the TTL window.
+// ok=false means no usable marker (missing, malformed, or unreadable):
+// callers full-hydrate, and the next success rewrites it.
+func readGenerationMarker(repoPath string) (gen int64, head string, fresh bool, ok bool) {
 	path := filepath.Join(repoPath, generationMarker)
 	fi, err := os.Stat(path)
 	if err != nil {
-		return 0, false, false
+		return 0, "", false, false
 	}
 	b, err := os.ReadFile(path)
 	if err != nil {
-		return 0, false, false
+		return 0, "", false, false
 	}
-	gen, perr := strconv.ParseInt(strings.TrimSpace(string(b)), 10, 64)
-	if perr != nil || gen < 0 {
-		return 0, false, false
+	genField, head, found := strings.Cut(strings.TrimSpace(string(b)), " ")
+	gen, perr := strconv.ParseInt(genField, 10, 64)
+	if !found || perr != nil || gen < 0 || !strings.HasPrefix(head, "refs/") {
+		return 0, "", false, false
 	}
-	return gen, time.Since(fi.ModTime()) < generationMarkerTTL, true
+	return gen, head, time.Since(fi.ModTime()) < generationMarkerTTL, true
 }
 
 // writeGenerationMarker persists gen via temp file + rename: concurrent
@@ -430,14 +455,15 @@ func readGenerationMarker(repoPath string) (gen int64, fresh bool, ok bool) {
 // Best-effort by design — on failure the marker is simply absent or stale
 // and the next hydrate does the full sync; a lost write can cost work but
 // never staleness.
-func writeGenerationMarker(repoPath string, gen int64) {
+func writeGenerationMarker(repoPath string, gen int64, head string) {
 	assertf(gen >= 0, "writeGenerationMarker: negative generation %d", gen)
+	assertf(strings.HasPrefix(head, "refs/"), "writeGenerationMarker: unqualified HEAD target %q", head)
 	tmp, err := os.CreateTemp(repoPath, generationMarker+".tmp-*")
 	if err != nil {
 		return
 	}
 	defer func() { _ = os.Remove(tmp.Name()) }() // no-op after a successful rename
-	if _, err := fmt.Fprintf(tmp, "%d\n", gen); err != nil {
+	if _, err := fmt.Fprintf(tmp, "%d %s\n", gen, head); err != nil {
 		_ = tmp.Close()
 		return
 	}
@@ -454,14 +480,21 @@ func writeGenerationMarker(repoPath string, gen int64) {
 // is fatal (upload path) or tolerable staleness (receive path, where git
 // re-validates old SHAs itself).
 //
-// Fast path (issue #4): when the store generation matches the local marker
+// Fast path (issue #4): when the store generation AND the HEAD symref
+// target derived from defaultBranch (issue #18) match the local marker
 // written by the last fully successful hydrate — and the marker is within
-// its TTL — the packs and refs are provably unchanged and Hydrate returns
-// after one point-read, skipping ListPacks, per-pack stats, ListRefs, and
-// the for-each-ref/update-ref/symbolic-ref subprocesses. EnsureCacheRepo
-// still runs unconditionally: hook and config repair must stay verified on
-// every request (the hook script embeds this binary's path, which changes
-// across deployments), and it touches no DB state.
+// its TTL — the packs, refs, and HEAD are provably unchanged and Hydrate
+// returns after one point-read, skipping ListPacks, per-pack stats,
+// ListRefs, and the for-each-ref/update-ref/symbolic-ref subprocesses.
+// EnsureCacheRepo still runs unconditionally: hook and config repair must
+// stay verified on every request (the hook script embeds this binary's
+// path, which changes across deployments), and it touches no DB state.
+//
+// defaultBranch is the repo's default branch as resolved from the meta row
+// for THIS request. A PATCH /repo landing after that read can transiently
+// lose to this hydrate's older value (each full sync records the HEAD it
+// actually set, so the marker never lies), and the next request — which
+// resolves the row fresh — repairs HEAD with one full sync.
 //
 // Full syncs serialize per repo on <repoPath>/codestorage.hydrate.lock:
 // two overlapping full hydrates spanning a mutation could otherwise
@@ -472,7 +505,8 @@ func writeGenerationMarker(repoPath string, gen int64) {
 // before releasing, so marker and refs advance monotonically together. The
 // marker read stays lock-free (temp+rename keeps it atomic): the idle fast
 // path must not serialize on an exclusive lock.
-func Hydrate(ctx context.Context, st ref.RefStore, bl blob.BlobStore, cacheDir, repo string) (repoPath string, refsErr error, err error) {
+func Hydrate(ctx context.Context, st ref.RefStore, bl blob.BlobStore, cacheDir, repo, defaultBranch string) (repoPath string, refsErr error, err error) {
+	headTarget := HeadTarget(defaultBranch)
 	repoPath, err = EnsureCacheRepo(cacheDir, repo)
 	if err != nil {
 		return "", nil, err
@@ -481,7 +515,7 @@ func Hydrate(ctx context.Context, st ref.RefStore, bl blob.BlobStore, cacheDir, 
 	if err != nil {
 		return "", nil, err
 	}
-	if markerGen, fresh, ok := readGenerationMarker(repoPath); ok && fresh && markerGen == gen {
+	if markerGen, markerHead, fresh, ok := readGenerationMarker(repoPath); ok && fresh && markerGen == gen && markerHead == headTarget {
 		return repoPath, nil, nil
 	}
 	// Full-sync critical section. The lock file is left in place, like the
@@ -506,7 +540,7 @@ func Hydrate(ctx context.Context, st ref.RefStore, bl blob.BlobStore, cacheDir, 
 	if err != nil {
 		return "", nil, err
 	}
-	if markerGen, fresh, ok := readGenerationMarker(repoPath); ok && fresh && markerGen == gen {
+	if markerGen, markerHead, fresh, ok := readGenerationMarker(repoPath); ok && fresh && markerGen == gen && markerHead == headTarget {
 		return repoPath, nil, nil
 	}
 	if err := HydratePacks(ctx, st, bl, repoPath, repo); err != nil {
@@ -517,7 +551,7 @@ func Hydrate(ctx context.Context, st ref.RefStore, bl blob.BlobStore, cacheDir, 
 		return "", nil, err
 	}
 	for attempt := 0; attempt < 3; attempt++ {
-		if refsErr = SyncRefs(repoPath, refs); refsErr == nil {
+		if refsErr = SyncRefs(repoPath, refs, headTarget); refsErr == nil {
 			break
 		}
 		time.Sleep(50 * time.Millisecond)
@@ -527,7 +561,7 @@ func Hydrate(ctx context.Context, st ref.RefStore, bl blob.BlobStore, cacheDir, 
 		// the marker — and strictly before the lock releases, so the next
 		// locker's recheck sees exactly the state this sync produced. The
 		// rename also refreshes the mtime, restarting the TTL window.
-		writeGenerationMarker(repoPath, gen)
+		writeGenerationMarker(repoPath, gen, headTarget)
 	}
 	return repoPath, refsErr, nil
 }

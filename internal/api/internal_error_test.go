@@ -42,6 +42,10 @@ func (f failingStore) GetRepoByID(context.Context, string, string) (meta.Repo, e
 	return meta.Repo{}, f.err
 }
 
+func (f failingStore) UpdateRepoDefaultBranch(context.Context, string, string, string, string) (bool, error) {
+	return false, f.err
+}
+
 func (f failingStore) SoftDeleteRepo(context.Context, string, string) (meta.Repo, error) {
 	return meta.Repo{}, f.err
 }

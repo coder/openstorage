@@ -70,7 +70,7 @@ func TestMaterialize(t *testing.T) {
 	}
 
 	cacheDir := t.TempDir()
-	repoPath, err := Materialize(ctx, st, bl, cacheDir, repoID)
+	repoPath, err := Materialize(ctx, st, bl, cacheDir, repoID, "main")
 	if err != nil {
 		t.Fatalf("Materialize: %v", err)
 	}
@@ -88,7 +88,7 @@ func TestMaterialize(t *testing.T) {
 	if won, err := st.CASRef(ctx, repoID, "refs/heads/main", f.c2, f.c1); err != nil || !won {
 		t.Fatalf("move main ref: won=%v err=%v", won, err)
 	}
-	repoPath2, err := Materialize(ctx, st, bl, cacheDir, repoID)
+	repoPath2, err := Materialize(ctx, st, bl, cacheDir, repoID, "main")
 	if err != nil {
 		t.Fatalf("re-Materialize: %v", err)
 	}
@@ -106,7 +106,7 @@ func TestMaterialize(t *testing.T) {
 	if won, err := st.CASRef(ctx, repoID, "refs/heads/broken", ref.ZeroSHA, missing); err != nil || !won {
 		t.Fatalf("seed broken ref: won=%v err=%v", won, err)
 	}
-	if _, err := Materialize(ctx, st, bl, cacheDir, repoID); err == nil {
+	if _, err := Materialize(ctx, st, bl, cacheDir, repoID, "main"); err == nil {
 		t.Fatal("Materialize succeeded despite a ref to a missing object")
 	}
 }
@@ -133,7 +133,7 @@ func TestMaterializeUnknownRepo(t *testing.T) {
 		t.Fatalf("ensure bucket: %v", err)
 	}
 
-	repoPath, err := Materialize(ctx, st, bl, t.TempDir(), "never-pushed")
+	repoPath, err := Materialize(ctx, st, bl, t.TempDir(), "never-pushed", "main")
 	if err != nil {
 		t.Fatalf("Materialize(empty repo): %v", err)
 	}

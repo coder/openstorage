@@ -146,7 +146,7 @@ func (s *server) handleForkRepo(w http.ResponseWriter, r *http.Request, verifier
 	}
 	assertf(srcRepo.RepoID != "", "store returned repo with empty RepoID")
 
-	srcPath, err := gitread.Materialize(ctx, s.refStore, s.blobStore, s.cacheDir, srcRepo.RepoID)
+	srcPath, err := gitread.Materialize(ctx, s.refStore, s.blobStore, s.cacheDir, srcRepo.RepoID, srcRepo.DefaultBranch)
 	if err != nil {
 		s.internalErr(w, r, "materialize fork source", err)
 		return

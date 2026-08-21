@@ -48,7 +48,7 @@ func (s *sim) doHydrate(name string, node *simNode, repo *simRepo, withNotFound 
 	}
 
 	mark := s.inj.Seq()
-	repoPath, refsErr, err := githttp.Hydrate(ctx, node.simRef, node.simBlob, node.cacheDir, repo.key)
+	repoPath, refsErr, err := githttp.Hydrate(ctx, node.simRef, node.simBlob, node.cacheDir, repo.key, "main")
 	evs, _ := s.inj.FiredSince(mark)
 
 	outcome := "ok"
@@ -159,7 +159,7 @@ func (s *sim) checkFull() error {
 	coldDir := filepath.Join(s.dir, fmt.Sprintf("oracle-cold-%04d", s.step))
 	defer os.RemoveAll(coldDir)
 	for _, r := range s.repos {
-		repoPath, refsErr, err := githttp.Hydrate(ctx, s.cl.oracle, s.cl.oracleBl, coldDir, r.key)
+		repoPath, refsErr, err := githttp.Hydrate(ctx, s.cl.oracle, s.cl.oracleBl, coldDir, r.key, "main")
 		if err != nil || refsErr != nil {
 			s.violate("step %d: invariant (a): cold hydrate of %s failed on clean stores: err=%v refsErr=%v",
 				s.step, r.key, err, refsErr)

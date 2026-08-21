@@ -837,7 +837,7 @@ func (s *server) handleCommitPack(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	repoPath, err := gitread.Materialize(r.Context(), s.refStore, s.blobStore, s.cacheDir, repo.RepoID)
+	repoPath, err := gitread.Materialize(r.Context(), s.refStore, s.blobStore, s.cacheDir, repo.RepoID, repo.DefaultBranch)
 	if err != nil {
 		s.wcInternal(w, r, "materialize repository", err)
 		return
@@ -1043,7 +1043,7 @@ func (s *server) handleDiffCommit(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	repoPath, err := gitread.Materialize(r.Context(), s.refStore, s.blobStore, s.cacheDir, repo.RepoID)
+	repoPath, err := gitread.Materialize(r.Context(), s.refStore, s.blobStore, s.cacheDir, repo.RepoID, repo.DefaultBranch)
 	if err != nil {
 		s.wcInternal(w, r, "materialize repository", err)
 		return
@@ -1227,7 +1227,7 @@ func (s *server) handleRestoreCommit(w http.ResponseWriter, r *http.Request) {
 			md.TargetBranch, ref.ZeroSHA)
 		return
 	}
-	repoPath, err := gitread.Materialize(r.Context(), s.refStore, s.blobStore, s.cacheDir, repo.RepoID)
+	repoPath, err := gitread.Materialize(r.Context(), s.refStore, s.blobStore, s.cacheDir, repo.RepoID, repo.DefaultBranch)
 	if err != nil {
 		s.wcInternal(w, r, "materialize repository", err)
 		return

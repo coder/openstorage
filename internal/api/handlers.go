@@ -210,6 +210,105 @@ func (s *server) handleGetRepo(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// patchRepoRequest is the PATCH /repo body: default_branch is the only
+// supported setting (openapi.yaml update_repo).
+type patchRepoRequest struct {
+	DefaultBranch string `json:"default_branch"`
+}
+
+// patchRepoResponse mirrors the live-spec PATCH schema exactly: repo_id and
+// repo_name plus their deprecated mirrors, and the branch name now recorded
+// as the default — unlike GET /repo's repoEntry, no created_at.
+type patchRepoResponse struct {
+	RepoID        string `json:"repo_id"`
+	ID            string `json:"id"` // deprecated: mirrors repo_id
+	RepoName      string `json:"repo_name"`
+	URL           string `json:"url"` // deprecated: mirrors repo_name
+	DefaultBranch string `json:"default_branch"`
+}
+
+// handlePatchRepo implements PATCH /api/v1/repo (scope repo:write): change
+// the default branch of the JWT `repo` claim's repository (openapi.yaml
+// update_repo). The row update is a CAS against the default branch read in
+// this request (upstream: "a transactional compare-and-swap"; a concurrent
+// change is a 409). The upstream gateway qualifies `main` to the symref
+// target `refs/heads/main`, so an input already carrying the refs/heads/
+// prefix folds to its short name before validation; the call never creates
+// the branch, and a default branch pointing at nothing would advertise a
+// dangling clone HEAD — unknown branches are rejected like the other branch
+// write routes (404). Cache-repo HEADs follow on the next hydrate: the
+// hydrate marker records the synced HEAD target, so a changed default
+// branch defeats the issue-#4 short-circuit (githttp/hydrate.go).
+func (s *server) handlePatchRepo(w http.ResponseWriter, r *http.Request) {
+	claims := mustClaims(r)
+	// docs/02: ref policies apply to every HTTP write endpoint. Changing
+	// the default branch moves no refs, so any well-formed policy allows
+	// it — but a malformed policy claim fails closed (mirrors create).
+	if _, err := refPolicies(claims); err != nil {
+		writeErr(w, http.StatusForbidden, err.Error())
+		return
+	}
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBodyBytes))
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "read request body: "+err.Error())
+		return
+	}
+	var req patchRepoRequest
+	if len(body) > 0 {
+		if err := json.Unmarshal(body, &req); err != nil {
+			writeErr(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
+			return
+		}
+	}
+	branch := strings.TrimPrefix(req.DefaultBranch, "refs/heads/")
+	if branch == "" {
+		// openapi.yaml: the body is required and default_branch must be a
+		// non-empty branch name.
+		writeErr(w, http.StatusBadRequest, "default_branch is required")
+		return
+	}
+	// A remaining refs/ prefix is a non-branch ref (refs/tags/...), which
+	// can never satisfy the branch-existence check below.
+	if strings.HasPrefix(branch, "refs/") || !validBranchName(branch) {
+		writeErr(w, http.StatusBadRequest, "invalid default_branch")
+		return
+	}
+	// ADR-21: the repo claim carries the url or the repo_id; resolve either
+	// (resolveRepo writes the 404/500 itself).
+	repo, ok := s.resolveRepo(w, r)
+	if !ok {
+		return
+	}
+	if _, err := s.refStore.GetRef(r.Context(), repo.RepoID, "refs/heads/"+branch); err != nil {
+		if errors.Is(err, ref.ErrNotFound) {
+			writeErr(w, http.StatusNotFound, "branch not found")
+			return
+		}
+		s.internalErr(w, r, "resolve default branch", err)
+		return
+	}
+	won, err := s.store.UpdateRepoDefaultBranch(r.Context(), claims.Iss, repo.URL, repo.DefaultBranch, branch)
+	switch {
+	case errors.Is(err, meta.ErrNotFound):
+		// The repo was soft-deleted between the read above and the CAS.
+		writeErr(w, http.StatusNotFound, "repository not found")
+		return
+	case err != nil:
+		s.internalErr(w, r, "update default branch", err)
+		return
+	case !won:
+		writeErr(w, http.StatusConflict, "default branch was modified concurrently, please retry")
+		return
+	}
+	writeJSON(w, http.StatusOK, patchRepoResponse{
+		RepoID:        repo.RepoID,
+		ID:            repo.RepoID,
+		RepoName:      repo.URL,
+		URL:           repo.URL,
+		DefaultBranch: branch,
+	})
+}
+
 // baseRepoEntry is the GET-response `base_repo` object (docs/03): the
 // upstream coordinates a synced repo mirrors.
 type baseRepoEntry struct {

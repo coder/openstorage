@@ -116,7 +116,7 @@ func hydrateEnv(t *testing.T) (*countingStore, blob.BlobStore, string) {
 // mustHydrate runs Hydrate and fails the test on either error return.
 func mustHydrate(t *testing.T, st ref.RefStore, bl blob.BlobStore, cacheDir, repo string) string {
 	t.Helper()
-	repoPath, refsErr, err := Hydrate(context.Background(), st, bl, cacheDir, repo)
+	repoPath, refsErr, err := Hydrate(context.Background(), st, bl, cacheDir, repo, "main")
 	if err != nil || refsErr != nil {
 		t.Fatalf("Hydrate = (refsErr %v, err %v), want clean", refsErr, err)
 	}
@@ -140,8 +140,8 @@ func TestHydrate_ShortCircuitsOnUnchangedGeneration(t *testing.T) {
 	if lp, lr, _ := st.counts(); lp != 1 || lr != 1 {
 		t.Fatalf("first hydrate: ListPacks=%d ListRefs=%d, want 1/1 (full sync)", lp, lr)
 	}
-	if got := markerContent(t, repoPath); got != "7" {
-		t.Fatalf("marker = %q, want \"7\"", got)
+	if got := markerContent(t, repoPath); got != "7 refs/heads/main" {
+		t.Fatalf("marker = %q, want \"7 refs/heads/main\"", got)
 	}
 
 	// Idle repo, back-to-back reads: one generation point-read each, zero
@@ -162,6 +162,44 @@ func TestHydrate_ShortCircuitsOnUnchangedGeneration(t *testing.T) {
 	}
 }
 
+// A default-branch change must defeat the short-circuit even when the
+// ref-store generation is unchanged (issue #18): default-branch updates
+// live in the meta row and bump no generation, so the marker additionally
+// records the HEAD target the last full sync wrote, and a mismatch forces
+// a full sync that repoints HEAD.
+func TestHydrate_DefaultBranchChangeInvalidatesShortCircuit(t *testing.T) {
+	st, bl, cacheDir := hydrateEnv(t)
+	const repo = "t-gen-head"
+
+	repoPath := mustHydrate(t, st, bl, cacheDir, repo) // full sync, HEAD -> main
+	if lp, lr, _ := st.counts(); lp != 1 || lr != 1 {
+		t.Fatalf("first hydrate: ListPacks=%d ListRefs=%d, want 1/1 (full sync)", lp, lr)
+	}
+
+	// Unchanged generation + fresh marker + changed default branch: the
+	// hydrate must do a full sync and repoint HEAD.
+	if _, refsErr, err := Hydrate(context.Background(), st, bl, cacheDir, repo, "dev"); err != nil || refsErr != nil {
+		t.Fatalf("Hydrate(dev) = (refsErr %v, err %v), want clean", refsErr, err)
+	}
+	if lp, lr, _ := st.counts(); lp != 2 || lr != 2 {
+		t.Fatalf("after default-branch change: ListPacks=%d ListRefs=%d, want 2/2 (full sync)", lp, lr)
+	}
+	if out, err := runGit(repoPath, "symbolic-ref", "HEAD"); err != nil || strings.TrimSpace(out) != "refs/heads/dev" {
+		t.Fatalf("HEAD = %q (err %v), want refs/heads/dev", strings.TrimSpace(out), err)
+	}
+	if got := markerContent(t, repoPath); got != "7 refs/heads/dev" {
+		t.Fatalf("marker = %q, want \"7 refs/heads/dev\"", got)
+	}
+
+	// Same branch again: the short-circuit is restored (no store scans).
+	if _, refsErr, err := Hydrate(context.Background(), st, bl, cacheDir, repo, "dev"); err != nil || refsErr != nil {
+		t.Fatalf("Hydrate(dev, again) = (refsErr %v, err %v), want clean", refsErr, err)
+	}
+	if lp, lr, _ := st.counts(); lp != 2 || lr != 2 {
+		t.Fatalf("unchanged-branch rehydrate hit the store: ListPacks=%d ListRefs=%d, want 2/2", lp, lr)
+	}
+}
+
 // TestHydrate_ConcurrentFullSyncsSerialize pins the fix for the marker
 // ordering race (PR #14 review): overlapping full hydrates spanning a
 // mutation must serialize on the per-repo hydrate lock, so an older ref
@@ -176,7 +214,7 @@ func TestHydrate_ConcurrentFullSyncsSerialize(t *testing.T) {
 
 	aDone := make(chan error, 1)
 	go func() {
-		_, refsErr, err := Hydrate(context.Background(), st, bl, cacheDir, repo)
+		_, refsErr, err := Hydrate(context.Background(), st, bl, cacheDir, repo, "main")
 		if err == nil {
 			err = refsErr
 		}
@@ -190,7 +228,7 @@ func TestHydrate_ConcurrentFullSyncsSerialize(t *testing.T) {
 	st.setGen(8)
 	bDone := make(chan error, 1)
 	go func() {
-		_, refsErr, err := Hydrate(context.Background(), st, bl, cacheDir, repo)
+		_, refsErr, err := Hydrate(context.Background(), st, bl, cacheDir, repo, "main")
 		if err == nil {
 			err = refsErr
 		}
@@ -216,8 +254,8 @@ func TestHydrate_ConcurrentFullSyncsSerialize(t *testing.T) {
 	// B ran strictly after A: it re-read the generation under the lock (8),
 	// full-synced, and published last — marker must hold the NEWEST
 	// generation, matching the refs actually in the cache.
-	if got := markerContent(t, RepoPath(cacheDir, repo)); got != "8" {
-		t.Fatalf("marker = %q, want \"8\" (newest sync publishes last)", got)
+	if got := markerContent(t, RepoPath(cacheDir, repo)); got != "8 refs/heads/main" {
+		t.Fatalf("marker = %q, want \"8 refs/heads/main\" (newest sync publishes last)", got)
 	}
 	if lp, lr, _ := st.counts(); lp != 2 || lr != 2 {
 		t.Fatalf("ListPacks=%d ListRefs=%d, want 2/2 (exactly one full sync each)", lp, lr)
@@ -246,7 +284,7 @@ func TestHydrate_LockWaitHonorsCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
-		_, refsErr, err := Hydrate(ctx, st, bl, cacheDir, repo)
+		_, refsErr, err := Hydrate(ctx, st, bl, cacheDir, repo, "main")
 		if err == nil {
 			err = refsErr
 		}
@@ -305,8 +343,8 @@ func TestHydrate_MutationInvalidatesShortCircuit(t *testing.T) {
 	if lp, lr, _ := st.counts(); lp != 2 || lr != 2 {
 		t.Fatalf("post-mutation hydrate: ListPacks=%d ListRefs=%d, want 2/2 (full sync)", lp, lr)
 	}
-	if got := markerContent(t, repoPath); got != "8" {
-		t.Fatalf("marker = %q, want \"8\"", got)
+	if got := markerContent(t, repoPath); got != "8 refs/heads/main" {
+		t.Fatalf("marker = %q, want \"8 refs/heads/main\"", got)
 	}
 
 	mustHydrate(t, st, bl, cacheDir, repo)
@@ -348,7 +386,7 @@ func TestHydrate_MarkerWrittenOnlyAfterSuccess(t *testing.T) {
 	// marker may exist (a marker would short-circuit the retry into serving
 	// a never-synced repo).
 	st.refsErr = errors.New("synthetic ListRefs outage")
-	_, _, err := Hydrate(context.Background(), st, bl, cacheDir, repo)
+	_, _, err := Hydrate(context.Background(), st, bl, cacheDir, repo, "main")
 	if err == nil {
 		t.Fatal("Hydrate must fail when ListRefs fails")
 	}
@@ -362,7 +400,7 @@ func TestHydrate_MarkerWrittenOnlyAfterSuccess(t *testing.T) {
 	// reported and the marker still must not advance.
 	st.refsErr = nil
 	st.refs = map[string]string{"refs/heads/main": strings.Repeat("ab", 20)}
-	_, refsErr, err := Hydrate(context.Background(), st, bl, cacheDir, repo)
+	_, refsErr, err := Hydrate(context.Background(), st, bl, cacheDir, repo, "main")
 	if err != nil {
 		t.Fatalf("Hydrate err = %v, want refsErr-only failure", err)
 	}
@@ -376,7 +414,7 @@ func TestHydrate_MarkerWrittenOnlyAfterSuccess(t *testing.T) {
 	// Success finally writes it.
 	st.refs = map[string]string{}
 	mustHydrate(t, st, bl, cacheDir, repo)
-	if got := markerContent(t, repoPath); got != "7" {
-		t.Fatalf("marker = %q, want \"7\"", got)
+	if got := markerContent(t, repoPath); got != "7 refs/heads/main" {
+		t.Fatalf("marker = %q, want \"7 refs/heads/main\"", got)
 	}
 }

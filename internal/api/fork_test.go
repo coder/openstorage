@@ -138,7 +138,7 @@ func forkRequireCreated(t *testing.T, resp *http.Response, body map[string]any) 
 // forkHasObject reports whether the materialized repo cache contains sha.
 func forkHasObject(t *testing.T, e *testEnv, repoID, sha string) bool {
 	t.Helper()
-	repoPath, err := gitread.Materialize(context.Background(), e.refStore, e.blobStore, e.cacheDir, repoID)
+	repoPath, err := gitread.Materialize(context.Background(), e.refStore, e.blobStore, e.cacheDir, repoID, "main")
 	if err != nil {
 		t.Fatalf("materialize %s: %v", repoID, err)
 	}
