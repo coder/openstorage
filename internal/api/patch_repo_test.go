@@ -74,25 +74,52 @@ func TestPatchRepoDefaultBranch(t *testing.T) {
 			t.Fatalf("GET /repo default_branch = %q after PATCH, want feature", got)
 		}
 
-		// Alias shape with a refs/heads/-qualified name (openapi.yaml: values
-		// are qualified for you): back to main, recorded in short form.
+		// Alias shape: back to main.
 		resp, body = e.doReq(t, http.MethodPatch, "/api/repos/"+url.PathEscape(fx.url), writeTok,
-			[]byte(`{"default_branch":"refs/heads/main"}`), "")
+			[]byte(`{"default_branch":"main"}`), "")
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("PATCH alias = %d: %s", resp.StatusCode, body)
 		}
 		if out := patchRepoBody(t, body); out["default_branch"] != "main" {
-			t.Fatalf("alias PATCH default_branch = %v, want main (short form)", out["default_branch"])
+			t.Fatalf("alias PATCH default_branch = %v, want main", out["default_branch"])
 		}
 		if got := getDefaultBranch(t, e, fx); got != "main" {
 			t.Fatalf("GET /repo default_branch = %q after alias PATCH, want main", got)
 		}
 
-		// Both route shapes answer identically for a non-mutating case
-		// (unknown branch -> 404 branch not found).
+		// An unborn branch is accepted (openapi.yaml: "The branch itself is
+		// not created by this call"; the default may point at nothing, like
+		// a freshly created repo before its first push).
+		resp, body = e.doReq(t, http.MethodPatch, "/api/v1/repo", writeTok,
+			[]byte(`{"default_branch":"unborn"}`), "")
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("PATCH unborn branch = %d, want 200: %s", resp.StatusCode, body)
+		}
+		if got := getDefaultBranch(t, e, fx); got != "unborn" {
+			t.Fatalf("GET /repo default_branch = %q, want unborn", got)
+		}
+
+		// A refs/-qualified value is stored and mirrored verbatim
+		// (openapi.yaml: "a value that already starts with `refs/` is used
+		// verbatim").
+		resp, body = e.doReq(t, http.MethodPatch, "/api/v1/repo", writeTok,
+			[]byte(`{"default_branch":"refs/heads/main"}`), "")
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("PATCH qualified ref = %d: %s", resp.StatusCode, body)
+		}
+		if out := patchRepoBody(t, body); out["default_branch"] != "refs/heads/main" {
+			t.Fatalf("qualified PATCH default_branch = %v, want refs/heads/main (verbatim)", out["default_branch"])
+		}
+
+		// Restore, then check both route shapes answer identically for a
+		// non-mutating failure (invalid name -> 400).
+		resp, _ = e.doReq(t, http.MethodPatch, "/api/v1/repo", writeTok, []byte(`{"default_branch":"main"}`), "")
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("restore PATCH = %d", resp.StatusCode)
+		}
 		aliasRequireIdentical(t, e, http.MethodPatch,
 			"/api/repos/"+url.PathEscape(fx.url), "/api/v1/repo", writeTok,
-			[]byte(`{"default_branch":"ghost"}`))
+			[]byte(`{"default_branch":"bad..name"}`))
 	})
 }
 
@@ -110,9 +137,8 @@ func TestPatchRepoDefaultBranchErrors(t *testing.T) {
 			{"empty object", []byte(`{}`), http.StatusBadRequest},
 			{"empty branch", []byte(`{"default_branch":""}`), http.StatusBadRequest},
 			{"invalid JSON", []byte(`{"default_branch":`), http.StatusBadRequest},
-			{"non-branch ref", []byte(`{"default_branch":"refs/tags/annot"}`), http.StatusBadRequest},
 			{"invalid name", []byte(`{"default_branch":"bad..name"}`), http.StatusBadRequest},
-			{"unknown branch", []byte(`{"default_branch":"ghost"}`), http.StatusNotFound},
+			{"lock suffix", []byte(`{"default_branch":"dev.lock"}`), http.StatusBadRequest},
 		}
 		for _, tc := range cases {
 			t.Run(tc.name, func(t *testing.T) {
@@ -163,6 +189,55 @@ func TestPatchRepoDefaultBranchErrors(t *testing.T) {
 		// Every failure above left the default branch untouched.
 		if got := getDefaultBranch(t, e, fx); got != "main" {
 			t.Fatalf("default_branch = %q after error matrix, want main", got)
+		}
+	})
+}
+
+// Ref policies gate the HEAD repoint: no-push and unknown ops on a rule
+// covering HEAD or the new target deny with 403; no-force-push and
+// verify-sig (and rules covering only other refs) do not.
+func TestPatchRepoDefaultBranchPolicies(t *testing.T) {
+	runBackends(t, func(t *testing.T, e *testEnv) {
+		fx := wrefSeedFixture(t, e)
+
+		cases := []struct {
+			name string
+			refs string
+			want int
+		}{
+			{"no-push wildcard", `[["*",["no-push"]]]`, http.StatusForbidden},
+			{"no-push on target", `[["refs/heads/feature",["no-push"]]]`, http.StatusForbidden},
+			{"no-push on HEAD", `[["HEAD",["no-push"]]]`, http.StatusForbidden},
+			{"unknown op", `[["*",["freeze"]]]`, http.StatusForbidden},
+			{"malformed claim", `[["*"]]`, http.StatusForbidden},
+			{"no-push elsewhere", `[["refs/heads/main",["no-push"]]]`, http.StatusOK},
+			{"no-force-push", `[["*",["no-force-push"]]]`, http.StatusOK},
+			{"verify-sig", `[["*",["verify-sig"]]]`, http.StatusOK},
+			{"empty rule", `[["*",[]]]`, http.StatusOK},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				tok := e.mint(t, tokenSpec{iss: fx.org, repo: fx.url,
+					scopes: []string{auth.ScopeRepoWrite}, refs: tc.refs})
+				resp, body := e.doReq(t, http.MethodPatch, "/api/v1/repo", tok,
+					[]byte(`{"default_branch":"feature"}`), "")
+				if resp.StatusCode != tc.want {
+					t.Fatalf("PATCH with refs=%s = %d, want %d: %s", tc.refs, resp.StatusCode, tc.want, body)
+				}
+				if tc.want == http.StatusOK {
+					// Restore for the next case.
+					restore := e.mint(t, tokenSpec{iss: fx.org, repo: fx.url, scopes: []string{auth.ScopeRepoWrite}})
+					if r2, _ := e.doReq(t, http.MethodPatch, "/api/v1/repo", restore,
+						[]byte(`{"default_branch":"main"}`), ""); r2.StatusCode != http.StatusOK {
+						t.Fatalf("restore PATCH = %d", r2.StatusCode)
+					}
+				}
+			})
+		}
+
+		// Denied requests never reached the store.
+		if got := getDefaultBranch(t, e, fx); got != "main" {
+			t.Fatalf("default_branch = %q after policy matrix, want main", got)
 		}
 	})
 }

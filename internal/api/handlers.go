@@ -210,6 +210,29 @@ func (s *server) handleGetRepo(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// policyDeniesDefaultBranchChange reports whether the token's ref policies
+// deny repointing HEAD at target (a normalized ref). The consulted rules
+// are the first match for HEAD itself and for the new target ref
+// (first-match-wins, like the update hook). Repointing HEAD moves no refs
+// and introduces no commits, so no-force-push (deletions/rewrites) and
+// verify-sig (introduced commits) never deny — but no-push denies every
+// update to a covered ref, including which ref default clones follow, and
+// unknown ops fail closed.
+func policyDeniesDefaultBranchChange(policies []auth.RefPolicy, target string) (string, bool) {
+	for _, ref := range []string{"HEAD", target} {
+		rule, ok := auth.MatchPolicy(policies, ref)
+		if !ok {
+			continue
+		}
+		for _, op := range rule.Ops {
+			if op != auth.OpVerifySig && op != auth.OpNoForcePush {
+				return op, true
+			}
+		}
+	}
+	return "", false
+}
+
 // patchRepoRequest is the PATCH /repo body: default_branch is the only
 // supported setting (openapi.yaml update_repo).
 type patchRepoRequest struct {
@@ -231,20 +254,22 @@ type patchRepoResponse struct {
 // the default branch of the JWT `repo` claim's repository (openapi.yaml
 // update_repo). The row update is a CAS against the default branch read in
 // this request (upstream: "a transactional compare-and-swap"; a concurrent
-// change is a 409). The upstream gateway qualifies `main` to the symref
-// target `refs/heads/main`, so an input already carrying the refs/heads/
-// prefix folds to its short name before validation; the call never creates
-// the branch, and a default branch pointing at nothing would advertise a
-// dangling clone HEAD — unknown branches are rejected like the other branch
-// write routes (404). Cache-repo HEADs follow on the next hydrate: the
-// hydrate marker records the synced HEAD target, so a changed default
-// branch defeats the issue-#4 short-circuit (githttp/hydrate.go).
+// change is a 409). Upstream contract: plain names are qualified for you
+// (`main` becomes the symref target `refs/heads/main`) while values already
+// starting with `refs/` are used verbatim, and the branch is never created
+// by this call — the target may be unborn (POST /repos likewise accepts an
+// unborn default on an empty repo), in which case clones see a dangling
+// HEAD until the branch is pushed, exactly like a freshly created repo.
+// Cache-repo HEADs follow on the next hydrate: the hydrate marker records
+// the synced HEAD target, so a changed default branch defeats the issue-#4
+// short-circuit (githttp/hydrate.go).
 func (s *server) handlePatchRepo(w http.ResponseWriter, r *http.Request) {
 	claims := mustClaims(r)
-	// docs/02: ref policies apply to every HTTP write endpoint. Changing
-	// the default branch moves no refs, so any well-formed policy allows
-	// it — but a malformed policy claim fails closed (mirrors create).
-	if _, err := refPolicies(claims); err != nil {
+	// docs/02: ref policies apply to every HTTP write endpoint; malformed
+	// policy claims fail closed, and the parsed rules gate the HEAD
+	// repoint below (policyDeniesDefaultBranchChange).
+	policies, err := refPolicies(claims)
+	if err != nil {
 		writeErr(w, http.StatusForbidden, err.Error())
 		return
 	}
@@ -260,31 +285,28 @@ func (s *server) handlePatchRepo(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	branch := strings.TrimPrefix(req.DefaultBranch, "refs/heads/")
+	branch := req.DefaultBranch
 	if branch == "" {
 		// openapi.yaml: the body is required and default_branch must be a
 		// non-empty branch name.
 		writeErr(w, http.StatusBadRequest, "default_branch is required")
 		return
 	}
-	// A remaining refs/ prefix is a non-branch ref (refs/tags/...), which
-	// can never satisfy the branch-existence check below.
-	if strings.HasPrefix(branch, "refs/") || !validBranchName(branch) {
+	// validBranchName vets the ref components either way; a refs/-prefixed
+	// value is otherwise stored and used verbatim (upstream contract), a
+	// plain name is qualified by HeadTarget at hydrate time.
+	if !validBranchName(branch) {
 		writeErr(w, http.StatusBadRequest, "invalid default_branch")
+		return
+	}
+	if op, denied := policyDeniesDefaultBranchChange(policies, auth.NormalizeRefName(branch)); denied {
+		writeErr(w, http.StatusForbidden, "ref policy op "+strconv.Quote(op)+" denies changing the default branch")
 		return
 	}
 	// ADR-21: the repo claim carries the url or the repo_id; resolve either
 	// (resolveRepo writes the 404/500 itself).
 	repo, ok := s.resolveRepo(w, r)
 	if !ok {
-		return
-	}
-	if _, err := s.refStore.GetRef(r.Context(), repo.RepoID, "refs/heads/"+branch); err != nil {
-		if errors.Is(err, ref.ErrNotFound) {
-			writeErr(w, http.StatusNotFound, "branch not found")
-			return
-		}
-		s.internalErr(w, r, "resolve default branch", err)
 		return
 	}
 	won, err := s.store.UpdateRepoDefaultBranch(r.Context(), claims.Iss, repo.URL, repo.DefaultBranch, branch)
