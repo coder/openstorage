@@ -136,6 +136,15 @@ func (r *Repacker) Repack(ctx context.Context, repo string) error {
 	}
 
 	objs, err := packObjectUnion(repoPath, old)
+	if errors.Is(err, errFoldInputGone) {
+		// A snapshotted pack has no local idx even after Hydrate: a
+		// concurrent fold replaced the row set between our snapshot and
+		// Hydrate's own listing, so hydration (correctly) never
+		// materialized it into this cold cache. Our input is stale —
+		// ReplacePacks would lose anyway. Stop cleanly; nothing uploaded.
+		r.logger.Info("repack: lost fold race before packing", "repo", repo, "err", err)
+		return nil
+	}
 	if err != nil {
 		return fmt.Errorf("repack %s: %w", repo, err)
 	}
@@ -235,18 +244,24 @@ func (t *RepackTrigger) MaybeEnqueue(ctx context.Context, repo string) {
 	t.logger.Info("repack trigger: scheduled fold", "repo", repo, "packs", len(packs), "threshold", t.threshold)
 }
 
+// errFoldInputGone reports (wrapped, match with errors.Is) that a
+// snapshotted pack is not materialized in the cache even after Hydrate:
+// a concurrent fold replaced the rows between the snapshot and Hydrate's
+// own listing, so this fold's input is stale and it has already lost.
+var errFoldInputGone = errors.New("jobs: snapshotted pack not materialized (folded away concurrently)")
+
 // packObjectUnion enumerates the union of the snapshotted packs' objects
 // from their .idx files in the hydrated cache repo, sorted ascending (a
-// deterministic pack-objects input). Every snapshotted pack must be
-// materialized locally — Hydrate ran after the snapshot — so a missing idx
-// is an invariant violation, not a race.
+// deterministic pack-objects input). Hydrate ran after the snapshot, so a
+// snapshotted pack can be missing locally only when a concurrent fold
+// removed its row before Hydrate listed — reported as errFoldInputGone.
 func packObjectUnion(repoPath string, packs []ref.Pack) ([]string, error) {
 	seen := make(map[string]bool)
 	for _, p := range packs {
 		idx := filepath.Join(repoPath, "objects", "pack", "pack-"+p.ID+".idx")
 		f, err := os.Open(idx)
 		if err != nil {
-			return nil, fmt.Errorf("snapshotted pack %s not materialized: %w", p.ID, err)
+			return nil, fmt.Errorf("pack %s: %w: %w", p.ID, errFoldInputGone, err)
 		}
 		out, err := runGitStdin(repoPath, f, "show-index")
 		_ = f.Close()

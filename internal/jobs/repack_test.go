@@ -464,6 +464,46 @@ func TestRepack_ConcurrentHydratorRetriesOntoFold(t *testing.T) {
 	testGit(t, repoPath, "", "fsck", "--connectivity-only", "--no-progress", "--no-dangling")
 }
 
+func TestRepack_StaleSnapshotLosesCleanlyBeforePacking(t *testing.T) {
+	f := newRepackFixture(t)
+	ctx := context.Background()
+	for range 3 {
+		f.push(t)
+	}
+
+	// The repacker's FIRST listing is a stale pre-fold snapshot; a
+	// concurrent fold then lands before its (cold) hydrate, so hydration
+	// materializes only the consolidated row and the union enumeration
+	// finds no idx for the snapshotted packs. The fold must stop cleanly:
+	// no error, no upload, no DB change beyond the winner's fold.
+	stale := &staleListStore{RefStore: f.store, stale: f.packRows(t)}
+	if err := f.repacker(t.TempDir()).Repack(ctx, f.repo); err != nil {
+		t.Fatalf("winner repack: %v", err)
+	}
+	winner := f.packRows(t)
+	before, err := f.blobs.List(ctx, blob.PackPrefix(f.repo))
+	if err != nil {
+		t.Fatalf("list blobs: %v", err)
+	}
+
+	loser := NewRepacker(stale, f.blobs, func(ctx context.Context, repo string) (string, error, error) {
+		return githttp.Hydrate(ctx, f.store, f.blobs, t.TempDir(), repo) // cold cache
+	}, slog.New(slog.DiscardHandler))
+	if err := loser.Repack(ctx, f.repo); err != nil {
+		t.Fatalf("stale-snapshot repack must lose cleanly, got %v", err)
+	}
+	if rows := f.packRows(t); len(rows) != 1 || rows[0].ID != winner[0].ID {
+		t.Fatalf("stale fold changed the pack set: %+v", rows)
+	}
+	after, err := f.blobs.List(ctx, blob.PackPrefix(f.repo))
+	if err != nil {
+		t.Fatalf("list blobs: %v", err)
+	}
+	if len(after) != len(before) {
+		t.Fatalf("stale fold changed the blob set: %d -> %d objects", len(before), len(after))
+	}
+}
+
 func TestRepackTrigger_Threshold(t *testing.T) {
 	f := newRepackFixture(t)
 	ctx := context.Background()
