@@ -183,6 +183,14 @@ func (s *SQLite) CASRef(ctx context.Context, repo, name, old, new string) (won b
 		return false, fmt.Errorf("cas acquire %s/%s: %w", repo, name, notExecuted(err))
 	}
 	defer func() { _ = conn.Close() }()
+	// Pre-dispatch guard: a context canceled after acquire but before
+	// ExecContext dispatches the statement is definitive non-execution too.
+	// (The residual race — cancellation landing during driver execution —
+	// surfaces as a *sqlite.Error interrupt, which the ambiguity classifier
+	// already treats as a definitive backend rejection.)
+	if cerr := ctx.Err(); cerr != nil {
+		return false, fmt.Errorf("cas %s/%s: %w", repo, name, notExecuted(cerr))
+	}
 
 	var tag string
 	var res sql.Result

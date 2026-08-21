@@ -212,6 +212,38 @@ func TestIdempotentCASAcquireFailureNeverRecovers(t *testing.T) {
 	}
 }
 
+// errOnlyCtx simulates a cancellation that lands immediately AFTER the
+// store's connection acquire: Done() stays open (the acquire path's select
+// proceeds), while Err() — which the store's pre-dispatch guard consults —
+// already reports the cancellation.
+type errOnlyCtx struct{ context.Context }
+
+func (errOnlyCtx) Done() <-chan struct{} { return nil }
+func (errOnlyCtx) Err() error            { return context.Canceled }
+
+// TestIdempotentCASPostAcquireCancelNeverRecovers pins the pre-dispatch
+// guard: a context canceled between acquire and statement dispatch is
+// definitive non-execution, so even with the ref already at the target
+// (someone else's write) the error propagates instead of fabricating a
+// success.
+func TestIdempotentCASPostAcquireCancelNeverRecovers(t *testing.T) {
+	raw, _ := openTestSQLite(t)
+	seedRef(t, raw, "r1", "refs/heads/main", idemSHA2) // someone else's write, already at target
+	st := IdempotentCAS{RefStore: raw}
+
+	won, err := st.CASRef(errOnlyCtx{context.Background()}, "r1", "refs/heads/main", idemSHA1, idemSHA2)
+	if won || !errors.Is(err, context.Canceled) {
+		t.Fatalf("CASRef = (%v, %v), want (false, context.Canceled)", won, err)
+	}
+	if ambiguousError(err) {
+		t.Fatalf("post-acquire cancel %v classified ambiguous, want definitive", err)
+	}
+	// The guard fired before dispatch: the ref must be untouched.
+	if cur, gerr := raw.GetRef(context.Background(), "r1", "refs/heads/main"); gerr != nil || cur != idemSHA2 {
+		t.Fatalf("ref = (%q, %v), want untouched %q", cur, gerr, idemSHA2)
+	}
+}
+
 // TestIdempotentCASCleanCreateLossIsAuthoritative pins the create decision:
 // a clean create loss (won=false, err=nil) affirmatively wrote nothing, so
 // it stays a conflict even when the existing ref holds the target sha —

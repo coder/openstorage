@@ -228,6 +228,14 @@ func (s *PG) CASRef(ctx context.Context, repo, name, old, new string) (won bool,
 		return false, fmt.Errorf("cas acquire %s/%s: %w", repo, name, notExecuted(err))
 	}
 	defer conn.Release()
+	// Pre-dispatch guard: a context canceled after acquire but before Exec
+	// sends the statement is definitive non-execution too. (The residual
+	// race — cancellation between this check and the wire write — is
+	// covered by pgconn itself, whose pre-send check returns a
+	// SafeToRetry-tagged contextAlreadyDoneError.)
+	if cerr := ctx.Err(); cerr != nil {
+		return false, fmt.Errorf("cas %s/%s: %w", repo, name, notExecuted(cerr))
+	}
 
 	var tag string
 	var ct interface{ RowsAffected() int64 }
