@@ -584,6 +584,34 @@ func TestQuarantineKey(t *testing.T) {
 	}
 }
 
+// A tiny classification threshold must not shrink the quarantine purge
+// age below the handshake-lifetime floor: a backup older than the
+// threshold but younger than quarantinePurgeFloor may still be an
+// in-flight handshake's restore source (Codex round 19).
+func TestSweep_PurgeEnforcesFloorUnderTinyThreshold(t *testing.T) {
+	f := newSweepFixture(t)
+	young := quarantinePrefix + "00112233aabbccdd/" + blob.PackKey("r1", "young")
+	f.upload(young, "young-bytes")
+	f.backdate(young, 10*time.Minute) // aged past the 1m threshold, under the floor
+	old := quarantinePrefix + "ddeeff0011223344/" + blob.PackKey("r1", "old")
+	f.upload(old, "old-bytes")
+	f.backdate(old, quarantinePurgeFloor+time.Hour) // past the floor too
+
+	report, err := f.sweeper(SweepConfig{Threshold: time.Minute, Delete: true}).Sweep(context.Background())
+	if err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if !f.exists(young) {
+		t.Fatalf("backup %q under the purge floor was purged (threshold must not shrink the floor)", young)
+	}
+	if f.exists(old) {
+		t.Fatalf("backup %q past the purge floor was not purged", old)
+	}
+	if want := int64(len("old-bytes")); report.BytesReclaimed != want {
+		t.Fatalf("BytesReclaimed = %d, want %d (old purge only)", report.BytesReclaimed, want)
+	}
+}
+
 // failingRegistry fails every HasPack, simulating a registry outage.
 type failingRegistry struct{}
 

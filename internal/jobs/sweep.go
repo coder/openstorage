@@ -225,9 +225,25 @@ var maxOrphanSample = 100
 
 // sweepRecoveryTimeout bounds safeDelete's post-delete recovery phase
 // (registry recheck + quarantine restore) when it runs detached from a
-// canceled sweep. Restores are server-side copies, so this generously
-// covers even multipart copies of the largest supported packs.
+// canceled sweep, and separately its delete phase. Restores are
+// server-side copies, so this generously covers even multipart copies of
+// the largest supported packs.
 const sweepRecoveryTimeout = 15 * time.Minute
+
+// quarantinePurgeFloor is the minimum age before a quarantine backup may
+// be purged, independent of the configured classification threshold: a
+// backup is safe to purge only once its handshake is provably dead, and
+// safeDelete bounds a handshake's lifetime at 2×sweepRecoveryTimeout from
+// the backup's write. 2× that bound doubles the margin.
+const quarantinePurgeFloor = 4 * sweepRecoveryTimeout
+
+// quarantinePurgeAge is the age gate for purging quarantine backups: the
+// configured threshold, floored at quarantinePurgeFloor (the threshold is
+// an orphan-classification knob an operator may tune far below any safe
+// purge age).
+func (s *Sweeper) quarantinePurgeAge() time.Duration {
+	return max(s.cfg.Threshold, quarantinePurgeFloor)
+}
 
 // classify handles one listed pack blob: a point registry read, then the
 // age-threshold diff, then (delete mode only) the revalidate + quarantine
@@ -366,9 +382,16 @@ func splitPackKey(key string) (repo string, ok bool) {
 // registration that landed mid-delete is repaired immediately by copying
 // the identical bytes back (pack keys are content-addressed, so the restore
 // is always correct). The quarantine backup is kept after a successful
-// reap; healQuarantine purges it once it ages past the threshold, and until
-// then it covers a sweeper crash anywhere in this sequence. Returns whether
-// the candidate ended up reaped.
+// reap; healQuarantine purges it once it ages past quarantinePurgeAge, and
+// until then it covers a sweeper crash anywhere in this sequence. Returns
+// whether the candidate ended up reaped.
+//
+// The handshake's total lifetime is bounded BY CONSTRUCTION: the delete
+// phase runs under a sweepRecoveryTimeout deadline and the recovery phase
+// under another, so from the moment the backup is written (its ModTime) to
+// the last possible restore from it, at most 2×sweepRecoveryTimeout
+// elapses. quarantinePurgeFloor is derived from that bound — the age gate
+// is a proof, not a heuristic.
 func (s *Sweeper) safeDelete(ctx context.Context, repo, key string) (bool, error) {
 	qKey := quarantineKey(key)
 	if err := s.blobs.Copy(ctx, qKey, key); err != nil {
@@ -377,6 +400,11 @@ func (s *Sweeper) safeDelete(ctx context.Context, repo, key string) (bool, error
 		}
 		return false, fmt.Errorf("sweep: quarantine %s: %w", key, err)
 	}
+	// The delete phase is deadline-bounded so the handshake lifetime bound
+	// above holds even against a wedged store or a sweep context without a
+	// deadline of its own.
+	hctx, hcancel := context.WithTimeout(ctx, sweepRecoveryTimeout)
+	defer hcancel()
 	// Everything after the delete request is recovery: it must be able to
 	// finish even when the sweep itself is being canceled (server shutdown,
 	// job backend cancellation racing the delete's response), or a canceled
@@ -385,7 +413,7 @@ func (s *Sweeper) safeDelete(ctx context.Context, repo, key string) (bool, error
 	// the sweep's cancellation (Codex round 16).
 	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sweepRecoveryTimeout)
 	defer cancel()
-	if err := s.blobs.Delete(ctx, key); err != nil && !errors.Is(err, blob.ErrNotFound) {
+	if err := s.blobs.Delete(hctx, key); err != nil && !errors.Is(err, blob.ErrNotFound) {
 		// The delete outcome is unknown — the request may have executed
 		// with its response lost. Restore from quarantine unconditionally:
 		// identical bytes, so a no-op if the delete never happened and a
@@ -505,8 +533,12 @@ func (s *Sweeper) healQuarantineEntry(ctx context.Context, q blob.ListedObject, 
 	}
 	// Purge strictly by age: quarantine entries are write-once (see
 	// quarantineKey), so an aged listing ModTime is immutable proof the
-	// entry's handshake is dead and no live handshake can be relying on it.
-	if !purge || q.ModTime.IsZero() || s.now().Sub(q.ModTime) < s.cfg.Threshold {
+	// entry's handshake is dead and no live handshake can be relying on it
+	// — PROVIDED the age gate exceeds the handshake's constructive
+	// lifetime bound (see safeDelete). The configured threshold governs
+	// orphan classification and may be tuned arbitrarily low, so the purge
+	// age enforces its own floor rather than trusting it.
+	if !purge || q.ModTime.IsZero() || s.now().Sub(q.ModTime) < s.quarantinePurgeAge() {
 		return nil
 	}
 	switch err := s.blobs.Delete(ctx, q.Key); {
