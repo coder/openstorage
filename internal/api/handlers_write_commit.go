@@ -752,13 +752,19 @@ func (s *server) wcPublish(ctx context.Context, sc *wcScratch, repoID string, pl
 	if err := s.blobStore.UploadFile(ctx, key, packPath); err != nil {
 		return 0, false, fmt.Errorf("upload pack %s: %w", key, err)
 	}
-	if err := s.refStore.RegisterPacks(ctx, repoID, []ref.Pack{{ID: packID, Key: key}}); err != nil {
-		return 0, false, fmt.Errorf("register pack %s: %w", packID, err)
-	}
 	// Writer half of the orphan-sweep coordination (issue #5): re-upload
 	// if a sweeper deleted the key before the registration committed.
+	// Verification runs even when RegisterPacks fails: an ambiguous error
+	// may have committed the row (see the pre-receive hook).
+	regErr := s.refStore.RegisterPacks(ctx, repoID, []ref.Pack{{ID: packID, Key: key}})
+	if regErr != nil {
+		regErr = fmt.Errorf("register pack %s: %w", packID, regErr)
+	}
 	if err := blob.EnsurePublished(ctx, s.blobStore, key, packPath); err != nil {
-		return 0, false, fmt.Errorf("verify pack %s: %w", key, err)
+		return 0, false, errors.Join(regErr, fmt.Errorf("verify pack %s: %w", key, err))
+	}
+	if regErr != nil {
+		return 0, false, regErr
 	}
 	won, err = s.refStore.CASRef(ctx, repoID, plan.refName, plan.oldSHA, newSHA)
 	if err != nil {

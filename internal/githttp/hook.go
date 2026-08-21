@@ -192,18 +192,24 @@ func preReceive(ctx context.Context) error {
 		return err
 	}
 	defer st.Close()
-	if err := st.RegisterPacks(ctx, repo, packs); err != nil {
-		return fmt.Errorf("pre-receive: register packs: %w", err)
-	}
 	// Writer half of the orphan-sweep coordination (issue #5): a sweeper
 	// may have deleted a just-uploaded key right before the registration
-	// above committed; re-upload from the quarantine pack file if so.
+	// committed; re-upload from the local pack file if so. Verification
+	// runs even when RegisterPacks fails — an ambiguous error (commit
+	// executed, response lost) may have registered the packs, and a
+	// committed row must never point at missing bytes. Extra verify work
+	// on a genuinely failed registration is harmless: the keys were just
+	// uploaded, so each check is one Stat.
+	regErr := st.RegisterPacks(ctx, repo, packs)
+	if regErr != nil {
+		regErr = fmt.Errorf("pre-receive: register packs: %w", regErr)
+	}
 	for i, p := range packs {
 		if err := blob.EnsurePublished(ctx, bl, p.Key, packFiles[i]); err != nil {
-			return fmt.Errorf("pre-receive: verify %s: %w", p.Key, err)
+			return errors.Join(regErr, fmt.Errorf("pre-receive: verify %s: %w", p.Key, err))
 		}
 	}
-	return nil
+	return regErr
 }
 
 // updateHook enforces the JWT ref policy (first-match-wins), then performs

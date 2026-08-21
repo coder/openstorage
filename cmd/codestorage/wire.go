@@ -93,10 +93,27 @@ func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL string, orgPEM
 			}
 		}
 	}
-	sweeper := jobs.NewSweeper(blobStore, refStore, jobs.SweepConfig{
+	sweepCfg := jobs.SweepConfig{
 		Threshold: sweep.ageThreshold,
 		Delete:    sweep.deleteEnabled,
-	}, logger)
+	}
+	if s3store, ok := blobStore.(*blob.S3); ok && sweep.deleteEnabled {
+		// Versioning can be enabled on the bucket while the process runs,
+		// silently turning startup's validation stale; every delete-mode
+		// sweep re-checks and downgrades itself to list-only on drift or
+		// probe failure (fail closed, matching the startup gate).
+		sweepCfg.DeleteGuard = func(ctx context.Context) error {
+			versioned, err := s3store.VersioningEnabled(ctx)
+			if err != nil {
+				return fmt.Errorf("verify bucket versioning: %w", err)
+			}
+			if versioned {
+				return fmt.Errorf("bucket has S3 versioning enabled or suspended; deletes would only write delete markers")
+			}
+			return nil
+		}
+	}
+	sweeper := jobs.NewSweeper(blobStore, refStore, sweepCfg, logger)
 	var schedule *jobs.SweepSchedule
 	if sweep.interval > 0 {
 		schedule = &jobs.SweepSchedule{Sweeper: sweeper, Interval: sweep.interval}

@@ -584,6 +584,50 @@ func TestQuarantineKey(t *testing.T) {
 	}
 }
 
+// A failing DeleteGuard downgrades the run to list-only: candidates are
+// reported, nothing is reaped or purged, and the guard error is returned
+// (Codex round 21).
+func TestSweep_DeleteGuardFailsClosed(t *testing.T) {
+	f := newSweepFixture(t)
+	key := blob.PackKey("r1", "guarded")
+	f.upload(key, "guarded-bytes")
+	f.backdate(key, 25*time.Hour)
+	aged := quarantinePrefix + "00112233aabbccdd/" + blob.PackKey("r1", "stale")
+	f.upload(aged, "stale-bytes")
+	f.backdate(aged, quarantinePurgeFloor+time.Hour)
+
+	guardErr := errors.New("simulated: versioning enabled mid-flight")
+	s := f.sweeper(SweepConfig{
+		Threshold:   24 * time.Hour,
+		Delete:      true,
+		DeleteGuard: func(context.Context) error { return guardErr },
+	})
+	report, err := s.Sweep(context.Background())
+	if !errors.Is(err, guardErr) {
+		t.Fatalf("Sweep err = %v, want the guard error", err)
+	}
+	if report.OrphanCount != 1 || report.Deleted != 0 || report.BytesReclaimed != 0 {
+		t.Fatalf("report = %+v, want 1 orphan reported and nothing destroyed", report)
+	}
+	if !f.exists(key) || !f.exists(aged) {
+		t.Fatalf("guard-failed sweep destroyed objects (key=%v aged backup=%v)", f.exists(key), f.exists(aged))
+	}
+
+	// A passing guard restores full delete mode.
+	s2 := f.sweeper(SweepConfig{
+		Threshold:   24 * time.Hour,
+		Delete:      true,
+		DeleteGuard: func(context.Context) error { return nil },
+	})
+	report2, err := s2.Sweep(context.Background())
+	if err != nil {
+		t.Fatalf("Sweep with passing guard: %v", err)
+	}
+	if report2.Deleted != 1 {
+		t.Fatalf("report = %+v, want the orphan reaped once the guard passes", report2)
+	}
+}
+
 // A tiny classification threshold must not shrink the quarantine purge
 // age below the handshake-lifetime floor: a backup older than the
 // threshold but younger than quarantinePurgeFloor may still be an

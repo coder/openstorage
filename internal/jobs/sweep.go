@@ -53,6 +53,13 @@ type SweepConfig struct {
 	// default everywhere: enable only after list-only reports have been
 	// boring for a while (issue #5 ships list-only first).
 	Delete bool
+	// DeleteGuard, when set, is consulted before each sweep's destructive
+	// work. A non-nil error downgrades that run to list-only (heals still
+	// run) and is reported. It re-checks preconditions that startup
+	// validated once but that can drift while the process runs — e.g. S3
+	// bucket versioning being enabled mid-flight, which would turn deletes
+	// into billed delete markers.
+	DeleteGuard func(context.Context) error
 }
 
 // OrphanPack is one orphan candidate found by a sweep.
@@ -145,7 +152,17 @@ func (s *Sweeper) Sweep(ctx context.Context) (SweepReport, error) {
 	// must still be restored then. Only purging stays delete-gated.
 	var report SweepReport
 	var deleteErrs boundedErrs
-	if err := s.healQuarantine(ctx, &report, s.cfg.Delete); err != nil {
+	// Fail closed per run, not just at startup: destructive preconditions
+	// (e.g. bucket versioning state) can drift while the process runs.
+	deleteMode := s.cfg.Delete
+	if deleteMode && s.cfg.DeleteGuard != nil {
+		if err := s.cfg.DeleteGuard(ctx); err != nil {
+			deleteMode = false
+			deleteErrs.add(fmt.Errorf("sweep: delete guard, running list-only: %w", err))
+			s.logger.Error("orphan pack sweep: delete guard failed; this run is list-only", "err", err)
+		}
+	}
+	if err := s.healQuarantine(ctx, &report, deleteMode); err != nil {
 		deleteErrs.add(err)
 	}
 	// Stream packs/ page-wise and classify each object with a point
@@ -168,7 +185,7 @@ func (s *Sweeper) Sweep(ctx context.Context) (SweepReport, error) {
 				s.logger.Warn("orphan pack sweep: skipping foreign key under packs/", "key", obj.Key)
 				continue
 			}
-			if err := s.classify(ctx, repo, obj, &report, &deleteErrs); err != nil {
+			if err := s.classify(ctx, repo, obj, deleteMode, &report, &deleteErrs); err != nil {
 				return err
 			}
 		}
@@ -249,7 +266,7 @@ func (s *Sweeper) quarantinePurgeAge() time.Duration {
 // age-threshold diff, then (delete mode only) the revalidate + quarantine
 // handshake. Registry errors abort the sweep (they would misclassify the
 // object); disposal errors accumulate into deleteErrs.
-func (s *Sweeper) classify(ctx context.Context, repo string, obj blob.ListedObject, report *SweepReport, deleteErrs *boundedErrs) error {
+func (s *Sweeper) classify(ctx context.Context, repo string, obj blob.ListedObject, deleteMode bool, report *SweepReport, deleteErrs *boundedErrs) error {
 	registered, err := s.packs.HasPack(ctx, repo, obj.Key)
 	if err != nil {
 		return fmt.Errorf("has pack %s: %w", obj.Key, err)
@@ -276,8 +293,8 @@ func (s *Sweeper) classify(ctx context.Context, repo string, obj blob.ListedObje
 	report.OrphanBytes += obj.Size
 	s.logger.Info("orphan pack candidate",
 		"key", obj.Key, "size_bytes", obj.Size, "age", age.Round(time.Second),
-		"delete_enabled", s.cfg.Delete)
-	if !s.cfg.Delete {
+		"delete_enabled", deleteMode)
+	if !deleteMode {
 		return nil
 	}
 	stillOrphan, err := s.revalidateOrphan(ctx, repo, obj.Key)

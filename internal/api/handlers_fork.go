@@ -258,16 +258,19 @@ func (s *server) handleForkRepo(w http.ResponseWriter, r *http.Request, verifier
 		s.internalErr(w, r, "upload fork pack", err)
 		return
 	}
-	if err := s.refStore.RegisterPacks(ctx, repo.RepoID, []ref.Pack{{ID: packID, Key: key}}); err != nil {
-		s.forkAbandon(ctx, claims.Iss, url)
-		s.internalErr(w, r, "register fork pack", err)
-		return
-	}
 	// Writer half of the orphan-sweep coordination (issue #5): re-upload
 	// if a sweeper deleted the key before the registration committed.
+	// Verification runs even when RegisterPacks fails: an ambiguous error
+	// may have committed the row (see the pre-receive hook).
+	regErr := s.refStore.RegisterPacks(ctx, repo.RepoID, []ref.Pack{{ID: packID, Key: key}})
 	if err := blob.EnsurePublished(ctx, s.blobStore, key, packPath); err != nil {
 		s.forkAbandon(ctx, claims.Iss, url)
-		s.internalErr(w, r, "verify fork pack", err)
+		s.internalErr(w, r, "verify fork pack", errors.Join(regErr, err))
+		return
+	}
+	if regErr != nil {
+		s.forkAbandon(ctx, claims.Iss, url)
+		s.internalErr(w, r, "register fork pack", regErr)
 		return
 	}
 	won, err := s.refStore.CASRef(ctx, repo.RepoID, forkRef, ref.ZeroSHA, forkSHA)
