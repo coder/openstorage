@@ -914,5 +914,10 @@ func (s *server) wrefPublish(ctx context.Context, repoPath, repoID string, scrat
 	if err := s.refStore.RegisterPacks(ctx, repoID, []ref.Pack{{ID: id, Key: key}}); err != nil {
 		return fmt.Errorf("register pack %s: %w", id, err)
 	}
+	// Writer half of the orphan-sweep coordination (issue #5): re-upload
+	// if a sweeper deleted the key before the registration committed.
+	if err := blob.EnsurePublished(ctx, s.blobStore, key, packPath); err != nil {
+		return fmt.Errorf("verify pack %s: %w", key, err)
+	}
 	return nil
 }

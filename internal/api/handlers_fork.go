@@ -263,6 +263,13 @@ func (s *server) handleForkRepo(w http.ResponseWriter, r *http.Request, verifier
 		s.internalErr(w, r, "register fork pack", err)
 		return
 	}
+	// Writer half of the orphan-sweep coordination (issue #5): re-upload
+	// if a sweeper deleted the key before the registration committed.
+	if err := blob.EnsurePublished(ctx, s.blobStore, key, packPath); err != nil {
+		s.forkAbandon(ctx, claims.Iss, url)
+		s.internalErr(w, r, "verify fork pack", err)
+		return
+	}
 	won, err := s.refStore.CASRef(ctx, repo.RepoID, forkRef, ref.ZeroSHA, forkSHA)
 	if err != nil {
 		s.forkAbandon(ctx, claims.Iss, url)

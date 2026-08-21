@@ -8,11 +8,13 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
 	gcblob "gocloud.dev/blob"
 	"gocloud.dev/blob/s3blob"
@@ -112,6 +114,26 @@ func PackPrefix(repo string) string { return PacksRoot + repo + "/" }
 func LFSKey(repoID, oid string) string {
 	assertf(repoID != "" && oid != "", "LFSKey(%q, %q)", repoID, oid)
 	return "lfs/" + repoID + "/" + oid
+}
+
+// EnsurePublished re-uploads the local file at path to key when key is
+// absent. It is the writer half of the orphan-sweep coordination (issue
+// #5), called strictly AFTER a successful RegisterPacks: registration
+// follows upload, so an orphan sweeper that deleted the freshly uploaded
+// key just before the registration committed would otherwise leave a
+// registered pack with no bytes. Ordering proof: the sweeper deletes (D)
+// then re-reads the registry (C); the writer registers (R) then verifies
+// here (V). If C observes R the sweeper restores the pack itself; if C ran
+// before R then D happened before V, so V observes the missing key and
+// re-uploads. Both writers produce identical bytes (pack keys are
+// content-addressed), so the overlap is harmless either way.
+func EnsurePublished(ctx context.Context, b BlobStore, key, path string) error {
+	assertf(b != nil && key != "" && path != "", "EnsurePublished(%q, %q)", key, path)
+	_, err := b.Stat(ctx, key)
+	if errors.Is(err, ErrNotFound) {
+		return b.UploadFile(ctx, key, path)
+	}
+	return err
 }
 
 // Open dispatches on the URL scheme to the matching BlobStore backend:
@@ -246,7 +268,87 @@ func (b *S3) Delete(ctx context.Context, key string) error {
 	return bucketDelete(ctx, b.bucket, key)
 }
 
-// Copy duplicates srcKey to dstKey (server-side CopyObject).
+// S3 CopyObject handles at most 5 GiB per request; larger objects (packs
+// can exceed it — uploads go through the multipart-capable writer) must be
+// copied part-wise with UploadPartCopy. Vars, not consts, so tests can
+// exercise the multipart path with small objects against MinIO.
+var (
+	s3SinglePartCopyLimit int64 = 5 * 1024 * 1024 * 1024
+	s3CopyPartSize        int64 = 1024 * 1024 * 1024
+)
+
+// Copy duplicates srcKey to dstKey: server-side CopyObject for objects up
+// to the single-request limit, multipart UploadPartCopy beyond it (still
+// fully server-side — bytes never flow through this process).
 func (b *S3) Copy(ctx context.Context, dstKey, srcKey string) error {
-	return bucketCopy(ctx, b.bucket, dstKey, srcKey)
+	size, err := b.Stat(ctx, srcKey)
+	if err != nil {
+		return fmt.Errorf("copy %s -> %s: %w", srcKey, dstKey, err)
+	}
+	if size <= s3SinglePartCopyLimit {
+		return bucketCopy(ctx, b.bucket, dstKey, srcKey)
+	}
+	return b.multipartCopy(ctx, dstKey, srcKey, size)
+}
+
+// copySourceHeader encodes bucket/key for the X-Amz-Copy-Source header:
+// URL-encoded path segments, with '+' escaped explicitly (url.PathEscape
+// leaves it literal, but namespaced repo keys contain '+', and copy-source
+// decoders are inconsistent about bare plus signs).
+func copySourceHeader(bucket, key string) string {
+	segs := strings.Split(key, "/")
+	for i := range segs {
+		segs[i] = strings.ReplaceAll(url.PathEscape(segs[i]), "+", "%2B")
+	}
+	return bucket + "/" + strings.Join(segs, "/")
+}
+
+// multipartCopy copies srcKey (size bytes) to dstKey in s3CopyPartSize
+// ranges via UploadPartCopy, aborting the multipart upload on any failure
+// so no billable incomplete upload leaks.
+func (b *S3) multipartCopy(ctx context.Context, dstKey, srcKey string, size int64) (err error) {
+	assertf(b.client != nil, "multipartCopy: S3 opened without a client")
+	assertf(size > 0, "multipartCopy(%q): non-positive size %d", srcKey, size)
+	create, err := b.client.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
+		Bucket: aws.String(b.name), Key: aws.String(dstKey),
+	})
+	if err != nil {
+		return fmt.Errorf("copy %s -> %s: create multipart: %w", srcKey, dstKey, err)
+	}
+	defer func() {
+		if err == nil {
+			return
+		}
+		// Abort must survive a canceled ctx, or the incomplete upload leaks.
+		abortCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		defer cancel()
+		_, _ = b.client.AbortMultipartUpload(abortCtx, &s3.AbortMultipartUploadInput{
+			Bucket: aws.String(b.name), Key: aws.String(dstKey), UploadId: create.UploadId,
+		})
+	}()
+
+	source := copySourceHeader(b.name, srcKey)
+	var parts []s3types.CompletedPart
+	for start := int64(0); start < size; start += s3CopyPartSize {
+		end := min(start+s3CopyPartSize, size) - 1
+		num := int32(len(parts) + 1) //nolint:gosec // bounded by S3's 10k part cap
+		part, err := b.client.UploadPartCopy(ctx, &s3.UploadPartCopyInput{
+			Bucket: aws.String(b.name), Key: aws.String(dstKey),
+			CopySource:      aws.String(source),
+			CopySourceRange: aws.String(fmt.Sprintf("bytes=%d-%d", start, end)),
+			PartNumber:      aws.Int32(num),
+			UploadId:        create.UploadId,
+		})
+		if err != nil {
+			return fmt.Errorf("copy %s -> %s: part %d: %w", srcKey, dstKey, num, err)
+		}
+		parts = append(parts, s3types.CompletedPart{ETag: part.CopyPartResult.ETag, PartNumber: aws.Int32(num)})
+	}
+	if _, err := b.client.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
+		Bucket: aws.String(b.name), Key: aws.String(dstKey), UploadId: create.UploadId,
+		MultipartUpload: &s3types.CompletedMultipartUpload{Parts: parts},
+	}); err != nil {
+		return fmt.Errorf("copy %s -> %s: complete multipart: %w", srcKey, dstKey, err)
+	}
+	return nil
 }

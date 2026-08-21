@@ -755,6 +755,11 @@ func (s *server) wcPublish(ctx context.Context, sc *wcScratch, repoID string, pl
 	if err := s.refStore.RegisterPacks(ctx, repoID, []ref.Pack{{ID: packID, Key: key}}); err != nil {
 		return 0, false, fmt.Errorf("register pack %s: %w", packID, err)
 	}
+	// Writer half of the orphan-sweep coordination (issue #5): re-upload
+	// if a sweeper deleted the key before the registration committed.
+	if err := blob.EnsurePublished(ctx, s.blobStore, key, packPath); err != nil {
+		return 0, false, fmt.Errorf("verify pack %s: %w", key, err)
+	}
 	won, err = s.refStore.CASRef(ctx, repoID, plan.refName, plan.oldSHA, newSHA)
 	if err != nil {
 		return 0, false, fmt.Errorf("cas %s: %w", plan.refName, err)

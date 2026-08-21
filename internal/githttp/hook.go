@@ -195,6 +195,14 @@ func preReceive(ctx context.Context) error {
 	if err := st.RegisterPacks(ctx, repo, packs); err != nil {
 		return fmt.Errorf("pre-receive: register packs: %w", err)
 	}
+	// Writer half of the orphan-sweep coordination (issue #5): a sweeper
+	// may have deleted a just-uploaded key right before the registration
+	// above committed; re-upload from the quarantine pack file if so.
+	for i, p := range packs {
+		if err := blob.EnsurePublished(ctx, bl, p.Key, packFiles[i]); err != nil {
+			return fmt.Errorf("pre-receive: verify %s: %w", p.Key, err)
+		}
+	}
 	return nil
 }
 

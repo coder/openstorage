@@ -331,3 +331,30 @@ func TestFile_Copy(t *testing.T) {
 		t.Fatalf("Copy of missing source = %v, want ErrNotFound", err)
 	}
 }
+
+// EnsurePublished is the writer half of the orphan-sweep coordination:
+// no-op when the key exists, re-upload when a sweeper deleted it between
+// upload and registration commit.
+func TestEnsurePublished(t *testing.T) {
+	ctx := context.Background()
+	key := PackKey("r1", "verify")
+	b := seededFile(t, key, "pack-bytes")
+	src := filepath.Join(t.TempDir(), "src")
+	if err := os.WriteFile(src, []byte("pack-bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := EnsurePublished(ctx, b, key, src); err != nil {
+		t.Fatalf("EnsurePublished(present): %v", err)
+	}
+	if err := b.Delete(ctx, key); err != nil {
+		t.Fatal(err)
+	}
+	if err := EnsurePublished(ctx, b, key, src); err != nil {
+		t.Fatalf("EnsurePublished(missing): %v", err)
+	}
+	size, err := b.Stat(ctx, key)
+	if err != nil || size != int64(len("pack-bytes")) {
+		t.Fatalf("Stat after re-publish = %d, %v", size, err)
+	}
+}

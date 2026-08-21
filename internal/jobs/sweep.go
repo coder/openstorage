@@ -104,7 +104,7 @@ func NewSweeper(blobs blob.BlobStore, packs PackLister, cfg SweepConfig, logger 
 // overwrite an orphaned key (pack keys are content-addressed, so the retry
 // reproduces the same key — and therefore identical bytes) at any point
 // during the sweep, and no portable blob backend offers conditional
-// deletes. Three layers make deletion safe anyway:
+// deletes. Four layers make deletion safe anyway:
 //
 //  1. revalidateOrphan re-reads the registry and the object's ModTime just
 //     before acting, sparing candidates registered or refreshed mid-sweep.
@@ -115,14 +115,18 @@ func NewSweeper(blobs blob.BlobStore, packs PackLister, cfg SweepConfig, logger 
 //  3. healQuarantine, at the start of EVERY sweep (list-only included, so a
 //     rollback to list-only still repairs a delete-enabled crash), restores
 //     any quarantined pack whose key is registered but missing (covering a
-//     sweeper crash mid-handshake, or a registration that landed after
-//     safeDelete's recheck); in delete mode it also purges quarantine
-//     backups once they age past the threshold.
+//     sweeper crash mid-handshake); in delete mode it also purges
+//     quarantine backups once they age past the threshold.
+//  4. Writers verify after registering (blob.EnsurePublished at every
+//     RegisterPacks call site): a registration that lands after
+//     safeDelete's recheck necessarily verifies after the delete, sees the
+//     missing key, and re-uploads it on the spot — so the recheck and the
+//     writer verify jointly cover every interleaving with no timing
+//     assumptions (see EnsurePublished's ordering proof).
 //
-// The residual exposure is transient, not data loss: a registration landing
-// after safeDelete's recheck leaves that pack unavailable until the next
-// sweep heals it (hydration's bounded missing-pack retry covers reads
-// racing the restore itself).
+// Any residual exposure (e.g. a reader racing the restore itself) is
+// transient, not data loss — hydration's bounded missing-pack retry
+// absorbs it — and the next sweep's heal pass remains the crash backstop.
 func (s *Sweeper) Sweep(ctx context.Context) (SweepReport, error) {
 	start := s.now()
 	// Heal before classifying so a pack restored from quarantine is listed
