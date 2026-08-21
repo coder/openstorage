@@ -508,6 +508,29 @@ func TestSweep_DeleteSkipsKeyRefreshedMidSweep(t *testing.T) {
 	}
 }
 
+// A quarantine backup overwritten by a concurrent replica's safeDelete
+// after the heal's listing must survive the purge: the age gate re-reads
+// the entry's ModTime at delete time, not list time (Codex round 13).
+func TestSweep_PurgeSkipsQuarantineRefreshedMidSweep(t *testing.T) {
+	f := newSweepFixture(t)
+	qKey := quarantinePrefix + blob.PackKey("r1", "requeued")
+	f.upload(qKey, "backup-bytes")
+	f.backdate(qKey, 25*time.Hour) // aged in the heal's listing snapshot
+
+	s := NewSweeper(&refreshedMidSweep{BlobStore: f.blobs, key: qKey}, f.store,
+		SweepConfig{Threshold: 24 * time.Hour, Delete: true}, slog.New(slog.DiscardHandler))
+	report, err := s.Sweep(context.Background())
+	if err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if !f.exists(qKey) {
+		t.Fatalf("mid-sweep-refreshed quarantine backup %q was purged", qKey)
+	}
+	if report.BytesReclaimed != 0 {
+		t.Fatalf("BytesReclaimed = %d, want 0 (purge skipped)", report.BytesReclaimed)
+	}
+}
+
 // ambiguousDelete executes deletes of the target key for real but reports
 // failure — the "delete executed, response lost" class (simtest's
 // FaultAmbiguous on blob.Delete).

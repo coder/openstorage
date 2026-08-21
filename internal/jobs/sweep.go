@@ -394,6 +394,22 @@ func (s *Sweeper) healQuarantineEntry(ctx context.Context, q blob.ListedObject, 
 	if !purge || q.ModTime.IsZero() || s.now().Sub(q.ModTime) < s.cfg.Threshold {
 		return nil
 	}
+	// The scan's ModTime is a snapshot: a concurrent replica's safeDelete
+	// may have overwritten this quarantine key with a fresh backup since
+	// the listing, and purging that fresh backup could strand the
+	// handshake's registered pack with no bytes anywhere. Re-read the
+	// entry's age immediately before the delete (Codex round 13).
+	mod, found, err := s.freshModTime(ctx, q.Key)
+	if err != nil {
+		return fmt.Errorf("sweep: revalidate quarantine %s: %w", q.Key, err)
+	}
+	if !found {
+		return nil // purged by a concurrent sweep: nothing left to do
+	}
+	if mod.IsZero() || s.now().Sub(mod) < s.cfg.Threshold {
+		s.logger.Info("orphan pack sweep: skipping quarantine purge, backup refreshed mid-sweep", "key", q.Key)
+		return nil
+	}
 	if err := s.blobs.Delete(ctx, q.Key); err != nil && !errors.Is(err, blob.ErrNotFound) {
 		return fmt.Errorf("sweep: purge quarantine %s: %w", q.Key, err)
 	}
@@ -421,21 +437,34 @@ func (s *Sweeper) revalidateOrphan(ctx context.Context, repo, key string) (bool,
 		s.logger.Info("orphan pack sweep: skipping delete, pack registered mid-sweep", "key", key)
 		return false, nil
 	}
-	objs, err := s.blobs.List(ctx, key)
+	mod, found, err := s.freshModTime(ctx, key)
 	if err != nil {
 		return false, fmt.Errorf("sweep: revalidate %s: list key: %w", key, err)
 	}
-	for _, obj := range objs {
-		if obj.Key != key {
-			continue // sibling key extending the prefix
-		}
-		if obj.ModTime.IsZero() || s.now().Sub(obj.ModTime) < s.cfg.Threshold {
-			s.logger.Info("orphan pack sweep: skipping delete, object refreshed mid-sweep", "key", key)
-			return false, nil
-		}
-		return true, nil
+	if !found {
+		return false, nil // gone already: nothing to delete
 	}
-	return false, nil // gone already: nothing to delete
+	if mod.IsZero() || s.now().Sub(mod) < s.cfg.Threshold {
+		s.logger.Info("orphan pack sweep: skipping delete, object refreshed mid-sweep", "key", key)
+		return false, nil
+	}
+	return true, nil
+}
+
+// freshModTime re-reads the exact key's current ModTime, discarding any
+// listing-snapshot value. found is false when the key no longer exists;
+// sibling keys merely extending the prefix do not count.
+func (s *Sweeper) freshModTime(ctx context.Context, key string) (mod time.Time, found bool, err error) {
+	objs, err := s.blobs.List(ctx, key)
+	if err != nil {
+		return time.Time{}, false, err
+	}
+	for _, obj := range objs {
+		if obj.Key == key {
+			return obj.ModTime, true, nil
+		}
+	}
+	return time.Time{}, false, nil
 }
 
 // Heal runs one standalone, strictly restorative quarantine pass. Serve
