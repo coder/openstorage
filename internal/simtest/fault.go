@@ -223,7 +223,8 @@ func (in *Injector) Fired() []FaultEvent {
 }
 
 // FiredSince returns injected faults with Seq > seq, plus the current
-// high-water mark to pass back next time (per-step fault attribution).
+// high-water mark to pass back next time (per-step fault attribution). It
+// does not mutate injector state, so overlapping windows are fine.
 func (in *Injector) FiredSince(seq int) ([]FaultEvent, int) {
 	in.mu.Lock()
 	defer in.mu.Unlock()
@@ -234,6 +235,13 @@ func (in *Injector) FiredSince(seq int) ([]FaultEvent, int) {
 		}
 	}
 	return out, in.seq
+}
+
+// Seq returns the current call sequence number (a mark for FiredSince).
+func (in *Injector) Seq() int {
+	in.mu.Lock()
+	defer in.mu.Unlock()
+	return in.seq
 }
 
 // begin counts one call of op and decides its fault class. Decorators call
