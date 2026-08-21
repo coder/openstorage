@@ -250,7 +250,7 @@ func TestRepack_FoldsToOnePack(t *testing.T) {
 	}
 }
 
-func TestRepack_LostRaceDeletesOwnOrphan(t *testing.T) {
+func TestRepack_LostRaceLeavesOrphanForSweeper(t *testing.T) {
 	f := newRepackFixture(t)
 	ctx := context.Background()
 	for range 3 {
@@ -285,7 +285,7 @@ func TestRepack_LostRaceDeletesOwnOrphan(t *testing.T) {
 		}
 		// Land a DIFFERENT competing fold: one more push changes the
 		// winner's input set, so the two consolidated packs differ and the
-		// loser's own-orphan cleanup must actually delete bytes.
+		// loser's blob becomes a genuine unregistered orphan.
 		f.push(t)
 		_, werr := f.repacker(winnerDir).Repack(ctx, f.repo)
 		return werr
@@ -301,10 +301,12 @@ func TestRepack_LostRaceDeletesOwnOrphan(t *testing.T) {
 	if rows[0].Key == loserKey {
 		t.Fatalf("winner and loser folds coincided (%s); the race was not exercised", loserKey)
 	}
-	// Lost race: zero DB changes beyond the winner's fold, and the loser
-	// deleted exactly its own orphan.
-	if f.blobExists(t, loserKey) {
-		t.Fatalf("loser's orphan blob %s survived its lost race", loserKey)
+	// Lost race: zero DB changes beyond the winner's fold, and NOTHING is
+	// deleted synchronously — the loser's blob lingers as an unregistered
+	// orphan for the sweeper (synchronous deletion cannot be made
+	// crash-safe against concurrent identical folds).
+	if !f.blobExists(t, loserKey) {
+		t.Fatalf("loser's orphan blob %s deleted synchronously; it must be left for the sweeper", loserKey)
 	}
 	if !f.blobExists(t, rows[0].Key) {
 		t.Fatalf("winner's consolidated blob %s missing", rows[0].Key)
@@ -313,6 +315,31 @@ func TestRepack_LostRaceDeletesOwnOrphan(t *testing.T) {
 		if !f.blobExists(t, key) {
 			t.Fatalf("pre-race blob %s deleted by the lost race", key)
 		}
+	}
+	f.checkColdHydrate(t)
+
+	// Composition: an aged delete-enabled sweep collects exactly the
+	// unregistered blobs (the loser's orphan and the superseded inputs),
+	// and the repo still cold-hydrates from what remains.
+	past := time.Now().Add(-25 * time.Hour)
+	objs, err := f.blobs.List(ctx, blob.PackPrefix(f.repo))
+	if err != nil {
+		t.Fatalf("list blobs: %v", err)
+	}
+	for _, o := range objs {
+		if o.Key == rows[0].Key {
+			continue // the live fold stays fresh
+		}
+		if err := os.Chtimes(filepath.Join(f.blobDir, filepath.FromSlash(o.Key)), past, past); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sweeper := NewSweeper(f.blobs, f.store, SweepConfig{Threshold: 24 * time.Hour, Delete: true}, slog.New(slog.DiscardHandler))
+	if _, err := sweeper.Sweep(ctx); err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	if f.blobExists(t, loserKey) {
+		t.Fatalf("aged sweep left the loser's orphan %s", loserKey)
 	}
 	f.checkColdHydrate(t)
 }
@@ -588,13 +615,14 @@ func (s *lostFoldShim) HasPack(ctx context.Context, repo, key string) (bool, err
 	return s.RefStore.HasPack(ctx, repo, key)
 }
 
-// TestRepack_LostFoldDeleteRaceRestoresLiveKey pins the round-2 P1 finding:
-// a stale fold that loses can produce the SAME content-addressed pack as
-// the winner (identical object union). If its pre-delete HasPack read lands
-// before the winner's install commits, it deletes the now-LIVE blob — the
-// post-delete registration recheck must detect this and restore the bytes
-// from the local pack file.
-func TestRepack_LostFoldDeleteRaceRestoresLiveKey(t *testing.T) {
+// TestRepack_LostIdenticalFoldKeepsLiveKey pins the round-2/3 P1 class: a
+// stale fold that loses can produce the SAME content-addressed pack as the
+// concurrent winner (identical object union), and its HasPack read can land
+// before the winner's install commits (the shim's first read reports
+// unregistered). The lost path must NOT delete — the key is (or is about to
+// be) LIVE, and no delete-then-restore dance is crash-safe. The blob must
+// survive untouched.
+func TestRepack_LostIdenticalFoldKeepsLiveKey(t *testing.T) {
 	f := newRepackFixture(t)
 	ctx := context.Background()
 	for range 2 {
@@ -614,7 +642,8 @@ func TestRepack_LostFoldDeleteRaceRestoresLiveKey(t *testing.T) {
 	liveKey := rows[0].Key
 
 	// The loser folds the same stale input in the same warm cache: same
-	// union, same deterministic pack id, same blob key as the LIVE row.
+	// union, same deterministic pack id, same blob key as the LIVE row —
+	// and its registration read (shim) says "unregistered", the worst case.
 	shim := &lostFoldShim{RefStore: f.store, stale: stale}
 	loser := NewRepacker(shim, f.blobs, func(ctx context.Context, repo string) (string, error, error) {
 		return githttp.Hydrate(ctx, f.store, f.blobs, warmDir, repo, "main")
@@ -622,17 +651,14 @@ func TestRepack_LostFoldDeleteRaceRestoresLiveKey(t *testing.T) {
 	if _, err := loser.Repack(ctx, f.repo); err != nil {
 		t.Fatalf("loser repack: %v", err)
 	}
-	if shim.hasPackCalls < 2 {
-		t.Fatalf("HasPack called %d times; the loser skipped the post-delete recheck", shim.hasPackCalls)
-	}
 
-	// The lost fold's cleanup deleted the live blob; the handshake must
-	// have restored it, and the repo must still cold-hydrate cleanly.
+	// The live blob was never deleted, the rows are the winner's, and the
+	// repo cold-hydrates cleanly.
 	if got := f.packRows(t); len(got) != 1 || got[0].Key != liveKey {
 		t.Fatalf("pack rows after lost fold = %+v, want the winner's row %s", got, liveKey)
 	}
 	if !f.blobExists(t, liveKey) {
-		t.Fatalf("live blob %s not restored after the lost fold's delete race", liveKey)
+		t.Fatalf("live blob %s deleted by the lost identical fold", liveKey)
 	}
 	f.checkColdHydrate(t)
 }
@@ -683,6 +709,51 @@ func TestRepack_RepublishesBlobSweptMidSwap(t *testing.T) {
 	}
 	if !f.blobExists(t, rows[0].Key) {
 		t.Fatalf("consolidated blob %s not re-published after mid-swap sweep", rows[0].Key)
+	}
+	f.checkColdHydrate(t)
+}
+
+// TestRepack_RuntimeBudgetBoundsFold pins the security-round runtime
+// budget: the whole fold runs under MaxFoldDuration, so an
+// already-expired budget aborts before any mutation — compressed-size
+// budgets alone undercount CPU (a tiny pack can inflate to huge logical
+// content), and only a wall-clock bound caps the actual work.
+func TestRepack_RuntimeBudgetBoundsFold(t *testing.T) {
+	f := newRepackFixture(t)
+	ctx := context.Background()
+	for range 3 {
+		f.push(t)
+	}
+	before, err := f.blobs.List(ctx, blob.PackPrefix(f.repo))
+	if err != nil {
+		t.Fatalf("list blobs: %v", err)
+	}
+
+	r := f.repacker(t.TempDir())
+	r.MaxFoldDuration = time.Nanosecond // expires before any step
+	folded, err := r.Repack(ctx, f.repo)
+	if err == nil || folded {
+		t.Fatalf("expired runtime budget: Repack = (folded %v, err %v), want a deadline error", folded, err)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Repack error = %v, want context.DeadlineExceeded in the chain", err)
+	}
+	// Crash-equivalence: no DB change, no blob change.
+	if rows := f.packRows(t); len(rows) != 3 {
+		t.Fatalf("pack rows after aborted fold = %+v, want the original 3", rows)
+	}
+	after, err := f.blobs.List(ctx, blob.PackPrefix(f.repo))
+	if err != nil {
+		t.Fatalf("list blobs: %v", err)
+	}
+	if len(after) != len(before) {
+		t.Fatalf("aborted fold changed the blob set: %d -> %d", len(before), len(after))
+	}
+
+	// A sane budget folds normally.
+	r.MaxFoldDuration = time.Minute
+	if folded, err := r.Repack(ctx, f.repo); err != nil || !folded {
+		t.Fatalf("sane runtime budget: Repack = (folded %v, err %v), want a fold", folded, err)
 	}
 	f.checkColdHydrate(t)
 }
@@ -834,8 +905,9 @@ func TestRiver_RepackUniqueByRepo(t *testing.T) {
 
 	// Triggers firing while the fold runs are swallowed by uniqueness
 	// (running is a required unique state): still exactly one job. The
-	// packs registered mid-fold survive the fold's snapshot; the WORKER's
-	// post-fold recheck owns folding them via snooze.
+	// packs registered mid-fold survive the fold's snapshot; the WORKER
+	// owns folding them via a durable successor inserted strictly after
+	// its transactional completion.
 	f.push(t)
 	f.push(t)
 	for range 3 {
@@ -848,11 +920,11 @@ func TestRiver_RepackUniqueByRepo(t *testing.T) {
 	}
 	release()
 
-	// The job folds its snapshot, rechecks the threshold (fold + 2 mid-run
-	// rows = 3 >= 2), snoozes, folds again, and only then completes — the
-	// SAME job throughout. Wait for completion (the state flips after the
-	// worker returns; the uniqueness check below must not race it).
-	waitJobs(`SELECT count(*) FROM river_job WHERE kind = 'repack' AND state = 'completed'`, 1, "completed repack jobs")
+	// The job folds its snapshot, completes itself transactionally,
+	// rechecks the threshold (fold + 2 mid-run rows = 3 >= 2), and inserts
+	// a successor; the successor folds the leftovers and completes with no
+	// further follow-up: exactly two completed jobs, one pack row.
+	waitJobs(`SELECT count(*) FROM river_job WHERE kind = 'repack' AND state = 'completed'`, 2, "completed repack jobs")
 	if rows := f.packRows(t); len(rows) != 1 {
 		t.Fatalf("pack rows after follow-up fold = %+v, want 1 (mid-run rows not refolded)", rows)
 	}
@@ -863,8 +935,8 @@ func TestRiver_RepackUniqueByRepo(t *testing.T) {
 	if err := q.EnqueueRepack(ctx, f.repo); err != nil {
 		t.Fatalf("enqueue after completion: %v", err)
 	}
-	if n := countJobs(); n != 2 {
-		t.Fatalf("river holds %d repack jobs after completion + retrigger, want 2", n)
+	if n := countJobs(); n != 3 {
+		t.Fatalf("river holds %d repack jobs after completion + retrigger, want 3", n)
 	}
 
 	// Insert-only clients (hook subprocesses) must refuse repack inserts:

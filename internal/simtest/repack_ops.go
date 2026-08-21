@@ -15,7 +15,6 @@ package simtest
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -170,12 +169,13 @@ func (c *captureReplace) ReplacePacks(ctx context.Context, repo string, old []re
 // race semantics exactly):
 //
 //	loser lists + packs + uploads → [mid-race push lands; winner folds] →
-//	loser's ReplacePacks loses → loser deletes its own uploaded blob.
+//	loser's ReplacePacks loses → loser leaves its blob for the sweeper.
 //
 // Oracle: exactly the winner's fold installs; the loser leaves no DB change
-// and no orphan blob; the mid-race push's row survives the winner's fold
-// input snapshot semantics (it IS part of the winner's input here because
-// the winner lists after it lands).
+// and deletes NOTHING — its uploaded blob remains as an unregistered orphan
+// (synchronous deletion cannot be made crash-safe against concurrent
+// identical folds; the aged sweeper owns it). The mid-race push's row is
+// part of the winner's input here because the winner lists after it lands.
 func (s *sim) doRepackRace(name string, node *simNode, repo *simRepo, branch string) error {
 	ctx := context.Background()
 	pre, err := s.oraclePackSet(repo.key)
@@ -259,16 +259,26 @@ func (s *sim) doRepackRace(name string, node *simNode, repo *simRepo, branch str
 			return nil
 		}
 	}
-	// Lost race leaves no leaked blob: the loser's upload must be gone...
-	if _, err := s.cl.oracleBl.Stat(ctx, loserKey); err == nil {
-		s.violate("step %d: repack race: loser's blob %s survived its lost race", s.step, loserKey)
+	// Lost race deletes NOTHING: the loser's upload must remain (an
+	// unregistered orphan the sweeper owns) and must not be registered.
+	if _, err := s.cl.oracleBl.Stat(ctx, loserKey); err != nil {
+		s.violate("step %d: repack race: loser's blob %s deleted synchronously (must be left for the sweeper): %v",
+			s.step, loserKey, err)
 		return nil
-	} else if !errors.Is(err, blob.ErrNotFound) {
-		return fmt.Errorf("step %d: stat loser blob: %w", s.step, err)
 	}
-	// ...while the winner's install and every superseded blob stay (the
-	// sweeper owns superseded blobs; per-step invariant (c) covers the
-	// winner's row).
+	registered := false
+	for _, key := range post {
+		if key == loserKey {
+			registered = true
+		}
+	}
+	if registered {
+		s.violate("step %d: repack race: loser's blob %s ended up registered despite losing", s.step, loserKey)
+		return nil
+	}
+	// The winner's install and every superseded blob stay too (the sweeper
+	// owns superseded blobs; per-step invariant (c) covers the winner's
+	// row).
 	for id, key := range pre {
 		if _, err := s.cl.oracleBl.Stat(ctx, key); err != nil {
 			s.violate("step %d: repack race: superseded blob %s (row %s) vanished synchronously: %v",

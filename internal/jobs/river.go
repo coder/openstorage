@@ -95,13 +95,16 @@ func (sweepArgs) InsertOpts() river.InsertOpts {
 // next insert past the threshold is the retry), and a failed fold is
 // harmless to defer the same way.
 //
-// Uniqueness including the running state swallows triggers that fire while
-// a fold runs — but a running fold works a row snapshot from its start, so
-// packs registered mid-fold survive it and a burst could otherwise finish
-// above the threshold with nothing scheduled until the next write. The
-// worker therefore rechecks the threshold after each fold and SNOOZES the
-// same job when more folding is due (river requires running in ByState, so
-// a separate queued follow-up is not expressible).
+// Uniqueness including the running state (river requires running in
+// ByState) swallows triggers that fire while a fold runs — but a running
+// fold works a row snapshot from its start, so packs registered mid-fold
+// survive it and a burst could otherwise finish above the threshold with
+// nothing scheduled until the next write. The worker therefore completes
+// its job TRANSACTIONALLY (river.JobCompleteTx) and only then rechecks the
+// threshold, inserting a durable successor when more folding is due: every
+// registration commits either before that post-completion recheck (the
+// successor covers it) or after it (its own trigger inserts successfully,
+// the running row being gone) — no ordering strands a swallowed trigger.
 type repackArgs struct {
 	Repo string `json:"repo" river:"unique"`
 }
@@ -124,35 +127,73 @@ func (repackArgs) InsertOpts() river.InsertOpts {
 	}
 }
 
-// repackFollowUpSnooze delays a due follow-up fold: long enough to batch a
-// burst's remaining registrations, short enough to keep pack counts near
-// the threshold under sustained traffic.
-const repackFollowUpSnooze = 5 * time.Second
+// repackFollowUpDelay schedules a due follow-up fold slightly in the
+// future: long enough to batch a burst's remaining registrations, short
+// enough to keep pack counts near the threshold under sustained traffic.
+const repackFollowUpDelay = 5 * time.Second
 
 // repackWorker runs one fold attempt; the Repacker owns race handling and
-// reporting. A post-fold threshold recheck snoozes the job when packs
-// registered mid-fold left the repo due for another fold (snoozing does not
-// consume the attempt). The residual window — a registration landing after
-// the recheck but before the job completes — is bounded by one job-state
-// flip and is retried by that write's own trigger chain on the next write.
+// reporting. pool is the river client's own pgx pool (set by NewRiver
+// before the client starts); the transactional completion below needs it.
 type repackWorker struct {
 	river.WorkerDefaults[repackArgs]
 	repacker *Repacker
+	pool     *pgxpool.Pool
 }
 
+// Work folds once, then closes the trigger-uniqueness window: it completes
+// the job via JobCompleteTx and re-checks the follow-up threshold strictly
+// AFTER that completion commits. Registrations racing the completion are
+// covered either by this recheck (committed before it) or by their own
+// trigger's insert (running after it, when the unique index no longer
+// holds an active row). The recheck is gated on an actual fold: after a
+// lost race there is nothing new to schedule (in river deployments the
+// winner was another river job whose own recheck runs), and after a
+// budget no-op a follow-up would no-op forever.
 func (w *repackWorker) Work(ctx context.Context, job *river.Job[repackArgs]) error {
 	folded, err := w.repacker.Repack(ctx, job.Args.Repo)
 	if err != nil {
 		return err
 	}
-	// Follow up only after an actual fold: snoozing after a lost race
-	// would be the eager retry the design rejects, and snoozing after a
-	// budget/no-op skip would loop forever on repos whose row count sits
-	// above the threshold without foldable work.
-	if folded && w.repacker.NeedsFollowUp(ctx, job.Args.Repo) {
-		return river.JobSnooze(repackFollowUpSnooze)
+	if !folded {
+		return nil
+	}
+	assertf(w.pool != nil, "repackWorker: pool not wired")
+	// Transactional self-completion. Failures roll back and fall through
+	// to river's normal completion — the recheck window then stays open
+	// for this job, which the next write's trigger chain covers (rare,
+	// logged, never corrupting).
+	tx, err := w.pool.Begin(ctx)
+	if err != nil {
+		w.repacker.logger.Warn("repack: follow-up completion begin failed", "repo", job.Args.Repo, "err", err)
+		return nil
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := river.JobCompleteTx[*riverpgxv5.Driver](ctx, tx, job); err != nil {
+		w.repacker.logger.Warn("repack: transactional completion failed", "repo", job.Args.Repo, "err", err)
+		return nil
+	}
+	if err := tx.Commit(ctx); err != nil {
+		w.repacker.logger.Warn("repack: completion commit failed", "repo", job.Args.Repo, "err", err)
+		return nil
+	}
+	// Strictly after the completion commit: the running row is gone from
+	// the unique index, so this insert (and any concurrent trigger's)
+	// succeeds when due.
+	if w.repacker.NeedsFollowUp(ctx, job.Args.Repo) {
+		if _, err := w.insertFollowUp(ctx, job.Args.Repo); err != nil {
+			w.repacker.logger.Warn("repack: follow-up insert failed (next write retries)",
+				"repo", job.Args.Repo, "err", err)
+		}
 	}
 	return nil
+}
+
+// insertFollowUp inserts the successor fold job, slightly delayed to batch
+// a burst's remaining registrations.
+func (w *repackWorker) insertFollowUp(ctx context.Context, repo string) (*rivertype.JobInsertResult, error) {
+	return river.ClientFromContext[pgx.Tx](ctx).Insert(ctx, repackArgs{Repo: repo},
+		&river.InsertOpts{ScheduledAt: time.Now().Add(repackFollowUpDelay)})
 }
 
 // sweepWorker runs one orphan-pack sweep; the Sweeper owns all reporting.
@@ -280,7 +321,7 @@ func NewRiver(ctx context.Context, pgURL string, deliverer *events.Deliverer, ru
 	river.AddWorker(workers, &deliveryWorker{deliverer: deliverer})
 	river.AddWorker(workers, &syncWorker{run: runSync, logger: logger})
 	if repack != nil {
-		river.AddWorker(workers, &repackWorker{repacker: repack})
+		river.AddWorker(workers, &repackWorker{repacker: repack, pool: pool})
 	}
 	var periodic []*river.PeriodicJob
 	if sweep != nil {

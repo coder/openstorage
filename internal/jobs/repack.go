@@ -16,12 +16,15 @@
 //  6. install the fold with ref.RefStore.ReplacePacks — one transaction that
 //     deletes exactly the selected rows and inserts the new one.
 //
-// A lost install (another node folded first) deletes its own uploaded blob
-// and stops; there is no eager retry — the next write past the threshold
-// re-triggers. Superseded pack BLOBS are never deleted here: they become
-// unregistered, age past the orphan sweeper's threshold, and are collected
-// by it (issue #5). Concurrent hydrators that raced the swap re-list and
-// retry via the bounded loop in githttp.HydratePacks (issue #6).
+// A lost install (another node folded first) stops cleanly; there is no
+// eager retry — the next write past the threshold re-triggers. NOTHING is
+// ever deleted from blob storage on this path: superseded pack blobs and a
+// lost fold's own upload alike become unregistered, age past the orphan
+// sweeper's threshold, and are collected by its crash-safe quarantine
+// protocol (issue #5) — synchronous deletion raced concurrent identical
+// folds on content-addressed keys and could not be made crash-safe without
+// duplicating that protocol. Concurrent hydrators that raced the swap
+// re-list and retry via the bounded loop in githttp.HydratePacks (issue #6).
 //
 // Fold contents — why the object UNION and not `git pack-objects --all`
 // (reachable objects): reachability at fold time is NOT a safe upper bound
@@ -66,10 +69,13 @@ type HydrateFunc func(ctx context.Context, repo string) (repoPath string, refsEr
 
 // runGitStdin executes git with args and the given stdin, returning stdout
 // only (stderr is captured separately and surfaced in the error text, like
-// githttp.runGit: warnings must never contaminate parsed stdout).
-func runGitStdin(dir string, stdin io.Reader, args ...string) (string, error) {
+// githttp.runGit: warnings must never contaminate parsed stdout). The
+// subprocess is killed when ctx expires — the fold's runtime budget must
+// bound pack-objects, whose work scales with logical (inflated) content,
+// not with the compressed input sizes the byte budget sees.
+func runGitStdin(ctx context.Context, dir string, stdin io.Reader, args ...string) (string, error) {
 	assertf(len(args) > 0, "runGitStdin: no args")
-	cmd := exec.Command("git", args...)
+	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Dir = dir
 	cmd.Stdin = stdin
 	var stderr bytes.Buffer
@@ -110,6 +116,15 @@ type Repacker struct {
 	// per fold beats one unbounded fold.
 	MaxFoldObjects int
 	MaxFoldBytes   int64
+	// MaxFoldDuration bounds ONE fold's wall-clock runtime (0 = default).
+	// The input budgets above measure compressed pack bytes, which
+	// undercount CPU: a few-hundred-KiB pack can inflate to hundreds of
+	// MiB of logical content that pack-objects re-delta-compresses. The
+	// runtime budget caps the actual work directly — the whole fold runs
+	// under a deadline and every git subprocess it spawns is killed on
+	// expiry. A timed-out fold is crash-equivalent at every point by
+	// design (at worst one unregistered uploaded blob, sweeper class).
+	MaxFoldDuration time.Duration
 
 	// BeforeSwap is a test seam: when set, it runs after the consolidated
 	// pack's blob upload and before ReplacePacks — the fold-install race
@@ -147,12 +162,14 @@ func NewRepacker(store ref.RefStore, blobs blob.BlobStore, hydrate HydrateFunc, 
 	return &Repacker{store: store, blobs: blobs, hydrate: hydrate, logger: logger}
 }
 
-// Default per-fold budgets (see Repacker.MaxFoldObjects/MaxFoldBytes): one
-// million objects bounds the in-memory union at tens of MB, and 2 GiB of
-// input pack bytes bounds one fold's recompression and upload work.
+// Default per-fold budgets (see the Repacker fields): one million objects
+// bounds the in-memory union at tens of MB, 2 GiB of input pack bytes
+// bounds one fold's download/upload traffic, and five minutes of wall-clock
+// runtime bounds its CPU regardless of how the inputs compress.
 const (
-	defaultMaxFoldObjects = 1 << 20
-	defaultMaxFoldBytes   = 2 << 30
+	defaultMaxFoldObjects  = 1 << 20
+	defaultMaxFoldBytes    = 2 << 30
+	defaultMaxFoldDuration = 5 * time.Minute
 )
 
 // Repack runs one fold attempt for repo, returning whether a fold was
@@ -162,6 +179,11 @@ const (
 // next trigger retries).
 func (r *Repacker) Repack(ctx context.Context, repo string) (folded bool, err error) {
 	assertf(repo != "", "Repack: empty repo")
+	// Runtime budget: the fold's deadline covers everything below —
+	// hydration, enumeration, pack-objects (killed via CommandContext on
+	// expiry), upload, and swap. Aborting anywhere is crash-equivalent.
+	ctx, cancel := context.WithTimeout(ctx, r.durationBudget())
+	defer cancel()
 
 	// Snapshot BEFORE hydrating: Hydrate materializes at least every pack
 	// listed here, so the union enumeration below can never miss a
@@ -213,7 +235,7 @@ func (r *Repacker) Repack(ctx context.Context, repo string) (folded bool, err er
 	}
 	old = fold
 
-	objs, err := packObjectUnion(repoPath, old)
+	objs, err := packObjectUnion(ctx, repoPath, old)
 	if lostBeforePacking(err) {
 		return false, nil
 	}
@@ -221,7 +243,7 @@ func (r *Repacker) Repack(ctx context.Context, repo string) (folded bool, err er
 		return false, fmt.Errorf("repack %s: %w", repo, err)
 	}
 
-	id, packPath, err := writeConsolidatedPack(repoPath, objs)
+	id, packPath, err := writeConsolidatedPack(ctx, repoPath, objs)
 	if err != nil {
 		return false, fmt.Errorf("repack %s: %w", repo, err)
 	}
@@ -251,44 +273,29 @@ func (r *Repacker) Repack(ctx context.Context, repo string) (folded bool, err er
 		return false, errors.Join(fmt.Errorf("repack %s: replace packs: %w", repo, err), verr)
 	}
 	if !won {
-		// Cleanly lost fold: delete our own orphan — unless an identical
-		// pack id is registered (identity fold or a concurrent identical
-		// fold won), in which case the blob is LIVE: keep it and verify
-		// its publication like the won path below.
-		switch has, herr := r.store.HasPack(ctx, repo, newPack.Key); {
-		case herr != nil:
-			r.logger.Warn("repack: lost fold; skipping blob cleanup (HasPack failed, sweeper will collect)",
+		// Cleanly lost fold: the uploaded blob is NEVER deleted here — it
+		// is left for the aged orphan sweeper, whose safeDelete protocol
+		// (age threshold, registration handshake, quarantine copy, heal)
+		// is the only crash-safe deletion path. Deleting synchronously
+		// raced concurrent identical folds on the content-addressed key: a
+		// winner installing the same pack between our HasPack read and the
+		// delete — with a crash before any restore — would leave its live
+		// row permanently referencing missing bytes, unrecoverable because
+		// this path (unlike the sweeper) kept no quarantine copy. The cost
+		// of deferring is one consolidated blob lingering for the sweep
+		// age threshold. When the key IS already registered (a concurrent
+		// identical fold won), the blob is live: verify its publication
+		// like the won path below.
+		if has, herr := r.store.HasPack(ctx, repo, newPack.Key); herr != nil {
+			r.logger.Warn("repack: lost fold; registration check failed (blob left for the sweeper)",
 				"repo", repo, "key", newPack.Key, "err", herr)
-		case has:
+		} else if has {
 			if verr := verifyPublished(ctx, r.blobs, newPack.Key, packPath); verr != nil {
 				return false, fmt.Errorf("repack %s: lost fold: %w", repo, verr)
 			}
-		default:
-			if derr := r.blobs.Delete(ctx, newPack.Key); derr != nil && !errors.Is(derr, blob.ErrNotFound) {
-				r.logger.Warn("repack: lost fold; blob cleanup failed (sweeper will collect)",
-					"repo", repo, "key", newPack.Key, "err", derr)
-			}
-			// Post-delete registration recheck (the sweeper's safeDelete
-			// handshake): a concurrent fold over the CURRENT rows can
-			// produce this same content-addressed key and install it
-			// between the HasPack read above and the delete — and its own
-			// post-swap verification may have passed before the delete
-			// landed. Re-read, and restore from the local pack file when
-			// the key is registered (or when the recheck cannot prove it
-			// is not: an extra orphan is sweeper fodder, a live row
-			// without bytes is corruption).
-			has2, herr2 := r.store.HasPack(ctx, repo, newPack.Key)
-			if herr2 != nil {
-				r.logger.Warn("repack: lost fold; post-delete recheck failed, restoring blob defensively",
-					"repo", repo, "key", newPack.Key, "err", herr2)
-			}
-			if has2 || herr2 != nil {
-				if verr := verifyPublished(ctx, r.blobs, newPack.Key, packPath); verr != nil {
-					return false, fmt.Errorf("repack %s: lost fold: restore after delete race: %w", repo, verr)
-				}
-			}
 		}
-		r.logger.Info("repack: lost fold-install race", "repo", repo, "folded", len(old))
+		r.logger.Info("repack: lost fold-install race (blob left for the sweeper)",
+			"repo", repo, "folded", len(old), "key", newPack.Key)
 		return false, nil
 	}
 	// Writer half of the orphan-sweep coordination (issue #5), exactly like
@@ -326,6 +333,13 @@ func (r *Repacker) byteBudget() int64 {
 		return r.MaxFoldBytes
 	}
 	return defaultMaxFoldBytes
+}
+
+func (r *Repacker) durationBudget() time.Duration {
+	if r.MaxFoldDuration > 0 {
+		return r.MaxFoldDuration
+	}
+	return defaultMaxFoldDuration
 }
 
 // selectFoldInput picks the fold's input greedily, oldest-first (ListPacks
@@ -462,7 +476,7 @@ var errFoldInputGone = errors.New("jobs: snapshotted pack not materialized (fold
 // the snapshot, so a snapshotted pack can be missing locally only when a
 // concurrent fold removed its row before Hydrate listed — reported as
 // errFoldInputGone.
-func packObjectUnion(repoPath string, packs []ref.Pack) ([]string, error) {
+func packObjectUnion(ctx context.Context, repoPath string, packs []ref.Pack) ([]string, error) {
 	seen := make(map[string]bool)
 	for _, p := range packs {
 		idx := filepath.Join(repoPath, "objects", "pack", "pack-"+p.ID+".idx")
@@ -470,7 +484,7 @@ func packObjectUnion(repoPath string, packs []ref.Pack) ([]string, error) {
 		if err != nil {
 			return nil, fmt.Errorf("pack %s: %w: %w", p.ID, errFoldInputGone, err)
 		}
-		err = streamShowIndex(repoPath, f, func(sha string) { seen[sha] = true })
+		err = streamShowIndex(ctx, repoPath, f, func(sha string) { seen[sha] = true })
 		_ = f.Close()
 		if err != nil {
 			return nil, fmt.Errorf("show-index %s: %w", p.ID, err)
@@ -487,8 +501,8 @@ func packObjectUnion(repoPath string, packs []ref.Pack) ([]string, error) {
 // streamShowIndex runs `git show-index` over one idx (fed via stdin) and
 // calls fn per object id, streaming stdout so memory never scales with the
 // pack's object count.
-func streamShowIndex(repoPath string, idx io.Reader, fn func(sha string)) error {
-	cmd := exec.Command("git", "show-index")
+func streamShowIndex(ctx context.Context, repoPath string, idx io.Reader, fn func(sha string)) error {
+	cmd := exec.CommandContext(ctx, "git", "show-index")
 	cmd.Dir = repoPath
 	cmd.Stdin = idx
 	var stderr bytes.Buffer
@@ -533,7 +547,7 @@ func streamShowIndex(repoPath string, idx io.Reader, fn func(sha string)) error 
 // pack bytes — and therefore the content-derived pack id — are a
 // deterministic function of the object set. Returns the pack id (the
 // content hash git names the pack with) and the .pack path.
-func writeConsolidatedPack(repoPath string, objs []string) (id, packPath string, err error) {
+func writeConsolidatedPack(ctx context.Context, repoPath string, objs []string) (id, packPath string, err error) {
 	prefix := filepath.Join(repoPath, "objects", "pack", "pack")
 	stdin := strings.NewReader(strings.Join(objs, "\n") + "\n")
 	if len(objs) == 0 {
@@ -541,7 +555,7 @@ func writeConsolidatedPack(repoPath string, objs []string) (id, packPath string,
 		// keep the reader empty rather than sending a blank line.
 		stdin = strings.NewReader("")
 	}
-	out, err := runGitStdin(repoPath, stdin, "pack-objects", "--threads=1", "-q", prefix)
+	out, err := runGitStdin(ctx, repoPath, stdin, "pack-objects", "--threads=1", "-q", prefix)
 	if err != nil {
 		return "", "", fmt.Errorf("pack-objects: %w", err)
 	}
