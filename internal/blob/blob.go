@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 
@@ -141,20 +142,31 @@ func LFSKey(repoID, oid string) string {
 // blob a concurrent sweep just deleted (Codex round 14).
 func EnsurePublished(ctx context.Context, b BlobStore, key, path string) error {
 	assertf(b != nil && key != "" && path != "", "EnsurePublished(%q, %q)", key, path)
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), ensurePublishedTimeout)
+	fi, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("stat local pack %s: %w", path, err)
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), ensurePublishedTimeout(fi.Size()))
 	defer cancel()
-	_, err := b.Stat(ctx, key)
+	_, err = b.Stat(ctx, key)
 	if errors.Is(err, ErrNotFound) {
 		return b.UploadFile(ctx, key, path)
 	}
 	return err
 }
 
-// ensurePublishedTimeout bounds EnsurePublished's detached verification:
-// generous enough to re-upload a pack that was just uploaded over the same
-// server→store link, small enough that a wedged store cannot pin request
-// goroutines indefinitely.
-const ensurePublishedTimeout = 5 * time.Minute
+// ensurePublishedTimeout bounds EnsurePublished's detached verification.
+// The bound scales with the pack size — a repair upload MUST be able to
+// finish, or the committed registry row keeps pointing at an absent object
+// until the next heal — while still guaranteeing a wedged store cannot pin
+// request goroutines forever. The floor covers round-trips and small packs;
+// the per-byte allowance assumes a worst-case sustained ~1 MiB/s to the
+// store, far below any realistic server→store link.
+func ensurePublishedTimeout(size int64) time.Duration {
+	assertf(size >= 0, "ensurePublishedTimeout: negative size %d", size)
+	const perMiB = time.Second
+	return 5*time.Minute + time.Duration(size>>20)*perMiB
+}
 
 // Open dispatches on the URL scheme to the matching BlobStore backend:
 //

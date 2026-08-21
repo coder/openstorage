@@ -373,6 +373,23 @@ func TestEnsurePublished(t *testing.T) {
 	}
 }
 
+// The verification deadline scales with pack size so a repair upload of a
+// supported large pack (S3 multipart copy handles >5 GiB) can finish
+// within it (Codex round 15).
+func TestEnsurePublishedTimeout(t *testing.T) {
+	if got := ensurePublishedTimeout(0); got != 5*time.Minute {
+		t.Fatalf("timeout(0) = %v, want the 5m floor", got)
+	}
+	const fiveGiB = 5 << 30
+	got := ensurePublishedTimeout(fiveGiB)
+	if want := 5*time.Minute + 5120*time.Second; got != want {
+		t.Fatalf("timeout(5GiB) = %v, want %v", got, want)
+	}
+	if got <= 6*time.Minute {
+		t.Fatalf("timeout(5GiB) = %v: cannot cover a 5 GiB re-upload", got)
+	}
+}
+
 // ListPages streams in key order with bounded pages; the final short page
 // is delivered and fn errors abort the scan.
 func TestFile_ListPages(t *testing.T) {

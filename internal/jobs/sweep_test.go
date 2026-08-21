@@ -532,6 +532,33 @@ func TestSweep_DeleteSkipsKeyRefreshedMidSweep(t *testing.T) {
 	}
 }
 
+// The report's orphan list is a bounded sample: counts and bytes stay
+// exact however large the backlog, but memory must not scale with it
+// (Codex round 15).
+func TestSweep_OrphanSampleBounded(t *testing.T) {
+	orig := maxOrphanSample
+	maxOrphanSample = 2
+	t.Cleanup(func() { maxOrphanSample = orig })
+
+	f := newSweepFixture(t)
+	var total int64
+	for _, id := range []string{"a", "b", "c"} {
+		key := blob.PackKey("r1", id)
+		total += f.upload(key, "orphan-"+id)
+		f.backdate(key, 25*time.Hour)
+	}
+	report, err := f.sweeper(SweepConfig{Threshold: 24 * time.Hour}).Sweep(context.Background())
+	if err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if report.OrphanCount != 3 || report.OrphanBytes != total {
+		t.Fatalf("report = %+v, want exact count 3 and bytes %d", report, total)
+	}
+	if len(report.Orphans) != 2 {
+		t.Fatalf("sample holds %d entries, want the maxOrphanSample cap of 2", len(report.Orphans))
+	}
+}
+
 // quarantineKey mints unique write-once backup keys that parse back to the
 // original pack key; the legacy shared-key layout still parses (Codex
 // round 14).

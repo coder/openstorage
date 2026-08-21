@@ -67,8 +67,14 @@ type SweepReport struct {
 	ReposScanned int
 	Live         int // blobs present in the pack registry
 	Fresh        int // unregistered but younger than the threshold
-	Orphans      []OrphanPack
-	OrphanBytes  int64
+	// Orphans is a bounded sample (maxOrphanSample) of the candidates:
+	// an orphan backlog after an outage can be arbitrarily large, and the
+	// report must not scale worker memory with it. OrphanCount and
+	// OrphanBytes stay exact; every candidate is also logged as it is
+	// classified.
+	Orphans     []OrphanPack
+	OrphanCount int
+	OrphanBytes int64
 	// Deleted counts orphans reaped this run. Their bytes move to a
 	// quarantine backup rather than disappearing, so reaping frees nothing
 	// by itself; BytesReclaimed counts only quarantine backups purged this
@@ -149,8 +155,8 @@ func (s *Sweeper) Sweep(ctx context.Context) (SweepReport, error) {
 	// uploads and registers packs before ref policy), so the sweep must
 	// never materialize a prefix listing or a repo's pack set. Memory is
 	// bounded by one page, the distinct-repo seen-set (a control-plane-
-	// bounded population), and the orphan report (orphans require a server
-	// crash mid-push, not attacker-mintable traffic). Keys not matching
+	// bounded population), and the report's bounded orphan sample
+	// (maxOrphanSample; counts and bytes stay exact). Keys not matching
 	// the exact blob.PackKey shape (packs/<repo>/pack-<id>.pack, no deeper
 	// nesting) were not written by this system — leave foreign objects
 	// alone, loudly.
@@ -178,7 +184,7 @@ func (s *Sweeper) Sweep(ctx context.Context) (SweepReport, error) {
 
 	s.logger.Info("orphan pack sweep finished",
 		"repos", report.ReposScanned, "live", report.Live, "fresh", report.Fresh,
-		"orphans", len(report.Orphans), "orphan_bytes", report.OrphanBytes,
+		"orphans", report.OrphanCount, "orphan_bytes", report.OrphanBytes,
 		"deleted", report.Deleted, "bytes_reclaimed", report.BytesReclaimed,
 		"delete_enabled", s.cfg.Delete, "threshold", s.cfg.Threshold,
 		"duration", s.now().Sub(start).Round(time.Millisecond))
@@ -188,6 +194,10 @@ func (s *Sweeper) Sweep(ctx context.Context) (SweepReport, error) {
 // sweepListPageSize bounds how many listed objects a sweep holds per page.
 // A var so tests can force multi-page scans with few objects.
 var sweepListPageSize = 1000
+
+// maxOrphanSample bounds SweepReport.Orphans (see its doc). A var so tests
+// can exercise the cap without minting thousands of objects.
+var maxOrphanSample = 100
 
 // classify handles one listed pack blob: a point registry read, then the
 // age-threshold diff, then (delete mode only) the revalidate + quarantine
@@ -213,7 +223,10 @@ func (s *Sweeper) classify(ctx context.Context, repo string, obj blob.ListedObje
 		report.Fresh++
 		return nil
 	}
-	report.Orphans = append(report.Orphans, OrphanPack{Key: obj.Key, Size: obj.Size, Age: age})
+	if len(report.Orphans) < maxOrphanSample {
+		report.Orphans = append(report.Orphans, OrphanPack{Key: obj.Key, Size: obj.Size, Age: age})
+	}
+	report.OrphanCount++
 	report.OrphanBytes += obj.Size
 	s.logger.Info("orphan pack candidate",
 		"key", obj.Key, "size_bytes", obj.Size, "age", age.Round(time.Second),
