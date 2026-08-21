@@ -574,6 +574,22 @@ func TestRepack_BudgetsBoundFoldInput(t *testing.T) {
 		t.Fatalf("pack rows after no-op = %+v, want unchanged 2", rows)
 	}
 
+	// Wedge regression (round-8): grow the repo to [fold(6obj), p(3), p(3)].
+	// The greedy pass selects the old consolidated pack first (6 ≤ 7) and
+	// crowds out both small packs; the restart pass must instead pair the
+	// two small packs — a permanent no-op here would let later pushes
+	// accumulate unbounded rows behind one oversized fold.
+	f.push(t)
+	folded, err = r.Repack(ctx, f.repo)
+	if err != nil || !folded {
+		t.Fatalf("wedge repack = (folded %v, err %v), want the small packs folded", folded, err)
+	}
+	rows := f.packRows(t)
+	if len(rows) != 2 {
+		t.Fatalf("pack rows after wedge fold = %+v, want [old fold, new small fold]", rows)
+	}
+	f.checkColdHydrate(t)
+
 	// A byte budget of one selects nothing either.
 	rb := f.repacker(t.TempDir())
 	rb.MaxFoldBytes = 1

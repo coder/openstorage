@@ -414,9 +414,7 @@ func (r *Repacker) durationBudget() time.Duration {
 // (our swap would lose) or its upload-verify repair is in flight (the next
 // fold picks it up).
 func (r *Repacker) selectByBytes(ctx context.Context, packs []ref.Pack) ([]ref.Pack, error) {
-	budget := r.byteBudget()
-	var selected []ref.Pack
-	var total int64
+	weights := make([]weightedPack, 0, len(packs))
 	for _, p := range packs {
 		size, err := r.blobs.Stat(ctx, p.Key)
 		if errors.Is(err, blob.ErrNotFound) {
@@ -425,13 +423,9 @@ func (r *Repacker) selectByBytes(ctx context.Context, packs []ref.Pack) ([]ref.P
 		if err != nil {
 			return nil, fmt.Errorf("stat pack blob %s: %w", p.Key, err)
 		}
-		if total+size > budget {
-			continue // over budget: leave this pack registered as-is
-		}
-		selected = append(selected, p)
-		total += size
+		weights = append(weights, weightedPack{pack: p, weight: size})
 	}
-	return selected, nil
+	return selectPairable(weights, r.byteBudget()), nil
 }
 
 // selectByObjects refines the materialized candidates under the cumulative
@@ -440,20 +434,50 @@ func (r *Repacker) selectByBytes(ctx context.Context, packs []ref.Pack) ([]ref.P
 // (shared objects count twice) — conservative in the safe direction.
 func selectByObjects(repoPath string, packs []ref.Pack, maxObjects int) ([]ref.Pack, error) {
 	assertf(maxObjects > 0, "selectByObjects: non-positive budget %d", maxObjects)
-	var selected []ref.Pack
-	objects := 0
+	weights := make([]weightedPack, 0, len(packs))
 	for _, p := range packs {
 		count, err := packObjectCount(filepath.Join(repoPath, "objects", "pack", "pack-"+p.ID+".idx"))
 		if err != nil {
 			return nil, fmt.Errorf("pack %s: %w", p.ID, err)
 		}
-		if objects+count > maxObjects {
-			continue // over budget: leave this pack registered as-is
-		}
-		selected = append(selected, p)
-		objects += count
+		weights = append(weights, weightedPack{pack: p, weight: int64(count)})
 	}
-	return selected, nil
+	return selectPairable(weights, int64(maxObjects)), nil
+}
+
+// weightedPack pairs one candidate with its budget weight (blob bytes or
+// object count).
+type weightedPack struct {
+	pack   ref.Pack
+	weight int64
+}
+
+// selectPairable picks a foldable (>= 2 packs) subset greedily, oldest
+// first, under the cumulative budget. When the greedy pass yields fewer
+// than two — an old consolidated pack consuming nearly the whole budget
+// crowds every later small pack out — the pass RESTARTS past its first
+// item: without this, the same oversized selection would repeat on every
+// trigger, later pushes would accumulate unbounded rows, and folding would
+// wedge permanently on exactly the growth it exists to prevent. Quadratic
+// only in the wedged case, over an in-memory slice whose length the
+// follow-up machinery keeps near the threshold.
+func selectPairable(items []weightedPack, budget int64) []ref.Pack {
+	assertf(budget > 0, "selectPairable: non-positive budget %d", budget)
+	for start := 0; start < len(items); start++ {
+		var selected []ref.Pack
+		var total int64
+		for _, it := range items[start:] {
+			if total+it.weight > budget {
+				continue // over budget: leave this pack registered as-is
+			}
+			selected = append(selected, it.pack)
+			total += it.weight
+		}
+		if len(selected) >= 2 {
+			return selected
+		}
+	}
+	return nil
 }
 
 // packObjectCount reads a pack's exact object count from its version-2 idx

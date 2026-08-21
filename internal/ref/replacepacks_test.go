@@ -152,6 +152,47 @@ func TestReplacePacksSequentialRace(t *testing.T) {
 	})
 }
 
+// TestReplacePacksLargeSet folds an old-pack set spanning several SQLite
+// delete chunks (1200 rows > 2 × sqliteDeleteChunk): the summed rowcount
+// CAS must win exactly like the single-statement case, and a mismatched
+// oversized set must still lose with zero changes (the chunks execute
+// inside one transaction).
+func TestReplacePacksLargeSet(t *testing.T) {
+	runRefBackends(t, func(t *testing.T, s Store) {
+		ctx := context.Background()
+		repo := t.Name()
+		const n = 1200
+		old := make([]Pack, n)
+		for i := range old {
+			old[i] = Pack{ID: fmt.Sprintf("p%04d", i), Key: fmt.Sprintf("k%04d", i)}
+		}
+		// Register in batches (RegisterPacks itself is not under test).
+		for i := 0; i < n; i += 300 {
+			if err := s.RegisterPacks(ctx, repo, old[i:i+300]); err != nil {
+				t.Fatalf("RegisterPacks batch %d: %v", i, err)
+			}
+		}
+
+		// Mismatched set (one ghost row) must lose without deleting any of
+		// the 1200 live rows across any chunk.
+		ghost := append(append([]Pack{}, old[:n-1]...), Pack{ID: "ghost", Key: "kg"})
+		if won, err := s.ReplacePacks(ctx, repo, ghost, Pack{ID: "fold-bad", Key: "kfb"}); err != nil || won {
+			t.Fatalf("mismatched large fold = (won %v, err %v), want a clean loss", won, err)
+		}
+		if packs, err := s.ListPacks(ctx, repo); err != nil || len(packs) != n {
+			t.Fatalf("pack rows after lost large fold = %d (err %v), want %d", len(packs), err, n)
+		}
+
+		if won, err := s.ReplacePacks(ctx, repo, old, Pack{ID: "fold", Key: "kf"}); err != nil || !won {
+			t.Fatalf("large fold = (won %v, err %v), want a win", won, err)
+		}
+		packs, err := s.ListPacks(ctx, repo)
+		if err != nil || len(packs) != 1 || packs[0].ID != "fold" {
+			t.Fatalf("pack rows after large fold = %+v (err %v), want only the fold", packs, err)
+		}
+	})
+}
+
 // TestReplacePacksConcurrent hammers one repo with parallel identical folds:
 // exactly one must win per round regardless of scheduling (the transactional
 // analog of the CASRef concurrency contract).
