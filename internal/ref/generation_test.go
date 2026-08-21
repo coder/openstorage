@@ -1,0 +1,307 @@
+// Generation-counter conformance tests (issue #4): every mutation path on
+// the RefStore surface bumps the per-repo generation in the same atomic unit
+// as the mutation, lost CAS races bump nothing, and GetGeneration is a
+// point-read. Test bodies fan out over BOTH backends via runRefBackends —
+// the pg lane lazily boots one testcontainers-go Postgres for the whole
+// package (sqlite-filtered runs boot zero containers) and doubles as direct
+// PG coverage for the CTE-based CASRef statements.
+package ref
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"sync"
+	"testing"
+
+	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
+)
+
+var (
+	pgOnce    sync.Once
+	pgErr     error
+	pgStore   *PG
+	pgCleanup []func()
+)
+
+// pgTestStore lazily boots the package-wide Postgres container and store.
+// Concurrent InitSchema runs here to exercise the advisory-lock
+// serialization with the repo_generations DDL included.
+func pgTestStore(t *testing.T) *PG {
+	t.Helper()
+	pgOnce.Do(func() {
+		ctx := context.Background()
+
+		pgC, err := tcpostgres.Run(ctx, "postgres:17-alpine",
+			tcpostgres.WithDatabase("postgres"),
+			tcpostgres.WithUsername("postgres"),
+			tcpostgres.WithPassword("postgres"),
+			tcpostgres.BasicWaitStrategies(),
+		)
+		if err != nil {
+			pgErr = fmt.Errorf("start postgres container: %w", err)
+			return
+		}
+		pgCleanup = append(pgCleanup, func() { _ = pgC.Terminate(ctx) })
+
+		pgURL, err := pgC.ConnectionString(ctx, "sslmode=disable")
+		if err != nil {
+			pgErr = err
+			return
+		}
+		store, err := OpenPG(ctx, pgURL)
+		if err != nil {
+			pgErr = err
+			return
+		}
+		pgCleanup = append(pgCleanup, store.Close)
+
+		errs := make(chan error, 4)
+		for range 4 {
+			go func() { errs <- store.InitSchema(ctx) }()
+		}
+		for range 4 {
+			if err := <-errs; err != nil {
+				pgErr = fmt.Errorf("concurrent InitSchema: %w", err)
+				return
+			}
+		}
+		pgStore = store
+	})
+	if pgErr != nil {
+		t.Fatalf("pg backend: %v", pgErr)
+	}
+	return pgStore
+}
+
+func TestMain(m *testing.M) {
+	code := m.Run()
+	for i := len(pgCleanup) - 1; i >= 0; i-- {
+		pgCleanup[i]()
+	}
+	os.Exit(code)
+}
+
+// runRefBackends fans one conformance test body out over both Store
+// implementations. The pg lane shares one container-wide store — tests
+// isolate by repo name (t.Name() is subtest-unique) — and the sqlite lane
+// gets a fresh DB file per subtest.
+func runRefBackends(t *testing.T, fn func(t *testing.T, s Store)) {
+	t.Run("pg", func(t *testing.T) { fn(t, pgTestStore(t)) })
+	t.Run("sqlite", func(t *testing.T) {
+		s, _ := openTestSQLite(t)
+		fn(t, s)
+	})
+}
+
+func TestGenerationBumpsOnEveryMutation(t *testing.T) {
+	runRefBackends(t, testGenerationBumpsOnEveryMutation)
+}
+
+func testGenerationBumpsOnEveryMutation(t *testing.T, s Store) {
+	ctx := context.Background()
+	repo := t.Name()
+	other := repo + "-isolated"
+
+	gen := func(r string) int64 {
+		t.Helper()
+		g, err := s.GetGeneration(ctx, r)
+		if err != nil {
+			t.Fatalf("GetGeneration(%q): %v", r, err)
+		}
+		return g
+	}
+	mustCAS := func(name, old, new string, wantWon bool) {
+		t.Helper()
+		won, err := s.CASRef(ctx, repo, name, old, new)
+		if err != nil {
+			t.Fatalf("CASRef(%s, %s -> %s): %v", name, old, new, err)
+		}
+		if won != wantWon {
+			t.Fatalf("CASRef(%s, %s -> %s) won = %v, want %v", name, old, new, won, wantWon)
+		}
+	}
+
+	if g := gen(repo); g != 0 {
+		t.Fatalf("virgin repo generation = %d, want 0", g)
+	}
+
+	// A second repo pins the isolation property: its generation must not
+	// move while the mutations below hammer the first repo.
+	if err := s.RegisterPacks(ctx, other, []Pack{{ID: "iso", Key: "k-iso"}}); err != nil {
+		t.Fatalf("RegisterPacks(%q): %v", other, err)
+	}
+	if g := gen(other); g != 1 {
+		t.Fatalf("isolated repo generation = %d, want 1 after first bump", g)
+	}
+
+	// The full RefStore mutation surface, table-driven (issue #4 acceptance:
+	// EVERY mutation path bumps; lost races must NOT).
+	const branch = "refs/heads/main"
+	steps := []struct {
+		name   string
+		mutate func(t *testing.T)
+		bump   bool
+	}{
+		{"RegisterPacks", func(t *testing.T) {
+			if err := s.RegisterPacks(ctx, repo, []Pack{{ID: "p1", Key: "k1"}}); err != nil {
+				t.Fatal(err)
+			}
+		}, true},
+		// The generation is an invalidation token over committed row
+		// changes, not a call counter: a retried identical registration
+		// changes no rows (ON CONFLICT DO NOTHING), fires no trigger, and
+		// must not invalidate hydrate markers — nothing changed.
+		{"RegisterPacks idempotent retry", func(t *testing.T) {
+			if err := s.RegisterPacks(ctx, repo, []Pack{{ID: "p1", Key: "k1"}}); err != nil {
+				t.Fatal(err)
+			}
+		}, false},
+		{"CASRef create won", func(t *testing.T) { mustCAS(branch, ZeroSHA, testSHA(0x11), true) }, true},
+		{"CASRef create lost", func(t *testing.T) { mustCAS(branch, ZeroSHA, testSHA(0x22), false) }, false},
+		{"CASRef update won", func(t *testing.T) { mustCAS(branch, testSHA(0x11), testSHA(0x22), true) }, true},
+		{"CASRef update lost", func(t *testing.T) { mustCAS(branch, testSHA(0x11), testSHA(0x33), false) }, false},
+		{"CASRef delete lost", func(t *testing.T) { mustCAS(branch, testSHA(0x11), ZeroSHA, false) }, false},
+		{"CASRef delete won", func(t *testing.T) { mustCAS(branch, testSHA(0x22), ZeroSHA, true) }, true},
+	}
+	for _, step := range steps {
+		before := gen(repo)
+		step.mutate(t)
+		want := before
+		if step.bump {
+			want++
+		}
+		if got := gen(repo); got != want {
+			t.Fatalf("%s: generation %d -> %d, want %d", step.name, before, got, want)
+		}
+	}
+
+	if g := gen(other); g != 1 {
+		t.Fatalf("isolated repo generation moved to %d; mutations must only bump their own repo", g)
+	}
+
+	// Multi-pack registration: the triggers fire per changed row, so two
+	// new packs advance the generation by exactly two. Callers only rely on
+	// "strictly increases"; the exact delta pins the per-row granularity.
+	before := gen(repo)
+	if err := s.RegisterPacks(ctx, repo, []Pack{{ID: "m1", Key: "km1"}, {ID: "m2", Key: "km2"}}); err != nil {
+		t.Fatal(err)
+	}
+	if got := gen(repo); got != before+2 {
+		t.Fatalf("multi-pack registration: generation %d -> %d, want %d", before, got, before+2)
+	}
+}
+
+// TestGenerationLegacyWriterStillBumps pins the rollout-safety property the
+// schema triggers exist for (PR #14 review, P1): a writer running a binary
+// that predates the generation counter commits plain refs/packs DML with no
+// application-side bump — the INSERT/UPDATE/DELETE statements below are
+// exactly what such a binary executes. Once any upgraded node's InitSchema
+// installed the triggers, those legacy writes must bump the generation
+// anyway, on both backends.
+func TestGenerationLegacyWriterStillBumps(t *testing.T) {
+	runRefBackends(t, testGenerationLegacyWriterStillBumps)
+}
+
+func testGenerationLegacyWriterStillBumps(t *testing.T, s Store) {
+	ctx := context.Background()
+	repo := t.Name()
+
+	// Raw SQL, bypassing every store method — the legacy binary's writes.
+	exec := func(pgSQL, liteSQL string, args ...any) {
+		t.Helper()
+		var err error
+		switch b := s.(type) {
+		case *PG:
+			_, err = b.pool.Exec(ctx, pgSQL, args...)
+		case *SQLite:
+			_, err = b.db.ExecContext(ctx, liteSQL, args...)
+		default:
+			t.Fatalf("unexpected store type %T", s)
+		}
+		if err != nil {
+			t.Fatalf("legacy write: %v", err)
+		}
+	}
+	gen := func() int64 {
+		t.Helper()
+		g, err := s.GetGeneration(ctx, repo)
+		if err != nil {
+			t.Fatalf("GetGeneration: %v", err)
+		}
+		return g
+	}
+
+	steps := []struct {
+		name           string
+		pgSQL, liteSQL string
+		args           []any
+	}{
+		{
+			"legacy ref create",
+			`INSERT INTO refs (repo, name, sha, created_at) VALUES ($1, $2, $3, now()) ON CONFLICT DO NOTHING`,
+			`INSERT INTO refs (repo, name, sha, created_at) VALUES (?, ?, ?, unixepoch()) ON CONFLICT DO NOTHING`,
+			[]any{repo, "refs/heads/main", testSHA(0x41)},
+		},
+		{
+			"legacy ref update",
+			`UPDATE refs SET sha = $1 WHERE repo = $2 AND name = $3 AND sha = $4`,
+			`UPDATE refs SET sha = ? WHERE repo = ? AND name = ? AND sha = ?`,
+			[]any{testSHA(0x42), repo, "refs/heads/main", testSHA(0x41)},
+		},
+		{
+			"legacy pack insert",
+			`INSERT INTO packs (repo, id, s3_key) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
+			`INSERT INTO packs (repo, id, s3_key) VALUES (?, ?, ?) ON CONFLICT DO NOTHING`,
+			[]any{repo, "lp1", "lk1"},
+		},
+		{
+			"legacy ref delete",
+			`DELETE FROM refs WHERE repo = $1 AND name = $2 AND sha = $3`,
+			`DELETE FROM refs WHERE repo = ? AND name = ? AND sha = ?`,
+			[]any{repo, "refs/heads/main", testSHA(0x42)},
+		},
+	}
+	for _, step := range steps {
+		before := gen()
+		exec(step.pgSQL, step.liteSQL, step.args...)
+		if got := gen(); got != before+1 {
+			t.Fatalf("%s: generation %d -> %d, want %d (schema trigger must fire for legacy DML)",
+				step.name, before, got, before+1)
+		}
+	}
+}
+
+// TestGenerationRecoveredWinBumpsExactlyOnce pins the issue #2 / issue #4
+// interaction: an ambiguous CASRef whose statement actually committed
+// already bumped the generation atomically with the swap, so the
+// IdempotentCAS recovery recheck — a pure point-read — must neither bump
+// again nor leave the recovered win without its bump.
+func TestGenerationRecoveredWinBumpsExactlyOnce(t *testing.T) {
+	ctx := context.Background()
+	raw, _ := openTestSQLite(t)
+	const repo, branch = "r-gen-recovery", "refs/heads/main"
+	seedRef(t, raw, repo, branch, idemSHA1)
+
+	before, err := raw.GetGeneration(ctx, repo)
+	if err != nil {
+		t.Fatalf("GetGeneration: %v", err)
+	}
+	if before != 1 {
+		t.Fatalf("generation after seed create = %d, want 1", before)
+	}
+
+	st := IdempotentCAS{RefStore: &commitThenFail{RefStore: raw}}
+	won, err := st.CASRef(ctx, repo, branch, idemSHA1, idemSHA2)
+	if !won || err != nil {
+		t.Fatalf("CASRef = (%v, %v), want recovered (true, nil)", won, err)
+	}
+
+	after, err := raw.GetGeneration(ctx, repo)
+	if err != nil {
+		t.Fatalf("GetGeneration: %v", err)
+	}
+	if after != before+1 {
+		t.Fatalf("generation after recovered win = %d, want exactly %d (one bump, from the committed statement)", after, before+1)
+	}
+}

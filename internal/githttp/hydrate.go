@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -282,6 +283,39 @@ func flockExclusive(path string) (unlock func(), err error) {
 	}, nil
 }
 
+// flockExclusiveCtx is flockExclusive with a cancelable wait: LOCK_NB
+// attempts polled against ctx. The repo-wide hydrate lock can be held
+// across slow blob downloads, and a blocking LOCK_EX would pin every
+// goroutine whose client already hung up behind it until the holder
+// finishes (PR #14 review). The per-pack locks stay blocking: their
+// critical sections are one pack's download, and their waiters overlap
+// that same work.
+func flockExclusiveCtx(ctx context.Context, path string) (unlock func(), err error) {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, err
+	}
+	for {
+		err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		if err == nil {
+			return func() { _ = f.Close() }, nil
+		}
+		// EWOULDBLOCK (== EAGAIN): held by someone else. EINTR: attempt
+		// interrupted by a signal. Both keep polling; anything else is a
+		// real failure.
+		if err != syscall.EWOULDBLOCK && err != syscall.EAGAIN && err != syscall.EINTR {
+			_ = f.Close()
+			return nil, err
+		}
+		select {
+		case <-ctx.Done():
+			_ = f.Close()
+			return nil, ctx.Err()
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
+
 // SyncRefs makes the local ref store match PG exactly (PG wins): updates
 // changed refs, deletes locals that PG does not know, and points HEAD at
 // refs/heads/main. Must run after HydratePacks so targets exist locally.
@@ -356,16 +390,124 @@ func updateRefStdin(repoPath, commands string) error {
 	return nil
 }
 
+// Generation marker (issue #4): the store's per-repo mutation generation
+// the last fully successful hydrate ran at, persisted as a file inside the
+// bare cache repo. Every mutation bumps the generation in the same atomic
+// unit (ref.RefStore.GetGeneration), so an unchanged value proves packs and
+// refs are unchanged and Hydrate can skip pack listing and ref sync
+// entirely. The TTL forces a periodic full sync regardless, bounding the
+// staleness of any missed bump or lost marker-ordering race to one window.
+const (
+	generationMarker    = "codestorage.generation"
+	generationMarkerTTL = 5 * time.Minute
+)
+
+// readGenerationMarker returns the marker's recorded generation and whether
+// its mtime — refreshed only by full successful hydrates, never by
+// short-circuited ones — is still within the TTL window. ok=false means no
+// usable marker (missing, malformed, or unreadable): callers full-hydrate,
+// and the next success rewrites it.
+func readGenerationMarker(repoPath string) (gen int64, fresh bool, ok bool) {
+	path := filepath.Join(repoPath, generationMarker)
+	fi, err := os.Stat(path)
+	if err != nil {
+		return 0, false, false
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return 0, false, false
+	}
+	gen, perr := strconv.ParseInt(strings.TrimSpace(string(b)), 10, 64)
+	if perr != nil || gen < 0 {
+		return 0, false, false
+	}
+	return gen, time.Since(fi.ModTime()) < generationMarkerTTL, true
+}
+
+// writeGenerationMarker persists gen via temp file + rename: concurrent
+// hydrators and re-exec'd hook processes share the cache dir, and a reader
+// must never see a torn write (a crash mid-write leaves only a temp file).
+// Best-effort by design — on failure the marker is simply absent or stale
+// and the next hydrate does the full sync; a lost write can cost work but
+// never staleness.
+func writeGenerationMarker(repoPath string, gen int64) {
+	assertf(gen >= 0, "writeGenerationMarker: negative generation %d", gen)
+	tmp, err := os.CreateTemp(repoPath, generationMarker+".tmp-*")
+	if err != nil {
+		return
+	}
+	defer func() { _ = os.Remove(tmp.Name()) }() // no-op after a successful rename
+	if _, err := fmt.Fprintf(tmp, "%d\n", gen); err != nil {
+		_ = tmp.Close()
+		return
+	}
+	if err := tmp.Close(); err != nil {
+		return
+	}
+	_ = os.Rename(tmp.Name(), filepath.Join(repoPath, generationMarker))
+}
+
 // Hydrate rebuilds the cache repo state for repo from PG + S3 (the stateless
 // node property): ensure repo, hydrate packs, then sync refs.
 // On the receive path a concurrent receive-pack may hold ref locks while we
 // sync; retry briefly, and let the caller decide whether a residual failure
 // is fatal (upload path) or tolerable staleness (receive path, where git
 // re-validates old SHAs itself).
+//
+// Fast path (issue #4): when the store generation matches the local marker
+// written by the last fully successful hydrate — and the marker is within
+// its TTL — the packs and refs are provably unchanged and Hydrate returns
+// after one point-read, skipping ListPacks, per-pack stats, ListRefs, and
+// the for-each-ref/update-ref/symbolic-ref subprocesses. EnsureCacheRepo
+// still runs unconditionally: hook and config repair must stay verified on
+// every request (the hook script embeds this binary's path, which changes
+// across deployments), and it touches no DB state.
+//
+// Full syncs serialize per repo on <repoPath>/codestorage.hydrate.lock:
+// two overlapping full hydrates spanning a mutation could otherwise
+// interleave so the OLDER ref sync lands after the newer one while the
+// newer marker survives — and the marker would then short-circuit reads
+// onto stale refs for up to a TTL window. Under the lock, each full sync
+// re-reads the generation before listing refs and publishes its marker
+// before releasing, so marker and refs advance monotonically together. The
+// marker read stays lock-free (temp+rename keeps it atomic): the idle fast
+// path must not serialize on an exclusive lock.
 func Hydrate(ctx context.Context, st ref.RefStore, bl blob.BlobStore, cacheDir, repo string) (repoPath string, refsErr error, err error) {
 	repoPath, err = EnsureCacheRepo(cacheDir, repo)
 	if err != nil {
 		return "", nil, err
+	}
+	gen, err := st.GetGeneration(ctx, repo)
+	if err != nil {
+		return "", nil, err
+	}
+	if markerGen, fresh, ok := readGenerationMarker(repoPath); ok && fresh && markerGen == gen {
+		return repoPath, nil, nil
+	}
+	// Full-sync critical section. The lock file is left in place, like the
+	// per-pack locks: removing it would race a concurrent locker onto a
+	// deleted inode. Lock order is repo hydrate lock -> per-pack locks;
+	// nothing acquires them in the opposite order. The wait is cancelable:
+	// a request whose client hung up must not stay parked behind a slow
+	// hydrate holding the repo-wide lock.
+	unlock, err := flockExclusiveCtx(ctx, filepath.Join(repoPath, "codestorage.hydrate.lock"))
+	if err != nil {
+		return "", nil, fmt.Errorf("lock hydrate %s: %w", repo, err)
+	}
+	defer unlock()
+	// Re-check under the lock: the hydrator we waited on may have already
+	// synced this generation (or newer — re-read, don't reuse the pre-lock
+	// value). Generation read strictly BEFORE the pack/ref reads below:
+	// the marker this hydrate publishes must never claim newer state than
+	// it actually synced. Mutations landing after this read leave
+	// marker < generation, which just forces the next hydrate down the
+	// full path again.
+	gen, err = st.GetGeneration(ctx, repo)
+	if err != nil {
+		return "", nil, err
+	}
+	if markerGen, fresh, ok := readGenerationMarker(repoPath); ok && fresh && markerGen == gen {
+		return repoPath, nil, nil
 	}
 	if err := HydratePacks(ctx, st, bl, repoPath, repo); err != nil {
 		return "", nil, err
@@ -379,6 +521,13 @@ func Hydrate(ctx context.Context, st ref.RefStore, bl blob.BlobStore, cacheDir, 
 			break
 		}
 		time.Sleep(50 * time.Millisecond)
+	}
+	if refsErr == nil {
+		// Strictly after full success — a failed hydrate must never advance
+		// the marker — and strictly before the lock releases, so the next
+		// locker's recheck sees exactly the state this sync produced. The
+		// rename also refreshes the mtime, restarting the TTL window.
+		writeGenerationMarker(repoPath, gen)
 	}
 	return repoPath, refsErr, nil
 }

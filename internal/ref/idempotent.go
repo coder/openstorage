@@ -72,6 +72,13 @@ var _ RefStore = IdempotentCAS{}
 // Callers observing a recovered win may emit duplicate webhooks for one
 // committed update (first attempt + recovered retry); delivery is
 // at-least-once, so duplicates are acceptable.
+//
+// Generation interaction (issue #4): a recovered win needs no generation
+// bump. The bump commits atomically with the swap itself (schema-level
+// AFTER-row triggers fire inside the swap statement's own transaction), so
+// an ambiguous-but-actually-committed CAS already moved the generation, and
+// the recheck below is a pure point-read. Recovering here can therefore
+// never leave a won CAS without its bump, nor bump twice.
 func (s IdempotentCAS) CASRef(ctx context.Context, repo, name, old, new string) (bool, error) {
 	won, err := s.RefStore.CASRef(ctx, repo, name, old, new)
 	assertf(!won || err == nil, "CASRef returned won=true with error: %v", err)

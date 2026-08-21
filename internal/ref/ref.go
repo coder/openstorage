@@ -74,6 +74,18 @@ type RefStore interface {
 	RegisterPacks(ctx context.Context, repo string, packs []Pack) error
 	// ListPacks returns all registered packs for repo, oldest first.
 	ListPacks(ctx context.Context, repo string) ([]Pack, error)
+	// GetGeneration returns repo's mutation generation: 0 for a repo no
+	// mutation ever touched, strictly positive and monotonically increasing
+	// afterwards. It is an invalidation token over committed row changes,
+	// not a call counter: schema-level triggers installed by InitSchema
+	// bump it inside the same transaction as ANY committed change to the
+	// repo's refs or packs rows — won CAS swaps, pack registrations
+	// (per changed row; a no-op idempotent retry changes nothing and bumps
+	// nothing), future pack rewrites (issue #1's ReplacePacks), and even
+	// writers running binaries that predate the counter. An unchanged value
+	// therefore proves the repo's packs and refs are unchanged; the hydrate
+	// short-circuit relies on exactly that (issue #4).
+	GetGeneration(ctx context.Context, repo string) (int64, error)
 }
 
 // Store extends RefStore with the lifecycle the wire seam needs: serve runs
@@ -146,9 +158,48 @@ CREATE TABLE IF NOT EXISTS refs  (repo text, name text, sha text NOT NULL,
                                   created_at timestamptz NOT NULL DEFAULT now(), PRIMARY KEY (repo, name));
 CREATE TABLE IF NOT EXISTS packs (repo text, id text, s3_key text NOT NULL,
                                   created_at timestamptz DEFAULT now(), PRIMARY KEY (repo, id));
+-- Per-repo mutation generation (issue #4). No row means "never mutated"
+-- (GetGeneration reports 0); the first bump creates the row at 1, so a
+-- hydrate marker taken before the first mutation can never match the state
+-- after it.
+CREATE TABLE IF NOT EXISTS repo_generations (repo text PRIMARY KEY,
+                                             generation bigint NOT NULL DEFAULT 1);
 -- Idempotent additive migration for pre-p3 dev databases (backfills
 -- existing rows via the NOT NULL DEFAULT).
 ALTER TABLE refs ADD COLUMN IF NOT EXISTS created_at timestamptz NOT NULL DEFAULT now();
+-- The generation bump lives in SCHEMA triggers, not application code:
+-- during a rolling upgrade a writer running an older binary still commits
+-- plain ref/pack DML, and a trigger is the only way its mutations bump the
+-- counter too. Any reader that trusts generation markers installed these
+-- triggers at its own boot (InitSchema runs before serving), so no marker
+-- can predate them. INSERT ... DO NOTHING + UPDATE instead of one upsert
+-- keeps the body byte-comparable with the SQLite triggers.
+CREATE OR REPLACE FUNCTION bump_repo_generation() RETURNS trigger LANGUAGE plpgsql AS $bump$
+BEGIN
+    INSERT INTO repo_generations (repo, generation)
+    VALUES (COALESCE(NEW.repo, OLD.repo), 0)
+    ON CONFLICT (repo) DO NOTHING;
+    UPDATE repo_generations SET generation = generation + 1
+    WHERE repo = COALESCE(NEW.repo, OLD.repo);
+    RETURN NULL;
+END $bump$;
+-- Constraint triggers, DEFERRABLE INITIALLY DEFERRED: the bump still
+-- commits atomically with the mutating transaction, but the generation-row
+-- lock is taken at COMMIT, strictly after every refs/packs row lock — a
+-- multi-row registration interleaving row locks with an immediate per-row
+-- bump could otherwise deadlock against a concurrent same-repo writer.
+-- DROP + CREATE (constraint triggers lack CREATE OR REPLACE) is safe here:
+-- the advisory lock above serializes InitSchema callers.
+DROP TRIGGER IF EXISTS refs_bump_generation ON refs;
+CREATE CONSTRAINT TRIGGER refs_bump_generation
+    AFTER INSERT OR UPDATE OR DELETE ON refs
+    DEFERRABLE INITIALLY DEFERRED
+    FOR EACH ROW EXECUTE FUNCTION bump_repo_generation();
+DROP TRIGGER IF EXISTS packs_bump_generation ON packs;
+CREATE CONSTRAINT TRIGGER packs_bump_generation
+    AFTER INSERT OR UPDATE OR DELETE ON packs
+    DEFERRABLE INITIALLY DEFERRED
+    FOR EACH ROW EXECUTE FUNCTION bump_repo_generation();
 `)
 		return err
 	})
@@ -213,7 +264,11 @@ func (s *PG) GetRef(ctx context.Context, repo, name string) (string, error) {
 // CASRef performs the compare-and-swap ref update. Returns won=false (no
 // error) when the precondition failed, i.e. someone else won the race.
 // Refs only ever change inside these single statements, so a broken/partial
-// ref state is impossible by construction.
+// ref state is impossible by construction. A won swap also bumps the repo
+// generation via the InitSchema-installed deferred constraint trigger —
+// inside the same implicit transaction, so the statement stays the single
+// unit of commit and the IdempotentCAS ambiguity classification
+// (idempotent.go) is unchanged.
 func (s *PG) CASRef(ctx context.Context, repo, name, old, new string) (won bool, err error) {
 	assertf(ValidSHA(old), "CASRef: malformed old sha %q", old)
 	assertf(ValidSHA(new), "CASRef: malformed new sha %q", new)
@@ -281,6 +336,22 @@ func (s *PG) RegisterPacks(ctx context.Context, repo string, packs []Pack) error
 		}
 		return nil
 	})
+}
+
+// GetGeneration returns repo's mutation generation (0 = never mutated).
+func (s *PG) GetGeneration(ctx context.Context, repo string) (int64, error) {
+	assertf(repo != "", "GetGeneration: empty repo")
+	var gen int64
+	err := s.pool.QueryRow(ctx,
+		`SELECT generation FROM repo_generations WHERE repo = $1`, repo).Scan(&gen)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, nil // never mutated: the first bump creates the row at 1
+	}
+	if err != nil {
+		return 0, err
+	}
+	assertf(gen >= 1, "repo_generations holds non-positive generation %d for %s", gen, repo)
+	return gen, nil
 }
 
 // ListPacks returns all registered packs for repo, oldest first.

@@ -84,6 +84,11 @@ func (s *SQLite) InitSchema(ctx context.Context) error {
 		// INTEGER unix seconds; ORDER BY created_at, id keeps the tie-break.
 		`CREATE TABLE IF NOT EXISTS packs (repo TEXT, id TEXT, s3_key TEXT NOT NULL,
 		                                   created_at INTEGER DEFAULT (unixepoch()), PRIMARY KEY (repo, id))`,
+		// Per-repo mutation generation (issue #4). No row means "never
+		// mutated" (GetGeneration reports 0); the first bump creates the
+		// row at 1 — same contract as PG.
+		`CREATE TABLE IF NOT EXISTS repo_generations (repo TEXT PRIMARY KEY,
+		                                              generation INTEGER NOT NULL DEFAULT 1)`,
 	} {
 		if _, err := tx.ExecContext(ctx, stmt); err != nil {
 			return fmt.Errorf("sqlite init schema: %w", err)
@@ -103,6 +108,33 @@ func (s *SQLite) InitSchema(ctx context.Context) error {
 		} {
 			if _, err := tx.ExecContext(ctx, stmt); err != nil {
 				return fmt.Errorf("sqlite init schema: add refs.created_at: %w", err)
+			}
+		}
+	}
+	// Generation-bump triggers (issue #4): in SCHEMA, not application code,
+	// so writers running older binaries (stale hook scripts re-execing a
+	// pre-upgrade binary) bump too — see the PG InitSchema rationale. SQLite
+	// has no multi-event triggers, so one trigger per (table, event); bodies
+	// use INSERT OR IGNORE + UPDATE (no UPSERT inside trigger bodies).
+	// Immediate per-row firing is deadlock-free here: SQLite has one writer
+	// at a time (BEGIN IMMEDIATE + busy_timeout). DROP + CREATE keeps future
+	// body changes effective on existing databases; the transaction plus
+	// SQLite's file lock make it safe under concurrent startups.
+	for _, table := range []string{"refs", "packs"} {
+		for _, ev := range []struct{ event, key string }{
+			{"INSERT", "NEW.repo"}, {"UPDATE", "NEW.repo"}, {"DELETE", "OLD.repo"},
+		} {
+			name := fmt.Sprintf("%s_bump_generation_%s", table, strings.ToLower(ev.event))
+			if _, err := tx.ExecContext(ctx,
+				fmt.Sprintf(`DROP TRIGGER IF EXISTS %s`, name)); err != nil {
+				return fmt.Errorf("sqlite init schema: drop trigger %s: %w", name, err)
+			}
+			if _, err := tx.ExecContext(ctx, fmt.Sprintf(`
+CREATE TRIGGER %s AFTER %s ON %s FOR EACH ROW BEGIN
+    INSERT OR IGNORE INTO repo_generations (repo, generation) VALUES (%s, 0);
+    UPDATE repo_generations SET generation = generation + 1 WHERE repo = %s;
+END`, name, ev.event, table, ev.key, ev.key)); err != nil {
+				return fmt.Errorf("sqlite init schema: create trigger %s: %w", name, err)
 			}
 		}
 	}
@@ -169,7 +201,11 @@ func (s *SQLite) GetRef(ctx context.Context, repo, name string) (string, error) 
 // CASRef performs the compare-and-swap ref update. Returns won=false (no
 // error) when the precondition failed, i.e. someone else won the race.
 // Refs only ever change inside these single statements, so a broken/partial
-// ref state is impossible by construction.
+// ref state is impossible by construction. A won swap also bumps the repo
+// generation via the InitSchema-installed triggers — inside the same
+// implicit transaction, so the statement stays the single unit of commit
+// and the IdempotentCAS ambiguity classification (idempotent.go) is
+// unchanged.
 func (s *SQLite) CASRef(ctx context.Context, repo, name, old, new string) (won bool, err error) {
 	assertf(ValidSHA(old), "CASRef: malformed old sha %q", old)
 	assertf(ValidSHA(new), "CASRef: malformed new sha %q", new)
@@ -244,6 +280,22 @@ func (s *SQLite) RegisterPacks(ctx context.Context, repo string, packs []Pack) e
 		}
 	}
 	return tx.Commit()
+}
+
+// GetGeneration returns repo's mutation generation (0 = never mutated).
+func (s *SQLite) GetGeneration(ctx context.Context, repo string) (int64, error) {
+	assertf(repo != "", "GetGeneration: empty repo")
+	var gen int64
+	err := s.db.QueryRowContext(ctx,
+		`SELECT generation FROM repo_generations WHERE repo = ?`, repo).Scan(&gen)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, nil // never mutated: the first bump creates the row at 1
+	}
+	if err != nil {
+		return 0, err
+	}
+	assertf(gen >= 1, "repo_generations holds non-positive generation %d for %s", gen, repo)
+	return gen, nil
 }
 
 // ListPacks returns all registered packs for repo, oldest first.
