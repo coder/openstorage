@@ -226,6 +226,94 @@ func TestSweep_ThresholdBoundary(t *testing.T) {
 	}
 }
 
+// registeredMidSweep returns the empty snapshot on the first ListPacks call
+// and the registered set afterwards, simulating a pack whose RegisterPacks
+// commits between the sweep's classification snapshot and its delete.
+type registeredMidSweep struct {
+	packs []ref.Pack
+	calls int
+}
+
+func (p *registeredMidSweep) ListPacks(context.Context, string) ([]ref.Pack, error) {
+	p.calls++
+	if p.calls == 1 {
+		return nil, nil
+	}
+	return p.packs, nil
+}
+
+// A pack registered mid-sweep must survive: the delete-time revalidation
+// re-reads the registry instead of trusting the classification snapshot
+// (the retried-push race from the Codex review).
+func TestSweep_DeleteSkipsPackRegisteredMidSweep(t *testing.T) {
+	f := newSweepFixture(t)
+	key := blob.PackKey("r1", "racer")
+	f.upload(key, "racer-bytes")
+	f.backdate(key, 25*time.Hour)
+
+	packs := &registeredMidSweep{packs: []ref.Pack{{ID: "racer", Key: key}}}
+	s := NewSweeper(f.blobs, packs, SweepConfig{Threshold: 24 * time.Hour, Delete: true}, slog.New(slog.DiscardHandler))
+	report, err := s.Sweep(context.Background())
+	if err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if report.Deleted != 0 {
+		t.Fatalf("report = %+v, want no deletes (pack registered mid-sweep)", report)
+	}
+	if len(report.Orphans) != 1 { // classified from the snapshot, then spared
+		t.Fatalf("orphans = %+v, want the snapshot candidate", report.Orphans)
+	}
+	if !f.exists(key) {
+		t.Fatalf("mid-sweep-registered pack %q was deleted", key)
+	}
+	if packs.calls != 2 {
+		t.Fatalf("ListPacks calls = %d, want 2 (snapshot + revalidation)", packs.calls)
+	}
+}
+
+// refreshedMidSweep serves the real store's listing for the snapshot but
+// reports a fresh ModTime on the exact-key revalidation read, simulating a
+// retried push overwriting the orphaned key mid-sweep.
+type refreshedMidSweep struct {
+	blob.BlobStore
+	key string
+}
+
+func (b *refreshedMidSweep) List(ctx context.Context, prefix string) ([]blob.ListedObject, error) {
+	objs, err := b.BlobStore.List(ctx, prefix)
+	if prefix != b.key {
+		return objs, err
+	}
+	for i := range objs {
+		if objs[i].Key == b.key {
+			objs[i].ModTime = time.Now()
+		}
+	}
+	return objs, err
+}
+
+// An orphaned key overwritten by a retried push mid-sweep must survive: the
+// revalidation reads the object's age at delete time, not list time.
+func TestSweep_DeleteSkipsKeyRefreshedMidSweep(t *testing.T) {
+	f := newSweepFixture(t)
+	key := blob.PackKey("r1", "refreshed")
+	f.upload(key, "refreshed-bytes")
+	f.backdate(key, 25*time.Hour)
+
+	s := NewSweeper(&refreshedMidSweep{BlobStore: f.blobs, key: key}, f.store,
+		SweepConfig{Threshold: 24 * time.Hour, Delete: true}, slog.New(slog.DiscardHandler))
+	report, err := s.Sweep(context.Background())
+	if err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if report.Deleted != 0 {
+		t.Fatalf("report = %+v, want no deletes (key refreshed mid-sweep)", report)
+	}
+	if !f.exists(key) {
+		t.Fatalf("mid-sweep-refreshed key %q was deleted", key)
+	}
+}
+
 // The local-mode ticker is the real wiring: an aged orphan disappears
 // without any explicit Sweep call once the ticker is started.
 func TestStartSweepTicker_ReapsOrphan(t *testing.T) {

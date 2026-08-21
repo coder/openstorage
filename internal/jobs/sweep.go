@@ -95,6 +95,18 @@ func NewSweeper(blobs blob.BlobStore, packs PackLister, cfg SweepConfig, logger 
 // when SweepConfig.Delete is set). Per-key delete failures do not stop the
 // sweep; they are joined into the returned error so the job backend records
 // the failure while the report stays complete.
+//
+// Deletes never trust the initial listing snapshot: a retried push can
+// overwrite an orphaned key (pack keys are content-addressed, so the retry
+// reproduces the same key) after the snapshot was taken, and deleting from
+// stale state would destroy the fresh upload right before its RegisterPacks
+// commits. Each delete therefore revalidates the candidate first — a fresh
+// registry lookup, then a fresh ModTime read — so the age threshold is
+// evaluated at delete time, not list time. The residual window is the gap
+// between the revalidation reads and the delete call (milliseconds, versus
+// an upload that must age past the threshold to matter); closing it fully
+// needs conditional deletes or upload leases, which no portable blob
+// backend offers (see the PR discussion on issue #5).
 func (s *Sweeper) Sweep(ctx context.Context) (SweepReport, error) {
 	start := s.now()
 	objs, err := s.blobs.List(ctx, blob.PacksRoot)
@@ -156,6 +168,14 @@ func (s *Sweeper) Sweep(ctx context.Context) (SweepReport, error) {
 			if !s.cfg.Delete {
 				continue
 			}
+			stillOrphan, err := s.revalidateOrphan(ctx, repo, obj.Key)
+			if err != nil {
+				deleteErrs = append(deleteErrs, err)
+				continue
+			}
+			if !stillOrphan {
+				continue
+			}
 			if err := s.blobs.Delete(ctx, obj.Key); err != nil && !errors.Is(err, blob.ErrNotFound) {
 				deleteErrs = append(deleteErrs, err)
 				continue
@@ -173,6 +193,41 @@ func (s *Sweeper) Sweep(ctx context.Context) (SweepReport, error) {
 		"delete_enabled", s.cfg.Delete, "threshold", s.cfg.Threshold,
 		"duration", s.now().Sub(start).Round(time.Millisecond))
 	return report, errors.Join(deleteErrs...)
+}
+
+// revalidateOrphan re-checks one delete candidate against live state,
+// discarding the sweep's initial snapshot: first a fresh registry lookup
+// (a pack registered mid-sweep is live), then a fresh ModTime read of the
+// exact key (an overwrite by a retried push resets the object's age; a key
+// that vanished needs no delete). Registration strictly follows upload, so
+// checking the registry before the mod time means any registration the
+// registry read misses still refreshes the ModTime read after it.
+func (s *Sweeper) revalidateOrphan(ctx context.Context, repo, key string) (bool, error) {
+	packs, err := s.packs.ListPacks(ctx, repo)
+	if err != nil {
+		return false, fmt.Errorf("sweep: revalidate %s: list packs: %w", key, err)
+	}
+	for _, p := range packs {
+		if p.Key == key {
+			s.logger.Info("orphan pack sweep: skipping delete, pack registered mid-sweep", "key", key)
+			return false, nil
+		}
+	}
+	objs, err := s.blobs.List(ctx, key)
+	if err != nil {
+		return false, fmt.Errorf("sweep: revalidate %s: list key: %w", key, err)
+	}
+	for _, obj := range objs {
+		if obj.Key != key {
+			continue // sibling key extending the prefix
+		}
+		if obj.ModTime.IsZero() || s.now().Sub(obj.ModTime) < s.cfg.Threshold {
+			s.logger.Info("orphan pack sweep: skipping delete, object refreshed mid-sweep", "key", key)
+			return false, nil
+		}
+		return true, nil
+	}
+	return false, nil // gone already: nothing to delete
 }
 
 // SweepSchedule configures the periodic orphan-pack sweep on a queue
