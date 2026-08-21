@@ -249,6 +249,21 @@ func TestCASRefLostToDifferentSHAEmitsNothing(t *testing.T) {
 	}
 }
 
+// TestCASRefCleanCreateLossEmitsNothing pins the create decision: a clean
+// create loss stays a conflict even when the existing ref already holds the
+// target sha — no fabricated success, no fabricated zero->sha push event
+// (duplicate same-sha creates keep their "already exists" API 409).
+func TestCASRefCleanCreateLossEmitsNothing(t *testing.T) {
+	env := newEmitEnv(t, &fakeInner{won: false, sha: shaB}, twoHooks())
+	won, err := env.store.CASRef(context.Background(), "repo_abc123", "refs/heads/main", ref.ZeroSHA, shaB)
+	if won || err != nil {
+		t.Fatalf("CASRef = (%v, %v), want (false, nil)", won, err)
+	}
+	if len(env.deliveries)+len(env.syncPokes) != 0 {
+		t.Errorf("clean create loss emitted %d deliveries, %d sync pokes", len(env.deliveries), len(env.syncPokes))
+	}
+}
+
 // TestCASRefAmbiguousDeleteStaysFailed pins the delete decision: absence is
 // not positive evidence, so an ambiguous-error delete keeps its error and
 // emits nothing (no fabricated deletion webhook).

@@ -92,7 +92,7 @@ func TestIdempotentCASRecheckFailureFallsBackToError(t *testing.T) {
 }
 
 // TestIdempotentCASRetryHealsUnreportedWin covers the client-visible symptom
-// from issue #2: a retry of an update whose first attempt committed but
+// from issue #2: a retry of an UPDATE whose first attempt committed but
 // failed to report matches zero rows (WHERE sha = old) and used to surface a
 // spurious "moved concurrently" conflict. The recheck reconciles it to a win.
 func TestIdempotentCASRetryHealsUnreportedWin(t *testing.T) {
@@ -107,13 +107,23 @@ func TestIdempotentCASRetryHealsUnreportedWin(t *testing.T) {
 			t.Fatalf("attempt %d: CASRef = (%v, %v), want (true, nil)", attempt, won, err)
 		}
 	}
-	// Same for a retried create: INSERT ... ON CONFLICT DO NOTHING affects
-	// zero rows on the retry, but the ref holds the target.
-	for attempt := 1; attempt <= 2; attempt++ {
-		won, err := st.CASRef(ctx, "r1", "refs/heads/created", ZeroSHA, idemSHA3)
-		if !won || err != nil {
-			t.Fatalf("create attempt %d: CASRef = (%v, %v), want (true, nil)", attempt, won, err)
-		}
+}
+
+// TestIdempotentCASCleanCreateLossIsAuthoritative pins the create decision:
+// a clean create loss (won=false, err=nil) affirmatively wrote nothing, so
+// it stays a conflict even when the existing ref holds the target sha —
+// same-sha duplicate creates keep their "already exists" outcome instead of
+// fabricating a success (and a zero->sha push event). Only the ambiguous
+// ERROR create recovers (TestIdempotentCASRecoversAmbiguousCreate).
+func TestIdempotentCASCleanCreateLossIsAuthoritative(t *testing.T) {
+	ctx := context.Background()
+	raw, _ := openTestSQLite(t)
+	seedRef(t, raw, "r1", "refs/heads/main", idemSHA1)
+	st := IdempotentCAS{RefStore: raw}
+
+	won, err := st.CASRef(ctx, "r1", "refs/heads/main", ZeroSHA, idemSHA1)
+	if won || err != nil {
+		t.Fatalf("same-sha duplicate create = (%v, %v), want (false, nil)", won, err)
 	}
 }
 
