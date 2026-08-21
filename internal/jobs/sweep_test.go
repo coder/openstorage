@@ -392,6 +392,29 @@ func TestSweep_ListOnlyStillHealsQuarantine(t *testing.T) {
 	}
 }
 
+// Heal is the standalone restorative pass serve runs at startup when the
+// periodic schedule is disabled (interval 0): registered-but-missing packs
+// are restored; nothing unregistered is purged in list-only config.
+func TestSweeper_HealStandalone(t *testing.T) {
+	f := newSweepFixture(t)
+	lost := blob.PackKey("r1", "lost")
+	f.upload("sweep/quarantine/"+lost, "lost-bytes")
+	f.register("r1", "lost", lost)
+	stale := blob.PackKey("r1", "stale")
+	f.upload("sweep/quarantine/"+stale, "stale-bytes")
+	f.backdate("sweep/quarantine/"+stale, 25*time.Hour)
+
+	if err := f.sweeper(SweepConfig{Threshold: 24 * time.Hour}).Heal(context.Background()); err != nil {
+		t.Fatalf("Heal: %v", err)
+	}
+	if !f.exists(lost) {
+		t.Fatalf("standalone heal did not restore %q", lost)
+	}
+	if !f.exists("sweep/quarantine/" + stale) {
+		t.Fatalf("standalone list-only heal purged %q", stale)
+	}
+}
+
 // healQuarantine finishes a crashed handshake: a quarantine backup whose
 // original key is registered but missing is restored; an unregistered
 // backup is purged only once it ages past the threshold.

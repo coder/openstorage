@@ -70,16 +70,21 @@ func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL string, orgPEM
 
 	// Orphan-pack sweep (issue #5): built over the RAW ref store — pack
 	// listing is a read, no events to emit — and the shared blob store.
-	// interval 0 disables it; nil schedule keeps both queue backends inert.
+	// interval 0 disables the periodic schedule; nil schedule keeps both
+	// queue backends inert.
+	sweeper := jobs.NewSweeper(blobStore, refStore, jobs.SweepConfig{
+		Threshold: sweep.ageThreshold,
+		Delete:    sweep.deleteEnabled,
+	}, logger)
 	var schedule *jobs.SweepSchedule
 	if sweep.interval > 0 {
-		schedule = &jobs.SweepSchedule{
-			Sweeper: jobs.NewSweeper(blobStore, refStore, jobs.SweepConfig{
-				Threshold: sweep.ageThreshold,
-				Delete:    sweep.deleteEnabled,
-			}, logger),
-			Interval: sweep.interval,
-		}
+		schedule = &jobs.SweepSchedule{Sweeper: sweeper, Interval: sweep.interval}
+	} else if err := sweeper.Heal(ctx); err != nil {
+		// Disabling the schedule must not strand a registered pack whose
+		// only copy a crashed delete-enabled handshake left in quarantine:
+		// run one restorative heal pass at startup regardless. Failure is
+		// logged, not fatal — the pass re-runs on next boot.
+		logger.Warn("startup quarantine heal failed", "err", err)
 	}
 
 	queue, decorate, queueCleanup, err := buildServeEventing(ctx, ms, dbURL, org, httpBaseURL, key, schedule, logger)

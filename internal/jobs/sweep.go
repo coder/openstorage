@@ -422,6 +422,20 @@ func (s *Sweeper) revalidateOrphan(ctx context.Context, repo, key string) (bool,
 	return false, nil // gone already: nothing to delete
 }
 
+// Heal runs one standalone restorative quarantine pass. Serve calls it at
+// startup when periodic sweeping is disabled (CODESTORAGE_SWEEP_INTERVAL=0):
+// a delete-enabled process that crashed mid-handshake may have left a
+// registered pack's only copy in quarantine, and disabling the schedule
+// must not strand it.
+func (s *Sweeper) Heal(ctx context.Context) error {
+	var report SweepReport
+	err := s.healQuarantine(ctx, &report)
+	if report.BytesReclaimed > 0 {
+		s.logger.Info("standalone quarantine heal reclaimed bytes", "bytes", report.BytesReclaimed)
+	}
+	return err
+}
+
 // SweepSchedule configures the periodic orphan-pack sweep on a queue
 // backend: a River periodic job in postgres mode, a background ticker in
 // local mode. Nil disables sweeping (hook subprocesses, tests).
