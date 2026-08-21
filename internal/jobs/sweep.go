@@ -25,6 +25,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -98,30 +100,49 @@ func NewSweeper(blobs blob.BlobStore, packs PackLister, cfg SweepConfig, logger 
 //
 // Deletes never trust the initial listing snapshot: a retried push can
 // overwrite an orphaned key (pack keys are content-addressed, so the retry
-// reproduces the same key) after the snapshot was taken, and deleting from
-// stale state would destroy the fresh upload right before its RegisterPacks
-// commits. Each delete therefore revalidates the candidate first — a fresh
-// registry lookup, then a fresh ModTime read — so the age threshold is
-// evaluated at delete time, not list time. The residual window is the gap
-// between the revalidation reads and the delete call (milliseconds, versus
-// an upload that must age past the threshold to matter); closing it fully
-// needs conditional deletes or upload leases, which no portable blob
-// backend offers (see the PR discussion on issue #5).
+// reproduces the same key — and therefore identical bytes) at any point
+// during the sweep, and no portable blob backend offers conditional
+// deletes. Three layers make deletion safe anyway:
+//
+//  1. revalidateOrphan re-reads the registry and the object's ModTime just
+//     before acting, sparing candidates registered or refreshed mid-sweep.
+//  2. safeDelete copies the bytes to a quarantine key before deleting, then
+//     re-reads the registry AFTER the delete: a registration that landed
+//     mid-delete is repaired on the spot by re-uploading the identical
+//     bytes (content-addressed keys make the restore always correct).
+//  3. healQuarantine, at the start of every delete-enabled sweep, restores
+//     any quarantined pack whose key is registered but missing (covering a
+//     sweeper crash mid-handshake, or a registration that landed after
+//     safeDelete's recheck) and purges quarantine backups once they age
+//     past the threshold.
+//
+// The residual exposure is transient, not data loss: a registration landing
+// after safeDelete's recheck leaves that pack unavailable until the next
+// delete-enabled sweep heals it (hydration's bounded missing-pack retry
+// covers reads racing the restore itself).
 func (s *Sweeper) Sweep(ctx context.Context) (SweepReport, error) {
 	start := s.now()
+	// Heal before classifying so a pack restored from quarantine is listed
+	// (and counted live) by the very sweep that healed it.
+	var deleteErrs []error
+	if s.cfg.Delete {
+		if err := s.healQuarantine(ctx); err != nil {
+			deleteErrs = append(deleteErrs, err)
+		}
+	}
 	objs, err := s.blobs.List(ctx, blob.PacksRoot)
 	if err != nil {
 		return SweepReport{}, fmt.Errorf("sweep: list %s: %w", blob.PacksRoot, err)
 	}
 
 	// Group by the key's repo segment (packs/<repo>/<file>). Keys not
-	// matching that shape were not written through blob.PackKey — leave
-	// foreign objects alone, loudly.
+	// matching the exact blob.PackKey shape (packs/<repo>/pack-<id>.pack,
+	// no deeper nesting) were not written by this system — leave foreign
+	// objects alone, loudly.
 	byRepo := make(map[string][]blob.ListedObject)
 	for _, obj := range objs {
-		rest := strings.TrimPrefix(obj.Key, blob.PacksRoot)
-		repo, file, ok := strings.Cut(rest, "/")
-		if !ok || repo == "" || file == "" {
+		repo, ok := splitPackKey(obj.Key)
+		if !ok {
 			s.logger.Warn("orphan pack sweep: skipping foreign key under packs/", "key", obj.Key)
 			continue
 		}
@@ -134,7 +155,6 @@ func (s *Sweeper) Sweep(ctx context.Context) (SweepReport, error) {
 	sort.Strings(repos) // deterministic logs and reports
 
 	var report SweepReport
-	var deleteErrs []error
 	for _, repo := range repos {
 		packs, err := s.packs.ListPacks(ctx, repo)
 		if err != nil {
@@ -176,8 +196,12 @@ func (s *Sweeper) Sweep(ctx context.Context) (SweepReport, error) {
 			if !stillOrphan {
 				continue
 			}
-			if err := s.blobs.Delete(ctx, obj.Key); err != nil && !errors.Is(err, blob.ErrNotFound) {
+			reaped, err := s.safeDelete(ctx, repo, obj.Key)
+			if err != nil {
 				deleteErrs = append(deleteErrs, err)
+				continue
+			}
+			if !reaped {
 				continue
 			}
 			report.Deleted++
@@ -193,6 +217,158 @@ func (s *Sweeper) Sweep(ctx context.Context) (SweepReport, error) {
 		"delete_enabled", s.cfg.Delete, "threshold", s.cfg.Threshold,
 		"duration", s.now().Sub(start).Round(time.Millisecond))
 	return report, errors.Join(deleteErrs...)
+}
+
+// quarantinePrefix roots the sweeper's pre-delete backups: safeDelete
+// copies packs/<repo>/pack-<id>.pack to sweep/quarantine/packs/... before
+// deleting, and healQuarantine restores or purges the copies. Deliberately
+// outside blob.PacksRoot so quarantined bytes never re-enter classification.
+const quarantinePrefix = "sweep/quarantine/"
+
+// splitPackKey validates that key has the exact shape blob.PackKey
+// produces — packs/<repo>/pack-<id>.pack with a non-empty id and no deeper
+// nesting — and returns the repo segment. Anything else (manifests, nested
+// directories, foreign objects) is not ours to classify or delete.
+func splitPackKey(key string) (repo string, ok bool) {
+	rest, found := strings.CutPrefix(key, blob.PacksRoot)
+	if !found {
+		return "", false
+	}
+	repo, file, found := strings.Cut(rest, "/")
+	if !found || repo == "" || strings.Contains(file, "/") {
+		return "", false
+	}
+	id, isPack := strings.CutPrefix(file, "pack-")
+	id, isPack2 := strings.CutSuffix(id, ".pack")
+	if !isPack || !isPack2 || id == "" {
+		return "", false
+	}
+	return repo, true
+}
+
+// safeDelete reaps one revalidated orphan candidate without ever being able
+// to lose registered bytes: it backs the object up to a quarantine key,
+// deletes, then re-reads the registry — a registration that landed
+// mid-delete is repaired immediately by re-uploading the identical bytes
+// (pack keys are content-addressed, so the restore is always correct).
+// The quarantine backup is kept after a successful reap; healQuarantine
+// purges it once it ages past the threshold, and until then it covers a
+// sweeper crash anywhere in this sequence. Returns whether the candidate
+// ended up reaped.
+func (s *Sweeper) safeDelete(ctx context.Context, repo, key string) (bool, error) {
+	tmpDir, err := os.MkdirTemp("", "orphan-sweep-*")
+	if err != nil {
+		return false, fmt.Errorf("sweep: delete %s: %w", key, err)
+	}
+	defer os.RemoveAll(tmpDir)
+	tmp := filepath.Join(tmpDir, "backup.pack")
+	if err := s.blobs.DownloadFile(ctx, key, tmp); err != nil {
+		if errors.Is(err, blob.ErrNotFound) {
+			return false, nil // gone already: nothing to delete
+		}
+		return false, fmt.Errorf("sweep: backup %s: %w", key, err)
+	}
+	if err := s.blobs.UploadFile(ctx, quarantinePrefix+key, tmp); err != nil {
+		return false, fmt.Errorf("sweep: quarantine %s: %w", key, err)
+	}
+	if err := s.blobs.Delete(ctx, key); err != nil && !errors.Is(err, blob.ErrNotFound) {
+		return false, fmt.Errorf("sweep: delete %s: %w", key, err)
+	}
+	// Post-delete registry recheck: whichever of {our delete, a retried
+	// push's RegisterPacks} lands last sees the other's state, so a
+	// registration this read observes gets its bytes restored here, and
+	// one it misses is healed from quarantine next sweep.
+	packs, err := s.packs.ListPacks(ctx, repo)
+	if err != nil {
+		// Deleted but unverified: the quarantine backup stays; the next
+		// sweep's heal pass restores it if it turns out registered.
+		return false, fmt.Errorf("sweep: post-delete recheck %s: %w", key, err)
+	}
+	for _, p := range packs {
+		if p.Key != key {
+			continue
+		}
+		if err := s.blobs.UploadFile(ctx, key, tmp); err != nil {
+			return false, fmt.Errorf("sweep: restore %s registered mid-delete: %w", key, err)
+		}
+		s.logger.Warn("orphan pack sweep: restored pack registered mid-delete", "key", key)
+		if err := s.blobs.Delete(ctx, quarantinePrefix+key); err != nil && !errors.Is(err, blob.ErrNotFound) {
+			s.logger.Warn("orphan pack sweep: purge quarantine after restore", "key", key, "err", err)
+		}
+		return false, nil
+	}
+	return true, nil
+}
+
+// healQuarantine finishes interrupted or lost-race safeDelete handshakes
+// from quarantine backups: a backup whose original key is registered gets
+// restored when the original is missing (identical bytes) and its backup
+// purged; an unregistered backup is purged only once it ages past the
+// threshold, so a concurrently running sweep's in-flight backup is never
+// touched. Failures are joined and reported; each entry is independent.
+func (s *Sweeper) healQuarantine(ctx context.Context) error {
+	entries, err := s.blobs.List(ctx, quarantinePrefix)
+	if err != nil {
+		return fmt.Errorf("sweep: list quarantine: %w", err)
+	}
+	var errs []error
+	for _, q := range entries {
+		orig := strings.TrimPrefix(q.Key, quarantinePrefix)
+		repo, ok := splitPackKey(orig)
+		if !ok {
+			s.logger.Warn("orphan pack sweep: skipping foreign quarantine key", "key", q.Key)
+			continue
+		}
+		packs, err := s.packs.ListPacks(ctx, repo)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("sweep: heal %s: list packs: %w", orig, err))
+			continue
+		}
+		registered := false
+		for _, p := range packs {
+			if p.Key == orig {
+				registered = true
+				break
+			}
+		}
+		if registered {
+			if _, err := s.blobs.Stat(ctx, orig); errors.Is(err, blob.ErrNotFound) {
+				if err := s.restoreFromQuarantine(ctx, q.Key, orig); err != nil {
+					errs = append(errs, err)
+					continue
+				}
+				s.logger.Warn("orphan pack sweep: healed registered pack from quarantine", "key", orig)
+			} else if err != nil {
+				errs = append(errs, fmt.Errorf("sweep: heal %s: stat: %w", orig, err))
+				continue
+			}
+		} else if q.ModTime.IsZero() || s.now().Sub(q.ModTime) < s.cfg.Threshold {
+			continue // possibly an in-flight sweep's backup: keep it
+		}
+		if err := s.blobs.Delete(ctx, q.Key); err != nil && !errors.Is(err, blob.ErrNotFound) {
+			errs = append(errs, fmt.Errorf("sweep: purge quarantine %s: %w", q.Key, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// restoreFromQuarantine copies the quarantined bytes back to the original
+// key through a local temp file (the BlobStore surface has no server-side
+// copy; sweeps are rare and packs are modest).
+func (s *Sweeper) restoreFromQuarantine(ctx context.Context, quarantineKey, orig string) error {
+	tmpDir, err := os.MkdirTemp("", "orphan-heal-*")
+	if err != nil {
+		return fmt.Errorf("sweep: heal %s: %w", orig, err)
+	}
+	defer os.RemoveAll(tmpDir)
+	tmp := filepath.Join(tmpDir, "restore.pack")
+	if err := s.blobs.DownloadFile(ctx, quarantineKey, tmp); err != nil {
+		return fmt.Errorf("sweep: heal %s: download quarantine: %w", orig, err)
+	}
+	if err := s.blobs.UploadFile(ctx, orig, tmp); err != nil {
+		return fmt.Errorf("sweep: heal %s: restore upload: %w", orig, err)
+	}
+	return nil
 }
 
 // revalidateOrphan re-checks one delete candidate against live state,

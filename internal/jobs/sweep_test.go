@@ -122,8 +122,12 @@ func seedSweepWorld(f *sweepFixture) (oldOrphan, nsOrphan, liveKey, nsLiveKey, f
 	freshKey = blob.PackKey("r1", "fresh")
 	f.upload(freshKey, "fresh-unregistered")
 
-	// A foreign key under packs/ without a repo segment: never touched.
-	f.upload("packs/stray", "not-a-pack-key")
+	// Foreign keys under packs/ that do not match the exact PackKey shape:
+	// never classified, never deleted, no matter how old (Codex P2).
+	for _, foreign := range []string{"packs/stray", "packs/r1/manifest.json", "packs/r1/archive/data"} {
+		f.upload(foreign, "not-a-pack-key")
+		f.backdate(foreign, 30*24*time.Hour)
+	}
 	return
 }
 
@@ -159,7 +163,8 @@ func TestSweep_ListOnlyReportsWithoutDeleting(t *testing.T) {
 	}
 
 	// List-only NEVER deletes, orphans included.
-	for _, key := range []string{liveKey, nsLiveKey, freshKey, oldOrphan, nsOrphan, "packs/stray"} {
+	for _, key := range []string{liveKey, nsLiveKey, freshKey, oldOrphan, nsOrphan,
+		"packs/stray", "packs/r1/manifest.json", "packs/r1/archive/data"} {
 		if !f.exists(key) {
 			t.Fatalf("list-only sweep deleted %q", key)
 		}
@@ -182,10 +187,19 @@ func TestSweep_DeleteReapsOrphansOnly(t *testing.T) {
 			t.Fatalf("orphan %q survived a delete-enabled sweep", key)
 		}
 	}
-	// Live packs, fresh uploads, and foreign keys all survive.
-	for _, key := range []string{liveKey, nsLiveKey, freshKey, "packs/stray"} {
+	// Live packs, fresh uploads, and foreign keys (however old) survive.
+	for _, key := range []string{liveKey, nsLiveKey, freshKey,
+		"packs/stray", "packs/r1/manifest.json", "packs/r1/archive/data"} {
 		if !f.exists(key) {
 			t.Fatalf("delete-enabled sweep deleted non-orphan %q", key)
+		}
+	}
+
+	// Reaped orphans leave quarantine backups behind (healQuarantine purges
+	// them once they age past the threshold).
+	for _, key := range []string{oldOrphan, nsOrphan} {
+		if !f.exists("sweep/quarantine/" + key) {
+			t.Fatalf("reaped orphan %q has no quarantine backup", key)
 		}
 	}
 
@@ -268,6 +282,102 @@ func TestSweep_DeleteSkipsPackRegisteredMidSweep(t *testing.T) {
 	}
 	if packs.calls != 2 {
 		t.Fatalf("ListPacks calls = %d, want 2 (snapshot + revalidation)", packs.calls)
+	}
+}
+
+// registeredAfterCall flips from empty to the registered set strictly after
+// the Nth ListPacks call, simulating a RegisterPacks landing at a chosen
+// point in the sweep.
+type registeredAfterCall struct {
+	packs []ref.Pack
+	after int
+	calls int
+}
+
+func (p *registeredAfterCall) ListPacks(context.Context, string) ([]ref.Pack, error) {
+	p.calls++
+	if p.calls <= p.after {
+		return nil, nil
+	}
+	return p.packs, nil
+}
+
+// A registration landing between revalidation and the delete (the
+// narrowest race) must be repaired by safeDelete's post-delete recheck:
+// the identical bytes are restored from the local backup (Codex P1 round 2).
+func TestSweep_DeleteRestoresPackRegisteredMidDelete(t *testing.T) {
+	f := newSweepFixture(t)
+	key := blob.PackKey("r1", "middelete")
+	content := "mid-delete-bytes"
+	f.upload(key, content)
+	f.backdate(key, 25*time.Hour)
+
+	// Calls: 1 = classification snapshot, 2 = revalidateOrphan (both see
+	// it unregistered), 3 = safeDelete's post-delete recheck (registered).
+	packs := &registeredAfterCall{packs: []ref.Pack{{ID: "middelete", Key: key}}, after: 2}
+	s := NewSweeper(f.blobs, packs, SweepConfig{Threshold: 24 * time.Hour, Delete: true}, slog.New(slog.DiscardHandler))
+	report, err := s.Sweep(context.Background())
+	if err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if report.Deleted != 0 {
+		t.Fatalf("report = %+v, want no deletes (registered mid-delete)", report)
+	}
+	if !f.exists(key) {
+		t.Fatalf("pack registered mid-delete %q was not restored", key)
+	}
+	dest := filepath.Join(t.TempDir(), "restored.pack")
+	if err := f.blobs.DownloadFile(context.Background(), key, dest); err != nil {
+		t.Fatalf("download restored pack: %v", err)
+	}
+	got, err := os.ReadFile(dest)
+	if err != nil || string(got) != content {
+		t.Fatalf("restored content = %q (err %v), want %q", got, err, content)
+	}
+	if f.exists("sweep/quarantine/" + key) {
+		t.Fatalf("quarantine backup not purged after restore")
+	}
+}
+
+// healQuarantine finishes a crashed handshake: a quarantine backup whose
+// original key is registered but missing is restored; an unregistered
+// backup is purged only once it ages past the threshold.
+func TestSweep_HealQuarantine(t *testing.T) {
+	f := newSweepFixture(t)
+
+	// Crashed handshake: registered pack, blob missing, backup present.
+	lost := blob.PackKey("r1", "lost")
+	f.upload("sweep/quarantine/"+lost, "lost-bytes")
+	f.register("r1", "lost", lost)
+
+	// Reaped long ago: unregistered, backup aged past the threshold.
+	stale := blob.PackKey("r1", "stale")
+	f.upload("sweep/quarantine/"+stale, "stale-bytes")
+	f.backdate("sweep/quarantine/"+stale, 25*time.Hour)
+
+	// In-flight sweep's backup: unregistered but fresh — must be kept.
+	inflight := blob.PackKey("r1", "inflight")
+	f.upload("sweep/quarantine/"+inflight, "inflight-bytes")
+
+	report, err := f.sweeper(SweepConfig{Threshold: 24 * time.Hour, Delete: true}).Sweep(context.Background())
+	if err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if !f.exists(lost) {
+		t.Fatalf("registered-but-missing pack %q was not healed from quarantine", lost)
+	}
+	if f.exists("sweep/quarantine/" + lost) {
+		t.Fatalf("healed backup %q was not purged", lost)
+	}
+	if f.exists("sweep/quarantine/" + stale) {
+		t.Fatalf("aged unregistered backup %q was not purged", stale)
+	}
+	if !f.exists("sweep/quarantine/" + inflight) {
+		t.Fatalf("fresh backup %q must be kept (possibly an in-flight sweep)", inflight)
+	}
+	// The healed pack is registered => live in the same sweep's report.
+	if report.Live != 1 {
+		t.Fatalf("report = %+v, want the healed pack counted live", report)
 	}
 }
 
