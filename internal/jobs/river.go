@@ -90,10 +90,18 @@ func (sweepArgs) InsertOpts() river.InsertOpts {
 
 // repackArgs is one durable background-repack job, unique per repo across
 // the active states exactly like syncArgs: post-write triggers on every
-// node can fire concurrently, and River coalesces them into one queued
-// fold. MaxAttempts 1 — a lost fold-install race must not retry eagerly
-// (the next insert past the threshold is the retry), and a failed fold is
+// node can fire concurrently, and River coalesces them into one job.
+// MaxAttempts 1 — a lost fold-install race must not retry eagerly (the
+// next insert past the threshold is the retry), and a failed fold is
 // harmless to defer the same way.
+//
+// Uniqueness including the running state swallows triggers that fire while
+// a fold runs — but a running fold works a row snapshot from its start, so
+// packs registered mid-fold survive it and a burst could otherwise finish
+// above the threshold with nothing scheduled until the next write. The
+// worker therefore rechecks the threshold after each fold and SNOOZES the
+// same job when more folding is due (river requires running in ByState, so
+// a separate queued follow-up is not expressible).
 type repackArgs struct {
 	Repo string `json:"repo" river:"unique"`
 }
@@ -116,15 +124,30 @@ func (repackArgs) InsertOpts() river.InsertOpts {
 	}
 }
 
+// repackFollowUpSnooze delays a due follow-up fold: long enough to batch a
+// burst's remaining registrations, short enough to keep pack counts near
+// the threshold under sustained traffic.
+const repackFollowUpSnooze = 5 * time.Second
+
 // repackWorker runs one fold attempt; the Repacker owns race handling and
-// reporting.
+// reporting. A post-fold threshold recheck snoozes the job when packs
+// registered mid-fold left the repo due for another fold (snoozing does not
+// consume the attempt). The residual window — a registration landing after
+// the recheck but before the job completes — is bounded by one job-state
+// flip and is retried by that write's own trigger chain on the next write.
 type repackWorker struct {
 	river.WorkerDefaults[repackArgs]
 	repacker *Repacker
 }
 
 func (w *repackWorker) Work(ctx context.Context, job *river.Job[repackArgs]) error {
-	return w.repacker.Repack(ctx, job.Args.Repo)
+	if err := w.repacker.Repack(ctx, job.Args.Repo); err != nil {
+		return err
+	}
+	if w.repacker.NeedsFollowUp(ctx, job.Args.Repo) {
+		return river.JobSnooze(repackFollowUpSnooze)
+	}
+	return nil
 }
 
 // sweepWorker runs one orphan-pack sweep; the Sweeper owns all reporting.

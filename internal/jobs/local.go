@@ -24,7 +24,13 @@ type Local struct {
 	mu        stdsync.Mutex
 	closed    bool
 	repacking map[string]bool // repos with an in-flight repack goroutine
-	wg        stdsync.WaitGroup
+	// repackPending remembers at most ONE follow-up per repo for triggers
+	// that fired while a fold was running: the running fold works a row
+	// snapshot from its start, so later registrations survive it and would
+	// otherwise strand above the threshold until the next write (mirrors
+	// River's queued-states-only uniqueness).
+	repackPending map[string]bool
+	wg            stdsync.WaitGroup
 }
 
 var _ Queue = (*Local)(nil)
@@ -38,11 +44,12 @@ func NewLocal(deliverer *events.Deliverer, runSync SyncRunner, repacker *Repacke
 	assertf(runSync != nil, "NewLocal: nil sync runner")
 	assertf(logger != nil, "NewLocal: nil logger")
 	return &Local{
-		deliverer: deliverer,
-		syncq:     sync.NewInProcessQueue(runSync, logger),
-		repacker:  repacker,
-		logger:    logger,
-		repacking: make(map[string]bool),
+		deliverer:     deliverer,
+		syncq:         sync.NewInProcessQueue(runSync, logger),
+		repacker:      repacker,
+		logger:        logger,
+		repacking:     make(map[string]bool),
+		repackPending: make(map[string]bool),
 	}
 }
 
@@ -77,9 +84,10 @@ func (q *Local) EnqueueSync(ctx context.Context, job sync.Job) error {
 
 // EnqueueRepack runs one fold attempt on a background goroutine with a
 // fresh context (it must outlive the HTTP request that triggered it). At
-// most one repack per repo is in flight — a trigger landing while one runs
-// is dropped, mirroring River's unique-by-repo jobs: if the finished fold
-// left the repo above the threshold, the next write re-triggers. Queued
+// most one repack per repo is in flight; a trigger landing while one runs
+// marks ONE pending rerun that starts when the current fold finishes —
+// mirroring River's unique-by-repo jobs, whose uniqueness spans only the
+// queued states so a mid-run trigger queues exactly one follow-up. Queued
 // work is lost on process restart (the documented local-mode trade-off).
 func (q *Local) EnqueueRepack(_ context.Context, repo string) error {
 	assertf(repo != "", "EnqueueRepack: empty repo")
@@ -92,22 +100,34 @@ func (q *Local) EnqueueRepack(_ context.Context, repo string) error {
 		return errors.New("jobs queue is closed")
 	}
 	if q.repacking[repo] {
-		return nil // one in flight already: coalesce
+		q.repackPending[repo] = true // one follow-up after the in-flight fold
+		return nil
 	}
 	q.repacking[repo] = true
 	q.wg.Add(1)
-	go func() {
-		defer q.wg.Done()
-		defer func() {
-			q.mu.Lock()
-			delete(q.repacking, repo)
-			q.mu.Unlock()
-		}()
+	go q.runRepack(repo)
+	return nil
+}
+
+// runRepack executes fold attempts for repo until no follow-up is pending
+// (or the queue is closing — pending local work dies with the process, the
+// documented trade-off).
+func (q *Local) runRepack(repo string) {
+	defer q.wg.Done()
+	for {
 		if err := q.repacker.Repack(context.Background(), repo); err != nil {
 			q.logger.Warn("repack failed", "repo", repo, "err", err)
 		}
-	}()
-	return nil
+		q.mu.Lock()
+		if q.closed || !q.repackPending[repo] {
+			delete(q.repacking, repo)
+			delete(q.repackPending, repo)
+			q.mu.Unlock()
+			return
+		}
+		delete(q.repackPending, repo)
+		q.mu.Unlock()
+	}
 }
 
 // Close stops accepting work and waits for in-flight deliveries and syncs.

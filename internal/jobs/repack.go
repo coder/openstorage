@@ -87,11 +87,36 @@ type Repacker struct {
 	hydrate HydrateFunc
 	logger  *slog.Logger
 
+	// FollowUpThreshold, when >= 2, is the registered-pack count at which
+	// a just-finished fold is followed by another one (queue backends
+	// consult NeedsFollowUp): packs registered after the fold's row
+	// snapshot survive it, and a burst could otherwise finish above the
+	// trigger threshold with nothing scheduled until the next write.
+	// Wiring sets it to the trigger threshold; 0 disables follow-ups.
+	FollowUpThreshold int
+
 	// BeforeSwap is a test seam: when set, it runs after the consolidated
 	// pack's blob upload and before ReplacePacks — the fold-install race
 	// window. Tests and the DST harness use it to interleave a competing
 	// fold deterministically. Never set in production wiring.
 	BeforeSwap func(ctx context.Context) error
+}
+
+// NeedsFollowUp reports whether repo's registered pack count has reached
+// FollowUpThreshold — the post-fold recheck queue backends use to schedule
+// one more fold for registrations that landed mid-fold. Read failures
+// report false (the next write's trigger retries).
+func (r *Repacker) NeedsFollowUp(ctx context.Context, repo string) bool {
+	assertf(repo != "", "NeedsFollowUp: empty repo")
+	if r.FollowUpThreshold < 2 {
+		return false
+	}
+	packs, err := r.store.ListPacks(ctx, repo)
+	if err != nil {
+		r.logger.Warn("repack follow-up recheck failed", "repo", repo, "err", err)
+		return false
+	}
+	return len(packs) >= r.FollowUpThreshold
 }
 
 // NewRepacker builds a Repacker over the raw ref/blob stores and the
@@ -196,6 +221,25 @@ func (r *Repacker) Repack(ctx context.Context, repo string) error {
 			if derr := r.blobs.Delete(ctx, newPack.Key); derr != nil && !errors.Is(derr, blob.ErrNotFound) {
 				r.logger.Warn("repack: lost fold; blob cleanup failed (sweeper will collect)",
 					"repo", repo, "key", newPack.Key, "err", derr)
+			}
+			// Post-delete registration recheck (the sweeper's safeDelete
+			// handshake): a concurrent fold over the CURRENT rows can
+			// produce this same content-addressed key and install it
+			// between the HasPack read above and the delete — and its own
+			// post-swap verification may have passed before the delete
+			// landed. Re-read, and restore from the local pack file when
+			// the key is registered (or when the recheck cannot prove it
+			// is not: an extra orphan is sweeper fodder, a live row
+			// without bytes is corruption).
+			has2, herr2 := r.store.HasPack(ctx, repo, newPack.Key)
+			if herr2 != nil {
+				r.logger.Warn("repack: lost fold; post-delete recheck failed, restoring blob defensively",
+					"repo", repo, "key", newPack.Key, "err", herr2)
+			}
+			if has2 || herr2 != nil {
+				if verr := verifyPublished(ctx, r.blobs, newPack.Key, packPath); verr != nil {
+					return fmt.Errorf("repack %s: lost fold: restore after delete race: %w", repo, verr)
+				}
 			}
 		}
 		r.logger.Info("repack: lost fold-install race", "repo", repo, "folded", len(old))

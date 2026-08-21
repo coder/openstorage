@@ -144,6 +144,10 @@ func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL string, orgPEM
 			}
 			return githttp.Hydrate(ctx, refStore, blobStore, cacheDir, repo, rec.DefaultBranch)
 		}, logger)
+	// Post-fold follow-ups share the trigger threshold: packs registered
+	// while a fold ran survive its snapshot, and the queue backends
+	// schedule one more fold when the count is still at/above it.
+	repacker.FollowUpThreshold = repackThreshold
 
 	queue, decorate, queueCleanup, err := buildServeEventing(ctx, ms, dbURL, org, httpBaseURL, key, schedule, repacker, logger)
 	if err != nil {

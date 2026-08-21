@@ -504,6 +504,89 @@ func TestRepack_StaleSnapshotLosesCleanlyBeforePacking(t *testing.T) {
 	}
 }
 
+// lostFoldShim models the P1 delete race deterministically: ListPacks
+// serves one stale pre-fold snapshot (so the fold loses), and the FIRST
+// HasPack read reports the key unregistered — as if it landed just before a
+// concurrent identical fold's install committed. Later HasPack calls (the
+// post-delete recheck) see the real store.
+type lostFoldShim struct {
+	ref.RefStore
+	mu           stdsync.Mutex
+	stale        []ref.Pack
+	hasPackCalls int
+}
+
+func (s *lostFoldShim) ListPacks(ctx context.Context, repo string) ([]ref.Pack, error) {
+	s.mu.Lock()
+	stale := s.stale
+	s.stale = nil
+	s.mu.Unlock()
+	if stale != nil {
+		return stale, nil
+	}
+	return s.RefStore.ListPacks(ctx, repo)
+}
+
+func (s *lostFoldShim) HasPack(ctx context.Context, repo, key string) (bool, error) {
+	s.mu.Lock()
+	s.hasPackCalls++
+	first := s.hasPackCalls == 1
+	s.mu.Unlock()
+	if first {
+		return false, nil
+	}
+	return s.RefStore.HasPack(ctx, repo, key)
+}
+
+// TestRepack_LostFoldDeleteRaceRestoresLiveKey pins the round-2 P1 finding:
+// a stale fold that loses can produce the SAME content-addressed pack as
+// the winner (identical object union). If its pre-delete HasPack read lands
+// before the winner's install commits, it deletes the now-LIVE blob — the
+// post-delete registration recheck must detect this and restore the bytes
+// from the local pack file.
+func TestRepack_LostFoldDeleteRaceRestoresLiveKey(t *testing.T) {
+	f := newRepackFixture(t)
+	ctx := context.Background()
+	for range 2 {
+		f.push(t)
+	}
+	stale := f.packRows(t) // pre-fold snapshot [A, B]
+
+	// Winner folds A,B into K; warmDir keeps A, B, and K materialized.
+	warmDir := t.TempDir()
+	if err := f.repacker(warmDir).Repack(ctx, f.repo); err != nil {
+		t.Fatalf("winner repack: %v", err)
+	}
+	rows := f.packRows(t)
+	if len(rows) != 1 {
+		t.Fatalf("pack rows after winner fold = %+v, want 1", rows)
+	}
+	liveKey := rows[0].Key
+
+	// The loser folds the same stale input in the same warm cache: same
+	// union, same deterministic pack id, same blob key as the LIVE row.
+	shim := &lostFoldShim{RefStore: f.store, stale: stale}
+	loser := NewRepacker(shim, f.blobs, func(ctx context.Context, repo string) (string, error, error) {
+		return githttp.Hydrate(ctx, f.store, f.blobs, warmDir, repo, "main")
+	}, slog.New(slog.DiscardHandler))
+	if err := loser.Repack(ctx, f.repo); err != nil {
+		t.Fatalf("loser repack: %v", err)
+	}
+	if shim.hasPackCalls < 2 {
+		t.Fatalf("HasPack called %d times; the loser skipped the post-delete recheck", shim.hasPackCalls)
+	}
+
+	// The lost fold's cleanup deleted the live blob; the handshake must
+	// have restored it, and the repo must still cold-hydrate cleanly.
+	if got := f.packRows(t); len(got) != 1 || got[0].Key != liveKey {
+		t.Fatalf("pack rows after lost fold = %+v, want the winner's row %s", got, liveKey)
+	}
+	if !f.blobExists(t, liveKey) {
+		t.Fatalf("live blob %s not restored after the lost fold's delete race", liveKey)
+	}
+	f.checkColdHydrate(t)
+}
+
 // TestRepack_RepublishesBlobSweptMidSwap pins the issue-#5 writer half on
 // the repack path: a delete-enabled sweeper reaping the freshly uploaded
 // consolidated blob between upload and swap commit (its content-addressed
@@ -652,6 +735,7 @@ func TestRiver_RepackUniqueByRepo(t *testing.T) {
 	defer release()
 	r := f.repacker(t.TempDir())
 	r.BeforeSwap = func(context.Context) error { <-gate; return nil }
+	r.FollowUpThreshold = 2 // post-fold recheck: mid-run rows demand a follow-up
 
 	deliverer := &events.Deliverer{Webhooks: stubWebhooks{}, Logger: slog.New(slog.DiscardHandler)}
 	q, err := NewRiver(ctx, pgURL, deliverer, func(context.Context, sync.Job) error { return nil },
@@ -674,37 +758,53 @@ func TestRiver_RepackUniqueByRepo(t *testing.T) {
 		return n
 	}
 
-	// Concurrent triggers while the fold is parked: exactly one durable job.
+	// First trigger inserts the job; wait until a worker is RUNNING it
+	// (parked at the BeforeSwap gate).
+	if err := q.EnqueueRepack(ctx, f.repo); err != nil {
+		t.Fatalf("enqueue repack: %v", err)
+	}
+	waitJobs := func(query string, want int, what string) {
+		t.Helper()
+		deadline := time.Now().Add(60 * time.Second)
+		for {
+			var n int
+			if err := pool.QueryRow(ctx, query).Scan(&n); err != nil {
+				t.Fatalf("count %s: %v", what, err)
+			}
+			if n == want {
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("%s = %d, want %d (pack rows %+v)", what, n, want, f.packRows(t))
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
+	waitJobs(`SELECT count(*) FROM river_job WHERE kind = 'repack' AND state = 'running'`, 1, "running repack jobs")
+
+	// Triggers firing while the fold runs are swallowed by uniqueness
+	// (running is a required unique state): still exactly one job. The
+	// packs registered mid-fold survive the fold's snapshot; the WORKER's
+	// post-fold recheck owns folding them via snooze.
+	f.push(t)
+	f.push(t)
 	for range 3 {
 		if err := q.EnqueueRepack(ctx, f.repo); err != nil {
-			t.Fatalf("enqueue repack: %v", err)
+			t.Fatalf("enqueue repack mid-run: %v", err)
 		}
 	}
 	if n := countJobs(); n != 1 {
-		t.Fatalf("river holds %d repack jobs while one is active, want 1", n)
+		t.Fatalf("river holds %d repack jobs while one is running, want 1 (unique)", n)
 	}
 	release()
 
-	// Wait for the JOB to complete (not merely the fold to land: the state
-	// flips after the worker returns, and the uniqueness check below must
-	// not race it).
-	deadline := time.Now().Add(30 * time.Second)
-	for {
-		var done int
-		if err := pool.QueryRow(ctx,
-			`SELECT count(*) FROM river_job WHERE kind = 'repack' AND state = 'completed'`).Scan(&done); err != nil {
-			t.Fatalf("count completed repack jobs: %v", err)
-		}
-		if done == 1 {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("repack job did not complete; pack rows = %+v", f.packRows(t))
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
+	// The job folds its snapshot, rechecks the threshold (fold + 2 mid-run
+	// rows = 3 >= 2), snoozes, folds again, and only then completes — the
+	// SAME job throughout. Wait for completion (the state flips after the
+	// worker returns; the uniqueness check below must not race it).
+	waitJobs(`SELECT count(*) FROM river_job WHERE kind = 'repack' AND state = 'completed'`, 1, "completed repack jobs")
 	if rows := f.packRows(t); len(rows) != 1 {
-		t.Fatalf("pack rows after fold = %+v, want 1", rows)
+		t.Fatalf("pack rows after follow-up fold = %+v, want 1 (mid-run rows not refolded)", rows)
 	}
 	f.checkColdHydrate(t)
 
@@ -761,11 +861,25 @@ func TestLocalQueue_RepackCoalescesPerRepo(t *testing.T) {
 		t.Fatal("a second repack ran concurrently for the same repo")
 	case <-time.After(100 * time.Millisecond):
 	}
+	// Packs registered after the running fold's snapshot survive it; the
+	// coalesced triggers above must yield ONE pending rerun that folds
+	// them once the first fold finishes (mirrors River's queued-states
+	// uniqueness): without it, these rows would strand above the
+	// threshold until the next write.
+	f.push(t)
+	f.push(t)
 	close(gate)
-	q.Close() // waits for the in-flight fold
+	deadline := time.Now().Add(30 * time.Second)
+	for len(f.packRows(t)) != 1 {
+		if time.Now().After(deadline) {
+			t.Fatalf("pending rerun never folded the mid-run rows: %+v", f.packRows(t))
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	q.Close() // waits for any in-flight fold
 
 	if rows := f.packRows(t); len(rows) != 1 {
-		t.Fatalf("pack rows after coalesced fold = %+v, want 1", rows)
+		t.Fatalf("pack rows after coalesced fold + rerun = %+v, want 1", rows)
 	}
 	if err := q.EnqueueRepack(ctx, f.repo); err == nil {
 		t.Fatal("EnqueueRepack after Close must fail")
