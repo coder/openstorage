@@ -8,6 +8,7 @@ package api
 // exactly repo_id/id/repo_name/url/default_branch (no created_at).
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/url"
@@ -218,6 +219,38 @@ func TestPatchRepoQualifiedDefaultStillDeleteProtected(t *testing.T) {
 		}
 		if got := wrefRefs(t, e, fx.repoID)["refs/heads/feature"]; got == "" {
 			t.Fatal("refs/heads/feature was deleted despite being the default branch")
+		}
+	})
+}
+
+// A fork inheriting a refs/heads/-qualified stored default must create its
+// initial ref at the trimmed branch name — never a double-qualified
+// refs/heads/refs/heads/... with a dangling HEAD.
+func TestPatchRepoQualifiedDefaultForkInheritance(t *testing.T) {
+	runBackends(t, func(t *testing.T, e *testEnv) {
+		srv := newForkServer(t, e)
+		src := wrefSeedFixture(t, e)
+		srcWriteTok := e.mint(t, tokenSpec{iss: src.org, repo: src.url, scopes: []string{auth.ScopeRepoWrite}})
+		resp, body := e.doReq(t, http.MethodPatch, "/api/v1/repo", srcWriteTok,
+			[]byte(`{"default_branch":"refs/heads/feature"}`), "")
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("PATCH qualified default = %d: %s", resp.StatusCode, body)
+		}
+
+		srcReadTok := e.mint(t, tokenSpec{iss: src.org, repo: src.url, scopes: []string{auth.ScopeGitRead}})
+		caller := newForkCaller(t, e, "")
+		fresp, fbody := forkDo(t, srv, caller.token, forkBody(srcReadTok, nil))
+		forkID := forkRequireCreated(t, fresp, fbody)
+
+		// The fork's only ref is the trimmed name at the source default's
+		// tip (feature@c1 in the fixture), and the row records the name.
+		refs := wrefRefs(t, e, forkID)
+		if len(refs) != 1 || refs["refs/heads/feature"] != src.c1 {
+			t.Fatalf("fork refs = %v, want exactly refs/heads/feature=%s", refs, src.c1)
+		}
+		row, err := e.store.GetRepoByURL(context.Background(), caller.org, caller.url)
+		if err != nil || row.DefaultBranch != "feature" {
+			t.Fatalf("fork repo row = %+v err %v, want default_branch feature", row, err)
 		}
 	})
 }

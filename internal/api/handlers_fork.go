@@ -184,7 +184,12 @@ func (s *server) handleForkRepo(w http.ResponseWriter, r *http.Request, verifier
 		branch = r.URL.Query().Get("default_branch")
 	}
 	if branch == "" {
-		branch = srcRepo.DefaultBranch
+		// The source's stored default may be refs/heads/-qualified (PATCH
+		// /repo stores such values verbatim); the fork inherits the branch
+		// NAME — forkRef below re-qualifies it. A source default outside
+		// refs/heads/ survives the trim and fails validBranchName: such a
+		// fork must name its default branch explicitly.
+		branch = strings.TrimPrefix(srcRepo.DefaultBranch, "refs/heads/")
 	}
 	if !validBranchName(branch) {
 		writeErr(w, http.StatusBadRequest, "invalid default_branch")
