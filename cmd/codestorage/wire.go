@@ -72,14 +72,17 @@ func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL string, orgPEM
 	// listing is a read, no events to emit — and the shared blob store.
 	// interval 0 disables the periodic schedule; nil schedule keeps both
 	// queue backends inert.
-	if sweep.deleteEnabled {
+	if sweep.deleteEnabled && sweep.interval > 0 {
 		// Versioned S3 buckets break delete-mode invariants: Delete only
 		// writes a delete marker while every pack and quarantine version
 		// stays stored and billed, so sweeps would report reclaimed bytes
 		// without reclaiming anything. Fail closed: delete mode requires
 		// the probe to definitively report an unversioned bucket — a role
 		// without s3:GetBucketVersioning must not silently run destructive
-		// sweeps against a possibly versioned bucket.
+		// sweeps against a possibly versioned bucket. Gated on a live
+		// schedule: interval zero (the emergency stop) runs only the
+		// strictly restorative Heal, so nothing destructive needs this
+		// validation and the stop switch must never be blocked by it.
 		if s3store, ok := blobStore.(*blob.S3); ok {
 			versioned, err := s3store.VersioningEnabled(ctx)
 			switch {
