@@ -539,7 +539,7 @@ func (s *server) handleMerge(w http.ResponseWriter, r *http.Request) {
 		s.wmInternal(w, r, "probe merge-tree support", err)
 		return
 	}
-	repoPath, err := gitread.Materialize(ctx, s.refStore, s.blobStore, s.cacheDir, repo.RepoID)
+	repoPath, err := gitread.Materialize(ctx, s.refStore, s.blobStore, s.cacheDir, repo.RepoID, repo.DefaultBranch)
 	if err != nil {
 		s.wmInternal(w, r, "materialize repository", err)
 		return
@@ -814,7 +814,7 @@ func (s *server) handleMergePreview(w http.ResponseWriter, r *http.Request) {
 		s.internalErr(w, r, "probe merge-tree support", err)
 		return
 	}
-	repoPath, ok := s.materializeReadRepo(w, r, repo.RepoID)
+	repoPath, ok := s.materializeReadRepo(w, r, repo)
 	if !ok {
 		return
 	}

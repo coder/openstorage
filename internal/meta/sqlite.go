@@ -359,6 +359,53 @@ func (s *SQLite) GetRepoByID(ctx context.Context, org, repoID string) (Repo, err
 	return r, nil
 }
 
+// UpdateRepoDefaultBranch CASes the live repo's default branch (Store
+// contract). One UPDATE carries the whole CAS; zero rows affected then
+// splits inside the same write transaction (BEGIN IMMEDIATE) into "no live
+// repo" (ErrNotFound) and "default branch changed concurrently" (won=false).
+func (s *SQLite) UpdateRepoDefaultBranch(ctx context.Context, org, url, oldBranch, newBranch string) (bool, error) {
+	assertf(url != "", "UpdateRepoDefaultBranch: empty url for org %q", org)
+	assertf(oldBranch != "" && newBranch != "",
+		"UpdateRepoDefaultBranch: empty branch for %q (old %q, new %q)", url, oldBranch, newBranch)
+	orgID, err := s.lookupOrgID(ctx, org)
+	if err != nil {
+		return false, err
+	}
+	won := false
+	err = s.inTx(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx,
+			`UPDATE repos SET default_branch = ?
+			 WHERE org_id = ? AND url = ? AND deleted_at IS NULL AND default_branch = ?`,
+			newBranch, orgID, url, oldBranch)
+		if err != nil {
+			return err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		assertf(n == 0 || n == 1, "default-branch CAS of %q/%q affected %d rows", org, url, n)
+		if n == 1 {
+			won = true
+			return nil
+		}
+		// No row matched: absent/soft-deleted repo (404) or a concurrently
+		// changed default branch (won=false -> caller's 409).
+		var one int
+		err = tx.QueryRowContext(ctx,
+			`SELECT 1 FROM repos WHERE org_id = ? AND url = ? AND deleted_at IS NULL`,
+			orgID, url).Scan(&one)
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		return err
+	})
+	if err != nil {
+		return false, fmt.Errorf("update default branch of %q in org %q: %w", url, org, err)
+	}
+	return won, nil
+}
+
 // SoftDeleteRepo sets deleted_at and returns the affected repo. ErrNotFound
 // when no row exists; ErrAlreadyDeleted when already soft-deleted.
 func (s *SQLite) SoftDeleteRepo(ctx context.Context, org, url string) (Repo, error) {

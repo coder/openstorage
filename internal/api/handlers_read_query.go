@@ -63,7 +63,7 @@ func (s *server) resolveQueryRepo(w http.ResponseWriter, r *http.Request) (meta.
 		return meta.Repo{}, "", false
 	}
 	assertf(repo.RepoID != "", "store returned live repo with empty RepoID")
-	repoPath, err := gitread.Materialize(r.Context(), s.refStore, s.blobStore, s.cacheDir, repo.RepoID)
+	repoPath, err := gitread.Materialize(r.Context(), s.refStore, s.blobStore, s.cacheDir, repo.RepoID, repo.DefaultBranch)
 	if err != nil {
 		s.internalErr(w, r, "materialize repository", err)
 		return meta.Repo{}, "", false

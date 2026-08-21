@@ -103,6 +103,14 @@ type Store interface {
 	// JWT `repo` claims carry the url (docs/02).
 	GetRepoByID(ctx context.Context, org, repoID string) (Repo, error)
 
+	// UpdateRepoDefaultBranch compare-and-swaps the live repo's default
+	// branch from oldBranch to newBranch (openapi.yaml PATCH repo: the
+	// update is "a transactional compare-and-swap" against the value the
+	// caller read). won=false (no error) when the live row's default
+	// branch is no longer oldBranch — someone else changed it first;
+	// ErrNotFound when no live repo matches.
+	UpdateRepoDefaultBranch(ctx context.Context, org, url, oldBranch, newBranch string) (won bool, err error)
+
 	// SoftDeleteRepo sets deleted_at and returns the affected repo.
 	// ErrNotFound when no row exists; ErrAlreadyDeleted when already
 	// soft-deleted.

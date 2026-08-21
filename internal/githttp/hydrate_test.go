@@ -18,7 +18,7 @@ func TestSyncRefs_DeletesStaleLocalRef(t *testing.T) {
 	head := revParse(t, dir, "HEAD")
 	mustGit(t, dir, "branch", "stale")
 
-	if err := SyncRefs(dir, map[string]string{"refs/heads/main": head}); err != nil {
+	if err := SyncRefs(dir, map[string]string{"refs/heads/main": head}, "refs/heads/main"); err != nil {
 		t.Fatalf("SyncRefs: %v", err)
 	}
 
@@ -28,6 +28,36 @@ func TestSyncRefs_DeletesStaleLocalRef(t *testing.T) {
 	}
 	if !strings.Contains(out, "refs/heads/main "+head) {
 		t.Fatalf("refs/heads/main missing or moved:\n%s", out)
+	}
+}
+
+// SyncRefs must point HEAD at the given target (issue #18: the default
+// branch is per-repo state from the meta row, no longer hardcoded main).
+func TestSyncRefs_PointsHeadAtTarget(t *testing.T) {
+	dir := initWorkRepo(t)
+	head := revParse(t, dir, "HEAD")
+
+	if err := SyncRefs(dir, map[string]string{
+		"refs/heads/main": head,
+		"refs/heads/dev":  head,
+	}, "refs/heads/dev"); err != nil {
+		t.Fatalf("SyncRefs: %v", err)
+	}
+
+	out := mustGit(t, dir, "symbolic-ref", "HEAD")
+	if got := strings.TrimSpace(out); got != "refs/heads/dev" {
+		t.Fatalf("HEAD = %q, want refs/heads/dev", got)
+	}
+}
+
+// HeadTarget qualifies short branch names and passes refs/-prefixed values
+// through verbatim (openapi.yaml PATCH repo).
+func TestHeadTarget(t *testing.T) {
+	if got := HeadTarget("main"); got != "refs/heads/main" {
+		t.Fatalf("HeadTarget(main) = %q, want refs/heads/main", got)
+	}
+	if got := HeadTarget("refs/heads/dev"); got != "refs/heads/dev" {
+		t.Fatalf("HeadTarget(refs/heads/dev) = %q, want refs/heads/dev", got)
 	}
 }
 
@@ -43,7 +73,7 @@ func TestSyncRefs_DirectoryFileConflict(t *testing.T) {
 	if err := SyncRefs(dir, map[string]string{
 		"refs/heads/main":    head,
 		"refs/heads/foo/bar": head,
-	}); err != nil {
+	}, "refs/heads/main"); err != nil {
 		t.Fatalf("SyncRefs: %v", err)
 	}
 

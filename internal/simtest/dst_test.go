@@ -172,7 +172,7 @@ func TestHydrateAbsorbsInjectedNotFound(t *testing.T) {
 	inj.FailNext(OpBlobDownloadFile, FaultNotFound)
 	cacheDir := filepath.Join(dir, "cache")
 	repoPath, refsErr, err := githttp.Hydrate(ctx,
-		NewSimRefStore(st, inj), NewSimBlobStore(bl, inj), cacheDir, "r")
+		NewSimRefStore(st, inj), NewSimBlobStore(bl, inj), cacheDir, "r", "main")
 	if err != nil || refsErr != nil {
 		t.Fatalf("Hydrate = (err=%v, refsErr=%v), want transient fault absorbed", err, refsErr)
 	}

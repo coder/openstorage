@@ -57,10 +57,11 @@ func (s *server) resolveReadRepo(w http.ResponseWriter, r *http.Request) (meta.R
 }
 
 // materializeReadRepo rebuilds the repo's bare cache from the ref/blob
-// stores (DB is the ref authority) and returns its path. Writes a 500 and
-// returns ok=false on failure.
-func (s *server) materializeReadRepo(w http.ResponseWriter, r *http.Request, repoID string) (string, bool) {
-	repoPath, err := gitread.Materialize(r.Context(), s.refStore, s.blobStore, s.cacheDir, repoID)
+// stores (DB is the ref authority; HEAD follows the repo record's default
+// branch) and returns its path. Writes a 500 and returns ok=false on
+// failure.
+func (s *server) materializeReadRepo(w http.ResponseWriter, r *http.Request, repo meta.Repo) (string, bool) {
+	repoPath, err := gitread.Materialize(r.Context(), s.refStore, s.blobStore, s.cacheDir, repo.RepoID, repo.DefaultBranch)
 	if err != nil {
 		s.internalErr(w, r, "materialize repository", err)
 		return "", false
@@ -352,7 +353,7 @@ func (s *server) handleListTags(w http.ResponseWriter, r *http.Request) {
 		}
 		after = fields[0]
 	}
-	repoPath, ok := s.materializeReadRepo(w, r, repo.RepoID)
+	repoPath, ok := s.materializeReadRepo(w, r, repo)
 	if !ok {
 		return
 	}
@@ -411,7 +412,7 @@ func (s *server) handleGetTag(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "name is required")
 		return
 	}
-	repoPath, ok := s.materializeReadRepo(w, r, repo.RepoID)
+	repoPath, ok := s.materializeReadRepo(w, r, repo)
 	if !ok {
 		return
 	}
@@ -488,7 +489,7 @@ func (s *server) handleListCommits(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	repoPath, ok := s.materializeReadRepo(w, r, repo.RepoID)
+	repoPath, ok := s.materializeReadRepo(w, r, repo)
 	if !ok {
 		return
 	}
@@ -582,7 +583,7 @@ func (s *server) handleGetCommit(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "missing ref")
 		return
 	}
-	repoPath, ok := s.materializeReadRepo(w, r, repo.RepoID)
+	repoPath, ok := s.materializeReadRepo(w, r, repo)
 	if !ok {
 		return
 	}
@@ -630,7 +631,7 @@ func (s *server) resolveFilesRequest(w http.ResponseWriter, r *http.Request, rep
 	if refLabel == "" {
 		refLabel = repo.DefaultBranch
 	}
-	repoPath, ok = s.materializeReadRepo(w, r, repo.RepoID)
+	repoPath, ok = s.materializeReadRepo(w, r, repo)
 	if !ok {
 		return "", "", "", false
 	}

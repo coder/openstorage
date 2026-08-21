@@ -146,7 +146,7 @@ func (s *server) handleForkRepo(w http.ResponseWriter, r *http.Request, verifier
 	}
 	assertf(srcRepo.RepoID != "", "store returned repo with empty RepoID")
 
-	srcPath, err := gitread.Materialize(ctx, s.refStore, s.blobStore, s.cacheDir, srcRepo.RepoID)
+	srcPath, err := gitread.Materialize(ctx, s.refStore, s.blobStore, s.cacheDir, srcRepo.RepoID, srcRepo.DefaultBranch)
 	if err != nil {
 		s.internalErr(w, r, "materialize fork source", err)
 		return
@@ -184,7 +184,11 @@ func (s *server) handleForkRepo(w http.ResponseWriter, r *http.Request, verifier
 		branch = r.URL.Query().Get("default_branch")
 	}
 	if branch == "" {
-		branch = srcRepo.DefaultBranch
+		// The source's stored default may be refs/heads/-qualified (PATCH
+		// /repo stores that spelling verbatim; both create and PATCH
+		// reject other ref namespaces); the fork inherits the branch
+		// NAME — forkRef below re-qualifies it.
+		branch = strings.TrimPrefix(srcRepo.DefaultBranch, "refs/heads/")
 	}
 	if !validBranchName(branch) {
 		writeErr(w, http.StatusBadRequest, "invalid default_branch")

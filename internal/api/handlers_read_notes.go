@@ -57,7 +57,7 @@ func (s *server) handleGetNote(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "no note found for "+sha)
 		return
 	}
-	repoPath, ok := s.materializeReadRepo(w, r, repo.RepoID)
+	repoPath, ok := s.materializeReadRepo(w, r, repo)
 	if !ok {
 		return
 	}

@@ -101,6 +101,10 @@ func (failingStore) GetRepoByID(context.Context, string, string) (meta.Repo, err
 	panic("not used by signing-key CLI")
 }
 
+func (failingStore) UpdateRepoDefaultBranch(context.Context, string, string, string, string) (bool, error) {
+	panic("not used by signing-key CLI")
+}
+
 func (failingStore) SoftDeleteRepo(context.Context, string, string) (meta.Repo, error) {
 	panic("not used by signing-key CLI")
 }

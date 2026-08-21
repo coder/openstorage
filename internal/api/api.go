@@ -114,6 +114,7 @@ func New(cfg Config) (http.Handler, error) {
 	// (*server).handleCreateRepo flow).
 	route("POST /api/v1/repos", false, s.forkAwareCreateRepo(cfg.Verifier, ss.handleCreateRepo), auth.ScopeRepoWrite)
 	route("GET /api/v1/repo", false, s.handleGetRepo, auth.ScopeGitRead)
+	route("PATCH /api/v1/repo", false, s.handlePatchRepo, auth.ScopeRepoWrite)
 	route("GET /api/v1/repos", true, s.handleListRepos, auth.ScopeOrgRead)
 	route("DELETE /api/v1/repos/delete", false, s.handleDeleteRepo, auth.ScopeRepoWrite)
 

@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"os/exec"
 	"regexp"
 	"strconv"
 	"strings"
@@ -14,6 +15,7 @@ import (
 
 	"codestorage/internal/auth"
 	"codestorage/internal/blob"
+	"codestorage/internal/githttp"
 	"codestorage/internal/meta"
 	"codestorage/internal/ref"
 )
@@ -80,14 +82,19 @@ func policyDeniesRepoDelete(policies []auth.RefPolicy) (string, bool) {
 // alphanumeric, then alphanumerics plus . _ - (docs/03: invalid input -> 400).
 var branchComponentRe = regexp.MustCompile(`\A[A-Za-z0-9][A-Za-z0-9._-]*\z`)
 
-// validBranchName reports whether name is an acceptable default branch:
-// slash-separated conservative ref components, no "..", no ".lock" suffix.
+// validBranchName reports whether name is an acceptable branch/tag name:
+// slash-separated conservative ref components, no "..", no ".lock" suffix,
+// no trailing dot. Within this charset those are exactly git's own
+// check-ref-format rules — every accepted name must survive as a real ref,
+// because stored default branches now drive `symbolic-ref HEAD` on every
+// hydrate (issue #18) and a git-rejected name would poison hydration.
 func validBranchName(name string) bool {
 	if name == "" || len(name) > 255 || strings.Contains(name, "..") {
 		return false
 	}
 	for _, comp := range strings.Split(name, "/") {
-		if !branchComponentRe.MatchString(comp) || strings.HasSuffix(comp, ".lock") {
+		if !branchComponentRe.MatchString(comp) ||
+			strings.HasSuffix(comp, ".lock") || strings.HasSuffix(comp, ".") {
 			return false
 		}
 	}
@@ -207,6 +214,152 @@ func (s *server) handleGetRepo(w http.ResponseWriter, r *http.Request) {
 		DefaultBranch: repo.DefaultBranch,
 		CreatedAt:     repo.CreatedAt.UTC().Format(time.RFC3339),
 		BaseRepo:      base,
+	})
+}
+
+// validRefFormat reports whether git itself accepts target as a ref name
+// (`git check-ref-format`, no repository needed). validBranchName's
+// conservative charset is necessary but not sufficient — git additionally
+// rejects e.g. trailing dots — and only git's own verdict guarantees the
+// later `symbolic-ref HEAD <target>` succeeds.
+func validRefFormat(ctx context.Context, target string) bool {
+	assertf(strings.HasPrefix(target, "refs/"), "validRefFormat: unqualified target %q", target)
+	return exec.CommandContext(ctx, "git", "check-ref-format", target).Run() == nil
+}
+
+// policyDeniesDefaultBranchChange reports whether the token's ref policies
+// deny repointing HEAD at target (a fully qualified ref, HeadTarget form).
+// The consulted rules are the first match for the pseudoref HEAD and for
+// the new target ref (first-match-wins, like the update hook). Repointing
+// HEAD moves no refs and introduces no commits, so no-force-push
+// (deletions/rewrites) and verify-sig (introduced commits) never deny —
+// but no-push denies every update to a covered ref, including which ref
+// default clones follow, and unknown ops fail closed.
+func policyDeniesDefaultBranchChange(policies []auth.RefPolicy, target string) (string, bool) {
+	for _, ref := range []string{"HEAD", target} {
+		rule, ok := auth.MatchPolicy(policies, ref)
+		if !ok {
+			continue
+		}
+		for _, op := range rule.Ops {
+			if op != auth.OpVerifySig && op != auth.OpNoForcePush {
+				return op, true
+			}
+		}
+	}
+	return "", false
+}
+
+// patchRepoRequest is the PATCH /repo body: default_branch is the only
+// supported setting (openapi.yaml update_repo).
+type patchRepoRequest struct {
+	DefaultBranch string `json:"default_branch"`
+}
+
+// patchRepoResponse mirrors the live-spec PATCH schema exactly: repo_id and
+// repo_name plus their deprecated mirrors, and the branch name now recorded
+// as the default — unlike GET /repo's repoEntry, no created_at.
+type patchRepoResponse struct {
+	RepoID        string `json:"repo_id"`
+	ID            string `json:"id"` // deprecated: mirrors repo_id
+	RepoName      string `json:"repo_name"`
+	URL           string `json:"url"` // deprecated: mirrors repo_name
+	DefaultBranch string `json:"default_branch"`
+}
+
+// handlePatchRepo implements PATCH /api/v1/repo (scope repo:write): change
+// the default branch of the JWT `repo` claim's repository (openapi.yaml
+// update_repo). The row update is a CAS against the default branch read in
+// this request (upstream: "a transactional compare-and-swap"; a concurrent
+// change is a 409). Upstream contract: plain names are qualified for you
+// (`main` becomes the symref target `refs/heads/main`) while values already
+// starting with `refs/` are used verbatim, and the branch is never created
+// by this call — the target may be unborn (POST /repos likewise accepts an
+// unborn default on an empty repo), in which case clones see a dangling
+// HEAD until the branch is pushed, exactly like a freshly created repo.
+// Cache-repo HEADs follow on the next hydrate: the hydrate marker records
+// the synced HEAD target, so a changed default branch defeats the issue-#4
+// short-circuit (githttp/hydrate.go).
+func (s *server) handlePatchRepo(w http.ResponseWriter, r *http.Request) {
+	claims := mustClaims(r)
+	// docs/02: ref policies apply to every HTTP write endpoint; malformed
+	// policy claims fail closed, and the parsed rules gate the HEAD
+	// repoint below (policyDeniesDefaultBranchChange).
+	policies, err := refPolicies(claims)
+	if err != nil {
+		writeErr(w, http.StatusForbidden, err.Error())
+		return
+	}
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBodyBytes))
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "read request body: "+err.Error())
+		return
+	}
+	var req patchRepoRequest
+	if len(body) > 0 {
+		if err := json.Unmarshal(body, &req); err != nil {
+			writeErr(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
+			return
+		}
+	}
+	branch := req.DefaultBranch
+	if branch == "" {
+		// openapi.yaml: the body is required and default_branch must be a
+		// non-empty branch name.
+		writeErr(w, http.StatusBadRequest, "default_branch is required")
+		return
+	}
+	// default_branch names a BRANCH: a plain name (validated with the same
+	// conservative validBranchName as POST /repos' identical field) or its
+	// refs/heads/-qualified spelling, stored verbatim (upstream contract).
+	// Other ref namespaces are rejected: a refs/tags/... HEAD would evade
+	// every default-deletion protection and dangle on tag deletion — and
+	// upstream's field is, by name and description, a branch. The derived
+	// HEAD target must additionally satisfy git's own ref-format rules
+	// (e.g. no trailing dot, which validBranchName's charset permits):
+	// hydration runs `symbolic-ref HEAD <target>` on every node, and a
+	// persisted target git rejects would break the repo's git/read
+	// surface until another PATCH repairs the row.
+	target := githttp.HeadTarget(branch)
+	shortName := strings.TrimPrefix(branch, "refs/heads/")
+	if strings.HasPrefix(shortName, "refs/") || !validBranchName(shortName) || !validRefFormat(r.Context(), target) {
+		writeErr(w, http.StatusBadRequest, "invalid default_branch")
+		return
+	}
+	// The policy target is the derived HEAD symref target, not the
+	// NormalizeRefName shorthand: for the literal branch name "HEAD" the
+	// two disagree (refs/heads/HEAD vs the pseudoref), and rules written
+	// against refs/heads/HEAD must match. The pseudoref itself is checked
+	// separately inside the helper.
+	if op, denied := policyDeniesDefaultBranchChange(policies, target); denied {
+		writeErr(w, http.StatusForbidden, "ref policy op "+strconv.Quote(op)+" denies changing the default branch")
+		return
+	}
+	// ADR-21: the repo claim carries the url or the repo_id; resolve either
+	// (resolveRepo writes the 404/500 itself).
+	repo, ok := s.resolveRepo(w, r)
+	if !ok {
+		return
+	}
+	won, err := s.store.UpdateRepoDefaultBranch(r.Context(), claims.Iss, repo.URL, repo.DefaultBranch, branch)
+	switch {
+	case errors.Is(err, meta.ErrNotFound):
+		// The repo was soft-deleted between the read above and the CAS.
+		writeErr(w, http.StatusNotFound, "repository not found")
+		return
+	case err != nil:
+		s.internalErr(w, r, "update default branch", err)
+		return
+	case !won:
+		writeErr(w, http.StatusConflict, "default branch was modified concurrently, please retry")
+		return
+	}
+	writeJSON(w, http.StatusOK, patchRepoResponse{
+		RepoID:        repo.RepoID,
+		ID:            repo.RepoID,
+		RepoName:      repo.URL,
+		URL:           repo.URL,
+		DefaultBranch: branch,
 	})
 }
 

@@ -303,6 +303,50 @@ func (s *PG) GetRepoByID(ctx context.Context, org, repoID string) (Repo, error) 
 	return r, nil
 }
 
+// UpdateRepoDefaultBranch CASes the live repo's default branch (Store
+// contract). One UPDATE carries the whole CAS; zero rows affected then
+// splits inside the same transaction into "no live repo" (ErrNotFound) and
+// "default branch changed concurrently" (won=false).
+func (s *PG) UpdateRepoDefaultBranch(ctx context.Context, org, url, oldBranch, newBranch string) (bool, error) {
+	assertf(url != "", "UpdateRepoDefaultBranch: empty url for org %q", org)
+	assertf(oldBranch != "" && newBranch != "",
+		"UpdateRepoDefaultBranch: empty branch for %q (old %q, new %q)", url, oldBranch, newBranch)
+	orgID, err := s.lookupOrgID(ctx, org)
+	if err != nil {
+		return false, err
+	}
+	won := false
+	err = pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		ct, err := tx.Exec(ctx,
+			`UPDATE repos SET default_branch = $1
+			 WHERE org_id = $2 AND url = $3 AND deleted_at IS NULL AND default_branch = $4`,
+			newBranch, orgID, url, oldBranch)
+		if err != nil {
+			return err
+		}
+		n := ct.RowsAffected()
+		assertf(n == 0 || n == 1, "default-branch CAS of %q/%q affected %d rows", org, url, n)
+		if n == 1 {
+			won = true
+			return nil
+		}
+		// No row matched: absent/soft-deleted repo (404) or a concurrently
+		// changed default branch (won=false -> caller's 409).
+		var one int
+		err = tx.QueryRow(ctx,
+			`SELECT 1 FROM repos WHERE org_id = $1 AND url = $2 AND deleted_at IS NULL`,
+			orgID, url).Scan(&one)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		return err
+	})
+	if err != nil {
+		return false, fmt.Errorf("update default branch of %q in org %q: %w", url, org, err)
+	}
+	return won, nil
+}
+
 // SoftDeleteRepo sets deleted_at and returns the affected repo. ErrNotFound
 // when no row exists; ErrAlreadyDeleted when already soft-deleted.
 func (s *PG) SoftDeleteRepo(ctx context.Context, org, url string) (Repo, error) {

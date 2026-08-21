@@ -460,7 +460,7 @@ func TestWriteRefsTags(t *testing.T) {
 
 		t.Run("target must resolve to a commit", func(t *testing.T) {
 			// A blob sha never peels to a commit.
-			repoPath, err := gitread.Materialize(context.Background(), e.refStore, e.blobStore, e.cacheDir, fx.repoID)
+			repoPath, err := gitread.Materialize(context.Background(), e.refStore, e.blobStore, e.cacheDir, fx.repoID, "main")
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -569,7 +569,7 @@ func TestWriteRefsNotes(t *testing.T) {
 		// durability, not just a ref flip.
 		showNote := func(t *testing.T, notesRef, sha string) (string, error) {
 			t.Helper()
-			repoPath, err := gitread.Materialize(ctx, e.refStore, e.blobStore, e.cacheDir, fx.repoID)
+			repoPath, err := gitread.Materialize(ctx, e.refStore, e.blobStore, e.cacheDir, fx.repoID, "main")
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -738,7 +738,7 @@ func TestWriteRefsNotes(t *testing.T) {
 			if resp.StatusCode != http.StatusOK {
 				t.Fatalf("status = %d body %v", resp.StatusCode, body)
 			}
-			repoPath, err := gitread.Materialize(ctx, e.refStore, e.blobStore, e.cacheDir, fx.repoID)
+			repoPath, err := gitread.Materialize(ctx, e.refStore, e.blobStore, e.cacheDir, fx.repoID, "main")
 			if err != nil {
 				t.Fatal(err)
 			}

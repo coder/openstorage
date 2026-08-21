@@ -1209,3 +1209,114 @@ func TestRepoKeySplit_CrossSurface(t *testing.T) {
 		t.Fatalf("unregistered push must not create refs: %v", refs)
 	}
 }
+
+// --- issue #18: PATCH default branch ----------------------------------------
+
+// apiJSON hits the node's HTTP API with a Bearer token and a JSON body,
+// decodes a JSON response into out (unless nil), and returns the status.
+func apiJSON(t *testing.T, n *testNode, method, token, path, body string, out any) int {
+	t.Helper()
+	req, err := http.NewRequest(method, "http://"+n.addr+path, strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out != nil && resp.StatusCode == http.StatusOK {
+		if err := json.Unmarshal(respBody, out); err != nil {
+			t.Fatalf("decode %s %s: %v\n%s", method, path, err, respBody)
+		}
+	}
+	return resp.StatusCode
+}
+
+// PATCH /repo end to end (issue #18): after the default branch changes,
+// GET /repo reflects it and a fresh clone's HEAD lands on the new branch.
+// The second clone runs against the SAME node that just served the first
+// one — a warm cache with a fresh generation marker and an unchanged
+// ref-store generation — so it also proves the default-branch change
+// defeats the issue-#4 hydrate short-circuit.
+func TestPatchDefaultBranch_CloneHEADFollows(t *testing.T) {
+	const repoURL = "t18-patch-default"
+	repoID := registerRepo(t, repoURL)
+	// One URL-claim token works on both surfaces (docs/02): the git path
+	// resolves the claim against the repo record, and the API accepts
+	// url-style claims directly.
+	token := mintTestToken(t, repoURL, "git:read,git:write,repo:write", "")
+
+	// Two branches: main at c1, dev one commit ahead at c2.
+	work := initWorkRepo(t)
+	mustGit(t, work, "push", remoteURL(nodeA, repoID, token), "HEAD:refs/heads/main")
+	mainTip := revParse(t, work, "HEAD")
+	writeFile(t, work, "d.txt", "dev\n")
+	mustGit(t, work, "add", ".")
+	mustGit(t, work, "commit", "-m", "dev tip")
+	devTip := revParse(t, work, "HEAD")
+	mustGit(t, work, "push", remoteURL(nodeA, repoID, token), "HEAD:refs/heads/dev")
+
+	// Warm the cache: the pre-PATCH clone advertises HEAD -> main.
+	clone1 := filepath.Join(t.TempDir(), "clone1")
+	mustGit(t, "", "clone", remoteURL(nodeA, repoID, token), clone1)
+	if got := revParse(t, clone1, "HEAD"); got != mainTip {
+		t.Fatalf("pre-PATCH clone HEAD = %q, want main tip %q", got, mainTip)
+	}
+
+	// PATCH via the v1 shape; the response carries the live-spec fields.
+	var patched struct {
+		RepoID        string `json:"repo_id"`
+		ID            string `json:"id"`
+		RepoName      string `json:"repo_name"`
+		URL           string `json:"url"`
+		DefaultBranch string `json:"default_branch"`
+	}
+	if status := apiJSON(t, nodeA, http.MethodPatch, token, "/api/v1/repo",
+		`{"default_branch":"dev"}`, &patched); status != http.StatusOK {
+		t.Fatalf("PATCH /api/v1/repo = %d", status)
+	}
+	if patched.RepoID != repoID || patched.ID != repoID ||
+		patched.RepoName != repoURL || patched.URL != repoURL ||
+		patched.DefaultBranch != "dev" {
+		t.Fatalf("PATCH response = %+v, want %s/%s default_branch dev", patched, repoID, repoURL)
+	}
+
+	// GET /repo reflects the change.
+	var got struct {
+		DefaultBranch string `json:"default_branch"`
+	}
+	if status := apiGet(t, nodeA, token, "/api/v1/repo", &got); status != http.StatusOK {
+		t.Fatalf("GET /api/v1/repo = %d", status)
+	}
+	if got.DefaultBranch != "dev" {
+		t.Fatalf("GET default_branch = %q after PATCH, want dev", got.DefaultBranch)
+	}
+
+	// Immediate re-clone from the SAME warm node: HEAD must follow dev.
+	clone2 := filepath.Join(t.TempDir(), "clone2")
+	mustGit(t, "", "clone", remoteURL(nodeA, repoID, token), clone2)
+	if got := revParse(t, clone2, "HEAD"); got != devTip {
+		t.Fatalf("post-PATCH clone HEAD = %q, want dev tip %q (hydrate short-circuit served stale HEAD?)", got, devTip)
+	}
+	if out := strings.TrimSpace(mustGit(t, clone2, "symbolic-ref", "--short", "HEAD")); out != "dev" {
+		t.Fatalf("post-PATCH clone branch = %q, want dev", out)
+	}
+
+	// The alias shape switches back; the next clone follows again.
+	if status := apiJSON(t, nodeA, http.MethodPatch, token, "/api/repos/"+repoURL,
+		`{"default_branch":"refs/heads/main"}`, nil); status != http.StatusOK {
+		t.Fatalf("PATCH /api/repos/%s = %d", repoURL, status)
+	}
+	clone3 := filepath.Join(t.TempDir(), "clone3")
+	mustGit(t, "", "clone", remoteURL(nodeA, repoID, token), clone3)
+	if got := revParse(t, clone3, "HEAD"); got != mainTip {
+		t.Fatalf("post-alias-PATCH clone HEAD = %q, want main tip %q", got, mainTip)
+	}
+}

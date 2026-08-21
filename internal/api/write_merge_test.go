@@ -133,7 +133,7 @@ var wmTestAuthor = map[string]any{"name": "wm", "email": "wm@test.invalid"}
 // scratch).
 func wmParents(t *testing.T, e *testEnv, repoID, commitSHA string) []string {
 	t.Helper()
-	repoPath, err := gitread.Materialize(context.Background(), e.refStore, e.blobStore, e.cacheDir, repoID)
+	repoPath, err := gitread.Materialize(context.Background(), e.refStore, e.blobStore, e.cacheDir, repoID, "main")
 	if err != nil {
 		t.Fatalf("materialize: %v", err)
 	}
@@ -337,7 +337,7 @@ func TestMergeStrategies(t *testing.T) {
 			if parents := wmParents(t, e, fx.repoID, commit); !reflect.DeepEqual(parents, []string{fx.c2, fx.featTip}) {
 				t.Fatalf("merge commit parents = %v, want [%s %s]", parents, fx.c2, fx.featTip)
 			}
-			repoPath, err := gitread.Materialize(context.Background(), e.refStore, e.blobStore, e.cacheDir, fx.repoID)
+			repoPath, err := gitread.Materialize(context.Background(), e.refStore, e.blobStore, e.cacheDir, fx.repoID, "main")
 			if err != nil {
 				t.Fatal(err)
 			}

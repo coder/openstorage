@@ -63,12 +63,12 @@ func runGit(ctx context.Context, repoPath string, args ...string) (string, error
 
 // Materialize rebuilds the cache repo for repo from the ref/blob stores
 // (githttp.Hydrate: ensure repo, hydrate packs, sync refs from the DB
-// authority) and returns its bare-repo path. Unlike the receive path, a
-// ref-sync failure is fatal here: read plumbing over stale refs would serve
-// wrong answers.
-func Materialize(ctx context.Context, st ref.RefStore, bl blob.BlobStore, cacheDir, repo string) (string, error) {
+// authority, point HEAD at defaultBranch) and returns its bare-repo path.
+// Unlike the receive path, a ref-sync failure is fatal here: read plumbing
+// over stale refs would serve wrong answers.
+func Materialize(ctx context.Context, st ref.RefStore, bl blob.BlobStore, cacheDir, repo, defaultBranch string) (string, error) {
 	assertf(st != nil && bl != nil && cacheDir != "" && repo != "", "Materialize: missing store/blob/cacheDir/repo")
-	repoPath, refsErr, err := githttp.Hydrate(ctx, st, bl, cacheDir, repo)
+	repoPath, refsErr, err := githttp.Hydrate(ctx, st, bl, cacheDir, repo, defaultBranch)
 	if err != nil {
 		return "", err
 	}

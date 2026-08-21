@@ -39,6 +39,7 @@ import (
 
 	"codestorage/internal/auth"
 	"codestorage/internal/blob"
+	"codestorage/internal/githttp"
 	"codestorage/internal/gitread"
 	"codestorage/internal/ref"
 )
@@ -256,7 +257,7 @@ func (s *server) handleCreateBranch(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "base_ref, base_branch, or preferred_base is required")
 		return
 	}
-	repoPath, ok := s.materializeReadRepo(w, r, repo.RepoID)
+	repoPath, ok := s.materializeReadRepo(w, r, repo)
 	if !ok {
 		return
 	}
@@ -375,11 +376,14 @@ func (s *server) handleDeleteBranch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	assertf(repo.DefaultBranch != "", "repo %s has empty default branch", repo.RepoID)
-	if !req.Ephemeral && name == repo.DefaultBranch {
+	refName := wrefRefName(name, req.Ephemeral)
+	// Compare STORED ref names: the default branch may be recorded in
+	// refs/-qualified form (PATCH /repo stores such values verbatim), and
+	// the short request name must still hit the protection.
+	if !req.Ephemeral && refName == githttp.HeadTarget(repo.DefaultBranch) {
 		writeErr(w, http.StatusForbidden, "refusing to delete the default branch")
 		return
 	}
-	refName := wrefRefName(name, req.Ephemeral)
 	refs, ok := s.wrefListRefs(w, r, repo.RepoID)
 	if !ok {
 		return
@@ -455,7 +459,7 @@ func (s *server) handleCreateTag(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "ref is required")
 		return
 	}
-	repoPath, ok := s.materializeReadRepo(w, r, repo.RepoID)
+	repoPath, ok := s.materializeReadRepo(w, r, repo)
 	if !ok {
 		return
 	}
@@ -687,7 +691,7 @@ func (s *server) wrefHandleNote(w http.ResponseWriter, r *http.Request, deleteNo
 		author = *req.Author
 	}
 
-	repoPath, ok := s.materializeReadRepo(w, r, repo.RepoID)
+	repoPath, ok := s.materializeReadRepo(w, r, repo)
 	if !ok {
 		return
 	}
