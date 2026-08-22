@@ -99,38 +99,54 @@ type Server struct {
 	// multiply quota-sized temp files (see lfsProxyUpload).
 	lfsUploadsInFlight sync.Map
 	// lfsStagingInFlight is the aggregate Content-Length currently
-	// reserved against LFSStagingBytes. Guarded by lfsStagingMu.
+	// reserved against LFSStagingBytes; lfsStagingOps counts the
+	// operations holding it (Codex round 17: tiny Content-Lengths pass a
+	// byte-only budget while each holds a goroutine, connection, fd, and
+	// temp file — the op count bounds that). Guarded by lfsStagingMu.
 	lfsStagingInFlight int64
+	lfsStagingOps      int
 	lfsStagingMu       sync.Mutex
 }
 
-// reserveLFSStaging reserves n bytes of the node-wide LFS staging budget.
-// ok=false when the reservation does not fit right now (transient — the
-// caller answers 429). n larger than the whole budget can never fit; the
-// caller distinguishes that case up front.
+// lfsMaxStagingOps bounds concurrent staging operations per replica
+// (uploads and legacy verifications alike), independent of bytes. A var so
+// tests can shrink it.
+var lfsMaxStagingOps = 256
+
+// reserveLFSStaging reserves n bytes of the node-wide LFS staging budget
+// and one staging-operation slot. ok=false when either does not fit right
+// now (transient — the caller answers 429). n larger than the whole byte
+// budget can never fit; the caller distinguishes that case up front. The
+// op slot is counted even for n==0 and with the byte budget disabled: the
+// operation count bounds goroutines/fds/temp files, which exist regardless
+// of declared size.
 func (s *Server) reserveLFSStaging(n int64) bool {
 	assertf(n >= 0, "reserveLFSStaging(%d)", n)
-	if s.LFSStagingBytes <= 0 || n == 0 {
-		return true
-	}
 	s.lfsStagingMu.Lock()
 	defer s.lfsStagingMu.Unlock()
-	if s.lfsStagingInFlight > s.LFSStagingBytes-n {
+	if s.lfsStagingOps >= lfsMaxStagingOps {
 		return false
 	}
-	s.lfsStagingInFlight += n
+	if s.LFSStagingBytes > 0 && n > 0 && s.lfsStagingInFlight > s.LFSStagingBytes-n {
+		return false
+	}
+	s.lfsStagingOps++
+	if s.LFSStagingBytes > 0 {
+		s.lfsStagingInFlight += n
+	}
 	return true
 }
 
 // releaseLFSStaging returns a reserveLFSStaging reservation.
 func (s *Server) releaseLFSStaging(n int64) {
-	if s.LFSStagingBytes <= 0 || n == 0 {
-		return
-	}
 	s.lfsStagingMu.Lock()
 	defer s.lfsStagingMu.Unlock()
-	s.lfsStagingInFlight -= n
-	assertf(s.lfsStagingInFlight >= 0, "releaseLFSStaging(%d): in-flight went negative", n)
+	s.lfsStagingOps--
+	assertf(s.lfsStagingOps >= 0, "releaseLFSStaging: op count went negative")
+	if s.LFSStagingBytes > 0 {
+		s.lfsStagingInFlight -= n
+		assertf(s.lfsStagingInFlight >= 0, "releaseLFSStaging(%d): in-flight went negative", n)
+	}
 }
 
 // repoTarget is a resolved request target: the live repo record plus the

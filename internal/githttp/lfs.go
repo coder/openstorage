@@ -460,39 +460,13 @@ func (s *Server) lfsBatchUpload(r *http.Request, repoElem string, target repoTar
 				incoming += sz
 			}
 		}
-		// Batch admissions are NON-renewing (Codex security round 3): a
-		// key already holding a live reservation is skipped — its action
-		// is still issued against the existing hold — so repeated batches
-		// never refresh a reservation's clock. Only transfer progress
-		// (the PUT paths) refreshes; a batch-only writer therefore holds
-		// headroom for at most one TTL, while crash retries still get
-		// their actions without wedging.
-		if len(packs) > 0 {
-			keys := make([]string, len(packs))
-			for i, p := range packs {
-				keys[i] = p.Key
-			}
-			live, err := s.Store.LiveReservationKeys(ctx, keys, s.lfsReservationTTL())
-			if err != nil {
-				log.Printf("lfs quota: %s: live-reservation read failed: %v", repoID, err)
-				return s.denyAllNeeded(order, needIdx, results, http.StatusInternalServerError, "storage quota check failed")
-			}
-			if len(live) > 0 {
-				held := make(map[string]bool, len(live))
-				for _, k := range live {
-					held[k] = true
-				}
-				kept := packs[:0]
-				incoming = 0
-				for _, p := range packs {
-					if !held[p.Key] {
-						kept = append(kept, p)
-						incoming += p.Size
-					}
-				}
-				packs = kept
-			}
-		}
+		// ADVISORY admission only — the batch inserts NO reservation rows
+		// (Codex round 17): any batch-time durable hold is rotatable (a
+		// fresh OID per TTL re-acquires the whole headroom without ever
+		// transferring a byte), so durable ledger writes require transfer
+		// progress — the PUT's post-body admission is authoritative. This
+		// check is the fast-fail UX: an already-over-quota batch answers
+		// per-object 507s before any transfer href is issued.
 		if len(packs) > 0 {
 			denyAll := func(code int, msg string) []lfsObjectResult {
 				return s.denyAllNeeded(order, needIdx, results, code, msg)
@@ -502,22 +476,16 @@ func (s *Server) lfsBatchUpload(r *http.Request, repoElem string, target repoTar
 				log.Printf("lfs quota: %s: usage listing failed: %v", repoID, err)
 				return denyAll(http.StatusInternalServerError, "storage quota check failed")
 			}
-			dec, err := s.Store.ReservePackBytes(ctx, blob.QuotaRepoGroup(repoID), packs,
-				ref.NewReservationOwner(), floor, s.PackQuotaBytes, s.lfsReservationTTL())
+			ls, err := s.Store.QuotaLedgerState(ctx, blob.QuotaRepoGroup(repoID), s.lfsReservationTTL())
 			if err != nil {
-				log.Printf("lfs quota: %s: reserve failed: %v", repoID, err)
+				log.Printf("lfs quota: %s: ledger read failed: %v", repoID, err)
 				return denyAll(http.StatusInternalServerError, "storage quota check failed")
 			}
-			if dec.KeyCapExceeded {
-				// Transient (rows expire with the TTL and consume on
-				// completed uploads), so 429, not 507.
-				return denyAll(http.StatusTooManyRequests,
-					"too many in-flight uploads reserved for this repository, retry later")
-			}
-			if !dec.OK {
+			used := max(ls.UsageBytes, floor)
+			if !ref.Admitted(used, ls.ReservedBytes, incoming, s.PackQuotaBytes) {
 				return denyAll(http.StatusInsufficientStorage, fmt.Sprintf(
 					"repository storage quota exceeded: upload adds %d bytes to %d bytes stored (+%d bytes reserved by in-flight uploads), quota is %d bytes",
-					incoming, dec.UsedBytes, dec.ReservedBytes, s.PackQuotaBytes))
+					incoming, used, ls.ReservedBytes, s.PackQuotaBytes))
 			}
 		}
 	}
@@ -605,7 +573,12 @@ func (s *Server) adoptLFSObject(ctx context.Context, repoID, key, oid string, si
 		return errLFSBusy
 	}
 	defer s.releaseLFSStaging(size)
-	if err := s.verifyStoredLFSObject(ctx, key, oid); err != nil {
+	// Bounded like publication (Codex round 17): the verification download
+	// holds staging capacity, so a wedged backend or a client parking the
+	// batch connection must not pin it past the lease window.
+	vctx, vcancel := context.WithTimeout(ctx, s.lfsReservationTTL()*9/10)
+	defer vcancel()
+	if err := s.verifyStoredLFSObject(vctx, key, oid); err != nil {
 		if !errors.Is(err, errLFSContentMismatch) {
 			return err
 		}

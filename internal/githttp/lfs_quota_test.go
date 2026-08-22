@@ -119,8 +119,10 @@ func TestLFSQuota_UploadSettlesLedger(t *testing.T) {
 	if resp.Objects[0].Error != nil {
 		t.Fatalf("batch denied: %+v", resp.Objects[0])
 	}
-	if ls := ledgerState(t, st, time.Hour); ls.ReservedBytes != int64(len(content)) {
-		t.Fatalf("batch did not reserve declared size: %+v", ls)
+	// Batches are ADVISORY and insert nothing (Codex round 17: batch-time
+	// durable holds are rotatable via fresh OIDs).
+	if ls := ledgerState(t, st, time.Hour); ls.ReservedBytes != 0 || ls.UsageBytes != 0 {
+		t.Fatalf("advisory batch touched the ledger: %+v", ls)
 	}
 
 	w := doLFS(t, srv, http.MethodPut, "/"+lfsTestRepoURL+".git/info/lfs/objects/"+oid,
@@ -164,49 +166,50 @@ func TestLFSQuota_WrongSHAReservationLifecycle(t *testing.T) {
 		t.Fatalf("failed PUT touched the ledger: %+v", ls)
 	}
 
-	// A batch-minted reservation survives a failed PUT (settle-or-TTL
-	// semantics) and a correct retry settles it into usage.
-	decodeBatch(t, doLFS(t, srv, http.MethodPost, lfsBatchPath, "basic:"+tok,
-		batchBody("upload", oid, int64(len(content)))))
-	if w := put("the fake content"); w.Code != http.StatusBadRequest {
-		t.Fatalf("hash-mismatch PUT status = %d", w.Code)
-	}
-	if ls := ledgerState(t, st, time.Hour); ls.ReservedBytes != int64(len(content)) {
-		t.Fatalf("batch reservation did not survive the failed PUT: %+v", ls)
-	}
+	// A correct retry admits post-body and settles straight into usage.
 	if w := put(string(content)); w.Code != http.StatusOK {
 		t.Fatalf("correct retry status = %d, body %s", w.Code, w.Body)
 	}
 	if ls := ledgerState(t, st, time.Hour); ls.ReservedBytes != 0 || ls.UsageBytes != int64(len(content)) {
-		t.Fatalf("retry did not settle the reservation: %+v", ls)
+		t.Fatalf("retry did not settle into usage: %+v", ls)
 	}
 }
 
-// TestLFSQuota_ReservationTTLExpiryFreesAdmission: an abandoned batch
-// reservation stops gating admission once it ages past the TTL.
+// TestLFSQuota_ReservationTTLExpiryFreesAdmission: a crash-leaked
+// reservation (a post-body upload that reserved, then died before
+// registering) gates both the batch's advisory check and the PUT's
+// admission only until it ages past the TTL.
 func TestLFSQuota_ReservationTTLExpiryFreesAdmission(t *testing.T) {
-	const ttl = 50 * time.Millisecond
-	srv, _, mint := newLFSQuotaServer(t, 100, ttl)
+	const ttl = 400 * time.Millisecond
+	srv, st, mint := newLFSQuotaServer(t, 100, ttl)
 	tok := mint(auth.ScopeGitWrite)
-	first := bytes.Repeat([]byte("a"), 90)
+	crashed := bytes.Repeat([]byte("a"), 90)
 	second := bytes.Repeat([]byte("b"), 90)
+	// Simulate the crash window: the ledger reservation exists (as the
+	// PUT's post-body admission would leave it) but no registration ever
+	// followed.
+	if dec, err := st.ReservePackBytes(context.Background(), blob.QuotaRepoGroup(lfsTestRepoID),
+		[]ref.Pack{{Key: blob.LFSKey(lfsTestRepoID, sha256Hex(crashed)), Size: 90}},
+		ref.NewReservationOwner(), 0, 100, ttl); err != nil || !dec.OK {
+		t.Fatalf("seed reservation: %+v, %v", dec, err)
+	}
 
 	resp := decodeBatch(t, doLFS(t, srv, http.MethodPost, lfsBatchPath, "basic:"+tok,
-		batchBody("upload", sha256Hex(first), 90)))
-	if resp.Objects[0].Error != nil {
-		t.Fatalf("first batch denied: %+v", resp.Objects[0])
-	}
-	resp = decodeBatch(t, doLFS(t, srv, http.MethodPost, lfsBatchPath, "basic:"+tok,
 		batchBody("upload", sha256Hex(second), 90)))
 	if resp.Objects[0].Error == nil {
-		t.Fatalf("second batch admitted against a live reservation: %+v", resp.Objects[0])
+		t.Fatalf("batch admitted against a live reservation: %+v", resp.Objects[0])
 	}
 
-	time.Sleep(2 * ttl) // the abandoned reservation expires
+	time.Sleep(2 * ttl) // the crash-leaked reservation expires
 	resp = decodeBatch(t, doLFS(t, srv, http.MethodPost, lfsBatchPath, "basic:"+tok,
 		batchBody("upload", sha256Hex(second), 90)))
 	if resp.Objects[0].Error != nil {
 		t.Fatalf("expired reservation still gates admission: %+v", resp.Objects[0])
+	}
+	w := doLFS(t, srv, http.MethodPut, "/"+lfsTestRepoURL+".git/info/lfs/objects/"+sha256Hex(second),
+		"basic:"+tok, string(second))
+	if w.Code != http.StatusOK {
+		t.Fatalf("post-expiry PUT status = %d, body %s", w.Code, w.Body)
 	}
 }
 
@@ -873,6 +876,56 @@ func TestLFSQuota_BatchReservationsNotRenewable(t *testing.T) {
 		batchBody("upload", sha256Hex(victim), 90)))
 	if resp.Objects[0].Error != nil {
 		t.Fatalf("batch-only hold survived past its TTL despite re-batching: %+v", resp.Objects[0])
+	}
+}
+
+// TestLFSUpload_StagingOpCountBounded (Codex round 17): tiny declared
+// sizes pass a byte-only budget while each holds a goroutine/fd/temp file —
+// the op-count cap bounds concurrent staging operations regardless of
+// bytes.
+func TestLFSUpload_StagingOpCountBounded(t *testing.T) {
+	old := lfsMaxStagingOps
+	lfsMaxStagingOps = 1
+	t.Cleanup(func() { lfsMaxStagingOps = old })
+	srv, _, mint := newLFSQuotaServer(t, 0, time.Hour)
+	srv.LFSStagingBytes = 1 << 20
+	tok := mint(auth.ScopeGitWrite)
+	first := []byte("op slot holder")
+	second := []byte("op slot loser!")
+
+	pr, pw := io.Pipe()
+	req := httptest.NewRequest(http.MethodPut,
+		"/"+lfsTestRepoURL+".git/info/lfs/objects/"+sha256Hex(first), pr)
+	req.ContentLength = int64(len(first))
+	req.SetBasicAuth("t", tok)
+	rec := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() { defer close(done); srv.Handler().ServeHTTP(rec, req) }()
+	if _, err := pw.Write(first[:2]); err != nil { // parked holding the one op slot
+		t.Fatal(err)
+	}
+
+	// A DISTINCT-key 1-byte-ish PUT passes every byte check but must be
+	// turned away by the op-count cap.
+	w := doLFS(t, srv, http.MethodPut, "/"+lfsTestRepoURL+".git/info/lfs/objects/"+sha256Hex(second),
+		"basic:"+tok, string(second))
+	if w.Code != http.StatusTooManyRequests {
+		t.Fatalf("op-cap-exceeded PUT status = %d, want 429", w.Code)
+	}
+
+	if _, err := pw.Write(first[2:]); err != nil {
+		t.Fatal(err)
+	}
+	pw.Close()
+	<-done
+	if rec.Code != http.StatusOK {
+		t.Fatalf("parked PUT status = %d, body %s", rec.Code, rec.Body)
+	}
+	// Slot released: the loser converges.
+	w = doLFS(t, srv, http.MethodPut, "/"+lfsTestRepoURL+".git/info/lfs/objects/"+sha256Hex(second),
+		"basic:"+tok, string(second))
+	if w.Code != http.StatusOK {
+		t.Fatalf("post-release PUT status = %d, body %s", w.Code, w.Body)
 	}
 }
 

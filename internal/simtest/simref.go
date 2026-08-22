@@ -195,9 +195,9 @@ func (s *SimRefStore) HasLFSObject(ctx context.Context, repo, key string) (bool,
 	return s.inner.HasLFSObject(ctx, repo, key)
 }
 
-// LiveReservationKeys delegates to the inner store.
-func (s *SimRefStore) LiveReservationKeys(ctx context.Context, keys []string, ttl time.Duration) ([]string, error) {
-	return s.inner.LiveReservationKeys(ctx, keys, ttl)
+// QuotaLedgerState delegates to the inner store (oracle reads).
+func (s *SimRefStore) QuotaLedgerState(ctx context.Context, group []string, ttl time.Duration) (ref.PackQuotaLedgerState, error) {
+	return s.inner.QuotaLedgerState(ctx, group, ttl)
 }
 
 // CountLFSObjects delegates to the inner store.

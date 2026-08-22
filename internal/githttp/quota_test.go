@@ -284,17 +284,23 @@ func TestStorageUsageBytes(t *testing.T) {
 	seedLFS(t, bl, "repo_a", strings.Repeat("aa", 32), 7)
 	seedLFS(t, bl, "repo_b", strings.Repeat("bb", 32), 9000)
 
-	got, err := packUsageBytes(context.Background(), bl, "repo_a")
+	got, err := blob.StorageUsageBytes(context.Background(), bl, "repo_a")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got != 1177 {
-		t.Fatalf("packUsageBytes(repo_a) = %d, want 1177 (base+namespaces+lfs)", got)
+		t.Fatalf("StorageUsageBytes(repo_a) = %d, want 1177 (base+namespaces+lfs)", got)
 	}
 	// A namespaced key measures the same rolled-up usage.
-	got, err = packUsageBytes(context.Background(), bl, "repo_a+ephemeral")
+	got, err = blob.StorageUsageBytes(context.Background(), bl, "repo_a+ephemeral")
 	if err != nil || got != 1177 {
-		t.Fatalf("packUsageBytes(repo_a+ephemeral) = (%d, %v), want (1177, nil)", got, err)
+		t.Fatalf("StorageUsageBytes(repo_a+ephemeral) = (%d, %v), want (1177, nil)", got, err)
+	}
+	// Pack admission's floor excludes the LFS prefix (registered LFS
+	// bytes reach it via the usage counter — issue #51, Codex round 17).
+	got, err = packUsageBytes(context.Background(), bl, "repo_a")
+	if err != nil || got != 1170 {
+		t.Fatalf("packUsageBytes(repo_a) = (%d, %v), want (1170, nil) — packs only", got, err)
 	}
 	// An empty prefix is zero usage, not an error.
 	got, err = packUsageBytes(context.Background(), bl, "repo_missing")

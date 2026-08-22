@@ -205,6 +205,16 @@ func admitted(used, reserved, incoming, quota int64) bool {
 	return total <= quota && total != math.MaxInt64
 }
 
+// Admitted is the exported, side-effect-free admission arithmetic — the
+// same saturating comparison ReservePackBytes applies transactionally. The
+// LFS batch surface uses it for its ADVISORY fast-fail check (issue #51,
+// Codex round 17): batch-time durable holds proved rotatable (a fresh OID
+// per TTL re-acquires the whole headroom without ever transferring), so
+// batches insert nothing and only real transfer progress reserves.
+func Admitted(used, reserved, incoming, quota int64) bool {
+	return admitted(used, reserved, incoming, quota)
+}
+
 // ReservePackBytes implements the admission check documented atop this file
 // on Postgres.
 func (s *PG) ReservePackBytes(ctx context.Context, group []string, packs []Pack, owner string, usageFloor, quotaBytes int64, ttl time.Duration) (ReserveDecision, error) {
@@ -287,28 +297,6 @@ ON CONFLICT (key) DO UPDATE SET repo = EXCLUDED.repo,
 		return ReserveDecision{}, err
 	}
 	return dec, nil
-}
-
-// LiveReservationKeys reports which keys hold unexpired reservation rows.
-func (s *PG) LiveReservationKeys(ctx context.Context, keys []string, ttl time.Duration) ([]string, error) {
-	assertf(len(keys) > 0 && ttl > 0, "LiveReservationKeys(%d keys, %v)", len(keys), ttl)
-	rows, err := s.pool.Query(ctx, `
-SELECT key FROM pack_reservations
-WHERE key = ANY($1) AND created_at > now() - make_interval(secs => $2)`,
-		keys, ttl.Seconds())
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var live []string
-	for rows.Next() {
-		var k string
-		if err := rows.Scan(&k); err != nil {
-			return nil, err
-		}
-		live = append(live, k)
-	}
-	return live, rows.Err()
 }
 
 // ReleasePackReservations deletes the owner's reservations for keys.

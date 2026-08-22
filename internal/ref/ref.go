@@ -106,15 +106,13 @@ type RefStore interface {
 	// reservation row per pack key on success. See ledger.go for the
 	// admission formula and serialization discipline.
 	ReservePackBytes(ctx context.Context, group []string, packs []Pack, owner string, usageFloor, quotaBytes int64, ttl time.Duration) (ReserveDecision, error)
-	// LiveReservationKeys reports which of the given keys currently hold
-	// an unexpired reservation row (issue #51, Codex security round 3).
-	// The LFS batch surface uses it to make batch admissions
-	// NON-renewing: a batch skips keys that are already reserved, so only
-	// actual transfer progress (the PUT paths) refreshes a reservation's
-	// clock — a batch-only writer cannot hold quota headroom beyond one
-	// TTL. Point-in-time read; the later reservation call re-checks
-	// admission transactionally regardless.
-	LiveReservationKeys(ctx context.Context, keys []string, ttl time.Duration) ([]string, error)
+	// QuotaLedgerState reads one accounting group's quota ledger in one
+	// snapshot (usage counter sum, active reservations, retained bytes).
+	// The LFS batch surface reads it for its ADVISORY fast-fail admission
+	// (issue #51 — batches insert no rows; the PUT's transactional
+	// admission is authoritative); also tests, oracles, and operator
+	// inspection.
+	QuotaLedgerState(ctx context.Context, group []string, ttl time.Duration) (PackQuotaLedgerState, error)
 	// ReleasePackReservations deletes the caller's reservation rows for
 	// keys — the failed-upload cleanup path. Owner-scoped: a stale caller
 	// must not delete a newer reservation another push re-acquired for the
@@ -179,10 +177,6 @@ type Store interface {
 	// InitSchema creates the ref/pack tables (idempotent, safe under
 	// concurrent startups).
 	InitSchema(ctx context.Context) error
-	// QuotaLedgerState reads one accounting group's quota ledger (tests,
-	// oracles, operator inspection — never the admission path, which reads
-	// its own transactional snapshot in ReservePackBytes).
-	QuotaLedgerState(ctx context.Context, group []string, ttl time.Duration) (PackQuotaLedgerState, error)
 	Close()
 }
 

@@ -70,8 +70,8 @@ func (f *fakeInner) HasLFSObject(context.Context, string, string) (bool, error) 
 	return false, nil
 }
 func (f *fakeInner) CountLFSObjects(context.Context, string) (int64, error) { return 0, nil }
-func (f *fakeInner) LiveReservationKeys(context.Context, []string, time.Duration) ([]string, error) {
-	return nil, nil
+func (f *fakeInner) QuotaLedgerState(context.Context, []string, time.Duration) (ref.PackQuotaLedgerState, error) {
+	return ref.PackQuotaLedgerState{}, nil
 }
 
 type fakeRepos struct {

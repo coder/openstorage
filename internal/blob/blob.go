@@ -180,8 +180,33 @@ func StorageUsageBytes(ctx context.Context, b BlobStore, repo string) (int64, er
 	// "packs/<base>+" only matches this repo's namespace prefixes ('+'
 	// cannot start another repo's key segment), and "lfs/<base>/" is the
 	// shared LFS object space every namespace rolls up to (ADR-35).
+	total, err := usageBytes(ctx, b, repo,
+		[]string{PackPrefix(base), PacksRoot + base + "+", LFSPrefix(base)})
+	assertf(err != nil || total >= 0, "StorageUsageBytes: negative total %d for %s", total, repo)
+	return total, err
+}
+
+// PackUsageBytes is StorageUsageBytes restricted to the PACK prefixes — the
+// usage floor for pack admission (pre-receive, REST pack writers). It skips
+// the LFS prefix deliberately (issue #51, Codex round 17): the LFS object
+// population is attacker-growable up to the object cap, so per-push
+// listings of it would amplify; registered LFS bytes gate pack admission
+// through the shared usage COUNTER instead (RegisterLFSObject credits it),
+// and the only LFS bytes the counter misses — pre-ledger objects and
+// orphaned uploads — stay floored at LFS admission time, whose listing is
+// cached.
+func PackUsageBytes(ctx context.Context, b BlobStore, repo string) (int64, error) {
+	assertf(b != nil && repo != "", "PackUsageBytes: missing blob store or repo")
+	base := QuotaRepoGroup(repo)[0]
+	total, err := usageBytes(ctx, b, repo, []string{PackPrefix(base), PacksRoot + base + "+"})
+	assertf(err != nil || total >= 0, "PackUsageBytes: negative total %d for %s", total, repo)
+	return total, err
+}
+
+// usageBytes sums object sizes under the given prefixes, page-bounded.
+func usageBytes(ctx context.Context, b BlobStore, repo string, prefixes []string) (int64, error) {
 	var total int64
-	for _, prefix := range []string{PackPrefix(base), PacksRoot + base + "+", LFSPrefix(base)} {
+	for _, prefix := range prefixes {
 		err := b.ListPages(ctx, prefix, packUsagePageSize, func(page []ListedObject) error {
 			for _, o := range page {
 				total += o.Size
@@ -189,10 +214,9 @@ func StorageUsageBytes(ctx context.Context, b BlobStore, repo string) (int64, er
 			return nil
 		})
 		if err != nil {
-			return 0, fmt.Errorf("list storage usage for %s: %w", repo, err)
+			return 0, fmt.Errorf("list usage for %s: %w", repo, err)
 		}
 	}
-	assertf(total >= 0, "StorageUsageBytes: negative total %d for %s", total, repo)
 	return total, nil
 }
 

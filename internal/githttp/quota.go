@@ -199,12 +199,15 @@ func (s *Server) peekUsage(repo string) (usage int64, ok bool) {
 
 // refreshUsage runs one usage flight for repo and publishes the result.
 // It owns the c.inflight[repo] slot the caller created; errors are logged
-// and not cached, so the next peek elects a new flight.
+// and not cached, so the next peek elects a new flight. The cached measure
+// is the FULL storage usage (packs + LFS): the LFS admission floor needs
+// the LFS prefix, and the git-surface pressure log is observational either
+// way.
 func (s *Server) refreshUsage(repo string, f *usageFlight) {
 	assertf(repo != "" && f != nil, "refreshUsage: missing repo or flight")
 	ctx, cancel := context.WithTimeout(context.Background(), usageListTimeout)
 	defer cancel()
-	usage, err := packUsageBytes(ctx, s.Blob, repo)
+	usage, err := blob.StorageUsageBytes(ctx, s.Blob, repo)
 
 	c := &s.usage
 	c.mu.Lock()
@@ -220,10 +223,12 @@ func (s *Server) refreshUsage(repo string, f *usageFlight) {
 	close(f.done)
 }
 
-// packUsageBytes sums the sizes of every object under repo's pack prefix
-// (blob.StorageUsageBytes, shared with the REST pack writers).
+// packUsageBytes sums the sizes of every object under repo's PACK prefixes
+// (blob.PackUsageBytes, shared with the REST pack writers) — pack
+// admission's floor. Registered LFS bytes reach pack admission through the
+// usage counter, not this listing (see blob.PackUsageBytes).
 func packUsageBytes(ctx context.Context, bl blob.BlobStore, repo string) (int64, error) {
-	return blob.StorageUsageBytes(ctx, bl, repo)
+	return blob.PackUsageBytes(ctx, bl, repo)
 }
 
 // cachedUsageFloor returns repo's storage usage floor for LFS admission,
