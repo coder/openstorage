@@ -55,10 +55,13 @@ const (
 const sweepInterval = time.Minute
 
 // bucket is one client's token bucket. tokens is refreshed lazily from the
-// elapsed time since last.
+// elapsed time since last. blocked is the git surface's hysteresis latch
+// (admitReserve); the REST path's reserve of 1 makes it equivalent to the
+// plain tokens >= 1 check.
 type bucket struct {
-	tokens float64
-	last   time.Time
+	tokens  float64
+	last    time.Time
+	blocked bool
 }
 
 // rateLimiter holds the per-node limiter state. A nil *rateLimiter means
@@ -138,7 +141,23 @@ func (l *rateLimiter) limit(flavor routeFlavor) middleware {
 // it returns ok=false and the whole seconds until one token is available
 // (>= 1, the Retry-After granularity).
 func (l *rateLimiter) admit(key string) (ok bool, retryAfterSecs int) {
-	assertf(key != "", "admit: empty client key")
+	return l.admitReserve(key, 1)
+}
+
+// admitReserve is admit with hysteresis: a request is charged one token,
+// but once a client has been limited its bucket latches blocked and
+// reopens only when reserve tokens have refilled. reserve = 1 degenerates
+// to the plain per-request bucket (the REST path). The git surface passes
+// a whole-exchange reserve (Codex round 9): one git operation is several
+// dependent HTTP requests, so with a tiny RPS a client that retries after
+// Retry-After would otherwise win exactly one token, spend it on the
+// exchange's first request, and 429 on the second — forever. Latching
+// until a full exchange fits makes the advertised Retry-After honest: the
+// retry completes. Long-run admission stays at RPS; the reserve only
+// quantizes it into completable bursts.
+func (l *rateLimiter) admitReserve(key string, reserve float64) (ok bool, retryAfterSecs int) {
+	assertf(key != "", "admitReserve: empty client key")
+	assertf(reserve >= 1 && reserve <= float64(l.cfg.Burst), "admitReserve: reserve %v outside [1, %d]", reserve, l.cfg.Burst)
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
@@ -152,10 +171,14 @@ func (l *rateLimiter) admit(key string) (ok bool, retryAfterSecs int) {
 	} else {
 		b.refill(now, l.cfg)
 	}
-	assertf(b.tokens >= 0 && b.tokens <= float64(l.cfg.Burst), "admit: bucket tokens %v outside [0, %d]", b.tokens, l.cfg.Burst)
+	assertf(b.tokens >= 0 && b.tokens <= float64(l.cfg.Burst), "admitReserve: bucket tokens %v outside [0, %d]", b.tokens, l.cfg.Burst)
 
-	if b.tokens < 1 {
-		secs := int(math.Ceil((1 - b.tokens) / l.cfg.RPS))
+	if b.blocked && b.tokens >= reserve {
+		b.blocked = false
+	}
+	if b.blocked || b.tokens < 1 {
+		b.blocked = true
+		secs := int(math.Ceil((reserve - b.tokens) / l.cfg.RPS))
 		if secs < 1 {
 			secs = 1
 		}
@@ -177,7 +200,9 @@ func (b *bucket) refill(now time.Time, cfg RateLimitConfig) {
 }
 
 // sweepLocked drops fully-refilled (stale) buckets at most once per
-// sweepInterval. Callers hold l.mu.
+// sweepInterval. Callers hold l.mu. Eviction stays behavior-neutral with
+// hysteresis: a full bucket satisfies any valid reserve (reserve <= Burst),
+// so recreating it unblocked is exactly what unlatching would produce.
 func (l *rateLimiter) sweepLocked(now time.Time) {
 	if now.Sub(l.lastSweep) < sweepInterval {
 		return
@@ -206,4 +231,60 @@ func clientKey(r *http.Request) string {
 		return "unknown"
 	}
 	return host
+}
+
+// gitMinBurst is the git-surface floor for the token-bucket depth. One git
+// operation is several smart-HTTP requests — up to two per endpoint (the
+// unauthenticated 401 probe plus the authenticated retry) across info/refs
+// and the service RPC — and git clients treat a mid-exchange 429 as a hard
+// failure rather than waiting for Retry-After. A burst below one full
+// exchange (e.g. the documented-valid BURST=1) would therefore make every
+// clone/fetch/push permanently fail, so NewGitRateLimit raises the depth to
+// this floor: 8 covers a complete exchange with headroom (e.g. an LFS batch
+// call) while keeping the operator's sustained RPS untouched.
+const gitMinBurst = 8
+
+// NewGitRateLimit returns the pre-auth rate-limit middleware for the git
+// smart-HTTP surface (issue #21): the same admission policy and config knob
+// as the REST limiter, applied by the serve wiring around the whole githttp
+// handler. Bucket state is intentionally separate from the REST limiter's —
+// git transfers are far heavier per request, so one surface exhausting its
+// budget must not starve the other. The configured burst is raised to
+// gitMinBurst so a single protocol exchange can always complete. 429
+// responses carry Retry-After and the git surface's plain {"error"}
+// envelope (git clients surface the status line, not the body). The zero
+// config yields the identity middleware; invalid config is a startup error,
+// mirroring newRateLimiter.
+func NewGitRateLimit(cfg RateLimitConfig) (func(http.Handler) http.Handler, error) {
+	// Validate the operator's pair as configured (half-set or malformed
+	// pairs stay startup errors), then apply the git-surface floor.
+	if _, err := newRateLimiter(cfg); err != nil {
+		return nil, err
+	}
+	if cfg.RPS > 0 && cfg.Burst < gitMinBurst {
+		cfg.Burst = gitMinBurst
+	}
+	l, err := newRateLimiter(cfg)
+	if err != nil {
+		return nil, err
+	}
+	if l == nil {
+		return func(next http.Handler) http.Handler { return next }, nil
+	}
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// clientKey maps an empty RemoteAddr to the shared "unknown"
+			// bucket (docs/15 deferred #3), so exotic listeners degrade to
+			// a collective limit instead of panicking or bypassing. The
+			// whole-exchange reserve (== the burst floor) latches limited
+			// clients until a complete git operation fits (admitReserve).
+			ok, retryAfter := l.admitReserve(clientKey(r), gitMinBurst)
+			if !ok {
+				w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
+				writeErr(w, http.StatusTooManyRequests, "rate limit exceeded")
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}, nil
 }

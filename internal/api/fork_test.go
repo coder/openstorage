@@ -429,3 +429,54 @@ func TestForkRepo(t *testing.T) {
 		})
 	})
 }
+
+// TestForkQuotaDoesNotTombstoneName (issue #21, Codex round 13): a fork
+// whose closure exceeds the quota is denied BEFORE CreateRepo — a
+// post-create denial would soft-delete the row and permanently burn the
+// requested name (soft-deleted URLs stay reserved by design). The same
+// name must fork successfully once the quota allows it.
+func TestForkQuotaDoesNotTombstoneName(t *testing.T) {
+	runBackends(t, func(t *testing.T, e *testEnv) {
+		quotaSrv := func(quota int64) *httptest.Server {
+			s := &server{
+				store:          e.store,
+				httpBaseURL:    testHTTPBaseURL,
+				logger:         discardLogger(),
+				refStore:       e.refStore,
+				blobStore:      e.blobStore,
+				cacheDir:       e.cacheDir,
+				packQuotaBytes: quota,
+			}
+			verifier := auth.NewVerifier(e.store)
+			mux := http.NewServeMux()
+			mux.Handle("POST /api/v1/repos",
+				requireAuth(verifier, false, auth.ScopeRepoWrite)(s.forkAwareCreateRepo(verifier, s.handleCreateRepo)))
+			srv := httptest.NewServer(recoverPanics(s.logger)(mux))
+			t.Cleanup(srv.Close)
+			return srv
+		}
+		src := wrefSeedFixture(t, e)
+		srcReadTok := e.mint(t, tokenSpec{iss: src.org, repo: src.url, scopes: []string{auth.ScopeGitRead}})
+		caller := newForkCaller(t, e, "")
+
+		// 1-byte quota: denied 403 naming the quota, and — critically —
+		// no repo row exists for the URL afterward (name not burned).
+		resp, body := forkDo(t, quotaSrv(1), caller.token, forkBody(srcReadTok, nil))
+		if resp.StatusCode != http.StatusForbidden {
+			t.Fatalf("over-quota fork = %d body %v", resp.StatusCode, body)
+		}
+		if msg, _ := body["error"].(string); !strings.Contains(msg, "quota") {
+			t.Fatalf("error = %v, want quota denial", body)
+		}
+		if _, err := e.store.GetRepoByURL(context.Background(), caller.org, caller.url); !errors.Is(err, meta.ErrNotFound) {
+			t.Fatalf("denied fork left a repo row (err %v): name tombstoned", err)
+		}
+
+		// The SAME name forks fine under a generous quota: no tombstone.
+		resp, body = forkDo(t, quotaSrv(1<<20), caller.token, forkBody(srcReadTok, nil))
+		forkID := forkRequireCreated(t, resp, body)
+		if refs := wrefRefs(t, e, forkID); refs["refs/heads/main"] != src.c2 {
+			t.Fatalf("fork refs = %v, want refs/heads/main=%s", refs, src.c2)
+		}
+	})
+}

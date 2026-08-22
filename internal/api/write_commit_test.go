@@ -31,6 +31,7 @@ import (
 	"time"
 
 	"codestorage/internal/auth"
+	"codestorage/internal/blob"
 	"codestorage/internal/meta"
 	"codestorage/internal/ref"
 )
@@ -989,5 +990,71 @@ func TestWriteCommitRefPolicies(t *testing.T) {
 			resp, body := wctPost(t, srv, "/api/v1/repos/restore-commit", tok, bytes.NewReader(raw))
 			wctRequireFail(t, resp, body, http.StatusForbidden, "forbidden")
 		})
+	})
+}
+
+// TestCommitPackQuota (issue #21, Codex round 11): the REST pack writers
+// enforce the same per-repo pack-bytes quota as the git surface — without
+// this, POST /repos/commit-pack bypasses the quota entirely and grows the
+// same packs/ prefix without bound. Breaches answer the ADR-26 write-route
+// envelope (403 "forbidden"); identical re-publications dedup instead of
+// re-uploading.
+func TestCommitPackQuota(t *testing.T) {
+	runBackends(t, func(t *testing.T, e *testEnv) {
+		quotaSrv := func(quota int64) *httptest.Server {
+			s := &server{
+				store:          e.store,
+				httpBaseURL:    testHTTPBaseURL,
+				logger:         discardLogger(),
+				refStore:       e.refStore,
+				blobStore:      e.blobStore,
+				cacheDir:       e.cacheDir,
+				packQuotaBytes: quota,
+			}
+			mux := http.NewServeMux()
+			registerWriteCommitRoutes(mux, s, auth.NewVerifier(e.store), nil)
+			srv := httptest.NewServer(recoverPanics(discardLogger())(mux))
+			t.Cleanup(srv.Close)
+			return srv
+		}
+		repo, writeTok, _ := wctRepo(t, e)
+
+		smallBody := func(msg, path string) []byte {
+			return wctLines(t,
+				wctMeta("main", msg, []map[string]any{
+					{"path": path, "content_id": "id-f", "operation": "upsert", "mode": "100644"},
+				}, nil),
+				wctChunk("id-f", []byte("tiny\n"), true),
+			)
+		}
+
+		// Under a generous quota the write passes.
+		generous := quotaSrv(1 << 20)
+		resp, respBody := wctPost(t, generous, "/api/v1/repos/commit-pack", writeTok, bytes.NewReader(smallBody("c1", "a.txt")))
+		wctRequireOK(t, resp, respBody)
+
+		usage, err := blob.PackUsageBytes(context.Background(), e.blobStore, repo.RepoID)
+		if err != nil || usage == 0 {
+			t.Fatalf("usage after first commit = (%d, %v), want > 0", usage, err)
+		}
+
+		// A 1-byte quota refuses new bytes with the 403 forbidden envelope
+		// and stores nothing new.
+		tiny := quotaSrv(1)
+		resp, respBody = wctPost(t, tiny, "/api/v1/repos/commit-pack", writeTok, bytes.NewReader(smallBody("c2", "b.txt")))
+		if resp.StatusCode != http.StatusForbidden {
+			t.Fatalf("over-quota commit-pack = %d, want 403; body: %s", resp.StatusCode, respBody)
+		}
+		var env wcEnvelope
+		if err := json.Unmarshal(respBody, &env); err != nil {
+			t.Fatalf("non-JSON quota body %q: %v", respBody, err)
+		}
+		if env.Result.Success || env.Result.Status != "forbidden" || !strings.Contains(env.Result.Message, "quota") {
+			t.Fatalf("unexpected result envelope: %+v", env.Result)
+		}
+		after, err := blob.PackUsageBytes(context.Background(), e.blobStore, repo.RepoID)
+		if err != nil || after != usage {
+			t.Fatalf("denied write changed usage: %d -> %d (err %v)", usage, after, err)
+		}
 	})
 }

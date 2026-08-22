@@ -38,7 +38,6 @@ import (
 	"strings"
 
 	"codestorage/internal/auth"
-	"codestorage/internal/blob"
 	"codestorage/internal/githttp"
 	"codestorage/internal/gitread"
 	"codestorage/internal/ref"
@@ -763,6 +762,12 @@ func (s *server) wrefHandleNote(w http.ResponseWriter, r *http.Request, deleteNo
 	}
 
 	if err := s.wrefPublish(ctx, repoPath, repo.RepoID, scratchEnv, oldOrZero, newSHA); err != nil {
+		if errors.Is(err, errPackQuotaExceeded) {
+			// Same 403 quota denial as commit-pack/merge/pre-receive
+			// (issue #21), in this route's note envelope.
+			wrefNoteFail(w, http.StatusForbidden, err.Error(), objectSHA, targetRef, old, oldOrZero)
+			return
+		}
 		s.internalErr(w, r, "publish notes objects", err)
 		return
 	}
@@ -911,26 +916,8 @@ func (s *server) wrefPublish(ctx context.Context, repoPath, repoID string, scrat
 	if fi, err := os.Stat(packPath); err != nil || fi.Size() == 0 {
 		return fmt.Errorf("pack-objects produced no pack at %s (err %v)", packPath, err)
 	}
-	key := blob.PackKey(repoID, id)
-	if err := s.blobStore.UploadFile(ctx, key, packPath); err != nil {
-		return fmt.Errorf("upload %s: %w", key, err)
-	}
-	// Writer half of the orphan-sweep coordination (issue #5): re-upload
-	// if a sweeper deleted the key before the registration committed.
-	// Verification runs even when RegisterPacks fails: an ambiguous error
-	// may have committed the row (see the pre-receive hook).
-	regErr := s.refStore.RegisterPacks(ctx, repoID, []ref.Pack{{ID: id, Key: key}})
-	if regErr != nil {
-		regErr = fmt.Errorf("register pack %s: %w", id, regErr)
-	}
-	if err := blob.EnsurePublished(ctx, s.blobStore, key, packPath); err != nil {
-		return errors.Join(regErr, fmt.Errorf("verify pack %s: %w", key, err))
-	}
-	// Threshold check regardless of regErr (issue #1): an ambiguous
-	// registration error may have committed the row — the same reason the
-	// verification above runs unconditionally — and skipping the trigger
-	// would strand a threshold crossing until the next write. The check
-	// reads the committed count, so it safely no-ops on a true failure.
-	s.triggerRepack(ctx, repoID)
-	return regErr
+	// Dedup + quota + upload + register + verify + repack trigger via the
+	// shared REST publication step (publish.go); quota denials store
+	// nothing and surface as errPackQuotaExceeded.
+	return s.publishPack(ctx, repoID, id, packPath)
 }

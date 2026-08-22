@@ -50,7 +50,6 @@ import (
 	"strings"
 
 	"codestorage/internal/auth"
-	"codestorage/internal/blob"
 	"codestorage/internal/gitread"
 	"codestorage/internal/meta"
 	"codestorage/internal/ref"
@@ -748,29 +747,11 @@ func (s *server) wcPublish(ctx context.Context, sc *wcScratch, repoID string, pl
 	if err != nil {
 		return 0, false, fmt.Errorf("stat pack: %w", err)
 	}
-	key := blob.PackKey(repoID, packID)
-	if err := s.blobStore.UploadFile(ctx, key, packPath); err != nil {
-		return 0, false, fmt.Errorf("upload pack %s: %w", key, err)
-	}
-	// Writer half of the orphan-sweep coordination (issue #5): re-upload
-	// if a sweeper deleted the key before the registration committed.
-	// Verification runs even when RegisterPacks fails: an ambiguous error
-	// may have committed the row (see the pre-receive hook).
-	regErr := s.refStore.RegisterPacks(ctx, repoID, []ref.Pack{{ID: packID, Key: key}})
-	if regErr != nil {
-		regErr = fmt.Errorf("register pack %s: %w", packID, regErr)
-	}
-	if err := blob.EnsurePublished(ctx, s.blobStore, key, packPath); err != nil {
-		return 0, false, errors.Join(regErr, fmt.Errorf("verify pack %s: %w", key, err))
-	}
-	// Threshold check regardless of regErr (issue #1): an ambiguous
-	// registration error may have committed the row — the same reason the
-	// verification above runs unconditionally — and skipping the trigger
-	// would strand a threshold crossing until the next write. The check
-	// reads the committed count, so it safely no-ops on a true failure.
-	s.triggerRepack(ctx, repoID)
-	if regErr != nil {
-		return 0, false, regErr
+	// Dedup + quota + upload + register + verify + repack trigger via the
+	// shared REST publication step (publish.go); quota denials store
+	// nothing and surface as errPackQuotaExceeded.
+	if err := s.publishPack(ctx, repoID, packID, packPath); err != nil {
+		return 0, false, err
 	}
 	won, err = s.refStore.CASRef(ctx, repoID, plan.refName, plan.oldSHA, newSHA)
 	if err != nil {
@@ -783,6 +764,13 @@ func (s *server) wcPublish(ctx context.Context, sc *wcScratch, repoID string, pl
 // the CAS outcome, and write the 200 envelope.
 func (s *server) wcFinishCommit(w http.ResponseWriter, r *http.Request, sc *wcScratch, repoID string, plan *wcPlan, md *wcMetadata, tree, commit string, blobCount *int) {
 	packBytes, won, err := s.wcPublish(r.Context(), sc, repoID, plan, commit)
+	if errors.Is(err, errPackQuotaExceeded) {
+		// md.TargetBranch is the request's bare branch name — the failure
+		// envelope must match the success path's branch identity, not the
+		// internal (possibly namespaced) ref name (Codex round 12).
+		wcFail(w, http.StatusForbidden, "forbidden", err.Error(), md.TargetBranch, plan.oldSHA)
+		return
+	}
 	if err != nil {
 		s.wcInternal(w, r, "publish commit", err)
 		return

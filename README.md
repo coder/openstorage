@@ -186,8 +186,9 @@ fallback aliases so old invocations keep working.
 | `CODESTORAGE_ORG` | — | **Required.** Org name (JWT `iss`) |
 | `CODESTORAGE_ORG_PUBKEYS` | — | **Required.** PEM file with 1..n org public key blocks |
 | `CODESTORAGE_BASE_URL` | — | External base for `http_url` in API responses (set it behind `0.0.0.0` binds) |
-| `CODESTORAGE_RATE_RPS` | — | Per-client-IP REST rate limit: sustained requests/second (429 + `Retry-After` when exceeded). Set together with `CODESTORAGE_RATE_BURST`; unset disables limiting |
-| `CODESTORAGE_RATE_BURST` | — | Token-bucket depth (>= 1) for the rate limit; set together with `CODESTORAGE_RATE_RPS` |
+| `CODESTORAGE_RATE_RPS` | — | Per-client-IP rate limit for the REST **and** git smart-HTTP surfaces (separate token buckets each): sustained requests/second (429 + `Retry-After` when exceeded). Set together with `CODESTORAGE_RATE_BURST`; unset disables limiting. Client identity is the TCP `RemoteAddr` (forwarded headers are not trusted): behind a proxy that pools backend connections, all clients share one bucket — rate-limit at the proxy instead |
+| `CODESTORAGE_RATE_BURST` | — | Token-bucket depth (>= 1) for the rate limit; set together with `CODESTORAGE_RATE_RPS`. The git surface raises depths below 8 to 8, and a limited client stays limited until 8 tokens have refilled, so one complete git exchange (several HTTP requests) always finishes after the advertised `Retry-After` |
+| `CODESTORAGE_PACK_QUOTA_BYTES` | — | Per-repo pack-bytes quota on every pack writer: git pushes that would grow a repo's `packs/` prefix past this are refused at pre-receive before anything is stored, and REST pack writes (commit-pack, merge) are refused with a 403 result envelope (default 10 GiB; `0` disables) |
 
 `serve` always runs single-org mode: `/api/v1` and the git smart-HTTP path authenticate
 against the same org-key verifier. The phase-0 git-only mode and its `--jwt-pubkey` flag

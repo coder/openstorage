@@ -68,6 +68,13 @@ type Config struct {
 	// background fold. It must be quick and never block on the fold. Nil
 	// disables triggering.
 	MaybeRepack func(ctx context.Context, repo string)
+
+	// PackQuotaBytes is the per-repo pack-bytes quota (issue #21), the same
+	// value the git surface enforces at pre-receive: REST pack writers
+	// (commit-pack, merge, notes, fork via publishPack) publish under the
+	// same packs/ prefix and must not bypass it. <= 0 disables enforcement.
+	// The serve command plumbs it from CODESTORAGE_PACK_QUOTA_BYTES.
+	PackQuotaBytes int64
 }
 
 // New builds the full HTTP handler: recover -> request log -> router, with
@@ -90,13 +97,14 @@ func New(cfg Config) (http.Handler, error) {
 	}
 
 	s := &server{
-		store:       cfg.Store,
-		httpBaseURL: strings.TrimRight(cfg.HTTPBaseURL, "/"),
-		logger:      logger,
-		refStore:    cfg.RefStore,
-		blobStore:   cfg.BlobStore,
-		cacheDir:    cfg.CacheDir,
-		maybeRepack: cfg.MaybeRepack,
+		store:          cfg.Store,
+		httpBaseURL:    strings.TrimRight(cfg.HTTPBaseURL, "/"),
+		logger:         logger,
+		refStore:       cfg.RefStore,
+		blobStore:      cfg.BlobStore,
+		cacheDir:       cfg.CacheDir,
+		maybeRepack:    cfg.MaybeRepack,
+		packQuotaBytes: cfg.PackQuotaBytes,
 	}
 
 	// Phase-5 eventing/sync surface (docs/07 p5): the syncServer extends

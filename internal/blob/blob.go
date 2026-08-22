@@ -121,6 +121,31 @@ const PacksRoot = "packs/"
 // PackPrefix is the listing prefix for a repo's packs.
 func PackPrefix(repo string) string { return PacksRoot + repo + "/" }
 
+// packUsagePageSize bounds one PackUsageBytes listing page, mirroring the
+// sweeper's page-bounded scans so a pathological pack count cannot balloon
+// memory.
+const packUsagePageSize = 1000
+
+// PackUsageBytes sums the sizes of every object under repo's pack prefix:
+// registered packs plus not-yet-swept orphans — exactly the packs/ growth
+// the per-repo quota (issue #21) bounds. Shared by the pre-receive hook,
+// the REST pack writers, and the git surface's pressure check.
+func PackUsageBytes(ctx context.Context, b BlobStore, repo string) (int64, error) {
+	assertf(b != nil && repo != "", "PackUsageBytes: missing blob store or repo")
+	var total int64
+	err := b.ListPages(ctx, PackPrefix(repo), packUsagePageSize, func(page []ListedObject) error {
+		for _, o := range page {
+			total += o.Size
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, fmt.Errorf("list pack usage for %s: %w", repo, err)
+	}
+	assertf(total >= 0, "PackUsageBytes: negative total %d for %s", total, repo)
+	return total, nil
+}
+
 // LFSKey is the immutable object key for a repo's LFS object with the given
 // sha256 oid. Keys are repo-scoped (docs/05): forks inherit LFS pointers
 // only, never the objects, which this keying yields automatically.

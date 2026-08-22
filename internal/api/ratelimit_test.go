@@ -263,3 +263,200 @@ func TestRateLimitAliasSingleCharge(t *testing.T) {
 		t.Fatalf("follow-up direct request = %d, want 429", w.Code)
 	}
 }
+
+// --- git-surface limiter (issue #21) ----------------------------------------
+
+// TestGitRateLimitDisabledPassthrough: the zero config yields the identity
+// middleware, exactly like the REST limiter.
+func TestGitRateLimitDisabledPassthrough(t *testing.T) {
+	mw, err := NewGitRateLimit(RateLimitConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := mw(okHandler())
+	for i := 0; i < 10; i++ {
+		if w := rlRequest(t, h, "10.0.0.1:1234"); w.Code != http.StatusOK {
+			t.Fatalf("request %d through disabled git limiter = %d, want 200", i, w.Code)
+		}
+	}
+}
+
+// TestGitRateLimitInvalidConfigError: invalid operator config is a clean
+// startup error, never a panic (mirrors newRateLimiter).
+func TestGitRateLimitInvalidConfigError(t *testing.T) {
+	for _, cfg := range []RateLimitConfig{
+		{RPS: 5, Burst: 0},
+		{RPS: math.NaN(), Burst: 1},
+		{RPS: math.Inf(1), Burst: 1},
+	} {
+		if _, err := NewGitRateLimit(cfg); err == nil {
+			t.Fatalf("NewGitRateLimit(%+v) = nil error, want config error", cfg)
+		}
+	}
+}
+
+// TestGitRateLimit429Envelope: exhausting the burst answers 429 with
+// Retry-After and the git surface's plain {"error"} envelope.
+func TestGitRateLimit429Envelope(t *testing.T) {
+	mw, err := NewGitRateLimit(RateLimitConfig{RPS: 0.5, Burst: gitMinBurst})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := mw(okHandler())
+	for i := 0; i < gitMinBurst; i++ {
+		if w := rlRequest(t, h, "10.0.0.9:1"); w.Code != http.StatusOK {
+			t.Fatalf("burst request %d = %d, want 200", i, w.Code)
+		}
+	}
+	w := rlRequest(t, h, "10.0.0.9:1")
+	if w.Code != http.StatusTooManyRequests {
+		t.Fatalf("over-burst request = %d, want 429", w.Code)
+	}
+	if w.Header().Get("Retry-After") == "" {
+		t.Fatal("429 must carry Retry-After")
+	}
+	var body errorEnvelope
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil || body.Error == "" {
+		t.Fatalf("expected {\"error\"} envelope, got %q (err %v)", w.Body.String(), err)
+	}
+	// A different client IP still has its own full bucket.
+	if w := rlRequest(t, h, "10.0.0.10:1"); w.Code != http.StatusOK {
+		t.Fatalf("other client = %d, want 200 (per-client isolation)", w.Code)
+	}
+}
+
+// TestGitRateLimitEmptyRemoteAddr: an empty RemoteAddr (exotic listeners,
+// in-process handlers) degrades to the shared "unknown" bucket instead of
+// panicking or bypassing the limiter (docs/15 deferred #3, issue #21).
+func TestGitRateLimitEmptyRemoteAddr(t *testing.T) {
+	mw, err := NewGitRateLimit(RateLimitConfig{RPS: 0.001, Burst: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := mw(okHandler())
+	for i := 0; i < gitMinBurst; i++ {
+		if w := rlRequest(t, h, ""); w.Code != http.StatusOK {
+			t.Fatalf("empty-RemoteAddr request %d = %d, want 200", i, w.Code)
+		}
+	}
+	// Same shared bucket: the next keyless request is limited.
+	if w := rlRequest(t, h, ""); w.Code != http.StatusTooManyRequests {
+		t.Fatalf("over-burst empty-RemoteAddr request = %d, want 429", w.Code)
+	}
+}
+
+// TestGitRateLimitMinimumBurst: the git surface raises sub-exchange bucket
+// depths to gitMinBurst — a Burst=1 config (documented-valid, and fine for
+// REST) must still admit one complete multi-request git exchange (Codex
+// round 1: git clients treat a mid-exchange 429 as a hard failure). The
+// REST limiter built from the same config keeps the configured depth.
+func TestGitRateLimitMinimumBurst(t *testing.T) {
+	cfg := RateLimitConfig{RPS: 0.001, Burst: 1}
+	mw, err := NewGitRateLimit(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	git := mw(okHandler())
+	for i := 0; i < gitMinBurst; i++ {
+		if w := rlRequest(t, git, "10.0.0.8:1"); w.Code != http.StatusOK {
+			t.Fatalf("git request %d = %d, want 200 (burst floor not applied)", i, w.Code)
+		}
+	}
+	if w := rlRequest(t, git, "10.0.0.8:1"); w.Code != http.StatusTooManyRequests {
+		t.Fatalf("request past the floor = %d, want 429", w.Code)
+	}
+
+	// The floor is git-only: a REST limiter from the same config still
+	// exhausts after the configured single token.
+	restRL, err := newRateLimiter(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rest := restRL.limit(routeRead)(okHandler())
+	if w := rlRequest(t, rest, "10.0.0.8:1"); w.Code != http.StatusOK {
+		t.Fatalf("first REST request = %d, want 200", w.Code)
+	}
+	if w := rlRequest(t, rest, "10.0.0.8:1"); w.Code != http.StatusTooManyRequests {
+		t.Fatalf("second REST request = %d, want 429 (configured burst 1)", w.Code)
+	}
+}
+
+// TestGitRateLimitSeparateBucketState: the git-surface limiter and a REST
+// limiter built from the same config never share buckets — exhausting one
+// surface's budget must not starve the other (issue #21).
+func TestGitRateLimitSeparateBucketState(t *testing.T) {
+	cfg := RateLimitConfig{RPS: 0.001, Burst: 1}
+	gitMW, err := NewGitRateLimit(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restRL, err := newRateLimiter(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	git := gitMW(okHandler())
+	rest := restRL.limit(routeRead)(okHandler())
+
+	// Drain the git bucket (raised to the gitMinBurst floor).
+	for i := 0; i < gitMinBurst; i++ {
+		if w := rlRequest(t, git, "10.0.0.7:1"); w.Code != http.StatusOK {
+			t.Fatalf("git request %d = %d, want 200", i, w.Code)
+		}
+	}
+	if w := rlRequest(t, git, "10.0.0.7:1"); w.Code != http.StatusTooManyRequests {
+		t.Fatalf("git surface not exhausted: %d, want 429", w.Code)
+	}
+	// The REST surface still has its own full bucket for the same client.
+	if w := rlRequest(t, rest, "10.0.0.7:1"); w.Code != http.StatusOK {
+		t.Fatalf("REST request after git exhaustion = %d, want 200 (shared bucket state?)", w.Code)
+	}
+}
+
+// TestGitRateLimitExchangeHysteresis (Codex round 9): once a client is
+// limited, the git bucket latches and reopens only when a full exchange
+// reserve has refilled — one refilled token must NOT admit the first
+// request of an exchange whose followers would then 429 forever. The
+// advertised Retry-After names the reserve wait, and after it a whole
+// multi-request exchange completes.
+func TestGitRateLimitExchangeHysteresis(t *testing.T) {
+	rl, now := newTestLimiter(RateLimitConfig{RPS: 0.01, Burst: gitMinBurst}, time.Unix(1000, 0))
+	const key = "10.0.0.42"
+
+	// Drain the full burst, then latch.
+	for i := 0; i < gitMinBurst; i++ {
+		if ok, _ := rl.admitReserve(key, gitMinBurst); !ok {
+			t.Fatalf("burst request %d denied", i)
+		}
+	}
+	ok, retryAfter := rl.admitReserve(key, gitMinBurst)
+	if ok {
+		t.Fatal("drained bucket admitted a request")
+	}
+	if want := int(math.Ceil(gitMinBurst / 0.01)); retryAfter != want {
+		t.Fatalf("latched Retry-After = %d, want %d (full reserve wait)", retryAfter, want)
+	}
+
+	// One token refilled (the pre-hysteresis trap): still latched.
+	*now = now.Add(100 * time.Second) // exactly 1 token at 0.01 RPS
+	if ok, _ := rl.admitReserve(key, gitMinBurst); ok {
+		t.Fatal("latched bucket admitted on a single refilled token")
+	}
+
+	// After the full reserve wait, an entire exchange completes.
+	*now = now.Add(time.Duration(gitMinBurst) * 100 * time.Second)
+	for i := 0; i < gitMinBurst; i++ {
+		if ok, _ := rl.admitReserve(key, gitMinBurst); !ok {
+			t.Fatalf("post-reserve exchange request %d denied", i)
+		}
+	}
+
+	// REST semantics are unchanged by the shared latch field: reserve=1
+	// unlatches on the next single token.
+	if ok, _ := rl.admitReserve(key, gitMinBurst); ok {
+		t.Fatal("bucket should be drained again")
+	}
+	*now = now.Add(100 * time.Second)
+	if ok, _ := rl.admit(key); !ok {
+		t.Fatal("reserve=1 admit must unlatch on one refilled token")
+	}
+}

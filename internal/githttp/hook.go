@@ -159,26 +159,103 @@ func preReceive(ctx context.Context) error {
 		return nil
 	}
 
+	// Publication policy gate (issue #21, Codex security rounds): a pack
+	// is published only when some policy-ALLOWED command actually needs
+	// its objects. Otherwise (every command denied, or the allowed
+	// commands all target already-stored objects — the round-7 decoy: a
+	// denied big update bundled with an allowed create at a stored SHA)
+	// the pack could only become a registered, unreachable,
+	// quota-consuming blob, so the whole push is refused before any
+	// upload. The update hook stays the per-ref policy authority.
+	if err := preReceivePolicyGate(ctx, repo, commands); err != nil {
+		return err
+	}
+
 	bl, err := blob.Open(ctx, mustEnv(envHookBlobURL...))
 	if err != nil {
 		return err
 	}
 	defer bl.Close()
 
+	// Resolve quarantined pack names to their content-addressed storage
+	// keys up front (the quota check below needs them). Quarantine contents
+	// are produced by git, but fail closed on a surprising name instead of
+	// crashing receive-pack.
 	var packs []ref.Pack
 	for _, pf := range packFiles {
 		base := filepath.Base(pf) // pack-<hash>.pack
 		id := strings.TrimSuffix(strings.TrimPrefix(base, "pack-"), ".pack")
 		if id == "" || id == base {
-			// Quarantine contents are produced by git, but fail closed on a
-			// surprising name instead of crashing receive-pack.
 			return fmt.Errorf("pre-receive: unexpected pack file name %q", base)
 		}
-		key := blob.PackKey(repo, id)
-		if err := bl.UploadFile(ctx, key, pf); err != nil {
-			return fmt.Errorf("pre-receive: upload %s: %w", key, err)
+		packs = append(packs, ref.Pack{ID: id, Key: blob.PackKey(repo, id)})
+	}
+
+	// Content-addressed dedup (Codex rounds 4 + 10): identical pack keys
+	// are re-sent by crash-window retries and ref re-creations. An already
+	// published key contributes zero quota `incoming` AND is not
+	// re-uploaded — on a versioned S3 bucket every overwrite would retain
+	// a billed noncurrent version invisible to usage listings (unbounded
+	// hidden growth), and the bytes are immutable so skipping loses
+	// nothing. A sweeper deleting the key between this check and
+	// registration is healed by blob.EnsurePublished below, exactly as for
+	// a fresh upload.
+	published := make([]bool, len(packs))
+	for i := range packs {
+		if _, err := bl.Stat(ctx, packs[i].Key); err == nil {
+			published[i] = true
+		} else if !errors.Is(err, blob.ErrNotFound) {
+			return fmt.Errorf("pre-receive: stat %s: %w", packs[i].Key, err)
 		}
-		packs = append(packs, ref.Pack{ID: id, Key: key})
+	}
+
+	// Per-repo pack-bytes quota (issue #21, quota.go), enforced before any
+	// upload: pre-receive runs BEFORE the update hook's ref policy, so
+	// without this gate even a rejected push durably grows packs/. Denying
+	// here leaves the quarantine for git to discard — nothing is published
+	// or registered. The error message reaches the client via the sideband
+	// channel; the serve process logs quota pressure at the HTTP layer.
+	//
+	// incoming counts only unpublished packs: double-counting bytes the
+	// usage listing already covers could reject the very retry that
+	// completes an interrupted publication, and an all-published push adds
+	// nothing and passes regardless of usage (the zero-growth rule).
+	if quotaRaw := os.Getenv(EnvPackQuota); quotaRaw != "" {
+		quota, err := strconv.ParseInt(quotaRaw, 10, 64)
+		if err != nil || quota <= 0 {
+			// The env is set by our own server (never by the client), but
+			// fail closed on nonsense instead of waving the push through.
+			return fmt.Errorf("pre-receive: malformed %s=%q", EnvPackQuota, quotaRaw)
+		}
+		var incoming int64
+		for i, pf := range packFiles {
+			if published[i] {
+				continue
+			}
+			fi, err := os.Stat(pf)
+			if err != nil {
+				return fmt.Errorf("pre-receive: stat quarantined pack: %w", err)
+			}
+			incoming += fi.Size()
+		}
+		if incoming > 0 {
+			usage, err := packUsageBytes(ctx, bl, repo)
+			if err != nil {
+				return fmt.Errorf("pre-receive: %w", err)
+			}
+			if usage+incoming > quota {
+				return fmt.Errorf("pre-receive: repository pack quota exceeded: push adds %d bytes to %d bytes stored, quota is %d bytes", incoming, usage, quota)
+			}
+		}
+	}
+
+	for i, pf := range packFiles {
+		if published[i] {
+			continue
+		}
+		if err := bl.UploadFile(ctx, packs[i].Key, pf); err != nil {
+			return fmt.Errorf("pre-receive: upload %s: %w", packs[i].Key, err)
+		}
 	}
 
 	// Test knob: crash between S3 upload and PG commit.
@@ -210,6 +287,47 @@ func preReceive(ctx context.Context) error {
 		}
 	}
 	return regErr
+}
+
+// preReceivePolicyGate refuses pack publication unless it is justified:
+// either the push is wholly policy-allowed (vestigial packs from creates at
+// existing SHAs stay accepted, matching the no-pack path), or at least one
+// policy-ALLOWED command needs quarantined objects (its target is not in
+// the main object store yet). A push containing any denied command whose
+// allowed commands all target already-stored objects is refused whole —
+// its pack could only serve the denied refs (round-7 decoy) — with a
+// message telling the client to push the allowed updates separately. It
+// reuses enforceRefPolicy verbatim — the quarantine is visible to
+// pre-receive via git's alternates, so is-ancestor and verify-sig checks
+// work here exactly as in the update hook; verify-sig-policied winners are
+// verified twice, an accepted redundancy for failing closed.
+//
+// Known residual (issue #28): under `git push --atomic`, a justified mixed
+// push whose denied command aborts the transaction can still register a
+// pack no surviving ref needs (githooks(5) exposes no atomic indicator to
+// server-side hooks); background repack reclaims such packs. The
+// durable-CAS twist halves the exposure: an allowed command's update hook
+// that ran before the denial has already committed its PG CAS, so the ref
+// survives durably and the pack is reachable.
+func preReceivePolicyGate(ctx context.Context, repo string, commands []refCommand) error {
+	assertf(len(commands) > 0, "preReceivePolicyGate: no commands")
+	var firstErr error
+	needsPack := false
+	for _, c := range commands {
+		if err := enforceRefPolicy(ctx, repo, c.ref, c.old, c.new); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		if c.new != ref.ZeroSHA && !objectInMainStore(c.new) {
+			needsPack = true
+		}
+	}
+	if firstErr == nil || needsPack {
+		return nil
+	}
+	return fmt.Errorf("pre-receive: the quarantined pack is needed only by policy-denied ref updates, refusing pack publication (push the allowed updates separately): %w", firstErr)
 }
 
 // updateHook enforces the JWT ref policy (first-match-wins), then performs
@@ -613,6 +731,36 @@ func objectExists(sha string) bool {
 	}
 	// Not an exit status (git missing, spawn failure): a bug, fail fast.
 	panic(fmt.Sprintf("githttp assertion failed: cat-file -e %s: %v", sha, err))
+}
+
+// objectInMainStore reports whether sha is resolvable WITHOUT the
+// quarantine. git runs pre-receive with GIT_OBJECT_DIRECTORY pointed at the
+// quarantine and the main store as an alternate (githooks(5)); stripping
+// those variables makes cat-file consult only $GIT_DIR/objects, so a true
+// result means the object is already stored and needs nothing from the
+// incoming pack.
+func objectInMainStore(sha string) bool {
+	cmd := exec.Command("git", "cat-file", "-e", sha)
+	for _, kv := range os.Environ() {
+		switch {
+		case strings.HasPrefix(kv, "GIT_QUARANTINE_PATH="),
+			strings.HasPrefix(kv, "GIT_OBJECT_DIRECTORY="),
+			strings.HasPrefix(kv, "GIT_ALTERNATE_OBJECT_DIRECTORIES="):
+			// dropped: quarantine must stay invisible to this check
+		default:
+			cmd.Env = append(cmd.Env, kv)
+		}
+	}
+	err := cmd.Run()
+	if err == nil {
+		return true
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		return false
+	}
+	// Not an exit status (git missing, spawn failure): a bug, fail fast.
+	panic(fmt.Sprintf("githttp assertion failed: main-store cat-file -e %s: %v", sha, err))
 }
 
 // isAncestor reports whether old is an ancestor of new in the repo git put
