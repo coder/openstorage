@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"codestorage/internal/blob"
 	"codestorage/internal/ref"
 )
 
@@ -422,6 +423,39 @@ func TestPackDedup_NoOverwriteOnRepush(t *testing.T) {
 	}
 	if got, want := pgRefs(t, repo)["refs/heads/scratch"], revParse(t, work, "HEAD"); got != want {
 		t.Fatalf("scratch = %q, want %q", got, want)
+	}
+}
+
+// TestPackQuota_NamespaceSharesQuota (Codex round 15): pushes through the
+// `+ephemeral` namespace count against the BASE repository's quota — auth
+// strips the suffix, so per-namespace quotas would hand one token 3x the
+// advertised per-repository bound.
+func TestPackQuota_NamespaceSharesQuota(t *testing.T) {
+	repo := registerRepo(t, "quota-namespace")
+	work := initWorkRepo(t)
+	token := mintTestToken(t, repo, "git:read,git:write", "")
+
+	// Fill the base repo through nodeA (generous quota).
+	mustGit(t, work, "push", remoteURL(nodeA, repo, token), "HEAD:refs/heads/main")
+	if objs := minioPacks(t, repo); len(objs) == 0 {
+		t.Fatal("seed push stored no packs")
+	}
+
+	// A 1-byte-quota node must deny a namespace push: base usage already
+	// exceeds the shared quota, and the ephemeral prefix being empty must
+	// not grant a fresh allowance.
+	node := startNodeT(t, "CODESTORAGE_PACK_QUOTA_BYTES=1")
+	commitFile(t, work, "ns.txt", "ns\n", "ns", nil)
+	out, err := tryGit(work, "push", remoteURL(node, repo+"+ephemeral", token), "HEAD:refs/heads/scratch")
+	if err == nil {
+		t.Fatalf("namespace push succeeded past the base repo's quota:\n%s", out)
+	}
+	if !strings.Contains(out, "pack quota exceeded") {
+		t.Fatalf("namespace push failure does not name the quota:\n%s", out)
+	}
+	t.Logf("namespace over-quota push output:\n%s", out)
+	if objs, err := testBlob.List(context.Background(), blob.PackPrefix(repo+"+ephemeral")); err != nil || len(objs) != 0 {
+		t.Fatalf("denied namespace push left packs: %v (err %v)", objs, err)
 	}
 }
 

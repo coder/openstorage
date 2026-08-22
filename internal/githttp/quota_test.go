@@ -108,15 +108,16 @@ func TestPackUsageCacheBoundsListings(t *testing.T) {
 			t.Fatalf("cached peek %d: (%d, %v), want (10, true)", i, usage, ok)
 		}
 	}
-	if cb.lists.Load() != 1 {
-		t.Fatalf("cold+cached peeks cost %d listings, want 1", cb.lists.Load())
+	// One refresh = two listings (base + namespace prefixes roll up).
+	if cb.lists.Load() != 2 {
+		t.Fatalf("cold+cached peeks cost %d listings, want 2", cb.lists.Load())
 	}
 
 	// A different repo has its own entry (one more listing)...
 	srv.peekUsage("repo_d")
 	awaitPeek(t, srv, "repo_d")
-	if cb.lists.Load() != 2 {
-		t.Fatalf("second repo cost %d total listings, want 2", cb.lists.Load())
+	if cb.lists.Load() != 4 {
+		t.Fatalf("second repo cost %d total listings, want 4", cb.lists.Load())
 	}
 
 	// ...and TTL expiry refreshes: the stale entry is re-listed, observing
@@ -131,8 +132,8 @@ func TestPackUsageCacheBoundsListings(t *testing.T) {
 	if got := awaitPeek(t, srv, "repo_c"); got != 15 {
 		t.Fatalf("post-TTL usage = %d, want 15", got)
 	}
-	if cb.lists.Load() != 3 {
-		t.Fatalf("post-TTL refresh cost %d total listings, want 3", cb.lists.Load())
+	if cb.lists.Load() != 6 {
+		t.Fatalf("post-TTL refresh cost %d total listings, want 6", cb.lists.Load())
 	}
 }
 
@@ -186,8 +187,9 @@ func TestPackUsageRefreshConcurrencyBounded(t *testing.T) {
 	if got := awaitPeek(t, srv, "repo_extra"); got != 0 {
 		t.Fatalf("refreshed usage = %d, want 0 (empty repo)", got)
 	}
-	if got := bb.calls.Load(); got != int64(slots)+1 {
-		t.Fatalf("total listings = %d, want %d", got, slots+1)
+	// Each completed refresh lists twice (base + namespace prefixes).
+	if got := bb.calls.Load(); got != int64(slots+1)*2 {
+		t.Fatalf("total listings = %d, want %d", got, (slots+1)*2)
 	}
 }
 
@@ -249,8 +251,9 @@ func TestPackUsageCacheCoalescesMisses(t *testing.T) {
 	if got := awaitPeek(t, srv, "repo_e"); got != 10 {
 		t.Fatalf("refreshed usage = %d, want 10", got)
 	}
-	if got := cb.lists.Load(); got != 1 {
-		t.Fatalf("%d concurrent cold peeks cost %d listings, want 1", goroutines, got)
+	// One coalesced refresh = two listings (base + namespace prefixes).
+	if got := cb.lists.Load(); got != 2 {
+		t.Fatalf("%d concurrent cold peeks cost %d listings, want 2", goroutines, got)
 	}
 }
 
@@ -258,16 +261,23 @@ func TestPackUsageBytes(t *testing.T) {
 	bl := openTestBlob(t)
 	seedPack(t, bl, "repo_a", "1111", 100)
 	seedPack(t, bl, "repo_a", "2222", 50)
-	// Other repos and namespaces must not count toward repo_a.
-	seedPack(t, bl, "repo_b", "3333", 1000)
+	// Namespaces roll up under the base repo (Codex round 15: one token
+	// writes to all of them, so they share the quota); other repos do not.
 	seedPack(t, bl, "repo_a+ephemeral", "4444", 1000)
+	seedPack(t, bl, "repo_a+import", "5555", 20)
+	seedPack(t, bl, "repo_b", "3333", 4000)
 
 	got, err := packUsageBytes(context.Background(), bl, "repo_a")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got != 150 {
-		t.Fatalf("packUsageBytes(repo_a) = %d, want 150", got)
+	if got != 1170 {
+		t.Fatalf("packUsageBytes(repo_a) = %d, want 1170 (base+namespaces)", got)
+	}
+	// A namespaced key measures the same rolled-up usage.
+	got, err = packUsageBytes(context.Background(), bl, "repo_a+ephemeral")
+	if err != nil || got != 1170 {
+		t.Fatalf("packUsageBytes(repo_a+ephemeral) = (%d, %v), want (1170, nil)", got, err)
 	}
 	// An empty prefix is zero usage, not an error.
 	got, err = packUsageBytes(context.Background(), bl, "repo_missing")

@@ -23,8 +23,10 @@ package githttp
 // a race of N in-flight pushes can overshoot by at most the N-1 smaller
 // pack payloads. Durable cross-replica reservations that close this window
 // need ref-store schema support and are tracked as issue #29.
-// Namespaced repos (`+ephemeral`/`+import`) keep fully separate pack spaces
-// (blob.PacksRoot) and therefore get their own quota each.
+// Namespaced repos (`+ephemeral`/`+import`) keep separate pack PREFIXES but
+// share the base repository's quota: blob.PackUsageBytes rolls all of a
+// repo's namespaces up, because auth strips the suffix and one token must
+// not obtain a fresh quota per namespace (Codex round 15).
 
 import (
 	"context"
