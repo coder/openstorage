@@ -29,9 +29,10 @@ own keys, never swept or repacked) and, on versioned S3 buckets, **old object ve
 Also note what does *not* reclaim space: **deleting branches** — repack preserves the
 whole registered object set, so unreachable objects are carried forward by design
 ([why](../explanation/storage-engine.md#why-repack-packs-the-union-not-reachable-objects)) —
-and **deleting repositories**: `DELETE /repos` soft-deletes the metadata record (freeing
-the name), while the repository's pack registry rows and blobs stay put and the sweeper
-keeps counting them live. Reclaiming a deleted repository's storage is currently a
+and **deleting repositories**: `DELETE /repos` soft-deletes the metadata record — the
+name stays burned (recreating the same URL is rejected as already existing) — while the
+repository's pack registry rows and blobs stay put and the sweeper keeps counting them
+live. Reclaiming a deleted repository's storage is currently a
 manual operation ([#52](https://github.com/coder/code-storage/issues/52)).
 
 ## Inspect what a repository stores
