@@ -60,7 +60,8 @@ curl -s -X POST http://127.0.0.1:8080/api/v1/repos -H "Authorization: Bearer $TO
 # 4. Plain git against the same node.
 TOKEN=$(./codestorage mint --key /tmp/cs-key.pem --iss selfhost --repo demo --scopes git:read,git:write)
 git clone "http://t:${TOKEN}@127.0.0.1:8080/demo.git"
-cd demo && git commit --allow-empty -m init && git push origin HEAD:main
+cd demo && git -c user.name=demo -c user.email=demo@example.com \
+  commit --allow-empty -m init && git push origin HEAD:main
 ```
 
 The derivation fills only slots not set explicitly — `CODESTORAGE_PG_URL`,
@@ -93,7 +94,8 @@ TOK_GIT=$(./codestorage mint --key ./compose-keys/cs-key.pem --iss selfhost --re
 curl -s -X POST http://127.0.0.1:8081/api/v1/repos -H "Authorization: Bearer $TOK_W" \
   -d '{"default_branch":"main"}'
 git clone "http://t:${TOK_GIT}@127.0.0.1:8081/demo.git" /tmp/demo-a
-(cd /tmp/demo-a && git commit --allow-empty -m two-nodes && git push origin HEAD:main)
+(cd /tmp/demo-a && git -c user.name=demo -c user.email=demo@example.com \
+  commit --allow-empty -m two-nodes && git push origin HEAD:main)
 git clone "http://t:${TOK_GIT}@127.0.0.1:8082/demo.git" /tmp/demo-b
 
 # 5. One API read per node (repo reads take git:read): v1 on A, named alias on B.

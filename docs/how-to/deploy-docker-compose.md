@@ -74,7 +74,8 @@ TOK_GIT=$(./codestorage mint --key ./compose-keys/cs-key.pem --iss selfhost --re
 curl -s -X POST http://127.0.0.1:8081/api/v1/repos -H "Authorization: Bearer $TOK_W" \
   -d '{"default_branch":"main"}'
 git clone "http://t:${TOK_GIT}@127.0.0.1:8081/demo.git" /tmp/demo-a
-(cd /tmp/demo-a && git commit --allow-empty -m two-nodes && git push origin HEAD:main)
+(cd /tmp/demo-a && git -c user.name=demo -c user.email=demo@example.com \
+  commit --allow-empty -m two-nodes && git push origin HEAD:main)
 
 # Clone via node B — same HEAD SHA as the push through A.
 git clone "http://t:${TOK_GIT}@127.0.0.1:8082/demo.git" /tmp/demo-b
@@ -104,11 +105,14 @@ expect.
 ## 5. Tear down
 
 ```sh
-docker compose --profile replicas down -v   # -v drops the Postgres/MinIO volumes too
+docker compose --profile replicas down -v   # -v also removes the anonymous data volumes
 ```
 
-Without `-v`, repositories survive: the next `up` reuses the volumes and the nodes serve
-the same refs and packs (steady-state boots skip schema setup).
+This stack is disposable by design: the compose file declares **no named data volumes**
+for Postgres or MinIO, so `down` (with or without `-v`) discards repository state and
+the next `up` starts empty. To pause instead of discard, use
+`docker compose --profile replicas stop` / `start`, which keeps the containers and their
+data; steady-state restarts skip schema setup.
 
 ## Variation: server on the host, backing services in Docker
 
