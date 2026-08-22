@@ -323,22 +323,44 @@ func OpenS3(ctx context.Context, blobURL string) (*S3, error) {
 
 func (b *S3) Close() error { return b.bucket.Close() }
 
+// bucketLifecycleClient is the subset of the S3 API EnsureBucket needs — a
+// seam so unit tests can fake CreateBucket/HeadBucket outcomes without a
+// live store. *s3.Client satisfies it.
+type bucketLifecycleClient interface {
+	CreateBucket(ctx context.Context, in *s3.CreateBucketInput, opts ...func(*s3.Options)) (*s3.CreateBucketOutput, error)
+	HeadBucket(ctx context.Context, in *s3.HeadBucketInput, opts ...func(*s3.Options)) (*s3.HeadBucketOutput, error)
+}
+
 // EnsureBucket creates the bucket, tolerating "already exists/owned by you"
-// (so `serve` works against a fresh MinIO).
+// (so `serve` works against a fresh MinIO). A least-privilege deployment
+// role for a pre-provisioned bucket has no s3:CreateBucket, so AccessDenied
+// on create is not proof the bucket is missing: probe it with HeadBucket and
+// accept when reachable. Any other create error, or a denied create with an
+// unreachable bucket, stays boot-fatal.
 func (b *S3) EnsureBucket(ctx context.Context) error {
 	assertf(b.client != nil, "EnsureBucket: S3 opened without a client")
-	_, err := b.client.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(b.name)})
-	if err != nil {
-		var apiErr smithy.APIError
-		if errors.As(err, &apiErr) {
-			code := apiErr.ErrorCode()
-			if code == "BucketAlreadyOwnedByYou" || code == "BucketAlreadyExists" {
-				return nil
-			}
-		}
-		return fmt.Errorf("create bucket %q: %w", b.name, err)
+	return ensureBucket(ctx, b.client, b.name)
+}
+
+func ensureBucket(ctx context.Context, client bucketLifecycleClient, name string) error {
+	assertf(name != "", "ensureBucket: empty bucket name")
+	_, err := client.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(name)})
+	if err == nil {
+		return nil
 	}
-	return nil
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) {
+		switch apiErr.ErrorCode() {
+		case "BucketAlreadyOwnedByYou", "BucketAlreadyExists":
+			return nil
+		case "AccessDenied":
+			if _, headErr := client.HeadBucket(ctx, &s3.HeadBucketInput{Bucket: aws.String(name)}); headErr != nil {
+				return fmt.Errorf("create bucket %q denied (%v) and probe failed: %w", name, err, headErr)
+			}
+			return nil
+		}
+	}
+	return fmt.Errorf("create bucket %q: %w", name, err)
 }
 
 // UploadFile streams a local file to key.
