@@ -1000,6 +1000,90 @@ func TestRepack_RuntimeBudgetBoundsFold(t *testing.T) {
 	f.checkColdHydrate(t)
 }
 
+// TestLocalQueue_RepackWorkersCapped pins the round-15 security finding:
+// triggers across many distinct repos must not multiply the per-fold
+// budgets — at most localRepackWorkers folds execute concurrently, the
+// rest park on the semaphore (and Close releases parked waiters).
+func TestLocalQueue_RepackWorkersCapped(t *testing.T) {
+	f := newRepackFixture(t)
+	ctx := context.Background()
+	// One real foldable repo is enough; the cap is about EXECUTION slots,
+	// which the gate seam occupies deterministically.
+	for range 2 {
+		f.push(t)
+	}
+
+	const repos = 12
+	gate := make(chan struct{})
+	var mu stdsync.Mutex
+	executing, peak := 0, 0
+	r := NewRepacker(f.store, f.blobs, func(ctx context.Context, repo string, packs []ref.Pack) (string, error) {
+		mu.Lock()
+		executing++
+		if executing > peak {
+			peak = executing
+		}
+		mu.Unlock()
+		<-gate
+		mu.Lock()
+		executing--
+		mu.Unlock()
+		return "", errors.New("gated fixture materialize: fold aborts after the concurrency probe")
+	}, slog.New(slog.DiscardHandler))
+	deliverer := &events.Deliverer{Webhooks: stubWebhooks{}, Logger: slog.New(slog.DiscardHandler)}
+	q := NewLocal(deliverer, func(context.Context, sync.Job) error { return nil }, r, slog.New(slog.DiscardHandler))
+
+	// Seed rows (with real backing blobs — selectByBytes Stats them) for N
+	// distinct repo keys so every fold reaches the materialize seam.
+	seed := filepath.Join(t.TempDir(), "seed.pack")
+	if err := os.WriteFile(seed, []byte("tiny"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for i := range repos {
+		repo := fmt.Sprintf("capped%d", i)
+		packs := []ref.Pack{
+			{ID: "a", Key: blob.PackKey(repo, "aaaa")},
+			{ID: "b", Key: blob.PackKey(repo, "bbbb")},
+		}
+		for _, p := range packs {
+			if err := f.blobs.UploadFile(ctx, p.Key, seed); err != nil {
+				t.Fatalf("upload %s: %v", p.Key, err)
+			}
+		}
+		if err := f.store.RegisterPacks(ctx, repo, packs); err != nil {
+			t.Fatalf("register %s: %v", repo, err)
+		}
+		if err := q.EnqueueRepack(ctx, repo); err != nil {
+			t.Fatalf("enqueue %s: %v", repo, err)
+		}
+	}
+	// Let the executing set saturate, then check the cap held.
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		mu.Lock()
+		cur := executing
+		mu.Unlock()
+		if cur == localRepackWorkers {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("executing folds = %d, want the cap %d to saturate", cur, localRepackWorkers)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	time.Sleep(50 * time.Millisecond) // give over-cap goroutines a chance to (wrongly) enter
+	mu.Lock()
+	gotPeak := peak
+	mu.Unlock()
+	if gotPeak != localRepackWorkers {
+		t.Fatalf("peak concurrent folds = %d, want exactly the cap %d", gotPeak, localRepackWorkers)
+	}
+	// Close must release both the executing folds (gate) and the parked
+	// waiters; everything exits.
+	close(gate)
+	q.Close()
+}
+
 // TestNormalizeCtxErr pins the deadline-classification identity (security
 // round 14): CommandContext kills an over-budget git subprocess, whose raw
 // *exec.ExitError ("signal: killed") does NOT match

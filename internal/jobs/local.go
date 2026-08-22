@@ -30,8 +30,20 @@ type Local struct {
 	// otherwise strand above the threshold until the next write (mirrors
 	// River's queued-states-only uniqueness).
 	repackPending map[string]bool
-	wg            stdsync.WaitGroup
+	// repackSem bounds CONCURRENT fold execution across repos (river caps
+	// its workers at 8; without a cap here, git:write callers crossing the
+	// threshold in many repos/namespaces would multiply the per-fold
+	// budgets by the repo count). Goroutines beyond the cap park cheaply
+	// on the semaphore; closing stops them via repackDone.
+	repackSem  chan struct{}
+	repackDone chan struct{} // closed by Close: unblocks semaphore waiters
+	wg         stdsync.WaitGroup
 }
+
+// localRepackWorkers caps concurrently EXECUTING local folds (the per-repo
+// goroutines beyond it wait): aggregate fold resources stay bounded by
+// cap × per-fold budgets instead of scaling with attacker-creatable repos.
+const localRepackWorkers = 4
 
 var _ Queue = (*Local)(nil)
 
@@ -50,6 +62,8 @@ func NewLocal(deliverer *events.Deliverer, runSync SyncRunner, repacker *Repacke
 		logger:        logger,
 		repacking:     make(map[string]bool),
 		repackPending: make(map[string]bool),
+		repackSem:     make(chan struct{}, localRepackWorkers),
+		repackDone:    make(chan struct{}),
 	}
 }
 
@@ -122,7 +136,20 @@ func (q *Local) EnqueueRepack(_ context.Context, repo string) error {
 func (q *Local) runRepack(repo string) {
 	defer q.wg.Done()
 	for {
+		// Execution slot: bounds aggregate fold work across repos. A
+		// waiter unblocks on Close and exits without folding (queued
+		// local work dies with the process, the documented trade-off).
+		select {
+		case q.repackSem <- struct{}{}:
+		case <-q.repackDone:
+			q.mu.Lock()
+			delete(q.repacking, repo)
+			delete(q.repackPending, repo)
+			q.mu.Unlock()
+			return
+		}
 		folded, err := q.repacker.Repack(context.Background(), repo)
+		<-q.repackSem
 		if err != nil {
 			q.logger.Warn("repack failed", "repo", repo, "err", err)
 		}
@@ -159,8 +186,12 @@ func (q *Local) runRepack(repo string) {
 // Close stops accepting work and waits for in-flight deliveries and syncs.
 func (q *Local) Close() {
 	q.mu.Lock()
+	alreadyClosed := q.closed
 	q.closed = true
 	q.mu.Unlock()
+	if !alreadyClosed {
+		close(q.repackDone) // unblock repack goroutines parked on the semaphore
+	}
 	q.wg.Wait()
 	q.syncq.Close()
 }
