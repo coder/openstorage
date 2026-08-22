@@ -122,3 +122,32 @@ func TestAtomicPush_DeleteOnlyMixedDeniedAsUnit(t *testing.T) {
 		t.Fatal("zz-denied-del was deleted by the non-atomic push")
 	}
 }
+
+// TestAtomicPush_ServeEnvNotInherited pins the round-2 fix: an operator
+// exporting CODESTORAGE_GIT_ATOMIC=1 in the serve process environment must
+// not make the hooks treat every push as atomic — the variable is a
+// per-request bit owned by the wire sniff, and duplicate env entries
+// resolve first-match in Go children, so it must be stripped, not merely
+// overridden by appending.
+func TestAtomicPush_ServeEnvNotInherited(t *testing.T) {
+	node := startNodeT(t, EnvAtomic+"=1")
+	repo := registerRepo(t, "atomic-env-not-inherited")
+	work := initWorkRepo(t)
+	mixed := mintTestToken(t, repo, "git:read,git:write",
+		`[["refs/heads/aa-denied",["no-push"]],["*",[]]]`)
+
+	// NON-atomic mixed push: per-ref semantics must survive the polluted
+	// serve environment (the allowed ref lands).
+	out, err := tryGit(work, "push", remoteURL(node, repo, mixed),
+		"HEAD:refs/heads/aa-denied", "HEAD:refs/heads/zz-allowed")
+	if err == nil {
+		t.Fatalf("non-atomic mixed push should exit non-zero (aa-denied is rejected):\n%s", out)
+	}
+	if strings.Contains(out, "atomic push carries a policy-denied update") {
+		t.Fatalf("non-atomic push hit the atomic gate; serve env leaked into the hook:\n%s", out)
+	}
+	head := revParse(t, work, "HEAD")
+	if refs := pgRefs(t, repo); refs["refs/heads/zz-allowed"] != head {
+		t.Fatalf("zz-allowed = %q, want %q (allowed ref must land)", refs["refs/heads/zz-allowed"], head)
+	}
+}

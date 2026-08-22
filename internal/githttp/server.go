@@ -369,7 +369,20 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 	cmd := exec.CommandContext(r.Context(), "git", service, "--stateless-rpc", repoPath)
 	cmd.Env = os.Environ()
 	if service == "receive-pack" {
-		cmd.Env = append(cmd.Env,
+		// Never inherit EnvAtomic from the serve process environment
+		// (Codex round 2): the pre-receive hook trusts it as THIS
+		// request's atomic bit, so a stale operator-exported value would
+		// make every mixed-policy push denial-happy — and appending
+		// without stripping would not even override it, since duplicate
+		// env entries resolve first-match in Go children. os.Environ()
+		// returns a fresh copy, so the in-place filter aliases nothing.
+		env := cmd.Env[:0]
+		for _, kv := range cmd.Env {
+			if !strings.HasPrefix(kv, EnvAtomic+"=") {
+				env = append(env, kv)
+			}
+		}
+		cmd.Env = append(env,
 			EnvRepo+"="+target.key,
 			EnvOrg+"="+s.Org,
 		)
