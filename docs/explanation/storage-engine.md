@@ -33,10 +33,13 @@ writers *verify* the blob is really readable (`blob.EnsurePublished`) — the be
 sweeper's suspenders ([below](#why-deletion-is-so-careful)).
 
 The payoff is crash asymmetry. A crash between publish and commit strands a paid-for but
-unreferenced blob — an **orphan**, invisible to every reader, costing only storage. A
-crash can never produce the opposite: a committed ref pointing at bytes that don't exist.
-Orphans are cheap and reclaimable; dangling refs would be data loss. The engine chooses
-its failure mode.
+unreferenced blob — an **orphan**, invisible to every reader, costing only storage. The
+write path can never produce the opposite — a committed ref pointing at bytes that were
+never published. (With destructive sweeping enabled, rare delete/registration races can
+make an already-registered pack *transiently* unavailable; the quarantine handshake and
+every sweep's opening heal pass restore it, so the exposure is a bounded retry window,
+never durable loss.) Orphans are cheap and reclaimable; durably dangling refs would be
+data loss. The engine chooses its failure mode.
 
 The corollary: **garbage is normal**. Crashed pushes, lost races, superseded packs all
 leave blobs behind by design, and reclamation is deferred to an asynchronous, careful
