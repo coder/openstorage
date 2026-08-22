@@ -24,6 +24,7 @@ never a silently-applied default.
 | [`CODESTORAGE_RATE_RPS`](#codestorage_rate_rps--codestorage_rate_burst) | unset (disabled) | Per-client-IP rate limit: sustained requests/second |
 | [`CODESTORAGE_RATE_BURST`](#codestorage_rate_rps--codestorage_rate_burst) | unset (disabled) | Rate-limit token-bucket depth |
 | [`CODESTORAGE_TRUSTED_PROXIES`](#codestorage_trusted_proxies) | unset | CIDR allowlist of reverse proxies for rate-limit client identity |
+| [`CODESTORAGE_WEBHOOK_ALLOW_PRIVATE`](#codestorage_webhook_allow_private) | `false` | Permit private-network webhook receivers (metadata and redirects stay blocked) |
 | [`CODESTORAGE_PACK_QUOTA_BYTES`](#codestorage_pack_quota_bytes) | 10 GiB | Per-repo pack-bytes quota (`0` disables) |
 | [`CODESTORAGE_PACK_RESERVATION_TTL`](#codestorage_pack_reservation_ttl) | `1h` | Lifetime of a crashed writer's quota reservation |
 | [`CODESTORAGE_SWEEP_INTERVAL`](#codestorage_sweep_interval) | `1h` | Orphan-pack sweep cadence (`0` disables sweeping) |
@@ -145,6 +146,34 @@ proxies whose forwarded client identity the rate limiters may trust.
 - **List only proxies that set or append `X-Forwarded-For` themselves** — trusting a proxy
   that forwards client-supplied values verbatim lets any client mint fresh rate-limit
   buckets.
+
+### `CODESTORAGE_WEBHOOK_ALLOW_PRIVATE`
+
+Controls the native webhook SSRF guard. **Default: `false`.** By default, webhook delivery
+rejects IANA special-purpose ranges, including loopback, RFC 1918, RFC 6598 shared,
+IPv4/IPv6 link-local, IPv6 ULA, translation/protocol anycast, documentation, benchmarking,
+reserved, unspecified, multicast, broadcast, and cloud-metadata targets. IPv4-mapped IPv6
+addresses are normalized before classification, so (for example) `::ffff:10.0.0.1` is private.
+
+Registration performs the same target check against IP literals and the DNS answers visible
+at that moment as a fast-feedback courtesy. **Registration acceptance is not a reachability
+guarantee:** DNS may be unavailable or change after registration. Every delivery attempt is
+authoritatively re-resolved at dial time; all returned addresses must be allowed, and a
+resolution failure, empty answer, or mixed public/private answer fails the attempt through
+the normal retry/dead-letter path. The client connects to the vetted IP literal so DNS cannot
+be rebound between validation and connect.
+
+Webhook deliveries never follow redirects. `301`, `302`, `307`, and `308` responses are
+delivery failures, and the redirect target receives no request. The delivery transport also
+ignores `HTTP_PROXY` / `HTTPS_PROXY`: validating a proxy socket would not validate the URL
+target the proxy later connects to.
+
+Set this variable to a Go boolean `true` only when webhooks intentionally target internal
+services. It admits loopback, RFC 1918, RFC 6598 shared, link-local, and ULA receivers,
+and logs a warning at startup. It **does not** permit cloud metadata, unspecified/multicast/
+broadcast addresses, other IANA special-purpose ranges (such as documentation, benchmarking,
+reserved, translation, or protocol-anycast space), or redirects. Malformed boolean values
+are startup errors.
 
 ## Pack quota
 

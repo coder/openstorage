@@ -456,7 +456,8 @@ func TestEndToEndPushDelivery(t *testing.T) {
 	hook := Webhook{ID: "wh_e2e", OrgID: 42, URL: srv.URL, Secret: secret}
 	lookup := &fakeLookup{hooks: map[string]Webhook{hook.ID: hook}}
 	deliverer := &Deliverer{Webhooks: lookup, Logger: testLogger(),
-		Backoff: func(int) time.Duration { return 0 }}
+		AllowPrivate: true, // httptest receiver is loopback (issue #53)
+		Backoff:      func(int) time.Duration { return 0 }}
 
 	// The "queue": enqueue delivers synchronously, as the in-process
 	// local-mode queue would (minus the goroutine).

@@ -90,6 +90,14 @@ type Config struct {
 	// back to a safe one-hour default. The serve command plumbs it from
 	// CODESTORAGE_PACK_RESERVATION_TTL.
 	PackReservationTTL time.Duration
+
+	// WebhookAllowPrivate relaxes the webhook SSRF guard's private-range
+	// denial (issue #53) for both the registration-time courtesy check
+	// here and — plumbed separately into the delivery workers — the
+	// authoritative dial-time enforcement. The zero value keeps the guard
+	// strict (the safe default). The serve command plumbs it from
+	// CODESTORAGE_WEBHOOK_ALLOW_PRIVATE.
+	WebhookAllowPrivate bool
 }
 
 // New builds the full HTTP handler: recover -> request log -> router, with
@@ -181,7 +189,7 @@ func New(cfg Config) (http.Handler, error) {
 
 	// Phase-5 routes: webhook CRUD (docs/06), git-credentials CRUD and
 	// upstream sync (docs/03).
-	RegisterWebhookRoutes(mux, cfg.Verifier, cfg.Org, events.MetaWebhookStore{Store: cfg.Store}, logger, rl)
+	RegisterWebhookRoutes(mux, cfg.Verifier, cfg.Org, events.MetaWebhookStore{Store: cfg.Store}, events.TargetGuard{AllowPrivate: cfg.WebhookAllowPrivate}, logger, rl)
 	registerCredentialRoutes(mux, cfg.Verifier, cfg.Org, ss, rl)
 	registerSyncRoutes(mux, cfg.Verifier, cfg.Org, ss, rl)
 

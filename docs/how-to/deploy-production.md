@@ -257,11 +257,29 @@ exactly):
 
 ### Webhook egress
 
-Webhook deliveries POST to registered URLs from the replicas, currently without
-resolved-target or redirect validation — a blind-SSRF path for anyone who can register
-webhooks ([#53](https://github.com/coder/code-storage/issues/53)). Treat webhook
-registration (org-level `repo:write`) as trusted, and apply egress controls on the
-replica network that block loopback, private-range, and cloud-metadata destinations.
+Webhook deliveries use a native SSRF guard. By default, every attempt resolves the
+registered hostname at dial time and fails closed unless **every** answer is a public,
+global-unicast address outside the IANA special-purpose registries. Loopback, RFC 1918,
+RFC 6598 shared, link-local, IPv6 ULA, translation/protocol anycast, documentation,
+benchmarking, reserved, unspecified, multicast, broadcast, and cloud-metadata targets are
+denied; IPv4-mapped IPv6 addresses are normalized before classification. The client connects
+to the vetted IP literal, opens a fresh connection for every attempt, ignores environment HTTP proxies, and never
+follows redirects.
+A denial is an ordinary delivery failure, so the configured queue backend applies its normal
+retry and dead-letter/discard behavior instead of crashing the worker.
+
+Registration checks literal IPs and the DNS answers visible at registration time for fast
+feedback, but **registration acceptance does not imply delivery reachability**. DNS can be
+unavailable or change later; the dial-time check is authoritative, and resolution failures,
+empty answers, or mixed allowed/denied answer sets fail closed.
+
+For deployments that intentionally deliver to internal receivers, set
+`CODESTORAGE_WEBHOOK_ALLOW_PRIVATE=true`. This admits loopback, RFC 1918, RFC 6598
+shared, link-local, and ULA targets and emits a startup warning. Cloud metadata
+(`169.254.169.254` and `fd00:ec2::254`), other IANA special-purpose ranges,
+malformed/non-routable targets, and redirects remain blocked. Keep network
+egress controls as defense in depth, especially where other workloads share the replica
+identity or network policy.
 
 ## Rolling upgrades and restarts
 

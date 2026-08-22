@@ -37,8 +37,15 @@ type Delivery struct {
 type Deliverer struct {
 	Webhooks WebhookLookup // required
 
-	// Client posts deliveries; defaults to a 30s-timeout client.
+	// Client posts deliveries; defaults to the TargetGuard-enforcing
+	// client (issue #53): private-range targets denied at dial time,
+	// redirects refused. Only tests override this — production wiring
+	// must keep the guard and steer it through AllowPrivate.
 	Client *http.Client
+	// AllowPrivate selects the guard's private-range escape hatch
+	// (CODESTORAGE_WEBHOOK_ALLOW_PRIVATE) when Client is nil. Redirects
+	// are refused either way.
+	AllowPrivate bool
 	// Now supplies the signing timestamp; defaults to time.Now.
 	Now func() time.Time
 	// MaxAttempts bounds Deliver's retry loop (default 10, then discard).
@@ -50,9 +57,14 @@ type Deliverer struct {
 	Logger *slog.Logger
 }
 
-// defaultClient bounds a whole attempt: a receiver that never responds
-// must not wedge a delivery worker.
-var defaultClient = &http.Client{Timeout: 30 * time.Second}
+// The default clients are guard-enforcing so a Deliverer constructed
+// without an explicit Client can only fail CLOSED (issue #53); both bound
+// a whole attempt at 30s — a receiver that never responds must not wedge
+// a delivery worker.
+var (
+	defaultClient        = TargetGuard{}.NewClient()
+	defaultPrivateClient = TargetGuard{AllowPrivate: true}.NewClient()
+)
 
 func defaultBackoff(attempt int) time.Duration {
 	assertf(attempt >= 1, "defaultBackoff: non-positive attempt %d", attempt)
@@ -65,6 +77,9 @@ func defaultBackoff(attempt int) time.Duration {
 func (d *Deliverer) client() *http.Client {
 	if d.Client != nil {
 		return d.Client
+	}
+	if d.AllowPrivate {
+		return defaultPrivateClient
 	}
 	return defaultClient
 }
@@ -135,7 +150,8 @@ func (d *Deliverer) Attempt(ctx context.Context, del Delivery) error {
 		return fmt.Errorf("deliver to webhook %s: %w", del.WebhookID, err)
 	}
 	// Receiver bodies are untrusted and irrelevant; drain a bounded amount
-	// so the connection can be reused, then close.
+	// to release transport resources, then close. Guarded clients disable
+	// keep-alives so every attempt gets a fresh authoritative DNS check.
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 	_ = resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
