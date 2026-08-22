@@ -91,8 +91,9 @@ max(usage counter, blob-listing floor) + active reservations + incoming ≤ quot
 ```
 
 - **Reservations** claim headroom *before* upload and are consumed atomically when the
-  pack registers. A crashed writer's reservation keeps gating until its TTL expires (the
-  sweeper prunes it); a *retry* of the same push refreshes the same reservation instead
+  pack registers. A crashed writer's reservation keeps gating until its TTL elapses —
+  admission filters expired rows out immediately; the sweeper's later pruning is pure
+  garbage collection. A *retry* of the same push refreshes the same reservation instead
   of double-charging, because packs are content-addressed.
 - **The counter and the floor cross-check each other.** The counter covers what the
   listing can't see yet (staleness, in-flight registrations); the physical listing floor

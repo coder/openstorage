@@ -26,7 +26,10 @@ clients ──► reverse proxy (TLS) ──► N × codestorage serve ──►
   which replica picks the job.
 - The container image (repo [`Dockerfile`](../../Dockerfile)) runs as a non-root user and
   needs the `git` binary at runtime — already included; remember it if you build your own
-  image.
+  image. If you protect refs with `verify-sig` policies, also install `gpg` and
+  `ssh-keygen` — signature verification shells out to them and fails closed, and the
+  supplied image currently includes neither
+  ([#50](https://github.com/coder/code-storage/issues/50)).
 
 ## Backing services
 

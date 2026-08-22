@@ -90,6 +90,10 @@ Beyond serving the smart-HTTP wire format, the semantics clients depend on match
   independently, as in git.
 - **Signed pushes**: `verify-sig` validates SSH/PGP commit signatures against keys
   registered via [`codestorage signing-key`](../reference/cli.md#codestorage-signing-key).
+  Verification shells out through git — `ssh-keygen` for SSH, `gpg` for PGP — and fails
+  closed per ref when the binary is absent. The repository's supplied container image
+  ships neither ([#50](https://github.com/coder/code-storage/issues/50)); install them
+  before protecting refs with `verify-sig`.
 
 ## The architectural difference: single-org
 
