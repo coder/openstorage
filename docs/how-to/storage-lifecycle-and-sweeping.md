@@ -20,7 +20,7 @@ of these classes:
 | **Registered packs** | Every push and REST write publishes a pack and registers it | [Repack](#background-repack) folds many into one (the originals become *retained*) |
 | **Retained (superseded) packs** | A repack fold replaced their registry rows; the blobs linger | Sweeper's superseded reap ([`CODESTORAGE_SWEEP_DELETE_SUPERSEDED`](../reference/configuration.md#codestorage_sweep_delete_superseded), on by default) after the age threshold |
 | **Orphan packs** | Crashed/interrupted writers (pack published, registration never committed), lost repack races | Sweeper — **list-only by default**; deletion is the explicit [`CODESTORAGE_SWEEP_DELETE_ENABLED`](../reference/configuration.md#codestorage_sweep_delete_enabled) opt-in |
-| **Quarantine copies** (`quarantine/` prefix) | Delete-mode sweeps copy every blob aside before deleting it | The sweep itself purges backups older than the purge window — `max(age threshold, 1h)` — while a destructive mode is on |
+| **Quarantine copies** (`sweep/quarantine/<nonce>/…` keys) | Delete-mode sweeps copy every blob aside before deleting it | The sweep itself purges backups older than the purge window — `max(age threshold, 1h)` — while a destructive mode is on |
 
 Two more growth sources sit outside this lifecycle: **LFS objects** (stored under their
 own keys, never swept or repacked) and, on versioned S3 buckets, **old object versions**
@@ -189,7 +189,7 @@ your (disabled) deletion and deserves investigation before you consider enabling
 ### Deletion is quarantine-first, and heals itself
 
 When a sweep does delete, it never hard-deletes directly: every blob is first copied to a
-`quarantine/` key, the registry is re-checked *after* the delete (a registration that
+`sweep/quarantine/<nonce>/…` key, the registry is re-checked *after* the delete (a registration that
 landed mid-delete is restored on the spot), and **every** sweep — list-only included —
 starts by restoring any registered-but-missing pack from quarantine. Rolling back to
 list-only after a scare therefore still repairs anything a delete-enabled crash left
