@@ -141,7 +141,7 @@ func cmdServe(ctx context.Context, args []string) error {
 	// HTTP API (single-org self-host mode). The read endpoints share the
 	// ref/blob stores and cache dir with the githttp fallback below.
 	apiHandler, metaStore, verifier, maybeRepack, cleanup, err := buildAPIHandler(ctx, cfg.dbURL, cfg.org, httpBaseURL, orgPEMBlocks, st, bl, cfg.cacheDir,
-		api.RateLimitConfig{RPS: cfg.rateRPS, Burst: cfg.rateBurst}, cfg.sweep, cfg.repackThreshold)
+		api.RateLimitConfig{RPS: cfg.rateRPS, Burst: cfg.rateBurst}, cfg.packQuotaBytes, cfg.sweep, cfg.repackThreshold)
 	if err != nil {
 		return err
 	}
@@ -160,6 +160,7 @@ func cmdServe(ctx context.Context, args []string) error {
 	// check runs in the serve process for BOTH queue backends (the local
 	// hook subprocess has no channel to the in-process queue).
 	srv.MaybeRepack = maybeRepack
+	srv.PackQuotaBytes = cfg.packQuotaBytes
 	// docs/05 git URLs address repos by repo_id (name-style urls accepted
 	// too, ADR-21); the resolved RepoID is the only storage key, and the
 	// record backs claim matching for url- or id-carrying tokens (docs/02).
@@ -174,7 +175,16 @@ func cmdServe(ctx context.Context, args []string) error {
 		}
 		return repo, true
 	}
-	mux.Handle("/", srv.Handler())
+	// The same rate-limit knob covers the git surface (issue #21):
+	// receive-pack uploads packs before any ref policy runs, so the git
+	// routes must not stay outside the limiter. Separate bucket state from
+	// the REST limiter — one surface exhausting its budget must not starve
+	// the other.
+	gitLimit, err := api.NewGitRateLimit(api.RateLimitConfig{RPS: cfg.rateRPS, Burst: cfg.rateBurst})
+	if err != nil {
+		return err
+	}
+	mux.Handle("/", gitLimit(srv.Handler()))
 
 	// Unauthenticated liveness probe: lets quickstarts and compose
 	// healthchecks confirm this server (not a stale process squatting the

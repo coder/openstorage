@@ -31,6 +31,11 @@ const (
 	envRateRPS    = "CODESTORAGE_RATE_RPS"
 	envRateBurst  = "CODESTORAGE_RATE_BURST"
 
+	// Per-repo pack-bytes quota on the git surface (issue #21): receive-pack
+	// refuses pushes that would take a repo's packs/ prefix past this many
+	// bytes. Unset applies the generous default; "0" disables enforcement.
+	envPackQuota = "CODESTORAGE_PACK_QUOTA_BYTES"
+
 	// Orphan-pack sweep (issue #5): interval between sweeps ("0" disables
 	// sweeping), minimum blob age before an unregistered pack counts as an
 	// orphan, and the explicit opt-in for actually deleting candidates
@@ -58,6 +63,12 @@ const (
 	defaultSweepInterval     = time.Hour
 	defaultSweepAgeThreshold = 24 * time.Hour
 	defaultRepackThreshold   = 10
+
+	// defaultPackQuotaBytes is the generous default per-repo pack-bytes
+	// quota (10 GiB): far above any healthy repository's pack footprint,
+	// while still bounding the packs/ growth a single repo-scoped
+	// git:write token can inflict (issue #21).
+	defaultPackQuotaBytes = int64(10) << 30
 )
 
 // envFirst returns the first non-empty value among names. getenv is injected
@@ -97,10 +108,16 @@ type serveConfig struct {
 	// address — which is unroutable when listening on 0.0.0.0.
 	baseURL string
 
-	// rateRPS/rateBurst configure the per-client-IP REST rate limit
-	// (docs/03 gateway-level 429). Both zero means disabled.
+	// rateRPS/rateBurst configure the per-client-IP rate limit (docs/03
+	// gateway-level 429) applied to the REST surface and — with separate
+	// bucket state — the git smart-HTTP surface (issue #21). Both zero
+	// means disabled.
 	rateRPS   float64
 	rateBurst int
+
+	// packQuotaBytes is the per-repo pack-bytes quota on the git surface
+	// (issue #21); 0 disables enforcement.
+	packQuotaBytes int64
 
 	// sweep configures the periodic orphan-pack sweep (issue #5).
 	sweep sweepSettings
@@ -212,6 +229,10 @@ func resolveServeConfig(getenv func(string) string, flagListen, flagAddr, flagCa
 	if err != nil {
 		return serveConfig{}, err
 	}
+	cfg.packQuotaBytes, err = resolvePackQuota(getenv)
+	if err != nil {
+		return serveConfig{}, err
+	}
 	cfg.sweep, err = resolveSweepSettings(getenv)
 	if err != nil {
 		return serveConfig{}, err
@@ -268,6 +289,26 @@ func resolveRateLimit(getenv func(string) string) (float64, int, error) {
 		return 0, 0, fmt.Errorf("%s must be set (>= 1) when %s is set", envRateBurst, envRateRPS)
 	}
 	return rps, burst, nil
+}
+
+// resolvePackQuota parses CODESTORAGE_PACK_QUOTA_BYTES (issue #21).
+// Fail-fast semantics matching resolveRateLimit: malformed or negative
+// values error naming the env var. Unset applies the generous default;
+// an explicit "0" disables quota enforcement.
+func resolvePackQuota(getenv func(string) string) (int64, error) {
+	assertf(getenv != nil, "resolvePackQuota: nil getenv")
+	raw := getenv(envPackQuota)
+	if raw == "" {
+		return defaultPackQuotaBytes, nil
+	}
+	v, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("%s: %w", envPackQuota, err)
+	}
+	if v < 0 {
+		return 0, fmt.Errorf("%s must be non-negative (0 disables the quota), got %q", envPackQuota, raw)
+	}
+	return v, nil
 }
 
 // resolveSweepSettings parses the orphan-pack sweep env vars. Fail-fast

@@ -39,7 +39,7 @@ import (
 // mux.Handle("/api/", h). refStore/blobStore/cacheDir back the
 // git:read endpoints — serve passes the same instances the githttp fallback
 // uses so both surfaces share one cache.
-func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL string, orgPEMBlocks []string, refStore ref.RefStore, blobStore blob.BlobStore, cacheDir string, rate api.RateLimitConfig, sweep sweepSettings, repackThreshold int) (http.Handler, meta.Store, auth.Verifier, func(ctx context.Context, repo string), func(), error) {
+func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL string, orgPEMBlocks []string, refStore ref.RefStore, blobStore blob.BlobStore, cacheDir string, rate api.RateLimitConfig, packQuotaBytes int64, sweep sweepSettings, repackThreshold int) (http.Handler, meta.Store, auth.Verifier, func(ctx context.Context, repo string), func(), error) {
 	assertf(dbURL != "" && org != "" && httpBaseURL != "" && len(orgPEMBlocks) > 0, "buildAPIHandler: missing dbURL/org/httpBaseURL/keys")
 	assertf(refStore != nil && blobStore != nil && cacheDir != "", "buildAPIHandler: missing refStore/blobStore/cacheDir")
 	ms, msCleanup, err := openMetaStore(ctx, dbURL)
@@ -177,6 +177,9 @@ func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL string, orgPEM
 		SyncQueue:   queue,
 		RateLimit:   rate,
 		MaybeRepack: maybeRepack,
+		// The same per-repo pack quota the git surface enforces at
+		// pre-receive (issue #21): REST pack writers must not bypass it.
+		PackQuotaBytes: packQuotaBytes,
 	})
 	if err != nil {
 		queueCleanup() // stop workers before closing their meta store

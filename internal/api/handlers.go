@@ -37,6 +37,10 @@ type server struct {
 	// (issue #1); nil disables triggering. Write pipelines invoke it via
 	// triggerRepack after a successful pack registration.
 	maybeRepack func(ctx context.Context, repo string)
+
+	// packQuotaBytes mirrors the git surface's per-repo pack quota onto
+	// the REST pack writers (issue #21); <= 0 disables enforcement.
+	packQuotaBytes int64
 }
 
 // triggerRepack runs the repack-threshold check after a successful pack

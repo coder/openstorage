@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 
 	"codestorage/internal/auth"
@@ -62,6 +63,13 @@ type Server struct {
 	// (a pack-count read plus at most one job enqueue) and must never
 	// block on the fold itself. Nil disables triggering.
 	MaybeRepack func(ctx context.Context, repo string)
+	// PackQuotaBytes is the per-repo pack-bytes quota (issue #21, see
+	// quota.go); <= 0 disables quota enforcement. Set by the serve wiring
+	// from the resolved config, like ResolveRepo.
+	PackQuotaBytes int64
+	// usage memoizes per-repo pack usage for the quota-pressure log so
+	// replayed cheap POSTs cannot amplify into per-request blob listings.
+	usage usageCache
 }
 
 // repoTarget is a resolved request target: the live repo record plus the
@@ -304,13 +312,6 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 		httpError(w, http.StatusNotFound, "repository not found")
 		return
 	}
-	repoPath, err := s.hydrate(r.Context(), target.key, service, target.repo.DefaultBranch)
-	if err != nil {
-		log.Printf("hydrate %s: %v", target.key, err)
-		httpError(w, http.StatusInternalServerError, "hydration failed")
-		return
-	}
-
 	body := io.Reader(r.Body)
 	// git clients gzip large request bodies.
 	if r.Header.Get("Content-Encoding") == "gzip" {
@@ -322,6 +323,35 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 		defer gz.Close()
 		body = gz
 	}
+	// Pack-quota pressure log (issue #21, quota.go). Enforcement lives
+	// exclusively in pre-receive: only it sees the quarantined packs'
+	// content-addressed keys, so only it can tell a quota-breaching push
+	// from a zero-growth one (delete-only pushes, refs to already-stored
+	// objects, and crash-window retries whose identical packs are already
+	// published and/or registered — Codex rounds 3, 4, 5, 6). An HTTP-time
+	// rejection of a pack-carrying request is unsound by construction: the
+	// incoming pack's key is unknowable before the stream arrives, and a
+	// wrong guess wedges the retry that would complete an interrupted
+	// publication. Denials therefore happen in the hook (nothing is
+	// stored; the client sees the sideband message); this cached, cheap
+	// check gives operators the server-side signal that a repo is pushing
+	// against its quota.
+	if service == "receive-pack" && s.PackQuotaBytes > 0 {
+		// Non-blocking peek (Codex rounds 7+9): the check is purely
+		// observational — pre-receive enforces without any listing — so
+		// neither a stalled blob backend nor a cold cache may delay or
+		// fail the request. A miss triggers an async coalesced refresh
+		// that serves later requests' peeks.
+		if usage, ok := s.peekUsage(target.key); ok && usage >= s.PackQuotaBytes {
+			log.Printf("quota: receive-pack for %s at/over quota (%d pack bytes stored >= %d): enforcement defers to pre-receive", target.key, usage, s.PackQuotaBytes)
+		}
+	}
+	repoPath, err := s.hydrate(r.Context(), target.key, service, target.repo.DefaultBranch)
+	if err != nil {
+		log.Printf("hydrate %s: %v", target.key, err)
+		httpError(w, http.StatusInternalServerError, "hydration failed")
+		return
+	}
 
 	cmd := exec.CommandContext(r.Context(), "git", service, "--stateless-rpc", repoPath)
 	cmd.Env = os.Environ()
@@ -330,6 +360,11 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 			EnvRepo+"="+target.key,
 			EnvOrg+"="+s.Org,
 		)
+		// Resolved quota for the pre-receive hook's authoritative
+		// usage+incoming check (quota.go); absent means disabled.
+		if s.PackQuotaBytes > 0 {
+			cmd.Env = append(cmd.Env, EnvPackQuota+"="+strconv.FormatInt(s.PackQuotaBytes, 10))
+		}
 		// The refs claim is passed through raw (docs/02 tuple encoding);
 		// the update hook owns parsing and fails closed on malformed JSON.
 		if len(claims.Refs) > 0 {

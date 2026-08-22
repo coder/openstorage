@@ -121,6 +121,59 @@ const PacksRoot = "packs/"
 // PackPrefix is the listing prefix for a repo's packs.
 func PackPrefix(repo string) string { return PacksRoot + repo + "/" }
 
+// packUsagePageSize bounds one PackUsageBytes listing page, mirroring the
+// sweeper's page-bounded scans so a pathological pack count cannot balloon
+// memory.
+const packUsagePageSize = 1000
+
+// packNamespaceSuffixes are the docs/05 namespace suffixes a repo key may
+// carry. Each namespace has its own pack PREFIX (storage isolation), but
+// quota accounting rolls all of them up under the base repo: auth strips
+// the suffix, so one git:write token can push to base, +ephemeral, and
+// +import — separate quotas would hand that token 3x the advertised
+// per-repository bound (issue #21, Codex round 15).
+var packNamespaceSuffixes = []string{"+ephemeral", "+import"}
+
+// PackUsageBytes sums the sizes of every object under the pack prefixes of
+// repo's BASE repository and all of its namespaces: registered packs plus
+// not-yet-swept orphans — the packs/ growth the per-repo quota (issue #21)
+// bounds. The suffix, if any, is stripped first, so every namespace write
+// is measured against the same rolled-up usage. Shared by the pre-receive
+// hook, the REST pack writers, and the git surface's pressure check.
+//
+// Known deferral (issue #31): a background repack fold uploads a
+// consolidated pack and ReplacePacks swaps only registry rows — the
+// superseded blobs remain (and are counted here) until a delete-mode sweep
+// reaps them, transiently inflating usage after folds. Retained-byte
+// accounting is #31's scope; this PR's quota treats the raw prefix bytes
+// as the (conservative) truth.
+func PackUsageBytes(ctx context.Context, b BlobStore, repo string) (int64, error) {
+	assertf(b != nil && repo != "", "PackUsageBytes: missing blob store or repo")
+	base := repo
+	for _, s := range packNamespaceSuffixes {
+		base = strings.TrimSuffix(base, s)
+	}
+	assertf(base != "", "PackUsageBytes: empty base repo for %q", repo)
+	// Two listings cover base + every namespace without matching sibling
+	// repos: "packs/<base>/" is the base prefix, and "packs/<base>+" only
+	// matches this repo's namespace prefixes ('+' cannot start another
+	// repo's key segment).
+	var total int64
+	for _, prefix := range []string{PackPrefix(base), PacksRoot + base + "+"} {
+		err := b.ListPages(ctx, prefix, packUsagePageSize, func(page []ListedObject) error {
+			for _, o := range page {
+				total += o.Size
+			}
+			return nil
+		})
+		if err != nil {
+			return 0, fmt.Errorf("list pack usage for %s: %w", repo, err)
+		}
+	}
+	assertf(total >= 0, "PackUsageBytes: negative total %d for %s", total, repo)
+	return total, nil
+}
+
 // LFSKey is the immutable object key for a repo's LFS object with the given
 // sha256 oid. Keys are repo-scoped (docs/05): forks inherit LFS pointers
 // only, never the objects, which this keying yields automatically.

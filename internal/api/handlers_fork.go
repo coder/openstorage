@@ -22,6 +22,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -31,7 +32,6 @@ import (
 	"time"
 
 	"codestorage/internal/auth"
-	"codestorage/internal/blob"
 	"codestorage/internal/gitread"
 	"codestorage/internal/meta"
 	"codestorage/internal/ref"
@@ -231,8 +231,20 @@ func (s *server) handleForkRepo(w http.ResponseWriter, r *http.Request, verifier
 		return
 	}
 	packPath := filepath.Join(packDir, "pack-"+packID+".pack")
-	if fi, err := os.Stat(packPath); err != nil || fi.Size() == 0 {
+	fi, err := os.Stat(packPath)
+	if err != nil || fi.Size() == 0 {
 		s.internalErr(w, r, "pack fork closure", errors.New("pack-objects produced no pack at "+packPath))
+		return
+	}
+	// Quota pre-check BEFORE CreateRepo (issue #21, Codex round 13): the
+	// fork targets a fresh repo whose pack usage is definitionally zero,
+	// so the whole quota question is "does the closure fit" — answerable
+	// now. Deciding it after CreateRepo would burn the requested name on
+	// denial: forkAbandon soft-deletes the row, and soft-deleted URLs stay
+	// reserved (recreate → 409) by design. publishPack re-checks under the
+	// new RepoID (usage 0), which by construction agrees.
+	if s.packQuotaBytes > 0 && fi.Size() > s.packQuotaBytes {
+		writeErr(w, http.StatusForbidden, fmt.Sprintf("%v: fork closure is %d bytes, quota is %d bytes", errPackQuotaExceeded, fi.Size(), s.packQuotaBytes))
 		return
 	}
 
@@ -253,34 +265,20 @@ func (s *server) handleForkRepo(w http.ResponseWriter, r *http.Request, verifier
 	assertf(repo.RepoID != "", "store returned repo with empty RepoID")
 
 	// Publish under the NEW RepoID's keys (ADR-21), strictly before the
-	// CASRef — same order as every write pipeline. From here on a failure
-	// abandons the shell repo; an already-uploaded pack stays behind as an
-	// unreferenced immutable object (same as a lost CAS race).
-	key := blob.PackKey(repo.RepoID, packID)
-	if err := s.blobStore.UploadFile(ctx, key, packPath); err != nil {
+	// CASRef — same order as every write pipeline, via the shared REST
+	// publication step (publish.go: dedup, quota, upload, register,
+	// verify). From here on a failure abandons the shell repo; an
+	// already-uploaded pack stays behind as an unreferenced immutable
+	// object (same as a lost CAS race). A quota denial (fork closure
+	// larger than the per-repo quota, issue #21) stores nothing and maps
+	// to this route's plain 403 envelope.
+	if err := s.publishPack(ctx, repo.RepoID, packID, packPath); err != nil {
 		s.forkAbandon(ctx, claims.Iss, url)
-		s.internalErr(w, r, "upload fork pack", err)
-		return
-	}
-	// Writer half of the orphan-sweep coordination (issue #5): re-upload
-	// if a sweeper deleted the key before the registration committed.
-	// Verification runs even when RegisterPacks fails: an ambiguous error
-	// may have committed the row (see the pre-receive hook).
-	regErr := s.refStore.RegisterPacks(ctx, repo.RepoID, []ref.Pack{{ID: packID, Key: key}})
-	if err := blob.EnsurePublished(ctx, s.blobStore, key, packPath); err != nil {
-		s.forkAbandon(ctx, claims.Iss, url)
-		s.internalErr(w, r, "verify fork pack", errors.Join(regErr, err))
-		return
-	}
-	// Threshold check regardless of regErr (issue #1): an ambiguous
-	// registration error may have committed the row — the same reason the
-	// verification above runs unconditionally — and skipping the trigger
-	// would strand a threshold crossing until the next write. The check
-	// reads the committed count, so it safely no-ops on a true failure.
-	s.triggerRepack(ctx, repo.RepoID)
-	if regErr != nil {
-		s.forkAbandon(ctx, claims.Iss, url)
-		s.internalErr(w, r, "register fork pack", regErr)
+		if errors.Is(err, errPackQuotaExceeded) {
+			writeErr(w, http.StatusForbidden, err.Error())
+			return
+		}
+		s.internalErr(w, r, "publish fork pack", err)
 		return
 	}
 	won, err := s.refStore.CASRef(ctx, repo.RepoID, forkRef, ref.ZeroSHA, forkSHA)

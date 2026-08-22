@@ -21,6 +21,7 @@ import (
 	"testing"
 
 	"codestorage/internal/auth"
+	"codestorage/internal/blob"
 	"codestorage/internal/gitread"
 	"codestorage/internal/ref"
 )
@@ -1009,6 +1010,58 @@ func TestWriteRefsAuth(t *testing.T) {
 			map[string]any{"target_branch": "x", "base_branch": "main"})
 		if resp2.StatusCode != http.StatusNotFound {
 			t.Fatalf("unknown repo: status = %d, want 404", resp2.StatusCode)
+		}
+	})
+}
+
+// TestNotesQuota (issue #21, Codex round 12): POST /repos/notes publishes
+// packs through the shared publishPack step, so the per-repo quota gates it
+// exactly like commit-pack/merge/pre-receive — without this, repeated note
+// appends grow packs/ without bound after every other writer is denied.
+func TestNotesQuota(t *testing.T) {
+	runBackends(t, func(t *testing.T, e *testEnv) {
+		fx := wrefSeedFixture(t, e)
+		quotaSrv := func(quota int64) *httptest.Server {
+			s := &server{
+				store:          e.store,
+				httpBaseURL:    testHTTPBaseURL,
+				logger:         discardLogger(),
+				refStore:       e.refStore,
+				blobStore:      e.blobStore,
+				cacheDir:       e.cacheDir,
+				packQuotaBytes: quota,
+			}
+			mux := http.NewServeMux()
+			s.registerWriteRefRoutes(mux, auth.NewVerifier(e.store), nil)
+			srv := httptest.NewServer(recoverPanics(s.logger)(mux))
+			t.Cleanup(srv.Close)
+			return srv
+		}
+
+		// Generous quota: the note write passes.
+		resp, body := wrefDo(t, quotaSrv(1<<20), "POST", "/api/v1/repos/notes", fx.token,
+			map[string]any{"sha": fx.c1, "action": "add", "note": "under quota"})
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("under-quota note = %d body %v", resp.StatusCode, body)
+		}
+		usage, err := blob.PackUsageBytes(context.Background(), e.blobStore, fx.repoID)
+		if err != nil || usage == 0 {
+			t.Fatalf("usage after note = (%d, %v), want > 0", usage, err)
+		}
+
+		// 1-byte quota: denied with the note envelope's 403, nothing stored.
+		resp, body = wrefDo(t, quotaSrv(1), "POST", "/api/v1/repos/notes", fx.token,
+			map[string]any{"sha": fx.c2, "action": "add", "note": "over quota"})
+		if resp.StatusCode != http.StatusForbidden {
+			t.Fatalf("over-quota note = %d body %v", resp.StatusCode, body)
+		}
+		result := wrefNoteResultOf(t, body)
+		if result["success"] != false || !strings.Contains(result["message"].(string), "quota") {
+			t.Fatalf("result = %v, want quota failure", result)
+		}
+		after, err := blob.PackUsageBytes(context.Background(), e.blobStore, fx.repoID)
+		if err != nil || after != usage {
+			t.Fatalf("denied note changed usage: %d -> %d (err %v)", usage, after, err)
 		}
 	})
 }

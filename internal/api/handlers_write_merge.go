@@ -699,6 +699,10 @@ func (s *server) handleMerge(w http.ResponseWriter, r *http.Request) {
 	// reachability frontier -> upload -> register -> CAS); a lost race
 	// strands only an unreferenced immutable pack (invariant 1).
 	_, won, err := s.wcPublish(ctx, sc, repo.RepoID, &wcPlan{refName: targetRef, oldSHA: targetSHA, tips: tips}, commit)
+	if errors.Is(err, errPackQuotaExceeded) {
+		wmFail(w, http.StatusForbidden, "forbidden", err.Error(), req.TargetBranch, targetSHA)
+		return
+	}
 	if err != nil {
 		s.wmInternal(w, r, "publish merge", err)
 		return

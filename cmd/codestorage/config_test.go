@@ -472,6 +472,67 @@ func TestResolveServeConfigRateLimit(t *testing.T) {
 	}
 }
 
+func TestResolveServeConfigPackQuota(t *testing.T) {
+	base := func(extra map[string]string) func(string) string {
+		env := map[string]string{
+			"CODESTORAGE_PG_URL":      "postgres://x",
+			"CODESTORAGE_S3_URL":      "s3://x",
+			"CODESTORAGE_ORG":         "org1",
+			"CODESTORAGE_ORG_PUBKEYS": "/tmp/org.pub.pem",
+		}
+		for k, v := range extra {
+			env[k] = v
+		}
+		return mapEnv(env)
+	}
+
+	t.Run("unset-applies-default", func(t *testing.T) {
+		cfg, err := resolveServeConfig(base(nil), "", "", "/tmp/cache", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.packQuotaBytes != defaultPackQuotaBytes {
+			t.Fatalf("unset quota resolved to %d, want default %d", cfg.packQuotaBytes, defaultPackQuotaBytes)
+		}
+	})
+
+	t.Run("explicit-zero-disables", func(t *testing.T) {
+		cfg, err := resolveServeConfig(base(map[string]string{envPackQuota: "0"}), "", "", "/tmp/cache", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.packQuotaBytes != 0 {
+			t.Fatalf("explicit zero resolved to %d, want 0 (disabled)", cfg.packQuotaBytes)
+		}
+	})
+
+	t.Run("parse-through", func(t *testing.T) {
+		cfg, err := resolveServeConfig(base(map[string]string{envPackQuota: "1048576"}), "", "", "/tmp/cache", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.packQuotaBytes != 1<<20 {
+			t.Fatalf("resolved quota %d, want %d", cfg.packQuotaBytes, 1<<20)
+		}
+	})
+
+	for _, tc := range []struct{ name, val string }{
+		{"malformed", "plenty"},
+		{"negative", "-1"},
+		{"float", "1.5"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := resolveServeConfig(base(map[string]string{envPackQuota: tc.val}), "", "", "/tmp/cache", "")
+			if err == nil {
+				t.Fatalf("%s=%q resolved without error", envPackQuota, tc.val)
+			}
+			if !strings.Contains(err.Error(), envPackQuota) {
+				t.Fatalf("error %q does not name %s", err, envPackQuota)
+			}
+		})
+	}
+}
+
 func TestResolveServeConfigSweep(t *testing.T) {
 	base := func(extra map[string]string) func(string) string {
 		env := map[string]string{
