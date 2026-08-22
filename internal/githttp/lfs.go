@@ -582,6 +582,20 @@ func (s *Server) adoptLFSObject(ctx context.Context, repoID, key, oid string) er
 		return err
 	}
 	if count >= ref.MaxLFSObjectsPerRepo {
+		// At the boundary the count races a twin registering THIS key
+		// (Codex round 27): between the registered check above and this
+		// count, a concurrent identical upload on another replica can
+		// take the last slot with the very key being adopted — this
+		// request is then zero-growth, not over-cap. Re-read before
+		// failing; registration is terminal per key, so a true here is
+		// final.
+		registered, rerr := s.Store.HasLFSObject(ctx, repoID, key)
+		if rerr != nil {
+			return rerr
+		}
+		if registered {
+			return nil // the twin registered this same key: nothing to add
+		}
 		return ref.ErrLFSObjectCapExceeded
 	}
 	// Legacy blobs were written through presigned PUTs that bound no
@@ -1006,10 +1020,22 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target r
 			return
 		}
 		if count >= ref.MaxLFSObjectsPerRepo {
-			lfsError(w, http.StatusInsufficientStorage, fmt.Sprintf(
-				"repository LFS object count limit reached (%d objects stored, limit %d)",
-				count, ref.MaxLFSObjectsPerRepo))
-			return
+			// Boundary race twin of adoptLFSObject's (Codex round 27): a
+			// concurrent identical upload can register THIS key between
+			// the registered read above and this count, taking the last
+			// slot — the upload is then zero-growth, not over-cap.
+			registered, err = s.Store.HasLFSObject(ctx, repoID, key)
+			if err != nil {
+				log.Printf("lfs registry %s: %v", key, err)
+				lfsError(w, http.StatusInternalServerError, "object registry unavailable")
+				return
+			}
+			if !registered {
+				lfsError(w, http.StatusInsufficientStorage, fmt.Sprintf(
+					"repository LFS object count limit reached (%d objects stored, limit %d)",
+					count, ref.MaxLFSObjectsPerRepo))
+				return
+			}
 		}
 	}
 	dir, err := os.MkdirTemp("", "lfs-upload-*")

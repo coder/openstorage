@@ -948,6 +948,53 @@ func TestLFSPut_TwinRegistrationDuringBodyIsZeroGrowth(t *testing.T) {
 	}
 }
 
+// TestLFSCap_TwinRegistrationAtBoundaryIsZeroGrowth (Codex round 27): at
+// the object-cap boundary, a concurrent identical upload can register THIS
+// key between the registered read and the count read, consuming the last
+// slot — the request is then zero-growth, not over-cap, and must succeed
+// instead of 507ing during a successful identical upload. Covers both
+// single-key fast-fail sites: batch adoption of stored bytes and the
+// direct PUT.
+func TestLFSCap_TwinRegistrationAtBoundaryIsZeroGrowth(t *testing.T) {
+	old := ref.MaxLFSObjectsPerRepo
+	ref.MaxLFSObjectsPerRepo = 1
+	t.Cleanup(func() { ref.MaxLFSObjectsPerRepo = old })
+
+	content := []byte("boundary twin object")
+	oid := sha256Hex(content)
+	key := blob.LFSKey(lfsTestRepoID, oid)
+
+	t.Run("batch-adoption-of-stored-bytes", func(t *testing.T) {
+		srv, st, mint := newLFSQuotaServer(t, 0, time.Hour)
+		tok := mint(auth.ScopeGitWrite)
+		if err := srv.Blob.UploadFile(context.Background(), key, writeTempFile(t, content)); err != nil {
+			t.Fatal(err)
+		}
+		// The twin registers this key right after the first registered
+		// read, taking the cap's only slot.
+		srv.Store = &twinWinsStore{Store: st, key: key, size: int64(len(content))}
+		resp := decodeBatch(t, doLFS(t, srv, http.MethodPost, lfsBatchPath, "basic:"+tok,
+			batchBody("upload", oid, int64(len(content)))))
+		if resp.Objects[0].Error != nil {
+			t.Fatalf("boundary-raced adoption denied: %+v", resp.Objects[0].Error)
+		}
+		if resp.Objects[0].Actions != nil {
+			t.Fatalf("registered object still got an upload action: %+v", resp.Objects[0])
+		}
+	})
+
+	t.Run("direct-put", func(t *testing.T) {
+		srv, st, mint := newLFSQuotaServer(t, 0, time.Hour)
+		tok := mint(auth.ScopeGitWrite)
+		srv.Store = &twinWinsStore{Store: st, key: key, size: int64(len(content))}
+		w := doLFS(t, srv, http.MethodPut, "/"+lfsTestRepoURL+".git/info/lfs/objects/"+oid,
+			"basic:"+tok, string(content))
+		if w.Code != http.StatusOK {
+			t.Fatalf("boundary-raced PUT status = %d, body %s", w.Code, w.Body)
+		}
+	})
+}
+
 // statCountingBlob counts Stat calls (the PUT dedup probe).
 type statCountingBlob struct {
 	blob.BlobStore
