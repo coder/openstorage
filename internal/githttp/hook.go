@@ -28,7 +28,14 @@ const (
 	EnvOps        = "CODESTORAGE_GIT_OPS"
 	// EnvOrg names the org whose signing keys verify-sig loads. Shared with
 	// the serve config on purpose: the server sets it explicitly for hooks.
-	EnvOrg       = "CODESTORAGE_ORG"
+	EnvOrg = "CODESTORAGE_ORG"
+	// EnvAtomic marks the push `--atomic` (issue #28). githooks(5) exposes
+	// no atomic indicator, so the HTTP layer sniffs the wire capability
+	// (atomic.go) and sets this; pre-receive then evaluates the policy
+	// across ALL commands and denies before publication when any command
+	// is denied — git would abort every ref on the first update-hook
+	// denial anyway.
+	EnvAtomic    = "CODESTORAGE_GIT_ATOMIC"
 	EnvTestMode  = "CODESTORAGE_TEST_MODE"
 	EnvCrash     = "CODESTORAGE_TEST_CRASH"
 	EnvHookDelay = "CODESTORAGE_TEST_HOOK_DELAY_MS"
@@ -134,6 +141,7 @@ func preReceive(ctx context.Context) error {
 	if len(commands) == 0 {
 		return errors.New("pre-receive: git invoked hook with no commands")
 	}
+	atomicPush := os.Getenv(EnvAtomic) == "1"
 
 	var packFiles []string
 	if quarantine != "" {
@@ -156,6 +164,19 @@ func preReceive(ctx context.Context) error {
 				return fmt.Errorf("pre-receive: no quarantined pack and unknown object %s for %s", c.new, c.ref)
 			}
 		}
+		// No pack means nothing can leak, but an atomic push still
+		// evaluates policy as a unit: git aborts every ref on the first
+		// update-hook denial anyway, and denying here keeps an allowed
+		// command's already-committed PG CAS (e.g. a delete that ran
+		// before the denied one) from durably surviving a push git
+		// reports as wholly failed — the issue #28 durable-CAS twist.
+		if atomicPush {
+			for _, c := range commands {
+				if err := enforceRefPolicy(ctx, repo, c.ref, c.old, c.new); err != nil {
+					return atomicDenied(err)
+				}
+			}
+		}
 		return nil
 	}
 
@@ -167,7 +188,7 @@ func preReceive(ctx context.Context) error {
 	// the pack could only become a registered, unreachable,
 	// quota-consuming blob, so the whole push is refused before any
 	// upload. The update hook stays the per-ref policy authority.
-	if err := preReceivePolicyGate(ctx, repo, commands); err != nil {
+	if err := preReceivePolicyGate(ctx, repo, commands, atomicPush); err != nil {
 		return err
 	}
 
@@ -364,13 +385,25 @@ func preReceive(ctx context.Context) error {
 // work here exactly as in the update hook; verify-sig-policied winners are
 // verified twice, an accepted redundancy for failing closed.
 //
-// Known residuals (issue #28 family — reachability-based reconciliation):
-//   - `git push --atomic`: a justified mixed push whose denied command
-//     aborts the transaction can still register a pack no surviving ref
-//     needs (githooks(5) exposes no atomic indicator to server-side
-//     hooks). The durable-CAS twist halves the exposure: an allowed
-//     command's update hook that ran before the denial has already
-//     committed its PG CAS, so the ref survives durably.
+// atomicPush (issue #28, EnvAtomic) tightens the gate to the whole
+// command set: under `git push --atomic` receive-pack aborts EVERY ref
+// update on the first update-hook denial, so a mixed push's pack can only
+// end up registered yet unreachable — permanently, because registered
+// packs are not sweeper orphans and repack folds carry every registered
+// object forward (internal/jobs/repack.go). Denying the whole push before
+// publication changes no ref outcome git would have produced and stores
+// nothing. It also closes the durable-CAS twist: without it, an allowed
+// command whose update hook ran before the denial had already committed
+// its PG CAS, durably surviving a push git reports as wholly failed.
+//
+// Known residuals, all quota-counted (self-limiting):
+//   - an atomic push that passes this gate can still abort on a
+//     non-policy update failure (concurrent CAS conflict, or a keyring
+//     change between the pre-receive and update evaluations) after the
+//     pack is registered. A client retry re-sends the identical
+//     content-addressed pack, which dedups and becomes reachable on
+//     success; an abandoned retry leaves quota-counted junk. Closing
+//     this needs reachability accounting — issue #31 territory.
 //   - junk riders: a mixed push whose allowed command genuinely needs the
 //     pack still publishes ALL of the pack's objects, including ones only
 //     denied commands reference. Filtering by reachability from allowed
@@ -379,19 +412,17 @@ func preReceive(ctx context.Context) error {
 //     git:write token can burn the repo's quota with policy-ALLOWED
 //     garbage (push a large blob to a permitted branch, delete the
 //     branch). The quota bounds per-repo growth; it cannot police
-//     intra-repo goodwill among authorized writers.
-//
-// In both cases the stray bytes are quota-counted (self-limiting) and
-// their reclamation is reachability work: repack folds carry unreachable
-// objects forward by design (see internal/jobs/repack.go — a fold-time
-// reachability cut races in-flight pushes), so cleanup belongs to #28's
-// reconciliation design, not this gate.
-func preReceivePolicyGate(ctx context.Context, repo string, commands []refCommand) error {
+//     intra-repo goodwill among authorized writers. Retained-byte
+//     reclamation is issue #31's accounting work.
+func preReceivePolicyGate(ctx context.Context, repo string, commands []refCommand, atomicPush bool) error {
 	assertf(len(commands) > 0, "preReceivePolicyGate: no commands")
 	var firstErr error
 	needsPack := false
 	for _, c := range commands {
 		if err := enforceRefPolicy(ctx, repo, c.ref, c.old, c.new); err != nil {
+			if atomicPush {
+				return atomicDenied(err)
+			}
 			if firstErr == nil {
 				firstErr = err
 			}
@@ -405,6 +436,14 @@ func preReceivePolicyGate(ctx context.Context, repo string, commands []refComman
 		return nil
 	}
 	return fmt.Errorf("pre-receive: the quarantined pack is needed only by policy-denied ref updates, refusing pack publication (push the allowed updates separately): %w", firstErr)
+}
+
+// atomicDenied is the whole-push denial for an atomic push carrying a
+// policy-denied command. The message reaches the client over the sideband;
+// it names the remedy because the same refspecs may be fine without
+// --atomic (per-ref semantics let the allowed updates land).
+func atomicDenied(err error) error {
+	return fmt.Errorf("pre-receive: atomic push carries a policy-denied update, denying the whole push before publication (drop --atomic or the denied refspec to push the allowed updates): %w", err)
 }
 
 // updateHook enforces the JWT ref policy (first-match-wins), then performs

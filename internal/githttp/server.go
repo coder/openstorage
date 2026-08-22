@@ -328,6 +328,14 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 		defer gz.Close()
 		body = gz
 	}
+	// Atomic-capability sniff (issue #28, atomic.go): the wire request is
+	// the only place the server can learn a push is `--atomic` (githooks(5)
+	// exposes no indicator to hooks), and pre-receive needs that bit to
+	// deny mixed-policy atomic pushes before publication.
+	atomicPush := false
+	if service == "receive-pack" {
+		atomicPush, body = sniffAtomicPush(body)
+	}
 	// Pack-quota pressure log (issue #21, quota.go). Enforcement lives
 	// exclusively in pre-receive: only it sees the quarantined packs'
 	// content-addressed keys, so only it can tell a quota-breaching push
@@ -361,7 +369,20 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 	cmd := exec.CommandContext(r.Context(), "git", service, "--stateless-rpc", repoPath)
 	cmd.Env = os.Environ()
 	if service == "receive-pack" {
-		cmd.Env = append(cmd.Env,
+		// Never inherit EnvAtomic from the serve process environment
+		// (Codex round 2): the pre-receive hook trusts it as THIS
+		// request's atomic bit, so a stale operator-exported value would
+		// make every mixed-policy push denial-happy — and appending
+		// without stripping would not even override it, since duplicate
+		// env entries resolve first-match in Go children. os.Environ()
+		// returns a fresh copy, so the in-place filter aliases nothing.
+		env := cmd.Env[:0]
+		for _, kv := range cmd.Env {
+			if !strings.HasPrefix(kv, EnvAtomic+"=") {
+				env = append(env, kv)
+			}
+		}
+		cmd.Env = append(env,
 			EnvRepo+"="+target.key,
 			EnvOrg+"="+s.Org,
 		)
@@ -372,6 +393,9 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 			if s.PackReservationTTL > 0 {
 				cmd.Env = append(cmd.Env, EnvPackReservationTTL+"="+s.PackReservationTTL.String())
 			}
+		}
+		if atomicPush {
+			cmd.Env = append(cmd.Env, EnvAtomic+"=1")
 		}
 		// The refs claim is passed through raw (docs/02 tuple encoding);
 		// the update hook owns parsing and fails closed on malformed JSON.
