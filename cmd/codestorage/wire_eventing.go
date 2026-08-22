@@ -158,7 +158,7 @@ func buildServeEventing(ctx context.Context, ms meta.Store, dbURL, org, loopback
 			}
 			return upsync.RepoInfo{RepoID: r.RepoID, URL: r.URL}, nil
 		},
-		Events:   webhookSink{webhooks: whStore, enqueue: enqueueDelivery, logger: logger},
+		Events: webhookSink{webhooks: whStore, enqueue: enqueueDelivery, logger: logger},
 		// The push target is THIS process's own listener, never the
 		// external base URL (issue #45): the minted token verifies only
 		// against this process's in-memory loopback key, so a push routed
