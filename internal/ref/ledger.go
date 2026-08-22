@@ -454,6 +454,41 @@ RETURNING count`, repo).Scan(&count); err != nil {
 	})
 }
 
+// GuardedLFSDelete — see RefStore. The counter row lock is the
+// serialization point: RegisterLFSObject's first-registration path upserts
+// that row inside its transaction, so a registration either committed
+// before this lock (the registry re-read sees it → abort) or blocks until
+// this transaction commits (its writer-verify then republishes the bytes).
+func (s *PG) GuardedLFSDelete(ctx context.Context, repo, key string, del func(context.Context) error) (bool, error) {
+	assertf(repo != "" && key != "" && del != nil, "GuardedLFSDelete(%q, %q)", repo, key)
+	deleted := false
+	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO lfs_object_counts (repo, count) VALUES ($1, 0) ON CONFLICT DO NOTHING`, repo); err != nil {
+			return err
+		}
+		var n int64
+		if err := tx.QueryRow(ctx,
+			`SELECT count FROM lfs_object_counts WHERE repo = $1 FOR UPDATE`, repo).Scan(&n); err != nil {
+			return err
+		}
+		var registered bool
+		if err := tx.QueryRow(ctx,
+			`SELECT EXISTS (SELECT 1 FROM lfs_objects WHERE repo = $1 AND key = $2)`, repo, key).Scan(&registered); err != nil {
+			return err
+		}
+		if registered {
+			return nil // a verified upload won: nothing to delete
+		}
+		if err := del(ctx); err != nil {
+			return err
+		}
+		deleted = true
+		return nil
+	})
+	return deleted, err
+}
+
 // CountLFSObjects returns repo's registered LFS object count — an O(1)
 // counter-row read (issue #51; the LFS surface's fast-fail pre-checks call
 // it per upload, so it must not scan the attacker-growable object table).

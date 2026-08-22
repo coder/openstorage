@@ -5,6 +5,7 @@ package ref
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 )
 
@@ -133,6 +134,49 @@ func TestRegisterLFSObject_AtomicCap(t *testing.T) {
 		// Idempotent re-registration of the existing object at cap: fine.
 		if err := s.RegisterLFSObject(ctx, k.base(), first, 10); err != nil {
 			t.Fatalf("idempotent register at cap: %v", err)
+		}
+	})
+}
+
+// TestGuardedLFSDelete (Codex round 18): the mismatch delete runs only
+// while the key is provably unregistered, serialized against
+// registrations; a registered key aborts without running del, and a del
+// failure propagates without claiming deletion.
+func TestGuardedLFSDelete(t *testing.T) {
+	runRefBackends(t, func(t *testing.T, s Store) {
+		ctx := context.Background()
+		k := newLedgerKit(t, s)
+		key := lfsLedgerKey(k, "ffff")
+
+		ran := false
+		deleted, err := s.GuardedLFSDelete(ctx, k.base(), key, func(context.Context) error {
+			ran = true
+			return nil
+		})
+		if err != nil || !deleted || !ran {
+			t.Fatalf("unregistered delete = (%v, %v), ran=%v; want (true, nil, true)", deleted, err, ran)
+		}
+
+		// Registered key: del must never run.
+		if err := s.RegisterLFSObject(ctx, k.base(), key, 5); err != nil {
+			t.Fatal(err)
+		}
+		ran = false
+		deleted, err = s.GuardedLFSDelete(ctx, k.base(), key, func(context.Context) error {
+			ran = true
+			return nil
+		})
+		if err != nil || deleted || ran {
+			t.Fatalf("registered delete = (%v, %v), ran=%v; want (false, nil, false)", deleted, err, ran)
+		}
+
+		// del failure propagates, deleted stays false.
+		other := lfsLedgerKey(k, "abab")
+		deleted, err = s.GuardedLFSDelete(ctx, k.base(), other, func(context.Context) error {
+			return fmt.Errorf("backend wedged")
+		})
+		if err == nil || deleted {
+			t.Fatalf("failing delete = (%v, %v); want error and false", deleted, err)
 		}
 	})
 }

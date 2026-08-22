@@ -582,31 +582,27 @@ func (s *Server) adoptLFSObject(ctx context.Context, repoID, key, oid string, si
 		if !errors.Is(err, errLFSContentMismatch) {
 			return err
 		}
-		// Cross-replica guard (Codex round 16): another replica may have
-		// replaced the corrupt bytes with a verified upload after our
-		// download — its registration is the proof. Re-check the registry
-		// immediately before deleting; if a row appeared, the current
-		// bytes are verified-by-upload and our stale verdict must not
-		// touch them.
-		switch nowRegistered, rerr := s.Store.HasLFSObject(ctx, repoID, key); {
-		case rerr != nil:
-			return rerr
-		case nowRegistered:
-			return nil // replaced and registered by a concurrent verified upload
-		}
+		// Cross-replica coordination (Codex rounds 16+18): the delete runs
+		// inside GuardedLFSDelete, serialized against registrations — a
+		// concurrent verified upload either registered first (the guard
+		// aborts, its bytes stand) or blocks until the delete commits and
+		// then republishes via its post-registration writer verify
+		// (blob.EnsurePublished). No interleaving can leave a registered
+		// row pointing at deleted bytes. Bounded and detached from the
+		// client's connection like every cleanup.
 		dctx, dcancel := context.WithTimeout(context.WithoutCancel(ctx), lfsCleanupTimeout)
 		defer dcancel()
-		if derr := s.Blob.Delete(dctx, key); derr != nil && !errors.Is(derr, blob.ErrNotFound) {
+		deleted, derr := s.Store.GuardedLFSDelete(dctx, repoID, key, func(delCtx context.Context) error {
+			if err := s.Blob.Delete(delCtx, key); err != nil && !errors.Is(err, blob.ErrNotFound) {
+				return err
+			}
+			return nil
+		})
+		if derr != nil {
 			return fmt.Errorf("remove mismatched legacy object %s: %w", key, derr)
 		}
-		// Post-delete registry re-check: a registration that landed inside
-		// the tiny check-then-delete window means we removed verified
-		// bytes. Loudly logged; not data loss — the registered-but-missing
-		// state is exactly the zero-growth repair path, so the next touch
-		// (including this caller's own upload action) re-publishes the
-		// client's bytes verified.
-		if nowRegistered, rerr := s.Store.HasLFSObject(ctx, repoID, key); rerr == nil && nowRegistered {
-			log.Printf("lfs adopt %s: deleted a concurrently registered replacement (stale mismatch verdict); zero-growth repair will restore it", key)
+		if !deleted {
+			return nil // replaced and registered by a concurrent verified upload
 		}
 		log.Printf("lfs adopt %s: removed legacy blob failing content verification", key)
 		return errLFSContentMismatch

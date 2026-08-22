@@ -255,6 +255,29 @@ RETURNING count`, repo).Scan(&count); err != nil {
 	return nil
 }
 
+// GuardedLFSDelete — see the PG twin; BEGIN IMMEDIATE's single writer is
+// the serialization here.
+func (s *SQLite) GuardedLFSDelete(ctx context.Context, repo, key string, del func(context.Context) error) (bool, error) {
+	assertf(repo != "" && key != "" && del != nil, "GuardedLFSDelete(%q, %q)", repo, key)
+	tx, err := s.db.BeginTx(ctx, nil) // BEGIN IMMEDIATE via _txlock
+	if err != nil {
+		return false, fmt.Errorf("guarded lfs delete begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	var registered bool
+	if err := tx.QueryRowContext(ctx,
+		`SELECT EXISTS (SELECT 1 FROM lfs_objects WHERE repo = ? AND key = ?)`, repo, key).Scan(&registered); err != nil {
+		return false, err
+	}
+	if registered {
+		return false, tx.Commit() // a verified upload won: nothing to delete
+	}
+	if err := del(ctx); err != nil {
+		return false, err
+	}
+	return true, tx.Commit()
+}
+
 // CountLFSObjects returns repo's registered LFS object count — an O(1)
 // counter-row read (see the PG twin).
 func (s *SQLite) CountLFSObjects(ctx context.Context, repo string) (int64, error) {

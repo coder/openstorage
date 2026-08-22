@@ -200,6 +200,11 @@ func (s *SimRefStore) QuotaLedgerState(ctx context.Context, group []string, ttl 
 	return s.inner.QuotaLedgerState(ctx, group, ttl)
 }
 
+// GuardedLFSDelete delegates to the inner store.
+func (s *SimRefStore) GuardedLFSDelete(ctx context.Context, repo, key string, del func(context.Context) error) (bool, error) {
+	return s.inner.GuardedLFSDelete(ctx, repo, key, del)
+}
+
 // CountLFSObjects delegates to the inner store.
 func (s *SimRefStore) CountLFSObjects(ctx context.Context, repo string) (int64, error) {
 	return s.inner.CountLFSObjects(ctx, repo)

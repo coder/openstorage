@@ -223,12 +223,13 @@ func (s *Server) refreshUsage(repo string, f *usageFlight) {
 	close(f.done)
 }
 
-// packUsageBytes sums the sizes of every object under repo's PACK prefixes
-// (blob.PackUsageBytes, shared with the REST pack writers) — pack
-// admission's floor. Registered LFS bytes reach pack admission through the
-// usage counter, not this listing (see blob.PackUsageBytes).
+// packUsageBytes sums the sizes of every object under repo's pack AND LFS
+// prefixes (blob.StorageUsageBytes, shared with the REST pack writers):
+// pre-ledger LFS bytes are invisible to the usage counter until adopted,
+// so pack admission must floor on a listing that sees them (issue #51,
+// Codex round 18).
 func packUsageBytes(ctx context.Context, bl blob.BlobStore, repo string) (int64, error) {
-	return blob.PackUsageBytes(ctx, bl, repo)
+	return blob.StorageUsageBytes(ctx, bl, repo)
 }
 
 // cachedUsageFloor returns repo's storage usage floor for LFS admission,

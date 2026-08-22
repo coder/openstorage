@@ -89,6 +89,10 @@ func (s *countingStore) CountLFSObjects(context.Context, string) (int64, error) 
 	panic("Hydrate must never count LFS objects")
 }
 
+func (s *countingStore) GuardedLFSDelete(context.Context, string, string, func(context.Context) error) (bool, error) {
+	panic("Hydrate must never delete LFS blobs")
+}
+
 func (s *countingStore) QuotaLedgerState(context.Context, []string, time.Duration) (ref.PackQuotaLedgerState, error) {
 	panic("Hydrate must never read the quota ledger")
 }

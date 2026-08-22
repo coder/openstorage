@@ -296,11 +296,11 @@ func TestStorageUsageBytes(t *testing.T) {
 	if err != nil || got != 1177 {
 		t.Fatalf("StorageUsageBytes(repo_a+ephemeral) = (%d, %v), want (1177, nil)", got, err)
 	}
-	// Pack admission's floor excludes the LFS prefix (registered LFS
-	// bytes reach it via the usage counter — issue #51, Codex round 17).
+	// Pack admission floors on the SAME full measure (issue #51, Codex
+	// round 18): pre-ledger LFS bytes must gate pack pushes too.
 	got, err = packUsageBytes(context.Background(), bl, "repo_a")
-	if err != nil || got != 1170 {
-		t.Fatalf("packUsageBytes(repo_a) = (%d, %v), want (1170, nil) — packs only", got, err)
+	if err != nil || got != 1177 {
+		t.Fatalf("packUsageBytes(repo_a) = (%d, %v), want (1177, nil)", got, err)
 	}
 	// An empty prefix is zero usage, not an error.
 	got, err = packUsageBytes(context.Background(), bl, "repo_missing")

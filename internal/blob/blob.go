@@ -186,22 +186,16 @@ func StorageUsageBytes(ctx context.Context, b BlobStore, repo string) (int64, er
 	return total, err
 }
 
-// PackUsageBytes is StorageUsageBytes restricted to the PACK prefixes — the
-// usage floor for pack admission (pre-receive, REST pack writers). It skips
-// the LFS prefix deliberately (issue #51, Codex round 17): the LFS object
-// population is attacker-growable up to the object cap, so per-push
-// listings of it would amplify; registered LFS bytes gate pack admission
-// through the shared usage COUNTER instead (RegisterLFSObject credits it),
-// and the only LFS bytes the counter misses — pre-ledger objects and
-// orphaned uploads — stay floored at LFS admission time, whose listing is
-// cached.
-func PackUsageBytes(ctx context.Context, b BlobStore, repo string) (int64, error) {
-	assertf(b != nil && repo != "", "PackUsageBytes: missing blob store or repo")
-	base := QuotaRepoGroup(repo)[0]
-	total, err := usageBytes(ctx, b, repo, []string{PackPrefix(base), PacksRoot + base + "+"})
-	assertf(err != nil || total >= 0, "PackUsageBytes: negative total %d for %s", total, repo)
-	return total, err
-}
+// Deliberately NO packs-only floor variant for pack admission (issue #51,
+// Codex rounds 17–18): omitting the LFS prefix from the pack writers'
+// floor let a repository's PRE-LEDGER LFS bytes (rowless, so invisible to
+// the usage counter until adopted) admit a full quota of new packs on top.
+// The full listing per push is the accepted cost: it is bounded by the
+// per-repo LFS object cap (≤ ~101 pages) — the same order as the pack
+// prefix listing this path always did — runs once per heavyweight push
+// (the per-TRANSFER amplification lives on the LFS surface, which caches),
+// and the alternative (a sweeper-reconciled per-repo baseline) requires
+// exactly the per-repo sweep state the sweeper's design forbids.
 
 // usageBytes sums object sizes under the given prefixes, page-bounded.
 func usageBytes(ctx context.Context, b BlobStore, repo string, prefixes []string) (int64, error) {

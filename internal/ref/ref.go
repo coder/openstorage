@@ -155,6 +155,17 @@ type RefStore interface {
 	// #51): bytes bound row count at nothing, and registered objects are
 	// permanent, so their population needs its own bound.
 	CountLFSObjects(ctx context.Context, repo string) (int64, error)
+	// GuardedLFSDelete runs del (a blob deletion for a stored key whose
+	// bytes failed content verification) serialized against concurrent
+	// LFS registrations of the same repo (issue #51, Codex round 18):
+	// within one transaction it takes the lock RegisterLFSObject's
+	// counter update takes, re-reads the registry, and only if key is
+	// still unregistered runs del. A concurrent verified upload therefore
+	// either registered first (deleted=false, del never runs) or blocks
+	// until this commits — its post-registration blob.EnsurePublished
+	// then republishes its bytes, so no interleaving can leave a
+	// registered row pointing at deleted bytes.
+	GuardedLFSDelete(ctx context.Context, repo, key string, del func(context.Context) error) (deleted bool, err error)
 	// GetGeneration returns repo's mutation generation: 0 for a repo no
 	// mutation ever touched, strictly positive and monotonically increasing
 	// afterwards. It is an invalidation token over committed row changes,
