@@ -62,11 +62,27 @@ from the standard AWS chain (env vars, shared config, instance roles).
     versioning per run and silently downgrades every sweep to list-only when the check
     fails (only the explicit general-orphan opt-in checks at startup, where it fails the
     boot instead);
-  - `s3:CreateBucket`, currently even for a pre-provisioned bucket: startup idempotently
-    issues `CreateBucket` and treats only already-exists/owned-by-you answers as
-    success — an `AccessDenied` fails boot rather than probing the existing bucket
-    ([#48](https://github.com/coder/code-storage/issues/48) tracks a least-privilege
-    probe).
+  - `s3:CreateBucket` — only if the bucket should be auto-provisioned at first boot. A
+    pre-provisioned bucket needs no create permission: startup still issues
+    `CreateBucket` first, but on `AccessDenied` it probes the bucket (`HeadBucket`,
+    covered by `s3:ListBucket` above) and boots when it is reachable. A denied create
+    with an unreachable bucket stays boot-fatal, naming both errors.
+
+- **Pin S3 access to your account (AWS).** The server trusts whatever bucket the
+  configured name resolves to — a pre-provisioned bucket is accepted owner-blind, and
+  the create path has always tolerated `BucketAlreadyExists` (a name owned by someone
+  else). AWS bucket names are global: a deleted bucket name can be re-registered by a
+  third party, who can even grant your replica role access to capture your packs. Add an
+  `aws:ResourceAccount` condition to the role's S3 statements so the startup probe *and*
+  every data operation fail closed outside your account:
+
+  ```json
+  "Condition": { "StringEquals": { "aws:ResourceAccount": "<your-account-id>" } }
+  ```
+
+  Self-hosted MinIO has no shared global namespace, so this applies to AWS (and
+  AWS-compatible multi-tenant) deployments. Application-level expected-owner enforcement
+  is tracked in [#58](https://github.com/coder/code-storage/issues/58).
 
 - Packs are immutable and content-addressed: the server only ever writes new keys and —
   through the sweeper's destructive modes — deletes provably-unreferenced ones. The bytes
