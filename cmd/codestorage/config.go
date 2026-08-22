@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -30,6 +31,11 @@ const (
 	envDataDir    = "CODESTORAGE_DATA_DIR"
 	envRateRPS    = "CODESTORAGE_RATE_RPS"
 	envRateBurst  = "CODESTORAGE_RATE_BURST"
+
+	// Trusted-proxy allowlist for rate-limit client identity (issue #30):
+	// comma-separated CIDR prefixes (bare IPs accepted as single-address
+	// entries). Unset keeps RemoteAddr-only keying.
+	envTrustedProxies = "CODESTORAGE_TRUSTED_PROXIES"
 
 	// Per-repo pack-bytes quota on the git surface (issue #21): receive-pack
 	// refuses pushes that would take a repo's packs/ prefix past this many
@@ -114,6 +120,13 @@ type serveConfig struct {
 	// means disabled.
 	rateRPS   float64
 	rateBurst int
+
+	// trustedProxies is the reverse-proxy allowlist for rate-limit client
+	// identity (issue #30): when the TCP peer is inside one of these
+	// prefixes, both limiters key buckets on the rightmost untrusted
+	// X-Forwarded-For hop instead of RemoteAddr. Empty keeps
+	// RemoteAddr-only keying (the default).
+	trustedProxies []netip.Prefix
 
 	// packQuotaBytes is the per-repo pack-bytes quota on the git surface
 	// (issue #21); 0 disables enforcement.
@@ -229,6 +242,10 @@ func resolveServeConfig(getenv func(string) string, flagListen, flagAddr, flagCa
 	if err != nil {
 		return serveConfig{}, err
 	}
+	cfg.trustedProxies, err = resolveTrustedProxies(getenv)
+	if err != nil {
+		return serveConfig{}, err
+	}
 	cfg.packQuotaBytes, err = resolvePackQuota(getenv)
 	if err != nil {
 		return serveConfig{}, err
@@ -289,6 +306,56 @@ func resolveRateLimit(getenv func(string) string) (float64, int, error) {
 		return 0, 0, fmt.Errorf("%s must be set (>= 1) when %s is set", envRateBurst, envRateRPS)
 	}
 	return rps, burst, nil
+}
+
+// resolveTrustedProxies parses CODESTORAGE_TRUSTED_PROXIES: a
+// comma-separated CIDR allowlist (bare IPs accepted as single-address
+// entries) of reverse proxies whose forwarded client identity both rate
+// limiters may trust (issue #30). Fail-fast semantics matching
+// resolveRateLimit: malformed, empty, or zone-scoped entries error naming
+// the env var — validated even while rate limiting is disabled, so a typo
+// surfaces at startup rather than when limits are later enabled. Unset
+// means no trusted proxies (RemoteAddr-only keying, the default).
+func resolveTrustedProxies(getenv func(string) string) ([]netip.Prefix, error) {
+	assertf(getenv != nil, "resolveTrustedProxies: nil getenv")
+	raw := getenv(envTrustedProxies)
+	if raw == "" {
+		return nil, nil
+	}
+	var prefixes []netip.Prefix
+	for _, entry := range strings.Split(raw, ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			return nil, fmt.Errorf("%s: empty entry in %q", envTrustedProxies, raw)
+		}
+		if p, err := netip.ParsePrefix(entry); err == nil {
+			// Normalize IPv4-mapped prefixes (::ffff:a.b.c.d/N) to IPv4:
+			// matching unmaps peer addresses, so a stored 4-in-6 prefix
+			// would never match anything (Codex round 1). Below /96 the
+			// entry covers more than the mapped-IPv4 space and has no
+			// IPv4 equivalent — reject rather than store dead config.
+			if p.Addr().Is4In6() {
+				if p.Bits() < 96 {
+					return nil, fmt.Errorf("%s: IPv4-mapped prefix %q needs at least /96 (use an IPv4 CIDR or a real IPv6 range)", envTrustedProxies, entry)
+				}
+				p = netip.PrefixFrom(p.Addr().Unmap(), p.Bits()-96)
+			}
+			prefixes = append(prefixes, p)
+			continue
+		}
+		addr, err := netip.ParseAddr(entry)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %q is neither a CIDR prefix nor an IP address", envTrustedProxies, entry)
+		}
+		if addr.Zone() != "" {
+			// netip.PrefixFrom on a zoned address yields the zero Prefix.
+			return nil, fmt.Errorf("%s: %q must not carry a zone", envTrustedProxies, entry)
+		}
+		// Unmap so an IPv4-mapped spelling still matches IPv4 peers.
+		addr = addr.Unmap()
+		prefixes = append(prefixes, netip.PrefixFrom(addr, addr.BitLen()))
+	}
+	return prefixes, nil
 }
 
 // resolvePackQuota parses CODESTORAGE_PACK_QUOTA_BYTES (issue #21).
