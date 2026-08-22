@@ -46,8 +46,11 @@ from the standard AWS chain (env vars, shared config, instance roles).
   already-exists/owned-by-you answers as success — an `AccessDenied` fails boot rather
   than probing the existing bucket
   ([#48](https://github.com/coder/code-storage/issues/48) tracks a least-privilege
-  probe). Also grant `s3:GetBucketVersioning` if you enable delete-mode sweeping (its
-  startup guard must verify versioning state).
+  probe). Also grant `s3:GetBucketVersioning` — it is needed **by default**: superseded
+  reaping is on out of the box and re-checks versioning state per run, silently
+  downgrading every sweep to list-only when the check fails (superseded packs and their
+  quota usage then linger indefinitely). Only the explicit general-orphan delete opt-in
+  performs the check at startup.
 
 - Packs are immutable and content-addressed: the server only ever writes new keys and —
   through the sweeper's destructive modes — deletes provably-unreferenced ones. Nothing

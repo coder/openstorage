@@ -43,8 +43,9 @@ codestorage list-packs --repo repo_01k5abc...   # takes the server-generated Rep
 `CODESTORAGE_S3_URL`/`CODESTORAGE_PG_URL` (or `--data-dir` in local mode) from the
 environment — see the [CLI reference](../reference/cli.md#codestorage-list-packs).
 
-Fleet-wide, the periodic [sweep report](#reading-a-sweep-report) is the storage census:
-live vs. orphan counts and bytes, per run.
+Fleet-wide, the periodic [sweep report](#reading-a-sweep-report) counts live vs. orphan
+blobs per run — but totals bytes for orphan candidates only. For live byte usage, use
+`list-packs` (above) or your blob-store metrics.
 
 ## Background repack
 
