@@ -29,6 +29,8 @@ never a silently-applied default.
 | [`CODESTORAGE_SECRETS_MODE`](#codestorage_secrets_mode) | `encrypt` | `decrypt-only` stages the key fleet-wide before encrypted writes begin |
 | [`CODESTORAGE_PACK_QUOTA_BYTES`](#codestorage_pack_quota_bytes) | 10 GiB | Per-repo pack-bytes quota (`0` disables) |
 | [`CODESTORAGE_PACK_RESERVATION_TTL`](#codestorage_pack_reservation_ttl) | `1h` | Lifetime of a crashed writer's quota reservation |
+| [`CODESTORAGE_MAX_PUSH_BYTES`](#codestorage_max_push_bytes) | 2 × pack quota | Decoded-byte cap on one git push (`0` disables) |
+| [`CODESTORAGE_VERIFY_SIG_BUDGET`](#codestorage_verify_sig_budget) | `10000` | Per-push `verify-sig` verified-commit budget (`0` disables) |
 | [`CODESTORAGE_SWEEP_INTERVAL`](#codestorage_sweep_interval) | `1h` | Orphan-pack sweep cadence (`0` disables sweeping) |
 | [`CODESTORAGE_SWEEP_AGE_THRESHOLD`](#codestorage_sweep_age_threshold) | `24h` | Minimum blob age before an unregistered pack counts as an orphan |
 | [`CODESTORAGE_SWEEP_DELETE_ENABLED`](#codestorage_sweep_delete_enabled) | `false` | Opt-in: actually delete general orphans (list-only otherwise) |
@@ -318,6 +320,42 @@ periodic pruning of expired rows is garbage collection, not what re-opens headro
 - Must comfortably exceed the longest plausible server-side pack upload — the default
   clears a default-quota-sized (10 GiB) upload at ~3 MB/s.
 
+## Push work bounds
+
+### `CODESTORAGE_MAX_PUSH_BYTES`
+
+Decoded-byte cap on one git push: a `git-receive-pack` request whose body — after any
+`Content-Encoding: gzip` decode, so compressed streams cannot smuggle a larger payload —
+exceeds this many bytes is rejected with `413` and a JSON error envelope **before** the
+stream reaches `git receive-pack`. Nothing is quarantined on local disk, published, or
+registered. This is the native pre-storage push bound
+([#55](https://github.com/coder/code-storage/issues/55)); the pack quota above bounds
+*retained* storage and runs only after a push has fully streamed to the replica's disk.
+
+- **Default:** 2 × [`CODESTORAGE_PACK_QUOTA_BYTES`](#codestorage_pack_quota_bytes) — a
+  push cannot legitimately need more than quota admission would accept, plus protocol
+  overhead. Disabling the quota (`0`) also disables the derived cap; set this variable
+  explicitly to keep a cap without a quota. **`0` disables the cap**; negative or
+  malformed values are startup errors.
+- Applies to git pushes only, including the upstream-sync worker's loopback pushes.
+  Fetches/clones (`upload-pack`) and LFS object transfers are unaffected.
+
+### `CODESTORAGE_VERIFY_SIG_BUDGET`
+
+Per-push budget for `verify-sig` signature verifications
+([#59](https://github.com/coder/code-storage/issues/59)): the maximum number of commits
+one push may verify — each verification spawns a `git verify-commit` subprocess — across
+all its refs, pre-receive evaluation and update hooks combined. A push that would exceed
+the remaining budget is rejected whole, fail-closed, **before** the excess verifications
+run, with an error naming this variable.
+
+- **Default:** `10000`. **`0` disables the budget**; negative or malformed values are
+  startup errors.
+- The budget is charged per unique commit actually verified: within one push, verdicts
+  are cached per commit and deduplicated across refs pushed to the same tip, and branch
+  creations verify only commits not already reachable from existing refs — so pushing
+  many refs at an existing tip costs nothing.
+
 ## Maintenance jobs
 
 Background jobs run through a queue seam: durable [River](https://riverqueue.com) jobs on
@@ -388,13 +426,15 @@ Variables outside the operator surface, listed for completeness — never set th
 
 - `CODESTORAGE_GIT_REPO`, `CODESTORAGE_GIT_REFS_POLICY`, `CODESTORAGE_GIT_OPS`,
   `CODESTORAGE_GIT_ATOMIC`, `CODESTORAGE_GIT_PACK_QUOTA`,
-  `CODESTORAGE_GIT_PACK_RESERVATION_TTL` — per-request plumbing the server sets for the
+  `CODESTORAGE_GIT_PACK_RESERVATION_TTL`, `CODESTORAGE_GIT_VERIFY_STATE`,
+  `CODESTORAGE_GIT_VERIFY_SIG_BUDGET` — per-request plumbing the server sets for the
   `codestorage hook` subprocess git re-execs.
 - `CODESTORAGE_ASKPASS_USERNAME`, `CODESTORAGE_ASKPASS_PASSWORD` — set by the upstream-sync
   worker for its own git credential-askpass subprocess.
 - `CODESTORAGE_TEST_MODE`, `CODESTORAGE_TEST_CRASH`, `CODESTORAGE_TEST_CAS_DROP`,
-  `CODESTORAGE_TEST_CAS_DROP_HARD`, `CODESTORAGE_TEST_HOOK_DELAY_MS` — crash/fault
-  injection for the e2e suites; the server refuses test-mode requests outside test mode.
+  `CODESTORAGE_TEST_CAS_DROP_HARD`, `CODESTORAGE_TEST_HOOK_DELAY_MS`,
+  `CODESTORAGE_TEST_VERIFY_SPAWN_LOG` — crash/fault injection and observability knobs
+  for the e2e suites; the server refuses test-mode requests outside test mode.
 - `CODESTORAGE_TEST_BACKEND`, `CODESTORAGE_SDK_DIR` — test-lane selection (see the
   [testing notes](../11-local-backends-implementation-notes.md)) and the SDK-compatibility
   suite's vendor checkout location.
