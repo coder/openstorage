@@ -25,6 +25,9 @@ func TestTargetGuardRejectsDeniedDialTargets(t *testing.T) {
 		"172.16.0.1",             // RFC 1918 172.16/12 lower bound
 		"172.31.255.254",         // RFC 1918 172.16/12 upper bound
 		"192.168.1.1",            // RFC 1918 192.168/16
+		"100.64.0.1",             // RFC 6598 shared lower bound
+		"100.100.100.200",        // RFC 6598 shared internal target
+		"100.127.255.254",        // RFC 6598 shared upper bound
 		"169.254.1.1",            // IPv4 link-local
 		"fe80::1",                // IPv6 link-local
 		"fc00::1",                // IPv6 ULA lower half
@@ -289,6 +292,7 @@ func TestTargetGuardAllowPrivateScope(t *testing.T) {
 	admitted := []string{
 		"127.0.0.1",
 		"10.0.0.1",
+		"100.64.0.1",
 		"169.254.1.1",
 		"fe80::1",
 		"fc00::1",

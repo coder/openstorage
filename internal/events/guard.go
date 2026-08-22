@@ -63,6 +63,10 @@ var (
 	// hatch enables internal webhook receivers, not instance credentials.
 	metadataV4 = netip.MustParseAddr("169.254.169.254")
 	metadataV6 = netip.MustParseAddr("fd00:ec2::254")
+	// RFC 6598 shared address space is non-public even though Go's
+	// IsGlobalUnicast reports true. Internal deployments may opt into it
+	// through AllowPrivate alongside RFC 1918.
+	sharedV4 = netip.MustParsePrefix("100.64.0.0/10")
 )
 
 // deniedReason classifies ip against the delivery deny-list, returning ""
@@ -96,6 +100,10 @@ func (g TargetGuard) deniedReason(ip netip.Addr) string {
 		// (fc00::/7).
 		if !g.AllowPrivate {
 			return "private address"
+		}
+	case sharedV4.Contains(ip):
+		if !g.AllowPrivate {
+			return "shared address"
 		}
 	case ip.IsLinkLocalUnicast():
 		// 169.254/16 and fe80::/10 (except metadata above).

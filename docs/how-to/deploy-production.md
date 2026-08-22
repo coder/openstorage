@@ -259,10 +259,10 @@ exactly):
 
 Webhook deliveries use a native SSRF guard. By default, every attempt resolves the
 registered hostname at dial time and fails closed unless **every** answer is a public,
-global-unicast address. Loopback, RFC 1918, link-local, IPv6 ULA, unspecified, multicast,
-broadcast, and cloud-metadata targets are denied; IPv4-mapped IPv6 addresses are normalized
-before classification. The client connects to the vetted IP literal, opens a fresh
-connection for every attempt, ignores environment HTTP proxies, and never follows redirects.
+global-unicast address. Loopback, RFC 1918, RFC 6598 shared, link-local, IPv6 ULA,
+unspecified, multicast, broadcast, and cloud-metadata targets are denied; IPv4-mapped IPv6
+addresses are normalized before classification. The client connects to the vetted IP literal,
+opens a fresh connection for every attempt, ignores environment HTTP proxies, and never follows redirects.
 A denial is an ordinary delivery failure, so the configured queue backend applies its normal
 retry and dead-letter/discard behavior instead of crashing the worker.
 
@@ -272,8 +272,9 @@ unavailable or change later; the dial-time check is authoritative, and resolutio
 empty answers, or mixed allowed/denied answer sets fail closed.
 
 For deployments that intentionally deliver to internal receivers, set
-`CODESTORAGE_WEBHOOK_ALLOW_PRIVATE=true`. This admits loopback, RFC 1918, link-local, and ULA
-targets and emits a startup warning. Cloud metadata (`169.254.169.254` and
+`CODESTORAGE_WEBHOOK_ALLOW_PRIVATE=true`. This admits loopback, RFC 1918, RFC 6598
+shared, link-local, and ULA targets and emits a startup warning. Cloud metadata
+(`169.254.169.254` and
 `fd00:ec2::254`), malformed/non-routable targets, and redirects remain blocked. Keep network
 egress controls as defense in depth, especially where other workloads share the replica
 identity or network policy.
