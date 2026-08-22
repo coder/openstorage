@@ -139,13 +139,28 @@ func (q *Local) runRepack(repo string) {
 		// Execution slot: bounds aggregate fold work across repos. A
 		// waiter unblocks on Close and exits without folding (queued
 		// local work dies with the process, the documented trade-off).
-		select {
-		case q.repackSem <- struct{}{}:
-		case <-q.repackDone:
+		// Go picks RANDOMLY among ready select cases, so a free slot can
+		// win over the closed done channel — recheck closure after
+		// acquiring, or shutdown could sit through full fold batches it
+		// meant to discard.
+		exit := func() {
 			q.mu.Lock()
 			delete(q.repacking, repo)
 			delete(q.repackPending, repo)
 			q.mu.Unlock()
+		}
+		select {
+		case q.repackSem <- struct{}{}:
+			q.mu.Lock()
+			closed := q.closed
+			q.mu.Unlock()
+			if closed {
+				<-q.repackSem
+				exit()
+				return
+			}
+		case <-q.repackDone:
+			exit()
 			return
 		}
 		folded, err := q.repacker.Repack(context.Background(), repo)

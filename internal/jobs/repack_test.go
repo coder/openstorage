@@ -1206,6 +1206,76 @@ func TestLocalQueue_RepackWorkersCapped(t *testing.T) {
 	q.Close()
 }
 
+// TestLocalQueue_CloseSkipsParkedFolds pins the round-19 finding: Go picks
+// randomly among ready select cases, so a parked worker can win a free
+// semaphore slot over the closed done channel — it must recheck closure
+// after acquiring and exit WITHOUT folding, or Close would sit through
+// fold batches it meant to discard.
+func TestLocalQueue_CloseSkipsParkedFolds(t *testing.T) {
+	f := newRepackFixture(t)
+	ctx := context.Background()
+
+	gate := make(chan struct{})
+	var mu stdsync.Mutex
+	folds := 0
+	r := NewRepacker(f.store, f.blobs, func(ctx context.Context, repo string, packs []ref.Pack) (string, error) {
+		mu.Lock()
+		folds++
+		mu.Unlock()
+		<-gate
+		return "", errors.New("gated")
+	}, slog.New(slog.DiscardHandler))
+	deliverer := &events.Deliverer{Webhooks: stubWebhooks{}, Logger: slog.New(slog.DiscardHandler)}
+	q := NewLocal(deliverer, func(context.Context, sync.Job) error { return nil }, r, slog.New(slog.DiscardHandler))
+
+	// Fill every slot plus park several waiters.
+	seed := filepath.Join(t.TempDir(), "seed.pack")
+	if err := os.WriteFile(seed, []byte("tiny"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	total := localRepackWorkers + 6
+	for i := range total {
+		repo := fmt.Sprintf("closeskip%d", i)
+		packs := []ref.Pack{{ID: "a", Key: blob.PackKey(repo, "aaaa")}, {ID: "b", Key: blob.PackKey(repo, "bbbb")}}
+		for _, p := range packs {
+			if err := f.blobs.UploadFile(ctx, p.Key, seed); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := f.store.RegisterPacks(ctx, repo, packs); err != nil {
+			t.Fatal(err)
+		}
+		if err := q.EnqueueRepack(ctx, repo); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Wait for the executing set to saturate the slots.
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		mu.Lock()
+		cur := folds
+		mu.Unlock()
+		if cur >= localRepackWorkers {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("folds started = %d, want the cap %d", cur, localRepackWorkers)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	// Close with parked waiters; release the executing folds concurrently
+	// (Close blocks on wg until they finish). Parked waiters must exit
+	// WITHOUT folding, whichever select case wins their wakeup.
+	go func() { time.Sleep(50 * time.Millisecond); close(gate) }()
+	q.Close()
+	mu.Lock()
+	got := folds
+	mu.Unlock()
+	if got != localRepackWorkers {
+		t.Fatalf("folds executed = %d, want exactly the %d in flight at Close (parked waiters must be discarded)", got, localRepackWorkers)
+	}
+}
+
 // TestNormalizeCtxErr pins the deadline-classification identity (security
 // round 14): CommandContext kills an over-budget git subprocess, whose raw
 // *exec.ExitError ("signal: killed") does NOT match
