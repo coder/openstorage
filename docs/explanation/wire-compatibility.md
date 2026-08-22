@@ -47,8 +47,10 @@ namespaces), and [docs/06](../06-webhooks.md) (webhooks). By feature group:
 
 Upstream renamed several parameters and body fields over time; SDKs in the wild still
 send the old spellings. The backend accepts exactly the documented deprecated aliases —
-no invented ones. On conflict the **current spelling wins**, and every supplied spelling
-must still validate (a malformed value in either is a `400`, never silently ignored):
+no invented ones. On conflict the **current spelling wins** and the losing duplicate is
+ignored rather than independently validated — with one deliberate exception: boolean
+*query* aliases shape-validate both spellings, so a request that `400`d on a malformed
+bool before the alias existed keeps `400`ing:
 
 | Endpoint | Current | Deprecated alias |
 |---|---|---|
@@ -95,8 +97,13 @@ deployment serves **one organization**, configured at boot
 [`CODESTORAGE_ORG_PUBKEYS`](../reference/configuration.md#codestorage_org_pubkeys)).
 
 For clients this is invisible — tokens carry the same `iss`/`repo`/`scopes` claims either
-way, and a token whose `iss` doesn't match the deployment's org is rejected exactly as an
-unknown org would be upstream. What changes is operations: org onboarding and signing-key
+way. The git smart-HTTP surface rejects any token whose `iss` is not the served org
+outright (`403`). The REST surface scopes every request to the token's issuer instead:
+with a single org row in the database — the normal state — an unknown issuer simply
+fails verification, but org rows retained from an earlier `CODESTORAGE_ORG` value stay
+addressable by their own tokens until removed
+([#47](https://github.com/coder/code-storage/issues/47) tracks aligning this with the
+git surface). What changes is operations: org onboarding and signing-key
 registration are your deployment configuration (env + CLI) rather than a vendor control
 plane, and serving multiple orgs means multiple deployments.
 

@@ -42,14 +42,18 @@ The database is the authority for refs, metadata, quota accounting, and the dura
 from the standard AWS chain (env vars, shared config, instance roles).
 
 - Packs are immutable and content-addressed: the server only ever writes new keys and —
-  when sweeping is explicitly enabled — deletes provably-unreferenced ones. Nothing is
-  overwritten in place.
-- **Decide on bucket versioning up front.** Delete-mode sweeping
+  through the sweeper's destructive modes — deletes provably-unreferenced ones. Nothing
+  is overwritten in place.
+- **Decide on bucket versioning up front.** Destructive sweeping and versioning don't
+  mix: deletes only write delete markers while every version stays stored and billed.
+  The general-orphan delete opt-in
   ([`CODESTORAGE_SWEEP_DELETE_ENABLED`](../reference/configuration.md#codestorage_sweep_delete_enabled))
-  refuses to start against a versioned or versioning-suspended bucket, because deletes
-  would only write delete markers while every version stays stored and billed. List-only
-  sweeping (the default) works with any bucket. See the
-  [storage lifecycle guide](storage-lifecycle-and-sweeping.md).
+  therefore refuses to start against a versioned or versioning-suspended bucket, and the
+  **default-on** superseded reaping
+  ([`CODESTORAGE_SWEEP_DELETE_SUPERSEDED`](../reference/configuration.md#codestorage_sweep_delete_superseded))
+  — which does delete repack-superseded blobs — downgrades itself to list-only per run
+  via a runtime guard. On a versioned bucket, either disable both modes or accept
+  report-only sweeps. See the [storage lifecycle guide](storage-lifecycle-and-sweeping.md).
 
 ## Replica configuration
 
