@@ -5,8 +5,11 @@
 packs) — and proof that a write through one node is immediately visible through the other.
 
 > **This is a development stack, not deployment guidance.** It uses default credentials,
-> publishes the backing-service ports, and speaks plain HTTP. For a hardened deployment
-> (TLS, trusted proxies, rolling upgrades, key rotation), follow the
+> publishes the backing-service ports, and speaks plain HTTP. Upstream mirror sync
+> (`pull-upstream`) is not functional here: each node's `CODESTORAGE_BASE_URL` is the
+> **host-facing** URL (`http://127.0.0.1:808x`), which the sync worker cannot reach from
+> inside its own container, so sync jobs fail while everything else works. For a hardened
+> deployment (TLS, trusted proxies, rolling upgrades, key rotation), follow the
 > [production deployment guide](deploy-production.md) — the topology is the same, only the
 > hardening differs.
 

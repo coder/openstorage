@@ -122,12 +122,17 @@ repositories that read endpoints and git smart-HTTP serve from. It is set with t
 - **Give each replica its own local directory** on fast disk. Never share one directory
   between replicas (hydration locking assumes local `flock` semantics), and never mount it
   on network storage.
-- Size it for your working set: a cold replica re-downloads the packs of each repository
-  it serves on first access ("hydration"), keyed by a per-repository generation counter
-  so warm replicas answer reads with a single database point-read. Losing the directory
-  is safe — the next request rebuilds it.
-- An emptied cache after a node replacement therefore shows as a burst of S3 reads and
-  slower first requests, not errors.
+- A cold replica re-downloads the packs of each repository it serves on first access
+  ("hydration"), keyed by a per-repository generation counter so warm replicas answer
+  reads with a single database point-read. Losing the directory is safe — the next
+  request rebuilds it.
+- **The cache only grows — there is no eviction.** A replica retains every pack it ever
+  hydrated, including packs long since superseded by repack and reaped from the bucket,
+  and repositories it no longer serves. Working-set sizing alone is not enough: monitor
+  the directory and periodically clear it (or replace nodes), which is always safe and
+  costs only re-hydration.
+- An emptied cache therefore shows as a burst of S3 reads and slower first requests, not
+  errors.
 
 ## Concurrent boot: schema setup and migrations
 
