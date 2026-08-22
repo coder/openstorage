@@ -225,3 +225,48 @@ func (s *Server) refreshUsage(repo string, f *usageFlight) {
 func packUsageBytes(ctx context.Context, bl blob.BlobStore, repo string) (int64, error) {
 	return blob.StorageUsageBytes(ctx, bl, repo)
 }
+
+// cachedUsageFloor returns repo's storage usage floor for LFS admission,
+// serving a ≤usageCacheTTL-stale cached listing and coalescing concurrent
+// misses into one flight (issue #51, Codex round 15: fresh per-transfer
+// listings amplify — a 100-object batch cost ~201 full prefix scans).
+// Staleness is safe FOR THE FLOOR: every byte registered since the ledger
+// exists is covered by the usage counter, and in-flight uploads by their
+// reservations, regardless of this value; the floor exists for pre-ledger
+// bytes (fixed) and orphaned uploads, whose admission visibility this
+// cache delays by at most its TTL — a bounded stretch of the ledger's
+// documented orphan-window overshoot. Unlike peekUsage (observational,
+// never blocks), admission needs a value: a cold entry lists inline,
+// concurrent cold callers share the leader's flight.
+func (s *Server) cachedUsageFloor(ctx context.Context, repo string) (int64, error) {
+	assertf(repo != "", "cachedUsageFloor: empty repo")
+	c := &s.usage
+	c.mu.Lock()
+	if e, ok := c.entries[repo]; ok && !c.clockNow().After(e.expires) {
+		c.mu.Unlock()
+		return e.usage, nil
+	}
+	f, leader := c.inflight[repo], false
+	if f == nil {
+		f = &usageFlight{done: make(chan struct{})}
+		if c.inflight == nil {
+			c.inflight = make(map[string]*usageFlight)
+		}
+		c.inflight[repo] = f
+		leader = true
+	}
+	c.mu.Unlock()
+	if leader {
+		// Synchronous: the admission decision needs the result. Callers
+		// are bounded by connection concurrency, so this does not need
+		// the background pool (usageRefreshSlots) that caps peekUsage's
+		// fire-and-forget refreshes.
+		s.refreshUsage(repo, f)
+	}
+	select {
+	case <-f.done:
+		return f.usage, f.err
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
+}

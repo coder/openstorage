@@ -371,14 +371,22 @@ func (s *Server) lfsBatchUpload(r *http.Request, repoElem string, target repoTar
 			// sweep would classify referenced objects as reapable, so a
 			// swallowed adoption failure here would let the client commit
 			// a pointer to a reapable blob).
-			if aerr := s.adoptLFSObject(ctx, repoID, key, size); errors.Is(aerr, ref.ErrLFSObjectCapExceeded) {
+			switch aerr := s.adoptLFSObject(ctx, repoID, key, obj.OID, size); {
+			case aerr == nil:
+				continue
+			case errors.Is(aerr, ref.ErrLFSObjectCapExceeded):
 				lfsObjectFail(&results[i], http.StatusInsufficientStorage, fmt.Sprintf(
 					"repository LFS object count limit reached (limit %d)", ref.MaxLFSObjectsPerRepo))
-			} else if aerr != nil {
+				continue
+			case errors.Is(aerr, errLFSContentMismatch):
+				// A mismatched legacy blob was removed: the object is now
+				// genuinely missing — fall through and issue an upload
+				// action so the client's correct bytes arrive verified.
+			default:
 				log.Printf("lfs adopt %s: %v", key, aerr)
 				lfsObjectFail(&results[i], http.StatusInternalServerError, "object registration failed, retry")
+				continue
 			}
-			continue
 		case !errors.Is(err, blob.ErrNotFound):
 			log.Printf("lfs stat %s: %v", key, err)
 			lfsObjectFail(&results[i], http.StatusInternalServerError, "object storage unavailable")
@@ -452,7 +460,7 @@ func (s *Server) lfsBatchUpload(r *http.Request, repoElem string, target repoTar
 			denyAll := func(code int, msg string) []lfsObjectResult {
 				return s.denyAllNeeded(order, needIdx, results, code, msg)
 			}
-			floor, err := blob.StorageUsageBytes(ctx, s.Blob, repoID)
+			floor, err := s.cachedUsageFloor(ctx, repoID)
 			if err != nil {
 				log.Printf("lfs quota: %s: usage listing failed: %v", repoID, err)
 				return denyAll(http.StatusInternalServerError, "storage quota check failed")
@@ -505,6 +513,11 @@ func (s *Server) lfsReservationTTL() time.Duration {
 	return defaultReservationTTL
 }
 
+// errLFSContentMismatch reports a stored blob whose bytes do not hash to
+// its content address — a legacy presigned-era upload that was never
+// digest-verified (issue #51's original hole).
+var errLFSContentMismatch = errors.New("stored LFS object does not match its content address")
+
 // adoptLFSObject backfills the lfs_objects registry row for an object that
 // is already stored but was never registered (uploads predating issue #51,
 // or a verified upload whose registration failed after publish). Callers
@@ -513,10 +526,33 @@ func (s *Server) lfsReservationTTL() time.Duration {
 // with DeleteLFS enabled a still-rowless object eventually classifies as an
 // orphan and is reaped — a transient ref-store outage must fail the request
 // so the client retries, never silently downgrade to data loss.
-func (s *Server) adoptLFSObject(ctx context.Context, repoID, key string, size int64) error {
+// errLFSContentMismatch means the stored blob was provably wrong for its
+// key and has been removed — the caller must treat the object as MISSING
+// and take the verified upload path.
+func (s *Server) adoptLFSObject(ctx context.Context, repoID, key, oid string, size int64) error {
 	registered, err := s.Store.HasLFSObject(ctx, repoID, key)
 	if err != nil || registered {
 		return err
+	}
+	// Legacy blobs were written through presigned PUTs that bound no
+	// digest, so existence does not prove content (Codex round 15).
+	// Hash the stored bytes once before adoption; a mismatch is provably
+	// wrong for its content address — no valid pointer can want those
+	// bytes under this key — so the blob is removed and the client's
+	// correct bytes come in through the verified path. At most one
+	// download+hash per object lifetime: adopted objects never re-verify,
+	// mismatches are deleted.
+	if err := s.verifyStoredLFSObject(ctx, key, oid); err != nil {
+		if !errors.Is(err, errLFSContentMismatch) {
+			return err
+		}
+		dctx, dcancel := context.WithTimeout(context.WithoutCancel(ctx), lfsCleanupTimeout)
+		defer dcancel()
+		if derr := s.Blob.Delete(dctx, key); derr != nil && !errors.Is(derr, blob.ErrNotFound) {
+			return fmt.Errorf("remove mismatched legacy object %s: %w", key, derr)
+		}
+		log.Printf("lfs adopt %s: removed legacy blob failing content verification", key)
+		return errLFSContentMismatch
 	}
 	if err := s.Store.RegisterLFSObject(ctx, repoID, key, size); err != nil {
 		return err
@@ -535,6 +571,33 @@ func (s *Server) adoptLFSObject(ctx context.Context, repoID, key string, size in
 	// row and restores the blob itself.
 	if _, err := s.Blob.Stat(ctx, key); err != nil {
 		return fmt.Errorf("adopted object vanished (racing sweep?): %w", err)
+	}
+	return nil
+}
+
+// verifyStoredLFSObject downloads the blob at key and checks that its
+// sha256 matches oid (the content address).
+func (s *Server) verifyStoredLFSObject(ctx context.Context, key, oid string) error {
+	dir, err := os.MkdirTemp("", "lfs-verify-*")
+	if err != nil {
+		return fmt.Errorf("scratch dir: %w", err)
+	}
+	defer os.RemoveAll(dir)
+	path := filepath.Join(dir, "obj")
+	if err := s.Blob.DownloadFile(ctx, key, path); err != nil {
+		return fmt.Errorf("download for verification: %w", err)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return err
+	}
+	if hex.EncodeToString(h.Sum(nil)) != oid {
+		return errLFSContentMismatch
 	}
 	return nil
 }
@@ -678,17 +741,22 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target r
 	// pointer to a blob the sweeper still sees as an orphan.
 	switch size, err := s.Blob.Stat(ctx, key); {
 	case err == nil:
-		if aerr := s.adoptLFSObject(ctx, repoID, key, size); errors.Is(aerr, ref.ErrLFSObjectCapExceeded) {
+		switch aerr := s.adoptLFSObject(ctx, repoID, key, oid, size); {
+		case aerr == nil:
+			w.WriteHeader(http.StatusOK)
+			return
+		case errors.Is(aerr, ref.ErrLFSObjectCapExceeded):
 			lfsError(w, http.StatusInsufficientStorage, fmt.Sprintf(
 				"repository LFS object count limit reached (limit %d)", ref.MaxLFSObjectsPerRepo))
 			return
-		} else if aerr != nil {
+		case errors.Is(aerr, errLFSContentMismatch):
+			// The mismatched legacy blob was removed: proceed as a normal
+			// verified upload of the request body.
+		default:
 			log.Printf("lfs adopt %s: %v", key, aerr)
 			lfsError(w, http.StatusInternalServerError, "object registration failed")
 			return
 		}
-		w.WriteHeader(http.StatusOK)
-		return
 	case !errors.Is(err, blob.ErrNotFound):
 		log.Printf("lfs stat %s: %v", key, err)
 		lfsError(w, http.StatusInternalServerError, "object storage unavailable")
@@ -779,7 +847,7 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target r
 	}
 	if s.PackQuotaBytes > 0 && r.ContentLength > 0 {
 		if !registered {
-			floor, err := blob.StorageUsageBytes(ctx, s.Blob, repoID)
+			floor, err := s.cachedUsageFloor(ctx, repoID)
 			if err != nil {
 				log.Printf("lfs quota: %s: usage listing failed: %v", repoID, err)
 				lfsError(w, http.StatusInternalServerError, "storage quota check failed")
@@ -874,7 +942,7 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target r
 	// before the row's created_at.
 	pubAnchor := time.Now()
 	if s.PackQuotaBytes > 0 && n > 0 && !registered {
-		floor, err := blob.StorageUsageBytes(ctx, s.Blob, repoID)
+		floor, err := s.cachedUsageFloor(ctx, repoID)
 		if err != nil {
 			log.Printf("lfs quota: %s: usage listing failed: %v", repoID, err)
 			lfsError(w, http.StatusInternalServerError, "storage quota check failed")

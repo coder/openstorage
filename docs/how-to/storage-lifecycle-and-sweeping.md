@@ -190,7 +190,10 @@ an older build has no registry row** and therefore shows up as an orphan candida
 however live its pointers are. That is why LFS deletion is a separate opt-in and is not
 covered by `CODESTORAGE_SWEEP_DELETE_ENABLED`. Stored objects are adopted into the
 registry whenever a write-scoped touch sees them (an upload batch naming the object, or
-a re-upload of the same content), so active repositories converge on their own. Before
+a re-upload of the same content) — after a one-time sha256 verification, since
+presigned-era uploads never proved their content: a mismatched legacy blob is removed
+and re-uploaded through the verified path instead of adopted. Active repositories
+therefore converge on their own. Before
 setting `CODESTORAGE_SWEEP_DELETE_LFS=true`, run list-only until the candidate lines
 stop naming objects that should live; re-pushing a repository's LFS content (batch
 adoption skips re-transfers of stored objects) is the fastest way to backfill a

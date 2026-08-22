@@ -791,6 +791,48 @@ func TestLFSQuota_CapDenialCleanupBounded(t *testing.T) {
 	}
 }
 
+// TestLFSAdopt_LegacyMismatchReplaced (Codex round 15): a stored blob from
+// the presigned-upload era whose bytes do NOT hash to its key must not be
+// adopted — existence never proved content back then. The batch treats it
+// as missing (upload action, mismatched blob removed) and the verified
+// re-upload replaces it.
+func TestLFSAdopt_LegacyMismatchReplaced(t *testing.T) {
+	srv, st, mint := newLFSQuotaServer(t, 0, time.Hour)
+	tok := mint(auth.ScopeGitWrite)
+	content := []byte("the genuine content")
+	oid := sha256Hex(content)
+	key := blob.LFSKey(lfsTestRepoID, oid)
+	// A legacy presigned PUT stored garbage under the oid's key.
+	if err := srv.Blob.UploadFile(context.Background(), key,
+		writeTempFile(t, []byte("attacker-substituted garbage"))); err != nil {
+		t.Fatal(err)
+	}
+
+	// Batch upload naming the oid: NOT reported stored — the mismatch is
+	// detected, the garbage removed, and an upload action issued.
+	resp := decodeBatch(t, doLFS(t, srv, http.MethodPost, lfsBatchPath, "basic:"+tok,
+		batchBody("upload", oid, int64(len(content)))))
+	if resp.Objects[0].Error != nil || resp.Objects[0].Actions["upload"] == nil {
+		t.Fatalf("mismatched legacy object not offered an upload action: %+v", resp.Objects[0])
+	}
+	if _, err := srv.Blob.Stat(context.Background(), key); err == nil {
+		t.Fatal("mismatched legacy blob still stored")
+	}
+	if has, err := st.HasLFSObject(context.Background(), lfsTestRepoID, key); err != nil || has {
+		t.Fatalf("mismatched legacy blob was adopted: %v, %v", has, err)
+	}
+
+	// The verified re-upload replaces it and registers.
+	w := doLFS(t, srv, http.MethodPut, "/"+lfsTestRepoURL+".git/info/lfs/objects/"+oid,
+		"basic:"+tok, string(content))
+	if w.Code != http.StatusOK {
+		t.Fatalf("verified re-upload status = %d, body %s", w.Code, w.Body)
+	}
+	if size, err := srv.Blob.Stat(context.Background(), key); err != nil || size != int64(len(content)) {
+		t.Fatalf("replacement blob = (%d, %v), want the genuine %d bytes", size, err, len(content))
+	}
+}
+
 // TestLFSQuota_NamespaceUsageRollsUpToBase: pack bytes registered under a
 // namespace member of the repo group charge the same quota LFS admission
 // uses — one token must not obtain fresh headroom per surface.
