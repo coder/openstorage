@@ -362,7 +362,7 @@ func (s *Server) lfsBatchUpload(r *http.Request, repoElem string, target repoTar
 		if !ok {
 			continue
 		}
-		size, err := s.Blob.Stat(ctx, key)
+		_, err := s.Blob.Stat(ctx, key)
 		switch {
 		case err == nil:
 			// Already stored: no actions means the client skips the
@@ -371,7 +371,7 @@ func (s *Server) lfsBatchUpload(r *http.Request, repoElem string, target repoTar
 			// sweep would classify referenced objects as reapable, so a
 			// swallowed adoption failure here would let the client commit
 			// a pointer to a reapable blob).
-			switch aerr := s.adoptLFSObjectLocked(ctx, repoID, key, obj.OID, size); {
+			switch aerr := s.adoptLFSObjectLocked(ctx, repoID, key, obj.OID); {
 			case aerr == nil:
 				continue
 			case errors.Is(aerr, ref.ErrLFSObjectCapExceeded):
@@ -480,7 +480,18 @@ func (s *Server) lfsBatchUpload(r *http.Request, repoElem string, target repoTar
 				log.Printf("lfs quota: %s: usage listing failed: %v", repoID, err)
 				return denyAll(http.StatusInternalServerError, "storage quota check failed")
 			}
-			ls, err := s.Store.QuotaLedgerState(ctx, blob.QuotaRepoGroup(repoID), s.lfsReservationTTL())
+			// The batch's OWN keys are excluded from the reserved sum
+			// (Codex round 24), mirroring ReservePackBytes's same-key
+			// exclusion: a failed verified PUT leaves a settle-or-TTL
+			// reservation for exactly these keys, and counting it here
+			// ON TOP of incoming would 507 the retry that settles it
+			// until the TTL expired. incoming still charges each key's
+			// declared size, so nothing is admitted for free.
+			keys := make([]string, len(packs))
+			for i, p := range packs {
+				keys[i] = p.Key
+			}
+			ls, err := s.Store.QuotaLedgerState(ctx, blob.QuotaRepoGroup(repoID), s.lfsReservationTTL(), keys...)
 			if err != nil {
 				log.Printf("lfs quota: %s: ledger read failed: %v", repoID, err)
 				return denyAll(http.StatusInternalServerError, "storage quota check failed")
@@ -535,12 +546,12 @@ var errLFSBusy = errors.New("concurrent LFS operation in progress")
 // adoptLFSObjectLocked runs adoptLFSObject under the per-key in-flight
 // slot — the batch path's entrance (the PUT path already holds the slot
 // for its whole lifetime). errLFSBusy when the slot is taken.
-func (s *Server) adoptLFSObjectLocked(ctx context.Context, repoID, key, oid string, size int64) error {
+func (s *Server) adoptLFSObjectLocked(ctx context.Context, repoID, key, oid string) error {
 	if _, busy := s.lfsUploadsInFlight.LoadOrStore(key, struct{}{}); busy {
 		return errLFSBusy
 	}
 	defer s.lfsUploadsInFlight.Delete(key)
-	return s.adoptLFSObject(ctx, repoID, key, oid, size)
+	return s.adoptLFSObject(ctx, repoID, key, oid)
 }
 
 // adoptLFSObject backfills the lfs_objects registry row for an object that
@@ -554,7 +565,7 @@ func (s *Server) adoptLFSObjectLocked(ctx context.Context, repoID, key, oid stri
 // errLFSContentMismatch means the stored blob was provably wrong for its
 // key and has been removed — the caller must treat the object as MISSING
 // and take the verified upload path.
-func (s *Server) adoptLFSObject(ctx context.Context, repoID, key, oid string, size int64) error {
+func (s *Server) adoptLFSObject(ctx context.Context, repoID, key, oid string) error {
 	registered, err := s.Store.HasLFSObject(ctx, repoID, key)
 	if err != nil || registered {
 		return err
@@ -579,21 +590,21 @@ func (s *Server) adoptLFSObject(ctx context.Context, repoID, key, oid string, si
 	// wrong for its content address — no valid pointer can want those
 	// bytes under this key — so the blob is removed and the client's
 	// correct bytes come in through the verified path. At most one
-	// download+hash per object lifetime: adopted objects never re-verify,
+	// hash per object lifetime: adopted objects never re-verify,
 	// mismatches are deleted. CALLERS HOLD the per-key in-flight slot, so
-	// same-replica verifications of one key are serialized; the download
-	// is charged against the staging budget like any upload (Codex round
-	// 16 — verification stages real disk bytes).
-	if size > 0 && s.LFSStagingBytes > 0 && size > s.LFSStagingBytes {
-		return fmt.Errorf("legacy object verification needs %d bytes of staging, budget is %d", size, s.LFSStagingBytes)
-	}
-	if !s.reserveLFSStaging(size) {
+	// same-replica verifications of one key are serialized. Verification
+	// streams ranged reads through the hasher (one chunk of memory, no
+	// disk — Codex round 24, replacing the round-16 disk metering whose
+	// Stat-sized reservation could not bound a concurrently replaced
+	// blob), so it takes only an op slot: the replica-wide concurrency
+	// bound, not staging bytes.
+	if !s.reserveLFSStaging(0) {
 		return errLFSBusy
 	}
-	defer s.releaseLFSStaging(size)
-	// Bounded like publication (Codex round 17): the verification download
-	// holds staging capacity, so a wedged backend or a client parking the
-	// batch connection must not pin it past the lease window.
+	defer s.releaseLFSStaging(0)
+	// Bounded like publication (Codex round 17): the verification holds
+	// the op slot, so a wedged backend or a client parking the batch
+	// connection must not pin it past the lease window.
 	vctx, vcancel := context.WithTimeout(ctx, s.lfsReservationTTL()*9/10)
 	defer vcancel()
 	verifiedSize, err := s.verifyStoredLFSObject(vctx, key, oid)
@@ -655,36 +666,40 @@ func (s *Server) adoptLFSObject(ctx context.Context, repoID, key, oid string, si
 	return nil
 }
 
-// verifyStoredLFSObject downloads the blob at key, checks that its sha256
-// matches oid (the content address), and returns the byte count of the
-// downloaded content — the ONLY size the caller may register (Codex round
-// 23): the stored object can be replaced between the caller's Stat and
-// this download, so any earlier measurement may describe a different blob
-// than the one verified here.
+// verifyStoredLFSObject streams the blob at key through sha256 in
+// lfsStagingChunk-sized ranged reads and checks the digest against oid,
+// returning the verified byte count — the ONLY size the caller may
+// register (Codex round 23): the stored object can be replaced between the
+// caller's earlier Stat and this verification, so no earlier measurement
+// may describe the bytes verified here. Streaming replaced the
+// download-to-temp-disk approach (Codex round 24): a Stat-sized staging
+// reservation could not bound what DownloadFile actually staged when a
+// concurrent replica swapped a small legacy blob for a larger valid
+// object. Ranged reads bound memory at one chunk and touch NO disk, so
+// verification needs no staging-byte reservation at all (callers still
+// hold the per-key slot and an op slot). A blob replaced mid-stream hashes
+// as a mismatch (a prefix of different content) — the same safe path as
+// any corrupt legacy blob; the digest covering exactly size bytes is what
+// makes the returned count trustworthy.
 func (s *Server) verifyStoredLFSObject(ctx context.Context, key, oid string) (int64, error) {
-	dir, err := os.MkdirTemp("", "lfs-verify-*")
+	size, err := s.Blob.Stat(ctx, key)
 	if err != nil {
-		return 0, fmt.Errorf("scratch dir: %w", err)
+		return 0, fmt.Errorf("stat for verification: %w", err)
 	}
-	defer os.RemoveAll(dir)
-	path := filepath.Join(dir, "obj")
-	if err := s.Blob.DownloadFile(ctx, key, path); err != nil {
-		return 0, fmt.Errorf("download for verification: %w", err)
-	}
-	f, err := os.Open(path)
-	if err != nil {
-		return 0, err
-	}
-	defer f.Close()
 	h := sha256.New()
-	n, err := io.Copy(h, f)
-	if err != nil {
-		return 0, err
+	for off := int64(0); off < size; {
+		n := min(lfsStagingChunk, size-off)
+		chunk, err := s.Blob.ReadRange(ctx, key, off, n)
+		if err != nil {
+			return 0, fmt.Errorf("read for verification [%d,%d): %w", off, off+n, err)
+		}
+		h.Write(chunk)
+		off += n
 	}
 	if hex.EncodeToString(h.Sum(nil)) != oid {
 		return 0, errLFSContentMismatch
 	}
-	return n, nil
+	return size, nil
 }
 
 // stagingFileWriter covers every byte with staging budget BEFORE it lands
@@ -871,9 +886,9 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target r
 	// the body (the key is content-addressed, so stored bytes match). A
 	// failed adoption fails the PUT: 200 would let the client commit a
 	// pointer to a blob the sweeper still sees as an orphan.
-	switch size, err := s.Blob.Stat(ctx, key); {
+	switch _, err := s.Blob.Stat(ctx, key); {
 	case err == nil:
-		switch aerr := s.adoptLFSObject(ctx, repoID, key, oid, size); {
+		switch aerr := s.adoptLFSObject(ctx, repoID, key, oid); {
 		case aerr == nil:
 			w.WriteHeader(http.StatusOK)
 			return

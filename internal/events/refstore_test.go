@@ -72,7 +72,7 @@ func (f *fakeInner) CountLFSObjects(context.Context, string) (int64, error) { re
 func (f *fakeInner) GuardedLFSDelete(context.Context, string, string, func(context.Context) error) (bool, error) {
 	return false, nil
 }
-func (f *fakeInner) QuotaLedgerState(context.Context, []string, time.Duration) (ref.PackQuotaLedgerState, error) {
+func (f *fakeInner) QuotaLedgerState(context.Context, []string, time.Duration, ...string) (ref.PackQuotaLedgerState, error) {
 	return ref.PackQuotaLedgerState{}, nil
 }
 

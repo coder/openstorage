@@ -631,9 +631,9 @@ func TestLFSQuota_TwoMaxInt64BatchDenied(t *testing.T) {
 	}
 }
 
-// staleStatBlob reports a stale (smaller) size from Stat while downloads
+// staleStatBlob reports a stale (smaller) size from Stat while reads
 // serve the real stored bytes — the HA race where the blob is replaced
-// between the caller's Stat and the verification download.
+// between the caller's Stat and the verification.
 type staleStatBlob struct {
 	blob.BlobStore
 	staleSize int64
@@ -641,14 +641,15 @@ type staleStatBlob struct {
 
 func (b staleStatBlob) Stat(context.Context, string) (int64, error) { return b.staleSize, nil }
 
-// TestLFSQuota_AdoptionRegistersVerifiedSize (Codex round 23): adoption
-// must register the byte count of the content it actually downloaded and
-// hashed, never the caller's pre-verification Stat. In an HA upgrade,
-// replica A can Stat a small corrupt rowless blob, replica B can
-// guarded-delete it and publish the larger correct object, and A's
-// verification then passes against the REPLACEMENT — registering A's
-// stale Stat size would under-charge pack_usage and mint phantom quota
-// headroom that B's later idempotent re-registration never corrects.
+// TestLFSQuota_AdoptionRegistersVerifiedSize (Codex rounds 23+24): the
+// registered size must be the byte count the verification hash actually
+// covered, never the caller's pre-verification Stat — in an HA upgrade a
+// small corrupt rowless blob can be replaced by the larger correct object
+// between the two. With a store whose Stat keeps reporting the stale
+// small size, verification hashes a prefix, fails the digest, removes the
+// blob under the registration guard, and the PUT re-uploads verified
+// bytes — either way pack_usage must record the REAL size (37), never the
+// stale Stat (3) that would mint phantom quota headroom.
 func TestLFSQuota_AdoptionRegistersVerifiedSize(t *testing.T) {
 	srv, st, mint := newLFSQuotaServer(t, 1<<20, time.Hour)
 	tok := mint(auth.ScopeGitWrite)
@@ -676,8 +677,9 @@ func TestLFSQuota_AdoptionRegistersVerifiedSize(t *testing.T) {
 	}
 }
 
-// downloadCountingBlob counts verification downloads (adoptLFSObject's
-// verifyStoredLFSObject stages via DownloadFile).
+// downloadCountingBlob counts verification reads (adoptLFSObject's
+// verifyStoredLFSObject streams via ReadRange; DownloadFile counted too so
+// a regression to disk staging cannot slip past the at-cap test).
 type downloadCountingBlob struct {
 	blob.BlobStore
 	downloads int
@@ -686,6 +688,78 @@ type downloadCountingBlob struct {
 func (b *downloadCountingBlob) DownloadFile(ctx context.Context, key, destPath string) error {
 	b.downloads++
 	return b.BlobStore.DownloadFile(ctx, key, destPath)
+}
+
+func (b *downloadCountingBlob) ReadRange(ctx context.Context, key string, offset, length int64) ([]byte, error) {
+	b.downloads++
+	return b.BlobStore.ReadRange(ctx, key, offset, length)
+}
+
+// TestLFSQuota_RetryAfterFailedPutNotDoubleCounted (Codex round 24): a
+// verified PUT that reserved most of the remaining quota and failed
+// before publishing leaves a settle-or-TTL reservation for its key. The
+// retry's batch admission must exclude that same-key reservation from the
+// reserved sum (mirroring ReservePackBytes) — counting it ON TOP of the
+// batch's own incoming bytes 507-wedged the retry until the TTL expired.
+func TestLFSQuota_RetryAfterFailedPutNotDoubleCounted(t *testing.T) {
+	srv, st, mint := newLFSQuotaServer(t, 100, time.Hour)
+	tok := mint(auth.ScopeGitWrite)
+	content := bytes.Repeat([]byte("r"), 90)
+	oid := sha256Hex(content)
+	key := blob.LFSKey(lfsTestRepoID, oid)
+	dec, err := st.ReservePackBytes(context.Background(), blob.QuotaRepoGroup(lfsTestRepoID),
+		[]ref.Pack{{Key: key, Size: 90}}, ref.NewReservationOwner(), 0, 100, time.Hour)
+	if err != nil || !dec.OK {
+		t.Fatalf("seed failed-PUT reservation: %+v, %v", dec, err)
+	}
+
+	resp := decodeBatch(t, doLFS(t, srv, http.MethodPost, lfsBatchPath, "basic:"+tok,
+		batchBody("upload", oid, 90)))
+	if resp.Objects[0].Error != nil {
+		t.Fatalf("retry batch denied (its own reservation double-counted?): %+v", resp.Objects[0].Error)
+	}
+	if resp.Objects[0].Actions == nil {
+		t.Fatalf("retry batch issued no upload action: %+v", resp.Objects[0])
+	}
+	// A DIFFERENT key of the same size must still be denied: the
+	// exclusion is per requested key, not a blanket reservation waiver.
+	other := bytes.Repeat([]byte("x"), 90)
+	resp = decodeBatch(t, doLFS(t, srv, http.MethodPost, lfsBatchPath, "basic:"+tok,
+		batchBody("upload", sha256Hex(other), 90)))
+	if resp.Objects[0].Error == nil || resp.Objects[0].Error.Code != http.StatusInsufficientStorage {
+		t.Fatalf("unrelated over-quota batch not denied: %+v", resp.Objects[0])
+	}
+}
+
+// TestLFSAdoption_VerificationNeedsNoStagingBytes (Codex round 24):
+// legacy-blob verification streams ranged reads through the hasher — no
+// disk staging, no staging-byte reservation — so it cannot exceed
+// LFSStagingBytes no matter what size the blob (or its concurrent
+// replacement) has. An object far larger than the whole byte budget must
+// still adopt.
+func TestLFSAdoption_VerificationNeedsNoStagingBytes(t *testing.T) {
+	srv, st, mint := newLFSQuotaServer(t, 0, time.Hour)
+	srv.LFSStagingBytes = 1 // pathological byte budget: streaming needs none of it
+	tok := mint(auth.ScopeGitWrite)
+
+	legacy := []byte("a legacy object far larger than the staging byte budget")
+	oid := sha256Hex(legacy)
+	key := blob.LFSKey(lfsTestRepoID, oid)
+	if err := srv.Blob.UploadFile(context.Background(), key, writeTempFile(t, legacy)); err != nil {
+		t.Fatal(err)
+	}
+
+	resp := decodeBatch(t, doLFS(t, srv, http.MethodPost, lfsBatchPath, "basic:"+tok,
+		batchBody("upload", oid, int64(len(legacy)))))
+	if resp.Objects[0].Error != nil {
+		t.Fatalf("adoption failed under a tiny staging budget: %+v", resp.Objects[0].Error)
+	}
+	if resp.Objects[0].Actions != nil {
+		t.Fatalf("adopted object still got an upload action: %+v", resp.Objects[0])
+	}
+	if has, err := st.HasLFSObject(context.Background(), lfsTestRepoID, key); err != nil || !has {
+		t.Fatalf("legacy blob was not adopted: %v, %v", has, err)
+	}
 }
 
 // TestLFSQuota_AtCapAdoptionDeniesBeforeDownload (Codex security round 4):

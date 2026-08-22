@@ -290,13 +290,20 @@ func (s *SQLite) HasLFSObject(ctx context.Context, repo, key string) (bool, erro
 }
 
 // QuotaLedgerState reads the group's ledger state (see the PG twin).
-func (s *SQLite) QuotaLedgerState(ctx context.Context, group []string, ttl time.Duration) (PackQuotaLedgerState, error) {
+func (s *SQLite) QuotaLedgerState(ctx context.Context, group []string, ttl time.Duration, excludeKeys ...string) (PackQuotaLedgerState, error) {
 	assertf(len(group) > 0 && group[0] != "" && ttl > 0, "QuotaLedgerState(%v, %v)", group, ttl)
-	args := make([]any, 0, 2*len(group)+2)
+	exclude := ""
+	args := make([]any, 0, 2*len(group)+2+len(excludeKeys))
 	for _, r := range group {
 		args = append(args, r)
 	}
 	args = append(args, group[0], ttl.Milliseconds())
+	if len(excludeKeys) > 0 {
+		exclude = ` AND key NOT IN (?` + placeholders(len(excludeKeys)-1) + `)`
+		for _, k := range excludeKeys {
+			args = append(args, k)
+		}
+	}
 	for _, r := range group {
 		args = append(args, r)
 	}
@@ -305,7 +312,7 @@ func (s *SQLite) QuotaLedgerState(ctx context.Context, group []string, ttl time.
 SELECT
   COALESCE((SELECT SUM(bytes) FROM pack_usage WHERE repo IN (?`+placeholders(len(group)-1)+`)), 0),
   COALESCE((SELECT SUM(bytes) FROM pack_reservations
-            WHERE repo = ? AND created_at > `+sqliteEpochMS+` - ?), 0),
+            WHERE repo = ? AND created_at > `+sqliteEpochMS+` - ?`+exclude+`), 0),
   COALESCE((SELECT SUM(bytes) FROM pack_retained WHERE repo IN (?`+placeholders(len(group)-1)+`)), 0)`,
 		args...).Scan(&st.UsageBytes, &st.ReservedBytes, &st.RetainedBytes)
 	return st, err

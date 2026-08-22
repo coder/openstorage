@@ -112,7 +112,13 @@ type RefStore interface {
 	// (issue #51 — batches insert no rows; the PUT's transactional
 	// admission is authoritative); also tests, oracles, and operator
 	// inspection.
-	QuotaLedgerState(ctx context.Context, group []string, ttl time.Duration) (PackQuotaLedgerState, error)
+	// excludeKeys omits those keys' active reservations from the
+	// ReservedBytes sum (Codex round 24), mirroring ReservePackBytes's
+	// same-key exclusion: an admission check for specific keys must not
+	// double-count a reservation those keys already hold (a failed
+	// verified upload's settle-or-TTL row would otherwise 507 its own
+	// retry until the TTL).
+	QuotaLedgerState(ctx context.Context, group []string, ttl time.Duration, excludeKeys ...string) (PackQuotaLedgerState, error)
 	// SweepExpiredPackReservations deletes reservation rows at least
 	// olderThan old (crash-swept leak reclamation, issue #29; the orphan
 	// sweeper calls it on its cadence). olderThan=0 expires everything —

@@ -189,8 +189,8 @@ func (s *SimRefStore) HasLFSObject(ctx context.Context, repo, key string) (bool,
 }
 
 // QuotaLedgerState delegates to the inner store (oracle reads).
-func (s *SimRefStore) QuotaLedgerState(ctx context.Context, group []string, ttl time.Duration) (ref.PackQuotaLedgerState, error) {
-	return s.inner.QuotaLedgerState(ctx, group, ttl)
+func (s *SimRefStore) QuotaLedgerState(ctx context.Context, group []string, ttl time.Duration, excludeKeys ...string) (ref.PackQuotaLedgerState, error) {
+	return s.inner.QuotaLedgerState(ctx, group, ttl, excludeKeys...)
 }
 
 // GuardedLFSDelete delegates to the inner store.
