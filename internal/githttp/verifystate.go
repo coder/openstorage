@@ -28,6 +28,7 @@ package githttp
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -131,8 +132,8 @@ func (st *verifyState) chargeWalk(n int64, maxWalk int64, refName string) error 
 		return nil
 	}
 	if maxWalk > 0 && st.walked+n > maxWalk {
-		return fmt.Errorf("verify-sig: push exceeds the per-push history-walk allowance: %s pushed the total past %d examined commits (%d× CODESTORAGE_VERIFY_SIG_BUDGET; raise the budget or split the push)",
-			refName, maxWalk, verifyWalkBudgetMultiplier)
+		return st.exhaust(fmt.Sprintf("verify-sig: push exceeds the per-push history-walk allowance: %s pushed the total past %d examined commits (%d× CODESTORAGE_VERIFY_SIG_BUDGET; raise the budget or split the push)",
+			refName, maxWalk, verifyWalkBudgetMultiplier))
 	}
 	if err := st.markWalked(n); err != nil {
 		return fmt.Errorf("verify-sig: %w", err)
@@ -163,6 +164,16 @@ func openVerifyState() (*verifyState, error) {
 		return st, nil
 	}
 	st.path = path
+	// Terminal exhaustion short-circuits everything: no sidecar load, no
+	// walk, just the persisted rejection (Codex round 16).
+	if msg, err := os.ReadFile(st.exhaustedPath()); err == nil {
+		if len(msg) == 0 {
+			return nil, fmt.Errorf("empty verify exhaustion marker")
+		}
+		return nil, errors.New(string(msg))
+	} else if !os.IsNotExist(err) {
+		return nil, fmt.Errorf("read verify exhaustion marker: %w", err)
+	}
 	// The range sidecar is created on first markRangeOK; absent means no
 	// range has been verified yet.
 	if err := readLineFile(st.rangesPath(), true, st.applyRangeLine); err != nil {
@@ -326,13 +337,34 @@ func (st *verifyState) markRangeOK(old, new string) error {
 	return appendTo(st.rangesPath(), line, true)
 }
 
-// verifyWalkedCounterSuffix and verifyRangesSuffix name the sibling files
-// next to the verdict state file; the server removes all three when the
-// request ends.
+// Sibling files next to the verdict state file, all inside the server's
+// private per-push directory (removed wholesale with the request).
 const (
 	verifyWalkedCounterSuffix = ".walked"
 	verifyRangesSuffix        = ".ranges"
+	verifyExhaustedSuffix     = ".exhausted"
 )
+
+// exhaustedPath is the terminal-exhaustion marker: once the push's work
+// allowance rejects a charge, every later evaluation must fail closed in
+// constant time — WITHOUT first re-scanning the accumulated sidecars,
+// which is exactly the cost the exhaustion exists to stop (Codex round
+// 16). The marker carries the rejection message.
+func (st *verifyState) exhaustedPath() string {
+	assertf(st.path != "", "exhaustedPath without a state file")
+	return st.path + verifyExhaustedSuffix
+}
+
+// exhaust persists the terminal marker (best-effort: a lost marker only
+// costs a re-scan, and the caller is already denying) and returns the
+// rejection as an error.
+func (st *verifyState) exhaust(msg string) error {
+	assertf(msg != "", "exhaust with empty message")
+	if st.path != "" {
+		_ = os.WriteFile(st.exhaustedPath(), []byte(msg), 0o600)
+	}
+	return errors.New(msg)
+}
 
 // rangesPath is the sidecar carrying okrange lines. Separate from the
 // verdict file so exact-range hits load only this bounded, usually tiny

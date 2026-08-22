@@ -821,8 +821,8 @@ func introducedPending(ctx context.Context, state *verifyState, refName, old, ne
 		examined++
 		if maxWalk > 0 && state.walked+examined > maxWalk {
 			abort()
-			return nil, examined, fmt.Errorf("verify-sig: push exceeds the per-push history-walk allowance: %s pushed the total past %d examined commits (%d× CODESTORAGE_VERIFY_SIG_BUDGET; raise the budget or split the push)",
-				refName, maxWalk, verifyWalkBudgetMultiplier)
+			return nil, examined, state.exhaust(fmt.Sprintf("verify-sig: push exceeds the per-push history-walk allowance: %s pushed the total past %d examined commits (%d× CODESTORAGE_VERIFY_SIG_BUDGET; raise the budget or split the push)",
+				refName, maxWalk, verifyWalkBudgetMultiplier))
 		}
 		if state.ok[line] {
 			continue
