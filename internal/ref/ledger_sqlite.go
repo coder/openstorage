@@ -215,15 +215,18 @@ func (s *SQLite) RegisterLFSObject(ctx context.Context, repo, key string, bytes 
 		return err
 	}
 	if inserted > 0 {
-		// Atomic object-count cap (see the PG twin; BEGIN IMMEDIATE is the
-		// serialization here — SQLite has one writer at a time).
+		// Atomic object-count cap via the maintained counter row (see the
+		// PG twin; BEGIN IMMEDIATE is the serialization here — SQLite has
+		// one writer at a time).
 		var count int64
-		if err := tx.QueryRowContext(ctx,
-			`SELECT COUNT(*) FROM lfs_objects WHERE repo = ?`, repo).Scan(&count); err != nil {
+		if err := tx.QueryRowContext(ctx, `
+INSERT INTO lfs_object_counts (repo, count) VALUES (?, 1)
+ON CONFLICT (repo) DO UPDATE SET count = lfs_object_counts.count + 1
+RETURNING count`, repo).Scan(&count); err != nil {
 			return err
 		}
 		if count > MaxLFSObjectsPerRepo {
-			return ErrLFSObjectCapExceeded // the deferred rollback discards the insert
+			return ErrLFSObjectCapExceeded // the deferred rollback discards insert + increment
 		}
 	}
 	if _, err := tx.ExecContext(ctx,
@@ -241,12 +244,13 @@ func (s *SQLite) RegisterLFSObject(ctx context.Context, repo, key string, bytes 
 	return nil
 }
 
-// CountLFSObjects returns repo's registered LFS object count.
+// CountLFSObjects returns repo's registered LFS object count — an O(1)
+// counter-row read (see the PG twin).
 func (s *SQLite) CountLFSObjects(ctx context.Context, repo string) (int64, error) {
 	assertf(repo != "", "CountLFSObjects(%q)", repo)
 	var n int64
 	err := s.db.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM lfs_objects WHERE repo = ?`, repo).Scan(&n)
+		`SELECT COALESCE((SELECT count FROM lfs_object_counts WHERE repo = ?), 0)`, repo).Scan(&n)
 	return n, err
 }
 

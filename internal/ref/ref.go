@@ -342,6 +342,13 @@ CREATE TABLE IF NOT EXISTS pack_usage (repo text PRIMARY KEY, bytes bigint NOT N
 CREATE TABLE IF NOT EXISTS lfs_objects (repo text, key text, bytes bigint NOT NULL,
                                         created_at timestamptz NOT NULL DEFAULT now(),
                                         PRIMARY KEY (repo, key));
+-- Maintained count of lfs_objects rows per repo (issue #51): the
+-- object-count cap reads it in O(1) instead of COUNT(*)-ing an
+-- attacker-growable table under lock. Incremented transactionally with
+-- every row insert; rows are never deleted today — any future deletion
+-- path must decrement in its own transaction or the cap turns stricter,
+-- never looser.
+CREATE TABLE IF NOT EXISTS lfs_object_counts (repo text PRIMARY KEY, count bigint NOT NULL DEFAULT 0);
 -- Idempotent additive migration for pre-p3 dev databases (backfills
 -- existing rows via the NOT NULL DEFAULT).
 ALTER TABLE refs ADD COLUMN IF NOT EXISTS created_at timestamptz NOT NULL DEFAULT now();

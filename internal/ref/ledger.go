@@ -143,12 +143,6 @@ var MaxLFSObjectsPerRepo = int64(100_000)
 // Re-registration of an existing key never returns it (zero growth).
 var ErrLFSObjectCapExceeded = errors.New("repository LFS object count limit reached")
 
-// lfsRegisterLockClass namespaces the per-repo advisory lock
-// RegisterLFSObject takes ("LFSC") in the two-int4 keyspace — disjoint from
-// the admission lock class ("PKQR") and never nested with it, so no
-// deadlock ordering exists.
-const lfsRegisterLockClass = int32(0x4C465343)
-
 // reserveLockClass namespaces the per-base advisory locks ReservePackBytes
 // takes ("PKQR"), in the two-int4 pg_advisory_xact_lock keyspace — disjoint
 // from the single-int8 keys the schema-init paths use (META, SPIKE, RIVER).
@@ -393,19 +387,16 @@ func validateRegisterLFS(repo, key string, bytes int64) {
 // reservation (issue #51) — see RefStore. Mirrors RegisterPacks' ledger
 // discipline: the one-transaction insert + reservation consumption + credit
 // is what lets ReservePackBytes read a single snapshot without locking
-// against LFS settlement. The object-count cap is enforced HERE, after the
-// insert, under a per-repo advisory lock (Codex round 6): registrations for
-// one repo serialize, so two writers straddling the cap cannot both count a
-// pre-insert snapshot and overshoot. Returns ErrLFSObjectCapExceeded (and
-// commits nothing) when the NEW row would exceed the cap.
+// against LFS settlement. The object-count cap is enforced HERE (Codex
+// round 6) via the maintained counter row (Codex round 10: a COUNT(*)
+// under lock made building to the cap quadratic): the counter upsert's row
+// lock serializes same-repo registrations, so the RETURNING value is the
+// authoritative post-insert population. Returns ErrLFSObjectCapExceeded
+// (and commits nothing — insert and increment roll back together) when the
+// NEW row would exceed the cap.
 func (s *PG) RegisterLFSObject(ctx context.Context, repo, key string, bytes int64) error {
 	validateRegisterLFS(repo, key, bytes)
 	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
-		// Serialize register-vs-register per repo so the post-insert count
-		// below is exact (disjoint lock class from admission, never nested).
-		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1), $2)`, repo, lfsRegisterLockClass); err != nil {
-			return err
-		}
 		ct, err := tx.Exec(ctx,
 			`INSERT INTO lfs_objects (repo, key, bytes) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
 			repo, key, bytes)
@@ -413,15 +404,15 @@ func (s *PG) RegisterLFSObject(ctx context.Context, repo, key string, bytes int6
 			return err
 		}
 		if ct.RowsAffected() > 0 {
-			// Count AFTER inserting (own row visible): under the lock this
-			// is the authoritative population including this registration.
 			var count int64
-			if err := tx.QueryRow(ctx,
-				`SELECT COUNT(*) FROM lfs_objects WHERE repo = $1`, repo).Scan(&count); err != nil {
+			if err := tx.QueryRow(ctx, `
+INSERT INTO lfs_object_counts (repo, count) VALUES ($1, 1)
+ON CONFLICT (repo) DO UPDATE SET count = lfs_object_counts.count + 1
+RETURNING count`, repo).Scan(&count); err != nil {
 				return err
 			}
 			if count > MaxLFSObjectsPerRepo {
-				return ErrLFSObjectCapExceeded // rolls back the insert
+				return ErrLFSObjectCapExceeded // rolls back insert + increment
 			}
 		}
 		if _, err := tx.Exec(ctx,
@@ -435,14 +426,14 @@ func (s *PG) RegisterLFSObject(ctx context.Context, repo, key string, bytes int6
 	})
 }
 
-// CountLFSObjects returns repo's registered LFS object count (a PK-prefix
-// index count; the LFS surface's per-repo object-count cap reads it at
-// admission time — issue #51, Codex security round 2).
+// CountLFSObjects returns repo's registered LFS object count — an O(1)
+// counter-row read (issue #51; the LFS surface's fast-fail pre-checks call
+// it per upload, so it must not scan the attacker-growable object table).
 func (s *PG) CountLFSObjects(ctx context.Context, repo string) (int64, error) {
 	assertf(repo != "", "CountLFSObjects(%q)", repo)
 	var n int64
 	err := s.pool.QueryRow(ctx,
-		`SELECT COUNT(*) FROM lfs_objects WHERE repo = $1`, repo).Scan(&n)
+		`SELECT COALESCE((SELECT count FROM lfs_object_counts WHERE repo = $1), 0)`, repo).Scan(&n)
 	return n, err
 }
 
