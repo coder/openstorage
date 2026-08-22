@@ -47,6 +47,20 @@ jobs:
       - run: go build ./...
       - run: go test ./... -count=1 -race -timeout=30m
 
+  # Build-only image smoke test (no push, no registry): verify-sig ref
+  # policies shell out through git to `gpg` (PGP) and `ssh-keygen` (SSH) at
+  # push time and fail closed when the binary is absent (ADR-9, #50), and the
+  # server hard-requires external `git`. Assert the runtime image keeps
+  # shipping all three so a base-image or package-list change cannot silently
+  # regress signed pushes.
+  image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - run: docker build -t codestorage-smoke .
+      - run: docker run --rm --entrypoint /bin/sh codestorage-smoke -c 'command -v git && command -v gpg && command -v ssh-keygen'
+
   test-local:
     runs-on: ubuntu-latest
     timeout-minutes: 20

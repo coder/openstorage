@@ -12,7 +12,11 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     CGO_ENABLED=0 go build -trimpath -o /out/codestorage ./cmd/codestorage
 
 FROM alpine:3.21
-RUN apk add --no-cache git ca-certificates \
+# gnupg + openssh-keygen: verify-sig ref policies shell out through git to
+# `gpg` (PGP) and `ssh-keygen` (SSH) and fail closed per ref when the binary
+# is absent (ADR-9, #50) — without them every signed push on a protected ref
+# is rejected. CI smoke-tests their presence in the built image.
+RUN apk add --no-cache git ca-certificates gnupg openssh-keygen \
     && adduser -D -H codestorage
 COPY --from=build /out/codestorage /usr/local/bin/codestorage
 USER codestorage
