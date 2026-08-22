@@ -30,10 +30,10 @@ import (
 	"testing"
 	"time"
 
-	"codestorage/internal/auth"
-	"codestorage/internal/blob"
-	"codestorage/internal/meta"
-	"codestorage/internal/ref"
+	"github.com/coder/code-storage/internal/auth"
+	"github.com/coder/code-storage/internal/blob"
+	"github.com/coder/code-storage/internal/meta"
+	"github.com/coder/code-storage/internal/ref"
 )
 
 // wctServer mounts ONLY the write-commit routes with the production auth

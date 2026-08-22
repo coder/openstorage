@@ -23,10 +23,10 @@ import (
 	"regexp"
 	"strings"
 
-	"codestorage/internal/auth"
-	"codestorage/internal/blob"
-	"codestorage/internal/githttp"
-	"codestorage/internal/ref"
+	"github.com/coder/code-storage/internal/auth"
+	"github.com/coder/code-storage/internal/blob"
+	"github.com/coder/code-storage/internal/githttp"
+	"github.com/coder/code-storage/internal/ref"
 )
 
 // ErrNotFound marks a missing ref, object, or path (handlers map it to 404

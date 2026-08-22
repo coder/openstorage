@@ -13,7 +13,7 @@ import (
 	"strings"
 	"testing"
 
-	"codestorage/internal/secrets"
+	"github.com/coder/code-storage/internal/secrets"
 )
 
 // newTestKey returns a fresh random base64 CODESTORAGE_SECRETS_KEY entry.

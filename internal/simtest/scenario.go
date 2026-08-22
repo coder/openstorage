@@ -14,8 +14,8 @@ import (
 	"strings"
 	"time"
 
-	"codestorage/internal/blob"
-	"codestorage/internal/ref"
+	"github.com/coder/code-storage/internal/blob"
+	"github.com/coder/code-storage/internal/ref"
 )
 
 // Config parameterizes one deterministic simulation run. The zero value of

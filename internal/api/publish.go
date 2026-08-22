@@ -17,8 +17,8 @@ import (
 	"os"
 	"time"
 
-	"codestorage/internal/blob"
-	"codestorage/internal/ref"
+	"github.com/coder/code-storage/internal/blob"
+	"github.com/coder/code-storage/internal/ref"
 )
 
 // errPackQuotaExceeded marks a publishPack denial for a write that would

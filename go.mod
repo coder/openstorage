@@ -1,4 +1,4 @@
-module codestorage
+module github.com/coder/code-storage
 
 go 1.26
 

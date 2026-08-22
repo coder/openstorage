@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"codestorage/internal/ref"
+	"github.com/coder/code-storage/internal/ref"
 )
 
 // ArchiveOptions tune one Archive stream. The zero value archives the whole

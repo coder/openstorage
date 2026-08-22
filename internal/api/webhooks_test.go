@@ -21,9 +21,9 @@ import (
 	"testing"
 	"time"
 
-	"codestorage/internal/auth"
-	"codestorage/internal/events"
-	"codestorage/internal/meta"
+	"github.com/coder/code-storage/internal/auth"
+	"github.com/coder/code-storage/internal/events"
+	"github.com/coder/code-storage/internal/meta"
 )
 
 // memWebhookStore is an in-memory events.WebhookStore keyed like the real

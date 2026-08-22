@@ -27,9 +27,9 @@ import (
 	"net/http"
 	"time"
 
-	"codestorage/internal/auth"
-	"codestorage/internal/meta"
-	upsync "codestorage/internal/sync"
+	"github.com/coder/code-storage/internal/auth"
+	"github.com/coder/code-storage/internal/meta"
+	upsync "github.com/coder/code-storage/internal/sync"
 )
 
 // syncServer holds the phase-5 credential/upstream-sync handler

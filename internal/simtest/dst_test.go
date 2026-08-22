@@ -7,9 +7,9 @@ import (
 	"strconv"
 	"testing"
 
-	"codestorage/internal/blob"
-	"codestorage/internal/githttp"
-	"codestorage/internal/ref"
+	"github.com/coder/code-storage/internal/blob"
+	"github.com/coder/code-storage/internal/githttp"
+	"github.com/coder/code-storage/internal/ref"
 )
 
 // reportRun logs a run's summary and fails the test on violations with

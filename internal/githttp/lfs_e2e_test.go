@@ -17,7 +17,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"codestorage/internal/blob"
+	"github.com/coder/code-storage/internal/blob"
 )
 
 func TestLFS_GitLFSRoundTrip(t *testing.T) {

@@ -12,8 +12,8 @@ import (
 	"net/http"
 	"strings"
 
-	"codestorage/internal/gitread"
-	"codestorage/internal/ref"
+	"github.com/coder/code-storage/internal/gitread"
+	"github.com/coder/code-storage/internal/ref"
 )
 
 // ---------------------------------------------------------------------------

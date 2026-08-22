@@ -13,7 +13,7 @@ import (
 	"fmt"
 	"os"
 
-	"codestorage/internal/simtest"
+	"github.com/coder/code-storage/internal/simtest"
 )
 
 func main() {

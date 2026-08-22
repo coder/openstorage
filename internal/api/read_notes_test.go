@@ -11,7 +11,7 @@ import (
 	"net/url"
 	"testing"
 
-	"codestorage/internal/auth"
+	"github.com/coder/code-storage/internal/auth"
 )
 
 // rnotesFixture is one seeded repo with notes on three notes refs.

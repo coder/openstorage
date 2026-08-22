@@ -15,10 +15,10 @@ import (
 
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 
-	"codestorage/internal/blob"
-	"codestorage/internal/events"
-	"codestorage/internal/ref"
-	"codestorage/internal/sync"
+	"github.com/coder/code-storage/internal/blob"
+	"github.com/coder/code-storage/internal/events"
+	"github.com/coder/code-storage/internal/ref"
+	"github.com/coder/code-storage/internal/sync"
 )
 
 // sweepFixture is one zero-container sweep environment: a fileblob store, a

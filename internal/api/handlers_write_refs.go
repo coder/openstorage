@@ -37,10 +37,10 @@ import (
 	"path/filepath"
 	"strings"
 
-	"codestorage/internal/auth"
-	"codestorage/internal/githttp"
-	"codestorage/internal/gitread"
-	"codestorage/internal/ref"
+	"github.com/coder/code-storage/internal/auth"
+	"github.com/coder/code-storage/internal/githttp"
+	"github.com/coder/code-storage/internal/gitread"
+	"github.com/coder/code-storage/internal/ref"
 )
 
 // registerWriteRefRoutes registers the W3 write endpoints on mux with the

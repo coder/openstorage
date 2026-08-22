@@ -17,13 +17,13 @@ import (
 	"strconv"
 	"time"
 
-	"codestorage/internal/auth"
-	"codestorage/internal/events"
-	"codestorage/internal/githttp"
-	"codestorage/internal/jobs"
-	"codestorage/internal/meta"
-	"codestorage/internal/ref"
-	upsync "codestorage/internal/sync"
+	"github.com/coder/code-storage/internal/auth"
+	"github.com/coder/code-storage/internal/events"
+	"github.com/coder/code-storage/internal/githttp"
+	"github.com/coder/code-storage/internal/jobs"
+	"github.com/coder/code-storage/internal/meta"
+	"github.com/coder/code-storage/internal/ref"
+	upsync "github.com/coder/code-storage/internal/sync"
 )
 
 // loopbackTokenTTL bounds the internally minted git:write JWT for one sync

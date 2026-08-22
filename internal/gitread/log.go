@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"codestorage/internal/ref"
+	"github.com/coder/code-storage/internal/ref"
 )
 
 // Commit is one parsed commit — the docs/03 CommitInfo source data

@@ -14,7 +14,7 @@ import (
 	"net/url"
 	"testing"
 
-	"codestorage/internal/auth"
+	"github.com/coder/code-storage/internal/auth"
 )
 
 // patchRepoBody decodes a PATCH /repo 200 body and pins the exact live-spec

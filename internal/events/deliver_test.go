@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"codestorage/internal/meta"
+	"github.com/coder/code-storage/internal/meta"
 )
 
 func testLogger() *slog.Logger {

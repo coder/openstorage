@@ -12,8 +12,8 @@ import (
 
 	"github.com/jackc/pgx/v5/pgconn"
 
-	"codestorage/internal/blob"
-	"codestorage/internal/ref"
+	"github.com/coder/code-storage/internal/blob"
+	"github.com/coder/code-storage/internal/ref"
 )
 
 const (

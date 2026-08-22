@@ -17,8 +17,8 @@ import (
 	"testing"
 	"time"
 
-	"codestorage/internal/blob"
-	"codestorage/internal/ref"
+	"github.com/coder/code-storage/internal/blob"
+	"github.com/coder/code-storage/internal/ref"
 )
 
 // countingStore is a ref.RefStore whose read methods count calls. Methods
