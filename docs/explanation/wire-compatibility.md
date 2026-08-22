@@ -40,7 +40,7 @@ namespaces), and [docs/06](../06-webhooks.md) (webhooks). By feature group:
 | Namespaces & forks | ✅ | `+ephemeral` / `+import` namespaces; synchronous forks — the full fork-point closure is copied into the new repository (independent storage and [quota](../how-to/storage-lifecycle-and-sweeping.md#pack-quotas), nothing shared with the source). Git-pushed vs REST-written ephemeral state live in separate ref spaces ([deviation](#known-deviations-from-the-vendored-spec)) |
 | Git LFS | ✅ | Batch API on the same remote; presigned S3 transfers with a server-proxied fallback |
 | Webhooks | ✅ | HMAC-signed `push` and `repo.sync.*` events, plus webhook CRUD |
-| Upstream sync & credentials | ✅ | `pull-upstream`, detach base, git-credential CRUD |
+| Upstream sync & credentials | ✅ | `pull-upstream`, detach base, git-credential CRUD. Local-mode (SQLite) gap: a *git-surface* push does not auto-schedule upstream sync (the hook subprocess cannot reach the in-process queue) — API writes and explicit `pull-upstream` are unaffected |
 | Auth model | ✅ | Customer-signed JWTs (`ES256`/`RS256`/`EdDSA`/`PS256`/`ES384`/`ES512`), scopes `git:read` / `git:write` / `repo:write` / `org:read` (exact matching — no scope implies another), `refs` policy tuples ([docs/02](../02-authentication.md)) |
 
 ### Deprecated aliases
@@ -136,7 +136,7 @@ snapshot (each recorded in the [decision log](../README.md#document-index)):
 | `POST .../reset-commits` (NDJSON) | Not implemented; `POST .../restore-commit` (plain JSON) covers the SDK-visible restore semantics | Recorded deviation (docs/12) — no SDK calls `reset-commits` |
 | `DELETE /api/repos/{repo_name}/tags/{tag_name}` (tag in path) | `DELETE .../tags` with the tag in the request body | Matches the SDKs' actual call shape |
 | `GET`/`POST /api/repos` (bare collection routes) | `/api/v1/repos` only; named-repo aliases exist for repo-scoped routes, not org-scoped collections | Alias layer covers the styles SDKs use |
-| RFC 9457 problem-details error bodies (spec) | Errors are `{"error":"<msg>"}` envelopes with meaningful status codes | Recorded deviation (docs/12): all three SDKs branch on status codes and none parses problem-details fields |
+| RFC 9457 problem-details error bodies (spec) | Read/management routes fail with `{"error":"<msg>"}` envelopes; the [docs/04](../04-streaming-commit-protocols.md) write routes (commit-pack, diff-commit, restore-commit, ref/notes writes, merge) fail with their protocol's `{"result":{"success":false,…}}` envelope — including auth failures. Status codes are meaningful on both | Recorded deviations (docs/12, ADR-26): all three SDKs branch on status codes and none parses problem-details fields |
 | `201` on streaming write endpoints (spec) | `commit-pack` / `diff-commit` / `restore-commit` return `200` | Recorded deviation (docs/12): the SDKs accept both; schema-validating clients should expect `200` |
 | One ephemeral namespace across git and REST | Two separate ref spaces: git push to `/{repo}+ephemeral.git` writes a distinct `+ephemeral` storage key, REST `ephemeral=true` reads/writes `refs/namespaces/ephemeral/…` under the base repository — ephemeral state does not cross surfaces | Recorded cross-surface split (docs/13): REST writes follow the REST read surface so API-created ephemeral refs stay visible to `GET .../branches?ephemeral=true` and merge promotion |
 
