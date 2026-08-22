@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"strings"
 	"testing"
 	"time"
 )
@@ -293,6 +294,12 @@ func TestClientKeyTrustedProxies(t *testing.T) {
 		// Sentinel keys stay put even with an allowlist configured.
 		{"empty-remoteaddr", "", []string{"203.0.113.9"}, "unknown"},
 		{"non-ip-remoteaddr", "pipe", []string{"203.0.113.9"}, "pipe"},
+		// Oversized chains fail closed to the peer key before any hop is
+		// examined (Codex security round: pre-auth allocation bound).
+		{"oversized-xff", proxy, []string{strings.Repeat("10.0.0.9, ", 512) + "203.0.113.9"}, "10.0.0.5"},
+		{"oversized-xff-multi-header", proxy, []string{strings.Repeat("x", 4096), "203.0.113.9"}, "10.0.0.5"},
+		// Just under the cap still resolves normally.
+		{"under-cap", proxy, []string{strings.Repeat("10.0.0.9, ", 300) + "198.51.100.7"}, "198.51.100.7"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -299,12 +299,32 @@ func (l *rateLimiter) clientKey(r *http.Request) string {
 		return host
 	}
 	// Walk the XFF chain right-to-left across all header copies (later
-	// headers are later hops).
+	// headers are later hops). The walk is allocation-free — hops are
+	// sliced off by reverse index, never split into a materialized list —
+	// because it runs pre-admission and pre-auth on every request, so a
+	// client-supplied megabyte of commas must not cost a megabyte-scale
+	// allocation even on already-limited requests (Codex security round).
 	values := r.Header.Values("X-Forwarded-For")
+	total := 0
+	for _, v := range values {
+		total += len(v)
+	}
+	if total > maxForwardedForBytes {
+		return host // oversized chain: fail closed to the peer key
+	}
 	for vi := len(values) - 1; vi >= 0; vi-- {
-		hops := strings.Split(values[vi], ",")
-		for hi := len(hops) - 1; hi >= 0; hi-- {
-			addr, ok := parseForwardedAddr(hops[hi])
+		v := values[vi]
+		if strings.TrimSpace(v) == "" {
+			return host // empty header copy: malformed, fail closed
+		}
+		for v != "" {
+			hop := v
+			if i := strings.LastIndexByte(v, ','); i >= 0 {
+				hop, v = v[i+1:], v[:i]
+			} else {
+				v = ""
+			}
+			addr, ok := parseForwardedAddr(hop)
 			if !ok {
 				return host // malformed hop: fall back to the peer key
 			}
@@ -315,6 +335,13 @@ func (l *rateLimiter) clientKey(r *http.Request) string {
 	}
 	return host
 }
+
+// maxForwardedForBytes caps the combined X-Forwarded-For bytes clientKey
+// will examine. Legitimate proxy chains are tens of bytes per hop and a
+// handful of hops; anything approaching this cap is hostile padding, and
+// failing closed to the peer key keeps the pre-auth key derivation O(small)
+// regardless of what a client stuffs into the header.
+const maxForwardedForBytes = 4096
 
 // trustedContains reports whether addr is inside any allowlisted prefix.
 // Addresses are unmapped first so IPv4-mapped IPv6 peers match IPv4
