@@ -272,6 +272,12 @@ func (s *server) handleForkRepo(w http.ResponseWriter, r *http.Request, verifier
 		s.internalErr(w, r, "verify fork pack", errors.Join(regErr, err))
 		return
 	}
+	// Threshold check regardless of regErr (issue #1): an ambiguous
+	// registration error may have committed the row — the same reason the
+	// verification above runs unconditionally — and skipping the trigger
+	// would strand a threshold crossing until the next write. The check
+	// reads the committed count, so it safely no-ops on a true failure.
+	s.triggerRepack(ctx, repo.RepoID)
 	if regErr != nil {
 		s.forkAbandon(ctx, claims.Iss, url)
 		s.internalErr(w, r, "register fork pack", regErr)

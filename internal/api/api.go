@@ -7,6 +7,7 @@
 package api
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -60,6 +61,13 @@ type Config struct {
 	// value disables limiting. The serve command plumbs it from
 	// CODESTORAGE_RATE_RPS / CODESTORAGE_RATE_BURST.
 	RateLimit RateLimitConfig
+
+	// MaybeRepack, when set, runs after every successful RegisterPacks on
+	// a write pipeline (issue #1): the serve command passes the repack
+	// trigger's threshold check, which enqueues at most one unique-by-repo
+	// background fold. It must be quick and never block on the fold. Nil
+	// disables triggering.
+	MaybeRepack func(ctx context.Context, repo string)
 }
 
 // New builds the full HTTP handler: recover -> request log -> router, with
@@ -88,6 +96,7 @@ func New(cfg Config) (http.Handler, error) {
 		refStore:    cfg.RefStore,
 		blobStore:   cfg.BlobStore,
 		cacheDir:    cfg.CacheDir,
+		maybeRepack: cfg.MaybeRepack,
 	}
 
 	// Phase-5 eventing/sync surface (docs/07 p5): the syncServer extends

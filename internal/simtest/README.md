@@ -17,7 +17,11 @@ its own handles and cache dir, like separate processes on a host):
   `events.RefStore` → `ref.IdempotentCAS` chain;
 - **ref deletes**, **node hydrations** (`githttp.Hydrate`), **mid-push
   crashes** (after upload / after register), **node crash-restarts** (warm
-  and cold).
+  and cold);
+- **background repacks** (issue #1, `jobs.Repacker`): plain folds through a
+  node's fault-injected stores, plus a deterministic two-folder race
+  (`repack-race`) where a mid-race push forces the competing folds apart and
+  the loser must delete exactly its own uploaded blob.
 
 Storage calls pass through `SimRefStore`/`SimBlobStore`, which inject:
 
@@ -43,7 +47,13 @@ Checked from clean (never fault-injected) handles:
    reported as a win; a clean conflict must never hide a committed
    own-write), and hydration absorbing transient not-founds (issue #6);
 5. webhook soundness/completeness: every delivery matches a committed
-   transition; every reported win emitted at least one delivery.
+   transition; every reported win emitted at least one delivery;
+6. **pack rows only grow, modulo repack** (issue #1, checked every step):
+   outside a repack a registered pack row never disappears or changes key;
+   a repack's before→after transition is pinned in-op — the observable row
+   set is exactly the pre-set or exactly the folded set (replacement
+   atomicity), a lost race changes nothing and leaks no blob, and
+   superseded blobs outlive the fold (the sweeper owns them).
 
 ## Entry points
 

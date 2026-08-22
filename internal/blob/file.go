@@ -112,6 +112,12 @@ func (b *File) Stat(ctx context.Context, key string) (int64, error) {
 	return bucketStat(ctx, b.bucket, key)
 }
 
+// ReadRange returns exactly the length bytes at offset from the object at
+// key (a seeked local read; ErrNotFound when absent).
+func (b *File) ReadRange(ctx context.Context, key string, offset, length int64) ([]byte, error) {
+	return bucketReadRange(ctx, b.bucket, key, offset, length)
+}
+
 // Delete removes the object at key (ErrNotFound when absent).
 func (b *File) Delete(ctx context.Context, key string) error {
 	return bucketDelete(ctx, b.bucket, key)
@@ -187,6 +193,34 @@ func bucketStat(ctx context.Context, bucket *gcblob.Bucket, key string) (int64, 
 		return 0, fmt.Errorf("stat %s: %w", key, err)
 	}
 	return attrs.Size, nil
+}
+
+// bucketReadRange reads exactly [offset, offset+length) from the object at
+// key via a ranged reader (S3 ranged GET / seeked local read), mapping
+// gocloud's NotFound code onto ErrNotFound. A short read — the object ends
+// before offset+length — is a loud non-ErrNotFound error, never silently
+// truncated bytes. It is the single ReadRange implementation for
+// gocloud-backed BlobStores.
+func bucketReadRange(ctx context.Context, bucket *gcblob.Bucket, key string, offset, length int64) ([]byte, error) {
+	assertf(bucket != nil && key != "" && offset >= 0 && length > 0,
+		"bucketReadRange(%q, %d, %d)", key, offset, length)
+	r, err := bucket.NewRangeReader(ctx, key, offset, length, nil)
+	if err != nil {
+		if gcerrors.Code(err) == gcerrors.NotFound {
+			return nil, fmt.Errorf("read range %s: %w", key, ErrNotFound)
+		}
+		return nil, fmt.Errorf("read range %s: %w", key, err)
+	}
+	defer r.Close()
+	buf, err := io.ReadAll(r)
+	if err != nil {
+		return nil, fmt.Errorf("read range %s: %w", key, err)
+	}
+	if int64(len(buf)) != length {
+		return nil, fmt.Errorf("read range %s: object too short: %d bytes at offset %d, want %d",
+			key, len(buf), offset, length)
+	}
+	return buf, nil
 }
 
 // bucketCopy duplicates srcKey to dstKey inside the bucket, mapping

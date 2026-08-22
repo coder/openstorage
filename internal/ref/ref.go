@@ -79,6 +79,19 @@ type RefStore interface {
 	// listed blob individually so its memory never scales with a repo's
 	// registered-pack count, which pre-policy pushes can grow).
 	HasPack(ctx context.Context, repo, key string) (bool, error)
+	// ReplacePacks atomically installs a repack fold (issue #1): in ONE
+	// transaction it deletes exactly the old rows and inserts newPack.
+	// The delete doubles as the CAS precondition — every old row must
+	// still exist — so a fold racing another fold loses cleanly:
+	// won=false, no error, zero DB changes. Rows registered concurrently
+	// by new pushes are NOT part of the precondition and survive the
+	// swap; the caller guarantees newPack covers every object of the old
+	// rows' packs (never a reachability-trimmed subset), so surviving
+	// rows and refs stay consistent regardless of interleaving. Callers
+	// must have published newPack's bytes to blob storage BEFORE calling
+	// (publish-before-flip); on won=false they own deleting that blob.
+	// A won swap bumps the repo generation via the InitSchema triggers.
+	ReplacePacks(ctx context.Context, repo string, old []Pack, newPack Pack) (won bool, err error)
 	// GetGeneration returns repo's mutation generation: 0 for a repo no
 	// mutation ever touched, strictly positive and monotonically increasing
 	// afterwards. It is an invalidation token over committed row changes,
@@ -346,6 +359,57 @@ func (s *PG) RegisterPacks(ctx context.Context, repo string, packs []Pack) error
 		}
 		return nil
 	})
+}
+
+// errReplaceLost aborts the ReplacePacks transaction (rollback) when the
+// delete precondition fails; mapped to won=false by the callers below.
+var errReplaceLost = errors.New("replace packs: old pack set changed")
+
+// validateReplacePacks asserts the ReplacePacks argument invariants shared
+// by both backends. Old ids must be unique: the delete-rowcount CAS counts
+// rows, and a duplicated id would make len(old) unreachable.
+func validateReplacePacks(repo string, old []Pack, newPack Pack) {
+	assertf(repo != "", "ReplacePacks: empty repo")
+	assertf(len(old) > 0, "ReplacePacks: empty old pack set")
+	assertf(newPack.ID != "" && newPack.Key != "", "ReplacePacks: empty new pack id/key %+v", newPack)
+	seen := make(map[string]bool, len(old))
+	for _, p := range old {
+		assertf(p.ID != "" && p.Key != "", "ReplacePacks: empty old pack id/key %+v", p)
+		assertf(!seen[p.ID], "ReplacePacks: duplicate old pack id %q", p.ID)
+		seen[p.ID] = true
+	}
+}
+
+// ReplacePacks installs a repack fold in one transaction (see RefStore).
+// The insert tolerates an existing (repo, id) row — pack ids derive from
+// pack content, so a same-id row registered concurrently is byte-identical
+// (RegisterPacks invariant) and keeping it is equivalent to inserting.
+func (s *PG) ReplacePacks(ctx context.Context, repo string, old []Pack, newPack Pack) (won bool, err error) {
+	validateReplacePacks(repo, old, newPack)
+	ids := make([]string, len(old))
+	for i, p := range old {
+		ids[i] = p.ID
+	}
+	err = pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		ct, err := tx.Exec(ctx, `DELETE FROM packs WHERE repo = $1 AND id = ANY($2)`, repo, ids)
+		if err != nil {
+			return err
+		}
+		if int(ct.RowsAffected()) != len(old) {
+			return errReplaceLost // another fold got here first: roll back
+		}
+		_, err = tx.Exec(ctx,
+			`INSERT INTO packs (repo, id, s3_key) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
+			repo, newPack.ID, newPack.Key)
+		return err
+	})
+	if errors.Is(err, errReplaceLost) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("replace packs %s: %w", repo, err)
+	}
+	return true, nil
 }
 
 // HasPack reports whether repo has a registered pack with blob key.

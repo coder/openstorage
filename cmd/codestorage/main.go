@@ -140,8 +140,8 @@ func cmdServe(ctx context.Context, args []string) error {
 
 	// HTTP API (single-org self-host mode). The read endpoints share the
 	// ref/blob stores and cache dir with the githttp fallback below.
-	apiHandler, metaStore, verifier, cleanup, err := buildAPIHandler(ctx, cfg.dbURL, cfg.org, httpBaseURL, orgPEMBlocks, st, bl, cfg.cacheDir,
-		api.RateLimitConfig{RPS: cfg.rateRPS, Burst: cfg.rateBurst}, cfg.sweep)
+	apiHandler, metaStore, verifier, maybeRepack, cleanup, err := buildAPIHandler(ctx, cfg.dbURL, cfg.org, httpBaseURL, orgPEMBlocks, st, bl, cfg.cacheDir,
+		api.RateLimitConfig{RPS: cfg.rateRPS, Burst: cfg.rateBurst}, cfg.sweep, cfg.repackThreshold)
 	if err != nil {
 		return err
 	}
@@ -155,6 +155,11 @@ func cmdServe(ctx context.Context, args []string) error {
 	// Git smart-HTTP path, authenticated with the same verifier as the API
 	// (ADR-8: iss-resolved org keys; the spike's single-key mode is gone).
 	srv := githttp.NewServer(st, bl, cfg.cacheDir, verifier, cfg.org)
+	// Post-push repack trigger (issue #1): pre-receive registered any
+	// pushed packs strictly before receive-pack returned, so the threshold
+	// check runs in the serve process for BOTH queue backends (the local
+	// hook subprocess has no channel to the in-process queue).
+	srv.MaybeRepack = maybeRepack
 	// docs/05 git URLs address repos by repo_id (name-style urls accepted
 	// too, ADR-21); the resolved RepoID is the only storage key, and the
 	// record backs claim matching for url- or id-carrying tokens (docs/02).

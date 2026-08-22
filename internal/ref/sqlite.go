@@ -285,6 +285,59 @@ func (s *SQLite) RegisterPacks(ctx context.Context, repo string, packs []Pack) e
 	return tx.Commit()
 }
 
+// sqliteDeleteChunk bounds one DELETE ... IN (...) statement's host
+// parameters during ReplacePacks: an old-pack set larger than SQLite's
+// variable limit (32766 by default; 999 in older builds) would otherwise
+// fail EVERY fold of a large backlog — and since later triggers submit the
+// same oversized set, repacking could never recover. Chunks execute inside
+// the one transaction, so atomicity and the rowcount CAS are unaffected.
+const sqliteDeleteChunk = 500
+
+// ReplacePacks installs a repack fold in one transaction (see RefStore and
+// the PG implementation, whose semantics this mirrors byte-for-byte: the
+// delete-rowcount is the CAS precondition — summed across bounded delete
+// chunks here — the insert tolerates an existing identical (repo, id) row,
+// and a lost race rolls back with won=false).
+func (s *SQLite) ReplacePacks(ctx context.Context, repo string, old []Pack, newPack Pack) (won bool, err error) {
+	validateReplacePacks(repo, old, newPack)
+	tx, err := s.db.BeginTx(ctx, nil) // BEGIN IMMEDIATE via _txlock
+	if err != nil {
+		return false, fmt.Errorf("replace packs begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	deleted := 0
+	for chunkStart := 0; chunkStart < len(old); chunkStart += sqliteDeleteChunk {
+		chunk := old[chunkStart:min(chunkStart+sqliteDeleteChunk, len(old))]
+		args := make([]any, 0, len(chunk)+1)
+		args = append(args, repo)
+		for _, p := range chunk {
+			args = append(args, p.ID)
+		}
+		res, err := tx.ExecContext(ctx,
+			`DELETE FROM packs WHERE repo = ? AND id IN (?`+strings.Repeat(",?", len(chunk)-1)+`)`, args...)
+		if err != nil {
+			return false, fmt.Errorf("replace packs %s: %w", repo, err)
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return false, fmt.Errorf("replace packs %s rows: %w", repo, err)
+		}
+		deleted += int(n)
+	}
+	if deleted != len(old) {
+		return false, nil // another fold got here first: roll back via defer
+	}
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO packs (repo, id, s3_key) VALUES (?, ?, ?) ON CONFLICT DO NOTHING`,
+		repo, newPack.ID, newPack.Key); err != nil {
+		return false, fmt.Errorf("replace packs %s: %w", repo, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("replace packs %s commit: %w", repo, err)
+	}
+	return true, nil
+}
+
 // HasPack reports whether repo has a registered pack with blob key.
 func (s *SQLite) HasPack(ctx context.Context, repo, key string) (bool, error) {
 	assertf(repo != "" && key != "", "HasPack(%q, %q)", repo, key)

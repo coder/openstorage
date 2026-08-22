@@ -44,6 +44,12 @@ type Queue interface {
 	// in-process coalescing); overlap with an in-flight run is handled by
 	// the store's TryBeginSync claim (invariant 11).
 	EnqueueSync(ctx context.Context, job sync.Job) error
+	// EnqueueRepack schedules one background repack of repo's registered
+	// packs (issue #1). Jobs for the same repo are deduplicated while
+	// active (River unique-by-args jobs / in-process in-flight skip); a
+	// fold that loses its install race is not retried eagerly — the next
+	// write past the threshold re-triggers.
+	EnqueueRepack(ctx context.Context, repo string) error
 	Close()
 }
 

@@ -88,6 +88,171 @@ func (sweepArgs) InsertOpts() river.InsertOpts {
 	}
 }
 
+// repackArgs is one durable background-repack job, unique per repo across
+// the active states exactly like syncArgs: post-write triggers on every
+// node can fire concurrently, and River coalesces them into one job.
+// MaxAttempts 1 — a lost fold-install race must not retry eagerly (the
+// next insert past the threshold is the retry), and a failed fold is
+// harmless to defer the same way.
+//
+// Uniqueness including the running state (river requires running in
+// ByState) swallows triggers that fire while a fold runs — but a running
+// fold works a row snapshot from its start, so packs registered mid-fold
+// survive it and a burst could otherwise finish above the threshold with
+// nothing scheduled until the next write. The worker therefore completes
+// its job transactionally (river.JobCompleteTx) and inserts a gated
+// successor in the SAME transaction — see repackWorker.Work for the gate
+// and the swallowed-trigger coverage argument.
+type repackArgs struct {
+	Repo string `json:"repo" river:"unique"`
+}
+
+func (repackArgs) Kind() string { return "repack" }
+
+// repackMaxAttempts bounds river's backoff retries of a FAILING fold
+// (transient materialization/blob/git errors). More than one attempt is
+// load-bearing: triggers arriving while the job is active are deduplicated
+// against it, so the retryable job itself is the only follow-up they have —
+// a single-attempt job dying on a blip stranded them until the next write.
+// Lost races and no-ops return nil (never retried), and a job exhausting
+// all attempts means a persistent infrastructure failure, where the next
+// write's trigger chain is the recovery path anyway.
+const repackMaxAttempts = 4
+
+func (repackArgs) InsertOpts() river.InsertOpts {
+	return river.InsertOpts{
+		MaxAttempts: repackMaxAttempts,
+		UniqueOpts: river.UniqueOpts{
+			ByArgs: true,
+			ByState: []rivertype.JobState{
+				rivertype.JobStateAvailable,
+				rivertype.JobStatePending,
+				rivertype.JobStateRetryable,
+				rivertype.JobStateRunning,
+				rivertype.JobStateScheduled,
+			},
+		},
+	}
+}
+
+// repackFollowUpDelay schedules a due follow-up fold slightly in the
+// future: long enough to batch a burst's remaining registrations, short
+// enough to keep pack counts near the threshold under sustained traffic.
+const repackFollowUpDelay = 5 * time.Second
+
+// repackWorker runs one fold attempt; the Repacker owns race handling and
+// reporting. pool is the river client's own pgx pool (set by NewRiver
+// before the client starts); the transactional completion below needs it.
+type repackWorker struct {
+	river.WorkerDefaults[repackArgs]
+	repacker *Repacker
+	pool     *pgxpool.Pool
+}
+
+// Work folds once, then closes the trigger-uniqueness window by completing
+// the job and inserting a GATED successor in one transaction. The gate —
+// due && (folded || count changed while this job ran) — makes chains both
+// complete and terminating:
+//
+//   - budget-sliced backlogs progress: each link folds (folded=true) and
+//     chains while the count stays at/above the threshold;
+//   - wedged repos terminate: a no-op link over an unchanged count
+//     schedules nothing, so a repo stuck above the threshold with no
+//     pairable pair does not busy-chain (and disabling the threshold
+//     stops everything);
+//   - a caller drip-feeding single packs cannot force per-pack
+//     recompression: after a fold drops the count below the threshold,
+//     due=false ends the chain until the trigger threshold is crossed
+//     again.
+//
+// Swallowed-trigger coverage: a trigger whose insert was deduped BEFORE
+// the completion transaction updated this job's row implies its
+// registration committed earlier still, so the post-completion count read
+// (ordered strictly after JobCompleteTx inside the transaction window)
+// observes it — count changed ⇒ successor. A trigger insert arriving
+// DURING the transaction blocks on the unique index entry this row is
+// vacating and proceeds after commit: it either conflicts with the
+// just-inserted successor (which covers it) or, when the gate scheduled
+// nothing, inserts its own job. No ordering strands a registration.
+func (w *repackWorker) Work(ctx context.Context, job *river.Job[repackArgs]) error {
+	// The pre-count baseline detects growth across the fold; a failed read
+	// degrades to preKnown=false, which the gate treats conservatively
+	// (schedule when due — an extra no-op successor terminates by the
+	// plateau rule).
+	preCount, _, preErr := w.repacker.FollowUpDue(ctx, job.Args.Repo)
+	preKnown := preErr == nil
+	folded, err := w.repacker.Repack(ctx, job.Args.Repo)
+	if !folded {
+		if err != nil {
+			// Fold-budget exhaustion is DETERMINISTIC: the same input
+			// times out on every attempt, so retrying would multiply the
+			// per-fold budget by MaxAttempts (a git:write caller
+			// registering pathological packs could hold a shared worker
+			// for the product). Cancel terminally — the budget already
+			// chose bounded-work-over-completeness for such inputs, and
+			// the next threshold crossing starts a fresh, equally bounded
+			// job. Everything else is a transient pre-swap failure:
+			// return it so river RETRIES with backoff (repackMaxAttempts)
+			// — the job must stay active, because triggers deduplicated
+			// against it have no other follow-up.
+			if errors.Is(err, context.DeadlineExceeded) {
+				return river.JobCancel(err)
+			}
+			return err
+		}
+		// Clean no-op or lost race: complete normally, but still through
+		// the gated path — registrations may have raced this job.
+	} else if err != nil {
+		// The fold committed (or may have) but verification failed
+		// transiently: the row swap is durable and the sweeper's
+		// quarantine heal backstops the bytes. Failing this MaxAttempts-1
+		// job would skip the successor and strand coalesced mid-fold
+		// triggers — log and continue to the atomic completion below.
+		w.repacker.logger.Warn("repack: fold committed but verification failed (sweeper heal is the backstop)",
+			"repo", job.Args.Repo, "err", err)
+	}
+	assertf(w.pool != nil, "repackWorker: pool not wired")
+	// Failures anywhere in the completion transaction SNOOZE the job:
+	// returning nil would let river complete it without the gate ever
+	// running. The snoozed re-run costs one idempotent no-op fold and
+	// retries the completion; if the commit failure was ambiguous (it
+	// actually landed, successor included), the resurrected job no-ops
+	// and completes normally.
+	completionFailed := func(stage string, err error) error {
+		w.repacker.logger.Warn("repack: atomic completion failed; snoozing to retry it",
+			"repo", job.Args.Repo, "stage", stage, "err", err)
+		return river.JobSnooze(repackFollowUpDelay)
+	}
+	tx, err := w.pool.Begin(ctx)
+	if err != nil {
+		return completionFailed("begin", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := river.JobCompleteTx[*riverpgxv5.Driver](ctx, tx, job); err != nil {
+		return completionFailed("complete", err)
+	}
+	// The count read runs strictly AFTER JobCompleteTx (see the coverage
+	// argument above) on the repacker's own store connection: it sees
+	// every registration whose trigger was already deduped against this
+	// job's active row. A failed read must NOT commit the completion —
+	// treating it as due=false would strand exactly those registrations —
+	// so it snoozes like any other completion-transaction failure.
+	postCount, due, postErr := w.repacker.FollowUpDue(ctx, job.Args.Repo)
+	if postErr != nil {
+		return completionFailed("follow-up recheck", postErr)
+	}
+	if due && (folded || !preKnown || postCount != preCount) {
+		if _, err := river.ClientFromContext[pgx.Tx](ctx).InsertTx(ctx, tx, repackArgs{Repo: job.Args.Repo},
+			&river.InsertOpts{ScheduledAt: time.Now().Add(repackFollowUpDelay)}); err != nil {
+			return completionFailed("insert successor", err)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return completionFailed("commit", err)
+	}
+	return nil
+}
+
 // sweepWorker runs one orphan-pack sweep; the Sweeper owns all reporting.
 type sweepWorker struct {
 	river.WorkerDefaults[sweepArgs]
@@ -141,9 +306,10 @@ func (w *syncWorker) Work(ctx context.Context, job *river.Job[syncArgs]) error {
 // insert-only clients against the same database, which is how git-surface
 // events reach the server's workers across process boundaries.
 type River struct {
-	client  *river.Client[pgx.Tx]
-	pool    *pgxpool.Pool
-	started bool
+	client        *river.Client[pgx.Tx]
+	pool          *pgxpool.Pool
+	started       bool
+	repackEnabled bool
 }
 
 var _ Queue = (*River)(nil)
@@ -153,7 +319,10 @@ var _ Queue = (*River)(nil)
 // share the delivery/sync code with the local queue. A non-nil sweep
 // schedules the periodic orphan-pack sweep (run once on start, then every
 // Interval); nil disables it (hook subprocesses, tests without storage).
-func NewRiver(ctx context.Context, pgURL string, deliverer *events.Deliverer, runSync SyncRunner, sweep *SweepSchedule, logger *slog.Logger) (*River, error) {
+// A non-nil repack registers the background-repack worker; nil rejects
+// EnqueueRepack (repacking disabled or not wired, e.g. insert-only hook
+// clients that must never fold).
+func NewRiver(ctx context.Context, pgURL string, deliverer *events.Deliverer, runSync SyncRunner, sweep *SweepSchedule, repack *Repacker, logger *slog.Logger) (*River, error) {
 	assertf(deliverer != nil, "NewRiver: nil deliverer")
 	assertf(runSync != nil, "NewRiver: nil sync runner")
 	assertf(sweep == nil || (sweep.Sweeper != nil && sweep.Interval > 0),
@@ -208,6 +377,9 @@ func NewRiver(ctx context.Context, pgURL string, deliverer *events.Deliverer, ru
 	workers := river.NewWorkers()
 	river.AddWorker(workers, &deliveryWorker{deliverer: deliverer})
 	river.AddWorker(workers, &syncWorker{run: runSync, logger: logger})
+	if repack != nil {
+		river.AddWorker(workers, &repackWorker{repacker: repack, pool: pool})
+	}
 	var periodic []*river.PeriodicJob
 	if sweep != nil {
 		river.AddWorker(workers, &sweepWorker{sweeper: sweep.Sweeper})
@@ -235,7 +407,7 @@ func NewRiver(ctx context.Context, pgURL string, deliverer *events.Deliverer, ru
 		pool.Close()
 		return nil, fmt.Errorf("jobs: start river client: %w", err)
 	}
-	return &River{client: client, pool: pool, started: true}, nil
+	return &River{client: client, pool: pool, started: true, repackEnabled: repack != nil}, nil
 }
 
 // NewRiverInsertOnly connects an insert-only client (no migrations — hooks
@@ -266,6 +438,18 @@ func (q *River) EnqueueWebhookDelivery(ctx context.Context, d events.Delivery) e
 
 func (q *River) EnqueueSync(ctx context.Context, job sync.Job) error {
 	_, err := q.client.Insert(ctx, syncArgs{Org: job.Org, RepoID: job.RepoID, Ref: job.Ref}, nil)
+	return err
+}
+
+// EnqueueRepack inserts one unique-by-repo repack job. Refused when this
+// client has no repack worker registered: a durable job nobody works would
+// sit queued forever AND its uniqueness would swallow every later insert.
+func (q *River) EnqueueRepack(ctx context.Context, repo string) error {
+	assertf(repo != "", "EnqueueRepack: empty repo")
+	if !q.repackEnabled {
+		return errors.New("jobs: repack worker not registered on this queue")
+	}
+	_, err := q.client.Insert(ctx, repackArgs{Repo: repo}, nil)
 	return err
 }
 

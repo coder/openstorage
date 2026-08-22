@@ -926,5 +926,11 @@ func (s *server) wrefPublish(ctx context.Context, repoPath, repoID string, scrat
 	if err := blob.EnsurePublished(ctx, s.blobStore, key, packPath); err != nil {
 		return errors.Join(regErr, fmt.Errorf("verify pack %s: %w", key, err))
 	}
+	// Threshold check regardless of regErr (issue #1): an ambiguous
+	// registration error may have committed the row — the same reason the
+	// verification above runs unconditionally — and skipping the trigger
+	// would strand a threshold crossing until the next write. The check
+	// reads the committed count, so it safely no-ops on a true failure.
+	s.triggerRepack(ctx, repoID)
 	return regErr
 }

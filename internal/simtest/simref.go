@@ -106,6 +106,24 @@ func (s *SimRefStore) RegisterPacks(ctx context.Context, repo string, packs []re
 	}
 }
 
+// ReplacePacks supports the same clean/ambiguous split as CASRef: an
+// ambiguous fault executes the swap (which may really commit) and then
+// loses the outcome, exercising the repack job's leave-the-blob handling.
+func (s *SimRefStore) ReplacePacks(ctx context.Context, repo string, old []ref.Pack, newPack ref.Pack) (bool, error) {
+	switch class := s.inj.begin(OpRefReplacePacks); class {
+	case FaultClean:
+		return false, cleanFaultError{op: OpRefReplacePacks}
+	case FaultAmbiguous:
+		won, err := s.inner.ReplacePacks(ctx, repo, old, newPack)
+		s.inj.noteInnerOutcome(OpRefReplacePacks, fmt.Sprintf("won=%v err=%v", won, err))
+		return false, ambiguousFaultError{op: OpRefReplacePacks}
+	case FaultNone:
+		return s.inner.ReplacePacks(ctx, repo, old, newPack)
+	default:
+		panic(fmt.Sprintf("simtest: fault class %v invalid for %s", class, OpRefReplacePacks))
+	}
+}
+
 // ListPacks delegates to the inner store unless a fault is injected.
 func (s *SimRefStore) ListPacks(ctx context.Context, repo string) ([]ref.Pack, error) {
 	if class := s.inj.begin(OpRefListPacks); class != FaultNone {

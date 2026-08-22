@@ -55,6 +55,13 @@ type Server struct {
 	// either the url or the repo_id claim (docs/02) authenticate. When
 	// nil, every path element is unresolvable.
 	ResolveRepo func(ctx context.Context, base string) (meta.Repo, bool)
+	// MaybeRepack, when set, runs after every receive-pack POST with the
+	// resolved storage key (issue #1): pre-receive registers pushed packs
+	// strictly before receive-pack returns, so this is the git surface's
+	// post-RegisterPacks repack-threshold trigger. It must be quick
+	// (a pack-count read plus at most one job enqueue) and must never
+	// block on the fold itself. Nil disables triggering.
+	MaybeRepack func(ctx context.Context, repo string)
 }
 
 // repoTarget is a resolved request target: the live repo record plus the
@@ -349,5 +356,12 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 		// Headers are already sent; the pkt-line stream carries per-ref
 		// errors to the client. Just log.
 		log.Printf("%s %s: %v", service, repo, err)
+	}
+	if service == "receive-pack" && s.MaybeRepack != nil {
+		// Unconditionally on completion, not only on success: pre-receive
+		// may have registered packs even when a later per-ref update was
+		// denied. Cancel-free context — the client hanging up right after
+		// its push must not suppress the trigger.
+		s.MaybeRepack(context.WithoutCancel(r.Context()), target.key)
 	}
 }
