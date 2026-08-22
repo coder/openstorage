@@ -222,8 +222,12 @@ every version stays stored and billed, so "reclaimed" bytes would be a lie:
 
 A conservative enablement sequence:
 
-1. Run list-only (the default) for at least one age-threshold window; watch
-   [sweep reports](#reading-a-sweep-report) and audit the candidate lines.
+1. Audit first: leave `CODESTORAGE_SWEEP_DELETE_ENABLED=false` (the default) for at
+   least one age-threshold window; watch [sweep reports](#reading-a-sweep-report) and
+   audit the candidate lines. Note the out-of-the-box default is list-only for *general*
+   orphans only — superseded reaping is already on. If the audit window must be fully
+   non-destructive, set `CODESTORAGE_SWEEP_DELETE_SUPERSEDED=false` for its duration and
+   restore it afterward.
 2. Confirm the whole fleet — including any node that executes git hooks — is on a current
    build (see the prerequisite above).
 3. Leave `CODESTORAGE_SWEEP_DELETE_SUPERSEDED=true` (the default) so repack-superseded
