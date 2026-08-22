@@ -129,6 +129,26 @@ type ReserveDecision struct {
 // exercise the cap without minting thousands of rows.
 var maxActiveReservations = 10_000
 
+// MaxLFSObjectsPerRepo caps a repository's REGISTERED LFS object count
+// (issue #51, Codex security round 2): registered objects are permanent
+// rows plus bucket keys, and the byte quota bounds their population at
+// nothing (16M three-byte objects cost 48 MiB). Enforced ATOMICALLY inside
+// RegisterLFSObject's serialized transaction (Codex round 6: an
+// HTTP-layer read-then-register check admits concurrent overshoot); the
+// LFS surface also pre-checks it for fast-fail UX. A var for tests.
+var MaxLFSObjectsPerRepo = int64(100_000)
+
+// ErrLFSObjectCapExceeded is RegisterLFSObject's typed denial: inserting
+// this NEW object would take the repository past MaxLFSObjectsPerRepo.
+// Re-registration of an existing key never returns it (zero growth).
+var ErrLFSObjectCapExceeded = errors.New("repository LFS object count limit reached")
+
+// lfsRegisterLockClass namespaces the per-repo advisory lock
+// RegisterLFSObject takes ("LFSC") in the two-int4 keyspace — disjoint from
+// the admission lock class ("PKQR") and never nested with it, so no
+// deadlock ordering exists.
+const lfsRegisterLockClass = int32(0x4C465343)
+
 // reserveLockClass namespaces the per-base advisory locks ReservePackBytes
 // takes ("PKQR"), in the two-int4 pg_advisory_xact_lock keyspace — disjoint
 // from the single-int8 keys the schema-init paths use (META, SPIKE, RIVER).
@@ -370,15 +390,36 @@ func validateRegisterLFS(repo, key string, bytes int64) {
 // reservation (issue #51) — see RefStore. Mirrors RegisterPacks' ledger
 // discipline: the one-transaction insert + reservation consumption + credit
 // is what lets ReservePackBytes read a single snapshot without locking
-// against LFS settlement.
+// against LFS settlement. The object-count cap is enforced HERE, after the
+// insert, under a per-repo advisory lock (Codex round 6): registrations for
+// one repo serialize, so two writers straddling the cap cannot both count a
+// pre-insert snapshot and overshoot. Returns ErrLFSObjectCapExceeded (and
+// commits nothing) when the NEW row would exceed the cap.
 func (s *PG) RegisterLFSObject(ctx context.Context, repo, key string, bytes int64) error {
 	validateRegisterLFS(repo, key, bytes)
 	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		// Serialize register-vs-register per repo so the post-insert count
+		// below is exact (disjoint lock class from admission, never nested).
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1), $2)`, repo, lfsRegisterLockClass); err != nil {
+			return err
+		}
 		ct, err := tx.Exec(ctx,
 			`INSERT INTO lfs_objects (repo, key, bytes) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
 			repo, key, bytes)
 		if err != nil {
 			return err
+		}
+		if ct.RowsAffected() > 0 {
+			// Count AFTER inserting (own row visible): under the lock this
+			// is the authoritative population including this registration.
+			var count int64
+			if err := tx.QueryRow(ctx,
+				`SELECT COUNT(*) FROM lfs_objects WHERE repo = $1`, repo).Scan(&count); err != nil {
+				return err
+			}
+			if count > MaxLFSObjectsPerRepo {
+				return ErrLFSObjectCapExceeded // rolls back the insert
+			}
 		}
 		if _, err := tx.Exec(ctx,
 			`DELETE FROM pack_reservations WHERE key = $1`, key); err != nil {

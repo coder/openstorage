@@ -135,12 +135,12 @@ func TestLFSQuota_UploadSettlesLedger(t *testing.T) {
 }
 
 // TestLFSQuota_WrongSHAReservationLifecycle: a proxy upload whose content
-// hash does not match the oid is rejected and publishes nothing. The
-// reservation outcome depends on who minted the row (Codex round 5's
-// keep-owner semantics): a direct PUT's own row is released immediately,
-// while a batch-minted row survives the failed PUT — its upload action is
-// still exercisable and a cross-replica release must never free headroom
-// under a possibly-still-staging writer — until settle or TTL expiry.
+// hash does not match the oid is rejected and publishes nothing. Its
+// reservation deliberately SURVIVES the failure (Codex round 6): a
+// content-addressed row can back concurrent writers on other replicas, so
+// no failing writer may free it — LFS reservations end only by settlement
+// or TTL expiry. The failure headroom hold is TTL-bounded; retries refresh
+// the same row and settle it on success.
 func TestLFSQuota_WrongSHAReservationLifecycle(t *testing.T) {
 	srv, st, mint := newLFSQuotaServer(t, 1000, time.Hour)
 	tok := mint(auth.ScopeGitWrite)
@@ -151,35 +151,26 @@ func TestLFSQuota_WrongSHAReservationLifecycle(t *testing.T) {
 			"basic:"+tok, body)
 	}
 
-	// Direct PUT (no batch): the PUT inserted the row, so failure frees it.
-	w := put("not the real content")
+	// Failed PUT: rejected, nothing published, the reservation row stays
+	// (same length as the real content so the byte value is stable).
+	w := put("the fake content")
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("hash-mismatch PUT status = %d, body %s", w.Code, w.Body)
 	}
 	if _, err := srv.Blob.Stat(context.Background(), blob.LFSKey(lfsTestRepoID, oid)); err == nil {
 		t.Fatal("hash-mismatch PUT published the object")
 	}
-	if ls := ledgerState(t, st, time.Hour); ls.ReservedBytes != 0 || ls.UsageBytes != 0 {
-		t.Fatalf("failed direct PUT left ledger state %+v", ls)
+	if ls := ledgerState(t, st, time.Hour); ls.ReservedBytes != int64(len(content)) || ls.UsageBytes != 0 {
+		t.Fatalf("failed PUT ledger state = %+v, want the TTL-bounded reservation held", ls)
 	}
 
-	// Batch-then-bad-PUT: the batch's row (its owner) survives the failed
-	// PUT — the action is still exercisable — and a correct retry settles
-	// it into usage. The wrong body has the same length so the surviving
-	// row's refreshed byte value stays comparable.
-	decodeBatch(t, doLFS(t, srv, http.MethodPost, lfsBatchPath, "basic:"+tok,
-		batchBody("upload", oid, int64(len(content)))))
-	if w := put("the fake content"); w.Code != http.StatusBadRequest {
-		t.Fatalf("hash-mismatch PUT status = %d", w.Code)
-	}
-	if ls := ledgerState(t, st, time.Hour); ls.ReservedBytes != int64(len(content)) {
-		t.Fatalf("batch reservation did not survive the failed PUT: %+v", ls)
-	}
+	// The retry refreshes the same row (no double-count, no wedge) and a
+	// correct upload settles it into usage.
 	if w := put(string(content)); w.Code != http.StatusOK {
 		t.Fatalf("correct retry status = %d, body %s", w.Code, w.Body)
 	}
 	if ls := ledgerState(t, st, time.Hour); ls.ReservedBytes != 0 || ls.UsageBytes != int64(len(content)) {
-		t.Fatalf("retry did not settle the batch reservation: %+v", ls)
+		t.Fatalf("retry did not settle the reservation: %+v", ls)
 	}
 }
 
@@ -532,9 +523,9 @@ func TestLFSQuota_ZeroGrowthRepairAtQuota(t *testing.T) {
 // registered-object population is bounded independent of bytes, at both
 // upload entrances, with zero-growth repairs exempt.
 func TestLFSQuota_ObjectCountCap(t *testing.T) {
-	old := maxLFSObjectsPerRepo
-	maxLFSObjectsPerRepo = 1
-	t.Cleanup(func() { maxLFSObjectsPerRepo = old })
+	old := ref.MaxLFSObjectsPerRepo
+	ref.MaxLFSObjectsPerRepo = 1
+	t.Cleanup(func() { ref.MaxLFSObjectsPerRepo = old })
 	srv, st, mint := newLFSQuotaServer(t, 0, time.Hour) // byte quota DISABLED: the cap must hold anyway
 	tok := mint(auth.ScopeGitWrite)
 	existing := []byte("the one allowed object")

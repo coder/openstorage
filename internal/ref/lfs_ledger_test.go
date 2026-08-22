@@ -4,6 +4,7 @@ package ref
 
 import (
 	"context"
+	"errors"
 	"testing"
 )
 
@@ -68,6 +69,42 @@ func TestRegisterLFSObject_ZeroBytes(t *testing.T) {
 		k.wantState(0, 0, 0)
 		if has, err := s.HasLFSObject(context.Background(), k.base(), key); err != nil || !has {
 			t.Fatalf("HasLFSObject = %v, %v; want true", has, err)
+		}
+	})
+}
+
+// TestRegisterLFSObject_AtomicCap (Codex round 6): the object-count cap is
+// enforced inside the registration transaction itself — a denial commits
+// nothing (no row, no credit, reservation untouched), idempotent
+// re-registration at cap stays allowed, and the typed sentinel surfaces.
+func TestRegisterLFSObject_AtomicCap(t *testing.T) {
+	old := MaxLFSObjectsPerRepo
+	MaxLFSObjectsPerRepo = 1
+	t.Cleanup(func() { MaxLFSObjectsPerRepo = old })
+	runRefBackends(t, func(t *testing.T, s Store) {
+		ctx := context.Background()
+		k := newLedgerKit(t, s)
+		first, second := lfsLedgerKey(k, "1111"), lfsLedgerKey(k, "2222")
+		if err := s.RegisterLFSObject(ctx, k.base(), first, 10); err != nil {
+			t.Fatalf("first register: %v", err)
+		}
+		// Over cap: typed denial, nothing committed.
+		if dec := k.reserve([]Pack{{Key: second, Size: 5}}, "owner-b", 0, 1000); !dec.OK {
+			t.Fatalf("reserve: %+v", dec)
+		}
+		if err := s.RegisterLFSObject(ctx, k.base(), second, 5); !errors.Is(err, ErrLFSObjectCapExceeded) {
+			t.Fatalf("over-cap register error = %v, want ErrLFSObjectCapExceeded", err)
+		}
+		if has, err := s.HasLFSObject(ctx, k.base(), second); err != nil || has {
+			t.Fatalf("denied register left a row: %v, %v", has, err)
+		}
+		k.wantState(10, 5, 0) // credit untouched, reservation NOT consumed
+		if n, err := s.CountLFSObjects(ctx, k.base()); err != nil || n != 1 {
+			t.Fatalf("CountLFSObjects = %d, %v; want 1", n, err)
+		}
+		// Idempotent re-registration of the existing object at cap: fine.
+		if err := s.RegisterLFSObject(ctx, k.base(), first, 10); err != nil {
+			t.Fatalf("idempotent register at cap: %v", err)
 		}
 	})
 }

@@ -212,6 +212,18 @@ func (s *SQLite) RegisterLFSObject(ctx context.Context, repo, key string, bytes 
 	if err != nil {
 		return err
 	}
+	if inserted > 0 {
+		// Atomic object-count cap (see the PG twin; BEGIN IMMEDIATE is the
+		// serialization here — SQLite has one writer at a time).
+		var count int64
+		if err := tx.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM lfs_objects WHERE repo = ?`, repo).Scan(&count); err != nil {
+			return err
+		}
+		if count > MaxLFSObjectsPerRepo {
+			return ErrLFSObjectCapExceeded // the deferred rollback discards the insert
+		}
+	}
 	if _, err := tx.ExecContext(ctx,
 		`DELETE FROM pack_reservations WHERE key = ?`, key); err != nil {
 		return err
