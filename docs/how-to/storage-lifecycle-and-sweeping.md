@@ -20,7 +20,7 @@ of these classes:
 | **Registered packs** | Every push and REST write publishes a pack and registers it | [Repack](#background-repack) folds many into one (the originals become *retained*) |
 | **Retained (superseded) packs** | A repack fold replaced their registry rows; the blobs linger | Sweeper's superseded reap ([`CODESTORAGE_SWEEP_DELETE_SUPERSEDED`](../reference/configuration.md#codestorage_sweep_delete_superseded), on by default) after the age threshold |
 | **Orphan packs** | Crashed/interrupted writers (pack published, registration never committed), lost repack races | Sweeper — **list-only by default**; deletion is the explicit [`CODESTORAGE_SWEEP_DELETE_ENABLED`](../reference/configuration.md#codestorage_sweep_delete_enabled) opt-in |
-| **Quarantine copies** (`quarantine/` prefix) | Delete-mode sweeps copy every blob aside before deleting it | The sweep itself purges backups older than the age threshold (only while a destructive mode is on) |
+| **Quarantine copies** (`quarantine/` prefix) | Delete-mode sweeps copy every blob aside before deleting it | The sweep itself purges backups older than the purge window — `max(age threshold, 1h)` — while a destructive mode is on |
 
 Two more growth sources sit outside this lifecycle: **LFS objects** (stored under their
 own keys, never swept or repacked) and, on versioned S3 buckets, **old object versions**
@@ -111,15 +111,18 @@ Reading the numbers: admission is `stored + reserved + incoming ≤ quota`, wher
   since general-orphan deletion is off by default, a repository with abandoned uploads
   can keep hitting denials that only
   [enabling delete mode](#before-enabling-delete-mode-fleet-prerequisite) resolves;
-- **reserved** counts other writers' in-flight admissions. A crashed writer's reservation
-  keeps gating for
+- **reserved** counts other writers' in-flight admissions. A crashed writer's
+  reservation keeps gating only until its
   [`CODESTORAGE_PACK_RESERVATION_TTL`](../reference/configuration.md#codestorage_pack_reservation_ttl)
-  (default 1h) before the sweeper prunes it — a retry of the *same* push is not
-  double-charged (same content key refreshes the reservation);
+  (default 1h) elapses — admission ignores expired rows immediately; the sweeper's
+  `reservations_expired` pruning is just garbage collection of those rows, not what
+  unblocks pushes. A retry of the *same* push is never double-charged (the same content
+  key refreshes the reservation);
 - pushing content that is already stored (identical pack key) adds zero incoming bytes.
 
 So a push denied right after heavy write traffic may succeed later without any config
-change — once the next sweep reclaims retained bytes and prunes expired reservations. If
+change — once the next sweep reclaims retained bytes and crashed writers' reservations
+pass their TTL. If
 denials persist, either raise the quota or accept that the repository's registered
 history is simply that large (remember:
 [deleting branches does not reclaim space](#why-is-the-bucket-growing)).
@@ -165,7 +168,7 @@ threshold=<age> duration=<d>
 | `fresh` | Unregistered but younger than the age threshold — likely in-flight writers; never touched |
 | `orphans` / `orphan_bytes` | Aged, unregistered candidates this run — **both** classes: repack-superseded blobs count here too until reaped |
 | `deleted` | Candidates reaped this run (superseded reaps included). Reaping moves bytes to quarantine, so it frees nothing by itself |
-| `bytes_reclaimed` | Bytes of aged quarantine backups purged this run — the moment storage consumption actually decreases |
+| `bytes_reclaimed` | Bytes of aged quarantine backups purged this run — the moment storage consumption actually decreases. Lags `deleted` by the quarantine purge window, `max(age threshold, 1h)` |
 | `superseded_deleted` / `retained_bytes_reclaimed` | The provably repack-superseded subset of `deleted`, and the **quota headroom** their reaps returned |
 | `reservations_expired` | Crashed-writer quota reservations pruned this run |
 | `delete_enabled` / `delete_superseded` | The **configured** modes — a [guard downgrade](#s3-bucket-versioning) to list-only is *not* reflected here; it shows only as the separate `delete guard failed; this run is list-only` error line |
@@ -184,8 +187,10 @@ When a sweep does delete, it never hard-deletes directly: every blob is first co
 landed mid-delete is restored on the spot), and **every** sweep — list-only included —
 starts by restoring any registered-but-missing pack from quarantine. Rolling back to
 list-only after a scare therefore still repairs anything a delete-enabled crash left
-behind; look for `orphan pack sweep: healed registered pack from quarantine`. Aged
-quarantine backups are purged only while a destructive mode is on.
+behind; look for `orphan pack sweep: healed registered pack from quarantine`. Quarantine
+backups are purged only while a destructive mode is on, and only once older than
+`max(age threshold, 1h)` — the floor guarantees a delete handshake is provably dead
+before its backup goes away, so tuning the age threshold low does not shorten it.
 
 ### S3 bucket versioning
 
@@ -226,5 +231,7 @@ A conservative enablement sequence:
 4. Opt into `CODESTORAGE_SWEEP_DELETE_ENABLED=true` only if orphan bytes materially
    accumulate — crashed pushes are rare, so for many deployments list-only is a fine
    permanent state.
-5. After the first delete-enabled sweeps, check `deleted`/`bytes_reclaimed` match the
-   candidates you audited, and keep the quarantine window (age threshold) generous.
+5. After the first delete-enabled sweeps, check `deleted` matches the candidates you
+   audited. `bytes_reclaimed` stays `0` until the quarantine backups age past the purge
+   window (`max(age threshold, 1h)`) — deletion and physical reclaim are different
+   cohorts, so an initial `0` is expected, not a failure signal.
