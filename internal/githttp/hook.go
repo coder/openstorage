@@ -708,6 +708,16 @@ func verifySig(ctx context.Context, refName, old, new string) error {
 
 	v, cleanup, err := newSigVerifier(keys)
 	if err != nil {
+		// Keyring construction is deterministic on the registered key
+		// material, so its failure holds for the whole push: cache it on
+		// the first introduced commit like the empty-keyring denial, or a
+		// registered-but-unimportable PGP key would re-spawn gpg once per
+		// ref at the same tip without charging any budget (Codex round
+		// 15).
+		reason := fmt.Sprintf("signing keyring unusable: %v", err)
+		if cacheErr := state.markCommitDenied(pending[0], reason); cacheErr != nil {
+			return fmt.Errorf("verify-sig: %w", cacheErr)
+		}
 		return fmt.Errorf("verify-sig: %w", err)
 	}
 	defer cleanup()

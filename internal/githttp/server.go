@@ -362,6 +362,14 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 		}
 		gz, err := gzip.NewReader(wire)
 		if err != nil {
+			// An oversized optional gzip header (FNAME/FCOMMENT) can trip
+			// the wire counter inside NewReader itself; that is a cap
+			// overflow, not malformed compression, and must keep the 413
+			// contract (Codex round 15).
+			if wireCap != nil && wireCap.exceeded {
+				httpError(w, http.StatusRequestEntityTooLarge, pushTooLargeMsg(s.MaxPushBytes))
+				return
+			}
 			httpError(w, http.StatusBadRequest, "bad gzip body: "+err.Error())
 			return
 		}
