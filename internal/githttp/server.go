@@ -137,6 +137,33 @@ func (s *Server) reserveLFSStaging(n int64) bool {
 	return true
 }
 
+// lfsStagingChunk is the staging-budget growth quantum (a var for tests).
+// Proxy uploads reserve one chunk ahead of the bytes actually received
+// instead of their full declared Content-Length (Codex security round 5 on
+// #51): an upfront declared-size reservation let a single header-plus-drip
+// PUT declare the entire node budget and pin it for the whole reservation
+// TTL while sending one byte per idle window, 429ing every unrelated
+// upload on the replica. Growing as data arrives caps a dripper's hold at
+// one chunk beyond what it genuinely transferred; the idle/absolute
+// deadlines still bound the duration.
+var lfsStagingChunk = int64(8 << 20)
+
+// growLFSStaging adds n bytes to an existing staging reservation whose op
+// slot is already held; the caller releases the grown total through one
+// releaseLFSStaging call.
+func (s *Server) growLFSStaging(n int64) bool {
+	assertf(n > 0, "growLFSStaging(%d)", n)
+	s.lfsStagingMu.Lock()
+	defer s.lfsStagingMu.Unlock()
+	if s.LFSStagingBytes > 0 {
+		if s.lfsStagingInFlight > s.LFSStagingBytes-n {
+			return false
+		}
+		s.lfsStagingInFlight += n
+	}
+	return true
+}
+
 // releaseLFSStaging returns a reserveLFSStaging reservation.
 func (s *Server) releaseLFSStaging(n int64) {
 	s.lfsStagingMu.Lock()

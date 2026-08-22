@@ -596,7 +596,8 @@ func (s *Server) adoptLFSObject(ctx context.Context, repoID, key, oid string, si
 	// batch connection must not pin it past the lease window.
 	vctx, vcancel := context.WithTimeout(ctx, s.lfsReservationTTL()*9/10)
 	defer vcancel()
-	if err := s.verifyStoredLFSObject(vctx, key, oid); err != nil {
+	verifiedSize, err := s.verifyStoredLFSObject(vctx, key, oid)
+	if err != nil {
 		if !errors.Is(err, errLFSContentMismatch) {
 			return err
 		}
@@ -625,7 +626,15 @@ func (s *Server) adoptLFSObject(ctx context.Context, repoID, key, oid string, si
 		log.Printf("lfs adopt %s: removed legacy blob failing content verification", key)
 		return errLFSContentMismatch
 	}
-	if err := s.Store.RegisterLFSObject(ctx, repoID, key, size); err != nil {
+	// Register the size of the bytes that were ACTUALLY downloaded and
+	// hashed, never the caller's pre-verification Stat (Codex round 23):
+	// between that Stat and this download, a concurrent replica can
+	// guarded-delete a small corrupt legacy blob and publish the larger
+	// correct object — verification then passes against the REPLACEMENT,
+	// and registering the stale Stat size would under-charge pack_usage
+	// (the later idempotent re-registration corrects nothing), minting
+	// phantom headroom until the cached floor refreshes.
+	if err := s.Store.RegisterLFSObject(ctx, repoID, key, verifiedSize); err != nil {
 		return err
 	}
 	// Post-registration existence recheck (Codex round 1) — the adoption
@@ -646,31 +655,73 @@ func (s *Server) adoptLFSObject(ctx context.Context, repoID, key, oid string, si
 	return nil
 }
 
-// verifyStoredLFSObject downloads the blob at key and checks that its
-// sha256 matches oid (the content address).
-func (s *Server) verifyStoredLFSObject(ctx context.Context, key, oid string) error {
+// verifyStoredLFSObject downloads the blob at key, checks that its sha256
+// matches oid (the content address), and returns the byte count of the
+// downloaded content — the ONLY size the caller may register (Codex round
+// 23): the stored object can be replaced between the caller's Stat and
+// this download, so any earlier measurement may describe a different blob
+// than the one verified here.
+func (s *Server) verifyStoredLFSObject(ctx context.Context, key, oid string) (int64, error) {
 	dir, err := os.MkdirTemp("", "lfs-verify-*")
 	if err != nil {
-		return fmt.Errorf("scratch dir: %w", err)
+		return 0, fmt.Errorf("scratch dir: %w", err)
 	}
 	defer os.RemoveAll(dir)
 	path := filepath.Join(dir, "obj")
 	if err := s.Blob.DownloadFile(ctx, key, path); err != nil {
-		return fmt.Errorf("download for verification: %w", err)
+		return 0, fmt.Errorf("download for verification: %w", err)
 	}
 	f, err := os.Open(path)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer f.Close()
 	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
-		return err
+	n, err := io.Copy(h, f)
+	if err != nil {
+		return 0, err
 	}
 	if hex.EncodeToString(h.Sum(nil)) != oid {
-		return errLFSContentMismatch
+		return 0, errLFSContentMismatch
 	}
-	return nil
+	return n, nil
+}
+
+// stagingFileWriter covers every byte with staging budget BEFORE it lands
+// on disk, growing the reservation one lfsStagingChunk at a time as the
+// body actually arrives (Codex security round 5 on #51): reserving the
+// full declared Content-Length up front let a drip-fed PUT pin the whole
+// node budget without transferring. The op slot and the initial chunk are
+// taken by the handler; *reserved is shared with its deferred release so
+// the final grown total is returned exactly once. A grow denial surfaces
+// as errLFSBusy (transient 429): the budget genuinely filled with other
+// uploads' real bytes while this body streamed.
+type stagingFileWriter struct {
+	s             *Server
+	f             *os.File
+	contentLength int64
+	written       int64
+	reserved      *int64
+}
+
+func (w *stagingFileWriter) Write(p []byte) (int, error) {
+	if need := w.written + int64(len(p)) - *w.reserved; need > 0 {
+		grow := max(need, lfsStagingChunk)
+		if maxGrow := w.contentLength - *w.reserved; grow > maxGrow {
+			grow = maxGrow
+		}
+		// The server-enforced Content-Length cap bounds the body, so the
+		// clamped chunk always covers the shortfall.
+		assertf(grow >= need, "stagingFileWriter: grow %d < need %d (CL %d, reserved %d, written %d)",
+			grow, need, w.contentLength, *w.reserved, w.written)
+		if !w.s.growLFSStaging(grow) {
+			return 0, errLFSBusy
+		}
+		*w.reserved += grow
+	}
+	n, err := w.f.Write(p)
+	w.written += int64(n)
+	return n, err
 }
 
 // lfsDownloadAction builds the basic-transfer download action for key: a
@@ -858,22 +909,26 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target r
 	// Node-wide staging budget (Codex round 4): every proxy upload stages
 	// its full Content-Length on this replica's disk before verification,
 	// and neither the per-key guard nor the per-repo quota bounds that
-	// node-wide. Reserve the declared length before any disk is touched;
-	// an object larger than the whole budget can never stage here (413,
-	// permanent), anything else that does not fit right now is transient
-	// (429).
+	// node-wide. An object larger than the whole budget can never stage
+	// here (413, permanent); anything that does not fit right now is
+	// transient (429). The reservation is INCREMENTAL (Codex security
+	// round 5): only the op slot plus one chunk is taken before body
+	// bytes arrive, and stagingFileWriter grows it as data actually
+	// lands — an upfront declared-length reservation let one drip-fed
+	// PUT pin the entire budget for the TTL without transferring.
 	if s.LFSStagingBytes > 0 && r.ContentLength > s.LFSStagingBytes {
 		lfsError(w, http.StatusRequestEntityTooLarge, fmt.Sprintf(
 			"object size %d exceeds this server's LFS staging budget (%d bytes)",
 			r.ContentLength, s.LFSStagingBytes))
 		return
 	}
-	if !s.reserveLFSStaging(r.ContentLength) {
+	stagingReserved := min(r.ContentLength, lfsStagingChunk)
+	if !s.reserveLFSStaging(stagingReserved) {
 		w.Header().Set("Retry-After", "10")
 		lfsError(w, http.StatusTooManyRequests, "server LFS staging budget exhausted, retry")
 		return
 	}
-	defer s.releaseLFSStaging(r.ContentLength)
+	defer func() { s.releaseLFSStaging(stagingReserved) }()
 	// NO durable reservation before body progress, deliberately (Codex
 	// security round 3 + round 16): a header-only PUT repeated once per
 	// TTL could otherwise hold the repository's whole headroom forever
@@ -929,11 +984,19 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target r
 		body = idle
 	}
 	h := sha256.New()
-	n, err := io.Copy(io.MultiWriter(f, h), body)
+	sfw := &stagingFileWriter{s: s, f: f, contentLength: r.ContentLength, reserved: &stagingReserved}
+	n, err := io.Copy(io.MultiWriter(sfw, h), body)
 	if cerr := f.Close(); err == nil {
 		err = cerr
 	}
 	if err != nil {
+		if errors.Is(err, errLFSBusy) {
+			// The budget filled while this body streamed (other uploads'
+			// real bytes claimed it): transient, like the entry check.
+			w.Header().Set("Retry-After", "10")
+			lfsError(w, http.StatusTooManyRequests, "server LFS staging budget exhausted, retry")
+			return
+		}
 		lfsError(w, http.StatusBadRequest, "reading upload body failed: "+err.Error())
 		return
 	}

@@ -631,6 +631,51 @@ func TestLFSQuota_TwoMaxInt64BatchDenied(t *testing.T) {
 	}
 }
 
+// staleStatBlob reports a stale (smaller) size from Stat while downloads
+// serve the real stored bytes — the HA race where the blob is replaced
+// between the caller's Stat and the verification download.
+type staleStatBlob struct {
+	blob.BlobStore
+	staleSize int64
+}
+
+func (b staleStatBlob) Stat(context.Context, string) (int64, error) { return b.staleSize, nil }
+
+// TestLFSQuota_AdoptionRegistersVerifiedSize (Codex round 23): adoption
+// must register the byte count of the content it actually downloaded and
+// hashed, never the caller's pre-verification Stat. In an HA upgrade,
+// replica A can Stat a small corrupt rowless blob, replica B can
+// guarded-delete it and publish the larger correct object, and A's
+// verification then passes against the REPLACEMENT — registering A's
+// stale Stat size would under-charge pack_usage and mint phantom quota
+// headroom that B's later idempotent re-registration never corrects.
+func TestLFSQuota_AdoptionRegistersVerifiedSize(t *testing.T) {
+	srv, st, mint := newLFSQuotaServer(t, 1<<20, time.Hour)
+	tok := mint(auth.ScopeGitWrite)
+
+	content := []byte("the larger correct replacement object")
+	oid := sha256Hex(content)
+	key := blob.LFSKey(lfsTestRepoID, oid)
+	if err := srv.Blob.UploadFile(context.Background(), key, writeTempFile(t, content)); err != nil {
+		t.Fatal(err)
+	}
+	// Every Stat sees the pre-replacement size; downloads see the truth.
+	srv.Blob = staleStatBlob{BlobStore: srv.Blob, staleSize: 3}
+
+	w := doLFS(t, srv, http.MethodPut, "/"+lfsTestRepoURL+".git/info/lfs/objects/"+oid,
+		"basic:"+tok, string(content))
+	if w.Code != http.StatusOK {
+		t.Fatalf("adopting PUT status = %d, body %s", w.Code, w.Body)
+	}
+	if has, err := st.HasLFSObject(context.Background(), lfsTestRepoID, key); err != nil || !has {
+		t.Fatalf("adoption did not register: %v, %v", has, err)
+	}
+	if ls := ledgerState(t, st, time.Hour); ls.UsageBytes != int64(len(content)) {
+		t.Fatalf("registered usage = %d, want %d (the verified download's size, not the stale Stat)",
+			ls.UsageBytes, len(content))
+	}
+}
+
 // downloadCountingBlob counts verification downloads (adoptLFSObject's
 // verifyStoredLFSObject stages via DownloadFile).
 type downloadCountingBlob struct {
@@ -687,6 +732,71 @@ func TestLFSQuota_AtCapAdoptionDeniesBeforeDownload(t *testing.T) {
 	if counting.downloads != 0 {
 		t.Fatalf("at-cap adoption performed %d verification downloads, want 0", counting.downloads)
 	}
+}
+
+// TestLFSStaging_DripperCannotPinBudget (Codex security round 5): a PUT
+// declaring the whole staging budget as Content-Length while dripping
+// bytes must NOT reserve the declared size up front — staging grows as
+// data actually arrives (one lfsStagingChunk ahead), so an unrelated
+// upload still admits while the dripper stalls.
+func TestLFSStaging_DripperCannotPinBudget(t *testing.T) {
+	oldChunk := lfsStagingChunk
+	lfsStagingChunk = 4
+	t.Cleanup(func() { lfsStagingChunk = oldChunk })
+
+	srv, _, mint := newLFSQuotaServer(t, 0, time.Hour)
+	srv.LFSStagingBytes = 10
+	tok := mint(auth.ScopeGitWrite)
+	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(ts.Close)
+
+	// The dripper: declares the WHOLE budget, sends one byte, stalls.
+	dripContent := bytes.Repeat([]byte("d"), 10)
+	pr, pw := io.Pipe()
+	req, err := http.NewRequest(http.MethodPut,
+		ts.URL+"/"+lfsTestRepoURL+".git/info/lfs/objects/"+sha256Hex(dripContent), pr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.ContentLength = 10
+	req.SetBasicAuth("t", tok)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if resp, err := http.DefaultClient.Do(req); err == nil {
+			resp.Body.Close()
+		}
+	}()
+	if _, err := pw.Write([]byte("d")); err != nil {
+		t.Fatal(err)
+	}
+	// Wait until the dripper's handler holds its initial chunk (4 of 10).
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		srv.lfsStagingMu.Lock()
+		held := srv.lfsStagingInFlight
+		srv.lfsStagingMu.Unlock()
+		if held == 4 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("dripper staging hold = %d, want 4 (one chunk)", held)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// An unrelated small upload must admit and complete: with the
+	// pre-fix upfront reservation the dripper held all 10 budget bytes
+	// and this returned 429.
+	content := []byte("abcdef")
+	w := doLFS(t, srv, http.MethodPut, "/"+lfsTestRepoURL+".git/info/lfs/objects/"+sha256Hex(content),
+		"basic:"+tok, string(content))
+	if w.Code != http.StatusOK {
+		t.Fatalf("unrelated upload status = %d, body %s (dripper pinned the staging budget?)", w.Code, w.Body)
+	}
+
+	pw.CloseWithError(io.ErrClosedPipe) // abort the dripper
+	<-done
 }
 
 // TestLFSUpload_AbsoluteDeadlineBoundsDrip (Codex security round 2): a

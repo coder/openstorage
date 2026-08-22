@@ -324,12 +324,14 @@ sizes cannot bypass the gate).
 
 Node-wide cap on the aggregate bytes of Git LFS uploads staging on one replica at a
 time. LFS uploads go through the verified proxy transfer
-([#51](https://github.com/coder/code-storage/issues/51)) and stage their full declared
-`Content-Length` under the replica's `$TMPDIR` before verification and publication —
-the per-repository quota above bounds neither the node (it is per repo) nor anything
-when disabled, so this is the replica's disk-protection bound. Uploads that do not fit
-right now answer `429` with `Retry-After`; an object larger than the whole budget
-answers `413`.
+([#51](https://github.com/coder/code-storage/issues/51)) and stage their full body
+under the replica's `$TMPDIR` before verification and publication — the
+per-repository quota above bounds neither the node (it is per repo) nor anything when
+disabled, so this is the replica's disk-protection bound. The budget is charged
+incrementally as body bytes actually arrive (a stalled upload holds only slightly more
+than it has transferred, not its declared `Content-Length`). Uploads that do not fit
+right now answer `429` with `Retry-After`; an object whose declared size exceeds the
+whole budget answers `413`.
 
 - **Default:** 10 GiB (`10737418240`) — one default-quota-sized object can always
   stage. **`0` disables the bound**; negative or malformed values are startup errors.
