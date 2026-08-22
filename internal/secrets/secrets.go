@@ -155,6 +155,22 @@ func IsEncrypted(stored string) bool {
 	return strings.HasPrefix(stored, Marker)
 }
 
+// validKeyID reports whether the envelope's key-id field is a well-formed
+// fingerprint (exactly keyIDLen lowercase hex chars) — the only shape
+// Encrypt ever writes, and the only shape errors may echo.
+func validKeyID(id string) bool {
+	if len(id) != keyIDLen {
+		return false
+	}
+	for i := 0; i < len(id); i++ {
+		c := id[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
 // Encrypt seals plaintext under the active key and returns the stored
 // envelope. Sealing a value that is already a v1 envelope is always a bug
 // (double encryption); other ReservedPrefix-carrying plaintext is legal
@@ -185,7 +201,10 @@ func (c *Codec) Decrypt(stored string) (plaintext string, stale bool, err error)
 	assertf(IsEncrypted(stored), "Decrypt on a non-envelope value")
 	rest := stored[len(Marker):]
 	keyID, b64, ok := strings.Cut(rest, ":")
-	if !ok || len(keyID) != keyIDLen {
+	if !ok || !validKeyID(keyID) {
+		// The field is untrusted (a legacy plaintext secret can be shaped
+		// like an envelope), so a malformed id is never echoed into the
+		// error — it could be secret bytes.
 		return "", false, fmt.Errorf("malformed envelope: %w", ErrDecrypt)
 	}
 	sealed, err := base64.StdEncoding.DecodeString(b64)

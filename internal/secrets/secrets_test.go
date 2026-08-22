@@ -166,6 +166,19 @@ func TestDecryptCorruptCiphertext(t *testing.T) {
 			t.Errorf("Decrypt(%q): err = %v, want ErrDecrypt/ErrUnknownKey", bad, err)
 		}
 	}
+
+	// A v1-shaped legacy plaintext value: the 8-char field after the marker
+	// is untrusted secret material, so the error must never echo it (only
+	// validated lowercase-hex fingerprints may appear in errors).
+	_, _, err = c.Decrypt(Marker + "Password:hunter22")
+	if !errors.Is(err, ErrDecrypt) {
+		t.Fatalf("v1-shaped plaintext: err = %v, want ErrDecrypt", err)
+	}
+	for _, leak := range []string{"Password", "hunter22"} {
+		if strings.Contains(err.Error(), leak) {
+			t.Errorf("error %q echoes untrusted envelope text %q", err, leak)
+		}
+	}
 }
 
 func TestMarkerInsideReservedNamespace(t *testing.T) {
