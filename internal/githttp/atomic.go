@@ -84,7 +84,17 @@ func sniffAtomicPush(r io.Reader) (bool, io.Reader) {
 		if nul < 0 {
 			return false, replay()
 		}
-		for _, tok := range strings.Fields(string(payload[nul+1:])) {
+		// Match git's C-string parsing exactly (Codex security round): the
+		// capability list ends at the NEXT NUL if any — receive-pack reads
+		// the caps as a NUL-terminated string, so `atomic\0junk` IS atomic
+		// to git and `junk\0atomic` is NOT. Tokenizing across the second
+		// NUL would diverge in both directions; the first direction is a
+		// gate bypass (sniffer says non-atomic, git behaves atomic).
+		caps := payload[nul+1:]
+		if next := bytes.IndexByte(caps, 0); next >= 0 {
+			caps = caps[:next]
+		}
+		for _, tok := range strings.Fields(string(caps)) {
 			if tok == "atomic" {
 				return true, replay()
 			}

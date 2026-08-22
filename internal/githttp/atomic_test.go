@@ -40,6 +40,12 @@ func TestSniffAtomicPush(t *testing.T) {
 		{"shallow prefix then atomic", manyShallow + pkt(cmdLine("refs/heads/main", "atomic")) + "0000", true},
 		{"push-cert with atomic", pkt("push-cert\x00report-status atomic\n") + pkt("certificate version 0.1\n"), true},
 		{"atomic-named ref does not count", pkt(cmdLine("refs/heads/atomic", "report-status")), false},
+		// git reads the capability list as a NUL-terminated C string
+		// (Codex security round): tokens before a second NUL count even
+		// with trailing bytes after it; tokens after it are invisible to
+		// git and must be invisible to the sniffer too.
+		{"second NUL ends caps: atomic before it counts", pkt(cmdLine("refs/heads/main", "report-status atomic\x00ignored junk")), true},
+		{"second NUL ends caps: atomic after it does not", pkt(cmdLine("refs/heads/main", "report-status\x00atomic")), false},
 		{"agent=atomic does not count", pkt(cmdLine("refs/heads/main", "agent=atomic report-status")), false},
 		{"no capabilities (no NUL)", pkt(tOld + " " + tNew + " refs/heads/main"), false},
 		{"empty capability list", pkt(cmdLine("refs/heads/main", "")), false},
