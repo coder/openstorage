@@ -129,7 +129,9 @@ repositories that read endpoints and git smart-HTTP serve from. It is set with t
 - **The cache only grows — there is no eviction.** A replica retains every pack it ever
   hydrated, including packs long since superseded by repack and reaped from the bucket,
   and repositories it no longer serves. Working-set sizing alone is not enough: monitor
-  the directory and periodically clear it (or replace nodes), which is always safe and
+  the directory and reclaim it periodically — either by replacing the node or by clearing
+  the directory **only while the replica is drained and stopped** (deleting it under a
+  live process races in-flight requests and the hydration lock file). Losing the data
   costs only re-hydration.
 - An emptied cache therefore shows as a burst of S3 reads and slower first requests, not
   errors.
