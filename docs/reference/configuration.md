@@ -370,8 +370,10 @@ while `git push --atomic` rejects the whole push on the first denial.
   than the budget under a `verify-sig` policy: such pushes are rejected fail-closed with
   an error naming this variable.
 - The budget also derives a per-push **history-walk allowance** of 100 × its value:
-  every commit a walk examines (cached verdicts included) counts, so many refs re-walking
-  the same already-verified history are bounded too. `0` disables both bounds.
+  every commit a walk examines (cached verdicts included) counts, and each ref
+  evaluation is additionally charged a small fee for the per-push verification state it
+  loads — so many refs re-walking or merely re-loading cached results are bounded too.
+  `0` disables all of these bounds.
 
 ## Maintenance jobs
 

@@ -298,6 +298,38 @@ func TestIntroducedPending_WalkAllowance(t *testing.T) {
 	})
 }
 
+func TestChargeWalk(t *testing.T) {
+	newStateFile(t)
+	st, err := openVerifyState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.chargeWalk(0, 10, "refs/heads/x"); err != nil || st.walked != 0 {
+		t.Fatalf("zero charge = (%v, walked %d), want free no-op", err, st.walked)
+	}
+	if err := st.chargeWalk(9, 10, "refs/heads/x"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.chargeWalk(2, 10, "refs/heads/x"); err == nil || !strings.Contains(err.Error(), "history-walk allowance") {
+		t.Fatalf("over-allowance charge = %v, want allowance rejection", err)
+	}
+	if st.walked != 9 {
+		t.Fatalf("walked = %d, want 9 (rejected charge not applied)", st.walked)
+	}
+	// Unbounded (budget 0) never rejects but still accounts.
+	if err := st.chargeWalk(1000, 0, "refs/heads/x"); err != nil || st.walked != 1009 {
+		t.Fatalf("unbounded charge = (%v, walked %d)", err, st.walked)
+	}
+	// The charge persists for the next hook process.
+	st2, err := openVerifyState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st2.walked != 1009 {
+		t.Fatalf("persisted walked = %d, want 1009", st2.walked)
+	}
+}
+
 func TestVerifySigBudget_Parsing(t *testing.T) {
 	t.Run("unset-unlimited", func(t *testing.T) {
 		t.Setenv(EnvVerifySigBudget, "")

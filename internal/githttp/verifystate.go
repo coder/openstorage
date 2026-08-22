@@ -104,6 +104,40 @@ type verifyState struct {
 	// verdictsLoaded records whether ok/deny/spent were read from the
 	// verdict file; range-cache hits never need them (see loadVerdicts).
 	verdictsLoaded bool
+	// rangeLines/verdictLines count state lines parsed by this load, the
+	// basis of the per-evaluation fee charged to the walk allowance.
+	rangeLines   int64
+	verdictLines int64
+}
+
+// verifyStateFeeDivisor converts state lines loaded into walk-allowance
+// units: one examined-commit-equivalent per 100 lines, so an evaluation
+// that reloads a budget-sized state file (≤ ~10k lines at the default
+// budget) is charged like a ~100-commit walk. Every evaluation additionally
+// pays a flat unit. This is the generic bound Codex rounds 5–12 converged
+// on: whatever per-push state a ref's evaluation forces the hook to parse
+// is charged against the same allowance that bounds history walks, so no
+// sequence of cheap cache-hitting or cache-missing refs can multiply
+// bounded per-ref costs indefinitely for one request-rate admission.
+const verifyStateFeeDivisor = 100
+
+// chargeWalk charges n walk-allowance units (fail-closed against maxWalk,
+// 0 = unbounded) and persists the new total for the push's later hook
+// processes. The allowance error deliberately reuses the history-walk
+// wording: state-load fees are denominated in examined-commit equivalents.
+func (st *verifyState) chargeWalk(n int64, maxWalk int64, refName string) error {
+	assertf(n >= 0 && maxWalk >= 0, "chargeWalk(%d, %d)", n, maxWalk)
+	if n == 0 {
+		return nil
+	}
+	if maxWalk > 0 && st.walked+n > maxWalk {
+		return fmt.Errorf("verify-sig: push exceeds the per-push history-walk allowance: %s pushed the total past %d examined commits (%d× CODESTORAGE_VERIFY_SIG_BUDGET; raise the budget or split the push)",
+			refName, maxWalk, verifyWalkBudgetMultiplier)
+	}
+	if err := st.markWalked(n); err != nil {
+		return fmt.Errorf("verify-sig: %w", err)
+	}
+	return nil
 }
 
 func rangeKey(old, new string) string { return old + " " + new }
@@ -216,6 +250,7 @@ func (st *verifyState) applyVerdictLine(line string) error {
 	default:
 		return fmt.Errorf("malformed verify state line %q", line)
 	}
+	st.verdictLines++
 	return nil
 }
 
@@ -227,6 +262,7 @@ func (st *verifyState) applyRangeLine(line string) error {
 		return fmt.Errorf("malformed verify range line %q", line)
 	}
 	st.ranges[rangeKey(old, new)] = true
+	st.rangeLines++
 	return nil
 }
 

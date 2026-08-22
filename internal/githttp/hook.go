@@ -634,21 +634,35 @@ func verifySig(ctx context.Context, refName, old, new string) error {
 	if err != nil {
 		return fmt.Errorf("verify-sig: %w", err) // fail closed
 	}
+	// Per-push verified-commit budget (issue #59), resolved BEFORE any
+	// cache checks: it also prices the state loads below.
+	budget, err := verifySigBudget()
+	if err != nil {
+		return fmt.Errorf("verify-sig: %w", err) // fail closed
+	}
+	maxWalk := walkBudget(budget)
+	// Every evaluation pays a fee — one flat unit plus its share of the
+	// range-sidecar lines just parsed — against the walk allowance (Codex
+	// round 12): cache-hitting refs cost almost nothing individually, but
+	// the accumulated fee fails a push closed once its ref count times its
+	// state size stops being cheap. Cheaper than the hook process spawn
+	// each ref already costs until the state is thousands of lines.
+	if err := state.chargeWalk(1+state.rangeLines/verifyStateFeeDivisor, maxWalk, refName); err != nil {
+		return err
+	}
 	// Cross-ref range dedup (issue #59): the verdict for an (old,new) pair
 	// is ref-independent, so N refs pushed to the same tip cost one walk.
 	if state.ranges[rangeKey(old, new)] {
 		return nil
 	}
-	// Per-push verified-commit budget (issue #59), resolved BEFORE the
-	// walk: it bounds the walk itself, not just the verifier spawns.
-	budget, err := verifySigBudget()
-	if err != nil {
-		return fmt.Errorf("verify-sig: %w", err) // fail closed
-	}
 	// Commit verdicts load only past the range cache (Codex round 11): a
 	// range-hit ref above never pays for the push's accumulated verdicts.
+	// The load is fee-charged like the sidecar one.
 	if err := state.loadVerdicts(); err != nil {
 		return fmt.Errorf("verify-sig: %w", err) // fail closed
+	}
+	if err := state.chargeWalk(state.verdictLines/verifyStateFeeDivisor, maxWalk, refName); err != nil {
+		return err
 	}
 	pending, _, err := introducedPending(ctx, state, refName, old, new, budget)
 	if err != nil {
