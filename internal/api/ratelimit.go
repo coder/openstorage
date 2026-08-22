@@ -46,7 +46,9 @@ type RateLimitConfig struct {
 	// headers from unlisted peers are never consulted. Operator contract:
 	// list ONLY proxies that set/append X-Forwarded-For themselves; a
 	// listed proxy that forwards client-supplied values verbatim
-	// reintroduces exactly that bucket-minting spoof.
+	// reintroduces exactly that bucket-minting spoof. IPv4-mapped IPv6
+	// prefixes (::ffff:a.b.c.d/96+) are normalized to IPv4 at
+	// construction; mapped prefixes below /96 are a config error.
 	TrustedProxies []netip.Prefix
 }
 
@@ -103,10 +105,29 @@ func newRateLimiter(cfg RateLimitConfig) (*rateLimiter, error) {
 	if cfg.Burst < 1 {
 		return nil, fmt.Errorf("rate limit config: Burst must be >= 1 when RPS > 0 (got %d)", cfg.Burst)
 	}
-	for _, p := range cfg.TrustedProxies {
-		// The allowlist arrives pre-parsed (resolveTrustedProxies); a zero
-		// prefix here is a caller bug, not operator input.
-		assertf(p.IsValid(), "rate limit config: invalid trusted-proxy prefix %v", p)
+	if len(cfg.TrustedProxies) > 0 {
+		// Normalize into a fresh slice (never mutate the caller's) so
+		// every config entry point — the CLI env var and direct
+		// api.New/NewGitRateLimit callers — gets identical matching
+		// semantics (Codex round 2). trustedContains unmaps peer
+		// addresses, so a stored 4-in-6 prefix would never match:
+		// convert /96+ mapped prefixes to IPv4 and reject shorter ones
+		// (they cover more than the mapped-IPv4 space and have no IPv4
+		// equivalent — dead config either way).
+		norm := make([]netip.Prefix, len(cfg.TrustedProxies))
+		for i, p := range cfg.TrustedProxies {
+			if !p.IsValid() {
+				return nil, fmt.Errorf("rate limit config: invalid trusted-proxy prefix %v", p)
+			}
+			if p.Addr().Is4In6() {
+				if p.Bits() < 96 {
+					return nil, fmt.Errorf("rate limit config: IPv4-mapped trusted-proxy prefix %v needs at least /96 (use an IPv4 CIDR or a real IPv6 range)", p)
+				}
+				p = netip.PrefixFrom(p.Addr().Unmap(), p.Bits()-96)
+			}
+			norm[i] = p
+		}
+		cfg.TrustedProxies = norm
 	}
 	l := &rateLimiter{cfg: cfg, now: time.Now, buckets: make(map[string]*bucket)}
 	l.lastSweep = l.now()

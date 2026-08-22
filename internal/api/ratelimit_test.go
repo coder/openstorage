@@ -552,6 +552,38 @@ func rlRequestXFF(t *testing.T, h http.Handler, remoteAddr, xff string) *httptes
 	return w
 }
 
+// TestRateLimitMappedPrefixNormalization: the limiter constructors — not
+// just the CLI env parser — normalize IPv4-mapped allowlist prefixes, so a
+// direct api.New/NewGitRateLimit caller passing ::ffff:10.0.0.0/104 still
+// matches IPv4 peers (Codex round 2); mapped prefixes below /96 are a
+// config error on both constructors.
+func TestRateLimitMappedPrefixNormalization(t *testing.T) {
+	mapped := []netip.Prefix{netip.MustParsePrefix("::ffff:10.0.0.0/104")} // == 10.0.0.0/8
+	cfg := RateLimitConfig{RPS: 0.001, Burst: 1, TrustedProxies: mapped}
+	rl, err := newRateLimiter(cfg)
+	if err != nil || rl == nil {
+		t.Fatalf("newRateLimiter(mapped /104) = (%v, %v), want a limiter", rl, err)
+	}
+	r := httptest.NewRequest(http.MethodGet, "/", nil)
+	r.RemoteAddr = "10.0.0.5:1234"
+	r.Header.Set("X-Forwarded-For", "203.0.113.9")
+	if got := rl.clientKey(r); got != "203.0.113.9" {
+		t.Errorf("clientKey via mapped-prefix-trusted peer = %q, want 203.0.113.9", got)
+	}
+	// The caller's slice is not mutated by normalization.
+	if mapped[0].String() != "::ffff:10.0.0.0/104" {
+		t.Errorf("caller slice mutated to %v", mapped[0])
+	}
+
+	tooShort := RateLimitConfig{RPS: 1, Burst: 1, TrustedProxies: []netip.Prefix{netip.MustParsePrefix("::ffff:10.0.0.0/64")}}
+	if _, err := newRateLimiter(tooShort); err == nil {
+		t.Error("newRateLimiter(mapped /64) = nil error, want config error")
+	}
+	if _, err := NewGitRateLimit(tooShort); err == nil {
+		t.Error("NewGitRateLimit(mapped /64) = nil error, want config error")
+	}
+}
+
 // TestRateLimitTrustedProxyBuckets: with the allowlist configured, clients
 // arriving through a trusted proxy get their own buckets keyed by the
 // forwarded address, while a spoofed XFF from an unlisted peer still shares
