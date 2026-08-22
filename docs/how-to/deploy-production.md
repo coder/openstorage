@@ -189,6 +189,12 @@ forward plain HTTP to the replicas. Then:
   therefore need direct network reach to the configured S3/MinIO endpoint — a
   VPC-internal bucket endpoint breaks LFS pushes/pulls for external clients even though
   the batch request itself succeeds.
+  **Abuse warning before exposing the endpoint to untrusted writers:** LFS uploads are
+  currently unmetered — presigned PUTs bind neither size nor checksum, LFS keys sit
+  outside the pack quota and the sweeper — so any `git:write` token holder can consume
+  unbounded bucket capacity ([#51](https://github.com/coder/code-storage/issues/51)).
+  Until that closes, weigh bucket-level metering/alerts or keeping LFS to trusted
+  clients.
 
 ### Client identity behind the proxy (`CODESTORAGE_TRUSTED_PROXIES`)
 
