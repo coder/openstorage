@@ -216,6 +216,26 @@ func TestPushCap_RawRequests(t *testing.T) {
 		assertCapEnvelope(t, status, body)
 	})
 
+	t.Run("chunked-overflow-with-git-running", func(t *testing.T) {
+		// A cap ABOVE the sniffer's 1 MiB peek budget: the sniff gives up
+		// inside the shallow flood (fail-closed atomic), git receive-pack
+		// starts and keeps consuming shallow lines until the counter trips
+		// mid-stream — the pushGate path. receive-pack's own failure report
+		// must not commit the response: the client still gets the 413.
+		bigCap := int64(2 << 20)
+		capNode, err := startNode(t.TempDir(), fmt.Sprintf("CODESTORAGE_MAX_PUSH_BYTES=%d", bigCap))
+		if err != nil {
+			t.Fatalf("start node: %v", err)
+		}
+		t.Cleanup(capNode.stop)
+		capRepo := registerRepo(t, "t-pushcap-midstream")
+		capToken := mintTestToken(t, capRepo, "git:read,git:write", "")
+		flood := shallowFlood(int(2 * bigCap))
+		status, body := postReceivePack(t, capNode, capRepo, capToken,
+			io.MultiReader(bytes.NewReader(flood)), false)
+		assertCapEnvelope(t, status, body)
+	})
+
 	t.Run("gzip-bomb", func(t *testing.T) {
 		// ~16 MiB decoded, a few KiB compressed: the compressed size passes
 		// any transport-level check, so only the post-gzip decoded counter

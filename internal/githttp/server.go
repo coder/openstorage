@@ -505,19 +505,28 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 		}
 		_ = stdin.Close()
 		runErr := cmd.Wait()
-		// A 413 needs BOTH overflow and a failed git: an exit-0 git means
-		// the wire protocol completed within the cap (the overflow was
-		// trailing junk) and hooks may have moved refs — that response
-		// must reach the client.
-		overflow := pushCap.exceeded && runErr != nil
+		// Overflow means the decoded body exceeded the cap — oversized by
+		// definition, so the push is rejected regardless of git's exit
+		// status. The exit status CANNOT discriminate anything here:
+		// receive-pack reports a truncated-pack unpack failure as a normal
+		// report-status response and exits 0.
+		overflow := pushCap.exceeded
 		if err := gate.settle(overflow); err != nil {
 			log.Printf("%s %s: response: %v", service, repo, err)
 		}
 		if overflow {
-			// git died on the truncated stream during unpack — before any
-			// hook could run — and discarded its own quarantine: nothing
-			// was published or registered, so the repack trigger below has
-			// nothing to see and the 413 can short-circuit it.
+			// On the normal overflow path git saw the truncated stream
+			// during unpack — before any hook could run — and discarded
+			// its own quarantine: nothing was published or registered, so
+			// the repack trigger below has nothing to see and the 413 can
+			// short-circuit it. The one exception is a client that padded
+			// a complete push with trailing junk past the cap; its hooks
+			// may have run, which is loud-logged and still rejected (only
+			// a non-git client can produce it, and its effects are
+			// quota-admitted like any other push).
+			if runErr == nil {
+				log.Printf("%s %s: receive-pack completed but the request body continued past the %d-byte cap (padded push?)", service, repo, s.MaxPushBytes)
+			}
 			if gate.responseStarted() {
 				// Response bytes already streamed (gateBufferMax safety
 				// valve): the status is committed, only log.
