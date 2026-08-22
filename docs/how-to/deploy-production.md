@@ -179,7 +179,11 @@ rates for serving health.
 ## Reverse proxy and TLS
 
 The server has no TLS support — terminate TLS at a reverse proxy or load balancer and
-forward plain HTTP to the replicas. Then:
+forward plain HTTP to the replicas. **Restrict ingress to the replica port** (firewall /
+security group / network policy allowlisting only the proxy and health-check sources):
+the listener binds `0.0.0.0`, and a client that can reach it directly bypasses every
+proxy-enforced limit — including the request-body cap that is currently the only
+pre-storage push bound ([#55](https://github.com/coder/code-storage/issues/55)). Then:
 
 - Set [`CODESTORAGE_BASE_URL`](../reference/configuration.md#codestorage_base_url) to the
   external `https://` URL so clone URLs and other `http_url` values in API responses are
