@@ -123,7 +123,10 @@ func TestRegisterLFSObject_AtomicCap(t *testing.T) {
 		if has, err := s.HasLFSObject(ctx, k.base(), second); err != nil || has {
 			t.Fatalf("denied register left a row: %v, %v", has, err)
 		}
-		k.wantState(10, 5, 0) // credit untouched, reservation NOT consumed
+		// Credit untouched; the loser's reservation is RETIRED (Codex
+		// round 13) — a permanent denial must not gate unrelated
+		// admissions for the TTL.
+		k.wantState(10, 0, 0)
 		if n, err := s.CountLFSObjects(ctx, k.base()); err != nil || n != 1 {
 			t.Fatalf("CountLFSObjects = %d, %v; want 1", n, err)
 		}

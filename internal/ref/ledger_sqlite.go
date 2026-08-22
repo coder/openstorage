@@ -199,6 +199,17 @@ ON CONFLICT (repo) DO UPDATE SET bytes = pack_usage.bytes + excluded.bytes`, rep
 // reservation (issue #51) — statement-for-statement mirror of the PG twin.
 func (s *SQLite) RegisterLFSObject(ctx context.Context, repo, key string, bytes int64) error {
 	validateRegisterLFS(repo, key, bytes)
+	err := s.registerLFSObjectTx(ctx, repo, key, bytes)
+	if errors.Is(err, ErrLFSObjectCapExceeded) {
+		// Retire the cap loser's reservation — see the PG twin.
+		if _, derr := s.db.ExecContext(ctx, `DELETE FROM pack_reservations WHERE key = ?`, key); derr != nil {
+			return errors.Join(err, fmt.Errorf("retire cap-denied reservation %s: %w", key, derr))
+		}
+	}
+	return err
+}
+
+func (s *SQLite) registerLFSObjectTx(ctx context.Context, repo, key string, bytes int64) error {
 	tx, err := s.db.BeginTx(ctx, nil) // BEGIN IMMEDIATE via _txlock
 	if err != nil {
 		return fmt.Errorf("register lfs object begin: %w", err)

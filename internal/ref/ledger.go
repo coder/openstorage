@@ -396,6 +396,24 @@ func validateRegisterLFS(repo, key string, bytes int64) {
 // NEW row would exceed the cap.
 func (s *PG) RegisterLFSObject(ctx context.Context, repo, key string, bytes int64) error {
 	validateRegisterLFS(repo, key, bytes)
+	err := s.registerLFSObjectTx(ctx, repo, key, bytes)
+	if errors.Is(err, ErrLFSObjectCapExceeded) {
+		// Retire the loser's reservation (Codex round 13): the cap denial
+		// is PERMANENT for a new key — every concurrent registration of
+		// any new key is denied too — so no writer can ever settle this
+		// row, and leaving it would gate unrelated admissions for the
+		// full TTL. Safe against same-key peers still staging: durable
+		// usage requires a fresh pre-publish admission plus a
+		// lease-bounded registration, both of which re-run after this
+		// delete. Best-effort — a failure just leaves TTL behavior.
+		if _, derr := s.pool.Exec(ctx, `DELETE FROM pack_reservations WHERE key = $1`, key); derr != nil {
+			return errors.Join(err, fmt.Errorf("retire cap-denied reservation %s: %w", key, derr))
+		}
+	}
+	return err
+}
+
+func (s *PG) registerLFSObjectTx(ctx context.Context, repo, key string, bytes int64) error {
 	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
 		ct, err := tx.Exec(ctx,
 			`INSERT INTO lfs_objects (repo, key, bytes) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
