@@ -1,0 +1,291 @@
+// Durable pack-quota ledger (issues #29 + #31): reservation, usage, and
+// retained-byte state living in the ref-authority store so admission is
+// atomic across nodes and replicas.
+//
+// Three tables (created by InitSchema on both backends):
+//
+//   - pack_reservations(key PK, repo, bytes, owner, created_at): one row
+//     per in-flight incoming pack, keyed by the content-addressed blob key.
+//     Inserted by ReservePackBytes BEFORE the blob upload; consumed
+//     (deleted) by RegisterPacks in the registration transaction; expired
+//     rows are ignored by admission and pruned on the sweeper cadence.
+//     A crash between reserve and register therefore over-reserves for at
+//     most the TTL — admission control, never a byte-exact ledger.
+//   - pack_usage(repo PK, bytes): the maintained per-repo usage counter.
+//     RegisterPacks credits newly inserted rows' sizes; ReplacePacks
+//     credits the fold's consolidated pack; ReclaimRetainedPack debits
+//     superseded bytes when their blob actually leaves the pack prefix.
+//   - pack_retained(repo+key PK, bytes): blob keys superseded by a
+//     ReplacePacks fold (issue #31). Their rows left the registry but the
+//     blobs linger under packs/ until a sweep reaps them, so their bytes
+//     STAY in pack_usage (nothing is subtracted at fold time) and this
+//     table records what to debit at reclaim — and identifies the
+//     provably-folded class the sweeper may delete by default.
+//
+// Admission formula (ReservePackBytes, all in one transaction):
+//
+//	max(SUM(pack_usage over group), usageFloor)
+//	  + SUM(active reservations for the base repo, excluding this push's keys)
+//	  + incoming  <=  quota
+//
+// usageFloor is the caller's blob-listing measurement (blob.PackUsageBytes).
+// It is kept as a safety floor rather than retired (deviating from issue
+// #29's "kill the listing" sketch) because it covers bytes no counter can
+// know: repos whose packs predate the ledger, and orphaned uploads from
+// crashed pushes that never registered. The counter covers what the listing
+// cannot see in time: bytes admitted by concurrent pushes that registered
+// after the caller listed. max() of two lower bounds of true usage is still
+// a lower bound, so admission stays exactly as strict as the tighter one.
+//
+// Serialization: reserve-vs-reserve for one base repo is serialized (PG: a
+// per-base advisory xact lock in a keyspace disjoint from the schema-init
+// locks; SQLite: the single-writer BEGIN IMMEDIATE), so two racing pushes
+// cannot admit against the same snapshot — the issue-#29 exploit (two
+// pushes that individually fit, together exceed) loses deterministically.
+// Reserve-vs-register needs no lock: the usage/reservation read is ONE
+// statement (one snapshot), and RegisterPacks moves a key's bytes from
+// reservation to counter atomically in its own transaction, so any snapshot
+// counts those bytes exactly once. Registrations only conserve or increase
+// accounted bytes; the only decrease (ReclaimRetainedPack) racing a reserve
+// can at worst deny a push that a moment later would fit — the safe side.
+//
+// Remaining overshoot windows, deliberately accepted and bounded:
+//   - a reservation outliving its TTL while its upload is still in flight
+//     frees headroom early (bounded by that pack's size; the TTL default
+//     comfortably exceeds server-side upload times);
+//   - orphaned uploads are invisible to the counter until the listing floor
+//     sees them (immediately on the next push's fresh listing).
+//
+// The versioned-bucket LWW dedup race documented at the Stat/upload sites
+// (hook.go, publish.go) is deliberately NOT closed by this ledger: refusing
+// a second reservation for the same live key would wedge crash-window
+// retries — a client whose push died between reserve and upload would be
+// locked out for the full TTL, the exact wedge class issue #21's reviews
+// eliminated. Same-key re-reservation instead refreshes the row (bytes
+// counted once — identical keys are identical bytes).
+
+package ref
+
+import (
+	"context"
+	"errors"
+	"strings"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+)
+
+// ReserveDecision reports one admission decision. UsedBytes and
+// ReservedBytes carry the arithmetic the caller folds into its denial
+// message (the client-facing sideband line / 403 detail).
+type ReserveDecision struct {
+	// OK reports whether the reservation was admitted and inserted.
+	OK bool
+	// UsedBytes is the usage the decision charged: the max of the ledger
+	// counter and the caller's listing floor.
+	UsedBytes int64
+	// ReservedBytes is the active in-flight reservations charged on top of
+	// UsedBytes (other pushes' keys only).
+	ReservedBytes int64
+}
+
+// reserveLockClass namespaces the per-base advisory locks ReservePackBytes
+// takes ("PKQR"), in the two-int4 pg_advisory_xact_lock keyspace — disjoint
+// from the single-int8 keys the schema-init paths use (META, SPIKE, RIVER).
+const reserveLockClass = int32(0x504B5152)
+
+// validateReserve asserts the ReservePackBytes argument invariants shared
+// by both backends. group[0] is the BASE repository (the quota accounting
+// unit reservations are keyed under); every other member must be one of its
+// namespaces. packs carry the incoming (unpublished) blobs: distinct keys,
+// positive sizes — an already-published key must not be re-reserved (it
+// contributes zero growth and is dedup-skipped by the caller).
+func validateReserve(group []string, packs []Pack, owner string, usageFloor, quotaBytes int64, ttl time.Duration) {
+	assertf(len(group) > 0 && group[0] != "", "ReservePackBytes: empty repo group")
+	for _, r := range group[1:] {
+		assertf(strings.HasPrefix(r, group[0]), "ReservePackBytes: group member %q not a namespace of base %q", r, group[0])
+	}
+	assertf(len(packs) > 0, "ReservePackBytes: no packs to reserve")
+	seen := make(map[string]bool, len(packs))
+	for _, p := range packs {
+		assertf(p.Key != "" && p.Size > 0, "ReservePackBytes: pack needs key and positive size: %+v", p)
+		assertf(!seen[p.Key], "ReservePackBytes: duplicate key %q", p.Key)
+		seen[p.Key] = true
+	}
+	assertf(owner != "", "ReservePackBytes: empty owner")
+	assertf(usageFloor >= 0, "ReservePackBytes: negative usage floor %d", usageFloor)
+	assertf(quotaBytes > 0, "ReservePackBytes: non-positive quota %d (0 disables the quota at the caller)", quotaBytes)
+	assertf(ttl > 0, "ReservePackBytes: non-positive ttl %v", ttl)
+}
+
+// incomingBytes sums the packs' sizes (validated positive).
+func incomingBytes(packs []Pack) int64 {
+	var total int64
+	for _, p := range packs {
+		total += p.Size
+	}
+	return total
+}
+
+// ReservePackBytes implements the admission check documented atop this file
+// on Postgres.
+func (s *PG) ReservePackBytes(ctx context.Context, group []string, packs []Pack, owner string, usageFloor, quotaBytes int64, ttl time.Duration) (ReserveDecision, error) {
+	validateReserve(group, packs, owner, usageFloor, quotaBytes, ttl)
+	keys := make([]string, len(packs))
+	for i, p := range packs {
+		keys[i] = p.Key
+	}
+	incoming := incomingBytes(packs)
+	var dec ReserveDecision
+	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		// Serialize reserve-vs-reserve per base repo (see the header).
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1), $2)`, group[0], reserveLockClass); err != nil {
+			return err
+		}
+		// ONE statement = one snapshot: a concurrent registration moves a
+		// key's bytes from reservation to counter atomically, so either
+		// side of that move is counted here, never neither.
+		var counter, reserved int64
+		if err := tx.QueryRow(ctx, `
+SELECT
+  COALESCE((SELECT SUM(bytes) FROM pack_usage WHERE repo = ANY($1)), 0),
+  COALESCE((SELECT SUM(bytes) FROM pack_reservations
+            WHERE repo = $2
+              AND created_at > now() - make_interval(secs => $3)
+              AND NOT (key = ANY($4))), 0)`,
+			group, group[0], ttl.Seconds(), keys).Scan(&counter, &reserved); err != nil {
+			return err
+		}
+		dec = ReserveDecision{UsedBytes: max(counter, usageFloor), ReservedBytes: reserved}
+		if dec.UsedBytes+dec.ReservedBytes+incoming > quotaBytes {
+			return nil // denied; dec.OK stays false
+		}
+		for _, p := range packs {
+			// Same-key upsert: a crash-window retry (or a concurrent
+			// identical push) refreshes the row instead of conflicting, so
+			// identical bytes are counted once and retries never wedge.
+			if _, err := tx.Exec(ctx, `
+INSERT INTO pack_reservations (key, repo, bytes, owner) VALUES ($1, $2, $3, $4)
+ON CONFLICT (key) DO UPDATE SET repo = EXCLUDED.repo, bytes = EXCLUDED.bytes,
+                                owner = EXCLUDED.owner, created_at = now()`,
+				p.Key, group[0], p.Size, owner); err != nil {
+				return err
+			}
+		}
+		dec.OK = true
+		return nil
+	})
+	if err != nil {
+		return ReserveDecision{}, err
+	}
+	return dec, nil
+}
+
+// ReleasePackReservations deletes the owner's reservations for keys.
+func (s *PG) ReleasePackReservations(ctx context.Context, keys []string, owner string) error {
+	assertf(len(keys) > 0 && owner != "", "ReleasePackReservations(%v, %q)", keys, owner)
+	_, err := s.pool.Exec(ctx,
+		`DELETE FROM pack_reservations WHERE owner = $1 AND key = ANY($2)`, owner, keys)
+	return err
+}
+
+// SweepExpiredPackReservations prunes reservation rows at least olderThan
+// old.
+func (s *PG) SweepExpiredPackReservations(ctx context.Context, olderThan time.Duration) (int64, error) {
+	assertf(olderThan >= 0, "SweepExpiredPackReservations: negative age %v", olderThan)
+	ct, err := s.pool.Exec(ctx,
+		`DELETE FROM pack_reservations WHERE created_at <= now() - make_interval(secs => $1)`,
+		olderThan.Seconds())
+	if err != nil {
+		return 0, err
+	}
+	return ct.RowsAffected(), nil
+}
+
+// IsRetainedPack reports whether (repo, key) is a recorded superseded blob.
+func (s *PG) IsRetainedPack(ctx context.Context, repo, key string) (bool, error) {
+	assertf(repo != "" && key != "", "IsRetainedPack(%q, %q)", repo, key)
+	var exists bool
+	err := s.pool.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM pack_retained WHERE repo = $1 AND key = $2)`, repo, key).Scan(&exists)
+	return exists, err
+}
+
+// ReclaimRetainedPack removes the retained row and debits the usage counter.
+func (s *PG) ReclaimRetainedPack(ctx context.Context, repo, key string) (int64, error) {
+	assertf(repo != "" && key != "", "ReclaimRetainedPack(%q, %q)", repo, key)
+	var bytes int64
+	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		switch err := tx.QueryRow(ctx,
+			`DELETE FROM pack_retained WHERE repo = $1 AND key = $2 RETURNING bytes`,
+			repo, key).Scan(&bytes); {
+		case errors.Is(err, pgx.ErrNoRows):
+			bytes = 0
+			return nil // no retained row: idempotent no-op
+		case err != nil:
+			return err
+		}
+		// GREATEST clamps defensively: the counter going negative would
+		// mean a double-debit bug, and clamping keeps admission sane (a
+		// too-small counter is still floored by the caller's listing).
+		_, err := tx.Exec(ctx,
+			`UPDATE pack_usage SET bytes = GREATEST(bytes - $2, 0) WHERE repo = $1`, repo, bytes)
+		return err
+	})
+	if err != nil {
+		return 0, err
+	}
+	return bytes, nil
+}
+
+// registerLedgerPG folds one newly inserted pack row into the ledger inside
+// the RegisterPacks transaction: the key stops being "retained" if it was
+// (re-registered superseded bytes were already counted at their original
+// registration and never debited), otherwise its size is credited to the
+// usage counter. Returns the credit.
+func registerLedgerPG(ctx context.Context, tx pgx.Tx, repo string, p Pack) (int64, error) {
+	ct, err := tx.Exec(ctx,
+		`DELETE FROM pack_retained WHERE repo = $1 AND key = $2`, repo, p.Key)
+	if err != nil {
+		return 0, err
+	}
+	if ct.RowsAffected() > 0 {
+		return 0, nil // bytes already counted since before the fold
+	}
+	return p.Size, nil
+}
+
+// creditUsagePG adds bytes to repo's usage counter row (upsert).
+func creditUsagePG(ctx context.Context, tx pgx.Tx, repo string, bytes int64) error {
+	assertf(bytes >= 0, "creditUsagePG: negative credit %d for %s", bytes, repo)
+	if bytes == 0 {
+		return nil
+	}
+	_, err := tx.Exec(ctx, `
+INSERT INTO pack_usage (repo, bytes) VALUES ($1, $2)
+ON CONFLICT (repo) DO UPDATE SET bytes = pack_usage.bytes + EXCLUDED.bytes`, repo, bytes)
+	return err
+}
+
+// PackQuotaLedgerState is a point-in-time read of one accounting group's
+// ledger, for tests, oracles, and operator inspection — NOT part of the
+// admission path (ReservePackBytes reads its own single snapshot).
+type PackQuotaLedgerState struct {
+	UsageBytes    int64 // SUM(pack_usage) over the group
+	ReservedBytes int64 // SUM(active reservations) for the base repo
+	RetainedBytes int64 // SUM(pack_retained) over the group
+}
+
+// QuotaLedgerState reads the group's ledger state (see PackQuotaLedgerState).
+func (s *PG) QuotaLedgerState(ctx context.Context, group []string, ttl time.Duration) (PackQuotaLedgerState, error) {
+	assertf(len(group) > 0 && group[0] != "" && ttl > 0, "QuotaLedgerState(%v, %v)", group, ttl)
+	var st PackQuotaLedgerState
+	err := s.pool.QueryRow(ctx, `
+SELECT
+  COALESCE((SELECT SUM(bytes) FROM pack_usage WHERE repo = ANY($1)), 0),
+  COALESCE((SELECT SUM(bytes) FROM pack_reservations
+            WHERE repo = $2 AND created_at > now() - make_interval(secs => $3)), 0),
+  COALESCE((SELECT SUM(bytes) FROM pack_retained WHERE repo = ANY($1)), 0)`,
+		group, group[0], ttl.Seconds()).Scan(&st.UsageBytes, &st.ReservedBytes, &st.RetainedBytes)
+	return st, err
+}

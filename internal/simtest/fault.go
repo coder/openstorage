@@ -73,6 +73,7 @@ const (
 	OpRefReplacePacks     = "ref.ReplacePacks"
 	OpRefListPacks        = "ref.ListPacks"
 	OpRefGetGeneration    = "ref.GetGeneration"
+	OpRefReservePacks     = "ref.ReservePackBytes"
 
 	OpBlobUploadFile   = "blob.UploadFile"
 	OpBlobDownloadFile = "blob.DownloadFile"

@@ -3,6 +3,7 @@ package simtest
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"codestorage/internal/ref"
 )
@@ -139,6 +140,47 @@ func (s *SimRefStore) HasPack(ctx context.Context, repo, key string) (bool, erro
 		return false, refReadFault(OpRefListPacks, class)
 	}
 	return s.inner.HasPack(ctx, repo, key)
+}
+
+// ReservePackBytes supports the same clean/ambiguous split as CASRef: an
+// ambiguous fault runs the admission (a reservation row may really be
+// inserted — the leaked-reservation class TTL expiry and the sweeper
+// reclaim) and then loses the outcome.
+func (s *SimRefStore) ReservePackBytes(ctx context.Context, group []string, packs []ref.Pack, owner string, usageFloor, quotaBytes int64, ttl time.Duration) (ref.ReserveDecision, error) {
+	switch class := s.inj.begin(OpRefReservePacks); class {
+	case FaultClean:
+		return ref.ReserveDecision{}, cleanFaultError{op: OpRefReservePacks}
+	case FaultAmbiguous:
+		dec, err := s.inner.ReservePackBytes(ctx, group, packs, owner, usageFloor, quotaBytes, ttl)
+		s.inj.noteInnerOutcome(OpRefReservePacks, fmt.Sprintf("ok=%v err=%v", dec.OK, err))
+		return ref.ReserveDecision{}, ambiguousFaultError{op: OpRefReservePacks}
+	case FaultNone:
+		return s.inner.ReservePackBytes(ctx, group, packs, owner, usageFloor, quotaBytes, ttl)
+	default:
+		panic(fmt.Sprintf("simtest: fault class %v invalid for %s", class, OpRefReservePacks))
+	}
+}
+
+// ReleasePackReservations delegates to the inner store (no fault point: the
+// release path's failure mode — a leaked reservation — is exactly what the
+// crash ops and TTL expiry already exercise).
+func (s *SimRefStore) ReleasePackReservations(ctx context.Context, keys []string, owner string) error {
+	return s.inner.ReleasePackReservations(ctx, keys, owner)
+}
+
+// SweepExpiredPackReservations delegates to the inner store.
+func (s *SimRefStore) SweepExpiredPackReservations(ctx context.Context, olderThan time.Duration) (int64, error) {
+	return s.inner.SweepExpiredPackReservations(ctx, olderThan)
+}
+
+// IsRetainedPack delegates to the inner store.
+func (s *SimRefStore) IsRetainedPack(ctx context.Context, repo, key string) (bool, error) {
+	return s.inner.IsRetainedPack(ctx, repo, key)
+}
+
+// ReclaimRetainedPack delegates to the inner store.
+func (s *SimRefStore) ReclaimRetainedPack(ctx context.Context, repo, key string) (int64, error) {
+	return s.inner.ReclaimRetainedPack(ctx, repo, key)
 }
 
 // GetGeneration delegates to the inner store unless a fault is injected.

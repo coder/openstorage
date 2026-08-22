@@ -42,6 +42,15 @@ func assertf(cond bool, format string, args ...any) {
 type Pack struct {
 	ID  string
 	Key string
+	// Size is the pack's byte size, feeding the quota ledger (issues
+	// #29/#31): ReservePackBytes admits Size against the quota,
+	// RegisterPacks credits it to the repo's usage counter, and
+	// ReplacePacks records superseded rows' sizes as retained bytes. It is
+	// accounting input, not a persisted row column — ListPacks returns it
+	// zero. Writers that know the pack file must set it; a zero Size
+	// registers fine but contributes nothing to the ledger (the blob
+	// listing floor still covers such bytes conservatively).
+	Size int64
 }
 
 // RefInfo is one ref row with its metadata. CreatedAt is the row's creation
@@ -92,6 +101,35 @@ type RefStore interface {
 	// (publish-before-flip); on won=false they own deleting that blob.
 	// A won swap bumps the repo generation via the InitSchema triggers.
 	ReplacePacks(ctx context.Context, repo string, old []Pack, newPack Pack) (won bool, err error)
+	// ReservePackBytes atomically admits the given incoming packs against
+	// the per-repo pack-bytes quota (issue #29), inserting one durable
+	// reservation row per pack key on success. See ledger.go for the
+	// admission formula and serialization discipline.
+	ReservePackBytes(ctx context.Context, group []string, packs []Pack, owner string, usageFloor, quotaBytes int64, ttl time.Duration) (ReserveDecision, error)
+	// ReleasePackReservations deletes the caller's reservation rows for
+	// keys — the failed-upload cleanup path. Owner-scoped: a stale caller
+	// must not delete a newer reservation another push re-acquired for the
+	// same key. Releasing an absent or re-owned key is a no-op. The happy
+	// path never calls this: RegisterPacks consumes reservations by key in
+	// the registration transaction.
+	ReleasePackReservations(ctx context.Context, keys []string, owner string) error
+	// SweepExpiredPackReservations deletes reservation rows at least
+	// olderThan old (crash-swept leak reclamation, issue #29; the orphan
+	// sweeper calls it on its cadence). olderThan=0 expires everything —
+	// a test/recovery escape hatch. Returns the number of rows deleted.
+	SweepExpiredPackReservations(ctx context.Context, olderThan time.Duration) (int64, error)
+	// IsRetainedPack reports whether (repo, key) is recorded as a
+	// superseded-by-repack blob (issue #31): its row was folded away by
+	// ReplacePacks but its bytes still occupy the pack prefix. A point
+	// read, mirroring HasPack, for the sweeper's per-object classification.
+	IsRetainedPack(ctx context.Context, repo, key string) (bool, error)
+	// ReclaimRetainedPack removes (repo, key) from the retained set and
+	// subtracts its recorded bytes from the repo's usage counter, returning
+	// the bytes reclaimed (0 when no retained row exists — idempotent).
+	// Callers invoke it exactly when the superseded blob's bytes leave the
+	// pack prefix (the sweeper's safeDelete, or its heal pass discovering
+	// the blob already gone).
+	ReclaimRetainedPack(ctx context.Context, repo, key string) (int64, error)
 	// GetGeneration returns repo's mutation generation: 0 for a repo no
 	// mutation ever touched, strictly positive and monotonically increasing
 	// afterwards. It is an invalidation token over committed row changes,
@@ -114,6 +152,10 @@ type Store interface {
 	// InitSchema creates the ref/pack tables (idempotent, safe under
 	// concurrent startups).
 	InitSchema(ctx context.Context) error
+	// QuotaLedgerState reads one accounting group's quota ledger (tests,
+	// oracles, operator inspection — never the admission path, which reads
+	// its own transactional snapshot in ReservePackBytes).
+	QuotaLedgerState(ctx context.Context, group []string, ttl time.Duration) (PackQuotaLedgerState, error)
 	Close()
 }
 
@@ -187,6 +229,18 @@ CREATE INDEX IF NOT EXISTS packs_repo_s3_key ON packs (repo, s3_key);
 -- after it.
 CREATE TABLE IF NOT EXISTS repo_generations (repo text PRIMARY KEY,
                                              generation bigint NOT NULL DEFAULT 1);
+-- Pack-quota ledger (issues #29/#31, see ledger.go). These tables carry
+-- accounting state only — they never affect clone content, so none of
+-- them get repo_generations triggers.
+CREATE TABLE IF NOT EXISTS pack_reservations (key text PRIMARY KEY, repo text NOT NULL,
+                                              bytes bigint NOT NULL, owner text NOT NULL,
+                                              created_at timestamptz NOT NULL DEFAULT now());
+-- Admission sums active reservations per base repo.
+CREATE INDEX IF NOT EXISTS pack_reservations_repo ON pack_reservations (repo);
+CREATE TABLE IF NOT EXISTS pack_retained (repo text, key text, bytes bigint NOT NULL,
+                                          superseded_at timestamptz NOT NULL DEFAULT now(),
+                                          PRIMARY KEY (repo, key));
+CREATE TABLE IF NOT EXISTS pack_usage (repo text PRIMARY KEY, bytes bigint NOT NULL DEFAULT 0);
 -- Idempotent additive migration for pre-p3 dev databases (backfills
 -- existing rows via the NOT NULL DEFAULT).
 ALTER TABLE refs ADD COLUMN IF NOT EXISTS created_at timestamptz NOT NULL DEFAULT now();
@@ -346,18 +400,41 @@ func (s *PG) CASRef(ctx context.Context, repo, name, old, new string) (won bool,
 // RegisterPacks inserts pack rows in ONE transaction (crash-ordering: this
 // runs strictly after the blob upload succeeded). Idempotent on retry: a
 // re-pushed identical pack has the same id.
+//
+// The same transaction settles the quota ledger (issues #29/#31): each
+// pack's admission reservation is consumed (deleted by KEY, any owner —
+// the bytes become counter-accounted below, and identical keys are
+// identical bytes, so a same-key reservation another push re-acquired
+// would double-count if kept), and each NEWLY inserted row credits its
+// size to the repo's usage counter unless the key was retained (superseded
+// bytes were counted at their original registration and never debited —
+// re-registering just makes them live again). Atomicity here is what lets
+// ReservePackBytes read one snapshot without locking against registration.
 func (s *PG) RegisterPacks(ctx context.Context, repo string, packs []Pack) error {
 	assertf(len(packs) > 0, "RegisterPacks called with no packs")
 	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		var credit int64
 		for _, p := range packs {
 			assertf(p.ID != "" && p.Key != "", "RegisterPacks: empty pack id/key %+v", p)
-			if _, err := tx.Exec(ctx,
+			ct, err := tx.Exec(ctx,
 				`INSERT INTO packs (repo, id, s3_key) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
-				repo, p.ID, p.Key); err != nil {
+				repo, p.ID, p.Key)
+			if err != nil {
+				return err
+			}
+			if ct.RowsAffected() > 0 {
+				c, err := registerLedgerPG(ctx, tx, repo, p)
+				if err != nil {
+					return err
+				}
+				credit += c
+			}
+			if _, err := tx.Exec(ctx,
+				`DELETE FROM pack_reservations WHERE key = $1`, p.Key); err != nil {
 				return err
 			}
 		}
-		return nil
+		return creditUsagePG(ctx, tx, repo, credit)
 	})
 }
 
@@ -398,10 +475,35 @@ func (s *PG) ReplacePacks(ctx context.Context, repo string, old []Pack, newPack 
 		if int(ct.RowsAffected()) != len(old) {
 			return errReplaceLost // another fold got here first: roll back
 		}
-		_, err = tx.Exec(ctx,
+		// Ledger (issue #31): the deleted rows' blobs LINGER under packs/
+		// until a sweep reaps them, so their bytes stay in pack_usage
+		// (nothing is debited here) and each key is recorded as retained —
+		// the reclaim record and the sweeper's provably-folded class. The
+		// insert precedes the new-pack insert on purpose: an identity fold
+		// whose newPack.ID matches an input immediately consumes its own
+		// retained row below, leaving the counter untouched (no new bytes).
+		for _, p := range old {
+			if _, err := tx.Exec(ctx, `
+INSERT INTO pack_retained (repo, key, bytes) VALUES ($1, $2, $3)
+ON CONFLICT (repo, key) DO UPDATE SET bytes = EXCLUDED.bytes, superseded_at = now()`,
+				repo, p.Key, p.Size); err != nil {
+				return err
+			}
+		}
+		ct, err = tx.Exec(ctx,
 			`INSERT INTO packs (repo, id, s3_key) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
 			repo, newPack.ID, newPack.Key)
-		return err
+		if err != nil {
+			return err
+		}
+		if ct.RowsAffected() == 0 {
+			return nil // row already registered: its bytes are already counted
+		}
+		credit, err := registerLedgerPG(ctx, tx, repo, newPack)
+		if err != nil {
+			return err
+		}
+		return creditUsagePG(ctx, tx, repo, credit)
 	})
 	if errors.Is(err, errReplaceLost) {
 		return false, nil
