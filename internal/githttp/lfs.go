@@ -722,7 +722,16 @@ func (s *Server) adoptLFSObject(ctx context.Context, repoID, key, oid string) er
 	// proof mirrors EnsurePublished's: a reap whose delete lands after
 	// this Stat necessarily runs its registry recheck after our committed
 	// row and restores the blob itself.
-	if _, err := s.Blob.Stat(ctx, key); err != nil {
+	// Bounded like the PUT path's probe (Codex round 29): this recheck
+	// runs while the caller holds the per-key slot and an op slot, and it
+	// sits OUTSIDE vctx (registration already committed under it), so a
+	// wedged backend must hand the slots back within a bounded window
+	// instead of pinning them for as long as the batch client stays
+	// connected. A timeout fails closed: the registration is committed
+	// and idempotent, so the client's retry lands on the adopted path.
+	rctx, rcancel := context.WithTimeout(ctx, lfsProbeTimeout)
+	defer rcancel()
+	if _, err := s.Blob.Stat(rctx, key); err != nil {
 		return fmt.Errorf("adopted object vanished (racing sweep?): %w", err)
 	}
 	return nil
