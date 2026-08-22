@@ -62,11 +62,11 @@ from the standard AWS chain (env vars, shared config, instance roles).
     versioning per run and silently downgrades every sweep to list-only when the check
     fails (only the explicit general-orphan opt-in checks at startup, where it fails the
     boot instead);
-  - `s3:CreateBucket`, currently even for a pre-provisioned bucket: startup idempotently
-    issues `CreateBucket` and treats only already-exists/owned-by-you answers as
-    success — an `AccessDenied` fails boot rather than probing the existing bucket
-    ([#48](https://github.com/coder/code-storage/issues/48) tracks a least-privilege
-    probe).
+  - `s3:CreateBucket` — only if the bucket should be auto-provisioned at first boot. A
+    pre-provisioned bucket needs no create permission: startup still issues
+    `CreateBucket` first, but on `AccessDenied` it probes the bucket (`HeadBucket`,
+    covered by `s3:ListBucket` above) and boots when it is reachable. A denied create
+    with an unreachable bucket stays boot-fatal, naming both errors.
 
 - Packs are immutable and content-addressed: the server only ever writes new keys and —
   through the sweeper's destructive modes — deletes provably-unreferenced ones. The bytes
