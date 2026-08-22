@@ -184,10 +184,20 @@ func (w *repackWorker) Work(ctx context.Context, job *river.Job[repackArgs]) err
 	folded, err := w.repacker.Repack(ctx, job.Args.Repo)
 	if !folded {
 		if err != nil {
-			// Real pre-swap failure: return it so river RETRIES this job
-			// with backoff (repackMaxAttempts). The job must stay active:
-			// triggers arriving while it ran were deduplicated against
-			// it, so this retryable job is the only follow-up they have.
+			// Fold-budget exhaustion is DETERMINISTIC: the same input
+			// times out on every attempt, so retrying would multiply the
+			// per-fold budget by MaxAttempts (a git:write caller
+			// registering pathological packs could hold a shared worker
+			// for the product). Cancel terminally — the budget already
+			// chose bounded-work-over-completeness for such inputs, and
+			// the next threshold crossing starts a fresh, equally bounded
+			// job. Everything else is a transient pre-swap failure:
+			// return it so river RETRIES with backoff (repackMaxAttempts)
+			// — the job must stay active, because triggers deduplicated
+			// against it have no other follow-up.
+			if errors.Is(err, context.DeadlineExceeded) {
+				return river.JobCancel(err)
+			}
 			return err
 		}
 		// Clean no-op or lost race: complete normally, but still through
