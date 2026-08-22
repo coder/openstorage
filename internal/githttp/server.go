@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -473,28 +474,30 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 		if s.TestMode && crash != "" {
 			cmd.Env = append(cmd.Env, EnvCrash+"="+crash)
 		}
-		// Per-push verify-sig verdict state (issue #59, verifystate.go): a
-		// fresh empty file per receive-pack request, appended to by the
+		// Per-push verify-sig verdict state (issue #59, verifystate.go):
+		// fresh files per receive-pack request, appended to by the
 		// pre-receive gate and every update hook. Only the request scopes
-		// "one push" — hooks are separate processes — so it is created and
-		// removed here.
-		stateFile, err := os.CreateTemp("", "codestorage-verify-sig-*.state")
+		// "one push" — hooks are separate processes — so they are created
+		// and removed here. Everything lives inside a PRIVATE 0700 temp
+		// directory: the hooks derive sibling paths (the range sidecar and
+		// walk counter) from the state path by name, and on a host whose
+		// shared temp dir admits other local users, predictable siblings
+		// next to a visible random name could otherwise be pre-created
+		// with forged verdicts (Codex round 13).
+		stateDir, err := os.MkdirTemp("", "codestorage-verify-sig-*")
 		if err != nil {
 			log.Printf("%s %s: verify state: %v", service, repo, err)
 			httpError(w, http.StatusInternalServerError, "push setup failed")
 			return
 		}
-		if err := stateFile.Close(); err != nil {
+		defer os.RemoveAll(stateDir)
+		statePath := filepath.Join(stateDir, "state")
+		if err := os.WriteFile(statePath, nil, 0o600); err != nil {
 			log.Printf("%s %s: verify state: %v", service, repo, err)
 			httpError(w, http.StatusInternalServerError, "push setup failed")
 			return
 		}
-		defer os.Remove(stateFile.Name())
-		// The hooks keep the cumulative walk counter and the range cache
-		// in sibling files (verifystate.go); remove them with the state.
-		defer os.Remove(stateFile.Name() + verifyWalkedCounterSuffix)
-		defer os.Remove(stateFile.Name() + verifyRangesSuffix)
-		cmd.Env = append(cmd.Env, EnvVerifyState+"="+stateFile.Name())
+		cmd.Env = append(cmd.Env, EnvVerifyState+"="+statePath)
 		if s.VerifySigBudget > 0 {
 			cmd.Env = append(cmd.Env, EnvVerifySigBudget+"="+strconv.Itoa(s.VerifySigBudget))
 		}
