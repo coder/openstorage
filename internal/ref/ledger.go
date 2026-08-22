@@ -268,16 +268,19 @@ SELECT
 			// identical push) refreshes the row instead of conflicting, so
 			// identical bytes are counted once and retries never wedge.
 			// The refresh deliberately KEEPS the existing owner (Codex
-			// round 5 on #51): replacing it would let the newcomer's
-			// failure cleanup delete the one row backing the original
-			// writer's still-in-flight upload — cross-replica same-key
-			// races must fail toward a TTL-bounded leak, never toward an
-			// uncounted in-flight upload. The original owner's own
-			// release stays correct, and settlement consumes by KEY
-			// regardless of owner.
+			// round 5 on #51; owner is now vestigial for LFS keys, whose
+			// rows end only by settle or TTL) and takes the MAXIMUM of the
+			// declared byte values (Codex round 7): declared sizes are
+			// client input, so a shrinking refresh would let a one-byte
+			// same-key PUT free headroom a concurrent larger upload is
+			// still staging under. Monotone growth until settlement is the
+			// conservative side — settlement replaces the row with the
+			// verified actual size in the usage counter, so an inflated
+			// declaration lives at most until settle or TTL.
 			if _, err := tx.Exec(ctx, `
 INSERT INTO pack_reservations (key, repo, bytes, owner) VALUES ($1, $2, $3, $4)
-ON CONFLICT (key) DO UPDATE SET repo = EXCLUDED.repo, bytes = EXCLUDED.bytes,
+ON CONFLICT (key) DO UPDATE SET repo = EXCLUDED.repo,
+                                bytes = GREATEST(pack_reservations.bytes, EXCLUDED.bytes),
                                 created_at = now()`,
 				p.Key, group[0], p.Size, owner); err != nil {
 				return err

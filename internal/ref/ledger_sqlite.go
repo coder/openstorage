@@ -72,12 +72,14 @@ SELECT
 		return dec, nil // denied; the deferred rollback discards nothing
 	}
 	for _, p := range packs {
-		// Same-key upsert (see the PG twin): retries refresh, never wedge,
-		// and the refresh KEEPS the existing owner (Codex round 5).
+		// Same-key upsert (see the PG twin): retries refresh, never wedge;
+		// the refresh KEEPS the existing owner (Codex round 5) and takes
+		// the MAX of the declared byte values (Codex round 7).
 		if _, err := tx.ExecContext(ctx, `
 INSERT INTO pack_reservations (key, repo, bytes, owner, created_at)
 VALUES (?, ?, ?, ?, `+sqliteEpochMS+`)
-ON CONFLICT (key) DO UPDATE SET repo = excluded.repo, bytes = excluded.bytes,
+ON CONFLICT (key) DO UPDATE SET repo = excluded.repo,
+                                bytes = MAX(pack_reservations.bytes, excluded.bytes),
                                 created_at = excluded.created_at`,
 			p.Key, group[0], p.Size, owner); err != nil {
 			return ReserveDecision{}, fmt.Errorf("reserve pack bytes insert: %w", err)

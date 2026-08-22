@@ -73,6 +73,31 @@ func TestRegisterLFSObject_ZeroBytes(t *testing.T) {
 	})
 }
 
+// TestReserveSameKeyRefreshNeverShrinks (Codex round 7): declared sizes
+// are client input, so a same-key refresh takes the MAX of the byte values
+// — a one-byte refresh must not free headroom a concurrent larger writer
+// is still staging under; a larger refresh must still grow the charge.
+func TestReserveSameKeyRefreshNeverShrinks(t *testing.T) {
+	runRefBackends(t, func(t *testing.T, s Store) {
+		k := newLedgerKit(t, s)
+		key := lfsLedgerKey(k, "eeee")
+		if dec := k.reserve([]Pack{{Key: key, Size: 60}}, "owner-a", 0, 1000); !dec.OK {
+			t.Fatalf("reserve 60: %+v", dec)
+		}
+		k.wantState(0, 60, 0)
+		// Shrinking refresh: row stays at 60.
+		if dec := k.reserve([]Pack{{Key: key, Size: 1}}, "owner-b", 0, 1000); !dec.OK {
+			t.Fatalf("refresh 1: %+v", dec)
+		}
+		k.wantState(0, 60, 0)
+		// Growing refresh: row grows to 80.
+		if dec := k.reserve([]Pack{{Key: key, Size: 80}}, "owner-c", 0, 1000); !dec.OK {
+			t.Fatalf("refresh 80: %+v", dec)
+		}
+		k.wantState(0, 80, 0)
+	})
+}
+
 // TestRegisterLFSObject_AtomicCap (Codex round 6): the object-count cap is
 // enforced inside the registration transaction itself — a denial commits
 // nothing (no row, no credit, reservation untouched), idempotent
