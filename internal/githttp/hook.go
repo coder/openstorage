@@ -200,6 +200,15 @@ func preReceive(ctx context.Context) error {
 	// nothing. A sweeper deleting the key between this check and
 	// registration is healed by blob.EnsurePublished below, exactly as for
 	// a fresh upload.
+	//
+	// The Stat/upload pair is not atomic: concurrent identical first-time
+	// pushes can each see the key absent and both upload. Byte-identical
+	// last-writer-wins is semantically harmless (content-addressed keys),
+	// and the cost is bounded — at most concurrency-many noncurrent
+	// versions per unique pack on versioned buckets, reclaimable by a
+	// standard noncurrent-version lifecycle rule. gocloud's portable blob
+	// API has no conditional create; per-key cross-replica reservations
+	// are issue #29's ledger design.
 	published := make([]bool, len(packs))
 	for i := range packs {
 		if _, err := bl.Stat(ctx, packs[i].Key); err == nil {
@@ -302,13 +311,28 @@ func preReceive(ctx context.Context) error {
 // work here exactly as in the update hook; verify-sig-policied winners are
 // verified twice, an accepted redundancy for failing closed.
 //
-// Known residual (issue #28): under `git push --atomic`, a justified mixed
-// push whose denied command aborts the transaction can still register a
-// pack no surviving ref needs (githooks(5) exposes no atomic indicator to
-// server-side hooks); background repack reclaims such packs. The
-// durable-CAS twist halves the exposure: an allowed command's update hook
-// that ran before the denial has already committed its PG CAS, so the ref
-// survives durably and the pack is reachable.
+// Known residuals (issue #28 family — reachability-based reconciliation):
+//   - `git push --atomic`: a justified mixed push whose denied command
+//     aborts the transaction can still register a pack no surviving ref
+//     needs (githooks(5) exposes no atomic indicator to server-side
+//     hooks). The durable-CAS twist halves the exposure: an allowed
+//     command's update hook that ran before the denial has already
+//     committed its PG CAS, so the ref survives durably.
+//   - junk riders: a mixed push whose allowed command genuinely needs the
+//     pack still publishes ALL of the pack's objects, including ones only
+//     denied commands reference. Filtering by reachability from allowed
+//     winners would require re-packing at pre-receive; and the marginal
+//     power it removes is nil — any holder of the same repo-scoped
+//     git:write token can burn the repo's quota with policy-ALLOWED
+//     garbage (push a large blob to a permitted branch, delete the
+//     branch). The quota bounds per-repo growth; it cannot police
+//     intra-repo goodwill among authorized writers.
+//
+// In both cases the stray bytes are quota-counted (self-limiting) and
+// their reclamation is reachability work: repack folds carry unreachable
+// objects forward by design (see internal/jobs/repack.go — a fold-time
+// reachability cut races in-flight pushes), so cleanup belongs to #28's
+// reconciliation design, not this gate.
 func preReceivePolicyGate(ctx context.Context, repo string, commands []refCommand) error {
 	assertf(len(commands) > 0, "preReceivePolicyGate: no commands")
 	var firstErr error

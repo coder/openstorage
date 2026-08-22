@@ -36,6 +36,13 @@ func (s *server) publishPack(ctx context.Context, repoID, packID, packPath strin
 		return fmt.Errorf("stat pack: %w", err)
 	}
 	key := blob.PackKey(repoID, packID)
+	// Stat/upload is not atomic: concurrent identical publications can
+	// both see the key absent and upload. Byte-identical last-writer-wins
+	// is harmless (content-addressed keys); on versioned buckets the cost
+	// is bounded by concurrency-many noncurrent versions per unique pack,
+	// reclaimable via a lifecycle rule (see the pre-receive hook's twin
+	// note; conditional create is not portable through gocloud, and per-key
+	// reservations are issue #29's ledger design).
 	published := false
 	if _, err := s.blobStore.Stat(ctx, key); err == nil {
 		published = true
