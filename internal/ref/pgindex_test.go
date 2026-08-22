@@ -12,6 +12,7 @@ import (
 	"context"
 	"fmt"
 	"testing"
+	"time"
 )
 
 // mustPacksIndexState reads the index state through the store's own pool.
@@ -85,5 +86,41 @@ func TestPGInitSchema_RepairsInvalidPacksIndex(t *testing.T) {
 	ok, err := s.HasPack(ctx, repo, key)
 	if err != nil || !ok {
 		t.Fatalf("HasPack through rebuilt index = %v, %v; want true", ok, err)
+	}
+}
+
+// TestPGInitSchema_SingleConnPoolBuildsIndex pins the Codex P1 on #43: the
+// build/repair path holds a dedicated conn for the SPIDX session lock, and
+// with pool_max_conns=1 that conn is the pool's only slot — the
+// transactional DDL must run on the held conn, or InitSchema waits forever
+// for a second slot on a non-expiring boot context.
+func TestPGInitSchema_SingleConnPoolBuildsIndex(t *testing.T) {
+	s := pgTestStore(t)
+	ctx := context.Background()
+
+	// Poison the index so the single-conn boot takes the lock-holding
+	// build path, not the steady-state fast path.
+	if _, err := s.pool.Exec(ctx,
+		`UPDATE pg_index SET indisvalid = false WHERE indexrelid = to_regclass('packs_repo_s3_key')`); err != nil {
+		t.Fatalf("inject invalid index: %v", err)
+	}
+
+	one, err := OpenPG(ctx, pgTestURL+"&pool_max_conns=1")
+	if err != nil {
+		t.Fatalf("open single-conn store: %v", err)
+	}
+	defer one.Close()
+	done := make(chan error, 1)
+	go func() { done <- one.InitSchema(ctx) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("single-conn InitSchema: %v", err)
+		}
+	case <-time.After(60 * time.Second):
+		t.Fatal("single-conn InitSchema deadlocked: transactional DDL must run on the held lock conn")
+	}
+	if exists, valid := mustPacksIndexState(t, s); !exists || !valid {
+		t.Fatalf("after single-conn repair: exists=%v valid=%v, want a valid index", exists, valid)
 	}
 }

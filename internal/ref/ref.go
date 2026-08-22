@@ -222,7 +222,7 @@ func (s *PG) InitSchema(ctx context.Context) error {
 	if exists, valid, err := packsIndexState(ctx, s.pool); err != nil {
 		return err
 	} else if exists && valid {
-		return s.initSchemaTx(ctx) // steady state: index built by an earlier boot
+		return initSchemaTx(ctx, s.pool) // steady state: index built by an earlier boot
 	}
 
 	// First boot (or crashed-build repair): one dedicated conn owns the
@@ -250,7 +250,7 @@ func (s *PG) InitSchema(ctx context.Context) error {
 		if exists, valid, err := packsIndexState(ctx, conn); err != nil {
 			return err
 		} else if exists && valid {
-			return s.initSchemaTx(ctx) // the lock holder finished the build while we waited
+			return initSchemaTx(ctx, conn) // the lock holder finished the build while we waited
 		}
 		select {
 		case <-ctx.Done():
@@ -271,17 +271,24 @@ func (s *PG) InitSchema(ctx context.Context) error {
 			_ = conn.Conn().Close(unlockCtx)
 		}
 	}()
-	if err := s.initSchemaTx(ctx); err != nil {
+	if err := initSchemaTx(ctx, conn); err != nil {
 		return err
 	}
 	return buildPacksIndexLocked(ctx, conn)
 }
 
-// initSchemaTx is InitSchema's transactional DDL. The advisory xact lock
-// serializes concurrent node startups: two racing CREATE TABLE IF NOT EXISTS
-// can fail with a duplicate pg_type key error (found via dogfooding).
-func (s *PG) initSchemaTx(ctx context.Context) error {
-	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+// initSchemaTx is InitSchema's transactional DDL, run on db: the pool on
+// steady-state boots, but the HELD dedicated conn on every path that has
+// acquired one — that conn may be the pool's only slot (pool_max_conns=1),
+// and beginning the transaction on the pool from under it would wait for a
+// second slot forever on a non-expiring boot context (Codex P1 on #43).
+// The advisory xact lock serializes concurrent node startups: two racing
+// CREATE TABLE IF NOT EXISTS can fail with a duplicate pg_type key error
+// (found via dogfooding).
+func initSchemaTx(ctx context.Context, db interface {
+	Begin(ctx context.Context) (pgx.Tx, error)
+}) error {
+	return pgx.BeginFunc(ctx, db, func(tx pgx.Tx) error {
 		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(0x5350494B45)`); err != nil { // "SPIKE"
 			return err
 		}

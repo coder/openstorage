@@ -21,6 +21,7 @@ var (
 	pgOnce    sync.Once
 	pgErr     error
 	pgStore   *PG
+	pgTestURL string // container URL for tests needing their own pool options
 	pgCleanup []func()
 )
 
@@ -49,6 +50,7 @@ func pgTestStore(t *testing.T) *PG {
 			pgErr = err
 			return
 		}
+		pgTestURL = pgURL
 		store, err := OpenPG(ctx, pgURL)
 		if err != nil {
 			pgErr = err
