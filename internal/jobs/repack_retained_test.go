@@ -65,7 +65,7 @@ func TestRepack_RetainedBytesAccountedAndSwept(t *testing.T) {
 	}
 	// The prefix listing agrees with the counter — both usage sources see
 	// the fold's amplification until the sweep reclaims it.
-	if listed, err := blob.PackUsageBytes(ctx, f.blobs, f.repo); err != nil || listed != st.UsageBytes {
+	if listed, err := blob.StorageUsageBytes(ctx, f.blobs, f.repo); err != nil || listed != st.UsageBytes {
 		t.Fatalf("listing = %d, %v; want counter %d", listed, err, st.UsageBytes)
 	}
 

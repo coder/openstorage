@@ -121,7 +121,7 @@ const PacksRoot = "packs/"
 // PackPrefix is the listing prefix for a repo's packs.
 func PackPrefix(repo string) string { return PacksRoot + repo + "/" }
 
-// packUsagePageSize bounds one PackUsageBytes listing page, mirroring the
+// packUsagePageSize bounds one StorageUsageBytes listing page, mirroring the
 // sweeper's page-bounded scans so a pathological pack count cannot balloon
 // memory.
 const packUsagePageSize = 1000
@@ -137,7 +137,7 @@ var packNamespaceSuffixes = []string{"+ephemeral", "+import"}
 // QuotaRepoGroup returns repo's quota accounting group: the BASE repository
 // first (suffix stripped), then every docs/05 namespace that rolls up under
 // it. The ref-store quota ledger (issue #29) keys reservations under
-// group[0] and sums usage over the whole group, mirroring PackUsageBytes'
+// group[0] and sums usage over the whole group, mirroring StorageUsageBytes'
 // rollup so both usage sources measure the same unit.
 func QuotaRepoGroup(repo string) []string {
 	assertf(repo != "", "QuotaRepoGroup: empty repo")
@@ -154,13 +154,14 @@ func QuotaRepoGroup(repo string) []string {
 	return group
 }
 
-// PackUsageBytes sums the sizes of every object under the pack prefixes of
-// repo's BASE repository and all of its namespaces: registered packs plus
-// not-yet-swept orphans AND retained superseded blobs — the packs/ growth
-// the per-repo quota (issue #21) bounds. The suffix, if any, is stripped
-// first, so every namespace write is measured against the same rolled-up
-// usage. Shared by the pre-receive hook, the REST pack writers, and the
-// git surface's pressure check.
+// StorageUsageBytes sums the sizes of every object under the pack prefixes
+// of repo's BASE repository and all of its namespaces PLUS the repo's LFS
+// prefix (issue #51): registered packs and LFS objects, not-yet-swept
+// orphans, AND retained superseded blobs — exactly the durable growth the
+// per-repo storage quota (issue #21) bounds. The suffix, if any, is
+// stripped first, so every namespace write is measured against the same
+// rolled-up usage. Shared by the pre-receive hook, the REST pack writers,
+// the LFS batch/transfer gates, and the git surface's pressure check.
 //
 // Since issue #29 this listing is the admission check's usage FLOOR rather
 // than its sole source: the ref-store ledger (ref.ReservePackBytes) charges
@@ -168,16 +169,19 @@ func QuotaRepoGroup(repo string) []string {
 // concurrent-push overshoot this listing alone admitted. Retained
 // superseded bytes (issue #31) are counted by BOTH sources — here as
 // lingering prefix objects, there as pack_retained rows — until a sweep
-// reclaims them.
-func PackUsageBytes(ctx context.Context, b BlobStore, repo string) (int64, error) {
-	assertf(b != nil && repo != "", "PackUsageBytes: missing blob store or repo")
+// reclaims them. LFS bytes are likewise counted by both once uploads
+// settle (ref.RegisterLFSObject); before #51's ledger existed, only this
+// listing could see them, which is one more reason the floor stays.
+func StorageUsageBytes(ctx context.Context, b BlobStore, repo string) (int64, error) {
+	assertf(b != nil && repo != "", "StorageUsageBytes: missing blob store or repo")
 	base := QuotaRepoGroup(repo)[0]
-	// Two listings cover base + every namespace without matching sibling
-	// repos: "packs/<base>/" is the base prefix, and "packs/<base>+" only
-	// matches this repo's namespace prefixes ('+' cannot start another
-	// repo's key segment).
+	// Three listings cover base + every namespace + LFS without matching
+	// sibling repos: "packs/<base>/" is the base pack prefix,
+	// "packs/<base>+" only matches this repo's namespace prefixes ('+'
+	// cannot start another repo's key segment), and "lfs/<base>/" is the
+	// shared LFS object space every namespace rolls up to (ADR-35).
 	var total int64
-	for _, prefix := range []string{PackPrefix(base), PacksRoot + base + "+"} {
+	for _, prefix := range []string{PackPrefix(base), PacksRoot + base + "+", LFSPrefix(base)} {
 		err := b.ListPages(ctx, prefix, packUsagePageSize, func(page []ListedObject) error {
 			for _, o := range page {
 				total += o.Size
@@ -185,10 +189,10 @@ func PackUsageBytes(ctx context.Context, b BlobStore, repo string) (int64, error
 			return nil
 		})
 		if err != nil {
-			return 0, fmt.Errorf("list pack usage for %s: %w", repo, err)
+			return 0, fmt.Errorf("list storage usage for %s: %w", repo, err)
 		}
 	}
-	assertf(total >= 0, "PackUsageBytes: negative total %d for %s", total, repo)
+	assertf(total >= 0, "StorageUsageBytes: negative total %d for %s", total, repo)
 	return total, nil
 }
 
@@ -197,7 +201,19 @@ func PackUsageBytes(ctx context.Context, b BlobStore, repo string) (int64, error
 // only, never the objects, which this keying yields automatically.
 func LFSKey(repoID, oid string) string {
 	assertf(repoID != "" && oid != "", "LFSKey(%q, %q)", repoID, oid)
-	return "lfs/" + repoID + "/" + oid
+	return LFSRoot + repoID + "/" + oid
+}
+
+// LFSRoot is the listing prefix covering every repo's LFS objects (the
+// orphan sweeper scans it like PacksRoot, issue #51). LFS keys always use
+// the BASE RepoID (ADR-35): namespaces share one object space, so there is
+// no "+suffix" variant to cover.
+const LFSRoot = "lfs/"
+
+// LFSPrefix is the listing prefix for a repo's LFS objects.
+func LFSPrefix(repoID string) string {
+	assertf(repoID != "", "LFSPrefix: empty repo")
+	return LFSRoot + repoID + "/"
 }
 
 // EnsurePublished re-uploads the local file at path to key when key is

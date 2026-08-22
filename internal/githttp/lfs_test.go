@@ -13,6 +13,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -20,6 +22,7 @@ import (
 	"codestorage/internal/auth"
 	"codestorage/internal/blob"
 	"codestorage/internal/meta"
+	"codestorage/internal/ref"
 )
 
 const (
@@ -28,12 +31,23 @@ const (
 )
 
 // newLFSServer wires a Server around bl with one resolvable repo
-// (lfsTestRepoURL / lfsTestRepoID) and returns a token minter for it.
+// (lfsTestRepoURL / lfsTestRepoID), a SQLite ref store (the upload path
+// registers verified objects durably, issue #51), and returns a token
+// minter for it.
 func newLFSServer(t *testing.T, bl blob.BlobStore) (*Server, func(scopes ...string) string) {
 	t.Helper()
 	key, pem := genKeyPEM(t, "ES256")
 	verifier := auth.NewVerifier(memKeys{"org1": {pem}})
+	st, err := ref.Open(context.Background(), "sqlite://"+t.TempDir()+"/refs.sqlite")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(st.Close)
+	if err := st.InitSchema(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 	srv := &Server{
+		Store:    st,
 		Blob:     bl,
 		Verifier: verifier,
 		Org:      "org1",
@@ -290,23 +304,59 @@ func (s signedBlob) SignedURL(_ context.Context, key, method string, expiry time
 	return "https://signed.example/" + method + "/" + key, nil
 }
 
+// TestLFS_BatchPresignedHref: on a presign-capable backend, DOWNLOADS get
+// presigned hrefs while UPLOADS still get the verified proxy href (issue
+// #51: a presigned PUT binds neither length nor digest, so it can never be
+// the upload transfer).
 func TestLFS_BatchPresignedHref(t *testing.T) {
 	srv, mint := newLFSServer(t, signedBlob{openFileBlob(t)})
-	oid := sha256Hex([]byte("presigned"))
+	content := []byte("presigned")
+	oid := sha256Hex(content)
+
+	// Upload on a presign-capable backend: proxy href, not a signed URL.
 	resp := decodeBatch(t, doLFS(t, srv, http.MethodPost, lfsBatchPath, "basic:"+mint(auth.ScopeGitWrite),
-		batchBody("upload", oid, 9)))
+		batchBody("upload", oid, int64(len(content)))))
 	up := resp.Objects[0].Actions["upload"]
 	if up == nil {
 		t.Fatalf("no upload action: %+v", resp.Objects[0])
 	}
-	wantHref := "https://signed.example/PUT/" + blob.LFSKey(lfsTestRepoID, oid)
-	if up.Href != wantHref {
-		t.Fatalf("presigned href = %q, want %q", up.Href, wantHref)
+	wantUp := "http://example.com/" + lfsTestRepoURL + ".git/info/lfs/objects/" + oid
+	if up.Href != wantUp {
+		t.Fatalf("upload href = %q, want verified proxy %q", up.Href, wantUp)
 	}
-	if up.ExpiresIn != int(lfsURLExpiry.Seconds()) {
-		t.Fatalf("expires_in = %d, want %d", up.ExpiresIn, int(lfsURLExpiry.Seconds()))
+	if len(up.Header) == 0 {
+		t.Fatalf("proxy upload action must carry Authorization, got %v", up.Header)
 	}
-	if len(up.Header) != 0 {
-		t.Fatalf("presigned action must not echo Authorization, got %v", up.Header)
+
+	// Download of a stored object: presigned GET without echoed creds.
+	if err := srv.Blob.(signedBlob).BlobStore.UploadFile(context.Background(),
+		blob.LFSKey(lfsTestRepoID, oid), writeTempFile(t, content)); err != nil {
+		t.Fatal(err)
 	}
+	resp = decodeBatch(t, doLFS(t, srv, http.MethodPost, lfsBatchPath, "basic:"+mint(auth.ScopeGitRead),
+		batchBody("download", oid, int64(len(content)))))
+	down := resp.Objects[0].Actions["download"]
+	if down == nil {
+		t.Fatalf("no download action: %+v", resp.Objects[0])
+	}
+	wantDown := "https://signed.example/GET/" + blob.LFSKey(lfsTestRepoID, oid)
+	if down.Href != wantDown {
+		t.Fatalf("presigned download href = %q, want %q", down.Href, wantDown)
+	}
+	if down.ExpiresIn != int(lfsURLExpiry.Seconds()) {
+		t.Fatalf("expires_in = %d, want %d", down.ExpiresIn, int(lfsURLExpiry.Seconds()))
+	}
+	if len(down.Header) != 0 {
+		t.Fatalf("presigned action must not echo Authorization, got %v", down.Header)
+	}
+}
+
+// writeTempFile writes content to a fresh temp file and returns its path.
+func writeTempFile(t *testing.T, content []byte) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "obj")
+	if err := os.WriteFile(path, content, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
 }

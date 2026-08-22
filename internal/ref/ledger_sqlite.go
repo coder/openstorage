@@ -174,6 +174,49 @@ ON CONFLICT (repo) DO UPDATE SET bytes = pack_usage.bytes + excluded.bytes`, rep
 	return err
 }
 
+// RegisterLFSObject records one verified LFS object and settles its quota
+// reservation (issue #51) — statement-for-statement mirror of the PG twin.
+func (s *SQLite) RegisterLFSObject(ctx context.Context, repo, key string, bytes int64) error {
+	validateRegisterLFS(repo, key, bytes)
+	tx, err := s.db.BeginTx(ctx, nil) // BEGIN IMMEDIATE via _txlock
+	if err != nil {
+		return fmt.Errorf("register lfs object begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	res, err := tx.ExecContext(ctx,
+		`INSERT INTO lfs_objects (repo, key, bytes) VALUES (?, ?, ?) ON CONFLICT DO NOTHING`,
+		repo, key, bytes)
+	if err != nil {
+		return err
+	}
+	inserted, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM pack_reservations WHERE key = ?`, key); err != nil {
+		return err
+	}
+	if inserted > 0 {
+		if err := creditUsageSQLite(ctx, tx, repo, bytes); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("register lfs object commit: %w", err)
+	}
+	return nil
+}
+
+// HasLFSObject reports whether (repo, key) is a registered LFS object.
+func (s *SQLite) HasLFSObject(ctx context.Context, repo, key string) (bool, error) {
+	assertf(repo != "" && key != "", "HasLFSObject(%q, %q)", repo, key)
+	var exists bool
+	err := s.db.QueryRowContext(ctx,
+		`SELECT EXISTS (SELECT 1 FROM lfs_objects WHERE repo = ? AND key = ?)`, repo, key).Scan(&exists)
+	return exists, err
+}
+
 // QuotaLedgerState reads the group's ledger state (see the PG twin).
 func (s *SQLite) QuotaLedgerState(ctx context.Context, group []string, ttl time.Duration) (PackQuotaLedgerState, error) {
 	assertf(len(group) > 0 && group[0] != "" && ttl > 0, "QuotaLedgerState(%v, %v)", group, ttl)

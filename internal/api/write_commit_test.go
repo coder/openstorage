@@ -1033,7 +1033,7 @@ func TestCommitPackQuota(t *testing.T) {
 		resp, respBody := wctPost(t, generous, "/api/v1/repos/commit-pack", writeTok, bytes.NewReader(smallBody("c1", "a.txt")))
 		wctRequireOK(t, resp, respBody)
 
-		usage, err := blob.PackUsageBytes(context.Background(), e.blobStore, repo.RepoID)
+		usage, err := blob.StorageUsageBytes(context.Background(), e.blobStore, repo.RepoID)
 		if err != nil || usage == 0 {
 			t.Fatalf("usage after first commit = (%d, %v), want > 0", usage, err)
 		}
@@ -1052,7 +1052,7 @@ func TestCommitPackQuota(t *testing.T) {
 		if env.Result.Success || env.Result.Status != "forbidden" || !strings.Contains(env.Result.Message, "quota") {
 			t.Fatalf("unexpected result envelope: %+v", env.Result)
 		}
-		after, err := blob.PackUsageBytes(context.Background(), e.blobStore, repo.RepoID)
+		after, err := blob.StorageUsageBytes(context.Background(), e.blobStore, repo.RepoID)
 		if err != nil || after != usage {
 			t.Fatalf("denied write changed usage: %d -> %d (err %v)", usage, after, err)
 		}

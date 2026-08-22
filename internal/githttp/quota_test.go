@@ -257,7 +257,7 @@ func TestPackUsageCacheCoalescesMisses(t *testing.T) {
 	}
 }
 
-func TestPackUsageBytes(t *testing.T) {
+func TestStorageUsageBytes(t *testing.T) {
 	bl := openTestBlob(t)
 	seedPack(t, bl, "repo_a", "1111", 100)
 	seedPack(t, bl, "repo_a", "2222", 50)

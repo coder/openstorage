@@ -183,6 +183,18 @@ func (s *SimRefStore) ReclaimRetainedPack(ctx context.Context, repo, key string)
 	return s.inner.ReclaimRetainedPack(ctx, repo, key)
 }
 
+// RegisterLFSObject delegates to the inner store (the DST does not model
+// LFS transfers yet; delegation keeps the interface honest without adding
+// an unexercised fault point).
+func (s *SimRefStore) RegisterLFSObject(ctx context.Context, repo, key string, bytes int64) error {
+	return s.inner.RegisterLFSObject(ctx, repo, key, bytes)
+}
+
+// HasLFSObject delegates to the inner store.
+func (s *SimRefStore) HasLFSObject(ctx context.Context, repo, key string) (bool, error) {
+	return s.inner.HasLFSObject(ctx, repo, key)
+}
+
 // GetGeneration delegates to the inner store unless a fault is injected.
 // Faulting it starves the issue-#4 hydrate short-circuit, which must then
 // surface the error rather than serve from a stale marker.

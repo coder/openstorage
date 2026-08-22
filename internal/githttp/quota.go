@@ -28,7 +28,7 @@ package githttp
 // expired in-flight reservations; orphaned uploads seen only by the next
 // listing).
 // Namespaced repos (`+ephemeral`/`+import`) keep separate pack PREFIXES but
-// share the base repository's quota: blob.PackUsageBytes rolls all of a
+// share the base repository's quota: blob.StorageUsageBytes rolls all of a
 // repo's namespaces up, because auth strips the suffix and one token must
 // not obtain a fresh quota per namespace (Codex round 15).
 
@@ -221,7 +221,7 @@ func (s *Server) refreshUsage(repo string, f *usageFlight) {
 }
 
 // packUsageBytes sums the sizes of every object under repo's pack prefix
-// (blob.PackUsageBytes, shared with the REST pack writers).
+// (blob.StorageUsageBytes, shared with the REST pack writers).
 func packUsageBytes(ctx context.Context, bl blob.BlobStore, repo string) (int64, error) {
-	return blob.PackUsageBytes(ctx, bl, repo)
+	return blob.StorageUsageBytes(ctx, bl, repo)
 }

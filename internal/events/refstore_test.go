@@ -65,6 +65,10 @@ func (f *fakeInner) IsRetainedPack(context.Context, string, string) (bool, error
 func (f *fakeInner) ReclaimRetainedPack(context.Context, string, string) (int64, error) {
 	return 0, nil
 }
+func (f *fakeInner) RegisterLFSObject(context.Context, string, string, int64) error { return nil }
+func (f *fakeInner) HasLFSObject(context.Context, string, string) (bool, error) {
+	return false, nil
+}
 
 type fakeRepos struct {
 	repo meta.Repo

@@ -104,6 +104,11 @@ func (s *SQLite) InitSchema(ctx context.Context) error {
 		                                           superseded_at INTEGER NOT NULL DEFAULT (unixepoch()),
 		                                           PRIMARY KEY (repo, key))`,
 		`CREATE TABLE IF NOT EXISTS pack_usage (repo TEXT PRIMARY KEY, bytes INTEGER NOT NULL DEFAULT 0)`,
+		// Registered LFS objects (issue #51): the LFS sweep registry and
+		// quota settle record — see the PG DDL for the rationale.
+		`CREATE TABLE IF NOT EXISTS lfs_objects (repo TEXT, key TEXT, bytes INTEGER NOT NULL,
+		                                         created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+		                                         PRIMARY KEY (repo, key))`,
 	} {
 		if _, err := tx.ExecContext(ctx, stmt); err != nil {
 			return fmt.Errorf("sqlite init schema: %w", err)

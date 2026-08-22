@@ -28,7 +28,7 @@
 //	  + SUM(active reservations for the base repo, excluding this push's keys)
 //	  + incoming  <=  quota
 //
-// usageFloor is the caller's blob-listing measurement (blob.PackUsageBytes).
+// usageFloor is the caller's blob-listing measurement (blob.StorageUsageBytes).
 // It is kept as a safety floor rather than retired (deviating from issue
 // #29's "kill the listing" sketch) because it covers bytes no counter can
 // know: repos whose packs predate the ledger, and orphaned uploads from
@@ -280,6 +280,48 @@ func creditUsagePG(ctx context.Context, tx pgx.Tx, repo string, bytes int64) err
 INSERT INTO pack_usage (repo, bytes) VALUES ($1, $2)
 ON CONFLICT (repo) DO UPDATE SET bytes = pack_usage.bytes + EXCLUDED.bytes`, repo, bytes)
 	return err
+}
+
+// validateRegisterLFS asserts the RegisterLFSObject argument invariants
+// shared by both backends. bytes zero is legal (the well-known empty
+// object) but negative is a caller bug.
+func validateRegisterLFS(repo, key string, bytes int64) {
+	assertf(repo != "" && key != "", "RegisterLFSObject(%q, %q)", repo, key)
+	assertf(bytes >= 0, "RegisterLFSObject(%s, %s): negative bytes %d", repo, key, bytes)
+}
+
+// RegisterLFSObject records one verified LFS object and settles its quota
+// reservation (issue #51) — see RefStore. Mirrors RegisterPacks' ledger
+// discipline: the one-transaction insert + reservation consumption + credit
+// is what lets ReservePackBytes read a single snapshot without locking
+// against LFS settlement.
+func (s *PG) RegisterLFSObject(ctx context.Context, repo, key string, bytes int64) error {
+	validateRegisterLFS(repo, key, bytes)
+	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		ct, err := tx.Exec(ctx,
+			`INSERT INTO lfs_objects (repo, key, bytes) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
+			repo, key, bytes)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx,
+			`DELETE FROM pack_reservations WHERE key = $1`, key); err != nil {
+			return err
+		}
+		if ct.RowsAffected() == 0 {
+			return nil // already registered: bytes already counted
+		}
+		return creditUsagePG(ctx, tx, repo, bytes)
+	})
+}
+
+// HasLFSObject reports whether (repo, key) is a registered LFS object.
+func (s *PG) HasLFSObject(ctx context.Context, repo, key string) (bool, error) {
+	assertf(repo != "" && key != "", "HasLFSObject(%q, %q)", repo, key)
+	var exists bool
+	err := s.pool.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM lfs_objects WHERE repo = $1 AND key = $2)`, repo, key).Scan(&exists)
+	return exists, err
 }
 
 // PackQuotaLedgerState is a point-in-time read of one accounting group's

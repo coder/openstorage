@@ -130,6 +130,19 @@ type RefStore interface {
 	// pack prefix (the sweeper's safeDelete, or its heal pass discovering
 	// the blob already gone).
 	ReclaimRetainedPack(ctx context.Context, repo, key string) (int64, error)
+	// RegisterLFSObject records one verified LFS object for repo (always
+	// the BASE RepoID — namespaces share the LFS space, ADR-35) strictly
+	// after its bytes are durable in blob storage, mirroring RegisterPacks
+	// (issue #51). In ONE transaction it inserts the row (idempotent on
+	// retry), consumes any admission reservation for key (deleted by KEY,
+	// any owner — the bytes become counter-accounted), and credits a NEWLY
+	// inserted row's bytes to the repo's usage counter. bytes may be zero
+	// (the empty object registers without ledger effect).
+	RegisterLFSObject(ctx context.Context, repo, key string, bytes int64) error
+	// HasLFSObject reports whether (repo, key) is a registered LFS object
+	// (a point read mirroring HasPack, for the sweeper's per-object
+	// classification of the lfs/ prefix).
+	HasLFSObject(ctx context.Context, repo, key string) (bool, error)
 	// GetGeneration returns repo's mutation generation: 0 for a repo no
 	// mutation ever touched, strictly positive and monotonically increasing
 	// afterwards. It is an invalidation token over committed row changes,
@@ -315,6 +328,15 @@ CREATE TABLE IF NOT EXISTS pack_retained (repo text, key text, bytes bigint NOT 
                                           superseded_at timestamptz NOT NULL DEFAULT now(),
                                           PRIMARY KEY (repo, key));
 CREATE TABLE IF NOT EXISTS pack_usage (repo text PRIMARY KEY, bytes bigint NOT NULL DEFAULT 0);
+-- Registered LFS objects (issue #51): one row per verified upload, keyed by
+-- the base RepoID and the content-addressed blob key (lfs/<repo>/<oid>).
+-- The registry the LFS orphan sweep classifies against, and the settle
+-- record that moves reserved bytes into pack_usage. Accounting/registry
+-- state only — LFS objects never affect clone content, so no generation
+-- triggers.
+CREATE TABLE IF NOT EXISTS lfs_objects (repo text, key text, bytes bigint NOT NULL,
+                                        created_at timestamptz NOT NULL DEFAULT now(),
+                                        PRIMARY KEY (repo, key));
 -- Idempotent additive migration for pre-p3 dev databases (backfills
 -- existing rows via the NOT NULL DEFAULT).
 ALTER TABLE refs ADD COLUMN IF NOT EXISTS created_at timestamptz NOT NULL DEFAULT now();

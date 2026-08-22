@@ -2,13 +2,28 @@
 // discovery path POST /{repo}.git/info/lfs/objects/batch on the same
 // JWT-authenticated remote — no separate LFS server or config. Object bytes
 // live in the BlobStore under blob.LFSKey(repoID, oid); transfers use the
-// "basic" adapter with presigned S3 URLs when the backend supports them,
-// falling back to proxying through this server (fileblob local mode) via
-// GET/PUT /{repo}.git/info/lfs/objects/{oid}.
+// "basic" adapter.
+//
+// DOWNLOADS use presigned S3 URLs when the backend supports them, falling
+// back to proxying through this server (fileblob local mode) via
+// GET /{repo}.git/info/lfs/objects/{oid}. Reads are never quota-gated.
+//
+// UPLOADS always go through the verified proxy transfer
+// (PUT /{repo}.git/info/lfs/objects/{oid}, issue #51): a presigned PUT
+// binds neither content length nor digest with the current signer
+// (gocloud.dev SignedURLOptions cannot sign Content-Length), so only the
+// server-verified path can anchor the storage-quota ledger and the sha256
+// content address. Upload admission is a durable reservation
+// (ref.ReservePackBytes) charged at batch time on the DECLARED size and
+// re-charged at PUT time on the request's ACTUAL Content-Length (the
+// declared-size-lie gate); a verified upload settles the reservation into
+// the usage counter via ref.RegisterLFSObject, which is also the registry
+// the LFS orphan sweep classifies against.
 package githttp
 
 import (
 	"compress/gzip"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -27,6 +42,7 @@ import (
 
 	"codestorage/internal/auth"
 	"codestorage/internal/blob"
+	"codestorage/internal/ref"
 )
 
 const (
@@ -37,6 +53,11 @@ const (
 	// lfsMaxBatchBody bounds the JSON batch request (defensive: a batch of
 	// 100 objects is ~10KB; 4MiB is far beyond any legitimate request).
 	lfsMaxBatchBody = 4 << 20
+	// lfsMaxBatchObjects bounds one batch's object count (defensive:
+	// git-lfs sends at most 100 per batch; each entry costs a blob Stat
+	// and, on upload, a ledger reservation row, so the count must not be
+	// attacker-sized up to the body limit's ~40k entries).
+	lfsMaxBatchObjects = 1000
 )
 
 // lfsOIDPattern is the sha256 content address git-lfs uses: exactly 64
@@ -180,87 +201,226 @@ func (s *Server) handleLFSBatch(w http.ResponseWriter, r *http.Request, repo str
 		lfsError(w, http.StatusConflict, `only hash_algo "sha256" is supported`)
 		return
 	}
-	resp := lfsBatchResponse{Transfer: "basic", HashAlgo: "sha256", Objects: make([]lfsObjectResult, 0, len(req.Objects))}
-	for _, obj := range req.Objects {
-		resp.Objects = append(resp.Objects, s.lfsBatchObject(r, repo, target, req.Operation, obj))
+	if len(req.Objects) > lfsMaxBatchObjects {
+		lfsError(w, http.StatusUnprocessableEntity,
+			fmt.Sprintf("too many objects in one batch (%d, max %d)", len(req.Objects), lfsMaxBatchObjects))
+		return
+	}
+	resp := lfsBatchResponse{Transfer: "basic", HashAlgo: "sha256"}
+	if req.Operation == "upload" {
+		resp.Objects = s.lfsBatchUpload(r, repo, target, req.Objects)
+	} else {
+		resp.Objects = make([]lfsObjectResult, 0, len(req.Objects))
+		for _, obj := range req.Objects {
+			resp.Objects = append(resp.Objects, s.lfsBatchDownload(r, repo, target, obj))
+		}
 	}
 	w.Header().Set("Content-Type", lfsMediaType)
 	w.Header().Set("Cache-Control", "no-cache")
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
-// lfsBatchObject resolves one batch entry to actions or a per-object error.
-// LFS keys are scoped to the base RepoID (blob.LFSKey): the `+ephemeral` /
-// `+import` namespaces share the repo's LFS object space, since pointers in
-// any namespace address the same content.
-func (s *Server) lfsBatchObject(r *http.Request, repoElem string, target repoTarget, op string, obj lfsObjectSpec) lfsObjectResult {
-	res := lfsObjectResult{OID: obj.OID, Size: obj.Size}
-	fail := func(code int, msg string) lfsObjectResult {
-		res.Actions = nil
-		res.Error = &lfsObjectError{Code: code, Message: msg}
-		return res
-	}
+// lfsObjectFail marks one batch entry failed with a per-object error.
+func lfsObjectFail(res *lfsObjectResult, code int, msg string) {
+	res.Authenticated = false
+	res.Actions = nil
+	res.Error = &lfsObjectError{Code: code, Message: msg}
+}
+
+// lfsValidateSpec applies the shared per-object validation and key
+// resolution. LFS keys are scoped to the base RepoID (blob.LFSKey): the
+// `+ephemeral` / `+import` namespaces share the repo's LFS object space,
+// since pointers in any namespace address the same content.
+func lfsValidateSpec(res *lfsObjectResult, target repoTarget, obj lfsObjectSpec) (key string, ok bool) {
 	if !lfsOIDPattern.MatchString(obj.OID) {
-		return fail(http.StatusUnprocessableEntity, "oid must be 64 lowercase hex digits (sha256)")
+		lfsObjectFail(res, http.StatusUnprocessableEntity, "oid must be 64 lowercase hex digits (sha256)")
+		return "", false
 	}
 	if obj.Size < 0 {
-		return fail(http.StatusUnprocessableEntity, "size must be non-negative")
+		lfsObjectFail(res, http.StatusUnprocessableEntity, "size must be non-negative")
+		return "", false
 	}
-	key := blob.LFSKey(target.repo.RepoID, obj.OID)
+	return blob.LFSKey(target.repo.RepoID, obj.OID), true
+}
+
+// lfsBatchDownload resolves one download batch entry to an action or a
+// per-object error. Downloads are never quota-gated (issue #51 scopes the
+// perimeter to writers).
+func (s *Server) lfsBatchDownload(r *http.Request, repoElem string, target repoTarget, obj lfsObjectSpec) lfsObjectResult {
+	res := lfsObjectResult{OID: obj.OID, Size: obj.Size}
+	key, ok := lfsValidateSpec(&res, target, obj)
+	if !ok {
+		return res
+	}
 	size, err := s.Blob.Stat(r.Context(), key)
-	missing := errors.Is(err, blob.ErrNotFound)
-	if err != nil && !missing {
+	if errors.Is(err, blob.ErrNotFound) {
+		lfsObjectFail(&res, http.StatusNotFound, "object not found")
+		return res
+	}
+	if err != nil {
 		log.Printf("lfs stat %s: %v", key, err)
-		return fail(http.StatusInternalServerError, "object storage unavailable")
+		lfsObjectFail(&res, http.StatusInternalServerError, "object storage unavailable")
+		return res
 	}
-	switch op {
-	case "download":
-		if missing {
-			return fail(http.StatusNotFound, "object not found")
-		}
-		res.Size = size // authoritative stored size
-		action, err := s.lfsAction(r, repoElem, http.MethodGet, key, obj.OID)
-		if err != nil {
-			log.Printf("lfs sign %s: %v", key, err)
-			return fail(http.StatusInternalServerError, "signing transfer URL failed")
-		}
-		res.Authenticated = true
-		res.Actions = map[string]*lfsAction{"download": action}
-	case "upload":
-		if !missing {
-			// Already stored: no actions means the client skips the upload.
-			return res
-		}
-		action, err := s.lfsAction(r, repoElem, http.MethodPut, key, obj.OID)
-		if err != nil {
-			log.Printf("lfs sign %s: %v", key, err)
-			return fail(http.StatusInternalServerError, "signing transfer URL failed")
-		}
-		res.Authenticated = true
-		res.Actions = map[string]*lfsAction{"upload": action}
-	default:
-		panic("githttp assertion failed: unknown LFS operation " + op)
+	res.Size = size // authoritative stored size
+	action, err := s.lfsDownloadAction(r, repoElem, key, obj.OID)
+	if err != nil {
+		log.Printf("lfs sign %s: %v", key, err)
+		lfsObjectFail(&res, http.StatusInternalServerError, "signing transfer URL failed")
+		return res
 	}
+	res.Authenticated = true
+	res.Actions = map[string]*lfsAction{"download": action}
 	return res
 }
 
-// lfsAction builds the basic-transfer action for key: a presigned blob URL
-// when the backend supports it, else a proxy href back through this server
-// (docs/05 local mode). The proxy href carries the caller's Authorization
-// header so git-lfs re-presents the same credentials on the transfer.
-func (s *Server) lfsAction(r *http.Request, repoElem, method, key, oid string) (*lfsAction, error) {
-	signed, err := s.Blob.SignedURL(r.Context(), key, method, lfsURLExpiry)
+// lfsBatchUpload resolves a whole upload batch: it validates and Stats each
+// entry, adopts already-stored objects into the LFS registry, admits every
+// missing object's DECLARED size through the durable quota ledger in ONE
+// reservation call (issue #51 — one admission snapshot per batch, listed
+// floor included, so a batch cannot admit piecemeal against itself), and
+// issues verified-proxy upload actions only for admitted objects. An
+// over-quota batch answers per-object 507 errors and issues no transfer
+// hrefs at all.
+func (s *Server) lfsBatchUpload(r *http.Request, repoElem string, target repoTarget, objs []lfsObjectSpec) []lfsObjectResult {
+	ctx := r.Context()
+	repoID := target.repo.RepoID
+	results := make([]lfsObjectResult, len(objs))
+	// Deduplicate by key before charging: identical oids are identical
+	// bytes, and the ledger admits each incoming key once (a duplicate
+	// entry in one batch shares its first occurrence's outcome). The max
+	// declared size wins so a duplicate cannot shrink the charge.
+	needIdx := make(map[string][]int)
+	needSize := make(map[string]int64)
+	var order []string
+	for i, obj := range objs {
+		results[i] = lfsObjectResult{OID: obj.OID, Size: obj.Size}
+		key, ok := lfsValidateSpec(&results[i], target, obj)
+		if !ok {
+			continue
+		}
+		size, err := s.Blob.Stat(ctx, key)
+		switch {
+		case err == nil:
+			// Already stored: no actions means the client skips the
+			// upload. Adopt the object into the registry (pre-#51 uploads
+			// have no rows; without adoption the orphan sweep would
+			// classify referenced objects as reapable).
+			s.adoptLFSObject(ctx, repoID, key, size)
+			continue
+		case !errors.Is(err, blob.ErrNotFound):
+			log.Printf("lfs stat %s: %v", key, err)
+			lfsObjectFail(&results[i], http.StatusInternalServerError, "object storage unavailable")
+			continue
+		}
+		if _, seen := needIdx[key]; !seen {
+			order = append(order, key)
+		}
+		needIdx[key] = append(needIdx[key], i)
+		needSize[key] = max(needSize[key], obj.Size)
+	}
+	// Admission: reserve the declared sizes before ANY transfer href is
+	// issued. Zero-size entries charge nothing (the empty object is
+	// zero growth) but still get actions.
+	if s.PackQuotaBytes > 0 {
+		var packs []ref.Pack
+		var incoming int64
+		for _, key := range order {
+			if sz := needSize[key]; sz > 0 {
+				packs = append(packs, ref.Pack{Key: key, Size: sz})
+				incoming += sz
+			}
+		}
+		if len(packs) > 0 {
+			denyAll := func(code int, msg string) []lfsObjectResult {
+				for _, key := range order {
+					for _, i := range needIdx[key] {
+						lfsObjectFail(&results[i], code, msg)
+					}
+				}
+				return results
+			}
+			floor, err := blob.StorageUsageBytes(ctx, s.Blob, repoID)
+			if err != nil {
+				log.Printf("lfs quota: %s: usage listing failed: %v", repoID, err)
+				return denyAll(http.StatusInternalServerError, "storage quota check failed")
+			}
+			dec, err := s.Store.ReservePackBytes(ctx, blob.QuotaRepoGroup(repoID), packs,
+				ref.NewReservationOwner(), floor, s.PackQuotaBytes, s.lfsReservationTTL())
+			if err != nil {
+				log.Printf("lfs quota: %s: reserve failed: %v", repoID, err)
+				return denyAll(http.StatusInternalServerError, "storage quota check failed")
+			}
+			if !dec.OK {
+				return denyAll(http.StatusInsufficientStorage, fmt.Sprintf(
+					"repository storage quota exceeded: upload adds %d bytes to %d bytes stored (+%d bytes reserved by in-flight uploads), quota is %d bytes",
+					incoming, dec.UsedBytes, dec.ReservedBytes, s.PackQuotaBytes))
+			}
+		}
+	}
+	for _, key := range order {
+		for _, i := range needIdx[key] {
+			results[i].Authenticated = true
+			results[i].Actions = map[string]*lfsAction{"upload": s.lfsUploadAction(r, repoElem, results[i].OID)}
+		}
+	}
+	return results
+}
+
+// lfsReservationTTL resolves the TTL LFS admission charges: the serve
+// wiring's PackReservationTTL, or the shared quota.go default.
+func (s *Server) lfsReservationTTL() time.Duration {
+	if s.PackReservationTTL > 0 {
+		return s.PackReservationTTL
+	}
+	return defaultReservationTTL
+}
+
+// adoptLFSObject backfills the lfs_objects registry row for an object that
+// is already stored but was never registered (uploads predating issue #51).
+// Best-effort by design: every verified upload registers durably, and a
+// miss here only postpones adoption to the object's next write-scoped
+// touch — it must not fail the batch.
+func (s *Server) adoptLFSObject(ctx context.Context, repoID, key string, size int64) {
+	registered, err := s.Store.HasLFSObject(ctx, repoID, key)
+	if err == nil && !registered {
+		err = s.Store.RegisterLFSObject(ctx, repoID, key, size)
+	}
+	if err != nil {
+		log.Printf("lfs adopt %s: %v", key, err)
+	}
+}
+
+// lfsDownloadAction builds the basic-transfer download action for key: a
+// presigned blob URL when the backend supports it, else a proxy href back
+// through this server (docs/05 local mode). The proxy href carries the
+// caller's Authorization header so git-lfs re-presents the same
+// credentials on the transfer.
+func (s *Server) lfsDownloadAction(r *http.Request, repoElem, key, oid string) (*lfsAction, error) {
+	signed, err := s.Blob.SignedURL(r.Context(), key, http.MethodGet, lfsURLExpiry)
 	if err == nil {
 		return &lfsAction{Href: signed, ExpiresIn: int(lfsURLExpiry.Seconds())}, nil
 	}
 	if !errors.Is(err, blob.ErrSignedURLUnsupported) {
 		return nil, err
 	}
+	return s.lfsProxyAction(r, repoElem, oid), nil
+}
+
+// lfsUploadAction builds the basic-transfer upload action: ALWAYS the
+// verified proxy PUT (issue #51) — see the package comment for why
+// presigned uploads are not issued.
+func (s *Server) lfsUploadAction(r *http.Request, repoElem, oid string) *lfsAction {
+	return s.lfsProxyAction(r, repoElem, oid)
+}
+
+// lfsProxyAction builds a proxy transfer href through this server.
+func (s *Server) lfsProxyAction(r *http.Request, repoElem, oid string) *lfsAction {
 	action := &lfsAction{Href: requestBaseURL(r) + "/" + repoElem + ".git/info/lfs/objects/" + oid}
 	if a := r.Header.Get("Authorization"); a != "" {
 		action.Header = map[string]string{"Authorization": a}
 	}
-	return action, nil
+	return action
 }
 
 // requestBaseURL reconstructs the externally visible scheme://host of the
@@ -306,7 +466,7 @@ func (s *Server) handleLFSObject(w http.ResponseWriter, r *http.Request, repo, o
 		s.lfsProxyDownload(w, r, key)
 		return
 	}
-	s.lfsProxyUpload(w, r, key, oid)
+	s.lfsProxyUpload(w, r, target, key, oid)
 }
 
 func (s *Server) lfsProxyDownload(w http.ResponseWriter, r *http.Request, key string) {
@@ -347,9 +507,74 @@ func (s *Server) lfsProxyDownload(w http.ResponseWriter, r *http.Request, key st
 	}
 }
 
-func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, key, oid string) {
+// lfsProxyUpload is the verified upload transfer and the quota ledger's
+// settle point (issue #51): it re-admits the request's ACTUAL
+// Content-Length (closing the batch-time declared-size lie), verifies the
+// sha256 content address, publishes, and registers the object — consuming
+// the reservation and crediting the usage counter atomically.
+func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target repoTarget, key, oid string) {
+	ctx := r.Context()
+	repoID := target.repo.RepoID
+	// Dedup before charging (the zero-growth rule): a re-PUT of a stored
+	// object (crash-window retry, concurrent identical upload) adds
+	// nothing — adopt it into the registry and succeed without reading
+	// the body (the key is content-addressed, so stored bytes match).
+	switch size, err := s.Blob.Stat(ctx, key); {
+	case err == nil:
+		s.adoptLFSObject(ctx, repoID, key, size)
+		w.WriteHeader(http.StatusOK)
+		return
+	case !errors.Is(err, blob.ErrNotFound):
+		log.Printf("lfs stat %s: %v", key, err)
+		lfsError(w, http.StatusInternalServerError, "object storage unavailable")
+		return
+	}
+	// The transfer must declare its size up front: the Go HTTP server
+	// caps a Content-Length body at the declared length, making it a hard
+	// bound the admission below can trust. Chunked bodies have no bound.
+	if r.ContentLength < 0 {
+		lfsError(w, http.StatusLengthRequired, "upload requires Content-Length")
+		return
+	}
+	// PUT-time admission: the batch charged the DECLARED size; re-reserve
+	// what actually arrives (a same-key reservation refreshes, so honest
+	// clients are counted once and a liar's oversized body re-runs the
+	// full admission check).
+	var reserveOwner string
+	release := func() {
+		if reserveOwner != "" {
+			// Best-effort: an unreleased row only gates admission until
+			// the TTL expires (owner-scoped, so it can never free a
+			// reservation a concurrent identical upload re-acquired).
+			_ = s.Store.ReleasePackReservations(ctx, []string{key}, reserveOwner)
+		}
+	}
+	if s.PackQuotaBytes > 0 && r.ContentLength > 0 {
+		floor, err := blob.StorageUsageBytes(ctx, s.Blob, repoID)
+		if err != nil {
+			log.Printf("lfs quota: %s: usage listing failed: %v", repoID, err)
+			lfsError(w, http.StatusInternalServerError, "storage quota check failed")
+			return
+		}
+		reserveOwner = ref.NewReservationOwner()
+		dec, err := s.Store.ReservePackBytes(ctx, blob.QuotaRepoGroup(repoID),
+			[]ref.Pack{{Key: key, Size: r.ContentLength}}, reserveOwner,
+			floor, s.PackQuotaBytes, s.lfsReservationTTL())
+		if err != nil {
+			log.Printf("lfs quota: %s: reserve failed: %v", repoID, err)
+			lfsError(w, http.StatusInternalServerError, "storage quota check failed")
+			return
+		}
+		if !dec.OK {
+			lfsError(w, http.StatusInsufficientStorage, fmt.Sprintf(
+				"repository storage quota exceeded: upload adds %d bytes to %d bytes stored (+%d bytes reserved by in-flight uploads), quota is %d bytes",
+				r.ContentLength, dec.UsedBytes, dec.ReservedBytes, s.PackQuotaBytes))
+			return
+		}
+	}
 	dir, err := os.MkdirTemp("", "lfs-upload-*")
 	if err != nil {
+		release()
 		lfsError(w, http.StatusInternalServerError, "scratch dir failed")
 		return
 	}
@@ -357,27 +582,58 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, key, oid
 	path := filepath.Join(dir, "obj")
 	f, err := os.Create(path)
 	if err != nil {
+		release()
 		lfsError(w, http.StatusInternalServerError, "scratch file failed")
 		return
 	}
 	h := sha256.New()
-	_, err = io.Copy(io.MultiWriter(f, h), r.Body)
+	n, err := io.Copy(io.MultiWriter(f, h), r.Body)
 	if cerr := f.Close(); err == nil {
 		err = cerr
 	}
 	if err != nil {
+		release()
 		lfsError(w, http.StatusBadRequest, "reading upload body failed: "+err.Error())
 		return
 	}
+	// The server-enforced Content-Length cap makes n <= ContentLength; a
+	// short body errors above. Assert rather than assume.
+	assertf(n == r.ContentLength, "lfs upload %s: read %d bytes with Content-Length %d", key, n, r.ContentLength)
 	// The oid IS the content address: publishing bytes under a key whose
 	// hash doesn't match would corrupt every future download of that oid.
 	if got := hex.EncodeToString(h.Sum(nil)); got != oid {
+		release()
 		lfsError(w, http.StatusBadRequest, fmt.Sprintf("content sha256 %s does not match oid %s", got, oid))
 		return
 	}
-	if err := s.Blob.UploadFile(r.Context(), key, path); err != nil {
+	if err := s.Blob.UploadFile(ctx, key, path); err != nil {
+		release()
 		log.Printf("lfs upload %s: %v", key, err)
 		lfsError(w, http.StatusInternalServerError, "object upload failed")
+		return
+	}
+	// Publish-before-commit: the bytes are durable, now settle the ledger
+	// and register the object. A failure here may still have committed
+	// (ambiguous), so the reservation is deliberately left to the TTL and
+	// the sweeper — mirroring the pre-receive hook's crash semantics — and
+	// the client's retry lands on the stored-object adoption path above.
+	regErr := s.Store.RegisterLFSObject(ctx, repoID, key, n)
+	if regErr != nil {
+		regErr = fmt.Errorf("lfs register %s: %w", key, regErr)
+	}
+	// Writer half of the orphan-sweep coordination (issue #5): a sweeper
+	// may have deleted the just-uploaded key right before the registration
+	// committed; re-upload from the local file if so. Runs even when
+	// registration failed — an ambiguous error may have registered the
+	// object, and a committed row must never point at missing bytes.
+	if err := blob.EnsurePublished(ctx, s.Blob, key, path); err != nil {
+		log.Printf("lfs verify %s: %v", key, errors.Join(regErr, err))
+		lfsError(w, http.StatusInternalServerError, "object verification failed")
+		return
+	}
+	if regErr != nil {
+		log.Printf("%v", regErr)
+		lfsError(w, http.StatusInternalServerError, "object registration failed")
 		return
 	}
 	w.WriteHeader(http.StatusOK)

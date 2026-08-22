@@ -77,6 +77,14 @@ func (s *countingStore) ReclaimRetainedPack(context.Context, string, string) (in
 	panic("Hydrate must never reclaim retained packs")
 }
 
+func (s *countingStore) RegisterLFSObject(context.Context, string, string, int64) error {
+	panic("Hydrate must never register LFS objects")
+}
+
+func (s *countingStore) HasLFSObject(context.Context, string, string) (bool, error) {
+	panic("Hydrate must never read LFS objects")
+}
+
 func (s *countingStore) ListRefs(context.Context, string) (map[string]string, error) {
 	s.mu.Lock()
 	s.listRefsCalls++

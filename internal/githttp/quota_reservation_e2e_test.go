@@ -23,14 +23,14 @@ import (
 func measureBranchPack(t *testing.T, measureRepo, work, branch, token string) int64 {
 	t.Helper()
 	ctx := context.Background()
-	before, err := blob.PackUsageBytes(ctx, testBlob, measureRepo)
+	before, err := blob.StorageUsageBytes(ctx, testBlob, measureRepo)
 	if err != nil {
-		t.Fatalf("PackUsageBytes before: %v", err)
+		t.Fatalf("StorageUsageBytes before: %v", err)
 	}
 	mustGit(t, work, "push", remoteURL(nodeA, measureRepo, token), "HEAD:refs/heads/"+branch)
-	after, err := blob.PackUsageBytes(ctx, testBlob, measureRepo)
+	after, err := blob.StorageUsageBytes(ctx, testBlob, measureRepo)
 	if err != nil {
-		t.Fatalf("PackUsageBytes after: %v", err)
+		t.Fatalf("StorageUsageBytes after: %v", err)
 	}
 	if after <= before {
 		t.Fatalf("measurement push added no bytes (%d -> %d)", before, after)
