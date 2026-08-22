@@ -135,6 +135,27 @@ func (s *SimBlobStore) Stat(ctx context.Context, key string) (int64, error) {
 	}
 }
 
+// ReadRange delegates unless a fault is injected. It deliberately shares
+// OpBlobStat with Stat rather than adding a fault point: both are the
+// repack selection's per-candidate point reads (size, pack-header object
+// count) with identical failure handling — one metadata surface, one
+// fault point (the List/ListPages precedent). FaultNotFound reports the
+// object as missing via blob.ErrNotFound.
+func (s *SimBlobStore) ReadRange(ctx context.Context, key string, offset, length int64) ([]byte, error) {
+	switch class := s.inj.begin(OpBlobStat); class {
+	case FaultClean:
+		return nil, cleanFaultError{op: OpBlobStat}
+	case FaultAmbiguous:
+		return nil, ambiguousFaultError{op: OpBlobStat}
+	case FaultNotFound:
+		return nil, notFoundFaultError(OpBlobStat)
+	case FaultNone:
+		return s.inner.ReadRange(ctx, key, offset, length)
+	default:
+		panic(fmt.Sprintf("simtest: fault class %v invalid for %s", class, OpBlobStat))
+	}
+}
+
 // Delete delegates unless a fault is injected; an ambiguous fault deletes
 // the object and then reports failure (the sweeper's delete outcome lost in
 // transit); FaultNotFound reports the object as already missing.

@@ -74,6 +74,12 @@ type BlobStore interface {
 	// Stat returns the size of the object at key; missing objects yield an
 	// error matching ErrNotFound via errors.Is.
 	Stat(ctx context.Context, key string) (int64, error)
+	// ReadRange returns exactly the length bytes at offset from the object
+	// at key — a ranged point read, never the whole object (repack fold
+	// selection reads exact object counts from 12-byte pack headers with
+	// it). Missing keys yield an error matching ErrNotFound via errors.Is;
+	// an object shorter than offset+length is a non-ErrNotFound error.
+	ReadRange(ctx context.Context, key string, offset, length int64) ([]byte, error)
 	// EnsureBucket idempotently creates the backing bucket.
 	EnsureBucket(ctx context.Context) error
 	Close() error
@@ -314,6 +320,12 @@ func (b *S3) SignedURL(ctx context.Context, key, method string, expiry time.Dura
 // Stat returns the size of the object at key (ErrNotFound when absent).
 func (b *S3) Stat(ctx context.Context, key string) (int64, error) {
 	return bucketStat(ctx, b.bucket, key)
+}
+
+// ReadRange returns exactly the length bytes at offset from the object at
+// key (a ranged GET; ErrNotFound when absent).
+func (b *S3) ReadRange(ctx context.Context, key string, offset, length int64) ([]byte, error) {
+	return bucketReadRange(ctx, b.bucket, key, offset, length)
 }
 
 // Delete removes the object at key (ErrNotFound when absent).

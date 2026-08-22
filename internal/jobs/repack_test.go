@@ -700,10 +700,10 @@ func TestRepack_BudgetsBoundFoldInput(t *testing.T) {
 	}
 
 	// Wedge regression (round-8): grow the repo to [fold(6obj), p(3), p(3)].
-	// The greedy pass selects the old consolidated pack first (6 ≤ 7) and
-	// crowds out both small packs; the restart pass must instead pair the
-	// two small packs — a permanent no-op here would let later pushes
-	// accumulate unbounded rows behind one oversized fold.
+	// The oldest-first greedy selects the old consolidated pack first
+	// (6 ≤ 7) and crowds out both small packs; the pair search must
+	// instead fold the two small packs — a permanent no-op here would let
+	// later pushes accumulate unbounded rows behind one oversized fold.
 	f.push(t)
 	folded, err = r.Repack(ctx, f.repo)
 	if err != nil || !folded {
@@ -716,8 +716,8 @@ func TestRepack_BudgetsBoundFoldInput(t *testing.T) {
 	f.checkColdHydrate(t)
 
 	// Unpairable backlog (round-9): when every pack exceeds half the
-	// budget, NO pair fits — the ascending-weight fallback proves that in
-	// one bounded pass and the fold no-ops cleanly.
+	// budget, NO pair fits — the exact pair search proves that in
+	// O(n log n) and the fold no-ops cleanly.
 	f3 := newRepackFixture(t)
 	for range 3 {
 		f3.push(t)
@@ -745,13 +745,13 @@ func TestRepack_BudgetsBoundFoldInput(t *testing.T) {
 	f.checkColdHydrate(t)
 }
 
-// TestRepack_CrossBudgetRescueFindsPair pins the round-21 selection gap: a
-// byte-first greedy can lock in {A: byte-heavy/object-light, B: byte-cheap/
-// object-heavy} whose union busts the object budget, while {A, C} (C small
-// in both dimensions) is feasible — C just never made the byte batch. The
-// rescue pass must materialize C and the pair scan must fold A+C, leaving B
-// registered; without it the same wedge repeats on every trigger.
-func TestRepack_CrossBudgetRescueFindsPair(t *testing.T) {
+// TestRepack_CrossBudgetSelectionFindsPair pins the round-21 selection
+// gap: {A: byte-heavy/object-light, B: byte-cheap/object-heavy} bust the
+// object budget together, while {A, C} (C small in both dimensions) is
+// feasible. Selection must fold A+C and leave B registered (B is
+// individually over the object budget — never even a candidate); a
+// byte-only view of the input wedged here on every trigger.
+func TestRepack_CrossBudgetSelectionFindsPair(t *testing.T) {
 	f := newRepackFixture(t)
 	ctx := context.Background()
 
@@ -802,7 +802,7 @@ func TestRepack_CrossBudgetRescueFindsPair(t *testing.T) {
 	r.MaxFoldObjects = 50
 	folded, err := r.Repack(ctx, f.repo)
 	if err != nil || !folded {
-		t.Fatalf("cross-budget repack = (folded %v, err %v), want the rescue fold", folded, err)
+		t.Fatalf("cross-budget repack = (folded %v, err %v), want the A+C fold", folded, err)
 	}
 	rows := f.packRows(t)
 	if len(rows) != 2 {
@@ -824,13 +824,16 @@ func TestRepack_CrossBudgetRescueFindsPair(t *testing.T) {
 	}
 }
 
-// TestRepack_RescueLoopDigsPastUnpairableGarbage pins the round-22
-// starvation shape: pass 1 fills on a byte-heavy pack; a first rescue
-// batch fills entirely with cheap packs that materialization reveals as
-// individually object-oversized (unpairable); the loop's NEXT iteration —
-// materialized garbage never re-consumes the allowance — must reach the
-// genuinely pairable duo sitting one batch deeper and fold it.
-func TestRepack_RescueLoopDigsPastUnpairableGarbage(t *testing.T) {
+// TestRepack_SelectionFindsPairBehindUnpairableGarbage pins the
+// round-22/23 starvation class: a feasible pair sits byte-wise BEHIND a
+// deep front of cheaper packs that are individually over the object
+// budget (unpairable garbage). Any materialize-to-learn-counts selection
+// with a fixed download allowance wedges here deterministically on every
+// trigger — the garbage below totals more than the removed rescue loop's
+// three extra byte budgets — while header-read selection knows every
+// candidate's object count up front: it must fold the pair, and download
+// NOTHING but the pair.
+func TestRepack_SelectionFindsPairBehindUnpairableGarbage(t *testing.T) {
 	f := newRepackFixture(t)
 	ctx := context.Background()
 
@@ -843,19 +846,6 @@ func TestRepack_RescueLoopDigsPastUnpairableGarbage(t *testing.T) {
 	blobOfSize := func(tag string, n int) string {
 		return strings.TrimSpace(testGit(t, f.scratch, tag+randomText(n), "hash-object", "-w", "--stdin"))
 	}
-	// Shapes (registration order = selection order):
-	//   big:      1 object, ~64KB      (pass-1 filler)
-	//   garbage:  30 objects, tiny     (cheapest; object-oversized at budget 20)
-	//   pairA/B:  1 object, ~2KB each  (the feasible duo, pricier than garbage)
-	var garbageBlobs []string
-	for i := range 30 {
-		garbageBlobs = append(garbageBlobs, blobOfSize(fmt.Sprintf("g%d ", i), 8))
-	}
-	idBig, pathBig := mkPack([]string{blobOfSize("big ", 64<<10)})
-	idGarbage, pathGarbage := mkPack(garbageBlobs)
-	idPairA, pathPairA := mkPack([]string{blobOfSize("pa ", 2<<10)})
-	idPairB, pathPairB := mkPack([]string{blobOfSize("pb ", 2<<10)})
-
 	sizeOf := func(p string) int64 {
 		fi, err := os.Stat(p)
 		if err != nil {
@@ -863,42 +853,80 @@ func TestRepack_RescueLoopDigsPastUnpairableGarbage(t *testing.T) {
 		}
 		return fi.Size()
 	}
-	if !(sizeOf(pathGarbage) < sizeOf(pathPairA)) {
-		t.Fatalf("fixture shape broken: garbage (%d) must be cheaper than pair members (%d)",
-			sizeOf(pathGarbage), sizeOf(pathPairA))
+	// Shapes (registration order = age order, garbage oldest):
+	//   garbage x12: 30 tiny objects each (byte-cheap; object-oversized
+	//                at budget 20 — can never be part of any fold)
+	//   pairA/B:     1 incompressible ~1KB object each (the feasible duo,
+	//                byte-pricier than every garbage pack)
+	shared := make([]string, 29)
+	for i := range shared {
+		shared[i] = blobOfSize(fmt.Sprintf("s%d ", i), 4)
 	}
-	for _, reg := range []struct{ id, path string }{
-		{idBig, pathBig}, {idGarbage, pathGarbage}, {idPairA, pathPairA}, {idPairB, pathPairB},
-	} {
-		key := blob.PackKey(f.repo, reg.id)
-		if err := f.blobs.UploadFile(ctx, key, reg.path); err != nil {
+	type reg struct{ id, path string }
+	var packs []reg
+	for g := range 12 {
+		id, path := mkPack(append([]string{blobOfSize(fmt.Sprintf("g%d ", g), 4)}, shared...))
+		packs = append(packs, reg{id, path})
+	}
+	idPairA, pathPairA := mkPack([]string{blobOfSize("pa ", 1<<10)})
+	idPairB, pathPairB := mkPack([]string{blobOfSize("pb ", 1<<10)})
+	packs = append(packs, reg{idPairA, pathPairA}, reg{idPairB, pathPairB})
+
+	// Fixture shape checks: every garbage pack is byte-cheaper than either
+	// pair member, and the garbage front is deeper than the removed rescue
+	// loop's whole allowance (3 byte budgets), so no fixed-window scheme
+	// could have reached the pair.
+	byteBudget := sizeOf(pathPairA) + sizeOf(pathPairB)
+	var garbageBytes int64
+	for _, p := range packs[:12] {
+		if sizeOf(p.path) >= sizeOf(pathPairA) {
+			t.Fatalf("fixture shape broken: garbage (%d) must be cheaper than pair members (%d)",
+				sizeOf(p.path), sizeOf(pathPairA))
+		}
+		garbageBytes += sizeOf(p.path)
+	}
+	if garbageBytes <= 3*byteBudget {
+		t.Fatalf("fixture shape broken: garbage front (%d) must exceed 3 byte budgets (%d)",
+			garbageBytes, 3*byteBudget)
+	}
+	for _, p := range packs {
+		key := blob.PackKey(f.repo, p.id)
+		if err := f.blobs.UploadFile(ctx, key, p.path); err != nil {
 			t.Fatal(err)
 		}
-		if err := f.store.RegisterPacks(ctx, f.repo, []ref.Pack{{ID: reg.id, Key: key}}); err != nil {
+		if err := f.store.RegisterPacks(ctx, f.repo, []ref.Pack{{ID: p.id, Key: key}}); err != nil {
 			t.Fatal(err)
 		}
 	}
 
-	r := f.repacker(t.TempDir())
-	// Byte budget: big alone fills pass 1 (nothing else fits beside it);
-	// one rescue batch fits garbage but not garbage+pairA; the loop's
-	// second batch reaches the pair. Object budget 20 makes garbage (30
-	// objects) individually unpairable while big+anything is byte-bound.
-	r.MaxFoldBytes = sizeOf(pathBig) + sizeOf(pathGarbage)/2
+	counting := &countingDownloadStore{BlobStore: f.blobs}
+	r := NewRepacker(f.store, f.blobs, fixtureMaterialize(counting, t.TempDir()), slog.New(slog.DiscardHandler))
+	r.MaxFoldBytes = byteBudget
 	r.MaxFoldObjects = 20
 	folded, err := r.Repack(ctx, f.repo)
 	if err != nil || !folded {
-		t.Fatalf("rescue-loop repack = (folded %v, err %v), want the pair folded", folded, err)
+		t.Fatalf("deep-garbage repack = (folded %v, err %v), want the pair folded", folded, err)
+	}
+	if got := counting.count(); got != 2 {
+		t.Fatalf("downloaded %d packs, want exactly the pair (garbage must never be downloaded)", got)
 	}
 	rows := f.packRows(t)
-	if len(rows) != 3 {
-		t.Fatalf("pack rows = %+v, want [big, garbage, fold(pairA,pairB)]", rows)
+	if len(rows) != 13 {
+		t.Fatalf("pack rows = %d, want 13 (12 garbage + fold(pairA,pairB))", len(rows))
 	}
 	for _, row := range rows {
 		if row.ID == idPairA || row.ID == idPairB {
 			t.Fatalf("pack rows = %+v: the pair must have been folded away", rows)
 		}
 	}
+}
+
+// fakePackHeader returns a syntactically valid 12-byte pack header ("PACK",
+// version 2, 1 object) with no object data — enough for selection's header
+// point read, so queue tests can seed rows that reach the materialize seam
+// without crafting real packs.
+func fakePackHeader() []byte {
+	return []byte{'P', 'A', 'C', 'K', 0, 0, 0, 2, 0, 0, 0, 1}
 }
 
 // randomText returns n bytes of git-safe pseudo-random text that zlib
@@ -1324,10 +1352,11 @@ func TestLocalQueue_RepackWorkersCapped(t *testing.T) {
 	deliverer := &events.Deliverer{Webhooks: stubWebhooks{}, Logger: slog.New(slog.DiscardHandler)}
 	q := NewLocal(deliverer, func(context.Context, sync.Job) error { return nil }, r, slog.New(slog.DiscardHandler))
 
-	// Seed rows (with real backing blobs — selectByBytes Stats them) for N
-	// distinct repo keys so every fold reaches the materialize seam.
+	// Seed rows (with real backing blobs — selection point-reads their
+	// size and 12-byte pack header) for N distinct repo keys so every
+	// fold reaches the materialize seam.
 	seed := filepath.Join(t.TempDir(), "seed.pack")
-	if err := os.WriteFile(seed, []byte("tiny"), 0o644); err != nil {
+	if err := os.WriteFile(seed, fakePackHeader(), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	for i := range repos {
@@ -1399,7 +1428,7 @@ func TestLocalQueue_CloseSkipsParkedFolds(t *testing.T) {
 
 	// Fill every slot plus park several waiters.
 	seed := filepath.Join(t.TempDir(), "seed.pack")
-	if err := os.WriteFile(seed, []byte("tiny"), 0o644); err != nil {
+	if err := os.WriteFile(seed, fakePackHeader(), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	total := localRepackWorkers + 6

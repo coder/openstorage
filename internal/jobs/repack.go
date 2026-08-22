@@ -5,10 +5,12 @@
 // job folds a repo's registered packs into one consolidated pack:
 //
 //  1. snapshot the registered pack rows (the fold input),
-//  2. hydrate the cache repo (materializes at least every snapshotted pack),
-//  3. select the fold input under per-fold object/byte budgets (repack runs
-//     automatically on writes, so one fold's work must be bounded even
-//     against adversarial pack shapes; see selectFoldInput),
+//  2. select the fold input under per-fold object/byte budgets — sizes and
+//     exact object counts come from per-candidate point reads, so selection
+//     is decided BEFORE anything is downloaded (repack runs automatically
+//     on writes, so one fold's work must be bounded even against
+//     adversarial pack shapes; see selectFoldInput),
+//  3. materialize only the selected packs into the cache repo,
 //  4. write ONE self-contained pack holding the union of the selected
 //     packs' objects,
 //  5. upload the new pack blob (publish-before-flip: bytes must be durable
@@ -232,9 +234,8 @@ func (r *Repacker) Repack(ctx context.Context, repo string) (folded bool, err er
 		return false, nil // nothing to fold
 	}
 
-	// Joint two-budget selection (bytes from point Stats before any
-	// download, exact object counts from idx fanouts after bounded
-	// materialization; see selectFoldInput).
+	// Joint two-budget selection (bytes and exact object counts from
+	// per-candidate point reads before any download; see selectFoldInput).
 	repoPath, fold, err := r.selectFoldInput(ctx, repo, old)
 	if errors.Is(err, blob.ErrNotFound) {
 		// A candidate's blob vanished between the listing and its
@@ -427,53 +428,40 @@ func (r *Repacker) durationBudget() time.Duration {
 }
 
 // foldCandidate is one selection candidate: blob bytes from a point Stat
-// (never a prefix listing — the packs/ prefix grows with the repo's whole
-// write history under the list-only sweeper, while the registered row set
-// stays bounded by the fold threshold), and the exact object count from
-// the materialized idx fanout (-1 until materialized). Cumulative counts
+// and the exact object count from the pack blob's 12-byte header (another
+// point read — never a prefix listing, which grows with the repo's whole
+// write history under the list-only sweeper). Both dimensions are known
+// for EVERY candidate before anything is downloaded. Cumulative counts
 // overestimate the union (shared objects count twice) — conservative in
 // the safe direction.
 type foldCandidate struct {
 	pack    ref.Pack
 	bytes   int64
-	objects int
+	objects int64
 }
 
-// selectFoldInput picks the fold's input under BOTH budgets jointly.
-// Skipped packs stay registered untouched: any subset of whole packs folds
-// into a self-contained pack (only reachability trimming was unsafe), so
-// bounding per-fold work never risks correctness, and repeated folds
-// converge oversized repos toward O(size/budget) consolidated rows. Rows
-// whose blob Stat reports not-found are skipped (concurrent fold or
-// repair in flight), as are rows that can never pair (individually over
-// the byte budget — never downloaded at all).
+// selectFoldInput picks the fold's input under BOTH budgets jointly, and
+// COMPLETELY: byte sizes (point Stats) and exact object counts (12-byte
+// pack-header point reads) are known for every candidate up front, so if
+// any two candidates fit both budgets together, a fold is selected — the
+// guarantee that killed rounds 21–23's wedge class, where selection had
+// to materialize packs in bounded batches just to learn object counts
+// and adversarially cheap unpairable packs could starve every batch in
+// front of a feasible pair, deterministically, on every trigger. Only
+// the SELECTED fold is ever downloaded, so one fold's I/O is bounded by
+// one byte budget plus two point reads per registered row.
 //
-// Object counts exist only after materialization, so selection runs in
-// bounded materialization batches:
-//
-//  1. oldest-first byte-greedy -> materialize -> joint greedy in the same
-//     order (the steady-state path, preferring the oldest accumulation);
-//  2. rescue LOOP, when pass 1 pairs nothing: repeatedly materialize the
-//     cheapest not-yet-materialized candidates (ascending bytes maximizes
-//     coverage per downloaded byte) and re-try — an ascending-object joint
-//     greedy, then a definitive early-exit pair scan with oldest-first
-//     extension, both exact over everything materialized so far. Because
-//     ALREADY-materialized candidates never consume the allowance again,
-//     each iteration reaches strictly deeper into the ascending-byte
-//     order: cheap packs that materialization exposed as unpairable
-//     (individually over the object budget) cannot re-starve the next
-//     batch, which was the deterministic wedge — the same garbage
-//     swallowing the same single rescue batch on every trigger while a
-//     feasible pair sat one batch deeper.
-//
-// The loop stops at a hard download cap (repackRescueBudgets extra byte
-// budgets), when everything is materialized, or when nothing more fits.
-// Residual: a feasible pair buried deeper than the cap's worth of cheaper
-// unpairable garbage is missed that fold. Sustaining the wedge requires
-// ever-growing volumes of individually-object-oversized packs — real pack
-// bytes scale with object count, so such packs are not cheap — which the
-// git-surface per-repo pack quotas bound; and any fold that does land
-// re-shuffles the set for the next selection.
+// Skipped packs stay registered untouched: any subset of whole packs
+// folds into a self-contained pack (only reachability trimming was
+// unsafe), so bounding per-fold work never risks correctness, and
+// repeated folds converge oversized repos toward O(size/budget)
+// consolidated rows. Rows whose blob point reads report not-found are
+// skipped (concurrent fold or repair in flight), as are rows that can
+// never pair (individually over either budget). Selection order:
+// oldest-first joint greedy (the steady-state path, preferring the
+// oldest accumulation), then the exact pair search with oldest-first
+// extension. A nil fold is therefore a PROVEN no-op — no two remaining
+// packs fit both budgets together — not a missed one.
 func (r *Repacker) selectFoldInput(ctx context.Context, repo string, rows []ref.Pack) (repoPath string, fold []ref.Pack, err error) {
 	byteBudget, objBudget := r.byteBudget(), int64(r.objectBudget())
 	var cands []*foldCandidate
@@ -486,148 +474,160 @@ func (r *Repacker) selectFoldInput(ctx context.Context, repo string, rows []ref.
 			return "", nil, fmt.Errorf("stat pack blob %s: %w", p.Key, err)
 		}
 		if size > byteBudget {
-			continue // can never pair: skip without downloading
+			continue // can never pair: skip without reading further
 		}
-		cands = append(cands, &foldCandidate{pack: p, bytes: size, objects: -1})
+		objects, err := packHeaderObjectCount(ctx, r.blobs, p.Key)
+		if errors.Is(err, blob.ErrNotFound) {
+			continue // vanished between the point reads: same skip
+		}
+		if err != nil {
+			return "", nil, err
+		}
+		if objects > objBudget {
+			continue // can never pair on the object dimension either
+		}
+		cands = append(cands, &foldCandidate{pack: p, bytes: size, objects: objects})
 	}
 	if len(cands) < 2 {
 		return "", nil, nil
 	}
 
-	jointGreedy := func(order []*foldCandidate) []ref.Pack {
-		var sel []ref.Pack
-		var b, o int64
-		for _, c := range order {
-			assertf(c.objects >= 0, "jointGreedy: unmaterialized candidate %s", c.pack.ID)
-			if b+c.bytes > byteBudget || o+int64(c.objects) > objBudget {
-				continue
-			}
-			sel = append(sel, c.pack)
-			b += c.bytes
-			o += int64(c.objects)
-		}
-		if len(sel) >= 2 {
-			return sel
-		}
-		return nil
+	sel := jointGreedy(cands, byteBudget, objBudget)
+	if sel == nil {
+		sel = pairAndExtend(cands, byteBudget, objBudget)
 	}
-
-	// tryFold searches everything materialized so far: ascending-object
-	// joint greedy, then the definitive early-exit pair scan with
-	// oldest-first extension — exact in-memory integer work, no I/O.
-	tryFold := func() []ref.Pack {
-		var mat []*foldCandidate // materialized, oldest-first order
-		for _, c := range cands {
-			if c.objects >= 0 {
-				mat = append(mat, c)
-			}
-		}
-		byObjects := append([]*foldCandidate(nil), mat...)
-		sort.SliceStable(byObjects, func(i, j int) bool { return byObjects[i].objects < byObjects[j].objects })
-		if fold := jointGreedy(byObjects); fold != nil {
-			return fold
-		}
-		for i := 0; i < len(mat); i++ {
-			for j := i + 1; j < len(mat); j++ {
-				if mat[i].bytes+mat[j].bytes > byteBudget || int64(mat[i].objects+mat[j].objects) > objBudget {
-					continue
-				}
-				sel := []ref.Pack{mat[i].pack, mat[j].pack}
-				b, o := mat[i].bytes+mat[j].bytes, int64(mat[i].objects+mat[j].objects)
-				for k, c := range mat {
-					if k == i || k == j || b+c.bytes > byteBudget || o+int64(c.objects) > objBudget {
-						continue
-					}
-					sel = append(sel, c.pack)
-					b += c.bytes
-					o += int64(c.objects)
-				}
-				return sel
-			}
-		}
-		return nil
+	if sel == nil {
+		return "", nil, nil
 	}
-
-	// Batch 1: oldest-first under the byte budget.
-	var batch []*foldCandidate
-	var batchBytes int64
-	for _, c := range cands {
-		if batchBytes+c.bytes > byteBudget {
-			continue
-		}
-		batch = append(batch, c)
-		batchBytes += c.bytes
-	}
-	repoPath, err = r.materializeCounts(ctx, repo, batch)
+	repoPath, err = r.materializeFold(ctx, repo, sel)
 	if err != nil {
 		return "", nil, err
 	}
-	if fold := jointGreedy(batch); fold != nil {
-		return repoPath, fold, nil
+	fold = make([]ref.Pack, len(sel))
+	for i, c := range sel {
+		fold[i] = c.pack
 	}
-	if fold := tryFold(); fold != nil {
-		return repoPath, fold, nil
-	}
-
-	// Rescue loop: cheapest-unmaterialized-first batches under the
-	// remaining download allowance; each iteration reaches strictly
-	// deeper (materialized candidates never re-consume the allowance).
-	asc := append([]*foldCandidate(nil), cands...)
-	sort.SliceStable(asc, func(i, j int) bool { return asc[i].bytes < asc[j].bytes })
-	allowance := repackRescueBudgets * byteBudget
-	for allowance > 0 {
-		var fresh []*foldCandidate
-		var freshBytes int64
-		for _, c := range asc {
-			if c.objects >= 0 {
-				continue // materialized: never re-billed
-			}
-			if freshBytes+c.bytes > byteBudget || freshBytes+c.bytes > allowance {
-				continue
-			}
-			fresh = append(fresh, c)
-			freshBytes += c.bytes
-		}
-		if len(fresh) == 0 {
-			break // everything affordable is materialized
-		}
-		allowance -= freshBytes
-		if _, err := r.materializeCounts(ctx, repo, fresh); err != nil {
-			return "", nil, err
-		}
-		if fold := tryFold(); fold != nil {
-			return repoPath, fold, nil
-		}
-	}
-	return repoPath, nil, nil
+	return repoPath, fold, nil
 }
 
-// repackRescueBudgets caps the rescue loop's total extra downloads (in
-// multiples of the byte budget) beyond batch 1. Three budgets let the loop
-// dig past substantial unpairable garbage while keeping one fold's I/O
-// bounded at 1+3 byte budgets.
-const repackRescueBudgets = 3
-
-// materializeCounts materializes the candidates' packs (via the injected
-// seam) and fills in their exact object counts from the idx fanout tables.
-func (r *Repacker) materializeCounts(ctx context.Context, repo string, cands []*foldCandidate) (string, error) {
-	if len(cands) == 0 {
-		return "", nil
+// jointGreedy accumulates order's candidates under both budgets; a fold
+// needs at least two packs, else nil.
+func jointGreedy(order []*foldCandidate, byteBudget, objBudget int64) []*foldCandidate {
+	var sel []*foldCandidate
+	var b, o int64
+	for _, c := range order {
+		if b+c.bytes > byteBudget || o+c.objects > objBudget {
+			continue
+		}
+		sel = append(sel, c)
+		b += c.bytes
+		o += c.objects
 	}
-	packs := make([]ref.Pack, len(cands))
-	for i, c := range cands {
+	if len(sel) >= 2 {
+		return sel
+	}
+	return nil
+}
+
+// pairAndExtend is the completeness backstop when the oldest-first greedy
+// pairs nothing (its single pick can block every partner): if ANY two
+// candidates fit both budgets together, it finds such a pair in
+// O(n log n) and tops it up oldest-first. Sorted by bytes ascending, each
+// candidate j checks the minimal-object candidate among the strictly
+// earlier, byte-compatible prefix (prefix minima; strictly earlier also
+// rules out self-pairing) — the best possible partner: if even that one
+// busts the object budget, no partner for j exists at all. Any feasible
+// pair (a, b) with bytes(a) <= bytes(b) is found no later than j = b, so
+// nil proves NO feasible pair — and hence no feasible fold — exists.
+func pairAndExtend(cands []*foldCandidate, byteBudget, objBudget int64) []*foldCandidate {
+	byBytes := append([]*foldCandidate(nil), cands...)
+	sort.SliceStable(byBytes, func(i, j int) bool { return byBytes[i].bytes < byBytes[j].bytes })
+	// prefixMin[k]: index in byBytes[0..k] of the minimal object count.
+	prefixMin := make([]int, len(byBytes))
+	for k := 1; k < len(byBytes); k++ {
+		prefixMin[k] = prefixMin[k-1]
+		if byBytes[k].objects < byBytes[prefixMin[k-1]].objects {
+			prefixMin[k] = k
+		}
+	}
+	for j := 1; j < len(byBytes); j++ {
+		// Largest i < j with bytes[i] + bytes[j] <= byteBudget: ascending
+		// order makes this a binary search over [0, j).
+		limit := byteBudget - byBytes[j].bytes
+		i := sort.Search(j, func(k int) bool { return byBytes[k].bytes > limit }) - 1
+		if i < 0 {
+			continue
+		}
+		m := prefixMin[i]
+		if byBytes[m].objects+byBytes[j].objects > objBudget {
+			continue
+		}
+		// Seed pair found: extend oldest-first (candidate order).
+		sel := []*foldCandidate{byBytes[m], byBytes[j]}
+		b, o := byBytes[m].bytes+byBytes[j].bytes, byBytes[m].objects+byBytes[j].objects
+		for _, c := range cands {
+			if c == byBytes[m] || c == byBytes[j] || b+c.bytes > byteBudget || o+c.objects > objBudget {
+				continue
+			}
+			sel = append(sel, c)
+			b += c.bytes
+			o += c.objects
+		}
+		return sel
+	}
+	return nil
+}
+
+// packHeaderLen is the fixed git pack header: "PACK" magic, version,
+// big-endian uint32 object count.
+const packHeaderLen = 12
+
+// packHeaderObjectCount reads a pack's exact object count from its header
+// via one ranged blob read. The header is trustworthy for every REGISTERED
+// pack: git-push packs passed index-pack in quarantine (it reads exactly
+// the header's count of objects and then verifies the trailer checksum — a
+// lying header cannot index), and API-write/fold packs are produced by
+// this server's own pack-objects. A malformed header is therefore a
+// corrupt blob and fails the fold loudly; a missing blob propagates
+// blob.ErrNotFound for the caller's concurrent-fold skip.
+func packHeaderObjectCount(ctx context.Context, bl blob.BlobStore, key string) (int64, error) {
+	hdr, err := bl.ReadRange(ctx, key, 0, packHeaderLen)
+	if err != nil {
+		return 0, err
+	}
+	if !bytes.Equal(hdr[:4], []byte("PACK")) {
+		return 0, fmt.Errorf("pack blob %s: bad magic %q", key, hdr[:4])
+	}
+	if v := binary.BigEndian.Uint32(hdr[4:8]); v != 2 && v != 3 {
+		return 0, fmt.Errorf("pack blob %s: unsupported pack version %d", key, v)
+	}
+	return int64(binary.BigEndian.Uint32(hdr[8:12])), nil
+}
+
+// materializeFold materializes the selected packs (via the injected seam —
+// the fold's ONLY pack downloads) and cross-checks each header count that
+// steered selection against the authoritative idx fanout the seam just
+// wrote. A mismatch is impossible for a registered pack (see
+// packHeaderObjectCount); detecting one means blob corruption, and the
+// fold fails loudly rather than pack a corrupt input.
+func (r *Repacker) materializeFold(ctx context.Context, repo string, sel []*foldCandidate) (string, error) {
+	packs := make([]ref.Pack, len(sel))
+	for i, c := range sel {
 		packs[i] = c.pack
 	}
 	repoPath, err := r.materialize(ctx, repo, packs)
 	if err != nil {
 		return "", fmt.Errorf("materialize: %w", err)
 	}
-	for _, c := range cands {
+	for _, c := range sel {
 		count, err := packObjectCount(filepath.Join(repoPath, "objects", "pack", "pack-"+c.pack.ID+".idx"))
 		if err != nil {
 			return "", fmt.Errorf("pack %s: %w", c.pack.ID, err)
 		}
-		c.objects = count
+		if int64(count) != c.objects {
+			return "", fmt.Errorf("pack %s: header claims %d objects, idx has %d (corrupt blob)",
+				c.pack.ID, c.objects, count)
+		}
 	}
 	return repoPath, nil
 }
