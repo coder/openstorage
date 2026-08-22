@@ -352,9 +352,14 @@ run, with an error naming this variable.
 - **Default:** `10000`. **`0` disables the budget**; negative or malformed values are
   startup errors.
 - The budget is charged per unique commit actually verified: within one push, verdicts
-  are cached per commit and deduplicated across refs pushed to the same tip, and branch
-  creations verify only commits not already reachable from existing refs — so pushing
-  many refs at an existing tip costs nothing.
+  are cached per commit and whole ranges are deduplicated across refs, so pushing many
+  refs over the same history costs each commit one verification.
+- Branch creation verifies **everything reachable** from the new tip — per the
+  branch-protection contract the comparison is against the ref's own prior tip, never
+  against other refs — so creating a ref over a deep signature-verified history is the
+  worst case this budget bounds. Raise it deliberately before importing histories deeper
+  than the budget under a `verify-sig` policy: such pushes are rejected fail-closed with
+  an error naming this variable.
 
 ## Maintenance jobs
 

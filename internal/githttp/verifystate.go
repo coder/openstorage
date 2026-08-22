@@ -1,29 +1,30 @@
 package githttp
 
 // Per-push verify-sig work bounds (issue #59). One cheap push used to fan
-// out into unbounded signature-verification work: branch creations walked
-// the FULL history reachable from the tip (`git rev-list <new>` with no
-// exclusions), every ref repeated its own walk plus one `git verify-commit`
-// subprocess per commit, and atomic pushes evaluated everything once in
-// pre-receive and again in every update hook. Refs created at existing tips
-// need no pack, so the pack quota never bounded any of it.
+// out into unbounded signature-verification work: every ref repeated its
+// own history walk plus one `git verify-commit` subprocess per commit, and
+// atomic pushes evaluated everything once in pre-receive and again in every
+// update hook. Refs created at existing tips need no pack, so the pack
+// quota never bounded any of it.
 //
-// Three coordinated bounds close this:
+// Two coordinated bounds close this:
 //
-//  1. Creation walks exclude commits already reachable from existing refs
-//     (`rev-list <new> --not --all`), which is also the correct reading of
-//     the documented semantics — verify-sig rejects "every commit the push
-//     INTRODUCES", not history that other refs already carry.
-//  2. A per-push verdict cache: commit verdicts and whole (old,new) range
+//  1. A per-push verdict cache: commit verdicts and whole (old,new) range
 //     verdicts are recorded in a state file the serve process creates per
 //     receive-pack request (EnvVerifyState, the EnvAtomic env-handoff
 //     pattern — hooks are separate processes re-executing this binary, and
 //     the pre-receive policy gate plus every update hook run sequentially
 //     within one push, so an append-only file needs no locking).
-//  3. A per-push verified-commit budget (EnvVerifySigBudget, resolved from
+//  2. A per-push verified-commit budget (EnvVerifySigBudget, resolved from
 //     CODESTORAGE_VERIFY_SIG_BUDGET by the serve process) that fails CLOSED:
 //     a ref needing more verifier spawns than the remaining budget is
 //     rejected before any of them run.
+//
+// Deliberately NOT among the bounds: trimming creation walks by other refs
+// (`rev-list --not --all`). The branch-protection contract compares against
+// the protected ref's own prior tip only — a commit already on an unpoliced
+// ref must still be verified the first time a protected ref references it
+// (see introducedCommits in hook.go).
 
 import (
 	"bufio"

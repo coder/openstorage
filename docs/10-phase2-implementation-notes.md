@@ -50,10 +50,10 @@ formats Git supports" (SSH and OpenPGP). Reimplementing SSHSIG/OpenPGP verificat
 is high-risk, low-value.
 
 **Decision.** The update hook computes the introduced set (`git rev-list <new> ^<old>`;
-branch creation checks commits not already reachable from existing refs — originally it
-walked everything reachable, tightened by
-[#59](https://github.com/coder/code-storage/issues/59), which also added a per-push
-verdict cache and verification budget — and deletions introduce nothing) and verifies
+branch creation checks everything reachable — the branch-protection contract compares
+against the ref's own prior tip only, never other refs — and deletions introduce
+nothing; [#59](https://github.com/coder/code-storage/issues/59) bounded the cost with a
+per-push verdict cache and a fail-closed verification budget) and verifies
 each commit by delegating to git inside the cache repo: a temp `allowed_signers` file
 (`* namespaces="git" <ssh-key>` lines) plus a temp `GNUPGHOME` with the org's armored PGP
 keys imported, then `git verify-commit <sha>` — git dispatches SSH vs OpenPGP by signature

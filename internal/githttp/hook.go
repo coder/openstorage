@@ -620,11 +620,12 @@ func enforceRefPolicy(ctx context.Context, repo, refName, old, new string) error
 // valid OpenPGP or SSH signature from one of the org's registered signing
 // keys (docs/02 verify-sig, branch-protection.md "Commit signing
 // verifications"). "Introduced" = reachable from new but not from this
-// ref's own pre-push tip — nor, on branch creation, from any existing ref
-// (issue #59) — and deletion checks nothing. The keyring is read fresh from
-// PG on every push; within one push, verdicts are cached and shared between
-// the pre-receive policy gate and the update hooks (verifystate.go), so the
-// pre-receive verdict is authoritative for the whole push.
+// ref's own pre-push tip; branch creation therefore checks everything and
+// deletion checks nothing. The keyring is read fresh from PG on every push;
+// within one push, verdicts are cached and shared between the pre-receive
+// policy gate and the update hooks (verifystate.go), so the pre-receive
+// verdict is authoritative for the whole push and N refs at one tip cost
+// each commit exactly one verifier spawn (issue #59).
 func verifySig(ctx context.Context, refName, old, new string) error {
 	if new == ref.ZeroSHA {
 		return nil // deletion introduces no commits
@@ -722,15 +723,20 @@ func verifySigDenied(refName, sha, reason string) error {
 	return fmt.Errorf("verify-sig denied %s at %s: %s", refName, sha, reason)
 }
 
-// introducedCommits lists the commits reachable from new but not from old.
-// Branch creation (old == ZeroSHA) excludes everything already reachable
-// from existing refs instead of walking the full history (issue #59): those
-// commits were either verified when they landed or accepted on unpoliced
-// refs, and re-walking them made a single cheap create at an existing deep
-// tip cost a full-history walk plus one verifier spawn per ancient commit.
-// Runs in the bare repo git put us in (cwd, GIT_DIR set by receive-pack);
-// in a later update hook of the same push, --all also covers refs updated
-// earlier in the push, whose commits carry cached verdicts already.
+// introducedCommits lists the commits reachable from new but not from old
+// (branch creation: old is ZeroSHA, so everything reachable from new).
+// Runs in the bare repo git put us in (cwd, GIT_DIR set by receive-pack).
+//
+// Deliberately NOT bounded by other refs (`--not --all` and friends): the
+// upstream branch-protection contract is explicit that the comparison is
+// against the protected ref's own prior tip, never against other refs — a
+// commit that already exists elsewhere is still checked the first time it
+// is brought onto the protected ref, so unsigned commits cannot be
+// laundered through an unpoliced ref and then referenced by a protected
+// creation (branch-protection.md "Commit signing verifications"; Codex
+// round 1 on issue #59's original direction). The cost of deep creation
+// walks is bounded instead by the per-push verdict cache and the
+// fail-closed verification budget (verifystate.go).
 func introducedCommits(ctx context.Context, old, new string) ([]string, error) {
 	if !ref.ValidSHA(new) || new == ref.ZeroSHA {
 		return nil, fmt.Errorf("introducedCommits: bad new sha %q", new)
@@ -738,8 +744,6 @@ func introducedCommits(ctx context.Context, old, new string) ([]string, error) {
 	args := []string{"rev-list", new}
 	if old != ref.ZeroSHA {
 		args = append(args, "^"+old)
-	} else {
-		args = append(args, "--not", "--all")
 	}
 	out, err := exec.CommandContext(ctx, "git", args...).Output()
 	if err != nil {

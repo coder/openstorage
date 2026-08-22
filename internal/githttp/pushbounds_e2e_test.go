@@ -310,12 +310,13 @@ func readSpawnLog(t *testing.T, path string) []string {
 	return strings.Fields(string(data))
 }
 
-// TestVerifySig_CreationAtExistingTipSpawnsNothing is the issue #59a
-// acceptance: creating refs at an existing deep tip verifies only the
-// introduced set — which is empty — so the push passes with ZERO verifier
-// subprocesses even though the reachable history is unsigned. (Pre-#59 this
-// walked all of history and spawned one verifier per commit per ref.)
-func TestVerifySig_CreationAtExistingTipSpawnsNothing(t *testing.T) {
+// TestVerifySig_CreationWalkDedupAcrossRefs pins the two issue #59
+// properties of creation walks together: per the upstream contract, a
+// creation verifies EVERYTHING reachable from the tip (never bounded by
+// other refs), but within one push the verdict cache makes N creations at
+// the same deep tip cost each commit exactly one verifier spawn instead of
+// N full re-verifications.
+func TestVerifySig_CreationWalkDedupAcrossRefs(t *testing.T) {
 	spawnLog := filepath.Join(t.TempDir(), "spawns.log")
 	node, err := startNode(t.TempDir(), EnvVerifySpawnLog+"="+spawnLog)
 	if err != nil {
@@ -324,16 +325,24 @@ func TestVerifySig_CreationAtExistingTipSpawnsNothing(t *testing.T) {
 	t.Cleanup(node.stop)
 
 	repo := registerRepo(t, "t-vs-creation")
-	work := initWorkRepo(t)
-	plain := mintTestToken(t, repo, "git:read,git:write", "")
-	for i := 0; i < 30; i++ {
-		commitFile(t, work, "f.txt", fmt.Sprintf("v%d\n", i), fmt.Sprintf("unsigned %d", i), nil)
+	privPath, pubLine := genSSHKey(t)
+	key := registerSigningKey(t, pubLine)
+	t.Cleanup(func() { removeSigningKey(t, key.ID) })
+
+	// A fully signed history (the unsigned initWorkRepo root would deny the
+	// creation walk — that path is pinned by TestVerifySig_SSHMatrix (5)).
+	work := t.TempDir()
+	mustGit(t, work, "init", "-b", "main", ".")
+	commits := 20
+	want := make(map[string]bool)
+	for i := 0; i < commits; i++ {
+		sha := commitFile(t, work, "f.txt", fmt.Sprintf("v%d\n", i), fmt.Sprintf("signed %d", i), nil, sshSigningArgs(privPath)...)
+		want[sha] = true
 	}
+	plain := mintTestToken(t, repo, "git:read,git:write", "")
 	mustGit(t, work, "push", remoteURL(node, repo, plain), "HEAD:refs/heads/main")
 	tip := revParse(t, work, "HEAD")
 
-	// verify-sig everywhere: keyring intentionally left empty — introduced
-	// is empty, so no keyring is consulted and no verifier spawns.
 	vsAll := mintTestToken(t, repo, "git:read,git:write", `[["*",["verify-sig"]]]`)
 	refspecs := []string{"push", remoteURL(node, repo, vsAll)}
 	for i := 0; i < 10; i++ {
@@ -347,15 +356,67 @@ func TestVerifySig_CreationAtExistingTipSpawnsNothing(t *testing.T) {
 			t.Fatalf("copy%d = %q, want %q", i, got, tip)
 		}
 	}
-	if spawns := readSpawnLog(t, spawnLog); len(spawns) != 0 {
-		t.Fatalf("creation at existing tip spawned %d verifiers (%v), want 0", len(spawns), spawns)
+	spawns := readSpawnLog(t, spawnLog)
+	if len(spawns) != commits {
+		t.Fatalf("10 creations at one tip spawned %d verifiers, want %d (full reachable walk, each commit once)", len(spawns), commits)
+	}
+	for _, sha := range spawns {
+		if !want[sha] {
+			t.Fatalf("verifier spawned for unexpected sha %s", sha)
+		}
+		delete(want, sha)
+	}
+}
+
+// TestVerifySig_UnpolicedRefLaunderingDenied pins the branch-protection
+// no-bypass rule end-to-end (Codex round 1 on issue #59's original
+// direction): pushing an unsigned commit to an unpoliced ref and then
+// creating a verify-sig-covered ref at that same SHA must still verify —
+// and reject — that commit. The comparison is never against other refs.
+func TestVerifySig_UnpolicedRefLaunderingDenied(t *testing.T) {
+	repo := registerRepo(t, "t-vs-launder")
+	privPath, pubLine := genSSHKey(t)
+	key := registerSigningKey(t, pubLine)
+	t.Cleanup(func() { removeSigningKey(t, key.ID) })
+
+	// One token: protected/* requires signatures, everything else is open.
+	tok := mintTestToken(t, repo, "git:read,git:write",
+		`[["refs/heads/protected/*",["verify-sig"]],["*",[]]]`)
+
+	// Signed-from-the-root history lands on protected/main (a creation
+	// walks everything reachable, so the root must be signed too).
+	work := t.TempDir()
+	mustGit(t, work, "init", "-b", "main", ".")
+	signedBase := commitFile(t, work, "a2.txt", "signed\n", "signed base", nil, sshSigningArgs(privPath)...)
+	mustGit(t, work, "push", remoteURL(nodeA, repo, tok), "HEAD:refs/heads/protected/main")
+
+	// Unsigned commit lands on the unpoliced scratch ref — allowed.
+	unsigned := commitFile(t, work, "b2.txt", "unsigned\n", "unsigned laundered", nil)
+	mustGit(t, work, "push", remoteURL(nodeA, repo, tok), "HEAD:refs/heads/scratch")
+
+	// Creating a protected ref at that same SHA must re-verify and deny it.
+	out, err := tryGit(work, "push", remoteURL(nodeA, repo, tok), "HEAD:refs/heads/protected/laundered")
+	if err == nil {
+		t.Fatalf("laundered creation should be rejected:\n%s", out)
+	}
+	if !strings.Contains(out, "verify-sig denied refs/heads/protected/laundered at "+unsigned) {
+		t.Fatalf("laundering rejection missing verify-sig log line for the unsigned commit:\n%s", out)
+	}
+	refs := pgRefs(t, repo)
+	if _, exists := refs["refs/heads/protected/laundered"]; exists {
+		t.Fatal("laundered protected ref landed")
+	}
+	if got := refs["refs/heads/protected/main"]; got != signedBase {
+		t.Fatalf("protected/main = %q, want %q", got, signedBase)
 	}
 }
 
 // TestVerifySig_VerdictCacheAcrossRefs is the issue #59b acceptance: one
-// push creating many refs at the same new tip verifies each introduced
-// commit exactly once, across the pre-receive policy gate AND every update
-// hook (which are separate processes sharing the per-push state file).
+// push advancing many refs over the same (old,new) range verifies each
+// introduced commit exactly once, across the pre-receive policy gate AND
+// every update hook (separate processes sharing the per-push state file).
+// The unsigned pre-policy base stays acceptable because updates compare
+// against each ref's own prior tip.
 func TestVerifySig_VerdictCacheAcrossRefs(t *testing.T) {
 	spawnLog := filepath.Join(t.TempDir(), "spawns.log")
 	node, err := startNode(t.TempDir(), EnvVerifySpawnLog+"="+spawnLog)
@@ -367,7 +428,13 @@ func TestVerifySig_VerdictCacheAcrossRefs(t *testing.T) {
 	repo := registerRepo(t, "t-vs-cache")
 	work := initWorkRepo(t)
 	plain := mintTestToken(t, repo, "git:read,git:write", "")
-	mustGit(t, work, "push", remoteURL(node, repo, plain), "HEAD:refs/heads/main")
+	// Seed all 10 refs at the unsigned base with the unpoliced token, so
+	// the verify-sig push below is 10 UPDATES sharing one (old,new) range.
+	refspecs := []string{"push", remoteURL(node, repo, plain), "HEAD:refs/heads/main"}
+	for i := 0; i < 10; i++ {
+		refspecs = append(refspecs, fmt.Sprintf("HEAD:refs/heads/r%d", i))
+	}
+	mustGit(t, work, refspecs...)
 
 	privPath, pubLine := genSSHKey(t)
 	key := registerSigningKey(t, pubLine)
@@ -380,7 +447,7 @@ func TestVerifySig_VerdictCacheAcrossRefs(t *testing.T) {
 	}
 
 	vsAll := mintTestToken(t, repo, "git:read,git:write", `[["*",["verify-sig"]]]`)
-	refspecs := []string{"push", remoteURL(node, repo, vsAll)}
+	refspecs = []string{"push", remoteURL(node, repo, vsAll)}
 	for i := 0; i < 10; i++ {
 		refspecs = append(refspecs, fmt.Sprintf("HEAD:refs/heads/r%d", i))
 	}
@@ -388,7 +455,7 @@ func TestVerifySig_VerdictCacheAcrossRefs(t *testing.T) {
 
 	spawns := readSpawnLog(t, spawnLog)
 	if len(spawns) != len(want) {
-		t.Fatalf("10 refs at one tip spawned %d verifiers (%v), want %d (one per introduced commit)", len(spawns), spawns, len(want))
+		t.Fatalf("10 refs over one range spawned %d verifiers (%v), want %d (one per introduced commit)", len(spawns), spawns, len(want))
 	}
 	for _, sha := range spawns {
 		if !want[sha] {
