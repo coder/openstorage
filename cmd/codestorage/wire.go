@@ -138,7 +138,7 @@ func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL string, orgPEM
 	// unselected packs would defeat its byte budget on cold workers).
 	repacker := jobs.NewRepacker(refStore, blobStore,
 		func(ctx context.Context, repo string, packs []ref.Pack) (string, error) {
-			repoPath, err := githttp.EnsureCacheRepo(cacheDir, repo)
+			repoPath, err := githttp.EnsureCacheRepoCtx(ctx, cacheDir, repo)
 			if err != nil {
 				return "", err
 			}

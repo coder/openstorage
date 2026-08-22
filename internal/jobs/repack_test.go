@@ -9,6 +9,8 @@ package jobs
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -165,7 +167,7 @@ func (f *repackFixture) repacker(cacheDir string) *Repacker {
 // fixture's blob store and a cache dir.
 func fixtureMaterialize(bl blob.BlobStore, cacheDir string) MaterializeFunc {
 	return func(ctx context.Context, repo string, packs []ref.Pack) (string, error) {
-		repoPath, err := githttp.EnsureCacheRepo(cacheDir, repo)
+		repoPath, err := githttp.EnsureCacheRepoCtx(ctx, cacheDir, repo)
 		if err != nil {
 			return "", err
 		}
@@ -741,6 +743,96 @@ func TestRepack_BudgetsBoundFoldInput(t *testing.T) {
 		t.Fatalf("pack rows after byte-budget no-op = %+v, want unchanged 2", rows)
 	}
 	f.checkColdHydrate(t)
+}
+
+// TestRepack_CrossBudgetRescueFindsPair pins the round-21 selection gap: a
+// byte-first greedy can lock in {A: byte-heavy/object-light, B: byte-cheap/
+// object-heavy} whose union busts the object budget, while {A, C} (C small
+// in both dimensions) is feasible — C just never made the byte batch. The
+// rescue pass must materialize C and the pair scan must fold A+C, leaving B
+// registered; without it the same wedge repeats on every trigger.
+func TestRepack_CrossBudgetRescueFindsPair(t *testing.T) {
+	f := newRepackFixture(t)
+	ctx := context.Background()
+
+	// Craft three packs in the scratch repo with controlled shapes:
+	//   A: 1 blob of ~64KB incompressible bytes  (1 object,  large bytes)
+	//   B: 60 tiny unique blobs                  (60 objects, small bytes)
+	//   C: 1 tiny blob                           (1 object,   tiny bytes)
+	mkPack := func(blobs []string) (id string, path string) {
+		t.Helper()
+		dir := t.TempDir()
+		stdin := strings.Join(blobs, "\n") + "\n"
+		id = strings.TrimSpace(testGit(t, f.scratch, stdin, "pack-objects", "--threads=1", "-q", filepath.Join(dir, "x")))
+		return id, filepath.Join(dir, "x-"+id+".pack")
+	}
+	bigBlob := strings.TrimSpace(testGit(t, f.scratch, randomText(64<<10), "hash-object", "-w", "--stdin"))
+	var tinyBlobs []string
+	for i := range 60 {
+		tinyBlobs = append(tinyBlobs, strings.TrimSpace(testGit(t, f.scratch, fmt.Sprintf("tiny %d", i), "hash-object", "-w", "--stdin")))
+	}
+	idA, pathA := mkPack([]string{bigBlob})
+	idB, pathB := mkPack(tinyBlobs)
+	idC, pathC := mkPack(tinyBlobs[:1])
+
+	sizeOf := func(p string) int64 {
+		fi, err := os.Stat(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return fi.Size()
+	}
+	// Registration order A, B, C (oldest first).
+	for _, reg := range []struct {
+		id, path string
+	}{{idA, pathA}, {idB, pathB}, {idC, pathC}} {
+		key := blob.PackKey(f.repo, reg.id)
+		if err := f.blobs.UploadFile(ctx, key, reg.path); err != nil {
+			t.Fatal(err)
+		}
+		if err := f.store.RegisterPacks(ctx, f.repo, []ref.Pack{{ID: reg.id, Key: key}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	r := f.repacker(t.TempDir())
+	// Byte budget admits A+B but not C on the oldest-first pass; object
+	// budget rejects A+B (61 > 50) but admits A+C (2).
+	r.MaxFoldBytes = sizeOf(pathA) + sizeOf(pathB) + sizeOf(pathC)/2
+	r.MaxFoldObjects = 50
+	folded, err := r.Repack(ctx, f.repo)
+	if err != nil || !folded {
+		t.Fatalf("cross-budget repack = (folded %v, err %v), want the rescue fold", folded, err)
+	}
+	rows := f.packRows(t)
+	if len(rows) != 2 {
+		t.Fatalf("pack rows = %+v, want [fold(A,C), B]", rows)
+	}
+	for _, row := range rows {
+		if row.ID == idA || row.ID == idC {
+			t.Fatalf("pack rows = %+v: A and C must have been folded away", rows)
+		}
+	}
+	foundB := false
+	for _, row := range rows {
+		if row.ID == idB {
+			foundB = true
+		}
+	}
+	if !foundB {
+		t.Fatalf("pack rows = %+v: object-heavy B must survive the fold", rows)
+	}
+}
+
+// randomText returns n bytes of git-safe pseudo-random text that zlib
+// cannot meaningfully compress (hex of urandom).
+func randomText(n int) string {
+	raw := make([]byte, n)
+	_, err := rand.Read(raw)
+	if err != nil {
+		panic(err)
+	}
+	return hex.EncodeToString(raw)[:n]
 }
 
 // lostFoldShim models the P1 delete race deterministically: ListPacks

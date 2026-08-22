@@ -36,7 +36,7 @@ func discardLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Disca
 // (EnsureCacheRepo + per-pack MaterializePack).
 func simMaterialize(bl blob.BlobStore, cacheDir string) jobs.MaterializeFunc {
 	return func(ctx context.Context, repo string, packs []ref.Pack) (string, error) {
-		repoPath, err := githttp.EnsureCacheRepo(cacheDir, repo)
+		repoPath, err := githttp.EnsureCacheRepoCtx(ctx, cacheDir, repo)
 		if err != nil {
 			return "", err
 		}

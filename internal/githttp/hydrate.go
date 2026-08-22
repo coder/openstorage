@@ -89,12 +89,20 @@ exec %q hook %s "$@"
 // policy enforcement. The hook script also embeds this binary's path,
 // which changes across deployments.
 func EnsureCacheRepo(cacheDir, repo string) (string, error) {
+	return EnsureCacheRepoCtx(context.Background(), cacheDir, repo)
+}
+
+// EnsureCacheRepoCtx is EnsureCacheRepo honoring ctx in its git
+// subprocesses (init, config): the repack fold's materialization runs the
+// setup under the fold's wall-clock budget, and a stalled subprocess or
+// filesystem must not outlive it.
+func EnsureCacheRepoCtx(ctx context.Context, cacheDir, repo string) (string, error) {
 	path := RepoPath(cacheDir, repo)
 	if _, err := os.Stat(filepath.Join(path, "HEAD")); err != nil {
 		if err := os.MkdirAll(path, 0o755); err != nil {
 			return "", err
 		}
-		if _, err := runGit("", "init", "--bare", "--initial-branch=main", path); err != nil {
+		if _, err := runGitCtx(ctx, "", "init", "--bare", "--initial-branch=main", path); err != nil {
 			return "", err
 		}
 	}
@@ -106,10 +114,10 @@ func EnsureCacheRepo(cacheDir, repo string) (string, error) {
 		// Read-check first: config writes take config.lock, and concurrent
 		// hydrates of the same repo must not fail on lock contention in the
 		// steady-state already-configured case.
-		if cur, err := runGit(path, "config", "--get", kv[0]); err == nil && strings.TrimSpace(cur) == kv[1] {
+		if cur, err := runGitCtx(ctx, path, "config", "--get", kv[0]); err == nil && strings.TrimSpace(cur) == kv[1] {
 			continue
 		}
-		if _, err := runGit(path, "config", kv[0], kv[1]); err != nil {
+		if _, err := runGitCtx(ctx, path, "config", kv[0], kv[1]); err != nil {
 			return "", err
 		}
 	}

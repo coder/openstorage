@@ -232,23 +232,10 @@ func (r *Repacker) Repack(ctx context.Context, repo string) (folded bool, err er
 		return false, nil // nothing to fold
 	}
 
-	// Byte-budget selection BEFORE any download: blob sizes come from one
-	// bounded listing, so a cold worker never materializes more than the
-	// budget admits — and an individually oversized pack is skipped
-	// without ever being downloaded.
-	candidates, err := r.selectByBytes(ctx, old)
-	if err != nil {
-		return false, fmt.Errorf("repack %s: %w", repo, err)
-	}
-	if len(candidates) < 2 {
-		r.logger.Info("repack: byte budget selects nothing to fold",
-			"repo", repo, "packs", len(old), "byte_budget", r.byteBudget())
-		return false, nil
-	}
-
-	// Materialize EXACTLY the candidates (never the whole repo) under the
-	// fold deadline.
-	repoPath, err := r.materialize(ctx, repo, candidates)
+	// Joint two-budget selection (bytes from point Stats before any
+	// download, exact object counts from idx fanouts after bounded
+	// materialization; see selectFoldInput).
+	repoPath, fold, err := r.selectFoldInput(ctx, repo, old)
 	if errors.Is(err, blob.ErrNotFound) {
 		// A candidate's blob vanished between the listing and its
 		// download: a concurrent fold already replaced the snapshotted
@@ -258,19 +245,11 @@ func (r *Repacker) Repack(ctx context.Context, repo string) (folded bool, err er
 		return false, nil
 	}
 	if err != nil {
-		return false, fmt.Errorf("repack %s: materialize: %w", repo, err)
-	}
-
-	// Object-budget selection from the materialized idx fanout tables
-	// (exact counts, constant work per pack). Packs materialized but
-	// skipped here cost at most the byte budget — already bounded.
-	fold, err := selectByObjects(repoPath, candidates, r.objectBudget())
-	if err != nil {
 		return false, fmt.Errorf("repack %s: %w", repo, err)
 	}
 	if len(fold) < 2 {
-		r.logger.Info("repack: object budget selects nothing to fold",
-			"repo", repo, "packs", len(old), "object_budget", r.objectBudget())
+		r.logger.Info("repack: budgets select nothing to fold", "repo", repo, "packs", len(old),
+			"byte_budget", r.byteBudget(), "object_budget", r.objectBudget())
 		return false, nil
 	}
 	old = fold
@@ -447,99 +426,178 @@ func (r *Repacker) durationBudget() time.Duration {
 	return defaultMaxFoldDuration
 }
 
-// selectByBytes picks fold candidates greedily, oldest-first (ListPacks
-// order), under the cumulative byte budget — from per-key blob Stats,
-// before anything is downloaded. Point reads, never a prefix listing: the
-// packs/ prefix accumulates every superseded blob until the sweeper
-// collects them (list-only by default), so its population grows with the
-// repo's write history while the registered row set this selection needs
-// stays bounded by the fold threshold. Skipped packs stay registered
-// untouched: any subset of whole packs folds into a self-contained pack
-// (only reachability trimming was unsafe), so bounding per-fold work never
-// risks correctness, and repeated folds converge oversized repos to
-// O(size/budget) consolidated rows. A snapshotted row whose blob Stat
-// reports not-found is skipped too — either a concurrent fold removed it
-// (our swap would lose) or its upload-verify repair is in flight (the next
-// fold picks it up).
-func (r *Repacker) selectByBytes(ctx context.Context, packs []ref.Pack) ([]ref.Pack, error) {
-	weights := make([]weightedPack, 0, len(packs))
-	for _, p := range packs {
+// foldCandidate is one selection candidate: blob bytes from a point Stat
+// (never a prefix listing — the packs/ prefix grows with the repo's whole
+// write history under the list-only sweeper, while the registered row set
+// stays bounded by the fold threshold), and the exact object count from
+// the materialized idx fanout (-1 until materialized). Cumulative counts
+// overestimate the union (shared objects count twice) — conservative in
+// the safe direction.
+type foldCandidate struct {
+	pack    ref.Pack
+	bytes   int64
+	objects int
+}
+
+// selectFoldInput picks the fold's input under BOTH budgets jointly.
+// Skipped packs stay registered untouched: any subset of whole packs folds
+// into a self-contained pack (only reachability trimming was unsafe), so
+// bounding per-fold work never risks correctness, and repeated folds
+// converge oversized repos toward O(size/budget) consolidated rows. Rows
+// whose blob Stat reports not-found are skipped (concurrent fold or
+// repair in flight), as are rows that can never pair (individually over
+// the byte budget — never downloaded at all).
+//
+// Object counts exist only after materialization, so selection runs in two
+// bounded batches (total downloads <= 2x the byte budget):
+//
+//  1. oldest-first byte-greedy -> materialize -> joint greedy in the same
+//     order (the steady-state path, preferring the oldest accumulation);
+//  2. rescue, when pass 1 pairs nothing: cheapest-bytes-first greedy
+//     (maximizes how many candidates the download budget can materialize)
+//     -> materialize the new ones -> joint greedy over ALL materialized
+//     candidates in ascending-object order, then a definitive pair scan
+//     with oldest-first greedy extension. The scan is exact over the
+//     materialized set: if any two materialized packs fit both budgets,
+//     a fold happens — one greedy ordering alone can wedge on a byte-heavy
+//     low-object pack (or the mirror image) while a cross pair fits, and
+//     the same wedge would then repeat on every trigger while rows grow.
+//     It is in-memory integer work, early-exiting, no I/O.
+//
+// Residual: a feasible pair whose members BOTH stay unmaterialized (crowded
+// out of both batches by many cheaper packs) is missed; later folds shrink
+// the set and every batch is re-selected fresh per fold, so the miss is
+// transient, never a permanent wedge on the same input.
+func (r *Repacker) selectFoldInput(ctx context.Context, repo string, rows []ref.Pack) (repoPath string, fold []ref.Pack, err error) {
+	byteBudget, objBudget := r.byteBudget(), int64(r.objectBudget())
+	var cands []*foldCandidate
+	for _, p := range rows {
 		size, err := r.blobs.Stat(ctx, p.Key)
 		if errors.Is(err, blob.ErrNotFound) {
 			continue // folded away or repair in flight: not a candidate
 		}
 		if err != nil {
-			return nil, fmt.Errorf("stat pack blob %s: %w", p.Key, err)
+			return "", nil, fmt.Errorf("stat pack blob %s: %w", p.Key, err)
 		}
-		weights = append(weights, weightedPack{pack: p, weight: size})
-	}
-	return selectPairable(weights, r.byteBudget()), nil
-}
-
-// selectByObjects refines the materialized candidates under the cumulative
-// object budget: each pack's exact object count comes from its idx fanout
-// table (constant work per pack). Cumulative counts overestimate the union
-// (shared objects count twice) — conservative in the safe direction.
-func selectByObjects(repoPath string, packs []ref.Pack, maxObjects int) ([]ref.Pack, error) {
-	assertf(maxObjects > 0, "selectByObjects: non-positive budget %d", maxObjects)
-	weights := make([]weightedPack, 0, len(packs))
-	for _, p := range packs {
-		count, err := packObjectCount(filepath.Join(repoPath, "objects", "pack", "pack-"+p.ID+".idx"))
-		if err != nil {
-			return nil, fmt.Errorf("pack %s: %w", p.ID, err)
+		if size > byteBudget {
+			continue // can never pair: skip without downloading
 		}
-		weights = append(weights, weightedPack{pack: p, weight: int64(count)})
+		cands = append(cands, &foldCandidate{pack: p, bytes: size, objects: -1})
 	}
-	return selectPairable(weights, int64(maxObjects)), nil
-}
+	if len(cands) < 2 {
+		return "", nil, nil
+	}
 
-// weightedPack pairs one candidate with its budget weight (blob bytes or
-// object count).
-type weightedPack struct {
-	pack   ref.Pack
-	weight int64
-}
-
-// selectPairable picks a foldable (>= 2 packs) subset under the cumulative
-// budget, in two bounded passes:
-//
-//  1. greedy oldest-first (ListPacks order) — the steady-state path, which
-//     preferentially folds the oldest accumulation;
-//  2. when that yields fewer than two — an old consolidated pack consuming
-//     nearly the whole budget crowds every later small pack out — greedy
-//     by ASCENDING WEIGHT: if any pairable subset exists, the two lightest
-//     packs fit together, so this pass finds one; if even they exceed the
-//     budget, no pair exists and the fold is a genuine no-op.
-//
-// Without the fallback, the same oversized selection would repeat on every
-// trigger, later pushes would accumulate unbounded rows, and folding would
-// wedge permanently on exactly the growth it exists to prevent. Both
-// passes are single scans over an in-memory slice (the sort bounds the
-// whole selection at O(n log n) — no suffix rescans, nothing here needs
-// cancellation checks even for degenerate backlogs).
-func selectPairable(items []weightedPack, budget int64) []ref.Pack {
-	assertf(budget > 0, "selectPairable: non-positive budget %d", budget)
-	greedy := func(order []weightedPack) []ref.Pack {
-		var selected []ref.Pack
-		var total int64
-		for _, it := range order {
-			if total+it.weight > budget {
-				continue // over budget: leave this pack registered as-is
+	jointGreedy := func(order []*foldCandidate) []ref.Pack {
+		var sel []ref.Pack
+		var b, o int64
+		for _, c := range order {
+			assertf(c.objects >= 0, "jointGreedy: unmaterialized candidate %s", c.pack.ID)
+			if b+c.bytes > byteBudget || o+int64(c.objects) > objBudget {
+				continue
 			}
-			selected = append(selected, it.pack)
-			total += it.weight
+			sel = append(sel, c.pack)
+			b += c.bytes
+			o += int64(c.objects)
 		}
-		if len(selected) >= 2 {
-			return selected
+		if len(sel) >= 2 {
+			return sel
 		}
 		return nil
 	}
-	if selected := greedy(items); selected != nil {
-		return selected
+
+	// Batch 1: oldest-first under the byte budget.
+	var batch []*foldCandidate
+	var batchBytes int64
+	for _, c := range cands {
+		if batchBytes+c.bytes > byteBudget {
+			continue
+		}
+		batch = append(batch, c)
+		batchBytes += c.bytes
 	}
-	byWeight := append([]weightedPack(nil), items...)
-	sort.SliceStable(byWeight, func(i, j int) bool { return byWeight[i].weight < byWeight[j].weight })
-	return greedy(byWeight)
+	repoPath, err = r.materializeCounts(ctx, repo, batch)
+	if err != nil {
+		return "", nil, err
+	}
+	if fold := jointGreedy(batch); fold != nil {
+		return repoPath, fold, nil
+	}
+
+	// Batch 2 (rescue): cheapest-first; already-materialized candidates
+	// ride along free, new downloads stay under one more byte budget.
+	asc := append([]*foldCandidate(nil), cands...)
+	sort.SliceStable(asc, func(i, j int) bool { return asc[i].bytes < asc[j].bytes })
+	var fresh []*foldCandidate
+	var freshBytes int64
+	for _, c := range asc {
+		if c.objects >= 0 {
+			continue
+		}
+		if freshBytes+c.bytes > byteBudget {
+			continue
+		}
+		fresh = append(fresh, c)
+		freshBytes += c.bytes
+	}
+	if _, err := r.materializeCounts(ctx, repo, fresh); err != nil {
+		return "", nil, err
+	}
+	var mat []*foldCandidate // all materialized, oldest-first order
+	for _, c := range cands {
+		if c.objects >= 0 {
+			mat = append(mat, c)
+		}
+	}
+	byObjects := append([]*foldCandidate(nil), mat...)
+	sort.SliceStable(byObjects, func(i, j int) bool { return byObjects[i].objects < byObjects[j].objects })
+	if fold := jointGreedy(byObjects); fold != nil {
+		return repoPath, fold, nil
+	}
+	// Definitive pair scan (early exit), then oldest-first extension.
+	for i := 0; i < len(mat); i++ {
+		for j := i + 1; j < len(mat); j++ {
+			if mat[i].bytes+mat[j].bytes > byteBudget || int64(mat[i].objects+mat[j].objects) > objBudget {
+				continue
+			}
+			sel := []ref.Pack{mat[i].pack, mat[j].pack}
+			b, o := mat[i].bytes+mat[j].bytes, int64(mat[i].objects+mat[j].objects)
+			for k, c := range mat {
+				if k == i || k == j || b+c.bytes > byteBudget || o+int64(c.objects) > objBudget {
+					continue
+				}
+				sel = append(sel, c.pack)
+				b += c.bytes
+				o += int64(c.objects)
+			}
+			return repoPath, sel, nil
+		}
+	}
+	return repoPath, nil, nil
+}
+
+// materializeCounts materializes the candidates' packs (via the injected
+// seam) and fills in their exact object counts from the idx fanout tables.
+func (r *Repacker) materializeCounts(ctx context.Context, repo string, cands []*foldCandidate) (string, error) {
+	if len(cands) == 0 {
+		return "", nil
+	}
+	packs := make([]ref.Pack, len(cands))
+	for i, c := range cands {
+		packs[i] = c.pack
+	}
+	repoPath, err := r.materialize(ctx, repo, packs)
+	if err != nil {
+		return "", fmt.Errorf("materialize: %w", err)
+	}
+	for _, c := range cands {
+		count, err := packObjectCount(filepath.Join(repoPath, "objects", "pack", "pack-"+c.pack.ID+".idx"))
+		if err != nil {
+			return "", fmt.Errorf("pack %s: %w", c.pack.ID, err)
+		}
+		c.objects = count
+	}
+	return repoPath, nil
 }
 
 // packObjectCount reads a pack's exact object count from its version-2 idx
