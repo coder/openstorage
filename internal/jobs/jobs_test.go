@@ -108,9 +108,10 @@ func TestLocalQueueRoundtrip(t *testing.T) {
 	defer srv.Close()
 
 	deliverer := &events.Deliverer{
-		Webhooks: stubWebhooks{"wh_test": {ID: "wh_test", URL: srv.URL, Secret: "s3cret"}},
-		Backoff:  func(int) time.Duration { return 10 * time.Millisecond },
-		Logger:   slog.New(slog.DiscardHandler),
+		Webhooks:     stubWebhooks{"wh_test": {ID: "wh_test", URL: srv.URL, Secret: "s3cret"}},
+		AllowPrivate: true, // httptest receiver is loopback (issue #53)
+		Backoff:      func(int) time.Duration { return 10 * time.Millisecond },
+		Logger:       slog.New(slog.DiscardHandler),
 	}
 	var ranSync atomic.Int32
 	q := NewLocal(deliverer, func(context.Context, sync.Job) error {
@@ -151,8 +152,9 @@ func TestRiverQueueRoundtrip(t *testing.T) {
 	defer srv.Close()
 
 	deliverer := &events.Deliverer{
-		Webhooks: stubWebhooks{"wh_test": {ID: "wh_test", URL: srv.URL, Secret: "s3cret"}},
-		Logger:   slog.New(slog.DiscardHandler),
+		Webhooks:     stubWebhooks{"wh_test": {ID: "wh_test", URL: srv.URL, Secret: "s3cret"}},
+		AllowPrivate: true, // httptest receiver is loopback (issue #53)
+		Logger:       slog.New(slog.DiscardHandler),
 	}
 	var ranSync atomic.Int32
 	q, err := NewRiver(ctx, pgURL, deliverer, func(context.Context, sync.Job) error {

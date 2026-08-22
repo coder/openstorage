@@ -92,6 +92,12 @@ const (
 	// post-write trigger schedules a fold ("0" disables triggering).
 	envRepackThreshold = "CODESTORAGE_REPACK_THRESHOLD"
 
+	// Webhook SSRF-guard escape hatch (issue #53): "true" admits
+	// loopback/private/link-local/ULA delivery targets for genuinely
+	// internal deployments. Default off; the redirect refusal is NOT
+	// relaxed. Enabling it logs a boot-time warning.
+	envWebhookAllowPrivate = "CODESTORAGE_WEBHOOK_ALLOW_PRIVATE"
+
 	defaultListen = "127.0.0.1:0"
 )
 
@@ -185,6 +191,11 @@ type serveConfig struct {
 	// trigger schedules a background repack (issue #1); 0 disables
 	// triggering (already-queued durable jobs still run).
 	repackThreshold int
+
+	// webhookAllowPrivate relaxes the webhook delivery SSRF guard's
+	// private-range denial (issue #53); false (the default) keeps it
+	// strict.
+	webhookAllowPrivate bool
 }
 
 // sweepSettings is the resolved orphan-pack sweep configuration.
@@ -311,6 +322,10 @@ func resolveServeConfig(getenv func(string) string, flagListen, flagAddr, flagCa
 		return serveConfig{}, err
 	}
 	cfg.repackThreshold, err = resolveRepackThreshold(getenv)
+	if err != nil {
+		return serveConfig{}, err
+	}
+	cfg.webhookAllowPrivate, err = resolveWebhookAllowPrivate(getenv)
 	if err != nil {
 		return serveConfig{}, err
 	}
@@ -544,6 +559,23 @@ func resolveRepackThreshold(getenv func(string) string) (int, error) {
 	}
 	if v < 0 || v == 1 {
 		return 0, fmt.Errorf("%s must be 0 (disabled) or >= 2, got %q", envRepackThreshold, raw)
+	}
+	return v, nil
+}
+
+// resolveWebhookAllowPrivate parses CODESTORAGE_WEBHOOK_ALLOW_PRIVATE
+// (issue #53): unset/false keeps the webhook delivery SSRF guard strict.
+// Fail-fast semantics: a malformed value is a boot error, never a silent
+// fallback in either direction.
+func resolveWebhookAllowPrivate(getenv func(string) string) (bool, error) {
+	assertf(getenv != nil, "resolveWebhookAllowPrivate: nil getenv")
+	raw := getenv(envWebhookAllowPrivate)
+	if raw == "" {
+		return false, nil
+	}
+	v, err := strconv.ParseBool(raw)
+	if err != nil {
+		return false, fmt.Errorf("%s: %w", envWebhookAllowPrivate, err)
 	}
 	return v, nil
 }

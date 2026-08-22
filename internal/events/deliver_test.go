@@ -124,8 +124,9 @@ func TestAttemptSignsAndPosts(t *testing.T) {
 		Webhooks: &fakeLookup{hooks: map[string]Webhook{
 			"wh_1": {ID: "wh_1", URL: srv.URL, Secret: secret},
 		}},
-		Now:    steppingClock(1737369000, 10),
-		Logger: testLogger(),
+		AllowPrivate: true, // httptest receivers are loopback (issue #53)
+		Now:          steppingClock(1737369000, 10),
+		Logger:       testLogger(),
 	}
 	if err := d.Attempt(context.Background(), Delivery{WebhookID: "wh_1", Event: EventPush, Payload: body}); err != nil {
 		t.Fatalf("Attempt: %v", err)
@@ -169,9 +170,10 @@ func TestDeliverResignsOnRetry(t *testing.T) {
 		Webhooks: &fakeLookup{hooks: map[string]Webhook{
 			"wh_1": {ID: "wh_1", URL: srv.URL, Secret: secret},
 		}},
-		Now:     steppingClock(1737369000, 30),
-		Backoff: func(int) time.Duration { return 0 },
-		Logger:  testLogger(),
+		AllowPrivate: true, // httptest receivers are loopback (issue #53)
+		Now:          steppingClock(1737369000, 30),
+		Backoff:      func(int) time.Duration { return 0 },
+		Logger:       testLogger(),
 	}
 	err := d.Deliver(context.Background(), Delivery{WebhookID: "wh_1", Event: EventPush, Payload: []byte(`{"x":1}`)})
 	if err != nil {
@@ -225,9 +227,10 @@ func TestDeliverGivesUpAfterMaxAttempts(t *testing.T) {
 		Webhooks: &fakeLookup{hooks: map[string]Webhook{
 			"wh_1": {ID: "wh_1", URL: srv.URL, Secret: "s"},
 		}},
-		MaxAttempts: 3,
-		Backoff:     func(int) time.Duration { return 0 },
-		Logger:      testLogger(),
+		AllowPrivate: true, // httptest receivers are loopback (issue #53)
+		MaxAttempts:  3,
+		Backoff:      func(int) time.Duration { return 0 },
+		Logger:       testLogger(),
 	}
 	err := d.Deliver(context.Background(), Delivery{WebhookID: "wh_1", Event: EventPush, Payload: []byte("{}")})
 	if err == nil || !strings.Contains(err.Error(), "giving up after 3 attempts") {
@@ -249,8 +252,9 @@ func TestDeliverStopsOnContextCancel(t *testing.T) {
 		Webhooks: &fakeLookup{hooks: map[string]Webhook{
 			"wh_1": {ID: "wh_1", URL: srv.URL, Secret: "s"},
 		}},
-		Backoff: func(int) time.Duration { return time.Hour },
-		Logger:  testLogger(),
+		AllowPrivate: true, // httptest receivers are loopback (issue #53)
+		Backoff:      func(int) time.Duration { return time.Hour },
+		Logger:       testLogger(),
 	}
 	err := d.Deliver(ctx, Delivery{WebhookID: "wh_1", Event: EventPush, Payload: []byte("{}")})
 	if !errors.Is(err, context.DeadlineExceeded) {
@@ -258,5 +262,56 @@ func TestDeliverStopsOnContextCancel(t *testing.T) {
 	}
 	if got := len(rc.requests()); got != 1 {
 		t.Errorf("receiver saw %d requests, want 1 (canceled during backoff)", got)
+	}
+}
+
+// TestZeroValueDelivererRefusesLoopback pins the fail-closed default
+// (issue #53): a Deliverer constructed without an explicit Client or
+// AllowPrivate must NOT reach a loopback receiver — the SSRF guard denies
+// the dial before any packet leaves the process.
+func TestZeroValueDelivererRefusesLoopback(t *testing.T) {
+	rc := &receiver{statuses: []int{http.StatusOK}}
+	srv := httptest.NewServer(rc.handler())
+	defer srv.Close()
+
+	d := &Deliverer{
+		Webhooks: &fakeLookup{hooks: map[string]Webhook{
+			"wh_1": {ID: "wh_1", URL: srv.URL, Secret: "s"},
+		}},
+		Logger: testLogger(),
+	}
+	err := d.Attempt(context.Background(), Delivery{WebhookID: "wh_1", Event: EventPush, Payload: []byte("{}")})
+	if err == nil {
+		t.Fatal("Attempt delivered to a loopback target: SSRF dial guard missing")
+	}
+	if got := len(rc.requests()); got != 0 {
+		t.Errorf("loopback receiver saw %d requests, want 0 (denied before connect)", got)
+	}
+}
+
+// TestZeroValueDelivererRefusesRedirects pins the no-redirect policy
+// (issue #53): a delivery answered with a redirect must fail without a
+// second request — following it would reopen SSRF via redirect targets.
+func TestZeroValueDelivererRefusesRedirects(t *testing.T) {
+	target := &receiver{statuses: []int{http.StatusOK}}
+	targetSrv := httptest.NewServer(target.handler())
+	defer targetSrv.Close()
+	front := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, targetSrv.URL, http.StatusMovedPermanently)
+	}))
+	defer front.Close()
+
+	d := &Deliverer{
+		Webhooks: &fakeLookup{hooks: map[string]Webhook{
+			"wh_1": {ID: "wh_1", URL: front.URL, Secret: "s"},
+		}},
+		Logger: testLogger(),
+	}
+	err := d.Attempt(context.Background(), Delivery{WebhookID: "wh_1", Event: EventPush, Payload: []byte("{}")})
+	if err == nil {
+		t.Fatal("Attempt succeeded through a redirect: redirects must be delivery failures")
+	}
+	if got := len(target.requests()); got != 0 {
+		t.Errorf("redirect target saw %d requests, want 0 (redirect must not be followed)", got)
 	}
 }

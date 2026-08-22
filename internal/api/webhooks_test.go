@@ -14,7 +14,9 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"regexp"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -104,9 +106,19 @@ func (m *memWebhookStore) DeleteWebhook(_ context.Context, org, id string) error
 // production once the meta store implements events.WebhookStore).
 func newWebhooksServer(t *testing.T, e *testEnv) (*httptest.Server, *memWebhookStore) {
 	t.Helper()
+	// Stub public DNS so ordinary registration tests never touch the
+	// network; dedicated guard tests inject denied answers (issue #53).
+	guard := events.TargetGuard{LookupNetIP: func(context.Context, string) ([]netip.Addr, error) {
+		return []netip.Addr{netip.MustParseAddr("8.8.8.8")}, nil
+	}}
+	return newWebhooksServerWithGuard(t, e, guard)
+}
+
+func newWebhooksServerWithGuard(t *testing.T, e *testEnv, guard events.TargetGuard) (*httptest.Server, *memWebhookStore) {
+	t.Helper()
 	store := newMemWebhookStore()
 	mux := http.NewServeMux()
-	RegisterWebhookRoutes(mux, auth.NewVerifier(e.store), "", store, discardLogger(), nil)
+	RegisterWebhookRoutes(mux, auth.NewVerifier(e.store), "", store, guard, discardLogger(), nil)
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 	return srv, store
@@ -260,6 +272,51 @@ func TestWebhookCreateValidation(t *testing.T) {
 	if n := len(store.hooks); n != 0 {
 		t.Errorf("invalid requests persisted %d webhooks", n)
 	}
+}
+
+func TestWebhookCreateTargetGuard(t *testing.T) {
+	e := testEnvironment(t, "sqlite")
+	org := e.newOrg(t)
+	token := orgToken(t, e, org)
+
+	t.Run("strict guard rejects literal and resolved private targets", func(t *testing.T) {
+		guard := events.TargetGuard{LookupNetIP: func(context.Context, string) ([]netip.Addr, error) {
+			return []netip.Addr{netip.MustParseAddr("10.0.0.7")}, nil
+		}}
+		srv, store := newWebhooksServerWithGuard(t, e, guard)
+		for _, rawURL := range []string{
+			"http://127.0.0.1/hook",
+			"http://[::ffff:192.168.1.2]/hook",
+			"https://internal.example/hook",
+		} {
+			body, err := json.Marshal(createWebhookRequest{URL: rawURL})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var envlp errorEnvelope
+			if status := whRequest(t, http.MethodPost, srv.URL+"/api/v1/webhooks", token, body, &envlp); status != http.StatusBadRequest {
+				t.Fatalf("register %s: status = %d, want 400", rawURL, status)
+			}
+			if !strings.Contains(envlp.Error, "denied") {
+				t.Fatalf("register %s: error = %q, want denied-target detail", rawURL, envlp.Error)
+			}
+		}
+		if got := len(store.hooks); got != 0 {
+			t.Fatalf("strict target guard persisted %d webhooks, want 0", got)
+		}
+	})
+
+	t.Run("AllowPrivate accepts a private target", func(t *testing.T) {
+		srv, store := newWebhooksServerWithGuard(t, e, events.TargetGuard{AllowPrivate: true})
+		body := []byte(`{"url":"http://127.0.0.1/hook"}`)
+		var created webhookResponse
+		if status := whRequest(t, http.MethodPost, srv.URL+"/api/v1/webhooks", token, body, &created); status != http.StatusOK {
+			t.Fatalf("status = %d, want 200", status)
+		}
+		if got := len(store.hooks); got != 1 {
+			t.Fatalf("AllowPrivate persisted %d webhooks, want 1", got)
+		}
+	})
 }
 
 func TestWebhookAuth(t *testing.T) {

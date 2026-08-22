@@ -14,6 +14,7 @@ import (
 	"log/slog"
 	"net/url"
 	"os"
+	"strconv"
 	"time"
 
 	"codestorage/internal/auth"
@@ -129,13 +130,16 @@ func isPGURL(dbURL string) bool {
 // non-nil repack registers the background-repack worker on both backends.
 // The returned cleanup stops the sweep and the queue (waiting for in-flight
 // local work).
-func buildServeEventing(ctx context.Context, ms meta.Store, dbURL, org, loopbackBaseURL string, key loopbackKey, sweep *jobs.SweepSchedule, repack *jobs.Repacker, logger *slog.Logger) (jobs.Queue, func(inner ref.RefStore) ref.RefStore, func(), error) {
+func buildServeEventing(ctx context.Context, ms meta.Store, dbURL, org, loopbackBaseURL string, key loopbackKey, sweep *jobs.SweepSchedule, repack *jobs.Repacker, webhookAllowPrivate bool, logger *slog.Logger) (jobs.Queue, func(inner ref.RefStore) ref.RefStore, func(), error) {
 	assertf(ms != nil && dbURL != "" && org != "" && loopbackBaseURL != "", "buildServeEventing: missing deps")
 	assertf(logger != nil, "buildServeEventing: nil logger")
 
 	whStore := events.MetaWebhookStore{Store: ms}
 	creds, ups := upsync.MetaStores(ms)
-	deliverer := &events.Deliverer{Webhooks: whStore, Logger: logger}
+	// AllowPrivate steers the delivery client's SSRF dial guard (issue
+	// #53, CODESTORAGE_WEBHOOK_ALLOW_PRIVATE); the guard itself is always
+	// on and redirects are always refused.
+	deliverer := &events.Deliverer{Webhooks: whStore, AllowPrivate: webhookAllowPrivate, Logger: logger}
 
 	// The worker's event sink enqueues into the queue built below; the
 	// late-bound pointer breaks the queue<->worker construction cycle
@@ -204,6 +208,25 @@ func buildServeEventing(ctx context.Context, ms meta.Store, dbURL, org, loopback
 // short (ADR gap: local mode has no cross-process durable queue).
 const hookDeliveryAttempts = 3
 
+// hookWebhookAllowPrivate reads the SSRF escape hatch (issue #53) inside
+// the hook subprocess. Unlike serve's fail-fast resolveWebhookAllowPrivate,
+// a malformed value here must not abort the push: log and keep the guard
+// strict (the safe direction).
+func hookWebhookAllowPrivate(logger *slog.Logger) bool {
+	assertf(logger != nil, "hookWebhookAllowPrivate: nil logger")
+	raw := os.Getenv(envWebhookAllowPrivate)
+	if raw == "" {
+		return false
+	}
+	v, err := strconv.ParseBool(raw)
+	if err != nil {
+		logger.Warn("ignoring malformed webhook escape hatch; SSRF guard stays strict",
+			"env", envWebhookAllowPrivate, "value", raw, "err", err)
+		return false
+	}
+	return v
+}
+
 // wireHookEventing points githttp.WrapHookRefStore at the events.RefStore
 // decorator for the `codestorage hook` subprocess, so git pushes emit push
 // events exactly like API writes (docs/06). It reads the same env the hook
@@ -263,7 +286,12 @@ func wireHookEventing(ctx context.Context, logger *slog.Logger) func() {
 		deliverer := &events.Deliverer{
 			Webhooks:    whStore,
 			MaxAttempts: hookDeliveryAttempts,
-			Logger:      logger,
+			// The hook subprocess inherits serve's environment, so the
+			// SSRF escape hatch (issue #53) matches the serve process.
+			// Lenient parse, strict direction: a malformed value keeps
+			// the guard ON (fail closed) rather than failing the push.
+			AllowPrivate: hookWebhookAllowPrivate(logger),
+			Logger:       logger,
 		}
 		local := jobs.NewLocal(deliverer, func(context.Context, upsync.Job) error {
 			panic("local hook queue must never run sync jobs")

@@ -35,6 +35,7 @@ import (
 // meta backend provides an events.WebhookStore.
 type webhooksAPI struct {
 	store  events.WebhookStore
+	guard  events.TargetGuard
 	logger *slog.Logger
 }
 
@@ -43,14 +44,14 @@ type webhooksAPI struct {
 // repo:write, with the plain {"error"} envelope on failures — these are
 // management routes, not docs/04 ref-write routes, so requireAuth (not
 // requireAuthWrite) is correct.
-func RegisterWebhookRoutes(mux *http.ServeMux, verifier auth.Verifier, org string, store events.WebhookStore, logger *slog.Logger, rl *rateLimiter) {
+func RegisterWebhookRoutes(mux *http.ServeMux, verifier auth.Verifier, org string, store events.WebhookStore, guard events.TargetGuard, logger *slog.Logger, rl *rateLimiter) {
 	assertf(mux != nil, "RegisterWebhookRoutes: nil mux")
 	assertf(verifier != nil, "RegisterWebhookRoutes: nil verifier")
 	assertf(store != nil, "RegisterWebhookRoutes: nil store")
 	if logger == nil {
 		logger = slog.Default()
 	}
-	h := &webhooksAPI{store: store, logger: logger}
+	h := &webhooksAPI{store: store, guard: guard, logger: logger}
 	route := func(pattern string, hf http.HandlerFunc) {
 		mux.Handle(pattern, rl.limit(routeRead)(requireAuth(verifier, org, true, auth.ScopeRepoWrite)(hf)))
 	}
@@ -117,6 +118,15 @@ func (h *webhooksAPI) handleCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	if !validWebhookURL(req.URL) {
 		writeErr(w, http.StatusBadRequest, "invalid webhook url: must be an absolute http(s) URL")
+		return
+	}
+	// Registration-time SSRF courtesy check (issue #53): reject targets
+	// that are denied IP literals or currently resolve to denied
+	// addresses. Fast feedback only — acceptance here is NOT a delivery
+	// guarantee, because DNS can change afterwards; the delivery client's
+	// dial-time guard (events.TargetGuard.NewClient) is authoritative.
+	if err := h.guard.CheckRegistration(r.Context(), req.URL); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid webhook url: "+err.Error())
 		return
 	}
 	secret := req.Secret
