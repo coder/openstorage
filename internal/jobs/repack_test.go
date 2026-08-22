@@ -1719,6 +1719,130 @@ func TestRiver_RepackUniqueByRepo(t *testing.T) {
 	}
 }
 
+// TestLocalQueue_TriggerMidFoldConvergesToOne pins the issue #34 flake
+// interleave deterministically, with the PRODUCTION trigger making every
+// scheduling decision: a push registers its pack after the running fold's
+// snapshot but before its swap — the trigger fires while the job is active
+// and is coalesced — and the follow-up machinery must still converge the
+// repo to exactly ONE pack row. At threshold 2 that convergence is
+// guaranteed for every interleave (any registration leaves the count ≥ 2,
+// so the last one always fires a trigger or lands inside an active job
+// whose follow-up covers it); the e2e TestRepack_PushesFoldToOnePack relies
+// on exactly this property, so it is pinned here without CI-load timing.
+func TestLocalQueue_TriggerMidFoldConvergesToOne(t *testing.T) {
+	f := newRepackFixture(t)
+	ctx := context.Background()
+
+	r := f.repacker(t.TempDir())
+	r.FollowUpThreshold = 2
+	deliverer := &events.Deliverer{Webhooks: stubWebhooks{}, Logger: slog.New(slog.DiscardHandler)}
+	q := NewLocal(deliverer, func(context.Context, sync.Job) error { return nil }, r, slog.New(slog.DiscardHandler))
+	defer q.Close()
+	trigger := NewRepackTrigger(f.store, 2, q.EnqueueRepack, slog.New(slog.DiscardHandler))
+
+	// The FIRST fold parks in its race window (post-snapshot, pre-swap) and
+	// hands control back to the test goroutine, which performs the late
+	// push there; successor folds pass straight through. Pushes must run on
+	// the test goroutine (testGit fails via t.Fatalf).
+	raceWindow := make(chan struct{})
+	resume := make(chan struct{})
+	first := true
+	r.BeforeSwap = func(context.Context, ref.Pack) error {
+		if first {
+			first = false
+			raceWindow <- struct{}{}
+			<-resume
+		}
+		return nil
+	}
+
+	// Push 1: below threshold, the trigger must schedule nothing.
+	f.push(t)
+	trigger.MaybeEnqueue(ctx, f.repo)
+	// Push 2: at threshold — the trigger starts the fold, which parks in
+	// the race window with both rows in its snapshot.
+	f.push(t)
+	trigger.MaybeEnqueue(ctx, f.repo)
+	<-raceWindow
+
+	// Push 3 lands mid-fold: registration + its post-receive trigger, like
+	// the git surface after every receive-pack. The trigger coalesces into
+	// the running job (pending flag) — this row survives the snapshot.
+	f.push(t)
+	trigger.MaybeEnqueue(ctx, f.repo)
+	close(resume)
+
+	// Convergence: the pending rerun (or follow-up gate) folds the fold
+	// output plus the late row down to one.
+	deadline := time.Now().Add(30 * time.Second)
+	for len(f.packRows(t)) != 1 {
+		if time.Now().After(deadline) {
+			t.Fatalf("mid-fold registration never converged to one pack row: %+v", f.packRows(t))
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	f.checkColdHydrate(t)
+}
+
+// TestLocalQueue_LateRegistrationBelowThresholdSettles is the deterministic
+// repro of why the e2e fold test could NOT assert "exactly one row" at
+// threshold 3 (issue #34): when the fold's snapshot covers all but the last
+// push and that push registers after the swap, the count settles BELOW the
+// threshold but above one — and nothing may fold it further. The trigger
+// correctly declines (2 < 3), the follow-up gate is not due, and the system
+// invariant is exactly this: convergence below the threshold, not to one
+// row, with no busy-chained no-op folds. The queue must be observably idle
+// afterwards.
+func TestLocalQueue_LateRegistrationBelowThresholdSettles(t *testing.T) {
+	f := newRepackFixture(t)
+	ctx := context.Background()
+
+	r := f.repacker(t.TempDir())
+	r.FollowUpThreshold = 3
+	deliverer := &events.Deliverer{Webhooks: stubWebhooks{}, Logger: slog.New(slog.DiscardHandler)}
+	q := NewLocal(deliverer, func(context.Context, sync.Job) error { return nil }, r, slog.New(slog.DiscardHandler))
+	defer q.Close()
+	trigger := NewRepackTrigger(f.store, 3, q.EnqueueRepack, slog.New(slog.DiscardHandler))
+
+	// Four pushes, then the fold consumes all four.
+	for range 4 {
+		f.push(t)
+	}
+	trigger.MaybeEnqueue(ctx, f.repo)
+	waitIdle := func(what string) {
+		t.Helper()
+		deadline := time.Now().Add(30 * time.Second)
+		for {
+			q.mu.Lock()
+			busy := q.repacking[f.repo]
+			q.mu.Unlock()
+			if !busy {
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("queue never drained %s", what)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	waitIdle("after the four-push fold")
+	if rows := f.packRows(t); len(rows) != 1 {
+		t.Fatalf("fold of four pushes left %+v, want 1 row", rows)
+	}
+
+	// The late push lands strictly after the swap: count 2 < threshold 3.
+	// Its trigger must decline, and no follow-up may run — the steady state
+	// is TWO rows, permanently. This is the interleave that made the old
+	// exactly-one e2e wait unreachable at threshold 3.
+	f.push(t)
+	trigger.MaybeEnqueue(ctx, f.repo)
+	waitIdle("after the below-threshold trigger")
+	if rows := f.packRows(t); len(rows) != 2 {
+		t.Fatalf("below-threshold steady state = %+v, want 2 rows (fold output + late push)", rows)
+	}
+	f.checkColdHydrate(t)
+}
+
 func TestLocalQueue_RepackCoalescesPerRepo(t *testing.T) {
 	f := newRepackFixture(t)
 	ctx := context.Background()

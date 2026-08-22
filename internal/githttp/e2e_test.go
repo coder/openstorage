@@ -1132,8 +1132,19 @@ func TestLocalMode_PacksOnDiskAndStatelessCache(t *testing.T) {
 // make the background repack consolidate the registered rows down to ONE
 // pack, superseded blobs linger for the sweeper, and a cold node clones the
 // byte-identical repo from the consolidated pack alone.
+//
+// Threshold 2 — the ONLY threshold where "exactly one row" is a guaranteed
+// eventual state (issue #34). The system invariant is convergence BELOW the
+// threshold, not to one row: at threshold 3, a fold that snapshots pushes
+// 1–4 with push 5 registering after the swap legitimately settles at 2 rows
+// forever (2 < 3: the trigger correctly declines, the follow-up gate is not
+// due). At threshold 2, every registration leaves the count at ≥ 2, so the
+// last push always fires a trigger (or lands inside an active job whose
+// gated successor covers it) and the chain terminates only at 1 row.
+// TestLocalQueue_TriggerMidFoldConvergesToOne pins the mid-fold interleave
+// of that argument deterministically.
 func TestRepack_PushesFoldToOnePack(t *testing.T) {
-	node := startNodeT(t, "CODESTORAGE_REPACK_THRESHOLD=3")
+	node := startNodeT(t, "CODESTORAGE_REPACK_THRESHOLD=2")
 	repo := registerRepo(t, "t-repack")
 	work := initWorkRepo(t)
 	token := mintTestToken(t, repo, "git:read,git:write", "")
@@ -1147,8 +1158,12 @@ func TestRepack_PushesFoldToOnePack(t *testing.T) {
 	}
 	head := revParse(t, work, "HEAD")
 
-	// Five pushes at threshold 3: the async fold must land and win.
-	deadline := time.Now().Add(60 * time.Second)
+	// Event-driven convergence wait. Generous budget: the river lane chains
+	// gated successors scheduled repackFollowUpDelay (5s) in the future,
+	// each surfaced by river's scheduler/fetch ticks, and an unlucky
+	// interleave needs several links — under -race on a loaded shared
+	// runner the old 60s budget expired mid-chain (issue #34).
+	deadline := time.Now().Add(3 * time.Minute)
 	for len(pgPacks(t, repo)) != 1 {
 		if time.Now().After(deadline) {
 			t.Fatalf("pack rows never folded to 1: %+v", pgPacks(t, repo))
