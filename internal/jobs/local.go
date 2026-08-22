@@ -126,8 +126,14 @@ func (q *Local) runRepack(repo string) {
 		if err != nil {
 			q.logger.Warn("repack failed", "repo", repo, "err", err)
 		}
-		// The follow-up recheck does I/O, so it runs outside the lock.
-		_, due := q.repacker.FollowUpDue(context.Background(), repo)
+		// The follow-up recheck does I/O, so it runs outside the lock. A
+		// read failure defers to the next trigger (log-only): unlike the
+		// river worker there is no durable job to preserve here, and the
+		// pending-flag consumption below still covers racing triggers.
+		_, due, ferr := q.repacker.FollowUpDue(context.Background(), repo)
+		if ferr != nil {
+			q.logger.Warn("repack follow-up recheck failed", "repo", repo, "err", ferr)
+		}
 		needMore := folded && due
 		// Consume the pending flag in the SAME critical section that
 		// decides exit: a trigger landing after the recheck above but

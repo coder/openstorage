@@ -147,19 +147,20 @@ type Repacker struct {
 // one more fold for registrations that landed mid-fold. The count lets the
 // river worker distinguish growth from a wedged plateau (a repo stuck
 // at/above the threshold with nothing pairable must not chain no-op
-// successors forever). Read failures report (0, false) — the next write's
-// trigger retries.
-func (r *Repacker) FollowUpDue(ctx context.Context, repo string) (count int, due bool) {
+// successors forever). Read failures propagate: inside the river worker's
+// completion transaction a silently-false answer would commit the job
+// away without a successor, stranding coalesced triggers — the caller
+// decides whether to snooze (river) or log and defer (local).
+func (r *Repacker) FollowUpDue(ctx context.Context, repo string) (count int, due bool, err error) {
 	assertf(repo != "", "FollowUpDue: empty repo")
 	if r.FollowUpThreshold < 2 {
-		return 0, false
+		return 0, false, nil
 	}
 	packs, err := r.store.ListPacks(ctx, repo)
 	if err != nil {
-		r.logger.Warn("repack follow-up recheck failed", "repo", repo, "err", err)
-		return 0, false
+		return 0, false, fmt.Errorf("follow-up recheck: %w", err)
 	}
-	return len(packs), len(packs) >= r.FollowUpThreshold
+	return len(packs), len(packs) >= r.FollowUpThreshold, nil
 }
 
 // NewRepacker builds a Repacker over the raw ref/blob stores and the

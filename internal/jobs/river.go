@@ -109,9 +109,19 @@ type repackArgs struct {
 
 func (repackArgs) Kind() string { return "repack" }
 
+// repackMaxAttempts bounds river's backoff retries of a FAILING fold
+// (transient materialization/blob/git errors). More than one attempt is
+// load-bearing: triggers arriving while the job is active are deduplicated
+// against it, so the retryable job itself is the only follow-up they have —
+// a single-attempt job dying on a blip stranded them until the next write.
+// Lost races and no-ops return nil (never retried), and a job exhausting
+// all attempts means a persistent infrastructure failure, where the next
+// write's trigger chain is the recovery path anyway.
+const repackMaxAttempts = 4
+
 func (repackArgs) InsertOpts() river.InsertOpts {
 	return river.InsertOpts{
-		MaxAttempts: 1,
+		MaxAttempts: repackMaxAttempts,
 		UniqueOpts: river.UniqueOpts{
 			ByArgs: true,
 			ByState: []rivertype.JobState{
@@ -165,11 +175,20 @@ type repackWorker struct {
 // just-inserted successor (which covers it) or, when the gate scheduled
 // nothing, inserts its own job. No ordering strands a registration.
 func (w *repackWorker) Work(ctx context.Context, job *river.Job[repackArgs]) error {
-	preCount, _ := w.repacker.FollowUpDue(ctx, job.Args.Repo)
+	// The pre-count baseline detects growth across the fold; a failed read
+	// degrades to preKnown=false, which the gate treats conservatively
+	// (schedule when due — an extra no-op successor terminates by the
+	// plateau rule).
+	preCount, _, preErr := w.repacker.FollowUpDue(ctx, job.Args.Repo)
+	preKnown := preErr == nil
 	folded, err := w.repacker.Repack(ctx, job.Args.Repo)
 	if !folded {
 		if err != nil {
-			return err // real failure: river records it, the next trigger retries
+			// Real pre-swap failure: return it so river RETRIES this job
+			// with backoff (repackMaxAttempts). The job must stay active:
+			// triggers arriving while it ran were deduplicated against
+			// it, so this retryable job is the only follow-up they have.
+			return err
 		}
 		// Clean no-op or lost race: complete normally, but still through
 		// the gated path — registrations may have raced this job.
@@ -205,9 +224,14 @@ func (w *repackWorker) Work(ctx context.Context, job *river.Job[repackArgs]) err
 	// The count read runs strictly AFTER JobCompleteTx (see the coverage
 	// argument above) on the repacker's own store connection: it sees
 	// every registration whose trigger was already deduped against this
-	// job's active row.
-	postCount, due := w.repacker.FollowUpDue(ctx, job.Args.Repo)
-	if due && (folded || postCount != preCount) {
+	// job's active row. A failed read must NOT commit the completion —
+	// treating it as due=false would strand exactly those registrations —
+	// so it snoozes like any other completion-transaction failure.
+	postCount, due, postErr := w.repacker.FollowUpDue(ctx, job.Args.Repo)
+	if postErr != nil {
+		return completionFailed("follow-up recheck", postErr)
+	}
+	if due && (folded || !preKnown || postCount != preCount) {
 		if _, err := river.ClientFromContext[pgx.Tx](ctx).InsertTx(ctx, tx, repackArgs{Repo: job.Args.Repo},
 			&river.InsertOpts{ScheduledAt: time.Now().Add(repackFollowUpDelay)}); err != nil {
 			return completionFailed("insert successor", err)
