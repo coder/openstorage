@@ -490,9 +490,10 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 			return
 		}
 		defer os.Remove(stateFile.Name())
-		// The hooks keep the cumulative walk counter in a sibling file
-		// (verifyState.walkedCounterPath); remove it with the state.
+		// The hooks keep the cumulative walk counter and the range cache
+		// in sibling files (verifystate.go); remove them with the state.
 		defer os.Remove(stateFile.Name() + verifyWalkedCounterSuffix)
+		defer os.Remove(stateFile.Name() + verifyRangesSuffix)
 		cmd.Env = append(cmd.Env, EnvVerifyState+"="+stateFile.Name())
 		if s.VerifySigBudget > 0 {
 			cmd.Env = append(cmd.Env, EnvVerifySigBudget+"="+strconv.Itoa(s.VerifySigBudget))
@@ -522,11 +523,20 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 		}
 		// exec's stdout goroutine drains git into the gate concurrently,
 		// so this synchronous copy cannot deadlock. Overflow surfaces on
-		// pushCap.exceeded; other copy errors (client hangup, gzip
+		// the cap counters; other copy errors (client hangup, gzip
 		// corruption, git dying early) just end the copy — git sees EOF
 		// and reports through the gate as usual.
 		if _, err := io.Copy(stdin, body); err != nil && !errors.Is(err, errPushTooLarge) {
 			log.Printf("%s %s: request body: %v", service, repo, err)
+		}
+		// The copy can also stop on the WRITE side before the counters
+		// decide anything: receive-pack closes stdin once it has what it
+		// needs (a delete-only push reads just the command list), so a
+		// padded request would otherwise sneak past the cap undetected
+		// (Codex round 11). Drain the capped reader — bounded by the cap
+		// itself — so oversized bodies uniformly reach the 413 path.
+		if _, err := io.Copy(io.Discard, body); err != nil && !errors.Is(err, errPushTooLarge) {
+			log.Printf("%s %s: request body drain: %v", service, repo, err)
 		}
 		_ = stdin.Close()
 		// Overflow is fully decided the moment the copy ends (the counters

@@ -50,9 +50,16 @@ func TestVerifyState_RoundTripAcrossLoads(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// A later hook process loads the same file fresh.
+	// A later hook process loads the same files fresh; commit verdicts are
+	// lazy (range hits never need them).
 	st2, err := openVerifyState()
 	if err != nil {
+		t.Fatal(err)
+	}
+	if !st2.ranges[rangeKey(shaA, shaB)] {
+		t.Fatal("range verdict not available before loadVerdicts (sidecar must load eagerly)")
+	}
+	if err := st2.loadVerdicts(); err != nil {
 		t.Fatal(err)
 	}
 	if !st2.ok[shaA] {
@@ -60,9 +67,6 @@ func TestVerifyState_RoundTripAcrossLoads(t *testing.T) {
 	}
 	if reason := st2.deny[shaB]; reason != "commit is not signed" {
 		t.Fatalf("deny verdict = %q, want reason preserved", reason)
-	}
-	if !st2.ranges[rangeKey(shaA, shaB)] {
-		t.Fatal("range verdict lost across loads")
 	}
 	if st2.spent != 2 {
 		t.Fatalf("spent = %d, want 2 (ok + deny; okrange lines are free)", st2.spent)
@@ -85,8 +89,13 @@ func TestVerifyState_UnsetEnvFallsBackToMemory(t *testing.T) {
 
 func TestVerifyState_MissingFileFailsClosed(t *testing.T) {
 	t.Setenv(EnvVerifyState, filepath.Join(t.TempDir(), "nope.state"))
-	if _, err := openVerifyState(); err == nil {
-		t.Fatal("set-but-missing state file must fail closed")
+	st, err := openVerifyState()
+	if err != nil {
+		// Missing sidecars are fine; only the verdict file is mandatory.
+		t.Fatalf("open with missing sidecars: %v", err)
+	}
+	if err := st.loadVerdicts(); err == nil {
+		t.Fatal("set-but-missing verdict file must fail closed")
 	}
 }
 
@@ -95,18 +104,31 @@ func TestVerifyState_MalformedLinesFailClosed(t *testing.T) {
 		{"unknown-directive", "grant " + shaA},
 		{"bad-ok-sha", "ok nothex"},
 		{"deny-missing-reason", "deny " + shaA},
-		{"bad-range", "okrange " + shaA + " nothex"},
+		{"range-in-verdict-file", "okrange " + shaA + " " + shaB},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			path := newStateFile(t)
 			if err := os.WriteFile(path, []byte(tc.line+"\n"), 0o600); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := openVerifyState(); err == nil {
-				t.Fatalf("state line %q loaded without error", tc.line)
+			st, err := openVerifyState()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := st.loadVerdicts(); err == nil {
+				t.Fatalf("verdict line %q loaded without error", tc.line)
 			}
 		})
 	}
+	t.Run("bad-range-sidecar", func(t *testing.T) {
+		path := newStateFile(t)
+		if err := os.WriteFile(path+verifyRangesSuffix, []byte("okrange "+shaA+" nothex\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := openVerifyState(); err == nil {
+			t.Fatal("malformed range sidecar loaded without error")
+		}
+	})
 }
 
 func TestVerifyState_DenyReasonNormalizedToOneLine(t *testing.T) {
@@ -123,6 +145,9 @@ func TestVerifyState_DenyReasonNormalizedToOneLine(t *testing.T) {
 	}
 	st2, err := openVerifyState()
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st2.loadVerdicts(); err != nil {
 		t.Fatal(err)
 	}
 	if got := st2.deny[shaC]; got != "gpg: BAD signature" {
@@ -154,6 +179,9 @@ func TestVerifyState_WalkedAccountingRoundTrip(t *testing.T) {
 	}
 	if st2.walked != 42 {
 		t.Fatalf("walked = %d, want 42 accumulated across loads", st2.walked)
+	}
+	if err := st2.loadVerdicts(); err != nil {
+		t.Fatal(err)
 	}
 	if !st2.ok[shaA] || st2.spent != 1 {
 		t.Fatalf("ok=%v spent=%d, want the verdict to survive counter updates", st2.ok[shaA], st2.spent)

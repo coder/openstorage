@@ -236,6 +236,18 @@ func TestPushCap_RawRequests(t *testing.T) {
 		assertCapEnvelope(t, status, body)
 	})
 
+	t.Run("delete-only-padded", func(t *testing.T) {
+		// receive-pack reads ONLY the command list for a delete-only push
+		// and closes stdin, so the stdin copy stops on a broken pipe long
+		// before the counter sees the padding — the post-copy drain must
+		// still trip the cap and answer 413 (Codex round 11).
+		cmd := "1111111111111111111111111111111111111111 0000000000000000000000000000000000000000 refs/heads/ghost\x00report-status"
+		body := append([]byte(pktLine(cmd)+"0000"), shallowFlood(3*testPushCap)...)
+		status, respBody := postReceivePack(t, node, repo, token,
+			io.MultiReader(bytes.NewReader(body)), false)
+		assertCapEnvelope(t, status, respBody)
+	})
+
 	t.Run("gzip-empty-member-flood", func(t *testing.T) {
 		// Concatenated EMPTY gzip members decode to nothing, so the
 		// decoded counter never advances — only the compressed-side wire

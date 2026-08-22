@@ -57,14 +57,21 @@ const EnvVerifySigBudget = "CODESTORAGE_GIT_VERIFY_SIG_BUDGET"
 // every update hook of one push.
 const EnvVerifySpawnLog = "CODESTORAGE_TEST_VERIFY_SPAWN_LOG"
 
-// State file directives. Every verifier spawn appends exactly one ok/deny
-// line, so spent (the budget charge) is their count; okrange lines record
-// whole-range successes for cross-ref (old,new) dedup and are persisted
-// only for ranges that actually verified commits. The cumulative
-// examined-commit counter lives in a SEPARATE fixed-size sibling file
-// (walkedCounterPath): folding it into this file would either grow it once
-// per walk or force a full rewrite per walk — both let cheap cached walks
-// amplify into O(refs × budget) state processing (Codex rounds 5–8).
+// State directives. The state is split across THREE files so that the cost
+// a hook pays scales with the work its ref actually causes, not with the
+// push's accumulated state (Codex rounds 5–8 and 11):
+//
+//   - <path>:         ok/deny commit verdicts, append-only, one line per
+//     verifier spawn (bounded by the spawn budget). Loaded lazily — only
+//     when a ref misses the range cache and must walk.
+//   - <path>.ranges:  okrange lines for ranges that actually verified
+//     commits (bounded by the spawn budget, and 1 line in the common
+//     N-refs-at-one-tip shape). Loaded on every call: an exact-range hit
+//     returns without touching the verdict file or spawning rev-list.
+//   - <path>.walked:  the cumulative examined-commit counter, fixed-size,
+//     atomically replaced. Folding it into an append-only file would grow
+//     it once per walk; rewriting verdicts to update it would reserialize
+//     O(budget) lines per walk.
 const (
 	verdictOK    = "ok"
 	verdictDeny  = "deny"
@@ -85,8 +92,8 @@ const (
 const verifyWalkBudgetMultiplier = 100
 
 // verifyState is one push's verdict cache. Loaded fresh per verifySig call
-// (the file is small and hooks are sequential); appends go straight to the
-// file so the next hook process sees them.
+// (hooks are sequential); appends go straight to the files so the next
+// hook process sees them.
 type verifyState struct {
 	path   string // "" = in-memory only (no serve-provided state file)
 	ok     map[string]bool
@@ -94,15 +101,22 @@ type verifyState struct {
 	ranges map[string]bool
 	spent  int
 	walked int64
+	// verdictsLoaded records whether ok/deny/spent were read from the
+	// verdict file; range-cache hits never need them (see loadVerdicts).
+	verdictsLoaded bool
 }
 
 func rangeKey(old, new string) string { return old + " " + new }
 
-// openVerifyState loads the per-push state. The path comes from our own
-// serve process, never the client; a set-but-unreadable or malformed state
-// file therefore means misconfiguration or tampering and fails closed (the
-// returned error denies the push). An unset env falls back to a fresh
-// in-memory state.
+// openVerifyState loads the cheap per-push state: the range cache and the
+// walk counter, both bounded and small. The (potentially budget-sized)
+// verdict file is NOT read here — call loadVerdicts before walking — so a
+// push fanning one verified range out to many refs costs each ref a
+// constant-size load, not a rescan of every verdict (Codex round 11). The
+// paths come from our own serve process, never the client; anything
+// set-but-unreadable or malformed means misconfiguration or tampering and
+// fails closed (the returned error denies the push). An unset env falls
+// back to a fresh in-memory state.
 func openVerifyState() (*verifyState, error) {
 	st := &verifyState{
 		ok:     make(map[string]bool),
@@ -111,30 +125,17 @@ func openVerifyState() (*verifyState, error) {
 	}
 	path := os.Getenv(EnvVerifyState)
 	if path == "" {
+		st.verdictsLoaded = true
 		return st, nil
 	}
 	st.path = path
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, fmt.Errorf("open verify state: %w", err)
+	// The range sidecar is created on first markRangeOK; absent means no
+	// range has been verified yet.
+	if err := readLineFile(st.rangesPath(), true, st.applyRangeLine); err != nil {
+		return nil, err
 	}
-	defer f.Close()
-	sc := bufio.NewScanner(f)
-	for sc.Scan() {
-		line := sc.Text()
-		if line == "" {
-			continue
-		}
-		if err := st.applyLine(line); err != nil {
-			return nil, err
-		}
-	}
-	if err := sc.Err(); err != nil {
-		return nil, fmt.Errorf("read verify state: %w", err)
-	}
-	// The cumulative examined-commit counter lives in the sibling
-	// fixed-size file; absent means no walk has been charged yet. Our own
-	// binary writes it, so anything unreadable or malformed fails closed.
+	// The cumulative examined-commit counter: absent means no walk has
+	// been charged yet.
 	raw, err := os.ReadFile(st.walkedCounterPath())
 	switch {
 	case err == nil:
@@ -151,10 +152,52 @@ func openVerifyState() (*verifyState, error) {
 	return st, nil
 }
 
-// applyLine folds one state-file line into the in-memory maps. Only this
-// binary writes the file, so a malformed line is a bug or tampering — but
-// hooks must never panic mid-push, so it surfaces as a denial error.
-func (st *verifyState) applyLine(line string) error {
+// loadVerdicts reads the ok/deny verdict file (created empty by the serve
+// process, so unlike the sidecars it must exist). Idempotent; required
+// before consulting st.ok/st.deny/st.spent.
+func (st *verifyState) loadVerdicts() error {
+	if st.verdictsLoaded {
+		return nil
+	}
+	if err := readLineFile(st.path, false, st.applyVerdictLine); err != nil {
+		return err
+	}
+	st.verdictsLoaded = true
+	return nil
+}
+
+// readLineFile feeds every non-empty line of path to apply, failing closed
+// on unreadable files (unless missingOK admits a not-yet-created sidecar).
+func readLineFile(path string, missingOK bool, apply func(string) error) error {
+	f, err := os.Open(path)
+	if err != nil {
+		if missingOK && os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("open verify state: %w", err)
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		line := sc.Text()
+		if line == "" {
+			continue
+		}
+		if err := apply(line); err != nil {
+			return err
+		}
+	}
+	if err := sc.Err(); err != nil {
+		return fmt.Errorf("read verify state: %w", err)
+	}
+	return nil
+}
+
+// applyVerdictLine folds one verdict-file line into the in-memory maps.
+// Only this binary writes these files, so a malformed line is a bug or
+// tampering — but hooks must never panic mid-push, so it surfaces as a
+// denial error.
+func (st *verifyState) applyVerdictLine(line string) error {
 	directive, rest, _ := strings.Cut(line, " ")
 	switch directive {
 	case verdictOK:
@@ -170,32 +213,34 @@ func (st *verifyState) applyLine(line string) error {
 		}
 		st.deny[sha] = reason
 		st.spent++
-	case verdictRange:
-		old, new, found := strings.Cut(rest, " ")
-		if !found || !ref.ValidSHA(old) || !ref.ValidSHA(new) {
-			return fmt.Errorf("malformed verify state line %q", line)
-		}
-		st.ranges[rangeKey(old, new)] = true
 	default:
 		return fmt.Errorf("malformed verify state line %q", line)
 	}
 	return nil
 }
 
-// appendLine records one directive both in memory and — when a state file
-// is wired — durably for the following hook processes of the same push. An
-// append failure fails closed at the caller (the verdict may not silently
-// evaporate: losing an ok costs a re-verify, but losing a deny would let a
-// later ref re-spawn for a known-bad commit).
-func (st *verifyState) appendLine(line string) error {
+// applyRangeLine folds one range-sidecar line into the range cache.
+func (st *verifyState) applyRangeLine(line string) error {
+	directive, rest, _ := strings.Cut(line, " ")
+	old, new, found := strings.Cut(rest, " ")
+	if directive != verdictRange || !found || !ref.ValidSHA(old) || !ref.ValidSHA(new) {
+		return fmt.Errorf("malformed verify range line %q", line)
+	}
+	st.ranges[rangeKey(old, new)] = true
+	return nil
+}
+
+// appendTo records one directive line durably for the following hook
+// processes of the same push. An append failure fails closed at the caller
+// (a verdict may not silently evaporate: losing an ok costs a re-verify,
+// but losing a deny would let a later ref re-spawn for a known-bad commit).
+func appendTo(path, line string, create bool) error {
 	assertf(!strings.Contains(line, "\n"), "verify state line %q contains newline", line)
-	if err := st.applyLine(line); err != nil {
-		return err
+	flags := os.O_WRONLY | os.O_APPEND
+	if create {
+		flags |= os.O_CREATE
 	}
-	if st.path == "" {
-		return nil
-	}
-	f, err := os.OpenFile(st.path, os.O_WRONLY|os.O_APPEND, 0)
+	f, err := os.OpenFile(path, flags, 0o600)
 	if err != nil {
 		return fmt.Errorf("append verify state: %w", err)
 	}
@@ -207,7 +252,14 @@ func (st *verifyState) appendLine(line string) error {
 }
 
 func (st *verifyState) markCommitOK(sha string) error {
-	return st.appendLine(verdictOK + " " + sha)
+	line := verdictOK + " " + sha
+	if err := st.applyVerdictLine(line); err != nil {
+		return err
+	}
+	if st.path == "" {
+		return nil
+	}
+	return appendTo(st.path, line, false)
 }
 
 func (st *verifyState) markCommitDenied(sha, reason string) error {
@@ -217,16 +269,42 @@ func (st *verifyState) markCommitDenied(sha, reason string) error {
 	if reason == "" {
 		reason = "signature verification failed"
 	}
-	return st.appendLine(verdictDeny + " " + sha + " " + reason)
+	line := verdictDeny + " " + sha + " " + reason
+	if err := st.applyVerdictLine(line); err != nil {
+		return err
+	}
+	if st.path == "" {
+		return nil
+	}
+	return appendTo(st.path, line, false)
 }
 
 func (st *verifyState) markRangeOK(old, new string) error {
-	return st.appendLine(verdictRange + " " + rangeKey(old, new))
+	line := verdictRange + " " + rangeKey(old, new)
+	if err := st.applyRangeLine(line); err != nil {
+		return err
+	}
+	if st.path == "" {
+		return nil
+	}
+	return appendTo(st.rangesPath(), line, true)
 }
 
-// verifyWalkedCounterSuffix names the sibling counter file next to the
-// verdict state file; the server removes both when the request ends.
-const verifyWalkedCounterSuffix = ".walked"
+// verifyWalkedCounterSuffix and verifyRangesSuffix name the sibling files
+// next to the verdict state file; the server removes all three when the
+// request ends.
+const (
+	verifyWalkedCounterSuffix = ".walked"
+	verifyRangesSuffix        = ".ranges"
+)
+
+// rangesPath is the sidecar carrying okrange lines. Separate from the
+// verdict file so exact-range hits load only this bounded, usually tiny
+// file (Codex round 11).
+func (st *verifyState) rangesPath() string {
+	assertf(st.path != "", "rangesPath without a state file")
+	return st.path + verifyRangesSuffix
+}
 
 // walkedCounterPath is the sibling fixed-size file carrying the push's
 // cumulative examined-commit counter. Kept out of the verdict state file so

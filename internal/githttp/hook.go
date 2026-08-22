@@ -645,6 +645,11 @@ func verifySig(ctx context.Context, refName, old, new string) error {
 	if err != nil {
 		return fmt.Errorf("verify-sig: %w", err) // fail closed
 	}
+	// Commit verdicts load only past the range cache (Codex round 11): a
+	// range-hit ref above never pays for the push's accumulated verdicts.
+	if err := state.loadVerdicts(); err != nil {
+		return fmt.Errorf("verify-sig: %w", err) // fail closed
+	}
 	pending, _, err := introducedPending(ctx, state, refName, old, new, budget)
 	if err != nil {
 		return err
@@ -743,7 +748,7 @@ func verifySigDenied(refName, sha, reason string) error {
 // the history once per ref for free. Budget 0 means unlimited by explicit
 // operator choice.
 func introducedPending(ctx context.Context, state *verifyState, refName, old, new string, budget int) (pending []string, examined int64, retErr error) {
-	assertf(state != nil && budget >= 0, "introducedPending: state=%v budget=%d", state, budget)
+	assertf(state != nil && budget >= 0 && state.verdictsLoaded, "introducedPending: state=%v budget=%d", state, budget)
 	if !ref.ValidSHA(new) || new == ref.ZeroSHA {
 		return nil, 0, fmt.Errorf("verify-sig: introducedPending: bad new sha %q", new)
 	}
