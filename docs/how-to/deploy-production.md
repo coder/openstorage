@@ -68,6 +68,22 @@ from the standard AWS chain (env vars, shared config, instance roles).
     covered by `s3:ListBucket` above) and boots when it is reachable. A denied create
     with an unreachable bucket stays boot-fatal, naming both errors.
 
+- **Pin S3 access to your account (AWS).** The server trusts whatever bucket the
+  configured name resolves to — a pre-provisioned bucket is accepted owner-blind, and
+  the create path has always tolerated `BucketAlreadyExists` (a name owned by someone
+  else). AWS bucket names are global: a deleted bucket name can be re-registered by a
+  third party, who can even grant your replica role access to capture your packs. Add an
+  `aws:ResourceAccount` condition to the role's S3 statements so the startup probe *and*
+  every data operation fail closed outside your account:
+
+  ```json
+  "Condition": { "StringEquals": { "aws:ResourceAccount": "<your-account-id>" } }
+  ```
+
+  Self-hosted MinIO has no shared global namespace, so this applies to AWS (and
+  AWS-compatible multi-tenant) deployments. Application-level expected-owner enforcement
+  is tracked in [#58](https://github.com/coder/code-storage/issues/58).
+
 - Packs are immutable and content-addressed: the server only ever writes new keys and —
   through the sweeper's destructive modes — deletes provably-unreferenced ones. The bytes
   under a key never change, but a key can be *re-PUT with identical content* (concurrent
