@@ -504,16 +504,20 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 			log.Printf("%s %s: request body: %v", service, repo, err)
 		}
 		_ = stdin.Close()
-		runErr := cmd.Wait()
-		// Overflow means the decoded body exceeded the cap — oversized by
-		// definition, so the push is rejected regardless of git's exit
-		// status. The exit status CANNOT discriminate anything here:
-		// receive-pack reports a truncated-pack unpack failure as a normal
+		// Overflow is fully decided the moment the copy ends (the counter
+		// only trips while feeding git), so settle the gate BEFORE waiting:
+		// hook-phase output — sideband progress and keepalives during
+		// pre-receive/update hooks that can legitimately run for minutes —
+		// must stream live on the within-cap path, not buffer until exit
+		// (Codex round 2). Overflow rejects regardless of git's exit
+		// status, which CANNOT discriminate anything here: receive-pack
+		// reports a truncated-pack unpack failure as a normal
 		// report-status response and exits 0.
 		overflow := pushCap.exceeded
 		if err := gate.settle(overflow); err != nil {
 			log.Printf("%s %s: response: %v", service, repo, err)
 		}
+		runErr := cmd.Wait()
 		if overflow {
 			// On the normal overflow path git saw the truncated stream
 			// during unpack — before any hook could run — and discarded

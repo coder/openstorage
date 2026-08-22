@@ -639,23 +639,15 @@ func verifySig(ctx context.Context, refName, old, new string) error {
 	if state.ranges[rangeKey(old, new)] {
 		return nil
 	}
-	introduced, err := introducedCommits(ctx, old, new)
+	// Per-push verified-commit budget (issue #59), resolved BEFORE the
+	// walk: it bounds the walk itself, not just the verifier spawns.
+	budget, err := verifySigBudget()
 	if err != nil {
-		return fmt.Errorf("verify-sig: %w", err)
+		return fmt.Errorf("verify-sig: %w", err) // fail closed
 	}
-	// Per-commit verdict cache: an earlier ref (or the pre-receive gate)
-	// already spawned the verifier for these. Cached denials short-circuit
-	// without a spawn — a non-atomic push cannot repeat the same failing
-	// verification once per ref.
-	var pending []string
-	for _, sha := range introduced {
-		if state.ok[sha] {
-			continue
-		}
-		if reason, denied := state.deny[sha]; denied {
-			return verifySigDenied(refName, sha, reason)
-		}
-		pending = append(pending, sha)
+	pending, err := introducedPending(ctx, state, refName, old, new, budget)
+	if err != nil {
+		return err
 	}
 	if len(pending) == 0 {
 		// Nothing new to verify: a creation at an already-stored tip, or a
@@ -665,17 +657,6 @@ func verifySig(ctx context.Context, refName, old, new string) error {
 			return fmt.Errorf("verify-sig: %w", err)
 		}
 		return nil
-	}
-	// Per-push verified-commit budget (issue #59), charged BEFORE any of
-	// the spawns run: failing closed after burning the budget would do the
-	// very work the budget exists to bound.
-	budget, err := verifySigBudget()
-	if err != nil {
-		return fmt.Errorf("verify-sig: %w", err) // fail closed
-	}
-	if budget > 0 && state.spent+len(pending) > budget {
-		return fmt.Errorf("verify-sig: push exceeds the per-push verification budget: %s introduces %d unverified commits with %d of %d verifications already used (raise CODESTORAGE_VERIFY_SIG_BUDGET or push fewer new commits)",
-			refName, len(pending), state.spent, budget)
 	}
 
 	org := mustEnv(EnvOrg)
@@ -723,44 +704,85 @@ func verifySigDenied(refName, sha, reason string) error {
 	return fmt.Errorf("verify-sig denied %s at %s: %s", refName, sha, reason)
 }
 
-// introducedCommits lists the commits reachable from new but not from old
-// (branch creation: old is ZeroSHA, so everything reachable from new).
-// Runs in the bare repo git put us in (cwd, GIT_DIR set by receive-pack).
+// introducedPending walks the commits reachable from new but not from old
+// (branch creation: old is ZeroSHA, so everything reachable from new) and
+// returns the ones still needing a verifier spawn — dropping cached-OK
+// commits, failing on a cached denial, and aborting the walk the moment the
+// uncached count exceeds the remaining budget. Runs in the bare repo git
+// put us in (cwd, GIT_DIR set by receive-pack).
 //
-// Deliberately NOT bounded by other refs (`--not --all` and friends): the
-// upstream branch-protection contract is explicit that the comparison is
-// against the protected ref's own prior tip, never against other refs — a
-// commit that already exists elsewhere is still checked the first time it
-// is brought onto the protected ref, so unsigned commits cannot be
-// laundered through an unpoliced ref and then referenced by a protected
-// creation (branch-protection.md "Commit signing verifications"; Codex
-// round 1 on issue #59's original direction). The cost of deep creation
-// walks is bounded instead by the per-push verdict cache and the
-// fail-closed verification budget (verifystate.go).
-func introducedCommits(ctx context.Context, old, new string) ([]string, error) {
+// The walk is deliberately NOT bounded by other refs (`--not --all` and
+// friends): the upstream branch-protection contract is explicit that the
+// comparison is against the protected ref's own prior tip, never against
+// other refs — a commit that already exists elsewhere is still checked the
+// first time it is brought onto the protected ref, so unsigned commits
+// cannot be laundered through an unpoliced ref and then referenced by a
+// protected creation (branch-protection.md "Commit signing verifications";
+// Codex round 1 on issue #59's original direction). Cost is bounded by the
+// per-push verdict cache and the budget instead — and the budget bounds the
+// walk ITSELF: rev-list output is consumed incrementally and the subprocess
+// is killed at budget exhaustion, so a deep creation cannot force
+// traversal or allocation proportional to its whole history (Codex round
+// 2). Budget 0 means unlimited by explicit operator choice.
+func introducedPending(ctx context.Context, state *verifyState, refName, old, new string, budget int) ([]string, error) {
+	assertf(state != nil && budget >= 0, "introducedPending: state=%v budget=%d", state, budget)
 	if !ref.ValidSHA(new) || new == ref.ZeroSHA {
-		return nil, fmt.Errorf("introducedCommits: bad new sha %q", new)
+		return nil, fmt.Errorf("verify-sig: introducedPending: bad new sha %q", new)
 	}
 	args := []string{"rev-list", new}
 	if old != ref.ZeroSHA {
 		args = append(args, "^"+old)
 	}
-	out, err := exec.CommandContext(ctx, "git", args...).Output()
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "git", args...)
+	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return nil, fmt.Errorf("git %s: %w", strings.Join(args, " "), err)
+		return nil, fmt.Errorf("verify-sig: rev-list stdout: %w", err)
 	}
-	var shas []string
-	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("verify-sig: start git %s: %w", strings.Join(args, " "), err)
+	}
+	// Reap the subprocess on every early return; cancel() has already
+	// killed it then, so the Wait error is expected and irrelevant.
+	abort := func() { cancel(); _ = cmd.Wait() }
+
+	var pending []string
+	sc := bufio.NewScanner(stdout)
+	for sc.Scan() {
+		line := sc.Text()
 		if line == "" {
 			continue
 		}
 		// Subprocess output: fail closed on surprises, never panic mid-push.
 		if !ref.ValidSHA(line) {
-			return nil, fmt.Errorf("rev-list emitted %q", line)
+			abort()
+			return nil, fmt.Errorf("verify-sig: rev-list emitted %q", line)
 		}
-		shas = append(shas, line)
+		if state.ok[line] {
+			continue
+		}
+		// Cached denial: an earlier ref already spawned the verifier for
+		// this commit and failed — short-circuit without another spawn.
+		if reason, denied := state.deny[line]; denied {
+			abort()
+			return nil, verifySigDenied(refName, line, reason)
+		}
+		pending = append(pending, line)
+		if budget > 0 && state.spent+len(pending) > budget {
+			abort()
+			return nil, fmt.Errorf("verify-sig: push exceeds the per-push verification budget: %s introduces more than %d unverified commits with %d of %d verifications already used (raise CODESTORAGE_VERIFY_SIG_BUDGET or push fewer new commits)",
+				refName, budget-state.spent, state.spent, budget)
+		}
 	}
-	return shas, nil
+	if err := sc.Err(); err != nil {
+		abort()
+		return nil, fmt.Errorf("verify-sig: reading rev-list: %w", err)
+	}
+	if err := cmd.Wait(); err != nil {
+		return nil, fmt.Errorf("verify-sig: git %s: %w", strings.Join(args, " "), err)
+	}
+	return pending, nil
 }
 
 // sigVerifier delegates signature checking to git's own machinery
