@@ -50,7 +50,7 @@ SELECT
 		return ReserveDecision{}, fmt.Errorf("reserve pack bytes read: %w", err)
 	}
 	dec := ReserveDecision{UsedBytes: max(counter, usageFloor), ReservedBytes: reserved}
-	if dec.UsedBytes+dec.ReservedBytes+incomingBytes(packs) > quotaBytes {
+	if !admitted(dec.UsedBytes, dec.ReservedBytes, incomingBytes(packs), quotaBytes) {
 		return dec, nil // denied; the deferred rollback discards nothing
 	}
 	for _, p := range packs {

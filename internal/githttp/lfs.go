@@ -438,9 +438,16 @@ func (s *Server) lfsUploadAction(r *http.Request, repoElem, oid string) *lfsActi
 	return s.lfsProxyAction(r, repoElem, oid)
 }
 
-// lfsProxyAction builds a proxy transfer href through this server.
+// lfsProxyAction builds a proxy transfer href through this server: on the
+// configured external base URL when the serve wiring set one (production
+// reverse proxies may present an internal Host and omit X-Forwarded-Proto
+// — Codex round 2), else reconstructed from the request.
 func (s *Server) lfsProxyAction(r *http.Request, repoElem, oid string) *lfsAction {
-	action := &lfsAction{Href: requestBaseURL(r) + "/" + repoElem + ".git/info/lfs/objects/" + oid}
+	base := strings.TrimRight(s.BaseURL, "/")
+	if base == "" {
+		base = requestBaseURL(r)
+	}
+	action := &lfsAction{Href: base + "/" + repoElem + ".git/info/lfs/objects/" + oid}
 	if a := r.Header.Get("Authorization"); a != "" {
 		action.Header = map[string]string{"Authorization": a}
 	}

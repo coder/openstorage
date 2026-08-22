@@ -72,6 +72,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"time"
 
@@ -133,13 +134,37 @@ func validateReserve(group []string, packs []Pack, owner string, usageFloor, quo
 	assertf(ttl > 0, "ReservePackBytes: non-positive ttl %v", ttl)
 }
 
-// incomingBytes sums the packs' sizes (validated positive).
+// addSat returns a+b saturated at MaxInt64. Admission arithmetic sums
+// CLIENT-DECLARED sizes (LFS batch entries are arbitrary int64s), so a
+// naive sum can wrap negative and admit anything (Codex round 2 on #51);
+// saturation keeps every overflowing total on the denying side of the
+// quota comparison instead.
+func addSat(a, b int64) int64 {
+	assertf(a >= 0 && b >= 0, "addSat(%d, %d): negative addend", a, b)
+	if a > math.MaxInt64-b {
+		return math.MaxInt64
+	}
+	return a + b
+}
+
+// incomingBytes sums the packs' sizes (validated positive), saturating at
+// MaxInt64 — see addSat.
 func incomingBytes(packs []Pack) int64 {
 	var total int64
 	for _, p := range packs {
-		total += p.Size
+		total = addSat(total, p.Size)
 	}
 	return total
+}
+
+// admitted reports whether incoming fits: used + reserved + incoming <=
+// quota, computed with saturation so oversized declared totals deny
+// instead of wrapping past the quota. A saturated total equal to MaxInt64
+// is treated as over ANY quota — a genuine exactly-MaxInt64 admission is
+// indistinguishable from an overflow and no real deployment stores 8 EiB.
+func admitted(used, reserved, incoming, quota int64) bool {
+	total := addSat(addSat(used, reserved), incoming)
+	return total <= quota && total != math.MaxInt64
 }
 
 // ReservePackBytes implements the admission check documented atop this file
@@ -172,7 +197,7 @@ SELECT
 			return err
 		}
 		dec = ReserveDecision{UsedBytes: max(counter, usageFloor), ReservedBytes: reserved}
-		if dec.UsedBytes+dec.ReservedBytes+incoming > quotaBytes {
+		if !admitted(dec.UsedBytes, dec.ReservedBytes, incoming, quotaBytes) {
 			return nil // denied; dec.OK stays false
 		}
 		for _, p := range packs {

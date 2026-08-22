@@ -168,6 +168,9 @@ func cmdServe(ctx context.Context, args []string) error {
 	srv.MaybeRepack = maybeRepack
 	srv.PackQuotaBytes = cfg.packQuotaBytes
 	srv.PackReservationTTL = cfg.packReservationTTL
+	// LFS proxy transfer hrefs must be externally routable (issue #51):
+	// same canonical base the API's http_url values use.
+	srv.BaseURL = httpBaseURL
 	// docs/05 git URLs address repos by repo_id (name-style urls accepted
 	// too, ADR-21); the resolved RepoID is the only storage key, and the
 	// record backs claim matching for url- or id-carrying tokens (docs/02).

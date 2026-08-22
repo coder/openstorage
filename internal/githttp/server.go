@@ -72,6 +72,14 @@ type Server struct {
 	// reservation gates admission (issue #29, ref/ledger.go). Set by the
 	// serve wiring; <= 0 leaves the hook on defaultReservationTTL.
 	PackReservationTTL time.Duration
+	// BaseURL is the externally reachable base URL (scheme://host, no
+	// trailing slash) LFS proxy transfer hrefs are built on (issue #51:
+	// uploads always proxy, so behind a reverse proxy the href must be
+	// the canonical external URL — the backend request's Host header may
+	// be internal). Set by the serve wiring from $CODESTORAGE_BASE_URL
+	// (or the bound listener); when empty, hrefs fall back to the
+	// request's Host and X-Forwarded-Proto.
+	BaseURL string
 	// usage memoizes per-repo pack usage for the quota-pressure log so
 	// replayed cheap POSTs cannot amplify into per-request blob listings.
 	usage usageCache

@@ -351,6 +351,25 @@ func TestLFS_BatchPresignedHref(t *testing.T) {
 	}
 }
 
+// TestLFS_ProxyActionUsesConfiguredBaseURL (issue #51, Codex round 2):
+// behind a reverse proxy the backend request's Host may be internal, so
+// proxy transfer hrefs must use the configured external base URL when set.
+func TestLFS_ProxyActionUsesConfiguredBaseURL(t *testing.T) {
+	srv, mint := newLFSServer(t, openFileBlob(t))
+	srv.BaseURL = "https://ext.example/" // trailing slash must not double up
+	oid := sha256Hex([]byte("routable"))
+	resp := decodeBatch(t, doLFS(t, srv, http.MethodPost, lfsBatchPath, "basic:"+mint(auth.ScopeGitWrite),
+		batchBody("upload", oid, 8)))
+	up := resp.Objects[0].Actions["upload"]
+	if up == nil {
+		t.Fatalf("no upload action: %+v", resp.Objects[0])
+	}
+	want := "https://ext.example/" + lfsTestRepoURL + ".git/info/lfs/objects/" + oid
+	if up.Href != want {
+		t.Fatalf("proxy href = %q, want configured base %q", up.Href, want)
+	}
+}
+
 // writeTempFile writes content to a fresh temp file and returns its path.
 func writeTempFile(t *testing.T, content []byte) string {
 	t.Helper()
