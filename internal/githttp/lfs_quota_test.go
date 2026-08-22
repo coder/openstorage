@@ -608,6 +608,61 @@ func TestLFSUpload_AbsoluteDeadlineBoundsDrip(t *testing.T) {
 	}
 }
 
+// TestLFSQuota_ExpiredMidUploadRefreshDenies (Codex round 8): an upload
+// whose reservation expires during the body copy must re-admit the
+// verified size BEFORE publishing — if another writer consumed the freed
+// headroom meanwhile, the upload is denied with nothing durable, instead
+// of publishing past the quota.
+func TestLFSQuota_ExpiredMidUploadRefreshDenies(t *testing.T) {
+	const ttl = 300 * time.Millisecond
+	srv, st, mint := newLFSQuotaServer(t, 100, ttl)
+	tok := mint(auth.ScopeGitWrite)
+	first := bytes.Repeat([]byte("a"), 60)
+	second := bytes.Repeat([]byte("b"), 60)
+	firstOID := sha256Hex(first)
+
+	// Park the first upload mid-body: its reservation (60) is live now.
+	pr, pw := io.Pipe()
+	req := httptest.NewRequest(http.MethodPut,
+		"/"+lfsTestRepoURL+".git/info/lfs/objects/"+firstOID, pr)
+	req.ContentLength = int64(len(first))
+	req.SetBasicAuth("t", tok)
+	rec := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() { defer close(done); srv.Handler().ServeHTTP(rec, req) }()
+	if _, err := pw.Write(first[:4]); err != nil {
+		t.Fatal(err)
+	}
+
+	// Let the reservation expire, then let a second upload claim the
+	// freed headroom and settle it into usage.
+	time.Sleep(2 * ttl)
+	w := doLFS(t, srv, http.MethodPut, "/"+lfsTestRepoURL+".git/info/lfs/objects/"+sha256Hex(second),
+		"basic:"+tok, string(second))
+	if w.Code != http.StatusOK {
+		t.Fatalf("second upload status = %d, body %s", w.Code, w.Body)
+	}
+
+	// Resume the first upload: its pre-publish refresh must deny (60
+	// settled + 60 incoming > 100) and publish nothing.
+	if _, err := pw.Write(first[4:]); err != nil {
+		t.Fatal(err)
+	}
+	if err := pw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	<-done
+	if rec.Code != http.StatusInsufficientStorage {
+		t.Fatalf("expired-mid-upload PUT status = %d, body %s (want 507)", rec.Code, rec.Body)
+	}
+	if _, err := srv.Blob.Stat(context.Background(), blob.LFSKey(lfsTestRepoID, firstOID)); err == nil {
+		t.Fatal("denied upload still published the object")
+	}
+	if ls := ledgerState(t, st, ttl); ls.UsageBytes != int64(len(second)) {
+		t.Fatalf("ledger usage = %+v, want only the second object settled", ls)
+	}
+}
+
 // TestLFSQuota_NamespaceUsageRollsUpToBase: pack bytes registered under a
 // namespace member of the repo group charge the same quota LFS admission
 // uses — one token must not obtain fresh headroom per surface.

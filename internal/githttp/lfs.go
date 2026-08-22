@@ -839,6 +839,43 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target r
 		lfsError(w, http.StatusBadRequest, fmt.Sprintf("content sha256 %s does not match oid %s", got, oid))
 		return
 	}
+	// Reservation freshness (Codex round 8): the body copy above may have
+	// consumed most of the TTL, and an expired row's headroom is claimable
+	// by other admissions while this object would still become durable.
+	// Re-admit the VERIFIED size immediately before publication — the
+	// same-key refresh restarts the TTL clock, restoring the pack path's
+	// reserve→publish→register ordering with only server-side work (well
+	// under any sane TTL) left inside the reservation's lifetime. A denial
+	// here means the freed headroom is genuinely gone: reject while
+	// nothing durable exists yet.
+	if s.PackQuotaBytes > 0 && n > 0 && !registered {
+		floor, err := blob.StorageUsageBytes(ctx, s.Blob, repoID)
+		if err != nil {
+			log.Printf("lfs quota: %s: usage listing failed: %v", repoID, err)
+			lfsError(w, http.StatusInternalServerError, "storage quota check failed")
+			return
+		}
+		dec, err := s.Store.ReservePackBytes(ctx, blob.QuotaRepoGroup(repoID),
+			[]ref.Pack{{Key: key, Size: n}}, ref.NewReservationOwner(),
+			floor, s.PackQuotaBytes, s.lfsReservationTTL())
+		if err != nil {
+			log.Printf("lfs quota: %s: pre-publish refresh failed: %v", repoID, err)
+			lfsError(w, http.StatusInternalServerError, "storage quota check failed")
+			return
+		}
+		if dec.KeyCapExceeded {
+			w.Header().Set("Retry-After", "10")
+			lfsError(w, http.StatusTooManyRequests,
+				"too many in-flight uploads reserved for this repository, retry later")
+			return
+		}
+		if !dec.OK {
+			lfsError(w, http.StatusInsufficientStorage, fmt.Sprintf(
+				"repository storage quota exceeded: upload adds %d bytes to %d bytes stored (+%d bytes reserved by in-flight uploads), quota is %d bytes",
+				n, dec.UsedBytes, dec.ReservedBytes, s.PackQuotaBytes))
+			return
+		}
+	}
 	if err := s.Blob.UploadFile(ctx, key, path); err != nil {
 		log.Printf("lfs upload %s: %v", key, err)
 		lfsError(w, http.StatusInternalServerError, "object upload failed")
