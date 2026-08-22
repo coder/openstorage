@@ -30,6 +30,7 @@ import (
 	"bufio"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -210,14 +211,64 @@ func (st *verifyState) markRangeOK(old, new string) error {
 	return st.appendLine(verdictRange + " " + rangeKey(old, new))
 }
 
-// markWalked accumulates n examined commits for the following hook
-// processes of the same push; a zero count records nothing.
+// markWalked folds n examined commits into the cumulative counter and
+// compacts the state file in place, so the file always carries at most ONE
+// walked line: appending one record per walk would grow the file once per
+// nonzero-walk ref and make every later hook re-parse all of them — the
+// same per-ref-free-record quadratic the okrange fix closed (Codex rounds
+// 5 + 6). A zero count records nothing.
 func (st *verifyState) markWalked(n int64) error {
 	assertf(n >= 0, "markWalked(%d)", n)
 	if n == 0 {
 		return nil
 	}
-	return st.appendLine(verdictWalked + " " + strconv.FormatInt(n, 10))
+	st.walked += n
+	if st.path == "" {
+		return nil
+	}
+	return st.rewrite()
+}
+
+// rewrite atomically replaces the state file with a compact rendering of
+// the in-memory state (write temp + rename). Hooks run strictly
+// sequentially within one push, so there is no concurrent reader to tear;
+// the ok/deny/okrange classes are bounded by the spawn budget, so one
+// rewrite costs O(budget) — the same order as the load every hook already
+// performs.
+func (st *verifyState) rewrite() error {
+	assertf(st.path != "", "verifyState.rewrite without a state file")
+	assertf(st.spent == len(st.ok)+len(st.deny), "verifyState.rewrite: spent %d != ok %d + deny %d", st.spent, len(st.ok), len(st.deny))
+	var b strings.Builder
+	for sha := range st.ok {
+		b.WriteString(verdictOK + " " + sha + "\n")
+	}
+	for sha, reason := range st.deny {
+		b.WriteString(verdictDeny + " " + sha + " " + reason + "\n")
+	}
+	for key := range st.ranges {
+		b.WriteString(verdictRange + " " + key + "\n")
+	}
+	if st.walked > 0 {
+		b.WriteString(verdictWalked + " " + strconv.FormatInt(st.walked, 10) + "\n")
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(st.path), ".codestorage-verify-sig-*")
+	if err != nil {
+		return fmt.Errorf("rewrite verify state: %w", err)
+	}
+	if _, err := tmp.WriteString(b.String()); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmp.Name())
+		return fmt.Errorf("rewrite verify state: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmp.Name())
+		return fmt.Errorf("rewrite verify state: %w", err)
+	}
+	if err := os.Rename(tmp.Name(), st.path); err != nil {
+		_ = os.Remove(tmp.Name())
+		return fmt.Errorf("rewrite verify state: %w", err)
+	}
+	return nil
 }
 
 // walkBudget derives the traversal bound from the verification budget,

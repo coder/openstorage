@@ -326,11 +326,40 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 		httpError(w, http.StatusNotFound, "repository not found")
 		return
 	}
-	body := io.Reader(r.Body)
-	// git clients gzip large request bodies.
+	// Decoded-byte ingress cap (issue #55, pushcap.go): bound the bytes a
+	// push may stream into git BEFORE receive-pack quarantines them on
+	// disk. Gzip pushes are bounded on BOTH sides of the decoder — the
+	// compressed wire stream (wireCap; empty gzip members decode to
+	// nothing, so the decoded counter alone cannot bound wire consumption)
+	// and the decoded stream (pushCap, which a gzip bomb inflates past).
+	// The decoded counter sits under the atomic sniffer below, so the teed
+	// prefix is counted exactly once. upload-pack requests carry small
+	// negotiation bodies and stay uncapped (out of #55's scope).
+	capped := service == "receive-pack" && s.MaxPushBytes > 0
 	gzipped := r.Header.Get("Content-Encoding") == "gzip"
+	// A body that declares a size past its bound is rejected before
+	// reading a single byte: the decoded cap for plain bodies, the
+	// slack-padded wire limit for gzip ones (whose decoded size the
+	// Content-Length does not bound).
+	if capped {
+		limit := s.MaxPushBytes
+		if gzipped {
+			limit = wirePushLimit(s.MaxPushBytes)
+		}
+		if r.ContentLength > limit {
+			httpError(w, http.StatusRequestEntityTooLarge, pushTooLargeMsg(s.MaxPushBytes))
+			return
+		}
+	}
+	body := io.Reader(r.Body)
+	var wireCap *cappedReader
 	if gzipped {
-		gz, err := gzip.NewReader(r.Body)
+		wire := io.Reader(r.Body)
+		if capped {
+			wireCap = newCappedReader(wire, wirePushLimit(s.MaxPushBytes))
+			wire = wireCap
+		}
+		gz, err := gzip.NewReader(wire)
 		if err != nil {
 			httpError(w, http.StatusBadRequest, "bad gzip body: "+err.Error())
 			return
@@ -338,22 +367,15 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 		defer gz.Close()
 		body = gz
 	}
-	// Decoded-byte ingress cap (issue #55, pushcap.go): bound the bytes a
-	// push may stream into git BEFORE receive-pack quarantines them on
-	// disk. The counter sits under the atomic sniffer below, so the teed
-	// prefix is counted exactly once. upload-pack requests carry small
-	// negotiation bodies and stay uncapped (out of #55's scope).
 	var pushCap *cappedReader
-	if service == "receive-pack" && s.MaxPushBytes > 0 {
-		// A non-gzip body declares its decoded size up front: reject
-		// before reading a single byte. Gzip bodies declare only the
-		// compressed size, which cannot strictly bound the decoded one.
-		if !gzipped && r.ContentLength > s.MaxPushBytes {
-			httpError(w, http.StatusRequestEntityTooLarge, pushTooLargeMsg(s.MaxPushBytes))
-			return
-		}
+	if capped {
 		pushCap = newCappedReader(body, s.MaxPushBytes)
 		body = pushCap
+	}
+	// pushOverflowed reports whether either counter has tripped; the wire
+	// counter surfaces through gzip reads, so both must be consulted.
+	pushOverflowed := func() bool {
+		return (pushCap != nil && pushCap.exceeded) || (wireCap != nil && wireCap.exceeded)
 	}
 	// Atomic-capability sniff (issue #28, atomic.go): the wire request is
 	// the only place the server can learn a push is `--atomic` (githooks(5)
@@ -365,7 +387,7 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 		// Overflow during the sniff (cap below the command-list prefix):
 		// reject before hydrate or git ever run. The sniffer's non-atomic
 		// verdict on the failed read is irrelevant — the push dies here.
-		if pushCap != nil && pushCap.exceeded {
+		if pushOverflowed() {
 			httpError(w, http.StatusRequestEntityTooLarge, pushTooLargeMsg(s.MaxPushBytes))
 			return
 		}
@@ -477,7 +499,7 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 
 	w.Header().Set("Content-Type", "application/x-git-"+service+"-result")
 	w.Header().Set("Cache-Control", "no-cache")
-	if pushCap != nil {
+	if capped {
 		// Capped receive path (issue #55): own the stdin copy so overflow
 		// stays observable, and gate stdout so the response can still
 		// become a 413 until the body has fully arrived under the cap
@@ -504,8 +526,8 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 			log.Printf("%s %s: request body: %v", service, repo, err)
 		}
 		_ = stdin.Close()
-		// Overflow is fully decided the moment the copy ends (the counter
-		// only trips while feeding git), so settle the gate BEFORE waiting:
+		// Overflow is fully decided the moment the copy ends (the counters
+		// only trip while feeding git), so settle the gate BEFORE waiting:
 		// hook-phase output — sideband progress and keepalives during
 		// pre-receive/update hooks that can legitimately run for minutes —
 		// must stream live on the within-cap path, not buffer until exit
@@ -513,7 +535,7 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 		// status, which CANNOT discriminate anything here: receive-pack
 		// reports a truncated-pack unpack failure as a normal
 		// report-status response and exits 0.
-		overflow := pushCap.exceeded
+		overflow := pushOverflowed()
 		if err := gate.settle(overflow); err != nil {
 			log.Printf("%s %s: response: %v", service, repo, err)
 		}

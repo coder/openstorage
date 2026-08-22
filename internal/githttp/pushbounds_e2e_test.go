@@ -236,6 +236,23 @@ func TestPushCap_RawRequests(t *testing.T) {
 		assertCapEnvelope(t, status, body)
 	})
 
+	t.Run("gzip-empty-member-flood", func(t *testing.T) {
+		// Concatenated EMPTY gzip members decode to nothing, so the
+		// decoded counter never advances — only the compressed-side wire
+		// counter can stop the stream (Codex round 6). Chunked, so no
+		// Content-Length fast path either.
+		var one bytes.Buffer
+		zw := gzip.NewWriter(&one)
+		if err := zw.Close(); err != nil {
+			t.Fatal(err)
+		}
+		member := one.Bytes()
+		flood := bytes.Repeat(member, 3*testPushCap/len(member))
+		status, body := postReceivePack(t, node, repo, token,
+			io.MultiReader(bytes.NewReader(flood)), true)
+		assertCapEnvelope(t, status, body)
+	})
+
 	t.Run("gzip-bomb", func(t *testing.T) {
 		// ~16 MiB decoded, a few KiB compressed: the compressed size passes
 		// any transport-level check, so only the post-gzip decoded counter

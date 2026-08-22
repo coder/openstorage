@@ -29,6 +29,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"sync"
 )
 
@@ -43,6 +44,23 @@ var errPushTooLarge = errors.New("push body exceeds the decoded-byte cap")
 func pushTooLargeMsg(limit int64) string {
 	assertf(limit > 0, "pushTooLargeMsg(%d)", limit)
 	return fmt.Sprintf("push body exceeds the server's decoded push-size cap of %d bytes (CODESTORAGE_MAX_PUSH_BYTES)", limit)
+}
+
+// wirePushLimit bounds the COMPRESSED stream of a gzip push whose decoded
+// cap is limit. The decoded counter alone cannot bound wire consumption:
+// concatenated empty gzip members decode to nothing, so a client could
+// stream unbounded compressed bytes without ever advancing the decoded
+// count (Codex round 6). A legitimate gzip body is at most marginally
+// larger than its decoded form — stored-mode deflate costs 5 bytes per
+// 64 KiB block plus constant member framing — so limit plus ~1.6% plus a
+// constant never rejects anything the decoded cap would admit. Saturating.
+func wirePushLimit(limit int64) int64 {
+	assertf(limit > 0, "wirePushLimit(%d)", limit)
+	slack := limit/64 + 1024
+	if limit > math.MaxInt64-slack {
+		return math.MaxInt64
+	}
+	return limit + slack
 }
 
 // cappedReader passes through at most limit bytes and fails with

@@ -131,9 +131,12 @@ func TestVerifyState_DenyReasonNormalizedToOneLine(t *testing.T) {
 }
 
 func TestVerifyState_WalkedAccountingRoundTrip(t *testing.T) {
-	newStateFile(t)
+	path := newStateFile(t)
 	st, err := openVerifyState()
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.markCommitOK(shaA); err != nil {
 		t.Fatal(err)
 	}
 	if err := st.markWalked(0); err != nil {
@@ -151,6 +154,19 @@ func TestVerifyState_WalkedAccountingRoundTrip(t *testing.T) {
 	}
 	if st2.walked != 42 {
 		t.Fatalf("walked = %d, want 42 accumulated across loads", st2.walked)
+	}
+	if !st2.ok[shaA] || st2.spent != 1 {
+		t.Fatalf("ok=%v spent=%d, want the verdict to survive walked compaction", st2.ok[shaA], st2.spent)
+	}
+	// Compaction invariant (Codex rounds 5+6): however many walks, the
+	// file carries at most ONE walked line, so per-hook reload cost stays
+	// bounded by the spawn budget, not the ref count.
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Count(string(data), verdictWalked+" "); got != 1 {
+		t.Fatalf("state file has %d walked lines, want exactly 1 (compacted):\n%s", got, data)
 	}
 }
 

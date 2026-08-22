@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"errors"
 	"io"
+	"math"
 	"strings"
 	"testing"
 )
@@ -86,6 +87,18 @@ func TestCappedReader_OverflowDuringSniff(t *testing.T) {
 	_, _ = sniffAtomicPush(c)
 	if !c.exceeded {
 		t.Fatal("sniffing past the cap did not set exceeded")
+	}
+}
+
+func TestWirePushLimit(t *testing.T) {
+	// The slack must admit any legitimate gzip encoding of a cap-sized
+	// body (stored-mode deflate ≈ +0.008% + constant framing) without
+	// materially extending the wire bound.
+	if got := wirePushLimit(1 << 20); got != (1<<20)+(1<<20)/64+1024 {
+		t.Fatalf("wirePushLimit(1MiB) = %d", got)
+	}
+	if got := wirePushLimit(math.MaxInt64 - 5); got != math.MaxInt64 {
+		t.Fatalf("huge cap = %d, want MaxInt64 saturation", got)
 	}
 }
 
