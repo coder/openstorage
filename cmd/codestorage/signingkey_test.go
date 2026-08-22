@@ -137,6 +137,10 @@ func (failingStore) CreateGitCredential(context.Context, meta.GitCredential) (me
 	panic("not used by signing-key CLI")
 }
 
+func (failingStore) GitCredentialMeta(context.Context, string) (meta.GitCredential, error) {
+	panic("not used by signing-key CLI")
+}
+
 func (failingStore) GetGitCredential(context.Context, string) (meta.GitCredential, error) {
 	panic("not used by signing-key CLI")
 }

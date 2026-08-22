@@ -18,9 +18,9 @@ import (
 )
 
 // Webhook is one registered delivery endpoint (docs/06). Secret is the HMAC
-// signing key, stored plaintext because every delivery signs with it
-// (ADR: at-rest secret encryption is out of scope for phase 5). Never log
-// Secret.
+// signing key — plaintext at this interface; at rest it is stored plaintext
+// by default and envelope-encrypted when the store carries a secrets codec
+// (issue #54, CODESTORAGE_SECRETS_KEY; see secrets.go). Never log Secret.
 type Webhook struct {
 	ID        string // server-generated "wh_<16 hex>"
 	OrgID     int64
@@ -30,8 +30,9 @@ type Webhook struct {
 }
 
 // GitCredential is one stored HTTPS credential for a repo's git upstream
-// (docs/03 "Git credentials"). Password is stored verbatim (plaintext ADR,
-// as for Webhook.Secret) and must never be logged.
+// (docs/03 "Git credentials"). Password is plaintext at this interface and
+// gets the same optional at-rest envelope encryption as Webhook.Secret;
+// it must never be logged.
 type GitCredential struct {
 	ID        string // server-generated "ggc_<16 hex>"
 	RepoID    string
@@ -74,7 +75,13 @@ type EventingStore interface {
 	// ErrNotFound when the org is unknown.
 	CreateWebhook(ctx context.Context, org, url, secret string) (Webhook, error)
 	// ListWebhooks returns the org's webhooks in registration order.
-	// ErrNotFound when the org is unknown.
+	// ErrNotFound when the org is unknown. ListWebhooks is an enumeration
+	// surface: a row whose stored secret cannot be decrypted (issue #54)
+	// is returned with Secret == "" rather than failing the listing, so
+	// event fan-out and the list API (which never expose secrets) keep
+	// working and the bad row's ID stays discoverable for deletion.
+	// Consumers that need the secret must use GetWebhook, which fails
+	// closed per webhook.
 	ListWebhooks(ctx context.Context, org string) ([]Webhook, error)
 	// GetWebhook returns the webhook with the given ID regardless of org
 	// (delivery jobs carry only the ID); ErrNotFound when absent.
@@ -89,6 +96,13 @@ type EventingStore interface {
 	CreateGitCredential(ctx context.Context, cred GitCredential) (GitCredential, error)
 	// GetGitCredential returns the credential by ID; ErrNotFound when absent.
 	GetGitCredential(ctx context.Context, id string) (GitCredential, error)
+	// GitCredentialMeta returns the credential row with Password always ""
+	// — the password column is never read, so this works even when the
+	// stored envelope can no longer be decrypted (issue #54). Ownership
+	// prechecks for update/delete use it so operators can always replace or
+	// remove a credential whose key was retired prematurely or whose row is
+	// corrupt. ErrNotFound when absent.
+	GitCredentialMeta(ctx context.Context, id string) (GitCredential, error)
 	// UpdateGitCredential replaces username/password; ErrNotFound when absent.
 	UpdateGitCredential(ctx context.Context, id, username, password string) (GitCredential, error)
 	// DeleteGitCredential removes the credential; ErrNotFound when absent.

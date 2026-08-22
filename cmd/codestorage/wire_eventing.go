@@ -256,8 +256,20 @@ func wireHookEventing(ctx context.Context, logger *slog.Logger) func() {
 		}
 	}
 
+	// Secrets codec (issue #54): hook subprocesses inherit serve's
+	// environment, so a serve process that booted with a valid
+	// CODESTORAGE_SECRETS_KEY hands the same value down here. A malformed
+	// value (possible only for direct hook invocation outside serve, which
+	// validates at boot) degrades to eventless — fail closed for secrets:
+	// no delivery ever signs with a wrong or plaintext-passthrough key.
+	secretsCodec, err := resolveSecretsCodec(os.Getenv)
+	if err != nil {
+		logger.Error("hook eventing disabled: secrets key", "err", err)
+		return func() {}
+	}
+
 	// Hooks never run DDL: meta.Open without InitSchema (serve owns it).
-	ms, err := meta.Open(ctx, dbURL)
+	ms, err := meta.Open(ctx, dbURL, meta.WithSecretsCodec(secretsCodec))
 	if err != nil {
 		// Fail open (eventless) rather than denying the push: the ref
 		// store open below would fail too if the DB were truly down.

@@ -12,6 +12,8 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"codestorage/internal/secrets"
 )
 
 // assertf is a fail-fast invariant check (crash-and-burn style).
@@ -35,12 +37,15 @@ const (
 // PG implements Backend on Postgres.
 type PG struct {
 	pool *pgxpool.Pool
+	// codec, when non-nil, envelope-encrypts the secret columns
+	// (webhooks.secret, git_credentials.password) — see secrets.go.
+	codec *secrets.Codec
 }
 
 var _ Backend = (*PG)(nil)
 
 // OpenPG connects to pgURL and pings the database.
-func OpenPG(ctx context.Context, pgURL string) (*PG, error) {
+func OpenPG(ctx context.Context, pgURL string, opts ...Option) (*PG, error) {
 	assertf(pgURL != "", "OpenPG: empty PG URL")
 	pool, err := pgxpool.New(ctx, pgURL)
 	if err != nil {
@@ -50,7 +55,7 @@ func OpenPG(ctx context.Context, pgURL string) (*PG, error) {
 		pool.Close()
 		return nil, fmt.Errorf("pg ping: %w", err)
 	}
-	return &PG{pool: pool}, nil
+	return &PG{pool: pool, codec: resolveOptions(opts).codec}, nil
 }
 
 func (s *PG) Close() { s.pool.Close() }

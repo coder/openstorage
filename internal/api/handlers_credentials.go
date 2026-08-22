@@ -157,6 +157,9 @@ func (s *syncServer) handleCreateCredential(w http.ResponseWriter, r *http.Reque
 	case errors.Is(err, upsync.ErrCredentialExists):
 		writeErr(w, http.StatusConflict, "credential already exists")
 		return
+	case errors.Is(err, meta.ErrReservedSecret):
+		writeErr(w, http.StatusBadRequest, "invalid password: "+meta.ErrReservedSecret.Error())
+		return
 	case err != nil:
 		s.internalErr(w, r, "create credential", err)
 		return
@@ -171,11 +174,14 @@ type gcredUpdateRequest struct {
 	Password string `json:"password"`
 }
 
-// gcredForOrg loads the credential and enforces org ownership: an ID owned
-// by another org (or pointing at a soft-deleted repo) answers 404, exactly
-// like a missing one — no cross-org existence oracle.
+// gcredForOrg loads the credential's password-free metadata and enforces
+// org ownership: an ID owned by another org (or pointing at a soft-deleted
+// repo) answers 404, exactly like a missing one — no cross-org existence
+// oracle. The returned Credential carries an empty Password on purpose:
+// update/delete prechecks must not decrypt the stored value, or a row under
+// a prematurely retired key could never be replaced or removed (issue #54).
 func (s *syncServer) gcredForOrg(w http.ResponseWriter, r *http.Request, org, id string) (upsync.Credential, bool) {
-	cred, err := s.creds.GetCredential(r.Context(), id)
+	cred, err := s.creds.CredentialMeta(r.Context(), id)
 	switch {
 	case errors.Is(err, upsync.ErrNotFound):
 		writeErr(w, http.StatusNotFound, "credential not found")
@@ -220,6 +226,9 @@ func (s *syncServer) handleUpdateCredential(w http.ResponseWriter, r *http.Reque
 	case errors.Is(err, upsync.ErrNotFound):
 		// Deleted between the ownership check and the update.
 		writeErr(w, http.StatusNotFound, "credential not found")
+		return
+	case errors.Is(err, meta.ErrReservedSecret):
+		writeErr(w, http.StatusBadRequest, "invalid password: "+meta.ErrReservedSecret.Error())
 		return
 	case err != nil:
 		s.internalErr(w, r, "update credential", err)
@@ -321,7 +330,10 @@ func (s *syncServer) gcredByPath(w http.ResponseWriter, r *http.Request) (upsync
 		return upsync.Credential{}, false
 	}
 
-	cred, err := s.creds.GetCredential(r.Context(), credID)
+	// Password-free metadata on purpose, mirroring gcredForOrg: the alias
+	// PUT/DELETE recovery paths must work on rows whose envelope can no
+	// longer be decrypted (issue #54).
+	cred, err := s.creds.CredentialMeta(r.Context(), credID)
 	switch {
 	case errors.Is(err, upsync.ErrNotFound):
 		aliasFail(w, routeWrite, http.StatusNotFound, "credential not found")
@@ -377,6 +389,9 @@ func (s *syncServer) handleUpdateCredentialByPath(w http.ResponseWriter, r *http
 	case errors.Is(err, upsync.ErrNotFound):
 		// Deleted between the path resolution and the update.
 		aliasFail(w, routeWrite, http.StatusNotFound, "credential not found")
+		return
+	case errors.Is(err, meta.ErrReservedSecret):
+		aliasFail(w, routeWrite, http.StatusBadRequest, "invalid password: "+meta.ErrReservedSecret.Error())
 		return
 	case err != nil:
 		s.internalErrResult(w, r, "update credential", err)

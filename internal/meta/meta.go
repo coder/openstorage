@@ -162,8 +162,9 @@ type Backend interface {
 //	sqlite:///abs/path/db.sqlite  → pure-Go SQLite store
 //
 // Open never runs InitSchema: hooks reconstruct stores from env URLs and
-// must not run DDL — the serve/wire seam owns schema init.
-func Open(ctx context.Context, dbURL string) (Backend, error) {
+// must not run DDL — the serve/wire seam owns schema init. Options
+// (WithSecretsCodec) apply to either backend.
+func Open(ctx context.Context, dbURL string, opts ...Option) (Backend, error) {
 	assertf(dbURL != "", "Open: empty metadata store URL")
 	u, err := url.Parse(dbURL)
 	if err != nil {
@@ -171,9 +172,9 @@ func Open(ctx context.Context, dbURL string) (Backend, error) {
 	}
 	switch u.Scheme {
 	case "postgres", "postgresql":
-		return OpenPG(ctx, dbURL)
+		return OpenPG(ctx, dbURL, opts...)
 	case "sqlite":
-		return OpenSQLite(ctx, dbURL)
+		return OpenSQLite(ctx, dbURL, opts...)
 	default:
 		return nil, fmt.Errorf("metadata store URL scheme %q unsupported (want postgres, postgresql, or sqlite)", u.Scheme)
 	}

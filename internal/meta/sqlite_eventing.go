@@ -61,10 +61,46 @@ func scanRepoUpstreamSQLite(row sqlRow) (RepoUpstream, error) {
 	return up, nil
 }
 
+// decryptWebhookSQLite mirrors PG.decryptWebhook (see pg_eventing.go for
+// the CAS-rewrite rationale).
+func (s *SQLite) decryptWebhookSQLite(ctx context.Context, w *Webhook) error {
+	pt, rewrite, err := decodeSecret(s.codec, w.Secret, fmt.Sprintf("webhook %q secret", w.ID))
+	if err != nil {
+		return err
+	}
+	if rewrite {
+		_, _ = s.db.ExecContext(ctx,
+			`UPDATE webhooks SET secret = ? WHERE id = ? AND secret = ?`,
+			s.codec.Encrypt(pt), w.ID, w.Secret)
+	}
+	w.Secret = pt
+	return nil
+}
+
+// decryptGitCredentialSQLite mirrors PG.decryptGitCredential.
+func (s *SQLite) decryptGitCredentialSQLite(ctx context.Context, c *GitCredential) error {
+	pt, rewrite, err := decodeSecret(s.codec, c.Password, fmt.Sprintf("credential %q password", c.ID))
+	if err != nil {
+		return err
+	}
+	if rewrite {
+		_, _ = s.db.ExecContext(ctx,
+			`UPDATE git_credentials SET password = ? WHERE id = ? AND password = ?`,
+			s.codec.Encrypt(pt), c.ID, c.Password)
+	}
+	c.Password = pt
+	return nil
+}
+
 // CreateWebhook inserts a webhook with a server-generated ID.
-// ErrNotFound when the org is unknown.
+// ErrNotFound when the org is unknown; ErrReservedSecret when the secret
+// starts with the reserved envelope prefix.
 func (s *SQLite) CreateWebhook(ctx context.Context, org, url, secret string) (Webhook, error) {
 	assertf(url != "", "CreateWebhook: empty url for org %q", org)
+	stored, err := encodeSecret(s.codec, secret)
+	if err != nil {
+		return Webhook{}, fmt.Errorf("create webhook for org %q: %w", org, err)
+	}
 	orgID, err := s.lookupOrgID(ctx, org)
 	if err != nil {
 		return Webhook{}, err
@@ -73,7 +109,7 @@ func (s *SQLite) CreateWebhook(ctx context.Context, org, url, secret string) (We
 	w := Webhook{ID: NewEventingID("wh"), OrgID: orgID, URL: url, Secret: secret, CreatedAt: createdAt}
 	if _, err := s.db.ExecContext(ctx,
 		`INSERT INTO webhooks (id, org_id, url, secret, created_at) VALUES (?, ?, ?, ?, ?)`,
-		w.ID, orgID, url, secret, nanos); err != nil {
+		w.ID, orgID, url, stored, nanos); err != nil {
 		return Webhook{}, fmt.Errorf("create webhook for org %q: %w", org, err)
 	}
 	return w, nil
@@ -100,7 +136,18 @@ func (s *SQLite) ListWebhooks(ctx context.Context, org string) ([]Webhook, error
 		}
 		hooks = append(hooks, w)
 	}
-	return hooks, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	_ = rows.Close() // release the connection before the rewrite UPDATEs
+	for i := range hooks {
+		if err := s.decryptWebhookSQLite(ctx, &hooks[i]); err != nil {
+			// Degrade the bad row to an empty secret instead of failing
+			// the whole listing — see PG.ListWebhooks for the rationale.
+			hooks[i].Secret = ""
+		}
+	}
+	return hooks, nil
 }
 
 // GetWebhook returns the webhook with the given ID regardless of org
@@ -114,6 +161,9 @@ func (s *SQLite) GetWebhook(ctx context.Context, id string) (Webhook, error) {
 	}
 	if err != nil {
 		return Webhook{}, fmt.Errorf("get webhook %q: %w", id, err)
+	}
+	if err := s.decryptWebhookSQLite(ctx, &w); err != nil {
+		return Webhook{}, err
 	}
 	return w, nil
 }
@@ -143,15 +193,20 @@ func (s *SQLite) DeleteWebhook(ctx context.Context, org, id string) error {
 }
 
 // CreateGitCredential stores cred (ID/CreatedAt assigned by the store).
-// ErrAlreadyExists when the repo already has a credential.
+// ErrAlreadyExists when the repo already has a credential; ErrReservedSecret
+// when the password starts with the reserved envelope prefix.
 func (s *SQLite) CreateGitCredential(ctx context.Context, cred GitCredential) (GitCredential, error) {
 	assertf(cred.RepoID != "", "CreateGitCredential: empty repo id")
+	stored, err := encodeSecret(s.codec, cred.Password)
+	if err != nil {
+		return GitCredential{}, fmt.Errorf("create credential for repo %q: %w", cred.RepoID, err)
+	}
 	nanos, createdAt := nowNano()
 	cred.ID = NewEventingID("ggc")
 	cred.CreatedAt = createdAt
-	_, err := s.db.ExecContext(ctx,
+	_, err = s.db.ExecContext(ctx,
 		`INSERT INTO git_credentials (id, repo_id, username, password, created_at) VALUES (?, ?, ?, ?, ?)`,
-		cred.ID, cred.RepoID, cred.Username, cred.Password, nanos)
+		cred.ID, cred.RepoID, cred.Username, stored, nanos)
 	// A unique violation here can only be repo_id: an id collision would be
 	// SQLITE_CONSTRAINT_PRIMARYKEY, a different extended code.
 	if isUniqueViolation(err) {
@@ -174,17 +229,46 @@ func (s *SQLite) GetGitCredential(ctx context.Context, id string) (GitCredential
 	if err != nil {
 		return GitCredential{}, fmt.Errorf("get credential %q: %w", id, err)
 	}
+	if err := s.decryptGitCredentialSQLite(ctx, &c); err != nil {
+		return GitCredential{}, err
+	}
 	return c, nil
 }
 
-// UpdateGitCredential replaces username/password; ErrNotFound when absent.
+// GitCredentialMeta returns the row with Password "" (the password column
+// is never read — see the interface comment: recovery for undecryptable
+// rows). ErrNotFound when absent.
+func (s *SQLite) GitCredentialMeta(ctx context.Context, id string) (GitCredential, error) {
+	assertf(id != "", "GitCredentialMeta: empty id")
+	var c GitCredential
+	var createdAt int64
+	err := s.db.QueryRowContext(ctx,
+		`SELECT id, repo_id, username, created_at FROM git_credentials WHERE id = ?`, id).
+		Scan(&c.ID, &c.RepoID, &c.Username, &createdAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return GitCredential{}, fmt.Errorf("credential %q: %w", id, ErrNotFound)
+	}
+	if err != nil {
+		return GitCredential{}, fmt.Errorf("get credential meta %q: %w", id, err)
+	}
+	c.CreatedAt = time.Unix(0, createdAt).UTC()
+	return c, nil
+}
+
+// UpdateGitCredential replaces username/password; ErrNotFound when absent;
+// ErrReservedSecret when the password starts with the reserved envelope
+// prefix.
 func (s *SQLite) UpdateGitCredential(ctx context.Context, id, username, password string) (GitCredential, error) {
 	assertf(id != "", "UpdateGitCredential: empty id")
+	stored, err := encodeSecret(s.codec, password)
+	if err != nil {
+		return GitCredential{}, fmt.Errorf("update credential %q: %w", id, err)
+	}
 	var cred GitCredential
-	err := s.inTx(ctx, func(tx *sql.Tx) error {
+	err = s.inTx(ctx, func(tx *sql.Tx) error {
 		res, err := tx.ExecContext(ctx,
 			`UPDATE git_credentials SET username = ?, password = ? WHERE id = ?`,
-			username, password, id)
+			username, stored, id)
 		if err != nil {
 			return err
 		}
@@ -207,6 +291,9 @@ func (s *SQLite) UpdateGitCredential(ctx context.Context, id, username, password
 	if err != nil {
 		return GitCredential{}, fmt.Errorf("update credential %q: %w", id, err)
 	}
+	// The re-read carries the stored form we just wrote; hand the caller
+	// its plaintext back (interface contract: plaintext in, plaintext out).
+	cred.Password = password
 	return cred, nil
 }
 
@@ -239,6 +326,9 @@ func (s *SQLite) GitCredentialForRepo(ctx context.Context, repoID string) (GitCr
 	}
 	if err != nil {
 		return GitCredential{}, fmt.Errorf("get credential for repo %q: %w", repoID, err)
+	}
+	if err := s.decryptGitCredentialSQLite(ctx, &c); err != nil {
+		return GitCredential{}, err
 	}
 	return c, nil
 }

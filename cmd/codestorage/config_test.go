@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/pem"
 	"os"
 	"path/filepath"
@@ -819,6 +820,54 @@ func TestResolveWebhookAllowPrivate(t *testing.T) {
 			}
 			if got != tc.want {
 				t.Fatalf("resolveWebhookAllowPrivate(%q) = %v, want %v", tc.raw, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestResolveSecretsCodec(t *testing.T) {
+	// 32 zero bytes, base64 — a syntactically valid AES-256 key.
+	validKey := base64.StdEncoding.EncodeToString(make([]byte, 32))
+
+	for name, tc := range map[string]struct {
+		key, mode       string
+		wantNil         bool
+		wantDecryptOnly bool
+		wantErrNaming   string // env var an error must name; "" = no error
+	}{
+		"unset disables":            {wantNil: true},
+		"valid key encrypts":        {key: validKey},
+		"explicit encrypt mode":     {key: validKey, mode: "encrypt"},
+		"decrypt-only staging":      {key: validKey, mode: "decrypt-only", wantDecryptOnly: true},
+		"malformed key":             {key: "not-base64!!!", wantErrNaming: envSecretsKey},
+		"short key":                 {key: base64.StdEncoding.EncodeToString(make([]byte, 16)), wantErrNaming: envSecretsKey},
+		"unknown mode":              {key: validKey, mode: "sideways", wantErrNaming: envSecretsMode},
+		"decrypt-only without key":  {mode: "decrypt-only", wantErrNaming: envSecretsMode},
+		"mode alone still rejected": {mode: "encrypt", wantNil: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			codec, err := resolveSecretsCodec(mapEnv(map[string]string{envSecretsKey: tc.key, envSecretsMode: tc.mode}))
+			if tc.wantErrNaming != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErrNaming) {
+					t.Fatalf("error = %v, want one naming %s", err, tc.wantErrNaming)
+				}
+				if tc.key == validKey {
+					return
+				}
+				// Key-list errors must never echo the key entry itself.
+				if tc.key != "" && strings.Contains(err.Error(), tc.key) {
+					t.Fatalf("error %q echoes the key entry", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if (codec == nil) != tc.wantNil {
+				t.Fatalf("codec nil = %v, want %v", codec == nil, tc.wantNil)
+			}
+			if codec != nil && codec.DecryptOnly != tc.wantDecryptOnly {
+				t.Fatalf("DecryptOnly = %v, want %v", codec.DecryptOnly, tc.wantDecryptOnly)
 			}
 		})
 	}

@@ -90,6 +90,10 @@ func (f failingStore) GetGitCredential(context.Context, string) (meta.GitCredent
 	return meta.GitCredential{}, f.err
 }
 
+func (f failingStore) GitCredentialMeta(context.Context, string) (meta.GitCredential, error) {
+	return meta.GitCredential{}, f.err
+}
+
 func (f failingStore) UpdateGitCredential(context.Context, string, string, string) (meta.GitCredential, error) {
 	return meta.GitCredential{}, f.err
 }
