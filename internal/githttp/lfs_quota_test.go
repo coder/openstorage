@@ -556,6 +556,47 @@ func TestLFSQuota_ObjectCountCap(t *testing.T) {
 	}
 }
 
+// staleCountStore simulates the concurrent burst at the cap (Codex round
+// 9): the fast pre-check reads a stale count (0), so the upload publishes
+// and only the ledger's atomic in-transaction cap denies it.
+type staleCountStore struct {
+	ref.Store
+}
+
+func (s staleCountStore) CountLFSObjects(context.Context, string) (int64, error) { return 0, nil }
+
+// TestLFSQuota_AtomicCapLoserLeavesNoBlob (Codex round 9): an upload denied
+// by the ATOMIC cap (after the fast check passed on a stale count) must
+// remove its just-published blob — DeleteLFS defaults off, so a stranded
+// orphan would permanently consume quota per cap loser.
+func TestLFSQuota_AtomicCapLoserLeavesNoBlob(t *testing.T) {
+	old := ref.MaxLFSObjectsPerRepo
+	ref.MaxLFSObjectsPerRepo = 1
+	t.Cleanup(func() { ref.MaxLFSObjectsPerRepo = old })
+	srv, st, mint := newLFSQuotaServer(t, 0, time.Hour)
+	tok := mint(auth.ScopeGitWrite)
+	// The repo is at cap, but the fast pre-check sees a stale count.
+	if err := st.RegisterLFSObject(context.Background(), lfsTestRepoID,
+		blob.LFSKey(lfsTestRepoID, strings.Repeat("aa", 32)), 10); err != nil {
+		t.Fatal(err)
+	}
+	srv.Store = staleCountStore{Store: st}
+
+	content := []byte("the cap race loser")
+	oid := sha256Hex(content)
+	w := doLFS(t, srv, http.MethodPut, "/"+lfsTestRepoURL+".git/info/lfs/objects/"+oid,
+		"basic:"+tok, string(content))
+	if w.Code != http.StatusInsufficientStorage {
+		t.Fatalf("atomic-cap loser status = %d, body %s (want 507)", w.Code, w.Body)
+	}
+	if _, err := srv.Blob.Stat(context.Background(), blob.LFSKey(lfsTestRepoID, oid)); err == nil {
+		t.Fatal("atomic-cap loser left its blob published")
+	}
+	if has, err := st.HasLFSObject(context.Background(), lfsTestRepoID, blob.LFSKey(lfsTestRepoID, oid)); err != nil || has {
+		t.Fatalf("atomic-cap loser left a registry row: %v, %v", has, err)
+	}
+}
+
 // TestLFSUpload_AbsoluteDeadlineBoundsDrip (Codex security round 2): a
 // client dripping one byte per idle window must still hit the ABSOLUTE
 // bound (the reservation TTL) and release its staging capacity.

@@ -889,8 +889,18 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target r
 	regErr := s.Store.RegisterLFSObject(ctx, repoID, key, n)
 	if errors.Is(regErr, ref.ErrLFSObjectCapExceeded) {
 		// The ledger's atomic cap lost the race our fast-fail pre-check
-		// won't have seen: nothing committed, so no verify is owed — the
-		// published blob is an orphan for the sweeper.
+		// won't have seen: nothing committed. Remove the just-published
+		// blob (Codex round 9: DeleteLFS defaults off, so leaving it would
+		// strand a quota-counted orphan per cap loser). Safe against
+		// concurrent same-key writers: the registered population never
+		// shrinks, so once this key's registration is cap-denied, every
+		// concurrent NEW-key registration is denied too — nothing can be
+		// pointing at these bytes. Best-effort: a failed delete only
+		// leaves what pre-fix behavior always left, an orphan for the
+		// sweeper.
+		if derr := s.Blob.Delete(ctx, key); derr != nil && !errors.Is(derr, blob.ErrNotFound) {
+			log.Printf("lfs cap-denied cleanup %s: %v", key, derr)
+		}
 		lfsError(w, http.StatusInsufficientStorage, fmt.Sprintf(
 			"repository LFS object count limit reached (limit %d)", ref.MaxLFSObjectsPerRepo))
 		return
