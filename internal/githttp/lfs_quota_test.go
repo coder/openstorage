@@ -341,6 +341,63 @@ func TestLFSUpload_SameKeyConcurrencyBounded(t *testing.T) {
 	}
 }
 
+// TestLFSUpload_NodeStagingBudget (Codex round 4): distinct-key uploads
+// stage real disk bytes, so the node-wide budget must gate them before any
+// temp file exists — an object bigger than the whole budget is permanent
+// (413), one that merely does not fit right now is transient (429), and
+// completed uploads return their reservation.
+func TestLFSUpload_NodeStagingBudget(t *testing.T) {
+	srv, _, mint := newLFSQuotaServer(t, 0, time.Hour)
+	srv.LFSStagingBytes = 40
+	tok := mint(auth.ScopeGitWrite)
+
+	// Permanently over budget: 413.
+	huge := bytes.Repeat([]byte("h"), 50)
+	w := doLFS(t, srv, http.MethodPut, "/"+lfsTestRepoURL+".git/info/lfs/objects/"+sha256Hex(huge),
+		"basic:"+tok, string(huge))
+	if w.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("over-budget PUT status = %d, want 413", w.Code)
+	}
+
+	// Park one 30-byte upload; a concurrent DISTINCT 30-byte upload no
+	// longer fits the 40-byte budget: 429.
+	first := bytes.Repeat([]byte("a"), 30)
+	second := bytes.Repeat([]byte("b"), 30)
+	pr, pw := io.Pipe()
+	req := httptest.NewRequest(http.MethodPut,
+		"/"+lfsTestRepoURL+".git/info/lfs/objects/"+sha256Hex(first), pr)
+	req.ContentLength = int64(len(first))
+	req.SetBasicAuth("t", tok)
+	rec := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() { defer close(done); srv.Handler().ServeHTTP(rec, req) }()
+	if _, err := pw.Write(first[:4]); err != nil { // parked holding 30 bytes
+		t.Fatal(err)
+	}
+	w = doLFS(t, srv, http.MethodPut, "/"+lfsTestRepoURL+".git/info/lfs/objects/"+sha256Hex(second),
+		"basic:"+tok, string(second))
+	if w.Code != http.StatusTooManyRequests || w.Header().Get("Retry-After") == "" {
+		t.Fatalf("budget-exhausted PUT = %d (Retry-After %q), want 429 with Retry-After", w.Code, w.Header().Get("Retry-After"))
+	}
+
+	// The winner finishes and releases its reservation; the retry fits.
+	if _, err := pw.Write(first[4:]); err != nil {
+		t.Fatal(err)
+	}
+	if err := pw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	<-done
+	if rec.Code != http.StatusOK {
+		t.Fatalf("parked PUT status = %d, body %s", rec.Code, rec.Body)
+	}
+	w = doLFS(t, srv, http.MethodPut, "/"+lfsTestRepoURL+".git/info/lfs/objects/"+sha256Hex(second),
+		"basic:"+tok, string(second))
+	if w.Code != http.StatusOK {
+		t.Fatalf("post-release PUT status = %d, body %s", w.Code, w.Body)
+	}
+}
+
 // TestLFSQuota_NamespaceUsageRollsUpToBase: pack bytes registered under a
 // namespace member of the repo group charge the same quota LFS admission
 // uses — one token must not obtain fresh headroom per surface.

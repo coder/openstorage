@@ -25,6 +25,7 @@ never a silently-applied default.
 | [`CODESTORAGE_RATE_BURST`](#codestorage_rate_rps--codestorage_rate_burst) | unset (disabled) | Rate-limit token-bucket depth |
 | [`CODESTORAGE_TRUSTED_PROXIES`](#codestorage_trusted_proxies) | unset | CIDR allowlist of reverse proxies for rate-limit client identity |
 | [`CODESTORAGE_PACK_QUOTA_BYTES`](#codestorage_pack_quota_bytes) | 10 GiB | Per-repo storage quota, packs + LFS (`0` disables) |
+| [`CODESTORAGE_LFS_STAGING_BYTES`](#codestorage_lfs_staging_bytes) | 10 GiB | Per-replica cap on in-flight LFS upload staging (`0` disables) |
 | [`CODESTORAGE_PACK_RESERVATION_TTL`](#codestorage_pack_reservation_ttl) | `1h` | Lifetime of a crashed writer's quota reservation |
 | [`CODESTORAGE_SWEEP_INTERVAL`](#codestorage_sweep_interval) | `1h` | Orphan-pack sweep cadence (`0` disables sweeping) |
 | [`CODESTORAGE_SWEEP_AGE_THRESHOLD`](#codestorage_sweep_age_threshold) | `24h` | Minimum blob age before an unregistered pack counts as an orphan |
@@ -171,6 +172,24 @@ sizes cannot bypass the gate).
 - Background repack maintenance is **not** quota-gated (an at-quota repository could never
   compact itself otherwise), and repack preserves the registered object set — it does not
   reclaim unreachable objects. LFS downloads are never quota-gated.
+
+### `CODESTORAGE_LFS_STAGING_BYTES`
+
+Node-wide cap on the aggregate bytes of Git LFS uploads staging on one replica at a
+time. LFS uploads go through the verified proxy transfer
+([#51](https://github.com/coder/code-storage/issues/51)) and stage their full declared
+`Content-Length` under the replica's `$TMPDIR` before verification and publication —
+the per-repository quota above bounds neither the node (it is per repo) nor anything
+when disabled, so this is the replica's disk-protection bound. Uploads that do not fit
+right now answer `429` with `Retry-After`; an object larger than the whole budget
+answers `413`.
+
+- **Default:** 10 GiB (`10737418240`) — one default-quota-sized object can always
+  stage. **`0` disables the bound**; negative or malformed values are startup errors.
+- Size it below the free space you guarantee `$TMPDIR`, minus headroom for git push
+  quarantines and fork closures, which stage there too.
+- Each object additionally allows only one in-flight upload per replica (concurrent
+  identical PUTs answer `429`).
 
 ### `CODESTORAGE_PACK_RESERVATION_TTL`
 

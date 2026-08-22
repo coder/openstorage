@@ -602,6 +602,66 @@ func TestResolveServeConfigPackQuota(t *testing.T) {
 	}
 }
 
+func TestResolveServeConfigLFSStaging(t *testing.T) {
+	base := func(extra map[string]string) func(string) string {
+		env := map[string]string{
+			"CODESTORAGE_PG_URL":      "postgres://x",
+			"CODESTORAGE_S3_URL":      "s3://x",
+			"CODESTORAGE_ORG":         "org1",
+			"CODESTORAGE_ORG_PUBKEYS": "/tmp/org.pub.pem",
+		}
+		for k, v := range extra {
+			env[k] = v
+		}
+		return mapEnv(env)
+	}
+
+	t.Run("unset-applies-default", func(t *testing.T) {
+		cfg, err := resolveServeConfig(base(nil), "", "", "/tmp/cache", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.lfsStagingBytes != defaultLFSStagingBytes {
+			t.Fatalf("unset staging budget resolved to %d, want default %d", cfg.lfsStagingBytes, defaultLFSStagingBytes)
+		}
+	})
+
+	t.Run("explicit-zero-disables", func(t *testing.T) {
+		cfg, err := resolveServeConfig(base(map[string]string{envLFSStagingBytes: "0"}), "", "", "/tmp/cache", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.lfsStagingBytes != 0 {
+			t.Fatalf("explicit zero resolved to %d, want 0 (disabled)", cfg.lfsStagingBytes)
+		}
+	})
+
+	t.Run("parse-through", func(t *testing.T) {
+		cfg, err := resolveServeConfig(base(map[string]string{envLFSStagingBytes: "1048576"}), "", "", "/tmp/cache", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.lfsStagingBytes != 1<<20 {
+			t.Fatalf("resolved staging budget %d, want %d", cfg.lfsStagingBytes, 1<<20)
+		}
+	})
+
+	for _, tc := range []struct{ name, val string }{
+		{"malformed", "plenty"},
+		{"negative", "-1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := resolveServeConfig(base(map[string]string{envLFSStagingBytes: tc.val}), "", "", "/tmp/cache", "")
+			if err == nil {
+				t.Fatalf("%s=%q resolved without error", envLFSStagingBytes, tc.val)
+			}
+			if !strings.Contains(err.Error(), envLFSStagingBytes) {
+				t.Fatalf("error %q does not name %s", err, envLFSStagingBytes)
+			}
+		})
+	}
+}
+
 func TestResolveServeConfigSweep(t *testing.T) {
 	base := func(extra map[string]string) func(string) string {
 		env := map[string]string{

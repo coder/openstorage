@@ -82,6 +82,12 @@ const (
 	// (write-scoped touches adopt stored objects into the registry).
 	envSweepDeleteLFS = "CODESTORAGE_SWEEP_DELETE_LFS"
 
+	// Node-wide LFS upload staging budget (issue #51): proxy uploads
+	// stage their full Content-Length on local disk before verification,
+	// so a replica needs a disk bound independent of the per-repo quota
+	// (which is per-repository and may be disabled). "0" disables.
+	envLFSStagingBytes = "CODESTORAGE_LFS_STAGING_BYTES"
+
 	// Background repack (issue #1): registered-pack count at which a
 	// post-write trigger schedules a fold ("0" disables triggering).
 	envRepackThreshold = "CODESTORAGE_REPACK_THRESHOLD"
@@ -99,6 +105,11 @@ const (
 	// while still bounding the packs/ growth a single repo-scoped
 	// git:write token can inflict (issue #21).
 	defaultPackQuotaBytes = int64(10) << 30
+
+	// defaultLFSStagingBytes is the default node-wide LFS upload staging
+	// budget (issue #51) — matches the default per-repo quota's scale so
+	// one default-quota-sized object can always stage.
+	defaultLFSStagingBytes = int64(10) << 30
 
 	// defaultPackReservationTTL clears a default-quota-sized (10 GiB)
 	// upload at ~3 MB/s before a live reservation can expire (issue #29).
@@ -156,6 +167,9 @@ type serveConfig struct {
 	// RemoteAddr-only keying (the default).
 	trustedProxies []netip.Prefix
 
+	// lfsStagingBytes caps aggregate in-flight LFS upload staging per
+	// replica (issue #51); 0 disables.
+	lfsStagingBytes int64
 	// packQuotaBytes is the per-repo pack-bytes quota on the git surface
 	// (issue #21); 0 disables enforcement.
 	packQuotaBytes int64
@@ -285,6 +299,10 @@ func resolveServeConfig(getenv func(string) string, flagListen, flagAddr, flagCa
 		return serveConfig{}, err
 	}
 	cfg.packReservationTTL, err = resolvePackReservationTTL(getenv)
+	if err != nil {
+		return serveConfig{}, err
+	}
+	cfg.lfsStagingBytes, err = resolveLFSStagingBytes(getenv)
 	if err != nil {
 		return serveConfig{}, err
 	}
@@ -434,6 +452,26 @@ func resolvePackReservationTTL(getenv func(string) string) (time.Duration, error
 		return 0, fmt.Errorf("%s must be positive, got %q", envPackReservationTTL, raw)
 	}
 	return d, nil
+}
+
+// resolveLFSStagingBytes parses CODESTORAGE_LFS_STAGING_BYTES (issue #51):
+// the node-wide cap on bytes of proxy LFS uploads staging on this replica
+// at once. Fail-fast like resolvePackQuota; unset applies the default, an
+// explicit "0" disables the bound.
+func resolveLFSStagingBytes(getenv func(string) string) (int64, error) {
+	assertf(getenv != nil, "resolveLFSStagingBytes: nil getenv")
+	raw := getenv(envLFSStagingBytes)
+	if raw == "" {
+		return defaultLFSStagingBytes, nil
+	}
+	v, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("%s: %w", envLFSStagingBytes, err)
+	}
+	if v < 0 {
+		return 0, fmt.Errorf("%s must be non-negative (0 disables the staging bound), got %q", envLFSStagingBytes, raw)
+	}
+	return v, nil
 }
 
 // resolveSweepSettings parses the orphan-pack sweep env vars. Fail-fast

@@ -226,11 +226,11 @@ pre-storage push bound ([#55](https://github.com/coder/code-storage/issues/55)).
   [storage quota](../reference/configuration.md#codestorage_pack_quota_bytes) before
   publishing it. Size the proxy's request-body cap and timeouts with the largest LFS
   object you intend to accept in mind, and note upload bytes are staged under the
-  server's `$TMPDIR` before publication. Aggregate staging per repository is bounded by
-  the storage quota — concurrent distinct-object admissions sum in the ledger, and each
-  object allows one in-flight upload per replica (extra concurrent PUTs for the same
-  object answer `429` + `Retry-After`) — so with the quota **disabled** (`0`) the
-  proxy's body cap is the only per-request staging bound left; keep one.
+  server's `$TMPDIR` before publication. Per-replica staging is bounded by
+  [`CODESTORAGE_LFS_STAGING_BYTES`](../reference/configuration.md#codestorage_lfs_staging_bytes)
+  (default 10 GiB; over-budget uploads answer `429`/`413`, and each object allows one
+  in-flight upload per replica) — size it against the disk you actually give `$TMPDIR`,
+  and keep the proxy body cap as defense in depth.
 
 ### Client identity behind the proxy (`CODESTORAGE_TRUSTED_PROXIES`)
 

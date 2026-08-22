@@ -587,6 +587,26 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target r
 		return
 	}
 	defer s.lfsUploadsInFlight.Delete(key)
+	// Node-wide staging budget (Codex round 4): the per-key guard bounds
+	// only identical uploads, and the per-repo quota is neither node-wide
+	// nor guaranteed enabled — but every proxy upload stages its full
+	// Content-Length on this replica's disk before verification. Reserve
+	// the declared length against the replica budget before any disk is
+	// touched; an object larger than the whole budget can never stage
+	// here (413, permanent), anything else that does not fit right now is
+	// transient (429).
+	if s.LFSStagingBytes > 0 && r.ContentLength > s.LFSStagingBytes {
+		lfsError(w, http.StatusRequestEntityTooLarge, fmt.Sprintf(
+			"object size %d exceeds this server's LFS staging budget (%d bytes)",
+			r.ContentLength, s.LFSStagingBytes))
+		return
+	}
+	if !s.reserveLFSStaging(r.ContentLength) {
+		w.Header().Set("Retry-After", "10")
+		lfsError(w, http.StatusTooManyRequests, "server LFS staging budget exhausted, retry")
+		return
+	}
+	defer s.releaseLFSStaging(r.ContentLength)
 	// PUT-time admission: the batch charged the DECLARED size; re-reserve
 	// what actually arrives (a same-key reservation refreshes, so honest
 	// clients are counted once and a liar's oversized body re-runs the

@@ -84,11 +84,53 @@ type Server struct {
 	// usage memoizes per-repo pack usage for the quota-pressure log so
 	// replayed cheap POSTs cannot amplify into per-request blob listings.
 	usage usageCache
+	// LFSStagingBytes bounds the aggregate bytes of proxy LFS uploads
+	// staging on this replica at once (issue #51, Codex round 4): uploads
+	// stage their full Content-Length under $TMPDIR before verification,
+	// and the per-repository quota is neither node-wide nor guaranteed
+	// enabled, so without this budget concurrent distinct-key uploads
+	// could exhaust a replica's disk. Set by the serve wiring
+	// ($CODESTORAGE_LFS_STAGING_BYTES, default 10 GiB); <= 0 disables the
+	// bound (the operator's explicit opt-out).
+	LFSStagingBytes int64
 	// lfsUploadsInFlight tracks blob keys with a proxy upload currently
 	// staging on this replica (issue #51, Codex security round): at most
 	// one in-flight upload per key, so concurrent identical PUTs cannot
 	// multiply quota-sized temp files (see lfsProxyUpload).
 	lfsUploadsInFlight sync.Map
+	// lfsStagingInFlight is the aggregate Content-Length currently
+	// reserved against LFSStagingBytes. Guarded by lfsStagingMu.
+	lfsStagingInFlight int64
+	lfsStagingMu       sync.Mutex
+}
+
+// reserveLFSStaging reserves n bytes of the node-wide LFS staging budget.
+// ok=false when the reservation does not fit right now (transient — the
+// caller answers 429). n larger than the whole budget can never fit; the
+// caller distinguishes that case up front.
+func (s *Server) reserveLFSStaging(n int64) bool {
+	assertf(n >= 0, "reserveLFSStaging(%d)", n)
+	if s.LFSStagingBytes <= 0 || n == 0 {
+		return true
+	}
+	s.lfsStagingMu.Lock()
+	defer s.lfsStagingMu.Unlock()
+	if s.lfsStagingInFlight > s.LFSStagingBytes-n {
+		return false
+	}
+	s.lfsStagingInFlight += n
+	return true
+}
+
+// releaseLFSStaging returns a reserveLFSStaging reservation.
+func (s *Server) releaseLFSStaging(n int64) {
+	if s.LFSStagingBytes <= 0 || n == 0 {
+		return
+	}
+	s.lfsStagingMu.Lock()
+	defer s.lfsStagingMu.Unlock()
+	s.lfsStagingInFlight -= n
+	assertf(s.lfsStagingInFlight >= 0, "releaseLFSStaging(%d): in-flight went negative", n)
 }
 
 // repoTarget is a resolved request target: the live repo record plus the
