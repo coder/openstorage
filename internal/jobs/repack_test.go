@@ -130,7 +130,13 @@ func (f *repackFixture) push(t *testing.T) string {
 	if err := f.blobs.UploadFile(ctx, key, packPath); err != nil {
 		t.Fatalf("upload pack: %v", err)
 	}
-	if err := f.store.RegisterPacks(ctx, f.repo, []ref.Pack{{ID: id, Key: key}}); err != nil {
+	fi, err := os.Stat(packPath)
+	if err != nil {
+		t.Fatalf("stat pack: %v", err)
+	}
+	// Size feeds the quota ledger (issue #31), matching the production
+	// writers (pre-receive and publishPack both stat before registering).
+	if err := f.store.RegisterPacks(ctx, f.repo, []ref.Pack{{ID: id, Key: key, Size: fi.Size()}}); err != nil {
 		t.Fatalf("register pack: %v", err)
 	}
 	won, err := f.store.CASRef(ctx, f.repo, "refs/heads/main", f.tip, commitSHA)

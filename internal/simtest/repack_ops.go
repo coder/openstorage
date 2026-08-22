@@ -322,7 +322,7 @@ func (s *sim) oraclePush(ctx context.Context, repo *simRepo, branch string) erro
 	if err := s.cl.oracleBl.UploadFile(ctx, key, packPath); err != nil {
 		return fmt.Errorf("upload mid-race pack: %w", err)
 	}
-	if err := s.cl.oracle.RegisterPacks(ctx, repo.key, []ref.Pack{{ID: packID, Key: key}}); err != nil {
+	if err := s.cl.oracle.RegisterPacks(ctx, repo.key, []ref.Pack{{ID: packID, Key: key, Size: packFileSize(packPath)}}); err != nil {
 		return fmt.Errorf("register mid-race pack: %w", err)
 	}
 	won, err := s.cl.oracle.CASRef(ctx, repo.key, branch, old, mc.commitSHA)

@@ -299,6 +299,13 @@ func preReceive(ctx context.Context) error {
 			for _, p := range unpublished {
 				reserved = append(reserved, p.Key)
 			}
+			// Test knob: crash after the reservation committed, before any
+			// upload — the reservation deliberately leaks (issue #29's
+			// reserve → crash → sweep recovery window).
+			if testMode() && os.Getenv(EnvCrash) == "after-reserve" {
+				fmt.Fprintln(os.Stderr, "codestorage: crashing after reservation, before upload (test knob)")
+				os.Exit(42)
+			}
 		}
 	}
 
