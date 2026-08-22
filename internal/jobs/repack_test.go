@@ -377,10 +377,11 @@ func TestRepack_AmbiguousSwapKeepsBlob(t *testing.T) {
 	if !errors.Is(err, errAmbiguousReplace) {
 		t.Fatalf("repack error = %v, want the injected ambiguous drop", err)
 	}
-	// The swap may have committed (here it did): folded must report true so
-	// queue backends still run their follow-up threshold recheck.
+	// The swap may have committed (here it did — the registration recheck
+	// finds the content-addressed key): folded must report true so queue
+	// backends still run their follow-up threshold recheck.
 	if !folded {
-		t.Fatal("ambiguous swap error must report folded=true (possibly committed)")
+		t.Fatal("ambiguous-but-committed swap error must report folded=true")
 	}
 
 	// The swap really committed; the consolidated blob must NOT have been
@@ -393,6 +394,42 @@ func TestRepack_AmbiguousSwapKeepsBlob(t *testing.T) {
 		t.Fatalf("ambiguous swap deleted the committed consolidated blob %s", rows[0].Key)
 	}
 	f.checkColdHydrate(t)
+}
+
+// failingReplaceStore fails ReplacePacks WITHOUT executing it — the
+// definitive-rollback shape (e.g. a SQLite ExecContext error).
+type failingReplaceStore struct {
+	ref.RefStore
+}
+
+var errReplaceRolledBack = errors.New("injected pre-commit replace failure")
+
+func (s failingReplaceStore) ReplacePacks(context.Context, string, []ref.Pack, ref.Pack) (bool, error) {
+	return false, errReplaceRolledBack
+}
+
+// TestRepack_RolledBackSwapReportsNotFolded pins the round-16 finding: a
+// ReplacePacks failure whose registration recheck proves the swap never
+// landed must report folded=false — folded=true there let a persistent
+// write failure drive unbounded fold+upload loops through the queues'
+// follow-up scheduling, bypassing river's retry budget.
+func TestRepack_RolledBackSwapReportsNotFolded(t *testing.T) {
+	f := newRepackFixture(t)
+	ctx := context.Background()
+	for range 3 {
+		f.push(t)
+	}
+	r := NewRepacker(failingReplaceStore{f.store}, f.blobs, fixtureMaterialize(f.blobs, t.TempDir()), slog.New(slog.DiscardHandler))
+	folded, err := r.Repack(ctx, f.repo)
+	if !errors.Is(err, errReplaceRolledBack) {
+		t.Fatalf("repack error = %v, want the injected rollback", err)
+	}
+	if folded {
+		t.Fatal("definitively rolled-back swap must report folded=false")
+	}
+	if rows := f.packRows(t); len(rows) != 3 {
+		t.Fatalf("pack rows = %+v, want the untouched 3", rows)
+	}
 }
 
 func TestRepack_SweeperCollectsSupersededBlobs(t *testing.T) {

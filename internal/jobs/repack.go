@@ -315,15 +315,26 @@ func (r *Repacker) Repack(ctx context.Context, repo string) (folded bool, err er
 	if err != nil {
 		// Ambiguous by construction (the transaction may have committed
 		// with the response lost), so the uploaded blob must NOT be
-		// deleted here — and, like every registration path, the possibly
-		// committed row must be verified against the sweeper race below:
-		// a committed row must never point at missing bytes. folded
-		// reports TRUE for the same reason: the swap may have landed, and
-		// queue backends key their follow-up threshold recheck on it — a
-		// false report after a committed swap would strand coalesced
-		// mid-fold triggers. A spurious recheck after a genuinely failed
-		// swap costs one ListPacks (and any follow-up fold it schedules
-		// retries work the next trigger would have retried anyway).
+		// deleted here. RESOLVE the ambiguity by re-reading the
+		// registration — the new pack's key is content-addressed, so a
+		// committed swap (ours, or a concurrent identical fold's) is
+		// exactly "the key is registered":
+		//
+		//   - registered: report folded=true (queue backends run their
+		//     follow-up recheck; coalesced mid-fold triggers stay
+		//     covered) and verify the blob like every registration path;
+		//   - definitively not registered: report folded=false with the
+		//     error — the swap rolled back, and folded=true here would
+		//     make a PERSISTENT write failure drive unbounded
+		//     fold+upload loops (local's folded&&due rerun, river's
+		//     successor) that bypass river's retry budget;
+		//   - recheck unavailable: stay conservative (folded=true +
+		//     verify) — one spurious follow-up recheck against a store
+		//     that just failed is bounded by its own error handling.
+		has, herr := r.store.HasPack(ctx, repo, newPack.Key)
+		if herr == nil && !has {
+			return false, fmt.Errorf("repack %s: replace packs (rolled back): %w", repo, err)
+		}
 		verr := verifyPublished(ctx, r.blobs, newPack.Key, packPath)
 		return true, errors.Join(fmt.Errorf("repack %s: replace packs: %w", repo, err), verr)
 	}
