@@ -70,7 +70,8 @@ Folds are budgeted (bytes, objects, wall time — compiled constants) and select
 cheap point reads (blob size + the pack header's object count) before anything is
 downloaded, so a fold either provably fits its budgets or provably cannot happen. Big
 repositories converge over successive folds; pack counts converge *below* the trigger
-threshold, not to one.
+threshold, not to one — except when no pack pair fits the budgets at all, where the
+no-op is proven and the count legitimately stays put.
 
 ## Why quota admission is a ledger, not a counter
 

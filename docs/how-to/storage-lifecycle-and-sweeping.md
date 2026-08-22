@@ -69,7 +69,9 @@ Operationally relevant properties:
 
 - **Counts converge below the threshold, not to one pack.** A fold that snapshots all but
   the very latest pushes can legitimately settle at `threshold - 1` packs. That is
-  converged, not stuck.
+  converged, not stuck. The one exception: when no combination of ≥ 2 packs fits the
+  fold budgets (next bullet), nothing is foldable and the count legitimately stays at or
+  above the threshold.
 - **Bounded folds.** Each fold is capped at compiled-in budgets (2 GiB of pack bytes,
   ~1M objects, 5 minutes — not tunable via environment). Repositories above the budgets
   fold incrementally: each fold schedules a successor until counts converge.
