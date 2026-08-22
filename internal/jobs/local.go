@@ -127,7 +127,8 @@ func (q *Local) runRepack(repo string) {
 			q.logger.Warn("repack failed", "repo", repo, "err", err)
 		}
 		// The follow-up recheck does I/O, so it runs outside the lock.
-		needMore := folded && q.repacker.NeedsFollowUp(context.Background(), repo)
+		_, due := q.repacker.FollowUpDue(context.Background(), repo)
+		needMore := folded && due
 		// Consume the pending flag in the SAME critical section that
 		// decides exit: a trigger landing after the recheck above but
 		// before this lock must either be observed here (we loop) or

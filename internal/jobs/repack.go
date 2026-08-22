@@ -142,21 +142,24 @@ type Repacker struct {
 	BeforeSwap func(ctx context.Context, pending ref.Pack) error
 }
 
-// NeedsFollowUp reports whether repo's registered pack count has reached
-// FollowUpThreshold — the post-fold recheck queue backends use to schedule
-// one more fold for registrations that landed mid-fold. Read failures
-// report false (the next write's trigger retries).
-func (r *Repacker) NeedsFollowUp(ctx context.Context, repo string) bool {
-	assertf(repo != "", "NeedsFollowUp: empty repo")
+// FollowUpDue reports repo's registered pack count and whether it has
+// reached FollowUpThreshold — the recheck queue backends use to schedule
+// one more fold for registrations that landed mid-fold. The count lets the
+// river worker distinguish growth from a wedged plateau (a repo stuck
+// at/above the threshold with nothing pairable must not chain no-op
+// successors forever). Read failures report (0, false) — the next write's
+// trigger retries.
+func (r *Repacker) FollowUpDue(ctx context.Context, repo string) (count int, due bool) {
+	assertf(repo != "", "FollowUpDue: empty repo")
 	if r.FollowUpThreshold < 2 {
-		return false
+		return 0, false
 	}
 	packs, err := r.store.ListPacks(ctx, repo)
 	if err != nil {
 		r.logger.Warn("repack follow-up recheck failed", "repo", repo, "err", err)
-		return false
+		return 0, false
 	}
-	return len(packs) >= r.FollowUpThreshold
+	return len(packs), len(packs) >= r.FollowUpThreshold
 }
 
 // NewRepacker builds a Repacker over the raw ref/blob stores and the
