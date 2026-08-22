@@ -294,6 +294,9 @@ func (stubLedger) ReclaimRetainedPack(context.Context, string, string) (int64, e
 func (stubLedger) SweepExpiredPackReservations(context.Context, time.Duration) (int64, error) {
 	return 0, nil
 }
+func (stubLedger) HasLFSObject(context.Context, string, string) (bool, error) {
+	return false, nil
+}
 
 // registeredMidSweep reports unregistered on the first HasPack call and
 // registered afterwards, simulating a pack whose RegisterPacks commits

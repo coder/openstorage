@@ -635,11 +635,12 @@ func TestResolveServeConfigSweep(t *testing.T) {
 			envSweepAgeThreshold:     "48h",
 			envSweepDeleteEnabled:    "true",
 			envSweepDeleteSuperseded: "false",
+			envSweepDeleteLFS:        "true",
 		}), "", "", "/tmp/cache", "")
 		if err != nil {
 			t.Fatal(err)
 		}
-		want := sweepSettings{interval: 30 * time.Minute, ageThreshold: 48 * time.Hour, deleteEnabled: true}
+		want := sweepSettings{interval: 30 * time.Minute, ageThreshold: 48 * time.Hour, deleteEnabled: true, deleteLFS: true}
 		if cfg.sweep != want {
 			t.Fatalf("sweep = %+v, want %+v", cfg.sweep, want)
 		}
@@ -663,6 +664,7 @@ func TestResolveServeConfigSweep(t *testing.T) {
 			"zero threshold":      {envSweepAgeThreshold: "0"},
 			"negative threshold":  {envSweepAgeThreshold: "-24h"},
 			"malformed delete":    {envSweepDeleteEnabled: "yes please"},
+			"malformed lfs":       {envSweepDeleteLFS: "sure"},
 		}
 		for name, extra := range cases {
 			t.Run(name, func(t *testing.T) {

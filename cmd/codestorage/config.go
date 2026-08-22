@@ -73,6 +73,15 @@ const (
 	// failing startup like the explicit general delete opt-in.
 	envSweepDeleteSuperseded = "CODESTORAGE_SWEEP_DELETE_SUPERSEDED"
 
+	// LFS-class deletion (issue #51): reap aged lfs/ blobs with no
+	// lfs_objects registry row. OFF by default and separate from the
+	// general delete opt-in: objects uploaded before the LFS registry
+	// existed have no rows, so a fleet already running general deletes
+	// must not start reaping its pre-existing LFS population on upgrade.
+	// Enable only after list-only reports stop naming live objects
+	// (write-scoped touches adopt stored objects into the registry).
+	envSweepDeleteLFS = "CODESTORAGE_SWEEP_DELETE_LFS"
+
 	// Background repack (issue #1): registered-pack count at which a
 	// post-write trigger schedules a fold ("0" disables triggering).
 	envRepackThreshold = "CODESTORAGE_REPACK_THRESHOLD"
@@ -170,6 +179,7 @@ type sweepSettings struct {
 	ageThreshold     time.Duration // > 0
 	deleteEnabled    bool          // false = list-only (the default)
 	deleteSuperseded bool          // true = reap provably-folded blobs (the default, issue #31)
+	deleteLFS        bool          // false = list-only for LFS orphans (the default, issue #51)
 }
 
 // storageURLs is the resolved storage location set shared by every
@@ -468,6 +478,13 @@ func resolveSweepSettings(getenv func(string) string) (sweepSettings, error) {
 			return sweepSettings{}, fmt.Errorf("%s: %w", envSweepDeleteSuperseded, err)
 		}
 		s.deleteSuperseded = v
+	}
+	if raw := getenv(envSweepDeleteLFS); raw != "" {
+		v, err := strconv.ParseBool(raw)
+		if err != nil {
+			return sweepSettings{}, fmt.Errorf("%s: %w", envSweepDeleteLFS, err)
+		}
+		s.deleteLFS = v
 	}
 	return s, nil
 }

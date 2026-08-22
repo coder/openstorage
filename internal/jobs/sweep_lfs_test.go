@@ -1,0 +1,194 @@
+// LFS-prefix sweep tests (issue #51): list-only classification, the
+// separate DeleteLFS opt-in (general Delete must NOT reap LFS keys — the
+// pre-registry rollout hazard), quarantine backups, heal restoration, and
+// foreign-key immunity. Runs over the same sweepFixture as the pack tests.
+package jobs
+
+import (
+	"context"
+	"log/slog"
+	"strings"
+	"testing"
+	"time"
+
+	"codestorage/internal/blob"
+)
+
+// lfsOID mints a deterministic 64-hex oid from a two-hex-char seed.
+func lfsOID(seed string) string {
+	if len(seed) != 2 {
+		panic("lfsOID seed must be 2 hex chars")
+	}
+	return strings.Repeat(seed, 32)
+}
+
+// registerLFS records an LFS object in the fixture's ref store.
+func (f *sweepFixture) registerLFS(repo, key string, bytes int64) {
+	f.t.Helper()
+	if err := f.store.RegisterLFSObject(context.Background(), repo, key, bytes); err != nil {
+		f.t.Fatalf("RegisterLFSObject: %v", err)
+	}
+}
+
+// seedLFSWorld builds the LFS classification matrix: a registered (live)
+// object, an aged orphan, a fresh orphan, and foreign keys under lfs/.
+func seedLFSWorld(f *sweepFixture) (liveKey, orphanKey, freshKey string) {
+	liveKey = blob.LFSKey("repo_lfs", lfsOID("aa"))
+	f.upload(liveKey, "live-lfs-bytes")
+	f.registerLFS("repo_lfs", liveKey, int64(len("live-lfs-bytes")))
+	f.backdate(liveKey, 25*time.Hour) // old AND registered: still live
+
+	orphanKey = blob.LFSKey("repo_lfs", lfsOID("bb"))
+	f.upload(orphanKey, "orphan-lfs-bytes")
+	f.backdate(orphanKey, 25*time.Hour)
+
+	freshKey = blob.LFSKey("repo_lfs", lfsOID("cc"))
+	f.upload(freshKey, "fresh-lfs-bytes")
+
+	// Foreign keys under lfs/ that do not match the exact LFSKey shape
+	// (bad oid, deeper nesting): never classified, never deleted.
+	for _, foreign := range []string{"lfs/stray", "lfs/repo_lfs/not-an-oid", "lfs/repo_lfs/" + lfsOID("dd") + "/nested"} {
+		f.upload(foreign, "not-an-lfs-key")
+		f.backdate(foreign, 30*24*time.Hour)
+	}
+	return
+}
+
+func TestSweepLFS_ListOnlyReportsWithoutDeleting(t *testing.T) {
+	f := newSweepFixture(t)
+	liveKey, orphanKey, freshKey := seedLFSWorld(f)
+
+	report, err := f.sweeper(SweepConfig{Threshold: 24 * time.Hour}).Sweep(context.Background())
+	if err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if report.Live != 1 || report.Fresh != 1 || report.OrphanCount != 1 || report.Deleted != 0 {
+		t.Fatalf("report = %+v, want live=1 fresh=1 orphans=1 deleted=0", report)
+	}
+	if len(report.Orphans) != 1 || report.Orphans[0].Key != orphanKey {
+		t.Fatalf("orphans = %+v, want %q", report.Orphans, orphanKey)
+	}
+	for _, key := range []string{liveKey, orphanKey, freshKey,
+		"lfs/stray", "lfs/repo_lfs/not-an-oid", "lfs/repo_lfs/" + lfsOID("dd") + "/nested"} {
+		if !f.exists(key) {
+			t.Fatalf("list-only sweep deleted %q", key)
+		}
+	}
+}
+
+// TestSweepLFS_GeneralDeleteSparesLFS: the general Delete opt-in must NOT
+// reap LFS orphans — pre-#51 LFS objects have no registry rows, so a fleet
+// already running Delete=true would otherwise reap its entire existing LFS
+// population on upgrade.
+func TestSweepLFS_GeneralDeleteSparesLFS(t *testing.T) {
+	f := newSweepFixture(t)
+	_, orphanKey, _ := seedLFSWorld(f)
+
+	report, err := f.sweeper(SweepConfig{Threshold: 24 * time.Hour, Delete: true}).Sweep(context.Background())
+	if err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if report.Deleted != 0 {
+		t.Fatalf("report = %+v, want no deletes (DeleteLFS off)", report)
+	}
+	if !f.exists(orphanKey) {
+		t.Fatalf("Delete=true without DeleteLFS reaped LFS orphan %q", orphanKey)
+	}
+}
+
+func TestSweepLFS_DeleteLFSReapsOrphansOnly(t *testing.T) {
+	f := newSweepFixture(t)
+	liveKey, orphanKey, freshKey := seedLFSWorld(f)
+	// A pack orphan alongside: DeleteLFS alone must not touch pack keys.
+	packOrphan := blob.PackKey("r1", "orphan")
+	f.upload(packOrphan, "pack-orphan-bytes")
+	f.backdate(packOrphan, 25*time.Hour)
+
+	report, err := f.sweeper(SweepConfig{Threshold: 24 * time.Hour, DeleteLFS: true}).Sweep(context.Background())
+	if err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if report.Deleted != 1 {
+		t.Fatalf("report = %+v, want deleted=1 (the aged LFS orphan)", report)
+	}
+	if f.exists(orphanKey) {
+		t.Fatalf("LFS orphan %q survived a DeleteLFS sweep", orphanKey)
+	}
+	if !f.hasBackup(orphanKey) {
+		t.Fatalf("reaped LFS orphan %q has no quarantine backup", orphanKey)
+	}
+	for _, key := range []string{liveKey, freshKey, packOrphan,
+		"lfs/stray", "lfs/repo_lfs/not-an-oid", "lfs/repo_lfs/" + lfsOID("dd") + "/nested"} {
+		if !f.exists(key) {
+			t.Fatalf("DeleteLFS sweep deleted non-candidate %q", key)
+		}
+	}
+
+	// Idempotence: a second sweep has nothing left to reap.
+	report, err = f.sweeper(SweepConfig{Threshold: 24 * time.Hour, DeleteLFS: true}).Sweep(context.Background())
+	if err != nil {
+		t.Fatalf("second Sweep: %v", err)
+	}
+	if report.Deleted != 0 {
+		t.Fatalf("second sweep report = %+v, want deleted=0", report)
+	}
+}
+
+// TestSweepLFS_HealRestoresRegisteredFromQuarantine: a registered LFS
+// object whose only copy sits in quarantine (delete-enabled crash
+// mid-handshake) is restored by the heal pass in every sweep mode.
+func TestSweepLFS_HealRestoresRegisteredFromQuarantine(t *testing.T) {
+	f := newSweepFixture(t)
+	key := blob.LFSKey("repo_lfs", lfsOID("ee"))
+	f.registerLFS("repo_lfs", key, int64(len("stranded-lfs-bytes")))
+	// Simulate the crash: the backup exists, the original does not.
+	f.upload(quarantineKey(key), "stranded-lfs-bytes")
+
+	if _, err := f.sweeper(SweepConfig{Threshold: 24 * time.Hour}).Sweep(context.Background()); err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if !f.exists(key) {
+		t.Fatalf("heal pass did not restore registered LFS object %q", key)
+	}
+}
+
+// TestSweepLFS_RegisteredMidSweepSurvives: an LFS object registered between
+// classification and the delete is spared by revalidation, mirroring the
+// pack race test.
+func TestSweepLFS_RegisteredMidSweepSurvives(t *testing.T) {
+	f := newSweepFixture(t)
+	key := blob.LFSKey("repo_lfs", lfsOID("ff"))
+	f.upload(key, "racer-lfs-bytes")
+	f.backdate(key, 25*time.Hour)
+
+	packs := &lfsRegisteredMidSweep{}
+	s := NewSweeper(f.blobs, packs, SweepConfig{Threshold: 24 * time.Hour, DeleteLFS: true}, slog.New(slog.DiscardHandler))
+	report, err := s.Sweep(context.Background())
+	if err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if report.Deleted != 0 {
+		t.Fatalf("report = %+v, want no deletes (object registered mid-sweep)", report)
+	}
+	if !f.exists(key) {
+		t.Fatalf("mid-sweep-registered LFS object %q was deleted", key)
+	}
+	if packs.calls != 2 {
+		t.Fatalf("HasLFSObject calls = %d, want 2 (classification + revalidation)", packs.calls)
+	}
+}
+
+// lfsRegisteredMidSweep mirrors registeredMidSweep for the LFS registry.
+type lfsRegisteredMidSweep struct {
+	stubLedger
+	calls int
+}
+
+func (p *lfsRegisteredMidSweep) HasPack(context.Context, string, string) (bool, error) {
+	return false, nil
+}
+
+func (p *lfsRegisteredMidSweep) HasLFSObject(context.Context, string, string) (bool, error) {
+	p.calls++
+	return p.calls > 1, nil
+}

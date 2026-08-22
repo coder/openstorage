@@ -70,7 +70,7 @@ func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL, loopbackBaseU
 	// listing is a read, no events to emit — and the shared blob store.
 	// interval 0 disables the periodic schedule; nil schedule keeps both
 	// queue backends inert.
-	if sweep.deleteEnabled && sweep.interval > 0 {
+	if (sweep.deleteEnabled || sweep.deleteLFS) && sweep.interval > 0 {
 		// Versioned S3 buckets break delete-mode invariants: Delete only
 		// writes a delete marker while every pack and quarantine version
 		// stays stored and billed, so sweeps would report reclaimed bytes
@@ -95,11 +95,12 @@ func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL, loopbackBaseU
 		Threshold:        sweep.ageThreshold,
 		Delete:           sweep.deleteEnabled,
 		DeleteSuperseded: sweep.deleteSuperseded,
+		DeleteLFS:        sweep.deleteLFS,
 		// The sweep prunes crash-leaked admission reservations (issue #29)
 		// on its cadence with the same TTL the write gates charge.
 		ReservationTTL: packReservationTTL,
 	}
-	if s3store, ok := blobStore.(*blob.S3); ok && (sweep.deleteEnabled || sweep.deleteSuperseded) {
+	if s3store, ok := blobStore.(*blob.S3); ok && (sweep.deleteEnabled || sweep.deleteSuperseded || sweep.deleteLFS) {
 		// Versioning can be enabled on the bucket while the process runs,
 		// silently turning startup's validation stale; every delete-mode
 		// sweep re-checks and downgrades itself to list-only on drift or

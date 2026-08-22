@@ -41,6 +41,10 @@ import (
 // never materialize a repo's full pack set.
 type PackRegistry interface {
 	HasPack(ctx context.Context, repo, key string) (bool, error)
+	// HasLFSObject is HasPack's twin for the LFS registry (issue #51):
+	// point membership for lfs/<repo>/<oid> keys, written by verified
+	// uploads (ref.RegisterLFSObject).
+	HasLFSObject(ctx context.Context, repo, key string) (bool, error)
 	// IsRetainedPack classifies (repo, key) as superseded-by-repack: a
 	// blob whose registry row a ReplacePacks fold removed. Provably
 	// DB-absent by that CAS — a narrower, safer deletion class than
@@ -77,6 +81,16 @@ type SweepConfig struct {
 	// quota. Disposal still runs the full revalidate + quarantine
 	// handshake and the same age threshold.
 	DeleteSuperseded bool
+	// DeleteLFS reaps aged candidates in the LFS class — lfs/ keys with no
+	// lfs_objects registry row (issue #51). A SEPARATE opt-in from Delete
+	// on purpose, and off by default: LFS objects uploaded before the
+	// registry existed have no rows, so a deployment already running
+	// Delete=true must not start reaping its entire pre-existing LFS
+	// population on upgrade. Write-scoped touches (upload batches, re-PUTs)
+	// adopt stored objects into the registry; enable this only after
+	// list-only reports stop naming objects that should live. Disposal
+	// runs the same revalidate + quarantine handshake and age threshold.
+	DeleteLFS bool
 	// DeleteGuard, when set, is consulted before each sweep's destructive
 	// work (Delete and DeleteSuperseded alike). A non-nil error downgrades
 	// that run to list-only (heals still run) and is reported. It
@@ -195,18 +209,18 @@ func (s *Sweeper) Sweep(ctx context.Context) (SweepReport, error) {
 	// (e.g. bucket versioning state) can drift while the process runs. One
 	// guard covers both destructive modes — a versioned bucket turns
 	// superseded-class deletes into billed delete markers all the same.
-	deleteMode, supersededMode := s.cfg.Delete, s.cfg.DeleteSuperseded
-	if (deleteMode || supersededMode) && s.cfg.DeleteGuard != nil {
+	deleteMode, supersededMode, lfsMode := s.cfg.Delete, s.cfg.DeleteSuperseded, s.cfg.DeleteLFS
+	if (deleteMode || supersededMode || lfsMode) && s.cfg.DeleteGuard != nil {
 		if err := s.cfg.DeleteGuard(ctx); err != nil {
-			deleteMode, supersededMode = false, false
+			deleteMode, supersededMode, lfsMode = false, false, false
 			deleteErrs.add(fmt.Errorf("sweep: delete guard, running list-only: %w", err))
 			s.logger.Error("orphan pack sweep: delete guard failed; this run is list-only", "err", err)
 		}
 	}
-	// Quarantine purging rides on EITHER destructive mode: backups only
+	// Quarantine purging rides on ANY destructive mode: backups only
 	// exist because some destructive pass created them, and the purge-age
 	// proof (write-once nonce keys) is class-agnostic.
-	if err := s.healQuarantine(ctx, &report, deleteMode || supersededMode); err != nil {
+	if err := s.healQuarantine(ctx, &report, deleteMode || supersededMode || lfsMode); err != nil {
 		deleteErrs.add(err)
 	}
 	// Crash-leaked admission reservations (issue #29): expired rows already
@@ -243,7 +257,7 @@ func (s *Sweeper) Sweep(ctx context.Context) (SweepReport, error) {
 				s.logger.Warn("orphan pack sweep: skipping foreign key under packs/", "key", obj.Key)
 				continue
 			}
-			if err := s.classify(ctx, repo, obj, deleteMode, supersededMode, &report, &deleteErrs); err != nil {
+			if err := s.classify(ctx, repo, obj, deleteMode, supersededMode, lfsMode, &report, &deleteErrs); err != nil {
 				return err
 			}
 		}
@@ -251,6 +265,26 @@ func (s *Sweeper) Sweep(ctx context.Context) (SweepReport, error) {
 	})
 	if err != nil {
 		return report, fmt.Errorf("sweep: list %s: %w", blob.PacksRoot, err)
+	}
+	// The LFS prefix is reconciled the same way (issue #51): stream,
+	// classify per object against the LFS registry, delete only under the
+	// class's own opt-in. Keys not matching the exact blob.LFSKey shape
+	// (lfs/<repo>/<64-hex oid>, no deeper nesting) are foreign.
+	err = s.blobs.ListPages(ctx, blob.LFSRoot, sweepListPageSize, func(page []blob.ListedObject) error {
+		for _, obj := range page {
+			repo, ok := splitLFSKey(obj.Key)
+			if !ok {
+				s.logger.Warn("orphan pack sweep: skipping foreign key under lfs/", "key", obj.Key)
+				continue
+			}
+			if err := s.classify(ctx, repo, obj, deleteMode, supersededMode, lfsMode, &report, &deleteErrs); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return report, fmt.Errorf("sweep: list %s: %w", blob.LFSRoot, err)
 	}
 
 	s.logger.Info("orphan pack sweep finished",
@@ -261,6 +295,7 @@ func (s *Sweeper) Sweep(ctx context.Context) (SweepReport, error) {
 		"retained_bytes_reclaimed", report.RetainedBytesReclaimed,
 		"reservations_expired", report.ReservationsExpired,
 		"delete_enabled", s.cfg.Delete, "delete_superseded", s.cfg.DeleteSuperseded,
+		"delete_lfs", s.cfg.DeleteLFS,
 		"threshold", s.cfg.Threshold,
 		"duration", s.now().Sub(start).Round(time.Millisecond))
 	return report, deleteErrs.join()
@@ -324,17 +359,29 @@ func (s *Sweeper) quarantinePurgeAge() time.Duration {
 	return max(s.cfg.Threshold, quarantinePurgeFloor)
 }
 
-// classify handles one listed pack blob: a point registry read, then the
+// registered dispatches the authoritative membership lookup by key class:
+// lfs/ keys consult the LFS registry (issue #51), everything else the pack
+// registry. Keys are self-describing (disjoint prefixes), so no class needs
+// threading through the revalidate/quarantine helpers.
+func (s *Sweeper) registered(ctx context.Context, repo, key string) (bool, error) {
+	if strings.HasPrefix(key, blob.LFSRoot) {
+		return s.packs.HasLFSObject(ctx, repo, key)
+	}
+	return s.packs.HasPack(ctx, repo, key)
+}
+
+// classify handles one listed blob: a point registry read, then the
 // age-threshold diff, then (when some destructive mode covers the object's
-// class) the revalidate + quarantine handshake. General orphans need
+// class) the revalidate + quarantine handshake. General pack orphans need
 // deleteMode; retained superseded blobs (a durable pack_retained record
 // written by the fold's own transaction, issue #31) are reaped under
-// supersededMode too. Registry errors abort the sweep (they would
+// supersededMode too; LFS orphans (issue #51) only under their own
+// lfsMode opt-in. Registry errors abort the sweep (they would
 // misclassify the object); disposal errors accumulate into deleteErrs.
-func (s *Sweeper) classify(ctx context.Context, repo string, obj blob.ListedObject, deleteMode, supersededMode bool, report *SweepReport, deleteErrs *boundedErrs) error {
-	registered, err := s.packs.HasPack(ctx, repo, obj.Key)
+func (s *Sweeper) classify(ctx context.Context, repo string, obj blob.ListedObject, deleteMode, supersededMode, lfsMode bool, report *SweepReport, deleteErrs *boundedErrs) error {
+	registered, err := s.registered(ctx, repo, obj.Key)
 	if err != nil {
-		return fmt.Errorf("has pack %s: %w", obj.Key, err)
+		return fmt.Errorf("registry lookup %s: %w", obj.Key, err)
 	}
 	if registered {
 		report.Live++
@@ -358,18 +405,24 @@ func (s *Sweeper) classify(ctx context.Context, repo string, obj blob.ListedObje
 	report.OrphanBytes += obj.Size
 	s.logger.Info("orphan pack candidate",
 		"key", obj.Key, "size_bytes", obj.Size, "age", age.Round(time.Second),
-		"delete_enabled", deleteMode, "delete_superseded", supersededMode)
-	// Deletion coverage: general delete mode reaps every aged candidate;
-	// superseded mode alone reaps only keys with a retained record (one
-	// extra point read per aged candidate, same shape as HasPack).
-	canDelete := deleteMode
-	if !canDelete && supersededMode {
-		retained, err := s.packs.IsRetainedPack(ctx, repo, obj.Key)
-		if err != nil {
-			deleteErrs.add(fmt.Errorf("is retained %s: %w", obj.Key, err))
-			return nil
+		"delete_enabled", deleteMode, "delete_superseded", supersededMode, "delete_lfs", lfsMode)
+	// Deletion coverage per class: LFS candidates need the lfsMode opt-in;
+	// pack candidates need general delete mode, or — under superseded mode
+	// alone — a retained record (one extra point read per aged candidate,
+	// same shape as HasPack).
+	var canDelete bool
+	if strings.HasPrefix(obj.Key, blob.LFSRoot) {
+		canDelete = lfsMode
+	} else {
+		canDelete = deleteMode
+		if !canDelete && supersededMode {
+			retained, err := s.packs.IsRetainedPack(ctx, repo, obj.Key)
+			if err != nil {
+				deleteErrs.add(fmt.Errorf("is retained %s: %w", obj.Key, err))
+				return nil
+			}
+			canDelete = retained
 		}
-		canDelete = retained
 	}
 	if !canDelete {
 		return nil
@@ -462,6 +515,47 @@ func isQuarantineNonce(s string) bool {
 	return true
 }
 
+// splitSweepKey validates that key has the exact shape of one of the two
+// sweepable classes (blob.PackKey / blob.LFSKey) and returns its repo
+// segment. Anything else is foreign: never a restore source, never purged.
+func splitSweepKey(key string) (repo string, ok bool) {
+	if strings.HasPrefix(key, blob.LFSRoot) {
+		return splitLFSKey(key)
+	}
+	return splitPackKey(key)
+}
+
+// splitLFSKey validates that key has the exact shape blob.LFSKey produces —
+// lfs/<repo>/<oid> with a 64-hex-char oid and no deeper nesting — and
+// returns the repo segment (always a BASE RepoID, ADR-35).
+func splitLFSKey(key string) (repo string, ok bool) {
+	rest, found := strings.CutPrefix(key, blob.LFSRoot)
+	if !found {
+		return "", false
+	}
+	repo, oid, found := strings.Cut(rest, "/")
+	if !found || repo == "" || !isLFSOID(oid) {
+		return "", false
+	}
+	return repo, true
+}
+
+// isLFSOID reports whether s is a sha256 content address as git-lfs spells
+// it: exactly 64 lowercase hex characters (which also rules out any deeper
+// key nesting — '/' is not hex).
+func isLFSOID(s string) bool {
+	if len(s) != 64 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
 // splitPackKey validates that key has the exact shape blob.PackKey
 // produces — packs/<repo>/pack-<id>.pack with a non-empty id and no deeper
 // nesting — and returns the repo segment. Anything else (manifests, nested
@@ -538,10 +632,11 @@ func (s *Sweeper) safeDelete(ctx context.Context, repo, key string) (bool, error
 		return false, deleteErr
 	}
 	// Post-delete registry recheck: whichever of {our delete, a retried
-	// push's RegisterPacks} lands last sees the other's state, so a
-	// registration this read observes gets its bytes restored here, and
-	// one it misses is healed from quarantine next sweep.
-	registered, err := s.packs.HasPack(rctx, repo, key)
+	// push's RegisterPacks / upload's RegisterLFSObject} lands last sees
+	// the other's state, so a registration this read observes gets its
+	// bytes restored here, and one it misses is healed from quarantine
+	// next sweep.
+	registered, err := s.registered(rctx, repo, key)
 	if err != nil {
 		// Deleted but unverifiable: a registration that landed before the
 		// delete (its EnsurePublished saw the key present) would be
@@ -607,13 +702,13 @@ func (s *Sweeper) healQuarantineEntry(ctx context.Context, q blob.ListedObject, 
 	orig, ok := parseQuarantineKey(q.Key)
 	var repo string
 	if ok {
-		repo, ok = splitPackKey(orig)
+		repo, ok = splitSweepKey(orig)
 	}
 	if !ok {
 		s.logger.Warn("orphan pack sweep: skipping foreign quarantine key", "key", q.Key)
 		return nil
 	}
-	registered, err := s.packs.HasPack(ctx, repo, orig)
+	registered, err := s.registered(ctx, repo, orig)
 	if err != nil {
 		return fmt.Errorf("sweep: heal %s: has pack: %w", orig, err)
 	}
@@ -692,9 +787,9 @@ func (s *Sweeper) healQuarantineEntry(ctx context.Context, q blob.ListedObject, 
 // checking the registry before the mod time means any registration the
 // registry read misses still refreshes the ModTime read after it.
 func (s *Sweeper) revalidateOrphan(ctx context.Context, repo, key string) (bool, error) {
-	registered, err := s.packs.HasPack(ctx, repo, key)
+	registered, err := s.registered(ctx, repo, key)
 	if err != nil {
-		return false, fmt.Errorf("sweep: revalidate %s: has pack: %w", key, err)
+		return false, fmt.Errorf("sweep: revalidate %s: registry lookup: %w", key, err)
 	}
 	if registered {
 		s.logger.Info("orphan pack sweep: skipping delete, pack registered mid-sweep", "key", key)
