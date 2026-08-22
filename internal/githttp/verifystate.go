@@ -59,13 +59,16 @@ const EnvVerifySpawnLog = "CODESTORAGE_TEST_VERIFY_SPAWN_LOG"
 
 // State file directives. Every verifier spawn appends exactly one ok/deny
 // line, so spent (the budget charge) is their count; okrange lines record
-// whole-range successes for cross-ref (old,new) dedup and are free; walked
-// lines accumulate rev-list output consumed by the push's history walks.
+// whole-range successes for cross-ref (old,new) dedup and are persisted
+// only for ranges that actually verified commits. The cumulative
+// examined-commit counter lives in a SEPARATE fixed-size sibling file
+// (walkedCounterPath): folding it into this file would either grow it once
+// per walk or force a full rewrite per walk — both let cheap cached walks
+// amplify into O(refs × budget) state processing (Codex rounds 5–8).
 const (
-	verdictOK     = "ok"
-	verdictDeny   = "deny"
-	verdictRange  = "okrange"
-	verdictWalked = "walked"
+	verdictOK    = "ok"
+	verdictDeny  = "deny"
+	verdictRange = "okrange"
 )
 
 // verifyWalkBudgetMultiplier derives the per-push traversal bound from the
@@ -129,6 +132,22 @@ func openVerifyState() (*verifyState, error) {
 	if err := sc.Err(); err != nil {
 		return nil, fmt.Errorf("read verify state: %w", err)
 	}
+	// The cumulative examined-commit counter lives in the sibling
+	// fixed-size file; absent means no walk has been charged yet. Our own
+	// binary writes it, so anything unreadable or malformed fails closed.
+	raw, err := os.ReadFile(st.walkedCounterPath())
+	switch {
+	case err == nil:
+		n, perr := strconv.ParseInt(strings.TrimSpace(string(raw)), 10, 64)
+		if perr != nil || n < 0 {
+			return nil, fmt.Errorf("malformed walked counter %q", strings.TrimSpace(string(raw)))
+		}
+		st.walked = n
+	case os.IsNotExist(err):
+		// no walks charged yet
+	default:
+		return nil, fmt.Errorf("read walked counter: %w", err)
+	}
 	return st, nil
 }
 
@@ -157,12 +176,6 @@ func (st *verifyState) applyLine(line string) error {
 			return fmt.Errorf("malformed verify state line %q", line)
 		}
 		st.ranges[rangeKey(old, new)] = true
-	case verdictWalked:
-		n, err := strconv.ParseInt(rest, 10, 64)
-		if err != nil || n <= 0 {
-			return fmt.Errorf("malformed verify state line %q", line)
-		}
-		st.walked += n
 	default:
 		return fmt.Errorf("malformed verify state line %q", line)
 	}
@@ -211,12 +224,23 @@ func (st *verifyState) markRangeOK(old, new string) error {
 	return st.appendLine(verdictRange + " " + rangeKey(old, new))
 }
 
+// verifyWalkedCounterSuffix names the sibling counter file next to the
+// verdict state file; the server removes both when the request ends.
+const verifyWalkedCounterSuffix = ".walked"
+
+// walkedCounterPath is the sibling fixed-size file carrying the push's
+// cumulative examined-commit counter. Kept out of the verdict state file so
+// updating it costs O(1) — never a reserialization of the budget-bounded
+// verdict lines (Codex round 8).
+func (st *verifyState) walkedCounterPath() string {
+	assertf(st.path != "", "walkedCounterPath without a state file")
+	return st.path + verifyWalkedCounterSuffix
+}
+
 // markWalked folds n examined commits into the cumulative counter and
-// compacts the state file in place, so the file always carries at most ONE
-// walked line: appending one record per walk would grow the file once per
-// nonzero-walk ref and make every later hook re-parse all of them — the
-// same per-ref-free-record quadratic the okrange fix closed (Codex rounds
-// 5 + 6). A zero count records nothing.
+// persists it by atomically replacing the fixed-size counter file (write
+// temp + rename; hooks run strictly sequentially within one push, so there
+// is no concurrent reader to tear). A zero count records nothing.
 func (st *verifyState) markWalked(n int64) error {
 	assertf(n >= 0, "markWalked(%d)", n)
 	if n == 0 {
@@ -226,47 +250,22 @@ func (st *verifyState) markWalked(n int64) error {
 	if st.path == "" {
 		return nil
 	}
-	return st.rewrite()
-}
-
-// rewrite atomically replaces the state file with a compact rendering of
-// the in-memory state (write temp + rename). Hooks run strictly
-// sequentially within one push, so there is no concurrent reader to tear;
-// the ok/deny/okrange classes are bounded by the spawn budget, so one
-// rewrite costs O(budget) — the same order as the load every hook already
-// performs.
-func (st *verifyState) rewrite() error {
-	assertf(st.path != "", "verifyState.rewrite without a state file")
-	assertf(st.spent == len(st.ok)+len(st.deny), "verifyState.rewrite: spent %d != ok %d + deny %d", st.spent, len(st.ok), len(st.deny))
-	var b strings.Builder
-	for sha := range st.ok {
-		b.WriteString(verdictOK + " " + sha + "\n")
-	}
-	for sha, reason := range st.deny {
-		b.WriteString(verdictDeny + " " + sha + " " + reason + "\n")
-	}
-	for key := range st.ranges {
-		b.WriteString(verdictRange + " " + key + "\n")
-	}
-	if st.walked > 0 {
-		b.WriteString(verdictWalked + " " + strconv.FormatInt(st.walked, 10) + "\n")
-	}
-	tmp, err := os.CreateTemp(filepath.Dir(st.path), ".codestorage-verify-sig-*")
+	tmp, err := os.CreateTemp(filepath.Dir(st.path), ".codestorage-verify-walked-*")
 	if err != nil {
-		return fmt.Errorf("rewrite verify state: %w", err)
+		return fmt.Errorf("write walked counter: %w", err)
 	}
-	if _, err := tmp.WriteString(b.String()); err != nil {
+	if _, err := tmp.WriteString(strconv.FormatInt(st.walked, 10) + "\n"); err != nil {
 		_ = tmp.Close()
 		_ = os.Remove(tmp.Name())
-		return fmt.Errorf("rewrite verify state: %w", err)
+		return fmt.Errorf("write walked counter: %w", err)
 	}
 	if err := tmp.Close(); err != nil {
 		_ = os.Remove(tmp.Name())
-		return fmt.Errorf("rewrite verify state: %w", err)
+		return fmt.Errorf("write walked counter: %w", err)
 	}
-	if err := os.Rename(tmp.Name(), st.path); err != nil {
+	if err := os.Rename(tmp.Name(), st.walkedCounterPath()); err != nil {
 		_ = os.Remove(tmp.Name())
-		return fmt.Errorf("rewrite verify state: %w", err)
+		return fmt.Errorf("write walked counter: %w", err)
 	}
 	return nil
 }

@@ -156,28 +156,36 @@ func TestVerifyState_WalkedAccountingRoundTrip(t *testing.T) {
 		t.Fatalf("walked = %d, want 42 accumulated across loads", st2.walked)
 	}
 	if !st2.ok[shaA] || st2.spent != 1 {
-		t.Fatalf("ok=%v spent=%d, want the verdict to survive walked compaction", st2.ok[shaA], st2.spent)
+		t.Fatalf("ok=%v spent=%d, want the verdict to survive counter updates", st2.ok[shaA], st2.spent)
 	}
-	// Compaction invariant (Codex rounds 5+6): however many walks, the
-	// file carries at most ONE walked line, so per-hook reload cost stays
-	// bounded by the spawn budget, not the ref count.
+	// Counter-separation invariant (Codex rounds 5–8): the verdict file
+	// never carries walk records — the counter lives in a fixed-size
+	// sibling — so neither per-walk appends nor per-walk rewrites can
+	// amplify state processing with the ref count.
 	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := strings.Count(string(data), verdictWalked+" "); got != 1 {
-		t.Fatalf("state file has %d walked lines, want exactly 1 (compacted):\n%s", got, data)
+	if strings.Contains(string(data), "walked") {
+		t.Fatalf("verdict state file carries walk records:\n%s", data)
+	}
+	counter, err := os.ReadFile(path + verifyWalkedCounterSuffix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(string(counter)) != "42" {
+		t.Fatalf("counter file = %q, want 42", counter)
 	}
 }
 
-func TestVerifyState_MalformedWalkedLineFailsClosed(t *testing.T) {
-	for _, bad := range []string{"walked", "walked x", "walked -1", "walked 0"} {
+func TestVerifyState_MalformedWalkedCounterFailsClosed(t *testing.T) {
+	for _, bad := range []string{"x", "-1", "1 2"} {
 		path := newStateFile(t)
-		if err := os.WriteFile(path, []byte(bad+"\n"), 0o600); err != nil {
+		if err := os.WriteFile(path+verifyWalkedCounterSuffix, []byte(bad+"\n"), 0o600); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := openVerifyState(); err == nil {
-			t.Fatalf("state line %q loaded without error", bad)
+			t.Fatalf("walked counter %q loaded without error", bad)
 		}
 	}
 }

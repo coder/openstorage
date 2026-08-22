@@ -490,6 +490,9 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 			return
 		}
 		defer os.Remove(stateFile.Name())
+		// The hooks keep the cumulative walk counter in a sibling file
+		// (verifyState.walkedCounterPath); remove it with the state.
+		defer os.Remove(stateFile.Name() + verifyWalkedCounterSuffix)
 		cmd.Env = append(cmd.Env, EnvVerifyState+"="+stateFile.Name())
 		if s.VerifySigBudget > 0 {
 			cmd.Env = append(cmd.Env, EnvVerifySigBudget+"="+strconv.Itoa(s.VerifySigBudget))
