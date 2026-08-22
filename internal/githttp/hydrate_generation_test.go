@@ -89,6 +89,10 @@ func (s *countingStore) CountLFSObjects(context.Context, string) (int64, error) 
 	panic("Hydrate must never count LFS objects")
 }
 
+func (s *countingStore) LiveReservationKeys(context.Context, []string, time.Duration) ([]string, error) {
+	panic("Hydrate must never read reservations")
+}
+
 func (s *countingStore) ListRefs(context.Context, string) (map[string]string, error) {
 	s.mu.Lock()
 	s.listRefsCalls++

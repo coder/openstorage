@@ -289,6 +289,28 @@ ON CONFLICT (key) DO UPDATE SET repo = EXCLUDED.repo,
 	return dec, nil
 }
 
+// LiveReservationKeys reports which keys hold unexpired reservation rows.
+func (s *PG) LiveReservationKeys(ctx context.Context, keys []string, ttl time.Duration) ([]string, error) {
+	assertf(len(keys) > 0 && ttl > 0, "LiveReservationKeys(%d keys, %v)", len(keys), ttl)
+	rows, err := s.pool.Query(ctx, `
+SELECT key FROM pack_reservations
+WHERE key = ANY($1) AND created_at > now() - make_interval(secs => $2)`,
+		keys, ttl.Seconds())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var live []string
+	for rows.Next() {
+		var k string
+		if err := rows.Scan(&k); err != nil {
+			return nil, err
+		}
+		live = append(live, k)
+	}
+	return live, rows.Err()
+}
+
 // ReleasePackReservations deletes the owner's reservations for keys.
 func (s *PG) ReleasePackReservations(ctx context.Context, keys []string, owner string) error {
 	assertf(len(keys) > 0 && owner != "", "ReleasePackReservations(%v, %q)", keys, owner)

@@ -70,6 +70,9 @@ func (f *fakeInner) HasLFSObject(context.Context, string, string) (bool, error) 
 	return false, nil
 }
 func (f *fakeInner) CountLFSObjects(context.Context, string) (int64, error) { return 0, nil }
+func (f *fakeInner) LiveReservationKeys(context.Context, []string, time.Duration) ([]string, error) {
+	return nil, nil
+}
 
 type fakeRepos struct {
 	repo meta.Repo

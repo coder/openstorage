@@ -106,6 +106,15 @@ type RefStore interface {
 	// reservation row per pack key on success. See ledger.go for the
 	// admission formula and serialization discipline.
 	ReservePackBytes(ctx context.Context, group []string, packs []Pack, owner string, usageFloor, quotaBytes int64, ttl time.Duration) (ReserveDecision, error)
+	// LiveReservationKeys reports which of the given keys currently hold
+	// an unexpired reservation row (issue #51, Codex security round 3).
+	// The LFS batch surface uses it to make batch admissions
+	// NON-renewing: a batch skips keys that are already reserved, so only
+	// actual transfer progress (the PUT paths) refreshes a reservation's
+	// clock — a batch-only writer cannot hold quota headroom beyond one
+	// TTL. Point-in-time read; the later reservation call re-checks
+	// admission transactionally regardless.
+	LiveReservationKeys(ctx context.Context, keys []string, ttl time.Duration) ([]string, error)
 	// ReleasePackReservations deletes the caller's reservation rows for
 	// keys — the failed-upload cleanup path. Owner-scoped: a stale caller
 	// must not delete a newer reservation another push re-acquired for the

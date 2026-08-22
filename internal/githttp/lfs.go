@@ -456,6 +456,39 @@ func (s *Server) lfsBatchUpload(r *http.Request, repoElem string, target repoTar
 				incoming += sz
 			}
 		}
+		// Batch admissions are NON-renewing (Codex security round 3): a
+		// key already holding a live reservation is skipped — its action
+		// is still issued against the existing hold — so repeated batches
+		// never refresh a reservation's clock. Only transfer progress
+		// (the PUT paths) refreshes; a batch-only writer therefore holds
+		// headroom for at most one TTL, while crash retries still get
+		// their actions without wedging.
+		if len(packs) > 0 {
+			keys := make([]string, len(packs))
+			for i, p := range packs {
+				keys[i] = p.Key
+			}
+			live, err := s.Store.LiveReservationKeys(ctx, keys, s.lfsReservationTTL())
+			if err != nil {
+				log.Printf("lfs quota: %s: live-reservation read failed: %v", repoID, err)
+				return s.denyAllNeeded(order, needIdx, results, http.StatusInternalServerError, "storage quota check failed")
+			}
+			if len(live) > 0 {
+				held := make(map[string]bool, len(live))
+				for _, k := range live {
+					held[k] = true
+				}
+				kept := packs[:0]
+				incoming = 0
+				for _, p := range packs {
+					if !held[p.Key] {
+						kept = append(kept, p)
+						incoming += p.Size
+					}
+				}
+				packs = kept
+			}
+		}
 		if len(packs) > 0 {
 			denyAll := func(code int, msg string) []lfsObjectResult {
 				return s.denyAllNeeded(order, needIdx, results, code, msg)

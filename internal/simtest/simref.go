@@ -195,6 +195,11 @@ func (s *SimRefStore) HasLFSObject(ctx context.Context, repo, key string) (bool,
 	return s.inner.HasLFSObject(ctx, repo, key)
 }
 
+// LiveReservationKeys delegates to the inner store.
+func (s *SimRefStore) LiveReservationKeys(ctx context.Context, keys []string, ttl time.Duration) ([]string, error) {
+	return s.inner.LiveReservationKeys(ctx, keys, ttl)
+}
+
 // CountLFSObjects delegates to the inner store.
 func (s *SimRefStore) CountLFSObjects(ctx context.Context, repo string) (int64, error) {
 	return s.inner.CountLFSObjects(ctx, repo)

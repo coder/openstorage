@@ -103,6 +103,32 @@ func placeholders(n int) string {
 	return string(out)
 }
 
+// LiveReservationKeys reports which keys hold unexpired reservation rows.
+func (s *SQLite) LiveReservationKeys(ctx context.Context, keys []string, ttl time.Duration) ([]string, error) {
+	assertf(len(keys) > 0 && ttl > 0, "LiveReservationKeys(%d keys, %v)", len(keys), ttl)
+	args := make([]any, 0, len(keys)+1)
+	for _, k := range keys {
+		args = append(args, k)
+	}
+	args = append(args, ttl.Milliseconds())
+	rows, err := s.db.QueryContext(ctx, `
+SELECT key FROM pack_reservations
+WHERE key IN (?`+placeholders(len(keys)-1)+`) AND created_at > `+sqliteEpochMS+` - ?`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var live []string
+	for rows.Next() {
+		var k string
+		if err := rows.Scan(&k); err != nil {
+			return nil, err
+		}
+		live = append(live, k)
+	}
+	return live, rows.Err()
+}
+
 // ReleasePackReservations deletes the owner's reservations for keys.
 func (s *SQLite) ReleasePackReservations(ctx context.Context, keys []string, owner string) error {
 	assertf(len(keys) > 0 && owner != "", "ReleasePackReservations(%v, %q)", keys, owner)

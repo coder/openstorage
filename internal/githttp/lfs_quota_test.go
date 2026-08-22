@@ -833,6 +833,41 @@ func TestLFSAdopt_LegacyMismatchReplaced(t *testing.T) {
 	}
 }
 
+// TestLFSQuota_BatchReservationsNotRenewable (Codex security round 3): a
+// batch-only writer must not sustain a quota hold past one TTL by
+// re-batching the same OID — batches skip keys with live reservations
+// (still issuing actions), so only actual transfers refresh the clock.
+func TestLFSQuota_BatchReservationsNotRenewable(t *testing.T) {
+	const ttl = 400 * time.Millisecond
+	srv, _, mint := newLFSQuotaServer(t, 100, ttl)
+	tok := mint(auth.ScopeGitWrite)
+	hog := bytes.Repeat([]byte("h"), 90)
+	victim := bytes.Repeat([]byte("v"), 90)
+
+	// Batch 1 reserves 90 of 100 and never transfers.
+	resp := decodeBatch(t, doLFS(t, srv, http.MethodPost, lfsBatchPath, "basic:"+tok,
+		batchBody("upload", sha256Hex(hog), 90)))
+	if resp.Objects[0].Error != nil {
+		t.Fatalf("first batch denied: %+v", resp.Objects[0])
+	}
+	// Halfway through the TTL, re-batching the same OID still yields an
+	// action (no wedge) but must NOT refresh the reservation clock.
+	time.Sleep(ttl / 2)
+	resp = decodeBatch(t, doLFS(t, srv, http.MethodPost, lfsBatchPath, "basic:"+tok,
+		batchBody("upload", sha256Hex(hog), 90)))
+	if resp.Objects[0].Error != nil || resp.Objects[0].Actions["upload"] == nil {
+		t.Fatalf("re-batch of a held key lost its action: %+v", resp.Objects[0])
+	}
+	// One full TTL after the ORIGINAL batch, the hold must be gone even
+	// though the re-batch happened mid-window: a competing upload admits.
+	time.Sleep(ttl/2 + ttl/4)
+	resp = decodeBatch(t, doLFS(t, srv, http.MethodPost, lfsBatchPath, "basic:"+tok,
+		batchBody("upload", sha256Hex(victim), 90)))
+	if resp.Objects[0].Error != nil {
+		t.Fatalf("batch-only hold survived past its TTL despite re-batching: %+v", resp.Objects[0])
+	}
+}
+
 // TestLFSQuota_NamespaceUsageRollsUpToBase: pack bytes registered under a
 // namespace member of the repo group charge the same quota LFS admission
 // uses — one token must not obtain fresh headroom per surface.
