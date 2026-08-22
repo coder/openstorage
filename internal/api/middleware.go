@@ -102,14 +102,14 @@ func bearerToken(r *http.Request) (string, bool) {
 
 // requireAuth enforces the docs/02 failure map for one route: missing or
 // unverifiable token -> 401 (+WWW-Authenticate via writeErr); verified token
-// missing ANY of the required scopes (docs/02: e.g. DELETE /repos/tags
-// demands both git:read and git:write), a non-"org" repo claim on an
-// org-level route, or an empty/"org" repo claim on a per-repo route -> 403
-// (claim mismatch with target). On success the verified claims are injected
-// into the request context; per-repo handlers can rely on a non-empty,
-// non-"org" repo claim.
-func requireAuth(verifier auth.Verifier, orgLevel bool, requiredScopes ...string) middleware {
-	return requireAuthWith(verifier, orgLevel, writeErr, requiredScopes...)
+// issued for another org (issue #47), missing ANY of the required scopes
+// (docs/02: e.g. DELETE /repos/tags demands both git:read and git:write), a
+// non-"org" repo claim on an org-level route, or an empty/"org" repo claim
+// on a per-repo route -> 403 (claim mismatch with target). On success the
+// verified claims are injected into the request context; per-repo handlers
+// can rely on a non-empty, non-"org" repo claim.
+func requireAuth(verifier auth.Verifier, org string, orgLevel bool, requiredScopes ...string) middleware {
+	return requireAuthWith(verifier, org, orgLevel, writeErr, requiredScopes...)
 }
 
 // authFailStatus maps the two auth-failure HTTP codes onto the docs/04
@@ -142,11 +142,11 @@ func writeAuthEnvelope(w http.ResponseWriter, httpCode int, msg string) {
 
 // requireAuthWrite is requireAuth with ADR-26 envelope-shaped 401/403
 // bodies; every docs/04 write route must use it.
-func requireAuthWrite(verifier auth.Verifier, orgLevel bool, requiredScopes ...string) middleware {
-	return requireAuthWith(verifier, orgLevel, writeAuthEnvelope, requiredScopes...)
+func requireAuthWrite(verifier auth.Verifier, org string, orgLevel bool, requiredScopes ...string) middleware {
+	return requireAuthWith(verifier, org, orgLevel, writeAuthEnvelope, requiredScopes...)
 }
 
-func requireAuthWith(verifier auth.Verifier, orgLevel bool, fail func(http.ResponseWriter, int, string), requiredScopes ...string) middleware {
+func requireAuthWith(verifier auth.Verifier, org string, orgLevel bool, fail func(http.ResponseWriter, int, string), requiredScopes ...string) middleware {
 	assertf(verifier != nil, "requireAuth: nil verifier")
 	assertf(fail != nil, "requireAuth: nil failure writer")
 	assertf(len(requiredScopes) > 0, "requireAuth: no required scopes")
@@ -166,6 +166,15 @@ func requireAuthWith(verifier auth.Verifier, orgLevel bool, fail func(http.Respo
 				return
 			}
 			assertf(claims != nil, "Verifier returned nil claims without error")
+			// Served-org gate (issue #47), mirroring githttp.Server.verifyClaims:
+			// a signature valid for some *other* registered org (e.g. a row
+			// retained after CODESTORAGE_ORG changed) must not grant access to
+			// this deployment's REST surface. Checked before scopes so the
+			// failure mode matches the git path's ordering.
+			if org != "" && claims.Iss != org {
+				fail(w, http.StatusForbidden, fmt.Sprintf("token issued for org %q, not served here", claims.Iss))
+				return
+			}
 			for _, scope := range requiredScopes {
 				if !claims.HasScope(scope) {
 					fail(w, http.StatusForbidden, "missing required scope "+scope)

@@ -273,3 +273,61 @@ func TestNewVerifier_NilKeySourcePanics(t *testing.T) {
 	}()
 	NewVerifier(nil)
 }
+
+// --- UnionKeySource (issue #45) ---------------------------------------------
+
+// TestUnionKeySource_OverlaysOnlyTheTargetOrg pins the loopback-key seam:
+// the unioned PEM verifies tokens for exactly the configured org, other
+// orgs resolve through the inner source unchanged, and inner errors
+// propagate.
+func TestUnionKeySource_OverlaysOnlyTheTargetOrg(t *testing.T) {
+	fileKey := mustGenerateKey(t, "ES256")
+	loopKey := mustGenerateKey(t, "ES256")
+	otherKey := mustGenerateKey(t, "ES256")
+	inner := fakeKeySource{
+		"acme":  {mustPublicPEM(t, fileKey)},
+		"other": {mustPublicPEM(t, otherKey)},
+	}
+	src := UnionKeySource(inner, "acme", mustPublicPEM(t, loopKey))
+
+	acme, err := src.PublicKeysForOrg(context.Background(), "acme")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(acme) != 2 || acme[0] != mustPublicPEM(t, fileKey) || acme[1] != mustPublicPEM(t, loopKey) {
+		t.Fatalf("acme keys = %d blocks, want inner file key + loopback key", len(acme))
+	}
+	other, err := src.PublicKeysForOrg(context.Background(), "other")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(other) != 1 || other[0] != mustPublicPEM(t, otherKey) {
+		t.Fatalf("other org keys = %d blocks, want inner key only", len(other))
+	}
+	if _, err := src.PublicKeysForOrg(context.Background(), "ghost"); err == nil {
+		t.Fatal("unknown org must propagate the inner error")
+	}
+
+	// End-to-end through the verifier: a loopback-signed token verifies
+	// for acme, and the same signature never verifies for the other org
+	// (its claims select the other org's keys).
+	v := NewVerifier(src)
+	if _, err := v.Verify(context.Background(), mustMint(t, loopKey, "ES256", validClaims("acme"))); err != nil {
+		t.Fatalf("loopback token for acme: %v", err)
+	}
+	if _, err := v.Verify(context.Background(), mustMint(t, loopKey, "ES256", validClaims("other"))); err == nil {
+		t.Fatal("loopback key must not verify tokens for other orgs")
+	}
+}
+
+// TestUnionKeySource_RejectsBadInputs pins the constructor's crash-early
+// contract: an unparsable PEM block is a programming error, not a latent
+// verification gap.
+func TestUnionKeySource_RejectsBadInputs(t *testing.T) {
+	defer func() {
+		if recover() == nil {
+			t.Fatal("UnionKeySource with a bad PEM block must panic")
+		}
+	}()
+	UnionKeySource(fakeKeySource{}, "acme", "not a pem block")
+}

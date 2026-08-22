@@ -70,6 +70,43 @@ func NewVerifier(keys KeySource) *OrgKeyVerifier {
 	return &OrgKeyVerifier{keys: keys}
 }
 
+// unionKeySource overlays in-memory PEM blocks onto one org's registered
+// keys (issue #45): the serve process's ephemeral loopback public key must
+// verify that process's own sync-push tokens without ever being persisted —
+// a shared database slot would make replica boots delete each other's keys.
+type unionKeySource struct {
+	inner KeySource
+	org   string
+	pems  []string
+}
+
+// UnionKeySource returns a KeySource that appends pems to inner's result
+// for exactly org; every other org resolves through inner unchanged.
+func UnionKeySource(inner KeySource, org string, pems ...string) KeySource {
+	assertf(inner != nil, "UnionKeySource: nil inner KeySource")
+	assertf(org != "", "UnionKeySource: empty org")
+	assertf(len(pems) > 0, "UnionKeySource: no PEM blocks to union")
+	for i, p := range pems {
+		_, err := ParsePublicKeysPEM([]byte(p))
+		assertf(err == nil, "UnionKeySource: PEM block %d does not parse: %v", i, err)
+	}
+	return unionKeySource{inner: inner, org: org, pems: pems}
+}
+
+func (s unionKeySource) PublicKeysForOrg(ctx context.Context, name string) ([]string, error) {
+	keys, err := s.inner.PublicKeysForOrg(ctx, name)
+	if err != nil {
+		return nil, err
+	}
+	if name != s.org {
+		return keys, nil
+	}
+	// Copy before appending: inner may return a slice it retains.
+	out := make([]string, 0, len(keys)+len(s.pems))
+	out = append(out, keys...)
+	return append(out, s.pems...), nil
+}
+
 // Verify authenticates a compact JWT per the Verifier contract: allowed
 // algorithm, valid signature for one of the issuer's registered keys,
 // `exp` in the future, `sub` == SubjectLiteral. Any failure maps to 401.

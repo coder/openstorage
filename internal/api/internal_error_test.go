@@ -30,6 +30,10 @@ func (f failingStore) PublicKeysForOrg(context.Context, string) ([]string, error
 	return nil, f.err
 }
 
+func (f failingStore) OrgNames(context.Context) ([]string, error) {
+	return nil, f.err
+}
+
 func (f failingStore) CreateRepo(context.Context, string, string, string) (meta.Repo, error) {
 	return meta.Repo{}, f.err
 }

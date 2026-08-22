@@ -292,6 +292,24 @@ func (s *SQLite) PublicKeysForOrg(ctx context.Context, name string) ([]string, e
 	return pems, rows.Err()
 }
 
+// OrgNames returns every org row's name, ordered by name.
+func (s *SQLite) OrgNames(ctx context.Context) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT name FROM orgs ORDER BY name`)
+	if err != nil {
+		return nil, fmt.Errorf("list org names: %w", err)
+	}
+	defer rows.Close()
+	var names []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		names = append(names, name)
+	}
+	return names, rows.Err()
+}
+
 // CreateRepo inserts a live repo with a server-generated RepoID.
 // ErrAlreadyExists when (org, url) is taken — even by a soft-deleted row.
 func (s *SQLite) CreateRepo(ctx context.Context, org, url, defaultBranch string) (Repo, error) {

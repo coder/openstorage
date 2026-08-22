@@ -16,10 +16,10 @@ import (
 // registerRepoURLRoutes wires the repo-urls surface: org-level org:read
 // token → 200 {"repo_id", "repo_name", "url"}; unknown/deleted repo → 404
 // {"error"} envelope; repo-scoped token → 403 (org-level auth).
-func registerRepoURLRoutes(mux *http.ServeMux, s *server, verifier auth.Verifier, rl *rateLimiter) {
+func registerRepoURLRoutes(mux *http.ServeMux, s *server, verifier auth.Verifier, org string, rl *rateLimiter) {
 	assertf(mux != nil && s != nil && verifier != nil, "registerRepoURLRoutes: nil dependency")
 	mux.Handle("GET /api/repo-urls/{repo_id}",
-		rl.limit(routeRead)(requireAuth(verifier, true, auth.ScopeOrgRead)(http.HandlerFunc(s.handleGetRepoURL))))
+		rl.limit(routeRead)(requireAuth(verifier, org, true, auth.ScopeOrgRead)(http.HandlerFunc(s.handleGetRepoURL))))
 }
 
 // repoURLResponse is the get_repo_url_by_id 200 shape (openapi.yaml).
