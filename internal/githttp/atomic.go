@@ -23,12 +23,16 @@ import (
 )
 
 // sniffPeekBudget bounds how many request bytes sniffAtomicPush buffers
-// while looking for the first command line, which may be preceded by
-// `shallow <oid>` lines (pushes from shallow clones). ~20k shallow lines
-// fit; a stream that exhausts the budget is treated as non-atomic. That
-// fail-open is deliberate: mis-detection merely restores the pre-#28
-// behavior, whose damage is quota-bounded junk in the pusher's own repo,
-// while failing closed would reject legitimate deep-shallow pushes.
+// while looking for the first command line, which may be preceded by an
+// unbounded `shallow <oid>` prefix (gitprotocol-pack update-requests;
+// pushes from shallow clones). ~20k shallow lines fit. A stream that
+// exhausts the budget is treated as ATOMIC — failing closed, because the
+// prefix is client-controlled: treating it as non-atomic would let a
+// pusher pad shallow lines to bypass the gate (Codex round 1), re-opening
+// both the pack leak and the durable-CAS atomicity violation. The
+// over-restriction is small and safe: a wholly-allowed push is unaffected
+// by the atomic gate, and a mixed-policy push from a >1 MiB-shallow clone
+// is denied with the split-the-push remedy instead of leaking.
 const sniffPeekBudget = 1 << 20
 
 // maxPktLen is the protocol's pkt-line length ceiling (gitprotocol-common:
@@ -38,10 +42,14 @@ const maxPktLen = 65520
 // sniffAtomicPush reports whether the receive-pack request stream in r
 // requests the `atomic` capability, returning a reader that replays the
 // consumed bytes followed by the rest of r. The input is untrusted wire
-// data: any framing surprise returns (false, replay) — never a panic —
-// leaving protocol enforcement to git, which parses the identical bytes.
-// False positives are impossible relative to receive-pack's behavior:
-// the sniffed token is the very request that makes receive-pack atomic.
+// data: a framing surprise returns (false, replay) — never a panic —
+// which is safe because git parses the identical bytes with the same
+// grammar and dies on them before pre-receive can publish anything. The
+// one place our scan can give up where git's would not — a shallow prefix
+// exhausting sniffPeekBudget — fails closed (atomic) instead, see the
+// budget comment. False positives on the capability itself are impossible
+// relative to receive-pack's behavior: the sniffed token is the very
+// request that makes receive-pack atomic.
 func sniffAtomicPush(r io.Reader) (bool, io.Reader) {
 	var peeked bytes.Buffer
 	tee := io.TeeReader(r, &peeked)
@@ -83,5 +91,7 @@ func sniffAtomicPush(r io.Reader) (bool, io.Reader) {
 		}
 		return false, replay()
 	}
-	return false, replay()
+	// Peek budget exhausted inside the (client-controlled) shallow prefix:
+	// fail closed. See sniffPeekBudget.
+	return true, replay()
 }

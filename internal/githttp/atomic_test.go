@@ -50,7 +50,11 @@ func TestSniffAtomicPush(t *testing.T) {
 		{"malformed length", "zzzz garbage", false},
 		{"oversized length", "ffff" + strings.Repeat("x", 32), false},
 		{"truncated payload", "0040short", false},
-		{"peek budget exhausted fails open", overBudget + pkt(cmdLine("refs/heads/main", "atomic")), false},
+		// A client can pad the shallow prefix past any fixed budget, so
+		// exhaustion must fail CLOSED (atomic) or padding would bypass the
+		// gate (Codex round 1) — regardless of what follows the budget.
+		{"peek budget exhausted fails closed (atomic follows)", overBudget + pkt(cmdLine("refs/heads/main", "atomic")), true},
+		{"peek budget exhausted fails closed (non-atomic follows)", overBudget + pkt(cmdLine("refs/heads/main", "report-status")), true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
