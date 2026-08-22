@@ -448,26 +448,32 @@ type foldCandidate struct {
 // repair in flight), as are rows that can never pair (individually over
 // the byte budget — never downloaded at all).
 //
-// Object counts exist only after materialization, so selection runs in two
-// bounded batches (total downloads <= 2x the byte budget):
+// Object counts exist only after materialization, so selection runs in
+// bounded materialization batches:
 //
 //  1. oldest-first byte-greedy -> materialize -> joint greedy in the same
 //     order (the steady-state path, preferring the oldest accumulation);
-//  2. rescue, when pass 1 pairs nothing: cheapest-bytes-first greedy
-//     (maximizes how many candidates the download budget can materialize)
-//     -> materialize the new ones -> joint greedy over ALL materialized
-//     candidates in ascending-object order, then a definitive pair scan
-//     with oldest-first greedy extension. The scan is exact over the
-//     materialized set: if any two materialized packs fit both budgets,
-//     a fold happens — one greedy ordering alone can wedge on a byte-heavy
-//     low-object pack (or the mirror image) while a cross pair fits, and
-//     the same wedge would then repeat on every trigger while rows grow.
-//     It is in-memory integer work, early-exiting, no I/O.
+//  2. rescue LOOP, when pass 1 pairs nothing: repeatedly materialize the
+//     cheapest not-yet-materialized candidates (ascending bytes maximizes
+//     coverage per downloaded byte) and re-try — an ascending-object joint
+//     greedy, then a definitive early-exit pair scan with oldest-first
+//     extension, both exact over everything materialized so far. Because
+//     ALREADY-materialized candidates never consume the allowance again,
+//     each iteration reaches strictly deeper into the ascending-byte
+//     order: cheap packs that materialization exposed as unpairable
+//     (individually over the object budget) cannot re-starve the next
+//     batch, which was the deterministic wedge — the same garbage
+//     swallowing the same single rescue batch on every trigger while a
+//     feasible pair sat one batch deeper.
 //
-// Residual: a feasible pair whose members BOTH stay unmaterialized (crowded
-// out of both batches by many cheaper packs) is missed; later folds shrink
-// the set and every batch is re-selected fresh per fold, so the miss is
-// transient, never a permanent wedge on the same input.
+// The loop stops at a hard download cap (repackRescueBudgets extra byte
+// budgets), when everything is materialized, or when nothing more fits.
+// Residual: a feasible pair buried deeper than the cap's worth of cheaper
+// unpairable garbage is missed that fold. Sustaining the wedge requires
+// ever-growing volumes of individually-object-oversized packs — real pack
+// bytes scale with object count, so such packs are not cheap — which the
+// git-surface per-repo pack quotas bound; and any fold that does land
+// re-shuffles the set for the next selection.
 func (r *Repacker) selectFoldInput(ctx context.Context, repo string, rows []ref.Pack) (repoPath string, fold []ref.Pack, err error) {
 	byteBudget, objBudget := r.byteBudget(), int64(r.objectBudget())
 	var cands []*foldCandidate
@@ -506,6 +512,42 @@ func (r *Repacker) selectFoldInput(ctx context.Context, repo string, rows []ref.
 		return nil
 	}
 
+	// tryFold searches everything materialized so far: ascending-object
+	// joint greedy, then the definitive early-exit pair scan with
+	// oldest-first extension — exact in-memory integer work, no I/O.
+	tryFold := func() []ref.Pack {
+		var mat []*foldCandidate // materialized, oldest-first order
+		for _, c := range cands {
+			if c.objects >= 0 {
+				mat = append(mat, c)
+			}
+		}
+		byObjects := append([]*foldCandidate(nil), mat...)
+		sort.SliceStable(byObjects, func(i, j int) bool { return byObjects[i].objects < byObjects[j].objects })
+		if fold := jointGreedy(byObjects); fold != nil {
+			return fold
+		}
+		for i := 0; i < len(mat); i++ {
+			for j := i + 1; j < len(mat); j++ {
+				if mat[i].bytes+mat[j].bytes > byteBudget || int64(mat[i].objects+mat[j].objects) > objBudget {
+					continue
+				}
+				sel := []ref.Pack{mat[i].pack, mat[j].pack}
+				b, o := mat[i].bytes+mat[j].bytes, int64(mat[i].objects+mat[j].objects)
+				for k, c := range mat {
+					if k == i || k == j || b+c.bytes > byteBudget || o+int64(c.objects) > objBudget {
+						continue
+					}
+					sel = append(sel, c.pack)
+					b += c.bytes
+					o += int64(c.objects)
+				}
+				return sel
+			}
+		}
+		return nil
+	}
+
 	// Batch 1: oldest-first under the byte budget.
 	var batch []*foldCandidate
 	var batchBytes int64
@@ -523,58 +565,48 @@ func (r *Repacker) selectFoldInput(ctx context.Context, repo string, rows []ref.
 	if fold := jointGreedy(batch); fold != nil {
 		return repoPath, fold, nil
 	}
-
-	// Batch 2 (rescue): cheapest-first; already-materialized candidates
-	// ride along free, new downloads stay under one more byte budget.
-	asc := append([]*foldCandidate(nil), cands...)
-	sort.SliceStable(asc, func(i, j int) bool { return asc[i].bytes < asc[j].bytes })
-	var fresh []*foldCandidate
-	var freshBytes int64
-	for _, c := range asc {
-		if c.objects >= 0 {
-			continue
-		}
-		if freshBytes+c.bytes > byteBudget {
-			continue
-		}
-		fresh = append(fresh, c)
-		freshBytes += c.bytes
-	}
-	if _, err := r.materializeCounts(ctx, repo, fresh); err != nil {
-		return "", nil, err
-	}
-	var mat []*foldCandidate // all materialized, oldest-first order
-	for _, c := range cands {
-		if c.objects >= 0 {
-			mat = append(mat, c)
-		}
-	}
-	byObjects := append([]*foldCandidate(nil), mat...)
-	sort.SliceStable(byObjects, func(i, j int) bool { return byObjects[i].objects < byObjects[j].objects })
-	if fold := jointGreedy(byObjects); fold != nil {
+	if fold := tryFold(); fold != nil {
 		return repoPath, fold, nil
 	}
-	// Definitive pair scan (early exit), then oldest-first extension.
-	for i := 0; i < len(mat); i++ {
-		for j := i + 1; j < len(mat); j++ {
-			if mat[i].bytes+mat[j].bytes > byteBudget || int64(mat[i].objects+mat[j].objects) > objBudget {
+
+	// Rescue loop: cheapest-unmaterialized-first batches under the
+	// remaining download allowance; each iteration reaches strictly
+	// deeper (materialized candidates never re-consume the allowance).
+	asc := append([]*foldCandidate(nil), cands...)
+	sort.SliceStable(asc, func(i, j int) bool { return asc[i].bytes < asc[j].bytes })
+	allowance := repackRescueBudgets * byteBudget
+	for allowance > 0 {
+		var fresh []*foldCandidate
+		var freshBytes int64
+		for _, c := range asc {
+			if c.objects >= 0 {
+				continue // materialized: never re-billed
+			}
+			if freshBytes+c.bytes > byteBudget || freshBytes+c.bytes > allowance {
 				continue
 			}
-			sel := []ref.Pack{mat[i].pack, mat[j].pack}
-			b, o := mat[i].bytes+mat[j].bytes, int64(mat[i].objects+mat[j].objects)
-			for k, c := range mat {
-				if k == i || k == j || b+c.bytes > byteBudget || o+int64(c.objects) > objBudget {
-					continue
-				}
-				sel = append(sel, c.pack)
-				b += c.bytes
-				o += int64(c.objects)
-			}
-			return repoPath, sel, nil
+			fresh = append(fresh, c)
+			freshBytes += c.bytes
+		}
+		if len(fresh) == 0 {
+			break // everything affordable is materialized
+		}
+		allowance -= freshBytes
+		if _, err := r.materializeCounts(ctx, repo, fresh); err != nil {
+			return "", nil, err
+		}
+		if fold := tryFold(); fold != nil {
+			return repoPath, fold, nil
 		}
 	}
 	return repoPath, nil, nil
 }
+
+// repackRescueBudgets caps the rescue loop's total extra downloads (in
+// multiples of the byte budget) beyond batch 1. Three budgets let the loop
+// dig past substantial unpairable garbage while keeping one fold's I/O
+// bounded at 1+3 byte budgets.
+const repackRescueBudgets = 3
 
 // materializeCounts materializes the candidates' packs (via the injected
 // seam) and fills in their exact object counts from the idx fanout tables.

@@ -824,6 +824,83 @@ func TestRepack_CrossBudgetRescueFindsPair(t *testing.T) {
 	}
 }
 
+// TestRepack_RescueLoopDigsPastUnpairableGarbage pins the round-22
+// starvation shape: pass 1 fills on a byte-heavy pack; a first rescue
+// batch fills entirely with cheap packs that materialization reveals as
+// individually object-oversized (unpairable); the loop's NEXT iteration —
+// materialized garbage never re-consumes the allowance — must reach the
+// genuinely pairable duo sitting one batch deeper and fold it.
+func TestRepack_RescueLoopDigsPastUnpairableGarbage(t *testing.T) {
+	f := newRepackFixture(t)
+	ctx := context.Background()
+
+	mkPack := func(blobs []string) (id, path string) {
+		t.Helper()
+		dir := t.TempDir()
+		id = strings.TrimSpace(testGit(t, f.scratch, strings.Join(blobs, "\n")+"\n", "pack-objects", "--threads=1", "-q", filepath.Join(dir, "x")))
+		return id, filepath.Join(dir, "x-"+id+".pack")
+	}
+	blobOfSize := func(tag string, n int) string {
+		return strings.TrimSpace(testGit(t, f.scratch, tag+randomText(n), "hash-object", "-w", "--stdin"))
+	}
+	// Shapes (registration order = selection order):
+	//   big:      1 object, ~64KB      (pass-1 filler)
+	//   garbage:  30 objects, tiny     (cheapest; object-oversized at budget 20)
+	//   pairA/B:  1 object, ~2KB each  (the feasible duo, pricier than garbage)
+	var garbageBlobs []string
+	for i := range 30 {
+		garbageBlobs = append(garbageBlobs, blobOfSize(fmt.Sprintf("g%d ", i), 8))
+	}
+	idBig, pathBig := mkPack([]string{blobOfSize("big ", 64<<10)})
+	idGarbage, pathGarbage := mkPack(garbageBlobs)
+	idPairA, pathPairA := mkPack([]string{blobOfSize("pa ", 2<<10)})
+	idPairB, pathPairB := mkPack([]string{blobOfSize("pb ", 2<<10)})
+
+	sizeOf := func(p string) int64 {
+		fi, err := os.Stat(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return fi.Size()
+	}
+	if !(sizeOf(pathGarbage) < sizeOf(pathPairA)) {
+		t.Fatalf("fixture shape broken: garbage (%d) must be cheaper than pair members (%d)",
+			sizeOf(pathGarbage), sizeOf(pathPairA))
+	}
+	for _, reg := range []struct{ id, path string }{
+		{idBig, pathBig}, {idGarbage, pathGarbage}, {idPairA, pathPairA}, {idPairB, pathPairB},
+	} {
+		key := blob.PackKey(f.repo, reg.id)
+		if err := f.blobs.UploadFile(ctx, key, reg.path); err != nil {
+			t.Fatal(err)
+		}
+		if err := f.store.RegisterPacks(ctx, f.repo, []ref.Pack{{ID: reg.id, Key: key}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	r := f.repacker(t.TempDir())
+	// Byte budget: big alone fills pass 1 (nothing else fits beside it);
+	// one rescue batch fits garbage but not garbage+pairA; the loop's
+	// second batch reaches the pair. Object budget 20 makes garbage (30
+	// objects) individually unpairable while big+anything is byte-bound.
+	r.MaxFoldBytes = sizeOf(pathBig) + sizeOf(pathGarbage)/2
+	r.MaxFoldObjects = 20
+	folded, err := r.Repack(ctx, f.repo)
+	if err != nil || !folded {
+		t.Fatalf("rescue-loop repack = (folded %v, err %v), want the pair folded", folded, err)
+	}
+	rows := f.packRows(t)
+	if len(rows) != 3 {
+		t.Fatalf("pack rows = %+v, want [big, garbage, fold(pairA,pairB)]", rows)
+	}
+	for _, row := range rows {
+		if row.ID == idPairA || row.ID == idPairB {
+			t.Fatalf("pack rows = %+v: the pair must have been folded away", rows)
+		}
+	}
+}
+
 // randomText returns n bytes of git-safe pseudo-random text that zlib
 // cannot meaningfully compress (hex of urandom).
 func randomText(n int) string {
