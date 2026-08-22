@@ -35,7 +35,7 @@ import (
 	"strconv"
 	"strings"
 
-	"codestorage/internal/ref"
+	"github.com/coder/code-storage/internal/ref"
 )
 
 // EnvVerifyState carries the per-push verify-sig state file path from the

@@ -9,7 +9,7 @@ import (
 	"strconv"
 	"strings"
 
-	"codestorage/internal/ref"
+	"github.com/coder/code-storage/internal/ref"
 )
 
 // TreeEntry types (docs/03 GET /repos/files entry `type`): symlinks and

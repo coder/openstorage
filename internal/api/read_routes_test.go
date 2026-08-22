@@ -8,7 +8,7 @@ import (
 	"net/http"
 	"testing"
 
-	"codestorage/internal/auth"
+	"github.com/coder/code-storage/internal/auth"
 )
 
 // readRoutes is the full docs/07 p3 route set plus the notes read routes

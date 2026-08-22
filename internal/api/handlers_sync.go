@@ -26,9 +26,9 @@ import (
 	"strings"
 	"time"
 
-	"codestorage/internal/auth"
-	"codestorage/internal/meta"
-	upsync "codestorage/internal/sync"
+	"github.com/coder/code-storage/internal/auth"
+	"github.com/coder/code-storage/internal/meta"
+	upsync "github.com/coder/code-storage/internal/sync"
 )
 
 // registerSyncRoutes registers pull-upstream + upstream detach. Scopes per

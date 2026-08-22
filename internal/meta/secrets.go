@@ -12,7 +12,7 @@ import (
 	"fmt"
 	"strings"
 
-	"codestorage/internal/secrets"
+	"github.com/coder/code-storage/internal/secrets"
 )
 
 // ErrReservedSecret: CreateWebhook/CreateGitCredential/UpdateGitCredential

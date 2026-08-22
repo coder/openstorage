@@ -17,7 +17,7 @@ import (
 	"strings"
 	"time"
 
-	"codestorage/internal/meta"
+	"github.com/coder/code-storage/internal/meta"
 )
 
 const (

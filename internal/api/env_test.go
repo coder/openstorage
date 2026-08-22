@@ -38,11 +38,11 @@ import (
 	"github.com/lestrrat-go/jwx/v3/jws"
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 
-	"codestorage/internal/auth"
-	"codestorage/internal/blob"
-	"codestorage/internal/meta"
-	"codestorage/internal/ref"
-	upsync "codestorage/internal/sync"
+	"github.com/coder/code-storage/internal/auth"
+	"github.com/coder/code-storage/internal/blob"
+	"github.com/coder/code-storage/internal/meta"
+	"github.com/coder/code-storage/internal/ref"
+	upsync "github.com/coder/code-storage/internal/sync"
 )
 
 const testHTTPBaseURL = "https://selfhost.code.storage"

@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"time"
 
-	"codestorage/internal/blob"
+	"github.com/coder/code-storage/internal/blob"
 )
 
 // SimBlobStore decorates a blob.BlobStore with seeded fault injection.

@@ -22,14 +22,14 @@ import (
 	"os"
 	"time"
 
-	"codestorage/internal/api"
-	"codestorage/internal/auth"
-	"codestorage/internal/blob"
-	"codestorage/internal/githttp"
-	"codestorage/internal/jobs"
-	"codestorage/internal/meta"
-	"codestorage/internal/ref"
-	"codestorage/internal/secrets"
+	"github.com/coder/code-storage/internal/api"
+	"github.com/coder/code-storage/internal/auth"
+	"github.com/coder/code-storage/internal/blob"
+	"github.com/coder/code-storage/internal/githttp"
+	"github.com/coder/code-storage/internal/jobs"
+	"github.com/coder/code-storage/internal/meta"
+	"github.com/coder/code-storage/internal/ref"
+	"github.com/coder/code-storage/internal/secrets"
 )
 
 // buildAPIHandler opens the metadata store, bootstraps the single org with

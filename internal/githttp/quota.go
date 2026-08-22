@@ -40,7 +40,7 @@ import (
 	"sync"
 	"time"
 
-	"codestorage/internal/blob"
+	"github.com/coder/code-storage/internal/blob"
 )
 
 // EnvPackQuota carries the resolved per-repo pack-bytes quota from the serve

@@ -16,7 +16,7 @@ import (
 	"testing"
 	"time"
 
-	"codestorage/internal/auth"
+	"github.com/coder/code-storage/internal/auth"
 )
 
 var repoIDRe = regexp.MustCompile(`\Arepo_[0-9a-f]{12}\z`)

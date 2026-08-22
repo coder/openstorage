@@ -3,7 +3,7 @@ package events
 import (
 	"context"
 
-	"codestorage/internal/meta"
+	"github.com/coder/code-storage/internal/meta"
 )
 
 // MetaWebhookStore adapts the durable meta.EventingStore webhook rows to

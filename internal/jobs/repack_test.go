@@ -26,11 +26,11 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 
-	"codestorage/internal/blob"
-	"codestorage/internal/events"
-	"codestorage/internal/githttp"
-	"codestorage/internal/ref"
-	"codestorage/internal/sync"
+	"github.com/coder/code-storage/internal/blob"
+	"github.com/coder/code-storage/internal/events"
+	"github.com/coder/code-storage/internal/githttp"
+	"github.com/coder/code-storage/internal/ref"
+	"github.com/coder/code-storage/internal/sync"
 )
 
 // testGit runs git hermetically (host config/identity must not leak into

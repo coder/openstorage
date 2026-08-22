@@ -17,7 +17,7 @@ import (
 	"strings"
 	"testing"
 
-	"codestorage/internal/auth"
+	"github.com/coder/code-storage/internal/auth"
 )
 
 // aliasRequireIdentical asserts one alias request and its v1 twin produce a

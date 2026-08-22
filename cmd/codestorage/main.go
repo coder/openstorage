@@ -22,12 +22,12 @@ import (
 	"strings"
 	"time"
 
-	"codestorage/internal/api"
-	"codestorage/internal/auth"
-	"codestorage/internal/blob"
-	"codestorage/internal/githttp"
-	"codestorage/internal/meta"
-	"codestorage/internal/ref"
+	"github.com/coder/code-storage/internal/api"
+	"github.com/coder/code-storage/internal/auth"
+	"github.com/coder/code-storage/internal/blob"
+	"github.com/coder/code-storage/internal/githttp"
+	"github.com/coder/code-storage/internal/meta"
+	"github.com/coder/code-storage/internal/ref"
 )
 
 func main() {

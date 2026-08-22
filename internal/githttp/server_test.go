@@ -15,8 +15,8 @@ import (
 	"testing"
 	"time"
 
-	"codestorage/internal/auth"
-	"codestorage/internal/meta"
+	"github.com/coder/code-storage/internal/auth"
+	"github.com/coder/code-storage/internal/meta"
 )
 
 // memKeys is an in-memory auth.KeySource: org name -> PEM public key blocks.

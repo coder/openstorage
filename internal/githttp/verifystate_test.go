@@ -12,7 +12,7 @@ import (
 	"strings"
 	"testing"
 
-	"codestorage/internal/ref"
+	"github.com/coder/code-storage/internal/ref"
 )
 
 const (
