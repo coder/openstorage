@@ -141,42 +141,44 @@ type repackWorker struct {
 	pool     *pgxpool.Pool
 }
 
-// Work folds once, then closes the trigger-uniqueness window: it completes
-// the job via JobCompleteTx and re-checks the follow-up threshold strictly
-// AFTER that completion commits. Registrations racing the completion are
-// covered either by this recheck (committed before it) or by their own
-// trigger's insert (running after it, when the unique index no longer
-// holds an active row). The recheck is gated on an actual fold: after a
-// lost race there is nothing new to schedule (in river deployments the
-// winner was another river job whose own recheck runs), and after a
-// budget no-op a follow-up would no-op forever.
+// Work folds once, then closes the trigger-uniqueness window ATOMICALLY:
+// one transaction completes the job (JobCompleteTx) and inserts an
+// unconditional successor — the completion removes this row from the
+// unique-active-states index, so the successor's insert in the same
+// transaction succeeds, and either both are durable or neither is. Every
+// registration whose trigger was coalesced against this running job is
+// therefore covered: the successor exists the instant the completion
+// commits, with no fallible check-and-insert window in between (a crash,
+// canceled context, or transient store failure there previously left no
+// active job to recover). The successor simply re-runs Repack: it folds
+// whatever is foldable and no-ops below two packs (or when budgets select
+// no pair), completing WITHOUT a successor of its own — chains terminate.
+// Lost races and no-ops schedule nothing: a loss proves a concurrent fold
+// won, and that winner's own completion carries the successor.
 func (w *repackWorker) Work(ctx context.Context, job *river.Job[repackArgs]) error {
 	folded, err := w.repacker.Repack(ctx, job.Args.Repo)
 	if !folded {
 		return err // real failures and clean no-ops/lost races (err == nil)
 	}
 	if err != nil {
-		// The fold COMMITTED but its post-swap verification failed
+		// The fold committed (or may have) but verification failed
 		// transiently: the row swap is durable and the sweeper's
 		// quarantine heal backstops the bytes. Failing this
-		// MaxAttempts-1 job would skip the follow-up check and strand
-		// mid-fold registrations whose triggers were coalesced — log and
-		// continue to completion + follow-up.
+		// MaxAttempts-1 job would skip the successor and strand
+		// coalesced mid-fold triggers — log and continue to the atomic
+		// completion below.
 		w.repacker.logger.Warn("repack: fold committed but verification failed (sweeper heal is the backstop)",
 			"repo", job.Args.Repo, "err", err)
 	}
 	assertf(w.pool != nil, "repackWorker: pool not wired")
-	// Transactional self-completion. Failures SNOOZE the job instead of
-	// completing it: returning nil would let river complete this
-	// MaxAttempts-1 job without the follow-up recheck ever running, and
-	// coalesced mid-fold triggers would strand (their registrations
-	// survive the fold's snapshot). A snooze keeps the recheck durably
-	// owed — the re-run's extra Repack attempt is a cheap no-op or folds
-	// genuinely new rows, either of which is correct. If the commit
-	// failure was ambiguous (it actually landed), the snooze merely
-	// resurrects a completed job for one idempotent no-op pass.
+	// Failures anywhere in the completion transaction SNOOZE the job:
+	// returning nil would let river complete it without the successor
+	// ever existing. The snoozed re-run costs one idempotent no-op fold
+	// and retries the completion; if the commit failure was ambiguous
+	// (it actually landed, successor included), the resurrected job
+	// no-ops and completes normally.
 	completionFailed := func(stage string, err error) error {
-		w.repacker.logger.Warn("repack: transactional completion failed; snoozing to preserve the follow-up recheck",
+		w.repacker.logger.Warn("repack: atomic completion failed; snoozing to retry it",
 			"repo", job.Args.Repo, "stage", stage, "err", err)
 		return river.JobSnooze(repackFollowUpDelay)
 	}
@@ -188,26 +190,14 @@ func (w *repackWorker) Work(ctx context.Context, job *river.Job[repackArgs]) err
 	if _, err := river.JobCompleteTx[*riverpgxv5.Driver](ctx, tx, job); err != nil {
 		return completionFailed("complete", err)
 	}
+	if _, err := river.ClientFromContext[pgx.Tx](ctx).InsertTx(ctx, tx, repackArgs{Repo: job.Args.Repo},
+		&river.InsertOpts{ScheduledAt: time.Now().Add(repackFollowUpDelay)}); err != nil {
+		return completionFailed("insert successor", err)
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return completionFailed("commit", err)
 	}
-	// Strictly after the completion commit: the running row is gone from
-	// the unique index, so this insert (and any concurrent trigger's)
-	// succeeds when due.
-	if w.repacker.NeedsFollowUp(ctx, job.Args.Repo) {
-		if _, err := w.insertFollowUp(ctx, job.Args.Repo); err != nil {
-			w.repacker.logger.Warn("repack: follow-up insert failed (next write retries)",
-				"repo", job.Args.Repo, "err", err)
-		}
-	}
 	return nil
-}
-
-// insertFollowUp inserts the successor fold job, slightly delayed to batch
-// a burst's remaining registrations.
-func (w *repackWorker) insertFollowUp(ctx context.Context, repo string) (*rivertype.JobInsertResult, error) {
-	return river.ClientFromContext[pgx.Tx](ctx).Insert(ctx, repackArgs{Repo: repo},
-		&river.InsertOpts{ScheduledAt: time.Now().Add(repackFollowUpDelay)})
 }
 
 // sweepWorker runs one orphan-pack sweep; the Sweeper owns all reporting.

@@ -1097,7 +1097,6 @@ func TestRiver_RepackUniqueByRepo(t *testing.T) {
 	defer release()
 	r := f.repacker(t.TempDir())
 	r.BeforeSwap = func(context.Context, ref.Pack) error { <-gate; return nil }
-	r.FollowUpThreshold = 2 // post-fold recheck: mid-run rows demand a follow-up
 
 	deliverer := &events.Deliverer{Webhooks: stubWebhooks{}, Logger: slog.New(slog.DiscardHandler)}
 	q, err := NewRiver(ctx, pgURL, deliverer, func(context.Context, sync.Job) error { return nil },
@@ -1147,8 +1146,8 @@ func TestRiver_RepackUniqueByRepo(t *testing.T) {
 	// Triggers firing while the fold runs are swallowed by uniqueness
 	// (running is a required unique state): still exactly one job. The
 	// packs registered mid-fold survive the fold's snapshot; the WORKER
-	// owns folding them via a durable successor inserted strictly after
-	// its transactional completion.
+	// owns folding them via the successor inserted atomically with its
+	// completion.
 	f.push(t)
 	f.push(t)
 	for range 3 {
@@ -1161,11 +1160,14 @@ func TestRiver_RepackUniqueByRepo(t *testing.T) {
 	}
 	release()
 
-	// The job folds its snapshot, completes itself transactionally,
-	// rechecks the threshold (fold + 2 mid-run rows = 3 >= 2), and inserts
-	// a successor; the successor folds the leftovers and completes with no
-	// further follow-up: exactly two completed jobs, one pack row.
-	waitJobs(`SELECT count(*) FROM river_job WHERE kind = 'repack' AND state = 'completed'`, 2, "completed repack jobs")
+	// The chain: job 1 folds its snapshot and atomically completes +
+	// inserts successor 1; successor 1 folds the fold + 2 mid-run rows
+	// and inserts successor 2; successor 2 sees one row, no-ops, and
+	// completes WITHOUT a successor — three completed jobs, one pack row.
+	waitJobs(`SELECT count(*) FROM river_job WHERE kind = 'repack' AND state = 'completed'`, 3, "completed repack jobs")
+	if n := countJobs(); n != 3 {
+		t.Fatalf("river holds %d repack jobs after the chain, want 3 (no-op successor must not chain)", n)
+	}
 	if rows := f.packRows(t); len(rows) != 1 {
 		t.Fatalf("pack rows after follow-up fold = %+v, want 1 (mid-run rows not refolded)", rows)
 	}
@@ -1176,8 +1178,8 @@ func TestRiver_RepackUniqueByRepo(t *testing.T) {
 	if err := q.EnqueueRepack(ctx, f.repo); err != nil {
 		t.Fatalf("enqueue after completion: %v", err)
 	}
-	if n := countJobs(); n != 3 {
-		t.Fatalf("river holds %d repack jobs after completion + retrigger, want 3", n)
+	if n := countJobs(); n != 4 {
+		t.Fatalf("river holds %d repack jobs after completion + retrigger, want 4", n)
 	}
 
 	// Insert-only clients (hook subprocesses) must refuse repack inserts:
