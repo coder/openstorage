@@ -545,7 +545,14 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 		// needs (a delete-only push reads just the command list), so a
 		// padded request would otherwise sneak past the cap undetected
 		// (Codex round 11). Drain the capped reader — bounded by the cap
-		// itself — so oversized bodies uniformly reach the 413 path.
+		// in bytes and by a read deadline in time, because git is already
+		// done and a stalling client must not pin the handler (Codex
+		// round 17; a deadline error just resolves the push from whatever
+		// the counters saw) — so oversized bodies uniformly reach the 413
+		// path.
+		if err := http.NewResponseController(w).SetReadDeadline(time.Now().Add(pushDrainTimeout)); err != nil {
+			log.Printf("%s %s: set drain deadline: %v", service, repo, err)
+		}
 		if _, err := io.Copy(io.Discard, body); err != nil && !errors.Is(err, errPushTooLarge) {
 			log.Printf("%s %s: request body drain: %v", service, repo, err)
 		}

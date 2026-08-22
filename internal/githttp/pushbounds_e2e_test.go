@@ -60,7 +60,7 @@ func assertCapEnvelope(t *testing.T, status int, body string) {
 	if err := json.Unmarshal([]byte(body), &envelope); err != nil {
 		t.Fatalf("413 body is not the structured envelope: %v\n%s", err, body)
 	}
-	if !strings.Contains(envelope.Error, "decoded push-size cap") || !strings.Contains(envelope.Error, "CODESTORAGE_MAX_PUSH_BYTES") {
+	if !strings.Contains(envelope.Error, "push-size cap") || !strings.Contains(envelope.Error, "CODESTORAGE_MAX_PUSH_BYTES") {
 		t.Fatalf("413 envelope does not name the cap and knob: %q", envelope.Error)
 	}
 }

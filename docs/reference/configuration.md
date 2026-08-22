@@ -345,6 +345,10 @@ still answers `413`, but its hooks already ran under the normal quota admission.
   negative or malformed values are startup errors.
 - Applies to git pushes only, including the upstream-sync worker's loopback pushes.
   Fetches/clones (`upload-pack`) and LFS object transfers are unaffected.
+- Gzip request bodies are additionally bounded on the **compressed** side at the cap
+  plus ~6% + 4 KiB of framing allowance (streams that decompress to almost nothing
+  cannot otherwise be bounded by a decoded count). Single-member streams — what git
+  clients send — never approach it; the 413 envelope names both bounds.
 
 ### `CODESTORAGE_VERIFY_SIG_BUDGET`
 

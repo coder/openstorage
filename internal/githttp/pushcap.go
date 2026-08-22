@@ -31,6 +31,7 @@ import (
 	"io"
 	"math"
 	"sync"
+	"time"
 )
 
 // errPushTooLarge marks a receive-pack body that exceeded the decoded-byte
@@ -40,23 +41,27 @@ var errPushTooLarge = errors.New("push body exceeds the decoded-byte cap")
 
 // pushTooLargeMsg is the client-facing 413 envelope message. It names the
 // operator knob because the default derives from the pack quota and the
-// remedy differs per deployment (raise the cap vs split the push).
+// remedy differs per deployment (raise the cap vs split the push), and it
+// names both bounds because gzip pushes can trip the compressed-side
+// allowance without reaching the decoded cap (Codex round 17).
 func pushTooLargeMsg(limit int64) string {
 	assertf(limit > 0, "pushTooLargeMsg(%d)", limit)
-	return fmt.Sprintf("push body exceeds the server's decoded push-size cap of %d bytes (CODESTORAGE_MAX_PUSH_BYTES)", limit)
+	return fmt.Sprintf("push body exceeds the server's push-size cap of %d decoded bytes (or its compressed-stream allowance; CODESTORAGE_MAX_PUSH_BYTES)", limit)
 }
 
 // wirePushLimit bounds the COMPRESSED stream of a gzip push whose decoded
 // cap is limit. The decoded counter alone cannot bound wire consumption:
 // concatenated empty gzip members decode to nothing, so a client could
 // stream unbounded compressed bytes without ever advancing the decoded
-// count (Codex round 6). A legitimate gzip body is at most marginally
-// larger than its decoded form — stored-mode deflate costs 5 bytes per
-// 64 KiB block plus constant member framing — so limit plus ~1.6% plus a
-// constant never rejects anything the decoded cap would admit. Saturating.
+// count (Codex round 6). Slack sizing: stored-mode deflate costs 5 bytes
+// per 64 KiB block, and each concatenated member adds ~18 bytes of
+// framing, so limit/16 + 4 KiB admits every plausible legitimate stream —
+// single-member (what git actually sends) trivially, and multi-member
+// streams down to ~300-byte members (Codex round 17) — while holding the
+// wire amplification of decode-to-nothing streams to ~6%. Saturating.
 func wirePushLimit(limit int64) int64 {
 	assertf(limit > 0, "wirePushLimit(%d)", limit)
-	slack := limit/64 + 1024
+	slack := limit/16 + 4096
 	if limit > math.MaxInt64-slack {
 		return math.MaxInt64
 	}
@@ -102,6 +107,16 @@ func (c *cappedReader) Read(p []byte) (int, error) {
 	c.remaining -= int64(n)
 	return n, err
 }
+
+// pushDrainTimeout bounds the post-copy drains that keep the cap counters
+// honest after receive-pack stops reading. The drains only exist for cap
+// accounting — git is done by then — so a client that stalls instead of
+// finishing its body must not hold the handler, its descriptors, and the
+// buffered response indefinitely (Codex round 17): the read deadline turns
+// the stall into a drain error, and the push resolves from whatever the
+// counters saw. Thirty seconds moves any legitimately in-flight remainder
+// (the drains consume at most one cap plus slack).
+const pushDrainTimeout = 30 * time.Second
 
 // gateBufferMax bounds pushGate's pre-consumption buffer. receive-pack
 // writes at most sideband keepalives before the request body is consumed,

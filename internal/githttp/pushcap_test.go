@@ -94,8 +94,14 @@ func TestWirePushLimit(t *testing.T) {
 	// The slack must admit any legitimate gzip encoding of a cap-sized
 	// body (stored-mode deflate ≈ +0.008% + constant framing) without
 	// materially extending the wire bound.
-	if got := wirePushLimit(1 << 20); got != (1<<20)+(1<<20)/64+1024 {
+	if got := wirePushLimit(1 << 20); got != (1<<20)+(1<<20)/16+4096 {
 		t.Fatalf("wirePushLimit(1MiB) = %d", got)
+	}
+	// The round-17 fixture: 1024 concatenated members of 1 KiB decoded
+	// each occupy ~1,072,128 wire bytes for exactly 1 MiB decoded — a
+	// legitimate stream the wire limit must admit.
+	if got := wirePushLimit(1 << 20); got < 1072128 {
+		t.Fatalf("wirePushLimit(1MiB) = %d, must admit 1024x1KiB multi-member streams (~1072128 bytes)", got)
 	}
 	if got := wirePushLimit(math.MaxInt64 - 5); got != math.MaxInt64 {
 		t.Fatalf("huge cap = %d, want MaxInt64 saturation", got)
