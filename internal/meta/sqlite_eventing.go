@@ -142,7 +142,9 @@ func (s *SQLite) ListWebhooks(ctx context.Context, org string) ([]Webhook, error
 	_ = rows.Close() // release the connection before the rewrite UPDATEs
 	for i := range hooks {
 		if err := s.decryptWebhookSQLite(ctx, &hooks[i]); err != nil {
-			return nil, err
+			// Degrade the bad row to an empty secret instead of failing
+			// the whole listing — see PG.ListWebhooks for the rationale.
+			hooks[i].Secret = ""
 		}
 	}
 	return hooks, nil

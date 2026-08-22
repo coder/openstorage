@@ -75,7 +75,13 @@ type EventingStore interface {
 	// ErrNotFound when the org is unknown.
 	CreateWebhook(ctx context.Context, org, url, secret string) (Webhook, error)
 	// ListWebhooks returns the org's webhooks in registration order.
-	// ErrNotFound when the org is unknown.
+	// ErrNotFound when the org is unknown. ListWebhooks is an enumeration
+	// surface: a row whose stored secret cannot be decrypted (issue #54)
+	// is returned with Secret == "" rather than failing the listing, so
+	// event fan-out and the list API (which never expose secrets) keep
+	// working and the bad row's ID stays discoverable for deletion.
+	// Consumers that need the secret must use GetWebhook, which fails
+	// closed per webhook.
 	ListWebhooks(ctx context.Context, org string) ([]Webhook, error)
 	// GetWebhook returns the webhook with the given ID regardless of org
 	// (delivery jobs carry only the ID); ErrNotFound when absent.

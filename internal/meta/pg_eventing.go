@@ -140,7 +140,13 @@ func (s *PG) ListWebhooks(ctx context.Context, org string) ([]Webhook, error) {
 	rows.Close() // release the connection before the rewrite UPDATEs
 	for i := range hooks {
 		if err := s.decryptWebhook(ctx, &hooks[i]); err != nil {
-			return nil, err
+			// Enumeration must not fail org-wide because one row's envelope
+			// is corrupt or under a missing key: event fan-out and the list
+			// API only need IDs, and hiding the bad row's ID would block
+			// the delete-and-re-register recovery. Degrade this row to an
+			// empty secret (never the raw envelope); per-delivery
+			// GetWebhook still fails closed for it.
+			hooks[i].Secret = ""
 		}
 	}
 	return hooks, nil

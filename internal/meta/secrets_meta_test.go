@@ -283,8 +283,31 @@ func TestSecretsWrongKeyFailsClosed(t *testing.T) {
 		} else if !strings.Contains(err.Error(), wh.ID) {
 			t.Errorf("error should name the webhook row: %v", err)
 		}
-		if _, err := wrong.ListWebhooks(ctx, org); !errors.Is(err, secrets.ErrUnknownKey) {
-			t.Errorf("ListWebhooks with wrong key: err = %v", err)
+		// Enumeration is decryption-independent: the listing succeeds and
+		// degrades the unreadable row to an empty secret (never the raw
+		// envelope), keeping its ID discoverable for deletion and event
+		// fan-out alive for healthy webhooks.
+		healthy, err := wrong.CreateWebhook(ctx, org, "https://example.com/ok", "readable")
+		if err != nil {
+			t.Fatal(err)
+		}
+		list, err := wrong.ListWebhooks(ctx, org)
+		if err != nil || len(list) != 2 {
+			t.Fatalf("ListWebhooks with one bad row: %d rows, err %v", len(list), err)
+		}
+		for _, got := range list {
+			switch got.ID {
+			case wh.ID:
+				if got.Secret != "" {
+					t.Errorf("unreadable row returned secret %q; want empty", got.Secret)
+				}
+			case healthy.ID:
+				if got.Secret != "readable" {
+					t.Errorf("healthy row returned %q; want plaintext", got.Secret)
+				}
+			default:
+				t.Errorf("unexpected webhook %q in listing", got.ID)
+			}
 		}
 		if _, err := wrong.GitCredentialForRepo(ctx, repoID); !errors.Is(err, secrets.ErrUnknownKey) {
 			t.Errorf("GitCredentialForRepo with wrong key: err = %v", err)
