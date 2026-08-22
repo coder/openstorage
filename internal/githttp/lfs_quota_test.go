@@ -731,35 +731,57 @@ func TestLFSQuota_RetryAfterFailedPutNotDoubleCounted(t *testing.T) {
 	}
 }
 
-// TestLFSAdoption_VerificationNeedsNoStagingBytes (Codex round 24):
+// TestLFSAdoption_VerificationMetersOneChunk (Codex rounds 24+25):
 // legacy-blob verification streams ranged reads through the hasher — no
-// disk staging, no staging-byte reservation — so it cannot exceed
-// LFSStagingBytes no matter what size the blob (or its concurrent
-// replacement) has. An object far larger than the whole byte budget must
-// still adopt.
-func TestLFSAdoption_VerificationNeedsNoStagingBytes(t *testing.T) {
-	srv, st, mint := newLFSQuotaServer(t, 0, time.Hour)
-	srv.LFSStagingBytes = 1 // pathological byte budget: streaming needs none of it
-	tok := mint(auth.ScopeGitWrite)
+// disk staging — but its per-read MEMORY buffer is metered against the
+// staging budget at its true upper bound, one lfsStagingChunk (round 25:
+// op slots alone would let 256 concurrent adoptions hold ~2 GiB of
+// unmetered heap). An object far larger than the budget still adopts as
+// long as ONE CHUNK fits (round 24's guarantee, now chunk-shaped), and a
+// budget that cannot hold even one chunk denies transiently instead of
+// buffering unmetered.
+func TestLFSAdoption_VerificationMetersOneChunk(t *testing.T) {
+	oldChunk := lfsStagingChunk
+	lfsStagingChunk = 16
+	t.Cleanup(func() { lfsStagingChunk = oldChunk })
 
-	legacy := []byte("a legacy object far larger than the staging byte budget")
+	legacy := []byte("a legacy object far larger than one sixteen-byte chunk")
 	oid := sha256Hex(legacy)
 	key := blob.LFSKey(lfsTestRepoID, oid)
-	if err := srv.Blob.UploadFile(context.Background(), key, writeTempFile(t, legacy)); err != nil {
-		t.Fatal(err)
-	}
 
-	resp := decodeBatch(t, doLFS(t, srv, http.MethodPost, lfsBatchPath, "basic:"+tok,
-		batchBody("upload", oid, int64(len(legacy)))))
-	if resp.Objects[0].Error != nil {
-		t.Fatalf("adoption failed under a tiny staging budget: %+v", resp.Objects[0].Error)
-	}
-	if resp.Objects[0].Actions != nil {
-		t.Fatalf("adopted object still got an upload action: %+v", resp.Objects[0])
-	}
-	if has, err := st.HasLFSObject(context.Background(), lfsTestRepoID, key); err != nil || !has {
-		t.Fatalf("legacy blob was not adopted: %v, %v", has, err)
-	}
+	t.Run("chunk-fits-full-size-need-not", func(t *testing.T) {
+		srv, st, mint := newLFSQuotaServer(t, 0, time.Hour)
+		srv.LFSStagingBytes = 20 // ≥ one chunk (16), far below the object (55)
+		tok := mint(auth.ScopeGitWrite)
+		if err := srv.Blob.UploadFile(context.Background(), key, writeTempFile(t, legacy)); err != nil {
+			t.Fatal(err)
+		}
+		resp := decodeBatch(t, doLFS(t, srv, http.MethodPost, lfsBatchPath, "basic:"+tok,
+			batchBody("upload", oid, int64(len(legacy)))))
+		if resp.Objects[0].Error != nil {
+			t.Fatalf("adoption failed with one chunk of budget: %+v", resp.Objects[0].Error)
+		}
+		if resp.Objects[0].Actions != nil {
+			t.Fatalf("adopted object still got an upload action: %+v", resp.Objects[0])
+		}
+		if has, err := st.HasLFSObject(context.Background(), lfsTestRepoID, key); err != nil || !has {
+			t.Fatalf("legacy blob was not adopted: %v, %v", has, err)
+		}
+	})
+
+	t.Run("chunk-does-not-fit-denies-transiently", func(t *testing.T) {
+		srv, _, mint := newLFSQuotaServer(t, 0, time.Hour)
+		srv.LFSStagingBytes = 8 // below one chunk: the buffer must not go unmetered
+		tok := mint(auth.ScopeGitWrite)
+		if err := srv.Blob.UploadFile(context.Background(), key, writeTempFile(t, legacy)); err != nil {
+			t.Fatal(err)
+		}
+		resp := decodeBatch(t, doLFS(t, srv, http.MethodPost, lfsBatchPath, "basic:"+tok,
+			batchBody("upload", oid, int64(len(legacy)))))
+		if resp.Objects[0].Error == nil || resp.Objects[0].Error.Code != http.StatusTooManyRequests {
+			t.Fatalf("under-chunk budget did not deny transiently: %+v", resp.Objects[0])
+		}
+	})
 }
 
 // TestLFSQuota_AtCapAdoptionDeniesBeforeDownload (Codex security round 4):
@@ -871,6 +893,91 @@ func TestLFSStaging_DripperCannotPinBudget(t *testing.T) {
 
 	pw.CloseWithError(io.ErrClosedPipe) // abort the dripper
 	<-done
+}
+
+// statCountingBlob counts Stat calls (the PUT dedup probe).
+type statCountingBlob struct {
+	blob.BlobStore
+	stats int
+}
+
+func (b *statCountingBlob) Stat(ctx context.Context, key string) (int64, error) {
+	b.stats++
+	return b.BlobStore.Stat(ctx, key)
+}
+
+// TestLFSPut_OpSlotAcquiredBeforeProbe (Codex round 25): the PUT path must
+// take its node-wide operation slot BEFORE any blob-store work — with the
+// slots exhausted, the handler must 429 without ever probing the backend,
+// or distinct-OID PUTs against a wedged backend would pile up goroutines
+// and connections that lfsMaxStagingOps never counts.
+func TestLFSPut_OpSlotAcquiredBeforeProbe(t *testing.T) {
+	srv, _, mint := newLFSQuotaServer(t, 0, time.Hour)
+	tok := mint(auth.ScopeGitWrite)
+	counting := &statCountingBlob{BlobStore: srv.Blob}
+	srv.Blob = counting
+
+	srv.lfsStagingMu.Lock()
+	srv.lfsStagingOps = lfsMaxStagingOps // every slot taken
+	srv.lfsStagingMu.Unlock()
+	t.Cleanup(func() {
+		srv.lfsStagingMu.Lock()
+		srv.lfsStagingOps = 0
+		srv.lfsStagingMu.Unlock()
+	})
+
+	content := []byte("slotless put probe")
+	w := doLFS(t, srv, http.MethodPut, "/"+lfsTestRepoURL+".git/info/lfs/objects/"+sha256Hex(content),
+		"basic:"+tok, string(content))
+	if w.Code != http.StatusTooManyRequests {
+		t.Fatalf("slot-exhausted PUT status = %d, want 429", w.Code)
+	}
+	if counting.stats != 0 {
+		t.Fatalf("slot-exhausted PUT probed the blob store %d times, want 0 (slot must come first)", counting.stats)
+	}
+}
+
+// wedgedStatBlob blocks Stat until the caller's context expires — the
+// wedged-backend scenario.
+type wedgedStatBlob struct {
+	blob.BlobStore
+}
+
+func (b wedgedStatBlob) Stat(ctx context.Context, string2 string) (int64, error) {
+	<-ctx.Done()
+	return 0, ctx.Err()
+}
+
+// TestLFSPut_ProbeIsDeadlineBound (Codex round 25): the dedup probe holds
+// an op slot, so a wedged backend must hand it back within lfsProbeTimeout
+// instead of pinning it for as long as the client keeps the connection
+// open.
+func TestLFSPut_ProbeIsDeadlineBound(t *testing.T) {
+	oldTimeout := lfsProbeTimeout
+	lfsProbeTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { lfsProbeTimeout = oldTimeout })
+
+	srv, _, mint := newLFSQuotaServer(t, 0, time.Hour)
+	tok := mint(auth.ScopeGitWrite)
+	srv.Blob = wedgedStatBlob{BlobStore: srv.Blob}
+
+	content := []byte("wedged backend probe")
+	start := time.Now()
+	w := doLFS(t, srv, http.MethodPut, "/"+lfsTestRepoURL+".git/info/lfs/objects/"+sha256Hex(content),
+		"basic:"+tok, string(content))
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("wedged-probe PUT status = %d, want 500", w.Code)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("wedged probe took %v — deadline not applied", elapsed)
+	}
+	// The op slot must be back.
+	srv.lfsStagingMu.Lock()
+	ops := srv.lfsStagingOps
+	srv.lfsStagingMu.Unlock()
+	if ops != 0 {
+		t.Fatalf("op slots after wedged probe = %d, want 0 (slot leaked)", ops)
+	}
 }
 
 // TestLFSUpload_AbsoluteDeadlineBoundsDrip (Codex security round 2): a

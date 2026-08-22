@@ -147,6 +147,13 @@ func (s *Server) reserveLFSStaging(n int64) bool {
 	return true
 }
 
+// lfsProbeTimeout bounds the PUT path's pre-body blob probe (a var for
+// tests): the dedup Stat runs while holding a node-wide op slot (Codex
+// round 25), so a wedged backend must return the slot within a bounded
+// window instead of letting 256 stuck probes disable the surface for as
+// long as clients keep their connections open.
+var lfsProbeTimeout = time.Minute
+
 // lfsStagingChunk is the staging-budget growth quantum (a var for tests).
 // Proxy uploads reserve one chunk ahead of the bytes actually received
 // instead of their full declared Content-Length (Codex security round 5 on
@@ -172,6 +179,19 @@ func (s *Server) growLFSStaging(n int64) bool {
 		s.lfsStagingInFlight += n
 	}
 	return true
+}
+
+// shrinkLFSStaging returns bytes grown via growLFSStaging without ending
+// the operation (the op slot stays held; one releaseLFSStaging still ends
+// it).
+func (s *Server) shrinkLFSStaging(n int64) {
+	assertf(n > 0, "shrinkLFSStaging(%d)", n)
+	s.lfsStagingMu.Lock()
+	defer s.lfsStagingMu.Unlock()
+	if s.LFSStagingBytes > 0 {
+		s.lfsStagingInFlight -= n
+		assertf(s.lfsStagingInFlight >= 0, "shrinkLFSStaging(%d): in-flight went negative", n)
+	}
 }
 
 // releaseLFSStaging returns a reserveLFSStaging reservation.

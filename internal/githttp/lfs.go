@@ -686,6 +686,18 @@ func (s *Server) verifyStoredLFSObject(ctx context.Context, key, oid string) (in
 	if err != nil {
 		return 0, fmt.Errorf("stat for verification: %w", err)
 	}
+	// The ranged reads below buffer up to one chunk in MEMORY, and the op
+	// slots alone would let 256 concurrent adoptions hold ~2 GiB of
+	// unmetered heap (Codex round 25, security). Charge the buffer's true
+	// upper bound — one chunk, or the whole object when smaller — against
+	// the staging budget for the verification's lifetime: memory spent on
+	// behalf of clients is metered by the same budget as disk.
+	if buf := min(lfsStagingChunk, size); buf > 0 {
+		if !s.growLFSStaging(buf) {
+			return 0, errLFSBusy
+		}
+		defer s.shrinkLFSStaging(buf)
+	}
 	h := sha256.New()
 	for off := int64(0); off < size; {
 		n := min(lfsStagingChunk, size-off)
@@ -880,13 +892,33 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target r
 		return
 	}
 	defer s.lfsUploadsInFlight.Delete(key)
+	// Node-wide operation slot BEFORE any blob-store work (Codex round
+	// 25): the dedup probe below can block on a slow or wedged backend,
+	// and handlers not yet holding a slot would accumulate goroutines and
+	// connections past lfsMaxStagingOps — distinct-OID PUTs are free to
+	// mint. The slot is taken with ZERO bytes; the byte budget is grown
+	// below only once a body will actually stream, and stagingReserved
+	// tracks the grown total for the single deferred release. (Adoption
+	// briefly takes a second slot of its own — it must hold one on the
+	// batch path too — which only makes the cap more conservative.)
+	if !s.reserveLFSStaging(0) {
+		w.Header().Set("Retry-After", "10")
+		lfsError(w, http.StatusTooManyRequests, "server LFS staging budget exhausted, retry")
+		return
+	}
+	stagingReserved := int64(0)
+	defer func() { s.releaseLFSStaging(stagingReserved) }()
 	// Dedup before charging (the zero-growth rule): a re-PUT of a stored
 	// object (crash-window retry, concurrent identical upload) adds
 	// nothing — adopt it into the registry and succeed without reading
 	// the body (the key is content-addressed, so stored bytes match). A
 	// failed adoption fails the PUT: 200 would let the client commit a
-	// pointer to a blob the sweeper still sees as an orphan.
-	switch _, err := s.Blob.Stat(ctx, key); {
+	// pointer to a blob the sweeper still sees as an orphan. The probe is
+	// deadline-bound (Codex round 25): a wedged backend must hand the op
+	// slot back instead of pinning it until the client hangs up.
+	pctx, pcancel := context.WithTimeout(ctx, lfsProbeTimeout)
+	defer pcancel()
+	switch _, err := s.Blob.Stat(pctx, key); {
 	case err == nil:
 		switch aerr := s.adoptLFSObject(ctx, repoID, key, oid); {
 		case aerr == nil:
@@ -937,13 +969,14 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target r
 			r.ContentLength, s.LFSStagingBytes))
 		return
 	}
-	stagingReserved := min(r.ContentLength, lfsStagingChunk)
-	if !s.reserveLFSStaging(stagingReserved) {
-		w.Header().Set("Retry-After", "10")
-		lfsError(w, http.StatusTooManyRequests, "server LFS staging budget exhausted, retry")
-		return
+	if initial := min(r.ContentLength, lfsStagingChunk); initial > 0 {
+		if !s.growLFSStaging(initial) {
+			w.Header().Set("Retry-After", "10")
+			lfsError(w, http.StatusTooManyRequests, "server LFS staging budget exhausted, retry")
+			return
+		}
+		stagingReserved = initial
 	}
-	defer func() { s.releaseLFSStaging(stagingReserved) }()
 	// NO durable reservation before body progress, deliberately (Codex
 	// security round 3 + round 16): a header-only PUT repeated once per
 	// TTL could otherwise hold the repository's whole headroom forever
