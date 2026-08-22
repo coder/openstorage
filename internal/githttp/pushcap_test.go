@@ -151,24 +151,45 @@ func TestPushGate_SettleOverflowDiscardsPastAndFuture(t *testing.T) {
 	}
 }
 
-func TestPushGate_ForcesOpenPastBufferBound(t *testing.T) {
+// TestPushGate_SpillsPastBufferBoundWithoutCommitting pins the round-18
+// contract: output beyond the memory bound spills to disk and the response
+// stays uncommitted — a 413 must remain possible until the counters settle,
+// however chatty receive-pack was.
+func TestPushGate_SpillsPastBufferBoundWithoutCommitting(t *testing.T) {
 	var dst bytes.Buffer
 	g := newPushGate(&dst)
-	big := bytes.Repeat([]byte("x"), gateBufferMax+1)
+	big := bytes.Repeat([]byte("x"), gateBufferMax+64)
+	if _, err := g.Write([]byte("head-")); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := g.Write(big); err != nil {
 		t.Fatal(err)
 	}
-	if dst.Len() != len(big) {
-		t.Fatalf("oversized early output was buffered (%d of %d bytes flushed), want forced stream", dst.Len(), len(big))
+	if _, err := g.Write([]byte("-tail")); err != nil {
+		t.Fatal(err)
 	}
-	if !g.responseStarted() {
-		t.Fatal("forced-open gate must report a started response (413 no longer possible)")
+	if dst.Len() != 0 || g.responseStarted() {
+		t.Fatalf("pre-settle output leaked (%d bytes, started=%v): 413 no longer possible", dst.Len(), g.responseStarted())
 	}
-	// settle(false) after the forced open stays a no-op.
 	if err := g.settle(false); err != nil {
 		t.Fatal(err)
 	}
-	if dst.Len() != len(big) {
-		t.Fatalf("settle after forced open changed output to %d bytes", dst.Len())
+	want := "head-" + string(big) + "-tail"
+	if dst.String() != want {
+		t.Fatalf("settle(false) emitted %d bytes, want %d in order", dst.Len(), len(want))
+	}
+}
+
+func TestPushGate_SpillDiscardedOnOverflow(t *testing.T) {
+	var dst bytes.Buffer
+	g := newPushGate(&dst)
+	if _, err := g.Write(bytes.Repeat([]byte("x"), gateBufferMax+64)); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.settle(true); err != nil {
+		t.Fatal(err)
+	}
+	if dst.Len() != 0 || g.responseStarted() {
+		t.Fatalf("overflow gate leaked %d bytes (started=%v)", dst.Len(), g.responseStarted())
 	}
 }

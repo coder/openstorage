@@ -30,6 +30,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"os"
 	"sync"
 	"time"
 )
@@ -118,22 +119,29 @@ func (c *cappedReader) Read(p []byte) (int, error) {
 // (the drains consume at most one cap plus slack).
 const pushDrainTimeout = 30 * time.Second
 
-// gateBufferMax bounds pushGate's pre-consumption buffer. receive-pack
-// writes at most sideband keepalives before the request body is consumed,
-// so the bound should never bind; if some git version streams real output
-// early, the gate opens and streams it (giving up the 413 conversion for
-// that request) rather than buffering without bound.
+// gateBufferMax bounds pushGate's in-MEMORY pre-verdict buffer.
+// receive-pack writes at most sideband keepalives before the request body
+// is consumed, so the bound rarely binds; larger pre-verdict output (a
+// completed multi-ref push reporting while the client still trickles
+// trailing padding) SPILLS TO DISK rather than committing the response —
+// flushing early would lock in a 200 before the drain could detect
+// overflow, breaking the 413 contract (Codex round 18). Blocking the
+// writer instead would deadlock: git stops reading stdin when its stdout
+// stalls. Spill volume is bounded by receive-pack's output for one
+// cap-bounded request (report-status is one line per command in the body).
 const gateBufferMax = 1 << 20
 
 // pushGate is the receive-pack stdout writer that keeps the 413 conversion
-// possible: writes are buffered until settle() reports how body consumption
-// ended. settle(false) flushes and switches to pass-through; settle(true)
-// discards everything, past and future, so the handler can still send the
-// 413 envelope on the untouched http.ResponseWriter.
+// possible: writes are buffered (spilling past gateBufferMax) until
+// settle() reports how body consumption ended. settle(false) flushes and
+// switches to pass-through; settle(true) discards everything, past and
+// future, so the handler can still send the 413 envelope on the untouched
+// http.ResponseWriter.
 type pushGate struct {
 	mu      sync.Mutex
 	dst     io.Writer
 	buf     bytes.Buffer
+	spill   *os.File // unlinked-at-create overflow for buf, nil until needed
 	settled bool
 	discard bool
 	wrote   bool // any byte reached dst (response committed)
@@ -150,44 +158,71 @@ func (g *pushGate) Write(p []byte) (int, error) {
 	if g.discard {
 		return len(p), nil
 	}
-	if !g.settled && g.buf.Len()+len(p) > gateBufferMax {
-		// Unexpectedly large early output: stream rather than grow. See
-		// gateBufferMax.
-		if err := g.flushLocked(); err != nil {
-			return 0, err
-		}
-		g.settled = true
+	if g.settled {
+		return g.writeDstLocked(p)
 	}
-	if !g.settled {
+	// Once spilling starts, everything goes to the spill to preserve
+	// order behind the memory buffer's contents.
+	if g.spill == nil && g.buf.Len()+len(p) <= gateBufferMax {
 		return g.buf.Write(p)
 	}
-	return g.writeDstLocked(p)
+	if g.spill == nil {
+		f, err := os.CreateTemp("", "codestorage-push-gate-*")
+		if err != nil {
+			return 0, fmt.Errorf("push gate spill: %w", err)
+		}
+		// Unlink immediately: the handle is the only reference, so the
+		// bytes vanish with it on every exit path.
+		_ = os.Remove(f.Name())
+		g.spill = f
+	}
+	n, err := g.spill.Write(p)
+	if err != nil {
+		return n, fmt.Errorf("push gate spill: %w", err)
+	}
+	return n, nil
 }
 
 // settle resolves the gate once the request body copy has finished:
 // overflowed=true discards all receive-pack output (the handler answers
-// 413 instead), overflowed=false flushes the buffer and streams from here
-// on. Calling settle on a gate that already forced itself open is a no-op
-// for false and impossible-by-construction for true (the handler checks
-// responseStarted before converting to 413).
+// 413 instead), overflowed=false flushes the buffered and spilled output
+// in order and streams from here on.
 func (g *pushGate) settle(overflowed bool) error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	if overflowed {
-		g.discard = true
-		g.buf.Reset()
-		g.settled = true
-		return nil
-	}
 	if g.settled {
 		return nil
 	}
 	g.settled = true
-	return g.flushLocked()
+	spill := g.spill
+	g.spill = nil
+	if spill != nil {
+		defer spill.Close() // unlinked at creation: close is the delete
+	}
+	if overflowed {
+		g.discard = true
+		g.buf.Reset()
+		return nil
+	}
+	if err := g.flushLocked(); err != nil {
+		return err
+	}
+	if spill != nil {
+		if _, err := spill.Seek(0, io.SeekStart); err != nil {
+			return fmt.Errorf("push gate spill: %w", err)
+		}
+		g.wrote = true
+		if _, err := io.Copy(g.dst, spill); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // responseStarted reports whether any byte reached the underlying writer —
 // after which the response status is committed and a 413 is impossible.
+// False until settle by construction: pre-verdict output only ever lands
+// in the buffer or the spill file.
 func (g *pushGate) responseStarted() bool {
 	g.mu.Lock()
 	defer g.mu.Unlock()
