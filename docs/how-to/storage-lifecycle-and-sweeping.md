@@ -32,7 +32,7 @@ whole registered object set, so unreachable objects are carried forward by desig
 and **deleting repositories**: `DELETE /repos` soft-deletes the metadata record (freeing
 the name), while the repository's pack registry rows and blobs stay put and the sweeper
 keeps counting them live. Reclaiming a deleted repository's storage is currently a
-manual operation.
+manual operation ([#52](https://github.com/coder/code-storage/issues/52)).
 
 ## Inspect what a repository stores
 
