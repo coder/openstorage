@@ -645,25 +645,21 @@ func verifySig(ctx context.Context, refName, old, new string) error {
 	if err != nil {
 		return fmt.Errorf("verify-sig: %w", err) // fail closed
 	}
-	pending, examined, err := introducedPending(ctx, state, refName, old, new, budget)
+	pending, _, err := introducedPending(ctx, state, refName, old, new, budget)
 	if err != nil {
 		return err
 	}
 	if len(pending) == 0 {
 		// Nothing new to verify — no keyring access needed, mirroring the
-		// deletion rule. A range that examined nothing (a rewind or
-		// re-advance introducing zero commits) also records nothing:
-		// recomputing it later costs one silent rev-list, whereas
-		// persisting it would let one push with many distinct
-		// zero-introduced ranges grow the state file once per ref and
-		// re-scan it in every later hook (Codex round 4). Only ranges
-		// whose commits carry cached verdicts are worth a record.
-		if examined == 0 {
-			return nil
-		}
-		if err := state.markRangeOK(old, new); err != nil {
-			return fmt.Errorf("verify-sig: %w", err)
-		}
+		// deletion rule. Deliberately records NO range verdict: okrange
+		// lines are persisted only when commits were actually verified
+		// (below), so the state file stays bounded by the spawn budget no
+		// matter how many distinct zero-introduced or fully-cached ranges
+		// one push carries (Codex rounds 4 + 5 — per-ref free records
+		// would grow the file once per ref and make every later hook
+		// rescan it). Recomputing a cached range costs one rev-list whose
+		// examined commits charge the walk allowance, keeping the total
+		// bounded.
 		return nil
 	}
 
