@@ -96,7 +96,11 @@ bootstrapped from this value at startup.
 ### `CODESTORAGE_ORG_PUBKEYS`
 
 **Required.** Path to a PEM file with one or more public key blocks (PKIX) that verify the
-org's JWTs. Every block is validated at startup — bad key material is a startup error.
+org's JWTs. Every block that PEM-decodes is validated at startup (must be a `PUBLIC KEY`
+block of a supported family) — but parsing stops silently at the first undecodable data, so
+a truncated block appended after a valid key is dropped rather than rejected. After a key
+rotation, verify a token signed with the newly added key is accepted instead of trusting
+startup success.
 Generate a keypair with [`codestorage keygen`](cli.md#codestorage-keygen); allowed JWS
 algorithms are `ES256`, `RS256`, `EdDSA`, `PS256`, `ES384`, `ES512` (`none` and `HS*` are
 always rejected).
