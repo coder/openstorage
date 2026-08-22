@@ -62,7 +62,14 @@
 // retries — a client whose push died between reserve and upload would be
 // locked out for the full TTL, the exact wedge class issue #21's reviews
 // eliminated. Same-key re-reservation instead refreshes the row (bytes
-// counted once — identical keys are identical bytes).
+// counted once — identical keys are identical bytes), KEEPING the original
+// owner (issue #51, Codex round 5): a refresh that took ownership would
+// let the newcomer's failure cleanup free the one row backing the original
+// writer's still-staging upload — an upload-duration-sized window for
+// uncounted growth. The inverse hazard (the original's failure cleanup
+// firing in the instants after a newcomer's refresh) is accepted as the
+// lesser risk: failure and release are one code path, so that window is
+// tiny, and the miss only leaves a TTL-bounded row.
 
 package ref
 
@@ -199,6 +206,17 @@ func (s *PG) ReservePackBytes(ctx context.Context, group []string, packs []Pack,
 		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1), $2)`, group[0], reserveLockClass); err != nil {
 			return err
 		}
+		// Self-healing GC (Codex round 5 on #51): expired rows already
+		// stopped gating admission, but they occupy physical rows the
+		// sweeper may never prune (sweeping can be disabled). Pruning this
+		// base repo's expired rows inside the serialized admission
+		// transaction bounds the repo's PHYSICAL row population at the
+		// active-row cap plus one TTL of churn, with no sweeper required.
+		if _, err := tx.Exec(ctx, `
+DELETE FROM pack_reservations WHERE repo = $1 AND created_at <= now() - make_interval(secs => $2)`,
+			group[0], ttl.Seconds()); err != nil {
+			return err
+		}
 		// ONE statement = one snapshot: a concurrent registration moves a
 		// key's bytes from reservation to counter atomically, so either
 		// side of that move is counted here, never neither.
@@ -229,10 +247,18 @@ SELECT
 			// Same-key upsert: a crash-window retry (or a concurrent
 			// identical push) refreshes the row instead of conflicting, so
 			// identical bytes are counted once and retries never wedge.
+			// The refresh deliberately KEEPS the existing owner (Codex
+			// round 5 on #51): replacing it would let the newcomer's
+			// failure cleanup delete the one row backing the original
+			// writer's still-in-flight upload — cross-replica same-key
+			// races must fail toward a TTL-bounded leak, never toward an
+			// uncounted in-flight upload. The original owner's own
+			// release stays correct, and settlement consumes by KEY
+			// regardless of owner.
 			if _, err := tx.Exec(ctx, `
 INSERT INTO pack_reservations (key, repo, bytes, owner) VALUES ($1, $2, $3, $4)
 ON CONFLICT (key) DO UPDATE SET repo = EXCLUDED.repo, bytes = EXCLUDED.bytes,
-                                owner = EXCLUDED.owner, created_at = now()`,
+                                created_at = now()`,
 				p.Key, group[0], p.Size, owner); err != nil {
 				return err
 			}
@@ -363,6 +389,17 @@ func (s *PG) RegisterLFSObject(ctx context.Context, repo, key string, bytes int6
 		}
 		return creditUsagePG(ctx, tx, repo, bytes)
 	})
+}
+
+// CountLFSObjects returns repo's registered LFS object count (a PK-prefix
+// index count; the LFS surface's per-repo object-count cap reads it at
+// admission time — issue #51, Codex security round 2).
+func (s *PG) CountLFSObjects(ctx context.Context, repo string) (int64, error) {
+	assertf(repo != "", "CountLFSObjects(%q)", repo)
+	var n int64
+	err := s.pool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM lfs_objects WHERE repo = $1`, repo).Scan(&n)
+	return n, err
 }
 
 // HasLFSObject reports whether (repo, key) is a registered LFS object.

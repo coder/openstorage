@@ -69,6 +69,7 @@ func (f *fakeInner) RegisterLFSObject(context.Context, string, string, int64) er
 func (f *fakeInner) HasLFSObject(context.Context, string, string) (bool, error) {
 	return false, nil
 }
+func (f *fakeInner) CountLFSObjects(context.Context, string) (int64, error) { return 0, nil }
 
 type fakeRepos struct {
 	repo meta.Repo

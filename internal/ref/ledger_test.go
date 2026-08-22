@@ -174,15 +174,68 @@ func TestReserveSameKeyRefreshes(t *testing.T) {
 		}
 		k.wantState(0, 60, 0)
 
-		// The stale owner's release must not free the refreshed row.
-		if err := s.ReleasePackReservations(ctx, []string{a.Key}, "owner-old"); err != nil {
-			t.Fatalf("stale release: %v", err)
+		// The refresh KEEPS the original owner (Codex round 5 on #51): the
+		// NEWCOMER's failure cleanup must not free the row — the original
+		// writer may still be staging behind it, for its whole upload
+		// duration. (The inverse hazard — the original's cleanup firing in
+		// the instants after a newcomer's refresh — is the accepted lesser
+		// risk: failure and release are one code path, so that window is
+		// not upload-sized, and the leak it can cause is TTL-bounded.)
+		if err := s.ReleasePackReservations(ctx, []string{a.Key}, "owner-new"); err != nil {
+			t.Fatalf("newcomer release: %v", err)
 		}
 		k.wantState(0, 60, 0)
-		if err := s.ReleasePackReservations(ctx, []string{a.Key}, "owner-new"); err != nil {
-			t.Fatalf("owner release: %v", err)
+		if err := s.ReleasePackReservations(ctx, []string{a.Key}, "owner-old"); err != nil {
+			t.Fatalf("original owner release: %v", err)
 		}
 		k.wantState(0, 0, 0)
+	})
+}
+
+// TestReservePrunesExpiredPhysicalRows (Codex round 5 on #51): admission
+// itself prunes the base repo's EXPIRED rows — with sweeping disabled, a
+// writer cycling TTL windows must not grow the table without bound.
+// Physical row counts are read directly (repo-scoped, so exact even on the
+// shared PG test store).
+func TestReservePrunesExpiredPhysicalRows(t *testing.T) {
+	runRefBackends(t, func(t *testing.T, s Store) {
+		ctx := context.Background()
+		k := newLedgerKit(t, s)
+		countRows := func() int {
+			t.Helper()
+			var n int
+			switch st := s.(type) {
+			case *PG:
+				if err := st.pool.QueryRow(ctx,
+					`SELECT COUNT(*) FROM pack_reservations WHERE repo = $1`, k.base()).Scan(&n); err != nil {
+					t.Fatal(err)
+				}
+			case *SQLite:
+				if err := st.db.QueryRowContext(ctx,
+					`SELECT COUNT(*) FROM pack_reservations WHERE repo = ?`, k.base()).Scan(&n); err != nil {
+					t.Fatal(err)
+				}
+			default:
+				t.Fatalf("unknown store %T", s)
+			}
+			return n
+		}
+
+		ttl := 100 * time.Millisecond
+		if dec, err := s.ReservePackBytes(ctx, k.group, []Pack{k.pack(k.base(), "aa1", 10)}, "o1", 0, 1000, ttl); err != nil || !dec.OK {
+			t.Fatalf("reserve: %+v, %v", dec, err)
+		}
+		if got := countRows(); got != 1 {
+			t.Fatalf("rows after reserve = %d, want 1", got)
+		}
+		time.Sleep(2 * ttl)
+		// The next admission prunes the expired row in its own transaction.
+		if dec, err := s.ReservePackBytes(ctx, k.group, []Pack{k.pack(k.base(), "bb2", 10)}, "o2", 0, 1000, ttl); err != nil || !dec.OK {
+			t.Fatalf("reserve after expiry: %+v, %v", dec, err)
+		}
+		if got := countRows(); got != 1 {
+			t.Fatalf("rows after expiry-pruning reserve = %d, want 1 (fresh row only)", got)
+		}
 	})
 }
 
@@ -208,19 +261,16 @@ func TestReservationExpiryAndSweep(t *testing.T) {
 		if dec, err := s.ReservePackBytes(ctx, k.group, []Pack{k.pack(k.base(), "cc3", 60)}, "live", 0, quota, ttl); err != nil || !dec.OK {
 			t.Fatalf("reserve after expiry = %+v, %v; want admission", dec, err)
 		}
-		// Sweep prunes the expired row. The sweep is global and the PG
-		// test store is shared package-wide, so assert lower bounds here;
-		// the fresh cc3 row must survive (proven by the state read below).
-		n, err := s.SweepExpiredPackReservations(ctx, ttl)
-		if err != nil {
+		// The TTL-scoped sweep is now a second line of defense: admission
+		// itself prunes the caller repo's expired rows (issue #51 round
+		// 5), so this sweep may find nothing left — assert only that it
+		// runs and that the fresh cc3 row survives.
+		if _, err := s.SweepExpiredPackReservations(ctx, ttl); err != nil {
 			t.Fatalf("SweepExpiredPackReservations: %v", err)
-		}
-		if n < 1 {
-			t.Fatalf("swept %d expired reservations, want >= 1", n)
 		}
 		k.wantState(0, 60, 0) // cc3 survives a TTL-scoped sweep
 		// olderThan=0 expires everything, cc3 included.
-		if n, err = s.SweepExpiredPackReservations(ctx, 0); err != nil || n < 1 {
+		if n, err := s.SweepExpiredPackReservations(ctx, 0); err != nil || n < 1 {
 			t.Fatalf("sweep all = %d, %v; want >= 1", n, err)
 		}
 		k.wantState(0, 0, 0)

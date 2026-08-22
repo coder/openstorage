@@ -195,6 +195,11 @@ func (s *SimRefStore) HasLFSObject(ctx context.Context, repo, key string) (bool,
 	return s.inner.HasLFSObject(ctx, repo, key)
 }
 
+// CountLFSObjects delegates to the inner store.
+func (s *SimRefStore) CountLFSObjects(ctx context.Context, repo string) (int64, error) {
+	return s.inner.CountLFSObjects(ctx, repo)
+}
+
 // GetGeneration delegates to the inner store unless a fault is injected.
 // Faulting it starves the issue-#4 hydrate short-circuit, which must then
 // surface the error rather than serve from a stale marker.

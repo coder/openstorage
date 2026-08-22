@@ -27,6 +27,12 @@ func (s *SQLite) ReservePackBytes(ctx context.Context, group []string, packs []P
 		return ReserveDecision{}, fmt.Errorf("reserve pack bytes begin: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+	// Self-healing GC for expired rows — see the PG twin's rationale.
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM pack_reservations WHERE repo = ? AND created_at <= `+sqliteEpochMS+` - ?`,
+		group[0], ttl.Milliseconds()); err != nil {
+		return ReserveDecision{}, fmt.Errorf("reserve pack bytes prune: %w", err)
+	}
 	// One aggregate read; the IMMEDIATE transaction serializes every
 	// writer, so this snapshot cannot interleave with a concurrent
 	// reserve or register.
@@ -66,12 +72,13 @@ SELECT
 		return dec, nil // denied; the deferred rollback discards nothing
 	}
 	for _, p := range packs {
-		// Same-key upsert (see the PG twin): retries refresh, never wedge.
+		// Same-key upsert (see the PG twin): retries refresh, never wedge,
+		// and the refresh KEEPS the existing owner (Codex round 5).
 		if _, err := tx.ExecContext(ctx, `
 INSERT INTO pack_reservations (key, repo, bytes, owner, created_at)
 VALUES (?, ?, ?, ?, `+sqliteEpochMS+`)
 ON CONFLICT (key) DO UPDATE SET repo = excluded.repo, bytes = excluded.bytes,
-                                owner = excluded.owner, created_at = excluded.created_at`,
+                                created_at = excluded.created_at`,
 			p.Key, group[0], p.Size, owner); err != nil {
 			return ReserveDecision{}, fmt.Errorf("reserve pack bytes insert: %w", err)
 		}
@@ -218,6 +225,15 @@ func (s *SQLite) RegisterLFSObject(ctx context.Context, repo, key string, bytes 
 		return fmt.Errorf("register lfs object commit: %w", err)
 	}
 	return nil
+}
+
+// CountLFSObjects returns repo's registered LFS object count.
+func (s *SQLite) CountLFSObjects(ctx context.Context, repo string) (int64, error) {
+	assertf(repo != "", "CountLFSObjects(%q)", repo)
+	var n int64
+	err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM lfs_objects WHERE repo = ?`, repo).Scan(&n)
+	return n, err
 }
 
 // HasLFSObject reports whether (repo, key) is a registered LFS object.

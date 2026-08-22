@@ -134,19 +134,25 @@ func TestLFSQuota_UploadSettlesLedger(t *testing.T) {
 	}
 }
 
-// TestLFSQuota_WrongSHAReleasesReservation: a proxy upload whose content
-// hash does not match the oid is rejected, publishes nothing, and frees the
-// admission headroom it reserved.
-func TestLFSQuota_WrongSHAReleasesReservation(t *testing.T) {
+// TestLFSQuota_WrongSHAReservationLifecycle: a proxy upload whose content
+// hash does not match the oid is rejected and publishes nothing. The
+// reservation outcome depends on who minted the row (Codex round 5's
+// keep-owner semantics): a direct PUT's own row is released immediately,
+// while a batch-minted row survives the failed PUT — its upload action is
+// still exercisable and a cross-replica release must never free headroom
+// under a possibly-still-staging writer — until settle or TTL expiry.
+func TestLFSQuota_WrongSHAReservationLifecycle(t *testing.T) {
 	srv, st, mint := newLFSQuotaServer(t, 1000, time.Hour)
 	tok := mint(auth.ScopeGitWrite)
 	content := []byte("the real content")
 	oid := sha256Hex(content)
+	put := func(body string) *httptest.ResponseRecorder {
+		return doLFS(t, srv, http.MethodPut, "/"+lfsTestRepoURL+".git/info/lfs/objects/"+oid,
+			"basic:"+tok, body)
+	}
 
-	decodeBatch(t, doLFS(t, srv, http.MethodPost, lfsBatchPath, "basic:"+tok,
-		batchBody("upload", oid, int64(len(content)))))
-	w := doLFS(t, srv, http.MethodPut, "/"+lfsTestRepoURL+".git/info/lfs/objects/"+oid,
-		"basic:"+tok, "not the real content") // same length not required
+	// Direct PUT (no batch): the PUT inserted the row, so failure frees it.
+	w := put("not the real content")
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("hash-mismatch PUT status = %d, body %s", w.Code, w.Body)
 	}
@@ -154,7 +160,26 @@ func TestLFSQuota_WrongSHAReleasesReservation(t *testing.T) {
 		t.Fatal("hash-mismatch PUT published the object")
 	}
 	if ls := ledgerState(t, st, time.Hour); ls.ReservedBytes != 0 || ls.UsageBytes != 0 {
-		t.Fatalf("failed PUT left ledger state %+v", ls)
+		t.Fatalf("failed direct PUT left ledger state %+v", ls)
+	}
+
+	// Batch-then-bad-PUT: the batch's row (its owner) survives the failed
+	// PUT — the action is still exercisable — and a correct retry settles
+	// it into usage. The wrong body has the same length so the surviving
+	// row's refreshed byte value stays comparable.
+	decodeBatch(t, doLFS(t, srv, http.MethodPost, lfsBatchPath, "basic:"+tok,
+		batchBody("upload", oid, int64(len(content)))))
+	if w := put("the fake content"); w.Code != http.StatusBadRequest {
+		t.Fatalf("hash-mismatch PUT status = %d", w.Code)
+	}
+	if ls := ledgerState(t, st, time.Hour); ls.ReservedBytes != int64(len(content)) {
+		t.Fatalf("batch reservation did not survive the failed PUT: %+v", ls)
+	}
+	if w := put(string(content)); w.Code != http.StatusOK {
+		t.Fatalf("correct retry status = %d, body %s", w.Code, w.Body)
+	}
+	if ls := ledgerState(t, st, time.Hour); ls.ReservedBytes != 0 || ls.UsageBytes != int64(len(content)) {
+		t.Fatalf("retry did not settle the batch reservation: %+v", ls)
 	}
 }
 
@@ -467,6 +492,129 @@ func TestLFSUpload_StalledClientReleasesStaging(t *testing.T) {
 	}
 	pw.Close()
 	<-stalled // the stalled request ends with a connection/HTTP error either way
+}
+
+// TestLFSQuota_ZeroGrowthRepairAtQuota (Codex round 5): a registered
+// object whose blob vanished re-admits without a fresh charge — an
+// at-quota repository must be able to repair itself.
+func TestLFSQuota_ZeroGrowthRepairAtQuota(t *testing.T) {
+	srv, st, mint := newLFSQuotaServer(t, 100, time.Hour)
+	tok := mint(auth.ScopeGitWrite)
+	content := bytes.Repeat([]byte("r"), 100) // exactly the whole quota
+	oid := sha256Hex(content)
+	key := blob.LFSKey(lfsTestRepoID, oid)
+	// Registered and fully counted (usage == quota), but the blob is gone
+	// (racing DeleteLFS reap).
+	if err := st.RegisterLFSObject(context.Background(), lfsTestRepoID, key, 100); err != nil {
+		t.Fatal(err)
+	}
+
+	resp := decodeBatch(t, doLFS(t, srv, http.MethodPost, lfsBatchPath, "basic:"+tok,
+		batchBody("upload", oid, 100)))
+	if resp.Objects[0].Error != nil || resp.Objects[0].Actions["upload"] == nil {
+		t.Fatalf("zero-growth repair denied at quota: %+v", resp.Objects[0])
+	}
+	w := doLFS(t, srv, http.MethodPut, "/"+lfsTestRepoURL+".git/info/lfs/objects/"+oid,
+		"basic:"+tok, string(content))
+	if w.Code != http.StatusOK {
+		t.Fatalf("zero-growth PUT status = %d, body %s", w.Code, w.Body)
+	}
+	// Counted once: usage stays at the original credit, nothing reserved.
+	if ls := ledgerState(t, st, time.Hour); ls.UsageBytes != 100 || ls.ReservedBytes != 0 {
+		t.Fatalf("zero-growth repair changed the ledger: %+v", ls)
+	}
+	if _, err := srv.Blob.Stat(context.Background(), key); err != nil {
+		t.Fatalf("repair did not republish: %v", err)
+	}
+}
+
+// TestLFSQuota_ObjectCountCap (Codex security round 2): the per-repo
+// registered-object population is bounded independent of bytes, at both
+// upload entrances, with zero-growth repairs exempt.
+func TestLFSQuota_ObjectCountCap(t *testing.T) {
+	old := maxLFSObjectsPerRepo
+	maxLFSObjectsPerRepo = 1
+	t.Cleanup(func() { maxLFSObjectsPerRepo = old })
+	srv, st, mint := newLFSQuotaServer(t, 0, time.Hour) // byte quota DISABLED: the cap must hold anyway
+	tok := mint(auth.ScopeGitWrite)
+	existing := []byte("the one allowed object")
+	if err := st.RegisterLFSObject(context.Background(), lfsTestRepoID,
+		blob.LFSKey(lfsTestRepoID, sha256Hex(existing)), int64(len(existing))); err != nil {
+		t.Fatal(err)
+	}
+
+	// New object via batch: denied with the count-limit message.
+	fresh := []byte("one object too many")
+	resp := decodeBatch(t, doLFS(t, srv, http.MethodPost, lfsBatchPath, "basic:"+tok,
+		batchBody("upload", sha256Hex(fresh), int64(len(fresh)))))
+	if resp.Objects[0].Error == nil || resp.Objects[0].Error.Code != http.StatusInsufficientStorage ||
+		!strings.Contains(resp.Objects[0].Error.Message, "object count limit") {
+		t.Fatalf("over-cap batch not denied: %+v", resp.Objects[0])
+	}
+	// New object via direct PUT: same denial.
+	w := doLFS(t, srv, http.MethodPut, "/"+lfsTestRepoURL+".git/info/lfs/objects/"+sha256Hex(fresh),
+		"basic:"+tok, string(fresh))
+	if w.Code != http.StatusInsufficientStorage {
+		t.Fatalf("over-cap PUT status = %d, want 507", w.Code)
+	}
+	// Zero-growth repair of the REGISTERED object stays allowed at cap.
+	w = doLFS(t, srv, http.MethodPut, "/"+lfsTestRepoURL+".git/info/lfs/objects/"+sha256Hex(existing),
+		"basic:"+tok, string(existing))
+	if w.Code != http.StatusOK {
+		t.Fatalf("at-cap zero-growth repair status = %d, body %s", w.Code, w.Body)
+	}
+}
+
+// TestLFSUpload_AbsoluteDeadlineBoundsDrip (Codex security round 2): a
+// client dripping one byte per idle window must still hit the ABSOLUTE
+// bound (the reservation TTL) and release its staging capacity.
+func TestLFSUpload_AbsoluteDeadlineBoundsDrip(t *testing.T) {
+	oldIdle := lfsUploadIdleTimeout
+	lfsUploadIdleTimeout = 10 * time.Second // idle alone would never fire
+	t.Cleanup(func() { lfsUploadIdleTimeout = oldIdle })
+
+	srv, _, mint := newLFSQuotaServer(t, 0, 400*time.Millisecond) // TTL = absolute bound
+	srv.LFSStagingBytes = 100
+	tok := mint(auth.ScopeGitWrite)
+	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(ts.Close)
+
+	content := bytes.Repeat([]byte("d"), 100)
+	req, err := http.NewRequest(http.MethodPut,
+		ts.URL+"/"+lfsTestRepoURL+".git/info/lfs/objects/"+sha256Hex(content), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pr, pw := io.Pipe()
+	req.Body = pr
+	req.ContentLength = int64(len(content))
+	req.SetBasicAuth("t", tok)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		resp, err := http.DefaultClient.Do(req)
+		if resp != nil {
+			resp.Body.Close()
+		}
+		_ = err
+	}()
+	// Drip one byte every 100ms: each write renews the idle window, but
+	// the absolute bound must abort the request within ~TTL regardless.
+	start := time.Now()
+	for i := range content {
+		if _, err := pw.Write(content[i : i+1]); err != nil {
+			break // server hung up: the absolute deadline fired
+		}
+		time.Sleep(100 * time.Millisecond)
+		if time.Since(start) > 5*time.Second {
+			t.Fatal("dripping upload was never aborted by the absolute deadline")
+		}
+	}
+	pw.Close()
+	<-done
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("drip upload survived %v, want abort within ~the 400ms TTL", elapsed)
+	}
 }
 
 // TestLFSQuota_NamespaceUsageRollsUpToBase: pack bytes registered under a

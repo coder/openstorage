@@ -69,15 +69,41 @@ const (
 // penalizing slow-but-moving links. A var so tests can shrink it.
 var lfsUploadIdleTimeout = time.Minute
 
+// maxLFSObjectsPerRepo caps a repository's REGISTERED LFS object count
+// (Codex security round 2 on #51): registered objects are permanent rows
+// plus bucket keys, and the byte quota bounds their population at nothing
+// (16M three-byte objects cost 48 MiB), so the population needs its own
+// admission-time bound. Compiled, like the reservation-row cap; 100k
+// objects is far beyond any repository git-lfs works acceptably on, and
+// the check runs at BOTH upload entrances (batch and direct PUT), so
+// overshoot is bounded by in-flight concurrency. A var for tests.
+var maxLFSObjectsPerRepo = int64(100_000)
+
 // idleDeadlineBody wraps an upload body, pushing the connection's read
-// deadline forward on every chunk of progress. Backed by
+// deadline forward on every chunk of progress — but never past the
+// absolute bound (Codex security round 2: renewing on every nonempty read
+// alone lets one byte per idle window pin staging capacity forever). The
+// absolute bound is the reservation TTL: an upload outliving its own
+// admission reservation breaks accounting anyway, and the TTL's documented
+// sizing (1h clears a default-quota 10 GiB object at ~3 MB/s) is exactly a
+// minimum-sustained-rate bound. Backed by
 // http.ResponseController.SetReadDeadline, which the standard net/http
 // server supports on HTTP/1 and HTTP/2 connections alike; wrappers that do
 // not (httptest recorders) are detected once by the caller and left
 // unbounded — the guard targets real deployments.
 type idleDeadlineBody struct {
-	r  io.Reader
-	rc *http.ResponseController
+	r        io.Reader
+	rc       *http.ResponseController
+	absolute time.Time
+}
+
+// deadline returns the next idle deadline, clamped to the absolute bound.
+func (b idleDeadlineBody) deadline(now time.Time) time.Time {
+	d := now.Add(lfsUploadIdleTimeout)
+	if d.After(b.absolute) {
+		return b.absolute
+	}
+	return d
 }
 
 func (b idleDeadlineBody) Read(p []byte) (int, error) {
@@ -86,7 +112,7 @@ func (b idleDeadlineBody) Read(p []byte) (int, error) {
 		// Errors here mean the connection lost deadline support mid-read
 		// (it cannot — the caller probed it); the read itself still
 		// succeeded, so pass the data through regardless.
-		_ = b.rc.SetReadDeadline(time.Now().Add(lfsUploadIdleTimeout))
+		_ = b.rc.SetReadDeadline(b.deadline(time.Now()))
 	}
 	return n, err
 }
@@ -323,6 +349,9 @@ func (s *Server) lfsBatchUpload(r *http.Request, repoElem string, target repoTar
 	// declared size wins so a duplicate cannot shrink the charge.
 	needIdx := make(map[string][]int)
 	needSize := make(map[string]int64)
+	zeroGrowth := make(map[string]bool)
+	checked := make(map[string]bool)
+	checkFailed := make(map[string]bool)
 	var order []string
 	for i, obj := range objs {
 		results[i] = lfsObjectResult{OID: obj.OID, Size: obj.Size}
@@ -349,11 +378,57 @@ func (s *Server) lfsBatchUpload(r *http.Request, repoElem string, target repoTar
 			lfsObjectFail(&results[i], http.StatusInternalServerError, "object storage unavailable")
 			continue
 		}
-		if _, seen := needIdx[key]; !seen {
-			order = append(order, key)
+		if !checked[key] {
+			checked[key] = true
+			// The zero-growth rule (Codex round 5): a missing object
+			// whose registry row exists — an adopted or settled object
+			// whose blob vanished (racing DeleteLFS sweep, manual bucket
+			// surgery) — is already counted by the usage counter AND the
+			// object-count cap, so its re-publication must be charged by
+			// neither: an at-quota (or at-cap) repository could otherwise
+			// never repair itself.
+			registered, rerr := s.Store.HasLFSObject(ctx, repoID, key)
+			if rerr != nil {
+				log.Printf("lfs registry %s: %v", key, rerr)
+				checkFailed[key] = true
+			} else {
+				zeroGrowth[key] = registered
+			}
+			if !checkFailed[key] {
+				order = append(order, key)
+			}
+		}
+		if checkFailed[key] {
+			// Every occurrence of an uncheckable key fails: without the
+			// zero-growth classification the entry can be neither charged
+			// correctly nor safely admitted free.
+			lfsObjectFail(&results[i], http.StatusInternalServerError, "object registry unavailable")
+			continue
 		}
 		needIdx[key] = append(needIdx[key], i)
 		needSize[key] = max(needSize[key], obj.Size)
+	}
+	// Object-count cap (Codex security round 2): NEW objects — keys with
+	// no registry row — bound the repo's permanent object population at
+	// admission, independent of bytes. Zero-growth repairs and stored
+	// objects are exempt: they add no rows.
+	var newObjects int64
+	for _, key := range order {
+		if !zeroGrowth[key] {
+			newObjects++
+		}
+	}
+	if newObjects > 0 {
+		count, err := s.Store.CountLFSObjects(ctx, repoID)
+		if err != nil {
+			log.Printf("lfs registry count %s: %v", repoID, err)
+			return s.denyAllNeeded(order, needIdx, results, http.StatusInternalServerError, "object registry unavailable")
+		}
+		if count+newObjects > maxLFSObjectsPerRepo {
+			return s.denyAllNeeded(order, needIdx, results, http.StatusInsufficientStorage, fmt.Sprintf(
+				"repository LFS object count limit reached (%d objects stored, limit %d)",
+				count, maxLFSObjectsPerRepo))
+		}
 	}
 	// Admission: reserve the declared sizes before ANY transfer href is
 	// issued. Zero-size entries charge nothing (the empty object is
@@ -362,19 +437,14 @@ func (s *Server) lfsBatchUpload(r *http.Request, repoElem string, target repoTar
 		var packs []ref.Pack
 		var incoming int64
 		for _, key := range order {
-			if sz := needSize[key]; sz > 0 {
+			if sz := needSize[key]; sz > 0 && !zeroGrowth[key] {
 				packs = append(packs, ref.Pack{Key: key, Size: sz})
 				incoming += sz
 			}
 		}
 		if len(packs) > 0 {
 			denyAll := func(code int, msg string) []lfsObjectResult {
-				for _, key := range order {
-					for _, i := range needIdx[key] {
-						lfsObjectFail(&results[i], code, msg)
-					}
-				}
-				return results
+				return s.denyAllNeeded(order, needIdx, results, code, msg)
 			}
 			floor, err := blob.StorageUsageBytes(ctx, s.Blob, repoID)
 			if err != nil {
@@ -404,6 +474,17 @@ func (s *Server) lfsBatchUpload(r *http.Request, repoElem string, target repoTar
 		for _, i := range needIdx[key] {
 			results[i].Authenticated = true
 			results[i].Actions = map[string]*lfsAction{"upload": s.lfsUploadAction(r, repoElem, results[i].OID)}
+		}
+	}
+	return results
+}
+
+// denyAllNeeded fails every batch entry that still needs an upload with
+// one shared per-object error (all-or-nothing admission).
+func (s *Server) denyAllNeeded(order []string, needIdx map[string][]int, results []lfsObjectResult, code int, msg string) []lfsObjectResult {
+	for _, key := range order {
+		for _, i := range needIdx[key] {
+			lfsObjectFail(&results[i], code, msg)
 		}
 	}
 	return results
@@ -651,39 +732,73 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target r
 	var reserveOwner string
 	release := func() {
 		if reserveOwner != "" {
-			// Best-effort: an unreleased row only gates admission until
-			// the TTL expires (owner-scoped, so it can never free a
-			// reservation a concurrent identical upload re-acquired).
+			// Best-effort and owner-scoped: this frees the row only when
+			// THIS request inserted it (a direct PUT with no prior batch).
+			// A row minted by the batch — or by another replica's writer —
+			// keeps its original owner across same-key refreshes (Codex
+			// round 5), so this release deliberately cannot free it: the
+			// batch's action remains exercisable and cross-replica races
+			// must fail toward a TTL-bounded hold, never toward freeing
+			// headroom under a still-staging upload.
 			_ = s.Store.ReleasePackReservations(ctx, []string{key}, reserveOwner)
 		}
 	}
-	if s.PackQuotaBytes > 0 && r.ContentLength > 0 {
-		floor, err := blob.StorageUsageBytes(ctx, s.Blob, repoID)
+	// The zero-growth rule (Codex round 5): a registered key's blob
+	// re-publication is already counted by the usage counter and the
+	// object-count cap, so it is charged by neither — an at-quota or
+	// at-cap repository must be able to repair a vanished-but-registered
+	// object.
+	registered, err := s.Store.HasLFSObject(ctx, repoID, key)
+	if err != nil {
+		log.Printf("lfs registry %s: %v", key, err)
+		lfsError(w, http.StatusInternalServerError, "object registry unavailable")
+		return
+	}
+	if !registered {
+		// Object-count cap (Codex security round 2) — enforced regardless
+		// of the byte quota: rows are the resource being bounded.
+		count, err := s.Store.CountLFSObjects(ctx, repoID)
 		if err != nil {
-			log.Printf("lfs quota: %s: usage listing failed: %v", repoID, err)
-			lfsError(w, http.StatusInternalServerError, "storage quota check failed")
+			log.Printf("lfs registry count %s: %v", repoID, err)
+			lfsError(w, http.StatusInternalServerError, "object registry unavailable")
 			return
 		}
-		reserveOwner = ref.NewReservationOwner()
-		dec, err := s.Store.ReservePackBytes(ctx, blob.QuotaRepoGroup(repoID),
-			[]ref.Pack{{Key: key, Size: r.ContentLength}}, reserveOwner,
-			floor, s.PackQuotaBytes, s.lfsReservationTTL())
-		if err != nil {
-			log.Printf("lfs quota: %s: reserve failed: %v", repoID, err)
-			lfsError(w, http.StatusInternalServerError, "storage quota check failed")
-			return
-		}
-		if dec.KeyCapExceeded {
-			w.Header().Set("Retry-After", "10")
-			lfsError(w, http.StatusTooManyRequests,
-				"too many in-flight uploads reserved for this repository, retry later")
-			return
-		}
-		if !dec.OK {
+		if count >= maxLFSObjectsPerRepo {
 			lfsError(w, http.StatusInsufficientStorage, fmt.Sprintf(
-				"repository storage quota exceeded: upload adds %d bytes to %d bytes stored (+%d bytes reserved by in-flight uploads), quota is %d bytes",
-				r.ContentLength, dec.UsedBytes, dec.ReservedBytes, s.PackQuotaBytes))
+				"repository LFS object count limit reached (%d objects stored, limit %d)",
+				count, maxLFSObjectsPerRepo))
 			return
+		}
+	}
+	if s.PackQuotaBytes > 0 && r.ContentLength > 0 {
+		if !registered {
+			floor, err := blob.StorageUsageBytes(ctx, s.Blob, repoID)
+			if err != nil {
+				log.Printf("lfs quota: %s: usage listing failed: %v", repoID, err)
+				lfsError(w, http.StatusInternalServerError, "storage quota check failed")
+				return
+			}
+			reserveOwner = ref.NewReservationOwner()
+			dec, err := s.Store.ReservePackBytes(ctx, blob.QuotaRepoGroup(repoID),
+				[]ref.Pack{{Key: key, Size: r.ContentLength}}, reserveOwner,
+				floor, s.PackQuotaBytes, s.lfsReservationTTL())
+			if err != nil {
+				log.Printf("lfs quota: %s: reserve failed: %v", repoID, err)
+				lfsError(w, http.StatusInternalServerError, "storage quota check failed")
+				return
+			}
+			if dec.KeyCapExceeded {
+				w.Header().Set("Retry-After", "10")
+				lfsError(w, http.StatusTooManyRequests,
+					"too many in-flight uploads reserved for this repository, retry later")
+				return
+			}
+			if !dec.OK {
+				lfsError(w, http.StatusInsufficientStorage, fmt.Sprintf(
+					"repository storage quota exceeded: upload adds %d bytes to %d bytes stored (+%d bytes reserved by in-flight uploads), quota is %d bytes",
+					r.ContentLength, dec.UsedBytes, dec.ReservedBytes, s.PackQuotaBytes))
+				return
+			}
 		}
 	}
 	dir, err := os.MkdirTemp("", "lfs-upload-*")
@@ -701,11 +816,13 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target r
 		return
 	}
 	// Stall guard: the reservations above are held for the duration of
-	// this copy, so the body must keep moving — see lfsUploadIdleTimeout.
+	// this copy, so the body must keep moving AND finish within the
+	// reservation TTL — see idleDeadlineBody.
 	body := io.Reader(r.Body)
 	rc := http.NewResponseController(w)
-	if err := rc.SetReadDeadline(time.Now().Add(lfsUploadIdleTimeout)); err == nil {
-		body = idleDeadlineBody{r: r.Body, rc: rc}
+	idle := idleDeadlineBody{r: r.Body, rc: rc, absolute: time.Now().Add(s.lfsReservationTTL())}
+	if err := rc.SetReadDeadline(idle.deadline(time.Now())); err == nil {
+		body = idle
 	}
 	h := sha256.New()
 	n, err := io.Copy(io.MultiWriter(f, h), body)

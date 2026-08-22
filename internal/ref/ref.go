@@ -143,6 +143,11 @@ type RefStore interface {
 	// (a point read mirroring HasPack, for the sweeper's per-object
 	// classification of the lfs/ prefix).
 	HasLFSObject(ctx context.Context, repo, key string) (bool, error)
+	// CountLFSObjects returns repo's registered LFS object count — the
+	// admission-time read behind the per-repo object-count cap (issue
+	// #51): bytes bound row count at nothing, and registered objects are
+	// permanent, so their population needs its own bound.
+	CountLFSObjects(ctx context.Context, repo string) (int64, error)
 	// GetGeneration returns repo's mutation generation: 0 for a repo no
 	// mutation ever touched, strictly positive and monotonically increasing
 	// afterwards. It is an invalidation token over committed row changes,
