@@ -234,6 +234,16 @@ Hook subprocesses and every replica must see the same value — it is read from 
 environment by the serve process and inherited by the re-executed hook binary, so no extra
 plumbing is needed beyond setting it consistently across replicas.
 
+**Upgrade ordering (mixed fleets).** Binaries that predate this variable do not understand
+the `enc:v1:` envelope: they would read it verbatim and sign webhook deliveries with the
+ciphertext string (or present it as an upstream password), producing invalid deliveries
+and failed syncs with no error. Enable encryption in two phases: **(1)** deploy an
+envelope-aware binary to *every* node — serve replicas and hook-running git nodes — with
+`CODESTORAGE_SECRETS_KEY` unset (plaintext behavior is unchanged); **(2)** only once no
+old binary can run, set the variable fleet-wide and restart. The same constraint applies
+in reverse: rolling back to a pre-envelope binary while encrypted rows exist silently
+misuses them — decrypt requirements do not roll back with the binary.
+
 ## Pack quota
 
 ### `CODESTORAGE_PACK_QUOTA_BYTES`

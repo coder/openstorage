@@ -42,7 +42,9 @@ upstream-sync credentials**, plaintext by default
 ([#54](https://github.com/coder/code-storage/issues/54)). Set
 [`CODESTORAGE_SECRETS_KEY`](../reference/configuration.md#codestorage_secrets_key) (the
 same value on every replica) to envelope-encrypt those columns with AES-256-GCM; the
-reference documents the key format, rotation procedure, and failure modes. Either way,
+reference documents the key format, rotation procedure, failure modes, and the required
+**two-phase enablement on mixed fleets** (every node must run an envelope-aware binary
+*before* the key is set anywhere — older binaries misread envelopes as literal secrets). Either way,
 scope database access tightly and encrypt the database and its backups at rest —
 application-level encryption narrows what a database read or backup leak exposes, but the
 serve process still holds the key.
