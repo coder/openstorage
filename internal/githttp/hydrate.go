@@ -54,7 +54,10 @@ func runGit(dir string, args ...string) (string, error) {
 // runGitCtx is runGit with cancellation: the subprocess is killed when ctx
 // expires. Pack materialization runs under callers' deadlines (the repack
 // fold's wall-clock budget, request contexts), and index-pack over a large
-// pack must not outlive them.
+// pack must not outlive them. A kill caused by ctx folds the context's own
+// error into the chain — the raw *exec.ExitError ("signal: killed") does
+// not match errors.Is(err, context.DeadlineExceeded), and the repack
+// worker classifies deterministic budget exhaustion by that identity.
 func runGitCtx(ctx context.Context, dir string, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, "git", args...)
 	if dir != "" {
@@ -64,6 +67,9 @@ func runGitCtx(ctx context.Context, dir string, args ...string) (string, error) 
 	cmd.Stderr = &stderr
 	out, err := cmd.Output()
 	if err != nil {
+		if cerr := ctx.Err(); cerr != nil {
+			err = fmt.Errorf("%w: %w", cerr, err)
+		}
 		return string(out), fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
 	}
 	return string(out), nil

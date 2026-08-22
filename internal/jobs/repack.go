@@ -89,9 +89,23 @@ func runGitStdin(ctx context.Context, dir string, stdin io.Reader, args ...strin
 	out, err := cmd.Output()
 	if err != nil {
 		return string(out), fmt.Errorf("git %s: %w: %s",
-			strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
+			strings.Join(args, " "), normalizeCtxErr(ctx, err), strings.TrimSpace(stderr.String()))
 	}
 	return string(out), nil
+}
+
+// normalizeCtxErr folds the context's own error into a subprocess failure
+// caused by cancellation: CommandContext KILLS the child on expiry, and the
+// raw *exec.ExitError ("signal: killed") does not match
+// errors.Is(err, context.DeadlineExceeded) — but callers classify
+// deterministic fold-budget exhaustion by exactly that identity (the river
+// worker cancels terminally instead of multiplying the budget by its retry
+// count).
+func normalizeCtxErr(ctx context.Context, err error) error {
+	if cerr := ctx.Err(); cerr != nil {
+		return fmt.Errorf("%w: %w", cerr, err)
+	}
+	return err
 }
 
 // Repacker folds one repo's registered packs into a consolidated pack.
@@ -650,7 +664,7 @@ func streamShowIndex(ctx context.Context, repoPath string, idx io.Reader, fn fun
 	// early scan abort, then surface the first failure.
 	_, _ = io.Copy(io.Discard, stdout)
 	if err := cmd.Wait(); err != nil {
-		return fmt.Errorf("git show-index: %w: %s", err, strings.TrimSpace(stderr.String()))
+		return fmt.Errorf("git show-index: %w: %s", normalizeCtxErr(ctx, err), strings.TrimSpace(stderr.String()))
 	}
 	return scanErr
 }

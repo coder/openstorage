@@ -11,6 +11,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -997,6 +998,44 @@ func TestRepack_RuntimeBudgetBoundsFold(t *testing.T) {
 		t.Fatalf("sane runtime budget: Repack = (folded %v, err %v), want a fold", folded, err)
 	}
 	f.checkColdHydrate(t)
+}
+
+// TestNormalizeCtxErr pins the deadline-classification identity (security
+// round 14): CommandContext kills an over-budget git subprocess, whose raw
+// *exec.ExitError ("signal: killed") does NOT match
+// errors.Is(err, context.DeadlineExceeded) — the river worker classifies
+// deterministic budget exhaustion by exactly that identity, so the helpers
+// must fold the context's own error into the chain.
+func TestNormalizeCtxErr(t *testing.T) {
+	killed := errors.New("signal: killed") // the *exec.ExitError shape
+	// Live context: the error passes through untouched (a genuine crash
+	// must stay retryable).
+	if got := normalizeCtxErr(context.Background(), killed); !errors.Is(got, killed) || errors.Is(got, context.DeadlineExceeded) {
+		t.Fatalf("live-ctx normalize = %v, want the original error only", got)
+	}
+	// Expired context: the chain must carry DeadlineExceeded AND the
+	// original error.
+	ctx, cancel := context.WithTimeout(context.Background(), time.Nanosecond)
+	defer cancel()
+	<-ctx.Done()
+	got := normalizeCtxErr(ctx, killed)
+	if !errors.Is(got, context.DeadlineExceeded) || !errors.Is(got, killed) {
+		t.Fatalf("expired-ctx normalize = %v, want both DeadlineExceeded and the original", got)
+	}
+
+	// End to end through a real killed subprocess: a git command started
+	// under an expiring context surfaces DeadlineExceeded through
+	// runGitStdin's chain. The pipe writer closes on expiry so exec's
+	// stdin-copy goroutine (which Wait joins) can finish — production
+	// callers pass an *os.File or a finite reader and never hit that.
+	shortCtx, cancel2 := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel2()
+	blockingStdin, w := io.Pipe() // never written: show-index blocks reading it
+	go func() { <-shortCtx.Done(); _ = w.Close() }()
+	_, err := runGitStdin(shortCtx, t.TempDir(), blockingStdin, "show-index")
+	if err == nil || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("killed-subprocess error = %v, want DeadlineExceeded in the chain", err)
+	}
 }
 
 // TestRepackTrigger_BoundedExecution pins the P2 contract: MaybeEnqueue is
