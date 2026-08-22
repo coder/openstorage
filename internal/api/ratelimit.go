@@ -7,7 +7,9 @@
 // Admission is a per-client-IP token bucket (hand-rolled, x/time/rate
 // semantics: float tokens, monotonic refill, burst cap) in a lazy map with a
 // mutex and a periodic stale-entry sweep. The key is the RemoteAddr host —
-// X-Forwarded-For is deliberately not trusted. Limiting is per node, in
+// X-Forwarded-For is trusted only from peers inside the operator's explicit
+// TrustedProxies allowlist (issue #30); by default (empty allowlist) it is
+// deliberately ignored. Limiting is per node, in
 // memory: nodes are stateless and per-node limiting is the documented
 // "basic" scope. 429-before-auth means unauthenticated clients consume rate
 // budget keyed by IP — accepted for the basic scope (plan risk note).
@@ -19,7 +21,9 @@ import (
 	"math"
 	"net"
 	"net/http"
+	"net/netip"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -33,6 +37,17 @@ type RateLimitConfig struct {
 	RPS float64
 	// Burst is the token-bucket depth; must be >= 1 when RPS > 0.
 	Burst int
+	// TrustedProxies is the reverse-proxy allowlist for client identity
+	// (issue #30). When the TCP peer is inside one of these prefixes, the
+	// bucket key becomes the rightmost X-Forwarded-For hop that is not
+	// itself allowlisted — the client address the nearest trusted proxy
+	// saw. Empty (the default) keeps RemoteAddr-only keying: a spoofable
+	// key would let any client mint fresh buckets at will, so forwarded
+	// headers from unlisted peers are never consulted. Operator contract:
+	// list ONLY proxies that set/append X-Forwarded-For themselves; a
+	// listed proxy that forwards client-supplied values verbatim
+	// reintroduces exactly that bucket-minting spoof.
+	TrustedProxies []netip.Prefix
 }
 
 // routeFlavor selects the 429 body shape, matching the existing envelope
@@ -88,6 +103,11 @@ func newRateLimiter(cfg RateLimitConfig) (*rateLimiter, error) {
 	if cfg.Burst < 1 {
 		return nil, fmt.Errorf("rate limit config: Burst must be >= 1 when RPS > 0 (got %d)", cfg.Burst)
 	}
+	for _, p := range cfg.TrustedProxies {
+		// The allowlist arrives pre-parsed (resolveTrustedProxies); a zero
+		// prefix here is a caller bug, not operator input.
+		assertf(p.IsValid(), "rate limit config: invalid trusted-proxy prefix %v", p)
+	}
 	l := &rateLimiter{cfg: cfg, now: time.Now, buckets: make(map[string]*bucket)}
 	l.lastSweep = l.now()
 	return l, nil
@@ -117,7 +137,7 @@ func (l *rateLimiter) limit(flavor routeFlavor) middleware {
 				next.ServeHTTP(w, r)
 				return
 			}
-			ok, retryAfter := l.admit(clientKey(r))
+			ok, retryAfter := l.admit(l.clientKey(r))
 			if !ok {
 				w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
 				const msg = "rate limit exceeded"
@@ -216,13 +236,21 @@ func (l *rateLimiter) sweepLocked(now time.Time) {
 	}
 }
 
-// clientKey extracts the bucket key for a request: the RemoteAddr host
-// (IPv4/IPv6), falling back to the raw RemoteAddr when it carries no port.
-// X-Forwarded-For is deliberately ignored (no proxy trust model here).
-// An empty RemoteAddr (possible for exotic listeners/in-process handlers)
-// maps to the shared "unknown" bucket so admit's non-empty-key invariant
-// holds (docs/15 deferred #3).
-func clientKey(r *http.Request) string {
+// clientKey extracts the bucket key for a request. The base identity is the
+// RemoteAddr host (IPv4/IPv6), falling back to the raw RemoteAddr when it
+// carries no port; an empty RemoteAddr (possible for exotic listeners/
+// in-process handlers) maps to the shared "unknown" bucket so admit's
+// non-empty-key invariant holds (docs/15 deferred #3).
+//
+// When the peer is inside the TrustedProxies allowlist (issue #30), the key
+// becomes the rightmost X-Forwarded-For hop that is not itself allowlisted:
+// hops at or right of that boundary were appended by trusted proxies, and
+// hops left of it are client-supplied and never examined. Everything else
+// fails closed to the peer key (today's behavior): an empty allowlist, an
+// unlisted peer (spoofed XFF), a trusted peer with no XFF or an all-trusted
+// chain (the proxy's own traffic), and any malformed hop at or right of the
+// boundary.
+func (l *rateLimiter) clientKey(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil || host == "" {
 		host = r.RemoteAddr
@@ -230,7 +258,67 @@ func clientKey(r *http.Request) string {
 	if host == "" {
 		return "unknown"
 	}
+	if len(l.cfg.TrustedProxies) == 0 {
+		return host
+	}
+	peer, err := netip.ParseAddr(host)
+	if err != nil || !trustedContains(l.cfg.TrustedProxies, peer) {
+		return host
+	}
+	// Walk the XFF chain right-to-left across all header copies (later
+	// headers are later hops).
+	values := r.Header.Values("X-Forwarded-For")
+	for vi := len(values) - 1; vi >= 0; vi-- {
+		hops := strings.Split(values[vi], ",")
+		for hi := len(hops) - 1; hi >= 0; hi-- {
+			addr, ok := parseForwardedAddr(hops[hi])
+			if !ok {
+				return host // malformed hop: fall back to the peer key
+			}
+			if !trustedContains(l.cfg.TrustedProxies, addr) {
+				return addr.String()
+			}
+		}
+	}
 	return host
+}
+
+// trustedContains reports whether addr is inside any allowlisted prefix.
+// Addresses are unmapped first so IPv4-mapped IPv6 peers match IPv4
+// allowlist entries. Zone-scoped addresses never match (netip.Prefix
+// semantics), so link-local peers keep RemoteAddr keying.
+func trustedContains(prefixes []netip.Prefix, addr netip.Addr) bool {
+	addr = addr.Unmap()
+	for _, p := range prefixes {
+		if p.Contains(addr) {
+			return true
+		}
+	}
+	return false
+}
+
+// parseForwardedAddr parses one X-Forwarded-For hop into an address.
+// Accepted spellings (surrounding whitespace ignored): bare IPv4/IPv6
+// (zone IDs allowed), bracketed IPv6, and either with a port. Anything
+// else — empty hops, "unknown", RFC 7239 obfuscated tokens, hostnames —
+// is malformed. IPv4-mapped IPv6 forms are unmapped so one client cannot
+// key two buckets under both spellings.
+func parseForwardedAddr(hop string) (netip.Addr, bool) {
+	hop = strings.TrimSpace(hop)
+	if addr, err := netip.ParseAddr(hop); err == nil {
+		return addr.Unmap(), true
+	}
+	host := hop
+	if h, _, err := net.SplitHostPort(hop); err == nil {
+		host = h // v4:port or [v6]:port
+	} else if len(hop) >= 2 && hop[0] == '[' && hop[len(hop)-1] == ']' {
+		host = hop[1 : len(hop)-1] // bracketed v6 without a port
+	}
+	addr, err := netip.ParseAddr(host)
+	if err != nil {
+		return netip.Addr{}, false
+	}
+	return addr.Unmap(), true
 }
 
 // gitMinBurst is the git-surface floor for the token-bucket depth. One git
@@ -275,10 +363,12 @@ func NewGitRateLimit(cfg RateLimitConfig) (func(http.Handler) http.Handler, erro
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			// clientKey maps an empty RemoteAddr to the shared "unknown"
 			// bucket (docs/15 deferred #3), so exotic listeners degrade to
-			// a collective limit instead of panicking or bypassing. The
-			// whole-exchange reserve (== the burst floor) latches limited
-			// clients until a complete git operation fits (admitReserve).
-			ok, retryAfter := l.admitReserve(clientKey(r), gitMinBurst)
+			// a collective limit instead of panicking or bypassing, and
+			// resolves trusted-proxy identity exactly like the REST
+			// limiter (issue #30, shared plumbing). The whole-exchange
+			// reserve (== the burst floor) latches limited clients until
+			// a complete git operation fits (admitReserve).
+			ok, retryAfter := l.admitReserve(l.clientKey(r), gitMinBurst)
 			if !ok {
 				w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
 				writeErr(w, http.StatusTooManyRequests, "rate limit exceeded")

@@ -141,7 +141,7 @@ func cmdServe(ctx context.Context, args []string) error {
 	// HTTP API (single-org self-host mode). The read endpoints share the
 	// ref/blob stores and cache dir with the githttp fallback below.
 	apiHandler, metaStore, verifier, maybeRepack, cleanup, err := buildAPIHandler(ctx, cfg.dbURL, cfg.org, httpBaseURL, orgPEMBlocks, st, bl, cfg.cacheDir,
-		api.RateLimitConfig{RPS: cfg.rateRPS, Burst: cfg.rateBurst}, cfg.packQuotaBytes, cfg.sweep, cfg.repackThreshold)
+		api.RateLimitConfig{RPS: cfg.rateRPS, Burst: cfg.rateBurst, TrustedProxies: cfg.trustedProxies}, cfg.packQuotaBytes, cfg.sweep, cfg.repackThreshold)
 	if err != nil {
 		return err
 	}
@@ -180,7 +180,7 @@ func cmdServe(ctx context.Context, args []string) error {
 	// routes must not stay outside the limiter. Separate bucket state from
 	// the REST limiter — one surface exhausting its budget must not starve
 	// the other.
-	gitLimit, err := api.NewGitRateLimit(api.RateLimitConfig{RPS: cfg.rateRPS, Burst: cfg.rateBurst})
+	gitLimit, err := api.NewGitRateLimit(api.RateLimitConfig{RPS: cfg.rateRPS, Burst: cfg.rateBurst, TrustedProxies: cfg.trustedProxies})
 	if err != nil {
 		return err
 	}

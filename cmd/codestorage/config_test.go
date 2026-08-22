@@ -472,6 +472,71 @@ func TestResolveServeConfigRateLimit(t *testing.T) {
 	}
 }
 
+func TestResolveServeConfigTrustedProxies(t *testing.T) {
+	base := func(extra map[string]string) func(string) string {
+		env := map[string]string{
+			"CODESTORAGE_PG_URL":      "postgres://x",
+			"CODESTORAGE_S3_URL":      "s3://x",
+			"CODESTORAGE_ORG":         "org1",
+			"CODESTORAGE_ORG_PUBKEYS": "/tmp/org.pub.pem",
+		}
+		for k, v := range extra {
+			env[k] = v
+		}
+		return mapEnv(env)
+	}
+
+	t.Run("unset-means-none", func(t *testing.T) {
+		cfg, err := resolveServeConfig(base(nil), "", "", "/tmp/cache", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(cfg.trustedProxies) != 0 {
+			t.Fatalf("unset env resolved to %v, want none", cfg.trustedProxies)
+		}
+	})
+
+	t.Run("parse-through", func(t *testing.T) {
+		cfg, err := resolveServeConfig(base(map[string]string{
+			// CIDRs, a bare IPv4 (single-address entry), a bare
+			// IPv4-mapped IPv6 (unmapped to /32), and whitespace padding.
+			envTrustedProxies: "10.0.0.0/8, 192.0.2.7 ,2001:db8::/32,::ffff:198.51.100.9",
+		}), "", "", "/tmp/cache", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := []string{"10.0.0.0/8", "192.0.2.7/32", "2001:db8::/32", "198.51.100.9/32"}
+		if len(cfg.trustedProxies) != len(want) {
+			t.Fatalf("resolved %v, want %v", cfg.trustedProxies, want)
+		}
+		for i, p := range cfg.trustedProxies {
+			if p.String() != want[i] {
+				t.Errorf("prefix %d = %s, want %s", i, p, want[i])
+			}
+		}
+	})
+
+	// Validated even without CODESTORAGE_RATE_* set: a typo must surface at
+	// startup, not when limits are later enabled.
+	for name, val := range map[string]string{
+		"malformed-cidr": "10.0.0.0/33",
+		"not-an-ip":      "proxy.example",
+		"empty-entry":    "10.0.0.1,,10.0.0.2",
+		"trailing-comma": "10.0.0.1,",
+		"zoned-address":  "fe80::1%eth0",
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := resolveServeConfig(base(map[string]string{envTrustedProxies: val}), "", "", "/tmp/cache", "")
+			if err == nil {
+				t.Fatalf("%s=%q resolved without error", envTrustedProxies, val)
+			}
+			if !strings.Contains(err.Error(), envTrustedProxies) {
+				t.Fatalf("error %q does not name %s", err, envTrustedProxies)
+			}
+		})
+	}
+}
+
 func TestResolveServeConfigPackQuota(t *testing.T) {
 	base := func(extra map[string]string) func(string) string {
 		env := map[string]string{

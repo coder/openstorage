@@ -102,7 +102,10 @@ in-memory token bucket per client IP, applied at every REST route registration s
   behavior-neutral, since a dropped bucket is recreated full.
 - **Key = `RemoteAddr` host.** `X-Forwarded-For` is deliberately not trusted — a
   spoofable header as the limit key would let any client mint fresh buckets at will.
-  Deployments behind a trusted proxy terminate client identity there.
+  Deployments behind a trusted proxy terminate client identity there. *(Issue #30
+  later added an opt-in `CODESTORAGE_TRUSTED_PROXIES` CIDR allowlist: when the peer
+  is a listed proxy, the key becomes the rightmost untrusted `X-Forwarded-For` hop;
+  the default stays `RemoteAddr`-only.)*
 - **Per node, in memory.** Nodes are stateless (no shared limiter state to operate), and
   per-node limiting is the documented "basic" scope. Pre-auth 429s mean unauthenticated
   clients consume budget keyed by IP — accepted for this scope.

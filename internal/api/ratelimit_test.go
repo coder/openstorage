@@ -3,8 +3,9 @@ package api
 // Unit tests for the pre-auth per-client-IP token bucket (ratelimit.go):
 // envelope shapes per route flavor, deterministic refill via the injectable
 // clock, per-client isolation, stale-bucket eviction, the client key
-// derivation (no XFF trust), and the alias re-dispatch exemption that keeps
-// aliased requests at exactly one token.
+// derivation (XFF trusted only behind allowlisted proxies, issue #30), and
+// the alias re-dispatch exemption that keeps aliased requests at exactly
+// one token.
 
 import (
 	"encoding/json"
@@ -12,6 +13,7 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"testing"
 	"time"
 )
@@ -203,6 +205,7 @@ func TestRateLimitStaleEviction(t *testing.T) {
 }
 
 func TestClientKey(t *testing.T) {
+	rl, _ := newTestLimiter(RateLimitConfig{RPS: 1, Burst: 1}, time.Unix(1000, 0))
 	cases := []struct {
 		name       string
 		remoteAddr string
@@ -224,8 +227,82 @@ func TestClientKey(t *testing.T) {
 			if tc.xff != "" {
 				r.Header.Set("X-Forwarded-For", tc.xff)
 			}
-			if got := clientKey(r); got != tc.want {
+			if got := rl.clientKey(r); got != tc.want {
 				t.Errorf("clientKey(%q) = %q, want %q", tc.remoteAddr, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestClientKeyTrustedProxies covers the issue #30 identity resolution: with
+// a trusted-proxy allowlist configured, a request whose TCP peer is inside
+// the allowlist keys on the rightmost X-Forwarded-For hop that is not
+// itself allowlisted; every other shape falls back to the RemoteAddr host.
+func TestClientKeyTrustedProxies(t *testing.T) {
+	trusted := []netip.Prefix{
+		netip.MustParsePrefix("10.0.0.0/8"),
+		netip.MustParsePrefix("2001:db8:1::/48"),
+	}
+	rl, _ := newTestLimiter(RateLimitConfig{RPS: 1, Burst: 1, TrustedProxies: trusted}, time.Unix(1000, 0))
+
+	const proxy = "10.0.0.5:7777" // inside 10.0.0.0/8
+	cases := []struct {
+		name       string
+		remoteAddr string
+		xff        []string // one entry per X-Forwarded-For header copy
+		want       string
+	}{
+		// Untrusted peer: XFF is never consulted (spoof attempt).
+		{"untrusted-peer-ignores-xff", "192.0.2.1:1", []string{"203.0.113.9"}, "192.0.2.1"},
+		// Trusted peer, single client hop.
+		{"single-hop", proxy, []string{"203.0.113.9"}, "203.0.113.9"},
+		// Rightmost untrusted wins; client-supplied garbage left of the
+		// boundary is never examined.
+		{"rightmost-untrusted", proxy, []string{"junk, 198.51.100.7"}, "198.51.100.7"},
+		// Trusted hops right of the client are skipped.
+		{"skips-trusted-hops", proxy, []string{"198.51.100.7, 10.0.0.9"}, "198.51.100.7"},
+		{"skips-trusted-v6-hop", proxy, []string{"198.51.100.7, 2001:db8:1::9"}, "198.51.100.7"},
+		// All hops trusted / no XFF: the proxy's own traffic.
+		{"all-trusted", proxy, []string{"10.0.0.9, 10.0.0.10"}, "10.0.0.5"},
+		{"no-xff", proxy, nil, "10.0.0.5"},
+		// Multiple header copies: later headers are later hops.
+		{"multi-header", proxy, []string{"198.51.100.7", "10.0.0.9"}, "198.51.100.7"},
+		// Hop spellings: ports, brackets, whitespace, zones, 4-in-6.
+		{"v4-with-port", proxy, []string{"203.0.113.9:4711"}, "203.0.113.9"},
+		{"v6-bare", proxy, []string{"2001:db8:2::9"}, "2001:db8:2::9"},
+		{"v6-bracketed", proxy, []string{"[2001:db8:2::9]"}, "2001:db8:2::9"},
+		{"v6-bracketed-port", proxy, []string{"[2001:db8:2::9]:443"}, "2001:db8:2::9"},
+		{"v6-zone", proxy, []string{"fe80::1%eth0"}, "fe80::1%eth0"},
+		{"whitespace", proxy, []string{"  203.0.113.9\t"}, "203.0.113.9"},
+		{"v4-mapped-unmapped", proxy, []string{"::ffff:203.0.113.9"}, "203.0.113.9"},
+		// Malformed rightmost hop: fail closed to the peer key.
+		{"malformed-hostname", proxy, []string{"evil.example"}, "10.0.0.5"},
+		{"malformed-unknown", proxy, []string{"unknown"}, "10.0.0.5"},
+		// An empty hop left of the boundary is never reached: the walk
+		// stops at the rightmost untrusted hop.
+		{"empty-hop-left-of-boundary", proxy, []string{"203.0.113.9,,198.51.100.7"}, "198.51.100.7"},
+		// ...but a malformed hop at the boundary (right of it only
+		// trusted hops) fails closed to the peer.
+		{"malformed-at-boundary", proxy, []string{"203.0.113.9,,10.0.0.9"}, "10.0.0.5"},
+		{"malformed-trailing-comma", proxy, []string{"203.0.113.9,"}, "10.0.0.5"},
+		{"malformed-empty-header", proxy, []string{""}, "10.0.0.5"},
+		// A 4-in-6 peer matches the IPv4 allowlist entry.
+		{"v4-mapped-peer-trusted", "[::ffff:10.0.0.5]:7777", []string{"203.0.113.9"}, "203.0.113.9"},
+		// A zone-scoped peer never matches the allowlist (netip semantics).
+		{"zoned-peer-untrusted", "[fe80::1%eth0]:7777", []string{"203.0.113.9"}, "fe80::1%eth0"},
+		// Sentinel keys stay put even with an allowlist configured.
+		{"empty-remoteaddr", "", []string{"203.0.113.9"}, "unknown"},
+		{"non-ip-remoteaddr", "pipe", []string{"203.0.113.9"}, "pipe"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := httptest.NewRequest(http.MethodGet, "/", nil)
+			r.RemoteAddr = tc.remoteAddr
+			for _, v := range tc.xff {
+				r.Header.Add("X-Forwarded-For", v)
+			}
+			if got := rl.clientKey(r); got != tc.want {
+				t.Errorf("clientKey(peer %q, xff %q) = %q, want %q", tc.remoteAddr, tc.xff, got, tc.want)
 			}
 		})
 	}
@@ -458,5 +535,108 @@ func TestGitRateLimitExchangeHysteresis(t *testing.T) {
 	*now = now.Add(100 * time.Second)
 	if ok, _ := rl.admit(key); !ok {
 		t.Fatal("reserve=1 admit must unlatch on one refilled token")
+	}
+}
+
+// --- trusted-proxy identity (issue #30) --------------------------------------
+
+// rlRequestXFF drives one request with a fixed peer address and
+// X-Forwarded-For header through h.
+func rlRequestXFF(t *testing.T, h http.Handler, remoteAddr, xff string) *httptest.ResponseRecorder {
+	t.Helper()
+	r := httptest.NewRequest(http.MethodGet, "/probe", nil)
+	r.RemoteAddr = remoteAddr
+	r.Header.Set("X-Forwarded-For", xff)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	return w
+}
+
+// TestRateLimitTrustedProxyBuckets: with the allowlist configured, clients
+// arriving through a trusted proxy get their own buckets keyed by the
+// forwarded address, while a spoofed XFF from an unlisted peer still shares
+// that peer's RemoteAddr bucket.
+func TestRateLimitTrustedProxyBuckets(t *testing.T) {
+	trusted := []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")}
+	rl, _ := newTestLimiter(RateLimitConfig{RPS: 0.001, Burst: 1, TrustedProxies: trusted}, time.Unix(1000, 0))
+	h := rl.limit(routeRead)(okHandler())
+	const proxy = "10.0.0.5:1234"
+
+	// Two clients behind the same proxy connection source: separate buckets.
+	if w := rlRequestXFF(t, h, proxy, "203.0.113.9"); w.Code != http.StatusOK {
+		t.Fatalf("client A via proxy = %d, want 200", w.Code)
+	}
+	if w := rlRequestXFF(t, h, proxy, "198.51.100.7"); w.Code != http.StatusOK {
+		t.Fatalf("client B via proxy = %d, want 200 (collapsed into A's bucket?)", w.Code)
+	}
+	if w := rlRequestXFF(t, h, proxy, "203.0.113.9"); w.Code != http.StatusTooManyRequests {
+		t.Fatalf("client A second request = %d, want 429", w.Code)
+	}
+	if w := rlRequestXFF(t, h, proxy, "198.51.100.7"); w.Code != http.StatusTooManyRequests {
+		t.Fatalf("client B second request = %d, want 429", w.Code)
+	}
+
+	// An unlisted peer cannot mint buckets via XFF: both spoofed values
+	// share the peer's RemoteAddr bucket.
+	if w := rlRequestXFF(t, h, "192.0.2.1:1", "203.0.113.100"); w.Code != http.StatusOK {
+		t.Fatalf("untrusted peer first request = %d, want 200", w.Code)
+	}
+	if w := rlRequestXFF(t, h, "192.0.2.1:1", "203.0.113.101"); w.Code != http.StatusTooManyRequests {
+		t.Fatalf("untrusted peer spoofed second request = %d, want 429 (XFF minted a bucket)", w.Code)
+	}
+}
+
+// TestRateLimitNoTrustBucketCollapse: the default (empty allowlist) keeps
+// today's behavior — XFF is ignored and every client behind one proxy
+// address shares the proxy's bucket.
+func TestRateLimitNoTrustBucketCollapse(t *testing.T) {
+	rl, _ := newTestLimiter(RateLimitConfig{RPS: 0.001, Burst: 1}, time.Unix(1000, 0))
+	h := rl.limit(routeRead)(okHandler())
+	const proxy = "10.0.0.5:1234"
+
+	if w := rlRequestXFF(t, h, proxy, "203.0.113.9"); w.Code != http.StatusOK {
+		t.Fatalf("first request = %d, want 200", w.Code)
+	}
+	if w := rlRequestXFF(t, h, proxy, "198.51.100.7"); w.Code != http.StatusTooManyRequests {
+		t.Fatalf("second client via same proxy = %d, want 429 (shared RemoteAddr bucket)", w.Code)
+	}
+}
+
+// TestGitRateLimitTrustedProxyIdentity: the git-surface limiter resolves
+// client identity through the same trusted-proxy plumbing as the REST
+// limiter (issue #30) — forwarded clients get separate buckets behind a
+// trusted proxy, and unlisted peers cannot mint buckets via XFF.
+func TestGitRateLimitTrustedProxyIdentity(t *testing.T) {
+	trusted := []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")}
+	mw, err := NewGitRateLimit(RateLimitConfig{RPS: 0.001, Burst: 1, TrustedProxies: trusted})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := mw(okHandler())
+	const proxy = "10.0.0.5:1234"
+
+	// Drain client A's bucket (raised to the gitMinBurst floor).
+	for i := 0; i < gitMinBurst; i++ {
+		if w := rlRequestXFF(t, h, proxy, "203.0.113.9"); w.Code != http.StatusOK {
+			t.Fatalf("client A request %d = %d, want 200", i, w.Code)
+		}
+	}
+	if w := rlRequestXFF(t, h, proxy, "203.0.113.9"); w.Code != http.StatusTooManyRequests {
+		t.Fatalf("client A over-burst = %d, want 429", w.Code)
+	}
+	// Client B behind the same proxy still has its own full bucket.
+	if w := rlRequestXFF(t, h, proxy, "198.51.100.7"); w.Code != http.StatusOK {
+		t.Fatalf("client B via proxy = %d, want 200 (git surface not honoring proxy identity)", w.Code)
+	}
+
+	// An unlisted peer's XFF is ignored: all spoofs drain one bucket.
+	for i := 0; i < gitMinBurst; i++ {
+		w := rlRequestXFF(t, h, "192.0.2.1:1", fmt.Sprintf("203.0.113.%d", 100+i))
+		if w.Code != http.StatusOK {
+			t.Fatalf("untrusted peer request %d = %d, want 200", i, w.Code)
+		}
+	}
+	if w := rlRequestXFF(t, h, "192.0.2.1:1", "203.0.113.200"); w.Code != http.StatusTooManyRequests {
+		t.Fatalf("untrusted peer over-burst = %d, want 429 (spoofed XFF minted buckets)", w.Code)
 	}
 }
