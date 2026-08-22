@@ -62,8 +62,11 @@ jobs:
             dist/checksums.txt
           if-no-files-found: error
 
-  # The darwin binaries come from a linux cross-compile; prove the arm64 one
-  # actually runs on macOS before it lands on the release.
+  # The darwin binaries come from a linux cross-compile; prove the one
+  # matching this runner's architecture actually runs on macOS before
+  # anything lands on the release. (macos-latest is Apple Silicon today, so
+  # this exercises darwin/arm64, but resolve the arch at runtime instead of
+  # hard-asserting a mutable runner label.)
   verify-macos:
     needs: build
     runs-on: macos-latest
@@ -73,14 +76,18 @@ jobs:
         with:
           name: release-archives
           path: dist
-      - name: Verify native archive (darwin/arm64) and all checksums
+      - name: Verify native darwin archive and all checksums
         env:
           TAG: ${{ inputs.tag }}
         run: |
-          [ "$(uname -m)" = arm64 ] # macos-latest is expected to be Apple Silicon
+          case "$(uname -m)" in
+            arm64) arch=arm64 ;;
+            x86_64) arch=amd64 ;;
+            *) echo "unexpected macOS runner arch: $(uname -m)" >&2; exit 1 ;;
+          esac
           cd dist
           shasum -a 256 -c checksums.txt
-          tar -xzf "codestorage_${TAG#v}_darwin_arm64.tar.gz"
+          tar -xzf "codestorage_${TAG#v}_darwin_${arch}.tar.gz"
           ./codestorage --version | grep -F "$TAG"
 
   publish:
