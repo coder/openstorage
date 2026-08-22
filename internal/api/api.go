@@ -14,12 +14,12 @@ import (
 	"strings"
 	"time"
 
-	"codestorage/internal/auth"
-	"codestorage/internal/blob"
-	"codestorage/internal/events"
-	"codestorage/internal/meta"
-	"codestorage/internal/ref"
-	upsync "codestorage/internal/sync"
+	"github.com/coder/code-storage/internal/auth"
+	"github.com/coder/code-storage/internal/blob"
+	"github.com/coder/code-storage/internal/events"
+	"github.com/coder/code-storage/internal/meta"
+	"github.com/coder/code-storage/internal/ref"
+	upsync "github.com/coder/code-storage/internal/sync"
 )
 
 // assertf is a fail-fast invariant check (crash-and-burn style).

@@ -16,7 +16,7 @@ import (
 	"testing"
 	"time"
 
-	"codestorage/internal/meta"
+	"github.com/coder/code-storage/internal/meta"
 )
 
 // sshWireBlob builds a minimal SSH public key blob: the length-prefixed

@@ -13,7 +13,7 @@ import (
 	"net/url"
 	"testing"
 
-	"codestorage/internal/auth"
+	"github.com/coder/code-storage/internal/auth"
 )
 
 func TestRepoURLByID(t *testing.T) {

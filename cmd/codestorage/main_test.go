@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"codestorage/internal/auth"
+	"github.com/coder/code-storage/internal/auth"
 )
 
 // decodeJWTClaims base64url-decodes the payload segment of a compact JWT.

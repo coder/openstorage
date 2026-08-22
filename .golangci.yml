@@ -14,7 +14,7 @@ linters:
 
 linters-settings:
   goimports:
-    local-prefixes: codestorage
+    local-prefixes: github.com/coder/code-storage
 
 issues:
   exclude-use-default: true

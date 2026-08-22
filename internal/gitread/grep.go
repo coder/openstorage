@@ -8,7 +8,7 @@ import (
 	"strconv"
 	"strings"
 
-	"codestorage/internal/ref"
+	"github.com/coder/code-storage/internal/ref"
 )
 
 // Grep line types (docs/03 POST /repos/grep lines[].type).

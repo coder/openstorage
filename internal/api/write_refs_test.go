@@ -20,10 +20,10 @@ import (
 	"strings"
 	"testing"
 
-	"codestorage/internal/auth"
-	"codestorage/internal/blob"
-	"codestorage/internal/gitread"
-	"codestorage/internal/ref"
+	"github.com/coder/code-storage/internal/auth"
+	"github.com/coder/code-storage/internal/blob"
+	"github.com/coder/code-storage/internal/gitread"
+	"github.com/coder/code-storage/internal/ref"
 )
 
 // newWrefServer builds an httptest server exposing only the W3 write routes

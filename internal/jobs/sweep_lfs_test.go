@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"codestorage/internal/blob"
+	"github.com/coder/code-storage/internal/blob"
 )
 
 // lfsOID mints a deterministic 64-hex oid from a two-hex-char seed.

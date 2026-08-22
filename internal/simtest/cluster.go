@@ -11,10 +11,10 @@ import (
 	"sync"
 	"time"
 
-	"codestorage/internal/blob"
-	"codestorage/internal/events"
-	"codestorage/internal/meta"
-	"codestorage/internal/ref"
+	"github.com/coder/code-storage/internal/blob"
+	"github.com/coder/code-storage/internal/events"
+	"github.com/coder/code-storage/internal/meta"
+	"github.com/coder/code-storage/internal/ref"
 )
 
 // simNode is one simulated stateless server node: its own SQLite and

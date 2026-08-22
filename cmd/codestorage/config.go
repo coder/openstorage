@@ -16,7 +16,7 @@ import (
 	"strings"
 	"time"
 
-	"codestorage/internal/secrets"
+	"github.com/coder/code-storage/internal/secrets"
 )
 
 // Environment variable names, canonical first; envFirst scans left to right.

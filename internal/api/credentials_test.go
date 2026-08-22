@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"codestorage/internal/auth"
+	"github.com/coder/code-storage/internal/auth"
 )
 
 // gcredCreate stores a credential for repoID via POST and returns its id.

@@ -5,7 +5,7 @@ import (
 	"errors"
 	"fmt"
 
-	"codestorage/internal/meta"
+	"github.com/coder/code-storage/internal/meta"
 )
 
 // MetaStores adapts the durable meta.EventingStore rows to this package's

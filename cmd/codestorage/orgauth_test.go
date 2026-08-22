@@ -22,9 +22,9 @@ import (
 	"path/filepath"
 	"testing"
 
-	"codestorage/internal/auth"
-	"codestorage/internal/meta"
-	upsync "codestorage/internal/sync"
+	"github.com/coder/code-storage/internal/auth"
+	"github.com/coder/code-storage/internal/meta"
+	upsync "github.com/coder/code-storage/internal/sync"
 )
 
 func TestBootstrapOrgAuth_TwoBootsKeepBothLoopbackKeys(t *testing.T) {

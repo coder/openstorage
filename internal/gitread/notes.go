@@ -7,7 +7,7 @@ import (
 	"os/exec"
 	"strings"
 
-	"codestorage/internal/ref"
+	"github.com/coder/code-storage/internal/ref"
 )
 
 // Note reads the git note attached to object sha from notesRef in the repo

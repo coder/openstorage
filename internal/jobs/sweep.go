@@ -31,7 +31,7 @@ import (
 	"strings"
 	"time"
 
-	"codestorage/internal/blob"
+	"github.com/coder/code-storage/internal/blob"
 )
 
 // PackRegistry is the slice of ref.RefStore the sweeper needs: point

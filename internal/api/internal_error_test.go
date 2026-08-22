@@ -14,8 +14,8 @@ import (
 	"strings"
 	"testing"
 
-	"codestorage/internal/auth"
-	"codestorage/internal/meta"
+	"github.com/coder/code-storage/internal/auth"
+	"github.com/coder/code-storage/internal/meta"
 )
 
 // failingStore returns err from every method; the leaked-secret marker in

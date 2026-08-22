@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"codestorage/internal/ref"
+	"github.com/coder/code-storage/internal/ref"
 )
 
 // BlameLine is one attributed line (docs/03 GET /repos/blame line objects).

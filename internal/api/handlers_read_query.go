@@ -21,9 +21,9 @@ import (
 	"strings"
 	"time"
 
-	"codestorage/internal/gitread"
-	"codestorage/internal/meta"
-	"codestorage/internal/ref"
+	"github.com/coder/code-storage/internal/gitread"
+	"github.com/coder/code-storage/internal/meta"
+	"github.com/coder/code-storage/internal/ref"
 )
 
 // maxInlineDiffBytes is the large-file filtering threshold for the diff
