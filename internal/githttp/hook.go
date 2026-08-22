@@ -670,7 +670,17 @@ func verifySig(ctx context.Context, refName, old, new string) error {
 		return fmt.Errorf("verify-sig: load signing keys for org %q: %w", org, err)
 	}
 	if len(keys) == 0 {
-		return verifySigDenied(refName, new, fmt.Sprintf("no signing keys registered for org %q", org))
+		// Cache the denial on the first introduced commit — the first line
+		// any identical-range walk emits — so later refs at the same tip
+		// abort after one rev-list line instead of repeating the walk
+		// (Codex round 3: without this, a keyless org turned N same-tip
+		// creations into N full-history walks). The message still names
+		// the tip, matching the documented log-line shape.
+		reason := fmt.Sprintf("no signing keys registered for org %q", org)
+		if err := state.markCommitDenied(pending[0], reason); err != nil {
+			return fmt.Errorf("verify-sig: %w", err)
+		}
+		return verifySigDenied(refName, new, reason)
 	}
 
 	v, cleanup, err := newSigVerifier(keys)
@@ -720,11 +730,15 @@ func verifySigDenied(refName, sha, reason string) error {
 // protected creation (branch-protection.md "Commit signing verifications";
 // Codex round 1 on issue #59's original direction). Cost is bounded by the
 // per-push verdict cache and the budget instead — and the budget bounds the
-// walk ITSELF: rev-list output is consumed incrementally and the subprocess
-// is killed at budget exhaustion, so a deep creation cannot force
-// traversal or allocation proportional to its whole history (Codex round
-// 2). Budget 0 means unlimited by explicit operator choice.
-func introducedPending(ctx context.Context, state *verifyState, refName, old, new string, budget int) ([]string, error) {
+// walk ITSELF, two ways (Codex rounds 2 and 3): rev-list output is consumed
+// incrementally with the subprocess killed at abort, uncached commits are
+// bounded by the remaining spawn budget, and EVERY examined commit — cached
+// verdicts included — charges the push's cumulative walk allowance
+// (verifyWalkBudgetMultiplier × budget, persisted across hook processes),
+// so refs at distinct ancestors of an already-verified chain cannot re-walk
+// the history once per ref for free. Budget 0 means unlimited by explicit
+// operator choice.
+func introducedPending(ctx context.Context, state *verifyState, refName, old, new string, budget int) (pending []string, retErr error) {
 	assertf(state != nil && budget >= 0, "introducedPending: state=%v budget=%d", state, budget)
 	if !ref.ValidSHA(new) || new == ref.ZeroSHA {
 		return nil, fmt.Errorf("verify-sig: introducedPending: bad new sha %q", new)
@@ -747,7 +761,18 @@ func introducedPending(ctx context.Context, state *verifyState, refName, old, ne
 	// killed it then, so the Wait error is expected and irrelevant.
 	abort := func() { cancel(); _ = cmd.Wait() }
 
-	var pending []string
+	// Persist the examined-commit count on every exit path — denials and
+	// aborts included, because a non-atomic push continues with its other
+	// refs. A persist failure must not let the walk allowance silently
+	// reset, so it fails the call closed unless it is already failing.
+	var walked int64
+	defer func() {
+		if err := state.markWalked(walked); err != nil && retErr == nil {
+			pending, retErr = nil, fmt.Errorf("verify-sig: %w", err)
+		}
+	}()
+	maxWalk := walkBudget(budget)
+
 	sc := bufio.NewScanner(stdout)
 	for sc.Scan() {
 		line := sc.Text()
@@ -758,6 +783,12 @@ func introducedPending(ctx context.Context, state *verifyState, refName, old, ne
 		if !ref.ValidSHA(line) {
 			abort()
 			return nil, fmt.Errorf("verify-sig: rev-list emitted %q", line)
+		}
+		walked++
+		if maxWalk > 0 && state.walked+walked > maxWalk {
+			abort()
+			return nil, fmt.Errorf("verify-sig: push exceeds the per-push history-walk allowance: %s pushed the total past %d examined commits (%d× CODESTORAGE_VERIFY_SIG_BUDGET; raise the budget or split the push)",
+				refName, maxWalk, verifyWalkBudgetMultiplier)
 		}
 		if state.ok[line] {
 			continue

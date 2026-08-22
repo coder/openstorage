@@ -5,10 +5,14 @@ package githttp
 // fail-closed parsing of malformed state and budget values.
 
 import (
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"codestorage/internal/ref"
 )
 
 const (
@@ -124,6 +128,122 @@ func TestVerifyState_DenyReasonNormalizedToOneLine(t *testing.T) {
 	if got := st2.deny[shaC]; got != "gpg: BAD signature" {
 		t.Fatalf("reason round-tripped as %q", got)
 	}
+}
+
+func TestVerifyState_WalkedAccountingRoundTrip(t *testing.T) {
+	newStateFile(t)
+	st, err := openVerifyState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.markWalked(0); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.markWalked(40); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.markWalked(2); err != nil {
+		t.Fatal(err)
+	}
+	st2, err := openVerifyState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st2.walked != 42 {
+		t.Fatalf("walked = %d, want 42 accumulated across loads", st2.walked)
+	}
+}
+
+func TestVerifyState_MalformedWalkedLineFailsClosed(t *testing.T) {
+	for _, bad := range []string{"walked", "walked x", "walked -1", "walked 0"} {
+		path := newStateFile(t)
+		if err := os.WriteFile(path, []byte(bad+"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := openVerifyState(); err == nil {
+			t.Fatalf("state line %q loaded without error", bad)
+		}
+	}
+}
+
+func TestWalkBudget(t *testing.T) {
+	if got := walkBudget(0); got != 0 {
+		t.Fatalf("walkBudget(0) = %d, want 0 (unbounded)", got)
+	}
+	if got := walkBudget(10000); got != 1000000 {
+		t.Fatalf("walkBudget(10000) = %d, want 1000000", got)
+	}
+	if got := walkBudget(int(int64(1) << 60)); got != 1<<62 {
+		t.Fatalf("huge budget = %d, want saturation at 1<<62", got)
+	}
+}
+
+// TestIntroducedPending_WalkAllowance pins the round-3 traversal bound:
+// every examined rev-list line — cached verdicts included — charges the
+// push's cumulative walk allowance, so re-walking already-verified history
+// once per ref is bounded too.
+func TestIntroducedPending_WalkAllowance(t *testing.T) {
+	dir := t.TempDir()
+	run := func(args ...string) string {
+		t.Helper()
+		cmd := exec.Command("git", append([]string{"-c", "user.email=t@t", "-c", "user.name=t"}, args...)...)
+		cmd.Dir = dir
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	run("init", "-b", "main", ".")
+	for i := 0; i < 5; i++ {
+		run("commit", "--allow-empty", "-m", fmt.Sprintf("c%d", i))
+	}
+	tip := run("rev-parse", "HEAD")
+	t.Chdir(dir)
+	t.Setenv(EnvVerifyState, "")
+
+	t.Run("allowance-trips-across-calls", func(t *testing.T) {
+		st, err := openVerifyState()
+		if err != nil {
+			t.Fatal(err)
+		}
+		// budget 1 ⇒ allowance 100; pre-charge 99 examined commits, and
+		// mark the whole history verified so the spawn budget cannot trip
+		// first: only the walk allowance can reject.
+		for _, sha := range strings.Fields(run("rev-list", tip)) {
+			st.ok[sha] = true
+		}
+		if err := st.markWalked(99); err != nil {
+			t.Fatal(err)
+		}
+		_, err = introducedPending(t.Context(), st, "refs/heads/x", ref.ZeroSHA, tip, 1)
+		if err == nil || !strings.Contains(err.Error(), "history-walk allowance") {
+			t.Fatalf("err = %v, want history-walk allowance rejection", err)
+		}
+		if st.walked <= 99 {
+			t.Fatalf("walked = %d, want the aborted walk charged on top of 99", st.walked)
+		}
+	})
+
+	t.Run("cached-commits-still-charge", func(t *testing.T) {
+		st, err := openVerifyState()
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, sha := range strings.Fields(run("rev-list", tip)) {
+			st.ok[sha] = true
+		}
+		pending, err := introducedPending(t.Context(), st, "refs/heads/x", ref.ZeroSHA, tip, 1000)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(pending) != 0 {
+			t.Fatalf("pending = %v, want none (all cached)", pending)
+		}
+		if st.walked != 5 {
+			t.Fatalf("walked = %d, want 5 (cached commits charge the allowance)", st.walked)
+		}
+	})
 }
 
 func TestVerifySigBudget_Parsing(t *testing.T) {

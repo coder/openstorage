@@ -360,6 +360,9 @@ run, with an error naming this variable.
   worst case this budget bounds. Raise it deliberately before importing histories deeper
   than the budget under a `verify-sig` policy: such pushes are rejected fail-closed with
   an error naming this variable.
+- The budget also derives a per-push **history-walk allowance** of 100 × its value:
+  every commit a walk examines (cached verdicts included) counts, so many refs re-walking
+  the same already-verified history are bounded too. `0` disables both bounds.
 
 ## Maintenance jobs
 

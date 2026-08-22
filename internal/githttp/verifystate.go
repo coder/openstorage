@@ -58,12 +58,27 @@ const EnvVerifySpawnLog = "CODESTORAGE_TEST_VERIFY_SPAWN_LOG"
 
 // State file directives. Every verifier spawn appends exactly one ok/deny
 // line, so spent (the budget charge) is their count; okrange lines record
-// whole-range successes for cross-ref (old,new) dedup and are free.
+// whole-range successes for cross-ref (old,new) dedup and are free; walked
+// lines accumulate rev-list output consumed by the push's history walks.
 const (
-	verdictOK    = "ok"
-	verdictDeny  = "deny"
-	verdictRange = "okrange"
+	verdictOK     = "ok"
+	verdictDeny   = "deny"
+	verdictRange  = "okrange"
+	verdictWalked = "walked"
 )
+
+// verifyWalkBudgetMultiplier derives the per-push traversal bound from the
+// verification budget: a push may examine at most multiplier × budget
+// commits across all its history walks, cached verdicts included. Without
+// it, cached-OK commits cost nothing, so refs at distinct ancestors of an
+// already-verified chain could re-walk the whole history once per ref with
+// zero verifier spawns (Codex round 3) — quota-invisible CPU amplification.
+// Examining a commit is orders of magnitude cheaper than verifying one
+// (one rev-list output line vs one subprocess), hence the generous
+// multiplier: the default budget of 10000 allows a million examined
+// commits per push. Compiled constant like the repack fold budgets;
+// budget 0 disables the walk bound too.
+const verifyWalkBudgetMultiplier = 100
 
 // verifyState is one push's verdict cache. Loaded fresh per verifySig call
 // (the file is small and hooks are sequential); appends go straight to the
@@ -74,6 +89,7 @@ type verifyState struct {
 	deny   map[string]string
 	ranges map[string]bool
 	spent  int
+	walked int64
 }
 
 func rangeKey(old, new string) string { return old + " " + new }
@@ -140,6 +156,12 @@ func (st *verifyState) applyLine(line string) error {
 			return fmt.Errorf("malformed verify state line %q", line)
 		}
 		st.ranges[rangeKey(old, new)] = true
+	case verdictWalked:
+		n, err := strconv.ParseInt(rest, 10, 64)
+		if err != nil || n <= 0 {
+			return fmt.Errorf("malformed verify state line %q", line)
+		}
+		st.walked += n
 	default:
 		return fmt.Errorf("malformed verify state line %q", line)
 	}
@@ -186,6 +208,29 @@ func (st *verifyState) markCommitDenied(sha, reason string) error {
 
 func (st *verifyState) markRangeOK(old, new string) error {
 	return st.appendLine(verdictRange + " " + rangeKey(old, new))
+}
+
+// markWalked accumulates n examined commits for the following hook
+// processes of the same push; a zero count records nothing.
+func (st *verifyState) markWalked(n int64) error {
+	assertf(n >= 0, "markWalked(%d)", n)
+	if n == 0 {
+		return nil
+	}
+	return st.appendLine(verdictWalked + " " + strconv.FormatInt(n, 10))
+}
+
+// walkBudget derives the traversal bound from the verification budget,
+// saturating instead of overflowing on absurd budgets. 0 = unbounded.
+func walkBudget(budget int) int64 {
+	assertf(budget >= 0, "walkBudget(%d)", budget)
+	if budget == 0 {
+		return 0
+	}
+	if int64(budget) > (1<<62)/verifyWalkBudgetMultiplier {
+		return 1 << 62
+	}
+	return int64(budget) * verifyWalkBudgetMultiplier
 }
 
 // verifySigBudget resolves the per-push verified-commit budget from the
