@@ -18,6 +18,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -117,6 +118,11 @@ func cmdServe(ctx context.Context, args []string) error {
 	if httpBaseURL == "" {
 		httpBaseURL = "http://" + ln.Addr().String()
 	}
+	// The sync worker's loopback pushes must terminate in THIS process
+	// (issue #45): the external base URL often points at a load balancer,
+	// which could route the push to a replica that cannot verify the
+	// minting process's in-memory loopback key.
+	loopbackBaseURL := selfLoopbackURL(ln.Addr())
 
 	mux := http.NewServeMux()
 
@@ -140,7 +146,7 @@ func cmdServe(ctx context.Context, args []string) error {
 
 	// HTTP API (single-org self-host mode). The read endpoints share the
 	// ref/blob stores and cache dir with the githttp fallback below.
-	apiHandler, metaStore, verifier, maybeRepack, cleanup, err := buildAPIHandler(ctx, cfg.dbURL, cfg.org, httpBaseURL, orgPEMBlocks, st, bl, cfg.cacheDir,
+	apiHandler, metaStore, verifier, maybeRepack, cleanup, err := buildAPIHandler(ctx, cfg.dbURL, cfg.org, httpBaseURL, loopbackBaseURL, orgPEMBlocks, st, bl, cfg.cacheDir,
 		api.RateLimitConfig{RPS: cfg.rateRPS, Burst: cfg.rateBurst, TrustedProxies: cfg.trustedProxies}, cfg.packQuotaBytes, cfg.packReservationTTL, cfg.sweep, cfg.repackThreshold)
 	if err != nil {
 		return err
@@ -197,6 +203,38 @@ func cmdServe(ctx context.Context, args []string) error {
 
 	fmt.Printf("listening on %s\n", ln.Addr())
 	return http.Serve(ln, mux)
+}
+
+// selfLoopbackURL derives the sync worker's push target from this process's
+// bound listener (issue #45): loopback pushes must terminate in the minting
+// process, so the external CODESTORAGE_BASE_URL — typically a load balancer
+// that may route to any replica — is unusable. An unspecified bind address
+// is rewritten to the matching loopback address; a concrete one is dialable
+// as-is.
+func selfLoopbackURL(addr net.Addr) string {
+	tcp, ok := addr.(*net.TCPAddr)
+	assertf(ok, "selfLoopbackURL: non-TCP listener address %T", addr)
+	assertf(tcp.Port > 0, "selfLoopbackURL: unresolved port in %q", addr.String())
+	var host string
+	switch {
+	case tcp.IP == nil:
+		// ":port" binds every interface dual-stack; IPv4 loopback works.
+		host = "127.0.0.1"
+	case tcp.IP.IsUnspecified():
+		if tcp.IP.To4() != nil {
+			host = "127.0.0.1"
+		} else {
+			host = "::1"
+		}
+	default:
+		host = tcp.IP.String()
+		if tcp.Zone != "" {
+			// Scoped IPv6 (e.g. fe80::1%eth0): RFC 6874 requires the
+			// zone separator to appear as %25 inside a URL host.
+			host += "%25" + tcp.Zone
+		}
+	}
+	return "http://" + net.JoinHostPort(host, strconv.Itoa(tcp.Port))
 }
 
 func cmdKeygen(args []string) error {

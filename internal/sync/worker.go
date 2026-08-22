@@ -31,7 +31,10 @@ type RepoLookup func(ctx context.Context, org, repoID string) (RepoInfo, error)
 // CAS, and push-event emission by doing a real `git push`).
 type Loopback struct {
 	// BaseURL prefixes push URLs as {BaseURL}/{repo_id}.git. Any scheme git
-	// understands works (http(s):// in production, file:// in tests).
+	// understands works (http(s):// in production, file:// in tests). It
+	// must terminate in THIS process when Token mints keys only this
+	// process can verify (issue #45): the serve command passes its own
+	// bound listener, never the external (load-balanced) base URL.
 	BaseURL string
 	// Token mints a short-lived git:write JWT for the loopback push (basic
 	// auth `t:<jwt>`, docs/05). The token is passed to git via GIT_ASKPASS
@@ -251,6 +254,12 @@ func (w *Worker) transfer(ctx context.Context, job Job, repo RepoInfo, up Upstre
 	if err != nil {
 		return &syncFailure{code: FailInternal, cause: err}
 	}
+	// The loopback push is a self-call (Loopback.BaseURL doc): proxy env
+	// must never reroute it through a load balancer, where the token could
+	// land on a replica that cannot verify it (issue #45). os/exec keeps
+	// the last duplicate env entry, so these override inherited settings.
+	// The upstream FETCH above keeps proxy env untouched on purpose.
+	pushEnv = append(pushEnv, "NO_PROXY=*", "no_proxy=*")
 	pushURL := strings.TrimRight(w.Loopback.BaseURL, "/") + "/" + repo.RepoID + ".git"
 	pushArgs := append([]string{"push", pushURL}, mirrorRefspecs...)
 	if stderr, err := runGit(ctx, mirror, pushEnv, pushArgs...); err != nil {

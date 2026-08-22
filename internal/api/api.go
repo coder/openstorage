@@ -37,6 +37,14 @@ type Config struct {
 	Store    meta.Store
 	Verifier auth.Verifier
 	Logger   *slog.Logger
+	// Org is the single served org (ADR-8), the same value the serve
+	// command passes to githttp.NewServer. When set, every REST route
+	// rejects verified tokens whose `iss` differs with 403 (issue #47),
+	// mirroring the git surface's served-org gate. The zero value disables
+	// the gate (matching this Config's other zero-value-disables knobs);
+	// it exists ONLY for this repo's multi-org integration harness — the
+	// serve command always sets Org.
+	Org string
 	// HTTPBaseURL is the externally reachable git base URL (scheme://host),
 	// used to build the `http_url` in the POST /repos response, e.g.
 	// "https://selfhost.code.storage".
@@ -131,7 +139,7 @@ func New(cfg Config) (http.Handler, error) {
 
 	mux := http.NewServeMux()
 	route := func(pattern string, orgLevel bool, h http.HandlerFunc, scopes ...string) {
-		mux.Handle(pattern, rl.limit(routeRead)(requireAuth(cfg.Verifier, orgLevel, scopes...)(h)))
+		mux.Handle(pattern, rl.limit(routeRead)(requireAuth(cfg.Verifier, cfg.Org, orgLevel, scopes...)(h)))
 	}
 	// POST /repos is the base_repo-aware create: code/code.storage fork
 	// specs dispatch to the synchronous fork (handlers_fork.go); everything
@@ -167,22 +175,22 @@ func New(cfg Config) (http.Handler, error) {
 
 	// git:write surface (docs/07 p4). The route/scope tables live next to
 	// the handlers (handlers_write_commit.go, handlers_write_refs.go).
-	registerWriteCommitRoutes(mux, s, cfg.Verifier, rl)
-	s.registerWriteRefRoutes(mux, cfg.Verifier, rl)
-	s.registerWriteMergeRoutes(mux, cfg.Verifier, rl)
+	registerWriteCommitRoutes(mux, s, cfg.Verifier, cfg.Org, rl)
+	s.registerWriteRefRoutes(mux, cfg.Verifier, cfg.Org, rl)
+	s.registerWriteMergeRoutes(mux, cfg.Verifier, cfg.Org, rl)
 
 	// Phase-5 routes: webhook CRUD (docs/06), git-credentials CRUD and
 	// upstream sync (docs/03).
-	RegisterWebhookRoutes(mux, cfg.Verifier, events.MetaWebhookStore{Store: cfg.Store}, logger, rl)
-	registerCredentialRoutes(mux, cfg.Verifier, ss, rl)
-	registerSyncRoutes(mux, cfg.Verifier, ss, rl)
+	RegisterWebhookRoutes(mux, cfg.Verifier, cfg.Org, events.MetaWebhookStore{Store: cfg.Store}, logger, rl)
+	registerCredentialRoutes(mux, cfg.Verifier, cfg.Org, ss, rl)
+	registerSyncRoutes(mux, cfg.Verifier, cfg.Org, ss, rl)
 
 	// Phase-6 routes: named-repo aliases /api/repos/{repo_name}/...
 	// (alias.go) and GET /api/repo-urls/{repo_id} (repourls.go). Both are
 	// registered last so their patterns cannot shadow the v1 surface they
 	// dispatch to.
-	registerAliasRoutes(mux, s, ss, cfg.Verifier, rl)
-	registerRepoURLRoutes(mux, s, cfg.Verifier, rl)
+	registerAliasRoutes(mux, s, ss, cfg.Verifier, cfg.Org, rl)
+	registerRepoURLRoutes(mux, s, cfg.Verifier, cfg.Org, rl)
 
 	if cfg.Fallback != nil {
 		mux.Handle("/", cfg.Fallback)

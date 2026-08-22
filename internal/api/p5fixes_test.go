@@ -136,8 +136,8 @@ func newP5FixStack(t *testing.T, e *testEnv, queue upsync.Queue) (string, *httpt
 	ss := newSyncServer(e.store, mem, mem, queue, testHTTPBaseURL, discardLogger())
 	mux := http.NewServeMux()
 	mux.Handle("POST /api/v1/repos",
-		requireAuth(verifier, false, auth.ScopeRepoWrite)(http.HandlerFunc(ss.handleCreateRepo)))
-	registerSyncRoutes(mux, verifier, ss, nil)
+		requireAuth(verifier, org, false, auth.ScopeRepoWrite)(http.HandlerFunc(ss.handleCreateRepo)))
+	registerSyncRoutes(mux, verifier, org, ss, nil)
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 	return org, srv

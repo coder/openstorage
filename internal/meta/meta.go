@@ -89,6 +89,12 @@ type Store interface {
 	// for JWT verification.
 	PublicKeysForOrg(ctx context.Context, name string) ([]string, error)
 
+	// OrgNames returns every org row's name, ordered by name. Org rows are
+	// retained forever (single-org mode never deletes them), so the serve
+	// command uses this at startup to warn about rows that no longer match
+	// the configured org (issue #47).
+	OrgNames(ctx context.Context) ([]string, error)
+
 	// CreateRepo inserts a live repo with a server-generated RepoID.
 	// ErrAlreadyExists when (org, url) is taken — even by a soft-deleted row.
 	CreateRepo(ctx context.Context, org, url, defaultBranch string) (Repo, error)

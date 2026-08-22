@@ -187,10 +187,10 @@ pre-storage push bound ([#55](https://github.com/coder/code-storage/issues/55)).
 
 - Set [`CODESTORAGE_BASE_URL`](../reference/configuration.md#codestorage_base_url) to the
   external `https://` URL so clone URLs and other `http_url` values in API responses are
-  routable. It is not only embedded in responses: the upstream-sync worker pushes its
-  loopback git traffic to `<base URL>/<repo_id>.git`, so **every replica must itself be
-  able to reach this URL** through the proxy (resolvable and hairpinnable from the
-  replica network), or `pull-upstream` syncs fail.
+  routable. It is only embedded in responses — internal traffic (the upstream-sync
+  worker's loopback pushes) targets each replica's own listener directly, so the
+  replicas do not need to reach the external URL themselves
+  ([#45](https://github.com/coder/code-storage/issues/45)).
 - Both the REST API and git smart-HTTP (clone/push, LFS *batch*) ride the same
   listener — proxy everything. Response bodies (clones, archives) can be very large;
   stream rather than buffer them. Request bodies need a **generous but bounded** cap set
@@ -296,12 +296,13 @@ Two sharp edges:
   parsed — a truncated block appended after a valid key is dropped, not rejected. After a
   rotation, verify a token signed with the *new* key is accepted rather than trusting
   startup success.
-- Each boot also registers a per-process loopback key used by the upstream-sync worker.
-  Because the boot-time rewrite is last-writer-wins, in a multi-replica fleet only the
-  most recently booted replica's loopback key survives, which can fail `pull-upstream`
-  sync runs on the other replicas — a known limitation tracked in
-  [#45](https://github.com/coder/code-storage/issues/45). Core API and git traffic is
-  unaffected.
+- The upstream-sync worker signs its loopback pushes with a per-process key that never
+  leaves that process's memory, and those pushes target the replica's own listener —
+  never the external base URL — so replicas cannot interfere with each other's
+  `pull-upstream` runs and the database's org key set stays exactly the configured file
+  keys. (Historically the loopback key was persisted last-writer-wins, breaking sync on
+  every replica but the most recently booted one —
+  [#45](https://github.com/coder/code-storage/issues/45).)
 
 ## Background maintenance in a fleet
 

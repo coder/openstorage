@@ -75,13 +75,13 @@ const wmFilteredReasonTooLarge = "max_content_bytes_exceeded"
 // registerWriteMergeRoutes mounts the merge endpoints (called from api.New)
 // with the per-route auth middleware (scope table docs/02: merge needs
 // git:write, the read-only preview needs git:read).
-func (s *server) registerWriteMergeRoutes(mux *http.ServeMux, verifier auth.Verifier, rl *rateLimiter) {
+func (s *server) registerWriteMergeRoutes(mux *http.ServeMux, verifier auth.Verifier, org string, rl *rateLimiter) {
 	assertf(mux != nil && s != nil && verifier != nil, "registerWriteMergeRoutes: nil dependency")
 	mux.Handle("POST /api/v1/repos/merge",
-		rl.limit(routeWrite)(requireAuthWrite(verifier, false, auth.ScopeGitWrite)(http.HandlerFunc(s.handleMerge))))
+		rl.limit(routeWrite)(requireAuthWrite(verifier, org, false, auth.ScopeGitWrite)(http.HandlerFunc(s.handleMerge))))
 	// Preview is a read (docs/03: git:read) and keeps the {"error"} body.
 	mux.Handle("GET /api/v1/repos/merge/preview",
-		rl.limit(routeRead)(requireAuth(verifier, false, auth.ScopeGitRead)(http.HandlerFunc(s.handleMergePreview))))
+		rl.limit(routeRead)(requireAuth(verifier, org, false, auth.ScopeGitRead)(http.HandlerFunc(s.handleMergePreview))))
 }
 
 // ---------------------------------------------------------------------------

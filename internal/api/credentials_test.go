@@ -151,13 +151,15 @@ func TestCredentialUpdate(t *testing.T) {
 			t.Fatalf("repo token on PUT: status %d, want 403", resp.StatusCode)
 		}
 
-		// Another org's token must see 404, not this org's credential.
+		// Another org's token never reaches the handler: the served-org
+		// gate (issue #47) answers 403 at the middleware, mirroring the
+		// git surface.
 		otherOrg := e.newOrg(t)
 		otherOrgToken := s.e.mint(t, tokenSpec{iss: otherOrg, repo: auth.RepoClaimOrg, scopes: []string{auth.ScopeRepoWrite}})
 		resp, _ = s.req(t, http.MethodPut, "/api/v1/repos/git-credentials", otherOrgToken,
 			[]byte(`{"id":"`+credID+`","password":"p"}`))
-		if resp.StatusCode != http.StatusNotFound {
-			t.Fatalf("cross-org update: status %d, want 404", resp.StatusCode)
+		if resp.StatusCode != http.StatusForbidden {
+			t.Fatalf("cross-org update: status %d, want 403", resp.StatusCode)
 		}
 	})
 }
@@ -170,13 +172,14 @@ func TestCredentialDelete(t *testing.T) {
 		credID := gcredCreate(t, s, repoURL, repoID)
 		orgToken := s.e.mint(t, tokenSpec{iss: s.org, repo: auth.RepoClaimOrg, scopes: []string{auth.ScopeRepoWrite}})
 
-		// Cross-org delete -> 404, credential untouched.
+		// Cross-org delete -> 403 at the served-org gate (issue #47),
+		// credential untouched.
 		otherOrg := e.newOrg(t)
 		otherOrgToken := s.e.mint(t, tokenSpec{iss: otherOrg, repo: auth.RepoClaimOrg, scopes: []string{auth.ScopeRepoWrite}})
 		resp, _ := s.req(t, http.MethodDelete, "/api/v1/repos/git-credentials", otherOrgToken,
 			[]byte(`{"id":"`+credID+`"}`))
-		if resp.StatusCode != http.StatusNotFound {
-			t.Fatalf("cross-org delete: status %d, want 404", resp.StatusCode)
+		if resp.StatusCode != http.StatusForbidden {
+			t.Fatalf("cross-org delete: status %d, want 403", resp.StatusCode)
 		}
 
 		// Happy path -> 204 with empty body.
