@@ -582,6 +582,30 @@ func TestRateLimitMappedPrefixNormalization(t *testing.T) {
 	if _, err := NewGitRateLimit(tooShort); err == nil {
 		t.Error("NewGitRateLimit(mapped /64) = nil error, want config error")
 	}
+
+	// The allowlist is validated even while limiting is disabled (RPS=0,
+	// Codex round 3): a bad prefix fails at deploy time, not later when
+	// rate limiting is first enabled.
+	for _, bad := range []RateLimitConfig{
+		{TrustedProxies: []netip.Prefix{netip.MustParsePrefix("::ffff:10.0.0.0/64")}},
+		{TrustedProxies: []netip.Prefix{{}}}, // zero prefix
+	} {
+		if _, err := newRateLimiter(bad); err == nil {
+			t.Errorf("newRateLimiter(disabled, bad allowlist %v) = nil error, want config error", bad.TrustedProxies)
+		}
+		if _, err := NewGitRateLimit(bad); err == nil {
+			t.Errorf("NewGitRateLimit(disabled, bad allowlist %v) = nil error, want config error", bad.TrustedProxies)
+		}
+	}
+	// A valid allowlist with limiting disabled still yields the disabled
+	// limiter / identity middleware.
+	okDisabled := RateLimitConfig{TrustedProxies: []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")}}
+	if rl, err := newRateLimiter(okDisabled); err != nil || rl != nil {
+		t.Errorf("newRateLimiter(disabled, valid allowlist) = (%v, %v), want (nil, nil)", rl, err)
+	}
+	if mw, err := NewGitRateLimit(okDisabled); err != nil || mw == nil {
+		t.Errorf("NewGitRateLimit(disabled, valid allowlist) = (mw==nil: %v, %v), want identity middleware", mw == nil, err)
+	}
 }
 
 // TestRateLimitTrustedProxyBuckets: with the allowlist configured, clients

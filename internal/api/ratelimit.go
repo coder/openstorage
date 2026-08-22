@@ -99,39 +99,51 @@ func newRateLimiter(cfg RateLimitConfig) (*rateLimiter, error) {
 	if math.IsNaN(cfg.RPS) || math.IsInf(cfg.RPS, 0) {
 		return nil, fmt.Errorf("rate limit config: RPS must be finite (got %v)", cfg.RPS)
 	}
+	// Validate the allowlist even when limiting is disabled (Codex round
+	// 3): a bad prefix must fail at deploy time, not later when RPS is
+	// first enabled.
+	trusted, err := normalizeTrustedProxies(cfg.TrustedProxies)
+	if err != nil {
+		return nil, err
+	}
+	cfg.TrustedProxies = trusted
 	if cfg.RPS <= 0 {
 		return nil, nil
 	}
 	if cfg.Burst < 1 {
 		return nil, fmt.Errorf("rate limit config: Burst must be >= 1 when RPS > 0 (got %d)", cfg.Burst)
 	}
-	if len(cfg.TrustedProxies) > 0 {
-		// Normalize into a fresh slice (never mutate the caller's) so
-		// every config entry point — the CLI env var and direct
-		// api.New/NewGitRateLimit callers — gets identical matching
-		// semantics (Codex round 2). trustedContains unmaps peer
-		// addresses, so a stored 4-in-6 prefix would never match:
-		// convert /96+ mapped prefixes to IPv4 and reject shorter ones
-		// (they cover more than the mapped-IPv4 space and have no IPv4
-		// equivalent — dead config either way).
-		norm := make([]netip.Prefix, len(cfg.TrustedProxies))
-		for i, p := range cfg.TrustedProxies {
-			if !p.IsValid() {
-				return nil, fmt.Errorf("rate limit config: invalid trusted-proxy prefix %v", p)
-			}
-			if p.Addr().Is4In6() {
-				if p.Bits() < 96 {
-					return nil, fmt.Errorf("rate limit config: IPv4-mapped trusted-proxy prefix %v needs at least /96 (use an IPv4 CIDR or a real IPv6 range)", p)
-				}
-				p = netip.PrefixFrom(p.Addr().Unmap(), p.Bits()-96)
-			}
-			norm[i] = p
-		}
-		cfg.TrustedProxies = norm
-	}
 	l := &rateLimiter{cfg: cfg, now: time.Now, buckets: make(map[string]*bucket)}
 	l.lastSweep = l.now()
 	return l, nil
+}
+
+// normalizeTrustedProxies validates the allowlist and returns a fresh
+// normalized slice (never mutating the caller's), so every config entry
+// point — the CLI env var and direct api.New/NewGitRateLimit callers —
+// gets identical matching semantics (Codex rounds 2–3). trustedContains
+// unmaps peer addresses, so a stored 4-in-6 prefix would never match:
+// convert /96+ mapped prefixes to IPv4 and reject shorter ones (they cover
+// more than the mapped-IPv4 space and have no IPv4 equivalent — dead
+// config either way).
+func normalizeTrustedProxies(prefixes []netip.Prefix) ([]netip.Prefix, error) {
+	if len(prefixes) == 0 {
+		return nil, nil
+	}
+	norm := make([]netip.Prefix, len(prefixes))
+	for i, p := range prefixes {
+		if !p.IsValid() {
+			return nil, fmt.Errorf("rate limit config: invalid trusted-proxy prefix %v", p)
+		}
+		if p.Addr().Is4In6() {
+			if p.Bits() < 96 {
+				return nil, fmt.Errorf("rate limit config: IPv4-mapped trusted-proxy prefix %v needs at least /96 (use an IPv4 CIDR or a real IPv6 range)", p)
+			}
+			p = netip.PrefixFrom(p.Addr().Unmap(), p.Bits()-96)
+		}
+		norm[i] = p
+	}
+	return norm, nil
 }
 
 // rlExemptKey marks a request that already paid the rate-limit toll at an
