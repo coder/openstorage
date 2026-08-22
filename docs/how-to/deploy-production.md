@@ -97,9 +97,15 @@ The minimum per replica:
 Do **not** set `CODESTORAGE_DATA_DIR` in production — it exists to derive a single-node
 SQLite + file-blob stack for [local mode](../../README.md#quickstart-local-mode-60-seconds).
 
-Everything else — rate limiting, trusted proxies, pack quotas, sweep/repack tuning — has
-production-safe defaults and is covered by the
-[configuration reference](../reference/configuration.md). Startup validation is fail-fast:
+Everything else — pack quotas, sweep/repack tuning — has production-safe defaults and is
+covered by the [configuration reference](../reference/configuration.md). The exception is
+**rate limiting, which is disabled by default**: an Internet-facing deployment should
+either set
+[`CODESTORAGE_RATE_RPS` / `CODESTORAGE_RATE_BURST`](../reference/configuration.md#codestorage_rate_rps--codestorage_rate_burst)
+(plus [trusted proxies](#client-identity-behind-the-proxy-codestorage_trusted_proxies))
+or enforce an equivalent per-client limit at the edge — the limiter wraps
+authentication, so nothing else bounds unauthenticated traffic per client. Startup
+validation is fail-fast:
 a malformed value is a startup error naming the variable, never a silently-applied
 default.
 
@@ -160,10 +166,19 @@ forward plain HTTP to the replicas. Then:
 
 - Set [`CODESTORAGE_BASE_URL`](../reference/configuration.md#codestorage_base_url) to the
   external `https://` URL so clone URLs and other `http_url` values in API responses are
-  routable.
-- Both the REST API and git smart-HTTP (clone/push/LFS) ride the same listener — proxy
-  everything, and allow large streaming request/response bodies (pushes and archive
-  downloads are unbounded).
+  routable. It is not only embedded in responses: the upstream-sync worker pushes its
+  loopback git traffic to `<base URL>/<repo_id>.git`, so **every replica must itself be
+  able to reach this URL** through the proxy (resolvable and hairpinnable from the
+  replica network), or `pull-upstream` syncs fail.
+- Both the REST API and git smart-HTTP (clone/push, LFS *batch*) ride the same
+  listener — proxy everything, and allow large streaming request/response bodies (pushes
+  and archive downloads are unbounded).
+- **LFS object transfers bypass the proxy on S3/MinIO**: the batch API hands clients
+  presigned bucket URLs whenever the backend can sign (the server-proxied transfer is
+  only the fallback for backends that cannot, i.e. local file mode). Git LFS clients
+  therefore need direct network reach to the configured S3/MinIO endpoint — a
+  VPC-internal bucket endpoint breaks LFS pushes/pulls for external clients even though
+  the batch request itself succeeds.
 
 ### Client identity behind the proxy (`CODESTORAGE_TRUSTED_PROXIES`)
 

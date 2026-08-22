@@ -132,6 +132,7 @@ snapshot (each recorded in the [decision log](../README.md#document-index)):
 | `POST .../reset-commits` (NDJSON) | Not implemented; `POST .../restore-commit` (plain JSON) covers the SDK-visible restore semantics | Recorded deviation (docs/12) — no SDK calls `reset-commits` |
 | `DELETE /api/repos/{repo_name}/tags/{tag_name}` (tag in path) | `DELETE .../tags` with the tag in the request body | Matches the SDKs' actual call shape |
 | `GET`/`POST /api/repos` (bare collection routes) | `/api/v1/repos` only; named-repo aliases exist for repo-scoped routes, not org-scoped collections | Alias layer covers the styles SDKs use |
+| RFC 9457 problem-details error bodies (spec) | Errors are `{"error":"<msg>"}` envelopes with meaningful status codes | Recorded deviation (docs/12): all three SDKs branch on status codes and none parses problem-details fields |
 | One ephemeral namespace across git and REST | Two separate ref spaces: git push to `/{repo}+ephemeral.git` writes a distinct `+ephemeral` storage key, REST `ephemeral=true` reads/writes `refs/namespaces/ephemeral/…` under the base repository — ephemeral state does not cross surfaces | Recorded cross-surface split (docs/13): REST writes follow the REST read surface so API-created ephemeral refs stay visible to `GET .../branches?ephemeral=true` and merge promotion |
 
 And extensions upstream's spec does not list: the single-item `branch`/`tag` lookups
