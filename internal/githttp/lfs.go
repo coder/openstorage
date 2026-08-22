@@ -573,6 +573,20 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target r
 		lfsError(w, http.StatusLengthRequired, "upload requires Content-Length")
 		return
 	}
+	// One in-flight upload per key (Codex security round on #51): staging
+	// happens on local disk before verification, and while DISTINCT keys'
+	// aggregate staging is bounded by the quota (each reservation counts
+	// the others' rows), a SAME-key reservation deliberately refreshes
+	// rather than sums — so N concurrent identical PUTs would each admit
+	// and stage N quota-sized temp files. Identical keys are identical
+	// bytes: let one win, turn the rest away before any disk is touched,
+	// and their retry lands on the stored-object adoption path above.
+	if _, busy := s.lfsUploadsInFlight.LoadOrStore(key, struct{}{}); busy {
+		w.Header().Set("Retry-After", "10")
+		lfsError(w, http.StatusTooManyRequests, "an upload for this object is already in progress")
+		return
+	}
+	defer s.lfsUploadsInFlight.Delete(key)
 	// PUT-time admission: the batch charged the DECLARED size; re-reserve
 	// what actually arrives (a same-key reservation refreshes, so honest
 	// clients are counted once and a liar's oversized body re-runs the

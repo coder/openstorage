@@ -16,6 +16,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"codestorage/internal/auth"
@@ -83,6 +84,11 @@ type Server struct {
 	// usage memoizes per-repo pack usage for the quota-pressure log so
 	// replayed cheap POSTs cannot amplify into per-request blob listings.
 	usage usageCache
+	// lfsUploadsInFlight tracks blob keys with a proxy upload currently
+	// staging on this replica (issue #51, Codex security round): at most
+	// one in-flight upload per key, so concurrent identical PUTs cannot
+	// multiply quota-sized temp files (see lfsProxyUpload).
+	lfsUploadsInFlight sync.Map
 }
 
 // repoTarget is a resolved request target: the live repo record plus the

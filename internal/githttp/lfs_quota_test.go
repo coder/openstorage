@@ -10,7 +10,9 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -282,6 +284,60 @@ func TestLFSAdopt_RecheckCatchesRacingSweep(t *testing.T) {
 	}
 	if _, err := srv.Blob.Stat(context.Background(), key); err != nil {
 		t.Fatalf("retry did not republish the object: %v", err)
+	}
+}
+
+// TestLFSUpload_SameKeyConcurrencyBounded (Codex security round on #51):
+// while one PUT for a key is staging, a second PUT for the same key is
+// turned away (429 + Retry-After) BEFORE touching disk — same-key
+// reservations refresh rather than sum, so without this guard N identical
+// concurrent uploads would each stage a quota-sized temp file. Once the
+// winner publishes, a retry succeeds via the stored-object adoption path.
+func TestLFSUpload_SameKeyConcurrencyBounded(t *testing.T) {
+	srv, _, mint := newLFSQuotaServer(t, 0, time.Hour)
+	tok := mint(auth.ScopeGitWrite)
+	content := []byte("contended lfs object body")
+	oid := sha256Hex(content)
+	path := "/" + lfsTestRepoURL + ".git/info/lfs/objects/" + oid
+
+	// First PUT: body delivered through a pipe so it parks mid-staging.
+	pr, pw := io.Pipe()
+	req := httptest.NewRequest(http.MethodPut, path, pr)
+	req.ContentLength = int64(len(content))
+	req.SetBasicAuth("t", tok)
+	first := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		srv.Handler().ServeHTTP(first, req)
+	}()
+	if _, err := pw.Write(content[:4]); err != nil { // parked: handler holds the key
+		t.Fatal(err)
+	}
+
+	// Second PUT for the same key while the first stages: rejected.
+	w := doLFS(t, srv, http.MethodPut, path, "basic:"+tok, string(content))
+	if w.Code != http.StatusTooManyRequests {
+		t.Fatalf("concurrent same-key PUT status = %d, want 429", w.Code)
+	}
+	if w.Header().Get("Retry-After") == "" {
+		t.Fatal("429 without Retry-After")
+	}
+
+	// Let the winner finish; the retry now succeeds (adoption path).
+	if _, err := pw.Write(content[4:]); err != nil {
+		t.Fatal(err)
+	}
+	if err := pw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	<-done
+	if first.Code != http.StatusOK {
+		t.Fatalf("winning PUT status = %d, body %s", first.Code, first.Body)
+	}
+	w = doLFS(t, srv, http.MethodPut, path, "basic:"+tok, string(content))
+	if w.Code != http.StatusOK {
+		t.Fatalf("retry after winner status = %d, body %s", w.Code, w.Body)
 	}
 }
 
