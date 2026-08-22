@@ -121,6 +121,12 @@ type CredentialStore interface {
 	CreateCredential(ctx context.Context, cred Credential) (Credential, error)
 	// GetCredential returns the credential by ID; ErrNotFound when absent.
 	GetCredential(ctx context.Context, id string) (Credential, error)
+	// CredentialMeta returns the credential with Password always "" — the
+	// stored password is never read or decrypted, so ownership prechecks
+	// for update/delete work even when an encrypted row's key is gone
+	// (issue #54 recovery: replace or remove without the old value).
+	// ErrNotFound when absent.
+	CredentialMeta(ctx context.Context, id string) (Credential, error)
 	// UpdateCredential replaces username/password; ErrNotFound when absent.
 	UpdateCredential(ctx context.Context, id, username, password string) (Credential, error)
 	// DeleteCredential removes the credential; ErrNotFound when absent.

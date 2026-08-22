@@ -38,9 +38,17 @@ separate migration step or job to run: each replica creates/upgrades the schema 
 serialized by advisory locks (see [concurrent boot](#concurrent-boot-schema-setup-and-migrations)).
 The database is the authority for refs, metadata, quota accounting, and the durable
 [River](https://riverqueue.com) job queue — and it stores **webhook HMAC secrets and
-upstream-sync credentials in plaintext**
-([#54](https://github.com/coder/code-storage/issues/54)): scope database access tightly
-and encrypt the database and its backups at rest.
+upstream-sync credentials**, plaintext by default
+([#54](https://github.com/coder/code-storage/issues/54)). Set
+[`CODESTORAGE_SECRETS_KEY`](../reference/configuration.md#codestorage_secrets_key) (the
+same value on every replica) to envelope-encrypt those columns with AES-256-GCM; the
+reference documents the key format, rotation procedure, failure modes, and the required
+**staged enablement on multi-replica fleets** (binary rollout first, then the key in
+`decrypt-only` staging mode, then encrypt — older binaries misread envelopes as literal
+secrets, and unkeyed replicas cannot read envelopes written mid-rollout). Either way,
+scope database access tightly and encrypt the database and its backups at rest —
+application-level encryption narrows what a database read or backup leak exposes, but the
+serve process still holds the key.
 
 **S3-compatible bucket** — dedicated to codestorage
 ([`CODESTORAGE_S3_URL`](../reference/configuration.md#codestorage_s3_url)); credentials come

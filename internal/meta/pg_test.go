@@ -24,6 +24,7 @@ var (
 	pgOnce    sync.Once
 	pgErr     error
 	pgStore   *PG
+	pgTestURL string // saved so tests can open extra handles (secrets_meta_test.go)
 	pgCleanup []func()
 )
 
@@ -52,6 +53,7 @@ func pgBackend(t *testing.T) Backend {
 			pgErr = err
 			return
 		}
+		pgTestURL = pgURL
 		store, err := OpenPG(ctx, pgURL)
 		if err != nil {
 			pgErr = err

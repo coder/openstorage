@@ -54,6 +54,17 @@ func (m *MemStore) GetCredential(_ context.Context, id string) (Credential, erro
 	return cred, nil
 }
 
+func (m *MemStore) CredentialMeta(_ context.Context, id string) (Credential, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cred, ok := m.creds[id]
+	if !ok {
+		return Credential{}, ErrNotFound
+	}
+	cred.Password = ""
+	return cred, nil
+}
+
 func (m *MemStore) UpdateCredential(_ context.Context, id, username, password string) (Credential, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

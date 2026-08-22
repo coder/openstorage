@@ -58,6 +58,15 @@ func (s metaCredentials) GetCredential(ctx context.Context, id string) (Credenti
 	return fromMetaCredential(row), nil
 }
 
+func (s metaCredentials) CredentialMeta(ctx context.Context, id string) (Credential, error) {
+	row, err := s.ms.GitCredentialMeta(ctx, id)
+	if err != nil {
+		return Credential{}, mapMetaErr(err, ErrNotFound, nil)
+	}
+	assertf(row.Password == "", "GitCredentialMeta returned a password for %q", id)
+	return fromMetaCredential(row), nil
+}
+
 func (s metaCredentials) UpdateCredential(ctx context.Context, id, username, password string) (Credential, error) {
 	row, err := s.ms.UpdateGitCredential(ctx, id, username, password)
 	if err != nil {

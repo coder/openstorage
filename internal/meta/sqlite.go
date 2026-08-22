@@ -26,6 +26,8 @@ import (
 
 	"modernc.org/sqlite"
 	sqlite3 "modernc.org/sqlite/lib"
+
+	"codestorage/internal/secrets"
 )
 
 // sqliteDSN builds the modernc.org/sqlite DSN for a DB file path. The
@@ -43,6 +45,9 @@ func sqliteDSN(path string) string {
 // modernc.org/sqlite driver (cgo-free cross-compiled single binaries).
 type SQLite struct {
 	db *sql.DB
+	// codec, when non-nil, envelope-encrypts the secret columns
+	// (webhooks.secret, git_credentials.password) — see secrets.go.
+	codec *secrets.Codec
 }
 
 var _ Backend = (*SQLite)(nil)
@@ -51,7 +56,7 @@ var _ Backend = (*SQLite)(nil)
 // after "sqlite://" (relative paths are tolerated; --data-dir always derives
 // absolute ones). Parent directories are created; the DB file itself is
 // created by the driver on first open.
-func OpenSQLite(ctx context.Context, sqliteURL string) (*SQLite, error) {
+func OpenSQLite(ctx context.Context, sqliteURL string, opts ...Option) (*SQLite, error) {
 	assertf(sqliteURL != "", "OpenSQLite: empty sqlite URL")
 	path, ok := strings.CutPrefix(sqliteURL, "sqlite://")
 	if !ok || path == "" {
@@ -68,7 +73,7 @@ func OpenSQLite(ctx context.Context, sqliteURL string) (*SQLite, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("sqlite ping %s: %w", path, err)
 	}
-	return &SQLite{db: db}, nil
+	return &SQLite{db: db, codec: resolveOptions(opts).codec}, nil
 }
 
 func (s *SQLite) Close() { _ = s.db.Close() }
