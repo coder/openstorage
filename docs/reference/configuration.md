@@ -326,11 +326,15 @@ periodic pruning of expired rows is garbage collection, not what re-opens headro
 
 Decoded-byte cap on one git push: a `git-receive-pack` request whose body — after any
 `Content-Encoding: gzip` decode, so compressed streams cannot smuggle a larger payload —
-exceeds this many bytes is rejected with `413` and a JSON error envelope **before** the
-stream reaches `git receive-pack`. Nothing is quarantined on local disk, published, or
-registered. This is the native pre-storage push bound
+exceeds this many bytes is rejected with `413` and a JSON error envelope. Only bytes
+**up to the cap** can ever reach `git receive-pack` (a declared oversize is rejected
+without reading at all), so per-push disk and decode work is bounded by the cap: git
+discards the truncated partial quarantine when the stream is cut, and nothing is
+published or registered on the overflow path. This is the native pre-storage push bound
 ([#55](https://github.com/coder/code-storage/issues/55)); the pack quota above bounds
 *retained* storage and runs only after a push has fully streamed to the replica's disk.
+(Degenerate exception: a *complete, valid* push padded with trailing junk past the cap
+still answers `413`, but its hooks already ran under the normal quota admission.)
 
 - **Default:** 2 × [`CODESTORAGE_PACK_QUOTA_BYTES`](#codestorage_pack_quota_bytes) — a
   push cannot legitimately need more than quota admission would accept, plus protocol

@@ -530,6 +530,13 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 			// quota-admitted like any other push).
 			if runErr == nil {
 				log.Printf("%s %s: receive-pack completed but the request body continued past the %d-byte cap (padded push?)", service, repo, s.MaxPushBytes)
+				// A completed receive-pack means its hooks ran and may
+				// have registered packs (the push was whole before the
+				// padding): the repack threshold trigger must still fire
+				// even though the response is a 413 (Codex round 4).
+				if s.MaybeRepack != nil {
+					s.MaybeRepack(context.WithoutCancel(r.Context()), target.key)
+				}
 			}
 			if gate.responseStarted() {
 				// Response bytes already streamed (gateBufferMax safety

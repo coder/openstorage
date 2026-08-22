@@ -216,7 +216,7 @@ func TestIntroducedPending_WalkAllowance(t *testing.T) {
 		if err := st.markWalked(99); err != nil {
 			t.Fatal(err)
 		}
-		_, err = introducedPending(t.Context(), st, "refs/heads/x", ref.ZeroSHA, tip, 1)
+		_, _, err = introducedPending(t.Context(), st, "refs/heads/x", ref.ZeroSHA, tip, 1)
 		if err == nil || !strings.Contains(err.Error(), "history-walk allowance") {
 			t.Fatalf("err = %v, want history-walk allowance rejection", err)
 		}
@@ -233,15 +233,15 @@ func TestIntroducedPending_WalkAllowance(t *testing.T) {
 		for _, sha := range strings.Fields(run("rev-list", tip)) {
 			st.ok[sha] = true
 		}
-		pending, err := introducedPending(t.Context(), st, "refs/heads/x", ref.ZeroSHA, tip, 1000)
+		pending, examined, err := introducedPending(t.Context(), st, "refs/heads/x", ref.ZeroSHA, tip, 1000)
 		if err != nil {
 			t.Fatal(err)
 		}
 		if len(pending) != 0 {
 			t.Fatalf("pending = %v, want none (all cached)", pending)
 		}
-		if st.walked != 5 {
-			t.Fatalf("walked = %d, want 5 (cached commits charge the allowance)", st.walked)
+		if examined != 5 || st.walked != 5 {
+			t.Fatalf("examined = %d walked = %d, want 5/5 (cached commits charge the allowance)", examined, st.walked)
 		}
 	})
 }

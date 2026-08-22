@@ -645,14 +645,22 @@ func verifySig(ctx context.Context, refName, old, new string) error {
 	if err != nil {
 		return fmt.Errorf("verify-sig: %w", err) // fail closed
 	}
-	pending, err := introducedPending(ctx, state, refName, old, new, budget)
+	pending, examined, err := introducedPending(ctx, state, refName, old, new, budget)
 	if err != nil {
 		return err
 	}
 	if len(pending) == 0 {
-		// Nothing new to verify: a creation at an already-stored tip, or a
-		// range whose commits all carry cached verdicts. No keyring access
-		// needed — mirrors the deletion rule (introduces no commits).
+		// Nothing new to verify — no keyring access needed, mirroring the
+		// deletion rule. A range that examined nothing (a rewind or
+		// re-advance introducing zero commits) also records nothing:
+		// recomputing it later costs one silent rev-list, whereas
+		// persisting it would let one push with many distinct
+		// zero-introduced ranges grow the state file once per ref and
+		// re-scan it in every later hook (Codex round 4). Only ranges
+		// whose commits carry cached verdicts are worth a record.
+		if examined == 0 {
+			return nil
+		}
 		if err := state.markRangeOK(old, new); err != nil {
 			return fmt.Errorf("verify-sig: %w", err)
 		}
@@ -738,10 +746,10 @@ func verifySigDenied(refName, sha, reason string) error {
 // so refs at distinct ancestors of an already-verified chain cannot re-walk
 // the history once per ref for free. Budget 0 means unlimited by explicit
 // operator choice.
-func introducedPending(ctx context.Context, state *verifyState, refName, old, new string, budget int) (pending []string, retErr error) {
+func introducedPending(ctx context.Context, state *verifyState, refName, old, new string, budget int) (pending []string, examined int64, retErr error) {
 	assertf(state != nil && budget >= 0, "introducedPending: state=%v budget=%d", state, budget)
 	if !ref.ValidSHA(new) || new == ref.ZeroSHA {
-		return nil, fmt.Errorf("verify-sig: introducedPending: bad new sha %q", new)
+		return nil, 0, fmt.Errorf("verify-sig: introducedPending: bad new sha %q", new)
 	}
 	args := []string{"rev-list", new}
 	if old != ref.ZeroSHA {
@@ -752,10 +760,10 @@ func introducedPending(ctx context.Context, state *verifyState, refName, old, ne
 	cmd := exec.CommandContext(ctx, "git", args...)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return nil, fmt.Errorf("verify-sig: rev-list stdout: %w", err)
+		return nil, 0, fmt.Errorf("verify-sig: rev-list stdout: %w", err)
 	}
 	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("verify-sig: start git %s: %w", strings.Join(args, " "), err)
+		return nil, 0, fmt.Errorf("verify-sig: start git %s: %w", strings.Join(args, " "), err)
 	}
 	// Reap the subprocess on every early return; cancel() has already
 	// killed it then, so the Wait error is expected and irrelevant.
@@ -763,11 +771,12 @@ func introducedPending(ctx context.Context, state *verifyState, refName, old, ne
 
 	// Persist the examined-commit count on every exit path — denials and
 	// aborts included, because a non-atomic push continues with its other
-	// refs. A persist failure must not let the walk allowance silently
-	// reset, so it fails the call closed unless it is already failing.
-	var walked int64
+	// refs. Zero-examined walks persist nothing (see verifySig — the state
+	// file must not grow once per zero-introduced ref). A persist failure
+	// must not let the walk allowance silently reset, so it fails the call
+	// closed unless it is already failing.
 	defer func() {
-		if err := state.markWalked(walked); err != nil && retErr == nil {
+		if err := state.markWalked(examined); err != nil && retErr == nil {
 			pending, retErr = nil, fmt.Errorf("verify-sig: %w", err)
 		}
 	}()
@@ -782,12 +791,12 @@ func introducedPending(ctx context.Context, state *verifyState, refName, old, ne
 		// Subprocess output: fail closed on surprises, never panic mid-push.
 		if !ref.ValidSHA(line) {
 			abort()
-			return nil, fmt.Errorf("verify-sig: rev-list emitted %q", line)
+			return nil, examined, fmt.Errorf("verify-sig: rev-list emitted %q", line)
 		}
-		walked++
-		if maxWalk > 0 && state.walked+walked > maxWalk {
+		examined++
+		if maxWalk > 0 && state.walked+examined > maxWalk {
 			abort()
-			return nil, fmt.Errorf("verify-sig: push exceeds the per-push history-walk allowance: %s pushed the total past %d examined commits (%d× CODESTORAGE_VERIFY_SIG_BUDGET; raise the budget or split the push)",
+			return nil, examined, fmt.Errorf("verify-sig: push exceeds the per-push history-walk allowance: %s pushed the total past %d examined commits (%d× CODESTORAGE_VERIFY_SIG_BUDGET; raise the budget or split the push)",
 				refName, maxWalk, verifyWalkBudgetMultiplier)
 		}
 		if state.ok[line] {
@@ -797,23 +806,23 @@ func introducedPending(ctx context.Context, state *verifyState, refName, old, ne
 		// this commit and failed — short-circuit without another spawn.
 		if reason, denied := state.deny[line]; denied {
 			abort()
-			return nil, verifySigDenied(refName, line, reason)
+			return nil, examined, verifySigDenied(refName, line, reason)
 		}
 		pending = append(pending, line)
 		if budget > 0 && state.spent+len(pending) > budget {
 			abort()
-			return nil, fmt.Errorf("verify-sig: push exceeds the per-push verification budget: %s introduces more than %d unverified commits with %d of %d verifications already used (raise CODESTORAGE_VERIFY_SIG_BUDGET or push fewer new commits)",
+			return nil, examined, fmt.Errorf("verify-sig: push exceeds the per-push verification budget: %s introduces more than %d unverified commits with %d of %d verifications already used (raise CODESTORAGE_VERIFY_SIG_BUDGET or push fewer new commits)",
 				refName, budget-state.spent, state.spent, budget)
 		}
 	}
 	if err := sc.Err(); err != nil {
 		abort()
-		return nil, fmt.Errorf("verify-sig: reading rev-list: %w", err)
+		return nil, examined, fmt.Errorf("verify-sig: reading rev-list: %w", err)
 	}
 	if err := cmd.Wait(); err != nil {
-		return nil, fmt.Errorf("verify-sig: git %s: %w", strings.Join(args, " "), err)
+		return nil, examined, fmt.Errorf("verify-sig: git %s: %w", strings.Join(args, " "), err)
 	}
-	return pending, nil
+	return pending, examined, nil
 }
 
 // sigVerifier delegates signature checking to git's own machinery
