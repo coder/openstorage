@@ -541,6 +541,15 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 		if _, err := io.Copy(io.Discard, body); err != nil && !errors.Is(err, errPushTooLarge) {
 			log.Printf("%s %s: request body drain: %v", service, repo, err)
 		}
+		// The decoded drain stops at the first gzip framing error without
+		// consuming the wire underneath: a valid push + corrupt member +
+		// padding would evade both counters (Codex round 14). Drain the
+		// compressed side too, bounded by the wire limit.
+		if wireCap != nil {
+			if _, err := io.Copy(io.Discard, wireCap); err != nil && !errors.Is(err, errPushTooLarge) {
+				log.Printf("%s %s: wire body drain: %v", service, repo, err)
+			}
+		}
 		_ = stdin.Close()
 		// Overflow is fully decided the moment the copy ends (the counters
 		// only trip while feeding git), so settle the gate BEFORE waiting:

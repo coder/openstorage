@@ -265,6 +265,26 @@ func TestPushCap_RawRequests(t *testing.T) {
 		assertCapEnvelope(t, status, body)
 	})
 
+	t.Run("gzip-valid-member-then-corrupt-padding", func(t *testing.T) {
+		// A complete valid member followed by a corrupt member header and
+		// wire-limit-busting padding: the decoded drain dies on the gzip
+		// error, so only the compressed-side drain can push the wire
+		// counter over the limit (Codex round 14).
+		var member bytes.Buffer
+		zw := gzip.NewWriter(&member)
+		cmd := "1111111111111111111111111111111111111111 0000000000000000000000000000000000000000 refs/heads/ghost\x00report-status"
+		if _, err := zw.Write([]byte(pktLine(cmd) + "0000")); err != nil {
+			t.Fatal(err)
+		}
+		if err := zw.Close(); err != nil {
+			t.Fatal(err)
+		}
+		body := append(member.Bytes(), bytes.Repeat([]byte{0xde, 0xad}, 2*testPushCap)...)
+		status, respBody := postReceivePack(t, node, repo, token,
+			io.MultiReader(bytes.NewReader(body)), true)
+		assertCapEnvelope(t, status, respBody)
+	})
+
 	t.Run("gzip-bomb", func(t *testing.T) {
 		// ~16 MiB decoded, a few KiB compressed: the compressed size passes
 		// any transport-level check, so only the post-gzip decoded counter
