@@ -398,6 +398,77 @@ func TestLFSUpload_NodeStagingBudget(t *testing.T) {
 	}
 }
 
+// TestLFSUpload_StalledClientReleasesStaging (Codex security round on
+// #51): a client that declares a Content-Length and stops transmitting
+// must not pin its staging reservation and per-key slot forever — the idle
+// read deadline aborts the copy and releases both. Runs over a REAL HTTP
+// server (httptest recorders do not support read deadlines).
+func TestLFSUpload_StalledClientReleasesStaging(t *testing.T) {
+	oldIdle := lfsUploadIdleTimeout
+	lfsUploadIdleTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { lfsUploadIdleTimeout = oldIdle })
+
+	srv, _, mint := newLFSQuotaServer(t, 0, time.Hour)
+	srv.LFSStagingBytes = 100
+	tok := mint(auth.ScopeGitWrite)
+	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(ts.Close)
+
+	content := bytes.Repeat([]byte("s"), 100) // the whole staging budget
+	oid := sha256Hex(content)
+	url := ts.URL + "/" + lfsTestRepoURL + ".git/info/lfs/objects/" + oid
+
+	// Stalling PUT: declare 100 bytes, send 4, then park the connection.
+	pr, pw := io.Pipe()
+	req, err := http.NewRequest(http.MethodPut, url, pr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.ContentLength = int64(len(content))
+	req.SetBasicAuth("t", tok)
+	stalled := make(chan error, 1)
+	go func() {
+		resp, err := http.DefaultClient.Do(req)
+		if resp != nil {
+			resp.Body.Close()
+		}
+		stalled <- err
+	}()
+	if _, err := pw.Write(content[:4]); err != nil {
+		t.Fatal(err)
+	}
+
+	// The idle deadline must abort the stalled upload and release its
+	// reservations; a fresh full-budget upload for another oid then fits.
+	deadline := time.Now().Add(10 * time.Second)
+	other := bytes.Repeat([]byte("t"), 100)
+	otherURL := ts.URL + "/" + lfsTestRepoURL + ".git/info/lfs/objects/" + sha256Hex(other)
+	for {
+		req2, err := http.NewRequest(http.MethodPut, otherURL, bytes.NewReader(other))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req2.SetBasicAuth("t", tok)
+		resp, err := http.DefaultClient.Do(req2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode == http.StatusOK {
+			break // stalled upload's capacity was released
+		}
+		if resp.StatusCode != http.StatusTooManyRequests {
+			t.Fatalf("competing PUT status = %d, want 200 or transient 429", resp.StatusCode)
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("stalled upload never released the staging budget")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	pw.Close()
+	<-stalled // the stalled request ends with a connection/HTTP error either way
+}
+
 // TestLFSQuota_NamespaceUsageRollsUpToBase: pack bytes registered under a
 // namespace member of the repo group charge the same quota LFS admission
 // uses — one token must not obtain fresh headroom per surface.

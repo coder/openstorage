@@ -103,7 +103,24 @@ type ReserveDecision struct {
 	// ReservedBytes is the active in-flight reservations charged on top of
 	// UsedBytes (other pushes' keys only).
 	ReservedBytes int64
+	// KeyCapExceeded reports that the denial was the per-repo cap on
+	// ACTIVE reservation ROWS, not byte arithmetic (Codex security round
+	// on #51): declared bytes bound row count at nothing — 1-byte LFS
+	// batch entries could mint durable rows ~quota times over — so the
+	// row population needs its own bound. Transient: rows expire with the
+	// TTL, so callers should tell the client to retry later.
+	KeyCapExceeded bool
 }
+
+// maxActiveReservations caps ACTIVE (non-expired) reservation rows per base
+// repository, counted in the same admission snapshot as the byte sums. A
+// compiled bound like the repack fold budgets: it exists to keep an abusive
+// writer from growing the shared ref database (each row is ~100 bytes, so
+// the cap bounds per-repo reservation state at ~1 MiB), not to tune
+// concurrency — legitimate writers hold at most a few in-flight keys per
+// push and up to one LFS batch (≤1000) at a time. A var so tests can
+// exercise the cap without minting thousands of rows.
+var maxActiveReservations = 10_000
 
 // reserveLockClass namespaces the per-base advisory locks ReservePackBytes
 // takes ("PKQR"), in the two-int4 pg_advisory_xact_lock keyspace — disjoint
@@ -185,18 +202,26 @@ func (s *PG) ReservePackBytes(ctx context.Context, group []string, packs []Pack,
 		// ONE statement = one snapshot: a concurrent registration moves a
 		// key's bytes from reservation to counter atomically, so either
 		// side of that move is counted here, never neither.
-		var counter, reserved int64
+		var counter, reserved, activeRows int64
 		if err := tx.QueryRow(ctx, `
 SELECT
   COALESCE((SELECT SUM(bytes) FROM pack_usage WHERE repo = ANY($1)), 0),
   COALESCE((SELECT SUM(bytes) FROM pack_reservations
             WHERE repo = $2
               AND created_at > now() - make_interval(secs => $3)
-              AND NOT (key = ANY($4))), 0)`,
-			group, group[0], ttl.Seconds(), keys).Scan(&counter, &reserved); err != nil {
+              AND NOT (key = ANY($4))), 0),
+  (SELECT COUNT(*) FROM pack_reservations
+   WHERE repo = $2
+     AND created_at > now() - make_interval(secs => $3)
+     AND NOT (key = ANY($4)))`,
+			group, group[0], ttl.Seconds(), keys).Scan(&counter, &reserved, &activeRows); err != nil {
 			return err
 		}
 		dec = ReserveDecision{UsedBytes: max(counter, usageFloor), ReservedBytes: reserved}
+		if activeRows+int64(len(packs)) > int64(maxActiveReservations) {
+			dec.KeyCapExceeded = true
+			return nil // denied; dec.OK stays false
+		}
 		if !admitted(dec.UsedBytes, dec.ReservedBytes, incoming, quotaBytes) {
 			return nil // denied; dec.OK stays false
 		}

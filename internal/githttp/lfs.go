@@ -60,6 +60,37 @@ const (
 	lfsMaxBatchObjects = 1000
 )
 
+// lfsUploadIdleTimeout bounds how long a proxy upload body may go without
+// delivering ANY bytes (Codex security round on #51): an upload holds a
+// per-key slot and a staging-budget reservation from before its first body
+// read, so a client that stalls after declaring Content-Length would
+// otherwise pin that capacity until it hangs up on its own. An idle bound
+// — reset on every chunk — caps the stall without capping object size or
+// penalizing slow-but-moving links. A var so tests can shrink it.
+var lfsUploadIdleTimeout = time.Minute
+
+// idleDeadlineBody wraps an upload body, pushing the connection's read
+// deadline forward on every chunk of progress. Backed by
+// http.ResponseController.SetReadDeadline, which the standard net/http
+// server supports on HTTP/1 and HTTP/2 connections alike; wrappers that do
+// not (httptest recorders) are detected once by the caller and left
+// unbounded — the guard targets real deployments.
+type idleDeadlineBody struct {
+	r  io.Reader
+	rc *http.ResponseController
+}
+
+func (b idleDeadlineBody) Read(p []byte) (int, error) {
+	n, err := b.r.Read(p)
+	if n > 0 {
+		// Errors here mean the connection lost deadline support mid-read
+		// (it cannot — the caller probed it); the read itself still
+		// succeeded, so pass the data through regardless.
+		_ = b.rc.SetReadDeadline(time.Now().Add(lfsUploadIdleTimeout))
+	}
+	return n, err
+}
+
 // lfsOIDPattern is the sha256 content address git-lfs uses: exactly 64
 // lowercase hex digits. Anything else is rejected before it can reach the
 // blob store as a key component.
@@ -356,6 +387,12 @@ func (s *Server) lfsBatchUpload(r *http.Request, repoElem string, target repoTar
 				log.Printf("lfs quota: %s: reserve failed: %v", repoID, err)
 				return denyAll(http.StatusInternalServerError, "storage quota check failed")
 			}
+			if dec.KeyCapExceeded {
+				// Transient (rows expire with the TTL and consume on
+				// completed uploads), so 429, not 507.
+				return denyAll(http.StatusTooManyRequests,
+					"too many in-flight uploads reserved for this repository, retry later")
+			}
 			if !dec.OK {
 				return denyAll(http.StatusInsufficientStorage, fmt.Sprintf(
 					"repository storage quota exceeded: upload adds %d bytes to %d bytes stored (+%d bytes reserved by in-flight uploads), quota is %d bytes",
@@ -636,6 +673,12 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target r
 			lfsError(w, http.StatusInternalServerError, "storage quota check failed")
 			return
 		}
+		if dec.KeyCapExceeded {
+			w.Header().Set("Retry-After", "10")
+			lfsError(w, http.StatusTooManyRequests,
+				"too many in-flight uploads reserved for this repository, retry later")
+			return
+		}
 		if !dec.OK {
 			lfsError(w, http.StatusInsufficientStorage, fmt.Sprintf(
 				"repository storage quota exceeded: upload adds %d bytes to %d bytes stored (+%d bytes reserved by in-flight uploads), quota is %d bytes",
@@ -657,8 +700,15 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target r
 		lfsError(w, http.StatusInternalServerError, "scratch file failed")
 		return
 	}
+	// Stall guard: the reservations above are held for the duration of
+	// this copy, so the body must keep moving — see lfsUploadIdleTimeout.
+	body := io.Reader(r.Body)
+	rc := http.NewResponseController(w)
+	if err := rc.SetReadDeadline(time.Now().Add(lfsUploadIdleTimeout)); err == nil {
+		body = idleDeadlineBody{r: r.Body, rc: rc}
+	}
 	h := sha256.New()
-	n, err := io.Copy(io.MultiWriter(f, h), r.Body)
+	n, err := io.Copy(io.MultiWriter(f, h), body)
 	if cerr := f.Close(); err == nil {
 		err = cerr
 	}

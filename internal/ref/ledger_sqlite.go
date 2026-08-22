@@ -30,26 +30,38 @@ func (s *SQLite) ReservePackBytes(ctx context.Context, group []string, packs []P
 	// One aggregate read; the IMMEDIATE transaction serializes every
 	// writer, so this snapshot cannot interleave with a concurrent
 	// reserve or register.
-	groupArgs := make([]any, 0, 2*len(group)+len(packs)+2)
+	groupArgs := make([]any, 0, len(group)+2*(len(packs)+2))
 	for _, r := range group {
 		groupArgs = append(groupArgs, r)
 	}
-	groupArgs = append(groupArgs, group[0], ttl.Milliseconds())
-	for _, p := range packs {
-		groupArgs = append(groupArgs, p.Key)
+	// Twice: the reserved-bytes SUM and the active-row COUNT repeat the
+	// same predicate (repo, TTL window, excluding this push's keys).
+	for range 2 {
+		groupArgs = append(groupArgs, group[0], ttl.Milliseconds())
+		for _, p := range packs {
+			groupArgs = append(groupArgs, p.Key)
+		}
 	}
-	var counter, reserved int64
+	var counter, reserved, activeRows int64
 	if err := tx.QueryRowContext(ctx, `
 SELECT
   COALESCE((SELECT SUM(bytes) FROM pack_usage WHERE repo IN (?`+placeholders(len(group)-1)+`)), 0),
   COALESCE((SELECT SUM(bytes) FROM pack_reservations
             WHERE repo = ?
               AND created_at > `+sqliteEpochMS+` - ?
-              AND key NOT IN (?`+placeholders(len(packs)-1)+`)), 0)`,
-		groupArgs...).Scan(&counter, &reserved); err != nil {
+              AND key NOT IN (?`+placeholders(len(packs)-1)+`)), 0),
+  (SELECT COUNT(*) FROM pack_reservations
+   WHERE repo = ?
+     AND created_at > `+sqliteEpochMS+` - ?
+     AND key NOT IN (?`+placeholders(len(packs)-1)+`))`,
+		groupArgs...).Scan(&counter, &reserved, &activeRows); err != nil {
 		return ReserveDecision{}, fmt.Errorf("reserve pack bytes read: %w", err)
 	}
 	dec := ReserveDecision{UsedBytes: max(counter, usageFloor), ReservedBytes: reserved}
+	if activeRows+int64(len(packs)) > int64(maxActiveReservations) {
+		dec.KeyCapExceeded = true
+		return dec, nil // denied; the deferred rollback discards nothing
+	}
 	if !admitted(dec.UsedBytes, dec.ReservedBytes, incomingBytes(packs), quotaBytes) {
 		return dec, nil // denied; the deferred rollback discards nothing
 	}

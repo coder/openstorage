@@ -168,7 +168,10 @@ sizes cannot bypass the gate).
 - Admission is a durable reservation ledger in the ref store, atomic across concurrent
   pushes and replicas: two pushes that individually fit but together exceed the quota —
   exactly one wins. LFS uploads charge the same ledger (reserve at batch, settle at
-  verified upload completion).
+  verified upload completion). Independent of bytes, each repository is capped at
+  10,000 active reservation rows (a compiled bound, like the repack fold budgets) so
+  tiny declared sizes cannot grow the shared database; batches beyond it answer
+  transient `429`s until rows settle or expire.
 - Background repack maintenance is **not** quota-gated (an at-quota repository could never
   compact itself otherwise), and repack preserves the registered object set — it does not
   reclaim unreachable objects. LFS downloads are never quota-gated.
@@ -189,7 +192,8 @@ answers `413`.
 - Size it below the free space you guarantee `$TMPDIR`, minus headroom for git push
   quarantines and fork closures, which stage there too.
 - Each object additionally allows only one in-flight upload per replica (concurrent
-  identical PUTs answer `429`).
+  identical PUTs answer `429`), and an upload body that delivers no bytes for a full
+  minute is aborted, releasing its capacity — stalled clients cannot pin the budget.
 
 ### `CODESTORAGE_PACK_RESERVATION_TTL`
 
