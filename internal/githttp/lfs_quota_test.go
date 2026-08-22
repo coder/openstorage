@@ -715,32 +715,38 @@ func (b stallingUploadBlob) UploadFile(ctx context.Context, key, path string) er
 	return ctx.Err()
 }
 
-// TestLFSQuota_PublicationBoundedByLease (Codex round 11): publication
+// TestLFSQuota_PublicationBoundedByLease (Codex rounds 11+12): publication
 // against a stalled backend must abort within the reservation's lease with
 // nothing registered — durable usage can never be created by an upload
-// whose admission reservation already expired.
+// whose admission reservation already expired, and the deadline holds even
+// with the byte quota DISABLED (a stalled publication pins the staging
+// budget and per-key slot regardless of quota configuration).
 func TestLFSQuota_PublicationBoundedByLease(t *testing.T) {
 	const ttl = 400 * time.Millisecond
-	srv, st, mint := newLFSQuotaServer(t, 1000, ttl)
-	srv.Blob = stallingUploadBlob{BlobStore: srv.Blob}
-	tok := mint(auth.ScopeGitWrite)
-	content := []byte("stalled publication")
-	oid := sha256Hex(content)
+	for name, quota := range map[string]int64{"quota-enabled": 1000, "quota-disabled": 0} {
+		t.Run(name, func(t *testing.T) {
+			srv, st, mint := newLFSQuotaServer(t, quota, ttl)
+			srv.Blob = stallingUploadBlob{BlobStore: srv.Blob}
+			tok := mint(auth.ScopeGitWrite)
+			content := []byte("stalled publication")
+			oid := sha256Hex(content)
 
-	start := time.Now()
-	w := doLFS(t, srv, http.MethodPut, "/"+lfsTestRepoURL+".git/info/lfs/objects/"+oid,
-		"basic:"+tok, string(content))
-	if w.Code != http.StatusInternalServerError {
-		t.Fatalf("stalled-publication PUT status = %d, body %s (want 500)", w.Code, w.Body)
-	}
-	if elapsed := time.Since(start); elapsed > 3*ttl {
-		t.Fatalf("stalled publication held the request %v, want ~90%% of the %v TTL", elapsed, ttl)
-	}
-	if has, err := st.HasLFSObject(context.Background(), lfsTestRepoID, blob.LFSKey(lfsTestRepoID, oid)); err != nil || has {
-		t.Fatalf("aborted publication left a registry row: %v, %v", has, err)
-	}
-	if ls := ledgerState(t, st, time.Hour); ls.UsageBytes != 0 {
-		t.Fatalf("aborted publication credited usage: %+v", ls)
+			start := time.Now()
+			w := doLFS(t, srv, http.MethodPut, "/"+lfsTestRepoURL+".git/info/lfs/objects/"+oid,
+				"basic:"+tok, string(content))
+			if w.Code != http.StatusInternalServerError {
+				t.Fatalf("stalled-publication PUT status = %d, body %s (want 500)", w.Code, w.Body)
+			}
+			if elapsed := time.Since(start); elapsed > 3*ttl {
+				t.Fatalf("stalled publication held the request %v, want ~90%% of the %v TTL", elapsed, ttl)
+			}
+			if has, err := st.HasLFSObject(context.Background(), lfsTestRepoID, blob.LFSKey(lfsTestRepoID, oid)); err != nil || has {
+				t.Fatalf("aborted publication left a registry row: %v, %v", has, err)
+			}
+			if ls := ledgerState(t, st, time.Hour); ls.UsageBytes != 0 {
+				t.Fatalf("aborted publication credited usage: %+v", ls)
+			}
+		})
 	}
 }
 

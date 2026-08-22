@@ -857,10 +857,16 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target r
 	// the deadline is 90% of the TTL from just before the refresh — the
 	// 10% guard band absorbs app-vs-database clock skew. Deadline expiry
 	// aborts the upload with nothing registered (any published bytes are
-	// a sweepable orphan).
-	pubCtx := ctx
+	// a sweepable orphan). The deadline applies even when no reservation
+	// needs protecting (quota disabled, zero-growth repairs — Codex round
+	// 12): a stalled publication holds this replica's staging budget and
+	// the per-key slot, and those must be reclaimable regardless of quota
+	// configuration.
+	// pubAnchor is taken BEFORE the refresh below, so when a reservation
+	// exists the deadline is measured from a conservative point strictly
+	// before the row's created_at.
+	pubAnchor := time.Now()
 	if s.PackQuotaBytes > 0 && n > 0 && !registered {
-		refreshedAt := time.Now()
 		floor, err := blob.StorageUsageBytes(ctx, s.Blob, repoID)
 		if err != nil {
 			log.Printf("lfs quota: %s: usage listing failed: %v", repoID, err)
@@ -887,10 +893,9 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target r
 				n, dec.UsedBytes, dec.ReservedBytes, s.PackQuotaBytes))
 			return
 		}
-		var cancel context.CancelFunc
-		pubCtx, cancel = context.WithDeadline(ctx, refreshedAt.Add(s.lfsReservationTTL()*9/10))
-		defer cancel()
 	}
+	pubCtx, cancel := context.WithDeadline(ctx, pubAnchor.Add(s.lfsReservationTTL()*9/10))
+	defer cancel()
 	if err := s.Blob.UploadFile(pubCtx, key, path); err != nil {
 		log.Printf("lfs upload %s: %v", key, err)
 		lfsError(w, http.StatusInternalServerError, "object upload failed")
