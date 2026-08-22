@@ -63,7 +63,7 @@ must still validate (a malformed value in either is a `400`, never silently igno
 | `DELETE /repos/branches` | `target_branch` | `name` |
 | `POST /repos/tags` | `ref` | `target` |
 | `POST /repos/merge` | `source_ref` | `source_branch` |
-| JWT claim | `refs` policy tuples | `ops` (folded into a `["*", ops]` fallback policy when `refs` is absent) |
+| JWT claim | `refs` policy tuples | `ops` (deprecated repo-wide op list; merged into the `"*"` pattern's policy alongside any `refs` tuples) |
 
 Responses mirror the legacy names alongside the current ones where upstream does (e.g.
 `url` mirrors `repo_name`, deleted-branch responses carry both `target_branch` and
