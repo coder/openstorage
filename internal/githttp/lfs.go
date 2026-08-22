@@ -303,10 +303,15 @@ func (s *Server) lfsBatchUpload(r *http.Request, repoElem string, target repoTar
 		switch {
 		case err == nil:
 			// Already stored: no actions means the client skips the
-			// upload. Adopt the object into the registry (pre-#51 uploads
-			// have no rows; without adoption the orphan sweep would
-			// classify referenced objects as reapable).
-			s.adoptLFSObject(ctx, repoID, key, size)
+			// upload — but ONLY once the object is durably registered
+			// (pre-#51 uploads have no rows; without adoption the orphan
+			// sweep would classify referenced objects as reapable, so a
+			// swallowed adoption failure here would let the client commit
+			// a pointer to a reapable blob).
+			if aerr := s.adoptLFSObject(ctx, repoID, key, size); aerr != nil {
+				log.Printf("lfs adopt %s: %v", key, aerr)
+				lfsObjectFail(&results[i], http.StatusInternalServerError, "object registration failed, retry")
+			}
 			continue
 		case !errors.Is(err, blob.ErrNotFound):
 			log.Printf("lfs stat %s: %v", key, err)
@@ -377,18 +382,37 @@ func (s *Server) lfsReservationTTL() time.Duration {
 }
 
 // adoptLFSObject backfills the lfs_objects registry row for an object that
-// is already stored but was never registered (uploads predating issue #51).
-// Best-effort by design: every verified upload registers durably, and a
-// miss here only postpones adoption to the object's next write-scoped
-// touch — it must not fail the batch.
-func (s *Server) adoptLFSObject(ctx context.Context, repoID, key string, size int64) {
+// is already stored but was never registered (uploads predating issue #51,
+// or a verified upload whose registration failed after publish). Callers
+// MUST propagate a failure instead of reporting the object stored (Codex
+// round 1): telling the client "stored" lets it commit its pointer, and
+// with DeleteLFS enabled a still-rowless object eventually classifies as an
+// orphan and is reaped — a transient ref-store outage must fail the request
+// so the client retries, never silently downgrade to data loss.
+func (s *Server) adoptLFSObject(ctx context.Context, repoID, key string, size int64) error {
 	registered, err := s.Store.HasLFSObject(ctx, repoID, key)
-	if err == nil && !registered {
-		err = s.Store.RegisterLFSObject(ctx, repoID, key, size)
+	if err != nil || registered {
+		return err
 	}
-	if err != nil {
-		log.Printf("lfs adopt %s: %v", key, err)
+	if err := s.Store.RegisterLFSObject(ctx, repoID, key, size); err != nil {
+		return err
 	}
+	// Post-registration existence recheck (Codex round 1) — the adoption
+	// analogue of blob.EnsurePublished's writer-verify half: a DeleteLFS
+	// sweep can reap the still-rowless blob between the caller's Stat and
+	// the registration commit, with its post-delete registry recheck also
+	// missing the row. Adoption holds no bytes to re-upload, so it fails
+	// instead: the client retries, the next batch sees the key missing
+	// and issues a real upload action, and the idempotent re-registration
+	// credits nothing twice (meanwhile the next sweep's heal pass would
+	// restore the now-registered blob from quarantine anyway). Ordering
+	// proof mirrors EnsurePublished's: a reap whose delete lands after
+	// this Stat necessarily runs its registry recheck after our committed
+	// row and restores the blob itself.
+	if _, err := s.Blob.Stat(ctx, key); err != nil {
+		return fmt.Errorf("adopted object vanished (racing sweep?): %w", err)
+	}
+	return nil
 }
 
 // lfsDownloadAction builds the basic-transfer download action for key: a
@@ -518,10 +542,16 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target r
 	// Dedup before charging (the zero-growth rule): a re-PUT of a stored
 	// object (crash-window retry, concurrent identical upload) adds
 	// nothing — adopt it into the registry and succeed without reading
-	// the body (the key is content-addressed, so stored bytes match).
+	// the body (the key is content-addressed, so stored bytes match). A
+	// failed adoption fails the PUT: 200 would let the client commit a
+	// pointer to a blob the sweeper still sees as an orphan.
 	switch size, err := s.Blob.Stat(ctx, key); {
 	case err == nil:
-		s.adoptLFSObject(ctx, repoID, key, size)
+		if aerr := s.adoptLFSObject(ctx, repoID, key, size); aerr != nil {
+			log.Printf("lfs adopt %s: %v", key, aerr)
+			lfsError(w, http.StatusInternalServerError, "object registration failed")
+			return
+		}
 		w.WriteHeader(http.StatusOK)
 		return
 	case !errors.Is(err, blob.ErrNotFound):

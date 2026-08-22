@@ -9,6 +9,7 @@ package githttp
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"net/http"
 	"strings"
 	"testing"
@@ -180,6 +181,107 @@ func TestLFSQuota_ReservationTTLExpiryFreesAdmission(t *testing.T) {
 		batchBody("upload", sha256Hex(second), 90)))
 	if resp.Objects[0].Error != nil {
 		t.Fatalf("expired reservation still gates admission: %+v", resp.Objects[0])
+	}
+}
+
+// failingLFSStore wraps a ref.Store, failing every LFS-registry call —
+// the transient ref-store outage of Codex round 1's P1.
+type failingLFSStore struct {
+	ref.Store
+}
+
+func (failingLFSStore) HasLFSObject(context.Context, string, string) (bool, error) {
+	return false, fmt.Errorf("ref store unavailable (injected)")
+}
+
+// TestLFSAdopt_FailurePropagates (Codex round 1): a stored-but-rowless
+// object whose adoption fails must FAIL the request — a success would let
+// the client commit a pointer to a blob the DeleteLFS sweep still
+// classifies as an orphan.
+func TestLFSAdopt_FailurePropagates(t *testing.T) {
+	srv, st, mint := newLFSQuotaServer(t, 0, time.Hour)
+	tok := mint(auth.ScopeGitWrite)
+	content := []byte("stored but rowless")
+	oid := sha256Hex(content)
+	// Publish the blob directly: stored, no lfs_objects row (pre-#51 state).
+	if err := srv.Blob.UploadFile(context.Background(),
+		blob.LFSKey(lfsTestRepoID, oid), writeTempFile(t, content)); err != nil {
+		t.Fatal(err)
+	}
+	srv.Store = failingLFSStore{Store: st}
+
+	// Batch upload naming the stored object: per-object error, not the
+	// silent "no actions = already stored" success.
+	resp := decodeBatch(t, doLFS(t, srv, http.MethodPost, lfsBatchPath, "basic:"+tok,
+		batchBody("upload", oid, int64(len(content)))))
+	if resp.Objects[0].Error == nil || resp.Objects[0].Error.Code != http.StatusInternalServerError {
+		t.Fatalf("failed adoption reported success: %+v", resp.Objects[0])
+	}
+
+	// Re-PUT of the stored object: 500, not 200.
+	w := doLFS(t, srv, http.MethodPut, "/"+lfsTestRepoURL+".git/info/lfs/objects/"+oid,
+		"basic:"+tok, string(content))
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("failed adoption PUT status = %d, want 500", w.Code)
+	}
+}
+
+// reapOnRegister deletes the blob just before the registration commits,
+// deterministically reproducing Codex round 1's P2 race: a DeleteLFS sweep
+// reaps the still-rowless blob after the caller's Stat, with the sweep's
+// post-delete registry recheck missing the row.
+type reapOnRegister struct {
+	ref.Store
+	bl  blob.BlobStore
+	key string
+}
+
+func (r reapOnRegister) RegisterLFSObject(ctx context.Context, repo, key string, bytes int64) error {
+	if key == r.key {
+		if err := r.bl.Delete(ctx, key); err != nil {
+			return fmt.Errorf("test reap: %v", err)
+		}
+	}
+	return r.Store.RegisterLFSObject(ctx, repo, key, bytes)
+}
+
+// TestLFSAdopt_RecheckCatchesRacingSweep (Codex round 1): adoption whose
+// blob a racing sweep reaped before the registration committed must fail
+// the request — the post-registration existence recheck catches it, and the
+// client's retry re-uploads for real.
+func TestLFSAdopt_RecheckCatchesRacingSweep(t *testing.T) {
+	srv, st, mint := newLFSQuotaServer(t, 0, time.Hour)
+	tok := mint(auth.ScopeGitWrite)
+	content := []byte("reaped mid-adoption")
+	oid := sha256Hex(content)
+	key := blob.LFSKey(lfsTestRepoID, oid)
+	if err := srv.Blob.UploadFile(context.Background(), key, writeTempFile(t, content)); err != nil {
+		t.Fatal(err)
+	}
+	srv.Store = reapOnRegister{Store: st, bl: srv.Blob, key: key}
+
+	resp := decodeBatch(t, doLFS(t, srv, http.MethodPost, lfsBatchPath, "basic:"+tok,
+		batchBody("upload", oid, int64(len(content)))))
+	if resp.Objects[0].Error == nil {
+		t.Fatalf("race-reaped adoption reported stored: %+v", resp.Objects[0])
+	}
+
+	// The retry converges: the key is now missing, so the next batch
+	// issues a real upload action and the PUT re-publishes (idempotent
+	// re-registration — the row already exists).
+	srv.Store = st
+	resp = decodeBatch(t, doLFS(t, srv, http.MethodPost, lfsBatchPath, "basic:"+tok,
+		batchBody("upload", oid, int64(len(content)))))
+	if resp.Objects[0].Error != nil || resp.Objects[0].Actions["upload"] == nil {
+		t.Fatalf("retry batch did not issue an upload action: %+v", resp.Objects[0])
+	}
+	w := doLFS(t, srv, http.MethodPut, "/"+lfsTestRepoURL+".git/info/lfs/objects/"+oid,
+		"basic:"+tok, string(content))
+	if w.Code != http.StatusOK {
+		t.Fatalf("retry PUT status = %d, body %s", w.Code, w.Body)
+	}
+	if _, err := srv.Blob.Stat(context.Background(), key); err != nil {
+		t.Fatalf("retry did not republish the object: %v", err)
 	}
 }
 
