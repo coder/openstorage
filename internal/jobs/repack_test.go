@@ -590,6 +590,23 @@ func TestRepack_BudgetsBoundFoldInput(t *testing.T) {
 	}
 	f.checkColdHydrate(t)
 
+	// Unpairable backlog (round-9): when every pack exceeds half the
+	// budget, NO pair fits — the ascending-weight fallback proves that in
+	// one bounded pass and the fold no-ops cleanly.
+	f3 := newRepackFixture(t)
+	for range 3 {
+		f3.push(t)
+	}
+	r3 := f3.repacker(t.TempDir())
+	r3.MaxFoldObjects = 5 // each 3-object pack > 5/2; any pair = 6 > 5
+	folded, err = r3.Repack(ctx, f3.repo)
+	if err != nil || folded {
+		t.Fatalf("unpairable repack = (folded %v, err %v), want a clean no-op", folded, err)
+	}
+	if rows := f3.packRows(t); len(rows) != 3 {
+		t.Fatalf("pack rows after unpairable no-op = %+v, want unchanged 3", rows)
+	}
+
 	// A byte budget of one selects nothing either.
 	rb := f.repacker(t.TempDir())
 	rb.MaxFoldBytes = 1

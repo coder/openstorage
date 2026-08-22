@@ -452,21 +452,29 @@ type weightedPack struct {
 	weight int64
 }
 
-// selectPairable picks a foldable (>= 2 packs) subset greedily, oldest
-// first, under the cumulative budget. When the greedy pass yields fewer
-// than two — an old consolidated pack consuming nearly the whole budget
-// crowds every later small pack out — the pass RESTARTS past its first
-// item: without this, the same oversized selection would repeat on every
+// selectPairable picks a foldable (>= 2 packs) subset under the cumulative
+// budget, in two bounded passes:
+//
+//  1. greedy oldest-first (ListPacks order) — the steady-state path, which
+//     preferentially folds the oldest accumulation;
+//  2. when that yields fewer than two — an old consolidated pack consuming
+//     nearly the whole budget crowds every later small pack out — greedy
+//     by ASCENDING WEIGHT: if any pairable subset exists, the two lightest
+//     packs fit together, so this pass finds one; if even they exceed the
+//     budget, no pair exists and the fold is a genuine no-op.
+//
+// Without the fallback, the same oversized selection would repeat on every
 // trigger, later pushes would accumulate unbounded rows, and folding would
-// wedge permanently on exactly the growth it exists to prevent. Quadratic
-// only in the wedged case, over an in-memory slice whose length the
-// follow-up machinery keeps near the threshold.
+// wedge permanently on exactly the growth it exists to prevent. Both
+// passes are single scans over an in-memory slice (the sort bounds the
+// whole selection at O(n log n) — no suffix rescans, nothing here needs
+// cancellation checks even for degenerate backlogs).
 func selectPairable(items []weightedPack, budget int64) []ref.Pack {
 	assertf(budget > 0, "selectPairable: non-positive budget %d", budget)
-	for start := 0; start < len(items); start++ {
+	greedy := func(order []weightedPack) []ref.Pack {
 		var selected []ref.Pack
 		var total int64
-		for _, it := range items[start:] {
+		for _, it := range order {
 			if total+it.weight > budget {
 				continue // over budget: leave this pack registered as-is
 			}
@@ -476,8 +484,14 @@ func selectPairable(items []weightedPack, budget int64) []ref.Pack {
 		if len(selected) >= 2 {
 			return selected
 		}
+		return nil
 	}
-	return nil
+	if selected := greedy(items); selected != nil {
+		return selected
+	}
+	byWeight := append([]weightedPack(nil), items...)
+	sort.SliceStable(byWeight, func(i, j int) bool { return byWeight[i].weight < byWeight[j].weight })
+	return greedy(byWeight)
 }
 
 // packObjectCount reads a pack's exact object count from its version-2 idx

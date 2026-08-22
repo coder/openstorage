@@ -166,23 +166,30 @@ func (w *repackWorker) Work(ctx context.Context, job *river.Job[repackArgs]) err
 			"repo", job.Args.Repo, "err", err)
 	}
 	assertf(w.pool != nil, "repackWorker: pool not wired")
-	// Transactional self-completion. Failures roll back and fall through
-	// to river's normal completion — the recheck window then stays open
-	// for this job, which the next write's trigger chain covers (rare,
-	// logged, never corrupting).
+	// Transactional self-completion. Failures SNOOZE the job instead of
+	// completing it: returning nil would let river complete this
+	// MaxAttempts-1 job without the follow-up recheck ever running, and
+	// coalesced mid-fold triggers would strand (their registrations
+	// survive the fold's snapshot). A snooze keeps the recheck durably
+	// owed — the re-run's extra Repack attempt is a cheap no-op or folds
+	// genuinely new rows, either of which is correct. If the commit
+	// failure was ambiguous (it actually landed), the snooze merely
+	// resurrects a completed job for one idempotent no-op pass.
+	completionFailed := func(stage string, err error) error {
+		w.repacker.logger.Warn("repack: transactional completion failed; snoozing to preserve the follow-up recheck",
+			"repo", job.Args.Repo, "stage", stage, "err", err)
+		return river.JobSnooze(repackFollowUpDelay)
+	}
 	tx, err := w.pool.Begin(ctx)
 	if err != nil {
-		w.repacker.logger.Warn("repack: follow-up completion begin failed", "repo", job.Args.Repo, "err", err)
-		return nil
+		return completionFailed("begin", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 	if _, err := river.JobCompleteTx[*riverpgxv5.Driver](ctx, tx, job); err != nil {
-		w.repacker.logger.Warn("repack: transactional completion failed", "repo", job.Args.Repo, "err", err)
-		return nil
+		return completionFailed("complete", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
-		w.repacker.logger.Warn("repack: completion commit failed", "repo", job.Args.Repo, "err", err)
-		return nil
+		return completionFailed("commit", err)
 	}
 	// Strictly after the completion commit: the running row is gone from
 	// the unique index, so this insert (and any concurrent trigger's)
