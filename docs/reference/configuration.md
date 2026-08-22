@@ -246,8 +246,11 @@ consolidated pack — the registered object set never shrinks.
 Variables outside the operator surface, listed for completeness — never set these manually:
 
 - `CODESTORAGE_GIT_REPO`, `CODESTORAGE_GIT_REFS_POLICY`, `CODESTORAGE_GIT_OPS`,
-  `CODESTORAGE_GIT_PACK_QUOTA`, `CODESTORAGE_GIT_PACK_RESERVATION_TTL` — per-request
-  plumbing the server sets for the `codestorage hook` subprocess git re-execs.
+  `CODESTORAGE_GIT_ATOMIC`, `CODESTORAGE_GIT_PACK_QUOTA`,
+  `CODESTORAGE_GIT_PACK_RESERVATION_TTL` — per-request plumbing the server sets for the
+  `codestorage hook` subprocess git re-execs.
+- `CODESTORAGE_ASKPASS_USERNAME`, `CODESTORAGE_ASKPASS_PASSWORD` — set by the upstream-sync
+  worker for its own git credential-askpass subprocess.
 - `CODESTORAGE_TEST_MODE`, `CODESTORAGE_TEST_CRASH`, `CODESTORAGE_TEST_CAS_DROP`,
   `CODESTORAGE_TEST_CAS_DROP_HARD`, `CODESTORAGE_TEST_HOOK_DELAY_MS` — crash/fault
   injection for the e2e suites; the server refuses test-mode requests outside test mode.
