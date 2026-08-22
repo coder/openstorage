@@ -309,25 +309,30 @@ func TestStorageUsageBytes(t *testing.T) {
 	}
 }
 
-// TestHookUsageFloor (Codex round 21): the pre-receive hook is a fresh
-// process per push, so per-push self-listings of the pack and LFS
+// TestHookUsageFloor (Codex rounds 21+30): the pre-receive hook is a
+// fresh process per push, so per-push self-listings of the pack and LFS
 // prefixes amplify against the shared backend. The serve process mints
-// the floor into EnvUsageFloor from its shared cache; the hook must use
-// it WITHOUT listing (nil blob store proves no listing — StorageUsageBytes
-// asserts on nil), fail closed on nonsense (the env comes from our own
-// server), and self-list only when the env is absent (binary skew).
+// "<bytes>:<unix mint time>" into EnvUsageFloor from its shared cache;
+// the hook must use a FRESH floor WITHOUT listing (nil blob store proves
+// no listing — StorageUsageBytes asserts on nil), self-list when the
+// floor aged past hookFloorMaxAge (the client controls the mint-to-hook
+// gap), self-list on absent or timestampless values (binary skew), and
+// fail closed on nonsense (the env comes from our own server).
 func TestHookUsageFloor(t *testing.T) {
-	t.Run("env-floor-used-without-listing", func(t *testing.T) {
-		t.Setenv(EnvUsageFloor, "1234")
+	now := time.Now().Unix()
+	t.Run("fresh-floor-used-without-listing", func(t *testing.T) {
+		t.Setenv(EnvUsageFloor, fmt.Sprintf("1234:%d", now))
 		got, err := hookUsageFloor(context.Background(), nil, "repo_a")
 		if err != nil || got != 1234 {
 			t.Fatalf("hookUsageFloor = (%d, %v), want (1234, nil)", got, err)
 		}
 	})
 	for name, raw := range map[string]string{
-		"malformed-fails-closed": "not-a-number",
-		"negative-fails-closed":  "-1",
-		"empty-fails-closed":     "",
+		"malformed-fails-closed":       "not-a-number",
+		"negative-fails-closed":        fmt.Sprintf("-1:%d", now),
+		"empty-fails-closed":           "",
+		"bad-timestamp-fails-closed":   "1234:xyz",
+		"bad-bytes-piece-fails-closed": fmt.Sprintf("abc:%d", now),
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Setenv(EnvUsageFloor, raw)
@@ -336,19 +341,31 @@ func TestHookUsageFloor(t *testing.T) {
 			}
 		})
 	}
-	t.Run("absent-falls-back-to-listing", func(t *testing.T) {
-		// t.Setenv registers cleanup; unset AFTER it so the var is absent
-		// during the test but restored for any outer value.
-		t.Setenv(EnvUsageFloor, "sentinel")
-		os.Unsetenv(EnvUsageFloor)
-		bl := openTestBlob(t)
-		seedPack(t, bl, "repo_a", "1111", 100)
-		seedLFS(t, bl, "repo_a", strings.Repeat("aa", 32), 7)
-		got, err := hookUsageFloor(context.Background(), bl, "repo_a")
-		if err != nil || got != 107 {
-			t.Fatalf("skew fallback = (%d, %v), want (107, nil)", got, err)
-		}
-	})
+	listingCases := map[string]func() string{
+		"absent-falls-back-to-listing":        func() string { return "" },
+		"stale-floor-falls-back-to-listing":   func() string { return fmt.Sprintf("1234:%d", time.Now().Add(-hookFloorMaxAge-time.Minute).Unix()) },
+		"timestampless-falls-back-to-listing": func() string { return "1234" },
+	}
+	for name, mkRaw := range listingCases {
+		t.Run(name, func(t *testing.T) {
+			raw := mkRaw()
+			if raw == "" {
+				// t.Setenv registers cleanup; unset AFTER it so the var is
+				// absent during the test but restored afterwards.
+				t.Setenv(EnvUsageFloor, "sentinel")
+				os.Unsetenv(EnvUsageFloor)
+			} else {
+				t.Setenv(EnvUsageFloor, raw)
+			}
+			bl := openTestBlob(t)
+			seedPack(t, bl, "repo_a", "1111", 100)
+			seedLFS(t, bl, "repo_a", strings.Repeat("aa", 32), 7)
+			got, err := hookUsageFloor(context.Background(), bl, "repo_a")
+			if err != nil || got != 107 {
+				t.Fatalf("listing fallback = (%d, %v), want (107, nil) — the untrusted floor must not be used", got, err)
+			}
+		})
+	}
 }
 
 // TestServiceRPC_QuotaNeverRejectsAtHTTP pins the HTTP layer's

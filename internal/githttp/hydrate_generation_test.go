@@ -93,6 +93,10 @@ func (s *countingStore) QuotaLedgerState(context.Context, []string, time.Duratio
 	panic("Hydrate must never read the quota ledger")
 }
 
+func (s *countingStore) RetirePackAttempts(context.Context, []string, []string) error {
+	panic("Hydrate must never retire pack reservations")
+}
+
 func (s *countingStore) ListRefs(context.Context, string) (map[string]string, error) {
 	s.mu.Lock()
 	s.listRefsCalls++

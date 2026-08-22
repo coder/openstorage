@@ -98,7 +98,8 @@ func (s *SQLite) InitSchema(ctx context.Context) error {
 		// statement (sqliteEpochMS), matching the admission predicate.
 		`CREATE TABLE IF NOT EXISTS pack_reservations (key TEXT PRIMARY KEY, repo TEXT NOT NULL,
 		                                               bytes INTEGER NOT NULL, owner TEXT NOT NULL,
-		                                               created_at INTEGER NOT NULL)`,
+		                                               created_at INTEGER NOT NULL,
+		                                               attempts INTEGER NOT NULL DEFAULT 1)`,
 		`CREATE INDEX IF NOT EXISTS pack_reservations_repo ON pack_reservations (repo)`,
 		`CREATE TABLE IF NOT EXISTS pack_retained (repo TEXT, key TEXT, bytes INTEGER NOT NULL,
 		                                           superseded_at INTEGER NOT NULL DEFAULT (unixepoch()),
@@ -131,6 +132,19 @@ func (s *SQLite) InitSchema(ctx context.Context) error {
 			if _, err := tx.ExecContext(ctx, stmt); err != nil {
 				return fmt.Errorf("sqlite init schema: add refs.created_at: %w", err)
 			}
+		}
+	}
+	// Idempotent additive migration for pre-attempt ledgers (issue #51,
+	// Codex round 30): rows minted by older binaries count as one attempt.
+	var haveAttempts int
+	if err := tx.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM pragma_table_info('pack_reservations') WHERE name = 'attempts'`).Scan(&haveAttempts); err != nil {
+		return fmt.Errorf("sqlite init schema: probe pack_reservations.attempts: %w", err)
+	}
+	if haveAttempts == 0 {
+		if _, err := tx.ExecContext(ctx,
+			`ALTER TABLE pack_reservations ADD COLUMN attempts INTEGER NOT NULL DEFAULT 1`); err != nil {
+			return fmt.Errorf("sqlite init schema: add pack_reservations.attempts: %w", err)
 		}
 	}
 	// Generation-bump triggers (issue #4): in SCHEMA, not application code,

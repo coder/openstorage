@@ -280,6 +280,7 @@ func preReceive(ctx context.Context) error {
 	// concurrent-push overshoot the listing alone admitted. The reservation
 	// is consumed atomically by RegisterPacks below; a crash anywhere
 	// between here and there leaves an expiring row the sweeper prunes.
+	var reservedKeys []string
 	if quotaRaw := os.Getenv(EnvPackQuota); quotaRaw != "" {
 		quota, err := strconv.ParseInt(quotaRaw, 10, 64)
 		if err != nil || quota <= 0 {
@@ -310,6 +311,9 @@ func preReceive(ctx context.Context) error {
 				return fmt.Errorf("pre-receive: repository pack quota exceeded: push adds %d bytes to %d bytes stored (+%d bytes reserved by in-flight pushes), quota is %d bytes",
 					ref.IncomingBytes(unpublished), dec.UsedBytes, dec.ReservedBytes, quota)
 			}
+			for _, p := range unpublished {
+				reservedKeys = append(reservedKeys, p.Key)
+			}
 			// Test knob: crash after the reservation committed, before any
 			// upload — the reservation deliberately leaks (issue #29's
 			// reserve → crash → sweep recovery window).
@@ -325,16 +329,17 @@ func preReceive(ctx context.Context) error {
 			continue
 		}
 		if err := bl.UploadFile(ctx, packs[i].Key, pf); err != nil {
-			// NO failure release, deliberately (Codex round 22): the
-			// reservation row is keyed by content-addressed pack key and
-			// SHARED with any concurrent identical push via refresh, so
-			// releasing it here could free headroom another writer is
-			// still staging under — a third push could then consume it
-			// and the concurrent writer's registration would overshoot
-			// the quota. Reservations end by settlement (RegisterPacks
-			// consumes by key) or TTL expiry, exactly like the LFS path;
-			// a clean failure holds its declared bytes for at most the
-			// TTL, the same bound a crash always had.
+			// Clean failure: retire THIS push's attempts (Codex round 30;
+			// replacing round 22's settle-or-TTL-only rule). The rows are
+			// shared with concurrent identical pushes via refresh, so the
+			// retire is per-attempt refcounted — it never removes a live
+			// same-key writer's protection, and a failed retire only
+			// leaves what the TTL always collected.
+			if len(reservedKeys) > 0 {
+				if rerr := st.RetirePackAttempts(ctx, blob.QuotaRepoGroup(repo), reservedKeys); rerr != nil {
+					fmt.Fprintf(os.Stderr, "codestorage: retire reservations: %v\n", rerr)
+				}
+			}
 			return fmt.Errorf("pre-receive: upload %s: %w", packs[i].Key, err)
 		}
 	}

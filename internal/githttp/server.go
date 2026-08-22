@@ -594,7 +594,11 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 				return
 			}
 			cmd.Env = append(cmd.Env, EnvPackQuota+"="+strconv.FormatInt(s.PackQuotaBytes, 10))
-			cmd.Env = append(cmd.Env, EnvUsageFloor+"="+strconv.FormatInt(floor, 10))
+			// The floor carries its mint time (Codex round 30): the hook
+			// runs only after the client's transfer, whose duration the
+			// client controls, so the hook must be able to judge the
+			// floor's age rather than trust an arbitrarily stale value.
+			cmd.Env = append(cmd.Env, EnvUsageFloor+"="+strconv.FormatInt(floor, 10)+":"+strconv.FormatInt(time.Now().Unix(), 10))
 			if s.PackReservationTTL > 0 {
 				cmd.Env = append(cmd.Env, EnvPackReservationTTL+"="+s.PackReservationTTL.String())
 			}

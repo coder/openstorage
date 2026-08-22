@@ -84,11 +84,14 @@ func (s *server) publishPack(ctx context.Context, repoID, packID, packPath strin
 					errPackQuotaExceeded, pack.Size, dec.UsedBytes, dec.ReservedBytes, s.packQuotaBytes)
 			}
 			if err := s.blobStore.UploadFile(ctx, key, packPath); err != nil {
-				// NO failure release, deliberately (Codex round 22): the
-				// reservation row is shared with concurrent identical
-				// writers via same-key refresh, so releasing it could
-				// free headroom another writer still stages under.
-				// Settlement or TTL expiry are the only row ends.
+				// Clean failure: retire THIS attempt (Codex round 30;
+				// replacing round 22's settle-or-TTL-only rule). The
+				// per-attempt refcount never removes a live same-key
+				// writer's protection; a failed retire only leaves what
+				// the TTL always collected.
+				if rerr := s.refStore.RetirePackAttempts(ctx, blob.QuotaRepoGroup(repoID), []string{key}); rerr != nil {
+					s.logger.Warn("retire pack reservation", "key", key, "error", rerr)
+				}
 				return fmt.Errorf("upload pack %s: %w", key, err)
 			}
 		} else if err := s.blobStore.UploadFile(ctx, key, packPath); err != nil {

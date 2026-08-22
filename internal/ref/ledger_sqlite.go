@@ -80,7 +80,8 @@ INSERT INTO pack_reservations (key, repo, bytes, owner, created_at)
 VALUES (?, ?, ?, ?, `+sqliteEpochMS+`)
 ON CONFLICT (key) DO UPDATE SET repo = excluded.repo,
                                 bytes = MAX(pack_reservations.bytes, excluded.bytes),
-                                created_at = excluded.created_at`,
+                                created_at = excluded.created_at,
+                                attempts = pack_reservations.attempts + 1`,
 			p.Key, group[0], p.Size, owner); err != nil {
 			return ReserveDecision{}, fmt.Errorf("reserve pack bytes insert: %w", err)
 		}
@@ -106,7 +107,35 @@ func placeholders(n int) string {
 // (ReleasePackReservations was removed in Codex round 22 on #51: same-key
 // reservation rows are shared by every concurrent writer via refresh, so
 // an owner-scoped failure release could free headroom another writer was
-// still staging under. Rows end by settlement or TTL only.)
+// still staging under. RetirePackAttempts replaced it in round 30 with
+// per-attempt refcounts.)
+
+// RetirePackAttempts — see the PG twin; BEGIN IMMEDIATE's single writer is
+// the serialization.
+func (s *SQLite) RetirePackAttempts(ctx context.Context, group []string, keys []string) error {
+	assertf(len(group) > 0 && group[0] != "" && len(keys) > 0, "RetirePackAttempts(%v, %v)", group, keys)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	args := make([]any, 0, len(keys)+1)
+	args = append(args, group[0])
+	for _, k := range keys {
+		args = append(args, k)
+	}
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE pack_reservations SET attempts = attempts - 1 WHERE repo = ? AND key IN (?`+placeholders(len(keys)-1)+`)`,
+		args...); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM pack_reservations WHERE repo = ? AND key IN (?`+placeholders(len(keys)-1)+`) AND attempts <= 0`,
+		args...); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
 
 // SweepExpiredPackReservations prunes reservation rows at least olderThan
 // old.

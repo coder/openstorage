@@ -1177,6 +1177,73 @@ func TestLFSPut_ProbeIsDeadlineBound(t *testing.T) {
 	}
 }
 
+// failingUploadBlob fails every UploadFile — the aborted-transfer /
+// wedged-publication clean-failure path.
+type failingUploadBlob struct {
+	blob.BlobStore
+}
+
+func (b failingUploadBlob) UploadFile(context.Context, string, string) error {
+	return fmt.Errorf("upload aborted")
+}
+
+// TestLFSPut_CleanFailureRetiresReservation (Codex security round on
+// round 30): an aborted PUT whose publication cleanly failed must retire
+// its reservation attempt instead of leaving the row until the TTL —
+// sequential aborted tiny PUTs (~3 bytes each) otherwise accumulate
+// maxActiveReservations rows from ~30 KB of bodies and wedge ALL of the
+// repository's git/REST/LFS growth for an hour.
+func TestLFSPut_CleanFailureRetiresReservation(t *testing.T) {
+	srv, st, mint := newLFSQuotaServer(t, 1<<20, time.Hour)
+	tok := mint(auth.ScopeGitWrite)
+	srv.Blob = failingUploadBlob{BlobStore: srv.Blob}
+
+	for i := range 3 {
+		content := []byte(fmt.Sprintf("tiny-%d", i))
+		w := doLFS(t, srv, http.MethodPut, "/"+lfsTestRepoURL+".git/info/lfs/objects/"+sha256Hex(content),
+			"basic:"+tok, string(content))
+		if w.Code != http.StatusInternalServerError {
+			t.Fatalf("aborted PUT %d status = %d, want 500", i, w.Code)
+		}
+	}
+	if ls := ledgerState(t, st, time.Hour); ls.ReservedBytes != 0 {
+		t.Fatalf("aborted PUTs left %d reserved bytes pinned to the TTL, want 0 (attempts retired)", ls.ReservedBytes)
+	}
+}
+
+// TestLFSPut_WriterVerifyBoundedByLease (Codex round 30): the
+// post-registration writer-verify must stay within the publication lease —
+// blob.EnsurePublished's own size-scaled detached allowance (~175 minutes
+// at 10 GiB) would hold the op slot, temp file, and full staging
+// reservation far past it, letting one wedged repair monopolize the node
+// budget. A wedged verify Stat now fails the request within the lease
+// with every slot reclaimed.
+func TestLFSPut_WriterVerifyBoundedByLease(t *testing.T) {
+	srv, _, mint := newLFSQuotaServer(t, 1<<20, 2*time.Second) // lease ≈ 1.8s
+	tok := mint(auth.ScopeGitWrite)
+	content := []byte("verify-wedge object")
+	oid := sha256Hex(content)
+	// Calls: 1 = dedup probe (NotFound passes through); 2 = the
+	// post-registration writer-verify, which wedges.
+	srv.Blob = &wedgedStatBlob{BlobStore: srv.Blob, after: 2}
+
+	start := time.Now()
+	w := doLFS(t, srv, http.MethodPut, "/"+lfsTestRepoURL+".git/info/lfs/objects/"+oid,
+		"basic:"+tok, string(content))
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("wedged-verify PUT status = %d, body %s (want 500)", w.Code, w.Body)
+	}
+	if elapsed := time.Since(start); elapsed > 30*time.Second {
+		t.Fatalf("wedged writer-verify took %v — lease not applied", elapsed)
+	}
+	srv.lfsStagingMu.Lock()
+	ops, inflight := srv.lfsStagingOps, srv.lfsStagingInFlight
+	srv.lfsStagingMu.Unlock()
+	if ops != 0 || inflight != 0 {
+		t.Fatalf("staging after wedged verify = ops %d, bytes %d — slots leaked", ops, inflight)
+	}
+}
+
 // TestLFSUpload_AbsoluteDeadlineBoundsDrip (Codex security round 2): a
 // client dripping one byte per idle window must still hit the ABSOLUTE
 // bound (the reservation TTL) and release its staging capacity.

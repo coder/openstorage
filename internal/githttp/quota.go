@@ -38,6 +38,7 @@ import (
 	"log"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -56,14 +57,27 @@ const EnvPackQuota = "CODESTORAGE_GIT_PACK_QUOTA"
 const EnvPackReservationTTL = "CODESTORAGE_GIT_PACK_RESERVATION_TTL"
 
 // EnvUsageFloor carries the repo's storage usage floor (packs + LFS
-// prefixes, bytes) from the serve process's shared single-flight cache
-// into the pre-receive hook (Codex round 21): the hook is a fresh process
-// per push, so a hook-side listing cannot be cached across pushes and
+// prefixes) from the serve process's shared single-flight cache into the
+// pre-receive hook (Codex round 21): the hook is a fresh process per
+// push, so a hook-side listing cannot be cached across pushes and
 // re-scans both prefixes every time — ~100 pages per push at the LFS
-// object cap. Set alongside EnvPackQuota. The value is minted at
-// receive-pack spawn (one cache TTL plus the client's transfer time
-// stale), which is safe for the FLOOR — see CachedUsageFloor.
+// object cap. Set alongside EnvPackQuota as "<bytes>:<unix mint time>"
+// (Codex round 30): the value is minted at receive-pack spawn but the
+// hook runs only after the client's transfer, whose duration the CLIENT
+// controls, so the hook self-lists when the floor has aged past
+// hookFloorMaxAge instead of trusting it — beyond the reservation TTL,
+// orphaned uploads whose reservations expired are visible only to a
+// listing.
 const EnvUsageFloor = "CODESTORAGE_GIT_USAGE_FLOOR"
+
+// hookFloorMaxAge bounds how old a server-minted usage floor may be
+// before the hook self-lists instead (a var for tests). Five minutes
+// passes every legitimate push comfortably while staying far under any
+// sane reservation TTL (which must already exceed the longest plausible
+// upload); a deliberately slow push exceeding it pays one self-listing —
+// no amplification, since the client spends over five minutes per
+// listing it triggers.
+var hookFloorMaxAge = 5 * time.Minute
 
 // defaultReservationTTL bounds how long a crashed push's reservation keeps
 // gating admission (ref/ledger.go). It must comfortably exceed the longest
@@ -244,21 +258,36 @@ func packUsageBytes(ctx context.Context, bl blob.BlobStore, repo string) (int64,
 }
 
 // hookUsageFloor resolves the pre-receive admission floor: the serve
-// process mints EnvUsageFloor from its shared single-flight cache (Codex
-// round 21 — the hook is a fresh process per push, so hook-side listings
-// re-scan the pack AND LFS prefixes on every push). Malformed or negative
-// values fail closed like a malformed EnvPackQuota: the env comes from our
-// own server, so nonsense means misconfiguration, not client input. An
-// ABSENT env falls back to a fresh self-listing — a serve binary predating
-// the minted floor (skew) must not weaken enforcement.
+// process mints EnvUsageFloor ("<bytes>:<unix mint time>") from its shared
+// single-flight cache (Codex round 21 — the hook is a fresh process per
+// push, so hook-side listings re-scan the pack AND LFS prefixes on every
+// push). A floor older than hookFloorMaxAge is NOT trusted (Codex round
+// 30 — the client controls the transfer duration between mint and hook)
+// and the hook self-lists, as it does for an absent env (a serve binary
+// predating the minted floor) or a bare timestampless value (one
+// predating the mint time): skew never weakens enforcement, it only costs
+// that push a listing. Malformed values fail closed like a malformed
+// EnvPackQuota: the env comes from our own server, so nonsense means
+// misconfiguration, not client input.
 func hookUsageFloor(ctx context.Context, bl blob.BlobStore, repo string) (int64, error) {
 	raw, ok := os.LookupEnv(EnvUsageFloor)
 	if !ok {
 		return packUsageBytes(ctx, bl, repo)
 	}
-	floor, err := strconv.ParseInt(raw, 10, 64)
-	if err != nil || floor < 0 {
+	val, mint, found := strings.Cut(raw, ":")
+	if !found {
+		if _, err := strconv.ParseInt(raw, 10, 64); err != nil {
+			return 0, fmt.Errorf("malformed %s=%q", EnvUsageFloor, raw)
+		}
+		return packUsageBytes(ctx, bl, repo) // timestampless legacy floor: no age evidence
+	}
+	floor, ferr := strconv.ParseInt(val, 10, 64)
+	mintUnix, merr := strconv.ParseInt(mint, 10, 64)
+	if ferr != nil || merr != nil || floor < 0 {
 		return 0, fmt.Errorf("malformed %s=%q", EnvUsageFloor, raw)
+	}
+	if time.Since(time.Unix(mintUnix, 0)) > hookFloorMaxAge {
+		return packUsageBytes(ctx, bl, repo)
 	}
 	return floor, nil
 }

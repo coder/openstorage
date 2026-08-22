@@ -176,21 +176,38 @@ func TestReserveSameKeyRefreshes(t *testing.T) {
 		}
 		k.wantState(0, 60, 0)
 
-		// Settle-or-TTL (Codex round 22): with writer A's "failure" having
-		// no release to fire, the shared row keeps gating — a third
-		// distinct write that would fit only in the released headroom is
-		// denied while B is still staging behind the reservation.
+		// Per-attempt refcounts (Codex round 30, refining round 22's
+		// settle-or-TTL): writer A's clean failure retires only ITS
+		// attempt — the shared row keeps gating while B still stages
+		// behind it, so a third distinct write that would fit only in the
+		// freed headroom stays denied.
+		if err := s.RetirePackAttempts(context.Background(), k.group, []string{a.Key}); err != nil {
+			t.Fatalf("first retire: %v", err)
+		}
 		c := k.pack(k.base(), "cc3", 50)
 		if dec := k.reserve([]Pack{c}, "owner-third", 0, 100); dec.OK {
 			t.Fatalf("third writer admitted into headroom a shared reservation still gates: %+v", dec)
 		}
 		k.wantState(0, 60, 0)
 
-		// Settlement consumes the shared row by KEY, whoever registers.
-		k.register(k.base(), a)
-		k.wantState(60, 0, 0)
-		if dec := k.reserve([]Pack{c}, "owner-third", 0, 200); !dec.OK {
-			t.Fatalf("post-settlement reserve wedged: %+v", dec)
+		// B's clean failure retires the LAST attempt: the row ends and
+		// the headroom frees without waiting out the TTL.
+		if err := s.RetirePackAttempts(context.Background(), k.group, []string{a.Key}); err != nil {
+			t.Fatalf("second retire: %v", err)
+		}
+		k.wantState(0, 0, 0)
+		if dec := k.reserve([]Pack{c}, "owner-third", 0, 100); !dec.OK {
+			t.Fatalf("post-retire reserve wedged: %+v", dec)
+		}
+		k.wantState(0, 50, 0)
+
+		// Settlement still consumes the row by KEY, whoever registers.
+		k.register(k.base(), c)
+		k.wantState(50, 0, 0)
+
+		// Retiring an absent key is a no-op, not an error.
+		if err := s.RetirePackAttempts(context.Background(), k.group, []string{"packs/absent/pack-x.pack"}); err != nil {
+			t.Fatalf("absent-key retire: %v", err)
 		}
 	})
 }

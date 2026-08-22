@@ -293,11 +293,16 @@ SELECT
 			// conservative side — settlement replaces the row with the
 			// verified actual size in the usage counter, so an inflated
 			// declaration lives at most until settle or TTL.
+			// attempts counts the live same-key writers sharing this row
+			// (Codex round 30): every reserve/refresh adds one, a clean
+			// failure retires one (RetirePackAttempts), and the row ends
+			// at zero attempts, settlement, or TTL.
 			if _, err := tx.Exec(ctx, `
 INSERT INTO pack_reservations (key, repo, bytes, owner) VALUES ($1, $2, $3, $4)
 ON CONFLICT (key) DO UPDATE SET repo = EXCLUDED.repo,
                                 bytes = GREATEST(pack_reservations.bytes, EXCLUDED.bytes),
-                                created_at = now()`,
+                                created_at = now(),
+                                attempts = pack_reservations.attempts + 1`,
 				p.Key, group[0], p.Size, owner); err != nil {
 				return err
 			}
@@ -309,6 +314,27 @@ ON CONFLICT (key) DO UPDATE SET repo = EXCLUDED.repo,
 		return ReserveDecision{}, err
 	}
 	return dec, nil
+}
+
+// RetirePackAttempts — see RefStore. Serialized with ReservePackBytes per
+// base repo (same advisory lock class): a retire must not interleave with
+// a concurrent same-key refresh or the decrement could race the increment.
+func (s *PG) RetirePackAttempts(ctx context.Context, group []string, keys []string) error {
+	assertf(len(group) > 0 && group[0] != "" && len(keys) > 0, "RetirePackAttempts(%v, %v)", group, keys)
+	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1), $2)`, group[0], reserveLockClass); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `
+UPDATE pack_reservations SET attempts = attempts - 1 WHERE repo = $1 AND key = ANY($2)`,
+			group[0], keys); err != nil {
+			return err
+		}
+		_, err := tx.Exec(ctx, `
+DELETE FROM pack_reservations WHERE repo = $1 AND key = ANY($2) AND attempts <= 0`,
+			group[0], keys)
+		return err
+	})
 }
 
 // SweepExpiredPackReservations prunes reservation rows at least olderThan

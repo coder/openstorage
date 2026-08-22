@@ -1219,6 +1219,21 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target r
 	pubCtx, cancel := context.WithDeadline(ctx, pubAnchor.Add(s.lfsReservationTTL()*9/10))
 	defer cancel()
 	if err := s.Blob.UploadFile(pubCtx, key, path); err != nil {
+		// Clean failure: nothing published, nothing registered — retire
+		// THIS attempt's share of the reservation (Codex round 30):
+		// leaving every aborted tiny PUT's row to the TTL let ~30 KB of
+		// aborted bodies pin maxActiveReservations and wedge all growth
+		// for an hour. Per-attempt refcounts keep a concurrent same-key
+		// writer's protection intact (the round-22 constraint). Detached
+		// from the client (the abort IS the attack) and bounded; a failed
+		// retire only leaves what the TTL always collected.
+		if s.PackQuotaBytes > 0 && n > 0 && !registered {
+			rctx, rcancel := context.WithTimeout(context.WithoutCancel(ctx), lfsCleanupTimeout)
+			defer rcancel()
+			if rerr := s.Store.RetirePackAttempts(rctx, blob.QuotaRepoGroup(repoID), []string{key}); rerr != nil {
+				log.Printf("lfs retire %s: %v", key, rerr)
+			}
+		}
 		log.Printf("lfs upload %s: %v", key, err)
 		lfsError(w, http.StatusInternalServerError, "object upload failed")
 		return
@@ -1260,8 +1275,27 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target r
 	// committed; re-upload from the local file if so. Runs even when
 	// registration failed — an ambiguous error may have registered the
 	// object, and a committed row must never point at missing bytes.
-	if err := blob.EnsurePublished(ctx, s.Blob, key, path); err != nil {
-		log.Printf("lfs verify %s: %v", key, errors.Join(regErr, err))
+	// Detached from client cancellation (a hangup must not skip the
+	// repair) but bounded by the SAME publication lease as everything
+	// else in this handler (Codex round 30): blob.EnsurePublished's own
+	// size-scaled detached allowance (~175 minutes at 10 GiB) would hold
+	// this handler's op slot, temp file, and full staging reservation
+	// far past the ~54-minute lease, letting one wedged repair
+	// monopolize the node's staging budget. Lease expiry fails the
+	// request with the row — if registration committed — in the
+	// documented zero-growth repair state, which the client's retry
+	// republishes.
+	ectx, ecancel := context.WithDeadline(context.WithoutCancel(ctx), pubAnchor.Add(s.lfsReservationTTL()*9/10))
+	defer ecancel()
+	verifyErr := func() error {
+		_, err := s.Blob.Stat(ectx, key)
+		if errors.Is(err, blob.ErrNotFound) {
+			return s.Blob.UploadFile(ectx, key, path)
+		}
+		return err
+	}()
+	if verifyErr != nil {
+		log.Printf("lfs verify %s: %v", key, errors.Join(regErr, verifyErr))
 		lfsError(w, http.StatusInternalServerError, "object verification failed")
 		return
 	}
