@@ -37,7 +37,7 @@ namespaces), and [docs/06](../06-webhooks.md) (webhooks). By feature group:
 | Both path styles | ✅ | `/api/v1/...` (repo from the JWT `repo` claim) and named-repo `/api/repos/{repo_name}/...` aliases over the same handlers |
 | Deprecated spellings | ✅ | Documented upstream aliases accepted ([below](#deprecated-aliases)) |
 | Git smart-HTTP | ✅ | Clone/fetch/push at `/{repo}.git` (repo ID or URL-encoded name), ref policies, signed-commit verification, atomic pushes ([below](#git-protocol-semantics)) |
-| Namespaces & forks | ✅ | `+ephemeral` / `+import` namespaces; copy-on-write forks |
+| Namespaces & forks | ✅ | `+ephemeral` / `+import` namespaces; copy-on-write forks. Git-pushed vs REST-written ephemeral state live in separate ref spaces ([deviation](#known-deviations-from-the-vendored-spec)) |
 | Git LFS | ✅ | Batch API on the same remote; presigned S3 transfers with a server-proxied fallback |
 | Webhooks | ✅ | HMAC-signed `push` and `repo.sync.*` events, plus webhook CRUD |
 | Upstream sync & credentials | ✅ | `pull-upstream`, detach base, git-credential CRUD |
@@ -130,6 +130,7 @@ snapshot (each recorded in the [decision log](../README.md#document-index)):
 | `POST .../reset-commits` (NDJSON) | Not implemented; `POST .../restore-commit` (plain JSON) covers the SDK-visible restore semantics | Recorded deviation (docs/12) — no SDK calls `reset-commits` |
 | `DELETE /api/repos/{repo_name}/tags/{tag_name}` (tag in path) | `DELETE .../tags` with the tag in the request body | Matches the SDKs' actual call shape |
 | `GET`/`POST /api/repos` (bare collection routes) | `/api/v1/repos` only; named-repo aliases exist for repo-scoped routes, not org-scoped collections | Alias layer covers the styles SDKs use |
+| One ephemeral namespace across git and REST | Two separate ref spaces: git push to `/{repo}+ephemeral.git` writes a distinct `+ephemeral` storage key, REST `ephemeral=true` reads/writes `refs/namespaces/ephemeral/…` under the base repository — ephemeral state does not cross surfaces | Recorded cross-surface split (docs/13): REST writes follow the REST read surface so API-created ephemeral refs stay visible to `GET .../branches?ephemeral=true` and merge promotion |
 
 And extensions upstream's spec does not list: the single-item `branch`/`tag` lookups
 (SDK-relied), webhook management endpoints (upstream documents webhooks but doesn't spec
