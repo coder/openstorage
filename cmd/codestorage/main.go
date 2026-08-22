@@ -228,6 +228,11 @@ func selfLoopbackURL(addr net.Addr) string {
 		}
 	default:
 		host = tcp.IP.String()
+		if tcp.Zone != "" {
+			// Scoped IPv6 (e.g. fe80::1%eth0): RFC 6874 requires the
+			// zone separator to appear as %25 inside a URL host.
+			host += "%25" + tcp.Zone
+		}
 	}
 	return "http://" + net.JoinHostPort(host, strconv.Itoa(tcp.Port))
 }
