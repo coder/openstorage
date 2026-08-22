@@ -97,6 +97,27 @@ func waitForMain(t *testing.T, repoID, want string) {
 	}
 }
 
+// waitForSyncIdle waits until no sync run is in flight for the repo.
+// TryBeginSync drops a run when one is already claimed, so a pull-upstream
+// issued while the create-triggered first run is still finishing would be
+// silently swallowed — the synced ref becomes visible BEFORE FinishSync
+// clears the claim, which is exactly the window CI load hits.
+func waitForSyncIdle(t *testing.T, repoID string) {
+	t.Helper()
+	deadline := time.After(90 * time.Second)
+	for {
+		up, err := testMeta.GetRepoUpstream(context.Background(), repoID)
+		if err == nil && !up.Syncing {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("repo %s sync never went idle (row: %+v, err: %v)", repoID, up, err)
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+}
+
 // TestSync_LoopbackPushesSurviveLaterBoots is the two-node #45 acceptance:
 // nodeA boots first (TestMain), nodeB boots later, and BOTH must complete
 // sync runs — including nodeA, whose loopback key a pre-fix nodeB boot
@@ -115,6 +136,7 @@ func TestSync_LoopbackPushesSurviveLaterBoots(t *testing.T) {
 	// pull-upstream of a fresh upstream commit.
 	repoA := createSyncedRepo(t, nodeA, up, "sync-a")
 	waitForMain(t, repoA, head)
+	waitForSyncIdle(t, repoA) // pull-upstream is dropped while a run is claimed
 
 	head = up.commitAndPublish(t, "two")
 	pullToken := mintTestToken(t, repoA, "git:write", "")
