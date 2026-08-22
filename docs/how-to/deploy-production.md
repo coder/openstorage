@@ -114,10 +114,14 @@ default.
 
 ## Local disk: the cache directory
 
-Replicas keep exactly one thing on local disk: a rebuildable cache of bare git
-repositories that read endpoints and git smart-HTTP serve from. It is set with the
-`--cache-dir` flag (there is no `CODESTORAGE_*` env var for it) and defaults to
-`<os temp dir>/codestorage-cache`.
+Replicas keep no *durable* state on local disk, but they use it in two ways. The main
+one is a rebuildable cache of bare git repositories that read endpoints and git
+smart-HTTP serve from, set with the `--cache-dir` flag (there is no `CODESTORAGE_*` env
+var for it) and defaulting to `<os temp dir>/codestorage-cache`. Separately, several
+operations stage potentially large short-lived data in the **OS temp dir** itself
+(fork-closure packs, upstream-sync clones, pack assembly) — so when you point
+`--cache-dir` at a big volume, provision `$TMPDIR` accordingly too instead of leaving it
+on a small container writable layer.
 
 - **Give each replica its own local directory** on fast disk. Never share one directory
   between replicas (hydration locking assumes local `flock` semantics), and never mount it
