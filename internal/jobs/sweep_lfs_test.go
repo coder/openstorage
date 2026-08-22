@@ -6,6 +6,8 @@ package jobs
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"log/slog"
 	"strings"
 	"testing"
@@ -136,19 +138,42 @@ func TestSweepLFS_DeleteLFSReapsOrphansOnly(t *testing.T) {
 
 // TestSweepLFS_HealRestoresRegisteredFromQuarantine: a registered LFS
 // object whose only copy sits in quarantine (delete-enabled crash
-// mid-handshake) is restored by the heal pass in every sweep mode.
+// mid-handshake) is restored by the heal pass in every sweep mode —
+// PROVIDED the backup's bytes hash to the key's oid (restores are
+// digest-verified since the round-19 security finding).
 func TestSweepLFS_HealRestoresRegisteredFromQuarantine(t *testing.T) {
 	f := newSweepFixture(t)
-	key := blob.LFSKey("repo_lfs", lfsOID("ee"))
-	f.registerLFS("repo_lfs", key, int64(len("stranded-lfs-bytes")))
+	content := "stranded-lfs-bytes"
+	key := blob.LFSKey("repo_lfs", lfsContentOID(content))
+	f.registerLFS("repo_lfs", key, int64(len(content)))
 	// Simulate the crash: the backup exists, the original does not.
-	f.upload(quarantineKey(key), "stranded-lfs-bytes")
+	f.upload(quarantineKey(key), content)
 
 	if _, err := f.sweeper(SweepConfig{Threshold: 24 * time.Hour}).Sweep(context.Background()); err != nil {
 		t.Fatalf("Sweep: %v", err)
 	}
 	if !f.exists(key) {
 		t.Fatalf("heal pass did not restore registered LFS object %q", key)
+	}
+}
+
+// TestSweepLFS_HealNeverRestoresMismatchedBackup (Codex round 19,
+// security): a quarantine backup whose bytes do NOT hash to the key's oid
+// descends from a pre-registry legacy blob — the heal pass must never
+// restore it over a registered row, or fast paths that trust the registry
+// would serve durable corruption. The row stays in the zero-growth repair
+// state instead.
+func TestSweepLFS_HealNeverRestoresMismatchedBackup(t *testing.T) {
+	f := newSweepFixture(t)
+	key := blob.LFSKey("repo_lfs", lfsOID("ee")) // oid ≠ sha256 of the backup bytes
+	f.registerLFS("repo_lfs", key, 10)
+	f.upload(quarantineKey(key), "legacy garbage that never hashed to ee...")
+
+	if _, err := f.sweeper(SweepConfig{Threshold: 24 * time.Hour}).Sweep(context.Background()); err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if f.exists(key) {
+		t.Fatalf("heal pass restored a digest-mismatched LFS backup to %q", key)
 	}
 }
 
@@ -161,7 +186,7 @@ func TestSweepLFS_RegisteredMidSweepSurvives(t *testing.T) {
 	f.upload(key, "racer-lfs-bytes")
 	f.backdate(key, 25*time.Hour)
 
-	packs := &lfsRegisteredMidSweep{}
+	packs := &lfsRegisteredMidSweep{after: 1}
 	s := NewSweeper(f.blobs, packs, SweepConfig{Threshold: 24 * time.Hour, DeleteLFS: true}, slog.New(slog.DiscardHandler))
 	report, err := s.Sweep(context.Background())
 	if err != nil {
@@ -178,10 +203,11 @@ func TestSweepLFS_RegisteredMidSweepSurvives(t *testing.T) {
 	}
 }
 
-// lfsRegisteredMidSweep mirrors registeredMidSweep for the LFS registry.
+// lfsRegisteredMidSweep mirrors registeredMidSweep for the LFS registry:
+// HasLFSObject flips to registered strictly after the Nth call.
 type lfsRegisteredMidSweep struct {
 	stubLedger
-	calls int
+	after, calls int
 }
 
 func (p *lfsRegisteredMidSweep) HasPack(context.Context, string, string) (bool, error) {
@@ -190,5 +216,59 @@ func (p *lfsRegisteredMidSweep) HasPack(context.Context, string, string) (bool, 
 
 func (p *lfsRegisteredMidSweep) HasLFSObject(context.Context, string, string) (bool, error) {
 	p.calls++
-	return p.calls > 1, nil
+	return p.calls > p.after, nil
+}
+
+// lfsContentOID returns content's sha256 — the oid a genuine LFS object's
+// key embeds.
+func lfsContentOID(content string) string {
+	sum := sha256.Sum256([]byte(content))
+	return hex.EncodeToString(sum[:])
+}
+
+// TestSweepLFS_MidDeleteRestoreIsDigestVerified (Codex round 19, security):
+// the mid-delete restore must not launder a corrupt pre-registry blob into
+// a registered object. Attack ordering: an aged legacy blob whose bytes do
+// NOT hash to its oid is quarantined and deleted; a verified upload
+// registers the same key mid-delete; the recheck sees the row. Restoring
+// the quarantined bytes now would overwrite the verified upload's content
+// with garbage that the registry vouches for — the digest check must skip
+// it. The genuine twin (backup bytes DO hash to the oid) must keep
+// restoring exactly as before.
+func TestSweepLFS_MidDeleteRestoreIsDigestVerified(t *testing.T) {
+	genuine := "genuine lfs bytes"
+	for name, tc := range map[string]struct {
+		oid         string
+		wantPresent bool
+	}{
+		"mismatched-not-restored": {oid: lfsOID("dd"), wantPresent: false},
+		"genuine-restored":        {oid: lfsContentOID(genuine), wantPresent: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newSweepFixture(t)
+			key := blob.LFSKey("repo_lfs", tc.oid)
+			f.upload(key, genuine)
+			f.backdate(key, 25*time.Hour)
+
+			// Calls: 1 = classification, 2 = revalidateOrphan (both
+			// unregistered), 3 = safeDelete's post-delete recheck
+			// (registered — the racing verified upload landed).
+			packs := &lfsRegisteredMidSweep{after: 2}
+			s := NewSweeper(f.blobs, packs, SweepConfig{Threshold: 24 * time.Hour, DeleteLFS: true}, slog.New(slog.DiscardHandler))
+			report, err := s.Sweep(context.Background())
+			if err != nil {
+				t.Fatalf("Sweep: %v", err)
+			}
+			if report.Deleted != 0 {
+				t.Fatalf("report = %+v, want no counted deletes (registered mid-delete)", report)
+			}
+			if got := f.exists(key); got != tc.wantPresent {
+				t.Fatalf("exists(%q) = %v, want %v", key, got, tc.wantPresent)
+			}
+			// The backup is retained either way for the aged purge.
+			if !f.hasBackup(key) {
+				t.Fatalf("quarantine backup for %q was not retained", key)
+			}
+		})
+	}
 }

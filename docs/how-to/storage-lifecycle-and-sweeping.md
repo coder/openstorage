@@ -235,7 +235,11 @@ When a sweep does delete, it never hard-deletes directly: every blob is first co
 landed mid-delete is restored on the spot), and **every** sweep — list-only included —
 starts by restoring any registered-but-missing pack from quarantine. Rolling back to
 list-only after a scare therefore still repairs anything a delete-enabled crash left
-behind; look for `orphan pack sweep: healed registered pack from quarantine`. Quarantine
+behind; look for `orphan pack sweep: healed registered pack from quarantine`. LFS
+restores are additionally digest-verified against the key's OID: a backup taken from a
+pre-registry blob whose bytes never hashed to its OID is *never* restored (logged as
+`NOT restoring LFS quarantine backup failing content verification`) — a registered
+object in that state repairs itself on the next upload touch instead. Quarantine
 backups are purged only while a destructive mode is on, and only once older than
 `max(age threshold, 1h)` — the floor guarantees a delete handshake is provably dead
 before its backup goes away, so tuning the age threshold low does not shorten it.

@@ -23,6 +23,7 @@ package jobs
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -179,7 +180,10 @@ func NewSweeper(blobs blob.BlobStore, packs PackRegistry, cfg SweepConfig, logge
 //  2. safeDelete copies the bytes to a quarantine key before deleting, then
 //     re-reads the registry AFTER the delete: a registration that landed
 //     mid-delete is repaired on the spot by re-uploading the identical
-//     bytes (content-addressed keys make the restore always correct).
+//     bytes. Pack restores are always correct by construction
+//     (content-addressed keys over server-built packs); LFS restores are
+//     digest-verified first, because a pre-registry legacy blob's bytes
+//     may not hash to its key's oid (see restoreFromQuarantine).
 //  3. healQuarantine, at the start of EVERY sweep (list-only included, so a
 //     rollback to list-only still repairs a delete-enabled crash), restores
 //     any quarantined pack whose key is registered but missing (covering a
@@ -272,7 +276,7 @@ func (s *Sweeper) Sweep(ctx context.Context) (SweepReport, error) {
 	// (lfs/<repo>/<64-hex oid>, no deeper nesting) are foreign.
 	err = s.blobs.ListPages(ctx, blob.LFSRoot, sweepListPageSize, func(page []blob.ListedObject) error {
 		for _, obj := range page {
-			repo, ok := splitLFSKey(obj.Key)
+			repo, _, ok := splitLFSKey(obj.Key)
 			if !ok {
 				s.logger.Warn("orphan pack sweep: skipping foreign key under lfs/", "key", obj.Key)
 				continue
@@ -520,24 +524,26 @@ func isQuarantineNonce(s string) bool {
 // segment. Anything else is foreign: never a restore source, never purged.
 func splitSweepKey(key string) (repo string, ok bool) {
 	if strings.HasPrefix(key, blob.LFSRoot) {
-		return splitLFSKey(key)
+		repo, _, ok := splitLFSKey(key)
+		return repo, ok
 	}
 	return splitPackKey(key)
 }
 
 // splitLFSKey validates that key has the exact shape blob.LFSKey produces —
 // lfs/<repo>/<oid> with a 64-hex-char oid and no deeper nesting — and
-// returns the repo segment (always a BASE RepoID, ADR-35).
-func splitLFSKey(key string) (repo string, ok bool) {
+// returns the repo segment (always a BASE RepoID, ADR-35) plus the oid
+// (the object's expected sha256, which quarantine restores verify against).
+func splitLFSKey(key string) (repo, oid string, ok bool) {
 	rest, found := strings.CutPrefix(key, blob.LFSRoot)
 	if !found {
-		return "", false
+		return "", "", false
 	}
-	repo, oid, found := strings.Cut(rest, "/")
+	repo, oid, found = strings.Cut(rest, "/")
 	if !found || repo == "" || !isLFSOID(oid) {
-		return "", false
+		return "", "", false
 	}
-	return repo, true
+	return repo, oid, true
 }
 
 // isLFSOID reports whether s is a sha256 content address as git-lfs spells
@@ -575,6 +581,64 @@ func splitPackKey(key string) (repo string, ok bool) {
 		return "", false
 	}
 	return repo, true
+}
+
+// lfsVerifyChunkSize bounds one ranged read while digest-verifying an LFS
+// quarantine backup: memory-bounded streaming hash over ReadRange, never
+// staged through local disk (matching the rest of the handshake).
+const lfsVerifyChunkSize = 8 << 20
+
+// restoreFromQuarantine copies the quarantine backup at qKey back to its
+// original key, digest-verifying LFS backups first (Codex security finding
+// on issue #51). Pack backups restore unconditionally — pack keys are
+// content-addressed to server-built packs, so the backup's bytes are the
+// key's by construction. An LFS key's correct content is likewise decidable
+// from the key itself (lfs/<repo>/<oid>, oid = sha256), but the backup may
+// descend from a PRE-REGISTRY legacy blob whose bytes never hashed to the
+// oid (presigned uploads proved nothing): restoring those over a
+// concurrently uploaded verified object would launder corruption into a
+// registered row that every fast path thereafter trusts. A mismatched
+// backup is therefore never restored (restored=false, nil error) — safe in
+// every caller, because bytes that fail the key's own digest cannot be
+// content anyone registered; a registered row's true content converges via
+// its writer's post-registration verify or the zero-growth repair path.
+func (s *Sweeper) restoreFromQuarantine(ctx context.Context, key, qKey string) (restored bool, err error) {
+	assertf(key != "" && qKey != "", "restoreFromQuarantine(%q, %q)", key, qKey)
+	if _, oid, ok := splitLFSKey(key); ok {
+		match, err := s.lfsBackupMatchesOID(ctx, qKey, oid)
+		if err != nil {
+			return false, err
+		}
+		if !match {
+			s.logger.Warn("orphan pack sweep: NOT restoring LFS quarantine backup failing content verification",
+				"key", key, "quarantine", qKey)
+			return false, nil
+		}
+	}
+	if err := s.blobs.Copy(ctx, key, qKey); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// lfsBackupMatchesOID reports whether the object at qKey hashes to oid.
+func (s *Sweeper) lfsBackupMatchesOID(ctx context.Context, qKey, oid string) (bool, error) {
+	assertf(isLFSOID(oid), "lfsBackupMatchesOID: bad oid %q", oid)
+	size, err := s.blobs.Stat(ctx, qKey)
+	if err != nil {
+		return false, fmt.Errorf("verify quarantine %s: stat: %w", qKey, err)
+	}
+	h := sha256.New()
+	for off := int64(0); off < size; {
+		n := min(int64(lfsVerifyChunkSize), size-off)
+		chunk, err := s.blobs.ReadRange(ctx, qKey, off, n)
+		if err != nil {
+			return false, fmt.Errorf("verify quarantine %s: read [%d,%d): %w", qKey, off, off+n, err)
+		}
+		h.Write(chunk)
+		off += n
+	}
+	return hex.EncodeToString(h.Sum(nil)) == oid, nil
 }
 
 // safeDelete reaps one revalidated orphan candidate without ever being able
@@ -617,15 +681,15 @@ func (s *Sweeper) safeDelete(ctx context.Context, repo, key string) (bool, error
 	defer cancel()
 	if err := s.blobs.Delete(hctx, key); err != nil && !errors.Is(err, blob.ErrNotFound) {
 		// The delete outcome is unknown — the request may have executed
-		// with its response lost. Restore from quarantine unconditionally:
-		// identical bytes, so a no-op if the delete never happened and a
-		// repair if it did. Either way a registration racing this delete
-		// finds its bytes present. The candidate stays unreaped (its next
-		// classification restarts from the restore's fresh ModTime); if
-		// even the restore fails, the retained backup plus the heal pass
-		// remain the backstop.
+		// with its response lost. Restore from quarantine (digest-verified
+		// for LFS keys): identical bytes, so a no-op if the delete never
+		// happened and a repair if it did. Either way a registration racing
+		// this delete finds its bytes present. The candidate stays unreaped
+		// (its next classification restarts from the restore's fresh
+		// ModTime); if even the restore fails, the retained backup plus the
+		// heal pass remain the backstop.
 		deleteErr := fmt.Errorf("sweep: delete %s: %w", key, err)
-		if rerr := s.blobs.Copy(rctx, key, qKey); rerr != nil {
+		if _, rerr := s.restoreFromQuarantine(rctx, key, qKey); rerr != nil {
 			return false, errors.Join(deleteErr,
 				fmt.Errorf("sweep: restore after ambiguous delete %s: %w", key, rerr))
 		}
@@ -644,20 +708,29 @@ func (s *Sweeper) safeDelete(ctx context.Context, repo, key string) (bool, error
 		// exactly like the ambiguous-delete path — a no-op if the key was
 		// truly orphaned, a repair if it was registered.
 		recheckErr := fmt.Errorf("sweep: post-delete recheck %s: %w", key, err)
-		if rerr := s.blobs.Copy(rctx, key, qKey); rerr != nil {
+		if _, rerr := s.restoreFromQuarantine(rctx, key, qKey); rerr != nil {
 			return false, errors.Join(recheckErr,
 				fmt.Errorf("sweep: restore after failed recheck %s: %w", key, rerr))
 		}
 		return false, recheckErr
 	}
 	if registered {
-		if err := s.blobs.Copy(rctx, key, qKey); err != nil {
+		restored, err := s.restoreFromQuarantine(rctx, key, qKey)
+		if err != nil {
 			return false, fmt.Errorf("sweep: restore %s registered mid-delete: %w", key, err)
 		}
-		// The backup is deliberately retained until the aged purge in
-		// healQuarantineEntry collects it; until then it covers a sweeper
-		// crash anywhere after this handshake.
-		s.logger.Warn("orphan pack sweep: restored pack registered mid-delete", "key", key)
+		if restored {
+			// The backup is deliberately retained until the aged purge in
+			// healQuarantineEntry collects it; until then it covers a
+			// sweeper crash anywhere after this handshake.
+			s.logger.Warn("orphan pack sweep: restored pack registered mid-delete", "key", key)
+		}
+		// !restored: the backup held pre-registry bytes failing the key's
+		// digest — the registration that raced us uploaded VERIFIED bytes,
+		// so its own post-registration verify (blob.EnsurePublished, layer
+		// 4) republishes them; until then the row is in the documented
+		// zero-growth repair state. Restoring the mismatched backup would
+		// instead make the corruption durable and trusted.
 		return false, nil
 	}
 	return true, nil
@@ -714,7 +787,7 @@ func (s *Sweeper) healQuarantineEntry(ctx context.Context, q blob.ListedObject, 
 	}
 	if registered {
 		if _, err := s.blobs.Stat(ctx, orig); errors.Is(err, blob.ErrNotFound) {
-			switch err := s.blobs.Copy(ctx, orig, q.Key); {
+			switch restored, err := s.restoreFromQuarantine(ctx, orig, q.Key); {
 			case errors.Is(err, blob.ErrNotFound):
 				// The entry vanished between listing and restore: a
 				// concurrent replica healed this same entry and purged it —
@@ -728,8 +801,13 @@ func (s *Sweeper) healQuarantineEntry(ctx context.Context, q blob.ListedObject, 
 				return nil // healed by a peer; the peer also owns the purge
 			case err != nil:
 				return fmt.Errorf("sweep: heal %s: restore: %w", orig, err)
+			case restored:
+				s.logger.Warn("orphan pack sweep: healed registered pack from quarantine", "key", orig)
 			}
-			s.logger.Warn("orphan pack sweep: healed registered pack from quarantine", "key", orig)
+			// !restored: an LFS backup failing the key's digest (pre-registry
+			// bytes) — never restored over a registered row; the row stays in
+			// the zero-growth repair state and the aged purge below still
+			// collects the backup.
 		} else if err != nil {
 			return fmt.Errorf("sweep: heal %s: stat: %w", orig, err)
 		}
