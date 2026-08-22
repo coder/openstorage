@@ -1,0 +1,52 @@
+# Release automation (issue #65): release-please maintains a rolling release
+# PR (CHANGELOG.md + .release-please-manifest.json bump) from conventional
+# commits on main; merging that PR cuts the semver tag + GitHub release, and
+# the binaries job populates it (issue #66).
+#
+# Only conventional-commit squash titles (feat:, fix:, feat!:, ...) bump the
+# version or appear in the changelog — see docs/how-to/release.md.
+#
+# Token caveat: this runs with the default GITHUB_TOKEN, and events created
+# with it do not trigger other workflows. That is why the binaries build is
+# chained here via workflow_call instead of an `on: push: tags` / `on:
+# release` trigger (those would never fire), and why the release PR needs a
+# manual nudge to get its required CI checks — see docs/how-to/release.md.
+name: release-please
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# Serialize runs so rapid pushes to main cannot race the release PR update.
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+    steps:
+      - uses: googleapis/release-please-action@v5
+        id: release
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  binaries:
+    needs: release-please
+    if: ${{ needs.release-please.outputs.release_created == 'true' }}
+    permissions:
+      contents: write
+    uses: ./.github/workflows/release.yml
+    with:
+      tag: ${{ needs.release-please.outputs.tag_name }}
