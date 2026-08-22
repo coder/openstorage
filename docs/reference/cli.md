@@ -77,9 +77,15 @@ service. Claims follow [docs/02](../02-authentication.md).
 | `--iss` | required | Issuer claim — the org name (`CODESTORAGE_ORG`) |
 | `--repo` | required | Repo claim: the target repo, or `org` for org-level operations |
 | `--scopes` | `git:read,git:write` | Comma-separated scopes: `git:read`, `git:write`, `repo:write`, `org:read` |
-| `--refs` | — | Optional ref-policy JSON, e.g. `[["refs/heads/main",["no-force-push"]],["*",[]]]` (validated at mint time) |
+| `--refs` | — | Optional ref-policy JSON, e.g. `[["refs/heads/main",["no-force-push"]],["*",[]]]` — only the JSON tuple structure is validated at mint time |
 | `--alg` | inferred from key type | JWS signature algorithm |
 | `--ttl` | `1h` | Token lifetime (must be positive) |
+
+Ref-policy patterns support an exact ref name, a standalone `*` (matches everything), or a
+single trailing `*` after a `/` (prefix match, e.g. `refs/heads/feature/*`). Any other `*`
+placement is **not** a glob — it falls through to exact comparison and never matches, so a
+mistyped pattern like `refs/heads/main*` silently leaves the ref unpoliced. Evaluation
+semantics: [docs/02](../02-authentication.md).
 
 ```sh
 TOKEN=$(codestorage mint --key /tmp/cs-key.pem --iss selfhost --repo demo --scopes git:read,git:write)
@@ -101,8 +107,11 @@ otherwise the database env URL is used).
 
 `--key` (required) points at either a single SSH public key line
 (`<type> <base64> [comment]`; types `ssh-ed25519`, `ssh-rsa`, `ecdsa-sha2-nistp256/384/521`
-and their `sk-` FIDO variants) or an ASCII-armored PGP public key block. Validation happens
-on add — the hook trusts registry contents verbatim.
+and their `sk-` FIDO variants) or an ASCII-armored PGP public key block. SSH keys are
+validated on add (type allow-list, base64, wire-format type echo); PGP blocks are checked
+only for the armor framing — corrupt contents between the markers surface later, at
+`verify-sig` push time, where one bad registry entry can block protected pushes until it is
+removed. The hook trusts registry contents verbatim.
 
 ### `signing-key list`
 
