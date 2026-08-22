@@ -329,6 +329,17 @@ func resolveTrustedProxies(getenv func(string) string) ([]netip.Prefix, error) {
 			return nil, fmt.Errorf("%s: empty entry in %q", envTrustedProxies, raw)
 		}
 		if p, err := netip.ParsePrefix(entry); err == nil {
+			// Normalize IPv4-mapped prefixes (::ffff:a.b.c.d/N) to IPv4:
+			// matching unmaps peer addresses, so a stored 4-in-6 prefix
+			// would never match anything (Codex round 1). Below /96 the
+			// entry covers more than the mapped-IPv4 space and has no
+			// IPv4 equivalent — reject rather than store dead config.
+			if p.Addr().Is4In6() {
+				if p.Bits() < 96 {
+					return nil, fmt.Errorf("%s: IPv4-mapped prefix %q needs at least /96 (use an IPv4 CIDR or a real IPv6 range)", envTrustedProxies, entry)
+				}
+				p = netip.PrefixFrom(p.Addr().Unmap(), p.Bits()-96)
+			}
 			prefixes = append(prefixes, p)
 			continue
 		}

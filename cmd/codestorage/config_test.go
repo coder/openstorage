@@ -499,13 +499,14 @@ func TestResolveServeConfigTrustedProxies(t *testing.T) {
 	t.Run("parse-through", func(t *testing.T) {
 		cfg, err := resolveServeConfig(base(map[string]string{
 			// CIDRs, a bare IPv4 (single-address entry), a bare
-			// IPv4-mapped IPv6 (unmapped to /32), and whitespace padding.
-			envTrustedProxies: "10.0.0.0/8, 192.0.2.7 ,2001:db8::/32,::ffff:198.51.100.9",
+			// IPv4-mapped IPv6 (unmapped to /32), an IPv4-mapped CIDR
+			// (normalized to IPv4, Codex round 1), and whitespace padding.
+			envTrustedProxies: "10.0.0.0/8, 192.0.2.7 ,2001:db8::/32,::ffff:198.51.100.9,::ffff:172.16.0.0/108",
 		}), "", "", "/tmp/cache", "")
 		if err != nil {
 			t.Fatal(err)
 		}
-		want := []string{"10.0.0.0/8", "192.0.2.7/32", "2001:db8::/32", "198.51.100.9/32"}
+		want := []string{"10.0.0.0/8", "192.0.2.7/32", "2001:db8::/32", "198.51.100.9/32", "172.16.0.0/12"}
 		if len(cfg.trustedProxies) != len(want) {
 			t.Fatalf("resolved %v, want %v", cfg.trustedProxies, want)
 		}
@@ -524,6 +525,9 @@ func TestResolveServeConfigTrustedProxies(t *testing.T) {
 		"empty-entry":    "10.0.0.1,,10.0.0.2",
 		"trailing-comma": "10.0.0.1,",
 		"zoned-address":  "fe80::1%eth0",
+		// A 4-in-6 prefix below /96 covers more than the mapped-IPv4
+		// space and has no IPv4 equivalent (Codex round 1).
+		"mapped-cidr-below-96": "::ffff:10.0.0.0/64",
 	} {
 		t.Run(name, func(t *testing.T) {
 			_, err := resolveServeConfig(base(map[string]string{envTrustedProxies: val}), "", "", "/tmp/cache", "")
