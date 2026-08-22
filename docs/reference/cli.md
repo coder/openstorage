@@ -56,7 +56,7 @@ Generates an org keypair for JWT signing.
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--out` | required | Output path prefix: writes `<out>.pem` (PKCS#8 private key, mode `0600`) and `<out>.pub.pem` (PKIX public key) |
+| `--out` | required | Output path prefix: writes `<out>.pem` (PKCS#8 private key, created with mode `0600` — a pre-existing file is overwritten but keeps its old mode) and `<out>.pub.pem` (PKIX public key) |
 | `--alg` | `ES256` | Key algorithm: one of `ES256`, `RS256`, `EdDSA`, `PS256`, `ES384`, `ES512` |
 
 Point `CODESTORAGE_ORG_PUBKEYS` at the `.pub.pem` file (it may hold several concatenated

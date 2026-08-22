@@ -14,7 +14,7 @@ never a silently-applied default.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| [`CODESTORAGE_PG_URL`](#codestorage_pg_url) | — (required*) | Database URL: refs + metadata (`postgres://` or `sqlite://`) |
+| [`CODESTORAGE_PG_URL`](#codestorage_pg_url) | — (required*) | Database URL: refs + metadata (`postgres://`, `postgresql://`, or `sqlite://`) |
 | [`CODESTORAGE_S3_URL`](#codestorage_s3_url) | — (required*) | Pack storage URL (`s3://` or `file://`) |
 | [`CODESTORAGE_DATA_DIR`](#codestorage_data_dir) | — | Local-mode data directory; derives the two URLs above |
 | [`CODESTORAGE_LISTEN`](#codestorage_listen) | `127.0.0.1:0` | Listen address |
@@ -40,8 +40,8 @@ never a silently-applied default.
 
 Database URL for the ref authority (CAS) and metadata store.
 
-- **Schemes:** `postgres://` (production, any number of stateless replicas) or
-  `sqlite://<absolute-path>` (local mode, single node).
+- **Schemes:** `postgres://` or `postgresql://` (production, any number of stateless
+  replicas) or `sqlite://<absolute-path>` (local mode, single node).
 - **Legacy aliases** (scanned left to right, first non-empty wins): `SPIKE_PG_URL`, `PG_URL`.
 - **Default:** none. Startup fails unless set explicitly or derived from the data dir
   (`sqlite://<dir>/codestorage.db`).

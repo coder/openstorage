@@ -142,9 +142,9 @@ published ports ([configuration reference](docs/reference/configuration.md)).
 |---|---|
 | `CODESTORAGE_ORG` | **Required.** Org name (JWT `iss` claim) |
 | `CODESTORAGE_ORG_PUBKEYS` | **Required.** PEM file with the org's public keys |
-| `CODESTORAGE_PG_URL` | Database URL for refs + metadata: `postgres://` or `sqlite://` |
+| `CODESTORAGE_PG_URL` | Database URL for refs + metadata: `postgres://`/`postgresql://` or `sqlite://` |
 | `CODESTORAGE_S3_URL` | Pack storage URL: `s3://` bucket or `file://` directory |
-| `CODESTORAGE_DATA_DIR` | Local mode: one directory that derives all of the above |
+| `CODESTORAGE_DATA_DIR` | Local mode: one directory that derives the two storage URLs above (org settings are still required) |
 
 Every variable — rate limiting, trusted proxies, pack quotas, sweep and repack tuning,
 legacy aliases — with defaults and validation constraints:
