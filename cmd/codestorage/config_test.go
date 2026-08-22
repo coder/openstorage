@@ -621,7 +621,9 @@ func TestResolveServeConfigSweep(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		want := sweepSettings{interval: defaultSweepInterval, ageThreshold: defaultSweepAgeThreshold}
+		// deleteSuperseded defaults ON (issue #31): the provably-folded
+		// class ships delete-enabled while general orphans stay list-only.
+		want := sweepSettings{interval: defaultSweepInterval, ageThreshold: defaultSweepAgeThreshold, deleteSuperseded: true}
 		if cfg.sweep != want {
 			t.Fatalf("default sweep = %+v, want %+v (hourly, 24h threshold, list-only)", cfg.sweep, want)
 		}
@@ -629,9 +631,10 @@ func TestResolveServeConfigSweep(t *testing.T) {
 
 	t.Run("parse-through", func(t *testing.T) {
 		cfg, err := resolveServeConfig(base(map[string]string{
-			envSweepInterval:      "30m",
-			envSweepAgeThreshold:  "48h",
-			envSweepDeleteEnabled: "true",
+			envSweepInterval:         "30m",
+			envSweepAgeThreshold:     "48h",
+			envSweepDeleteEnabled:    "true",
+			envSweepDeleteSuperseded: "false",
 		}), "", "", "/tmp/cache", "")
 		if err != nil {
 			t.Fatal(err)

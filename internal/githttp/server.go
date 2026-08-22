@@ -16,6 +16,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"time"
 
 	"codestorage/internal/auth"
 	"codestorage/internal/blob"
@@ -67,6 +68,10 @@ type Server struct {
 	// quota.go); <= 0 disables quota enforcement. Set by the serve wiring
 	// from the resolved config, like ResolveRepo.
 	PackQuotaBytes int64
+	// PackReservationTTL bounds how long a crashed push's quota
+	// reservation gates admission (issue #29, ref/ledger.go). Set by the
+	// serve wiring; <= 0 leaves the hook on defaultReservationTTL.
+	PackReservationTTL time.Duration
 	// usage memoizes per-repo pack usage for the quota-pressure log so
 	// replayed cheap POSTs cannot amplify into per-request blob listings.
 	usage usageCache
@@ -364,6 +369,9 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 		// usage+incoming check (quota.go); absent means disabled.
 		if s.PackQuotaBytes > 0 {
 			cmd.Env = append(cmd.Env, EnvPackQuota+"="+strconv.FormatInt(s.PackQuotaBytes, 10))
+			if s.PackReservationTTL > 0 {
+				cmd.Env = append(cmd.Env, EnvPackReservationTTL+"="+s.PackReservationTTL.String())
+			}
 		}
 		// The refs claim is passed through raw (docs/02 tuple encoding);
 		// the update hook owns parsing and fails closed on malformed JSON.

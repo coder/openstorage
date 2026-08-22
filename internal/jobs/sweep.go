@@ -34,12 +34,25 @@ import (
 )
 
 // PackRegistry is the slice of ref.RefStore the sweeper needs: point
-// membership in the authoritative registered-pack set. Point reads, not
+// membership in the authoritative registered-pack set, plus the quota
+// ledger's sweep-side operations (issues #29/#31). Point reads, not
 // ListPacks: a repo's registered-pack count is attacker-growable
 // (pre-receive registers packs before ref policy), so the sweeper must
 // never materialize a repo's full pack set.
 type PackRegistry interface {
 	HasPack(ctx context.Context, repo, key string) (bool, error)
+	// IsRetainedPack classifies (repo, key) as superseded-by-repack: a
+	// blob whose registry row a ReplacePacks fold removed. Provably
+	// DB-absent by that CAS — a narrower, safer deletion class than
+	// general orphans (issue #31).
+	IsRetainedPack(ctx context.Context, repo, key string) (bool, error)
+	// ReclaimRetainedPack debits the retained bytes from the repo's quota
+	// usage once the blob actually left the pack prefix; idempotent.
+	ReclaimRetainedPack(ctx context.Context, repo, key string) (int64, error)
+	// SweepExpiredPackReservations prunes reservation rows abandoned by
+	// crashed pushes (issue #29); expired rows already stopped gating
+	// admission, so this is pure garbage collection.
+	SweepExpiredPackReservations(ctx context.Context, olderThan time.Duration) (int64, error)
 }
 
 // SweepConfig controls one sweeper's classification and disposal.
@@ -53,13 +66,30 @@ type SweepConfig struct {
 	// default everywhere: enable only after list-only reports have been
 	// boring for a while (issue #5 ships list-only first).
 	Delete bool
+	// DeleteSuperseded reaps aged candidates in the RETAINED class —
+	// blobs a ReplacePacks fold provably removed from the registry
+	// (issue #31) — even when Delete is off. ON by default (the serve
+	// config's CODESTORAGE_SWEEP_DELETE_SUPERSEDED=false disables it):
+	// unlike general orphans, whose registration status the sweeper infers
+	// by diffing, this class carries a durable DB record written in the
+	// fold's own transaction, and without deletion a drip-writer turns the
+	// repack threshold into a storage multiplier bounded only by the
+	// quota. Disposal still runs the full revalidate + quarantine
+	// handshake and the same age threshold.
+	DeleteSuperseded bool
 	// DeleteGuard, when set, is consulted before each sweep's destructive
-	// work. A non-nil error downgrades that run to list-only (heals still
-	// run) and is reported. It re-checks preconditions that startup
-	// validated once but that can drift while the process runs — e.g. S3
-	// bucket versioning being enabled mid-flight, which would turn deletes
-	// into billed delete markers.
+	// work (Delete and DeleteSuperseded alike). A non-nil error downgrades
+	// that run to list-only (heals still run) and is reported. It
+	// re-checks preconditions that startup validated once but that can
+	// drift while the process runs — e.g. S3 bucket versioning being
+	// enabled mid-flight, which would turn deletes into billed delete
+	// markers.
 	DeleteGuard func(context.Context) error
+	// ReservationTTL, when positive, prunes pack-quota reservation rows
+	// older than it each sweep (issue #29's crash-swept leaks). Use the
+	// same TTL the write gates charge so pruning never races a live
+	// reservation.
+	ReservationTTL time.Duration
 }
 
 // OrphanPack is one orphan candidate found by a sweep.
@@ -87,6 +117,15 @@ type SweepReport struct {
 	// run — the moment storage consumption actually decreases.
 	Deleted        int
 	BytesReclaimed int64
+	// SupersededDeleted counts retained-class reaps (issue #31, provably
+	// superseded by a ReplacePacks fold), a subset of Deleted;
+	// RetainedBytesReclaimed is the quota-usage headroom their reaps
+	// returned via ReclaimRetainedPack.
+	SupersededDeleted      int
+	RetainedBytesReclaimed int64
+	// ReservationsExpired counts crash-leaked pack-quota reservation rows
+	// pruned this run (issue #29).
+	ReservationsExpired int64
 }
 
 // Sweeper finds (and optionally deletes) orphan pack blobs. Construct with
@@ -153,17 +192,36 @@ func (s *Sweeper) Sweep(ctx context.Context) (SweepReport, error) {
 	var report SweepReport
 	var deleteErrs boundedErrs
 	// Fail closed per run, not just at startup: destructive preconditions
-	// (e.g. bucket versioning state) can drift while the process runs.
-	deleteMode := s.cfg.Delete
-	if deleteMode && s.cfg.DeleteGuard != nil {
+	// (e.g. bucket versioning state) can drift while the process runs. One
+	// guard covers both destructive modes — a versioned bucket turns
+	// superseded-class deletes into billed delete markers all the same.
+	deleteMode, supersededMode := s.cfg.Delete, s.cfg.DeleteSuperseded
+	if (deleteMode || supersededMode) && s.cfg.DeleteGuard != nil {
 		if err := s.cfg.DeleteGuard(ctx); err != nil {
-			deleteMode = false
+			deleteMode, supersededMode = false, false
 			deleteErrs.add(fmt.Errorf("sweep: delete guard, running list-only: %w", err))
 			s.logger.Error("orphan pack sweep: delete guard failed; this run is list-only", "err", err)
 		}
 	}
-	if err := s.healQuarantine(ctx, &report, deleteMode); err != nil {
+	// Quarantine purging rides on EITHER destructive mode: backups only
+	// exist because some destructive pass created them, and the purge-age
+	// proof (write-once nonce keys) is class-agnostic.
+	if err := s.healQuarantine(ctx, &report, deleteMode || supersededMode); err != nil {
 		deleteErrs.add(err)
+	}
+	// Crash-leaked admission reservations (issue #29): expired rows already
+	// stopped gating pushes, so this is garbage collection on the sweeper
+	// cadence — exactly the reclamation path the ledger design names.
+	if s.cfg.ReservationTTL > 0 {
+		n, err := s.packs.SweepExpiredPackReservations(ctx, s.cfg.ReservationTTL)
+		if err != nil {
+			deleteErrs.add(fmt.Errorf("sweep: expired pack reservations: %w", err))
+		} else {
+			report.ReservationsExpired = n
+			if n > 0 {
+				s.logger.Info("orphan pack sweep: pruned expired pack reservations", "count", n)
+			}
+		}
 	}
 	// Stream packs/ page-wise and classify each object with a point
 	// registry read (PackRegistry.HasPack): both the blob population and a
@@ -185,7 +243,7 @@ func (s *Sweeper) Sweep(ctx context.Context) (SweepReport, error) {
 				s.logger.Warn("orphan pack sweep: skipping foreign key under packs/", "key", obj.Key)
 				continue
 			}
-			if err := s.classify(ctx, repo, obj, deleteMode, &report, &deleteErrs); err != nil {
+			if err := s.classify(ctx, repo, obj, deleteMode, supersededMode, &report, &deleteErrs); err != nil {
 				return err
 			}
 		}
@@ -199,7 +257,11 @@ func (s *Sweeper) Sweep(ctx context.Context) (SweepReport, error) {
 		"live", report.Live, "fresh", report.Fresh,
 		"orphans", report.OrphanCount, "orphan_bytes", report.OrphanBytes,
 		"deleted", report.Deleted, "bytes_reclaimed", report.BytesReclaimed,
-		"delete_enabled", s.cfg.Delete, "threshold", s.cfg.Threshold,
+		"superseded_deleted", report.SupersededDeleted,
+		"retained_bytes_reclaimed", report.RetainedBytesReclaimed,
+		"reservations_expired", report.ReservationsExpired,
+		"delete_enabled", s.cfg.Delete, "delete_superseded", s.cfg.DeleteSuperseded,
+		"threshold", s.cfg.Threshold,
 		"duration", s.now().Sub(start).Round(time.Millisecond))
 	return report, deleteErrs.join()
 }
@@ -263,10 +325,13 @@ func (s *Sweeper) quarantinePurgeAge() time.Duration {
 }
 
 // classify handles one listed pack blob: a point registry read, then the
-// age-threshold diff, then (delete mode only) the revalidate + quarantine
-// handshake. Registry errors abort the sweep (they would misclassify the
-// object); disposal errors accumulate into deleteErrs.
-func (s *Sweeper) classify(ctx context.Context, repo string, obj blob.ListedObject, deleteMode bool, report *SweepReport, deleteErrs *boundedErrs) error {
+// age-threshold diff, then (when some destructive mode covers the object's
+// class) the revalidate + quarantine handshake. General orphans need
+// deleteMode; retained superseded blobs (a durable pack_retained record
+// written by the fold's own transaction, issue #31) are reaped under
+// supersededMode too. Registry errors abort the sweep (they would
+// misclassify the object); disposal errors accumulate into deleteErrs.
+func (s *Sweeper) classify(ctx context.Context, repo string, obj blob.ListedObject, deleteMode, supersededMode bool, report *SweepReport, deleteErrs *boundedErrs) error {
 	registered, err := s.packs.HasPack(ctx, repo, obj.Key)
 	if err != nil {
 		return fmt.Errorf("has pack %s: %w", obj.Key, err)
@@ -293,8 +358,20 @@ func (s *Sweeper) classify(ctx context.Context, repo string, obj blob.ListedObje
 	report.OrphanBytes += obj.Size
 	s.logger.Info("orphan pack candidate",
 		"key", obj.Key, "size_bytes", obj.Size, "age", age.Round(time.Second),
-		"delete_enabled", deleteMode)
-	if !deleteMode {
+		"delete_enabled", deleteMode, "delete_superseded", supersededMode)
+	// Deletion coverage: general delete mode reaps every aged candidate;
+	// superseded mode alone reaps only keys with a retained record (one
+	// extra point read per aged candidate, same shape as HasPack).
+	canDelete := deleteMode
+	if !canDelete && supersededMode {
+		retained, err := s.packs.IsRetainedPack(ctx, repo, obj.Key)
+		if err != nil {
+			deleteErrs.add(fmt.Errorf("is retained %s: %w", obj.Key, err))
+			return nil
+		}
+		canDelete = retained
+	}
+	if !canDelete {
 		return nil
 	}
 	stillOrphan, err := s.revalidateOrphan(ctx, repo, obj.Key)
@@ -312,6 +389,20 @@ func (s *Sweeper) classify(ctx context.Context, repo string, obj blob.ListedObje
 	}
 	if reaped {
 		report.Deleted++
+		// The blob just left the pack prefix: return its retained bytes to
+		// the repo's quota headroom (issue #31). Idempotent and class-safe
+		// — a general orphan simply has no retained row (reclaims 0). A
+		// crash between the delete above and this reclaim is healed by
+		// healQuarantineEntry's original-absent reclaim next sweep.
+		bytes, err := s.packs.ReclaimRetainedPack(ctx, repo, obj.Key)
+		if err != nil {
+			deleteErrs.add(fmt.Errorf("reclaim retained %s: %w", obj.Key, err))
+			return nil
+		}
+		if bytes > 0 {
+			report.SupersededDeleted++
+			report.RetainedBytesReclaimed += bytes
+		}
 	}
 	return nil
 }
@@ -547,6 +638,25 @@ func (s *Sweeper) healQuarantineEntry(ctx context.Context, q blob.ListedObject, 
 		} else if err != nil {
 			return fmt.Errorf("sweep: heal %s: stat: %w", orig, err)
 		}
+	} else if _, err := s.blobs.Stat(ctx, orig); errors.Is(err, blob.ErrNotFound) {
+		// Crash self-heal for the reap ledger (issue #31): a safeDelete
+		// that died between its blob delete and its ReclaimRetainedPack
+		// left the retained row (and its quota bytes) behind. The original
+		// is unregistered AND gone from the prefix, so the bytes have
+		// truly left — finish the reclaim now. Idempotent: a completed
+		// reap already removed the row (reclaims 0), and a concurrent
+		// identical re-push that re-registers the key afterwards credits
+		// its bytes freshly, netting zero.
+		bytes, rerr := s.packs.ReclaimRetainedPack(ctx, repo, orig)
+		if rerr != nil {
+			return fmt.Errorf("sweep: heal %s: reclaim retained: %w", orig, rerr)
+		}
+		if bytes > 0 {
+			report.RetainedBytesReclaimed += bytes
+			s.logger.Warn("orphan pack sweep: reclaimed retained bytes for interrupted reap", "key", orig, "bytes", bytes)
+		}
+	} else if err != nil {
+		return fmt.Errorf("sweep: heal %s: stat: %w", orig, err)
 	}
 	// Purge strictly by age: quarantine entries are write-once (see
 	// quarantineKey), so an aged listing ModTime is immutable proof the

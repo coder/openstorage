@@ -68,12 +68,27 @@ package ref
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 )
+
+// NewReservationOwner mints the random owner token scoping one writer's
+// reservations: ReleasePackReservations is owner-scoped so a stale writer's
+// failure cleanup can never free a reservation a concurrent identical push
+// (or a retry) re-acquired for the same key.
+func NewReservationOwner() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		panic(fmt.Sprintf("ref assertion failed: reservation owner entropy: %v", err))
+	}
+	return hex.EncodeToString(b[:])
+}
 
 // ReserveDecision reports one admission decision. UsedBytes and
 // ReservedBytes carry the arithmetic the caller folds into its denial

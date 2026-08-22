@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 
 	"codestorage/internal/auth"
 	"codestorage/internal/blob"
@@ -75,6 +76,12 @@ type Config struct {
 	// same packs/ prefix and must not bypass it. <= 0 disables enforcement.
 	// The serve command plumbs it from CODESTORAGE_PACK_QUOTA_BYTES.
 	PackQuotaBytes int64
+
+	// PackReservationTTL bounds how long a crashed writer's quota
+	// reservation gates admission (issue #29, ref/ledger.go). <= 0 falls
+	// back to a safe one-hour default. The serve command plumbs it from
+	// CODESTORAGE_PACK_RESERVATION_TTL.
+	PackReservationTTL time.Duration
 }
 
 // New builds the full HTTP handler: recover -> request log -> router, with
@@ -97,14 +104,15 @@ func New(cfg Config) (http.Handler, error) {
 	}
 
 	s := &server{
-		store:          cfg.Store,
-		httpBaseURL:    strings.TrimRight(cfg.HTTPBaseURL, "/"),
-		logger:         logger,
-		refStore:       cfg.RefStore,
-		blobStore:      cfg.BlobStore,
-		cacheDir:       cfg.CacheDir,
-		maybeRepack:    cfg.MaybeRepack,
-		packQuotaBytes: cfg.PackQuotaBytes,
+		store:              cfg.Store,
+		httpBaseURL:        strings.TrimRight(cfg.HTTPBaseURL, "/"),
+		logger:             logger,
+		refStore:           cfg.RefStore,
+		blobStore:          cfg.BlobStore,
+		cacheDir:           cfg.CacheDir,
+		maybeRepack:        cfg.MaybeRepack,
+		packQuotaBytes:     cfg.PackQuotaBytes,
+		packReservationTTL: cfg.PackReservationTTL,
 	}
 
 	// Phase-5 eventing/sync surface (docs/07 p5): the syncServer extends

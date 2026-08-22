@@ -280,10 +280,26 @@ func TestSweep_ThresholdBoundary(t *testing.T) {
 	}
 }
 
+// stubLedger supplies no-op quota-ledger methods for PackRegistry fakes
+// that only script HasPack behavior (the real ledger paths are covered by
+// the fixtures running over an actual ref.Store).
+type stubLedger struct{}
+
+func (stubLedger) IsRetainedPack(context.Context, string, string) (bool, error) {
+	return false, nil
+}
+func (stubLedger) ReclaimRetainedPack(context.Context, string, string) (int64, error) {
+	return 0, nil
+}
+func (stubLedger) SweepExpiredPackReservations(context.Context, time.Duration) (int64, error) {
+	return 0, nil
+}
+
 // registeredMidSweep reports unregistered on the first HasPack call and
 // registered afterwards, simulating a pack whose RegisterPacks commits
 // between the sweep's classification read and its delete.
 type registeredMidSweep struct {
+	stubLedger
 	calls int
 }
 
@@ -325,6 +341,7 @@ func TestSweep_DeleteSkipsPackRegisteredMidSweep(t *testing.T) {
 // the Nth HasPack call, simulating a RegisterPacks landing at a chosen
 // point in the sweep.
 type registeredAfterCall struct {
+	stubLedger
 	after int
 	calls int
 }
@@ -657,7 +674,7 @@ func TestSweep_PurgeEnforcesFloorUnderTinyThreshold(t *testing.T) {
 }
 
 // failingRegistry fails every HasPack, simulating a registry outage.
-type failingRegistry struct{}
+type failingRegistry struct{ stubLedger }
 
 func (failingRegistry) HasPack(context.Context, string, string) (bool, error) {
 	return false, errors.New("simulated registry outage")
@@ -876,6 +893,7 @@ func TestSweep_AmbiguousDeleteRestoresFromQuarantine(t *testing.T) {
 // failRecheck serves the classification and revalidation HasPack reads,
 // then fails the post-delete recheck (call 3) with a transient error.
 type failRecheck struct {
+	stubLedger
 	calls int
 }
 

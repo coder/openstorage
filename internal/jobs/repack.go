@@ -264,7 +264,16 @@ func (r *Repacker) Repack(ctx context.Context, repo string) (folded bool, err er
 	if err != nil {
 		return false, fmt.Errorf("repack %s: %w", repo, err)
 	}
-	newPack := ref.Pack{ID: id, Key: blob.PackKey(repo, id)}
+	fi, err := os.Stat(packPath)
+	if err != nil {
+		return false, fmt.Errorf("repack %s: stat consolidated pack: %w", repo, err)
+	}
+	assertf(fi.Size() > 0, "repack %s: empty consolidated pack %s", repo, packPath)
+	// Size feeds ReplacePacks' usage-counter credit (issue #31): the
+	// consolidated blob is NEW prefix bytes on top of the lingering
+	// superseded ones, so an at-quota repo shows the fold's cost until the
+	// sweeper reclaims the retained blobs.
+	newPack := ref.Pack{ID: id, Key: blob.PackKey(repo, id), Size: fi.Size()}
 
 	// Publish-before-flip: the blob must be durable before ReplacePacks can
 	// commit a row referencing it. A crash after this upload strands only
@@ -506,6 +515,10 @@ func (r *Repacker) selectFoldInput(ctx context.Context, repo string, rows []ref.
 	fold = make([]ref.Pack, len(sel))
 	for i, c := range sel {
 		fold[i] = c.pack
+		// The candidate's point-Stat size feeds ReplacePacks' retained-byte
+		// ledger (issue #31): superseded blobs linger under packs/ until a
+		// sweep reclaims exactly these bytes from the usage counter.
+		fold[i].Size = c.bytes
 	}
 	return repoPath, fold, nil
 }

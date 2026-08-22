@@ -42,6 +42,13 @@ const (
 	// bytes. Unset applies the generous default; "0" disables enforcement.
 	envPackQuota = "CODESTORAGE_PACK_QUOTA_BYTES"
 
+	// Reservation TTL for the quota's durable admission ledger (issue #29):
+	// how long a crashed writer's reservation keeps gating admission. Must
+	// comfortably exceed the longest plausible server-side pack upload —
+	// an expiring in-flight reservation reopens the overshoot the ledger
+	// closes. Unset applies the one-hour default; must be positive.
+	envPackReservationTTL = "CODESTORAGE_PACK_RESERVATION_TTL"
+
 	// Orphan-pack sweep (issue #5): interval between sweeps ("0" disables
 	// sweeping), minimum blob age before an unregistered pack counts as an
 	// orphan, and the explicit opt-in for actually deleting candidates
@@ -57,6 +64,14 @@ const (
 	envSweepInterval      = "CODESTORAGE_SWEEP_INTERVAL"
 	envSweepAgeThreshold  = "CODESTORAGE_SWEEP_AGE_THRESHOLD"
 	envSweepDeleteEnabled = "CODESTORAGE_SWEEP_DELETE_ENABLED"
+
+	// Narrow superseded-class deletion (issue #31): reap aged blobs whose
+	// registry rows a repack fold provably removed (durable pack_retained
+	// records), even while general orphan deletion stays list-only. ON by
+	// default — set "false" to disable. On S3 it degrades to list-only per
+	// run when the bucket is versioned (the DeleteGuard), rather than
+	// failing startup like the explicit general delete opt-in.
+	envSweepDeleteSuperseded = "CODESTORAGE_SWEEP_DELETE_SUPERSEDED"
 
 	// Background repack (issue #1): registered-pack count at which a
 	// post-write trigger schedules a fold ("0" disables triggering).
@@ -75,6 +90,10 @@ const (
 	// while still bounding the packs/ growth a single repo-scoped
 	// git:write token can inflict (issue #21).
 	defaultPackQuotaBytes = int64(10) << 30
+
+	// defaultPackReservationTTL clears a default-quota-sized (10 GiB)
+	// upload at ~3 MB/s before a live reservation can expire (issue #29).
+	defaultPackReservationTTL = time.Hour
 )
 
 // envFirst returns the first non-empty value among names. getenv is injected
@@ -132,6 +151,10 @@ type serveConfig struct {
 	// (issue #21); 0 disables enforcement.
 	packQuotaBytes int64
 
+	// packReservationTTL bounds how long a crashed writer's quota
+	// reservation gates admission (issue #29); always positive.
+	packReservationTTL time.Duration
+
 	// sweep configures the periodic orphan-pack sweep (issue #5).
 	sweep sweepSettings
 
@@ -143,9 +166,10 @@ type serveConfig struct {
 
 // sweepSettings is the resolved orphan-pack sweep configuration.
 type sweepSettings struct {
-	interval      time.Duration // 0 = sweeping disabled
-	ageThreshold  time.Duration // > 0
-	deleteEnabled bool          // false = list-only (the default)
+	interval         time.Duration // 0 = sweeping disabled
+	ageThreshold     time.Duration // > 0
+	deleteEnabled    bool          // false = list-only (the default)
+	deleteSuperseded bool          // true = reap provably-folded blobs (the default, issue #31)
 }
 
 // storageURLs is the resolved storage location set shared by every
@@ -247,6 +271,10 @@ func resolveServeConfig(getenv func(string) string, flagListen, flagAddr, flagCa
 		return serveConfig{}, err
 	}
 	cfg.packQuotaBytes, err = resolvePackQuota(getenv)
+	if err != nil {
+		return serveConfig{}, err
+	}
+	cfg.packReservationTTL, err = resolvePackReservationTTL(getenv)
 	if err != nil {
 		return serveConfig{}, err
 	}
@@ -378,13 +406,35 @@ func resolvePackQuota(getenv func(string) string) (int64, error) {
 	return v, nil
 }
 
+// resolvePackReservationTTL parses CODESTORAGE_PACK_RESERVATION_TTL
+// (issue #29). Fail-fast: malformed or non-positive values error naming the
+// env var (a zero TTL would expire live reservations instantly, silently
+// reopening the overshoot). Unset applies the one-hour default.
+func resolvePackReservationTTL(getenv func(string) string) (time.Duration, error) {
+	assertf(getenv != nil, "resolvePackReservationTTL: nil getenv")
+	raw := getenv(envPackReservationTTL)
+	if raw == "" {
+		return defaultPackReservationTTL, nil
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		return 0, fmt.Errorf("%s: %w", envPackReservationTTL, err)
+	}
+	if d <= 0 {
+		return 0, fmt.Errorf("%s must be positive, got %q", envPackReservationTTL, raw)
+	}
+	return d, nil
+}
+
 // resolveSweepSettings parses the orphan-pack sweep env vars. Fail-fast
 // semantics matching resolveRateLimit: malformed or negative values error
-// naming the env var. Defaults: sweep hourly, 24h age threshold, list-only.
-// CODESTORAGE_SWEEP_INTERVAL=0 disables sweeping entirely.
+// naming the env var. Defaults: sweep hourly, 24h age threshold, list-only
+// for general orphans, delete-enabled for the provably-folded superseded
+// class (issue #31). CODESTORAGE_SWEEP_INTERVAL=0 disables sweeping
+// entirely.
 func resolveSweepSettings(getenv func(string) string) (sweepSettings, error) {
 	assertf(getenv != nil, "resolveSweepSettings: nil getenv")
-	s := sweepSettings{interval: defaultSweepInterval, ageThreshold: defaultSweepAgeThreshold}
+	s := sweepSettings{interval: defaultSweepInterval, ageThreshold: defaultSweepAgeThreshold, deleteSuperseded: true}
 	if raw := getenv(envSweepInterval); raw != "" {
 		d, err := time.ParseDuration(raw)
 		if err != nil {
@@ -411,6 +461,13 @@ func resolveSweepSettings(getenv func(string) string) (sweepSettings, error) {
 			return sweepSettings{}, fmt.Errorf("%s: %w", envSweepDeleteEnabled, err)
 		}
 		s.deleteEnabled = v
+	}
+	if raw := getenv(envSweepDeleteSuperseded); raw != "" {
+		v, err := strconv.ParseBool(raw)
+		if err != nil {
+			return sweepSettings{}, fmt.Errorf("%s: %w", envSweepDeleteSuperseded, err)
+		}
+		s.deleteSuperseded = v
 	}
 	return s, nil
 }
