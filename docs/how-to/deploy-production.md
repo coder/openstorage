@@ -188,8 +188,13 @@ forward plain HTTP to the replicas. Then:
   able to reach this URL** through the proxy (resolvable and hairpinnable from the
   replica network), or `pull-upstream` syncs fail.
 - Both the REST API and git smart-HTTP (clone/push, LFS *batch*) ride the same
-  listener — proxy everything, and allow large streaming request/response bodies (pushes
-  and archive downloads are unbounded).
+  listener — proxy everything. Response bodies (clones, archives) can be very large;
+  stream rather than buffer them. Request bodies need a **generous but bounded** cap set
+  to the largest push you intend to accept: the server currently has no ingress byte
+  bound of its own, and the pack quota runs only *after* a push is fully streamed to
+  local disk ([#55](https://github.com/coder/code-storage/issues/55)) — so the proxy's
+  body cap (plus aligned duration and concurrency limits) is the effective pre-storage
+  bound against resource-exhaustion pushes.
 - **LFS object transfers bypass the proxy on S3/MinIO**: the batch API hands clients
   presigned bucket URLs whenever the backend can sign (the server-proxied transfer is
   only the fallback for backends that cannot, i.e. local file mode). Git LFS clients
