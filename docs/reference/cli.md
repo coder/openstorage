@@ -107,11 +107,12 @@ otherwise the database env URL is used).
 
 `--key` (required) points at either a single SSH public key line
 (`<type> <base64> [comment]`; types `ssh-ed25519`, `ssh-rsa`, `ecdsa-sha2-nistp256/384/521`
-and their `sk-` FIDO variants) or an ASCII-armored PGP public key block. SSH keys are
-validated on add (type allow-list, base64, wire-format type echo); PGP blocks are checked
-only for the armor framing — corrupt contents between the markers surface later, at
-`verify-sig` push time, where one bad registry entry can block protected pushes until it is
-removed. The hook trusts registry contents verbatim.
+and their `sk-` FIDO variants) or an ASCII-armored PGP public key block. Validation on add
+checks framing only, not full key material: for SSH lines the type allow-list, base64
+decodability, and the wire-format type echo (a truncated key payload still passes); for
+PGP blocks just the armor header/footer. Bad key material surfaces later, at `verify-sig`
+push time, where one bad registry entry can block protected pushes until it is removed —
+so verify a signed push after adding a key. The hook trusts registry contents verbatim.
 
 ### `signing-key list`
 
