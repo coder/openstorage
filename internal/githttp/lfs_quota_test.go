@@ -731,27 +731,23 @@ func TestLFSQuota_RetryAfterFailedPutNotDoubleCounted(t *testing.T) {
 	}
 }
 
-// TestLFSAdoption_VerificationMetersOneChunk (Codex rounds 24+25):
+// TestLFSAdoption_VerificationBuffersAreBudgeted (Codex rounds 24–26):
 // legacy-blob verification streams ranged reads through the hasher — no
-// disk staging — but its per-read MEMORY buffer is metered against the
-// staging budget at its true upper bound, one lfsStagingChunk (round 25:
-// op slots alone would let 256 concurrent adoptions hold ~2 GiB of
-// unmetered heap). An object far larger than the budget still adopts as
-// long as ONE CHUNK fits (round 24's guarantee, now chunk-shaped), and a
-// budget that cannot hold even one chunk denies transiently instead of
-// buffering unmetered.
-func TestLFSAdoption_VerificationMetersOneChunk(t *testing.T) {
-	oldChunk := lfsStagingChunk
-	lfsStagingChunk = 16
-	t.Cleanup(func() { lfsStagingChunk = oldChunk })
-
-	legacy := []byte("a legacy object far larger than one sixteen-byte chunk")
+// disk staging, no disk-budget charge at all (round 24's guarantee in
+// full: adoption works under ANY LFSStagingBytes) — while its per-read
+// HEAP buffer is bounded by a dedicated memory-sized slot pool
+// (lfsMaxVerifyBuffers × lfsStagingChunk; round 26: charging the
+// disk-sized budget still admitted ~2 GiB of concurrent buffers). With
+// every slot taken, adoption denies transiently instead of buffering
+// unbounded heap.
+func TestLFSAdoption_VerificationBuffersAreBudgeted(t *testing.T) {
+	legacy := []byte("a legacy object bigger than any disk staging budget")
 	oid := sha256Hex(legacy)
 	key := blob.LFSKey(lfsTestRepoID, oid)
 
-	t.Run("chunk-fits-full-size-need-not", func(t *testing.T) {
+	t.Run("adopts-under-any-disk-budget", func(t *testing.T) {
 		srv, st, mint := newLFSQuotaServer(t, 0, time.Hour)
-		srv.LFSStagingBytes = 20 // ≥ one chunk (16), far below the object (55)
+		srv.LFSStagingBytes = 1 // pathological disk budget: verification needs none of it
 		tok := mint(auth.ScopeGitWrite)
 		if err := srv.Blob.UploadFile(context.Background(), key, writeTempFile(t, legacy)); err != nil {
 			t.Fatal(err)
@@ -759,7 +755,7 @@ func TestLFSAdoption_VerificationMetersOneChunk(t *testing.T) {
 		resp := decodeBatch(t, doLFS(t, srv, http.MethodPost, lfsBatchPath, "basic:"+tok,
 			batchBody("upload", oid, int64(len(legacy)))))
 		if resp.Objects[0].Error != nil {
-			t.Fatalf("adoption failed with one chunk of budget: %+v", resp.Objects[0].Error)
+			t.Fatalf("adoption failed under a tiny disk budget: %+v", resp.Objects[0].Error)
 		}
 		if resp.Objects[0].Actions != nil {
 			t.Fatalf("adopted object still got an upload action: %+v", resp.Objects[0])
@@ -769,17 +765,24 @@ func TestLFSAdoption_VerificationMetersOneChunk(t *testing.T) {
 		}
 	})
 
-	t.Run("chunk-does-not-fit-denies-transiently", func(t *testing.T) {
+	t.Run("slots-exhausted-denies-transiently", func(t *testing.T) {
 		srv, _, mint := newLFSQuotaServer(t, 0, time.Hour)
-		srv.LFSStagingBytes = 8 // below one chunk: the buffer must not go unmetered
 		tok := mint(auth.ScopeGitWrite)
 		if err := srv.Blob.UploadFile(context.Background(), key, writeTempFile(t, legacy)); err != nil {
 			t.Fatal(err)
 		}
+		for range lfsMaxVerifyBuffers { // every buffer slot held elsewhere
+			lfsVerifyBuffers <- struct{}{}
+		}
+		t.Cleanup(func() {
+			for range lfsMaxVerifyBuffers {
+				<-lfsVerifyBuffers
+			}
+		})
 		resp := decodeBatch(t, doLFS(t, srv, http.MethodPost, lfsBatchPath, "basic:"+tok,
 			batchBody("upload", oid, int64(len(legacy)))))
 		if resp.Objects[0].Error == nil || resp.Objects[0].Error.Code != http.StatusTooManyRequests {
-			t.Fatalf("under-chunk budget did not deny transiently: %+v", resp.Objects[0])
+			t.Fatalf("slot-exhausted verification did not deny transiently: %+v", resp.Objects[0])
 		}
 	})
 }
@@ -893,6 +896,56 @@ func TestLFSStaging_DripperCannotPinBudget(t *testing.T) {
 
 	pw.CloseWithError(io.ErrClosedPipe) // abort the dripper
 	<-done
+}
+
+// twinWinsStore simulates a concurrent identical upload on another replica
+// winning DURING this handler's body copy: right after the first
+// HasLFSObject read for the target key (the PUT's pre-body check), it
+// registers the key in the underlying store.
+type twinWinsStore struct {
+	ref.Store
+	key   string
+	size  int64
+	calls int
+}
+
+func (s *twinWinsStore) HasLFSObject(ctx context.Context, repo, key string) (bool, error) {
+	has, err := s.Store.HasLFSObject(ctx, repo, key)
+	if err == nil && key == s.key {
+		s.calls++
+		if s.calls == 1 {
+			if rerr := s.Store.RegisterLFSObject(ctx, repo, key, s.size); rerr != nil {
+				return false, rerr
+			}
+		}
+	}
+	return has, err
+}
+
+// TestLFSPut_TwinRegistrationDuringBodyIsZeroGrowth (Codex round 26): the
+// pre-body registered flag goes stale when a concurrent identical upload
+// registers the OID while this handler receives the body. The post-body
+// admission must re-read the registry and skip the reservation — the
+// upload is zero-growth now, and charging n as new growth 507s a push
+// whose object is already durably stored, purely because the twin won.
+func TestLFSPut_TwinRegistrationDuringBodyIsZeroGrowth(t *testing.T) {
+	srv, st, mint := newLFSQuotaServer(t, 100, time.Hour)
+	tok := mint(auth.ScopeGitWrite)
+	content := bytes.Repeat([]byte("t"), 90)
+	oid := sha256Hex(content)
+	key := blob.LFSKey(lfsTestRepoID, oid)
+	srv.Store = &twinWinsStore{Store: st, key: key, size: 90}
+
+	w := doLFS(t, srv, http.MethodPut, "/"+lfsTestRepoURL+".git/info/lfs/objects/"+oid,
+		"basic:"+tok, string(content))
+	if w.Code != http.StatusOK {
+		t.Fatalf("twin-raced PUT status = %d, body %s (stale registered flag double-charged?)", w.Code, w.Body)
+	}
+	// The twin's 90 bytes are the only charge: no reservation left behind,
+	// no double credit.
+	if ls := ledgerState(t, st, time.Hour); ls.UsageBytes != 90 || ls.ReservedBytes != 0 {
+		t.Fatalf("ledger after twin race = %+v, want usage=90 reserved=0", ls)
+	}
 }
 
 // statCountingBlob counts Stat calls (the PUT dedup probe).

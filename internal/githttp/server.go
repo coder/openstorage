@@ -165,6 +165,16 @@ var lfsProbeTimeout = time.Minute
 // deadlines still bound the duration.
 var lfsStagingChunk = int64(8 << 20)
 
+// lfsMaxVerifyBuffers caps concurrent legacy-verification buffer slots
+// node-wide (Codex round 26, security): each in-flight verification holds
+// one lfsStagingChunk-sized ReadRange slice in HEAP, a resource the
+// disk-sized staging budget cannot meaningfully meter. 32 slots bound
+// verification memory at ~256 MiB with the default 8 MiB chunk.
+const lfsMaxVerifyBuffers = 32
+
+// lfsVerifyBuffers is the slot pool behind lfsMaxVerifyBuffers.
+var lfsVerifyBuffers = make(chan struct{}, lfsMaxVerifyBuffers)
+
 // growLFSStaging adds n bytes to an existing staging reservation whose op
 // slot is already held; the caller releases the grown total through one
 // releaseLFSStaging call.
@@ -179,19 +189,6 @@ func (s *Server) growLFSStaging(n int64) bool {
 		s.lfsStagingInFlight += n
 	}
 	return true
-}
-
-// shrinkLFSStaging returns bytes grown via growLFSStaging without ending
-// the operation (the op slot stays held; one releaseLFSStaging still ends
-// it).
-func (s *Server) shrinkLFSStaging(n int64) {
-	assertf(n > 0, "shrinkLFSStaging(%d)", n)
-	s.lfsStagingMu.Lock()
-	defer s.lfsStagingMu.Unlock()
-	if s.LFSStagingBytes > 0 {
-		s.lfsStagingInFlight -= n
-		assertf(s.lfsStagingInFlight >= 0, "shrinkLFSStaging(%d): in-flight went negative", n)
-	}
 }
 
 // releaseLFSStaging returns a reserveLFSStaging reservation.

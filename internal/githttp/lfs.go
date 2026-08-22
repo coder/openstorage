@@ -686,17 +686,19 @@ func (s *Server) verifyStoredLFSObject(ctx context.Context, key, oid string) (in
 	if err != nil {
 		return 0, fmt.Errorf("stat for verification: %w", err)
 	}
-	// The ranged reads below buffer up to one chunk in MEMORY, and the op
-	// slots alone would let 256 concurrent adoptions hold ~2 GiB of
-	// unmetered heap (Codex round 25, security). Charge the buffer's true
-	// upper bound — one chunk, or the whole object when smaller — against
-	// the staging budget for the verification's lifetime: memory spent on
-	// behalf of clients is metered by the same budget as disk.
-	if buf := min(lfsStagingChunk, size); buf > 0 {
-		if !s.growLFSStaging(buf) {
-			return 0, errLFSBusy
-		}
-		defer s.shrinkLFSStaging(buf)
+	// The ranged reads below buffer up to one chunk in MEMORY, so the
+	// bound must be memory-sized (Codex round 26, security, refining
+	// round 25): the op slots alone admit 256 concurrent 8 MiB buffers
+	// (~2 GiB of heap), and charging the DISK-sized staging budget — 10
+	// GiB by default — still admits nearly all of them. A dedicated slot
+	// pool caps concurrent verification buffers at lfsMaxVerifyBuffers ×
+	// lfsStagingChunk (~256 MiB); excess adoptions deny transiently like
+	// every budget denial (the client retries, the object is unchanged).
+	select {
+	case lfsVerifyBuffers <- struct{}{}:
+		defer func() { <-lfsVerifyBuffers }()
+	default:
+		return 0, errLFSBusy
 	}
 	h := sha256.New()
 	for off := int64(0); off < size; {
@@ -1084,6 +1086,25 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target r
 	// exists the deadline is measured from a conservative point strictly
 	// before the row's created_at.
 	pubAnchor := time.Now()
+	if s.PackQuotaBytes > 0 && n > 0 && !registered {
+		// The pre-body registered flag can go STALE during the body copy
+		// (Codex round 26): a concurrent identical upload on another
+		// replica can publish and register this OID meanwhile, making
+		// this upload zero-growth — charging n as new growth would 507 a
+		// push whose object is already durably stored, purely because the
+		// twin won. Re-read the registry after verification, immediately
+		// before admission, and skip the reservation when the key is now
+		// registered (registration is terminal for a key, so this read
+		// cannot go stale in the dangerous direction; the reverse race —
+		// registered row losing its blob — is the zero-growth repair
+		// path, whose republication needs no reservation either).
+		registered, err = s.Store.HasLFSObject(ctx, repoID, key)
+		if err != nil {
+			log.Printf("lfs registry %s: %v", key, err)
+			lfsError(w, http.StatusInternalServerError, "object registry unavailable")
+			return
+		}
+	}
 	if s.PackQuotaBytes > 0 && n > 0 && !registered {
 		floor, err := s.CachedUsageFloor(ctx, repoID)
 		if err != nil {
