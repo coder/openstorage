@@ -202,11 +202,19 @@ enabled stay readable and are transparently re-encrypted the next time they are 
 must not look like envelopes, the API rejects new webhook secrets and credential passwords
 starting with the reserved prefix `enc:` (HTTP 400) — in plaintext mode too.
 
-**Key rotation.** Prepend the new key and keep the old key listed:
+**Key rotation.** Rotation is staged so that no process ever encounters a key it cannot
+decrypt — the same replica-by-replica reasoning as the upgrade-ordering note below,
+because a rolling restart applies any new list one replica at a time:
 
-```sh
-CODESTORAGE_SECRETS_KEY="<new-key>,<old-key>"
-```
+1. **Stage the new key fleet-wide, decrypt-only:** `CODESTORAGE_SECRETS_KEY="<old-key>,<new-key>"`.
+   Writes still use the old key, but every restarted process can already decrypt both, so
+   ordering within the rollout does not matter.
+2. **Promote, fleet-wide:** `CODESTORAGE_SECRETS_KEY="<new-key>,<old-key>"`. Replicas
+   restarted earlier keep decrypting new-key rows because step 1 listed it everywhere.
+3. **Rewrite and verify, then drop the old key** (below).
+
+A single-replica deployment (local mode) can skip step 1 — one restart swaps the whole
+list atomically.
 
 Reads decrypt with whichever listed key wrote the row and re-encrypt it under the new
 active key. To force full re-encryption instead of waiting for organic reads, touch every
