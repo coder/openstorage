@@ -44,7 +44,10 @@ from the standard AWS chain (env vars, shared config, instance roles).
 - **Bucket permissions for the replica role.** With default settings the role needs all
   of:
   - object read/write/list (`s3:GetObject`, `s3:PutObject`, `s3:ListBucket`) — serving,
-    LFS, sweeping's listings, and quarantine copies;
+    LFS, sweeping's listings, and quarantine copies — plus `s3:AbortMultipartUpload`:
+    large copies are multipart, and a failed copy's abort is best-effort, so without the
+    permission (and ideally an `AbortIncompleteMultipartUpload` bucket lifecycle rule)
+    incomplete multipart uploads linger stored and billed;
   - `s3:DeleteObject` — the sweeper's destructive modes, one of which (superseded
     reaping) is **on by default**. Without it the service starts fine, but every reap
     fails after writing its quarantine copy, and retained packs stay quota-counted

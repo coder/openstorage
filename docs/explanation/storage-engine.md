@@ -99,8 +99,9 @@ max(usage counter, blob-listing floor) + active reservations + incoming ≤ quot
   reachability. (Bucket-wide consumption falls a step later still: a reaped blob leaves
   an equal-sized quarantine backup outside the pack prefixes until the purge window
   passes.)
-- **Namespaces roll up.** `+ephemeral` and `+import` namespaces of a repository share the
-  base repository's packs prefix and therefore its quota.
+- **Namespaces roll up.** `+ephemeral` / `+import` pushes store packs under sibling
+  prefixes (`packs/<repo>+ephemeral/…`), not the base prefix — but quota admission lists
+  base and namespace prefixes together and charges them all against the base repository.
 
 Repack is deliberately not admission-gated: it replaces rows rather than growing the
 registered set, and gating it would deadlock exactly the at-quota repositories that need

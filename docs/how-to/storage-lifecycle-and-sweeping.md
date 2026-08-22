@@ -39,7 +39,10 @@ codestorage list-packs --repo repo_01k5abc...   # takes the server-generated Rep
 ```
 
 `--repo` takes the **RepoID** (`repo_...`, returned by repo creation and
-`GET /api/v1/repo`), *not* the repository name. The command reads
+`GET /api/v1/repo`), *not* the repository name. Namespace pushes store under sibling
+prefixes — list them by suffixing the key (`--repo repo_01k5abc...+ephemeral`); a
+quota denial's `stored` bytes cover the base **and** all namespace prefixes. The command
+reads
 `CODESTORAGE_S3_URL`/`CODESTORAGE_PG_URL` (or `--data-dir` in local mode) from the
 environment — see the [CLI reference](../reference/cli.md#codestorage-list-packs).
 
