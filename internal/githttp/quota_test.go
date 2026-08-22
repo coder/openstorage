@@ -37,6 +37,17 @@ func seedPack(t *testing.T, bl blob.BlobStore, repo, id string, size int) {
 	}
 }
 
+func seedLFS(t *testing.T, bl blob.BlobStore, repoID, oid string, size int) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "seed.lfs")
+	if err := os.WriteFile(path, make([]byte, size), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := bl.UploadFile(context.Background(), blob.LFSKey(repoID, oid), path); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func openTestBlob(t *testing.T) blob.BlobStore {
 	t.Helper()
 	bl, err := blob.Open(context.Background(), "file://"+t.TempDir())
@@ -108,16 +119,16 @@ func TestPackUsageCacheBoundsListings(t *testing.T) {
 			t.Fatalf("cached peek %d: (%d, %v), want (10, true)", i, usage, ok)
 		}
 	}
-	// One refresh = two listings (base + namespace prefixes roll up).
-	if cb.lists.Load() != 2 {
-		t.Fatalf("cold+cached peeks cost %d listings, want 2", cb.lists.Load())
+	// One refresh = three listings (base + namespace + LFS prefixes roll up).
+	if cb.lists.Load() != 3 {
+		t.Fatalf("cold+cached peeks cost %d listings, want 3", cb.lists.Load())
 	}
 
-	// A different repo has its own entry (one more listing)...
+	// A different repo has its own entry (one more refresh)...
 	srv.peekUsage("repo_d")
 	awaitPeek(t, srv, "repo_d")
-	if cb.lists.Load() != 4 {
-		t.Fatalf("second repo cost %d total listings, want 4", cb.lists.Load())
+	if cb.lists.Load() != 6 {
+		t.Fatalf("second repo cost %d total listings, want 6", cb.lists.Load())
 	}
 
 	// ...and TTL expiry refreshes: the stale entry is re-listed, observing
@@ -132,8 +143,8 @@ func TestPackUsageCacheBoundsListings(t *testing.T) {
 	if got := awaitPeek(t, srv, "repo_c"); got != 15 {
 		t.Fatalf("post-TTL usage = %d, want 15", got)
 	}
-	if cb.lists.Load() != 6 {
-		t.Fatalf("post-TTL refresh cost %d total listings, want 6", cb.lists.Load())
+	if cb.lists.Load() != 9 {
+		t.Fatalf("post-TTL refresh cost %d total listings, want 9", cb.lists.Load())
 	}
 }
 
@@ -187,9 +198,10 @@ func TestPackUsageRefreshConcurrencyBounded(t *testing.T) {
 	if got := awaitPeek(t, srv, "repo_extra"); got != 0 {
 		t.Fatalf("refreshed usage = %d, want 0 (empty repo)", got)
 	}
-	// Each completed refresh lists twice (base + namespace prefixes).
-	if got := bb.calls.Load(); got != int64(slots+1)*2 {
-		t.Fatalf("total listings = %d, want %d", got, (slots+1)*2)
+	// Each completed refresh lists three times (base + namespace + LFS
+	// prefixes).
+	if got := bb.calls.Load(); got != int64(slots+1)*3 {
+		t.Fatalf("total listings = %d, want %d", got, (slots+1)*3)
 	}
 }
 
@@ -251,9 +263,10 @@ func TestPackUsageCacheCoalescesMisses(t *testing.T) {
 	if got := awaitPeek(t, srv, "repo_e"); got != 10 {
 		t.Fatalf("refreshed usage = %d, want 10", got)
 	}
-	// One coalesced refresh = two listings (base + namespace prefixes).
-	if got := cb.lists.Load(); got != 2 {
-		t.Fatalf("%d concurrent cold peeks cost %d listings, want 2", goroutines, got)
+	// One coalesced refresh = three listings (base + namespace + LFS
+	// prefixes).
+	if got := cb.lists.Load(); got != 3 {
+		t.Fatalf("%d concurrent cold peeks cost %d listings, want 3", goroutines, got)
 	}
 }
 
@@ -266,18 +279,22 @@ func TestStorageUsageBytes(t *testing.T) {
 	seedPack(t, bl, "repo_a+ephemeral", "4444", 1000)
 	seedPack(t, bl, "repo_a+import", "5555", 20)
 	seedPack(t, bl, "repo_b", "3333", 4000)
+	// LFS objects count too (issue #51): keyed under the base RepoID, so
+	// they roll up like namespace packs; another repo's LFS space does not.
+	seedLFS(t, bl, "repo_a", strings.Repeat("aa", 32), 7)
+	seedLFS(t, bl, "repo_b", strings.Repeat("bb", 32), 9000)
 
 	got, err := packUsageBytes(context.Background(), bl, "repo_a")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got != 1170 {
-		t.Fatalf("packUsageBytes(repo_a) = %d, want 1170 (base+namespaces)", got)
+	if got != 1177 {
+		t.Fatalf("packUsageBytes(repo_a) = %d, want 1177 (base+namespaces+lfs)", got)
 	}
 	// A namespaced key measures the same rolled-up usage.
 	got, err = packUsageBytes(context.Background(), bl, "repo_a+ephemeral")
-	if err != nil || got != 1170 {
-		t.Fatalf("packUsageBytes(repo_a+ephemeral) = (%d, %v), want (1170, nil)", got, err)
+	if err != nil || got != 1177 {
+		t.Fatalf("packUsageBytes(repo_a+ephemeral) = (%d, %v), want (1177, nil)", got, err)
 	}
 	// An empty prefix is zero usage, not an error.
 	got, err = packUsageBytes(context.Background(), bl, "repo_missing")
