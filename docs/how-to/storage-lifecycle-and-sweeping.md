@@ -26,9 +26,13 @@ Two more growth sources sit outside this lifecycle: **LFS objects** (stored unde
 own keys, never swept or repacked) and, on versioned S3 buckets, **old object versions**
 (the reason destructive sweeping [refuses versioned buckets](#s3-bucket-versioning)).
 
-Also note what does *not* reclaim space: deleting branches. Repack preserves the whole
-registered object set — unreachable objects are carried forward, by design
-([why](../explanation/storage-engine.md#why-repack-packs-the-union-not-reachable-objects)).
+Also note what does *not* reclaim space: **deleting branches** — repack preserves the
+whole registered object set, so unreachable objects are carried forward by design
+([why](../explanation/storage-engine.md#why-repack-packs-the-union-not-reachable-objects)) —
+and **deleting repositories**: `DELETE /repos` soft-deletes the metadata record (freeing
+the name), while the repository's pack registry rows and blobs stay put and the sweeper
+keeps counting them live. Reclaiming a deleted repository's storage is currently a
+manual operation.
 
 ## Inspect what a repository stores
 
@@ -47,8 +51,11 @@ reads
 environment — see the [CLI reference](../reference/cli.md#codestorage-list-packs).
 
 Fleet-wide, the periodic [sweep report](#reading-a-sweep-report) counts live vs. orphan
-blobs per run — but totals bytes for orphan candidates only. For live byte usage, use
-`list-packs` (above) or your blob-store metrics.
+blobs per run — but totals bytes for orphan candidates only. `list-packs` reports
+**physical** bytes under a repository's prefixes — live, retained, and orphan blobs
+alike, the same measure the quota's listing floor uses — without consulting the
+registry; no surface reports registry-live bytes on their own, so use blob-store metrics
+for fleet-wide capacity tracking.
 
 ## Background repack
 
