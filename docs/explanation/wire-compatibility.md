@@ -65,6 +65,7 @@ bool before the alias existed keeps `400`ing:
 | `DELETE /repos/branches` | `target_branch` | `name` |
 | `POST /repos/tags` | `ref` | `target` |
 | `POST /repos/merge` | `source_ref` | `source_branch` |
+| `POST /repos/grep` | `ref` | `rev` |
 | JWT claim | `refs` policy tuples | `ops` (deprecated repo-wide op list; merged into the `"*"` pattern's policy alongside any `refs` tuples) |
 
 Responses mirror the legacy names alongside the current ones where upstream does (e.g.

@@ -63,8 +63,13 @@ from the standard AWS chain (env vars, shared config, instance roles).
     probe).
 
 - Packs are immutable and content-addressed: the server only ever writes new keys and —
-  through the sweeper's destructive modes — deletes provably-unreferenced ones. Nothing
-  is overwritten in place.
+  through the sweeper's destructive modes — deletes provably-unreferenced ones. The bytes
+  under a key never change, but a key can be *re-PUT with identical content* (concurrent
+  replicas publishing the same pack race a non-atomic exists-check, by design) — harmless
+  on an unversioned bucket, while a versioned bucket accumulates billed noncurrent
+  versions invisible to usage listings and the sweeper. If you keep versioning (and
+  therefore report-only sweeps, below), add a noncurrent-version expiration lifecycle
+  rule.
 - **Decide on bucket versioning up front.** Destructive sweeping and versioning don't
   mix: deletes only write delete markers while every version stays stored and billed.
   The general-orphan delete opt-in
