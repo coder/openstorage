@@ -555,6 +555,20 @@ func (s *Server) adoptLFSObject(ctx context.Context, repoID, key, oid string, si
 	if err != nil || registered {
 		return err
 	}
+	// Fast-fail the object cap BEFORE the verification download (Codex
+	// security round 4): an at-cap repository holding a rowless legacy
+	// blob would otherwise pay a full download+hash on every write-scoped
+	// touch and then 507 in RegisterLFSObject anyway — a repeatable
+	// bandwidth/staging drain (a near-budget blob blocks the replica's
+	// unrelated uploads for the whole hash). O(1) counter read; advisory
+	// only — RegisterLFSObject's in-transaction check stays authoritative.
+	count, err := s.Store.CountLFSObjects(ctx, repoID)
+	if err != nil {
+		return err
+	}
+	if count >= ref.MaxLFSObjectsPerRepo {
+		return ref.ErrLFSObjectCapExceeded
+	}
 	// Legacy blobs were written through presigned PUTs that bound no
 	// digest, so existence does not prove content (Codex round 15).
 	// Hash the stored bytes once before adoption; a mismatch is provably

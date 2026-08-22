@@ -298,6 +298,16 @@ func (stubLedger) HasLFSObject(context.Context, string, string) (bool, error) {
 	return false, nil
 }
 
+// GuardedLFSDelete runs del directly and reports it executed: stub-based
+// tests inject races via HasLFSObject call counting, so the guard itself
+// stays transparent unless a test overrides it.
+func (stubLedger) GuardedLFSDelete(ctx context.Context, _, _ string, del func(context.Context) error) (bool, error) {
+	if err := del(ctx); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // registeredMidSweep reports unregistered on the first HasPack call and
 // registered afterwards, simulating a pack whose RegisterPacks commits
 // between the sweep's classification read and its delete.

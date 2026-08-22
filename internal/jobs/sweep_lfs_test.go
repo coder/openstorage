@@ -226,6 +226,57 @@ func lfsContentOID(content string) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// lfsGuardWins simulates a verified upload whose registration commits
+// between the sweep's quarantine copy and the guarded delete: the guard's
+// in-transaction re-read sees the row, never runs del, and reports
+// deleted=false.
+type lfsGuardWins struct {
+	stubLedger
+	guardCalls int
+}
+
+func (p *lfsGuardWins) HasPack(context.Context, string, string) (bool, error) { return false, nil }
+
+func (p *lfsGuardWins) GuardedLFSDelete(context.Context, string, string, func(context.Context) error) (bool, error) {
+	p.guardCalls++
+	return false, nil // registration won: del never executed
+}
+
+// TestSweepLFS_GuardedDeleteSparesRaceWinner (Codex round 20, P1): a
+// verified upload whose register→verify pair completes between the
+// quarantine copy and the delete must keep its bytes. An unguarded delete
+// would remove the verified replacement with no writer check left behind
+// it, and the digest check would rightly refuse to restore the corrupt
+// backup — a registered row blobless forever. The sweep's LFS delete
+// therefore runs inside GuardedLFSDelete: when the guard reports a
+// registration won, the candidate is spared untouched.
+func TestSweepLFS_GuardedDeleteSparesRaceWinner(t *testing.T) {
+	f := newSweepFixture(t)
+	content := "verified winner bytes"
+	key := blob.LFSKey("repo_lfs", lfsContentOID(content))
+	f.upload(key, content)
+	f.backdate(key, 25*time.Hour)
+
+	packs := &lfsGuardWins{}
+	s := NewSweeper(f.blobs, packs, SweepConfig{Threshold: 24 * time.Hour, DeleteLFS: true}, slog.New(slog.DiscardHandler))
+	report, err := s.Sweep(context.Background())
+	if err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if packs.guardCalls != 1 {
+		t.Fatalf("GuardedLFSDelete calls = %d, want 1 (LFS deletes must be guarded)", packs.guardCalls)
+	}
+	if report.Deleted != 0 {
+		t.Fatalf("report = %+v, want no deletes (guard spared the race winner)", report)
+	}
+	if !f.exists(key) {
+		t.Fatalf("guard-spared LFS object %q was deleted", key)
+	}
+	if !f.hasBackup(key) {
+		t.Fatalf("quarantine backup for %q was not retained", key)
+	}
+}
+
 // TestSweepLFS_MidDeleteRestoreIsDigestVerified (Codex round 19, security):
 // the mid-delete restore must not launder a corrupt pre-registry blob into
 // a registered object. Attack ordering: an aged legacy blob whose bytes do

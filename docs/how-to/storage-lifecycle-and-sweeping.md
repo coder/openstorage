@@ -239,7 +239,10 @@ behind; look for `orphan pack sweep: healed registered pack from quarantine`. LF
 restores are additionally digest-verified against the key's OID: a backup taken from a
 pre-registry blob whose bytes never hashed to its OID is *never* restored (logged as
 `NOT restoring LFS quarantine backup failing content verification`) — a registered
-object in that state repairs itself on the next upload touch instead. Quarantine
+object in that state repairs itself on the next upload touch instead. LFS deletes are
+also serialized with registration (the same in-transaction guard verified uploads use),
+so a concurrent upload either keeps its bytes untouched or provably re-publishes them
+after the delete. Quarantine
 backups are purged only while a destructive mode is on, and only once older than
 `max(age threshold, 1h)` — the floor guarantees a delete handshake is provably dead
 before its backup goes away, so tuning the age threshold low does not shorten it.

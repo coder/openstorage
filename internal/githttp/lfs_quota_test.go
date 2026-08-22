@@ -608,6 +608,64 @@ func TestLFSQuota_AtomicCapLoserLeavesNoBlob(t *testing.T) {
 	}
 }
 
+// downloadCountingBlob counts verification downloads (adoptLFSObject's
+// verifyStoredLFSObject stages via DownloadFile).
+type downloadCountingBlob struct {
+	blob.BlobStore
+	downloads int
+}
+
+func (b *downloadCountingBlob) DownloadFile(ctx context.Context, key, destPath string) error {
+	b.downloads++
+	return b.BlobStore.DownloadFile(ctx, key, destPath)
+}
+
+// TestLFSQuota_AtCapAdoptionDeniesBeforeDownload (Codex security round 4):
+// an at-cap repository holding a stored-but-rowless legacy blob must be
+// denied BEFORE the verification download. Registration would 507 the
+// adoption anyway, but only after a full download+hash of the stored
+// object — so every write-scoped touch of that oid becomes a repeatable
+// bandwidth/staging drain (a near-budget blob blocks the replica's
+// unrelated uploads for the whole hash).
+func TestLFSQuota_AtCapAdoptionDeniesBeforeDownload(t *testing.T) {
+	old := ref.MaxLFSObjectsPerRepo
+	ref.MaxLFSObjectsPerRepo = 1
+	t.Cleanup(func() { ref.MaxLFSObjectsPerRepo = old })
+	srv, st, mint := newLFSQuotaServer(t, 0, time.Hour)
+	tok := mint(auth.ScopeGitWrite)
+
+	// The cap is consumed by a registered object…
+	if err := st.RegisterLFSObject(context.Background(), lfsTestRepoID,
+		blob.LFSKey(lfsTestRepoID, strings.Repeat("aa", 32)), 10); err != nil {
+		t.Fatal(err)
+	}
+	// …while a rowless pre-registry blob sits stored under another oid.
+	legacy := []byte("legacy rowless bytes")
+	legacyOID := sha256Hex(legacy)
+	if err := srv.Blob.UploadFile(context.Background(),
+		blob.LFSKey(lfsTestRepoID, legacyOID), writeTempFile(t, legacy)); err != nil {
+		t.Fatal(err)
+	}
+	counting := &downloadCountingBlob{BlobStore: srv.Blob}
+	srv.Blob = counting
+
+	// Direct PUT touch: denied at the cap without downloading.
+	w := doLFS(t, srv, http.MethodPut, "/"+lfsTestRepoURL+".git/info/lfs/objects/"+legacyOID,
+		"basic:"+tok, string(legacy))
+	if w.Code != http.StatusInsufficientStorage {
+		t.Fatalf("at-cap legacy PUT status = %d, body %s (want 507)", w.Code, w.Body)
+	}
+	// Batch upload touch: per-object 507, still no download.
+	resp := decodeBatch(t, doLFS(t, srv, http.MethodPost, lfsBatchPath, "basic:"+tok,
+		batchBody("upload", legacyOID, int64(len(legacy)))))
+	if resp.Objects[0].Error == nil || resp.Objects[0].Error.Code != http.StatusInsufficientStorage {
+		t.Fatalf("at-cap legacy batch not denied: %+v", resp.Objects[0])
+	}
+	if counting.downloads != 0 {
+		t.Fatalf("at-cap adoption performed %d verification downloads, want 0", counting.downloads)
+	}
+}
+
 // TestLFSUpload_AbsoluteDeadlineBoundsDrip (Codex security round 2): a
 // client dripping one byte per idle window must still hit the ABSOLUTE
 // bound (the reservation TTL) and release its staging capacity.

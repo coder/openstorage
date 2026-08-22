@@ -46,6 +46,14 @@ type PackRegistry interface {
 	// point membership for lfs/<repo>/<oid> keys, written by verified
 	// uploads (ref.RegisterLFSObject).
 	HasLFSObject(ctx context.Context, repo, key string) (bool, error)
+	// GuardedLFSDelete runs del serialized against LFS registration (see
+	// ref.RefStore): safeDelete's LFS blob delete must go through it, or
+	// a verified upload's register+verify can complete between the
+	// quarantine copy and the delete — the sweep would then delete the
+	// verified replacement and (correctly) refuse to restore a
+	// digest-mismatched backup, leaving a registered row blobless with no
+	// remaining writer check (Codex round 20).
+	GuardedLFSDelete(ctx context.Context, repo, key string, del func(context.Context) error) (deleted bool, err error)
 	// IsRetainedPack classifies (repo, key) as superseded-by-repack: a
 	// blob whose registry row a ReplacePacks fold removed. Provably
 	// DB-absent by that CAS — a narrower, safer deletion class than
@@ -183,7 +191,10 @@ func NewSweeper(blobs blob.BlobStore, packs PackRegistry, cfg SweepConfig, logge
 //     bytes. Pack restores are always correct by construction
 //     (content-addressed keys over server-built packs); LFS restores are
 //     digest-verified first, because a pre-registry legacy blob's bytes
-//     may not hash to its key's oid (see restoreFromQuarantine).
+//     may not hash to its key's oid (see restoreFromQuarantine), and the
+//     LFS delete itself runs inside ref.GuardedLFSDelete so no verified
+//     upload's register→verify pair can complete between the quarantine
+//     copy and the delete (Codex round 20).
 //  3. healQuarantine, at the start of EVERY sweep (list-only included, so a
 //     rollback to list-only still repairs a delete-enabled crash), restores
 //     any quarantined pack whose key is registered but missing (covering a
@@ -679,7 +690,38 @@ func (s *Sweeper) safeDelete(ctx context.Context, repo, key string) (bool, error
 	// the sweep's cancellation (Codex round 16).
 	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sweepRecoveryTimeout)
 	defer cancel()
-	if err := s.blobs.Delete(hctx, key); err != nil && !errors.Is(err, blob.ErrNotFound) {
+	var deleteErr error
+	if _, _, isLFS := splitLFSKey(key); isLFS {
+		// LFS deletes serialize with registration through the same guard
+		// the adoption path uses (Codex round 20): a verified upload's
+		// register→verify pair completing between the quarantine copy and
+		// an unguarded delete would have its verified bytes deleted with
+		// no writer check left behind them (EnsurePublished already ran),
+		// and the digest check above would rightly refuse to restore the
+		// corrupt backup — a registered row blobless forever. Under the
+		// guard, a registration either commits first (the guard's re-read
+		// spares the bytes) or blocks until the delete commits, making its
+		// post-registration writer verify strictly follow the delete and
+		// republish. Pack deletes stay unguarded: their restores are
+		// always correct, so the existing recheck+heal layers suffice.
+		deleted, gerr := s.packs.GuardedLFSDelete(hctx, repo, key, func(ctx context.Context) error {
+			if err := s.blobs.Delete(ctx, key); err != nil && !errors.Is(err, blob.ErrNotFound) {
+				return err
+			}
+			return nil
+		})
+		if gerr == nil && !deleted {
+			// A verified upload registered before the guard's re-read: the
+			// delete never executed and its bytes stand. The backup is
+			// retained for the aged purge like every spared handshake.
+			s.logger.Warn("orphan pack sweep: spared LFS object registered before guarded delete", "key", key)
+			return false, nil
+		}
+		deleteErr = gerr
+	} else if err := s.blobs.Delete(hctx, key); err != nil && !errors.Is(err, blob.ErrNotFound) {
+		deleteErr = err
+	}
+	if deleteErr != nil {
 		// The delete outcome is unknown — the request may have executed
 		// with its response lost. Restore from quarantine (digest-verified
 		// for LFS keys): identical bytes, so a no-op if the delete never
@@ -688,7 +730,7 @@ func (s *Sweeper) safeDelete(ctx context.Context, repo, key string) (bool, error
 		// (its next classification restarts from the restore's fresh
 		// ModTime); if even the restore fails, the retained backup plus the
 		// heal pass remain the backstop.
-		deleteErr := fmt.Errorf("sweep: delete %s: %w", key, err)
+		deleteErr = fmt.Errorf("sweep: delete %s: %w", key, deleteErr)
 		if _, rerr := s.restoreFromQuarantine(rctx, key, qKey); rerr != nil {
 			return false, errors.Join(deleteErr,
 				fmt.Errorf("sweep: restore after ambiguous delete %s: %w", key, rerr))
