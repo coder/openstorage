@@ -103,15 +103,14 @@ deployment serves **one organization**, configured at boot
 [`CODESTORAGE_ORG_PUBKEYS`](../reference/configuration.md#codestorage_org_pubkeys)).
 
 For clients this is invisible — tokens carry the same `iss`/`repo`/`scopes` claims either
-way. The git smart-HTTP surface rejects any token whose `iss` is not the served org
-outright (`403`). The REST surface scopes every request to the token's issuer instead:
-with a single org row in the database — the normal state — an unknown issuer simply
-fails verification, but org rows retained from an earlier `CODESTORAGE_ORG` value stay
-addressable by their own tokens until removed
-([#47](https://github.com/coder/code-storage/issues/47) tracks aligning this with the
-git surface). What changes is operations: org onboarding and signing-key
-registration are your deployment configuration (env + CLI) rather than a vendor control
-plane, and serving multiple orgs means multiple deployments.
+way. Both surfaces reject any verified token whose `iss` is not the served org with
+`403` (the REST surface historically accepted tokens for retained org rows —
+[#47](https://github.com/coder/code-storage/issues/47)). Org rows retained from an
+earlier `CODESTORAGE_ORG` value stay in the database and each boot logs a warning naming
+them, but their tokens are rejected on both surfaces. What changes is operations: org
+onboarding and signing-key registration are your deployment configuration (env + CLI)
+rather than a vendor control plane, and serving multiple orgs means multiple
+deployments.
 
 ## Intentionally out of scope
 

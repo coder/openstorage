@@ -45,8 +45,8 @@ func newForkServer(t *testing.T, e *testEnv) *httptest.Server {
 	verifier := auth.NewVerifier(e.store)
 	mux := http.NewServeMux()
 	mux.Handle("POST /api/v1/repos",
-		requireAuth(verifier, false, auth.ScopeRepoWrite)(s.forkAwareCreateRepo(verifier, s.handleCreateRepo)))
-	s.registerWriteRefRoutes(mux, verifier, nil)
+		requireAuth(verifier, "", false, auth.ScopeRepoWrite)(s.forkAwareCreateRepo(verifier, s.handleCreateRepo)))
+	s.registerWriteRefRoutes(mux, verifier, "", nil)
 	srv := httptest.NewServer(recoverPanics(s.logger)(mux))
 	t.Cleanup(srv.Close)
 	return srv
@@ -450,7 +450,7 @@ func TestForkQuotaDoesNotTombstoneName(t *testing.T) {
 			verifier := auth.NewVerifier(e.store)
 			mux := http.NewServeMux()
 			mux.Handle("POST /api/v1/repos",
-				requireAuth(verifier, false, auth.ScopeRepoWrite)(s.forkAwareCreateRepo(verifier, s.handleCreateRepo)))
+				requireAuth(verifier, "", false, auth.ScopeRepoWrite)(s.forkAwareCreateRepo(verifier, s.handleCreateRepo)))
 			srv := httptest.NewServer(recoverPanics(s.logger)(mux))
 			t.Cleanup(srv.Close)
 			return srv

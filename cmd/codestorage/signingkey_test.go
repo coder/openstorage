@@ -89,6 +89,10 @@ func (failingStore) PublicKeysForOrg(context.Context, string) ([]string, error) 
 	panic("not used by signing-key CLI")
 }
 
+func (failingStore) OrgNames(context.Context) ([]string, error) {
+	panic("not used by signing-key CLI")
+}
+
 func (failingStore) CreateRepo(context.Context, string, string, string) (meta.Repo, error) {
 	panic("not used by signing-key CLI")
 }

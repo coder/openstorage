@@ -40,8 +40,9 @@ import (
 // mux.Handle("/api/", h). refStore/blobStore/cacheDir back the
 // git:read endpoints — serve passes the same instances the githttp fallback
 // uses so both surfaces share one cache.
-func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL string, orgPEMBlocks []string, refStore ref.RefStore, blobStore blob.BlobStore, cacheDir string, rate api.RateLimitConfig, packQuotaBytes int64, packReservationTTL time.Duration, sweep sweepSettings, repackThreshold int) (http.Handler, meta.Store, auth.Verifier, func(ctx context.Context, repo string), func(), error) {
+func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL, loopbackBaseURL string, orgPEMBlocks []string, refStore ref.RefStore, blobStore blob.BlobStore, cacheDir string, rate api.RateLimitConfig, packQuotaBytes int64, packReservationTTL time.Duration, sweep sweepSettings, repackThreshold int) (http.Handler, meta.Store, auth.Verifier, func(ctx context.Context, repo string), func(), error) {
 	assertf(dbURL != "" && org != "" && httpBaseURL != "" && len(orgPEMBlocks) > 0, "buildAPIHandler: missing dbURL/org/httpBaseURL/keys")
+	assertf(loopbackBaseURL != "", "buildAPIHandler: missing loopbackBaseURL")
 	assertf(refStore != nil && blobStore != nil && cacheDir != "", "buildAPIHandler: missing refStore/blobStore/cacheDir")
 	ms, msCleanup, err := openMetaStore(ctx, dbURL)
 	if err != nil {
@@ -52,23 +53,18 @@ func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL string, orgPEM
 		return nil, nil, nil, nil, nil, err
 	}
 
-	// Loopback sync-push key (docs/07 p5): per-process keypair whose public
-	// half joins the org's registered keys, so the sync worker's internally
-	// minted git:write JWTs verify on our own git endpoint.
-	key, loopbackPubPEM, err := newLoopbackKey()
-	if err != nil {
-		return fail(err)
-	}
-	if _, err := ms.UpsertOrgWithKeys(ctx, org, append(orgPEMBlocks, loopbackPubPEM)); err != nil {
-		return fail(fmt.Errorf("bootstrap org %q: %w", org, err))
-	}
-	verifier := auth.NewVerifier(ms)
-
 	// Eventing/sync stack (docs/06): jobs queue with delivery + sync
 	// workers, and the events.RefStore decorator so API ref writes emit
 	// push events. The git surface gets the same decorator in the hook
 	// subprocess via wireHookEventing.
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
+
+	// Org bootstrap + verifier, including the per-process loopback
+	// sync-push key (docs/07 p5, issue #45).
+	key, verifier, err := bootstrapOrgAuth(ctx, ms, org, orgPEMBlocks, logger)
+	if err != nil {
+		return fail(err)
+	}
 
 	// Orphan-pack sweep (issue #5): built over the RAW ref store — pack
 	// listing is a read, no events to emit — and the shared blob store.
@@ -159,7 +155,7 @@ func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL string, orgPEM
 	// schedule one more fold when the count is still at/above it.
 	repacker.FollowUpThreshold = repackThreshold
 
-	queue, decorate, queueCleanup, err := buildServeEventing(ctx, ms, dbURL, org, httpBaseURL, key, schedule, repacker, logger)
+	queue, decorate, queueCleanup, err := buildServeEventing(ctx, ms, dbURL, org, loopbackBaseURL, key, schedule, repacker, logger)
 	if err != nil {
 		return fail(err)
 	}
@@ -173,8 +169,12 @@ func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL string, orgPEM
 	}
 
 	h, err := api.New(api.Config{
-		Store:       ms,
-		Verifier:    verifier,
+		Store:    ms,
+		Verifier: verifier,
+		// Served-org gate (issue #47): REST rejects verified tokens whose
+		// iss is another (e.g. retained) org row, exactly like the git
+		// surface's verifyClaims.
+		Org:         org,
 		HTTPBaseURL: httpBaseURL,
 		RefStore:    decorate(refStore),
 		BlobStore:   blobStore,
@@ -196,6 +196,42 @@ func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL string, orgPEM
 		msCleanup()
 	}
 	return h, ms, verifier, maybeRepack, cleanup, nil
+}
+
+// bootstrapOrgAuth registers the configured file keys for the served org
+// (idempotent last-writer-wins upsert — correct for file keys, every replica
+// re-inserts the same shared set) and builds the process verifier: database
+// org keys unioned in-memory with this process's loopback public key.
+//
+// The loopback key is deliberately NOT persisted (issue #45): the org key
+// set is one shared slot, so a persisted per-process key would be deleted by
+// the next replica's boot, 403ing this process's own sync pushes. In-memory
+// verification is sound because loopback pushes terminate at this process's
+// own listener (see selfLoopbackURL), never at another replica.
+//
+// It also warns about retained org rows that no longer match the configured
+// org (issue #47): both surfaces reject their tokens, but the rows (and any
+// registered keys) stay in the database — cleanup is operator-driven.
+func bootstrapOrgAuth(ctx context.Context, ms meta.Store, org string, orgPEMBlocks []string, logger *slog.Logger) (loopbackKey, auth.Verifier, error) {
+	assertf(ms != nil && org != "" && len(orgPEMBlocks) > 0 && logger != nil, "bootstrapOrgAuth: missing deps")
+	key, loopbackPubPEM, err := newLoopbackKey()
+	if err != nil {
+		return loopbackKey{}, nil, err
+	}
+	if _, err := ms.UpsertOrgWithKeys(ctx, org, orgPEMBlocks); err != nil {
+		return loopbackKey{}, nil, fmt.Errorf("bootstrap org %q: %w", org, err)
+	}
+	names, err := ms.OrgNames(ctx)
+	if err != nil {
+		return loopbackKey{}, nil, fmt.Errorf("list org rows: %w", err)
+	}
+	for _, name := range names {
+		if name != org {
+			logger.Warn("retained org row does not match the configured org; its tokens are rejected on both surfaces (issue #47)",
+				"org_row", name, "configured_org", org)
+		}
+	}
+	return key, auth.NewVerifier(auth.UnionKeySource(ms, org, loopbackPubPEM)), nil
 }
 
 // openMetaStore opens the metadata store (URL-scheme dispatch via meta.Open)

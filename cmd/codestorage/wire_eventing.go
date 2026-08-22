@@ -129,8 +129,8 @@ func isPGURL(dbURL string) bool {
 // non-nil repack registers the background-repack worker on both backends.
 // The returned cleanup stops the sweep and the queue (waiting for in-flight
 // local work).
-func buildServeEventing(ctx context.Context, ms meta.Store, dbURL, org, httpBaseURL string, key loopbackKey, sweep *jobs.SweepSchedule, repack *jobs.Repacker, logger *slog.Logger) (jobs.Queue, func(inner ref.RefStore) ref.RefStore, func(), error) {
-	assertf(ms != nil && dbURL != "" && org != "" && httpBaseURL != "", "buildServeEventing: missing deps")
+func buildServeEventing(ctx context.Context, ms meta.Store, dbURL, org, loopbackBaseURL string, key loopbackKey, sweep *jobs.SweepSchedule, repack *jobs.Repacker, logger *slog.Logger) (jobs.Queue, func(inner ref.RefStore) ref.RefStore, func(), error) {
+	assertf(ms != nil && dbURL != "" && org != "" && loopbackBaseURL != "", "buildServeEventing: missing deps")
 	assertf(logger != nil, "buildServeEventing: nil logger")
 
 	whStore := events.MetaWebhookStore{Store: ms}
@@ -158,8 +158,13 @@ func buildServeEventing(ctx context.Context, ms meta.Store, dbURL, org, httpBase
 			}
 			return upsync.RepoInfo{RepoID: r.RepoID, URL: r.URL}, nil
 		},
-		Events:   webhookSink{webhooks: whStore, enqueue: enqueueDelivery, logger: logger},
-		Loopback: upsync.Loopback{BaseURL: httpBaseURL, Token: func(_ context.Context, org string, repo upsync.RepoInfo) (string, error) { return key.mint(org, repo) }},
+		Events: webhookSink{webhooks: whStore, enqueue: enqueueDelivery, logger: logger},
+		// The push target is THIS process's own listener, never the
+		// external base URL (issue #45): the minted token verifies only
+		// against this process's in-memory loopback key, so a push routed
+		// through a load balancer could land on a replica that must
+		// reject it.
+		Loopback: upsync.Loopback{BaseURL: loopbackBaseURL, Token: func(_ context.Context, org string, repo upsync.RepoInfo) (string, error) { return key.mint(org, repo) }},
 		Logger:   logger,
 	}
 

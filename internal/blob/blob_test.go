@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/smithy-go"
 	"gocloud.dev/blob/memblob"
 )
 
@@ -130,5 +132,89 @@ func TestOpenSchemeDispatch(t *testing.T) {
 		if !strings.Contains(err.Error(), scheme) {
 			t.Fatalf("unsupported-scheme error must list %q, got %v", scheme, err)
 		}
+	}
+}
+
+// fakeBucketClient fakes the CreateBucket/HeadBucket seam so EnsureBucket's
+// error handling is unit-testable without a live store.
+type fakeBucketClient struct {
+	createErr error
+	headErr   error
+	headCalls int
+}
+
+func (f *fakeBucketClient) CreateBucket(context.Context, *s3.CreateBucketInput, ...func(*s3.Options)) (*s3.CreateBucketOutput, error) {
+	return &s3.CreateBucketOutput{}, f.createErr
+}
+
+func (f *fakeBucketClient) HeadBucket(context.Context, *s3.HeadBucketInput, ...func(*s3.Options)) (*s3.HeadBucketOutput, error) {
+	f.headCalls++
+	return &s3.HeadBucketOutput{}, f.headErr
+}
+
+// EnsureBucket must keep create-first semantics (fresh MinIO/dev stacks stay
+// zero-setup) while accepting AccessDenied on create when the bucket is
+// reachable: a least-privilege role for a pre-provisioned bucket has no
+// s3:CreateBucket, and the denial is not proof the bucket is missing
+// (issue #48).
+func TestEnsureBucket(t *testing.T) {
+	ctx := context.Background()
+	apiErr := func(code string) error {
+		return &smithy.GenericAPIError{Code: code, Message: code + " (fake)"}
+	}
+
+	cases := map[string]struct {
+		client        *fakeBucketClient
+		wantErr       []string // substrings; empty = success
+		wantHeadCalls int
+	}{
+		"created": {
+			client: &fakeBucketClient{},
+		},
+		"already owned by you": {
+			client: &fakeBucketClient{createErr: apiErr("BucketAlreadyOwnedByYou")},
+		},
+		"already exists": {
+			client: &fakeBucketClient{createErr: apiErr("BucketAlreadyExists")},
+		},
+		"access denied, bucket reachable": {
+			client:        &fakeBucketClient{createErr: apiErr("AccessDenied")},
+			wantHeadCalls: 1,
+		},
+		"access denied, probe fails": {
+			client:        &fakeBucketClient{createErr: apiErr("AccessDenied"), headErr: apiErr("NotFound")},
+			wantErr:       []string{"AccessDenied", "NotFound", `create bucket "b" denied`},
+			wantHeadCalls: 1,
+		},
+		"other api error stays fatal without probe": {
+			client:  &fakeBucketClient{createErr: apiErr("InternalError")},
+			wantErr: []string{`create bucket "b"`, "InternalError"},
+		},
+		"non-api error stays fatal without probe": {
+			client:  &fakeBucketClient{createErr: errors.New("dial tcp: connection refused")},
+			wantErr: []string{`create bucket "b"`, "connection refused"},
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			err := ensureBucket(ctx, tc.client, "b")
+			if len(tc.wantErr) == 0 {
+				if err != nil {
+					t.Fatalf("ensureBucket: %v", err)
+				}
+			} else {
+				if err == nil {
+					t.Fatal("ensureBucket succeeded, want error")
+				}
+				for _, want := range tc.wantErr {
+					if !strings.Contains(err.Error(), want) {
+						t.Errorf("error %q must mention %q", err, want)
+					}
+				}
+			}
+			if tc.client.headCalls != tc.wantHeadCalls {
+				t.Errorf("HeadBucket called %d times, want %d", tc.client.headCalls, tc.wantHeadCalls)
+			}
+		})
 	}
 }

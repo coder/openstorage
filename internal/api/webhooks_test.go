@@ -106,7 +106,7 @@ func newWebhooksServer(t *testing.T, e *testEnv) (*httptest.Server, *memWebhookS
 	t.Helper()
 	store := newMemWebhookStore()
 	mux := http.NewServeMux()
-	RegisterWebhookRoutes(mux, auth.NewVerifier(e.store), store, discardLogger(), nil)
+	RegisterWebhookRoutes(mux, auth.NewVerifier(e.store), "", store, discardLogger(), nil)
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 	return srv, store
