@@ -40,7 +40,7 @@ import (
 // mux.Handle("/api/", h). refStore/blobStore/cacheDir back the
 // git:read endpoints — serve passes the same instances the githttp fallback
 // uses so both surfaces share one cache.
-func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL, loopbackBaseURL string, orgPEMBlocks []string, refStore ref.RefStore, blobStore blob.BlobStore, cacheDir string, rate api.RateLimitConfig, packQuotaBytes int64, packReservationTTL time.Duration, sweep sweepSettings, repackThreshold int) (http.Handler, meta.Store, auth.Verifier, func(ctx context.Context, repo string), func(), error) {
+func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL, loopbackBaseURL string, orgPEMBlocks []string, refStore ref.RefStore, blobStore blob.BlobStore, cacheDir string, rate api.RateLimitConfig, packQuotaBytes int64, packReservationTTL time.Duration, sweep sweepSettings, repackThreshold int, webhookAllowPrivate bool) (http.Handler, meta.Store, auth.Verifier, func(ctx context.Context, repo string), func(), error) {
 	assertf(dbURL != "" && org != "" && httpBaseURL != "" && len(orgPEMBlocks) > 0, "buildAPIHandler: missing dbURL/org/httpBaseURL/keys")
 	assertf(loopbackBaseURL != "", "buildAPIHandler: missing loopbackBaseURL")
 	assertf(refStore != nil && blobStore != nil && cacheDir != "", "buildAPIHandler: missing refStore/blobStore/cacheDir")
@@ -58,6 +58,14 @@ func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL, loopbackBaseU
 	// push events. The git surface gets the same decorator in the hook
 	// subprocess via wireHookEventing.
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
+
+	// Webhook SSRF-guard escape hatch (issue #53): loud boot-time warning —
+	// enabling it means any org repo:write holder can point deliveries at
+	// internal addresses, so it must never be flipped silently.
+	if webhookAllowPrivate {
+		logger.Warn("webhook SSRF guard relaxed: deliveries may target loopback/private/link-local addresses",
+			"env", envWebhookAllowPrivate)
+	}
 
 	// Org bootstrap + verifier, including the per-process loopback
 	// sync-push key (docs/07 p5, issue #45).
@@ -155,7 +163,7 @@ func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL, loopbackBaseU
 	// schedule one more fold when the count is still at/above it.
 	repacker.FollowUpThreshold = repackThreshold
 
-	queue, decorate, queueCleanup, err := buildServeEventing(ctx, ms, dbURL, org, loopbackBaseURL, key, schedule, repacker, logger)
+	queue, decorate, queueCleanup, err := buildServeEventing(ctx, ms, dbURL, org, loopbackBaseURL, key, schedule, repacker, webhookAllowPrivate, logger)
 	if err != nil {
 		return fail(err)
 	}
@@ -186,6 +194,9 @@ func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL, loopbackBaseU
 		// pre-receive (issue #21): REST pack writers must not bypass it.
 		PackQuotaBytes:     packQuotaBytes,
 		PackReservationTTL: packReservationTTL,
+		// Webhook registration-time SSRF courtesy check (issue #53);
+		// the delivery workers got the same flag via buildServeEventing.
+		WebhookAllowPrivate: webhookAllowPrivate,
 	})
 	if err != nil {
 		queueCleanup() // stop workers before closing their meta store

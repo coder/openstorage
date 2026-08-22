@@ -732,3 +732,32 @@ func TestResolveServeConfigRepackThreshold(t *testing.T) {
 		}
 	})
 }
+
+func TestResolveWebhookAllowPrivate(t *testing.T) {
+	for name, tc := range map[string]struct {
+		raw     string
+		want    bool
+		wantErr bool
+	}{
+		"unset defaults strict": {},
+		"false":                 {raw: "false"},
+		"true":                  {raw: "true", want: true},
+		"malformed":             {raw: "sometimes", wantErr: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			got, err := resolveWebhookAllowPrivate(mapEnv(map[string]string{envWebhookAllowPrivate: tc.raw}))
+			if tc.wantErr {
+				if err == nil || !strings.Contains(err.Error(), envWebhookAllowPrivate) {
+					t.Fatalf("error = %v, want one naming %s", err, envWebhookAllowPrivate)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != tc.want {
+				t.Fatalf("resolveWebhookAllowPrivate(%q) = %v, want %v", tc.raw, got, tc.want)
+			}
+		})
+	}
+}
