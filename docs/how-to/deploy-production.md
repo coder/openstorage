@@ -41,16 +41,23 @@ The database is the authority for refs, metadata, quota accounting, and the dura
 ([`CODESTORAGE_S3_URL`](../reference/configuration.md#codestorage_s3_url)); credentials come
 from the standard AWS chain (env vars, shared config, instance roles).
 
-- **The replica role currently needs `s3:CreateBucket`** even for a pre-provisioned
-  bucket: startup idempotently issues `CreateBucket` and treats only
-  already-exists/owned-by-you answers as success — an `AccessDenied` fails boot rather
-  than probing the existing bucket
-  ([#48](https://github.com/coder/code-storage/issues/48) tracks a least-privilege
-  probe). Also grant `s3:GetBucketVersioning` — it is needed **by default**: superseded
-  reaping is on out of the box and re-checks versioning state per run, silently
-  downgrading every sweep to list-only when the check fails (superseded packs and their
-  quota usage then linger indefinitely). Only the explicit general-orphan delete opt-in
-  performs the check at startup.
+- **Bucket permissions for the replica role.** With default settings the role needs all
+  of:
+  - object read/write/list (`s3:GetObject`, `s3:PutObject`, `s3:ListBucket`) — serving,
+    LFS, sweeping's listings, and quarantine copies;
+  - `s3:DeleteObject` — the sweeper's destructive modes, one of which (superseded
+    reaping) is **on by default**. Without it the service starts fine, but every reap
+    fails after writing its quarantine copy, and retained packs stay quota-counted
+    indefinitely;
+  - `s3:GetBucketVersioning` — also needed by default: superseded reaping re-checks
+    versioning per run and silently downgrades every sweep to list-only when the check
+    fails (only the explicit general-orphan opt-in checks at startup, where it fails the
+    boot instead);
+  - `s3:CreateBucket`, currently even for a pre-provisioned bucket: startup idempotently
+    issues `CreateBucket` and treats only already-exists/owned-by-you answers as
+    success — an `AccessDenied` fails boot rather than probing the existing bucket
+    ([#48](https://github.com/coder/code-storage/issues/48) tracks a least-privilege
+    probe).
 
 - Packs are immutable and content-addressed: the server only ever writes new keys and —
   through the sweeper's destructive modes — deletes provably-unreferenced ones. Nothing

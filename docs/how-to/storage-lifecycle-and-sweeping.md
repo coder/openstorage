@@ -169,7 +169,7 @@ threshold=<age> duration=<d>
 | `fresh` | Unregistered but younger than the age threshold — likely in-flight writers; never touched |
 | `orphans` / `orphan_bytes` | Aged, unregistered candidates this run — **both** classes: repack-superseded blobs count here too until reaped |
 | `deleted` | Candidates reaped this run (superseded reaps included). Reaping moves bytes to quarantine, so it frees nothing by itself |
-| `bytes_reclaimed` | Bytes of aged quarantine backups purged this run — the moment storage consumption actually decreases. Lags `deleted` by the quarantine purge window, `max(age threshold, 1h)` |
+| `bytes_reclaimed` | **Net** bytes returned by purging aged quarantine backups whose blob stayed unregistered. A backup whose original was restored purges without being counted (net zero — the original is live again). Lags `deleted` by the quarantine purge window, `max(age threshold, 1h)` |
 | `superseded_deleted` / `retained_bytes_reclaimed` | The provably repack-superseded subset of `deleted`, and the **quota headroom** their reaps returned |
 | `reservations_expired` | Crashed-writer quota reservations pruned this run |
 | `delete_enabled` / `delete_superseded` | The **configured** modes — a [guard downgrade](#s3-bucket-versioning) to list-only is *not* reflected here; it shows only as the separate `delete guard failed; this run is list-only` error line |
