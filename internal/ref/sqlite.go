@@ -92,6 +92,18 @@ func (s *SQLite) InitSchema(ctx context.Context) error {
 		// row at 1 — same contract as PG.
 		`CREATE TABLE IF NOT EXISTS repo_generations (repo TEXT PRIMARY KEY,
 		                                              generation INTEGER NOT NULL DEFAULT 1)`,
+		// Pack-quota ledger (issues #29/#31, see ledger.go). Accounting
+		// state only — no repo_generations triggers (same rationale as PG).
+		// created_at is INTEGER epoch milliseconds stamped by the writing
+		// statement (sqliteEpochMS), matching the admission predicate.
+		`CREATE TABLE IF NOT EXISTS pack_reservations (key TEXT PRIMARY KEY, repo TEXT NOT NULL,
+		                                               bytes INTEGER NOT NULL, owner TEXT NOT NULL,
+		                                               created_at INTEGER NOT NULL)`,
+		`CREATE INDEX IF NOT EXISTS pack_reservations_repo ON pack_reservations (repo)`,
+		`CREATE TABLE IF NOT EXISTS pack_retained (repo TEXT, key TEXT, bytes INTEGER NOT NULL,
+		                                           superseded_at INTEGER NOT NULL DEFAULT (unixepoch()),
+		                                           PRIMARY KEY (repo, key))`,
+		`CREATE TABLE IF NOT EXISTS pack_usage (repo TEXT PRIMARY KEY, bytes INTEGER NOT NULL DEFAULT 0)`,
 	} {
 		if _, err := tx.ExecContext(ctx, stmt); err != nil {
 			return fmt.Errorf("sqlite init schema: %w", err)
@@ -266,7 +278,10 @@ func (s *SQLite) CASRef(ctx context.Context, repo, name, old, new string) (won b
 
 // RegisterPacks inserts pack rows in ONE transaction (crash-ordering: this
 // runs strictly after the blob upload succeeded). Idempotent on retry: a
-// re-pushed identical pack has the same id.
+// re-pushed identical pack has the same id. The transaction settles the
+// quota ledger exactly like the PG twin (see its doc): reservations are
+// consumed by key, and newly inserted non-retained rows credit the usage
+// counter.
 func (s *SQLite) RegisterPacks(ctx context.Context, repo string, packs []Pack) error {
 	assertf(len(packs) > 0, "RegisterPacks called with no packs")
 	tx, err := s.db.BeginTx(ctx, nil) // BEGIN IMMEDIATE via _txlock
@@ -274,13 +289,33 @@ func (s *SQLite) RegisterPacks(ctx context.Context, repo string, packs []Pack) e
 		return fmt.Errorf("register packs begin: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+	var credit int64
 	for _, p := range packs {
 		assertf(p.ID != "" && p.Key != "", "RegisterPacks: empty pack id/key %+v", p)
-		if _, err := tx.ExecContext(ctx,
+		res, err := tx.ExecContext(ctx,
 			`INSERT INTO packs (repo, id, s3_key) VALUES (?, ?, ?) ON CONFLICT DO NOTHING`,
-			repo, p.ID, p.Key); err != nil {
+			repo, p.ID, p.Key)
+		if err != nil {
 			return err
 		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if n > 0 {
+			c, err := registerLedgerSQLite(ctx, tx, repo, p)
+			if err != nil {
+				return err
+			}
+			credit += c
+		}
+		if _, err := tx.ExecContext(ctx,
+			`DELETE FROM pack_reservations WHERE key = ?`, p.Key); err != nil {
+			return err
+		}
+	}
+	if err := creditUsageSQLite(ctx, tx, repo, credit); err != nil {
+		return err
 	}
 	return tx.Commit()
 }
@@ -327,10 +362,35 @@ func (s *SQLite) ReplacePacks(ctx context.Context, repo string, old []Pack, newP
 	if deleted != len(old) {
 		return false, nil // another fold got here first: roll back via defer
 	}
-	if _, err := tx.ExecContext(ctx,
+	// Ledger (issue #31): mirror the PG twin — record superseded keys as
+	// retained (their blobs linger; bytes stay counted), then credit the
+	// new pack only when its row is newly inserted and not itself retained.
+	for _, p := range old {
+		if _, err := tx.ExecContext(ctx, `
+INSERT INTO pack_retained (repo, key, bytes) VALUES (?, ?, ?)
+ON CONFLICT (repo, key) DO UPDATE SET bytes = excluded.bytes, superseded_at = unixepoch()`,
+			repo, p.Key, p.Size); err != nil {
+			return false, fmt.Errorf("replace packs %s: %w", repo, err)
+		}
+	}
+	res, err := tx.ExecContext(ctx,
 		`INSERT INTO packs (repo, id, s3_key) VALUES (?, ?, ?) ON CONFLICT DO NOTHING`,
-		repo, newPack.ID, newPack.Key); err != nil {
+		repo, newPack.ID, newPack.Key)
+	if err != nil {
 		return false, fmt.Errorf("replace packs %s: %w", repo, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("replace packs %s rows: %w", repo, err)
+	}
+	if n > 0 {
+		credit, err := registerLedgerSQLite(ctx, tx, repo, newPack)
+		if err != nil {
+			return false, fmt.Errorf("replace packs %s: %w", repo, err)
+		}
+		if err := creditUsageSQLite(ctx, tx, repo, credit); err != nil {
+			return false, fmt.Errorf("replace packs %s: %w", repo, err)
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return false, fmt.Errorf("replace packs %s commit: %w", repo, err)

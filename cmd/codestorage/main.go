@@ -141,7 +141,7 @@ func cmdServe(ctx context.Context, args []string) error {
 	// HTTP API (single-org self-host mode). The read endpoints share the
 	// ref/blob stores and cache dir with the githttp fallback below.
 	apiHandler, metaStore, verifier, maybeRepack, cleanup, err := buildAPIHandler(ctx, cfg.dbURL, cfg.org, httpBaseURL, orgPEMBlocks, st, bl, cfg.cacheDir,
-		api.RateLimitConfig{RPS: cfg.rateRPS, Burst: cfg.rateBurst, TrustedProxies: cfg.trustedProxies}, cfg.packQuotaBytes, cfg.sweep, cfg.repackThreshold)
+		api.RateLimitConfig{RPS: cfg.rateRPS, Burst: cfg.rateBurst, TrustedProxies: cfg.trustedProxies}, cfg.packQuotaBytes, cfg.packReservationTTL, cfg.sweep, cfg.repackThreshold)
 	if err != nil {
 		return err
 	}
@@ -161,6 +161,7 @@ func cmdServe(ctx context.Context, args []string) error {
 	// hook subprocess has no channel to the in-process queue).
 	srv.MaybeRepack = maybeRepack
 	srv.PackQuotaBytes = cfg.packQuotaBytes
+	srv.PackReservationTTL = cfg.packReservationTTL
 	// docs/05 git URLs address repos by repo_id (name-style urls accepted
 	// too, ADR-21); the resolved RepoID is the only storage key, and the
 	// record backs claim matching for url- or id-carrying tokens (docs/02).

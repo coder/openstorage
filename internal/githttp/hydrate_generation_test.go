@@ -57,6 +57,26 @@ func (s *countingStore) ReplacePacks(context.Context, string, []ref.Pack, ref.Pa
 	panic("Hydrate must never replace packs")
 }
 
+func (s *countingStore) ReservePackBytes(context.Context, []string, []ref.Pack, string, int64, int64, time.Duration) (ref.ReserveDecision, error) {
+	panic("Hydrate must never reserve pack bytes")
+}
+
+func (s *countingStore) ReleasePackReservations(context.Context, []string, string) error {
+	panic("Hydrate must never release pack reservations")
+}
+
+func (s *countingStore) SweepExpiredPackReservations(context.Context, time.Duration) (int64, error) {
+	panic("Hydrate must never sweep pack reservations")
+}
+
+func (s *countingStore) IsRetainedPack(context.Context, string, string) (bool, error) {
+	panic("Hydrate must never read retained packs")
+}
+
+func (s *countingStore) ReclaimRetainedPack(context.Context, string, string) (int64, error) {
+	panic("Hydrate must never reclaim retained packs")
+}
+
 func (s *countingStore) ListRefs(context.Context, string) (map[string]string, error) {
 	s.mu.Lock()
 	s.listRefsCalls++

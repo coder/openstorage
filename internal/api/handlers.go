@@ -41,6 +41,9 @@ type server struct {
 	// packQuotaBytes mirrors the git surface's per-repo pack quota onto
 	// the REST pack writers (issue #21); <= 0 disables enforcement.
 	packQuotaBytes int64
+	// packReservationTTL bounds how long a crashed writer's quota
+	// reservation gates admission (issue #29, ref/ledger.go).
+	packReservationTTL time.Duration
 }
 
 // triggerRepack runs the repack-threshold check after a successful pack

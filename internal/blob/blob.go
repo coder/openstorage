@@ -134,26 +134,44 @@ const packUsagePageSize = 1000
 // per-repository bound (issue #21, Codex round 15).
 var packNamespaceSuffixes = []string{"+ephemeral", "+import"}
 
-// PackUsageBytes sums the sizes of every object under the pack prefixes of
-// repo's BASE repository and all of its namespaces: registered packs plus
-// not-yet-swept orphans — the packs/ growth the per-repo quota (issue #21)
-// bounds. The suffix, if any, is stripped first, so every namespace write
-// is measured against the same rolled-up usage. Shared by the pre-receive
-// hook, the REST pack writers, and the git surface's pressure check.
-//
-// Known deferral (issue #31): a background repack fold uploads a
-// consolidated pack and ReplacePacks swaps only registry rows — the
-// superseded blobs remain (and are counted here) until a delete-mode sweep
-// reaps them, transiently inflating usage after folds. Retained-byte
-// accounting is #31's scope; this PR's quota treats the raw prefix bytes
-// as the (conservative) truth.
-func PackUsageBytes(ctx context.Context, b BlobStore, repo string) (int64, error) {
-	assertf(b != nil && repo != "", "PackUsageBytes: missing blob store or repo")
+// QuotaRepoGroup returns repo's quota accounting group: the BASE repository
+// first (suffix stripped), then every docs/05 namespace that rolls up under
+// it. The ref-store quota ledger (issue #29) keys reservations under
+// group[0] and sums usage over the whole group, mirroring PackUsageBytes'
+// rollup so both usage sources measure the same unit.
+func QuotaRepoGroup(repo string) []string {
+	assertf(repo != "", "QuotaRepoGroup: empty repo")
 	base := repo
 	for _, s := range packNamespaceSuffixes {
 		base = strings.TrimSuffix(base, s)
 	}
-	assertf(base != "", "PackUsageBytes: empty base repo for %q", repo)
+	assertf(base != "", "QuotaRepoGroup: empty base repo for %q", repo)
+	group := make([]string, 0, 1+len(packNamespaceSuffixes))
+	group = append(group, base)
+	for _, s := range packNamespaceSuffixes {
+		group = append(group, base+s)
+	}
+	return group
+}
+
+// PackUsageBytes sums the sizes of every object under the pack prefixes of
+// repo's BASE repository and all of its namespaces: registered packs plus
+// not-yet-swept orphans AND retained superseded blobs — the packs/ growth
+// the per-repo quota (issue #21) bounds. The suffix, if any, is stripped
+// first, so every namespace write is measured against the same rolled-up
+// usage. Shared by the pre-receive hook, the REST pack writers, and the
+// git surface's pressure check.
+//
+// Since issue #29 this listing is the admission check's usage FLOOR rather
+// than its sole source: the ref-store ledger (ref.ReservePackBytes) charges
+// max(counter, this listing) plus in-flight reservations, closing the
+// concurrent-push overshoot this listing alone admitted. Retained
+// superseded bytes (issue #31) are counted by BOTH sources — here as
+// lingering prefix objects, there as pack_retained rows — until a sweep
+// reclaims them.
+func PackUsageBytes(ctx context.Context, b BlobStore, repo string) (int64, error) {
+	assertf(b != nil && repo != "", "PackUsageBytes: missing blob store or repo")
+	base := QuotaRepoGroup(repo)[0]
 	// Two listings cover base + every namespace without matching sibling
 	// repos: "packs/<base>/" is the base prefix, and "packs/<base>+" only
 	// matches this repo's namespace prefixes ('+' cannot start another

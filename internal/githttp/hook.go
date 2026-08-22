@@ -178,9 +178,9 @@ func preReceive(ctx context.Context) error {
 	defer bl.Close()
 
 	// Resolve quarantined pack names to their content-addressed storage
-	// keys up front (the quota check below needs them). Quarantine contents
-	// are produced by git, but fail closed on a surprising name instead of
-	// crashing receive-pack.
+	// keys and byte sizes up front (the quota gate and the registration
+	// ledger below need both). Quarantine contents are produced by git, but
+	// fail closed on a surprising name instead of crashing receive-pack.
 	var packs []ref.Pack
 	for _, pf := range packFiles {
 		base := filepath.Base(pf) // pack-<hash>.pack
@@ -188,7 +188,14 @@ func preReceive(ctx context.Context) error {
 		if id == "" || id == base {
 			return fmt.Errorf("pre-receive: unexpected pack file name %q", base)
 		}
-		packs = append(packs, ref.Pack{ID: id, Key: blob.PackKey(repo, id)})
+		fi, err := os.Stat(pf)
+		if err != nil {
+			return fmt.Errorf("pre-receive: stat quarantined pack: %w", err)
+		}
+		if fi.Size() <= 0 {
+			return fmt.Errorf("pre-receive: quarantined pack %q is empty", base)
+		}
+		packs = append(packs, ref.Pack{ID: id, Key: blob.PackKey(repo, id), Size: fi.Size()})
 	}
 
 	// Content-addressed dedup (Codex rounds 4 + 10): identical pack keys
@@ -207,8 +214,13 @@ func preReceive(ctx context.Context) error {
 	// and the cost is bounded — at most concurrency-many noncurrent
 	// versions per unique pack on versioned buckets, reclaimable by a
 	// standard noncurrent-version lifecycle rule. gocloud's portable blob
-	// API has no conditional create; per-key cross-replica reservations
-	// are issue #29's ledger design.
+	// API has no conditional create. Issue #29's reservation ledger
+	// deliberately does NOT close this window either: an exclusive live
+	// same-key reservation would wedge crash-window retries for the full
+	// reservation TTL (the wedge class issue #21's reviews eliminated), so
+	// same-key reservations refresh instead — the quota counts the bytes
+	// once and the LWW overwrite stays bounded as described above (see
+	// ref/ledger.go).
 	published := make([]bool, len(packs))
 	for i := range packs {
 		if _, err := bl.Stat(ctx, packs[i].Key); err == nil {
@@ -218,17 +230,37 @@ func preReceive(ctx context.Context) error {
 		}
 	}
 
+	// The ref store opens before the quota gate: the durable reservation
+	// (issue #29) lives there, and RegisterPacks below needs it anyway. An
+	// unreachable store now fails the push before any upload — strictly
+	// better than failing after.
+	st, err := ref.Open(ctx, mustEnv(envHookPGURL...))
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+
 	// Per-repo pack-bytes quota (issue #21, quota.go), enforced before any
 	// upload: pre-receive runs BEFORE the update hook's ref policy, so
 	// without this gate even a rejected push durably grows packs/. Denying
-	// here leaves the quarantine for git to discard — nothing is published
-	// or registered. The error message reaches the client via the sideband
-	// channel; the serve process logs quota pressure at the HTTP layer.
+	// here leaves the quarantine for git to discard — nothing is published,
+	// registered, or reserved. The error message reaches the client via the
+	// sideband channel; the serve process logs quota pressure at the HTTP
+	// layer.
 	//
 	// incoming counts only unpublished packs: double-counting bytes the
 	// usage listing already covers could reject the very retry that
 	// completes an interrupted publication, and an all-published push adds
 	// nothing and passes regardless of usage (the zero-growth rule).
+	//
+	// Admission is a durable reservation in the ref store (issue #29,
+	// ref/ledger.go), not a bare check: the blob listing feeds it only as
+	// the usage FLOOR, while in-flight reservations close the
+	// concurrent-push overshoot the listing alone admitted. The reservation
+	// is consumed atomically by RegisterPacks below; a crash anywhere
+	// between here and there leaves an expiring row the sweeper prunes.
+	var reserved []string
+	var reserveOwner string
 	if quotaRaw := os.Getenv(EnvPackQuota); quotaRaw != "" {
 		quota, err := strconv.ParseInt(quotaRaw, 10, 64)
 		if err != nil || quota <= 0 {
@@ -236,24 +268,43 @@ func preReceive(ctx context.Context) error {
 			// fail closed on nonsense instead of waving the push through.
 			return fmt.Errorf("pre-receive: malformed %s=%q", EnvPackQuota, quotaRaw)
 		}
-		var incoming int64
-		for i, pf := range packFiles {
-			if published[i] {
-				continue
-			}
-			fi, err := os.Stat(pf)
-			if err != nil {
-				return fmt.Errorf("pre-receive: stat quarantined pack: %w", err)
-			}
-			incoming += fi.Size()
+		ttl, err := reservationTTL()
+		if err != nil {
+			return fmt.Errorf("pre-receive: %w", err)
 		}
-		if incoming > 0 {
-			usage, err := packUsageBytes(ctx, bl, repo)
+		var unpublished []ref.Pack
+		for i := range packs {
+			if !published[i] {
+				unpublished = append(unpublished, packs[i])
+			}
+		}
+		if len(unpublished) > 0 {
+			floor, err := packUsageBytes(ctx, bl, repo)
 			if err != nil {
 				return fmt.Errorf("pre-receive: %w", err)
 			}
-			if usage+incoming > quota {
-				return fmt.Errorf("pre-receive: repository pack quota exceeded: push adds %d bytes to %d bytes stored, quota is %d bytes", incoming, usage, quota)
+			reserveOwner = ref.NewReservationOwner()
+			dec, err := st.ReservePackBytes(ctx, blob.QuotaRepoGroup(repo), unpublished, reserveOwner, floor, quota, ttl)
+			if err != nil {
+				return fmt.Errorf("pre-receive: reserve pack bytes: %w", err)
+			}
+			if !dec.OK {
+				var incoming int64
+				for _, p := range unpublished {
+					incoming += p.Size
+				}
+				return fmt.Errorf("pre-receive: repository pack quota exceeded: push adds %d bytes to %d bytes stored (+%d bytes reserved by in-flight pushes), quota is %d bytes",
+					incoming, dec.UsedBytes, dec.ReservedBytes, quota)
+			}
+			for _, p := range unpublished {
+				reserved = append(reserved, p.Key)
+			}
+			// Test knob: crash after the reservation committed, before any
+			// upload — the reservation deliberately leaks (issue #29's
+			// reserve → crash → sweep recovery window).
+			if testMode() && os.Getenv(EnvCrash) == "after-reserve" {
+				fmt.Fprintln(os.Stderr, "codestorage: crashing after reservation, before upload (test knob)")
+				os.Exit(42)
 			}
 		}
 	}
@@ -263,21 +314,23 @@ func preReceive(ctx context.Context) error {
 			continue
 		}
 		if err := bl.UploadFile(ctx, packs[i].Key, pf); err != nil {
+			// Best-effort release: the push is failing, so free the
+			// admission headroom now instead of waiting out the TTL. A
+			// failed release only leaves an expiring row (owner-scoped, so
+			// it can never free a reservation a retry re-acquired).
+			if len(reserved) > 0 {
+				_ = st.ReleasePackReservations(ctx, reserved, reserveOwner)
+			}
 			return fmt.Errorf("pre-receive: upload %s: %w", packs[i].Key, err)
 		}
 	}
 
-	// Test knob: crash between S3 upload and PG commit.
+	// Test knob: crash between S3 upload and PG commit. The reservation
+	// deliberately leaks here — TTL expiry plus the sweeper reclaim it.
 	if testMode() && os.Getenv(EnvCrash) == "after-s3" {
 		fmt.Fprintln(os.Stderr, "codestorage: crashing after S3 upload, before PG commit (test knob)")
 		os.Exit(42)
 	}
-
-	st, err := ref.Open(ctx, mustEnv(envHookPGURL...))
-	if err != nil {
-		return err
-	}
-	defer st.Close()
 	// Writer half of the orphan-sweep coordination (issue #5): a sweeper
 	// may have deleted a just-uploaded key right before the registration
 	// committed; re-upload from the local pack file if so. Verification

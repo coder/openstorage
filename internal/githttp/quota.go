@@ -16,13 +16,17 @@ package githttp
 // quota-pressure log line (packUsageCached) — the server-side
 // observability signal — and never rejects on quota.
 //
-// Usage is measured by listing the repo's pack prefix: registered packs
-// plus not-yet-swept orphans — exactly the packs/ growth the quota bounds.
-// Concurrent pushes each list before their own upload, so the quota is a
-// soft bound: each push individually satisfies usage+incoming <= quota, and
-// a race of N in-flight pushes can overshoot by at most the N-1 smaller
-// pack payloads. Durable cross-replica reservations that close this window
-// need ref-store schema support and are tracked as issue #29.
+// Usage feeding the admission decision has two sources (issue #29,
+// ref/ledger.go): the repo's pack-prefix listing (registered packs plus
+// not-yet-swept orphans and retained superseded blobs — exactly the packs/
+// growth the quota bounds) serves as the FLOOR, and the ref store's
+// maintained usage counter plus in-flight reservations close the
+// concurrent-push overshoot the listing alone admitted: admission is a
+// durable reservation committed before upload and consumed at
+// registration, serialized per base repo across nodes and replicas.
+// Residual overshoot is bounded and documented in ref/ledger.go (TTL-
+// expired in-flight reservations; orphaned uploads seen only by the next
+// listing).
 // Namespaced repos (`+ephemeral`/`+import`) keep separate pack PREFIXES but
 // share the base repository's quota: blob.PackUsageBytes rolls all of a
 // repo's namespaces up, because auth strips the suffix and one token must
@@ -30,7 +34,9 @@ package githttp
 
 import (
 	"context"
+	"fmt"
 	"log"
+	"os"
 	"sync"
 	"time"
 
@@ -40,6 +46,37 @@ import (
 // EnvPackQuota carries the resolved per-repo pack-bytes quota from the serve
 // process into the pre-receive hook (set only when the quota is enabled).
 const EnvPackQuota = "CODESTORAGE_GIT_PACK_QUOTA"
+
+// EnvPackReservationTTL carries the resolved reservation TTL (issue #29, a
+// Go duration string) from the serve process into the pre-receive hook.
+// Set alongside EnvPackQuota; the hook falls back to
+// defaultReservationTTL when it is absent (a serve binary predating the
+// ledger), so quota enforcement never silently weakens on skew.
+const EnvPackReservationTTL = "CODESTORAGE_GIT_PACK_RESERVATION_TTL"
+
+// defaultReservationTTL bounds how long a crashed push's reservation keeps
+// gating admission (ref/ledger.go). It must comfortably exceed the longest
+// plausible server-side pack upload — the reservation is taken BEFORE the
+// upload and consumed at registration — because an expiring in-flight
+// reservation reopens exactly the overshoot the ledger closes. One hour
+// clears a 10 GiB (default-quota-sized) upload at ~3 MB/s.
+const defaultReservationTTL = time.Hour
+
+// reservationTTL resolves the reservation TTL the hook charges and stamps.
+// Malformed values fail closed (deny the push) like a malformed quota: the
+// env comes from our own server, so nonsense means misconfiguration, not
+// client input.
+func reservationTTL() (time.Duration, error) {
+	raw := os.Getenv(EnvPackReservationTTL)
+	if raw == "" {
+		return defaultReservationTTL, nil
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil || d <= 0 {
+		return 0, fmt.Errorf("malformed %s=%q", EnvPackReservationTTL, raw)
+	}
+	return d, nil
+}
 
 // usageCacheTTL bounds how often the HTTP-layer pressure check lists one
 // repo's pack prefix (Codex round 2): without it, every receive-pack POST —

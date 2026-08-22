@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"time"
 
 	"codestorage/internal/blob"
 	"codestorage/internal/ref"
@@ -41,25 +42,53 @@ func (s *server) publishPack(ctx context.Context, repoID, packID, packPath strin
 	// is harmless (content-addressed keys); on versioned buckets the cost
 	// is bounded by concurrency-many noncurrent versions per unique pack,
 	// reclaimable via a lifecycle rule (see the pre-receive hook's twin
-	// note; conditional create is not portable through gocloud, and per-key
-	// reservations are issue #29's ledger design).
+	// note: issue #29's reservation ledger deliberately leaves this window
+	// open — exclusive same-key reservations would wedge crash-window
+	// retries for the TTL; conditional create is not portable through
+	// gocloud).
 	published := false
 	if _, err := s.blobStore.Stat(ctx, key); err == nil {
 		published = true
 	} else if !errors.Is(err, blob.ErrNotFound) {
 		return fmt.Errorf("stat published pack %s: %w", key, err)
 	}
+	pack := ref.Pack{ID: packID, Key: key, Size: info.Size()}
+	assertf(pack.Size > 0, "publishPack: empty pack file %s", packPath)
 	if !published {
 		if s.packQuotaBytes > 0 {
-			usage, err := blob.PackUsageBytes(ctx, s.blobStore, repoID)
+			// Durable admission (issue #29, ref/ledger.go): the listing is
+			// the usage floor; the reservation closes concurrent-writer
+			// overshoot and is consumed by RegisterPacks below. A failed
+			// upload releases it (owner-scoped); a crash leaves an
+			// expiring row the sweeper prunes.
+			floor, err := blob.PackUsageBytes(ctx, s.blobStore, repoID)
 			if err != nil {
 				return fmt.Errorf("pack quota usage: %w", err)
 			}
-			if usage+info.Size() > s.packQuotaBytes {
-				return fmt.Errorf("%w: write adds %d bytes to %d bytes stored, quota is %d bytes", errPackQuotaExceeded, info.Size(), usage, s.packQuotaBytes)
+			owner := ref.NewReservationOwner()
+			ttl := s.packReservationTTL
+			if ttl <= 0 {
+				// Unwired server (direct construction in tests, or a
+				// caller predating the ledger): fall back like the
+				// pre-receive hook does on an absent env — quota
+				// enforcement must never silently weaken.
+				ttl = time.Hour
 			}
-		}
-		if err := s.blobStore.UploadFile(ctx, key, packPath); err != nil {
+			dec, err := s.refStore.ReservePackBytes(ctx, blob.QuotaRepoGroup(repoID),
+				[]ref.Pack{pack}, owner, floor, s.packQuotaBytes, ttl)
+			if err != nil {
+				return fmt.Errorf("reserve pack bytes: %w", err)
+			}
+			if !dec.OK {
+				return fmt.Errorf("%w: write adds %d bytes to %d bytes stored (+%d bytes reserved by in-flight writes), quota is %d bytes",
+					errPackQuotaExceeded, pack.Size, dec.UsedBytes, dec.ReservedBytes, s.packQuotaBytes)
+			}
+			if err := s.blobStore.UploadFile(ctx, key, packPath); err != nil {
+				// Best-effort: a failed release only leaves an expiring row.
+				_ = s.refStore.ReleasePackReservations(ctx, []string{key}, owner)
+				return fmt.Errorf("upload pack %s: %w", key, err)
+			}
+		} else if err := s.blobStore.UploadFile(ctx, key, packPath); err != nil {
 			return fmt.Errorf("upload pack %s: %w", key, err)
 		}
 	}
@@ -67,7 +96,7 @@ func (s *server) publishPack(ctx context.Context, repoID, packID, packPath strin
 	// if a sweeper deleted the key before the registration committed.
 	// Verification runs even when RegisterPacks fails: an ambiguous error
 	// may have committed the row (see the pre-receive hook).
-	regErr := s.refStore.RegisterPacks(ctx, repoID, []ref.Pack{{ID: packID, Key: key}})
+	regErr := s.refStore.RegisterPacks(ctx, repoID, []ref.Pack{pack})
 	if regErr != nil {
 		regErr = fmt.Errorf("register pack %s: %w", packID, regErr)
 	}

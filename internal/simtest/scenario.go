@@ -88,6 +88,7 @@ func defaultFaultProfile(inj *Injector) {
 	inj.SetProbs(OpRefListRefs, Probs{Clean: 0.02})
 	inj.SetProbs(OpBlobUploadFile, Probs{Clean: 0.02, Ambiguous: 0.03})
 	inj.SetProbs(OpBlobDownloadFile, Probs{Clean: 0.02})
+	inj.SetProbs(OpRefReservePacks, Probs{Clean: 0.03, Ambiguous: 0.05})
 }
 
 // Scheduler op kinds and weights. The table is fixed (never map-ordered) so
@@ -105,6 +106,8 @@ const (
 	opPushCrashRegister
 	opRepack
 	opRepackRace
+	opReserveCrash
+	opReserveSweep
 )
 
 var opTable = []struct {
@@ -122,6 +125,8 @@ var opTable = []struct {
 	{opPushCrashRegister, "push-crash-after-register", 7},
 	{opRepack, "repack", 8},
 	{opRepackRace, "repack-race", 4},
+	{opReserveCrash, "reserve-crash", 5},
+	{opReserveSweep, "reserve-sweep", 3},
 }
 
 // simRepo is one simulated repository: its storage key plus the scratch
@@ -224,6 +229,12 @@ func Run(cfg Config) (Result, error) {
 			break
 		}
 		if err := s.checkPackRows(); err != nil {
+			return s.result(), err
+		}
+		if s.stopped {
+			break
+		}
+		if err := s.checkQuotaLedger(); err != nil {
 			return s.result(), err
 		}
 		if !s.stopped && s.step%cfg.FullCheckEvery == 0 {
@@ -338,6 +349,10 @@ func (s *sim) doStep() error {
 		return s.doRepack(name, node, repo)
 	case opRepackRace:
 		return s.doRepackRace(name, node, repo, branch)
+	case opReserveCrash:
+		return s.doReserveCrash(name, node, repo)
+	case opReserveSweep:
+		return s.doReserveSweep(name, node)
 	}
 	panic(fmt.Sprintf("simtest: unhandled op kind %d", kind))
 }
@@ -425,7 +440,7 @@ func (s *sim) pushPipeline(ctx context.Context, node *simNode, repo *simRepo, br
 	if crashPoint == "after-upload" {
 		return "crashed-after-upload", s.checkTipUnchanged(repo.key, branch, old, new)
 	}
-	if err := node.simRef.RegisterPacks(ctx, repo.key, []ref.Pack{{ID: packID, Key: key}}); err != nil {
+	if err := node.simRef.RegisterPacks(ctx, repo.key, []ref.Pack{{ID: packID, Key: key, Size: packFileSize(packPath)}}); err != nil {
 		s.refreshBelief(node, repo.key, branch)
 		return "register-" + errToken(err), s.checkTipUnchanged(repo.key, branch, old, new)
 	}
