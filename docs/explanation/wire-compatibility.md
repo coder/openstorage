@@ -37,7 +37,7 @@ namespaces), and [docs/06](../06-webhooks.md) (webhooks). By feature group:
 | Both path styles | ✅ | `/api/v1/...` (repo from the JWT `repo` claim) and named-repo `/api/repos/{repo_name}/...` aliases over the same handlers |
 | Deprecated spellings | ✅ | Documented upstream aliases accepted ([below](#deprecated-aliases)) |
 | Git smart-HTTP | ✅ | Clone/fetch/push at `/{repo}.git` (repo ID or URL-encoded name), ref policies, signed-commit verification, atomic pushes ([below](#git-protocol-semantics)) |
-| Namespaces & forks | ✅ | `+ephemeral` / `+import` namespaces; copy-on-write forks. Git-pushed vs REST-written ephemeral state live in separate ref spaces ([deviation](#known-deviations-from-the-vendored-spec)) |
+| Namespaces & forks | ✅ | `+ephemeral` / `+import` namespaces; synchronous forks — the full fork-point closure is copied into the new repository (independent storage and [quota](../how-to/storage-lifecycle-and-sweeping.md#pack-quotas), nothing shared with the source). Git-pushed vs REST-written ephemeral state live in separate ref spaces ([deviation](#known-deviations-from-the-vendored-spec)) |
 | Git LFS | ✅ | Batch API on the same remote; presigned S3 transfers with a server-proxied fallback |
 | Webhooks | ✅ | HMAC-signed `push` and `repo.sync.*` events, plus webhook CRUD |
 | Upstream sync & credentials | ✅ | `pull-upstream`, detach base, git-credential CRUD |

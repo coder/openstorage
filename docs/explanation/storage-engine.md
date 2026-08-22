@@ -93,9 +93,12 @@ max(usage counter, blob-listing floor) + active reservations + incoming ≤ quot
   listing can't see yet (staleness, in-flight registrations); the physical listing floor
   covers what the counter never saw (pre-ledger packs, orphaned uploads). Taking the max
   fails toward *denying* at the margin, never toward silent overshoot.
-- **Retained bytes stay counted.** A repack fold doesn't free physical storage, so it
-  doesn't free quota either — headroom returns when the sweeper actually deletes the
-  superseded blobs and debits the ledger. Physical truth, not logical truth.
+- **Retained bytes stay counted.** A repack fold doesn't remove the superseded blobs, so
+  it doesn't free quota either — the ledger is debited only when the sweeper reaps them.
+  Quota tracks the bytes under the repository's *pack prefixes*, not logical
+  reachability. (Bucket-wide consumption falls a step later still: a reaped blob leaves
+  an equal-sized quarantine backup outside the pack prefixes until the purge window
+  passes.)
 - **Namespaces roll up.** `+ephemeral` and `+import` namespaces of a repository share the
   base repository's packs prefix and therefore its quota.
 

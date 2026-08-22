@@ -41,6 +41,14 @@ The database is the authority for refs, metadata, quota accounting, and the dura
 ([`CODESTORAGE_S3_URL`](../reference/configuration.md#codestorage_s3_url)); credentials come
 from the standard AWS chain (env vars, shared config, instance roles).
 
+- **The replica role currently needs `s3:CreateBucket`** even for a pre-provisioned
+  bucket: startup idempotently issues `CreateBucket` and treats only
+  already-exists/owned-by-you answers as success — an `AccessDenied` fails boot rather
+  than probing the existing bucket
+  ([#48](https://github.com/coder/code-storage/issues/48) tracks a least-privilege
+  probe). Also grant `s3:GetBucketVersioning` if you enable delete-mode sweeping (its
+  startup guard must verify versioning state).
+
 - Packs are immutable and content-addressed: the server only ever writes new keys and —
   through the sweeper's destructive modes — deletes provably-unreferenced ones. Nothing
   is overwritten in place.
@@ -120,8 +128,12 @@ inspect `pg_locks` for these advisory lock IDs before suspecting the replica its
 It is a **liveness** probe only: it proves this process (not a stale one squatting the
 port) is accepting HTTP. It does **not** ping Postgres or the bucket — a replica that has
 lost its database still answers `/healthz` while failing real requests with `5xx`. Use it
-for container liveness and load-balancer target registration, and alert on API error
-rates for actual serving health.
+for container liveness (restart-on-hang), but do **not** let it alone drive
+load-balancer target health: a `200` from a broken replica would keep it in rotation.
+There is no built-in dependency-aware readiness endpoint, so route on an external check
+that exercises a real dependency — e.g. a synthetic authenticated read against each
+target, or per-target `5xx`-rate ejection at the load balancer — and alert on API error
+rates for serving health.
 
 ## Reverse proxy and TLS
 
