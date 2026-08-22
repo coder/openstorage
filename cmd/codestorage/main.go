@@ -168,6 +168,8 @@ func cmdServe(ctx context.Context, args []string) error {
 	srv.MaybeRepack = maybeRepack
 	srv.PackQuotaBytes = cfg.packQuotaBytes
 	srv.PackReservationTTL = cfg.packReservationTTL
+	srv.MaxPushBytes = cfg.maxPushBytes
+	srv.VerifySigBudget = cfg.verifySigBudget
 	// docs/05 git URLs address repos by repo_id (name-style urls accepted
 	// too, ADR-21); the resolved RepoID is the only storage key, and the
 	// record backs claim matching for url- or id-carrying tokens (docs/02).

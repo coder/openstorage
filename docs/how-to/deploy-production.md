@@ -204,9 +204,8 @@ rates for serving health.
 The server has no TLS support — terminate TLS at a reverse proxy or load balancer and
 forward plain HTTP to the replicas. **Restrict ingress to the replica port** (firewall /
 security group / network policy allowlisting only the proxy and health-check sources):
-the listener binds `0.0.0.0`, and a client that can reach it directly bypasses every
-proxy-enforced limit — including the request-body cap that is currently the only
-pre-storage push bound ([#55](https://github.com/coder/code-storage/issues/55)). Then:
+the listener binds `0.0.0.0`, and a client that can reach it directly talks plain HTTP
+and bypasses every proxy-enforced limit. Then:
 
 - Set [`CODESTORAGE_BASE_URL`](../reference/configuration.md#codestorage_base_url) to the
   external `https://` URL so clone URLs and other `http_url` values in API responses are
@@ -216,12 +215,17 @@ pre-storage push bound ([#55](https://github.com/coder/code-storage/issues/55)).
   ([#45](https://github.com/coder/code-storage/issues/45)).
 - Both the REST API and git smart-HTTP (clone/push, LFS *batch*) ride the same
   listener — proxy everything. Response bodies (clones, archives) can be very large;
-  stream rather than buffer them. Request bodies need a **generous but bounded** cap set
-  to the largest push you intend to accept: the server currently has no ingress byte
-  bound of its own, and the pack quota runs only *after* a push is fully streamed to
-  local disk ([#55](https://github.com/coder/code-storage/issues/55)) — so the proxy's
-  body cap (plus aligned duration and concurrency limits) is the effective pre-storage
-  bound against resource-exhaustion pushes.
+  stream rather than buffer them. Push ingress is bounded natively: the server rejects
+  any push whose decoded body exceeds
+  [`CODESTORAGE_MAX_PUSH_BYTES`](../reference/configuration.md#codestorage_max_push_bytes)
+  (default 2 × the pack quota, 2 MiB minimum) with a `413`, feeding git at most the cap's worth of
+  bytes ([#55](https://github.com/coder/code-storage/issues/55)) — so size temporary
+  disk for up to one cap per concurrent push (git discards the truncated quarantine on
+  rejection; a declared oversize is rejected without reading at all). A proxy
+  request-body cap is therefore optional defense-in-depth — if you set one, size it at
+  or above the server cap and remember the proxy sees wire bytes while the server counts
+  decoded (post-gzip) bytes. Request duration and concurrency limits remain the proxy's
+  job.
 - **LFS object transfers bypass the proxy on S3/MinIO**: the batch API hands clients
   presigned bucket URLs whenever the backend can sign (the server-proxied transfer is
   only the fallback for backends that cannot, i.e. local file mode). Git LFS clients

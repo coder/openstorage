@@ -124,7 +124,9 @@ func TestVerifySig_SSHMatrix(t *testing.T) {
 	}
 
 	// (5) Branch creation checks EVERYTHING reachable (no pre-push tip), so
-	// the unsigned base history rejects it — the documented no-bypass rule.
+	// the unsigned base history rejects it — the documented no-bypass rule
+	// (branch-protection.md: the comparison is never against other refs;
+	// re-affirmed against issue #59's original creation-walk direction).
 	allRefs := mintTestToken(t, repo, "git:read,git:write", `[["*",["verify-sig"]]]`)
 	mustGit(t, work, "reset", "--hard", signedHead)
 	out, err = tryGit(work, "push", remoteURL(nodeA, repo, allRefs), "HEAD:refs/heads/frombase")
