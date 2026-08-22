@@ -750,6 +750,47 @@ func TestLFSQuota_PublicationBoundedByLease(t *testing.T) {
 	}
 }
 
+// stallingDeleteBlob wedges Delete until its context expires (Codex round
+// 14: the cap-denial cleanup must be deadline-bounded).
+type stallingDeleteBlob struct {
+	blob.BlobStore
+}
+
+func (b stallingDeleteBlob) Delete(ctx context.Context, key string) error {
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+// TestLFSQuota_CapDenialCleanupBounded (Codex round 14): a stalled backend
+// delete during cap-denial cleanup must not pin the handler — the 507
+// answer arrives within the cleanup bound and the per-key slot frees.
+func TestLFSQuota_CapDenialCleanupBounded(t *testing.T) {
+	oldCap, oldTimeout := ref.MaxLFSObjectsPerRepo, lfsCleanupTimeout
+	ref.MaxLFSObjectsPerRepo = 1
+	lfsCleanupTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { ref.MaxLFSObjectsPerRepo, lfsCleanupTimeout = oldCap, oldTimeout })
+
+	srv, st, mint := newLFSQuotaServer(t, 0, time.Hour)
+	tok := mint(auth.ScopeGitWrite)
+	if err := st.RegisterLFSObject(context.Background(), lfsTestRepoID,
+		blob.LFSKey(lfsTestRepoID, strings.Repeat("aa", 32)), 10); err != nil {
+		t.Fatal(err)
+	}
+	srv.Store = staleCountStore{Store: st} // force the atomic-loser path
+	srv.Blob = stallingDeleteBlob{BlobStore: srv.Blob}
+
+	content := []byte("cap loser with stalled cleanup")
+	start := time.Now()
+	w := doLFS(t, srv, http.MethodPut, "/"+lfsTestRepoURL+".git/info/lfs/objects/"+sha256Hex(content),
+		"basic:"+tok, string(content))
+	if w.Code != http.StatusInsufficientStorage {
+		t.Fatalf("cap-loser status = %d, body %s (want 507)", w.Code, w.Body)
+	}
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Fatalf("stalled cleanup held the handler %v, want ~the %v bound", elapsed, lfsCleanupTimeout)
+	}
+}
+
 // TestLFSQuota_NamespaceUsageRollsUpToBase: pack bytes registered under a
 // namespace member of the repo group charge the same quota LFS admission
 // uses — one token must not obtain fresh headroom per surface.

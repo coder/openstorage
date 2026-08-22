@@ -60,6 +60,13 @@ const (
 	lfsMaxBatchObjects = 1000
 )
 
+// lfsCleanupTimeout bounds the cap-denial blob cleanup (Codex round 14):
+// the delete must finish independently of the client's connection lifetime
+// — detached from request cancellation (a hang-up must not skip it) and
+// deadline-bounded (a stalled backend must not pin the handler's staging
+// reservation and per-key slot). A var so tests can shrink it.
+var lfsCleanupTimeout = time.Minute
+
 // lfsUploadIdleTimeout bounds how long a proxy upload body may go without
 // delivering ANY bytes (Codex security round on #51): an upload holds a
 // per-key slot and a staging-budget reservation from before its first body
@@ -917,8 +924,13 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target r
 		// concurrent NEW-key registration is denied too — nothing can be
 		// pointing at these bytes. Best-effort: a failed delete only
 		// leaves what pre-fix behavior always left, an orphan for the
-		// sweeper.
-		if derr := s.Blob.Delete(ctx, key); derr != nil && !errors.Is(derr, blob.ErrNotFound) {
+		// sweeper. Bounded and detached from the request context (Codex
+		// round 14): the cleanup must run even if the client hung up, and
+		// a stalled backend must not pin this handler's staging
+		// reservation and per-key slot behind an unbounded delete.
+		dctx, dcancel := context.WithTimeout(context.WithoutCancel(ctx), lfsCleanupTimeout)
+		defer dcancel()
+		if derr := s.Blob.Delete(dctx, key); derr != nil && !errors.Is(derr, blob.ErrNotFound) {
 			log.Printf("lfs cap-denied cleanup %s: %v", key, derr)
 		}
 		lfsError(w, http.StatusInsufficientStorage, fmt.Sprintf(
