@@ -763,10 +763,15 @@ func (s *server) wcPublish(ctx context.Context, sc *wcScratch, repoID string, pl
 	if err := blob.EnsurePublished(ctx, s.blobStore, key, packPath); err != nil {
 		return 0, false, errors.Join(regErr, fmt.Errorf("verify pack %s: %w", key, err))
 	}
+	// Threshold check regardless of regErr (issue #1): an ambiguous
+	// registration error may have committed the row — the same reason the
+	// verification above runs unconditionally — and skipping the trigger
+	// would strand a threshold crossing until the next write. The check
+	// reads the committed count, so it safely no-ops on a true failure.
+	s.triggerRepack(ctx, repoID)
 	if regErr != nil {
 		return 0, false, regErr
 	}
-	s.triggerRepack(ctx, repoID) // post-RegisterPacks threshold check (issue #1)
 	won, err = s.refStore.CASRef(ctx, repoID, plan.refName, plan.oldSHA, newSHA)
 	if err != nil {
 		return 0, false, fmt.Errorf("cas %s: %w", plan.refName, err)
