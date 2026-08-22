@@ -58,7 +58,8 @@ services:
     ports:
       - "${NODEA_PORT:-8081}:8080"
     volumes:
-      - ${CS_KEYS_DIR:-./compose-keys}:/keys:ro
+      # Only the PUBLIC half: the private key stays on the host for minting.
+      - ${CS_KEYS_DIR:-./compose-keys}/cs-key.pub.pem:/keys/cs-key.pub.pem:ro
     healthcheck:
       # /healthz is unauthenticated; wget is busybox, present in the alpine
       # runtime image.

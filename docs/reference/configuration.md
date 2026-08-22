@@ -169,8 +169,9 @@ a `403` envelope.
 
 ### `CODESTORAGE_PACK_RESERVATION_TTL`
 
-How long a crashed writer's quota reservation keeps gating admission before the sweeper
-prunes it (Go duration, e.g. `30m`, `2h`).
+How long a crashed writer's quota reservation keeps gating admission (Go duration, e.g.
+`30m`, `2h`). Admission ignores rows older than the TTL immediately; the sweeper's
+periodic pruning of expired rows is garbage collection, not what re-opens headroom.
 
 - **Default:** `1h`. **Constraints:** must be positive; a zero TTL would expire live
   reservations instantly, silently reopening the overshoot the ledger closes.
