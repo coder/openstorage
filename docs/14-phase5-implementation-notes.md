@@ -138,6 +138,14 @@ are never logged (worker and delivery code paths keep them out of errors and slo
 fields), webhook secrets are shown exactly once at registration (ADR-29), and credential
 reads are scoped to the sync worker. Revisit when a KMS/keystore seam exists.
 
+**Amended by [#54](https://github.com/coder/code-storage/issues/54):** the environment is
+now that seam. Optional
+[`CODESTORAGE_SECRETS_KEY`](reference/configuration.md#codestorage_secrets_key)
+envelope-encrypts both columns (AES-256-GCM, `enc:v1:` marker, comma-separated key list
+with first-key-encrypts rotation) inside `internal/meta` — encrypt-on-write, fail-closed
+decrypt-on-read, lazy re-encryption of legacy plaintext rows. Unset preserves this ADR's
+plaintext behavior; the never-log and show-once rules stand.
+
 ## ADR-33: Git-push eventing crosses processes — durable River inserts on pg, synchronous deliveries in local mode
 
 Git pushes mutate refs in the `codestorage hook` subprocess (the pre-receive/update

@@ -25,6 +25,7 @@ never a silently-applied default.
 | [`CODESTORAGE_RATE_BURST`](#codestorage_rate_rps--codestorage_rate_burst) | unset (disabled) | Rate-limit token-bucket depth |
 | [`CODESTORAGE_TRUSTED_PROXIES`](#codestorage_trusted_proxies) | unset | CIDR allowlist of reverse proxies for rate-limit client identity |
 | [`CODESTORAGE_WEBHOOK_ALLOW_PRIVATE`](#codestorage_webhook_allow_private) | `false` | Permit private-network webhook receivers (metadata and redirects stay blocked) |
+| [`CODESTORAGE_SECRETS_KEY`](#codestorage_secrets_key) | unset (plaintext) | AES-256 key list for at-rest encryption of stored webhook secrets and upstream credentials |
 | [`CODESTORAGE_PACK_QUOTA_BYTES`](#codestorage_pack_quota_bytes) | 10 GiB | Per-repo pack-bytes quota (`0` disables) |
 | [`CODESTORAGE_PACK_RESERVATION_TTL`](#codestorage_pack_reservation_ttl) | `1h` | Lifetime of a crashed writer's quota reservation |
 | [`CODESTORAGE_SWEEP_INTERVAL`](#codestorage_sweep_interval) | `1h` | Orphan-pack sweep cadence (`0` disables sweeping) |
@@ -174,6 +175,64 @@ and logs a warning at startup. It **does not** permit cloud metadata, unspecifie
 broadcast addresses, other IANA special-purpose ranges (such as documentation, benchmarking,
 reserved, translation, or protocol-anycast space), or redirects. Malformed boolean values
 are startup errors.
+
+## Secrets at rest
+
+### `CODESTORAGE_SECRETS_KEY`
+
+Enables application-level envelope encryption of the metadata database's secret columns:
+webhook HMAC signing secrets (`webhooks.secret`) and upstream-sync credential passwords
+(`git_credentials.password`). **Default: unset — those columns are stored plaintext** and
+the [production guide's](../how-to/deploy-production.md#backing-services) guidance to
+scope database access tightly and encrypt the database and its backups applies unchanged
+(it remains recommended defense-in-depth even with this variable set).
+
+Format: a comma-separated list of base64-encoded 32-byte (AES-256) keys. The **first key
+encrypts every write**; the remaining keys are decrypt-only. Generate a key with:
+
+```sh
+head -c 32 /dev/urandom | base64
+```
+
+Values are stored as `enc:v1:<keyid>:<base64 nonce+ciphertext>` (AES-256-GCM), where
+`<keyid>` is the first 8 hex characters of the key's SHA-256 fingerprint — public, safe to
+log, and usable in SQL to audit rotation progress. Rows written before encryption was
+enabled stay readable and are transparently re-encrypted the next time they are read
+(webhook deliveries, credential use, and list/get API calls all count). Because secrets
+must not look like envelopes, the API rejects new webhook secrets and credential passwords
+starting with the reserved prefix `enc:` (HTTP 400) — in plaintext mode too.
+
+**Key rotation.** Prepend the new key and keep the old key listed:
+
+```sh
+CODESTORAGE_SECRETS_KEY="<new-key>,<old-key>"
+```
+
+Reads decrypt with whichever listed key wrote the row and re-encrypt it under the new
+active key. To force full re-encryption instead of waiting for organic reads, touch every
+row once — list the org's webhooks (`GET /api/v1/webhooks`) and, per repo with a stored
+credential, trigger a sync (`POST /api/v1/repos/pull-upstream`) or re-`PUT` the
+credential. Verify progress directly:
+
+```sql
+SELECT count(*) FROM webhooks        WHERE secret   NOT LIKE 'enc:v1:<new-keyid>:%';
+SELECT count(*) FROM git_credentials WHERE password NOT LIKE 'enc:v1:<new-keyid>:%';
+```
+
+When both counts reach zero, drop the old key from the list.
+
+Failure modes are fail-closed and named: a malformed key list (bad base64, wrong length,
+duplicate or empty entries) is a startup error; reading an encrypted row without the key
+that wrote it is a request-time error naming the row and key fingerprint — never a silent
+plaintext or ciphertext passthrough. Removing the variable entirely while encrypted rows
+exist makes those rows unreadable (same error), so keep the key list stable once enabled
+and back the keys up outside the database. Startup logs one line
+(`secrets at-rest encryption enabled`) with the key count and active fingerprint; key
+material never appears in logs or errors.
+
+Hook subprocesses and every replica must see the same value — it is read from the
+environment by the serve process and inherited by the re-executed hook binary, so no extra
+plumbing is needed beyond setting it consistently across replicas.
 
 ## Pack quota
 
