@@ -93,8 +93,8 @@ share one quota, accounted against the base repository.
 What a denial looks like — over git:
 
 ```
-remote: pre-receive: repository pack quota exceeded: push adds <n> bytes to <n> bytes
-stored (+<n> bytes reserved by in-flight pushes), quota is <n> bytes
+remote: codestorage hook: pre-receive: repository pack quota exceeded: push adds <n> bytes
+to <n> bytes stored (+<n> bytes reserved by in-flight pushes), quota is <n> bytes
 ```
 
 Over REST (commit-pack, diff-commit, restore-commit, merge, notes writes): a `403` with
@@ -159,15 +159,17 @@ threshold=<age> duration=<d>
 |---|---|
 | `live` | Blobs with a registry row — real data, not candidates |
 | `fresh` | Unregistered but younger than the age threshold — likely in-flight writers; never touched |
-| `orphans` / `orphan_bytes` | General orphan candidates (aged, unregistered) |
-| `deleted` / `bytes_reclaimed` | General orphans actually deleted (only in delete mode) |
-| `superseded_deleted` / `retained_bytes_reclaimed` | Repack-superseded blobs reaped and the quota headroom returned |
+| `orphans` / `orphan_bytes` | Aged, unregistered candidates this run — **both** classes: repack-superseded blobs count here too until reaped |
+| `deleted` | Candidates reaped this run (superseded reaps included). Reaping moves bytes to quarantine, so it frees nothing by itself |
+| `bytes_reclaimed` | Bytes of aged quarantine backups purged this run — the moment storage consumption actually decreases |
+| `superseded_deleted` / `retained_bytes_reclaimed` | The provably repack-superseded subset of `deleted`, and the **quota headroom** their reaps returned |
 | `reservations_expired` | Crashed-writer quota reservations pruned this run |
 | `delete_enabled` / `delete_superseded` | The modes this run actually ran with (a [guard downgrade](#s3-bucket-versioning) shows here) |
 
-In list-only mode, each candidate is also logged individually
-(`orphan pack candidate ... mode=list-only`) so you can audit exactly what deletion
-*would* reap. A healthy steady state is `orphans=0` or a small, stable count;
+Every candidate is also logged individually as it is classified
+(`orphan pack candidate key=… size_bytes=… age=… delete_enabled=… delete_superseded=…`),
+so in list-only mode you can audit exactly what deletion *would* reap.
+A healthy steady state is `orphans=0` or a small, stable count;
 monotonically growing `orphan_bytes` means crashed writers or fold races are outpacing
 your (disabled) deletion and deserves investigation before you consider enabling it.
 
