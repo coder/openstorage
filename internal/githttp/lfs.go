@@ -426,55 +426,95 @@ func (s *Server) lfsBatchUpload(r *http.Request, repoElem string, target repoTar
 		needIdx[key] = append(needIdx[key], i)
 		needSize[key] = max(needSize[key], obj.Size)
 	}
+	// refreshZeroGrowth re-reads the still-new keys' registry rows: any
+	// denial below may rest on a STALE classification (Codex round 28) —
+	// a concurrent identical upload on another replica can register a
+	// requested OID after the initial read, making that key zero-growth
+	// (its bytes and row are already counted). Called only on the brink
+	// of a denial, so the happy path keeps one registry read per key;
+	// registration is terminal per key, so flips to zero-growth are
+	// final.
+	refreshZeroGrowth := func() error {
+		for _, key := range order {
+			if zeroGrowth[key] {
+				continue
+			}
+			registered, rerr := s.Store.HasLFSObject(ctx, repoID, key)
+			if rerr != nil {
+				return rerr
+			}
+			if registered {
+				zeroGrowth[key] = true
+			}
+		}
+		return nil
+	}
+	countNew := func() int64 {
+		var n int64
+		for _, key := range order {
+			if !zeroGrowth[key] {
+				n++
+			}
+		}
+		return n
+	}
 	// Object-count cap (Codex security round 2): NEW objects — keys with
 	// no registry row — bound the repo's permanent object population at
 	// admission, independent of bytes. Zero-growth repairs and stored
 	// objects are exempt: they add no rows.
-	var newObjects int64
-	for _, key := range order {
-		if !zeroGrowth[key] {
-			newObjects++
-		}
-	}
-	if newObjects > 0 {
+	if newObjects := countNew(); newObjects > 0 {
 		count, err := s.Store.CountLFSObjects(ctx, repoID)
 		if err != nil {
 			log.Printf("lfs registry count %s: %v", repoID, err)
 			return s.denyAllNeeded(order, needIdx, results, http.StatusInternalServerError, "object registry unavailable")
 		}
 		if count+newObjects > ref.MaxLFSObjectsPerRepo {
-			return s.denyAllNeeded(order, needIdx, results, http.StatusInsufficientStorage, fmt.Sprintf(
-				"repository LFS object count limit reached (%d objects stored, limit %d)",
-				count, ref.MaxLFSObjectsPerRepo))
+			if err := refreshZeroGrowth(); err != nil {
+				log.Printf("lfs registry %s: %v", repoID, err)
+				return s.denyAllNeeded(order, needIdx, results, http.StatusInternalServerError, "object registry unavailable")
+			}
+			if count+countNew() > ref.MaxLFSObjectsPerRepo {
+				return s.denyAllNeeded(order, needIdx, results, http.StatusInsufficientStorage, fmt.Sprintf(
+					"repository LFS object count limit reached (%d objects stored, limit %d)",
+					count, ref.MaxLFSObjectsPerRepo))
+			}
 		}
 	}
 	// Admission: reserve the declared sizes before ANY transfer href is
 	// issued. Zero-size entries charge nothing (the empty object is
 	// zero growth) but still get actions.
+	//
+	// ADVISORY admission only — the batch inserts NO reservation rows
+	// (Codex round 17): any batch-time durable hold is rotatable (a
+	// fresh OID per TTL re-acquires the whole headroom without ever
+	// transferring a byte), so durable ledger writes require transfer
+	// progress — the PUT's post-body admission is authoritative. This
+	// check is the fast-fail UX: an already-over-quota batch answers
+	// per-object 507s before any transfer href is issued. A denial
+	// verdict refreshes the zero-growth classification once and re-runs
+	// (Codex round 28): the verdict may rest on a twin's registration
+	// whose bytes ls.UsageBytes already counts while incoming still
+	// charges them again.
 	if s.PackQuotaBytes > 0 {
-		var packs []ref.Pack
-		for _, key := range order {
-			if sz := needSize[key]; sz > 0 && !zeroGrowth[key] {
-				packs = append(packs, ref.Pack{Key: key, Size: sz})
+		buildPacks := func() []ref.Pack {
+			var packs []ref.Pack
+			for _, key := range order {
+				if sz := needSize[key]; sz > 0 && !zeroGrowth[key] {
+					packs = append(packs, ref.Pack{Key: key, Size: sz})
+				}
 			}
+			return packs
 		}
-		// Saturating sum (Codex round 21): declared sizes are arbitrary
-		// client int64s, and two MaxInt64 entries wrap a naive sum
-		// negative — panicking Admitted's non-negative assertion instead
-		// of denying. The ledger's own arithmetic keeps the total on the
-		// denying side.
-		incoming := ref.IncomingBytes(packs)
-		// ADVISORY admission only — the batch inserts NO reservation rows
-		// (Codex round 17): any batch-time durable hold is rotatable (a
-		// fresh OID per TTL re-acquires the whole headroom without ever
-		// transferring a byte), so durable ledger writes require transfer
-		// progress — the PUT's post-body admission is authoritative. This
-		// check is the fast-fail UX: an already-over-quota batch answers
-		// per-object 507s before any transfer href is issued.
-		if len(packs) > 0 {
-			denyAll := func(code int, msg string) []lfsObjectResult {
-				return s.denyAllNeeded(order, needIdx, results, code, msg)
-			}
+		denyAll := func(code int, msg string) []lfsObjectResult {
+			return s.denyAllNeeded(order, needIdx, results, code, msg)
+		}
+		for attempt, packs := 0, buildPacks(); len(packs) > 0; attempt++ {
+			// Saturating sum (Codex round 21): declared sizes are
+			// arbitrary client int64s, and two MaxInt64 entries wrap a
+			// naive sum negative — panicking Admitted's non-negative
+			// assertion instead of denying. The ledger's own arithmetic
+			// keeps the total on the denying side.
+			incoming := ref.IncomingBytes(packs)
 			floor, err := s.CachedUsageFloor(ctx, repoID)
 			if err != nil {
 				log.Printf("lfs quota: %s: usage listing failed: %v", repoID, err)
@@ -497,11 +537,19 @@ func (s *Server) lfsBatchUpload(r *http.Request, repoElem string, target repoTar
 				return denyAll(http.StatusInternalServerError, "storage quota check failed")
 			}
 			used := max(ls.UsageBytes, floor)
-			if !ref.Admitted(used, ls.ReservedBytes, incoming, s.PackQuotaBytes) {
+			if ref.Admitted(used, ls.ReservedBytes, incoming, s.PackQuotaBytes) {
+				break
+			}
+			if attempt > 0 {
 				return denyAll(http.StatusInsufficientStorage, fmt.Sprintf(
 					"repository storage quota exceeded: upload adds %d bytes to %d bytes stored (+%d bytes reserved by in-flight uploads), quota is %d bytes",
 					incoming, used, ls.ReservedBytes, s.PackQuotaBytes))
 			}
+			if err := refreshZeroGrowth(); err != nil {
+				log.Printf("lfs registry %s: %v", repoID, err)
+				return denyAll(http.StatusInternalServerError, "storage quota check failed")
+			}
+			packs = buildPacks()
 		}
 	}
 	for _, key := range order {

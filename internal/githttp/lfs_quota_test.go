@@ -995,6 +995,55 @@ func TestLFSCap_TwinRegistrationAtBoundaryIsZeroGrowth(t *testing.T) {
 	})
 }
 
+// TestLFSBatch_TwinRegistrationBeforeDenialIsZeroGrowth (Codex round 28):
+// the batch's quota and object-cap denials can rest on a STALE
+// classification — a twin can register a requested OID after the initial
+// registry read. On the brink of either denial the classification is
+// refreshed and newly registered keys flip to zero-growth (their bytes and
+// row are already counted), so the batch issues actions instead of 507ing
+// during a successful identical upload.
+func TestLFSBatch_TwinRegistrationBeforeDenialIsZeroGrowth(t *testing.T) {
+	content := bytes.Repeat([]byte("b"), 90)
+	oid := sha256Hex(content)
+	key := blob.LFSKey(lfsTestRepoID, oid)
+
+	t.Run("quota-denial-path", func(t *testing.T) {
+		srv, st, mint := newLFSQuotaServer(t, 100, time.Hour)
+		tok := mint(auth.ScopeGitWrite)
+		// The twin registers the key (crediting its 90 bytes) right after
+		// the batch's classification read: stale incoming would then
+		// double the bytes past the quota.
+		srv.Store = &twinWinsStore{Store: st, key: key, size: 90}
+		resp := decodeBatch(t, doLFS(t, srv, http.MethodPost, lfsBatchPath, "basic:"+tok,
+			batchBody("upload", oid, 90)))
+		if resp.Objects[0].Error != nil {
+			t.Fatalf("twin-raced batch denied on quota: %+v", resp.Objects[0].Error)
+		}
+		if resp.Objects[0].Actions == nil {
+			t.Fatalf("twin-raced batch issued no action: %+v", resp.Objects[0])
+		}
+	})
+
+	t.Run("cap-denial-path", func(t *testing.T) {
+		old := ref.MaxLFSObjectsPerRepo
+		ref.MaxLFSObjectsPerRepo = 1
+		t.Cleanup(func() { ref.MaxLFSObjectsPerRepo = old })
+		srv, st, mint := newLFSQuotaServer(t, 0, time.Hour)
+		tok := mint(auth.ScopeGitWrite)
+		// The twin's registration consumes the only slot — with the key
+		// registered, this batch adds no object and must not 507.
+		srv.Store = &twinWinsStore{Store: st, key: key, size: 90}
+		resp := decodeBatch(t, doLFS(t, srv, http.MethodPost, lfsBatchPath, "basic:"+tok,
+			batchBody("upload", oid, 90)))
+		if resp.Objects[0].Error != nil {
+			t.Fatalf("twin-raced batch denied on the object cap: %+v", resp.Objects[0].Error)
+		}
+		if resp.Objects[0].Actions == nil {
+			t.Fatalf("twin-raced batch issued no action: %+v", resp.Objects[0])
+		}
+	})
+}
+
 // statCountingBlob counts Stat calls (the PUT dedup probe).
 type statCountingBlob struct {
 	blob.BlobStore
