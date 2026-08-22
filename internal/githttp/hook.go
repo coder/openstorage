@@ -614,13 +614,68 @@ func enforceRefPolicy(ctx context.Context, repo, refName, old, new string) error
 // keys (docs/02 verify-sig, branch-protection.md "Commit signing
 // verifications"). "Introduced" = reachable from new but not from this
 // ref's own pre-push tip; branch creation therefore checks everything and
-// deletion checks nothing. The keyring is read fresh from PG on every push.
+// deletion checks nothing. The keyring is read fresh from PG on every push;
+// within one push, verdicts are cached and shared between the pre-receive
+// policy gate and the update hooks (verifystate.go), so the pre-receive
+// verdict is authoritative for the whole push and N refs at one tip cost
+// each commit exactly one verifier spawn (issue #59).
 func verifySig(ctx context.Context, refName, old, new string) error {
 	if new == ref.ZeroSHA {
 		return nil // deletion introduces no commits
 	}
-	org := mustEnv(EnvOrg)
+	state, err := openVerifyState()
+	if err != nil {
+		return fmt.Errorf("verify-sig: %w", err) // fail closed
+	}
+	// Per-push verified-commit budget (issue #59), resolved BEFORE any
+	// cache checks: it also prices the state loads below.
+	budget, err := verifySigBudget()
+	if err != nil {
+		return fmt.Errorf("verify-sig: %w", err) // fail closed
+	}
+	maxWalk := walkBudget(budget)
+	// Every evaluation pays a fee — one flat unit plus its share of the
+	// range-sidecar lines just parsed — against the walk allowance (Codex
+	// round 12): cache-hitting refs cost almost nothing individually, but
+	// the accumulated fee fails a push closed once its ref count times its
+	// state size stops being cheap. Cheaper than the hook process spawn
+	// each ref already costs until the state is thousands of lines.
+	if err := state.chargeWalk(1+state.rangeLines/verifyStateFeeDivisor, maxWalk, refName); err != nil {
+		return err
+	}
+	// Cross-ref range dedup (issue #59): the verdict for an (old,new) pair
+	// is ref-independent, so N refs pushed to the same tip cost one walk.
+	if state.ranges[rangeKey(old, new)] {
+		return nil
+	}
+	// Commit verdicts load only past the range cache (Codex round 11): a
+	// range-hit ref above never pays for the push's accumulated verdicts.
+	// The load is fee-charged like the sidecar one.
+	if err := state.loadVerdicts(); err != nil {
+		return fmt.Errorf("verify-sig: %w", err) // fail closed
+	}
+	if err := state.chargeWalk(state.verdictLines/verifyStateFeeDivisor, maxWalk, refName); err != nil {
+		return err
+	}
+	pending, _, err := introducedPending(ctx, state, refName, old, new, budget)
+	if err != nil {
+		return err
+	}
+	if len(pending) == 0 {
+		// Nothing new to verify — no keyring access needed, mirroring the
+		// deletion rule. Deliberately records NO range verdict: okrange
+		// lines are persisted only when commits were actually verified
+		// (below), so the state file stays bounded by the spawn budget no
+		// matter how many distinct zero-introduced or fully-cached ranges
+		// one push carries (Codex rounds 4 + 5 — per-ref free records
+		// would grow the file once per ref and make every later hook
+		// rescan it). Recomputing a cached range costs one rev-list whose
+		// examined commits charge the walk allowance, keeping the total
+		// bounded.
+		return nil
+	}
 
+	org := mustEnv(EnvOrg)
 	ms, err := meta.Open(ctx, mustEnv(envHookPGURL...))
 	if err != nil {
 		return fmt.Errorf("verify-sig: open metadata store: %w", err)
@@ -631,23 +686,49 @@ func verifySig(ctx context.Context, refName, old, new string) error {
 		return fmt.Errorf("verify-sig: load signing keys for org %q: %w", org, err)
 	}
 	if len(keys) == 0 {
-		return verifySigDenied(refName, new, fmt.Sprintf("no signing keys registered for org %q", org))
+		// Cache the denial on the first introduced commit — the first line
+		// any identical-range walk emits — so later refs at the same tip
+		// abort after one rev-list line instead of repeating the walk
+		// (Codex round 3: without this, a keyless org turned N same-tip
+		// creations into N full-history walks). The message still names
+		// the tip, matching the documented log-line shape.
+		reason := fmt.Sprintf("no signing keys registered for org %q", org)
+		if err := state.markCommitDenied(pending[0], reason); err != nil {
+			return fmt.Errorf("verify-sig: %w", err)
+		}
+		return verifySigDenied(refName, new, reason)
 	}
 
 	v, cleanup, err := newSigVerifier(keys)
 	if err != nil {
+		// Keyring construction is deterministic on the registered key
+		// material, so its failure holds for the whole push: cache it on
+		// the first introduced commit like the empty-keyring denial, or a
+		// registered-but-unimportable PGP key would re-spawn gpg once per
+		// ref at the same tip without charging any budget (Codex round
+		// 15).
+		reason := fmt.Sprintf("signing keyring unusable: %v", err)
+		if cacheErr := state.markCommitDenied(pending[0], reason); cacheErr != nil {
+			return fmt.Errorf("verify-sig: %w", cacheErr)
+		}
 		return fmt.Errorf("verify-sig: %w", err)
 	}
 	defer cleanup()
 
-	introduced, err := introducedCommits(ctx, old, new)
-	if err != nil {
-		return fmt.Errorf("verify-sig: %w", err)
-	}
-	for _, sha := range introduced {
-		if reason := v.verifyCommit(ctx, sha); reason != "" {
+	for _, sha := range pending {
+		reason := v.verifyCommit(ctx, sha)
+		if reason != "" {
+			if err := state.markCommitDenied(sha, reason); err != nil {
+				return fmt.Errorf("verify-sig: %w", err)
+			}
 			return verifySigDenied(refName, sha, reason)
 		}
+		if err := state.markCommitOK(sha); err != nil {
+			return fmt.Errorf("verify-sig: %w", err)
+		}
+	}
+	if err := state.markRangeOK(old, new); err != nil {
+		return fmt.Errorf("verify-sig: %w", err)
 	}
 	return nil
 }
@@ -659,33 +740,107 @@ func verifySigDenied(refName, sha, reason string) error {
 	return fmt.Errorf("verify-sig denied %s at %s: %s", refName, sha, reason)
 }
 
-// introducedCommits lists the commits reachable from new but not from old
-// (branch creation: old is ZeroSHA, so everything reachable from new).
-// Runs in the bare repo git put us in (cwd, GIT_DIR set by receive-pack).
-func introducedCommits(ctx context.Context, old, new string) ([]string, error) {
+// introducedPending walks the commits reachable from new but not from old
+// (branch creation: old is ZeroSHA, so everything reachable from new) and
+// returns the ones still needing a verifier spawn — dropping cached-OK
+// commits, failing on a cached denial, and aborting the walk the moment the
+// uncached count exceeds the remaining budget. Runs in the bare repo git
+// put us in (cwd, GIT_DIR set by receive-pack).
+//
+// The walk is deliberately NOT bounded by other refs (`--not --all` and
+// friends): the upstream branch-protection contract is explicit that the
+// comparison is against the protected ref's own prior tip, never against
+// other refs — a commit that already exists elsewhere is still checked the
+// first time it is brought onto the protected ref, so unsigned commits
+// cannot be laundered through an unpoliced ref and then referenced by a
+// protected creation (branch-protection.md "Commit signing verifications";
+// Codex round 1 on issue #59's original direction). Cost is bounded by the
+// per-push verdict cache and the budget instead — and the budget bounds the
+// walk ITSELF, two ways (Codex rounds 2 and 3): rev-list output is consumed
+// incrementally with the subprocess killed at abort, uncached commits are
+// bounded by the remaining spawn budget, and EVERY examined commit — cached
+// verdicts included — charges the push's cumulative walk allowance
+// (verifyWalkBudgetMultiplier × budget, persisted across hook processes),
+// so refs at distinct ancestors of an already-verified chain cannot re-walk
+// the history once per ref for free. Budget 0 means unlimited by explicit
+// operator choice.
+func introducedPending(ctx context.Context, state *verifyState, refName, old, new string, budget int) (pending []string, examined int64, retErr error) {
+	assertf(state != nil && budget >= 0 && state.verdictsLoaded, "introducedPending: state=%v budget=%d", state, budget)
 	if !ref.ValidSHA(new) || new == ref.ZeroSHA {
-		return nil, fmt.Errorf("introducedCommits: bad new sha %q", new)
+		return nil, 0, fmt.Errorf("verify-sig: introducedPending: bad new sha %q", new)
 	}
 	args := []string{"rev-list", new}
 	if old != ref.ZeroSHA {
 		args = append(args, "^"+old)
 	}
-	out, err := exec.CommandContext(ctx, "git", args...).Output()
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "git", args...)
+	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return nil, fmt.Errorf("git %s: %w", strings.Join(args, " "), err)
+		return nil, 0, fmt.Errorf("verify-sig: rev-list stdout: %w", err)
 	}
-	var shas []string
-	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+	if err := cmd.Start(); err != nil {
+		return nil, 0, fmt.Errorf("verify-sig: start git %s: %w", strings.Join(args, " "), err)
+	}
+	// Reap the subprocess on every early return; cancel() has already
+	// killed it then, so the Wait error is expected and irrelevant.
+	abort := func() { cancel(); _ = cmd.Wait() }
+
+	// Persist the examined-commit count on every exit path — denials and
+	// aborts included, because a non-atomic push continues with its other
+	// refs. Zero-examined walks persist nothing (see verifySig — the state
+	// file must not grow once per zero-introduced ref). A persist failure
+	// must not let the walk allowance silently reset, so it fails the call
+	// closed unless it is already failing.
+	defer func() {
+		if err := state.markWalked(examined); err != nil && retErr == nil {
+			pending, retErr = nil, fmt.Errorf("verify-sig: %w", err)
+		}
+	}()
+	maxWalk := walkBudget(budget)
+
+	sc := bufio.NewScanner(stdout)
+	for sc.Scan() {
+		line := sc.Text()
 		if line == "" {
 			continue
 		}
 		// Subprocess output: fail closed on surprises, never panic mid-push.
 		if !ref.ValidSHA(line) {
-			return nil, fmt.Errorf("rev-list emitted %q", line)
+			abort()
+			return nil, examined, fmt.Errorf("verify-sig: rev-list emitted %q", line)
 		}
-		shas = append(shas, line)
+		examined++
+		if maxWalk > 0 && state.walked+examined > maxWalk {
+			abort()
+			return nil, examined, state.exhaust(fmt.Sprintf("verify-sig: push exceeds the per-push history-walk allowance: %s pushed the total past %d examined commits (%d× CODESTORAGE_VERIFY_SIG_BUDGET; raise the budget or split the push)",
+				refName, maxWalk, verifyWalkBudgetMultiplier))
+		}
+		if state.ok[line] {
+			continue
+		}
+		// Cached denial: an earlier ref already spawned the verifier for
+		// this commit and failed — short-circuit without another spawn.
+		if reason, denied := state.deny[line]; denied {
+			abort()
+			return nil, examined, verifySigDenied(refName, line, reason)
+		}
+		pending = append(pending, line)
+		if budget > 0 && state.spent+len(pending) > budget {
+			abort()
+			return nil, examined, fmt.Errorf("verify-sig: push exceeds the per-push verification budget: %s introduces more than %d unverified commits with %d of %d verifications already used (raise CODESTORAGE_VERIFY_SIG_BUDGET or push fewer new commits)",
+				refName, budget-state.spent, state.spent, budget)
+		}
 	}
-	return shas, nil
+	if err := sc.Err(); err != nil {
+		abort()
+		return nil, examined, fmt.Errorf("verify-sig: reading rev-list: %w", err)
+	}
+	if err := cmd.Wait(); err != nil {
+		return nil, examined, fmt.Errorf("verify-sig: git %s: %w", strings.Join(args, " "), err)
+	}
+	return pending, examined, nil
 }
 
 // sigVerifier delegates signature checking to git's own machinery
@@ -788,6 +943,7 @@ func (v *sigVerifier) verifyCommit(ctx context.Context, sha string) (reason stri
 		// denial reason instead of crashing receive-pack.
 		return fmt.Sprintf("malformed commit sha %q", sha)
 	}
+	logVerifySpawn(sha)
 	cmd := exec.CommandContext(ctx, "git",
 		"-c", "gpg.ssh.allowedSignersFile="+v.allowedSigners,
 		"verify-commit", sha)

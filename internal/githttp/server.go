@@ -8,12 +8,14 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -81,6 +83,14 @@ type Server struct {
 	// (or the bound listener); when empty, hrefs fall back to the
 	// request's Host and X-Forwarded-Proto.
 	BaseURL string
+	// MaxPushBytes caps the DECODED bytes one receive-pack request may
+	// stream into git (issue #55, pushcap.go); <= 0 disables the cap. Set
+	// by the serve wiring (default: a small multiple of the pack quota).
+	MaxPushBytes int64
+	// VerifySigBudget caps how many commits one push may signature-verify
+	// (issue #59, verifystate.go); <= 0 disables the budget. Set by the
+	// serve wiring.
+	VerifySigBudget int
 	// usage memoizes per-repo pack usage for the quota-pressure log so
 	// replayed cheap POSTs cannot amplify into per-request blob listings.
 	usage usageCache
@@ -416,16 +426,64 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 		httpError(w, http.StatusNotFound, "repository not found")
 		return
 	}
+	// Decoded-byte ingress cap (issue #55, pushcap.go): bound the bytes a
+	// push may stream into git BEFORE receive-pack quarantines them on
+	// disk. Gzip pushes are bounded on BOTH sides of the decoder — the
+	// compressed wire stream (wireCap; empty gzip members decode to
+	// nothing, so the decoded counter alone cannot bound wire consumption)
+	// and the decoded stream (pushCap, which a gzip bomb inflates past).
+	// The decoded counter sits under the atomic sniffer below, so the teed
+	// prefix is counted exactly once. upload-pack requests carry small
+	// negotiation bodies and stay uncapped (out of #55's scope).
+	capped := service == "receive-pack" && s.MaxPushBytes > 0
+	gzipped := r.Header.Get("Content-Encoding") == "gzip"
+	// A body that declares a size past its bound is rejected before
+	// reading a single byte: the decoded cap for plain bodies, the
+	// slack-padded wire limit for gzip ones (whose decoded size the
+	// Content-Length does not bound).
+	if capped {
+		limit := s.MaxPushBytes
+		if gzipped {
+			limit = wirePushLimit(s.MaxPushBytes)
+		}
+		if r.ContentLength > limit {
+			httpError(w, http.StatusRequestEntityTooLarge, pushTooLargeMsg(s.MaxPushBytes))
+			return
+		}
+	}
 	body := io.Reader(r.Body)
-	// git clients gzip large request bodies.
-	if r.Header.Get("Content-Encoding") == "gzip" {
-		gz, err := gzip.NewReader(r.Body)
+	var wireCap *cappedReader
+	if gzipped {
+		wire := io.Reader(r.Body)
+		if capped {
+			wireCap = newCappedReader(wire, wirePushLimit(s.MaxPushBytes))
+			wire = wireCap
+		}
+		gz, err := gzip.NewReader(wire)
 		if err != nil {
+			// An oversized optional gzip header (FNAME/FCOMMENT) can trip
+			// the wire counter inside NewReader itself; that is a cap
+			// overflow, not malformed compression, and must keep the 413
+			// contract (Codex round 15).
+			if wireCap != nil && wireCap.exceeded {
+				httpError(w, http.StatusRequestEntityTooLarge, pushTooLargeMsg(s.MaxPushBytes))
+				return
+			}
 			httpError(w, http.StatusBadRequest, "bad gzip body: "+err.Error())
 			return
 		}
 		defer gz.Close()
 		body = gz
+	}
+	var pushCap *cappedReader
+	if capped {
+		pushCap = newCappedReader(body, s.MaxPushBytes)
+		body = pushCap
+	}
+	// pushOverflowed reports whether either counter has tripped; the wire
+	// counter surfaces through gzip reads, so both must be consulted.
+	pushOverflowed := func() bool {
+		return (pushCap != nil && pushCap.exceeded) || (wireCap != nil && wireCap.exceeded)
 	}
 	// Atomic-capability sniff (issue #28, atomic.go): the wire request is
 	// the only place the server can learn a push is `--atomic` (githooks(5)
@@ -434,6 +492,13 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 	atomicPush := false
 	if service == "receive-pack" {
 		atomicPush, body = sniffAtomicPush(body)
+		// Overflow during the sniff (cap below the command-list prefix):
+		// reject before hydrate or git ever run. The sniffer's non-atomic
+		// verdict on the failed read is irrelevant — the push dies here.
+		if pushOverflowed() {
+			httpError(w, http.StatusRequestEntityTooLarge, pushTooLargeMsg(s.MaxPushBytes))
+			return
+		}
 	}
 	// Pack-quota pressure log (issue #21, quota.go). Enforcement lives
 	// exclusively in pre-receive: only it sees the quarantined packs'
@@ -468,18 +533,25 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 	cmd := exec.CommandContext(r.Context(), "git", service, "--stateless-rpc", repoPath)
 	cmd.Env = os.Environ()
 	if service == "receive-pack" {
-		// Never inherit EnvAtomic from the serve process environment
-		// (Codex round 2): the pre-receive hook trusts it as THIS
-		// request's atomic bit, so a stale operator-exported value would
-		// make every mixed-policy push denial-happy — and appending
-		// without stripping would not even override it, since duplicate
-		// env entries resolve first-match in Go children. os.Environ()
-		// returns a fresh copy, so the in-place filter aliases nothing.
+		// Never inherit per-push hook env from the serve process
+		// environment (Codex round 2): the hooks trust these as THIS
+		// request's state, so a stale operator-exported value would poison
+		// every push (EnvAtomic: denial-happy mixed-policy handling;
+		// EnvVerifyState: verdicts and budget shared ACROSS pushes;
+		// EnvVerifySigBudget: an unvalidated value failing every
+		// verify-sig push closed) — and appending without stripping would
+		// not even override it, since duplicate env entries resolve
+		// first-match in Go children. os.Environ() returns a fresh copy,
+		// so the in-place filter aliases nothing.
 		env := cmd.Env[:0]
 		for _, kv := range cmd.Env {
-			// EnvUsageFloor is stripped for the same reason: the hook
-			// trusts it as THIS push's admission floor.
-			if !strings.HasPrefix(kv, EnvAtomic+"=") && !strings.HasPrefix(kv, EnvUsageFloor+"=") {
+			// EnvUsageFloor, EnvVerifyState, and EnvVerifySigBudget are
+			// stripped for the same reason: the hook trusts them as THIS
+			// push's admission floor and verification state/budget.
+			if !strings.HasPrefix(kv, EnvAtomic+"=") &&
+				!strings.HasPrefix(kv, EnvUsageFloor+"=") &&
+				!strings.HasPrefix(kv, EnvVerifyState+"=") &&
+				!strings.HasPrefix(kv, EnvVerifySigBudget+"=") {
 				env = append(env, kv)
 			}
 		}
@@ -528,17 +600,145 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 		if s.TestMode && crash != "" {
 			cmd.Env = append(cmd.Env, EnvCrash+"="+crash)
 		}
+		// Per-push verify-sig verdict state (issue #59, verifystate.go):
+		// fresh files per receive-pack request, appended to by the
+		// pre-receive gate and every update hook. Only the request scopes
+		// "one push" — hooks are separate processes — so they are created
+		// and removed here. Everything lives inside a PRIVATE 0700 temp
+		// directory: the hooks derive sibling paths (the range sidecar and
+		// walk counter) from the state path by name, and on a host whose
+		// shared temp dir admits other local users, predictable siblings
+		// next to a visible random name could otherwise be pre-created
+		// with forged verdicts (Codex round 13).
+		stateDir, err := os.MkdirTemp("", "codestorage-verify-sig-*")
+		if err != nil {
+			log.Printf("%s %s: verify state: %v", service, repo, err)
+			httpError(w, http.StatusInternalServerError, "push setup failed")
+			return
+		}
+		defer os.RemoveAll(stateDir)
+		statePath := filepath.Join(stateDir, "state")
+		if err := os.WriteFile(statePath, nil, 0o600); err != nil {
+			log.Printf("%s %s: verify state: %v", service, repo, err)
+			httpError(w, http.StatusInternalServerError, "push setup failed")
+			return
+		}
+		cmd.Env = append(cmd.Env, EnvVerifyState+"="+statePath)
+		if s.VerifySigBudget > 0 {
+			cmd.Env = append(cmd.Env, EnvVerifySigBudget+"="+strconv.Itoa(s.VerifySigBudget))
+		}
 	}
-	cmd.Stdin = body
 	cmd.Stderr = os.Stderr
 
 	w.Header().Set("Content-Type", "application/x-git-"+service+"-result")
 	w.Header().Set("Cache-Control", "no-cache")
-	cmd.Stdout = w
-	if err := cmd.Run(); err != nil {
-		// Headers are already sent; the pkt-line stream carries per-ref
-		// errors to the client. Just log.
-		log.Printf("%s %s: %v", service, repo, err)
+	if capped {
+		// Capped receive path (issue #55): own the stdin copy so overflow
+		// stays observable, and gate stdout so the response can still
+		// become a 413 until the body has fully arrived under the cap
+		// (pushcap.go).
+		gate := newPushGate(w)
+		cmd.Stdout = gate
+		stdin, err := cmd.StdinPipe()
+		if err != nil {
+			log.Printf("%s %s: stdin pipe: %v", service, repo, err)
+			httpError(w, http.StatusInternalServerError, "push setup failed")
+			return
+		}
+		if err := cmd.Start(); err != nil {
+			log.Printf("%s %s: start: %v", service, repo, err)
+			httpError(w, http.StatusInternalServerError, "push setup failed")
+			return
+		}
+		// exec's stdout goroutine drains git into the gate concurrently,
+		// so this synchronous copy cannot deadlock. Overflow surfaces on
+		// the cap counters; other copy errors (client hangup, gzip
+		// corruption, git dying early) just end the copy — git sees EOF
+		// and reports through the gate as usual.
+		if _, err := io.Copy(stdin, body); err != nil && !errors.Is(err, errPushTooLarge) {
+			log.Printf("%s %s: request body: %v", service, repo, err)
+		}
+		// The copy can also stop on the WRITE side before the counters
+		// decide anything: receive-pack closes stdin once it has what it
+		// needs (a delete-only push reads just the command list), so a
+		// padded request would otherwise sneak past the cap undetected
+		// (Codex round 11). Drain the capped reader — bounded by the cap
+		// in bytes and by a read deadline in time, because git is already
+		// done and a stalling client must not pin the handler (Codex
+		// round 17; a deadline error just resolves the push from whatever
+		// the counters saw) — so oversized bodies uniformly reach the 413
+		// path.
+		if err := http.NewResponseController(w).SetReadDeadline(time.Now().Add(pushDrainTimeout)); err != nil {
+			log.Printf("%s %s: set drain deadline: %v", service, repo, err)
+		}
+		if _, err := io.Copy(io.Discard, body); err != nil && !errors.Is(err, errPushTooLarge) {
+			log.Printf("%s %s: request body drain: %v", service, repo, err)
+		}
+		// The decoded drain stops at the first gzip framing error without
+		// consuming the wire underneath: a valid push + corrupt member +
+		// padding would evade both counters (Codex round 14). Drain the
+		// compressed side too, bounded by the wire limit.
+		if wireCap != nil {
+			if _, err := io.Copy(io.Discard, wireCap); err != nil && !errors.Is(err, errPushTooLarge) {
+				log.Printf("%s %s: wire body drain: %v", service, repo, err)
+			}
+		}
+		_ = stdin.Close()
+		// Overflow is fully decided the moment the copy ends (the counters
+		// only trip while feeding git), so settle the gate BEFORE waiting:
+		// hook-phase output — sideband progress and keepalives during
+		// pre-receive/update hooks that can legitimately run for minutes —
+		// must stream live on the within-cap path, not buffer until exit
+		// (Codex round 2). Overflow rejects regardless of git's exit
+		// status, which CANNOT discriminate anything here: receive-pack
+		// reports a truncated-pack unpack failure as a normal
+		// report-status response and exits 0.
+		overflow := pushOverflowed()
+		if err := gate.settle(overflow); err != nil {
+			log.Printf("%s %s: response: %v", service, repo, err)
+		}
+		runErr := cmd.Wait()
+		if overflow {
+			// On the normal overflow path git saw the truncated stream
+			// during unpack — before any hook could run — and discarded
+			// its own quarantine: nothing was published or registered, so
+			// the repack trigger below has nothing to see and the 413 can
+			// short-circuit it. The one exception is a client that padded
+			// a complete push with trailing junk past the cap; its hooks
+			// may have run, which is loud-logged and still rejected (only
+			// a non-git client can produce it, and its effects are
+			// quota-admitted like any other push).
+			if runErr == nil {
+				log.Printf("%s %s: receive-pack completed but the request body continued past the %d-byte cap (padded push?)", service, repo, s.MaxPushBytes)
+				// A completed receive-pack means its hooks ran and may
+				// have registered packs (the push was whole before the
+				// padding): the repack threshold trigger must still fire
+				// even though the response is a 413 (Codex round 4).
+				if s.MaybeRepack != nil {
+					s.MaybeRepack(context.WithoutCancel(r.Context()), target.key)
+				}
+			}
+			if gate.responseStarted() {
+				// Response bytes already streamed (gateBufferMax safety
+				// valve): the status is committed, only log.
+				log.Printf("%s %s: push exceeded the %d-byte cap after the response started", service, repo, s.MaxPushBytes)
+				return
+			}
+			log.Printf("%s %s: push exceeded the %d-byte decoded cap, rejected with 413", service, repo, s.MaxPushBytes)
+			httpError(w, http.StatusRequestEntityTooLarge, pushTooLargeMsg(s.MaxPushBytes))
+			return
+		}
+		if runErr != nil {
+			log.Printf("%s %s: %v", service, repo, runErr)
+		}
+	} else {
+		cmd.Stdin = body
+		cmd.Stdout = w
+		if err := cmd.Run(); err != nil {
+			// Headers are already sent; the pkt-line stream carries per-ref
+			// errors to the client. Just log.
+			log.Printf("%s %s: %v", service, repo, err)
+		}
 	}
 	if service == "receive-pack" && s.MaybeRepack != nil {
 		// Unconditionally on completion, not only on success: pre-receive
