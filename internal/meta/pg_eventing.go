@@ -226,6 +226,25 @@ func (s *PG) GetGitCredential(ctx context.Context, id string) (GitCredential, er
 	return c, nil
 }
 
+// GitCredentialMeta returns the row with Password "" (the password column
+// is never read — see the interface comment: recovery for undecryptable
+// rows). ErrNotFound when absent.
+func (s *PG) GitCredentialMeta(ctx context.Context, id string) (GitCredential, error) {
+	assertf(id != "", "GitCredentialMeta: empty id")
+	var c GitCredential
+	err := s.pool.QueryRow(ctx,
+		`SELECT id, repo_id, username, created_at FROM git_credentials WHERE id = $1`, id).
+		Scan(&c.ID, &c.RepoID, &c.Username, &c.CreatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return GitCredential{}, fmt.Errorf("credential %q: %w", id, ErrNotFound)
+	}
+	if err != nil {
+		return GitCredential{}, fmt.Errorf("get credential meta %q: %w", id, err)
+	}
+	c.CreatedAt = c.CreatedAt.UTC()
+	return c, nil
+}
+
 // UpdateGitCredential replaces username/password; ErrNotFound when absent;
 // ErrReservedSecret when the password starts with the reserved envelope
 // prefix.

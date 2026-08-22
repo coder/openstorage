@@ -90,6 +90,13 @@ type EventingStore interface {
 	CreateGitCredential(ctx context.Context, cred GitCredential) (GitCredential, error)
 	// GetGitCredential returns the credential by ID; ErrNotFound when absent.
 	GetGitCredential(ctx context.Context, id string) (GitCredential, error)
+	// GitCredentialMeta returns the credential row with Password always ""
+	// — the password column is never read, so this works even when the
+	// stored envelope can no longer be decrypted (issue #54). Ownership
+	// prechecks for update/delete use it so operators can always replace or
+	// remove a credential whose key was retired prematurely or whose row is
+	// corrupt. ErrNotFound when absent.
+	GitCredentialMeta(ctx context.Context, id string) (GitCredential, error)
 	// UpdateGitCredential replaces username/password; ErrNotFound when absent.
 	UpdateGitCredential(ctx context.Context, id, username, password string) (GitCredential, error)
 	// DeleteGitCredential removes the credential; ErrNotFound when absent.

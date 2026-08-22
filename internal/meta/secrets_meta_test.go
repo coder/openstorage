@@ -296,6 +296,57 @@ func TestSecretsWrongKeyFailsClosed(t *testing.T) {
 	})
 }
 
+// TestSecretsCredentialRecovery covers the operational escape hatch for
+// undecryptable credential rows: the password-free metadata lookup, replace
+// (Update), and delete must all work without decrypting the stored value,
+// so an operator can recover from a prematurely retired key via the normal
+// PUT/DELETE routes.
+func TestSecretsCredentialRecovery(t *testing.T) {
+	runSecretsBackends(t, func(t *testing.T, plain Backend, reopen func(*secrets.Codec) Backend) {
+		ctx := t.Context()
+		writer := reopen(newCodec(t, newTestKey(t)))
+		org := seedOrg(t, writer)
+		repoID := seedRepo(t, writer, org)
+		cred, err := writer.CreateGitCredential(ctx, GitCredential{RepoID: repoID, Username: "bot", Password: "lost-key-pw"})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// The key is gone: decrypting reads fail, metadata does not.
+		wrong := reopen(newCodec(t, newTestKey(t)))
+		if _, err := wrong.GetGitCredential(ctx, cred.ID); !errors.Is(err, secrets.ErrUnknownKey) {
+			t.Fatalf("GetGitCredential: err = %v, want ErrUnknownKey", err)
+		}
+		row, err := wrong.GitCredentialMeta(ctx, cred.ID)
+		if err != nil {
+			t.Fatalf("GitCredentialMeta on undecryptable row: %v", err)
+		}
+		if row.ID != cred.ID || row.RepoID != repoID || row.Username != "bot" || !row.CreatedAt.Equal(cred.CreatedAt) {
+			t.Errorf("GitCredentialMeta = %+v, want id/repo/username/created_at of %+v", row, cred)
+		}
+		if row.Password != "" {
+			t.Errorf("GitCredentialMeta returned a password (%d bytes); must always be empty", len(row.Password))
+		}
+
+		// Replace writes a fresh envelope under the wrong-key handle's
+		// active key — the row is readable again.
+		if _, err := wrong.UpdateGitCredential(ctx, cred.ID, "bot", "replacement-pw"); err != nil {
+			t.Fatalf("UpdateGitCredential on undecryptable row: %v", err)
+		}
+		if got, err := wrong.GetGitCredential(ctx, cred.ID); err != nil || got.Password != "replacement-pw" {
+			t.Fatalf("read after replace: %q, err %v", got.Password, err)
+		}
+
+		// Delete works regardless of decryptability.
+		if err := wrong.DeleteGitCredential(ctx, cred.ID); err != nil {
+			t.Fatalf("DeleteGitCredential: %v", err)
+		}
+		if _, err := wrong.GitCredentialMeta(ctx, cred.ID); !errors.Is(err, ErrNotFound) {
+			t.Errorf("GitCredentialMeta after delete: err = %v, want ErrNotFound", err)
+		}
+	})
+}
+
 func TestSecretsReservedPrefixRejected(t *testing.T) {
 	runSecretsBackends(t, func(t *testing.T, plain Backend, reopen func(*secrets.Codec) Backend) {
 		ctx := t.Context()

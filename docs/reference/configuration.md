@@ -234,7 +234,9 @@ duplicate or empty entries) is a startup error; reading an encrypted row without
 that wrote it is a request-time error naming the row and key fingerprint — never a silent
 plaintext or ciphertext passthrough. Removing the variable entirely while encrypted rows
 exist makes those rows unreadable (same error), so keep the key list stable once enabled
-and back the keys up outside the database. Startup logs one line
+and back the keys up outside the database. Recovery never requires the lost key: replacing
+a credential's password (`PUT`) or deleting it, and deleting + re-registering a webhook,
+work on undecryptable rows — those paths never read the stored value. Startup logs one line
 (`secrets at-rest encryption enabled`) with the key count and active fingerprint; key
 material never appears in logs or errors.
 
