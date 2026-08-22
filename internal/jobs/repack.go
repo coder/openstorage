@@ -315,24 +315,32 @@ func (r *Repacker) Repack(ctx context.Context, repo string) (folded bool, err er
 	if err != nil {
 		// Ambiguous by construction (the transaction may have committed
 		// with the response lost), so the uploaded blob must NOT be
-		// deleted here. RESOLVE the ambiguity by re-reading the
-		// registration — the new pack's key is content-addressed, so a
-		// committed swap (ours, or a concurrent identical fold's) is
-		// exactly "the key is registered":
+		// deleted here. RESOLVE the ambiguity by probing a DISTINGUISHING
+		// old row — one whose id differs from newPack.ID, which always
+		// exists (len(old) >= 2, and the content-derived newPack.ID can
+		// coincide with at most one input). newPack.Key itself proves
+		// nothing: in an identity fold it is registered BEFORE the swap.
+		// A committed swap deletes the probe row; a rollback keeps it:
 		//
-		//   - registered: report folded=true (queue backends run their
-		//     follow-up recheck; coalesced mid-fold triggers stay
-		//     covered) and verify the blob like every registration path;
-		//   - definitively not registered: report folded=false with the
-		//     error — the swap rolled back, and folded=true here would
-		//     make a PERSISTENT write failure drive unbounded
-		//     fold+upload loops (local's folded&&due rerun, river's
-		//     successor) that bypass river's retry budget;
-		//   - recheck unavailable: stay conservative (folded=true +
-		//     verify) — one spurious follow-up recheck against a store
-		//     that just failed is bounded by its own error handling.
-		has, herr := r.store.HasPack(ctx, repo, newPack.Key)
-		if herr == nil && !has {
+		//   - probe still registered: the swap rolled back — report
+		//     folded=false with the error, so a PERSISTENT write failure
+		//     stays inside river's retry budget instead of driving
+		//     unbounded fold+upload loops through follow-up scheduling.
+		//     (A committed swap racing an identical re-push that
+		//     re-registers the probe id would misread as rollback — the
+		//     cost is one skipped follow-up recheck, recovered by the
+		//     next write; never a loop, never corruption.)
+		//   - probe gone: a fold committed (ours, or a concurrent one
+		//     that folded the row away) — folded=true, and verify the
+		//     possibly-referenced blob like every registration path;
+		//   - probe unreadable: stay conservative (folded=true + verify).
+		probe := old[0]
+		if probe.ID == newPack.ID {
+			probe = old[1]
+		}
+		assertf(probe.ID != newPack.ID, "ReplacePacks input %v deduplicates to one id", old)
+		has, herr := r.store.HasPack(ctx, repo, probe.Key)
+		if herr == nil && has {
 			return false, fmt.Errorf("repack %s: replace packs (rolled back): %w", repo, err)
 		}
 		verr := verifyPublished(ctx, r.blobs, newPack.Key, packPath)
