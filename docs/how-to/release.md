@@ -39,19 +39,22 @@ in the CHANGELOG. For releasable work, title the PR:
 
 After the next push to main, release-please opens (or updates) the rolling release PR.
 
-**Known caveat:** the PR is created with the workflow's default `GITHUB_TOKEN`, and
-GitHub never triggers workflows from events created by that token — so the release PR
-starts with **no CI runs** while branch protection requires `lint` / `test` /
-`test-local`. To start the required checks, re-deliver the PR event as a real user:
+**Known caveat** (verified empirically on the first release PR, #74): the PR is created
+by `github-actions[bot]`, so GitHub creates the `pull_request` CI run but holds it at
+**"action required"** — nothing executes until a maintainer approves it, while branch
+protection requires `lint` / `test` / `test-local`. Approve via the **Approve and run**
+button on the PR's Actions run, or:
 
 ```sh
-gh pr close  <release-pr> -R coder/code-storage
-gh pr reopen <release-pr> -R coder/code-storage
+gh run list -R coder/code-storage --branch release-please--branches--main --limit 1
+gh api --method POST repos/coder/code-storage/actions/runs/<run-id>/approve
 ```
 
-The long-term fix is a fine-grained PAT or GitHub App token stored as a repo secret and
-passed to the action's `token` input; until one is provisioned, the close/reopen nudge
-is the documented ritual. Do **not** loosen branch protection instead.
+Each release-please refresh of the branch (any push to main while the release PR is
+open) creates a fresh held run needing the same approval. A fine-grained PAT or GitHub
+App token in the action's `token` input would remove the ritual; until one is
+provisioned, approve-and-run is the documented path. Do **not** loosen branch
+protection instead.
 
 ## 3. Merge the release PR
 
@@ -79,9 +82,11 @@ from the tag and replaces the assets (`--clobber`).
   or `gpg` / `ssh-keygen` (required for `verify-sig` ref policies, which shell out and
   fail closed — [#50](https://github.com/coder/code-storage/issues/50)). Unlike the
   Docker image, a bare binary brings none of these; install them on the host.
-- **First release bootstrap:** `.release-please-manifest.json` starts at `0.0.0` and
-  `bootstrap-sha` in [`release-please-config.json`](../../release-please-config.json)
-  pins where changelog collection starts; both are self-maintaining after the first
-  merged release PR.
+- **First release bootstrap:** `initial-version` in
+  [`release-please-config.json`](../../release-please-config.json) pins the first
+  release to `0.1.0` (without it, release-please's first-release path proposes `1.0.0`
+  and ignores the manifest's `0.0.0`), and `bootstrap-sha` pins where changelog
+  collection starts. Both only affect the first release; the manifest is
+  self-maintaining afterwards.
 - **Tag namespace:** leave `v*` tags to release-please. A manually pushed tag would
   desync its notion of the last release.
