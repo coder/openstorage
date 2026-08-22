@@ -156,11 +156,13 @@ func TestRegisterConsumesReservation(t *testing.T) {
 
 // TestReserveSameKeyRefreshes: a crash-window retry (or concurrent
 // identical push) re-reserving the same key counts its bytes once and never
-// wedges; release is owner-scoped so the stale owner cannot free the newer
-// reservation.
+// wedges. The row is settle-or-TTL (Codex round 22): NO failure-release
+// API exists, because the row is shared by every same-key writer via
+// refresh — whichever writer's failure released it would free headroom the
+// others still stage under, and a third distinct write could consume that
+// headroom before their registration lands, overshooting the quota.
 func TestReserveSameKeyRefreshes(t *testing.T) {
 	runRefBackends(t, func(t *testing.T, s Store) {
-		ctx := context.Background()
 		k := newLedgerKit(t, s)
 		a := k.pack(k.base(), "aa1", 60)
 		if dec := k.reserve([]Pack{a}, "owner-old", 0, 100); !dec.OK {
@@ -174,21 +176,22 @@ func TestReserveSameKeyRefreshes(t *testing.T) {
 		}
 		k.wantState(0, 60, 0)
 
-		// The refresh KEEPS the original owner (Codex round 5 on #51): the
-		// NEWCOMER's failure cleanup must not free the row — the original
-		// writer may still be staging behind it, for its whole upload
-		// duration. (The inverse hazard — the original's cleanup firing in
-		// the instants after a newcomer's refresh — is the accepted lesser
-		// risk: failure and release are one code path, so that window is
-		// not upload-sized, and the leak it can cause is TTL-bounded.)
-		if err := s.ReleasePackReservations(ctx, []string{a.Key}, "owner-new"); err != nil {
-			t.Fatalf("newcomer release: %v", err)
+		// Settle-or-TTL (Codex round 22): with writer A's "failure" having
+		// no release to fire, the shared row keeps gating — a third
+		// distinct write that would fit only in the released headroom is
+		// denied while B is still staging behind the reservation.
+		c := k.pack(k.base(), "cc3", 50)
+		if dec := k.reserve([]Pack{c}, "owner-third", 0, 100); dec.OK {
+			t.Fatalf("third writer admitted into headroom a shared reservation still gates: %+v", dec)
 		}
 		k.wantState(0, 60, 0)
-		if err := s.ReleasePackReservations(ctx, []string{a.Key}, "owner-old"); err != nil {
-			t.Fatalf("original owner release: %v", err)
+
+		// Settlement consumes the shared row by KEY, whoever registers.
+		k.register(k.base(), a)
+		k.wantState(60, 0, 0)
+		if dec := k.reserve([]Pack{c}, "owner-third", 0, 200); !dec.OK {
+			t.Fatalf("post-settlement reserve wedged: %+v", dec)
 		}
-		k.wantState(0, 0, 0)
 	})
 }
 

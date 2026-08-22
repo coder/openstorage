@@ -161,13 +161,6 @@ func (s *SimRefStore) ReservePackBytes(ctx context.Context, group []string, pack
 	}
 }
 
-// ReleasePackReservations delegates to the inner store (no fault point: the
-// release path's failure mode — a leaked reservation — is exactly what the
-// crash ops and TTL expiry already exercise).
-func (s *SimRefStore) ReleasePackReservations(ctx context.Context, keys []string, owner string) error {
-	return s.inner.ReleasePackReservations(ctx, keys, owner)
-}
-
 // SweepExpiredPackReservations delegates to the inner store.
 func (s *SimRefStore) SweepExpiredPackReservations(ctx context.Context, olderThan time.Duration) (int64, error) {
 	return s.inner.SweepExpiredPackReservations(ctx, olderThan)

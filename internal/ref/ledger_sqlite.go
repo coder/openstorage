@@ -103,18 +103,10 @@ func placeholders(n int) string {
 	return string(out)
 }
 
-// ReleasePackReservations deletes the owner's reservations for keys.
-func (s *SQLite) ReleasePackReservations(ctx context.Context, keys []string, owner string) error {
-	assertf(len(keys) > 0 && owner != "", "ReleasePackReservations(%v, %q)", keys, owner)
-	args := make([]any, 0, len(keys)+1)
-	args = append(args, owner)
-	for _, k := range keys {
-		args = append(args, k)
-	}
-	_, err := s.db.ExecContext(ctx,
-		`DELETE FROM pack_reservations WHERE owner = ? AND key IN (?`+placeholders(len(keys)-1)+`)`, args...)
-	return err
-}
+// (ReleasePackReservations was removed in Codex round 22 on #51: same-key
+// reservation rows are shared by every concurrent writer via refresh, so
+// an owner-scoped failure release could free headroom another writer was
+// still staging under. Rows end by settlement or TTL only.)
 
 // SweepExpiredPackReservations prunes reservation rows at least olderThan
 // old.

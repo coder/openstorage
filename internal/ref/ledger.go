@@ -86,10 +86,13 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-// NewReservationOwner mints the random owner token scoping one writer's
-// reservations: ReleasePackReservations is owner-scoped so a stale writer's
-// failure cleanup can never free a reservation a concurrent identical push
-// (or a retry) re-acquired for the same key.
+// NewReservationOwner mints the random owner token stamped on one writer's
+// reservation rows. The owner is provenance only (Codex round 22): rows end
+// exclusively by settlement (RegisterPacks/RegisterLFSObject consume by
+// KEY) or TTL expiry — same-key rows are shared by every concurrent writer
+// via refresh, so no owner-scoped delete can ever be sound: whichever
+// writer's failure fired it would free headroom the others still stage
+// under.
 func NewReservationOwner() string {
 	var b [16]byte
 	if _, err := rand.Read(b[:]); err != nil {
@@ -306,14 +309,6 @@ ON CONFLICT (key) DO UPDATE SET repo = EXCLUDED.repo,
 		return ReserveDecision{}, err
 	}
 	return dec, nil
-}
-
-// ReleasePackReservations deletes the owner's reservations for keys.
-func (s *PG) ReleasePackReservations(ctx context.Context, keys []string, owner string) error {
-	assertf(len(keys) > 0 && owner != "", "ReleasePackReservations(%v, %q)", keys, owner)
-	_, err := s.pool.Exec(ctx,
-		`DELETE FROM pack_reservations WHERE owner = $1 AND key = ANY($2)`, owner, keys)
-	return err
 }
 
 // SweepExpiredPackReservations prunes reservation rows at least olderThan

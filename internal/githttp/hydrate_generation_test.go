@@ -61,10 +61,6 @@ func (s *countingStore) ReservePackBytes(context.Context, []string, []ref.Pack, 
 	panic("Hydrate must never reserve pack bytes")
 }
 
-func (s *countingStore) ReleasePackReservations(context.Context, []string, string) error {
-	panic("Hydrate must never release pack reservations")
-}
-
 func (s *countingStore) SweepExpiredPackReservations(context.Context, time.Duration) (int64, error) {
 	panic("Hydrate must never sweep pack reservations")
 }

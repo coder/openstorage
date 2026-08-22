@@ -113,13 +113,6 @@ type RefStore interface {
 	// admission is authoritative); also tests, oracles, and operator
 	// inspection.
 	QuotaLedgerState(ctx context.Context, group []string, ttl time.Duration) (PackQuotaLedgerState, error)
-	// ReleasePackReservations deletes the caller's reservation rows for
-	// keys — the failed-upload cleanup path. Owner-scoped: a stale caller
-	// must not delete a newer reservation another push re-acquired for the
-	// same key. Releasing an absent or re-owned key is a no-op. The happy
-	// path never calls this: RegisterPacks consumes reservations by key in
-	// the registration transaction.
-	ReleasePackReservations(ctx context.Context, keys []string, owner string) error
 	// SweepExpiredPackReservations deletes reservation rows at least
 	// olderThan old (crash-swept leak reclamation, issue #29; the orphan
 	// sweeper calls it on its cadence). olderThan=0 expires everything —

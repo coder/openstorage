@@ -58,9 +58,9 @@ func (s *server) publishPack(ctx context.Context, repoID, packID, packPath strin
 		if s.packQuotaBytes > 0 {
 			// Durable admission (issue #29, ref/ledger.go): the listing is
 			// the usage floor; the reservation closes concurrent-writer
-			// overshoot and is consumed by RegisterPacks below. A failed
-			// upload releases it (owner-scoped); a crash leaves an
-			// expiring row the sweeper prunes.
+			// overshoot and is consumed by RegisterPacks below. Failed
+			// uploads and crashes alike leave an expiring row the sweeper
+			// prunes (settle-or-TTL, Codex round 22).
 			floor, err := s.usageFloor(ctx, repoID)
 			if err != nil {
 				return fmt.Errorf("pack quota usage: %w", err)
@@ -84,8 +84,11 @@ func (s *server) publishPack(ctx context.Context, repoID, packID, packPath strin
 					errPackQuotaExceeded, pack.Size, dec.UsedBytes, dec.ReservedBytes, s.packQuotaBytes)
 			}
 			if err := s.blobStore.UploadFile(ctx, key, packPath); err != nil {
-				// Best-effort: a failed release only leaves an expiring row.
-				_ = s.refStore.ReleasePackReservations(ctx, []string{key}, owner)
+				// NO failure release, deliberately (Codex round 22): the
+				// reservation row is shared with concurrent identical
+				// writers via same-key refresh, so releasing it could
+				// free headroom another writer still stages under.
+				// Settlement or TTL expiry are the only row ends.
 				return fmt.Errorf("upload pack %s: %w", key, err)
 			}
 		} else if err := s.blobStore.UploadFile(ctx, key, packPath); err != nil {

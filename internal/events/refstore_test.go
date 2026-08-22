@@ -55,7 +55,6 @@ func (f *fakeInner) GetGeneration(context.Context, string) (int64, error)  { ret
 func (f *fakeInner) ReservePackBytes(context.Context, []string, []ref.Pack, string, int64, int64, time.Duration) (ref.ReserveDecision, error) {
 	return ref.ReserveDecision{OK: true}, nil
 }
-func (f *fakeInner) ReleasePackReservations(context.Context, []string, string) error { return nil }
 func (f *fakeInner) SweepExpiredPackReservations(context.Context, time.Duration) (int64, error) {
 	return 0, nil
 }
