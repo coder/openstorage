@@ -848,7 +848,19 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target r
 	// under any sane TTL) left inside the reservation's lifetime. A denial
 	// here means the freed headroom is genuinely gone: reject while
 	// nothing durable exists yet.
+	//
+	// pubCtx then bounds publication + registration by that refreshed
+	// reservation's lease (Codex round 11): UploadFile against a stalled
+	// backend could otherwise outlast the TTL, letting another admission
+	// consume the expired row's headroom while this object still becomes
+	// durable. Registration must COMMIT while the reservation lives, so
+	// the deadline is 90% of the TTL from just before the refresh — the
+	// 10% guard band absorbs app-vs-database clock skew. Deadline expiry
+	// aborts the upload with nothing registered (any published bytes are
+	// a sweepable orphan).
+	pubCtx := ctx
 	if s.PackQuotaBytes > 0 && n > 0 && !registered {
+		refreshedAt := time.Now()
 		floor, err := blob.StorageUsageBytes(ctx, s.Blob, repoID)
 		if err != nil {
 			log.Printf("lfs quota: %s: usage listing failed: %v", repoID, err)
@@ -875,8 +887,11 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target r
 				n, dec.UsedBytes, dec.ReservedBytes, s.PackQuotaBytes))
 			return
 		}
+		var cancel context.CancelFunc
+		pubCtx, cancel = context.WithDeadline(ctx, refreshedAt.Add(s.lfsReservationTTL()*9/10))
+		defer cancel()
 	}
-	if err := s.Blob.UploadFile(ctx, key, path); err != nil {
+	if err := s.Blob.UploadFile(pubCtx, key, path); err != nil {
 		log.Printf("lfs upload %s: %v", key, err)
 		lfsError(w, http.StatusInternalServerError, "object upload failed")
 		return
@@ -886,7 +901,7 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target r
 	// (ambiguous), so the reservation is deliberately left to the TTL and
 	// the sweeper — mirroring the pre-receive hook's crash semantics — and
 	// the client's retry lands on the stored-object adoption path above.
-	regErr := s.Store.RegisterLFSObject(ctx, repoID, key, n)
+	regErr := s.Store.RegisterLFSObject(pubCtx, repoID, key, n)
 	if errors.Is(regErr, ref.ErrLFSObjectCapExceeded) {
 		// The ledger's atomic cap lost the race our fast-fail pre-check
 		// won't have seen: nothing committed. Remove the just-published

@@ -704,6 +704,46 @@ func TestLFSQuota_ExpiredMidUploadRefreshDenies(t *testing.T) {
 	}
 }
 
+// stallingUploadBlob wedges UploadFile until the context expires,
+// simulating a stalled S3 backend (Codex round 11).
+type stallingUploadBlob struct {
+	blob.BlobStore
+}
+
+func (b stallingUploadBlob) UploadFile(ctx context.Context, key, path string) error {
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+// TestLFSQuota_PublicationBoundedByLease (Codex round 11): publication
+// against a stalled backend must abort within the reservation's lease with
+// nothing registered — durable usage can never be created by an upload
+// whose admission reservation already expired.
+func TestLFSQuota_PublicationBoundedByLease(t *testing.T) {
+	const ttl = 400 * time.Millisecond
+	srv, st, mint := newLFSQuotaServer(t, 1000, ttl)
+	srv.Blob = stallingUploadBlob{BlobStore: srv.Blob}
+	tok := mint(auth.ScopeGitWrite)
+	content := []byte("stalled publication")
+	oid := sha256Hex(content)
+
+	start := time.Now()
+	w := doLFS(t, srv, http.MethodPut, "/"+lfsTestRepoURL+".git/info/lfs/objects/"+oid,
+		"basic:"+tok, string(content))
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("stalled-publication PUT status = %d, body %s (want 500)", w.Code, w.Body)
+	}
+	if elapsed := time.Since(start); elapsed > 3*ttl {
+		t.Fatalf("stalled publication held the request %v, want ~90%% of the %v TTL", elapsed, ttl)
+	}
+	if has, err := st.HasLFSObject(context.Background(), lfsTestRepoID, blob.LFSKey(lfsTestRepoID, oid)); err != nil || has {
+		t.Fatalf("aborted publication left a registry row: %v, %v", has, err)
+	}
+	if ls := ledgerState(t, st, time.Hour); ls.UsageBytes != 0 {
+		t.Fatalf("aborted publication credited usage: %+v", ls)
+	}
+}
+
 // TestLFSQuota_NamespaceUsageRollsUpToBase: pack bytes registered under a
 // namespace member of the repo group charge the same quota LFS admission
 // uses — one token must not obtain fresh headroom per surface.
