@@ -157,6 +157,9 @@ func (s *syncServer) handleCreateCredential(w http.ResponseWriter, r *http.Reque
 	case errors.Is(err, upsync.ErrCredentialExists):
 		writeErr(w, http.StatusConflict, "credential already exists")
 		return
+	case errors.Is(err, meta.ErrReservedSecret):
+		writeErr(w, http.StatusBadRequest, "invalid password: "+meta.ErrReservedSecret.Error())
+		return
 	case err != nil:
 		s.internalErr(w, r, "create credential", err)
 		return
@@ -220,6 +223,9 @@ func (s *syncServer) handleUpdateCredential(w http.ResponseWriter, r *http.Reque
 	case errors.Is(err, upsync.ErrNotFound):
 		// Deleted between the ownership check and the update.
 		writeErr(w, http.StatusNotFound, "credential not found")
+		return
+	case errors.Is(err, meta.ErrReservedSecret):
+		writeErr(w, http.StatusBadRequest, "invalid password: "+meta.ErrReservedSecret.Error())
 		return
 	case err != nil:
 		s.internalErr(w, r, "update credential", err)
@@ -377,6 +383,9 @@ func (s *syncServer) handleUpdateCredentialByPath(w http.ResponseWriter, r *http
 	case errors.Is(err, upsync.ErrNotFound):
 		// Deleted between the path resolution and the update.
 		aliasFail(w, routeWrite, http.StatusNotFound, "credential not found")
+		return
+	case errors.Is(err, meta.ErrReservedSecret):
+		aliasFail(w, routeWrite, http.StatusBadRequest, "invalid password: "+meta.ErrReservedSecret.Error())
 		return
 	case err != nil:
 		s.internalErrResult(w, r, "update credential", err)

@@ -54,10 +54,50 @@ func scanRepoUpstream(row pgx.Row) (RepoUpstream, error) {
 	return up, nil
 }
 
+// decryptWebhook maps w.Secret from its stored column form to plaintext.
+// Legacy plaintext rows and rows under a retired key are lazily rewritten
+// under the active key: the stored-value guard makes the UPDATE a
+// compare-and-swap, so a concurrent writer wins and the rewrite no-ops.
+// Rewrite errors are ignored on purpose — the read stays correct and the
+// next read retries.
+func (s *PG) decryptWebhook(ctx context.Context, w *Webhook) error {
+	pt, rewrite, err := decodeSecret(s.codec, w.Secret, fmt.Sprintf("webhook %q secret", w.ID))
+	if err != nil {
+		return err
+	}
+	if rewrite {
+		_, _ = s.pool.Exec(ctx,
+			`UPDATE webhooks SET secret = $3 WHERE id = $1 AND secret = $2`,
+			w.ID, w.Secret, s.codec.Encrypt(pt))
+	}
+	w.Secret = pt
+	return nil
+}
+
+// decryptGitCredential is decryptWebhook's git_credentials.password twin.
+func (s *PG) decryptGitCredential(ctx context.Context, c *GitCredential) error {
+	pt, rewrite, err := decodeSecret(s.codec, c.Password, fmt.Sprintf("credential %q password", c.ID))
+	if err != nil {
+		return err
+	}
+	if rewrite {
+		_, _ = s.pool.Exec(ctx,
+			`UPDATE git_credentials SET password = $3 WHERE id = $1 AND password = $2`,
+			c.ID, c.Password, s.codec.Encrypt(pt))
+	}
+	c.Password = pt
+	return nil
+}
+
 // CreateWebhook inserts a webhook with a server-generated ID.
-// ErrNotFound when the org is unknown.
+// ErrNotFound when the org is unknown; ErrReservedSecret when the secret
+// starts with the reserved envelope prefix.
 func (s *PG) CreateWebhook(ctx context.Context, org, url, secret string) (Webhook, error) {
 	assertf(url != "", "CreateWebhook: empty url for org %q", org)
+	stored, err := encodeSecret(s.codec, secret)
+	if err != nil {
+		return Webhook{}, fmt.Errorf("create webhook for org %q: %w", org, err)
+	}
 	orgID, err := s.lookupOrgID(ctx, org)
 	if err != nil {
 		return Webhook{}, err
@@ -65,7 +105,7 @@ func (s *PG) CreateWebhook(ctx context.Context, org, url, secret string) (Webhoo
 	w := Webhook{ID: NewEventingID("wh"), OrgID: orgID, URL: url, Secret: secret}
 	err = s.pool.QueryRow(ctx,
 		`INSERT INTO webhooks (id, org_id, url, secret) VALUES ($1, $2, $3, $4)
-		 RETURNING created_at`, w.ID, orgID, url, secret).Scan(&w.CreatedAt)
+		 RETURNING created_at`, w.ID, orgID, url, stored).Scan(&w.CreatedAt)
 	if err != nil {
 		return Webhook{}, fmt.Errorf("create webhook for org %q: %w", org, err)
 	}
@@ -94,7 +134,16 @@ func (s *PG) ListWebhooks(ctx context.Context, org string) ([]Webhook, error) {
 		}
 		hooks = append(hooks, w)
 	}
-	return hooks, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	rows.Close() // release the connection before the rewrite UPDATEs
+	for i := range hooks {
+		if err := s.decryptWebhook(ctx, &hooks[i]); err != nil {
+			return nil, err
+		}
+	}
+	return hooks, nil
 }
 
 // GetWebhook returns the webhook with the given ID regardless of org
@@ -108,6 +157,9 @@ func (s *PG) GetWebhook(ctx context.Context, id string) (Webhook, error) {
 	}
 	if err != nil {
 		return Webhook{}, fmt.Errorf("get webhook %q: %w", id, err)
+	}
+	if err := s.decryptWebhook(ctx, &w); err != nil {
+		return Webhook{}, err
 	}
 	return w, nil
 }
@@ -133,14 +185,19 @@ func (s *PG) DeleteWebhook(ctx context.Context, org, id string) error {
 }
 
 // CreateGitCredential stores cred (ID/CreatedAt assigned by the store).
-// ErrAlreadyExists when the repo already has a credential.
+// ErrAlreadyExists when the repo already has a credential; ErrReservedSecret
+// when the password starts with the reserved envelope prefix.
 func (s *PG) CreateGitCredential(ctx context.Context, cred GitCredential) (GitCredential, error) {
 	assertf(cred.RepoID != "", "CreateGitCredential: empty repo id")
+	stored, err := encodeSecret(s.codec, cred.Password)
+	if err != nil {
+		return GitCredential{}, fmt.Errorf("create credential for repo %q: %w", cred.RepoID, err)
+	}
 	cred.ID = NewEventingID("ggc")
-	err := s.pool.QueryRow(ctx,
+	err = s.pool.QueryRow(ctx,
 		`INSERT INTO git_credentials (id, repo_id, username, password) VALUES ($1, $2, $3, $4)
 		 RETURNING created_at`,
-		cred.ID, cred.RepoID, cred.Username, cred.Password).Scan(&cred.CreatedAt)
+		cred.ID, cred.RepoID, cred.Username, stored).Scan(&cred.CreatedAt)
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) && pgErr.Code == pgUniqueViolation && pgErr.ConstraintName == gitCredentialRepoConstraint {
 		return GitCredential{}, fmt.Errorf("credential for repo %q: %w", cred.RepoID, ErrAlreadyExists)
@@ -163,21 +220,33 @@ func (s *PG) GetGitCredential(ctx context.Context, id string) (GitCredential, er
 	if err != nil {
 		return GitCredential{}, fmt.Errorf("get credential %q: %w", id, err)
 	}
+	if err := s.decryptGitCredential(ctx, &c); err != nil {
+		return GitCredential{}, err
+	}
 	return c, nil
 }
 
-// UpdateGitCredential replaces username/password; ErrNotFound when absent.
+// UpdateGitCredential replaces username/password; ErrNotFound when absent;
+// ErrReservedSecret when the password starts with the reserved envelope
+// prefix.
 func (s *PG) UpdateGitCredential(ctx context.Context, id, username, password string) (GitCredential, error) {
 	assertf(id != "", "UpdateGitCredential: empty id")
+	stored, err := encodeSecret(s.codec, password)
+	if err != nil {
+		return GitCredential{}, fmt.Errorf("update credential %q: %w", id, err)
+	}
 	c, err := scanGitCredential(s.pool.QueryRow(ctx,
 		`UPDATE git_credentials SET username = $2, password = $3 WHERE id = $1
-		 RETURNING `+gitCredentialCols, id, username, password))
+		 RETURNING `+gitCredentialCols, id, username, stored))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return GitCredential{}, fmt.Errorf("credential %q: %w", id, ErrNotFound)
 	}
 	if err != nil {
 		return GitCredential{}, fmt.Errorf("update credential %q: %w", id, err)
 	}
+	// The RETURNING row carries the stored form we just wrote; hand the
+	// caller its plaintext back (interface contract: plaintext in, plaintext out).
+	c.Password = password
 	return c, nil
 }
 
@@ -206,6 +275,9 @@ func (s *PG) GitCredentialForRepo(ctx context.Context, repoID string) (GitCreden
 	}
 	if err != nil {
 		return GitCredential{}, fmt.Errorf("get credential for repo %q: %w", repoID, err)
+	}
+	if err := s.decryptGitCredential(ctx, &c); err != nil {
+		return GitCredential{}, err
 	}
 	return c, nil
 }

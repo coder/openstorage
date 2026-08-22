@@ -73,7 +73,14 @@ func cmdSigningKey(ctx context.Context, args []string) error {
 	if urls.dbURL == "" {
 		return errDBURLRequired()
 	}
-	ms, cleanup, err := openMetaStore(ctx, urls.dbURL)
+	// Signing keys are not encrypted, but the codec is threaded for uniform
+	// store semantics (and boot-fatal key-list validation) across every
+	// subcommand that opens the metadata store.
+	secretsCodec, err := resolveSecretsCodec(os.Getenv)
+	if err != nil {
+		return err
+	}
+	ms, cleanup, err := openMetaStore(ctx, urls.dbURL, secretsCodec)
 	if err != nil {
 		return err
 	}

@@ -144,6 +144,9 @@ func (h *webhooksAPI) handleCreate(w http.ResponseWriter, r *http.Request) {
 	case errors.Is(err, meta.ErrNotFound):
 		writeErr(w, http.StatusNotFound, "organization not found")
 		return
+	case errors.Is(err, meta.ErrReservedSecret):
+		writeErr(w, http.StatusBadRequest, "invalid secret: "+meta.ErrReservedSecret.Error())
+		return
 	case err != nil:
 		h.internalErr(w, r, "create webhook", err)
 		return

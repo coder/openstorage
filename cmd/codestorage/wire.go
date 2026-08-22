@@ -29,6 +29,7 @@ import (
 	"codestorage/internal/jobs"
 	"codestorage/internal/meta"
 	"codestorage/internal/ref"
+	"codestorage/internal/secrets"
 )
 
 // buildAPIHandler opens the metadata store, bootstraps the single org with
@@ -40,11 +41,11 @@ import (
 // mux.Handle("/api/", h). refStore/blobStore/cacheDir back the
 // git:read endpoints — serve passes the same instances the githttp fallback
 // uses so both surfaces share one cache.
-func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL, loopbackBaseURL string, orgPEMBlocks []string, refStore ref.RefStore, blobStore blob.BlobStore, cacheDir string, rate api.RateLimitConfig, packQuotaBytes int64, packReservationTTL time.Duration, sweep sweepSettings, repackThreshold int, webhookAllowPrivate bool) (http.Handler, meta.Store, auth.Verifier, func(ctx context.Context, repo string), func(), error) {
+func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL, loopbackBaseURL string, orgPEMBlocks []string, refStore ref.RefStore, blobStore blob.BlobStore, cacheDir string, rate api.RateLimitConfig, packQuotaBytes int64, packReservationTTL time.Duration, sweep sweepSettings, repackThreshold int, webhookAllowPrivate bool, secretsCodec *secrets.Codec) (http.Handler, meta.Store, auth.Verifier, func(ctx context.Context, repo string), func(), error) {
 	assertf(dbURL != "" && org != "" && httpBaseURL != "" && len(orgPEMBlocks) > 0, "buildAPIHandler: missing dbURL/org/httpBaseURL/keys")
 	assertf(loopbackBaseURL != "", "buildAPIHandler: missing loopbackBaseURL")
 	assertf(refStore != nil && blobStore != nil && cacheDir != "", "buildAPIHandler: missing refStore/blobStore/cacheDir")
-	ms, msCleanup, err := openMetaStore(ctx, dbURL)
+	ms, msCleanup, err := openMetaStore(ctx, dbURL, secretsCodec)
 	if err != nil {
 		return nil, nil, nil, nil, nil, err
 	}
@@ -65,6 +66,14 @@ func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL, loopbackBaseU
 	if webhookAllowPrivate {
 		logger.Warn("webhook SSRF guard relaxed: deliveries may target loopback/private/link-local addresses",
 			"env", envWebhookAllowPrivate)
+	}
+
+	// Secrets at-rest encryption status (issue #54): one boot line so
+	// operators can confirm the key list parsed — key ids are public
+	// fingerprints, never material.
+	if secretsCodec != nil {
+		logger.Info("secrets at-rest encryption enabled",
+			"env", envSecretsKey, "keys", secretsCodec.KeyCount(), "active_key_id", secretsCodec.ActiveKeyID())
 	}
 
 	// Org bootstrap + verifier, including the per-process loopback
@@ -250,9 +259,9 @@ func bootstrapOrgAuth(ctx context.Context, ms meta.Store, org string, orgPEMBloc
 // buildAPIHandler) and the signing-key CLI, which talks to the database
 // directly — there is no HTTP surface for the signing-key registry
 // (docs/02: upstream manages keys in its dashboard).
-func openMetaStore(ctx context.Context, dbURL string) (meta.Store, func(), error) {
+func openMetaStore(ctx context.Context, dbURL string, secretsCodec *secrets.Codec) (meta.Store, func(), error) {
 	assertf(dbURL != "", "openMetaStore: empty dbURL")
-	ms, err := meta.Open(ctx, dbURL)
+	ms, err := meta.Open(ctx, dbURL, meta.WithSecretsCodec(secretsCodec))
 	if err != nil {
 		return nil, nil, fmt.Errorf("open metadata store: %w", err)
 	}
