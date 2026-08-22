@@ -74,7 +74,8 @@ survive restarts, so it doubles as a tiny durable git server.
 Two stateless server replicas (`node-a`, `node-b`) share one Postgres + MinIO stack, built
 from the repo `Dockerfile` — a push through one node is immediately visible through the
 other. This is a **development stack** for demonstrating multi-node statelessness (default
-credentials, published backing-service ports, plain HTTP) — not a hardened deployment:
+credentials, published backing-service ports, plain HTTP) — not a hardened deployment
+(for that, see the [production guide](docs/how-to/deploy-production.md)):
 
 ```sh
 # 1. Keys on the host (the same binary also mints tokens below).
@@ -158,8 +159,8 @@ legacy aliases — with defaults and validation constraints:
 |---|---|
 | **Tutorials** | The two quickstarts above |
 | **Reference** | [Configuration](docs/reference/configuration.md) · [CLI](docs/reference/cli.md) · [HTTP API](docs/03-http-api.md) · [Auth & JWT claims](docs/02-authentication.md) · [Webhooks](docs/06-webhooks.md) |
-| **Explanation** | [Domain model](docs/01-domain-model.md) · [Git protocol & namespaces](docs/05-git-protocol-and-namespaces.md) · [Streaming commit protocols](docs/04-streaming-commit-protocols.md) · [Spec index & decision log](docs/README.md) |
-| **How-to** | Hardened production guides are still to come — the compose profile above is a development stack, not deployment guidance. Deployment-relevant knobs (TLS-terminating proxies, rate limits, quotas, sweeping) live in the [configuration reference](docs/reference/configuration.md); packaging decisions are recorded in the [decision log](docs/README.md#document-index) |
+| **Explanation** | [Wire compatibility with code.storage](docs/explanation/wire-compatibility.md) · [The storage engine](docs/explanation/storage-engine.md) · [Domain model](docs/01-domain-model.md) · [Git protocol & namespaces](docs/05-git-protocol-and-namespaces.md) · [Streaming commit protocols](docs/04-streaming-commit-protocols.md) · [Spec index & decision log](docs/README.md) |
+| **How-to** | [Deploy to production (multi-replica)](docs/how-to/deploy-production.md) · [Deploy a two-replica stack with Docker Compose](docs/how-to/deploy-docker-compose.md) · [Operate the storage lifecycle: repack, quotas, sweeping](docs/how-to/storage-lifecycle-and-sweeping.md) |
 
 ## Contributing & testing
 
