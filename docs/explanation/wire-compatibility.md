@@ -48,9 +48,10 @@ namespaces), and [docs/06](../06-webhooks.md) (webhooks). By feature group:
 Upstream renamed several parameters and body fields over time; SDKs in the wild still
 send the old spellings. The backend accepts exactly the documented deprecated aliases —
 no invented ones. On conflict the **current spelling wins** and the losing duplicate is
-ignored rather than independently validated — with one deliberate exception: boolean
-*query* aliases shape-validate both spellings, so a request that `400`d on a malformed
-bool before the alias existed keeps `400`ing:
+ignored rather than independently validated — with two deliberate exceptions: boolean
+*query* aliases shape-validate both spellings (a request that `400`d on a malformed bool
+before the alias existed keeps `400`ing), and the JWT `refs`/`ops` pair **merges**
+rather than conflicts — see the table's last row:
 
 | Endpoint | Current | Deprecated alias |
 |---|---|---|
