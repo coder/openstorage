@@ -5,15 +5,12 @@
 packs) — and proof that a write through one node is immediately visible through the other.
 
 > **This is a development stack, not deployment guidance.** It uses default credentials,
-> publishes the backing-service ports, and speaks plain HTTP. Three flows are not
+> publishes the backing-service ports, and speaks plain HTTP. Two flows are not
 > functional from the host: **upstream mirror sync** (`pull-upstream`) — each node's
 > `CODESTORAGE_BASE_URL` is the **host-facing** URL (`http://127.0.0.1:808x`), which the
-> sync worker cannot reach from inside its own container — **Git LFS transfers** — the
+> sync worker cannot reach from inside its own container — and **Git LFS transfers** — the
 > batch API presigns URLs for the container-only endpoint `http://minio:9000`, which
-> host-side clients cannot resolve — and **`verify-sig`-protected pushes** — the image
-> ships neither `gpg` nor `ssh-keygen`, so signature verification fails closed
-> ([#50](https://github.com/coder/code-storage/issues/50)). Everything else works. For a
-> hardened
+> host-side clients cannot resolve. Everything else works. For a hardened
 > deployment (TLS, trusted proxies, rolling upgrades, key rotation), follow the
 > [production deployment guide](deploy-production.md) — the topology is the same, only the
 > hardening differs.

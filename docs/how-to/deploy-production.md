@@ -25,11 +25,10 @@ clients ──► reverse proxy (TLS) ──► N × codestorage serve ──►
   behavior — e.g. a quota only some replicas enforce, or a sweeper mode that depends on
   which replica picks the job.
 - The container image (repo [`Dockerfile`](../../Dockerfile)) runs as a non-root user and
-  needs the `git` binary at runtime — already included; remember it if you build your own
-  image. If you protect refs with `verify-sig` policies, also install `gpg` and
-  `ssh-keygen` — signature verification shells out to them and fails closed, and the
-  supplied image currently includes neither
-  ([#50](https://github.com/coder/code-storage/issues/50)).
+  needs the `git` binary at runtime, plus `gpg` and `ssh-keygen` if you protect refs with
+  `verify-sig` policies — signature verification shells out to them and fails closed
+  ([#50](https://github.com/coder/code-storage/issues/50)). The supplied image includes
+  all three (CI asserts this); remember them if you build your own image.
 
 ## Backing services
 
