@@ -193,7 +193,10 @@ forward plain HTTP to the replicas. Then:
 ### Client identity behind the proxy (`CODESTORAGE_TRUSTED_PROXIES`)
 
 Rate limiting ([`CODESTORAGE_RATE_RPS` / `CODESTORAGE_RATE_BURST`](../reference/configuration.md#codestorage_rate_rps--codestorage_rate_burst))
-keys token buckets by client IP. Behind a proxy the TCP peer is the proxy itself, so all
+keys token buckets by client IP. Buckets are **per replica and per surface** (REST and
+git each keep their own in-process state): a client spread across N replicas can consume
+roughly N× the configured REST budget plus N separate git budgets. Size the values as
+per-replica limits, and enforce at the edge when you need one global per-client ceiling. Behind a proxy the TCP peer is the proxy itself, so all
 clients would share one bucket — unless you tell the server which peers are proxies via
 [`CODESTORAGE_TRUSTED_PROXIES`](../reference/configuration.md#codestorage_trusted_proxies),
 a comma-separated CIDR allowlist. The resolution rules (matching the merged behavior
