@@ -379,11 +379,13 @@ func TestSecretsReservedPrefixRejected(t *testing.T) {
 	})
 }
 
-// TestSecretsReservedPrefixReadFailsClosed covers the read side of the
-// collision argument: a stored value inside the reserved namespace that is
-// not a valid v1 envelope (e.g. written by a newer version) must error, not
-// pass through as plaintext.
-func TestSecretsReservedPrefixReadFailsClosed(t *testing.T) {
+// TestSecretsLegacyReservedPrefixMigrated covers the read side of the
+// collision argument: a pre-#54 plaintext row that happens to start with
+// "enc:" (but is not a valid v1 envelope) keeps reading verbatim — older
+// binaries accepted such values — and, once a key is active, is migrated
+// into a real envelope, which removes the ambiguity permanently. Only exact
+// v1-marker values enter the decrypt path (and fail closed there).
+func TestSecretsLegacyReservedPrefixMigrated(t *testing.T) {
 	runSecretsBackends(t, func(t *testing.T, plain Backend, reopen func(*secrets.Codec) Backend) {
 		ctx := t.Context()
 		org := seedOrg(t, plain)
@@ -391,22 +393,113 @@ func TestSecretsReservedPrefixReadFailsClosed(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		// Forge a future-version envelope directly in the database.
-		forged := "enc:v2:00000000:AAAA"
-		switch b := plain.(type) {
-		case *PG:
-			_, err = b.pool.Exec(ctx, `UPDATE webhooks SET secret = $2 WHERE id = $1`, wh.ID, forged)
-		case *SQLite:
-			_, err = b.db.ExecContext(ctx, `UPDATE webhooks SET secret = ? WHERE id = ?`, forged, wh.ID)
+		// Forge a legacy plaintext value inside the reserved namespace
+		// directly in the database (write paths reject it since #54).
+		const legacy = "enc:v0-legacy-plaintext-secret"
+		forgeWebhookSecret(t, plain, wh.ID, legacy)
+
+		// Plaintext mode: reads verbatim, no mutation.
+		if got, err := plain.GetWebhook(ctx, wh.ID); err != nil || got.Secret != legacy {
+			t.Fatalf("plain read of legacy reserved-prefix value: %q, err %v", got.Secret, err)
 		}
+		if raw := rawStored(t, plain, "webhooks", "secret", wh.ID); raw != legacy {
+			t.Fatalf("plain read mutated the row: %q", raw)
+		}
+
+		// Keyed mode: reads verbatim and migrates the row into an envelope.
+		codec := newCodec(t, newTestKey(t))
+		enc := reopen(codec)
+		if got, err := enc.GetWebhook(ctx, wh.ID); err != nil || got.Secret != legacy {
+			t.Fatalf("keyed read of legacy reserved-prefix value: %q, err %v", got.Secret, err)
+		}
+		if raw := rawStored(t, plain, "webhooks", "secret", wh.ID); !strings.HasPrefix(raw, secrets.Marker+codec.ActiveKeyID()+":") {
+			t.Errorf("keyed read did not migrate the legacy value into an envelope: %q", raw)
+		}
+		if got, err := enc.GetWebhook(ctx, wh.ID); err != nil || got.Secret != legacy {
+			t.Errorf("re-read after migration: %q, err %v", got.Secret, err)
+		}
+
+		// An exact v1-shaped value still fails closed (unknown key id) —
+		// the documented residual assumption.
+		forgeWebhookSecret(t, plain, wh.ID, "enc:v1:00000000:AAAA")
+		if got, err := enc.GetWebhook(ctx, wh.ID); err == nil {
+			t.Errorf("v1-shaped forged value returned %q; want fail-closed error", got.Secret)
+		}
+	})
+}
+
+// forgeWebhookSecret plants a stored secret value directly, bypassing the
+// write-path checks (simulating rows written by older binaries).
+func forgeWebhookSecret(t *testing.T, s Backend, id, value string) {
+	t.Helper()
+	ctx := context.Background()
+	var err error
+	switch b := s.(type) {
+	case *PG:
+		_, err = b.pool.Exec(ctx, `UPDATE webhooks SET secret = $2 WHERE id = $1`, id, value)
+	case *SQLite:
+		_, err = b.db.ExecContext(ctx, `UPDATE webhooks SET secret = ? WHERE id = ?`, value, id)
+	default:
+		t.Fatalf("forgeWebhookSecret: unknown backend %T", s)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestSecretsDecryptOnlyStaging covers CODESTORAGE_SECRETS_MODE=decrypt-only
+// (first-enable staging on multi-replica fleets): keys decrypt existing
+// envelopes, but no envelope is ever written — new secrets store plaintext
+// and no lazy rewrite happens — so replicas still running without the key
+// never meet a value they cannot read.
+func TestSecretsDecryptOnlyStaging(t *testing.T) {
+	runSecretsBackends(t, func(t *testing.T, plain Backend, reopen func(*secrets.Codec) Backend) {
+		ctx := t.Context()
+		key := newTestKey(t)
+		enc := reopen(newCodec(t, key))
+		staging := newCodec(t, key)
+		staging.DecryptOnly = true
+		stager := reopen(staging)
+		org := seedOrg(t, plain)
+
+		// Existing envelope: readable through staging, not rewritten.
+		whEnc, err := enc.CreateWebhook(ctx, org, "https://example.com/a", "sealed")
 		if err != nil {
 			t.Fatal(err)
 		}
-		for name, s := range map[string]Backend{"plain": plain, "encrypted": reopen(newCodec(t, newTestKey(t)))} {
-			got, err := s.GetWebhook(ctx, wh.ID)
-			if err == nil {
-				t.Errorf("%s: read of forged envelope returned %q; want fail-closed error", name, got.Secret)
-			}
+		rawBefore := rawStored(t, plain, "webhooks", "secret", whEnc.ID)
+		if got, err := stager.GetWebhook(ctx, whEnc.ID); err != nil || got.Secret != "sealed" {
+			t.Fatalf("staging read of envelope: %q, err %v", got.Secret, err)
+		}
+
+		// New write through staging: plaintext, so key-less replicas can
+		// still read it.
+		whNew, err := stager.CreateWebhook(ctx, org, "https://example.com/b", "staged-secret")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if raw := rawStored(t, plain, "webhooks", "secret", whNew.ID); raw != "staged-secret" {
+			t.Errorf("staging write produced %q; want plaintext", raw)
+		}
+		if got, err := plain.GetWebhook(ctx, whNew.ID); err != nil || got.Secret != "staged-secret" {
+			t.Errorf("key-less read of staged write: %q, err %v", got.Secret, err)
+		}
+
+		// No lazy rewrites in staging mode: legacy plaintext and the
+		// envelope row keep their stored forms.
+		if got, err := stager.ListWebhooks(ctx, org); err != nil || len(got) != 2 {
+			t.Fatalf("staging list: %d rows, err %v", len(got), err)
+		}
+		if raw := rawStored(t, plain, "webhooks", "secret", whNew.ID); raw != "staged-secret" {
+			t.Errorf("staging list rewrote a plaintext row: %q", raw)
+		}
+		if raw := rawStored(t, plain, "webhooks", "secret", whEnc.ID); raw != rawBefore {
+			t.Errorf("staging list rewrote an envelope row: %q -> %q", rawBefore, raw)
+		}
+
+		// Reserved-prefix rejection applies in staging mode too.
+		if _, err := stager.CreateWebhook(ctx, org, "https://example.com/c", "enc:v1:x"); !errors.Is(err, ErrReservedSecret) {
+			t.Errorf("staging CreateWebhook reserved prefix: err = %v, want ErrReservedSecret", err)
 		}
 	})
 }

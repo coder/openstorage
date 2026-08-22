@@ -44,11 +44,15 @@ func resolveOptions(opts []Option) storeOptions {
 
 // encodeSecret maps a plaintext secret to its stored column value:
 // the reserved-prefix rejection, then encryption when the codec is set.
+// A decrypt-only codec (CODESTORAGE_SECRETS_MODE=decrypt-only staging)
+// writes plaintext like a nil codec — no envelope may exist before every
+// replica can decrypt it; staged rows are re-encrypted lazily once the
+// fleet flips to encrypt mode.
 func encodeSecret(c *secrets.Codec, plaintext string) (string, error) {
 	if strings.HasPrefix(plaintext, secrets.ReservedPrefix) {
 		return "", ErrReservedSecret
 	}
-	if c == nil {
+	if c == nil || c.DecryptOnly {
 		return plaintext, nil
 	}
 	return c.Encrypt(plaintext), nil
@@ -56,16 +60,19 @@ func encodeSecret(c *secrets.Codec, plaintext string) (string, error) {
 
 // decodeSecret maps a stored column value back to plaintext. rewrite=true
 // when the caller should CAS-rewrite the row under the active key: a legacy
-// plaintext row read while encryption is enabled, or an envelope under a
-// retired (non-first) key. what names the row class for operational errors
-// (e.g. `webhook "wh_x" secret`) and must never contain secret material.
+// plaintext row read while encryption is actively on, or an envelope under
+// a retired (non-first) key. A decrypt-only codec never asks for rewrites
+// (staging mode writes no envelopes). what names the row class for
+// operational errors (e.g. `webhook "wh_x" secret`) and must never contain
+// secret material.
 //
-// Fail-closed cases (never silent ciphertext passthrough):
-//   - envelope + nil codec → the operator unset CODESTORAGE_SECRETS_KEY
-//     while encrypted rows remain;
-//   - reserved prefix without a valid v1 marker → written by a newer
-//     version, or corrupt;
-//   - unknown key id / GCM failure → secrets.ErrUnknownKey / ErrDecrypt.
+// Only exact v1 envelopes enter the decrypt path; any other value —
+// including pre-#54 plaintext that happens to start with "enc:" — reads as
+// legacy plaintext (see the internal/secrets package comment for the
+// collision argument). Fail-closed cases (never silent ciphertext
+// passthrough): envelope + nil codec (the operator unset
+// CODESTORAGE_SECRETS_KEY while encrypted rows remain), and unknown key id
+// / GCM failure (secrets.ErrUnknownKey / ErrDecrypt).
 func decodeSecret(c *secrets.Codec, stored, what string) (plaintext string, rewrite bool, err error) {
 	if secrets.IsEncrypted(stored) {
 		if c == nil {
@@ -75,17 +82,10 @@ func decodeSecret(c *secrets.Codec, stored, what string) (plaintext string, rewr
 		if err != nil {
 			return "", false, fmt.Errorf("%s: %w", what, err)
 		}
-		return pt, stale, nil
+		return pt, stale && !c.DecryptOnly, nil
 	}
-	if strings.HasPrefix(stored, secrets.ReservedPrefix) {
-		// Not a v1 envelope, but inside the reserved namespace: written by
-		// a newer envelope version, or a pre-#54 plaintext secret that
-		// collides with the marker (write paths reject these now). Fail
-		// closed rather than guess.
-		return "", false, fmt.Errorf("%s carries the reserved %q prefix but is not a valid %q envelope; refusing to return it as plaintext",
-			what, secrets.ReservedPrefix, secrets.Marker)
-	}
-	// Legacy plaintext row: readable in both modes; rewrite when encryption
-	// is on.
-	return stored, c != nil, nil
+	// Legacy plaintext row: readable in both modes; rewrite into an
+	// envelope when encryption is actively on (this also migrates legacy
+	// values inside the reserved "enc:" namespace, removing the collision).
+	return stored, c != nil && !c.DecryptOnly, nil
 }

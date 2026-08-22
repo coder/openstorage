@@ -26,6 +26,7 @@ never a silently-applied default.
 | [`CODESTORAGE_TRUSTED_PROXIES`](#codestorage_trusted_proxies) | unset | CIDR allowlist of reverse proxies for rate-limit client identity |
 | [`CODESTORAGE_WEBHOOK_ALLOW_PRIVATE`](#codestorage_webhook_allow_private) | `false` | Permit private-network webhook receivers (metadata and redirects stay blocked) |
 | [`CODESTORAGE_SECRETS_KEY`](#codestorage_secrets_key) | unset (plaintext) | AES-256 key list for at-rest encryption of stored webhook secrets and upstream credentials |
+| [`CODESTORAGE_SECRETS_MODE`](#codestorage_secrets_mode) | `encrypt` | `decrypt-only` stages the key fleet-wide before encrypted writes begin |
 | [`CODESTORAGE_PACK_QUOTA_BYTES`](#codestorage_pack_quota_bytes) | 10 GiB | Per-repo pack-bytes quota (`0` disables) |
 | [`CODESTORAGE_PACK_RESERVATION_TTL`](#codestorage_pack_reservation_ttl) | `1h` | Lifetime of a crashed writer's quota reservation |
 | [`CODESTORAGE_SWEEP_INTERVAL`](#codestorage_sweep_interval) | `1h` | Orphan-pack sweep cadence (`0` disables sweeping) |
@@ -198,23 +199,44 @@ Values are stored as `enc:v1:<keyid>:<base64 nonce+ciphertext>` (AES-256-GCM), w
 `<keyid>` is the first 8 hex characters of the key's SHA-256 fingerprint — public, safe to
 log, and usable in SQL to audit rotation progress. Rows written before encryption was
 enabled stay readable and are transparently re-encrypted the next time they are read
-(webhook deliveries, credential use, and list/get API calls all count). Because secrets
-must not look like envelopes, the API rejects new webhook secrets and credential passwords
-starting with the reserved prefix `enc:` (HTTP 400) — in plaintext mode too.
+(webhook deliveries, credential use, and list/get API calls all count) — including any
+legacy plaintext value that happens to start with `enc:`, which reads verbatim and is
+migrated into a real envelope. To keep new values unambiguous, the API rejects new webhook
+secrets and credential passwords starting with the reserved prefix `enc:` (HTTP 400) — in
+plaintext mode too.
 
-**Key rotation.** Rotation is staged so that no process ever encounters a key it cannot
-decrypt — the same replica-by-replica reasoning as the upgrade-ordering note below,
-because a rolling restart applies any new list one replica at a time:
+**Enabling on a multi-replica fleet.** A rolling restart applies any environment change
+one replica at a time, so enablement is staged so that no envelope is ever written before
+every process can decrypt it (a single-replica deployment, e.g. local mode, can skip
+straight to step 3):
 
-1. **Stage the new key fleet-wide, decrypt-only:** `CODESTORAGE_SECRETS_KEY="<old-key>,<new-key>"`.
-   Writes still use the old key, but every restarted process can already decrypt both, so
-   ordering within the rollout does not matter.
+1. **Binary first:** deploy an envelope-aware binary to *every* node — serve replicas and
+   hook-running git nodes — with `CODESTORAGE_SECRETS_KEY` unset. Plaintext behavior is
+   unchanged (see the upgrade-ordering note below for why this must come first).
+2. **Stage the key, decrypt-only:** set `CODESTORAGE_SECRETS_KEY` together with
+   [`CODESTORAGE_SECRETS_MODE=decrypt-only`](#codestorage_secrets_mode) fleet-wide. Every
+   process loads the key for reading but keeps writing plaintext and performs no rewrites,
+   so replicas restarted earlier never produce a value the rest cannot read.
+3. **Switch to encrypt:** once every replica runs with the staged key, drop
+   `CODESTORAGE_SECRETS_MODE` (or set it to `encrypt`) fleet-wide. Encrypted writes and
+   lazy re-encryption begin; replicas restarted earlier in this rollout write envelopes
+   the not-yet-restarted ones already decrypt, courtesy of step 2.
+
+Alternatively, a drained/atomic cutover (stop all replicas, set the key, start) collapses
+steps 2–3.
+
+**Key rotation.** The same staging applies when introducing a new key — no process may
+ever encounter a key it cannot decrypt:
+
+1. **Stage the new key fleet-wide, as a decrypt-only list entry:**
+   `CODESTORAGE_SECRETS_KEY="<old-key>,<new-key>"`. Writes still use the old key, but
+   every restarted process can already decrypt both, so ordering within the rollout does
+   not matter.
 2. **Promote, fleet-wide:** `CODESTORAGE_SECRETS_KEY="<new-key>,<old-key>"`. Replicas
    restarted earlier keep decrypting new-key rows because step 1 listed it everywhere.
 3. **Rewrite and verify, then drop the old key** (below).
 
-A single-replica deployment (local mode) can skip step 1 — one restart swaps the whole
-list atomically.
+A single-replica deployment can skip step 1 — one restart swaps the whole list atomically.
 
 Reads decrypt with whichever listed key wrote the row and re-encrypt it under the new
 active key. To force full re-encryption instead of waiting for organic reads, touch every
@@ -237,8 +259,8 @@ exist makes those rows unreadable (same error), so keep the key list stable once
 and back the keys up outside the database. Recovery never requires the lost key: replacing
 a credential's password (`PUT`) or deleting it, and deleting + re-registering a webhook,
 work on undecryptable rows — those paths never read the stored value. Startup logs one line
-(`secrets at-rest encryption enabled`) with the key count and active fingerprint; key
-material never appears in logs or errors.
+(`secrets at-rest encryption enabled`) with the mode, key count, and active fingerprint;
+key material never appears in logs or errors.
 
 Hook subprocesses and every replica must see the same value — it is read from the
 environment by the serve process and inherited by the re-executed hook binary, so no extra
@@ -247,12 +269,20 @@ plumbing is needed beyond setting it consistently across replicas.
 **Upgrade ordering (mixed fleets).** Binaries that predate this variable do not understand
 the `enc:v1:` envelope: they would read it verbatim and sign webhook deliveries with the
 ciphertext string (or present it as an upstream password), producing invalid deliveries
-and failed syncs with no error. Enable encryption in two phases: **(1)** deploy an
-envelope-aware binary to *every* node — serve replicas and hook-running git nodes — with
-`CODESTORAGE_SECRETS_KEY` unset (plaintext behavior is unchanged); **(2)** only once no
-old binary can run, set the variable fleet-wide and restart. The same constraint applies
+and failed syncs with no error. That is why enablement step 1 above requires every node to
+run an envelope-aware binary before the key is set anywhere. The same constraint applies
 in reverse: rolling back to a pre-envelope binary while encrypted rows exist silently
 misuses them — decrypt requirements do not roll back with the binary.
+
+### `CODESTORAGE_SECRETS_MODE`
+
+Staging switch for [`CODESTORAGE_SECRETS_KEY`](#codestorage_secrets_key). **Default:
+`encrypt`** (normal operation). `decrypt-only` loads the key list for reading but keeps
+writing plaintext and performs no lazy rewrites — the first-enable staging mode described
+above, used while a rolling restart distributes the key so that no envelope exists before
+every replica can decrypt it. Setting `decrypt-only` without `CODESTORAGE_SECRETS_KEY`,
+or any other value, is a startup error. Do not run `decrypt-only` indefinitely: it stores
+new secrets plaintext.
 
 ## Pack quota
 

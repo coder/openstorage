@@ -69,11 +69,15 @@ func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL, loopbackBaseU
 	}
 
 	// Secrets at-rest encryption status (issue #54): one boot line so
-	// operators can confirm the key list parsed — key ids are public
-	// fingerprints, never material.
+	// operators can confirm the key list and mode parsed — key ids are
+	// public fingerprints, never material.
 	if secretsCodec != nil {
+		mode := "encrypt"
+		if secretsCodec.DecryptOnly {
+			mode = "decrypt-only"
+		}
 		logger.Info("secrets at-rest encryption enabled",
-			"env", envSecretsKey, "keys", secretsCodec.KeyCount(), "active_key_id", secretsCodec.ActiveKeyID())
+			"env", envSecretsKey, "mode", mode, "keys", secretsCodec.KeyCount(), "active_key_id", secretsCodec.ActiveKeyID())
 	}
 
 	// Org bootstrap + verifier, including the per-process loopback

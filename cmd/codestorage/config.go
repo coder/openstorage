@@ -91,6 +91,12 @@ const (
 	// legacy plaintext behavior. Hook subprocesses inherit serve's
 	// environment, so the same value reaches their meta stores.
 	envSecretsKey = "CODESTORAGE_SECRETS_KEY"
+	// Staging mode for enabling the key on multi-replica fleets:
+	// "decrypt-only" loads the keys for reading but writes plaintext and
+	// performs no rewrites, so a rolling restart never produces an envelope
+	// some replica cannot read yet; "encrypt" (or unset) is normal
+	// operation. Requires the key to be set.
+	envSecretsMode = "CODESTORAGE_SECRETS_MODE"
 
 	defaultListen = "127.0.0.1:0"
 )
@@ -542,8 +548,9 @@ func resolveWebhookAllowPrivate(getenv func(string) string) (bool, error) {
 	return v, nil
 }
 
-// resolveSecretsCodec parses CODESTORAGE_SECRETS_KEY (issue #54): unset
-// keeps the metadata store's secret columns plaintext; a malformed key list
+// resolveSecretsCodec parses CODESTORAGE_SECRETS_KEY plus the
+// CODESTORAGE_SECRETS_MODE staging switch (issue #54): unset key keeps the
+// metadata store's secret columns plaintext; a malformed key list or mode
 // is a boot error (secrets.ParseKeys never echoes key material). Shared by
 // serve and the signing-key CLI so every store handle in the process tree
 // carries identical secret semantics.
@@ -552,6 +559,17 @@ func resolveSecretsCodec(getenv func(string) string) (*secrets.Codec, error) {
 	codec, err := secrets.ParseKeys(getenv(envSecretsKey))
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", envSecretsKey, err)
+	}
+	switch mode := getenv(envSecretsMode); mode {
+	case "", "encrypt":
+		// Normal operation.
+	case "decrypt-only":
+		if codec == nil {
+			return nil, fmt.Errorf("%s=decrypt-only requires %s to be set", envSecretsMode, envSecretsKey)
+		}
+		codec.DecryptOnly = true
+	default:
+		return nil, fmt.Errorf("%s: want \"encrypt\" or \"decrypt-only\", got %q", envSecretsMode, mode)
 	}
 	return codec, nil
 }
