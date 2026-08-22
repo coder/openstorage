@@ -371,12 +371,16 @@ func (s *Server) lfsBatchUpload(r *http.Request, repoElem string, target repoTar
 			// sweep would classify referenced objects as reapable, so a
 			// swallowed adoption failure here would let the client commit
 			// a pointer to a reapable blob).
-			switch aerr := s.adoptLFSObject(ctx, repoID, key, obj.OID, size); {
+			switch aerr := s.adoptLFSObjectLocked(ctx, repoID, key, obj.OID, size); {
 			case aerr == nil:
 				continue
 			case errors.Is(aerr, ref.ErrLFSObjectCapExceeded):
 				lfsObjectFail(&results[i], http.StatusInsufficientStorage, fmt.Sprintf(
 					"repository LFS object count limit reached (limit %d)", ref.MaxLFSObjectsPerRepo))
+				continue
+			case errors.Is(aerr, errLFSBusy):
+				lfsObjectFail(&results[i], http.StatusTooManyRequests,
+					"a concurrent operation holds this object, retry")
 				continue
 			case errors.Is(aerr, errLFSContentMismatch):
 				// A mismatched legacy blob was removed: the object is now
@@ -551,6 +555,22 @@ func (s *Server) lfsReservationTTL() time.Duration {
 // digest-verified (issue #51's original hole).
 var errLFSContentMismatch = errors.New("stored LFS object does not match its content address")
 
+// errLFSBusy is a transient denial: a concurrent operation holds the
+// resources (per-key slot, staging budget) this request needs. Callers
+// answer 429 + Retry-After.
+var errLFSBusy = errors.New("concurrent LFS operation in progress")
+
+// adoptLFSObjectLocked runs adoptLFSObject under the per-key in-flight
+// slot — the batch path's entrance (the PUT path already holds the slot
+// for its whole lifetime). errLFSBusy when the slot is taken.
+func (s *Server) adoptLFSObjectLocked(ctx context.Context, repoID, key, oid string, size int64) error {
+	if _, busy := s.lfsUploadsInFlight.LoadOrStore(key, struct{}{}); busy {
+		return errLFSBusy
+	}
+	defer s.lfsUploadsInFlight.Delete(key)
+	return s.adoptLFSObject(ctx, repoID, key, oid, size)
+}
+
 // adoptLFSObject backfills the lfs_objects registry row for an object that
 // is already stored but was never registered (uploads predating issue #51,
 // or a verified upload whose registration failed after publish). Callers
@@ -574,15 +594,46 @@ func (s *Server) adoptLFSObject(ctx context.Context, repoID, key, oid string, si
 	// bytes under this key — so the blob is removed and the client's
 	// correct bytes come in through the verified path. At most one
 	// download+hash per object lifetime: adopted objects never re-verify,
-	// mismatches are deleted.
+	// mismatches are deleted. CALLERS HOLD the per-key in-flight slot, so
+	// same-replica verifications of one key are serialized; the download
+	// is charged against the staging budget like any upload (Codex round
+	// 16 — verification stages real disk bytes).
+	if size > 0 && s.LFSStagingBytes > 0 && size > s.LFSStagingBytes {
+		return fmt.Errorf("legacy object verification needs %d bytes of staging, budget is %d", size, s.LFSStagingBytes)
+	}
+	if !s.reserveLFSStaging(size) {
+		return errLFSBusy
+	}
+	defer s.releaseLFSStaging(size)
 	if err := s.verifyStoredLFSObject(ctx, key, oid); err != nil {
 		if !errors.Is(err, errLFSContentMismatch) {
 			return err
+		}
+		// Cross-replica guard (Codex round 16): another replica may have
+		// replaced the corrupt bytes with a verified upload after our
+		// download — its registration is the proof. Re-check the registry
+		// immediately before deleting; if a row appeared, the current
+		// bytes are verified-by-upload and our stale verdict must not
+		// touch them.
+		switch nowRegistered, rerr := s.Store.HasLFSObject(ctx, repoID, key); {
+		case rerr != nil:
+			return rerr
+		case nowRegistered:
+			return nil // replaced and registered by a concurrent verified upload
 		}
 		dctx, dcancel := context.WithTimeout(context.WithoutCancel(ctx), lfsCleanupTimeout)
 		defer dcancel()
 		if derr := s.Blob.Delete(dctx, key); derr != nil && !errors.Is(derr, blob.ErrNotFound) {
 			return fmt.Errorf("remove mismatched legacy object %s: %w", key, derr)
+		}
+		// Post-delete registry re-check: a registration that landed inside
+		// the tiny check-then-delete window means we removed verified
+		// bytes. Loudly logged; not data loss — the registered-but-missing
+		// state is exactly the zero-growth repair path, so the next touch
+		// (including this caller's own upload action) re-publishes the
+		// client's bytes verified.
+		if nowRegistered, rerr := s.Store.HasLFSObject(ctx, repoID, key); rerr == nil && nowRegistered {
+			log.Printf("lfs adopt %s: deleted a concurrently registered replacement (stale mismatch verdict); zero-growth repair will restore it", key)
 		}
 		log.Printf("lfs adopt %s: removed legacy blob failing content verification", key)
 		return errLFSContentMismatch
@@ -766,6 +817,16 @@ func (s *Server) lfsProxyDownload(w http.ResponseWriter, r *http.Request, key st
 func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target repoTarget, key, oid string) {
 	ctx := r.Context()
 	repoID := target.repo.RepoID
+	// One in-flight operation per key, acquired before ANY per-key work
+	// (Codex rounds — security 1 and 16): concurrent identical PUTs must
+	// not multiply staging files, and concurrent adoption verifications
+	// of one legacy key must not race each other's mismatch deletes.
+	if _, busy := s.lfsUploadsInFlight.LoadOrStore(key, struct{}{}); busy {
+		w.Header().Set("Retry-After", "10")
+		lfsError(w, http.StatusTooManyRequests, "an operation for this object is already in progress")
+		return
+	}
+	defer s.lfsUploadsInFlight.Delete(key)
 	// Dedup before charging (the zero-growth rule): a re-PUT of a stored
 	// object (crash-window retry, concurrent identical upload) adds
 	// nothing — adopt it into the registry and succeed without reading
@@ -782,6 +843,10 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target r
 			lfsError(w, http.StatusInsufficientStorage, fmt.Sprintf(
 				"repository LFS object count limit reached (limit %d)", ref.MaxLFSObjectsPerRepo))
 			return
+		case errors.Is(aerr, errLFSBusy):
+			w.Header().Set("Retry-After", "10")
+			lfsError(w, http.StatusTooManyRequests, "server LFS staging budget exhausted, retry")
+			return
 		case errors.Is(aerr, errLFSContentMismatch):
 			// The mismatched legacy blob was removed: proceed as a normal
 			// verified upload of the request body.
@@ -797,33 +862,19 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target r
 	}
 	// The transfer must declare its size up front: the Go HTTP server
 	// caps a Content-Length body at the declared length, making it a hard
-	// bound the admission below can trust. Chunked bodies have no bound.
+	// bound the staging budget below can trust. Chunked bodies have no
+	// bound.
 	if r.ContentLength < 0 {
 		lfsError(w, http.StatusLengthRequired, "upload requires Content-Length")
 		return
 	}
-	// One in-flight upload per key (Codex security round on #51): staging
-	// happens on local disk before verification, and while DISTINCT keys'
-	// aggregate staging is bounded by the quota (each reservation counts
-	// the others' rows), a SAME-key reservation deliberately refreshes
-	// rather than sums — so N concurrent identical PUTs would each admit
-	// and stage N quota-sized temp files. Identical keys are identical
-	// bytes: let one win, turn the rest away before any disk is touched,
-	// and their retry lands on the stored-object adoption path above.
-	if _, busy := s.lfsUploadsInFlight.LoadOrStore(key, struct{}{}); busy {
-		w.Header().Set("Retry-After", "10")
-		lfsError(w, http.StatusTooManyRequests, "an upload for this object is already in progress")
-		return
-	}
-	defer s.lfsUploadsInFlight.Delete(key)
-	// Node-wide staging budget (Codex round 4): the per-key guard bounds
-	// only identical uploads, and the per-repo quota is neither node-wide
-	// nor guaranteed enabled — but every proxy upload stages its full
-	// Content-Length on this replica's disk before verification. Reserve
-	// the declared length against the replica budget before any disk is
-	// touched; an object larger than the whole budget can never stage
-	// here (413, permanent), anything else that does not fit right now is
-	// transient (429).
+	// Node-wide staging budget (Codex round 4): every proxy upload stages
+	// its full Content-Length on this replica's disk before verification,
+	// and neither the per-key guard nor the per-repo quota bounds that
+	// node-wide. Reserve the declared length before any disk is touched;
+	// an object larger than the whole budget can never stage here (413,
+	// permanent), anything else that does not fit right now is transient
+	// (429).
 	if s.LFSStagingBytes > 0 && r.ContentLength > s.LFSStagingBytes {
 		lfsError(w, http.StatusRequestEntityTooLarge, fmt.Sprintf(
 			"object size %d exceeds this server's LFS staging budget (%d bytes)",
@@ -836,26 +887,19 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target r
 		return
 	}
 	defer s.releaseLFSStaging(r.ContentLength)
-	// PUT-time admission: the batch charged the DECLARED size; re-reserve
-	// what actually arrives (a same-key reservation refreshes, so honest
-	// clients are counted once and a liar's oversized body re-runs the
-	// full admission check).
-	// NO failure release, deliberately (Codex round 6): reservation rows
-	// for content-addressed keys can back MULTIPLE writers — a batch on
-	// this replica, a concurrent PUT on another — and same-key refreshes
-	// keep the row shared, so no failing writer can ever prove it is the
-	// last one out. LFS reservations therefore end in exactly two ways:
-	// settlement (RegisterLFSObject consumes by key) or TTL expiry — a
-	// failed upload holds its headroom for at most the TTL, which is the
-	// ledger's documented, bounded overshoot class, while an early release
-	// under a still-staging peer would be unbounded uncounted growth.
-	// Retries are unaffected: a same-key re-reserve refreshes rather than
-	// conflicts, and admission excludes the push's own keys.
-	// The zero-growth rule (Codex round 5): a registered key's blob
-	// re-publication is already counted by the usage counter and the
-	// object-count cap, so it is charged by neither — an at-quota or
-	// at-cap repository must be able to repair a vanished-but-registered
-	// object.
+	// NO durable reservation before body progress, deliberately (Codex
+	// security round 3 + round 16): a header-only PUT repeated once per
+	// TTL could otherwise hold the repository's whole headroom forever
+	// without transferring a byte. The batch's declared-size reservation
+	// (non-renewable) covers the batch→transfer window; the PUT's own
+	// durable admission happens AFTER the body is fully received and
+	// verified (the pre-publish block below), so only real transfer
+	// progress touches the ledger. Until then the upload is bounded by
+	// the node staging budget, not the quota. The zero-growth rule (Codex
+	// round 5) still applies there: a registered key's re-publication is
+	// charged by neither the counter nor the object cap. The count-cap
+	// fast-fail here stops hopeless transfers early (reads only; the
+	// atomic cap inside RegisterLFSObject remains authoritative).
 	registered, err := s.Store.HasLFSObject(ctx, repoID, key)
 	if err != nil {
 		log.Printf("lfs registry %s: %v", key, err)
@@ -863,8 +907,6 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target r
 		return
 	}
 	if !registered {
-		// Object-count cap (Codex security round 2) — enforced regardless
-		// of the byte quota: rows are the resource being bounded.
 		count, err := s.Store.CountLFSObjects(ctx, repoID)
 		if err != nil {
 			log.Printf("lfs registry count %s: %v", repoID, err)
@@ -876,36 +918,6 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target r
 				"repository LFS object count limit reached (%d objects stored, limit %d)",
 				count, ref.MaxLFSObjectsPerRepo))
 			return
-		}
-	}
-	if s.PackQuotaBytes > 0 && r.ContentLength > 0 {
-		if !registered {
-			floor, err := s.cachedUsageFloor(ctx, repoID)
-			if err != nil {
-				log.Printf("lfs quota: %s: usage listing failed: %v", repoID, err)
-				lfsError(w, http.StatusInternalServerError, "storage quota check failed")
-				return
-			}
-			dec, err := s.Store.ReservePackBytes(ctx, blob.QuotaRepoGroup(repoID),
-				[]ref.Pack{{Key: key, Size: r.ContentLength}}, ref.NewReservationOwner(),
-				floor, s.PackQuotaBytes, s.lfsReservationTTL())
-			if err != nil {
-				log.Printf("lfs quota: %s: reserve failed: %v", repoID, err)
-				lfsError(w, http.StatusInternalServerError, "storage quota check failed")
-				return
-			}
-			if dec.KeyCapExceeded {
-				w.Header().Set("Retry-After", "10")
-				lfsError(w, http.StatusTooManyRequests,
-					"too many in-flight uploads reserved for this repository, retry later")
-				return
-			}
-			if !dec.OK {
-				lfsError(w, http.StatusInsufficientStorage, fmt.Sprintf(
-					"repository storage quota exceeded: upload adds %d bytes to %d bytes stored (+%d bytes reserved by in-flight uploads), quota is %d bytes",
-					r.ContentLength, dec.UsedBytes, dec.ReservedBytes, s.PackQuotaBytes))
-				return
-			}
 		}
 	}
 	dir, err := os.MkdirTemp("", "lfs-upload-*")

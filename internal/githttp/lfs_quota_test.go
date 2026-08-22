@@ -135,12 +135,13 @@ func TestLFSQuota_UploadSettlesLedger(t *testing.T) {
 }
 
 // TestLFSQuota_WrongSHAReservationLifecycle: a proxy upload whose content
-// hash does not match the oid is rejected and publishes nothing. Its
-// reservation deliberately SURVIVES the failure (Codex round 6): a
-// content-addressed row can back concurrent writers on other replicas, so
-// no failing writer may free it — LFS reservations end only by settlement
-// or TTL expiry. The failure headroom hold is TTL-bounded; retries refresh
-// the same row and settle it on success.
+// hash does not match the oid is rejected and publishes nothing. Since the
+// PUT path takes NO durable reservation before body progress (Codex
+// security round 3 + round 16 — its only durable admission runs after the
+// verified body, which a hash mismatch never reaches), a failed direct PUT
+// leaves the ledger completely untouched; a batch-minted reservation
+// (declared size) survives independently until settle or TTL, and a
+// correct retry settles it.
 func TestLFSQuota_WrongSHAReservationLifecycle(t *testing.T) {
 	srv, st, mint := newLFSQuotaServer(t, 1000, time.Hour)
 	tok := mint(auth.ScopeGitWrite)
@@ -151,8 +152,7 @@ func TestLFSQuota_WrongSHAReservationLifecycle(t *testing.T) {
 			"basic:"+tok, body)
 	}
 
-	// Failed PUT: rejected, nothing published, the reservation row stays
-	// (same length as the real content so the byte value is stable).
+	// Failed direct PUT: rejected, nothing published, NOTHING reserved.
 	w := put("the fake content")
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("hash-mismatch PUT status = %d, body %s", w.Code, w.Body)
@@ -160,12 +160,20 @@ func TestLFSQuota_WrongSHAReservationLifecycle(t *testing.T) {
 	if _, err := srv.Blob.Stat(context.Background(), blob.LFSKey(lfsTestRepoID, oid)); err == nil {
 		t.Fatal("hash-mismatch PUT published the object")
 	}
-	if ls := ledgerState(t, st, time.Hour); ls.ReservedBytes != int64(len(content)) || ls.UsageBytes != 0 {
-		t.Fatalf("failed PUT ledger state = %+v, want the TTL-bounded reservation held", ls)
+	if ls := ledgerState(t, st, time.Hour); ls.ReservedBytes != 0 || ls.UsageBytes != 0 {
+		t.Fatalf("failed PUT touched the ledger: %+v", ls)
 	}
 
-	// The retry refreshes the same row (no double-count, no wedge) and a
-	// correct upload settles it into usage.
+	// A batch-minted reservation survives a failed PUT (settle-or-TTL
+	// semantics) and a correct retry settles it into usage.
+	decodeBatch(t, doLFS(t, srv, http.MethodPost, lfsBatchPath, "basic:"+tok,
+		batchBody("upload", oid, int64(len(content)))))
+	if w := put("the fake content"); w.Code != http.StatusBadRequest {
+		t.Fatalf("hash-mismatch PUT status = %d", w.Code)
+	}
+	if ls := ledgerState(t, st, time.Hour); ls.ReservedBytes != int64(len(content)) {
+		t.Fatalf("batch reservation did not survive the failed PUT: %+v", ls)
+	}
 	if w := put(string(content)); w.Code != http.StatusOK {
 		t.Fatalf("correct retry status = %d, body %s", w.Code, w.Body)
 	}
