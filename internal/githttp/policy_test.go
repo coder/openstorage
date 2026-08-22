@@ -123,17 +123,29 @@ func TestVerifySig_SSHMatrix(t *testing.T) {
 		t.Fatalf("unregistered-key rejection missing verify-sig log line:\n%s", out)
 	}
 
-	// (5) Branch creation checks EVERYTHING reachable (no pre-push tip), so
-	// the unsigned base history rejects it — the documented no-bypass rule.
+	// (5) Branch creation at an EXISTING tip introduces nothing (issue #59):
+	// everything reachable from signedHead is already on main, so the
+	// creation passes without re-verifying the unsigned base history.
+	// (Before #59 this walked the full history and rejected on the base.)
 	allRefs := mintTestToken(t, repo, "git:read,git:write", `[["*",["verify-sig"]]]`)
 	mustGit(t, work, "reset", "--hard", signedHead)
-	out, err = tryGit(work, "push", remoteURL(nodeA, repo, allRefs), "HEAD:refs/heads/frombase")
+	mustGit(t, work, "push", remoteURL(nodeA, repo, allRefs), "HEAD:refs/heads/frombase")
+	if got := pgRefs(t, repo)["refs/heads/frombase"]; got != signedHead {
+		t.Fatalf("PG frombase = %q, want existing tip %q", got, signedHead)
+	}
+
+	// (5b) Branch creation carrying commits NOT reachable from any existing
+	// ref verifies exactly those: an unsigned new commit rejects the
+	// creation, named in the denial.
+	unsignedNew := commitFile(t, work, "e.txt", "five\n", "unsigned five", nil)
+	out, err = tryGit(work, "push", remoteURL(nodeA, repo, allRefs), "HEAD:refs/heads/fromnew")
 	if err == nil {
-		t.Fatalf("branch creation with unsigned history should be rejected:\n%s", out)
+		t.Fatalf("branch creation with new unsigned commits should be rejected:\n%s", out)
 	}
-	if !strings.Contains(out, "verify-sig denied refs/heads/frombase") {
-		t.Fatalf("creation rejection missing verify-sig log line:\n%s", out)
+	if !strings.Contains(out, "verify-sig denied refs/heads/fromnew at "+unsignedNew) {
+		t.Fatalf("creation rejection missing verify-sig log line for the introduced commit:\n%s", out)
 	}
+	mustGit(t, work, "reset", "--hard", signedHead)
 
 	// (6) Branch deletion under verify-sig introduces nothing: allowed.
 	mustGit(t, work, "push", remoteURL(nodeA, repo, plain), "HEAD:refs/heads/todelete")

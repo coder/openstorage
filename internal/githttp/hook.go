@@ -620,14 +620,64 @@ func enforceRefPolicy(ctx context.Context, repo, refName, old, new string) error
 // valid OpenPGP or SSH signature from one of the org's registered signing
 // keys (docs/02 verify-sig, branch-protection.md "Commit signing
 // verifications"). "Introduced" = reachable from new but not from this
-// ref's own pre-push tip; branch creation therefore checks everything and
-// deletion checks nothing. The keyring is read fresh from PG on every push.
+// ref's own pre-push tip — nor, on branch creation, from any existing ref
+// (issue #59) — and deletion checks nothing. The keyring is read fresh from
+// PG on every push; within one push, verdicts are cached and shared between
+// the pre-receive policy gate and the update hooks (verifystate.go), so the
+// pre-receive verdict is authoritative for the whole push.
 func verifySig(ctx context.Context, refName, old, new string) error {
 	if new == ref.ZeroSHA {
 		return nil // deletion introduces no commits
 	}
-	org := mustEnv(EnvOrg)
+	state, err := openVerifyState()
+	if err != nil {
+		return fmt.Errorf("verify-sig: %w", err) // fail closed
+	}
+	// Cross-ref range dedup (issue #59): the verdict for an (old,new) pair
+	// is ref-independent, so N refs pushed to the same tip cost one walk.
+	if state.ranges[rangeKey(old, new)] {
+		return nil
+	}
+	introduced, err := introducedCommits(ctx, old, new)
+	if err != nil {
+		return fmt.Errorf("verify-sig: %w", err)
+	}
+	// Per-commit verdict cache: an earlier ref (or the pre-receive gate)
+	// already spawned the verifier for these. Cached denials short-circuit
+	// without a spawn — a non-atomic push cannot repeat the same failing
+	// verification once per ref.
+	var pending []string
+	for _, sha := range introduced {
+		if state.ok[sha] {
+			continue
+		}
+		if reason, denied := state.deny[sha]; denied {
+			return verifySigDenied(refName, sha, reason)
+		}
+		pending = append(pending, sha)
+	}
+	if len(pending) == 0 {
+		// Nothing new to verify: a creation at an already-stored tip, or a
+		// range whose commits all carry cached verdicts. No keyring access
+		// needed — mirrors the deletion rule (introduces no commits).
+		if err := state.markRangeOK(old, new); err != nil {
+			return fmt.Errorf("verify-sig: %w", err)
+		}
+		return nil
+	}
+	// Per-push verified-commit budget (issue #59), charged BEFORE any of
+	// the spawns run: failing closed after burning the budget would do the
+	// very work the budget exists to bound.
+	budget, err := verifySigBudget()
+	if err != nil {
+		return fmt.Errorf("verify-sig: %w", err) // fail closed
+	}
+	if budget > 0 && state.spent+len(pending) > budget {
+		return fmt.Errorf("verify-sig: push exceeds the per-push verification budget: %s introduces %d unverified commits with %d of %d verifications already used (raise CODESTORAGE_VERIFY_SIG_BUDGET or push fewer new commits)",
+			refName, len(pending), state.spent, budget)
+	}
 
+	org := mustEnv(EnvOrg)
 	ms, err := meta.Open(ctx, mustEnv(envHookPGURL...))
 	if err != nil {
 		return fmt.Errorf("verify-sig: open metadata store: %w", err)
@@ -647,14 +697,20 @@ func verifySig(ctx context.Context, refName, old, new string) error {
 	}
 	defer cleanup()
 
-	introduced, err := introducedCommits(ctx, old, new)
-	if err != nil {
-		return fmt.Errorf("verify-sig: %w", err)
-	}
-	for _, sha := range introduced {
-		if reason := v.verifyCommit(ctx, sha); reason != "" {
+	for _, sha := range pending {
+		reason := v.verifyCommit(ctx, sha)
+		if reason != "" {
+			if err := state.markCommitDenied(sha, reason); err != nil {
+				return fmt.Errorf("verify-sig: %w", err)
+			}
 			return verifySigDenied(refName, sha, reason)
 		}
+		if err := state.markCommitOK(sha); err != nil {
+			return fmt.Errorf("verify-sig: %w", err)
+		}
+	}
+	if err := state.markRangeOK(old, new); err != nil {
+		return fmt.Errorf("verify-sig: %w", err)
 	}
 	return nil
 }
@@ -666,9 +722,15 @@ func verifySigDenied(refName, sha, reason string) error {
 	return fmt.Errorf("verify-sig denied %s at %s: %s", refName, sha, reason)
 }
 
-// introducedCommits lists the commits reachable from new but not from old
-// (branch creation: old is ZeroSHA, so everything reachable from new).
-// Runs in the bare repo git put us in (cwd, GIT_DIR set by receive-pack).
+// introducedCommits lists the commits reachable from new but not from old.
+// Branch creation (old == ZeroSHA) excludes everything already reachable
+// from existing refs instead of walking the full history (issue #59): those
+// commits were either verified when they landed or accepted on unpoliced
+// refs, and re-walking them made a single cheap create at an existing deep
+// tip cost a full-history walk plus one verifier spawn per ancient commit.
+// Runs in the bare repo git put us in (cwd, GIT_DIR set by receive-pack);
+// in a later update hook of the same push, --all also covers refs updated
+// earlier in the push, whose commits carry cached verdicts already.
 func introducedCommits(ctx context.Context, old, new string) ([]string, error) {
 	if !ref.ValidSHA(new) || new == ref.ZeroSHA {
 		return nil, fmt.Errorf("introducedCommits: bad new sha %q", new)
@@ -676,6 +738,8 @@ func introducedCommits(ctx context.Context, old, new string) ([]string, error) {
 	args := []string{"rev-list", new}
 	if old != ref.ZeroSHA {
 		args = append(args, "^"+old)
+	} else {
+		args = append(args, "--not", "--all")
 	}
 	out, err := exec.CommandContext(ctx, "git", args...).Output()
 	if err != nil {
@@ -795,6 +859,7 @@ func (v *sigVerifier) verifyCommit(ctx context.Context, sha string) (reason stri
 		// denial reason instead of crashing receive-pack.
 		return fmt.Sprintf("malformed commit sha %q", sha)
 	}
+	logVerifySpawn(sha)
 	cmd := exec.CommandContext(ctx, "git",
 		"-c", "gpg.ssh.allowedSignersFile="+v.allowedSigners,
 		"verify-commit", sha)

@@ -6,8 +6,10 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/pem"
+	"math"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -598,6 +600,148 @@ func TestResolveServeConfigPackQuota(t *testing.T) {
 			}
 			if !strings.Contains(err.Error(), envPackQuota) {
 				t.Fatalf("error %q does not name %s", err, envPackQuota)
+			}
+		})
+	}
+}
+
+func TestResolveServeConfigMaxPushBytes(t *testing.T) {
+	base := func(extra map[string]string) func(string) string {
+		env := map[string]string{
+			"CODESTORAGE_PG_URL":      "postgres://x",
+			"CODESTORAGE_S3_URL":      "s3://x",
+			"CODESTORAGE_ORG":         "org1",
+			"CODESTORAGE_ORG_PUBKEYS": "/tmp/org.pub.pem",
+		}
+		for k, v := range extra {
+			env[k] = v
+		}
+		return mapEnv(env)
+	}
+
+	t.Run("unset-derives-from-quota", func(t *testing.T) {
+		cfg, err := resolveServeConfig(base(nil), "", "", "/tmp/cache", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if want := int64(defaultMaxPushQuotaMultiple) * defaultPackQuotaBytes; cfg.maxPushBytes != want {
+			t.Fatalf("unset cap resolved to %d, want %d (multiple of default quota)", cfg.maxPushBytes, want)
+		}
+	})
+
+	t.Run("unset-with-disabled-quota-disables", func(t *testing.T) {
+		cfg, err := resolveServeConfig(base(map[string]string{envPackQuota: "0"}), "", "", "/tmp/cache", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.maxPushBytes != 0 {
+			t.Fatalf("cap with disabled quota resolved to %d, want 0 (disabled)", cfg.maxPushBytes)
+		}
+	})
+
+	t.Run("unset-saturates-on-huge-quota", func(t *testing.T) {
+		huge := strconv.FormatInt(math.MaxInt64-1, 10)
+		cfg, err := resolveServeConfig(base(map[string]string{envPackQuota: huge}), "", "", "/tmp/cache", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.maxPushBytes != math.MaxInt64 {
+			t.Fatalf("cap for quota %s resolved to %d, want MaxInt64 saturation", huge, cfg.maxPushBytes)
+		}
+	})
+
+	t.Run("explicit-zero-disables", func(t *testing.T) {
+		cfg, err := resolveServeConfig(base(map[string]string{envMaxPushBytes: "0"}), "", "", "/tmp/cache", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.maxPushBytes != 0 {
+			t.Fatalf("explicit zero resolved to %d, want 0 (disabled)", cfg.maxPushBytes)
+		}
+	})
+
+	t.Run("explicit-overrides-quota-derivation", func(t *testing.T) {
+		cfg, err := resolveServeConfig(base(map[string]string{envMaxPushBytes: "4096"}), "", "", "/tmp/cache", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.maxPushBytes != 4096 {
+			t.Fatalf("resolved cap %d, want 4096", cfg.maxPushBytes)
+		}
+	})
+
+	for _, tc := range []struct{ name, val string }{
+		{"malformed", "plenty"},
+		{"negative", "-1"},
+		{"float", "1.5"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := resolveServeConfig(base(map[string]string{envMaxPushBytes: tc.val}), "", "", "/tmp/cache", "")
+			if err == nil {
+				t.Fatalf("%s=%q resolved without error", envMaxPushBytes, tc.val)
+			}
+			if !strings.Contains(err.Error(), envMaxPushBytes) {
+				t.Fatalf("error %q does not name %s", err, envMaxPushBytes)
+			}
+		})
+	}
+}
+
+func TestResolveServeConfigVerifySigBudget(t *testing.T) {
+	base := func(extra map[string]string) func(string) string {
+		env := map[string]string{
+			"CODESTORAGE_PG_URL":      "postgres://x",
+			"CODESTORAGE_S3_URL":      "s3://x",
+			"CODESTORAGE_ORG":         "org1",
+			"CODESTORAGE_ORG_PUBKEYS": "/tmp/org.pub.pem",
+		}
+		for k, v := range extra {
+			env[k] = v
+		}
+		return mapEnv(env)
+	}
+
+	t.Run("unset-applies-default", func(t *testing.T) {
+		cfg, err := resolveServeConfig(base(nil), "", "", "/tmp/cache", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.verifySigBudget != defaultVerifySigBudget {
+			t.Fatalf("unset budget resolved to %d, want default %d", cfg.verifySigBudget, defaultVerifySigBudget)
+		}
+	})
+
+	t.Run("explicit-zero-disables", func(t *testing.T) {
+		cfg, err := resolveServeConfig(base(map[string]string{envVerifySigBudget: "0"}), "", "", "/tmp/cache", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.verifySigBudget != 0 {
+			t.Fatalf("explicit zero resolved to %d, want 0 (disabled)", cfg.verifySigBudget)
+		}
+	})
+
+	t.Run("parse-through", func(t *testing.T) {
+		cfg, err := resolveServeConfig(base(map[string]string{envVerifySigBudget: "25"}), "", "", "/tmp/cache", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.verifySigBudget != 25 {
+			t.Fatalf("resolved budget %d, want 25", cfg.verifySigBudget)
+		}
+	})
+
+	for _, tc := range []struct{ name, val string }{
+		{"malformed", "plenty"},
+		{"negative", "-1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := resolveServeConfig(base(map[string]string{envVerifySigBudget: tc.val}), "", "", "/tmp/cache", "")
+			if err == nil {
+				t.Fatalf("%s=%q resolved without error", envVerifySigBudget, tc.val)
+			}
+			if !strings.Contains(err.Error(), envVerifySigBudget) {
+				t.Fatalf("error %q does not name %s", err, envVerifySigBudget)
 			}
 		})
 	}

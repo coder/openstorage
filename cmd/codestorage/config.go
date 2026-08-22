@@ -51,6 +51,20 @@ const (
 	// closes. Unset applies the one-hour default; must be positive.
 	envPackReservationTTL = "CODESTORAGE_PACK_RESERVATION_TTL"
 
+	// Decoded-byte cap on one git push (issue #55): receive-pack requests
+	// whose body (after any gzip decode) exceeds this many bytes are
+	// rejected with 413 before the stream reaches git. Unset derives the
+	// cap from the pack quota (a push cannot legitimately exceed what
+	// quota admission would accept, plus protocol overhead); "0" disables
+	// the cap.
+	envMaxPushBytes = "CODESTORAGE_MAX_PUSH_BYTES"
+
+	// Per-push verified-commit budget (issue #59): the maximum number of
+	// commits one push may signature-verify across all its refs before it
+	// is rejected (fail closed). Unset applies the generous default; "0"
+	// disables the budget.
+	envVerifySigBudget = "CODESTORAGE_VERIFY_SIG_BUDGET"
+
 	// Orphan-pack sweep (issue #5): interval between sweeps ("0" disables
 	// sweeping), minimum blob age before an unregistered pack counts as an
 	// orphan, and the explicit opt-in for actually deleting candidates
@@ -115,6 +129,20 @@ const (
 	// defaultPackReservationTTL clears a default-quota-sized (10 GiB)
 	// upload at ~3 MB/s before a live reservation can expire (issue #29).
 	defaultPackReservationTTL = time.Hour
+
+	// defaultMaxPushQuotaMultiple derives the default decoded push-size cap
+	// from the pack quota (issue #55): a push cannot legitimately need more
+	// than the quota admission would accept, so twice the quota leaves
+	// ample room for commands, pkt-line framing, and multi-pack pushes
+	// while still bounding ingress work at the same order of magnitude the
+	// quota bounds retained storage.
+	defaultMaxPushQuotaMultiple = 2
+
+	// defaultVerifySigBudget bounds verifier spawns per push (issue #59).
+	// Generous by design: a verifier spawn costs tens of milliseconds, so
+	// 10000 admits any plausible signed-history push while capping the
+	// abusive fan-out at minutes, not days.
+	defaultVerifySigBudget = 10000
 )
 
 // envFirst returns the first non-empty value among names. getenv is injected
@@ -175,6 +203,14 @@ type serveConfig struct {
 	// packReservationTTL bounds how long a crashed writer's quota
 	// reservation gates admission (issue #29); always positive.
 	packReservationTTL time.Duration
+
+	// maxPushBytes caps the decoded bytes one git push may stream into
+	// receive-pack (issue #55); 0 disables the cap.
+	maxPushBytes int64
+
+	// verifySigBudget caps how many commits one push may signature-verify
+	// (issue #59); 0 disables the budget.
+	verifySigBudget int
 
 	// sweep configures the periodic orphan-pack sweep (issue #5).
 	sweep sweepSettings
@@ -305,6 +341,14 @@ func resolveServeConfig(getenv func(string) string, flagListen, flagAddr, flagCa
 		return serveConfig{}, err
 	}
 	cfg.packReservationTTL, err = resolvePackReservationTTL(getenv)
+	if err != nil {
+		return serveConfig{}, err
+	}
+	cfg.maxPushBytes, err = resolveMaxPushBytes(getenv, cfg.packQuotaBytes)
+	if err != nil {
+		return serveConfig{}, err
+	}
+	cfg.verifySigBudget, err = resolveVerifySigBudget(getenv)
 	if err != nil {
 		return serveConfig{}, err
 	}
@@ -440,6 +484,55 @@ func resolvePackQuota(getenv func(string) string) (int64, error) {
 	}
 	if v < 0 {
 		return 0, fmt.Errorf("%s must be non-negative (0 disables the quota), got %q", envPackQuota, raw)
+	}
+	return v, nil
+}
+
+// resolveMaxPushBytes parses CODESTORAGE_MAX_PUSH_BYTES (issue #55).
+// Fail-fast semantics matching resolvePackQuota: malformed or negative
+// values error naming the env var. Unset derives the cap from the pack
+// quota (defaultMaxPushQuotaMultiple × quota, saturating; a disabled quota
+// leaves the cap disabled too — the operator opted out of size bounds);
+// an explicit "0" disables the cap.
+func resolveMaxPushBytes(getenv func(string) string, packQuotaBytes int64) (int64, error) {
+	assertf(getenv != nil, "resolveMaxPushBytes: nil getenv")
+	assertf(packQuotaBytes >= 0, "resolveMaxPushBytes: negative quota %d", packQuotaBytes)
+	raw := getenv(envMaxPushBytes)
+	if raw == "" {
+		if packQuotaBytes == 0 {
+			return 0, nil
+		}
+		if packQuotaBytes > math.MaxInt64/defaultMaxPushQuotaMultiple {
+			return math.MaxInt64, nil
+		}
+		return defaultMaxPushQuotaMultiple * packQuotaBytes, nil
+	}
+	v, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("%s: %w", envMaxPushBytes, err)
+	}
+	if v < 0 {
+		return 0, fmt.Errorf("%s must be non-negative (0 disables the cap), got %q", envMaxPushBytes, raw)
+	}
+	return v, nil
+}
+
+// resolveVerifySigBudget parses CODESTORAGE_VERIFY_SIG_BUDGET (issue #59).
+// Fail-fast semantics matching resolvePackQuota: malformed or negative
+// values error naming the env var. Unset applies the generous default; an
+// explicit "0" disables the budget.
+func resolveVerifySigBudget(getenv func(string) string) (int, error) {
+	assertf(getenv != nil, "resolveVerifySigBudget: nil getenv")
+	raw := getenv(envVerifySigBudget)
+	if raw == "" {
+		return defaultVerifySigBudget, nil
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0, fmt.Errorf("%s: %w", envVerifySigBudget, err)
+	}
+	if v < 0 {
+		return 0, fmt.Errorf("%s must be non-negative (0 disables the budget), got %q", envVerifySigBudget, raw)
 	}
 	return v, nil
 }

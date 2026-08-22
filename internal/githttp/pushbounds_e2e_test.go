@@ -1,0 +1,423 @@
+package githttp
+
+// End-to-end acceptance for the push-work bounds: the decoded-byte ingress
+// cap (issue #55, CODESTORAGE_MAX_PUSH_BYTES) and the verify-sig work
+// bounds (issue #59: bounded creation walks, per-push verdict cache,
+// CODESTORAGE_VERIFY_SIG_BUDGET). Real serve nodes, real git clients, and
+// raw smart-HTTP requests where the wire shape matters.
+
+import (
+	"bytes"
+	"compress/gzip"
+	"crypto/rand"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+const testPushCap = 64 << 10 // 64 KiB: tiny but roomy for the setup pushes
+
+// postReceivePack sends a raw git-receive-pack POST and returns the status
+// code and body. body streams as chunked when it is not a *bytes.Reader.
+func postReceivePack(t *testing.T, n *testNode, repo, token string, body io.Reader, gzipEncoded bool) (int, string) {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPost, "http://"+n.addr+"/"+repo+".git/git-receive-pack", body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.SetBasicAuth("t", token)
+	req.Header.Set("Content-Type", "application/x-git-receive-pack-request")
+	if gzipEncoded {
+		req.Header.Set("Content-Encoding", "gzip")
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST git-receive-pack: %v", err)
+	}
+	defer resp.Body.Close()
+	got, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	return resp.StatusCode, string(got)
+}
+
+// assertCapEnvelope asserts the issue #55 rejection contract: 413 plus the
+// structured JSON envelope naming the operator knob.
+func assertCapEnvelope(t *testing.T, status int, body string) {
+	t.Helper()
+	if status != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want 413\nbody: %s", status, body)
+	}
+	var envelope struct {
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(body), &envelope); err != nil {
+		t.Fatalf("413 body is not the structured envelope: %v\n%s", err, body)
+	}
+	if !strings.Contains(envelope.Error, "decoded push-size cap") || !strings.Contains(envelope.Error, "CODESTORAGE_MAX_PUSH_BYTES") {
+		t.Fatalf("413 envelope does not name the cap and knob: %q", envelope.Error)
+	}
+}
+
+// shallowFlood builds n bytes of protocol-valid `shallow <oid>` pkt-lines —
+// a client-controlled prefix that legitimately precedes the first command
+// (gitprotocol-pack update-requests), so the sniffer keeps reading through
+// it and the decoded-byte counter does the rejecting.
+func shallowFlood(n int) []byte {
+	line := pktLine("shallow 1234567812345678123456781234567812345678\n")
+	var b bytes.Buffer
+	for b.Len() < n {
+		b.WriteString(line)
+	}
+	return b.Bytes()
+}
+
+// TestPushCap_OversizedGitPush413 is the real-client acceptance: a push
+// whose pack exceeds the cap is rejected with an HTTP 413 before any pack
+// bytes reach storage, and the server state stays pristine.
+func TestPushCap_OversizedGitPush413(t *testing.T) {
+	cacheDir := t.TempDir()
+	node, err := startNode(cacheDir, fmt.Sprintf("CODESTORAGE_MAX_PUSH_BYTES=%d", testPushCap))
+	if err != nil {
+		t.Fatalf("start node: %v", err)
+	}
+	t.Cleanup(node.stop)
+
+	repo := registerRepo(t, "t-pushcap-git")
+	work := initWorkRepo(t)
+	token := mintTestToken(t, repo, "git:read,git:write", "")
+	mustGit(t, work, "push", remoteURL(node, repo, token), "HEAD:refs/heads/main")
+	mainHead := revParse(t, work, "HEAD")
+
+	// ~300 KiB of incompressible bytes: the pack stays far above the 64 KiB
+	// cap but under git's http.postBuffer, so the client declares a
+	// Content-Length and the fast path answers 413 without reading.
+	big := make([]byte, 300<<10)
+	if _, err := rand.Read(big); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(work, "big.bin"), big, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, work, "add", ".")
+	mustGit(t, work, "commit", "-m", "oversized")
+
+	out, err := tryGit(work, "push", remoteURL(node, repo, token), "HEAD:refs/heads/main")
+	if err == nil {
+		t.Fatalf("oversized push should fail:\n%s", out)
+	}
+	t.Logf("oversized push transcript:\n%s", out)
+	if !strings.Contains(out, "413") {
+		t.Fatalf("push failure does not surface the 413:\n%s", out)
+	}
+
+	// Server state is untouched: ref unchanged, no new packs registered,
+	// and no quarantine leftovers below the node's cache repo.
+	if got := pgRefs(t, repo)["refs/heads/main"]; got != mainHead {
+		t.Fatalf("PG main = %q, want unchanged %q", got, mainHead)
+	}
+	if packs := pgPacks(t, repo); len(packs) != 1 {
+		t.Fatalf("registered packs = %d, want 1 (setup push only)", len(packs))
+	}
+	leftovers, err := filepath.Glob(filepath.Join(cacheDir, "*", "objects", "incoming-*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(leftovers) != 0 {
+		t.Fatalf("quarantine leftovers after 413: %v", leftovers)
+	}
+}
+
+// TestPushCap_MidStreamOverflowCleanState drives the streaming path: a
+// chunked request (no Content-Length fast path) whose pack overflows the
+// cap WHILE git receive-pack is consuming it. The push must fail without
+// registering anything or leaving quarantine debris.
+func TestPushCap_MidStreamOverflowCleanState(t *testing.T) {
+	cacheDir := t.TempDir()
+	node, err := startNode(cacheDir, fmt.Sprintf("CODESTORAGE_MAX_PUSH_BYTES=%d", testPushCap))
+	if err != nil {
+		t.Fatalf("start node: %v", err)
+	}
+	t.Cleanup(node.stop)
+
+	repo := registerRepo(t, "t-pushcap-stream")
+	work := initWorkRepo(t)
+	token := mintTestToken(t, repo, "git:read,git:write", "")
+	mustGit(t, work, "push", remoteURL(node, repo, token), "HEAD:refs/heads/main")
+	mainHead := revParse(t, work, "HEAD")
+
+	// ~4 MiB forces git past http.postBuffer into a chunked upload, so the
+	// server must catch the overflow mid-stream (pushGate path).
+	big := make([]byte, 4<<20)
+	if _, err := rand.Read(big); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(work, "big.bin"), big, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, work, "add", ".")
+	mustGit(t, work, "commit", "-m", "oversized chunked")
+
+	out, err := tryGit(work, "push", remoteURL(node, repo, token), "HEAD:refs/heads/main")
+	if err == nil {
+		t.Fatalf("oversized chunked push should fail:\n%s", out)
+	}
+	t.Logf("oversized chunked push transcript:\n%s", out)
+
+	if got := pgRefs(t, repo)["refs/heads/main"]; got != mainHead {
+		t.Fatalf("PG main = %q, want unchanged %q", got, mainHead)
+	}
+	if packs := pgPacks(t, repo); len(packs) != 1 {
+		t.Fatalf("registered packs = %d, want 1 (setup push only)", len(packs))
+	}
+	leftovers, err := filepath.Glob(filepath.Join(cacheDir, "*", "objects", "incoming-*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(leftovers) != 0 {
+		t.Fatalf("quarantine leftovers after mid-stream overflow: %v", leftovers)
+	}
+}
+
+// TestPushCap_RawRequests pins the wire-level rejection shapes: declared
+// oversize (Content-Length fast path), chunked overflow caught during the
+// capability sniff, and a gzip bomb whose small compressed body decodes
+// past the cap.
+func TestPushCap_RawRequests(t *testing.T) {
+	node, err := startNode(t.TempDir(), fmt.Sprintf("CODESTORAGE_MAX_PUSH_BYTES=%d", testPushCap))
+	if err != nil {
+		t.Fatalf("start node: %v", err)
+	}
+	t.Cleanup(node.stop)
+
+	repo := registerRepo(t, "t-pushcap-raw")
+	token := mintTestToken(t, repo, "git:read,git:write", "")
+
+	t.Run("content-length-fast-path", func(t *testing.T) {
+		// *bytes.Reader ⇒ Content-Length set ⇒ rejected before any read.
+		status, body := postReceivePack(t, node, repo, token,
+			bytes.NewReader(make([]byte, testPushCap+1)), false)
+		assertCapEnvelope(t, status, body)
+	})
+
+	t.Run("chunked-overflow-during-sniff", func(t *testing.T) {
+		// Wrapping the reader hides the length ⇒ chunked ⇒ the decoded
+		// counter (not the absent Content-Length) must reject, before git
+		// is ever spawned.
+		flood := shallowFlood(2 * testPushCap)
+		status, body := postReceivePack(t, node, repo, token,
+			io.MultiReader(bytes.NewReader(flood)), false)
+		assertCapEnvelope(t, status, body)
+	})
+
+	t.Run("gzip-bomb", func(t *testing.T) {
+		// ~16 MiB decoded, a few KiB compressed: the compressed size passes
+		// any transport-level check, so only the post-gzip decoded counter
+		// can catch it.
+		var compressed bytes.Buffer
+		zw := gzip.NewWriter(&compressed)
+		if _, err := zw.Write(shallowFlood(16 << 20)); err != nil {
+			t.Fatal(err)
+		}
+		if err := zw.Close(); err != nil {
+			t.Fatal(err)
+		}
+		t.Logf("gzip bomb: %d bytes compressed, %d decoded", compressed.Len(), 16<<20)
+		// The compressed body must fit UNDER the cap: a server counting
+		// compressed (wire) bytes would accept it, so a 413 here proves
+		// the counter runs on the decoded stream.
+		if compressed.Len() >= testPushCap {
+			t.Fatalf("bomb did not compress below the cap (%d bytes); the test would not prove decoded counting", compressed.Len())
+		}
+		status, body := postReceivePack(t, node, repo, token, bytes.NewReader(compressed.Bytes()), true)
+		assertCapEnvelope(t, status, body)
+	})
+}
+
+// TestPushCap_AtomicSniffStillWorks proves the #28 atomic gate keeps
+// working through the capped reader: a mixed-policy `git push --atomic`
+// under the cap is denied whole by the atomic gate — not mangled into a
+// 413, not partially applied.
+func TestPushCap_AtomicSniffStillWorks(t *testing.T) {
+	node, err := startNode(t.TempDir(), fmt.Sprintf("CODESTORAGE_MAX_PUSH_BYTES=%d", 1<<20))
+	if err != nil {
+		t.Fatalf("start node: %v", err)
+	}
+	t.Cleanup(node.stop)
+
+	repo := registerRepo(t, "t-pushcap-atomic")
+	work := initWorkRepo(t)
+	plain := mintTestToken(t, repo, "git:read,git:write", "")
+	mustGit(t, work, "push", remoteURL(node, repo, plain), "HEAD:refs/heads/main")
+
+	commitFile(t, work, "b.txt", "two\n", "two", nil)
+	mixed := mintTestToken(t, repo, "git:read,git:write",
+		`[["refs/heads/protected",["no-push"]],["*",[]]]`)
+	out, err := tryGit(work, "push", "--atomic", remoteURL(node, repo, mixed),
+		"HEAD:refs/heads/ok", "HEAD:refs/heads/protected")
+	if err == nil {
+		t.Fatalf("mixed-policy atomic push should be denied whole:\n%s", out)
+	}
+	if !strings.Contains(out, "atomic push carries a policy-denied update") {
+		t.Fatalf("atomic denial missing through the capped path:\n%s", out)
+	}
+	refs := pgRefs(t, repo)
+	if _, exists := refs["refs/heads/ok"]; exists {
+		t.Fatal("atomic semantics broken on the capped path: allowed ref landed despite the denial")
+	}
+	if _, exists := refs["refs/heads/protected"]; exists {
+		t.Fatal("policy-denied ref landed")
+	}
+}
+
+// readSpawnLog returns the verifier-spawn shas recorded by the test-mode
+// knob (one line per actual `git verify-commit` subprocess).
+func readSpawnLog(t *testing.T, path string) []string {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	return strings.Fields(string(data))
+}
+
+// TestVerifySig_CreationAtExistingTipSpawnsNothing is the issue #59a
+// acceptance: creating refs at an existing deep tip verifies only the
+// introduced set — which is empty — so the push passes with ZERO verifier
+// subprocesses even though the reachable history is unsigned. (Pre-#59 this
+// walked all of history and spawned one verifier per commit per ref.)
+func TestVerifySig_CreationAtExistingTipSpawnsNothing(t *testing.T) {
+	spawnLog := filepath.Join(t.TempDir(), "spawns.log")
+	node, err := startNode(t.TempDir(), EnvVerifySpawnLog+"="+spawnLog)
+	if err != nil {
+		t.Fatalf("start node: %v", err)
+	}
+	t.Cleanup(node.stop)
+
+	repo := registerRepo(t, "t-vs-creation")
+	work := initWorkRepo(t)
+	plain := mintTestToken(t, repo, "git:read,git:write", "")
+	for i := 0; i < 30; i++ {
+		commitFile(t, work, "f.txt", fmt.Sprintf("v%d\n", i), fmt.Sprintf("unsigned %d", i), nil)
+	}
+	mustGit(t, work, "push", remoteURL(node, repo, plain), "HEAD:refs/heads/main")
+	tip := revParse(t, work, "HEAD")
+
+	// verify-sig everywhere: keyring intentionally left empty — introduced
+	// is empty, so no keyring is consulted and no verifier spawns.
+	vsAll := mintTestToken(t, repo, "git:read,git:write", `[["*",["verify-sig"]]]`)
+	refspecs := []string{"push", remoteURL(node, repo, vsAll)}
+	for i := 0; i < 10; i++ {
+		refspecs = append(refspecs, fmt.Sprintf("HEAD:refs/heads/copy%d", i))
+	}
+	mustGit(t, work, refspecs...)
+
+	refs := pgRefs(t, repo)
+	for i := 0; i < 10; i++ {
+		if got := refs[fmt.Sprintf("refs/heads/copy%d", i)]; got != tip {
+			t.Fatalf("copy%d = %q, want %q", i, got, tip)
+		}
+	}
+	if spawns := readSpawnLog(t, spawnLog); len(spawns) != 0 {
+		t.Fatalf("creation at existing tip spawned %d verifiers (%v), want 0", len(spawns), spawns)
+	}
+}
+
+// TestVerifySig_VerdictCacheAcrossRefs is the issue #59b acceptance: one
+// push creating many refs at the same new tip verifies each introduced
+// commit exactly once, across the pre-receive policy gate AND every update
+// hook (which are separate processes sharing the per-push state file).
+func TestVerifySig_VerdictCacheAcrossRefs(t *testing.T) {
+	spawnLog := filepath.Join(t.TempDir(), "spawns.log")
+	node, err := startNode(t.TempDir(), EnvVerifySpawnLog+"="+spawnLog)
+	if err != nil {
+		t.Fatalf("start node: %v", err)
+	}
+	t.Cleanup(node.stop)
+
+	repo := registerRepo(t, "t-vs-cache")
+	work := initWorkRepo(t)
+	plain := mintTestToken(t, repo, "git:read,git:write", "")
+	mustGit(t, work, "push", remoteURL(node, repo, plain), "HEAD:refs/heads/main")
+
+	privPath, pubLine := genSSHKey(t)
+	key := registerSigningKey(t, pubLine)
+	t.Cleanup(func() { removeSigningKey(t, key.ID) })
+
+	want := make(map[string]bool)
+	for i := 0; i < 3; i++ {
+		sha := commitFile(t, work, "s.txt", fmt.Sprintf("s%d\n", i), fmt.Sprintf("signed %d", i), nil, sshSigningArgs(privPath)...)
+		want[sha] = true
+	}
+
+	vsAll := mintTestToken(t, repo, "git:read,git:write", `[["*",["verify-sig"]]]`)
+	refspecs := []string{"push", remoteURL(node, repo, vsAll)}
+	for i := 0; i < 10; i++ {
+		refspecs = append(refspecs, fmt.Sprintf("HEAD:refs/heads/r%d", i))
+	}
+	mustGit(t, work, refspecs...)
+
+	spawns := readSpawnLog(t, spawnLog)
+	if len(spawns) != len(want) {
+		t.Fatalf("10 refs at one tip spawned %d verifiers (%v), want %d (one per introduced commit)", len(spawns), spawns, len(want))
+	}
+	for _, sha := range spawns {
+		if !want[sha] {
+			t.Fatalf("verifier spawned for unexpected sha %s", sha)
+		}
+		delete(want, sha)
+	}
+}
+
+// TestVerifySig_BudgetFailsClosed is the issue #59c acceptance: a push
+// introducing more commits than CODESTORAGE_VERIFY_SIG_BUDGET allows is
+// rejected whole BEFORE any verifier runs, with a message naming the knob.
+func TestVerifySig_BudgetFailsClosed(t *testing.T) {
+	spawnLog := filepath.Join(t.TempDir(), "spawns.log")
+	node, err := startNode(t.TempDir(),
+		"CODESTORAGE_VERIFY_SIG_BUDGET=2",
+		EnvVerifySpawnLog+"="+spawnLog,
+	)
+	if err != nil {
+		t.Fatalf("start node: %v", err)
+	}
+	t.Cleanup(node.stop)
+
+	repo := registerRepo(t, "t-vs-budget")
+	work := initWorkRepo(t)
+	plain := mintTestToken(t, repo, "git:read,git:write", "")
+	mustGit(t, work, "push", remoteURL(node, repo, plain), "HEAD:refs/heads/main")
+
+	privPath, pubLine := genSSHKey(t)
+	key := registerSigningKey(t, pubLine)
+	t.Cleanup(func() { removeSigningKey(t, key.ID) })
+	for i := 0; i < 3; i++ {
+		commitFile(t, work, "s.txt", fmt.Sprintf("s%d\n", i), fmt.Sprintf("signed %d", i), nil, sshSigningArgs(privPath)...)
+	}
+
+	vsAll := mintTestToken(t, repo, "git:read,git:write", `[["*",["verify-sig"]]]`)
+	out, err := tryGit(work, "push", remoteURL(node, repo, vsAll), "HEAD:refs/heads/feature")
+	if err == nil {
+		t.Fatalf("push over the verification budget should be rejected:\n%s", out)
+	}
+	if !strings.Contains(out, "per-push verification budget") || !strings.Contains(out, "CODESTORAGE_VERIFY_SIG_BUDGET") {
+		t.Fatalf("budget rejection missing the documented message:\n%s", out)
+	}
+	if _, exists := pgRefs(t, repo)["refs/heads/feature"]; exists {
+		t.Fatal("budget-rejected ref landed")
+	}
+	// Fail closed means BEFORE the work: the pre-charge rejected the push
+	// without a single verifier spawn.
+	if spawns := readSpawnLog(t, spawnLog); len(spawns) != 0 {
+		t.Fatalf("budget rejection spawned %d verifiers (%v), want 0", len(spawns), spawns)
+	}
+}
