@@ -17,6 +17,13 @@ namespace question ADR-3 answered for *refs* gets the opposite answer for LFS *o
 
 ## ADR-34: LFS lives on the storage host — presigned transfers, proxy fallback
 
+> **Amended by [#51](https://github.com/coder/code-storage/issues/51):** presigned
+> transfers are now download-only. Uploads always use the verified proxy endpoint — a
+> presigned PUT binds neither content length nor digest, which left LFS outside the
+> storage-quota perimeter — and every verified upload is admitted through the quota
+> ledger and registered for the orphan sweep. See the
+> [wire-compatibility notes](explanation/wire-compatibility.md#git-lfs-transfer-semantics).
+
 docs/05 puts LFS on the git remote itself: git-lfs discovers
 `POST /{repo}.git/info/lfs/objects/batch` relative to the clone URL. Decision: **the
 smart-HTTP server implements the Batch API directly — no separate LFS server, no extra

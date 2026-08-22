@@ -214,18 +214,19 @@ pre-storage push bound ([#55](https://github.com/coder/code-storage/issues/55)).
   local disk ([#55](https://github.com/coder/code-storage/issues/55)) — so the proxy's
   body cap (plus aligned duration and concurrency limits) is the effective pre-storage
   bound against resource-exhaustion pushes.
-- **LFS object transfers bypass the proxy on S3/MinIO**: the batch API hands clients
-  presigned bucket URLs whenever the backend can sign (the server-proxied transfer is
-  only the fallback for backends that cannot, i.e. local file mode). Git LFS clients
-  therefore need direct network reach to the configured S3/MinIO endpoint — a
-  VPC-internal bucket endpoint breaks LFS pushes/pulls for external clients even though
-  the batch request itself succeeds.
-  **Abuse warning before exposing the endpoint to untrusted writers:** LFS uploads are
-  currently unmetered — presigned PUTs bind neither size nor checksum, LFS keys sit
-  outside the pack quota and the sweeper — so any `git:write` token holder can consume
-  unbounded bucket capacity ([#51](https://github.com/coder/code-storage/issues/51)).
-  Until that closes, weigh bucket-level metering/alerts or keeping LFS to trusted
-  clients.
+- **LFS downloads bypass the proxy on S3/MinIO; uploads do not**: for downloads the
+  batch API hands clients presigned bucket URLs whenever the backend can sign (the
+  server-proxied transfer is only the fallback for backends that cannot, i.e. local file
+  mode), so Git LFS clients need direct network reach to the configured S3/MinIO
+  endpoint — a VPC-internal bucket endpoint breaks LFS pulls for external clients even
+  though the batch request itself succeeds. Uploads always go through the server's
+  verified proxy transfer ([#51](https://github.com/coder/code-storage/issues/51)):
+  a presigned PUT cannot bind content length or checksum, so the server receives, size-
+  and sha256-verifies, and meters every upload against the repository
+  [storage quota](../reference/configuration.md#codestorage_pack_quota_bytes) before
+  publishing it. Size the proxy's request-body cap and timeouts with the largest LFS
+  object you intend to accept in mind, and note upload bytes are staged under the
+  server's `$TMPDIR` before publication.
 
 ### Client identity behind the proxy (`CODESTORAGE_TRUSTED_PROXIES`)
 

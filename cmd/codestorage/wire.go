@@ -81,13 +81,17 @@ func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL, loopbackBaseU
 		// schedule: interval zero (the emergency stop) runs only the
 		// strictly restorative Heal, so nothing destructive needs this
 		// validation and the stop switch must never be blocked by it.
+		deleteFlag := envSweepDeleteEnabled
+		if !sweep.deleteEnabled {
+			deleteFlag = envSweepDeleteLFS
+		}
 		if s3store, ok := blobStore.(*blob.S3); ok {
 			versioned, err := s3store.VersioningEnabled(ctx)
 			switch {
 			case err != nil:
-				return fail(fmt.Errorf("%s: cannot verify bucket versioning (grant s3:GetBucketVersioning, or keep the sweeper list-only): %w", envSweepDeleteEnabled, err))
+				return fail(fmt.Errorf("%s: cannot verify bucket versioning (grant s3:GetBucketVersioning, or keep the sweeper list-only): %w", deleteFlag, err))
 			case versioned:
-				return fail(fmt.Errorf("%s: bucket has S3 versioning enabled or suspended; delete-mode sweeps only write delete markers there (add a noncurrent-version lifecycle policy, or keep the sweeper list-only)", envSweepDeleteEnabled))
+				return fail(fmt.Errorf("%s: bucket has S3 versioning enabled or suspended; delete-mode sweeps only write delete markers there (add a noncurrent-version lifecycle policy, or keep the sweeper list-only)", deleteFlag))
 			}
 		}
 	}
