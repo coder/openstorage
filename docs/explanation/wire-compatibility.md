@@ -75,10 +75,15 @@ Beyond serving the smart-HTTP wire format, the semantics clients depend on match
 
 - **Ref policies** from the JWT `refs` claim (`no-push`, `no-force-push`, `verify-sig`)
   are enforced in server-side hooks; unknown operations fail closed.
-- **Atomic pushes** (`git push --atomic`) match git's all-or-nothing contract exactly:
-  the server detects the `atomic` capability and evaluates the full policy set across
-  every pushed ref *before* anything is stored — one denied ref rejects the whole push.
-  Without the flag, refs succeed and fail independently, as in git.
+- **Atomic pushes** (`git push --atomic`): the server detects the `atomic` capability
+  and evaluates the full policy set across every pushed ref *before* anything is
+  stored — one policy-denied ref rejects the whole push, as in git. One documented
+  deviation remains: refs advance through per-ref compare-and-swap on the ref
+  authority, so a non-policy failure midway through the batch (e.g. a concurrent write
+  landing on a later ref) can leave the batch's earlier refs already committed even
+  though git reports the push as failed. Policy enforcement is all-or-nothing; the
+  concurrent-conflict window is not. Without the flag, refs succeed and fail
+  independently, as in git.
 - **Signed pushes**: `verify-sig` validates SSH/PGP commit signatures against keys
   registered via [`codestorage signing-key`](../reference/cli.md#codestorage-signing-key).
 

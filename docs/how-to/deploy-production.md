@@ -170,8 +170,13 @@ therefore lean on the proxy plus statelessness:
 4. Re-register, move to the next replica.
 
 Interrupted work is safe by construction: pack data is published to the bucket *before*
-any ref moves, so a killed push leaves at worst an unreferenced pack for the
-[sweeper](storage-lifecycle-and-sweeping.md) — never a ref pointing at missing objects.
+any ref moves, so a killed push never leaves a ref pointing at missing objects. What it
+can leave behind is storage, not corruption: an unregistered blob (reclaimable by the
+[sweeper](storage-lifecycle-and-sweeping.md)), or — when the kill lands between pack
+registration and the ref update — a **registered** pack whose objects stay quota-counted
+and are carried forward by repack
+([why](../explanation/storage-engine.md#why-repack-packs-the-union-not-reachable-objects));
+a client retry of the same push deduplicates against it and makes it reachable.
 Schema upgrades ride the same boot-time locking as [above](#concurrent-boot-schema-setup-and-migrations),
 so a mixed-version fleet mid-roll is expected and fine, with one deliberate exception:
 

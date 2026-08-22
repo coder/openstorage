@@ -106,7 +106,11 @@ Reading the numbers: admission is `stored + reserved + incoming ≤ quota`, wher
 
 - **stored** counts every registered pack **plus retained (superseded) bytes** — after a
   repack fold, headroom stays reduced until the sweeper reaps the superseded originals
-  and the report shows `retained_bytes_reclaimed`;
+  and the report shows `retained_bytes_reclaimed`. It is also floored by the *physical*
+  bytes under the repository's pack prefixes, which include aged **orphan** blobs — and
+  since general-orphan deletion is off by default, a repository with abandoned uploads
+  can keep hitting denials that only
+  [enabling delete mode](#before-enabling-delete-mode-fleet-prerequisite) resolves;
 - **reserved** counts other writers' in-flight admissions. A crashed writer's reservation
   keeps gating for
   [`CODESTORAGE_PACK_RESERVATION_TTL`](../reference/configuration.md#codestorage_pack_reservation_ttl)
@@ -164,7 +168,7 @@ threshold=<age> duration=<d>
 | `bytes_reclaimed` | Bytes of aged quarantine backups purged this run — the moment storage consumption actually decreases |
 | `superseded_deleted` / `retained_bytes_reclaimed` | The provably repack-superseded subset of `deleted`, and the **quota headroom** their reaps returned |
 | `reservations_expired` | Crashed-writer quota reservations pruned this run |
-| `delete_enabled` / `delete_superseded` | The modes this run actually ran with (a [guard downgrade](#s3-bucket-versioning) shows here) |
+| `delete_enabled` / `delete_superseded` | The **configured** modes — a [guard downgrade](#s3-bucket-versioning) to list-only is *not* reflected here; it shows only as the separate `delete guard failed; this run is list-only` error line |
 
 Every candidate is also logged individually as it is classified
 (`orphan pack candidate key=… size_bytes=… age=… delete_enabled=… delete_superseded=…`),
