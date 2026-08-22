@@ -1,112 +1,79 @@
 # codestorage
 
-An open-source, wire-compatible backend for [code.storage](https://code.storage), built from
-the specification in [`docs/`](docs/README.md).
+An open-source, wire-compatible backend for [code.storage](https://code.storage) — Pierre
+Computer Company's git-native storage service — built from the specification in
+[`docs/`](docs/README.md). One Go binary serves the `/api/v1` HTTP API and the production
+git smart-HTTP path (clone/push, LFS) behind customer-signed JWTs; the official SDKs drop
+in via their `apiBaseUrl` / `storageBaseUrl` overrides without changing client code. Run it
+as a fleet of stateless nodes on Postgres + S3/MinIO, or as a single zero-dependency
+process on SQLite + plain files.
 
-Current state: **phase 7 (deployment packaging + p6 burn-down) implemented**. One Go binary
-(`codestorage serve`) exposes the `/api/v1` repo CRUD
-API, the full `git:read` surface (files, branches, tags, commits, diff, blame, grep, notes,
-archive — cursor pagination, conditional/range file streaming), the `git:write` surface
-(NDJSON commit-pack / diff-commit streaming, restore-commit, merge + read-only preview,
-branch / tag / notes writes — CAS and ref policies everywhere), the production git
-smart-HTTP path (clone/push, ref-policy enforcement, commit-signature verification) behind
-the same per-org JWT verifier, the eventing/sync surface (HMAC-signed `push` and
-`repo.sync.*` webhooks, webhook + git-credentials CRUD, upstream `base_repo` mirror sync
-with `pull-upstream`, synchronous forking), and the phase-6 additions: the Git LFS batch
-API on the same git remote (presigned S3/MinIO transfers, server-proxied in local mode),
-the named-repo path style `/api/repos/{repo_name}/...` as routing aliases,
-`GET /api/repo-urls/{repo_id}`, and optional per-client-IP rate limiting. Background jobs
-run through a queue seam — durable [River](https://riverqueue.com) jobs on Postgres
-(tables migrated automatically at startup) or in-process in local mode — and nodes stay
-stateless. Storage is selected by URL scheme: Postgres + S3 (MinIO) for multi-node
-deployments — packaged as a multi-stage `Dockerfile` plus a two-replica compose profile
-(quickstart below, decisions in docs/16) — or zero-dependency local mode (SQLite + plain
-files via `serve --data-dir`).
-Next: gate evidence for the p4 write surface (docs/13) —
-see [docs/07-implementation-roadmap.md](docs/07-implementation-roadmap.md).
+## Architecture at a glance
 
-## Layout
+```mermaid
+flowchart TB
+    clients["SDKs · plain git · curl<br/>(customer-signed JWTs, per-org keys)"]
 
-| Path | Contents |
-|---|---|
-| `docs/` | Backend specification (wire formats, auth, protocols) + roadmap + ADRs |
-| `cmd/codestorage` | Service binary: `serve`, `hook`, `keygen`, `mint`, `signing-key`, `list-packs` |
-| `internal/api` | `/api/v1` HTTP handlers, JWT middleware, `{"error"}` envelope |
-| `internal/auth` | JWT verification contract (per-org public keys, allowed algorithms) |
-| `internal/meta` | Metadata store: orgs, org public keys, repos, webhooks, git credentials, upstream links |
-| `internal/blob` | `BlobStore` contract + S3/MinIO and local-file implementations (immutable packs) |
-| `internal/ref` | `RefStore` contract + Postgres and SQLite implementations (CAS ref authority) |
-| `internal/gitread` | Read-side git plumbing (ls-tree, log, diff, blame, grep, archive) over the hydrated cache repo |
-| `internal/githttp` | Git smart-HTTP server + LFS batch API, policy/verify-sig hooks, cache hydration, e2e suite |
-| `internal/events` | Outbound webhooks: HMAC-signed delivery + the push-event `RefStore` decorator |
-| `internal/sync` | Upstream mirror sync worker (fetch + loopback push), credential/upstream contracts |
-| `internal/jobs` | Background queue seam: durable River jobs (Postgres) or in-process (local mode) |
-| `docker-compose.yml` | Postgres + MinIO for local dogfooding, plus an opt-in two-replica `replicas` profile (`Dockerfile` image) |
+    subgraph node["codestorage serve — stateless, replicate freely"]
+        api["REST API<br/>/api/v1 + named-repo aliases"]
+        git["git smart-HTTP + LFS"]
+        jobs["background jobs<br/>orphan sweep · repack · webhooks · upstream sync"]
+    end
 
-## Quickstart
+    refs[("Postgres — ref CAS + metadata<br/>(local mode: SQLite)")]
+    packs[("S3 / MinIO — immutable packs<br/>(local mode: plain files)")]
 
-Requires Go, git, and Docker.
+    clients --> api
+    clients --> git
+    node --> refs
+    node --> packs
+```
+
+Refs advance only through compare-and-swap on the database; pack data is published to the
+blob store *before* any ref moves, so a committed ref never points at unavailable objects.
+Nodes keep no durable state — a push through one replica is immediately visible through
+every other.
+
+## Quickstart: local mode (60 seconds)
+
+Requires only Go and git — no Docker, no Postgres, no MinIO. One flag derives the whole
+storage stack: `sqlite://<dir>/codestorage.db` (refs + metadata), `file://<dir>/blobs`
+(packs as plain files), and `<dir>/cache` (rebuildable cache).
 
 ```sh
-# 1. Infra: Postgres (refs + metadata) + MinIO (pack storage).
-docker compose up -d --wait
-
-# 2. Build and generate an org keypair (keys stay in /tmp, never commit them).
+# 1. Build and generate an org keypair (keys are never committed).
 go build ./cmd/codestorage
 ./codestorage keygen --out /tmp/cs-key    # writes /tmp/cs-key.pem + /tmp/cs-key.pub.pem
 
-# 3. Start a node: /api/v1 HTTP API + git smart-HTTP on one listener.
-export CODESTORAGE_PG_URL='postgres://postgres:postgres@127.0.0.1:15432/postgres'
-export CODESTORAGE_S3_URL='s3://codestorage?endpoint=http://127.0.0.1:19000&s3ForcePathStyle=true&region=us-east-1'
-export AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin
+# 2. Start a node: REST API + git smart-HTTP on one listener, storage under ~/cs-data.
 CODESTORAGE_ORG=selfhost CODESTORAGE_ORG_PUBKEYS=/tmp/cs-key.pub.pem \
-  ./codestorage serve --listen 127.0.0.1:8080 &
+  ./codestorage serve --listen 127.0.0.1:8080 --data-dir ~/cs-data &
 sleep 1 && curl -sf http://127.0.0.1:8080/healthz && kill -0 $!
-# ^ catches a stale server squatting the port: serve exits with "address already
-#   in use" behind `&`, and every later command would silently talk to the old
-#   process (whose keys/repos don't match this shell's) — kill it first.
+# ^ fails fast if the port was already taken by an older server (serve's
+#   "address already in use" exit is easy to miss behind `&`).
 
-# 4. Mint JWTs with the org's private key (iss = org, repo = target repo or "org").
+# 3. Mint a token and create a repo.
 TOK_CREATE=$(./codestorage mint --key /tmp/cs-key.pem --iss selfhost --repo demo --scopes repo:write)
-TOK_READ=$(./codestorage mint   --key /tmp/cs-key.pem --iss selfhost --repo demo --scopes git:read)
-TOK_ORG=$(./codestorage mint    --key /tmp/cs-key.pem --iss selfhost --repo org  --scopes org:read)
-
-# 5. Repo CRUD (envelope + status codes per docs/03-http-api.md).
 curl -s -X POST http://127.0.0.1:8080/api/v1/repos -H "Authorization: Bearer $TOK_CREATE" \
   -d '{"default_branch":"main"}'                                    # {"repo_id":...}
-curl -s http://127.0.0.1:8080/api/v1/repo  -H "Authorization: Bearer $TOK_READ"
-curl -s 'http://127.0.0.1:8080/api/v1/repos?limit=10&q=demo' -H "Authorization: Bearer $TOK_ORG"
 
-# 6. Plain git against the same node.
+# 4. Plain git against the same node.
 TOKEN=$(./codestorage mint --key /tmp/cs-key.pem --iss selfhost --repo demo --scopes git:read,git:write)
 git clone "http://t:${TOKEN}@127.0.0.1:8080/demo.git"
 cd demo && git commit --allow-empty -m init && git push origin HEAD:main
-
-# 7. Optional: Git LFS on the same remote — no separate LFS server or config
-#    (requires git-lfs; transfers are presigned MinIO URLs on this stack,
-#    proxied through the server in local mode).
-git lfs install --local && git lfs track '*.bin'
-head -c 1M /dev/urandom > model.bin
-git add . && git commit -m 'lfs object' && git push origin HEAD:main
-
-# 8. Optional: register commit-signing keys (SSH public key line or armored PGP
-#    block) for the `verify-sig` ref-policy op; hooks read them fresh per push.
-./codestorage signing-key add --org selfhost --key ~/.ssh/id_ed25519.pub
-./codestorage signing-key list --org selfhost
-
-# 9. Clean up: soft delete + async storage cleanup. Note: this is last for a
-#    reason — the name stays reserved (recreate → 409, clone → not found) until
-#    cleanup completes, so don't delete a repo you're about to clone.
-curl -s -X DELETE http://127.0.0.1:8080/api/v1/repos/delete -H "Authorization: Bearer $TOK_CREATE"
 ```
 
-Host ports are env-overridable (`PGPORT`, `MINIOPORT`) — see the compose file header.
+The derivation fills only slots not set explicitly — `CODESTORAGE_PG_URL`,
+`CODESTORAGE_S3_URL`, and `--cache-dir` always win. Local mode is intentionally
+single-node (ADR-13 in
+[docs/11](docs/11-local-backends-implementation-notes.md)); the same binary and data
+survive restarts, so it doubles as a tiny durable git server.
 
-### Two-replica compose profile
+## Quickstart: multi-node with Docker Compose
 
-Two stateless server replicas (`node-a`, `node-b`) share one Postgres+MinIO stack,
-built from the repo `Dockerfile` — a push through one node is immediately visible
-through the other:
+Two stateless server replicas (`node-a`, `node-b`) share one Postgres + MinIO stack, built
+from the repo `Dockerfile` — a push through one node is immediately visible through the
+other:
 
 ```sh
 # 1. Keys on the host (the same binary also mints tokens below).
@@ -135,69 +102,65 @@ curl -s http://127.0.0.1:8082/api/repos/demo -H "Authorization: Bearer $TOK_GIT"
 docker compose --profile replicas down -v
 ```
 
-Replica host ports are env-overridable like the backing services (`NODEA_PORT`,
-`NODEB_PORT`); keys are read from `./compose-keys` (override with `CS_KEYS_DIR`).
+Host ports and key locations are env-overridable (`PGPORT`, `MINIOPORT`, `NODEA_PORT`,
+`NODEB_PORT`, `CS_KEYS_DIR`) — see the [`docker-compose.yml`](docker-compose.yml) header.
+To run the server on the host against just the backing services, boot them with plain
+`docker compose up -d --wait` and point `CODESTORAGE_PG_URL` / `CODESTORAGE_S3_URL` at the
+published ports ([configuration reference](docs/reference/configuration.md)).
 
-### Local mode quickstart
+## Features
 
-Zero external dependencies — no Docker, no Postgres, no MinIO. One flag derives the whole
-storage stack: `sqlite://<dir>/codestorage.db` (refs + metadata), `file://<dir>/blobs`
-(packs as plain files), and `<dir>/cache` (rebuildable cache).
+- **Full read surface** (`git:read`): files, branches, tags, commits, diff, blame, grep,
+  notes, archive — cursor pagination, conditional/range file streaming
+  ([docs/03](docs/03-http-api.md)).
+- **Full write surface** (`git:write`): NDJSON commit-pack / diff-commit streaming,
+  restore-commit, merge with read-only preview, branch/tag/notes writes — compare-and-swap
+  and ref policies everywhere ([docs/04](docs/04-streaming-commit-protocols.md)).
+- **Production git smart-HTTP**: clone/push with ref-policy enforcement and
+  commit-signature verification ([docs/05](docs/05-git-protocol-and-namespaces.md)),
+  behind the same per-org JWT verifier as the API
+  ([docs/02](docs/02-authentication.md)).
+- **Git LFS on the same remote** — no separate LFS server: presigned S3/MinIO transfers,
+  server-proxied in local mode ([docs/05](docs/05-git-protocol-and-namespaces.md)).
+- **Eventing & sync**: HMAC-signed `push` / `repo.sync.*` webhooks, webhook +
+  git-credential CRUD, upstream mirror sync, synchronous forking
+  ([docs/06](docs/06-webhooks.md)).
+- **Both API path styles**: `/api/v1` (JWT-addressed) plus the named-repo aliases
+  `/api/repos/{repo_name}/...` and `GET /api/repo-urls/{repo_id}`.
+- **Operations built in**: per-client-IP rate limiting, per-repo pack quotas with durable
+  admission reservations, orphan-pack sweeping, and background repack — durable
+  [River](https://riverqueue.com) jobs on Postgres, in-process in local mode
+  ([configuration reference](docs/reference/configuration.md)).
+- **Commit-signing key registry** managed from the CLI
+  ([`codestorage signing-key`](docs/reference/cli.md#codestorage-signing-key)).
 
-```sh
-# 1. Build and generate an org keypair (keys stay in /tmp, never commit them).
-go build ./cmd/codestorage
-./codestorage keygen --out /tmp/cs-key    # writes /tmp/cs-key.pem + /tmp/cs-key.pub.pem
+## Configuration
 
-# 2. Start a node: same /api/v1 + git smart-HTTP surface as the container stack.
-CODESTORAGE_ORG=selfhost CODESTORAGE_ORG_PUBKEYS=/tmp/cs-key.pub.pem \
-  ./codestorage serve --listen 127.0.0.1:8080 --data-dir /tmp/cs-data &
-sleep 1 && curl -sf http://127.0.0.1:8080/healthz && kill -0 $!
-# ^ fails fast if the port was already taken by an older server (serve's
-#   "address already in use" exit is easy to miss behind `&`).
+`serve` is configured through `CODESTORAGE_*` environment variables. The essentials:
 
-# 3. Mint a token and create a repo.
-TOK_CREATE=$(./codestorage mint --key /tmp/cs-key.pem --iss selfhost --repo demo --scopes repo:write)
-curl -s -X POST http://127.0.0.1:8080/api/v1/repos -H "Authorization: Bearer $TOK_CREATE" \
-  -d '{"default_branch":"main"}'                                    # {"repo_id":...}
+| Variable | Meaning |
+|---|---|
+| `CODESTORAGE_ORG` | **Required.** Org name (JWT `iss` claim) |
+| `CODESTORAGE_ORG_PUBKEYS` | **Required.** PEM file with the org's public keys |
+| `CODESTORAGE_PG_URL` | Database URL for refs + metadata: `postgres://` or `sqlite://` |
+| `CODESTORAGE_S3_URL` | Pack storage URL: `s3://` bucket or `file://` directory |
+| `CODESTORAGE_DATA_DIR` | Local mode: one directory that derives all of the above |
 
-# 4. Plain git against the same node.
-TOKEN=$(./codestorage mint --key /tmp/cs-key.pem --iss selfhost --repo demo --scopes git:read,git:write)
-git clone "http://t:${TOKEN}@127.0.0.1:8080/demo.git"
-cd demo && git commit --allow-empty -m init && git push origin HEAD:main
-```
+Every variable — rate limiting, trusted proxies, pack quotas, sweep and repack tuning,
+legacy aliases — with defaults and validation constraints:
+**[configuration reference](docs/reference/configuration.md)**. Flags and subcommands:
+**[CLI reference](docs/reference/cli.md)**.
 
-The derivation fills only slots not set explicitly — `CODESTORAGE_PG_URL`,
-`CODESTORAGE_S3_URL`, and `--cache-dir` always win. Local mode is intentionally
-single-node (ADR-13 in
-[docs/11-local-backends-implementation-notes.md](docs/11-local-backends-implementation-notes.md)).
+## Documentation
 
-### Configuration
+| | Start here |
+|---|---|
+| **Tutorials** | The two quickstarts above |
+| **Reference** | [Configuration](docs/reference/configuration.md) · [CLI](docs/reference/cli.md) · [HTTP API](docs/03-http-api.md) · [Auth & JWT claims](docs/02-authentication.md) · [Webhooks](docs/06-webhooks.md) |
+| **Explanation** | [Domain model](docs/01-domain-model.md) · [Git protocol & namespaces](docs/05-git-protocol-and-namespaces.md) · [Streaming commit protocols](docs/04-streaming-commit-protocols.md) · [Spec index & decision log](docs/README.md) |
+| **How-to** | The compose profile above is the reference deployment; packaging decisions are recorded in the [decision log](docs/README.md#document-index) |
 
-`serve` reads `CODESTORAGE_*` environment variables; the phase-0 spike names are kept as
-fallback aliases so old invocations keep working.
-
-| Variable (canonical) | Fallback aliases | Meaning |
-|---|---|---|
-| `CODESTORAGE_PG_URL` | `SPIKE_PG_URL`, `PG_URL` | Database URL for refs + metadata: `postgres://` or `sqlite://` |
-| `CODESTORAGE_S3_URL` | `SPIKE_S3_URL`, `BLOB_URL` | Pack storage URL: gocloud.dev `s3://` bucket or `file://` directory |
-| `CODESTORAGE_DATA_DIR` | `--data-dir` flag wins | Local-mode data directory; derives `sqlite://<dir>/codestorage.db`, `file://<dir>/blobs`, and `<dir>/cache` for slots not set explicitly |
-| `CODESTORAGE_LISTEN` | `--listen` / `--addr` flags win | Listen address (default `127.0.0.1:0`) |
-| `CODESTORAGE_ORG` | — | **Required.** Org name (JWT `iss`) |
-| `CODESTORAGE_ORG_PUBKEYS` | — | **Required.** PEM file with 1..n org public key blocks |
-| `CODESTORAGE_BASE_URL` | — | External base for `http_url` in API responses (set it behind `0.0.0.0` binds) |
-| `CODESTORAGE_RATE_RPS` | — | Per-client-IP rate limit for the REST **and** git smart-HTTP surfaces (separate token buckets each): sustained requests/second (429 + `Retry-After` when exceeded). Set together with `CODESTORAGE_RATE_BURST`; unset disables limiting. Client identity defaults to the TCP `RemoteAddr` (forwarded headers are not trusted): behind a proxy that pools backend connections, all clients share one bucket — set `CODESTORAGE_TRUSTED_PROXIES` or rate-limit at the proxy instead |
-| `CODESTORAGE_RATE_BURST` | — | Token-bucket depth (>= 1) for the rate limit; set together with `CODESTORAGE_RATE_RPS`. The git surface raises depths below 8 to 8, and a limited client stays limited until 8 tokens have refilled, so one complete git exchange (several HTTP requests) always finishes after the advertised `Retry-After` |
-| `CODESTORAGE_TRUSTED_PROXIES` | — | Comma-separated CIDR allowlist (bare IPs allowed) of reverse proxies for rate-limit client identity. When the TCP peer is inside the allowlist, both limiters key buckets on the rightmost `X-Forwarded-For` hop that is not itself allowlisted; otherwise (including malformed `X-Forwarded-For`) they key on `RemoteAddr` as before. Unset keeps `RemoteAddr`-only keying. **List only proxies that set/append `X-Forwarded-For` themselves** — trusting a proxy that forwards client-supplied values verbatim lets any client mint fresh rate-limit buckets |
-| `CODESTORAGE_PACK_QUOTA_BYTES` | — | Per-repo pack-bytes quota on every pack writer: git pushes that would grow a repo's `packs/` usage past this are refused at pre-receive before anything is stored, and REST pack writes (commit-pack, merge, notes, fork) are refused with a 403 envelope. Admission is a durable reservation in the ref store, atomic across concurrent pushes and replicas (two pushes that individually fit but together exceed: exactly one wins). A repository and its `+ephemeral`/`+import` namespaces share one quota (default 10 GiB; `0` disables) |
-| `CODESTORAGE_PACK_RESERVATION_TTL` | — | How long a crashed writer's quota reservation keeps gating admission before the sweeper reclaims it (Go duration, default `1h`). Must comfortably exceed the longest plausible server-side pack upload |
-| `CODESTORAGE_SWEEP_DELETE_SUPERSEDED` | — | Sweeper delete mode for the narrow superseded-by-repack class: blobs whose registry rows a repack fold provably removed are reaped after the age threshold and their retained bytes returned to the repo's quota headroom. On by default (`false` disables); general orphan deletion stays opt-in via `CODESTORAGE_SWEEP_DELETE_ENABLED` |
-
-`serve` always runs single-org mode: `/api/v1` and the git smart-HTTP path authenticate
-against the same org-key verifier. The phase-0 git-only mode and its `--jwt-pubkey` flag
-are gone (ADR-8 in [docs/10-phase2-implementation-notes.md](docs/10-phase2-implementation-notes.md)).
-
-## Tests
+## Contributing & testing
 
 ```sh
 go test ./...   # needs Docker: boots real Postgres + MinIO via testcontainers
@@ -206,4 +169,27 @@ go test ./...   # needs Docker: boots real Postgres + MinIO via testcontainers
 Zero-container lanes cover the same surfaces on the local backends: the api integration
 tests fan out into `/pg` + `/sqlite` subtests, and
 `CODESTORAGE_TEST_BACKEND=local go test ./internal/githttp` runs the full git e2e suite on
-`sqlite://` + `file://` (see docs/11 for the lane table).
+`sqlite://` + `file://` (see [docs/11](docs/11-local-backends-implementation-notes.md) for
+the lane table).
+
+<details>
+<summary>Repository layout</summary>
+
+| Path | Contents |
+|---|---|
+| `docs/` | Backend specification (wire formats, auth, protocols) + decision log |
+| `docs/reference/` | Operator reference: configuration, CLI |
+| `cmd/codestorage` | Service binary: `serve`, `hook`, `keygen`, `mint`, `signing-key`, `list-packs` |
+| `internal/api` | `/api/v1` HTTP handlers, JWT middleware, `{"error"}` envelope |
+| `internal/auth` | JWT verification contract (per-org public keys, allowed algorithms) |
+| `internal/meta` | Metadata store: orgs, org public keys, repos, webhooks, git credentials, upstream links |
+| `internal/blob` | `BlobStore` contract + S3/MinIO and local-file implementations (immutable packs) |
+| `internal/ref` | `RefStore` contract + Postgres and SQLite implementations (CAS ref authority) |
+| `internal/gitread` | Read-side git plumbing (ls-tree, log, diff, blame, grep, archive) over the hydrated cache repo |
+| `internal/githttp` | Git smart-HTTP server + LFS batch API, policy/verify-sig hooks, cache hydration, e2e suite |
+| `internal/events` | Outbound webhooks: HMAC-signed delivery + the push-event `RefStore` decorator |
+| `internal/sync` | Upstream mirror sync worker (fetch + loopback push), credential/upstream contracts |
+| `internal/jobs` | Background queue seam: durable River jobs (Postgres) or in-process (local mode) |
+| `docker-compose.yml` | Postgres + MinIO for local dogfooding, plus an opt-in two-replica `replicas` profile |
+
+</details>
