@@ -195,6 +195,15 @@ func incomingBytes(packs []Pack) int64 {
 	return total
 }
 
+// IncomingBytes is the exported saturating declared-size sum for admission
+// callers. The LFS batch surface sums CLIENT-DECLARED sizes before its
+// advisory Admitted check; a naive sum of two MaxInt64 entries wraps
+// negative and panics Admitted's non-negative assertion instead of denying
+// (Codex round 21), so the sum must use the ledger's own arithmetic.
+func IncomingBytes(packs []Pack) int64 {
+	return incomingBytes(packs)
+}
+
 // admitted reports whether incoming fits: used + reserved + incoming <=
 // quota, computed with saturation so oversized declared totals deny
 // instead of wrapping past the quota. A saturated total equal to MaxInt64

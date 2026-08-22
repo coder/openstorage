@@ -146,8 +146,18 @@ func cmdServe(ctx context.Context, args []string) error {
 
 	// HTTP API (single-org self-host mode). The read endpoints share the
 	// ref/blob stores and cache dir with the githttp fallback below.
+	// The REST pack writers' admission floor late-binds to the git
+	// server's shared single-flight cache (issue #51, Codex round 21):
+	// the API handler is built before the git server (it produces the
+	// verifier the git server needs), and gitSrv is assigned strictly
+	// before the listener serves any request.
+	var gitSrv *githttp.Server
+	usageFloor := func(ctx context.Context, repo string) (int64, error) {
+		assertf(gitSrv != nil, "usageFloor called before the git server was wired")
+		return gitSrv.CachedUsageFloor(ctx, repo)
+	}
 	apiHandler, metaStore, verifier, maybeRepack, cleanup, err := buildAPIHandler(ctx, cfg.dbURL, cfg.org, httpBaseURL, loopbackBaseURL, orgPEMBlocks, st, bl, cfg.cacheDir,
-		api.RateLimitConfig{RPS: cfg.rateRPS, Burst: cfg.rateBurst, TrustedProxies: cfg.trustedProxies}, cfg.packQuotaBytes, cfg.packReservationTTL, cfg.sweep, cfg.repackThreshold, cfg.webhookAllowPrivate, cfg.secretsCodec)
+		api.RateLimitConfig{RPS: cfg.rateRPS, Burst: cfg.rateBurst, TrustedProxies: cfg.trustedProxies}, cfg.packQuotaBytes, cfg.packReservationTTL, cfg.sweep, cfg.repackThreshold, cfg.webhookAllowPrivate, cfg.secretsCodec, usageFloor)
 	if err != nil {
 		return err
 	}
@@ -161,6 +171,7 @@ func cmdServe(ctx context.Context, args []string) error {
 	// Git smart-HTTP path, authenticated with the same verifier as the API
 	// (ADR-8: iss-resolved org keys; the spike's single-key mode is gone).
 	srv := githttp.NewServer(st, bl, cfg.cacheDir, verifier, cfg.org)
+	gitSrv = srv // late-binds the REST writers' usageFloor above
 	// Post-push repack trigger (issue #1): pre-receive registered any
 	// pushed packs strictly before receive-pack returned, so the threshold
 	// check runs in the serve process for BOTH queue backends (the local

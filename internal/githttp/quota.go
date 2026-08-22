@@ -37,6 +37,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strconv"
 	"sync"
 	"time"
 
@@ -53,6 +54,16 @@ const EnvPackQuota = "CODESTORAGE_GIT_PACK_QUOTA"
 // defaultReservationTTL when it is absent (a serve binary predating the
 // ledger), so quota enforcement never silently weakens on skew.
 const EnvPackReservationTTL = "CODESTORAGE_GIT_PACK_RESERVATION_TTL"
+
+// EnvUsageFloor carries the repo's storage usage floor (packs + LFS
+// prefixes, bytes) from the serve process's shared single-flight cache
+// into the pre-receive hook (Codex round 21): the hook is a fresh process
+// per push, so a hook-side listing cannot be cached across pushes and
+// re-scans both prefixes every time — ~100 pages per push at the LFS
+// object cap. Set alongside EnvPackQuota. The value is minted at
+// receive-pack spawn (one cache TTL plus the client's transfer time
+// stale), which is safe for the FLOOR — see CachedUsageFloor.
+const EnvUsageFloor = "CODESTORAGE_GIT_USAGE_FLOOR"
 
 // defaultReservationTTL bounds how long a crashed push's reservation keeps
 // gating admission (ref/ledger.go). It must comfortably exceed the longest
@@ -232,20 +243,44 @@ func packUsageBytes(ctx context.Context, bl blob.BlobStore, repo string) (int64,
 	return blob.StorageUsageBytes(ctx, bl, repo)
 }
 
-// cachedUsageFloor returns repo's storage usage floor for LFS admission,
+// hookUsageFloor resolves the pre-receive admission floor: the serve
+// process mints EnvUsageFloor from its shared single-flight cache (Codex
+// round 21 — the hook is a fresh process per push, so hook-side listings
+// re-scan the pack AND LFS prefixes on every push). Malformed or negative
+// values fail closed like a malformed EnvPackQuota: the env comes from our
+// own server, so nonsense means misconfiguration, not client input. An
+// ABSENT env falls back to a fresh self-listing — a serve binary predating
+// the minted floor (skew) must not weaken enforcement.
+func hookUsageFloor(ctx context.Context, bl blob.BlobStore, repo string) (int64, error) {
+	raw, ok := os.LookupEnv(EnvUsageFloor)
+	if !ok {
+		return packUsageBytes(ctx, bl, repo)
+	}
+	floor, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || floor < 0 {
+		return 0, fmt.Errorf("malformed %s=%q", EnvUsageFloor, raw)
+	}
+	return floor, nil
+}
+
+// CachedUsageFloor returns repo's storage usage floor for admission,
 // serving a ≤usageCacheTTL-stale cached listing and coalescing concurrent
 // misses into one flight (issue #51, Codex round 15: fresh per-transfer
-// listings amplify — a 100-object batch cost ~201 full prefix scans).
-// Staleness is safe FOR THE FLOOR: every byte registered since the ledger
-// exists is covered by the usage counter, and in-flight uploads by their
-// reservations, regardless of this value; the floor exists for pre-ledger
-// bytes (fixed) and orphaned uploads, whose admission visibility this
-// cache delays by at most its TTL — a bounded stretch of the ledger's
-// documented orphan-window overshoot. Unlike peekUsage (observational,
-// never blocks), admission needs a value: a cold entry lists inline,
-// concurrent cold callers share the leader's flight.
-func (s *Server) cachedUsageFloor(ctx context.Context, repo string) (int64, error) {
-	assertf(repo != "", "cachedUsageFloor: empty repo")
+// listings amplify — a 100-object batch cost ~201 full prefix scans). It
+// feeds every admission surface: LFS transfers here, the pre-receive
+// hook via its spawn env (EnvUsageFloor), and REST pack writers via
+// api.Config.UsageFloor (Codex round 21 — per-push self-listings in those
+// paths re-amplify at the LFS object cap). Staleness is safe FOR THE
+// FLOOR: every byte registered since the ledger exists is covered by the
+// usage counter, and in-flight uploads by their reservations, regardless
+// of this value; the floor exists for pre-ledger bytes (fixed) and
+// orphaned uploads, whose admission visibility this cache delays by at
+// most its TTL — a bounded stretch of the ledger's documented
+// orphan-window overshoot. Unlike peekUsage (observational, never
+// blocks), admission needs a value: a cold entry lists inline, concurrent
+// cold callers share the leader's flight.
+func (s *Server) CachedUsageFloor(ctx context.Context, repo string) (int64, error) {
+	assertf(repo != "", "CachedUsageFloor: empty repo")
 	c := &s.usage
 	c.mu.Lock()
 	if e, ok := c.entries[repo]; ok && !c.clockNow().After(e.expires) {

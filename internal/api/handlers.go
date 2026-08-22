@@ -44,6 +44,24 @@ type server struct {
 	// packReservationTTL bounds how long a crashed writer's quota
 	// reservation gates admission (issue #29, ref/ledger.go).
 	packReservationTTL time.Duration
+	// usageFloorFn resolves the pack-admission usage floor (Config.
+	// UsageFloor); nil falls back to a fresh listing per write.
+	usageFloorFn func(ctx context.Context, repo string) (int64, error)
+}
+
+// usageFloor resolves the pack-admission usage floor: the serve command
+// wires the git server's shared single-flight cached listing (Codex round
+// 21 — a fresh listing per REST pack write re-scans the repo's pack and
+// LFS prefixes, ~100 pages per write at the LFS object cap). Staleness is
+// safe for the FLOOR: registered bytes are covered by the ledger counter
+// and in-flight writes by reservations; the floor exists for pre-ledger
+// and orphaned bytes (see githttp.Server.CachedUsageFloor). Direct
+// construction without the hook keeps the fresh listing.
+func (s *server) usageFloor(ctx context.Context, repo string) (int64, error) {
+	if s.usageFloorFn != nil {
+		return s.usageFloorFn(ctx, repo)
+	}
+	return blob.StorageUsageBytes(ctx, s.blobStore, repo)
 }
 
 // triggerRepack runs the repack-threshold check after a successful pack

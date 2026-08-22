@@ -61,7 +61,7 @@ func (s *server) publishPack(ctx context.Context, repoID, packID, packPath strin
 			// overshoot and is consumed by RegisterPacks below. A failed
 			// upload releases it (owner-scoped); a crash leaves an
 			// expiring row the sweeper prunes.
-			floor, err := blob.StorageUsageBytes(ctx, s.blobStore, repoID)
+			floor, err := s.usageFloor(ctx, repoID)
 			if err != nil {
 				return fmt.Errorf("pack quota usage: %w", err)
 			}

@@ -11,6 +11,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -605,6 +606,28 @@ func TestLFSQuota_AtomicCapLoserLeavesNoBlob(t *testing.T) {
 	}
 	if has, err := st.HasLFSObject(context.Background(), lfsTestRepoID, blob.LFSKey(lfsTestRepoID, oid)); err != nil || has {
 		t.Fatalf("atomic-cap loser left a registry row: %v, %v", has, err)
+	}
+}
+
+// TestLFSQuota_TwoMaxInt64BatchDenied (Codex round 21): TWO distinct
+// objects each declaring MaxInt64 wrap a naive batch sum negative, and
+// ref.Admitted panics its non-negative assertion instead of denying —
+// repeatable panic logs for any write-scoped client. The batch's declared
+// total must use the ledger's saturating arithmetic and answer 507s.
+func TestLFSQuota_TwoMaxInt64BatchDenied(t *testing.T) {
+	srv, _, mint := newLFSQuotaServer(t, 1<<20, time.Hour)
+	tok := mint(auth.ScopeGitWrite)
+	body := fmt.Sprintf(
+		`{"operation":"upload","transfers":["basic"],"objects":[{"oid":%q,"size":%d},{"oid":%q,"size":%d}]}`,
+		strings.Repeat("ab", 32), int64(math.MaxInt64), strings.Repeat("cd", 32), int64(math.MaxInt64))
+	resp := decodeBatch(t, doLFS(t, srv, http.MethodPost, lfsBatchPath, "basic:"+tok, body))
+	if len(resp.Objects) != 2 {
+		t.Fatalf("objects = %d, want 2", len(resp.Objects))
+	}
+	for i, obj := range resp.Objects {
+		if obj.Error == nil || obj.Error.Code != http.StatusInsufficientStorage {
+			t.Fatalf("overflow object %d not denied with 507: %+v", i, obj)
+		}
 	}
 }
 

@@ -309,6 +309,48 @@ func TestStorageUsageBytes(t *testing.T) {
 	}
 }
 
+// TestHookUsageFloor (Codex round 21): the pre-receive hook is a fresh
+// process per push, so per-push self-listings of the pack and LFS
+// prefixes amplify against the shared backend. The serve process mints
+// the floor into EnvUsageFloor from its shared cache; the hook must use
+// it WITHOUT listing (nil blob store proves no listing — StorageUsageBytes
+// asserts on nil), fail closed on nonsense (the env comes from our own
+// server), and self-list only when the env is absent (binary skew).
+func TestHookUsageFloor(t *testing.T) {
+	t.Run("env-floor-used-without-listing", func(t *testing.T) {
+		t.Setenv(EnvUsageFloor, "1234")
+		got, err := hookUsageFloor(context.Background(), nil, "repo_a")
+		if err != nil || got != 1234 {
+			t.Fatalf("hookUsageFloor = (%d, %v), want (1234, nil)", got, err)
+		}
+	})
+	for name, raw := range map[string]string{
+		"malformed-fails-closed": "not-a-number",
+		"negative-fails-closed":  "-1",
+		"empty-fails-closed":     "",
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv(EnvUsageFloor, raw)
+			if _, err := hookUsageFloor(context.Background(), nil, "repo_a"); err == nil {
+				t.Fatalf("hookUsageFloor(%s=%q) did not fail closed", EnvUsageFloor, raw)
+			}
+		})
+	}
+	t.Run("absent-falls-back-to-listing", func(t *testing.T) {
+		// t.Setenv registers cleanup; unset AFTER it so the var is absent
+		// during the test but restored for any outer value.
+		t.Setenv(EnvUsageFloor, "sentinel")
+		os.Unsetenv(EnvUsageFloor)
+		bl := openTestBlob(t)
+		seedPack(t, bl, "repo_a", "1111", 100)
+		seedLFS(t, bl, "repo_a", strings.Repeat("aa", 32), 7)
+		got, err := hookUsageFloor(context.Background(), bl, "repo_a")
+		if err != nil || got != 107 {
+			t.Fatalf("skew fallback = (%d, %v), want (107, nil)", got, err)
+		}
+	})
+}
+
 // TestServiceRPC_QuotaNeverRejectsAtHTTP pins the HTTP layer's
 // quota-neutral contract (Codex rounds 3–6): even a repo far over quota is
 // NOT rejected at HTTP time — the request proceeds toward receive-pack

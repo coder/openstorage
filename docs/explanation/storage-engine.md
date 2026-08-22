@@ -101,7 +101,11 @@ max(usage counter, blob-listing floor) + active reservations + incoming ≤ quot
 - **The counter and the floor cross-check each other.** The counter covers what the
   listing can't see yet (staleness, in-flight registrations); the physical listing floor
   covers what the counter never saw (pre-ledger packs, orphaned uploads). Taking the max
-  fails toward *denying* at the margin, never toward silent overshoot.
+  fails toward *denying* at the margin, never toward silent overshoot. The floor listing
+  is served from a short-lived per-repository cache shared by every admission surface
+  (git pushes, REST pack writes, LFS transfers) rather than re-scanned per write — safe
+  precisely because everything registered or in flight is covered by the counter and
+  reservations regardless of the floor's staleness.
 - **Retained bytes stay counted.** A repack fold doesn't remove the superseded blobs, so
   it doesn't free quota either — the ledger is debited only when the sweeper reaps them.
   Quota tracks the bytes under the repository's *pack prefixes*, not logical

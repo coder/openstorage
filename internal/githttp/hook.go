@@ -300,7 +300,7 @@ func preReceive(ctx context.Context) error {
 			}
 		}
 		if len(unpublished) > 0 {
-			floor, err := packUsageBytes(ctx, bl, repo)
+			floor, err := hookUsageFloor(ctx, bl, repo)
 			if err != nil {
 				return fmt.Errorf("pre-receive: %w", err)
 			}
@@ -310,12 +310,8 @@ func preReceive(ctx context.Context) error {
 				return fmt.Errorf("pre-receive: reserve pack bytes: %w", err)
 			}
 			if !dec.OK {
-				var incoming int64
-				for _, p := range unpublished {
-					incoming += p.Size
-				}
 				return fmt.Errorf("pre-receive: repository pack quota exceeded: push adds %d bytes to %d bytes stored (+%d bytes reserved by in-flight pushes), quota is %d bytes",
-					incoming, dec.UsedBytes, dec.ReservedBytes, quota)
+					ref.IncomingBytes(unpublished), dec.UsedBytes, dec.ReservedBytes, quota)
 			}
 			for _, p := range unpublished {
 				reserved = append(reserved, p.Key)

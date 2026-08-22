@@ -450,7 +450,9 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 		// returns a fresh copy, so the in-place filter aliases nothing.
 		env := cmd.Env[:0]
 		for _, kv := range cmd.Env {
-			if !strings.HasPrefix(kv, EnvAtomic+"=") {
+			// EnvUsageFloor is stripped for the same reason: the hook
+			// trusts it as THIS push's admission floor.
+			if !strings.HasPrefix(kv, EnvAtomic+"=") && !strings.HasPrefix(kv, EnvUsageFloor+"=") {
 				env = append(env, kv)
 			}
 		}
@@ -461,7 +463,22 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 		// Resolved quota for the pre-receive hook's authoritative
 		// usage+incoming check (quota.go); absent means disabled.
 		if s.PackQuotaBytes > 0 {
+			// The hook is a fresh process per push and cannot cache
+			// across pushes, so its admission floor is minted HERE from
+			// the shared single-flight cache (Codex round 21: hook-side
+			// self-listings scan the pack AND LFS prefixes per push —
+			// ~100 pages at the LFS object cap — amplifying cheap pushes
+			// into shared-backend listing load). Fail closed: spawning
+			// without the env would just reopen the per-push listing
+			// path via the hook's skew fallback.
+			floor, err := s.CachedUsageFloor(r.Context(), target.key)
+			if err != nil {
+				log.Printf("quota: %s: usage floor for receive-pack: %v", target.key, err)
+				httpError(w, http.StatusInternalServerError, "storage quota check failed")
+				return
+			}
 			cmd.Env = append(cmd.Env, EnvPackQuota+"="+strconv.FormatInt(s.PackQuotaBytes, 10))
+			cmd.Env = append(cmd.Env, EnvUsageFloor+"="+strconv.FormatInt(floor, 10))
 			if s.PackReservationTTL > 0 {
 				cmd.Env = append(cmd.Env, EnvPackReservationTTL+"="+s.PackReservationTTL.String())
 			}

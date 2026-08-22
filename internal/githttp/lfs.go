@@ -453,13 +453,17 @@ func (s *Server) lfsBatchUpload(r *http.Request, repoElem string, target repoTar
 	// zero growth) but still get actions.
 	if s.PackQuotaBytes > 0 {
 		var packs []ref.Pack
-		var incoming int64
 		for _, key := range order {
 			if sz := needSize[key]; sz > 0 && !zeroGrowth[key] {
 				packs = append(packs, ref.Pack{Key: key, Size: sz})
-				incoming += sz
 			}
 		}
+		// Saturating sum (Codex round 21): declared sizes are arbitrary
+		// client int64s, and two MaxInt64 entries wrap a naive sum
+		// negative — panicking Admitted's non-negative assertion instead
+		// of denying. The ledger's own arithmetic keeps the total on the
+		// denying side.
+		incoming := ref.IncomingBytes(packs)
 		// ADVISORY admission only — the batch inserts NO reservation rows
 		// (Codex round 17): any batch-time durable hold is rotatable (a
 		// fresh OID per TTL re-acquires the whole headroom without ever
@@ -471,7 +475,7 @@ func (s *Server) lfsBatchUpload(r *http.Request, repoElem string, target repoTar
 			denyAll := func(code int, msg string) []lfsObjectResult {
 				return s.denyAllNeeded(order, needIdx, results, code, msg)
 			}
-			floor, err := s.cachedUsageFloor(ctx, repoID)
+			floor, err := s.CachedUsageFloor(ctx, repoID)
 			if err != nil {
 				log.Printf("lfs quota: %s: usage listing failed: %v", repoID, err)
 				return denyAll(http.StatusInternalServerError, "storage quota check failed")
@@ -970,7 +974,7 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target r
 	// before the row's created_at.
 	pubAnchor := time.Now()
 	if s.PackQuotaBytes > 0 && n > 0 && !registered {
-		floor, err := s.cachedUsageFloor(ctx, repoID)
+		floor, err := s.CachedUsageFloor(ctx, repoID)
 		if err != nil {
 			log.Printf("lfs quota: %s: usage listing failed: %v", repoID, err)
 			lfsError(w, http.StatusInternalServerError, "storage quota check failed")

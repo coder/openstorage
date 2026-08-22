@@ -5,6 +5,7 @@ package api
 // api_integration_test.go.
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -16,6 +17,23 @@ import (
 
 func discardLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+// TestUsageFloorPrefersInjectedHook (Codex round 21): when the serve
+// command wires Config.UsageFloor (the git server's shared single-flight
+// cached listing), REST pack admission must use it instead of re-listing
+// the repo's pack and LFS prefixes per write. A nil blob store proves no
+// listing happened (blob.StorageUsageBytes asserts on nil).
+func TestUsageFloorPrefersInjectedHook(t *testing.T) {
+	var gotRepo string
+	s := &server{usageFloorFn: func(_ context.Context, repo string) (int64, error) {
+		gotRepo = repo
+		return 4321, nil
+	}}
+	floor, err := s.usageFloor(context.Background(), "repo_x")
+	if err != nil || floor != 4321 || gotRepo != "repo_x" {
+		t.Fatalf("usageFloor = (%d, %v) for %q, want (4321, nil) for repo_x", floor, err, gotRepo)
+	}
 }
 
 func decodeEnvelope(t *testing.T, rr *httptest.ResponseRecorder) string {
