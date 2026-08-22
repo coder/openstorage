@@ -349,9 +349,12 @@ still answers `413`, but its hooks already ran under the normal quota admission.
 Per-push budget for `verify-sig` signature verifications
 ([#59](https://github.com/coder/code-storage/issues/59)): the maximum number of commits
 one push may verify — each verification spawns a `git verify-commit` subprocess — across
-all its refs, pre-receive evaluation and update hooks combined. A push that would exceed
-the remaining budget is rejected whole, fail-closed, **before** the excess verifications
-run, with an error naming this variable.
+all its refs, pre-receive evaluation and update hooks combined. A ref update that would
+exceed the remaining budget is rejected fail-closed **before** the excess verifications
+run, with an error naming this variable. Rejection follows git's normal per-ref
+semantics, like every other policy denial: on a plain multi-ref push only the
+over-budget ref updates are denied (refs whose commits fit the budget can still land),
+while `git push --atomic` rejects the whole push on the first denial.
 
 - **Default:** `10000`. **`0` disables the budget**; negative or malformed values are
   startup errors.
