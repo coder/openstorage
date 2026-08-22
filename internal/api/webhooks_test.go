@@ -109,7 +109,7 @@ func newWebhooksServer(t *testing.T, e *testEnv) (*httptest.Server, *memWebhookS
 	// Stub public DNS so ordinary registration tests never touch the
 	// network; dedicated guard tests inject denied answers (issue #53).
 	guard := events.TargetGuard{LookupNetIP: func(context.Context, string) ([]netip.Addr, error) {
-		return []netip.Addr{netip.MustParseAddr("192.0.2.10")}, nil
+		return []netip.Addr{netip.MustParseAddr("8.8.8.8")}, nil
 	}}
 	return newWebhooksServerWithGuard(t, e, guard)
 }

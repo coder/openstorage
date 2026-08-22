@@ -67,7 +67,53 @@ var (
 	// IsGlobalUnicast reports true. Internal deployments may opt into it
 	// through AllowPrivate alongside RFC 1918.
 	sharedV4 = netip.MustParsePrefix("100.64.0.0/10")
+	// IANA currently allocates ordinary globally routed IPv6 unicast from
+	// 2000::/3. Requiring that super-prefix denies unallocated/reserved
+	// IPv6 space that Go still labels global unicast.
+	globalV6 = netip.MustParsePrefix("2000::/3")
 )
+
+// specialUsePrefixes is the complete IPv4/IPv6 special-purpose registry
+// outside the internal receiver classes handled separately below. These
+// ranges are not normal public webhook destinations, even when Go reports
+// IsGlobalUnicast (for example benchmarking, documentation, protocol
+// anycast, translation, and reserved space). The list follows the IANA
+// IPv4/IPv6 Special-Purpose Address Registries; fec0::/10 is added because
+// the deprecated IPv6 site-local block is no longer in the current registry.
+var specialUsePrefixes = []netip.Prefix{
+	netip.MustParsePrefix("0.0.0.0/8"),
+	netip.MustParsePrefix("::/96"), // deprecated IPv4-compatible addresses
+	netip.MustParsePrefix("192.0.0.0/24"),
+	netip.MustParsePrefix("192.0.2.0/24"),
+	netip.MustParsePrefix("192.31.196.0/24"),
+	netip.MustParsePrefix("192.52.193.0/24"),
+	netip.MustParsePrefix("192.88.99.0/24"),
+	netip.MustParsePrefix("192.175.48.0/24"),
+	netip.MustParsePrefix("198.18.0.0/15"),
+	netip.MustParsePrefix("198.51.100.0/24"),
+	netip.MustParsePrefix("203.0.113.0/24"),
+	netip.MustParsePrefix("240.0.0.0/4"),
+	netip.MustParsePrefix("64:ff9b::/96"),
+	netip.MustParsePrefix("64:ff9b:1::/48"),
+	netip.MustParsePrefix("100::/64"),
+	netip.MustParsePrefix("100:0:0:1::/64"),
+	netip.MustParsePrefix("2001::/23"),
+	netip.MustParsePrefix("2001:db8::/32"),
+	netip.MustParsePrefix("2002::/16"),
+	netip.MustParsePrefix("2620:4f:8000::/48"),
+	netip.MustParsePrefix("3fff::/20"),
+	netip.MustParsePrefix("5f00::/16"),
+	netip.MustParsePrefix("fec0::/10"),
+}
+
+func isSpecialUse(ip netip.Addr) bool {
+	for _, prefix := range specialUsePrefixes {
+		if prefix.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
 
 // deniedReason classifies ip against the delivery deny-list, returning ""
 // when the address is an acceptable target. IPv4-mapped IPv6 is unmapped
@@ -110,6 +156,10 @@ func (g TargetGuard) deniedReason(ip netip.Addr) string {
 		if !g.AllowPrivate {
 			return "link-local address"
 		}
+	case isSpecialUse(ip):
+		return "special-purpose address"
+	case ip.Is6() && !globalV6.Contains(ip):
+		return "non-public IPv6 address"
 	case !ip.IsGlobalUnicast():
 		// Defensive catch-all: anything outside the explicitly allowed
 		// private classes stays denied even under the escape hatch.

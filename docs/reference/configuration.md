@@ -150,9 +150,10 @@ proxies whose forwarded client identity the rate limiters may trust.
 ### `CODESTORAGE_WEBHOOK_ALLOW_PRIVATE`
 
 Controls the native webhook SSRF guard. **Default: `false`.** By default, webhook delivery
-rejects loopback, RFC 1918, RFC 6598 shared, IPv4/IPv6 link-local, IPv6 ULA,
-unspecified, multicast, broadcast, and cloud-metadata targets. IPv4-mapped IPv6 addresses are
-normalized before classification, so (for example) `::ffff:10.0.0.1` is private.
+rejects IANA special-purpose ranges, including loopback, RFC 1918, RFC 6598 shared,
+IPv4/IPv6 link-local, IPv6 ULA, translation/protocol anycast, documentation, benchmarking,
+reserved, unspecified, multicast, broadcast, and cloud-metadata targets. IPv4-mapped IPv6
+addresses are normalized before classification, so (for example) `::ffff:10.0.0.1` is private.
 
 Registration performs the same target check against IP literals and the DNS answers visible
 at that moment as a fast-feedback courtesy. **Registration acceptance is not a reachability
@@ -169,8 +170,10 @@ target the proxy later connects to.
 
 Set this variable to a Go boolean `true` only when webhooks intentionally target internal
 services. It admits loopback, RFC 1918, RFC 6598 shared, link-local, and ULA receivers,
-and logs a warning at startup. It **does not** permit `169.254.169.254`, `fd00:ec2::254`,
-unspecified/multicast/broadcast addresses, or redirects. Malformed boolean values are startup errors.
+and logs a warning at startup. It **does not** permit cloud metadata, unspecified/multicast/
+broadcast addresses, other IANA special-purpose ranges (such as documentation, benchmarking,
+reserved, translation, or protocol-anycast space), or redirects. Malformed boolean values
+are startup errors.
 
 ## Pack quota
 

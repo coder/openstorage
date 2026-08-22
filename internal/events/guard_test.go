@@ -28,6 +28,30 @@ func TestTargetGuardRejectsDeniedDialTargets(t *testing.T) {
 		"100.64.0.1",             // RFC 6598 shared lower bound
 		"100.100.100.200",        // RFC 6598 shared internal target
 		"100.127.255.254",        // RFC 6598 shared upper bound
+		"0.0.0.1",                // this-network special use
+		"192.0.0.9",              // protocol anycast special use
+		"192.0.2.1",              // documentation TEST-NET-1
+		"192.31.196.1",           // AS112 special use
+		"192.52.193.1",           // AMT special use
+		"192.88.99.1",            // deprecated 6to4 relay
+		"192.175.48.1",           // AS112 direct delegation
+		"198.18.0.1",             // benchmarking
+		"198.51.100.1",           // documentation TEST-NET-2
+		"203.0.113.1",            // documentation TEST-NET-3
+		"240.0.0.1",              // reserved
+		"64:ff9b::1",             // NAT64 translation
+		"64:ff9b:1::1",           // local-use NAT64 translation
+		"100::1",                 // discard-only
+		"100:0:0:1::1",           // dummy IPv6 prefix
+		"2001::1",                // IETF protocol assignments
+		"2001:db8::1",            // IPv6 documentation
+		"2002::1",                // deprecated 6to4
+		"2620:4f:8000::1",        // AS112 direct delegation
+		"3fff::1",                // IPv6 documentation
+		"5f00::1",                // SRv6 SIDs
+		"fec0::1",                // deprecated IPv6 site-local
+		"::2",                    // deprecated IPv4-compatible space
+		"4000::1",                // unallocated outside global 2000::/3
 		"169.254.1.1",            // IPv4 link-local
 		"fe80::1",                // IPv6 link-local
 		"fc00::1",                // IPv6 ULA lower half
@@ -62,7 +86,7 @@ func TestTargetGuardRejectsDeniedDialTargets(t *testing.T) {
 func TestTargetGuardFailsClosedOnResolutionProblems(t *testing.T) {
 	t.Parallel()
 
-	public := netip.MustParseAddr("198.51.100.10")
+	public := netip.MustParseAddr("8.8.8.8")
 	private := netip.MustParseAddr("10.0.0.1")
 	invalid := netip.Addr{}
 	cases := map[string]func(context.Context, string) ([]netip.Addr, error){
@@ -146,7 +170,7 @@ func TestTargetGuardPublicLiteralDialsTestServer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	public := netip.MustParseAddr("198.51.100.10")
+	public := netip.MustParseAddr("8.8.8.8")
 	guard := TargetGuard{dialAddrPort: func(ctx context.Context, network string, got netip.AddrPort) (net.Conn, error) {
 		if got != netip.AddrPortFrom(public, uint16(port)) {
 			return nil, errors.New("guard dialed an unexpected address")
@@ -177,7 +201,7 @@ func TestTargetGuardRejectsDNSRebindingAtDialTime(t *testing.T) {
 	guard := TargetGuard{
 		LookupNetIP: func(context.Context, string) ([]netip.Addr, error) {
 			if lookups.Add(1) == 1 {
-				return []netip.Addr{netip.MustParseAddr("198.51.100.10")}, nil
+				return []netip.Addr{netip.MustParseAddr("8.8.8.8")}, nil
 			}
 			return []netip.Addr{netip.MustParseAddr("127.0.0.1")}, nil
 		},
@@ -213,23 +237,24 @@ func TestTargetGuardRegistrationCourtesyCheck(t *testing.T) {
 		case "private.example":
 			return []netip.Addr{netip.MustParseAddr("10.0.0.1")}, nil
 		case "mixed.example":
-			return []netip.Addr{netip.MustParseAddr("198.51.100.10"), netip.MustParseAddr("fc00::1")}, nil
+			return []netip.Addr{netip.MustParseAddr("8.8.8.8"), netip.MustParseAddr("fc00::1")}, nil
 		case "unresolved.example":
 			return nil, errors.New("temporary resolver failure")
 		default:
-			return []netip.Addr{netip.MustParseAddr("198.51.100.10")}, nil
+			return []netip.Addr{netip.MustParseAddr("8.8.8.8")}, nil
 		}
 	}}
 	for name, tc := range map[string]struct {
 		rawURL string
 		wantOK bool
 	}{
-		"private literal denied":     {rawURL: "http://192.168.1.2/hook"},
-		"mapped literal denied":      {rawURL: "http://[::ffff:10.0.0.1]/hook"},
-		"private resolution denied":  {rawURL: "https://private.example/hook"},
-		"mixed resolution denied":    {rawURL: "https://mixed.example/hook"},
-		"public literal accepted":    {rawURL: "https://198.51.100.10/hook", wantOK: true},
-		"public resolution accepted": {rawURL: "https://public.example/hook", wantOK: true},
+		"private literal denied":       {rawURL: "http://192.168.1.2/hook"},
+		"mapped literal denied":        {rawURL: "http://[::ffff:10.0.0.1]/hook"},
+		"private resolution denied":    {rawURL: "https://private.example/hook"},
+		"mixed resolution denied":      {rawURL: "https://mixed.example/hook"},
+		"public IPv4 literal accepted": {rawURL: "https://8.8.8.8/hook", wantOK: true},
+		"public IPv6 literal accepted": {rawURL: "https://[2606:4700:4700::1111]/hook", wantOK: true},
+		"public resolution accepted":   {rawURL: "https://public.example/hook", wantOK: true},
 		// Registration is courtesy-only: a temporary resolution failure
 		// does not promise reachability; dial time later fails closed.
 		"resolution failure accepted": {rawURL: "https://unresolved.example/hook", wantOK: true},
@@ -328,6 +353,14 @@ func TestTargetGuardAllowPrivateScope(t *testing.T) {
 		"0.0.0.0",
 		"::",
 		"224.0.0.1",
+		"192.0.2.1",
+		"198.18.0.1",
+		"240.0.0.1",
+		"64:ff9b::1",
+		"2001:db8::1",
+		"fec0::1",
+		"::2",
+		"4000::1",
 	} {
 		raw := raw
 		t.Run("still_denies_"+strings.ReplaceAll(raw, ":", "_"), func(t *testing.T) {
