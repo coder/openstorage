@@ -339,11 +339,22 @@ func (r *Repacker) Repack(ctx context.Context, repo string) (folded bool, err er
 			probe = old[1]
 		}
 		assertf(probe.ID != newPack.ID, "ReplacePacks input %v deduplicates to one id", old)
-		has, herr := r.store.HasPack(ctx, repo, probe.Key)
+		// The resolution runs on a DETACHED bounded context: the most
+		// common ambiguity cause is the fold deadline expiring during the
+		// swap, and a probe on that same expired context could never
+		// resolve to rollback — the conservative folded=true would then
+		// send a deterministic deadline failure down the follow-up path
+		// (local rerun, river successor) instead of river's terminal
+		// deadline cancel. The bound keeps a wedged store from pinning
+		// the worker (the trigger-check timeout, same scale as one point
+		// read).
+		probeCtx, cancelProbe := context.WithTimeout(context.WithoutCancel(ctx), repackTriggerTimeout)
+		defer cancelProbe()
+		has, herr := r.store.HasPack(probeCtx, repo, probe.Key)
 		if herr == nil && has {
 			return false, fmt.Errorf("repack %s: replace packs (rolled back): %w", repo, err)
 		}
-		verr := verifyPublished(ctx, r.blobs, newPack.Key, packPath)
+		verr := verifyPublished(probeCtx, r.blobs, newPack.Key, packPath)
 		return true, errors.Join(fmt.Errorf("repack %s: replace packs: %w", repo, err), verr)
 	}
 	if !won {

@@ -432,6 +432,42 @@ func TestRepack_RolledBackSwapReportsNotFolded(t *testing.T) {
 	}
 }
 
+// expiredCtxReplaceStore fails ReplacePacks with the deadline shape (the
+// fold budget expiring mid-swap) after a definitive rollback: the
+// resolution probe must still identify the rollback via its DETACHED
+// context, not inherit the expired one.
+type expiredCtxReplaceStore struct {
+	ref.RefStore
+}
+
+func (s expiredCtxReplaceStore) ReplacePacks(context.Context, string, []ref.Pack, ref.Pack) (bool, error) {
+	return false, fmt.Errorf("swap: %w", context.DeadlineExceeded)
+}
+
+// TestRepack_DeadlineDuringSwapResolvesRollback pins the round-18 finding:
+// when the fold deadline expires during a ReplacePacks that rolled back,
+// the ambiguity probe must run on a live detached context and classify the
+// rollback as folded=false with the deadline error intact — river then
+// takes its terminal deadline cancel instead of chaining successors.
+func TestRepack_DeadlineDuringSwapResolvesRollback(t *testing.T) {
+	f := newRepackFixture(t)
+	ctx := context.Background()
+	for range 3 {
+		f.push(t)
+	}
+	r := NewRepacker(expiredCtxReplaceStore{f.store}, f.blobs, fixtureMaterialize(f.blobs, t.TempDir()), slog.New(slog.DiscardHandler))
+	folded, err := r.Repack(ctx, f.repo)
+	if folded {
+		t.Fatal("rolled-back deadline swap must report folded=false")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error = %v, want DeadlineExceeded preserved for river's terminal cancel", err)
+	}
+	if rows := f.packRows(t); len(rows) != 3 {
+		t.Fatalf("pack rows = %+v, want the untouched 3", rows)
+	}
+}
+
 // TestRepack_RolledBackIdentityFoldReportsNotFolded pins the round-17
 // refinement: in an identity fold (union byte-identical to one input,
 // newPack.Key registered BEFORE the swap) a key-membership recheck cannot
