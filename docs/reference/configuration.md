@@ -29,7 +29,7 @@ never a silently-applied default.
 | [`CODESTORAGE_SECRETS_MODE`](#codestorage_secrets_mode) | `encrypt` | `decrypt-only` stages the key fleet-wide before encrypted writes begin |
 | [`CODESTORAGE_PACK_QUOTA_BYTES`](#codestorage_pack_quota_bytes) | 10 GiB | Per-repo pack-bytes quota (`0` disables) |
 | [`CODESTORAGE_PACK_RESERVATION_TTL`](#codestorage_pack_reservation_ttl) | `1h` | Lifetime of a crashed writer's quota reservation |
-| [`CODESTORAGE_MAX_PUSH_BYTES`](#codestorage_max_push_bytes) | 2 × pack quota | Decoded-byte cap on one git push (`0` disables) |
+| [`CODESTORAGE_MAX_PUSH_BYTES`](#codestorage_max_push_bytes) | 2 × pack quota (min 2 MiB) | Decoded-byte cap on one git push (`0` disables) |
 | [`CODESTORAGE_VERIFY_SIG_BUDGET`](#codestorage_verify_sig_budget) | `10000` | Per-push `verify-sig` verified-commit budget (`0` disables) |
 | [`CODESTORAGE_SWEEP_INTERVAL`](#codestorage_sweep_interval) | `1h` | Orphan-pack sweep cadence (`0` disables sweeping) |
 | [`CODESTORAGE_SWEEP_AGE_THRESHOLD`](#codestorage_sweep_age_threshold) | `24h` | Minimum blob age before an unregistered pack counts as an orphan |
@@ -336,11 +336,13 @@ published or registered on the overflow path. This is the native pre-storage pus
 (Degenerate exception: a *complete, valid* push padded with trailing junk past the cap
 still answers `413`, but its hooks already ran under the normal quota admission.)
 
-- **Default:** 2 × [`CODESTORAGE_PACK_QUOTA_BYTES`](#codestorage_pack_quota_bytes) — a
-  push cannot legitimately need more than quota admission would accept, plus protocol
-  overhead. Disabling the quota (`0`) also disables the derived cap; set this variable
-  explicitly to keep a cap without a quota. **`0` disables the cap**; negative or
-  malformed values are startup errors.
+- **Default:** 2 × [`CODESTORAGE_PACK_QUOTA_BYTES`](#codestorage_pack_quota_bytes), with
+  a 2 MiB minimum — a push cannot legitimately need more than quota admission would
+  accept plus protocol overhead, and the floor keeps delete-only/zero-growth pushes (the
+  over-quota recovery path) working under byte-scale quotas. Disabling the quota (`0`)
+  also disables the derived cap; an explicit value is taken verbatim (no floor); set
+  this variable explicitly to keep a cap without a quota. **`0` disables the cap**;
+  negative or malformed values are startup errors.
 - Applies to git pushes only, including the upstream-sync worker's loopback pushes.
   Fetches/clones (`upload-pack`) and LFS object transfers are unaffected.
 

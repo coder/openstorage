@@ -629,6 +629,30 @@ func TestResolveServeConfigMaxPushBytes(t *testing.T) {
 		}
 	})
 
+	t.Run("unset-floors-on-tiny-quota", func(t *testing.T) {
+		// A byte-scale quota (which the quota resolver accepts) must not
+		// derive a cap below protocol overhead: delete-only/zero-growth
+		// pushes are the over-quota recovery path and still carry command
+		// lists plus the sniffable shallow prefix.
+		cfg, err := resolveServeConfig(base(map[string]string{envPackQuota: "1"}), "", "", "/tmp/cache", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.maxPushBytes != defaultMaxPushFloorBytes {
+			t.Fatalf("cap for 1-byte quota resolved to %d, want floor %d", cfg.maxPushBytes, defaultMaxPushFloorBytes)
+		}
+	})
+
+	t.Run("explicit-value-not-floored", func(t *testing.T) {
+		cfg, err := resolveServeConfig(base(map[string]string{envMaxPushBytes: "512"}), "", "", "/tmp/cache", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.maxPushBytes != 512 {
+			t.Fatalf("explicit tiny cap resolved to %d, want 512 verbatim", cfg.maxPushBytes)
+		}
+	})
+
 	t.Run("unset-with-disabled-quota-disables", func(t *testing.T) {
 		cfg, err := resolveServeConfig(base(map[string]string{envPackQuota: "0"}), "", "", "/tmp/cache", "")
 		if err != nil {

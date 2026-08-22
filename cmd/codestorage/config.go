@@ -138,6 +138,16 @@ const (
 	// quota bounds retained storage.
 	defaultMaxPushQuotaMultiple = 2
 
+	// defaultMaxPushFloorBytes floors the DERIVED cap (Codex round 10): the
+	// quota accepts any positive value, and a byte-scale quota must not
+	// shrink the cap below protocol overhead — delete-only and zero-growth
+	// pushes carry command lists (plus up to a 1 MiB client-controlled
+	// shallow prefix the atomic sniffer reads) and are exactly the recovery
+	// path the quota admits for over-quota repositories. 2 MiB covers that
+	// comfortably while still bounding ingress work. An EXPLICIT
+	// CODESTORAGE_MAX_PUSH_BYTES is taken verbatim.
+	defaultMaxPushFloorBytes = int64(2) << 20
+
 	// defaultVerifySigBudget bounds verifier spawns per push (issue #59).
 	// Generous by design: a verifier spawn costs tens of milliseconds, so
 	// 10000 admits any plausible signed-history push while capping the
@@ -505,7 +515,7 @@ func resolveMaxPushBytes(getenv func(string) string, packQuotaBytes int64) (int6
 		if packQuotaBytes > math.MaxInt64/defaultMaxPushQuotaMultiple {
 			return math.MaxInt64, nil
 		}
-		return defaultMaxPushQuotaMultiple * packQuotaBytes, nil
+		return max(defaultMaxPushQuotaMultiple*packQuotaBytes, defaultMaxPushFloorBytes), nil
 	}
 	v, err := strconv.ParseInt(raw, 10, 64)
 	if err != nil {

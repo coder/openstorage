@@ -218,7 +218,7 @@ and bypasses every proxy-enforced limit. Then:
   stream rather than buffer them. Push ingress is bounded natively: the server rejects
   any push whose decoded body exceeds
   [`CODESTORAGE_MAX_PUSH_BYTES`](../reference/configuration.md#codestorage_max_push_bytes)
-  (default 2 × the pack quota) with a `413`, feeding git at most the cap's worth of
+  (default 2 × the pack quota, 2 MiB minimum) with a `413`, feeding git at most the cap's worth of
   bytes ([#55](https://github.com/coder/code-storage/issues/55)) — so size temporary
   disk for up to one cap per concurrent push (git discards the truncated quarantine on
   rejection; a declared oversize is rejected without reading at all). A proxy
