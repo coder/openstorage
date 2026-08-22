@@ -38,7 +38,10 @@ clients ──► reverse proxy (TLS) ──► N × codestorage serve ──►
 separate migration step or job to run: each replica creates/upgrades the schema at boot,
 serialized by advisory locks (see [concurrent boot](#concurrent-boot-schema-setup-and-migrations)).
 The database is the authority for refs, metadata, quota accounting, and the durable
-[River](https://riverqueue.com) job queue.
+[River](https://riverqueue.com) job queue — and it stores **webhook HMAC secrets and
+upstream-sync credentials in plaintext**
+([#54](https://github.com/coder/code-storage/issues/54)): scope database access tightly
+and encrypt the database and its backups at rest.
 
 **S3-compatible bucket** — dedicated to codestorage
 ([`CODESTORAGE_S3_URL`](../reference/configuration.md#codestorage_s3_url)); credentials come
@@ -227,6 +230,14 @@ exactly):
 - **List only proxies that set or append `X-Forwarded-For` themselves.** Trusting a proxy
   that forwards client-supplied headers verbatim lets any client mint fresh rate-limit
   buckets at will.
+
+### Webhook egress
+
+Webhook deliveries POST to registered URLs from the replicas, currently without
+resolved-target or redirect validation — a blind-SSRF path for anyone who can register
+webhooks ([#53](https://github.com/coder/code-storage/issues/53)). Treat webhook
+registration (org-level `repo:write`) as trusted, and apply egress controls on the
+replica network that block loopback, private-range, and cloud-metadata destinations.
 
 ## Rolling upgrades and restarts
 
