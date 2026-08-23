@@ -259,6 +259,61 @@ func TestRetireIsGenerationBound(t *testing.T) {
 	})
 }
 
+// legacyRelease simulates a pre-round-22 (v0.1.0) binary's owner-scoped
+// ReleasePackReservations: DELETE ... WHERE owner = ? AND key = ?.
+func legacyRelease(t *testing.T, s Store, owner, key string) {
+	t.Helper()
+	ctx := context.Background()
+	switch st := s.(type) {
+	case *PG:
+		if _, err := st.pool.Exec(ctx,
+			`DELETE FROM pack_reservations WHERE owner = $1 AND key = $2`, owner, key); err != nil {
+			t.Fatalf("legacy release: %v", err)
+		}
+	case *SQLite:
+		if _, err := st.db.ExecContext(ctx,
+			`DELETE FROM pack_reservations WHERE owner = ? AND key = ?`, owner, key); err != nil {
+			t.Fatalf("legacy release: %v", err)
+		}
+	default:
+		t.Fatalf("legacyRelease: unknown store %T", s)
+	}
+}
+
+// TestRefreshRotatesOwnerAgainstLegacyRelease (Codex round 34, P1): during
+// a rolling upgrade a v0.1.0 replica still runs the owner-scoped
+// ReleasePackReservations, which ignores attempts/gen/created_at. The new
+// binary's refresh must ROTATE the row's owner so a legacy inserter's
+// clean-failure release no longer matches the shared row — the reservation
+// protecting the new writer survives. A row only the legacy writer touched
+// keeps legacy semantics (its own release still works).
+func TestRefreshRotatesOwnerAgainstLegacyRelease(t *testing.T) {
+	runRefBackends(t, func(t *testing.T, s Store) {
+		k := newLedgerKit(t, s)
+		a := k.pack(k.base(), "aa1", 60)
+		// The legacy replica reserves first (its owner on the row)...
+		if dec := k.reserve([]Pack{a}, "legacy-owner", 0, 100); !dec.OK {
+			t.Fatalf("legacy reserve: %+v", dec)
+		}
+		// ...a new-binary writer refreshes the shared row...
+		if dec := k.reserve([]Pack{a}, "new-owner", 0, 100); !dec.OK {
+			t.Fatalf("new refresh: %+v", dec)
+		}
+		// ...and the legacy replica's upload fails cleanly, firing its
+		// owner-scoped release. It must not match the rotated row.
+		legacyRelease(t, s, "legacy-owner", a.Key)
+		k.wantState(0, 60, 0)
+
+		// A row only the legacy writer touched keeps legacy semantics.
+		b := k.pack(k.base(), "bb2", 20)
+		if dec := k.reserve([]Pack{b}, "legacy-owner", 0, 100); !dec.OK {
+			t.Fatalf("legacy-only reserve: %+v", dec)
+		}
+		legacyRelease(t, s, "legacy-owner", b.Key)
+		k.wantState(0, 60, 0)
+	})
+}
+
 // TestRetireRequiresUnrefreshedRow (Codex round 33, mixed-fleet half): the
 // DELETE additionally requires created_at unchanged since the retiring
 // writer's own reserve — a row refreshed AFTER that reserve (by any

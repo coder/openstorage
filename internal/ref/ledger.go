@@ -87,12 +87,17 @@ import (
 )
 
 // NewReservationOwner mints the random owner token stamped on one writer's
-// reservation rows. The owner is provenance only (Codex round 22): rows end
-// exclusively by settlement (RegisterPacks/RegisterLFSObject consume by
-// KEY) or TTL expiry — same-key rows are shared by every concurrent writer
-// via refresh, so no owner-scoped delete can ever be sound: whichever
-// writer's failure fired it would free headroom the others still stage
-// under.
+// reservation rows. The owner is provenance only for THIS binary (Codex
+// round 22): rows end by settlement (RegisterPacks/RegisterLFSObject
+// consume by KEY), token-bound retirement, or TTL expiry — same-key rows
+// are shared by every concurrent writer via refresh, so no owner-scoped
+// delete can ever be sound. The refresh deliberately ROTATES the row's
+// owner to the newest writer's token (Codex round 34): pre-round-22
+// binaries (v0.1.0) still run the owner-scoped ReleasePackReservations on
+// clean failures, and rotating the owner makes any row a NEW writer shares
+// unmatchable by a legacy release — the legacy inserter's failure can no
+// longer delete the reservation protecting the new writer mid-upgrade. A
+// row only legacy writers touch keeps legacy semantics.
 func NewReservationOwner() string {
 	var b [16]byte
 	if _, err := rand.Read(b[:]); err != nil {
@@ -327,6 +332,7 @@ SELECT
 INSERT INTO pack_reservations (key, repo, bytes, owner, gen) VALUES ($1, $2, $3, $4, $5)
 ON CONFLICT (key) DO UPDATE SET repo = EXCLUDED.repo,
                                 bytes = GREATEST(pack_reservations.bytes, EXCLUDED.bytes),
+                                owner = EXCLUDED.owner,
                                 created_at = now(),
                                 attempts = pack_reservations.attempts + 1
 RETURNING gen, created_at`,

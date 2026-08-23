@@ -243,6 +243,13 @@ and bypasses every proxy-enforced limit. Then:
   (default 10 GiB; over-budget uploads answer `429`/`413`, and each object allows one
   in-flight upload per replica) — size it against the disk you actually give `$TMPDIR`,
   and keep the proxy body cap as defense in depth.
+  **Upgrading from v0.1.0:** older replicas hand clients presigned upload URLs that
+  write to the bucket directly, bypassing verification, and such URLs stay valid up to
+  15 minutes after the last old replica exits. Complete the roll promptly; LFS objects
+  a client uploaded around the roll window are re-verified on their next write-scoped
+  touch only while unregistered, so treat uploads from that window with the same trust
+  you gave v0.1.0's presigned path ([#78](https://github.com/coder/code-storage/issues/78)
+  tracks closing this window with object-version fencing).
 
 ### Client identity behind the proxy (`CODESTORAGE_TRUSTED_PROXIES`)
 

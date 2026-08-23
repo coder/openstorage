@@ -81,6 +81,7 @@ INSERT INTO pack_reservations (key, repo, bytes, owner, created_at, gen)
 VALUES (?, ?, ?, ?, `+sqliteEpochMS+`, ?)
 ON CONFLICT (key) DO UPDATE SET repo = excluded.repo,
                                 bytes = MAX(pack_reservations.bytes, excluded.bytes),
+                                owner = excluded.owner,
                                 created_at = excluded.created_at,
                                 attempts = pack_reservations.attempts + 1`,
 			p.Key, group[0], p.Size, owner, NewReservationOwner()); err != nil {
