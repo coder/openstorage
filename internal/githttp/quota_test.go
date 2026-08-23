@@ -291,6 +291,55 @@ func TestUsageFloorSubtractsCounterAtScan(t *testing.T) {
 	}
 }
 
+// slowListBlob delays each ListPages call, simulating a scan that
+// outlives the freshness window (bounded by limit scans).
+type slowListBlob struct {
+	blob.BlobStore
+	delay time.Duration
+	limit int
+	mu    sync.Mutex
+	scans int
+}
+
+func (b *slowListBlob) ListPages(ctx context.Context, prefix string, pageSize int, fn func([]blob.ListedObject) error) error {
+	b.mu.Lock()
+	if b.scans%3 == 0 && b.scans/3 < b.limit {
+		time.Sleep(b.delay)
+	}
+	b.scans++
+	b.mu.Unlock()
+	return b.BlobStore.ListPages(ctx, prefix, pageSize, fn)
+}
+
+// TestHookSelfListFloorRejectsSlowScans (Codex round 46): the hook's
+// SELF-LISTED floor has no cache in front of it, so it needs the same
+// scan-age discipline as the cached flights — a listing that outlives the
+// freshness window may miss an orphan whose reservation expires before
+// the hook's bounded reserve lands. One retry covers a transient stall;
+// persistently slow scans fail CLOSED (deny the push) instead of
+// admitting against the stale floor.
+func TestHookSelfListFloorRejectsSlowScans(t *testing.T) {
+	old := hookFloorFreshness
+	hookFloorFreshness = 50 * time.Millisecond
+	t.Cleanup(func() { hookFloorFreshness = old })
+
+	t.Run("retry-covers-a-transient-stall", func(t *testing.T) {
+		bl := &slowListBlob{BlobStore: openTestBlob(t), delay: 100 * time.Millisecond, limit: 1}
+		seedPack(t, bl.BlobStore, "repo_slowhook", "aaaa", 25)
+		got, err := hookSelfListFloor(context.Background(), bl, openTestRefStore(t), "repo_slowhook")
+		if err != nil || got != 25 {
+			t.Fatalf("floor after one slow scan = (%d, %v), want (25, nil) via retry", got, err)
+		}
+	})
+
+	t.Run("persistently-slow-fails-closed", func(t *testing.T) {
+		bl := &slowListBlob{BlobStore: openTestBlob(t), delay: 100 * time.Millisecond, limit: 1 << 30}
+		if got, err := hookSelfListFloor(context.Background(), bl, openTestRefStore(t), "repo_alwaysslow"); err == nil {
+			t.Fatalf("persistently slow self-list served floor %d, want fail-closed error", got)
+		}
+	})
+}
+
 // TestUsageFloorScanExpiredResultFailsClosed (Codex round 41): the
 // flight-result path must not hand CURRENT waiters a value whose scan
 // already outlived the freshness window — under the minimum reservation

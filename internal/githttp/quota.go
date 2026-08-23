@@ -357,21 +357,40 @@ func packUsageBytes(ctx context.Context, bl blob.BlobStore, repo string) (int64,
 	return blob.StorageUsageBytes(ctx, bl, repo)
 }
 
+// hookFloorFreshness bounds one self-listed floor scan's duration — the
+// hook-side mirror of the cache's scan-start-anchored expiry (Codex round
+// 46): with no cache in front of it, a self-listing that outlives this
+// window may miss an orphan whose reservation expires before the hook's
+// margin-bounded reserve lands. usageCacheTTL keeps the coverage chain
+// identical to the cached path (scanStart + freshness + margin < TTL). A
+// var so tests can shrink it.
+var hookFloorFreshness = usageCacheTTL
+
 // hookSelfListFloor is the hook's own uncounted-floor measurement: the
 // usage counter is read BEFORE the listing starts (the same conservative
 // ordering as refreshUsage — Codex round 44), and the floor is the
-// listing minus that counter, clamped at zero.
+// listing minus that counter, clamped at zero. A scan that outlives
+// hookFloorFreshness is rejected — one retry covers a transient stall,
+// then the push fails closed (Codex round 46).
 func hookSelfListFloor(ctx context.Context, bl blob.BlobStore, st ref.Store, repo string) (int64, error) {
 	assertf(st != nil, "hookSelfListFloor: nil ref store")
-	ls, err := st.QuotaLedgerState(ctx, blob.QuotaRepoGroup(repo), time.Hour)
-	if err != nil {
-		return 0, fmt.Errorf("usage counter read: %w", err)
+	for attempt := 0; ; attempt++ {
+		scanStart := time.Now()
+		ls, err := st.QuotaLedgerState(ctx, blob.QuotaRepoGroup(repo), time.Hour)
+		if err != nil {
+			return 0, fmt.Errorf("usage counter read: %w", err)
+		}
+		listing, err := packUsageBytes(ctx, bl, repo)
+		if err != nil {
+			return 0, err
+		}
+		if time.Since(scanStart) <= hookFloorFreshness {
+			return max(0, listing-ls.UsageBytes), nil
+		}
+		if attempt >= 1 {
+			return 0, fmt.Errorf("usage floor for %s: listing outlived its %v freshness window twice", repo, hookFloorFreshness)
+		}
 	}
-	listing, err := packUsageBytes(ctx, bl, repo)
-	if err != nil {
-		return 0, err
-	}
-	return max(0, listing-ls.UsageBytes), nil
 }
 
 // hookUsageFloor resolves the pre-receive admission floor — the
