@@ -1051,6 +1051,21 @@ func (s *Server) adoptLFSObject(ctx context.Context, repoID, key, oid string) er
 	// any URL lifetime) reclaims it under the DeleteLFS opt-in; until
 	// then floors count it alongside the canonical bytes — conservative
 	// over-statement, never a quota hole.
+	//
+	// Objects adopted from ROWLESS CANONICAL bytes have no legacy source
+	// at all (a verified publication whose registration failed or timed
+	// out, registered by this retry) — with the compat bridge active,
+	// old replicas would 404 them despite the flag (Codex round 82).
+	// Ensure the legacy spelling exists; the probe keeps the hot path at
+	// one stat only when compat is on.
+	if s.LFSV020WriteCompat {
+		lctx, lcancel := context.WithTimeout(context.WithoutCancel(ctx), lfsProbeTimeout)
+		_, lerr := s.Blob.Stat(lctx, blob.LFSLegacyKey(repoID, oid))
+		lcancel()
+		if errors.Is(lerr, blob.ErrNotFound) {
+			s.maybeLegacyCompatCopy(ctx, repoID, oid, key, verifiedSize)
+		}
+	}
 	return nil
 }
 
@@ -1697,7 +1712,25 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target r
 		lfsError(w, http.StatusTooManyRequests, "an operation for this object is already in progress")
 		return
 	}
-	defer s.lfsUploadsInFlight.Delete(key)
+	// The upload's node resources release EARLY on the compat-copy path
+	// (Codex round 82): releaseUploadResources is idempotent and runs
+	// before the size-scaled server-side copy, so slow copies hold one
+	// goroutine, never the staging budget, op slot, per-key lock, or
+	// scratch file.
+	uploadResourcesReleased := false
+	stagingReserved := int64(0)
+	scratchDir := ""
+	releaseUploadResources := func() {
+		if uploadResourcesReleased {
+			return
+		}
+		uploadResourcesReleased = true
+		s.lfsUploadsInFlight.Delete(key)
+		s.releaseLFSStaging(repoID, stagingReserved)
+		if scratchDir != "" {
+			_ = os.RemoveAll(scratchDir)
+		}
+	}
 	// Node-wide operation slot BEFORE any blob-store work (Codex round
 	// 25): the dedup probe below can block on a slow or wedged backend,
 	// and handlers not yet holding a slot would accumulate goroutines and
@@ -1710,10 +1743,11 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target r
 	if !s.reserveLFSStaging(repoID, 0) {
 		w.Header().Set("Retry-After", "10")
 		lfsError(w, http.StatusTooManyRequests, "server LFS staging budget exhausted, retry")
+		s.lfsUploadsInFlight.Delete(key)
+		uploadResourcesReleased = true // nothing else was acquired
 		return
 	}
-	stagingReserved := int64(0)
-	defer func() { s.releaseLFSStaging(repoID, stagingReserved) }()
+	defer releaseUploadResources()
 	// Dedup before charging (the zero-growth rule): a re-PUT of a stored
 	// object (crash-window retry, concurrent identical upload) adds
 	// nothing — adopt it into the registry and succeed without reading
@@ -1875,7 +1909,7 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target r
 		lfsError(w, http.StatusInternalServerError, "scratch dir failed")
 		return
 	}
-	defer os.RemoveAll(dir)
+	scratchDir = dir
 	path := filepath.Join(dir, "obj")
 	f, err := os.Create(path)
 	if err != nil {
@@ -2220,6 +2254,7 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target r
 		}
 		s.invalidateUsageFloor(repoID)
 	}
+	releaseUploadResources()
 	s.maybeLegacyCompatCopy(ctx, repoID, oid, key, n)
 	w.WriteHeader(http.StatusOK)
 }
@@ -2236,6 +2271,7 @@ func (s *Server) maybeLegacyCompatCopy(ctx context.Context, repoID, oid, key str
 	if !s.LFSV020WriteCompat {
 		return
 	}
+	legacyKey := blob.LFSLegacyKey(repoID, oid)
 	// Size-scaled allowance, not a fixed wall-clock cap (Codex round 81):
 	// accepted objects reach many GiB and S3's multipart copy is
 	// sequential, so the one-minute cleanup bound was guaranteed to
@@ -2246,10 +2282,41 @@ func (s *Server) maybeLegacyCompatCopy(ctx context.Context, repoID, oid, key str
 	// wedged one is still cut loose; the copy runs detached and
 	// best-effort, so the held resources are one goroutine, not the
 	// upload's staging slots.
-	bound := 5*time.Minute + time.Duration(size>>20)*time.Second
-	cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), bound)
-	defer cancel()
-	if err := s.Blob.Copy(cctx, blob.LFSLegacyKey(repoID, oid), key); err != nil {
-		log.Printf("lfs compat copy %s: %v", key, err)
+	doCopy := func(opCtx context.Context) error {
+		bound := 5*time.Minute + time.Duration(size>>20)*time.Second
+		cctx, cancel := context.WithTimeout(opCtx, bound)
+		defer cancel()
+		return s.Blob.Copy(cctx, legacyKey, key)
+	}
+	dctx := context.WithoutCancel(ctx)
+	if size <= 0 || s.PackQuotaBytes <= 0 {
+		if err := doCopy(dctx); err != nil {
+			log.Printf("lfs compat copy %s: %v", key, err)
+		}
+		return
+	}
+	// The compat copy materializes ANOTHER size bytes after registration
+	// consumed the canonical upload's reservation (Codex round 82): a
+	// floor scanned before this copy sees neither the legacy bytes nor
+	// any reservation for them, so an admission committing against it
+	// could durably exceed the quota. Same machinery as the adoption
+	// publish: a cover renewed through the copy and its stale-floor tail,
+	// with the floor-generation bump as the invalidation handoff. The
+	// cover row (legacy key + repair suffix) is never settled — the TTL
+	// collects it after every absence-window floor has aged out.
+	renewCover := func(rctx context.Context) error {
+		return ref.ReserveRestoreCover(rctx, s.Store, blob.QuotaRepoGroup(repoID), legacyKey, size, s.lfsReservationTTL())
+	}
+	bump := func(bctx context.Context) error {
+		return s.Store.BumpLFSAdoptionGen(bctx, BaseRepo(repoID))
+	}
+	copyErr, renewErr := blob.WithRenewedCover(dctx, renewCover, doCopy, bump)
+	if copyErr != nil {
+		log.Printf("lfs compat copy %s: %v", key, copyErr)
+		return
+	}
+	s.invalidateUsageFloor(repoID)
+	if renewErr != nil {
+		log.Printf("lfs compat copy %s: cover tail: %v", key, renewErr)
 	}
 }

@@ -1103,18 +1103,161 @@ func TestLFSPut_V020WriteCompatDualPublishes(t *testing.T) {
 	}
 }
 
+// TestLFSCompatCopy_CoversQuotaBytes (Codex round 82): with quota
+// enforcement on, the compat copy materializes ANOTHER size bytes after
+// registration consumed the upload's reservation — a floor scanned before
+// the copy sees neither the legacy bytes nor a reservation, so admissions
+// against it could durably exceed the quota. The copy must run under the
+// renewed-cover machinery (initial cover + mandatory stale-floor tail =
+// >= 2 reservations on the LEGACY key) and hand off a floor-generation
+// bump.
+func TestLFSCompatCopy_CoversQuotaBytes(t *testing.T) {
+	ctx := context.Background()
+	srv, st, mint := newLFSQuotaServer(t, 1<<20, time.Hour) // quota ENABLED
+	srv.LFSV020WriteCompat = true
+	tok := mint(auth.ScopeGitWrite)
+	cs := &coverCountingStore{RefStore: srv.Store}
+	srv.Store = cs
+	content := []byte("compat copy under quota")
+	oid := sha256Hex(content)
+	preGen, err := st.LFSAdoptionGen(ctx, lfsTestRepoID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := doLFS(t, srv, http.MethodPut, "/"+lfsTestRepoURL+".git/info/lfs/objects/"+oid,
+		"basic:"+tok, string(content))
+	if w.Code != http.StatusOK {
+		t.Fatalf("PUT status = %d, body %s", w.Code, w.Body)
+	}
+	legacyCover := blob.LFSLegacyKey(lfsTestRepoID, oid) + ref.RepairCoverSuffix
+	if got := cs.coversFor(legacyCover); got < 2 {
+		t.Fatalf("compat-copy covers = %d, want >= 2 (initial + mandatory tail) — uncovered legacy bytes let stale floors over-admit", got)
+	}
+	if postGen, err := st.LFSAdoptionGen(ctx, lfsTestRepoID); err != nil || postGen == preGen {
+		t.Fatalf("floor generation after compat copy = (%d -> %d, %v), want bumped (the invalidation handoff)", preGen, postGen, err)
+	}
+}
+
+// TestLFSAdopt_CompatCopyAfterCanonicalAdoption (Codex round 82): an
+// object adopted from ROWLESS CANONICAL bytes (a verified publication
+// whose registration failed, registered by the retry) has no legacy
+// spelling — with the compat bridge active, old replicas would 404 it
+// despite the flag. Adoption must publish the compat copy too.
+func TestLFSAdopt_CompatCopyAfterCanonicalAdoption(t *testing.T) {
+	ctx := context.Background()
+	srv, st, _ := newLFSQuotaServer(t, 0, time.Hour)
+	srv.LFSV020WriteCompat = true
+	content := []byte("canonical-only survivor")
+	oid := sha256Hex(content)
+	key := blob.LFSKey(lfsTestRepoID, oid)
+	// The crash residue: canonical bytes, no row, no legacy spelling.
+	if err := srv.Blob.UploadFile(ctx, key, writeTempFile(t, content)); err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.adoptLFSObject(ctx, lfsTestRepoID, key, oid); err != nil {
+		t.Fatalf("adopt: %v", err)
+	}
+	if has, err := st.HasLFSObject(ctx, lfsTestRepoID, key); err != nil || !has {
+		t.Fatalf("object not adopted: %v, %v", has, err)
+	}
+	size, err := srv.Blob.Stat(ctx, blob.LFSLegacyKey(lfsTestRepoID, oid))
+	if err != nil || size != int64(len(content)) {
+		t.Fatalf("legacy compat spelling after canonical adoption = (%d, %v), want the object — old replicas 404 otherwise", size, err)
+	}
+}
+
+// gateCopyBlob blocks copies TO legacy-spelled destinations until release
+// is closed, capturing the moment the compat copy is in flight.
+type gateCopyBlob struct {
+	blob.BlobStore
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (b *gateCopyBlob) Copy(ctx context.Context, dstKey, srcKey string) error {
+	if !strings.Contains(dstKey, "/o2/") {
+		b.once.Do(func() { close(b.started) })
+		select {
+		case <-b.release:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return b.BlobStore.Copy(ctx, dstKey, srcKey)
+}
+
+// TestLFSPut_CompatCopyReleasesUploadResources (Codex round 82): the
+// compat copy can legitimately run for a size-scaled window — holding the
+// upload's staging budget, op slot, and per-key lock through it would let
+// a few slow copies pin the node and 429 unrelated transfers whose
+// canonical bytes are already durable. The handler must free the upload
+// resources BEFORE the copy.
+func TestLFSPut_CompatCopyReleasesUploadResources(t *testing.T) {
+	srv, _, mint := newLFSQuotaServer(t, 0, time.Hour)
+	srv.LFSV020WriteCompat = true
+	gate := &gateCopyBlob{BlobStore: srv.Blob, started: make(chan struct{}), release: make(chan struct{})}
+	srv.Blob = gate
+	tok := mint(auth.ScopeGitWrite)
+	content := []byte("slow compat copy")
+	oid := sha256Hex(content)
+
+	done := make(chan int, 1)
+	go func() {
+		w := doLFS(t, srv, http.MethodPut, "/"+lfsTestRepoURL+".git/info/lfs/objects/"+oid,
+			"basic:"+tok, string(content))
+		done <- w.Code
+	}()
+	select {
+	case <-gate.started:
+	case <-time.After(10 * time.Second):
+		t.Fatal("compat copy never started")
+	}
+	// The copy is in flight: every upload resource must already be free.
+	srv.lfsStagingMu.Lock()
+	ops, inflight := srv.lfsStagingOps, srv.lfsStagingInFlight
+	srv.lfsStagingMu.Unlock()
+	if ops != 0 || inflight != 0 {
+		close(gate.release)
+		t.Fatalf("staging during compat copy = ops %d, bytes %d — upload resources must release before the copy", ops, inflight)
+	}
+	if _, busy := srv.lfsUploadsInFlight.Load(blob.LFSKey(lfsTestRepoID, oid)); busy {
+		close(gate.release)
+		t.Fatal("per-key lock still held during the compat copy")
+	}
+	close(gate.release)
+	if code := <-done; code != http.StatusOK {
+		t.Fatalf("PUT status = %d, want 200", code)
+	}
+}
+
 // coverCountingStore counts repair-cover reservations (key suffix
 // ref.RepairCoverSuffix) passing through ReservePackBytes.
 type coverCountingStore struct {
 	ref.RefStore
 	covers atomic.Int64
+	mu     sync.Mutex
+	perKey map[string]int
 }
 
 func (c *coverCountingStore) ReservePackBytes(ctx context.Context, group []string, packs []ref.Pack, owner string, usageFloor, floorGen, quotaBytes int64, ttl time.Duration) (ref.ReserveDecision, error) {
 	if len(packs) == 1 && strings.HasSuffix(packs[0].Key, ref.RepairCoverSuffix) {
 		c.covers.Add(1)
+		c.mu.Lock()
+		if c.perKey == nil {
+			c.perKey = map[string]int{}
+		}
+		c.perKey[packs[0].Key]++
+		c.mu.Unlock()
 	}
 	return c.RefStore.ReservePackBytes(ctx, group, packs, owner, usageFloor, floorGen, quotaBytes, ttl)
+}
+
+// coversFor returns how many cover reservations named exactly coverKey.
+func (c *coverCountingStore) coversFor(coverKey string) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.perKey[coverKey]
 }
 
 // TestLFSAdoption_CopyCoverIsRenewed (Codex round 79): the adoption copy's

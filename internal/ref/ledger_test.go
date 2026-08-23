@@ -807,9 +807,19 @@ func TestReconcileLegacyLFSTwinRows(t *testing.T) {
 		if count, err := s.CountLFSObjects(ctx, k.base()); err != nil || count != 2 {
 			t.Fatalf("twin precondition count = (%d, %v), want 2", count, err)
 		}
+		preGen, err := s.LFSAdoptionGen(ctx, k.base())
+		if err != nil {
+			t.Fatal(err)
+		}
 		n, err := s.ReconcileLegacyLFSObjects(ctx)
 		if err != nil || n != 1 {
 			t.Fatalf("ReconcileLegacyLFSObjects = (%d, %v), want (1, nil)", n, err)
+		}
+		// The refund moves counted bytes out of the live counter: floors
+		// cached while the twin double-counted must be invalidated
+		// atomically with it (Codex round 82, security).
+		if gen, err := s.LFSAdoptionGen(ctx, k.base()); err != nil || gen == preGen {
+			t.Fatalf("adoption gen after janitor refund = (%d -> %d, %v), want bumped", preGen, gen, err)
 		}
 		if has, err := s.HasLFSObject(ctx, k.base(), legacyKey); err != nil || has {
 			t.Fatalf("legacy twin after reconcile = (%v, %v), want gone", has, err)
@@ -829,8 +839,17 @@ func TestReconcileLegacyLFSTwinRows(t *testing.T) {
 
 		// Seam 2: a registration that DOES run reconciles in-transaction.
 		legacyKey2, _ := twin(strings.Repeat("ab", 32))
+		preGen2, err := s.LFSAdoptionGen(ctx, k.base())
+		if err != nil {
+			t.Fatal(err)
+		}
 		if err := s.RegisterAdoptedLFSObject(ctx, k.base(), "lfs/"+k.base()+"/o2/"+strings.Repeat("ab", 32), 40); err != nil {
 			t.Fatal(err)
+		}
+		// The conflicting insert skips the adopted-path bump (inserted ==
+		// 0), so the reconcile's OWN bump is load-bearing here too.
+		if gen, err := s.LFSAdoptionGen(ctx, k.base()); err != nil || gen == preGen2 {
+			t.Fatalf("adoption gen after in-tx refund = (%d -> %d, %v), want bumped", preGen2, gen, err)
 		}
 		if has, err := s.HasLFSObject(ctx, k.base(), legacyKey2); err != nil || has {
 			t.Fatalf("legacy twin after re-registration = (%v, %v), want reconciled away", has, err)

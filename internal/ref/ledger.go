@@ -848,6 +848,30 @@ ON CONFLICT (repo) DO UPDATE SET gen = lfs_adoption_gens.gen + 1`, repo); err !=
 // bytes it double-charged (ADR-41, Codex round 79). Reports whether a row
 // was reconciled.
 func reconcileLegacyLFSRowPG(ctx context.Context, tx pgx.Tx, repo, legacy, canonical string) (bool, error) {
+	// Cheap gate: the serialization below is taken only when a legacy row
+	// actually exists — the hot path (every LFS registration) stays a
+	// point read. A row appearing after this read is caught by the next
+	// registration or the sweeper's janitor.
+	var exists bool
+	if err := tx.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM lfs_objects WHERE repo = $1 AND key = $2)`, repo, legacy).Scan(&exists); err != nil {
+		return false, err
+	}
+	if !exists {
+		return false, nil
+	}
+	// The refund moves counted bytes OUT of the live counter (Codex round
+	// 82, security): a floor cached while the twin double-counted
+	// (listing 2S − counter 2S = 0) would still pass generation checks
+	// after the refund and admit against understated usage. Serialize
+	// with admissions on the base-ledger lock — the same lock the
+	// round-60 floor-generation recheck holds — and bump the generation
+	// ATOMICALLY with the refund, so every stale floor is rejected.
+	// Reentrant under registerLFSObjectTx's adopted path (advisory xact
+	// locks stack within one transaction).
+	if err := lockBaseLedger(ctx, tx, repo); err != nil {
+		return false, err
+	}
 	var legacyBytes int64
 	switch err := tx.QueryRow(ctx, `
 DELETE FROM lfs_objects WHERE repo = $1 AND key = $2
@@ -864,6 +888,11 @@ RETURNING bytes`, repo, legacy, canonical).Scan(&legacyBytes); {
 	}
 	if _, err := tx.Exec(ctx,
 		`UPDATE pack_usage SET bytes = GREATEST(bytes - $2, 0) WHERE repo = $1`, repo, legacyBytes); err != nil {
+		return false, err
+	}
+	if _, err := tx.Exec(ctx, `
+INSERT INTO lfs_adoption_gens (repo, gen) VALUES ($1, 1)
+ON CONFLICT (repo) DO UPDATE SET gen = lfs_adoption_gens.gen + 1`, repo); err != nil {
 		return false, err
 	}
 	return true, nil

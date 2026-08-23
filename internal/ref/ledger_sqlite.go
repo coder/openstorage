@@ -372,6 +372,14 @@ SELECT bytes FROM lfs_objects WHERE repo = ? AND key = ?
 		`UPDATE pack_usage SET bytes = MAX(bytes - ?, 0) WHERE repo = ?`, legacyBytes, repo); err != nil {
 		return false, err
 	}
+	// Atomic floor invalidation with the refund (Codex round 82,
+	// security) — see the PG twin; BEGIN IMMEDIATE is the admission
+	// serialization here.
+	if _, err := tx.ExecContext(ctx, `
+INSERT INTO lfs_adoption_gens (repo, gen) VALUES (?, 1)
+ON CONFLICT (repo) DO UPDATE SET gen = lfs_adoption_gens.gen + 1`, repo); err != nil {
+		return false, err
+	}
 	return true, nil
 }
 
