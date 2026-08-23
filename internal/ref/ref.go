@@ -119,18 +119,23 @@ type RefStore interface {
 	// verified upload's settle-or-TTL row would otherwise 507 its own
 	// retry until the TTL).
 	QuotaLedgerState(ctx context.Context, group []string, ttl time.Duration, excludeKeys ...string) (PackQuotaLedgerState, error)
-	// RetirePackAttempts retires one same-key reservation attempt per key
-	// — the CLEAN-failure cleanup (Codex round 30 on #51). Every
-	// reserve/refresh increments the row's attempt count, so a failed
-	// writer retires exactly its own attempt: the row is deleted only
-	// when no attempts remain, never out from under a live same-key
-	// writer (the round-22 unsoundness of owner-scoped deletes). Crashes
-	// never retire — their attempts expire with the row's TTL. Absent
-	// keys are no-ops. Mixed-fleet caveat: a pre-attempt binary's refresh
-	// does not increment, so a new binary's retire can end a row that old
-	// binary still stages under — the overshoot is one pack size and
-	// heals at TTL, matching the pre-round-30 crash semantics.
-	RetirePackAttempts(ctx context.Context, group []string, keys []string) error
+	// RetirePackAttempts retires one same-key reservation attempt per
+	// entry — the PROVEN-clean-failure cleanup (Codex rounds 30+33 on
+	// #51). Every reserve/refresh increments the row's attempt count, so
+	// a failed writer retires exactly its own attempt: the row is deleted
+	// only when no attempts remain, never out from under a live same-key
+	// writer (the round-22 unsoundness of owner-scoped deletes). gens
+	// maps each key to the row-incarnation token ReserveDecision.Gens
+	// returned: a replacement row minted after this caller's expired and
+	// was pruned carries a different gen and is untouched (round 33).
+	// Callers retire only with EVIDENCE of non-publication (the blob
+	// provably absent) — ambiguous outcomes leave the row to settlement
+	// or TTL, and crashes never retire. Absent or re-minted keys are
+	// no-ops. Mixed fleets are safe: the delete also requires created_at
+	// unchanged since the retiring writer's own reserve, and a
+	// pre-attempt binary's refresh bumps created_at, so its same-key
+	// writer keeps the row (see ReservationToken).
+	RetirePackAttempts(ctx context.Context, group []string, gens map[string]ReservationToken) error
 	// SweepExpiredPackReservations deletes reservation rows at least
 	// olderThan old (crash-swept leak reclamation, issue #29; the orphan
 	// sweeper calls it on its cadence). olderThan=0 expires everything —
@@ -352,10 +357,16 @@ CREATE TABLE IF NOT EXISTS repo_generations (repo text PRIMARY KEY,
 CREATE TABLE IF NOT EXISTS pack_reservations (key text PRIMARY KEY, repo text NOT NULL,
                                               bytes bigint NOT NULL, owner text NOT NULL,
                                               created_at timestamptz NOT NULL DEFAULT now(),
-                                              attempts bigint NOT NULL DEFAULT 1);
+                                              attempts bigint NOT NULL DEFAULT 1,
+                                              gen text NOT NULL DEFAULT '');
 -- Rolling upgrade from pre-attempt schemas (issue #51, Codex round 30):
 -- rows minted by older binaries count as one attempt.
 ALTER TABLE pack_reservations ADD COLUMN IF NOT EXISTS attempts bigint NOT NULL DEFAULT 1;
+-- gen identifies the ROW INCARNATION (issue #51, Codex round 33): minted
+-- at INSERT, preserved across same-key refreshes, so a stale writer's
+-- retirement can never touch a replacement row created after its own
+-- expired and was pruned.
+ALTER TABLE pack_reservations ADD COLUMN IF NOT EXISTS gen text NOT NULL DEFAULT '';
 -- Admission sums active reservations per base repo.
 CREATE INDEX IF NOT EXISTS pack_reservations_repo ON pack_reservations (repo);
 CREATE TABLE IF NOT EXISTS pack_retained (repo text, key text, bytes bigint NOT NULL,

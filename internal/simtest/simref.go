@@ -164,8 +164,8 @@ func (s *SimRefStore) ReservePackBytes(ctx context.Context, group []string, pack
 // RetirePackAttempts delegates to the inner store (no fault point: a
 // failed retire only leaves a TTL-expiring row, exactly what the crash ops
 // already exercise).
-func (s *SimRefStore) RetirePackAttempts(ctx context.Context, group []string, keys []string) error {
-	return s.inner.RetirePackAttempts(ctx, group, keys)
+func (s *SimRefStore) RetirePackAttempts(ctx context.Context, group []string, gens map[string]ref.ReservationToken) error {
+	return s.inner.RetirePackAttempts(ctx, group, gens)
 }
 
 // SweepExpiredPackReservations delegates to the inner store.

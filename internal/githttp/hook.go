@@ -280,7 +280,7 @@ func preReceive(ctx context.Context) error {
 	// concurrent-push overshoot the listing alone admitted. The reservation
 	// is consumed atomically by RegisterPacks below; a crash anywhere
 	// between here and there leaves an expiring row the sweeper prunes.
-	var reservedKeys []string
+	var reservedGens map[string]ref.ReservationToken
 	if quotaRaw := os.Getenv(EnvPackQuota); quotaRaw != "" {
 		quota, err := strconv.ParseInt(quotaRaw, 10, 64)
 		if err != nil || quota <= 0 {
@@ -311,9 +311,7 @@ func preReceive(ctx context.Context) error {
 				return fmt.Errorf("pre-receive: repository pack quota exceeded: push adds %d bytes to %d bytes stored (+%d bytes reserved by in-flight pushes), quota is %d bytes",
 					ref.IncomingBytes(unpublished), dec.UsedBytes, dec.ReservedBytes, quota)
 			}
-			for _, p := range unpublished {
-				reservedKeys = append(reservedKeys, p.Key)
-			}
+			reservedGens = dec.Gens
 			// Test knob: crash after the reservation committed, before any
 			// upload — the reservation deliberately leaks (issue #29's
 			// reserve → crash → sweep recovery window).
@@ -329,15 +327,28 @@ func preReceive(ctx context.Context) error {
 			continue
 		}
 		if err := bl.UploadFile(ctx, packs[i].Key, pf); err != nil {
-			// Clean failure: retire THIS push's attempts (Codex round 30;
-			// replacing round 22's settle-or-TTL-only rule). The rows are
-			// shared with concurrent identical pushes via refresh, so the
-			// retire is per-attempt refcounted — it never removes a live
-			// same-key writer's protection, and a failed retire only
-			// leaves what the TTL always collected.
-			if len(reservedKeys) > 0 {
-				if rerr := st.RetirePackAttempts(ctx, blob.QuotaRepoGroup(repo), reservedKeys); rerr != nil {
-					fmt.Fprintf(os.Stderr, "codestorage: retire reservations: %v\n", rerr)
+			// PROVEN-clean failure: retire this push's attempts (Codex
+			// round 30; replacing round 22's settle-or-TTL-only rule).
+			// The rows are shared with concurrent identical pushes via
+			// refresh, so the retire is per-attempt refcounted and
+			// gen-bound (round 33: a stale retire never touches a
+			// replacement row), and each key retires only on EVIDENCE its
+			// blob is absent — the failed upload itself may have
+			// committed with its response lost, and keys uploaded by
+			// earlier iterations are durable orphans whose rows must keep
+			// covering them (round 33). Ambiguity and retire failures
+			// only leave what the TTL always collected.
+			if len(reservedGens) > 0 {
+				proven := make(map[string]ref.ReservationToken, len(reservedGens))
+				for k, g := range reservedGens {
+					if _, serr := bl.Stat(ctx, k); errors.Is(serr, blob.ErrNotFound) {
+						proven[k] = g
+					}
+				}
+				if len(proven) > 0 {
+					if rerr := st.RetirePackAttempts(ctx, blob.QuotaRepoGroup(repo), proven); rerr != nil {
+						fmt.Fprintf(os.Stderr, "codestorage: retire reservations: %v\n", rerr)
+					}
 				}
 			}
 			return fmt.Errorf("pre-receive: upload %s: %w", packs[i].Key, err)

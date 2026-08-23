@@ -116,7 +116,12 @@ type Server struct {
 	lfsStagingInFlight int64
 	lfsStagingOps      int
 	lfsRepoStagingOps  map[string]int
-	lfsStagingMu       sync.Mutex
+	// lfsVerifyOps / lfsRepoVerifyOps count in-flight legacy-verification
+	// buffers (node-wide and per base repo — Codex rounds 26+33); guarded
+	// by lfsStagingMu like the op counters.
+	lfsVerifyOps     int
+	lfsRepoVerifyOps map[string]int
+	lfsStagingMu     sync.Mutex
 }
 
 // lfsMaxStagingOps bounds concurrent staging operations per replica
@@ -188,8 +193,44 @@ var lfsStagingChunk = int64(8 << 20)
 // verification memory at ~256 MiB with the default 8 MiB chunk.
 const lfsMaxVerifyBuffers = 32
 
-// lfsVerifyBuffers is the slot pool behind lfsMaxVerifyBuffers.
-var lfsVerifyBuffers = make(chan struct{}, lfsMaxVerifyBuffers)
+// lfsMaxRepoVerifyBuffers caps ONE base repository's share of the
+// verification buffers (Codex round 33, security): the buffer pool and the
+// per-repo op-slot share are both 32, so one repository's concurrent
+// adoptions could otherwise occupy every process-wide verification slot
+// and 429 other repositories' legacy adoptions. Eight slots keep a single
+// repository's upgrade traffic brisk while confining its outages to
+// itself.
+const lfsMaxRepoVerifyBuffers = 8
+
+// reserveLFSVerifyBuffer takes one node-wide verification buffer slot
+// charged to repo's share; ok=false is transient (429).
+func (s *Server) reserveLFSVerifyBuffer(repo string) bool {
+	assertf(repo != "", "reserveLFSVerifyBuffer(%q)", repo)
+	s.lfsStagingMu.Lock()
+	defer s.lfsStagingMu.Unlock()
+	if s.lfsVerifyOps >= lfsMaxVerifyBuffers || s.lfsRepoVerifyOps[repo] >= lfsMaxRepoVerifyBuffers {
+		return false
+	}
+	s.lfsVerifyOps++
+	if s.lfsRepoVerifyOps == nil {
+		s.lfsRepoVerifyOps = make(map[string]int)
+	}
+	s.lfsRepoVerifyOps[repo]++
+	return true
+}
+
+// releaseLFSVerifyBuffer returns a reserveLFSVerifyBuffer slot.
+func (s *Server) releaseLFSVerifyBuffer(repo string) {
+	s.lfsStagingMu.Lock()
+	defer s.lfsStagingMu.Unlock()
+	s.lfsVerifyOps--
+	assertf(s.lfsVerifyOps >= 0, "releaseLFSVerifyBuffer: count went negative")
+	s.lfsRepoVerifyOps[repo]--
+	assertf(s.lfsRepoVerifyOps[repo] >= 0, "releaseLFSVerifyBuffer(%q): repo count went negative", repo)
+	if s.lfsRepoVerifyOps[repo] == 0 {
+		delete(s.lfsRepoVerifyOps, repo)
+	}
+}
 
 // growLFSStaging adds n bytes to an existing staging reservation whose op
 // slot is already held; the caller releases the grown total through one

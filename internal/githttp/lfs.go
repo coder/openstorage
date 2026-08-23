@@ -676,7 +676,7 @@ func (s *Server) adoptLFSObject(ctx context.Context, repoID, key, oid string) er
 	// wedged backend or a parked connection.
 	vctx, vcancel := context.WithTimeout(context.WithoutCancel(ctx), s.lfsReservationTTL()*9/10)
 	defer vcancel()
-	verifiedSize, err := s.verifyStoredLFSObject(vctx, key, oid)
+	verifiedSize, err := s.verifyStoredLFSObject(vctx, repoID, key, oid)
 	if err != nil {
 		if !errors.Is(err, errLFSContentMismatch) {
 			return err
@@ -759,7 +759,7 @@ func (s *Server) adoptLFSObject(ctx context.Context, repoID, key, oid string) er
 // as a mismatch (a prefix of different content) — the same safe path as
 // any corrupt legacy blob; the digest covering exactly size bytes is what
 // makes the returned count trustworthy.
-func (s *Server) verifyStoredLFSObject(ctx context.Context, key, oid string) (int64, error) {
+func (s *Server) verifyStoredLFSObject(ctx context.Context, repo, key, oid string) (int64, error) {
 	size, err := s.Blob.Stat(ctx, key)
 	if err != nil {
 		return 0, fmt.Errorf("stat for verification: %w", err)
@@ -768,16 +768,17 @@ func (s *Server) verifyStoredLFSObject(ctx context.Context, key, oid string) (in
 	// bound must be memory-sized (Codex round 26, security, refining
 	// round 25): the op slots alone admit 256 concurrent 8 MiB buffers
 	// (~2 GiB of heap), and charging the DISK-sized staging budget — 10
-	// GiB by default — still admits nearly all of them. A dedicated slot
-	// pool caps concurrent verification buffers at lfsMaxVerifyBuffers ×
-	// lfsStagingChunk (~256 MiB); excess adoptions deny transiently like
+	// GiB by default — still admits nearly all of them. The slot pool
+	// caps concurrent verification buffers at lfsMaxVerifyBuffers ×
+	// lfsStagingChunk (~256 MiB) and charges each slot to the
+	// repository's share (Codex round 33: one repository's upgrade
+	// traffic could otherwise occupy the whole pool and 429 other
+	// repositories' adoptions). Excess adoptions deny transiently like
 	// every budget denial (the client retries, the object is unchanged).
-	select {
-	case lfsVerifyBuffers <- struct{}{}:
-		defer func() { <-lfsVerifyBuffers }()
-	default:
+	if !s.reserveLFSVerifyBuffer(repo) {
 		return 0, errLFSBusy
 	}
+	defer s.releaseLFSVerifyBuffer(repo)
 	h := sha256.New()
 	for off := int64(0); off < size; {
 		n := min(lfsStagingChunk, size-off)
@@ -1176,6 +1177,10 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target r
 	// exists the deadline is measured from a conservative point strictly
 	// before the row's created_at.
 	pubAnchor := time.Now()
+	// resGens holds the reservation's row-incarnation tokens when one was
+	// taken below; the upload-failure path retires against exactly these
+	// (Codex round 33).
+	var resGens map[string]ref.ReservationToken
 	if s.PackQuotaBytes > 0 && n > 0 && !registered {
 		// The pre-body registered flag can go STALE during the body copy
 		// (Codex round 26): a concurrent identical upload on another
@@ -1222,23 +1227,34 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target r
 				n, dec.UsedBytes, dec.ReservedBytes, s.PackQuotaBytes))
 			return
 		}
+		resGens = dec.Gens
 	}
 	pubCtx, cancel := context.WithDeadline(ctx, pubAnchor.Add(s.lfsReservationTTL()*9/10))
 	defer cancel()
 	if err := s.Blob.UploadFile(pubCtx, key, path); err != nil {
-		// Clean failure: nothing published, nothing registered — retire
-		// THIS attempt's share of the reservation (Codex round 30):
-		// leaving every aborted tiny PUT's row to the TTL let ~30 KB of
-		// aborted bodies pin maxActiveReservations and wedge all growth
-		// for an hour. Per-attempt refcounts keep a concurrent same-key
-		// writer's protection intact (the round-22 constraint). Detached
-		// from the client (the abort IS the attack) and bounded; a failed
-		// retire only leaves what the TTL always collected.
-		if s.PackQuotaBytes > 0 && n > 0 && !registered {
+		// PROVEN-clean failure: retire THIS attempt's share of the
+		// reservation (Codex round 30): leaving every aborted tiny PUT's
+		// row to the TTL let ~30 KB of aborted bodies pin
+		// maxActiveReservations and wedge all growth for an hour.
+		// Per-attempt refcounts keep a concurrent same-key writer's
+		// protection intact (round 22), the gen token keeps a stale
+		// retire off any replacement row (round 33), and the retire runs
+		// only on EVIDENCE the upload did not commit (round 33): an
+		// UploadFile error can be ambiguous — bytes durable, response
+		// lost — and retiring then would leave a rowless durable blob
+		// uncovered until the floor cache refreshes. Detached from the
+		// client (the abort IS the attack) and bounded; a failed retire
+		// or an ambiguous verdict only leaves what the TTL always
+		// collected.
+		if len(resGens) > 0 {
 			rctx, rcancel := context.WithTimeout(context.WithoutCancel(ctx), lfsCleanupTimeout)
 			defer rcancel()
-			if rerr := s.Store.RetirePackAttempts(rctx, blob.QuotaRepoGroup(repoID), []string{key}); rerr != nil {
-				log.Printf("lfs retire %s: %v", key, rerr)
+			if _, serr := s.Blob.Stat(rctx, key); errors.Is(serr, blob.ErrNotFound) {
+				if rerr := s.Store.RetirePackAttempts(rctx, blob.QuotaRepoGroup(repoID), resGens); rerr != nil {
+					log.Printf("lfs retire %s: %v", key, rerr)
+				}
+			} else {
+				log.Printf("lfs retire %s: skipped, upload outcome ambiguous (stat: %v)", key, serr)
 			}
 		}
 		log.Printf("lfs upload %s: %v", key, err)

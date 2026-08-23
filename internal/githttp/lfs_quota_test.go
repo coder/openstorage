@@ -771,19 +771,49 @@ func TestLFSAdoption_VerificationBuffersAreBudgeted(t *testing.T) {
 		if err := srv.Blob.UploadFile(context.Background(), key, writeTempFile(t, legacy)); err != nil {
 			t.Fatal(err)
 		}
-		for range lfsMaxVerifyBuffers { // every buffer slot held elsewhere
-			lfsVerifyBuffers <- struct{}{}
-		}
+		srv.lfsStagingMu.Lock() // every buffer slot held elsewhere on the node
+		srv.lfsVerifyOps = lfsMaxVerifyBuffers
+		srv.lfsStagingMu.Unlock()
 		t.Cleanup(func() {
-			for range lfsMaxVerifyBuffers {
-				<-lfsVerifyBuffers
-			}
+			srv.lfsStagingMu.Lock()
+			srv.lfsVerifyOps = 0
+			srv.lfsStagingMu.Unlock()
 		})
 		resp := decodeBatch(t, doLFS(t, srv, http.MethodPost, lfsBatchPath, "basic:"+tok,
 			batchBody("upload", oid, int64(len(legacy)))))
 		if resp.Objects[0].Error == nil || resp.Objects[0].Error.Code != http.StatusTooManyRequests {
 			t.Fatalf("slot-exhausted verification did not deny transiently: %+v", resp.Objects[0])
 		}
+	})
+
+	t.Run("repo-share-isolates-repos", func(t *testing.T) {
+		// Codex round 33: one repository's adoptions occupy only its own
+		// share of the verification buffers, never the whole pool.
+		srv, _, mint := newLFSQuotaServer(t, 0, time.Hour)
+		tok := mint(auth.ScopeGitWrite)
+		if err := srv.Blob.UploadFile(context.Background(), key, writeTempFile(t, legacy)); err != nil {
+			t.Fatal(err)
+		}
+		srv.lfsStagingMu.Lock()
+		srv.lfsRepoVerifyOps = map[string]int{lfsTestRepoID: lfsMaxRepoVerifyBuffers}
+		srv.lfsVerifyOps = lfsMaxRepoVerifyBuffers // pool mostly free
+		srv.lfsStagingMu.Unlock()
+		t.Cleanup(func() {
+			srv.lfsStagingMu.Lock()
+			srv.lfsRepoVerifyOps, srv.lfsVerifyOps = nil, 0
+			srv.lfsStagingMu.Unlock()
+		})
+		// Same repository: denied at its share.
+		resp := decodeBatch(t, doLFS(t, srv, http.MethodPost, lfsBatchPath, "basic:"+tok,
+			batchBody("upload", oid, int64(len(legacy)))))
+		if resp.Objects[0].Error == nil || resp.Objects[0].Error.Code != http.StatusTooManyRequests {
+			t.Fatalf("share-exhausted same-repo adoption not denied: %+v", resp.Objects[0])
+		}
+		// Another repository still reserves.
+		if !srv.reserveLFSVerifyBuffer("repo_other") {
+			t.Fatal("unrelated repository starved by another repository's verify share")
+		}
+		srv.releaseLFSVerifyBuffer("repo_other")
 	})
 }
 
@@ -1284,6 +1314,45 @@ func TestLFSPut_CleanFailureRetiresReservation(t *testing.T) {
 	}
 	if ls := ledgerState(t, st, time.Hour); ls.ReservedBytes != 0 {
 		t.Fatalf("aborted PUTs left %d reserved bytes pinned to the TTL, want 0 (attempts retired)", ls.ReservedBytes)
+	}
+}
+
+// commitThenFailBlob commits the upload and THEN reports failure — the
+// ambiguous outcome where object storage made the bytes durable but the
+// response was lost.
+type commitThenFailBlob struct {
+	blob.BlobStore
+}
+
+func (b commitThenFailBlob) UploadFile(ctx context.Context, key, path string) error {
+	if err := b.BlobStore.UploadFile(ctx, key, path); err != nil {
+		return err
+	}
+	return fmt.Errorf("response lost after commit")
+}
+
+// TestLFSPut_AmbiguousUploadFailurePreservesReservation (Codex round 33):
+// an UploadFile error can be ambiguous — the bytes durable, the response
+// lost. Retiring the reservation then would leave a rowless durable blob
+// unaccounted until the floor cache refreshes, letting a distinct writer
+// consume the freed headroom and later adoption push durable usage over
+// quota. Retirement requires EVIDENCE of non-publication (the blob
+// provably absent); ambiguous outcomes leave the row to settlement or TTL.
+func TestLFSPut_AmbiguousUploadFailurePreservesReservation(t *testing.T) {
+	srv, st, mint := newLFSQuotaServer(t, 1<<20, time.Hour)
+	tok := mint(auth.ScopeGitWrite)
+	srv.Blob = commitThenFailBlob{BlobStore: srv.Blob}
+
+	content := bytes.Repeat([]byte("a"), 40)
+	w := doLFS(t, srv, http.MethodPut, "/"+lfsTestRepoURL+".git/info/lfs/objects/"+sha256Hex(content),
+		"basic:"+tok, string(content))
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("ambiguous PUT status = %d, want 500", w.Code)
+	}
+	// The bytes are durable and rowless: the reservation must keep
+	// covering them until settlement or TTL.
+	if ls := ledgerState(t, st, time.Hour); ls.ReservedBytes != 40 {
+		t.Fatalf("ambiguous failure left %d reserved bytes, want 40 (row preserved)", ls.ReservedBytes)
 	}
 }
 

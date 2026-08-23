@@ -73,18 +73,30 @@ SELECT
 	}
 	for _, p := range packs {
 		// Same-key upsert (see the PG twin): retries refresh, never wedge;
-		// the refresh KEEPS the existing owner (Codex round 5) and takes
-		// the MAX of the declared byte values (Codex round 7).
+		// the refresh KEEPS the existing owner (Codex round 5) and gen
+		// (round 33 — the row incarnation the retirement must present),
+		// and takes the MAX of the declared byte values (Codex round 7).
 		if _, err := tx.ExecContext(ctx, `
-INSERT INTO pack_reservations (key, repo, bytes, owner, created_at)
-VALUES (?, ?, ?, ?, `+sqliteEpochMS+`)
+INSERT INTO pack_reservations (key, repo, bytes, owner, created_at, gen)
+VALUES (?, ?, ?, ?, `+sqliteEpochMS+`, ?)
 ON CONFLICT (key) DO UPDATE SET repo = excluded.repo,
                                 bytes = MAX(pack_reservations.bytes, excluded.bytes),
                                 created_at = excluded.created_at,
                                 attempts = pack_reservations.attempts + 1`,
-			p.Key, group[0], p.Size, owner); err != nil {
+			p.Key, group[0], p.Size, owner, NewReservationOwner()); err != nil {
 			return ReserveDecision{}, fmt.Errorf("reserve pack bytes insert: %w", err)
 		}
+		var tok ReservationToken
+		var createdMS int64
+		if err := tx.QueryRowContext(ctx,
+			`SELECT gen, created_at FROM pack_reservations WHERE key = ?`, p.Key).Scan(&tok.Gen, &createdMS); err != nil {
+			return ReserveDecision{}, fmt.Errorf("reserve pack bytes gen: %w", err)
+		}
+		tok.CreatedAt = time.UnixMilli(createdMS)
+		if dec.Gens == nil {
+			dec.Gens = make(map[string]ReservationToken, len(packs))
+		}
+		dec.Gens[p.Key] = tok
 	}
 	if err := tx.Commit(); err != nil {
 		return ReserveDecision{}, fmt.Errorf("reserve pack bytes commit: %w", err)
@@ -112,27 +124,24 @@ func placeholders(n int) string {
 
 // RetirePackAttempts — see the PG twin; BEGIN IMMEDIATE's single writer is
 // the serialization.
-func (s *SQLite) RetirePackAttempts(ctx context.Context, group []string, keys []string) error {
-	assertf(len(group) > 0 && group[0] != "" && len(keys) > 0, "RetirePackAttempts(%v, %v)", group, keys)
+func (s *SQLite) RetirePackAttempts(ctx context.Context, group []string, gens map[string]ReservationToken) error {
+	assertf(len(group) > 0 && group[0] != "" && len(gens) > 0, "RetirePackAttempts(%v, %v)", group, gens)
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
-	args := make([]any, 0, len(keys)+1)
-	args = append(args, group[0])
-	for _, k := range keys {
-		args = append(args, k)
-	}
-	if _, err := tx.ExecContext(ctx,
-		`UPDATE pack_reservations SET attempts = attempts - 1 WHERE repo = ? AND key IN (?`+placeholders(len(keys)-1)+`)`,
-		args...); err != nil {
-		return err
-	}
-	if _, err := tx.ExecContext(ctx,
-		`DELETE FROM pack_reservations WHERE repo = ? AND key IN (?`+placeholders(len(keys)-1)+`) AND attempts <= 0`,
-		args...); err != nil {
-		return err
+	for key, tok := range gens {
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE pack_reservations SET attempts = attempts - 1 WHERE repo = ? AND key = ? AND gen = ?`,
+			group[0], key, tok.Gen); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx,
+			`DELETE FROM pack_reservations WHERE repo = ? AND key = ? AND gen = ? AND attempts <= 0 AND created_at <= ?`,
+			group[0], key, tok.Gen, tok.CreatedAt.UnixMilli()); err != nil {
+			return err
+		}
 	}
 	return tx.Commit()
 }

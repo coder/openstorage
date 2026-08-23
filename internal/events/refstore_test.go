@@ -75,7 +75,9 @@ func (f *fakeInner) GuardedLFSDelete(context.Context, string, string, func(conte
 func (f *fakeInner) QuotaLedgerState(context.Context, []string, time.Duration, ...string) (ref.PackQuotaLedgerState, error) {
 	return ref.PackQuotaLedgerState{}, nil
 }
-func (f *fakeInner) RetirePackAttempts(context.Context, []string, []string) error { return nil }
+func (f *fakeInner) RetirePackAttempts(context.Context, []string, map[string]ref.ReservationToken) error {
+	return nil
+}
 
 type fakeRepos struct {
 	repo meta.Repo

@@ -84,20 +84,25 @@ func (s *server) publishPack(ctx context.Context, repoID, packID, packPath strin
 					errPackQuotaExceeded, pack.Size, dec.UsedBytes, dec.ReservedBytes, s.packQuotaBytes)
 			}
 			if err := s.blobStore.UploadFile(ctx, key, packPath); err != nil {
-				// Clean failure: retire THIS attempt (Codex round 30;
-				// replacing round 22's settle-or-TTL-only rule). The
+				// PROVEN-clean failure: retire THIS attempt (Codex round
+				// 30; replacing round 22's settle-or-TTL-only rule). The
 				// per-attempt refcount never removes a live same-key
-				// writer's protection; a failed retire only leaves what
-				// the TTL always collected. Detached from the request
-				// context and bounded (Codex round 31): the most common
-				// clean failure here IS a client cancellation, and a
-				// retire on the already-canceled context can never reach
-				// the database — repeated canceled writes with distinct
-				// keys would pin maxActiveReservations rows for the TTL.
+				// writer's protection, the gen token keeps a stale retire
+				// off any replacement row (round 33), and the retire runs
+				// only on EVIDENCE the upload did not commit (round 33:
+				// the error may be ambiguous with the bytes durable).
+				// Detached from the request context and bounded (Codex
+				// round 31): the most common clean failure here IS a
+				// client cancellation, and a retire on the
+				// already-canceled context can never reach the database.
 				rctx, rcancel := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
 				defer rcancel()
-				if rerr := s.refStore.RetirePackAttempts(rctx, blob.QuotaRepoGroup(repoID), []string{key}); rerr != nil {
-					s.logger.Warn("retire pack reservation", "key", key, "error", rerr)
+				if _, serr := s.blobStore.Stat(rctx, key); errors.Is(serr, blob.ErrNotFound) {
+					if rerr := s.refStore.RetirePackAttempts(rctx, blob.QuotaRepoGroup(repoID), dec.Gens); rerr != nil {
+						s.logger.Warn("retire pack reservation", "key", key, "error", rerr)
+					}
+				} else {
+					s.logger.Warn("retire skipped, upload outcome ambiguous", "key", key, "stat_error", serr)
 				}
 				return fmt.Errorf("upload pack %s: %w", key, err)
 			}

@@ -113,6 +113,11 @@ type ReserveDecision struct {
 	// ReservedBytes is the active in-flight reservations charged on top of
 	// UsedBytes (other pushes' keys only).
 	ReservedBytes int64
+	// Gens maps each reserved key to its row-incarnation token (Codex
+	// round 33): minted at INSERT, preserved across same-key refreshes.
+	// RetirePackAttempts requires it, so a stale writer whose row expired
+	// and was replaced can never retire the replacement. Set only when OK.
+	Gens map[string]ReservationToken
 	// KeyCapExceeded reports that the denial was the per-repo cap on
 	// ACTIVE reservation ROWS, not byte arithmetic (Codex security round
 	// on #51): declared bytes bound row count at nothing — 1-byte LFS
@@ -173,6 +178,22 @@ func validateReserve(group []string, packs []Pack, owner string, usageFloor, quo
 	assertf(usageFloor >= 0, "ReservePackBytes: negative usage floor %d", usageFloor)
 	assertf(quotaBytes > 0, "ReservePackBytes: non-positive quota %d (0 disables the quota at the caller)", quotaBytes)
 	assertf(ttl > 0, "ReservePackBytes: non-positive ttl %v", ttl)
+}
+
+// ReservationToken identifies one reservation row incarnation as observed
+// by the reserve that returned it (Codex round 33). Gen is the row's
+// incarnation token (minted at INSERT, preserved across refreshes);
+// CreatedAt is the DB-stamped refresh time this reserve itself wrote.
+// Retirement deletes a row only when BOTH match its expectations: the gen
+// proves the row is the same incarnation, and created_at ≤ CreatedAt
+// proves no later writer — a pre-attempt binary's refresh included, which
+// bumps created_at without incrementing attempts — refreshed the row after
+// this reserve. Both comparisons are DB-clock-to-DB-clock, so app/database
+// clock skew cannot misfire them; a blocked delete only leaves the row to
+// the TTL.
+type ReservationToken struct {
+	Gen       string
+	CreatedAt time.Time
 }
 
 // addSat returns a+b saturated at MaxInt64. Admission arithmetic sums
@@ -296,16 +317,26 @@ SELECT
 			// attempts counts the live same-key writers sharing this row
 			// (Codex round 30): every reserve/refresh adds one, a clean
 			// failure retires one (RetirePackAttempts), and the row ends
-			// at zero attempts, settlement, or TTL.
-			if _, err := tx.Exec(ctx, `
-INSERT INTO pack_reservations (key, repo, bytes, owner) VALUES ($1, $2, $3, $4)
+			// at zero attempts, settlement, or TTL. gen is the row's
+			// incarnation (Codex round 33): a fresh INSERT mints one, a
+			// refresh preserves it, and RETURNING hands the caller the
+			// token — gen plus this reserve's own DB-stamped created_at —
+			// its retirement must present.
+			var tok ReservationToken
+			if err := tx.QueryRow(ctx, `
+INSERT INTO pack_reservations (key, repo, bytes, owner, gen) VALUES ($1, $2, $3, $4, $5)
 ON CONFLICT (key) DO UPDATE SET repo = EXCLUDED.repo,
                                 bytes = GREATEST(pack_reservations.bytes, EXCLUDED.bytes),
                                 created_at = now(),
-                                attempts = pack_reservations.attempts + 1`,
-				p.Key, group[0], p.Size, owner); err != nil {
+                                attempts = pack_reservations.attempts + 1
+RETURNING gen, created_at`,
+				p.Key, group[0], p.Size, owner, NewReservationOwner()).Scan(&tok.Gen, &tok.CreatedAt); err != nil {
 				return err
 			}
+			if dec.Gens == nil {
+				dec.Gens = make(map[string]ReservationToken, len(packs))
+			}
+			dec.Gens[p.Key] = tok
 		}
 		dec.OK = true
 		return nil
@@ -319,21 +350,34 @@ ON CONFLICT (key) DO UPDATE SET repo = EXCLUDED.repo,
 // RetirePackAttempts — see RefStore. Serialized with ReservePackBytes per
 // base repo (same advisory lock class): a retire must not interleave with
 // a concurrent same-key refresh or the decrement could race the increment.
-func (s *PG) RetirePackAttempts(ctx context.Context, group []string, keys []string) error {
-	assertf(len(group) > 0 && group[0] != "" && len(keys) > 0, "RetirePackAttempts(%v, %v)", group, keys)
+func (s *PG) RetirePackAttempts(ctx context.Context, group []string, gens map[string]ReservationToken) error {
+	assertf(len(group) > 0 && group[0] != "" && len(gens) > 0, "RetirePackAttempts(%v, %v)", group, gens)
 	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
 		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1), $2)`, group[0], reserveLockClass); err != nil {
 			return err
 		}
-		if _, err := tx.Exec(ctx, `
-UPDATE pack_reservations SET attempts = attempts - 1 WHERE repo = $1 AND key = ANY($2)`,
-			group[0], keys); err != nil {
-			return err
+		for key, tok := range gens {
+			// The token binds the decrement to the row incarnation the
+			// caller actually reserved (Codex round 33): a replacement
+			// row created after this caller's expired and was pruned
+			// carries a different gen and is untouched. The DELETE
+			// additionally requires created_at unchanged since this
+			// caller's own reserve — ANY later refresh, including a
+			// pre-attempt binary's (which bumps created_at without
+			// incrementing attempts, the mixed-fleet hazard), retains the
+			// row for the TTL.
+			if _, err := tx.Exec(ctx, `
+UPDATE pack_reservations SET attempts = attempts - 1 WHERE repo = $1 AND key = $2 AND gen = $3`,
+				group[0], key, tok.Gen); err != nil {
+				return err
+			}
+			if _, err := tx.Exec(ctx, `
+DELETE FROM pack_reservations WHERE repo = $1 AND key = $2 AND gen = $3 AND attempts <= 0 AND created_at <= $4`,
+				group[0], key, tok.Gen, tok.CreatedAt); err != nil {
+				return err
+			}
 		}
-		_, err := tx.Exec(ctx, `
-DELETE FROM pack_reservations WHERE repo = $1 AND key = ANY($2) AND attempts <= 0`,
-			group[0], keys)
-		return err
+		return nil
 	})
 }
 
