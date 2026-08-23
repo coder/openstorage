@@ -2225,6 +2225,20 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target r
 				return
 			}
 			if !registered {
+				// The boundary race includes the LEGACY spelling (Codex
+				// round 99, the PUT twin of adoption's round-86
+				// recheck): mid-roll, an old replica can register this
+				// OID's legacy row between the entry lookup and the
+				// count — registration migrates that row in place, so
+				// the object adds nothing and the cap must not deny it.
+				registered, err = s.Store.HasLFSObject(ctx, repoID, blob.LFSLegacyKey(repoID, oid))
+				if err != nil {
+					log.Printf("lfs registry %s: %v", key, err)
+					lfsError(w, http.StatusInternalServerError, "object registry unavailable")
+					return
+				}
+			}
+			if !registered {
 				lfsError(w, http.StatusInsufficientStorage, fmt.Sprintf(
 					"repository LFS object count limit reached (%d objects stored, limit %d)",
 					count, ref.MaxLFSObjectsPerRepo))
