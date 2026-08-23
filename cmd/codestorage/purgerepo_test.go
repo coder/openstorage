@@ -159,6 +159,17 @@ func TestCmdPurgeRepo(t *testing.T) {
 	}
 }
 
+func TestSanitizeTerm(t *testing.T) {
+	in := "https://x/\x1b]0;pwned\x07a\u009bm\r\nrepo.git"
+	got := sanitizeTerm(in)
+	if strings.ContainsAny(got, "\x1b\x07\r\n") || strings.ContainsRune(got, '\u009b') {
+		t.Fatalf("control bytes survived: %q", got)
+	}
+	if sanitizeTerm("team/demo.git") != "team/demo.git" {
+		t.Fatal("plain URL mangled")
+	}
+}
+
 func TestCmdPurgeRepo_InitializesRefSchema(t *testing.T) {
 	// Upgrade path: purge-repo may be the FIRST new binary to touch a
 	// database created before the purge fence table existed. The command

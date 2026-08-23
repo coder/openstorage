@@ -12,12 +12,26 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/coder/code-storage/internal/blob"
 	"github.com/coder/code-storage/internal/jobs"
 	"github.com/coder/code-storage/internal/ref"
 )
+
+// sanitizeTerm replaces control characters (C0, DEL, C1 — the bytes
+// ANSI/OSC escapes are built from) so a hostile persisted repository URL
+// (JWT repo claims are attacker-chosen strings) cannot forge the purge
+// confirmation summary or restyle the operator's terminal.
+func sanitizeTerm(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f) {
+			return '\uFFFD'
+		}
+		return r
+	}, s)
+}
 
 func cmdPurgeRepo(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("purge-repo", flag.ExitOnError)
@@ -135,10 +149,10 @@ Flags:
 		return fmt.Errorf("repo %s not found (never created, or purged by an older build)", repoID)
 	}
 	if state.Repo.DeletedAt == nil {
-		return fmt.Errorf("repo %s (%s) is live — delete it first (DELETE /api/v1/repos/delete)", repoID, state.Repo.URL)
+		return fmt.Errorf("repo %s (%s) is live — delete it first (DELETE /api/v1/repos/delete)", repoID, sanitizeTerm(state.Repo.URL))
 	}
 	fmt.Printf("repo:       %s\n", state.Repo.RepoID)
-	fmt.Printf("url:        %s\n", state.Repo.URL)
+	fmt.Printf("url:        %s\n", sanitizeTerm(state.Repo.URL))
 	fmt.Printf("deleted at: %s (%s ago)\n",
 		state.Repo.DeletedAt.Format(time.RFC3339), time.Since(*state.Repo.DeletedAt).Round(time.Second))
 	if state.PurgedAt != nil {

@@ -645,6 +645,40 @@ func TestSweepSchedule_RunsPurge(t *testing.T) {
 	f.assertPurged(repo.RepoID)
 }
 
+func TestSweep_ListOnlyRollbackPreservesOrphanBackups(t *testing.T) {
+	// The operator's rollback move — every delete flag off — must keep
+	// preserving ORDINARY orphan backups even though sweeps are now
+	// always purge-aware (PR #105 round 12): only purge-FENCED repos'
+	// backups may age out in that state.
+	f := newPurgeFixture(t)
+	ctx := context.Background()
+	live := f.seedRepo("https://example.com/rollback.git")
+	orphanKey := blob.PackKey(live.RepoID, "orphan")
+	f.upload(orphanKey, "orphan bytes")
+	f.backdate(orphanKey, 25*time.Hour)
+
+	// A delete-enabled sweep quarantines the aged orphan.
+	deleter := f.sweeper(SweepConfig{Threshold: 24 * time.Hour, Delete: true,
+		PurgedRepoProbe: f.store.(RepoPurgeRegistry).IsRepoPurged})
+	if _, err := deleter.Sweep(ctx); err != nil {
+		t.Fatalf("delete-enabled sweep: %v", err)
+	}
+	backups := f.backupKeys(orphanKey)
+	if len(backups) != 1 {
+		t.Fatalf("want 1 quarantined orphan backup, got %d", len(backups))
+	}
+	f.backdate(backups[0], 25*time.Hour)
+
+	// Rollback: all delete flags off. The aged backup of a NON-fenced
+	// repo must survive purge-aware sweeps — it may be the last copy.
+	if _, err := f.purgeAwareSweeper().Sweep(ctx); err != nil {
+		t.Fatalf("list-only sweep: %v", err)
+	}
+	if len(f.backupKeys(orphanKey)) != 1 {
+		t.Fatal("list-only rollback destroyed an ordinary orphan's backup")
+	}
+}
+
 func TestSweep_RetentionModeAgesQuarantine(t *testing.T) {
 	f := newPurgeFixture(t)
 	repo := f.seedRepo("https://example.com/aged.git")
