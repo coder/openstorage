@@ -95,7 +95,7 @@ func fromMetaUpstream(u meta.RepoUpstream) Upstream {
 	return Upstream{
 		RepoID: u.RepoID, Provider: u.Provider, Owner: u.Owner, Name: u.Name,
 		UpstreamHost: u.UpstreamHost, RunCount: u.RunCount, SuccessCount: u.SuccessCount,
-		Syncing: u.Syncing, CreatedAt: u.CreatedAt,
+		Syncing: u.Syncing, SyncPending: u.SyncPending, CreatedAt: u.CreatedAt,
 	}
 }
 
@@ -120,6 +120,10 @@ func (s metaUpstreams) GetUpstream(ctx context.Context, repoID string) (Upstream
 
 func (s metaUpstreams) DeleteUpstream(ctx context.Context, repoID string) error {
 	return mapMetaErr(s.ms.DeleteRepoUpstream(ctx, repoID), ErrNotFound, nil)
+}
+
+func (s metaUpstreams) RequestSync(ctx context.Context, repoID string) error {
+	return mapMetaErr(s.ms.RequestSync(ctx, repoID), ErrNotFound, nil)
 }
 
 func (s metaUpstreams) BeginSync(ctx context.Context, repoID string) (Upstream, error) {

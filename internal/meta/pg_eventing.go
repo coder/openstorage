@@ -20,7 +20,7 @@ const (
 	// scanRepoUpstream (shared with sqlite_eventing.go like repoCols).
 	webhookCols       = "id, org_id, url, secret, created_at"
 	gitCredentialCols = "id, repo_id, username, password, created_at"
-	repoUpstreamCols  = "repo_id, provider, owner, name, upstream_host, run_count, success_count, syncing, created_at"
+	repoUpstreamCols  = "repo_id, provider, owner, name, upstream_host, run_count, success_count, syncing, sync_pending, created_at"
 )
 
 // scanWebhook scans one row of webhookCols; CreatedAt normalized to UTC.
@@ -47,7 +47,7 @@ func scanGitCredential(row pgx.Row) (GitCredential, error) {
 func scanRepoUpstream(row pgx.Row) (RepoUpstream, error) {
 	var up RepoUpstream
 	if err := row.Scan(&up.RepoID, &up.Provider, &up.Owner, &up.Name, &up.UpstreamHost,
-		&up.RunCount, &up.SuccessCount, &up.Syncing, &up.CreatedAt); err != nil {
+		&up.RunCount, &up.SuccessCount, &up.Syncing, &up.SyncPending, &up.CreatedAt); err != nil {
 		return RepoUpstream{}, err
 	}
 	up.CreatedAt = up.CreatedAt.UTC()
@@ -308,10 +308,11 @@ func (s *PG) GitCredentialForRepo(ctx context.Context, repoID string) (GitCreden
 }
 
 // SetRepoUpstream inserts the upstream row (CreatedAt assigned by the store;
-// counters/syncing zeroed). ErrAlreadyExists when the repo already has one.
+// counters/syncing/sync_pending zeroed). ErrAlreadyExists when the repo
+// already has one.
 func (s *PG) SetRepoUpstream(ctx context.Context, up RepoUpstream) (RepoUpstream, error) {
 	assertf(up.RepoID != "", "SetRepoUpstream: empty repo id")
-	up.RunCount, up.SuccessCount, up.Syncing = 0, 0, false
+	up.RunCount, up.SuccessCount, up.Syncing, up.SyncPending = 0, 0, false, false
 	err := s.pool.QueryRow(ctx,
 		`INSERT INTO repo_upstreams (repo_id, provider, owner, name, upstream_host)
 		 VALUES ($1, $2, $3, $4, $5) RETURNING created_at`,
@@ -356,13 +357,31 @@ func (s *PG) DeleteRepoUpstream(ctx context.Context, repoID string) error {
 	return nil
 }
 
-// TryBeginSync atomically claims a sync run (syncing false -> true).
-// claimed=false with the current row when a run is already in flight;
-// ErrNotFound when detached.
+// RequestSync marks a pending sync request; ErrNotFound when detached.
+// See the EventingStore contract (eventing.go) for the pending-flag
+// protocol (issue #79).
+func (s *PG) RequestSync(ctx context.Context, repoID string) error {
+	assertf(repoID != "", "RequestSync: empty repo id")
+	tag, err := s.pool.Exec(ctx,
+		`UPDATE repo_upstreams SET sync_pending = true WHERE repo_id = $1`, repoID)
+	if err != nil {
+		return fmt.Errorf("request sync for repo %q: %w", repoID, err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("upstream for repo %q: %w", repoID, ErrNotFound)
+	}
+	assertf(tag.RowsAffected() == 1, "UPDATE by primary key affected %d rows", tag.RowsAffected())
+	return nil
+}
+
+// TryBeginSync atomically claims a sync run (syncing false -> true) and
+// consumes sync_pending (the claimed run's fetch postdates every request
+// marked before the claim). claimed=false with the current row when a run
+// is already in flight; ErrNotFound when detached.
 func (s *PG) TryBeginSync(ctx context.Context, repoID string) (RepoUpstream, bool, error) {
 	assertf(repoID != "", "TryBeginSync: empty repo id")
 	up, err := scanRepoUpstream(s.pool.QueryRow(ctx,
-		`UPDATE repo_upstreams SET syncing = true
+		`UPDATE repo_upstreams SET syncing = true, sync_pending = false
 		 WHERE repo_id = $1 AND NOT syncing
 		 RETURNING `+repoUpstreamCols, repoID))
 	if err == nil {
