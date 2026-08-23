@@ -474,11 +474,17 @@ func updateHook(ctx context.Context, args []string) error {
 		return err
 	}
 	// Sync claim fence (issue #86): a loopback sync push carries its
-	// run's claim-holder token; refuse the update when the claim moved.
+	// run's claim-holder token. The precheck refuses obviously-stale
+	// pushes with a clear message (and fails closed on meta trouble);
+	// the fenced CAS context below closes the residual check-to-update
+	// race by re-evaluating the holder ATOMICALLY inside the CAS
+	// statement itself — a steal committing after the precheck makes the
+	// CAS report won=false instead of publishing the stale ref.
 	if holder := os.Getenv(EnvSyncClaim); holder != "" {
 		if err := enforceSyncClaimFence(ctx, repo, holder); err != nil {
 			return err
 		}
+		ctx = ref.WithSyncClaimFence(ctx, repo, holder)
 	}
 
 	// Test knob: widen the CAS race window deterministically.
