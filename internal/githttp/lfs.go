@@ -2585,6 +2585,19 @@ func (s *Server) maybeLegacyCompatCopy(ctx context.Context, repoID, oid, key str
 	case !errors.Is(rperr, blob.ErrNotFound):
 		return fmt.Errorf("compat recheck %s: %w", legacyKey, rperr)
 	}
+	// Node-wide operation slot for the copy (Codex round 92): distinct-OID
+	// batch touches each launch a size-scaled server-side copy, and the
+	// per-key claim dedupes only one OID while quota reservations are
+	// per-repository (or disabled) — without a cross-key bound, one
+	// write-scoped client could fan out unbounded simultaneous multipart
+	// copies and exhaust backend connections. The same repository-fair
+	// slot that bounds uploads and adoptions bounds the bridge; denial is
+	// transient (429) like every op-slot contention, and the next
+	// write-scoped touch repairs via ensureLegacyCompat.
+	if !s.reserveLFSStaging(repoID, 0) {
+		return fmt.Errorf("compat copy %s: %w", legacyKey, errLFSBusy)
+	}
+	defer s.releaseLFSStaging(repoID, 0)
 	// Size-scaled allowance, not a fixed wall-clock cap (Codex round 81):
 	// accepted objects reach many GiB and S3's multipart copy is
 	// sequential, so the one-minute cleanup bound was guaranteed to
