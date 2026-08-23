@@ -31,7 +31,7 @@ LINK = re.compile(
 REFDEF = re.compile(r"^ {0,3}\[[^\]^]+\]:\s")
 ANGLE = re.compile(r"\]\(\s*<")
 FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
-HEADING = re.compile(r"^ {0,3}(#+) +(.*)$")
+HEADING = re.compile(r"^ {0,3}(#{1,6}) +(.*)$")
 
 
 def gh_anchor(h):
