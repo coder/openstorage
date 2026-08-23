@@ -1438,6 +1438,64 @@ func TestLFSAdopt_LegacyRowMigratesAtObjectCap(t *testing.T) {
 	}
 }
 
+// TestLFS_BloblessLegacyRowIsZeroGrowthRepair (Codex round 87): a v0.2.0
+// legacy-spelled registry row whose blob is GONE (storage loss before the
+// upgrade) is a zero-growth repair — registration migrates the row in
+// place, adding no count and no bytes — but both write surfaces classified
+// the OID as NEW: at the byte quota or object cap they answered 507 with
+// no upload action, so the row could never be repaired without an
+// operator raising a limit. The round-86 fix ran only after a successful
+// legacy blob stat, which this blobless state never reaches.
+func TestLFS_BloblessLegacyRowIsZeroGrowthRepair(t *testing.T) {
+	old := ref.MaxLFSObjectsPerRepo
+	ref.MaxLFSObjectsPerRepo = 1
+	t.Cleanup(func() { ref.MaxLFSObjectsPerRepo = old })
+	ctx := context.Background()
+	content := []byte(strings.Repeat("z", 64))
+	oid := sha256Hex(content)
+
+	t.Run("batch-issues-upload-action", func(t *testing.T) {
+		// At the byte quota AND the object cap: the repair must be
+		// exempt from both.
+		srv, st, mint := newLFSQuotaServer(t, 64, time.Hour)
+		tok := mint(auth.ScopeGitWrite)
+		if err := st.RegisterLFSObject(ctx, lfsTestRepoID, blob.LFSLegacyKey(lfsTestRepoID, oid), 64); err != nil {
+			t.Fatal(err)
+		}
+		resp := decodeBatch(t, doLFS(t, srv, http.MethodPost, lfsBatchPath, "basic:"+tok,
+			batchBody("upload", oid, 64)))
+		if resp.Objects[0].Error != nil {
+			t.Fatalf("blobless legacy-row batch touch at quota+cap = %+v, want an upload action — a 507 here is permanent", resp.Objects[0])
+		}
+		if len(resp.Objects[0].Actions) == 0 {
+			t.Fatal("no upload action for a blobless legacy-row object — nothing can ever repair the row")
+		}
+	})
+	t.Run("put-repairs-and-migrates", func(t *testing.T) {
+		srv, st, mint := newLFSQuotaServer(t, 64, time.Hour)
+		tok := mint(auth.ScopeGitWrite)
+		key := blob.LFSKey(lfsTestRepoID, oid)
+		legacyKey := blob.LFSLegacyKey(lfsTestRepoID, oid)
+		if err := st.RegisterLFSObject(ctx, lfsTestRepoID, legacyKey, 64); err != nil {
+			t.Fatal(err)
+		}
+		w := doLFS(t, srv, http.MethodPut, "/"+lfsTestRepoURL+".git/info/lfs/objects/"+oid,
+			"basic:"+tok, string(content))
+		if w.Code != http.StatusOK {
+			t.Fatalf("repair PUT of a blobless legacy-row object = %d, body %s — must be admitted as a zero-growth repair", w.Code, w.Body)
+		}
+		if has, err := st.HasLFSObject(ctx, lfsTestRepoID, key); err != nil || !has {
+			t.Fatalf("canonical row after repair = (%v, %v), want migrated in place", has, err)
+		}
+		if has, err := st.HasLFSObject(ctx, lfsTestRepoID, legacyKey); err != nil || has {
+			t.Fatalf("legacy row after repair = (%v, %v), want migrated away", has, err)
+		}
+		if _, err := srv.Blob.Stat(ctx, key); err != nil {
+			t.Fatalf("canonical bytes missing after repair: %v", err)
+		}
+	})
+}
+
 // TestLFSCompat_RepairSerializedOnLegacyClaim (Codex security round 85):
 // the batch fast path's bridge repair launched an unserialized full copy —
 // every tiny concurrent touch of the object started another one. Compat
