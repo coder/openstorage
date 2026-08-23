@@ -75,6 +75,17 @@ type BlobStore interface {
 	// Stat returns the size of the object at key; missing objects yield an
 	// error matching ErrNotFound via errors.Is.
 	Stat(ctx context.Context, key string) (int64, error)
+	// StatFingerprint returns the size plus an opaque content-version
+	// fingerprint for the object at key: any overwrite changes it (S3
+	// ETag — content-derived, so an attacker cannot preserve it across a
+	// same-length rewrite; file backends fall back to mtime+size).
+	// Verification flows that hash an object across multiple reads use
+	// fingerprint equality to prove the bytes were not REPLACED between
+	// reads (issue #51, Codex round 77): ranged reads spanning a swap
+	// can splice old-prefix+new-suffix into a digest that matches even
+	// though the stored bytes differ. Missing objects yield an error
+	// matching ErrNotFound via errors.Is.
+	StatFingerprint(ctx context.Context, key string) (int64, string, error)
 	// ReadRange returns exactly the length bytes at offset from the object
 	// at key — a ranged point read, never the whole object (repack fold
 	// selection reads exact object counts from 12-byte pack headers with
@@ -744,6 +755,11 @@ func (b *S3) SignedURL(ctx context.Context, key, method string, expiry time.Dura
 // Stat returns the size of the object at key (ErrNotFound when absent).
 func (b *S3) Stat(ctx context.Context, key string) (int64, error) {
 	return bucketStat(ctx, b.bucket, key)
+}
+
+// StatFingerprint — see BlobStore.
+func (b *S3) StatFingerprint(ctx context.Context, key string) (int64, string, error) {
+	return bucketStatFingerprint(ctx, b.bucket, key)
 }
 
 // ReadRange returns exactly the length bytes at offset from the object at

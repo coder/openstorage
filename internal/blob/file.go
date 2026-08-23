@@ -112,6 +112,11 @@ func (b *File) Stat(ctx context.Context, key string) (int64, error) {
 	return bucketStat(ctx, b.bucket, key)
 }
 
+// StatFingerprint — see BlobStore.
+func (b *File) StatFingerprint(ctx context.Context, key string) (int64, string, error) {
+	return bucketStatFingerprint(ctx, b.bucket, key)
+}
+
 // ReadRange returns exactly the length bytes at offset from the object at
 // key (a seeked local read; ErrNotFound when absent).
 func (b *File) ReadRange(ctx context.Context, key string, offset, length int64) ([]byte, error) {
@@ -193,6 +198,27 @@ func bucketStat(ctx context.Context, bucket *gcblob.Bucket, key string) (int64, 
 		return 0, fmt.Errorf("stat %s: %w", key, err)
 	}
 	return attrs.Size, nil
+}
+
+// bucketStatFingerprint is the single StatFingerprint implementation for
+// gocloud-backed BlobStores: the driver ETag when present (content-derived
+// on S3), else an mtime+size fallback (file backends; local-mode
+// overwrites bump mtime). The fingerprint is OPAQUE — callers may only
+// compare for equality.
+func bucketStatFingerprint(ctx context.Context, bucket *gcblob.Bucket, key string) (int64, string, error) {
+	assertf(bucket != nil && key != "", "bucketStatFingerprint(%q)", key)
+	attrs, err := bucket.Attributes(ctx, key)
+	if err != nil {
+		if gcerrors.Code(err) == gcerrors.NotFound {
+			return 0, "", fmt.Errorf("stat fingerprint %s: %w", key, ErrNotFound)
+		}
+		return 0, "", fmt.Errorf("stat fingerprint %s: %w", key, err)
+	}
+	fp := attrs.ETag
+	if fp == "" {
+		fp = fmt.Sprintf("mt:%d-%d", attrs.ModTime.UnixNano(), attrs.Size)
+	}
+	return attrs.Size, fp, nil
 }
 
 // bucketReadRange reads exactly [offset, offset+length) from the object at

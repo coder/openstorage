@@ -591,8 +591,8 @@ func TestLFSAdoption_EvictedParkedLeaseIsNotReleased(t *testing.T) {
 	}
 	h := sha256.New()
 	h.Write([]byte("prefix"))
-	srv.saveLFSVerifyResume(keyA, 10, 6, h, ownerA)
-	srv.saveLFSVerifyResume(keyB, 10, 6, h, ownerB) // cap 1: evicts A's entry
+	srv.saveLFSVerifyResume(keyA, 10, 6, "fp", h, ownerA)
+	srv.saveLFSVerifyResume(keyB, 10, 6, "fp", h, ownerB) // cap 1: evicts A's entry
 	// Give any (buggy) async release a chance to land before asserting.
 	time.Sleep(200 * time.Millisecond)
 	if again, _, err := st.TryAdoptionClaim(ctx, lfsTestRepoID, keyA); err != nil || again {
@@ -660,8 +660,67 @@ func TestLFSAdoption_CompletedHashSurvivesRegistrationFailure(t *testing.T) {
 	}
 	bl.mu.Lock()
 	defer bl.mu.Unlock()
-	if want := (len(legacy) + 3) / 4; len(bl.reads) != want {
-		t.Fatalf("%d ranged reads across both attempts (offsets: %v), want %d — a completed hash must not replay for a registration retry", len(bl.reads), bl.reads, want)
+	// Attempt 1 read every chunk; attempt 2 re-read ONLY the final chunk
+	// (the digest over exactly size bytes is always re-checked before the
+	// registration — Codex round 77 — but the completed prefix is not).
+	if want := (len(legacy)+3)/4 + 1; len(bl.reads) != want {
+		t.Fatalf("%d ranged reads across both attempts (offsets: %v), want %d — a registration retry must re-read only the final chunk", len(bl.reads), bl.reads, want)
+	}
+	zeroReads := 0
+	for _, off := range bl.reads {
+		if off == 0 {
+			zeroReads++
+		}
+	}
+	if zeroReads != 1 {
+		t.Fatalf("offset 0 read %d times (reads: %v), want exactly 1 — the completed prefix must not replay", zeroReads, bl.reads)
+	}
+}
+
+// TestLFSAdoption_RegistrationRetryReverifiesReplacedBlob (Codex round
+// 77): the round-76 completed-hash memo trusted SIZE alone. During a
+// v0.1.0 rolling upgrade a still-valid legacy presigned PUT can overwrite
+// the rowless key with different bytes of the SAME length between the
+// failed registration and the retry — a memo that skips the digest then
+// registers the forgery as verified content, and adopted objects never
+// re-verify. The retry may skip the completed prefix, but it must always
+// re-check the full digest over exactly size bytes before registering.
+func TestLFSAdoption_RegistrationRetryReverifiesReplacedBlob(t *testing.T) {
+	ctx := context.Background()
+	oldChunk := lfsStagingChunk
+	lfsStagingChunk = 4
+	t.Cleanup(func() { lfsStagingChunk = oldChunk })
+
+	srv, st, mint := newLFSQuotaServer(t, 0, time.Hour)
+	tok := mint(auth.ScopeGitWrite)
+	legacy := []byte("legacy 12b!!")
+	oid := sha256Hex(legacy)
+	key := blob.LFSKey(lfsTestRepoID, oid)
+	if err := srv.Blob.UploadFile(ctx, key, writeTempFile(t, legacy)); err != nil {
+		t.Fatal(err)
+	}
+	srv.Store = &failOnceRegisterStore{RefStore: srv.Store}
+
+	// Attempt 1: the hash completes, the registration fails.
+	resp := decodeBatch(t, doLFS(t, srv, http.MethodPost, lfsBatchPath, "basic:"+tok,
+		batchBody("upload", oid, int64(len(legacy)))))
+	if resp.Objects[0].Error == nil {
+		t.Fatalf("adoption with failed registration reported stored: %+v", resp.Objects[0])
+	}
+	// The still-valid legacy presigned PUT swaps in same-length forged
+	// bytes while the completed verification is parked.
+	forged := []byte("forged 12b!!")
+	if len(forged) != len(legacy) {
+		t.Fatal("fixture: forged bytes must match the legacy length")
+	}
+	if err := srv.Blob.UploadFile(ctx, key, writeTempFile(t, forged)); err != nil {
+		t.Fatal(err)
+	}
+	// Attempt 2 must NOT register the forgery as verified content.
+	decodeBatch(t, doLFS(t, srv, http.MethodPost, lfsBatchPath, "basic:"+tok,
+		batchBody("upload", oid, int64(len(legacy)))))
+	if has, err := st.HasLFSObject(ctx, lfsTestRepoID, key); err != nil || has {
+		t.Fatalf("HasLFSObject after same-size replacement = (%v, %v), want unregistered — the retry skipped the digest re-check", has, err)
 	}
 }
 
@@ -1863,9 +1922,10 @@ func TestLFSAdoption_PostRegistrationRecheckIsBounded(t *testing.T) {
 	if err := srv.Blob.UploadFile(context.Background(), key, writeTempFile(t, legacy)); err != nil {
 		t.Fatal(err)
 	}
-	// Calls: 1 = batch handler Stat, 2 = verification Stat; 3 = the
-	// post-registration recheck, which wedges.
-	srv.Blob = &wedgedStatBlob{BlobStore: srv.Blob, after: 3}
+	// Calls: 1 = batch handler Stat; 2 = the post-registration recheck,
+	// which wedges. (Verification's start/end stats go through
+	// StatFingerprint — round 77 — which this wrapper passes through.)
+	srv.Blob = &wedgedStatBlob{BlobStore: srv.Blob, after: 2}
 
 	start := time.Now()
 	resp := decodeBatch(t, doLFS(t, srv, http.MethodPost, lfsBatchPath, "basic:"+tok,

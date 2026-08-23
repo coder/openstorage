@@ -780,7 +780,7 @@ func (s *Server) adoptLFSObject(ctx context.Context, repoID, key, oid string) er
 	// live backend COMPLETES and registers, making the work truly
 	// once-per-object, while a wedged backend still frees the op slot
 	// and verify buffer within one chunk window.
-	verifiedSize, err := s.verifyStoredLFSObject(context.WithoutCancel(ctx), repoID, key, oid, claimOwner)
+	verifiedSize, pen, err := s.verifyStoredLFSObject(context.WithoutCancel(ctx), repoID, key, oid, claimOwner)
 	if err != nil {
 		if !errors.Is(err, errLFSContentMismatch) {
 			return err
@@ -836,11 +836,19 @@ func (s *Server) adoptLFSObject(ctx context.Context, repoID, key, oid string) er
 	defer regCancel()
 	if err := s.Store.RegisterAdoptedLFSObject(regCtx, repoID, key, verifiedSize); err != nil {
 		// The hash COMPLETED — only the idempotent registration failed
-		// (Codex round 76). Park the lease with a completed-verification
-		// memo: the retry skips straight back to this transaction instead
-		// of re-downloading the whole object, so a transiently contended
-		// ref store cannot amplify backend reads of large objects.
-		s.saveLFSVerifiedResume(key, verifiedSize, claimOwner)
+		// (Codex round 76). Park the lease with the hash's PENULTIMATE
+		// midstate: the retry re-reads just the final chunk instead of
+		// the whole object, so a transiently contended ref store cannot
+		// amplify backend reads — yet it still re-checks the full digest
+		// before registering (Codex round 77: a completed memo that
+		// trusted size alone would register same-length forged bytes a
+		// still-valid legacy presigned PUT swapped in mid-park). Nil for
+		// single-chunk objects: their full re-read is one chunk, and the
+		// released lease lets any replica pick that up.
+		if pen != nil {
+			pen.owner = claimOwner
+			s.putLFSVerifyResume(key, *pen)
+		}
 		return err
 	}
 	s.invalidateUsageFloor(repoID)
@@ -886,12 +894,18 @@ func (s *Server) adoptLFSObject(ctx context.Context, repoID, key, oid string) er
 // as a mismatch (a prefix of different content) — the same safe path as
 // any corrupt legacy blob; the digest covering exactly size bytes is what
 // makes the returned count trustworthy.
-func (s *Server) verifyStoredLFSObject(ctx context.Context, repo, key, oid, claimOwner string) (int64, error) {
+// On success it also returns the hash's PENULTIMATE midstate — captured
+// just before the final chunk — so a failed registration can park it
+// (Codex rounds 76+77): the retry then re-reads only the final chunk yet
+// still re-checks the full digest over exactly size bytes before
+// registering. Nil for single-chunk objects, whose full re-read is one
+// chunk anyway.
+func (s *Server) verifyStoredLFSObject(ctx context.Context, repo, key, oid, claimOwner string) (int64, *lfsVerifyResume, error) {
 	sctx, scancel := context.WithTimeout(ctx, lfsProbeTimeout)
-	size, err := s.Blob.Stat(sctx, key)
+	size, fp, err := s.Blob.StatFingerprint(sctx, key)
 	scancel()
 	if err != nil {
-		return 0, fmt.Errorf("stat for verification: %w", err)
+		return 0, nil, fmt.Errorf("stat for verification: %w", err)
 	}
 	// The hash is bounded by its own progress, never the reservation TTL
 	// (Codex security round 56): a TTL-derived cap makes objects slower
@@ -919,7 +933,7 @@ func (s *Server) verifyStoredLFSObject(ctx context.Context, repo, key, oid, clai
 	// repositories' adoptions). Excess adoptions deny transiently like
 	// every budget denial (the client retries, the object is unchanged).
 	if !s.reserveLFSVerifyBuffer(repo) {
-		return 0, errLFSBusy
+		return 0, nil, errLFSBusy
 	}
 	defer s.releaseLFSVerifyBuffer(repo)
 	// Resume rather than replay (Codex round 57): an abort below — chunk
@@ -933,29 +947,22 @@ func (s *Server) verifyStoredLFSObject(ctx context.Context, repo, key, oid, clai
 	// ranges, so total backend reads are bounded by ~one object plus one
 	// lost chunk per abort — monotone progress. The final digest check
 	// stays the correctness authority: resume state is only ever an
-	// accelerant (size-keyed, single-use, evicted on use), and a stale
-	// midstate over a same-size replaced blob at worst yields the
-	// mismatch path, whose guarded delete the concurrent writer's
-	// registration blocks or its writer-verify repairs — the same race
-	// the direct mismatch path already tolerates.
+	// accelerant (single-use, evicted on use) and is BOUND to the blob's
+	// size AND content fingerprint (Codex round 77 hardening the round-57
+	// "at worst the mismatch path" rationale, which was adversarially
+	// wrong: a same-size replacement sharing the true content's tail
+	// splices a stale midstate into a FALSE MATCH) — any replacement
+	// discards the entry and the hash restarts over the current bytes.
 	h := sha256.New()
 	var off int64
-	if r, ok := s.takeLFSVerifyResume(key, size); ok {
-		if r.verified {
-			// A prior attempt fully hashed these bytes and only its
-			// registration failed (Codex round 76): the digest matched
-			// over exactly size bytes — same size re-checked by take —
-			// and the key is content-addressed, so the retry's work is
-			// the registration alone. A replaced blob at a different
-			// size discards the memo (take) and re-verifies in full.
-			return size, nil
-		}
+	if r, ok := s.takeLFSVerifyResume(key, size, fp); ok {
 		if u, uok := h.(encoding.BinaryUnmarshaler); uok && u.UnmarshalBinary(r.state) == nil {
 			off = r.off
 		} else {
 			h = sha256.New() // defensive: never hash on a half-restored state
 		}
 	}
+	var pen *lfsVerifyResume
 	lastRenew := time.Now()
 	for off < size {
 		// The fleet-wide claim must stay live for the hash's whole
@@ -979,9 +986,9 @@ func (s *Server) verifyStoredLFSObject(ctx context.Context, repo, key, oid, clai
 				// — no other replica restarts from zero, and this
 				// replica's next attempt renews the token and resumes.
 				if off > 0 {
-					s.saveLFSVerifyResume(key, size, off, h, claimOwner)
+					s.saveLFSVerifyResume(key, size, off, fp, h, claimOwner)
 				}
-				return 0, fmt.Errorf("renew adoption claim: %w", rerr)
+				return 0, nil, fmt.Errorf("renew adoption claim: %w", rerr)
 			}
 			if !renewed {
 				// Lease definitively lost (expired and taken over):
@@ -989,13 +996,27 @@ func (s *Server) verifyStoredLFSObject(ctx context.Context, repo, key, oid, clai
 				// local-only — parking a dead token would skip the
 				// release of a lease this process no longer holds.
 				if off > 0 {
-					s.saveLFSVerifyResume(key, size, off, h, "")
+					s.saveLFSVerifyResume(key, size, off, fp, h, "")
 				}
-				return 0, errLFSBusy
+				return 0, nil, errLFSBusy
 			}
 			lastRenew = time.Now()
 		}
 		n := min(lfsStagingChunk, size-off)
+		if off > 0 && off+n == size {
+			// Capture the midstate BEFORE the final chunk (Codex round
+			// 77): a failed registration parks THIS, never a completed
+			// "trust the size" memo — the retry re-reads one chunk and
+			// re-checks the full digest. Like every resume entry it is
+			// fingerprint-bound, so bytes a still-valid legacy presigned
+			// PUT swapped in (same length, v0.1.0 rolling upgrade) while
+			// the park waited discard it and re-verify in full.
+			if m, mok := h.(encoding.BinaryMarshaler); mok {
+				if st, serr := m.MarshalBinary(); serr == nil {
+					pen = &lfsVerifyResume{size: size, off: off, state: st, fp: fp}
+				}
+			}
+		}
 		cctx, ccancel := context.WithTimeout(vctx, lfsVerifyChunkTimeout)
 		chunk, err := s.Blob.ReadRange(cctx, key, off, n)
 		ccancel()
@@ -1003,17 +1024,35 @@ func (s *Server) verifyStoredLFSObject(ctx context.Context, repo, key, oid, clai
 			// The lease is still this process's: park it with the
 			// progress (Codex round 75) so the retry resumes here.
 			if off > 0 {
-				s.saveLFSVerifyResume(key, size, off, h, claimOwner)
+				s.saveLFSVerifyResume(key, size, off, fp, h, claimOwner)
 			}
-			return 0, fmt.Errorf("read for verification [%d,%d): %w", off, off+n, err)
+			return 0, nil, fmt.Errorf("read for verification [%d,%d): %w", off, off+n, err)
 		}
 		h.Write(chunk)
 		off += n
 	}
-	if hex.EncodeToString(h.Sum(nil)) != oid {
-		return 0, errLFSContentMismatch
+	// NEITHER verdict below is trustworthy if the object was REPLACED
+	// while we hashed (Codex round 77): ranged reads spanning a swap can
+	// splice old-prefix+new-suffix into a digest that MATCHES oid even
+	// though the stored bytes differ — a still-valid legacy presigned PUT
+	// (v0.1.0 rolling upgrade) can write same-length forged bytes sharing
+	// the true content's tail — and a spliced MISMATCH would
+	// guarded-delete bytes this hash never covered. A moved fingerprint
+	// therefore fails transiently: the retry hashes the current bytes,
+	// with any parked resume discarded by its own fingerprint binding.
+	ectx, ecancel := context.WithTimeout(ctx, lfsProbeTimeout)
+	_, endFP, err := s.Blob.StatFingerprint(ectx, key)
+	ecancel()
+	if err != nil {
+		return 0, nil, fmt.Errorf("fingerprint after verification: %w", err)
 	}
-	return size, nil
+	if endFP != fp {
+		return 0, nil, fmt.Errorf("object %s replaced during verification: %w", key, errLFSBusy)
+	}
+	if hex.EncodeToString(h.Sum(nil)) != oid {
+		return 0, nil, errLFSContentMismatch
+	}
+	return size, pen, nil
 }
 
 // lfsRepairCoverSuffix — see ref.RepairCoverSuffix (shared with the pack
@@ -1043,6 +1082,14 @@ type lfsVerifyResume struct {
 	size  int64
 	off   int64
 	state []byte
+	// fp is the blob's content-version fingerprint when the hashed
+	// prefix was read (Codex round 77): a resume is only valid against
+	// the SAME stored bytes — a midstate over replaced bytes could
+	// splice old-prefix+new-suffix into a false digest match (or a
+	// false mismatch that guarded-deletes unverified bytes). take
+	// discards entries whose fingerprint moved; the retry re-hashes the
+	// current bytes in full.
+	fp string
 	// owner, when non-empty, is the fleet adoption-claim lease PARKED
 	// with this progress (Codex round 75): the abort deliberately kept
 	// the claim held, because the midstate lives only in this process —
@@ -1052,13 +1099,6 @@ type lfsVerifyResume struct {
 	// renews the token and resumes; a parked lease nobody retries
 	// expires via ref.AdoptionClaimTTL exactly like a crashed winner's.
 	owner string
-	// verified marks a COMPLETED verification (off == size, no midstate)
-	// whose registration failed (Codex round 76): the digest matched
-	// over exactly size bytes and the key is content-addressed, so the
-	// retry's remaining work is the idempotent registration alone —
-	// re-reading the object would amplify backend reads every time the
-	// ref store is transiently contended at commit time.
-	verified bool
 }
 
 // lfsMaxVerifyResumes bounds the resume cache (eviction beyond it, see
@@ -1070,7 +1110,7 @@ var lfsMaxVerifyResumes = 128
 // the next attempt can continue after the completed ranges. A non-empty
 // owner parks the fleet adoption-claim lease with the progress (Codex
 // round 75) — pass "" when the lease was definitively lost or never held.
-func (s *Server) saveLFSVerifyResume(key string, size, off int64, h hash.Hash, owner string) {
+func (s *Server) saveLFSVerifyResume(key string, size, off int64, fp string, h hash.Hash, owner string) {
 	assertf(off > 0 && off < size, "saveLFSVerifyResume(%q): off %d, size %d", key, off, size)
 	m, ok := h.(encoding.BinaryMarshaler)
 	if !ok {
@@ -1080,15 +1120,7 @@ func (s *Server) saveLFSVerifyResume(key string, size, off int64, h hash.Hash, o
 	if err != nil {
 		return
 	}
-	s.putLFSVerifyResume(key, lfsVerifyResume{size: size, off: off, state: state, owner: owner})
-}
-
-// saveLFSVerifiedResume parks a COMPLETED verification whose registration
-// failed (Codex round 76): the retry consumes it to skip straight back to
-// the idempotent registration instead of re-reading the whole object.
-func (s *Server) saveLFSVerifiedResume(key string, size int64, owner string) {
-	assertf(size >= 0, "saveLFSVerifiedResume(%q): size %d", key, size)
-	s.putLFSVerifyResume(key, lfsVerifyResume{size: size, off: size, verified: true, owner: owner})
+	s.putLFSVerifyResume(key, lfsVerifyResume{size: size, off: off, state: state, fp: fp, owner: owner})
 }
 
 // putLFSVerifyResume inserts one resume entry, evicting beyond the cache
@@ -1188,9 +1220,11 @@ func (s *Server) releaseAdoptionClaim(key, owner string) {
 }
 
 // takeLFSVerifyResume claims (and removes — single use, re-saved on the
-// next abort) the key's saved progress. A size change means the blob was
-// replaced since the abort: the state is discarded and the hash restarts.
-func (s *Server) takeLFSVerifyResume(key string, size int64) (lfsVerifyResume, bool) {
+// next abort) the key's saved progress. A size or FINGERPRINT change means
+// the blob was replaced since the abort (Codex round 77 — same-length
+// replacement is the adversarial case): the state is discarded and the
+// hash restarts over the current bytes.
+func (s *Server) takeLFSVerifyResume(key string, size int64, fp string) (lfsVerifyResume, bool) {
 	s.lfsVerifyResumeMu.Lock()
 	defer s.lfsVerifyResumeMu.Unlock()
 	r, ok := s.lfsVerifyResumes[key]
@@ -1198,7 +1232,7 @@ func (s *Server) takeLFSVerifyResume(key string, size int64) (lfsVerifyResume, b
 		return lfsVerifyResume{}, false
 	}
 	delete(s.lfsVerifyResumes, key)
-	if r.size != size {
+	if r.size != size || r.fp != fp {
 		return lfsVerifyResume{}, false
 	}
 	return r, true
