@@ -11,26 +11,30 @@ import (
 )
 
 // PurgeableRepos — see the PG twin. deleted_at is stored as unixnano.
-func (s *SQLite) PurgeableRepos(ctx context.Context, deletedBefore time.Time, limit int) ([]string, error) {
+func (s *SQLite) PurgeableRepos(ctx context.Context, deletedBefore time.Time, after PurgeCandidate, limit int) ([]PurgeCandidate, error) {
 	assertf(limit > 0, "PurgeableRepos: non-positive limit %d", limit)
+	afterAt, afterID := purgeCursorArgs(after)
 	rows, err := s.db.QueryContext(ctx, `
-SELECT repo_id FROM repos
+SELECT repo_id, deleted_at FROM repos
 WHERE deleted_at IS NOT NULL AND deleted_at <= ? AND purged_at IS NULL
+  AND (deleted_at, repo_id) > (?, ?)
 ORDER BY deleted_at ASC, repo_id ASC
-LIMIT ?`, deletedBefore.UnixNano(), limit)
+LIMIT ?`, deletedBefore.UnixNano(), afterAt.UnixNano(), afterID, limit)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = rows.Close() }()
-	var ids []string
+	var out []PurgeCandidate
 	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
+		var c PurgeCandidate
+		var nanos int64
+		if err := rows.Scan(&c.RepoID, &nanos); err != nil {
 			return nil, err
 		}
-		ids = append(ids, id)
+		c.DeletedAt = time.Unix(0, nanos).UTC()
+		out = append(out, c)
 	}
-	return ids, rows.Err()
+	return out, rows.Err()
 }
 
 // RepoPurgeState — see the PG twin.

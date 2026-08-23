@@ -15,9 +15,18 @@ import (
 // (jobs.RepoPurgeMeta mirrors this).
 type purgeMetaStore interface {
 	Backend
-	PurgeableRepos(ctx context.Context, deletedBefore time.Time, limit int) ([]string, error)
+	PurgeableRepos(ctx context.Context, deletedBefore time.Time, after PurgeCandidate, limit int) ([]PurgeCandidate, error)
 	RepoPurgeState(ctx context.Context, repoID string) (PurgeState, bool, error)
 	PurgeRepoMeta(ctx context.Context, repoID string) error
+}
+
+// candidateIDs projects a candidate list onto repo IDs.
+func candidateIDs(cands []PurgeCandidate) []string {
+	ids := make([]string, 0, len(cands))
+	for _, c := range cands {
+		ids = append(ids, c.RepoID)
+	}
+	return ids
 }
 
 func TestRepoPurgeMetaSeams(t *testing.T) { runBackends(t, testRepoPurgeMetaSeams) }
@@ -71,22 +80,33 @@ func testRepoPurgeMetaSeams(t *testing.T, s Backend) {
 
 	// PurgeableRepos: a future cutoff sees both soft-deleted repos (never
 	// the live one); a past cutoff sees none (within-retention repos are
-	// untouched); limit=1 returns exactly the oldest deletion.
-	ids, err := ps.PurgeableRepos(ctx, time.Now().Add(time.Hour), 10)
+	// untouched); limit=1 returns exactly the oldest deletion; the keyset
+	// cursor resumes strictly after a candidate and yields nothing past
+	// the end (the caller's rotation wraps on that).
+	cands, err := ps.PurgeableRepos(ctx, time.Now().Add(time.Hour), PurgeCandidate{}, 10)
 	if err != nil {
 		t.Fatalf("PurgeableRepos(future): %v", err)
 	}
+	ids := candidateIDs(cands)
 	if !slices.Contains(ids, delA.RepoID) || !slices.Contains(ids, delB.RepoID) {
 		t.Fatalf("PurgeableRepos(future) = %v, want both %s and %s", ids, delA.RepoID, delB.RepoID)
 	}
 	if slices.Contains(ids, live.RepoID) {
 		t.Fatalf("PurgeableRepos listed the live repo: %v", ids)
 	}
-	if ids, err := ps.PurgeableRepos(ctx, time.Now().Add(-time.Hour), 10); err != nil || len(ids) != 0 {
-		t.Fatalf("PurgeableRepos(past) = %v err=%v, want empty", ids, err)
+	if got, err := ps.PurgeableRepos(ctx, time.Now().Add(-time.Hour), PurgeCandidate{}, 10); err != nil || len(got) != 0 {
+		t.Fatalf("PurgeableRepos(past) = %v err=%v, want empty", got, err)
 	}
-	if ids, err := ps.PurgeableRepos(ctx, time.Now().Add(time.Hour), 1); err != nil || len(ids) != 1 {
-		t.Fatalf("PurgeableRepos(limit 1) = %v err=%v, want exactly one", ids, err)
+	first, err := ps.PurgeableRepos(ctx, time.Now().Add(time.Hour), PurgeCandidate{}, 1)
+	if err != nil || len(first) != 1 || first[0] != cands[0] {
+		t.Fatalf("PurgeableRepos(limit 1) = %v err=%v, want exactly %v", first, err, cands[0])
+	}
+	rest, err := ps.PurgeableRepos(ctx, time.Now().Add(time.Hour), first[0], 10)
+	if err != nil || len(rest) != len(cands)-1 || slices.Contains(candidateIDs(rest), first[0].RepoID) {
+		t.Fatalf("PurgeableRepos(after first) = %v err=%v, want the remaining %d", rest, err, len(cands)-1)
+	}
+	if past, err := ps.PurgeableRepos(ctx, time.Now().Add(time.Hour), cands[len(cands)-1], 10); err != nil || len(past) != 0 {
+		t.Fatalf("PurgeableRepos(after last) = %v err=%v, want empty", past, err)
 	}
 
 	// RepoPurgeState: live vs deleted vs absent.
@@ -132,10 +152,11 @@ func testRepoPurgeMetaSeams(t *testing.T, s Backend) {
 		t.Fatalf("PurgeRepoMeta rerun: %v", err)
 	}
 	// Purged rows leave the background queue permanently.
-	ids, err = ps.PurgeableRepos(ctx, time.Now().Add(time.Hour), 10)
+	cands, err = ps.PurgeableRepos(ctx, time.Now().Add(time.Hour), PurgeCandidate{}, 10)
 	if err != nil {
 		t.Fatalf("PurgeableRepos after purge: %v", err)
 	}
+	ids = candidateIDs(cands)
 	if slices.Contains(ids, delA.RepoID) {
 		t.Fatalf("purged repo still purgeable: %v", ids)
 	}

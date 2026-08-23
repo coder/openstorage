@@ -75,9 +75,10 @@ type RepoPurgeRegistry interface {
 // eligibility reads and the final metadata deletion. Same concrete-backend
 // discipline as RepoPurgeRegistry.
 type RepoPurgeMeta interface {
-	// PurgeableRepos lists up to limit repo IDs soft-deleted at or before
-	// deletedBefore, oldest first.
-	PurgeableRepos(ctx context.Context, deletedBefore time.Time, limit int) ([]string, error)
+	// PurgeableRepos lists up to limit purge candidates soft-deleted at or
+	// before deletedBefore and not yet purged, (deleted_at, repo_id)
+	// ascending, strictly after the cursor (zero = start).
+	PurgeableRepos(ctx context.Context, deletedBefore time.Time, after meta.PurgeCandidate, limit int) ([]meta.PurgeCandidate, error)
 	// RepoPurgeState returns the repo row plus its purge tombstone
 	// (found=false when absent; Repo.DeletedAt==nil when live; PurgedAt
 	// non-nil once a purge completed).
@@ -155,6 +156,14 @@ type RepoPurger struct {
 	retention time.Duration
 	logger    *slog.Logger
 	now       func() time.Time // injectable clock for tests
+	// cursor is the last candidate a PurgeExpired pass attempted,
+	// successful or not: each pass resumes strictly after it and wraps to
+	// the oldest pending repo on exhaustion, so a batch of persistently
+	// failing repos (which stay in the eligible set) cannot monopolize
+	// every pass and starve later deletions (PR #105 round 9). In-memory
+	// per process — a restart resumes from the oldest, which is correct,
+	// just not rotated.
+	cursor meta.PurgeCandidate
 }
 
 // NewRepoPurger builds a RepoPurger over the sweeper (blob disposal
@@ -190,26 +199,38 @@ func (p *RepoPurger) PurgeExpired(ctx context.Context) (PurgeRunReport, error) {
 		}
 	}
 	cutoff := p.now().Add(-max(p.retention, MinRepoPurgeAge))
-	ids, err := p.meta.PurgeableRepos(ctx, cutoff, purgeBatchLimit)
+	batch, err := p.meta.PurgeableRepos(ctx, cutoff, p.cursor, purgeBatchLimit)
 	if err != nil {
 		return report, fmt.Errorf("repo purge: list purgeable repos: %w", err)
 	}
-	report.Eligible = len(ids)
+	if len(batch) == 0 && p.cursor != (meta.PurgeCandidate{}) {
+		// The rotation wrapped past the end of the eligible set: resume
+		// from the oldest pending repo (deferred/failed repos from
+		// earlier passes get their retry here).
+		p.cursor = meta.PurgeCandidate{}
+		if batch, err = p.meta.PurgeableRepos(ctx, cutoff, p.cursor, purgeBatchLimit); err != nil {
+			return report, fmt.Errorf("repo purge: list purgeable repos: %w", err)
+		}
+	}
+	report.Eligible = len(batch)
 	var errs boundedErrs
-	for _, id := range ids {
+	for _, cand := range batch {
 		if ctx.Err() != nil {
 			errs.add(ctx.Err())
 			break
 		}
-		rep, err := p.purgeRepo(ctx, id)
+		// Advance the rotation before attempting: failures must not pin
+		// the cursor, or a failing batch would monopolize every pass.
+		p.cursor = cand
+		rep, err := p.purgeRepo(ctx, cand.RepoID)
 		if err != nil {
 			report.Failed++
-			errs.add(fmt.Errorf("repo purge %s: %w", id, err))
+			errs.add(fmt.Errorf("repo purge %s: %w", cand.RepoID, err))
 			continue
 		}
 		report.Purged++
 		p.logger.Info("repo purge: reclaimed soft-deleted repository",
-			"repo", id, "refs_dropped", rep.RefsDropped,
+			"repo", cand.RepoID, "refs_dropped", rep.RefsDropped,
 			"packs_retired", rep.PacksRetired, "lfs_dropped", rep.LFSDropped,
 			"blobs_reaped", rep.BlobsReaped, "bytes_reaped", rep.BytesReaped,
 			"rows_purged", rep.RowsPurged)
@@ -330,8 +351,11 @@ func (p *RepoPurger) purgeRepo(ctx context.Context, repoID string) (RepoPurgeRep
 }
 
 // rescanPurged reaps straggler blobs of an already-completed purge — the
-// same prefix walk as phase 4, with the row phases (provably done, fenced)
-// skipped.
+// same prefix walk as phase 4, with the tombstoning phases (provably done,
+// fenced) skipped — and repeats the ledger cleanup: TTL'd rows a pre-delete
+// writer minted through paths outside the fence's reach (LFS adoption
+// claims) must not outlive a purge re-run on deployments with sweeping
+// disabled (PR #105 round 9).
 func (p *RepoPurger) rescanPurged(ctx context.Context, repoID string, rep *RepoPurgeReport) error {
 	for _, prefix := range []string{
 		blob.PackPrefix(repoID),
@@ -341,6 +365,10 @@ func (p *RepoPurger) rescanPurged(ctx context.Context, repoID string, rep *RepoP
 		if err := p.reapPrefix(ctx, prefix, rep); err != nil {
 			return err
 		}
+	}
+	var err error
+	if rep.RowsPurged, err = p.registry.PurgeRepoLedger(ctx, blob.QuotaRepoGroup(repoID)); err != nil {
+		return fmt.Errorf("purge ledger rows: %w", err)
 	}
 	return nil
 }

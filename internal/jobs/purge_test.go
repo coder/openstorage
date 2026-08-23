@@ -269,9 +269,15 @@ func TestPurgedRepoStragglers(t *testing.T) {
 	}
 
 	// Path 2: a purge-repo re-run rescans and reaps a fresh straggler
-	// immediately (no age threshold — rows are provably gone).
+	// immediately (no age threshold — rows are provably gone), and
+	// repeats the ledger cleanup: an adoption-claim reservation minted by
+	// an in-flight pre-delete writer AFTER completion (the one ledger
+	// write outside the fence's reach) must not survive the re-run.
 	straggler2 := blob.PackKey(repo.RepoID, "late2")
 	f.upload(straggler2, "second straggler")
+	if claimed, _, err := f.store.TryAdoptionClaim(ctx, repo.RepoID, blob.LFSKey(repo.RepoID, strings.Repeat("d", 64))); err != nil || !claimed {
+		t.Fatalf("TryAdoptionClaim = (%v, %v), want a claim row", claimed, err)
+	}
 	rep, err := purger.PurgeRepo(ctx, repo.RepoID)
 	if err != nil {
 		t.Fatalf("rescan PurgeRepo: %v", err)
@@ -279,6 +285,53 @@ func TestPurgedRepoStragglers(t *testing.T) {
 	if rep.BlobsReaped != 1 || f.exists(straggler2) {
 		t.Fatalf("rescan reaped %d (blob present=%v), want the straggler gone", rep.BlobsReaped, f.exists(straggler2))
 	}
+	if rep.RowsPurged == 0 {
+		t.Fatalf("rescan purged %d ledger rows, want the leaked adoption claim gone", rep.RowsPurged)
+	}
+}
+
+func TestPurgeExpired_RotatesPastFailingRepos(t *testing.T) {
+	// A persistently failing repo stays purgeable forever; the rotating
+	// cursor must let later deletions purge anyway instead of the failing
+	// batch monopolizing every pass (PR #105 round 9).
+	oldLimit := purgeBatchLimit
+	purgeBatchLimit = 1
+	t.Cleanup(func() { purgeBatchLimit = oldLimit })
+
+	f := newPurgeFixture(t)
+	ctx := context.Background()
+	// bad deletes first (oldest), so every pass's first batch would be
+	// [bad] without rotation.
+	bad := f.seedRepo("https://example.com/bad.git")
+	f.metaNow = func() time.Time { return time.Now().Add(-4 * time.Hour) }
+	f.softDelete(bad.URL)
+	good := f.seedRepo("https://example.com/good.git")
+	f.metaNow = func() time.Time { return time.Now().Add(-3 * time.Hour) }
+	f.softDelete(good.URL)
+	f.metaNow = time.Now
+
+	sweeper := f.purgeAwareSweeper()
+	hooks := &purgeRegistryHooks{RepoPurgeRegistry: f.store.(RepoPurgeRegistry)}
+	purger := NewRepoPurger(sweeper, hooks, f.meta.(RepoPurgeMeta), time.Hour, slog.New(slog.DiscardHandler))
+
+	// Pass 1 attempts bad (oldest) and fails; the cursor advances anyway.
+	hooks.retireFailRepo = bad.RepoID
+	if report, err := purger.PurgeExpired(ctx); err == nil || report.Failed != 1 || report.Purged != 0 {
+		t.Fatalf("pass 1 = %+v err=%v, want the failing repo attempted", report, err)
+	}
+	// Pass 2 resumes after bad and purges good despite bad still failing.
+	report, err := purger.PurgeExpired(ctx)
+	if err != nil || report.Purged != 1 {
+		t.Fatalf("pass 2 = %+v err=%v, want the later repo purged", report, err)
+	}
+	f.assertPurged(good.RepoID)
+	// Pass 3 wraps to the oldest pending repo: bad gets its retry (and
+	// succeeds now that the fault is gone).
+	hooks.retireFailRepo = ""
+	if report, err := purger.PurgeExpired(ctx); err != nil || report.Purged != 1 {
+		t.Fatalf("pass 3 = %+v err=%v, want the wrapped retry to purge", report, err)
+	}
+	f.assertPurged(bad.RepoID)
 }
 
 func TestPurgeExpired_RespectsRetention(t *testing.T) {
@@ -354,12 +407,16 @@ func TestPurgeRepo_Refusals(t *testing.T) {
 // late-writer hooks.
 type purgeRegistryHooks struct {
 	RepoPurgeRegistry
-	retireErr   error  // one-shot RetireRepoPacks failure
-	ledgerErr   error  // one-shot PurgeRepoLedger failure
-	afterRetire func() // one-shot post-retire hook (late writer)
+	retireErr      error  // one-shot RetireRepoPacks failure
+	retireFailRepo string // persistent RetireRepoPacks failure for this base repo
+	ledgerErr      error  // one-shot PurgeRepoLedger failure
+	afterRetire    func() // one-shot post-retire hook (late writer)
 }
 
 func (h *purgeRegistryHooks) RetireRepoPacks(ctx context.Context, group []string) (int64, error) {
+	if h.retireFailRepo != "" && group[0] == h.retireFailRepo {
+		return 0, errors.New("persistent failure")
+	}
 	if err := h.retireErr; err != nil {
 		h.retireErr = nil
 		return 0, err

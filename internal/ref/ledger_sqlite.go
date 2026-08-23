@@ -27,6 +27,12 @@ func (s *SQLite) ReservePackBytes(ctx context.Context, group []string, packs []P
 		return ReserveDecision{}, fmt.Errorf("reserve pack bytes begin: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+	// Purge fence — see the PG twin (issue #52, PR #105 round 9).
+	if fenced, err := repoPurgeFencedSQLite(ctx, tx, group[0]); err != nil {
+		return ReserveDecision{}, err
+	} else if fenced {
+		return ReserveDecision{}, fmt.Errorf("reserve pack bytes %s: %w", group[0], ErrRepoPurged)
+	}
 	// Self-healing GC for expired rows — see the PG twin's rationale.
 	if _, err := tx.ExecContext(ctx,
 		`DELETE FROM pack_reservations WHERE repo = ? AND created_at <= `+sqliteEpochMS+` - ?

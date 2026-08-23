@@ -39,31 +39,55 @@ type PurgeState struct {
 	PurgedAt *time.Time
 }
 
-// PurgeableRepos returns up to limit repo IDs soft-deleted at or before
-// deletedBefore and not yet purged, oldest deletion first — the background
-// purge pass's work queue. Limit bounds one pass; completed purges leave
-// the eligible set (purged_at set), so the next tick continues where this
-// one stopped.
-func (s *PG) PurgeableRepos(ctx context.Context, deletedBefore time.Time, limit int) ([]string, error) {
+// PurgeCandidate is one purge-queue entry: the repo plus the keyset
+// position its deletion time defines. The zero value doubles as the
+// start-of-queue cursor for PurgeableRepos.
+type PurgeCandidate struct {
+	RepoID    string
+	DeletedAt time.Time
+}
+
+// purgeCursorArgs normalizes an `after` cursor for the keyset comparison:
+// the zero cursor becomes (epoch, ""), strictly below every real deletion
+// timestamp on both backends.
+func purgeCursorArgs(after PurgeCandidate) (time.Time, string) {
+	if after.DeletedAt.IsZero() {
+		return time.Unix(0, 0).UTC(), ""
+	}
+	return after.DeletedAt, after.RepoID
+}
+
+// PurgeableRepos returns up to limit repos soft-deleted at or before
+// deletedBefore and not yet purged, ordered by (deleted_at, repo_id)
+// ascending and strictly after the `after` cursor — the background purge
+// pass's rotating work queue (PR #105 round 9): a batch of persistently
+// failing repos stays in the eligible set, so the caller carries the last
+// attempted candidate as the cursor and wraps on exhaustion; without the
+// cursor, oldest-first alone would let such a batch monopolize every pass
+// and starve the rest of the fleet.
+func (s *PG) PurgeableRepos(ctx context.Context, deletedBefore time.Time, after PurgeCandidate, limit int) ([]PurgeCandidate, error) {
 	assertf(limit > 0, "PurgeableRepos: non-positive limit %d", limit)
+	afterAt, afterID := purgeCursorArgs(after)
 	rows, err := s.pool.Query(ctx, `
-SELECT repo_id FROM repos
+SELECT repo_id, deleted_at FROM repos
 WHERE deleted_at IS NOT NULL AND deleted_at <= $1 AND purged_at IS NULL
+  AND (deleted_at, repo_id) > ($2, $3)
 ORDER BY deleted_at ASC, repo_id ASC
-LIMIT $2`, deletedBefore, limit)
+LIMIT $4`, deletedBefore, afterAt, afterID, limit)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var ids []string
+	var out []PurgeCandidate
 	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
+		var c PurgeCandidate
+		if err := rows.Scan(&c.RepoID, &c.DeletedAt); err != nil {
 			return nil, err
 		}
-		ids = append(ids, id)
+		c.DeletedAt = c.DeletedAt.UTC()
+		out = append(out, c)
 	}
-	return ids, rows.Err()
+	return out, rows.Err()
 }
 
 // RepoPurgeState returns the repo row for purge eligibility checks:

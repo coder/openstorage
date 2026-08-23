@@ -123,6 +123,13 @@ func TestRepoPurgeSeams(t *testing.T) {
 				t.Fatalf("CASRef %s (fenced namespace) = %v, want ErrRepoPurged", cas.tag, err)
 			}
 		}
+		// Quota reservations are fenced too (PR #105 round 9): admission
+		// must fail before a late writer can mint a reservation row that
+		// outlives the purge's ledger cleanup.
+		if _, err := s.ReservePackBytes(ctx, group, []Pack{{ID: "lr", Key: "packs/" + base + "/pack-lr.pack", Size: 1}},
+			NewReservationOwner(), 0, 0, 1<<30, time.Hour); !errors.Is(err, ErrRepoPurged) {
+			t.Fatalf("ReservePackBytes(fenced) = %v, want ErrRepoPurged", err)
+		}
 		if err := s.RegisterPacks(ctx, other, []Pack{{ID: "ok", Key: "packs/" + other + "/pack-ok.pack", Size: 2}}); err != nil {
 			t.Fatalf("control RegisterPacks after fence: %v", err)
 		}

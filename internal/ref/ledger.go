@@ -452,6 +452,15 @@ func (s *PG) ReservePackBytes(ctx context.Context, group []string, packs []Pack,
 		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1), $2)`, group[0], reserveLockClass); err != nil {
 			return err
 		}
+		// Purge fence (issue #52, PR #105 round 9): the lock above is the
+		// one FenceRepoPurge takes, so a reservation for a purge-fenced
+		// repo can never be minted after the purge's ledger cleanup and
+		// leak forever — the writer fails at admission instead.
+		if fenced, err := repoPurgeFencedPG(ctx, tx, group[0]); err != nil {
+			return err
+		} else if fenced {
+			return fmt.Errorf("reserve pack bytes %s: %w", group[0], ErrRepoPurged)
+		}
 		// Self-healing GC (Codex round 5 on #51): expired rows already
 		// stopped gating admission, but they occupy physical rows the
 		// sweeper may never prune (sweeping can be disabled). Pruning this
