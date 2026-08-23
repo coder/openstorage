@@ -76,7 +76,13 @@ const EnvUsageFloor = "CODESTORAGE_GIT_USAGE_FLOOR"
 // sane reservation TTL (which must already exceed the longest plausible
 // upload); a deliberately slow push exceeding it pays one self-listing —
 // no amplification, since the client spends over five minutes per
-// listing it triggers.
+// listing it triggers. The EFFECTIVE bound also never reaches the
+// configured reservation TTL (Codex round 32): an orphan published after
+// the mint stops being counted by the ledger once its reservation
+// expires, so the floor must be young enough to have seen it — and the
+// minted value may itself be one usageCacheTTL stale, so the trusted
+// mint-to-hook age is capped at TTL − usageCacheTTL (operators may
+// configure TTLs below five minutes).
 var hookFloorMaxAge = 5 * time.Minute
 
 // defaultReservationTTL bounds how long a crashed push's reservation keeps
@@ -286,7 +292,12 @@ func hookUsageFloor(ctx context.Context, bl blob.BlobStore, repo string) (int64,
 	if ferr != nil || merr != nil || floor < 0 {
 		return 0, fmt.Errorf("malformed %s=%q", EnvUsageFloor, raw)
 	}
-	if time.Since(time.Unix(mintUnix, 0)) > hookFloorMaxAge {
+	ttl, err := reservationTTL()
+	if err != nil {
+		return 0, err // fail closed, matching the reserve path's own use
+	}
+	maxAge := min(hookFloorMaxAge, ttl-usageCacheTTL)
+	if maxAge <= 0 || time.Since(time.Unix(mintUnix, 0)) > maxAge {
 		return packUsageBytes(ctx, bl, repo)
 	}
 	return floor, nil

@@ -1086,6 +1086,40 @@ func TestLFSPut_OpSlotAcquiredBeforeProbe(t *testing.T) {
 	}
 }
 
+// TestLFSStaging_RepoSlotShareIsolatesRepos (Codex round 32, security):
+// parked bodyless PUTs hold op slots for the idle window, and tokens are
+// repo-scoped — so one repository's writer filling slots must be confined
+// to its own share (lfsMaxRepoStagingOps), never starving other
+// repositories' uploads and adoptions on the replica.
+func TestLFSStaging_RepoSlotShareIsolatesRepos(t *testing.T) {
+	srv, _, mint := newLFSQuotaServer(t, 0, time.Hour)
+	tok := mint(auth.ScopeGitWrite)
+	// The attacker's repository holds its whole share; the node-wide cap
+	// still has plenty of slots left.
+	srv.lfsStagingMu.Lock()
+	srv.lfsRepoStagingOps = map[string]int{lfsTestRepoID: lfsMaxRepoStagingOps}
+	srv.lfsStagingOps = lfsMaxRepoStagingOps
+	srv.lfsStagingMu.Unlock()
+	t.Cleanup(func() {
+		srv.lfsStagingMu.Lock()
+		srv.lfsRepoStagingOps, srv.lfsStagingOps = nil, 0
+		srv.lfsStagingMu.Unlock()
+	})
+
+	// Same repository: denied at its share.
+	content := []byte("same-repo parked slot victim")
+	w := doLFS(t, srv, http.MethodPut, "/"+lfsTestRepoURL+".git/info/lfs/objects/"+sha256Hex(content),
+		"basic:"+tok, string(content))
+	if w.Code != http.StatusTooManyRequests {
+		t.Fatalf("share-exhausted same-repo PUT status = %d, want 429", w.Code)
+	}
+	// A DIFFERENT repository still reserves: the share isolates.
+	if !srv.reserveLFSStaging("repo_other", 0) {
+		t.Fatal("unrelated repository starved by another repository's slot share")
+	}
+	srv.releaseLFSStaging("repo_other", 0)
+}
+
 // wedgedStatBlob blocks Stat until the caller's context expires — the
 // wedged-backend scenario. When after > 0, only the Nth and later Stat
 // calls wedge (earlier ones pass through).

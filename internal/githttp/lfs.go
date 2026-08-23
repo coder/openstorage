@@ -660,10 +660,10 @@ func (s *Server) adoptLFSObject(ctx context.Context, repoID, key, oid string) er
 	// Stat-sized reservation could not bound a concurrently replaced
 	// blob), so it takes only an op slot: the replica-wide concurrency
 	// bound, not staging bytes.
-	if !s.reserveLFSStaging(0) {
+	if !s.reserveLFSStaging(repoID, 0) {
 		return errLFSBusy
 	}
-	defer s.releaseLFSStaging(0)
+	defer s.releaseLFSStaging(repoID, 0)
 	// Bounded like publication (Codex round 17) and DETACHED from the
 	// client (Codex round 31, security): adoption is server-side repair
 	// work. A client canceling mid-verification would abort the ranged
@@ -981,13 +981,13 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target r
 	// tracks the grown total for the single deferred release. (Adoption
 	// briefly takes a second slot of its own — it must hold one on the
 	// batch path too — which only makes the cap more conservative.)
-	if !s.reserveLFSStaging(0) {
+	if !s.reserveLFSStaging(repoID, 0) {
 		w.Header().Set("Retry-After", "10")
 		lfsError(w, http.StatusTooManyRequests, "server LFS staging budget exhausted, retry")
 		return
 	}
 	stagingReserved := int64(0)
-	defer func() { s.releaseLFSStaging(stagingReserved) }()
+	defer func() { s.releaseLFSStaging(repoID, stagingReserved) }()
 	// Dedup before charging (the zero-growth rule): a re-PUT of a stored
 	// object (crash-window retry, concurrent identical upload) adds
 	// nothing — adopt it into the registry and succeed without reading

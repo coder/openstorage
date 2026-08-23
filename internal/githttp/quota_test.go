@@ -341,14 +341,33 @@ func TestHookUsageFloor(t *testing.T) {
 			}
 		})
 	}
-	listingCases := map[string]func() string{
-		"absent-falls-back-to-listing":        func() string { return "" },
-		"stale-floor-falls-back-to-listing":   func() string { return fmt.Sprintf("1234:%d", time.Now().Add(-hookFloorMaxAge-time.Minute).Unix()) },
-		"timestampless-falls-back-to-listing": func() string { return "1234" },
+	listingCases := map[string]struct {
+		raw func() string
+		ttl string
+	}{
+		"absent-falls-back-to-listing":        {raw: func() string { return "" }},
+		"stale-floor-falls-back-to-listing":   {raw: func() string { return fmt.Sprintf("1234:%d", time.Now().Add(-hookFloorMaxAge-time.Minute).Unix()) }},
+		"timestampless-falls-back-to-listing": {raw: func() string { return "1234" }},
+		// Codex round 32: the trusted age never reaches the CONFIGURED
+		// reservation TTL — with a 90s TTL, a 70s-old floor (fresh by the
+		// five-minute default) can no longer see an orphan whose
+		// reservation expired, so it must self-list.
+		"ttl-bounded-age-falls-back-to-listing": {
+			raw: func() string { return fmt.Sprintf("1234:%d", time.Now().Add(-70*time.Second).Unix()) },
+			ttl: "90s",
+		},
+		// A TTL at or below the mint cache's own staleness trusts nothing.
+		"tiny-ttl-always-falls-back-to-listing": {
+			raw: func() string { return fmt.Sprintf("1234:%d", time.Now().Unix()) },
+			ttl: "30s",
+		},
 	}
-	for name, mkRaw := range listingCases {
+	for name, tc := range listingCases {
 		t.Run(name, func(t *testing.T) {
-			raw := mkRaw()
+			if tc.ttl != "" {
+				t.Setenv(EnvPackReservationTTL, tc.ttl)
+			}
+			raw := tc.raw()
 			if raw == "" {
 				// t.Setenv registers cleanup; unset AFTER it so the var is
 				// absent during the test but restored afterwards.

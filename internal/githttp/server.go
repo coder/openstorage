@@ -115,6 +115,7 @@ type Server struct {
 	// temp file — the op count bounds that). Guarded by lfsStagingMu.
 	lfsStagingInFlight int64
 	lfsStagingOps      int
+	lfsRepoStagingOps  map[string]int
 	lfsStagingMu       sync.Mutex
 }
 
@@ -123,24 +124,39 @@ type Server struct {
 // tests can shrink it.
 var lfsMaxStagingOps = 256
 
+// lfsMaxRepoStagingOps bounds ONE base repository's share of the op slots
+// (Codex round 32, security): tokens are repo-scoped, so a writer parking
+// bodyless PUTs for distinct OIDs — each slot held up to the idle deadline
+// — could otherwise occupy the whole replica-global cap with ~256 live
+// connections and starve every OTHER repository's uploads and adoptions.
+// Capping the per-repo share confines that outage to the attacker's own
+// repository; unrelated repositories retain the remaining slots. A var so
+// tests can shrink it.
+var lfsMaxRepoStagingOps = 32
+
 // reserveLFSStaging reserves n bytes of the node-wide LFS staging budget
-// and one staging-operation slot. ok=false when either does not fit right
-// now (transient — the caller answers 429). n larger than the whole byte
+// and one staging-operation slot charged to repo's share. ok=false when
+// the node cap, the repo share, or the byte budget does not fit right now
+// (transient — the caller answers 429). n larger than the whole byte
 // budget can never fit; the caller distinguishes that case up front. The
 // op slot is counted even for n==0 and with the byte budget disabled: the
 // operation count bounds goroutines/fds/temp files, which exist regardless
 // of declared size.
-func (s *Server) reserveLFSStaging(n int64) bool {
-	assertf(n >= 0, "reserveLFSStaging(%d)", n)
+func (s *Server) reserveLFSStaging(repo string, n int64) bool {
+	assertf(repo != "" && n >= 0, "reserveLFSStaging(%q, %d)", repo, n)
 	s.lfsStagingMu.Lock()
 	defer s.lfsStagingMu.Unlock()
-	if s.lfsStagingOps >= lfsMaxStagingOps {
+	if s.lfsStagingOps >= lfsMaxStagingOps || s.lfsRepoStagingOps[repo] >= lfsMaxRepoStagingOps {
 		return false
 	}
 	if s.LFSStagingBytes > 0 && n > 0 && s.lfsStagingInFlight > s.LFSStagingBytes-n {
 		return false
 	}
 	s.lfsStagingOps++
+	if s.lfsRepoStagingOps == nil {
+		s.lfsRepoStagingOps = make(map[string]int)
+	}
+	s.lfsRepoStagingOps[repo]++
 	if s.LFSStagingBytes > 0 {
 		s.lfsStagingInFlight += n
 	}
@@ -192,11 +208,16 @@ func (s *Server) growLFSStaging(n int64) bool {
 }
 
 // releaseLFSStaging returns a reserveLFSStaging reservation.
-func (s *Server) releaseLFSStaging(n int64) {
+func (s *Server) releaseLFSStaging(repo string, n int64) {
 	s.lfsStagingMu.Lock()
 	defer s.lfsStagingMu.Unlock()
 	s.lfsStagingOps--
 	assertf(s.lfsStagingOps >= 0, "releaseLFSStaging: op count went negative")
+	s.lfsRepoStagingOps[repo]--
+	assertf(s.lfsRepoStagingOps[repo] >= 0, "releaseLFSStaging(%q): repo op count went negative", repo)
+	if s.lfsRepoStagingOps[repo] == 0 {
+		delete(s.lfsRepoStagingOps, repo) // bound the map by active repos
+	}
 	if s.LFSStagingBytes > 0 {
 		s.lfsStagingInFlight -= n
 		assertf(s.lfsStagingInFlight >= 0, "releaseLFSStaging(%d): in-flight went negative", n)
