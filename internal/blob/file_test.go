@@ -493,6 +493,40 @@ func TestEnsurePublishedRenewsCoverThroughPublication(t *testing.T) {
 	}
 }
 
+// TestWithRenewedCoverAbortsOnLapse (Codex round 62): a renewal stalling
+// past the cover's TTL used to block the renewal loop while the restore
+// upload continued on its own healthy connection — the cover row expired
+// mid-restore and the uncovered bytes still became physical. Each renewal
+// attempt is now deadline-bounded (a stall costs one attempt, not the
+// loop), and once coverLapseBudget passes without a successful renewal
+// the op's context is canceled: an uncovered restore must never publish.
+func TestWithRenewedCoverAbortsOnLapse(t *testing.T) {
+	oldI, oldT, oldB := coverRenewInterval, coverRenewTimeout, coverLapseBudget
+	coverRenewInterval, coverRenewTimeout, coverLapseBudget = 10*time.Millisecond, 5*time.Millisecond, 40*time.Millisecond
+	t.Cleanup(func() { coverRenewInterval, coverRenewTimeout, coverLapseBudget = oldI, oldT, oldB })
+
+	// Every renewal stalls until its per-attempt deadline: the loop must
+	// keep making (failing) attempts and abort the op at the budget.
+	renew := func(rctx context.Context) error {
+		<-rctx.Done()
+		return rctx.Err()
+	}
+	opErr, renewErr := WithRenewedCover(context.Background(), renew, func(opCtx context.Context) error {
+		select {
+		case <-opCtx.Done():
+			return context.Cause(opCtx)
+		case <-time.After(2 * time.Second):
+			return nil // the abort never came: uncovered bytes would publish
+		}
+	})
+	if opErr == nil || !strings.Contains(opErr.Error(), "restore cover lapsed") {
+		t.Fatalf("opErr = %v, want a cover-lapse abort", opErr)
+	}
+	if renewErr != nil {
+		t.Fatalf("renewErr = %v, want nil (op failed, no final refresh)", renewErr)
+	}
+}
+
 // TestWithRenewedCoverRefreshSurvivesOpDeadline (Codex round 60): the
 // post-publication refresh is MANDATORY tail coverage — its restarted TTL
 // must span the stale-floor tail (floor lifetime + admission handoff
@@ -508,7 +542,7 @@ func TestWithRenewedCoverRefreshSurvivesOpDeadline(t *testing.T) {
 	opErr, renewErr := WithRenewedCover(ctx, func(rctx context.Context) error {
 		refreshCtxErr = rctx.Err()
 		return rctx.Err()
-	}, func() error {
+	}, func(context.Context) error {
 		cancel() // the op consumed its whole deadline as it finished
 		return nil
 	})

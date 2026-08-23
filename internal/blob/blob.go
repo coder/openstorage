@@ -291,8 +291,8 @@ func EnsurePublished(ctx context.Context, b BlobStore, key, path string, onResto
 		// outlives the last stale-floor commit (usageCacheTTL + handoff
 		// margin past publication).
 		renew := func(rctx context.Context) error { return onRestore(rctx, fi.Size()) }
-		upErr, renewErr := WithRenewedCover(ctx, renew, func() error {
-			return b.UploadFile(ctx, key, path)
+		upErr, renewErr := WithRenewedCover(ctx, renew, func(opCtx context.Context) error {
+			return b.UploadFile(opCtx, key, path)
 		})
 		if upErr != nil {
 			return false, upErr
@@ -311,22 +311,41 @@ func EnsurePublished(ctx context.Context, b BlobStore, key, path string, onResto
 }
 
 // coverRenewInterval is WithRenewedCover's renewal cadence (a var for
-// tests): strictly under a third of the minimum reservation TTL (61s, see
-// ref.MinPackReservationTTL's config gate), so a restore cover stays
-// continuously alive even across two consecutive failed or missed
-// renewals.
+// tests). Together with coverRenewTimeout and coverLapseBudget it keeps a
+// restore cover continuously alive under the minimum reservation TTL
+// (61s, see ref.MinPackReservationTTL's config gate): a single failed or
+// stalled renewal still leaves the next attempt committing within the
+// prior success's TTL (20s tick + 20s tick + 10s bound = 50s < 61s).
 var coverRenewInterval = 20 * time.Second
 
+// coverRenewTimeout bounds ONE in-progress renewal attempt (Codex round
+// 62): an unbounded renew stalling on a wedged connection would block the
+// renewal loop past the cover's TTL while the restore upload continues on
+// its own healthy connection.
+var coverRenewTimeout = 10 * time.Second
+
+// coverLapseBudget is how long WithRenewedCover tolerates renewal
+// failures before it must assume the cover row expired and ABORT the
+// publication (Codex round 62): declared strictly before the minimum TTL
+// (45s < 61s) so the abort lands while the last successful renewal still
+// covers the bytes — an uncovered restore must never become physical.
+var coverLapseBudget = 45 * time.Second
+
 // WithRenewedCover runs op while keeping a restore's cover reservation
-// alive (Codex round 59): renew is invoked every coverRenewInterval for
-// op's duration (best-effort — the ledger failing renewals is the same
-// ledger competing admissions need) and once more after op succeeds, the
-// post-publication refresh whose restarted TTL outlives every floor
-// scanned during the absence. The caller takes the initial cover BEFORE
-// calling this. opErr reports op's own failure; renewErr reports only the
-// final refresh.
-func WithRenewedCover(ctx context.Context, renew func(context.Context) error, op func() error) (opErr, renewErr error) {
+// alive (Codex round 59): renew is invoked every coverRenewInterval —
+// each attempt deadline-bounded by coverRenewTimeout — for op's duration,
+// and once more after op succeeds, the post-publication refresh whose
+// restarted TTL outlives every floor scanned during the absence. The
+// caller takes the initial cover BEFORE calling this. Renewal failures
+// are tolerated while a recent success still covers the bytes; once
+// coverLapseBudget passes without one, op's context is canceled — the
+// restore aborts rather than publishing uncovered bytes (Codex round 62),
+// and the caller's retry converges. opErr reports op's own failure;
+// renewErr reports only the final refresh.
+func WithRenewedCover(ctx context.Context, renew func(context.Context) error, op func(context.Context) error) (opErr, renewErr error) {
 	assertf(renew != nil && op != nil, "WithRenewedCover: nil renew or op")
+	opCtx, opCancel := context.WithCancelCause(ctx)
+	defer opCancel(nil)
 	// renew invocations are strictly serialized: the renewal goroutine is
 	// joined before the final refresh, so callers need no concurrency
 	// handling in the callback.
@@ -337,19 +356,31 @@ func WithRenewedCover(ctx context.Context, renew func(context.Context) error, op
 		defer wg.Done()
 		t := time.NewTicker(coverRenewInterval)
 		defer t.Stop()
+		lastSuccess := time.Now() // the caller's initial cover
 		for {
 			select {
 			case <-done:
 				return
 			case <-t.C:
-				_ = renew(ctx) // best-effort; the final refresh is checked
+				rctx, rcancel := context.WithTimeout(ctx, coverRenewTimeout)
+				err := renew(rctx)
+				rcancel()
+				if err == nil {
+					lastSuccess = time.Now()
+				} else if time.Since(lastSuccess) > coverLapseBudget {
+					opCancel(fmt.Errorf("restore cover lapsed (last renewal failure: %w)", err))
+					return
+				}
 			}
 		}
 	}()
-	opErr = op()
+	opErr = op(opCtx)
 	close(done)
 	wg.Wait()
 	if opErr != nil {
+		if cause := context.Cause(opCtx); cause != nil && !errors.Is(cause, context.Canceled) {
+			opErr = fmt.Errorf("%w (%v)", opErr, cause)
+		}
 		return opErr, nil
 	}
 	// The op may have consumed nearly its entire deadline (Codex round

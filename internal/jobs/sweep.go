@@ -676,8 +676,8 @@ func (s *Sweeper) restoreFromQuarantine(ctx context.Context, key, qKey string) (
 		// the restarted TTL outlives the last stale-floor commit. A
 		// failed final refresh is logged, not fatal: the bytes ARE back
 		// and the generation bump below still runs.
-		copyErr, renewErr := blob.WithRenewedCover(ctx, renewCover, func() error {
-			return s.blobs.Copy(ctx, key, qKey)
+		copyErr, renewErr := blob.WithRenewedCover(ctx, renewCover, func(opCtx context.Context) error {
+			return s.blobs.Copy(opCtx, key, qKey)
 		})
 		if copyErr != nil {
 			return false, copyErr
