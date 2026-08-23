@@ -101,7 +101,7 @@ func (b *File) ListPages(ctx context.Context, prefix string, pageSize int, fn fu
 
 // SignedURL is unsupported on the filesystem backend: it returns
 // ErrSignedURLUnsupported so callers fall back to proxying transfers
-// through the server (docs/05 local mode).
+// through the server (docs/explanation/git-protocol-and-namespaces.md local mode).
 func (b *File) SignedURL(_ context.Context, key, method string, expiry time.Duration) (string, error) {
 	assertSignedURLArgs(key, method, expiry)
 	return "", ErrSignedURLUnsupported

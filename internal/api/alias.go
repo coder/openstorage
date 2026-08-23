@@ -39,7 +39,7 @@ type aliasRoute struct {
 	v1Path string
 	// flavor selects the auth middleware and the alias-layer failure
 	// envelope: routeRead → requireAuth + {"error"}, routeWrite →
-	// requireAuthWrite + docs/04 result envelope.
+	// requireAuthWrite + docs/explanation/streaming-commit-protocols.md result envelope.
 	flavor routeFlavor
 	// orgLevel mirrors the v1 route's requireAuth org-level flag (only the
 	// PUT/DELETE git-credentials routes). Org tokens carry repo claim
@@ -131,7 +131,7 @@ func registerAliasRoutes(mux *http.ServeMux, s *server, ss *syncServer, verifier
 		mux.Handle(pattern, rl.limit(ar.flavor)(authMW(verifier, org, ar.orgLevel, ar.scopes...)(s.aliasHandler(mux, ar))))
 	}
 
-	// Path-id git-credentials routes (openapi.yaml; docs/15 deferred #1):
+	// Path-id git-credentials routes (openapi.yaml; docs/archive/phases/15-phase6-implementation-notes.md deferred #1):
 	// direct routes with NO v1 twin to re-dispatch to — the handlers own
 	// the alias-layer repo_name resolution themselves
 	// (handlers_credentials.go). Auth is per-repo repo:write with ADR-26
@@ -199,7 +199,7 @@ func (s *server) aliasHandler(mux *http.ServeMux, ar aliasRoute) http.HandlerFun
 }
 
 // aliasFail writes an alias-layer failure in the route's envelope flavor:
-// read routes use the {"error"} envelope, write routes the docs/04 result
+// read routes use the {"error"} envelope, write routes the docs/explanation/streaming-commit-protocols.md result
 // envelope (status via the shared statusForHTTP table).
 func aliasFail(w http.ResponseWriter, flavor routeFlavor, httpCode int, msg string) {
 	assertf(msg != "", "aliasFail: empty message")
@@ -216,7 +216,7 @@ func aliasFail(w http.ResponseWriter, flavor routeFlavor, httpCode int, msg stri
 }
 
 // aliasInternal logs the real error and writes the generic 500 in the
-// route's envelope flavor (docs/03: raw errors never reach the wire).
+// route's envelope flavor (docs/reference/http-api.md: raw errors never reach the wire).
 func (s *server) aliasInternal(w http.ResponseWriter, r *http.Request, flavor routeFlavor, op string, err error) {
 	assertf(err != nil, "aliasInternal called with nil error")
 	assertf(op != "", "aliasInternal called with empty op")

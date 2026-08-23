@@ -1,7 +1,7 @@
 package api
 
 // Acceptance tests for the repo CRUD surface against real Postgres
-// (testcontainers) with the server in-process on 127.0.0.1:0: the docs/03
+// (testcontainers) with the server in-process on 127.0.0.1:0: the docs/reference/http-api.md
 // status-code matrix (401/403/404/409/200), pagination/q, and per-algorithm
 // JWT positives. Keys are generated at runtime and never committed.
 
@@ -168,7 +168,7 @@ func testCreateRepoValidation(t *testing.T, e *testEnv) {
 	org := e.newOrg(t)
 
 	// repo claim "org" / "" are not repo-scoped: requireAuth rejects them
-	// with 403 per docs/02 (claim mismatch with target).
+	// with 403 per docs/reference/authentication.md (claim mismatch with target).
 	createRepo(t, e, org, auth.RepoClaimOrg, nil, http.StatusForbidden)
 	// Empty repo claim.
 	createRepo(t, e, org, "", nil, http.StatusForbidden)
@@ -212,7 +212,7 @@ func testCreateRepoValidation(t *testing.T, e *testEnv) {
 	}
 }
 
-// TestPerRepoRoutesRejectNonRepoClaims locks in the docs/02 failure map for
+// TestPerRepoRoutesRejectNonRepoClaims locks in the docs/reference/authentication.md failure map for
 // per-repo routes: tokens whose repo claim is empty or "org" get 403 — never
 // a 500 (regression: empty claims previously reached the store and panicked).
 func TestPerRepoRoutesRejectNonRepoClaims(t *testing.T) {
@@ -246,7 +246,7 @@ func testPerRepoRoutesRejectNonRepoClaims(t *testing.T, e *testEnv) {
 	}
 }
 
-// TestRefPolicyOnWriteEndpoints covers docs/02 ref-policy enforcement on
+// TestRefPolicyOnWriteEndpoints covers docs/reference/authentication.md ref-policy enforcement on
 // the API write path: repo deletion destroys every ref, so a token whose
 // policies could deny deleting some ref must not delete the repo; malformed
 // policy claims fail closed on both write endpoints; verify-sig-only and
@@ -452,7 +452,7 @@ func testListPaginationAndQ(t *testing.T, e *testEnv) {
 	listPage(url.Values{"limit": {"abc"}}, http.StatusBadRequest)
 }
 
-// TestAuthMatrix drives the docs/03 401/403 failure map across all four
+// TestAuthMatrix drives the docs/reference/http-api.md 401/403 failure map across all four
 // endpoints, asserting status, envelope shape, and WWW-Authenticate on 401.
 func TestAuthMatrix(t *testing.T) { runBackends(t, testAuthMatrix) }
 
@@ -589,7 +589,7 @@ func testAuthMatrix(t *testing.T, e *testEnv) {
 }
 
 // TestJWTPerAlgorithmPositive proves a token signed with each allowed
-// algorithm's registered key authenticates (docs/02 allow-list).
+// algorithm's registered key authenticates (docs/reference/authentication.md allow-list).
 func TestJWTPerAlgorithmPositive(t *testing.T) { runBackends(t, testJWTPerAlgorithmPositive) }
 
 func testJWTPerAlgorithmPositive(t *testing.T, e *testEnv) {

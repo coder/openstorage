@@ -1,5 +1,5 @@
 // Package meta declares the metadata-store contract for organizations, org
-// public keys, and repositories (docs/01 domain model, docs/03 HTTP API).
+// public keys, and repositories (docs/explanation/domain-model.md domain model, docs/reference/http-api.md HTTP API).
 //
 // FROZEN CONTRACT: parallel phase-1 slices implement Store against Postgres
 // (schema: orgs / org_public_keys / repos with UNIQUE(org_id, url) spanning
@@ -17,7 +17,7 @@ import (
 
 // Sentinel errors implementations must return (possibly wrapped; callers
 // match with errors.Is) so HTTP handlers can map storage outcomes onto the
-// docs/03 status contract.
+// docs/reference/http-api.md status contract.
 var (
 	// ErrNotFound: unknown org, or repo absent/soft-deleted → 404.
 	ErrNotFound = errors.New("not found")
@@ -45,7 +45,7 @@ type Repo struct {
 	URL           string     // JWT `repo` claim value at create time
 	DefaultBranch string     // validated ref component, default "main"
 	CreatedAt     time.Time  // UTC; rendered as RFC 3339 in responses
-	DeletedAt     *time.Time // nil while live (soft delete per docs/01)
+	DeletedAt     *time.Time // nil while live (soft delete per docs/explanation/domain-model.md)
 }
 
 // ListParams are the GET /repos query parameters after handler-side
@@ -65,7 +65,7 @@ type ListResult struct {
 	HasMore    bool
 }
 
-// SigningKey is one registered commit-signing key for an org (docs/02
+// SigningKey is one registered commit-signing key for an org (docs/reference/authentication.md
 // verify-sig; the OSS stand-in for the upstream dashboard key registry).
 // KeyText is either a single SSH public key line ("ssh-ed25519 AAAA...")
 // or an ASCII-armored PGP public key block; callers validate the format
@@ -105,8 +105,8 @@ type Store interface {
 
 	// GetRepoByID returns the live repo with the given server-generated
 	// RepoID; ErrNotFound when absent or soft-deleted. Used by the git
-	// smart-HTTP path, whose URLs address repos by repo_id (docs/05) while
-	// JWT `repo` claims carry the url (docs/02).
+	// smart-HTTP path, whose URLs address repos by repo_id (docs/explanation/git-protocol-and-namespaces.md) while
+	// JWT `repo` claims carry the url (docs/reference/authentication.md).
 	GetRepoByID(ctx context.Context, org, repoID string) (Repo, error)
 
 	// UpdateRepoDefaultBranch compare-and-swaps the live repo's default

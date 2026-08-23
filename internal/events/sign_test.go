@@ -9,7 +9,7 @@ import (
 	"testing"
 )
 
-// TestSignGoldenVector locks the exact docs/06 header format against an
+// TestSignGoldenVector locks the exact docs/reference/webhooks.md header format against an
 // externally computed HMAC (python3 hmac/hashlib over "1737369000.{body}").
 func TestSignGoldenVector(t *testing.T) {
 	got := Sign("whsec_test_0123456789abcdef", 1737369000, []byte(`{"hello":"world"}`))

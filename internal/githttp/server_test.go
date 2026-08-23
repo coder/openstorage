@@ -1,8 +1,8 @@
 package githttp
 
-// Unit tests for Server.authenticate: docs/02 failure mapping on the git
+// Unit tests for Server.authenticate: docs/reference/authentication.md failure mapping on the git
 // path (401 for any Verifier failure, 403 for org/repo/scope mismatch) and
-// the docs/05 repo_id->url resolution. Uses the real auth.OrgKeyVerifier
+// the docs/explanation/git-protocol-and-namespaces.md repo_id->url resolution. Uses the real auth.OrgKeyVerifier
 // over an in-memory key source — no containers needed.
 
 import (
@@ -141,7 +141,7 @@ func TestAuthenticate_RejectsNonRepoScopedClaims(t *testing.T) {
 }
 
 // The git path must accept every allowed signature algorithm the org
-// registered keys for, not just ES256 (docs/02 multi-alg requirement).
+// registered keys for, not just ES256 (docs/reference/authentication.md multi-alg requirement).
 func TestAuthenticate_MultiAlgorithm(t *testing.T) {
 	for _, alg := range []string{"ES256", "EdDSA", "RS256"} {
 		t.Run(alg, func(t *testing.T) {
@@ -189,7 +189,7 @@ func TestAuthenticate_ResolvesRepoIDToURLClaim(t *testing.T) {
 		t.Fatalf("claims.Repo = %q, want %q", claims.Repo, repoURL)
 	}
 
-	// Namespace suffixes are stripped before resolution (docs/05).
+	// Namespace suffixes are stripped before resolution (docs/explanation/git-protocol-and-namespaces.md).
 	if _, status, err := srv.authenticate(newReq(), repoID+"+ephemeral", auth.ScopeGitRead); err != nil {
 		t.Fatalf("namespaced auth failed: status = %d, err = %v", status, err)
 	}

@@ -2,7 +2,7 @@ package sync
 
 import "testing"
 
-// docs/14 deferred #1: the openapi provider enum value "sourcehut" maps to
+// docs/archive/phases/14-phase5-implementation-notes.md deferred #1: the openapi provider enum value "sourcehut" maps to
 // git.sr.ht exactly like the pre-existing "sr.ht" spelling.
 func TestProviderHostSourcehut(t *testing.T) {
 	for _, provider := range []string{"sourcehut", "sr.ht"} {

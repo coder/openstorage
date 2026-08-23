@@ -1,12 +1,12 @@
 # HTTP API Reference (v1, SDK-compatible surface)
 
 Base: `https://api.{org}.code.storage/api/v1` (SDKs build `{apiBaseUrl}/api/v{version}`,
-version fixed at 1). All endpoints require `Authorization: Bearer <jwt>` (see
-02-authentication.md). SDKs send a `Code-Storage-Agent` header — `code-storage-sdk/<ver>`
+version fixed at 1). All endpoints require `Authorization: Bearer <jwt>` (see the
+[auth spec](authentication.md)). SDKs send a `Code-Storage-Agent` header — `code-storage-sdk/<ver>`
 (TypeScript), `code-storage-py-sdk/<ver>` (Python), `code-storage-go-sdk/<ver>` (Go);
 treat it as informational.
 
-For exhaustive request/response schemas see `upstream/openapi.yaml` (official; also defines
+For exhaustive request/response schemas see [`../upstream/openapi.yaml`](../upstream/openapi.yaml) (official; also defines
 the parallel `/api/repos/{repo_name}/...` path style). This document is the SDK-verified
 contract with implementation notes the spec lacks.
 
@@ -18,7 +18,7 @@ contract with implementation notes the spec lacks.
   server defaults differ per endpoint (files 1000/max 5000, files/metadata 200/max 1000,
   notes refs 20).
 - **Errors**: `{"error": "<unstable human string>"}` + status code. Write endpoints that move
-  refs return the richer `result` envelope (04-streaming-commit-protocols.md) even on
+  refs return the richer `result` envelope ([streaming protocols](../explanation/streaming-commit-protocols.md)) even on
   4xx/5xx statuses `[400,401,403,404,408,409,412,422,429,499,500,502,503,504]`.
 - **Booleans in query strings** are literal `"true"` / `"false"`.
 - **Repeated params**: `path` may repeat on diff endpoints; `range` may repeat on blame.
@@ -83,9 +83,9 @@ contract with implementation notes the spec lacks.
 | `GET /repos/commits` | git:read | `ref?` (deprecated alias `branch`), `cursor?, limit?, ephemeral?, path?` → `{commits: [CommitInfo], next_cursor, has_more}`, newest first; defaults to default branch |
 | `GET /repos/commit` | git:read | `ref` (req; deprecated alias `sha`; branch name, tag, short or full SHA) → `{commit: CommitInfo & {signature?, payload?}}` (signed commits: armored sig + exact signed payload bytes) |
 | `GET /repos/diff` | git:read | `ref` (req; deprecated alias `sha`), `base_ref?` (deprecated alias `baseSha`), `ref_is_ephemeral?`, `base_is_ephemeral?`, `git_apply_compatible?` (deprecated alias `gitApplyCompatible`), `path` (repeatable) → `{sha, stats, files: [FileDiff], filtered_files}`. On alias conflict the current name wins |
-| `POST /repos/commit-pack` | git:write | NDJSON stream — see 04 |
-| `POST /repos/diff-commit` | git:write | NDJSON stream — see 04 |
-| `POST /repos/restore-commit` | git:write | JSON `{metadata: {target_branch, target_commit_sha, author, commit_message?, expected_head_sha?, committer?}}` → commit ack (04). Creates a *new* commit restoring old tree (history preserved) |
+| `POST /repos/commit-pack` | git:write | NDJSON stream — see the [streaming protocols](../explanation/streaming-commit-protocols.md) |
+| `POST /repos/diff-commit` | git:write | NDJSON stream — see the [streaming protocols](../explanation/streaming-commit-protocols.md) |
+| `POST /repos/restore-commit` | git:write | JSON `{metadata: {target_branch, target_commit_sha, author, commit_message?, expected_head_sha?, committer?}}` → commit ack ([streaming protocols](../explanation/streaming-commit-protocols.md)). Creates a *new* commit restoring old tree (history preserved) |
 | `POST /repos/reset-commits` | git:write | In OpenAPI only (not in SDKs): NDJSON metadata stream; same restore-commit family |
 
 `CommitInfo` = `{sha, parent_shas[], message, author_name, author_email, committer_name,

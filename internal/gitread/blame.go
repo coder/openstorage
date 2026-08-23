@@ -10,7 +10,7 @@ import (
 	"github.com/coder/code-storage/internal/ref"
 )
 
-// BlameLine is one attributed line (docs/03 GET /repos/blame line objects).
+// BlameLine is one attributed line (docs/reference/http-api.md GET /repos/blame line objects).
 type BlameLine struct {
 	LineNumber         int    // 1-based line number in the file at the blamed commit
 	CommitSHA          string // commit that introduced the line
@@ -27,7 +27,7 @@ type BlameLine struct {
 }
 
 // Blame attributes every line of path at commit (a resolved full SHA).
-// ranges are raw `git blame -L` specs (docs/03: repeatable `range` params
+// ranges are raw `git blame -L` specs (docs/reference/http-api.md: repeatable `range` params
 // like "1,10" — the handler validates their shape); detectMoves adds -M.
 // A path absent at commit wraps ErrNotFound.
 func Blame(ctx context.Context, repoPath, commit, path string, ranges []string, detectMoves bool) ([]BlameLine, error) {
@@ -90,7 +90,7 @@ func parseBlamePorcelain(out string) ([]BlameLine, error) {
 		for i++; i < len(raw); i++ {
 			l := raw[i]
 			if strings.HasPrefix(l, "\t") {
-				break // content line: consumed, not surfaced (docs/03 has no text field)
+				break // content line: consumed, not surfaced (docs/reference/http-api.md has no text field)
 			}
 			key, value, _ := strings.Cut(l, " ")
 			switch key {

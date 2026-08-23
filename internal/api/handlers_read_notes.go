@@ -1,4 +1,4 @@
-// Notes read endpoints (docs/03 "Notes"): GET /repos/notes returns the note
+// Notes read endpoints (docs/reference/http-api.md "Notes"): GET /repos/notes returns the note
 // attached to one object, GET /repos/notes/refs enumerates notes refs from
 // the ref authority. Custom notes refs are always enabled on this server
 // (the write surface accepts them), so the upstream "custom notes refs
@@ -71,7 +71,7 @@ func (s *server) handleGetNote(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// git notes add/append run stripspace, so stored notes end in exactly
-	// one newline; trim it to echo back what was posted (docs/03 shape).
+	// one newline; trim it to echo back what was posted (docs/reference/http-api.md shape).
 	writeJSON(w, http.StatusOK, rnotesGetResponse{SHA: sha, Note: strings.TrimSuffix(note, "\n"), RefSHA: refSHA})
 }
 
@@ -95,7 +95,7 @@ type rnotesListRefsResponse struct {
 	HasMore    bool             `json:"has_more"`
 }
 
-// rnotesPrefix normalizes the `prefix` query param (docs/03): empty selects
+// rnotesPrefix normalizes the `prefix` query param (docs/reference/http-api.md): empty selects
 // refs/notes/, a bare prefix goes under refs/notes/, and a fully qualified
 // prefix must already live there.
 func rnotesPrefix(raw string) (string, error) {

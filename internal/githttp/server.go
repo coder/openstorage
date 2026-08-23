@@ -1,6 +1,6 @@
-// Package githttp is the git smart HTTP surface (docs/05): stateless HTTP
+// Package githttp is the git smart HTTP surface (docs/explanation/git-protocol-and-namespaces.md): stateless HTTP
 // nodes with Postgres as ref authority, S3/MinIO as immutable pack storage,
-// and local disk as a rebuildable cache. Authentication follows docs/02:
+// and local disk as a rebuildable cache. Authentication follows docs/reference/authentication.md:
 // customer-signed JWTs verified against the issuing org's registered keys.
 package githttp
 
@@ -42,7 +42,7 @@ type Server struct {
 	Store    ref.RefStore
 	Blob     blob.BlobStore
 	CacheDir string
-	// Verifier authenticates docs/02 JWTs (multi-algorithm, iss-resolved
+	// Verifier authenticates docs/reference/authentication.md JWTs (multi-algorithm, iss-resolved
 	// org keys, exp/sub checks). Any Verify failure maps to 401.
 	Verifier auth.Verifier
 	// Org is the single organization this node serves. A valid token from a
@@ -52,12 +52,12 @@ type Server struct {
 	// TestMode gates fault-injection knobs (crash header). Only ever set
 	// from CODESTORAGE_TEST_MODE=1; the crash header is refused otherwise.
 	TestMode bool
-	// ResolveRepo maps a base path element (docs/05: repo_id, but ADR-21
+	// ResolveRepo maps a base path element (docs/explanation/git-protocol-and-namespaces.md: repo_id, but ADR-21
 	// accepts name-style urls too) to its live repo record. ok=false when
 	// no live repo matches — both handlers then answer 404 (repos must be
 	// created via POST /api/v1/repos first). The record's RepoID is the
 	// only storage key (repo-key-split fix); it also lets tokens carrying
-	// either the url or the repo_id claim (docs/02) authenticate. When
+	// either the url or the repo_id claim (docs/reference/authentication.md) authenticate. When
 	// nil, every path element is unresolvable.
 	ResolveRepo func(ctx context.Context, base string) (meta.Repo, bool)
 	// MaybeRepack, when set, runs after every receive-pack POST with the
@@ -137,7 +137,7 @@ func httpError(w http.ResponseWriter, status int, msg string) {
 	_ = json.NewEncoder(w).Encode(map[string]string{"error": msg})
 }
 
-// Handler routes the smart-HTTP and LFS endpoints per repo (docs/05):
+// Handler routes the smart-HTTP and LFS endpoints per repo (docs/explanation/git-protocol-and-namespaces.md):
 //
 //	GET  /{repo}.git/info/refs?service=git-{upload|receive}-pack
 //	POST /{repo}.git/git-{upload|receive}-pack
@@ -165,7 +165,7 @@ func (s *Server) Handler() http.Handler {
 }
 
 // splitRepoPath parses "/{repo}.git/{rest}" and validates the repo element,
-// which may carry a `+ephemeral`/`+import` namespace suffix (docs/05).
+// which may carry a `+ephemeral`/`+import` namespace suffix (docs/explanation/git-protocol-and-namespaces.md).
 func splitRepoPath(path string) (repo, rest string, ok bool) {
 	path = strings.TrimPrefix(path, "/")
 	elem, rest, found := strings.Cut(path, "/")
@@ -179,7 +179,7 @@ func splitRepoPath(path string) (repo, rest string, ok bool) {
 	return repo, rest, true
 }
 
-// authenticate enforces the docs/02 failure mapping on the git path: 401 for
+// authenticate enforces the docs/reference/authentication.md failure mapping on the git path: 401 for
 // a missing/invalid token (any Verifier failure), 403 for a valid token that
 // does not fit this org, repo, or scope.
 func (s *Server) authenticate(r *http.Request, repo, scope string) (*auth.Claims, int, error) {
@@ -205,14 +205,14 @@ func (s *Server) verifyClaims(ctx context.Context, token, repo, scope string) (*
 	if claims.Iss != s.Org {
 		return nil, http.StatusForbidden, fmt.Errorf("token issued for org %q, not served here", claims.Iss)
 	}
-	// Git endpoints are always repo-scoped (docs/02): an org-level or empty
+	// Git endpoints are always repo-scoped (docs/reference/authentication.md): an org-level or empty
 	// `repo` claim never grants git access — not even to a repo literally
 	// named "org", which would otherwise satisfy the verbatim compare
 	// below. Mirrors the API middleware's repo-scope gate.
 	if claims.Repo == "" || claims.Repo == auth.RepoClaimOrg {
 		return nil, http.StatusForbidden, fmt.Errorf("token is not repo-scoped")
 	}
-	// docs/02: the repo claim carries the repo url (or id); docs/05 paths
+	// docs/reference/authentication.md: the repo claim carries the repo url (or id); docs/explanation/git-protocol-and-namespaces.md paths
 	// address repos by repo_id but name-style urls resolve too (ADR-21).
 	// Accept a verbatim match, else resolve the path element and compare
 	// against both the record's repo_id and url. Auth stays before the
@@ -542,13 +542,13 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 		if atomicPush {
 			cmd.Env = append(cmd.Env, EnvAtomic+"=1")
 		}
-		// The refs claim is passed through raw (docs/02 tuple encoding);
+		// The refs claim is passed through raw (docs/reference/authentication.md tuple encoding);
 		// the update hook owns parsing and fails closed on malformed JSON.
 		if len(claims.Refs) > 0 {
 			cmd.Env = append(cmd.Env, EnvRefsPolicy+"="+string(claims.Refs))
 		}
 		// Deprecated repo-wide ops claim: folded into the ref policies by
-		// the hook (docs/02 fallback semantics).
+		// the hook (docs/reference/authentication.md fallback semantics).
 		if len(claims.Ops) > 0 {
 			ops, err := json.Marshal(claims.Ops)
 			assertf(err == nil, "marshal ops claim: %v", err)

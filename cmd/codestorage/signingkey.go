@@ -1,5 +1,5 @@
 // signing-key subcommands manage the org's commit-signing key registry
-// (docs/02 verify-sig). Upstream exposes this only through its dashboard;
+// (docs/reference/authentication.md verify-sig). Upstream exposes this only through its dashboard;
 // the OSS equivalent is this CLI writing to the metadata store's
 // org_signing_keys table, which the receive-path update hook reads fresh
 // from Postgres on every push.
@@ -169,7 +169,7 @@ func signingKeySummary(keyText string) string {
 }
 
 // validateSigningKeyText checks that text is one of the two key formats the
-// verify-sig hook can hand to git (docs/02): a single SSH public key line
+// verify-sig hook can hand to git (docs/reference/authentication.md): a single SSH public key line
 // ("<type> <base64> [comment]") or an ASCII-armored PGP public key block.
 // Returns the trimmed text to store. Validation happens here, on add — the
 // hook trusts registry contents verbatim.

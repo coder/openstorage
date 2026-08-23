@@ -10,7 +10,7 @@ import (
 	"github.com/coder/code-storage/internal/ref"
 )
 
-// Commit is one parsed commit — the docs/03 CommitInfo source data
+// Commit is one parsed commit — the docs/reference/http-api.md CommitInfo source data
 // ({sha, parent_shas[], message, author_*, committer_*, date}).
 type Commit struct {
 	SHA            string

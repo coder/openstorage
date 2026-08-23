@@ -1,6 +1,6 @@
 package api
 
-// Integration tests for the git-credentials CRUD surface (docs/03,
+// Integration tests for the git-credentials CRUD surface (docs/reference/http-api.md,
 // handlers_credentials.go), running over both storage backend lanes via the
 // shared usyncStack from sync_test.go.
 
@@ -21,7 +21,7 @@ func gcredCreate(t *testing.T, s *usyncStack, repoURL, repoID string) string {
 	token := s.e.mint(t, tokenSpec{iss: s.org, repo: repoURL, scopes: []string{auth.ScopeRepoWrite}})
 	body := []byte(`{"repo_id":"` + repoID + `","username":"git","password":"tok-1"}`)
 	resp, respBody := s.req(t, http.MethodPost, "/api/v1/repos/git-credentials", token, body)
-	// 201 per openapi.yaml (docs/14 deferred #4).
+	// 201 per openapi.yaml (docs/archive/phases/14-phase5-implementation-notes.md deferred #4).
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("create credential status %d, want 201: %s", resp.StatusCode, respBody)
 	}
@@ -88,11 +88,11 @@ func TestCredentialCreate(t *testing.T) {
 			t.Fatalf("no token: status %d, want 401", resp.StatusCode)
 		}
 
-		// Happy path: the token may carry the repo url (docs/02) while the
+		// Happy path: the token may carry the repo url (docs/reference/authentication.md) while the
 		// body carries the repo_id.
 		gcredCreate(t, s, repoURL, repoID)
 
-		// Duplicate -> 409 (docs/03: 409 = exists).
+		// Duplicate -> 409 (docs/reference/http-api.md: 409 = exists).
 		resp, _ = s.req(t, http.MethodPost, "/api/v1/repos/git-credentials", repoToken,
 			[]byte(`{"repo_id":"`+repoID+`","password":"p2"}`))
 		if resp.StatusCode != http.StatusConflict {
@@ -208,7 +208,7 @@ func TestCredentialDelete(t *testing.T) {
 	})
 }
 
-// Path-id route tests (docs/15 deferred #1): PUT/DELETE
+// Path-id route tests (docs/archive/phases/15-phase6-implementation-notes.md deferred #1): PUT/DELETE
 // /api/repos/{repo_name}/git-credentials/{git_credential_id} per
 // openapi.yaml, served by the FULL api.New server (testEnv) so the
 // registration in registerAliasRoutes is what is exercised.

@@ -11,7 +11,7 @@ import (
 	"github.com/coder/code-storage/internal/auth"
 )
 
-// readRoutes is the full docs/07 p3 route set plus the notes read routes
+// readRoutes is the full docs/archive/phases/07-implementation-roadmap.md p3 route set plus the notes read routes
 // (method + path).
 var readRoutes = []struct{ method, path string }{
 	{http.MethodGet, "/api/v1/repos/file"},

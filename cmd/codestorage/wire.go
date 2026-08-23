@@ -54,7 +54,7 @@ func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL, loopbackBaseU
 		return nil, nil, nil, nil, nil, err
 	}
 
-	// Eventing/sync stack (docs/06): jobs queue with delivery + sync
+	// Eventing/sync stack (docs/reference/webhooks.md): jobs queue with delivery + sync
 	// workers, and the events.RefStore decorator so API ref writes emit
 	// push events. The git surface gets the same decorator in the hook
 	// subprocess via wireHookEventing.
@@ -81,7 +81,7 @@ func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL, loopbackBaseU
 	}
 
 	// Org bootstrap + verifier, including the per-process loopback
-	// sync-push key (docs/07 p5, issue #45).
+	// sync-push key (docs/archive/phases/07-implementation-roadmap.md p5, issue #45).
 	key, verifier, err := bootstrapOrgAuth(ctx, ms, org, orgPEMBlocks, logger)
 	if err != nil {
 		return fail(err)
@@ -262,7 +262,7 @@ func bootstrapOrgAuth(ctx context.Context, ms meta.Store, org string, orgPEMBloc
 // and ensures its schema exists (idempotent). Shared by serve (via
 // buildAPIHandler) and the signing-key CLI, which talks to the database
 // directly — there is no HTTP surface for the signing-key registry
-// (docs/02: upstream manages keys in its dashboard).
+// (docs/reference/authentication.md: upstream manages keys in its dashboard).
 func openMetaStore(ctx context.Context, dbURL string, secretsCodec *secrets.Codec) (meta.Store, func(), error) {
 	assertf(dbURL != "", "openMetaStore: empty dbURL")
 	ms, err := meta.Open(ctx, dbURL, meta.WithSecretsCodec(secretsCodec))

@@ -96,7 +96,7 @@ curl -s http://127.0.0.1:8082/api/repos/demo -H "Authorization: Bearer $TOK_GIT"
 
 `mint` needs `--iss selfhost` because the compose nodes run with
 `CODESTORAGE_ORG=selfhost` — the JWT `iss` claim must match the configured org
-([auth spec](../02-authentication.md)).
+([auth spec](../reference/authentication.md)).
 
 ## 4. Watch the nodes work
 

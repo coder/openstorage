@@ -1,5 +1,5 @@
-// Package sync implements upstream mirror synchronization (docs/01
-// invariant 11, docs/03 "Upstream sync", docs/06 repo.sync.* events): a
+// Package sync implements upstream mirror synchronization (docs/explanation/domain-model.md
+// invariant 11, docs/reference/http-api.md "Upstream sync", docs/reference/webhooks.md repo.sync.* events): a
 // worker mirror-fetches from an upstream git provider and loopback-pushes
 // into this server's own git smart-HTTP endpoint, reusing pack storage, ref
 // policy, CAS, and push-event emission (phase-5 Decision 4).
@@ -35,7 +35,7 @@ var (
 	// ErrNotFound: unknown credential/upstream/repo row.
 	ErrNotFound = errors.New("not found")
 	// ErrCredentialExists: CreateCredential when the repo already has one
-	// (docs/03: POST /repos/git-credentials 409 = exists).
+	// (docs/reference/http-api.md: POST /repos/git-credentials 409 = exists).
 	ErrCredentialExists = errors.New("credential already exists")
 	// ErrUpstreamExists: PutUpstream when the repo already has an upstream
 	// row (base_repo is set exactly once at repo creation).
@@ -46,7 +46,7 @@ var (
 )
 
 // Credential is one stored HTTPS credential for a repo's generic git
-// upstream (docs/03 "Git credentials"). Password is the upstream secret
+// upstream (docs/reference/http-api.md "Git credentials"). Password is the upstream secret
 // (token or password) verbatim; it must never be logged.
 type Credential struct {
 	ID        string // server-generated "ggc_<16 hex>"
@@ -70,7 +70,7 @@ type Upstream struct {
 }
 
 // CloneURL builds the upstream fetch URL, https://{host}/{owner}/{name}.git
-// (docs/03). A host that already carries a scheme (self-host upstreams,
+// (docs/reference/http-api.md). A host that already carries a scheme (self-host upstreams,
 // tests) is used verbatim as the base.
 func (u Upstream) CloneURL() string {
 	assertf(u.Owner != "" && u.Name != "" && u.UpstreamHost != "",
@@ -82,7 +82,7 @@ func (u Upstream) CloneURL() string {
 	return strings.TrimRight(base, "/") + "/" + u.Owner + "/" + u.Name + ".git"
 }
 
-// providerHosts maps the docs/03 sync providers to their default hosts.
+// providerHosts maps the docs/reference/http-api.md sync providers to their default hosts.
 // Empty string = no default; upstream_host is required (self-hosted forges).
 var providerHosts = map[string]string{
 	"github":    "github.com",
@@ -90,7 +90,7 @@ var providerHosts = map[string]string{
 	"bitbucket": "bitbucket.org",
 	"codeberg":  "codeberg.org",
 	"sr.ht":     "git.sr.ht",
-	"sourcehut": "git.sr.ht", // openapi enum alias for sr.ht (docs/14 deferred #1)
+	"sourcehut": "git.sr.ht", // openapi enum alias for sr.ht (docs/archive/phases/14-phase5-implementation-notes.md deferred #1)
 	"gitea":     "",
 	"forgejo":   "",
 }
@@ -112,7 +112,7 @@ func NewCredentialID() string {
 	return "ggc_" + hex.EncodeToString(buf[:])
 }
 
-// CredentialStore persists git credentials (docs/03 "Git credentials").
+// CredentialStore persists git credentials (docs/reference/http-api.md "Git credentials").
 // The durable implementation is meta-backed (foundation slice); MemStore
 // implements it in-memory.
 type CredentialStore interface {
@@ -153,12 +153,12 @@ type UpstreamStore interface {
 	// FinishSync completes the claimed run: increments RunCount (and
 	// SuccessCount when success), clears Syncing, returns the updated row.
 	// ErrNotFound when the repo was detached mid-run — the run then ends
-	// silently (docs/06: detach cancels without a failed event).
+	// silently (docs/reference/webhooks.md: detach cancels without a failed event).
 	FinishSync(ctx context.Context, repoID string, success bool) (Upstream, error)
 }
 
 // EventSink receives one repo.sync.* event for fan-out to the org's
-// registered webhooks (docs/06). payload is the exact JSON body to sign and
+// registered webhooks (docs/reference/webhooks.md). payload is the exact JSON body to sign and
 // deliver; implementations must not mutate it. The webhook-delivery slice
 // provides the production sink; tests use recorders.
 type EventSink interface {
@@ -166,7 +166,7 @@ type EventSink interface {
 }
 
 // Job is one queued sync request. Ref is the optional pull-upstream hint
-// (docs/03 {ref?}); the worker currently performs a full mirror sync — a
+// (docs/reference/http-api.md {ref?}); the worker currently performs a full mirror sync — a
 // superset of any single-ref request — so Ref is carried for logging only.
 type Job struct {
 	Org    string // org name (JWT iss)

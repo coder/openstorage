@@ -1,11 +1,42 @@
-# Building an Open-Source `code.storage` Backend — Specification Documents
+# codestorage documentation
 
-This document set specifies the API surface of [code.storage](https://code.storage) (Pierre
-Computer Company) precisely enough to build an open-source, wire-compatible backend from
-scratch. A compatible backend can be dropped in via the SDKs' `apiBaseUrl` / `storageBaseUrl`
+Documentation for the open-source, wire-compatible [code.storage](https://code.storage)
+backend, organized by [Diátaxis](https://diataxis.fr/) quadrant.
+
+## Navigation
+
+| Quadrant | Start here |
+|---|---|
+| **Tutorials** | The [README quickstarts](../README.md#quickstart-local-mode-60-seconds): local mode in 60 seconds, multi-node with Docker Compose |
+| **How-to guides** | [Deploy to production](how-to/deploy-production.md) · [Deploy a two-replica stack with Docker Compose](how-to/deploy-docker-compose.md) · [Operate the storage lifecycle](how-to/storage-lifecycle-and-sweeping.md) · [Cut a release](how-to/release.md) |
+| **Reference** | [Configuration](reference/configuration.md) · [CLI](reference/cli.md) · [Testing](reference/testing.md) · [HTTP API](reference/http-api.md) · [Authentication & JWT claims](reference/authentication.md) · [Webhooks](reference/webhooks.md) |
+| **Explanation** | [Wire compatibility](explanation/wire-compatibility.md) · [The storage engine](explanation/storage-engine.md) · [Domain model](explanation/domain-model.md) · [Git protocol & namespaces](explanation/git-protocol-and-namespaces.md) · [Streaming commit protocols](explanation/streaming-commit-protocols.md) |
+
+Two further directories sit outside the quadrants:
+
+- **[`adr/`](adr/README.md)** — standalone architecture decision records (ADR-1..40),
+  extracted from the phase notes; historical, individually addressable.
+- **[`archive/`](archive/phases/07-implementation-roadmap.md)** — the original
+  [implementation roadmap](archive/phases/07-implementation-roadmap.md) and the per-phase
+  implementation notes (`archive/phases/08` … `16`), kept verbatim as the project's
+  build history. **Historical material**: for current behavior, prefer the reference and
+  explanation pages above.
+- **`upstream/`** — verbatim copies of the vendor's official OpenAPI spec and doc pages,
+  kept for wire-compatibility auditing.
+
+Contributor entry points: [CONTRIBUTING](../CONTRIBUTING.md) (setup, gates, review bar)
+and the [testing reference](reference/testing.md).
+
+## The specification set: sources & methodology
+
+Five of the pages above — [domain model](explanation/domain-model.md),
+[authentication](reference/authentication.md), [HTTP API](reference/http-api.md),
+[streaming commit protocols](explanation/streaming-commit-protocols.md),
+[git protocol & namespaces](explanation/git-protocol-and-namespaces.md), and
+[webhooks](reference/webhooks.md) — specify the API surface of code.storage (Pierre
+Computer Company) precisely enough to build a wire-compatible backend from scratch. A
+compatible backend can be dropped in via the SDKs' `apiBaseUrl` / `storageBaseUrl`
 overrides without changing client code.
-
-## Sources & methodology
 
 Claims were extracted independently from three parallel SDK implementations and cross-checked
 against the vendor's own documentation:
@@ -21,27 +52,6 @@ against the vendor's own documentation:
 
 The three SDKs implement an **identical** wire surface (endpoints, claims, chunk sizes,
 signature scheme), which gives high confidence that the extracted spec is correct.
-
-## Document index
-
-1. [01-domain-model.md](01-domain-model.md) — Entities, lifecycle, invariants a backend must uphold
-2. [02-authentication.md](02-authentication.md) — Customer-signed JWTs, scopes, ref policies
-3. [03-http-api.md](03-http-api.md) — Endpoint catalog, conventions (pagination, errors, headers)
-4. [04-streaming-commit-protocols.md](04-streaming-commit-protocols.md) — NDJSON commit-pack / diff-commit / restore-commit
-5. [05-git-protocol-and-namespaces.md](05-git-protocol-and-namespaces.md) — Smart HTTP, `+ephemeral` / `+import` namespaces, LFS
-6. [06-webhooks.md](06-webhooks.md) — Outbound events, HMAC signatures
-7. [07-implementation-roadmap.md](07-implementation-roadmap.md) — Phased build plan + conformance testing strategy
-8. [08-spike-implementation-notes.md](08-spike-implementation-notes.md) — ADRs from the phase-0 de-risk spike
-9. [09-phase1-implementation-notes.md](09-phase1-implementation-notes.md) — ADRs from phase 1 (skeleton + auth)
-10. [10-phase2-implementation-notes.md](10-phase2-implementation-notes.md) — ADRs from phase 2 (git smart HTTP promotion)
-11. [11-local-backends-implementation-notes.md](11-local-backends-implementation-notes.md) — ADRs from the pluggable-storage interlude (local mode: SQLite + file blobs)
-12. [12-phase3-implementation-notes.md](12-phase3-implementation-notes.md) — ADRs from phase 3 (read API)
-13. [13-phase4-implementation-notes.md](13-phase4-implementation-notes.md) — ADRs from phase 4 (write API + p3 read burn-down)
-14. [14-phase5-implementation-notes.md](14-phase5-implementation-notes.md) — ADRs from phase 5 (eventing, upstream sync, credentials, fork)
-15. [15-phase6-implementation-notes.md](15-phase6-implementation-notes.md) — ADRs from phase 6 (LFS, named-repo aliases, repo-urls, rate limiting)
-16. [16-phase7-implementation-notes.md](16-phase7-implementation-notes.md) — ADRs from phase 7 (deployment packaging, river migration locking, p6 burn-down)
-
-`upstream/` contains verbatim copies of the official OpenAPI spec and doc pages for reference.
 
 ## The two API path styles
 

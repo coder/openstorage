@@ -46,7 +46,7 @@ CODESTORAGE_PG_URL='postgres://...' CODESTORAGE_S3_URL='s3://...' codestorage se
 Internal. `codestorage hook <pre-receive|update> [args...]` is installed by the server
 into cached bare repositories and re-exec'd by git during pushes: `pre-receive` publishes
 and registers the quarantined pack (enforcing the pack quota), `update` runs the ref-CAS
-and ref policies ([docs/05](../05-git-protocol-and-namespaces.md)). It reads connection
+and ref policies ([git protocol](../explanation/git-protocol-and-namespaces.md)). It reads connection
 and per-request environment inherited from the serve process — there is no reason to run
 it manually.
 
@@ -69,7 +69,7 @@ codestorage keygen --out /tmp/cs-key   # /tmp/cs-key.pem + /tmp/cs-key.pub.pem
 ## `codestorage mint`
 
 Mints a JWT signed with the org's private key — the local-mode stand-in for your token
-service. Claims follow [docs/02](../02-authentication.md).
+service. Claims follow [auth spec](authentication.md).
 
 | Flag | Default | Meaning |
 |---|---|---|
@@ -85,7 +85,7 @@ Ref-policy patterns support an exact ref name, a standalone `*` (matches everyth
 single trailing `*` after a `/` (prefix match, e.g. `refs/heads/feature/*`). Any other `*`
 placement is **not** a glob — it falls through to exact comparison and never matches, so a
 mistyped pattern like `refs/heads/main*` silently leaves the ref unpoliced. Evaluation
-semantics: [docs/02](../02-authentication.md).
+semantics: [auth spec](authentication.md).
 
 ```sh
 TOKEN=$(codestorage mint --key /tmp/cs-key.pem --iss selfhost --repo demo --scopes git:read,git:write)
@@ -95,7 +95,7 @@ git clone "http://t:${TOKEN}@127.0.0.1:8080/demo.git"
 ## `codestorage signing-key`
 
 Manages the org's commit-signing key registry for the `verify-sig` ref-policy op
-([docs/02](../02-authentication.md)). Upstream exposes this through its dashboard; the OSS
+([auth spec](authentication.md)). Upstream exposes this through its dashboard; the OSS
 equivalent is this CLI writing to the metadata store, which the update hook reads fresh on
 every push. The org must already be registered (`serve` bootstraps it from
 `CODESTORAGE_ORG`).
