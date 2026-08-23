@@ -55,9 +55,22 @@ type syncArgs struct {
 
 func (syncArgs) Kind() string { return "upstream_sync" }
 
+// syncRescueAttempts exists for exactly one consumer: river's job rescuer.
+// Work never returns a plain error (run outcomes are handled in-run and
+// completion failures snooze, which does not consume attempts), so on a
+// healthy worker a job still executes at most once. Only a job orphaned by
+// a CRASHED worker process is rescued and re-run — and that retry is
+// load-bearing (issue #86): a pull-upstream accepted just before the crash
+// was deduplicated against the orphaned job's running row, so the rescued
+// re-run — whose claim attempt steals the dead holder's expired lease — is
+// that request's only follow-up. With a single attempt the rescuer could
+// only discard the orphan, stranding the accepted 202 until an unrelated
+// later trigger.
+const syncRescueAttempts = 3
+
 func (syncArgs) InsertOpts() river.InsertOpts {
 	return river.InsertOpts{
-		MaxAttempts: 1,
+		MaxAttempts: syncRescueAttempts,
 		UniqueOpts: river.UniqueOpts{
 			ByArgs: true,
 			ByState: []rivertype.JobState{
@@ -388,21 +401,36 @@ func (w *syncWorker) Work(ctx context.Context, job *river.Job[syncArgs]) error {
 		// Detached mid-flight: nothing to follow up.
 	case err != nil:
 		return completionFailed("pending recheck", err)
-	case up.SyncPending && runErr != nil && preKnown && up.RunCount == preRuns:
-		// The run failed without counting a run: either it never claimed
-		// (transient lookup/store error) or it claimed and could not
-		// finish even through finishSync's detached retries. Completing
-		// would strand the accepted 202 — no successor exists and, with
-		// no counted run, no claim holder's gate is guaranteed to cover
-		// it. Snooze retries the whole run: once any live holder finishes
-		// (or the claim was never taken), the retry claims and consumes
-		// the marker. If the claim's holder died, the snoozed retry
-		// eventually finds the lease expired and STEALS the claim
-		// (issue #86), so the accepted request still syncs. (Returning
-		// without commit rolls the completion back.)
-		w.logger.Warn("sync: run failed with an uncovered pending request; snoozing to retry it",
-			"repo", job.Args.RepoID, "err", runErr)
-		return river.JobSnooze(syncFollowUpSnooze)
+	case up.SyncPending && preKnown && up.RunCount == preRuns && (runErr != nil || up.Syncing):
+		// No run was counted and a request is pending — completing would
+		// strand the accepted 202: no successor exists and no counted
+		// run's gate covers it. Two shapes land here:
+		//   - the run FAILED before counting (transient lookup/store
+		//     error, or a claimed run that could not finish through
+		//     finishSync's detached retries);
+		//   - the run SKIPPED because another holder's unexpired lease
+		//     refused the steal (up.Syncing) — if that holder is dead
+		//     (crashed process, issue #86), nothing will ever report the
+		//     marker.
+		// Snooze retries the whole run: a live holder's finisher consumes
+		// the marker (the re-run then completes as a no-op), and a dead
+		// holder's lease is stealable once expired — so wake just past
+		// the observed expiry when a claim is held. (Returning without
+		// commit rolls the completion back.)
+		delay := syncFollowUpSnooze
+		if up.Syncing {
+			if until := time.Until(up.SyncClaimExpiresAt) + time.Second; until > delay {
+				delay = until
+			}
+			// Clock-skew paranoia cap: the delay only defers the retry,
+			// never correctness — each re-run recomputes from the row.
+			if delay > 30*time.Minute {
+				delay = 30 * time.Minute
+			}
+		}
+		w.logger.Warn("sync: uncovered pending request; snoozing to retry it",
+			"repo", job.Args.RepoID, "delay", delay, "claimHeld", up.Syncing, "err", runErr)
+		return river.JobSnooze(delay)
 	case up.SyncPending && (!preKnown || up.RunCount != preRuns):
 		if _, err := river.ClientFromContext[pgx.Tx](ctx).InsertTx(ctx, tx,
 			syncArgs{Org: job.Args.Org, RepoID: job.Args.RepoID}, nil); err != nil {

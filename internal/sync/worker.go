@@ -203,7 +203,13 @@ func (w *Worker) Run(ctx context.Context, job Job) error {
 	case errors.Is(err, ErrNotFound):
 		return nil // detached before start: cancel silently (docs/reference/webhooks.md)
 	case errors.Is(err, ErrSyncInProgress):
-		return nil // overlapping run: skip (invariant 11)
+		// Overlapping run: skip (invariant 11). A LIVE holder covers any
+		// pending request at its FinishSync (#85) — but a dead holder's
+		// unexpired lease refuses the steal AND never finishes, and this
+		// run was the request's only local vehicle: schedule one retry
+		// for just after the lease expires (issue #86).
+		w.deferPendingRetry(ctx, job)
+		return nil
 	case err != nil:
 		return fmt.Errorf("begin sync %s: %w", job.RepoID, err)
 	}
@@ -299,6 +305,49 @@ func (w *Worker) Run(ctx context.Context, job Job) error {
 		}
 	}
 	return runErr
+}
+
+// deferRetrySlack delays the deferred retry past the observed lease expiry
+// so the retry's claim attempt lands strictly after the lease can be
+// stolen (clock granularity, store latency).
+const deferRetrySlack = time.Second
+
+// deferPendingRetry schedules one delayed re-enqueue after a claim-skip
+// that would otherwise strand an accepted pull-upstream request: when the
+// refusing claim's holder is DEAD (crashed process, lease not yet
+// expired), no FinishSync will ever report the pending marker, so the
+// skip is the request's last local vehicle until the lease can be stolen.
+// The timer is gated on the marker both now and at fire time: a live
+// holder's finisher (or any interim run's claim) consumes it, making the
+// deferred retry a cheap no-op. Timers die with the process — the
+// documented local-mode trade-off; the river lane instead relies on its
+// durable job being rescued and re-run (jobs/river.go syncRescueAttempts).
+func (w *Worker) deferPendingRetry(ctx context.Context, job Job) {
+	if w.Requeue == nil {
+		return // river lane: durable rescue owns crashed-holder recovery
+	}
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), detachedOpTimeout)
+	defer cancel()
+	up, err := w.Upstreams.GetUpstream(rctx, job.RepoID)
+	if err != nil || !up.SyncPending {
+		return // nothing promised (or detached): the skip is final
+	}
+	delay := time.Until(up.SyncClaimExpiresAt) + deferRetrySlack
+	if delay < deferRetrySlack {
+		delay = deferRetrySlack
+	}
+	time.AfterFunc(delay, func() {
+		bg, cancel := context.WithTimeout(context.Background(), detachedOpTimeout)
+		defer cancel()
+		cur, err := w.Upstreams.GetUpstream(bg, job.RepoID)
+		if err != nil || !cur.SyncPending {
+			return // covered meanwhile (or detached)
+		}
+		if rqErr := w.Requeue(bg, job); rqErr != nil {
+			w.Logger.Warn("deferred pending sync requeue failed",
+				"org", job.Org, "repo", job.RepoID, "err", rqErr)
+		}
+	})
 }
 
 // emitDetached emits one lifecycle event on a bounded context DETACHED

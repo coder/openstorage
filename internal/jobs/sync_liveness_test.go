@@ -171,3 +171,62 @@ func TestRiverSyncPendingSurvivesPreClaimFailure(t *testing.T) {
 		t.Errorf("SyncPending still set after the retried run: %+v", up)
 	}
 }
+
+// A run that SKIPS because a dead holder's unexpired lease refuses the
+// steal must not complete its only job over the pending request: the
+// gated completion snoozes until just past the observed expiry, and the
+// re-run steals and syncs (issue #86, rescued-orphan shape).
+func TestRiverSyncSkipWithPendingSnoozesUntilSteal(t *testing.T) {
+	ctx := context.Background()
+	pgURL := livenessPG(t, ctx)
+
+	store := sync.NewMemStore()
+	if _, err := store.PutUpstream(ctx, sync.Upstream{
+		RepoID: "repo_snz", Provider: "gitea", Owner: "o", Name: "n", UpstreamHost: "example.test",
+	}); err != nil {
+		t.Fatalf("PutUpstream: %v", err)
+	}
+	// Crashed holder: claim held, never finished, lease still live.
+	if _, _, err := store.BeginSync(ctx, "repo_snz", "dead-holder", 3*time.Second); err != nil {
+		t.Fatalf("dead-holder claim: %v", err)
+	}
+
+	var runSeq, claimedRuns atomic.Int32
+	runner := func(ctx context.Context, job sync.Job) error {
+		holder := fmt.Sprintf("test-%d", runSeq.Add(1))
+		if _, _, err := store.BeginSync(ctx, job.RepoID, holder, time.Minute); err != nil {
+			if errors.Is(err, sync.ErrSyncInProgress) {
+				return nil // unexpired lease refused the steal: skip
+			}
+			return err
+		}
+		claimedRuns.Add(1)
+		_, err := store.FinishSync(ctx, job.RepoID, holder, true)
+		return err
+	}
+
+	deliverer := &events.Deliverer{Webhooks: stubWebhooks{}, Logger: slog.New(slog.DiscardHandler)}
+	q, err := NewRiver(ctx, pgURL, deliverer, runner, store, nil, nil, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("NewRiver: %v", err)
+	}
+	defer q.Close()
+
+	// The 202 path against the wedged row.
+	if err := store.RequestSync(ctx, "repo_snz"); err != nil {
+		t.Fatalf("RequestSync: %v", err)
+	}
+	if err := q.EnqueueSync(ctx, sync.Job{Org: "org", RepoID: "repo_snz"}); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+
+	// First run skips; the snoozed re-run (past the 3s lease) steals.
+	waitFor(t, "post-expiry stolen run", func() bool { return claimedRuns.Load() >= 1 })
+	up, err := store.GetUpstream(ctx, "repo_snz")
+	if err != nil {
+		t.Fatalf("GetUpstream: %v", err)
+	}
+	if up.SyncPending || up.Syncing {
+		t.Errorf("row after snoozed steal = %+v, want released claim with consumed marker", up)
+	}
+}

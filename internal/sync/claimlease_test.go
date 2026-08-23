@@ -73,6 +73,52 @@ func TestDeadHolderClaimIsStolenAndSyncHeals(t *testing.T) {
 	}
 }
 
+// A dead holder whose lease has NOT yet expired refuses the steal, and the
+// skipped run was the accepted request's only local vehicle — the worker
+// must defer one retry past the observed expiry instead of dropping it.
+func TestDeadHolderUnexpiredLeaseDefersRetry(t *testing.T) {
+	f := newWorkerFixture(t)
+	head := seedUpstream(t, f.upstreamDir, "own", "proj")
+	loop := f.addLoopbackRepo(t, "repo_defer")
+	f.putUpstream(t, "repo_defer", "own", "proj", "file://"+f.upstreamDir)
+
+	// Crashed process whose lease is still live when the request arrives.
+	if _, _, err := f.store.BeginSync(context.Background(), "repo_defer", "dead-holder", 1500*time.Millisecond); err != nil {
+		t.Fatalf("dead-holder claim: %v", err)
+	}
+
+	q := NewInProcessQueue(f.worker.Run, discardTestLogger())
+	defer q.Close()
+	f.worker.Requeue = q.EnqueueSync
+
+	if err := f.store.RequestSync(context.Background(), "repo_defer"); err != nil {
+		t.Fatalf("RequestSync: %v", err)
+	}
+	if err := q.EnqueueSync(context.Background(), Job{Org: "acme", RepoID: "repo_defer"}); err != nil {
+		t.Fatalf("EnqueueSync: %v", err)
+	}
+
+	// The immediate run skips (lease unexpired); the deferred retry fires
+	// just past expiry, steals, and syncs.
+	deadline := time.After(30 * time.Second)
+	for loopbackMain(t, loop) != head {
+		select {
+		case <-deadline:
+			up, _ := f.store.GetUpstream(context.Background(), "repo_defer")
+			t.Fatalf("unexpired dead holder stranded the request: loopback main = %q, want %s (row: %+v)",
+				loopbackMain(t, loop), head, up)
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+	up, err := f.store.GetUpstream(context.Background(), "repo_defer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if up.Syncing || up.SyncPending || up.RunCount != 1 {
+		t.Errorf("row after deferred steal = %+v, want one counted run with consumed marker", up)
+	}
+}
+
 // finishGateUpstreams parks the FIRST FinishSync until released (CAS, not
 // sync.Once — later calls must flow while the first is held).
 type finishGateUpstreams struct {
