@@ -36,6 +36,14 @@ func assertf(cond bool, format string, args ...any) {
 	}
 }
 
+// isTimeoutError reports network/request read deadlines without depending on
+// a concrete net.Error type; both gzip.NewReader and later decode reads can
+// surface the connection's timeout (Codex final review).
+func isTimeoutError(err error) bool {
+	var timeoutErr interface{ Timeout() bool }
+	return errors.As(err, &timeoutErr) && timeoutErr.Timeout()
+}
+
 // Server is one stateless HTTP node: all durable truth lives in PG (refs,
 // pack registry) and S3 (pack bytes); CacheDir is rebuildable at any time.
 type Server struct {
@@ -421,7 +429,13 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 				httpError(w, http.StatusRequestEntityTooLarge, capMsg)
 				return
 			}
-			httpError(w, http.StatusBadRequest, "bad gzip body: "+err.Error())
+			// The body deadline can fire while NewReader is still reading
+			// the fixed or optional gzip header, before io.ReadAll below.
+			if uploadCapped && isTimeoutError(err) {
+				httpError(w, http.StatusRequestTimeout, "fetch negotiation body timed out")
+			} else {
+				httpError(w, http.StatusBadRequest, "bad gzip body: "+err.Error())
+			}
 			return
 		}
 		defer gz.Close()
@@ -441,8 +455,7 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 			return
 		}
 		if err != nil {
-			var timeoutErr interface{ Timeout() bool }
-			if errors.As(err, &timeoutErr) && timeoutErr.Timeout() {
+			if isTimeoutError(err) {
 				httpError(w, http.StatusRequestTimeout, "fetch negotiation body timed out")
 			} else {
 				httpError(w, http.StatusBadRequest, "bad gzip body: "+err.Error())

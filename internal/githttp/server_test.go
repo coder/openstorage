@@ -314,42 +314,53 @@ func TestServiceRPC_UploadPackReadTimeoutIs408(t *testing.T) {
 	if err := zw.Close(); err != nil {
 		t.Fatal(err)
 	}
-	pr, pw := io.Pipe()
-	release := make(chan struct{})
-	writerDone := make(chan struct{})
-	go func() {
-		defer close(writerDone)
-		_, _ = pw.Write(member.Bytes())
-		<-release // withhold EOF until the server has answered
-		_ = pw.Close()
-	}()
+	cases := []struct {
+		name   string
+		prefix []byte
+	}{
+		{"partial-header", []byte{0x1f}}, // gzip.NewReader blocks in its fixed header
+		{"between-members", member.Bytes()},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pr, pw := io.Pipe()
+			release := make(chan struct{})
+			writerDone := make(chan struct{})
+			go func() {
+				defer close(writerDone)
+				_, _ = pw.Write(tc.prefix)
+				<-release // withhold the rest/EOF until the server has answered
+				_ = pw.Close()
+			}()
 
-	req, err := http.NewRequest(http.MethodPost, httpServer.URL+"/fetch-timeout.git/git-upload-pack", pr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	req.SetBasicAuth("t", token)
-	req.Header.Set("Content-Type", "application/x-git-upload-pack-request")
-	req.Header.Set("Content-Encoding", "gzip")
-	resp, err := httpServer.Client().Do(req)
-	close(release)
-	<-writerDone
-	if err != nil {
-		t.Fatalf("POST git-upload-pack: %v", err)
-	}
-	defer resp.Body.Close()
-	got, err := io.ReadAll(resp.Body)
-	if err != nil {
-		t.Fatalf("read response: %v", err)
-	}
-	if resp.StatusCode != http.StatusRequestTimeout {
-		t.Fatalf("status = %d, want 408; body: %s", resp.StatusCode, got)
-	}
-	var body map[string]string
-	if err := json.Unmarshal(got, &body); err != nil {
-		t.Fatalf("decode JSON error: %v; body: %s", err, got)
-	}
-	if body["error"] != "fetch negotiation body timed out" {
-		t.Fatalf("error = %q, want timeout message", body["error"])
+			req, err := http.NewRequest(http.MethodPost, httpServer.URL+"/fetch-timeout.git/git-upload-pack", pr)
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.SetBasicAuth("t", token)
+			req.Header.Set("Content-Type", "application/x-git-upload-pack-request")
+			req.Header.Set("Content-Encoding", "gzip")
+			resp, err := httpServer.Client().Do(req)
+			close(release)
+			<-writerDone
+			if err != nil {
+				t.Fatalf("POST git-upload-pack: %v", err)
+			}
+			defer resp.Body.Close()
+			got, err := io.ReadAll(resp.Body)
+			if err != nil {
+				t.Fatalf("read response: %v", err)
+			}
+			if resp.StatusCode != http.StatusRequestTimeout {
+				t.Fatalf("status = %d, want 408; body: %s", resp.StatusCode, got)
+			}
+			var body map[string]string
+			if err := json.Unmarshal(got, &body); err != nil {
+				t.Fatalf("decode JSON error: %v; body: %s", err, got)
+			}
+			if body["error"] != "fetch negotiation body timed out" {
+				t.Fatalf("error = %q, want timeout message", body["error"])
+			}
+		})
 	}
 }
