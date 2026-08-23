@@ -1634,13 +1634,13 @@ func (s *Server) publishVerifiedLFSObject(ctx context.Context, repoID, key, lega
 		if lerr != nil || !renewed {
 			return fmt.Errorf("adoption publish %s: %w", key, copyErr)
 		}
-		if s.PackQuotaBytes > 0 && size > 0 {
-			hctx, hcancel := context.WithTimeout(dctx, blob.CoverHandoffTimeout)
-			if cerr := ref.ReserveRestoreCover(hctx, s.Store, blob.QuotaRepoGroup(repoID), key, size, s.lfsReservationTTL()); cerr != nil {
-				log.Printf("lfs adopt %s: ambiguous-commit cover: %v", key, cerr)
-			}
-			hcancel()
-		}
+		// The cover must LAND (or the stale-floor window must pass)
+		// before the potentially long re-hash continues (Codex round 97):
+		// a swallowed one-shot failure left the rowless canonical bytes
+		// floor-invisible until registration's bump, which some pre-copy
+		// floor's admission could beat. No bump here — the registration
+		// that follows performs the handoff atomically.
+		s.ensureAmbiguousCommitAccounting(dctx, repoID, key, size, nil)
 		log.Printf("lfs adopt %s: destination committed despite copy error: %v", key, copyErr)
 		return nil // the caller's destination re-verify digest-proves the bytes
 	}
@@ -1725,6 +1725,64 @@ func (s *Server) keepAdoptionClaimRenewed(region context.Context, cancel context
 		// verdict would miss it. A renewal already in flight delays this
 		// by at most lfsClaimRenewTimeout.
 		<-exited
+	}
+}
+
+// ambiguousAccountingRetryInterval paces the round-97 ambiguous-commit
+// accounting convergence loop.
+var ambiguousAccountingRetryInterval = 2 * time.Second
+
+// ensureAmbiguousCommitAccounting converges the quota accounting for a
+// copy that COMMITTED its destination while reporting an error (Codex
+// round 97): the durable bytes need a live cover and — when the caller
+// passes one — the floor-generation handoff, and a swallowed one-shot
+// failure could never converge, because every later retry sees the
+// destination present and skips the seam entirely. Retry both until they
+// land, or until every usage floor scanned BEFORE the copy has provably
+// aged out (usageCacheTTL + UsageFloorHandoffMargin): floors scanned
+// after the commit list the durable bytes, so from then on the missing
+// rows can hide nothing. The context is detached and never client-paced;
+// a ref store down for the whole window also blocks every admission that
+// could exploit the gap.
+func (s *Server) ensureAmbiguousCommitAccounting(ctx context.Context, repoID, coverKey string, size int64, bump func(context.Context) error) {
+	covered := size <= 0 || s.PackQuotaBytes <= 0
+	bumped := bump == nil
+	deadline := time.Now().Add(usageCacheTTL + UsageFloorHandoffMargin)
+	for !covered || !bumped {
+		if !covered {
+			cctx, ccancel := context.WithTimeout(ctx, blob.CoverHandoffTimeout)
+			err := ref.ReserveRestoreCover(cctx, s.Store, blob.QuotaRepoGroup(repoID), coverKey, size, s.lfsReservationTTL())
+			ccancel()
+			if err == nil {
+				covered = true
+			} else {
+				log.Printf("lfs ambiguous-commit cover %s: %v", coverKey, err)
+			}
+		}
+		if !bumped {
+			bctx, bcancel := context.WithTimeout(ctx, blob.CoverHandoffTimeout)
+			err := bump(bctx)
+			bcancel()
+			if err == nil {
+				bumped = true
+			} else {
+				log.Printf("lfs ambiguous-commit handoff %s: %v", coverKey, err)
+			}
+		}
+		if covered && bumped {
+			return
+		}
+		if time.Now().After(deadline) {
+			// Every pre-copy floor has aged out: fresh scans list the
+			// durable bytes, so the accounting is safe without the rows.
+			log.Printf("lfs ambiguous-commit accounting %s: outwaited the stale-floor window", coverKey)
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(ambiguousAccountingRetryInterval):
+		}
 	}
 }
 
@@ -2770,14 +2828,11 @@ func (s *Server) maybeLegacyCompatCopy(ctx context.Context, repoID, oid, key str
 			// without the registered-retry repair seam.
 			return fmt.Errorf("compat copy %s: %w", legacyKey, copyErr)
 		}
-		hctx, hcancel := context.WithTimeout(dctx, blob.CoverHandoffTimeout)
-		defer hcancel()
-		if cerr := ref.ReserveRestoreCover(hctx, s.Store, blob.QuotaRepoGroup(repoID), legacyKey, size, s.lfsReservationTTL()); cerr != nil {
-			log.Printf("lfs compat copy %s: ambiguous-commit cover: %v", legacyKey, cerr)
-		}
-		if berr := bump(hctx); berr != nil {
-			log.Printf("lfs compat copy %s: ambiguous-commit handoff: %v", legacyKey, berr)
-		}
+		// The cover AND the handoff must land (or the stale-floor window
+		// must pass) before success (Codex round 97): one swallowed
+		// attempt never converges — every retry sees the spelling
+		// present and skips this seam.
+		s.ensureAmbiguousCommitAccounting(dctx, repoID, legacyKey, size, bump)
 		s.invalidateUsageFloor(repoID)
 		log.Printf("lfs compat copy %s: destination committed despite copy error: %v", legacyKey, copyErr)
 		return nil
