@@ -407,36 +407,82 @@ func TestPurgeRepo_CrashResume(t *testing.T) {
 	})
 }
 
-func TestPurgeRepo_LateWriterDefers(t *testing.T) {
+func TestPurgeRepo_FenceRejectsLateWriter(t *testing.T) {
 	f := newPurgeFixture(t)
 	ctx := context.Background()
 	repo := f.seedRepo("https://example.com/late.git")
 	f.softDelete(repo.URL)
-	packKey, _, _ := repoKeys(repo.RepoID)
+	packKey, _, lfsKey := repoKeys(repo.RepoID)
 
 	sweeper := f.sweeper(SweepConfig{Threshold: 24 * time.Hour, RetentionEnabled: true})
 	hooks := &purgeRegistryHooks{RepoPurgeRegistry: f.store.(RepoPurgeRegistry)}
-	// An in-flight pre-delete push re-registers its pack right after the
-	// tombstoning phase (content-addressed retry: same id, same key).
-	hooks.afterRetire = func() { f.register(repo.RepoID, "p1", packKey) }
+	// An in-flight pre-delete push tries to re-register its pack right
+	// after the tombstoning phase (content-addressed retry: same id, same
+	// key). The purge fence written in phase 0 must reject it — this is
+	// what closes the verify-then-complete window (PR #105 security
+	// round): no registration can settle between the zero-row
+	// verification and the completion commit.
+	var lateErr error
+	hooks.afterRetire = func() {
+		lateErr = f.store.RegisterPacks(ctx, repo.RepoID, []ref.Pack{{ID: "p1", Key: packKey}})
+	}
+	purger := NewRepoPurger(sweeper, hooks, f.meta.(RepoPurgeMeta), 0, slog.New(slog.DiscardHandler))
+	purger.now = func() time.Time { return time.Now().Add(2 * time.Hour) }
+
+	// The purge completes in ONE pass: the late writer never lands a row.
+	if _, err := purger.PurgeRepo(ctx, repo.RepoID); err != nil {
+		t.Fatalf("PurgeRepo = %v, want success (fenced late writer)", err)
+	}
+	if !errors.Is(lateErr, ref.ErrRepoPurged) {
+		t.Fatalf("late RegisterPacks = %v, want ErrRepoPurged", lateErr)
+	}
+	f.assertPurged(repo.RepoID)
+	// The fence outlives the purge: post-completion registrations of any
+	// class are rejected too, so nothing can ever strand rows behind the
+	// stamped tombstone.
+	if err := f.store.RegisterPacks(ctx, repo.RepoID, []ref.Pack{{ID: "p2", Key: packKey}}); !errors.Is(err, ref.ErrRepoPurged) {
+		t.Fatalf("post-purge RegisterPacks = %v, want ErrRepoPurged", err)
+	}
+	if err := f.store.RegisterLFSObject(ctx, repo.RepoID, lfsKey, 1); !errors.Is(err, ref.ErrRepoPurged) {
+		t.Fatalf("post-purge RegisterLFSObject = %v, want ErrRepoPurged", err)
+	}
+}
+
+// stragglerRowRegistry simulates a row that appears after tombstoning
+// through a path the fence cannot see (defense-in-depth: no such path
+// exists today — pack and LFS registrations are fenced — but the
+// verification must stay authoritative regardless).
+type stragglerRowRegistry struct {
+	RepoPurgeRegistry
+	stragglers int64 // one-shot CountRepoRows override
+}
+
+func (s *stragglerRowRegistry) CountRepoRows(ctx context.Context, group []string) (int64, error) {
+	if n := s.stragglers; n > 0 {
+		s.stragglers = 0
+		return n, nil
+	}
+	return s.RepoPurgeRegistry.CountRepoRows(ctx, group)
+}
+
+func TestPurgeRepo_StragglerRowsDefer(t *testing.T) {
+	f := newPurgeFixture(t)
+	ctx := context.Background()
+	repo := f.seedRepo("https://example.com/straggler.git")
+	f.softDelete(repo.URL)
+
+	sweeper := f.sweeper(SweepConfig{Threshold: 24 * time.Hour, RetentionEnabled: true})
+	hooks := &stragglerRowRegistry{RepoPurgeRegistry: f.store.(RepoPurgeRegistry), stragglers: 1}
 	purger := NewRepoPurger(sweeper, hooks, f.meta.(RepoPurgeMeta), 0, slog.New(slog.DiscardHandler))
 	purger.now = func() time.Time { return time.Now().Add(2 * time.Hour) }
 
 	if _, err := purger.PurgeRepo(ctx, repo.RepoID); !errors.Is(err, ErrPurgeDeferred) {
 		t.Fatalf("PurgeRepo = %v, want ErrPurgeDeferred", err)
 	}
-	// The re-registered blob was spared — present, never quarantined —
-	// and the meta row survived for the retry.
-	if !f.exists(packKey) {
-		t.Fatal("re-registered blob was deleted")
+	// Deferred: no completion stamp, so the next pass retries and wins.
+	if state, found, err := f.meta.(RepoPurgeMeta).RepoPurgeState(ctx, repo.RepoID); err != nil || !found || state.PurgedAt != nil {
+		t.Fatalf("deferred purge stamped the tombstone: found=%v state=%+v err=%v", found, state, err)
 	}
-	if len(f.backupKeys(packKey)) != 0 {
-		t.Fatal("re-registered blob was quarantined")
-	}
-	if _, found, err := f.meta.(RepoPurgeMeta).RepoPurgeState(ctx, repo.RepoID); err != nil || !found {
-		t.Fatalf("meta tombstone lost: found=%v err=%v", found, err)
-	}
-	// The next pass re-tombstones the row and completes.
 	if _, err := purger.PurgeRepo(ctx, repo.RepoID); err != nil {
 		t.Fatalf("retried purge: %v", err)
 	}

@@ -15,9 +15,17 @@ package ref
 
 import (
 	"context"
+	"errors"
 
 	"github.com/jackc/pgx/v5"
 )
+
+// ErrRepoPurged rejects a pack or LFS registration for a repository whose
+// purge has begun (fence row present, see FenceRepoPurge): the write
+// pipeline resolved the repository before its soft-delete, and letting the
+// registration commit could strand rows — or worse, re-point storage —
+// behind a completed purge. Surfaces to the writer as a failed push.
+var ErrRepoPurged = errors.New("repository is being purged")
 
 // validatePurgeGroup asserts the shared purge-seam argument invariants.
 func validatePurgeGroup(group []string) {
@@ -25,6 +33,37 @@ func validatePurgeGroup(group []string) {
 	for _, r := range group {
 		assertf(r != "", "purge: empty repo key in group %v", group)
 	}
+}
+
+// FenceRepoPurge durably marks the BASE repo as purge-fenced — the purge's
+// first destructive-side step, BEFORE any row is tombstoned. Registrations
+// serialize against the fence through lockBaseLedger (PG) or the database
+// single-writer lock (SQLite): once this commits, every later RegisterPacks
+// / RegisterLFSObject for the group fails with ErrRepoPurged, so the
+// purge's later verification-then-completion cannot be raced by a write
+// that settles in between (PR #105 security round) — any straggler row
+// either landed before the fence (re-tombstoned by the resumed purge) or
+// can never land at all. Fences are permanent, like the name burn;
+// idempotent.
+func (s *PG) FenceRepoPurge(ctx context.Context, base string) error {
+	assertf(base != "", "FenceRepoPurge: empty base repo")
+	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		if err := lockBaseLedger(ctx, tx, base); err != nil {
+			return err
+		}
+		_, err := tx.Exec(ctx,
+			`INSERT INTO purged_repos (repo) VALUES ($1) ON CONFLICT DO NOTHING`, base)
+		return err
+	})
+}
+
+// repoPurgeFencedPG reports whether repo's BASE is purge-fenced; called
+// inside registration transactions that already hold the base-ledger lock.
+func repoPurgeFencedPG(ctx context.Context, tx pgx.Tx, repo string) (bool, error) {
+	var fenced bool
+	err := tx.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM purged_repos WHERE repo = $1)`, baseRepoOf(repo)).Scan(&fenced)
+	return fenced, err
 }
 
 // DropRepoRefs deletes every ref row of the group's repos (purge phase:

@@ -43,6 +43,12 @@ import (
 // wiring type-asserts the concrete backend (see the compile-time
 // assertions below).
 type RepoPurgeRegistry interface {
+	// FenceRepoPurge durably write-fences the base repo (phase 0, before
+	// any tombstoning): pack/LFS registrations for the group fail with
+	// ref.ErrRepoPurged from then on, so the later verification and
+	// completion cannot be raced by an in-flight pre-delete writer.
+	// Permanent, like the name burn; idempotent.
+	FenceRepoPurge(ctx context.Context, base string) error
 	// DropRepoRefs deletes the group's ref rows (purge phase 1 — refs die
 	// first, so no later phase can strand a committed ref).
 	DropRepoRefs(ctx context.Context, group []string) (int64, error)
@@ -258,6 +264,19 @@ func (p *RepoPurger) purgeRepo(ctx context.Context, repoID string) (RepoPurgeRep
 	}
 
 	group := blob.QuotaRepoGroup(repoID)
+	// Phase 0: durable write fence, BEFORE any tombstoning. Pack/LFS
+	// registrations serialize against it in the ref store, so every
+	// straggler write either committed before this fence (its rows are
+	// tombstoned by phases 1–3 / the next resume) or fails with
+	// ref.ErrRepoPurged — the phase-5 verification below can then never
+	// be invalidated by a write settling after it (PR #105 security
+	// round). Ref-only CAS writes are not fenced: pushes register packs
+	// before any ref CAS, so a fenced push dies before touching refs, and
+	// a hypothetical straggler ref row is unreachable metadata (the repo
+	// no longer resolves) that carries no bytes.
+	if err := p.registry.FenceRepoPurge(ctx, repoID); err != nil {
+		return rep, fmt.Errorf("fence repo purge: %w", err)
+	}
 	// Phases 1–3: tombstone registry rows strictly before touching blobs.
 	if rep.RefsDropped, err = p.registry.DropRepoRefs(ctx, group); err != nil {
 		return rep, fmt.Errorf("drop refs: %w", err)

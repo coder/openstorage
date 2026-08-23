@@ -451,6 +451,12 @@ CREATE TABLE IF NOT EXISTS lfs_objects (repo text, key text, bytes bigint NOT NU
 -- never looser.
 CREATE TABLE IF NOT EXISTS lfs_object_counts (repo text PRIMARY KEY, count bigint NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS lfs_adoption_gens (repo text PRIMARY KEY, gen bigint NOT NULL DEFAULT 0);
+-- Repository purge fence (issue #52, PR #105 security round): one row per
+-- BASE repo whose purge began. Pack/LFS registrations check it under the
+-- base-ledger lock and fail closed, so no write settling after the fence
+-- can strand registry rows behind a completed purge.
+CREATE TABLE IF NOT EXISTS purged_repos (repo text PRIMARY KEY,
+                                         fenced_at timestamptz NOT NULL DEFAULT now());
 -- Idempotent additive migration for pre-p3 dev databases (backfills
 -- existing rows via the NOT NULL DEFAULT).
 ALTER TABLE refs ADD COLUMN IF NOT EXISTS created_at timestamptz NOT NULL DEFAULT now();
@@ -755,18 +761,20 @@ func (s *PG) CASRef(ctx context.Context, repo, name, old, new string) (won bool,
 // ReservePackBytes read one snapshot without locking against registration.
 func (s *PG) RegisterPacks(ctx context.Context, repo string, packs []Pack) error {
 	assertf(len(packs) > 0, "RegisterPacks called with no packs")
-	mayAdopt := false
-	for _, p := range packs {
-		mayAdopt = mayAdopt || p.Adopted
-	}
 	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
-		if mayAdopt {
-			// A possible adoption bump below must be serialized with the
-			// admission recheck (Codex round 65, ledger.go
-			// lockBaseLedger), lock-first before any row work.
-			if err := lockBaseLedger(ctx, tx, baseRepoOf(repo)); err != nil {
-				return err
-			}
+		// Lock-first before any row work, unconditionally: an adoption
+		// bump below must be serialized with the admission recheck (Codex
+		// round 65, ledger.go lockBaseLedger), and the purge-fence check
+		// must be ordered against FenceRepoPurge's insert (issue #52) —
+		// without the lock, a registration could read the fence as absent
+		// and commit after the purge's zero-row verification.
+		if err := lockBaseLedger(ctx, tx, baseRepoOf(repo)); err != nil {
+			return err
+		}
+		if fenced, err := repoPurgeFencedPG(ctx, tx, repo); err != nil {
+			return err
+		} else if fenced {
+			return fmt.Errorf("register packs %s: %w", repo, ErrRepoPurged)
 		}
 		var credit int64
 		adopted := false

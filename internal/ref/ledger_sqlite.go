@@ -283,6 +283,13 @@ func (s *SQLite) registerLFSObjectTx(ctx context.Context, repo, key string, byte
 		return fmt.Errorf("register lfs object begin: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+	// Purge fence (issue #52): the single-writer transaction orders this
+	// read against FenceRepoPurge's insert — see the PG twin.
+	if fenced, err := repoPurgeFencedSQLite(ctx, tx, repo); err != nil {
+		return err
+	} else if fenced {
+		return fmt.Errorf("register lfs object %s: %w", key, ErrRepoPurged)
+	}
 	res, err := tx.ExecContext(ctx,
 		`INSERT INTO lfs_objects (repo, key, bytes) VALUES (?, ?, ?) ON CONFLICT DO NOTHING`,
 		repo, key, bytes)

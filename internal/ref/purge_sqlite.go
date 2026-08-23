@@ -5,7 +5,9 @@ package ref
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
+	"time"
 )
 
 // inList returns n comma-separated SQL placeholders ("?,?,..."), the full
@@ -24,6 +26,26 @@ func purgeGroupArgs(group []string) []any {
 		args[i] = r
 	}
 	return args
+}
+
+// FenceRepoPurge — see the PG twin. SQLite's single-writer transactions
+// (BEGIN IMMEDIATE) already totally order the fence insert against every
+// registration transaction, so no extra lock is needed.
+func (s *SQLite) FenceRepoPurge(ctx context.Context, base string) error {
+	assertf(base != "", "FenceRepoPurge: empty base repo")
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO purged_repos (repo, fenced_at) VALUES (?, ?) ON CONFLICT DO NOTHING`,
+		base, time.Now().UnixNano())
+	return err
+}
+
+// repoPurgeFencedSQLite mirrors repoPurgeFencedPG inside a registration
+// transaction.
+func repoPurgeFencedSQLite(ctx context.Context, tx *sql.Tx, repo string) (bool, error) {
+	var fenced bool
+	err := tx.QueryRowContext(ctx,
+		`SELECT EXISTS (SELECT 1 FROM purged_repos WHERE repo = ?)`, baseRepoOf(repo)).Scan(&fenced)
+	return fenced, err
 }
 
 // DropRepoRefs — see the PG twin.

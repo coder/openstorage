@@ -84,7 +84,10 @@ authorize against a new repository created at that URL.
 
 Purged repositories drop out of every registry surface except the tombstoned metadata
 row (soft-deleted plus a purge timestamp), which keeps `DELETE`-then-recreate races and
-stale-token replays structurally impossible.
+stale-token replays structurally impossible. A purge also write-fences the repository
+in the ref store before touching anything: a push that resolved the repository just
+before its deletion and is still in flight fails its pack/LFS registration instead of
+re-registering rows behind the purge.
 
 The purge is crash-safe by ordering, the inverse of the write path's
 publish-before-registration: registry rows are tombstoned **before** any blob is

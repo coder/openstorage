@@ -114,6 +114,10 @@ func (s *SQLite) InitSchema(ctx context.Context) error {
 		// O(1) object-count cap reads — see the PG DDL for the rationale.
 		`CREATE TABLE IF NOT EXISTS lfs_object_counts (repo TEXT PRIMARY KEY, count INTEGER NOT NULL DEFAULT 0)`,
 		`CREATE TABLE IF NOT EXISTS lfs_adoption_gens (repo TEXT PRIMARY KEY, gen INTEGER NOT NULL DEFAULT 0)`,
+		// Repository purge fence (issue #52, PR #105 security round):
+		// see the PG schema comment.
+		`CREATE TABLE IF NOT EXISTS purged_repos (repo TEXT PRIMARY KEY,
+		    fenced_at INTEGER NOT NULL DEFAULT 0)`,
 	} {
 		if _, err := tx.ExecContext(ctx, stmt); err != nil {
 			return fmt.Errorf("sqlite init schema: %w", err)
@@ -352,6 +356,13 @@ func (s *SQLite) RegisterPacks(ctx context.Context, repo string, packs []Pack) e
 		return fmt.Errorf("register packs begin: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+	// Purge fence (issue #52): the single-writer transaction orders this
+	// read against FenceRepoPurge's insert — see the PG twin.
+	if fenced, err := repoPurgeFencedSQLite(ctx, tx, repo); err != nil {
+		return err
+	} else if fenced {
+		return fmt.Errorf("register packs %s: %w", repo, ErrRepoPurged)
+	}
 	var credit int64
 	adopted := false
 	for _, p := range packs {

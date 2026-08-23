@@ -5,6 +5,8 @@ package ref
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"testing"
 	"time"
 )
@@ -13,6 +15,7 @@ import (
 // deliberately live off RefStore; jobs.RepoPurgeRegistry mirrors this).
 type purgeStore interface {
 	Store
+	FenceRepoPurge(ctx context.Context, base string) error
 	DropRepoRefs(ctx context.Context, group []string) (int64, error)
 	RetireRepoPacks(ctx context.Context, group []string) (int64, error)
 	DropRepoLFSObjects(ctx context.Context, group []string) (int64, error)
@@ -84,6 +87,31 @@ func TestRepoPurgeSeams(t *testing.T) {
 			t.Fatal("seed produced no usage bytes")
 		}
 
+		// Phase 0: the write fence. Once fenced, pack and LFS
+		// registrations for ANY group member fail with ErrRepoPurged —
+		// including namespaced keys, which fence by their base — while
+		// the control repo keeps writing. Idempotent.
+		if err := ps.FenceRepoPurge(ctx, base); err != nil {
+			t.Fatalf("FenceRepoPurge: %v", err)
+		}
+		if err := ps.FenceRepoPurge(ctx, base); err != nil {
+			t.Fatalf("FenceRepoPurge rerun: %v", err)
+		}
+		late := Pack{ID: "late", Key: "packs/" + base + "/pack-late.pack", Size: 1}
+		if err := s.RegisterPacks(ctx, base, []Pack{late}); !errors.Is(err, ErrRepoPurged) {
+			t.Fatalf("RegisterPacks(fenced base) = %v, want ErrRepoPurged", err)
+		}
+		if err := s.RegisterPacks(ctx, base+"+import", []Pack{{ID: "ln", Key: "packs/" + base + "+import/pack-ln.pack"}}); !errors.Is(err, ErrRepoPurged) {
+			t.Fatalf("RegisterPacks(fenced namespace) = %v, want ErrRepoPurged", err)
+		}
+		lateOID := strings.Repeat("b", 64)
+		if err := s.RegisterLFSObject(ctx, base, "lfs/"+base+"/"+lateOID, 1); !errors.Is(err, ErrRepoPurged) {
+			t.Fatalf("RegisterLFSObject(fenced) = %v, want ErrRepoPurged", err)
+		}
+		if err := s.RegisterPacks(ctx, other, []Pack{{ID: "ok", Key: "packs/" + other + "/pack-ok.pack", Size: 2}}); err != nil {
+			t.Fatalf("control RegisterPacks after fence: %v", err)
+		}
+
 		// Phase 1: refs die, group-wide, control untouched, idempotent.
 		if n, err := ps.DropRepoRefs(ctx, group); err != nil || n != 4 {
 			t.Fatalf("DropRepoRefs: n=%d err=%v (want 4)", n, err)
@@ -146,8 +174,8 @@ func TestRepoPurgeSeams(t *testing.T) {
 		if n, err := ps.CountRepoRows(ctx, group); err != nil || n != 0 {
 			t.Fatalf("CountRepoRows(group): n=%d err=%v (want 0)", n, err)
 		}
-		if n, err := ps.CountRepoRows(ctx, otherGroup); err != nil || n != 4 {
-			t.Fatalf("CountRepoRows(other): n=%d err=%v (want 4: 2 refs + pack + lfs)", n, err)
+		if n, err := ps.CountRepoRows(ctx, otherGroup); err != nil || n != 5 {
+			t.Fatalf("CountRepoRows(other): n=%d err=%v (want 5: 2 refs + 2 packs + lfs)", n, err)
 		}
 
 		// Phase 6: ledger rows die wholesale; control accounting intact.
@@ -164,8 +192,8 @@ func TestRepoPurgeSeams(t *testing.T) {
 		if gen, err := s.GetGeneration(ctx, base); err != nil || gen != 0 {
 			t.Fatalf("GetGeneration after purge: %d err=%v", gen, err)
 		}
-		if got := ledgerState(t, s, otherGroup).UsageBytes; got != po.Size+3 {
-			t.Fatalf("control usage after purge: %d (want %d)", got, po.Size+3)
+		if got := ledgerState(t, s, otherGroup).UsageBytes; got != po.Size+3+2 {
+			t.Fatalf("control usage after purge: %d (want %d)", got, po.Size+3+2)
 		}
 		if n, err := ps.PurgeRepoLedger(ctx, group); err != nil || n != 0 {
 			t.Fatalf("PurgeRepoLedger rerun: n=%d err=%v (want 0)", n, err)

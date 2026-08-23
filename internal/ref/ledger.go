@@ -747,13 +747,18 @@ func (s *PG) RegisterAdoptedLFSObject(ctx context.Context, repo, key string, byt
 
 func (s *PG) registerLFSObjectTx(ctx context.Context, repo, key string, bytes int64, adopted bool) error {
 	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
-		if adopted {
-			// The adoption bump below must be serialized with the
-			// admission recheck (Codex round 65, lockBaseLedger); LFS
-			// repos are always base repos (ADR-35).
-			if err := lockBaseLedger(ctx, tx, repo); err != nil {
-				return err
-			}
+		// Lock-first unconditionally, mirroring RegisterPacks: the
+		// adoption bump must be serialized with the admission recheck
+		// (Codex round 65), and the purge-fence check below must be
+		// ordered against FenceRepoPurge's insert (issue #52). LFS repos
+		// are always base repos (ADR-35).
+		if err := lockBaseLedger(ctx, tx, repo); err != nil {
+			return err
+		}
+		if fenced, err := repoPurgeFencedPG(ctx, tx, repo); err != nil {
+			return err
+		} else if fenced {
+			return fmt.Errorf("register lfs object %s: %w", key, ErrRepoPurged)
 		}
 		ct, err := tx.Exec(ctx,
 			`INSERT INTO lfs_objects (repo, key, bytes) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
