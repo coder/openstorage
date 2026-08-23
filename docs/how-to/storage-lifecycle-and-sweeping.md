@@ -80,7 +80,10 @@ packs, LFS objects):
 Both are **irreversible** — there is no restore after a purge. The repository row is
 kept as a permanent tombstone, so the burned `(org, url)` name is **never released**:
 an unexpired token carries the repository URL in its claim and would otherwise
-authorize against a new repository created at that URL.
+authorize against a new repository created at that URL. Both also share the
+[fleet-upgrade prerequisite](../reference/configuration.md#codestorage_repo_retention):
+every serve replica and hook-running git node must run a fence-aware build before the
+first purge.
 
 Purged repositories drop out of every registry surface except the tombstoned metadata
 row (soft-deleted plus a purge timestamp), which keeps `DELETE`-then-recreate races and

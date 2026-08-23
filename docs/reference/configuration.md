@@ -518,6 +518,14 @@ command runs the same primitive synchronously for one repository.
   push can race it), and sweeping must be enabled
   ([`CODESTORAGE_SWEEP_INTERVAL`](#codestorage_sweep_interval) > 0) — the purge rides
   the sweep schedule.
+- **Fleet-upgrade prerequisite:** enable only once **every** node — serve replicas *and*
+  hook-running git nodes — runs a build with the purge write fence (ref updates and
+  pack/LFS registrations reject purged repositories). Older binaries do not check the
+  fence, so on a mixed fleet a write accepted by an old node can commit after the
+  purge's verification and be stranded behind the completed purge while reporting
+  success. The same prerequisite applies to running
+  [`codestorage purge-repo`](cli.md#codestorage-purge-repo). Leaving retention unset is
+  safe on any fleet.
 - **Purged repositories cannot be restored.** The repository row is kept as a permanent
   tombstone, so the burned `(org, url)` name is never released: JWT repo claims are
   URL-scoped and can outlive any retention window, and a name reuse would let a stale

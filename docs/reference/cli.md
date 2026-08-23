@@ -158,6 +158,12 @@ outlive the purge, so the name is never released). The repository must already b
 soft-deleted (`DELETE /api/v1/repos/delete`) at least one hour earlier — younger
 deletions are refused so no in-flight pre-delete push can race the purge.
 
+**Fleet-upgrade prerequisite:** run this only once every node — serve replicas *and*
+hook-running git nodes — runs a build with the purge write fence, exactly like enabling
+[`CODESTORAGE_REPO_RETENTION`](configuration.md#codestorage_repo_retention): an older
+binary does not check the fence, so its in-flight write can be stranded behind the
+completed purge.
+
 ```
 codestorage purge-repo [flags] <repo-id>
 ```
