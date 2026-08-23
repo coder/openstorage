@@ -13,6 +13,24 @@ import (
 	"time"
 )
 
+// TestDeferredRetryDelayLegacyBackoff: a lapsed LEGACY claim may be
+// deliberately non-stealable (opt-in unset), so its retry must probe at
+// lease-slack cadence, not spin at the one-second floor.
+func TestDeferredRetryDelayLegacyBackoff(t *testing.T) {
+	lapsed := Upstream{SyncClaimHolder: "h-dead", SyncClaimExpiresAt: time.Now().Add(-time.Hour)}
+	if d := deferredRetryDelay(lapsed); d != deferRetrySlack {
+		t.Errorf("lapsed lease-aware delay = %v, want floor %v", d, deferRetrySlack)
+	}
+	lapsedLegacy := Upstream{SyncClaimHolder: LegacyClaimHolder, SyncClaimExpiresAt: time.Now().Add(-time.Hour)}
+	if d := deferredRetryDelay(lapsedLegacy); d != claimLeaseSlack {
+		t.Errorf("lapsed legacy delay = %v, want backoff %v", d, claimLeaseSlack)
+	}
+	live := Upstream{SyncClaimHolder: "h-live", SyncClaimExpiresAt: time.Now().Add(time.Minute)}
+	if d := deferredRetryDelay(live); d < time.Minute || d > time.Minute+2*deferRetrySlack {
+		t.Errorf("live-claim delay = %v, want ~expiry+slack", d)
+	}
+}
+
 // backdateClaim expires the repo's current claim in place — the test-side
 // stand-in for a lease running out while the holder is stuck.
 func backdateClaim(t *testing.T, m *MemStore, repoID string) {

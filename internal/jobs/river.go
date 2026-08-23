@@ -309,6 +309,34 @@ func (w *deliveryWorker) Work(ctx context.Context, job *river.Job[deliveryArgs])
 // transaction (mirrors repackFollowUpDelay for the analogous repack gate).
 const syncFollowUpSnooze = 5 * time.Second
 
+// legacyClaimSnooze paces re-runs against a lapsed LEGACY claim, which may
+// be deliberately non-stealable (meta.EnvSyncStealLegacy unset): the
+// durable job must stay alive for the moment the opt-in lands or the old
+// replica finishes, but not spin the queue and store every few seconds.
+const legacyClaimSnooze = 5 * time.Minute
+
+// syncSnoozeDelay computes the uncovered-pending-request snooze: the base
+// completion-retry delay normally, until just past the observed claim
+// expiry when a claim is held, at legacy pace for lapsed legacy claims,
+// capped for clock-skew paranoia (the delay only defers the retry, never
+// correctness — each re-run recomputes from the row).
+func syncSnoozeDelay(up sync.Upstream) time.Duration {
+	delay := syncFollowUpSnooze
+	if !up.Syncing {
+		return delay
+	}
+	if until := time.Until(up.SyncClaimExpiresAt) + time.Second; until > delay {
+		delay = until
+	}
+	if up.SyncClaimHolder == sync.LegacyClaimHolder && delay < legacyClaimSnooze {
+		delay = legacyClaimSnooze
+	}
+	if delay > 30*time.Minute {
+		delay = 30 * time.Minute
+	}
+	return delay
+}
+
 // syncWorker executes one sync run. Run's error return is for logging only
 // (documented failure outcomes already emitted repo.sync.failed), so the
 // job always completes — through the gated transactional completion below,
@@ -417,17 +445,7 @@ func (w *syncWorker) Work(ctx context.Context, job *river.Job[syncArgs]) error {
 		// holder's lease is stealable once expired — so wake just past
 		// the observed expiry when a claim is held. (Returning without
 		// commit rolls the completion back.)
-		delay := syncFollowUpSnooze
-		if up.Syncing {
-			if until := time.Until(up.SyncClaimExpiresAt) + time.Second; until > delay {
-				delay = until
-			}
-			// Clock-skew paranoia cap: the delay only defers the retry,
-			// never correctness — each re-run recomputes from the row.
-			if delay > 30*time.Minute {
-				delay = 30 * time.Minute
-			}
-		}
+		delay := syncSnoozeDelay(up)
 		w.logger.Warn("sync: uncovered pending request; snoozing to retry it",
 			"repo", job.Args.RepoID, "delay", delay, "claimHeld", up.Syncing, "err", runErr)
 		return river.JobSnooze(delay)

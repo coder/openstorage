@@ -9,9 +9,9 @@ import (
 	"time"
 )
 
-// legacyClaimHolder mirrors meta.LegacyClaimHolder (the sync package must
+// LegacyClaimHolder mirrors meta.LegacyClaimHolder (the sync package must
 // not import meta): a claim adopted from a pre-lease writer under a grace.
-const legacyClaimHolder = "!legacy-grace"
+const LegacyClaimHolder = "!legacy-grace"
 
 // MemStore is an in-memory CredentialStore + UpstreamStore: the test
 // double and the local-mode stand-in until the durable meta-backed rows
@@ -171,11 +171,11 @@ func (m *MemStore) BeginSync(_ context.Context, repoID, holder string, lease tim
 			// Legacy claim (pre-lease writer, mixed fleet): adopt with a
 			// full grace instead of stealing what may be a live run
 			// (meta.LegacyClaimHolder semantics, issue #86).
-			up.SyncClaimHolder, up.SyncClaimExpiresAt = legacyClaimHolder, time.Now().Add(lease)
+			up.SyncClaimHolder, up.SyncClaimExpiresAt = LegacyClaimHolder, time.Now().Add(lease)
 			m.upstreams[repoID] = up
 			return Upstream{}, "", ErrSyncInProgress
 		}
-		if up.SyncClaimHolder == legacyClaimHolder {
+		if up.SyncClaimHolder == LegacyClaimHolder {
 			// Stealing an adopted legacy claim needs the operator's
 			// drained-fleet assertion (meta.EnvSyncStealLegacy).
 			if v, err := strconv.ParseBool(os.Getenv("CODESTORAGE_SYNC_STEAL_LEGACY")); err != nil || !v {

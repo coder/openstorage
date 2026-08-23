@@ -23,6 +23,27 @@ import (
 	"github.com/coder/code-storage/internal/sync"
 )
 
+// TestSyncSnoozeDelayLegacyBackoff: a lapsed LEGACY claim may be
+// deliberately non-stealable (opt-in unset) — the durable job must pace
+// its re-runs at legacy cadence instead of spinning every few seconds.
+func TestSyncSnoozeDelayLegacyBackoff(t *testing.T) {
+	if d := syncSnoozeDelay(sync.Upstream{}); d != syncFollowUpSnooze {
+		t.Errorf("no-claim delay = %v, want %v", d, syncFollowUpSnooze)
+	}
+	lapsed := sync.Upstream{Syncing: true, SyncClaimHolder: "h-dead", SyncClaimExpiresAt: time.Now().Add(-time.Hour)}
+	if d := syncSnoozeDelay(lapsed); d != syncFollowUpSnooze {
+		t.Errorf("lapsed lease-aware delay = %v, want %v", d, syncFollowUpSnooze)
+	}
+	lapsedLegacy := sync.Upstream{Syncing: true, SyncClaimHolder: sync.LegacyClaimHolder, SyncClaimExpiresAt: time.Now().Add(-time.Hour)}
+	if d := syncSnoozeDelay(lapsedLegacy); d != legacyClaimSnooze {
+		t.Errorf("lapsed legacy delay = %v, want %v", d, legacyClaimSnooze)
+	}
+	frozen := sync.Upstream{Syncing: true, SyncClaimHolder: "h-live", SyncClaimExpiresAt: time.Now().Add(2 * time.Hour)}
+	if d := syncSnoozeDelay(frozen); d != 30*time.Minute {
+		t.Errorf("far-future delay = %v, want the 30m cap", d)
+	}
+}
+
 // livenessPG starts one postgres container for a river liveness test.
 func livenessPG(t *testing.T, ctx context.Context) string {
 	t.Helper()

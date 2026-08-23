@@ -340,6 +340,24 @@ func (w *Worker) Run(ctx context.Context, job Job) error {
 // stolen (clock granularity, store latency).
 const deferRetrySlack = time.Second
 
+// deferredRetryDelay computes how long a claim-skip retry waits for the
+// observed claim: just past its expiry normally, but a LEGACY claim
+// (adopted from a pre-lease replica) may be deliberately non-stealable
+// (meta.EnvSyncStealLegacy unset), so a lapsed one is probed at
+// lease-slack cadence instead of spinning at the floor — the retry loop
+// stays alive for the moment the operator enables the opt-in (or the old
+// replica finishes) without burning queue and store work every second.
+func deferredRetryDelay(up Upstream) time.Duration {
+	delay := time.Until(up.SyncClaimExpiresAt) + deferRetrySlack
+	if delay < deferRetrySlack {
+		delay = deferRetrySlack
+	}
+	if up.SyncClaimHolder == LegacyClaimHolder && delay < claimLeaseSlack {
+		delay = claimLeaseSlack
+	}
+	return delay
+}
+
 // deferPendingRetry schedules one delayed re-enqueue after a claim-skip
 // that would otherwise strand an accepted pull-upstream request: when the
 // refusing claim's holder is DEAD (crashed process, lease not yet
@@ -374,11 +392,7 @@ func (w *Worker) deferPendingRetry(ctx context.Context, job Job) {
 	w.deferredRetry[job.RepoID] = true
 	w.deferMu.Unlock()
 
-	delay := time.Until(up.SyncClaimExpiresAt) + deferRetrySlack
-	if delay < deferRetrySlack {
-		delay = deferRetrySlack
-	}
-	time.AfterFunc(delay, func() {
+	time.AfterFunc(deferredRetryDelay(up), func() {
 		w.deferMu.Lock()
 		delete(w.deferredRetry, job.RepoID)
 		w.deferMu.Unlock()
