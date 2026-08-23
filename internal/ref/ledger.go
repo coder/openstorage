@@ -185,12 +185,20 @@ const AdoptionClaimTTL = 30 * time.Minute
 func (s *PG) TryAdoptionClaim(ctx context.Context, repo, key string) (bool, string, error) {
 	assertf(repo != "" && key != "", "TryAdoptionClaim(%q, %q)", repo, key)
 	owner := NewReservationOwner()
+	// The purge-fence guard is inside the statement (issue #52, PR #105
+	// round 13): a pre-delete LFS touch reaching this after a purge
+	// re-run's ledger cleanup must not recreate a claim row behind the
+	// completed purge on no-sweep deployments. No proposed row for a
+	// fenced repo means no insert AND no steal — claimed=false, the
+	// caller simply skips adoption. Claim rows are TTL'd, so the
+	// single-statement snapshot residual self-heals regardless.
 	ct, err := s.pool.Exec(ctx, `
 INSERT INTO pack_reservations (key, repo, bytes, owner, created_at, gen)
-VALUES ($1, $2, 1, $3, now(), '')
+SELECT $1, $2, 1, $3, now(), ''
+WHERE NOT EXISTS (SELECT 1 FROM purged_repos WHERE repo = $5)
 ON CONFLICT (key) DO UPDATE SET repo = EXCLUDED.repo, owner = EXCLUDED.owner, created_at = now()
 WHERE pack_reservations.created_at <= now() - make_interval(secs => $4)`,
-		key+AdoptionClaimSuffix, repo, owner, AdoptionClaimTTL.Seconds())
+		key+AdoptionClaimSuffix, repo, owner, AdoptionClaimTTL.Seconds(), baseRepoOf(repo))
 	if err != nil {
 		return false, "", err
 	}

@@ -269,14 +269,14 @@ func TestPurgedRepoStragglers(t *testing.T) {
 	}
 
 	// Path 2: a purge-repo re-run rescans and reaps a fresh straggler
-	// immediately (no age threshold — rows are provably gone), and
-	// repeats the ledger cleanup: an adoption-claim reservation minted by
-	// an in-flight pre-delete writer AFTER completion (the one ledger
-	// write outside the fence's reach) must not survive the re-run.
+	// immediately (no age threshold — rows are provably gone). A late
+	// adoption claim — the last row-creating ledger path — is rejected by
+	// the fence outright (round 13), so nothing is left for the rescan's
+	// defense-in-depth ledger cleanup to remove.
 	straggler2 := blob.PackKey(repo.RepoID, "late2")
 	f.upload(straggler2, "second straggler")
-	if claimed, _, err := f.store.TryAdoptionClaim(ctx, repo.RepoID, blob.LFSKey(repo.RepoID, strings.Repeat("d", 64))); err != nil || !claimed {
-		t.Fatalf("TryAdoptionClaim = (%v, %v), want a claim row", claimed, err)
+	if claimed, _, err := f.store.TryAdoptionClaim(ctx, repo.RepoID, blob.LFSKey(repo.RepoID, strings.Repeat("d", 64))); err != nil || claimed {
+		t.Fatalf("TryAdoptionClaim on purged repo = (%v, %v), want fenced no-claim", claimed, err)
 	}
 	rep, err := purger.PurgeRepo(ctx, repo.RepoID)
 	if err != nil {
@@ -285,8 +285,8 @@ func TestPurgedRepoStragglers(t *testing.T) {
 	if rep.BlobsReaped != 1 || f.exists(straggler2) {
 		t.Fatalf("rescan reaped %d (blob present=%v), want the straggler gone", rep.BlobsReaped, f.exists(straggler2))
 	}
-	if rep.RowsPurged == 0 {
-		t.Fatalf("rescan purged %d ledger rows, want the leaked adoption claim gone", rep.RowsPurged)
+	if rep.RowsPurged != 0 {
+		t.Fatalf("rescan purged %d ledger rows, want 0 (the fence rejected the late claim)", rep.RowsPurged)
 	}
 }
 

@@ -130,6 +130,15 @@ func TestRepoPurgeSeams(t *testing.T) {
 			NewReservationOwner(), 0, 0, 1<<30, time.Hour); !errors.Is(err, ErrRepoPurged) {
 			t.Fatalf("ReservePackBytes(fenced) = %v, want ErrRepoPurged", err)
 		}
+		// Adoption claims are the last row-creating path (round 13): a
+		// fenced repo's claim silently fails, so no TTL'd row can be
+		// minted behind a completed purge.
+		if claimed, _, err := s.TryAdoptionClaim(ctx, base, "lfs/"+base+"/"+strings.Repeat("e", 64)); err != nil || claimed {
+			t.Fatalf("TryAdoptionClaim(fenced) = (%v, %v), want no claim", claimed, err)
+		}
+		if claimed, _, err := s.TryAdoptionClaim(ctx, other, "lfs/"+other+"/"+strings.Repeat("e", 64)); err != nil || !claimed {
+			t.Fatalf("control TryAdoptionClaim = (%v, %v), want claimed", claimed, err)
+		}
 		if err := s.RegisterPacks(ctx, other, []Pack{{ID: "ok", Key: "packs/" + other + "/pack-ok.pack", Size: 2}}); err != nil {
 			t.Fatalf("control RegisterPacks after fence: %v", err)
 		}

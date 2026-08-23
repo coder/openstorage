@@ -376,12 +376,15 @@ func (s *SQLite) LFSAdoptionGen(ctx context.Context, repo string) (int64, error)
 func (s *SQLite) TryAdoptionClaim(ctx context.Context, repo, key string) (bool, string, error) {
 	assertf(repo != "" && key != "", "TryAdoptionClaim(%q, %q)", repo, key)
 	owner := NewReservationOwner()
+	// Purge-fence guard inside the statement — see the PG twin (issue
+	// #52, PR #105 round 13); the single writer totally orders it.
 	res, err := s.db.ExecContext(ctx, `
 INSERT INTO pack_reservations (key, repo, bytes, owner, created_at, gen)
-VALUES (?, ?, 1, ?, `+sqliteEpochMS+`, '')
+SELECT ?, ?, 1, ?, `+sqliteEpochMS+`, ''
+WHERE NOT EXISTS (SELECT 1 FROM purged_repos WHERE repo = ?)
 ON CONFLICT (key) DO UPDATE SET repo = excluded.repo, owner = excluded.owner, created_at = excluded.created_at
 WHERE pack_reservations.created_at <= `+sqliteEpochMS+` - ?`,
-		key+AdoptionClaimSuffix, repo, owner, AdoptionClaimTTL.Milliseconds())
+		key+AdoptionClaimSuffix, repo, owner, baseRepoOf(repo), AdoptionClaimTTL.Milliseconds())
 	if err != nil {
 		return false, "", err
 	}
