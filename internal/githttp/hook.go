@@ -266,6 +266,29 @@ func preReceive(ctx context.Context) error {
 	}
 	defer st.Close()
 
+	// An unpublished pack whose key is already REGISTERED is a RESTORE,
+	// not fresh growth (Codex security round 70): its bytes are in the
+	// usage counter, floors scanned during the absence are deflated by
+	// them, and uploading it through the fresh path would re-materialize
+	// the bytes with no distinct cover (settlement consumes the admission
+	// reservation without crediting or bumping — RowsAffected 0, the
+	// zero-credit no-op). Such packs skip the admission charge (the
+	// zero-growth rule: their bytes are already counted) and the fresh
+	// upload loop; the post-registration EnsurePublished pass Stats them
+	// missing and restores them through the covered, generation-bumping
+	// seam (initial cover → renewed upload → invalidation handoff).
+	restores := make([]bool, len(packs))
+	for i := range packs {
+		if published[i] {
+			continue
+		}
+		has, err := st.HasPack(ctx, repo, packs[i].Key)
+		if err != nil {
+			return fmt.Errorf("pre-receive: registry probe %s: %w", packs[i].Key, err)
+		}
+		restores[i] = has
+	}
+
 	// Per-repo pack-bytes quota (issue #21, quota.go), enforced before any
 	// upload: pre-receive runs BEFORE the update hook's ref policy, so
 	// without this gate even a rejected push durably grows packs/. Denying
@@ -302,7 +325,7 @@ func preReceive(ctx context.Context) error {
 		}
 		var unpublished []ref.Pack
 		for i := range packs {
-			if !published[i] {
+			if !published[i] && !restores[i] {
 				unpublished = append(unpublished, packs[i])
 			}
 		}
@@ -362,8 +385,8 @@ func preReceive(ctx context.Context) error {
 	}
 
 	for i, pf := range packFiles {
-		if published[i] {
-			continue
+		if published[i] || restores[i] {
+			continue // restores go through the covered seam below
 		}
 		if err := bl.UploadFile(ctx, packs[i].Key, pf); err != nil {
 			// PROVEN-clean failure: retire this push's attempts (Codex
