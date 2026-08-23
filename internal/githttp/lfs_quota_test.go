@@ -555,6 +555,66 @@ func TestLFSRepair_CoversRepublishedBytesAgainstStaleFloors(t *testing.T) {
 	}
 }
 
+// reapFreshOnRegister deletes the blob just before a FRESH verified
+// upload's registration commits — the writer-half sweep race whose repair
+// the PUT's post-registration verify performs (issue #5).
+type reapFreshOnRegister struct {
+	ref.Store
+	bl  blob.BlobStore
+	key string
+}
+
+func (r reapFreshOnRegister) RegisterLFSObject(ctx context.Context, repo, key string, bytes int64) error {
+	if key == r.key {
+		if err := r.bl.Delete(ctx, key); err != nil {
+			return fmt.Errorf("test reap: %v", err)
+		}
+	}
+	return r.Store.RegisterLFSObject(ctx, repo, key, bytes)
+}
+
+// TestLFSPut_SweepRaceRestoreIsCoveredAndBumpsGen (Codex round 58): the
+// PUT's post-registration verify re-uploads bytes a racing sweep reaped —
+// counter-accounted bytes made physical again. Like every restore, it must
+// take a pre-publication cover (admissions holding an absence-window floor
+// see the returning bytes in active_reservations) and bump the shared
+// floor generation (future serves re-scan).
+func TestLFSPut_SweepRaceRestoreIsCoveredAndBumpsGen(t *testing.T) {
+	ctx := context.Background()
+	srv, st, mint := newLFSQuotaServer(t, 1000, time.Hour)
+	tok := mint(auth.ScopeGitWrite)
+
+	content := []byte("fresh object reaped mid-registration")
+	oid := sha256Hex(content)
+	key := blob.LFSKey(lfsTestRepoID, oid)
+	srv.Store = reapFreshOnRegister{Store: st, bl: srv.Blob, key: key}
+
+	gen0, err := st.LFSAdoptionGen(ctx, lfsTestRepoID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := doLFS(t, srv, http.MethodPut, "/"+lfsTestRepoURL+".git/info/lfs/objects/"+oid,
+		"basic:"+tok, string(content))
+	if w.Code != http.StatusOK {
+		t.Fatalf("sweep-raced PUT status = %d, body %s", w.Code, w.Body)
+	}
+	if _, err := srv.Blob.Stat(ctx, key); err != nil {
+		t.Fatalf("restore did not republish: %v", err)
+	}
+	// The restore's cover holds the republished bytes beyond the settled
+	// upload reservation (settlement consumed the upload's own row).
+	if ls := ledgerState(t, st, time.Hour); ls.ReservedBytes != int64(len(content)) {
+		t.Fatalf("ledger after sweep-race restore = %+v, want the %d-byte cover reserved", ls, len(content))
+	}
+	gen1, err := st.LFSAdoptionGen(ctx, lfsTestRepoID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gen1 == gen0 {
+		t.Fatal("sweep-race restore did not bump the shared floor generation")
+	}
+}
+
 // TestLFSAdopt_RecheckCatchesRacingSweep (Codex round 1): adoption whose
 // blob a racing sweep reaped before the registration committed must fail
 // the request — the post-registration existence recheck catches it, and the

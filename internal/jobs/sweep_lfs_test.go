@@ -162,6 +162,17 @@ func TestSweepLFS_HealRestoresRegisteredFromQuarantine(t *testing.T) {
 	if gen, err := f.store.LFSAdoptionGen(context.Background(), "repo_lfs"); err != nil || gen == 0 {
 		t.Fatalf("floor generation after quarantine restore = (%d, %v), want > 0", gen, err)
 	}
+	// The bump only stops FUTURE floor serves: an admission already
+	// holding an absence-window floor must see the restored bytes in
+	// active_reservations, so the heal takes a pre-publication cover
+	// reservation (Codex round 58, security).
+	ls, err := f.store.QuotaLedgerState(context.Background(), blob.QuotaRepoGroup("repo_lfs"), time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ls.ReservedBytes != int64(len(content)) {
+		t.Fatalf("ledger after quarantine restore = %+v, want the %d-byte cover reserved", ls, len(content))
+	}
 }
 
 // TestSweepLFS_HealNeverRestoresMismatchedBackup (Codex round 19,
