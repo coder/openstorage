@@ -168,6 +168,13 @@ type EventingStore interface {
 	// survives to that run's FinishSync and the finisher schedules a
 	// follow-up run. ErrNotFound when detached.
 	RequestSync(ctx context.Context, repoID string) error
+	// PendingSyncRepoIDs lists repos whose sync_pending marker is set —
+	// accepted pull-upstream requests not yet covered by a claimed run.
+	// Local-mode boot recovery re-enqueues them (issue #86): queued local
+	// work dies with the process, and the restart that applies the
+	// EnvSyncStealLegacy opt-in would otherwise strand the very requests
+	// it is meant to heal until an unrelated trigger arrives.
+	PendingSyncRepoIDs(ctx context.Context) ([]string, error)
 	// TryBeginSync atomically claims a sync run (syncing false -> true)
 	// under a lease and returns the row as of the claim. holder is the
 	// caller's per-run claim token; the claim records it with an expiry

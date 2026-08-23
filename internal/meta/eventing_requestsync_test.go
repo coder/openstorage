@@ -8,6 +8,7 @@ package meta
 
 import (
 	"errors"
+	"slices"
 	"testing"
 	"time"
 )
@@ -37,12 +38,18 @@ func testRequestSyncPendingLifecycle(t *testing.T, s Backend) {
 		t.Errorf("fresh row has SyncPending set: %+v", got)
 	}
 
-	// Request before any claim: pending until the next claim consumes it.
+	// Request before any claim: pending until the next claim consumes it,
+	// and visible to boot recovery.
 	if err := s.RequestSync(ctx, repoID); err != nil {
 		t.Fatalf("RequestSync: %v", err)
 	}
 	if got, err = s.GetRepoUpstream(ctx, repoID); err != nil || !got.SyncPending {
 		t.Fatalf("after RequestSync: row = %+v, err = %v, want SyncPending", got, err)
+	}
+	// Containment, not equality: the backend database is shared across
+	// the package's tests, which may leave their own pending rows.
+	if ids, err := s.PendingSyncRepoIDs(ctx); err != nil || !slices.Contains(ids, repoID) {
+		t.Errorf("PendingSyncRepoIDs = (%v, %v), want %s listed", ids, err, repoID)
 	}
 	claimed, ok, _, err := s.TryBeginSync(ctx, repoID, testClaimHolder, time.Minute)
 	if err != nil || !ok {

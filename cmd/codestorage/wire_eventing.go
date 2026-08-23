@@ -26,6 +26,10 @@ import (
 	upsync "github.com/coder/code-storage/internal/sync"
 )
 
+// pendingSyncRecoveryDelay defers the local-mode boot recovery scan until
+// the serve listener is up (the recovered runs loopback-push to it).
+const pendingSyncRecoveryDelay = 15 * time.Second
+
 // loopbackTokenTTL is the CEILING for the internally minted git:write JWT
 // of one sync run's loopback push (sync runs are capped at 10 minutes).
 // The worker passes a per-run fence TTL derived from its claim lease
@@ -208,9 +212,35 @@ func buildServeEventing(ctx context.Context, ms meta.Store, dbURL, org, loopback
 		// in-process queue never deduplicates against a running run, so
 		// a plain re-enqueue is sound here.
 		worker.Requeue = queue.EnqueueSync
+		// Boot recovery (issue #86): queued local work and deferred retry
+		// timers die with the process, but the SyncPending marker is
+		// durable — re-enqueue marked repos so accepted pull-upstream
+		// requests survive restarts (in particular the restart that
+		// applies CODESTORAGE_SYNC_STEAL_LEGACY). Delayed so the loopback
+		// listener is serving before the first recovered run pushes; a
+		// run that still meets a held claim re-arms the deferred retry.
+		recovery := time.AfterFunc(pendingSyncRecoveryDelay, func() {
+			rctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			ids, err := ms.PendingSyncRepoIDs(rctx)
+			if err != nil {
+				logger.Warn("pending sync boot recovery failed", "err", err)
+				return
+			}
+			for _, id := range ids {
+				if err := queue.EnqueueSync(rctx, upsync.Job{Org: org, RepoID: id}); err != nil {
+					logger.Warn("pending sync boot recovery enqueue failed", "repo", id, "err", err)
+				}
+			}
+		})
+		cleanup = func() {
+			recovery.Stop()
+			queue.Close()
+		}
 		if sweep != nil {
 			stopSweep := jobs.StartSweepTicker(sweep.Sweeper, sweep.Interval)
 			cleanup = func() {
+				recovery.Stop()
 				stopSweep()
 				queue.Close()
 			}

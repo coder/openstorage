@@ -378,6 +378,29 @@ func (s *PG) RequestSync(ctx context.Context, repoID string) error {
 	return nil
 }
 
+// PendingSyncRepoIDs lists repos with the sync_pending marker set (boot
+// recovery for accepted pull-upstream requests, issue #86).
+func (s *PG) PendingSyncRepoIDs(ctx context.Context) ([]string, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT repo_id FROM repo_upstreams WHERE sync_pending ORDER BY repo_id`)
+	if err != nil {
+		return nil, fmt.Errorf("list pending sync repos: %w", err)
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("list pending sync repos: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list pending sync repos: %w", err)
+	}
+	return ids, nil
+}
+
 // TryBeginSync atomically claims a sync run (syncing false -> true) under
 // a lease and consumes sync_pending (the claimed run's fetch postdates
 // every request marked before the claim). An EXPIRED claim is stolen in

@@ -173,6 +173,10 @@ func (failingStore) RequestSync(context.Context, string) error {
 	panic("not used by signing-key CLI")
 }
 
+func (failingStore) PendingSyncRepoIDs(context.Context) ([]string, error) {
+	panic("not used by signing-key CLI")
+}
+
 func (failingStore) TryBeginSync(context.Context, string, string, time.Duration) (meta.RepoUpstream, bool, string, error) {
 	panic("not used by signing-key CLI")
 }
