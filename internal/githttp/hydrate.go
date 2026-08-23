@@ -167,11 +167,14 @@ var cacheRepoConfig = [][2]string{
 
 // fileUnchanged reports whether two stats identify the same unchanged file:
 // same inode (os.SameFile — rewrites via lockfile/temp + rename always
-// change it), mtime, size, and mode (a bare chmod changes nothing else, and
-// git silently skips non-executable hooks).
+// change it), mtime, size, mode (a bare chmod changes nothing else, and
+// git silently skips non-executable hooks), and ctime (an in-place rewrite
+// can preserve all of the former with a same-length write plus Chtimes,
+// but never ctime — see fileChangeTime).
 func fileUnchanged(a, b os.FileInfo) bool {
 	assertf(a != nil && b != nil, "fileUnchanged: nil FileInfo")
-	return os.SameFile(a, b) && a.ModTime().Equal(b.ModTime()) && a.Size() == b.Size() && a.Mode() == b.Mode()
+	return os.SameFile(a, b) && a.ModTime().Equal(b.ModTime()) && a.Size() == b.Size() &&
+		a.Mode() == b.Mode() && fileChangeTime(a).Equal(fileChangeTime(b))
 }
 
 // verifyLocalConfig proves every cacheRepoConfig value is pinned in the
@@ -364,6 +367,14 @@ func ensureHook(path, script string) (os.FileInfo, error) {
 	}
 	if err := os.Rename(tmp.Name(), path); err != nil {
 		return nil, err
+	}
+	// Rename preserves content, mtime, size, and mode but bumps ctime, so
+	// re-stat the path for the settled fingerprint — only if it still
+	// names the inode we wrote (SameFile). If a concurrent installer won
+	// the race, return the pre-rename stat: its stale ctime simply fails
+	// the next memo comparison, forcing a re-verify (fail closed).
+	if pathFI, err := os.Stat(path); err == nil && os.SameFile(fi, pathFI) {
+		return pathFI, nil
 	}
 	return fi, nil
 }

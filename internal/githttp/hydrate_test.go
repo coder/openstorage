@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/coder/code-storage/internal/blob"
 	"github.com/coder/code-storage/internal/ref"
@@ -165,6 +166,68 @@ func TestEnsureCacheRepo_MemoFallsThroughOnRepoRemoval(t *testing.T) {
 	}
 	if got := strings.TrimSpace(mustGit(t, repoPath, "config", "--get", "receive.unpackLimit")); got != "0" {
 		t.Fatalf("receive.unpackLimit = %q, want 0", got)
+	}
+}
+
+// An in-place rewrite that preserves every classic stat attribute — same
+// inode (no rename), same byte length, mtime restored via Chtimes (the
+// `touch -r` pattern) — must still invalidate the memo (PR #98 round-4
+// review): only ctime, which no unprivileged rewrite can restore, tells
+// such a tampered file apart, and a fast path trusting it would leave a
+// hostile receive.unpackLimit active for the process lifetime.
+func TestEnsureCacheRepo_MemoInvalidatedByMetadataPreservingRewrite(t *testing.T) {
+	cacheDir := t.TempDir()
+	const repo = "t-ensure-ctime"
+	repoPath, err := EnsureCacheRepo(cacheDir, repo)
+	if err != nil {
+		t.Fatalf("EnsureCacheRepo: %v", err)
+	}
+	// Prime the memo fast path.
+	if _, err := EnsureCacheRepo(cacheDir, repo); err != nil {
+		t.Fatalf("EnsureCacheRepo (memoize): %v", err)
+	}
+
+	configPath := filepath.Join(repoPath, "config")
+	before, err := os.Stat(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Same-length hostile edit, written in place (same inode), mtime
+	// restored: every attribute but ctime matches the memo.
+	tampered := strings.Replace(string(old), "unpackLimit = 0", "unpackLimit = 1", 1)
+	if tampered == string(old) || len(tampered) != len(old) {
+		t.Fatalf("fixture drift: cannot build a same-length tamper of %q", string(old))
+	}
+	f, err := os.OpenFile(configPath, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteAt([]byte(tampered), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(configPath, time.Time{}, before.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.Stat(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(before, after) || after.Size() != before.Size() || !after.ModTime().Equal(before.ModTime()) {
+		t.Fatalf("tamper was not metadata-preserving: %+v vs %+v", before, after)
+	}
+
+	if _, err := EnsureCacheRepo(cacheDir, repo); err != nil {
+		t.Fatalf("EnsureCacheRepo (after tamper): %v", err)
+	}
+	if got := strings.TrimSpace(mustGit(t, repoPath, "config", "--local", "--get", "receive.unpackLimit")); got != "0" {
+		t.Fatalf("receive.unpackLimit = %q after metadata-preserving tamper, want 0 repinned", got)
 	}
 }
 
