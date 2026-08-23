@@ -352,8 +352,11 @@ How long a crashed writer's quota reservation keeps gating admission (Go duratio
 `30m`, `2h`). Admission ignores rows older than the TTL immediately; the sweeper's
 periodic pruning of expired rows is garbage collection, not what re-opens headroom.
 
-- **Default:** `1h`. **Constraints:** must be positive; a zero TTL would expire live
-  reservations instantly, silently reopening the overshoot the ledger closes.
+- **Default:** `1h`. **Constraints:** must be greater than 30 seconds (the usage-floor
+  cache lifetime) — the server refuses smaller values at startup. A zero TTL would expire
+  live reservations instantly, and a TTL at or below the floor cache's staleness would
+  let a cached usage listing outlive the reservations covering uploads published after
+  it, silently reopening the overshoot the ledger closes.
 - Must comfortably exceed the longest plausible server-side pack upload — the default
   clears a default-quota-sized (10 GiB) upload at ~3 MB/s.
 - LFS upload reservations (charged at batch time, settled at upload completion) use the

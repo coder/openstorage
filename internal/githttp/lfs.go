@@ -573,7 +573,11 @@ func (s *Server) denyAllNeeded(order []string, needIdx map[string][]int, results
 }
 
 // lfsReservationTTL resolves the TTL LFS admission charges: the serve
-// wiring's PackReservationTTL, or the shared quota.go default.
+// wiring's PackReservationTTL, or the shared quota.go default. Production
+// wiring guarantees the value strictly exceeds the usage-floor cache
+// lifetime (serve's config rejects smaller TTLs at startup — see
+// MinPackReservationTTL); tests drive shorter TTLs deliberately to
+// exercise expiry.
 func (s *Server) lfsReservationTTL() time.Duration {
 	if s.PackReservationTTL > 0 {
 		return s.PackReservationTTL

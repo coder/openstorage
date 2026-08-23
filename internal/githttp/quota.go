@@ -118,6 +118,20 @@ func reservationTTL() (time.Duration, error) {
 // only delays the pressure log line by at most this long.
 const usageCacheTTL = 30 * time.Second
 
+// MinPackReservationTTL is the exclusive lower bound serve's config
+// enforces on CODESTORAGE_PACK_RESERVATION_TTL (Codex round 36 on #51):
+// the reservation TTL must STRICTLY exceed the usage-floor cache lifetime.
+// CachedUsageFloor feeds LFS and REST admission directly with a listing up
+// to usageCacheTTL stale; with a TTL at or below that staleness, an
+// orphaned upload's reservation (published, registration failed) can
+// expire while a floor listed BEFORE the publish is still served — the
+// next writer then sees neither the orphaned bytes nor a live reservation
+// and is admitted into headroom that no longer exists. The hook path
+// tolerates such TTLs by self-listing (hookUsageFloor's maxAge goes
+// non-positive), but the direct cache consumers have no fresher source, so
+// the configuration is rejected at startup instead.
+const MinPackReservationTTL = usageCacheTTL
+
 // usageCachePruneInterval is how often inserts drop expired entries,
 // bounding memory on nodes serving many repos. Time-based like the rate
 // limiter's sweepLocked (Codex round 8): a size trigger would walk the

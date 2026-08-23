@@ -605,6 +605,65 @@ func TestResolveServeConfigPackQuota(t *testing.T) {
 	}
 }
 
+// TestResolveServeConfigPackReservationTTL (issue #29; floor-cache bound
+// added in Codex round 36 on #51): the reservation TTL must STRICTLY
+// exceed the usage-floor cache lifetime (githttp.MinPackReservationTTL) —
+// with a TTL at or below it, a cached floor can outlive the reservations
+// covering objects published after that listing, and a subsequent writer
+// sees neither the orphaned bytes nor a live reservation.
+func TestResolveServeConfigPackReservationTTL(t *testing.T) {
+	base := func(extra map[string]string) func(string) string {
+		env := map[string]string{
+			"CODESTORAGE_PG_URL":      "postgres://x",
+			"CODESTORAGE_S3_URL":      "s3://x",
+			"CODESTORAGE_ORG":         "org1",
+			"CODESTORAGE_ORG_PUBKEYS": "/tmp/org.pub.pem",
+		}
+		for k, v := range extra {
+			env[k] = v
+		}
+		return mapEnv(env)
+	}
+
+	t.Run("unset-applies-default", func(t *testing.T) {
+		cfg, err := resolveServeConfig(base(nil), "", "", "/tmp/cache", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.packReservationTTL != defaultPackReservationTTL {
+			t.Fatalf("unset TTL resolved to %v, want default %v", cfg.packReservationTTL, defaultPackReservationTTL)
+		}
+	})
+
+	t.Run("parse-through", func(t *testing.T) {
+		cfg, err := resolveServeConfig(base(map[string]string{envPackReservationTTL: "31s"}), "", "", "/tmp/cache", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.packReservationTTL != 31*time.Second {
+			t.Fatalf("resolved TTL %v, want 31s", cfg.packReservationTTL)
+		}
+	})
+
+	for _, tc := range []struct{ name, val string }{
+		{"malformed", "plenty"},
+		{"zero", "0"},
+		{"negative", "-5m"},
+		{"below-floor-cache", "10s"},
+		{"at-floor-cache-boundary", "30s"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := resolveServeConfig(base(map[string]string{envPackReservationTTL: tc.val}), "", "", "/tmp/cache", "")
+			if err == nil {
+				t.Fatalf("%s=%q resolved without error", envPackReservationTTL, tc.val)
+			}
+			if !strings.Contains(err.Error(), envPackReservationTTL) {
+				t.Fatalf("error %q does not name %s", err, envPackReservationTTL)
+			}
+		})
+	}
+}
+
 func TestResolveServeConfigLFSStaging(t *testing.T) {
 	base := func(extra map[string]string) func(string) string {
 		env := map[string]string{

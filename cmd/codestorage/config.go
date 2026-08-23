@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/coder/code-storage/internal/githttp"
 	"github.com/coder/code-storage/internal/secrets"
 )
 
@@ -578,7 +579,11 @@ func resolveVerifySigBudget(getenv func(string) string) (int, error) {
 // resolvePackReservationTTL parses CODESTORAGE_PACK_RESERVATION_TTL
 // (issue #29). Fail-fast: malformed or non-positive values error naming the
 // env var (a zero TTL would expire live reservations instantly, silently
-// reopening the overshoot). Unset applies the one-hour default.
+// reopening the overshoot), and the TTL must strictly exceed the
+// usage-floor cache lifetime (Codex round 36 on #51: at or below it, a
+// cached floor outlives the reservations covering objects published after
+// that listing — see githttp.MinPackReservationTTL). Unset applies the
+// one-hour default.
 func resolvePackReservationTTL(getenv func(string) string) (time.Duration, error) {
 	assertf(getenv != nil, "resolvePackReservationTTL: nil getenv")
 	raw := getenv(envPackReservationTTL)
@@ -589,8 +594,9 @@ func resolvePackReservationTTL(getenv func(string) string) (time.Duration, error
 	if err != nil {
 		return 0, fmt.Errorf("%s: %w", envPackReservationTTL, err)
 	}
-	if d <= 0 {
-		return 0, fmt.Errorf("%s must be positive, got %q", envPackReservationTTL, raw)
+	if d <= githttp.MinPackReservationTTL {
+		return 0, fmt.Errorf("%s must exceed the %v usage-floor cache lifetime, got %q",
+			envPackReservationTTL, githttp.MinPackReservationTTL, raw)
 	}
 	return d, nil
 }
