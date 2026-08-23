@@ -34,7 +34,8 @@ work, title the PR:
 | `fix: ...`, `fix(scope): ...` | patch bump, CHANGELOG "Bug Fixes" |
 | `feat: ...`, `feat(scope): ...` | minor bump, CHANGELOG "Features" |
 | `feat!: ...` / `BREAKING CHANGE:` footer | minor bump (major once we pass 1.0.0) |
-| `docs:`, `chore:`, `ci:`, `build:`, `test:`, ... | no bump, hidden from CHANGELOG |
+| `perf: ...` | patch bump, CHANGELOG "Performance Improvements" |
+| `docs:`, `chore:`, `ci:`, `build:`, `test:`, `refactor:` | no bump, hidden from CHANGELOG |
 | anything else (`api: ...`) | ignored entirely |
 
 ## 2. Get the release PR green

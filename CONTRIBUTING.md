@@ -119,8 +119,11 @@ type(scope)?: summary
   to #81).
 - `fix: ...` → patch release, `feat: ...` → minor release,
   `feat!:` / `BREAKING CHANGE:` → breaking.
-- `docs:`, `test:`, `ci:`, `chore:`, `build:`, `refactor:`, `perf:` → no
-  release, hidden from the CHANGELOG.
+- `perf: ...` → also releasable: with our uncustomized release-please config it
+  triggers a patch release and appears in the CHANGELOG under "Performance
+  Improvements". Don't use it for refactors that don't change performance.
+- `docs:`, `test:`, `ci:`, `chore:`, `build:`, `refactor:` → no release, hidden
+  from the CHANGELOG.
 
 Individual commits inside the PR branch can be anything; only the squash title
 counts.
