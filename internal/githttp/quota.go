@@ -118,19 +118,35 @@ func reservationTTL() (time.Duration, error) {
 // only delays the pressure log line by at most this long.
 const usageCacheTTL = 30 * time.Second
 
+// UsageFloorHandoffMargin is the freshness headroom the reservation TTL
+// must leave BEYOND the floor cache lifetime (Codex round 42 on #51): a
+// floor can be served at the very end of its usageCacheTTL window and
+// then sit while ReservePackBytes waits on the database, so the interval
+// from scan start to the admission snapshot is floor age plus handoff
+// time. Charging reserve calls are deadline-bounded by this margin, which
+// makes the chain airtight: an orphan published after its page was
+// scanned (publish p > scan start t0) had its reservation refreshed at
+// the pre-publish admission, so it gates until p+TTL, while any admission
+// using a floor from t0 snapshots by t0 + usageCacheTTL + margin < p+TTL.
+// The reservation stamps and the snapshot share the DATABASE clock, so
+// only the duration — not absolute clocks — must agree.
+const UsageFloorHandoffMargin = 30 * time.Second
+
 // MinPackReservationTTL is the exclusive lower bound serve's config
-// enforces on CODESTORAGE_PACK_RESERVATION_TTL (Codex round 36 on #51):
-// the reservation TTL must STRICTLY exceed the usage-floor cache lifetime.
-// CachedUsageFloor feeds LFS and REST admission directly with a listing up
-// to usageCacheTTL stale; with a TTL at or below that staleness, an
-// orphaned upload's reservation (published, registration failed) can
-// expire while a floor listed BEFORE the publish is still served — the
-// next writer then sees neither the orphaned bytes nor a live reservation
-// and is admitted into headroom that no longer exists. The hook path
-// tolerates such TTLs by self-listing (hookUsageFloor's maxAge goes
-// non-positive), but the direct cache consumers have no fresher source, so
-// the configuration is rejected at startup instead.
-const MinPackReservationTTL = usageCacheTTL
+// enforces on CODESTORAGE_PACK_RESERVATION_TTL (Codex rounds 36+42 on
+// #51): the reservation TTL must STRICTLY exceed the usage-floor cache
+// lifetime plus the floor-to-reservation handoff margin. CachedUsageFloor
+// feeds LFS and REST admission directly with a listing up to
+// usageCacheTTL stale, and the subsequent reserve call takes up to the
+// margin; with a TTL at or below their sum, an orphaned upload's
+// reservation (published, registration failed) can expire while a floor
+// listed BEFORE the publish still drives an admission — the writer then
+// sees neither the orphaned bytes nor a live reservation and is admitted
+// into headroom that no longer exists. The hook path tolerates such TTLs
+// by self-listing (hookUsageFloor's maxAge goes non-positive), but the
+// direct cache consumers have no fresher source, so the configuration is
+// rejected at startup instead.
+const MinPackReservationTTL = usageCacheTTL + UsageFloorHandoffMargin
 
 // usageCachePruneInterval is how often inserts drop expired entries,
 // bounding memory on nodes serving many repos. Time-based like the rate
@@ -340,7 +356,11 @@ func hookUsageFloor(ctx context.Context, bl blob.BlobStore, repo string) (int64,
 	if err != nil {
 		return 0, err // fail closed, matching the reserve path's own use
 	}
-	maxAge := min(hookFloorMaxAge, ttl-usageCacheTTL)
+	// The trusted age leaves the handoff margin too (Codex round 42): the
+	// hook's own reserve call runs after this floor resolves, and an
+	// orphan's reservation must outlive scan start + trusted age + that
+	// call.
+	maxAge := min(hookFloorMaxAge, ttl-usageCacheTTL-UsageFloorHandoffMargin)
 	if maxAge <= 0 || time.Since(time.Unix(mintUnix, 0)) > maxAge {
 		return packUsageBytes(ctx, bl, repo)
 	}

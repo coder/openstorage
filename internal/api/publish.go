@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/coder/code-storage/internal/blob"
+	"github.com/coder/code-storage/internal/githttp"
 	"github.com/coder/code-storage/internal/ref"
 )
 
@@ -74,8 +75,13 @@ func (s *server) publishPack(ctx context.Context, repoID, packID, packPath strin
 				// enforcement must never silently weaken.
 				ttl = time.Hour
 			}
-			dec, err := s.refStore.ReservePackBytes(ctx, blob.QuotaRepoGroup(repoID),
+			// Deadline-bounded by the handoff margin (Codex round 42 on
+			// #51) — see the LFS PUT twin: the floor's orphan cover must
+			// outlive the admission snapshot.
+			rsvCtx, rsvCancel := context.WithTimeout(ctx, githttp.UsageFloorHandoffMargin)
+			dec, err := s.refStore.ReservePackBytes(rsvCtx, blob.QuotaRepoGroup(repoID),
 				[]ref.Pack{pack}, owner, floor, s.packQuotaBytes, ttl)
+			rsvCancel()
 			if err != nil {
 				return fmt.Errorf("reserve pack bytes: %w", err)
 			}

@@ -636,12 +636,12 @@ func TestResolveServeConfigPackReservationTTL(t *testing.T) {
 	})
 
 	t.Run("parse-through", func(t *testing.T) {
-		cfg, err := resolveServeConfig(base(map[string]string{envPackReservationTTL: "31s"}), "", "", "/tmp/cache", "")
+		cfg, err := resolveServeConfig(base(map[string]string{envPackReservationTTL: "61s"}), "", "", "/tmp/cache", "")
 		if err != nil {
 			t.Fatal(err)
 		}
-		if cfg.packReservationTTL != 31*time.Second {
-			t.Fatalf("resolved TTL %v, want 31s", cfg.packReservationTTL)
+		if cfg.packReservationTTL != 61*time.Second {
+			t.Fatalf("resolved TTL %v, want 61s", cfg.packReservationTTL)
 		}
 	})
 
@@ -651,6 +651,8 @@ func TestResolveServeConfigPackReservationTTL(t *testing.T) {
 		{"negative", "-5m"},
 		{"below-floor-cache", "10s"},
 		{"at-floor-cache-boundary", "30s"},
+		{"inside-handoff-margin", "31s"},
+		{"at-margin-boundary", "60s"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			_, err := resolveServeConfig(base(map[string]string{envPackReservationTTL: tc.val}), "", "", "/tmp/cache", "")

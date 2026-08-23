@@ -303,7 +303,12 @@ func preReceive(ctx context.Context) error {
 			if err != nil {
 				return fmt.Errorf("pre-receive: %w", err)
 			}
-			dec, err := st.ReservePackBytes(ctx, blob.QuotaRepoGroup(repo), unpublished, ref.NewReservationOwner(), floor, quota, ttl)
+			// Deadline-bounded by the handoff margin (Codex round 42) — see
+			// the LFS PUT twin: the floor's orphan cover must outlive the
+			// admission snapshot.
+			rsvCtx, rsvCancel := context.WithTimeout(ctx, UsageFloorHandoffMargin)
+			dec, err := st.ReservePackBytes(rsvCtx, blob.QuotaRepoGroup(repo), unpublished, ref.NewReservationOwner(), floor, quota, ttl)
+			rsvCancel()
 			if err != nil {
 				return fmt.Errorf("pre-receive: reserve pack bytes: %w", err)
 			}

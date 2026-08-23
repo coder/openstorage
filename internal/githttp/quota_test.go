@@ -514,6 +514,14 @@ func TestHookUsageFloor(t *testing.T) {
 			raw: func() string { return fmt.Sprintf("1234:%d", time.Now().Unix()) },
 			ttl: "30s",
 		},
+		// Codex round 42: the trusted age must also leave the
+		// floor-to-reservation HANDOFF margin — with a 90s TTL, a
+		// 40s-old floor leaves only 90−30−40 = 20s < the 30s margin, so
+		// an orphan's reservation could expire during the reserve call.
+		"handoff-margin-falls-back-to-listing": {
+			raw: func() string { return fmt.Sprintf("1234:%d", time.Now().Add(-40*time.Second).Unix()) },
+			ttl: "90s",
+		},
 	}
 	for name, tc := range listingCases {
 		t.Run(name, func(t *testing.T) {

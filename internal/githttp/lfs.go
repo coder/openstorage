@@ -1219,9 +1219,17 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target r
 			lfsError(w, http.StatusInternalServerError, "storage quota check failed")
 			return
 		}
-		dec, err := s.Store.ReservePackBytes(ctx, blob.QuotaRepoGroup(repoID),
+		// The reserve is deadline-bounded by the handoff margin (Codex
+		// round 42): the floor above may be served up to usageCacheTTL
+		// after its scan, so the admission snapshot must land within the
+		// margin for MinPackReservationTTL's coverage argument to hold —
+		// a stalled database fails the request rather than admitting
+		// against a floor whose orphan cover may have lapsed.
+		rsvCtx, rsvCancel := context.WithTimeout(ctx, UsageFloorHandoffMargin)
+		dec, err := s.Store.ReservePackBytes(rsvCtx, blob.QuotaRepoGroup(repoID),
 			[]ref.Pack{{Key: key, Size: n}}, ref.NewReservationOwner(),
 			floor, s.PackQuotaBytes, s.lfsReservationTTL())
+		rsvCancel()
 		if err != nil {
 			log.Printf("lfs quota: %s: pre-publish refresh failed: %v", repoID, err)
 			lfsError(w, http.StatusInternalServerError, "storage quota check failed")

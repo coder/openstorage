@@ -602,7 +602,7 @@ func resolvePackReservationTTL(getenv func(string) string) (time.Duration, error
 		return 0, fmt.Errorf("%s: %w", envPackReservationTTL, err)
 	}
 	if d <= githttp.MinPackReservationTTL {
-		return 0, fmt.Errorf("%s must exceed the %v usage-floor cache lifetime, got %q",
+		return 0, fmt.Errorf("%s must exceed the %v usage-floor freshness budget (cache lifetime + admission handoff margin), got %q",
 			envPackReservationTTL, githttp.MinPackReservationTTL, raw)
 	}
 	return d, nil
