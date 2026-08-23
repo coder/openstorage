@@ -1537,6 +1537,68 @@ func TestLFS_BloblessLegacyRowIsZeroGrowthRepair(t *testing.T) {
 	})
 }
 
+// bridgeOnClaimStore lands the legacy spelling exactly when the compat
+// claim is WON — the serialized peer (or an old replica's presigned PUT)
+// completing the bridge between the lock-free probe and this worker's
+// claim acquisition.
+type bridgeOnClaimStore struct {
+	ref.RefStore
+	t         *testing.T
+	blobs     blob.BlobStore
+	legacyKey string
+	content   []byte
+}
+
+func (b *bridgeOnClaimStore) TryAdoptionClaim(ctx context.Context, repo, key string) (bool, string, error) {
+	claimed, owner, err := b.RefStore.TryAdoptionClaim(ctx, repo, key)
+	if err == nil && claimed && key == b.legacyKey {
+		if uerr := b.blobs.UploadFile(ctx, b.legacyKey, writeTempFile(b.t, b.content)); uerr != nil {
+			return false, "", uerr
+		}
+	}
+	return claimed, owner, err
+}
+
+// TestLFSCompatCopy_ClaimWinnerRechecksDestination (Codex round 90): the
+// destination probe runs BEFORE the fleet claim is acquired, so a peer's
+// compat copy landing in between left this worker treating the bridge as
+// missing — recharging the full size as fresh growth (a spurious 507 at
+// the quota edge) and recopying identical bytes. The claim winner must
+// re-probe the destination before admitting anything.
+func TestLFSCompatCopy_ClaimWinnerRechecksDestination(t *testing.T) {
+	ctx := context.Background()
+	// Q holds both objects plus admission slack, but NOT a third copy:
+	// a fresh-growth bridge admission (60 more) must 507.
+	srv, st, mint := newLFSQuotaServer(t, 130, time.Hour)
+	srv.LFSV020WriteCompat = true
+	tok := mint(auth.ScopeGitWrite)
+	// An unrelated registered object consumes half the quota.
+	other := bytes.Repeat([]byte("o"), 60)
+	otherOID := sha256Hex(other)
+	if err := st.RegisterLFSObject(ctx, lfsTestRepoID, blob.LFSKey(lfsTestRepoID, otherOID), 60); err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.Blob.UploadFile(ctx, blob.LFSKey(lfsTestRepoID, otherOID), writeTempFile(t, other)); err != nil {
+		t.Fatal(err)
+	}
+	content := bytes.Repeat([]byte("c"), 60)
+	oid := sha256Hex(content)
+	legacyKey := blob.LFSLegacyKey(lfsTestRepoID, oid)
+	srv.Store = &bridgeOnClaimStore{RefStore: st, t: t, blobs: srv.Blob, legacyKey: legacyKey, content: content}
+
+	// The fresh upload fits (60+60 = Q); the bridge lands via the "peer"
+	// as the claim is won — a recheck sees it, a fresh-growth admission
+	// would demand 60 more and 507.
+	w := doLFS(t, srv, http.MethodPut, "/"+lfsTestRepoURL+".git/info/lfs/objects/"+oid,
+		"basic:"+tok, string(content))
+	if w.Code != http.StatusOK {
+		t.Fatalf("PUT whose bridge a peer completed under the claim = %d, body %s — the claim winner must re-probe before admitting fresh growth", w.Code, w.Body)
+	}
+	if _, err := srv.Blob.Stat(ctx, legacyKey); err != nil {
+		t.Fatalf("legacy spelling missing: %v", err)
+	}
+}
+
 // TestLFSCompat_RepairSerializedOnLegacyClaim (Codex security round 85):
 // the batch fast path's bridge repair launched an unserialized full copy —
 // every tiny concurrent touch of the object started another one. Compat
