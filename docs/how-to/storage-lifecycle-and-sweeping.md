@@ -63,9 +63,9 @@ for fleet-wide capacity tracking.
 ## Reclaiming deleted repositories
 
 Soft-delete alone reclaims nothing. Two paths — the same purge primitive — permanently
-remove a deleted repository's registry rows (refs, packs, LFS objects, credentials,
-upstream link, and finally the repository row) and its blobs (base packs, namespace
-packs, LFS objects):
+remove a deleted repository's registry and eventing rows (refs, packs, LFS objects,
+credentials, upstream link) and its blobs (base packs, namespace packs, LFS objects);
+only the repository row itself is retained, stamped as a purge tombstone:
 
 - **Retention window:** set
   [`CODESTORAGE_REPO_RETENTION`](../reference/configuration.md#codestorage_repo_retention)

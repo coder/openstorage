@@ -507,9 +507,10 @@ on upgrade. Stored objects are adopted into the registry by write-scoped touches
 
 Retention window for soft-deleted repositories: once a repository has been deleted
 longer than this, a purge pass on the sweep cadence **permanently** removes its
-registry rows (refs, packs, LFS objects, credentials, upstream link, the repository
-row itself) and deletes its blobs through the same quarantine-first discipline as
-every other sweep class. The [`codestorage purge-repo`](cli.md#codestorage-purge-repo)
+registry and eventing rows (refs, packs, LFS objects, credentials, upstream link) and
+deletes its blobs through the same quarantine-first discipline as every other sweep
+class. Only the repository row itself is retained, stamped as a purge tombstone — see
+the name-burn note below. The [`codestorage purge-repo`](cli.md#codestorage-purge-repo)
 command runs the same primitive synchronously for one repository.
 
 - **Default:** unset (`0`) — soft-deleted repositories are kept forever.
