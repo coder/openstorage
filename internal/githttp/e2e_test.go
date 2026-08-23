@@ -72,7 +72,49 @@ var (
 )
 
 func TestMain(m *testing.M) {
+	if fuzzSkipEnvBoot(os.Args[1:]) {
+		os.Exit(m.Run())
+	}
 	os.Exit(testMainInner(m))
+}
+
+// fuzzSkipEnvBoot reports whether this process belongs to a `go test -fuzz`
+// campaign that cannot reach the ordinary e2e tests, in which case TestMain
+// skips the environment boot (issue #91): without it, -parallel=N would run
+// N binary builds + backend stacks per campaign, because `go test -fuzz`
+// runs TestMain in the coordinator AND in every worker process. True for
+// fuzz workers (they only ever execute the fuzz target) and for a
+// coordinator whose -run selection is the match-nothing idiom `^$` (the
+// documented campaign form). A coordinator with any other -run value still
+// runs the matching ordinary tests before fuzzing (`go help testflag`), so
+// it keeps the full boot (Codex review). None of this package's fuzz
+// targets touch the e2e environment; plain `go test` — including the
+// seed-corpus replay of the fuzz targets — never sees these flags.
+func fuzzSkipEnvBoot(args []string) bool {
+	flagValue := func(name string) (string, bool) {
+		for i, arg := range args {
+			a := strings.TrimPrefix(strings.TrimPrefix(arg, "-"), "-")
+			if a == name {
+				// Bare-flag spelling; a non-bool flag's value is the next arg.
+				if i+1 < len(args) {
+					return args[i+1], true
+				}
+				return "", true
+			}
+			if v, ok := strings.CutPrefix(a, name+"="); ok {
+				return v, true
+			}
+		}
+		return "", false
+	}
+	if _, worker := flagValue("test.fuzzworker"); worker {
+		return true
+	}
+	if _, fuzzing := flagValue("test.fuzz"); !fuzzing {
+		return false
+	}
+	runPat, ok := flagValue("test.run")
+	return ok && runPat == "^$"
 }
 
 func testMainInner(m *testing.M) int {
