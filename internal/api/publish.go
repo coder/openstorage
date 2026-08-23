@@ -88,8 +88,15 @@ func (s *server) publishPack(ctx context.Context, repoID, packID, packPath strin
 				// replacing round 22's settle-or-TTL-only rule). The
 				// per-attempt refcount never removes a live same-key
 				// writer's protection; a failed retire only leaves what
-				// the TTL always collected.
-				if rerr := s.refStore.RetirePackAttempts(ctx, blob.QuotaRepoGroup(repoID), []string{key}); rerr != nil {
+				// the TTL always collected. Detached from the request
+				// context and bounded (Codex round 31): the most common
+				// clean failure here IS a client cancellation, and a
+				// retire on the already-canceled context can never reach
+				// the database — repeated canceled writes with distinct
+				// keys would pin maxActiveReservations rows for the TTL.
+				rctx, rcancel := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
+				defer rcancel()
+				if rerr := s.refStore.RetirePackAttempts(rctx, blob.QuotaRepoGroup(repoID), []string{key}); rerr != nil {
 					s.logger.Warn("retire pack reservation", "key", key, "error", rerr)
 				}
 				return fmt.Errorf("upload pack %s: %w", key, err)

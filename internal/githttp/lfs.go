@@ -664,10 +664,17 @@ func (s *Server) adoptLFSObject(ctx context.Context, repoID, key, oid string) er
 		return errLFSBusy
 	}
 	defer s.releaseLFSStaging(0)
-	// Bounded like publication (Codex round 17): the verification holds
-	// the op slot, so a wedged backend or a client parking the batch
-	// connection must not pin it past the lease window.
-	vctx, vcancel := context.WithTimeout(ctx, s.lfsReservationTTL()*9/10)
+	// Bounded like publication (Codex round 17) and DETACHED from the
+	// client (Codex round 31, security): adoption is server-side repair
+	// work. A client canceling mid-verification would abort the ranged
+	// hash before RegisterLFSObject, leave the blob rowless, and let the
+	// next tiny batch restart the whole hash at offset zero — repeatable
+	// backend reads over large legacy blobs, one full pass per cancel.
+	// Once adoption starts it runs to completion under the lease
+	// regardless of the requester's fate; the committed row makes the
+	// work once-per-object. The lease still bounds the op slot against a
+	// wedged backend or a parked connection.
+	vctx, vcancel := context.WithTimeout(context.WithoutCancel(ctx), s.lfsReservationTTL()*9/10)
 	defer vcancel()
 	verifiedSize, err := s.verifyStoredLFSObject(vctx, key, oid)
 	if err != nil {
@@ -707,7 +714,7 @@ func (s *Server) adoptLFSObject(ctx context.Context, repoID, key, oid string) er
 	// and registering the stale Stat size would under-charge pack_usage
 	// (the later idempotent re-registration corrects nothing), minting
 	// phantom headroom until the cached floor refreshes.
-	if err := s.Store.RegisterLFSObject(ctx, repoID, key, verifiedSize); err != nil {
+	if err := s.Store.RegisterLFSObject(vctx, repoID, key, verifiedSize); err != nil {
 		return err
 	}
 	// Post-registration existence recheck (Codex round 1) — the adoption
@@ -729,7 +736,7 @@ func (s *Server) adoptLFSObject(ctx context.Context, repoID, key, oid string) er
 	// instead of pinning them for as long as the batch client stays
 	// connected. A timeout fails closed: the registration is committed
 	// and idempotent, so the client's retry lands on the adopted path.
-	rctx, rcancel := context.WithTimeout(ctx, lfsProbeTimeout)
+	rctx, rcancel := context.WithTimeout(context.WithoutCancel(ctx), lfsProbeTimeout)
 	defer rcancel()
 	if _, err := s.Blob.Stat(rctx, key); err != nil {
 		return fmt.Errorf("adopted object vanished (racing sweep?): %w", err)

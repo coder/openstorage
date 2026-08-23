@@ -11,8 +11,14 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/coder/code-storage/internal/blob"
+	"github.com/coder/code-storage/internal/ref"
 )
 
 func discardLogger() *slog.Logger {
@@ -33,6 +39,63 @@ func TestUsageFloorPrefersInjectedHook(t *testing.T) {
 	floor, err := s.usageFloor(context.Background(), "repo_x")
 	if err != nil || floor != 4321 || gotRepo != "repo_x" {
 		t.Fatalf("usageFloor = (%d, %v) for %q, want (4321, nil) for repo_x", floor, err, gotRepo)
+	}
+}
+
+// cancelingUploadBlob cancels the request context mid-upload and fails —
+// the aborted REST pack write.
+type cancelingUploadBlob struct {
+	blob.BlobStore
+	cancel context.CancelFunc
+}
+
+func (b cancelingUploadBlob) UploadFile(ctx context.Context, _, _ string) error {
+	b.cancel()
+	return ctx.Err()
+}
+
+func (cancelingUploadBlob) Stat(context.Context, string) (int64, error) {
+	return 0, blob.ErrNotFound
+}
+
+// TestPublishPack_CanceledUploadStillRetiresReservation (Codex round 31):
+// the clean-failure retirement must run on a context DETACHED from the
+// request — the most common clean failure is a client cancellation, and a
+// retire on the already-canceled context can never reach the database, so
+// repeated canceled writes with distinct keys would pin
+// maxActiveReservations rows for the full TTL.
+func TestPublishPack_CanceledUploadStillRetiresReservation(t *testing.T) {
+	st, err := ref.Open(context.Background(), "sqlite://"+t.TempDir()+"/refs.sqlite")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(st.Close)
+	if err := st.InitSchema(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	packPath := filepath.Join(t.TempDir(), "p.pack")
+	if err := os.WriteFile(packPath, []byte("tiny pack bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s := &server{
+		refStore:           st,
+		blobStore:          cancelingUploadBlob{cancel: cancel},
+		logger:             discardLogger(),
+		packQuotaBytes:     1 << 20,
+		packReservationTTL: time.Hour,
+		usageFloorFn:       func(context.Context, string) (int64, error) { return 0, nil },
+	}
+	if err := s.publishPack(ctx, "repo_c", "abcd", packPath); err == nil {
+		t.Fatal("canceled publishPack reported success")
+	}
+	ls, err := st.QuotaLedgerState(context.Background(), blob.QuotaRepoGroup("repo_c"), time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ls.ReservedBytes != 0 {
+		t.Fatalf("canceled write left %d reserved bytes pinned to the TTL, want 0 (attempt retired)", ls.ReservedBytes)
 	}
 }
 

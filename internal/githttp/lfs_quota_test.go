@@ -1177,6 +1177,48 @@ func TestLFSPut_ProbeIsDeadlineBound(t *testing.T) {
 	}
 }
 
+// readCancelingBlob cancels the request context on the first ReadRange —
+// the client disconnecting mid-verification — and surfaces the passed
+// context's error if it propagated the cancellation.
+type readCancelingBlob struct {
+	blob.BlobStore
+	cancel context.CancelFunc
+}
+
+func (b readCancelingBlob) ReadRange(ctx context.Context, key string, off, n int64) ([]byte, error) {
+	b.cancel()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return b.BlobStore.ReadRange(ctx, key, off, n)
+}
+
+// TestLFSAdoption_CompletesAfterClientCancellation (Codex round 31,
+// security): adoption is server-side repair work — a client canceling
+// mid-verification must not abort the ranged hash before registration, or
+// the blob stays rowless and every next tiny batch restarts the whole
+// hash at offset zero (repeatable backend reads over large legacy blobs).
+// Once started, adoption completes under its own lease.
+func TestLFSAdoption_CompletesAfterClientCancellation(t *testing.T) {
+	srv, st, _ := newLFSQuotaServer(t, 0, time.Hour)
+	legacy := []byte("large legacy blob the client abandons mid-hash")
+	oid := sha256Hex(legacy)
+	key := blob.LFSKey(lfsTestRepoID, oid)
+	if err := srv.Blob.UploadFile(context.Background(), key, writeTempFile(t, legacy)); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	srv.Blob = readCancelingBlob{BlobStore: srv.Blob, cancel: cancel}
+
+	if err := srv.adoptLFSObject(ctx, lfsTestRepoID, key, oid); err != nil {
+		t.Fatalf("adoption aborted with the canceling client: %v", err)
+	}
+	if has, err := st.HasLFSObject(context.Background(), lfsTestRepoID, key); err != nil || !has {
+		t.Fatalf("adoption did not register after client cancellation: %v, %v", has, err)
+	}
+}
+
 // failingUploadBlob fails every UploadFile — the aborted-transfer /
 // wedged-publication clean-failure path.
 type failingUploadBlob struct {
