@@ -794,7 +794,13 @@ func (s *Server) adoptLFSObject(ctx context.Context, repoID, key, oid string) er
 			return rerr
 		}
 		if registered {
-			return nil // the twin registered this same key: nothing to add
+			// The race winner repairs the bridge like the registered fast
+			// path (Codex round 98): a bare success here let the client
+			// commit its pointer while the twin's potentially long bridge
+			// copy was still in flight — a copy failure then stranded the
+			// legacy spelling with no request left to converge it.
+			s.dropLFSVerifyResume(key)
+			return s.ensureLegacyCompat(ctx, repoID, oid, key)
 		}
 		// A v0.2.0 legacy-spelled row for THIS oid already holds the
 		// object's cap slot (Codex round 86): registration migrates it in

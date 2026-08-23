@@ -2003,6 +2003,45 @@ func TestLFSAmbiguousCommit_AccountingConverges(t *testing.T) {
 	})
 }
 
+// TestLFSAdopt_CapRaceWinnerRepairsBridge (Codex round 98): at the object
+// cap, a concurrent upload can register THIS canonical key between the
+// initial registered check and the cap recheck — and the recheck's early
+// success return bypassed ensureLegacyCompat, unlike the registered fast
+// path. The client could then commit its pointer while the concurrent
+// writer's potentially long bridge copy was still in flight; if that copy
+// failed (or its requester vanished), the legacy spelling stayed absent
+// and old replicas 404'd with no retry driven by this success.
+func TestLFSAdopt_CapRaceWinnerRepairsBridge(t *testing.T) {
+	old := ref.MaxLFSObjectsPerRepo
+	ref.MaxLFSObjectsPerRepo = 1
+	t.Cleanup(func() { ref.MaxLFSObjectsPerRepo = old })
+	ctx := context.Background()
+	srv, st, _ := newLFSQuotaServer(t, 0, time.Hour)
+	srv.LFSV020WriteCompat = true
+	content := []byte("cap-race twin with a missing bridge")
+	oid := sha256Hex(content)
+	key := blob.LFSKey(lfsTestRepoID, oid)
+	// The twin's committed state: a registered canonical (holding the
+	// only cap slot) with bytes present but NO legacy spelling — its
+	// bridge copy failed after registration.
+	if err := st.RegisterLFSObject(ctx, lfsTestRepoID, key, int64(len(content))); err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.Blob.UploadFile(ctx, key, writeTempFile(t, content)); err != nil {
+		t.Fatal(err)
+	}
+	// The initial registry read misses the twin's registration; the
+	// at-cap recheck sees it — the round-27 boundary race.
+	srv.Store = &staleRegistryOnce{RefStore: st}
+
+	if aerr := srv.adoptLFSObject(ctx, lfsTestRepoID, key, oid); aerr != nil {
+		t.Fatalf("cap-race twin-win adoption = %v", aerr)
+	}
+	if _, err := srv.Blob.Stat(ctx, blob.LFSLegacyKey(lfsTestRepoID, oid)); err != nil {
+		t.Fatalf("legacy spelling missing after cap-race success: %v — the race winner must repair the bridge like the registered fast path", err)
+	}
+}
+
 // TestLFSCompat_RepairSerializedOnLegacyClaim (Codex security round 85):
 // the batch fast path's bridge repair launched an unserialized full copy —
 // every tiny concurrent touch of the object started another one. Compat
