@@ -181,7 +181,10 @@ func (s *server) publishPack(ctx context.Context, repoID, packID, packPath strin
 		// registration must not be able to skip the invalidation — with
 		// the bump lost, absence-window floors outlive the covers and a
 		// later writer settles against the deflated floor.
-		bctx, bcancel := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
+		// Bounded by the cover handoff window (Codex round 69): the
+		// bump must commit while the last cover row still lives — after
+		// a broken tail refresh that can be ~16s.
+		bctx, bcancel := context.WithTimeout(context.WithoutCancel(ctx), blob.CoverHandoffTimeout)
 		defer bcancel()
 		if berr := s.refStore.BumpLFSAdoptionGen(bctx, githttp.BaseRepo(repoID)); berr != nil {
 			s.logger.Warn("floor generation bump after pack restore", "key", key, "error", berr)

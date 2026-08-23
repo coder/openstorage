@@ -1621,7 +1621,11 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target r
 	// bump leaves only the TTL-bounded staleness a crash right here
 	// would always leave. Zero-byte objects never appear in floors.
 	if (repair || restoredHere) && n > 0 {
-		bctx, bcancel := context.WithTimeout(context.WithoutCancel(ctx), lfsCleanupTimeout)
+		// Bounded by the cover handoff window (Codex round 69): the
+		// repair cover's remaining life at this point is at least the
+		// publication lease's residual (≥ MinPackReservationTTL), and
+		// the bump must commit inside it.
+		bctx, bcancel := context.WithTimeout(context.WithoutCancel(ctx), blob.CoverHandoffTimeout)
 		defer bcancel()
 		if err := s.Store.BumpLFSAdoptionGen(bctx, BaseRepo(repoID)); err != nil {
 			log.Printf("lfs repair %s: floor generation bump failed: %v", key, err)

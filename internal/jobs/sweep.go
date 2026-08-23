@@ -694,7 +694,12 @@ func (s *Sweeper) restoreFromQuarantine(ctx context.Context, key, qKey string) (
 	// itself must not be reported failed (the bytes ARE back).
 	if repo, ok := splitSweepKey(key); ok {
 		base, _, _ := strings.Cut(repo, "+")
-		if err := s.packs.BumpLFSAdoptionGen(ctx, base); err != nil {
+		// Bounded by the cover handoff window (Codex round 69) and
+		// detached like the restore: the bump must commit while the
+		// last cover row still lives, regardless of the sweep context.
+		bctx, bcancel := context.WithTimeout(context.WithoutCancel(ctx), blob.CoverHandoffTimeout)
+		defer bcancel()
+		if err := s.packs.BumpLFSAdoptionGen(bctx, base); err != nil {
 			s.logger.Warn("orphan pack sweep: floor generation bump after restore failed",
 				"key", key, "error", err)
 		}

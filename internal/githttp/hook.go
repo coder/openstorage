@@ -451,7 +451,9 @@ func preReceive(ctx context.Context) error {
 		// Detached and bounded like the restores it concludes (Codex
 		// security round 68) — a canceled hook context must not skip
 		// the invalidation the covers hand off to.
-		bctx, bcancel := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
+		// Bounded by the cover handoff window (Codex round 69): commit
+		// while the last cover row still lives.
+		bctx, bcancel := context.WithTimeout(context.WithoutCancel(ctx), blob.CoverHandoffTimeout)
 		defer bcancel()
 		if err := st.BumpLFSAdoptionGen(bctx, BaseRepo(repo)); err != nil {
 			fmt.Fprintf(os.Stderr, "codestorage: floor generation bump after pack restore: %v\n", err)

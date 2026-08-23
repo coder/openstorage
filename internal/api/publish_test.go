@@ -107,6 +107,7 @@ type bumpRecordingStore struct {
 	ref.RefStore // nil: only the methods below are exercised
 	bumped       bool
 	bumpCtxErr   error
+	bumpDeadline time.Time
 }
 
 func (s *bumpRecordingStore) RegisterPacks(context.Context, string, []ref.Pack) error {
@@ -116,6 +117,7 @@ func (s *bumpRecordingStore) RegisterPacks(context.Context, string, []ref.Pack) 
 func (s *bumpRecordingStore) BumpLFSAdoptionGen(ctx context.Context, _ string) error {
 	s.bumped = true
 	s.bumpCtxErr = ctx.Err()
+	s.bumpDeadline, _ = ctx.Deadline()
 	return ctx.Err()
 }
 
@@ -148,6 +150,12 @@ func TestPublishPackRestoreBumpSurvivesClientCancel(t *testing.T) {
 	}
 	if st.bumpCtxErr != nil {
 		t.Fatalf("bump ran on the canceled request context (ctx err %v) — it must be detached like the restore", st.bumpCtxErr)
+	}
+	// The bump must commit while the last cover row still lives (Codex
+	// round 69): after a broken tail refresh that can be ~16s, so the
+	// handoff bound must be CoverHandoffTimeout, not a generous minute.
+	if st.bumpDeadline.IsZero() || time.Until(st.bumpDeadline) > blob.CoverHandoffTimeout+time.Second {
+		t.Fatalf("bump deadline %v exceeds the cover handoff window (%v)", time.Until(st.bumpDeadline), blob.CoverHandoffTimeout)
 	}
 }
 

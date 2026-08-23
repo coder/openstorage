@@ -310,6 +310,15 @@ func EnsurePublished(ctx context.Context, b BlobStore, key, path string, onResto
 	return false, err
 }
 
+// CoverHandoffTimeout bounds the floor-generation bump a caller runs
+// after a restore (Codex round 69): the bump must COMMIT while the last
+// cover row still lives, and after a broken tail refresh that row's
+// remaining lifetime can be as short as minTTL − coverLapseBudget ≈ 16s
+// (the loss is reported at covered+budget; the row lives to covered+TTL).
+// Ten seconds fits inside that worst case with slack, and trivially
+// inside the fresh full TTL a successful tail refresh leaves.
+const CoverHandoffTimeout = 10 * time.Second
+
 // coverRenewInterval is WithRenewedCover's renewal cadence (a var for
 // tests). Together with coverRenewTimeout and coverLapseBudget it keeps a
 // restore cover continuously alive under the minimum reservation TTL
