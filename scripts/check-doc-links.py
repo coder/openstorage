@@ -14,7 +14,7 @@ import os, re, sys, posixpath
 
 os.chdir(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
-LINK = re.compile(r"\]\(([^)\s#]+)(#[^)\s]*)?\)")
+LINK = re.compile(r"\]\(([^)\s#]*)(#[^)\s]*)?\)")
 HEADING = re.compile(r"^#+ +(.*)$")
 def gh_anchor(h):
     h = re.sub(r"[`*]", "", h.strip().lower())
@@ -59,11 +59,14 @@ def check():
                 target, anchor = m.group(1), m.group(2)
                 if re.match(r"^[a-z]+:", target) or target.startswith("/"):
                     continue
-                resolved = posixpath.normpath(posixpath.join(d, target))
+                if not target and not anchor:
+                    continue
+                # fragment-only links resolve to the current file
+                resolved = path if not target else posixpath.normpath(posixpath.join(d, target))
                 if not os.path.exists(resolved):
                     print(f"BROKEN FILE {path}:{lineno} -> {target}")
                     bad += 1
-                elif anchor and resolved.endswith(".md") and not path.startswith("docs/upstream"):
+                elif anchor and anchor != "#" and resolved.endswith(".md") and not path.startswith("docs/upstream"):
                     if anchor[1:] not in anchors.get(resolved, set()):
                         print(f"BROKEN ANCHOR {path}:{lineno} -> {target}{anchor}")
                         bad += 1
