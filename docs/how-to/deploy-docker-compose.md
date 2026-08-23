@@ -5,12 +5,15 @@
 packs) — and proof that a write through one node is immediately visible through the other.
 
 > **This is a development stack, not deployment guidance.** It uses default credentials,
-> publishes the backing-service ports, and speaks plain HTTP. Two flows are not
-> functional from the host: **upstream mirror sync** (`pull-upstream`) — each node's
-> `CODESTORAGE_BASE_URL` is the **host-facing** URL (`http://127.0.0.1:808x`), which the
-> sync worker cannot reach from inside its own container — and **Git LFS transfers** — the
-> batch API presigns URLs for the container-only endpoint `http://minio:9000`, which
-> host-side clients cannot resolve. Everything else works. For a hardened
+> publishes the backing-service ports, and speaks plain HTTP. One flow is not functional
+> from the host: **Git LFS transfers** — the batch API presigns URLs for the
+> container-only endpoint `http://minio:9000`, which host-side clients cannot resolve.
+> Everything else works, including **upstream mirror sync** (`pull-upstream`): since
+> [#49](https://github.com/coder/code-storage/pull/49) the sync worker pushes through the
+> node's **own bound listener**, never `CODESTORAGE_BASE_URL`, so sync works against any
+> upstream the *containers* can reach — public forges just work; an upstream bound to the
+> host's loopback does not (re-verified live in
+> [#60](https://github.com/coder/code-storage/issues/60)). For a hardened
 > deployment (TLS, trusted proxies, rolling upgrades, key rotation), follow the
 > [production deployment guide](deploy-production.md) — the topology is the same, only the
 > hardening differs.
@@ -36,7 +39,7 @@ Runtime keys are generated, never committed. The nodes mount only the **public**
 on the host for minting:
 
 ```sh
-go build ./cmd/codestorage
+go build ./cmd/codestorage   # or install a released binary: README → Install
 mkdir -p compose-keys && ./codestorage keygen --out ./compose-keys/cs-key
 # writes compose-keys/cs-key.pem (private, 0600) + compose-keys/cs-key.pub.pem
 ```

@@ -3,7 +3,7 @@
 The `codestorage` binary bundles the server and its operational helpers:
 
 ```
-codestorage <serve|hook|keygen|mint|signing-key|list-packs> [flags]
+codestorage <serve|hook|keygen|mint|signing-key|list-packs|version> [flags]
 ```
 
 Sources of truth: [`cmd/codestorage/main.go`](../../cmd/codestorage/main.go) and
@@ -141,3 +141,15 @@ size per line, plus a total) — a storage-inspection helper for dogfooding and 
 ```sh
 codestorage list-packs --repo repo_761aac427fd3 --data-dir ~/cs-data
 ```
+
+## `codestorage version`
+
+Prints the build version on one line and exits (`--version` is an alias):
+
+```
+codestorage v0.1.0 (commit 4594422de4787645bac7356973ec7932ee0256d4, built 2026-08-23T00:00:00Z, go1.26.0)
+```
+
+Release binaries have the tag/commit/date stamped at build time
+([`scripts/release-archives.sh`](../../scripts/release-archives.sh)); source builds fall
+back to Go module build info, reporting `devel` when nothing better is known.

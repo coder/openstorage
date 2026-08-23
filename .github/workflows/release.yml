@@ -1,0 +1,110 @@
+# Release binaries (issue #66): cross-compiles ./cmd/codestorage for
+# linux/darwin × amd64/arm64 (pure Go, CGO off), packages
+# codestorage_<version>_<os>_<arch>.tar.gz + checksums.txt, verifies the
+# native archive on both a linux and a macOS runner, and only then uploads
+# everything as assets on the GitHub release for the tag.
+#
+# Not tag/release-triggered on purpose: release-please creates tags with the
+# default GITHUB_TOKEN, and GITHUB_TOKEN-created events never trigger
+# workflows. Instead release-please.yml chains this via workflow_call in the
+# same run. workflow_dispatch is the manual escape hatch to (re)build assets
+# for an existing release tag, e.g. after a transient failure.
+name: release
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: "Release tag to build and upload assets for (e.g. v0.1.0)"
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to (re)build assets for (e.g. v0.1.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.tag }}
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Build archives + checksums (CGO off)
+        env:
+          TAG: ${{ inputs.tag }}
+        run: ./scripts/release-archives.sh "$TAG" dist
+      - name: Verify native archive (linux/amd64) and all checksums
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          cd dist
+          sha256sum -c checksums.txt
+          tar -xzf "codestorage_${TAG#v}_linux_amd64.tar.gz"
+          out="$(./codestorage --version)"
+          echo "$out"
+          grep -F "$TAG" <<<"$out"
+          grep -F "$(git -C .. rev-parse HEAD)" <<<"$out"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-archives
+          path: |
+            dist/codestorage_*.tar.gz
+            dist/checksums.txt
+          if-no-files-found: error
+
+  # The darwin binaries come from a linux cross-compile; prove the one
+  # matching this runner's architecture actually runs on macOS before
+  # anything lands on the release. (macos-latest is Apple Silicon today, so
+  # this exercises darwin/arm64, but resolve the arch at runtime instead of
+  # hard-asserting a mutable runner label.)
+  verify-macos:
+    needs: build
+    runs-on: macos-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-archives
+          path: dist
+      - name: Verify native darwin archive and all checksums
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          case "$(uname -m)" in
+            arm64) arch=arm64 ;;
+            x86_64) arch=amd64 ;;
+            *) echo "unexpected macOS runner arch: $(uname -m)" >&2; exit 1 ;;
+          esac
+          cd dist
+          shasum -a 256 -c checksums.txt
+          tar -xzf "codestorage_${TAG#v}_darwin_${arch}.tar.gz"
+          ./codestorage --version | grep -F "$TAG"
+
+  publish:
+    needs: [build, verify-macos]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-archives
+          path: dist
+      - name: Upload assets to the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ inputs.tag }}
+        # --clobber so a workflow_dispatch rebuild replaces existing assets.
+        run: gh release upload "$TAG" dist/codestorage_*.tar.gz dist/checksums.txt --clobber
