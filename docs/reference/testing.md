@@ -110,7 +110,11 @@ determinism rules; this section covers how to run and triage it.
 | Nightly sweep | [`dst-nightly.yml`](../../.github/workflows/dst-nightly.yml) → `TestDSTSweep` |
 
 A run prints one summary line and a verdict; the trace hash is a pure function
-of the seed, so the CLI and the test entry point replay identically:
+of the full run configuration (seed, steps, nodes), so runs with the same
+configuration replay identically. The CLI and the test entry point agree when
+their parameters match — `TestDSTSeed` takes `DST_SEED`/`DST_STEPS` and always
+uses the default node count; replay non-default `-nodes` runs through
+`cmd/dst`:
 
 ```console
 $ go run ./cmd/dst -seed 42
