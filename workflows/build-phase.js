@@ -50,14 +50,16 @@ export const meta = {
 };
 
 const SPEC_POINTER =
-  "Authoritative specs live in docs/ (the reference/ and explanation/ spec pages; the archived roadmap at docs/archive/phases/07-implementation-roadmap.md; docs/README.md) " +
-  "and docs/upstream/openapi.yaml. Architecture: stateless Go nodes; Postgres = ref authority " +
+  "Authoritative specs live in docs/ (the reference/ and explanation/ spec pages; docs/README.md) " +
+  "and docs/upstream/openapi.yaml. Anything under docs/archive/ is historical context only " +
+  "(frozen phase notes and the original roadmap — decisions there may have been superseded); " +
+  "never treat it as the contract. Architecture: stateless Go nodes; Postgres = ref authority " +
   "(CAS) + metadata; S3/MinIO = immutable packs via gocloud.dev/blob; local disk = rebuildable LRU cache.";
 
 const PHASES = {
   "p0-spike": {
     title: "De-risk spike: git push -> S3 -> PG-CAS -> clone from a second node",
-    specRefs: "docs/explanation/git-protocol-and-namespaces.md, docs/archive/phases/07-implementation-roadmap.md",
+    specRefs: "docs/explanation/git-protocol-and-namespaces.md (authoritative); docs/archive/phases/07-implementation-roadmap.md (historical context only)",
     deliverables:
       "Working spike (throwaway quality allowed, but tested): git receive-pack behind JWT basic auth (user 't'); " +
       "hook routes every ref update through a Postgres CAS transaction; packs uploaded to MinIO BEFORE the ref flip; " +
