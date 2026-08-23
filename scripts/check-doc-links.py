@@ -72,7 +72,8 @@ def check():
         for _, ln in scan_lines(path):
             m = HEADING.match(ln)
             if m:
-                base = gh_anchor(m.group(2))
+                # strip an optional ATX closing sequence ("## Title ##")
+                base = gh_anchor(re.sub(r"\s+#+\s*$", "", m.group(2)))
                 a, i = base, 1
                 while a in aset:
                     a = f"{base}-{i}"; i += 1
