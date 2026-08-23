@@ -2570,6 +2570,21 @@ func (s *Server) maybeLegacyCompatCopy(ctx context.Context, repoID, oid, key str
 		return fmt.Errorf("compat copy %s: %w", legacyKey, errLFSBusy)
 	}
 	defer s.releaseAdoptionClaim(legacyKey, claimOwner)
+	// Re-probe under the claim (Codex round 90): a serialized peer — or
+	// an old replica's still-valid presigned PUT — can land the legacy
+	// spelling between the lock-free probe above and this acquisition.
+	// Without the recheck the winner recharges the full size as fresh
+	// growth (a spurious 507 at the quota edge) and recopies identical
+	// bytes; presence still satisfies the bridge.
+	rpctx, rpcancel := context.WithTimeout(context.WithoutCancel(ctx), lfsProbeTimeout)
+	_, rperr := s.Blob.Stat(rpctx, legacyKey)
+	rpcancel()
+	switch {
+	case rperr == nil:
+		return nil // a peer completed the bridge while we queued
+	case !errors.Is(rperr, blob.ErrNotFound):
+		return fmt.Errorf("compat recheck %s: %w", legacyKey, rperr)
+	}
 	// Size-scaled allowance, not a fixed wall-clock cap (Codex round 81):
 	// accepted objects reach many GiB and S3's multipart copy is
 	// sequential, so the one-minute cleanup bound was guaranteed to
