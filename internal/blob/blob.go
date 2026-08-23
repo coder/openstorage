@@ -352,8 +352,22 @@ func WithRenewedCover(ctx context.Context, renew func(context.Context) error, op
 	if opErr != nil {
 		return opErr, nil
 	}
-	return nil, renew(ctx)
+	// The op may have consumed nearly its entire deadline (Codex round
+	// 60): a publication succeeding at the deadline's edge must not lose
+	// its MANDATORY tail refresh to that same deadline — the last tick
+	// could be a full renewal interval old, leaving the cover a shorter
+	// life than the stale-floor tail (floor lifetime + admission handoff
+	// margin). The refresh runs on its own fresh bounded context,
+	// detached like the restore work it concludes.
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), coverRefreshTimeout)
+	defer cancel()
+	return nil, renew(rctx)
 }
+
+// coverRefreshTimeout bounds WithRenewedCover's post-publication refresh:
+// one ledger round-trip on a fresh context, generous against transient
+// stalls yet far under the refreshed TTL it exists to restart.
+const coverRefreshTimeout = time.Minute
 
 // ensurePublishedTimeout bounds EnsurePublished's detached verification.
 // The bound scales with the pack size — a repair upload MUST be able to

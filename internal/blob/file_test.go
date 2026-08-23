@@ -493,6 +493,36 @@ func TestEnsurePublishedRenewsCoverThroughPublication(t *testing.T) {
 	}
 }
 
+// TestWithRenewedCoverRefreshSurvivesOpDeadline (Codex round 60): the
+// post-publication refresh is MANDATORY tail coverage — its restarted TTL
+// must span the stale-floor tail (floor lifetime + admission handoff
+// margin) — but it used to inherit the operation context. A restore
+// succeeding at its deadline's edge then lost the refresh to that same
+// deadline, leaving the cover's remaining life (TTL minus up to one
+// renewal interval) shorter than the tail. The refresh must run on a
+// fresh bounded context detached from the op's.
+func TestWithRenewedCoverRefreshSurvivesOpDeadline(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var refreshCtxErr error
+	opErr, renewErr := WithRenewedCover(ctx, func(rctx context.Context) error {
+		refreshCtxErr = rctx.Err()
+		return rctx.Err()
+	}, func() error {
+		cancel() // the op consumed its whole deadline as it finished
+		return nil
+	})
+	if opErr != nil {
+		t.Fatalf("opErr = %v, want nil", opErr)
+	}
+	if renewErr != nil {
+		t.Fatalf("post-publication refresh failed on the exhausted op context: %v", renewErr)
+	}
+	if refreshCtxErr != nil {
+		t.Fatalf("refresh ran on the dead op context (ctx err %v), want a fresh bounded context", refreshCtxErr)
+	}
+}
+
 // The verification deadline scales with pack size so a repair upload of a
 // supported large pack (S3 multipart copy handles >5 GiB) can finish
 // within it (Codex round 15).
