@@ -37,9 +37,11 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/coder/code-storage/internal/blob"
@@ -361,36 +363,98 @@ func packUsageBytes(ctx context.Context, bl blob.BlobStore, repo string) (int64,
 // hook-side mirror of the cache's scan-start-anchored expiry (Codex round
 // 46): with no cache in front of it, a self-listing that outlives this
 // window may miss an orphan whose reservation expires before the hook's
-// margin-bounded reserve lands. usageCacheTTL keeps the coverage chain
-// identical to the cached path (scanStart + freshness + margin < TTL). A
-// var so tests can shrink it.
+// margin-bounded reserve lands. It is also each attempt's context
+// DEADLINE (Codex round 47): a scan that cannot finish inside the window
+// is canceled instead of completing uselessly and burning a second full
+// scan's backend work on rejection. usageCacheTTL keeps the coverage
+// chain identical to the cached path (scanStart + freshness + margin <
+// TTL). A var so tests can shrink it.
 var hookFloorFreshness = usageCacheTTL
+
+// hookFloorScanSlots bounds concurrent self-listed floor scans PER NODE,
+// across processes (Codex round 47): every pre-receive hook is a fresh
+// process, so the serve-side usageRefreshSlots pool cannot see it — a
+// client slowing pushes past the trusted-floor age on a large repo could
+// otherwise fan out one ~100-page scan per throttled push against the
+// shared blob backend. flock-based slot files under os.TempDir() (hooks
+// inherit the serve process's environment, so all of a node's processes
+// agree on the directory) mirror the in-process pool's size; a crashed
+// holder releases its slot with its file descriptor. The serve process's
+// own scans stay on usageRefreshSlots — two pools of four bound the
+// node's total concurrent floor scans at eight.
+const hookFloorScanSlots = 4
+
+// acquireHookFloorScanSlot polls the slot files with non-blocking flocks
+// until one is taken or ctx expires (the attempt deadline).
+func acquireHookFloorScanSlot(ctx context.Context) (unlock func(), err error) {
+	for {
+		for i := range hookFloorScanSlots {
+			path := filepath.Join(os.TempDir(), fmt.Sprintf("codestorage-floor-scan-%d.lock", i))
+			f, oerr := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
+			if oerr != nil {
+				return nil, oerr
+			}
+			ferr := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+			if ferr == nil {
+				return func() { _ = f.Close() }, nil // Close releases the flock
+			}
+			_ = f.Close()
+			if ferr != syscall.EWOULDBLOCK && ferr != syscall.EAGAIN && ferr != syscall.EINTR {
+				return nil, ferr
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("floor scan slot: %w", ctx.Err())
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
 
 // hookSelfListFloor is the hook's own uncounted-floor measurement: the
 // usage counter is read BEFORE the listing starts (the same conservative
 // ordering as refreshUsage — Codex round 44), and the floor is the
-// listing minus that counter, clamped at zero. A scan that outlives
-// hookFloorFreshness is rejected — one retry covers a transient stall,
-// then the push fails closed (Codex round 46).
+// listing minus that counter, clamped at zero. Each attempt is
+// slot-gated across processes and deadline-bounded by the freshness
+// window (Codex rounds 46+47); one retry covers a transient stall, then
+// the push fails closed.
 func hookSelfListFloor(ctx context.Context, bl blob.BlobStore, st ref.Store, repo string) (int64, error) {
 	assertf(st != nil, "hookSelfListFloor: nil ref store")
-	for attempt := 0; ; attempt++ {
-		scanStart := time.Now()
-		ls, err := st.QuotaLedgerState(ctx, blob.QuotaRepoGroup(repo), time.Hour)
-		if err != nil {
-			return 0, fmt.Errorf("usage counter read: %w", err)
+	var lastErr error
+	for attempt := 0; attempt < 2 && ctx.Err() == nil; attempt++ {
+		floor, err := hookFloorScanOnce(ctx, bl, st, repo)
+		if err == nil {
+			return floor, nil
 		}
-		listing, err := packUsageBytes(ctx, bl, repo)
-		if err != nil {
-			return 0, err
-		}
-		if time.Since(scanStart) <= hookFloorFreshness {
-			return max(0, listing-ls.UsageBytes), nil
-		}
-		if attempt >= 1 {
-			return 0, fmt.Errorf("usage floor for %s: listing outlived its %v freshness window twice", repo, hookFloorFreshness)
-		}
+		lastErr = err
 	}
+	return 0, fmt.Errorf("usage floor for %s: %w", repo, lastErr)
+}
+
+// hookFloorScanOnce runs one slot-gated, deadline-bounded floor scan.
+func hookFloorScanOnce(ctx context.Context, bl blob.BlobStore, st ref.Store, repo string) (int64, error) {
+	actx, cancel := context.WithTimeout(ctx, hookFloorFreshness)
+	defer cancel()
+	unlock, err := acquireHookFloorScanSlot(actx)
+	if err != nil {
+		return 0, err
+	}
+	defer unlock()
+	scanStart := time.Now()
+	ls, err := st.QuotaLedgerState(actx, blob.QuotaRepoGroup(repo), time.Hour)
+	if err != nil {
+		return 0, fmt.Errorf("usage counter read: %w", err)
+	}
+	listing, err := packUsageBytes(actx, bl, repo)
+	if err != nil {
+		return 0, err
+	}
+	// Defensive backstop: the deadline above should preempt any scan
+	// this check would reject.
+	if time.Since(scanStart) > hookFloorFreshness {
+		return 0, fmt.Errorf("listing outlived its %v freshness window", hookFloorFreshness)
+	}
+	return max(0, listing-ls.UsageBytes), nil
 }
 
 // hookUsageFloor resolves the pre-receive admission floor — the

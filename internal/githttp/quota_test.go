@@ -340,6 +340,47 @@ func TestHookSelfListFloorRejectsSlowScans(t *testing.T) {
 	})
 }
 
+// TestHookFloorScansAreSlotBoundedAcrossProcesses (Codex round 47): hook
+// self-list scans run in fresh processes the serve-side pool cannot see,
+// so they take flock slot files instead — with every slot held (here by
+// this test, in production by other hook processes), a scan must wait
+// bounded by its attempt deadline and fail closed WITHOUT listing, and
+// releasing a slot must let the next attempt succeed.
+func TestHookFloorScansAreSlotBoundedAcrossProcesses(t *testing.T) {
+	t.Setenv("TMPDIR", t.TempDir()) // isolate the slot files from parallel suites
+	oldFresh := hookFloorFreshness
+	hookFloorFreshness = 100 * time.Millisecond
+	t.Cleanup(func() { hookFloorFreshness = oldFresh })
+
+	// Hold every slot, as concurrent hook processes would.
+	var unlocks []func()
+	for i := 0; i < hookFloorScanSlots; i++ {
+		u, err := acquireHookFloorScanSlot(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		unlocks = append(unlocks, u)
+	}
+
+	cb := &countingBlob{BlobStore: openTestBlob(t)}
+	st := openTestRefStore(t)
+	if _, err := hookSelfListFloor(context.Background(), cb, st, "repo_slots"); err == nil {
+		t.Fatal("slot-starved floor scan did not fail closed")
+	}
+	if got := cb.lists.Load(); got != 0 {
+		t.Fatalf("slot-starved floor scan ran %d listings, want 0 (the slot must gate the scan)", got)
+	}
+
+	// Freeing one slot lets the scan through.
+	unlocks[0]()
+	if floor, err := hookSelfListFloor(context.Background(), cb, st, "repo_slots"); err != nil || floor != 0 {
+		t.Fatalf("post-release floor = (%d, %v), want (0, nil)", floor, err)
+	}
+	for _, u := range unlocks[1:] {
+		u()
+	}
+}
+
 // TestUsageFloorScanExpiredResultFailsClosed (Codex round 41): the
 // flight-result path must not hand CURRENT waiters a value whose scan
 // already outlived the freshness window — under the minimum reservation
