@@ -1398,6 +1398,46 @@ func TestLFSCompatCopy_AdmissionRetiredAfterSuccess(t *testing.T) {
 	}
 }
 
+// TestLFSAdopt_LegacyRowMigratesAtObjectCap (Codex round 86): a v0.2.0
+// legacy-spelled registry row already holds the object's cap slot, and
+// registration migrates it in place — zero growth for both ledgers — but
+// the adoption cap precheck recovered only the CANONICAL spelling, so at
+// MaxLFSObjectsPerRepo every write-scoped touch of such an object
+// permanently answered 507, blocking exactly the migration that frees
+// nothing and adds nothing.
+func TestLFSAdopt_LegacyRowMigratesAtObjectCap(t *testing.T) {
+	old := ref.MaxLFSObjectsPerRepo
+	ref.MaxLFSObjectsPerRepo = 1
+	t.Cleanup(func() { ref.MaxLFSObjectsPerRepo = old })
+	ctx := context.Background()
+	srv, st, mint := newLFSQuotaServer(t, 0, time.Hour)
+	tok := mint(auth.ScopeGitWrite)
+	content := []byte("legacy-registered at the cap")
+	oid := sha256Hex(content)
+	key := blob.LFSKey(lfsTestRepoID, oid)
+	legacyKey := blob.LFSLegacyKey(lfsTestRepoID, oid)
+	// The v0.2.0 state occupying the only cap slot: a legacy-spelled row
+	// with its legacy blob.
+	if err := st.RegisterLFSObject(ctx, lfsTestRepoID, legacyKey, int64(len(content))); err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.Blob.UploadFile(ctx, legacyKey, writeTempFile(t, content)); err != nil {
+		t.Fatal(err)
+	}
+
+	resp := decodeBatch(t, doLFS(t, srv, http.MethodPost, lfsBatchPath, "basic:"+tok,
+		batchBody("upload", oid, int64(len(content)))))
+	if resp.Objects[0].Error != nil || len(resp.Objects[0].Actions) != 0 {
+		t.Fatalf("at-cap touch of a legacy-registered object = %+v, want stored — the in-place migration is zero-growth", resp.Objects[0])
+	}
+	if has, err := st.HasLFSObject(ctx, lfsTestRepoID, key); err != nil || !has {
+		t.Fatalf("canonical row after migration = (%v, %v), want registered", has, err)
+	}
+	if has, err := st.HasLFSObject(ctx, lfsTestRepoID, legacyKey); err != nil || has {
+		t.Fatalf("legacy row after migration = (%v, %v), want migrated away", has, err)
+	}
+}
+
 // TestLFSCompat_RepairSerializedOnLegacyClaim (Codex security round 85):
 // the batch fast path's bridge repair launched an unserialized full copy —
 // every tiny concurrent touch of the object started another one. Compat
