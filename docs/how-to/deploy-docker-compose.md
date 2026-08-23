@@ -38,7 +38,7 @@ Runtime keys are generated, never committed. The nodes mount only the **public**
 on the host for minting:
 
 ```sh
-go build ./cmd/codestorage
+go build ./cmd/codestorage   # or install a released binary: README → Install
 mkdir -p compose-keys && ./codestorage keygen --out ./compose-keys/cs-key
 # writes compose-keys/cs-key.pem (private, 0600) + compose-keys/cs-key.pub.pem
 ```
