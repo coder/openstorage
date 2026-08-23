@@ -109,12 +109,12 @@ determinism rules; this section covers how to run and triage it.
 | Reproduce a seed (CLI) | `go run ./cmd/dst -seed <seed> [-steps N] [-nodes N] [-v] [-keep]` |
 | Nightly sweep | [`dst-nightly.yml`](../../.github/workflows/dst-nightly.yml) → `TestDSTSweep` |
 
-A run prints one summary line and a verdict; the trace hash is a pure function
-of the full run configuration (seed, steps, nodes), so runs with the same
-configuration replay identically. The CLI and the test entry point agree when
-their parameters match — `TestDSTSeed` takes `DST_SEED`/`DST_STEPS` and always
-uses the default node count; replay non-default `-nodes` runs through
-`cmd/dst`:
+A run prints one summary line and a verdict. Determinism means: the same
+binary run with the same configuration prints the same trace hash. The two
+entry points expose different slices of that configuration — `cmd/dst` takes
+`-seed`/`-steps`/`-nodes`, `TestDSTSeed` takes `DST_SEED`/`DST_STEPS` with the
+default node count — so a replay reproduces a run when its parameters match
+the original's (everything not exposed stays at the shared defaults):
 
 ```console
 $ go run ./cmd/dst -seed 42
