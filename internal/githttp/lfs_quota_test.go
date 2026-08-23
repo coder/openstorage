@@ -1166,6 +1166,147 @@ func TestLFSAdopt_CompatCopyAfterCanonicalAdoption(t *testing.T) {
 	}
 }
 
+// failLegacyCopyBlob fails every copy to a legacy-spelled destination a
+// bounded number of times, then succeeds — the transient-backend shape.
+type failLegacyCopyBlob struct {
+	blob.BlobStore
+	failures atomic.Int64
+}
+
+func (b *failLegacyCopyBlob) Copy(ctx context.Context, dstKey, srcKey string) error {
+	if !strings.Contains(dstKey, "/o2/") && b.failures.Add(-1) >= 0 {
+		return fmt.Errorf("simulated compat copy failure")
+	}
+	return b.BlobStore.Copy(ctx, dstKey, srcKey)
+}
+
+// TestLFSCompatCopy_FailurePropagatesAndRetryConverges (Codex round 83):
+// a swallowed compat-copy failure returned 200 while v0.2.0 replicas 404
+// the object — and no client retry could ever repair it, because the
+// registered-object fast paths returned success without re-attempting the
+// copy. The upload must FAIL when the compat bridge cannot land the legacy
+// spelling, and a retry of the registered object must repair it.
+func TestLFSCompatCopy_FailurePropagatesAndRetryConverges(t *testing.T) {
+	ctx := context.Background()
+	srv, st, mint := newLFSQuotaServer(t, 0, time.Hour)
+	srv.LFSV020WriteCompat = true
+	fb := &failLegacyCopyBlob{BlobStore: srv.Blob}
+	fb.failures.Store(1) // the first compat copy fails, the repair succeeds
+	srv.Blob = fb
+	tok := mint(auth.ScopeGitWrite)
+	content := []byte("compat copy fails once")
+	oid := sha256Hex(content)
+	objPath := "/" + lfsTestRepoURL + ".git/info/lfs/objects/" + oid
+
+	w := doLFS(t, srv, http.MethodPut, objPath, "basic:"+tok, string(content))
+	if w.Code == http.StatusOK {
+		t.Fatalf("PUT with a failed compat copy = 200 — old replicas 404 the object and no retry ever repairs it")
+	}
+	// The canonical object is durable and registered regardless…
+	if has, err := st.HasLFSObject(ctx, lfsTestRepoID, blob.LFSKey(lfsTestRepoID, oid)); err != nil || !has {
+		t.Fatalf("canonical registration = (%v, %v), want committed", has, err)
+	}
+	// …and the client's retry lands on the registered fast path, which
+	// must REPAIR the missing legacy spelling instead of short-circuiting.
+	w = doLFS(t, srv, http.MethodPut, objPath, "basic:"+tok, string(content))
+	if w.Code != http.StatusOK {
+		t.Fatalf("retry PUT = %d, body %s", w.Code, w.Body)
+	}
+	size, err := srv.Blob.Stat(ctx, blob.LFSLegacyKey(lfsTestRepoID, oid))
+	if err != nil || size != int64(len(content)) {
+		t.Fatalf("legacy spelling after retry = (%d, %v), want repaired", size, err)
+	}
+}
+
+// renewCountingStore counts adoption-claim renewals for one key.
+type renewCountingStore struct {
+	ref.RefStore
+	renews atomic.Int64
+}
+
+func (r *renewCountingStore) RenewAdoptionClaim(ctx context.Context, key, owner string) (bool, error) {
+	r.renews.Add(1)
+	return r.RefStore.RenewAdoptionClaim(ctx, key, owner)
+}
+
+// slowLegacySourceCopyBlob delays copies FROM legacy sources long enough
+// for renewal ticks to fire.
+type slowLegacySourceCopyBlob struct {
+	blob.BlobStore
+	delay time.Duration
+}
+
+func (b *slowLegacySourceCopyBlob) Copy(ctx context.Context, dstKey, srcKey string) error {
+	if !strings.Contains(srcKey, "/o2/") {
+		select {
+		case <-time.After(b.delay):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return b.BlobStore.Copy(ctx, dstKey, srcKey)
+}
+
+// TestLFSAdopt_PublishCopyRenewsClaimThroughout (Codex security round 83):
+// the publish copy was clamped to ref.AdoptionClaimTTL−5m (25 minutes), so
+// any sequential multipart copy slower than that was CANCELED with all
+// completed parts aborted — a guaranteed-lost, repeatable full-object cost
+// for large legacy blobs. The copy must instead run under its size-scaled
+// allowance with the claim RENEWED on the adoption cadence throughout, so
+// a live backend always finishes.
+func TestLFSAdopt_PublishCopyRenewsClaimThroughout(t *testing.T) {
+	ctx := context.Background()
+	oldInterval := lfsAdoptClaimRenewInterval
+	lfsAdoptClaimRenewInterval = 20 * time.Millisecond
+	t.Cleanup(func() { lfsAdoptClaimRenewInterval = oldInterval })
+
+	srv, _, _ := newLFSQuotaServer(t, 0, time.Hour)
+	legacy := []byte("large legacy object with a slow publish copy")
+	oid := sha256Hex(legacy)
+	key := blob.LFSKey(lfsTestRepoID, oid)
+	if err := srv.Blob.UploadFile(ctx, blob.LFSLegacyKey(lfsTestRepoID, oid), writeTempFile(t, legacy)); err != nil {
+		t.Fatal(err)
+	}
+	rs := &renewCountingStore{RefStore: srv.Store}
+	srv.Store = rs
+	srv.Blob = &slowLegacySourceCopyBlob{BlobStore: srv.Blob, delay: 150 * time.Millisecond}
+
+	if err := srv.adoptLFSObject(ctx, lfsTestRepoID, key, oid); err != nil {
+		t.Fatalf("adopt with slow publish copy: %v", err)
+	}
+	// Entry fence (1) plus at least one mid-copy renewal: without the
+	// renewal loop, a copy outliving the lease runs unfenced and any
+	// >25m copy is canceled outright.
+	if got := rs.renews.Load(); got < 2 {
+		t.Fatalf("claim renewals across the publish copy = %d, want >= 2 (entry fence + mid-copy cadence)", got)
+	}
+}
+
+// TestLFSAdopt_PublishCopyBudgetNotClampedByClaimTTL (Codex security round
+// 83): the copy deadline must scale with the object size — a 10 GiB
+// multipart copy at realistic throughput needs ~an hour, and the old
+// 25-minute clamp guaranteed cancellation.
+func TestLFSAdopt_PublishCopyBudgetNotClampedByClaimTTL(t *testing.T) {
+	srv, _, _ := newLFSQuotaServer(t, 0, time.Hour)
+	cb := &deadlineCapturingBlob{BlobStore: srv.Blob}
+	srv.Blob = cb
+	claimed, owner, err := srv.Store.TryAdoptionClaim(context.Background(), lfsTestRepoID, "lfs/"+lfsTestRepoID+"/o2/"+strings.Repeat("aa", 32))
+	if err != nil || !claimed {
+		t.Fatalf("claim = (%v, %v)", claimed, err)
+	}
+	key := blob.LFSKey(lfsTestRepoID, strings.Repeat("aa", 32))
+	legacyKey := blob.LFSLegacyKey(lfsTestRepoID, strings.Repeat("aa", 32))
+	if err := srv.Blob.UploadFile(context.Background(), legacyKey, writeTempFile(t, []byte("x"))); err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.publishVerifiedLFSObject(context.Background(), lfsTestRepoID, key, legacyKey, 10<<30, owner); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	if got := time.Duration(cb.budget.Load()); got < 2*time.Hour {
+		t.Fatalf("publish copy budget = %v for a 10 GiB object, want the size-scaled allowance (>= ~2h51m), not the 25m claim-TTL clamp", got)
+	}
+}
+
 // gateCopyBlob blocks copies TO legacy-spelled destinations until release
 // is closed, capturing the moment the compat copy is in flight.
 type gateCopyBlob struct {
