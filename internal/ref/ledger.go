@@ -277,6 +277,22 @@ var MaxLFSObjectsPerRepo = int64(100_000)
 // Re-registration of an existing key never returns it (zero growth).
 var ErrLFSObjectCapExceeded = errors.New("repository LFS object count limit reached")
 
+// lockBaseLedger takes the per-base advisory lock serializing quota
+// admissions (reserveLockClass) inside tx. Every transaction that BUMPS
+// the shared floor generation must take it BEFORE its first row work
+// (Codex round 65): ReservePackBytes' transactional generation recheck is
+// a plain snapshot read, so a bump committing between that read and the
+// reserve's commit would evade it — under the shared lock the bump either
+// commits before the reserve's recheck (which then sees the moved
+// generation) or strictly after the reserve committed (whose admission
+// used the pre-bump counter — the conservative side). Lock-first ordering
+// also keeps bump transactions deadlock-free against reserves touching
+// the same reservation rows.
+func lockBaseLedger(ctx context.Context, tx pgx.Tx, base string) error {
+	_, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1), $2)`, base, reserveLockClass)
+	return err
+}
+
 // reserveLockClass namespaces the per-base advisory locks ReservePackBytes
 // takes ("PKQR"), in the two-int4 pg_advisory_xact_lock keyspace — disjoint
 // from the single-int8 keys the schema-init paths use (META, SPIKE, RIVER).
@@ -557,6 +573,11 @@ func (s *PG) ReclaimRetainedPack(ctx context.Context, repo, key string) (int64, 
 	assertf(repo != "" && key != "", "ReclaimRetainedPack(%q, %q)", repo, key)
 	var bytes int64
 	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		// The debit bumps the floor generation below: serialize with the
+		// admission recheck (Codex round 65, lockBaseLedger).
+		if err := lockBaseLedger(ctx, tx, baseRepoOf(repo)); err != nil {
+			return err
+		}
 		switch err := tx.QueryRow(ctx,
 			`DELETE FROM pack_retained WHERE repo = $1 AND key = $2 RETURNING bytes`,
 			repo, key).Scan(&bytes); {
@@ -666,6 +687,14 @@ func (s *PG) RegisterAdoptedLFSObject(ctx context.Context, repo, key string, byt
 
 func (s *PG) registerLFSObjectTx(ctx context.Context, repo, key string, bytes int64, adopted bool) error {
 	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		if adopted {
+			// The adoption bump below must be serialized with the
+			// admission recheck (Codex round 65, lockBaseLedger); LFS
+			// repos are always base repos (ADR-35).
+			if err := lockBaseLedger(ctx, tx, repo); err != nil {
+				return err
+			}
+		}
 		ct, err := tx.Exec(ctx,
 			`INSERT INTO lfs_objects (repo, key, bytes) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
 			repo, key, bytes)
@@ -754,10 +783,17 @@ func baseRepoOf(repo string) string {
 // BumpLFSAdoptionGen — see RefStore (Codex round 49).
 func (s *PG) BumpLFSAdoptionGen(ctx context.Context, repo string) error {
 	assertf(repo != "", "BumpLFSAdoptionGen(%q)", repo)
-	_, err := s.pool.Exec(ctx, `
+	// Serialized with the admission recheck (Codex round 65,
+	// lockBaseLedger) like every generation bump.
+	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		if err := lockBaseLedger(ctx, tx, baseRepoOf(repo)); err != nil {
+			return err
+		}
+		_, err := tx.Exec(ctx, `
 INSERT INTO lfs_adoption_gens (repo, gen) VALUES ($1, 1)
 ON CONFLICT (repo) DO UPDATE SET gen = lfs_adoption_gens.gen + 1`, repo)
-	return err
+		return err
+	})
 }
 
 // LFSAdoptionGen — see RefStore (Codex round 49).

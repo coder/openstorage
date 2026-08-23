@@ -729,7 +729,19 @@ func (s *PG) CASRef(ctx context.Context, repo, name, old, new string) (won bool,
 // ReservePackBytes read one snapshot without locking against registration.
 func (s *PG) RegisterPacks(ctx context.Context, repo string, packs []Pack) error {
 	assertf(len(packs) > 0, "RegisterPacks called with no packs")
+	mayAdopt := false
+	for _, p := range packs {
+		mayAdopt = mayAdopt || p.Adopted
+	}
 	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		if mayAdopt {
+			// A possible adoption bump below must be serialized with the
+			// admission recheck (Codex round 65, ledger.go
+			// lockBaseLedger), lock-first before any row work.
+			if err := lockBaseLedger(ctx, tx, baseRepoOf(repo)); err != nil {
+				return err
+			}
+		}
 		var credit int64
 		adopted := false
 		for _, p := range packs {

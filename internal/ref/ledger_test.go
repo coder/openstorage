@@ -11,6 +11,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 )
 
 // ledgerTTL is generous so nothing expires mid-test unless a test says so.
@@ -663,6 +665,66 @@ func TestReserveRejectsStaleFloorGen(t *testing.T) {
 			t.Fatalf("fresh-gen reserve = %+v, %v, want admission", dec, err)
 		}
 	})
+}
+
+// TestGenBumpsSerializeWithAdmissionLock (Codex round 65, PG only —
+// SQLite's IMMEDIATE transactions serialize every writer already): the
+// reserve's transactional generation recheck is a plain snapshot read, so
+// a bump-carrying transaction committing between that read and the
+// reserve's commit would evade it. Every generation-bumping transaction
+// must therefore take the SAME per-base advisory lock as the reserve:
+// while an admission holds it, bumps (and the reclaim's debit+bump, even
+// its idempotent no-op form — lock-first) must block until it releases.
+func TestGenBumpsSerializeWithAdmissionLock(t *testing.T) {
+	ctx := context.Background()
+	s := pgTestStore(t)
+	base := "TestGenBumpsSerializeWithAdmissionLock"
+
+	conn, err := pgx.Connect(ctx, pgTestURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = conn.Close(context.Background()) })
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+	// The "admission": holds the per-base reserve lock mid-transaction.
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1), $2)`, base, reserveLockClass); err != nil {
+		t.Fatal(err)
+	}
+
+	for name, op := range map[string]func(context.Context) error{
+		"bump": func(c context.Context) error { return s.BumpLFSAdoptionGen(c, base) },
+		"reclaim": func(c context.Context) error {
+			_, err := s.ReclaimRetainedPack(c, base, "packs/"+base+"/pack-x.pack")
+			return err
+		},
+	} {
+		done := make(chan error, 1)
+		go func() { done <- op(ctx) }()
+		select {
+		case err := <-done:
+			t.Fatalf("%s completed while the admission lock was held (err=%v) — it must serialize with the reserve recheck", name, err)
+		case <-time.After(300 * time.Millisecond):
+			// Blocked, as required.
+		}
+		if err := tx.Rollback(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if err := <-done; err != nil {
+			t.Fatalf("%s after lock release: %v", name, err)
+		}
+		// Re-arm the lock for the next case.
+		tx, err = conn.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1), $2)`, base, reserveLockClass); err != nil {
+			t.Fatal(err)
+		}
+	}
 }
 
 // TestRetainedBytesGateAdmission is issue #31's drip-write amplification
