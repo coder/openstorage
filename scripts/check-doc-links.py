@@ -83,6 +83,9 @@ def check():
     for path in md:
         d = posixpath.dirname(path) or "."
         for lineno, ln in scan_lines(path):
+            # mask inline code spans (`...`, ``...``) so demonstrated link
+            # syntax inside them is not validated
+            ln = re.sub(r"(`+).*?\1", "", ln)
             if REFDEF.match(ln):
                 print(f"UNSUPPORTED REF-STYLE LINK DEF {path}:{lineno} -> {ln.strip()[:60]}")
                 bad += 1

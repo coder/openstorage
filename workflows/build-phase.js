@@ -479,7 +479,8 @@ export default function workflow({ args, phase, log, agent, parallel, applyPatch
   agent(
     `Update project documentation for this phase: implementation notes / ADRs for non-obvious decisions ` +
       `(ref-authority-in-PG, S3-before-ref-flip, namespace mapping), README quickstart if setup changed, and ` +
-      `docs/archive/phases/07-implementation-roadmap.md phase status. Match existing docs tone; no marketing fluff.\n\nWhat was built:\n${implementSummary}${commitRule}`,
+      `the affected living reference/explanation pages under docs/. Do NOT edit anything under docs/archive/ ` +
+      `— those are frozen historical records. Match existing docs tone; no marketing fluff.\n\nWhat was built:\n${implementSummary}${commitRule}`,
     { id: "document", title: "Document phase" }
   );
   applyChildPatch("apply-document", "document");
