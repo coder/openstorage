@@ -54,10 +54,11 @@ message in the PR.
 
 ### E2E conventions (`internal/githttp`)
 
-- **No `-count=N` on the e2e suites.** E2E tests register repositories under
-  fixed names (`t-repack`, ...) against a backend that lives for the whole
-  `TestMain` process, so an in-process rerun collides with the first run's
-  state. Rerun by invoking `go test` again, not with `-count`.
+- **Keep `-count=1`; never `-count=2` or higher on the e2e suites.** E2E tests
+  register repositories under fixed names (`t-repack`, ...) against a backend
+  that lives for the whole `TestMain` process, so an in-process rerun collides
+  with the first run's state. Repeat a run by invoking `go test -count=1`
+  again, not by raising `-count`.
 - **Repack convergence asserts must use threshold 2.** With
   `CODESTORAGE_REPACK_THRESHOLD=t`, pack rows converge *below* `t`, not to one
   row — a fold that snapshots all but the latest push can settle at `t-1` rows

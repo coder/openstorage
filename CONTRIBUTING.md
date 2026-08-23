@@ -19,14 +19,15 @@ depth, see the [testing reference](docs/reference/testing.md).
 
 ```sh
 go build ./cmd/codestorage && ./codestorage version
+./codestorage keygen --out /tmp/cs-key   # org keypair, used by both serve modes below
 ```
 
-Two ways to run what you built:
+(A source build lands at `./codestorage` without touching `PATH` — spell the
+`./` out, or `go install` it.) Two ways to run what you built:
 
 - **Zero-dependency local mode** — SQLite + plain-file blobs, one flag:
 
   ```sh
-  codestorage keygen --out /tmp/cs-key
   CODESTORAGE_ORG=selfhost CODESTORAGE_ORG_PUBKEYS=/tmp/cs-key.pub.pem \
     ./codestorage serve --listen 127.0.0.1:8080 --data-dir /tmp/cs-data
   ```
