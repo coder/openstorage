@@ -778,7 +778,21 @@ func (s *Server) adoptLFSObject(ctx context.Context, repoID, key, oid string) er
 		if registered {
 			return nil // the twin registered this same key: nothing to add
 		}
-		return ref.ErrLFSObjectCapExceeded
+		// A v0.2.0 legacy-spelled row for THIS oid already holds the
+		// object's cap slot (Codex round 86): registration migrates it in
+		// place — zero growth for both the count and usage ledgers — so
+		// the cap must not deny the touch. Failing here made every
+		// write-scoped touch of an existing legacy object answer 507
+		// forever once the repository reached MaxLFSObjectsPerRepo,
+		// permanently blocking exactly the migrations that add nothing.
+		legacyRegistered, lerr := s.Store.HasLFSObject(ctx, repoID, blob.LFSLegacyKey(repoID, oid))
+		if lerr != nil {
+			return lerr
+		}
+		if !legacyRegistered {
+			return ref.ErrLFSObjectCapExceeded
+		}
+		// Zero-growth in-place migration: proceed.
 	}
 	// Fleet-wide adoption claim (Codex security round 73): the in-flight
 	// map below this call dedupes only within one process, so replicas
