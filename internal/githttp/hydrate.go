@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -259,10 +260,24 @@ func EnsureCacheRepoCtx(ctx context.Context, cacheDir, repo string) (string, err
 // content-matched file, or of the fully written temp file (rename preserves
 // inode, mtime, and mode). The memo fingerprints these so it can only ever
 // vouch for a state this function actually checked or wrote.
+//
+// Content, mode, and fingerprint all come from ONE opened descriptor: a
+// re-read by path could pair the content of one inode with the stat of a
+// concurrent replacement renamed over it — during a rolling deployment the
+// memo would then vouch for the other binary's hook as if verified, and
+// stop repairing it (PR #98 review, P1). The path is then confirmed to
+// still name that same inode before the fingerprint may be memoized;
+// otherwise fall through and install our own script, exactly as if the
+// content had not matched.
 func ensureHook(path, script string) (os.FileInfo, error) {
-	if cur, err := os.ReadFile(path); err == nil && string(cur) == script {
-		if fi, err := os.Stat(path); err == nil && fi.Mode().Perm() == 0o755 {
-			return fi, nil
+	if f, err := os.Open(path); err == nil {
+		cur, rerr := io.ReadAll(f)
+		fi, serr := f.Stat()
+		_ = f.Close()
+		if rerr == nil && serr == nil && string(cur) == script && fi.Mode().Perm() == 0o755 {
+			if pathFI, err := os.Stat(path); err == nil && os.SameFile(fi, pathFI) {
+				return fi, nil
+			}
 		}
 	}
 	tmp, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".tmp-*")
