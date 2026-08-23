@@ -48,6 +48,15 @@ func repoPurgeFencedSQLite(ctx context.Context, tx *sql.Tx, repo string) (bool, 
 	return fenced, err
 }
 
+// IsRepoPurged — see the PG twin.
+func (s *SQLite) IsRepoPurged(ctx context.Context, base string) (bool, error) {
+	assertf(base != "", "IsRepoPurged: empty base repo")
+	var fenced bool
+	err := s.db.QueryRowContext(ctx,
+		`SELECT EXISTS (SELECT 1 FROM purged_repos WHERE repo = ?)`, base).Scan(&fenced)
+	return fenced, err
+}
+
 // DropRepoRefs — see the PG twin.
 func (s *SQLite) DropRepoRefs(ctx context.Context, group []string) (int64, error) {
 	validatePurgeGroup(group)

@@ -85,6 +85,12 @@ Flags:
 		return fmt.Errorf("open ref store: %w", err)
 	}
 	defer rs.Close()
+	// Operator commands own schema init like serve (hooks never run DDL):
+	// when purge-repo is the first upgraded binary to touch a database,
+	// the purge fence table must exist before the seams run.
+	if err := rs.InitSchema(ctx); err != nil {
+		return fmt.Errorf("init ref schema: %w", err)
+	}
 	bl, err := blob.Open(ctx, urls.blobURL)
 	if err != nil {
 		return fmt.Errorf("open blob store: %w", err)
@@ -128,9 +134,6 @@ Flags:
 	if !found {
 		return fmt.Errorf("repo %s not found (never created, or purged by an older build)", repoID)
 	}
-	if state.PurgedAt != nil {
-		return fmt.Errorf("repo %s (%s) was already purged at %s", repoID, state.Repo.URL, state.PurgedAt.Format(time.RFC3339))
-	}
 	if state.Repo.DeletedAt == nil {
 		return fmt.Errorf("repo %s (%s) is live — delete it first (DELETE /api/v1/repos/delete)", repoID, state.Repo.URL)
 	}
@@ -138,6 +141,12 @@ Flags:
 	fmt.Printf("url:        %s\n", state.Repo.URL)
 	fmt.Printf("deleted at: %s (%s ago)\n",
 		state.Repo.DeletedAt.Format(time.RFC3339), time.Since(*state.Repo.DeletedAt).Round(time.Second))
+	if state.PurgedAt != nil {
+		// Completed purge: re-running rescans the blob prefixes for
+		// stragglers an in-flight pre-delete writer published after the
+		// completed pass's scan (still gated on --yes, like any purge).
+		fmt.Printf("purged at:  %s — rescanning for straggler blobs\n", state.PurgedAt.Format(time.RFC3339))
+	}
 	if !*yes {
 		return errors.New("refusing to purge without --yes: purging is IRREVERSIBLE (no restore)")
 	}

@@ -198,9 +198,79 @@ func TestRepoPurge_EndToEnd(t *testing.T) {
 	if _, err := f.meta.CreateRepo(context.Background(), f.org, victim.URL, "main"); !errors.Is(err, meta.ErrAlreadyExists) {
 		t.Fatalf("purge released the burned name: CreateRepo = %v, want ErrAlreadyExists", err)
 	}
-	// Idempotence: purging again reports already-purged.
-	if _, err := f.purger(sweeper, 0).PurgeRepo(context.Background(), victim.RepoID); !errors.Is(err, ErrRepoAlreadyPurged) {
-		t.Fatalf("re-purge = %v, want ErrRepoAlreadyPurged", err)
+	// Idempotence: re-purging a completed repo is a straggler rescan —
+	// success with nothing left to reap.
+	rep2, err := f.purger(sweeper, 0).PurgeRepo(context.Background(), victim.RepoID)
+	if err != nil || rep2.BlobsReaped != 0 {
+		t.Fatalf("re-purge = %+v err=%v, want clean no-op rescan", rep2, err)
+	}
+}
+
+func TestPurgedRepoStragglers(t *testing.T) {
+	// An in-flight pre-delete writer PUBLISHES its blob after the purge's
+	// prefix scan; its fenced registration then fails, stranding an
+	// unregistered blob under the purged repo's prefix. Both recovery
+	// paths must reap it: the sweeper's PurgedRepoProbe classification on
+	// the normal cadence, and a purge-repo re-run's rescan.
+	f := newPurgeFixture(t)
+	ctx := context.Background()
+	repo := f.seedRepo("https://example.com/straggler-blob.git")
+	f.softDelete(repo.URL)
+	probe := f.store.(RepoPurgeRegistry).IsRepoPurged
+	sweeper := f.sweeper(SweepConfig{Threshold: 24 * time.Hour, RetentionEnabled: true, PurgedRepoProbe: probe})
+	purger := f.purger(sweeper, 0)
+	if _, err := purger.PurgeRepo(ctx, repo.RepoID); err != nil {
+		t.Fatalf("PurgeRepo: %v", err)
+	}
+
+	// The late publication lands after completion (uploads are not
+	// fenced), in both classes; age it past the threshold.
+	stragglerPack := blob.PackKey(repo.RepoID, "late")
+	stragglerLFS := blob.LFSKey(repo.RepoID, strings.Repeat("c", 64))
+	f.upload(stragglerPack, "late pack bytes")
+	f.upload(stragglerLFS, "late lfs bytes")
+	f.backdate(stragglerPack, 25*time.Hour)
+	f.backdate(stragglerLFS, 25*time.Hour)
+
+	// Path 1: the ordinary sweep, retention mode alone (every delete flag
+	// off), reaps both classes via the fence probe.
+	report, err := sweeper.Sweep(ctx)
+	if err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if report.Deleted != 2 {
+		t.Fatalf("sweep reaped %d stragglers, want 2 (report %+v)", report.Deleted, report)
+	}
+	if f.exists(stragglerPack) || f.exists(stragglerLFS) {
+		t.Fatal("straggler blobs survived the retention-mode sweep")
+	}
+	if len(f.backupKeys(stragglerPack)) != 1 || len(f.backupKeys(stragglerLFS)) != 1 {
+		t.Fatal("straggler reaps skipped quarantine")
+	}
+
+	// A live repo's aged unregistered blob stays untouched by the probe
+	// path (it is not fenced): retention mode alone must not reap it.
+	control := f.seedRepo("https://example.com/straggler-control.git")
+	controlOrphan := blob.PackKey(control.RepoID, "orphan")
+	f.upload(controlOrphan, "orphan bytes")
+	f.backdate(controlOrphan, 25*time.Hour)
+	if _, err := sweeper.Sweep(ctx); err != nil {
+		t.Fatalf("control sweep: %v", err)
+	}
+	if !f.exists(controlOrphan) {
+		t.Fatal("retention-mode sweep reaped a live repo's orphan")
+	}
+
+	// Path 2: a purge-repo re-run rescans and reaps a fresh straggler
+	// immediately (no age threshold — rows are provably gone).
+	straggler2 := blob.PackKey(repo.RepoID, "late2")
+	f.upload(straggler2, "second straggler")
+	rep, err := purger.PurgeRepo(ctx, repo.RepoID)
+	if err != nil {
+		t.Fatalf("rescan PurgeRepo: %v", err)
+	}
+	if rep.BlobsReaped != 1 || f.exists(straggler2) {
+		t.Fatalf("rescan reaped %d (blob present=%v), want the straggler gone", rep.BlobsReaped, f.exists(straggler2))
 	}
 }
 

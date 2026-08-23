@@ -174,7 +174,10 @@ codestorage purge-repo --data-dir ~/cs-data --yes repo_761aac427fd3
 
 Deleted blob bytes land in `sweep/quarantine/` first and are freed once the backups age
 past the quarantine window on a later sweep (the running server's sweep collects them;
-with sweeping disabled they remain until one runs).
+with sweeping disabled they remain until one runs). Re-running the command on an
+already-purged repository rescans its blob prefixes for stragglers — bytes an in-flight
+pre-delete push published after the first pass — and reaps them through the same
+quarantine handshake.
 
 ## `codestorage version`
 

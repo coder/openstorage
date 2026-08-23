@@ -49,6 +49,9 @@ type RepoPurgeRegistry interface {
 	// completion cannot be raced by an in-flight pre-delete writer.
 	// Permanent, like the name burn; idempotent.
 	FenceRepoPurge(ctx context.Context, base string) error
+	// IsRepoPurged reports whether the base repo is purge-fenced — the
+	// sweeper's straggler-blob probe (SweepConfig.PurgedRepoProbe).
+	IsRepoPurged(ctx context.Context, base string) (bool, error)
 	// DropRepoRefs deletes the group's ref rows (purge phase 1 — refs die
 	// first, so no later phase can strand a committed ref).
 	DropRepoRefs(ctx context.Context, group []string) (int64, error)
@@ -118,9 +121,6 @@ var (
 	// but left the repos row unstamped so the next pass re-tombstones and
 	// retries.
 	ErrPurgeDeferred = errors.New("purge deferred: registry rows were re-registered mid-purge")
-	// ErrRepoAlreadyPurged rejects purging a repository whose purge
-	// already completed (purged_at stamped).
-	ErrRepoAlreadyPurged = errors.New("repository is already purged")
 )
 
 // RepoPurgeReport summarizes one repository's purge.
@@ -253,7 +253,14 @@ func (p *RepoPurger) purgeRepo(ctx context.Context, repoID string) (RepoPurgeRep
 		return rep, fmt.Errorf("repo %s: %w", repoID, meta.ErrNotFound)
 	}
 	if state.PurgedAt != nil {
-		return rep, fmt.Errorf("repo %s was purged at %s: %w", repoID, state.PurgedAt.Format(time.RFC3339), ErrRepoAlreadyPurged)
+		// Completed purge: the row phases are done and the fence rejects
+		// every new registration, but a pre-fence writer may have
+		// PUBLISHED a blob after the completed pass's prefix scan
+		// (uploads precede registration and cannot be fenced). Re-running
+		// is a straggler rescan: reap the prefixes again and leave the
+		// stamped tombstone alone. The background analogue is the
+		// sweeper's PurgedRepoProbe classification.
+		return rep, p.rescanPurged(ctx, repoID, &rep)
 	}
 	if state.Repo.DeletedAt == nil {
 		return rep, fmt.Errorf("repo %s is live — delete it first: %w", repoID, meta.ErrRepoNotDeleted)
@@ -322,6 +329,22 @@ func (p *RepoPurger) purgeRepo(ctx context.Context, repoID string) (RepoPurgeRep
 		return rep, err
 	}
 	return rep, nil
+}
+
+// rescanPurged reaps straggler blobs of an already-completed purge — the
+// same prefix walk as phase 4, with the row phases (provably done, fenced)
+// skipped.
+func (p *RepoPurger) rescanPurged(ctx context.Context, repoID string, rep *RepoPurgeReport) error {
+	for _, prefix := range []string{
+		blob.PackPrefix(repoID),
+		blob.PacksRoot + repoID + "+",
+		blob.LFSPrefix(repoID),
+	} {
+		if err := p.reapPrefix(ctx, prefix, rep); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // reapPrefix disposes of every blob under prefix through the sweeper's

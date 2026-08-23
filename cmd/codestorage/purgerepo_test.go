@@ -6,6 +6,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"os"
 	"path/filepath"
@@ -140,8 +141,52 @@ func TestCmdPurgeRepo(t *testing.T) {
 	if state, found, err := ms.(jobs.RepoPurgeMeta).RepoPurgeState(ctx, deleted.RepoID); err != nil || !found || state.PurgedAt == nil {
 		t.Fatalf("purge tombstone wrong: found=%v state=%+v err=%v", found, state, err)
 	}
-	// Re-purging reports already-purged (idempotent completion).
-	if err := cmdPurgeRepo(ctx, []string{"--data-dir", dir, "--yes", deleted.RepoID}); err == nil || !strings.Contains(err.Error(), "already purged") {
-		t.Fatalf("re-purge = %v, want already-purged", err)
+	// Re-purging a completed repo is a straggler rescan: succeeds and
+	// reaps blobs published after the first pass's scan.
+	stragglerKey := blob.PackKey(deleted.RepoID, "late")
+	src := filepath.Join(t.TempDir(), "late")
+	if err := os.WriteFile(src, []byte("late straggler"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := bl.UploadFile(ctx, stragglerKey, src); err != nil {
+		t.Fatal(err)
+	}
+	if err := cmdPurgeRepo(ctx, []string{"--data-dir", dir, "--yes", deleted.RepoID}); err != nil {
+		t.Fatalf("re-purge rescan = %v, want success", err)
+	}
+	if _, err := bl.Stat(ctx, stragglerKey); !errors.Is(err, blob.ErrNotFound) {
+		t.Fatalf("straggler survived the rescan: %v", err)
+	}
+}
+
+func TestCmdPurgeRepo_InitializesRefSchema(t *testing.T) {
+	// Upgrade path: purge-repo may be the FIRST new binary to touch a
+	// database created before the purge fence table existed. The command
+	// must run ref InitSchema itself (operator commands own DDL like
+	// serve) or the very first purge fails on the missing table.
+	for _, env := range []string{
+		"CODESTORAGE_PG_URL", "SPIKE_PG_URL", "PG_URL",
+		"CODESTORAGE_S3_URL", "SPIKE_S3_URL", "BLOB_URL",
+		envDataDir, envSecretsKey, envPackQuota, envPackReservationTTL,
+	} {
+		t.Setenv(env, "")
+	}
+	ctx := context.Background()
+	dir := t.TempDir()
+	deleted, _ := seedPurgeDataDir(t, dir)
+	// Simulate the pre-upgrade database by dropping the fence table the
+	// seeding's InitSchema created.
+	db, err := sql.Open("sqlite", filepath.Join(dir, "codestorage.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `DROP TABLE purged_repos`); err != nil {
+		t.Fatalf("drop fence table: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := cmdPurgeRepo(ctx, []string{"--data-dir", dir, "--yes", deleted.RepoID}); err != nil {
+		t.Fatalf("purge on pre-upgrade database = %v, want success", err)
 	}
 }

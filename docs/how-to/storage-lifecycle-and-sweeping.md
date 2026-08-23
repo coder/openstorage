@@ -87,7 +87,11 @@ row (soft-deleted plus a purge timestamp), which keeps `DELETE`-then-recreate ra
 stale-token replays structurally impossible. A purge also write-fences the repository
 in the ref store before touching anything: a push that resolved the repository just
 before its deletion and is still in flight fails its pack/LFS registration instead of
-re-registering rows behind the purge.
+re-registering rows behind the purge. Such a push may still have *published* its blob
+after the purge's scan (uploads precede registration) — the fence makes those bytes
+provably permanent garbage, so later retention-mode sweeps reap them in every class
+once aged, and re-running `purge-repo` on the purged repository rescans its prefixes
+immediately.
 
 The purge is crash-safe by ordering, the inverse of the write path's
 publish-before-registration: registry rows are tombstoned **before** any blob is

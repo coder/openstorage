@@ -153,19 +153,28 @@ func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL, loopbackBaseU
 			return nil
 		}
 	}
+	// Repo-retention purge (issue #52): rides the sweep schedule over the
+	// same raw stores. The purge seams live on the concrete backends
+	// (ref/purge.go, meta/purge.go), so the raw stores opened above always
+	// satisfy these assertions.
+	var purgeReg jobs.RepoPurgeRegistry
+	var purgeMeta jobs.RepoPurgeMeta
+	if sweep.repoRetention > 0 {
+		pr, ok := refStore.(jobs.RepoPurgeRegistry)
+		assertf(ok, "ref store %T lacks the repo purge seams", refStore)
+		pm, ok := ms.(jobs.RepoPurgeMeta)
+		assertf(ok, "meta store %T lacks the repo purge seams", ms)
+		purgeReg, purgeMeta = pr, pm
+		// Sweeps reap straggler blobs published into purge-fenced repos
+		// after their purge's own prefix scan (uploads precede the fenced
+		// registration and cannot be fenced themselves).
+		sweepCfg.PurgedRepoProbe = pr.IsRepoPurged
+	}
 	sweeper := jobs.NewSweeper(blobStore, refStore, sweepCfg, logger)
 	var schedule *jobs.SweepSchedule
 	if sweep.interval > 0 {
 		schedule = &jobs.SweepSchedule{Sweeper: sweeper, Interval: sweep.interval}
 		if sweep.repoRetention > 0 {
-			// Repo-retention purge (issue #52): rides the sweep schedule
-			// over the same raw stores. The purge seams live on the
-			// concrete backends (ref/purge.go, meta/purge.go), so the raw
-			// stores opened above always satisfy these assertions.
-			purgeReg, ok := refStore.(jobs.RepoPurgeRegistry)
-			assertf(ok, "ref store %T lacks the repo purge seams", refStore)
-			purgeMeta, ok := ms.(jobs.RepoPurgeMeta)
-			assertf(ok, "meta store %T lacks the repo purge seams", ms)
 			schedule.Purger = jobs.NewRepoPurger(sweeper, purgeReg, purgeMeta, sweep.repoRetention, logger)
 			logger.Info("soft-deleted repository retention purge enabled",
 				"env", envRepoRetention, "retention", sweep.repoRetention)

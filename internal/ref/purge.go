@@ -66,6 +66,18 @@ func repoPurgeFencedPG(ctx context.Context, tx pgx.Tx, repo string) (bool, error
 	return fenced, err
 }
 
+// IsRepoPurged reports whether the BASE repo is purge-fenced — the
+// sweeper's point read for classifying straggler blobs (a fenced repo's
+// unregistered blobs are provably garbage: registrations reject forever),
+// mirroring HasPack's per-candidate shape.
+func (s *PG) IsRepoPurged(ctx context.Context, base string) (bool, error) {
+	assertf(base != "", "IsRepoPurged: empty base repo")
+	var fenced bool
+	err := s.pool.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM purged_repos WHERE repo = $1)`, base).Scan(&fenced)
+	return fenced, err
+}
+
 // DropRepoRefs deletes every ref row of the group's repos (purge phase:
 // refs die FIRST, so no later phase can strand a committed ref). Returns
 // the rows deleted. The InitSchema triggers bump the repo generations as

@@ -133,6 +133,16 @@ type SweepConfig struct {
 	// failure downgrades it alongside the delete modes (the paired
 	// RepoPurger consults the same guard before its own destructive work).
 	RetentionEnabled bool
+	// PurgedRepoProbe, when set with RetentionEnabled, classifies aged
+	// unregistered blobs of purge-FENCED base repos as reapable in every
+	// class (packs and LFS alike, no per-class opt-in needed): an
+	// in-flight pre-delete writer publishes its blob BEFORE its fenced
+	// registration fails, so the blob can land after the purge's own
+	// prefix scan — this probe is how the ordinary sweep cadence reaps
+	// those stragglers (fenced repos never register again, making the
+	// blobs provably garbage). One extra point read per aged candidate
+	// not already covered by another mode, mirroring IsRetainedPack.
+	PurgedRepoProbe func(ctx context.Context, base string) (bool, error)
 	// QuotaEnforced reports that pack-quota admission is enabled
 	// (CODESTORAGE_PACK_QUOTA_BYTES > 0). Quarantine restores take cover
 	// reservations and hand off floor-generation bumps ONLY then (Codex
@@ -306,7 +316,7 @@ func (s *Sweeper) Sweep(ctx context.Context) (SweepReport, error) {
 				s.logger.Warn("orphan pack sweep: skipping foreign key under packs/", "key", obj.Key)
 				continue
 			}
-			if err := s.classify(ctx, repo, obj, deleteMode, supersededMode, lfsMode, &report, &deleteErrs); err != nil {
+			if err := s.classify(ctx, repo, obj, deleteMode, supersededMode, lfsMode, retentionMode, &report, &deleteErrs); err != nil {
 				return err
 			}
 		}
@@ -326,7 +336,7 @@ func (s *Sweeper) Sweep(ctx context.Context) (SweepReport, error) {
 				s.logger.Warn("orphan pack sweep: skipping foreign key under lfs/", "key", obj.Key)
 				continue
 			}
-			if err := s.classify(ctx, repo, obj, deleteMode, supersededMode, lfsMode, &report, &deleteErrs); err != nil {
+			if err := s.classify(ctx, repo, obj, deleteMode, supersededMode, lfsMode, retentionMode, &report, &deleteErrs); err != nil {
 				return err
 			}
 		}
@@ -425,9 +435,11 @@ func (s *Sweeper) registered(ctx context.Context, repo, key string) (bool, error
 // deleteMode; retained superseded blobs (a durable pack_retained record
 // written by the fold's own transaction, issue #31) are reaped under
 // supersededMode too; LFS orphans (issue #51) only under their own
-// lfsMode opt-in. Registry errors abort the sweep (they would
-// misclassify the object); disposal errors accumulate into deleteErrs.
-func (s *Sweeper) classify(ctx context.Context, repo string, obj blob.ListedObject, deleteMode, supersededMode, lfsMode bool, report *SweepReport, deleteErrs *boundedErrs) error {
+// lfsMode opt-in; blobs of purge-FENCED repos (issue #52, PurgedRepoProbe)
+// under retentionMode in every class. Registry errors abort the sweep
+// (they would misclassify the object); disposal errors accumulate into
+// deleteErrs.
+func (s *Sweeper) classify(ctx context.Context, repo string, obj blob.ListedObject, deleteMode, supersededMode, lfsMode, retentionMode bool, report *SweepReport, deleteErrs *boundedErrs) error {
 	registered, err := s.registered(ctx, repo, obj.Key)
 	if err != nil {
 		return fmt.Errorf("registry lookup %s: %w", obj.Key, err)
@@ -472,6 +484,20 @@ func (s *Sweeper) classify(ctx context.Context, repo string, obj blob.ListedObje
 			}
 			canDelete = retained
 		}
+	}
+	if !canDelete && retentionMode && s.cfg.PurgedRepoProbe != nil {
+		// Straggler blobs of a purge-fenced repo (issue #52): an
+		// in-flight pre-delete writer published after the purge's own
+		// prefix scan. The fence makes them provably permanent garbage —
+		// no registration for the repo can ever succeed again — so every
+		// class is reapable without its own opt-in.
+		base, _, _ := strings.Cut(repo, "+")
+		purged, err := s.cfg.PurgedRepoProbe(ctx, base)
+		if err != nil {
+			deleteErrs.add(fmt.Errorf("is repo purged %s: %w", obj.Key, err))
+			return nil
+		}
+		canDelete = purged
 	}
 	if !canDelete {
 		return nil
