@@ -217,6 +217,22 @@ type RefStore interface {
 	// then republishes its bytes, so no interleaving can leave a
 	// registered row pointing at deleted bytes.
 	GuardedLFSDelete(ctx context.Context, repo, key string, del func(context.Context) error) (deleted bool, err error)
+	// TryAdoptionClaim atomically claims exclusive fleet-wide ownership
+	// of one legacy-object adoption (Codex security round 73): the
+	// verification hash downloads the whole object, and without a shared
+	// claim every replica races the same hash — tiny write-scoped
+	// batches fanned across the fleet multiply backend reads by fleet
+	// size. claimed=false means a live claim exists (another replica is
+	// hashing; the caller denies transiently and the client retries —
+	// usually landing on the winner's committed registration). A claim
+	// older than ttl is expired and taken over; ReleaseAdoptionClaim
+	// frees it early on completion, and the admission GC prunes
+	// leftovers. Claims live in pack_reservations under a suffixed key
+	// no settlement or retirement path matches.
+	TryAdoptionClaim(ctx context.Context, repo, key string, ttl time.Duration) (claimed bool, err error)
+	// ReleaseAdoptionClaim frees key's adoption claim (best-effort: a
+	// crashed winner's claim expires via ttl instead).
+	ReleaseAdoptionClaim(ctx context.Context, key string) error
 	// GetGeneration returns repo's mutation generation: 0 for a repo no
 	// mutation ever touched, strictly positive and monotonically increasing
 	// afterwards. It is an invalidation token over committed row changes,

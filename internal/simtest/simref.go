@@ -215,6 +215,17 @@ func (s *SimRefStore) QuotaLedgerState(ctx context.Context, group []string, ttl 
 	return s.inner.QuotaLedgerState(ctx, group, ttl, excludeKeys...)
 }
 
+// TryAdoptionClaim / ReleaseAdoptionClaim pass through without fault
+// injection: adoption claims are an advisory cross-replica dedup (Codex
+// security round 73), not lifecycle state the oracle models.
+func (s *SimRefStore) TryAdoptionClaim(ctx context.Context, repo, key string, ttl time.Duration) (bool, error) {
+	return s.inner.TryAdoptionClaim(ctx, repo, key, ttl)
+}
+
+func (s *SimRefStore) ReleaseAdoptionClaim(ctx context.Context, key string) error {
+	return s.inner.ReleaseAdoptionClaim(ctx, key)
+}
+
 // GuardedLFSDelete delegates to the inner store.
 func (s *SimRefStore) GuardedLFSDelete(ctx context.Context, repo, key string, del func(context.Context) error) (bool, error) {
 	return s.inner.GuardedLFSDelete(ctx, repo, key, del)

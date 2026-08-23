@@ -675,6 +675,31 @@ func (s *Server) adoptLFSObject(ctx context.Context, repoID, key, oid string) er
 		}
 		return ref.ErrLFSObjectCapExceeded
 	}
+	// Fleet-wide adoption claim (Codex security round 73): the in-flight
+	// map below this call dedupes only within one process, so replicas
+	// racing the same legacy oid would EACH download and hash the whole
+	// object — tiny write-scoped batches fanned across the fleet
+	// multiply backend reads by fleet size. One replica wins the shared
+	// TTL'd claim; losers deny transiently (the client's retry lands on
+	// the winner's committed registration — zero-growth — or re-claims
+	// after a crash's claim expires).
+	claimed, err := s.Store.TryAdoptionClaim(ctx, repoID, key, lfsAdoptClaimTTL)
+	if err != nil {
+		return err
+	}
+	if !claimed {
+		return errLFSBusy
+	}
+	// Best-effort early release on every exit (success included: the
+	// committed registration terminalizes the key, so the claim row is
+	// dead weight either way); a crash leaves it to the TTL.
+	defer func() {
+		rctx, rcancel := context.WithTimeout(context.WithoutCancel(ctx), lfsCleanupTimeout)
+		defer rcancel()
+		if rerr := s.Store.ReleaseAdoptionClaim(rctx, key); rerr != nil {
+			log.Printf("lfs adopt %s: release claim: %v", key, rerr)
+		}
+	}()
 	// Legacy blobs were written through presigned PUTs that bound no
 	// digest, so existence does not prove content (Codex round 15).
 	// Hash the stored bytes once before adoption; a mismatch is provably
@@ -900,6 +925,13 @@ func (s *Server) verifyStoredLFSObject(ctx context.Context, repo, key, oid strin
 // lfsRepairCoverSuffix — see ref.RepairCoverSuffix (shared with the pack
 // restore paths since Codex round 58).
 const lfsRepairCoverSuffix = ref.RepairCoverSuffix
+
+// lfsAdoptClaimTTL bounds a fleet-wide adoption claim (Codex security
+// round 73): generous against the size-scaled verification hash of large
+// legacy objects (the same shape as blob.EnsurePublished's repair
+// allowance at ~10 GiB), yet finite so a crashed winner's claim expires
+// and the next write-scoped touch re-claims.
+var lfsAdoptClaimTTL = 30 * time.Minute
 
 // lfsVerifyResume is a partially completed adoption hash: the verified
 // prefix length and the sha256 midstate over it (Codex round 57).

@@ -164,6 +164,36 @@ func reservKeySpellings(keys ...string) []string {
 // admission must pass the generation its floor was validated against.
 const ReserveNoFloorGen int64 = -1
 
+// AdoptionClaimSuffix distinguishes an adoption claim row (see
+// RefStore.TryAdoptionClaim) from real reservations and covers: LFS keys
+// end in the 64-hex oid, so the suffix never collides, and neither
+// settlement (blob-key spellings) nor retirement (era rows) ever touches
+// it. The admission GC prunes expired claims like any aged row; a live
+// claim contributes one byte to admission sums (deny-side, negligible).
+const AdoptionClaimSuffix = "/adopt-claim"
+
+// TryAdoptionClaim — see RefStore.
+func (s *PG) TryAdoptionClaim(ctx context.Context, repo, key string, ttl time.Duration) (bool, error) {
+	assertf(repo != "" && key != "" && ttl > 0, "TryAdoptionClaim(%q, %q, %v)", repo, key, ttl)
+	ct, err := s.pool.Exec(ctx, `
+INSERT INTO pack_reservations (key, repo, bytes, owner, created_at, gen)
+VALUES ($1, $2, 1, $3, now(), '')
+ON CONFLICT (key) DO UPDATE SET repo = EXCLUDED.repo, owner = EXCLUDED.owner, created_at = now()
+WHERE pack_reservations.created_at <= now() - make_interval(secs => $4)`,
+		key+AdoptionClaimSuffix, repo, NewReservationOwner(), ttl.Seconds())
+	if err != nil {
+		return false, err
+	}
+	return ct.RowsAffected() > 0, nil
+}
+
+// ReleaseAdoptionClaim — see RefStore.
+func (s *PG) ReleaseAdoptionClaim(ctx context.Context, key string) error {
+	assertf(key != "", "ReleaseAdoptionClaim(%q)", key)
+	_, err := s.pool.Exec(ctx, `DELETE FROM pack_reservations WHERE key = $1`, key+AdoptionClaimSuffix)
+	return err
+}
+
 // RepairCoverSuffix distinguishes a restore's cover reservation key from
 // the restored blob's settle key (Codex rounds 57+58): settlement consumes
 // the blob key's own spellings, and the cover must instead outlive the

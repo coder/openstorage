@@ -622,6 +622,53 @@ func TestLFSPut_SweepRaceRestoreIsCoveredAndBumpsGen(t *testing.T) {
 	}
 }
 
+// TestLFSAdopt_FleetClaimDedupesConcurrentHashes (Codex round 73,
+// security): the per-key in-flight map dedupes only within one process —
+// replicas racing the same legacy oid each downloaded and hashed the
+// whole object, multiplying backend reads by fleet size for every
+// distinct legacy oid an attacker touches. Adoption now takes a shared
+// TTL'd claim first: while one replica holds it, another replica's
+// adoption of the same oid denies transiently WITHOUT downloading, and
+// converges once the claim is released.
+func TestLFSAdopt_FleetClaimDedupesConcurrentHashes(t *testing.T) {
+	ctx := context.Background()
+	srv, st, mint := newLFSQuotaServer(t, 0, time.Hour)
+	tok := mint(auth.ScopeGitWrite)
+	legacy := []byte("legacy object hashed on one replica only")
+	oid := sha256Hex(legacy)
+	key := blob.LFSKey(lfsTestRepoID, oid)
+	if err := srv.Blob.UploadFile(ctx, key, writeTempFile(t, legacy)); err != nil {
+		t.Fatal(err)
+	}
+	cb := &downloadCountingBlob{BlobStore: srv.Blob}
+	srv.Blob = cb
+
+	// "Another replica" holds the fleet claim mid-hash.
+	if claimed, err := st.TryAdoptionClaim(ctx, lfsTestRepoID, key, time.Hour); err != nil || !claimed {
+		t.Fatalf("seed claim = (%v, %v), want held", claimed, err)
+	}
+	resp := decodeBatch(t, doLFS(t, srv, http.MethodPost, lfsBatchPath, "basic:"+tok,
+		batchBody("upload", oid, int64(len(legacy)))))
+	if resp.Objects[0].Error == nil {
+		t.Fatalf("adoption proceeded under a foreign fleet claim: %+v", resp.Objects[0])
+	}
+	if cb.downloads != 0 {
+		t.Fatalf("losing replica performed %d verification reads, want 0 — the whole point is not downloading", cb.downloads)
+	}
+	// The winner releases (crash → TTL expiry); the retry converges.
+	if err := st.ReleaseAdoptionClaim(ctx, key); err != nil {
+		t.Fatal(err)
+	}
+	resp = decodeBatch(t, doLFS(t, srv, http.MethodPost, lfsBatchPath, "basic:"+tok,
+		batchBody("upload", oid, int64(len(legacy)))))
+	if resp.Objects[0].Error != nil || resp.Objects[0].Actions != nil {
+		t.Fatalf("post-release adoption failed: %+v", resp.Objects[0])
+	}
+	if has, err := st.HasLFSObject(ctx, lfsTestRepoID, key); err != nil || !has {
+		t.Fatalf("object not adopted: %v, %v", has, err)
+	}
+}
+
 // TestLFSAdopt_RecheckCatchesRacingSweep (Codex round 1): adoption whose
 // blob a racing sweep reaped before the registration committed must fail
 // the request — the post-registration existence recheck catches it, and the

@@ -349,6 +349,34 @@ func (s *SQLite) LFSAdoptionGen(ctx context.Context, repo string) (int64, error)
 
 // GuardedLFSDelete — see the PG twin; BEGIN IMMEDIATE's single writer is
 // the serialization here.
+// TryAdoptionClaim — see RefStore (Codex security round 73). Local mode is
+// single-process, but the shared-table claim keeps semantics identical to
+// PG (and dedupes across the serve process and hook subprocesses).
+func (s *SQLite) TryAdoptionClaim(ctx context.Context, repo, key string, ttl time.Duration) (bool, error) {
+	assertf(repo != "" && key != "" && ttl > 0, "TryAdoptionClaim(%q, %q, %v)", repo, key, ttl)
+	res, err := s.db.ExecContext(ctx, `
+INSERT INTO pack_reservations (key, repo, bytes, owner, created_at, gen)
+VALUES (?, ?, 1, ?, `+sqliteEpochMS+`, '')
+ON CONFLICT (key) DO UPDATE SET repo = excluded.repo, owner = excluded.owner, created_at = excluded.created_at
+WHERE pack_reservations.created_at <= `+sqliteEpochMS+` - ?`,
+		key+AdoptionClaimSuffix, repo, NewReservationOwner(), ttl.Milliseconds())
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
+// ReleaseAdoptionClaim — see RefStore.
+func (s *SQLite) ReleaseAdoptionClaim(ctx context.Context, key string) error {
+	assertf(key != "", "ReleaseAdoptionClaim(%q)", key)
+	_, err := s.db.ExecContext(ctx, `DELETE FROM pack_reservations WHERE key = ?`, key+AdoptionClaimSuffix)
+	return err
+}
+
 func (s *SQLite) GuardedLFSDelete(ctx context.Context, repo, key string, del func(context.Context) error) (bool, error) {
 	assertf(repo != "" && key != "" && del != nil, "GuardedLFSDelete(%q, %q)", repo, key)
 	tx, err := s.db.BeginTx(ctx, nil) // BEGIN IMMEDIATE via _txlock
