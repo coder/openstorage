@@ -905,46 +905,70 @@ ON CONFLICT (repo) DO UPDATE SET gen = lfs_adoption_gens.gen + 1`, repo); err !=
 
 // ReconcileLegacyLFSObjects — see RefStore.
 func (s *PG) ReconcileLegacyLFSObjects(ctx context.Context) (int64, error) {
-	rows, err := s.pool.Query(ctx, `
+	// Paged (Codex round 91): a mixed-version fleet can strand twins
+	// across MANY repositories — no per-repo cap bounds the cross-repo
+	// candidate set, and Heal runs this synchronously at startup when
+	// sweeping is disabled, so materializing every candidate could stall
+	// or OOM serving. Each reconcile DELETES its legacy row, so
+	// re-running the bounded query converges without offsets; a
+	// non-empty page that makes no progress fails loudly instead of
+	// spinning.
+	var n int64
+	for {
+		rows, err := s.pool.Query(ctx, `
 SELECT l.repo, l.key FROM lfs_objects l
 WHERE strpos(l.key, '/o2/') = 0
   AND EXISTS (SELECT 1 FROM lfs_objects c WHERE c.repo = l.repo
-    AND c.key = 'lfs/' || l.repo || '/o2/' || substr(l.key, char_length('lfs/' || l.repo || '/') + 1))`)
-	if err != nil {
-		return 0, err
-	}
-	type cand struct{ repo, key string }
-	var cands []cand
-	for rows.Next() {
-		var c cand
-		if err := rows.Scan(&c.repo, &c.key); err != nil {
-			rows.Close()
-			return 0, err
-		}
-		cands = append(cands, c)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return 0, err
-	}
-	var n int64
-	for _, c := range cands {
-		canonical, ok := canonicalFromLegacyLFSRowKey(c.repo, c.key)
-		if !ok {
-			continue // defensive: candidate selection and Go parsing disagree
-		}
-		if err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
-			done, err := reconcileLegacyLFSRowPG(ctx, tx, c.repo, c.key, canonical)
-			if done {
-				n++
-			}
-			return err
-		}); err != nil {
+    AND c.key = 'lfs/' || l.repo || '/o2/' || substr(l.key, char_length('lfs/' || l.repo || '/') + 1))
+LIMIT $1`, reconcileLegacyLFSBatch)
+		if err != nil {
 			return n, err
 		}
+		type cand struct{ repo, key string }
+		var cands []cand
+		for rows.Next() {
+			var c cand
+			if err := rows.Scan(&c.repo, &c.key); err != nil {
+				rows.Close()
+				return n, err
+			}
+			cands = append(cands, c)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return n, err
+		}
+		var progress int64
+		for _, c := range cands {
+			canonical, ok := canonicalFromLegacyLFSRowKey(c.repo, c.key)
+			if !ok {
+				continue // defensive: candidate selection and Go parsing disagree
+			}
+			if err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+				done, err := reconcileLegacyLFSRowPG(ctx, tx, c.repo, c.key, canonical)
+				if done {
+					n++
+					progress++
+				}
+				return err
+			}); err != nil {
+				return n, err
+			}
+		}
+		if len(cands) < reconcileLegacyLFSBatch {
+			return n, nil
+		}
+		if progress == 0 {
+			return n, fmt.Errorf("reconcile legacy lfs rows: full page of %d candidates made no progress", len(cands))
+		}
 	}
-	return n, nil
 }
+
+// reconcileLegacyLFSBatch bounds one ReconcileLegacyLFSObjects page
+// (Codex round 91): candidates are re-selected after each page — every
+// reconcile deletes its row — so the loop holds at most one page in
+// memory regardless of fleet-wide twin count.
+var reconcileLegacyLFSBatch = 512
 
 // canonicalFromLegacyLFSRowKey maps a legacy row key (lfs/<repo>/<oid>)
 // back to its canonical spelling, the inverse of lfsLegacyRowKey.

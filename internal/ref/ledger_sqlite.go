@@ -385,15 +385,37 @@ ON CONFLICT (repo) DO UPDATE SET gen = lfs_adoption_gens.gen + 1`, repo); err !=
 	return true, nil
 }
 
-// ReconcileLegacyLFSObjects — see RefStore.
+// ReconcileLegacyLFSObjects — see RefStore. Paged like the PG twin
+// (Codex round 91): one bounded candidate page in memory at a time; each
+// reconcile deletes its row, so re-querying converges without offsets.
 func (s *SQLite) ReconcileLegacyLFSObjects(ctx context.Context) (int64, error) {
+	var n int64
+	for {
+		page, progress, err := s.reconcileLegacyLFSPage(ctx)
+		n += progress
+		if err != nil {
+			return n, err
+		}
+		if page < reconcileLegacyLFSBatch {
+			return n, nil
+		}
+		if progress == 0 {
+			return n, fmt.Errorf("reconcile legacy lfs rows: full page of %d candidates made no progress", page)
+		}
+	}
+}
+
+// reconcileLegacyLFSPage reconciles one bounded candidate page, returning
+// the page size and the rows actually reconciled.
+func (s *SQLite) reconcileLegacyLFSPage(ctx context.Context) (int, int64, error) {
 	rows, err := s.db.QueryContext(ctx, `
 SELECT l.repo, l.key FROM lfs_objects l
 WHERE instr(l.key, '/o2/') = 0
   AND EXISTS (SELECT 1 FROM lfs_objects c WHERE c.repo = l.repo
-    AND c.key = 'lfs/' || l.repo || '/o2/' || substr(l.key, length('lfs/' || l.repo || '/') + 1))`)
+    AND c.key = 'lfs/' || l.repo || '/o2/' || substr(l.key, length('lfs/' || l.repo || '/') + 1))
+LIMIT ?`, reconcileLegacyLFSBatch)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	type cand struct{ repo, key string }
 	var cands []cand
@@ -401,13 +423,13 @@ WHERE instr(l.key, '/o2/') = 0
 		var c cand
 		if err := rows.Scan(&c.repo, &c.key); err != nil {
 			rows.Close()
-			return 0, err
+			return 0, 0, err
 		}
 		cands = append(cands, c)
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	var n int64
 	for _, c := range cands {
@@ -417,21 +439,21 @@ WHERE instr(l.key, '/o2/') = 0
 		}
 		tx, err := s.db.BeginTx(ctx, nil)
 		if err != nil {
-			return n, err
+			return len(cands), n, err
 		}
 		done, err := reconcileLegacyLFSRowSQLite(ctx, tx, c.repo, c.key, canonical)
 		if err != nil {
 			_ = tx.Rollback()
-			return n, err
+			return len(cands), n, err
 		}
 		if err := tx.Commit(); err != nil {
-			return n, err
+			return len(cands), n, err
 		}
 		if done {
 			n++
 		}
 	}
-	return n, nil
+	return len(cands), n, nil
 }
 
 // BumpLFSAdoptionGen — see RefStore (Codex round 49).
