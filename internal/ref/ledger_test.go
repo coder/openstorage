@@ -727,6 +727,54 @@ func TestGenBumpsSerializeWithAdmissionLock(t *testing.T) {
 	}
 }
 
+// TestRegisterLFSObjectMigratesLegacyRow (ADR-41): v0.2.0 registered
+// lfs_objects rows at the single legacy spelling (lfs/<repo>/<oid>); this
+// binary registers only canonical o2/ keys. Registering an object that
+// already has a legacy row must MIGRATE it in place — same count, same
+// usage — never insert a duplicate: a fresh insert would double both the
+// object-count cap and the usage counter for every v0.2.0-era object
+// touched after the upgrade.
+func TestRegisterLFSObjectMigratesLegacyRow(t *testing.T) {
+	runRefBackends(t, func(t *testing.T, s Store) {
+		ctx := context.Background()
+		k := newLedgerKit(t, s)
+		oid := strings.Repeat("cd", 32)
+		legacyKey := "lfs/" + k.base() + "/" + oid
+		canonicalKey := "lfs/" + k.base() + "/o2/" + oid
+
+		// The v0.2.0 binary registered the legacy spelling.
+		if err := s.RegisterLFSObject(ctx, k.base(), legacyKey, 70); err != nil {
+			t.Fatal(err)
+		}
+		// The upgraded binary adopts/re-registers canonically.
+		if err := s.RegisterAdoptedLFSObject(ctx, k.base(), canonicalKey, 70); err != nil {
+			t.Fatal(err)
+		}
+		if has, err := s.HasLFSObject(ctx, k.base(), canonicalKey); err != nil || !has {
+			t.Fatalf("canonical row after migration = (%v, %v), want present", has, err)
+		}
+		if has, err := s.HasLFSObject(ctx, k.base(), legacyKey); err != nil || has {
+			t.Fatalf("legacy row after migration = (%v, %v), want migrated away", has, err)
+		}
+		if count, err := s.CountLFSObjects(ctx, k.base()); err != nil || count != 1 {
+			t.Fatalf("object count after migration = (%d, %v), want 1 — a duplicate insert double-counts", count, err)
+		}
+		if st := k.state(); st.UsageBytes != 70 {
+			t.Fatalf("usage after migration = %d, want 70 — the object's bytes were already credited", st.UsageBytes)
+		}
+		// Idempotent re-registration stays zero-growth.
+		if err := s.RegisterAdoptedLFSObject(ctx, k.base(), canonicalKey, 70); err != nil {
+			t.Fatal(err)
+		}
+		if count, err := s.CountLFSObjects(ctx, k.base()); err != nil || count != 1 {
+			t.Fatalf("object count after re-registration = (%d, %v), want 1", count, err)
+		}
+		if st := k.state(); st.UsageBytes != 70 {
+			t.Fatalf("usage after re-registration = %d, want 70", st.UsageBytes)
+		}
+	})
+}
+
 // TestAdoptionClaimLease (Codex round 74): the fleet-wide adoption claim
 // must behave as a proper lease — (1) the admission GC, which runs with
 // the ADMISSION ttl (as short as ~61s), must never delete a live claim

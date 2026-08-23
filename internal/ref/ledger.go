@@ -221,6 +221,30 @@ func (s *PG) ReleaseAdoptionClaim(ctx context.Context, key, owner string) error 
 	return err
 }
 
+// lfsLegacyRowKey maps a canonical LFS object key — blob.LFSKey's
+// lfs/<repo>/o2/<oid> layout (ADR-41) — to the spelling v0.2.0 stored in
+// lfs_objects rows: lfs/<repo>/<oid>. ok is false for every other key
+// shape. This is deliberately the ledger's only knowledge of the LFS key
+// layout: registration uses it to migrate a legacy row in place (zero
+// growth) instead of double-counting the object.
+func lfsLegacyRowKey(key string) (string, bool) {
+	if !strings.HasPrefix(key, "lfs/") {
+		return "", false
+	}
+	// Split at the LAST "/o2/": the oid is the final slash-free segment
+	// (blob.LFSKey asserts that), so this stays correct for any repo
+	// segment content.
+	i := strings.LastIndex(key, "/o2/")
+	if i < len("lfs/") { // absent, or an empty repo segment
+		return "", false
+	}
+	oid := key[i+len("/o2/"):]
+	if oid == "" || strings.Contains(oid, "/") {
+		return "", false
+	}
+	return key[:i] + "/" + oid, true
+}
+
 // RepairCoverSuffix distinguishes a restore's cover reservation key from
 // the restored blob's settle key (Codex rounds 57+58): settlement consumes
 // the blob key's own spellings, and the cover must instead outlive the
@@ -752,6 +776,21 @@ func (s *PG) registerLFSObjectTx(ctx context.Context, repo, key string, bytes in
 			// admission recheck (Codex round 65, lockBaseLedger); LFS
 			// repos are always base repos (ADR-35).
 			if err := lockBaseLedger(ctx, tx, repo); err != nil {
+				return err
+			}
+		}
+		// v0.2.0 registered rows at the single legacy spelling (ADR-41);
+		// this binary registers only canonical `o2/` keys. Migrate a
+		// same-object legacy row in place instead of inserting a
+		// duplicate: its bytes and count are already credited, so this
+		// registration must be zero-growth — a fresh insert would
+		// double-count both ledgers. Guarded against a canonical twin so
+		// the primary key cannot conflict.
+		if legacy, ok := lfsLegacyRowKey(key); ok {
+			if _, err := tx.Exec(ctx, `
+UPDATE lfs_objects SET key = $1 WHERE repo = $2 AND key = $3
+  AND NOT EXISTS (SELECT 1 FROM lfs_objects o2 WHERE o2.repo = $2 AND o2.key = $1)`,
+				key, repo, legacy); err != nil {
 				return err
 			}
 		}

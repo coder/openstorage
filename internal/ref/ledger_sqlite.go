@@ -283,6 +283,16 @@ func (s *SQLite) registerLFSObjectTx(ctx context.Context, repo, key string, byte
 		return fmt.Errorf("register lfs object begin: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+	// Migrate a v0.2.0 legacy-spelled row in place (zero growth) — see
+	// the PG twin (ADR-41).
+	if legacy, ok := lfsLegacyRowKey(key); ok {
+		if _, err := tx.ExecContext(ctx, `
+UPDATE lfs_objects SET key = ? WHERE repo = ? AND key = ?
+  AND NOT EXISTS (SELECT 1 FROM lfs_objects o2 WHERE o2.repo = ? AND o2.key = ?)`,
+			key, repo, legacy, repo, key); err != nil {
+			return err
+		}
+	}
 	res, err := tx.ExecContext(ctx,
 		`INSERT INTO lfs_objects (repo, key, bytes) VALUES (?, ?, ?) ON CONFLICT DO NOTHING`,
 		repo, key, bytes)

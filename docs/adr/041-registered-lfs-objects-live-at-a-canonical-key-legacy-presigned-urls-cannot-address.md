@@ -35,3 +35,10 @@ digest-verified re-upload (the zero-growth path), never by re-adopting a
 legacy source that remains forgeable. ADR-35 (base-RepoID keying, shared
 namespace object space) is unchanged; both spellings stay under
 `lfs/<repoID>/`, so usage floors and the sweeper cover them uniformly.
+
+v0.2.0 shipped before this split, registering rows at the legacy
+spelling. Registration migrates such a row in place — transactionally,
+zero-growth — on the object's first write-scoped touch under the upgraded
+binary, so neither the usage counter nor the object-count cap
+double-charges v0.2.0-era objects; until migrated they read from the
+legacy blob exactly as v0.2.0 served them.
