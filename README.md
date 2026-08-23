@@ -206,7 +206,7 @@ legacy aliases — with defaults and validation constraints:
 | | Start here |
 |---|---|
 | **Tutorials** | The two quickstarts above |
-| **Reference** | [Configuration](docs/reference/configuration.md) · [CLI](docs/reference/cli.md) · [HTTP API](docs/03-http-api.md) · [Auth & JWT claims](docs/02-authentication.md) · [Webhooks](docs/06-webhooks.md) |
+| **Reference** | [Configuration](docs/reference/configuration.md) · [CLI](docs/reference/cli.md) · [Testing](docs/reference/testing.md) · [HTTP API](docs/03-http-api.md) · [Auth & JWT claims](docs/02-authentication.md) · [Webhooks](docs/06-webhooks.md) |
 | **Explanation** | [Wire compatibility with code.storage](docs/explanation/wire-compatibility.md) · [The storage engine](docs/explanation/storage-engine.md) · [Domain model](docs/01-domain-model.md) · [Git protocol & namespaces](docs/05-git-protocol-and-namespaces.md) · [Streaming commit protocols](docs/04-streaming-commit-protocols.md) · [Spec index & decision log](docs/README.md) |
 | **How-to** | [Deploy to production (multi-replica)](docs/how-to/deploy-production.md) · [Deploy a two-replica stack with Docker Compose](docs/how-to/deploy-docker-compose.md) · [Operate the storage lifecycle: repack, quotas, sweeping](docs/how-to/storage-lifecycle-and-sweeping.md) |
 
@@ -219,8 +219,9 @@ go test ./...   # needs Docker: boots real Postgres + MinIO via testcontainers
 Zero-container lanes cover the same surfaces on the local backends: the api integration
 tests fan out into `/pg` + `/sqlite` subtests, and
 `CODESTORAGE_TEST_BACKEND=local go test ./internal/githttp` runs the full git e2e suite on
-`sqlite://` + `file://` (see [docs/11](docs/11-local-backends-implementation-notes.md) for
-the lane table).
+`sqlite://` + `file://`. Setup, lanes, lint, commit conventions, and the review bar:
+**[CONTRIBUTING.md](CONTRIBUTING.md)**; test lanes and the DST simulation harness in
+depth: **[testing reference](docs/reference/testing.md)**.
 
 <details>
 <summary>Repository layout</summary>
