@@ -1852,13 +1852,19 @@ func TestLFSPut_CompatCopyReleasesUploadResources(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("compat copy never started")
 	}
-	// The copy is in flight: every upload resource must already be free.
+	// The copy is in flight: the UPLOAD's resources must already be free —
+	// its staged bytes and its op slot are returned before the bridge
+	// runs. The copy holds exactly ONE operation-only slot of its own
+	// (Codex round 92): the bridge is bounded by the same repository-fair
+	// pool as uploads and adoptions, so ops == 1 here is the copy's slot,
+	// not a leaked upload slot; bytes stay zero (a server-side copy
+	// stages nothing).
 	srv.lfsStagingMu.Lock()
 	ops, inflight := srv.lfsStagingOps, srv.lfsStagingInFlight
 	srv.lfsStagingMu.Unlock()
-	if ops != 0 || inflight != 0 {
+	if ops != 1 || inflight != 0 {
 		close(gate.release)
-		t.Fatalf("staging during compat copy = ops %d, bytes %d — upload resources must release before the copy", ops, inflight)
+		t.Fatalf("staging during compat copy = ops %d, bytes %d — want the copy's own op slot (1) and zero staged bytes", ops, inflight)
 	}
 	if _, busy := srv.lfsUploadsInFlight.Load(blob.LFSKey(lfsTestRepoID, oid)); busy {
 		close(gate.release)
