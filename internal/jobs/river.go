@@ -274,15 +274,16 @@ func (w *repackWorker) Work(ctx context.Context, job *river.Job[repackArgs]) err
 	return nil
 }
 
-// sweepWorker runs one orphan-pack sweep; the Sweeper owns all reporting.
+// sweepWorker runs one scheduled tick — the orphan-pack sweep plus the
+// optional repo-retention purge pass (issue #52); the Sweeper and
+// RepoPurger own all reporting.
 type sweepWorker struct {
 	river.WorkerDefaults[sweepArgs]
-	sweeper *Sweeper
+	schedule *SweepSchedule
 }
 
 func (w *sweepWorker) Work(ctx context.Context, _ *river.Job[sweepArgs]) error {
-	_, err := w.sweeper.Sweep(ctx)
-	return err
+	return w.schedule.runOnce(ctx)
 }
 
 // deliveryWorker performs one signed POST per job attempt; River owns the
@@ -545,7 +546,7 @@ func NewRiver(ctx context.Context, pgURL string, deliverer *events.Deliverer, ru
 	}
 	var periodic []*river.PeriodicJob
 	if sweep != nil {
-		river.AddWorker(workers, &sweepWorker{sweeper: sweep.Sweeper})
+		river.AddWorker(workers, &sweepWorker{schedule: sweep})
 		periodic = append(periodic, river.NewPeriodicJob(
 			river.PeriodicInterval(sweep.Interval),
 			func() (river.JobArgs, *river.InsertOpts) { return sweepArgs{}, nil },

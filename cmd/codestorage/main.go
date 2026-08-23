@@ -33,7 +33,7 @@ import (
 
 func main() {
 	if len(os.Args) < 2 {
-		fatalf("usage: codestorage <serve|hook|keygen|mint|signing-key|list-packs|version> ...")
+		fatalf("usage: codestorage <serve|hook|keygen|mint|signing-key|list-packs|purge-repo|version> ...")
 	}
 	ctx := context.Background()
 	var err error
@@ -55,6 +55,8 @@ func main() {
 		err = cmdSigningKey(ctx, os.Args[2:])
 	case "list-packs":
 		err = cmdListPacks(ctx, os.Args[2:])
+	case "purge-repo":
+		err = cmdPurgeRepo(ctx, os.Args[2:])
 	case "version", "--version":
 		fmt.Println(version.String())
 	default:

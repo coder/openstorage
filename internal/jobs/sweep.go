@@ -125,6 +125,14 @@ type SweepConfig struct {
 	// enabled mid-flight, which would turn deletes into billed delete
 	// markers.
 	DeleteGuard func(context.Context) error
+	// RetentionEnabled reports that soft-deleted-repository retention
+	// purging is configured (CODESTORAGE_REPO_RETENTION > 0, issue #52).
+	// It joins the destructive-mode set for quarantine aging: purge-minted
+	// backups must be collected even when every other delete flag is off,
+	// or reclamation would only move bytes into quarantine. A DeleteGuard
+	// failure downgrades it alongside the delete modes (the paired
+	// RepoPurger consults the same guard before its own destructive work).
+	RetentionEnabled bool
 	// QuotaEnforced reports that pack-quota admission is enabled
 	// (CODESTORAGE_PACK_QUOTA_BYTES > 0). Quarantine restores take cover
 	// reservations and hand off floor-generation bumps ONLY then (Codex
@@ -249,17 +257,19 @@ func (s *Sweeper) Sweep(ctx context.Context) (SweepReport, error) {
 	// guard covers both destructive modes — a versioned bucket turns
 	// superseded-class deletes into billed delete markers all the same.
 	deleteMode, supersededMode, lfsMode := s.cfg.Delete, s.cfg.DeleteSuperseded, s.cfg.DeleteLFS
-	if (deleteMode || supersededMode || lfsMode) && s.cfg.DeleteGuard != nil {
+	retentionMode := s.cfg.RetentionEnabled
+	if (deleteMode || supersededMode || lfsMode || retentionMode) && s.cfg.DeleteGuard != nil {
 		if err := s.cfg.DeleteGuard(ctx); err != nil {
-			deleteMode, supersededMode, lfsMode = false, false, false
+			deleteMode, supersededMode, lfsMode, retentionMode = false, false, false, false
 			deleteErrs.add(fmt.Errorf("sweep: delete guard, running list-only: %w", err))
 			s.logger.Error("orphan pack sweep: delete guard failed; this run is list-only", "err", err)
 		}
 	}
 	// Quarantine purging rides on ANY destructive mode: backups only
-	// exist because some destructive pass created them, and the purge-age
-	// proof (write-once nonce keys) is class-agnostic.
-	if err := s.healQuarantine(ctx, &report, deleteMode || supersededMode || lfsMode); err != nil {
+	// exist because some destructive pass created them (the repo-retention
+	// purge included, issue #52), and the purge-age proof (write-once
+	// nonce keys) is class-agnostic.
+	if err := s.healQuarantine(ctx, &report, deleteMode || supersededMode || lfsMode || retentionMode); err != nil {
 		deleteErrs.add(err)
 	}
 	// Crash-leaked admission reservations (issue #29): expired rows already
@@ -1050,24 +1060,40 @@ func (s *Sweeper) Heal(ctx context.Context) error {
 type SweepSchedule struct {
 	Sweeper  *Sweeper
 	Interval time.Duration
+	// Purger, when non-nil, runs a repo-retention purge pass after each
+	// sweep on the same cadence (issue #52; nil when
+	// CODESTORAGE_REPO_RETENTION is unset).
+	Purger *RepoPurger
 }
 
-// StartSweepTicker runs sweeper.Sweep every interval on a background
+// runOnce executes one scheduled tick: the sweep, then — even when the
+// sweep errored, so a noisy orphan backlog cannot starve reclamation — the
+// retention purge pass. Errors are joined for the caller's reporting.
+func (s *SweepSchedule) runOnce(ctx context.Context) error {
+	_, sweepErr := s.Sweeper.Sweep(ctx)
+	var purgeErr error
+	if s.Purger != nil {
+		_, purgeErr = s.Purger.PurgeExpired(ctx)
+	}
+	return errors.Join(sweepErr, purgeErr)
+}
+
+// StartSweepTicker runs the schedule every Interval on a background
 // goroutine — local mode's analogue of the River periodic job, with the
 // same run-on-start behavior. The returned stop function cancels the loop
-// and waits for an in-flight sweep to finish.
-func StartSweepTicker(sweeper *Sweeper, interval time.Duration) (stop func()) {
-	assertf(sweeper != nil, "StartSweepTicker: nil sweeper")
-	assertf(interval > 0, "StartSweepTicker: non-positive interval %v", interval)
+// and waits for an in-flight run to finish.
+func StartSweepTicker(schedule *SweepSchedule) (stop func()) {
+	assertf(schedule != nil && schedule.Sweeper != nil, "StartSweepTicker: nil schedule or sweeper")
+	assertf(schedule.Interval > 0, "StartSweepTicker: non-positive interval %v", schedule.Interval)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		ticker := time.NewTicker(interval)
+		ticker := time.NewTicker(schedule.Interval)
 		defer ticker.Stop()
 		for {
-			if _, err := sweeper.Sweep(ctx); err != nil && ctx.Err() == nil {
-				sweeper.logger.Error("orphan pack sweep failed", "err", err)
+			if err := schedule.runOnce(ctx); err != nil && ctx.Err() == nil {
+				schedule.Sweeper.logger.Error("scheduled sweep failed", "err", err)
 			}
 			select {
 			case <-ctx.Done():
