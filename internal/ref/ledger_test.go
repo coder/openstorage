@@ -863,6 +863,46 @@ func TestReconcileLegacyLFSTwinRows(t *testing.T) {
 	})
 }
 
+// TestReconcileLegacyLFSObjectsPaged (Codex round 91): the janitor
+// materialized EVERY cross-repository candidate before reconciling any —
+// unbounded memory on a large mixed-roll fleet, inside Heal's synchronous
+// startup path. Candidates now process in bounded pages (each reconcile
+// deletes its row, so re-querying converges without offsets); a multi-page
+// backlog must still reconcile everything in one call.
+func TestReconcileLegacyLFSObjectsPaged(t *testing.T) {
+	oldBatch := reconcileLegacyLFSBatch
+	reconcileLegacyLFSBatch = 2
+	t.Cleanup(func() { reconcileLegacyLFSBatch = oldBatch })
+	runRefBackends(t, func(t *testing.T, s Store) {
+		ctx := context.Background()
+		k := newLedgerKit(t, s)
+		oids := []string{
+			strings.Repeat("11", 32), strings.Repeat("22", 32), strings.Repeat("33", 32),
+			strings.Repeat("44", 32), strings.Repeat("55", 32),
+		}
+		for _, oid := range oids {
+			if err := s.RegisterAdoptedLFSObject(ctx, k.base(), "lfs/"+k.base()+"/o2/"+oid, 40); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.RegisterLFSObject(ctx, k.base(), "lfs/"+k.base()+"/"+oid, 40); err != nil {
+				t.Fatal(err)
+			}
+		}
+		n, err := s.ReconcileLegacyLFSObjects(ctx)
+		if err != nil || n != int64(len(oids)) {
+			t.Fatalf("paged reconcile = (%d, %v), want (%d, nil) — the loop must run every page to exhaustion", n, err, len(oids))
+		}
+		for _, oid := range oids {
+			if has, err := s.HasLFSObject(ctx, k.base(), "lfs/"+k.base()+"/"+oid); err != nil || has {
+				t.Fatalf("legacy twin %s after paged reconcile = (%v, %v), want gone", oid, has, err)
+			}
+			if has, err := s.HasLFSObject(ctx, k.base(), "lfs/"+k.base()+"/o2/"+oid); err != nil || !has {
+				t.Fatalf("canonical row %s after paged reconcile = (%v, %v), want intact", oid, has, err)
+			}
+		}
+	})
+}
+
 // TestAdoptionClaimLease (Codex round 74): the fleet-wide adoption claim
 // must behave as a proper lease — (1) the admission GC, which runs with
 // the ADMISSION ttl (as short as ~61s), must never delete a live claim
