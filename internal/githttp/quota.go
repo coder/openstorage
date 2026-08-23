@@ -43,6 +43,7 @@ import (
 	"time"
 
 	"github.com/coder/code-storage/internal/blob"
+	"github.com/coder/code-storage/internal/ref"
 )
 
 // EnvPackQuota carries the resolved per-repo pack-bytes quota from the serve
@@ -56,8 +57,9 @@ const EnvPackQuota = "CODESTORAGE_GIT_PACK_QUOTA"
 // ledger), so quota enforcement never silently weakens on skew.
 const EnvPackReservationTTL = "CODESTORAGE_GIT_PACK_RESERVATION_TTL"
 
-// EnvUsageFloor carries the repo's storage usage floor (packs + LFS
-// prefixes) from the serve process's shared single-flight cache into the
+// EnvUsageFloor carries the repo's UNCOUNTED-bytes admission floor (the
+// packs + LFS listing minus the usage counter at scan start — Codex round
+// 44) from the serve process's shared single-flight cache into the
 // pre-receive hook (Codex round 21): the hook is a fresh process per
 // push, so a hook-side listing cannot be cached across pushes and
 // re-scans both prefixes every time — ~100 pages per push at the LFS
@@ -187,8 +189,17 @@ type usageCache struct {
 }
 
 type usageEntry struct {
-	usage   int64
+	usage   int64 // raw listing bytes (the pressure log's view)
+	counter int64 // usage counter at scan start (Codex round 44)
 	expires time.Time
+}
+
+// uncounted is the entry's admission floor: physical bytes the usage
+// counter did not cover at scan start (pre-registry LFS objects, orphans;
+// Codex round 44). ReservePackBytes SUMS it with the live counter, so
+// settlements after the scan are counted exactly once.
+func (e usageEntry) uncounted() int64 {
+	return max(0, e.usage-e.counter)
 }
 
 // usageFlight is one in-progress listing; done is closed after
@@ -203,7 +214,8 @@ type usageEntry struct {
 // eventually run a detached listing nobody consumes).
 type usageFlight struct {
 	done    chan struct{}
-	usage   int64
+	usage   int64 // raw listing bytes (pressure log)
+	counter int64 // usage counter at scan start (Codex round 44)
 	err     error
 	expires time.Time
 
@@ -229,8 +241,8 @@ func (c *usageCache) clockNow() time.Time {
 // entry, and the flight's own waiters reject the result too (round 41 —
 // usageFlight.expires). Drops expired entries at most once per
 // usageCachePruneInterval. Callers hold c.mu.
-func (c *usageCache) putLocked(repo string, usage int64, scanStart time.Time) {
-	assertf(repo != "" && usage >= 0 && !scanStart.IsZero(), "usageCache.putLocked(%q, %d, %v)", repo, usage, scanStart)
+func (c *usageCache) putLocked(repo string, usage, counter int64, scanStart time.Time) {
+	assertf(repo != "" && usage >= 0 && counter >= 0 && !scanStart.IsZero(), "usageCache.putLocked(%q, %d, %d, %v)", repo, usage, counter, scanStart)
 	now := c.clockNow()
 	if c.entries == nil {
 		c.entries = make(map[string]usageEntry)
@@ -243,7 +255,7 @@ func (c *usageCache) putLocked(repo string, usage int64, scanStart time.Time) {
 			}
 		}
 	}
-	c.entries[repo] = usageEntry{usage: usage, expires: scanStart.Add(usageCacheTTL)}
+	c.entries[repo] = usageEntry{usage: usage, counter: counter, expires: scanStart.Add(usageCacheTTL)}
 }
 
 // peekUsage returns repo's cached pack usage without ever blocking the
@@ -296,21 +308,43 @@ func (s *Server) refreshUsage(repo string, f *usageFlight) {
 	scanStart := s.usage.clockNow() // entry age counts from HERE (round 40)
 	ctx, cancel := context.WithTimeout(context.Background(), usageListTimeout)
 	defer cancel()
+	// The usage counter is read BEFORE the listing begins (Codex round
+	// 44) — the subtraction that yields the uncounted floor is only
+	// conservative when the counter snapshot cannot contain bytes the
+	// listing missed: a registration committing mid-scan lands in the
+	// LIVE counter admission reads, never silently vanishes from both.
+	// A missing Store (bare test servers; NewServer asserts it in
+	// production) degrades to counter 0 — the floor then counts
+	// everything listed, the deny-safe side.
+	var counter int64
+	if s.Store != nil {
+		ls, lerr := s.Store.QuotaLedgerState(ctx, blob.QuotaRepoGroup(repo), time.Hour)
+		if lerr != nil {
+			s.finishUsageFlight(repo, f, 0, 0, scanStart, fmt.Errorf("usage counter read: %w", lerr))
+			return
+		}
+		counter = ls.UsageBytes
+	}
 	usage, err := blob.StorageUsageBytes(ctx, s.Blob, repo)
+	s.finishUsageFlight(repo, f, usage, counter, scanStart, err)
+}
 
+// finishUsageFlight publishes one flight outcome: cache insert on
+// success, inflight removal, and waiter release.
+func (s *Server) finishUsageFlight(repo string, f *usageFlight, usage, counter int64, scanStart time.Time, err error) {
 	c := &s.usage
 	c.mu.Lock()
 	if c.inflight[repo] == f { // an aborted flight may have been replaced
 		delete(c.inflight, repo)
 	}
 	if err == nil {
-		c.putLocked(repo, usage, scanStart)
+		c.putLocked(repo, usage, counter, scanStart)
 	}
 	c.mu.Unlock()
 	if err != nil {
 		log.Printf("quota: %s: usage refresh failed: %v", repo, err)
 	}
-	f.usage, f.err, f.expires = usage, err, scanStart.Add(usageCacheTTL)
+	f.usage, f.counter, f.err, f.expires = usage, counter, err, scanStart.Add(usageCacheTTL)
 	close(f.done)
 }
 
@@ -323,29 +357,48 @@ func packUsageBytes(ctx context.Context, bl blob.BlobStore, repo string) (int64,
 	return blob.StorageUsageBytes(ctx, bl, repo)
 }
 
-// hookUsageFloor resolves the pre-receive admission floor: the serve
-// process mints EnvUsageFloor ("<bytes>:<unix mint time>") from its shared
-// single-flight cache (Codex round 21 — the hook is a fresh process per
-// push, so hook-side listings re-scan the pack AND LFS prefixes on every
-// push). A floor older than hookFloorMaxAge is NOT trusted (Codex round
-// 30 — the client controls the transfer duration between mint and hook)
-// and the hook self-lists, as it does for an absent env (a serve binary
-// predating the minted floor) or a bare timestampless value (one
-// predating the mint time): skew never weakens enforcement, it only costs
-// that push a listing. Malformed values fail closed like a malformed
-// EnvPackQuota: the env comes from our own server, so nonsense means
-// misconfiguration, not client input.
-func hookUsageFloor(ctx context.Context, bl blob.BlobStore, repo string) (int64, error) {
+// hookSelfListFloor is the hook's own uncounted-floor measurement: the
+// usage counter is read BEFORE the listing starts (the same conservative
+// ordering as refreshUsage — Codex round 44), and the floor is the
+// listing minus that counter, clamped at zero.
+func hookSelfListFloor(ctx context.Context, bl blob.BlobStore, st ref.Store, repo string) (int64, error) {
+	assertf(st != nil, "hookSelfListFloor: nil ref store")
+	ls, err := st.QuotaLedgerState(ctx, blob.QuotaRepoGroup(repo), time.Hour)
+	if err != nil {
+		return 0, fmt.Errorf("usage counter read: %w", err)
+	}
+	listing, err := packUsageBytes(ctx, bl, repo)
+	if err != nil {
+		return 0, err
+	}
+	return max(0, listing-ls.UsageBytes), nil
+}
+
+// hookUsageFloor resolves the pre-receive admission floor — the
+// UNCOUNTED-bytes floor ReservePackBytes sums with the live counter
+// (Codex round 44). The serve process mints EnvUsageFloor
+// ("<bytes>:<unix mint time>") from its shared single-flight cache (Codex
+// round 21 — the hook is a fresh process per push, so hook-side listings
+// re-scan the pack AND LFS prefixes on every push). A floor older than
+// hookFloorMaxAge is NOT trusted (Codex round 30 — the client controls
+// the transfer duration between mint and hook) and the hook self-lists,
+// as it does for an absent env (a serve binary predating the minted
+// floor) or a bare timestampless value (one predating the mint time):
+// skew never weakens enforcement, it only costs that push a listing.
+// Malformed values fail closed like a malformed EnvPackQuota: the env
+// comes from our own server, so nonsense means misconfiguration, not
+// client input.
+func hookUsageFloor(ctx context.Context, bl blob.BlobStore, st ref.Store, repo string) (int64, error) {
 	raw, ok := os.LookupEnv(EnvUsageFloor)
 	if !ok {
-		return packUsageBytes(ctx, bl, repo)
+		return hookSelfListFloor(ctx, bl, st, repo)
 	}
 	val, mint, found := strings.Cut(raw, ":")
 	if !found {
 		if _, err := strconv.ParseInt(raw, 10, 64); err != nil {
 			return 0, fmt.Errorf("malformed %s=%q", EnvUsageFloor, raw)
 		}
-		return packUsageBytes(ctx, bl, repo) // timestampless legacy floor: no age evidence
+		return hookSelfListFloor(ctx, bl, st, repo) // timestampless legacy floor: no age evidence
 	}
 	floor, ferr := strconv.ParseInt(val, 10, 64)
 	mintUnix, merr := strconv.ParseInt(mint, 10, 64)
@@ -362,21 +415,25 @@ func hookUsageFloor(ctx context.Context, bl blob.BlobStore, repo string) (int64,
 	// call.
 	maxAge := min(hookFloorMaxAge, ttl-usageCacheTTL-UsageFloorHandoffMargin)
 	if maxAge <= 0 || time.Since(time.Unix(mintUnix, 0)) > maxAge {
-		return packUsageBytes(ctx, bl, repo)
+		return hookSelfListFloor(ctx, bl, st, repo)
 	}
 	return floor, nil
 }
 
-// CachedUsageFloor returns repo's storage usage floor for admission,
-// serving a ≤usageCacheTTL-stale cached listing and coalescing concurrent
-// misses into one flight (issue #51, Codex round 15: fresh per-transfer
-// listings amplify — a 100-object batch cost ~201 full prefix scans). It
-// feeds every admission surface: LFS transfers here, the pre-receive
-// hook via its spawn env (EnvUsageFloor), and REST pack writers via
-// api.Config.UsageFloor (Codex round 21 — per-push self-listings in those
-// paths re-amplify at the LFS object cap). Staleness is safe FOR THE
-// FLOOR: every byte registered since the ledger exists is covered by the
-// usage counter, and in-flight uploads by their reservations, regardless
+// CachedUsageFloor returns repo's UNCOUNTED-bytes admission floor — the
+// listing minus the usage counter at that listing's scan start, clamped
+// at zero (Codex round 44: ReservePackBytes SUMS this floor with the live
+// counter, so settlements after the scan count exactly once; the old
+// max() combination hid them whenever pre-registry bytes coexisted with
+// fresh settlements). Serves a ≤usageCacheTTL-stale cached scan and
+// coalesces concurrent misses into one flight (issue #51, Codex round 15:
+// fresh per-transfer listings amplify — a 100-object batch cost ~201 full
+// prefix scans). It feeds every admission surface: LFS transfers here,
+// the pre-receive hook via its spawn env (EnvUsageFloor), and REST pack
+// writers via api.Config.UsageFloor (Codex round 21 — per-push
+// self-listings in those paths re-amplify at the LFS object cap).
+// Staleness is safe FOR THE FLOOR: bytes registered since the scan are in
+// the live counter, in-flight uploads in their reservations, regardless
 // of this value; the floor exists for pre-ledger bytes (fixed) and
 // orphaned uploads, whose admission visibility this cache delays by at
 // most its TTL — a bounded stretch of the ledger's documented
@@ -413,7 +470,7 @@ func (s *Server) usageFloorOnce(ctx context.Context, repo string) (usage int64, 
 	c.mu.Lock()
 	if e, ok := c.entries[repo]; ok && !c.clockNow().After(e.expires) {
 		c.mu.Unlock()
-		return e.usage, false, nil
+		return e.uncounted(), false, nil
 	}
 	f := c.inflight[repo]
 	if f == nil {
@@ -466,7 +523,7 @@ func (s *Server) usageFloorOnce(ctx context.Context, repo string) (usage int64, 
 		if c.clockNow().After(f.expires) {
 			return 0, true, nil
 		}
-		return f.usage, false, nil
+		return max(0, f.usage-f.counter), false, nil
 	case <-ctx.Done():
 		c.mu.Lock()
 		f.waiters--

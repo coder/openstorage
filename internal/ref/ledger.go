@@ -26,18 +26,23 @@
 //
 // Admission formula (ReservePackBytes, all in one transaction):
 //
-//	max(SUM(pack_usage over group), usageFloor)
+//	SUM(pack_usage over group) + usageFloor
 //	  + SUM(active reservations for the base repo, excluding this push's keys)
 //	  + incoming  <=  quota
 //
-// usageFloor is the caller's blob-listing measurement (blob.StorageUsageBytes).
-// It is kept as a safety floor rather than retired (deviating from issue
-// #29's "kill the listing" sketch) because it covers bytes no counter can
-// know: repos whose packs predate the ledger, and orphaned uploads from
-// crashed pushes that never registered. The counter covers what the listing
-// cannot see in time: bytes admitted by concurrent pushes that registered
-// after the caller listed. max() of two lower bounds of true usage is still
-// a lower bound, so admission stays exactly as strict as the tighter one.
+// usageFloor is the caller's UNCOUNTED-bytes floor: its blob-listing
+// measurement (blob.StorageUsageBytes) MINUS the usage counter read at
+// that listing's scan start, clamped at zero. It is kept rather than
+// retired (deviating from issue #29's "kill the listing" sketch) because
+// it covers bytes no counter can know: repos whose packs predate the
+// ledger, pre-registry LFS objects, and orphaned uploads from crashed
+// pushes that never registered. The live counter covers everything
+// registered — including settlements AFTER the floor's scan, which a
+// max() of the two combined measurements hid whenever uncounted bytes
+// coexisted with fresh settlements (Codex round 44). The sum counts a
+// byte twice only when its blob was listed before its registration
+// committed inside the scan-to-admission window — transient, and on the
+// deny side.
 //
 // Serialization: reserve-vs-reserve for one base repo is serialized (PG: a
 // per-base advisory xact lock in a keyspace disjoint from the schema-init
@@ -289,6 +294,11 @@ func Admitted(used, reserved, incoming, quota int64) bool {
 	return admitted(used, reserved, incoming, quota)
 }
 
+// AddSat is the exported saturating sum, for callers combining the usage
+// counter with the uncounted-bytes floor outside the ledger (the LFS
+// batch's advisory check) exactly as ReservePackBytes does (round 44).
+func AddSat(a, b int64) int64 { return addSat(a, b) }
+
 // ReservePackBytes implements the admission check documented atop this file
 // on Postgres.
 func (s *PG) ReservePackBytes(ctx context.Context, group []string, packs []Pack, owner string, usageFloor, quotaBytes int64, ttl time.Duration) (ReserveDecision, error) {
@@ -337,7 +347,12 @@ SELECT
 			group, group[0], ttl.Seconds(), reservKeySpellings(keys...), reservRowKeys(keys)).Scan(&counter, &reserved, &activeRows); err != nil {
 			return err
 		}
-		dec = ReserveDecision{UsedBytes: max(counter, usageFloor), ReservedBytes: reserved}
+		// SUM, not max (Codex round 44): the floor is the UNCOUNTED-bytes
+		// snapshot (listing minus the counter at its scan), so bytes
+		// registered after that scan appear exactly once — in the
+		// counter. max() hid them whenever uncounted bytes coexisted
+		// with fresh settlements.
+		dec = ReserveDecision{UsedBytes: addSat(counter, usageFloor), ReservedBytes: reserved}
 		if activeRows+int64(len(packs)) > int64(maxActiveReservations) {
 			dec.KeyCapExceeded = true
 			return nil // denied; dec.OK stays false

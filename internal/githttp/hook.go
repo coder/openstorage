@@ -299,7 +299,7 @@ func preReceive(ctx context.Context) error {
 			}
 		}
 		if len(unpublished) > 0 {
-			floor, err := hookUsageFloor(ctx, bl, repo)
+			floor, err := hookUsageFloor(ctx, bl, st, repo)
 			if err != nil {
 				return fmt.Errorf("pre-receive: %w", err)
 			}

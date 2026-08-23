@@ -71,7 +71,8 @@ SELECT
 		groupArgs...).Scan(&counter, &reserved, &activeRows); err != nil {
 		return ReserveDecision{}, fmt.Errorf("reserve pack bytes read: %w", err)
 	}
-	dec := ReserveDecision{UsedBytes: max(counter, usageFloor), ReservedBytes: reserved}
+	// SUM, not max — see the PG twin (Codex round 44).
+	dec := ReserveDecision{UsedBytes: addSat(counter, usageFloor), ReservedBytes: reserved}
 	if activeRows+int64(len(packs)) > int64(maxActiveReservations) {
 		dec.KeyCapExceeded = true
 		return dec, nil // denied; the deferred rollback discards nothing

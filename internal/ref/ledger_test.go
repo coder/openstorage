@@ -498,6 +498,41 @@ func TestReverseOrderRetirementEndsRow(t *testing.T) {
 	})
 }
 
+// TestReserveCountsPostScanSettlements (Codex round 44, security): the
+// floor is a listing SNAPSHOT — bytes registered after its scan live in
+// the usage counter but not in the floor, so combining them with max()
+// undercounts whenever uncounted physical bytes (pre-registry LFS,
+// orphans) coexist with fresh settlements. The floor parameter is
+// therefore the UNCOUNTED-bytes floor (listing minus the counter at scan,
+// clamped at zero) and admission SUMS it with the live counter: with 80
+// uncounted bytes and a 100-byte quota, a 20-byte upload that settles
+// must leave the next 20-byte upload DENIED (counter 20 + floor 80 +
+// incoming 20 = 120 > 100), even though the floor snapshot predates the
+// settlement.
+func TestReserveCountsPostScanSettlements(t *testing.T) {
+	runRefBackends(t, func(t *testing.T, s Store) {
+		ctx := context.Background()
+		k := newLedgerKit(t, s)
+		const quota, uncounted = 100, 80
+
+		// Upload A: 20 bytes against 80 uncounted bytes — fits exactly.
+		a := "lfs/" + k.base() + "/" + strings.Repeat("aa", 32)
+		if dec := k.reserve([]Pack{{Key: a, Size: 20}}, "owner-a", uncounted, quota); !dec.OK {
+			t.Fatalf("first reserve: %+v", dec)
+		}
+		if err := s.RegisterLFSObject(ctx, k.base(), a, 20); err != nil {
+			t.Fatal(err)
+		}
+		// Upload B admits against the SAME floor snapshot (its scan
+		// predates A's settlement — the cache window). The counter now
+		// carries A's 20 bytes the floor cannot see: B must be denied.
+		b := "lfs/" + k.base() + "/" + strings.Repeat("bb", 32)
+		if dec := k.reserve([]Pack{{Key: b, Size: 20}}, "owner-b", uncounted, quota); dec.OK {
+			t.Fatalf("post-settlement reserve admitted past quota: %+v (counter and floor must SUM)", dec)
+		}
+	})
+}
+
 // TestReservePrunesExpiredPhysicalRows (Codex round 5 on #51): admission
 // itself prunes the base repo's EXPIRED rows — with sweeping disabled, a
 // writer cycling TTL windows must not grow the table without bound.

@@ -536,7 +536,9 @@ func (s *Server) lfsBatchUpload(r *http.Request, repoElem string, target repoTar
 				log.Printf("lfs quota: %s: ledger read failed: %v", repoID, err)
 				return denyAll(http.StatusInternalServerError, "storage quota check failed")
 			}
-			used := max(ls.UsageBytes, floor)
+			// SUM, not max (Codex round 44) — the floor is the
+			// uncounted-bytes snapshot; see ref.ReservePackBytes.
+			used := ref.AddSat(ls.UsageBytes, floor)
 			if ref.Admitted(used, ls.ReservedBytes, incoming, s.PackQuotaBytes) {
 				break
 			}

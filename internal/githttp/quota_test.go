@@ -24,6 +24,7 @@ import (
 	"github.com/coder/code-storage/internal/auth"
 	"github.com/coder/code-storage/internal/blob"
 	"github.com/coder/code-storage/internal/meta"
+	"github.com/coder/code-storage/internal/ref"
 )
 
 // seedPack publishes size bytes at repo's pack key with the given id.
@@ -261,6 +262,35 @@ func TestUsageFloorEntryAgesFromScanStart(t *testing.T) {
 	}
 }
 
+// TestUsageFloorSubtractsCounterAtScan (Codex round 44): the admission
+// floor is the UNCOUNTED-bytes measurement — listing minus the usage
+// counter at scan start — because ReservePackBytes SUMS it with the live
+// counter. Returning the raw listing would double-charge every registered
+// byte; returning it under max() semantics hid post-scan settlements. A
+// repo with 30 listed bytes of which 20 are registered must floor at 10.
+func TestUsageFloorSubtractsCounterAtScan(t *testing.T) {
+	ctx := context.Background()
+	st := openTestRefStore(t)
+	bl := openTestBlob(t)
+	srv := &Server{Blob: bl, Store: st}
+
+	seedPack(t, bl, "repo_unc", "aaaa", 10) // pre-registry: uncounted
+	seedLFS(t, bl, "repo_unc", strings.Repeat("ab", 32), 20)
+	if err := st.RegisterLFSObject(ctx, "repo_unc",
+		blob.LFSKey("repo_unc", strings.Repeat("ab", 32)), 20); err != nil {
+		t.Fatal(err)
+	}
+
+	if floor, err := srv.CachedUsageFloor(ctx, "repo_unc"); err != nil || floor != 10 {
+		t.Fatalf("uncounted floor = (%d, %v), want (10, nil) — registered bytes must not double-charge", floor, err)
+	}
+	// The observational peek keeps the RAW listing (the pressure log
+	// compares total usage against the quota).
+	if usage, ok := srv.peekUsage("repo_unc"); !ok || usage != 30 {
+		t.Fatalf("peek usage = (%d, %v), want (30, true)", usage, ok)
+	}
+}
+
 // TestUsageFloorScanExpiredResultFailsClosed (Codex round 41): the
 // flight-result path must not hand CURRENT waiters a value whose scan
 // already outlived the freshness window — under the minimum reservation
@@ -367,7 +397,7 @@ func TestPackUsageCachePruneIsTimeBounded(t *testing.T) {
 
 	c.mu.Lock()
 	for i := 0; i < 2000; i++ {
-		c.putLocked(fmt.Sprintf("repo_%04d", i), 1, now)
+		c.putLocked(fmt.Sprintf("repo_%04d", i), 1, 0, now)
 	}
 	if got := len(c.entries); got != 2000 {
 		t.Fatalf("fresh entries pruned early: %d, want 2000", got)
@@ -376,7 +406,7 @@ func TestPackUsageCachePruneIsTimeBounded(t *testing.T) {
 	// Past the prune interval every old entry has also expired (TTL ==
 	// interval); the next insert sweeps them all, keeping only itself.
 	now = now.Add(usageCachePruneInterval + time.Second)
-	c.putLocked("repo_new", 1, now)
+	c.putLocked("repo_new", 1, 0, now)
 	if got := len(c.entries); got != 1 {
 		t.Fatalf("post-interval insert kept %d entries, want 1", got)
 	}
@@ -387,7 +417,7 @@ func TestPackUsageCachePruneIsTimeBounded(t *testing.T) {
 	// Immediately after a sweep, inserts must not sweep again (lastPrune
 	// advanced): an expired straggler survives until the next interval.
 	c.entries["repo_stale"] = usageEntry{usage: 1, expires: now.Add(-time.Second)}
-	c.putLocked("repo_new2", 1, now)
+	c.putLocked("repo_new2", 1, 0, now)
 	if _, ok := c.entries["repo_stale"]; !ok {
 		t.Fatal("insert swept before the prune interval elapsed")
 	}
@@ -471,11 +501,26 @@ func TestStorageUsageBytes(t *testing.T) {
 // floor aged past hookFloorMaxAge (the client controls the mint-to-hook
 // gap), self-list on absent or timestampless values (binary skew), and
 // fail closed on nonsense (the env comes from our own server).
+// openTestRefStore opens a throwaway SQLite ref store (the hook floor
+// reads the usage counter at scan start — Codex round 44).
+func openTestRefStore(t *testing.T) ref.Store {
+	t.Helper()
+	st, err := ref.Open(context.Background(), "sqlite://"+t.TempDir()+"/refs.sqlite")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(st.Close)
+	if err := st.InitSchema(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	return st
+}
+
 func TestHookUsageFloor(t *testing.T) {
 	now := time.Now().Unix()
 	t.Run("fresh-floor-used-without-listing", func(t *testing.T) {
 		t.Setenv(EnvUsageFloor, fmt.Sprintf("1234:%d", now))
-		got, err := hookUsageFloor(context.Background(), nil, "repo_a")
+		got, err := hookUsageFloor(context.Background(), nil, nil, "repo_a")
 		if err != nil || got != 1234 {
 			t.Fatalf("hookUsageFloor = (%d, %v), want (1234, nil)", got, err)
 		}
@@ -489,7 +534,7 @@ func TestHookUsageFloor(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Setenv(EnvUsageFloor, raw)
-			if _, err := hookUsageFloor(context.Background(), nil, "repo_a"); err == nil {
+			if _, err := hookUsageFloor(context.Background(), nil, nil, "repo_a"); err == nil {
 				t.Fatalf("hookUsageFloor(%s=%q) did not fail closed", EnvUsageFloor, raw)
 			}
 		})
@@ -540,7 +585,7 @@ func TestHookUsageFloor(t *testing.T) {
 			bl := openTestBlob(t)
 			seedPack(t, bl, "repo_a", "1111", 100)
 			seedLFS(t, bl, "repo_a", strings.Repeat("aa", 32), 7)
-			got, err := hookUsageFloor(context.Background(), bl, "repo_a")
+			got, err := hookUsageFloor(context.Background(), bl, openTestRefStore(t), "repo_a")
 			if err != nil || got != 107 {
 				t.Fatalf("listing fallback = (%d, %v), want (107, nil) — the untrusted floor must not be used", got, err)
 			}

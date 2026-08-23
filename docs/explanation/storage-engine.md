@@ -90,19 +90,24 @@ Admission is a durable reservation ledger in the database, serialized per base r
 (one advisory lock in Postgres, an immediate transaction in SQLite):
 
 ```
-max(usage counter, blob-listing floor) + active reservations + incoming ≤ quota
+usage counter + uncounted floor + active reservations + incoming ≤ quota
 ```
+
+The *uncounted floor* is the physical blob listing minus the usage counter read at that
+listing's scan start, clamped at zero: the bytes the counter has never seen.
 
 - **Reservations** claim headroom *before* upload and are consumed atomically when the
   pack registers. A crashed writer's reservation keeps gating until its TTL elapses —
   admission filters expired rows out immediately; the sweeper's later pruning is pure
   garbage collection. A *retry* of the same push refreshes the same reservation instead
   of double-charging, because packs are content-addressed.
-- **The counter and the floor cross-check each other.** The counter covers what the
-  listing can't see yet (staleness, in-flight registrations); the physical listing floor
-  covers what the counter never saw (pre-ledger packs, orphaned uploads). Taking the max
-  fails toward *denying* at the margin, never toward silent overshoot. The floor listing
-  is served from a short-lived per-repository cache shared by every admission surface
+- **The counter and the floor split the bytes between them.** The live counter covers
+  everything registered — including settlements newer than the floor's scan — while the
+  uncounted floor covers what the counter never saw (pre-ledger packs, pre-registry LFS
+  objects, orphaned uploads). Summing the two counts every byte at least once and
+  double-counts only a blob whose listing and registration straddle one scan window —
+  transient, and toward *denying* at the margin, never silent overshoot. The floor is
+  served from a short-lived per-repository cache shared by every admission surface
   (git pushes, REST pack writes, LFS transfers) rather than re-scanned per write — safe
   precisely because everything registered or in flight is covered by the counter and
   reservations regardless of the floor's staleness.
