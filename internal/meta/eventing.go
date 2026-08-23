@@ -59,7 +59,15 @@ type RepoUpstream struct {
 	// claimed (its fetch may predate them) and a follow-up run is due
 	// (issue #79 liveness).
 	SyncPending bool
-	CreatedAt   time.Time
+	// SyncClaimHolder/SyncClaimExpiresAt lease the Syncing claim (issue
+	// #86): every claim records a per-run holder token and an expiry, and
+	// a conflicting claimant may STEAL a claim whose lease has provably
+	// expired — the only recovery for a holder process that died between
+	// TryBeginSync and FinishSync. FinishSync clears both (holder "" and
+	// expiry at the zero instant, epoch/0 in storage).
+	SyncClaimHolder    string
+	SyncClaimExpiresAt time.Time
+	CreatedAt          time.Time
 }
 
 // NewEventingID returns "<prefix>_<16 hex>" — the shared ID shape for
@@ -132,16 +140,27 @@ type EventingStore interface {
 	// survives to that run's FinishSync and the finisher schedules a
 	// follow-up run. ErrNotFound when detached.
 	RequestSync(ctx context.Context, repoID string) error
-	// TryBeginSync atomically claims a sync run (syncing false -> true) and
-	// returns the row as of the claim. The claim consumes sync_pending:
-	// every request marked before the claim is observed by the claimed
-	// run's upstream fetch, which happens after it. claimed=false (row
-	// returned) when a run is already in flight; ErrNotFound when detached.
-	TryBeginSync(ctx context.Context, repoID string) (up RepoUpstream, claimed bool, err error)
-	// FinishSync completes the claimed run: increments RunCount (and
-	// SuccessCount when success), clears Syncing, returns the updated row.
-	// SyncPending is NOT touched: a set flag in the returned row tells the
-	// finisher to schedule a follow-up run (the follow-up's claim consumes
-	// it). ErrNotFound when the repo was detached mid-run.
-	FinishSync(ctx context.Context, repoID string, success bool) (RepoUpstream, error)
+	// TryBeginSync atomically claims a sync run (syncing false -> true)
+	// under a lease and returns the row as of the claim. holder is the
+	// caller's per-run claim token; the claim records it with an expiry
+	// of now+lease. A row whose current claim has EXPIRED is stolen
+	// atomically (read-check-write inside one transaction/row lock — no
+	// read-then-write window): stolenFrom then carries the previous
+	// holder for observability, and the previous holder's late
+	// FinishSync fails with ErrClaimLost. The claim consumes
+	// sync_pending: every request marked before the claim is observed by
+	// the claimed run's upstream fetch, which happens after it.
+	// claimed=false (row returned) when an UNEXPIRED run is in flight;
+	// ErrNotFound when detached.
+	TryBeginSync(ctx context.Context, repoID, holder string, lease time.Duration) (up RepoUpstream, claimed bool, stolenFrom string, err error)
+	// FinishSync completes the run claimed by holder: increments RunCount
+	// (and SuccessCount when success), clears Syncing and the claim
+	// lease, returns the updated row. SyncPending is NOT touched: a set
+	// flag in the returned row tells the finisher to schedule a follow-up
+	// run (the follow-up's claim consumes it). ErrNotFound when the repo
+	// was detached mid-run or no run is in flight; ErrClaimLost when the
+	// row is claimed by a DIFFERENT holder — the caller's expired claim
+	// was stolen, and the late finisher must abandon without touching the
+	// thief's claim or the counters.
+	FinishSync(ctx context.Context, repoID, holder string, success bool) (RepoUpstream, error)
 }

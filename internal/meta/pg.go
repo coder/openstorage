@@ -130,11 +130,18 @@ CREATE TABLE IF NOT EXISTS repo_upstreams (
     success_count integer NOT NULL DEFAULT 0,
     syncing       boolean NOT NULL DEFAULT false,
     sync_pending  boolean NOT NULL DEFAULT false,
+    sync_claim_holder     text NOT NULL DEFAULT '',
+    sync_claim_expires_at timestamptz NOT NULL DEFAULT 'epoch',
     created_at    timestamptz NOT NULL DEFAULT now()
 );
--- Upgrade path for pre-#79 deployments whose repo_upstreams predates the
--- sync_pending column (idempotent; runs under the META advisory lock).
+-- Upgrade path for deployments whose repo_upstreams predates the
+-- sync_pending (#79) or claim-lease (#86) columns (idempotent; runs under
+-- the META advisory lock). The epoch expiry default makes pre-existing
+-- WEDGED claims (holder died before the lease existed) immediately
+-- stealable on upgrade.
 ALTER TABLE repo_upstreams ADD COLUMN IF NOT EXISTS sync_pending boolean NOT NULL DEFAULT false;
+ALTER TABLE repo_upstreams ADD COLUMN IF NOT EXISTS sync_claim_holder text NOT NULL DEFAULT '';
+ALTER TABLE repo_upstreams ADD COLUMN IF NOT EXISTS sync_claim_expires_at timestamptz NOT NULL DEFAULT 'epoch';
 `)
 		return err
 	})

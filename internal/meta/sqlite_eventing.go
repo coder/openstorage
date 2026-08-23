@@ -49,14 +49,16 @@ func scanGitCredentialSQLite(row sqlRow) (GitCredential, error) {
 }
 
 // scanRepoUpstreamSQLite scans one row of repoUpstreamCols (syncing scans
-// from INTEGER 0/1 into bool).
+// from INTEGER 0/1 into bool; timestamps from unixnano).
 func scanRepoUpstreamSQLite(row sqlRow) (RepoUpstream, error) {
 	var up RepoUpstream
-	var createdAt int64
+	var claimExpires, createdAt int64
 	if err := row.Scan(&up.RepoID, &up.Provider, &up.Owner, &up.Name, &up.UpstreamHost,
-		&up.RunCount, &up.SuccessCount, &up.Syncing, &up.SyncPending, &createdAt); err != nil {
+		&up.RunCount, &up.SuccessCount, &up.Syncing, &up.SyncPending,
+		&up.SyncClaimHolder, &claimExpires, &createdAt); err != nil {
 		return RepoUpstream{}, err
 	}
+	up.SyncClaimExpiresAt = time.Unix(0, claimExpires).UTC()
 	up.CreatedAt = time.Unix(0, createdAt).UTC()
 	return up, nil
 }
@@ -334,17 +336,19 @@ func (s *SQLite) GitCredentialForRepo(ctx context.Context, repoID string) (GitCr
 }
 
 // SetRepoUpstream inserts the upstream row (CreatedAt assigned by the store;
-// counters/syncing/sync_pending zeroed). ErrAlreadyExists when the repo
-// already has one.
+// counters/syncing/sync_pending/claim lease zeroed). ErrAlreadyExists when
+// the repo already has one.
 func (s *SQLite) SetRepoUpstream(ctx context.Context, up RepoUpstream) (RepoUpstream, error) {
 	assertf(up.RepoID != "", "SetRepoUpstream: empty repo id")
 	nanos, createdAt := nowNano()
 	up.RunCount, up.SuccessCount, up.Syncing, up.SyncPending = 0, 0, false, false
+	up.SyncClaimHolder, up.SyncClaimExpiresAt = "", time.Unix(0, 0).UTC()
 	up.CreatedAt = createdAt
 	_, err := s.db.ExecContext(ctx,
 		`INSERT INTO repo_upstreams (repo_id, provider, owner, name, upstream_host,
-		        run_count, success_count, syncing, sync_pending, created_at)
-		 VALUES (?, ?, ?, ?, ?, 0, 0, 0, 0, ?)`,
+		        run_count, success_count, syncing, sync_pending,
+		        sync_claim_holder, sync_claim_expires_at, created_at)
+		 VALUES (?, ?, ?, ?, ?, 0, 0, 0, 0, '', 0, ?)`,
 		up.RepoID, up.Provider, up.Owner, up.Name, up.UpstreamHost, nanos)
 	// The only constraint on repo_upstreams is the repo_id PRIMARY KEY.
 	if isPrimaryKeyViolation(err) {
@@ -409,19 +413,37 @@ func (s *SQLite) RequestSync(ctx context.Context, repoID string) error {
 	return nil
 }
 
-// TryBeginSync atomically claims a sync run (syncing false -> true) and
-// consumes sync_pending (the claimed run's fetch postdates every request
-// marked before the claim). claimed=false with the current row when a run
-// is already in flight; ErrNotFound when detached. The BEGIN IMMEDIATE
-// transaction makes the claim-then-read pair atomic against concurrent
-// claimers.
-func (s *SQLite) TryBeginSync(ctx context.Context, repoID string) (RepoUpstream, bool, error) {
+// TryBeginSync atomically claims a sync run (syncing false -> true) under
+// a lease and consumes sync_pending (the claimed run's fetch postdates
+// every request marked before the claim). An EXPIRED claim is stolen in
+// the same guarded UPDATE (issue #86: the only recovery for a holder that
+// died mid-run). The BEGIN IMMEDIATE transaction makes the
+// read-check-write atomic against concurrent claimers; local mode is a
+// single-host topology, so Go wall time is a consistent clock source.
+// claimed=false with the current row when an unexpired run is in flight;
+// ErrNotFound when detached.
+func (s *SQLite) TryBeginSync(ctx context.Context, repoID, holder string, lease time.Duration) (RepoUpstream, bool, string, error) {
 	assertf(repoID != "", "TryBeginSync: empty repo id")
+	assertf(holder != "", "TryBeginSync: empty holder")
+	assertf(lease > 0, "TryBeginSync: non-positive lease %v", lease)
+	nowNanos, _ := nowNano()
 	var up RepoUpstream
 	var claimed bool
+	var stolenFrom string
 	err := s.inTx(ctx, func(tx *sql.Tx) error {
+		prev, err := scanRepoUpstreamSQLite(tx.QueryRowContext(ctx,
+			`SELECT `+repoUpstreamCols+` FROM repo_upstreams WHERE repo_id = ?`, repoID))
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		if err != nil {
+			return err
+		}
 		res, err := tx.ExecContext(ctx,
-			`UPDATE repo_upstreams SET syncing = 1, sync_pending = 0 WHERE repo_id = ? AND syncing = 0`, repoID)
+			`UPDATE repo_upstreams
+			 SET syncing = 1, sync_pending = 0, sync_claim_holder = ?, sync_claim_expires_at = ?
+			 WHERE repo_id = ? AND (syncing = 0 OR sync_claim_expires_at <= ?)`,
+			holder, nowNanos+lease.Nanoseconds(), repoID, nowNanos)
 		if err != nil {
 			return err
 		}
@@ -431,31 +453,40 @@ func (s *SQLite) TryBeginSync(ctx context.Context, repoID string) (RepoUpstream,
 		}
 		assertf(n == 0 || n == 1, "sync claim for %q affected %d rows", repoID, n)
 		claimed = n == 1
+		if !claimed {
+			up = prev // unexpired claim in flight: refused, current row
+			return nil
+		}
 		row, err := scanRepoUpstreamSQLite(tx.QueryRowContext(ctx,
 			`SELECT `+repoUpstreamCols+` FROM repo_upstreams WHERE repo_id = ?`, repoID))
-		if errors.Is(err, sql.ErrNoRows) {
-			return ErrNotFound
-		}
 		if err != nil {
 			return err
 		}
-		assertf(!claimed || row.Syncing, "claimed row %q returned syncing=false", repoID)
+		assertf(row.Syncing && row.SyncClaimHolder == holder,
+			"claimed row %q returned holder %q syncing=%v", repoID, row.SyncClaimHolder, row.Syncing)
 		up = row
+		if prev.Syncing {
+			stolenFrom = prev.SyncClaimHolder // expired claim stolen
+		}
 		return nil
 	})
 	if err != nil {
-		return RepoUpstream{}, false, fmt.Errorf("begin sync for repo %q: %w", repoID, err)
+		return RepoUpstream{}, false, "", fmt.Errorf("begin sync for repo %q: %w", repoID, err)
 	}
-	return up, claimed, nil
+	return up, claimed, stolenFrom, nil
 }
 
-// FinishSync completes the claimed run: increments RunCount (and
-// SuccessCount when success), clears Syncing, returns the updated row.
-// ErrNotFound when the repo was detached mid-run — or when no run is in
-// flight: the `AND syncing` guard keeps a stale finisher (detached mid-run,
-// then re-attached) from polluting the fresh row's counters.
-func (s *SQLite) FinishSync(ctx context.Context, repoID string, success bool) (RepoUpstream, error) {
+// FinishSync completes the run claimed by holder: increments RunCount (and
+// SuccessCount when success), clears Syncing and the claim lease, returns
+// the updated row. ErrNotFound when the repo was detached mid-run — or
+// when no run is in flight: the `AND syncing` guard keeps a stale finisher
+// (detached mid-run, then re-attached) from polluting the fresh row's
+// counters. ErrClaimLost when the row is claimed by a DIFFERENT holder:
+// the caller's expired claim was stolen (issue #86), and the late
+// finisher must not clear the thief's claim or touch the counters.
+func (s *SQLite) FinishSync(ctx context.Context, repoID, holder string, success bool) (RepoUpstream, error) {
 	assertf(repoID != "", "FinishSync: empty repo id")
+	assertf(holder != "", "FinishSync: empty holder")
 	successInc := 0
 	if success {
 		successInc = 1
@@ -464,8 +495,10 @@ func (s *SQLite) FinishSync(ctx context.Context, repoID string, success bool) (R
 	err := s.inTx(ctx, func(tx *sql.Tx) error {
 		res, err := tx.ExecContext(ctx,
 			`UPDATE repo_upstreams
-			 SET syncing = 0, run_count = run_count + 1, success_count = success_count + ?
-			 WHERE repo_id = ? AND syncing = 1`, successInc, repoID)
+			 SET syncing = 0, run_count = run_count + 1, success_count = success_count + ?,
+			     sync_claim_holder = '', sync_claim_expires_at = 0
+			 WHERE repo_id = ? AND syncing = 1 AND sync_claim_holder = ?`,
+			successInc, repoID, holder)
 		if err != nil {
 			return err
 		}
@@ -474,6 +507,18 @@ func (s *SQLite) FinishSync(ctx context.Context, repoID string, success bool) (R
 			return err
 		}
 		if n == 0 {
+			// Guard miss: classify inside the same transaction.
+			cur, err := scanRepoUpstreamSQLite(tx.QueryRowContext(ctx,
+				`SELECT `+repoUpstreamCols+` FROM repo_upstreams WHERE repo_id = ?`, repoID))
+			if errors.Is(err, sql.ErrNoRows) {
+				return ErrNotFound
+			}
+			if err != nil {
+				return err
+			}
+			if cur.Syncing && cur.SyncClaimHolder != holder {
+				return fmt.Errorf("now held by %q: %w", cur.SyncClaimHolder, ErrClaimLost)
+			}
 			return ErrNotFound
 		}
 		assertf(n == 1, "finish sync for %q affected %d rows", repoID, n)

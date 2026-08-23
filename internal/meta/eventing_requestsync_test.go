@@ -9,6 +9,7 @@ package meta
 import (
 	"errors"
 	"testing"
+	"time"
 )
 
 func TestRequestSyncPendingLifecycle(t *testing.T) {
@@ -43,7 +44,7 @@ func testRequestSyncPendingLifecycle(t *testing.T, s Backend) {
 	if got, err = s.GetRepoUpstream(ctx, repoID); err != nil || !got.SyncPending {
 		t.Fatalf("after RequestSync: row = %+v, err = %v, want SyncPending", got, err)
 	}
-	claimed, ok, err := s.TryBeginSync(ctx, repoID)
+	claimed, ok, _, err := s.TryBeginSync(ctx, repoID, testClaimHolder, time.Minute)
 	if err != nil || !ok {
 		t.Fatalf("claim = (%+v, %v, %v), want claimed", claimed, ok, err)
 	}
@@ -57,33 +58,33 @@ func testRequestSyncPendingLifecycle(t *testing.T, s Backend) {
 	if err := s.RequestSync(ctx, repoID); err != nil {
 		t.Fatalf("RequestSync during claim: %v", err)
 	}
-	fin, err := s.FinishSync(ctx, repoID, true)
+	fin, err := s.FinishSync(ctx, repoID, testClaimHolder, true)
 	if err != nil {
 		t.Fatalf("FinishSync: %v", err)
 	}
 	if !fin.SyncPending || fin.Syncing || fin.RunCount != 1 || fin.SuccessCount != 1 {
 		t.Errorf("FinishSync row = %+v, want SyncPending with cleared claim and counted run", fin)
 	}
-	claimed, ok, err = s.TryBeginSync(ctx, repoID)
+	claimed, ok, _, err = s.TryBeginSync(ctx, repoID, testClaimHolder, time.Minute)
 	if err != nil || !ok {
 		t.Fatalf("follow-up claim = (%+v, %v, %v), want claimed", claimed, ok, err)
 	}
 	if claimed.SyncPending {
 		t.Errorf("follow-up claim did not consume SyncPending: %+v", claimed)
 	}
-	if fin, err = s.FinishSync(ctx, repoID, true); err != nil || fin.SyncPending {
+	if fin, err = s.FinishSync(ctx, repoID, testClaimHolder, true); err != nil || fin.SyncPending {
 		t.Errorf("quiet FinishSync row = %+v, err = %v, want SyncPending clear", fin, err)
 	}
 
 	// A conflicting claim attempt must NOT consume the marker: only the
 	// holder's post-claim fetch can cover the request.
-	if _, ok, err := s.TryBeginSync(ctx, repoID); err != nil || !ok {
+	if _, ok, _, err := s.TryBeginSync(ctx, repoID, testClaimHolder, time.Minute); err != nil || !ok {
 		t.Fatalf("re-claim failed: (%v, %v)", ok, err)
 	}
 	if err := s.RequestSync(ctx, repoID); err != nil {
 		t.Fatalf("RequestSync during claim: %v", err)
 	}
-	if _, ok, err := s.TryBeginSync(ctx, repoID); err != nil || ok {
+	if _, ok, _, err := s.TryBeginSync(ctx, repoID, testClaimHolder, time.Minute); err != nil || ok {
 		t.Fatalf("conflicting claim = (%v, %v), want not claimed", ok, err)
 	}
 	if got, err = s.GetRepoUpstream(ctx, repoID); err != nil || !got.SyncPending {

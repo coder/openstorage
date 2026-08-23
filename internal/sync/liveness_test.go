@@ -301,11 +301,11 @@ type flakyFinishUpstreams struct {
 	fails atomic.Int32
 }
 
-func (f *flakyFinishUpstreams) FinishSync(ctx context.Context, repoID string, success bool) (Upstream, error) {
+func (f *flakyFinishUpstreams) FinishSync(ctx context.Context, repoID, holder string, success bool) (Upstream, error) {
 	if f.fails.Add(-1) >= 0 {
 		return Upstream{}, errors.New("transient store blip")
 	}
-	return f.UpstreamStore.FinishSync(ctx, repoID, success)
+	return f.UpstreamStore.FinishSync(ctx, repoID, holder, success)
 }
 
 // A transient FinishSync failure must be retried while the claim is still

@@ -155,6 +155,8 @@ func (s *SQLite) InitSchema(ctx context.Context) error {
 		    success_count INTEGER NOT NULL,
 		    syncing       INTEGER NOT NULL,
 		    sync_pending  INTEGER NOT NULL DEFAULT 0,
+		    sync_claim_holder     TEXT NOT NULL DEFAULT '',
+		    sync_claim_expires_at INTEGER NOT NULL DEFAULT 0,
 		    created_at    INTEGER NOT NULL
 		)`,
 	} {
@@ -162,18 +164,26 @@ func (s *SQLite) InitSchema(ctx context.Context) error {
 			return fmt.Errorf("sqlite init schema: %w", err)
 		}
 	}
-	// Upgrade path for pre-#79 data dirs whose repo_upstreams predates the
-	// sync_pending column (SQLite has no ADD COLUMN IF NOT EXISTS).
-	var hasSyncPending int
-	if err := tx.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM pragma_table_info('repo_upstreams') WHERE name = 'sync_pending'`,
-	).Scan(&hasSyncPending); err != nil {
-		return fmt.Errorf("sqlite init schema: probe sync_pending column: %w", err)
-	}
-	if hasSyncPending == 0 {
-		if _, err := tx.ExecContext(ctx,
-			`ALTER TABLE repo_upstreams ADD COLUMN sync_pending INTEGER NOT NULL DEFAULT 0`); err != nil {
-			return fmt.Errorf("sqlite init schema: add sync_pending column: %w", err)
+	// Upgrade path for data dirs whose repo_upstreams predates the
+	// sync_pending (#79) or claim-lease (#86) columns (SQLite has no ADD
+	// COLUMN IF NOT EXISTS). The zero expiry default makes pre-existing
+	// wedged claims immediately stealable on upgrade.
+	for _, col := range []struct{ name, ddl string }{
+		{"sync_pending", `sync_pending INTEGER NOT NULL DEFAULT 0`},
+		{"sync_claim_holder", `sync_claim_holder TEXT NOT NULL DEFAULT ''`},
+		{"sync_claim_expires_at", `sync_claim_expires_at INTEGER NOT NULL DEFAULT 0`},
+	} {
+		var present int
+		if err := tx.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM pragma_table_info('repo_upstreams') WHERE name = ?`, col.name,
+		).Scan(&present); err != nil {
+			return fmt.Errorf("sqlite init schema: probe %s column: %w", col.name, err)
+		}
+		if present == 0 {
+			if _, err := tx.ExecContext(ctx,
+				`ALTER TABLE repo_upstreams ADD COLUMN `+col.ddl); err != nil {
+				return fmt.Errorf("sqlite init schema: add %s column: %w", col.name, err)
+			}
 		}
 	}
 	return tx.Commit()

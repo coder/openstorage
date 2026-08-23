@@ -10,10 +10,12 @@ package jobs
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	stdsync "sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 
@@ -61,9 +63,10 @@ func TestRiverSyncRequestDuringRunningJobSchedulesSuccessor(t *testing.T) {
 	entered := make(chan struct{})
 	release := make(chan struct{})
 	var once stdsync.Once
-	var claimedRuns atomic.Int32
+	var runSeq, claimedRuns atomic.Int32
 	runner := func(ctx context.Context, job sync.Job) error {
-		if _, err := store.BeginSync(ctx, job.RepoID); err != nil {
+		holder := fmt.Sprintf("test-%d", runSeq.Add(1))
+		if _, _, err := store.BeginSync(ctx, job.RepoID, holder, time.Minute); err != nil {
 			if errors.Is(err, sync.ErrSyncInProgress) {
 				return nil // overlapping run: skip, like the real worker
 			}
@@ -74,7 +77,7 @@ func TestRiverSyncRequestDuringRunningJobSchedulesSuccessor(t *testing.T) {
 			close(entered)
 			<-release
 		})
-		_, err := store.FinishSync(ctx, job.RepoID, true)
+		_, err := store.FinishSync(ctx, job.RepoID, holder, true)
 		return err
 	}
 
@@ -128,14 +131,16 @@ func TestRiverSyncPendingSurvivesPreClaimFailure(t *testing.T) {
 
 	var attempts, claimedRuns atomic.Int32
 	runner := func(ctx context.Context, job sync.Job) error {
-		if attempts.Add(1) == 1 {
+		n := attempts.Add(1)
+		if n == 1 {
 			return errors.New("transient lookup failure before any claim")
 		}
-		if _, err := store.BeginSync(ctx, job.RepoID); err != nil {
+		holder := fmt.Sprintf("test-%d", n)
+		if _, _, err := store.BeginSync(ctx, job.RepoID, holder, time.Minute); err != nil {
 			return err
 		}
 		claimedRuns.Add(1)
-		_, err := store.FinishSync(ctx, job.RepoID, true)
+		_, err := store.FinishSync(ctx, job.RepoID, holder, true)
 		return err
 	}
 

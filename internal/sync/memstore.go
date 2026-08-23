@@ -2,6 +2,7 @@ package sync
 
 import (
 	"context"
+	"fmt"
 	stdsync "sync"
 	"time"
 )
@@ -146,24 +147,32 @@ func (m *MemStore) RequestSync(_ context.Context, repoID string) error {
 	return nil
 }
 
-func (m *MemStore) BeginSync(_ context.Context, repoID string) (Upstream, error) {
+func (m *MemStore) BeginSync(_ context.Context, repoID, holder string, lease time.Duration) (Upstream, string, error) {
+	assertf(holder != "", "BeginSync: empty holder")
+	assertf(lease > 0, "BeginSync: non-positive lease %v", lease)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	up, ok := m.upstreams[repoID]
 	if !ok {
-		return Upstream{}, ErrNotFound
+		return Upstream{}, "", ErrNotFound
 	}
+	stolenFrom := ""
 	if up.Syncing {
-		return Upstream{}, ErrSyncInProgress
+		if time.Now().Before(up.SyncClaimExpiresAt) {
+			return Upstream{}, "", ErrSyncInProgress
+		}
+		stolenFrom = up.SyncClaimHolder // expired claim stolen (issue #86)
 	}
 	// The claim consumes the pending marker: this run's upstream fetch
 	// postdates every request marked before the claim.
 	up.Syncing, up.SyncPending = true, false
+	up.SyncClaimHolder, up.SyncClaimExpiresAt = holder, time.Now().Add(lease)
 	m.upstreams[repoID] = up
-	return up, nil
+	return up, stolenFrom, nil
 }
 
-func (m *MemStore) FinishSync(_ context.Context, repoID string, success bool) (Upstream, error) {
+func (m *MemStore) FinishSync(_ context.Context, repoID, holder string, success bool) (Upstream, error) {
+	assertf(holder != "", "FinishSync: empty holder")
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	up, ok := m.upstreams[repoID]
@@ -171,7 +180,11 @@ func (m *MemStore) FinishSync(_ context.Context, repoID string, success bool) (U
 		return Upstream{}, ErrNotFound
 	}
 	assertf(up.Syncing, "FinishSync without BeginSync (repo %q)", repoID)
+	if up.SyncClaimHolder != holder {
+		return Upstream{}, fmt.Errorf("now held by %q: %w", up.SyncClaimHolder, ErrClaimLost)
+	}
 	up.Syncing = false
+	up.SyncClaimHolder, up.SyncClaimExpiresAt = "", time.Time{}
 	up.RunCount++
 	if success {
 		up.SuccessCount++

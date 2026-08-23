@@ -292,7 +292,7 @@ func TestWorkerOverlappingRunSkips(t *testing.T) {
 	f := newWorkerFixture(t)
 	seedUpstream(t, f.upstreamDir, "own", "proj")
 	f.putUpstream(t, "repo_ee", "own", "proj", "file://"+f.upstreamDir)
-	if _, err := f.store.BeginSync(context.Background(), "repo_ee"); err != nil {
+	if _, _, err := f.store.BeginSync(context.Background(), "repo_ee", "other-holder", time.Minute); err != nil {
 		t.Fatal(err)
 	}
 	if err := f.worker.Run(context.Background(), Job{Org: "acme", RepoID: "repo_ee"}); err != nil {
