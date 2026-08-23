@@ -202,9 +202,16 @@ func bucketStat(ctx context.Context, bucket *gcblob.Bucket, key string) (int64, 
 
 // bucketStatFingerprint is the single StatFingerprint implementation for
 // gocloud-backed BlobStores: the driver ETag when present (content-derived
-// on S3), else an mtime+size fallback (file backends; local-mode
-// overwrites bump mtime). The fingerprint is OPAQUE — callers may only
-// compare for equality.
+// on S3), else an mtime+size fallback. The fingerprint is OPAQUE — callers
+// may only compare for equality.
+//
+// Granularity caveat: fileblob's ETag is mtime-derived, and filesystem
+// mtimes tick on the kernel's coarse clock (1–10ms), so two same-size
+// rewrites inside one tick can collide. That weakness is acceptable
+// because the adversarial same-size rewriter the fingerprint defends
+// against is a still-valid presigned PUT (ADR-41) — and file backends
+// never issue presigned URLs (ErrSignedURLUnsupported), while S3's
+// content-derived ETag cannot be preserved across a rewrite at all.
 func bucketStatFingerprint(ctx context.Context, bucket *gcblob.Bucket, key string) (int64, string, error) {
 	assertf(bucket != nil && key != "", "bucketStatFingerprint(%q)", key)
 	attrs, err := bucket.Attributes(ctx, key)

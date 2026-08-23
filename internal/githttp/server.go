@@ -116,6 +116,16 @@ type Server struct {
 	// ($CODESTORAGE_LFS_STAGING_BYTES, default 10 GiB); <= 0 disables the
 	// bound (the operator's explicit opt-out).
 	LFSStagingBytes int64
+	// LFSV020WriteCompat keeps the v0.2.0 LFS read surface alive during a
+	// rolling upgrade (ADR-41, Codex round 80): old replicas derive only
+	// the legacy single-key spelling, so a mixed-version fleet would 404
+	// objects that exist only canonically. When set (serve wiring,
+	// $CODESTORAGE_LFS_V020_WRITE_COMPAT), every verified publication
+	// also copies the bytes to the legacy key — rowless copies the orphan
+	// sweep reclaims after the flag is dropped post-roll. Off by default:
+	// the canonical spelling is the secure one, and the compat copies are
+	// exactly as forgeable as everything v0.2.0 served.
+	LFSV020WriteCompat bool
 	// lfsUploadsInFlight tracks blob keys with a proxy upload currently
 	// staging on this replica (issue #51, Codex security round): at most
 	// one in-flight upload per key, so concurrent identical PUTs cannot

@@ -29,6 +29,7 @@ never a silently-applied default.
 | [`CODESTORAGE_SECRETS_MODE`](#codestorage_secrets_mode) | `encrypt` | `decrypt-only` stages the key fleet-wide before encrypted writes begin |
 | [`CODESTORAGE_PACK_QUOTA_BYTES`](#codestorage_pack_quota_bytes) | 10 GiB | Per-repo storage quota, packs + LFS (`0` disables) |
 | [`CODESTORAGE_LFS_STAGING_BYTES`](#codestorage_lfs_staging_bytes) | 32 GiB | Per-replica cap on in-flight LFS upload staging (`0` disables) |
+| [`CODESTORAGE_LFS_V020_WRITE_COMPAT`](#codestorage_lfs_v020_write_compat) | `false` | Dual-publish LFS objects to the legacy v0.2.0 key during a rolling upgrade |
 | [`CODESTORAGE_PACK_RESERVATION_TTL`](#codestorage_pack_reservation_ttl) | `1h` | Lifetime of a crashed writer's quota reservation |
 | [`CODESTORAGE_MAX_PUSH_BYTES`](#codestorage_max_push_bytes) | 2 × pack quota (min 2 MiB) | Decoded-byte cap on one git push (`0` disables) |
 | [`CODESTORAGE_VERIFY_SIG_BUDGET`](#codestorage_verify_sig_budget) | `10000` | Per-push `verify-sig` verified-commit budget (`0` disables) |
@@ -354,6 +355,22 @@ answers `413`.
   [reservation TTL](#codestorage_pack_reservation_ttl) in total (an upload slower than
   the TTL's implied floor — ~3 MB/s for 10 GiB at the defaults — cannot finish before
   its admission reservation expires anyway).
+
+### `CODESTORAGE_LFS_V020_WRITE_COMPAT`
+
+Registered LFS objects live at a canonical key old presigned upload URLs cannot
+address ([ADR-41](../adr/041-registered-lfs-objects-live-at-a-canonical-key-legacy-presigned-urls-cannot-address.md));
+replicas running v0.2.0 or older derive only the legacy single-key spelling and
+cannot see canonically stored objects. During a rolling upgrade from v0.2.0, set
+this on the **upgraded** replicas so every verified LFS publication is also copied
+to the legacy key — not-yet-upgraded replicas keep serving those objects for the
+duration of the roll. Drop the variable once the whole fleet is upgraded: the
+compat copies are rowless, so the [orphan sweep](../how-to/storage-lifecycle-and-sweeping.md)
+reclaims them under its LFS opt-in.
+
+- **Default:** `false`. The canonical spelling is the secure one — the compat
+  copies are exactly as exposed to still-valid legacy upload URLs as everything
+  v0.2.0 served — so compat is opt-in and meant to be temporary.
 
 ### `CODESTORAGE_PACK_RESERVATION_TTL`
 

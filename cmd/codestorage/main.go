@@ -186,6 +186,7 @@ func cmdServe(ctx context.Context, args []string) error {
 	// same canonical base the API's http_url values use.
 	srv.BaseURL = httpBaseURL
 	srv.LFSStagingBytes = cfg.lfsStagingBytes
+	srv.LFSV020WriteCompat = cfg.lfsV020WriteCompat
 	srv.MaxPushBytes = cfg.maxPushBytes
 	srv.VerifySigBudget = cfg.verifySigBudget
 	// docs/explanation/git-protocol-and-namespaces.md git URLs address repos by repo_id (name-style urls accepted

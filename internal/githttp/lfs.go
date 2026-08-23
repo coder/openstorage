@@ -808,21 +808,29 @@ func (s *Server) adoptLFSObject(ctx context.Context, repoID, key, oid string) er
 		return errLFSBusy
 	}
 	defer s.releaseLFSStaging(repoID, 0)
-	// Canonicalize before verifying (Codex security round 78): the legacy
-	// spelling was presigned-PUT-addressable in v0.1.x, so a still-valid
-	// URL can overwrite it at ANY moment — including after registration —
-	// and no registration-time check can defend a mutable key. The bytes
-	// are therefore server-side-copied to the canonical `o2/` key, which
-	// no legacy URL can address, and verification + registration bind to
-	// that copy. Rowless canonical bytes are never served, so an
-	// unverified (possibly forged) copy is unreadable; a forged copy
-	// fails the digest below and is deleted with its source. The copy
-	// runs only under a FRESHLY RENEWED lease and is bounded well inside
-	// the lease: a stale worker that lost its claim can never overwrite a
-	// successor's verified (or registered) canonical bytes, because every
-	// adoption-side canonical write happens under the exclusive lease.
-	if _, err := s.copyLegacyLFSObject(ctx, repoID, key, oid, claimOwner); err != nil {
-		return err
+	// VERIFY FIRST, publish after (Codex round 80, hardening round 78):
+	// the legacy spelling is presigned-PUT-addressable in v0.1.x, so the
+	// bytes must move to the canonical `o2/` key no legacy URL can
+	// address — but a copy taken BEFORE verification carries unverified
+	// bytes, and any interleaving (or crash) that leaves such a copy
+	// where a verified publisher just registered serves forged bytes
+	// under a trusted row. Adoption therefore verifies the SOURCE first
+	// and publishes canonically only content the digest already proved:
+	// no ordering with a verified publisher can put unverified bytes at
+	// the canonical key, and the worst crash residue is a rowless (never
+	// served) canonical blob the next touch re-verifies. The verify
+	// target is the canonical bytes when they exist (a crashed verified
+	// publish or a prior adoption's publish — re-proven either way),
+	// else the legacy source.
+	target := key
+	tctx, tcancel := context.WithTimeout(ctx, lfsProbeTimeout)
+	_, terr := s.Blob.Stat(tctx, key)
+	tcancel()
+	switch {
+	case errors.Is(terr, blob.ErrNotFound):
+		target = blob.LFSLegacyKey(repoID, oid)
+	case terr != nil:
+		return fmt.Errorf("canonical probe %s: %w", key, terr)
 	}
 	// Bounded like publication (Codex round 17) and DETACHED from the
 	// client (Codex round 31, security): adoption is server-side repair
@@ -847,21 +855,34 @@ func (s *Server) adoptLFSObject(ctx context.Context, repoID, key, oid string) er
 	// live backend COMPLETES and registers, making the work truly
 	// once-per-object, while a wedged backend still frees the op slot
 	// and verify buffer within one chunk window.
-	verifiedSize, pen, err := s.verifyStoredLFSObject(context.WithoutCancel(ctx), repoID, key, oid, claimOwner)
+	verifiedSize, pen, contentFP, err := s.verifyStoredLFSObject(context.WithoutCancel(ctx), repoID, key, target, oid, claimOwner)
 	if err != nil {
 		if !errors.Is(err, errLFSContentMismatch) {
 			return err
 		}
-		// Cross-replica coordination (Codex rounds 16+18): the delete runs
-		// inside GuardedLFSDelete, serialized against registrations — a
-		// concurrent verified upload either registered first (the guard
-		// aborts, its bytes stand) or blocks until the delete commits and
-		// then republishes via its post-registration writer verify
-		// (blob.EnsurePublished). No interleaving can leave a registered
-		// row pointing at deleted bytes. Bounded and detached from the
-		// client's connection like every cleanup.
 		dctx, dcancel := context.WithTimeout(context.WithoutCancel(ctx), lfsCleanupTimeout)
 		defer dcancel()
+		if target != key {
+			// The legacy SOURCE is provably wrong for its content
+			// address (readers of the rowless object are being served
+			// garbage): remove it, unguarded — the legacy spelling is
+			// never registered — so the next touch cannot re-verify the
+			// same bytes. The canonical key was never written.
+			if err := s.Blob.Delete(dctx, target); err != nil && !errors.Is(err, blob.ErrNotFound) {
+				return fmt.Errorf("remove mismatched legacy object %s: %w", target, err)
+			}
+			log.Printf("lfs adopt %s: removed legacy blob failing content verification", key)
+			return errLFSContentMismatch
+		}
+		// Canonical-bytes mismatch. Cross-replica coordination (Codex
+		// rounds 16+18): the delete runs inside GuardedLFSDelete,
+		// serialized against registrations — a concurrent verified
+		// upload either registered first (the guard aborts; the
+		// registered branch below re-examines) or blocks until the
+		// delete commits and then republishes via its post-registration
+		// writer verify (blob.EnsurePublished). No interleaving can
+		// leave a registered row pointing at deleted bytes. Bounded and
+		// detached from the client's connection like every cleanup.
 		deleted, derr := s.Store.GuardedLFSDelete(dctx, repoID, key, func(delCtx context.Context) error {
 			if err := s.Blob.Delete(delCtx, key); err != nil && !errors.Is(err, blob.ErrNotFound) {
 				return err
@@ -872,7 +893,39 @@ func (s *Server) adoptLFSObject(ctx context.Context, repoID, key, oid string) er
 			return fmt.Errorf("remove mismatched legacy object %s: %w", key, derr)
 		}
 		if !deleted {
-			return nil // replaced and registered by a concurrent verified upload
+			// A registered row exists. Historically that meant "a
+			// concurrent verified upload won, its bytes stand" (round
+			// 16) — but the canonical copy seam adds another ordering
+			// (Codex round 80): this adoption's own copy can land AFTER
+			// a verified publisher's upload+registration (the claim
+			// fences only adopters), overwriting verified bytes with the
+			// unverified legacy content just hashed. The digest proof is
+			// decisive either way: bytes carrying THIS fingerprint are
+			// provably not the row's content-addressed bytes. Delete
+			// them only while the fingerprint still matches — a
+			// concurrent verified/restore writer moves it, and then its
+			// bytes rightly stand. The conditional's residual race
+			// (fingerprint read → true-bytes republish → delete) at
+			// worst leaves registered-but-blobless, which self-heals
+			// (the publisher's own writer-verify republishes; a client
+			// retry repairs zero-growth) — never forged bytes served
+			// under a trusted OID.
+			fctx, fcancel := context.WithTimeout(context.WithoutCancel(ctx), lfsProbeTimeout)
+			_, nowFP, ferr := s.Blob.StatFingerprint(fctx, key)
+			fcancel()
+			switch {
+			case errors.Is(ferr, blob.ErrNotFound):
+				return errLFSContentMismatch // the corrupt bytes are already gone
+			case ferr != nil:
+				return fmt.Errorf("fingerprint mismatched registered object %s: %w", key, ferr)
+			case nowFP != contentFP:
+				return nil // replaced since the hash: the new writer's verified bytes stand
+			}
+			if err := s.Blob.Delete(dctx, key); err != nil && !errors.Is(err, blob.ErrNotFound) {
+				return fmt.Errorf("remove corrupt canonical object %s: %w", key, err)
+			}
+			log.Printf("lfs adopt %s: removed corrupt canonical bytes under a registered row (heals via writer verify or client retry)", key)
+			return errLFSContentMismatch
 		}
 		// The forged bytes came from the legacy source (the canonical
 		// copy is adoption-written only): remove it too, unguarded — the
@@ -908,6 +961,25 @@ func (s *Server) adoptLFSObject(ctx context.Context, repoID, key, oid string) er
 	// Bounded on its own window (the verify allowance above ended with
 	// the hash): a quick transaction that must not inherit an unbounded
 	// detached context.
+	if target != key {
+		// PUBLISH the digest-proven content canonically (Codex round
+		// 80): the source fingerprint sandwich inside proves the copied
+		// bytes are exactly the verified ones, so this write can never
+		// place unverified content at the canonical key — racing a
+		// verified publisher at worst overwrites identical bytes.
+		destFP, perr := s.publishVerifiedLFSObject(ctx, repoID, key, target, contentFP, verifiedSize, claimOwner)
+		if perr != nil {
+			return perr
+		}
+		if pen != nil {
+			// The midstate hashes the verified content, which is what
+			// the canonical key now provably holds: rebind the memo to
+			// the destination so a registration-failure retry (whose
+			// verify target flips to the canonical bytes) can resume
+			// instead of re-reading the whole object.
+			pen.fp = destFP
+		}
+	}
 	regCtx, regCancel := context.WithTimeout(context.WithoutCancel(ctx), lfsCleanupTimeout)
 	defer regCancel()
 	if err := s.Store.RegisterAdoptedLFSObject(regCtx, repoID, key, verifiedSize); err != nil {
@@ -952,17 +1024,16 @@ func (s *Server) adoptLFSObject(ctx context.Context, repoID, key, oid string) er
 	if _, err := s.Blob.Stat(rctx, key); err != nil {
 		return fmt.Errorf("adopted object vanished (racing sweep?): %w", err)
 	}
-	// The object now lives canonically; the legacy source is surplus —
-	// rowless, so the orphan sweep would reap it eventually — and every
-	// replica's uncounted floor keeps counting it against the quota until
-	// it disappears from listings. Best-effort delete, bounded and
-	// detached like every cleanup; a failure just leaves the conservative
-	// double-count to the sweeper's LFS opt-in (Codex security round 78).
-	lctx, lcancel := context.WithTimeout(context.WithoutCancel(ctx), lfsCleanupTimeout)
-	defer lcancel()
-	if err := s.Blob.Delete(lctx, blob.LFSLegacyKey(repoID, oid)); err != nil && !errors.Is(err, blob.ErrNotFound) {
-		log.Printf("lfs adopt %s: remove adopted legacy source: %v", key, err)
-	}
+	// The legacy source is deliberately RETAINED (Codex round 80): a
+	// rowless legacy object can have live download capabilities — a
+	// 15-minute presigned GET issued moments before this registration, a
+	// proxy stream between its stat and read, and (during a rolling
+	// upgrade) every not-yet-upgraded replica's reads — and an inline
+	// delete here would break them mid-lifetime. The source is rowless,
+	// so the ordinary age-thresholded orphan sweep (its threshold dwarfs
+	// any URL lifetime) reclaims it under the DeleteLFS opt-in; until
+	// then floors count it alongside the canonical bytes — conservative
+	// over-statement, never a quota hole.
 	return nil
 }
 
@@ -987,12 +1058,23 @@ func (s *Server) adoptLFSObject(ctx context.Context, repoID, key, oid string) er
 // still re-checks the full digest over exactly size bytes before
 // registering. Nil for single-chunk objects, whose full re-read is one
 // chunk anyway.
-func (s *Server) verifyStoredLFSObject(ctx context.Context, repo, key, oid, claimOwner string) (int64, *lfsVerifyResume, error) {
+// It also returns the content-version fingerprint the digest verdict was
+// proven against (Codex round 80) — on success the caller's canonical
+// publish sandwiches the source with it; on errLFSContentMismatch the
+// caller's cleanup may delete the corrupt bytes ONLY while that exact
+// content is still stored.
+//
+// targetKey is the blob actually read (the canonical bytes when they
+// exist, else the legacy source); key is the object's canonical identity,
+// which keys the resume cache and the fleet claim — entries carry the
+// TARGET's size and fingerprint, so a retry whose target flipped (the
+// prior attempt published canonically) discards them and re-verifies.
+func (s *Server) verifyStoredLFSObject(ctx context.Context, repo, key, targetKey, oid, claimOwner string) (size int64, pen *lfsVerifyResume, contentFP string, err error) {
 	sctx, scancel := context.WithTimeout(ctx, lfsProbeTimeout)
-	size, fp, err := s.Blob.StatFingerprint(sctx, key)
+	size, fp, err := s.Blob.StatFingerprint(sctx, targetKey)
 	scancel()
 	if err != nil {
-		return 0, nil, fmt.Errorf("stat for verification: %w", err)
+		return 0, nil, "", fmt.Errorf("stat for verification: %w", err)
 	}
 	// The hash is bounded by its own progress, never the reservation TTL
 	// (Codex security round 56): a TTL-derived cap makes objects slower
@@ -1020,7 +1102,7 @@ func (s *Server) verifyStoredLFSObject(ctx context.Context, repo, key, oid, clai
 	// repositories' adoptions). Excess adoptions deny transiently like
 	// every budget denial (the client retries, the object is unchanged).
 	if !s.reserveLFSVerifyBuffer(repo) {
-		return 0, nil, errLFSBusy
+		return 0, nil, "", errLFSBusy
 	}
 	defer s.releaseLFSVerifyBuffer(repo)
 	// Resume rather than replay (Codex round 57): an abort below — chunk
@@ -1049,7 +1131,6 @@ func (s *Server) verifyStoredLFSObject(ctx context.Context, repo, key, oid, clai
 			h = sha256.New() // defensive: never hash on a half-restored state
 		}
 	}
-	var pen *lfsVerifyResume
 	lastRenew := time.Now()
 	for off < size {
 		// The fleet-wide claim must stay live for the hash's whole
@@ -1075,7 +1156,7 @@ func (s *Server) verifyStoredLFSObject(ctx context.Context, repo, key, oid, clai
 				if off > 0 {
 					s.saveLFSVerifyResume(key, size, off, fp, h, claimOwner)
 				}
-				return 0, nil, fmt.Errorf("renew adoption claim: %w", rerr)
+				return 0, nil, "", fmt.Errorf("renew adoption claim: %w", rerr)
 			}
 			if !renewed {
 				// Lease definitively lost (expired and taken over):
@@ -1085,7 +1166,7 @@ func (s *Server) verifyStoredLFSObject(ctx context.Context, repo, key, oid, clai
 				if off > 0 {
 					s.saveLFSVerifyResume(key, size, off, fp, h, "")
 				}
-				return 0, nil, errLFSBusy
+				return 0, nil, "", errLFSBusy
 			}
 			lastRenew = time.Now()
 		}
@@ -1105,7 +1186,7 @@ func (s *Server) verifyStoredLFSObject(ctx context.Context, repo, key, oid, clai
 			}
 		}
 		cctx, ccancel := context.WithTimeout(vctx, lfsVerifyChunkTimeout)
-		chunk, err := s.Blob.ReadRange(cctx, key, off, n)
+		chunk, err := s.Blob.ReadRange(cctx, targetKey, off, n)
 		ccancel()
 		if err != nil {
 			// The lease is still this process's: park it with the
@@ -1113,7 +1194,7 @@ func (s *Server) verifyStoredLFSObject(ctx context.Context, repo, key, oid, clai
 			if off > 0 {
 				s.saveLFSVerifyResume(key, size, off, fp, h, claimOwner)
 			}
-			return 0, nil, fmt.Errorf("read for verification [%d,%d): %w", off, off+n, err)
+			return 0, nil, "", fmt.Errorf("read for verification [%d,%d): %w", off, off+n, err)
 		}
 		h.Write(chunk)
 		off += n
@@ -1128,18 +1209,18 @@ func (s *Server) verifyStoredLFSObject(ctx context.Context, repo, key, oid, clai
 	// therefore fails transiently: the retry hashes the current bytes,
 	// with any parked resume discarded by its own fingerprint binding.
 	ectx, ecancel := context.WithTimeout(ctx, lfsProbeTimeout)
-	_, endFP, err := s.Blob.StatFingerprint(ectx, key)
+	_, endFP, err := s.Blob.StatFingerprint(ectx, targetKey)
 	ecancel()
 	if err != nil {
-		return 0, nil, fmt.Errorf("fingerprint after verification: %w", err)
+		return 0, nil, "", fmt.Errorf("fingerprint after verification: %w", err)
 	}
 	if endFP != fp {
-		return 0, nil, fmt.Errorf("object %s replaced during verification: %w", key, errLFSBusy)
+		return 0, nil, "", fmt.Errorf("object %s replaced during verification: %w", targetKey, errLFSBusy)
 	}
 	if hex.EncodeToString(h.Sum(nil)) != oid {
-		return 0, nil, errLFSContentMismatch
+		return 0, nil, fp, errLFSContentMismatch
 	}
-	return size, pen, nil
+	return size, pen, fp, nil
 }
 
 // lfsRepairCoverSuffix — see ref.RepairCoverSuffix (shared with the pack
@@ -1300,31 +1381,16 @@ func (s *Server) parkLFSClaimOwner(key, owner string) bool {
 // when canonical bytes already existed and no copy ran). Callers hold the
 // per-key slot and the fleet adoption claim; the copy itself re-renews the
 // lease first — see the call site's rationale in adoptLFSObject.
-func (s *Server) copyLegacyLFSObject(ctx context.Context, repoID, key, oid, claimOwner string) (int64, error) {
-	assertf(claimOwner != "", "copyLegacyLFSObject(%q): no claim", key)
-	// A prior attempt's copy (or a concurrent verified upload's publish)
-	// already placed canonical bytes: verify THOSE — re-copying would
-	// rewrite the object, discarding any fingerprint-bound resume
-	// progress, and the digest decides the existing bytes' fate anyway.
-	pctx, pcancel := context.WithTimeout(ctx, lfsProbeTimeout)
-	_, err := s.Blob.Stat(pctx, key)
-	pcancel()
-	if err == nil {
-		return 0, nil
-	}
-	if !errors.Is(err, blob.ErrNotFound) {
-		return 0, fmt.Errorf("canonical probe %s: %w", key, err)
-	}
-	legacyKey := blob.LFSLegacyKey(repoID, oid)
-	sctx, scancel := context.WithTimeout(ctx, lfsProbeTimeout)
-	size, err := s.Blob.Stat(sctx, legacyKey)
-	scancel()
-	if err != nil {
-		// ErrNotFound included: with neither spelling present the object
-		// is genuinely missing — the caller's error path has the client
-		// re-upload through the verified proxy.
-		return 0, fmt.Errorf("legacy source %s: %w", legacyKey, err)
-	}
+// publishVerifiedLFSObject copies DIGEST-PROVEN legacy bytes to the
+// canonical key (Codex round 80): verification already matched the oid
+// against the source content carrying contentFP, and the fingerprint
+// sandwich below proves the copy carried exactly that content — so this
+// is the only adoption-side canonical write and it can never place
+// unverified bytes there (racing a verified publisher at worst overwrites
+// identical bytes). Returns the destination's fingerprint for the
+// registration-retry memo, best-effort ("" when unavailable).
+func (s *Server) publishVerifiedLFSObject(ctx context.Context, repoID, key, legacyKey, contentFP string, size int64, claimOwner string) (string, error) {
+	assertf(claimOwner != "" && contentFP != "", "publishVerifiedLFSObject(%q)", key)
 	doCopy := func(opCtx context.Context) error {
 		// Lease fence: renew immediately before the copy and bound the
 		// copy WELL inside the fresh ref.AdoptionClaimTTL. Only the live
@@ -1355,12 +1421,46 @@ func (s *Server) copyLegacyLFSObject(ctx context.Context, repoID, key, oid, clai
 	// large object on every retry. The copy stays bounded above and, when
 	// covered below, cancels on cover-continuity loss.
 	dctx := context.WithoutCancel(ctx)
+	// sandwich re-fingerprints the SOURCE after the copy: equality with
+	// contentFP proves the (atomic-snapshot) copy carried the verified
+	// content. A moved fingerprint means the copied bytes are suspect —
+	// delete the canonical copy and deny transiently. The delete is safe:
+	// either the bytes are our unregistered copy (rowless, never served),
+	// or a racing verified publisher's — whose own writer verify or the
+	// client's zero-growth retry republishes them (the same self-healing
+	// every registered-but-blobless state uses). A crash before the
+	// sandwich leaves at worst a rowless suspect blob the next touch
+	// re-verifies as its canonical target.
+	sandwich := func() (string, error) {
+		fctx, fcancel := context.WithTimeout(dctx, lfsProbeTimeout)
+		_, srcFP, err := s.Blob.StatFingerprint(fctx, legacyKey)
+		fcancel()
+		if err == nil && srcFP == contentFP {
+			// Best-effort destination fingerprint for the retry memo.
+			dfctx, dfcancel := context.WithTimeout(dctx, lfsProbeTimeout)
+			_, destFP, derr := s.Blob.StatFingerprint(dfctx, key)
+			dfcancel()
+			if derr != nil {
+				return "", nil
+			}
+			return destFP, nil
+		}
+		delCtx, delCancel := context.WithTimeout(dctx, lfsCleanupTimeout)
+		defer delCancel()
+		if derr := s.Blob.Delete(delCtx, key); derr != nil && !errors.Is(derr, blob.ErrNotFound) {
+			return "", fmt.Errorf("remove suspect canonical copy %s: %w", key, derr)
+		}
+		if err != nil {
+			return "", fmt.Errorf("fingerprint source after publish %s: %w", legacyKey, err)
+		}
+		return "", fmt.Errorf("source %s replaced during publish: %w", legacyKey, errLFSBusy)
+	}
 	if size <= 0 || s.PackQuotaBytes <= 0 {
 		// No floors to protect (quota disabled) or nothing to account.
 		if err := doCopy(dctx); err != nil {
-			return 0, err
+			return "", err
 		}
-		return size, nil
+		return sandwich()
 	}
 	// Stale-floor cover (the round-57/58 pattern): the copy creates NEW
 	// physical bytes invisible both to floors scanned before it and to
@@ -1381,14 +1481,14 @@ func (s *Server) copyLegacyLFSObject(ctx context.Context, repoID, key, oid, clai
 	}
 	copyErr, renewErr := blob.WithRenewedCover(dctx, renewCover, doCopy, nil)
 	if copyErr != nil {
-		return 0, fmt.Errorf("adoption copy %s: %w", key, copyErr)
+		return "", fmt.Errorf("adoption publish %s: %w", key, copyErr)
 	}
 	if renewErr != nil {
 		// The bytes are durable and the cover tail broke: log like the
 		// restore paths — the next admission's fresh floor lists them.
-		log.Printf("lfs adopt %s: copy cover tail: %v", key, renewErr)
+		log.Printf("lfs adopt %s: publish cover tail: %v", key, renewErr)
 	}
-	return size, nil
+	return sandwich()
 }
 
 // releaseAdoptionClaim best-effort frees a fleet adoption claim on a
@@ -2143,5 +2243,25 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target r
 		}
 		s.invalidateUsageFloor(repoID)
 	}
+	s.maybeLegacyCompatCopy(ctx, repoID, oid, key)
 	w.WriteHeader(http.StatusOK)
+}
+
+// maybeLegacyCompatCopy maintains the v0.2.0 read surface during a rolling
+// upgrade (ADR-41, Codex round 80): with LFSV020WriteCompat set, a
+// verified publication is also copied to the legacy spelling so
+// not-yet-upgraded replicas — which derive only that key — keep serving
+// the object until the fleet rolls. Best-effort and detached: compat is an
+// availability bridge, never a correctness dependency (the canonical copy
+// stays the registered truth), and a failure just means old replicas 404
+// this object as they would any post-upgrade upload.
+func (s *Server) maybeLegacyCompatCopy(ctx context.Context, repoID, oid, key string) {
+	if !s.LFSV020WriteCompat {
+		return
+	}
+	cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), lfsCleanupTimeout)
+	defer cancel()
+	if err := s.Blob.Copy(cctx, blob.LFSLegacyKey(repoID, oid), key); err != nil {
+		log.Printf("lfs compat copy %s: %v", key, err)
+	}
 }

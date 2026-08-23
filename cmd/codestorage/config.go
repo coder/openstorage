@@ -104,6 +104,10 @@ const (
 	// so a replica needs a disk bound independent of the per-repo quota
 	// (which is per-repository and may be disabled). "0" disables.
 	envLFSStagingBytes = "CODESTORAGE_LFS_STAGING_BYTES"
+	// envLFSV020WriteCompat keeps the v0.2.0 LFS read surface alive
+	// during a rolling upgrade (ADR-41): set to "1"/"true" on upgraded
+	// replicas until the fleet rolls, then drop it.
+	envLFSV020WriteCompat = "CODESTORAGE_LFS_V020_WRITE_COMPAT"
 
 	// Background repack (issue #1): registered-pack count at which a
 	// post-write trigger schedules a fold ("0" disables triggering).
@@ -237,6 +241,10 @@ type serveConfig struct {
 	// lfsStagingBytes caps aggregate in-flight LFS upload staging per
 	// replica (issue #51); 0 disables.
 	lfsStagingBytes int64
+
+	// lfsV020WriteCompat dual-publishes LFS objects to the legacy
+	// spelling during a rolling upgrade (ADR-41); default off.
+	lfsV020WriteCompat bool
 	// packQuotaBytes is the per-repo pack-bytes quota on the git surface
 	// (issue #21); 0 disables enforcement.
 	packQuotaBytes int64
@@ -389,6 +397,12 @@ func resolveServeConfig(getenv func(string) string, flagListen, flagAddr, flagCa
 	cfg.lfsStagingBytes, err = resolveLFSStagingBytes(getenv)
 	if err != nil {
 		return serveConfig{}, err
+	}
+	if raw := getenv(envLFSV020WriteCompat); raw != "" {
+		cfg.lfsV020WriteCompat, err = strconv.ParseBool(raw)
+		if err != nil {
+			return serveConfig{}, fmt.Errorf("%s: %w", envLFSV020WriteCompat, err)
+		}
 	}
 	cfg.maxPushBytes, err = resolveMaxPushBytes(getenv, cfg.packQuotaBytes)
 	if err != nil {

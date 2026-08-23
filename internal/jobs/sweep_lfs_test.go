@@ -80,8 +80,9 @@ func TestSweepLFS_ListOnlyReportsWithoutDeleting(t *testing.T) {
 
 // TestSweepLFS_LegacySpellingSweepsAsLFS (ADR-41, Codex security round
 // 78): the v0.1.x single-key spelling must classify as LFS — never foreign
-// — and sweep exactly like a canonical orphan: adoption leaves its legacy
-// source rowless (best-effort deleted, this is the failure path), and a
+// — and sweep exactly like a canonical orphan: adoption RETAINS its legacy
+// source (live presigned GETs and mid-roll old replicas still read it —
+// round 80), leaving this sweep as the designed reclamation path, and a
 // registered CANONICAL row must not make the legacy spelling live.
 func TestSweepLFS_LegacySpellingSweepsAsLFS(t *testing.T) {
 	f := newSweepFixture(t)

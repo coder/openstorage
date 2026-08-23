@@ -41,4 +41,11 @@ spelling. Registration migrates such a row in place — transactionally,
 zero-growth — on the object's first write-scoped touch under the upgraded
 binary, so neither the usage counter nor the object-count cap
 double-charges v0.2.0-era objects; until migrated they read from the
-legacy blob exactly as v0.2.0 served them.
+legacy blob exactly as v0.2.0 served them. Rolling-upgrade races that
+strand a legacy row alongside the canonical one are reconciled by
+registration and by the sweeper's janitor, refunding the double-charge.
+Adopted legacy sources are retained (live presigned GETs and mid-roll old
+replicas may still read them) and reclaimed by the age-thresholded orphan
+sweep; `CODESTORAGE_LFS_V020_WRITE_COMPAT` additionally dual-publishes
+fresh uploads to the legacy spelling so not-yet-upgraded replicas keep
+serving LFS reads until the fleet finishes rolling.

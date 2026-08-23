@@ -10,6 +10,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -705,6 +706,13 @@ func TestLFSAdoption_ImmuneToLegacyPresignReplay(t *testing.T) {
 	if has, err := st.HasLFSObject(ctx, lfsTestRepoID, key); err != nil || !has {
 		t.Fatalf("object not adopted: %v, %v", has, err)
 	}
+	// The legacy source is RETAINED after adoption (Codex round 80): a
+	// presigned GET issued moments before the registration must survive
+	// its 15-minute lifetime, and mid-roll v0.2.0 replicas can only read
+	// this spelling. The age-thresholded sweep reclaims it later.
+	if _, err := srv.Blob.Stat(ctx, legacyKey); err != nil {
+		t.Fatalf("adopted legacy source missing: %v — must be retained for live URL lifetimes", err)
+	}
 	// The still-valid legacy presigned PUT replays with forged bytes (any
 	// size — the attacker controls the body entirely).
 	forged := []byte("forged replacement written through the legacy presigned URL")
@@ -795,6 +803,134 @@ func TestLFSDownload_RetriesCanonicalAfterAdoptionRace(t *testing.T) {
 	}
 }
 
+// TestLFSAdopt_CorruptCanonicalUnderRegisteredRowIsRemoved (Codex round
+// 80): an adoption's canonical copy can land AFTER a verified publisher's
+// upload+registration (the fleet claim fences only adopters), overwriting
+// verified bytes with unverified legacy content. The old mismatch path
+// then declined to delete because the registry row existed — leaving
+// forged bytes served under a trusted OID forever. Bytes that provably
+// fail their key's digest must be removed even under a registered row
+// (fingerprint-conditionally, so a concurrent true-bytes republish
+// stands); the registered-but-blobless remainder self-heals.
+func TestLFSAdopt_CorruptCanonicalUnderRegisteredRowIsRemoved(t *testing.T) {
+	ctx := context.Background()
+	srv, st, _ := newLFSQuotaServer(t, 0, time.Hour)
+	content := []byte("the true registered content")
+	oid := sha256Hex(content)
+	key := blob.LFSKey(lfsTestRepoID, oid)
+	// The verified publisher registered the true bytes…
+	if err := st.RegisterLFSObject(ctx, lfsTestRepoID, key, int64(len(content))); err != nil {
+		t.Fatal(err)
+	}
+	// …but the adoption's late copy overwrote them with the legacy
+	// content (the fabricated end state of the race), sourced from a
+	// forged legacy blob.
+	forged := []byte("forged legacy bytes copied late")
+	if err := srv.Blob.UploadFile(ctx, key, writeTempFile(t, forged)); err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.Blob.UploadFile(ctx, blob.LFSLegacyKey(lfsTestRepoID, oid), writeTempFile(t, forged)); err != nil {
+		t.Fatal(err)
+	}
+	// This adoption's registered early-out predated the publisher's
+	// commit: it believes the object is rowless.
+	srv.Store = &staleRegistryOnce{RefStore: srv.Store}
+
+	err := srv.adoptLFSObject(ctx, lfsTestRepoID, key, oid)
+	if !errors.Is(err, errLFSContentMismatch) {
+		t.Fatalf("adopt over corrupt registered canonical = %v, want errLFSContentMismatch", err)
+	}
+	if _, serr := srv.Blob.Stat(ctx, key); serr == nil {
+		t.Fatal("forged canonical bytes still stored under the registered row")
+	}
+	// The row survives: registered-but-blobless heals via the publisher's
+	// writer verify or the client's zero-growth re-upload.
+	if has, herr := st.HasLFSObject(ctx, lfsTestRepoID, key); herr != nil || !has {
+		t.Fatalf("row after corrupt-bytes cleanup = (%v, %v), want intact", has, herr)
+	}
+}
+
+// swapOnPublishBlob replaces the SOURCE with forged bytes at the moment
+// the adoption's canonical publish copy runs — the copy then carries
+// content the verification never hashed.
+type swapOnPublishBlob struct {
+	blob.BlobStore
+	forged []byte
+	tmp    string
+}
+
+func (b *swapOnPublishBlob) Copy(ctx context.Context, dstKey, srcKey string) error {
+	// Outlast the coarse mtime tick so the file backend's mtime-derived
+	// fingerprint provably moves (see bucketStatFingerprint's caveat).
+	time.Sleep(25 * time.Millisecond)
+	if err := b.BlobStore.UploadFile(ctx, srcKey, b.tmp); err != nil {
+		return err
+	}
+	return b.BlobStore.Copy(ctx, dstKey, srcKey)
+}
+
+// TestLFSAdopt_PublishSandwichCatchesSourceSwap (Codex round 80): the
+// canonical publish copies the source AFTER verification — if a
+// still-valid legacy presigned PUT swaps the source in that window, the
+// copy carries bytes the digest never proved. The source-fingerprint
+// sandwich must catch the swap, delete the suspect canonical copy, and
+// deny transiently; nothing may register.
+func TestLFSAdopt_PublishSandwichCatchesSourceSwap(t *testing.T) {
+	ctx := context.Background()
+	srv, st, _ := newLFSQuotaServer(t, 0, time.Hour)
+	legacy := []byte("true bytes verified pre-publish")
+	oid := sha256Hex(legacy)
+	key := blob.LFSKey(lfsTestRepoID, oid)
+	legacyKey := blob.LFSLegacyKey(lfsTestRepoID, oid)
+	if err := srv.Blob.UploadFile(ctx, legacyKey, writeTempFile(t, legacy)); err != nil {
+		t.Fatal(err)
+	}
+	forged := []byte("forged bytes swapped mid-publish!")
+	srv.Blob = &swapOnPublishBlob{BlobStore: srv.Blob, forged: forged, tmp: writeTempFile(t, forged)}
+
+	err := srv.adoptLFSObject(ctx, lfsTestRepoID, key, oid)
+	if err == nil {
+		t.Fatal("adoption succeeded across a mid-publish source swap")
+	}
+	if has, herr := st.HasLFSObject(ctx, lfsTestRepoID, key); herr != nil || has {
+		t.Fatalf("registered after source swap = (%v, %v), want unregistered", has, herr)
+	}
+	if _, serr := srv.Blob.Stat(ctx, key); serr == nil {
+		t.Fatal("suspect canonical copy retained after the sandwich caught the swap")
+	}
+}
+
+// TestLFSPut_V020WriteCompatDualPublishes (Codex round 80, ADR-41):
+// during a rolling upgrade, old v0.2.0 replicas derive only the legacy
+// spelling — with the compat flag set, a verified publication must also
+// land there so mid-roll reads keep working; without it, publication is
+// canonical-only.
+func TestLFSPut_V020WriteCompatDualPublishes(t *testing.T) {
+	for name, compat := range map[string]bool{"compat-on": true, "compat-off": false} {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			srv, _, mint := newLFSQuotaServer(t, 0, time.Hour)
+			srv.LFSV020WriteCompat = compat
+			tok := mint(auth.ScopeGitWrite)
+			content := []byte("dual-published during the roll")
+			oid := sha256Hex(content)
+			w := doLFS(t, srv, http.MethodPut, "/"+lfsTestRepoURL+".git/info/lfs/objects/"+oid,
+				"basic:"+tok, string(content))
+			if w.Code != http.StatusOK {
+				t.Fatalf("PUT status = %d, body %s", w.Code, w.Body)
+			}
+			size, err := srv.Blob.Stat(ctx, blob.LFSLegacyKey(lfsTestRepoID, oid))
+			if compat {
+				if err != nil || size != int64(len(content)) {
+					t.Fatalf("legacy compat copy = (%d, %v), want the published bytes", size, err)
+				}
+			} else if err == nil {
+				t.Fatal("compat-off publication wrote the legacy spelling")
+			}
+		})
+	}
+}
+
 // coverCountingStore counts repair-cover reservations (key suffix
 // ref.RepairCoverSuffix) passing through ReservePackBytes.
 type coverCountingStore struct {
@@ -871,7 +1007,13 @@ func TestLFSAdoption_RegistrationRetryReverifiesReplacedBlob(t *testing.T) {
 		t.Fatalf("adoption with failed registration reported stored: %+v", resp.Objects[0])
 	}
 	// The still-valid legacy presigned PUT swaps in same-length forged
-	// bytes while the completed verification is parked.
+	// bytes while the completed verification is parked. The pause outlasts
+	// the kernel's coarse mtime tick: the FILE backend's fingerprint is
+	// mtime-derived (see bucketStatFingerprint's granularity caveat), and
+	// this test proves the fingerprint BINDING, which needs the rewrite to
+	// be distinguishable — production S3 ETags are content-derived and
+	// need no such spacing.
+	time.Sleep(25 * time.Millisecond)
 	forged := []byte("forged 12b!!")
 	if len(forged) != len(legacy) {
 		t.Fatal("fixture: forged bytes must match the legacy length")
@@ -2084,12 +2226,12 @@ func TestLFSAdoption_PostRegistrationRecheckIsBounded(t *testing.T) {
 	if err := srv.Blob.UploadFile(context.Background(), blob.LFSLegacyKey(lfsTestRepoID, oid), writeTempFile(t, legacy)); err != nil {
 		t.Fatal(err)
 	}
-	// Stat calls on the adoption path (round 78 key split): 1 = batch
-	// legacy probe, 2 = copy's canonical probe, 3 = copy's legacy source
-	// stat; 4 = the post-registration recheck, which wedges.
-	// (Verification's start/end stats go through StatFingerprint — round
-	// 77 — which this wrapper passes through.)
-	srv.Blob = &wedgedStatBlob{BlobStore: srv.Blob, after: 4}
+	// Stat calls on the adoption path (rounds 78+80): 1 = batch legacy
+	// probe, 2 = the verify-target canonical probe; 3 = the
+	// post-registration recheck, which wedges. (Verification and the
+	// publish sandwich go through StatFingerprint — round 77 — which
+	// this wrapper passes through.)
+	srv.Blob = &wedgedStatBlob{BlobStore: srv.Blob, after: 3}
 
 	start := time.Now()
 	resp := decodeBatch(t, doLFS(t, srv, http.MethodPost, lfsBatchPath, "basic:"+tok,
