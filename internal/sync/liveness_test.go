@@ -122,4 +122,11 @@ func TestSyncRequestDuringClaimedRunIsObserved(t *testing.T) {
 	if up.SyncPending {
 		t.Errorf("SyncPending still set after the follow-up run: %+v", up)
 	}
+
+	// Lifecycle ordering: the finisher requeues strictly AFTER emitting
+	// its terminal event, so the follow-up's started event can never
+	// overtake the finished run's succeeded event.
+	<-runDone // the follow-up run completed (its events are recorded)
+	assertEventTypes(t, f.rec.list(),
+		EventSyncStarted, EventSyncSucceeded, EventSyncStarted, EventSyncSucceeded)
 }
