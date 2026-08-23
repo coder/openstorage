@@ -484,7 +484,25 @@ func (s *Server) lfsBatchUpload(r *http.Request, repoElem string, target repoTar
 				lfsObjectFail(&results[i], http.StatusInternalServerError, "object storage unavailable")
 				continue
 			}
-			// Nothing stored anywhere: a genuinely new upload.
+			// Nothing stored anywhere — but a v0.2.0 legacy-spelled ROW
+			// may survive without its blob (Codex round 87): that object
+			// is a zero-growth REPAIR, not a new upload — registration
+			// migrates the row in place, adding no count and no bytes,
+			// with the repair cover accounting the returning bytes.
+			// Classifying it as new made byte-quota and object-cap
+			// denials PERMANENT: a 507 with no upload action leaves
+			// nothing that could ever repair the row.
+			if !checked[key] {
+				legacyRegistered, rerr := s.Store.HasLFSObject(ctx, repoID, blob.LFSLegacyKey(repoID, obj.OID))
+				if rerr != nil {
+					log.Printf("lfs registry %s: %v", key, rerr)
+					checked[key] = true
+					checkFailed[key] = true
+					lfsObjectFail(&results[i], http.StatusInternalServerError, "object registry unavailable")
+					continue
+				}
+				registered = legacyRegistered
+			}
 		}
 		if !checked[key] {
 			checked[key] = true
@@ -2036,6 +2054,22 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target r
 		log.Printf("lfs registry %s: %v", key, err)
 		lfsError(w, http.StatusInternalServerError, "object registry unavailable")
 		return
+	}
+	if !registered {
+		// A v0.2.0 legacy-spelled row without its blob is a zero-growth
+		// repair too (Codex round 87): registration migrates the row in
+		// place — no count, no bytes — so this PUT must be admitted
+		// like every registered-but-blobless repair, not denied as
+		// fresh growth at the byte quota or object cap (a denial is
+		// PERMANENT: no other flow can ever repair the row). The entry
+		// probe already proved both spellings blobless — a present
+		// legacy blob takes the adoption path above instead.
+		registered, err = s.Store.HasLFSObject(ctx, repoID, blob.LFSLegacyKey(repoID, oid))
+		if err != nil {
+			log.Printf("lfs registry %s: %v", key, err)
+			lfsError(w, http.StatusInternalServerError, "object registry unavailable")
+			return
+		}
 	}
 	// repair records whether this PUT is a zero-growth REPAIR — a row
 	// that predates the request whose blob the entry probe found missing
