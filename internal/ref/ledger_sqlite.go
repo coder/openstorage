@@ -199,6 +199,15 @@ func (s *SQLite) ReclaimRetainedPack(ctx context.Context, repo, key string) (int
 		`UPDATE pack_usage SET bytes = MAX(bytes - ?, 0) WHERE repo = ?`, bytes, repo); err != nil {
 		return 0, err
 	}
+	// Floor-generation bump atomic with the debit (Codex round 59,
+	// security) — see the PG twin's rationale.
+	if bytes > 0 {
+		if _, err := tx.ExecContext(ctx, `
+INSERT INTO lfs_adoption_gens (repo, gen) VALUES (?, 1)
+ON CONFLICT (repo) DO UPDATE SET gen = lfs_adoption_gens.gen + 1`, baseRepoOf(repo)); err != nil {
+			return 0, err
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		return 0, fmt.Errorf("reclaim retained commit: %w", err)
 	}

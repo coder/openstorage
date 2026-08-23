@@ -531,8 +531,24 @@ func (s *PG) ReclaimRetainedPack(ctx context.Context, repo, key string) (int64, 
 		// GREATEST clamps defensively: the counter going negative would
 		// mean a double-debit bug, and clamping keeps admission sane (a
 		// too-small counter is still floored by the caller's listing).
-		_, err := tx.Exec(ctx,
-			`UPDATE pack_usage SET bytes = GREATEST(bytes - $2, 0) WHERE repo = $1`, repo, bytes)
+		if _, err := tx.Exec(ctx,
+			`UPDATE pack_usage SET bytes = GREATEST(bytes - $2, 0) WHERE repo = $1`, repo, bytes); err != nil {
+			return err
+		}
+		if bytes == 0 {
+			return nil
+		}
+		// The debit shrinks the counter AFTER floors snapshotted it
+		// (Codex round 59, security): a floor scanned between the aged
+		// blob's deletion and this debit cached max(0, listing−counter)
+		// with the retained bytes still in the counter — deflated by up
+		// to the retained size, hiding equally sized rowless legacy
+		// bytes. Bump the shared floor generation atomically with the
+		// debit (the counter-decrease twin of the adoption bump) so
+		// every replica's floor from that window re-scans.
+		_, err := tx.Exec(ctx, `
+INSERT INTO lfs_adoption_gens (repo, gen) VALUES ($1, 1)
+ON CONFLICT (repo) DO UPDATE SET gen = lfs_adoption_gens.gen + 1`, baseRepoOf(repo))
 		return err
 	})
 	if err != nil {

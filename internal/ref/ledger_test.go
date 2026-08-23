@@ -651,8 +651,23 @@ func TestRetainedBytesGateAdmission(t *testing.T) {
 		}
 		// Reclaiming a's blob (the sweeper's safeDelete moment) frees its
 		// headroom; the fitting push is admitted again.
+		gen0, err := s.LFSAdoptionGen(ctx, k.base())
+		if err != nil {
+			t.Fatal(err)
+		}
 		if got, err := s.ReclaimRetainedPack(ctx, k.base(), a.Key); err != nil || got != 10 {
 			t.Fatalf("ReclaimRetainedPack = %d, %v; want 10", got, err)
+		}
+		// The debit shrinks the counter AFTER floors snapshotted it
+		// (Codex round 59, security): the reclaim must bump the shared
+		// floor generation atomically, or a floor scanned between the
+		// aged blob's deletion and this debit keeps hiding legacy bytes.
+		gen1, err := s.LFSAdoptionGen(ctx, k.base())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if gen1 == gen0 {
+			t.Fatal("ReclaimRetainedPack did not bump the shared floor generation with its debit")
 		}
 		k.wantState(45, 0, 20)
 		if got, err := s.ReclaimRetainedPack(ctx, k.base(), a.Key); err != nil || got != 0 {
