@@ -2042,6 +2042,57 @@ func TestLFSAdopt_CapRaceWinnerRepairsBridge(t *testing.T) {
 	}
 }
 
+// legacyTwinOnCapCountStore registers this OID's LEGACY row just before
+// the PUT's cap count reads — a mid-roll old replica registering the same
+// object between the entry lookup and the count.
+type legacyTwinOnCapCountStore struct {
+	ref.RefStore
+	repo, legacyKey string
+	size            int64
+	done            atomic.Bool
+}
+
+func (s *legacyTwinOnCapCountStore) CountLFSObjects(ctx context.Context, repo string) (int64, error) {
+	if !s.done.Swap(true) {
+		if err := s.RefStore.RegisterLFSObject(ctx, s.repo, s.legacyKey, s.size); err != nil {
+			return 0, err
+		}
+	}
+	return s.RefStore.CountLFSObjects(ctx, repo)
+}
+
+// TestLFSPut_CapRaceRechecksLegacyRow (Codex round 99, the PUT twin of the
+// adoption path's round-86 recheck): mid-roll, an old replica can register
+// this OID's LEGACY row between the PUT's entry lookup and its cap count —
+// the boundary recheck consulted only the canonical spelling and answered
+// 507, even though registration migrates the legacy row in place and adds
+// no object.
+func TestLFSPut_CapRaceRechecksLegacyRow(t *testing.T) {
+	old := ref.MaxLFSObjectsPerRepo
+	ref.MaxLFSObjectsPerRepo = 1
+	t.Cleanup(func() { ref.MaxLFSObjectsPerRepo = old })
+	ctx := context.Background()
+	srv, st, mint := newLFSQuotaServer(t, 0, time.Hour)
+	tok := mint(auth.ScopeGitWrite)
+	content := []byte("legacy twin lands mid-race")
+	oid := sha256Hex(content)
+	key := blob.LFSKey(lfsTestRepoID, oid)
+	legacyKey := blob.LFSLegacyKey(lfsTestRepoID, oid)
+	srv.Store = &legacyTwinOnCapCountStore{RefStore: st, repo: lfsTestRepoID, legacyKey: legacyKey, size: int64(len(content))}
+
+	w := doLFS(t, srv, http.MethodPut, "/"+lfsTestRepoURL+".git/info/lfs/objects/"+oid,
+		"basic:"+tok, string(content))
+	if w.Code != http.StatusOK {
+		t.Fatalf("PUT racing a legacy-row twin at the cap = %d, body %s — migration adds no object, the cap must not deny it", w.Code, w.Body)
+	}
+	if has, err := st.HasLFSObject(ctx, lfsTestRepoID, key); err != nil || !has {
+		t.Fatalf("canonical row = (%v, %v), want migrated in place", has, err)
+	}
+	if has, err := st.HasLFSObject(ctx, lfsTestRepoID, legacyKey); err != nil || has {
+		t.Fatalf("legacy row = (%v, %v), want migrated away", has, err)
+	}
+}
+
 // TestLFSCompat_RepairSerializedOnLegacyClaim (Codex security round 85):
 // the batch fast path's bridge repair launched an unserialized full copy —
 // every tiny concurrent touch of the object started another one. Compat
