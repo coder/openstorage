@@ -124,8 +124,8 @@ func (f *purgeFixture) assertIntact(base string) {
 	if n, err := f.store.(RepoPurgeRegistry).CountRepoRows(ctx, blob.QuotaRepoGroup(base)); err != nil || n != 4 {
 		f.t.Fatalf("CountRepoRows(%s) = %d err=%v (want 4: ref + 2 packs + lfs)", base, n, err)
 	}
-	if _, found, err := f.meta.(RepoPurgeMeta).RepoPurgeState(ctx, base); err != nil || !found {
-		f.t.Fatalf("meta row of %s missing: found=%v err=%v", base, found, err)
+	if state, found, err := f.meta.(RepoPurgeMeta).RepoPurgeState(ctx, base); err != nil || !found || state.PurgedAt != nil {
+		f.t.Fatalf("meta row of %s missing or stamped: found=%v state=%+v err=%v", base, found, state, err)
 	}
 }
 
@@ -144,8 +144,11 @@ func (f *purgeFixture) assertPurged(base string) {
 	if n, err := f.store.(RepoPurgeRegistry).CountRepoRows(ctx, group); err != nil || n != 0 {
 		f.t.Fatalf("CountRepoRows(%s) = %d err=%v (want 0)", base, n, err)
 	}
-	if _, found, err := f.meta.(RepoPurgeMeta).RepoPurgeState(ctx, base); err != nil || found {
-		f.t.Fatalf("meta row of %s survived: found=%v err=%v", base, found, err)
+	// The repos row is KEPT as the permanent name tombstone, stamped
+	// purged_at (the completion commit).
+	state, found, err := f.meta.(RepoPurgeMeta).RepoPurgeState(ctx, base)
+	if err != nil || !found || state.PurgedAt == nil {
+		f.t.Fatalf("purge tombstone of %s wrong: found=%v state=%+v err=%v", base, found, state, err)
 	}
 	if state, err := f.store.QuotaLedgerState(ctx, group, time.Hour); err != nil ||
 		state.UsageBytes != 0 || state.ReservedBytes != 0 || state.RetainedBytes != 0 {
@@ -190,13 +193,14 @@ func TestRepoPurge_EndToEnd(t *testing.T) {
 		}
 	}
 
-	// The purge released the burned name.
-	if _, err := f.meta.CreateRepo(context.Background(), f.org, victim.URL, "main"); err != nil {
-		t.Fatalf("name not released: %v", err)
+	// The burned name is NEVER released (URL-scoped tokens may outlive
+	// any retention — Codex security round on #105).
+	if _, err := f.meta.CreateRepo(context.Background(), f.org, victim.URL, "main"); !errors.Is(err, meta.ErrAlreadyExists) {
+		t.Fatalf("purge released the burned name: CreateRepo = %v, want ErrAlreadyExists", err)
 	}
-	// Idempotence: purging again reports not-found.
-	if _, err := f.purger(sweeper, 0).PurgeRepo(context.Background(), victim.RepoID); !errors.Is(err, meta.ErrNotFound) {
-		t.Fatalf("re-purge = %v, want ErrNotFound", err)
+	// Idempotence: purging again reports already-purged.
+	if _, err := f.purger(sweeper, 0).PurgeRepo(context.Background(), victim.RepoID); !errors.Is(err, ErrRepoAlreadyPurged) {
+		t.Fatalf("re-purge = %v, want ErrRepoAlreadyPurged", err)
 	}
 }
 

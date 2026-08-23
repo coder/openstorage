@@ -136,11 +136,12 @@ func TestCmdPurgeRepo(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer ms.Close()
-	if _, found, err := ms.(jobs.RepoPurgeMeta).RepoPurgeState(ctx, deleted.RepoID); err != nil || found {
-		t.Fatalf("purged repo row survived: found=%v err=%v", found, err)
+	// The repos row is kept as a stamped name tombstone (never released).
+	if state, found, err := ms.(jobs.RepoPurgeMeta).RepoPurgeState(ctx, deleted.RepoID); err != nil || !found || state.PurgedAt == nil {
+		t.Fatalf("purge tombstone wrong: found=%v state=%+v err=%v", found, state, err)
 	}
-	// Re-purging reports not-found (idempotent completion).
-	if err := cmdPurgeRepo(ctx, []string{"--data-dir", dir, "--yes", deleted.RepoID}); err == nil || !strings.Contains(err.Error(), "not found") {
-		t.Fatalf("re-purge = %v, want not-found", err)
+	// Re-purging reports already-purged (idempotent completion).
+	if err := cmdPurgeRepo(ctx, []string{"--data-dir", dir, "--yes", deleted.RepoID}); err == nil || !strings.Contains(err.Error(), "already purged") {
+		t.Fatalf("re-purge = %v, want already-purged", err)
 	}
 }

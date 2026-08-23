@@ -11,9 +11,11 @@
 // so no crash point can leave a committed ref pointing at deleted bytes —
 // only reapable tombstones and orphan-class blobs. The soft-deleted repos
 // row is the durable marker that drives resumption: every phase is
-// idempotent, a crash anywhere resumes on the next pass, and deleting the
-// repos row is the completion commit (which also releases the burned name —
-// restore after purge is impossible).
+// idempotent, a crash anywhere resumes on the next pass, and stamping the
+// row's purged_at tombstone is the completion commit. The row itself is
+// kept forever — the burned (org, url) name is never released, because
+// URL-scoped JWTs can outlive any retention window (see meta/purge.go) —
+// and restore after purge is impossible.
 //
 // Blob disposal reuses the sweeper's quarantine handshake verbatim
 // (safeDelete: quarantine-copy → delete → registry recheck, GuardedLFSDelete
@@ -67,11 +69,14 @@ type RepoPurgeMeta interface {
 	// PurgeableRepos lists up to limit repo IDs soft-deleted at or before
 	// deletedBefore, oldest first.
 	PurgeableRepos(ctx context.Context, deletedBefore time.Time, limit int) ([]string, error)
-	// RepoPurgeState returns the repo row (found=false when absent;
-	// DeletedAt==nil when live).
-	RepoPurgeState(ctx context.Context, repoID string) (repo meta.Repo, found bool, err error)
-	// PurgeRepoMeta deletes credentials, upstream, and the repos row in
-	// one guarded transaction (phase 7, the completion commit).
+	// RepoPurgeState returns the repo row plus its purge tombstone
+	// (found=false when absent; Repo.DeletedAt==nil when live; PurgedAt
+	// non-nil once a purge completed).
+	RepoPurgeState(ctx context.Context, repoID string) (state meta.PurgeState, found bool, err error)
+	// PurgeRepoMeta deletes credentials and the upstream row and stamps
+	// the repos row's purged_at tombstone in one guarded transaction
+	// (phase 7, the completion commit; the row is kept as the permanent
+	// name burn).
 	PurgeRepoMeta(ctx context.Context, repoID string) error
 }
 
@@ -104,8 +109,12 @@ var (
 	ErrRepoRecentlyDeleted = errors.New("repository was soft-deleted too recently to purge")
 	// ErrPurgeDeferred reports that registry rows reappeared after
 	// tombstoning (an in-flight pre-delete writer): the run made progress
-	// but left the repos row so the next pass re-tombstones and retries.
+	// but left the repos row unstamped so the next pass re-tombstones and
+	// retries.
 	ErrPurgeDeferred = errors.New("purge deferred: registry rows were re-registered mid-purge")
+	// ErrRepoAlreadyPurged rejects purging a repository whose purge
+	// already completed (purged_at stamped).
+	ErrRepoAlreadyPurged = errors.New("repository is already purged")
 )
 
 // RepoPurgeReport summarizes one repository's purge.
@@ -230,17 +239,20 @@ func (p *RepoPurger) purgeRepo(ctx context.Context, repoID string) (RepoPurgeRep
 		// base; slashes would corrupt the blob-prefix walk below.
 		return rep, fmt.Errorf("invalid repo ID %q: purge takes the base repository ID", repoID)
 	}
-	repo, found, err := p.meta.RepoPurgeState(ctx, repoID)
+	state, found, err := p.meta.RepoPurgeState(ctx, repoID)
 	if err != nil {
 		return rep, fmt.Errorf("read repo state: %w", err)
 	}
 	if !found {
 		return rep, fmt.Errorf("repo %s: %w", repoID, meta.ErrNotFound)
 	}
-	if repo.DeletedAt == nil {
+	if state.PurgedAt != nil {
+		return rep, fmt.Errorf("repo %s was purged at %s: %w", repoID, state.PurgedAt.Format(time.RFC3339), ErrRepoAlreadyPurged)
+	}
+	if state.Repo.DeletedAt == nil {
 		return rep, fmt.Errorf("repo %s is live — delete it first: %w", repoID, meta.ErrRepoNotDeleted)
 	}
-	if age := p.now().Sub(*repo.DeletedAt); age < MinRepoPurgeAge {
+	if age := p.now().Sub(*state.Repo.DeletedAt); age < MinRepoPurgeAge {
 		return rep, fmt.Errorf("repo %s was soft-deleted %v ago (minimum %v — an in-flight pre-delete push could still be writing): %w",
 			repoID, age.Round(time.Second), MinRepoPurgeAge, ErrRepoRecentlyDeleted)
 	}
@@ -284,8 +296,9 @@ func (p *RepoPurger) purgeRepo(ctx context.Context, repoID string) (RepoPurgeRep
 	if rep.RowsPurged, err = p.registry.PurgeRepoLedger(ctx, group); err != nil {
 		return rep, fmt.Errorf("purge ledger rows: %w", err)
 	}
-	// Phase 7: completion commit — deletes the repos row (releasing the
-	// burned name) plus credentials/upstream, guarded on deleted_at.
+	// Phase 7: completion commit — deletes credentials/upstream and stamps
+	// the repos row's purged_at tombstone, guarded on deleted_at. The row
+	// stays: the burned name is never released (see meta/purge.go).
 	if err := p.meta.PurgeRepoMeta(ctx, repoID); err != nil {
 		return rep, err
 	}

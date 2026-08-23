@@ -125,6 +125,7 @@ func (s *SQLite) InitSchema(ctx context.Context) error {
 		    default_branch TEXT NOT NULL,
 		    created_at     INTEGER NOT NULL,
 		    deleted_at     INTEGER,
+		    purged_at      INTEGER,
 		    CONSTRAINT repos_org_id_url_key UNIQUE (org_id, url)
 		)`,
 		// Keyset pagination index for ListRepos (live rows only).
@@ -180,20 +181,22 @@ func (s *SQLite) InitSchema(ctx context.Context) error {
 	// defaults are LEGACY claims: TryBeginSync adopts them under one
 	// grace period before they become stealable (pre-existing wedges
 	// heal one grace after the first post-upgrade sync attempt).
-	for _, col := range []struct{ name, ddl string }{
-		{"sync_pending", `sync_pending INTEGER NOT NULL DEFAULT 0`},
-		{"sync_claim_holder", `sync_claim_holder TEXT NOT NULL DEFAULT ''`},
-		{"sync_claim_expires_at", `sync_claim_expires_at INTEGER NOT NULL DEFAULT 0`},
+	for _, col := range []struct{ table, name, ddl string }{
+		{"repo_upstreams", "sync_pending", `sync_pending INTEGER NOT NULL DEFAULT 0`},
+		{"repo_upstreams", "sync_claim_holder", `sync_claim_holder TEXT NOT NULL DEFAULT ''`},
+		{"repo_upstreams", "sync_claim_expires_at", `sync_claim_expires_at INTEGER NOT NULL DEFAULT 0`},
+		// Purge tombstone column (issue #52) for data dirs predating it.
+		{"repos", "purged_at", `purged_at INTEGER`},
 	} {
 		var present int
 		if err := tx.QueryRowContext(ctx,
-			`SELECT COUNT(*) FROM pragma_table_info('repo_upstreams') WHERE name = ?`, col.name,
+			`SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?`, col.table, col.name,
 		).Scan(&present); err != nil {
 			return fmt.Errorf("sqlite init schema: probe %s column: %w", col.name, err)
 		}
 		if present == 0 {
 			if _, err := tx.ExecContext(ctx,
-				`ALTER TABLE repo_upstreams ADD COLUMN `+col.ddl); err != nil {
+				`ALTER TABLE `+col.table+` ADD COLUMN `+col.ddl); err != nil {
 				return fmt.Errorf("sqlite init schema: add %s column: %w", col.name, err)
 			}
 		}

@@ -15,7 +15,7 @@ func (s *SQLite) PurgeableRepos(ctx context.Context, deletedBefore time.Time, li
 	assertf(limit > 0, "PurgeableRepos: non-positive limit %d", limit)
 	rows, err := s.db.QueryContext(ctx, `
 SELECT repo_id FROM repos
-WHERE deleted_at IS NOT NULL AND deleted_at <= ?
+WHERE deleted_at IS NOT NULL AND deleted_at <= ? AND purged_at IS NULL
 ORDER BY deleted_at ASC, repo_id ASC
 LIMIT ?`, deletedBefore.UnixNano(), limit)
 	if err != nil {
@@ -34,29 +34,45 @@ LIMIT ?`, deletedBefore.UnixNano(), limit)
 }
 
 // RepoPurgeState — see the PG twin.
-func (s *SQLite) RepoPurgeState(ctx context.Context, repoID string) (repo Repo, found bool, err error) {
+func (s *SQLite) RepoPurgeState(ctx context.Context, repoID string) (state PurgeState, found bool, err error) {
 	assertf(repoID != "", "RepoPurgeState: empty repo ID")
-	r, err := scanRepoSQLite(s.db.QueryRowContext(ctx,
-		`SELECT `+repoCols+` FROM repos WHERE repo_id = ?`, repoID))
+	row := s.db.QueryRowContext(ctx,
+		`SELECT `+repoCols+`, purged_at FROM repos WHERE repo_id = ?`, repoID)
+	var r Repo
+	var createdAt int64
+	var deletedAt, purgedAt sql.NullInt64
+	err = row.Scan(&r.RepoID, &r.OrgID, &r.URL, &r.DefaultBranch, &createdAt, &deletedAt, &purgedAt)
 	if errors.Is(err, sql.ErrNoRows) {
-		return Repo{}, false, nil
+		return PurgeState{}, false, nil
 	}
 	if err != nil {
-		return Repo{}, false, err
+		return PurgeState{}, false, err
 	}
-	return r, true, nil
+	// Unixnano → UTC time.Time, matching scanRepoSQLite's Repo contract.
+	r.CreatedAt = time.Unix(0, createdAt).UTC()
+	if deletedAt.Valid {
+		utc := time.Unix(0, deletedAt.Int64).UTC()
+		r.DeletedAt = &utc
+	}
+	state = PurgeState{Repo: r}
+	if purgedAt.Valid {
+		utc := time.Unix(0, purgedAt.Int64).UTC()
+		state.PurgedAt = &utc
+	}
+	return state, true, nil
 }
 
 // PurgeRepoMeta — see the PG twin. The inTx write transaction (BEGIN
 // IMMEDIATE) serializes the guard read with the deletes.
 func (s *SQLite) PurgeRepoMeta(ctx context.Context, repoID string) error {
 	assertf(repoID != "", "PurgeRepoMeta: empty repo ID")
+	nanos, _ := s.nowNano()
 	err := s.inTx(ctx, func(tx *sql.Tx) error {
 		var deletedAt sql.NullInt64
 		err := tx.QueryRowContext(ctx,
 			`SELECT deleted_at FROM repos WHERE repo_id = ?`, repoID).Scan(&deletedAt)
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil // already purged: the completion commit is durable
+			return nil // row gone (legacy purge): nothing left to finalize
 		}
 		if err != nil {
 			return err
@@ -67,13 +83,14 @@ func (s *SQLite) PurgeRepoMeta(ctx context.Context, repoID string) error {
 		for _, stmt := range []string{
 			`DELETE FROM git_credentials WHERE repo_id = ?`,
 			`DELETE FROM repo_upstreams  WHERE repo_id = ?`,
-			`DELETE FROM repos           WHERE repo_id = ? AND deleted_at IS NOT NULL`,
 		} {
 			if _, err := tx.ExecContext(ctx, stmt, repoID); err != nil {
 				return err
 			}
 		}
-		return nil
+		_, err = tx.ExecContext(ctx, `UPDATE repos SET purged_at = ?
+		  WHERE repo_id = ? AND deleted_at IS NOT NULL AND purged_at IS NULL`, nanos, repoID)
+		return err
 	})
 	if err != nil {
 		return fmt.Errorf("purge repo %s metadata: %w", repoID, err)

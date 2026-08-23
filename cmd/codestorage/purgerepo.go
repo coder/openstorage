@@ -2,7 +2,7 @@
 // rows and blobs (issue #52) — the synchronous operator twin of the
 // CODESTORAGE_REPO_RETENTION background purge, running the exact same
 // jobs.RepoPurger primitive. Purged repositories CANNOT be restored, and
-// the purge releases the repository's burned (org, url) name.
+// the burned (org, url) name is never released (see meta/purge.go).
 package main
 
 import (
@@ -27,10 +27,10 @@ func cmdPurgeRepo(ctx context.Context, args []string) error {
 Permanently reclaims a soft-deleted repository: drops its registry rows
 (refs, packs, LFS objects, credentials, upstream links) and deletes its
 blobs through the sweeper's quarantine discipline. IRREVERSIBLE — the
-repository cannot be restored afterwards, and its (org, url) name becomes
-available for re-creation. The repository must have been soft-deleted at
-least %v ago (an in-flight pre-delete push could otherwise still be
-writing).
+repository cannot be restored afterwards. Its (org, url) name stays burned
+forever (URL-scoped tokens may outlive the purge, so the name is never
+released). The repository must have been soft-deleted at least %v ago (an
+in-flight pre-delete push could otherwise still be writing).
 
 Flags:
 `, jobs.MinRepoPurgeAge)
@@ -121,22 +121,25 @@ Flags:
 
 	// Summarize what would be purged before demanding confirmation, so an
 	// operator without --yes gets a dry look instead of a bare refusal.
-	repo, found, err := purgeMeta.RepoPurgeState(ctx, repoID)
+	state, found, err := purgeMeta.RepoPurgeState(ctx, repoID)
 	if err != nil {
 		return fmt.Errorf("read repo state: %w", err)
 	}
 	if !found {
-		return fmt.Errorf("repo %s not found (already purged, or never created)", repoID)
+		return fmt.Errorf("repo %s not found (never created, or purged by an older build)", repoID)
 	}
-	if repo.DeletedAt == nil {
-		return fmt.Errorf("repo %s (%s) is live — delete it first (DELETE /api/v1/repos/delete)", repoID, repo.URL)
+	if state.PurgedAt != nil {
+		return fmt.Errorf("repo %s (%s) was already purged at %s", repoID, state.Repo.URL, state.PurgedAt.Format(time.RFC3339))
 	}
-	fmt.Printf("repo:       %s\n", repo.RepoID)
-	fmt.Printf("url:        %s\n", repo.URL)
+	if state.Repo.DeletedAt == nil {
+		return fmt.Errorf("repo %s (%s) is live — delete it first (DELETE /api/v1/repos/delete)", repoID, state.Repo.URL)
+	}
+	fmt.Printf("repo:       %s\n", state.Repo.RepoID)
+	fmt.Printf("url:        %s\n", state.Repo.URL)
 	fmt.Printf("deleted at: %s (%s ago)\n",
-		repo.DeletedAt.Format(time.RFC3339), time.Since(*repo.DeletedAt).Round(time.Second))
+		state.Repo.DeletedAt.Format(time.RFC3339), time.Since(*state.Repo.DeletedAt).Round(time.Second))
 	if !*yes {
-		return errors.New("refusing to purge without --yes: purging is IRREVERSIBLE (no restore) and releases the repository's name for re-creation")
+		return errors.New("refusing to purge without --yes: purging is IRREVERSIBLE (no restore)")
 	}
 
 	report, err := purger.PurgeRepo(ctx, repoID)
@@ -146,6 +149,6 @@ Flags:
 	fmt.Printf("purged %s: %d refs, %d packs, %d LFS objects unregistered; %d blobs (%d bytes) quarantined; %d ledger rows removed\n",
 		report.RepoID, report.RefsDropped, report.PacksRetired, report.LFSDropped,
 		report.BlobsReaped, report.BytesReaped, report.RowsPurged)
-	fmt.Println("quarantine backups are collected by the next aged sweep pass; the repository name is now available for re-creation")
+	fmt.Println("quarantine backups are collected by the next aged sweep pass; the repository name remains burned (URL-scoped tokens may outlive the purge)")
 	return nil
 }

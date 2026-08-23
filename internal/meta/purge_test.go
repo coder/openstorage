@@ -16,7 +16,7 @@ import (
 type purgeMetaStore interface {
 	Backend
 	PurgeableRepos(ctx context.Context, deletedBefore time.Time, limit int) ([]string, error)
-	RepoPurgeState(ctx context.Context, repoID string) (Repo, bool, error)
+	RepoPurgeState(ctx context.Context, repoID string) (PurgeState, bool, error)
 	PurgeRepoMeta(ctx context.Context, repoID string) error
 }
 
@@ -77,11 +77,11 @@ func testRepoPurgeMetaSeams(t *testing.T, s Backend) {
 	}
 
 	// RepoPurgeState: live vs deleted vs absent.
-	if r, found, err := ps.RepoPurgeState(ctx, live.RepoID); err != nil || !found || r.DeletedAt != nil {
-		t.Fatalf("RepoPurgeState(live) = %+v found=%v err=%v", r, found, err)
+	if s, found, err := ps.RepoPurgeState(ctx, live.RepoID); err != nil || !found || s.Repo.DeletedAt != nil || s.PurgedAt != nil {
+		t.Fatalf("RepoPurgeState(live) = %+v found=%v err=%v", s, found, err)
 	}
-	if r, found, err := ps.RepoPurgeState(ctx, delA.RepoID); err != nil || !found || r.DeletedAt == nil || r.URL != delA.URL {
-		t.Fatalf("RepoPurgeState(del-a) = %+v found=%v err=%v", r, found, err)
+	if s, found, err := ps.RepoPurgeState(ctx, delA.RepoID); err != nil || !found || s.Repo.DeletedAt == nil || s.Repo.URL != delA.URL || s.PurgedAt != nil {
+		t.Fatalf("RepoPurgeState(del-a) = %+v found=%v err=%v", s, found, err)
 	}
 	if _, found, err := ps.RepoPurgeState(ctx, "repo_nonexistent0"); err != nil || found {
 		t.Fatalf("RepoPurgeState(absent): found=%v err=%v", found, err)
@@ -95,25 +95,39 @@ func testRepoPurgeMetaSeams(t *testing.T, s Backend) {
 		t.Fatalf("live repo damaged by refused purge: %v", err)
 	}
 
-	// The completion delete removes the repos row plus eventing rows,
-	// releases the burned name, and is idempotent.
+	// The completion commit removes the eventing rows and stamps the
+	// purge tombstone; the repos row is KEPT and the burned name is never
+	// released (URL-scoped tokens may outlive any retention — Codex
+	// security round on #105). Idempotent on rerun.
 	if err := ps.PurgeRepoMeta(ctx, delA.RepoID); err != nil {
 		t.Fatalf("PurgeRepoMeta(del-a): %v", err)
 	}
-	if _, found, err := ps.RepoPurgeState(ctx, delA.RepoID); err != nil || found {
-		t.Fatalf("repos row survived purge: found=%v err=%v", found, err)
+	stateA, found, err := ps.RepoPurgeState(ctx, delA.RepoID)
+	if err != nil || !found {
+		t.Fatalf("repos tombstone row lost by purge: found=%v err=%v", found, err)
+	}
+	if stateA.PurgedAt == nil || stateA.Repo.DeletedAt == nil {
+		t.Fatalf("purge tombstone not stamped: %+v", stateA)
 	}
 	if _, err := s.GetRepoUpstream(ctx, delA.RepoID); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("repo_upstreams row survived purge: %v", err)
 	}
-	if _, err := s.CreateRepo(ctx, org, delA.URL, "main"); err != nil {
-		t.Fatalf("name not released after purge: %v", err)
+	if _, err := s.CreateRepo(ctx, org, delA.URL, "main"); !errors.Is(err, ErrAlreadyExists) {
+		t.Fatalf("purge released the burned name: CreateRepo = %v, want ErrAlreadyExists", err)
 	}
 	if err := ps.PurgeRepoMeta(ctx, delA.RepoID); err != nil {
 		t.Fatalf("PurgeRepoMeta rerun: %v", err)
 	}
+	// Purged rows leave the background queue permanently.
+	ids, err = ps.PurgeableRepos(ctx, time.Now().Add(time.Hour), 10)
+	if err != nil {
+		t.Fatalf("PurgeableRepos after purge: %v", err)
+	}
+	if slices.Contains(ids, delA.RepoID) {
+		t.Fatalf("purged repo still purgeable: %v", ids)
+	}
 	// The other soft-deleted repo is untouched by delA's purge.
-	if _, found, err := ps.RepoPurgeState(ctx, delB.RepoID); err != nil || !found {
-		t.Fatalf("del-b row lost: found=%v err=%v", found, err)
+	if !slices.Contains(ids, delB.RepoID) {
+		t.Fatalf("del-b lost from the purge queue: %v", ids)
 	}
 }

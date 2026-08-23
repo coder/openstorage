@@ -77,10 +77,14 @@ packs, LFS objects):
   purges one repository immediately (it must have been soft-deleted at least an hour
   earlier).
 
-Both are **irreversible** — there is no restore after a purge — and both release the
-repository's burned `(org, url)` name for re-creation. Pick a retention comfortably
-above your token lifetimes: an unexpired token carries the repository URL in its claim
-and would authorize against a new repository created at that URL.
+Both are **irreversible** — there is no restore after a purge. The repository row is
+kept as a permanent tombstone, so the burned `(org, url)` name is **never released**:
+an unexpired token carries the repository URL in its claim and would otherwise
+authorize against a new repository created at that URL.
+
+Purged repositories drop out of every registry surface except the tombstoned metadata
+row (soft-deleted plus a purge timestamp), which keeps `DELETE`-then-recreate races and
+stale-token replays structurally impossible.
 
 The purge is crash-safe by ordering, the inverse of the write path's
 publish-before-registration: registry rows are tombstoned **before** any blob is

@@ -518,10 +518,10 @@ command runs the same primitive synchronously for one repository.
   push can race it), and sweeping must be enabled
   ([`CODESTORAGE_SWEEP_INTERVAL`](#codestorage_sweep_interval) > 0) — the purge rides
   the sweep schedule.
-- **Purged repositories cannot be restored**, and the purge releases the repository's
-  burned `(org, url)` name for re-creation. Choose a retention comfortably above any
-  issued token lifetime: an unexpired token carrying the URL claim would authorize
-  against a repository re-created at that URL.
+- **Purged repositories cannot be restored.** The repository row is kept as a permanent
+  tombstone, so the burned `(org, url)` name is never released: JWT repo claims are
+  URL-scoped and can outlive any retention window, and a name reuse would let a stale
+  token authorize against the successor repository.
 - Purged blob bytes move to quarantine first and are freed when the backups age out
   (retention counts as a destructive mode for quarantine aging even with every
   `*_DELETE_*` flag off). On versioned S3 buckets it fails startup exactly like the

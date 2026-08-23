@@ -146,16 +146,17 @@ codestorage list-packs --repo repo_761aac427fd3 --data-dir ~/cs-data
 
 Permanently reclaims one **soft-deleted** repository: unregisters its refs, packs, and
 LFS objects (base repository plus `+ephemeral`/`+import` namespaces), deletes its blobs
-through the sweeper's quarantine-first discipline, and removes its credentials, upstream
-link, and repository row. The synchronous twin of the
+through the sweeper's quarantine-first discipline, and removes its credentials and
+upstream link. The synchronous twin of the
 [`CODESTORAGE_REPO_RETENTION`](configuration.md#codestorage_repo_retention) background
 purge — same primitive, same crash-safe ordering (rows tombstone before blobs; an
 interrupted purge resumes on re-run).
 
 **Irreversible.** A purged repository cannot be restored, and its `(org, url)` name
-becomes available for re-creation. The repository must already be soft-deleted
-(`DELETE /api/v1/repos/delete`) at least one hour earlier — younger deletions are
-refused so no in-flight pre-delete push can race the purge.
+stays burned forever (the repository row is kept as a tombstone — URL-scoped tokens may
+outlive the purge, so the name is never released). The repository must already be
+soft-deleted (`DELETE /api/v1/repos/delete`) at least one hour earlier — younger
+deletions are refused so no in-flight pre-delete push can race the purge.
 
 ```
 codestorage purge-repo [flags] <repo-id>
