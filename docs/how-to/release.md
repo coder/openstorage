@@ -49,9 +49,14 @@ protection requires `lint` / `test` / `test-local`. Approve via the **Approve an
 button on the PR's Actions run, or:
 
 ```sh
-gh run list -R coder/code-storage --branch release-please--branches--main --limit 1
+gh run list -R coder/code-storage --branch release-please--branches--main \
+  --workflow ci --status action_required --limit 1
 gh api --method POST repos/coder/code-storage/actions/runs/<run-id>/approve
 ```
+
+(`--workflow ci` matters: the branch also gets a held run from the optional
+`pr-title` workflow, and without the filter `--limit 1` can return that one —
+approving it would leave the required `lint`/`test`/`test-local` checks blocked.)
 
 Each release-please refresh of the branch (any push to main while the release PR is
 open) creates a fresh held run needing the same approval. The separate `pr-title`
