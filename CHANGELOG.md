@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.4](https://github.com/coder/code-storage/compare/v0.1.3...v0.1.4) (2026-08-23)
+
+
+### Performance Improvements
+
+* **githttp:** eliminate git subprocess forks from the hydration fast path ([#98](https://github.com/coder/code-storage/issues/98)) ([cab32ca](https://github.com/coder/code-storage/commit/cab32ca5c0ebe431167758312dedf3144000eeda))
+
 ## [0.1.3](https://github.com/coder/code-storage/compare/v0.1.2...v0.1.3) (2026-08-23)
 
 
