@@ -459,7 +459,7 @@ Variables outside the operator surface, listed for completeness — never set th
   `CODESTORAGE_TEST_VERIFY_SPAWN_LOG` — crash/fault injection and observability knobs
   for the e2e suites; the server refuses test-mode requests outside test mode.
 - `CODESTORAGE_TEST_BACKEND`, `CODESTORAGE_SDK_DIR` — test-lane selection (see the
-  [testing notes](../11-local-backends-implementation-notes.md)) and the SDK-compatibility
+  [testing reference](testing.md)) and the SDK-compatibility
   suite's vendor checkout location.
 
 The Docker Compose file has its own host-port overrides (`PGPORT`, `MINIOPORT`,
