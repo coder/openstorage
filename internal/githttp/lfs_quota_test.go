@@ -1715,6 +1715,91 @@ func TestLFSPut_ClaimLossRejectsSuccessfulPublication(t *testing.T) {
 	}
 }
 
+// gateCanonicalCopyBlob holds copies toward canonical destinations open —
+// the adoption-copy twin of gateCopyBlob.
+type gateCanonicalCopyBlob struct {
+	blob.BlobStore
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (b *gateCanonicalCopyBlob) Copy(ctx context.Context, dstKey, srcKey string) error {
+	if strings.Contains(dstKey, "/o2/") {
+		b.once.Do(func() { close(b.started) })
+		select {
+		case <-b.release:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return b.BlobStore.Copy(ctx, dstKey, srcKey)
+}
+
+// TestLFSCopyAdmission_SingleChargeDuringCopy (Codex round 94): both
+// server-side copies reserved TWICE for the same planned bytes — a real
+// admission row (the object key) plus the renewed repair cover (the
+// suffixed key) — for the copy's whole, potentially hours-long window:
+// with usage S and quota 3S, adopting an S-byte object left S of genuine
+// post-copy headroom while unrelated uploads saw S used + 2S reserved and
+// were denied throughout. One reservation must both admit and cover.
+func TestLFSCopyAdmission_SingleChargeDuringCopy(t *testing.T) {
+	content := bytes.Repeat([]byte("d"), 60)
+	oid := sha256Hex(content)
+
+	t.Run("adoption", func(t *testing.T) {
+		ctx := context.Background()
+		srv, st, mint := newLFSQuotaServer(t, 1<<20, time.Hour)
+		tok := mint(auth.ScopeGitWrite)
+		if err := srv.Blob.UploadFile(ctx, blob.LFSLegacyKey(lfsTestRepoID, oid), writeTempFile(t, content)); err != nil {
+			t.Fatal(err)
+		}
+		gate := &gateCanonicalCopyBlob{BlobStore: srv.Blob, started: make(chan struct{}), release: make(chan struct{})}
+		srv.Blob = gate
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			doLFS(t, srv, http.MethodPost, lfsBatchPath, "basic:"+tok,
+				batchBody("upload", oid, int64(len(content))))
+		}()
+		select {
+		case <-gate.started:
+		case <-time.After(10 * time.Second):
+			t.Fatal("adoption copy never started")
+		}
+		reserved := ledgerState(t, st, time.Hour).ReservedBytes
+		close(gate.release)
+		<-done
+		if reserved >= 2*int64(len(content)) {
+			t.Fatalf("mid-copy reserved = %d for a %d-byte adoption — the admission row and the renewed cover double-charge the same planned bytes", reserved, len(content))
+		}
+	})
+	t.Run("bridge", func(t *testing.T) {
+		srv, st, mint := newLFSQuotaServer(t, 1<<20, time.Hour)
+		srv.LFSV020WriteCompat = true
+		tok := mint(auth.ScopeGitWrite)
+		gate := &gateCopyBlob{BlobStore: srv.Blob, started: make(chan struct{}), release: make(chan struct{})}
+		srv.Blob = gate
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			doLFS(t, srv, http.MethodPut, "/"+lfsTestRepoURL+".git/info/lfs/objects/"+oid,
+				"basic:"+tok, string(content))
+		}()
+		select {
+		case <-gate.started:
+		case <-time.After(10 * time.Second):
+			t.Fatal("bridge copy never started")
+		}
+		reserved := ledgerState(t, st, time.Hour).ReservedBytes
+		close(gate.release)
+		<-done
+		if reserved >= 2*int64(len(content)) {
+			t.Fatalf("mid-copy reserved = %d for a %d-byte bridge — the admission row and the renewed cover double-charge the same planned bytes", reserved, len(content))
+		}
+	})
+}
+
 // TestLFSCompat_RepairSerializedOnLegacyClaim (Codex security round 85):
 // the batch fast path's bridge repair launched an unserialized full copy —
 // every tiny concurrent touch of the object started another one. Compat
