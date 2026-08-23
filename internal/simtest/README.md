@@ -68,9 +68,11 @@ Checked from clean (never fault-injected) handles:
    expired claim must be stolen by the very next attempt; steals only take
    expired claims (never live ones) and name the exact previous holder; a
    stolen run's late FinishSync fails (`ErrClaimLost` while the thief
-   holds, `ErrNotFound` after it finished) without touching the row or
-   counters; run/success counters and the pending marker mirror a
-   ground-truth model; and after quiescence (clock jumped past every
+   holds, `ErrNotFound` after it finished); after every mutation point
+   (claim attempt, request, finish, late finish, quiescence) the row is
+   mirrored field-for-field against a ground-truth model — claim state,
+   pending marker, and both counters — so any unmodeled change violates at
+   the next observation; and after quiescence (clock jumped past every
    lease) one final claim per repo must succeed and finish cleanly — a
    refusal is exactly the pre-#86 wedged row.
 

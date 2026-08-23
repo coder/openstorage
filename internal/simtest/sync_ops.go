@@ -99,7 +99,7 @@ func (s *sim) doSyncClaim(name string, node *simNode, repo *simRepo) error {
 	holder := fmt.Sprintf("n%d-s%04d", node.id, s.step)
 	now := s.simNow()
 
-	row, claimed, stolenFrom, err := node.metaStore.TryBeginSync(ctx, repo.key, holder, simSyncLease)
+	_, claimed, stolenFrom, err := node.metaStore.TryBeginSync(ctx, repo.key, holder, simSyncLease)
 	if err != nil {
 		return fmt.Errorf("step %d: TryBeginSync %s: %w", s.step, repo.key, err)
 	}
@@ -149,15 +149,6 @@ func (s *sim) doSyncClaim(name string, node *simNode, repo *simRepo) error {
 	}
 
 	if claimed {
-		if row.SyncPending {
-			s.violate("step %d: sync-claim %s: claim by %s did not consume the pending marker", s.step, repo.key, holder)
-			return nil
-		}
-		if row.RunCount != s.syncRunCount[repo.key] || row.SuccessCount != s.syncSuccessCount[repo.key] {
-			s.violate("step %d: sync-claim %s: claim changed counters to %d/%d, model %d/%d",
-				s.step, repo.key, row.RunCount, row.SuccessCount, s.syncRunCount[repo.key], s.syncSuccessCount[repo.key])
-			return nil
-		}
 		run := &simSyncRun{
 			repo: repo.key, node: node.id, holder: holder,
 			finishStep: s.step + duration, success: success, crashed: crash,
@@ -185,12 +176,10 @@ func describeClaim(cl *simSyncClaim, now time.Time) string {
 	return fmt.Sprintf("holder %s expired=%t", cl.holder, !cl.expires.After(now))
 }
 
-// checkSyncRow is the row-level oracle run after every claim attempt:
-// (a) lease liveness (the #88 invariant) — at sim time now the row must
-// not keep syncing=true with an expiry at or before now, the attempt must
-// have stolen it; (b) the pending marker matches the model — a claim
-// consumes it, a refusal must leave it alone (a refused attempt that
-// clears an accepted request would silently lose it).
+// checkSyncRow runs after every claim attempt: lease liveness (the #88
+// invariant) — at sim time now the row must not keep syncing=true with an
+// expiry at or before now, the attempt must have stolen it — then the full
+// row mirror.
 func (s *sim) checkSyncRow(ctx context.Context, repoKey string, now time.Time, op string) error {
 	cur, err := s.cl.oracleMeta.GetRepoUpstream(ctx, repoKey)
 	if err != nil {
@@ -201,29 +190,55 @@ func (s *sim) checkSyncRow(ctx context.Context, repoKey string, now time.Time, o
 			s.step, op, repoKey, cur.SyncClaimHolder, cur.SyncClaimExpiresAt, now)
 		return nil
 	}
+	return s.checkSyncMirror(ctx, repoKey, op)
+}
+
+// checkSyncMirror compares the repo's row field-for-field against the
+// model: claim state (syncing/holder/expiry), the pending marker, and both
+// counters. Called after every sync mutation point once the model reflects
+// the intended outcome, it turns ANY unmodeled field change — by a claim,
+// a refusal, a finish, or a late finisher — into a violation at the very
+// next observation. One uniform check instead of per-call-site field
+// lists, so no observation point can miss a field.
+func (s *sim) checkSyncMirror(ctx context.Context, repoKey, op string) error {
+	cur, err := s.cl.oracleMeta.GetRepoUpstream(ctx, repoKey)
+	if err != nil {
+		return fmt.Errorf("step %d: oracle GetRepoUpstream %s: %w", s.step, repoKey, err)
+	}
+	wantSyncing, wantHolder, wantExpires := false, "", time.Unix(0, 0).UTC()
+	if cl := s.syncClaims[repoKey]; cl != nil {
+		wantSyncing, wantHolder, wantExpires = true, cl.holder, cl.expires
+	}
+	if cur.Syncing != wantSyncing || cur.SyncClaimHolder != wantHolder || !cur.SyncClaimExpiresAt.Equal(wantExpires) {
+		s.violate("step %d: %s: %s claim state (syncing=%t holder=%q expires=%v) diverged from the model (syncing=%t holder=%q expires=%v)",
+			s.step, op, repoKey, cur.Syncing, cur.SyncClaimHolder, cur.SyncClaimExpiresAt, wantSyncing, wantHolder, wantExpires)
+		return nil
+	}
 	if cur.SyncPending != s.syncPending[repoKey] {
 		s.violate("step %d: %s: %s pending marker %t, model %t",
 			s.step, op, repoKey, cur.SyncPending, s.syncPending[repoKey])
+		return nil
+	}
+	if cur.RunCount != s.syncRunCount[repoKey] || cur.SuccessCount != s.syncSuccessCount[repoKey] {
+		s.violate("step %d: %s: %s counters %d/%d, model %d/%d",
+			s.step, op, repoKey, cur.RunCount, cur.SuccessCount, s.syncRunCount[repoKey], s.syncSuccessCount[repoKey])
 	}
 	return nil
 }
 
 // doSyncRequest marks a sync request (the 202-accepted pull-upstream /
-// push-trigger surface): the row must carry the pending marker immediately
-// (a request the store silently dropped would otherwise be unobservable
-// when the next claim consumes it), and the next claim must consume it.
+// push-trigger surface). The mirror check right after demands the marker
+// is actually set (a request the store silently dropped would otherwise be
+// unobservable once the next claim consumes it) and everything else is
+// untouched; the next claim must consume it.
 func (s *sim) doSyncRequest(name string, node *simNode, repo *simRepo) error {
 	ctx := context.Background()
 	if err := node.metaStore.RequestSync(ctx, repo.key); err != nil {
 		return fmt.Errorf("step %d: RequestSync %s: %w", s.step, repo.key, err)
 	}
 	s.syncPending[repo.key] = true
-	cur, err := s.cl.oracleMeta.GetRepoUpstream(ctx, repo.key)
-	if err != nil {
-		return fmt.Errorf("step %d: oracle GetRepoUpstream %s: %w", s.step, repo.key, err)
-	}
-	if !cur.SyncPending {
-		s.violate("step %d: sync-request %s: RequestSync returned nil but the pending marker is not set", s.step, repo.key)
+	if err := s.checkSyncMirror(ctx, repo.key, "sync-request"); err != nil {
+		return err
 	}
 	s.tracef("step=%04d op=%s node=%d repo=%s out=ok", s.step, name, node.id, repo.key)
 	return nil
@@ -265,7 +280,7 @@ func (s *sim) processSyncFinishes() error {
 func (s *sim) finishSyncRun(ctx context.Context, run *simSyncRun) error {
 	assertf(!run.done && !run.crashed, "finishSyncRun: run %s already settled", run.holder)
 	node := s.cl.nodes[run.node]
-	row, err := node.metaStore.FinishSync(ctx, run.repo, run.holder, run.success)
+	_, err := node.metaStore.FinishSync(ctx, run.repo, run.holder, run.success)
 	run.done = true
 	outcome := ""
 	switch {
@@ -275,40 +290,30 @@ func (s *sim) finishSyncRun(ctx context.Context, run *simSyncRun) error {
 				s.step, run.repo, run.holder)
 			return nil
 		}
-		s.syncRunCount[run.repo]++
-		if run.success {
-			s.syncSuccessCount[run.repo]++
-		}
-		if row.RunCount != s.syncRunCount[run.repo] || row.SuccessCount != s.syncSuccessCount[run.repo] {
-			s.violate("step %d: sync-finish %s: counters %d/%d, model %d/%d",
-				s.step, run.repo, row.RunCount, row.SuccessCount, s.syncRunCount[run.repo], s.syncSuccessCount[run.repo])
-			return nil
-		}
-		if row.Syncing || row.SyncClaimHolder != "" || !row.SyncClaimExpiresAt.Equal(time.Unix(0, 0).UTC()) {
-			s.violate("step %d: sync-finish %s: finish by %s left claim state (syncing=%t holder=%q expires=%v)",
-				s.step, run.repo, run.holder, row.Syncing, row.SyncClaimHolder, row.SyncClaimExpiresAt)
-			return nil
-		}
-		if row.SyncPending != s.syncPending[run.repo] {
-			s.violate("step %d: sync-finish %s: pending=%t, model %t", s.step, run.repo, row.SyncPending, s.syncPending[run.repo])
-			return nil
-		}
 		cl := s.syncClaims[run.repo]
 		if cl == nil || cl.holder != run.holder {
 			s.violate("step %d: sync-finish %s: %s finished but the model claim is %s",
 				s.step, run.repo, run.holder, describeClaim(cl, s.simNow()))
 			return nil
 		}
+		s.syncRunCount[run.repo]++
+		if run.success {
+			s.syncSuccessCount[run.repo]++
+		}
 		delete(s.syncClaims, run.repo)
+		if err := s.checkSyncMirror(ctx, run.repo, "sync-finish"); err != nil {
+			return err
+		}
 		outcome = fmt.Sprintf("finished ok=%t", run.success)
 	case errors.Is(err, meta.ErrClaimLost):
-		cl := s.syncClaims[run.repo]
-		if !run.stolen || cl == nil {
+		if !run.stolen || s.syncClaims[run.repo] == nil {
 			s.violate("step %d: sync-finish %s: %s got ErrClaimLost but stolen=%t model=%s",
-				s.step, run.repo, run.holder, run.stolen, describeClaim(cl, s.simNow()))
+				s.step, run.repo, run.holder, run.stolen, describeClaim(s.syncClaims[run.repo], s.simNow()))
 			return nil
 		}
-		if err := s.checkSyncUntouched(ctx, run, cl.holder, true); err != nil {
+		// The late finisher must have changed nothing: the mirror still
+		// expects the thief's claim, counters, and pending marker intact.
+		if err := s.checkSyncMirror(ctx, run.repo, "sync-finish-late"); err != nil {
 			return err
 		}
 		outcome = "claim-lost"
@@ -320,7 +325,7 @@ func (s *sim) finishSyncRun(ctx context.Context, run *simSyncRun) error {
 				s.step, run.repo, run.holder, run.stolen, describeClaim(s.syncClaims[run.repo], s.simNow()))
 			return nil
 		}
-		if err := s.checkSyncUntouched(ctx, run, "", false); err != nil {
+		if err := s.checkSyncMirror(ctx, run.repo, "sync-finish-late"); err != nil {
 			return err
 		}
 		outcome = "claim-gone"
@@ -328,26 +333,6 @@ func (s *sim) finishSyncRun(ctx context.Context, run *simSyncRun) error {
 		return fmt.Errorf("step %d: FinishSync %s/%s: %w", s.step, run.repo, run.holder, err)
 	}
 	s.tracef("step=%04d op=sync-finish node=%d repo=%s holder=%s out=%s", s.step, run.node, run.repo, run.holder, outcome)
-	return nil
-}
-
-// checkSyncUntouched asserts a failed late finish left the row alone:
-// counters at model values and the claim exactly as the model has it
-// (held by wantHolder, or idle).
-func (s *sim) checkSyncUntouched(ctx context.Context, run *simSyncRun, wantHolder string, wantSyncing bool) error {
-	cur, err := s.cl.oracleMeta.GetRepoUpstream(ctx, run.repo)
-	if err != nil {
-		return fmt.Errorf("step %d: oracle GetRepoUpstream %s: %w", s.step, run.repo, err)
-	}
-	if cur.Syncing != wantSyncing || cur.SyncClaimHolder != wantHolder {
-		s.violate("step %d: sync-finish %s: late finisher %s disturbed the claim (syncing=%t holder=%q, want syncing=%t holder=%q)",
-			s.step, run.repo, run.holder, cur.Syncing, cur.SyncClaimHolder, wantSyncing, wantHolder)
-		return nil
-	}
-	if cur.RunCount != s.syncRunCount[run.repo] || cur.SuccessCount != s.syncSuccessCount[run.repo] {
-		s.violate("step %d: sync-finish %s: late finisher %s polluted counters to %d/%d, model %d/%d",
-			s.step, run.repo, run.holder, cur.RunCount, cur.SuccessCount, s.syncRunCount[run.repo], s.syncSuccessCount[run.repo])
-	}
 	return nil
 }
 
@@ -403,28 +388,31 @@ func (s *sim) checkSyncFinal() error {
 				s.syncCrashSteals++
 			}
 		}
-		if row.SyncPending {
-			s.violate("issue-#88 quiescence: %s final claim did not consume the pending marker", repo.key)
+		// The final claim now owns the row: mirror the model through the
+		// claimed state (pending consumed) and, after finishing, through
+		// the idle state — counters included, so a crashed or stolen run
+		// leaking into them violates here.
+		s.syncClaims[repo.key] = &simSyncClaim{holder: holder, expires: now.Add(simSyncLease)}
+		s.syncPending[repo.key] = false
+		if err := s.checkSyncMirror(ctx, repo.key, "sync-quiesce-claim"); err != nil {
+			return err
+		}
+		if s.stopped {
 			return nil
 		}
-		s.syncPending[repo.key] = false
 		fin, err := s.cl.nodes[0].metaStore.FinishSync(ctx, repo.key, holder, true)
 		if err != nil {
 			return fmt.Errorf("final finish %s: %w", repo.key, err)
 		}
 		s.syncRunCount[repo.key]++
 		s.syncSuccessCount[repo.key]++
-		if fin.RunCount != s.syncRunCount[repo.key] || fin.SuccessCount != s.syncSuccessCount[repo.key] {
-			s.violate("issue-#88 quiescence: %s final counters %d/%d, model %d/%d (a crashed or stolen run leaked into the counters)",
-				repo.key, fin.RunCount, fin.SuccessCount, s.syncRunCount[repo.key], s.syncSuccessCount[repo.key])
-			return nil
-		}
-		if fin.Syncing || fin.SyncClaimHolder != "" || fin.SyncPending != s.syncPending[repo.key] {
-			s.violate("issue-#88 quiescence: %s final finish left claim state (syncing=%t holder=%q pending=%t, model pending %t)",
-				repo.key, fin.Syncing, fin.SyncClaimHolder, fin.SyncPending, s.syncPending[repo.key])
-			return nil
-		}
 		delete(s.syncClaims, repo.key)
+		if err := s.checkSyncMirror(ctx, repo.key, "sync-quiesce-finish"); err != nil {
+			return err
+		}
+		if s.stopped {
+			return nil
+		}
 		s.tracef("step=%04d op=sync-quiesce repo=%s out=%s runs=%d successes=%d",
 			s.step, repo.key, quiesceToken(stolenFrom), fin.RunCount, fin.SuccessCount)
 	}
