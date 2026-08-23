@@ -73,9 +73,10 @@ the default lane already covers both backends for those packages.
 
 Two flags are load-bearing:
 
-- **`-count=1`** — lane selection is an environment variable read in `TestMain`,
-  which the Go test cache does not key on. Without `-count=1`, switching lanes
-  can silently replay cached results from the other lane.
+- **`-count=1`** — lane selection is an environment variable read in `TestMain`
+  before the tests start, which the Go test cache cannot see. Without
+  `-count=1`, switching lanes can silently replay cached results from the
+  other lane ([details](docs/reference/testing.md#flags-that-are-not-optional)).
 - **`-race`** — CI runs every lane under the race detector; a test that is only
   green without `-race` is not green.
 

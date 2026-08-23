@@ -29,10 +29,14 @@ HTTP, and a real `git lfs` client.
 
 ### Flags that are not optional
 
-- **`-count=1` whenever an env var selects behavior.** The Go build cache does
-  not key test results on environment variables read at run time, so switching
-  `CODESTORAGE_TEST_BACKEND` (or any `DST_*` variable) without `-count=1` can
-  replay the *other* lane's cached results and report them as fresh.
+- **`-count=1` when switching lanes.** The Go test cache does track environment
+  variables — but only reads made while the tests run. `CODESTORAGE_TEST_BACKEND`
+  is read in `TestMain` *before* `m.Run()`, which the cache cannot see, so
+  switching lanes without `-count=1` silently replays the other lane's cached
+  results and reports them as fresh (reproducible: a `TestMain`-read variable
+  change still yields `(cached)`). Variables read inside test functions, such
+  as `DST_SEED`, invalidate the cache on their own; `-count=1` everywhere is
+  simply the uniform CI-parity habit.
 - **`-race` always.** Every CI lane runs under the race detector, including the
   nightly DST sweep. Local runs without `-race` are for fast iteration only.
 
@@ -131,8 +135,10 @@ Defaults: 150 steps, 3 nodes. Exit codes: `0` clean, `1` invariant violation,
    fault to the op that consumed it — e.g.
    `ref.CASRef/ambiguous(won=true err=<nil>)` is a CAS that committed under an
    ambiguous fault, the exact class the recovery oracles guard.
-4. **Pin it.** Once fixed, the seed is the regression test:
-   `DST_SEED=<seed> go test ./internal/simtest -run 'TestDSTSeed' -v -count=1`
+4. **Pin it.** Once fixed, the seed is the regression test — carry the
+   reported step count too, or a longer sweep's failure point silently falls
+   back to the 150-step default:
+   `DST_SEED=<seed> DST_STEPS=<steps> go test ./internal/simtest -run 'TestDSTSeed' -v -count=1`
    must print the same trace hash and pass.
 
 ### The nightly sweep
