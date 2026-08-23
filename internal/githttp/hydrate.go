@@ -60,6 +60,12 @@ func observeGitSpawn(dir string, args []string) {
 	}
 }
 
+// hookVerifyBarrier, when set, runs inside ensureHook's verification branch
+// between the content read and the trailing descriptor stat. Test seam for
+// injecting an in-place rewrite into that window deterministically (PR #98
+// round-9 review); same atomic-pointer pattern as gitSpawnObserver.
+var hookVerifyBarrier atomic.Pointer[func(path string)]
+
 // runGit executes git with args, returning stdout only. Stderr is captured
 // separately and surfaced in the error text: git warnings on stderr must
 // never contaminate parsed stdout (e.g. for-each-ref in SyncRefs).
@@ -290,6 +296,13 @@ func cacheRepoUnchanged(repoPath string, m cacheRepoMemo) bool {
 // setup under the fold's wall-clock budget, and a stalled subprocess or
 // filesystem must not outlive it.
 func EnsureCacheRepoCtx(ctx context.Context, cacheDir, repo string) (string, error) {
+	// Before memoization every call reached runGitCtx and propagated an
+	// expired context via its first subprocess; the memo hit must honor
+	// the same contract — the repack materializer runs this under its
+	// fold's wall-clock budget (PR #98 round-9 review).
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	path := RepoPath(cacheDir, repo)
 	if m, ok := cacheRepoMemos.Load(path); ok {
 		if cacheRepoUnchanged(path, m.(cacheRepoMemo)) {
@@ -399,18 +412,26 @@ func EnsureCacheRepoCtx(ctx context.Context, cacheDir, repo string) (string, err
 // re-read by path could pair the content of one inode with the stat of a
 // concurrent replacement renamed over it — during a rolling deployment the
 // memo would then vouch for the other binary's hook as if verified, and
-// stop repairing it (PR #98 review, P1). The path is then confirmed to
-// still name that same inode before the fingerprint may be memoized;
-// otherwise fall through and install our own script, exactly as if the
-// content had not matched.
+// stop repairing it (PR #98 round-1 review). The descriptor is stat'd
+// BEFORE and AFTER the content read and both must match: an in-place
+// writer on the same inode landing inside the read window would otherwise
+// pair the pre-write content with the post-write fingerprint (PR #98
+// round-9 review). Finally the path must still name that same unchanged
+// inode for the fingerprint to be memoizable; any failure falls through
+// and installs our own script, exactly as if the content had not matched.
 func ensureHook(path, script string) (os.FileInfo, error) {
 	if f, err := os.Open(path); err == nil {
+		pre, perr := f.Stat()
 		cur, rerr := io.ReadAll(f)
-		fi, serr := f.Stat()
+		if barrier := hookVerifyBarrier.Load(); barrier != nil {
+			(*barrier)(path)
+		}
+		post, serr := f.Stat()
 		_ = f.Close()
-		if rerr == nil && serr == nil && string(cur) == script && fi.Mode().Perm() == 0o755 {
-			if pathFI, err := os.Stat(path); err == nil && os.SameFile(fi, pathFI) {
-				return fi, nil
+		if perr == nil && rerr == nil && serr == nil && string(cur) == script &&
+			post.Mode().Perm() == 0o755 && fileUnchanged(pre, post) {
+			if pathFI, err := os.Stat(path); err == nil && fileUnchanged(post, pathFI) {
+				return post, nil
 			}
 		}
 	}

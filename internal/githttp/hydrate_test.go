@@ -169,6 +169,79 @@ func TestEnsureCacheRepo_MemoFallsThroughOnRepoRemoval(t *testing.T) {
 	}
 }
 
+// An in-place hook rewrite landing between ensureHook's content read and
+// its descriptor stat (same inode — no rename) must not be memoized as
+// verified: the read returned the good script but the fingerprint captures
+// the replacement, and the memo would then vouch for content nobody
+// checked (PR #98 round-9 review). The hookVerifyBarrier seam injects the
+// write into exactly that window.
+func TestEnsureCacheRepo_HookRewriteDuringVerifyNotMemoized(t *testing.T) {
+	cacheDir := t.TempDir()
+	const repo = "t-ensure-hookrace"
+	repoPath, err := EnsureCacheRepo(cacheDir, repo)
+	if err != nil {
+		t.Fatalf("EnsureCacheRepo: %v", err)
+	}
+	hook := filepath.Join(repoPath, "hooks", "pre-receive")
+	good, err := os.ReadFile(hook)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Force the next call down the full verification path.
+	cacheRepoMemos.Delete(repoPath)
+
+	var raced atomic.Bool
+	barrier := func(path string) {
+		if path != hook || raced.Swap(true) {
+			return
+		}
+		// In-place O_TRUNC rewrite: same inode, hostile content.
+		if err := os.WriteFile(hook, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+			t.Errorf("in-place hook rewrite: %v", err)
+		}
+	}
+	hookVerifyBarrier.Store(&barrier)
+	defer hookVerifyBarrier.Store(nil)
+
+	if _, err := EnsureCacheRepo(cacheDir, repo); err != nil {
+		t.Fatalf("EnsureCacheRepo (raced): %v", err)
+	}
+	if !raced.Load() {
+		t.Fatal("race injection never fired: hook verification read not observed")
+	}
+	hookVerifyBarrier.Store(nil)
+
+	// Whether the raced call repaired inline or declined to memoize, the
+	// hostile hook must not survive behind a memoized fast path.
+	if _, err := EnsureCacheRepo(cacheDir, repo); err != nil {
+		t.Fatalf("EnsureCacheRepo (after race): %v", err)
+	}
+	cur, err := os.ReadFile(hook)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(cur) != string(good) {
+		t.Fatalf("hostile hook survived verification race:\n%s", cur)
+	}
+}
+
+// A memo hit must still observe an expired context (PR #98 round-9
+// review): before memoization even the steady-state call reached runGitCtx
+// and propagated cancellation, and the repack materializer's fold budget
+// relies on that contract.
+func TestEnsureCacheRepoCtx_MemoHitObservesCancellation(t *testing.T) {
+	cacheDir := t.TempDir()
+	const repo = "t-ensure-memocancel"
+	if _, err := EnsureCacheRepo(cacheDir, repo); err != nil {
+		t.Fatalf("EnsureCacheRepo (memoize): %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := EnsureCacheRepoCtx(ctx, cacheDir, repo); !errors.Is(err, context.Canceled) {
+		t.Fatalf("memo-hit EnsureCacheRepoCtx = %v, want context.Canceled", err)
+	}
+}
+
 // Context expiry during the post-repair re-verification must propagate
 // (PR #98 round-8 review): the repack materializer runs EnsureCacheRepoCtx
 // under its wall-clock budget, and swallowing the ctx error as a "benign
