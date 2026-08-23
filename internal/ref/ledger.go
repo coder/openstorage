@@ -863,6 +863,15 @@ func (s *PG) BumpLFSAdoptionGen(ctx context.Context, repo string) error {
 		if err := lockBaseLedger(ctx, tx, baseRepoOf(repo)); err != nil {
 			return err
 		}
+		// Purge fence (issue #52, PR #105 round 10): a pre-delete
+		// writer's post-registration repair path can reach this bump
+		// after the purge's ledger cleanup; silently no-op instead of
+		// recreating the row — no admission for a purged repo consults
+		// floors, so there is nothing left to invalidate. The lock above
+		// totally orders the check against FenceRepoPurge.
+		if fenced, err := repoPurgeFencedPG(ctx, tx, repo); err != nil || fenced {
+			return err
+		}
 		_, err := tx.Exec(ctx, `
 INSERT INTO lfs_adoption_gens (repo, gen) VALUES ($1, 1)
 ON CONFLICT (repo) DO UPDATE SET gen = lfs_adoption_gens.gen + 1`, repo)

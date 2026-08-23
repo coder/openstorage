@@ -223,6 +223,20 @@ func TestRepoPurgeSeams(t *testing.T) {
 		if n, err := ps.PurgeRepoLedger(ctx, group); err != nil || n != 0 {
 			t.Fatalf("PurgeRepoLedger rerun: n=%d err=%v (want 0)", n, err)
 		}
+		// A post-cleanup generation bump (a pre-delete writer's repair
+		// handoff, PR #105 round 10) must not recreate the gens row.
+		if err := s.BumpLFSAdoptionGen(ctx, base); err != nil {
+			t.Fatalf("BumpLFSAdoptionGen(fenced): %v", err)
+		}
+		if gen, err := s.LFSAdoptionGen(ctx, base); err != nil || gen != 0 {
+			t.Fatalf("gens row recreated after purge: gen=%d err=%v", gen, err)
+		}
+		if err := s.BumpLFSAdoptionGen(ctx, other); err != nil {
+			t.Fatalf("control BumpLFSAdoptionGen: %v", err)
+		}
+		if gen, err := s.LFSAdoptionGen(ctx, other); err != nil || gen == 0 {
+			t.Fatalf("control gens bump lost: gen=%d err=%v", gen, err)
+		}
 	})
 }
 

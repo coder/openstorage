@@ -345,12 +345,17 @@ ON CONFLICT (repo) DO UPDATE SET gen = lfs_adoption_gens.gen + 1`, repo); err !=
 	return nil
 }
 
-// BumpLFSAdoptionGen — see RefStore (Codex round 49).
+// BumpLFSAdoptionGen — see RefStore (Codex round 49). The purge-fence
+// guard is inside the single upsert statement (issue #52, PR #105 round
+// 10; see the PG twin's rationale): no row proposed for a fenced repo
+// means no conflict and no update, and SQLite's single writer totally
+// orders the statement against FenceRepoPurge's insert.
 func (s *SQLite) BumpLFSAdoptionGen(ctx context.Context, repo string) error {
 	assertf(repo != "", "BumpLFSAdoptionGen(%q)", repo)
 	_, err := s.db.ExecContext(ctx, `
-INSERT INTO lfs_adoption_gens (repo, gen) VALUES (?, 1)
-ON CONFLICT (repo) DO UPDATE SET gen = lfs_adoption_gens.gen + 1`, repo)
+INSERT INTO lfs_adoption_gens (repo, gen)
+SELECT ?, 1 WHERE NOT EXISTS (SELECT 1 FROM purged_repos WHERE repo = ?)
+ON CONFLICT (repo) DO UPDATE SET gen = lfs_adoption_gens.gen + 1`, repo, baseRepoOf(repo))
 	return err
 }
 
