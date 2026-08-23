@@ -64,4 +64,4 @@ event types.
 - Emit events after the ref update commits atomically (queue + at-least-once delivery;
   receivers use timestamp checks, not idempotency keys — keep retry windows short or
   re-sign).
-- Ephemeral-namespace updates do not emit `push` events (see 01, invariant 7).
+- Ephemeral-namespace updates do not emit `push` events (see the [domain model](../explanation/domain-model.md), invariant 7).

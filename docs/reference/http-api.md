@@ -83,9 +83,9 @@ contract with implementation notes the spec lacks.
 | `GET /repos/commits` | git:read | `ref?` (deprecated alias `branch`), `cursor?, limit?, ephemeral?, path?` → `{commits: [CommitInfo], next_cursor, has_more}`, newest first; defaults to default branch |
 | `GET /repos/commit` | git:read | `ref` (req; deprecated alias `sha`; branch name, tag, short or full SHA) → `{commit: CommitInfo & {signature?, payload?}}` (signed commits: armored sig + exact signed payload bytes) |
 | `GET /repos/diff` | git:read | `ref` (req; deprecated alias `sha`), `base_ref?` (deprecated alias `baseSha`), `ref_is_ephemeral?`, `base_is_ephemeral?`, `git_apply_compatible?` (deprecated alias `gitApplyCompatible`), `path` (repeatable) → `{sha, stats, files: [FileDiff], filtered_files}`. On alias conflict the current name wins |
-| `POST /repos/commit-pack` | git:write | NDJSON stream — see 04 |
-| `POST /repos/diff-commit` | git:write | NDJSON stream — see 04 |
-| `POST /repos/restore-commit` | git:write | JSON `{metadata: {target_branch, target_commit_sha, author, commit_message?, expected_head_sha?, committer?}}` → commit ack (04). Creates a *new* commit restoring old tree (history preserved) |
+| `POST /repos/commit-pack` | git:write | NDJSON stream — see the [streaming protocols](../explanation/streaming-commit-protocols.md) |
+| `POST /repos/diff-commit` | git:write | NDJSON stream — see the [streaming protocols](../explanation/streaming-commit-protocols.md) |
+| `POST /repos/restore-commit` | git:write | JSON `{metadata: {target_branch, target_commit_sha, author, commit_message?, expected_head_sha?, committer?}}` → commit ack ([streaming protocols](../explanation/streaming-commit-protocols.md)). Creates a *new* commit restoring old tree (history preserved) |
 | `POST /repos/reset-commits` | git:write | In OpenAPI only (not in SDKs): NDJSON metadata stream; same restore-commit family |
 
 `CommitInfo` = `{sha, parent_shas[], message, author_name, author_email, committer_name,
