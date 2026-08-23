@@ -176,16 +176,24 @@ func (w *Worker) Run(ctx context.Context, job Job) error {
 	if err != nil {
 		return fmt.Errorf("finish sync %s: %w", job.RepoID, err)
 	}
+	// The run context may already be dead here — deadline expiry IS a
+	// common cause of reaching the failed path — and the production event
+	// sink uses the context for webhook listing and queue insertion, so a
+	// terminal event emitted on it would be silently dropped even though
+	// the row just counted the run. Emit (and requeue) detached, bounded.
+	tailCtx, cancelTail := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancelTail()
+
 	terminal := base
 	terminal.RunCount = fin.RunCount // includes the run that just finished
 	terminal.CompletedAt = eventTime(time.Now())
 	if runErr == nil {
 		terminal.Type = EventSyncSucceeded
-		w.Events.Emit(ctx, job.Org, EventSyncSucceeded, terminal.marshal())
+		w.Events.Emit(tailCtx, job.Org, EventSyncSucceeded, terminal.marshal())
 	} else {
 		terminal.Type = EventSyncFailed
 		terminal.Error = failureCode(runErr)
-		w.Events.Emit(ctx, job.Org, EventSyncFailed, terminal.marshal())
+		w.Events.Emit(tailCtx, job.Org, EventSyncFailed, terminal.marshal())
 		w.Logger.Warn("upstream sync failed",
 			"org", job.Org, "repo", job.RepoID, "error", terminal.Error, "cause", runErr)
 	}
@@ -199,7 +207,7 @@ func (w *Worker) Run(ctx context.Context, job Job) error {
 		// this run's lifecycle completes. Failure is log-only — local
 		// queued work is already documented as best-effort across
 		// restarts.
-		if rqErr := w.Requeue(ctx, job); rqErr != nil {
+		if rqErr := w.Requeue(tailCtx, job); rqErr != nil {
 			w.Logger.Warn("requeue pending sync failed",
 				"org", job.Org, "repo", job.RepoID, "err", rqErr)
 		}

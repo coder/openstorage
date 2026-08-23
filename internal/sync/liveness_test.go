@@ -133,10 +133,23 @@ func TestSyncRequestDuringClaimedRunIsObserved(t *testing.T) {
 		EventSyncStarted, EventSyncSucceeded, EventSyncStarted, EventSyncSucceeded)
 }
 
-// A run whose context expires mid-transfer must still clear its claim:
-// finishSync runs on a context detached from the run's budget. A claim
-// wedged by an expired-context FinishSync would make every later run —
-// including requeued pull-upstream requests — skip at BeginSync forever.
+// ctxCheckedSink mirrors the production webhookSink, which uses the emit
+// context for webhook listing and queue insertion: a dead context drops
+// the event. The plain recorder would hide emissions on expired contexts.
+type ctxCheckedSink struct{ inner EventSink }
+
+func (s ctxCheckedSink) Emit(ctx context.Context, org, eventType string, payload []byte) {
+	if ctx.Err() != nil {
+		return
+	}
+	s.inner.Emit(ctx, org, eventType, payload)
+}
+
+// A run whose context expires mid-transfer must still clear its claim AND
+// emit its terminal event: finishSync and the terminal emission both run
+// on contexts detached from the run's budget. A claim wedged by an
+// expired-context FinishSync would make every later run — including
+// requeued pull-upstream requests — skip at BeginSync forever.
 func TestFinishSyncSurvivesExpiredRunContext(t *testing.T) {
 	f := newWorkerFixture(t)
 	seedUpstream(t, f.upstreamDir, "own", "proj")
@@ -149,6 +162,7 @@ func TestFinishSyncSurvivesExpiredRunContext(t *testing.T) {
 		release:       make(chan struct{}),
 	}
 	f.worker.Upstreams = gate
+	f.worker.Events = ctxCheckedSink{f.rec}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
