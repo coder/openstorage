@@ -64,10 +64,12 @@ SELECT
   COALESCE((SELECT SUM(bytes) FROM pack_reservations
             WHERE repo = ?
               AND created_at > `+sqliteEpochMS+` - ?
+              AND key NOT LIKE '%`+AdoptionClaimSuffix+`'
               AND key NOT IN (?`+placeholders(len(excludeSum)-1)+`)), 0),
   (SELECT COUNT(*) FROM pack_reservations
    WHERE repo = ?
      AND created_at > `+sqliteEpochMS+` - ?
+     AND key NOT LIKE '%`+AdoptionClaimSuffix+`'
      AND key NOT IN (?`+placeholders(len(excludeCount)-1)+`))`,
 		groupArgs...).Scan(&counter, &reserved, &activeRows); err != nil {
 		return ReserveDecision{}, fmt.Errorf("reserve pack bytes read: %w", err)

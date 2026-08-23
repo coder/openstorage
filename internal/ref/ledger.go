@@ -502,10 +502,12 @@ SELECT
   COALESCE((SELECT SUM(bytes) FROM pack_reservations
             WHERE repo = $2
               AND created_at > now() - make_interval(secs => $3)
+              AND key NOT LIKE '%`+AdoptionClaimSuffix+`'
               AND NOT (key = ANY($4))), 0),
   (SELECT COUNT(*) FROM pack_reservations
    WHERE repo = $2
      AND created_at > now() - make_interval(secs => $3)
+     AND key NOT LIKE '%`+AdoptionClaimSuffix+`'
      AND NOT (key = ANY($5)))`,
 			group, group[0], ttl.Seconds(), reservKeySpellings(keys...), reservRowKeys(keys)).Scan(&counter, &reserved, &activeRows); err != nil {
 			return err

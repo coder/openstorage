@@ -2719,13 +2719,37 @@ func (s *Server) maybeLegacyCompatCopy(ctx context.Context, repoID, oid, key str
 	}
 	copyErr, renewErr := blob.WithRenewedCover(dctx, renewCover, doCopy, bump)
 	if copyErr != nil {
-		// PROPAGATED, not swallowed (Codex round 83): a 200 with no
-		// legacy spelling does not converge — the canonical row is
-		// registered, so no client retry would ever reach a path that
-		// re-attempts this copy without the registered-retry repair seam.
-		// Failing the request keeps the client retrying until
-		// ensureLegacyCompat lands the spelling.
-		return fmt.Errorf("compat copy %s: %w", legacyKey, copyErr)
+		// Ambiguous-commit probe (Codex round 95, P1): an S3 copy can
+		// COMMIT its destination and still return an error (response
+		// lost, context canceled concurrently). Returning here skipped
+		// the cover tail and the floor-generation handoff — and every
+		// retry saw the spelling present and skipped them too, so the
+		// durable bytes stayed invisible to pre-copy cached floors for
+		// their whole serve-and-handoff window. A present destination is
+		// a commit: re-cover best-effort, hand off, and succeed.
+		actx, acancel := context.WithTimeout(dctx, lfsProbeTimeout)
+		_, aerr := s.Blob.Stat(actx, legacyKey)
+		acancel()
+		if aerr != nil {
+			// Truly absent (or unknowable: fail closed, the retry
+			// repairs via ensureLegacyCompat). PROPAGATED, not swallowed
+			// (Codex round 83): a 200 with no legacy spelling does not
+			// converge — the canonical row is registered, so no client
+			// retry would ever reach a path that re-attempts this copy
+			// without the registered-retry repair seam.
+			return fmt.Errorf("compat copy %s: %w", legacyKey, copyErr)
+		}
+		hctx, hcancel := context.WithTimeout(dctx, blob.CoverHandoffTimeout)
+		defer hcancel()
+		if cerr := ref.ReserveRestoreCover(hctx, s.Store, blob.QuotaRepoGroup(repoID), legacyKey, size, s.lfsReservationTTL()); cerr != nil {
+			log.Printf("lfs compat copy %s: ambiguous-commit cover: %v", legacyKey, cerr)
+		}
+		if berr := bump(hctx); berr != nil {
+			log.Printf("lfs compat copy %s: ambiguous-commit handoff: %v", legacyKey, berr)
+		}
+		s.invalidateUsageFloor(repoID)
+		log.Printf("lfs compat copy %s: destination committed despite copy error: %v", legacyKey, copyErr)
+		return nil
 	}
 	s.invalidateUsageFloor(repoID)
 	if renewErr != nil {
