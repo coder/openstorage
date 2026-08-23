@@ -13,20 +13,48 @@ Zero dependencies. Not wired into CI on purpose — run it when touching docs:
 Exits non-zero and prints one line per broken link. Anchor checking follows
 GitHub's algorithm (lowercase, strip backticks/asterisks, spaces to hyphens,
 dedupe with -1/-2 suffixes) and skips docs/upstream/ anchors (vendor copies).
+
+Deliberately minimal: it parses the Markdown this tree actually writes.
+Destinations may contain balanced (single-level) parentheses and an optional
+quoted title; fences track their opening character and length per CommonMark.
 """
 import os, re, sys, posixpath
 
 os.chdir(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
-LINK = re.compile(r"\]\(([^)\s#]*)(#[^)\s]*)?(?:\s+[\"\x27][^)]*[\"\x27])?\)")
+# Destination: runs of non-space/non-paren/non-# chars, allowing one level of
+# balanced parens; then an optional #fragment and an optional quoted title.
+LINK = re.compile(
+    r"\]\(((?:[^()\s#]|\([^()\s]*\))*)(#[^)\s]*)?(?:\s+[\"\x27][^)]*[\"\x27])?\)")
 REFDEF = re.compile(r"^ {0,3}\[[^\]^]+\]:\s")
-FENCE = re.compile(r"^ {0,3}(```|~~~)")
+FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
+HEADING = re.compile(r"^ {0,3}(#+) +(.*)$")
 
-HEADING = re.compile(r"^#+ +(.*)$")
+
 def gh_anchor(h):
     h = re.sub(r"[`*]", "", h.strip().lower())
     h = re.sub(r"[^\w\- ]", "", h, flags=re.UNICODE)
     return h.replace(" ", "-")
+
+
+def scan_lines(path):
+    """Yield (lineno, line) for lines outside fenced code blocks, tracking the
+    opening fence's character and length so only a compatible closer ends it."""
+    fence = None  # (char, length) of the open fence
+    for lineno, ln in enumerate(open(path), 1):
+        m = FENCE.match(ln)
+        if m:
+            marker = m.group(1)
+            if fence is None:
+                fence = (marker[0], len(marker))
+                continue
+            if marker[0] == fence[0] and len(marker) >= fence[1]:
+                fence = None
+                continue
+            # a shorter/other-char fence inside an open block is content
+        if fence is None:
+            yield lineno, ln
+
 
 def check():
     md = ["README.md", "CONTRIBUTING.md", "CHANGELOG.md"]
@@ -37,15 +65,10 @@ def check():
     anchors = {}
     for path in md:
         aset = set()
-        in_code = False
-        for ln in open(path):
-            if FENCE.match(ln):
-                in_code = not in_code
-                continue
-            if in_code: continue
+        for _, ln in scan_lines(path):
             m = HEADING.match(ln)
             if m:
-                base = gh_anchor(m.group(1))
+                base = gh_anchor(m.group(2))
                 a, i = base, 1
                 while a in aset:
                     a = f"{base}-{i}"; i += 1
@@ -53,15 +76,8 @@ def check():
         anchors[path] = aset
     bad = 0
     for path in md:
-        if path.startswith("docs/upstream"):  # vendor copies: check file targets only
-            pass
         d = posixpath.dirname(path) or "."
-        in_code = False
-        for lineno, ln in enumerate(open(path), 1):
-            if FENCE.match(ln):
-                in_code = not in_code
-                continue
-            if in_code: continue
+        for lineno, ln in scan_lines(path):
             if REFDEF.match(ln):
                 print(f"UNSUPPORTED REF-STYLE LINK DEF {path}:{lineno} -> {ln.strip()[:60]}")
                 bad += 1
