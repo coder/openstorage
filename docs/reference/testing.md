@@ -165,3 +165,37 @@ be dispatched manually with `seeds` / `base` / `steps` inputs, which map to the
 `DST_SWEEP_SEEDS` / `DST_SWEEP_BASE` / `DST_STEPS` variables of `TestDSTSweep`.
 There are no artifacts — everything needed to replay a failure is in the job
 log.
+
+## Fuzzing
+
+Native Go fuzz targets (`func Fuzz*` in `fuzz_test.go` files) cover the
+untrusted-input decoders: receive-pack sniffing and the LFS batch decode
+(`internal/githttp`), JWT verification and ref-policy parsing
+(`internal/auth`), secret envelopes and key parsing (`internal/secrets`),
+pack header/idx counts (`internal/jobs`), and rate-limit client keying and
+pagination cursors (`internal/api`). Targets assert *graceful* behavior, not
+just no-panic: garbage must map to errors — never a fabricated identity,
+plaintext, or capability — usually via an independent reference oracle or a
+known-answer set built from keys that exist only in the test process.
+
+Seed corpora live in the `f.Add` calls next to each target, so plain
+`go test ./...` replays every seed as an ordinary test — normal CI covers
+fuzz regressions for free. When a campaign finds a failing input, `go test`
+writes it to `<pkg>/testdata/fuzz/<FuzzTarget>/`; check that file in with the
+fix so the crasher replays forever.
+
+Run a target locally with (one `-fuzz` target per invocation):
+
+```sh
+go test ./internal/auth -run '^$' -fuzz '^FuzzVerify$' -fuzztime 60s -parallel 8
+```
+
+Keep `-parallel` around 8 on high-core machines — the default spawns one
+worker per core, and each `internal/githttp` fuzz process skips the e2e
+environment boot via the fuzz early-out in its `TestMain`.
+
+[`fuzz-nightly.yml`](../../.github/workflows/fuzz-nightly.yml) runs the
+sustained sweep daily (02:41 UTC): every target sequentially at 4m each
+(dispatch inputs `fuzztime` / `parallel` override the budget). A failing
+input turns the workflow red and uploads everything under
+`internal/*/testdata/fuzz/` as the `fuzz-crashers` artifact for triage.

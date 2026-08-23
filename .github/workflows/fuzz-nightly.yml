@@ -1,0 +1,73 @@
+# Nightly sustained fuzzing for the untrusted-input decoders (issue #91).
+# The PR pipeline already replays every checked-in seed (f.Add corpora run
+# as ordinary tests under plain `go test`); this workflow explores new
+# inputs with real per-target budgets. `go test` only fuzzes one target per
+# invocation, so the sweep runs each target sequentially and keeps going
+# after a failure to surface every crasher in one run. Crashers are written
+# to <pkg>/testdata/fuzz/<Target>/ and uploaded as artifacts; reproduce
+# locally with `go test <pkg> -run 'Fuzz<Target>/<crasher-id>'` after
+# dropping the artifact file back into that directory.
+name: fuzz-nightly
+
+on:
+  schedule:
+    - cron: "41 2 * * *" # daily, 02:41 UTC
+  workflow_dispatch:
+    inputs:
+      fuzztime:
+        description: "per-target fuzz budget (go duration)"
+        default: "4m"
+      parallel:
+        description: "fuzz workers per target"
+        default: "8"
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: sustained fuzzing sweep
+        run: |
+          FUZZTIME="${{ github.event.inputs.fuzztime }}"
+          PARALLEL="${{ github.event.inputs.parallel }}"
+          FUZZTIME="${FUZZTIME:-4m}"
+          PARALLEL="${PARALLEL:-8}"
+          echo "sweep: fuzztime=$FUZZTIME parallel=$PARALLEL"
+          targets="
+            ./internal/githttp:FuzzSniffAtomicPush
+            ./internal/githttp:FuzzLFSBatch
+            ./internal/auth:FuzzVerify
+            ./internal/auth:FuzzParseRefPolicies
+            ./internal/secrets:FuzzDecrypt
+            ./internal/secrets:FuzzParseKeys
+            ./internal/jobs:FuzzPackHeaderObjectCount
+            ./internal/jobs:FuzzPackObjectCount
+            ./internal/api:FuzzClientKey
+            ./internal/api:FuzzCoreCursor
+          "
+          failed=0
+          for t in $targets; do
+            pkg="${t%%:*}"
+            fn="${t##*:}"
+            echo "::group::$pkg $fn"
+            if ! go test "$pkg" -run '^$' -fuzz "^${fn}\$" -fuzztime "$FUZZTIME" -parallel "$PARALLEL" -timeout 30m; then
+              failed=1
+              echo "::error::fuzz target $fn found a failing input"
+            fi
+            echo "::endgroup::"
+          done
+          exit "$failed"
+      - name: upload crashers
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fuzz-crashers
+          path: internal/*/testdata/fuzz/**
+          if-no-files-found: warn
