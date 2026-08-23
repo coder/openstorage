@@ -14,6 +14,8 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"os"
+	"strconv"
 	"time"
 )
 
@@ -59,7 +61,15 @@ type RepoUpstream struct {
 	// claimed (its fetch may predate them) and a follow-up run is due
 	// (issue #79 liveness).
 	SyncPending bool
-	CreatedAt   time.Time
+	// SyncClaimHolder/SyncClaimExpiresAt lease the Syncing claim (issue
+	// #86): every claim records a per-run holder token and an expiry, and
+	// a conflicting claimant may STEAL a claim whose lease has provably
+	// expired — the only recovery for a holder process that died between
+	// TryBeginSync and FinishSync. FinishSync clears both (holder "" and
+	// expiry at the zero instant, epoch/0 in storage).
+	SyncClaimHolder    string
+	SyncClaimExpiresAt time.Time
+	CreatedAt          time.Time
 }
 
 // NewEventingID returns "<prefix>_<16 hex>" — the shared ID shape for
@@ -71,6 +81,32 @@ func NewEventingID(prefix string) string {
 	_, err := rand.Read(buf[:])
 	assertf(err == nil, "NewEventingID: crypto/rand failed: %v", err)
 	return prefix + "_" + hex.EncodeToString(buf[:])
+}
+
+// LegacyClaimHolder marks a sync claim taken by a pre-lease replica and
+// adopted into the lease regime by a new one (TryBeginSync mixed-fleet
+// staging). The '!' prefix cannot occur in real holder tokens, whose
+// process tag is hostname-pid (RFC 1123 hostnames have no '!').
+//
+// Adopted legacy claims are NEVER stolen by default: a pre-lease binary
+// has neither the ref-update fence nor a holder-guarded FinishSync, so no
+// finite grace can make stealing from a possibly-alive one safe. Stealing
+// them requires EnvSyncStealLegacy — the operator's assertion that no
+// pre-lease replica remains (same fleet-prerequisite pattern as
+// delete-mode sweeping), after which legacy rows can only be pre-upgrade
+// wedges. Claims from lease-aware replicas heal automatically regardless.
+const LegacyClaimHolder = "!legacy-grace"
+
+// EnvSyncStealLegacy enables stealing adopted legacy claims whose grace
+// has lapsed. Any value strconv.ParseBool accepts as true enables it;
+// malformed values stay disabled (the safe direction).
+const EnvSyncStealLegacy = "CODESTORAGE_SYNC_STEAL_LEGACY"
+
+// legacyStealEnabled reads EnvSyncStealLegacy per decision (cheap; tests
+// flip it with t.Setenv).
+func legacyStealEnabled() bool {
+	v, err := strconv.ParseBool(os.Getenv(EnvSyncStealLegacy))
+	return err == nil && v
 }
 
 // EventingStore is the phase-5 persistence surface. Org-scoped methods key
@@ -132,16 +168,45 @@ type EventingStore interface {
 	// survives to that run's FinishSync and the finisher schedules a
 	// follow-up run. ErrNotFound when detached.
 	RequestSync(ctx context.Context, repoID string) error
-	// TryBeginSync atomically claims a sync run (syncing false -> true) and
-	// returns the row as of the claim. The claim consumes sync_pending:
-	// every request marked before the claim is observed by the claimed
-	// run's upstream fetch, which happens after it. claimed=false (row
-	// returned) when a run is already in flight; ErrNotFound when detached.
-	TryBeginSync(ctx context.Context, repoID string) (up RepoUpstream, claimed bool, err error)
-	// FinishSync completes the claimed run: increments RunCount (and
-	// SuccessCount when success), clears Syncing, returns the updated row.
-	// SyncPending is NOT touched: a set flag in the returned row tells the
-	// finisher to schedule a follow-up run (the follow-up's claim consumes
-	// it). ErrNotFound when the repo was detached mid-run.
-	FinishSync(ctx context.Context, repoID string, success bool) (RepoUpstream, error)
+	// PendingSyncRepoIDs lists repos whose sync_pending marker is set —
+	// accepted pull-upstream requests not yet covered by a claimed run.
+	// Local-mode boot recovery re-enqueues them (issue #86): queued local
+	// work dies with the process, and the restart that applies the
+	// EnvSyncStealLegacy opt-in would otherwise strand the very requests
+	// it is meant to heal until an unrelated trigger arrives.
+	PendingSyncRepoIDs(ctx context.Context) ([]string, error)
+	// TryBeginSync atomically claims a sync run (syncing false -> true)
+	// under a lease and returns the row as of the claim. holder is the
+	// caller's per-run claim token; the claim records it with an expiry
+	// of now+lease. A row whose current claim has EXPIRED is stolen
+	// atomically (read-check-write inside one transaction/row lock — no
+	// read-then-write window): stolenFrom then carries the previous
+	// holder for observability, and the previous holder's late
+	// FinishSync fails with ErrClaimLost.
+	//
+	// Mixed-fleet staging (rolling upgrades from pre-lease versions): a
+	// claim with an EMPTY holder was taken by an old replica that writes
+	// no lease — it may be a live run, not a crashed one. Such a claim
+	// is never stolen on sight; it is ADOPTED instead (holder set to
+	// LegacyClaimHolder, expiry now+lease, claimed=false) and becomes
+	// stealable only when that grace passes without the old replica's
+	// FinishSync clearing it. The grace equals the caller's lease, which
+	// strictly dominates any live pre-lease run window.
+	//
+	// The claim consumes sync_pending: every request marked before the
+	// claim is observed by the claimed run's upstream fetch, which
+	// happens after it. claimed=false (row returned) when an unexpired
+	// run is in flight or a legacy claim was just adopted; ErrNotFound
+	// when detached.
+	TryBeginSync(ctx context.Context, repoID, holder string, lease time.Duration) (up RepoUpstream, claimed bool, stolenFrom string, err error)
+	// FinishSync completes the run claimed by holder: increments RunCount
+	// (and SuccessCount when success), clears Syncing and the claim
+	// lease, returns the updated row. SyncPending is NOT touched: a set
+	// flag in the returned row tells the finisher to schedule a follow-up
+	// run (the follow-up's claim consumes it). ErrNotFound when the repo
+	// was detached mid-run or no run is in flight; ErrClaimLost when the
+	// row is claimed by a DIFFERENT holder — the caller's expired claim
+	// was stolen, and the late finisher must abandon without touching the
+	// thief's claim or the counters.
+	FinishSync(ctx context.Context, repoID, holder string, success bool) (RepoUpstream, error)
 }

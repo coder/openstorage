@@ -3,6 +3,8 @@ package sync
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -10,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	stdsync "sync"
 	"time"
 )
 
@@ -39,11 +42,78 @@ type Loopback struct {
 	// Token mints a short-lived git:write JWT for the loopback push (basic
 	// auth `t:<jwt>`, docs/explanation/git-protocol-and-namespaces.md). The token is passed to git via GIT_ASKPASS
 	// and never logged. May return "" when BaseURL needs no auth (file://).
-	Token func(ctx context.Context, org string, repo RepoInfo) (string, error)
+	// ttl and holder FENCE the push against a claim steal (issue #86):
+	// implementations must cap the token lifetime at ttl (no new push
+	// request authenticates once the lease can be stolen) and carry
+	// holder as the auth.Claims.SyncClaim so the update hook refuses ref
+	// updates from a run whose claim was stolen mid-receive-pack.
+	Token func(ctx context.Context, org string, repo RepoInfo, ttl time.Duration, holder string) (string, error)
 }
 
 // defaultRunTimeout caps one sync run end-to-end.
 const defaultRunTimeout = 10 * time.Minute
+
+// detachedOpTimeout bounds each lifecycle step that runs on a context
+// DETACHED from the run budget (started/terminal emissions, finishSync,
+// requeue): they must survive run-context death without running unbounded.
+const detachedOpTimeout = 30 * time.Second
+
+// claimLeaseSlack pads the sync claim lease beyond the worst-case claim
+// window. From claim to release a run spends at most: the started
+// emission's detached window (detachedOpTimeout — it runs between the
+// claim and the transfer) + the remaining run budget (the transfer runs
+// under the run context, ≤ Timeout) + finishSync's detached window
+// (detachedOpTimeout, which internally bounds its retries). The slack
+// absorbs scheduler stalls, DB latency, and clock granularity on top of
+// that hard bound. On Postgres both sides of the expiry comparison
+// evaluate on the database clock, so node clock skew does not participate.
+// A holder that still outlives the lease (VM freeze) remains SAFE: its
+// late FinishSync fails the holder-token guard (ErrClaimLost) and
+// abandons without touching the thief's claim.
+const claimLeaseSlack = 5 * time.Minute
+
+// claimLease derives the lease for one run from its effective timeout.
+func claimLease(timeout time.Duration) time.Duration {
+	assertf(timeout > 0, "claimLease: non-positive timeout %v", timeout)
+	return timeout + 2*detachedOpTimeout + claimLeaseSlack
+}
+
+// claimFenceMargin is how long BEFORE the lease expiry the run's loopback
+// token dies (the push fence, issue #86): a steal is only possible at
+// expiry, so no zombie can authenticate a new push request within the
+// margin of one. Structurally safe for live runs: the push starts at most
+// timeout + one detached window after the claim, and
+// claimLease - claimFenceMargin = timeout + 4min leaves ≥ 3min of token
+// life at that point. The margin also absorbs clock skew between the
+// database clock (which governs the expiry on Postgres) and this
+// process's clock (which mints the token), and bounds how stale an
+// in-flight request can be: with the run context killing the git client
+// (exec.CommandContext) well before the lease can expire, the residual
+// exposure is a worker frozen (SIGSTOP/VM pause) past its own run budget
+// whose orphaned localhost push request stays continuously in flight
+// longer than this margin.
+const claimFenceMargin = 2 * time.Minute
+
+// processTag identifies this process in claim-holder tokens (observability
+// only; uniqueness comes from the per-run nonce).
+var processTag = func() string {
+	host, err := os.Hostname()
+	if err != nil {
+		host = "unknown"
+	}
+	return fmt.Sprintf("%s-%d", host, os.Getpid())
+}()
+
+// newClaimHolder mints a per-RUN claim token. Uniqueness per claim (not
+// per process) matters: FinishSync must clear exactly the claim its run
+// took, or a lingering late finisher from the same process could clear a
+// successor's claim.
+func newClaimHolder() string {
+	var buf [8]byte
+	_, err := rand.Read(buf[:])
+	assertf(err == nil, "crypto/rand failed: %v", err)
+	return processTag + "-" + hex.EncodeToString(buf[:])
+}
 
 // Worker executes sync runs (docs/reference/webhooks.md lifecycle): claim the run, emit
 // repo.sync.started, mirror-fetch the upstream, loopback-push to storage,
@@ -63,6 +133,12 @@ type Worker struct {
 	// endpoints); production keeps the default so hostile upstream rows
 	// can never reach local files, ssh, or transport helpers (ext::).
 	AllowProtocol string
+	// deferMu guards deferredRetry: at most ONE pending deferred retry
+	// timer per repository (issue #86 — request volume against a dead
+	// holder's unexpired lease must not accumulate timers).
+	deferMu       stdsync.Mutex
+	deferredRetry map[string]bool
+
 	// Requeue, when non-nil, schedules a follow-up run when FinishSync
 	// reports sync requests that arrived after this run's claim
 	// (Upstream.SyncPending, issue #79): this run's upstream fetch may
@@ -107,6 +183,13 @@ func (f *syncFailure) Unwrap() error { return f.cause }
 // documented semantics are silent cancellation (no failed event).
 var errDetached = errors.New("upstream detached during sync")
 
+// errClaimStolen signals the pre-push barrier found the claim held by a
+// DIFFERENT holder: this run outlived its lease and was stolen (issue
+// #86). Abandoning BEFORE the loopback push keeps the zombie's stale fetch
+// snapshot from overwriting the thief's newer push; like errDetached, the
+// run ends silently (the thief owns the lifecycle).
+var errClaimStolen = errors.New("sync claim stolen during run")
+
 // failureCode maps a run error onto the documented repo.sync.failed string.
 func failureCode(err error) string {
 	assertf(err != nil, "failureCode: nil error")
@@ -142,14 +225,29 @@ func (w *Worker) Run(ctx context.Context, job Job) error {
 	}
 	assertf(repo.RepoID == job.RepoID, "RepoLookup returned %q for %q", repo.RepoID, job.RepoID)
 
-	up, err := w.Upstreams.BeginSync(ctx, job.RepoID)
+	holder := newClaimHolder()
+	up, stolenFrom, err := w.Upstreams.BeginSync(ctx, job.RepoID, holder, claimLease(timeout))
 	switch {
 	case errors.Is(err, ErrNotFound):
 		return nil // detached before start: cancel silently (docs/reference/webhooks.md)
 	case errors.Is(err, ErrSyncInProgress):
-		return nil // overlapping run: skip (invariant 11)
+		// Overlapping run: skip (invariant 11). A LIVE holder covers any
+		// pending request at its FinishSync (#85) — but a dead holder's
+		// unexpired lease refuses the steal AND never finishes, and this
+		// run was the request's only local vehicle: schedule one retry
+		// for just after the lease expires (issue #86).
+		w.deferPendingRetry(ctx, job)
+		return nil
 	case err != nil:
 		return fmt.Errorf("begin sync %s: %w", job.RepoID, err)
+	}
+	if stolenFrom != "" {
+		// The previous holder's lease expired without a FinishSync — its
+		// process died mid-run (issue #86). Loud on purpose: steals are
+		// normal only after crashes; a pattern of them means the lease is
+		// racing live runs (clock trouble or budget drift).
+		w.Logger.Warn("stole expired sync claim",
+			"org", job.Org, "repo", job.RepoID, "holder", holder, "stolen_from", stolenFrom)
 	}
 
 	startedAt := eventTime(time.Now())
@@ -164,14 +262,31 @@ func (w *Worker) Run(ctx context.Context, job Job) error {
 	started.Type = EventSyncStarted
 	w.emitDetached(ctx, job.Org, EventSyncStarted, started.marshal())
 
-	runErr := w.transfer(ctx, job, repo, up)
+	runErr := w.transfer(ctx, job, repo, up, holder)
 	if errors.Is(runErr, errDetached) {
 		return nil // detach raced the run: the row is gone, cancel silently
 	}
+	if errors.Is(runErr, errClaimStolen) {
+		// Lease expired mid-run and the claim was stolen before our push:
+		// abandon without finishing or terminal events — but loudly, so
+		// operators can spot leases racing live runs.
+		w.Logger.Warn("sync claim stolen mid-run; abandoning before the loopback push",
+			"org", job.Org, "repo", job.RepoID, "holder", holder)
+		return nil
+	}
 
-	fin, err := w.finishSync(ctx, job.RepoID, runErr == nil)
+	fin, err := w.finishSync(ctx, job.RepoID, holder, runErr == nil)
 	if errors.Is(err, ErrNotFound) {
 		return nil // detached mid-run: cancel silently (docs/reference/webhooks.md)
+	}
+	if errors.Is(err, ErrClaimLost) {
+		// This run outlived its lease and the claim was stolen: the thief
+		// owns the lifecycle (its fetch postdates ours), so abandon
+		// without terminal events or counter writes — but loudly, so
+		// operators can spot leases racing live runs.
+		w.Logger.Warn("sync claim lost before completion; abandoning late run",
+			"org", job.Org, "repo", job.RepoID, "holder", holder, "runErr", runErr)
+		return nil
 	}
 	if err != nil {
 		return fmt.Errorf("finish sync %s: %w", job.RepoID, err)
@@ -199,7 +314,7 @@ func (w *Worker) Run(ctx context.Context, job Job) error {
 		// this run's lifecycle completes. Failure is log-only — local
 		// queued work is already documented as best-effort across
 		// restarts.
-		rqCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		rqCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), detachedOpTimeout)
 		defer cancel()
 		// fin is a snapshot from FinishSync, and the emissions above can
 		// block long enough for another run (e.g. the request's own
@@ -220,6 +335,80 @@ func (w *Worker) Run(ctx context.Context, job Job) error {
 	return runErr
 }
 
+// deferRetrySlack delays the deferred retry past the observed lease expiry
+// so the retry's claim attempt lands strictly after the lease can be
+// stolen (clock granularity, store latency).
+const deferRetrySlack = time.Second
+
+// deferredRetryDelay computes how long a claim-skip retry waits for the
+// observed claim: just past its expiry normally, but a LEGACY claim
+// (adopted from a pre-lease replica) may be deliberately non-stealable
+// (meta.EnvSyncStealLegacy unset), so a lapsed one is probed at
+// lease-slack cadence instead of spinning at the floor — the retry loop
+// stays alive for the moment the operator enables the opt-in (or the old
+// replica finishes) without burning queue and store work every second.
+func deferredRetryDelay(up Upstream) time.Duration {
+	delay := time.Until(up.SyncClaimExpiresAt) + deferRetrySlack
+	if delay < deferRetrySlack {
+		delay = deferRetrySlack
+	}
+	if up.SyncClaimHolder == LegacyClaimHolder && delay < claimLeaseSlack {
+		delay = claimLeaseSlack
+	}
+	return delay
+}
+
+// deferPendingRetry schedules one delayed re-enqueue after a claim-skip
+// that would otherwise strand an accepted pull-upstream request: when the
+// refusing claim's holder is DEAD (crashed process, lease not yet
+// expired), no FinishSync will ever report the pending marker, so the
+// skip is the request's last local vehicle until the lease can be stolen.
+// The timer is gated on the marker both now and at fire time: a live
+// holder's finisher (or any interim run's claim) consumes it, making the
+// deferred retry a cheap no-op. Timers die with the process — the
+// documented local-mode trade-off; the river lane instead relies on its
+// durable job being rescued and re-run (jobs/river.go syncRescueAttempts).
+func (w *Worker) deferPendingRetry(ctx context.Context, job Job) {
+	if w.Requeue == nil {
+		return // river lane: durable rescue owns crashed-holder recovery
+	}
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), detachedOpTimeout)
+	defer cancel()
+	up, err := w.Upstreams.GetUpstream(rctx, job.RepoID)
+	if err != nil || !up.SyncPending {
+		return // nothing promised (or detached): the skip is final
+	}
+	// At most one pending timer per repo: repeated requests against the
+	// same dead lease coalesce into it (their markers are one flag), and
+	// the slot frees when it fires so a later skip can schedule anew.
+	w.deferMu.Lock()
+	if w.deferredRetry == nil {
+		w.deferredRetry = make(map[string]bool)
+	}
+	if w.deferredRetry[job.RepoID] {
+		w.deferMu.Unlock()
+		return
+	}
+	w.deferredRetry[job.RepoID] = true
+	w.deferMu.Unlock()
+
+	time.AfterFunc(deferredRetryDelay(up), func() {
+		w.deferMu.Lock()
+		delete(w.deferredRetry, job.RepoID)
+		w.deferMu.Unlock()
+		bg, cancel := context.WithTimeout(context.Background(), detachedOpTimeout)
+		defer cancel()
+		cur, err := w.Upstreams.GetUpstream(bg, job.RepoID)
+		if err != nil || !cur.SyncPending {
+			return // covered meanwhile (or detached)
+		}
+		if rqErr := w.Requeue(bg, job); rqErr != nil {
+			w.Logger.Warn("deferred pending sync requeue failed",
+				"org", job.Org, "repo", job.RepoID, "err", rqErr)
+		}
+	})
+}
+
 // emitDetached emits one lifecycle event on a bounded context DETACHED
 // from the run budget: run-context death (deadline expiry is a normal
 // failure cause, and cancellation can land right after the claim) must not
@@ -227,7 +416,7 @@ func (w *Worker) Run(ctx context.Context, job Job) error {
 // listing and queue insertion, so a dead context would silently lose the
 // event and leave observers with an incomplete started/terminal sequence.
 func (w *Worker) emitDetached(ctx context.Context, org, eventType string, payload []byte) {
-	ectx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	ectx, cancel := context.WithTimeout(context.WithoutCancel(ctx), detachedOpTimeout)
 	defer cancel()
 	w.Events.Emit(ectx, org, eventType, payload)
 }
@@ -238,19 +427,20 @@ const finishSyncAttempts = 3
 
 // finishSync completes the claimed run on a context DETACHED from the
 // run's own budget, retrying transient failures. Only the claim holder can
-// clear Syncing, so a FinishSync failed on the run's already-expired
-// context (the run timeout is the most likely cause of reaching here late)
-// would wedge the row permanently — every later run, including requeued
-// pull-upstream requests, would skip at BeginSync forever. ErrNotFound
-// (detach) returns immediately; exhausting the attempts leaves the row in
-// the documented crash state (claim held until operator action).
-func (w *Worker) finishSync(ctx context.Context, repoID string, success bool) (Upstream, error) {
-	fctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+// clear Syncing before the lease expires, so a FinishSync failed on the
+// run's already-expired context (the run timeout is the most likely cause
+// of reaching here late) would leave the row claimed until the lease
+// steal (issue #86) — recover in-process first. ErrNotFound (detach) and
+// ErrClaimLost (claim stolen: retrying cannot win it back) return
+// immediately; exhausting the attempts leaves the claim to expire and be
+// stolen by the next run.
+func (w *Worker) finishSync(ctx context.Context, repoID, holder string, success bool) (Upstream, error) {
+	fctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), detachedOpTimeout)
 	defer cancel()
 	var lastErr error
 	for attempt := 1; attempt <= finishSyncAttempts; attempt++ {
-		fin, err := w.Upstreams.FinishSync(fctx, repoID, success)
-		if err == nil || errors.Is(err, ErrNotFound) {
+		fin, err := w.Upstreams.FinishSync(fctx, repoID, holder, success)
+		if err == nil || errors.Is(err, ErrNotFound) || errors.Is(err, ErrClaimLost) {
 			return fin, err
 		}
 		lastErr = err
@@ -271,9 +461,10 @@ func (w *Worker) finishSync(ctx context.Context, repoID string, success bool) (U
 var mirrorRefspecs = []string{"+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"}
 
 // transfer performs the fetch + loopback push. A nil return means success;
-// errDetached means DELETE /repos/base raced the run; every other failure
-// is a *syncFailure carrying the documented error string.
-func (w *Worker) transfer(ctx context.Context, job Job, repo RepoInfo, up Upstream) error {
+// errDetached means DELETE /repos/base raced the run; errClaimStolen means
+// the claim barrier found the run's lease stolen; every other failure is a
+// *syncFailure carrying the documented error string.
+func (w *Worker) transfer(ctx context.Context, job Job, repo RepoInfo, up Upstream, holder string) error {
 	if up.Owner == "" || up.Name == "" || up.UpstreamHost == "" {
 		return &syncFailure{code: FailConfig, cause: fmt.Errorf(
 			"incomplete upstream row: owner=%q name=%q host=%q", up.Owner, up.Name, up.UpstreamHost)}
@@ -311,12 +502,22 @@ func (w *Worker) transfer(ctx context.Context, job Job, repo RepoInfo, up Upstre
 		return &syncFailure{code: classifyFetchFailure(stderr), cause: fmt.Errorf("git fetch: %w: %s", err, stderr)}
 	}
 
-	// Detach barrier between fetch and the storage push: DELETE /repos/base
-	// must cancel in-flight runs without a failed event (docs/reference/webhooks.md).
-	if _, err := w.Upstreams.GetUpstream(ctx, job.RepoID); errors.Is(err, ErrNotFound) {
+	// Detach/steal barrier between fetch and the storage push: DELETE
+	// /repos/base must cancel in-flight runs without a failed event
+	// (docs/reference/webhooks.md), and a run whose expired claim was
+	// stolen (issue #86) must not overwrite the thief's newer push with
+	// this run's stale fetch snapshot. The barrier's fresh row also
+	// supplies the lease expiry the push fence below is computed from.
+	var claimExpiresAt time.Time
+	switch cur, err := w.Upstreams.GetUpstream(ctx, job.RepoID); {
+	case errors.Is(err, ErrNotFound):
 		return errDetached
-	} else if err != nil {
+	case err != nil:
 		return &syncFailure{code: FailInternal, cause: fmt.Errorf("detach check: %w", err)}
+	case cur.SyncClaimHolder != holder:
+		return errClaimStolen
+	default:
+		claimExpiresAt = cur.SyncClaimExpiresAt
 	}
 
 	// Empty upstream: nothing to push, the run still counts as a success.
@@ -328,7 +529,20 @@ func (w *Worker) transfer(ctx context.Context, job Job, repo RepoInfo, up Upstre
 		return nil
 	}
 
-	token, err := w.Loopback.Token(ctx, job.Org, repo)
+	// The token TTL fences the push against a claim steal (issue #86):
+	// it dies claimFenceMargin before the lease can be stolen, so a
+	// zombie run cannot authenticate a new push request once a thief may
+	// own the refs. Non-positive means this run is already inside the
+	// fence window (only reachable when it has far outlived its own
+	// budget): fail the run instead of pushing unfenced — the claim is
+	// still OURS here, so the normal FinishSync path releases it cleanly
+	// rather than leaving it to expire.
+	tokenTTL := time.Until(claimExpiresAt) - claimFenceMargin
+	if tokenTTL <= 0 {
+		return &syncFailure{code: FailInternal, cause: fmt.Errorf(
+			"claim lease expires at %v, inside the push fence margin: refusing to push", claimExpiresAt)}
+	}
+	token, err := w.Loopback.Token(ctx, job.Org, repo, tokenTTL, holder)
 	if err != nil {
 		return &syncFailure{code: FailInternal, cause: fmt.Errorf("mint loopback token: %w", err)}
 	}

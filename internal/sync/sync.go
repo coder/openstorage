@@ -43,6 +43,10 @@ var (
 	// ErrSyncInProgress: BeginSync while a run is already in flight —
 	// callers skip silently (invariant 11: no overlapping runs).
 	ErrSyncInProgress = errors.New("sync already in progress")
+	// ErrClaimLost: FinishSync by a holder whose expired claim was stolen
+	// (issue #86) — the late finisher abandons silently; the thief owns
+	// the run lifecycle now.
+	ErrClaimLost = errors.New("sync claim lost")
 )
 
 // Credential is one stored HTTPS credential for a repo's generic git
@@ -72,7 +76,13 @@ type Upstream struct {
 	// claimed (its upstream fetch may predate them) and a follow-up run
 	// is due (issue #79 liveness).
 	SyncPending bool
-	CreatedAt   time.Time
+	// SyncClaimHolder/SyncClaimExpiresAt lease the Syncing claim (issue
+	// #86): each claim records the run's holder token and an expiry, and
+	// BeginSync steals a claim whose lease has provably expired — the
+	// only recovery when the holder process died mid-run.
+	SyncClaimHolder    string
+	SyncClaimExpiresAt time.Time
+	CreatedAt          time.Time
 }
 
 // CloneURL builds the upstream fetch URL, https://{host}/{owner}/{name}.git
@@ -158,20 +168,26 @@ type UpstreamStore interface {
 	// claimed, the flag survives to that run's FinishSync and the
 	// finisher schedules a follow-up run. ErrNotFound when detached.
 	RequestSync(ctx context.Context, repoID string) error
-	// BeginSync atomically claims a sync run (syncing false -> true) and
-	// returns the row as of the claim (RunCount = completed runs). The
-	// claim consumes SyncPending: every request marked before the claim
-	// is observed by the claimed run's upstream fetch, which happens
-	// after it. ErrNotFound when detached; ErrSyncInProgress when already
-	// syncing.
-	BeginSync(ctx context.Context, repoID string) (Upstream, error)
-	// FinishSync completes the claimed run: increments RunCount (and
-	// SuccessCount when success), clears Syncing, returns the updated row.
-	// SyncPending is NOT touched: a set flag on the returned row tells
-	// the finisher to schedule a follow-up run (issue #79 liveness).
-	// ErrNotFound when the repo was detached mid-run — the run then ends
-	// silently (docs/reference/webhooks.md: detach cancels without a failed event).
-	FinishSync(ctx context.Context, repoID string, success bool) (Upstream, error)
+	// BeginSync atomically claims a sync run (syncing false -> true)
+	// under a lease and returns the row as of the claim (RunCount =
+	// completed runs). holder is the run's claim token, recorded with an
+	// expiry of now+lease; a claim whose lease has EXPIRED is stolen
+	// atomically, and stolenFrom then carries the previous holder for
+	// observability (issue #86). The claim consumes SyncPending: every
+	// request marked before the claim is observed by the claimed run's
+	// upstream fetch, which happens after it. ErrNotFound when detached;
+	// ErrSyncInProgress when an unexpired run is already syncing.
+	BeginSync(ctx context.Context, repoID, holder string, lease time.Duration) (up Upstream, stolenFrom string, err error)
+	// FinishSync completes the run claimed by holder: increments RunCount
+	// (and SuccessCount when success), clears Syncing and the claim
+	// lease, returns the updated row. SyncPending is NOT touched: a set
+	// flag on the returned row tells the finisher to schedule a follow-up
+	// run (issue #79 liveness). ErrNotFound when the repo was detached
+	// mid-run — the run then ends silently (docs/reference/webhooks.md:
+	// detach cancels without a failed event). ErrClaimLost when the
+	// caller's expired claim was stolen: the late finisher abandons
+	// without touching the thief's claim or the counters.
+	FinishSync(ctx context.Context, repoID, holder string, success bool) (Upstream, error)
 }
 
 // EventSink receives one repo.sync.* event for fan-out to the org's

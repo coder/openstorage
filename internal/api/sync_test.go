@@ -205,7 +205,7 @@ func newUsyncStack(t *testing.T, e *testEnv) *usyncStack {
 		Events: &usyncSink{ch: s.events},
 		Loopback: upsync.Loopback{
 			BaseURL: loop.URL,
-			Token: func(_ context.Context, org string, repo upsync.RepoInfo) (string, error) {
+			Token: func(_ context.Context, org string, repo upsync.RepoInfo, _ time.Duration, _ string) (string, error) {
 				return e.mint(t, tokenSpec{iss: org, repo: repo.RepoID, scopes: []string{auth.ScopeGitWrite}}), nil
 			},
 		},
