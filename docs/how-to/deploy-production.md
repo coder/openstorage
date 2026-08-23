@@ -347,7 +347,12 @@ so a mixed-version fleet mid-roll is expected and fine, with two deliberate exce
 > on the upgraded replicas for the duration of the roll, then drop it.** Registered
 > LFS objects now live at a canonical key old replicas cannot derive (ADR-41); the
 > compat flag dual-publishes to the legacy key so old replicas keep serving LFS
-> reads until the fleet is fully rolled.
+> reads until the fleet is fully rolled. Legacy-spelled keys (adoption sources,
+> compat copies) are reclaimed only by the separate post-roll
+> [`CODESTORAGE_SWEEP_DELETE_LFS_LEGACY`](../reference/configuration.md#codestorage_sweep_delete_lfs_legacy)
+> opt-in — that transition gate dominates every sweep flag, so even a fleet already
+> running `CODESTORAGE_SWEEP_DELETE_LFS=true` cannot break mid-roll reads. Enable it
+> only once the last old replica has been gone ≥ 15 minutes.
 
 Upstream-sync claims are leased: a replica that dies mid-sync leaves a claim that the
 next run steals automatically once the lease expires, so a crash can delay but never

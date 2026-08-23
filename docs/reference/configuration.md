@@ -38,6 +38,7 @@ never a silently-applied default.
 | [`CODESTORAGE_SWEEP_DELETE_ENABLED`](#codestorage_sweep_delete_enabled) | `false` | Opt-in: actually delete general orphans (list-only otherwise) |
 | [`CODESTORAGE_SWEEP_DELETE_SUPERSEDED`](#codestorage_sweep_delete_superseded) | `true` | Reap blobs a repack fold provably superseded |
 | [`CODESTORAGE_SWEEP_DELETE_LFS`](#codestorage_sweep_delete_lfs) | `false` | Opt-in: actually delete orphan LFS objects (list-only otherwise) |
+| [`CODESTORAGE_SWEEP_DELETE_LFS_LEGACY`](#codestorage_sweep_delete_lfs_legacy) | `false` | Post-roll opt-in: admit legacy-spelled LFS keys to the LFS reap (ADR-41 transition gate) |
 | [`CODESTORAGE_REPACK_THRESHOLD`](#codestorage_repack_threshold) | `10` | Registered-pack count that triggers a background repack (`0` disables) |
 | [`CODESTORAGE_SYNC_STEAL_LEGACY`](#codestorage_sync_steal_legacy) | `false` | Opt-in: steal pre-lease sync claims after their adoption grace lapses |
 
@@ -518,6 +519,27 @@ on upgrade. Stored objects are adopted into the registry by write-scoped touches
   stop naming objects that should live.
 - Same quarantine-first disposal and heal pass as the pack classes; on versioned S3
   buckets it fails startup exactly like the general delete opt-in.
+- Legacy-spelled keys (`lfs/<repo_id>/<oid>`, ADR-41) are **excluded** from this reap
+  until [`CODESTORAGE_SWEEP_DELETE_LFS_LEGACY`](#codestorage_sweep_delete_lfs_legacy)
+  is also set.
+
+### `CODESTORAGE_SWEEP_DELETE_LFS_LEGACY`
+
+Post-roll cleanup opt-in for **legacy-spelled** LFS keys (`lfs/<repo_id>/<oid>` — the
+v0.2.0-and-older spelling,
+[ADR-41](../adr/041-registered-lfs-objects-live-at-a-canonical-key-legacy-presigned-urls-cannot-address.md)).
+Adoption migrates objects to canonical keys but **retains** the legacy source: old
+replicas derive only that spelling, and a just-issued presigned GET must survive its
+lifetime — so during a rolling upgrade the retained sources are aged rowless orphans
+that [`CODESTORAGE_SWEEP_DELETE_LFS`](#codestorage_sweep_delete_lfs) alone must not
+touch. This flag is the operator's assertion that the transition is over: every
+replica runs the new binary and the last old replica exited more than 15 minutes ago
+(the presign expiry). The transition gate dominates every other flag combination —
+without this flag no sweep mode deletes a legacy-spelled key.
+
+- **Default:** `false` (legacy keys are never deleted). **Constraints:** must parse
+  as a boolean; only meaningful together with `CODESTORAGE_SWEEP_DELETE_LFS`.
+- Same quarantine-first disposal as every destructive class.
 
 ### `CODESTORAGE_REPACK_THRESHOLD`
 

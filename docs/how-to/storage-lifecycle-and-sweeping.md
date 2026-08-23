@@ -186,7 +186,8 @@ Four independent knobs control what a sweep may *do*:
 | List-only (no flag) | **active** | Reports orphans of every class, deletes nothing |
 | [`CODESTORAGE_SWEEP_DELETE_SUPERSEDED`](../reference/configuration.md#codestorage_sweep_delete_superseded) | `true` | Only blobs a repack fold provably superseded (durable `pack_retained` records); reclaims their quota bytes |
 | [`CODESTORAGE_SWEEP_DELETE_ENABLED`](../reference/configuration.md#codestorage_sweep_delete_enabled) | `false` | General pack orphans (crashed pushes, lost races) — the risky class, hence opt-in |
-| [`CODESTORAGE_SWEEP_DELETE_LFS`](../reference/configuration.md#codestorage_sweep_delete_lfs) | `false` | LFS orphans — separate from the pack opt-in because of the [pre-registry caveat](#lfs-orphans-and-pre-registry-objects) |
+| [`CODESTORAGE_SWEEP_DELETE_LFS`](../reference/configuration.md#codestorage_sweep_delete_lfs) | `false` | LFS orphans — separate from the pack opt-in because of the [pre-registry caveat](#lfs-orphans-and-pre-registry-objects); legacy-spelled keys additionally need the flag below |
+| [`CODESTORAGE_SWEEP_DELETE_LFS_LEGACY`](../reference/configuration.md#codestorage_sweep_delete_lfs_legacy) | `false` | Legacy-spelled LFS keys (ADR-41): the post-roll cleanup opt-in — off, no sweep mode deletes them (retained adoption sources feed old replicas' reads mid-roll) |
 
 ### LFS orphans and pre-registry objects
 

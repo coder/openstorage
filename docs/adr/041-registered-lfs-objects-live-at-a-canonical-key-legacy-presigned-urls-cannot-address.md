@@ -45,7 +45,13 @@ legacy blob exactly as v0.2.0 served them. Rolling-upgrade races that
 strand a legacy row alongside the canonical one are reconciled by
 registration and by the sweeper's janitor, refunding the double-charge.
 Adopted legacy sources are retained (live presigned GETs and mid-roll old
-replicas may still read them) and reclaimed by the age-thresholded orphan
-sweep; `CODESTORAGE_LFS_V020_WRITE_COMPAT` additionally dual-publishes
-fresh uploads to the legacy spelling so not-yet-upgraded replicas keep
-serving LFS reads until the fleet finishes rolling.
+replicas may still read them); `CODESTORAGE_LFS_V020_WRITE_COMPAT`
+additionally dual-publishes fresh uploads to the legacy spelling so
+not-yet-upgraded replicas keep serving LFS reads until the fleet finishes
+rolling. Reclaiming legacy-spelled keys is a separate post-roll operator
+action (`CODESTORAGE_SWEEP_DELETE_LFS_LEGACY`, Codex round 81): the
+transition gate dominates every sweep flag, so no mode deletes a legacy
+key while old replicas may still be reading it. Adoption registration is
+likewise bound to a digest re-verification of the CANONICAL destination
+bytes — never to source fingerprints, which content-derived ETags make
+ABA-blind under a still-valid legacy PUT.
