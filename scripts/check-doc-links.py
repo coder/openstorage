@@ -100,7 +100,7 @@ def check():
                 if not os.path.exists(resolved):
                     print(f"BROKEN FILE {path}:{lineno} -> {target}")
                     bad += 1
-                elif anchor and anchor != "#" and resolved.endswith(".md") and not path.startswith("docs/upstream"):
+                elif anchor and anchor != "#" and resolved.endswith(".md") and not resolved.startswith("docs/upstream"):
                     if anchor[1:] not in anchors.get(resolved, set()):
                         print(f"BROKEN ANCHOR {path}:{lineno} -> {target}{anchor}")
                         bad += 1
