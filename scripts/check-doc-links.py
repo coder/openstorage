@@ -91,6 +91,12 @@ def check():
                 print(f"UNSUPPORTED ANGLE-BRACKET DEST {path}:{lineno} -> {ln.strip()[:60]}")
                 bad += 1
                 continue
+            # fail closed on any ]( this parser cannot consume on one line
+            # (e.g. a link whose destination/title spans a line ending)
+            if "](" in LINK.sub("", ln):
+                print(f"UNSUPPORTED UNPARSED LINK {path}:{lineno} -> {ln.strip()[:60]}")
+                bad += 1
+                continue
             for m in LINK.finditer(ln):
                 target, anchor = m.group(1), m.group(2)
                 if re.match(r"^[a-z]+:", target) or target.startswith("/"):
