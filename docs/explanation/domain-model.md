@@ -72,7 +72,13 @@ Derived from SDK behavior and the real consumer (`just-code-storage`):
    intended for persistent refs; deletion of ephemeral branches skips default-branch
    protection.
 8. **Deletion is soft-first.** `DELETE /repos/delete` performs a soft delete, then async
-   hot/cold storage cleanup; repeat deletion returns 409 ("already deleted").
+   hot/cold storage cleanup; repeat deletion returns 409 ("already deleted"). In this
+   implementation the async cleanup is the retention purge
+   ([`CODESTORAGE_REPO_RETENTION`](../reference/configuration.md#codestorage_repo_retention)
+   / [`codestorage purge-repo`](../reference/cli.md#codestorage-purge-repo)): it removes
+   the repository's storage permanently — no restore — while the name burn persists
+   (URL-scoped tokens may outlive any retention, so the `(org, url)` pair is never
+   released).
 9. **Commit ordering.** `GET /repos/commits` returns history newest-first by commit date,
    cursor-paginated.
 10. **Tag semantics.** `POST /repos/tags` creates lightweight tags only; `target` must

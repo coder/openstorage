@@ -19,7 +19,7 @@ func TestRequestSyncPendingLifecycle(t *testing.T) {
 
 func testRequestSyncPendingLifecycle(t *testing.T, s Backend) {
 	ctx := t.Context()
-	repoID := testRepoID(t, "")
+	repoID := testRepoID(t, s, "")
 
 	// Detached repo: ErrNotFound.
 	if err := s.RequestSync(ctx, repoID); !errors.Is(err, ErrNotFound) {

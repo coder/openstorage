@@ -238,7 +238,7 @@ func buildServeEventing(ctx context.Context, ms meta.Store, dbURL, org, loopback
 			queue.Close()
 		}
 		if sweep != nil {
-			stopSweep := jobs.StartSweepTicker(sweep.Sweeper, sweep.Interval)
+			stopSweep := jobs.StartSweepTicker(sweep)
 			cleanup = func() {
 				recovery.Stop()
 				stopSweep()

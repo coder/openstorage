@@ -185,16 +185,38 @@ const AdoptionClaimTTL = 30 * time.Minute
 func (s *PG) TryAdoptionClaim(ctx context.Context, repo, key string) (bool, string, error) {
 	assertf(repo != "" && key != "", "TryAdoptionClaim(%q, %q)", repo, key)
 	owner := NewReservationOwner()
-	ct, err := s.pool.Exec(ctx, `
+	claimed := false
+	// The claim runs under the base-ledger lock like every other
+	// row-creating writer (issue #52, PR #105 rounds 13–14): a pre-delete
+	// LFS touch must not mint a claim row behind a completed purge on
+	// no-sweep deployments, and the shared lock totally orders the fence
+	// check against FenceRepoPurge — a statement-snapshot predicate alone
+	// could take its snapshot before the fence committed yet insert after
+	// the ledger cleanup. Fenced repos get claimed=false: the caller
+	// simply skips adoption.
+	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		if err := lockBaseLedger(ctx, tx, baseRepoOf(repo)); err != nil {
+			return err
+		}
+		if fenced, err := repoPurgeFencedPG(ctx, tx, repo); err != nil || fenced {
+			return err
+		}
+		ct, err := tx.Exec(ctx, `
 INSERT INTO pack_reservations (key, repo, bytes, owner, created_at, gen)
 VALUES ($1, $2, 1, $3, now(), '')
 ON CONFLICT (key) DO UPDATE SET repo = EXCLUDED.repo, owner = EXCLUDED.owner, created_at = now()
 WHERE pack_reservations.created_at <= now() - make_interval(secs => $4)`,
-		key+AdoptionClaimSuffix, repo, owner, AdoptionClaimTTL.Seconds())
+			key+AdoptionClaimSuffix, repo, owner, AdoptionClaimTTL.Seconds())
+		if err != nil {
+			return err
+		}
+		claimed = ct.RowsAffected() > 0
+		return nil
+	})
 	if err != nil {
 		return false, "", err
 	}
-	if ct.RowsAffected() == 0 {
+	if !claimed {
 		return false, "", nil
 	}
 	return true, owner, nil
@@ -451,6 +473,15 @@ func (s *PG) ReservePackBytes(ctx context.Context, group []string, packs []Pack,
 		// Serialize reserve-vs-reserve per base repo (see the header).
 		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1), $2)`, group[0], reserveLockClass); err != nil {
 			return err
+		}
+		// Purge fence (issue #52, PR #105 round 9): the lock above is the
+		// one FenceRepoPurge takes, so a reservation for a purge-fenced
+		// repo can never be minted after the purge's ledger cleanup and
+		// leak forever — the writer fails at admission instead.
+		if fenced, err := repoPurgeFencedPG(ctx, tx, group[0]); err != nil {
+			return err
+		} else if fenced {
+			return fmt.Errorf("reserve pack bytes %s: %w", group[0], ErrRepoPurged)
 		}
 		// Self-healing GC (Codex round 5 on #51): expired rows already
 		// stopped gating admission, but they occupy physical rows the
@@ -747,13 +778,18 @@ func (s *PG) RegisterAdoptedLFSObject(ctx context.Context, repo, key string, byt
 
 func (s *PG) registerLFSObjectTx(ctx context.Context, repo, key string, bytes int64, adopted bool) error {
 	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
-		if adopted {
-			// The adoption bump below must be serialized with the
-			// admission recheck (Codex round 65, lockBaseLedger); LFS
-			// repos are always base repos (ADR-35).
-			if err := lockBaseLedger(ctx, tx, repo); err != nil {
-				return err
-			}
+		// Lock-first unconditionally, mirroring RegisterPacks: the
+		// adoption bump must be serialized with the admission recheck
+		// (Codex round 65), and the purge-fence check below must be
+		// ordered against FenceRepoPurge's insert (issue #52). LFS repos
+		// are always base repos (ADR-35).
+		if err := lockBaseLedger(ctx, tx, repo); err != nil {
+			return err
+		}
+		if fenced, err := repoPurgeFencedPG(ctx, tx, repo); err != nil {
+			return err
+		} else if fenced {
+			return fmt.Errorf("register lfs object %s: %w", key, ErrRepoPurged)
 		}
 		ct, err := tx.Exec(ctx,
 			`INSERT INTO lfs_objects (repo, key, bytes) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
@@ -805,6 +841,28 @@ func (s *PG) GuardedLFSDelete(ctx context.Context, repo, key string, del func(co
 	assertf(repo != "" && key != "" && del != nil, "GuardedLFSDelete(%q, %q)", repo, key)
 	deleted := false
 	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		// Lock-first, matching every other row-creating path (PR #105
+		// round 15): the fence check below must be totally ordered
+		// against FenceRepoPurge's insert, or a snapshot read taken just
+		// before the fence commits could run the counter-row upsert after
+		// the purge's ledger cleanup. LFS repos are base repos (ADR-35).
+		if err := lockBaseLedger(ctx, tx, repo); err != nil {
+			return err
+		}
+		// A purge-FENCED repo needs no writer guard at all: the
+		// registrations this guard serializes against are themselves
+		// fenced and can never commit, and the counter-row upsert below
+		// would recreate accounting metadata the purge's ledger cleanup
+		// removed (issue #52, PR #105 round 14). Delete directly.
+		if fenced, err := repoPurgeFencedPG(ctx, tx, repo); err != nil {
+			return err
+		} else if fenced {
+			if err := del(ctx); err != nil {
+				return err
+			}
+			deleted = true
+			return nil
+		}
 		if _, err := tx.Exec(ctx,
 			`INSERT INTO lfs_object_counts (repo, count) VALUES ($1, 0) ON CONFLICT DO NOTHING`, repo); err != nil {
 			return err
@@ -847,6 +905,15 @@ func (s *PG) BumpLFSAdoptionGen(ctx context.Context, repo string) error {
 	// lockBaseLedger) like every generation bump.
 	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
 		if err := lockBaseLedger(ctx, tx, baseRepoOf(repo)); err != nil {
+			return err
+		}
+		// Purge fence (issue #52, PR #105 round 10): a pre-delete
+		// writer's post-registration repair path can reach this bump
+		// after the purge's ledger cleanup; silently no-op instead of
+		// recreating the row — no admission for a purged repo consults
+		// floors, so there is nothing left to invalidate. The lock above
+		// totally orders the check against FenceRepoPurge.
+		if fenced, err := repoPurgeFencedPG(ctx, tx, repo); err != nil || fenced {
 			return err
 		}
 		_, err := tx.Exec(ctx, `

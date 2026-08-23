@@ -20,7 +20,7 @@ of these classes:
 | **Registered packs** | Every push and REST write publishes a pack and registers it | [Repack](#background-repack) folds many into one (the originals become *retained*) |
 | **Retained (superseded) packs** | A repack fold replaced their registry rows; the blobs linger | Sweeper's superseded reap ([`CODESTORAGE_SWEEP_DELETE_SUPERSEDED`](../reference/configuration.md#codestorage_sweep_delete_superseded), on by default) after the age threshold |
 | **Orphan packs** | Crashed/interrupted writers (pack published, registration never committed), lost repack races | Sweeper — **list-only by default**; deletion is the explicit [`CODESTORAGE_SWEEP_DELETE_ENABLED`](../reference/configuration.md#codestorage_sweep_delete_enabled) opt-in |
-| **LFS objects** (`lfs/<repo_id>/<oid>` keys) | Verified LFS uploads publish the object and register it in the LFS registry | Never — like packs, registered LFS objects are permanent (repositories soft-delete without reclaiming storage) |
+| **LFS objects** (`lfs/<repo_id>/<oid>` keys) | Verified LFS uploads publish the object and register it in the LFS registry | Like registered packs, permanent while the repository lives; the [repository purge](#reclaiming-deleted-repositories) reclaims them with the rest of a deleted repository |
 | **Orphan LFS objects** | Crashed uploads (published, registration never committed) and objects uploaded before the LFS registry existed | Sweeper — **list-only by default**; deletion is the separate [`CODESTORAGE_SWEEP_DELETE_LFS`](../reference/configuration.md#codestorage_sweep_delete_lfs) opt-in (see [the caveat](#lfs-orphans-and-pre-registry-objects)) |
 | **Quarantine copies** (`sweep/quarantine/<nonce>/…` keys) | Delete-mode sweeps copy every blob aside before deleting it | The sweep itself purges backups older than the purge window — `max(age threshold, 1h)` — while a destructive mode is on |
 
@@ -31,11 +31,11 @@ object versions** (the reason destructive sweeping
 Also note what does *not* reclaim space: **deleting branches** — repack preserves the
 whole registered object set, so unreachable objects are carried forward by design
 ([why](../explanation/storage-engine.md#why-repack-packs-the-union-not-reachable-objects)) —
-and **deleting repositories**: `DELETE /repos` soft-deletes the metadata record — the
-name stays burned (recreating the same URL is rejected as already existing) — while the
-repository's pack registry rows and blobs stay put and the sweeper keeps counting them
-live. Reclaiming a deleted repository's storage is currently a
-manual operation ([#52](https://github.com/coder/code-storage/issues/52)).
+and **deleting repositories on its own**: `DELETE /repos` soft-deletes the metadata
+record — the name stays burned (recreating the same URL is rejected as already
+existing) — while the repository's registry rows and blobs stay put and the sweeper
+keeps counting them live. Reclamation is the separate, explicitly-enabled
+[repository purge](#reclaiming-deleted-repositories).
 
 ## Inspect what a repository stores
 
@@ -59,6 +59,54 @@ blobs per run — but totals bytes for orphan candidates only. `list-packs` repo
 alike, the same measure the quota's listing floor uses — without consulting the
 registry; no surface reports registry-live bytes on their own, so use blob-store metrics
 for fleet-wide capacity tracking.
+
+## Reclaiming deleted repositories
+
+Soft-delete alone reclaims nothing. Two paths — the same purge primitive — permanently
+remove a deleted repository's registry and eventing rows (refs, packs, LFS objects,
+credentials, upstream link) and its blobs (base packs, namespace packs, LFS objects);
+only the repository row itself is retained, stamped as a purge tombstone:
+
+- **Retention window:** set
+  [`CODESTORAGE_REPO_RETENTION`](../reference/configuration.md#codestorage_repo_retention)
+  (for example `720h` for 30 days) and a purge pass on the
+  [sweep](#the-orphan-sweeper) cadence reclaims every repository soft-deleted longer
+  than that.
+- **Operator command:**
+  [`codestorage purge-repo --yes <repo-id>`](../reference/cli.md#codestorage-purge-repo)
+  purges one repository immediately (it must have been soft-deleted at least an hour
+  earlier).
+
+Both are **irreversible** — there is no restore after a purge. The repository row is
+kept as a permanent tombstone, so the burned `(org, url)` name is **never released**:
+an unexpired token carries the repository URL in its claim and would otherwise
+authorize against a new repository created at that URL. Both also share the
+[fleet-upgrade prerequisite](../reference/configuration.md#codestorage_repo_retention):
+every serve replica and hook-running git node must run a fence-aware build before the
+first purge.
+
+Purged repositories drop out of every registry surface except the tombstoned metadata
+row (soft-deleted plus a purge timestamp), which keeps `DELETE`-then-recreate races and
+stale-token replays structurally impossible. A purge also write-fences the repository
+in the ref store before touching anything: a request that resolved the repository just
+before its deletion and is still in flight fails its ref update and its pack/LFS
+registration instead of re-registering rows behind the purge, and credential/upstream
+writes only ever attach to live repositories. Such a push may still have *published* its blob
+after the purge's scan (uploads precede registration) — the fence makes those bytes
+provably permanent garbage, so later sweeps reap them in every class once aged
+(purge-awareness is built in, independent of the retention setting and the delete
+opt-ins), and re-running `purge-repo` on the purged repository rescans its prefixes
+immediately.
+
+The purge is crash-safe by ordering, the inverse of the write path's
+publish-before-registration: registry rows are tombstoned **before** any blob is
+deleted (ref rows first of all), so an interruption can never leave a committed ref
+pointing at missing bytes — only tombstones the next pass (or a `purge-repo` re-run)
+finishes reaping. Blob deletion itself goes through the sweeper's quarantine-first
+handshake: bytes move to `sweep/quarantine/` and are freed once the backups age past
+the purge window on a later sweep, so the moment storage actually shrinks is one sweep
+behind the purge (purge-aware sweeps age those backups out even when all `*_DELETE_*`
+flags are off).
 
 ## Background repack
 

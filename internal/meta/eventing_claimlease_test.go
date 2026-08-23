@@ -16,7 +16,7 @@ func TestSyncClaimLease(t *testing.T) { runBackends(t, testSyncClaimLease) }
 
 func testSyncClaimLease(t *testing.T, s Backend) {
 	ctx := t.Context()
-	repoID := testRepoID(t, "")
+	repoID := testRepoID(t, s, "")
 	up := RepoUpstream{RepoID: repoID, Provider: "github", Owner: "acme", Name: "demo", UpstreamHost: "github.com"}
 	if _, err := s.SetRepoUpstream(ctx, up); err != nil {
 		t.Fatalf("SetRepoUpstream: %v", err)
@@ -87,7 +87,7 @@ func TestSyncClaimLegacyAdoption(t *testing.T) { runBackends(t, testSyncClaimLeg
 // unfinished proves the holder dead.
 func testSyncClaimLegacyAdoption(t *testing.T, s Backend) {
 	ctx := t.Context()
-	repoID := testRepoID(t, "")
+	repoID := testRepoID(t, s, "")
 	if _, err := s.SetRepoUpstream(ctx, RepoUpstream{
 		RepoID: repoID, Provider: "github", Owner: "acme", Name: "demo", UpstreamHost: "github.com",
 	}); err != nil {

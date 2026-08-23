@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/coder/code-storage/internal/githttp"
+	"github.com/coder/code-storage/internal/jobs"
 	"github.com/coder/code-storage/internal/secrets"
 )
 
@@ -98,6 +99,18 @@ const (
 	// Enable only after list-only reports stop naming live objects
 	// (write-scoped touches adopt stored objects into the registry).
 	envSweepDeleteLFS = "CODESTORAGE_SWEEP_DELETE_LFS"
+
+	// Soft-deleted repository retention (issue #52): how long after its
+	// soft-delete a repository's registry rows and blobs are permanently
+	// reclaimed by a purge pass on the sweep cadence. Unset/0 disables the
+	// background purge (soft-deleted repos are kept forever; the
+	// `codestorage purge-repo` command still reclaims individually). When
+	// set it must be at least jobs.MinRepoPurgeAge and sweeping must be
+	// enabled (the purge rides the sweep schedule). Purged repositories
+	// cannot be restored, and the purge releases the deleted repository's
+	// burned (org, url) name — pick a retention comfortably above any
+	// issued token lifetime.
+	envRepoRetention = "CODESTORAGE_REPO_RETENTION"
 
 	// Node-wide LFS upload staging budget (issue #51): proxy uploads
 	// stage their full Content-Length on local disk before verification,
@@ -278,6 +291,7 @@ type sweepSettings struct {
 	deleteEnabled    bool          // false = list-only (the default)
 	deleteSuperseded bool          // true = reap provably-folded blobs (the default, issue #31)
 	deleteLFS        bool          // false = list-only for LFS orphans (the default, issue #51)
+	repoRetention    time.Duration // 0 = never purge soft-deleted repos (the default, issue #52)
 }
 
 // storageURLs is the resolved storage location set shared by every
@@ -677,6 +691,26 @@ func resolveSweepSettings(getenv func(string) string) (sweepSettings, error) {
 			return sweepSettings{}, fmt.Errorf("%s: %w", envSweepDeleteLFS, err)
 		}
 		s.deleteLFS = v
+	}
+	if raw := getenv(envRepoRetention); raw != "" {
+		d, err := time.ParseDuration(raw)
+		if err != nil {
+			return sweepSettings{}, fmt.Errorf("%s: %w", envRepoRetention, err)
+		}
+		switch {
+		case d < 0:
+			return sweepSettings{}, fmt.Errorf("%s must be non-negative (0 disables the background purge), got %q", envRepoRetention, raw)
+		case d > 0 && d < jobs.MinRepoPurgeAge:
+			// The purge floor bounds in-flight pre-delete writers (see
+			// jobs.MinRepoPurgeAge); a shorter retention would silently
+			// behave like the floor, so reject it loudly instead.
+			return sweepSettings{}, fmt.Errorf("%s must be at least %v (or 0 to disable), got %q", envRepoRetention, jobs.MinRepoPurgeAge, raw)
+		case d > 0 && s.interval == 0:
+			// The purge rides the sweep schedule; retention with sweeping
+			// disabled would silently never run.
+			return sweepSettings{}, fmt.Errorf("%s requires sweeping enabled (%s > 0)", envRepoRetention, envSweepInterval)
+		}
+		s.repoRetention = d
 	}
 	return s, nil
 }

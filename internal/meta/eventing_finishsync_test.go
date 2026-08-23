@@ -17,7 +17,7 @@ func TestFinishSyncRequiresInFlightRun(t *testing.T) {
 
 func testFinishSyncRequiresInFlightRun(t *testing.T, s Backend) {
 	ctx := t.Context()
-	repoID := testRepoID(t, "")
+	repoID := testRepoID(t, s, "")
 	up := RepoUpstream{RepoID: repoID, Provider: "github", Owner: "acme", Name: "demo", UpstreamHost: "github.com"}
 	if _, err := s.SetRepoUpstream(ctx, up); err != nil {
 		t.Fatalf("SetRepoUpstream: %v", err)

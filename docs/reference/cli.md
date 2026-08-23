@@ -3,16 +3,16 @@
 The `codestorage` binary bundles the server and its operational helpers:
 
 ```
-codestorage <serve|hook|keygen|mint|signing-key|list-packs|version> [flags]
+codestorage <serve|hook|keygen|mint|signing-key|list-packs|purge-repo|version> [flags]
 ```
 
 Sources of truth: [`cmd/codestorage/main.go`](../../cmd/codestorage/main.go) and
 [`cmd/codestorage/signingkey.go`](../../cmd/codestorage/signingkey.go). Environment
 variables are documented in the [configuration reference](configuration.md).
 
-Subcommands that open the stores (`serve`, `signing-key`, `list-packs`) share one storage
-resolution: explicit env URLs win, then `--data-dir` / `$CODESTORAGE_DATA_DIR` (local mode)
-derives the missing slots.
+Subcommands that open the stores (`serve`, `signing-key`, `list-packs`, `purge-repo`)
+share one storage resolution: explicit env URLs win, then `--data-dir` /
+`$CODESTORAGE_DATA_DIR` (local mode) derives the missing slots.
 
 ## `codestorage serve`
 
@@ -141,6 +141,49 @@ size per line, plus a total) — a storage-inspection helper for dogfooding and 
 ```sh
 codestorage list-packs --repo repo_761aac427fd3 --data-dir ~/cs-data
 ```
+
+## `codestorage purge-repo`
+
+Permanently reclaims one **soft-deleted** repository: unregisters its refs, packs, and
+LFS objects (base repository plus `+ephemeral`/`+import` namespaces), deletes its blobs
+through the sweeper's quarantine-first discipline, and removes its credentials and
+upstream link. The synchronous twin of the
+[`CODESTORAGE_REPO_RETENTION`](configuration.md#codestorage_repo_retention) background
+purge — same primitive, same crash-safe ordering (rows tombstone before blobs; an
+interrupted purge resumes on re-run).
+
+**Irreversible.** A purged repository cannot be restored, and its `(org, url)` name
+stays burned forever (the repository row is kept as a tombstone — URL-scoped tokens may
+outlive the purge, so the name is never released). The repository must already be
+soft-deleted (`DELETE /api/v1/repos/delete`) at least one hour earlier — younger
+deletions are refused so no in-flight pre-delete push can race the purge.
+
+**Fleet-upgrade prerequisite:** run this only once every node — serve replicas *and*
+hook-running git nodes — runs a build with the purge write fence, exactly like enabling
+[`CODESTORAGE_REPO_RETENTION`](configuration.md#codestorage_repo_retention): an older
+binary does not check the fence, so its in-flight write can be stranded behind the
+completed purge.
+
+```
+codestorage purge-repo [flags] <repo-id>
+```
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `<repo-id>` | required | The server-generated **base** repository ID (`repo_...`) — never a `+namespace` key |
+| `--yes` | `false` | Required confirmation; without it the command prints the repo summary and refuses |
+| `--data-dir` | `$CODESTORAGE_DATA_DIR` | Local mode; otherwise the database and blob env URLs are used |
+
+```sh
+codestorage purge-repo --data-dir ~/cs-data --yes repo_761aac427fd3
+```
+
+Deleted blob bytes land in `sweep/quarantine/` first and are freed once the backups age
+past the quarantine window on a later sweep (the running server's sweep collects them;
+with sweeping disabled they remain until one runs). Re-running the command on an
+already-purged repository rescans its blob prefixes for stragglers — bytes an in-flight
+pre-delete push published after the first pass — and reaps them through the same
+quarantine handshake.
 
 ## `codestorage version`
 

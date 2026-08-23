@@ -13,11 +13,17 @@ import (
 	"time"
 )
 
-// testRepoID returns a test-unique repo id so per-repo rows (git_credentials
-// UNIQUE(repo_id), repo_upstreams PK) never collide across pg-lane tests.
-func testRepoID(t *testing.T, suffix string) string {
+// testRepoID seeds a LIVE repo row and returns its server-generated,
+// test-unique ID — credential/upstream inserts are guarded on a live repos
+// row (issue #52), so eventing rows can no longer attach to made-up IDs.
+func testRepoID(t *testing.T, s Backend, suffix string) string {
 	t.Helper()
-	return "repo_" + t.Name() + suffix
+	org := seedOrg(t, s)
+	r, err := s.CreateRepo(t.Context(), org, "https://example.com/"+t.Name()+suffix+".git", "main")
+	if err != nil {
+		t.Fatalf("testRepoID: CreateRepo: %v", err)
+	}
+	return r.RepoID
 }
 
 // testClaimHolder is the claim token tests use where holder identity is
@@ -129,7 +135,7 @@ func TestGitCredentials(t *testing.T) { runBackends(t, testGitCredentials) }
 
 func testGitCredentials(t *testing.T, s Backend) {
 	ctx := t.Context()
-	repoID := testRepoID(t, "")
+	repoID := testRepoID(t, s, "")
 
 	// Caller-set ID/CreatedAt are ignored: the store assigns both.
 	created, err := s.CreateGitCredential(ctx, GitCredential{
@@ -176,7 +182,7 @@ func testGitCredentials(t *testing.T, s Backend) {
 	if _, err := s.GetGitCredential(ctx, "ggc_0000000000000000"); !errors.Is(err, ErrNotFound) {
 		t.Errorf("get absent err = %v, want ErrNotFound", err)
 	}
-	if _, err := s.GitCredentialForRepo(ctx, testRepoID(t, "-none")); !errors.Is(err, ErrNotFound) {
+	if _, err := s.GitCredentialForRepo(ctx, testRepoID(t, s, "-none")); !errors.Is(err, ErrNotFound) {
 		t.Errorf("for-repo absent err = %v, want ErrNotFound", err)
 	}
 
@@ -216,7 +222,7 @@ func TestRepoUpstream(t *testing.T) { runBackends(t, testRepoUpstream) }
 
 func testRepoUpstream(t *testing.T, s Backend) {
 	ctx := t.Context()
-	repoID := testRepoID(t, "")
+	repoID := testRepoID(t, s, "")
 
 	if _, err := s.GetRepoUpstream(ctx, repoID); !errors.Is(err, ErrNotFound) {
 		t.Errorf("get never-linked err = %v, want ErrNotFound", err)
@@ -282,7 +288,7 @@ func TestSyncLifecycle(t *testing.T) { runBackends(t, testSyncLifecycle) }
 
 func testSyncLifecycle(t *testing.T, s Backend) {
 	ctx := t.Context()
-	repoID := testRepoID(t, "")
+	repoID := testRepoID(t, s, "")
 
 	if _, _, _, err := s.TryBeginSync(ctx, repoID, testClaimHolder, time.Minute); !errors.Is(err, ErrNotFound) {
 		t.Errorf("claim never-linked err = %v, want ErrNotFound", err)
@@ -356,7 +362,7 @@ func TestTryBeginSyncConcurrent(t *testing.T) { runBackends(t, testTryBeginSyncC
 
 func testTryBeginSyncConcurrent(t *testing.T, s Backend) {
 	ctx := t.Context()
-	repoID := testRepoID(t, "")
+	repoID := testRepoID(t, s, "")
 	if _, err := s.SetRepoUpstream(ctx, RepoUpstream{RepoID: repoID, Provider: "github", Owner: "acme", Name: "demo", UpstreamHost: "github.com"}); err != nil {
 		t.Fatalf("SetRepoUpstream: %v", err)
 	}

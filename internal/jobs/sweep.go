@@ -125,6 +125,24 @@ type SweepConfig struct {
 	// enabled mid-flight, which would turn deletes into billed delete
 	// markers.
 	DeleteGuard func(context.Context) error
+	// PurgedRepoProbe, when set, makes the sweep PURGE-AWARE (issue #52):
+	// aged unregistered blobs of purge-FENCED base repos classify as
+	// reapable in every class (packs and LFS alike, no per-class opt-in
+	// needed), because an in-flight pre-delete writer publishes its blob
+	// BEFORE its fenced registration fails — the blob can land after a
+	// purge's own prefix scan, and fenced repos never register again, so
+	// such blobs are provably permanent garbage. Wired whenever the ref
+	// store carries the purge seams, independent of the retention window:
+	// `codestorage purge-repo` mints fences on retention-less deployments
+	// too (PR #105 round 8). One extra point read per aged candidate not
+	// already covered by another mode, mirroring IsRetainedPack.
+	//
+	// Probe presence also joins the destructive-mode set for quarantine
+	// aging — purge-minted backups must be collected even with every
+	// delete flag off, or reclamation would only move bytes into
+	// quarantine — and for the per-run DeleteGuard consult, whose failure
+	// downgrades purge-aware reaping alongside the delete modes.
+	PurgedRepoProbe func(ctx context.Context, base string) (bool, error)
 	// QuotaEnforced reports that pack-quota admission is enabled
 	// (CODESTORAGE_PACK_QUOTA_BYTES > 0). Quarantine restores take cover
 	// reservations and hand off floor-generation bumps ONLY then (Codex
@@ -249,17 +267,23 @@ func (s *Sweeper) Sweep(ctx context.Context) (SweepReport, error) {
 	// guard covers both destructive modes — a versioned bucket turns
 	// superseded-class deletes into billed delete markers all the same.
 	deleteMode, supersededMode, lfsMode := s.cfg.Delete, s.cfg.DeleteSuperseded, s.cfg.DeleteLFS
-	if (deleteMode || supersededMode || lfsMode) && s.cfg.DeleteGuard != nil {
+	purgeMode := s.cfg.PurgedRepoProbe != nil
+	if (deleteMode || supersededMode || lfsMode || purgeMode) && s.cfg.DeleteGuard != nil {
 		if err := s.cfg.DeleteGuard(ctx); err != nil {
-			deleteMode, supersededMode, lfsMode = false, false, false
+			deleteMode, supersededMode, lfsMode, purgeMode = false, false, false, false
 			deleteErrs.add(fmt.Errorf("sweep: delete guard, running list-only: %w", err))
 			s.logger.Error("orphan pack sweep: delete guard failed; this run is list-only", "err", err)
 		}
 	}
-	// Quarantine purging rides on ANY destructive mode: backups only
-	// exist because some destructive pass created them, and the purge-age
-	// proof (write-once nonce keys) is class-agnostic.
-	if err := s.healQuarantine(ctx, &report, deleteMode || supersededMode || lfsMode); err != nil {
+	// Quarantine purging rides on the DELETE modes: backups only exist
+	// because some destructive pass created them, and the purge-age proof
+	// (write-once nonce keys) is class-agnostic. Purge-aware mode alone
+	// (probe wired, every delete flag off — the operator's list-only
+	// rollback state) collects only purge-FENCED repos' backups, decided
+	// per entry inside the heal: an ordinary orphan's aged backup may be
+	// the last copy of bytes the rollback exists to protect (PR #105
+	// round 12), while a fenced repo's backups can never be needed again.
+	if err := s.healQuarantine(ctx, &report, deleteMode || supersededMode || lfsMode, purgeMode); err != nil {
 		deleteErrs.add(err)
 	}
 	// Crash-leaked admission reservations (issue #29): expired rows already
@@ -296,7 +320,7 @@ func (s *Sweeper) Sweep(ctx context.Context) (SweepReport, error) {
 				s.logger.Warn("orphan pack sweep: skipping foreign key under packs/", "key", obj.Key)
 				continue
 			}
-			if err := s.classify(ctx, repo, obj, deleteMode, supersededMode, lfsMode, &report, &deleteErrs); err != nil {
+			if err := s.classify(ctx, repo, obj, deleteMode, supersededMode, lfsMode, purgeMode, &report, &deleteErrs); err != nil {
 				return err
 			}
 		}
@@ -316,7 +340,7 @@ func (s *Sweeper) Sweep(ctx context.Context) (SweepReport, error) {
 				s.logger.Warn("orphan pack sweep: skipping foreign key under lfs/", "key", obj.Key)
 				continue
 			}
-			if err := s.classify(ctx, repo, obj, deleteMode, supersededMode, lfsMode, &report, &deleteErrs); err != nil {
+			if err := s.classify(ctx, repo, obj, deleteMode, supersededMode, lfsMode, purgeMode, &report, &deleteErrs); err != nil {
 				return err
 			}
 		}
@@ -415,9 +439,11 @@ func (s *Sweeper) registered(ctx context.Context, repo, key string) (bool, error
 // deleteMode; retained superseded blobs (a durable pack_retained record
 // written by the fold's own transaction, issue #31) are reaped under
 // supersededMode too; LFS orphans (issue #51) only under their own
-// lfsMode opt-in. Registry errors abort the sweep (they would
-// misclassify the object); disposal errors accumulate into deleteErrs.
-func (s *Sweeper) classify(ctx context.Context, repo string, obj blob.ListedObject, deleteMode, supersededMode, lfsMode bool, report *SweepReport, deleteErrs *boundedErrs) error {
+// lfsMode opt-in; blobs of purge-FENCED repos (issue #52, PurgedRepoProbe)
+// under purgeMode in every class. Registry errors abort the sweep
+// (they would misclassify the object); disposal errors accumulate into
+// deleteErrs.
+func (s *Sweeper) classify(ctx context.Context, repo string, obj blob.ListedObject, deleteMode, supersededMode, lfsMode, purgeMode bool, report *SweepReport, deleteErrs *boundedErrs) error {
 	registered, err := s.registered(ctx, repo, obj.Key)
 	if err != nil {
 		return fmt.Errorf("registry lookup %s: %w", obj.Key, err)
@@ -462,6 +488,19 @@ func (s *Sweeper) classify(ctx context.Context, repo string, obj blob.ListedObje
 			}
 			canDelete = retained
 		}
+	}
+	if !canDelete && purgeMode {
+		// Straggler blobs of a purge-fenced repo (issue #52): an
+		// in-flight pre-delete writer published after the purge's own
+		// prefix scan. The fence makes them provably permanent garbage —
+		// no registration for the repo can ever succeed again — so every
+		// class is reapable without its own opt-in.
+		purged, err := s.cfg.PurgedRepoProbe(ctx, baseOf(repo))
+		if err != nil {
+			deleteErrs.add(fmt.Errorf("is repo purged %s: %w", obj.Key, err))
+			return nil
+		}
+		canDelete = purged
 	}
 	if !canDelete {
 		return nil
@@ -552,6 +591,13 @@ func isQuarantineNonce(s string) bool {
 		}
 	}
 	return true
+}
+
+// baseOf strips the namespace suffix from a sweep repo segment (the fence
+// and floor state are keyed by the BASE repository).
+func baseOf(repo string) string {
+	base, _, _ := strings.Cut(repo, "+")
+	return base
 }
 
 // splitSweepKey validates that key has the exact shape of one of the two
@@ -872,12 +918,16 @@ func (s *Sweeper) safeDelete(ctx context.Context, repo, key string) (bool, error
 // rollback must still repair a delete-enabled crash — while destructive
 // purging is gated on the caller's purge flag (the sweep passes its Delete
 // config; the standalone Heal forces it off): an unregistered backup is
-// purged only when purge is set AND it aged past the threshold, so an
-// in-flight sweep's backup is never touched. Purged backup bytes are
-// credited to report.BytesReclaimed — the point where storage consumption
-// actually drops (reaping only moves bytes into quarantine). Failures are
-// joined; each entry is independent.
-func (s *Sweeper) healQuarantine(ctx context.Context, report *SweepReport, purge bool) error {
+// purged only when purging covers it AND it aged past the threshold, so an
+// in-flight sweep's backup is never touched. purgeAll (any delete mode on)
+// covers every aged backup; purgeFenced alone (purge-aware list-only, PR
+// #105 round 12) covers only backups whose repo the PurgedRepoProbe
+// reports fenced — never an ordinary orphan's backup, which a list-only
+// rollback must preserve. Purged backup bytes are credited to
+// report.BytesReclaimed — the point where storage consumption actually
+// drops (reaping only moves bytes into quarantine). Failures are joined;
+// each entry is independent.
+func (s *Sweeper) healQuarantine(ctx context.Context, report *SweepReport, purgeAll, purgeFenced bool) error {
 	// Streamed like the packs/ scan: quarantine grows with reaped orphans,
 	// which an attacker can mint, so this prefix must not be materialized
 	// whole either — and neither may its errors: an outage can fail every
@@ -886,7 +936,7 @@ func (s *Sweeper) healQuarantine(ctx context.Context, report *SweepReport, purge
 	var errs boundedErrs
 	listErr := s.blobs.ListPages(ctx, quarantinePrefix, sweepListPageSize, func(page []blob.ListedObject) error {
 		for _, q := range page {
-			if err := s.healQuarantineEntry(ctx, q, report, purge); err != nil {
+			if err := s.healQuarantineEntry(ctx, q, report, purgeAll, purgeFenced); err != nil {
 				errs.add(err)
 			}
 		}
@@ -900,7 +950,7 @@ func (s *Sweeper) healQuarantine(ctx context.Context, report *SweepReport, purge
 
 // healQuarantineEntry disposes of one quarantine backup per the
 // healQuarantine contract.
-func (s *Sweeper) healQuarantineEntry(ctx context.Context, q blob.ListedObject, report *SweepReport, purge bool) error {
+func (s *Sweeper) healQuarantineEntry(ctx context.Context, q blob.ListedObject, report *SweepReport, purgeAll, purgeFenced bool) error {
 	orig, ok := parseQuarantineKey(q.Key)
 	var repo string
 	if ok {
@@ -967,8 +1017,23 @@ func (s *Sweeper) healQuarantineEntry(ctx context.Context, q blob.ListedObject, 
 	// lifetime bound (see safeDelete). The configured threshold governs
 	// orphan classification and may be tuned arbitrarily low, so the purge
 	// age enforces its own floor rather than trusting it.
-	if !purge || q.ModTime.IsZero() || s.now().Sub(q.ModTime) < s.quarantinePurgeAge() {
+	if (!purgeAll && !purgeFenced) || q.ModTime.IsZero() || s.now().Sub(q.ModTime) < s.quarantinePurgeAge() {
 		return nil
+	}
+	if !purgeAll {
+		// Purge-aware mode alone (every delete flag off — the operator's
+		// list-only rollback): collect only purge-FENCED repos' backups,
+		// which can never be needed as a restore source (their repos
+		// never register again). An ordinary orphan's backup may be the
+		// last copy of bytes the rollback exists to protect (PR #105
+		// round 12).
+		fenced, err := s.cfg.PurgedRepoProbe(ctx, baseOf(repo))
+		if err != nil {
+			return fmt.Errorf("sweep: purge quarantine %s: is repo purged: %w", q.Key, err)
+		}
+		if !fenced {
+			return nil
+		}
 	}
 	switch err := s.blobs.Delete(ctx, q.Key); {
 	case errors.Is(err, blob.ErrNotFound):
@@ -1041,7 +1106,7 @@ func (s *Sweeper) freshModTime(ctx context.Context, key string) (mod time.Time, 
 // so an emergency stop must never destroy anything.
 func (s *Sweeper) Heal(ctx context.Context) error {
 	var report SweepReport
-	return s.healQuarantine(ctx, &report, false)
+	return s.healQuarantine(ctx, &report, false, false)
 }
 
 // SweepSchedule configures the periodic orphan-pack sweep on a queue
@@ -1050,24 +1115,40 @@ func (s *Sweeper) Heal(ctx context.Context) error {
 type SweepSchedule struct {
 	Sweeper  *Sweeper
 	Interval time.Duration
+	// Purger, when non-nil, runs a repo-retention purge pass after each
+	// sweep on the same cadence (issue #52; nil when
+	// CODESTORAGE_REPO_RETENTION is unset).
+	Purger *RepoPurger
 }
 
-// StartSweepTicker runs sweeper.Sweep every interval on a background
+// runOnce executes one scheduled tick: the sweep, then — even when the
+// sweep errored, so a noisy orphan backlog cannot starve reclamation — the
+// retention purge pass. Errors are joined for the caller's reporting.
+func (s *SweepSchedule) runOnce(ctx context.Context) error {
+	_, sweepErr := s.Sweeper.Sweep(ctx)
+	var purgeErr error
+	if s.Purger != nil {
+		_, purgeErr = s.Purger.PurgeExpired(ctx)
+	}
+	return errors.Join(sweepErr, purgeErr)
+}
+
+// StartSweepTicker runs the schedule every Interval on a background
 // goroutine — local mode's analogue of the River periodic job, with the
 // same run-on-start behavior. The returned stop function cancels the loop
-// and waits for an in-flight sweep to finish.
-func StartSweepTicker(sweeper *Sweeper, interval time.Duration) (stop func()) {
-	assertf(sweeper != nil, "StartSweepTicker: nil sweeper")
-	assertf(interval > 0, "StartSweepTicker: non-positive interval %v", interval)
+// and waits for an in-flight run to finish.
+func StartSweepTicker(schedule *SweepSchedule) (stop func()) {
+	assertf(schedule != nil && schedule.Sweeper != nil, "StartSweepTicker: nil schedule or sweeper")
+	assertf(schedule.Interval > 0, "StartSweepTicker: non-positive interval %v", schedule.Interval)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		ticker := time.NewTicker(interval)
+		ticker := time.NewTicker(schedule.Interval)
 		defer ticker.Stop()
 		for {
-			if _, err := sweeper.Sweep(ctx); err != nil && ctx.Err() == nil {
-				sweeper.logger.Error("orphan pack sweep failed", "err", err)
+			if err := schedule.runOnce(ctx); err != nil && ctx.Err() == nil {
+				schedule.Sweeper.logger.Error("scheduled sweep failed", "err", err)
 			}
 			select {
 			case <-ctx.Done():
