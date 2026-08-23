@@ -42,7 +42,10 @@ jobs:
           BENCHTIME="${BENCHTIME:-1s}"
           COUNT="${COUNT:-1}"
           echo "sweep: benchtime=$BENCHTIME count=$COUNT"
-          go test ./... -run '^$' -bench . -benchmem -benchtime "$BENCHTIME" -count "$COUNT" -timeout 50m | tee bench-results.txt
+          # -p 1 serializes the per-package test binaries: concurrent
+          # benchmark packages would contend for CPU and disk, making ns/op
+          # depend on package scheduling instead of the benched code.
+          go test -p 1 ./... -run '^$' -bench . -benchmem -benchtime "$BENCHTIME" -count "$COUNT" -timeout 50m | tee bench-results.txt
       - name: upload results
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

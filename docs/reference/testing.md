@@ -218,11 +218,13 @@ timed iteration also checks its result against the expected value, so a
 benchmark that silently stops measuring the intended path fails instead of
 reporting numbers for the wrong one.
 
-Run the full sweep locally (`-run '^$'` skips ordinary tests; the local
-backend keeps the `internal/githttp` boot container-free):
+Run the full sweep locally (`-run '^$'` skips ordinary tests; `-p 1`
+serializes the per-package test binaries so benchmark packages never
+contend with each other; the local backend keeps the `internal/githttp`
+boot container-free):
 
 ```sh
-CODESTORAGE_TEST_BACKEND=local go test ./... -run '^$' -bench . -benchmem
+CODESTORAGE_TEST_BACKEND=local go test -p 1 ./... -run '^$' -bench . -benchmem
 ```
 
 Benchmarks are **not** a per-PR gate — shared-runner deltas are too noisy to
