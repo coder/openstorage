@@ -1595,6 +1595,46 @@ func TestLFSAdopt_PublishCopyRenewsClaimThroughout(t *testing.T) {
 	}
 }
 
+// TestLFSAdopt_ClaimLossRejectsSuccessfulOp (Codex round 88, P1): the
+// renewal loop cancels the op region when the lease is lost, but a long S3
+// copy can COMMIT and return nil concurrently with that cancellation. An
+// unconditional success verdict would let the stale worker proceed to
+// destination verification and registration after another replica took the
+// claim — the successor can overwrite the canonical key between those two
+// steps, registering bytes nobody verified at rest. A recorded loss must
+// dominate even a successful op, and the renewer must be JOINED before the
+// verdict so a loss it records cannot race it.
+func TestLFSAdopt_ClaimLossRejectsSuccessfulOp(t *testing.T) {
+	ctx := context.Background()
+	oldInterval := lfsAdoptClaimRenewInterval
+	lfsAdoptClaimRenewInterval = 20 * time.Millisecond
+	t.Cleanup(func() { lfsAdoptClaimRenewInterval = oldInterval })
+
+	srv, st, _ := newLFSQuotaServer(t, 0, time.Hour)
+	key := blob.LFSKey(lfsTestRepoID, strings.Repeat("ab", 32))
+	claimed, owner, err := st.TryAdoptionClaim(ctx, lfsTestRepoID, key)
+	if err != nil || !claimed {
+		t.Fatalf("claim = (%v, %v)", claimed, err)
+	}
+	err = srv.withRenewedAdoptionClaim(ctx, key, owner, func(opCtx context.Context) error {
+		// The lease is lost mid-op: the owner's claim goes away and a
+		// competitor takes it over, so the next renewal records the loss
+		// and cancels the region...
+		if rerr := st.ReleaseAdoptionClaim(ctx, key, owner); rerr != nil {
+			t.Fatal(rerr)
+		}
+		if taken, _, terr := st.TryAdoptionClaim(ctx, lfsTestRepoID, key); terr != nil || !taken {
+			t.Fatalf("takeover claim = (%v, %v)", taken, terr)
+		}
+		<-opCtx.Done()
+		// ...but the in-flight copy still commits and reports success.
+		return nil
+	})
+	if err == nil {
+		t.Fatal("successful op after a recorded lease loss must be rejected, not registered")
+	}
+}
+
 // TestLFSAdopt_PublishCopyBudgetNotClampedByClaimTTL (Codex security round
 // 83): the copy deadline must scale with the object size — a 10 GiB
 // multipart copy at realistic throughput needs ~an hour, and the old

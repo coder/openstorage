@@ -1619,14 +1619,21 @@ func (s *Server) withRenewedAdoptionClaim(ctx context.Context, key, owner string
 	defer cancel(nil)
 	stop := s.keepAdoptionClaimRenewed(opCtx, cancel, key, owner)
 	defer stop()
-	if err := op(opCtx); err != nil {
-		// Surface the loss cause rather than the bare context error.
-		if cause := context.Cause(opCtx); cause != nil && !errors.Is(cause, context.Canceled) && opCtx.Err() != nil {
-			return cause
-		}
-		return err
+	err := op(opCtx)
+	// JOIN the renewer before judging the lease (Codex round 88): stop
+	// blocks until the renewal goroutine has exited, so any loss it
+	// recorded is visible now and no later cancel can race the verdict.
+	stop()
+	// A recorded loss dominates even a SUCCESSFUL op (Codex round 88): a
+	// long copy can commit and return nil concurrently with the takeover
+	// cancellation, and the successor may overwrite the canonical key
+	// between this worker's destination verification and registration —
+	// success on a lost lease would register bytes nobody verified at
+	// rest. Surface the loss cause rather than the bare context error.
+	if cause := context.Cause(opCtx); cause != nil && !errors.Is(cause, context.Canceled) && opCtx.Err() != nil {
+		return cause
 	}
-	return nil
+	return err
 }
 
 // keepAdoptionClaimRenewed renews the fleet claim for key on the adoption
@@ -1638,8 +1645,10 @@ func (s *Server) withRenewedAdoptionClaim(ctx context.Context, key, owner string
 func (s *Server) keepAdoptionClaimRenewed(region context.Context, cancel context.CancelCauseFunc, key, owner string) (stop func()) {
 	assertf(key != "" && owner != "", "keepAdoptionClaimRenewed(%q, %q)", key, owner)
 	done := make(chan struct{})
+	exited := make(chan struct{})
 	var once sync.Once
 	go func() {
+		defer close(exited)
 		ticker := time.NewTicker(lfsAdoptClaimRenewInterval)
 		defer ticker.Stop()
 		for {
@@ -1663,7 +1672,15 @@ func (s *Server) keepAdoptionClaimRenewed(region context.Context, cancel context
 			}
 		}
 	}()
-	return func() { once.Do(func() { close(done) }) }
+	return func() {
+		once.Do(func() { close(done) })
+		// Stop JOINS (Codex round 88): callers judge the lease from
+		// context.Cause(region) immediately after stopping, so an
+		// un-joined renewer could record a loss a moment later and the
+		// verdict would miss it. A renewal already in flight delays this
+		// by at most lfsClaimRenewTimeout.
+		<-exited
+	}
 }
 
 // releaseAdoptionClaim best-effort frees a fleet adoption claim on a
