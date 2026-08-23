@@ -254,6 +254,11 @@ func TestPurgedRepoStragglers(t *testing.T) {
 	if len(f.backupKeys(stragglerPack)) != 1 || len(f.backupKeys(stragglerLFS)) != 1 {
 		t.Fatal("straggler reaps skipped quarantine")
 	}
+	// The straggler reaps recreated NO ledger rows (PR #105 round 14:
+	// GuardedLFSDelete skips its counter-row upsert for fenced repos).
+	if n, err := f.store.(RepoPurgeRegistry).PurgeRepoLedger(ctx, blob.QuotaRepoGroup(repo.RepoID)); err != nil || n != 0 {
+		t.Fatalf("straggler reaps left %d ledger rows (err=%v), want 0", n, err)
+	}
 
 	// A live repo's aged unregistered blob stays untouched by the probe
 	// path (it is not fenced): retention mode alone must not reap it.

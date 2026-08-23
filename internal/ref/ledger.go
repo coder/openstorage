@@ -185,24 +185,38 @@ const AdoptionClaimTTL = 30 * time.Minute
 func (s *PG) TryAdoptionClaim(ctx context.Context, repo, key string) (bool, string, error) {
 	assertf(repo != "" && key != "", "TryAdoptionClaim(%q, %q)", repo, key)
 	owner := NewReservationOwner()
-	// The purge-fence guard is inside the statement (issue #52, PR #105
-	// round 13): a pre-delete LFS touch reaching this after a purge
-	// re-run's ledger cleanup must not recreate a claim row behind the
-	// completed purge on no-sweep deployments. No proposed row for a
-	// fenced repo means no insert AND no steal — claimed=false, the
-	// caller simply skips adoption. Claim rows are TTL'd, so the
-	// single-statement snapshot residual self-heals regardless.
-	ct, err := s.pool.Exec(ctx, `
+	claimed := false
+	// The claim runs under the base-ledger lock like every other
+	// row-creating writer (issue #52, PR #105 rounds 13–14): a pre-delete
+	// LFS touch must not mint a claim row behind a completed purge on
+	// no-sweep deployments, and the shared lock totally orders the fence
+	// check against FenceRepoPurge — a statement-snapshot predicate alone
+	// could take its snapshot before the fence committed yet insert after
+	// the ledger cleanup. Fenced repos get claimed=false: the caller
+	// simply skips adoption.
+	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		if err := lockBaseLedger(ctx, tx, baseRepoOf(repo)); err != nil {
+			return err
+		}
+		if fenced, err := repoPurgeFencedPG(ctx, tx, repo); err != nil || fenced {
+			return err
+		}
+		ct, err := tx.Exec(ctx, `
 INSERT INTO pack_reservations (key, repo, bytes, owner, created_at, gen)
-SELECT $1, $2, 1, $3, now(), ''
-WHERE NOT EXISTS (SELECT 1 FROM purged_repos WHERE repo = $5)
+VALUES ($1, $2, 1, $3, now(), '')
 ON CONFLICT (key) DO UPDATE SET repo = EXCLUDED.repo, owner = EXCLUDED.owner, created_at = now()
 WHERE pack_reservations.created_at <= now() - make_interval(secs => $4)`,
-		key+AdoptionClaimSuffix, repo, owner, AdoptionClaimTTL.Seconds(), baseRepoOf(repo))
+			key+AdoptionClaimSuffix, repo, owner, AdoptionClaimTTL.Seconds())
+		if err != nil {
+			return err
+		}
+		claimed = ct.RowsAffected() > 0
+		return nil
+	})
 	if err != nil {
 		return false, "", err
 	}
-	if ct.RowsAffected() == 0 {
+	if !claimed {
 		return false, "", nil
 	}
 	return true, owner, nil
@@ -827,6 +841,20 @@ func (s *PG) GuardedLFSDelete(ctx context.Context, repo, key string, del func(co
 	assertf(repo != "" && key != "" && del != nil, "GuardedLFSDelete(%q, %q)", repo, key)
 	deleted := false
 	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		// A purge-FENCED repo needs no writer guard at all: the
+		// registrations this guard serializes against are themselves
+		// fenced and can never commit, and the counter-row upsert below
+		// would recreate accounting metadata the purge's ledger cleanup
+		// removed (issue #52, PR #105 round 14). Delete directly.
+		if fenced, err := repoPurgeFencedPG(ctx, tx, repo); err != nil {
+			return err
+		} else if fenced {
+			if err := del(ctx); err != nil {
+				return err
+			}
+			deleted = true
+			return nil
+		}
 		if _, err := tx.Exec(ctx,
 			`INSERT INTO lfs_object_counts (repo, count) VALUES ($1, 0) ON CONFLICT DO NOTHING`, repo); err != nil {
 			return err
