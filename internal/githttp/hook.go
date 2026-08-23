@@ -280,7 +280,7 @@ func preReceive(ctx context.Context) error {
 	// concurrent-push overshoot the listing alone admitted. The reservation
 	// is consumed atomically by RegisterPacks below; a crash anywhere
 	// between here and there leaves an expiring row the sweeper prunes.
-	var reservedGens map[string]ref.ReservationToken
+	var reservedGens map[string]string
 	if quotaRaw := os.Getenv(EnvPackQuota); quotaRaw != "" {
 		quota, err := strconv.ParseInt(quotaRaw, 10, 64)
 		if err != nil || quota <= 0 {
@@ -339,7 +339,7 @@ func preReceive(ctx context.Context) error {
 			// covering them (round 33). Ambiguity and retire failures
 			// only leave what the TTL always collected.
 			if len(reservedGens) > 0 {
-				proven := make(map[string]ref.ReservationToken, len(reservedGens))
+				proven := make(map[string]string, len(reservedGens))
 				for k, g := range reservedGens {
 					if _, serr := bl.Stat(ctx, k); errors.Is(serr, blob.ErrNotFound) {
 						proven[k] = g

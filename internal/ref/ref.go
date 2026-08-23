@@ -125,7 +125,7 @@ type RefStore interface {
 	// a failed writer retires exactly its own attempt: the row is deleted
 	// only when no attempts remain, never out from under a live same-key
 	// writer (the round-22 unsoundness of owner-scoped deletes). gens
-	// maps each key to the row-incarnation token ReserveDecision.Gens
+	// maps each key to the row-incarnation gen ReserveDecision.Gens
 	// returned: a replacement row minted after this caller's expired and
 	// was pruned carries a different gen and is untouched (round 33).
 	// Callers retire only with EVIDENCE of non-publication (the blob
@@ -135,7 +135,7 @@ type RefStore interface {
 	// live under an era-spelled key (reservKeySuffix) no v0.1.0
 	// statement addresses, and retirement touches only that spelling —
 	// a legacy same-key twin row is left to its own binary's lifecycle.
-	RetirePackAttempts(ctx context.Context, group []string, gens map[string]ReservationToken) error
+	RetirePackAttempts(ctx context.Context, group []string, gens map[string]string) error
 	// SweepExpiredPackReservations deletes reservation rows at least
 	// olderThan old (crash-swept leak reclamation, issue #29; the orphan
 	// sweeper calls it on its cadence). olderThan=0 expires everything —

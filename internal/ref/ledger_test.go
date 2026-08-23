@@ -179,8 +179,8 @@ func TestReserveSameKeyRefreshes(t *testing.T) {
 		if !decB.OK {
 			t.Fatalf("same-key re-reserve wedged: %+v", decB)
 		}
-		if decA.Gens[a.Key].Gen == "" || decA.Gens[a.Key].Gen != decB.Gens[a.Key].Gen {
-			t.Fatalf("refresh changed the row gen: %q vs %q", decA.Gens[a.Key].Gen, decB.Gens[a.Key].Gen)
+		if decA.Gens[a.Key] == "" || decA.Gens[a.Key] != decB.Gens[a.Key] {
+			t.Fatalf("refresh changed the row gen: %q vs %q", decA.Gens[a.Key], decB.Gens[a.Key])
 		}
 		k.wantState(0, 60, 0)
 
@@ -215,7 +215,7 @@ func TestReserveSameKeyRefreshes(t *testing.T) {
 		k.wantState(50, 0, 0)
 
 		// Retiring an absent key is a no-op, not an error.
-		if err := s.RetirePackAttempts(context.Background(), k.group, map[string]ReservationToken{"packs/absent/pack-x.pack": {Gen: "g", CreatedAt: time.Now()}}); err != nil {
+		if err := s.RetirePackAttempts(context.Background(), k.group, map[string]string{"packs/absent/pack-x.pack": "g"}); err != nil {
 			t.Fatalf("absent-key retire: %v", err)
 		}
 	})
@@ -244,8 +244,8 @@ func TestRetireIsGenerationBound(t *testing.T) {
 		if !decNew.OK {
 			t.Fatalf("new reserve: %+v", decNew)
 		}
-		if decNew.Gens[a.Key].Gen == decOld.Gens[a.Key].Gen {
-			t.Fatalf("replacement row kept the old gen %q", decOld.Gens[a.Key].Gen)
+		if decNew.Gens[a.Key] == decOld.Gens[a.Key] {
+			t.Fatalf("replacement row kept the old gen %q", decOld.Gens[a.Key])
 		}
 		// The old writer's late clean failure retires with ITS token: the
 		// new writer's only reservation must survive.
@@ -449,12 +449,17 @@ func TestRetireLeavesLegacyTwinRow(t *testing.T) {
 	})
 }
 
-// TestRetireRequiresUnrefreshedRow (Codex round 33, mixed-fleet half): the
-// DELETE additionally requires created_at unchanged since the retiring
-// writer's own reserve — a row refreshed AFTER that reserve (by any
-// binary, including a pre-attempt one that bumps created_at without
-// incrementing attempts) is retained for the TTL even at zero attempts.
-func TestRetireRequiresUnrefreshedRow(t *testing.T) {
+// TestReverseOrderRetirementEndsRow (Codex round 35, security): with the
+// era spelling fencing legacy statements out entirely, every refresh of an
+// era row increments attempts — the refcount alone proves a zero-attempt
+// row has no live writer, in EITHER retirement order. Round 33's extra
+// created_at guard (needed while a pre-attempt binary could bump
+// created_at without incrementing attempts) retained reverse-order
+// zero-attempt rows to the TTL: ~10,000 failed tiny same-key upload pairs
+// could wedge the row cap — and with it ALL of the repository's git, REST,
+// and LFS growth — for the full default hour. The row must end when its
+// LAST attempt retires, regardless of order.
+func TestReverseOrderRetirementEndsRow(t *testing.T) {
 	runRefBackends(t, func(t *testing.T, s Store) {
 		ctx := context.Background()
 		k := newLedgerKit(t, s)
@@ -463,21 +468,22 @@ func TestRetireRequiresUnrefreshedRow(t *testing.T) {
 		if !decA.OK {
 			t.Fatalf("reserve A: %+v", decA)
 		}
-		time.Sleep(20 * time.Millisecond) // ensure a later refresh timestamp
+		time.Sleep(20 * time.Millisecond) // B's refresh gets a later timestamp
 		decB := k.reserve([]Pack{a}, "owner-b", 0, 100)
 		if !decB.OK {
 			t.Fatalf("reserve B: %+v", decB)
 		}
-		// B retires first: attempts 2→1, no delete.
+		// B retires first: attempts 2→1, the row keeps gating for A.
 		if err := s.RetirePackAttempts(ctx, k.group, decB.Gens); err != nil {
 			t.Fatalf("retire B: %v", err)
 		}
-		// A retires with ITS token: attempts 1→0, but the row was
-		// refreshed after A's reserve — the delete must not fire.
+		k.wantState(0, 60, 0)
+		// A retires LAST with the earlier token: attempts 1→0 — no live
+		// writer remains, so the row must end now, not at the TTL.
 		if err := s.RetirePackAttempts(ctx, k.group, decA.Gens); err != nil {
 			t.Fatalf("retire A: %v", err)
 		}
-		k.wantState(0, 60, 0) // row retained; the TTL is its only end now
+		k.wantState(0, 0, 0)
 	})
 }
 

@@ -1180,7 +1180,7 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target r
 	// resGens holds the reservation's row-incarnation tokens when one was
 	// taken below; the upload-failure path retires against exactly these
 	// (Codex round 33).
-	var resGens map[string]ref.ReservationToken
+	var resGens map[string]string
 	if s.PackQuotaBytes > 0 && n > 0 && !registered {
 		// The pre-body registered flag can go STALE during the body copy
 		// (Codex round 26): a concurrent identical upload on another

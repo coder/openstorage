@@ -96,17 +96,15 @@ ON CONFLICT (key) DO UPDATE SET repo = excluded.repo,
 			reservRowKey(p.Key), group[0], p.Size, owner, NewReservationOwner()); err != nil {
 			return ReserveDecision{}, fmt.Errorf("reserve pack bytes insert: %w", err)
 		}
-		var tok ReservationToken
-		var createdMS int64
+		var gen string
 		if err := tx.QueryRowContext(ctx,
-			`SELECT gen, created_at FROM pack_reservations WHERE key = ?`, reservRowKey(p.Key)).Scan(&tok.Gen, &createdMS); err != nil {
+			`SELECT gen FROM pack_reservations WHERE key = ?`, reservRowKey(p.Key)).Scan(&gen); err != nil {
 			return ReserveDecision{}, fmt.Errorf("reserve pack bytes gen: %w", err)
 		}
-		tok.CreatedAt = time.UnixMilli(createdMS)
 		if dec.Gens == nil {
-			dec.Gens = make(map[string]ReservationToken, len(packs))
+			dec.Gens = make(map[string]string, len(packs))
 		}
-		dec.Gens[p.Key] = tok
+		dec.Gens[p.Key] = gen
 	}
 	if err := tx.Commit(); err != nil {
 		return ReserveDecision{}, fmt.Errorf("reserve pack bytes commit: %w", err)
@@ -134,22 +132,22 @@ func placeholders(n int) string {
 
 // RetirePackAttempts — see the PG twin; BEGIN IMMEDIATE's single writer is
 // the serialization.
-func (s *SQLite) RetirePackAttempts(ctx context.Context, group []string, gens map[string]ReservationToken) error {
+func (s *SQLite) RetirePackAttempts(ctx context.Context, group []string, gens map[string]string) error {
 	assertf(len(group) > 0 && group[0] != "" && len(gens) > 0, "RetirePackAttempts(%v, %v)", group, gens)
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
-	for key, tok := range gens {
+	for key, gen := range gens {
 		if _, err := tx.ExecContext(ctx,
 			`UPDATE pack_reservations SET attempts = attempts - 1 WHERE repo = ? AND key = ? AND gen = ?`,
-			group[0], reservRowKey(key), tok.Gen); err != nil {
+			group[0], reservRowKey(key), gen); err != nil {
 			return err
 		}
 		if _, err := tx.ExecContext(ctx,
-			`DELETE FROM pack_reservations WHERE repo = ? AND key = ? AND gen = ? AND attempts <= 0 AND created_at <= ?`,
-			group[0], reservRowKey(key), tok.Gen, tok.CreatedAt.UnixMilli()); err != nil {
+			`DELETE FROM pack_reservations WHERE repo = ? AND key = ? AND gen = ? AND attempts <= 0`,
+			group[0], reservRowKey(key), gen); err != nil {
 			return err
 		}
 	}
