@@ -201,12 +201,22 @@ func (s *sim) checkSyncRow(ctx context.Context, repoKey string, now time.Time, o
 }
 
 // doSyncRequest marks a sync request (the 202-accepted pull-upstream /
-// push-trigger surface): the next claim must consume it.
+// push-trigger surface): the row must carry the pending marker immediately
+// (a request the store silently dropped would otherwise be unobservable
+// when the next claim consumes it), and the next claim must consume it.
 func (s *sim) doSyncRequest(name string, node *simNode, repo *simRepo) error {
-	if err := node.metaStore.RequestSync(context.Background(), repo.key); err != nil {
+	ctx := context.Background()
+	if err := node.metaStore.RequestSync(ctx, repo.key); err != nil {
 		return fmt.Errorf("step %d: RequestSync %s: %w", s.step, repo.key, err)
 	}
 	s.syncPending[repo.key] = true
+	cur, err := s.cl.oracleMeta.GetRepoUpstream(ctx, repo.key)
+	if err != nil {
+		return fmt.Errorf("step %d: oracle GetRepoUpstream %s: %w", s.step, repo.key, err)
+	}
+	if !cur.SyncPending {
+		s.violate("step %d: sync-request %s: RequestSync returned nil but the pending marker is not set", s.step, repo.key)
+	}
 	s.tracef("step=%04d op=%s node=%d repo=%s out=ok", s.step, name, node.id, repo.key)
 	return nil
 }
