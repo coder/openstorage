@@ -25,14 +25,17 @@ binaries built (CGO off), archives verified on linux + macOS, assets uploaded
 release-please only reacts to [conventional-commit](https://www.conventionalcommits.org/)
 **squash titles** on main. This repo's historical `<scope>: <subject>` style (`api: ...`,
 `githttp: ...`) is *invisible* to it — such commits neither bump the version nor appear
-in the CHANGELOG. For releasable work, title the PR:
+in the CHANGELOG. The `pr-title` CI check ([#68](https://github.com/coder/code-storage/issues/68))
+rejects non-conventional titles on every PR and re-checks on title edits. For releasable
+work, title the PR:
 
 | Squash title | Effect (pre-1.0, `bump-minor-pre-major`) |
 |---|---|
 | `fix: ...`, `fix(scope): ...` | patch bump, CHANGELOG "Bug Fixes" |
 | `feat: ...`, `feat(scope): ...` | minor bump, CHANGELOG "Features" |
 | `feat!: ...` / `BREAKING CHANGE:` footer | minor bump (major once we pass 1.0.0) |
-| `docs:`, `chore:`, `ci:`, `build:`, `test:`, ... | no bump, hidden from CHANGELOG |
+| `perf: ...` | patch bump, CHANGELOG "Performance Improvements" |
+| `docs:`, `chore:`, `ci:`, `build:`, `test:`, `refactor:` | no bump, hidden from CHANGELOG |
 | anything else (`api: ...`) | ignored entirely |
 
 ## 2. Get the release PR green
@@ -46,12 +49,20 @@ protection requires `lint` / `test` / `test-local`. Approve via the **Approve an
 button on the PR's Actions run, or:
 
 ```sh
-gh run list -R coder/code-storage --branch release-please--branches--main --limit 1
+gh run list -R coder/code-storage --branch release-please--branches--main \
+  --workflow ci --status action_required --limit 1
 gh api --method POST repos/coder/code-storage/actions/runs/<run-id>/approve
 ```
 
+(`--workflow ci` matters: the branch also gets a held run from the optional
+`pr-title` workflow, and without the filter `--limit 1` can return that one —
+approving it would leave the required `lint`/`test`/`test-local` checks blocked.)
+
 Each release-please refresh of the branch (any push to main while the release PR is
-open) creates a fresh held run needing the same approval. A fine-grained PAT or GitHub
+open) creates a fresh held run needing the same approval. The separate `pr-title`
+workflow run is held the same way, but it is deliberately **not** in the required-check
+set precisely so an unapproved run cannot wedge the release PR — approving it is
+optional (the `chore(main): release X.Y.Z` title passes). A fine-grained PAT or GitHub
 App token in the action's `token` input would remove the ritual; until one is
 provisioned, approve-and-run is the documented path. Do **not** loosen branch
 protection instead.
@@ -88,5 +99,18 @@ from the tag and replaces the assets (`--clobber`).
   and ignores the manifest's `0.0.0`), and `bootstrap-sha` pins where changelog
   collection starts. Both only affect the first release; the manifest is
   self-maintaining afterwards.
+- **Retroactively fixing a bad squash title:** if a releasable commit already landed
+  on main with a non-conventional title, edit the *merged PR's body* to add
+  release-please's commit-override block — the next run parses it instead of the
+  commit message (works because we squash-merge):
+
+  ```
+  BEGIN_COMMIT_OVERRIDE
+  fix(githttp): the corrected conventional subject
+  END_COMMIT_OVERRIDE
+  ```
+
+  Never put these markers in an unmerged PR body unless you mean it — they replace
+  the squash title for release purposes.
 - **Tag namespace:** leave `v*` tags to release-please. A manually pushed tag would
   desync its notion of the last release.

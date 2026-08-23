@@ -1,0 +1,65 @@
+# PR-title lint (issue #68): this repo squash-merges, so the PR title becomes
+# the commit subject on main, and release-please derives versions and the
+# CHANGELOG from those subjects (docs/how-to/release.md). A non-conventional
+# title — like the repo's old bare package-prefix habit, "githttp: ..." — is
+# invisible to the release tooling, so releasable work silently never ships
+# (#81 was dropped from the changelog exactly this way).
+#
+# Lives in its own workflow rather than ci.yml because it must re-run on the
+# `edited` event (title fixes). Adding `edited` to ci.yml would restart — and,
+# via its cancel-in-progress concurrency group, cancel — the full test suite
+# on every title or body edit.
+#
+# Deliberately NOT in branch protection's required checks yet: release-please's
+# own PRs get their pull_request runs held at "action required" (bot author —
+# docs/how-to/release.md), and the documented approval ritual targets the
+# single held ci run. A required-but-never-approved pr-title run would wedge
+# release PRs. Revisit once the next release PR demonstrates the held-run
+# behavior for this workflow.
+name: pr-title
+
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+
+# Pure metadata check: no checkout, no API calls, no token scopes needed.
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  pr-title:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # The title is untrusted input: pass it via env, never interpolate it
+      # into the script body.
+      - name: Require a conventional-commit PR title
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          types='feat|fix|docs|ci|chore|build|refactor|test|perf'
+          if printf '%s' "$TITLE" | grep -qE "^($types)(\([a-z0-9][a-z0-9._/+-]*\))?!?: [^ ]"; then
+            echo "PR title is a conventional-commit subject: $TITLE"
+            exit 0
+          fi
+          echo "::error title=Non-conventional PR title::Expected 'type(scope): summary'; got '$TITLE'. See CONTRIBUTING.md (Commit and PR conventions)."
+          cat <<'EOF'
+          This repository squash-merges: the PR title becomes the commit subject
+          on main, and release-please derives versions and the CHANGELOG from it.
+          A non-conventional title makes releasable work invisible to the release
+          tooling (docs/how-to/release.md).
+
+          Allowed types: feat fix docs ci chore build refactor test perf
+          The package path goes in the scope, not the type:
+
+            fix(githttp): bound upload-pack gzip negotiation bodies
+            feat(meta): add webhook secret rotation
+            ci: enforce conventional-commit PR titles
+
+          NOT: "githttp: fix ..." — a bare package prefix is ignored entirely
+          by release-please.
+          EOF
+          exit 1
