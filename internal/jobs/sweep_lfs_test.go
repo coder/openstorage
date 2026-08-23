@@ -106,6 +106,30 @@ func TestSweepLFS_LegacySpellingSweepsAsLFS(t *testing.T) {
 	}
 }
 
+// TestSweepHeal_ReconcilesTwinRows (Codex round 85): with periodic
+// sweeping disabled (CODESTORAGE_SWEEP_INTERVAL=0), startup runs Heal —
+// which never invoked the twin-row janitor, so a mixed-roll duplicate
+// (legacy row stranded beside the canonical one) double-charged usage and
+// the object cap indefinitely. Heal must reconcile too.
+func TestSweepHeal_ReconcilesTwinRows(t *testing.T) {
+	f := newSweepFixture(t)
+	oid := lfsOID("ab")
+	canonical := blob.LFSKey("repo_lfs", oid)
+	legacy := blob.LFSLegacyKey("repo_lfs", oid)
+	f.registerLFS("repo_lfs", canonical, 40)
+	f.registerLFS("repo_lfs", legacy, 40)
+
+	if err := f.sweeper(SweepConfig{Threshold: 24 * time.Hour}).Heal(context.Background()); err != nil {
+		t.Fatalf("Heal: %v", err)
+	}
+	if has, err := f.store.HasLFSObject(context.Background(), "repo_lfs", legacy); err != nil || has {
+		t.Fatalf("legacy twin after Heal = (%v, %v), want reconciled away", has, err)
+	}
+	if has, err := f.store.HasLFSObject(context.Background(), "repo_lfs", canonical); err != nil || !has {
+		t.Fatalf("canonical row after Heal = (%v, %v), want intact", has, err)
+	}
+}
+
 // TestSweepLFS_LegacyReapNeedsExplicitOptIn (Codex round 81): during a
 // rolling upgrade, old replicas derive ONLY the legacy spelling — but
 // adopting any legacy object older than the sweep threshold immediately

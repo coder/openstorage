@@ -1319,6 +1319,120 @@ func TestLFSCompatCopy_ChargedAgainstQuota(t *testing.T) {
 	}
 }
 
+// TestLFSAdopt_CopyChargedAgainstQuota (Codex round 85, P1 + security
+// twin): the adoption copy creates a second size-byte canonical object
+// while the legacy source is retained until the post-roll sweep — with
+// only the unbounded restore cover admitting it, adopting an S-byte object
+// at quota Q=S durably left 2S physical bytes. The copy must pass real
+// quota admission (the reservation settles at registration; the retained
+// source stays floor-charged), and a denial fails the adoption with 507.
+func TestLFSAdopt_CopyChargedAgainstQuota(t *testing.T) {
+	ctx := context.Background()
+	seed := func(t *testing.T, srv *Server, content []byte) string {
+		oid := sha256Hex(content)
+		if err := srv.Blob.UploadFile(ctx, blob.LFSLegacyKey(lfsTestRepoID, oid), writeTempFile(t, content)); err != nil {
+			t.Fatal(err)
+		}
+		return oid
+	}
+	t.Run("at-quota-denied", func(t *testing.T) {
+		srv, st, mint := newLFSQuotaServer(t, 100, time.Hour)
+		tok := mint(auth.ScopeGitWrite)
+		content := bytes.Repeat([]byte("a"), 60) // legacy 60 + copy 60 > Q=100
+		oid := seed(t, srv, content)
+		resp := decodeBatch(t, doLFS(t, srv, http.MethodPost, lfsBatchPath, "basic:"+tok,
+			batchBody("upload", oid, int64(len(content)))))
+		if resp.Objects[0].Error == nil {
+			t.Fatal("over-quota adoption copy succeeded — physical usage reached 2S at Q=S")
+		}
+		if code := resp.Objects[0].Error.Code; code != http.StatusInsufficientStorage {
+			t.Fatalf("over-quota adoption error code = %d, want 507", code)
+		}
+		if has, err := st.HasLFSObject(ctx, lfsTestRepoID, blob.LFSKey(lfsTestRepoID, oid)); err != nil || has {
+			t.Fatalf("registered despite quota denial = (%v, %v)", has, err)
+		}
+		usage, err := blob.StorageUsageBytes(ctx, srv.Blob, lfsTestRepoID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if usage > 100 {
+			t.Fatalf("physical usage after denied adoption = %d, want <= 100", usage)
+		}
+	})
+	t.Run("with-headroom-adopts", func(t *testing.T) {
+		srv, st, mint := newLFSQuotaServer(t, 300, time.Hour)
+		tok := mint(auth.ScopeGitWrite)
+		content := bytes.Repeat([]byte("b"), 60)
+		oid := seed(t, srv, content)
+		resp := decodeBatch(t, doLFS(t, srv, http.MethodPost, lfsBatchPath, "basic:"+tok,
+			batchBody("upload", oid, int64(len(content)))))
+		if resp.Objects[0].Error != nil || len(resp.Objects[0].Actions) != 0 {
+			t.Fatalf("in-quota adoption = %+v, want stored", resp.Objects[0])
+		}
+		if has, err := st.HasLFSObject(ctx, lfsTestRepoID, blob.LFSKey(lfsTestRepoID, oid)); err != nil || !has {
+			t.Fatalf("adopted = (%v, %v), want registered", has, err)
+		}
+	})
+}
+
+// TestLFSCompatCopy_AdmissionRetiredAfterSuccess (Codex round 85): the
+// bridge's quota admission row lingered until the reservation TTL even
+// after the copy succeeded and the refreshed floor charged the same bytes
+// — double-charging unrelated uploads for up to an hour. After the cover
+// handoff, only the deliberate tail cover may remain reserved.
+func TestLFSCompatCopy_AdmissionRetiredAfterSuccess(t *testing.T) {
+	srv, st, mint := newLFSQuotaServer(t, 1<<20, time.Hour)
+	srv.LFSV020WriteCompat = true
+	tok := mint(auth.ScopeGitWrite)
+	content := bytes.Repeat([]byte("r"), 50)
+	oid := sha256Hex(content)
+	w := doLFS(t, srv, http.MethodPut, "/"+lfsTestRepoURL+".git/info/lfs/objects/"+oid,
+		"basic:"+tok, string(content))
+	if w.Code != http.StatusOK {
+		t.Fatalf("PUT status = %d, body %s", w.Code, w.Body)
+	}
+	// Canonical settled at registration; the bridge tail cover (50) is
+	// deliberate and TTL-bounded — the bridge ADMISSION row must be gone.
+	if ls := ledgerState(t, st, time.Hour); ls.ReservedBytes != int64(len(content)) {
+		t.Fatalf("reserved after compat success = %d, want %d (tail cover only) — a lingering admission double-charges until TTL", ls.ReservedBytes, len(content))
+	}
+}
+
+// TestLFSCompat_RepairSerializedOnLegacyClaim (Codex security round 85):
+// the batch fast path's bridge repair launched an unserialized full copy —
+// every tiny concurrent touch of the object started another one. Compat
+// copies now serialize on the LEGACY key's fleet claim: with it held
+// elsewhere, the repair answers retryable contention and copies nothing.
+func TestLFSCompat_RepairSerializedOnLegacyClaim(t *testing.T) {
+	ctx := context.Background()
+	srv, st, mint := newLFSQuotaServer(t, 0, time.Hour)
+	srv.LFSV020WriteCompat = true
+	tok := mint(auth.ScopeGitWrite)
+	content := []byte("repair blocked by the legacy claim")
+	oid := sha256Hex(content)
+	key := blob.LFSKey(lfsTestRepoID, oid)
+	legacyKey := blob.LFSLegacyKey(lfsTestRepoID, oid)
+	if err := srv.Blob.UploadFile(ctx, key, writeTempFile(t, content)); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.RegisterLFSObject(ctx, lfsTestRepoID, key, int64(len(content))); err != nil {
+		t.Fatal(err)
+	}
+	claimed, _, err := st.TryAdoptionClaim(ctx, lfsTestRepoID, legacyKey)
+	if err != nil || !claimed {
+		t.Fatalf("seed legacy claim = (%v, %v), want held", claimed, err)
+	}
+
+	resp := decodeBatch(t, doLFS(t, srv, http.MethodPost, lfsBatchPath, "basic:"+tok,
+		batchBody("upload", oid, int64(len(content)))))
+	if resp.Objects[0].Error == nil || resp.Objects[0].Error.Code != http.StatusTooManyRequests {
+		t.Fatalf("bridge repair under a held legacy claim = %+v, want per-object 429", resp.Objects[0])
+	}
+	if _, serr := srv.Blob.Stat(ctx, legacyKey); !errors.Is(serr, blob.ErrNotFound) {
+		t.Fatalf("repair copied despite the held claim (stat err %v)", serr)
+	}
+}
+
 // renewCountingStore counts adoption-claim renewals for one key.
 type renewCountingStore struct {
 	ref.RefStore
