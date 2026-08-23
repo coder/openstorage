@@ -37,6 +37,7 @@ never a silently-applied default.
 | [`CODESTORAGE_SWEEP_DELETE_ENABLED`](#codestorage_sweep_delete_enabled) | `false` | Opt-in: actually delete general orphans (list-only otherwise) |
 | [`CODESTORAGE_SWEEP_DELETE_SUPERSEDED`](#codestorage_sweep_delete_superseded) | `true` | Reap blobs a repack fold provably superseded |
 | [`CODESTORAGE_SWEEP_DELETE_LFS`](#codestorage_sweep_delete_lfs) | `false` | Opt-in: actually delete orphan LFS objects (list-only otherwise) |
+| [`CODESTORAGE_REPO_RETENTION`](#codestorage_repo_retention) | unset | Purge repositories soft-deleted longer than this (unset/`0` keeps them forever) |
 | [`CODESTORAGE_REPACK_THRESHOLD`](#codestorage_repack_threshold) | `10` | Registered-pack count that triggers a background repack (`0` disables) |
 | [`CODESTORAGE_SYNC_STEAL_LEGACY`](#codestorage_sync_steal_legacy) | `false` | Opt-in: steal pre-lease sync claims after their adoption grace lapses |
 
@@ -501,6 +502,30 @@ on upgrade. Stored objects are adopted into the registry by write-scoped touches
   stop naming objects that should live.
 - Same quarantine-first disposal and heal pass as the pack classes; on versioned S3
   buckets it fails startup exactly like the general delete opt-in.
+
+### `CODESTORAGE_REPO_RETENTION`
+
+Retention window for soft-deleted repositories: once a repository has been deleted
+longer than this, a purge pass on the sweep cadence **permanently** removes its
+registry rows (refs, packs, LFS objects, credentials, upstream link, the repository
+row itself) and deletes its blobs through the same quarantine-first discipline as
+every other sweep class. The [`codestorage purge-repo`](cli.md#codestorage-purge-repo)
+command runs the same primitive synchronously for one repository.
+
+- **Default:** unset (`0`) — soft-deleted repositories are kept forever.
+- **Constraints:** a Go duration of at least `1h` (shorter values are startup errors:
+  the purge always waits at least an hour after deletion so no in-flight pre-delete
+  push can race it), and sweeping must be enabled
+  ([`CODESTORAGE_SWEEP_INTERVAL`](#codestorage_sweep_interval) > 0) — the purge rides
+  the sweep schedule.
+- **Purged repositories cannot be restored**, and the purge releases the repository's
+  burned `(org, url)` name for re-creation. Choose a retention comfortably above any
+  issued token lifetime: an unexpired token carrying the URL claim would authorize
+  against a repository re-created at that URL.
+- Purged blob bytes move to quarantine first and are freed when the backups age out
+  (retention counts as a destructive mode for quarantine aging even with every
+  `*_DELETE_*` flag off). On versioned S3 buckets it fails startup exactly like the
+  delete opt-ins.
 
 ### `CODESTORAGE_REPACK_THRESHOLD`
 
