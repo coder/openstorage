@@ -221,7 +221,12 @@ and bypasses every proxy-enforced limit. Then:
   (default 2 × the pack quota, 2 MiB minimum) with a `413`, feeding git at most the cap's worth of
   bytes ([#55](https://github.com/coder/code-storage/issues/55)) — so size temporary
   disk for up to one cap per concurrent push (git discards the truncated quarantine on
-  rejection; a declared oversize is rejected without reading at all). A proxy
+  rejection; a declared oversize is rejected without reading at all). Fetch-side
+  negotiation bodies are bounded too: a gzip-encoded `git-upload-pack` request is capped
+  at a fixed 4 MiB decoded — plus a small compressed-stream allowance, so
+  decode-to-nothing gzip streams cannot hold a connection open — and must finish within
+  30 seconds. Oversize requests are rejected with a `413` before git runs
+  ([#70](https://github.com/coder/code-storage/issues/70)). A proxy
   request-body cap is therefore optional defense-in-depth — if you set one, size it at
   or above the server cap and remember the proxy sees wire bytes while the server counts
   decoded (post-gzip) bytes. Request duration and concurrency limits remain the proxy's
