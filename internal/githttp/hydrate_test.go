@@ -169,6 +169,66 @@ func TestEnsureCacheRepo_MemoFallsThroughOnRepoRemoval(t *testing.T) {
 	}
 }
 
+// A local-scope [include] can override the pinned values for receive-pack
+// (which follows includes) while `--local --get` without --includes still
+// reports the direct pins — and the included file lives OUTSIDE the memo's
+// fingerprint, so its later drift would be invisible (PR #98 round-5
+// review). A config with include directives must therefore never be
+// memoized, and verification must resolve includes so an override defeats
+// it: every call re-checks, fail closed.
+func TestEnsureCacheRepo_LocalIncludeDisablesMemoization(t *testing.T) {
+	cacheDir := t.TempDir()
+	const repo = "t-ensure-include"
+	repoPath, err := EnsureCacheRepo(cacheDir, repo)
+	if err != nil {
+		t.Fatalf("EnsureCacheRepo: %v", err)
+	}
+
+	// Hostile include appended AFTER the pinned values: the included
+	// definition wins for receive-pack.
+	inc := filepath.Join(repoPath, "hostile.inc")
+	if err := os.WriteFile(inc, []byte("[receive]\n\tunpackLimit = 1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.OpenFile(filepath.Join(repoPath, "config"), os.O_WRONLY|os.O_APPEND, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString("[include]\n\tpath = hostile.inc\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// The edit changed the config fingerprint, so this call re-verifies
+	// with includes resolved. The override survives the direct repair
+	// write (the include still wins), which is corruption-grade: fail
+	// loudly rather than serve pushes that unpack loose objects the hooks
+	// never persist.
+	if _, err := EnsureCacheRepo(cacheDir, repo); err == nil {
+		t.Fatal("EnsureCacheRepo served a repo whose pinned config an include overrides")
+	} else if !errors.Is(err, errConfigValueMismatch) {
+		t.Fatalf("EnsureCacheRepo (hostile include) = %v, want errConfigValueMismatch", err)
+	}
+	if _, ok := cacheRepoMemos.Load(repoPath); ok {
+		t.Fatal("memoized a config whose effective values an included file controls")
+	}
+
+	// Benign include (no pinned keys): serves, but never memoized — the
+	// included file could later grow an override without touching the
+	// fingerprinted file.
+	if err := os.WriteFile(inc, []byte("[user]\n\tname = ops\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := EnsureCacheRepo(cacheDir, repo); err != nil {
+		t.Fatalf("EnsureCacheRepo (benign include): %v", err)
+	}
+	if _, ok := cacheRepoMemos.Load(repoPath); ok {
+		t.Fatal("memoized a config containing include directives")
+	}
+}
+
 // An in-place rewrite that preserves every classic stat attribute — same
 // inode (no rename), same byte length, mtime restored via Chtimes (the
 // `touch -r` pattern) — must still invalidate the memo (PR #98 round-4
@@ -254,7 +314,7 @@ func TestEnsureCacheRepo_RacedConfigRewriteNotMemoized(t *testing.T) {
 		line := strings.Join(args, " ")
 		// Fire once, on the gc.auto read — receive.unpackLimit was already
 		// read and verified from the pre-race file by then.
-		if dir != repoPath || !strings.Contains(line, "--get gc.auto") || raced.Swap(true) {
+		if dir != repoPath || !strings.Contains(line, "--get-all gc.auto") || raced.Swap(true) {
 			return
 		}
 		tmp := filepath.Join(repoPath, "config.raced")

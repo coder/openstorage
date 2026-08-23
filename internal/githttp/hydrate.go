@@ -177,31 +177,73 @@ func fileUnchanged(a, b os.FileInfo) bool {
 		a.Mode() == b.Mode() && fileChangeTime(a).Equal(fileChangeTime(b))
 }
 
-// verifyLocalConfig proves every cacheRepoConfig value is pinned in the
-// repo's LOCAL config file and returns a fingerprint of the exact file
-// state the reads covered: stat, read each value, stat again, and fail
-// unless both stats identify the same unchanged file — a rewrite racing
-// the reads could otherwise pair one file's values with another's
-// fingerprint (PR #98 round-3 review).
+// errConfigHasIncludes marks a local config containing [include]/
+// [includeIf] directives: the included files control effective values but
+// live outside the memo's fingerprint, so such a config is verified but
+// NEVER memoized — every call re-checks (PR #98 round-5 review).
+var errConfigHasIncludes = errors.New("local config contains include directives; memoization disabled")
+
+// errConfigValueMismatch marks a pinned key whose effective local-scope
+// value (includes resolved) is wrong or unset. Surviving the caller's own
+// direct repair write, it can only mean an include override or a hostile
+// racer — corruption-grade.
+var errConfigValueMismatch = errors.New("local config value mismatch")
+
+// verifyLocalConfig proves every cacheRepoConfig value is effective in the
+// repo's LOCAL scope and returns a fingerprint of the exact file state the
+// reads covered: stat, read each value, stat again, and fail unless both
+// stats identify the same unchanged file — a rewrite racing the reads
+// could otherwise pair one file's values with another's fingerprint (PR
+// #98 round-3 review).
 //
-// Scoped --local: an unscoped get would be satisfied by global/system/
-// include scopes, skip the local pin, and the memo (which fingerprints
-// only the local file) would freeze that decision against later drift of
-// the external source (PR #98 round-2 review). The local pin also outranks
+// Scoped --local: an unscoped get would be satisfied by global/system
+// scopes, skip the local pin, and the memo (which fingerprints only the
+// local file) would freeze that decision against later drift of the
+// external source (PR #98 round-2 review). The local pin also outranks
 // those scopes at receive-pack time, so drift cannot re-enable unpacking
 // pushes into loose objects that the hooks never upload.
+//
+// WITH --includes and --get-all (PR #98 round-5 review): receive-pack
+// follows local [include] directives and takes the LAST definition, so a
+// local include appended after the pins could override them while an
+// include-blind single-value read still reported the pin. Resolving
+// includes and requiring every definition to match makes any effective
+// override fail verification; a config that merely CONTAINS include
+// directives additionally fails with errConfigHasIncludes after the value
+// checks, because the included files could drift later without touching
+// the fingerprinted file.
 func verifyLocalConfig(ctx context.Context, repoPath, configPath string) (os.FileInfo, error) {
 	pre, err := os.Stat(configPath)
 	if err != nil {
 		return nil, err
 	}
 	for _, kv := range cacheRepoConfig {
-		cur, err := runGitCtx(ctx, repoPath, "config", "--local", "--get", kv[0])
+		cur, err := runGitCtx(ctx, repoPath, "config", "--local", "--includes", "--get-all", kv[0])
 		if err != nil {
 			return nil, err
 		}
-		if got := strings.TrimSpace(cur); got != kv[1] {
-			return nil, fmt.Errorf("local config %s = %q, want %q", kv[0], got, kv[1])
+		vals := strings.Split(strings.TrimSpace(cur), "\n")
+		if len(vals) == 0 || vals[0] == "" {
+			return nil, fmt.Errorf("%w: %s unset, want %q", errConfigValueMismatch, kv[0], kv[1])
+		}
+		for _, got := range vals {
+			if got != kv[1] {
+				return nil, fmt.Errorf("%w: %s = %q, want %q", errConfigValueMismatch, kv[0], got, kv[1])
+			}
+		}
+	}
+	// Include scan AFTER the value checks so callers repair values first;
+	// --no-includes lists the raw directives themselves.
+	names, err := runGitCtx(ctx, repoPath, "config", "--local", "--no-includes", "--name-only", "--list")
+	if err != nil {
+		return nil, err
+	}
+	hasIncludes := false
+	for _, name := range strings.Split(names, "\n") {
+		key := strings.ToLower(strings.TrimSpace(name))
+		if strings.HasPrefix(key, "include.") || strings.HasPrefix(key, "includeif.") {
+			hasIncludes = true
+			break
 		}
 	}
 	post, err := os.Stat(configPath)
@@ -210,6 +252,9 @@ func verifyLocalConfig(ctx context.Context, repoPath, configPath string) (os.Fil
 	}
 	if !fileUnchanged(pre, post) {
 		return nil, errors.New("config file changed underneath the verification reads")
+	}
+	if hasIncludes {
+		return nil, errConfigHasIncludes
 	}
 	return pre, nil
 }
@@ -268,13 +313,22 @@ func EnsureCacheRepoCtx(ctx context.Context, cacheDir, repo string) (string, err
 	// re-verifies.
 	configPath := filepath.Join(path, "config")
 	configFI, configErr := verifyLocalConfig(ctx, path, configPath)
-	if configErr != nil {
+	if configErr != nil && !errors.Is(configErr, errConfigHasIncludes) {
 		for _, kv := range cacheRepoConfig {
 			if _, err := runGitCtx(ctx, path, "config", kv[0], kv[1]); err != nil {
 				return "", err
 			}
 		}
 		configFI, configErr = verifyLocalConfig(ctx, path, configPath)
+		// A wrong effective value surviving our own direct write can only
+		// be a local include override or a hostile racer: fail loudly
+		// rather than serve pushes that unpack loose objects the hooks
+		// never persist (PR #98 round-5 review). Other residual errors —
+		// the file changing under a racing full pass — stay non-fatal:
+		// serve, skip memoization, and the next call re-verifies.
+		if errors.Is(configErr, errConfigValueMismatch) {
+			return "", fmt.Errorf("cache repo %s: pinned config overridden after repair: %w", repo, configErr)
+		}
 	}
 	self, err := os.Executable()
 	if err != nil {
