@@ -862,7 +862,7 @@ type stagingFileWriter struct {
 
 func (w *stagingFileWriter) Write(p []byte) (int, error) {
 	if need := w.written + int64(len(p)) - *w.reserved; need > 0 {
-		grow := max(need, lfsStagingChunk)
+		grow := max(need, w.s.lfsStagingQuantum())
 		if maxGrow := w.contentLength - *w.reserved; grow > maxGrow {
 			grow = maxGrow
 		}
@@ -1097,7 +1097,7 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target r
 	// transferring.
 	if s.LFSStagingBytes > 0 {
 		bound := min(s.LFSStagingBytes,
-			max(lfsStagingChunk, s.LFSStagingBytes/(lfsRepoStagingByteShareDiv+1)))
+			max(s.lfsStagingQuantum(), s.LFSStagingBytes/(lfsRepoStagingByteShareDiv+1)))
 		if r.ContentLength > bound {
 			lfsError(w, http.StatusRequestEntityTooLarge, fmt.Sprintf(
 				"object size %d exceeds this server's LFS staging allowance (%d bytes)",
@@ -1105,7 +1105,7 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target r
 			return
 		}
 	}
-	if initial := min(r.ContentLength, lfsStagingChunk); initial > 0 {
+	if initial := min(r.ContentLength, s.lfsStagingQuantum()); initial > 0 {
 		if !s.growLFSStaging(repoID, initial) {
 			w.Header().Set("Retry-After", "10")
 			lfsError(w, http.StatusTooManyRequests, "server LFS staging budget exhausted, retry")

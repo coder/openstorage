@@ -294,6 +294,22 @@ func (s *Server) releaseLFSVerifyBuffer(repo string) {
 	}
 }
 
+// lfsStagingQuantum is the effective staging growth quantum and share
+// floor: the default chunk, scaled DOWN to a third of the byte budget
+// when the budget is smaller (Codex round 55, security). With a budget at
+// or below one default chunk, the chunk-floored share allowance covered
+// the whole pool — a header-only PUT declaring the budget then reserved
+// every byte before reading any body and starved all repositories for the
+// idle minute, renewable once a minute. Scaling the quantum keeps the
+// share floor (and the 413 capability bound it implies) strictly below
+// the pool, so a victim repository always retains admissible capacity.
+func (s *Server) lfsStagingQuantum() int64 {
+	if s.LFSStagingBytes > 0 {
+		return min(lfsStagingChunk, max(1, s.LFSStagingBytes/(lfsRepoStagingByteShareDiv+1)))
+	}
+	return lfsStagingChunk
+}
+
 // lfsRepoStagingByteShareDiv scales one repository's staged-BYTE
 // allowance by the byte budget's free capacity, the byte analog of
 // lfsRepoStagingShareDiv (Codex round 38): with only the global budget, a
@@ -328,7 +344,7 @@ func (s *Server) growLFSStaging(repo string, n int64) bool {
 		// — see lfsRepoStagingByteShareDiv. The chunk floor keeps a
 		// minimal upload growable while the global budget has room.
 		free := s.LFSStagingBytes - s.lfsStagingInFlight
-		if s.lfsRepoStagingBytes[repo] > max(lfsStagingChunk, free/lfsRepoStagingByteShareDiv)-n {
+		if s.lfsRepoStagingBytes[repo] > max(s.lfsStagingQuantum(), free/lfsRepoStagingByteShareDiv)-n {
 			return false
 		}
 		s.lfsStagingInFlight += n

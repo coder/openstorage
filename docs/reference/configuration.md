@@ -309,7 +309,8 @@ sizes cannot bypass the gate).
   base repository. LFS objects always store under the base repository's prefix.
 - Admission is a durable reservation ledger in the ref store, atomic across concurrent
   pushes and replicas: two pushes that individually fit but together exceed the quota —
-  exactly one wins. LFS uploads charge the same ledger (reserve at batch, settle at
+  exactly one wins. LFS uploads charge the same ledger (an advisory batch fast-fail,
+  then a durable reserve at the verified upload, settled at
   verified upload completion). Independent of bytes, two compiled population bounds
   (like the repack fold budgets) keep tiny declared sizes from growing the shared
   database: each repository is capped at 10,000 **active reservation rows** (excess
@@ -367,9 +368,10 @@ periodic pruning of expired rows is garbage collection, not what re-opens headro
   uploads published after it, silently reopening the overshoot the ledger closes.
 - Must comfortably exceed the longest plausible server-side pack upload — the default
   clears a default-quota-sized (10 GiB) upload at ~3 MB/s.
-- LFS upload reservations (charged at batch time, settled at upload completion) use the
-  same TTL, so it must also cover the gap between a client's batch request and the end
-  of its slowest object transfer.
+- LFS upload reservations (charged durably at the verified upload, right before its
+  bytes publish; the batch check is advisory and holds nothing) use the same TTL, so it
+  must cover an object's publication and registration tail, not the client's transfer
+  time.
 
 ## Push work bounds
 

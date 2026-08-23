@@ -125,11 +125,17 @@ and the verified upload transfer re-checks the request's actual `Content-Length`
 batch that under-declares sizes is caught at the transfer. Either way git-lfs surfaces
 `repository storage quota exceeded: upload adds <n> bytes to <n> bytes stored (+<n>
 bytes reserved by in-flight uploads), quota is <n> bytes` and the push fails. LFS
-admission works like pack admission: a durable reservation charged at batch time on the
-declared sizes, settled into the usage counter when the verified upload completes, and
-expiring after the same
+admission happens in two stages: the batch API runs an **advisory** fast-fail check on
+the declared sizes (an over-quota batch answers per-object `507`s and issues no upload
+URLs, but reserves nothing durable — batch-time holds proved renewable-for-free), and
+the **durable** reservation is charged per object at the verified upload itself, right
+before its bytes are published, then settled into the usage counter when registration
+completes — expiring after the same
 [`CODESTORAGE_PACK_RESERVATION_TTL`](../reference/configuration.md#codestorage_pack_reservation_ttl)
-if the upload never arrives. Downloads are never quota-gated.
+if registration never lands. Between those stages nothing is held, so two near-quota
+clients can both receive upload URLs and one can transfer its whole object before the
+durable admission rejects it — wasted transfer, never quota overshoot. Downloads are
+never quota-gated.
 
 Reading the numbers: admission is `stored + reserved + incoming ≤ quota`, where
 

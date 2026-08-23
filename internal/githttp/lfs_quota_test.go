@@ -275,6 +275,45 @@ func (r reapOnRegister) RegisterAdoptedLFSObject(ctx context.Context, repo, key 
 	return r.Store.RegisterAdoptedLFSObject(ctx, repo, key, bytes)
 }
 
+// TestLFSStaging_SubChunkBudgetCannotBeMonopolized (Codex round 55,
+// security): with a configured budget at or below one default chunk, the
+// chunk-floored share allowance covered the WHOLE pool, so a header-only
+// PUT declaring the budget reserved every byte before reading any body
+// and starved all repositories for the idle minute. The staging quantum
+// must scale down with the budget: a whole-budget declaration is 413'd
+// outright (no single repository's share can ever hold it), and a parked
+// in-share upload leaves unrelated repositories admissible.
+func TestLFSStaging_SubChunkBudgetCannotBeMonopolized(t *testing.T) {
+	srv, _, mint := newLFSQuotaServer(t, 0, time.Hour)
+	srv.LFSStagingBytes = 3 << 20 // below one default 8 MiB chunk
+	tok := mint(auth.ScopeGitWrite)
+
+	// Declaring the whole budget must be permanently rejected — the
+	// per-repository capability is a third of the budget.
+	huge := bytes.Repeat([]byte("h"), 3<<20)
+	w := doLFS(t, srv, http.MethodPut, "/"+lfsTestRepoURL+".git/info/lfs/objects/"+sha256Hex(huge),
+		"basic:"+tok, string(huge))
+	if w.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("whole-budget PUT status = %d, want 413", w.Code)
+	}
+
+	// An in-share upload (1 MiB) holds at most its share: an unrelated
+	// repository must still reserve and grow.
+	content := bytes.Repeat([]byte("s"), 1<<20)
+	w = doLFS(t, srv, http.MethodPut, "/"+lfsTestRepoURL+".git/info/lfs/objects/"+sha256Hex(content),
+		"basic:"+tok, string(content))
+	if w.Code != http.StatusOK {
+		t.Fatalf("in-share PUT status = %d, body %s", w.Code, w.Body)
+	}
+	if !srv.reserveLFSStaging("repo_other", 0) {
+		t.Fatal("victim op slot starved")
+	}
+	if !srv.growLFSStaging("repo_other", 256<<10) {
+		t.Fatal("sub-chunk budget: unrelated repository's byte growth starved")
+	}
+	srv.releaseLFSStaging("repo_other", 256<<10)
+}
+
 // TestLFSPublicationLeaseLeavesFloorCoverage (Codex round 51): the
 // publication lease must end with a FULL floor-freshness-plus-handoff
 // window of reservation cover remaining — a registration failing at the
@@ -451,10 +490,10 @@ func TestLFSUpload_SameKeyConcurrencyBounded(t *testing.T) {
 // completed uploads return their reservation.
 func TestLFSUpload_NodeStagingBudget(t *testing.T) {
 	srv, _, mint := newLFSQuotaServer(t, 0, time.Hour)
-	srv.LFSStagingBytes = 40
+	srv.LFSStagingBytes = 100 // share bound (round 55 quantum): 100/3 = 33
 	tok := mint(auth.ScopeGitWrite)
 
-	// Permanently over budget: 413.
+	// Permanently over any repository's share: 413.
 	huge := bytes.Repeat([]byte("h"), 50)
 	w := doLFS(t, srv, http.MethodPut, "/"+lfsTestRepoURL+".git/info/lfs/objects/"+sha256Hex(huge),
 		"basic:"+tok, string(huge))
@@ -463,7 +502,7 @@ func TestLFSUpload_NodeStagingBudget(t *testing.T) {
 	}
 
 	// Park one 30-byte upload; a concurrent DISTINCT 30-byte upload no
-	// longer fits the 40-byte budget: 429.
+	// longer fits the repository's free-scaled byte share: 429.
 	first := bytes.Repeat([]byte("a"), 30)
 	second := bytes.Repeat([]byte("b"), 30)
 	pr, pw := io.Pipe()
@@ -512,12 +551,12 @@ func TestLFSUpload_StalledClientReleasesStaging(t *testing.T) {
 	t.Cleanup(func() { lfsUploadIdleTimeout = oldIdle })
 
 	srv, _, mint := newLFSQuotaServer(t, 0, time.Hour)
-	srv.LFSStagingBytes = 100
+	srv.LFSStagingBytes = 300 // per-repo share bound (round 55): 100
 	tok := mint(auth.ScopeGitWrite)
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
 
-	content := bytes.Repeat([]byte("s"), 100) // the whole staging budget
+	content := bytes.Repeat([]byte("s"), 100) // the whole repository share
 	oid := sha256Hex(content)
 	url := ts.URL + "/" + lfsTestRepoURL + ".git/info/lfs/objects/" + oid
 
@@ -542,7 +581,7 @@ func TestLFSUpload_StalledClientReleasesStaging(t *testing.T) {
 	}
 
 	// The idle deadline must abort the stalled upload and release its
-	// reservations; a fresh full-budget upload for another oid then fits.
+	// reservations; a fresh full-share upload for another oid then fits.
 	deadline := time.Now().Add(10 * time.Second)
 	other := bytes.Repeat([]byte("t"), 100)
 	otherURL := ts.URL + "/" + lfsTestRepoURL + ".git/info/lfs/objects/" + sha256Hex(other)
@@ -1572,7 +1611,7 @@ func TestLFSUpload_AbsoluteDeadlineBoundsDrip(t *testing.T) {
 	t.Cleanup(func() { lfsUploadIdleTimeout = oldIdle })
 
 	srv, _, mint := newLFSQuotaServer(t, 0, 400*time.Millisecond) // TTL = absolute bound
-	srv.LFSStagingBytes = 100
+	srv.LFSStagingBytes = 300 // per-repo share (round 55): 100 — the drip stays in-share
 	tok := mint(auth.ScopeGitWrite)
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
