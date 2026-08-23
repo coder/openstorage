@@ -288,6 +288,9 @@ type stubLedger struct{}
 func (stubLedger) IsRetainedPack(context.Context, string, string) (bool, error) {
 	return false, nil
 }
+func (stubLedger) LFSObjectRegisteredAt(context.Context, string, string) (time.Time, bool, error) {
+	return time.Time{}, false, nil
+}
 func (stubLedger) ReclaimRetainedPack(context.Context, string, string) (int64, error) {
 	return 0, nil
 }

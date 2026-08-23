@@ -197,6 +197,17 @@ type RefStore interface {
 	// (a point read mirroring HasPack, for the sweeper's per-object
 	// classification of the lfs/ prefix).
 	HasLFSObject(ctx context.Context, repo, key string) (bool, error)
+	// LFSObjectRegisteredAt returns (repo, key)'s registration time — the
+	// row's created_at, which the in-place legacy→canonical migration
+	// REFRESHES (Codex round 89): downloads presign the still-rowless
+	// LEGACY spelling right up to the moment the canonical row exists, so
+	// the row's clock is the only trustworthy "no more legacy URLs are
+	// being minted" anchor. Blob timestamps are not: a rowless canonical
+	// copy can be hours old (publication or adoption copied it and only
+	// the registration failed) while its late registration retry
+	// verifies it in place without rewriting it. ok is false when no row
+	// exists.
+	LFSObjectRegisteredAt(ctx context.Context, repo, key string) (at time.Time, ok bool, err error)
 	// BumpLFSAdoptionGen increments repo's shared adoption generation
 	// (Codex round 49 on #51): adopting a pre-registry LFS object moves
 	// bytes that physical listings ALREADY contain into the usage

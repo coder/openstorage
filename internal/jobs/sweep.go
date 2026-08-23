@@ -47,6 +47,11 @@ type PackRegistry interface {
 	// point membership for lfs/<repo>/<oid> keys, written by verified
 	// uploads (ref.RegisterLFSObject).
 	HasLFSObject(ctx context.Context, repo, key string) (bool, error)
+	// LFSObjectRegisteredAt reads a registered object's registration time
+	// (see ref.RefStore): the legacy reap grace's clock (Codex round 89)
+	// — legacy presigned GETs are minted right up to the registration
+	// moment, and neither blob timestamp bounds that.
+	LFSObjectRegisteredAt(ctx context.Context, repo, key string) (at time.Time, ok bool, err error)
 	// GuardedLFSDelete runs del serialized against LFS registration (see
 	// ref.RefStore): safeDelete's LFS blob delete must go through it, or
 	// a verified upload's register+verify can complete between the
@@ -775,46 +780,38 @@ func (s *Sweeper) restoreFromQuarantine(ctx context.Context, key, qKey string) (
 const legacyReapGraceFloor = time.Hour
 
 // legacySourceInReapGrace reports whether the aged legacy-spelled orphan
-// at key is an adoption-retained source whose adoption is too RECENT to
-// reap (Codex round 88): batch downloads presign the rowless legacy key
-// right up to the adoption moment, and the source's own ModTime is its
-// original upload — already past any threshold — so the candidate age
-// proves nothing about those URLs. The canonical blob's ModTime IS the
-// adoption (or verified-publish) time: the source reaps only once that
-// copy is older than the grace, which dwarfs the presign lifetime.
-// Unknowable canonical state spares the source (conservative; the next
-// sweep re-examines).
+// at key is an adoption-retained source whose REGISTRATION is too RECENT
+// to reap (Codex rounds 88+89): batch downloads presign the rowless legacy
+// key right up to the moment the canonical row exists, and the source's
+// own ModTime is its original upload — already past any threshold — so the
+// candidate age proves nothing about those URLs. Neither does the
+// canonical BLOB's ModTime (round 89): a rowless canonical copy can be
+// hours old — publication or adoption copied it and only the registration
+// failed — while the successful retry verifies it in place without
+// rewriting it. The row's created_at is the clock: registration mints it
+// fresh, and the in-place legacy-row migration refreshes it. The source
+// reaps only once the registration is older than the grace, which dwarfs
+// the presign lifetime. Unknowable state spares the source (conservative;
+// the next sweep re-examines).
 func (s *Sweeper) legacySourceInReapGrace(ctx context.Context, repo, key string) (bool, error) {
 	_, oid, ok := splitLFSKey(key)
 	if !ok {
 		return false, nil
 	}
 	canonical := blob.LFSKey(repo, oid)
-	registered, err := s.packs.HasLFSObject(ctx, repo, canonical)
+	registeredAt, registered, err := s.packs.LFSObjectRegisteredAt(ctx, repo, canonical)
 	if err != nil {
 		return false, fmt.Errorf("reap-grace twin lookup %s: %w", canonical, err)
 	}
 	if !registered {
 		return false, nil // plain rowless orphan: the age threshold governs
 	}
-	entries, err := s.blobs.List(ctx, canonical)
-	if err != nil {
-		return false, fmt.Errorf("reap-grace canonical list %s: %w", canonical, err)
-	}
 	grace := max(s.cfg.Threshold, legacyReapGraceFloor)
-	for _, e := range entries {
-		if e.Key != canonical {
-			continue
-		}
-		if e.ModTime.IsZero() || s.now().Sub(e.ModTime) < grace {
-			s.logger.Info("orphan pack sweep: sparing adoption-retained legacy source in reap grace", "key", key)
-			return true, nil
-		}
-		return false, nil
+	if registeredAt.IsZero() || s.now().Sub(registeredAt) < grace {
+		s.logger.Info("orphan pack sweep: sparing adoption-retained legacy source in reap grace", "key", key)
+		return true, nil
 	}
-	// Registered but blobless: spare — deleting the source buys nothing
-	// while the row's repair story is still converging.
-	return true, nil
+	return false, nil
 }
 
 // ReconcileTickInterval is the always-live twin janitor's cadence when

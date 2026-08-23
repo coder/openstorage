@@ -287,8 +287,10 @@ func (s *SQLite) registerLFSObjectTx(ctx context.Context, repo, key string, byte
 	// the PG twin (ADR-41) — and reconcile a twin a racing v0.2.0
 	// registration left behind (Codex round 79).
 	if legacy, ok := lfsLegacyRowKey(key); ok {
+		// created_at refreshes to the migration moment — the legacy reap
+		// grace's clock (Codex round 89); see the PG twin.
 		if _, err := tx.ExecContext(ctx, `
-UPDATE lfs_objects SET key = ? WHERE repo = ? AND key = ?
+UPDATE lfs_objects SET key = ?, created_at = unixepoch() WHERE repo = ? AND key = ?
   AND NOT EXISTS (SELECT 1 FROM lfs_objects o2 WHERE o2.repo = ? AND o2.key = ?)`,
 			key, repo, legacy, repo, key); err != nil {
 			return err
@@ -540,6 +542,22 @@ func (s *SQLite) HasLFSObject(ctx context.Context, repo, key string) (bool, erro
 	err := s.db.QueryRowContext(ctx,
 		`SELECT EXISTS (SELECT 1 FROM lfs_objects WHERE repo = ? AND key = ?)`, repo, key).Scan(&exists)
 	return exists, err
+}
+
+// LFSObjectRegisteredAt — see RefStore (Codex round 89). created_at is
+// unixepoch() seconds in the SQLite schema.
+func (s *SQLite) LFSObjectRegisteredAt(ctx context.Context, repo, key string) (time.Time, bool, error) {
+	assertf(repo != "" && key != "", "LFSObjectRegisteredAt(%q, %q)", repo, key)
+	var secs int64
+	err := s.db.QueryRowContext(ctx,
+		`SELECT created_at FROM lfs_objects WHERE repo = ? AND key = ?`, repo, key).Scan(&secs)
+	if errors.Is(err, sql.ErrNoRows) {
+		return time.Time{}, false, nil
+	}
+	if err != nil {
+		return time.Time{}, false, err
+	}
+	return time.Unix(secs, 0), true, nil
 }
 
 // QuotaLedgerState reads the group's ledger state (see the PG twin).

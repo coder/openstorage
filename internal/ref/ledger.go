@@ -787,8 +787,13 @@ func (s *PG) registerLFSObjectTx(ctx context.Context, repo, key string, bytes in
 		// double-count both ledgers. Guarded against a canonical twin so
 		// the primary key cannot conflict.
 		if legacy, ok := lfsLegacyRowKey(key); ok {
+			// created_at is REFRESHED to the migration moment (Codex
+			// round 89): the row's clock anchors the legacy reap grace —
+			// downloads presign the legacy spelling right up to this
+			// registration, and the old row's v0.2.0-era timestamp says
+			// nothing about those URLs.
 			if _, err := tx.Exec(ctx, `
-UPDATE lfs_objects SET key = $1 WHERE repo = $2 AND key = $3
+UPDATE lfs_objects SET key = $1, created_at = now() WHERE repo = $2 AND key = $3
   AND NOT EXISTS (SELECT 1 FROM lfs_objects o2 WHERE o2.repo = $2 AND o2.key = $1)`,
 				key, repo, legacy); err != nil {
 				return err
@@ -1038,6 +1043,18 @@ func (s *PG) HasLFSObject(ctx context.Context, repo, key string) (bool, error) {
 	err := s.pool.QueryRow(ctx,
 		`SELECT EXISTS (SELECT 1 FROM lfs_objects WHERE repo = $1 AND key = $2)`, repo, key).Scan(&exists)
 	return exists, err
+}
+
+// LFSObjectRegisteredAt — see RefStore (Codex round 89).
+func (s *PG) LFSObjectRegisteredAt(ctx context.Context, repo, key string) (time.Time, bool, error) {
+	assertf(repo != "" && key != "", "LFSObjectRegisteredAt(%q, %q)", repo, key)
+	var at time.Time
+	err := s.pool.QueryRow(ctx,
+		`SELECT created_at FROM lfs_objects WHERE repo = $1 AND key = $2`, repo, key).Scan(&at)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return time.Time{}, false, nil
+	}
+	return at, err == nil, err
 }
 
 // PackQuotaLedgerState is a point-in-time read of one accounting group's

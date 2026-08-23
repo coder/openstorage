@@ -97,6 +97,10 @@ func (s *countingStore) HasLFSObject(context.Context, string, string) (bool, err
 	panic("Hydrate must never read LFS objects")
 }
 
+func (s *countingStore) LFSObjectRegisteredAt(context.Context, string, string) (time.Time, bool, error) {
+	panic("Hydrate must never read LFS objects")
+}
+
 func (s *countingStore) CountLFSObjects(context.Context, string) (int64, error) {
 	panic("Hydrate must never count LFS objects")
 }

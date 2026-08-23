@@ -83,6 +83,9 @@ func (f *fakeInner) RegisterLFSObject(context.Context, string, string, int64) er
 func (f *fakeInner) HasLFSObject(context.Context, string, string) (bool, error) {
 	return false, nil
 }
+func (f *fakeInner) LFSObjectRegisteredAt(context.Context, string, string) (time.Time, bool, error) {
+	return time.Time{}, false, nil
+}
 func (f *fakeInner) CountLFSObjects(context.Context, string) (int64, error) { return 0, nil }
 func (f *fakeInner) BumpLFSAdoptionGen(context.Context, string) error       { return nil }
 func (f *fakeInner) RegisterAdoptedLFSObject(context.Context, string, string, int64) error {
