@@ -175,12 +175,26 @@ type usageEntry struct {
 	expires time.Time
 }
 
-// usageFlight is one in-progress listing; done is closed after usage/err
-// are set, releasing every coalesced waiter.
+// usageFlight is one in-progress listing; done is closed after
+// usage/err/expires are set, releasing every coalesced waiter. expires is
+// the scan-start-anchored freshness bound (Codex round 41): waiters must
+// not admit against a result whose scan outlived it. waiters/started/
+// aborted are guarded by the cache mutex; abort is closed when the last
+// admission waiter departs before the flight acquired its slot, so
+// abandoned flights exit without ever listing (round 41: slots bound only
+// ACTIVE listings — without cancellation, one parked goroutine and
+// inflight entry per repository would survive client disconnects and
+// eventually run a detached listing nobody consumes).
 type usageFlight struct {
-	done  chan struct{}
-	usage int64
-	err   error
+	done    chan struct{}
+	usage   int64
+	err     error
+	expires time.Time
+
+	abort   chan struct{}
+	waiters int
+	started bool
+	aborted bool
 }
 
 func (c *usageCache) clockNow() time.Time {
@@ -196,8 +210,8 @@ func (c *usageCache) clockNow() time.Time {
 // exceeds the recorded expiry by the whole scan duration, undoing the
 // MinPackReservationTTL guarantee for orphans published after their page
 // was scanned. A scan that outlives the TTL stores a dead-on-arrival
-// entry (the flight's own waiters already received the value — the same
-// staleness a self-listing has). Drops expired entries at most once per
+// entry, and the flight's own waiters reject the result too (round 41 —
+// usageFlight.expires). Drops expired entries at most once per
 // usageCachePruneInterval. Callers hold c.mu.
 func (c *usageCache) putLocked(repo string, usage int64, scanStart time.Time) {
 	assertf(repo != "" && usage >= 0 && !scanStart.IsZero(), "usageCache.putLocked(%q, %d, %v)", repo, usage, scanStart)
@@ -233,7 +247,9 @@ func (s *Server) peekUsage(repo string) (usage int64, ok bool) {
 	if _, refreshing := c.inflight[repo]; !refreshing {
 		select {
 		case usageRefreshSlots <- struct{}{}:
-			f := &usageFlight{done: make(chan struct{})}
+			// started: the slot is already held, so a departing
+			// admission waiter must not abort this flight.
+			f := &usageFlight{done: make(chan struct{}), abort: make(chan struct{}), started: true}
 			if c.inflight == nil {
 				c.inflight = make(map[string]*usageFlight)
 			}
@@ -268,7 +284,9 @@ func (s *Server) refreshUsage(repo string, f *usageFlight) {
 
 	c := &s.usage
 	c.mu.Lock()
-	delete(c.inflight, repo)
+	if c.inflight[repo] == f { // an aborted flight may have been replaced
+		delete(c.inflight, repo)
+	}
 	if err == nil {
 		c.putLocked(repo, usage, scanStart)
 	}
@@ -276,7 +294,7 @@ func (s *Server) refreshUsage(repo string, f *usageFlight) {
 	if err != nil {
 		log.Printf("quota: %s: usage refresh failed: %v", repo, err)
 	}
-	f.usage, f.err = usage, err
+	f.usage, f.err, f.expires = usage, err, scanStart.Add(usageCacheTTL)
 	close(f.done)
 }
 
@@ -347,15 +365,39 @@ func hookUsageFloor(ctx context.Context, bl blob.BlobStore, repo string) (int64,
 // cold callers share the leader's flight.
 func (s *Server) CachedUsageFloor(ctx context.Context, repo string) (int64, error) {
 	assertf(repo != "", "CachedUsageFloor: empty repo")
+	// A flight result whose scan outlived the freshness window is NOT
+	// servable (Codex round 41): under the minimum reservation TTL, an
+	// orphan published after its page was scanned has already lost
+	// reservation cover when such a listing completes. One retry covers a
+	// transiently slow scan; persistently slow scans fail CLOSED (the
+	// deny-safe side) rather than admit against the stale floor.
+	for attempt := 0; ; attempt++ {
+		usage, expired, err := s.usageFloorOnce(ctx, repo)
+		if err != nil {
+			return 0, err
+		}
+		if !expired {
+			return usage, nil
+		}
+		if attempt >= 1 {
+			return 0, fmt.Errorf("usage floor for %s: listing outlived its %v freshness window twice", repo, usageCacheTTL)
+		}
+	}
+}
+
+// usageFloorOnce serves one cache read / coalesced-flight wait for
+// CachedUsageFloor. expired=true reports a completed flight whose scan
+// outlived the freshness window (the caller retries or fails closed).
+func (s *Server) usageFloorOnce(ctx context.Context, repo string) (usage int64, expired bool, err error) {
 	c := &s.usage
 	c.mu.Lock()
 	if e, ok := c.entries[repo]; ok && !c.clockNow().After(e.expires) {
 		c.mu.Unlock()
-		return e.usage, nil
+		return e.usage, false, nil
 	}
 	f := c.inflight[repo]
 	if f == nil {
-		f = &usageFlight{done: make(chan struct{})}
+		f = &usageFlight{done: make(chan struct{}), abort: make(chan struct{})}
 		if c.inflight == nil {
 			c.inflight = make(map[string]*usageFlight)
 		}
@@ -366,21 +408,60 @@ func (s *Server) CachedUsageFloor(ctx context.Context, repo string) (int64, erro
 		// cold requests and leave one detached backend listing per
 		// repository running for up to usageListTimeout. The goroutine
 		// parks until a node-wide slot frees — at most one per repo (the
-		// inflight map), holding only memory while parked — and every
-		// caller, the flight starter included, waits below bounded by
-		// its own request context.
+		// inflight map), holding only memory while parked, and reaped
+		// entirely when its last waiter departs (the abort arm; round
+		// 41) — and every caller, the flight starter included, waits
+		// below bounded by its own request context.
 		slots := usageRefreshSlots // captured now: tests swap the var
 		go func() {
-			slots <- struct{}{}
+			select {
+			case slots <- struct{}{}:
+			case <-f.abort:
+				return // last waiter left before a slot freed
+			}
+			c.mu.Lock()
+			run := !f.aborted
+			if run {
+				f.started = true
+			}
+			c.mu.Unlock()
+			if !run { // abort raced the slot: hand it back unused
+				<-slots
+				return
+			}
 			defer func() { <-slots }()
 			s.refreshUsage(repo, f)
 		}()
 	}
+	f.waiters++
 	c.mu.Unlock()
 	select {
 	case <-f.done:
-		return f.usage, f.err
+		c.mu.Lock()
+		f.waiters--
+		c.mu.Unlock()
+		if f.err != nil {
+			return 0, false, f.err
+		}
+		if c.clockNow().After(f.expires) {
+			return 0, true, nil
+		}
+		return f.usage, false, nil
 	case <-ctx.Done():
-		return 0, ctx.Err()
+		c.mu.Lock()
+		f.waiters--
+		if f.waiters == 0 && !f.started && !f.aborted {
+			// Nobody is left to consume this flight and it never
+			// started listing: reap it so abandoned cold requests
+			// cannot accumulate parked goroutines and inflight
+			// entries, or run detached listings with no consumer.
+			f.aborted = true
+			close(f.abort)
+			if c.inflight[repo] == f {
+				delete(c.inflight, repo)
+			}
+		}
+		c.mu.Unlock()
+		return 0, false, ctx.Err()
 	}
 }

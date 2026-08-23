@@ -206,16 +206,26 @@ func TestPackUsageRefreshConcurrencyBounded(t *testing.T) {
 	}
 }
 
-// scanAdvancingBlob advances the injected clock on its first ListPages
-// call, simulating a listing whose scan takes longer than the cache TTL.
+// scanAdvancingBlob advances the injected clock at the start of each
+// scan's first ListPages call (limit bounds how many scans it slows),
+// simulating listings that take longer than the cache TTL.
 type scanAdvancingBlob struct {
 	blob.BlobStore
 	advance func()
-	once    sync.Once
+	limit   int
+	mu      sync.Mutex
+	scans   int
 }
 
 func (b *scanAdvancingBlob) ListPages(ctx context.Context, prefix string, pageSize int, fn func([]blob.ListedObject) error) error {
-	b.once.Do(b.advance)
+	b.mu.Lock()
+	// Three ListPages per refresh (base + namespace + LFS): the first of
+	// each triple marks a new scan.
+	if b.scans%3 == 0 && b.scans/3 < b.limit {
+		b.advance()
+	}
+	b.scans++
+	b.mu.Unlock()
 	return b.BlobStore.ListPages(ctx, prefix, pageSize, fn)
 }
 
@@ -226,25 +236,86 @@ func (b *scanAdvancingBlob) ListPages(ctx context.Context, prefix string, pageSi
 // duration, and with the reservation TTL configured near its 30s minimum,
 // an orphan published after its page was scanned loses reservation cover
 // while the stale floor is still served. A scan that itself outlives the
-// TTL must produce an entry that is already expired.
+// TTL must produce an entry that is already expired (dead on arrival), so
+// the peek path keeps electing refreshes until a fast scan lands.
 func TestUsageFloorEntryAgesFromScanStart(t *testing.T) {
 	now := time.Unix(1000, 0)
 	var nowMu sync.Mutex
 	srv := &Server{}
 	srv.usage.now = func() time.Time { nowMu.Lock(); defer nowMu.Unlock(); return now }
-	srv.Blob = &scanAdvancingBlob{BlobStore: openTestBlob(t), advance: func() {
+	cb := &countingBlob{BlobStore: openTestBlob(t)}
+	srv.Blob = &scanAdvancingBlob{BlobStore: cb, limit: 1, advance: func() {
 		nowMu.Lock()
 		now = now.Add(usageCacheTTL + 10*time.Second) // the scan outlives the TTL
 		nowMu.Unlock()
 	}}
 
-	if _, err := srv.CachedUsageFloor(context.Background(), "repo_slow"); err != nil {
-		t.Fatalf("CachedUsageFloor: %v", err)
+	// The first refresh's entry is dead on arrival, so peeks keep
+	// re-electing flights until the second (fast) scan stores a fresh
+	// entry: exactly two refreshes = six listings.
+	if got := awaitPeek(t, srv, "repo_slow"); got != 0 {
+		t.Fatalf("refreshed usage = %d, want 0", got)
 	}
-	// The scan began at t0 and finished past t0+TTL: the entry must not
-	// serve as fresh now.
-	if usage, ok := srv.peekUsage("repo_slow"); ok {
-		t.Fatalf("scan-outlived entry served as fresh (%d) — entry age must count from scan start", usage)
+	if got := cb.lists.Load(); got != 6 {
+		t.Fatalf("scan-outlived refresh cost %d listings, want 6 (dead-on-arrival entry must re-elect)", got)
+	}
+}
+
+// TestUsageFloorScanExpiredResultFailsClosed (Codex round 41): the
+// flight-result path must not hand CURRENT waiters a value whose scan
+// already outlived the freshness window — under the minimum reservation
+// TTL, an orphan published after its page was scanned has lost
+// reservation cover by the time such a listing completes, so admitting
+// against it overshoots quota. One retry covers a transiently slow scan;
+// persistently slow scans FAIL CLOSED instead of serving the stale floor.
+func TestUsageFloorScanExpiredResultFailsClosed(t *testing.T) {
+	now := time.Unix(1000, 0)
+	var nowMu sync.Mutex
+	srv := &Server{}
+	srv.usage.now = func() time.Time { nowMu.Lock(); defer nowMu.Unlock(); return now }
+	srv.Blob = &scanAdvancingBlob{BlobStore: openTestBlob(t), limit: 1 << 30, advance: func() {
+		nowMu.Lock()
+		now = now.Add(usageCacheTTL + 10*time.Second) // EVERY scan outlives the TTL
+		nowMu.Unlock()
+	}}
+
+	if usage, err := srv.CachedUsageFloor(context.Background(), "repo_always_slow"); err == nil {
+		t.Fatalf("scan-expired floor served (%d, nil), want fail-closed error", usage)
+	}
+}
+
+// TestUsageFloorAbandonedFlightIsCanceled (Codex round 41): a parked
+// flight whose last waiter departs must be canceled and removed — slots
+// bound only ACTIVE listings, so without cancellation a writer with many
+// repositories could park one goroutine and inflight entry per repo and
+// every abandoned flight would still run its detached one-minute listing
+// with no caller remaining.
+func TestUsageFloorAbandonedFlightIsCanceled(t *testing.T) {
+	oldSlots := usageRefreshSlots
+	usageRefreshSlots = make(chan struct{}, 1)
+	usageRefreshSlots <- struct{}{} // the pool is full
+	t.Cleanup(func() { usageRefreshSlots = oldSlots })
+
+	cb := &countingBlob{BlobStore: openTestBlob(t)}
+	srv := &Server{Blob: cb}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if _, err := srv.CachedUsageFloor(ctx, "repo_abandoned"); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("pool-full cold floor error = %v, want context.DeadlineExceeded", err)
+	}
+	// The departed waiter was the last: the flight must be gone.
+	srv.usage.mu.Lock()
+	inflight := len(srv.usage.inflight)
+	srv.usage.mu.Unlock()
+	if inflight != 0 {
+		t.Fatalf("abandoned flight still registered (%d inflight entries), want 0", inflight)
+	}
+	// Freeing the slot must NOT resurrect the abandoned listing.
+	<-usageRefreshSlots
+	time.Sleep(50 * time.Millisecond)
+	if got := cb.lists.Load(); got != 0 {
+		t.Fatalf("abandoned flight ran %d listings after its last waiter left, want 0", got)
 	}
 }
 
