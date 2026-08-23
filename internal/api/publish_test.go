@@ -29,6 +29,10 @@ func (capBusyRefStore) QuotaLedgerState(context.Context, []string, time.Duration
 	return ref.PackQuotaLedgerState{}, nil // the uncached floor's counter read
 }
 
+func (capBusyRefStore) HasPack(context.Context, string, string) (bool, error) {
+	return false, nil // fresh growth: the admission path is under test
+}
+
 func (capBusyRefStore) LFSAdoptionGen(context.Context, string) (int64, error) {
 	return 0, nil // the uncached floor's generation read (Codex round 60)
 }
@@ -105,6 +109,9 @@ func (b *restoreRaceBlob) UploadFile(context.Context, string, string) error {
 // floor-generation bump receives.
 type bumpRecordingStore struct {
 	ref.RefStore // nil: only the methods below are exercised
+	registered   bool
+	reserved     bool
+	covered      bool
 	bumped       bool
 	bumpCtxErr   error
 	bumpDeadline time.Time
@@ -112,6 +119,21 @@ type bumpRecordingStore struct {
 
 func (s *bumpRecordingStore) RegisterPacks(context.Context, string, []ref.Pack) error {
 	return nil
+}
+
+func (s *bumpRecordingStore) HasPack(context.Context, string, string) (bool, error) {
+	return s.registered, nil
+}
+
+func (s *bumpRecordingStore) ReservePackBytes(_ context.Context, _ []string, packs []ref.Pack, _ string, _, _, _ int64, _ time.Duration) (ref.ReserveDecision, error) {
+	for _, p := range packs {
+		if strings.HasSuffix(p.Key, ref.RepairCoverSuffix) {
+			s.covered = true // the seam's restore cover: required, not a charge
+		} else {
+			s.reserved = true // an admission charge on the real key
+		}
+	}
+	return ref.ReserveDecision{OK: true}, nil
 }
 
 func (s *bumpRecordingStore) BumpLFSAdoptionGen(ctx context.Context, _ string) error {
@@ -156,6 +178,47 @@ func TestPublishPackRestoreBumpSurvivesClientCancel(t *testing.T) {
 	// handoff bound must be CoverHandoffTimeout, not a generous minute.
 	if st.bumpDeadline.IsZero() || time.Until(st.bumpDeadline) > blob.CoverHandoffTimeout+time.Second {
 		t.Fatalf("bump deadline %v exceeds the cover handoff window (%v)", time.Until(st.bumpDeadline), blob.CoverHandoffTimeout)
+	}
+}
+
+// TestPublishPackRegisteredMissingIsRestoredNotCharged (Codex round 72 —
+// the REST twin of the hook's round-70 classification): a pack whose key
+// is registered but whose blob is missing must be treated as a RESTORE:
+// no admission charge (its bytes are already in the counter — charging
+// them can falsely reject an at-quota repair, and the zero-credit
+// registration no-op would consume the reservation without any bump),
+// with the republication going through the covered, generation-bumping
+// seam.
+func TestPublishPackRegisteredMissingIsRestoredNotCharged(t *testing.T) {
+	ctx := context.Background()
+	packPath := filepath.Join(t.TempDir(), "pack")
+	if err := os.WriteFile(packPath, []byte("pack-bytes"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	st := &bumpRecordingStore{registered: true}
+	s := &server{
+		refStore:  st,
+		blobStore: &restoreRaceBlob{cancel: func() {}},
+		logger:    discardLogger(),
+		// Quota ON: the restore must bypass the admission charge.
+		packQuotaBytes:     1 << 20,
+		packReservationTTL: time.Hour,
+		usageFloorFn: func(context.Context, string) (int64, int64, error) {
+			t.Fatal("restore consulted the usage floor (admission path)")
+			return 0, 0, nil
+		},
+	}
+	if err := s.publishPack(ctx, "repo_rm", "abcd", packPath); err != nil {
+		t.Fatalf("publishPack: %v", err)
+	}
+	if st.reserved {
+		t.Fatal("registered-but-missing pack was charged as fresh growth")
+	}
+	if !st.covered {
+		t.Fatal("restore took no distinct cover reservation")
+	}
+	if !st.bumped {
+		t.Fatal("restore did not hand off the floor-generation bump")
 	}
 }
 

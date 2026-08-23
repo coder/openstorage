@@ -62,7 +62,24 @@ func (s *server) publishPack(ctx context.Context, repoID, packID, packPath strin
 	}
 	pack := ref.Pack{ID: packID, Key: key, Size: info.Size()}
 	assertf(pack.Size > 0, "publishPack: empty pack file %s", packPath)
+	// An unpublished pack whose key is already REGISTERED is a RESTORE,
+	// not fresh growth (Codex round 72 — the REST twin of the
+	// pre-receive hook's round-70 classification): its bytes are in the
+	// usage counter, so charging them as incoming can falsely reject an
+	// at-quota repair, and the fresh path would re-materialize them with
+	// no distinct cover (the zero-credit registration no-op consumes the
+	// reservation without bumping). Restores skip the admission charge
+	// and the fresh upload; EnsurePublished below Stats them missing and
+	// restores them through the covered, generation-bumping seam.
+	restore := false
 	if !published {
+		has, err := s.refStore.HasPack(ctx, repoID, key)
+		if err != nil {
+			return fmt.Errorf("registry probe %s: %w", key, err)
+		}
+		restore = has
+	}
+	if !published && !restore {
 		if s.packQuotaBytes > 0 {
 			// Durable admission (issue #29, ref/ledger.go): the listing is
 			// the usage floor; the reservation closes concurrent-writer
