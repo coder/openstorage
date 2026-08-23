@@ -9,6 +9,7 @@ package githttp
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -205,6 +206,87 @@ func TestPackUsageRefreshConcurrencyBounded(t *testing.T) {
 	}
 }
 
+// scanAdvancingBlob advances the injected clock on its first ListPages
+// call, simulating a listing whose scan takes longer than the cache TTL.
+type scanAdvancingBlob struct {
+	blob.BlobStore
+	advance func()
+	once    sync.Once
+}
+
+func (b *scanAdvancingBlob) ListPages(ctx context.Context, prefix string, pageSize int, fn func([]blob.ListedObject) error) error {
+	b.once.Do(b.advance)
+	return b.BlobStore.ListPages(ctx, prefix, pageSize, fn)
+}
+
+// TestUsageFloorEntryAgesFromScanStart (Codex round 40): the cached
+// floor's age must count from the START of the listing, not its
+// completion — a scan approaching usageListTimeout otherwise yields an
+// entry whose true age exceeds the recorded expiry by the whole scan
+// duration, and with the reservation TTL configured near its 30s minimum,
+// an orphan published after its page was scanned loses reservation cover
+// while the stale floor is still served. A scan that itself outlives the
+// TTL must produce an entry that is already expired.
+func TestUsageFloorEntryAgesFromScanStart(t *testing.T) {
+	now := time.Unix(1000, 0)
+	var nowMu sync.Mutex
+	srv := &Server{}
+	srv.usage.now = func() time.Time { nowMu.Lock(); defer nowMu.Unlock(); return now }
+	srv.Blob = &scanAdvancingBlob{BlobStore: openTestBlob(t), advance: func() {
+		nowMu.Lock()
+		now = now.Add(usageCacheTTL + 10*time.Second) // the scan outlives the TTL
+		nowMu.Unlock()
+	}}
+
+	if _, err := srv.CachedUsageFloor(context.Background(), "repo_slow"); err != nil {
+		t.Fatalf("CachedUsageFloor: %v", err)
+	}
+	// The scan began at t0 and finished past t0+TTL: the entry must not
+	// serve as fresh now.
+	if usage, ok := srv.peekUsage("repo_slow"); ok {
+		t.Fatalf("scan-outlived entry served as fresh (%d) — entry age must count from scan start", usage)
+	}
+}
+
+// TestUsageFloorColdLeadersAreSlotBounded (Codex round 40): cold
+// admission-floor requests must start their listing through the SAME
+// bounded node-wide pool as the observational refreshes — inline leader
+// listings bypassed usageRefreshSlots, so a writer with tokens for many
+// repositories could disconnect many cold requests and leave one detached
+// backend listing per repository running for up to usageListTimeout. With
+// the pool full, a cold caller must wait (bounded by ITS context), and no
+// listing may start until a slot frees.
+func TestUsageFloorColdLeadersAreSlotBounded(t *testing.T) {
+	oldSlots := usageRefreshSlots
+	usageRefreshSlots = make(chan struct{}, 1)
+	usageRefreshSlots <- struct{}{} // the pool is full
+	t.Cleanup(func() { usageRefreshSlots = oldSlots })
+
+	cb := &countingBlob{BlobStore: openTestBlob(t)}
+	srv := &Server{Blob: cb}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if _, err := srv.CachedUsageFloor(ctx, "repo_cold"); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("pool-full cold floor error = %v, want context.DeadlineExceeded", err)
+	}
+	if got := cb.lists.Load(); got != 0 {
+		t.Fatalf("pool-full cold floor started %d listings, want 0 (slot must gate the flight)", got)
+	}
+
+	// Freeing the slot lets the parked flight run; a fresh caller
+	// coalesces onto it and gets the value.
+	<-usageRefreshSlots
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel2()
+	if usage, err := srv.CachedUsageFloor(ctx2, "repo_cold"); err != nil || usage != 0 {
+		t.Fatalf("post-release floor = (%d, %v), want (0, nil)", usage, err)
+	}
+	if got := cb.lists.Load(); got != 3 {
+		t.Fatalf("completed refresh cost %d listings, want 3", got)
+	}
+}
+
 // TestPackUsageCachePruneIsTimeBounded (Codex round 8): inserts drop
 // expired entries at most once per usageCachePruneInterval — never a
 // per-insert full-map walk — and fresh entries survive the sweep.
@@ -214,7 +296,7 @@ func TestPackUsageCachePruneIsTimeBounded(t *testing.T) {
 
 	c.mu.Lock()
 	for i := 0; i < 2000; i++ {
-		c.putLocked(fmt.Sprintf("repo_%04d", i), 1)
+		c.putLocked(fmt.Sprintf("repo_%04d", i), 1, now)
 	}
 	if got := len(c.entries); got != 2000 {
 		t.Fatalf("fresh entries pruned early: %d, want 2000", got)
@@ -223,7 +305,7 @@ func TestPackUsageCachePruneIsTimeBounded(t *testing.T) {
 	// Past the prune interval every old entry has also expired (TTL ==
 	// interval); the next insert sweeps them all, keeping only itself.
 	now = now.Add(usageCachePruneInterval + time.Second)
-	c.putLocked("repo_new", 1)
+	c.putLocked("repo_new", 1, now)
 	if got := len(c.entries); got != 1 {
 		t.Fatalf("post-interval insert kept %d entries, want 1", got)
 	}
@@ -234,7 +316,7 @@ func TestPackUsageCachePruneIsTimeBounded(t *testing.T) {
 	// Immediately after a sweep, inserts must not sweep again (lastPrune
 	// advanced): an expired straggler survives until the next interval.
 	c.entries["repo_stale"] = usageEntry{usage: 1, expires: now.Add(-time.Second)}
-	c.putLocked("repo_new2", 1)
+	c.putLocked("repo_new2", 1, now)
 	if _, ok := c.entries["repo_stale"]; !ok {
 		t.Fatal("insert swept before the prune interval elapsed")
 	}

@@ -190,10 +190,17 @@ func (c *usageCache) clockNow() time.Time {
 	return time.Now()
 }
 
-// putLocked stores repo's usage for usageCacheTTL, dropping expired entries
-// at most once per usageCachePruneInterval. Callers hold c.mu.
-func (c *usageCache) putLocked(repo string, usage int64) {
-	assertf(repo != "" && usage >= 0, "usageCache.putLocked(%q, %d)", repo, usage)
+// putLocked stores repo's usage for usageCacheTTL measured from scanStart
+// — the moment its listing BEGAN, not completed (Codex round 40): a scan
+// approaching usageListTimeout otherwise yields an entry whose true age
+// exceeds the recorded expiry by the whole scan duration, undoing the
+// MinPackReservationTTL guarantee for orphans published after their page
+// was scanned. A scan that outlives the TTL stores a dead-on-arrival
+// entry (the flight's own waiters already received the value — the same
+// staleness a self-listing has). Drops expired entries at most once per
+// usageCachePruneInterval. Callers hold c.mu.
+func (c *usageCache) putLocked(repo string, usage int64, scanStart time.Time) {
+	assertf(repo != "" && usage >= 0 && !scanStart.IsZero(), "usageCache.putLocked(%q, %d, %v)", repo, usage, scanStart)
 	now := c.clockNow()
 	if c.entries == nil {
 		c.entries = make(map[string]usageEntry)
@@ -206,7 +213,7 @@ func (c *usageCache) putLocked(repo string, usage int64) {
 			}
 		}
 	}
-	c.entries[repo] = usageEntry{usage: usage, expires: now.Add(usageCacheTTL)}
+	c.entries[repo] = usageEntry{usage: usage, expires: scanStart.Add(usageCacheTTL)}
 }
 
 // peekUsage returns repo's cached pack usage without ever blocking the
@@ -231,12 +238,16 @@ func (s *Server) peekUsage(repo string) (usage int64, ok bool) {
 				c.inflight = make(map[string]*usageFlight)
 			}
 			c.inflight[repo] = f
+			slots := usageRefreshSlots // captured now: tests swap the var
 			go func() {
-				defer func() { <-usageRefreshSlots }()
+				defer func() { <-slots }()
 				s.refreshUsage(repo, f)
 			}()
 		default:
 			// Pool exhausted: skip; a later peek retries the refresh.
+			// (Observational path only — admission's CachedUsageFloor
+			// instead parks its flight on the slot, because it needs a
+			// value.)
 		}
 	}
 	return 0, false
@@ -250,6 +261,7 @@ func (s *Server) peekUsage(repo string) (usage int64, ok bool) {
 // way.
 func (s *Server) refreshUsage(repo string, f *usageFlight) {
 	assertf(repo != "" && f != nil, "refreshUsage: missing repo or flight")
+	scanStart := s.usage.clockNow() // entry age counts from HERE (round 40)
 	ctx, cancel := context.WithTimeout(context.Background(), usageListTimeout)
 	defer cancel()
 	usage, err := blob.StorageUsageBytes(ctx, s.Blob, repo)
@@ -258,7 +270,7 @@ func (s *Server) refreshUsage(repo string, f *usageFlight) {
 	c.mu.Lock()
 	delete(c.inflight, repo)
 	if err == nil {
-		c.putLocked(repo, usage)
+		c.putLocked(repo, usage, scanStart)
 	}
 	c.mu.Unlock()
 	if err != nil {
@@ -341,23 +353,30 @@ func (s *Server) CachedUsageFloor(ctx context.Context, repo string) (int64, erro
 		c.mu.Unlock()
 		return e.usage, nil
 	}
-	f, leader := c.inflight[repo], false
+	f := c.inflight[repo]
 	if f == nil {
 		f = &usageFlight{done: make(chan struct{})}
 		if c.inflight == nil {
 			c.inflight = make(map[string]*usageFlight)
 		}
 		c.inflight[repo] = f
-		leader = true
+		// The flight is ASYNCHRONOUS and slot-gated (Codex round 40):
+		// an inline leader listing bypassed usageRefreshSlots, so a
+		// writer with tokens for many repositories could disconnect many
+		// cold requests and leave one detached backend listing per
+		// repository running for up to usageListTimeout. The goroutine
+		// parks until a node-wide slot frees — at most one per repo (the
+		// inflight map), holding only memory while parked — and every
+		// caller, the flight starter included, waits below bounded by
+		// its own request context.
+		slots := usageRefreshSlots // captured now: tests swap the var
+		go func() {
+			slots <- struct{}{}
+			defer func() { <-slots }()
+			s.refreshUsage(repo, f)
+		}()
 	}
 	c.mu.Unlock()
-	if leader {
-		// Synchronous: the admission decision needs the result. Callers
-		// are bounded by connection concurrency, so this does not need
-		// the background pool (usageRefreshSlots) that caps peekUsage's
-		// fire-and-forget refreshes.
-		s.refreshUsage(repo, f)
-	}
 	select {
 	case <-f.done:
 		return f.usage, f.err
