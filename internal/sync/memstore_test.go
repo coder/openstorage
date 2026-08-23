@@ -71,22 +71,22 @@ func TestMemStoreUpstreamLifecycle(t *testing.T) {
 		t.Fatalf("second put = %v, want ErrUpstreamExists", err)
 	}
 
-	claimed, err := m.BeginSync(ctx, "repo_b")
+	claimed, _, err := m.BeginSync(ctx, "repo_b", "test-holder", time.Minute)
 	if err != nil || claimed.RunCount != 0 || claimed.SuccessCount != 0 {
 		t.Fatalf("begin = %+v, %v", claimed, err)
 	}
-	if _, err := m.BeginSync(ctx, "repo_b"); !errors.Is(err, ErrSyncInProgress) {
+	if _, _, err := m.BeginSync(ctx, "repo_b", "test-holder", time.Minute); !errors.Is(err, ErrSyncInProgress) {
 		t.Fatalf("overlapping begin = %v, want ErrSyncInProgress", err)
 	}
-	fin, err := m.FinishSync(ctx, "repo_b", true)
+	fin, err := m.FinishSync(ctx, "repo_b", "test-holder", true)
 	if err != nil || fin.RunCount != 1 || fin.SuccessCount != 1 || fin.Syncing {
 		t.Fatalf("finish = %+v, %v", fin, err)
 	}
 
-	if _, err := m.BeginSync(ctx, "repo_b"); err != nil {
+	if _, _, err := m.BeginSync(ctx, "repo_b", "test-holder", time.Minute); err != nil {
 		t.Fatal(err)
 	}
-	fin, err = m.FinishSync(ctx, "repo_b", false)
+	fin, err = m.FinishSync(ctx, "repo_b", "test-holder", false)
 	if err != nil || fin.RunCount != 2 || fin.SuccessCount != 1 {
 		t.Fatalf("failed finish = %+v, %v", fin, err)
 	}
@@ -97,10 +97,10 @@ func TestMemStoreUpstreamLifecycle(t *testing.T) {
 	if err := m.DeleteUpstream(ctx, "repo_b"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("second delete = %v, want ErrNotFound", err)
 	}
-	if _, err := m.BeginSync(ctx, "repo_b"); !errors.Is(err, ErrNotFound) {
+	if _, _, err := m.BeginSync(ctx, "repo_b", "test-holder", time.Minute); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("begin after detach = %v, want ErrNotFound", err)
 	}
-	if _, err := m.FinishSync(ctx, "repo_b", true); !errors.Is(err, ErrNotFound) {
+	if _, err := m.FinishSync(ctx, "repo_b", "test-holder", true); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("finish after detach = %v, want ErrNotFound", err)
 	}
 }
@@ -119,7 +119,7 @@ func TestMemStoreBeginSyncClaimIsExclusive(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if _, err := m.BeginSync(ctx, "repo_c"); err == nil {
+			if _, _, err := m.BeginSync(ctx, "repo_c", "test-holder", time.Minute); err == nil {
 				mu.Lock()
 				claims++
 				mu.Unlock()

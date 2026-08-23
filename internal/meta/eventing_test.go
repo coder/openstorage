@@ -20,6 +20,11 @@ func testRepoID(t *testing.T, suffix string) string {
 	return "repo_" + t.Name() + suffix
 }
 
+// testClaimHolder is the claim token tests use where holder identity is
+// not itself under test; a 1-minute lease keeps claims unexpired for the
+// duration of any test that is not exercising expiry.
+const testClaimHolder = "test-holder"
+
 func TestWebhooks(t *testing.T) { runBackends(t, testWebhooks) }
 
 func testWebhooks(t *testing.T, s Backend) {
@@ -279,10 +284,10 @@ func testSyncLifecycle(t *testing.T, s Backend) {
 	ctx := t.Context()
 	repoID := testRepoID(t, "")
 
-	if _, _, err := s.TryBeginSync(ctx, repoID); !errors.Is(err, ErrNotFound) {
+	if _, _, _, err := s.TryBeginSync(ctx, repoID, testClaimHolder, time.Minute); !errors.Is(err, ErrNotFound) {
 		t.Errorf("claim never-linked err = %v, want ErrNotFound", err)
 	}
-	if _, err := s.FinishSync(ctx, repoID, true); !errors.Is(err, ErrNotFound) {
+	if _, err := s.FinishSync(ctx, repoID, testClaimHolder, true); !errors.Is(err, ErrNotFound) {
 		t.Errorf("finish never-linked err = %v, want ErrNotFound", err)
 	}
 
@@ -290,7 +295,7 @@ func testSyncLifecycle(t *testing.T, s Backend) {
 		t.Fatalf("SetRepoUpstream: %v", err)
 	}
 
-	up, claimed, err := s.TryBeginSync(ctx, repoID)
+	up, claimed, _, err := s.TryBeginSync(ctx, repoID, testClaimHolder, time.Minute)
 	if err != nil || !claimed {
 		t.Fatalf("first claim = (%+v, %v, %v), want claimed", up, claimed, err)
 	}
@@ -300,7 +305,7 @@ func testSyncLifecycle(t *testing.T, s Backend) {
 
 	// A second claim while the run is in flight is refused but returns the
 	// current row.
-	up, claimed, err = s.TryBeginSync(ctx, repoID)
+	up, claimed, _, err = s.TryBeginSync(ctx, repoID, testClaimHolder, time.Minute)
 	if err != nil || claimed {
 		t.Fatalf("contended claim = (%+v, %v, %v), want claimed=false", up, claimed, err)
 	}
@@ -308,7 +313,7 @@ func testSyncLifecycle(t *testing.T, s Backend) {
 		t.Errorf("contended row = %+v, want syncing", up)
 	}
 
-	up, err = s.FinishSync(ctx, repoID, true)
+	up, err = s.FinishSync(ctx, repoID, testClaimHolder, true)
 	if err != nil {
 		t.Fatalf("FinishSync success: %v", err)
 	}
@@ -317,10 +322,10 @@ func testSyncLifecycle(t *testing.T, s Backend) {
 	}
 
 	// Claim/finish a failed run: RunCount advances, SuccessCount stays.
-	if _, claimed, err := s.TryBeginSync(ctx, repoID); err != nil || !claimed {
+	if _, claimed, _, err := s.TryBeginSync(ctx, repoID, testClaimHolder, time.Minute); err != nil || !claimed {
 		t.Fatalf("reclaim after finish = (%v, %v), want claimed", claimed, err)
 	}
-	up, err = s.FinishSync(ctx, repoID, false)
+	up, err = s.FinishSync(ctx, repoID, testClaimHolder, false)
 	if err != nil {
 		t.Fatalf("FinishSync failure: %v", err)
 	}
@@ -333,16 +338,16 @@ func testSyncLifecycle(t *testing.T, s Backend) {
 
 	// Detach mid-run: the worker's FinishSync (and any further claim) is a
 	// 404.
-	if _, claimed, err := s.TryBeginSync(ctx, repoID); err != nil || !claimed {
+	if _, claimed, _, err := s.TryBeginSync(ctx, repoID, testClaimHolder, time.Minute); err != nil || !claimed {
 		t.Fatalf("claim before detach = (%v, %v), want claimed", claimed, err)
 	}
 	if err := s.DeleteRepoUpstream(ctx, repoID); err != nil {
 		t.Fatalf("detach mid-run: %v", err)
 	}
-	if _, err := s.FinishSync(ctx, repoID, true); !errors.Is(err, ErrNotFound) {
+	if _, err := s.FinishSync(ctx, repoID, testClaimHolder, true); !errors.Is(err, ErrNotFound) {
 		t.Errorf("finish after detach err = %v, want ErrNotFound", err)
 	}
-	if _, _, err := s.TryBeginSync(ctx, repoID); !errors.Is(err, ErrNotFound) {
+	if _, _, _, err := s.TryBeginSync(ctx, repoID, testClaimHolder, time.Minute); !errors.Is(err, ErrNotFound) {
 		t.Errorf("claim after detach err = %v, want ErrNotFound", err)
 	}
 }
@@ -364,7 +369,7 @@ func testTryBeginSyncConcurrent(t *testing.T, s Backend) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_, claimed, err := s.TryBeginSync(ctx, repoID)
+			_, claimed, _, err := s.TryBeginSync(ctx, repoID, testClaimHolder, time.Minute)
 			claims <- claimed
 			errs <- err
 		}()

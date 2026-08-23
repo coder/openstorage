@@ -591,6 +591,40 @@ func (s *PG) GetRef(ctx context.Context, repo, name string) (string, error) {
 	return sha, nil
 }
 
+// syncClaimFenceKey carries an optional sync-claim fence (issue #86) to
+// CASRef implementations via context — deliberately NOT a RefStore method:
+// every decorator in the stack (events, idempotent recovery, test fault
+// injectors) forwards the context untouched, so the fence reaches the
+// backend without widening the interface.
+type syncClaimFenceKey struct{}
+
+type syncClaimFence struct{ repo, holder string }
+
+// WithSyncClaimFence fences every CASRef executed under the returned
+// context: the swap applies only while repo's upstream-sync claim is held
+// by holder, evaluated ATOMICALLY inside the CAS statement itself against
+// the repo_upstreams table (deployment invariant: meta and ref share one
+// database — a single --data-dir sqlite file or the single serve PG URL).
+// A fenced CAS whose holder no longer matches (its claim was stolen, or
+// the upstream was detached) reports won=false, exactly like losing the
+// SHA race: the stale sync push's update is refused before publication.
+// Only the update hook sets this, and only for loopback sync pushes
+// (EnvSyncClaim).
+func WithSyncClaimFence(ctx context.Context, repo, holder string) context.Context {
+	assertf(repo != "" && holder != "", "WithSyncClaimFence: empty repo %q or holder %q", repo, holder)
+	return context.WithValue(ctx, syncClaimFenceKey{}, syncClaimFence{repo: repo, holder: holder})
+}
+
+// casFence extracts the sync-claim fence, verifying it targets this repo.
+func casFence(ctx context.Context, repo string) (syncClaimFence, bool) {
+	f, ok := ctx.Value(syncClaimFenceKey{}).(syncClaimFence)
+	if !ok {
+		return syncClaimFence{}, false
+	}
+	assertf(f.repo == repo, "sync claim fence for %q used on CAS for %q", f.repo, repo)
+	return f, true
+}
+
 // CASRef performs the compare-and-swap ref update. Returns won=false (no
 // error) when the precondition failed, i.e. someone else won the race.
 // Refs only ever change inside these single statements, so a broken/partial
@@ -599,6 +633,12 @@ func (s *PG) GetRef(ctx context.Context, repo, name string) (string, error) {
 // inside the same implicit transaction, so the statement stays the single
 // unit of commit and the IdempotentCAS ambiguity classification
 // (idempotent.go) is unchanged.
+//
+// Under WithSyncClaimFence the statement additionally requires the repo's
+// sync claim to be held by the fencing holder, with FOR UPDATE on the
+// repo_upstreams row: a concurrent claim steal serializes against the CAS
+// instead of racing its snapshot, so a stolen run's update can never
+// commit after the thief's claim (issue #86).
 func (s *PG) CASRef(ctx context.Context, repo, name, old, new string) (won bool, err error) {
 	assertf(ValidSHA(old), "CASRef: malformed old sha %q", old)
 	assertf(ValidSHA(new), "CASRef: malformed new sha %q", new)
@@ -622,25 +662,46 @@ func (s *PG) CASRef(ctx context.Context, repo, name, old, new string) (won bool,
 		return false, fmt.Errorf("cas %s/%s: %w", repo, name, notExecuted(cerr))
 	}
 
+	fence, fenced := casFence(ctx, repo)
 	var tag string
 	var ct interface{ RowsAffected() int64 }
 	switch {
-	case old == ZeroSHA: // create
+	case old == ZeroSHA && !fenced: // create
 		// created_at is set here once; SHA updates below never touch it.
 		c, cerr := conn.Exec(ctx,
 			`INSERT INTO refs (repo, name, sha, created_at) VALUES ($1, $2, $3, now()) ON CONFLICT DO NOTHING`,
 			repo, name, new)
 		ct, err, tag = c, cerr, "create"
-	case new == ZeroSHA: // delete
+	case old == ZeroSHA: // fenced create
+		c, cerr := conn.Exec(ctx,
+			`INSERT INTO refs (repo, name, sha, created_at)
+			 SELECT $1, $2, $3, now()
+			 WHERE EXISTS (SELECT 1 FROM repo_upstreams WHERE repo_id = $1 AND sync_claim_holder = $4 FOR UPDATE)
+			 ON CONFLICT DO NOTHING`,
+			repo, name, new, fence.holder)
+		ct, err, tag = c, cerr, "fenced create"
+	case new == ZeroSHA && !fenced: // delete
 		c, cerr := conn.Exec(ctx,
 			`DELETE FROM refs WHERE repo = $1 AND name = $2 AND sha = $3`,
 			repo, name, old)
 		ct, err, tag = c, cerr, "delete"
-	default: // update
+	case new == ZeroSHA: // fenced delete
+		c, cerr := conn.Exec(ctx,
+			`DELETE FROM refs WHERE repo = $1 AND name = $2 AND sha = $3
+			 AND EXISTS (SELECT 1 FROM repo_upstreams WHERE repo_id = $1 AND sync_claim_holder = $4 FOR UPDATE)`,
+			repo, name, old, fence.holder)
+		ct, err, tag = c, cerr, "fenced delete"
+	case !fenced: // update
 		c, cerr := conn.Exec(ctx,
 			`UPDATE refs SET sha = $1 WHERE repo = $2 AND name = $3 AND sha = $4`,
 			new, repo, name, old)
 		ct, err, tag = c, cerr, "update"
+	default: // fenced update
+		c, cerr := conn.Exec(ctx,
+			`UPDATE refs SET sha = $1 WHERE repo = $2 AND name = $3 AND sha = $4
+			 AND EXISTS (SELECT 1 FROM repo_upstreams WHERE repo_id = $2 AND sync_claim_holder = $5 FOR UPDATE)`,
+			new, repo, name, old, fence.holder)
+		ct, err, tag = c, cerr, "fenced update"
 	}
 	if err != nil {
 		return false, fmt.Errorf("cas %s %s/%s: %w", tag, repo, name, err)

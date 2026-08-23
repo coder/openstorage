@@ -26,6 +26,9 @@ var (
 	ErrAlreadyExists = errors.New("repository already exists")
 	// ErrAlreadyDeleted: SoftDeleteRepo on an already soft-deleted repo → 409.
 	ErrAlreadyDeleted = errors.New("repository already deleted")
+	// ErrClaimLost: FinishSync by a holder whose expired sync claim was
+	// stolen (issue #86) — the late finisher must abandon silently.
+	ErrClaimLost = errors.New("sync claim lost")
 	// ErrInvalidCursor: ListRepos received an undecodable cursor → 400.
 	ErrInvalidCursor = errors.New("invalid cursor")
 )

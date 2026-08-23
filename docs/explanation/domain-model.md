@@ -86,7 +86,11 @@ Derived from SDK behavior and the real consumer (`just-code-storage`):
     `repo.sync.started/succeeded/failed` webhooks. At most one sync run per repo is in
     flight; a `pull-upstream` accepted while a run is already in flight is never dropped —
     it coalesces into one follow-up run scheduled when the in-flight run finishes, so a 202
-    always means a sync run will observe upstream as of the request or later.
+    always means a sync run will observe upstream as of the request or later. The in-flight
+    claim is leased (holder token + expiry derived from the run budget): a claim whose
+    holder died mid-run expires and is stolen atomically by the next run — no operator
+    intervention — and a stolen run's late writes are refused by holder-token guards, so a
+    crash can delay but never permanently stop syncing.
 12. **Forking.** `base_repo: {provider: "code", operation: "fork", auth: {token: <jwt>}}`
     forks an existing code.storage repo (optionally at `ref`/`sha`) into an independent repo.
     The fork-source JWT carries `git:read` on the source repo.

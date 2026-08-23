@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.3](https://github.com/coder/code-storage/compare/v0.1.2...v0.1.3) (2026-08-23)
+
+
+### Bug Fixes
+
+* **sync:** lease the sync claim so a dead holder can never wedge syncing ([#89](https://github.com/coder/code-storage/issues/89)) ([8c7ba19](https://github.com/coder/code-storage/commit/8c7ba1943d1bf465c67203970a4491a42e5aced1))
+
 ## [0.1.2](https://github.com/coder/code-storage/compare/v0.1.1...v0.1.2) (2026-08-23)
 
 

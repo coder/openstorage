@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/coder/code-storage/internal/meta"
 )
@@ -95,7 +96,9 @@ func fromMetaUpstream(u meta.RepoUpstream) Upstream {
 	return Upstream{
 		RepoID: u.RepoID, Provider: u.Provider, Owner: u.Owner, Name: u.Name,
 		UpstreamHost: u.UpstreamHost, RunCount: u.RunCount, SuccessCount: u.SuccessCount,
-		Syncing: u.Syncing, SyncPending: u.SyncPending, CreatedAt: u.CreatedAt,
+		Syncing: u.Syncing, SyncPending: u.SyncPending,
+		SyncClaimHolder: u.SyncClaimHolder, SyncClaimExpiresAt: u.SyncClaimExpiresAt,
+		CreatedAt: u.CreatedAt,
 	}
 }
 
@@ -126,19 +129,22 @@ func (s metaUpstreams) RequestSync(ctx context.Context, repoID string) error {
 	return mapMetaErr(s.ms.RequestSync(ctx, repoID), ErrNotFound, nil)
 }
 
-func (s metaUpstreams) BeginSync(ctx context.Context, repoID string) (Upstream, error) {
-	row, claimed, err := s.ms.TryBeginSync(ctx, repoID)
+func (s metaUpstreams) BeginSync(ctx context.Context, repoID, holder string, lease time.Duration) (Upstream, string, error) {
+	row, claimed, stolenFrom, err := s.ms.TryBeginSync(ctx, repoID, holder, lease)
 	if err != nil {
-		return Upstream{}, mapMetaErr(err, ErrNotFound, nil)
+		return Upstream{}, "", mapMetaErr(err, ErrNotFound, nil)
 	}
 	if !claimed {
-		return Upstream{}, fmt.Errorf("%w: repo %s", ErrSyncInProgress, repoID)
+		return Upstream{}, "", fmt.Errorf("%w: repo %s", ErrSyncInProgress, repoID)
 	}
-	return fromMetaUpstream(row), nil
+	return fromMetaUpstream(row), stolenFrom, nil
 }
 
-func (s metaUpstreams) FinishSync(ctx context.Context, repoID string, success bool) (Upstream, error) {
-	row, err := s.ms.FinishSync(ctx, repoID, success)
+func (s metaUpstreams) FinishSync(ctx context.Context, repoID, holder string, success bool) (Upstream, error) {
+	row, err := s.ms.FinishSync(ctx, repoID, holder, success)
+	if errors.Is(err, meta.ErrClaimLost) {
+		return Upstream{}, fmt.Errorf("%w: %v", ErrClaimLost, err)
+	}
 	if err != nil {
 		return Upstream{}, mapMetaErr(err, ErrNotFound, nil)
 	}

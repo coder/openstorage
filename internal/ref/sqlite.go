@@ -256,6 +256,13 @@ func (s *SQLite) GetRef(ctx context.Context, repo, name string) (string, error) 
 // implicit transaction, so the statement stays the single unit of commit
 // and the IdempotentCAS ambiguity classification (idempotent.go) is
 // unchanged.
+//
+// Under WithSyncClaimFence (ref.go) the statement additionally requires
+// the repo's sync claim to be held by the fencing holder: SQLite's
+// single-writer lock serializes the fenced CAS against a concurrent claim
+// steal, so a stolen run's update can never commit after the thief's
+// claim (issue #86). Requires the shared local database (meta + ref in
+// one --data-dir file).
 func (s *SQLite) CASRef(ctx context.Context, repo, name, old, new string) (won bool, err error) {
 	assertf(ValidSHA(old), "CASRef: malformed old sha %q", old)
 	assertf(ValidSHA(new), "CASRef: malformed new sha %q", new)
@@ -278,10 +285,11 @@ func (s *SQLite) CASRef(ctx context.Context, repo, name, old, new string) (won b
 		return false, fmt.Errorf("cas %s/%s: %w", repo, name, notExecuted(cerr))
 	}
 
+	fence, fenced := casFence(ctx, repo)
 	var tag string
 	var res sql.Result
 	switch {
-	case old == ZeroSHA: // create
+	case old == ZeroSHA && !fenced: // create
 		// created_at set explicitly (not via column default): databases
 		// migrated by the InitSchema ALTER have no default on the column.
 		// SHA updates below never touch it.
@@ -289,16 +297,36 @@ func (s *SQLite) CASRef(ctx context.Context, repo, name, old, new string) (won b
 			`INSERT INTO refs (repo, name, sha, created_at) VALUES (?, ?, ?, unixepoch()) ON CONFLICT DO NOTHING`,
 			repo, name, new)
 		tag = "create"
-	case new == ZeroSHA: // delete
+	case old == ZeroSHA: // fenced create
+		res, err = conn.ExecContext(ctx,
+			`INSERT INTO refs (repo, name, sha, created_at)
+			 SELECT ?, ?, ?, unixepoch()
+			 WHERE EXISTS (SELECT 1 FROM repo_upstreams WHERE repo_id = ? AND sync_claim_holder = ?)
+			 ON CONFLICT DO NOTHING`,
+			repo, name, new, repo, fence.holder)
+		tag = "fenced create"
+	case new == ZeroSHA && !fenced: // delete
 		res, err = conn.ExecContext(ctx,
 			`DELETE FROM refs WHERE repo = ? AND name = ? AND sha = ?`,
 			repo, name, old)
 		tag = "delete"
-	default: // update
+	case new == ZeroSHA: // fenced delete
+		res, err = conn.ExecContext(ctx,
+			`DELETE FROM refs WHERE repo = ? AND name = ? AND sha = ?
+			 AND EXISTS (SELECT 1 FROM repo_upstreams WHERE repo_id = ? AND sync_claim_holder = ?)`,
+			repo, name, old, repo, fence.holder)
+		tag = "fenced delete"
+	case !fenced: // update
 		res, err = conn.ExecContext(ctx,
 			`UPDATE refs SET sha = ? WHERE repo = ? AND name = ? AND sha = ?`,
 			new, repo, name, old)
 		tag = "update"
+	default: // fenced update
+		res, err = conn.ExecContext(ctx,
+			`UPDATE refs SET sha = ? WHERE repo = ? AND name = ? AND sha = ?
+			 AND EXISTS (SELECT 1 FROM repo_upstreams WHERE repo_id = ? AND sync_claim_holder = ?)`,
+			new, repo, name, old, repo, fence.holder)
+		tag = "fenced update"
 	}
 	if err != nil {
 		return false, fmt.Errorf("cas %s %s/%s: %w", tag, repo, name, err)

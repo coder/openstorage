@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/coder/code-storage/internal/auth"
 	"github.com/coder/code-storage/internal/meta"
@@ -116,11 +117,13 @@ func (f failingStore) DeleteRepoUpstream(context.Context, string) error { return
 
 func (f failingStore) RequestSync(context.Context, string) error { return f.err }
 
-func (f failingStore) TryBeginSync(context.Context, string) (meta.RepoUpstream, bool, error) {
-	return meta.RepoUpstream{}, false, f.err
+func (f failingStore) PendingSyncRepoIDs(context.Context) ([]string, error) { return nil, f.err }
+
+func (f failingStore) TryBeginSync(context.Context, string, string, time.Duration) (meta.RepoUpstream, bool, string, error) {
+	return meta.RepoUpstream{}, false, "", f.err
 }
 
-func (f failingStore) FinishSync(context.Context, string, bool) (meta.RepoUpstream, error) {
+func (f failingStore) FinishSync(context.Context, string, string, bool) (meta.RepoUpstream, error) {
 	return meta.RepoUpstream{}, f.err
 }
 

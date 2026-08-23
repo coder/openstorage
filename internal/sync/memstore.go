@@ -2,9 +2,16 @@ package sync
 
 import (
 	"context"
+	"fmt"
+	"os"
+	"strconv"
 	stdsync "sync"
 	"time"
 )
+
+// LegacyClaimHolder mirrors meta.LegacyClaimHolder (the sync package must
+// not import meta): a claim adopted from a pre-lease writer under a grace.
+const LegacyClaimHolder = "!legacy-grace"
 
 // MemStore is an in-memory CredentialStore + UpstreamStore: the test
 // double and the local-mode stand-in until the durable meta-backed rows
@@ -146,32 +153,64 @@ func (m *MemStore) RequestSync(_ context.Context, repoID string) error {
 	return nil
 }
 
-func (m *MemStore) BeginSync(_ context.Context, repoID string) (Upstream, error) {
+func (m *MemStore) BeginSync(_ context.Context, repoID, holder string, lease time.Duration) (Upstream, string, error) {
+	assertf(holder != "", "BeginSync: empty holder")
+	assertf(lease > 0, "BeginSync: non-positive lease %v", lease)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	up, ok := m.upstreams[repoID]
 	if !ok {
-		return Upstream{}, ErrNotFound
+		return Upstream{}, "", ErrNotFound
 	}
+	stolenFrom := ""
 	if up.Syncing {
-		return Upstream{}, ErrSyncInProgress
+		if time.Now().Before(up.SyncClaimExpiresAt) {
+			return Upstream{}, "", ErrSyncInProgress
+		}
+		if up.SyncClaimHolder == "" {
+			// Legacy claim (pre-lease writer, mixed fleet): adopt with a
+			// full grace instead of stealing what may be a live run
+			// (meta.LegacyClaimHolder semantics, issue #86).
+			up.SyncClaimHolder, up.SyncClaimExpiresAt = LegacyClaimHolder, time.Now().Add(lease)
+			m.upstreams[repoID] = up
+			return Upstream{}, "", ErrSyncInProgress
+		}
+		if up.SyncClaimHolder == LegacyClaimHolder {
+			// Stealing an adopted legacy claim needs the operator's
+			// drained-fleet assertion (meta.EnvSyncStealLegacy).
+			if v, err := strconv.ParseBool(os.Getenv("CODESTORAGE_SYNC_STEAL_LEGACY")); err != nil || !v {
+				return Upstream{}, "", ErrSyncInProgress
+			}
+		}
+		stolenFrom = up.SyncClaimHolder // expired lease (or lapsed grace) stolen (issue #86)
 	}
 	// The claim consumes the pending marker: this run's upstream fetch
 	// postdates every request marked before the claim.
 	up.Syncing, up.SyncPending = true, false
+	up.SyncClaimHolder, up.SyncClaimExpiresAt = holder, time.Now().Add(lease)
 	m.upstreams[repoID] = up
-	return up, nil
+	return up, stolenFrom, nil
 }
 
-func (m *MemStore) FinishSync(_ context.Context, repoID string, success bool) (Upstream, error) {
+func (m *MemStore) FinishSync(_ context.Context, repoID, holder string, success bool) (Upstream, error) {
+	assertf(holder != "", "FinishSync: empty holder")
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	up, ok := m.upstreams[repoID]
 	if !ok {
 		return Upstream{}, ErrNotFound
 	}
-	assertf(up.Syncing, "FinishSync without BeginSync (repo %q)", repoID)
+	if !up.Syncing {
+		// No run in flight: a late finisher whose stolen claim was already
+		// released by the thief (issue #86) — same answer as the durable
+		// backends' `AND syncing` guard.
+		return Upstream{}, fmt.Errorf("no run in flight for %q: %w", repoID, ErrNotFound)
+	}
+	if up.SyncClaimHolder != holder {
+		return Upstream{}, fmt.Errorf("now held by %q: %w", up.SyncClaimHolder, ErrClaimLost)
+	}
 	up.Syncing = false
+	up.SyncClaimHolder, up.SyncClaimExpiresAt = "", time.Time{}
 	up.RunCount++
 	if success {
 		up.SuccessCount++

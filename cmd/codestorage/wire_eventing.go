@@ -26,8 +26,15 @@ import (
 	upsync "github.com/coder/code-storage/internal/sync"
 )
 
-// loopbackTokenTTL bounds the internally minted git:write JWT for one sync
-// run's loopback push (sync runs are capped at 10 minutes).
+// pendingSyncRecoveryDelay defers the local-mode boot recovery scan until
+// the serve listener is up (the recovered runs loopback-push to it).
+const pendingSyncRecoveryDelay = 15 * time.Second
+
+// loopbackTokenTTL is the CEILING for the internally minted git:write JWT
+// of one sync run's loopback push (sync runs are capped at 10 minutes).
+// The worker passes a per-run fence TTL derived from its claim lease
+// (issue #86); mint honors the SHORTER of the two, so a zombie run whose
+// claim can be stolen never holds a token that still authenticates.
 const loopbackTokenTTL = 15 * time.Minute
 
 // loopbackKey is the serve process's runtime-generated signing key for
@@ -53,17 +60,27 @@ func newLoopbackKey() (loopbackKey, string, error) {
 }
 
 // mint returns a short-lived repo-scoped git:write token for one loopback
-// push (docs/explanation/git-protocol-and-namespaces.md basic auth `t:<jwt>`).
-func (k loopbackKey) mint(org string, repo upsync.RepoInfo) (string, error) {
+// push (docs/explanation/git-protocol-and-namespaces.md basic auth `t:<jwt>`),
+// capped at min(ttl, loopbackTokenTTL) — ttl is the worker's claim-lease
+// push fence (sync.Loopback.Token contract). holder is the run's claim
+// token, carried as the sync_claim JWT claim so the update hook can fence
+// an in-flight receive-pack that outlives a claim steal (issue #86).
+func (k loopbackKey) mint(org string, repo upsync.RepoInfo, ttl time.Duration, holder string) (string, error) {
 	assertf(k.priv != nil, "loopbackKey.mint: missing key")
+	assertf(ttl > 0, "loopbackKey.mint: non-positive ttl %v", ttl)
+	assertf(holder != "", "loopbackKey.mint: empty claim holder")
+	if ttl > loopbackTokenTTL {
+		ttl = loopbackTokenTTL
+	}
 	now := time.Now()
 	return auth.MintToken(k.priv, k.alg, auth.Claims{
-		Iss:    org,
-		Sub:    auth.SubjectLiteral,
-		Repo:   repo.URL,
-		Scopes: []string{auth.ScopeGitRead, auth.ScopeGitWrite},
-		Iat:    now.Unix(),
-		Exp:    now.Add(loopbackTokenTTL).Unix(),
+		Iss:       org,
+		Sub:       auth.SubjectLiteral,
+		Repo:      repo.URL,
+		Scopes:    []string{auth.ScopeGitRead, auth.ScopeGitWrite},
+		Iat:       now.Unix(),
+		Exp:       now.Add(ttl).Unix(),
+		SyncClaim: holder,
 	})
 }
 
@@ -172,8 +189,10 @@ func buildServeEventing(ctx context.Context, ms meta.Store, dbURL, org, loopback
 		// against this process's in-memory loopback key, so a push routed
 		// through a load balancer could land on a replica that must
 		// reject it.
-		Loopback: upsync.Loopback{BaseURL: loopbackBaseURL, Token: func(_ context.Context, org string, repo upsync.RepoInfo) (string, error) { return key.mint(org, repo) }},
-		Logger:   logger,
+		Loopback: upsync.Loopback{BaseURL: loopbackBaseURL, Token: func(_ context.Context, org string, repo upsync.RepoInfo, ttl time.Duration, holder string) (string, error) {
+			return key.mint(org, repo, ttl, holder)
+		}},
+		Logger: logger,
 	}
 
 	cleanup := func() { queue.Close() }
@@ -193,9 +212,35 @@ func buildServeEventing(ctx context.Context, ms meta.Store, dbURL, org, loopback
 		// in-process queue never deduplicates against a running run, so
 		// a plain re-enqueue is sound here.
 		worker.Requeue = queue.EnqueueSync
+		// Boot recovery (issue #86): queued local work and deferred retry
+		// timers die with the process, but the SyncPending marker is
+		// durable — re-enqueue marked repos so accepted pull-upstream
+		// requests survive restarts (in particular the restart that
+		// applies CODESTORAGE_SYNC_STEAL_LEGACY). Delayed so the loopback
+		// listener is serving before the first recovered run pushes; a
+		// run that still meets a held claim re-arms the deferred retry.
+		recovery := time.AfterFunc(pendingSyncRecoveryDelay, func() {
+			rctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			ids, err := ms.PendingSyncRepoIDs(rctx)
+			if err != nil {
+				logger.Warn("pending sync boot recovery failed", "err", err)
+				return
+			}
+			for _, id := range ids {
+				if err := queue.EnqueueSync(rctx, upsync.Job{Org: org, RepoID: id}); err != nil {
+					logger.Warn("pending sync boot recovery enqueue failed", "repo", id, "err", err)
+				}
+			}
+		})
+		cleanup = func() {
+			recovery.Stop()
+			queue.Close()
+		}
 		if sweep != nil {
 			stopSweep := jobs.StartSweepTicker(sweep.Sweeper, sweep.Interval)
 			cleanup = func() {
+				recovery.Stop()
 				stopSweep()
 				queue.Close()
 			}

@@ -8,6 +8,7 @@ package meta
 import (
 	"errors"
 	"testing"
+	"time"
 )
 
 func TestFinishSyncRequiresInFlightRun(t *testing.T) {
@@ -23,7 +24,7 @@ func testFinishSyncRequiresInFlightRun(t *testing.T, s Backend) {
 	}
 
 	// Attached but idle (never claimed): FinishSync must refuse.
-	if _, err := s.FinishSync(ctx, repoID, true); !errors.Is(err, ErrNotFound) {
+	if _, err := s.FinishSync(ctx, repoID, testClaimHolder, true); !errors.Is(err, ErrNotFound) {
 		t.Errorf("finish without claim err = %v, want ErrNotFound", err)
 	}
 	got, err := s.GetRepoUpstream(ctx, repoID)
@@ -37,7 +38,7 @@ func testFinishSyncRequiresInFlightRun(t *testing.T, s Backend) {
 	// The stats-pollution race the guard exists for: claim, detach
 	// mid-run, re-attach — the stale run's FinishSync must not count
 	// against the fresh row.
-	if _, claimed, err := s.TryBeginSync(ctx, repoID); err != nil || !claimed {
+	if _, claimed, _, err := s.TryBeginSync(ctx, repoID, testClaimHolder, time.Minute); err != nil || !claimed {
 		t.Fatalf("claim = (%v, %v), want claimed", claimed, err)
 	}
 	if err := s.DeleteRepoUpstream(ctx, repoID); err != nil {
@@ -46,7 +47,7 @@ func testFinishSyncRequiresInFlightRun(t *testing.T, s Backend) {
 	if _, err := s.SetRepoUpstream(ctx, up); err != nil {
 		t.Fatalf("re-attach: %v", err)
 	}
-	if _, err := s.FinishSync(ctx, repoID, true); !errors.Is(err, ErrNotFound) {
+	if _, err := s.FinishSync(ctx, repoID, testClaimHolder, true); !errors.Is(err, ErrNotFound) {
 		t.Errorf("stale finish err = %v, want ErrNotFound", err)
 	}
 	got, err = s.GetRepoUpstream(ctx, repoID)
