@@ -412,6 +412,7 @@ func preReceive(ctx context.Context) error {
 	// ADOPTIONS: cached floors may already contain their bytes, so the
 	// registration bumps the shared floor generation for them (Codex
 	// round 53).
+	//
 	for i := range packs {
 		packs[i].Adopted = published[i]
 	}
@@ -425,11 +426,14 @@ func preReceive(ctx context.Context) error {
 	// rowless legacy bytes. Each restore is covered by a reservation
 	// BEFORE its upload (stale-floor admissions see the returning bytes),
 	// and any restore bumps the shared floor generation afterward so
-	// future serves re-scan. The bump is best-effort like the sweeper's
-	// quarantine-restore bump: the bytes ARE back, and a failed bump
-	// leaves only the TTL-bounded staleness the cover already guards.
-	restoredAny := false
-	var verifyErr error
+	// future serves re-scan.
+	// The floor-generation bump is the restore's invalidation HANDOFF
+	// (Codex rounds 68–70): it runs inside the seam, under a live cover,
+	// detached from the hook's fate, retried until it commits or cover
+	// continuity is lost.
+	bump := func(bctx context.Context) error {
+		return st.BumpLFSAdoptionGen(bctx, BaseRepo(repo))
+	}
 	for i, p := range packs {
 		var cover func(context.Context, int64) error
 		if quota > 0 {
@@ -437,30 +441,9 @@ func preReceive(ctx context.Context) error {
 				return ref.ReserveRestoreCover(cctx, st, blob.QuotaRepoGroup(repo), p.Key, size, ttl)
 			}
 		}
-		restored, err := blob.EnsurePublished(ctx, bl, p.Key, packFiles[i], cover)
-		// Track restores BEFORE the error check (Codex round 59): a
-		// restore whose post-publication cover refresh failed still made
-		// the bytes physical, and the generation bump below must run.
-		restoredAny = restoredAny || restored
-		if err != nil {
-			verifyErr = fmt.Errorf("pre-receive: verify %s: %w", p.Key, err)
-			break
+		if _, err := blob.EnsurePublished(ctx, bl, p.Key, packFiles[i], cover, bump); err != nil {
+			return errors.Join(regErr, fmt.Errorf("pre-receive: verify %s: %w", p.Key, err))
 		}
-	}
-	if restoredAny {
-		// Detached and bounded like the restores it concludes (Codex
-		// security round 68) — a canceled hook context must not skip
-		// the invalidation the covers hand off to.
-		// Bounded by the cover handoff window (Codex round 69): commit
-		// while the last cover row still lives.
-		bctx, bcancel := context.WithTimeout(context.WithoutCancel(ctx), blob.CoverHandoffTimeout)
-		defer bcancel()
-		if err := st.BumpLFSAdoptionGen(bctx, BaseRepo(repo)); err != nil {
-			fmt.Fprintf(os.Stderr, "codestorage: floor generation bump after pack restore: %v\n", err)
-		}
-	}
-	if verifyErr != nil {
-		return errors.Join(regErr, verifyErr)
 	}
 	return regErr
 }

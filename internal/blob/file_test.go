@@ -350,7 +350,7 @@ func TestEnsurePublished(t *testing.T) {
 	restored, err := EnsurePublished(ctx, b, key, src, func(context.Context, int64) error {
 		t.Fatal("onRestore ran for a present blob")
 		return nil
-	})
+	}, nil)
 	if err != nil || restored {
 		t.Fatalf("EnsurePublished(present) = (%v, %v), want (false, nil)", restored, err)
 	}
@@ -374,7 +374,7 @@ func TestEnsurePublished(t *testing.T) {
 			}
 		}
 		return nil
-	})
+	}, nil)
 	if err != nil || !restored || coverCalls != 2 {
 		t.Fatalf("EnsurePublished(missing) = (%v, %v), onRestore calls %d; want (true, nil), 2 (initial cover + post-publication refresh)", restored, err, coverCalls)
 	}
@@ -389,14 +389,14 @@ func TestEnsurePublished(t *testing.T) {
 	}
 	restored, err = EnsurePublished(ctx, b, key, src, func(context.Context, int64) error {
 		return errors.New("cover denied")
-	})
+	}, nil)
 	if err == nil || restored {
 		t.Fatalf("EnsurePublished(cover denied) = (%v, %v), want (false, error)", restored, err)
 	}
 	if _, serr := b.Stat(ctx, key); !errors.Is(serr, ErrNotFound) {
 		t.Fatalf("uncovered restore published bytes anyway (stat: %v)", serr)
 	}
-	if _, err := EnsurePublished(ctx, b, key, src, nil); err != nil {
+	if _, err := EnsurePublished(ctx, b, key, src, nil, nil); err != nil {
 		t.Fatal(err) // nil onRestore: re-seed for the next case
 	}
 
@@ -407,7 +407,7 @@ func TestEnsurePublished(t *testing.T) {
 	}
 	canceled, cancel := context.WithCancel(ctx)
 	cancel()
-	if _, err := EnsurePublished(canceled, b, key, src, nil); err != nil {
+	if _, err := EnsurePublished(canceled, b, key, src, nil, nil); err != nil {
 		t.Fatalf("EnsurePublished(canceled ctx): %v", err)
 	}
 	if _, err := b.Stat(ctx, key); err != nil {
@@ -461,7 +461,7 @@ func TestEnsurePublishedRenewsCoverThroughPublication(t *testing.T) {
 	restored, err := EnsurePublished(ctx, slow, key, src, func(context.Context, int64) error {
 		calls.Add(1)
 		return nil
-	})
+	}, nil)
 	if err != nil || !restored {
 		t.Fatalf("EnsurePublished(slow restore) = (%v, %v), want (true, nil)", restored, err)
 	}
@@ -484,7 +484,7 @@ func TestEnsurePublishedRenewsCoverThroughPublication(t *testing.T) {
 			return nil // the initial cover succeeds
 		}
 		return errors.New("ledger unreachable") // every renewal fails
-	})
+	}, nil)
 	if restored || err == nil || !strings.Contains(err.Error(), "restore cover continuity lost") {
 		t.Fatalf("EnsurePublished(dead ledger) = (%v, %v), want an aborted, unpublished restore", restored, err)
 	}
@@ -524,7 +524,7 @@ func TestWithRenewedCoverAbortsOnLapse(t *testing.T) {
 		case <-time.After(2 * time.Second):
 			return nil // the abort never came: uncovered bytes would publish
 		}
-	})
+	}, nil)
 	if opErr == nil || !strings.Contains(opErr.Error(), "restore cover continuity lost") {
 		t.Fatalf("opErr = %v, want a cover-lapse abort", opErr)
 	}
@@ -555,7 +555,7 @@ func TestWithRenewedCoverRejectsLateSuccess(t *testing.T) {
 		case <-time.After(2 * time.Second):
 			return nil // late successes were accepted: the gap went unnoticed
 		}
-	})
+	}, nil)
 	if opErr == nil || !strings.Contains(opErr.Error(), "restore cover continuity lost") {
 		t.Fatalf("opErr = %v, want a continuity abort on late-completing renewals", opErr)
 	}
@@ -592,7 +592,7 @@ func TestWithRenewedCoverBudgetExpiryAbortsBetweenTicks(t *testing.T) {
 		case <-time.After(2 * time.Second):
 			return nil // never aborted: uncovered bytes would publish
 		}
-	})
+	}, nil)
 	elapsed := time.Since(start)
 	if opErr == nil || !strings.Contains(opErr.Error(), "restore cover continuity lost") {
 		t.Fatalf("opErr = %v, want a budget-expiry abort", opErr)
@@ -623,7 +623,7 @@ func TestWithRenewedCoverTakesInitialCoverItself(t *testing.T) {
 		}
 		opStarts.Add(1)
 		return nil
-	})
+	}, nil)
 	if opErr != nil || renewErr != nil || opStarts.Load() != 1 {
 		t.Fatalf("WithRenewedCover = (%v, %v), op starts %d; want (nil, nil), 1", opErr, renewErr, opStarts.Load())
 	}
@@ -635,9 +635,52 @@ func TestWithRenewedCoverTakesInitialCoverItself(t *testing.T) {
 	}, func(context.Context) error {
 		opStarts.Add(1)
 		return nil
-	})
+	}, nil)
 	if opErr == nil || !strings.Contains(opErr.Error(), "initial restore cover") || opStarts.Load() != 0 {
 		t.Fatalf("WithRenewedCover(initial failure) = %v, op starts %d; want an initial-cover abort with op never run", opErr, opStarts.Load())
+	}
+}
+
+// TestWithRenewedCoverHandoffRetriesUnderLiveCover (Codex round 70): the
+// caller's invalidation used to be one best-effort attempt after the seam
+// returned — if it failed, the durable restored bytes were left with
+// neither cover nor invalidation, permanently (a retry of the original
+// write sees the blob present and never restores again). The handoff now
+// runs INSIDE the seam: each attempt bounded and executed under a freshly
+// proven cover, retried — alternating with renewals — until it commits;
+// only lost continuity gives up (and surfaces renewErr).
+func TestWithRenewedCoverHandoffRetriesUnderLiveCover(t *testing.T) {
+	oldI, oldT, oldB := coverRenewInterval, coverRenewTimeout, coverLapseBudget
+	coverRenewInterval, coverRenewTimeout, coverLapseBudget = 10*time.Millisecond, 50*time.Millisecond, 200*time.Millisecond
+	t.Cleanup(func() { coverRenewInterval, coverRenewTimeout, coverLapseBudget = oldI, oldT, oldB })
+
+	var renews atomic.Int32
+	renew := func(context.Context) error {
+		renews.Add(1)
+		return nil // the cover stays renewable throughout
+	}
+	handoffs := 0
+	lastRenewsSeen := int32(0)
+	handoff := func(hctx context.Context) error {
+		handoffs++
+		if d, ok := hctx.Deadline(); !ok || time.Until(d) > CoverHandoffTimeout+time.Second {
+			t.Fatalf("handoff attempt %d unbounded or over the handoff window", handoffs)
+		}
+		if r := renews.Load(); r <= lastRenewsSeen {
+			t.Fatalf("handoff attempt %d ran without a fresh cover renewal since the last attempt", handoffs)
+		}
+		lastRenewsSeen = renews.Load()
+		if handoffs < 3 {
+			return errors.New("ledger transiently down") // the invalidation must be RETRIED
+		}
+		return nil
+	}
+	opErr, renewErr := WithRenewedCover(context.Background(), renew, func(context.Context) error { return nil }, handoff)
+	if opErr != nil || renewErr != nil {
+		t.Fatalf("WithRenewedCover = (%v, %v), want (nil, nil) once the handoff lands", opErr, renewErr)
+	}
+	if handoffs != 3 {
+		t.Fatalf("handoff attempts = %d, want 3 (two transient failures retried under live covers)", handoffs)
 	}
 }
 
@@ -660,7 +703,7 @@ func TestWithRenewedCoverFinalRefreshRejectsLateCommit(t *testing.T) {
 		time.Sleep(40 * time.Millisecond)
 		return nil
 	}
-	opErr, renewErr := WithRenewedCover(context.Background(), renew, func(context.Context) error { return nil })
+	opErr, renewErr := WithRenewedCover(context.Background(), renew, func(context.Context) error { return nil }, nil)
 	if opErr != nil {
 		t.Fatalf("opErr = %v, want nil", opErr)
 	}
@@ -692,7 +735,7 @@ func TestWithRenewedCoverFinalRefreshReportsAtBudgetDeadline(t *testing.T) {
 		return errors.New("ledger down") // the tail refresh keeps failing fast
 	}
 	start := time.Now()
-	opErr, renewErr := WithRenewedCover(context.Background(), renew, func(context.Context) error { return nil })
+	opErr, renewErr := WithRenewedCover(context.Background(), renew, func(context.Context) error { return nil }, nil)
 	elapsed := time.Since(start)
 	if opErr != nil {
 		t.Fatalf("opErr = %v, want nil (op is instant)", opErr)
@@ -725,7 +768,7 @@ func TestWithRenewedCoverRefreshSurvivesOpDeadline(t *testing.T) {
 	}, func(context.Context) error {
 		cancel() // the op consumed its whole deadline as it finished
 		return nil
-	})
+	}, nil)
 	if opErr != nil {
 		t.Fatalf("opErr = %v, want nil", opErr)
 	}

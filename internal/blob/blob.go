@@ -263,7 +263,12 @@ func LFSPrefix(repoID string) string {
 // retry heals. The returned restored flag tells the caller to invalidate
 // cached floors (bump the shared floor generation) after the bytes are
 // back.
-func EnsurePublished(ctx context.Context, b BlobStore, key, path string, onRestore func(context.Context, int64) error) (restored bool, err error) {
+// onRestored (nil-ok) is the invalidation HANDOFF (Codex round 70): it
+// runs under a live, freshly proven cover and is retried — alternating
+// with cover renewals — until it commits or continuity is lost, so a
+// transient ledger failure cannot strand durable restored bytes with
+// neither cover nor invalidation.
+func EnsurePublished(ctx context.Context, b BlobStore, key, path string, onRestore func(context.Context, int64) error, onRestored func(context.Context) error) (restored bool, err error) {
 	assertf(b != nil && key != "" && path != "", "EnsurePublished(%q, %q)", key, path)
 	fi, err := os.Stat(path)
 	if err != nil {
@@ -276,6 +281,13 @@ func EnsurePublished(ctx context.Context, b BlobStore, key, path string, onResto
 		if onRestore == nil {
 			if err := b.UploadFile(ctx, key, path); err != nil {
 				return false, err
+			}
+			if onRestored != nil {
+				hctx, hcancel := context.WithTimeout(context.WithoutCancel(ctx), CoverHandoffTimeout)
+				defer hcancel()
+				if herr := onRestored(hctx); herr != nil {
+					return true, fmt.Errorf("hand off restore of %s: %w", key, herr)
+				}
 			}
 			return true, nil
 		}
@@ -293,17 +305,15 @@ func EnsurePublished(ctx context.Context, b BlobStore, key, path string, onResto
 		renew := func(rctx context.Context) error { return onRestore(rctx, fi.Size()) }
 		upErr, renewErr := WithRenewedCover(ctx, renew, func(opCtx context.Context) error {
 			return b.UploadFile(opCtx, key, path)
-		})
+		}, onRestored)
 		if upErr != nil {
 			return false, fmt.Errorf("restore %s: %w", key, upErr)
 		}
 		if renewErr != nil {
-			// The bytes ARE durably back — report the restore so the
-			// caller still invalidates floors — but surface the failed
-			// post-publication refresh: the cover's tail coverage now
-			// rests on the last mid-upload renewal (at most one renewal
-			// interval short of the full guarantee).
-			return true, fmt.Errorf("refresh restore cover of %s after publication: %w", key, renewErr)
+			// The bytes ARE durably back — report the restore — but the
+			// invalidation handoff never landed under a live cover
+			// (continuity was lost first): surface it, the caller logs.
+			return true, fmt.Errorf("hand off restore of %s: %w", key, renewErr)
 		}
 		return true, nil
 	}
@@ -341,17 +351,19 @@ var coverRenewTimeout = 10 * time.Second
 var coverLapseBudget = 45 * time.Second
 
 // WithRenewedCover runs op while keeping a restore's cover reservation
-// alive (Codex round 59): renew is invoked every coverRenewInterval —
-// each attempt deadline-bounded by coverRenewTimeout — for op's duration,
-// and once more after op succeeds, the post-publication refresh whose
-// restarted TTL outlives every floor scanned during the absence. The
-// caller takes the initial cover BEFORE calling this. Renewal failures
-// are tolerated while a recent success still covers the bytes; once
-// coverLapseBudget passes without one, op's context is canceled — the
-// restore aborts rather than publishing uncovered bytes (Codex round 62),
-// and the caller's retry converges. opErr reports op's own failure;
-// renewErr reports only the final refresh.
-func WithRenewedCover(ctx context.Context, renew func(context.Context) error, op func(context.Context) error) (opErr, renewErr error) {
+// alive (Codex round 59): it takes the initial cover itself (round 64),
+// renews it every coverRenewInterval — each attempt deadline-bounded and
+// continuity-checked — for op's duration, and after op succeeds it
+// alternates fresh cover refreshes with bounded attempts of the caller's
+// handoff (the floor invalidation) until the handoff COMMITS under a
+// live cover or continuity is lost (Codex round 70 — a single
+// best-effort handoff could fail and strand durable bytes with neither
+// cover nor invalidation). Renewal failures are tolerated while a recent
+// success still covers the bytes; once coverLapseBudget passes without
+// one, op's context is canceled — the restore aborts rather than
+// publishing uncovered bytes (Codex round 62). opErr reports op's own
+// failure; renewErr reports a handoff that never landed.
+func WithRenewedCover(ctx context.Context, renew func(context.Context) error, op func(context.Context) error, handoff func(context.Context) error) (opErr, renewErr error) {
 	assertf(renew != nil && op != nil, "WithRenewedCover: nil renew or op")
 	opCtx, opCancel := context.WithCancelCause(ctx)
 	defer opCancel(nil)
@@ -461,7 +473,25 @@ func WithRenewedCover(ctx context.Context, renew func(context.Context) error, op
 	for {
 		ok, lost, err := attemptRenew()
 		if ok {
-			return nil, nil
+			if handoff == nil {
+				return nil, nil
+			}
+			// The handoff runs under the freshly proven cover, bounded
+			// so a stalled attempt cannot outlive it (Codex rounds
+			// 69+70). A failure keeps the loop alive: the cover is
+			// renewed and the handoff retried until it commits or
+			// continuity is lost — the invalidation must LAND, not be
+			// logged away.
+			hctx, hcancel := context.WithTimeout(context.WithoutCancel(ctx), CoverHandoffTimeout)
+			herr := handoff(hctx)
+			hcancel()
+			if herr == nil {
+				return nil, nil
+			}
+			if wait := min(coverRenewInterval, time.Until(covered.Add(coverLapseBudget))); wait > 0 {
+				time.Sleep(wait)
+			}
+			continue
 		}
 		if lost {
 			return nil, fmt.Errorf("restore cover continuity lost at the final refresh (last renewal: %v)", err)

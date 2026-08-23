@@ -170,27 +170,14 @@ func (s *server) publishPack(ctx context.Context, repoID, packID, packPath strin
 			return ref.ReserveRestoreCover(cctx, s.refStore, blob.QuotaRepoGroup(repoID), key, size, ttl)
 		}
 	}
-	restored, err := blob.EnsurePublished(ctx, s.blobStore, key, packPath, cover)
-	// Bump BEFORE the error check (Codex round 59): a restore whose
-	// post-publication cover refresh failed still made the bytes
-	// physical, and cached floors must re-scan regardless.
-	if restored {
-		// Detached and bounded like the restore it concludes (Codex
-		// security round 68): EnsurePublished deliberately survives
-		// request cancellation, so a client disconnecting after
-		// registration must not be able to skip the invalidation — with
-		// the bump lost, absence-window floors outlive the covers and a
-		// later writer settles against the deflated floor.
-		// Bounded by the cover handoff window (Codex round 69): the
-		// bump must commit while the last cover row still lives — after
-		// a broken tail refresh that can be ~16s.
-		bctx, bcancel := context.WithTimeout(context.WithoutCancel(ctx), blob.CoverHandoffTimeout)
-		defer bcancel()
-		if berr := s.refStore.BumpLFSAdoptionGen(bctx, githttp.BaseRepo(repoID)); berr != nil {
-			s.logger.Warn("floor generation bump after pack restore", "key", key, "error", berr)
-		}
-	}
-	if err != nil {
+	// The floor-generation bump is the restore's invalidation HANDOFF
+	// (Codex rounds 68–70): it runs inside the seam, under a live cover,
+	// detached from the request's fate (EnsurePublished deliberately
+	// survives client cancellation), retried until it commits or cover
+	// continuity is lost.
+	if _, err := blob.EnsurePublished(ctx, s.blobStore, key, packPath, cover, func(bctx context.Context) error {
+		return s.refStore.BumpLFSAdoptionGen(bctx, githttp.BaseRepo(repoID))
+	}); err != nil {
 		return errors.Join(regErr, fmt.Errorf("verify pack %s: %w", key, err))
 	}
 	// Threshold check regardless of regErr (issue #1): an ambiguous

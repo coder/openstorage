@@ -667,41 +667,46 @@ func (s *Sweeper) restoreFromQuarantine(ctx context.Context, key, qKey string) (
 			}
 		}
 	}
+	// The floor-generation bump is the restore's invalidation HANDOFF
+	// (Codex rounds 54, 68–70): floors scanned during the absence hide
+	// the returning bytes, so the bump runs inside the seam, under a
+	// live cover, retried until it commits or continuity is lost.
+	var bump func(context.Context) error
+	if repo, ok := splitSweepKey(key); ok {
+		base, _, _ := strings.Cut(repo, "+")
+		bump = func(bctx context.Context) error {
+			return s.packs.BumpLFSAdoptionGen(bctx, base)
+		}
+	}
 	if renewCover != nil {
 		// The restore copy can outlive a near-minimum TTL cover (Codex
-		// round 59): renew it through the copy and refresh it after —
-		// the restarted TTL outlives the last stale-floor commit. A
-		// failed final refresh is logged, not fatal: the bytes ARE back
-		// and the generation bump below still runs.
+		// round 59): renew it through the copy, then hand off the
+		// invalidation under a fresh cover. A failed handoff is logged,
+		// not fatal: the bytes ARE back.
 		copyErr, renewErr := blob.WithRenewedCover(ctx, renewCover, func(opCtx context.Context) error {
 			return s.blobs.Copy(opCtx, key, qKey)
-		})
+		}, bump)
 		if copyErr != nil {
 			return false, copyErr
 		}
 		if renewErr != nil {
-			s.logger.Warn("orphan pack sweep: restore cover refresh after publication failed",
+			s.logger.Warn("orphan pack sweep: restore invalidation handoff failed",
 				"key", key, "error", renewErr)
 		}
-	} else if err := s.blobs.Copy(ctx, key, qKey); err != nil {
-		return false, err
-	}
-	// The restore re-materialized bytes a floor scanned during their
-	// absence could not see (Codex round 54): bump the shared floor
-	// generation so every replica's cached floor and minted hook floor
-	// from that window is invalidated. Best-effort with logging — a
-	// failed bump leaves only the TTL-bounded staleness, and the restore
-	// itself must not be reported failed (the bytes ARE back).
-	if repo, ok := splitSweepKey(key); ok {
-		base, _, _ := strings.Cut(repo, "+")
-		// Bounded by the cover handoff window (Codex round 69) and
-		// detached like the restore: the bump must commit while the
-		// last cover row still lives, regardless of the sweep context.
-		bctx, bcancel := context.WithTimeout(context.WithoutCancel(ctx), blob.CoverHandoffTimeout)
-		defer bcancel()
-		if err := s.packs.BumpLFSAdoptionGen(bctx, base); err != nil {
-			s.logger.Warn("orphan pack sweep: floor generation bump after restore failed",
-				"key", key, "error", err)
+	} else {
+		if err := s.blobs.Copy(ctx, key, qKey); err != nil {
+			return false, err
+		}
+		if bump != nil {
+			// No cover machinery (unparsable key never reaches here;
+			// this is the renewCover==nil zero-size case): one bounded
+			// detached attempt.
+			bctx, bcancel := context.WithTimeout(context.WithoutCancel(ctx), blob.CoverHandoffTimeout)
+			defer bcancel()
+			if err := bump(bctx); err != nil {
+				s.logger.Warn("orphan pack sweep: floor generation bump after restore failed",
+					"key", key, "error", err)
+			}
 		}
 	}
 	return true, nil
