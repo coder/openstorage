@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/coder/code-storage/internal/blob"
@@ -164,6 +165,63 @@ func TestEnsureCacheRepo_MemoFallsThroughOnRepoRemoval(t *testing.T) {
 	}
 	if got := strings.TrimSpace(mustGit(t, repoPath, "config", "--get", "receive.unpackLimit")); got != "0" {
 		t.Fatalf("receive.unpackLimit = %q, want 0", got)
+	}
+}
+
+// A concurrent rewrite of <repo>/config landing between the verification
+// reads and the fingerprint stat must never be memoized as verified (PR
+// #98 round-3 review): the memo would then vouch indefinitely for values
+// nobody checked — a hostile receive.unpackLimit would let pushes unpack
+// into loose objects the hooks never upload. The gitSpawnObserver seam
+// injects the race deterministically: after the first config value is read
+// and verified, the file is replaced with one whose already-read value is
+// hostile while the not-yet-read value still matches.
+func TestEnsureCacheRepo_RacedConfigRewriteNotMemoized(t *testing.T) {
+	cacheDir := t.TempDir()
+	const repo = "t-ensure-raced-config"
+	repoPath, err := EnsureCacheRepo(cacheDir, repo)
+	if err != nil {
+		t.Fatalf("EnsureCacheRepo: %v", err)
+	}
+	// Force the next call down the full verification path.
+	cacheRepoMemos.Delete(repoPath)
+
+	var raced atomic.Bool
+	obs := func(dir string, args []string) {
+		line := strings.Join(args, " ")
+		// Fire once, on the gc.auto read — receive.unpackLimit was already
+		// read and verified from the pre-race file by then.
+		if dir != repoPath || !strings.Contains(line, "--get gc.auto") || raced.Swap(true) {
+			return
+		}
+		tmp := filepath.Join(repoPath, "config.raced")
+		if err := os.WriteFile(tmp, []byte("[receive]\n\tunpackLimit = 1\n[gc]\n\tauto = 0\n"), 0o644); err != nil {
+			t.Errorf("write raced config: %v", err)
+			return
+		}
+		if err := os.Rename(tmp, filepath.Join(repoPath, "config")); err != nil {
+			t.Errorf("rename raced config: %v", err)
+		}
+	}
+	gitSpawnObserver.Store(&obs)
+	defer gitSpawnObserver.Store(nil)
+
+	if _, err := EnsureCacheRepo(cacheDir, repo); err != nil {
+		t.Fatalf("EnsureCacheRepo (raced): %v", err)
+	}
+	if !raced.Load() {
+		t.Fatal("race injection never fired: no gc.auto config read observed")
+	}
+	gitSpawnObserver.Store(nil)
+
+	// Whether the raced call repaired inline or declined to memoize, the
+	// next call must observe and repin the hostile value — it must NOT
+	// fast-path over a fingerprint nobody verified.
+	if _, err := EnsureCacheRepo(cacheDir, repo); err != nil {
+		t.Fatalf("EnsureCacheRepo (after race): %v", err)
+	}
+	if got := strings.TrimSpace(mustGit(t, repoPath, "config", "--local", "--get", "receive.unpackLimit")); got != "0" {
+		t.Fatalf("receive.unpackLimit = %q after raced rewrite, want 0 repinned", got)
 	}
 }
 

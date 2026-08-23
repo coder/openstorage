@@ -157,6 +157,60 @@ func (m cacheRepoMemo) memoFiles(repoPath string) [3]struct {
 	}
 }
 
+// cacheRepoConfig lists the values every cache repo must pin in its LOCAL
+// config file. Every push must yield a pack file (>= 0 received objects
+// keeps the pack).
+var cacheRepoConfig = [][2]string{
+	{"receive.unpackLimit", "0"},
+	{"gc.auto", "0"},
+}
+
+// fileUnchanged reports whether two stats identify the same unchanged file:
+// same inode (os.SameFile — rewrites via lockfile/temp + rename always
+// change it), mtime, size, and mode (a bare chmod changes nothing else, and
+// git silently skips non-executable hooks).
+func fileUnchanged(a, b os.FileInfo) bool {
+	assertf(a != nil && b != nil, "fileUnchanged: nil FileInfo")
+	return os.SameFile(a, b) && a.ModTime().Equal(b.ModTime()) && a.Size() == b.Size() && a.Mode() == b.Mode()
+}
+
+// verifyLocalConfig proves every cacheRepoConfig value is pinned in the
+// repo's LOCAL config file and returns a fingerprint of the exact file
+// state the reads covered: stat, read each value, stat again, and fail
+// unless both stats identify the same unchanged file — a rewrite racing
+// the reads could otherwise pair one file's values with another's
+// fingerprint (PR #98 round-3 review).
+//
+// Scoped --local: an unscoped get would be satisfied by global/system/
+// include scopes, skip the local pin, and the memo (which fingerprints
+// only the local file) would freeze that decision against later drift of
+// the external source (PR #98 round-2 review). The local pin also outranks
+// those scopes at receive-pack time, so drift cannot re-enable unpacking
+// pushes into loose objects that the hooks never upload.
+func verifyLocalConfig(ctx context.Context, repoPath, configPath string) (os.FileInfo, error) {
+	pre, err := os.Stat(configPath)
+	if err != nil {
+		return nil, err
+	}
+	for _, kv := range cacheRepoConfig {
+		cur, err := runGitCtx(ctx, repoPath, "config", "--local", "--get", kv[0])
+		if err != nil {
+			return nil, err
+		}
+		if got := strings.TrimSpace(cur); got != kv[1] {
+			return nil, fmt.Errorf("local config %s = %q, want %q", kv[0], got, kv[1])
+		}
+	}
+	post, err := os.Stat(configPath)
+	if err != nil {
+		return nil, err
+	}
+	if !fileUnchanged(pre, post) {
+		return nil, errors.New("config file changed underneath the verification reads")
+	}
+	return pre, nil
+}
+
 // cacheRepoUnchanged reports whether repoPath still matches the memoized
 // verified state, using only stats (zero forks, zero reads).
 func cacheRepoUnchanged(repoPath string, m cacheRepoMemo) bool {
@@ -169,8 +223,7 @@ func cacheRepoUnchanged(repoPath string, m cacheRepoMemo) bool {
 	for _, f := range m.memoFiles(repoPath) {
 		assertf(f.fi != nil, "cacheRepoUnchanged: memo without fingerprint for %s", f.path)
 		fi, err := os.Stat(f.path)
-		if err != nil || !os.SameFile(f.fi, fi) || !f.fi.ModTime().Equal(fi.ModTime()) ||
-			f.fi.Size() != fi.Size() || f.fi.Mode() != fi.Mode() {
+		if err != nil || !fileUnchanged(f.fi, fi) {
 			return false
 		}
 	}
@@ -200,27 +253,25 @@ func EnsureCacheRepoCtx(ctx context.Context, cacheDir, repo string) (string, err
 			return "", err
 		}
 	}
-	// Every push must yield a pack file (>= 0 received objects keeps the pack).
-	for _, kv := range [][2]string{
-		{"receive.unpackLimit", "0"},
-		{"gc.auto", "0"},
-	} {
-		// Read-check first: config writes take config.lock, and concurrent
-		// hydrates of the same repo must not fail on lock contention in the
-		// steady-state already-configured case. Scoped --local: the values
-		// must be pinned in <repo>/config itself — an unscoped get would be
-		// satisfied by global/system/include scopes, skip the local write,
-		// and the memo (which fingerprints only the local file) would
-		// freeze that decision against later drift of the external source
-		// (PR #98 round-2 review). The local pin also outranks those scopes
-		// at receive-pack time, so drift cannot re-enable unpacking pushes
-		// into loose objects.
-		if cur, err := runGitCtx(ctx, path, "config", "--local", "--get", kv[0]); err == nil && strings.TrimSpace(cur) == kv[1] {
-			continue
+	// Read-check first: config writes take config.lock, and concurrent
+	// hydrates of the same repo must not fail on lock contention in the
+	// steady-state already-configured case. On any verification failure —
+	// values missing (fresh init), drifted, or the file changing under the
+	// reads — write the values and verify once more, so a fresh or
+	// repaired repo converges to the memoized fork-free steady state in
+	// this same call. A second failure means a concurrent writer is still
+	// racing: proceed (our values are written; a racer writes the same
+	// ones) but skip memoization below — fail closed, the next call
+	// re-verifies.
+	configPath := filepath.Join(path, "config")
+	configFI, configErr := verifyLocalConfig(ctx, path, configPath)
+	if configErr != nil {
+		for _, kv := range cacheRepoConfig {
+			if _, err := runGitCtx(ctx, path, "config", kv[0], kv[1]); err != nil {
+				return "", err
+			}
 		}
-		if _, err := runGitCtx(ctx, path, "config", kv[0], kv[1]); err != nil {
-			return "", err
-		}
+		configFI, configErr = verifyLocalConfig(ctx, path, configPath)
 	}
 	self, err := os.Executable()
 	if err != nil {
@@ -246,13 +297,14 @@ func EnsureCacheRepoCtx(ctx context.Context, cacheDir, repo string) (string, err
 		assertf(fi != nil, "ensureHook returned no FileInfo for %s", hook.name)
 		*hook.fi = fi
 	}
-	// Config content is bound by construction, not by this stat: only our
-	// own code writes it (same-value writes everywhere), so any state the
-	// stat can capture — including a concurrent full pass's rewrite — holds
-	// the values verified above. A vanished file (external wipe racing us)
-	// just skips memoization: fail closed, the next call re-verifies.
-	if fi, err := os.Stat(filepath.Join(path, "config")); err == nil {
-		memo.config = fi
+	// Memoize only a config state some verifyLocalConfig pass proved: the
+	// fingerprint identifies the exact unchanged file the reads covered
+	// (PR #98 round-3 review). A raced rewrite leaves configErr set and
+	// skips memoization entirely — hooks included, so the whole memo only
+	// ever vouches for verified state.
+	if configErr == nil {
+		assertf(configFI != nil, "verifyLocalConfig returned no FileInfo for %s", configPath)
+		memo.config = configFI
 		cacheRepoMemos.Store(path, memo)
 	}
 	return path, nil
