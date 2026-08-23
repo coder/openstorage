@@ -1403,5 +1403,25 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target r
 		lfsError(w, http.StatusInternalServerError, "object registration failed")
 		return
 	}
+	// Zero-growth repair republication (Codex round 56): registered here
+	// means the entry probe found NO blob for a key whose bytes the
+	// usage counter already includes — a floor scanned during that
+	// absence subtracted the full counter from a listing missing these
+	// bytes, hiding equally sized rowless legacy data. The republication
+	// above re-materialized them without touching the counter, so floors
+	// cached in the absence window now undercount physical usage: bump
+	// the shared floor generation — the PUT analogue of the sweeper's
+	// quarantine-restore bump (round 54). Best-effort with logging, like
+	// that bump: the bytes ARE durably back and registered, and a failed
+	// bump leaves only the TTL-bounded staleness a crash right here
+	// would always leave. Zero-byte objects never appear in floors.
+	if registered && n > 0 {
+		bctx, bcancel := context.WithTimeout(context.WithoutCancel(ctx), lfsCleanupTimeout)
+		defer bcancel()
+		if err := s.Store.BumpLFSAdoptionGen(bctx, BaseRepo(repoID)); err != nil {
+			log.Printf("lfs repair %s: floor generation bump failed: %v", key, err)
+		}
+		s.invalidateUsageFloor(repoID)
+	}
 	w.WriteHeader(http.StatusOK)
 }

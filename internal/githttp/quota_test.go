@@ -413,6 +413,58 @@ func TestUsageFloorInvalidatedAcrossReplicas(t *testing.T) {
 	}
 }
 
+// TestUsageFloorInvalidatedByZeroGrowthRepair (Codex round 56): a
+// registered object's blob can vanish (storage loss, a crash between an
+// ambiguous registration and republication). A floor scanned during the
+// absence subtracts the full counter from a listing that no longer holds
+// the object's bytes — hiding equally sized rowless legacy data — and the
+// zero-growth PUT that repairs the object re-materializes those bytes
+// without touching the counter. The repair must bump the shared floor
+// generation (the PUT analogue of the sweeper's quarantine-restore bump,
+// round 54) so every replica's floor cached in the absence window is
+// invalidated.
+func TestUsageFloorInvalidatedByZeroGrowthRepair(t *testing.T) {
+	ctx := context.Background()
+	srv1, st, mint := newLFSQuotaServer(t, 1000, time.Hour)
+	tok := mint(auth.ScopeGitWrite)
+	// The "other replica": its own floor cache, the same shared stores.
+	srv2 := &Server{Blob: srv1.Blob, Store: st}
+
+	// A registered, counter-accounted object.
+	body := []byte("registered object body, counter-accounted")
+	oid := sha256Hex(body)
+	key := blob.LFSKey(lfsTestRepoID, oid)
+	objPath := "/" + lfsTestRepoURL + ".git/info/lfs/objects/" + oid
+	if w := doLFS(t, srv1, http.MethodPut, objPath, "basic:"+tok, string(body)); w.Code != http.StatusOK {
+		t.Fatalf("upload PUT status = %d, body %s", w.Code, w.Body)
+	}
+	// Rowless legacy bytes, smaller than the registered object.
+	legacy := []byte("rowless legacy")
+	if err := srv1.Blob.UploadFile(ctx, blob.LFSKey(lfsTestRepoID, sha256Hex(legacy)), writeTempFile(t, legacy)); err != nil {
+		t.Fatal(err)
+	}
+	// The registered blob vanishes; replica 2 scans during the absence:
+	// the listing (legacy only) minus the counter (the registered object)
+	// clamps to zero — the legacy bytes are hidden by the missing object.
+	if err := srv1.Blob.Delete(ctx, key); err != nil {
+		t.Fatal(err)
+	}
+	if floor, err := srv2.CachedUsageFloor(ctx, lfsTestRepoID); err != nil || floor != 0 {
+		t.Fatalf("absence-window floor = (%d, %v), want (0, nil)", floor, err)
+	}
+	// The client repairs the object (zero-growth re-PUT).
+	if w := doLFS(t, srv1, http.MethodPut, objPath, "basic:"+tok, string(body)); w.Code != http.StatusOK {
+		t.Fatalf("repair PUT status = %d, body %s", w.Code, w.Body)
+	}
+	// Replica 2's cached zero floor must be rejected by the generation
+	// check: a fresh scan lists legacy + registered bytes, and the
+	// uncounted legacy bytes resurface in the floor.
+	if floor, err := srv2.CachedUsageFloor(ctx, lfsTestRepoID); err != nil || floor != int64(len(legacy)) {
+		t.Fatalf("post-repair floor = (%d, %v), want (%d, nil) — the repair must bump the shared floor generation",
+			floor, err, len(legacy))
+	}
+}
+
 // genStallStore stalls the FIRST adoption-generation read via the
 // injected callback (advancing a fake clock or sleeping), simulating a
 // database stall during the serve-time generation check.

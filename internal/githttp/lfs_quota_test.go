@@ -1611,7 +1611,7 @@ func TestLFSUpload_AbsoluteDeadlineBoundsDrip(t *testing.T) {
 	t.Cleanup(func() { lfsUploadIdleTimeout = oldIdle })
 
 	srv, _, mint := newLFSQuotaServer(t, 0, 400*time.Millisecond) // TTL = absolute bound
-	srv.LFSStagingBytes = 300 // per-repo share (round 55): 100 — the drip stays in-share
+	srv.LFSStagingBytes = 300                                     // per-repo share (round 55): 100 — the drip stays in-share
 	tok := mint(auth.ScopeGitWrite)
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
