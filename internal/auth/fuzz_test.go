@@ -8,63 +8,62 @@ package auth
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/json"
 	"slices"
 	"strings"
 	"testing"
-	"time"
 )
 
 func FuzzVerify(f *testing.F) {
-	esKey, err := GenerateKey("ES256")
+	// Everything below is deterministic — fixture key seeds, fixed claim
+	// timestamps, and Ed25519's deterministic signatures (RFC 8032) — so
+	// the fuzz coordinator and every worker process trust identical keys
+	// and mint byte-identical seeds. Worker processes re-run this setup
+	// (Codex review): with fresh per-process randomness each worker would
+	// reject the coordinator's genuinely signed corpus entries and never
+	// fuzz the success path, and process-local time.Now() claims would
+	// make a re-verified seed trip the claims oracle spuriously. These are
+	// throwaway fuzz fixtures for the in-process verifier only — never
+	// register them anywhere real.
+	registered := ed25519.NewKeyFromSeed(bytes.Repeat([]byte{0xA1}, ed25519.SeedSize))
+	secondary := ed25519.NewKeyFromSeed(bytes.Repeat([]byte{0xB2}, ed25519.SeedSize))
+	unregistered := ed25519.NewKeyFromSeed(bytes.Repeat([]byte{0xC3}, ed25519.SeedSize))
+	regPEM, err := MarshalPublicKeyPEM(registered.Public())
 	if err != nil {
 		f.Fatal(err)
 	}
-	edKey, err := GenerateKey("EdDSA")
+	secPEM, err := MarshalPublicKeyPEM(secondary.Public())
 	if err != nil {
 		f.Fatal(err)
 	}
-	esPEM, err := MarshalPublicKeyPEM(esKey.Public())
-	if err != nil {
-		f.Fatal(err)
-	}
-	edPEM, err := MarshalPublicKeyPEM(edKey.Public())
-	if err != nil {
-		f.Fatal(err)
-	}
-	v := NewVerifier(fakeKeySource{"acme": {string(esPEM), string(edPEM)}})
+	v := NewVerifier(fakeKeySource{"acme": {string(regPEM), string(secPEM)}})
 
 	// The single claim set behind every genuinely signed valid seed. The
-	// signing keys exist only in this process, so any input Verify accepts
-	// must carry exactly this identity — anything else would mean the
-	// fuzzer forged a signature.
-	now := time.Now()
+	// signing keys are never registered outside this fuzz target, so any
+	// input Verify accepts must carry exactly this identity — anything
+	// else would mean the fuzzer forged a signature.
 	good := Claims{
 		Iss:    "acme",
 		Sub:    SubjectLiteral,
 		Repo:   "repo-1",
 		Scopes: []string{ScopeGitRead},
-		Iat:    now.Unix(),
-		// Far future so the campaign can never cross the expiry mid-run.
-		Exp:  now.Add(10 * 365 * 24 * time.Hour).Unix(),
-		Refs: json.RawMessage(`[["refs/heads/*",["no-push"]]]`),
-		Ops:  []string{OpNoForcePush},
+		Iat:    1700000000, // fixed: 2023-11-14T22:13:20Z
+		Exp:    4102444800, // fixed: 2100-01-01T00:00:00Z, outlives any campaign
+		Refs:   json.RawMessage(`[["refs/heads/*",["no-push"]]]`),
+		Ops:    []string{OpNoForcePush},
 	}
-	mint := func(c Claims, alg string) string {
-		key := esKey
-		if alg == "EdDSA" {
-			key = edKey
-		}
-		tok, err := MintToken(key, alg, c)
+	mint := func(key ed25519.PrivateKey, c Claims) string {
+		tok, err := MintToken(key, "EdDSA", c)
 		if err != nil {
 			f.Fatal(err)
 		}
 		return tok
 	}
 	expired := good
-	expired.Exp = now.Add(-time.Hour).Unix()
+	expired.Exp = 946684800 // fixed: 2000-01-01T00:00:00Z
 	wrongSub := good
 	wrongSub.Sub = "someone-else"
 	wrongOrg := good
@@ -78,25 +77,26 @@ func FuzzVerify(f *testing.F) {
 	// PEM text as the HMAC secret. Must be rejected by the algorithm
 	// allow-list, never verified.
 	hsInput := b64seg([]byte(`{"alg":"HS256","typ":"JWT"}`)) + "." + b64seg(goodJSON)
-	mac := hmac.New(sha256.New, esPEM)
+	mac := hmac.New(sha256.New, regPEM)
 	mac.Write([]byte(hsInput))
 	hs256 := hsInput + "." + b64seg(mac.Sum(nil))
 	noneTok := b64seg([]byte(`{"alg":"none","typ":"JWT"}`)) + "." + b64seg(goodJSON) + "."
 	// JSON-serialized JWS with exactly two dots hidden in an unprotected
 	// header value (slips the compact-form pre-check; see verifier.go).
 	flattened := `{"payload":"` + b64seg(goodJSON) + `","protected":"` +
-		b64seg([]byte(`{"alg":"ES256"}`)) + `","header":{"kid":".."},"signature":"` +
+		b64seg([]byte(`{"alg":"EdDSA"}`)) + `","header":{"kid":".."},"signature":"` +
 		b64seg([]byte("nope")) + `"}`
 
-	esToken := mint(good, "ES256")
-	tampered := []byte(esToken)
+	valid := mint(registered, good)
+	tampered := []byte(valid)
 	tampered[len(tampered)/2] ^= 0x01
 	for _, seed := range []string{
-		esToken,
-		mint(good, "EdDSA"),
-		mint(expired, "ES256"),
-		mint(wrongSub, "ES256"),
-		mint(wrongOrg, "ES256"),
+		valid,
+		mint(secondary, good),      // second registered key: multi-key iteration
+		mint(unregistered, good),   // right shape, unknown key: must fail
+		mint(registered, expired),  // signed but expired
+		mint(registered, wrongSub), // signed but wrong sub
+		mint(registered, wrongOrg), // signed but unknown issuer
 		hs256,
 		noneTok,
 		flattened,
@@ -104,7 +104,7 @@ func FuzzVerify(f *testing.F) {
 		"",
 		"..",
 		"a.b.c",
-		esToken + ".",
+		valid + ".",
 	} {
 		f.Add(seed)
 	}

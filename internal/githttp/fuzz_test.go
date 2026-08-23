@@ -17,6 +17,34 @@ import (
 	"testing"
 )
 
+// TestFuzzSkipEnvBoot pins the TestMain early-out contract (Codex review):
+// workers always skip the e2e boot, a coordinator skips only under the
+// match-nothing `-run '^$'` idiom, and every other invocation — including a
+// coordinator that will run ordinary tests before fuzzing — keeps the full
+// boot.
+func TestFuzzSkipEnvBoot(t *testing.T) {
+	cases := []struct {
+		name string
+		args []string
+		want bool
+	}{
+		{"plain go test", nil, false},
+		{"run filter without fuzzing", []string{"-test.run=^$"}, false},
+		{"worker", []string{"-test.fuzzworker", "-test.fuzz=^FuzzX$"}, true},
+		{"worker bool spelling", []string{"--test.fuzzworker=true"}, true},
+		{"coordinator, match-nothing run", []string{"-test.run=^$", "-test.fuzz=^FuzzX$"}, true},
+		{"coordinator, space-separated run", []string{"-test.run", "^$", "-test.fuzz=^FuzzX$"}, true},
+		{"coordinator without run", []string{"-test.fuzz=^FuzzX$"}, false},
+		{"coordinator with real run pattern", []string{"-test.run=TestPush", "-test.fuzz=^FuzzX$"}, false},
+		{"coordinator with empty run pattern", []string{"-test.run=", "-test.fuzz=^FuzzX$"}, false},
+	}
+	for _, tc := range cases {
+		if got := fuzzSkipEnvBoot(tc.args); got != tc.want {
+			t.Errorf("%s: fuzzSkipEnvBoot(%q) = %v, want %v", tc.name, tc.args, got, tc.want)
+		}
+	}
+}
+
 // fuzzPkt frames payload as one pkt-line.
 func fuzzPkt(payload string) string {
 	return fmt.Sprintf("%04x", len(payload)+4) + payload
