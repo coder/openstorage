@@ -201,9 +201,20 @@ func TestPackUsageRefreshConcurrencyBounded(t *testing.T) {
 		t.Fatalf("refreshed usage = %d, want 0 (empty repo)", got)
 	}
 	// Each completed refresh lists three times (base + namespace + LFS
-	// prefixes).
-	if got := bb.calls.Load(); got != int64(slots+1)*3 {
-		t.Fatalf("total listings = %d, want %d", got, (slots+1)*3)
+	// prefixes). Converge on that terminal count instead of reading it
+	// right after the single awaited peek: a slot frees as soon as ONE
+	// released flight finishes, so repo_extra can publish while other
+	// flights are still mid-scan on a loaded runner (issue #106). Exactly
+	// slots+1 flights exist — the pool-exhausted assertion above proved no
+	// extra flight started — so the count is stable once reached, and an
+	// overshoot still fails the equality check.
+	want := int64(slots+1) * 3
+	deadline = time.Now().Add(5 * time.Second)
+	for bb.calls.Load() < want && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := bb.calls.Load(); got != want {
+		t.Fatalf("total listings = %d, want %d", got, want)
 	}
 }
 
