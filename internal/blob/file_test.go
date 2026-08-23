@@ -684,47 +684,59 @@ func TestWithRenewedCoverHandoffRetriesUnderLiveCover(t *testing.T) {
 	}
 }
 
-// TestWithRenewedCoverFinalRefreshRejectsLateCommit (Codex round 63,
-// security): the tail refresh used to run as ONE wide-timeout attempt —
-// with a near-minimum TTL it could finish tens of seconds after the prior
-// cover expired, and the gap before the caller's generation bump is
-// exactly the uncovered window a stale-floor admission exploits. The
-// refresh now runs under the same continuity discipline as every renewal:
-// an attempt completing outside the prior cover's budget surfaces
-// renewErr instead of silently accepting the gap.
-func TestWithRenewedCoverFinalRefreshRejectsLateCommit(t *testing.T) {
-	oldI, oldT, oldB := coverRenewInterval, coverRenewTimeout, coverLapseBudget
-	coverRenewInterval, coverRenewTimeout, coverLapseBudget = 10*time.Millisecond, 100*time.Millisecond, 25*time.Millisecond
-	t.Cleanup(func() { coverRenewInterval, coverRenewTimeout, coverLapseBudget = oldI, oldT, oldB })
+// TestWithRenewedCoverTailPersistsThroughContinuityLoss (Codex round 72,
+// security): continuity loss after publication used to abandon BOTH
+// repairs immediately, while absence-window floors minted before
+// publication stay admissible for the full stale-floor tail — the last
+// cover could expire with neither invalidation nor re-cover. After a
+// loss the seam must keep attempting both through the tail: a handoff
+// success still invalidates every stale floor.
+func TestWithRenewedCoverTailPersistsThroughContinuityLoss(t *testing.T) {
+	oldI, oldT, oldB, oldTail := coverRenewInterval, coverRenewTimeout, coverLapseBudget, staleFloorTail
+	coverRenewInterval, coverRenewTimeout, coverLapseBudget, staleFloorTail =
+		10*time.Millisecond, 5*time.Millisecond, 25*time.Millisecond, 2*time.Second
+	t.Cleanup(func() {
+		coverRenewInterval, coverRenewTimeout, coverLapseBudget, staleFloorTail = oldI, oldT, oldB, oldTail
+	})
 
-	// The op is instant (no ticks); the final refresh SUCCEEDS but only
-	// after the prior cover's budget window has passed.
-	renew := func(context.Context) error {
-		time.Sleep(40 * time.Millisecond)
+	initial := true
+	renew := func(rctx context.Context) error {
+		if initial {
+			initial = false
+			return nil // the initial cover; every later renewal fails
+		}
+		return errors.New("ledger down")
+	}
+	handoffs := 0
+	handoff := func(context.Context) error {
+		handoffs++
+		if handoffs < 3 {
+			return errors.New("ledger still down") // recovery on the 3rd try
+		}
 		return nil
 	}
-	opErr, renewErr := WithRenewedCover(context.Background(), renew, func(context.Context) error { return nil }, nil)
-	if opErr != nil {
-		t.Fatalf("opErr = %v, want nil", opErr)
+	opErr, renewErr := WithRenewedCover(context.Background(), renew, func(context.Context) error { return nil }, handoff)
+	if opErr != nil || renewErr != nil {
+		t.Fatalf("WithRenewedCover = (%v, %v), want (nil, nil): the tail must persist through continuity loss until the handoff lands", opErr, renewErr)
 	}
-	if renewErr == nil || !strings.Contains(renewErr.Error(), "continuity lost at the final refresh") {
-		t.Fatalf("renewErr = %v, want a late-commit rejection", renewErr)
+	if handoffs < 3 {
+		t.Fatalf("handoff attempts = %d, want ≥3 (post-loss retries through the stale-floor tail)", handoffs)
 	}
 }
 
-// TestWithRenewedCoverFinalRefreshReportsAtBudgetDeadline (Codex round
-// 67, security): the final-refresh retry loop slept a full renewal
-// interval between attempts — quick failures deferred the loss report a
-// full cadence past covered+budget, and under a just-over-minimum TTL
-// the cover could expire before the caller learned the tail broke and
-// bumped the floor generation. The loop must wake at the earlier of the
-// cadence and the budget deadline, reporting the loss AT the deadline.
-func TestWithRenewedCoverFinalRefreshReportsAtBudgetDeadline(t *testing.T) {
-	oldI, oldT, oldB := coverRenewInterval, coverRenewTimeout, coverLapseBudget
-	// The retry cadence is far past the budget: only a budget-bounded
-	// wait can report in time.
-	coverRenewInterval, coverRenewTimeout, coverLapseBudget = 300*time.Millisecond, 10*time.Millisecond, 50*time.Millisecond
-	t.Cleanup(func() { coverRenewInterval, coverRenewTimeout, coverLapseBudget = oldI, oldT, oldB })
+// TestWithRenewedCoverAbandonsAfterStaleFloorTail (Codex rounds 67+72):
+// when the ledger never recovers, the post-publication loop gives up only
+// once the stale-floor tail has passed — every floor that could hide the
+// restored bytes has expired by then, so abandoning is safe — and the
+// abandonment is reported. It must not give up earlier (round 72: floors
+// outlive the continuity budget) nor persist forever.
+func TestWithRenewedCoverAbandonsAfterStaleFloorTail(t *testing.T) {
+	oldI, oldT, oldB, oldTail := coverRenewInterval, coverRenewTimeout, coverLapseBudget, staleFloorTail
+	coverRenewInterval, coverRenewTimeout, coverLapseBudget, staleFloorTail =
+		10*time.Millisecond, 5*time.Millisecond, 25*time.Millisecond, 150*time.Millisecond
+	t.Cleanup(func() {
+		coverRenewInterval, coverRenewTimeout, coverLapseBudget, staleFloorTail = oldI, oldT, oldB, oldTail
+	})
 
 	initial := true
 	renew := func(context.Context) error {
@@ -732,21 +744,22 @@ func TestWithRenewedCoverFinalRefreshReportsAtBudgetDeadline(t *testing.T) {
 			initial = false
 			return nil // the initial cover succeeds
 		}
-		return errors.New("ledger down") // the tail refresh keeps failing fast
+		return errors.New("ledger down") // and never recovers
 	}
 	start := time.Now()
-	opErr, renewErr := WithRenewedCover(context.Background(), renew, func(context.Context) error { return nil }, nil)
+	opErr, renewErr := WithRenewedCover(context.Background(), renew, func(context.Context) error { return nil },
+		func(context.Context) error { return errors.New("ledger down") })
 	elapsed := time.Since(start)
 	if opErr != nil {
 		t.Fatalf("opErr = %v, want nil (op is instant)", opErr)
 	}
-	if renewErr == nil || !strings.Contains(renewErr.Error(), "continuity lost at the final refresh") {
-		t.Fatalf("renewErr = %v, want the tail-loss report", renewErr)
+	if renewErr == nil || !strings.Contains(renewErr.Error(), "abandoned after the stale-floor tail") {
+		t.Fatalf("renewErr = %v, want the tail-abandonment report", renewErr)
 	}
-	// The report must land ≈ the budget deadline (~50ms), not a full
-	// retry cadence later (~300ms); generous slack for scheduler noise.
-	if elapsed > 200*time.Millisecond {
-		t.Fatalf("tail-loss report took %v, want ≈coverLapseBudget (budget-bounded wait, not the retry cadence)", elapsed)
+	// Give-up lands ≈ the tail's end (150ms) — after the continuity
+	// budget (25ms: too early) and well before forever.
+	if elapsed < 100*time.Millisecond || elapsed > time.Second {
+		t.Fatalf("abandonment took %v, want ≈staleFloorTail", elapsed)
 	}
 }
 

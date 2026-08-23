@@ -320,6 +320,16 @@ func EnsurePublished(ctx context.Context, b BlobStore, key, path string, onResto
 	return false, err
 }
 
+// staleFloorTail is how long an absence-window floor can remain
+// admissible after publication re-materialized the bytes (a var for
+// tests): deflated floors were scanned while the bytes were absent —
+// strictly before publication ended — and every consumer serves a floor
+// for at most its cache lifetime (30s, githttp usageCacheTTL) plus the
+// admission handoff margin (30s, githttp UsageFloorHandoffMargin). Once
+// this tail passes, no floor that could hide the restored bytes can
+// still commit, and abandoning cover/invalidation repairs becomes safe.
+var staleFloorTail = 60 * time.Second
+
 // CoverHandoffTimeout bounds the floor-generation bump a caller runs
 // after a restore (Codex round 69): the bump must COMMIT while the last
 // cover row still lives, and after a broken tail refresh that row's
@@ -470,22 +480,26 @@ func WithRenewedCover(ctx context.Context, renew func(context.Context) error, op
 	// cadence while continuity holds; losing it surfaces renewErr (the
 	// bytes are already durable — the caller reports the broken tail and
 	// still bumps the floor generation).
+	pubEnd := time.Now()
+	attemptHandoff := func() error {
+		if handoff == nil {
+			return nil
+		}
+		hctx, hcancel := context.WithTimeout(context.WithoutCancel(ctx), CoverHandoffTimeout)
+		defer hcancel()
+		return handoff(hctx)
+	}
+	lossRegime := false
 	for {
 		ok, lost, err := attemptRenew()
 		if ok {
-			if handoff == nil {
-				return nil, nil
-			}
+			lossRegime = false // a proven cover (or re-cover) is live again
 			// The handoff runs under the freshly proven cover, bounded
 			// so a stalled attempt cannot outlive it (Codex rounds
 			// 69+70). A failure keeps the loop alive: the cover is
-			// renewed and the handoff retried until it commits or
-			// continuity is lost — the invalidation must LAND, not be
-			// logged away.
-			hctx, hcancel := context.WithTimeout(context.WithoutCancel(ctx), CoverHandoffTimeout)
-			herr := handoff(hctx)
-			hcancel()
-			if herr == nil {
+			// renewed and the handoff retried until it commits — the
+			// invalidation must LAND, not be logged away.
+			if herr := attemptHandoff(); herr == nil {
 				return nil, nil
 			}
 			if wait := min(coverRenewInterval, time.Until(covered.Add(coverLapseBudget))); wait > 0 {
@@ -493,8 +507,36 @@ func WithRenewedCover(ctx context.Context, renew func(context.Context) error, op
 			}
 			continue
 		}
-		if lost {
-			return nil, fmt.Errorf("restore cover continuity lost at the final refresh (last renewal: %v)", err)
+		if lost || lossRegime {
+			// CONTINUITY LOST — but abandoning here is premature (Codex
+			// round 72, security): absence-window floors scanned before
+			// publication stay admissible until pubEnd+staleFloorTail,
+			// and the last cover can expire before they do. Both
+			// repairs remain strictly safety-improving, so keep
+			// attempting through the tail: a handoff success
+			// invalidates every stale floor, a renewal success
+			// re-covers the bytes (the anchor is zeroed so the next
+			// success re-anchors without a false continuity claim —
+			// lossRegime keeps failures in this branch meanwhile). Only
+			// when every floor that could hide the restored bytes has
+			// expired is giving up safe.
+			lossRegime = true
+			if time.Since(pubEnd) > staleFloorTail {
+				return nil, fmt.Errorf("restore handoff abandoned after the stale-floor tail (last renewal: %v)", err)
+			}
+			// A nil handoff has nothing to land: only a successful
+			// re-cover (above, via the zeroed anchor) or the tail's end
+			// exits the loop.
+			if handoff != nil {
+				if herr := attemptHandoff(); herr == nil {
+					return nil, nil
+				}
+			}
+			covered = time.Time{}
+			if wait := min(coverRenewInterval, time.Until(pubEnd.Add(staleFloorTail))); wait > 0 {
+				time.Sleep(wait)
+			}
+			continue
 		}
 		// Wake at the earlier of the retry cadence and the budget
 		// deadline (Codex round 67, security): sleeping a full interval
