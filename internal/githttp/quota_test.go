@@ -462,6 +462,86 @@ func TestUsageFloorGenReadStallRechecksExpiry(t *testing.T) {
 	}
 }
 
+// TestUsageFloorZeroFloorsAreGenChecked (Codex round 54, security): a
+// sweeper quarantine restore re-materializes counter-accounted bytes a
+// scan could not see, so a stale ZERO floor can under-measure — the
+// zero-floor generation-check skip was unsound. A cached zero floor whose
+// generation moved (here bumped directly, as the restore path does) must
+// be dropped and re-scanned, never served.
+func TestUsageFloorZeroFloorsAreGenChecked(t *testing.T) {
+	ctx := context.Background()
+	st := openTestRefStore(t)
+	cb := &countingBlob{BlobStore: openTestBlob(t)}
+	srv := &Server{Blob: cb, Store: st}
+
+	// A fully counted repo: listing 30, counter 30 → floor 0, cached.
+	key := blob.LFSKey("repo_zerogen", strings.Repeat("ef", 32))
+	seedLFS(t, cb.BlobStore, "repo_zerogen", strings.Repeat("ef", 32), 30)
+	if err := st.RegisterLFSObject(ctx, "repo_zerogen", key, 30); err != nil {
+		t.Fatal(err)
+	}
+	if floor, err := srv.CachedUsageFloor(ctx, "repo_zerogen"); err != nil || floor != 0 {
+		t.Fatalf("warm floor = (%d, %v), want (0, nil)", floor, err)
+	}
+	warmLists := cb.lists.Load()
+
+	// A sweeper restore elsewhere bumps the shared generation.
+	if err := st.BumpLFSAdoptionGen(ctx, "repo_zerogen"); err != nil {
+		t.Fatal(err)
+	}
+	// The cached zero must NOT be served: the serve re-scans.
+	if floor, err := srv.CachedUsageFloor(ctx, "repo_zerogen"); err != nil || floor != 0 {
+		t.Fatalf("post-bump floor = (%d, %v), want (0, nil) via re-scan", floor, err)
+	}
+	if got := cb.lists.Load(); got != warmLists+3 {
+		t.Fatalf("post-bump serve cost %d listings total, want %d (stale zero floor must re-scan)", got, warmLists+3)
+	}
+}
+
+// adoptDuringListBlob performs an adoption (register + gen bump) during
+// the FIRST listing, simulating another replica adopting mid-scan.
+type adoptDuringListBlob struct {
+	blob.BlobStore
+	st    ref.Store
+	repo  string
+	key   string
+	bytes int64
+	once  sync.Once
+}
+
+func (b *adoptDuringListBlob) ListPages(ctx context.Context, prefix string, pageSize int, fn func([]blob.ListedObject) error) error {
+	b.once.Do(func() {
+		if err := b.st.RegisterAdoptedLFSObject(ctx, b.repo, b.key, b.bytes); err != nil {
+			panic(err)
+		}
+	})
+	return b.BlobStore.ListPages(ctx, prefix, pageSize, fn)
+}
+
+// TestHookSelfListFloorDetectsMidScanAdoption (Codex round 54): the hook's
+// self-list measurement is bracketed by floor-generation reads — an
+// adoption committing between the counter read and the listing would skew
+// the subtraction (the listing sees bytes the counter snapshot missed AND
+// the live counter now carries), so a moved generation rejects the
+// attempt and the retry measures post-adoption reality.
+func TestHookSelfListFloorDetectsMidScanAdoption(t *testing.T) {
+	ctx := context.Background()
+	st := openTestRefStore(t)
+	bl := openTestBlob(t)
+	oid := strings.Repeat("ba", 32)
+	key := blob.LFSKey("repo_midscan", oid)
+	seedLFS(t, bl, "repo_midscan", oid, 30)
+
+	adopting := &adoptDuringListBlob{BlobStore: bl, st: st, repo: "repo_midscan", key: key, bytes: 30}
+	// Attempt 1: counter read 0, adoption fires inside the listing
+	// (listing 30, counter now 30) — the bracketing rejects it. Attempt
+	// 2: counter 30, listing 30 → floor 0.
+	got, err := hookSelfListFloor(ctx, adopting, st, "repo_midscan")
+	if err != nil || got != 0 {
+		t.Fatalf("mid-scan-adoption self-list floor = (%d, %v), want (0, nil) via retry", got, err)
+	}
+}
+
 // TestUsageFloorInFlightScanInvalidatedByAdoption (Codex round 49,
 // security): adoption racing a COLD in-flight scan must not hand the
 // scan's waiters a stale floor — the flight snapshotted the generation

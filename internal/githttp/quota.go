@@ -459,7 +459,11 @@ func hookSelfListFloor(ctx context.Context, bl blob.BlobStore, st ref.Store, rep
 	return 0, fmt.Errorf("usage floor for %s: %w", repo, lastErr)
 }
 
-// hookFloorScanOnce runs one slot-gated, deadline-bounded floor scan.
+// hookFloorScanOnce runs one slot-gated, deadline-bounded floor scan. The
+// measurement is BRACKETED by floor-generation reads (Codex round 54): an
+// adoption or sweeper restore committing between the counter read and the
+// listing would skew the subtraction, so a generation moving during the
+// scan rejects the attempt (the caller retries once, then fails closed).
 func hookFloorScanOnce(ctx context.Context, bl blob.BlobStore, st ref.Store, repo string) (int64, error) {
 	actx, cancel := context.WithTimeout(ctx, hookFloorFreshness)
 	defer cancel()
@@ -469,6 +473,10 @@ func hookFloorScanOnce(ctx context.Context, bl blob.BlobStore, st ref.Store, rep
 	}
 	defer unlock()
 	scanStart := time.Now()
+	genBefore, err := st.LFSAdoptionGen(actx, BaseRepo(repo))
+	if err != nil {
+		return 0, fmt.Errorf("floor gen read: %w", err)
+	}
 	ls, err := st.QuotaLedgerState(actx, blob.QuotaRepoGroup(repo), time.Hour)
 	if err != nil {
 		return 0, fmt.Errorf("usage counter read: %w", err)
@@ -476,6 +484,13 @@ func hookFloorScanOnce(ctx context.Context, bl blob.BlobStore, st ref.Store, rep
 	listing, err := packUsageBytes(actx, bl, repo)
 	if err != nil {
 		return 0, err
+	}
+	genAfter, err := st.LFSAdoptionGen(actx, BaseRepo(repo))
+	if err != nil {
+		return 0, fmt.Errorf("floor gen read: %w", err)
+	}
+	if genAfter != genBefore {
+		return 0, fmt.Errorf("floor generation moved during the scan (adoption or restore)")
 	}
 	// Defensive backstop: the deadline above should preempt any scan
 	// this check would reject.
@@ -539,30 +554,29 @@ func hookUsageFloor(ctx context.Context, bl blob.BlobStore, st ref.Store, repo s
 	if maxAge <= 0 || time.Since(time.Unix(mintUnix, 0)) > maxAge {
 		return hookSelfListFloor(ctx, bl, st, repo)
 	}
-	// A non-zero floor is trusted only while the shared adoption
-	// generation still matches its scan (Codex round 49): an adoption on
-	// ANY replica during the client's transfer moved listed bytes into
-	// the counter, and summing both would double-count them. Zero floors
-	// cannot double-count, so they skip the point read. The lookup is
+	// EVERY floor is trusted only while the shared floor generation still
+	// matches its scan — zero floors included (Codex rounds 49+54): an
+	// adoption on ANY replica during the client's transfer moved listed
+	// bytes into the counter (double-count), and a sweeper restore can
+	// re-materialize counter-accounted bytes the scan missed (a stale
+	// ZERO floor then under-measures — the overshoot side). The lookup is
 	// bounded by the floor's remaining trusted age and the age check is
 	// re-evaluated afterwards (Codex round 50): a database stall here
 	// otherwise consumes the window after the check passed.
-	if floor > 0 {
-		gctx, gcancel := context.WithDeadline(ctx, time.Unix(mintUnix, 0).Add(maxAge))
-		live, err := st.LFSAdoptionGen(gctx, BaseRepo(repo))
-		gcancel()
-		if err != nil {
-			// The remaining-age deadline killed the read: the floor's
-			// window is consumed — self-list like every other
-			// untrustworthy-floor case. Other failures stay closed.
-			if !errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
-				return 0, fmt.Errorf("adoption gen read: %w", err)
-			}
-			return hookSelfListFloor(ctx, bl, st, repo)
+	gctx, gcancel := context.WithDeadline(ctx, time.Unix(mintUnix, 0).Add(maxAge))
+	live, err := st.LFSAdoptionGen(gctx, BaseRepo(repo))
+	gcancel()
+	if err != nil {
+		// The remaining-age deadline killed the read: the floor's
+		// window is consumed — self-list like every other
+		// untrustworthy-floor case. Other failures stay closed.
+		if !errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
+			return 0, fmt.Errorf("floor gen read: %w", err)
 		}
-		if live != mintGen || time.Since(time.Unix(mintUnix, 0)) > maxAge {
-			return hookSelfListFloor(ctx, bl, st, repo)
-		}
+		return hookSelfListFloor(ctx, bl, st, repo)
+	}
+	if live != mintGen || time.Since(time.Unix(mintUnix, 0)) > maxAge {
+		return hookSelfListFloor(ctx, bl, st, repo)
 	}
 	return floor, nil
 }
@@ -612,11 +626,12 @@ func (s *Server) cachedUsageFloorGen(ctx context.Context, repo string) (int64, i
 			return 0, 0, err
 		}
 		if !expired {
-			// A zero floor cannot double-count: skip the generation
-			// point read on the hot steady-state path.
-			if usage == 0 {
-				return 0, gen, nil
-			}
+			// EVERY floor is generation-checked, zero included (Codex
+			// round 54, security): a sweeper quarantine restore can
+			// re-materialize counter-accounted bytes a scan missed, so
+			// a stale ZERO floor can under-measure — the earlier
+			// zero-skip optimization traded that soundness for one
+			// point read and is gone.
 			// The generation read is bounded by the floor's REMAINING
 			// freshness (computed on the cache clock, so injected test
 			// clocks stay consistent) AND the expiry is re-checked

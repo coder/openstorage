@@ -54,6 +54,15 @@ type PackRegistry interface {
 	// digest-mismatched backup, leaving a registered row blobless with no
 	// remaining writer check (Codex round 20).
 	GuardedLFSDelete(ctx context.Context, repo, key string, del func(context.Context) error) (deleted bool, err error)
+	// BumpLFSAdoptionGen advances the repo's shared FLOOR generation
+	// (see ref.RefStore; despite the name it invalidates every cached
+	// uncounted floor, not just LFS state). A quarantine restore makes
+	// a counter-accounted blob physically visible again without touching
+	// the counter (Codex round 54, security): a floor scanned while the
+	// blob was absent under-measures — listing minus counter can hide
+	// equally sized rowless legacy bytes — so the repair must invalidate
+	// it, or a stale floor admits past quota until expiry.
+	BumpLFSAdoptionGen(ctx context.Context, repo string) error
 	// IsRetainedPack classifies (repo, key) as superseded-by-repack: a
 	// blob whose registry row a ReplacePacks fold removed. Provably
 	// DB-absent by that CAS — a narrower, safer deletion class than
@@ -628,6 +637,19 @@ func (s *Sweeper) restoreFromQuarantine(ctx context.Context, key, qKey string) (
 	}
 	if err := s.blobs.Copy(ctx, key, qKey); err != nil {
 		return false, err
+	}
+	// The restore re-materialized bytes a floor scanned during their
+	// absence could not see (Codex round 54): bump the shared floor
+	// generation so every replica's cached floor and minted hook floor
+	// from that window is invalidated. Best-effort with logging — a
+	// failed bump leaves only the TTL-bounded staleness, and the restore
+	// itself must not be reported failed (the bytes ARE back).
+	if repo, ok := splitSweepKey(key); ok {
+		base, _, _ := strings.Cut(repo, "+")
+		if err := s.packs.BumpLFSAdoptionGen(ctx, base); err != nil {
+			s.logger.Warn("orphan pack sweep: floor generation bump after restore failed",
+				"key", key, "error", err)
+		}
 	}
 	return true, nil
 }

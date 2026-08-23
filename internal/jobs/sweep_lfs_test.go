@@ -155,6 +155,13 @@ func TestSweepLFS_HealRestoresRegisteredFromQuarantine(t *testing.T) {
 	if !f.exists(key) {
 		t.Fatalf("heal pass did not restore registered LFS object %q", key)
 	}
+	// The restore re-materialized bytes floors scanned during their
+	// absence could not see: it must bump the shared floor generation so
+	// every replica's cached floor from that window is invalidated
+	// (Codex round 54, security).
+	if gen, err := f.store.LFSAdoptionGen(context.Background(), "repo_lfs"); err != nil || gen == 0 {
+		t.Fatalf("floor generation after quarantine restore = (%d, %v), want > 0", gen, err)
+	}
 }
 
 // TestSweepLFS_HealNeverRestoresMismatchedBackup (Codex round 19,

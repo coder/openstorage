@@ -297,6 +297,9 @@ func (stubLedger) SweepExpiredPackReservations(context.Context, time.Duration) (
 func (stubLedger) HasLFSObject(context.Context, string, string) (bool, error) {
 	return false, nil
 }
+func (stubLedger) BumpLFSAdoptionGen(context.Context, string) error {
+	return nil
+}
 
 // GuardedLFSDelete runs del directly and reports it executed: stub-based
 // tests inject races via HasLFSObject call counting, so the guard itself
