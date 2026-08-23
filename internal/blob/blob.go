@@ -490,6 +490,7 @@ func WithRenewedCover(ctx context.Context, renew func(context.Context) error, op
 		return handoff(hctx)
 	}
 	lossRegime := false
+	var gap error // first continuity loss, if any — never forgotten
 	for {
 		ok, lost, err := attemptRenew()
 		if ok {
@@ -500,6 +501,14 @@ func WithRenewedCover(ctx context.Context, renew func(context.Context) error, op
 			// renewed and the handoff retried until it commits — the
 			// invalidation must LAND, not be logged away.
 			if herr := attemptHandoff(); herr == nil {
+				// A post-gap success repaired what remained repairable —
+				// future admissions are covered and invalidated — but an
+				// UNCOVERED WINDOW existed and a write settled in it
+				// cannot be revoked (Codex round 73): never report a
+				// gapped restore as clean.
+				if gap != nil {
+					return nil, fmt.Errorf("restore repaired after an uncovered cover gap: %w", gap)
+				}
 				return nil, nil
 			}
 			if wait := min(coverRenewInterval, time.Until(covered.Add(coverLapseBudget))); wait > 0 {
@@ -521,15 +530,18 @@ func WithRenewedCover(ctx context.Context, renew func(context.Context) error, op
 			// when every floor that could hide the restored bytes has
 			// expired is giving up safe.
 			lossRegime = true
+			if gap == nil {
+				gap = fmt.Errorf("cover continuity lost after publication (last renewal: %v)", err)
+			}
 			if time.Since(pubEnd) > staleFloorTail {
-				return nil, fmt.Errorf("restore handoff abandoned after the stale-floor tail (last renewal: %v)", err)
+				return nil, fmt.Errorf("restore handoff abandoned after the stale-floor tail: %w", gap)
 			}
 			// A nil handoff has nothing to land: only a successful
 			// re-cover (above, via the zeroed anchor) or the tail's end
 			// exits the loop.
 			if handoff != nil {
 				if herr := attemptHandoff(); herr == nil {
-					return nil, nil
+					return nil, fmt.Errorf("restore repaired after an uncovered cover gap: %w", gap)
 				}
 			}
 			covered = time.Time{}

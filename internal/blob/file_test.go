@@ -716,8 +716,14 @@ func TestWithRenewedCoverTailPersistsThroughContinuityLoss(t *testing.T) {
 		return nil
 	}
 	opErr, renewErr := WithRenewedCover(context.Background(), renew, func(context.Context) error { return nil }, handoff)
-	if opErr != nil || renewErr != nil {
-		t.Fatalf("WithRenewedCover = (%v, %v), want (nil, nil): the tail must persist through continuity loss until the handoff lands", opErr, renewErr)
+	if opErr != nil {
+		t.Fatalf("opErr = %v, want nil", opErr)
+	}
+	// The repairs landed — but a post-gap success must REPORT the gap
+	// (Codex round 73): a write settled in the uncovered window cannot
+	// be revoked, so a gapped restore is never clean.
+	if renewErr == nil || !strings.Contains(renewErr.Error(), "uncovered cover gap") {
+		t.Fatalf("renewErr = %v, want the gap report on a post-loss repair", renewErr)
 	}
 	if handoffs < 3 {
 		t.Fatalf("handoff attempts = %d, want ≥3 (post-loss retries through the stale-floor tail)", handoffs)

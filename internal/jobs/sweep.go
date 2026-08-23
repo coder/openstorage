@@ -125,6 +125,13 @@ type SweepConfig struct {
 	// enabled mid-flight, which would turn deletes into billed delete
 	// markers.
 	DeleteGuard func(context.Context) error
+	// QuotaEnforced reports that pack-quota admission is enabled
+	// (CODESTORAGE_PACK_QUOTA_BYTES > 0). Quarantine restores take cover
+	// reservations and hand off floor-generation bumps ONLY then (Codex
+	// round 73): with enforcement off no admission consults floors or
+	// covers, and the rows would only burn the per-repo reservation cap —
+	// enough restores in one TTL could wedge later restores outright.
+	QuotaEnforced bool
 	// ReservationTTL, when positive, prunes pack-quota reservation rows
 	// older than it each sweep (issue #29's crash-swept leaks). Use the
 	// same TTL the write gates charge so pruning never races a live
@@ -652,7 +659,7 @@ func (s *Sweeper) restoreFromQuarantine(ctx context.Context, key, qKey string) (
 	// stale floor can commit. A cover failure aborts the restore (the
 	// next sweep retries with the quarantine backup intact).
 	var renewCover func(context.Context) error
-	if repo, ok := splitSweepKey(key); ok {
+	if repo, ok := splitSweepKey(key); ok && s.cfg.QuotaEnforced {
 		size, err := s.blobs.Stat(ctx, qKey)
 		if err != nil {
 			return false, fmt.Errorf("stat quarantine %s: %w", qKey, err)
@@ -672,7 +679,7 @@ func (s *Sweeper) restoreFromQuarantine(ctx context.Context, key, qKey string) (
 	// the returning bytes, so the bump runs inside the seam, under a
 	// live cover, retried until it commits or continuity is lost.
 	var bump func(context.Context) error
-	if repo, ok := splitSweepKey(key); ok {
+	if repo, ok := splitSweepKey(key); ok && s.cfg.QuotaEnforced {
 		base, _, _ := strings.Cut(repo, "+")
 		bump = func(bctx context.Context) error {
 			return s.packs.BumpLFSAdoptionGen(bctx, base)

@@ -121,6 +121,10 @@ func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL, loopbackBaseU
 		Delete:           sweep.deleteEnabled,
 		DeleteSuperseded: sweep.deleteSuperseded,
 		DeleteLFS:        sweep.deleteLFS,
+		// Quarantine restores take cover reservations + generation
+		// bumps only when quota admission actually consults them
+		// (Codex round 73).
+		QuotaEnforced: packQuotaBytes > 0,
 		// The sweep prunes crash-leaked admission reservations (issue #29)
 		// on its cadence with the same TTL the write gates charge.
 		ReservationTTL: packReservationTTL,

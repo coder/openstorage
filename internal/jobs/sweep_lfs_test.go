@@ -149,7 +149,7 @@ func TestSweepLFS_HealRestoresRegisteredFromQuarantine(t *testing.T) {
 	// Simulate the crash: the backup exists, the original does not.
 	f.upload(quarantineKey(key), content)
 
-	if _, err := f.sweeper(SweepConfig{Threshold: 24 * time.Hour}).Sweep(context.Background()); err != nil {
+	if _, err := f.sweeper(SweepConfig{Threshold: 24 * time.Hour, QuotaEnforced: true}).Sweep(context.Background()); err != nil {
 		t.Fatalf("Sweep: %v", err)
 	}
 	if !f.exists(key) {
@@ -172,6 +172,35 @@ func TestSweepLFS_HealRestoresRegisteredFromQuarantine(t *testing.T) {
 	}
 	if ls.ReservedBytes != int64(len(content)) {
 		t.Fatalf("ledger after quarantine restore = %+v, want the %d-byte cover reserved", ls, len(content))
+	}
+}
+
+// TestSweepLFS_HealTakesNoCoverWhenQuotaDisabled (Codex round 73): with
+// quota enforcement off, no admission consults floors or covers — a
+// restore-cover row would only burn the per-repo reservation cap, and
+// enough repairs in one TTL could wedge later restores outright. The heal
+// must restore WITHOUT touching the reservation ledger.
+func TestSweepLFS_HealTakesNoCoverWhenQuotaDisabled(t *testing.T) {
+	f := newSweepFixture(t)
+	content := "quota-off-stranded-bytes"
+	key := blob.LFSKey("repo_qoff", lfsContentOID(content))
+	f.registerLFS("repo_qoff", key, int64(len(content)))
+	f.upload(quarantineKey(key), content)
+
+	// QuotaEnforced deliberately unset: the production default when
+	// CODESTORAGE_PACK_QUOTA_BYTES is absent.
+	if _, err := f.sweeper(SweepConfig{Threshold: 24 * time.Hour}).Sweep(context.Background()); err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if !f.exists(key) {
+		t.Fatalf("heal pass did not restore registered LFS object %q", key)
+	}
+	ls, err := f.store.QuotaLedgerState(context.Background(), blob.QuotaRepoGroup("repo_qoff"), time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ls.ReservedBytes != 0 {
+		t.Fatalf("quota-disabled heal reserved %d bytes — covers must be skipped when nothing consults them", ls.ReservedBytes)
 	}
 }
 
