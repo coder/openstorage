@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -12,6 +13,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -44,6 +47,25 @@ func RepoPath(cacheDir, repo string) string {
 	return filepath.Join(cacheDir, repo+".git")
 }
 
+// gitSpawnObserver, when set, observes every git subprocess spawned through
+// runGitCtx and updateRefStdin — the only two exec sites reachable from
+// Hydrate. Test seam for issue #93's guarantee that the generation-match
+// fast path forks no subprocess; an atomic pointer so installing the
+// observer never races a concurrent hydrator.
+var gitSpawnObserver atomic.Pointer[func(dir string, args []string)]
+
+func observeGitSpawn(dir string, args []string) {
+	if obs := gitSpawnObserver.Load(); obs != nil {
+		(*obs)(dir, args)
+	}
+}
+
+// hookVerifyBarrier, when set, runs inside ensureHook's verification branch
+// between the content read and the trailing descriptor stat. Test seam for
+// injecting an in-place rewrite into that window deterministically (PR #98
+// round-9 review); same atomic-pointer pattern as gitSpawnObserver.
+var hookVerifyBarrier atomic.Pointer[func(path string)]
+
 // runGit executes git with args, returning stdout only. Stderr is captured
 // separately and surfaced in the error text: git warnings on stderr must
 // never contaminate parsed stdout (e.g. for-each-ref in SyncRefs).
@@ -59,6 +81,7 @@ func runGit(dir string, args ...string) (string, error) {
 // not match errors.Is(err, context.DeadlineExceeded), and the repack
 // worker classifies deterministic budget exhaustion by that identity.
 func runGitCtx(ctx context.Context, dir string, args ...string) (string, error) {
+	observeGitSpawn(dir, args)
 	cmd := exec.CommandContext(ctx, "git", args...)
 	if dir != "" {
 		cmd.Dir = dir
@@ -88,8 +111,184 @@ exec %q hook %s "$@"
 // without the hooks that own S3 upload, PG pack/ref registration, and
 // policy enforcement. The hook script also embeds this binary's path,
 // which changes across deployments.
+//
+// The steady-state verification is memoized (issue #93): the full pass —
+// two `git config --get` forks plus per-hook ReadFile/Stat — used to run
+// on every request and dominated the hydration fast path (~93% of it, PR
+// #97 baseline). Every mutator of the verified state is our own code
+// (`git init` and the `git config` writes below rewrite config via
+// lockfile + rename; ensureHook rewrites hooks via temp + rename; nothing
+// in this codebase deletes cache repos), so a fingerprint of the exact
+// file states the last full pass in THIS process verified proves them
+// unchanged without forking — see cacheRepoMemo.
 func EnsureCacheRepo(cacheDir, repo string) (string, error) {
 	return EnsureCacheRepoCtx(context.Background(), cacheDir, repo)
+}
+
+// cacheRepoMemo fingerprints (os.FileInfo: dev+inode, mtime, size, mode)
+// the config and hook files a full EnsureCacheRepo pass verified. The
+// FileInfos come from the verification itself (ensureHook returns the stat
+// of the content it read-verified or the temp file it installed — rename
+// preserves inode, mtime, and mode), so a memo can only ever vouch for a
+// state some full pass actually checked. Every mutation invalidates it:
+// rewrites through lockfile/temp + rename change the inode (os.SameFile),
+// in-place writes bump mtime or size, and a bare chmod — which changes
+// neither — flips the mode, compared precisely because git silently skips
+// non-executable hooks. Re-executed hook processes and restarted servers
+// start with an empty memo and always take the full pass.
+type cacheRepoMemo struct {
+	config     os.FileInfo
+	preReceive os.FileInfo
+	update     os.FileInfo
+}
+
+// cacheRepoMemos maps cache repo paths to their verified fingerprints, one
+// small entry per repo this process serves. Concurrent full passes may
+// both store; either snapshot is a state a full pass verified, and the
+// same-value config writes make the passes idempotent.
+var cacheRepoMemos sync.Map // map[string]cacheRepoMemo
+
+// memoFiles pairs each fingerprint with the path it must still match.
+func (m cacheRepoMemo) memoFiles(repoPath string) [3]struct {
+	fi   os.FileInfo
+	path string
+} {
+	return [3]struct {
+		fi   os.FileInfo
+		path string
+	}{
+		{m.config, filepath.Join(repoPath, "config")},
+		{m.preReceive, filepath.Join(repoPath, "hooks", "pre-receive")},
+		{m.update, filepath.Join(repoPath, "hooks", "update")},
+	}
+}
+
+// cacheRepoConfig lists the values every cache repo must pin in its LOCAL
+// config file. Every push must yield a pack file (>= 0 received objects
+// keeps the pack).
+var cacheRepoConfig = [][2]string{
+	{"receive.unpackLimit", "0"},
+	{"gc.auto", "0"},
+}
+
+// fileUnchanged reports whether two stats identify the same unchanged file:
+// same inode (os.SameFile — rewrites via lockfile/temp + rename always
+// change it), mtime, size, mode (a bare chmod changes nothing else, and
+// git silently skips non-executable hooks), and ctime (an in-place rewrite
+// can preserve all of the former with a same-length write plus Chtimes,
+// but never ctime — see fileChangeTime).
+func fileUnchanged(a, b os.FileInfo) bool {
+	assertf(a != nil && b != nil, "fileUnchanged: nil FileInfo")
+	return os.SameFile(a, b) && a.ModTime().Equal(b.ModTime()) && a.Size() == b.Size() &&
+		a.Mode() == b.Mode() && fileChangeTime(a).Equal(fileChangeTime(b))
+}
+
+// errConfigHasIncludes marks a local config containing [include]/
+// [includeIf] directives: the included files control effective values but
+// live outside the memo's fingerprint, so such a config is verified but
+// NEVER memoized — every call re-checks (PR #98 round-5 review).
+var errConfigHasIncludes = errors.New("local config contains include directives; memoization disabled")
+
+// errConfigValueMismatch marks a pinned key whose effective local-scope
+// value (includes resolved) is wrong or unset. Surviving the caller's own
+// direct repair write, it can only mean an include override or a hostile
+// racer — corruption-grade.
+var errConfigValueMismatch = errors.New("local config value mismatch")
+
+// errConfigChangedUnderfoot marks a config file that changed between the
+// bracketing stats of one verification pass: a concurrent full pass is
+// racing. Benign for serving — the racer writes the same values — but the
+// pass proved nothing, so it must not memoize.
+var errConfigChangedUnderfoot = errors.New("config file changed underneath the verification reads")
+
+// verifyLocalConfig proves every cacheRepoConfig value is effective in the
+// repo's LOCAL scope and returns a fingerprint of the exact file state the
+// reads covered: stat, read each value, stat again, and fail unless both
+// stats identify the same unchanged file — a rewrite racing the reads
+// could otherwise pair one file's values with another's fingerprint (PR
+// #98 round-3 review).
+//
+// Scoped --local: an unscoped get would be satisfied by global/system
+// scopes, skip the local pin, and the memo (which fingerprints only the
+// local file) would freeze that decision against later drift of the
+// external source (PR #98 round-2 review). The local pin also outranks
+// those scopes at receive-pack time, so drift cannot re-enable unpacking
+// pushes into loose objects that the hooks never upload.
+//
+// WITH --includes and --get-all (PR #98 round-5 review): receive-pack
+// follows local [include] directives and takes the LAST definition, so a
+// local include appended after the pins could override them while an
+// include-blind single-value read still reported the pin. Resolving
+// includes and checking the LAST value listed — git's last-definition-wins,
+// which is exactly what receive-pack loads — makes any effective override
+// fail verification, while an earlier stale duplicate followed by the safe
+// pin stays accepted, as the pre-memo code accepted it (PR #98 round-6
+// review). A config that merely CONTAINS include directives additionally
+// fails with errConfigHasIncludes after the value checks, because the
+// included files could drift later without touching the fingerprinted
+// file.
+func verifyLocalConfig(ctx context.Context, repoPath, configPath string) (os.FileInfo, error) {
+	pre, err := os.Stat(configPath)
+	if err != nil {
+		return nil, err
+	}
+	for _, kv := range cacheRepoConfig {
+		cur, err := runGitCtx(ctx, repoPath, "config", "--local", "--includes", "--get-all", kv[0])
+		if err != nil {
+			return nil, err
+		}
+		vals := strings.Split(strings.TrimSpace(cur), "\n")
+		if len(vals) == 0 || vals[0] == "" {
+			return nil, fmt.Errorf("%w: %s unset, want %q", errConfigValueMismatch, kv[0], kv[1])
+		}
+		if got := vals[len(vals)-1]; got != kv[1] {
+			return nil, fmt.Errorf("%w: %s = %q effective, want %q", errConfigValueMismatch, kv[0], got, kv[1])
+		}
+	}
+	// Include scan AFTER the value checks so callers repair values first;
+	// --no-includes lists the raw directives themselves.
+	names, err := runGitCtx(ctx, repoPath, "config", "--local", "--no-includes", "--name-only", "--list")
+	if err != nil {
+		return nil, err
+	}
+	hasIncludes := false
+	for _, name := range strings.Split(names, "\n") {
+		key := strings.ToLower(strings.TrimSpace(name))
+		if strings.HasPrefix(key, "include.") || strings.HasPrefix(key, "includeif.") {
+			hasIncludes = true
+			break
+		}
+	}
+	post, err := os.Stat(configPath)
+	if err != nil {
+		return nil, err
+	}
+	if !fileUnchanged(pre, post) {
+		return nil, errConfigChangedUnderfoot
+	}
+	if hasIncludes {
+		return nil, errConfigHasIncludes
+	}
+	return pre, nil
+}
+
+// cacheRepoUnchanged reports whether repoPath still matches the memoized
+// verified state, using only stats (zero forks, zero reads).
+func cacheRepoUnchanged(repoPath string, m cacheRepoMemo) bool {
+	// Defensive (issue #93): a memo must never vouch for a missing or
+	// recreated repo dir — fall through to the full pass, never crash. HEAD
+	// is the same liveness probe the full pass uses.
+	if _, err := os.Stat(filepath.Join(repoPath, "HEAD")); err != nil {
+		return false
+	}
+	for _, f := range m.memoFiles(repoPath) {
+		assertf(f.fi != nil, "cacheRepoUnchanged: memo without fingerprint for %s", f.path)
+		fi, err := os.Stat(f.path)
+		if err != nil || !fileUnchanged(f.fi, fi) {
+			return false
+		}
+	}
+	return true
 }
 
 // EnsureCacheRepoCtx is EnsureCacheRepo honoring ctx in its git
@@ -97,7 +296,23 @@ func EnsureCacheRepo(cacheDir, repo string) (string, error) {
 // setup under the fold's wall-clock budget, and a stalled subprocess or
 // filesystem must not outlive it.
 func EnsureCacheRepoCtx(ctx context.Context, cacheDir, repo string) (string, error) {
+	// Before memoization every call reached runGitCtx and propagated an
+	// expired context via its first subprocess; the memo hit must honor
+	// the same contract — the repack materializer runs this under its
+	// fold's wall-clock budget (PR #98 round-9 review).
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	path := RepoPath(cacheDir, repo)
+	if m, ok := cacheRepoMemos.Load(path); ok {
+		if cacheRepoUnchanged(path, m.(cacheRepoMemo)) {
+			return path, nil
+		}
+		// Stale memo: the repo was recreated, repaired by another process,
+		// or a verified file changed underneath us. Drop it and take the
+		// full verify/repair pass below, which re-memoizes on success.
+		cacheRepoMemos.Delete(path)
+	}
 	if _, err := os.Stat(filepath.Join(path, "HEAD")); err != nil {
 		if err := os.MkdirAll(path, 0o755); err != nil {
 			return "", err
@@ -106,19 +321,44 @@ func EnsureCacheRepoCtx(ctx context.Context, cacheDir, repo string) (string, err
 			return "", err
 		}
 	}
-	// Every push must yield a pack file (>= 0 received objects keeps the pack).
-	for _, kv := range [][2]string{
-		{"receive.unpackLimit", "0"},
-		{"gc.auto", "0"},
-	} {
-		// Read-check first: config writes take config.lock, and concurrent
-		// hydrates of the same repo must not fail on lock contention in the
-		// steady-state already-configured case.
-		if cur, err := runGitCtx(ctx, path, "config", "--get", kv[0]); err == nil && strings.TrimSpace(cur) == kv[1] {
-			continue
+	// Read-check first: config writes take config.lock, and concurrent
+	// hydrates of the same repo must not fail on lock contention in the
+	// steady-state already-configured case. On any verification failure —
+	// values missing (fresh init), drifted, or the file changing under the
+	// reads — write the values and verify once more, so a fresh or
+	// repaired repo converges to the memoized fork-free steady state in
+	// this same call. A second failure means a concurrent writer is still
+	// racing: proceed (our values are written; a racer writes the same
+	// ones) but skip memoization below — fail closed, the next call
+	// re-verifies.
+	configPath := filepath.Join(path, "config")
+	configFI, configErr := verifyLocalConfig(ctx, path, configPath)
+	if configErr != nil && !errors.Is(configErr, errConfigHasIncludes) {
+		for _, kv := range cacheRepoConfig {
+			// --replace-all: a hostile trailing duplicate must collapse to
+			// one pinned definition — a single-value write would fail with
+			// "cannot overwrite multiple values" (PR #98 round-6 review).
+			if _, err := runGitCtx(ctx, path, "config", "--replace-all", kv[0], kv[1]); err != nil {
+				return "", err
+			}
 		}
-		if _, err := runGitCtx(ctx, path, "config", kv[0], kv[1]); err != nil {
-			return "", err
+		configFI, configErr = verifyLocalConfig(ctx, path, configPath)
+		// A wrong effective value surviving our own direct write can only
+		// be a local include override or a hostile racer: fail loudly
+		// rather than serve pushes that unpack loose objects the hooks
+		// never persist (PR #98 round-5 review).
+		if errors.Is(configErr, errConfigValueMismatch) {
+			return "", fmt.Errorf("cache repo %s: pinned config overridden after repair: %w", repo, configErr)
+		}
+		// Only the two documented outcomes are benign residuals: a racing
+		// full pass changing the file underfoot (serve, skip memoization)
+		// or include directives (same). Anything else — context expiry,
+		// git or stat failures — must propagate: the repack materializer
+		// runs this under its wall-clock budget and swallowing its
+		// cancellation would fake success (PR #98 round-8 review).
+		if configErr != nil && !errors.Is(configErr, errConfigHasIncludes) &&
+			!errors.Is(configErr, errConfigChangedUnderfoot) {
+			return "", configErr
 		}
 	}
 	self, err := os.Executable()
@@ -129,11 +369,31 @@ func EnsureCacheRepoCtx(ctx context.Context, cacheDir, repo string) (string, err
 	if err := os.MkdirAll(hooksDir, 0o755); err != nil {
 		return "", err
 	}
-	for _, name := range []string{"pre-receive", "update"} {
-		script := fmt.Sprintf(hookScript, self, name)
-		if err := ensureHook(filepath.Join(hooksDir, name), script); err != nil {
+	var memo cacheRepoMemo
+	for _, hook := range []struct {
+		name string
+		fi   *os.FileInfo
+	}{
+		{"pre-receive", &memo.preReceive},
+		{"update", &memo.update},
+	} {
+		script := fmt.Sprintf(hookScript, self, hook.name)
+		fi, err := ensureHook(filepath.Join(hooksDir, hook.name), script)
+		if err != nil {
 			return "", err
 		}
+		assertf(fi != nil, "ensureHook returned no FileInfo for %s", hook.name)
+		*hook.fi = fi
+	}
+	// Memoize only a config state some verifyLocalConfig pass proved: the
+	// fingerprint identifies the exact unchanged file the reads covered
+	// (PR #98 round-3 review). A raced rewrite leaves configErr set and
+	// skips memoization entirely — hooks included, so the whole memo only
+	// ever vouches for verified state.
+	if configErr == nil {
+		assertf(configFI != nil, "verifyLocalConfig returned no FileInfo for %s", configPath)
+		memo.config = configFI
+		cacheRepoMemos.Store(path, memo)
 	}
 	return path, nil
 }
@@ -142,29 +402,74 @@ func EnsureCacheRepoCtx(ctx context.Context, cacheDir, repo string) (string, err
 // executable (git silently skips non-executable hooks, which would bypass
 // enforcement). Writes go through a temp file + rename so a concurrent
 // receive-pack never execs a partially written script.
-func ensureHook(path, script string) error {
-	if cur, err := os.ReadFile(path); err == nil && string(cur) == script {
-		if fi, err := os.Stat(path); err == nil && fi.Mode().Perm() == 0o755 {
-			return nil
+//
+// It returns the FileInfo of the exact state it verified: the stat of the
+// content-matched file, or of the fully written temp file (rename preserves
+// inode, mtime, and mode). The memo fingerprints these so it can only ever
+// vouch for a state this function actually checked or wrote.
+//
+// Content, mode, and fingerprint all come from ONE opened descriptor: a
+// re-read by path could pair the content of one inode with the stat of a
+// concurrent replacement renamed over it — during a rolling deployment the
+// memo would then vouch for the other binary's hook as if verified, and
+// stop repairing it (PR #98 round-1 review). The descriptor is stat'd
+// BEFORE and AFTER the content read and both must match: an in-place
+// writer on the same inode landing inside the read window would otherwise
+// pair the pre-write content with the post-write fingerprint (PR #98
+// round-9 review). Finally the path must still name that same unchanged
+// inode for the fingerprint to be memoizable; any failure falls through
+// and installs our own script, exactly as if the content had not matched.
+func ensureHook(path, script string) (os.FileInfo, error) {
+	if f, err := os.Open(path); err == nil {
+		pre, perr := f.Stat()
+		cur, rerr := io.ReadAll(f)
+		if barrier := hookVerifyBarrier.Load(); barrier != nil {
+			(*barrier)(path)
+		}
+		post, serr := f.Stat()
+		_ = f.Close()
+		if perr == nil && rerr == nil && serr == nil && string(cur) == script &&
+			post.Mode().Perm() == 0o755 && fileUnchanged(pre, post) {
+			if pathFI, err := os.Stat(path); err == nil && fileUnchanged(post, pathFI) {
+				return post, nil
+			}
 		}
 	}
 	tmp, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".tmp-*")
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer os.Remove(tmp.Name())
 	if _, err := tmp.WriteString(script); err != nil {
 		tmp.Close()
-		return err
+		return nil, err
 	}
 	if err := tmp.Chmod(0o755); err != nil {
 		tmp.Close()
-		return err
+		return nil, err
+	}
+	// Fingerprint before close/rename: no writes follow, so this is the
+	// final state the rename publishes.
+	fi, err := tmp.Stat()
+	if err != nil {
+		tmp.Close()
+		return nil, err
 	}
 	if err := tmp.Close(); err != nil {
-		return err
+		return nil, err
 	}
-	return os.Rename(tmp.Name(), path)
+	if err := os.Rename(tmp.Name(), path); err != nil {
+		return nil, err
+	}
+	// Rename preserves content, mtime, size, and mode but bumps ctime, so
+	// re-stat the path for the settled fingerprint — only if it still
+	// names the inode we wrote (SameFile). If a concurrent installer won
+	// the race, return the pre-rename stat: its stale ctime simply fails
+	// the next memo comparison, forcing a re-verify (fail closed).
+	if pathFI, err := os.Stat(path); err == nil && os.SameFile(fi, pathFI) {
+		return pathFI, nil
+	}
+	return fi, nil
 }
 
 // maxHydrateRaces bounds the "missing pack blob → re-ListPacks → retry"
@@ -444,6 +749,7 @@ func SyncRefs(repoPath string, want map[string]string, headTarget string) error 
 
 // updateRefStdin feeds commands to one `git update-ref --stdin` transaction.
 func updateRefStdin(repoPath, commands string) error {
+	observeGitSpawn(repoPath, []string{"update-ref", "--stdin"})
 	cmd := exec.Command("git", "update-ref", "--stdin")
 	cmd.Dir = repoPath
 	cmd.Stdin = strings.NewReader(commands)
@@ -536,6 +842,8 @@ func writeGenerationMarker(repoPath string, gen int64, head string) {
 // EnsureCacheRepo still runs unconditionally: hook and config repair must
 // stay verified on every request (the hook script embeds this binary's
 // path, which changes across deployments), and it touches no DB state.
+// After the first full pass its verification is memoized fingerprint stats
+// (issue #93), so the fast path as a whole forks zero subprocesses.
 //
 // defaultBranch is the repo's default branch as resolved from the meta row
 // for THIS request. A PATCH /repo landing after that read can transiently
