@@ -185,9 +185,12 @@ func describeClaim(cl *simSyncClaim, now time.Time) string {
 	return fmt.Sprintf("holder %s expired=%t", cl.holder, !cl.expires.After(now))
 }
 
-// checkSyncRow is the row-level lease-liveness oracle (the #88 invariant):
-// after a claim attempt at sim time now, the row must not keep syncing=true
-// with an expiry at or before now — the attempt must have stolen it.
+// checkSyncRow is the row-level oracle run after every claim attempt:
+// (a) lease liveness (the #88 invariant) — at sim time now the row must
+// not keep syncing=true with an expiry at or before now, the attempt must
+// have stolen it; (b) the pending marker matches the model — a claim
+// consumes it, a refusal must leave it alone (a refused attempt that
+// clears an accepted request would silently lose it).
 func (s *sim) checkSyncRow(ctx context.Context, repoKey string, now time.Time, op string) error {
 	cur, err := s.cl.oracleMeta.GetRepoUpstream(ctx, repoKey)
 	if err != nil {
@@ -196,6 +199,11 @@ func (s *sim) checkSyncRow(ctx context.Context, repoKey string, now time.Time, o
 	if cur.Syncing && !cur.SyncClaimExpiresAt.After(now) {
 		s.violate("step %d: issue-#88 lease liveness: %s left %s claimed by %q with expiry %v <= now %v (expired claim survived a claim attempt)",
 			s.step, op, repoKey, cur.SyncClaimHolder, cur.SyncClaimExpiresAt, now)
+		return nil
+	}
+	if cur.SyncPending != s.syncPending[repoKey] {
+		s.violate("step %d: %s: %s pending marker %t, model %t",
+			s.step, op, repoKey, cur.SyncPending, s.syncPending[repoKey])
 	}
 	return nil
 }
@@ -395,6 +403,11 @@ func (s *sim) checkSyncFinal() error {
 				s.syncCrashSteals++
 			}
 		}
+		if row.SyncPending {
+			s.violate("issue-#88 quiescence: %s final claim did not consume the pending marker", repo.key)
+			return nil
+		}
+		s.syncPending[repo.key] = false
 		fin, err := s.cl.nodes[0].metaStore.FinishSync(ctx, repo.key, holder, true)
 		if err != nil {
 			return fmt.Errorf("final finish %s: %w", repo.key, err)
@@ -406,9 +419,9 @@ func (s *sim) checkSyncFinal() error {
 				repo.key, fin.RunCount, fin.SuccessCount, s.syncRunCount[repo.key], s.syncSuccessCount[repo.key])
 			return nil
 		}
-		if fin.Syncing || fin.SyncClaimHolder != "" {
-			s.violate("issue-#88 quiescence: %s final finish left claim state (syncing=%t holder=%q)",
-				repo.key, fin.Syncing, fin.SyncClaimHolder)
+		if fin.Syncing || fin.SyncClaimHolder != "" || fin.SyncPending != s.syncPending[repo.key] {
+			s.violate("issue-#88 quiescence: %s final finish left claim state (syncing=%t holder=%q pending=%t, model pending %t)",
+				repo.key, fin.Syncing, fin.SyncClaimHolder, fin.SyncPending, s.syncPending[repo.key])
 			return nil
 		}
 		delete(s.syncClaims, repo.key)
