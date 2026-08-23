@@ -184,6 +184,33 @@ func TestFinishSyncSurvivesExpiredRunContext(t *testing.T) {
 	assertEventTypes(t, f.rec.list(), EventSyncStarted, EventSyncFailed)
 }
 
+// A run whose context is already dead when it claims must still emit a
+// COMPLETE lifecycle (started + failed): the started emission runs
+// detached too, so cancellation between the claim and the emit cannot
+// produce a terminal event with no corresponding start.
+func TestStartedEventSurvivesExpiredRunContext(t *testing.T) {
+	f := newWorkerFixture(t)
+	seedUpstream(t, f.upstreamDir, "own", "proj")
+	f.addLoopbackRepo(t, "repo_dead")
+	f.putUpstream(t, "repo_dead", "own", "proj", "file://"+f.upstreamDir)
+	f.worker.Events = ctxCheckedSink{f.rec}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // the budget is gone before the run claims
+	if err := f.worker.Run(ctx, Job{Org: "acme", RepoID: "repo_dead"}); err == nil {
+		t.Error("Run on a dead context returned nil, want the transfer failure")
+	}
+
+	up, err := f.store.GetUpstream(context.Background(), "repo_dead")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if up.Syncing || up.RunCount != 1 || up.SuccessCount != 0 {
+		t.Errorf("row after dead-context run = %+v, want cleared claim and one counted failed run", up)
+	}
+	assertEventTypes(t, f.rec.list(), EventSyncStarted, EventSyncFailed)
+}
+
 // flakyFinishUpstreams fails the first `fails` FinishSync calls.
 type flakyFinishUpstreams struct {
 	UpstreamStore

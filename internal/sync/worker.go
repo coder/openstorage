@@ -162,7 +162,7 @@ func (w *Worker) Run(ctx context.Context, job Job) error {
 	}
 	started := base
 	started.Type = EventSyncStarted
-	w.Events.Emit(ctx, job.Org, EventSyncStarted, started.marshal())
+	w.emitDetached(ctx, job.Org, EventSyncStarted, started.marshal())
 
 	runErr := w.transfer(ctx, job, repo, up)
 	if errors.Is(runErr, errDetached) {
@@ -176,24 +176,16 @@ func (w *Worker) Run(ctx context.Context, job Job) error {
 	if err != nil {
 		return fmt.Errorf("finish sync %s: %w", job.RepoID, err)
 	}
-	// The run context may already be dead here — deadline expiry IS a
-	// common cause of reaching the failed path — and the production event
-	// sink uses the context for webhook listing and queue insertion, so a
-	// terminal event emitted on it would be silently dropped even though
-	// the row just counted the run. Emit (and requeue) detached, bounded.
-	tailCtx, cancelTail := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
-	defer cancelTail()
-
 	terminal := base
 	terminal.RunCount = fin.RunCount // includes the run that just finished
 	terminal.CompletedAt = eventTime(time.Now())
 	if runErr == nil {
 		terminal.Type = EventSyncSucceeded
-		w.Events.Emit(tailCtx, job.Org, EventSyncSucceeded, terminal.marshal())
+		w.emitDetached(ctx, job.Org, EventSyncSucceeded, terminal.marshal())
 	} else {
 		terminal.Type = EventSyncFailed
 		terminal.Error = failureCode(runErr)
-		w.Events.Emit(tailCtx, job.Org, EventSyncFailed, terminal.marshal())
+		w.emitDetached(ctx, job.Org, EventSyncFailed, terminal.marshal())
 		w.Logger.Warn("upstream sync failed",
 			"org", job.Org, "repo", job.RepoID, "error", terminal.Error, "cause", runErr)
 	}
@@ -207,12 +199,26 @@ func (w *Worker) Run(ctx context.Context, job Job) error {
 		// this run's lifecycle completes. Failure is log-only — local
 		// queued work is already documented as best-effort across
 		// restarts.
-		if rqErr := w.Requeue(tailCtx, job); rqErr != nil {
+		rqCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		if rqErr := w.Requeue(rqCtx, job); rqErr != nil {
 			w.Logger.Warn("requeue pending sync failed",
 				"org", job.Org, "repo", job.RepoID, "err", rqErr)
 		}
+		cancel()
 	}
 	return runErr
+}
+
+// emitDetached emits one lifecycle event on a bounded context DETACHED
+// from the run budget: run-context death (deadline expiry is a normal
+// failure cause, and cancellation can land right after the claim) must not
+// drop lifecycle events — the production sink uses the context for webhook
+// listing and queue insertion, so a dead context would silently lose the
+// event and leave observers with an incomplete started/terminal sequence.
+func (w *Worker) emitDetached(ctx context.Context, org, eventType string, payload []byte) {
+	ectx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
+	w.Events.Emit(ectx, org, eventType, payload)
 }
 
 // finishSyncAttempts bounds finishSync retries; the backoff between
