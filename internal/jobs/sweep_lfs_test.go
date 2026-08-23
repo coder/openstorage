@@ -402,6 +402,36 @@ func TestSweepLFS_LegacyReapGraceKeysOnRegistrationTime(t *testing.T) {
 	}
 }
 
+// TestSweepLFS_LegacyReapSparesLastCopyOfBloblessRow (Codex round 89
+// follow-up): keying the grace on registration time dropped round 88's
+// registered-but-blobless spare. A registered row whose canonical blob
+// was LOST serves reads through the legacy download fallback, and its
+// retained legacy source may be the object's only remaining bytes — an
+// aged registration alone must not reap it, or a repairable degradation
+// becomes data loss (nothing server-side can ever converge the row again).
+func TestSweepLFS_LegacyReapSparesLastCopyOfBloblessRow(t *testing.T) {
+	f := newSweepFixture(t)
+	content := "blobless row's last copy"
+	oid := lfsContentOID(content)
+	canonical := blob.LFSKey("repo_lfs", oid)
+	legacy := blob.LFSLegacyKey("repo_lfs", oid)
+	// An old registration (past any grace) whose canonical blob is gone:
+	// only the retained legacy source still holds the bytes.
+	f.upload(legacy, content)
+	f.backdate(legacy, 48*time.Hour)
+	f.registerLFS("repo_lfs", canonical, int64(len(content)))
+
+	cfg := SweepConfig{Threshold: 24 * time.Hour, DeleteLFS: true, DeleteLFSLegacy: true}
+	aged := f.sweeper(cfg)
+	aged.now = func() time.Time { return time.Now().Add(25 * time.Hour) }
+	if _, err := aged.Sweep(context.Background()); err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if !f.exists(legacy) {
+		t.Fatal("reaped the ONLY copy of a registered-but-blobless object — fallback reads lose the bytes and the row can never converge")
+	}
+}
+
 // TestSweepLFS_HealTakesNoCoverWhenQuotaDisabled (Codex round 73): with
 // quota enforcement off, no admission consults floors or covers — a
 // restore-cover row would only burn the per-repo reservation cap, and

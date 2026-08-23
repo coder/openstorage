@@ -811,6 +811,21 @@ func (s *Sweeper) legacySourceInReapGrace(ctx context.Context, repo, key string)
 		s.logger.Info("orphan pack sweep: sparing adoption-retained legacy source in reap grace", "key", key)
 		return true, nil
 	}
+	// The canonical copy must EXIST before the source reaps (round 88's
+	// registered-but-blobless spare, which the registration-time rewrite
+	// must keep): a registered row whose canonical blob was lost serves
+	// reads through the legacy download fallback, and the retained source
+	// may be the object's ONLY remaining bytes — reaping it on row age
+	// alone turns a repairable degradation into data loss. One point
+	// stat, reached only by reap-eligible candidates; unknowable state
+	// spares (the next sweep re-examines).
+	switch _, err := s.blobs.Stat(ctx, canonical); {
+	case errors.Is(err, blob.ErrNotFound):
+		s.logger.Info("orphan pack sweep: sparing last copy of a registered-but-blobless object", "key", key)
+		return true, nil
+	case err != nil:
+		return false, fmt.Errorf("reap-grace canonical stat %s: %w", canonical, err)
+	}
 	return false, nil
 }
 
