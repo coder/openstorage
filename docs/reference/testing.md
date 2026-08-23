@@ -139,14 +139,19 @@ Defaults: 150 steps, 3 nodes. Exit codes: `0` clean, `1` invariant violation,
    fault to the op that consumed it — e.g.
    `ref.CASRef/ambiguous(won=true err=<nil>)` is a CAS that committed under an
    ambiguous fault, the exact class the recovery oracles guard.
-4. **Pin it.** Once fixed, the seed is the regression test — carry the
-   reported step count too, or a longer sweep's failure point silently falls
-   back to the 150-step default:
+4. **Verify the fix against the seed** — carrying the reported step count, or
+   a longer sweep's failure point silently falls back to the 150-step default:
    `DST_SEED=<seed> DST_STEPS=<steps> go test ./internal/simtest -run 'TestDSTSeed' -v -count=1`
    must pass. Trace hashes are per-run-content: the failing hash belongs to the
    *pre-fix* reproduction (the `VIOLATION` line is hashed and stops the run);
    the fixed run produces a different hash — what determinism guarantees is
    that repeated runs of the same binary print the *same* one.
+5. **Pin it in a committed test.** The reproduction command guards nothing
+   after it scrolls by — `TestDSTSeed` skips when `DST_SEED` is unset, and the
+   nightly sweep derives fresh seeds from each run id. Add the failing
+   seed+steps to the PR gate (`TestDSTFast`'s fixed-seed list in
+   `internal/simtest/dst_test.go` is the pattern) so every future run replays
+   it.
 
 ### The nightly sweep
 
