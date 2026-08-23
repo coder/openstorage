@@ -8,10 +8,15 @@ import (
 )
 
 // InProcessQueue runs sync jobs on goroutines with per-repo coalescing: a
-// job enqueued while one for the same repo is still waiting is dropped (the
-// waiting run will pick up the same upstream state). This is the local-mode
-// jobs story — queued work is lost on process restart (foundation-slice
-// ADR); the Postgres deployment substitutes the durable jobs seam.
+// job enqueued while one for the same repo is still waiting is dropped —
+// sound, because the waiting run's upstream fetch is still in the future,
+// so it observes the coalesced request's state. A job enqueued while a run
+// is already CLAIMED skips at BeginSync instead; the claim holder's
+// FinishSync then reports the pending request (RequestSync marker) and
+// Worker.Requeue schedules the follow-up run (issue #79). This is the
+// local-mode jobs story — queued work is lost on process restart
+// (foundation-slice ADR); the Postgres deployment substitutes the durable
+// jobs seam.
 type InProcessQueue struct {
 	run     func(ctx context.Context, job Job) error
 	logger  *slog.Logger
@@ -33,7 +38,9 @@ func NewInProcessQueue(run func(ctx context.Context, job Job) error, logger *slo
 // EnqueueSync schedules one sync run. The run executes on its own goroutine
 // with a fresh background context — it must outlive the enqueueing HTTP
 // request. Overlap with an in-flight run is handled by BeginSync
-// (ErrSyncInProgress -> silent skip), matching invariant 11.
+// (ErrSyncInProgress -> silent skip), matching invariant 11; callers that
+// must not lose the request mark it first (UpstreamStore.RequestSync), and
+// the in-flight run's finisher requeues it (Worker.Requeue).
 func (q *InProcessQueue) EnqueueSync(_ context.Context, job Job) error {
 	assertf(job.Org != "" && job.RepoID != "", "EnqueueSync: incomplete job %+v", job)
 	q.mu.Lock()

@@ -53,7 +53,13 @@ type RepoUpstream struct {
 	RunCount     int    // completed sync runs (success + failure)
 	SuccessCount int    // completed successful runs
 	Syncing      bool   // one run in flight (TryBeginSync..FinishSync)
-	CreatedAt    time.Time
+	// SyncPending marks a sync request (RequestSync) not yet covered by a
+	// claimed run: TryBeginSync consumes it, so a flag still set when
+	// FinishSync returns means requests arrived AFTER the finished run
+	// claimed (its fetch may predate them) and a follow-up run is due
+	// (issue #79 liveness).
+	SyncPending bool
+	CreatedAt   time.Time
 }
 
 // NewEventingID returns "<prefix>_<16 hex>" — the shared ID shape for
@@ -119,12 +125,23 @@ type EventingStore interface {
 	GetRepoUpstream(ctx context.Context, repoID string) (RepoUpstream, error)
 	// DeleteRepoUpstream detaches the repo; ErrNotFound when already detached.
 	DeleteRepoUpstream(ctx context.Context, repoID string) error
+	// RequestSync marks a pending sync request (sync_pending = true).
+	// Callers that promise a sync (POST /repos/pull-upstream 202) set it
+	// BEFORE enqueueing: if the enqueue coalesces with a run that already
+	// claimed (whose upstream fetch may predate this request), the flag
+	// survives to that run's FinishSync and the finisher schedules a
+	// follow-up run. ErrNotFound when detached.
+	RequestSync(ctx context.Context, repoID string) error
 	// TryBeginSync atomically claims a sync run (syncing false -> true) and
-	// returns the row as of the claim. claimed=false (row returned) when a
-	// run is already in flight; ErrNotFound when detached.
+	// returns the row as of the claim. The claim consumes sync_pending:
+	// every request marked before the claim is observed by the claimed
+	// run's upstream fetch, which happens after it. claimed=false (row
+	// returned) when a run is already in flight; ErrNotFound when detached.
 	TryBeginSync(ctx context.Context, repoID string) (up RepoUpstream, claimed bool, err error)
 	// FinishSync completes the claimed run: increments RunCount (and
 	// SuccessCount when success), clears Syncing, returns the updated row.
-	// ErrNotFound when the repo was detached mid-run.
+	// SyncPending is NOT touched: a set flag in the returned row tells the
+	// finisher to schedule a follow-up run (the follow-up's claim consumes
+	// it). ErrNotFound when the repo was detached mid-run.
 	FinishSync(ctx context.Context, repoID string, success bool) (RepoUpstream, error)
 }

@@ -115,7 +115,7 @@ Default notes ref `refs/notes/commits`; bare names resolve to `refs/notes/<name>
 
 | Method & path | Scope | Notes |
 |---|---|---|
-| `POST /repos/pull-upstream` | git:write | `{ref?}` → **202 Accepted** (async); only for repos with `base_repo` |
+| `POST /repos/pull-upstream` | git:write | `{ref?}` → **202 Accepted** (async); only for repos with `base_repo`. A 202 is never dropped: a request that arrives while a sync run is already in flight coalesces into one follow-up run, so some run observes upstream as of the request or later |
 
 ## Status-code contract (what clients key on)
 

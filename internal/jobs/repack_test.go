@@ -1619,7 +1619,7 @@ func TestRiver_RepackUniqueByRepo(t *testing.T) {
 	r.FollowUpThreshold = 2 // successor gate: mid-run rows demand a follow-up
 
 	deliverer := &events.Deliverer{Webhooks: stubWebhooks{}, Logger: slog.New(slog.DiscardHandler)}
-	q, err := NewRiver(ctx, pgURL, deliverer, func(context.Context, sync.Job) error { return nil },
+	q, err := NewRiver(ctx, pgURL, deliverer, func(context.Context, sync.Job) error { return nil }, sync.NewMemStore(),
 		nil, r, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatalf("NewRiver: %v", err)

@@ -97,7 +97,11 @@ func (s webhookSink) Emit(ctx context.Context, org, eventType string, payload []
 // contract (docs/explanation/domain-model.md invariant 11): a won persistent ref update schedules a
 // sync only when the repo has an upstream row AND no run is currently in
 // flight — the in-flight check is what keeps the sync worker's own loopback
-// pushes from re-triggering themselves.
+// pushes from re-triggering themselves. Deliberately NO RequestSync here
+// (issue #79): the pending marker would turn every loopback push into a
+// follow-up run, self-perpetuating the sync chain. Push-triggered syncs
+// carry no 202 promise, so dropping one under an in-flight claim stays the
+// documented invariant-11 behavior.
 func enqueueSyncIfDue(ms meta.EventingStore, enqueue func(ctx context.Context, job upsync.Job) error, org string) func(ctx context.Context, repoID string) error {
 	assertf(ms != nil && enqueue != nil && org != "", "enqueueSyncIfDue: missing deps")
 	return func(ctx context.Context, repoID string) error {
@@ -174,13 +178,21 @@ func buildServeEventing(ctx context.Context, ms meta.Store, dbURL, org, loopback
 
 	cleanup := func() { queue.Close() }
 	if isPGURL(dbURL) {
-		q, err := jobs.NewRiver(ctx, dbURL, deliverer, worker.Run, sweep, repack, logger)
+		// worker.Requeue stays nil on pg: river's insert-time uniqueness
+		// would swallow a requeue of a still-running job; the river sync
+		// worker schedules successors transactionally instead (issue #79).
+		q, err := jobs.NewRiver(ctx, dbURL, deliverer, worker.Run, ups, sweep, repack, logger)
 		if err != nil {
 			return nil, nil, nil, err
 		}
 		queue = q
 	} else {
 		queue = jobs.NewLocal(deliverer, worker.Run, repack, logger)
+		// Pending pull-upstream requests that arrive while a run is in
+		// flight are re-enqueued by the finishing run (issue #79); the
+		// in-process queue never deduplicates against a running run, so
+		// a plain re-enqueue is sound here.
+		worker.Requeue = queue.EnqueueSync
 		if sweep != nil {
 			stopSweep := jobs.StartSweepTicker(sweep.Sweeper, sweep.Interval)
 			cleanup = func() {

@@ -154,11 +154,26 @@ func (s *SQLite) InitSchema(ctx context.Context) error {
 		    run_count     INTEGER NOT NULL,
 		    success_count INTEGER NOT NULL,
 		    syncing       INTEGER NOT NULL,
+		    sync_pending  INTEGER NOT NULL DEFAULT 0,
 		    created_at    INTEGER NOT NULL
 		)`,
 	} {
 		if _, err := tx.ExecContext(ctx, stmt); err != nil {
 			return fmt.Errorf("sqlite init schema: %w", err)
+		}
+	}
+	// Upgrade path for pre-#79 data dirs whose repo_upstreams predates the
+	// sync_pending column (SQLite has no ADD COLUMN IF NOT EXISTS).
+	var hasSyncPending int
+	if err := tx.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM pragma_table_info('repo_upstreams') WHERE name = 'sync_pending'`,
+	).Scan(&hasSyncPending); err != nil {
+		return fmt.Errorf("sqlite init schema: probe sync_pending column: %w", err)
+	}
+	if hasSyncPending == 0 {
+		if _, err := tx.ExecContext(ctx,
+			`ALTER TABLE repo_upstreams ADD COLUMN sync_pending INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return fmt.Errorf("sqlite init schema: add sync_pending column: %w", err)
 		}
 	}
 	return tx.Commit()

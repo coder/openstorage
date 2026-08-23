@@ -63,6 +63,17 @@ type Worker struct {
 	// endpoints); production keeps the default so hostile upstream rows
 	// can never reach local files, ssh, or transport helpers (ext::).
 	AllowProtocol string
+	// Requeue, when non-nil, schedules a follow-up run when FinishSync
+	// reports sync requests that arrived after this run's claim
+	// (Upstream.SyncPending, issue #79): this run's upstream fetch may
+	// predate those requests, so dropping them would break the
+	// pull-upstream 202 promise. Local-mode wiring points it at the
+	// queue's EnqueueSync (safe there: the in-process queue never
+	// deduplicates against a running run). River wiring leaves it nil —
+	// its insert-time uniqueness would swallow a follow-up inserted while
+	// this job's row is still running, so the river sync worker schedules
+	// successors transactionally at job completion instead (jobs/river.go).
+	Requeue func(ctx context.Context, job Job) error
 }
 
 // allowProtocol resolves the effective GIT_ALLOW_PROTOCOL value.
@@ -151,35 +162,107 @@ func (w *Worker) Run(ctx context.Context, job Job) error {
 	}
 	started := base
 	started.Type = EventSyncStarted
-	w.Events.Emit(ctx, job.Org, EventSyncStarted, started.marshal())
+	w.emitDetached(ctx, job.Org, EventSyncStarted, started.marshal())
 
 	runErr := w.transfer(ctx, job, repo, up)
 	if errors.Is(runErr, errDetached) {
 		return nil // detach raced the run: the row is gone, cancel silently
 	}
 
-	fin, err := w.Upstreams.FinishSync(ctx, job.RepoID, runErr == nil)
+	fin, err := w.finishSync(ctx, job.RepoID, runErr == nil)
 	if errors.Is(err, ErrNotFound) {
 		return nil // detached mid-run: cancel silently (docs/reference/webhooks.md)
 	}
 	if err != nil {
 		return fmt.Errorf("finish sync %s: %w", job.RepoID, err)
 	}
-
 	terminal := base
 	terminal.RunCount = fin.RunCount // includes the run that just finished
 	terminal.CompletedAt = eventTime(time.Now())
 	if runErr == nil {
 		terminal.Type = EventSyncSucceeded
-		w.Events.Emit(ctx, job.Org, EventSyncSucceeded, terminal.marshal())
-		return nil
+		w.emitDetached(ctx, job.Org, EventSyncSucceeded, terminal.marshal())
+	} else {
+		terminal.Type = EventSyncFailed
+		terminal.Error = failureCode(runErr)
+		w.emitDetached(ctx, job.Org, EventSyncFailed, terminal.marshal())
+		w.Logger.Warn("upstream sync failed",
+			"org", job.Org, "repo", job.RepoID, "error", terminal.Error, "cause", runErr)
 	}
-	terminal.Type = EventSyncFailed
-	terminal.Error = failureCode(runErr)
-	w.Events.Emit(ctx, job.Org, EventSyncFailed, terminal.marshal())
-	w.Logger.Warn("upstream sync failed",
-		"org", job.Org, "repo", job.RepoID, "error", terminal.Error, "cause", runErr)
+
+	if fin.SyncPending && w.Requeue != nil {
+		// Requests marked (RequestSync) after this run claimed are not
+		// covered by its fetch snapshot: schedule the coalesced follow-up
+		// now that the claim is free (the follow-up's BeginSync consumes
+		// the marker). This runs strictly AFTER the terminal event above
+		// so the successor's repo.sync.started cannot be emitted before
+		// this run's lifecycle completes. Failure is log-only — local
+		// queued work is already documented as best-effort across
+		// restarts.
+		rqCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		defer cancel()
+		// fin is a snapshot from FinishSync, and the emissions above can
+		// block long enough for another run (e.g. the request's own
+		// queued goroutine claiming the freed row) to consume the marker
+		// and cover every request. Re-read and skip the follow-up when
+		// the marker is already covered or the repo was detached; a
+		// failed read requeues conservatively — an extra run is a
+		// harmless no-op, a dropped request is not.
+		switch up, err := w.Upstreams.GetUpstream(rqCtx, job.RepoID); {
+		case err == nil && !up.SyncPending, errors.Is(err, ErrNotFound):
+			return runErr
+		}
+		if rqErr := w.Requeue(rqCtx, job); rqErr != nil {
+			w.Logger.Warn("requeue pending sync failed",
+				"org", job.Org, "repo", job.RepoID, "err", rqErr)
+		}
+	}
 	return runErr
+}
+
+// emitDetached emits one lifecycle event on a bounded context DETACHED
+// from the run budget: run-context death (deadline expiry is a normal
+// failure cause, and cancellation can land right after the claim) must not
+// drop lifecycle events — the production sink uses the context for webhook
+// listing and queue insertion, so a dead context would silently lose the
+// event and leave observers with an incomplete started/terminal sequence.
+func (w *Worker) emitDetached(ctx context.Context, org, eventType string, payload []byte) {
+	ectx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
+	w.Events.Emit(ectx, org, eventType, payload)
+}
+
+// finishSyncAttempts bounds finishSync retries; the backoff between
+// attempt n and n+1 is n seconds.
+const finishSyncAttempts = 3
+
+// finishSync completes the claimed run on a context DETACHED from the
+// run's own budget, retrying transient failures. Only the claim holder can
+// clear Syncing, so a FinishSync failed on the run's already-expired
+// context (the run timeout is the most likely cause of reaching here late)
+// would wedge the row permanently — every later run, including requeued
+// pull-upstream requests, would skip at BeginSync forever. ErrNotFound
+// (detach) returns immediately; exhausting the attempts leaves the row in
+// the documented crash state (claim held until operator action).
+func (w *Worker) finishSync(ctx context.Context, repoID string, success bool) (Upstream, error) {
+	fctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
+	var lastErr error
+	for attempt := 1; attempt <= finishSyncAttempts; attempt++ {
+		fin, err := w.Upstreams.FinishSync(fctx, repoID, success)
+		if err == nil || errors.Is(err, ErrNotFound) {
+			return fin, err
+		}
+		lastErr = err
+		w.Logger.Warn("finish sync failed; retrying while the claim is held",
+			"repo", repoID, "attempt", attempt, "err", err)
+		select {
+		case <-fctx.Done():
+			return Upstream{}, lastErr
+		case <-time.After(time.Duration(attempt) * time.Second):
+		}
+	}
+	return Upstream{}, lastErr
 }
 
 // mirrorRefspecs mirror heads and tags; the leading + lets upstream

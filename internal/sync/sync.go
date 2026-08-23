@@ -66,7 +66,13 @@ type Upstream struct {
 	RunCount     int    // completed sync runs (success + failure)
 	SuccessCount int    // completed successful runs; is_first_sync := SuccessCount == 0
 	Syncing      bool   // one run in flight (BeginSync..FinishSync)
-	CreatedAt    time.Time
+	// SyncPending marks a sync request (RequestSync) not yet covered by a
+	// claimed run: BeginSync consumes it, so a flag still set on the row
+	// FinishSync returns means requests arrived after the finished run
+	// claimed (its upstream fetch may predate them) and a follow-up run
+	// is due (issue #79 liveness).
+	SyncPending bool
+	CreatedAt   time.Time
 }
 
 // CloneURL builds the upstream fetch URL, https://{host}/{owner}/{name}.git
@@ -146,12 +152,23 @@ type UpstreamStore interface {
 	// DeleteUpstream detaches the repo; ErrNotFound when already detached
 	// (DELETE /repos/base is idempotent — callers treat that as success).
 	DeleteUpstream(ctx context.Context, repoID string) error
+	// RequestSync marks a pending sync request (SyncPending = true).
+	// Callers that promise a sync (POST /repos/pull-upstream 202) set it
+	// BEFORE enqueueing: if the enqueue coalesces with a run that already
+	// claimed, the flag survives to that run's FinishSync and the
+	// finisher schedules a follow-up run. ErrNotFound when detached.
+	RequestSync(ctx context.Context, repoID string) error
 	// BeginSync atomically claims a sync run (syncing false -> true) and
-	// returns the row as of the claim (RunCount = completed runs).
-	// ErrNotFound when detached; ErrSyncInProgress when already syncing.
+	// returns the row as of the claim (RunCount = completed runs). The
+	// claim consumes SyncPending: every request marked before the claim
+	// is observed by the claimed run's upstream fetch, which happens
+	// after it. ErrNotFound when detached; ErrSyncInProgress when already
+	// syncing.
 	BeginSync(ctx context.Context, repoID string) (Upstream, error)
 	// FinishSync completes the claimed run: increments RunCount (and
 	// SuccessCount when success), clears Syncing, returns the updated row.
+	// SyncPending is NOT touched: a set flag on the returned row tells
+	// the finisher to schedule a follow-up run (issue #79 liveness).
 	// ErrNotFound when the repo was detached mid-run — the run then ends
 	// silently (docs/reference/webhooks.md: detach cancels without a failed event).
 	FinishSync(ctx context.Context, repoID string, success bool) (Upstream, error)

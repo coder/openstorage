@@ -129,8 +129,12 @@ CREATE TABLE IF NOT EXISTS repo_upstreams (
     run_count     integer NOT NULL DEFAULT 0,
     success_count integer NOT NULL DEFAULT 0,
     syncing       boolean NOT NULL DEFAULT false,
+    sync_pending  boolean NOT NULL DEFAULT false,
     created_at    timestamptz NOT NULL DEFAULT now()
 );
+-- Upgrade path for pre-#79 deployments whose repo_upstreams predates the
+-- sync_pending column (idempotent; runs under the META advisory lock).
+ALTER TABLE repo_upstreams ADD COLUMN IF NOT EXISTS sync_pending boolean NOT NULL DEFAULT false;
 `)
 		return err
 	})

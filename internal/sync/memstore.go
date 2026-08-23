@@ -134,6 +134,18 @@ func (m *MemStore) DeleteUpstream(_ context.Context, repoID string) error {
 	return nil
 }
 
+func (m *MemStore) RequestSync(_ context.Context, repoID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	up, ok := m.upstreams[repoID]
+	if !ok {
+		return ErrNotFound
+	}
+	up.SyncPending = true
+	m.upstreams[repoID] = up
+	return nil
+}
+
 func (m *MemStore) BeginSync(_ context.Context, repoID string) (Upstream, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -144,7 +156,9 @@ func (m *MemStore) BeginSync(_ context.Context, repoID string) (Upstream, error)
 	if up.Syncing {
 		return Upstream{}, ErrSyncInProgress
 	}
-	up.Syncing = true
+	// The claim consumes the pending marker: this run's upstream fetch
+	// postdates every request marked before the claim.
+	up.Syncing, up.SyncPending = true, false
 	m.upstreams[repoID] = up
 	return up, nil
 }
