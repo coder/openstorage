@@ -34,31 +34,77 @@ blob store *before* any ref moves, so a committed ref never points at unavailabl
 Nodes keep no durable state — a push through one replica is immediately visible through
 every other.
 
-## Quickstart: local mode (60 seconds)
+## Install
 
-Requires only Go and git — no Docker, no Postgres, no MinIO. One flag derives the whole
-storage stack: `sqlite://<dir>/codestorage.db` (refs + metadata), `file://<dir>/blobs`
-(packs as plain files), and `<dir>/cache` (rebuildable cache).
+Prebuilt binaries (`linux`/`darwin` × `amd64`/`arm64`, with `checksums.txt`) ship on the
+[releases page](https://github.com/coder/code-storage/releases). Any of these puts
+`codestorage` on your `PATH`:
 
 ```sh
-# 1. Build and generate an org keypair (keys are never committed).
-go build ./cmd/codestorage
-./codestorage keygen --out /tmp/cs-key    # writes /tmp/cs-key.pem + /tmp/cs-key.pub.pem
+# Go toolchain (needs Go >= 1.26):
+go install github.com/coder/code-storage/cmd/codestorage@latest
+
+# mise (downloads the release binary; verifies checksums + GitHub artifact attestations):
+mise use -g github:coder/code-storage@latest
+
+# From source (contributors):
+git clone https://github.com/coder/code-storage.git && cd code-storage
+go build ./cmd/codestorage        # → ./codestorage
+
+codestorage version               # verify the install
+```
+
+> [!NOTE]
+> While this repository is **internal** (coder org members only), both hosted paths need
+> GitHub credentials:
+>
+> - `go install` must fetch the module directly from GitHub instead of the public proxy,
+>   using authenticated git — without `GOPRIVATE` it fails at the public checksum
+>   database (`sum.golang.org … 404 Not Found`):
+>
+>   ```sh
+>   gh auth setup-git   # or any git credential helper for github.com
+>   GOPRIVATE='github.com/coder/*' go install github.com/coder/code-storage/cmd/codestorage@latest
+>   ```
+>
+> - mise needs a GitHub token for the release download: a logged-in `gh` CLI is picked up
+>   automatically (the `github.gh_cli_tokens` setting is on by default); otherwise set
+>   `GITHUB_TOKEN`. On mise versions that predate the `github:` backend, the equivalent is
+>   `mise use -g 'ubi:coder/code-storage[exe=codestorage]@latest'` — the `exe=` hint is
+>   required because the repo name (`code-storage`) differs from the binary name
+>   (`codestorage`).
+
+**Runtime dependencies:** the server shells out to `git` (always) and to `gpg` /
+`ssh-keygen` (only for `verify-sig` ref policies, which fail closed without them —
+[ADR-9](docs/10-phase2-implementation-notes.md#adr-9-verify-sig-delegates-to-gits-own-verification-machinery),
+[#50](https://github.com/coder/code-storage/issues/50)). The Docker image carries all
+three; a bare binary brings none — install them on the host.
+
+## Quickstart: local mode (60 seconds)
+
+Requires only the `codestorage` binary ([install](#install)) and git — no Docker, no
+Postgres, no MinIO. One flag derives the whole storage stack:
+`sqlite://<dir>/codestorage.db` (refs + metadata), `file://<dir>/blobs` (packs as plain
+files), and `<dir>/cache` (rebuildable cache).
+
+```sh
+# 1. Generate an org keypair (keys are never committed).
+codestorage keygen --out /tmp/cs-key      # writes /tmp/cs-key.pem + /tmp/cs-key.pub.pem
 
 # 2. Start a node: REST API + git smart-HTTP on one listener, storage under ~/cs-data.
 CODESTORAGE_ORG=selfhost CODESTORAGE_ORG_PUBKEYS=/tmp/cs-key.pub.pem \
-  ./codestorage serve --listen 127.0.0.1:8080 --data-dir ~/cs-data &
+  codestorage serve --listen 127.0.0.1:8080 --data-dir ~/cs-data &
 sleep 1 && curl -sf http://127.0.0.1:8080/healthz && kill -0 $!
 # ^ fails fast if the port was already taken by an older server (serve's
 #   "address already in use" exit is easy to miss behind `&`).
 
 # 3. Mint a token and create a repo.
-TOK_CREATE=$(./codestorage mint --key /tmp/cs-key.pem --iss selfhost --repo demo --scopes repo:write)
+TOK_CREATE=$(codestorage mint --key /tmp/cs-key.pem --iss selfhost --repo demo --scopes repo:write)
 curl -s -X POST http://127.0.0.1:8080/api/v1/repos -H "Authorization: Bearer $TOK_CREATE" \
   -d '{"default_branch":"main"}'                                    # {"repo_id":...}
 
 # 4. Plain git against the same node.
-TOKEN=$(./codestorage mint --key /tmp/cs-key.pem --iss selfhost --repo demo --scopes git:read,git:write)
+TOKEN=$(codestorage mint --key /tmp/cs-key.pem --iss selfhost --repo demo --scopes git:read,git:write)
 git clone "http://t:${TOKEN}@127.0.0.1:8080/demo.git"
 cd demo && git -c user.name=demo -c user.email=demo@example.com \
   commit --allow-empty -m init && git push origin HEAD:main
@@ -79,16 +125,15 @@ credentials, published backing-service ports, plain HTTP) — not a hardened dep
 (for that, see the [production guide](docs/how-to/deploy-production.md)):
 
 ```sh
-# 1. Keys on the host (the same binary also mints tokens below).
-go build ./cmd/codestorage
-mkdir -p compose-keys && ./codestorage keygen --out ./compose-keys/cs-key
+# 1. Keys on the host, from this checkout (needs the codestorage binary — see Install).
+mkdir -p compose-keys && codestorage keygen --out ./compose-keys/cs-key
 
 # 2. Boot backing services + both replicas (node A on :8081, node B on :8082).
 docker compose --profile replicas up -d --wait --build
 
 # 3. Mint tokens against the compose keypair.
-TOK_W=$(./codestorage mint --key ./compose-keys/cs-key.pem --iss selfhost --repo demo --scopes repo:write)
-TOK_GIT=$(./codestorage mint --key ./compose-keys/cs-key.pem --iss selfhost --repo demo --scopes git:read,git:write)
+TOK_W=$(codestorage mint --key ./compose-keys/cs-key.pem --iss selfhost --repo demo --scopes repo:write)
+TOK_GIT=$(codestorage mint --key ./compose-keys/cs-key.pem --iss selfhost --repo demo --scopes git:read,git:write)
 
 # 4. Create + push via node A; clone via node B — same HEAD SHA.
 curl -s -X POST http://127.0.0.1:8081/api/v1/repos -H "Authorization: Bearer $TOK_W" \
