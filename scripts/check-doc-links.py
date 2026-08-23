@@ -2,9 +2,11 @@
 """Offline docs link checker: validates every relative INLINE markdown link
 (file + heading anchor) under README.md, CONTRIBUTING.md, CHANGELOG.md, and docs/.
 
-Reference-style links ([text][ref] with a [ref]: destination line) are NOT
-resolved; this tree uses none, and to keep it that way any reference-style
-definition found outside a code fence is itself reported as a failure.
+Unsupported-but-valid Markdown fails closed rather than silently passing:
+reference-style links ([text][ref] with a [ref]: destination line) and
+angle-bracket destinations ([text](<file.md>)) are not resolved — this tree
+uses neither, and any occurrence outside a code fence is itself reported as a
+failure so it cannot bypass validation.
 
 Zero dependencies. Not wired into CI on purpose — run it when touching docs:
 
@@ -27,6 +29,7 @@ os.chdir(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 LINK = re.compile(
     r"\]\(((?:[^()\s#]|\([^()\s]*\))*)(#[^)\s]*)?(?:\s+[\"\x27][^)]*[\"\x27])?\)")
 REFDEF = re.compile(r"^ {0,3}\[[^\]^]+\]:\s")
+ANGLE = re.compile(r"\]\(\s*<")
 FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
 HEADING = re.compile(r"^ {0,3}(#+) +(.*)$")
 
@@ -80,6 +83,10 @@ def check():
         for lineno, ln in scan_lines(path):
             if REFDEF.match(ln):
                 print(f"UNSUPPORTED REF-STYLE LINK DEF {path}:{lineno} -> {ln.strip()[:60]}")
+                bad += 1
+                continue
+            if ANGLE.search(ln):
+                print(f"UNSUPPORTED ANGLE-BRACKET DEST {path}:{lineno} -> {ln.strip()[:60]}")
                 bad += 1
                 continue
             for m in LINK.finditer(ln):
