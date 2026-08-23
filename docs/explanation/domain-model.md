@@ -25,8 +25,8 @@ Organization (org)                     ← tenant; from subdomain + JWT `iss`
 - **Repository identity**: repos have both an internal `repo_id` and a `url` path. The JWT
   `repo` claim carries the `url` value; `GET /api/repo-urls/{repo_id}` resolves internal ID →
   url (org:read scope, no per-repo claim needed).
-- **There is no user model.** Authentication is entirely customer-signed JWTs (see
-  02-authentication.md); authorization is claims-based. The backend never stores accounts.
+- **There is no user model.** Authentication is entirely customer-signed JWTs (see the
+  [auth spec](../reference/authentication.md)); authorization is claims-based. The backend never stores accounts.
 
 ## Ref namespaces
 
