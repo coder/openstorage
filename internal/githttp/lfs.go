@@ -2519,6 +2519,22 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target r
 		lfsError(w, compatFailStatus(err), "compatibility copy failed, retry")
 		return
 	}
+	// Terminal lease verdict (Codex round 93, the PUT twin of round 88's
+	// adoption-copy fix): cancellation alone cannot reject work that
+	// COMMITS concurrently with a recorded loss — the region's final op
+	// can return nil as the renewer cancels, and the handler would
+	// answer 200 on a lease it no longer provably holds, while the
+	// claim's successor may be writing different canonical bytes past
+	// this worker's verify. JOIN the renewer (stopRenew blocks until it
+	// exits) and reject any recorded loss before reporting success; the
+	// registration is committed and idempotent, so the client's retry
+	// is zero-growth.
+	stopRenew()
+	if cause := context.Cause(regionCtx); cause != nil && !errors.Is(cause, context.Canceled) {
+		log.Printf("lfs claim %s: %v", key, cause)
+		lfsError(w, http.StatusInternalServerError, "object claim lost during publication, retry")
+		return
+	}
 	w.WriteHeader(http.StatusOK)
 }
 
