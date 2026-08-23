@@ -155,6 +155,13 @@ func (f *syncFailure) Unwrap() error { return f.cause }
 // documented semantics are silent cancellation (no failed event).
 var errDetached = errors.New("upstream detached during sync")
 
+// errClaimStolen signals the pre-push barrier found the claim held by a
+// DIFFERENT holder: this run outlived its lease and was stolen (issue
+// #86). Abandoning BEFORE the loopback push keeps the zombie's stale fetch
+// snapshot from overwriting the thief's newer push; like errDetached, the
+// run ends silently (the thief owns the lifecycle).
+var errClaimStolen = errors.New("sync claim stolen during run")
+
 // failureCode maps a run error onto the documented repo.sync.failed string.
 func failureCode(err error) string {
 	assertf(err != nil, "failureCode: nil error")
@@ -221,9 +228,17 @@ func (w *Worker) Run(ctx context.Context, job Job) error {
 	started.Type = EventSyncStarted
 	w.emitDetached(ctx, job.Org, EventSyncStarted, started.marshal())
 
-	runErr := w.transfer(ctx, job, repo, up)
+	runErr := w.transfer(ctx, job, repo, up, holder)
 	if errors.Is(runErr, errDetached) {
 		return nil // detach raced the run: the row is gone, cancel silently
+	}
+	if errors.Is(runErr, errClaimStolen) {
+		// Lease expired mid-run and the claim was stolen before our push:
+		// abandon without finishing or terminal events — but loudly, so
+		// operators can spot leases racing live runs.
+		w.Logger.Warn("sync claim stolen mid-run; abandoning before the loopback push",
+			"org", job.Org, "repo", job.RepoID, "holder", holder)
+		return nil
 	}
 
 	fin, err := w.finishSync(ctx, job.RepoID, holder, runErr == nil)
@@ -338,9 +353,10 @@ func (w *Worker) finishSync(ctx context.Context, repoID, holder string, success 
 var mirrorRefspecs = []string{"+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"}
 
 // transfer performs the fetch + loopback push. A nil return means success;
-// errDetached means DELETE /repos/base raced the run; every other failure
-// is a *syncFailure carrying the documented error string.
-func (w *Worker) transfer(ctx context.Context, job Job, repo RepoInfo, up Upstream) error {
+// errDetached means DELETE /repos/base raced the run; errClaimStolen means
+// the claim barrier found the run's lease stolen; every other failure is a
+// *syncFailure carrying the documented error string.
+func (w *Worker) transfer(ctx context.Context, job Job, repo RepoInfo, up Upstream, holder string) error {
 	if up.Owner == "" || up.Name == "" || up.UpstreamHost == "" {
 		return &syncFailure{code: FailConfig, cause: fmt.Errorf(
 			"incomplete upstream row: owner=%q name=%q host=%q", up.Owner, up.Name, up.UpstreamHost)}
@@ -378,12 +394,18 @@ func (w *Worker) transfer(ctx context.Context, job Job, repo RepoInfo, up Upstre
 		return &syncFailure{code: classifyFetchFailure(stderr), cause: fmt.Errorf("git fetch: %w: %s", err, stderr)}
 	}
 
-	// Detach barrier between fetch and the storage push: DELETE /repos/base
-	// must cancel in-flight runs without a failed event (docs/reference/webhooks.md).
-	if _, err := w.Upstreams.GetUpstream(ctx, job.RepoID); errors.Is(err, ErrNotFound) {
+	// Detach/steal barrier between fetch and the storage push: DELETE
+	// /repos/base must cancel in-flight runs without a failed event
+	// (docs/reference/webhooks.md), and a run whose expired claim was
+	// stolen (issue #86) must not overwrite the thief's newer push with
+	// this run's stale fetch snapshot.
+	switch cur, err := w.Upstreams.GetUpstream(ctx, job.RepoID); {
+	case errors.Is(err, ErrNotFound):
 		return errDetached
-	} else if err != nil {
+	case err != nil:
 		return &syncFailure{code: FailInternal, cause: fmt.Errorf("detach check: %w", err)}
+	case cur.SyncClaimHolder != holder:
+		return errClaimStolen
 	}
 
 	// Empty upstream: nothing to push, the run still counts as a success.

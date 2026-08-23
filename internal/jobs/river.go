@@ -396,11 +396,10 @@ func (w *syncWorker) Work(ctx context.Context, job *river.Job[syncArgs]) error {
 		// no counted run, no claim holder's gate is guaranteed to cover
 		// it. Snooze retries the whole run: once any live holder finishes
 		// (or the claim was never taken), the retry claims and consumes
-		// the marker. If the claim is truly wedged (crash-equivalent
-		// FinishSync exhaustion), the retry skips cleanly (runErr nil)
-		// and completes, degrading to the documented crash behavior
-		// instead of snoozing forever. (Returning without commit rolls
-		// the completion back.)
+		// the marker. If the claim's holder died, the snoozed retry
+		// eventually finds the lease expired and STEALS the claim
+		// (issue #86), so the accepted request still syncs. (Returning
+		// without commit rolls the completion back.)
 		w.logger.Warn("sync: run failed with an uncovered pending request; snoozing to retry it",
 			"repo", job.Args.RepoID, "err", runErr)
 		return river.JobSnooze(syncFollowUpSnooze)

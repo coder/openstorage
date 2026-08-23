@@ -179,7 +179,12 @@ func (m *MemStore) FinishSync(_ context.Context, repoID, holder string, success 
 	if !ok {
 		return Upstream{}, ErrNotFound
 	}
-	assertf(up.Syncing, "FinishSync without BeginSync (repo %q)", repoID)
+	if !up.Syncing {
+		// No run in flight: a late finisher whose stolen claim was already
+		// released by the thief (issue #86) — same answer as the durable
+		// backends' `AND syncing` guard.
+		return Upstream{}, fmt.Errorf("no run in flight for %q: %w", repoID, ErrNotFound)
+	}
 	if up.SyncClaimHolder != holder {
 		return Upstream{}, fmt.Errorf("now held by %q: %w", up.SyncClaimHolder, ErrClaimLost)
 	}
