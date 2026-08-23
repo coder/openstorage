@@ -136,9 +136,10 @@ CREATE TABLE IF NOT EXISTS repo_upstreams (
 );
 -- Upgrade path for deployments whose repo_upstreams predates the
 -- sync_pending (#79) or claim-lease (#86) columns (idempotent; runs under
--- the META advisory lock). The epoch expiry default makes pre-existing
--- WEDGED claims (holder died before the lease existed) immediately
--- stealable on upgrade.
+-- the META advisory lock). Claims with the empty-holder/epoch defaults are
+-- LEGACY claims: TryBeginSync adopts them under one grace period before
+-- they become stealable, so a rolling upgrade's live old-version runs are
+-- never raced while pre-existing wedges still heal automatically.
 ALTER TABLE repo_upstreams ADD COLUMN IF NOT EXISTS sync_pending boolean NOT NULL DEFAULT false;
 ALTER TABLE repo_upstreams ADD COLUMN IF NOT EXISTS sync_claim_holder text NOT NULL DEFAULT '';
 ALTER TABLE repo_upstreams ADD COLUMN IF NOT EXISTS sync_claim_expires_at timestamptz NOT NULL DEFAULT 'epoch';

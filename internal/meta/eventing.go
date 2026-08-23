@@ -81,6 +81,12 @@ func NewEventingID(prefix string) string {
 	return prefix + "_" + hex.EncodeToString(buf[:])
 }
 
+// LegacyClaimHolder marks a sync claim taken by a pre-lease replica and
+// adopted into the lease regime by a new one (TryBeginSync mixed-fleet
+// staging). The '!' prefix cannot occur in real holder tokens, whose
+// process tag is hostname-pid (RFC 1123 hostnames have no '!').
+const LegacyClaimHolder = "!legacy-grace"
+
 // EventingStore is the phase-5 persistence surface. Org-scoped methods key
 // by org name (JWT `iss`) and return ErrNotFound for unknown orgs, matching
 // the Store conventions above.
@@ -147,11 +153,22 @@ type EventingStore interface {
 	// atomically (read-check-write inside one transaction/row lock — no
 	// read-then-write window): stolenFrom then carries the previous
 	// holder for observability, and the previous holder's late
-	// FinishSync fails with ErrClaimLost. The claim consumes
-	// sync_pending: every request marked before the claim is observed by
-	// the claimed run's upstream fetch, which happens after it.
-	// claimed=false (row returned) when an UNEXPIRED run is in flight;
-	// ErrNotFound when detached.
+	// FinishSync fails with ErrClaimLost.
+	//
+	// Mixed-fleet staging (rolling upgrades from pre-lease versions): a
+	// claim with an EMPTY holder was taken by an old replica that writes
+	// no lease — it may be a live run, not a crashed one. Such a claim
+	// is never stolen on sight; it is ADOPTED instead (holder set to
+	// LegacyClaimHolder, expiry now+lease, claimed=false) and becomes
+	// stealable only when that grace passes without the old replica's
+	// FinishSync clearing it. The grace equals the caller's lease, which
+	// strictly dominates any live pre-lease run window.
+	//
+	// The claim consumes sync_pending: every request marked before the
+	// claim is observed by the claimed run's upstream fetch, which
+	// happens after it. claimed=false (row returned) when an unexpired
+	// run is in flight or a legacy claim was just adopted; ErrNotFound
+	// when detached.
 	TryBeginSync(ctx context.Context, repoID, holder string, lease time.Duration) (up RepoUpstream, claimed bool, stolenFrom string, err error)
 	// FinishSync completes the run claimed by holder: increments RunCount
 	// (and SuccessCount when success), clears Syncing and the claim

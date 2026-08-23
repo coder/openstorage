@@ -7,6 +7,10 @@ import (
 	"time"
 )
 
+// legacyClaimHolder mirrors meta.LegacyClaimHolder (the sync package must
+// not import meta): a claim adopted from a pre-lease writer under a grace.
+const legacyClaimHolder = "!legacy-grace"
+
 // MemStore is an in-memory CredentialStore + UpstreamStore: the test
 // double and the local-mode stand-in until the durable meta-backed rows
 // land (foundation slice). Safe for concurrent use.
@@ -161,7 +165,15 @@ func (m *MemStore) BeginSync(_ context.Context, repoID, holder string, lease tim
 		if time.Now().Before(up.SyncClaimExpiresAt) {
 			return Upstream{}, "", ErrSyncInProgress
 		}
-		stolenFrom = up.SyncClaimHolder // expired claim stolen (issue #86)
+		if up.SyncClaimHolder == "" {
+			// Legacy claim (pre-lease writer, mixed fleet): adopt with a
+			// full grace instead of stealing what may be a live run
+			// (meta.LegacyClaimHolder semantics, issue #86).
+			up.SyncClaimHolder, up.SyncClaimExpiresAt = legacyClaimHolder, time.Now().Add(lease)
+			m.upstreams[repoID] = up
+			return Upstream{}, "", ErrSyncInProgress
+		}
+		stolenFrom = up.SyncClaimHolder // expired lease (or lapsed grace) stolen (issue #86)
 	}
 	// The claim consumes the pending marker: this run's upstream fetch
 	// postdates every request marked before the claim.

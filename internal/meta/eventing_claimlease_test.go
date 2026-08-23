@@ -78,3 +78,86 @@ func testSyncClaimLease(t *testing.T, s Backend) {
 		t.Errorf("row after thief finish = %+v, want idle row with cleared lease", fin)
 	}
 }
+
+func TestSyncClaimLegacyAdoption(t *testing.T) { runBackends(t, testSyncClaimLegacyAdoption) }
+
+// Mixed-fleet staging: a claim written by a pre-lease replica (empty
+// holder, epoch expiry) may belong to a LIVE run — it must be adopted
+// under a full grace, never stolen on sight; only a grace that lapses
+// unfinished proves the holder dead.
+func testSyncClaimLegacyAdoption(t *testing.T, s Backend) {
+	ctx := t.Context()
+	repoID := testRepoID(t, "")
+	if _, err := s.SetRepoUpstream(ctx, RepoUpstream{
+		RepoID: repoID, Provider: "github", Owner: "acme", Name: "demo", UpstreamHost: "github.com",
+	}); err != nil {
+		t.Fatalf("SetRepoUpstream: %v", err)
+	}
+
+	// Raw-SQL surgery reproducing the exact writes of pre-lease replicas
+	// (their UPDATEs never touch the lease columns).
+	exec := func(pgSQL, liteSQL string) {
+		t.Helper()
+		var err error
+		switch b := s.(type) {
+		case *PG:
+			_, err = b.pool.Exec(ctx, pgSQL, repoID)
+		case *SQLite:
+			_, err = b.db.ExecContext(ctx, liteSQL, repoID)
+		default:
+			t.Fatalf("unexpected backend %T", s)
+		}
+		if err != nil {
+			t.Fatalf("surgery: %v", err)
+		}
+	}
+	legacyClaim := func() {
+		exec(`UPDATE repo_upstreams SET syncing = true, sync_claim_holder = '', sync_claim_expires_at = 'epoch' WHERE repo_id = $1`,
+			`UPDATE repo_upstreams SET syncing = 1, sync_claim_holder = '', sync_claim_expires_at = 0 WHERE repo_id = ?`)
+	}
+	legacyFinish := func() { // the old replica's FinishSync shape
+		exec(`UPDATE repo_upstreams SET syncing = false, run_count = run_count + 1, success_count = success_count + 1 WHERE repo_id = $1 AND syncing`,
+			`UPDATE repo_upstreams SET syncing = 0, run_count = run_count + 1, success_count = success_count + 1 WHERE repo_id = ? AND syncing = 1`)
+	}
+	lapseGrace := func() {
+		exec(`UPDATE repo_upstreams SET sync_claim_expires_at = now() - interval '1 second' WHERE repo_id = $1`,
+			`UPDATE repo_upstreams SET sync_claim_expires_at = 1 WHERE repo_id = ?`)
+	}
+
+	// A live old-version run: the contender ADOPTS, never steals.
+	legacyClaim()
+	up, claimed, stolenFrom, err := s.TryBeginSync(ctx, repoID, "holder-new", time.Minute)
+	if err != nil || claimed || stolenFrom != "" {
+		t.Fatalf("legacy contend = (%v, %q, %v), want adoption without claim or steal", claimed, stolenFrom, err)
+	}
+	if !up.Syncing || up.SyncClaimHolder != LegacyClaimHolder {
+		t.Errorf("adopted row = %+v, want intact claim under %q", up, LegacyClaimHolder)
+	}
+	// Within the grace the adopted claim is simply refused (no re-stamp).
+	if _, claimed, stolenFrom, err := s.TryBeginSync(ctx, repoID, "holder-new", time.Minute); err != nil || claimed || stolenFrom != "" {
+		t.Fatalf("contend within grace = (%v, %q, %v), want plain refusal", claimed, stolenFrom, err)
+	}
+	// The live old replica finishes: the claim frees normally, no steal.
+	legacyFinish()
+	up, claimed, stolenFrom, err = s.TryBeginSync(ctx, repoID, "holder-new", time.Minute)
+	if err != nil || !claimed || stolenFrom != "" {
+		t.Fatalf("claim after legacy finish = (%v, %q, %v), want clean claim", claimed, stolenFrom, err)
+	}
+	if _, err := s.FinishSync(ctx, repoID, "holder-new", true); err != nil {
+		t.Fatalf("FinishSync: %v", err)
+	}
+
+	// A crashed old-version run: adoption, lapse, then the steal.
+	legacyClaim()
+	if _, claimed, _, err := s.TryBeginSync(ctx, repoID, "holder-new", time.Minute); err != nil || claimed {
+		t.Fatalf("adopt crashed legacy = (%v, %v), want adoption", claimed, err)
+	}
+	lapseGrace()
+	up, claimed, stolenFrom, err = s.TryBeginSync(ctx, repoID, "holder-new", time.Minute)
+	if err != nil || !claimed || stolenFrom != LegacyClaimHolder {
+		t.Fatalf("steal after lapsed grace = (%v, %q, %v), want steal from %q", claimed, stolenFrom, err, LegacyClaimHolder)
+	}
+	if up.SyncClaimHolder != "holder-new" {
+		t.Errorf("stolen row = %+v, want the new holder's claim", up)
+	}
+}

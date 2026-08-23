@@ -403,17 +403,41 @@ func (s *PG) TryBeginSync(ctx context.Context, repoID, holder string, lease time
 		if err != nil {
 			return err
 		}
+		// The row is locked: the claim decision runs in Go on consistent
+		// state, and every write below is unconditional on the locked
+		// row. Expiry compares on the DATABASE clock, matching the
+		// now()-derived expiry writes — node clock skew never participates.
+		var dbNow time.Time
+		if err := tx.QueryRow(ctx, `SELECT now()`).Scan(&dbNow); err != nil {
+			return err
+		}
+		if prev.Syncing && prev.SyncClaimExpiresAt.After(dbNow) {
+			up = prev // unexpired claim in flight: refused, current row
+			return nil
+		}
+		if prev.Syncing && prev.SyncClaimHolder == "" {
+			// Legacy claim (pre-lease replica, mixed fleet): adopt with a
+			// full grace instead of stealing what may be a LIVE run — the
+			// old replica's FinishSync clears it if so; only an unclaimed
+			// expiry after the grace proves the holder dead.
+			row, err := scanRepoUpstream(tx.QueryRow(ctx,
+				`UPDATE repo_upstreams
+				 SET sync_claim_holder = $2, sync_claim_expires_at = now() + make_interval(secs => $3)
+				 WHERE repo_id = $1
+				 RETURNING `+repoUpstreamCols, repoID, LegacyClaimHolder, lease.Seconds()))
+			if err != nil {
+				return err
+			}
+			up = row
+			return nil
+		}
 		row, err := scanRepoUpstream(tx.QueryRow(ctx,
 			`UPDATE repo_upstreams
 			 SET syncing = true, sync_pending = false,
 			     sync_claim_holder = $2,
 			     sync_claim_expires_at = now() + make_interval(secs => $3)
-			 WHERE repo_id = $1 AND (NOT syncing OR sync_claim_expires_at <= now())
+			 WHERE repo_id = $1
 			 RETURNING `+repoUpstreamCols, repoID, holder, lease.Seconds()))
-		if errors.Is(err, pgx.ErrNoRows) {
-			up = prev // unexpired claim in flight: refused, current row
-			return nil
-		}
 		if err != nil {
 			return err
 		}
@@ -421,7 +445,7 @@ func (s *PG) TryBeginSync(ctx context.Context, repoID, holder string, lease time
 			"claimed row %q returned holder %q syncing=%v", repoID, row.SyncClaimHolder, row.Syncing)
 		up, claimed = row, true
 		if prev.Syncing {
-			stolenFrom = prev.SyncClaimHolder // expired claim stolen
+			stolenFrom = prev.SyncClaimHolder // expired lease (or lapsed grace) stolen
 		}
 		return nil
 	})

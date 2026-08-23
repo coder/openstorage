@@ -439,34 +439,50 @@ func (s *SQLite) TryBeginSync(ctx context.Context, repoID, holder string, lease 
 		if err != nil {
 			return err
 		}
-		res, err := tx.ExecContext(ctx,
-			`UPDATE repo_upstreams
-			 SET syncing = 1, sync_pending = 0, sync_claim_holder = ?, sync_claim_expires_at = ?
-			 WHERE repo_id = ? AND (syncing = 0 OR sync_claim_expires_at <= ?)`,
-			holder, nowNanos+lease.Nanoseconds(), repoID, nowNanos)
-		if err != nil {
-			return err
-		}
-		n, err := res.RowsAffected()
-		if err != nil {
-			return err
-		}
-		assertf(n == 0 || n == 1, "sync claim for %q affected %d rows", repoID, n)
-		claimed = n == 1
-		if !claimed {
+		// BEGIN IMMEDIATE holds the writer lock: the claim decision runs
+		// in Go on consistent state, and every write below is
+		// unconditional.
+		now := time.Unix(0, nowNanos)
+		if prev.Syncing && prev.SyncClaimExpiresAt.After(now) {
 			up = prev // unexpired claim in flight: refused, current row
 			return nil
 		}
-		row, err := scanRepoUpstreamSQLite(tx.QueryRowContext(ctx,
-			`SELECT `+repoUpstreamCols+` FROM repo_upstreams WHERE repo_id = ?`, repoID))
-		if err != nil {
+		reread := func() error {
+			row, err := scanRepoUpstreamSQLite(tx.QueryRowContext(ctx,
+				`SELECT `+repoUpstreamCols+` FROM repo_upstreams WHERE repo_id = ?`, repoID))
+			if err != nil {
+				return err
+			}
+			up = row
+			return nil
+		}
+		if prev.Syncing && prev.SyncClaimHolder == "" {
+			// Legacy claim (pre-lease replica, mixed fleet): adopt with a
+			// full grace instead of stealing what may be a LIVE run — the
+			// old replica's FinishSync clears it if so; only an unclaimed
+			// expiry after the grace proves the holder dead.
+			if _, err := tx.ExecContext(ctx,
+				`UPDATE repo_upstreams SET sync_claim_holder = ?, sync_claim_expires_at = ? WHERE repo_id = ?`,
+				LegacyClaimHolder, nowNanos+lease.Nanoseconds(), repoID); err != nil {
+				return err
+			}
+			return reread()
+		}
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE repo_upstreams
+			 SET syncing = 1, sync_pending = 0, sync_claim_holder = ?, sync_claim_expires_at = ?
+			 WHERE repo_id = ?`,
+			holder, nowNanos+lease.Nanoseconds(), repoID); err != nil {
 			return err
 		}
-		assertf(row.Syncing && row.SyncClaimHolder == holder,
-			"claimed row %q returned holder %q syncing=%v", repoID, row.SyncClaimHolder, row.Syncing)
-		up = row
+		if err := reread(); err != nil {
+			return err
+		}
+		assertf(up.Syncing && up.SyncClaimHolder == holder,
+			"claimed row %q returned holder %q syncing=%v", repoID, up.SyncClaimHolder, up.Syncing)
+		claimed = true
 		if prev.Syncing {
-			stolenFrom = prev.SyncClaimHolder // expired claim stolen
+			stolenFrom = prev.SyncClaimHolder // expired lease (or lapsed grace) stolen
 		}
 		return nil
 	})

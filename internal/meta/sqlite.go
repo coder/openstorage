@@ -166,8 +166,10 @@ func (s *SQLite) InitSchema(ctx context.Context) error {
 	}
 	// Upgrade path for data dirs whose repo_upstreams predates the
 	// sync_pending (#79) or claim-lease (#86) columns (SQLite has no ADD
-	// COLUMN IF NOT EXISTS). The zero expiry default makes pre-existing
-	// wedged claims immediately stealable on upgrade.
+	// COLUMN IF NOT EXISTS). Claims left at the empty-holder/zero-expiry
+	// defaults are LEGACY claims: TryBeginSync adopts them under one
+	// grace period before they become stealable (pre-existing wedges
+	// heal one grace after the first post-upgrade sync attempt).
 	for _, col := range []struct{ name, ddl string }{
 		{"sync_pending", `sync_pending INTEGER NOT NULL DEFAULT 0`},
 		{"sync_claim_holder", `sync_claim_holder TEXT NOT NULL DEFAULT ''`},

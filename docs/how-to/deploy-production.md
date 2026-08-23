@@ -326,6 +326,13 @@ so a mixed-version fleet mid-roll is expected and fine, with one deliberate exce
 > See the [storage lifecycle guide](storage-lifecycle-and-sweeping.md#before-enabling-delete-mode-fleet-prerequisite)
 > for the exact prerequisite and why list-only mode is safe on any fleet.
 
+Upstream-sync claims are leased: a replica that dies mid-sync leaves a claim that the
+next run steals automatically once the lease expires, so a crash can delay but never
+permanently stop syncing. Claims written by pre-lease replicas (rolling upgrades from
+older builds, or wedges left by crashes before the upgrade) carry no lease; they are
+adopted under one full grace period — a live old-version run finishes undisturbed,
+and only a grace that lapses unfinished is treated as dead and stolen.
+
 ## JWT keys across the fleet
 
 Tokens are verified against the org's public keys in the database, and each replica
