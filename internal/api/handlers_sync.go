@@ -355,13 +355,18 @@ func (s *syncServer) handlePullUpstream(w http.ResponseWriter, r *http.Request) 
 		s.internalErr(w, r, "resolve pull-upstream repo", err)
 		return
 	}
-	_, err = s.ups.GetUpstream(r.Context(), repo.RepoID)
+	// RequestSync doubles as the has-upstream precheck AND makes the 202
+	// promise durable (issue #79): the pending marker is set BEFORE the
+	// enqueue, so a request that coalesces with a run that already claimed
+	// (whose upstream fetch may predate this request) survives to that
+	// run's FinishSync, and the finisher schedules the follow-up run.
+	err = s.ups.RequestSync(r.Context(), repo.RepoID)
 	switch {
 	case errors.Is(err, upsync.ErrNotFound):
 		writeErr(w, http.StatusBadRequest, "repository has no upstream base_repo")
 		return
 	case err != nil:
-		s.internalErr(w, r, "load upstream", err)
+		s.internalErr(w, r, "request sync", err)
 		return
 	}
 	syncRef := req.Ref

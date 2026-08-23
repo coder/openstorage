@@ -169,6 +169,10 @@ func (failingStore) DeleteRepoUpstream(context.Context, string) error {
 	panic("not used by signing-key CLI")
 }
 
+func (failingStore) RequestSync(context.Context, string) error {
+	panic("not used by signing-key CLI")
+}
+
 func (failingStore) TryBeginSync(context.Context, string) (meta.RepoUpstream, bool, error) {
 	panic("not used by signing-key CLI")
 }

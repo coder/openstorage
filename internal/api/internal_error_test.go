@@ -114,6 +114,8 @@ func (f failingStore) GetRepoUpstream(context.Context, string) (meta.RepoUpstrea
 
 func (f failingStore) DeleteRepoUpstream(context.Context, string) error { return f.err }
 
+func (f failingStore) RequestSync(context.Context, string) error { return f.err }
+
 func (f failingStore) TryBeginSync(context.Context, string) (meta.RepoUpstream, bool, error) {
 	return meta.RepoUpstream{}, false, f.err
 }

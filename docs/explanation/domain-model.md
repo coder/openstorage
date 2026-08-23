@@ -83,7 +83,10 @@ Derived from SDK behavior and the real consumer (`just-code-storage`):
     instances via `upstream_host`, credentials via git-credentials). Non-ephemeral ref
     mutations on synced repos schedule background sync; `pull-upstream` returns 202
     (async); `DELETE /repos/base` detaches idempotently. Sync lifecycle emits
-    `repo.sync.started/succeeded/failed` webhooks.
+    `repo.sync.started/succeeded/failed` webhooks. At most one sync run per repo is in
+    flight; a `pull-upstream` accepted while a run is already in flight is never dropped —
+    it coalesces into one follow-up run scheduled when the in-flight run finishes, so a 202
+    always means a sync run will observe upstream as of the request or later.
 12. **Forking.** `base_repo: {provider: "code", operation: "fork", auth: {token: <jwt>}}`
     forks an existing code.storage repo (optionally at `ref`/`sha`) into an independent repo.
     The fork-source JWT carries `git:read` on the source repo.

@@ -63,6 +63,17 @@ type Worker struct {
 	// endpoints); production keeps the default so hostile upstream rows
 	// can never reach local files, ssh, or transport helpers (ext::).
 	AllowProtocol string
+	// Requeue, when non-nil, schedules a follow-up run when FinishSync
+	// reports sync requests that arrived after this run's claim
+	// (Upstream.SyncPending, issue #79): this run's upstream fetch may
+	// predate those requests, so dropping them would break the
+	// pull-upstream 202 promise. Local-mode wiring points it at the
+	// queue's EnqueueSync (safe there: the in-process queue never
+	// deduplicates against a running run). River wiring leaves it nil —
+	// its insert-time uniqueness would swallow a follow-up inserted while
+	// this job's row is still running, so the river sync worker schedules
+	// successors transactionally at job completion instead (jobs/river.go).
+	Requeue func(ctx context.Context, job Job) error
 }
 
 // allowProtocol resolves the effective GIT_ALLOW_PROTOCOL value.
@@ -164,6 +175,17 @@ func (w *Worker) Run(ctx context.Context, job Job) error {
 	}
 	if err != nil {
 		return fmt.Errorf("finish sync %s: %w", job.RepoID, err)
+	}
+	if fin.SyncPending && w.Requeue != nil {
+		// Requests marked (RequestSync) after this run claimed are not
+		// covered by its fetch snapshot: schedule the coalesced follow-up
+		// now that the claim is free (the follow-up's BeginSync consumes
+		// the marker). Failure is log-only — local queued work is already
+		// documented as best-effort across restarts.
+		if rqErr := w.Requeue(ctx, job); rqErr != nil {
+			w.Logger.Warn("requeue pending sync failed",
+				"org", job.Org, "repo", job.RepoID, "err", rqErr)
+		}
 	}
 
 	terminal := base
