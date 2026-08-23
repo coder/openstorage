@@ -665,9 +665,6 @@ func (s *Sweeper) restoreFromQuarantine(ctx context.Context, key, qKey string) (
 			renewCover = func(rctx context.Context) error {
 				return ref.ReserveRestoreCover(rctx, s.packs, blob.QuotaRepoGroup(repo), key, size, ttl)
 			}
-			if err := renewCover(ctx); err != nil {
-				return false, err
-			}
 		}
 	}
 	if renewCover != nil {

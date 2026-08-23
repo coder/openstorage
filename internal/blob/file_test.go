@@ -505,9 +505,15 @@ func TestWithRenewedCoverAbortsOnLapse(t *testing.T) {
 	coverRenewInterval, coverRenewTimeout, coverLapseBudget = 10*time.Millisecond, 5*time.Millisecond, 40*time.Millisecond
 	t.Cleanup(func() { coverRenewInterval, coverRenewTimeout, coverLapseBudget = oldI, oldT, oldB })
 
-	// Every renewal stalls until its per-attempt deadline: the loop must
-	// keep making (failing) attempts and abort the op at the budget.
+	// The initial cover succeeds; every later renewal stalls until its
+	// per-attempt deadline: the loop must keep making (failing) attempts
+	// and abort the op at the budget.
+	initial := true
 	renew := func(rctx context.Context) error {
+		if initial {
+			initial = false
+			return nil
+		}
 		<-rctx.Done()
 		return rctx.Err()
 	}
@@ -552,6 +558,43 @@ func TestWithRenewedCoverRejectsLateSuccess(t *testing.T) {
 	})
 	if opErr == nil || !strings.Contains(opErr.Error(), "restore cover continuity lost") {
 		t.Fatalf("opErr = %v, want a continuity abort on late-completing renewals", opErr)
+	}
+}
+
+// TestWithRenewedCoverTakesInitialCoverItself (Codex round 64): a
+// caller-side initial reservation with the anchor captured at helper
+// entry let a process suspension between the caller's commit and entry
+// fabricate a fresh anchor over an already-aging row — publication could
+// then run past the real cover's expiry. The helper must take the
+// initial cover ITSELF, anchored at the attempt's own start, before any
+// op byte can become physical; an initial-cover failure prevents op
+// entirely.
+func TestWithRenewedCoverTakesInitialCoverItself(t *testing.T) {
+	var renews, opStarts atomic.Int32
+	opErr, renewErr := WithRenewedCover(context.Background(), func(context.Context) error {
+		renews.Add(1)
+		return nil
+	}, func(context.Context) error {
+		if renews.Load() == 0 {
+			t.Fatal("op started before the initial cover committed")
+		}
+		opStarts.Add(1)
+		return nil
+	})
+	if opErr != nil || renewErr != nil || opStarts.Load() != 1 {
+		t.Fatalf("WithRenewedCover = (%v, %v), op starts %d; want (nil, nil), 1", opErr, renewErr, opStarts.Load())
+	}
+
+	// An initial-cover failure aborts before op runs.
+	opStarts.Store(0)
+	opErr, _ = WithRenewedCover(context.Background(), func(context.Context) error {
+		return errors.New("ledger down")
+	}, func(context.Context) error {
+		opStarts.Add(1)
+		return nil
+	})
+	if opErr == nil || !strings.Contains(opErr.Error(), "initial restore cover") || opStarts.Load() != 0 {
+		t.Fatalf("WithRenewedCover(initial failure) = %v, op starts %d; want an initial-cover abort with op never run", opErr, opStarts.Load())
 	}
 }
 

@@ -279,23 +279,23 @@ func EnsurePublished(ctx context.Context, b BlobStore, key, path string, onResto
 			}
 			return true, nil
 		}
-		if err := onRestore(ctx, fi.Size()); err != nil {
-			return false, fmt.Errorf("account restore of %s: %w", key, err)
-		}
-		// The cover must stay alive from here until the stale-floor tail
-		// closes (Codex round 59): this allowance deliberately exceeds
-		// the minimum reservation TTL (repairs must finish), so one
-		// reservation cannot span the upload. Renew it through the
-		// upload and refresh it once after publication — the refresh
-		// restarts the TTL clock, which the config floor guarantees
-		// outlives the last stale-floor commit (usageCacheTTL + handoff
-		// margin past publication).
+		// The cover must exist BEFORE any byte becomes physical and stay
+		// alive until the stale-floor tail closes (Codex rounds 58+59):
+		// the restore allowance deliberately exceeds the minimum
+		// reservation TTL (repairs must finish), so one reservation
+		// cannot span the upload. WithRenewedCover takes the initial
+		// cover itself (anchored inside its continuity discipline —
+		// Codex round 64), renews it through the upload, and refreshes
+		// it after publication — the refresh restarts the TTL clock,
+		// which the config floor guarantees outlives the last
+		// stale-floor commit (usageCacheTTL + handoff margin past
+		// publication).
 		renew := func(rctx context.Context) error { return onRestore(rctx, fi.Size()) }
 		upErr, renewErr := WithRenewedCover(ctx, renew, func(opCtx context.Context) error {
 			return b.UploadFile(opCtx, key, path)
 		})
 		if upErr != nil {
-			return false, upErr
+			return false, fmt.Errorf("restore %s: %w", key, upErr)
 		}
 		if renewErr != nil {
 			// The bytes ARE durably back — report the restore so the
@@ -347,31 +347,40 @@ func WithRenewedCover(ctx context.Context, renew func(context.Context) error, op
 	opCtx, opCancel := context.WithCancelCause(ctx)
 	defer opCancel(nil)
 	// covered is the conservative anchor of the newest PROVEN cover row:
-	// the caller's initial cover committed before this function was
-	// entered, and each accepted renewal anchors at its attempt START
-	// (the row's created_at is at or after it). Written by the renewal
-	// goroutine, read by the final-refresh loop strictly after wg.Wait —
-	// no concurrent access.
-	covered := time.Now()
+	// each accepted attempt anchors at its own START (the row's
+	// created_at is at or after it). The INITIAL cover is taken inside
+	// this function under the same discipline (Codex round 64): a
+	// caller-side reservation anchored at entry let a process suspension
+	// between the caller's commit and entry fabricate a fresh anchor
+	// over an already-aging row. Written by the renewal goroutine, read
+	// by the final-refresh loop strictly after wg.Wait — no concurrent
+	// access.
+	var covered time.Time
 	// attemptRenew runs ONE bounded, continuity-checked renewal: a
 	// renewal proves continuity only if it COMPLETED while the prior
 	// cover still lived (Codex round 63) — a success committing after
 	// the prior row expired leaves an uncovered gap a stale-floor
 	// admission can use. Completion is an upper bound on the commit
 	// time; the budget is strictly under the minimum TTL, so
-	// completion-before-deadline proves commit-before-expiry. The
-	// context is detached: renewals are restore accounting, not client
-	// work.
+	// completion-before-deadline proves commit-before-expiry. The first
+	// success (no prior cover to prove continuity against) is anchored
+	// at its own conservative start. The context is detached: renewals
+	// are restore accounting, not client work.
 	attemptRenew := func() (ok, lost bool, err error) {
 		start := time.Now()
 		rctx, rcancel := context.WithTimeout(context.WithoutCancel(ctx), coverRenewTimeout)
 		err = renew(rctx)
 		rcancel()
-		if err == nil && time.Since(covered) <= coverLapseBudget {
+		if err == nil && (covered.IsZero() || time.Since(covered) <= coverLapseBudget) {
 			covered = start
 			return true, false, nil
 		}
-		return false, time.Since(covered) > coverLapseBudget, err
+		return false, !covered.IsZero() && time.Since(covered) > coverLapseBudget, err
+	}
+	// No bytes may become physical before the initial cover commits: an
+	// initial failure aborts before op starts.
+	if ok, _, err := attemptRenew(); !ok {
+		return fmt.Errorf("initial restore cover: %w", err), nil
 	}
 	// renew invocations are strictly serialized: the renewal goroutine is
 	// joined before the final refresh, so callers need no concurrency
