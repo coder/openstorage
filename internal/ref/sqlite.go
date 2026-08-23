@@ -325,6 +325,7 @@ func (s *SQLite) RegisterPacks(ctx context.Context, repo string, packs []Pack) e
 	}
 	defer func() { _ = tx.Rollback() }()
 	var credit int64
+	adopted := false
 	for _, p := range packs {
 		assertf(p.ID != "" && p.Key != "", "RegisterPacks: empty pack id/key %+v", p)
 		res, err := tx.ExecContext(ctx,
@@ -343,10 +344,19 @@ func (s *SQLite) RegisterPacks(ctx context.Context, repo string, packs []Pack) e
 				return err
 			}
 			credit += c
+			adopted = adopted || (p.Adopted && c > 0)
 		}
 		// Settlement consumes BOTH era spellings — see the PG twin.
 		if _, err := tx.ExecContext(ctx,
 			`DELETE FROM pack_reservations WHERE key IN (?, ?)`, reservRowKey(p.Key), p.Key); err != nil {
+			return err
+		}
+	}
+	if adopted {
+		// Atomic with the credit — see the PG twin (Codex round 53).
+		if _, err := tx.ExecContext(ctx, `
+INSERT INTO lfs_adoption_gens (repo, gen) VALUES (?, 1)
+ON CONFLICT (repo) DO UPDATE SET gen = lfs_adoption_gens.gen + 1`, baseRepoOf(repo)); err != nil {
 			return err
 		}
 	}

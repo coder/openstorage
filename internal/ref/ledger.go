@@ -641,6 +641,15 @@ func (s *PG) GuardedLFSDelete(ctx context.Context, repo, key string, del func(co
 	return deleted, err
 }
 
+// baseRepoOf strips the optional namespace suffix (`+ephemeral`/`+import`)
+// so the adoption generation is keyed by the BASE repository, matching the
+// floor caches' quota accounting unit (mirrors githttp.BaseRepo, which ref
+// cannot import).
+func baseRepoOf(repo string) string {
+	base, _, _ := strings.Cut(repo, "+")
+	return base
+}
+
 // BumpLFSAdoptionGen — see RefStore (Codex round 49).
 func (s *PG) BumpLFSAdoptionGen(ctx context.Context, repo string) error {
 	assertf(repo != "", "BumpLFSAdoptionGen(%q)", repo)

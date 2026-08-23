@@ -51,6 +51,17 @@ type Pack struct {
 	// registers fine but contributes nothing to the ledger (the blob
 	// listing floor still covers such bytes conservatively).
 	Size int64
+	// Adopted marks a pack whose BLOB already existed before this
+	// registration (a crash-window retry re-registering a published-but-
+	// rowless pack — the pack analog of LFS adoption, Codex round 53):
+	// physical listings may already contain its bytes, so RegisterPacks
+	// bumps the shared floor generation IN ITS REGISTRATION TRANSACTION
+	// when it credits a newly inserted Adopted pack, invalidating every
+	// replica's cached uncounted floor. Fresh uploads leave it false —
+	// their bytes are in no cached scan, and bumping per push would
+	// defeat the floor cache under write load. Accounting input like
+	// Size, never persisted.
+	Adopted bool
 }
 
 // RefInfo is one ref row with its metadata. CreatedAt is the row's creation
@@ -656,6 +667,7 @@ func (s *PG) RegisterPacks(ctx context.Context, repo string, packs []Pack) error
 	assertf(len(packs) > 0, "RegisterPacks called with no packs")
 	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
 		var credit int64
+		adopted := false
 		for _, p := range packs {
 			assertf(p.ID != "" && p.Key != "", "RegisterPacks: empty pack id/key %+v", p)
 			ct, err := tx.Exec(ctx,
@@ -670,11 +682,22 @@ func (s *PG) RegisterPacks(ctx context.Context, repo string, packs []Pack) error
 					return err
 				}
 				credit += c
+				adopted = adopted || (p.Adopted && c > 0)
 			}
 			// Settlement consumes BOTH era spellings (reservKeySpellings):
 			// the key's bytes are in the usage counter now.
 			if _, err := tx.Exec(ctx,
 				`DELETE FROM pack_reservations WHERE key = ANY($1)`, reservKeySpellings(p.Key)); err != nil {
+				return err
+			}
+		}
+		if adopted {
+			// A crash-retry adopted a published-but-rowless pack whose
+			// bytes cached floors may already contain (Codex round 53) —
+			// atomic with the credit, like RegisterAdoptedLFSObject.
+			if _, err := tx.Exec(ctx, `
+INSERT INTO lfs_adoption_gens (repo, gen) VALUES ($1, 1)
+ON CONFLICT (repo) DO UPDATE SET gen = lfs_adoption_gens.gen + 1`, baseRepoOf(repo)); err != nil {
 				return err
 			}
 		}

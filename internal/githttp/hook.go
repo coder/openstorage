@@ -381,6 +381,13 @@ func preReceive(ctx context.Context) error {
 	// committed row must never point at missing bytes. Extra verify work
 	// on a genuinely failed registration is harmless: the keys were just
 	// uploaded, so each check is one Stat.
+	// Packs whose blobs pre-existed this push (crash-window retries) are
+	// ADOPTIONS: cached floors may already contain their bytes, so the
+	// registration bumps the shared floor generation for them (Codex
+	// round 53).
+	for i := range packs {
+		packs[i].Adopted = published[i]
+	}
 	regErr := st.RegisterPacks(ctx, repo, packs)
 	if regErr != nil {
 		regErr = fmt.Errorf("pre-receive: register packs: %w", regErr)

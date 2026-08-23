@@ -134,6 +134,10 @@ func (s *server) publishPack(ctx context.Context, repoID, packID, packPath strin
 	// if a sweeper deleted the key before the registration committed.
 	// Verification runs even when RegisterPacks fails: an ambiguous error
 	// may have committed the row (see the pre-receive hook).
+	// A pre-existing blob means this registration ADOPTS bytes cached
+	// floors may already contain (Codex round 53) — the registration
+	// bumps the shared floor generation for it.
+	pack.Adopted = published
 	regErr := s.refStore.RegisterPacks(ctx, repoID, []ref.Pack{pack})
 	if regErr != nil {
 		regErr = fmt.Errorf("register pack %s: %w", packID, regErr)

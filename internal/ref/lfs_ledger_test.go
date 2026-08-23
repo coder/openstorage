@@ -247,3 +247,37 @@ func TestRegisterAdoptedLFSObjectBumpsGenAtomically(t *testing.T) {
 		}
 	})
 }
+
+// TestRegisterPacksAdoptedBumpsGen (Codex round 53): registering a pack
+// whose BLOB pre-existed (a crash-window retry — the pack analog of LFS
+// adoption) moves listed bytes into the counter, so it must bump the
+// shared floor generation atomically with the credit. Fresh packs never
+// bump (per-push bumps would defeat the floor cache), and idempotent
+// re-registration commits nothing and bumps nothing.
+func TestRegisterPacksAdoptedBumpsGen(t *testing.T) {
+	runRefBackends(t, func(t *testing.T, s Store) {
+		ctx := context.Background()
+		k := newLedgerKit(t, s)
+
+		fresh := k.pack(k.base(), "aa1", 10)
+		k.register(k.base(), fresh)
+		if gen, err := s.LFSAdoptionGen(ctx, k.base()); err != nil || gen != 0 {
+			t.Fatalf("fresh-pack gen = (%d, %v), want (0, nil)", gen, err)
+		}
+
+		adopted := k.pack(k.base(), "bb2", 20)
+		adopted.Adopted = true
+		k.register(k.base(), adopted)
+		if gen, err := s.LFSAdoptionGen(ctx, k.base()); err != nil || gen != 1 {
+			t.Fatalf("adopted-pack gen = (%d, %v), want (1, nil)", gen, err)
+		}
+		k.wantState(30, 0, 0)
+
+		// Idempotent re-registration: no new row, no bump.
+		k.register(k.base(), adopted)
+		if gen, err := s.LFSAdoptionGen(ctx, k.base()); err != nil || gen != 1 {
+			t.Fatalf("re-registration gen = (%d, %v), want (1, nil)", gen, err)
+		}
+		k.wantState(30, 0, 0)
+	})
+}
