@@ -72,6 +72,18 @@ var (
 )
 
 func TestMain(m *testing.M) {
+	// Fuzzing early-out (issue #91): `go test -fuzz` runs this TestMain in
+	// the coordinator AND in every worker process, and none of the fuzz
+	// targets touch the e2e environment — without this, -parallel=N would
+	// boot N binary builds + backend stacks per campaign. Plain `go test`
+	// (including the seed-corpus replay of the fuzz targets) never sees
+	// these flags and keeps the full boot.
+	for _, arg := range os.Args[1:] {
+		if strings.HasPrefix(arg, "-test.fuzz=") || strings.HasPrefix(arg, "--test.fuzz=") ||
+			strings.HasPrefix(arg, "-test.fuzzworker") || strings.HasPrefix(arg, "--test.fuzzworker") {
+			os.Exit(m.Run())
+		}
+	}
 	os.Exit(testMainInner(m))
 }
 
