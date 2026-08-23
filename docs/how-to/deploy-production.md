@@ -240,9 +240,13 @@ and bypasses every proxy-enforced limit. Then:
   object you intend to accept in mind, and note upload bytes are staged under the
   server's `$TMPDIR` before publication. Per-replica staging is bounded by
   [`CODESTORAGE_LFS_STAGING_BYTES`](../reference/configuration.md#codestorage_lfs_staging_bytes)
-  (default 10 GiB; over-budget uploads answer `429`/`413`, and each object allows one
-  in-flight upload per replica) — size it against the disk you actually give `$TMPDIR`,
-  and keep the proxy body cap as defense in depth.
+  (default 32 GiB; over-budget uploads answer `429`/`413`, and each object allows one
+  in-flight upload per replica). Any single repository's staged bytes are held to at
+  most a third of the budget — the budget is a working set sized at roughly `3 ×` the
+  largest object you accept, and the default keeps one default-quota-sized (10 GiB)
+  object stageable. Give `$TMPDIR` at least the full configured budget (plus git push
+  quarantine headroom) or lower the budget to the disk you actually provision, and
+  keep the proxy body cap as defense in depth.
   **Upgrading from v0.1.0:** older replicas hand clients presigned upload URLs that
   write to the bucket directly, bypassing verification, and such URLs stay valid up to
   15 minutes after the last old replica exits. Complete the roll promptly; LFS objects
