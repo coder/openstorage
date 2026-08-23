@@ -438,17 +438,30 @@ type stallOnceBlob struct {
 	stalled  atomic.Bool
 	mu       sync.Mutex
 	reads    []int64
+	readKeys []string
 }
 
 func (b *stallOnceBlob) ReadRange(ctx context.Context, key string, offset, length int64) ([]byte, error) {
 	b.mu.Lock()
 	b.reads = append(b.reads, offset)
+	b.readKeys = append(b.readKeys, key)
 	b.mu.Unlock()
 	if offset == b.stallOff && !b.stalled.Swap(true) {
 		<-ctx.Done()
 		return nil, ctx.Err()
 	}
 	return b.BlobStore.ReadRange(ctx, key, offset, length)
+}
+
+// keyReads returns the recorded offsets read from key. Callers hold b.mu.
+func (b *stallOnceBlob) keyReads(key string) []int64 {
+	var offs []int64
+	for i, k := range b.readKeys {
+		if k == key {
+			offs = append(offs, b.reads[i])
+		}
+	}
+	return offs
 }
 
 // TestLFSAdoption_ResumesAfterSlowRange (Codex round 57): a ranged read
@@ -510,14 +523,21 @@ func TestLFSAdoption_ResumesAfterSlowRange(t *testing.T) {
 	}
 	bl.mu.Lock()
 	defer bl.mu.Unlock()
-	zeroReads := 0
-	for _, off := range bl.reads {
+	// The SOURCE must never replay a completed range; the canonical
+	// DESTINATION's single full read is the round-81 re-verification that
+	// binds registration to the bytes legacy URLs cannot touch — a
+	// deliberate, once-per-object cost, not a resume failure.
+	srcZero := 0
+	for _, off := range bl.keyReads(blob.LFSLegacyKey(lfsTestRepoID, oid)) {
 		if off == 0 {
-			zeroReads++
+			srcZero++
 		}
 	}
-	if zeroReads != 1 {
-		t.Fatalf("offset 0 read %d times across attempts (reads: %v), want exactly 1 — completed ranges must not replay", zeroReads, bl.reads)
+	if srcZero != 1 {
+		t.Fatalf("source offset 0 read %d times across attempts (reads: %v / %v), want exactly 1 — completed ranges must not replay", srcZero, bl.readKeys, bl.reads)
+	}
+	if destReads := bl.keyReads(key); len(destReads) != (len(legacy)+3)/4 {
+		t.Fatalf("destination reads = %v, want exactly one full re-verification pass", destReads)
 	}
 }
 
@@ -663,20 +683,27 @@ func TestLFSAdoption_CompletedHashSurvivesRegistrationFailure(t *testing.T) {
 	}
 	bl.mu.Lock()
 	defer bl.mu.Unlock()
-	// Attempt 1 read every chunk; attempt 2 re-read ONLY the final chunk
-	// (the digest over exactly size bytes is always re-checked before the
-	// registration — Codex round 77 — but the completed prefix is not).
-	if want := (len(legacy)+3)/4 + 1; len(bl.reads) != want {
-		t.Fatalf("%d ranged reads across both attempts (offsets: %v), want %d — a registration retry must re-read only the final chunk", len(bl.reads), bl.reads, want)
+	// Attempt 1 read the source once and the canonical destination once
+	// (the round-81 re-verification that binds registration to the
+	// destination bytes); attempt 2's retry re-read ONLY the destination's
+	// final chunk from the parked midstate (the digest over exactly size
+	// bytes is always re-checked before the registration — Codex round 77
+	// — but the completed prefix is not).
+	chunks := (len(legacy) + 3) / 4
+	if srcReads := bl.keyReads(blob.LFSLegacyKey(lfsTestRepoID, oid)); len(srcReads) != chunks {
+		t.Fatalf("source reads = %v, want exactly one verification pass", srcReads)
+	}
+	if destReads := bl.keyReads(key); len(destReads) != chunks+1 {
+		t.Fatalf("destination reads = %v, want one full pass plus the retry's final chunk", destReads)
 	}
 	zeroReads := 0
-	for _, off := range bl.reads {
+	for _, off := range bl.keyReads(key) {
 		if off == 0 {
 			zeroReads++
 		}
 	}
 	if zeroReads != 1 {
-		t.Fatalf("offset 0 read %d times (reads: %v), want exactly 1 — the completed prefix must not replay", zeroReads, bl.reads)
+		t.Fatalf("destination offset 0 read %d times (reads: %v), want exactly 1 — the completed prefix must not replay on the retry", zeroReads, bl.reads)
 	}
 }
 
