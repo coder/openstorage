@@ -169,6 +169,49 @@ func TestEnsureCacheRepo_MemoFallsThroughOnRepoRemoval(t *testing.T) {
 	}
 }
 
+// Context expiry during the post-repair re-verification must propagate
+// (PR #98 round-8 review): the repack materializer runs EnsureCacheRepoCtx
+// under its wall-clock budget, and swallowing the ctx error as a "benign
+// residual race" would return success from a call whose budget expired.
+// The observer cancels the context right after the second repair write, so
+// the re-verify's first subprocess fails with the ctx error in its chain.
+func TestEnsureCacheRepoCtx_PropagatesCancellationDuringReverify(t *testing.T) {
+	cacheDir := t.TempDir()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// The observer runs before each exec: count the two repair writes,
+	// then cancel on the NEXT read spawn — the re-verify's first
+	// subprocess — so both writes complete and the ctx error surfaces
+	// inside verifyLocalConfig itself.
+	var writes atomic.Int32
+	obs := func(dir string, args []string) {
+		if len(args) == 0 || args[0] != "config" {
+			return
+		}
+		line := strings.Join(args, " ")
+		if strings.Contains(line, "--replace-all") {
+			writes.Add(1)
+			return
+		}
+		if writes.Load() >= 2 && strings.Contains(line, "--get-all") {
+			cancel() // budget expires as the re-verify starts
+		}
+	}
+	gitSpawnObserver.Store(&obs)
+	defer gitSpawnObserver.Store(nil)
+
+	// Fresh repo: the first verification fails (values unset), forcing the
+	// repair loop and the re-verify the cancellation lands on.
+	_, err := EnsureCacheRepoCtx(ctx, cacheDir, "t-ensure-cancel")
+	if err == nil {
+		t.Fatal("EnsureCacheRepoCtx returned success although its context expired mid-verification")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("EnsureCacheRepoCtx = %v, want context.Canceled in the chain", err)
+	}
+}
+
 // Duplicate definitions where the TRAILING value is the safe pin (git's
 // last-definition-wins: `unpackLimit = 1` then `= 0` is effectively 0)
 // must keep serving and memoizing — the pre-memo code accepted them, and

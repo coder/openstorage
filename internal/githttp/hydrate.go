@@ -189,6 +189,12 @@ var errConfigHasIncludes = errors.New("local config contains include directives;
 // racer — corruption-grade.
 var errConfigValueMismatch = errors.New("local config value mismatch")
 
+// errConfigChangedUnderfoot marks a config file that changed between the
+// bracketing stats of one verification pass: a concurrent full pass is
+// racing. Benign for serving — the racer writes the same values — but the
+// pass proved nothing, so it must not memoize.
+var errConfigChangedUnderfoot = errors.New("config file changed underneath the verification reads")
+
 // verifyLocalConfig proves every cacheRepoConfig value is effective in the
 // repo's LOCAL scope and returns a fingerprint of the exact file state the
 // reads covered: stat, read each value, stat again, and fail unless both
@@ -252,7 +258,7 @@ func verifyLocalConfig(ctx context.Context, repoPath, configPath string) (os.Fil
 		return nil, err
 	}
 	if !fileUnchanged(pre, post) {
-		return nil, errors.New("config file changed underneath the verification reads")
+		return nil, errConfigChangedUnderfoot
 	}
 	if hasIncludes {
 		return nil, errConfigHasIncludes
@@ -327,11 +333,19 @@ func EnsureCacheRepoCtx(ctx context.Context, cacheDir, repo string) (string, err
 		// A wrong effective value surviving our own direct write can only
 		// be a local include override or a hostile racer: fail loudly
 		// rather than serve pushes that unpack loose objects the hooks
-		// never persist (PR #98 round-5 review). Other residual errors —
-		// the file changing under a racing full pass — stay non-fatal:
-		// serve, skip memoization, and the next call re-verifies.
+		// never persist (PR #98 round-5 review).
 		if errors.Is(configErr, errConfigValueMismatch) {
 			return "", fmt.Errorf("cache repo %s: pinned config overridden after repair: %w", repo, configErr)
+		}
+		// Only the two documented outcomes are benign residuals: a racing
+		// full pass changing the file underfoot (serve, skip memoization)
+		// or include directives (same). Anything else — context expiry,
+		// git or stat failures — must propagate: the repack materializer
+		// runs this under its wall-clock budget and swallowing its
+		// cancellation would fake success (PR #98 round-8 review).
+		if configErr != nil && !errors.Is(configErr, errConfigHasIncludes) &&
+			!errors.Is(configErr, errConfigChangedUnderfoot) {
+			return "", configErr
 		}
 	}
 	self, err := os.Executable()
