@@ -462,6 +462,9 @@ func (s *Server) lfsBatchUpload(r *http.Request, repoElem string, target repoTar
 					lfsObjectFail(&results[i], http.StatusInsufficientStorage, fmt.Sprintf(
 						"repository LFS object count limit reached (limit %d)", ref.MaxLFSObjectsPerRepo))
 					continue
+				case errors.Is(aerr, errLFSAdoptQuotaExceeded):
+					lfsObjectFail(&results[i], http.StatusInsufficientStorage, aerr.Error())
+					continue
 				case errors.Is(aerr, errLFSBusy):
 					lfsObjectFail(&results[i], http.StatusTooManyRequests,
 						"a concurrent operation holds this object, retry")
@@ -687,6 +690,13 @@ var errLFSBusy = errors.New("concurrent LFS operation in progress")
 // bytes for the roll's duration, and at the quota edge the copy is DENIED
 // rather than overshooting — callers map it to 507.
 var errLFSCompatQuotaExceeded = errors.New("repository storage quota exceeded by the v0.2.0 compatibility copy")
+
+// errLFSAdoptQuotaExceeded is the adoption copy's quota denial (Codex
+// round 85): canonicalizing a legacy object materializes a second
+// size-byte copy while the source stays retained (and floor-charged) until
+// the post-roll sweep, so the copy passes real admission — at the quota
+// edge adoption fails with 507 instead of durably exceeding the quota.
+var errLFSAdoptQuotaExceeded = errors.New("repository storage quota exceeded by the adoption copy (free space or raise the quota to migrate this object)")
 
 // compatFailStatus maps a compat-bridge failure to its response status:
 // quota denials are 507 (the client must free space or finish the roll),
@@ -1497,6 +1507,45 @@ func (s *Server) publishVerifiedLFSObject(ctx context.Context, repoID, key, lega
 		// No floors to protect (quota disabled) or nothing to account.
 		return doCopy(dctx)
 	}
+	// REAL quota admission for the canonical copy (Codex round 85, the
+	// adoption twin of the bridge's round-84 admission): the copy
+	// materializes a second size-byte object while the legacy source
+	// stays retained — and floor-charged — until the post-roll sweep, so
+	// admitting it under an unbounded quota let an at-quota repository
+	// durably reach 2S. The reservation is keyed by the CANONICAL key, so
+	// the registration that follows settles it (no lingering charge); the
+	// retained source remains accounted by the listing floor. A denial
+	// fails the adoption with 507 — freeing space or finishing the roll
+	// (and reclaiming sources) lets a retry migrate the object.
+	for attempt := 0; ; attempt++ {
+		floor, floorGen, err := s.cachedUsageFloorGen(dctx, repoID)
+		if err != nil {
+			return fmt.Errorf("adoption admission %s: usage listing: %w", key, err)
+		}
+		rsvCtx, rsvCancel := context.WithTimeout(dctx, UsageFloorHandoffMargin)
+		dec, err := s.Store.ReservePackBytes(rsvCtx, blob.QuotaRepoGroup(repoID),
+			[]ref.Pack{{Key: key, Size: size}}, ref.NewReservationOwner(),
+			floor, floorGen, s.PackQuotaBytes, s.lfsReservationTTL())
+		rsvCancel()
+		if err != nil {
+			return fmt.Errorf("adoption admission %s: %w", key, err)
+		}
+		if dec.FloorStale {
+			s.invalidateUsageFloor(repoID)
+			if attempt >= 1 {
+				return fmt.Errorf("adoption admission %s: usage floor went stale twice", key)
+			}
+			continue
+		}
+		if dec.KeyCapExceeded {
+			return fmt.Errorf("adoption admission %s: %w", key, errLFSBusy)
+		}
+		if !dec.OK {
+			return fmt.Errorf("adopt %s: %w (copy adds %d bytes to %d stored, +%d reserved, quota %d)",
+				key, errLFSAdoptQuotaExceeded, size, dec.UsedBytes, dec.ReservedBytes, s.PackQuotaBytes)
+		}
+		break
+	}
 	// Stale-floor cover (the round-57/58 pattern): the copy creates NEW
 	// physical bytes invisible both to floors scanned before it and to
 	// the usage counter until registration commits — an admission holding
@@ -1895,6 +1944,9 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target r
 		case errors.Is(aerr, ref.ErrLFSObjectCapExceeded):
 			lfsError(w, http.StatusInsufficientStorage, fmt.Sprintf(
 				"repository LFS object count limit reached (limit %d)", ref.MaxLFSObjectsPerRepo))
+			return
+		case errors.Is(aerr, errLFSAdoptQuotaExceeded):
+			lfsError(w, http.StatusInsufficientStorage, aerr.Error())
 			return
 		case errors.Is(aerr, errLFSBusy):
 			w.Header().Set("Retry-After", "10")
@@ -2419,6 +2471,23 @@ func (s *Server) maybeLegacyCompatCopy(ctx context.Context, repoID, oid, key str
 		return nil
 	}
 	legacyKey := blob.LFSLegacyKey(repoID, oid)
+	// Compat copies serialize on the LEGACY key's fleet claim (Codex
+	// security round 85): the bridge repair runs from lock-free fast
+	// paths, so without a shared exclusion every tiny concurrent touch of
+	// a not-yet-bridged object launched another full server-side copy —
+	// fleet-multiplied backend read/write cost for identical bytes.
+	// One winner copies; losers answer retryable contention (429). The
+	// claim is renewed through the size-scaled copy like every long
+	// canonical operation. Lock ordering: callers may hold the CANONICAL
+	// key's claim; nothing acquires canonical while holding legacy.
+	claimed, claimOwner, err := s.Store.TryAdoptionClaim(ctx, repoID, legacyKey)
+	if err != nil {
+		return fmt.Errorf("compat claim %s: %w", legacyKey, err)
+	}
+	if !claimed {
+		return fmt.Errorf("compat copy %s: %w", legacyKey, errLFSBusy)
+	}
+	defer s.releaseAdoptionClaim(legacyKey, claimOwner)
 	// Size-scaled allowance, not a fixed wall-clock cap (Codex round 81):
 	// accepted objects reach many GiB and S3's multipart copy is
 	// sequential, so the one-minute cleanup bound was guaranteed to
@@ -2430,10 +2499,12 @@ func (s *Server) maybeLegacyCompatCopy(ctx context.Context, repoID, oid, key str
 	// best-effort, so the held resources are one goroutine, not the
 	// upload's staging slots.
 	doCopy := func(opCtx context.Context) error {
-		bound := 5*time.Minute + time.Duration(size>>20)*time.Second
-		cctx, cancel := context.WithTimeout(opCtx, bound)
-		defer cancel()
-		return s.Blob.Copy(cctx, legacyKey, key)
+		return s.withRenewedAdoptionClaim(opCtx, legacyKey, claimOwner, func(copyCtx context.Context) error {
+			bound := 5*time.Minute + time.Duration(size>>20)*time.Second
+			cctx, cancel := context.WithTimeout(copyCtx, bound)
+			defer cancel()
+			return s.Blob.Copy(cctx, legacyKey, key)
+		})
 	}
 	dctx := context.WithoutCancel(ctx)
 	if size <= 0 || s.PackQuotaBytes <= 0 {
@@ -2450,10 +2521,12 @@ func (s *Server) maybeLegacyCompatCopy(ctx context.Context, repoID, oid, key str
 	// admission (floor + generation recheck, real PackQuotaBytes) BEFORE
 	// anything becomes physical; a denial fails the bridge, never
 	// overshoots — the canonical object stays registered and a later
-	// retry repairs the bridge if headroom appears. The row settles by
-	// TTL; the listing floor charges the durable bridge bytes from then
-	// on (rowless legacy copies are floor-accounted, like every retained
-	// source).
+	// retry repairs the bridge if headroom appears. The admission row is
+	// RETIRED after the cover handoff (Codex round 85): once the bump
+	// invalidates floors and rescans list the durable bridge bytes,
+	// leaving the row to its TTL would double-charge them for up to an
+	// hour and falsely 507 unrelated uploads.
+	var admissionGens map[string]string
 	for attempt := 0; ; attempt++ {
 		floor, floorGen, err := s.cachedUsageFloorGen(dctx, repoID)
 		if err != nil {
@@ -2481,6 +2554,7 @@ func (s *Server) maybeLegacyCompatCopy(ctx context.Context, repoID, oid, key str
 			return fmt.Errorf("compat copy %s: %w (bridge adds %d bytes to %d stored, +%d reserved, quota %d)",
 				legacyKey, errLFSCompatQuotaExceeded, size, dec.UsedBytes, dec.ReservedBytes, s.PackQuotaBytes)
 		}
+		admissionGens = dec.Gens
 		break
 	}
 	// The compat copy materializes ANOTHER size bytes after registration
@@ -2513,6 +2587,19 @@ func (s *Server) maybeLegacyCompatCopy(ctx context.Context, repoID, oid, key str
 		// The bytes ARE durable; only the cover tail broke. Log like the
 		// restore paths.
 		log.Printf("lfs compat copy %s: cover tail: %v", key, renewErr)
+	}
+	// Retire the admission row (Codex round 85): the copy succeeded, the
+	// handoff bump invalidated every pre-copy floor, and fresh rescans
+	// list the bridge bytes — the deliberate TTL-bounded tail cover is
+	// the only reservation that should keep charging them. Best-effort
+	// and bounded: a failed retire leaves only what the TTL always
+	// collected.
+	if len(admissionGens) > 0 {
+		rctx, rcancel := context.WithTimeout(dctx, lfsCleanupTimeout)
+		defer rcancel()
+		if err := s.Store.RetirePackAttempts(rctx, blob.QuotaRepoGroup(repoID), admissionGens); err != nil {
+			log.Printf("lfs compat retire %s: %v", legacyKey, err)
+		}
 	}
 	return nil
 }

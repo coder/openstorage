@@ -1079,6 +1079,16 @@ func (s *Sweeper) freshModTime(ctx context.Context, key string) (mod time.Time, 
 // regardless of SweepConfig.Delete — interval zero documents "no sweeping",
 // so an emergency stop must never destroy anything.
 func (s *Sweeper) Heal(ctx context.Context) error {
+	// Legacy/canonical LFS row twins stranded by rolling-upgrade races
+	// need the janitor even when periodic sweeping is disabled (Codex
+	// round 85): no registration fast path ever runs again for a twin, so
+	// this startup pass is the only reconciliation such deployments get —
+	// without it the duplicate usage and object-count charge is permanent.
+	if n, err := s.packs.ReconcileLegacyLFSObjects(ctx); err != nil {
+		s.logger.Error("heal: reconcile legacy lfs rows", "err", err)
+	} else if n > 0 {
+		s.logger.Info("heal: reconciled legacy lfs row twins", "count", n)
+	}
 	var report SweepReport
 	return s.healQuarantine(ctx, &report, false)
 }
