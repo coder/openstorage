@@ -9,6 +9,7 @@ package githttp
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"io"
 	"math"
@@ -558,6 +559,109 @@ func TestLFSAdoption_RenewalIsBounded(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("adoption not bounded by the renewal timeout — a wedged ref store pinned the verification slots for the size-scaled allowance")
+	}
+}
+
+// TestLFSAdoption_EvictedParkedLeaseIsNotReleased (Codex round 76):
+// evicting a parked resume entry under cache pressure discards the sha256
+// midstate — nothing can save the completed prefix then — but RELEASING
+// the victim's lease on top of that let the key's next retry win a fresh
+// claim on any replica and restart from offset zero immediately: cycling
+// more keys than the cache bound turned every eviction into a full
+// re-read. Eviction must have crash semantics instead: the orphaned lease
+// keeps denying every replica read-free until ref.AdoptionClaimTTL, so a
+// key restarts from zero at most once per TTL window regardless of cache
+// pressure.
+func TestLFSAdoption_EvictedParkedLeaseIsNotReleased(t *testing.T) {
+	ctx := context.Background()
+	oldMax := lfsMaxVerifyResumes
+	lfsMaxVerifyResumes = 1
+	t.Cleanup(func() { lfsMaxVerifyResumes = oldMax })
+
+	srv, st, _ := newLFSQuotaServer(t, 0, time.Hour)
+	keyA := blob.LFSKey(lfsTestRepoID, sha256Hex([]byte("evicted object")))
+	keyB := blob.LFSKey(lfsTestRepoID, sha256Hex([]byte("evictor object")))
+	claimedA, ownerA, err := st.TryAdoptionClaim(ctx, lfsTestRepoID, keyA)
+	if err != nil || !claimedA {
+		t.Fatalf("seed claim A = (%v, %v), want held", claimedA, err)
+	}
+	claimedB, ownerB, err := st.TryAdoptionClaim(ctx, lfsTestRepoID, keyB)
+	if err != nil || !claimedB {
+		t.Fatalf("seed claim B = (%v, %v), want held", claimedB, err)
+	}
+	h := sha256.New()
+	h.Write([]byte("prefix"))
+	srv.saveLFSVerifyResume(keyA, 10, 6, h, ownerA)
+	srv.saveLFSVerifyResume(keyB, 10, 6, h, ownerB) // cap 1: evicts A's entry
+	// Give any (buggy) async release a chance to land before asserting.
+	time.Sleep(200 * time.Millisecond)
+	if again, _, err := st.TryAdoptionClaim(ctx, lfsTestRepoID, keyA); err != nil || again {
+		t.Fatalf("claim on evicted key = (%v, %v), want denied — an evicted parked lease must be orphaned to its TTL, not released", again, err)
+	}
+	// The survivor's parked lease is untouched.
+	if again, _, err := st.TryAdoptionClaim(ctx, lfsTestRepoID, keyB); err != nil || again {
+		t.Fatalf("claim on surviving key = (%v, %v), want denied", again, err)
+	}
+}
+
+// failOnceRegisterStore fails the first adopted-object registration,
+// simulating a transient/contended ref store at commit time.
+type failOnceRegisterStore struct {
+	ref.RefStore
+	failed atomic.Bool
+}
+
+func (f *failOnceRegisterStore) RegisterAdoptedLFSObject(ctx context.Context, repo, key string, bytes int64) error {
+	if !f.failed.Swap(true) {
+		return fmt.Errorf("simulated registration failure")
+	}
+	return f.RefStore.RegisterAdoptedLFSObject(ctx, repo, key, bytes)
+}
+
+// TestLFSAdoption_CompletedHashSurvivesRegistrationFailure (Codex round
+// 76): a fully verified hash whose registration fails transiently was
+// discarded with the released claim — the next write-scoped touch
+// downloaded and hashed the ENTIRE object again just to retry the same
+// idempotent transaction, so a contended ref store repeatedly amplified
+// reads of large objects. The completed verification must be parked with
+// the lease: the retry skips straight to registration, re-reading nothing.
+func TestLFSAdoption_CompletedHashSurvivesRegistrationFailure(t *testing.T) {
+	ctx := context.Background()
+	oldChunk := lfsStagingChunk
+	lfsStagingChunk = 4
+	t.Cleanup(func() { lfsStagingChunk = oldChunk })
+
+	srv, st, mint := newLFSQuotaServer(t, 0, time.Hour)
+	tok := mint(auth.ScopeGitWrite)
+	legacy := []byte("legacy 12b!!") // three 4-byte chunks
+	oid := sha256Hex(legacy)
+	key := blob.LFSKey(lfsTestRepoID, oid)
+	if err := srv.Blob.UploadFile(ctx, key, writeTempFile(t, legacy)); err != nil {
+		t.Fatal(err)
+	}
+	srv.Store = &failOnceRegisterStore{RefStore: srv.Store}
+	bl := &stallOnceBlob{BlobStore: srv.Blob, stallOff: -1} // never stalls: pure read recorder
+	srv.Blob = bl
+
+	// Attempt 1: the hash completes, the registration fails.
+	resp := decodeBatch(t, doLFS(t, srv, http.MethodPost, lfsBatchPath, "basic:"+tok,
+		batchBody("upload", oid, int64(len(legacy)))))
+	if resp.Objects[0].Error == nil {
+		t.Fatalf("adoption with failed registration reported stored: %+v", resp.Objects[0])
+	}
+	// Attempt 2: converges by retrying the registration alone.
+	resp = decodeBatch(t, doLFS(t, srv, http.MethodPost, lfsBatchPath, "basic:"+tok,
+		batchBody("upload", oid, int64(len(legacy)))))
+	if resp.Objects[0].Error != nil || resp.Objects[0].Actions != nil {
+		t.Fatalf("registration retry failed: %+v", resp.Objects[0])
+	}
+	if has, err := st.HasLFSObject(ctx, lfsTestRepoID, key); err != nil || !has {
+		t.Fatalf("object not adopted: %v, %v", has, err)
+	}
+	bl.mu.Lock()
+	defer bl.mu.Unlock()
+	if want := (len(legacy) + 3) / 4; len(bl.reads) != want {
+		t.Fatalf("%d ranged reads across both attempts (offsets: %v), want %d — a completed hash must not replay for a registration retry", len(bl.reads), bl.reads, want)
 	}
 }
 

@@ -645,6 +645,13 @@ func (s *Server) adoptLFSObjectLocked(ctx context.Context, repoID, key, oid stri
 func (s *Server) adoptLFSObject(ctx context.Context, repoID, key, oid string) error {
 	registered, err := s.Store.HasLFSObject(ctx, repoID, key)
 	if err != nil || registered {
+		if registered {
+			// A prior attempt's registration may have committed after
+			// its bounded context expired (indeterminate failure), with
+			// the lease parked for a retry that now has nothing to do
+			// (Codex round 76): free the memo and its lease.
+			s.dropLFSVerifyResume(key)
+		}
 		return err
 	}
 	// Fast-fail the object cap BEFORE the verification download (Codex
@@ -828,6 +835,12 @@ func (s *Server) adoptLFSObject(ctx context.Context, repoID, key, oid string) er
 	regCtx, regCancel := context.WithTimeout(context.WithoutCancel(ctx), lfsCleanupTimeout)
 	defer regCancel()
 	if err := s.Store.RegisterAdoptedLFSObject(regCtx, repoID, key, verifiedSize); err != nil {
+		// The hash COMPLETED — only the idempotent registration failed
+		// (Codex round 76). Park the lease with a completed-verification
+		// memo: the retry skips straight back to this transaction instead
+		// of re-downloading the whole object, so a transiently contended
+		// ref store cannot amplify backend reads of large objects.
+		s.saveLFSVerifiedResume(key, verifiedSize, claimOwner)
 		return err
 	}
 	s.invalidateUsageFloor(repoID)
@@ -928,6 +941,15 @@ func (s *Server) verifyStoredLFSObject(ctx context.Context, repo, key, oid, clai
 	h := sha256.New()
 	var off int64
 	if r, ok := s.takeLFSVerifyResume(key, size); ok {
+		if r.verified {
+			// A prior attempt fully hashed these bytes and only its
+			// registration failed (Codex round 76): the digest matched
+			// over exactly size bytes — same size re-checked by take —
+			// and the key is content-addressed, so the retry's work is
+			// the registration alone. A replaced blob at a different
+			// size discards the memo (take) and re-verifies in full.
+			return size, nil
+		}
 		if u, uok := h.(encoding.BinaryUnmarshaler); uok && u.UnmarshalBinary(r.state) == nil {
 			off = r.off
 		} else {
@@ -1030,12 +1052,19 @@ type lfsVerifyResume struct {
 	// renews the token and resumes; a parked lease nobody retries
 	// expires via ref.AdoptionClaimTTL exactly like a crashed winner's.
 	owner string
+	// verified marks a COMPLETED verification (off == size, no midstate)
+	// whose registration failed (Codex round 76): the digest matched
+	// over exactly size bytes and the key is content-addressed, so the
+	// retry's remaining work is the idempotent registration alone —
+	// re-reading the object would amplify backend reads every time the
+	// ref store is transiently contended at commit time.
+	verified bool
 }
 
-// lfsMaxVerifyResumes bounds the resume cache (arbitrary eviction beyond
-// it). Entries are a few hundred bytes; the cap only exists so unbounded
-// distinct aborting keys cannot grow replica memory.
-const lfsMaxVerifyResumes = 128
+// lfsMaxVerifyResumes bounds the resume cache (eviction beyond it, see
+// saveLFSVerifyResume). Entries are a few hundred bytes; the cap only
+// exists so unbounded distinct aborting keys cannot grow replica memory.
+var lfsMaxVerifyResumes = 128
 
 // saveLFSVerifyResume records a verification's progress for the key so
 // the next attempt can continue after the completed ranges. A non-empty
@@ -1051,25 +1080,58 @@ func (s *Server) saveLFSVerifyResume(key string, size, off int64, h hash.Hash, o
 	if err != nil {
 		return
 	}
+	s.putLFSVerifyResume(key, lfsVerifyResume{size: size, off: off, state: state, owner: owner})
+}
+
+// saveLFSVerifiedResume parks a COMPLETED verification whose registration
+// failed (Codex round 76): the retry consumes it to skip straight back to
+// the idempotent registration instead of re-reading the whole object.
+func (s *Server) saveLFSVerifiedResume(key string, size int64, owner string) {
+	assertf(size >= 0, "saveLFSVerifiedResume(%q): size %d", key, size)
+	s.putLFSVerifyResume(key, lfsVerifyResume{size: size, off: size, verified: true, owner: owner})
+}
+
+// putLFSVerifyResume inserts one resume entry, evicting beyond the cache
+// bound. Eviction prefers entries with NO parked lease, and NEVER releases
+// a parked victim's lease (Codex round 76): releasing let the evicted
+// key's next retry win a fresh claim on any replica and restart from
+// offset zero immediately — cycling more failure-prone keys than the cap
+// turned every eviction into a full re-read. The orphaned lease instead
+// keeps denying every replica READ-FREE until ref.AdoptionClaimTTL — crash
+// semantics — so a key restarts from zero at most once per TTL window
+// regardless of cache pressure.
+func (s *Server) putLFSVerifyResume(key string, r lfsVerifyResume) {
 	s.lfsVerifyResumeMu.Lock()
 	defer s.lfsVerifyResumeMu.Unlock()
 	if s.lfsVerifyResumes == nil {
 		s.lfsVerifyResumes = make(map[string]lfsVerifyResume)
 	}
 	if _, exists := s.lfsVerifyResumes[key]; !exists && len(s.lfsVerifyResumes) >= lfsMaxVerifyResumes {
-		for k, victim := range s.lfsVerifyResumes {
-			delete(s.lfsVerifyResumes, k) // arbitrary eviction: resume is an accelerant, not a contract
-			if victim.owner != "" {
-				// The victim parked a live lease and this eviction just
-				// discarded the only copy of its owner token: unlock the
-				// key for the fleet instead of burning the rest of the
-				// 30-minute TTL with a holder nobody can resume.
-				go s.releaseAdoptionClaim(k, victim.owner)
+		victim := ""
+		for k, v := range s.lfsVerifyResumes {
+			victim = k
+			if v.owner == "" {
+				break
 			}
-			break
 		}
+		delete(s.lfsVerifyResumes, victim)
 	}
-	s.lfsVerifyResumes[key] = lfsVerifyResume{size: size, off: off, state: state, owner: owner}
+	s.lfsVerifyResumes[key] = r
+}
+
+// dropLFSVerifyResume discards the key's saved verification state, if any,
+// releasing a lease parked with it — used once the key is registered and
+// the memo can never be consumed (Codex round 76: an indeterminate
+// registration timeout can commit AFTER parking the lease for a retry that
+// then early-outs on the registered row).
+func (s *Server) dropLFSVerifyResume(key string) {
+	s.lfsVerifyResumeMu.Lock()
+	r, ok := s.lfsVerifyResumes[key]
+	delete(s.lfsVerifyResumes, key)
+	s.lfsVerifyResumeMu.Unlock()
+	if ok && r.owner != "" {
+		s.releaseAdoptionClaim(key, r.owner)
+	}
 }
 
 // takeParkedLFSClaimOwner consumes the lease owner parked with the key's
