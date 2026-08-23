@@ -7,7 +7,7 @@ import (
 
 // internalErrorMsg is the only 500 body clients ever see: raw error strings
 // (often verbatim DB/driver output) are logged server-side, never leaked
-// onto the wire (docs/03: clients branch on status codes only).
+// onto the wire (docs/reference/http-api.md: clients branch on status codes only).
 const internalErrorMsg = "internal error"
 
 // internalErr logs the real error with request context and writes the
@@ -20,13 +20,13 @@ func (s *server) internalErr(w http.ResponseWriter, r *http.Request, op string, 
 }
 
 // errorEnvelope is the wire error shape: {"error": "<unstable human string>"}
-// (docs/03). Clients branch on status codes only, never on the message.
+// (docs/reference/http-api.md). Clients branch on status codes only, never on the message.
 type errorEnvelope struct {
 	Error string `json:"error"`
 }
 
 // writeErr writes the {"error": msg} envelope with the given status.
-// 401 responses additionally carry `WWW-Authenticate: Bearer` (docs/02).
+// 401 responses additionally carry `WWW-Authenticate: Bearer` (docs/reference/authentication.md).
 func writeErr(w http.ResponseWriter, status int, msg string) {
 	assertf(status >= 400 && status < 600, "writeErr called with non-error status %d", status)
 	assertf(msg != "", "writeErr called with empty message")
@@ -46,7 +46,7 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-// statusForHTTP maps an HTTP failure code onto the docs/04 result-envelope
+// statusForHTTP maps an HTTP failure code onto the docs/explanation/streaming-commit-protocols.md result-envelope
 // status string the SDKs convert into typed RefUpdateErrors. This is the
 // single authoritative table for the write surface (wcFail, wmFailConflict,
 // wrefNoteFail); an unmapped code is a programming error and fails fast.
@@ -63,7 +63,7 @@ func statusForHTTP(httpStatus int) string {
 	case http.StatusPreconditionFailed:
 		return "precondition_failed"
 	case http.StatusTooManyRequests:
-		return "unavailable" // docs/03: rate limit ("unavailable" to ref-update clients)
+		return "unavailable" // docs/reference/http-api.md: rate limit ("unavailable" to ref-update clients)
 	case http.StatusInternalServerError:
 		return "internal"
 	default:

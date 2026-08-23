@@ -7,7 +7,7 @@ import (
 	"strconv"
 )
 
-// Sign computes the docs/06 delivery signature header value for one
+// Sign computes the docs/reference/webhooks.md delivery signature header value for one
 // attempt: hex(HMAC-SHA256(secret, "<ts>." + body)) rendered as
 // "t=<ts>,sha256=<hex>". Receivers reject timestamps older than ~300s, so
 // callers must sign with the send-time timestamp on EVERY attempt

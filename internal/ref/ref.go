@@ -65,7 +65,7 @@ type Pack struct {
 }
 
 // RefInfo is one ref row with its metadata. CreatedAt is the row's creation
-// time (docs/03 branches[].created_at): set on first insert, preserved
+// time (docs/reference/http-api.md branches[].created_at): set on first insert, preserved
 // across SHA updates, and reset when a ref is deleted and recreated.
 type RefInfo struct {
 	Name      string

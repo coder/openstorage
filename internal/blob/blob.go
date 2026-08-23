@@ -126,7 +126,7 @@ func PackPrefix(repo string) string { return PacksRoot + repo + "/" }
 // memory.
 const packUsagePageSize = 1000
 
-// packNamespaceSuffixes are the docs/05 namespace suffixes a repo key may
+// packNamespaceSuffixes are the docs/explanation/git-protocol-and-namespaces.md namespace suffixes a repo key may
 // carry. Each namespace has its own pack PREFIX (storage isolation), but
 // quota accounting rolls all of them up under the base repo: auth strips
 // the suffix, so one git:write token can push to base, +ephemeral, and
@@ -135,7 +135,7 @@ const packUsagePageSize = 1000
 var packNamespaceSuffixes = []string{"+ephemeral", "+import"}
 
 // QuotaRepoGroup returns repo's quota accounting group: the BASE repository
-// first (suffix stripped), then every docs/05 namespace that rolls up under
+// first (suffix stripped), then every docs/explanation/git-protocol-and-namespaces.md namespace that rolls up under
 // it. The ref-store quota ledger (issue #29) keys reservations under
 // group[0] and sums usage over the whole group, mirroring StorageUsageBytes'
 // rollup so both usage sources measure the same unit.
@@ -215,7 +215,7 @@ func usageBytes(ctx context.Context, b BlobStore, repo string, prefixes []string
 }
 
 // LFSKey is the immutable object key for a repo's LFS object with the given
-// sha256 oid. Keys are repo-scoped (docs/05): forks inherit LFS pointers
+// sha256 oid. Keys are repo-scoped (docs/explanation/git-protocol-and-namespaces.md): forks inherit LFS pointers
 // only, never the objects, which this keying yields automatically.
 func LFSKey(repoID, oid string) string {
 	assertf(repoID != "" && oid != "", "LFSKey(%q, %q)", repoID, oid)

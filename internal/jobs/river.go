@@ -20,7 +20,7 @@ import (
 )
 
 // deliveryArgs is one durable webhook-delivery job. The payload is the
-// exact JSON body frozen at enqueue time (docs/06: only the signature is
+// exact JSON body frozen at enqueue time (docs/reference/webhooks.md: only the signature is
 // recomputed per attempt).
 type deliveryArgs struct {
 	WebhookID string          `json:"webhook_id"`
@@ -39,6 +39,14 @@ func (deliveryArgs) InsertOpts() river.InsertOpts {
 // duplicate insert); completed runs are excluded so later pushes can
 // re-sync. The run itself owns retries/outcomes (sync.Worker), so a job
 // executes at most once.
+//
+// Uniqueness including the running state (river requires running in
+// ByState) swallows pull-upstream requests that arrive while a run is in
+// flight — but that run's upstream fetch may already be behind the
+// request's causally-later upstream state (issue #79). The producer
+// therefore marks the request durable first (RequestSync), and the worker
+// completes its job transactionally with a gated successor insert — see
+// syncWorker.Work for the gate and the swallowed-request coverage argument.
 type syncArgs struct {
 	Org    string `json:"org"`
 	RepoID string `json:"repo_id" river:"unique"`
@@ -284,19 +292,126 @@ func (w *deliveryWorker) Work(ctx context.Context, job *river.Job[deliveryArgs])
 	return err
 }
 
+// syncFollowUpSnooze delays the retry of a failed sync completion
+// transaction (mirrors repackFollowUpDelay for the analogous repack gate).
+const syncFollowUpSnooze = 5 * time.Second
+
 // syncWorker executes one sync run. Run's error return is for logging only
 // (documented failure outcomes already emitted repo.sync.failed), so the
-// job always completes.
+// job always completes — through the gated transactional completion below,
+// which closes the uniqueness window for pull-upstream requests (issue #79).
 type syncWorker struct {
 	river.WorkerDefaults[syncArgs]
-	run    SyncRunner
-	logger *slog.Logger
+	run       SyncRunner
+	upstreams sync.UpstreamStore
+	pool      *pgxpool.Pool
+	logger    *slog.Logger
 }
 
+// Work runs one sync, then completes the job and inserts a GATED successor
+// in one transaction, exactly like repackWorker.Work: syncArgs uniqueness
+// must include the running state (river requires it), so a pull-upstream
+// insert while this job runs is deduplicated against it even though this
+// run's upstream fetch may already have happened — the request's only
+// follow-up is the successor inserted here. The producer marks the request
+// durable first (UpstreamStore.RequestSync sets SyncPending; the claim in
+// BeginSync consumes it), so the gate is a durable, re-checkable condition.
+//
+// Swallowed-request coverage (repackWorker's argument, adapted): a
+// pull-upstream insert deduplicated BEFORE the completion transaction
+// vacates this job's unique-index entry implies its RequestSync committed
+// earlier still, so the post-completion pending read (ordered strictly
+// after JobCompleteTx) observes it — pending ⇒ successor. An insert
+// arriving DURING the transaction blocks on the entry this row is vacating
+// and proceeds after commit: it either deduplicates against the
+// just-inserted successor (whose claim-and-fetch are still in the future,
+// so it covers the request) or, when the gate scheduled nothing, inserts
+// its own job. No ordering strands a request.
+//
+// The RunCount half of the gate keeps successor chains bounded: a job that
+// never claimed (skip on ErrSyncInProgress) leaves the counters untouched
+// and schedules nothing — a skip implies the claim holder was live after
+// this job's pre-read, so the holder's own gated completion covers
+// concurrent requests. A run that FAILED before claiming is different: a
+// pending marker with no counted run and no claim holder has no coverage
+// at all, so completing would strand the accepted request — that case
+// SNOOZES the job to retry the whole run (which then claims and consumes
+// the marker), mirroring the transient-failure retry the completion path
+// already uses.
 func (w *syncWorker) Work(ctx context.Context, job *river.Job[syncArgs]) error {
-	if err := w.run(ctx, sync.Job{Org: job.Args.Org, RepoID: job.Args.RepoID, Ref: job.Args.Ref}); err != nil {
+	// Pre-run baseline: RunCount changing across this job proves a claimed
+	// run completed while it was active. A failed read degrades to
+	// preKnown=false, which the gate treats conservatively (schedule when
+	// pending — the successor's claim consumes the marker, so a stale flag
+	// cannot chain runs).
+	preRuns, preKnown := 0, false
+	switch up, err := w.upstreams.GetUpstream(ctx, job.Args.RepoID); {
+	case err == nil:
+		preRuns, preKnown = up.RunCount, true
+	case !errors.Is(err, sync.ErrNotFound):
+		w.logger.Warn("sync: pre-run upstream read failed",
+			"repo", job.Args.RepoID, "err", err)
+	}
+
+	runErr := w.run(ctx, sync.Job{Org: job.Args.Org, RepoID: job.Args.RepoID, Ref: job.Args.Ref})
+	if runErr != nil {
 		w.logger.Warn("sync run finished with error",
-			"org", job.Args.Org, "repo", job.Args.RepoID, "err", err)
+			"org", job.Args.Org, "repo", job.Args.RepoID, "err", runErr)
+	}
+
+	assertf(w.pool != nil, "syncWorker: pool not wired")
+	// Failures anywhere in the completion transaction SNOOZE the job:
+	// returning nil would let river complete it without the gate ever
+	// running, stranding requests deduplicated against this job. The
+	// snoozed re-run costs one idempotent extra sync attempt (its
+	// BeginSync claim, or skip, is harmless) and retries the completion.
+	completionFailed := func(stage string, err error) error {
+		w.logger.Warn("sync: atomic completion failed; snoozing to retry it",
+			"repo", job.Args.RepoID, "stage", stage, "err", err)
+		return river.JobSnooze(syncFollowUpSnooze)
+	}
+	tx, err := w.pool.Begin(ctx)
+	if err != nil {
+		return completionFailed("begin", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := river.JobCompleteTx[*riverpgxv5.Driver](ctx, tx, job); err != nil {
+		return completionFailed("complete", err)
+	}
+	// The pending read runs strictly AFTER JobCompleteTx (see the coverage
+	// argument above) on the upstream store's own connection. A failed
+	// read must NOT commit the completion — treating it as not-pending
+	// would strand exactly the requests deduplicated against this job —
+	// so it snoozes like any other completion-transaction failure.
+	switch up, err := w.upstreams.GetUpstream(ctx, job.Args.RepoID); {
+	case errors.Is(err, sync.ErrNotFound):
+		// Detached mid-flight: nothing to follow up.
+	case err != nil:
+		return completionFailed("pending recheck", err)
+	case up.SyncPending && runErr != nil && preKnown && up.RunCount == preRuns:
+		// The run failed without counting a run: either it never claimed
+		// (transient lookup/store error) or it claimed and could not
+		// finish even through finishSync's detached retries. Completing
+		// would strand the accepted 202 — no successor exists and, with
+		// no counted run, no claim holder's gate is guaranteed to cover
+		// it. Snooze retries the whole run: once any live holder finishes
+		// (or the claim was never taken), the retry claims and consumes
+		// the marker. If the claim is truly wedged (crash-equivalent
+		// FinishSync exhaustion), the retry skips cleanly (runErr nil)
+		// and completes, degrading to the documented crash behavior
+		// instead of snoozing forever. (Returning without commit rolls
+		// the completion back.)
+		w.logger.Warn("sync: run failed with an uncovered pending request; snoozing to retry it",
+			"repo", job.Args.RepoID, "err", runErr)
+		return river.JobSnooze(syncFollowUpSnooze)
+	case up.SyncPending && (!preKnown || up.RunCount != preRuns):
+		if _, err := river.ClientFromContext[pgx.Tx](ctx).InsertTx(ctx, tx,
+			syncArgs{Org: job.Args.Org, RepoID: job.Args.RepoID}, nil); err != nil {
+			return completionFailed("insert successor", err)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return completionFailed("commit", err)
 	}
 	return nil
 }
@@ -316,15 +431,18 @@ var _ Queue = (*River)(nil)
 
 // NewRiver opens a dedicated pool on pgURL, applies the river migrations
 // (serve owns DDL, mirroring meta/ref InitSchema), and starts workers that
-// share the delivery/sync code with the local queue. A non-nil sweep
-// schedules the periodic orphan-pack sweep (run once on start, then every
-// Interval); nil disables it (hook subprocesses, tests without storage).
-// A non-nil repack registers the background-repack worker; nil rejects
-// EnqueueRepack (repacking disabled or not wired, e.g. insert-only hook
-// clients that must never fold).
-func NewRiver(ctx context.Context, pgURL string, deliverer *events.Deliverer, runSync SyncRunner, sweep *SweepSchedule, repack *Repacker, logger *slog.Logger) (*River, error) {
+// share the delivery/sync code with the local queue. upstreams is the
+// durable upstream-row store the sync worker's successor gate reads
+// (syncWorker.Work, issue #79). A non-nil sweep schedules the periodic
+// orphan-pack sweep (run once on start, then every Interval); nil disables
+// it (hook subprocesses, tests without storage). A non-nil repack registers
+// the background-repack worker; nil rejects EnqueueRepack (repacking
+// disabled or not wired, e.g. insert-only hook clients that must never
+// fold).
+func NewRiver(ctx context.Context, pgURL string, deliverer *events.Deliverer, runSync SyncRunner, upstreams sync.UpstreamStore, sweep *SweepSchedule, repack *Repacker, logger *slog.Logger) (*River, error) {
 	assertf(deliverer != nil, "NewRiver: nil deliverer")
 	assertf(runSync != nil, "NewRiver: nil sync runner")
+	assertf(upstreams != nil, "NewRiver: nil upstream store")
 	assertf(sweep == nil || (sweep.Sweeper != nil && sweep.Interval > 0),
 		"NewRiver: sweep schedule missing sweeper or interval: %+v", sweep)
 	assertf(logger != nil, "NewRiver: nil logger")
@@ -376,7 +494,7 @@ func NewRiver(ctx context.Context, pgURL string, deliverer *events.Deliverer, ru
 
 	workers := river.NewWorkers()
 	river.AddWorker(workers, &deliveryWorker{deliverer: deliverer})
-	river.AddWorker(workers, &syncWorker{run: runSync, logger: logger})
+	river.AddWorker(workers, &syncWorker{run: runSync, upstreams: upstreams, pool: pool, logger: logger})
 	if repack != nil {
 		river.AddWorker(workers, &repackWorker{repacker: repack, pool: pool})
 	}

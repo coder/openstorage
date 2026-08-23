@@ -18,7 +18,7 @@ import (
 )
 
 // Webhook CRUD surface. Endpoint management is NOT part of the public SDK
-// surface (docs/06: upstream handles it in the dashboard/control-plane), so
+// surface (docs/reference/webhooks.md: upstream handles it in the dashboard/control-plane), so
 // the OSS backend defines its own org-scoped routes, following the
 // git-credentials precedent: org-wide tokens with repo:write.
 //
@@ -40,9 +40,9 @@ type webhooksAPI struct {
 }
 
 // RegisterWebhookRoutes mounts the webhook CRUD routes on mux. All three
-// routes are org-level (docs/02: `repo` claim == "org") and require
+// routes are org-level (docs/reference/authentication.md: `repo` claim == "org") and require
 // repo:write, with the plain {"error"} envelope on failures — these are
-// management routes, not docs/04 ref-write routes, so requireAuth (not
+// management routes, not docs/explanation/streaming-commit-protocols.md ref-write routes, so requireAuth (not
 // requireAuthWrite) is correct.
 func RegisterWebhookRoutes(mux *http.ServeMux, verifier auth.Verifier, org string, store events.WebhookStore, guard events.TargetGuard, logger *slog.Logger, rl *rateLimiter) {
 	assertf(mux != nil, "RegisterWebhookRoutes: nil mux")
@@ -61,7 +61,7 @@ func RegisterWebhookRoutes(mux *http.ServeMux, verifier auth.Verifier, org strin
 }
 
 // internalErr mirrors server.internalErr: log the real error, answer with
-// the generic 500 envelope (docs/03: raw errors never reach the wire).
+// the generic 500 envelope (docs/reference/http-api.md: raw errors never reach the wire).
 func (h *webhooksAPI) internalErr(w http.ResponseWriter, r *http.Request, op string, err error) {
 	assertf(err != nil, "internalErr called with nil error")
 	assertf(op != "", "internalErr called with empty op")
@@ -102,7 +102,7 @@ func generateWebhookSecret() string {
 
 // handleCreate implements POST /api/v1/webhooks: register a delivery
 // endpoint for the org. The secret is optional; when omitted the server
-// generates one and returns it exactly once (docs/12 deviation style:
+// generates one and returns it exactly once (docs/archive/phases/12-phase3-implementation-notes.md deviation style:
 // 200, not 201).
 func (h *webhooksAPI) handleCreate(w http.ResponseWriter, r *http.Request) {
 	claims := mustClaims(r)

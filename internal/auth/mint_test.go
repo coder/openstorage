@@ -75,7 +75,7 @@ func TestPrivateKeyPEMRoundTrip(t *testing.T) {
 }
 
 // TestParsePrivateKeyPEM_SEC1 accepts the legacy "EC PRIVATE KEY" encoding
-// named in docs/02.
+// named in docs/reference/authentication.md.
 func TestParsePrivateKeyPEM_SEC1(t *testing.T) {
 	key := mustGenerateKey(t, "ES256").(*ecdsa.PrivateKey)
 	der, err := x509.MarshalECPrivateKey(key)

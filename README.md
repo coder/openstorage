@@ -77,7 +77,7 @@ go build ./cmd/codestorage && ./codestorage version
 
 **Runtime dependencies:** the server shells out to `git` (always) and to `gpg` /
 `ssh-keygen` (only for `verify-sig` ref policies, which fail closed without them —
-[ADR-9](docs/10-phase2-implementation-notes.md#adr-9-verify-sig-delegates-to-gits-own-verification-machinery),
+[ADR-9](docs/adr/009-verify-sig-delegates-to-gits-own-verification-machinery.md),
 [#50](https://github.com/coder/code-storage/issues/50)). The Docker image carries all
 three; a bare binary brings none — install them on the host.
 
@@ -113,8 +113,8 @@ cd demo && git -c user.name=demo -c user.email=demo@example.com \
 
 The derivation fills only slots not set explicitly — `CODESTORAGE_PG_URL`,
 `CODESTORAGE_S3_URL`, and `--cache-dir` always win. Local mode is intentionally
-single-node (ADR-13 in
-[docs/11](docs/11-local-backends-implementation-notes.md)); the same binary and data
+single-node
+([ADR-13](docs/adr/013-local-mode-is-intentionally-single-node.md)); the same binary and data
 survive restarts, so it doubles as a tiny durable git server.
 
 ## Quickstart: multi-node with Docker Compose
@@ -162,20 +162,20 @@ published ports ([configuration reference](docs/reference/configuration.md)).
 
 - **Full read surface** (`git:read`): files, branches, tags, commits, diff, blame, grep,
   notes, archive — cursor pagination, conditional/range file streaming
-  ([docs/03](docs/03-http-api.md)).
+  ([HTTP API](docs/reference/http-api.md)).
 - **Full write surface** (`git:write`): NDJSON commit-pack / diff-commit streaming,
   restore-commit, merge with read-only preview, branch/tag/notes writes — compare-and-swap
-  and ref policies everywhere ([docs/04](docs/04-streaming-commit-protocols.md)).
+  and ref policies everywhere ([streaming protocols](docs/explanation/streaming-commit-protocols.md)).
 - **Production git smart-HTTP**: clone/push with ref-policy enforcement and
-  commit-signature verification ([docs/05](docs/05-git-protocol-and-namespaces.md)),
+  commit-signature verification ([git protocol](docs/explanation/git-protocol-and-namespaces.md)),
   behind the same per-org JWT verifier as the API
-  ([docs/02](docs/02-authentication.md)).
+  ([auth spec](docs/reference/authentication.md)).
 - **Git LFS on the same remote** — no separate LFS server: presigned S3/MinIO downloads
   (server-proxied in local mode) and verified, quota-metered server-proxied uploads
-  ([docs/05](docs/05-git-protocol-and-namespaces.md)).
+  ([git protocol](docs/explanation/git-protocol-and-namespaces.md)).
 - **Eventing & sync**: HMAC-signed `push` / `repo.sync.*` webhooks, webhook +
   git-credential CRUD, upstream mirror sync, synchronous forking
-  ([docs/06](docs/06-webhooks.md)).
+  ([webhooks](docs/reference/webhooks.md)).
 - **Both API path styles**: `/api/v1` (JWT-addressed) plus the named-repo aliases
   `/api/repos/{repo_name}/...` and `GET /api/repo-urls/{repo_id}`.
 - **Operations built in**: per-client-IP rate limiting, per-repo pack quotas with durable
@@ -207,8 +207,8 @@ legacy aliases — with defaults and validation constraints:
 | | Start here |
 |---|---|
 | **Tutorials** | The two quickstarts above |
-| **Reference** | [Configuration](docs/reference/configuration.md) · [CLI](docs/reference/cli.md) · [HTTP API](docs/03-http-api.md) · [Auth & JWT claims](docs/02-authentication.md) · [Webhooks](docs/06-webhooks.md) |
-| **Explanation** | [Wire compatibility with code.storage](docs/explanation/wire-compatibility.md) · [The storage engine](docs/explanation/storage-engine.md) · [Domain model](docs/01-domain-model.md) · [Git protocol & namespaces](docs/05-git-protocol-and-namespaces.md) · [Streaming commit protocols](docs/04-streaming-commit-protocols.md) · [Spec index & decision log](docs/README.md) |
+| **Reference** | [Configuration](docs/reference/configuration.md) · [CLI](docs/reference/cli.md) · [Testing](docs/reference/testing.md) · [HTTP API](docs/reference/http-api.md) · [Auth & JWT claims](docs/reference/authentication.md) · [Webhooks](docs/reference/webhooks.md) |
+| **Explanation** | [Wire compatibility with code.storage](docs/explanation/wire-compatibility.md) · [The storage engine](docs/explanation/storage-engine.md) · [Domain model](docs/explanation/domain-model.md) · [Git protocol & namespaces](docs/explanation/git-protocol-and-namespaces.md) · [Streaming commit protocols](docs/explanation/streaming-commit-protocols.md) · [Docs index](docs/README.md) · [Architecture decision records](docs/adr/README.md) |
 | **How-to** | [Deploy to production (multi-replica)](docs/how-to/deploy-production.md) · [Deploy a two-replica stack with Docker Compose](docs/how-to/deploy-docker-compose.md) · [Operate the storage lifecycle: repack, quotas, sweeping](docs/how-to/storage-lifecycle-and-sweeping.md) |
 
 ## Contributing & testing
@@ -220,16 +220,20 @@ go test ./...   # needs Docker: boots real Postgres + MinIO via testcontainers
 Zero-container lanes cover the same surfaces on the local backends: the api integration
 tests fan out into `/pg` + `/sqlite` subtests, and
 `CODESTORAGE_TEST_BACKEND=local go test ./internal/githttp` runs the full git e2e suite on
-`sqlite://` + `file://` (see [docs/11](docs/11-local-backends-implementation-notes.md) for
-the lane table).
+`sqlite://` + `file://`. Setup, lanes, lint, commit conventions, and the review bar:
+**[CONTRIBUTING.md](CONTRIBUTING.md)**; test lanes and the DST simulation harness in
+depth: **[testing reference](docs/reference/testing.md)**.
 
 <details>
 <summary>Repository layout</summary>
 
 | Path | Contents |
 |---|---|
-| `docs/` | Backend specification (wire formats, auth, protocols) + decision log |
-| `docs/reference/` | Operator reference: configuration, CLI |
+| `docs/` | Documentation, organized by [Diátaxis](https://diataxis.fr/) quadrant — start at the [index](docs/README.md) |
+| `docs/reference/` | Reference: configuration, CLI, testing, HTTP API, auth, webhooks |
+| `docs/explanation/` | Explanation: storage engine, wire compatibility, domain model, protocols |
+| `docs/adr/` | Standalone architecture decision records (ADR-1..40) |
+| `docs/archive/` | Historical roadmap + per-phase implementation notes |
 | `cmd/codestorage` | Service binary: `serve`, `hook`, `keygen`, `mint`, `signing-key`, `list-packs` |
 | `internal/api` | `/api/v1` HTTP handlers, JWT middleware, `{"error"}` envelope |
 | `internal/auth` | JWT verification contract (per-org public keys, allowed algorithms) |

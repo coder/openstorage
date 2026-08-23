@@ -1,4 +1,4 @@
-// Synchronous repo forking (docs/01 invariant 12, docs/03 POST /repos,
+// Synchronous repo forking (docs/explanation/domain-model.md invariant 12, docs/reference/http-api.md POST /repos,
 // phase-5 workstream E):
 //
 //	POST /api/v1/repos  repo:write  base_repo {provider: "code"|"code.storage",
@@ -102,14 +102,14 @@ func (s *server) handleForkRepo(w http.ResponseWriter, r *http.Request, verifier
 	// requireAuth(orgLevel=false) rejects empty/"org" repo claims with 403.
 	assertf(url != "" && url != auth.RepoClaimOrg, "fork: repo claim %q passed requireAuth", url)
 
-	// docs/02: ref policies apply to every HTTP write endpoint; malformed
+	// docs/reference/authentication.md: ref policies apply to every HTTP write endpoint; malformed
 	// policy claims fail closed exactly like the sibling creators.
 	if _, err := refPolicies(claims); err != nil {
 		writeErr(w, http.StatusForbidden, err.Error())
 		return
 	}
 
-	// The fork-source JWT (docs/01 invariant 12) authorizes reading the
+	// The fork-source JWT (docs/explanation/domain-model.md invariant 12) authorizes reading the
 	// source repo. Absent token: malformed request (400). A token that does
 	// not verify, is not repo-scoped, or lacks git:read: authorization
 	// failure on the source (403).
@@ -152,7 +152,7 @@ func (s *server) handleForkRepo(w http.ResponseWriter, r *http.Request, verifier
 		return
 	}
 
-	// Fork point (docs/03): sha overrides ref; default = the source's
+	// Fork point (docs/reference/http-api.md): sha overrides ref; default = the source's
 	// default branch. Everything unresolvable is invalid input (400).
 	point := spec.SHA
 	if point == "" {
@@ -196,7 +196,7 @@ func (s *server) handleForkRepo(w http.ResponseWriter, r *http.Request, verifier
 	}
 
 	// The fork's initial ref is a ref creation by the CALLER: their ref
-	// policies apply (docs/02, invariant 5). Creation is fast-forward by
+	// policies apply (docs/reference/authentication.md, invariant 5). Creation is fast-forward by
 	// definition, so no ancestry callback is needed.
 	forkRef := "refs/heads/" + branch
 	deny, err := wrefPolicyCheck(claims, forkRef, ref.ZeroSHA, forkSHA, nil)

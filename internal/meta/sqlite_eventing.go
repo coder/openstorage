@@ -54,7 +54,7 @@ func scanRepoUpstreamSQLite(row sqlRow) (RepoUpstream, error) {
 	var up RepoUpstream
 	var createdAt int64
 	if err := row.Scan(&up.RepoID, &up.Provider, &up.Owner, &up.Name, &up.UpstreamHost,
-		&up.RunCount, &up.SuccessCount, &up.Syncing, &createdAt); err != nil {
+		&up.RunCount, &up.SuccessCount, &up.Syncing, &up.SyncPending, &createdAt); err != nil {
 		return RepoUpstream{}, err
 	}
 	up.CreatedAt = time.Unix(0, createdAt).UTC()
@@ -334,16 +334,17 @@ func (s *SQLite) GitCredentialForRepo(ctx context.Context, repoID string) (GitCr
 }
 
 // SetRepoUpstream inserts the upstream row (CreatedAt assigned by the store;
-// counters/syncing zeroed). ErrAlreadyExists when the repo already has one.
+// counters/syncing/sync_pending zeroed). ErrAlreadyExists when the repo
+// already has one.
 func (s *SQLite) SetRepoUpstream(ctx context.Context, up RepoUpstream) (RepoUpstream, error) {
 	assertf(up.RepoID != "", "SetRepoUpstream: empty repo id")
 	nanos, createdAt := nowNano()
-	up.RunCount, up.SuccessCount, up.Syncing = 0, 0, false
+	up.RunCount, up.SuccessCount, up.Syncing, up.SyncPending = 0, 0, false, false
 	up.CreatedAt = createdAt
 	_, err := s.db.ExecContext(ctx,
 		`INSERT INTO repo_upstreams (repo_id, provider, owner, name, upstream_host,
-		        run_count, success_count, syncing, created_at)
-		 VALUES (?, ?, ?, ?, ?, 0, 0, 0, ?)`,
+		        run_count, success_count, syncing, sync_pending, created_at)
+		 VALUES (?, ?, ?, ?, ?, 0, 0, 0, 0, ?)`,
 		up.RepoID, up.Provider, up.Owner, up.Name, up.UpstreamHost, nanos)
 	// The only constraint on repo_upstreams is the repo_id PRIMARY KEY.
 	if isPrimaryKeyViolation(err) {
@@ -387,17 +388,40 @@ func (s *SQLite) DeleteRepoUpstream(ctx context.Context, repoID string) error {
 	return nil
 }
 
-// TryBeginSync atomically claims a sync run (syncing false -> true).
-// claimed=false with the current row when a run is already in flight;
-// ErrNotFound when detached. The BEGIN IMMEDIATE transaction makes the
-// claim-then-read pair atomic against concurrent claimers.
+// RequestSync marks a pending sync request; ErrNotFound when detached.
+// See the EventingStore contract (eventing.go) for the pending-flag
+// protocol (issue #79).
+func (s *SQLite) RequestSync(ctx context.Context, repoID string) error {
+	assertf(repoID != "", "RequestSync: empty repo id")
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE repo_upstreams SET sync_pending = 1 WHERE repo_id = ?`, repoID)
+	if err != nil {
+		return fmt.Errorf("request sync for repo %q: %w", repoID, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("request sync for repo %q: %w", repoID, err)
+	}
+	if n == 0 {
+		return fmt.Errorf("upstream for repo %q: %w", repoID, ErrNotFound)
+	}
+	assertf(n == 1, "UPDATE by primary key affected %d rows", n)
+	return nil
+}
+
+// TryBeginSync atomically claims a sync run (syncing false -> true) and
+// consumes sync_pending (the claimed run's fetch postdates every request
+// marked before the claim). claimed=false with the current row when a run
+// is already in flight; ErrNotFound when detached. The BEGIN IMMEDIATE
+// transaction makes the claim-then-read pair atomic against concurrent
+// claimers.
 func (s *SQLite) TryBeginSync(ctx context.Context, repoID string) (RepoUpstream, bool, error) {
 	assertf(repoID != "", "TryBeginSync: empty repo id")
 	var up RepoUpstream
 	var claimed bool
 	err := s.inTx(ctx, func(tx *sql.Tx) error {
 		res, err := tx.ExecContext(ctx,
-			`UPDATE repo_upstreams SET syncing = 1 WHERE repo_id = ? AND syncing = 0`, repoID)
+			`UPDATE repo_upstreams SET syncing = 1, sync_pending = 0 WHERE repo_id = ? AND syncing = 0`, repoID)
 		if err != nil {
 			return err
 		}

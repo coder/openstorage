@@ -1,5 +1,10 @@
 # Phase-7 Implementation Notes & ADRs (deployment packaging + p6 burn-down)
 
+> **Archived.** Historical implementation notes, kept verbatim as the project's build
+> history; decisions here may have been superseded by later work. For current
+> behavior, start at the [docs index](../../README.md); the ADRs recorded below are
+> individually addressable under [`docs/adr/`](../../adr/README.md).
+
 Phase 7 delivers the deployment-packaging deliverable that the p6 gate carried forward —
 a multi-stage `Dockerfile` and an opt-in two-replica compose profile, with quickstarts in
 the root `README.md` — plus the p6 deferred-findings burn-down. The burn-down closures

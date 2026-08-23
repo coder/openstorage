@@ -351,7 +351,7 @@ func commitFile(t *testing.T, dir, name, content, msg string, env []string, gitF
 
 // --- token helpers ---------------------------------------------------------
 
-// testClaims returns a fully populated docs/02 claim set for testOrg.
+// testClaims returns a fully populated docs/reference/authentication.md claim set for testOrg.
 func testClaims(repo, scopes string) auth.Claims {
 	now := time.Now()
 	return auth.Claims{
@@ -373,7 +373,7 @@ func mintWith(t *testing.T, key crypto.Signer, alg string, c auth.Claims) string
 	return token
 }
 
-// mintTestToken mints a testOrg ES256 token; refsJSON is the raw docs/02
+// mintTestToken mints a testOrg ES256 token; refsJSON is the raw docs/reference/authentication.md
 // tuple encoding ("" for no ref policies).
 func mintTestToken(t *testing.T, repo, scopes, refsJSON string) string {
 	t.Helper()
@@ -714,7 +714,7 @@ func TestCrashHeader_RefusedOutsideTestMode(t *testing.T) {
 	}
 }
 
-// --- docs/02 auth matrix (e2e) ----------------------------------------------
+// --- docs/reference/authentication.md auth matrix (e2e) ----------------------------------------------
 
 // TestAuth_Matrix drives the failure mapping end-to-end over real HTTP:
 // 401 for anything the Verifier rejects, 403 for valid-but-wrong tokens.
@@ -863,7 +863,7 @@ func TestRefPolicy_NoPushWildcard(t *testing.T) {
 	}
 }
 
-// docs/05: `+ephemeral` remotes see/update only the ephemeral ref space and
+// docs/explanation/git-protocol-and-namespaces.md: `+ephemeral` remotes see/update only the ephemeral ref space and
 // persistent remotes must not see ephemeral refs (separate ref stores).
 // Extended with promotion prep: fetching from `+ephemeral` and pushing the
 // same objects to a persistent branch is the client-side promotion flow.
@@ -924,7 +924,7 @@ func TestNamespace_EphemeralIsolated(t *testing.T) {
 	}
 }
 
-// docs/05 `+import` namespace: bulk history round-trips through its own
+// docs/explanation/git-protocol-and-namespaces.md `+import` namespace: bulk history round-trips through its own
 // isolated ref space (clone/push/fetch), invisible from the persistent
 // remote.
 func TestNamespace_ImportRoundTrip(t *testing.T) {
@@ -1026,7 +1026,7 @@ func TestForcePush_RejectedPerRef(t *testing.T) {
 
 // TestRefPolicy_NoForcePushDeniesDeletion: no-force-push must also reject
 // branch DELETION — ref policies are the only branch-protection mechanism
-// (docs/02), so allowing deletion would make the policy trivially
+// (docs/reference/authentication.md), so allowing deletion would make the policy trivially
 // bypassable (delete + re-push = force push). Unpoliced refs stay deletable.
 // The policed ref is deliberately NOT the repo HEAD: deleting HEAD is
 // rejected by git's own receive.denyDeleteCurrent before hooks run.
@@ -1320,7 +1320,7 @@ func apiJSON(t *testing.T, n *testNode, method, token, path, body string, out an
 func TestPatchDefaultBranch_CloneHEADFollows(t *testing.T) {
 	const repoURL = "t18-patch-default"
 	repoID := registerRepo(t, repoURL)
-	// One URL-claim token works on both surfaces (docs/02): the git path
+	// One URL-claim token works on both surfaces (docs/reference/authentication.md): the git path
 	// resolves the claim against the repo record, and the API accepts
 	// url-style claims directly.
 	token := mintTestToken(t, repoURL, "git:read,git:write,repo:write", "")

@@ -1,7 +1,7 @@
-// Branch, tag, and notes write endpoints (docs/07 p4 W3, docs/03):
+// Branch, tag, and notes write endpoints (docs/archive/phases/07-implementation-roadmap.md p4 W3, docs/reference/http-api.md):
 // POST /repos/branches/create, DELETE /repos/branches, POST/DELETE
 // /repos/tags, POST/DELETE /repos/notes — with default-branch delete
-// protection (docs/01 invariant 4, ephemeral exemption per invariant 7),
+// protection (docs/explanation/domain-model.md invariant 4, ephemeral exemption per invariant 7),
 // lightweight-tag peeling (invariant 10), notes add/append CAS via
 // expected_notes_ref_sha (invariant 1), and ref-policy enforcement on
 // every write (invariant 5). Aliased request-body fields (issue #17)
@@ -45,7 +45,7 @@ import (
 
 // registerWriteRefRoutes registers the W3 write endpoints on mux with the
 // same per-route auth middleware api.New uses. DELETE /repos/tags demands
-// BOTH git:read and git:write (docs/03, docs/12).
+// BOTH git:read and git:write (docs/reference/http-api.md, docs/archive/phases/12-phase3-implementation-notes.md).
 func (s *server) registerWriteRefRoutes(mux *http.ServeMux, verifier auth.Verifier, org string, rl *rateLimiter) {
 	assertf(mux != nil, "registerWriteRefRoutes: nil mux")
 	assertf(verifier != nil, "registerWriteRefRoutes: nil verifier")
@@ -104,14 +104,14 @@ func wrefRefName(branch string, ephemeral bool) string {
 	return "refs/heads/" + branch
 }
 
-// wrefValidBranchInput validates a request branch/tag name (docs/03: bare
+// wrefValidBranchInput validates a request branch/tag name (docs/reference/http-api.md: bare
 // name, never refs/-prefixed) with the same conservative rules as the
 // default-branch validator.
 func wrefValidBranchInput(name string) bool {
 	return !strings.HasPrefix(name, "refs/") && validBranchName(name)
 }
 
-// wrefPolicyCheck evaluates the token's ref policies (docs/02, invariant 5)
+// wrefPolicyCheck evaluates the token's ref policies (docs/reference/authentication.md, invariant 5)
 // for one CAS update against the STORED ref name, mirroring the git update
 // hook: no-push denies everything; no-force-push denies deletions and
 // non-fast-forward updates of existing refs; verify-sig lets deletions pass
@@ -507,7 +507,7 @@ type wrefDeleteTagResponse struct {
 
 // handleDeleteTag CAS-deletes a tag by its STORED ref value — for annotated
 // tags that is the tag object sha, so both lightweight and annotated tags
-// delete correctly without peeling (docs/03).
+// delete correctly without peeling (docs/reference/http-api.md).
 func (s *server) handleDeleteTag(w http.ResponseWriter, r *http.Request) {
 	repo, ok := s.resolveReadRepo(w, r)
 	if !ok {
@@ -587,7 +587,7 @@ type wrefNoteResponse struct {
 	Result     wrefNoteResult `json:"result"`
 }
 
-// wrefNoteFail writes the docs/03 note-write envelope with a failure result
+// wrefNoteFail writes the docs/reference/http-api.md note-write envelope with a failure result
 // (SDKs parse this body on every 4xx/5xx and raise typed RefUpdateErrors).
 // newRefSHA is the notes ref's current tip, or the zero sha when unborn.
 func wrefNoteFail(w http.ResponseWriter, httpStatus int, msg, sha, targetRef, baseCommit, newRefSHA string) {
@@ -606,7 +606,7 @@ func wrefNoteFail(w http.ResponseWriter, httpStatus int, msg, sha, targetRef, ba
 // wrefNotesRefName resolves the request `notes_ref` field (deprecated
 // alias `ref`) to a full notes ref: empty picks the default
 // refs/notes/commits, a bare name goes under refs/notes/, and a fully
-// qualified name must already live there (docs/03).
+// qualified name must already live there (docs/reference/http-api.md).
 func wrefNotesRefName(raw string) (string, error) {
 	if raw == "" {
 		return "refs/notes/commits", nil
@@ -663,7 +663,7 @@ func (s *server) wrefHandleNote(w http.ResponseWriter, r *http.Request, deleteNo
 	}
 	action := "remove"
 	if !deleteNote {
-		// docs/03 + openapi: action defaults to add; note text is required.
+		// docs/reference/http-api.md + openapi: action defaults to add; note text is required.
 		action = req.Action
 		if action == "" {
 			action = "add"

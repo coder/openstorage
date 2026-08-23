@@ -1,6 +1,6 @@
-// Read-endpoint handlers, query group (docs/07 p3 phases 2c/2d): commit and
+// Read-endpoint handlers, query group (docs/archive/phases/07-implementation-roadmap.md p3 phases 2c/2d): commit and
 // branch diffs (GET /repos/diff, GET /repos/branches/diff), blame, grep, and
-// tar.gz archive streaming. Contracts: docs/03, docs/01 (invariants + the
+// tar.gz archive streaming. Contracts: docs/reference/http-api.md, docs/explanation/domain-model.md (invariants + the
 // "consumers concatenate files[].raw" rule), docs/upstream/openapi.yaml.
 //
 // All git plumbing goes through internal/gitread over a cache repo
@@ -31,7 +31,7 @@ import (
 // `filtered_files` (no raw/counts) unless the request narrowed the diff to
 // explicit `path` params, which bypasses size filtering (openapi: "Repeated
 // path filters ... bypass the usual large-file filtering for those requested
-// paths"). Neither docs/03 nor openapi pin an exact number; 1 MiB matches
+// paths"). Neither docs/reference/http-api.md nor openapi pin an exact number; 1 MiB matches
 // the "review-oriented" intent of the filtered example (50 KB lockfile).
 const maxInlineDiffBytes = 1 << 20
 
@@ -118,8 +118,8 @@ type diffStatsPayload struct {
 	Changes   int `json:"changes"`
 }
 
-// fileDiffEntry is the docs/03 FileDiff wire shape. Raw always carries the
-// full per-file `diff --git` patch (docs/01:93-95: consumers concatenate
+// fileDiffEntry is the docs/reference/http-api.md FileDiff wire shape. Raw always carries the
+// full per-file `diff --git` patch (docs/explanation/domain-model.md:93-95: consumers concatenate
 // raws directly, and gitApplyCompatible=true concatenations must pass
 // `git apply`) — byte-exact `git diff` output satisfies both modes, so the
 // gitApplyCompatible flag is validated but does not alter formatting.
@@ -683,7 +683,7 @@ type grepPosition struct {
 }
 
 // handleGrep implements POST /api/v1/repos/grep: synchronous git grep at
-// the resolved ref (docs/01 allows strictly-fresher-than-index synchronous
+// the resolved ref (docs/explanation/domain-model.md allows strictly-fresher-than-index synchronous
 // results). Limits truncate the collected result (incomplete_results);
 // pagination pages through the truncated set with a commit-anchored keyset
 // cursor, so every page reflects one commit.

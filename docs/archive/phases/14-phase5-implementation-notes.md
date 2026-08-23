@@ -1,5 +1,10 @@
 # Phase-5 Implementation Notes & ADRs (eventing, upstream sync, credentials, fork)
 
+> **Archived.** Historical implementation notes, kept verbatim as the project's build
+> history; decisions here may have been superseded by later work. For current
+> behavior, start at the [docs index](../../README.md); the ADRs recorded below are
+> individually addressable under [`docs/adr/`](../../adr/README.md).
+
 Phase 5 delivers the docs/06 outbound-webhook surface (`internal/events`), upstream mirror
 sync with the loopback-push worker (`internal/sync`, `internal/api/handlers_sync.go`),
 git-credential and webhook CRUD (`handlers_credentials.go`, `handlers_webhooks.go`), and
@@ -140,7 +145,7 @@ reads are scoped to the sync worker. Revisit when a KMS/keystore seam exists.
 
 **Amended by [#54](https://github.com/coder/code-storage/issues/54):** the environment is
 now that seam. Optional
-[`CODESTORAGE_SECRETS_KEY`](reference/configuration.md#codestorage_secrets_key)
+[`CODESTORAGE_SECRETS_KEY`](../../reference/configuration.md#codestorage_secrets_key)
 envelope-encrypts both columns (AES-256-GCM, `enc:v1:` marker, comma-separated key list
 with first-key-encrypts rotation) inside `internal/meta` — encrypt-on-write, fail-closed
 decrypt-on-read, lazy re-encryption of legacy plaintext rows. Unset preserves this ADR's

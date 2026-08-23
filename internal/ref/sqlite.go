@@ -73,7 +73,7 @@ func (s *SQLite) InitSchema(ctx context.Context) error {
 	}
 	defer func() { _ = tx.Rollback() }()
 	for _, stmt := range []string{
-		// refs.created_at is INTEGER unix seconds (docs/03
+		// refs.created_at is INTEGER unix seconds (docs/reference/http-api.md
 		// branches[].created_at); CASRef sets it explicitly on insert so
 		// rows are correct even on databases migrated by the ALTER below
 		// (SQLite cannot ADD COLUMN with a non-constant default).

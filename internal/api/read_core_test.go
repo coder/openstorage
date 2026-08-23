@@ -1,6 +1,6 @@
 package api
 
-// Contract integration tests for the core git:read endpoints (docs/07 p3
+// Contract integration tests for the core git:read endpoints (docs/archive/phases/07-implementation-roadmap.md p3
 // phases 2a/2b): GET /repos/branches, /repos/tags, /repos/commits,
 // /repos/commit, /repos/files, /repos/files/metadata, and GET+HEAD
 // /repos/file. Wired through runBackends so the pg and sqlite lanes assert

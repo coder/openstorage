@@ -29,7 +29,7 @@ func assertf(cond bool, format string, args ...any) {
 }
 
 // MaxDeliveryAttempts bounds webhook delivery retries on both backends
-// (docs/06: capped exponential backoff, then discard).
+// (docs/reference/webhooks.md: capped exponential backoff, then discard).
 const MaxDeliveryAttempts = 10
 
 // Queue schedules background work. Enqueue methods are safe for concurrent
@@ -42,7 +42,11 @@ type Queue interface {
 	// EnqueueSync schedules one upstream sync run for job.RepoID. Runs for
 	// the same repo are deduplicated while queued (River unique jobs /
 	// in-process coalescing); overlap with an in-flight run is handled by
-	// the store's TryBeginSync claim (invariant 11).
+	// the store's TryBeginSync claim (invariant 11). Deduplication against
+	// a run that already claimed can drop the enqueue (issue #79): callers
+	// that promise the sync (pull-upstream 202) mark the request first via
+	// UpstreamStore.RequestSync, and the in-flight run's finisher schedules
+	// the coalesced follow-up run.
 	EnqueueSync(ctx context.Context, job sync.Job) error
 	// EnqueueRepack schedules one background repack of repo's registered
 	// packs (issue #1). Jobs for the same repo are deduplicated while

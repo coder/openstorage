@@ -21,7 +21,7 @@ func encodeCursor(createdAt time.Time, repoID string) string {
 }
 
 // decodeCursor parses an opaque cursor back into its keyset position.
-// Any malformed input maps onto ErrInvalidCursor (docs/03: 400).
+// Any malformed input maps onto ErrInvalidCursor (docs/reference/http-api.md: 400).
 func decodeCursor(cursor string) (time.Time, string, error) {
 	assertf(cursor != "", "decodeCursor: empty cursor (caller must skip keyset predicate)")
 	raw, err := base64.RawURLEncoding.DecodeString(cursor)

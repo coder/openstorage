@@ -1,7 +1,7 @@
 // codestorage is the service binary: `serve` runs a stateless node exposing
 // the /api/v1 HTTP API (single-org self-host mode) and the git smart-HTTP
 // path; `hook` is re-exec'd by git as pre-receive/update hooks;
-// `signing-key` manages the org's commit-signing key registry (docs/02
+// `signing-key` manages the org's commit-signing key registry (docs/reference/authentication.md
 // verify-sig); keygen/mint/list-packs are local dogfooding helpers.
 //
 // Configuration comes from CODESTORAGE_* environment variables, with the
@@ -41,7 +41,7 @@ func main() {
 	case "serve":
 		err = cmdServe(ctx, os.Args[2:])
 	case "hook":
-		// Eventing wiring for the git surface (docs/06): decorate the
+		// Eventing wiring for the git surface (docs/reference/webhooks.md): decorate the
 		// update hook's ref store so won pushes emit push events. No-op
 		// (identity default) when the serve env is absent.
 		hookCleanup := wireHookEventing(ctx, slogForHook())
@@ -188,9 +188,9 @@ func cmdServe(ctx context.Context, args []string) error {
 	srv.LFSStagingBytes = cfg.lfsStagingBytes
 	srv.MaxPushBytes = cfg.maxPushBytes
 	srv.VerifySigBudget = cfg.verifySigBudget
-	// docs/05 git URLs address repos by repo_id (name-style urls accepted
+	// docs/explanation/git-protocol-and-namespaces.md git URLs address repos by repo_id (name-style urls accepted
 	// too, ADR-21); the resolved RepoID is the only storage key, and the
-	// record backs claim matching for url- or id-carrying tokens (docs/02).
+	// record backs claim matching for url- or id-carrying tokens (docs/reference/authentication.md).
 	org := cfg.org
 	srv.ResolveRepo = func(ctx context.Context, base string) (meta.Repo, bool) {
 		repo, err := meta.ResolveRepoKey(ctx, metaStore, org, base)
@@ -325,7 +325,7 @@ func cmdMint(args []string) error {
 	return nil
 }
 
-// mintToken signs a docs/02 claim set with the private key at keyPath.
+// mintToken signs a docs/reference/authentication.md claim set with the private key at keyPath.
 // alg == "" infers the algorithm from the key type; refsJSON, when given,
 // must decode as ordered [pattern, ops] tuples (validated here so a typo
 // fails at mint time, not as a mid-push policy error).

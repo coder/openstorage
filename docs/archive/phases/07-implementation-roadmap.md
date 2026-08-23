@@ -1,5 +1,10 @@
 # Implementation Roadmap & Conformance Strategy
 
+> **Archived.** Historical implementation notes, kept verbatim as the project's build
+> history; decisions here may have been superseded by later work. For current
+> behavior, start at the [docs index](../../README.md); the ADRs recorded below are
+> individually addressable under [`docs/adr/`](../../adr/README.md).
+
 ## Architecture sketch
 
 ```

@@ -1,6 +1,6 @@
 package githttp
 
-// Unit tests for the LFS Batch API (docs/05): auth mapping (Basic and
+// Unit tests for the LFS Batch API (docs/explanation/git-protocol-and-namespaces.md): auth mapping (Basic and
 // Bearer), batch validation, the proxy transfer round-trip over the
 // fileblob backend (no presign support), and the presigned-href path via a
 // stub store. Reuses the server_test.go auth scaffolding.
@@ -266,7 +266,7 @@ func TestLFS_ProxyUploadHashMismatch(t *testing.T) {
 	}
 }
 
-// TestLFS_NamespaceSharesObjects pins the docs/05 keying: `+ephemeral`
+// TestLFS_NamespaceSharesObjects pins the docs/explanation/git-protocol-and-namespaces.md keying: `+ephemeral`
 // paths resolve to the same base-RepoID LFS space, and proxy hrefs preserve
 // the namespaced path element.
 func TestLFS_NamespaceSharesObjects(t *testing.T) {

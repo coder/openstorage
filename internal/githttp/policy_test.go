@@ -1,6 +1,6 @@
 package githttp
 
-// E2E matrix for the docs/02 ref-policy engine on the receive path:
+// E2E matrix for the docs/reference/authentication.md ref-policy engine on the receive path:
 // verify-sig (SSH + OpenPGP, delegated to `git verify-commit`), the
 // deprecated repo-wide `ops` fallback, the trailing-glob pattern contract,
 // and the ephemeral-namespace policy quirk (branch-protection.md).
@@ -210,7 +210,7 @@ func TestVerifySig_GPG(t *testing.T) {
 	}
 }
 
-// TestOpsFallback enforces the deprecated repo-wide `ops` claim per docs/02:
+// TestOpsFallback enforces the deprecated repo-wide `ops` claim per docs/reference/authentication.md:
 // standalone it acts as a catch-all rule; combined with `refs` it only fills
 // the gap left by refs (fold, not additive), preserving first-match-wins.
 func TestOpsFallback(t *testing.T) {

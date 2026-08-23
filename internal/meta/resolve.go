@@ -6,10 +6,10 @@ import (
 	"fmt"
 )
 
-// ResolveRepoKey resolves key — a git URL path element (docs/05, after the
+// ResolveRepoKey resolves key — a git URL path element (docs/explanation/git-protocol-and-namespaces.md, after the
 // caller strips any `+ephemeral`/`+import` namespace suffix) or a JWT repo
-// claim (docs/02, url or repo_id) — to its live repo row. RepoID takes
-// precedence (docs/05 addresses repos by repo_id; ADR-21), then url, so
+// claim (docs/reference/authentication.md, url or repo_id) — to its live repo row. RepoID takes
+// precedence (docs/explanation/git-protocol-and-namespaces.md addresses repos by repo_id; ADR-21), then url, so
 // name-style URLs work too. Unknown or soft-deleted keys yield a wrapped
 // ErrNotFound.
 func ResolveRepoKey(ctx context.Context, store Store, org, key string) (Repo, error) {

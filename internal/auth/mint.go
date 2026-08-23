@@ -17,7 +17,7 @@ import (
 
 // This file holds key-generation and token-minting helpers for tests and the
 // CLI (keygen/mint subcommands). The service itself never mints tokens —
-// customers sign their own (docs/02).
+// customers sign their own (docs/reference/authentication.md).
 
 // GenerateKey creates a fresh private key for the named algorithm: the
 // curve-matched ECDSA key for ES256/ES384/ES512, RSA-2048 for RS256/PS256,
@@ -118,7 +118,7 @@ func MarshalPublicKeyPEM(pub crypto.PublicKey) ([]byte, error) {
 
 // ParsePrivateKeyPEM parses the first PEM block as a PKCS#8 (EC, RSA, or
 // Ed25519) or SEC1 EC private key — the client-side formats named in
-// docs/02.
+// docs/reference/authentication.md.
 func ParsePrivateKeyPEM(data []byte) (crypto.Signer, error) {
 	block, _ := pem.Decode(data)
 	if block == nil {

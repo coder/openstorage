@@ -27,7 +27,7 @@ const (
 	// pgUniqueViolation is SQLSTATE 23505.
 	pgUniqueViolation = "23505"
 	// repoURLConstraint is the named UNIQUE(org_id, url) constraint; it spans
-	// soft-deleted rows on purpose (docs/01: re-create of a soft-deleted url
+	// soft-deleted rows on purpose (docs/explanation/domain-model.md: re-create of a soft-deleted url
 	// must 409).
 	repoURLConstraint = "repos_org_id_url_key"
 	// repoCols is the scan column list matching scanRepo.
@@ -129,8 +129,12 @@ CREATE TABLE IF NOT EXISTS repo_upstreams (
     run_count     integer NOT NULL DEFAULT 0,
     success_count integer NOT NULL DEFAULT 0,
     syncing       boolean NOT NULL DEFAULT false,
+    sync_pending  boolean NOT NULL DEFAULT false,
     created_at    timestamptz NOT NULL DEFAULT now()
 );
+-- Upgrade path for pre-#79 deployments whose repo_upstreams predates the
+-- sync_pending column (idempotent; runs under the META advisory lock).
+ALTER TABLE repo_upstreams ADD COLUMN IF NOT EXISTS sync_pending boolean NOT NULL DEFAULT false;
 `)
 		return err
 	})

@@ -11,7 +11,7 @@ import (
 	"github.com/coder/code-storage/internal/ref"
 )
 
-// Grep line types (docs/03 POST /repos/grep lines[].type).
+// Grep line types (docs/reference/http-api.md POST /repos/grep lines[].type).
 const (
 	GrepLineMatch   = "match"
 	GrepLineContext = "context"
@@ -25,7 +25,7 @@ type GrepLine struct {
 }
 
 // GrepFile groups all matched/context lines of one file, ascending by line
-// number (docs/03 matches[] entries).
+// number (docs/reference/http-api.md matches[] entries).
 type GrepFile struct {
 	Path  string
 	Lines []GrepLine
@@ -43,7 +43,7 @@ type GrepOptions struct {
 
 // Grep searches the tree at commit (a resolved full SHA). Binary blobs are
 // skipped (-I). No matches is a successful empty result, not an error.
-// Result limiting/pagination (docs/03 limits, incomplete_results) is the
+// Result limiting/pagination (docs/reference/http-api.md limits, incomplete_results) is the
 // endpoint slice's job on top of this full result.
 //
 // Match/context typing: `--null` (needed for unambiguous parsing of paths

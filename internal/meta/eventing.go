@@ -1,4 +1,4 @@
-// Phase-5 eventing/sync persistence contract (docs/06 webhooks, docs/03
+// Phase-5 eventing/sync persistence contract (docs/reference/webhooks.md webhooks, docs/reference/http-api.md
 // git-credentials + upstream sync): webhook registrations, git credentials,
 // and repo upstream links live in the meta database next to the repo rows
 // they reference.
@@ -17,7 +17,7 @@ import (
 	"time"
 )
 
-// Webhook is one registered delivery endpoint (docs/06). Secret is the HMAC
+// Webhook is one registered delivery endpoint (docs/reference/webhooks.md). Secret is the HMAC
 // signing key — plaintext at this interface; at rest it is stored plaintext
 // by default and envelope-encrypted when the store carries a secrets codec
 // (issue #54, CODESTORAGE_SECRETS_KEY; see secrets.go). Never log Secret.
@@ -30,7 +30,7 @@ type Webhook struct {
 }
 
 // GitCredential is one stored HTTPS credential for a repo's git upstream
-// (docs/03 "Git credentials"). Password is plaintext at this interface and
+// (docs/reference/http-api.md "Git credentials"). Password is plaintext at this interface and
 // gets the same optional at-rest envelope encryption as Webhook.Secret;
 // it must never be logged.
 type GitCredential struct {
@@ -42,7 +42,7 @@ type GitCredential struct {
 }
 
 // RepoUpstream is one repo's upstream mirror link plus its sync-run state
-// (docs/01 invariant 11). is_first_sync := SuccessCount == 0; detach =
+// (docs/explanation/domain-model.md invariant 11). is_first_sync := SuccessCount == 0; detach =
 // delete the row.
 type RepoUpstream struct {
 	RepoID       string
@@ -53,7 +53,13 @@ type RepoUpstream struct {
 	RunCount     int    // completed sync runs (success + failure)
 	SuccessCount int    // completed successful runs
 	Syncing      bool   // one run in flight (TryBeginSync..FinishSync)
-	CreatedAt    time.Time
+	// SyncPending marks a sync request (RequestSync) not yet covered by a
+	// claimed run: TryBeginSync consumes it, so a flag still set when
+	// FinishSync returns means requests arrived AFTER the finished run
+	// claimed (its fetch may predate them) and a follow-up run is due
+	// (issue #79 liveness).
+	SyncPending bool
+	CreatedAt   time.Time
 }
 
 // NewEventingID returns "<prefix>_<16 hex>" — the shared ID shape for
@@ -92,7 +98,7 @@ type EventingStore interface {
 
 	// CreateGitCredential stores cred (ID/CreatedAt assigned by the store;
 	// caller-set ID/CreatedAt are ignored). ErrAlreadyExists when the repo
-	// already has a credential (docs/03: 409).
+	// already has a credential (docs/reference/http-api.md: 409).
 	CreateGitCredential(ctx context.Context, cred GitCredential) (GitCredential, error)
 	// GetGitCredential returns the credential by ID; ErrNotFound when absent.
 	GetGitCredential(ctx context.Context, id string) (GitCredential, error)
@@ -119,12 +125,23 @@ type EventingStore interface {
 	GetRepoUpstream(ctx context.Context, repoID string) (RepoUpstream, error)
 	// DeleteRepoUpstream detaches the repo; ErrNotFound when already detached.
 	DeleteRepoUpstream(ctx context.Context, repoID string) error
+	// RequestSync marks a pending sync request (sync_pending = true).
+	// Callers that promise a sync (POST /repos/pull-upstream 202) set it
+	// BEFORE enqueueing: if the enqueue coalesces with a run that already
+	// claimed (whose upstream fetch may predate this request), the flag
+	// survives to that run's FinishSync and the finisher schedules a
+	// follow-up run. ErrNotFound when detached.
+	RequestSync(ctx context.Context, repoID string) error
 	// TryBeginSync atomically claims a sync run (syncing false -> true) and
-	// returns the row as of the claim. claimed=false (row returned) when a
-	// run is already in flight; ErrNotFound when detached.
+	// returns the row as of the claim. The claim consumes sync_pending:
+	// every request marked before the claim is observed by the claimed
+	// run's upstream fetch, which happens after it. claimed=false (row
+	// returned) when a run is already in flight; ErrNotFound when detached.
 	TryBeginSync(ctx context.Context, repoID string) (up RepoUpstream, claimed bool, err error)
 	// FinishSync completes the claimed run: increments RunCount (and
 	// SuccessCount when success), clears Syncing, returns the updated row.
-	// ErrNotFound when the repo was detached mid-run.
+	// SyncPending is NOT touched: a set flag in the returned row tells the
+	// finisher to schedule a follow-up run (the follow-up's claim consumes
+	// it). ErrNotFound when the repo was detached mid-run.
 	FinishSync(ctx context.Context, repoID string, success bool) (RepoUpstream, error)
 }

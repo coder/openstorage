@@ -1,10 +1,10 @@
-// Streaming write endpoints (docs/07 p4 W2; contract docs/04 + docs/03):
+// Streaming write endpoints (docs/archive/phases/07-implementation-roadmap.md p4 W2; contract docs/explanation/streaming-commit-protocols.md + docs/reference/http-api.md):
 //
 //	POST /api/v1/repos/commit-pack    — NDJSON: metadata + blob_chunk frames
 //	POST /api/v1/repos/diff-commit    — NDJSON: metadata + diff_chunk frames
 //	POST /api/v1/repos/restore-commit — plain JSON
 //
-// NDJSON bodies are parsed INCREMENTALLY (docs/04: chunked bodies without
+// NDJSON bodies are parsed INCREMENTALLY (docs/explanation/streaming-commit-protocols.md: chunked bodies without
 // Content-Length, uploads can exceed memory): one bounded line at a time,
 // with blob bytes streamed straight into `git hash-object -w --stdin`.
 //
@@ -15,8 +15,8 @@
 //
 // Status mapping (plan decision #2): expected_head_sha mismatch -> 412
 // precondition_failed; CAS race lost at publish time -> 409 conflict; root
-// commits report old_sha = 40 zeros (docs/01 invariant 2). Success is 200
-// (decision #3). Failures carry the docs/04 result envelope; the auth
+// commits report old_sha = 40 zeros (docs/explanation/domain-model.md invariant 2). Success is 200
+// (decision #3). Failures carry the docs/explanation/streaming-commit-protocols.md result envelope; the auth
 // middleware's plain {"error"} bodies on 401/403 are SDK-compatible (the
 // SDK falls back to the error envelope + numeric status mapping).
 //
@@ -56,7 +56,7 @@ import (
 )
 
 const (
-	// wcMaxChunkBytes is the docs/04 chunk cap: 4 MiB of raw bytes before
+	// wcMaxChunkBytes is the docs/explanation/streaming-commit-protocols.md chunk cap: 4 MiB of raw bytes before
 	// base64.
 	wcMaxChunkBytes = 4 << 20
 	// wcMaxLineBytes bounds one NDJSON line: 4 MiB raw -> +33% base64 ->
@@ -71,7 +71,7 @@ const (
 )
 
 // registerWriteCommitRoutes mounts the three write-commit endpoints (called
-// from api.New). All require a repo-scoped token with git:write (docs/02
+// from api.New). All require a repo-scoped token with git:write (docs/reference/authentication.md
 // scope table).
 func registerWriteCommitRoutes(mux *http.ServeMux, s *server, verifier auth.Verifier, org string, rl *rateLimiter) {
 	assertf(mux != nil && s != nil && verifier != nil, "registerWriteCommitRoutes: nil dependency")
@@ -84,11 +84,11 @@ func registerWriteCommitRoutes(mux *http.ServeMux, s *server, verifier auth.Veri
 }
 
 // ---------------------------------------------------------------------------
-// Result envelope (docs/04 §3)
+// Result envelope (docs/explanation/streaming-commit-protocols.md §3)
 
 // wcCommitInfo is the success-side `commit` object. BlobCount is a pointer:
 // commit-pack and diff-commit must emit it (the SDK ack schema requires it
-// on both), restore-commit omits it (docs/04 §4).
+// on both), restore-commit omits it (docs/explanation/streaming-commit-protocols.md §4).
 type wcCommitInfo struct {
 	CommitSHA    string `json:"commit_sha"`
 	TreeSHA      string `json:"tree_sha"`
@@ -115,7 +115,7 @@ type wcEnvelope struct {
 }
 
 // wcFail writes the failure envelope. The status string must agree with the
-// docs/04 HTTP mapping table (statusForHTTP, errors.go) — enforced here so a
+// docs/explanation/streaming-commit-protocols.md HTTP mapping table (statusForHTTP, errors.go) — enforced here so a
 // drifting call site fails fast in tests instead of shipping a mismatched
 // pair.
 func wcFail(w http.ResponseWriter, httpCode int, status, msg, branch, oldSHA string) {
@@ -127,7 +127,7 @@ func wcFail(w http.ResponseWriter, httpCode int, status, msg, branch, oldSHA str
 }
 
 // wcInternal is internalErr's envelope-flavored twin: log the real error,
-// leak nothing (docs/03: clients branch on codes, bodies stay generic).
+// leak nothing (docs/reference/http-api.md: clients branch on codes, bodies stay generic).
 func (s *server) wcInternal(w http.ResponseWriter, r *http.Request, op string, err error) {
 	assertf(err != nil && op != "", "wcInternal: nil error or empty op")
 	s.logger.Error("internal error", "op", op, "method", r.Method, "path", r.URL.Path, "err", err)
@@ -139,7 +139,7 @@ func (s *server) wcInternal(w http.ResponseWriter, r *http.Request, op string, e
 
 // wcResolveRepo maps the JWT repo claim to its live repo row with envelope
 // errors. The claim may carry the repo url or the server-generated repo_id
-// (docs/02: auth accepts both), resolved through the shared
+// (docs/reference/authentication.md: auth accepts both), resolved through the shared
 // meta.ResolveRepoKey (ADR-21: repo_id first, then url).
 func (s *server) wcResolveRepo(w http.ResponseWriter, r *http.Request) (meta.Repo, bool) {
 	claims := mustClaims(r)
@@ -168,7 +168,7 @@ func wcRefName(branch string, ephemeral bool) string {
 	return "refs/heads/" + branch
 }
 
-// wcCheckRefPolicy enforces the token ref policies (docs/02, invariant 5)
+// wcCheckRefPolicy enforces the token ref policies (docs/reference/authentication.md, invariant 5)
 // for one server-created ref update, mirroring the git update hook:
 //   - no-push denies every update;
 //   - verify-sig denies (server-created commits are unsigned — hook parity);
@@ -212,7 +212,7 @@ func wcCheckRefPolicy(w http.ResponseWriter, claims *auth.Claims, refName string
 // NDJSON stream reader
 
 // wcLineReader yields one bounded NDJSON line at a time without buffering
-// the request body (docs/04: streaming parse). next returns io.EOF at end.
+// the request body (docs/explanation/streaming-commit-protocols.md: streaming parse). next returns io.EOF at end.
 type wcLineReader struct {
 	br *bufio.Reader
 }
@@ -248,7 +248,7 @@ func (lr *wcLineReader) next() ([]byte, error) {
 	}
 }
 
-// Frame shapes (docs/04 §1–2). Exactly one member per line.
+// Frame shapes (docs/explanation/streaming-commit-protocols.md §1–2). Exactly one member per line.
 type wcAuthor struct {
 	Name  string `json:"name"`
 	Email string `json:"email"`
@@ -271,7 +271,7 @@ type wcMetadata struct {
 	Ephemeral       bool       `json:"ephemeral"`
 	EphemeralBase   bool       `json:"ephemeral_base"`
 	Files           []wcFileOp `json:"files"`
-	// restore-commit only (docs/04 §4).
+	// restore-commit only (docs/explanation/streaming-commit-protocols.md §4).
 	TargetCommitSHA string `json:"target_commit_sha"`
 }
 
@@ -312,7 +312,7 @@ func wcReadMetadata(w http.ResponseWriter, lr *wcLineReader) (*wcMetadata, bool)
 	return frame.Metadata, true
 }
 
-// wcValidPath rejects the traversal/mangling vectors of docs/04 (absolute
+// wcValidPath rejects the traversal/mangling vectors of docs/explanation/streaming-commit-protocols.md (absolute
 // paths, `..`), plus the inputs that would corrupt the update-index stream
 // or the repository itself (control bytes, `.git` components, `.` segments,
 // empty segments/trailing slash).
@@ -341,7 +341,7 @@ func wcValidPath(p string) error {
 
 var wcValidModes = map[string]bool{"100644": true, "100755": true, "120000": true, "160000": true}
 
-// wcValidateBranchParam validates one branch-name request field (docs/04:
+// wcValidateBranchParam validates one branch-name request field (docs/explanation/streaming-commit-protocols.md:
 // no refs/ prefix; conservative component rule shared with repo creation).
 func wcValidateBranchParam(field, name string) error {
 	if name == "" {
@@ -369,7 +369,7 @@ func wcValidateAuthor(field string, a wcAuthor) error {
 }
 
 // wcValidateMetadata checks the fields shared by commit-pack and
-// diff-commit (docs/04 §1–2). File-op validation is commit-pack-specific
+// diff-commit (docs/explanation/streaming-commit-protocols.md §1–2). File-op validation is commit-pack-specific
 // and handled by the caller.
 func wcValidateMetadata(md *wcMetadata) error {
 	assertf(md != nil, "wcValidateMetadata: nil metadata")
@@ -450,7 +450,7 @@ type wcPlan struct {
 	tips    map[string]string // all refs at resolve time
 }
 
-// wcPlanCommit resolves the docs/04 base rules against the ref authority
+// wcPlanCommit resolves the docs/explanation/streaming-commit-protocols.md base rules against the ref authority
 // and enforces guard + policy, writing the mapped envelope on failure:
 //  1. target branch exists -> old = parent = tip;
 //  2. unborn + base_branch -> branch from that tip (404 when missing);
@@ -682,7 +682,7 @@ func (sc *wcScratch) buildTree(ctx context.Context, baseTree string, entries []w
 }
 
 // commitTree creates the commit object in the scratch odb. parent "" makes
-// a root commit. Committer defaults to the author (docs/04).
+// a root commit. Committer defaults to the author (docs/explanation/streaming-commit-protocols.md).
 func (sc *wcScratch) commitTree(ctx context.Context, tree, parent string, md *wcMetadata) (string, error) {
 	assertf(ref.ValidSHA(tree), "commitTree: malformed tree %q", tree)
 	committer := md.Author
@@ -811,7 +811,7 @@ func (s *server) wcFinishCommit(w http.ResponseWriter, r *http.Request, sc *wcSc
 // ---------------------------------------------------------------------------
 // POST /api/v1/repos/commit-pack
 
-// handleCommitPack implements the docs/04 §1 NDJSON commit: metadata frame,
+// handleCommitPack implements the docs/explanation/streaming-commit-protocols.md §1 NDJSON commit: metadata frame,
 // then contiguous base64 blob_chunk frames per upsert file terminated by
 // eof:true, streamed into scratch blobs, composed into a tree over the base
 // and published under CAS.
@@ -887,7 +887,7 @@ func (s *server) handleCommitPack(w http.ResponseWriter, r *http.Request) {
 	s.wcFinishCommit(w, r, sc, repo.RepoID, plan, md, tree, commit, &blobCount)
 }
 
-// wcStreamBlobs drives the blob_chunk state machine (docs/04 §1): chunks
+// wcStreamBlobs drives the blob_chunk state machine (docs/explanation/streaming-commit-protocols.md §1): chunks
 // per file are contiguous and eof-terminated; every upsert must be fed;
 // deletes must not be; decoded chunks are capped at 4 MiB. Content bytes
 // stream straight into hash-object — except 160000 gitlinks, whose payload
@@ -1017,7 +1017,7 @@ func (s *server) wcStreamBlobs(w http.ResponseWriter, r *http.Request, lr *wcLin
 // ---------------------------------------------------------------------------
 // POST /api/v1/repos/diff-commit
 
-// handleDiffCommit implements docs/04 §2: same metadata frame (no files),
+// handleDiffCommit implements docs/explanation/streaming-commit-protocols.md §2: same metadata frame (no files),
 // diff_chunk frames spooled to a scratch file and applied to the base tree
 // with `git apply --cached`. An empty diff yields an empty commit; a patch
 // that does not apply is `invalid` (422).
@@ -1079,7 +1079,7 @@ func (s *server) handleDiffCommit(w http.ResponseWriter, r *http.Request) {
 	if patchBytes > 0 {
 		if _, err := sc.git(r.Context(), nil, nil, "apply", "--cached", "--binary", "--whitespace=nowarn", patchPath); err != nil {
 			// The patch is client input: rejection is an envelope, never
-			// a 500 (docs/04 maps 422 -> invalid).
+			// a 500 (docs/explanation/streaming-commit-protocols.md maps 422 -> invalid).
 			wcFail(w, http.StatusUnprocessableEntity, "invalid", "patch does not apply: "+err.Error(),
 				md.TargetBranch, plan.oldSHA)
 			return
@@ -1181,8 +1181,8 @@ func (s *server) wcSpoolDiff(w http.ResponseWriter, lr *wcLineReader, sc *wcScra
 // ---------------------------------------------------------------------------
 // POST /api/v1/repos/restore-commit
 
-// wcRestoreBody is the plain-JSON restore request (docs/04 §4; the openapi
-// NDJSON/`reset-commits` variant is a recorded deviation, docs/12).
+// wcRestoreBody is the plain-JSON restore request (docs/explanation/streaming-commit-protocols.md §4; the openapi
+// NDJSON/`reset-commits` variant is a recorded deviation, docs/archive/phases/12-phase3-implementation-notes.md).
 type wcRestoreBody struct {
 	Metadata *wcMetadata `json:"metadata"`
 }

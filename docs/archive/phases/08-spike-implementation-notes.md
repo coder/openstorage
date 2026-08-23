@@ -1,5 +1,10 @@
 # Spike Implementation Notes & ADRs
 
+> **Archived.** Historical implementation notes, kept verbatim as the project's build
+> history; decisions here may have been superseded by later work. For current
+> behavior, start at the [docs index](../../README.md); the ADRs recorded below are
+> individually addressable under [`docs/adr/`](../../adr/README.md).
+
 Records the load-bearing decisions from the phase-0 de-risk spike (`cmd/codestorage`,
 `internal/spike/`). The spike code itself is throwaway-quality; the decisions below are the
 part meant to survive into the real backend. Acceptance is covered by container-based tests

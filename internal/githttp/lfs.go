@@ -1,4 +1,4 @@
-// Git LFS Batch API (docs/05): the storage host serves the standard LFS
+// Git LFS Batch API (docs/explanation/git-protocol-and-namespaces.md): the storage host serves the standard LFS
 // discovery path POST /{repo}.git/info/lfs/objects/batch on the same
 // JWT-authenticated remote — no separate LFS server or config. Object bytes
 // live in the BlobStore under blob.LFSKey(repoID, oid); transfers use the
@@ -184,7 +184,7 @@ func lfsToken(r *http.Request) (string, bool) {
 	return "", false
 }
 
-// authenticateLFS enforces the docs/02 failure mapping on the LFS path,
+// authenticateLFS enforces the docs/reference/authentication.md failure mapping on the LFS path,
 // accepting both credential forms (see lfsToken).
 func (s *Server) authenticateLFS(r *http.Request, repo, scope string) (*auth.Claims, int, error) {
 	token, ok := lfsToken(r)
@@ -882,7 +882,7 @@ func (w *stagingFileWriter) Write(p []byte) (int, error) {
 
 // lfsDownloadAction builds the basic-transfer download action for key: a
 // presigned blob URL when the backend supports it, else a proxy href back
-// through this server (docs/05 local mode). The proxy href carries the
+// through this server (docs/explanation/git-protocol-and-namespaces.md local mode). The proxy href carries the
 // caller's Authorization header so git-lfs re-presents the same
 // credentials on the transfer.
 func (s *Server) lfsDownloadAction(r *http.Request, repoElem, key, oid string) (*lfsAction, error) {

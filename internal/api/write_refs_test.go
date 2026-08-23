@@ -1,6 +1,6 @@
 package api
 
-// Contract integration tests for the W3 write endpoints (docs/07 p4):
+// Contract integration tests for the W3 write endpoints (docs/archive/phases/07-implementation-roadmap.md p4):
 // POST /repos/branches/create, DELETE /repos/branches, POST/DELETE
 // /repos/tags, POST/DELETE /repos/notes — fanned out over the pg and
 // sqlite lanes via runBackends.
@@ -503,7 +503,7 @@ func TestWriteRefsTags(t *testing.T) {
 		})
 
 		t.Run("delete requires both scopes", func(t *testing.T) {
-			// docs/03: DELETE /repos/tags demands git:read AND git:write.
+			// docs/reference/http-api.md: DELETE /repos/tags demands git:read AND git:write.
 			for _, scopes := range [][]string{{auth.ScopeGitWrite}, {auth.ScopeGitRead}} {
 				tok := e.mint(t, tokenSpec{iss: fx.org, repo: fx.url, scopes: scopes})
 				resp, _ := wrefDo(t, srv, "DELETE", "/api/v1/repos/tags", tok,

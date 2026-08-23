@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-// The tuple wire encoding of RefPolicy is a frozen contract (docs/02 `refs`
+// The tuple wire encoding of RefPolicy is a frozen contract (docs/reference/authentication.md `refs`
 // claim); ParseRefPolicies/MatchPolicy/FoldOps behavior is covered by the
 // policy-engine workstream once the stubs are implemented.
 func TestRefPolicyTupleCodec(t *testing.T) {
@@ -203,7 +203,7 @@ func TestFoldOps(t *testing.T) {
 	}
 }
 
-// docs/02 e2e shape (WS5 #3): refs=[["main",[]]] + ops=["no-push"] must
+// docs/reference/authentication.md e2e shape (WS5 #3): refs=[["main",[]]] + ops=["no-push"] must
 // allow main and reject everything else (fold appends, first match wins).
 func TestFoldOps_SpecificRefStillWins(t *testing.T) {
 	refs, err := ParseRefPolicies(`[["main",[]]]`)

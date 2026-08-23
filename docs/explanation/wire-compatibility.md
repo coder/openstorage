@@ -23,9 +23,9 @@ call, plus the documented HTTP API. It is not a bug-for-bug clone of upstream in
 ## Implemented surface
 
 The full endpoint catalog with request/response shapes is
-[docs/03](../03-http-api.md) (REST), [docs/04](../04-streaming-commit-protocols.md)
-(streaming writes), [docs/05](../05-git-protocol-and-namespaces.md) (git protocol, LFS,
-namespaces), and [docs/06](../06-webhooks.md) (webhooks). By feature group:
+[HTTP API](../reference/http-api.md) (REST), [streaming protocols](streaming-commit-protocols.md)
+(streaming writes), [git protocol](git-protocol-and-namespaces.md) (git protocol, LFS,
+namespaces), and [webhooks](../reference/webhooks.md) (webhooks). By feature group:
 
 | Surface | Status | Notes |
 |---|---|---|
@@ -41,7 +41,7 @@ namespaces), and [docs/06](../06-webhooks.md) (webhooks). By feature group:
 | Git LFS | ✅ | Batch API on the same remote; presigned S3 downloads with a server-proxied fallback, verified server-proxied uploads ([below](#git-lfs-transfer-semantics)) |
 | Webhooks | ✅ | HMAC-signed `push` and `repo.sync.*` events, plus webhook CRUD |
 | Upstream sync & credentials | ✅ | `pull-upstream`, detach base, git-credential CRUD. Local-mode (SQLite) gap: a *git-surface* push does not auto-schedule upstream sync (the hook subprocess cannot reach the in-process queue) — API writes and explicit `pull-upstream` are unaffected |
-| Auth model | ✅ | Customer-signed JWTs (`ES256`/`RS256`/`EdDSA`/`PS256`/`ES384`/`ES512`), scopes `git:read` / `git:write` / `repo:write` / `org:read` (exact matching — no scope implies another), `refs` policy tuples ([docs/02](../02-authentication.md)) |
+| Auth model | ✅ | Customer-signed JWTs (`ES256`/`RS256`/`EdDSA`/`PS256`/`ES384`/`ES512`), scopes `git:read` / `git:write` / `repo:write` / `org:read` (exact matching — no scope implies another), `refs` policy tuples ([auth spec](../reference/authentication.md)) |
 
 ### Deprecated aliases
 
@@ -147,17 +147,17 @@ which is what the SDKs do — none of these are observable.
 ## Known deviations from the vendored spec
 
 Tracked deviations where this backend intentionally differs from the upstream OpenAPI
-snapshot (each recorded in the [decision log](../README.md#document-index)):
+snapshot (recorded in the [archived phase notes](../archive/phases/)):
 
 | Upstream spec | Here | Rationale |
 |---|---|---|
-| `POST .../reset-commits` (NDJSON) | Not implemented; `POST .../restore-commit` (plain JSON) covers the SDK-visible restore semantics | Recorded deviation (docs/12) — no SDK calls `reset-commits` |
+| `POST .../reset-commits` (NDJSON) | Not implemented; `POST .../restore-commit` (plain JSON) covers the SDK-visible restore semantics | Recorded deviation ([phase-3 notes](../archive/phases/12-phase3-implementation-notes.md)) — no SDK calls `reset-commits` |
 | `DELETE /api/repos/{repo_name}/tags/{tag_name}` (tag in path) | `DELETE .../tags` with the tag in the request body | Matches the SDKs' actual call shape |
 | `GET`/`POST /api/repos` (bare collection routes) | `/api/v1/repos` only; named-repo aliases exist for repo-scoped routes, not org-scoped collections | Alias layer covers the styles SDKs use |
-| RFC 9457 problem-details error bodies (spec) | No problem-details anywhere. Failures use one of two shapes depending on route and failure class: the plain `{"error":"<msg>"}` envelope or the [docs/04](../04-streaming-commit-protocols.md) `{"result":{"success":false,…}}` envelope. Do not assume one shape per route family — branch on the status code, or check both shapes; the per-route contract is in [docs/03](../03-http-api.md) and [docs/04](../04-streaming-commit-protocols.md) | Recorded deviations (docs/12, ADR-26): all three SDKs branch on status codes and none parses problem-details fields |
-| `201` on write endpoints (spec) | `commit-pack` / `diff-commit` / `restore-commit` and `POST`/`DELETE .../notes` return `200` | Recorded deviation (docs/12): the SDKs accept both; schema-validating clients should expect `200` |
-| Credential-create response includes a summary (`created_at`, …) | `POST .../git-credentials` returns only `{"id": …}` | Recorded deviation (docs/16); fetch the summary via the credential list if needed |
-| One ephemeral namespace across git and REST | Two separate ref spaces: git push to `/{repo}+ephemeral.git` writes a distinct `+ephemeral` storage key, REST `ephemeral=true` reads/writes `refs/namespaces/ephemeral/…` under the base repository — ephemeral state does not cross surfaces | Recorded cross-surface split (docs/13): REST writes follow the REST read surface so API-created ephemeral refs stay visible to `GET .../branches?ephemeral=true` and merge promotion |
+| RFC 9457 problem-details error bodies (spec) | No problem-details anywhere. Failures use one of two shapes depending on route and failure class: the plain `{"error":"<msg>"}` envelope or the [streaming protocols](streaming-commit-protocols.md) `{"result":{"success":false,…}}` envelope. Do not assume one shape per route family — branch on the status code, or check both shapes; the per-route contract is in [HTTP API](../reference/http-api.md) and [streaming protocols](streaming-commit-protocols.md) | Recorded deviations ([phase-3 notes](../archive/phases/12-phase3-implementation-notes.md), [ADR-26](../adr/026-result-envelope-statuses-499-is-not-emittable.md)): all three SDKs branch on status codes and none parses problem-details fields |
+| `201` on write endpoints (spec) | `commit-pack` / `diff-commit` / `restore-commit` and `POST`/`DELETE .../notes` return `200` | Recorded deviation ([phase-3 notes](../archive/phases/12-phase3-implementation-notes.md)): the SDKs accept both; schema-validating clients should expect `200` |
+| Credential-create response includes a summary (`created_at`, …) | `POST .../git-credentials` returns only `{"id": …}` | Recorded deviation ([phase-7 notes](../archive/phases/16-phase7-implementation-notes.md)); fetch the summary via the credential list if needed |
+| One ephemeral namespace across git and REST | Two separate ref spaces: git push to `/{repo}+ephemeral.git` writes a distinct `+ephemeral` storage key, REST `ephemeral=true` reads/writes `refs/namespaces/ephemeral/…` under the base repository — ephemeral state does not cross surfaces | Recorded cross-surface split ([phase-4 notes](../archive/phases/13-phase4-implementation-notes.md)): REST writes follow the REST read surface so API-created ephemeral refs stay visible to `GET .../branches?ephemeral=true` and merge promotion |
 
 And extensions upstream's spec does not list: the single-item `branch`/`tag` lookups
 (SDK-relied), webhook management endpoints (upstream documents webhooks but doesn't spec
@@ -168,7 +168,7 @@ the CRUD), and the unauthenticated `/healthz` liveness probe.
 Upstream evolves continuously; wire compatibility is this project's purpose, so drift is
 tracked as ordinary, visible project work:
 
-- **Vendored snapshot:** [`docs/upstream/`](../upstream/) holds verbatim copies of the
+- **Vendored snapshot:** [`docs/upstream/`](../upstream) holds verbatim copies of the
   official OpenAPI spec ([`openapi.yaml`](../upstream/openapi.yaml)) and doc pages the
   implementation was built against.
 - **Recurring diff:** the live upstream spec and docs are periodically re-fetched and

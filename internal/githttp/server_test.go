@@ -1,15 +1,18 @@
 package githttp
 
-// Unit tests for Server.authenticate: docs/02 failure mapping on the git
+// Unit tests for Server.authenticate: docs/reference/authentication.md failure mapping on the git
 // path (401 for any Verifier failure, 403 for org/repo/scope mismatch) and
-// the docs/05 repo_id->url resolution. Uses the real auth.OrgKeyVerifier
+// the docs/explanation/git-protocol-and-namespaces.md repo_id->url resolution. Uses the real auth.OrgKeyVerifier
 // over an in-memory key source — no containers needed.
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -138,7 +141,7 @@ func TestAuthenticate_RejectsNonRepoScopedClaims(t *testing.T) {
 }
 
 // The git path must accept every allowed signature algorithm the org
-// registered keys for, not just ES256 (docs/02 multi-alg requirement).
+// registered keys for, not just ES256 (docs/reference/authentication.md multi-alg requirement).
 func TestAuthenticate_MultiAlgorithm(t *testing.T) {
 	for _, alg := range []string{"ES256", "EdDSA", "RS256"} {
 		t.Run(alg, func(t *testing.T) {
@@ -186,7 +189,7 @@ func TestAuthenticate_ResolvesRepoIDToURLClaim(t *testing.T) {
 		t.Fatalf("claims.Repo = %q, want %q", claims.Repo, repoURL)
 	}
 
-	// Namespace suffixes are stripped before resolution (docs/05).
+	// Namespace suffixes are stripped before resolution (docs/explanation/git-protocol-and-namespaces.md).
 	if _, status, err := srv.authenticate(newReq(), repoID+"+ephemeral", auth.ScopeGitRead); err != nil {
 		t.Fatalf("namespaced auth failed: status = %d, err = %v", status, err)
 	}
@@ -285,5 +288,79 @@ func TestServiceRPC_CrashHeaderRefusedOutsideTestMode(t *testing.T) {
 	var body map[string]string
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil || body["error"] == "" {
 		t.Fatalf("expected JSON error body, got %q (err %v)", rec.Body.String(), err)
+	}
+}
+
+// A gzip negotiation that stays under both byte caps but withholds EOF must
+// not pin the connection indefinitely. The deadline fires before hydration,
+// returns a structured 408, and is test-overridden to keep the unit fast.
+func TestServiceRPC_UploadPackReadTimeoutIs408(t *testing.T) {
+	key, pemBlock := genKeyPEM(t, "ES256")
+	repo := meta.Repo{RepoID: "repo_timeout1234", URL: "fetch-timeout"}
+	srv := &Server{
+		Verifier: auth.NewVerifier(memKeys{"org1": {pemBlock}}),
+		Org:      "org1",
+		ResolveRepo: func(_ context.Context, base string) (meta.Repo, bool) {
+			return repo, base == repo.URL
+		},
+		uploadPackReadTimeout: 100 * time.Millisecond,
+	}
+	httpServer := httptest.NewServer(srv.Handler())
+	defer httpServer.Close()
+	token := mintUnitToken(t, key, "ES256", unitClaims("org1", repo.URL, auth.ScopeGitRead))
+
+	var member bytes.Buffer
+	zw := gzip.NewWriter(&member)
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		name   string
+		prefix []byte
+	}{
+		{"partial-header", []byte{0x1f}}, // gzip.NewReader blocks in its fixed header
+		{"between-members", member.Bytes()},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pr, pw := io.Pipe()
+			release := make(chan struct{})
+			writerDone := make(chan struct{})
+			go func() {
+				defer close(writerDone)
+				_, _ = pw.Write(tc.prefix)
+				<-release // withhold the rest/EOF until the server has answered
+				_ = pw.Close()
+			}()
+
+			req, err := http.NewRequest(http.MethodPost, httpServer.URL+"/fetch-timeout.git/git-upload-pack", pr)
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.SetBasicAuth("t", token)
+			req.Header.Set("Content-Type", "application/x-git-upload-pack-request")
+			req.Header.Set("Content-Encoding", "gzip")
+			resp, err := httpServer.Client().Do(req)
+			close(release)
+			<-writerDone
+			if err != nil {
+				t.Fatalf("POST git-upload-pack: %v", err)
+			}
+			defer resp.Body.Close()
+			got, err := io.ReadAll(resp.Body)
+			if err != nil {
+				t.Fatalf("read response: %v", err)
+			}
+			if resp.StatusCode != http.StatusRequestTimeout {
+				t.Fatalf("status = %d, want 408; body: %s", resp.StatusCode, got)
+			}
+			var body map[string]string
+			if err := json.Unmarshal(got, &body); err != nil {
+				t.Fatalf("decode JSON error: %v; body: %s", err, got)
+			}
+			if body["error"] != "fetch negotiation body timed out" {
+				t.Fatalf("error = %q, want timeout message", body["error"])
+			}
+		})
 	}
 }

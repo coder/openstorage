@@ -101,7 +101,7 @@ func mustClaims(r *http.Request) *auth.Claims {
 }
 
 // refPolicies parses the token's ref-policy claims the same way the git
-// update hook does (docs/02): the ordered `refs` tuples with the deprecated
+// update hook does (docs/reference/authentication.md): the ordered `refs` tuples with the deprecated
 // repo-wide `ops` claim folded in exactly once. Malformed claims fail
 // closed — callers must map the error to 403.
 func refPolicies(claims *auth.Claims) ([]auth.RefPolicy, error) {
@@ -133,7 +133,7 @@ func policyDeniesRepoDelete(policies []auth.RefPolicy) (string, bool) {
 }
 
 // branchComponentRe matches one conservative git ref component: leading
-// alphanumeric, then alphanumerics plus . _ - (docs/03: invalid input -> 400).
+// alphanumeric, then alphanumerics plus . _ - (docs/reference/http-api.md: invalid input -> 400).
 var branchComponentRe = regexp.MustCompile(`\A[A-Za-z0-9][A-Za-z0-9._-]*\z`)
 
 // validBranchName reports whether name is an acceptable branch/tag name:
@@ -169,14 +169,14 @@ type createRepoResponse struct {
 
 // handleCreateRepo implements POST /api/v1/repos (scope repo:write). The new
 // repo's url is the JWT `repo` claim; the optional body carries
-// {default_branch?, base_repo?} (docs/03).
+// {default_branch?, base_repo?} (docs/reference/http-api.md).
 func (s *server) handleCreateRepo(w http.ResponseWriter, r *http.Request) {
 	claims := mustClaims(r)
 	url := claims.Repo
 	// requireAuth(orgLevel=false) rejects empty/"org" repo claims with 403.
 	assertf(url != "" && url != auth.RepoClaimOrg, "create: repo claim %q passed requireAuth", url)
 
-	// docs/02: ref policies apply to every HTTP write endpoint. A new repo
+	// docs/reference/authentication.md: ref policies apply to every HTTP write endpoint. A new repo
 	// has no refs, so any well-formed policy allows creation — but a
 	// malformed policy claim fails closed, matching the git hook.
 	if _, err := refPolicies(claims); err != nil {
@@ -244,7 +244,7 @@ func (s *server) handleCreateRepo(w http.ResponseWriter, r *http.Request) {
 // response schema (openapi.yaml) requires repo_id, repo_name, url
 // (deprecated mirror of repo_name), default_branch, created_at —
 // repoEntry carries exactly those, plus base_repo when the repo has an
-// upstream link (docs/03, docs/14 deferred #2).
+// upstream link (docs/reference/http-api.md, docs/archive/phases/14-phase5-implementation-notes.md deferred #2).
 func (s *server) handleGetRepo(w http.ResponseWriter, r *http.Request) {
 	claims := mustClaims(r)
 	repo, err := s.store.GetRepoByURL(r.Context(), claims.Iss, claims.Repo)
@@ -336,7 +336,7 @@ type patchRepoResponse struct {
 // short-circuit (githttp/hydrate.go).
 func (s *server) handlePatchRepo(w http.ResponseWriter, r *http.Request) {
 	claims := mustClaims(r)
-	// docs/02: ref policies apply to every HTTP write endpoint; malformed
+	// docs/reference/authentication.md: ref policies apply to every HTTP write endpoint; malformed
 	// policy claims fail closed, and the parsed rules gate the HEAD
 	// repoint below (policyDeniesDefaultBranchChange).
 	policies, err := refPolicies(claims)
@@ -417,7 +417,7 @@ func (s *server) handlePatchRepo(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// baseRepoEntry is the GET-response `base_repo` object (docs/03): the
+// baseRepoEntry is the GET-response `base_repo` object (docs/reference/http-api.md): the
 // upstream coordinates a synced repo mirrors.
 type baseRepoEntry struct {
 	Provider string `json:"provider"`
@@ -497,7 +497,7 @@ func (s *server) handleListRepos(w http.ResponseWriter, r *http.Request) {
 
 	entries := make([]repoEntry, 0, len(res.Repos))
 	for _, repo := range res.Repos {
-		// Per-repo upstream lookup (docs/14 deferred #2); pages are capped
+		// Per-repo upstream lookup (docs/archive/phases/14-phase5-implementation-notes.md deferred #2); pages are capped
 		// at 100 entries, keeping the N+1 bounded.
 		base, err := s.baseRepoOf(r.Context(), repo.RepoID)
 		if err != nil {
@@ -527,10 +527,10 @@ type deleteRepoResponse struct {
 
 // handleDeleteRepo implements DELETE /api/v1/repos/delete (scope
 // repo:write): soft delete of the JWT `repo` claim target. 404 when the
-// repo never existed, 409 when already soft-deleted (docs/01, docs/03).
+// repo never existed, 409 when already soft-deleted (docs/explanation/domain-model.md, docs/reference/http-api.md).
 func (s *server) handleDeleteRepo(w http.ResponseWriter, r *http.Request) {
 	claims := mustClaims(r)
-	// docs/02: ref policies apply to every HTTP write endpoint, and deleting
+	// docs/reference/authentication.md: ref policies apply to every HTTP write endpoint, and deleting
 	// a repository destroys every ref in it. The API has no ref inventory
 	// (meta.Store carries no refs), so this fails closed: any rule that
 	// could deny deleting some ref denies the whole-repo delete, even when

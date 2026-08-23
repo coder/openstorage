@@ -1,10 +1,11 @@
-// Package githttp is the git smart HTTP surface (docs/05): stateless HTTP
+// Package githttp is the git smart HTTP surface (docs/explanation/git-protocol-and-namespaces.md): stateless HTTP
 // nodes with Postgres as ref authority, S3/MinIO as immutable pack storage,
-// and local disk as a rebuildable cache. Authentication follows docs/02:
+// and local disk as a rebuildable cache. Authentication follows docs/reference/authentication.md:
 // customer-signed JWTs verified against the issuing org's registered keys.
 package githttp
 
 import (
+	"bytes"
 	"compress/gzip"
 	"context"
 	"encoding/json"
@@ -36,13 +37,21 @@ func assertf(cond bool, format string, args ...any) {
 	}
 }
 
+// isTimeoutError reports network/request read deadlines without depending on
+// a concrete net.Error type; both gzip.NewReader and later decode reads can
+// surface the connection's timeout (Codex final review).
+func isTimeoutError(err error) bool {
+	var timeoutErr interface{ Timeout() bool }
+	return errors.As(err, &timeoutErr) && timeoutErr.Timeout()
+}
+
 // Server is one stateless HTTP node: all durable truth lives in PG (refs,
 // pack registry) and S3 (pack bytes); CacheDir is rebuildable at any time.
 type Server struct {
 	Store    ref.RefStore
 	Blob     blob.BlobStore
 	CacheDir string
-	// Verifier authenticates docs/02 JWTs (multi-algorithm, iss-resolved
+	// Verifier authenticates docs/reference/authentication.md JWTs (multi-algorithm, iss-resolved
 	// org keys, exp/sub checks). Any Verify failure maps to 401.
 	Verifier auth.Verifier
 	// Org is the single organization this node serves. A valid token from a
@@ -52,12 +61,12 @@ type Server struct {
 	// TestMode gates fault-injection knobs (crash header). Only ever set
 	// from CODESTORAGE_TEST_MODE=1; the crash header is refused otherwise.
 	TestMode bool
-	// ResolveRepo maps a base path element (docs/05: repo_id, but ADR-21
+	// ResolveRepo maps a base path element (docs/explanation/git-protocol-and-namespaces.md: repo_id, but ADR-21
 	// accepts name-style urls too) to its live repo record. ok=false when
 	// no live repo matches — both handlers then answer 404 (repos must be
 	// created via POST /api/v1/repos first). The record's RepoID is the
 	// only storage key (repo-key-split fix); it also lets tokens carrying
-	// either the url or the repo_id claim (docs/02) authenticate. When
+	// either the url or the repo_id claim (docs/reference/authentication.md) authenticate. When
 	// nil, every path element is unresolvable.
 	ResolveRepo func(ctx context.Context, base string) (meta.Repo, bool)
 	// MaybeRepack, when set, runs after every receive-pack POST with the
@@ -87,6 +96,10 @@ type Server struct {
 	// stream into git (issue #55, pushcap.go); <= 0 disables the cap. Set
 	// by the serve wiring (default: a small multiple of the pack quota).
 	MaxPushBytes int64
+	// uploadPackReadTimeout overrides the fixed gzip negotiation body-read
+	// deadline in tests; zero uses defaultUploadPackReadTimeout. It is not an
+	// operator knob — production always leaves it zero.
+	uploadPackReadTimeout time.Duration
 	// VerifySigBudget caps how many commits one push may signature-verify
 	// (issue #59, verifystate.go); <= 0 disables the budget. Set by the
 	// serve wiring.
@@ -394,7 +407,7 @@ func httpError(w http.ResponseWriter, status int, msg string) {
 	_ = json.NewEncoder(w).Encode(map[string]string{"error": msg})
 }
 
-// Handler routes the smart-HTTP and LFS endpoints per repo (docs/05):
+// Handler routes the smart-HTTP and LFS endpoints per repo (docs/explanation/git-protocol-and-namespaces.md):
 //
 //	GET  /{repo}.git/info/refs?service=git-{upload|receive}-pack
 //	POST /{repo}.git/git-{upload|receive}-pack
@@ -422,7 +435,7 @@ func (s *Server) Handler() http.Handler {
 }
 
 // splitRepoPath parses "/{repo}.git/{rest}" and validates the repo element,
-// which may carry a `+ephemeral`/`+import` namespace suffix (docs/05).
+// which may carry a `+ephemeral`/`+import` namespace suffix (docs/explanation/git-protocol-and-namespaces.md).
 func splitRepoPath(path string) (repo, rest string, ok bool) {
 	path = strings.TrimPrefix(path, "/")
 	elem, rest, found := strings.Cut(path, "/")
@@ -436,7 +449,7 @@ func splitRepoPath(path string) (repo, rest string, ok bool) {
 	return repo, rest, true
 }
 
-// authenticate enforces the docs/02 failure mapping on the git path: 401 for
+// authenticate enforces the docs/reference/authentication.md failure mapping on the git path: 401 for
 // a missing/invalid token (any Verifier failure), 403 for a valid token that
 // does not fit this org, repo, or scope.
 func (s *Server) authenticate(r *http.Request, repo, scope string) (*auth.Claims, int, error) {
@@ -462,14 +475,14 @@ func (s *Server) verifyClaims(ctx context.Context, token, repo, scope string) (*
 	if claims.Iss != s.Org {
 		return nil, http.StatusForbidden, fmt.Errorf("token issued for org %q, not served here", claims.Iss)
 	}
-	// Git endpoints are always repo-scoped (docs/02): an org-level or empty
+	// Git endpoints are always repo-scoped (docs/reference/authentication.md): an org-level or empty
 	// `repo` claim never grants git access — not even to a repo literally
 	// named "org", which would otherwise satisfy the verbatim compare
 	// below. Mirrors the API middleware's repo-scope gate.
 	if claims.Repo == "" || claims.Repo == auth.RepoClaimOrg {
 		return nil, http.StatusForbidden, fmt.Errorf("token is not repo-scoped")
 	}
-	// docs/02: the repo claim carries the repo url (or id); docs/05 paths
+	// docs/reference/authentication.md: the repo claim carries the repo url (or id); docs/explanation/git-protocol-and-namespaces.md paths
 	// address repos by repo_id but name-style urls resolve too (ADR-21).
 	// Accept a verbatim match, else resolve the path element and compare
 	// against both the record's repo_id and url. Auth stays before the
@@ -596,10 +609,22 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 	// nothing, so the decoded counter alone cannot bound wire consumption)
 	// and the decoded stream (pushCap, which a gzip bomb inflates past).
 	// The decoded counter sits under the atomic sniffer below, so the teed
-	// prefix is counted exactly once. upload-pack requests carry small
-	// negotiation bodies and stay uncapped (out of #55's scope).
+	// prefix is counted exactly once.
 	capped := service == "receive-pack" && s.MaxPushBytes > 0
 	gzipped := r.Header.Get("Content-Encoding") == "gzip"
+	// Gzip upload-pack negotiation bodies get the same two-sided caps at a
+	// fixed limit, resolved BEFORE git runs (issue #70, uploadcap.go).
+	// Plain upload-pack bodies stay unbuffered: without a decoder the
+	// server does no work git does not see, and git ends garbage streams
+	// itself by closing stdin.
+	uploadCapped := service == "upload-pack" && gzipped
+	capMsg := ""
+	switch {
+	case capped:
+		capMsg = pushTooLargeMsg(s.MaxPushBytes)
+	case uploadCapped:
+		capMsg = uploadPackTooLargeMsg()
+	}
 	// A body that declares a size past its bound is rejected before
 	// reading a single byte: the decoded cap for plain bodies, the
 	// slack-padded wire limit for gzip ones (whose decoded size the
@@ -610,16 +635,50 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 			limit = wirePushLimit(s.MaxPushBytes)
 		}
 		if r.ContentLength > limit {
-			httpError(w, http.StatusRequestEntityTooLarge, pushTooLargeMsg(s.MaxPushBytes))
+			httpError(w, http.StatusRequestEntityTooLarge, capMsg)
 			return
+		}
+	}
+	if uploadCapped && r.ContentLength > wirePushLimit(maxUploadPackBytes) {
+		httpError(w, http.StatusRequestEntityTooLarge, capMsg)
+		return
+	}
+	// Bound under-cap clients that stall between gzip members or before EOF.
+	// Production's statusRecorder unwraps to net/http's deadline-capable
+	// writer; unsupported test/custom writers keep functional cap coverage.
+	uploadReadDeadlineSet := false
+	clearUploadReadDeadline := func() {
+		if !uploadReadDeadlineSet {
+			return
+		}
+		if err := http.NewResponseController(w).SetReadDeadline(time.Time{}); err != nil {
+			log.Printf("%s %s: clear negotiation read deadline: %v", service, repo, err)
+		}
+		uploadReadDeadlineSet = false
+	}
+	if uploadCapped {
+		readTimeout := s.uploadPackReadTimeout
+		if readTimeout <= 0 {
+			readTimeout = defaultUploadPackReadTimeout
+		}
+		assertf(readTimeout > 0, "upload-pack read timeout = %v", readTimeout)
+		if err := http.NewResponseController(w).SetReadDeadline(time.Now().Add(readTimeout)); err != nil {
+			log.Printf("%s %s: set negotiation read deadline: %v", service, repo, err)
+		} else {
+			uploadReadDeadlineSet = true
+			defer clearUploadReadDeadline()
 		}
 	}
 	body := io.Reader(r.Body)
 	var wireCap *cappedReader
 	if gzipped {
 		wire := io.Reader(r.Body)
-		if capped {
+		switch {
+		case capped:
 			wireCap = newCappedReader(wire, wirePushLimit(s.MaxPushBytes))
+			wire = wireCap
+		case uploadCapped:
+			wireCap = newCappedReader(wire, wirePushLimit(maxUploadPackBytes))
 			wire = wireCap
 		}
 		gz, err := gzip.NewReader(wire)
@@ -629,14 +688,43 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 			// overflow, not malformed compression, and must keep the 413
 			// contract (Codex round 15).
 			if wireCap != nil && wireCap.exceeded {
-				httpError(w, http.StatusRequestEntityTooLarge, pushTooLargeMsg(s.MaxPushBytes))
+				httpError(w, http.StatusRequestEntityTooLarge, capMsg)
 				return
 			}
-			httpError(w, http.StatusBadRequest, "bad gzip body: "+err.Error())
+			// The body deadline can fire while NewReader is still reading
+			// the fixed or optional gzip header, before io.ReadAll below.
+			if uploadCapped && isTimeoutError(err) {
+				httpError(w, http.StatusRequestTimeout, "fetch negotiation body timed out")
+			} else {
+				httpError(w, http.StatusBadRequest, "bad gzip body: "+err.Error())
+			}
 			return
 		}
 		defer gz.Close()
 		body = gz
+	}
+	if uploadCapped {
+		// Read the whole decoded negotiation in memory under both caps
+		// BEFORE hydrate or git upload-pack runs (uploadcap.go). This keeps
+		// 413 deterministic without replica-global temp-disk pressure.
+		assertf(wireCap != nil, "uploadCapped without a wire counter")
+		decodedCap := newCappedReader(body, maxUploadPackBytes)
+		decoded, err := io.ReadAll(decodedCap)
+		clearUploadReadDeadline()
+		if decodedCap.exceeded || wireCap.exceeded {
+			log.Printf("%s %s: negotiation exceeded the %d-byte cap or its wire allowance, rejected with 413", service, repo, maxUploadPackBytes)
+			httpError(w, http.StatusRequestEntityTooLarge, capMsg)
+			return
+		}
+		if err != nil {
+			if isTimeoutError(err) {
+				httpError(w, http.StatusRequestTimeout, "fetch negotiation body timed out")
+			} else {
+				httpError(w, http.StatusBadRequest, "bad gzip body: "+err.Error())
+			}
+			return
+		}
+		body = bytes.NewReader(decoded)
 	}
 	var pushCap *cappedReader
 	if capped {
@@ -757,13 +845,13 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 		if atomicPush {
 			cmd.Env = append(cmd.Env, EnvAtomic+"=1")
 		}
-		// The refs claim is passed through raw (docs/02 tuple encoding);
+		// The refs claim is passed through raw (docs/reference/authentication.md tuple encoding);
 		// the update hook owns parsing and fails closed on malformed JSON.
 		if len(claims.Refs) > 0 {
 			cmd.Env = append(cmd.Env, EnvRefsPolicy+"="+string(claims.Refs))
 		}
 		// Deprecated repo-wide ops claim: folded into the ref policies by
-		// the hook (docs/02 fallback semantics).
+		// the hook (docs/reference/authentication.md fallback semantics).
 		if len(claims.Ops) > 0 {
 			ops, err := json.Marshal(claims.Ops)
 			assertf(err == nil, "marshal ops claim: %v", err)

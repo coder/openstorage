@@ -1,6 +1,6 @@
 package api
 
-// Contract integration tests for the streaming write endpoints (docs/07 p4
+// Contract integration tests for the streaming write endpoints (docs/archive/phases/07-implementation-roadmap.md p4
 // W2): POST /repos/commit-pack, /repos/diff-commit, /repos/restore-commit.
 // Wired through runBackends so the pg and sqlite lanes assert identical
 // behavior.
@@ -8,7 +8,7 @@ package api
 // The write routes are registered in api.New (api.go) and additionally
 // mounted on a dedicated test server via registerWriteCommitRoutes so the
 // streaming surface is exercised in isolation; cross-surface visibility is asserted against the
-// environment's api.New server (e.srv) — the docs/05 interop invariant:
+// environment's api.New server (e.srv) — the docs/explanation/git-protocol-and-namespaces.md interop invariant:
 // API-written commits must be immediately readable through the git:read
 // endpoints, since both surfaces share one ref/blob store and cache.
 //
@@ -175,7 +175,7 @@ func wctRequireOK(t *testing.T, resp *http.Response, body []byte) wcEnvelope {
 	return env
 }
 
-// wctRequireFail asserts the docs/04 failure envelope with the given
+// wctRequireFail asserts the docs/explanation/streaming-commit-protocols.md failure envelope with the given
 // HTTP/status pair and returns it.
 func wctRequireFail(t *testing.T, resp *http.Response, body []byte, wantCode int, wantStatus string) wcEnvelope {
 	t.Helper()
@@ -258,7 +258,7 @@ func TestCommitPack(t *testing.T) {
 			}
 			tip1 = env.Commit.CommitSHA
 
-			// Cross-surface (docs/05 interop invariant): the read API sees
+			// Cross-surface (docs/explanation/git-protocol-and-namespaces.md interop invariant): the read API sees
 			// the commit immediately.
 			if got := wctBranchTip(t, e, readTok, "main", false); got != tip1 {
 				t.Errorf("read API main tip = %q, want %q", got, tip1)
@@ -564,7 +564,7 @@ func TestCommitPackValidation(t *testing.T) {
 			wctRequireFail(t, resp, respBody, http.StatusBadRequest, "invalid")
 		})
 
-		// ADR-26: auth failures on write routes carry the docs/04 result
+		// ADR-26: auth failures on write routes carry the docs/explanation/streaming-commit-protocols.md result
 		// envelope (not the read-route {"error"} body).
 		t.Run("missing token is 401 with result envelope", func(t *testing.T) {
 			resp, body := wctPost(t, srv, "/api/v1/repos/commit-pack", "", bytes.NewReader(wctLines(t, wctMeta("main", "m", nil, nil))))

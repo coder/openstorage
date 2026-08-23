@@ -20,9 +20,9 @@ import (
 )
 
 // A repo URL element is a base repo name optionally followed by one
-// namespace suffix, `+ephemeral` or `+import` (docs/05). Namespaced repos
+// namespace suffix, `+ephemeral` or `+import` (docs/explanation/git-protocol-and-namespaces.md). Namespaced repos
 // use fully separate ref stores, pack spaces, and cache dirs keyed by the
-// full name — docs/05 allows "git namespaces or separate ref stores", and
+// full name — docs/explanation/git-protocol-and-namespaces.md allows "git namespaces or separate ref stores", and
 // separate stores give the required isolation for free.
 var repoNameRe = regexp.MustCompile(`\A[A-Za-z0-9][A-Za-z0-9._-]*(\+(ephemeral|import))?\z`)
 
@@ -32,7 +32,7 @@ func ValidRepoName(repo string) bool {
 }
 
 // BaseRepo strips the optional namespace suffix: JWTs carry the base repo id
-// in the `repo` claim and are valid for its namespaces (docs/05 URL scheme).
+// in the `repo` claim and are valid for its namespaces (docs/explanation/git-protocol-and-namespaces.md URL scheme).
 func BaseRepo(repo string) string {
 	base, _, _ := strings.Cut(repo, "+")
 	return base

@@ -1,6 +1,6 @@
 package api
 
-// Contract tests for the notes read endpoints (docs/03 "Notes"): GET
+// Contract tests for the notes read endpoints (docs/reference/http-api.md "Notes"): GET
 // /repos/notes and GET /repos/notes/refs, fanned out over the pg and
 // sqlite lanes via runBackends. Fixtures seed durable state exactly like
 // the other read tests (coreGit + coreSeedStores).
