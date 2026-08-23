@@ -146,7 +146,7 @@ func TestCASRefEmitsOnePushPerWebhook(t *testing.T) {
 		t.Errorf("fan-out payloads differ")
 	}
 
-	// docs/06: exactly these seven fields, all non-empty.
+	// docs/reference/webhooks.md: exactly these seven fields, all non-empty.
 	var got map[string]any
 	if err := json.Unmarshal(env.deliveries[0].Payload, &got); err != nil {
 		t.Fatalf("unmarshal payload: %v", err)
@@ -162,7 +162,7 @@ func TestCASRefEmitsOnePushPerWebhook(t *testing.T) {
 		"ref":    "refs/heads/main",
 		"before": shaA,
 		"after":  shaB,
-		// docs/14 deferred #3: customer_id is the org-name string matching
+		// docs/archive/phases/14-phase5-implementation-notes.md deferred #3: customer_id is the org-name string matching
 		// the JWT `iss` claim, not the internal integer org ID.
 		"customer_id": "acme",
 		"pushed_at":   "2026-01-20T10:30:00Z",

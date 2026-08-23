@@ -1,5 +1,5 @@
 // Package auth declares the JWT authentication contract for the HTTP API
-// (docs/02): customer-signed tokens verified against per-org public keys.
+// (docs/reference/authentication.md): customer-signed tokens verified against per-org public keys.
 //
 // FROZEN CONTRACT: parallel phase-1 slices implement Verifier (jwx v3, keys
 // resolved via the meta store) and build middleware/handlers on these exact
@@ -18,14 +18,14 @@ import (
 	"fmt"
 )
 
-// SubjectLiteral is the fixed `sub` claim used by all vendor SDKs (docs/02).
+// SubjectLiteral is the fixed `sub` claim used by all vendor SDKs (docs/reference/authentication.md).
 const SubjectLiteral = "@pierre/storage"
 
 // RepoClaimOrg is the sentinel `repo` claim value for org-level operations
 // (GET /repos).
 const RepoClaimOrg = "org"
 
-// Scopes (docs/02 scope table). Matching is exact: no scope implies another.
+// Scopes (docs/reference/authentication.md scope table). Matching is exact: no scope implies another.
 const (
 	ScopeGitRead   = "git:read"
 	ScopeGitWrite  = "git:write"
@@ -33,11 +33,11 @@ const (
 	ScopeOrgRead   = "org:read"
 )
 
-// AllowedAlgorithms is the JWS signature algorithm allow-list (docs/02).
+// AllowedAlgorithms is the JWS signature algorithm allow-list (docs/reference/authentication.md).
 // `none` and HS* are always rejected.
 var AllowedAlgorithms = []string{"ES256", "RS256", "EdDSA", "PS256", "ES384", "ES512"}
 
-// Claims is the verified JWT claim set (docs/02). Refs/Ops are passed
+// Claims is the verified JWT claim set (docs/reference/authentication.md). Refs/Ops are passed
 // through raw for the git path, which owns ref-policy parsing.
 type Claims struct {
 	Iss    string          `json:"iss"`

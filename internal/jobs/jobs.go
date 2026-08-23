@@ -29,7 +29,7 @@ func assertf(cond bool, format string, args ...any) {
 }
 
 // MaxDeliveryAttempts bounds webhook delivery retries on both backends
-// (docs/06: capped exponential backoff, then discard).
+// (docs/reference/webhooks.md: capped exponential backoff, then discard).
 const MaxDeliveryAttempts = 10
 
 // Queue schedules background work. Enqueue methods are safe for concurrent

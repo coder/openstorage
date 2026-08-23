@@ -1,4 +1,4 @@
-// Regression tests for the FinishSync `AND syncing` claim guard (docs/14
+// Regression tests for the FinishSync `AND syncing` claim guard (docs/archive/phases/14-phase5-implementation-notes.md
 // deferred #7): finishing without an in-flight claim must not touch the
 // row's counters — in particular a stale finisher whose run was detached
 // mid-flight and whose repo was then re-attached.

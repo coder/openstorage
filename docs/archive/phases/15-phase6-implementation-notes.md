@@ -1,5 +1,10 @@
 # Phase-6 Implementation Notes & ADRs (LFS, named-repo aliases, repo-urls, rate limiting)
 
+> **Archived.** Historical implementation notes, kept verbatim as the project's build
+> history; decisions here may have been superseded by later work. For current
+> behavior, start at the [docs index](../../README.md); the ADRs recorded below are
+> individually addressable under [`docs/adr/`](../../adr/README.md).
+
 Phase 6 delivers the Git LFS Batch API on the smart-HTTP host
 (`internal/githttp/lfs.go`), the named-repo path style `/api/repos/{repo_name}/...` as
 routing aliases (`internal/api/alias.go`), `GET /api/repo-urls/{repo_id}`

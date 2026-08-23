@@ -1,9 +1,9 @@
 package api
 
-// Contract integration tests for the p3 "query" read endpoints (docs/07
+// Contract integration tests for the p3 "query" read endpoints (docs/archive/phases/07-implementation-roadmap.md
 // phases 2c/2d): GET /repos/diff, GET /repos/branches/diff, GET
 // /repos/blame, POST /repos/grep, POST /repos/archive. All tests fan out
-// over both storage backend lanes via runBackends and assert the docs/03 +
+// over both storage backend lanes via runBackends and assert the docs/reference/http-api.md +
 // openapi status-code and envelope contract against a repo seeded with a
 // real multi-commit git history (rename, executable bit, symlink, binary
 // and >1MiB files, ephemeral ref, annotated tag).
@@ -1115,7 +1115,7 @@ func testQueryArchive(t *testing.T, e *testEnv) {
 
 // --- unborn/unknown-repo 404s ---------------------------------------------------
 
-// TestQueryUnborn404s covers docs/01 invariant 3 for the query group: a
+// TestQueryUnborn404s covers docs/explanation/domain-model.md invariant 3 for the query group: a
 // fresh repo has an unborn default branch, so every default-ref read maps
 // to 404 (ref absent in the DB).
 func TestQueryUnborn404s(t *testing.T) { runBackends(t, testQueryUnborn404s) }

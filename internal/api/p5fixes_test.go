@@ -1,6 +1,6 @@
 package api
 
-// Regression tests for the docs/14 "Deferred gate findings" burned down in
+// Regression tests for the docs/archive/phases/14-phase5-implementation-notes.md "Deferred gate findings" burned down in
 // phase 6: base_repo in GET /repo(s) responses (#2), handleCreateRepo
 // post-create row cleanup (#5), and pull-upstream empty-ref defaulting
 // (#8). #1/#3/#4/#7 are covered next to their code (providerhost_test.go,
@@ -183,7 +183,7 @@ func testCreateRepoAbandonsRowOnPostCreateFailure(t *testing.T, e *testEnv) {
 		t.Fatalf("create with failing queue status = %d (body %s), want 500", resp.StatusCode, respBody)
 	}
 
-	// docs/14 deferred #5: the fresh repo row must not linger live behind
+	// docs/archive/phases/14-phase5-implementation-notes.md deferred #5: the fresh repo row must not linger live behind
 	// the 500 — createAbandon soft-deletes it like forkAbandon.
 	if _, err := e.store.GetRepoByURL(context.Background(), org, repoURL); !errors.Is(err, meta.ErrNotFound) {
 		t.Errorf("GetRepoByURL after failed create err = %v, want ErrNotFound (soft-deleted)", err)
@@ -207,7 +207,7 @@ func testPullUpstreamDefaultsRefToDefaultBranch(t *testing.T, e *testEnv) {
 		t.Fatalf("create status = %d (body %s)", resp.StatusCode, respBody)
 	}
 
-	// docs/14 deferred #8: an omitted ref defaults to the repo's default
+	// docs/archive/phases/14-phase5-implementation-notes.md deferred #8: an omitted ref defaults to the repo's default
 	// branch instead of enqueueing an empty one.
 	resp, respBody = p5fixReq(t, srv, http.MethodPost, "/api/v1/repos/pull-upstream", gitTok, []byte(`{}`))
 	if resp.StatusCode != http.StatusAccepted {
@@ -229,7 +229,7 @@ func testPullUpstreamDefaultsRefToDefaultBranch(t *testing.T, e *testEnv) {
 
 // TestCreateAbandonCleansSiblingRows seeds the durable rows a base_repo
 // create produces (repo + credential + upstream) and asserts createAbandon
-// removes all three, not just the repo row (docs/15 deferred #2).
+// removes all three, not just the repo row (docs/archive/phases/15-phase6-implementation-notes.md deferred #2).
 func TestCreateAbandonCleansSiblingRows(t *testing.T) {
 	runBackends(t, testCreateAbandonCleansSiblingRows)
 }

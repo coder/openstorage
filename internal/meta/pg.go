@@ -27,7 +27,7 @@ const (
 	// pgUniqueViolation is SQLSTATE 23505.
 	pgUniqueViolation = "23505"
 	// repoURLConstraint is the named UNIQUE(org_id, url) constraint; it spans
-	// soft-deleted rows on purpose (docs/01: re-create of a soft-deleted url
+	// soft-deleted rows on purpose (docs/explanation/domain-model.md: re-create of a soft-deleted url
 	// must 409).
 	repoURLConstraint = "repos_org_id_url_key"
 	// repoCols is the scan column list matching scanRepo.

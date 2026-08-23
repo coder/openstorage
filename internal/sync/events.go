@@ -5,14 +5,14 @@ import (
 	"time"
 )
 
-// Sync lifecycle event types (docs/06, X-Pierre-Event values).
+// Sync lifecycle event types (docs/reference/webhooks.md, X-Pierre-Event values).
 const (
 	EventSyncStarted   = "repo.sync.started"
 	EventSyncSucceeded = "repo.sync.succeeded"
 	EventSyncFailed    = "repo.sync.failed"
 )
 
-// Exact documented repo.sync.failed error strings (docs/06 — receivers may
+// Exact documented repo.sync.failed error strings (docs/reference/webhooks.md — receivers may
 // switch on these verbatim; never reword them).
 const (
 	FailAuth        = "authentication failed"

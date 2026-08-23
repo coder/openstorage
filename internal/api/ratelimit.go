@@ -1,4 +1,4 @@
-// Pre-auth rate limiting (docs/03: gateway-level 429). This file holds the
+// Pre-auth rate limiting (docs/reference/http-api.md: gateway-level 429). This file holds the
 // frozen phase-6 contract: RateLimitConfig on api.Config, a *rateLimiter
 // built once in New, and (*rateLimiter).limit(flavor) applied at every REST
 // route registration site (v1 + named-repo aliases + repo-urls) BEFORE the
@@ -61,8 +61,8 @@ const (
 	// plain {"error": ...} envelope.
 	routeRead routeFlavor = iota
 	// routeWrite: routes registered with requireAuthWrite answer 429 with
-	// the docs/04 §3 result envelope ({"result": {success: false, status:
-	// "unavailable", ...}}, docs/03 status mapping).
+	// the docs/explanation/streaming-commit-protocols.md §3 result envelope ({"result": {success: false, status:
+	// "unavailable", ...}}, docs/reference/http-api.md status mapping).
 	routeWrite
 )
 
@@ -94,7 +94,7 @@ type rateLimiter struct {
 
 // newRateLimiter returns (nil, nil) (disabled) when cfg.RPS <= 0, else a
 // limiter. Invalid config is an operator input error, so it returns a clean
-// startup error instead of panicking (docs/15 deferred #4).
+// startup error instead of panicking (docs/archive/phases/15-phase6-implementation-notes.md deferred #4).
 func newRateLimiter(cfg RateLimitConfig) (*rateLimiter, error) {
 	if math.IsNaN(cfg.RPS) || math.IsInf(cfg.RPS, 0) {
 		return nil, fmt.Errorf("rate limit config: RPS must be finite (got %v)", cfg.RPS)
@@ -273,7 +273,7 @@ func (l *rateLimiter) sweepLocked(now time.Time) {
 // RemoteAddr host (IPv4/IPv6), falling back to the raw RemoteAddr when it
 // carries no port; an empty RemoteAddr (possible for exotic listeners/
 // in-process handlers) maps to the shared "unknown" bucket so admit's
-// non-empty-key invariant holds (docs/15 deferred #3).
+// non-empty-key invariant holds (docs/archive/phases/15-phase6-implementation-notes.md deferred #3).
 //
 // When the peer is inside the TrustedProxies allowlist (issue #30), the key
 // becomes the rightmost X-Forwarded-For hop that is not itself allowlisted:
@@ -422,7 +422,7 @@ func NewGitRateLimit(cfg RateLimitConfig) (func(http.Handler) http.Handler, erro
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			// clientKey maps an empty RemoteAddr to the shared "unknown"
-			// bucket (docs/15 deferred #3), so exotic listeners degrade to
+			// bucket (docs/archive/phases/15-phase6-implementation-notes.md deferred #3), so exotic listeners degrade to
 			// a collective limit instead of panicking or bypassing, and
 			// resolves trusted-proxy identity exactly like the REST
 			// limiter (issue #30, shared plumbing). The whole-exchange

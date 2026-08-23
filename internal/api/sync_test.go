@@ -2,7 +2,7 @@ package api
 
 // Integration tests for the phase-5 upstream-sync surface (handlers_sync.go
 // + internal/sync): base_repo sync creation, pull-upstream, detach, and the
-// docs/06 repo.sync.* lifecycle with the exact documented error strings.
+// docs/reference/webhooks.md repo.sync.* lifecycle with the exact documented error strings.
 //
 // Topology per stack: the API mux registers ONLY this slice's routes
 // (api.New is frozen and does not call the register funcs yet — see the
@@ -179,7 +179,7 @@ func newUsyncStack(t *testing.T, e *testEnv) *usyncStack {
 	}
 
 	// Loopback: basic auth user "t" + verified git:write JWT for this org
-	// (docs/05) — the same checks githttp performs before receive-pack.
+	// (docs/explanation/git-protocol-and-namespaces.md) — the same checks githttp performs before receive-pack.
 	loop := usyncCGIServer(t, s.loopRoot, func(r *http.Request) bool {
 		user, pass, ok := r.BasicAuth()
 		if !ok || user != "t" {
@@ -318,7 +318,7 @@ func basicAuthEquals(user, pass, wantUser, wantPass string) bool {
 		subtle.ConstantTimeCompare([]byte(pass), []byte(wantPass)) == 1
 }
 
-// TestUpstreamSyncLifecycle drives the full docs/06 story: base_repo create
+// TestUpstreamSyncLifecycle drives the full docs/reference/webhooks.md story: base_repo create
 // with auth.token -> first sync (started/succeeded, run_count 0->1,
 // is_first_sync) -> pull-upstream 202 + second sync -> broken credential ->
 // failed with "authentication failed" -> idempotent detach.

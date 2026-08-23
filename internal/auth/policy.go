@@ -1,4 +1,4 @@
-// Ref-policy contract for the git receive path (docs/02 `refs`/`ops`
+// Ref-policy contract for the git receive path (docs/reference/authentication.md `refs`/`ops`
 // claims, docs/upstream/guides/branch-protection.md pattern syntax).
 //
 // FROZEN CONTRACT: the RefPolicy type, its tuple JSON encoding, and the
@@ -15,7 +15,7 @@ import (
 	"strings"
 )
 
-// Policy ops (docs/02 + branch-protection.md). Unknown ops fail closed in
+// Policy ops (docs/reference/authentication.md + branch-protection.md). Unknown ops fail closed in
 // the hook.
 const (
 	OpNoPush      = "no-push"
@@ -63,7 +63,7 @@ func (p RefPolicy) MarshalJSON() ([]byte, error) {
 // `refs/namespaces/ephemeral/refs/heads/main`.
 const EphemeralNamespacePrefix = "refs/namespaces/ephemeral/"
 
-// NormalizeRefName applies the docs/02 shorthand rule: anything not
+// NormalizeRefName applies the docs/reference/authentication.md shorthand rule: anything not
 // starting with `refs/` (and not exactly `*` or `HEAD`) becomes
 // `refs/heads/<value>`.
 func NormalizeRefName(s string) string {
@@ -91,7 +91,7 @@ func EphemeralRefName(ref string) string {
 }
 
 // ParseRefPolicies parses the `refs` claim JSON (ordered [pattern, ops]
-// tuples) and normalizes each pattern per the docs/02 shorthand rule:
+// tuples) and normalizes each pattern per the docs/reference/authentication.md shorthand rule:
 // anything not starting with `refs/` (and not exactly `*` or `HEAD`)
 // becomes `refs/heads/<value>`. Returns an error for malformed JSON or
 // tuples.
@@ -150,7 +150,7 @@ func patternMatch(pattern, ref string) bool {
 }
 
 // FoldOps merges the deprecated repo-wide `ops` claim into refs as a
-// fallback (docs/02): with no ops it returns refs unchanged; when refs
+// fallback (docs/reference/authentication.md): with no ops it returns refs unchanged; when refs
 // contains a `*` pattern entry, ops are merged into that entry's op list
 // (deduplicated, existing ops first); otherwise a trailing `["*", ops]`
 // rule is appended. `refs` and `ops` are not additive — callers apply this

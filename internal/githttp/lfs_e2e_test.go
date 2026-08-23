@@ -1,6 +1,6 @@
 package githttp
 
-// End-to-end git-lfs round-trip (docs/05): track a binary, push (the
+// End-to-end git-lfs round-trip (docs/explanation/git-protocol-and-namespaces.md): track a binary, push (the
 // git-lfs pre-push hook uploads via the batch API), fresh clone (the smudge
 // filter downloads it back), and assert the object landed in the blob store
 // under blob.LFSKey. Runs on both TestMain lanes: pg/minio exercises

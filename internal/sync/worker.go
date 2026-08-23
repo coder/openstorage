@@ -37,7 +37,7 @@ type Loopback struct {
 	// bound listener, never the external (load-balanced) base URL.
 	BaseURL string
 	// Token mints a short-lived git:write JWT for the loopback push (basic
-	// auth `t:<jwt>`, docs/05). The token is passed to git via GIT_ASKPASS
+	// auth `t:<jwt>`, docs/explanation/git-protocol-and-namespaces.md). The token is passed to git via GIT_ASKPASS
 	// and never logged. May return "" when BaseURL needs no auth (file://).
 	Token func(ctx context.Context, org string, repo RepoInfo) (string, error)
 }
@@ -45,7 +45,7 @@ type Loopback struct {
 // defaultRunTimeout caps one sync run end-to-end.
 const defaultRunTimeout = 10 * time.Minute
 
-// Worker executes sync runs (docs/06 lifecycle): claim the run, emit
+// Worker executes sync runs (docs/reference/webhooks.md lifecycle): claim the run, emit
 // repo.sync.started, mirror-fetch the upstream, loopback-push to storage,
 // then emit succeeded/failed with the exact documented error strings.
 // DELETE /repos/base at any point cancels silently (no failed event).
@@ -134,7 +134,7 @@ func (w *Worker) Run(ctx context.Context, job Job) error {
 	up, err := w.Upstreams.BeginSync(ctx, job.RepoID)
 	switch {
 	case errors.Is(err, ErrNotFound):
-		return nil // detached before start: cancel silently (docs/06)
+		return nil // detached before start: cancel silently (docs/reference/webhooks.md)
 	case errors.Is(err, ErrSyncInProgress):
 		return nil // overlapping run: skip (invariant 11)
 	case err != nil:
@@ -160,7 +160,7 @@ func (w *Worker) Run(ctx context.Context, job Job) error {
 
 	fin, err := w.Upstreams.FinishSync(ctx, job.RepoID, runErr == nil)
 	if errors.Is(err, ErrNotFound) {
-		return nil // detached mid-run: cancel silently (docs/06)
+		return nil // detached mid-run: cancel silently (docs/reference/webhooks.md)
 	}
 	if err != nil {
 		return fmt.Errorf("finish sync %s: %w", job.RepoID, err)
@@ -208,7 +208,7 @@ func (w *Worker) transfer(ctx context.Context, job Job, repo RepoInfo, up Upstre
 	}
 
 	// Upstream credential: absent = public upstream. Username defaults to
-	// "git" for token-only providers (docs/03: username optional).
+	// "git" for token-only providers (docs/reference/http-api.md: username optional).
 	username, password := "", ""
 	switch cred, err := w.Credentials.CredentialForRepo(ctx, job.RepoID); {
 	case err == nil:
@@ -229,7 +229,7 @@ func (w *Worker) transfer(ctx context.Context, job Job, repo RepoInfo, up Upstre
 	}
 
 	// Detach barrier between fetch and the storage push: DELETE /repos/base
-	// must cancel in-flight runs without a failed event (docs/06).
+	// must cancel in-flight runs without a failed event (docs/reference/webhooks.md).
 	if _, err := w.Upstreams.GetUpstream(ctx, job.RepoID); errors.Is(err, ErrNotFound) {
 		return errDetached
 	} else if err != nil {
@@ -249,7 +249,7 @@ func (w *Worker) transfer(ctx context.Context, job Job, repo RepoInfo, up Upstre
 	if err != nil {
 		return &syncFailure{code: FailInternal, cause: fmt.Errorf("mint loopback token: %w", err)}
 	}
-	// docs/05: git basic auth is username "t", password = JWT.
+	// docs/explanation/git-protocol-and-namespaces.md: git basic auth is username "t", password = JWT.
 	pushEnv, err := authGitEnv(filepath.Join(tmp, "askpass-push.sh"), "t", token, w.allowProtocol())
 	if err != nil {
 		return &syncFailure{code: FailInternal, cause: err}

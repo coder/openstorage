@@ -1,5 +1,5 @@
-// Core git:read endpoints (docs/07 p3 phases 2a/2b): refs, commits, files,
-// and conditional/range file streaming per docs/03 + docs/01 invariants
+// Core git:read endpoints (docs/archive/phases/07-implementation-roadmap.md p3 phases 2a/2b): refs, commits, files,
+// and conditional/range file streaming per docs/reference/http-api.md + docs/explanation/domain-model.md invariants
 // 2 (root commits), 3 (unborn branch 404), 9 (commits newest-first), and
 // 10 (annotated tags listed with the peeled commit sha).
 package api
@@ -28,11 +28,11 @@ import (
 // cursors. Helpers deliberately carry a "core" prefix: sibling endpoint
 // files add their own helpers and must not collide in this package.
 
-// resolveRepo maps the JWT repo claim — url or repo_id (docs/02) — to its
+// resolveRepo maps the JWT repo claim — url or repo_id (docs/reference/authentication.md) — to its
 // live repo row via meta.ResolveRepoKey (ADR-21); a repo that never existed
 // (or is soft-deleted) is a 404. Writes the {"error"} response and returns
 // ok=false on failure. Shared by the read and write surfaces; write
-// handlers that must answer with the docs/04 result envelope instead wrap
+// handlers that must answer with the docs/explanation/streaming-commit-protocols.md result envelope instead wrap
 // it (wcResolveRepo).
 func (s *server) resolveRepo(w http.ResponseWriter, r *http.Request) (meta.Repo, bool) {
 	claims := mustClaims(r)
@@ -69,7 +69,7 @@ func (s *server) materializeReadRepo(w http.ResponseWriter, r *http.Request, rep
 	return repoPath, true
 }
 
-// coreBoolParam parses a literal "true"/"false" query boolean (docs/03);
+// coreBoolParam parses a literal "true"/"false" query boolean (docs/reference/http-api.md);
 // absent means false. Anything else is a 400.
 func coreBoolParam(q url.Values, name string) (bool, error) {
 	switch q.Get(name) {
@@ -188,7 +188,7 @@ type listBranchesResponse struct {
 // handleListBranches implements GET /api/v1/repos/branches: branch rows come
 // straight from the ref authority (name, head sha, created_at), lexically
 // ordered, keyset-paginated by name. `ephemeral=true` lists the ephemeral
-// namespace instead (docs/02 p2 namespace).
+// namespace instead (docs/reference/authentication.md p2 namespace).
 func (s *server) handleListBranches(w http.ResponseWriter, r *http.Request) {
 	repo, ok := s.resolveReadRepo(w, r)
 	if !ok {
@@ -433,7 +433,7 @@ func (s *server) handleGetTag(w http.ResponseWriter, r *http.Request) {
 // ---------------------------------------------------------------------------
 // 2a: GET /repos/commits + GET /repos/commit
 
-// commitInfo is the docs/03 CommitInfo wire shape; `date` is the committer
+// commitInfo is the docs/reference/http-api.md CommitInfo wire shape; `date` is the committer
 // date (invariant 9 orders history by commit date).
 type commitInfo struct {
 	SHA            string   `json:"sha"`
@@ -901,7 +901,7 @@ func (s *server) handleGetFile(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "missing path")
 		return
 	}
-	// docs/03 lists ephemeral_base on this endpoint; with a single ref to
+	// docs/reference/http-api.md lists ephemeral_base on this endpoint; with a single ref to
 	// resolve it has no distinct meaning here, so it is validated and
 	// otherwise ignored (SDKs send it for API symmetry).
 	if _, err := coreBoolParam(q, "ephemeral_base"); err != nil {

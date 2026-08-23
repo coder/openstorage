@@ -9,7 +9,7 @@ import (
 )
 
 // Tag is one refs/tags entry. SHA is the PEELED commit sha for annotated
-// tags (invariant 10, docs/01:78-80) and the target itself for lightweight
+// tags (invariant 10, docs/explanation/domain-model.md:78-80) and the target itself for lightweight
 // tags.
 type Tag struct {
 	Name string // short tag name (refs/tags/ stripped)
@@ -23,7 +23,7 @@ type Tag struct {
 const tagRefPrefix = "refs/tags/"
 
 // PeeledTags lists all tags of the repo at repoPath in lexical refname
-// order (for-each-ref's default — the docs/03 GET /repos/tags order).
+// order (for-each-ref's default — the docs/reference/http-api.md GET /repos/tags order).
 // Invariant 10 wants the peeled COMMIT sha, so tags that reference (or
 // peel to) a non-commit object — trees or blobs, pushable with plain git —
 // are skipped rather than surfaced with a non-commit sha.

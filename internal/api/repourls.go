@@ -1,4 +1,4 @@
-// GET /api/repo-urls/{repo_id} (docs/03, openapi get_repo_url_by_id — note:
+// GET /api/repo-urls/{repo_id} (docs/reference/http-api.md, openapi get_repo_url_by_id — note:
 // NO /v1 prefix): resolve an internal repository ID to the repository URL
 // clients put in the JWT `repo` claim. Org-level org:read auth; the response
 // is exactly {"repo_id", "repo_name", "url"} (openapi: additionalProperties

@@ -50,14 +50,16 @@ export const meta = {
 };
 
 const SPEC_POINTER =
-  "Authoritative specs live in docs/ (01-domain-model .. 07-implementation-roadmap, README.md) " +
-  "and docs/upstream/openapi.yaml. Architecture: stateless Go nodes; Postgres = ref authority " +
+  "Authoritative specs live in docs/ (the reference/ and explanation/ spec pages; docs/README.md) " +
+  "and docs/upstream/openapi.yaml. Anything under docs/archive/ is historical context only " +
+  "(frozen phase notes and the original roadmap — decisions there may have been superseded); " +
+  "never treat it as the contract. Architecture: stateless Go nodes; Postgres = ref authority " +
   "(CAS) + metadata; S3/MinIO = immutable packs via gocloud.dev/blob; local disk = rebuildable LRU cache.";
 
 const PHASES = {
   "p0-spike": {
     title: "De-risk spike: git push -> S3 -> PG-CAS -> clone from a second node",
-    specRefs: "docs/05-git-protocol-and-namespaces.md, docs/07-implementation-roadmap.md",
+    specRefs: "docs/explanation/git-protocol-and-namespaces.md (authoritative); docs/archive/phases/07-implementation-roadmap.md (historical context only)",
     deliverables:
       "Working spike (throwaway quality allowed, but tested): git receive-pack behind JWT basic auth (user 't'); " +
       "hook routes every ref update through a Postgres CAS transaction; packs uploaded to MinIO BEFORE the ref flip; " +
@@ -75,13 +77,13 @@ const PHASES = {
   },
   "p1-skeleton-auth": {
     title: "Skeleton + auth: org registry, JWT middleware, repo CRUD, error envelope",
-    specRefs: "docs/02-authentication.md, docs/03-http-api.md (repo lifecycle), docs/01-domain-model.md",
+    specRefs: "docs/reference/authentication.md, docs/reference/http-api.md (repo lifecycle), docs/explanation/domain-model.md",
     deliverables:
       "Go service skeleton: BlobStore/RefStore interfaces; JWT middleware (ES256/RS256/EdDSA + PS256/ES384/ES512, " +
       "iss/repo/scopes/exp checks); {error} envelope; POST /repos, GET /repo, GET /repos (cursor pagination, q filter), " +
       "DELETE /repos/delete (soft delete, 404/409 semantics); single-org self-host mode; compose quickstart.",
     acceptance: [
-      "repo CRUD passes against PG+MinIO testcontainers, incl. 401/403/404/409 matrix from docs/03",
+      "repo CRUD passes against PG+MinIO testcontainers, incl. 401/403/404/409 matrix from docs/reference/http-api.md",
       "vendor Go SDK (apiBaseUrl override) performs createRepo/findOne/listRepos/deleteRepo unmodified",
       "JWT negative tests: wrong alg, expired, wrong iss, wrong repo claim, missing scope all rejected correctly",
     ],
@@ -89,7 +91,7 @@ const PHASES = {
   },
   "p2-git-http": {
     title: "Git smart HTTP: upload-pack/receive-pack, namespaces, policy hooks",
-    specRefs: "docs/05-git-protocol-and-namespaces.md, docs/02-authentication.md (ref policies)",
+    specRefs: "docs/explanation/git-protocol-and-namespaces.md, docs/reference/authentication.md (ref policies)",
     deliverables:
       "Smart HTTP on the storage host paths: info/refs + upload-pack (git:read), receive-pack (git:write) with " +
       "PG-CAS ref authority and S3-before-ref-flip ordering; +ephemeral/+import namespace routing; " +
@@ -103,12 +105,12 @@ const PHASES = {
   },
   "p3-read-api": {
     title: "Read API: files/branches/tags/commits/diff/blame/grep/archive",
-    specRefs: "docs/03-http-api.md, docs/01-domain-model.md (invariants 2,3,9,10)",
+    specRefs: "docs/reference/http-api.md, docs/explanation/domain-model.md (invariants 2,3,9,10)",
     deliverables:
       "All git:read endpoints incl. conditional/range file streaming (X-Blob-Sha, ETag, 206/304/412/416), " +
       "unborn-branch 404s, cursor pagination everywhere, camelCase quirks on GET /repos/diff.",
     acceptance: [
-      "endpoint tests match docs/03 status-code contract and response shapes",
+      "endpoint tests match docs/reference/http-api.md status-code contract and response shapes",
       "vendor SDK read methods pass against the service",
       "openapi.yaml schema validation on read endpoints (schemathesis or equivalent)",
     ],
@@ -116,7 +118,7 @@ const PHASES = {
   },
   "p4-write-api": {
     title: "Write API: NDJSON commit-pack/diff-commit, merge, branches, tags, notes",
-    specRefs: "docs/04-streaming-commit-protocols.md, docs/03-http-api.md, docs/01-domain-model.md (invariants 1-6)",
+    specRefs: "docs/explanation/streaming-commit-protocols.md, docs/reference/http-api.md, docs/explanation/domain-model.md (invariants 1-6)",
     deliverables:
       "Streaming NDJSON ingestion (incremental parse, 4MiB chunks, chunked bodies without Content-Length); " +
       "result envelope on the documented status list; CAS everywhere; merge + read-only preview; " +
@@ -130,7 +132,7 @@ const PHASES = {
   },
   "p5-eventing-sync": {
     title: "Eventing & sync: webhooks, upstream mirrors, forking",
-    specRefs: "docs/06-webhooks.md, docs/03-http-api.md (git-credentials, pull-upstream), docs/01 (invariants 7,11,12)",
+    specRefs: "docs/reference/webhooks.md, docs/reference/http-api.md (git-credentials, pull-upstream), docs/explanation/domain-model.md (invariants 7,11,12)",
     deliverables:
       "River-backed webhook delivery (HMAC t=..,sha256=.. signing, re-sign on retry); base_repo sync workers; " +
       "pull-upstream 202; git-credentials CRUD; provider:code forking; ephemeral updates emit no push events.",
@@ -143,7 +145,7 @@ const PHASES = {
   },
   "p6-lfs-polish": {
     title: "LFS + polish: batch API, named-repo routes, repo-urls, rate limits",
-    specRefs: "docs/05-git-protocol-and-namespaces.md (LFS), docs/03-http-api.md, docs/README.md (path styles)",
+    specRefs: "docs/explanation/git-protocol-and-namespaces.md (LFS), docs/reference/http-api.md, docs/README.md (path styles)",
     deliverables:
       "LFS batch endpoint with presigned S3 transfers; /api/repos/{repo_name}/... routing aliases; " +
       "GET /api/repo-urls/{repo_id}; basic rate limiting; two-replica compose profile in the quickstart.",
@@ -164,7 +166,7 @@ const REVIEW_LANES = [
   {
     name: "wire-conformance",
     focus:
-      "exact conformance to docs/02..04 and docs/upstream/openapi.yaml: paths, param names/casing, status codes, envelopes, headers",
+      "exact conformance to the auth/http-api/streaming spec pages (docs/reference, docs/explanation) and docs/upstream/openapi.yaml: paths, param names/casing, status codes, envelopes, headers",
   },
   {
     name: "security",
@@ -479,7 +481,8 @@ export default function workflow({ args, phase, log, agent, parallel, applyPatch
   agent(
     `Update project documentation for this phase: implementation notes / ADRs for non-obvious decisions ` +
       `(ref-authority-in-PG, S3-before-ref-flip, namespace mapping), README quickstart if setup changed, and ` +
-      `docs/07-implementation-roadmap.md phase status. Match existing docs tone; no marketing fluff.\n\nWhat was built:\n${implementSummary}${commitRule}`,
+      `the affected living reference/explanation pages under docs/. Do NOT edit anything under docs/archive/ ` +
+      `— those are frozen historical records. Match existing docs tone; no marketing fluff.\n\nWhat was built:\n${implementSummary}${commitRule}`,
     { id: "document", title: "Document phase" }
   );
   applyChildPatch("apply-document", "document");
