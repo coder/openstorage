@@ -442,9 +442,9 @@ func (s slowUploadStore) UploadFile(ctx context.Context, key, path string) error
 // the floor generation.
 func TestEnsurePublishedRenewsCoverThroughPublication(t *testing.T) {
 	ctx := context.Background()
-	oldInterval := coverRenewInterval
-	coverRenewInterval = 20 * time.Millisecond
-	t.Cleanup(func() { coverRenewInterval = oldInterval })
+	oldInterval, oldBudget := coverRenewInterval, coverLapseBudget
+	coverRenewInterval, coverLapseBudget = 20*time.Millisecond, 80*time.Millisecond
+	t.Cleanup(func() { coverRenewInterval, coverLapseBudget = oldInterval, oldBudget })
 
 	key := PackKey("r1", "renewed")
 	b := seededFile(t, key, "pack-bytes")
@@ -471,9 +471,9 @@ func TestEnsurePublishedRenewsCoverThroughPublication(t *testing.T) {
 		t.Fatalf("cover calls = %d, want ≥ 4 (initial + renewals through the upload + post-publication refresh)", n)
 	}
 
-	// Renewal-tick failures are tolerated while the upload converges, but
-	// a failed POST-PUBLICATION refresh surfaces with restored=true: the
-	// bytes are durably back and the caller must still invalidate floors.
+	// Once every renewal fails, continuity runs out MID-UPLOAD and the
+	// restore aborts (Codex rounds 62+63): uncovered bytes must never
+	// become physical.
 	if err := b.Delete(ctx, key); err != nil {
 		t.Fatal(err)
 	}
@@ -483,13 +483,13 @@ func TestEnsurePublishedRenewsCoverThroughPublication(t *testing.T) {
 			first = false
 			return nil // the initial cover succeeds
 		}
-		return errors.New("ledger unreachable") // every renewal + the final refresh fail
+		return errors.New("ledger unreachable") // every renewal fails
 	})
-	if !restored || err == nil {
-		t.Fatalf("EnsurePublished(failed final refresh) = (%v, %v), want (true, error)", restored, err)
+	if restored || err == nil || !strings.Contains(err.Error(), "restore cover continuity lost") {
+		t.Fatalf("EnsurePublished(dead ledger) = (%v, %v), want an aborted, unpublished restore", restored, err)
 	}
-	if _, serr := b.Stat(ctx, key); serr != nil {
-		t.Fatalf("restore with failed refresh did not publish: %v", serr)
+	if _, serr := b.Stat(ctx, key); !errors.Is(serr, ErrNotFound) {
+		t.Fatalf("aborted restore published anyway (stat: %v)", serr)
 	}
 }
 
@@ -552,6 +552,34 @@ func TestWithRenewedCoverRejectsLateSuccess(t *testing.T) {
 	})
 	if opErr == nil || !strings.Contains(opErr.Error(), "restore cover continuity lost") {
 		t.Fatalf("opErr = %v, want a continuity abort on late-completing renewals", opErr)
+	}
+}
+
+// TestWithRenewedCoverFinalRefreshRejectsLateCommit (Codex round 63,
+// security): the tail refresh used to run as ONE wide-timeout attempt —
+// with a near-minimum TTL it could finish tens of seconds after the prior
+// cover expired, and the gap before the caller's generation bump is
+// exactly the uncovered window a stale-floor admission exploits. The
+// refresh now runs under the same continuity discipline as every renewal:
+// an attempt completing outside the prior cover's budget surfaces
+// renewErr instead of silently accepting the gap.
+func TestWithRenewedCoverFinalRefreshRejectsLateCommit(t *testing.T) {
+	oldI, oldT, oldB := coverRenewInterval, coverRenewTimeout, coverLapseBudget
+	coverRenewInterval, coverRenewTimeout, coverLapseBudget = 10*time.Millisecond, 100*time.Millisecond, 25*time.Millisecond
+	t.Cleanup(func() { coverRenewInterval, coverRenewTimeout, coverLapseBudget = oldI, oldT, oldB })
+
+	// The op is instant (no ticks); the final refresh SUCCEEDS but only
+	// after the prior cover's budget window has passed.
+	renew := func(context.Context) error {
+		time.Sleep(40 * time.Millisecond)
+		return nil
+	}
+	opErr, renewErr := WithRenewedCover(context.Background(), renew, func(context.Context) error { return nil })
+	if opErr != nil {
+		t.Fatalf("opErr = %v, want nil", opErr)
+	}
+	if renewErr == nil || !strings.Contains(renewErr.Error(), "continuity lost at the final refresh") {
+		t.Fatalf("renewErr = %v, want a late-commit rejection", renewErr)
 	}
 }
 

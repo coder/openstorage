@@ -346,6 +346,33 @@ func WithRenewedCover(ctx context.Context, renew func(context.Context) error, op
 	assertf(renew != nil && op != nil, "WithRenewedCover: nil renew or op")
 	opCtx, opCancel := context.WithCancelCause(ctx)
 	defer opCancel(nil)
+	// covered is the conservative anchor of the newest PROVEN cover row:
+	// the caller's initial cover committed before this function was
+	// entered, and each accepted renewal anchors at its attempt START
+	// (the row's created_at is at or after it). Written by the renewal
+	// goroutine, read by the final-refresh loop strictly after wg.Wait —
+	// no concurrent access.
+	covered := time.Now()
+	// attemptRenew runs ONE bounded, continuity-checked renewal: a
+	// renewal proves continuity only if it COMPLETED while the prior
+	// cover still lived (Codex round 63) — a success committing after
+	// the prior row expired leaves an uncovered gap a stale-floor
+	// admission can use. Completion is an upper bound on the commit
+	// time; the budget is strictly under the minimum TTL, so
+	// completion-before-deadline proves commit-before-expiry. The
+	// context is detached: renewals are restore accounting, not client
+	// work.
+	attemptRenew := func() (ok, lost bool, err error) {
+		start := time.Now()
+		rctx, rcancel := context.WithTimeout(context.WithoutCancel(ctx), coverRenewTimeout)
+		err = renew(rctx)
+		rcancel()
+		if err == nil && time.Since(covered) <= coverLapseBudget {
+			covered = start
+			return true, false, nil
+		}
+		return false, time.Since(covered) > coverLapseBudget, err
+	}
 	// renew invocations are strictly serialized: the renewal goroutine is
 	// joined before the final refresh, so callers need no concurrency
 	// handling in the callback.
@@ -356,34 +383,12 @@ func WithRenewedCover(ctx context.Context, renew func(context.Context) error, op
 		defer wg.Done()
 		t := time.NewTicker(coverRenewInterval)
 		defer t.Stop()
-		// covered is the conservative anchor of the newest PROVEN cover
-		// row: the caller's initial cover committed before this function
-		// was entered, and each accepted renewal below anchors at its
-		// attempt START (the row's created_at is at or after it).
-		covered := time.Now()
 		for {
 			select {
 			case <-done:
 				return
 			case <-t.C:
-				start := time.Now()
-				rctx, rcancel := context.WithTimeout(ctx, coverRenewTimeout)
-				err := renew(rctx)
-				rcancel()
-				// A renewal proves CONTINUITY only if it COMPLETED while
-				// the prior cover still lived (Codex round 63): a success
-				// committing after the prior row expired leaves an
-				// uncovered gap a stale-floor admission can use, so it
-				// must abort like a lapse — resetting the anchor on any
-				// success accepted exactly that gap. Completion is an
-				// upper bound on the commit time; the budget is strictly
-				// under the minimum TTL, so completion-before-deadline
-				// proves commit-before-expiry.
-				if err == nil && time.Since(covered) <= coverLapseBudget {
-					covered = start
-					continue
-				}
-				if time.Since(covered) > coverLapseBudget {
+				if _, lost, err := attemptRenew(); lost {
 					opCancel(fmt.Errorf("restore cover continuity lost (last renewal: %v)", err))
 					return
 				}
@@ -401,22 +406,26 @@ func WithRenewedCover(ctx context.Context, renew func(context.Context) error, op
 		}
 		return opErr, nil
 	}
-	// The op may have consumed nearly its entire deadline (Codex round
-	// 60): a publication succeeding at the deadline's edge must not lose
-	// its MANDATORY tail refresh to that same deadline — the last tick
-	// could be a full renewal interval old, leaving the cover a shorter
-	// life than the stale-floor tail (floor lifetime + admission handoff
-	// margin). The refresh runs on its own fresh bounded context,
-	// detached like the restore work it concludes.
-	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), coverRefreshTimeout)
-	defer cancel()
-	return nil, renew(rctx)
+	// The MANDATORY tail refresh runs under the SAME continuity
+	// discipline (Codex rounds 60+63, security): it must COMMIT while the
+	// prior cover still lives — a single wide-timeout attempt could
+	// finish after that row expired, and the gap before the caller's
+	// generation bump is exactly the uncovered window a stale-floor
+	// admission exploits. Attempts stay bounded and retry on the renewal
+	// cadence while continuity holds; losing it surfaces renewErr (the
+	// bytes are already durable — the caller reports the broken tail and
+	// still bumps the floor generation).
+	for {
+		ok, lost, err := attemptRenew()
+		if ok {
+			return nil, nil
+		}
+		if lost {
+			return nil, fmt.Errorf("restore cover continuity lost at the final refresh (last renewal: %v)", err)
+		}
+		time.Sleep(coverRenewInterval)
+	}
 }
-
-// coverRefreshTimeout bounds WithRenewedCover's post-publication refresh:
-// one ledger round-trip on a fresh context, generous against transient
-// stalls yet far under the refreshed TTL it exists to restart.
-const coverRefreshTimeout = time.Minute
 
 // ensurePublishedTimeout bounds EnsurePublished's detached verification.
 // The bound scales with the pack size — a repair upload MUST be able to
