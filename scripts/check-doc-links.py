@@ -15,6 +15,8 @@ import os, re, sys, posixpath
 os.chdir(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
 LINK = re.compile(r"\]\(([^)\s#]*)(#[^)\s]*)?\)")
+FENCE = re.compile(r"^ {0,3}(```|~~~)")
+
 HEADING = re.compile(r"^#+ +(.*)$")
 def gh_anchor(h):
     h = re.sub(r"[`*]", "", h.strip().lower())
@@ -32,7 +34,7 @@ def check():
         aset = set()
         in_code = False
         for ln in open(path):
-            if ln.startswith("```"):
+            if FENCE.match(ln):
                 in_code = not in_code
                 continue
             if in_code: continue
@@ -51,7 +53,7 @@ def check():
         d = posixpath.dirname(path) or "."
         in_code = False
         for lineno, ln in enumerate(open(path), 1):
-            if ln.strip().startswith("```"):
+            if FENCE.match(ln):
                 in_code = not in_code
                 continue
             if in_code: continue
