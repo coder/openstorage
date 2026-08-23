@@ -2,12 +2,13 @@
 // smart-HTTP and REST read calls Hydrate first, so the generation-marker
 // short circuit is the read path's per-request floor.
 // BenchmarkHydrateFastPath times the whole short-circuited Hydrate
-// (EnsureCacheRepo verification + one GetGeneration point-read + marker
-// read); BenchmarkEnsureCacheRepo isolates the EnsureCacheRepo component,
-// whose two `git config --get` subprocess forks per call dominate the fast
-// path — the companion perf issue (#93) consumes these numbers as its
-// baseline. Fixtures are container-free (SQLite ref store + fileblob, the
-// local-mode wiring) and run identically on both TestMain lanes.
+// (memoized EnsureCacheRepo verification + one GetGeneration point-read +
+// marker read); BenchmarkEnsureCacheRepo isolates the EnsureCacheRepo
+// component, whose two `git config --get` subprocess forks per call used
+// to dominate the fast path until issue #93 memoized the verification —
+// these benchmarks are its before/after evidence. Fixtures are
+// container-free (SQLite ref store + fileblob, the local-mode wiring) and
+// run identically on both TestMain lanes.
 package githttp
 
 import (
@@ -67,9 +68,10 @@ func BenchmarkHydrateFastPath(b *testing.B) {
 }
 
 // BenchmarkEnsureCacheRepo measures the steady-state (already configured)
-// EnsureCacheRepo alone: the two `git config --get` subprocess forks plus
-// hook verification that run on EVERY request even when the generation
-// marker short-circuits everything else (issue #93's optimization target).
+// EnsureCacheRepo alone: the memoized fingerprint verification (issue #93)
+// that replaced the two `git config --get` subprocess forks plus hook
+// ReadFile/Stat checks that previously ran on EVERY request even when the
+// generation marker short-circuited everything else.
 func BenchmarkEnsureCacheRepo(b *testing.B) {
 	const repo = "benchrepo"
 	_, _, cacheDir := benchHydrateEnv(b, repo)

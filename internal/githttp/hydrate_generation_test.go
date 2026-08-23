@@ -186,6 +186,50 @@ func TestHydrate_ShortCircuitsOnUnchangedGeneration(t *testing.T) {
 	}
 }
 
+// The generation fast path must spawn ZERO git subprocesses (issue #93):
+// EnsureCacheRepo's config/hook verification is memoized in-process after
+// the first full pass, so the two per-request `git config --get` forks
+// disappear from the marker short-circuit. Spawns are observed through the
+// gitSpawnObserver seam and filtered to this test's private cache dir, so
+// unrelated git activity can never pollute the count.
+func TestHydrate_FastPathSpawnsNoGitSubprocess(t *testing.T) {
+	st, bl, cacheDir := hydrateEnv(t)
+	const repo = "t-gen-nofork"
+
+	// Full first hydrate: creates + verifies the cache repo and writes the
+	// generation marker, priming both the marker and the memo.
+	repoPath := mustHydrate(t, st, bl, cacheDir, repo)
+
+	var (
+		mu     sync.Mutex
+		spawns []string
+	)
+	obs := func(dir string, args []string) {
+		line := dir + ": git " + strings.Join(args, " ")
+		if !strings.Contains(line, cacheDir) {
+			return // not ours (defensive; this package's tests are sequential)
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		spawns = append(spawns, line)
+	}
+	gitSpawnObserver.Store(&obs)
+	defer gitSpawnObserver.Store(nil)
+
+	for i := 0; i < 3; i++ {
+		if again := mustHydrate(t, st, bl, cacheDir, repo); again != repoPath {
+			t.Fatalf("repoPath changed on fast path: %q != %q", again, repoPath)
+		}
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(spawns) != 0 {
+		t.Fatalf("fast-path Hydrate spawned %d git subprocesses, want 0:\n%s",
+			len(spawns), strings.Join(spawns, "\n"))
+	}
+}
+
 // A default-branch change must defeat the short-circuit even when the
 // ref-store generation is unchanged (issue #18): default-branch updates
 // live in the meta row and bump no generation, so the marker additionally

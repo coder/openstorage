@@ -126,6 +126,79 @@ func TestEnsureCacheRepo_RepairsHooksAndConfig(t *testing.T) {
 	}
 }
 
+// A memoized "verified" cache repo whose directory vanishes underneath the
+// process (operator wipe of the rebuildable cache — the stateless-node
+// property) must fall through to the full pass and recreate everything,
+// never crash and never vouch for the missing repo (issue #93).
+func TestEnsureCacheRepo_MemoFallsThroughOnRepoRemoval(t *testing.T) {
+	cacheDir := t.TempDir()
+	const repo = "t-ensure-recreate"
+	repoPath, err := EnsureCacheRepo(cacheDir, repo)
+	if err != nil {
+		t.Fatalf("EnsureCacheRepo: %v", err)
+	}
+	// Second call takes the memo fast path and must agree on the path.
+	if again, err := EnsureCacheRepo(cacheDir, repo); err != nil || again != repoPath {
+		t.Fatalf("memoized EnsureCacheRepo = (%q, %v), want (%q, nil)", again, err, repoPath)
+	}
+
+	if err := os.RemoveAll(repoPath); err != nil {
+		t.Fatal(err)
+	}
+
+	again, err := EnsureCacheRepo(cacheDir, repo)
+	if err != nil {
+		t.Fatalf("EnsureCacheRepo (recreate): %v", err)
+	}
+	if again != repoPath {
+		t.Fatalf("repo path changed on recreate: %q != %q", again, repoPath)
+	}
+	for _, name := range []string{"pre-receive", "update"} {
+		fi, err := os.Stat(filepath.Join(repoPath, "hooks", name))
+		if err != nil {
+			t.Fatalf("hook %s not reinstalled after recreate: %v", name, err)
+		}
+		if fi.Mode().Perm() != 0o755 {
+			t.Fatalf("hook %s not executable: %v", name, fi.Mode())
+		}
+	}
+	if got := strings.TrimSpace(mustGit(t, repoPath, "config", "--get", "receive.unpackLimit")); got != "0" {
+		t.Fatalf("receive.unpackLimit = %q, want 0", got)
+	}
+}
+
+// A bare chmod changes neither the hook's inode nor its mtime/size, and git
+// silently skips non-executable hooks — the memo compares the mode exactly
+// so a memoized fast path can never vouch for a disarmed hook (issue #93).
+func TestEnsureCacheRepo_MemoInvalidatedByHookChmod(t *testing.T) {
+	cacheDir := t.TempDir()
+	const repo = "t-ensure-chmod"
+	repoPath, err := EnsureCacheRepo(cacheDir, repo)
+	if err != nil {
+		t.Fatalf("EnsureCacheRepo: %v", err)
+	}
+	// Prime the memo fast path.
+	if _, err := EnsureCacheRepo(cacheDir, repo); err != nil {
+		t.Fatalf("EnsureCacheRepo (memoize): %v", err)
+	}
+
+	hook := filepath.Join(repoPath, "hooks", "pre-receive")
+	if err := os.Chmod(hook, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := EnsureCacheRepo(cacheDir, repo); err != nil {
+		t.Fatalf("EnsureCacheRepo (repair): %v", err)
+	}
+	fi, err := os.Stat(hook)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode().Perm() != 0o755 {
+		t.Fatalf("disarmed hook not repaired: mode %v, want 0755", fi.Mode())
+	}
+}
+
 // Regression for the corrupt-pack race: a corrupt pack file left at the
 // hydration target (crashed downloader, partial write) must never wedge
 // hydration. The temp-file + rename scheme downloads fresh bytes beside it
