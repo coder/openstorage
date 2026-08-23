@@ -303,6 +303,53 @@ func TestLFSPublicationLeaseLeavesFloorCoverage(t *testing.T) {
 	}
 }
 
+// TestLFSAdoption_UsableLeaseAtMinimumTTL (Codex round 52): adoption
+// verification must NOT run under the publication lease's residual-cover
+// cap — its bytes are already durable and floor-covered, no reservation
+// protects them — or near-minimum TTLs (61s → a one-second lease) would
+// make any legacy object slower than that to read and hash permanently
+// unadoptable, wedging the write-touch migration. At a 61-second TTL the
+// adoption of a (deliberately slow-to-read) legacy object must succeed.
+func TestLFSAdoption_UsableLeaseAtMinimumTTL(t *testing.T) {
+	ctx := context.Background()
+	srv, st, mint := newLFSQuotaServer(t, 0, MinPackReservationTTL+time.Second)
+	tok := mint(auth.ScopeGitWrite)
+
+	legacy := []byte("legacy object slower than the capped lease")
+	oid := sha256Hex(legacy)
+	key := blob.LFSKey(lfsTestRepoID, oid)
+	if err := srv.Blob.UploadFile(ctx, key, writeTempFile(t, legacy)); err != nil {
+		t.Fatal(err)
+	}
+	// Reads take ~1.2s: longer than the 1s capped publication lease, far
+	// under the 90%-of-TTL adoption lease.
+	srv.Blob = slowReadBlob{BlobStore: srv.Blob, delay: 1200 * time.Millisecond}
+
+	resp := decodeBatch(t, doLFS(t, srv, http.MethodPost, lfsBatchPath, "basic:"+tok,
+		batchBody("upload", oid, int64(len(legacy)))))
+	if resp.Objects[0].Error != nil || resp.Objects[0].Actions != nil {
+		t.Fatalf("near-minimum-TTL adoption failed: %+v", resp.Objects[0])
+	}
+	if has, err := st.HasLFSObject(ctx, lfsTestRepoID, key); err != nil || !has {
+		t.Fatalf("object not adopted: %v, %v", has, err)
+	}
+}
+
+// slowReadBlob delays ranged reads, simulating a slow-to-hash legacy blob.
+type slowReadBlob struct {
+	blob.BlobStore
+	delay time.Duration
+}
+
+func (b slowReadBlob) ReadRange(ctx context.Context, key string, offset, length int64) ([]byte, error) {
+	select {
+	case <-time.After(b.delay):
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	return b.BlobStore.ReadRange(ctx, key, offset, length)
+}
+
 // TestLFSAdopt_RecheckCatchesRacingSweep (Codex round 1): adoption whose
 // blob a racing sweep reaped before the registration committed must fail
 // the request — the post-registration existence recheck catches it, and the

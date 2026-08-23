@@ -700,7 +700,16 @@ func (s *Server) adoptLFSObject(ctx context.Context, repoID, key, oid string) er
 	// regardless of the requester's fate; the committed row makes the
 	// work once-per-object. The lease still bounds the op slot against a
 	// wedged backend or a parked connection.
-	vctx, vcancel := context.WithTimeout(context.WithoutCancel(ctx), s.lfsPublicationLease())
+	// Adoption gets its own lease — the FULL 90% of the TTL, not the
+	// publication lease's residual-cover cap (Codex round 52): the
+	// residual-cover requirement protects newly published orphan bytes
+	// whose only quota cover is a reservation, but adoption verifies
+	// bytes that are ALREADY durable and listed (floor-covered), holds no
+	// reservation, and registers atomically or not at all. Capping it
+	// would make any legacy object needing more than TTL−60s to read and
+	// hash permanently unadoptable at near-minimum TTLs, wedging the
+	// documented write-touch migration.
+	vctx, vcancel := context.WithTimeout(context.WithoutCancel(ctx), s.lfsReservationTTL()*9/10)
 	defer vcancel()
 	verifiedSize, err := s.verifyStoredLFSObject(vctx, repoID, key, oid)
 	if err != nil {
