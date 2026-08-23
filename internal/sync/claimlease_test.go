@@ -72,21 +72,27 @@ func TestDeadHolderClaimIsStolenAndSyncHeals(t *testing.T) {
 		t.Fatalf("EnqueueSync: %v", err)
 	}
 
+	// Converge on the ROW, not just the loopback ref: the worker pushes
+	// before FinishSync releases the claim, so a row read at push time
+	// races the finisher and still sees an in-flight claim (issue #99).
+	var up Upstream
 	deadline := time.After(30 * time.Second)
-	for loopbackMain(t, loop) != head {
+	for {
+		var err error
+		if up, err = f.store.GetUpstream(context.Background(), "repo_wedge"); err != nil {
+			t.Fatal(err)
+		}
+		if !up.Syncing && loopbackMain(t, loop) == head {
+			break
+		}
 		select {
 		case <-deadline:
-			up, _ := f.store.GetUpstream(context.Background(), "repo_wedge")
 			t.Fatalf("dead holder wedged sync forever: loopback main = %q, want %s (row: %+v)",
 				loopbackMain(t, loop), head, up)
 		case <-time.After(100 * time.Millisecond):
 		}
 	}
-	up, err := f.store.GetUpstream(context.Background(), "repo_wedge")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if up.Syncing || up.SyncPending || up.RunCount != 1 || up.SyncClaimHolder != "" {
+	if up.SyncPending || up.RunCount != 1 || up.SyncClaimHolder != "" {
 		t.Errorf("row after steal-and-sync = %+v, want one counted run with a released, cleared claim", up)
 	}
 }
@@ -117,22 +123,28 @@ func TestDeadHolderUnexpiredLeaseDefersRetry(t *testing.T) {
 	}
 
 	// The immediate run skips (lease unexpired); the deferred retry fires
-	// just past expiry, steals, and syncs.
+	// just past expiry, steals, and syncs. Converge on the ROW, not just
+	// the loopback ref: the worker pushes before FinishSync releases the
+	// claim, so a row read at push time races the finisher and still sees
+	// the thief's in-flight claim (issue #99).
+	var up Upstream
 	deadline := time.After(30 * time.Second)
-	for loopbackMain(t, loop) != head {
+	for {
+		var err error
+		if up, err = f.store.GetUpstream(context.Background(), "repo_defer"); err != nil {
+			t.Fatal(err)
+		}
+		if !up.Syncing && loopbackMain(t, loop) == head {
+			break
+		}
 		select {
 		case <-deadline:
-			up, _ := f.store.GetUpstream(context.Background(), "repo_defer")
 			t.Fatalf("unexpired dead holder stranded the request: loopback main = %q, want %s (row: %+v)",
 				loopbackMain(t, loop), head, up)
 		case <-time.After(100 * time.Millisecond):
 		}
 	}
-	up, err := f.store.GetUpstream(context.Background(), "repo_defer")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if up.Syncing || up.SyncPending || up.RunCount != 1 {
+	if up.SyncPending || up.RunCount != 1 {
 		t.Errorf("row after deferred steal = %+v, want one counted run with consumed marker", up)
 	}
 }
