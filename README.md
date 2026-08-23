@@ -37,8 +37,9 @@ every other.
 ## Install
 
 Prebuilt binaries (`linux`/`darwin` × `amd64`/`arm64`, with `checksums.txt`) ship on the
-[releases page](https://github.com/coder/code-storage/releases). Any of these puts
-`codestorage` on your `PATH`:
+[releases page](https://github.com/coder/code-storage/releases). The first two options put
+`codestorage` on your `PATH`, which the quickstarts below assume; a source build lands at
+`./codestorage` — substitute accordingly:
 
 ```sh
 # Go toolchain (needs Go >= 1.26):
@@ -47,11 +48,11 @@ go install github.com/coder/code-storage/cmd/codestorage@latest
 # mise (downloads the release binary; verifies checksums + GitHub artifact attestations):
 mise use -g github:coder/code-storage@latest
 
-# From source (contributors):
-git clone https://github.com/coder/code-storage.git && cd code-storage
-go build ./cmd/codestorage        # → ./codestorage
-
 codestorage version               # verify the install
+
+# From source (contributors; builds ./codestorage without touching PATH):
+git clone https://github.com/coder/code-storage.git && cd code-storage
+go build ./cmd/codestorage && ./codestorage version
 ```
 
 > [!NOTE]
