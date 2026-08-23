@@ -102,14 +102,25 @@ The pin lives in [`.github/workflows/ci.yml`](.github/workflows/ci.yml) (the
 
 PRs are **squash-merged**, and [release-please derives versions and the
 CHANGELOG from the squash titles](docs/how-to/release.md) — so the PR title
-must be a [conventional commit](https://www.conventionalcommits.org/):
+must be a [conventional commit](https://www.conventionalcommits.org/) subject.
+The `pr-title` CI check enforces the shape on every PR and re-checks it when
+the title is edited:
 
+```
+type(scope)?: summary
+```
+
+- The type prefix is **required**. Allowed types: `feat`, `fix`, `docs`, `ci`,
+  `chore`, `build`, `refactor`, `test`, `perf`.
+- The repo's package-prefix habit goes in the **scope**, not the type:
+  `fix(githttp): ...`, never `githttp: ...`. A bare package prefix is not a
+  conventional commit, so release-please ignores the commit entirely — a
+  genuine fix never reaches the CHANGELOG or the version bump (this happened
+  to #81).
 - `fix: ...` → patch release, `feat: ...` → minor release,
   `feat!:` / `BREAKING CHANGE:` → breaking.
-- `docs:`, `test:`, `ci:`, `chore:`, `build:`, `refactor:` → no release, hidden
-  from the CHANGELOG.
-- Anything else is invisible to the release tooling — releasable work with a
-  non-conventional title silently never ships.
+- `docs:`, `test:`, `ci:`, `chore:`, `build:`, `refactor:`, `perf:` → no
+  release, hidden from the CHANGELOG.
 
 Individual commits inside the PR branch can be anything; only the squash title
 counts.
