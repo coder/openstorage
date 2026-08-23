@@ -51,10 +51,11 @@ def scan_lines(path):
             if fence is None:
                 fence = (marker[0], len(marker))
                 continue
-            if marker[0] == fence[0] and len(marker) >= fence[1]:
+            # a closing fence may be followed only by whitespace (CommonMark)
+            if marker[0] == fence[0] and len(marker) >= fence[1] and not ln[m.end():].strip():
                 fence = None
                 continue
-            # a shorter/other-char fence inside an open block is content
+            # anything else inside an open block is content
         if fence is None:
             yield lineno, ln
 
