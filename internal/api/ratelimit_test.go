@@ -50,7 +50,7 @@ func TestRateLimitDisabledPassthrough(t *testing.T) {
 }
 
 // TestRateLimitInvalidConfigError asserts invalid operator config is a clean
-// startup error, never a panic (docs/15 deferred #4).
+// startup error, never a panic (docs/archive/phases/15-phase6-implementation-notes.md deferred #4).
 func TestRateLimitInvalidConfigError(t *testing.T) {
 	cases := map[string]RateLimitConfig{
 		"burst zero": {RPS: 1},
@@ -217,7 +217,7 @@ func TestClientKey(t *testing.T) {
 		{"ipv6", "[2001:db8::1]:443", "", "2001:db8::1"},
 		{"no-port", "10.1.2.3", "", "10.1.2.3"},
 		{"xff-ignored", "10.1.2.3:5555", "203.0.113.9", "10.1.2.3"},
-		// docs/15 deferred #3: an empty RemoteAddr falls back to the
+		// docs/archive/phases/15-phase6-implementation-notes.md deferred #3: an empty RemoteAddr falls back to the
 		// shared sentinel bucket instead of tripping admit's assert.
 		{"empty", "", "", "unknown"},
 	}
@@ -411,7 +411,7 @@ func TestGitRateLimit429Envelope(t *testing.T) {
 
 // TestGitRateLimitEmptyRemoteAddr: an empty RemoteAddr (exotic listeners,
 // in-process handlers) degrades to the shared "unknown" bucket instead of
-// panicking or bypassing the limiter (docs/15 deferred #3, issue #21).
+// panicking or bypassing the limiter (docs/archive/phases/15-phase6-implementation-notes.md deferred #3, issue #21).
 func TestGitRateLimitEmptyRemoteAddr(t *testing.T) {
 	mw, err := NewGitRateLimit(RateLimitConfig{RPS: 0.001, Burst: 1})
 	if err != nil {

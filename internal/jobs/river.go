@@ -20,7 +20,7 @@ import (
 )
 
 // deliveryArgs is one durable webhook-delivery job. The payload is the
-// exact JSON body frozen at enqueue time (docs/06: only the signature is
+// exact JSON body frozen at enqueue time (docs/reference/webhooks.md: only the signature is
 // recomputed per attempt).
 type deliveryArgs struct {
 	WebhookID string          `json:"webhook_id"`

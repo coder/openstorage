@@ -81,7 +81,7 @@ every storage slot **not set explicitly**:
 Explicit `CODESTORAGE_PG_URL` / `CODESTORAGE_S3_URL` / `--cache-dir` always win over the
 derivation. The path is made absolute at startup (git hooks re-exec the binary from a
 different working directory). Local mode is intentionally single-node — see ADR-13 in
-[docs/11](../11-local-backends-implementation-notes.md).
+[local-backends notes](../archive/phases/11-local-backends-implementation-notes.md).
 
 ## Server identity and network
 
@@ -94,7 +94,7 @@ The `--listen` flag (or its legacy alias `--addr`) wins. **Default:** `127.0.0.1
 ### `CODESTORAGE_ORG`
 
 **Required.** The organization name — the JWT `iss` claim every token must carry
-([docs/02](../02-authentication.md)). `serve` always runs single-org mode: the REST API and
+([auth spec](authentication.md)). `serve` always runs single-org mode: the REST API and
 the git smart-HTTP path authenticate against the same org-key verifier, and the org row is
 bootstrapped from this value at startup.
 
@@ -300,7 +300,7 @@ a `403` envelope.
 - **Default:** 10 GiB (`10737418240`). **`0` disables enforcement**; negative or malformed
   values are startup errors.
 - **Namespace roll-up:** a repository and its `+ephemeral` / `+import` namespaces
-  ([docs/05](../05-git-protocol-and-namespaces.md)) share one quota, accounted against the
+  ([git protocol](../explanation/git-protocol-and-namespaces.md)) share one quota, accounted against the
   base repository.
 - Admission is a durable reservation ledger in the ref store, atomic across concurrent
   pushes and replicas: two pushes that individually fit but together exceed the quota —

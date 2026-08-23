@@ -198,7 +198,7 @@ func (v *OrgKeyVerifier) Verify(ctx context.Context, token string) (*Claims, err
 // validateClaims enforces the claim requirements from the Verifier contract:
 // `exp` in the future (a missing exp unmarshals to 0 and fails too) and the
 // fixed `sub` literal. `iat` is carried but intentionally not validated —
-// docs/02 imposes no requirement on it and clock skew would break SDKs.
+// docs/reference/authentication.md imposes no requirement on it and clock skew would break SDKs.
 func validateClaims(c *Claims) error {
 	if c.Exp <= time.Now().Unix() {
 		return errors.New("jwt expired")

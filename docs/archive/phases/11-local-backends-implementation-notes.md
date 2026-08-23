@@ -1,5 +1,10 @@
 # Local-Backends Implementation Notes & ADRs
 
+> **Archived.** Historical implementation notes, kept verbatim as the project's build
+> history; decisions here may have been superseded by later work. For current
+> behavior, start at the [docs index](../../README.md); the ADRs recorded below are
+> individually addressable under [`docs/adr/`](../../adr/README.md).
+
 Records the load-bearing decisions from the pluggable-storage phase (local mode): swapping
 Postgres + S3 for SQLite + local files behind URL-scheme factories, so one binary serves
 either stack. Every prior decision — PG-style CAS as the ref authority (ADR-1), blob upload

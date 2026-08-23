@@ -1,5 +1,10 @@
 # Phase-4 Implementation Notes & ADRs (write API + p3 read burn-down)
 
+> **Archived.** Historical implementation notes, kept verbatim as the project's build
+> history; decisions here may have been superseded by later work. For current
+> behavior, start at the [docs index](../../README.md); the ADRs recorded below are
+> individually addressable under [`docs/adr/`](../../adr/README.md).
+
 Phase 4 delivers the `git:write` surface on `/api/v1` (docs/07 §4): NDJSON streaming
 commit-pack and diff-commit, restore-commit, merge + read-only merge preview, branch
 create/delete, tags, and notes — CAS everywhere, ref policies on every new write path, the

@@ -1,4 +1,4 @@
-// Phase-5 eventing/sync persistence contract (docs/06 webhooks, docs/03
+// Phase-5 eventing/sync persistence contract (docs/reference/webhooks.md webhooks, docs/reference/http-api.md
 // git-credentials + upstream sync): webhook registrations, git credentials,
 // and repo upstream links live in the meta database next to the repo rows
 // they reference.
@@ -17,7 +17,7 @@ import (
 	"time"
 )
 
-// Webhook is one registered delivery endpoint (docs/06). Secret is the HMAC
+// Webhook is one registered delivery endpoint (docs/reference/webhooks.md). Secret is the HMAC
 // signing key — plaintext at this interface; at rest it is stored plaintext
 // by default and envelope-encrypted when the store carries a secrets codec
 // (issue #54, CODESTORAGE_SECRETS_KEY; see secrets.go). Never log Secret.
@@ -30,7 +30,7 @@ type Webhook struct {
 }
 
 // GitCredential is one stored HTTPS credential for a repo's git upstream
-// (docs/03 "Git credentials"). Password is plaintext at this interface and
+// (docs/reference/http-api.md "Git credentials"). Password is plaintext at this interface and
 // gets the same optional at-rest envelope encryption as Webhook.Secret;
 // it must never be logged.
 type GitCredential struct {
@@ -42,7 +42,7 @@ type GitCredential struct {
 }
 
 // RepoUpstream is one repo's upstream mirror link plus its sync-run state
-// (docs/01 invariant 11). is_first_sync := SuccessCount == 0; detach =
+// (docs/explanation/domain-model.md invariant 11). is_first_sync := SuccessCount == 0; detach =
 // delete the row.
 type RepoUpstream struct {
 	RepoID       string
@@ -92,7 +92,7 @@ type EventingStore interface {
 
 	// CreateGitCredential stores cred (ID/CreatedAt assigned by the store;
 	// caller-set ID/CreatedAt are ignored). ErrAlreadyExists when the repo
-	// already has a credential (docs/03: 409).
+	// already has a credential (docs/reference/http-api.md: 409).
 	CreateGitCredential(ctx context.Context, cred GitCredential) (GitCredential, error)
 	// GetGitCredential returns the credential by ID; ErrNotFound when absent.
 	GetGitCredential(ctx context.Context, id string) (GitCredential, error)

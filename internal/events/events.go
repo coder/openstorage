@@ -1,8 +1,8 @@
-// Package events implements the docs/06 outbound-webhook surface: HMAC
+// Package events implements the docs/reference/webhooks.md outbound-webhook surface: HMAC
 // delivery signing, the per-attempt delivery worker (re-signing on every
 // retry), the storage contract for registered webhooks, and the
 // ref.RefStore decorator that turns won non-ephemeral CAS ref flips into
-// `push` events (docs/01 invariant 7).
+// `push` events (docs/explanation/domain-model.md invariant 7).
 //
 // The package deliberately owns only the eventing seam: durable queueing
 // (internal/jobs) and webhook persistence (internal/meta) plug in through
@@ -25,7 +25,7 @@ func assertf(cond bool, format string, args ...any) {
 	}
 }
 
-// Delivery headers and event names (docs/06 "Delivery headers").
+// Delivery headers and event names (docs/reference/webhooks.md "Delivery headers").
 const (
 	// HeaderEvent carries the event type on every delivery.
 	HeaderEvent = "X-Pierre-Event"

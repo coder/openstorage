@@ -325,7 +325,7 @@ type tokenSpec struct {
 	sub    string // default auth.SubjectLiteral
 	repo   string
 	scopes []string
-	refs   string        // raw `refs` claim JSON (docs/02 policy tuples); "" omits
+	refs   string        // raw `refs` claim JSON (docs/reference/authentication.md policy tuples); "" omits
 	ops    []string      // deprecated repo-wide `ops` claim; nil omits
 	expIn  time.Duration // default 1h; negative mints an expired token
 	key    any           // signing key override (default: env key for alg)
@@ -442,7 +442,7 @@ func (e *testEnv) doReq(t *testing.T, method, path, token string, body []byte, a
 }
 
 // requireAuthResultEnvelope asserts an auth failure from a write route
-// carries the docs/04 result envelope (ADR-26): {"result": {success:false,
+// carries the docs/explanation/streaming-commit-protocols.md result envelope (ADR-26): {"result": {success:false,
 // status, message}}.
 func requireAuthResultEnvelope(t *testing.T, body []byte, wantStatus string) {
 	t.Helper()

@@ -1,6 +1,6 @@
 package api
 
-// Contract integration tests for the merge write endpoints (docs/07 p4):
+// Contract integration tests for the merge write endpoints (docs/archive/phases/07-implementation-roadmap.md p4):
 // POST /repos/merge and GET /repos/merge/preview — fanned out over the pg
 // and sqlite lanes via runBackends.
 //
@@ -347,7 +347,7 @@ func TestMergeStrategies(t *testing.T) {
 			if tree := coreRevParse(t, repoPath, commit+"^{tree}"); tree != body["tree_sha"] {
 				t.Errorf("tree_sha = %v, want %s", body["tree_sha"], tree)
 			}
-			// Cross-surface (docs/05 interop): the read API sees the merged
+			// Cross-surface (docs/explanation/git-protocol-and-namespaces.md interop): the read API sees the merged
 			// tree immediately.
 			rresp, rbody := e.doReq(t, http.MethodGet, "/api/v1/repos/file?path=feat.txt&ref=t-clean", fx.token, nil, "")
 			if rresp.StatusCode != http.StatusOK || string(rbody) != "feat\n" {

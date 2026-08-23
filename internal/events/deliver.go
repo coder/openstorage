@@ -28,7 +28,7 @@ type Delivery struct {
 	Payload   []byte // JSON body as sent on the wire
 }
 
-// Deliverer is the webhook delivery worker (docs/06). Both queue backends
+// Deliverer is the webhook delivery worker (docs/reference/webhooks.md). Both queue backends
 // share it: River workers call Attempt once per job attempt (River owns
 // backoff/attempt accounting), the in-process local-mode queue calls
 // Deliver which loops attempts with backoff itself. Every attempt reloads
@@ -122,7 +122,7 @@ func (d *Deliverer) validate(del Delivery) {
 }
 
 // Attempt performs exactly one delivery attempt: reload the webhook, sign
-// the payload with the current time, POST it with the docs/06 headers.
+// the payload with the current time, POST it with the docs/reference/webhooks.md headers.
 // A non-2xx status or transport error returns an error (the caller
 // retries); ErrWebhookGone (wrapped) is terminal.
 func (d *Deliverer) Attempt(ctx context.Context, del Delivery) error {
@@ -162,7 +162,7 @@ func (d *Deliverer) Attempt(ctx context.Context, del Delivery) error {
 
 // Deliver runs Attempt with backoff until success, a terminal drop
 // (webhook deleted), MaxAttempts exhaustion (delivery discarded, per the
-// docs/06 at-least-once + bounded-retries guidance), or ctx cancellation.
+// docs/reference/webhooks.md at-least-once + bounded-retries guidance), or ctx cancellation.
 // Used by the in-process local-mode queue; River jobs use Attempt directly.
 func (d *Deliverer) Deliver(ctx context.Context, del Delivery) error {
 	d.validate(del)

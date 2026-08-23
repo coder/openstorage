@@ -10,7 +10,7 @@ import (
 )
 
 // FileDiff is one changed file between two trees. Status is git's raw
-// status letter (A/M/D/R/C/T — docs/03 "state (raw letter)"); rename/copy
+// status letter (A/M/D/R/C/T — docs/reference/http-api.md "state (raw letter)"); rename/copy
 // similarity scores are stripped.
 type FileDiff struct {
 	Path      string // post-image path (the old path for deletions)
@@ -21,11 +21,11 @@ type FileDiff struct {
 	Binary    bool
 	// Patch is this file's slice of `git diff --patch` output, starting at
 	// its `diff --git` header line. Endpoint slices own the final `raw`
-	// formatting (hunks-only vs git-apply-compatible, docs/01:93-95).
+	// formatting (hunks-only vs git-apply-compatible, docs/explanation/domain-model.md:93-95).
 	Patch string
 }
 
-// DiffStats aggregates a diff (docs/03 stats envelope). Binary files count
+// DiffStats aggregates a diff (docs/reference/http-api.md stats envelope). Binary files count
 // toward Files but contribute 0 additions/deletions.
 type DiffStats struct {
 	Files     int
@@ -42,7 +42,7 @@ type DiffOptions struct {
 // Diff computes the tree diff base..target (both resolved full SHAs; pass
 // EmptyTreeSHA as base for root commits). Rename/copy detection is always
 // on (-M) so renames surface as one R entry with OldPath, matching the
-// docs/03 FileDiff shape.
+// docs/reference/http-api.md FileDiff shape.
 func Diff(ctx context.Context, repoPath, base, target string, opts DiffOptions) ([]FileDiff, DiffStats, error) {
 	assertf(ref.ValidSHA(base) || base == EmptyTreeSHA, "Diff: unresolved base %q", base)
 	assertf(ref.ValidSHA(target) || target == EmptyTreeSHA, "Diff: unresolved target %q", target)

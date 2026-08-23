@@ -2,7 +2,7 @@ package api
 
 // Integration tests for the named-repo route aliases /api/repos/{repo_name}
 // (alias.go): table-driven byte-identity against the v1 twins (sampled
-// matrix per docs/07 p6), URL-encoded name handling (the fixture repo URL
+// matrix per docs/archive/phases/07-implementation-roadmap.md p6), URL-encoded name handling (the fixture repo URL
 // contains slashes, so every alias path here exercises %2F segments),
 // alias-by-repo_id, claim/path mismatch → 404 in the route's envelope
 // flavor, and auth wiring (same flavor + scopes as v1).
@@ -223,7 +223,7 @@ func TestAliasAuthWiring(t *testing.T) {
 			}
 		}
 
-		// Write-flavor alias: docs/04 result envelopes (ADR-26).
+		// Write-flavor alias: docs/explanation/streaming-commit-protocols.md result envelopes (ADR-26).
 		writePath := "/api/repos/" + esc + "/tags"
 		resp, body := e.doReq(t, http.MethodPost, writePath, "", nil, "")
 		if resp.StatusCode != http.StatusUnauthorized {

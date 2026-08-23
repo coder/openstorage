@@ -104,7 +104,7 @@ func (s *SQLite) InitSchema(ctx context.Context) error {
 		    created_at INTEGER NOT NULL
 		)`,
 		`CREATE INDEX IF NOT EXISTS org_public_keys_org_idx ON org_public_keys (org_id)`,
-		// Commit-signing keys for verify-sig (docs/02): SSH public key lines
+		// Commit-signing keys for verify-sig (docs/reference/authentication.md): SSH public key lines
 		// or ASCII-armored PGP public key blocks, read fresh on every push.
 		`CREATE TABLE IF NOT EXISTS org_signing_keys (
 		    id         INTEGER PRIMARY KEY AUTOINCREMENT,

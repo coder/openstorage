@@ -88,7 +88,7 @@ func TestDiffPathFilterAndEmpty(t *testing.T) {
 	}
 }
 
-// TestDiffPatchesApplyCleanly is the docs/01:93-95 invariant seed: the
+// TestDiffPatchesApplyCleanly is the docs/explanation/domain-model.md:93-95 invariant seed: the
 // concatenated per-file patches of a text-only diff must pass
 // `git apply --check` against the base tree.
 func TestDiffPatchesApplyCleanly(t *testing.T) {

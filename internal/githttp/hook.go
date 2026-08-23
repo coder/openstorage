@@ -66,7 +66,7 @@ func testMode() bool { return os.Getenv(EnvTestMode) == "1" }
 // installed hook script), so the serve process's wired store cannot reach
 // them; instead the cmd wiring seam — which runs in the hook subprocess
 // too, it is the same binary — replaces this variable at startup with the
-// events.RefStore decorator so git pushes emit push events (docs/06)
+// events.RefStore decorator so git pushes emit push events (docs/reference/webhooks.md)
 // exactly like API writes (that decorator wraps ref.IdempotentCAS itself).
 // The eventless default keeps hooks working before/without eventing wiring,
 // wrapping just the CAS-recovery decorator so ambiguous outcomes still
@@ -545,7 +545,7 @@ func injectCASDrop(st ref.RefStore) ref.RefStore {
 	return casDropStore{RefStore: st, hard: hard}
 }
 
-// enforceRefPolicy evaluates the token's ref policies (docs/02, docs/upstream
+// enforceRefPolicy evaluates the token's ref policies (docs/reference/authentication.md, docs/upstream
 // branch-protection.md) for one ref update. The deprecated repo-wide `ops`
 // claim is folded in as a fallback exactly once, here at parse time.
 func enforceRefPolicy(ctx context.Context, repo, refName, old, new string) error {
@@ -590,7 +590,7 @@ func enforceRefPolicy(ctx context.Context, repo, refName, old, new string) error
 			return fmt.Errorf("policy no-push denies update to %s", refName)
 		case auth.OpNoForcePush:
 			// Rejects any rewind of an existing ref: non-fast-forward
-			// updates AND deletions. docs/02: ref policies are the
+			// updates AND deletions. docs/reference/authentication.md: ref policies are the
 			// only branch-protection mechanism, so allowing deletion
 			// would make the policy trivially bypassable
 			// (delete + re-push = force push). Safe to check here:
@@ -618,7 +618,7 @@ func enforceRefPolicy(ctx context.Context, repo, refName, old, new string) error
 
 // verifySig rejects the update unless every commit it introduces carries a
 // valid OpenPGP or SSH signature from one of the org's registered signing
-// keys (docs/02 verify-sig, branch-protection.md "Commit signing
+// keys (docs/reference/authentication.md verify-sig, branch-protection.md "Commit signing
 // verifications"). "Introduced" = reachable from new but not from this
 // ref's own pre-push tip; branch creation therefore checks everything and
 // deletion checks nothing. The keyring is read fresh from PG on every push;

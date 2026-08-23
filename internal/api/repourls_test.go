@@ -1,6 +1,6 @@
 package api
 
-// Integration tests for GET /api/repo-urls/{repo_id} (docs/03, openapi
+// Integration tests for GET /api/repo-urls/{repo_id} (docs/reference/http-api.md, openapi
 // get_repo_url_by_id; note: no /v1 prefix): 200 {"repo_id","repo_name",
 // "url"} shape, 404 for unknown / cross-org / soft-deleted IDs, org-level
 // auth (403 for repo-scoped tokens and missing org:read scope), 401

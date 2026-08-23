@@ -33,7 +33,7 @@ type RefStoreOptions struct {
 	// propagated (the ref flip already committed).
 	EnqueueDelivery func(ctx context.Context, d Delivery) error
 	// EnqueueSync, when non-nil, is invoked once per won non-ephemeral ref
-	// update with the base RepoID (docs/01 invariant 11: pushes to a repo
+	// update with the base RepoID (docs/explanation/domain-model.md invariant 11: pushes to a repo
 	// with an upstream schedule a sync). Implementations decide whether a
 	// sync is actually due — upstream row present AND no run currently in
 	// progress (which also prevents the sync worker's own loopback pushes
@@ -51,7 +51,7 @@ type RefStoreOptions struct {
 // surfaces (API handlers and the git receive-pack update hook), which both
 // flow their ref flips through CASRef. Emission happens strictly AFTER the
 // CAS commits and never fails the update: enqueue errors are logged and
-// swallowed (docs/06 "emit after the ref update commits").
+// swallowed (docs/reference/webhooks.md "emit after the ref update commits").
 type RefStore struct {
 	ref.RefStore // inner store; every method except CASRef delegates
 
@@ -178,7 +178,7 @@ type RepositoryRef struct {
 	URL string `json:"url"`
 }
 
-// PushPayload is the docs/06 `push` event body. All seven fields are
+// PushPayload is the docs/reference/webhooks.md `push` event body. All seven fields are
 // required non-empty — vendor SDKs reject payloads with any empty field.
 type PushPayload struct {
 	Repository RepositoryRef `json:"repository"`
@@ -191,8 +191,8 @@ type PushPayload struct {
 
 // NewPushPayload builds the push body for one won CAS. before/after come
 // straight from CASRef's old/new, which already use ref.ZeroSHA for
-// create/delete — exactly the docs/06 wire convention. customer_id is the
-// owning org's name — the same string the JWT `iss` claim carries (docs/06
+// create/delete — exactly the docs/reference/webhooks.md wire convention. customer_id is the
+// owning org's name — the same string the JWT `iss` claim carries (docs/reference/webhooks.md
 // "org/customer id"; vendor SDKs compare it against iss).
 func NewPushPayload(org string, repo meta.Repo, refName, before, after string, pushedAt time.Time) PushPayload {
 	assertf(org != "", "NewPushPayload: empty org")

@@ -1,6 +1,6 @@
 package api
 
-// git-credentials CRUD (docs/03 "Git credentials", phase-5 workstream C):
+// git-credentials CRUD (docs/reference/http-api.md "Git credentials", phase-5 workstream C):
 //
 //	POST   /api/v1/repos/git-credentials  repo:write (repo=repoId)  {repo_id?, password, username?} -> {id}
 //	PUT    /api/v1/repos/git-credentials  repo:write (repo="org")   {id, password, username?}      -> {id, created_at}; 404
@@ -62,7 +62,7 @@ func newSyncServer(store meta.Store, creds upsync.CredentialStore, ups upsync.Up
 }
 
 // internalErr mirrors (*server).internalErr: log the real error, answer the
-// generic envelope (docs/03: clients branch on status codes only).
+// generic envelope (docs/reference/http-api.md: clients branch on status codes only).
 func (s *syncServer) internalErr(w http.ResponseWriter, r *http.Request, op string, err error) {
 	assertf(err != nil, "internalErr called with nil error")
 	assertf(op != "", "internalErr called with empty op")
@@ -71,7 +71,7 @@ func (s *syncServer) internalErr(w http.ResponseWriter, r *http.Request, op stri
 }
 
 // registerCredentialRoutes registers the git-credentials CRUD routes.
-// POST is repo-scoped (repo=repoId); PUT/DELETE are org-scoped (docs/03).
+// POST is repo-scoped (repo=repoId); PUT/DELETE are org-scoped (docs/reference/http-api.md).
 func registerCredentialRoutes(mux *http.ServeMux, verifier auth.Verifier, org string, s *syncServer, rl *rateLimiter) {
 	assertf(mux != nil, "registerCredentialRoutes: nil mux")
 	assertf(verifier != nil, "registerCredentialRoutes: nil verifier")
@@ -111,13 +111,13 @@ type gcredCreateRequest struct {
 
 // handleCreateCredential implements POST /api/v1/repos/git-credentials:
 // store one HTTPS credential for the repo's generic upstream. The JWT repo
-// claim must target the same repo as body repo_id (docs/03: repo=repoId).
+// claim must target the same repo as body repo_id (docs/reference/http-api.md: repo=repoId).
 // The alias POST /api/repos/{repo_name}/git-credentials (openapi.yaml)
 // re-dispatches here with a body that carries NO repo_id, so an absent
 // repo_id falls back to the token's repo claim — requireAuth(orgLevel=false)
 // guarantees it is non-empty and non-"org", and aliasHandler has already
 // matched it against the path name. Success is 201 {id} (openapi.yaml;
-// docs/14 deferred #4).
+// docs/archive/phases/14-phase5-implementation-notes.md deferred #4).
 func (s *syncServer) handleCreateCredential(w http.ResponseWriter, r *http.Request) {
 	claims := mustClaims(r)
 	var req gcredCreateRequest
@@ -142,7 +142,7 @@ func (s *syncServer) handleCreateCredential(w http.ResponseWriter, r *http.Reque
 		s.internalErr(w, r, "resolve credential repo", err)
 		return
 	}
-	// The claim may carry either the repo url or the repo_id (docs/02);
+	// The claim may carry either the repo url or the repo_id (docs/reference/authentication.md);
 	// both must resolve to the same repo the body targets.
 	if claims.Repo != repo.RepoID && claims.Repo != repo.URL {
 		writeErr(w, http.StatusForbidden, "jwt repo claim does not match repo_id")
@@ -271,7 +271,7 @@ func (s *syncServer) handleDeleteCredential(w http.ResponseWriter, r *http.Reque
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// Path-id git-credentials routes (openapi.yaml, docs/15 deferred #1):
+// Path-id git-credentials routes (openapi.yaml, docs/archive/phases/15-phase6-implementation-notes.md deferred #1):
 //
 //	PUT    /api/repos/{repo_name}/git-credentials/{git_credential_id}  repo:write (per repo)  {username?, password} -> {id, created_at}
 //	DELETE /api/repos/{repo_name}/git-credentials/{git_credential_id}  repo:write (per repo)  -> 204
@@ -281,7 +281,7 @@ func (s *syncServer) handleDeleteCredential(w http.ResponseWriter, r *http.Reque
 // repo:write, ADR-26 result envelopes), so every failure here carries the
 // write flavor; the success bodies match the v1 PUT/DELETE exactly.
 
-// internalErrResult mirrors internalErr with the docs/04 result envelope
+// internalErrResult mirrors internalErr with the docs/explanation/streaming-commit-protocols.md result envelope
 // (the path-id credential routes are write-flavored, ADR-26).
 func (s *syncServer) internalErrResult(w http.ResponseWriter, r *http.Request, op string, err error) {
 	assertf(s != nil && s.logger != nil, "internalErrResult: nil syncServer deps")
@@ -315,7 +315,7 @@ func (s *syncServer) gcredByPath(w http.ResponseWriter, r *http.Request) (upsync
 	}
 
 	// requireAuthWrite(orgLevel=false) guarantees a non-empty, non-"org"
-	// repo claim; it may carry the repo url or the repo_id (docs/02).
+	// repo claim; it may carry the repo url or the repo_id (docs/reference/authentication.md).
 	claimRepo, err := meta.ResolveRepoKey(r.Context(), s.store, claims.Iss, claims.Repo)
 	switch {
 	case errors.Is(err, meta.ErrNotFound):

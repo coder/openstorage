@@ -1,5 +1,10 @@
 # Phase-1 Implementation Notes & ADRs
 
+> **Archived.** Historical implementation notes, kept verbatim as the project's build
+> history; decisions here may have been superseded by later work. For current
+> behavior, start at the [docs index](../../README.md); the ADRs recorded below are
+> individually addressable under [`docs/adr/`](../../adr/README.md).
+
 Records the load-bearing decisions from phase 1 (skeleton + auth: `internal/meta`,
 `internal/auth`, `internal/api`, and the `cmd/codestorage` wiring). The phase-0 core
 decisions — PG as ref authority (ADR-1), S3 upload before the ref flip (ADR-2), namespace

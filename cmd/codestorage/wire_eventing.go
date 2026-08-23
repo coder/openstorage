@@ -1,5 +1,5 @@
 // wire_eventing.go is the phase-5 sibling of wire.go: it assembles the
-// eventing/sync stack (docs/06, docs/07 p5) from the slice-owned packages —
+// eventing/sync stack (docs/reference/webhooks.md, docs/archive/phases/07-implementation-roadmap.md p5) from the slice-owned packages —
 // jobs queue (River on pg / in-process in local mode), webhook deliverer,
 // upstream-sync worker with loopback push, and the events.RefStore CASRef
 // decorator — for both the serve process and the `codestorage hook`
@@ -53,7 +53,7 @@ func newLoopbackKey() (loopbackKey, string, error) {
 }
 
 // mint returns a short-lived repo-scoped git:write token for one loopback
-// push (docs/05 basic auth `t:<jwt>`).
+// push (docs/explanation/git-protocol-and-namespaces.md basic auth `t:<jwt>`).
 func (k loopbackKey) mint(org string, repo upsync.RepoInfo) (string, error) {
 	assertf(k.priv != nil, "loopbackKey.mint: missing key")
 	now := time.Now()
@@ -94,7 +94,7 @@ func (s webhookSink) Emit(ctx context.Context, org, eventType string, payload []
 }
 
 // enqueueSyncIfDue implements the events.RefStoreOptions.EnqueueSync
-// contract (docs/01 invariant 11): a won persistent ref update schedules a
+// contract (docs/explanation/domain-model.md invariant 11): a won persistent ref update schedules a
 // sync only when the repo has an upstream row AND no run is currently in
 // flight — the in-flight check is what keeps the sync worker's own loopback
 // pushes from re-triggering themselves.
@@ -229,7 +229,7 @@ func hookWebhookAllowPrivate(logger *slog.Logger) bool {
 
 // wireHookEventing points githttp.WrapHookRefStore at the events.RefStore
 // decorator for the `codestorage hook` subprocess, so git pushes emit push
-// events exactly like API writes (docs/06). It reads the same env the hook
+// events exactly like API writes (docs/reference/webhooks.md). It reads the same env the hook
 // itself uses (serve exports PG_URL; CODESTORAGE_ORG is inherited). The
 // returned cleanup must run after the hook finishes: in local mode it waits
 // for in-flight deliveries (the subprocess IS the queue), in pg mode it

@@ -12,7 +12,7 @@ import (
 	"github.com/coder/code-storage/internal/ref"
 )
 
-// TreeEntry types (docs/03 GET /repos/files entry `type`): symlinks and
+// TreeEntry types (docs/reference/http-api.md GET /repos/files entry `type`): symlinks and
 // submodules are surfaced distinctly from plain blobs/trees.
 const (
 	EntryBlob      = "blob"

@@ -192,7 +192,7 @@ type serveConfig struct {
 	// address — which is unroutable when listening on 0.0.0.0.
 	baseURL string
 
-	// rateRPS/rateBurst configure the per-client-IP rate limit (docs/03
+	// rateRPS/rateBurst configure the per-client-IP rate limit (docs/reference/http-api.md
 	// gateway-level 429) applied to the REST surface and — with separate
 	// bucket state — the git smart-HTTP surface (issue #21). Both zero
 	// means disabled.

@@ -14,7 +14,7 @@ import (
 
 const (
 	// gitCredentialRepoConstraint is the named UNIQUE(repo_id) constraint:
-	// one credential per repo (docs/03: 409).
+	// one credential per repo (docs/reference/http-api.md: 409).
 	gitCredentialRepoConstraint = "git_credentials_repo_id_key"
 	// Scan column lists matching scanWebhook / scanGitCredential /
 	// scanRepoUpstream (shared with sqlite_eventing.go like repoCols).

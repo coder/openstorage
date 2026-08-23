@@ -1,5 +1,5 @@
 // Package gitread is the read-side git plumbing layer for the /api/v1
-// git:read endpoints (docs/03): ref resolution, ls-tree, log, diff, blame,
+// git:read endpoints (docs/reference/http-api.md): ref resolution, ls-tree, log, diff, blame,
 // grep, and tar.gz archive streaming over a hydrated bare cache repo.
 //
 // FROZEN CONTRACT: the exported types and function signatures are the shared
@@ -30,7 +30,7 @@ import (
 )
 
 // ErrNotFound marks a missing ref, object, or path (handlers map it to 404
-// per docs/03, e.g. unknown branch and unborn-branch reads).
+// per docs/reference/http-api.md, e.g. unknown branch and unborn-branch reads).
 var ErrNotFound = errors.New("not found")
 
 // EmptyTreeSHA is git's well-known empty tree object id (SHA-1 repos): the
@@ -85,7 +85,7 @@ func Materialize(ctx context.Context, st ref.RefStore, bl blob.BlobStore, cacheD
 var hexRevRe = regexp.MustCompile(`\A[0-9a-f]{4,40}\z`)
 
 // ResolveRef resolves a request ref to a full commit SHA in the repo at
-// repoPath. Resolution order (docs/03 "branch name, short or full SHA"):
+// repoPath. Resolution order (docs/reference/http-api.md "branch name, short or full SHA"):
 //
 //  1. branch:   refs/heads/<spec> — or the ephemeral namespace name
 //     (auth.EphemeralRefName) when ephemeral is true

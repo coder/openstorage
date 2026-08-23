@@ -1,9 +1,9 @@
-// Merge write endpoints (docs/07 p4; contract docs/03 + openapi):
+// Merge write endpoints (docs/archive/phases/07-implementation-roadmap.md p4; contract docs/reference/http-api.md + openapi):
 //
 //	POST /api/v1/repos/merge          — merge source into target (git:write)
 //	GET  /api/v1/repos/merge/preview  — read-only merge preview (git:read)
 //
-// Merge engine (docs/13 ADR-23): `git merge-base` + `git merge-tree
+// Merge engine (docs/archive/phases/13-phase4-implementation-notes.md ADR-23): `git merge-base` + `git merge-tree
 // --write-tree -z` (requires git >= 2.38, probed at first use) running in
 // the per-request scratch odb over the materialized cache repo, so every
 // object the merge creates stays request-local until publish. The merge
@@ -11,13 +11,13 @@
 // (pack-objects over the new-tip reachability frontier -> blob upload ->
 // RegisterPacks -> CASRef); a lost CAS race strands only an unreferenced
 // immutable pack. The preview endpoint never publishes anything — the
-// scratch odb is deleted with the request (docs/01 invariant 6).
+// scratch odb is deleted with the request (docs/explanation/domain-model.md invariant 6).
 //
-// Status mapping (docs/13 ADR-22): a stale expected_target_sha is a 412
+// Status mapping (docs/archive/phases/13-phase4-implementation-notes.md ADR-22): a stale expected_target_sha is a 412
 // `precondition_failed`; merge conflicts, ff_only non-fast-forwards,
 // unrelated histories without allow_unrelated_histories, and CAS races
 // lost at publish time are 409 `conflict` (merge conflicts additionally
-// carry conflict_paths + merge_base_sha, docs/03).
+// carry conflict_paths + merge_base_sha, docs/reference/http-api.md).
 //
 // Fast-forwards move the ref without publishing: refs only ever name
 // objects already durable in registered packs (the source tip was a ref),
@@ -73,13 +73,13 @@ const wmMaxConflictSideBytes = 1 << 20
 const wmFilteredReasonTooLarge = "max_content_bytes_exceeded"
 
 // registerWriteMergeRoutes mounts the merge endpoints (called from api.New)
-// with the per-route auth middleware (scope table docs/02: merge needs
+// with the per-route auth middleware (scope table docs/reference/authentication.md: merge needs
 // git:write, the read-only preview needs git:read).
 func (s *server) registerWriteMergeRoutes(mux *http.ServeMux, verifier auth.Verifier, org string, rl *rateLimiter) {
 	assertf(mux != nil && s != nil && verifier != nil, "registerWriteMergeRoutes: nil dependency")
 	mux.Handle("POST /api/v1/repos/merge",
 		rl.limit(routeWrite)(requireAuthWrite(verifier, org, false, auth.ScopeGitWrite)(http.HandlerFunc(s.handleMerge))))
-	// Preview is a read (docs/03: git:read) and keeps the {"error"} body.
+	// Preview is a read (docs/reference/http-api.md: git:read) and keeps the {"error"} body.
 	mux.Handle("GET /api/v1/repos/merge/preview",
 		rl.limit(routeRead)(requireAuth(verifier, org, false, auth.ScopeGitRead)(http.HandlerFunc(s.handleMergePreview))))
 }
@@ -113,8 +113,8 @@ type wmMergeResponse struct {
 	PromotedCommits int           `json:"promoted_commits"`
 }
 
-// wmFailBody is the merge failure envelope: the docs/04 result object,
-// plus conflict_paths + merge_base_sha on merge conflicts (docs/03).
+// wmFailBody is the merge failure envelope: the docs/explanation/streaming-commit-protocols.md result object,
+// plus conflict_paths + merge_base_sha on merge conflicts (docs/reference/http-api.md).
 type wmFailBody struct {
 	Result        wcResult `json:"result"`
 	ConflictPaths []string `json:"conflict_paths,omitempty"`
@@ -122,13 +122,13 @@ type wmFailBody struct {
 }
 
 // wmFail writes the merge failure envelope; the status string must agree
-// with the docs/04 HTTP mapping (same fail-fast table as wcFail).
+// with the docs/explanation/streaming-commit-protocols.md HTTP mapping (same fail-fast table as wcFail).
 func wmFail(w http.ResponseWriter, httpCode int, status, msg, branch, oldSHA string) {
 	wmFailConflict(w, httpCode, status, msg, branch, oldSHA, nil, "")
 }
 
 // wmFailConflict is wmFail plus the 409 merge-conflict extras. The
-// status/code pairing is checked against the shared docs/04 table
+// status/code pairing is checked against the shared docs/explanation/streaming-commit-protocols.md table
 // (statusForHTTP, errors.go).
 func wmFailConflict(w http.ResponseWriter, httpCode int, status, msg, branch, oldSHA string, conflictPaths []string, mergeBase string) {
 	assertf(statusForHTTP(httpCode) == status, "wmFail: status %q does not map to HTTP %d", status, httpCode)
@@ -141,7 +141,7 @@ func wmFailConflict(w http.ResponseWriter, httpCode int, status, msg, branch, ol
 }
 
 // wmInternal logs the real error and writes the generic 500 envelope
-// (docs/03: raw error strings never leak onto the wire).
+// (docs/reference/http-api.md: raw error strings never leak onto the wire).
 func (s *server) wmInternal(w http.ResponseWriter, r *http.Request, op string, err error) {
 	assertf(err != nil && op != "", "wmInternal: nil error or empty op")
 	s.logger.Error("internal error", "op", op, "method", r.Method, "path", r.URL.Path, "err", err)
@@ -152,7 +152,7 @@ func (s *server) wmInternal(w http.ResponseWriter, r *http.Request, op string, e
 // git version probe
 
 // wmGitProbe caches the once-per-process merge-tree support probe
-// (docs/13 ADR-23: git >= 2.38, asserted at first use).
+// (docs/archive/phases/13-phase4-implementation-notes.md ADR-23: git >= 2.38, asserted at first use).
 var wmGitProbe struct {
 	once sync.Once
 	err  error
@@ -368,7 +368,7 @@ func wmPromotedCommits(ctx context.Context, sc *wcScratch, tips map[string]strin
 	return n, nil
 }
 
-// wmCheckRefPolicy enforces the token ref policies (docs/02, invariant 5)
+// wmCheckRefPolicy enforces the token ref policies (docs/reference/authentication.md, invariant 5)
 // for the merge-driven target update, mirroring the git update hook (see
 // package comment for the per-op semantics). Writes the 403 envelope and
 // returns false on denial.
@@ -480,7 +480,7 @@ func wmValidateMergeRequest(req *wmMergeRequest) error {
 	return nil
 }
 
-// handleMerge implements POST /repos/merge (docs/03): resolve both branch
+// handleMerge implements POST /repos/merge (docs/reference/http-api.md): resolve both branch
 // tips from the ref authority, guard on expected_target_sha (412), decide
 // the outcome (no_op / fast_forward / merge_commit / squash), run
 // merge-tree in the scratch odb, enforce ref policies, and publish under
@@ -754,7 +754,7 @@ type wmPreviewResponse struct {
 	FilteredConflicts []wmPreviewFiltered `json:"filtered_conflicts"`
 }
 
-// handleMergePreview implements GET /repos/merge/preview (docs/03,
+// handleMergePreview implements GET /repos/merge/preview (docs/reference/http-api.md,
 // invariant 6): a read-only dry run answering 200 for clean AND conflicted
 // outcomes. Everything merge-tree creates lands in the request's scratch
 // odb, which is deleted on return — no ref store, blob store, or cache

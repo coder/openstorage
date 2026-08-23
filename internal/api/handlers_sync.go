@@ -1,6 +1,6 @@
 package api
 
-// Upstream-sync HTTP surface (docs/03 "Upstream sync", phase-5 workstream D):
+// Upstream-sync HTTP surface (docs/reference/http-api.md "Upstream sync", phase-5 workstream D):
 //
 //	POST   /api/v1/repos                repo:write  base_repo {operation: "sync"} -> mirror link + first sync
 //	POST   /api/v1/repos/pull-upstream  git:write   {ref?, after?} -> 202 {"message": "Repository sync initiated successfully"}
@@ -32,7 +32,7 @@ import (
 )
 
 // registerSyncRoutes registers pull-upstream + upstream detach. Scopes per
-// docs/02: pull-upstream is a ref mutation (git:write); detach is repo
+// docs/reference/authentication.md: pull-upstream is a ref mutation (git:write); detach is repo
 // lifecycle (repo:write). Both are repo-scoped.
 func registerSyncRoutes(mux *http.ServeMux, verifier auth.Verifier, org string, s *syncServer, rl *rateLimiter) {
 	assertf(mux != nil, "registerSyncRoutes: nil mux")
@@ -44,7 +44,7 @@ func registerSyncRoutes(mux *http.ServeMux, verifier auth.Verifier, org string, 
 		rl.limit(routeRead)(requireAuth(verifier, org, false, auth.ScopeRepoWrite)(http.HandlerFunc(s.handleDetachBase))))
 }
 
-// usyncBaseRepo is the POST /repos base_repo object (docs/03).
+// usyncBaseRepo is the POST /repos base_repo object (docs/reference/http-api.md).
 type usyncBaseRepo struct {
 	Provider      string             `json:"provider"`
 	Owner         string             `json:"owner"`
@@ -128,7 +128,7 @@ func validUpstreamHost(host string) bool {
 // claims, fail-closed ref policies, body/branch validation, store error
 // mapping — and additionally accepts base_repo sync links: store an
 // optional credential from auth.token, insert the repo_upstreams row, and
-// enqueue the first sync (docs/01 invariant 11).
+// enqueue the first sync (docs/explanation/domain-model.md invariant 11).
 func (s *syncServer) handleCreateRepo(w http.ResponseWriter, r *http.Request) {
 	assertf(s != nil && s.store != nil && s.creds != nil && s.ups != nil && s.queue != nil,
 		"handleCreateRepo: nil syncServer deps")
@@ -137,7 +137,7 @@ func (s *syncServer) handleCreateRepo(w http.ResponseWriter, r *http.Request) {
 	// requireAuth(orgLevel=false) rejects empty/"org" repo claims with 403.
 	assertf(url != "" && url != auth.RepoClaimOrg, "create: repo claim %q passed requireAuth", url)
 
-	// docs/02: ref policies apply to every HTTP write endpoint; malformed
+	// docs/reference/authentication.md: ref policies apply to every HTTP write endpoint; malformed
 	// policy claims fail closed exactly like the frozen create handler.
 	if _, err := refPolicies(claims); err != nil {
 		writeErr(w, http.StatusForbidden, err.Error())
@@ -207,7 +207,7 @@ func (s *syncServer) handleCreateRepo(w http.ResponseWriter, r *http.Request) {
 	if spec != nil {
 		// Order matters: the credential must exist before the first sync
 		// run can start (the queue spawns the worker immediately). Each
-		// post-create failure abandons the fresh repo row (docs/14
+		// post-create failure abandons the fresh repo row (docs/archive/phases/14-phase5-implementation-notes.md
 		// deferred #5): without the soft-delete a half-linked live repo
 		// would remain behind a 500.
 		if spec.Auth != nil && spec.Auth.Token != "" {
@@ -255,7 +255,7 @@ func (s *syncServer) handleCreateRepo(w http.ResponseWriter, r *http.Request) {
 // cancellation, so detach from it (bounded) instead of orphaning the rows
 // with a context.Canceled cleanup. Besides soft-deleting the repo row it
 // best-effort deletes the upstream and credential rows created alongside it
-// (docs/15 deferred #2); each step logs its own failure and not-found is
+// (docs/archive/phases/15-phase6-implementation-notes.md deferred #2); each step logs its own failure and not-found is
 // fine (the step that failed determines which rows exist).
 func (s *syncServer) createAbandon(ctx context.Context, org, url, repoID string) {
 	assertf(s != nil && s.store != nil && s.creds != nil && s.ups != nil && s.logger != nil,
@@ -316,12 +316,12 @@ func policyDeniesPullUpstream(policies []auth.RefPolicy) (string, bool) {
 
 // handlePullUpstream implements POST /api/v1/repos/pull-upstream (scope
 // git:write): enqueue a sync for the JWT repo claim target. 400 when the
-// repo has no upstream base_repo (docs/03: "only for repos with base_repo").
+// repo has no upstream base_repo (docs/reference/http-api.md: "only for repos with base_repo").
 func (s *syncServer) handlePullUpstream(w http.ResponseWriter, r *http.Request) {
 	assertf(s != nil && s.store != nil && s.ups != nil && s.queue != nil,
 		"handlePullUpstream: nil syncServer deps")
 	claims := mustClaims(r)
-	// docs/02: ref policies apply to every HTTP write endpoint. The
+	// docs/reference/authentication.md: ref policies apply to every HTTP write endpoint. The
 	// loopback push runs with an unpoliced internal token, so the caller's
 	// policies are enforced here, before the sync is enqueued; malformed
 	// policy claims fail closed.
@@ -366,7 +366,7 @@ func (s *syncServer) handlePullUpstream(w http.ResponseWriter, r *http.Request) 
 	}
 	syncRef := req.Ref
 	if syncRef == "" {
-		// docs/14 deferred #8: an omitted ref targets the repo's default
+		// docs/archive/phases/14-phase5-implementation-notes.md deferred #8: an omitted ref targets the repo's default
 		// branch instead of flowing empty into the sync job.
 		syncRef = repo.DefaultBranch
 		assertf(syncRef != "", "repo %s has empty default branch", repo.RepoID)
@@ -384,11 +384,11 @@ func (s *syncServer) handlePullUpstream(w http.ResponseWriter, r *http.Request) 
 
 // handleDetachBase implements DELETE /api/v1/repos/base (scope repo:write):
 // idempotent upstream detach. In-flight or queued syncs observe the missing
-// row and end silently — the documented cancellation semantics (docs/06).
+// row and end silently — the documented cancellation semantics (docs/reference/webhooks.md).
 func (s *syncServer) handleDetachBase(w http.ResponseWriter, r *http.Request) {
 	assertf(s != nil && s.store != nil && s.ups != nil, "handleDetachBase: nil syncServer deps")
 	claims := mustClaims(r)
-	// Malformed ref-policy claims fail closed on write endpoints (docs/02).
+	// Malformed ref-policy claims fail closed on write endpoints (docs/reference/authentication.md).
 	if _, err := refPolicies(claims); err != nil {
 		writeErr(w, http.StatusForbidden, err.Error())
 		return

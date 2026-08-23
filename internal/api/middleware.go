@@ -100,10 +100,10 @@ func bearerToken(r *http.Request) (string, bool) {
 	return token, true
 }
 
-// requireAuth enforces the docs/02 failure map for one route: missing or
+// requireAuth enforces the docs/reference/authentication.md failure map for one route: missing or
 // unverifiable token -> 401 (+WWW-Authenticate via writeErr); verified token
 // issued for another org (issue #47), missing ANY of the required scopes
-// (docs/02: e.g. DELETE /repos/tags demands both git:read and git:write), a
+// (docs/reference/authentication.md: e.g. DELETE /repos/tags demands both git:read and git:write), a
 // non-"org" repo claim on an org-level route, or an empty/"org" repo claim
 // on a per-repo route -> 403 (claim mismatch with target). On success the
 // verified claims are injected into the request context; per-repo handlers
@@ -112,7 +112,7 @@ func requireAuth(verifier auth.Verifier, org string, orgLevel bool, requiredScop
 	return requireAuthWith(verifier, org, orgLevel, writeErr, requiredScopes...)
 }
 
-// authFailStatus maps the two auth-failure HTTP codes onto the docs/04
+// authFailStatus maps the two auth-failure HTTP codes onto the docs/explanation/streaming-commit-protocols.md
 // result-envelope status strings.
 func authFailStatus(httpCode int) string {
 	switch httpCode {
@@ -124,7 +124,7 @@ func authFailStatus(httpCode int) string {
 	panic(fmt.Sprintf("api assertion failed: authFailStatus: unexpected code %d", httpCode))
 }
 
-// writeAuthEnvelope is the docs/04 §3 / ADR-26 failure writer for write
+// writeAuthEnvelope is the docs/explanation/streaming-commit-protocols.md §3 / ADR-26 failure writer for write
 // routes: auth failures carry the result envelope ({"result": {success,
 // status, message}}) instead of the plain {"error"} body, so SDKs can map
 // them onto typed RefUpdateErrors. 401 keeps WWW-Authenticate (RFC 9110).
@@ -141,7 +141,7 @@ func writeAuthEnvelope(w http.ResponseWriter, httpCode int, msg string) {
 }
 
 // requireAuthWrite is requireAuth with ADR-26 envelope-shaped 401/403
-// bodies; every docs/04 write route must use it.
+// bodies; every docs/explanation/streaming-commit-protocols.md write route must use it.
 func requireAuthWrite(verifier auth.Verifier, org string, orgLevel bool, requiredScopes ...string) middleware {
 	return requireAuthWith(verifier, org, orgLevel, writeAuthEnvelope, requiredScopes...)
 }
