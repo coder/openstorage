@@ -663,11 +663,24 @@ func casFence(ctx context.Context, repo string) (syncClaimFence, bool) {
 // CASRef performs the compare-and-swap ref update. Returns won=false (no
 // error) when the precondition failed, i.e. someone else won the race.
 // Refs only ever change inside these single statements, so a broken/partial
-// ref state is impossible by construction. A won swap also bumps the repo
-// generation via the InitSchema-installed deferred constraint trigger —
-// inside the same implicit transaction, so the statement stays the single
-// unit of commit and the IdempotentCAS ambiguity classification
-// (idempotent.go) is unchanged.
+// ref state is impossible by construction; the statement runs inside an
+// explicit transaction whose only other work happens strictly BEFORE it
+// (the base-ledger lock and the purge-fence read below), so the statement
+// remains the single mutation unit and the IdempotentCAS ambiguity
+// classification (idempotent.go) is unchanged: pre-statement failures are
+// tagged notExecuted, statement failures classify exactly as before, and a
+// lost COMMIT response stays ambiguous (recovered by the recheck). A won
+// swap also bumps the repo generation via the InitSchema-installed
+// deferred constraint trigger at commit.
+//
+// The transaction takes the base-ledger advisory lock first and rejects
+// purge-fenced repos with ErrRepoPurged (issue #52, PR #105 security
+// round): ref writers do not all pass through pack registration — REST
+// branch/tag creation CASes an existing sha with no new pack — so without
+// this, a create landing between the purge's zero-row verification and its
+// completion would strand a ref row forever. The lock totally orders every
+// CAS against FenceRepoPurge's insert; registration paths already take it,
+// so per-base writer serialization is the established cost of the fence.
 //
 // Under WithSyncClaimFence the statement additionally requires the repo's
 // sync claim to be held by the fencing holder, with FOR UPDATE on the
@@ -697,18 +710,36 @@ func (s *PG) CASRef(ctx context.Context, repo, name, old, new string) (won bool,
 		return false, fmt.Errorf("cas %s/%s: %w", repo, name, notExecuted(cerr))
 	}
 
+	// Everything up to (but excluding) the CAS statement is provably
+	// non-executing: an error here means the mutation was never sent.
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		return false, fmt.Errorf("cas begin %s/%s: %w", repo, name, notExecuted(err))
+	}
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	if err := lockBaseLedger(ctx, tx, baseRepoOf(repo)); err != nil {
+		return false, fmt.Errorf("cas %s/%s: %w", repo, name, notExecuted(err))
+	}
+	purged, err := repoPurgeFencedPG(ctx, tx, repo)
+	if err != nil {
+		return false, fmt.Errorf("cas %s/%s: purge fence: %w", repo, name, notExecuted(err))
+	}
+	if purged {
+		return false, fmt.Errorf("cas %s/%s: %w", repo, name, notExecuted(ErrRepoPurged))
+	}
+
 	fence, fenced := casFence(ctx, repo)
 	var tag string
 	var ct interface{ RowsAffected() int64 }
 	switch {
 	case old == ZeroSHA && !fenced: // create
 		// created_at is set here once; SHA updates below never touch it.
-		c, cerr := conn.Exec(ctx,
+		c, cerr := tx.Exec(ctx,
 			`INSERT INTO refs (repo, name, sha, created_at) VALUES ($1, $2, $3, now()) ON CONFLICT DO NOTHING`,
 			repo, name, new)
 		ct, err, tag = c, cerr, "create"
 	case old == ZeroSHA: // fenced create
-		c, cerr := conn.Exec(ctx,
+		c, cerr := tx.Exec(ctx,
 			`INSERT INTO refs (repo, name, sha, created_at)
 			 SELECT $1, $2, $3, now()
 			 WHERE EXISTS (SELECT 1 FROM repo_upstreams WHERE repo_id = $1 AND sync_claim_holder = $4 FOR UPDATE)
@@ -716,23 +747,23 @@ func (s *PG) CASRef(ctx context.Context, repo, name, old, new string) (won bool,
 			repo, name, new, fence.holder)
 		ct, err, tag = c, cerr, "fenced create"
 	case new == ZeroSHA && !fenced: // delete
-		c, cerr := conn.Exec(ctx,
+		c, cerr := tx.Exec(ctx,
 			`DELETE FROM refs WHERE repo = $1 AND name = $2 AND sha = $3`,
 			repo, name, old)
 		ct, err, tag = c, cerr, "delete"
 	case new == ZeroSHA: // fenced delete
-		c, cerr := conn.Exec(ctx,
+		c, cerr := tx.Exec(ctx,
 			`DELETE FROM refs WHERE repo = $1 AND name = $2 AND sha = $3
 			 AND EXISTS (SELECT 1 FROM repo_upstreams WHERE repo_id = $1 AND sync_claim_holder = $4 FOR UPDATE)`,
 			repo, name, old, fence.holder)
 		ct, err, tag = c, cerr, "fenced delete"
 	case !fenced: // update
-		c, cerr := conn.Exec(ctx,
+		c, cerr := tx.Exec(ctx,
 			`UPDATE refs SET sha = $1 WHERE repo = $2 AND name = $3 AND sha = $4`,
 			new, repo, name, old)
 		ct, err, tag = c, cerr, "update"
 	default: // fenced update
-		c, cerr := conn.Exec(ctx,
+		c, cerr := tx.Exec(ctx,
 			`UPDATE refs SET sha = $1 WHERE repo = $2 AND name = $3 AND sha = $4
 			 AND EXISTS (SELECT 1 FROM repo_upstreams WHERE repo_id = $2 AND sync_claim_holder = $5 FOR UPDATE)`,
 			new, repo, name, old, fence.holder)
@@ -740,6 +771,12 @@ func (s *PG) CASRef(ctx context.Context, repo, name, old, new string) (won bool,
 	}
 	if err != nil {
 		return false, fmt.Errorf("cas %s %s/%s: %w", tag, repo, name, err)
+	}
+	// A commit failure is NOT notExecuted: the response may have been
+	// lost after the backend committed — exactly the ambiguity class the
+	// IdempotentCAS recovery recheck exists for.
+	if err := tx.Commit(ctx); err != nil {
+		return false, fmt.Errorf("cas %s %s/%s: commit: %w", tag, repo, name, err)
 	}
 	n := ct.RowsAffected()
 	assertf(n == 0 || n == 1, "cas %s %s/%s affected %d rows", tag, repo, name, n)

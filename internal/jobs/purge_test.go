@@ -516,6 +516,11 @@ func TestPurgeRepo_FenceRejectsLateWriter(t *testing.T) {
 	if err := f.store.RegisterLFSObject(ctx, repo.RepoID, lfsKey, 1); !errors.Is(err, ref.ErrRepoPurged) {
 		t.Fatalf("post-purge RegisterLFSObject = %v, want ErrRepoPurged", err)
 	}
+	// Ref-only writers (REST branch/tag creation reaches CASRef with no
+	// pack registration, PR #105 round 4) are fenced too.
+	if _, err := f.store.CASRef(ctx, repo.RepoID, "refs/heads/late", ref.ZeroSHA, "2222222222222222222222222222222222222222"); !errors.Is(err, ref.ErrRepoPurged) {
+		t.Fatalf("post-purge CASRef = %v, want ErrRepoPurged", err)
+	}
 }
 
 // stragglerRowRegistry simulates a row that appears after tombstoning

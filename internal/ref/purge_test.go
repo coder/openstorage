@@ -108,8 +108,26 @@ func TestRepoPurgeSeams(t *testing.T) {
 		if err := s.RegisterLFSObject(ctx, base, "lfs/"+base+"/"+lateOID, 1); !errors.Is(err, ErrRepoPurged) {
 			t.Fatalf("RegisterLFSObject(fenced) = %v, want ErrRepoPurged", err)
 		}
+		// Ref CAS is fenced too (PR #105 round 4): REST branch/tag
+		// creation reaches CASRef without registering a pack, so create,
+		// update, AND delete must all reject on a fenced repo.
+		for _, cas := range []struct{ tag, old, new string }{
+			{"create", ZeroSHA, "2222222222222222222222222222222222222222"},
+			{"update", "1111111111111111111111111111111111111111", "2222222222222222222222222222222222222222"},
+			{"delete", "1111111111111111111111111111111111111111", ZeroSHA},
+		} {
+			if _, err := s.CASRef(ctx, base, "refs/heads/main", cas.old, cas.new); !errors.Is(err, ErrRepoPurged) {
+				t.Fatalf("CASRef %s (fenced) = %v, want ErrRepoPurged", cas.tag, err)
+			}
+			if _, err := s.CASRef(ctx, base+"+ephemeral", "refs/heads/x", cas.old, cas.new); !errors.Is(err, ErrRepoPurged) {
+				t.Fatalf("CASRef %s (fenced namespace) = %v, want ErrRepoPurged", cas.tag, err)
+			}
+		}
 		if err := s.RegisterPacks(ctx, other, []Pack{{ID: "ok", Key: "packs/" + other + "/pack-ok.pack", Size: 2}}); err != nil {
 			t.Fatalf("control RegisterPacks after fence: %v", err)
+		}
+		if won, err := s.CASRef(ctx, other, "refs/heads/post-fence", ZeroSHA, "3333333333333333333333333333333333333333"); err != nil || !won {
+			t.Fatalf("control CASRef after fence: won=%v err=%v", won, err)
 		}
 
 		// Phase 1: refs die, group-wide, control untouched, idempotent.
@@ -119,8 +137,8 @@ func TestRepoPurgeSeams(t *testing.T) {
 		if refs, err := s.ListRefs(ctx, base); err != nil || len(refs) != 0 {
 			t.Fatalf("base refs after drop: %v err=%v", refs, err)
 		}
-		if refs, err := s.ListRefs(ctx, other); err != nil || len(refs) != 2 {
-			t.Fatalf("control refs after drop: %v err=%v", refs, err)
+		if refs, err := s.ListRefs(ctx, other); err != nil || len(refs) != 3 {
+			t.Fatalf("control refs after drop: %v err=%v (want 3)", refs, err)
 		}
 		if n, err := ps.DropRepoRefs(ctx, group); err != nil || n != 0 {
 			t.Fatalf("DropRepoRefs rerun: n=%d err=%v (want 0)", n, err)
@@ -174,8 +192,8 @@ func TestRepoPurgeSeams(t *testing.T) {
 		if n, err := ps.CountRepoRows(ctx, group); err != nil || n != 0 {
 			t.Fatalf("CountRepoRows(group): n=%d err=%v (want 0)", n, err)
 		}
-		if n, err := ps.CountRepoRows(ctx, otherGroup); err != nil || n != 5 {
-			t.Fatalf("CountRepoRows(other): n=%d err=%v (want 5: 2 refs + 2 packs + lfs)", n, err)
+		if n, err := ps.CountRepoRows(ctx, otherGroup); err != nil || n != 6 {
+			t.Fatalf("CountRepoRows(other): n=%d err=%v (want 6: 3 refs + 2 packs + lfs)", n, err)
 		}
 
 		// Phase 6: ledger rows die wholesale; control accounting intact.

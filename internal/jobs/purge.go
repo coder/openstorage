@@ -271,16 +271,14 @@ func (p *RepoPurger) purgeRepo(ctx context.Context, repoID string) (RepoPurgeRep
 	}
 
 	group := blob.QuotaRepoGroup(repoID)
-	// Phase 0: durable write fence, BEFORE any tombstoning. Pack/LFS
-	// registrations serialize against it in the ref store, so every
-	// straggler write either committed before this fence (its rows are
-	// tombstoned by phases 1–3 / the next resume) or fails with
-	// ref.ErrRepoPurged — the phase-5 verification below can then never
-	// be invalidated by a write settling after it (PR #105 security
-	// round). Ref-only CAS writes are not fenced: pushes register packs
-	// before any ref CAS, so a fenced push dies before touching refs, and
-	// a hypothetical straggler ref row is unreachable metadata (the repo
-	// no longer resolves) that carries no bytes.
+	// Phase 0: durable write fence, BEFORE any tombstoning. Every ref-
+	// store write — CASRef (REST branch/tag creation reaches it with no
+	// pack registration), RegisterPacks, RegisterLFSObject — serializes
+	// against the fence in its own transaction, so a straggler write
+	// either committed before this fence (its rows are tombstoned by
+	// phases 1–3 / the next resume) or fails with ref.ErrRepoPurged: the
+	// phase-5 verification below can never be invalidated by a write
+	// settling after it (PR #105 security rounds 2 and 4).
 	if err := p.registry.FenceRepoPurge(ctx, repoID); err != nil {
 		return rep, fmt.Errorf("fence repo purge: %w", err)
 	}

@@ -85,9 +85,9 @@ authorize against a new repository created at that URL.
 Purged repositories drop out of every registry surface except the tombstoned metadata
 row (soft-deleted plus a purge timestamp), which keeps `DELETE`-then-recreate races and
 stale-token replays structurally impossible. A purge also write-fences the repository
-in the ref store before touching anything: a push that resolved the repository just
-before its deletion and is still in flight fails its pack/LFS registration instead of
-re-registering rows behind the purge. Such a push may still have *published* its blob
+in the ref store before touching anything: a request that resolved the repository just
+before its deletion and is still in flight fails its ref update and its pack/LFS
+registration instead of re-registering rows behind the purge. Such a push may still have *published* its blob
 after the purge's scan (uploads precede registration) — the fence makes those bytes
 provably permanent garbage, so later retention-mode sweeps reap them in every class
 once aged, and re-running `purge-repo` on the purged repository rescans its prefixes
