@@ -315,6 +315,20 @@ func (s *Server) lfsBatchDownload(r *http.Request, repoElem string, target repoT
 	if !ok {
 		return res
 	}
+	// Registered objects are served ONLY from the canonical key; rowless
+	// objects fall back to the legacy spelling (the read-compat surface
+	// for not-yet-adopted pre-#51 blobs). Rowless canonical bytes are
+	// never served: they may be a mid-adoption unverified copy (Codex
+	// security round 78).
+	registered, rerr := s.Store.HasLFSObject(r.Context(), target.repo.RepoID, key)
+	if rerr != nil {
+		log.Printf("lfs registry %s: %v", key, rerr)
+		lfsObjectFail(&res, http.StatusInternalServerError, "object registry unavailable")
+		return res
+	}
+	if !registered {
+		key = blob.LFSLegacyKey(target.repo.RepoID, obj.OID)
+	}
 	size, err := s.Blob.Stat(r.Context(), key)
 	if errors.Is(err, blob.ErrNotFound) {
 		lfsObjectFail(&res, http.StatusNotFound, "object not found")
@@ -365,58 +379,26 @@ func (s *Server) lfsBatchUpload(r *http.Request, repoElem string, target repoTar
 		if !ok {
 			continue
 		}
-		_, err := s.Blob.Stat(ctx, key)
-		switch {
-		case err == nil:
-			// Already stored: no actions means the client skips the
-			// upload — but ONLY once the object is durably registered
-			// (pre-#51 uploads have no rows; without adoption the orphan
-			// sweep would classify referenced objects as reapable, so a
-			// swallowed adoption failure here would let the client commit
-			// a pointer to a reapable blob).
-			switch aerr := s.adoptLFSObjectLocked(ctx, repoID, key, obj.OID); {
-			case aerr == nil:
-				continue
-			case errors.Is(aerr, ref.ErrLFSObjectCapExceeded):
-				lfsObjectFail(&results[i], http.StatusInsufficientStorage, fmt.Sprintf(
-					"repository LFS object count limit reached (limit %d)", ref.MaxLFSObjectsPerRepo))
-				continue
-			case errors.Is(aerr, errLFSBusy):
-				lfsObjectFail(&results[i], http.StatusTooManyRequests,
-					"a concurrent operation holds this object, retry")
-				continue
-			case errors.Is(aerr, errLFSContentMismatch):
-				// A mismatched legacy blob was removed: the object is now
-				// genuinely missing — fall through and issue an upload
-				// action so the client's correct bytes arrive verified.
-			default:
-				log.Printf("lfs adopt %s: %v", key, aerr)
-				lfsObjectFail(&results[i], http.StatusInternalServerError, "object registration failed, retry")
-				continue
-			}
-		case !errors.Is(err, blob.ErrNotFound):
-			log.Printf("lfs stat %s: %v", key, err)
-			lfsObjectFail(&results[i], http.StatusInternalServerError, "object storage unavailable")
-			continue
-		}
-		if !checked[key] {
-			checked[key] = true
-			// The zero-growth rule (Codex round 5): a missing object
-			// whose registry row exists — an adopted or settled object
-			// whose blob vanished (racing DeleteLFS sweep, manual bucket
-			// surgery) — is already counted by the usage counter AND the
-			// object-count cap, so its re-publication must be charged by
-			// neither: an at-quota (or at-cap) repository could otherwise
-			// never repair itself.
-			registered, rerr := s.Store.HasLFSObject(ctx, repoID, key)
+		// The registry row is authoritative for "stored" (Codex security
+		// round 78): registered objects live at the canonical key, and a
+		// rowless canonical blob — a mid-adoption unverified copy — must
+		// never satisfy an upload. This read doubles as the zero-growth
+		// classification below (Codex round 5): a registered object whose
+		// canonical blob vanished (racing DeleteLFS sweep, manual bucket
+		// surgery) is already counted by the usage counter AND the
+		// object-count cap, so its re-publication must be charged by
+		// neither — an at-quota (or at-cap) repository could otherwise
+		// never repair itself.
+		registered := false
+		if checked[key] {
+			registered = zeroGrowth[key]
+		} else {
+			var rerr error
+			registered, rerr = s.Store.HasLFSObject(ctx, repoID, key)
 			if rerr != nil {
 				log.Printf("lfs registry %s: %v", key, rerr)
+				checked[key] = true
 				checkFailed[key] = true
-			} else {
-				zeroGrowth[key] = registered
-			}
-			if !checkFailed[key] {
-				order = append(order, key)
 			}
 		}
 		if checkFailed[key] {
@@ -425,6 +407,64 @@ func (s *Server) lfsBatchUpload(r *http.Request, repoElem string, target repoTar
 			// correctly nor safely admitted free.
 			lfsObjectFail(&results[i], http.StatusInternalServerError, "object registry unavailable")
 			continue
+		}
+		if registered {
+			switch _, err := s.Blob.Stat(ctx, key); {
+			case err == nil:
+				// Registered with canonical bytes present: stored — no
+				// actions means the client skips the upload. A memo
+				// parked for a registration that (indeterminately)
+				// committed is dead weight; free it and its lease.
+				s.dropLFSVerifyResume(key)
+				continue
+			case !errors.Is(err, blob.ErrNotFound):
+				log.Printf("lfs stat %s: %v", key, err)
+				lfsObjectFail(&results[i], http.StatusInternalServerError, "object storage unavailable")
+				continue
+			}
+			// Registered but blobless: fall through to the zero-growth
+			// repair admission.
+		} else {
+			switch _, err := s.Blob.Stat(ctx, blob.LFSLegacyKey(repoID, obj.OID)); {
+			case err == nil:
+				// Rowless legacy bytes: adopt — copy to the canonical
+				// key, verify, register (pre-#51 uploads have no rows;
+				// without adoption the orphan sweep would classify
+				// referenced objects as reapable, so a swallowed adoption
+				// failure here would let the client commit a pointer to a
+				// reapable blob).
+				switch aerr := s.adoptLFSObjectLocked(ctx, repoID, key, obj.OID); {
+				case aerr == nil:
+					continue
+				case errors.Is(aerr, ref.ErrLFSObjectCapExceeded):
+					lfsObjectFail(&results[i], http.StatusInsufficientStorage, fmt.Sprintf(
+						"repository LFS object count limit reached (limit %d)", ref.MaxLFSObjectsPerRepo))
+					continue
+				case errors.Is(aerr, errLFSBusy):
+					lfsObjectFail(&results[i], http.StatusTooManyRequests,
+						"a concurrent operation holds this object, retry")
+					continue
+				case errors.Is(aerr, errLFSContentMismatch):
+					// A mismatched legacy blob was removed: the object is
+					// now genuinely missing — fall through and issue an
+					// upload action so the client's correct bytes arrive
+					// verified.
+				default:
+					log.Printf("lfs adopt %s: %v", key, aerr)
+					lfsObjectFail(&results[i], http.StatusInternalServerError, "object registration failed, retry")
+					continue
+				}
+			case !errors.Is(err, blob.ErrNotFound):
+				log.Printf("lfs stat %s: %v", key, err)
+				lfsObjectFail(&results[i], http.StatusInternalServerError, "object storage unavailable")
+				continue
+			}
+			// Nothing stored anywhere: a genuinely new upload.
+		}
+		if !checked[key] {
+			checked[key] = true
+			zeroGrowth[key] = registered
+			order = append(order, key)
 		}
 		needIdx[key] = append(needIdx[key], i)
 		needSize[key] = max(needSize[key], obj.Size)
@@ -757,6 +797,22 @@ func (s *Server) adoptLFSObject(ctx context.Context, repoID, key, oid string) er
 		return errLFSBusy
 	}
 	defer s.releaseLFSStaging(repoID, 0)
+	// Canonicalize before verifying (Codex security round 78): the legacy
+	// spelling was presigned-PUT-addressable in v0.1.x, so a still-valid
+	// URL can overwrite it at ANY moment — including after registration —
+	// and no registration-time check can defend a mutable key. The bytes
+	// are therefore server-side-copied to the canonical `o2/` key, which
+	// no legacy URL can address, and verification + registration bind to
+	// that copy. Rowless canonical bytes are never served, so an
+	// unverified (possibly forged) copy is unreadable; a forged copy
+	// fails the digest below and is deleted with its source. The copy
+	// runs only under a FRESHLY RENEWED lease and is bounded well inside
+	// the lease: a stale worker that lost its claim can never overwrite a
+	// successor's verified (or registered) canonical bytes, because every
+	// adoption-side canonical write happens under the exclusive lease.
+	if _, err := s.copyLegacyLFSObject(ctx, repoID, key, oid, claimOwner); err != nil {
+		return err
+	}
 	// Bounded like publication (Codex round 17) and DETACHED from the
 	// client (Codex round 31, security): adoption is server-side repair
 	// work. A client canceling mid-verification would abort the ranged
@@ -806,6 +862,15 @@ func (s *Server) adoptLFSObject(ctx context.Context, repoID, key, oid string) er
 		}
 		if !deleted {
 			return nil // replaced and registered by a concurrent verified upload
+		}
+		// The forged bytes came from the legacy source (the canonical
+		// copy is adoption-written only): remove it too, unguarded — the
+		// legacy spelling is never registered — so the next touch cannot
+		// re-copy the same provably wrong bytes (Codex security round
+		// 78). Best-effort: a survivor is re-copied, re-fails the
+		// digest, and lands back here.
+		if err := s.Blob.Delete(dctx, blob.LFSLegacyKey(repoID, oid)); err != nil && !errors.Is(err, blob.ErrNotFound) {
+			log.Printf("lfs adopt %s: remove mismatched legacy source: %v", key, err)
 		}
 		log.Printf("lfs adopt %s: removed legacy blob failing content verification", key)
 		return errLFSContentMismatch
@@ -875,6 +940,17 @@ func (s *Server) adoptLFSObject(ctx context.Context, repoID, key, oid string) er
 	defer rcancel()
 	if _, err := s.Blob.Stat(rctx, key); err != nil {
 		return fmt.Errorf("adopted object vanished (racing sweep?): %w", err)
+	}
+	// The object now lives canonically; the legacy source is surplus —
+	// rowless, so the orphan sweep would reap it eventually — and every
+	// replica's uncounted floor keeps counting it against the quota until
+	// it disappears from listings. Best-effort delete, bounded and
+	// detached like every cleanup; a failure just leaves the conservative
+	// double-count to the sweeper's LFS opt-in (Codex security round 78).
+	lctx, lcancel := context.WithTimeout(context.WithoutCancel(ctx), lfsCleanupTimeout)
+	defer lcancel()
+	if err := s.Blob.Delete(lctx, blob.LFSLegacyKey(repoID, oid)); err != nil && !errors.Is(err, blob.ErrNotFound) {
+		log.Printf("lfs adopt %s: remove adopted legacy source: %v", key, err)
 	}
 	return nil
 }
@@ -1208,6 +1284,74 @@ func (s *Server) parkLFSClaimOwner(key, owner string) bool {
 	return true
 }
 
+// copyLegacyLFSObject ensures the canonical key holds a copy of the legacy
+// object's bytes (Codex security round 78), returning the copied size (0
+// when canonical bytes already existed and no copy ran). Callers hold the
+// per-key slot and the fleet adoption claim; the copy itself re-renews the
+// lease first — see the call site's rationale in adoptLFSObject.
+func (s *Server) copyLegacyLFSObject(ctx context.Context, repoID, key, oid, claimOwner string) (int64, error) {
+	assertf(claimOwner != "", "copyLegacyLFSObject(%q): no claim", key)
+	// A prior attempt's copy (or a concurrent verified upload's publish)
+	// already placed canonical bytes: verify THOSE — re-copying would
+	// rewrite the object, discarding any fingerprint-bound resume
+	// progress, and the digest decides the existing bytes' fate anyway.
+	pctx, pcancel := context.WithTimeout(ctx, lfsProbeTimeout)
+	_, err := s.Blob.Stat(pctx, key)
+	pcancel()
+	if err == nil {
+		return 0, nil
+	}
+	if !errors.Is(err, blob.ErrNotFound) {
+		return 0, fmt.Errorf("canonical probe %s: %w", key, err)
+	}
+	legacyKey := blob.LFSLegacyKey(repoID, oid)
+	sctx, scancel := context.WithTimeout(ctx, lfsProbeTimeout)
+	size, err := s.Blob.Stat(sctx, legacyKey)
+	scancel()
+	if err != nil {
+		// ErrNotFound included: with neither spelling present the object
+		// is genuinely missing — the caller's error path has the client
+		// re-upload through the verified proxy.
+		return 0, fmt.Errorf("legacy source %s: %w", legacyKey, err)
+	}
+	// Stale-floor cover (the round-57/58 pattern): the copy creates NEW
+	// physical bytes invisible both to floors scanned before it and to
+	// the usage counter until registration commits — an admission holding
+	// such a floor would under-count by the copy's size for the whole
+	// size-scaled verify window. Account them BEFORE they exist; the TTL
+	// collects the cover (settlement consumes only the blob key's own
+	// spellings). Skipped when quota is disabled: no floors to protect.
+	if size > 0 && s.PackQuotaBytes > 0 {
+		cvCtx, cvCancel := context.WithTimeout(ctx, UsageFloorHandoffMargin)
+		err := ref.ReserveRestoreCover(cvCtx, s.Store, blob.QuotaRepoGroup(repoID), key, size, s.lfsReservationTTL())
+		cvCancel()
+		if err != nil {
+			return 0, fmt.Errorf("adoption copy cover %s: %w", key, err)
+		}
+	}
+	// Lease fence: renew immediately before the copy and bound the copy
+	// WELL inside the fresh ref.AdoptionClaimTTL. Only the live lease
+	// holder ever writes the canonical key on the adoption side, so a
+	// stale worker cannot overwrite a successor's verified or registered
+	// canonical bytes — its renewal fails here instead.
+	rctx, rcancel := context.WithTimeout(ctx, lfsClaimRenewTimeout)
+	renewed, rerr := s.Store.RenewAdoptionClaim(rctx, key, claimOwner)
+	rcancel()
+	if rerr != nil {
+		return 0, fmt.Errorf("renew claim before canonical copy: %w", rerr)
+	}
+	if !renewed {
+		return 0, errLFSBusy // lease lost: the successor owns the copy now
+	}
+	bound := min(5*time.Minute+time.Duration(size>>20)*time.Second, ref.AdoptionClaimTTL-5*time.Minute)
+	cctx, ccancel := context.WithTimeout(ctx, bound)
+	defer ccancel()
+	if err := s.Blob.Copy(cctx, key, legacyKey); err != nil {
+		return 0, fmt.Errorf("canonicalize %s: %w", legacyKey, err)
+	}
+	return size, nil
+}
+
 // releaseAdoptionClaim best-effort frees a fleet adoption claim on a
 // bounded context detached from any request; a failure leaves the row to
 // ref.AdoptionClaimTTL like a crashed winner's.
@@ -1355,6 +1499,18 @@ func (s *Server) handleLFSObject(w http.ResponseWriter, r *http.Request, repo, o
 	}
 	key := blob.LFSKey(target.repo.RepoID, oid)
 	if r.Method == http.MethodGet {
+		// Same serve rule as the batch (Codex security round 78):
+		// registered → canonical only; rowless → legacy read-compat,
+		// never a mid-adoption unverified canonical copy.
+		registered, err := s.Store.HasLFSObject(r.Context(), target.repo.RepoID, key)
+		if err != nil {
+			log.Printf("lfs registry %s: %v", key, err)
+			lfsError(w, http.StatusInternalServerError, "object registry unavailable")
+			return
+		}
+		if !registered {
+			key = blob.LFSLegacyKey(target.repo.RepoID, oid)
+		}
 		s.lfsProxyDownload(w, r, key)
 		return
 	}
@@ -1443,7 +1599,33 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target r
 	// slot back instead of pinning it until the client hangs up.
 	pctx, pcancel := context.WithTimeout(ctx, lfsProbeTimeout)
 	defer pcancel()
-	switch _, err := s.Blob.Stat(pctx, key); {
+	// Probe both spellings (Codex security round 78): canonical bytes
+	// (crashed adoption copy or registered object) and rowless legacy
+	// bytes (pre-#51 upload) are each adoptable — adoption itself
+	// copies/verifies/registers canonically and early-outs on a row. A
+	// REGISTERED object whose canonical bytes are missing is repaired by
+	// THIS verified body (the zero-growth path below), never by
+	// re-adopting a legacy source: that spelling remains writable by
+	// still-valid legacy presigned URLs, so the true bytes must come in
+	// through the digest-verified proxy.
+	_, probeErr := s.Blob.Stat(pctx, key)
+	if errors.Is(probeErr, blob.ErrNotFound) {
+		switch _, lerr := s.Blob.Stat(pctx, blob.LFSLegacyKey(repoID, oid)); {
+		case lerr == nil:
+			registered, rerr := s.Store.HasLFSObject(ctx, repoID, key)
+			if rerr != nil {
+				log.Printf("lfs registry %s: %v", key, rerr)
+				lfsError(w, http.StatusInternalServerError, "object registry unavailable")
+				return
+			}
+			if !registered {
+				probeErr = nil // rowless legacy bytes: adopt them
+			}
+		case !errors.Is(lerr, blob.ErrNotFound):
+			probeErr = lerr
+		}
+	}
+	switch err := probeErr; {
 	case err == nil:
 		switch aerr := s.adoptLFSObject(ctx, repoID, key, oid); {
 		case aerr == nil:

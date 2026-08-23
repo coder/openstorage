@@ -78,6 +78,33 @@ func TestSweepLFS_ListOnlyReportsWithoutDeleting(t *testing.T) {
 	}
 }
 
+// TestSweepLFS_LegacySpellingSweepsAsLFS (ADR-41, Codex security round
+// 78): the v0.1.x single-key spelling must classify as LFS — never foreign
+// — and sweep exactly like a canonical orphan: adoption leaves its legacy
+// source rowless (best-effort deleted, this is the failure path), and a
+// registered CANONICAL row must not make the legacy spelling live.
+func TestSweepLFS_LegacySpellingSweepsAsLFS(t *testing.T) {
+	f := newSweepFixture(t)
+	canonical := blob.LFSKey("repo_lfs", lfsOID("aa"))
+	f.upload(canonical, "adopted-bytes")
+	f.registerLFS("repo_lfs", canonical, int64(len("adopted-bytes")))
+	f.backdate(canonical, 25*time.Hour)
+	legacy := blob.LFSLegacyKey("repo_lfs", lfsOID("aa"))
+	f.upload(legacy, "adopted-bytes")
+	f.backdate(legacy, 25*time.Hour)
+
+	report, err := f.sweeper(SweepConfig{Threshold: 24 * time.Hour}).Sweep(context.Background())
+	if err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if report.Live != 1 || report.OrphanCount != 1 {
+		t.Fatalf("report = %+v, want live=1 (canonical) orphans=1 (legacy source)", report)
+	}
+	if report.Orphans[0].Key != legacy {
+		t.Fatalf("orphan = %q, want the legacy source %q", report.Orphans[0].Key, legacy)
+	}
+}
+
 // TestSweepLFS_GeneralDeleteSparesLFS: the general Delete opt-in must NOT
 // reap LFS orphans — pre-#51 LFS objects have no registry rows, so a fleet
 // already running Delete=true would otherwise reap its entire existing LFS

@@ -229,8 +229,31 @@ func usageBytes(ctx context.Context, b BlobStore, repo string, prefixes []string
 // LFSKey is the immutable object key for a repo's LFS object with the given
 // sha256 oid. Keys are repo-scoped (docs/explanation/git-protocol-and-namespaces.md): forks inherit LFS pointers
 // only, never the objects, which this keying yields automatically.
+//
+// LFSKey is the CANONICAL object key: bytes here are written only by the
+// server's digest-verified paths (verified proxy uploads, adoption copies,
+// registered-object restores) — never by presigned PUTs. The `o2/` segment
+// makes the spelling unreachable by any v0.1.x presigned upload URL, which
+// signed exactly the bare LFSLegacyKey spelling (Codex security round 78
+// on issue #51): a still-valid legacy URL can overwrite ONLY the legacy
+// key, so registered content — always canonical — is immune to replay for
+// the URL's whole lifetime, with no quiesce-window reasoning. The oid is
+// caller-validated 64-hex (lfsOIDPattern / isLFSOID); the assert rules out
+// path tricks reaching the canonical namespace.
 func LFSKey(repoID, oid string) string {
-	assertf(repoID != "" && oid != "", "LFSKey(%q, %q)", repoID, oid)
+	assertf(repoID != "" && oid != "" && !strings.Contains(oid, "/"),
+		"LFSKey(%q, %q)", repoID, oid)
+	return LFSRoot + repoID + "/o2/" + oid
+}
+
+// LFSLegacyKey is the v0.1.x object spelling — the only one old presigned
+// PUT URLs can address. It is never registered and never served for
+// registered objects: it exists as the adoption SOURCE (rowless pre-#51
+// blobs live here until adopted, then the source is deleted) and as the
+// read-compat location for not-yet-adopted rowless objects.
+func LFSLegacyKey(repoID, oid string) string {
+	assertf(repoID != "" && oid != "" && !strings.Contains(oid, "/"),
+		"LFSLegacyKey(%q, %q)", repoID, oid)
 	return LFSRoot + repoID + "/" + oid
 }
 

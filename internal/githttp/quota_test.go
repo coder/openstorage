@@ -355,7 +355,7 @@ func TestUsageFloorInvalidatedByAdoption(t *testing.T) {
 	legacy := []byte("pre-registry legacy object body")
 	oid := sha256Hex(legacy)
 	key := blob.LFSKey(lfsTestRepoID, oid)
-	if err := srv.Blob.UploadFile(ctx, key, writeTempFile(t, legacy)); err != nil {
+	if err := srv.Blob.UploadFile(ctx, blob.LFSLegacyKey(lfsTestRepoID, oid), writeTempFile(t, legacy)); err != nil {
 		t.Fatal(err)
 	}
 	// Warm the cache: the whole object is uncounted.
@@ -392,8 +392,7 @@ func TestUsageFloorInvalidatedAcrossReplicas(t *testing.T) {
 
 	legacy := []byte("cross-replica legacy object")
 	oid := sha256Hex(legacy)
-	key := blob.LFSKey(lfsTestRepoID, oid)
-	if err := srv1.Blob.UploadFile(ctx, key, writeTempFile(t, legacy)); err != nil {
+	if err := srv1.Blob.UploadFile(ctx, blob.LFSLegacyKey(lfsTestRepoID, oid), writeTempFile(t, legacy)); err != nil {
 		t.Fatal(err)
 	}
 	// Replica 2 caches the pre-adoption floor.

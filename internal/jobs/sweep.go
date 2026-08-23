@@ -565,17 +565,25 @@ func splitSweepKey(key string) (repo string, ok bool) {
 	return splitPackKey(key)
 }
 
-// splitLFSKey validates that key has the exact shape blob.LFSKey produces —
-// lfs/<repo>/<oid> with a 64-hex-char oid and no deeper nesting — and
-// returns the repo segment (always a BASE RepoID, ADR-35) plus the oid
-// (the object's expected sha256, which quarantine restores verify against).
+// splitLFSKey validates that key has the exact shape of one of the two LFS
+// spellings — canonical blob.LFSKey (lfs/<repo>/o2/<oid>) or the v0.1.x
+// blob.LFSLegacyKey (lfs/<repo>/<oid>), each with a 64-hex-char oid and no
+// deeper nesting — and returns the repo segment (always a BASE RepoID,
+// ADR-35) plus the oid (the object's expected sha256, which quarantine
+// restores verify against). Both spellings sweep identically: registered
+// rows always hold canonical keys, so legacy blobs are rowless orphans
+// once adopted (Codex security round 78).
 func splitLFSKey(key string) (repo, oid string, ok bool) {
 	rest, found := strings.CutPrefix(key, blob.LFSRoot)
 	if !found {
 		return "", "", false
 	}
 	repo, oid, found = strings.Cut(rest, "/")
-	if !found || repo == "" || !isLFSOID(oid) {
+	if !found || repo == "" {
+		return "", "", false
+	}
+	oid = strings.TrimPrefix(oid, "o2/")
+	if !isLFSOID(oid) {
 		return "", "", false
 	}
 	return repo, oid, true
