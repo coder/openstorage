@@ -23,7 +23,12 @@ import (
 // git hooks (which re-exec this binary). CODESTORAGE_TEST_* fault-injection
 // knobs are honored only when CODESTORAGE_TEST_MODE=1.
 const (
-	EnvRepo       = "CODESTORAGE_GIT_REPO"
+	EnvRepo = "CODESTORAGE_GIT_REPO"
+	// EnvSyncClaim carries the loopback sync push's claim-holder token
+	// (auth.Claims.SyncClaim, issue #86): the update hook refuses the ref
+	// CAS when the repo's sync claim is no longer held by this holder,
+	// fencing a stale run's in-flight force push out of the ref store.
+	EnvSyncClaim  = "CODESTORAGE_SYNC_CLAIM"
 	EnvRefsPolicy = "CODESTORAGE_GIT_REFS_POLICY"
 	EnvOps        = "CODESTORAGE_GIT_OPS"
 	// EnvOrg names the org whose signing keys verify-sig loads. Shared with
@@ -468,6 +473,13 @@ func updateHook(ctx context.Context, args []string) error {
 	if err := enforceRefPolicy(ctx, repo, refName, old, new); err != nil {
 		return err
 	}
+	// Sync claim fence (issue #86): a loopback sync push carries its
+	// run's claim-holder token; refuse the update when the claim moved.
+	if holder := os.Getenv(EnvSyncClaim); holder != "" {
+		if err := enforceSyncClaimFence(ctx, repo, holder); err != nil {
+			return err
+		}
+	}
 
 	// Test knob: widen the CAS race window deterministically.
 	if testMode() {
@@ -495,6 +507,32 @@ func updateHook(ctx context.Context, args []string) error {
 	}
 	if !won {
 		return fmt.Errorf("CAS conflict: %s moved concurrently (expected %.8s)", refName, old)
+	}
+	return nil
+}
+
+// enforceSyncClaimFence refuses a loopback sync push whose run no longer
+// holds the repo's sync claim (issue #86). The token TTL already fences
+// NEW requests out past the lease, but an in-flight receive-pack that
+// authenticated before a steal could still commit its stale force push and
+// regress the thief's newer refs — this check runs per ref update,
+// immediately before the CAS, shrinking that window from an unbounded
+// in-flight request to the gap between this read and the CAS commit. It
+// fails CLOSED (no meta access ⇒ no fence ⇒ no update): a spuriously
+// refused sync push is retried by the pending-request machinery, while an
+// unfenced stale push is unrecoverable.
+func enforceSyncClaimFence(ctx context.Context, repo, holder string) error {
+	ms, err := meta.Open(ctx, mustEnv(envHookPGURL...))
+	if err != nil {
+		return fmt.Errorf("sync claim fence: open meta store: %w", err)
+	}
+	defer ms.Close()
+	up, err := ms.GetRepoUpstream(ctx, repo)
+	if err != nil {
+		return fmt.Errorf("sync claim fence: load upstream: %w", err)
+	}
+	if up.SyncClaimHolder != holder {
+		return fmt.Errorf("sync claim fence: claim now held by %q, refusing the stale sync push", up.SyncClaimHolder)
 	}
 	return nil
 }

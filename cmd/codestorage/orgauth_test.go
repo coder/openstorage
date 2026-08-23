@@ -63,11 +63,11 @@ func TestBootstrapOrgAuth_TwoBootsKeepBothLoopbackKeys(t *testing.T) {
 	}
 
 	repo := upsync.RepoInfo{RepoID: "repo_abc123", URL: "mirror"}
-	tokenA, err := keyA.mint(org, repo, time.Minute)
+	tokenA, err := keyA.mint(org, repo, time.Minute, "test-holder")
 	if err != nil {
 		t.Fatal(err)
 	}
-	tokenB, err := keyB.mint(org, repo, time.Minute)
+	tokenB, err := keyB.mint(org, repo, time.Minute, "test-holder")
 	if err != nil {
 		t.Fatal(err)
 	}

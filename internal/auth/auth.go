@@ -48,6 +48,12 @@ type Claims struct {
 	Exp    int64           `json:"exp"`            // unix seconds
 	Refs   json.RawMessage `json:"refs,omitempty"` // ordered [pattern, ops] tuples
 	Ops    []string        `json:"ops,omitempty"`  // deprecated repo-wide policy ops
+	// SyncClaim carries an upstream-sync run's claim-holder token on the
+	// internally minted loopback push JWT (issue #86): the update hook
+	// refuses ref updates when the repo's sync claim is no longer held by
+	// this holder, fencing a stale run's force push out of the ref store
+	// even after its request authenticated. Never set on external tokens.
+	SyncClaim string `json:"sync_claim,omitempty"`
 }
 
 // HasScope reports whether claims grant exactly the given scope.

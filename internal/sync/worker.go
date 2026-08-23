@@ -42,11 +42,12 @@ type Loopback struct {
 	// Token mints a short-lived git:write JWT for the loopback push (basic
 	// auth `t:<jwt>`, docs/explanation/git-protocol-and-namespaces.md). The token is passed to git via GIT_ASKPASS
 	// and never logged. May return "" when BaseURL needs no auth (file://).
-	// ttl is the FENCE for the run's claim lease (issue #86): the token
-	// must not be honored past it, so a zombie holder whose claim was
-	// stolen cannot authenticate a new push request — implementations
-	// must cap their token lifetime at ttl.
-	Token func(ctx context.Context, org string, repo RepoInfo, ttl time.Duration) (string, error)
+	// ttl and holder FENCE the push against a claim steal (issue #86):
+	// implementations must cap the token lifetime at ttl (no new push
+	// request authenticates once the lease can be stolen) and carry
+	// holder as the auth.Claims.SyncClaim so the update hook refuses ref
+	// updates from a run whose claim was stolen mid-receive-pack.
+	Token func(ctx context.Context, org string, repo RepoInfo, ttl time.Duration, holder string) (string, error)
 }
 
 // defaultRunTimeout caps one sync run end-to-end.
@@ -527,7 +528,7 @@ func (w *Worker) transfer(ctx context.Context, job Job, repo RepoInfo, up Upstre
 		return &syncFailure{code: FailInternal, cause: fmt.Errorf(
 			"claim lease expires at %v, inside the push fence margin: refusing to push", claimExpiresAt)}
 	}
-	token, err := w.Loopback.Token(ctx, job.Org, repo, tokenTTL)
+	token, err := w.Loopback.Token(ctx, job.Org, repo, tokenTTL, holder)
 	if err != nil {
 		return &syncFailure{code: FailInternal, cause: fmt.Errorf("mint loopback token: %w", err)}
 	}

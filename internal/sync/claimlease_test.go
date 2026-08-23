@@ -249,7 +249,7 @@ func TestLoopbackTokenFencedByClaimLease(t *testing.T) {
 	f.putUpstream(t, "repo_fence", "own", "proj", "file://"+f.upstreamDir)
 
 	var gotTTL atomic.Int64
-	f.worker.Loopback.Token = func(_ context.Context, _ string, _ RepoInfo, ttl time.Duration) (string, error) {
+	f.worker.Loopback.Token = func(_ context.Context, _ string, _ RepoInfo, ttl time.Duration, _ string) (string, error) {
 		gotTTL.Store(int64(ttl))
 		return "", nil
 	}
@@ -272,7 +272,7 @@ func TestLoopbackTokenFencedByClaimLease(t *testing.T) {
 	}
 	f.worker.Upstreams = gate
 	minted := make(chan struct{}, 1)
-	f.worker.Loopback.Token = func(context.Context, string, RepoInfo, time.Duration) (string, error) {
+	f.worker.Loopback.Token = func(context.Context, string, RepoInfo, time.Duration, string) (string, error) {
 		minted <- struct{}{}
 		return "", nil
 	}

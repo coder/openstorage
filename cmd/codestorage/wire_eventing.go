@@ -58,21 +58,25 @@ func newLoopbackKey() (loopbackKey, string, error) {
 // mint returns a short-lived repo-scoped git:write token for one loopback
 // push (docs/explanation/git-protocol-and-namespaces.md basic auth `t:<jwt>`),
 // capped at min(ttl, loopbackTokenTTL) — ttl is the worker's claim-lease
-// push fence (sync.Loopback.Token contract).
-func (k loopbackKey) mint(org string, repo upsync.RepoInfo, ttl time.Duration) (string, error) {
+// push fence (sync.Loopback.Token contract). holder is the run's claim
+// token, carried as the sync_claim JWT claim so the update hook can fence
+// an in-flight receive-pack that outlives a claim steal (issue #86).
+func (k loopbackKey) mint(org string, repo upsync.RepoInfo, ttl time.Duration, holder string) (string, error) {
 	assertf(k.priv != nil, "loopbackKey.mint: missing key")
 	assertf(ttl > 0, "loopbackKey.mint: non-positive ttl %v", ttl)
+	assertf(holder != "", "loopbackKey.mint: empty claim holder")
 	if ttl > loopbackTokenTTL {
 		ttl = loopbackTokenTTL
 	}
 	now := time.Now()
 	return auth.MintToken(k.priv, k.alg, auth.Claims{
-		Iss:    org,
-		Sub:    auth.SubjectLiteral,
-		Repo:   repo.URL,
-		Scopes: []string{auth.ScopeGitRead, auth.ScopeGitWrite},
-		Iat:    now.Unix(),
-		Exp:    now.Add(ttl).Unix(),
+		Iss:       org,
+		Sub:       auth.SubjectLiteral,
+		Repo:      repo.URL,
+		Scopes:    []string{auth.ScopeGitRead, auth.ScopeGitWrite},
+		Iat:       now.Unix(),
+		Exp:       now.Add(ttl).Unix(),
+		SyncClaim: holder,
 	})
 }
 
@@ -181,8 +185,8 @@ func buildServeEventing(ctx context.Context, ms meta.Store, dbURL, org, loopback
 		// against this process's in-memory loopback key, so a push routed
 		// through a load balancer could land on a replica that must
 		// reject it.
-		Loopback: upsync.Loopback{BaseURL: loopbackBaseURL, Token: func(_ context.Context, org string, repo upsync.RepoInfo, ttl time.Duration) (string, error) {
-			return key.mint(org, repo, ttl)
+		Loopback: upsync.Loopback{BaseURL: loopbackBaseURL, Token: func(_ context.Context, org string, repo upsync.RepoInfo, ttl time.Duration, holder string) (string, error) {
+			return key.mint(org, repo, ttl, holder)
 		}},
 		Logger: logger,
 	}
