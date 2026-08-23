@@ -43,8 +43,8 @@ func main() {
 		fmt.Fprintln(os.Stderr, "dst: infrastructure failure:", err)
 		os.Exit(2)
 	}
-	fmt.Printf("seed=%d steps=%d trace=%s transitions=%d deliveries=%d faults=%d\n",
-		res.Seed, res.Steps, res.TraceHash, res.Transitions, res.Deliveries, res.Faults)
+	fmt.Printf("seed=%d steps=%d trace=%s transitions=%d deliveries=%d faults=%d steals=%d crash-steals=%d\n",
+		res.Seed, res.Steps, res.TraceHash, res.Transitions, res.Deliveries, res.Faults, res.Steals, res.CrashSteals)
 	if len(res.Violations) > 0 {
 		for _, v := range res.Violations {
 			fmt.Println("VIOLATION:", v)

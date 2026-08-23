@@ -107,7 +107,7 @@ func (s *SQLite) CreateWebhook(ctx context.Context, org, url, secret string) (We
 	if err != nil {
 		return Webhook{}, err
 	}
-	nanos, createdAt := nowNano()
+	nanos, createdAt := s.nowNano()
 	w := Webhook{ID: NewEventingID("wh"), OrgID: orgID, URL: url, Secret: secret, CreatedAt: createdAt}
 	if _, err := s.db.ExecContext(ctx,
 		`INSERT INTO webhooks (id, org_id, url, secret, created_at) VALUES (?, ?, ?, ?, ?)`,
@@ -203,7 +203,7 @@ func (s *SQLite) CreateGitCredential(ctx context.Context, cred GitCredential) (G
 	if err != nil {
 		return GitCredential{}, fmt.Errorf("create credential for repo %q: %w", cred.RepoID, err)
 	}
-	nanos, createdAt := nowNano()
+	nanos, createdAt := s.nowNano()
 	cred.ID = NewEventingID("ggc")
 	cred.CreatedAt = createdAt
 	_, err = s.db.ExecContext(ctx,
@@ -340,7 +340,7 @@ func (s *SQLite) GitCredentialForRepo(ctx context.Context, repoID string) (GitCr
 // the repo already has one.
 func (s *SQLite) SetRepoUpstream(ctx context.Context, up RepoUpstream) (RepoUpstream, error) {
 	assertf(up.RepoID != "", "SetRepoUpstream: empty repo id")
-	nanos, createdAt := nowNano()
+	nanos, createdAt := s.nowNano()
 	up.RunCount, up.SuccessCount, up.Syncing, up.SyncPending = 0, 0, false, false
 	up.SyncClaimHolder, up.SyncClaimExpiresAt = "", time.Unix(0, 0).UTC()
 	up.CreatedAt = createdAt
@@ -449,7 +449,7 @@ func (s *SQLite) TryBeginSync(ctx context.Context, repoID, holder string, lease 
 	assertf(repoID != "", "TryBeginSync: empty repo id")
 	assertf(holder != "", "TryBeginSync: empty holder")
 	assertf(lease > 0, "TryBeginSync: non-positive lease %v", lease)
-	nowNanos, _ := nowNano()
+	nowNanos, _ := s.nowNano()
 	var up RepoUpstream
 	var claimed bool
 	var stolenFrom string

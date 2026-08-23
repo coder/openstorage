@@ -95,10 +95,11 @@ list is in the [configuration reference](configuration.md#internal-and-test-vari
 ## The DST harness
 
 `internal/simtest` is a deterministic, seeded simulation of a multi-node
-cluster — pushes, API writes, hydrations, crashes, restarts, repack races, and
-injected storage faults, all in one process on the local backends, checked
-against invariant oracles (ref/pack consistency, CAS atomicity, webhook
-soundness). **[`internal/simtest/README.md`](../../internal/simtest/README.md)**
+cluster — pushes, API writes, hydrations, crashes, restarts, repack races,
+upstream-sync claim/steal/finish cycles, and injected storage faults, all in
+one process on the local backends, checked against invariant oracles
+(ref/pack consistency, CAS atomicity, webhook soundness, sync claim-lease
+liveness). **[`internal/simtest/README.md`](../../internal/simtest/README.md)**
 is the authoritative description of what it exercises, the oracles, and the
 determinism rules; this section covers how to run and triage it.
 
@@ -198,3 +199,39 @@ sustained sweep daily (02:41 UTC): every target sequentially at 4m each
 (dispatch inputs `fuzztime` / `parallel` override the budget). A failing
 input turns the workflow red and uploads everything under
 `internal/*/testdata/fuzz/` as the `fuzz-crashers` artifact for triage.
+
+## Benchmarks
+
+Hot-path benchmarks (`func Benchmark*` in `*_bench_test.go` files) baseline
+the per-request and per-trigger costs optimization work measures against:
+the hydration fast path and steady-state `EnsureCacheRepo`
+(`internal/githttp`), quota-admission usage listing and ledger reservation
+(`internal/blob`, `internal/ref`), repack fold selection (`internal/jobs`),
+bearer-token verification per algorithm family (`internal/auth`), and
+pre-auth rate limiting under mutex contention (`internal/api`).
+
+House conventions: report allocations (`b.ReportAllocs`), iterate with
+`b.Loop()` (setup stays untimed and results stay live), express size and
+algorithm matrices as `b.Run` sub-benchmarks (`packs=100`, `candidates=1000`,
+`ES256`), and keep fixtures deterministic and container-free — SQLite,
+fileblob, or in-memory buckets; never the network, Docker, or real S3. Each
+timed iteration also checks its result against the expected value, so a
+benchmark that silently stops measuring the intended path fails instead of
+reporting numbers for the wrong one.
+
+Run the full sweep locally (`-run '^$'` skips ordinary tests; `-p 1`
+serializes the per-package test binaries so benchmark packages never
+contend with each other; the local backend keeps the `internal/githttp`
+boot container-free):
+
+```sh
+CODESTORAGE_TEST_BACKEND=local go test -p 1 ./... -run '^$' -bench . -benchmem
+```
+
+Benchmarks are **not** a per-PR gate — shared-runner deltas are too noisy to
+block merges on. [`bench-nightly.yml`](../../.github/workflows/bench-nightly.yml)
+runs the sweep daily (04:23 UTC) and uploads the output as the
+`bench-results` artifact; dispatch inputs `benchtime` / `count` override the
+budget (compare runs with `benchstat`, which wants `count` around 10). One
+caveat when reading results: `BenchmarkAdmitReserve/parallelism=N` scales
+`b.SetParallelism`, so the worker count is N × GOMAXPROCS, not N.
