@@ -167,6 +167,32 @@ func TestEnsureCacheRepo_MemoFallsThroughOnRepoRemoval(t *testing.T) {
 	}
 }
 
+// Config values supplied by global/system git config must still be written
+// to the LOCAL config file: the memo fingerprints only <repo>/config, so a
+// value satisfied from an external scope would freeze the decision against
+// later drift of that scope (PR #98 round-2 review). Pinning locally also
+// outranks global/system at receive-pack time, so drift cannot re-enable
+// unpacking pushes into loose objects even on the full pass.
+func TestEnsureCacheRepo_PinsConfigLocallyDespiteGlobalConfig(t *testing.T) {
+	global := filepath.Join(t.TempDir(), "gitconfig")
+	if err := os.WriteFile(global, []byte("[receive]\n\tunpackLimit = 0\n[gc]\n\tauto = 0\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GIT_CONFIG_GLOBAL", global)
+
+	cacheDir := t.TempDir()
+	repoPath, err := EnsureCacheRepo(cacheDir, "t-ensure-pin-local")
+	if err != nil {
+		t.Fatalf("EnsureCacheRepo: %v", err)
+	}
+	for key, want := range map[string]string{"receive.unpackLimit": "0", "gc.auto": "0"} {
+		got := strings.TrimSpace(mustGit(t, repoPath, "config", "--local", "--get", key))
+		if got != want {
+			t.Fatalf("local config %s = %q, want %q pinned despite global scope supplying it", key, got, want)
+		}
+	}
+}
+
 // A bare chmod changes neither the hook's inode nor its mtime/size, and git
 // silently skips non-executable hooks — the memo compares the mode exactly
 // so a memoized fast path can never vouch for a disarmed hook (issue #93).

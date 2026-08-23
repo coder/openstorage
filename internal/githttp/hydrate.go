@@ -207,8 +207,15 @@ func EnsureCacheRepoCtx(ctx context.Context, cacheDir, repo string) (string, err
 	} {
 		// Read-check first: config writes take config.lock, and concurrent
 		// hydrates of the same repo must not fail on lock contention in the
-		// steady-state already-configured case.
-		if cur, err := runGitCtx(ctx, path, "config", "--get", kv[0]); err == nil && strings.TrimSpace(cur) == kv[1] {
+		// steady-state already-configured case. Scoped --local: the values
+		// must be pinned in <repo>/config itself — an unscoped get would be
+		// satisfied by global/system/include scopes, skip the local write,
+		// and the memo (which fingerprints only the local file) would
+		// freeze that decision against later drift of the external source
+		// (PR #98 round-2 review). The local pin also outranks those scopes
+		// at receive-pack time, so drift cannot re-enable unpacking pushes
+		// into loose objects.
+		if cur, err := runGitCtx(ctx, path, "config", "--local", "--get", kv[0]); err == nil && strings.TrimSpace(cur) == kv[1] {
 			continue
 		}
 		if _, err := runGitCtx(ctx, path, "config", kv[0], kv[1]); err != nil {
