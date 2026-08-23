@@ -1220,6 +1220,105 @@ func TestLFSCompatCopy_FailurePropagatesAndRetryConverges(t *testing.T) {
 	}
 }
 
+// TestLFSCompatCopy_BatchRetryRepairsBridge (Codex round 84): after a
+// failed compat copy, the NATURAL client retry is another batch request —
+// its registered/canonical-present fast path returned "stored" with no
+// actions and no repair, so the missing legacy spelling could never
+// converge through the protocol's own flow. The batch fast path must
+// repair the bridge (or fail the entry retryably).
+func TestLFSCompatCopy_BatchRetryRepairsBridge(t *testing.T) {
+	ctx := context.Background()
+	srv, st, mint := newLFSQuotaServer(t, 0, time.Hour)
+	srv.LFSV020WriteCompat = true
+	tok := mint(auth.ScopeGitWrite)
+	content := []byte("bridge repaired from the batch path")
+	oid := sha256Hex(content)
+	key := blob.LFSKey(lfsTestRepoID, oid)
+	// The post-failure state: canonical bytes + row, NO legacy spelling.
+	if err := srv.Blob.UploadFile(ctx, key, writeTempFile(t, content)); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.RegisterLFSObject(ctx, lfsTestRepoID, key, int64(len(content))); err != nil {
+		t.Fatal(err)
+	}
+
+	resp := decodeBatch(t, doLFS(t, srv, http.MethodPost, lfsBatchPath, "basic:"+tok,
+		batchBody("upload", oid, int64(len(content)))))
+	if resp.Objects[0].Error != nil || len(resp.Objects[0].Actions) != 0 {
+		t.Fatalf("batch touch of stored object = %+v, want stored", resp.Objects[0])
+	}
+	size, err := srv.Blob.Stat(ctx, blob.LFSLegacyKey(lfsTestRepoID, oid))
+	if err != nil || size != int64(len(content)) {
+		t.Fatalf("legacy spelling after batch retry = (%d, %v), want repaired — old replicas 404 and nothing else converges", size, err)
+	}
+}
+
+// TestLFSPut_PublicationHoldsFleetAdoptionClaim (Codex round 84): the
+// registered-row corrupt-byte delete in the adoption mismatch path is
+// fingerprint-conditional, but the check and the delete are not atomic — a
+// verified PUT publishing valid bytes in that window (after its own final
+// writer verify) would lose them with no repair left. Canonical publishers
+// therefore serialize on the SAME fleet claim adoption holds: with the
+// oid's claim held elsewhere, a verified PUT answers 429 and publishes
+// nothing; once released, the retry succeeds. Under that serialization no
+// publisher can be mid-flight while adoption's mismatch delete runs.
+func TestLFSPut_PublicationHoldsFleetAdoptionClaim(t *testing.T) {
+	srv, st, mint := newLFSQuotaServer(t, 0, time.Hour)
+	tok := mint(auth.ScopeGitWrite)
+	content := []byte("upload racing a fleet adoption claim")
+	oid := sha256Hex(content)
+	key := blob.LFSKey(lfsTestRepoID, oid)
+	ctx := context.Background()
+	claimed, owner, err := st.TryAdoptionClaim(ctx, lfsTestRepoID, key)
+	if err != nil || !claimed {
+		t.Fatalf("seed claim = (%v, %v), want held", claimed, err)
+	}
+
+	objPath := "/" + lfsTestRepoURL + ".git/info/lfs/objects/" + oid
+	w := doLFS(t, srv, http.MethodPut, objPath, "basic:"+tok, string(content))
+	if w.Code != http.StatusTooManyRequests {
+		t.Fatalf("PUT under a held fleet claim = %d, body %s (want 429 — publication must serialize with adoption's canonical writes)", w.Code, w.Body)
+	}
+	if _, serr := srv.Blob.Stat(ctx, key); !errors.Is(serr, blob.ErrNotFound) {
+		t.Fatalf("claim-blocked PUT published canonical bytes (stat err %v)", serr)
+	}
+	if err := st.ReleaseAdoptionClaim(ctx, key, owner); err != nil {
+		t.Fatal(err)
+	}
+	if w := doLFS(t, srv, http.MethodPut, objPath, "basic:"+tok, string(content)); w.Code != http.StatusOK {
+		t.Fatalf("PUT after claim release = %d, body %s", w.Code, w.Body)
+	}
+}
+
+// TestLFSCompatCopy_ChargedAgainstQuota (Codex security round 84): the
+// bridge copy materializes a SECOND size bytes, but its cover reserved
+// under math.MaxInt64 — an upload equal to the remaining headroom returned
+// 200 and left physical usage near 2Q. The bridge is fresh growth and must
+// pass real quota admission; at the quota edge the upload fails (the
+// canonical object stays registered — headroom later lets a retry repair
+// the bridge), and physical usage never exceeds the quota.
+func TestLFSCompatCopy_ChargedAgainstQuota(t *testing.T) {
+	ctx := context.Background()
+	srv, _, mint := newLFSQuotaServer(t, 100, time.Hour)
+	srv.LFSV020WriteCompat = true
+	tok := mint(auth.ScopeGitWrite)
+	content := bytes.Repeat([]byte("q"), 60) // 60 fits; 2×60 exceeds Q=100
+	oid := sha256Hex(content)
+
+	w := doLFS(t, srv, http.MethodPut, "/"+lfsTestRepoURL+".git/info/lfs/objects/"+oid,
+		"basic:"+tok, string(content))
+	if w.Code == http.StatusOK {
+		t.Fatal("PUT whose bridge copy exceeds the quota = 200 — physical usage reached ~2Q uncharged")
+	}
+	usage, err := blob.StorageUsageBytes(ctx, srv.Blob, lfsTestRepoID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if usage > 100 {
+		t.Fatalf("physical usage after quota-edge compat upload = %d, want <= 100 — the bridge must be admitted before it materializes", usage)
+	}
+}
+
 // renewCountingStore counts adoption-claim renewals for one key.
 type renewCountingStore struct {
 	ref.RefStore
