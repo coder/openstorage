@@ -1800,6 +1800,56 @@ func TestLFSCopyAdmission_SingleChargeDuringCopy(t *testing.T) {
 	})
 }
 
+// commitButFailCopyBlob performs the legacy copy, then reports failure —
+// the committed-but-response-lost S3 outcome.
+type commitButFailCopyBlob struct {
+	blob.BlobStore
+	failed atomic.Bool
+}
+
+func (b *commitButFailCopyBlob) Copy(ctx context.Context, dstKey, srcKey string) error {
+	err := b.BlobStore.Copy(ctx, dstKey, srcKey)
+	if err == nil && !strings.Contains(dstKey, "/o2/") && !b.failed.Swap(true) {
+		return fmt.Errorf("simulated lost CopyObject response")
+	}
+	return err
+}
+
+// TestLFSCompatCopy_AmbiguousCommitHandsOff (Codex round 95, P1): an S3
+// copy can commit its destination and still return an error (response
+// lost, context canceled concurrently) — the bridge then skipped both the
+// cover tail and the floor-generation handoff, and every retry saw the
+// legacy key present and skipped them too: the durable bytes stayed
+// invisible to pre-copy cached floors, whose 60-second serve-and-handoff
+// window could admit another upload without accounting for them. An
+// ambiguous copy failure must probe the destination; a present spelling
+// is a COMMIT and takes the success path's handoff.
+func TestLFSCompatCopy_AmbiguousCommitHandsOff(t *testing.T) {
+	ctx := context.Background()
+	srv, st, mint := newLFSQuotaServer(t, 1<<20, time.Hour)
+	srv.LFSV020WriteCompat = true
+	tok := mint(auth.ScopeGitWrite)
+	content := bytes.Repeat([]byte("g"), 50)
+	oid := sha256Hex(content)
+	srv.Blob = &commitButFailCopyBlob{BlobStore: srv.Blob}
+	preGen, err := st.LFSAdoptionGen(ctx, lfsTestRepoID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	w := doLFS(t, srv, http.MethodPut, "/"+lfsTestRepoURL+".git/info/lfs/objects/"+oid,
+		"basic:"+tok, string(content))
+	if w.Code != http.StatusOK {
+		t.Fatalf("PUT whose bridge copy committed despite the error = %d, body %s — the destination probe proves the commit", w.Code, w.Body)
+	}
+	if _, serr := srv.Blob.Stat(ctx, blob.LFSLegacyKey(lfsTestRepoID, oid)); serr != nil {
+		t.Fatalf("legacy spelling missing: %v", serr)
+	}
+	if gen, err := st.LFSAdoptionGen(ctx, lfsTestRepoID); err != nil || gen == preGen {
+		t.Fatalf("adoption gen after ambiguous-commit bridge = (%d -> %d, %v), want bumped — the durable copy stays floor-invisible without the handoff", preGen, gen, err)
+	}
+}
+
 // TestLFSCompat_RepairSerializedOnLegacyClaim (Codex security round 85):
 // the batch fast path's bridge repair launched an unserialized full copy —
 // every tiny concurrent touch of the object started another one. Compat

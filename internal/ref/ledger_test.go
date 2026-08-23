@@ -863,6 +863,40 @@ func TestReconcileLegacyLFSTwinRows(t *testing.T) {
 	})
 }
 
+// TestReserveExcludesAdoptionClaims (Codex round 95): adoption-claim rows
+// carry a bookkeeping byte in pack_reservations, and the admission sums
+// counted it — at a quota exactly equal to the intended post-operation
+// usage, a legitimate reservation was denied as needing one byte more
+// (or two, while both an object's canonical and legacy claims were held).
+// Claims are leases, not storage: both the byte sum and the row-cap count
+// must exclude them.
+func TestReserveExcludesAdoptionClaims(t *testing.T) {
+	runRefBackends(t, func(t *testing.T, s Store) {
+		ctx := context.Background()
+		k := newLedgerKit(t, s)
+		oid := strings.Repeat("cd", 32)
+		for _, key := range []string{
+			"lfs/" + k.base() + "/o2/" + oid,
+			"lfs/" + k.base() + "/" + oid,
+		} {
+			claimed, _, err := s.TryAdoptionClaim(ctx, k.base(), key)
+			if err != nil || !claimed {
+				t.Fatalf("seed claim %s = (%v, %v)", key, claimed, err)
+			}
+		}
+		// The FULL quota must remain reservable under held claims.
+		dec, err := s.ReservePackBytes(ctx, []string{k.base()},
+			[]Pack{{Key: "packs/" + k.base() + "/pack-full.pack", Size: 100}},
+			NewReservationOwner(), 0, ReserveNoFloorGen, 100, time.Hour)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !dec.OK {
+			t.Fatalf("exact-quota reservation under held claims denied: %+v — claim bookkeeping bytes are not storage", dec)
+		}
+	})
+}
+
 // TestReconcileLegacyLFSObjectsPaged (Codex round 91): the janitor
 // materialized EVERY cross-repository candidate before reconciling any —
 // unbounded memory on a large mixed-roll fleet, inside Heal's synchronous
