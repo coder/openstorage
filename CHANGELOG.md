@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.0](https://github.com/coder/code-storage/compare/v0.1.4...v0.2.0) (2026-08-23)
+
+
+### Features
+
+* **lfs:** quota-metered, digest-verified uploads and lfs/ sweep reconciliation ([#51](https://github.com/coder/code-storage/issues/51)) ([583f369](https://github.com/coder/code-storage/commit/583f369aafbc26d31a6b95d3d13755674cf4cdb0))
+
 ## [0.1.4](https://github.com/coder/code-storage/compare/v0.1.3...v0.1.4) (2026-08-23)
 
 
