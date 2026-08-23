@@ -312,6 +312,13 @@ func preReceive(ctx context.Context) error {
 			if err != nil {
 				return fmt.Errorf("pre-receive: reserve pack bytes: %w", err)
 			}
+			if dec.KeyCapExceeded {
+				// Transient row-cap denial, not a quota breach (Codex
+				// round 43): rows expire with the TTL, so tell the
+				// client to RETRY instead of reporting a quota failure
+				// whose arithmetic may even show the push fits.
+				return fmt.Errorf("pre-receive: too many in-flight uploads reserved for this repository, retry later")
+			}
 			if !dec.OK {
 				return fmt.Errorf("pre-receive: repository pack quota exceeded: push adds %d bytes to %d bytes stored (+%d bytes reserved by in-flight pushes), quota is %d bytes",
 					ref.IncomingBytes(unpublished), dec.UsedBytes, dec.ReservedBytes, quota)

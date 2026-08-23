@@ -27,6 +27,13 @@ import (
 // The wrapped message carries the byte arithmetic.
 var errPackQuotaExceeded = errors.New("repository pack quota exceeded")
 
+// errPackReservationsBusy marks a publishPack denial by the ACTIVE
+// reservation-row cap (issue #51, Codex round 43): rows expire with the
+// TTL, so unlike the byte-quota denial this is transient — handlers
+// answer 429 with Retry-After, never the permanent 403 whose quota
+// arithmetic may even show the write fits.
+var errPackReservationsBusy = errors.New("too many in-flight uploads reserved for this repository, retry later")
+
 // publishPack publishes the local pack file at packPath under repoID's
 // content-addressed key. Nothing is stored when the quota would be
 // exceeded. A nil return means the pack is durably published, registered,
@@ -84,6 +91,13 @@ func (s *server) publishPack(ctx context.Context, repoID, packID, packPath strin
 			rsvCancel()
 			if err != nil {
 				return fmt.Errorf("reserve pack bytes: %w", err)
+			}
+			if dec.KeyCapExceeded {
+				// Transient row-cap denial, not a quota breach (Codex
+				// round 43): rows expire with the TTL, so this maps to
+				// retry — the byte arithmetic below would even suggest
+				// the write fits.
+				return errPackReservationsBusy
 			}
 			if !dec.OK {
 				return fmt.Errorf("%w: write adds %d bytes to %d bytes stored (+%d bytes reserved by in-flight writes), quota is %d bytes",

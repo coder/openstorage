@@ -703,6 +703,12 @@ func (s *server) handleMerge(w http.ResponseWriter, r *http.Request) {
 		wmFail(w, http.StatusForbidden, "forbidden", err.Error(), req.TargetBranch, targetSHA)
 		return
 	}
+	if errors.Is(err, errPackReservationsBusy) {
+		// Transient row-cap denial (Codex round 43): retryable.
+		w.Header().Set("Retry-After", "10")
+		wmFail(w, http.StatusTooManyRequests, "busy", err.Error(), req.TargetBranch, targetSHA)
+		return
+	}
 	if err != nil {
 		s.wmInternal(w, r, "publish merge", err)
 		return

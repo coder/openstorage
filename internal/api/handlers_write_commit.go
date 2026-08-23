@@ -771,6 +771,12 @@ func (s *server) wcFinishCommit(w http.ResponseWriter, r *http.Request, sc *wcSc
 		wcFail(w, http.StatusForbidden, "forbidden", err.Error(), md.TargetBranch, plan.oldSHA)
 		return
 	}
+	if errors.Is(err, errPackReservationsBusy) {
+		// Transient row-cap denial (Codex round 43): retryable.
+		w.Header().Set("Retry-After", "10")
+		wcFail(w, http.StatusTooManyRequests, "busy", err.Error(), md.TargetBranch, plan.oldSHA)
+		return
+	}
 	if err != nil {
 		s.wcInternal(w, r, "publish commit", err)
 		return
