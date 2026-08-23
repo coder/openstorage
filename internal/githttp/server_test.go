@@ -6,12 +6,15 @@ package githttp
 // over an in-memory key source — no containers needed.
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto"
 	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"testing"
 	"time"
 
@@ -285,5 +288,54 @@ func TestServiceRPC_CrashHeaderRefusedOutsideTestMode(t *testing.T) {
 	var body map[string]string
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil || body["error"] == "" {
 		t.Fatalf("expected JSON error body, got %q (err %v)", rec.Body.String(), err)
+	}
+}
+
+// Local spool failures are server setup errors, not malformed client gzip:
+// valid gzip must receive the structured 500 without reaching hydration.
+func TestServiceRPC_UploadPackSpoolFailureIs500(t *testing.T) {
+	key, pemBlock := genKeyPEM(t, "ES256")
+	repo := meta.Repo{RepoID: "repo_spool123456", URL: "spool-failure"}
+	srv := &Server{
+		// Store/Blob/CacheDir stay zero: the spool verdict must happen
+		// before hydration, and unexpected pass-through fails loudly.
+		Verifier: auth.NewVerifier(memKeys{"org1": {pemBlock}}),
+		Org:      "org1",
+		ResolveRepo: func(_ context.Context, base string) (meta.Repo, bool) {
+			return repo, base == repo.URL
+		},
+	}
+	token := mintUnitToken(t, key, "ES256", unitClaims("org1", repo.URL, auth.ScopeGitRead))
+
+	var compressed bytes.Buffer
+	zw := gzip.NewWriter(&compressed)
+	if _, err := zw.Write(make([]byte, uploadPackMemBufferMax+1)); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	previous := createUploadPackTemp
+	createUploadPackTemp = func() (*os.File, error) {
+		return nil, os.ErrPermission
+	}
+	t.Cleanup(func() { createUploadPackTemp = previous })
+
+	req := httptest.NewRequest(http.MethodPost, "/spool-failure.git/git-upload-pack", bytes.NewReader(compressed.Bytes()))
+	req.SetBasicAuth("t", token)
+	req.Header.Set("Content-Type", "application/x-git-upload-pack-request")
+	req.Header.Set("Content-Encoding", "gzip")
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500; body: %s", rec.Code, rec.Body.String())
+	}
+	var body map[string]string
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode JSON error: %v; body: %s", err, rec.Body.String())
+	}
+	if body["error"] != "fetch setup failed" {
+		t.Fatalf("error = %q, want fetch setup failed", body["error"])
 	}
 }

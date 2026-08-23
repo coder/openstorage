@@ -10,6 +10,8 @@ import (
 	"crypto/rand"
 	"errors"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -91,4 +93,66 @@ func TestBufferUploadPackBody_CapOverflowPropagates(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestBufferUploadPackBody_SpoolCreateFailureTagged(t *testing.T) {
+	previous := createUploadPackTemp
+	createUploadPackTemp = func() (*os.File, error) {
+		return nil, os.ErrPermission
+	}
+	t.Cleanup(func() { createUploadPackTemp = previous })
+
+	buffered, err := bufferUploadPackBody(bytes.NewReader(make([]byte, uploadPackMemBufferMax+1)))
+	if !errors.Is(err, errUploadPackSpool) {
+		t.Fatalf("err = %v, want errUploadPackSpool", err)
+	}
+	if buffered != nil {
+		t.Fatal("failed spool returned a body")
+	}
+}
+
+func TestBufferUploadPackBody_SpoolWriteFailureTagged(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "read-only-spill")
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	previous := createUploadPackTemp
+	createUploadPackTemp = func() (*os.File, error) {
+		return os.Open(path) // read-only: the first spill write fails
+	}
+	t.Cleanup(func() { createUploadPackTemp = previous })
+
+	buffered, err := bufferUploadPackBody(bytes.NewReader(make([]byte, uploadPackMemBufferMax+1)))
+	if !errors.Is(err, errUploadPackSpool) {
+		t.Fatalf("err = %v, want errUploadPackSpool", err)
+	}
+	if buffered != nil {
+		t.Fatal("failed spool returned a body")
+	}
+}
+
+func TestBufferUploadPackBody_SourceFailureNotTaggedAsSpool(t *testing.T) {
+	sourceErr := errors.New("corrupt gzip stream")
+	r := io.MultiReader(
+		bytes.NewReader(make([]byte, uploadPackMemBufferMax+1)),
+		errorReader{err: sourceErr},
+	)
+	buffered, err := bufferUploadPackBody(r)
+	if !errors.Is(err, sourceErr) {
+		t.Fatalf("err = %v, want source error", err)
+	}
+	if errors.Is(err, errUploadPackSpool) {
+		t.Fatalf("source error was mislabeled as spool failure: %v", err)
+	}
+	if buffered != nil {
+		t.Fatal("failed source returned a body")
+	}
+}
+
+type errorReader struct {
+	err error
+}
+
+func (r errorReader) Read([]byte) (int, error) {
+	return 0, r.err
 }

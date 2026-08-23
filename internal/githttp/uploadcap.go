@@ -30,6 +30,7 @@ package githttp
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -71,10 +72,38 @@ func (b *bufferedBody) Close() error {
 	return b.spill.Close()
 }
 
+// errUploadPackSpool marks local temp-file failures so handleServiceRPC can
+// map server-side resource errors to 500 without misreporting valid requests
+// as malformed gzip (Codex review round 1).
+var errUploadPackSpool = errors.New("upload-pack spool failed")
+
+// createUploadPackTemp is a narrow fault-injection seam for the local spool;
+// production always uses an unlinked os.CreateTemp file.
+var createUploadPackTemp = func() (*os.File, error) {
+	return os.CreateTemp("", "codestorage-upload-pack-*")
+}
+
+// spoolWriter tags destination failures from io.Copy. Source errors remain
+// unwrapped so gzip corruption and client hangups still map to 400.
+type spoolWriter struct {
+	w io.Writer
+}
+
+func (w spoolWriter) Write(p []byte) (int, error) {
+	n, err := w.w.Write(p)
+	if err != nil {
+		return n, fmt.Errorf("%w: write: %v", errUploadPackSpool, err)
+	}
+	if n != len(p) {
+		return n, fmt.Errorf("%w: write: %v", errUploadPackSpool, io.ErrShortWrite)
+	}
+	return n, nil
+}
+
 // bufferUploadPackBody spools r (the capped, decoded negotiation stream)
-// to completion. Any read error — cap overflow, gzip corruption, client
-// hangup — aborts the spool; the caller distinguishes overflow via the cap
-// counters, not the returned error.
+// to completion. Source read errors — cap overflow, gzip corruption, client
+// hangup — propagate unchanged; local create/write/seek errors carry
+// errUploadPackSpool so the handler can return 500.
 func bufferUploadPackBody(r io.Reader) (*bufferedBody, error) {
 	assertf(r != nil, "bufferUploadPackBody: nil reader")
 	var mem bytes.Buffer
@@ -85,20 +114,20 @@ func bufferUploadPackBody(r io.Reader) (*bufferedBody, error) {
 		return nil, err
 	}
 	// More than the memory tier: spill the rest to an unlinked temp file.
-	f, err := os.CreateTemp("", "codestorage-upload-pack-*")
+	f, err := createUploadPackTemp()
 	if err != nil {
-		return nil, fmt.Errorf("upload-pack spool: %w", err)
+		return nil, fmt.Errorf("%w: create: %v", errUploadPackSpool, err)
 	}
 	// Unlink immediately: the handle is the only reference, so the bytes
 	// vanish with it on every exit path.
 	_ = os.Remove(f.Name())
-	if _, err := io.Copy(f, r); err != nil {
+	if _, err := io.Copy(spoolWriter{w: f}, r); err != nil {
 		_ = f.Close()
 		return nil, err
 	}
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
 		_ = f.Close()
-		return nil, fmt.Errorf("upload-pack spool: %w", err)
+		return nil, fmt.Errorf("%w: seek: %v", errUploadPackSpool, err)
 	}
 	return &bufferedBody{Reader: io.MultiReader(&mem, f), spill: f}, nil
 }

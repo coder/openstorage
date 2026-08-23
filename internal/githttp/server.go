@@ -411,7 +411,12 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 			return
 		}
 		if err != nil {
-			httpError(w, http.StatusBadRequest, "bad gzip body: "+err.Error())
+			if errors.Is(err, errUploadPackSpool) {
+				log.Printf("%s %s: negotiation spool: %v", service, repo, err)
+				httpError(w, http.StatusInternalServerError, "fetch setup failed")
+			} else {
+				httpError(w, http.StatusBadRequest, "bad gzip body: "+err.Error())
+			}
 			return
 		}
 		defer buffered.Close()
