@@ -32,6 +32,11 @@ type simNode struct {
 	simRef   *SimRefStore
 	simBlob  *SimBlobStore
 	casStore ref.RefStore // events.RefStore(IdempotentCAS(simRef)) — the write seam
+	// metaStore is the node's own handle onto the shared meta DB (the
+	// upstream-sync claim/steal/finish surface, issue #88). It carries the
+	// simulation's logical clock (meta.WithNowFunc), so sync-claim lease
+	// expiry is a pure function of the seed, never wall time.
+	metaStore *meta.SQLite
 
 	// believedTips is the node's client-side view: repoKey -> ref name ->
 	// sha (ZeroSHA when believed absent). Stale beliefs across nodes are
@@ -101,9 +106,13 @@ type cluster struct {
 	inj      *Injector
 	rec      *deliveryRecorder
 	now      func() time.Time
+	metaURL  string
 	nodes    []*simNode
 	oracle   ref.Store      // clean, never fault-injected: ground truth
 	oracleBl blob.BlobStore // clean blob handle for invariant (c)
+	// oracleMeta is the clean meta handle the sync-claim oracle reads
+	// repo_upstreams ground truth through (issue #88).
+	oracleMeta *meta.SQLite
 }
 
 // newCluster boots the shared SQLite file + fileblob dir, the oracle
@@ -115,6 +124,7 @@ func newCluster(dir string, n int, inj *Injector, now func() time.Time) (*cluste
 		dir:     dir,
 		dbURL:   "sqlite://" + filepath.Join(dir, "refs.sqlite"),
 		blobURL: "file://" + filepath.Join(dir, "blobs"),
+		metaURL: "sqlite://" + filepath.Join(dir, "meta.sqlite"),
 		inj:     inj,
 		rec:     &deliveryRecorder{},
 		now:     now,
@@ -134,6 +144,16 @@ func newCluster(dir string, n int, inj *Injector, now func() time.Time) (*cluste
 		return nil, fmt.Errorf("open oracle blob store: %w", err)
 	}
 	c.oracleBl = oracleBl
+	oracleMeta, err := meta.OpenSQLite(ctx, c.metaURL, meta.WithNowFunc(c.now))
+	if err != nil {
+		c.close()
+		return nil, fmt.Errorf("open oracle meta store: %w", err)
+	}
+	c.oracleMeta = oracleMeta
+	if err := oracleMeta.InitSchema(ctx); err != nil {
+		c.close()
+		return nil, fmt.Errorf("init meta schema: %w", err)
+	}
 	for i := 0; i < n; i++ {
 		node := &simNode{
 			id:           i,
@@ -162,7 +182,13 @@ func (c *cluster) openNodeHandles(n *simNode) error {
 		raw.Close()
 		return fmt.Errorf("node %d: open blob store: %w", n.id, err)
 	}
-	n.raw, n.rawBlob = raw, rawBlob
+	metaStore, err := meta.OpenSQLite(ctx, c.metaURL, meta.WithNowFunc(c.now))
+	if err != nil {
+		raw.Close()
+		_ = rawBlob.Close()
+		return fmt.Errorf("node %d: open meta store: %w", n.id, err)
+	}
+	n.raw, n.rawBlob, n.metaStore = raw, rawBlob, metaStore
 	n.simRef = NewSimRefStore(raw, c.inj)
 	n.simBlob = NewSimBlobStore(rawBlob, c.inj)
 	// The production write chain: events emission over idempotent CAS
@@ -186,7 +212,8 @@ func (c *cluster) crashNode(n *simNode, cold bool) error {
 	if err := n.rawBlob.Close(); err != nil {
 		return fmt.Errorf("node %d: close blob store: %w", n.id, err)
 	}
-	n.raw, n.rawBlob, n.simRef, n.simBlob, n.casStore = nil, nil, nil, nil, nil
+	n.metaStore.Close()
+	n.raw, n.rawBlob, n.simRef, n.simBlob, n.casStore, n.metaStore = nil, nil, nil, nil, nil, nil
 	if cold {
 		if err := os.RemoveAll(n.cacheDir); err != nil {
 			return fmt.Errorf("node %d: wipe cache: %w", n.id, err)
@@ -205,12 +232,18 @@ func (c *cluster) close() {
 		if n.rawBlob != nil {
 			_ = n.rawBlob.Close()
 		}
+		if n.metaStore != nil {
+			n.metaStore.Close()
+		}
 	}
 	if c.oracleBl != nil {
 		_ = c.oracleBl.Close()
 	}
 	if c.oracle != nil {
 		c.oracle.Close()
+	}
+	if c.oracleMeta != nil {
+		c.oracleMeta.Close()
 	}
 }
 

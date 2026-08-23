@@ -8,8 +8,9 @@ containers.
 ## What it exercises
 
 A seeded scheduler serializes logically-concurrent ops against N simulated
-nodes that share one SQLite ref DB and one fileblob directory (each node has
-its own handles and cache dir, like separate processes on a host):
+nodes that share one SQLite ref DB, one SQLite meta DB, and one fileblob
+directory (each node has its own handles and cache dir, like separate
+processes on a host):
 
 - **pushes / API writes** — deterministic commits minted with git plumbing,
   driven through the real pipeline: blob upload → `RegisterPacks` →
@@ -21,7 +22,14 @@ its own handles and cache dir, like separate processes on a host):
 - **background repacks** (issue #1, `jobs.Repacker`): plain folds through a
   node's fault-injected stores, plus a deterministic two-folder race
   (`repack-race`) where a mid-race push forces the competing folds apart and
-  the loser must delete exactly its own uploaded blob.
+  the loser must delete exactly its own uploaded blob;
+- **upstream-sync claim leases** (issues #86/#88, `sync-claim` /
+  `sync-request`): a minimal sync actor drives TryBeginSync/FinishSync
+  cycles against the real meta store (the transfer is a seeded number of
+  sim steps, no real git), with seeded crash injection between claim and
+  finish; node crashes kill the node's in-flight runs too. The meta store
+  runs on the simulation's logical clock (`meta.WithNowFunc`), so lease
+  expiry is a pure function of the seed.
 
 Storage calls pass through `SimRefStore`/`SimBlobStore`, which inject:
 
@@ -53,7 +61,18 @@ Checked from clean (never fault-injected) handles:
    a repack's before→after transition is pinned in-op — the observable row
    set is exactly the pre-set or exactly the folded set (replacement
    atomicity), a lost race changes nothing and leaks no blob, and
-   superseded blobs outlive the fold (the sweeper owns them).
+   superseded blobs outlive the fold (the sweeper owns them);
+7. **no sync claim outlives its lease without progress** (issues #86/#88,
+   `sync_ops.go`): after any claim attempt at sim time T, no
+   `repo_upstreams` row keeps `syncing=true` with an expiry ≤ T — an
+   expired claim must be stolen by the very next attempt; steals only take
+   expired claims (never live ones) and name the exact previous holder; a
+   stolen run's late FinishSync fails (`ErrClaimLost` while the thief
+   holds, `ErrNotFound` after it finished) without touching the row or
+   counters; run/success counters and the pending marker mirror a
+   ground-truth model; and after quiescence (clock jumped past every
+   lease) one final claim per repo must succeed and finish cleanly — a
+   refusal is exactly the pre-#86 wedged row.
 
 ## Entry points
 
@@ -93,10 +112,16 @@ The harness must catch re-broken variants of the fixes it guards. Locally
   `false` — the sweep reports an `issue-#2 class` violation;
 - revert #6: make `HydratePacks` in `internal/githttp/hydrate.go` fail on
   `blob.ErrNotFound` instead of re-listing — the sweep reports an
-  `issue #6 class` violation.
+  `issue #6 class` violation;
+- revert #86: make `TryBeginSync` in `internal/meta/sqlite_eventing.go`
+  refuse every `syncing=true` row regardless of expiry (change the refusal
+  guard to `if prev.Syncing {`) — the sweep reports an `issue-#88 lease
+  liveness` violation on the first claim attempt after a crashed holder's
+  lease expires (and an `issue-#88 quiescence` violation on seeds whose
+  crashes go unprobed in-run).
 
-Both were validated when this harness landed; the landing PR documents the
-detecting seeds.
+The first two were validated when this harness landed and the #86 one when
+the sync oracle landed; the landing PRs document the detecting seeds.
 
 ## Determinism rules
 

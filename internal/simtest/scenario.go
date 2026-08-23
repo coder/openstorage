@@ -71,6 +71,7 @@ type Result struct {
 	Transitions int // distinct committed ref transitions observed
 	Deliveries  int // webhook deliveries recorded
 	Faults      int // faults injected
+	Steals      int // expired sync claims stolen (issues #86/#88)
 	OpCounts    map[string]int
 }
 
@@ -108,6 +109,8 @@ const (
 	opRepackRace
 	opReserveCrash
 	opReserveSweep
+	opSyncClaim
+	opSyncRequest
 )
 
 var opTable = []struct {
@@ -127,6 +130,8 @@ var opTable = []struct {
 	{opRepackRace, "repack-race", 4},
 	{opReserveCrash, "reserve-crash", 5},
 	{opReserveSweep, "reserve-sweep", 3},
+	{opSyncClaim, "sync-claim", 10},
+	{opSyncRequest, "sync-request", 4},
 }
 
 // simRepo is one simulated repository: its storage key plus the scratch
@@ -160,6 +165,32 @@ type sim struct {
 	// key as of the last check. The repack ops rewrite their repo's
 	// baseline in-op after pinning the exact fold transition.
 	prevPacks map[string]map[string]string
+
+	// Sync claim-lease model state (issues #86/#88, sync_ops.go): the
+	// model claim per repo, runs pending their FinishSync in claim order,
+	// and the expected pending flag and counters.
+	syncClaims       map[string]*simSyncClaim
+	syncRuns         []*simSyncRun
+	syncPending      map[string]bool
+	syncRunCount     map[string]int
+	syncSuccessCount map[string]int
+	syncSteals       int
+	// clockSkew shifts the logical clock past the step counter; the final
+	// sync quiescence check uses it to provably expire every lease.
+	clockSkew int64
+}
+
+// simNow is the simulation's logical clock: step N happens at simEpoch+N
+// (+clockSkew during the final quiescence check). Shared by the cluster's
+// stores (events.RefStore, meta.WithNowFunc), so lease-expiry decisions are
+// a pure function of the seed.
+func (s *sim) simNow() time.Time {
+	return time.Unix(simEpoch+int64(s.step)+s.clockSkew, 0).UTC()
+}
+
+// stepNow is simNow in step units (finish-due comparisons).
+func (s *sim) stepNow() int {
+	return s.step + int(s.clockSkew)
 }
 
 // Run executes one deterministic simulation and reports the outcome.
@@ -195,9 +226,7 @@ func Run(cfg Config) (Result, error) {
 		return Result{}, err
 	}
 
-	cl, err := newCluster(dir, cfg.Nodes, inj, func() time.Time {
-		return time.Unix(simEpoch+int64(s.step), 0).UTC()
-	})
+	cl, err := newCluster(dir, cfg.Nodes, inj, s.simNow)
 	if err != nil {
 		return Result{}, err
 	}
@@ -214,8 +243,17 @@ func Run(cfg Config) (Result, error) {
 		}
 		s.repos = append(s.repos, r)
 	}
+	if err := s.initSync(context.Background()); err != nil {
+		return Result{}, err
+	}
 
 	for s.step = 1; s.step <= cfg.Steps; s.step++ {
+		if err := s.processSyncFinishes(); err != nil {
+			return s.result(), err
+		}
+		if s.stopped {
+			break
+		}
 		if err := s.doStep(); err != nil {
 			return s.result(), err
 		}
@@ -250,6 +288,13 @@ func Run(cfg Config) (Result, error) {
 		if err := s.checkFull(); err != nil {
 			return s.result(), err
 		}
+	}
+	if !s.stopped {
+		if err := s.checkSyncFinal(); err != nil {
+			return s.result(), err
+		}
+	}
+	if !s.stopped {
 		s.checkDeliveries()
 	}
 	return s.result(), nil
@@ -268,6 +313,7 @@ func (s *sim) result() Result {
 		Transitions: len(s.observed),
 		Deliveries:  len(s.cl.rec.all()),
 		Faults:      len(s.inj.Fired()),
+		Steals:      s.syncSteals,
 		OpCounts:    s.inj.Counts(),
 	}
 }
@@ -353,6 +399,10 @@ func (s *sim) doStep() error {
 		return s.doReserveCrash(name, node, repo)
 	case opReserveSweep:
 		return s.doReserveSweep(name, node)
+	case opSyncClaim:
+		return s.doSyncClaim(name, node, repo)
+	case opSyncRequest:
+		return s.doSyncRequest(name, node, repo)
 	}
 	panic(fmt.Sprintf("simtest: unhandled op kind %d", kind))
 }
@@ -594,11 +644,15 @@ func (s *sim) refreshBelief(node *simNode, repoKey, refName string) {
 	node.setBelief(repoKey, refName, tip)
 }
 
-// doCrash kills and restarts a node (cold = cache wiped too).
+// doCrash kills and restarts a node (cold = cache wiped too). The process
+// death also kills every sync run the node had in flight (issue #86: died
+// between TryBeginSync and FinishSync) — their claims stay held until the
+// lease expires and a later claimant steals them.
 func (s *sim) doCrash(name string, node *simNode, cold bool) error {
+	killed := s.syncKillNode(node.id)
 	if err := s.cl.crashNode(node, cold); err != nil {
 		return fmt.Errorf("step %d: crash node %d: %w", s.step, node.id, err)
 	}
-	s.tracef("step=%04d op=%s node=%d", s.step, name, node.id)
+	s.tracef("step=%04d op=%s node=%d sync-killed=%d", s.step, name, node.id, killed)
 	return nil
 }

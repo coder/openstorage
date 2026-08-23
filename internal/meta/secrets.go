@@ -11,6 +11,7 @@ package meta
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/coder/code-storage/internal/secrets"
 )
@@ -26,12 +27,26 @@ type Option func(*storeOptions)
 
 type storeOptions struct {
 	codec *secrets.Codec
+	now   func() time.Time
 }
 
 // WithSecretsCodec enables envelope encryption of the secret columns
 // (nil codec = plaintext, the default).
 func WithSecretsCodec(c *secrets.Codec) Option {
 	return func(o *storeOptions) { o.codec = c }
+}
+
+// WithNowFunc pins the store's Go-side clock (nil = time.Now, the default).
+// SQLite only: every SQLite timestamp — including the sync-claim lease
+// expiry comparison in TryBeginSync — is written and evaluated Go-side, so
+// injecting a logical clock makes lease expiry a pure function of that
+// clock (the DST harness, internal/simtest, depends on this for
+// deterministic traces). PG ignores it deliberately: its lease comparisons
+// evaluate on the DATABASE clock so node clock skew never participates
+// (issue #86).
+func WithNowFunc(now func() time.Time) Option {
+	assertf(now != nil, "WithNowFunc: nil clock")
+	return func(o *storeOptions) { o.now = now }
 }
 
 func resolveOptions(opts []Option) storeOptions {
