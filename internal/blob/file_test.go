@@ -669,6 +669,44 @@ func TestWithRenewedCoverFinalRefreshRejectsLateCommit(t *testing.T) {
 	}
 }
 
+// TestWithRenewedCoverFinalRefreshReportsAtBudgetDeadline (Codex round
+// 67, security): the final-refresh retry loop slept a full renewal
+// interval between attempts — quick failures deferred the loss report a
+// full cadence past covered+budget, and under a just-over-minimum TTL
+// the cover could expire before the caller learned the tail broke and
+// bumped the floor generation. The loop must wake at the earlier of the
+// cadence and the budget deadline, reporting the loss AT the deadline.
+func TestWithRenewedCoverFinalRefreshReportsAtBudgetDeadline(t *testing.T) {
+	oldI, oldT, oldB := coverRenewInterval, coverRenewTimeout, coverLapseBudget
+	// The retry cadence is far past the budget: only a budget-bounded
+	// wait can report in time.
+	coverRenewInterval, coverRenewTimeout, coverLapseBudget = 300*time.Millisecond, 10*time.Millisecond, 50*time.Millisecond
+	t.Cleanup(func() { coverRenewInterval, coverRenewTimeout, coverLapseBudget = oldI, oldT, oldB })
+
+	initial := true
+	renew := func(context.Context) error {
+		if initial {
+			initial = false
+			return nil // the initial cover succeeds
+		}
+		return errors.New("ledger down") // the tail refresh keeps failing fast
+	}
+	start := time.Now()
+	opErr, renewErr := WithRenewedCover(context.Background(), renew, func(context.Context) error { return nil })
+	elapsed := time.Since(start)
+	if opErr != nil {
+		t.Fatalf("opErr = %v, want nil (op is instant)", opErr)
+	}
+	if renewErr == nil || !strings.Contains(renewErr.Error(), "continuity lost at the final refresh") {
+		t.Fatalf("renewErr = %v, want the tail-loss report", renewErr)
+	}
+	// The report must land ≈ the budget deadline (~50ms), not a full
+	// retry cadence later (~300ms); generous slack for scheduler noise.
+	if elapsed > 200*time.Millisecond {
+		t.Fatalf("tail-loss report took %v, want ≈coverLapseBudget (budget-bounded wait, not the retry cadence)", elapsed)
+	}
+}
+
 // TestWithRenewedCoverRefreshSurvivesOpDeadline (Codex round 60): the
 // post-publication refresh is MANDATORY tail coverage — its restarted TTL
 // must span the stale-floor tail (floor lifetime + admission handoff

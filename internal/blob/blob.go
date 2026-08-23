@@ -457,7 +457,16 @@ func WithRenewedCover(ctx context.Context, renew func(context.Context) error, op
 		if lost {
 			return nil, fmt.Errorf("restore cover continuity lost at the final refresh (last renewal: %v)", err)
 		}
-		time.Sleep(coverRenewInterval)
+		// Wake at the earlier of the retry cadence and the budget
+		// deadline (Codex round 67, security): sleeping a full interval
+		// past covered+budget deferred the loss report to ~T+60 on a
+		// 20s cadence while the budget expired at T+45 — under a
+		// just-over-60s TTL the cover could expire before the caller
+		// learned the tail broke and bumped the floor generation. The
+		// next attempt then reports the exhausted budget immediately.
+		if wait := min(coverRenewInterval, time.Until(covered.Add(coverLapseBudget))); wait > 0 {
+			time.Sleep(wait)
+		}
 	}
 }
 
