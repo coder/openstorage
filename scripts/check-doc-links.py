@@ -18,7 +18,7 @@ import os, re, sys, posixpath
 
 os.chdir(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
-LINK = re.compile(r"\]\(([^)\s#]*)(#[^)\s]*)?\)")
+LINK = re.compile(r"\]\(([^)\s#]*)(#[^)\s]*)?(?:\s+[\"\x27][^)]*[\"\x27])?\)")
 REFDEF = re.compile(r"^ {0,3}\[[^\]^]+\]:\s")
 FENCE = re.compile(r"^ {0,3}(```|~~~)")
 
