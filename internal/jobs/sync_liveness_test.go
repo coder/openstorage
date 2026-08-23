@@ -21,11 +21,12 @@ import (
 	"github.com/coder/code-storage/internal/sync"
 )
 
-func TestRiverSyncRequestDuringRunningJobSchedulesSuccessor(t *testing.T) {
+// livenessPG starts one postgres container for a river liveness test.
+func livenessPG(t *testing.T, ctx context.Context) string {
+	t.Helper()
 	if testing.Short() {
-		t.Skip("river successor test needs docker")
+		t.Skip("river liveness tests need docker")
 	}
-	ctx := context.Background()
 	pgC, err := tcpostgres.Run(ctx, "postgres:17-alpine",
 		tcpostgres.WithDatabase("postgres"),
 		tcpostgres.WithUsername("postgres"),
@@ -35,11 +36,17 @@ func TestRiverSyncRequestDuringRunningJobSchedulesSuccessor(t *testing.T) {
 	if err != nil {
 		t.Fatalf("start postgres container: %v", err)
 	}
-	defer func() { _ = pgC.Terminate(ctx) }()
+	t.Cleanup(func() { _ = pgC.Terminate(context.Background()) })
 	pgURL, err := pgC.ConnectionString(ctx, "sslmode=disable")
 	if err != nil {
 		t.Fatalf("connection string: %v", err)
 	}
+	return pgURL
+}
+
+func TestRiverSyncRequestDuringRunningJobSchedulesSuccessor(t *testing.T) {
+	ctx := context.Background()
+	pgURL := livenessPG(t, ctx)
 
 	store := sync.NewMemStore()
 	if _, err := store.PutUpstream(ctx, sync.Upstream{
@@ -101,5 +108,61 @@ func TestRiverSyncRequestDuringRunningJobSchedulesSuccessor(t *testing.T) {
 	}
 	if up.SyncPending {
 		t.Errorf("SyncPending still set after the successor run: %+v", up)
+	}
+}
+
+// A run that fails BEFORE claiming (transient repo-lookup/store error)
+// must not strand a pending request: no run counted, no claim holder —
+// the worker snoozes the job so the retry claims and consumes the marker
+// (Codex round-2 finding on #79).
+func TestRiverSyncPendingSurvivesPreClaimFailure(t *testing.T) {
+	ctx := context.Background()
+	pgURL := livenessPG(t, ctx)
+
+	store := sync.NewMemStore()
+	if _, err := store.PutUpstream(ctx, sync.Upstream{
+		RepoID: "repo_flaky", Provider: "gitea", Owner: "o", Name: "n", UpstreamHost: "example.test",
+	}); err != nil {
+		t.Fatalf("PutUpstream: %v", err)
+	}
+
+	var attempts, claimedRuns atomic.Int32
+	runner := func(ctx context.Context, job sync.Job) error {
+		if attempts.Add(1) == 1 {
+			return errors.New("transient lookup failure before any claim")
+		}
+		if _, err := store.BeginSync(ctx, job.RepoID); err != nil {
+			return err
+		}
+		claimedRuns.Add(1)
+		_, err := store.FinishSync(ctx, job.RepoID, true)
+		return err
+	}
+
+	deliverer := &events.Deliverer{Webhooks: stubWebhooks{}, Logger: slog.New(slog.DiscardHandler)}
+	q, err := NewRiver(ctx, pgURL, deliverer, runner, store, nil, nil, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("NewRiver: %v", err)
+	}
+	defer q.Close()
+
+	// The 202 path: marked durable, then enqueued; the job's first run
+	// dies before claiming.
+	if err := store.RequestSync(ctx, "repo_flaky"); err != nil {
+		t.Fatalf("RequestSync: %v", err)
+	}
+	if err := q.EnqueueSync(ctx, sync.Job{Org: "org", RepoID: "repo_flaky"}); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+
+	// The snoozed retry (syncFollowUpSnooze) must claim and consume the
+	// pending marker instead of completing the only job and stranding it.
+	waitFor(t, "retried claimed run", func() bool { return claimedRuns.Load() >= 1 })
+	up, err := store.GetUpstream(ctx, "repo_flaky")
+	if err != nil {
+		t.Fatalf("GetUpstream: %v", err)
+	}
+	if up.SyncPending {
+		t.Errorf("SyncPending still set after the retried run: %+v", up)
 	}
 }

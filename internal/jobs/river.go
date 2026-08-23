@@ -329,10 +329,15 @@ type syncWorker struct {
 // its own job. No ordering strands a request.
 //
 // The RunCount half of the gate keeps successor chains bounded: a job that
-// never claimed (skip on ErrSyncInProgress, pre-claim failure) leaves the
-// counters untouched and schedules nothing — the claim holder's own gated
-// completion covers concurrent requests, and a pending flag without any
-// active run is consumed by the next request's job.
+// never claimed (skip on ErrSyncInProgress) leaves the counters untouched
+// and schedules nothing — a skip implies the claim holder was live after
+// this job's pre-read, so the holder's own gated completion covers
+// concurrent requests. A run that FAILED before claiming is different: a
+// pending marker with no counted run and no claim holder has no coverage
+// at all, so completing would strand the accepted request — that case
+// SNOOZES the job to retry the whole run (which then claims and consumes
+// the marker), mirroring the transient-failure retry the completion path
+// already uses.
 func (w *syncWorker) Work(ctx context.Context, job *river.Job[syncArgs]) error {
 	// Pre-run baseline: RunCount changing across this job proves a claimed
 	// run completed while it was active. A failed read degrades to
@@ -348,9 +353,10 @@ func (w *syncWorker) Work(ctx context.Context, job *river.Job[syncArgs]) error {
 			"repo", job.Args.RepoID, "err", err)
 	}
 
-	if err := w.run(ctx, sync.Job{Org: job.Args.Org, RepoID: job.Args.RepoID, Ref: job.Args.Ref}); err != nil {
+	runErr := w.run(ctx, sync.Job{Org: job.Args.Org, RepoID: job.Args.RepoID, Ref: job.Args.Ref})
+	if runErr != nil {
 		w.logger.Warn("sync run finished with error",
-			"org", job.Args.Org, "repo", job.Args.RepoID, "err", err)
+			"org", job.Args.Org, "repo", job.Args.RepoID, "err", runErr)
 	}
 
 	assertf(w.pool != nil, "syncWorker: pool not wired")
@@ -382,6 +388,15 @@ func (w *syncWorker) Work(ctx context.Context, job *river.Job[syncArgs]) error {
 		// Detached mid-flight: nothing to follow up.
 	case err != nil:
 		return completionFailed("pending recheck", err)
+	case up.SyncPending && runErr != nil && preKnown && up.RunCount == preRuns && !up.Syncing:
+		// The run failed BEFORE claiming (post-claim failures count the
+		// run via FinishSync) and no claim holder is live to cover the
+		// pending request — completing would strand the accepted 202.
+		// Snooze retries the whole run, whose claim then consumes the
+		// marker. (Returning without commit rolls the completion back.)
+		w.logger.Warn("sync: run failed before claiming with a pending request; snoozing to retry it",
+			"repo", job.Args.RepoID, "err", runErr)
+		return river.JobSnooze(syncFollowUpSnooze)
 	case up.SyncPending && (!preKnown || up.RunCount != preRuns):
 		if _, err := river.ClientFromContext[pgx.Tx](ctx).InsertTx(ctx, tx,
 			syncArgs{Org: job.Args.Org, RepoID: job.Args.RepoID}, nil); err != nil {
