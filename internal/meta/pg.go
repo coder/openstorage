@@ -102,6 +102,10 @@ CREATE TABLE IF NOT EXISTS repos (
 -- Keyset pagination index for ListRepos (live rows only).
 CREATE INDEX IF NOT EXISTS repos_org_created_idx
     ON repos (org_id, created_at DESC, repo_id DESC) WHERE deleted_at IS NULL;
+-- Retention-purge scan index (issue #52): PurgeableRepos pages soft-deleted
+-- rows oldest-deletion-first without touching the live population.
+CREATE INDEX IF NOT EXISTS repos_deleted_idx
+    ON repos (deleted_at, repo_id) WHERE deleted_at IS NOT NULL;
 -- Phase-5 eventing/sync tables (eventing.go): webhook registrations, git
 -- credentials, and repo upstream links.
 CREATE TABLE IF NOT EXISTS webhooks (
