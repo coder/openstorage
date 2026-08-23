@@ -139,6 +139,23 @@ var lfsMaxStagingOps = 256
 // tests can shrink it.
 var lfsMaxRepoStagingOps = 32
 
+// lfsRepoStagingShareDiv scales a repository's slot allowance by the
+// pool's FREE capacity (Codex round 37, security): the fixed shares above
+// still summed to the global cap, so an actor holding git:write tokens
+// for just 8 repositories — the wire carries no finer caller identity;
+// auth.SubjectLiteral is one literal for every vendor SDK — could park
+// 8 × 32 bodyless PUTs and starve the node. Each new slot must fit
+// min(lfsMaxRepoStagingOps, max(1, free/lfsRepoStagingShareDiv)), so
+// allowances shrink as the pool fills: a k-repo coalition equilibrates
+// near cap·k/(div+k) — half the pool for the 8-repo attack, leaving every
+// other repository a ≥free/div allowance — and SATURATING the pool takes
+// a coalition on the order of the cap itself (~250 write-scoped repos),
+// not 8. A quiet node still grants a single busy repository ~cap/(div+1)
+// (~28) concurrent transfers. Exhaustion by an arbitrarily large
+// authorized coalition is inherent to any finite pool; the residual is
+// accepted and edge rate limiting remains the operator lever beyond it.
+const lfsRepoStagingShareDiv = 8
+
 // reserveLFSStaging reserves n bytes of the node-wide LFS staging budget
 // and one staging-operation slot charged to repo's share. ok=false when
 // the node cap, the repo share, or the byte budget does not fit right now
@@ -151,7 +168,14 @@ func (s *Server) reserveLFSStaging(repo string, n int64) bool {
 	assertf(repo != "" && n >= 0, "reserveLFSStaging(%q, %d)", repo, n)
 	s.lfsStagingMu.Lock()
 	defer s.lfsStagingMu.Unlock()
-	if s.lfsStagingOps >= lfsMaxStagingOps || s.lfsRepoStagingOps[repo] >= lfsMaxRepoStagingOps {
+	if s.lfsStagingOps >= lfsMaxStagingOps {
+		return false
+	}
+	// The repo allowance scales with free capacity — see
+	// lfsRepoStagingShareDiv. The floor of 1 keeps a first slot available
+	// to any repository while the global cap has room.
+	free := lfsMaxStagingOps - s.lfsStagingOps
+	if s.lfsRepoStagingOps[repo] >= min(lfsMaxRepoStagingOps, max(1, free/lfsRepoStagingShareDiv)) {
 		return false
 	}
 	if s.LFSStagingBytes > 0 && n > 0 && s.lfsStagingInFlight > s.LFSStagingBytes-n {

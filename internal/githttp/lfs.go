@@ -1287,8 +1287,21 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target r
 		// reservation and per-key slot behind an unbounded delete.
 		dctx, dcancel := context.WithTimeout(context.WithoutCancel(ctx), lfsCleanupTimeout)
 		defer dcancel()
-		if derr := s.Blob.Delete(dctx, key); derr != nil && !errors.Is(derr, blob.ErrNotFound) {
+		derr := s.Blob.Delete(dctx, key)
+		if derr != nil && !errors.Is(derr, blob.ErrNotFound) {
 			log.Printf("lfs cap-denied cleanup %s: %v", key, derr)
+		}
+		// Retire only THIS writer's attempt (Codex round 37 — the ledger
+		// no longer key-wide-deletes on cap denial, because a same-key
+		// peer's attempt may still be publishing under the shared row).
+		// Same evidence discipline as the upload-failure retire above:
+		// the successful delete (or proven absence) is the
+		// non-publication evidence; an ambiguous delete leaves the row
+		// to settlement or TTL.
+		if len(resGens) > 0 && (derr == nil || errors.Is(derr, blob.ErrNotFound)) {
+			if rerr := s.Store.RetirePackAttempts(dctx, blob.QuotaRepoGroup(repoID), resGens); rerr != nil {
+				log.Printf("lfs cap-denied retire %s: %v", key, rerr)
+			}
 		}
 		lfsError(w, http.StatusInsufficientStorage, fmt.Sprintf(
 			"repository LFS object count limit reached (limit %d)", ref.MaxLFSObjectsPerRepo))

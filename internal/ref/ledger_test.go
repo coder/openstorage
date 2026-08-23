@@ -408,8 +408,10 @@ func TestSettlementConsumesBothEraRows(t *testing.T) {
 // clean-FAILURE path — nothing was credited to usage — so it must end
 // only this binary's era row. The legacy twin may still be protecting a
 // live legacy writer's staging; only its own release, its own settle, or
-// the TTL may end it. Same rule for the cap-denial retire inside
-// RegisterLFSObject (its transaction rolled back: no usage credited).
+// the TTL may end it. A cap-denied RegisterLFSObject (Codex round 37)
+// deletes NO reservation rows at all — a same-key peer's attempt may
+// still be publishing under the shared era row — and each cap-denied
+// caller retires its own attempt with its gen token instead.
 func TestRetireLeavesLegacyTwinRow(t *testing.T) {
 	runRefBackends(t, func(t *testing.T, s Store) {
 		ctx := context.Background()
@@ -426,8 +428,8 @@ func TestRetireLeavesLegacyTwinRow(t *testing.T) {
 		}
 		k.wantState(0, 60, 0) // the legacy twin row alone remains
 
-		// Cap-denial retire: consume the cap with one registered object,
-		// then cap-deny a reserved second key that also has a legacy twin.
+		// Cap denial: consume the cap with one registered object, then
+		// cap-deny a reserved second key that also has a legacy twin.
 		old := MaxLFSObjectsPerRepo
 		MaxLFSObjectsPerRepo = 1
 		t.Cleanup(func() { MaxLFSObjectsPerRepo = old })
@@ -436,15 +438,24 @@ func TestRetireLeavesLegacyTwinRow(t *testing.T) {
 			t.Fatal(err)
 		}
 		lfsKey := "lfs/" + k.base() + "/" + strings.Repeat("bb", 32)
-		if dec := k.reserve([]Pack{{Key: lfsKey, Size: 30}}, "new-owner", 0, 1000); !dec.OK {
-			t.Fatalf("lfs reserve: %+v", dec)
+		decLFS := k.reserve([]Pack{{Key: lfsKey, Size: 30}}, "new-owner", 0, 1000)
+		if !decLFS.OK {
+			t.Fatalf("lfs reserve: %+v", decLFS)
 		}
 		legacyReserve(t, s, k.base(), lfsKey, 30, "legacy-owner")
 		if err := s.RegisterLFSObject(ctx, k.base(), lfsKey, 30); !errors.Is(err, ErrLFSObjectCapExceeded) {
 			t.Fatalf("cap-exceeded register err = %v", err)
 		}
-		// usage: 10 (the cap consumer) + 60 legacy pack twin + 30 legacy
-		// LFS twin still reserved; the era row alone was retired.
+		// The denial deleted NOTHING: 10 registered + 60 legacy pack twin
+		// + 30 era row + 30 legacy LFS twin (a same-key peer may still be
+		// publishing under the shared era row).
+		k.wantState(10, 120, 0)
+		// The cap-denied caller retires its own attempt (evidence-based,
+		// as on every clean failure): the era row ends at zero attempts,
+		// the legacy twin stays.
+		if err := s.RetirePackAttempts(ctx, k.group, decLFS.Gens); err != nil {
+			t.Fatalf("cap-denied retire: %v", err)
+		}
 		k.wantState(10, 90, 0)
 	})
 }

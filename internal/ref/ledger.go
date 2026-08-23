@@ -529,23 +529,16 @@ func validateRegisterLFS(repo, key string, bytes int64) {
 // NEW row would exceed the cap.
 func (s *PG) RegisterLFSObject(ctx context.Context, repo, key string, bytes int64) error {
 	validateRegisterLFS(repo, key, bytes)
-	err := s.registerLFSObjectTx(ctx, repo, key, bytes)
-	if errors.Is(err, ErrLFSObjectCapExceeded) {
-		// Retire the loser's reservation (Codex round 13): the cap denial
-		// is PERMANENT for a new key — every concurrent registration of
-		// any new key is denied too — so no writer can ever settle this
-		// row, and leaving it would gate unrelated admissions for the
-		// full TTL. Safe against same-key peers still staging: durable
-		// usage requires a fresh pre-publish admission plus a
-		// lease-bounded registration, both of which re-run after this
-		// delete. Era spelling only — this is a clean failure (nothing
-		// credited), so a legacy twin row keeps protecting its own
-		// writer. Best-effort — a failure just leaves TTL behavior.
-		if _, derr := s.pool.Exec(ctx, `DELETE FROM pack_reservations WHERE key = $1`, reservRowKey(key)); derr != nil {
-			return errors.Join(err, fmt.Errorf("retire cap-denied reservation %s: %w", key, derr))
-		}
-	}
-	return err
+	// A cap denial deletes NO reservation rows here (Codex round 37,
+	// reversing round 13's key-wide retire): the shared era row may carry
+	// a same-key peer's attempt that is still publishing — if that peer's
+	// bytes commit durably but its registration never runs, the deleted
+	// row was the only cover keeping the orphan inside quota until the
+	// floor cache refreshes. Each cap-denied CALLER retires its own
+	// attempt instead (gen-bound, on evidence of non-publication, like
+	// every other clean failure), so the row still ends promptly at zero
+	// attempts and a crashed loser leaves only the TTL behavior.
+	return s.registerLFSObjectTx(ctx, repo, key, bytes)
 }
 
 func (s *PG) registerLFSObjectTx(ctx context.Context, repo, key string, bytes int64) error {

@@ -115,7 +115,8 @@ func TestRegisterLFSObject_AtomicCap(t *testing.T) {
 			t.Fatalf("first register: %v", err)
 		}
 		// Over cap: typed denial, nothing committed.
-		if dec := k.reserve([]Pack{{Key: second, Size: 5}}, "owner-b", 0, 1000); !dec.OK {
+		dec := k.reserve([]Pack{{Key: second, Size: 5}}, "owner-b", 0, 1000)
+		if !dec.OK {
 			t.Fatalf("reserve: %+v", dec)
 		}
 		if err := s.RegisterLFSObject(ctx, k.base(), second, 5); !errors.Is(err, ErrLFSObjectCapExceeded) {
@@ -124,9 +125,16 @@ func TestRegisterLFSObject_AtomicCap(t *testing.T) {
 		if has, err := s.HasLFSObject(ctx, k.base(), second); err != nil || has {
 			t.Fatalf("denied register left a row: %v, %v", has, err)
 		}
-		// Credit untouched; the loser's reservation is RETIRED (Codex
-		// round 13) — a permanent denial must not gate unrelated
+		// Credit untouched; the reservation SURVIVES the denial (Codex
+		// round 37, reversing round 13's key-wide retire — a same-key
+		// peer's attempt may still be publishing under the shared row).
+		// The cap-denied caller then retires its OWN attempt with its gen
+		// token, so a permanent denial still does not gate unrelated
 		// admissions for the TTL.
+		k.wantState(10, 5, 0)
+		if err := s.RetirePackAttempts(ctx, k.group, dec.Gens); err != nil {
+			t.Fatalf("cap-denied retire: %v", err)
+		}
 		k.wantState(10, 0, 0)
 		if n, err := s.CountLFSObjects(ctx, k.base()); err != nil || n != 1 {
 			t.Fatalf("CountLFSObjects = %d, %v; want 1", n, err)

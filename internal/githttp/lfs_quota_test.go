@@ -1150,6 +1150,34 @@ func TestLFSStaging_RepoSlotShareIsolatesRepos(t *testing.T) {
 	srv.releaseLFSStaging("repo_other", 0)
 }
 
+// TestLFSStaging_RepoCoalitionCannotExhaustNode (Codex round 37,
+// security): tokens carry no caller identity beyond the repo claim
+// (auth.SubjectLiteral is one fixed literal for every vendor SDK), so a
+// writer holding git:write tokens for several repositories could park
+// bodyless PUTs whose fixed per-repo shares SUM to the node cap
+// (8 × 32 = 256) and starve every other repository's uploads and
+// adoptions. The allowance must shrink with pool occupancy so a small
+// coalition equilibrates well below the cap: a greedy 8-repo coalition
+// runs until every member is denied, and an unrelated repository must
+// still reserve.
+func TestLFSStaging_RepoCoalitionCannotExhaustNode(t *testing.T) {
+	srv := &Server{}
+	for {
+		progress := false
+		for i := range 8 {
+			if srv.reserveLFSStaging(fmt.Sprintf("coalition_%d", i), 0) {
+				progress = true
+			}
+		}
+		if !progress {
+			break // every coalition member is at its allowance
+		}
+	}
+	if !srv.reserveLFSStaging("repo_victim", 0) {
+		t.Fatal("an 8-repo coalition exhausted the node-wide LFS staging pool")
+	}
+}
+
 // wedgedStatBlob blocks Stat until the caller's context expires — the
 // wedged-backend scenario. When after > 0, only the Nth and later Stat
 // calls wedge (earlier ones pass through).
