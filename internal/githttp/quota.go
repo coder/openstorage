@@ -260,6 +260,21 @@ func (c *usageCache) putLocked(repo string, usage, counter int64, scanStart time
 	c.entries[repo] = usageEntry{usage: usage, counter: counter, expires: scanStart.Add(usageCacheTTL)}
 }
 
+// invalidateUsageFloor drops repo's cached floor entry (Codex round 48):
+// adopting a pre-registry LFS object moves bytes a cached scan already
+// listed into the usage counter, so entries scanned before the adoption
+// would double-count them in the floor+counter sum until expiry — the
+// false-denial side. Verified NEW uploads need no invalidation: their
+// bytes were published after any older scan, so no cached floor contains
+// them.
+func (s *Server) invalidateUsageFloor(repo string) {
+	assertf(repo != "", "invalidateUsageFloor: empty repo")
+	c := &s.usage
+	c.mu.Lock()
+	delete(c.entries, repo)
+	c.mu.Unlock()
+}
+
 // peekUsage returns repo's cached pack usage without ever blocking the
 // request path (Codex round 9: a stalled blob backend must not delay
 // receive-pack behind a synchronous listing — the check is observational,

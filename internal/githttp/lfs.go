@@ -723,6 +723,13 @@ func (s *Server) adoptLFSObject(ctx context.Context, repoID, key, oid string) er
 	if err := s.Store.RegisterLFSObject(vctx, repoID, key, verifiedSize); err != nil {
 		return err
 	}
+	// Adoption moves already-LISTED bytes into the counter (Codex round
+	// 48): a cached uncounted floor scanned before this registration
+	// still contains them, so the next admission's floor+counter sum
+	// would double-count the object — a false denial preserved for the
+	// cache lifetime and any hook floors minted from it. Drop the entry;
+	// the next admission re-scans post-adoption reality.
+	s.invalidateUsageFloor(repoID)
 	// Post-registration existence recheck (Codex round 1) — the adoption
 	// analogue of blob.EnsurePublished's writer-verify half: a DeleteLFS
 	// sweep can reap the still-rowless blob between the caller's Stat and

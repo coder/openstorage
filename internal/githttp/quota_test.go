@@ -340,6 +340,43 @@ func TestHookSelfListFloorRejectsSlowScans(t *testing.T) {
 	})
 }
 
+// TestUsageFloorInvalidatedByAdoption (Codex round 48): adopting a
+// pre-registry LFS object moves bytes a cached scan already listed into
+// the usage counter — an entry scanned before the adoption would then
+// double-count them in the floor+counter sum (false denials for the
+// cache lifetime, and via any hook floor minted from it). Adoption must
+// invalidate the repo's entry so the next admission re-scans.
+func TestUsageFloorInvalidatedByAdoption(t *testing.T) {
+	ctx := context.Background()
+	srv, st, mint := newLFSQuotaServer(t, 1000, time.Hour)
+	tok := mint(auth.ScopeGitWrite)
+
+	// A rowless pre-registry object: listed, not counted.
+	legacy := []byte("pre-registry legacy object body")
+	oid := sha256Hex(legacy)
+	key := blob.LFSKey(lfsTestRepoID, oid)
+	if err := srv.Blob.UploadFile(ctx, key, writeTempFile(t, legacy)); err != nil {
+		t.Fatal(err)
+	}
+	// Warm the cache: the whole object is uncounted.
+	if floor, err := srv.CachedUsageFloor(ctx, lfsTestRepoID); err != nil || floor != int64(len(legacy)) {
+		t.Fatalf("pre-adoption floor = (%d, %v), want (%d, nil)", floor, err, len(legacy))
+	}
+	// Adopt it (write-scoped batch touch registers the stored object).
+	resp := decodeBatch(t, doLFS(t, srv, http.MethodPost, lfsBatchPath, "basic:"+tok,
+		batchBody("upload", oid, int64(len(legacy)))))
+	if resp.Objects[0].Error != nil || resp.Objects[0].Actions != nil {
+		t.Fatalf("adoption failed: %+v", resp.Objects[0])
+	}
+	if has, err := st.HasLFSObject(ctx, lfsTestRepoID, key); err != nil || !has {
+		t.Fatalf("object not adopted: %v, %v", has, err)
+	}
+	// The stale entry must be gone: a fresh scan sees the bytes counted.
+	if floor, err := srv.CachedUsageFloor(ctx, lfsTestRepoID); err != nil || floor != 0 {
+		t.Fatalf("post-adoption floor = (%d, %v), want (0, nil) — adopted bytes must not double-count", floor, err)
+	}
+}
+
 // TestHookFloorScansAreSlotBoundedAcrossProcesses (Codex round 47): hook
 // self-list scans run in fresh processes the serve-side pool cannot see,
 // so they take flock slot files instead — with every slot held (here by
