@@ -91,6 +91,17 @@ type Config struct {
 	// CODESTORAGE_PACK_RESERVATION_TTL.
 	PackReservationTTL time.Duration
 
+	// UsageFloor, when set, resolves the pack-admission usage floor for a
+	// repo. The serve command wires the git server's shared single-flight
+	// cached listing (githttp.Server.CachedUsageFloor), so REST pack
+	// writers do not re-list the repo's pack and LFS prefixes on every
+	// write (issue #51, Codex round 21 — per-write listings amplify at
+	// the LFS object cap). Nil falls back to a fresh listing per write.
+	// Returns the floor plus the shared floor generation it was
+	// validated against (forwarded into ReservePackBytes' transactional
+	// recheck — Codex round 60).
+	UsageFloor func(ctx context.Context, repo string) (int64, int64, error)
+
 	// WebhookAllowPrivate relaxes the webhook SSRF guard's private-range
 	// denial (issue #53) for both the registration-time courtesy check
 	// here and — plumbed separately into the delivery workers — the
@@ -129,6 +140,7 @@ func New(cfg Config) (http.Handler, error) {
 		maybeRepack:        cfg.MaybeRepack,
 		packQuotaBytes:     cfg.PackQuotaBytes,
 		packReservationTTL: cfg.PackReservationTTL,
+		usageFloorFn:       cfg.UsageFloor,
 	}
 
 	// Phase-5 eventing/sync surface (docs/archive/phases/07-implementation-roadmap.md p5): the syncServer extends

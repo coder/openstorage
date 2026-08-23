@@ -1044,7 +1044,7 @@ func TestNotesQuota(t *testing.T) {
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("under-quota note = %d body %v", resp.StatusCode, body)
 		}
-		usage, err := blob.PackUsageBytes(context.Background(), e.blobStore, fx.repoID)
+		usage, err := blob.StorageUsageBytes(context.Background(), e.blobStore, fx.repoID)
 		if err != nil || usage == 0 {
 			t.Fatalf("usage after note = (%d, %v), want > 0", usage, err)
 		}
@@ -1059,7 +1059,7 @@ func TestNotesQuota(t *testing.T) {
 		if result["success"] != false || !strings.Contains(result["message"].(string), "quota") {
 			t.Fatalf("result = %v, want quota failure", result)
 		}
-		after, err := blob.PackUsageBytes(context.Background(), e.blobStore, fx.repoID)
+		after, err := blob.StorageUsageBytes(context.Background(), e.blobStore, fx.repoID)
 		if err != nil || after != usage {
 			t.Fatalf("denied note changed usage: %d -> %d (err %v)", usage, after, err)
 		}

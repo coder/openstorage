@@ -266,6 +266,29 @@ func preReceive(ctx context.Context) error {
 	}
 	defer st.Close()
 
+	// An unpublished pack whose key is already REGISTERED is a RESTORE,
+	// not fresh growth (Codex security round 70): its bytes are in the
+	// usage counter, floors scanned during the absence are deflated by
+	// them, and uploading it through the fresh path would re-materialize
+	// the bytes with no distinct cover (settlement consumes the admission
+	// reservation without crediting or bumping — RowsAffected 0, the
+	// zero-credit no-op). Such packs skip the admission charge (the
+	// zero-growth rule: their bytes are already counted) and the fresh
+	// upload loop; the post-registration EnsurePublished pass Stats them
+	// missing and restores them through the covered, generation-bumping
+	// seam (initial cover → renewed upload → invalidation handoff).
+	restores := make([]bool, len(packs))
+	for i := range packs {
+		if published[i] {
+			continue
+		}
+		has, err := st.HasPack(ctx, repo, packs[i].Key)
+		if err != nil {
+			return fmt.Errorf("pre-receive: registry probe %s: %w", packs[i].Key, err)
+		}
+		restores[i] = has
+	}
+
 	// Per-repo pack-bytes quota (issue #21, quota.go), enforced before any
 	// upload: pre-receive runs BEFORE the update hook's ref policy, so
 	// without this gate even a rejected push durably grows packs/. Denying
@@ -285,46 +308,72 @@ func preReceive(ctx context.Context) error {
 	// concurrent-push overshoot the listing alone admitted. The reservation
 	// is consumed atomically by RegisterPacks below; a crash anywhere
 	// between here and there leaves an expiring row the sweeper prunes.
-	var reserved []string
-	var reserveOwner string
+	var reservedGens map[string]string
+	var quota int64 // 0 = quota disabled (restore covers are skipped too)
+	var ttl time.Duration
 	if quotaRaw := os.Getenv(EnvPackQuota); quotaRaw != "" {
-		quota, err := strconv.ParseInt(quotaRaw, 10, 64)
-		if err != nil || quota <= 0 {
+		q, err := strconv.ParseInt(quotaRaw, 10, 64)
+		if err != nil || q <= 0 {
 			// The env is set by our own server (never by the client), but
 			// fail closed on nonsense instead of waving the push through.
 			return fmt.Errorf("pre-receive: malformed %s=%q", EnvPackQuota, quotaRaw)
 		}
-		ttl, err := reservationTTL()
+		quota = q
+		ttl, err = reservationTTL()
 		if err != nil {
 			return fmt.Errorf("pre-receive: %w", err)
 		}
 		var unpublished []ref.Pack
 		for i := range packs {
-			if !published[i] {
+			if !published[i] && !restores[i] {
 				unpublished = append(unpublished, packs[i])
 			}
 		}
 		if len(unpublished) > 0 {
-			floor, err := packUsageBytes(ctx, bl, repo)
+			floor, floorGen, err := hookUsageFloor(ctx, bl, st, repo)
 			if err != nil {
 				return fmt.Errorf("pre-receive: %w", err)
 			}
-			reserveOwner = ref.NewReservationOwner()
-			dec, err := st.ReservePackBytes(ctx, blob.QuotaRepoGroup(repo), unpublished, reserveOwner, floor, quota, ttl)
-			if err != nil {
-				return fmt.Errorf("pre-receive: reserve pack bytes: %w", err)
+			var dec ref.ReserveDecision
+			for attempt := 0; ; attempt++ {
+				// Deadline-bounded by the handoff margin (Codex round 42) —
+				// see the LFS PUT twin: the floor's orphan cover must
+				// outlive the admission snapshot.
+				rsvCtx, rsvCancel := context.WithTimeout(ctx, UsageFloorHandoffMargin)
+				dec, err = st.ReservePackBytes(rsvCtx, blob.QuotaRepoGroup(repo), unpublished, ref.NewReservationOwner(), floor, floorGen, quota, ttl)
+				rsvCancel()
+				if err != nil {
+					return fmt.Errorf("pre-receive: reserve pack bytes: %w", err)
+				}
+				if !dec.FloorStale {
+					break
+				}
+				// The ledger's transactional generation recheck rejected
+				// the floor (Codex round 60): a restore, adoption, or
+				// retained-bytes debit moved it between the floor's own
+				// check and the reserve. Self-list a fresh floor (with
+				// its generation) and retry once; a second rejection
+				// fails the push closed — the client retries.
+				if attempt >= 1 {
+					return fmt.Errorf("pre-receive: usage floor went stale during admission twice, retry")
+				}
+				floor, floorGen, err = hookSelfListFloor(ctx, bl, st, repo)
+				if err != nil {
+					return fmt.Errorf("pre-receive: %w", err)
+				}
+			}
+			if dec.KeyCapExceeded {
+				// Transient row-cap denial, not a quota breach (Codex
+				// round 43): rows expire with the TTL, so tell the
+				// client to RETRY instead of reporting a quota failure
+				// whose arithmetic may even show the push fits.
+				return fmt.Errorf("pre-receive: too many in-flight uploads reserved for this repository, retry later")
 			}
 			if !dec.OK {
-				var incoming int64
-				for _, p := range unpublished {
-					incoming += p.Size
-				}
 				return fmt.Errorf("pre-receive: repository pack quota exceeded: push adds %d bytes to %d bytes stored (+%d bytes reserved by in-flight pushes), quota is %d bytes",
-					incoming, dec.UsedBytes, dec.ReservedBytes, quota)
+					ref.IncomingBytes(unpublished), dec.UsedBytes, dec.ReservedBytes, quota)
 			}
-			for _, p := range unpublished {
-				reserved = append(reserved, p.Key)
-			}
+			reservedGens = dec.Gens
 			// Test knob: crash after the reservation committed, before any
 			// upload — the reservation deliberately leaks (issue #29's
 			// reserve → crash → sweep recovery window).
@@ -336,16 +385,33 @@ func preReceive(ctx context.Context) error {
 	}
 
 	for i, pf := range packFiles {
-		if published[i] {
-			continue
+		if published[i] || restores[i] {
+			continue // restores go through the covered seam below
 		}
 		if err := bl.UploadFile(ctx, packs[i].Key, pf); err != nil {
-			// Best-effort release: the push is failing, so free the
-			// admission headroom now instead of waiting out the TTL. A
-			// failed release only leaves an expiring row (owner-scoped, so
-			// it can never free a reservation a retry re-acquired).
-			if len(reserved) > 0 {
-				_ = st.ReleasePackReservations(ctx, reserved, reserveOwner)
+			// PROVEN-clean failure: retire this push's attempts (Codex
+			// round 30; replacing round 22's settle-or-TTL-only rule).
+			// The rows are shared with concurrent identical pushes via
+			// refresh, so the retire is per-attempt refcounted and
+			// gen-bound (round 33: a stale retire never touches a
+			// replacement row), and each key retires only on EVIDENCE its
+			// blob is absent — the failed upload itself may have
+			// committed with its response lost, and keys uploaded by
+			// earlier iterations are durable orphans whose rows must keep
+			// covering them (round 33). Ambiguity and retire failures
+			// only leave what the TTL always collected.
+			if len(reservedGens) > 0 {
+				proven := make(map[string]string, len(reservedGens))
+				for k, g := range reservedGens {
+					if _, serr := bl.Stat(ctx, k); errors.Is(serr, blob.ErrNotFound) {
+						proven[k] = g
+					}
+				}
+				if len(proven) > 0 {
+					if rerr := st.RetirePackAttempts(ctx, blob.QuotaRepoGroup(repo), proven); rerr != nil {
+						fmt.Fprintf(os.Stderr, "codestorage: retire reservations: %v\n", rerr)
+					}
+				}
 			}
 			return fmt.Errorf("pre-receive: upload %s: %w", packs[i].Key, err)
 		}
@@ -365,12 +431,40 @@ func preReceive(ctx context.Context) error {
 	// committed row must never point at missing bytes. Extra verify work
 	// on a genuinely failed registration is harmless: the keys were just
 	// uploaded, so each check is one Stat.
+	// Packs whose blobs pre-existed this push (crash-window retries) are
+	// ADOPTIONS: cached floors may already contain their bytes, so the
+	// registration bumps the shared floor generation for them (Codex
+	// round 53).
+	//
+	for i := range packs {
+		packs[i].Adopted = published[i]
+	}
 	regErr := st.RegisterPacks(ctx, repo, packs)
 	if regErr != nil {
 		regErr = fmt.Errorf("pre-receive: register packs: %w", regErr)
 	}
+	// A restore here re-materializes counter-accounted bytes (Codex round
+	// 58, the pack twin of the LFS zero-growth repair): floors scanned
+	// while a registered pack's blob was absent hide equally sized
+	// rowless legacy bytes. Each restore is covered by a reservation
+	// BEFORE its upload (stale-floor admissions see the returning bytes),
+	// and any restore bumps the shared floor generation afterward so
+	// future serves re-scan.
+	// The floor-generation bump is the restore's invalidation HANDOFF
+	// (Codex rounds 68–70): it runs inside the seam, under a live cover,
+	// detached from the hook's fate, retried until it commits or cover
+	// continuity is lost.
+	bump := func(bctx context.Context) error {
+		return st.BumpLFSAdoptionGen(bctx, BaseRepo(repo))
+	}
 	for i, p := range packs {
-		if err := blob.EnsurePublished(ctx, bl, p.Key, packFiles[i]); err != nil {
+		var cover func(context.Context, int64) error
+		if quota > 0 {
+			cover = func(cctx context.Context, size int64) error {
+				return ref.ReserveRestoreCover(cctx, st, blob.QuotaRepoGroup(repo), p.Key, size, ttl)
+			}
+		}
+		if _, err := blob.EnsurePublished(ctx, bl, p.Key, packFiles[i], cover, bump); err != nil {
 			return errors.Join(regErr, fmt.Errorf("pre-receive: verify %s: %w", p.Key, err))
 		}
 	}

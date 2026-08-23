@@ -20,11 +20,13 @@ of these classes:
 | **Registered packs** | Every push and REST write publishes a pack and registers it | [Repack](#background-repack) folds many into one (the originals become *retained*) |
 | **Retained (superseded) packs** | A repack fold replaced their registry rows; the blobs linger | Sweeper's superseded reap ([`CODESTORAGE_SWEEP_DELETE_SUPERSEDED`](../reference/configuration.md#codestorage_sweep_delete_superseded), on by default) after the age threshold |
 | **Orphan packs** | Crashed/interrupted writers (pack published, registration never committed), lost repack races | Sweeper — **list-only by default**; deletion is the explicit [`CODESTORAGE_SWEEP_DELETE_ENABLED`](../reference/configuration.md#codestorage_sweep_delete_enabled) opt-in |
+| **LFS objects** (`lfs/<repo_id>/<oid>` keys) | Verified LFS uploads publish the object and register it in the LFS registry | Never — like packs, registered LFS objects are permanent (repositories soft-delete without reclaiming storage) |
+| **Orphan LFS objects** | Crashed uploads (published, registration never committed) and objects uploaded before the LFS registry existed | Sweeper — **list-only by default**; deletion is the separate [`CODESTORAGE_SWEEP_DELETE_LFS`](../reference/configuration.md#codestorage_sweep_delete_lfs) opt-in (see [the caveat](#lfs-orphans-and-pre-registry-objects)) |
 | **Quarantine copies** (`sweep/quarantine/<nonce>/…` keys) | Delete-mode sweeps copy every blob aside before deleting it | The sweep itself purges backups older than the purge window — `max(age threshold, 1h)` — while a destructive mode is on |
 
-Two more growth sources sit outside this lifecycle: **LFS objects** (stored under their
-own keys, never swept or repacked) and, on versioned S3 buckets, **old object versions**
-(the reason destructive sweeping [refuses versioned buckets](#s3-bucket-versioning)).
+One more growth source sits outside this lifecycle: on versioned S3 buckets, **old
+object versions** (the reason destructive sweeping
+[refuses versioned buckets](#s3-bucket-versioning)).
 
 Also note what does *not* reclaim space: **deleting branches** — repack preserves the
 whole registered object set, so unreachable objects are carried forward by design
@@ -99,10 +101,12 @@ Tuning: raise the threshold to fold less often (bigger, rarer folds), lower it (
 
 ## Pack quotas
 
-Every repository has a pack-bytes quota
+Every repository has a storage-bytes quota
 ([`CODESTORAGE_PACK_QUOTA_BYTES`](../reference/configuration.md#codestorage_pack_quota_bytes),
-default 10 GiB, `0` disables). A repository and its `+ephemeral` / `+import` namespaces
-share one quota, accounted against the base repository.
+default 10 GiB, `0` disables) covering its packs **and its LFS objects**
+([#51](https://github.com/coder/code-storage/issues/51)). A repository and its
+`+ephemeral` / `+import` namespaces share one quota, accounted against the base
+repository — including LFS, whose object space the namespaces share outright.
 
 What a denial looks like — over git:
 
@@ -116,14 +120,31 @@ Over REST (commit-pack, diff-commit, restore-commit, merge, notes writes): a `40
 closure alone exceeds the quota is denied up front with
 `repository pack quota exceeded: fork closure is <n> bytes, quota is <n> bytes`.
 
+Over Git LFS: the batch API answers per-object `507` errors (no transfer URL is issued)
+and the verified upload transfer re-checks the request's actual `Content-Length` — a
+batch that under-declares sizes is caught at the transfer. Either way git-lfs surfaces
+`repository storage quota exceeded: upload adds <n> bytes to <n> bytes stored (+<n>
+bytes reserved by in-flight uploads), quota is <n> bytes` and the push fails. LFS
+admission happens in two stages: the batch API runs an **advisory** fast-fail check on
+the declared sizes (an over-quota batch answers per-object `507`s and issues no upload
+URLs, but reserves nothing durable — batch-time holds proved renewable-for-free), and
+the **durable** reservation is charged per object at the verified upload itself, right
+before its bytes are published, then settled into the usage counter when registration
+completes — expiring after the same
+[`CODESTORAGE_PACK_RESERVATION_TTL`](../reference/configuration.md#codestorage_pack_reservation_ttl)
+if registration never lands. Between those stages nothing is held, so two near-quota
+clients can both receive upload URLs and one can transfer its whole object before the
+durable admission rejects it — wasted transfer, never quota overshoot. Downloads are
+never quota-gated.
+
 Reading the numbers: admission is `stored + reserved + incoming ≤ quota`, where
 
-- **stored** counts every registered pack **plus retained (superseded) bytes** — after a
-  repack fold, headroom stays reduced until the sweeper reaps the superseded originals
-  and the report shows `retained_bytes_reclaimed`. It is also floored by the *physical*
-  bytes under the repository's pack prefixes, which include aged **orphan** blobs — and
-  since general-orphan deletion is off by default, a repository with abandoned uploads
-  can keep hitting denials that only
+- **stored** counts every registered pack and LFS object **plus retained (superseded)
+  bytes** — after a repack fold, headroom stays reduced until the sweeper reaps the
+  superseded originals and the report shows `retained_bytes_reclaimed`. It is also
+  floored by the *physical* bytes under the repository's pack and LFS prefixes, which
+  include aged **orphan** blobs — and since orphan deletion is off by default, a
+  repository with abandoned uploads can keep hitting denials that only
   [enabling delete mode](#before-enabling-delete-mode-fleet-prerequisite) resolves;
 - **reserved** counts other writers' in-flight admissions. A crashed writer's
   reservation keeps gating only until its
@@ -152,18 +173,37 @@ quota: receive-pack for <repo> at/over quota (<n> pack bytes stored >= <n>): enf
 
 Every [`CODESTORAGE_SWEEP_INTERVAL`](../reference/configuration.md#codestorage_sweep_interval)
 (default 1h), a sweep job: heals the quarantine, prunes expired quota reservations, then
-streams the bucket's `packs/` listing and classifies every blob against the pack registry.
-Blobs with no registry row that are older than
+streams the bucket's `packs/` and `lfs/` listings and classifies every blob against its
+registry (pack rows for pack keys, LFS rows for LFS keys). Blobs with no registry row
+that are older than
 [`CODESTORAGE_SWEEP_AGE_THRESHOLD`](../reference/configuration.md#codestorage_sweep_age_threshold)
 (default 24h) are orphan candidates.
 
-Three independent knobs control what a sweep may *do*:
+Four independent knobs control what a sweep may *do*:
 
 | Mode | Default | Acts on |
 |---|---|---|
-| List-only (no flag) | **active** | Reports general orphans, deletes nothing |
+| List-only (no flag) | **active** | Reports orphans of every class, deletes nothing |
 | [`CODESTORAGE_SWEEP_DELETE_SUPERSEDED`](../reference/configuration.md#codestorage_sweep_delete_superseded) | `true` | Only blobs a repack fold provably superseded (durable `pack_retained` records); reclaims their quota bytes |
-| [`CODESTORAGE_SWEEP_DELETE_ENABLED`](../reference/configuration.md#codestorage_sweep_delete_enabled) | `false` | General orphans (crashed pushes, lost races) — the risky class, hence opt-in |
+| [`CODESTORAGE_SWEEP_DELETE_ENABLED`](../reference/configuration.md#codestorage_sweep_delete_enabled) | `false` | General pack orphans (crashed pushes, lost races) — the risky class, hence opt-in |
+| [`CODESTORAGE_SWEEP_DELETE_LFS`](../reference/configuration.md#codestorage_sweep_delete_lfs) | `false` | LFS orphans — separate from the pack opt-in because of the [pre-registry caveat](#lfs-orphans-and-pre-registry-objects) |
+
+### LFS orphans and pre-registry objects
+
+The LFS registry (which upload settlement writes) was introduced with
+[#51](https://github.com/coder/code-storage/issues/51): **every LFS object uploaded by
+an older build has no registry row** and therefore shows up as an orphan candidate,
+however live its pointers are. That is why LFS deletion is a separate opt-in and is not
+covered by `CODESTORAGE_SWEEP_DELETE_ENABLED`. Stored objects are adopted into the
+registry whenever a write-scoped touch sees them (an upload batch naming the object, or
+a re-upload of the same content) — after a one-time sha256 verification, since
+presigned-era uploads never proved their content: a mismatched legacy blob is removed
+and re-uploaded through the verified path instead of adopted. Active repositories
+therefore converge on their own. Before
+setting `CODESTORAGE_SWEEP_DELETE_LFS=true`, run list-only until the candidate lines
+stop naming objects that should live; re-pushing a repository's LFS content (batch
+adoption skips re-transfers of stored objects) is the fastest way to backfill a
+repository you cannot afford to lose objects from.
 
 ### Reading a sweep report
 
@@ -172,23 +212,23 @@ Each run ends with one summary line:
 ```
 orphan pack sweep finished live=<n> fresh=<n> orphans=<n> orphan_bytes=<n> deleted=<n>
 bytes_reclaimed=<n> superseded_deleted=<n> retained_bytes_reclaimed=<n>
-reservations_expired=<n> delete_enabled=<bool> delete_superseded=<bool>
+reservations_expired=<n> delete_enabled=<bool> delete_superseded=<bool> delete_lfs=<bool>
 threshold=<age> duration=<d>
 ```
 
 | Field | Meaning |
 |---|---|
-| `live` | Blobs with a registry row — real data, not candidates |
+| `live` | Blobs with a registry row (pack or LFS) — real data, not candidates |
 | `fresh` | Unregistered but younger than the age threshold — likely in-flight writers; never touched |
-| `orphans` / `orphan_bytes` | Aged, unregistered candidates this run — **both** classes: repack-superseded blobs count here too until reaped |
+| `orphans` / `orphan_bytes` | Aged, unregistered candidates this run — **all** classes: repack-superseded blobs and LFS orphans count here too until reaped (the candidate lines' keys distinguish them) |
 | `deleted` | Candidates reaped this run (superseded reaps included). Reaping moves bytes to quarantine, so it frees nothing by itself |
 | `bytes_reclaimed` | **Net** bytes returned by purging aged quarantine backups whose blob stayed unregistered. A backup whose original was restored purges without being counted (net zero — the original is live again). Lags `deleted` by the quarantine purge window, `max(age threshold, 1h)` |
 | `superseded_deleted` / `retained_bytes_reclaimed` | The provably repack-superseded subset of `deleted`, and the **quota headroom** their reaps returned |
 | `reservations_expired` | Crashed-writer quota reservations pruned this run |
-| `delete_enabled` / `delete_superseded` | The **configured** modes — a [guard downgrade](#s3-bucket-versioning) to list-only is *not* reflected here; it shows only as the separate `delete guard failed; this run is list-only` error line |
+| `delete_enabled` / `delete_superseded` / `delete_lfs` | The **configured** modes — a [guard downgrade](#s3-bucket-versioning) to list-only is *not* reflected here; it shows only as the separate `delete guard failed; this run is list-only` error line |
 
 Every candidate is also logged individually as it is classified
-(`orphan pack candidate key=… size_bytes=… age=… delete_enabled=… delete_superseded=…`),
+(`orphan pack candidate key=… size_bytes=… age=… delete_enabled=… delete_superseded=… delete_lfs=…`),
 so in list-only mode you can audit exactly what deletion *would* reap.
 A healthy steady state is `orphans=0` or a small, stable count;
 monotonically growing `orphan_bytes` means crashed writers or fold races are outpacing
@@ -201,7 +241,14 @@ When a sweep does delete, it never hard-deletes directly: every blob is first co
 landed mid-delete is restored on the spot), and **every** sweep — list-only included —
 starts by restoring any registered-but-missing pack from quarantine. Rolling back to
 list-only after a scare therefore still repairs anything a delete-enabled crash left
-behind; look for `orphan pack sweep: healed registered pack from quarantine`. Quarantine
+behind; look for `orphan pack sweep: healed registered pack from quarantine`. LFS
+restores are additionally digest-verified against the key's OID: a backup taken from a
+pre-registry blob whose bytes never hashed to its OID is *never* restored (logged as
+`NOT restoring LFS quarantine backup failing content verification`) — a registered
+object in that state repairs itself on the next upload touch instead. LFS deletes are
+also serialized with registration (the same in-transaction guard verified uploads use),
+so a concurrent upload either keeps its bytes untouched or provably re-publishes them
+after the delete. Quarantine
 backups are purged only while a destructive mode is on, and only once older than
 `max(age threshold, 1h)` — the floor guarantees a delete handshake is provably dead
 before its backup goes away, so tuning the age threshold low does not shorten it.
@@ -211,9 +258,9 @@ before its backup goes away, so tuning the age threshold low does not shorten it
 On a bucket with versioning enabled (or suspended), deletes only write delete markers —
 every version stays stored and billed, so "reclaimed" bytes would be a lie:
 
-- `CODESTORAGE_SWEEP_DELETE_ENABLED=true` **fails startup** against such a bucket (or
-  when versioning state cannot be verified — grant `s3:GetBucketVersioning` or stay
-  list-only).
+- `CODESTORAGE_SWEEP_DELETE_ENABLED=true` and `CODESTORAGE_SWEEP_DELETE_LFS=true`
+  **fail startup** against such a bucket (or when versioning state cannot be verified —
+  grant `s3:GetBucketVersioning` or stay list-only).
 - The default superseded reap does not fail startup; each run re-checks and **downgrades
   itself to list-only** on drift, logging
   `orphan pack sweep: delete guard failed; this run is list-only`.

@@ -51,6 +51,17 @@ type Pack struct {
 	// registers fine but contributes nothing to the ledger (the blob
 	// listing floor still covers such bytes conservatively).
 	Size int64
+	// Adopted marks a pack whose BLOB already existed before this
+	// registration (a crash-window retry re-registering a published-but-
+	// rowless pack — the pack analog of LFS adoption, Codex round 53):
+	// physical listings may already contain its bytes, so RegisterPacks
+	// bumps the shared floor generation IN ITS REGISTRATION TRANSACTION
+	// when it credits a newly inserted Adopted pack, invalidating every
+	// replica's cached uncounted floor. Fresh uploads leave it false —
+	// their bytes are in no cached scan, and bumping per push would
+	// defeat the floor cache under write load. Accounting input like
+	// Size, never persisted.
+	Adopted bool
 }
 
 // RefInfo is one ref row with its metadata. CreatedAt is the row's creation
@@ -105,14 +116,40 @@ type RefStore interface {
 	// the per-repo pack-bytes quota (issue #29), inserting one durable
 	// reservation row per pack key on success. See ledger.go for the
 	// admission formula and serialization discipline.
-	ReservePackBytes(ctx context.Context, group []string, packs []Pack, owner string, usageFloor, quotaBytes int64, ttl time.Duration) (ReserveDecision, error)
-	// ReleasePackReservations deletes the caller's reservation rows for
-	// keys — the failed-upload cleanup path. Owner-scoped: a stale caller
-	// must not delete a newer reservation another push re-acquired for the
-	// same key. Releasing an absent or re-owned key is a no-op. The happy
-	// path never calls this: RegisterPacks consumes reservations by key in
-	// the registration transaction.
-	ReleasePackReservations(ctx context.Context, keys []string, owner string) error
+	// The floorGen argument is the shared floor generation the caller's
+	// usageFloor was validated against (ReserveNoFloorGen skips the
+	// transactional recheck — cover reservations only, Codex round 60).
+	ReservePackBytes(ctx context.Context, group []string, packs []Pack, owner string, usageFloor, floorGen, quotaBytes int64, ttl time.Duration) (ReserveDecision, error)
+	// QuotaLedgerState reads one accounting group's quota ledger in one
+	// snapshot (usage counter sum, active reservations, retained bytes).
+	// The LFS batch surface reads it for its ADVISORY fast-fail admission
+	// (issue #51 — batches insert no rows; the PUT's transactional
+	// admission is authoritative); also tests, oracles, and operator
+	// inspection.
+	// excludeKeys omits those keys' active reservations from the
+	// ReservedBytes sum (Codex round 24), mirroring ReservePackBytes's
+	// same-key exclusion: an admission check for specific keys must not
+	// double-count a reservation those keys already hold (a failed
+	// verified upload's settle-or-TTL row would otherwise 507 its own
+	// retry until the TTL).
+	QuotaLedgerState(ctx context.Context, group []string, ttl time.Duration, excludeKeys ...string) (PackQuotaLedgerState, error)
+	// RetirePackAttempts retires one same-key reservation attempt per
+	// entry — the PROVEN-clean-failure cleanup (Codex rounds 30+33 on
+	// #51). Every reserve/refresh increments the row's attempt count, so
+	// a failed writer retires exactly its own attempt: the row is deleted
+	// only when no attempts remain, never out from under a live same-key
+	// writer (the round-22 unsoundness of owner-scoped deletes). gens
+	// maps each key to the row-incarnation gen ReserveDecision.Gens
+	// returned: a replacement row minted after this caller's expired and
+	// was pruned carries a different gen and is untouched (round 33).
+	// Callers retire only with EVIDENCE of non-publication (the blob
+	// provably absent) — ambiguous outcomes leave the row to settlement
+	// or TTL, and crashes never retire. Absent or re-minted keys are
+	// no-ops. Mixed fleets are fenced structurally: this binary's rows
+	// live under an era-spelled key (reservKeySuffix) no v0.1.0
+	// statement addresses, and retirement touches only that spelling —
+	// a legacy same-key twin row is left to its own binary's lifecycle.
+	RetirePackAttempts(ctx context.Context, group []string, gens map[string]string) error
 	// SweepExpiredPackReservations deletes reservation rows at least
 	// olderThan old (crash-swept leak reclamation, issue #29; the orphan
 	// sweeper calls it on its cadence). olderThan=0 expires everything —
@@ -130,6 +167,82 @@ type RefStore interface {
 	// pack prefix (the sweeper's safeDelete, or its heal pass discovering
 	// the blob already gone).
 	ReclaimRetainedPack(ctx context.Context, repo, key string) (int64, error)
+	// RegisterLFSObject records one verified LFS object for repo (always
+	// the BASE RepoID — namespaces share the LFS space, ADR-35) strictly
+	// after its bytes are durable in blob storage, mirroring RegisterPacks
+	// (issue #51). In ONE transaction it inserts the row (idempotent on
+	// retry), consumes any admission reservation for key (deleted by KEY,
+	// any owner — the bytes become counter-accounted), and credits a NEWLY
+	// inserted row's bytes to the repo's usage counter. bytes may be zero
+	// (the empty object registers without ledger effect).
+	RegisterLFSObject(ctx context.Context, repo, key string, bytes int64) error
+	// RegisterAdoptedLFSObject is RegisterLFSObject for ADOPTED objects
+	// (pre-registry blobs whose bytes physical listings already contain):
+	// the same transaction also bumps the adoption generation (Codex
+	// round 51 — a separate best-effort bump could time out after the
+	// registration committed, leaving remote floors double-counting the
+	// adopted bytes with no retry, because adoption short-circuits once
+	// the row exists). A re-registration of an existing row commits
+	// nothing and bumps nothing.
+	RegisterAdoptedLFSObject(ctx context.Context, repo, key string, bytes int64) error
+	// HasLFSObject reports whether (repo, key) is a registered LFS object
+	// (a point read mirroring HasPack, for the sweeper's per-object
+	// classification of the lfs/ prefix).
+	HasLFSObject(ctx context.Context, repo, key string) (bool, error)
+	// BumpLFSAdoptionGen increments repo's shared adoption generation
+	// (Codex round 49 on #51): adopting a pre-registry LFS object moves
+	// bytes that physical listings ALREADY contain into the usage
+	// counter, so every replica's cached uncounted floor scanned before
+	// the adoption would double-count them (floor + counter) until
+	// expiry. Floor caches snapshot this generation at scan start and
+	// reject entries whose generation moved — the ref store is the only
+	// state all replicas and hook processes share.
+	BumpLFSAdoptionGen(ctx context.Context, repo string) error
+	// LFSAdoptionGen returns repo's adoption generation (0 before any
+	// adoption) — a point read on the floor-serve path.
+	LFSAdoptionGen(ctx context.Context, repo string) (int64, error)
+	// CountLFSObjects returns repo's registered LFS object count — the
+	// admission-time read behind the per-repo object-count cap (issue
+	// #51): bytes bound row count at nothing, and registered objects are
+	// permanent, so their population needs its own bound.
+	CountLFSObjects(ctx context.Context, repo string) (int64, error)
+	// GuardedLFSDelete runs del (a blob deletion for a stored key whose
+	// bytes failed content verification) serialized against concurrent
+	// LFS registrations of the same repo (issue #51, Codex round 18):
+	// within one transaction it takes the lock RegisterLFSObject's
+	// counter update takes, re-reads the registry, and only if key is
+	// still unregistered runs del. A concurrent verified upload therefore
+	// either registered first (deleted=false, del never runs) or blocks
+	// until this commits — its post-registration blob.EnsurePublished
+	// then republishes its bytes, so no interleaving can leave a
+	// registered row pointing at deleted bytes.
+	GuardedLFSDelete(ctx context.Context, repo, key string, del func(context.Context) error) (deleted bool, err error)
+	// TryAdoptionClaim atomically claims exclusive fleet-wide ownership
+	// of one legacy-object adoption (Codex security round 73): the
+	// verification hash downloads the whole object, and without a shared
+	// claim every replica races the same hash — tiny write-scoped
+	// batches fanned across the fleet multiply backend reads by fleet
+	// size. claimed=false means a live claim exists (another replica is
+	// hashing; the caller denies transiently and the client retries —
+	// usually landing on the winner's committed registration). A claim
+	// older than AdoptionClaimTTL is expired and taken over. The
+	// returned owner token fences every later mutation (Codex round 74):
+	// a worker whose claim was taken over must not be able to release or
+	// renew the successor's lease. Claims live in pack_reservations
+	// under a suffixed key that no settlement, retirement, or
+	// admission-GC path touches; only expiry-takeover, owner-fenced
+	// release, and the claim-aware sweeper prune remove them.
+	TryAdoptionClaim(ctx context.Context, repo, key string) (claimed bool, owner string, err error)
+	// RenewAdoptionClaim restarts the claim's TTL clock when key's live
+	// claim still belongs to owner (Codex round 74 — verification is
+	// size-scaled and can outlive any fixed TTL). renewed=false means
+	// the lease was lost (expired and taken over, or released): the
+	// caller must stop hashing.
+	RenewAdoptionClaim(ctx context.Context, key, owner string) (renewed bool, err error)
+	// ReleaseAdoptionClaim frees key's adoption claim if it still
+	// belongs to owner (best-effort: a crashed winner's claim expires
+	// via AdoptionClaimTTL instead).
+	ReleaseAdoptionClaim(ctx context.Context, key, owner string) error
 	// GetGeneration returns repo's mutation generation: 0 for a repo no
 	// mutation ever touched, strictly positive and monotonically increasing
 	// afterwards. It is an invalidation token over committed row changes,
@@ -152,10 +265,6 @@ type Store interface {
 	// InitSchema creates the ref/pack tables (idempotent, safe under
 	// concurrent startups).
 	InitSchema(ctx context.Context) error
-	// QuotaLedgerState reads one accounting group's quota ledger (tests,
-	// oracles, operator inspection — never the admission path, which reads
-	// its own transactional snapshot in ReservePackBytes).
-	QuotaLedgerState(ctx context.Context, group []string, ttl time.Duration) (PackQuotaLedgerState, error)
 	Close()
 }
 
@@ -308,13 +417,40 @@ CREATE TABLE IF NOT EXISTS repo_generations (repo text PRIMARY KEY,
 -- them get repo_generations triggers.
 CREATE TABLE IF NOT EXISTS pack_reservations (key text PRIMARY KEY, repo text NOT NULL,
                                               bytes bigint NOT NULL, owner text NOT NULL,
-                                              created_at timestamptz NOT NULL DEFAULT now());
+                                              created_at timestamptz NOT NULL DEFAULT now(),
+                                              attempts bigint NOT NULL DEFAULT 1,
+                                              gen text NOT NULL DEFAULT '');
+-- Rolling upgrade from pre-attempt schemas (issue #51, Codex round 30):
+-- rows minted by older binaries count as one attempt.
+ALTER TABLE pack_reservations ADD COLUMN IF NOT EXISTS attempts bigint NOT NULL DEFAULT 1;
+-- gen identifies the ROW INCARNATION (issue #51, Codex round 33): minted
+-- at INSERT, preserved across same-key refreshes, so a stale writer's
+-- retirement can never touch a replacement row created after its own
+-- expired and was pruned.
+ALTER TABLE pack_reservations ADD COLUMN IF NOT EXISTS gen text NOT NULL DEFAULT '';
 -- Admission sums active reservations per base repo.
 CREATE INDEX IF NOT EXISTS pack_reservations_repo ON pack_reservations (repo);
 CREATE TABLE IF NOT EXISTS pack_retained (repo text, key text, bytes bigint NOT NULL,
                                           superseded_at timestamptz NOT NULL DEFAULT now(),
                                           PRIMARY KEY (repo, key));
 CREATE TABLE IF NOT EXISTS pack_usage (repo text PRIMARY KEY, bytes bigint NOT NULL DEFAULT 0);
+-- Registered LFS objects (issue #51): one row per verified upload, keyed by
+-- the base RepoID and the content-addressed blob key (lfs/<repo>/<oid>).
+-- The registry the LFS orphan sweep classifies against, and the settle
+-- record that moves reserved bytes into pack_usage. Accounting/registry
+-- state only — LFS objects never affect clone content, so no generation
+-- triggers.
+CREATE TABLE IF NOT EXISTS lfs_objects (repo text, key text, bytes bigint NOT NULL,
+                                        created_at timestamptz NOT NULL DEFAULT now(),
+                                        PRIMARY KEY (repo, key));
+-- Maintained count of lfs_objects rows per repo (issue #51): the
+-- object-count cap reads it in O(1) instead of COUNT(*)-ing an
+-- attacker-growable table under lock. Incremented transactionally with
+-- every row insert; rows are never deleted today — any future deletion
+-- path must decrement in its own transaction or the cap turns stricter,
+-- never looser.
+CREATE TABLE IF NOT EXISTS lfs_object_counts (repo text PRIMARY KEY, count bigint NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS lfs_adoption_gens (repo text PRIMARY KEY, gen bigint NOT NULL DEFAULT 0);
 -- Idempotent additive migration for pre-p3 dev databases (backfills
 -- existing rows via the NOT NULL DEFAULT).
 ALTER TABLE refs ADD COLUMN IF NOT EXISTS created_at timestamptz NOT NULL DEFAULT now();
@@ -619,8 +755,21 @@ func (s *PG) CASRef(ctx context.Context, repo, name, old, new string) (won bool,
 // ReservePackBytes read one snapshot without locking against registration.
 func (s *PG) RegisterPacks(ctx context.Context, repo string, packs []Pack) error {
 	assertf(len(packs) > 0, "RegisterPacks called with no packs")
+	mayAdopt := false
+	for _, p := range packs {
+		mayAdopt = mayAdopt || p.Adopted
+	}
 	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		if mayAdopt {
+			// A possible adoption bump below must be serialized with the
+			// admission recheck (Codex round 65, ledger.go
+			// lockBaseLedger), lock-first before any row work.
+			if err := lockBaseLedger(ctx, tx, baseRepoOf(repo)); err != nil {
+				return err
+			}
+		}
 		var credit int64
+		adopted := false
 		for _, p := range packs {
 			assertf(p.ID != "" && p.Key != "", "RegisterPacks: empty pack id/key %+v", p)
 			ct, err := tx.Exec(ctx,
@@ -635,9 +784,22 @@ func (s *PG) RegisterPacks(ctx context.Context, repo string, packs []Pack) error
 					return err
 				}
 				credit += c
+				adopted = adopted || (p.Adopted && c > 0)
 			}
+			// Settlement consumes BOTH era spellings (reservKeySpellings):
+			// the key's bytes are in the usage counter now.
 			if _, err := tx.Exec(ctx,
-				`DELETE FROM pack_reservations WHERE key = $1`, p.Key); err != nil {
+				`DELETE FROM pack_reservations WHERE key = ANY($1)`, reservKeySpellings(p.Key)); err != nil {
+				return err
+			}
+		}
+		if adopted {
+			// A crash-retry adopted a published-but-rowless pack whose
+			// bytes cached floors may already contain (Codex round 53) —
+			// atomic with the credit, like RegisterAdoptedLFSObject.
+			if _, err := tx.Exec(ctx, `
+INSERT INTO lfs_adoption_gens (repo, gen) VALUES ($1, 1)
+ON CONFLICT (repo) DO UPDATE SET gen = lfs_adoption_gens.gen + 1`, baseRepoOf(repo)); err != nil {
 				return err
 			}
 		}

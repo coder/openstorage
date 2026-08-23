@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/coder/code-storage/internal/blob"
+	"github.com/coder/code-storage/internal/githttp"
 	"github.com/coder/code-storage/internal/ref"
 )
 
@@ -25,6 +26,13 @@ import (
 // take the repo's packs/ prefix past the configured quota (issue #21).
 // The wrapped message carries the byte arithmetic.
 var errPackQuotaExceeded = errors.New("repository pack quota exceeded")
+
+// errPackReservationsBusy marks a publishPack denial by the ACTIVE
+// reservation-row cap (issue #51, Codex round 43): rows expire with the
+// TTL, so unlike the byte-quota denial this is transient — handlers
+// answer 429 with Retry-After, never the permanent 403 whose quota
+// arithmetic may even show the write fits.
+var errPackReservationsBusy = errors.New("too many in-flight uploads reserved for this repository, retry later")
 
 // publishPack publishes the local pack file at packPath under repoID's
 // content-addressed key. Nothing is stored when the quota would be
@@ -54,17 +62,30 @@ func (s *server) publishPack(ctx context.Context, repoID, packID, packPath strin
 	}
 	pack := ref.Pack{ID: packID, Key: key, Size: info.Size()}
 	assertf(pack.Size > 0, "publishPack: empty pack file %s", packPath)
+	// An unpublished pack whose key is already REGISTERED is a RESTORE,
+	// not fresh growth (Codex round 72 — the REST twin of the
+	// pre-receive hook's round-70 classification): its bytes are in the
+	// usage counter, so charging them as incoming can falsely reject an
+	// at-quota repair, and the fresh path would re-materialize them with
+	// no distinct cover (the zero-credit registration no-op consumes the
+	// reservation without bumping). Restores skip the admission charge
+	// and the fresh upload; EnsurePublished below Stats them missing and
+	// restores them through the covered, generation-bumping seam.
+	restore := false
 	if !published {
+		has, err := s.refStore.HasPack(ctx, repoID, key)
+		if err != nil {
+			return fmt.Errorf("registry probe %s: %w", key, err)
+		}
+		restore = has
+	}
+	if !published && !restore {
 		if s.packQuotaBytes > 0 {
 			// Durable admission (issue #29, ref/ledger.go): the listing is
 			// the usage floor; the reservation closes concurrent-writer
-			// overshoot and is consumed by RegisterPacks below. A failed
-			// upload releases it (owner-scoped); a crash leaves an
-			// expiring row the sweeper prunes.
-			floor, err := blob.PackUsageBytes(ctx, s.blobStore, repoID)
-			if err != nil {
-				return fmt.Errorf("pack quota usage: %w", err)
-			}
+			// overshoot and is consumed by RegisterPacks below. Failed
+			// uploads and crashes alike leave an expiring row the sweeper
+			// prunes (settle-or-TTL, Codex round 22).
 			owner := ref.NewReservationOwner()
 			ttl := s.packReservationTTL
 			if ttl <= 0 {
@@ -74,18 +95,64 @@ func (s *server) publishPack(ctx context.Context, repoID, packID, packPath strin
 				// enforcement must never silently weaken.
 				ttl = time.Hour
 			}
-			dec, err := s.refStore.ReservePackBytes(ctx, blob.QuotaRepoGroup(repoID),
-				[]ref.Pack{pack}, owner, floor, s.packQuotaBytes, ttl)
-			if err != nil {
-				return fmt.Errorf("reserve pack bytes: %w", err)
+			var dec ref.ReserveDecision
+			for attempt := 0; ; attempt++ {
+				floor, floorGen, err := s.usageFloor(ctx, repoID)
+				if err != nil {
+					return fmt.Errorf("pack quota usage: %w", err)
+				}
+				// Deadline-bounded by the handoff margin (Codex round 42 on
+				// #51) — see the LFS PUT twin: the floor's orphan cover must
+				// outlive the admission snapshot.
+				rsvCtx, rsvCancel := context.WithTimeout(ctx, githttp.UsageFloorHandoffMargin)
+				dec, err = s.refStore.ReservePackBytes(rsvCtx, blob.QuotaRepoGroup(repoID),
+					[]ref.Pack{pack}, owner, floor, floorGen, s.packQuotaBytes, ttl)
+				rsvCancel()
+				if err != nil {
+					return fmt.Errorf("reserve pack bytes: %w", err)
+				}
+				if !dec.FloorStale {
+					break
+				}
+				// The ledger's transactional generation recheck rejected
+				// the floor (Codex round 60): re-derive once, then fail
+				// closed (the client retries).
+				if attempt >= 1 {
+					return fmt.Errorf("usage floor went stale during admission twice, retry")
+				}
+			}
+			if dec.KeyCapExceeded {
+				// Transient row-cap denial, not a quota breach (Codex
+				// round 43): rows expire with the TTL, so this maps to
+				// retry — the byte arithmetic below would even suggest
+				// the write fits.
+				return errPackReservationsBusy
 			}
 			if !dec.OK {
 				return fmt.Errorf("%w: write adds %d bytes to %d bytes stored (+%d bytes reserved by in-flight writes), quota is %d bytes",
 					errPackQuotaExceeded, pack.Size, dec.UsedBytes, dec.ReservedBytes, s.packQuotaBytes)
 			}
 			if err := s.blobStore.UploadFile(ctx, key, packPath); err != nil {
-				// Best-effort: a failed release only leaves an expiring row.
-				_ = s.refStore.ReleasePackReservations(ctx, []string{key}, owner)
+				// PROVEN-clean failure: retire THIS attempt (Codex round
+				// 30; replacing round 22's settle-or-TTL-only rule). The
+				// per-attempt refcount never removes a live same-key
+				// writer's protection, the gen token keeps a stale retire
+				// off any replacement row (round 33), and the retire runs
+				// only on EVIDENCE the upload did not commit (round 33:
+				// the error may be ambiguous with the bytes durable).
+				// Detached from the request context and bounded (Codex
+				// round 31): the most common clean failure here IS a
+				// client cancellation, and a retire on the
+				// already-canceled context can never reach the database.
+				rctx, rcancel := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
+				defer rcancel()
+				if _, serr := s.blobStore.Stat(rctx, key); errors.Is(serr, blob.ErrNotFound) {
+					if rerr := s.refStore.RetirePackAttempts(rctx, blob.QuotaRepoGroup(repoID), dec.Gens); rerr != nil {
+						s.logger.Warn("retire pack reservation", "key", key, "error", rerr)
+					}
+				} else {
+					s.logger.Warn("retire skipped, upload outcome ambiguous", "key", key, "stat_error", serr)
+				}
 				return fmt.Errorf("upload pack %s: %w", key, err)
 			}
 		} else if err := s.blobStore.UploadFile(ctx, key, packPath); err != nil {
@@ -96,11 +163,38 @@ func (s *server) publishPack(ctx context.Context, repoID, packID, packPath strin
 	// if a sweeper deleted the key before the registration committed.
 	// Verification runs even when RegisterPacks fails: an ambiguous error
 	// may have committed the row (see the pre-receive hook).
+	// A pre-existing blob means this registration ADOPTS bytes cached
+	// floors may already contain (Codex round 53) — the registration
+	// bumps the shared floor generation for it.
+	pack.Adopted = published
 	regErr := s.refStore.RegisterPacks(ctx, repoID, []ref.Pack{pack})
 	if regErr != nil {
 		regErr = fmt.Errorf("register pack %s: %w", packID, regErr)
 	}
-	if err := blob.EnsurePublished(ctx, s.blobStore, key, packPath); err != nil {
+	// A restore re-materializes counter-accounted bytes (Codex round 58,
+	// the pack twin of the LFS zero-growth repair): cover it with a
+	// reservation BEFORE the upload — stale absence-window floors held by
+	// concurrent admissions must see the returning bytes — and bump the
+	// shared floor generation afterward (best-effort, like the sweeper's
+	// quarantine-restore bump) so future serves re-scan.
+	var cover func(context.Context, int64) error
+	if s.packQuotaBytes > 0 {
+		cover = func(cctx context.Context, size int64) error {
+			ttl := s.packReservationTTL
+			if ttl <= 0 {
+				ttl = time.Hour // unwired server: match the admission fallback above
+			}
+			return ref.ReserveRestoreCover(cctx, s.refStore, blob.QuotaRepoGroup(repoID), key, size, ttl)
+		}
+	}
+	// The floor-generation bump is the restore's invalidation HANDOFF
+	// (Codex rounds 68–70): it runs inside the seam, under a live cover,
+	// detached from the request's fate (EnsurePublished deliberately
+	// survives client cancellation), retried until it commits or cover
+	// continuity is lost.
+	if _, err := blob.EnsurePublished(ctx, s.blobStore, key, packPath, cover, func(bctx context.Context) error {
+		return s.refStore.BumpLFSAdoptionGen(bctx, githttp.BaseRepo(repoID))
+	}); err != nil {
 		return errors.Join(regErr, fmt.Errorf("verify pack %s: %w", key, err))
 	}
 	// Threshold check regardless of regErr (issue #1): an ambiguous

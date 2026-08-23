@@ -19,6 +19,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/coder/code-storage/internal/auth"
@@ -83,6 +84,14 @@ type Server struct {
 	// reservation gates admission (issue #29, ref/ledger.go). Set by the
 	// serve wiring; <= 0 leaves the hook on defaultReservationTTL.
 	PackReservationTTL time.Duration
+	// BaseURL is the externally reachable base URL (scheme://host, no
+	// trailing slash) LFS proxy transfer hrefs are built on (issue #51:
+	// uploads always proxy, so behind a reverse proxy the href must be
+	// the canonical external URL — the backend request's Host header may
+	// be internal). Set by the serve wiring from $CODESTORAGE_BASE_URL
+	// (or the bound listener); when empty, hrefs fall back to the
+	// request's Host and X-Forwarded-Proto.
+	BaseURL string
 	// MaxPushBytes caps the DECODED bytes one receive-pack request may
 	// stream into git (issue #55, pushcap.go); <= 0 disables the cap. Set
 	// by the serve wiring (default: a small multiple of the pack quota).
@@ -98,6 +107,292 @@ type Server struct {
 	// usage memoizes per-repo pack usage for the quota-pressure log so
 	// replayed cheap POSTs cannot amplify into per-request blob listings.
 	usage usageCache
+	// LFSStagingBytes bounds the aggregate bytes of proxy LFS uploads
+	// staging on this replica at once (issue #51, Codex round 4): uploads
+	// stage their full Content-Length under $TMPDIR before verification,
+	// and the per-repository quota is neither node-wide nor guaranteed
+	// enabled, so without this budget concurrent distinct-key uploads
+	// could exhaust a replica's disk. Set by the serve wiring
+	// ($CODESTORAGE_LFS_STAGING_BYTES, default 10 GiB); <= 0 disables the
+	// bound (the operator's explicit opt-out).
+	LFSStagingBytes int64
+	// lfsUploadsInFlight tracks blob keys with a proxy upload currently
+	// staging on this replica (issue #51, Codex security round): at most
+	// one in-flight upload per key, so concurrent identical PUTs cannot
+	// multiply quota-sized temp files (see lfsProxyUpload).
+	lfsUploadsInFlight sync.Map
+	// lfsStagingInFlight is the aggregate Content-Length currently
+	// reserved against LFSStagingBytes; lfsStagingOps counts the
+	// operations holding it (Codex round 17: tiny Content-Lengths pass a
+	// byte-only budget while each holds a goroutine, connection, fd, and
+	// temp file — the op count bounds that). Guarded by lfsStagingMu.
+	lfsStagingInFlight int64
+	lfsStagingOps      int
+	lfsRepoStagingOps  map[string]int
+	// lfsRepoStagingBytes is each base repository's share of
+	// lfsStagingInFlight (Codex round 38): the global byte budget alone
+	// let one repository's transferred-and-dripping uploads 429 every
+	// other repository — see lfsRepoStagingByteShareDiv. Guarded by
+	// lfsStagingMu.
+	lfsRepoStagingBytes map[string]int64
+	// lfsVerifyOps / lfsRepoVerifyOps count in-flight legacy-verification
+	// buffers (node-wide and per base repo — Codex rounds 26+33); guarded
+	// by lfsStagingMu like the op counters.
+	lfsVerifyOps     int
+	lfsRepoVerifyOps map[string]int
+	lfsStagingMu     sync.Mutex
+	// lfsVerifyResumes holds partially completed adoption hashes by blob
+	// key (Codex round 57): an aborted verification saves its offset and
+	// sha256 midstate so the next attempt continues instead of replaying
+	// completed ranges from offset zero. Guarded by lfsVerifyResumeMu;
+	// bounded by lfsMaxVerifyResumes.
+	lfsVerifyResumes  map[string]lfsVerifyResume
+	lfsVerifyResumeMu sync.Mutex
+}
+
+// lfsMaxStagingOps bounds concurrent staging operations per replica
+// (uploads and legacy verifications alike), independent of bytes. A var so
+// tests can shrink it.
+var lfsMaxStagingOps = 256
+
+// lfsMaxRepoStagingOps bounds ONE base repository's share of the op slots
+// (Codex round 32, security): tokens are repo-scoped, so a writer parking
+// bodyless PUTs for distinct OIDs — each slot held up to the idle deadline
+// — could otherwise occupy the whole replica-global cap with ~256 live
+// connections and starve every OTHER repository's uploads and adoptions.
+// Capping the per-repo share confines that outage to the attacker's own
+// repository; unrelated repositories retain the remaining slots. A var so
+// tests can shrink it.
+var lfsMaxRepoStagingOps = 32
+
+// lfsRepoStagingShareDiv scales a repository's slot allowance by the
+// pool's FREE capacity (Codex round 37, security): the fixed shares above
+// still summed to the global cap, so an actor holding git:write tokens
+// for just 8 repositories — the wire carries no finer caller identity;
+// auth.SubjectLiteral is one literal for every vendor SDK — could park
+// 8 × 32 bodyless PUTs and starve the node. Each new slot must fit
+// min(lfsMaxRepoStagingOps, max(1, free/lfsRepoStagingShareDiv)), so
+// allowances shrink as the pool fills: a k-repo coalition equilibrates
+// near cap·k/(div+k) — half the pool for the 8-repo attack, leaving every
+// other repository a ≥free/div allowance — and SATURATING the pool takes
+// a coalition on the order of the cap itself (~250 write-scoped repos),
+// not 8. A quiet node still grants a single busy repository ~cap/(div+1)
+// (~28) concurrent transfers. Exhaustion by an arbitrarily large
+// authorized coalition is inherent to any finite pool; the residual is
+// accepted and edge rate limiting remains the operator lever beyond it.
+const lfsRepoStagingShareDiv = 8
+
+// reserveLFSStaging reserves n bytes of the node-wide LFS staging budget
+// and one staging-operation slot charged to repo's share. ok=false when
+// the node cap, the repo share, or the byte budget does not fit right now
+// (transient — the caller answers 429). n larger than the whole byte
+// budget can never fit; the caller distinguishes that case up front. The
+// op slot is counted even for n==0 and with the byte budget disabled: the
+// operation count bounds goroutines/fds/temp files, which exist regardless
+// of declared size.
+func (s *Server) reserveLFSStaging(repo string, n int64) bool {
+	assertf(repo != "" && n >= 0, "reserveLFSStaging(%q, %d)", repo, n)
+	s.lfsStagingMu.Lock()
+	defer s.lfsStagingMu.Unlock()
+	if s.lfsStagingOps >= lfsMaxStagingOps {
+		return false
+	}
+	// The repo allowance scales with free capacity — see
+	// lfsRepoStagingShareDiv. The floor of 1 keeps a first slot available
+	// to any repository while the global cap has room.
+	free := lfsMaxStagingOps - s.lfsStagingOps
+	if s.lfsRepoStagingOps[repo] >= min(lfsMaxRepoStagingOps, max(1, free/lfsRepoStagingShareDiv)) {
+		return false
+	}
+	if s.LFSStagingBytes > 0 && n > 0 && s.lfsStagingInFlight > s.LFSStagingBytes-n {
+		return false
+	}
+	s.lfsStagingOps++
+	if s.lfsRepoStagingOps == nil {
+		s.lfsRepoStagingOps = make(map[string]int)
+	}
+	s.lfsRepoStagingOps[repo]++
+	if s.LFSStagingBytes > 0 && n > 0 {
+		s.lfsStagingInFlight += n
+		if s.lfsRepoStagingBytes == nil {
+			s.lfsRepoStagingBytes = make(map[string]int64)
+		}
+		s.lfsRepoStagingBytes[repo] += n
+	}
+	return true
+}
+
+// lfsProbeTimeout bounds the PUT path's pre-body blob probe (a var for
+// tests): the dedup Stat runs while holding a node-wide op slot (Codex
+// round 25), so a wedged backend must return the slot within a bounded
+// window instead of letting 256 stuck probes disable the surface for as
+// long as clients keep their connections open.
+var lfsProbeTimeout = time.Minute
+
+// lfsStagingChunk is the staging-budget growth quantum (a var for tests).
+// Proxy uploads reserve one chunk ahead of the bytes actually received
+// instead of their full declared Content-Length (Codex security round 5 on
+// #51): an upfront declared-size reservation let a single header-plus-drip
+// PUT declare the entire node budget and pin it for the whole reservation
+// TTL while sending one byte per idle window, 429ing every unrelated
+// upload on the replica. Growing as data arrives caps a dripper's hold at
+// one chunk beyond what it genuinely transferred; the idle/absolute
+// deadlines still bound the duration.
+var lfsStagingChunk = int64(8 << 20)
+
+// lfsVerifyChunkTimeout bounds ONE ranged read of an adoption
+// verification hash (Codex security round 56; a var for tests). The
+// hash's absolute bound scales with the object so it can always finish
+// (verifyStoredLFSObject); this per-chunk stall guard is what protects
+// the op slot and verify buffer from a WEDGED backend — the slots come
+// back within one chunk window, not the whole size-scaled allowance. An
+// abort never discards progress: the saved resume state (Codex round 57)
+// lets the next attempt continue after the completed ranges.
+var lfsVerifyChunkTimeout = time.Minute
+
+// lfsMaxVerifyBuffers caps concurrent legacy-verification buffer slots
+// node-wide (Codex round 26, security): each in-flight verification holds
+// one lfsStagingChunk-sized ReadRange slice in HEAP, a resource the
+// disk-sized staging budget cannot meaningfully meter. 32 slots bound
+// verification memory at ~256 MiB with the default 8 MiB chunk.
+const lfsMaxVerifyBuffers = 32
+
+// lfsMaxRepoVerifyBuffers caps ONE base repository's share of the
+// verification buffers (Codex round 33, security): the buffer pool and the
+// per-repo op-slot share are both 32, so one repository's concurrent
+// adoptions could otherwise occupy every process-wide verification slot
+// and 429 other repositories' legacy adoptions. Eight slots keep a single
+// repository's upgrade traffic brisk while confining its outages to
+// itself.
+const lfsMaxRepoVerifyBuffers = 8
+
+// lfsRepoVerifyShareDiv scales one repository's verification-buffer
+// allowance by the pool's free capacity (Codex round 38, security): the
+// fixed 8-slot shares summed to the 32-slot pool, so git:write tokens for
+// four repositories could park long adoptions and 429 every other
+// repository's legacy uploads on an upgrade node. Same construction as
+// lfsRepoStagingShareDiv: a k-repo coalition equilibrates near
+// pool·k/(div+k) and every victim keeps a free/div allowance, while a
+// quiet node still grants a single repository its full 8-slot share
+// (32/4 = 8).
+const lfsRepoVerifyShareDiv = 4
+
+// reserveLFSVerifyBuffer takes one node-wide verification buffer slot
+// charged to repo's share; ok=false is transient (429).
+func (s *Server) reserveLFSVerifyBuffer(repo string) bool {
+	assertf(repo != "", "reserveLFSVerifyBuffer(%q)", repo)
+	s.lfsStagingMu.Lock()
+	defer s.lfsStagingMu.Unlock()
+	if s.lfsVerifyOps >= lfsMaxVerifyBuffers {
+		return false
+	}
+	free := lfsMaxVerifyBuffers - s.lfsVerifyOps
+	if s.lfsRepoVerifyOps[repo] >= min(lfsMaxRepoVerifyBuffers, max(1, free/lfsRepoVerifyShareDiv)) {
+		return false
+	}
+	s.lfsVerifyOps++
+	if s.lfsRepoVerifyOps == nil {
+		s.lfsRepoVerifyOps = make(map[string]int)
+	}
+	s.lfsRepoVerifyOps[repo]++
+	return true
+}
+
+// releaseLFSVerifyBuffer returns a reserveLFSVerifyBuffer slot.
+func (s *Server) releaseLFSVerifyBuffer(repo string) {
+	s.lfsStagingMu.Lock()
+	defer s.lfsStagingMu.Unlock()
+	s.lfsVerifyOps--
+	assertf(s.lfsVerifyOps >= 0, "releaseLFSVerifyBuffer: count went negative")
+	s.lfsRepoVerifyOps[repo]--
+	assertf(s.lfsRepoVerifyOps[repo] >= 0, "releaseLFSVerifyBuffer(%q): repo count went negative", repo)
+	if s.lfsRepoVerifyOps[repo] == 0 {
+		delete(s.lfsRepoVerifyOps, repo)
+	}
+}
+
+// lfsStagingQuantum is the effective staging growth quantum and share
+// floor: the default chunk, scaled DOWN to a third of the byte budget
+// when the budget is smaller (Codex round 55, security). With a budget at
+// or below one default chunk, the chunk-floored share allowance covered
+// the whole pool — a header-only PUT declaring the budget then reserved
+// every byte before reading any body and starved all repositories for the
+// idle minute, renewable once a minute. Scaling the quantum keeps the
+// share floor (and the 413 capability bound it implies) strictly below
+// the pool, so a victim repository always retains admissible capacity.
+func (s *Server) lfsStagingQuantum() int64 {
+	if s.LFSStagingBytes > 0 {
+		return min(lfsStagingChunk, max(1, s.LFSStagingBytes/(lfsRepoStagingByteShareDiv+1)))
+	}
+	return lfsStagingChunk
+}
+
+// lfsRepoStagingByteShareDiv scales one repository's staged-BYTE
+// allowance by the byte budget's free capacity, the byte analog of
+// lfsRepoStagingShareDiv (Codex round 38): with only the global budget, a
+// writer for one repository could transfer LFSStagingBytes of real data
+// and drip inside its reserved chunks until the absolute deadline —
+// invalid digests make the traffic repeatable without consuming quota or
+// object-count entries — 429ing every other repository's uploads despite
+// the op-slot shares. Each grow must fit
+// max(lfsStagingChunk, freeBytes/div); bytes get a SMALLER divisor than
+// op slots because the byte allowance bounds the largest stageable
+// object: a solo repository's hold stalls at the B/(div+1) fixed point
+// (div 2 → B/3; the 413 pre-check advertises exactly that bound), so the
+// default budget must be ≈(div+1)× the largest expected object — see
+// defaultLFSStagingBytes. A k-repo coalition equilibrates near
+// B·k/(div+k), leaving every victim a free/div allowance; the residual
+// (arbitrarily many authorized repos exhausting any finite budget) is
+// accepted, with edge rate limiting the operator lever beyond it.
+const lfsRepoStagingByteShareDiv = 2
+
+// growLFSStaging adds n bytes to repo's existing staging reservation
+// whose op slot is already held; the caller releases the grown total
+// through one releaseLFSStaging call.
+func (s *Server) growLFSStaging(repo string, n int64) bool {
+	assertf(repo != "" && n > 0, "growLFSStaging(%q, %d)", repo, n)
+	s.lfsStagingMu.Lock()
+	defer s.lfsStagingMu.Unlock()
+	if s.LFSStagingBytes > 0 {
+		if s.lfsStagingInFlight > s.LFSStagingBytes-n {
+			return false
+		}
+		// The repo byte allowance scales with the budget's free capacity
+		// — see lfsRepoStagingByteShareDiv. The chunk floor keeps a
+		// minimal upload growable while the global budget has room.
+		free := s.LFSStagingBytes - s.lfsStagingInFlight
+		if s.lfsRepoStagingBytes[repo] > max(s.lfsStagingQuantum(), free/lfsRepoStagingByteShareDiv)-n {
+			return false
+		}
+		s.lfsStagingInFlight += n
+		if s.lfsRepoStagingBytes == nil {
+			s.lfsRepoStagingBytes = make(map[string]int64)
+		}
+		s.lfsRepoStagingBytes[repo] += n
+	}
+	return true
+}
+
+// releaseLFSStaging returns a reserveLFSStaging reservation.
+func (s *Server) releaseLFSStaging(repo string, n int64) {
+	s.lfsStagingMu.Lock()
+	defer s.lfsStagingMu.Unlock()
+	s.lfsStagingOps--
+	assertf(s.lfsStagingOps >= 0, "releaseLFSStaging: op count went negative")
+	s.lfsRepoStagingOps[repo]--
+	assertf(s.lfsRepoStagingOps[repo] >= 0, "releaseLFSStaging(%q): repo op count went negative", repo)
+	if s.lfsRepoStagingOps[repo] == 0 {
+		delete(s.lfsRepoStagingOps, repo) // bound the map by active repos
+	}
+	if s.LFSStagingBytes > 0 && n > 0 {
+		s.lfsStagingInFlight -= n
+		assertf(s.lfsStagingInFlight >= 0, "releaseLFSStaging(%d): in-flight went negative", n)
+		s.lfsRepoStagingBytes[repo] -= n
+		assertf(s.lfsRepoStagingBytes[repo] >= 0, "releaseLFSStaging(%q, %d): repo bytes went negative", repo, n)
+		if s.lfsRepoStagingBytes[repo] == 0 {
+			delete(s.lfsRepoStagingBytes, repo) // bound the map by active repos
+		}
+	}
 }
 
 // repoTarget is a resolved request target: the live repo record plus the
@@ -534,7 +829,11 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 		// so the in-place filter aliases nothing.
 		env := cmd.Env[:0]
 		for _, kv := range cmd.Env {
+			// EnvUsageFloor, EnvVerifyState, and EnvVerifySigBudget are
+			// stripped for the same reason: the hook trusts them as THIS
+			// push's admission floor and verification state/budget.
 			if !strings.HasPrefix(kv, EnvAtomic+"=") &&
+				!strings.HasPrefix(kv, EnvUsageFloor+"=") &&
 				!strings.HasPrefix(kv, EnvVerifyState+"=") &&
 				!strings.HasPrefix(kv, EnvVerifySigBudget+"=") &&
 				!strings.HasPrefix(kv, EnvSyncClaim+"=") {
@@ -554,7 +853,31 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 		// Resolved quota for the pre-receive hook's authoritative
 		// usage+incoming check (quota.go); absent means disabled.
 		if s.PackQuotaBytes > 0 {
+			// The hook is a fresh process per push and cannot cache
+			// across pushes, so its admission floor is minted HERE from
+			// the shared single-flight cache (Codex round 21: hook-side
+			// self-listings scan the pack AND LFS prefixes per push —
+			// ~100 pages at the LFS object cap — amplifying cheap pushes
+			// into shared-backend listing load). Fail closed: spawning
+			// without the env would just reopen the per-push listing
+			// path via the hook's skew fallback.
+			floor, gen, err := s.cachedUsageFloorGen(r.Context(), target.key)
+			if err != nil {
+				log.Printf("quota: %s: usage floor for receive-pack: %v", target.key, err)
+				httpError(w, http.StatusInternalServerError, "storage quota check failed")
+				return
+			}
 			cmd.Env = append(cmd.Env, EnvPackQuota+"="+strconv.FormatInt(s.PackQuotaBytes, 10))
+			// The floor carries its mint time (Codex round 30): the hook
+			// runs only after the client's transfer, whose duration the
+			// client controls, so the hook must be able to judge the
+			// floor's age rather than trust an arbitrarily stale value.
+			// It also carries the shared adoption generation its scan
+			// snapshotted (Codex round 49), so the hook can reject a
+			// floor whose listed bytes another replica adopted while the
+			// client transferred.
+			cmd.Env = append(cmd.Env, EnvUsageFloor+"="+strconv.FormatInt(floor, 10)+
+				":"+strconv.FormatInt(time.Now().Unix(), 10)+":"+strconv.FormatInt(gen, 10))
 			if s.PackReservationTTL > 0 {
 				cmd.Env = append(cmd.Env, EnvPackReservationTTL+"="+s.PackReservationTTL.String())
 			}

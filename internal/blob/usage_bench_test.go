@@ -1,5 +1,5 @@
 // Hot-path benchmark for the quota-admission usage listing (issue #92):
-// PackUsageBytes runs on every push/write admission as the usage floor, and
+// StorageUsageBytes runs on every push/write admission as the usage floor, and
 // its cost scales with the repo's registered pack count (page-bounded
 // listings, page size packUsagePageSize). The pack-count matrix exposes the
 // listing-page allocation profile on both test backends: the in-memory
@@ -51,7 +51,7 @@ func benchUsageStore(b *testing.B, backend, repo string, n int, contentSize int6
 	return store
 }
 
-func BenchmarkPackUsageBytes(b *testing.B) {
+func BenchmarkStorageUsageBytes(b *testing.B) {
 	const repo = "benchrepo"
 	const contentSize = int64(256)
 	ctx := context.Background()
@@ -62,12 +62,12 @@ func BenchmarkPackUsageBytes(b *testing.B) {
 				want := int64(n) * contentSize
 				b.ReportAllocs()
 				for b.Loop() {
-					total, err := PackUsageBytes(ctx, store, repo)
+					total, err := StorageUsageBytes(ctx, store, repo)
 					if err != nil {
-						b.Fatalf("PackUsageBytes: %v", err)
+						b.Fatalf("StorageUsageBytes: %v", err)
 					}
 					if total != want {
-						b.Fatalf("PackUsageBytes = %d, want %d", total, want)
+						b.Fatalf("StorageUsageBytes = %d, want %d", total, want)
 					}
 				}
 			})

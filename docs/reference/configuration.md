@@ -27,7 +27,8 @@ never a silently-applied default.
 | [`CODESTORAGE_WEBHOOK_ALLOW_PRIVATE`](#codestorage_webhook_allow_private) | `false` | Permit private-network webhook receivers (metadata and redirects stay blocked) |
 | [`CODESTORAGE_SECRETS_KEY`](#codestorage_secrets_key) | unset (plaintext) | AES-256 key list for at-rest encryption of stored webhook secrets and upstream credentials |
 | [`CODESTORAGE_SECRETS_MODE`](#codestorage_secrets_mode) | `encrypt` | `decrypt-only` stages the key fleet-wide before encrypted writes begin |
-| [`CODESTORAGE_PACK_QUOTA_BYTES`](#codestorage_pack_quota_bytes) | 10 GiB | Per-repo pack-bytes quota (`0` disables) |
+| [`CODESTORAGE_PACK_QUOTA_BYTES`](#codestorage_pack_quota_bytes) | 10 GiB | Per-repo storage quota, packs + LFS (`0` disables) |
+| [`CODESTORAGE_LFS_STAGING_BYTES`](#codestorage_lfs_staging_bytes) | 32 GiB | Per-replica cap on in-flight LFS upload staging (`0` disables) |
 | [`CODESTORAGE_PACK_RESERVATION_TTL`](#codestorage_pack_reservation_ttl) | `1h` | Lifetime of a crashed writer's quota reservation |
 | [`CODESTORAGE_MAX_PUSH_BYTES`](#codestorage_max_push_bytes) | 2 × pack quota (min 2 MiB) | Decoded-byte cap on one git push (`0` disables) |
 | [`CODESTORAGE_VERIFY_SIG_BUDGET`](#codestorage_verify_sig_budget) | `10000` | Per-push `verify-sig` verified-commit budget (`0` disables) |
@@ -35,6 +36,7 @@ never a silently-applied default.
 | [`CODESTORAGE_SWEEP_AGE_THRESHOLD`](#codestorage_sweep_age_threshold) | `24h` | Minimum blob age before an unregistered pack counts as an orphan |
 | [`CODESTORAGE_SWEEP_DELETE_ENABLED`](#codestorage_sweep_delete_enabled) | `false` | Opt-in: actually delete general orphans (list-only otherwise) |
 | [`CODESTORAGE_SWEEP_DELETE_SUPERSEDED`](#codestorage_sweep_delete_superseded) | `true` | Reap blobs a repack fold provably superseded |
+| [`CODESTORAGE_SWEEP_DELETE_LFS`](#codestorage_sweep_delete_lfs) | `false` | Opt-in: actually delete orphan LFS objects (list-only otherwise) |
 | [`CODESTORAGE_REPACK_THRESHOLD`](#codestorage_repack_threshold) | `10` | Registered-pack count that triggers a background repack (`0` disables) |
 | [`CODESTORAGE_SYNC_STEAL_LEGACY`](#codestorage_sync_steal_legacy) | `false` | Opt-in: steal pre-lease sync claims after their adoption grace lapses |
 
@@ -293,22 +295,65 @@ new secrets plaintext.
 
 ### `CODESTORAGE_PACK_QUOTA_BYTES`
 
-Per-repository pack-bytes quota enforced at every external pack writer: git pushes that
-would grow a repo's `packs/` usage past the quota are refused at pre-receive before
-anything is stored, and REST pack writes (commit-pack, merge, notes, fork) are refused with
-a `403` envelope.
+Per-repository storage-bytes quota enforced at every external storage writer: git pushes
+that would grow a repo's `packs/` usage past the quota are refused at pre-receive before
+anything is stored, REST pack writes (commit-pack, merge, notes, fork) are refused with
+a `403` envelope, and Git LFS uploads ([#51](https://github.com/coder/code-storage/issues/51))
+are refused with per-object `507` batch errors before any transfer URL is issued (the
+verified upload transfer re-checks the actual `Content-Length`, so under-declared batch
+sizes cannot bypass the gate).
 
 - **Default:** 10 GiB (`10737418240`). **`0` disables enforcement**; negative or malformed
   values are startup errors.
 - **Namespace roll-up:** a repository and its `+ephemeral` / `+import` namespaces
   ([git protocol](../explanation/git-protocol-and-namespaces.md)) share one quota, accounted against the
-  base repository.
+  base repository. LFS objects always store under the base repository's prefix.
 - Admission is a durable reservation ledger in the ref store, atomic across concurrent
   pushes and replicas: two pushes that individually fit but together exceed the quota —
-  exactly one wins.
+  exactly one wins. LFS uploads charge the same ledger (an advisory batch fast-fail,
+  then a durable reserve at the verified upload, settled at
+  verified upload completion). Independent of bytes, two compiled population bounds
+  (like the repack fold budgets) keep tiny declared sizes from growing the shared
+  database: each repository is capped at 10,000 **active reservation rows** (excess
+  batches answer transient `429`s until rows settle or expire; admission also prunes the
+  repo's expired rows itself, so the physical table stays bounded even with sweeping
+  disabled) and at 100,000 **registered LFS objects** (excess answers `507` naming the
+  limit; re-publication of already-registered objects is exempt). These apply even with
+  the byte quota disabled.
 - Background repack maintenance is **not** quota-gated (an at-quota repository could never
   compact itself otherwise), and repack preserves the registered object set — it does not
-  reclaim unreachable objects.
+  reclaim unreachable objects. LFS downloads are never quota-gated.
+
+### `CODESTORAGE_LFS_STAGING_BYTES`
+
+Node-wide cap on the aggregate bytes of Git LFS uploads staging on one replica at a
+time. LFS uploads go through the verified proxy transfer
+([#51](https://github.com/coder/code-storage/issues/51)) and stage their full body
+under the replica's `$TMPDIR` before verification and publication — the
+per-repository quota above bounds neither the node (it is per repo) nor anything when
+disabled, so this is the replica's disk-protection bound. The budget is charged
+incrementally as body bytes actually arrive (a stalled upload holds only slightly more
+than it has transferred, not its declared `Content-Length`), and each repository's
+staged bytes are held to a fair share that scales with the budget's free capacity, so
+one repository's uploads cannot occupy the whole replica budget. Uploads that do not
+fit right now answer `429` with `Retry-After`; an object whose declared size exceeds
+the largest hold a single repository can ever reach — one third of the budget —
+answers `413`.
+
+- **Default:** 32 GiB (`34359738368`). The budget is a **working set, not an
+  object-size cap**: because a single repository's hold tops out at a third of the
+  budget, supporting objects of size `S` needs a budget of about `3 × S` — the default
+  keeps one default-quota-sized (10 GiB) object stageable with cross-repository
+  capacity intact. **`0` disables the bound**; negative or malformed values are
+  startup errors.
+- Size it below the free space you guarantee `$TMPDIR`, minus headroom for git push
+  quarantines and fork closures, which stage there too.
+- Each object additionally allows only one in-flight upload per replica (concurrent
+  identical PUTs answer `429`), and an upload body is aborted — releasing its capacity —
+  when it delivers no bytes for a full minute **or** outlives the
+  [reservation TTL](#codestorage_pack_reservation_ttl) in total (an upload slower than
+  the TTL's implied floor — ~3 MB/s for 10 GiB at the defaults — cannot finish before
+  its admission reservation expires anyway).
 
 ### `CODESTORAGE_PACK_RESERVATION_TTL`
 
@@ -316,10 +361,18 @@ How long a crashed writer's quota reservation keeps gating admission (Go duratio
 `30m`, `2h`). Admission ignores rows older than the TTL immediately; the sweeper's
 periodic pruning of expired rows is garbage collection, not what re-opens headroom.
 
-- **Default:** `1h`. **Constraints:** must be positive; a zero TTL would expire live
-  reservations instantly, silently reopening the overshoot the ledger closes.
+- **Default:** `1h`. **Constraints:** must be greater than 60 seconds — the 30-second
+  usage-floor cache lifetime plus the 30-second admission handoff margin — and the
+  server refuses smaller values at startup. A zero TTL would expire live reservations
+  instantly, and a TTL at or below the floor's freshness budget would let a cached
+  usage listing (plus the admission call it feeds) outlive the reservations covering
+  uploads published after it, silently reopening the overshoot the ledger closes.
 - Must comfortably exceed the longest plausible server-side pack upload — the default
   clears a default-quota-sized (10 GiB) upload at ~3 MB/s.
+- LFS upload reservations (charged durably at the verified upload, right before its
+  bytes publish; the batch check is advisory and holds nothing) use the same TTL, so it
+  must cover an object's publication and registration tail, not the client's transfer
+  time.
 
 ## Push work bounds
 
@@ -388,9 +441,9 @@ Postgres, in-process in local mode.
 ### `CODESTORAGE_SWEEP_INTERVAL`
 
 Interval between orphan-pack sweeps (Go duration). The sweeper diffs the blob store's
-`packs/` listing against the authoritative pack registry and reports — and only when
-explicitly enabled, deletes — unregistered blobs older than the age threshold. It also
-prunes expired quota reservations on the same cadence.
+`packs/` and `lfs/` listings against their authoritative registries and reports — and
+only when explicitly enabled, deletes — unregistered blobs older than the age threshold.
+It also prunes expired quota reservations on the same cadence.
 
 - **Default:** `1h`. **`0` disables sweeping** (a strictly restorative quarantine-heal pass
   still runs once at startup); negative values are startup errors.
@@ -432,6 +485,22 @@ threshold and their retained bytes returned to the repo's quota headroom.
 - **Default:** `true` (`false` disables). **Constraints:** must parse as a boolean.
 - Unlike the general delete opt-in above, a versioned S3 bucket does not fail startup —
   each sweep run downgrades to list-only instead (the heal pass still runs).
+
+### `CODESTORAGE_SWEEP_DELETE_LFS`
+
+Delete mode for **LFS orphans**: `lfs/` blobs with no LFS registry row, older than the
+age threshold. Deliberately separate from `CODESTORAGE_SWEEP_DELETE_ENABLED`: the LFS
+registry ships with [#51](https://github.com/coder/code-storage/issues/51), so **every
+LFS object uploaded by an older build has no row** and would classify as an orphan —
+a fleet already running general deletes must not reap its pre-existing LFS population
+on upgrade. Stored objects are adopted into the registry by write-scoped touches
+(upload batches naming them, re-uploads of the same content).
+
+- **Default:** `false` (list-only). **Constraints:** must parse as a boolean.
+- Enable only after list-only [sweep reports](../how-to/storage-lifecycle-and-sweeping.md#lfs-orphans-and-pre-registry-objects)
+  stop naming objects that should live.
+- Same quarantine-first disposal and heal pass as the pack classes; on versioned S3
+  buckets it fails startup exactly like the general delete opt-in.
 
 ### `CODESTORAGE_REPACK_THRESHOLD`
 

@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/coder/code-storage/internal/githttp"
 	"github.com/coder/code-storage/internal/secrets"
 )
 
@@ -89,6 +90,21 @@ const (
 	// failing startup like the explicit general delete opt-in.
 	envSweepDeleteSuperseded = "CODESTORAGE_SWEEP_DELETE_SUPERSEDED"
 
+	// LFS-class deletion (issue #51): reap aged lfs/ blobs with no
+	// lfs_objects registry row. OFF by default and separate from the
+	// general delete opt-in: objects uploaded before the LFS registry
+	// existed have no rows, so a fleet already running general deletes
+	// must not start reaping its pre-existing LFS population on upgrade.
+	// Enable only after list-only reports stop naming live objects
+	// (write-scoped touches adopt stored objects into the registry).
+	envSweepDeleteLFS = "CODESTORAGE_SWEEP_DELETE_LFS"
+
+	// Node-wide LFS upload staging budget (issue #51): proxy uploads
+	// stage their full Content-Length on local disk before verification,
+	// so a replica needs a disk bound independent of the per-repo quota
+	// (which is per-repository and may be disabled). "0" disables.
+	envLFSStagingBytes = "CODESTORAGE_LFS_STAGING_BYTES"
+
 	// Background repack (issue #1): registered-pack count at which a
 	// post-write trigger schedules a fold ("0" disables triggering).
 	envRepackThreshold = "CODESTORAGE_REPACK_THRESHOLD"
@@ -125,6 +141,18 @@ const (
 	// while still bounding the packs/ growth a single repo-scoped
 	// git:write token can inflict (issue #21).
 	defaultPackQuotaBytes = int64(10) << 30
+
+	// defaultLFSStagingBytes is the default node-wide LFS upload staging
+	// budget (issue #51). Sized as a WORKING SET, not an object-size cap
+	// (Codex round 38): per-repository byte fairness caps a single
+	// repository's staged hold at budget/(div+1) of the free budget
+	// (githttp's lfsRepoStagingByteShareDiv, div 2), so supporting an
+	// object of size S needs a budget of about (div+1)·S — no budget
+	// equal to the largest object can both stage that object and reserve
+	// capacity for other repositories. 32 GiB keeps one
+	// default-quota-sized (10 GiB) object stageable (32/3 ≈ 10.7 GiB)
+	// with cross-repo capacity intact.
+	defaultLFSStagingBytes = int64(32) << 30
 
 	// defaultPackReservationTTL clears a default-quota-sized (10 GiB)
 	// upload at ~3 MB/s before a live reservation can expire (issue #29).
@@ -206,6 +234,9 @@ type serveConfig struct {
 	// RemoteAddr-only keying (the default).
 	trustedProxies []netip.Prefix
 
+	// lfsStagingBytes caps aggregate in-flight LFS upload staging per
+	// replica (issue #51); 0 disables.
+	lfsStagingBytes int64
 	// packQuotaBytes is the per-repo pack-bytes quota on the git surface
 	// (issue #21); 0 disables enforcement.
 	packQuotaBytes int64
@@ -246,6 +277,7 @@ type sweepSettings struct {
 	ageThreshold     time.Duration // > 0
 	deleteEnabled    bool          // false = list-only (the default)
 	deleteSuperseded bool          // true = reap provably-folded blobs (the default, issue #31)
+	deleteLFS        bool          // false = list-only for LFS orphans (the default, issue #51)
 }
 
 // storageURLs is the resolved storage location set shared by every
@@ -351,6 +383,10 @@ func resolveServeConfig(getenv func(string) string, flagListen, flagAddr, flagCa
 		return serveConfig{}, err
 	}
 	cfg.packReservationTTL, err = resolvePackReservationTTL(getenv)
+	if err != nil {
+		return serveConfig{}, err
+	}
+	cfg.lfsStagingBytes, err = resolveLFSStagingBytes(getenv)
 	if err != nil {
 		return serveConfig{}, err
 	}
@@ -550,7 +586,11 @@ func resolveVerifySigBudget(getenv func(string) string) (int, error) {
 // resolvePackReservationTTL parses CODESTORAGE_PACK_RESERVATION_TTL
 // (issue #29). Fail-fast: malformed or non-positive values error naming the
 // env var (a zero TTL would expire live reservations instantly, silently
-// reopening the overshoot). Unset applies the one-hour default.
+// reopening the overshoot), and the TTL must strictly exceed the
+// usage-floor cache lifetime (Codex round 36 on #51: at or below it, a
+// cached floor outlives the reservations covering objects published after
+// that listing — see githttp.MinPackReservationTTL). Unset applies the
+// one-hour default.
 func resolvePackReservationTTL(getenv func(string) string) (time.Duration, error) {
 	assertf(getenv != nil, "resolvePackReservationTTL: nil getenv")
 	raw := getenv(envPackReservationTTL)
@@ -561,10 +601,31 @@ func resolvePackReservationTTL(getenv func(string) string) (time.Duration, error
 	if err != nil {
 		return 0, fmt.Errorf("%s: %w", envPackReservationTTL, err)
 	}
-	if d <= 0 {
-		return 0, fmt.Errorf("%s must be positive, got %q", envPackReservationTTL, raw)
+	if d <= githttp.MinPackReservationTTL {
+		return 0, fmt.Errorf("%s must exceed the %v usage-floor freshness budget (cache lifetime + admission handoff margin), got %q",
+			envPackReservationTTL, githttp.MinPackReservationTTL, raw)
 	}
 	return d, nil
+}
+
+// resolveLFSStagingBytes parses CODESTORAGE_LFS_STAGING_BYTES (issue #51):
+// the node-wide cap on bytes of proxy LFS uploads staging on this replica
+// at once. Fail-fast like resolvePackQuota; unset applies the default, an
+// explicit "0" disables the bound.
+func resolveLFSStagingBytes(getenv func(string) string) (int64, error) {
+	assertf(getenv != nil, "resolveLFSStagingBytes: nil getenv")
+	raw := getenv(envLFSStagingBytes)
+	if raw == "" {
+		return defaultLFSStagingBytes, nil
+	}
+	v, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("%s: %w", envLFSStagingBytes, err)
+	}
+	if v < 0 {
+		return 0, fmt.Errorf("%s must be non-negative (0 disables the staging bound), got %q", envLFSStagingBytes, raw)
+	}
+	return v, nil
 }
 
 // resolveSweepSettings parses the orphan-pack sweep env vars. Fail-fast
@@ -609,6 +670,13 @@ func resolveSweepSettings(getenv func(string) string) (sweepSettings, error) {
 			return sweepSettings{}, fmt.Errorf("%s: %w", envSweepDeleteSuperseded, err)
 		}
 		s.deleteSuperseded = v
+	}
+	if raw := getenv(envSweepDeleteLFS); raw != "" {
+		v, err := strconv.ParseBool(raw)
+		if err != nil {
+			return sweepSettings{}, fmt.Errorf("%s: %w", envSweepDeleteLFS, err)
+		}
+		s.deleteLFS = v
 	}
 	return s, nil
 }

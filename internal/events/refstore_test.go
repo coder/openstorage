@@ -52,10 +52,21 @@ func (f *fakeInner) ReplacePacks(context.Context, string, []ref.Pack, ref.Pack) 
 func (f *fakeInner) ListPacks(context.Context, string) ([]ref.Pack, error) { return nil, nil }
 func (f *fakeInner) HasPack(context.Context, string, string) (bool, error) { return false, nil }
 func (f *fakeInner) GetGeneration(context.Context, string) (int64, error)  { return 0, nil }
-func (f *fakeInner) ReservePackBytes(context.Context, []string, []ref.Pack, string, int64, int64, time.Duration) (ref.ReserveDecision, error) {
+func (f *fakeInner) TryAdoptionClaim(context.Context, string, string) (bool, string, error) {
+	return true, "o", nil
+}
+
+func (f *fakeInner) RenewAdoptionClaim(context.Context, string, string) (bool, error) {
+	return true, nil
+}
+
+func (f *fakeInner) ReleaseAdoptionClaim(context.Context, string, string) error {
+	return nil
+}
+
+func (f *fakeInner) ReservePackBytes(context.Context, []string, []ref.Pack, string, int64, int64, int64, time.Duration) (ref.ReserveDecision, error) {
 	return ref.ReserveDecision{OK: true}, nil
 }
-func (f *fakeInner) ReleasePackReservations(context.Context, []string, string) error { return nil }
 func (f *fakeInner) SweepExpiredPackReservations(context.Context, time.Duration) (int64, error) {
 	return 0, nil
 }
@@ -64,6 +75,25 @@ func (f *fakeInner) IsRetainedPack(context.Context, string, string) (bool, error
 }
 func (f *fakeInner) ReclaimRetainedPack(context.Context, string, string) (int64, error) {
 	return 0, nil
+}
+func (f *fakeInner) RegisterLFSObject(context.Context, string, string, int64) error { return nil }
+func (f *fakeInner) HasLFSObject(context.Context, string, string) (bool, error) {
+	return false, nil
+}
+func (f *fakeInner) CountLFSObjects(context.Context, string) (int64, error) { return 0, nil }
+func (f *fakeInner) BumpLFSAdoptionGen(context.Context, string) error       { return nil }
+func (f *fakeInner) RegisterAdoptedLFSObject(context.Context, string, string, int64) error {
+	return nil
+}
+func (f *fakeInner) LFSAdoptionGen(context.Context, string) (int64, error) { return 0, nil }
+func (f *fakeInner) GuardedLFSDelete(context.Context, string, string, func(context.Context) error) (bool, error) {
+	return false, nil
+}
+func (f *fakeInner) QuotaLedgerState(context.Context, []string, time.Duration, ...string) (ref.PackQuotaLedgerState, error) {
+	return ref.PackQuotaLedgerState{}, nil
+}
+func (f *fakeInner) RetirePackAttempts(context.Context, []string, map[string]string) error {
+	return nil
 }
 
 type fakeRepos struct {

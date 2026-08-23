@@ -57,12 +57,20 @@ func (s *countingStore) ReplacePacks(context.Context, string, []ref.Pack, ref.Pa
 	panic("Hydrate must never replace packs")
 }
 
-func (s *countingStore) ReservePackBytes(context.Context, []string, []ref.Pack, string, int64, int64, time.Duration) (ref.ReserveDecision, error) {
-	panic("Hydrate must never reserve pack bytes")
+func (s *countingStore) TryAdoptionClaim(context.Context, string, string) (bool, string, error) {
+	return true, "o", nil
 }
 
-func (s *countingStore) ReleasePackReservations(context.Context, []string, string) error {
-	panic("Hydrate must never release pack reservations")
+func (s *countingStore) RenewAdoptionClaim(context.Context, string, string) (bool, error) {
+	return true, nil
+}
+
+func (s *countingStore) ReleaseAdoptionClaim(context.Context, string, string) error {
+	return nil
+}
+
+func (s *countingStore) ReservePackBytes(context.Context, []string, []ref.Pack, string, int64, int64, int64, time.Duration) (ref.ReserveDecision, error) {
+	panic("Hydrate must never reserve pack bytes")
 }
 
 func (s *countingStore) SweepExpiredPackReservations(context.Context, time.Duration) (int64, error) {
@@ -75,6 +83,42 @@ func (s *countingStore) IsRetainedPack(context.Context, string, string) (bool, e
 
 func (s *countingStore) ReclaimRetainedPack(context.Context, string, string) (int64, error) {
 	panic("Hydrate must never reclaim retained packs")
+}
+
+func (s *countingStore) RegisterLFSObject(context.Context, string, string, int64) error {
+	panic("Hydrate must never register LFS objects")
+}
+
+func (s *countingStore) HasLFSObject(context.Context, string, string) (bool, error) {
+	panic("Hydrate must never read LFS objects")
+}
+
+func (s *countingStore) CountLFSObjects(context.Context, string) (int64, error) {
+	panic("Hydrate must never count LFS objects")
+}
+
+func (s *countingStore) GuardedLFSDelete(context.Context, string, string, func(context.Context) error) (bool, error) {
+	panic("Hydrate must never delete LFS blobs")
+}
+
+func (s *countingStore) BumpLFSAdoptionGen(context.Context, string) error {
+	panic("Hydrate must never bump the adoption generation")
+}
+
+func (s *countingStore) RegisterAdoptedLFSObject(context.Context, string, string, int64) error {
+	panic("Hydrate must never adopt LFS objects")
+}
+
+func (s *countingStore) LFSAdoptionGen(context.Context, string) (int64, error) {
+	panic("Hydrate must never read the adoption generation")
+}
+
+func (s *countingStore) QuotaLedgerState(context.Context, []string, time.Duration, ...string) (ref.PackQuotaLedgerState, error) {
+	panic("Hydrate must never read the quota ledger")
+}
+
+func (s *countingStore) RetirePackAttempts(context.Context, []string, map[string]string) error {
+	panic("Hydrate must never retire pack reservations")
 }
 
 func (s *countingStore) ListRefs(context.Context, string) (map[string]string, error) {

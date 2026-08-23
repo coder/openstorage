@@ -41,7 +41,7 @@ import (
 // mux.Handle("/api/", h). refStore/blobStore/cacheDir back the
 // git:read endpoints — serve passes the same instances the githttp fallback
 // uses so both surfaces share one cache.
-func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL, loopbackBaseURL string, orgPEMBlocks []string, refStore ref.RefStore, blobStore blob.BlobStore, cacheDir string, rate api.RateLimitConfig, packQuotaBytes int64, packReservationTTL time.Duration, sweep sweepSettings, repackThreshold int, webhookAllowPrivate bool, secretsCodec *secrets.Codec) (http.Handler, meta.Store, auth.Verifier, func(ctx context.Context, repo string), func(), error) {
+func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL, loopbackBaseURL string, orgPEMBlocks []string, refStore ref.RefStore, blobStore blob.BlobStore, cacheDir string, rate api.RateLimitConfig, packQuotaBytes int64, packReservationTTL time.Duration, sweep sweepSettings, repackThreshold int, webhookAllowPrivate bool, secretsCodec *secrets.Codec, usageFloor func(context.Context, string) (int64, int64, error)) (http.Handler, meta.Store, auth.Verifier, func(ctx context.Context, repo string), func(), error) {
 	assertf(dbURL != "" && org != "" && httpBaseURL != "" && len(orgPEMBlocks) > 0, "buildAPIHandler: missing dbURL/org/httpBaseURL/keys")
 	assertf(loopbackBaseURL != "", "buildAPIHandler: missing loopbackBaseURL")
 	assertf(refStore != nil && blobStore != nil && cacheDir != "", "buildAPIHandler: missing refStore/blobStore/cacheDir")
@@ -91,7 +91,7 @@ func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL, loopbackBaseU
 	// listing is a read, no events to emit — and the shared blob store.
 	// interval 0 disables the periodic schedule; nil schedule keeps both
 	// queue backends inert.
-	if sweep.deleteEnabled && sweep.interval > 0 {
+	if (sweep.deleteEnabled || sweep.deleteLFS) && sweep.interval > 0 {
 		// Versioned S3 buckets break delete-mode invariants: Delete only
 		// writes a delete marker while every pack and quarantine version
 		// stays stored and billed, so sweeps would report reclaimed bytes
@@ -102,13 +102,17 @@ func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL, loopbackBaseU
 		// schedule: interval zero (the emergency stop) runs only the
 		// strictly restorative Heal, so nothing destructive needs this
 		// validation and the stop switch must never be blocked by it.
+		deleteFlag := envSweepDeleteEnabled
+		if !sweep.deleteEnabled {
+			deleteFlag = envSweepDeleteLFS
+		}
 		if s3store, ok := blobStore.(*blob.S3); ok {
 			versioned, err := s3store.VersioningEnabled(ctx)
 			switch {
 			case err != nil:
-				return fail(fmt.Errorf("%s: cannot verify bucket versioning (grant s3:GetBucketVersioning, or keep the sweeper list-only): %w", envSweepDeleteEnabled, err))
+				return fail(fmt.Errorf("%s: cannot verify bucket versioning (grant s3:GetBucketVersioning, or keep the sweeper list-only): %w", deleteFlag, err))
 			case versioned:
-				return fail(fmt.Errorf("%s: bucket has S3 versioning enabled or suspended; delete-mode sweeps only write delete markers there (add a noncurrent-version lifecycle policy, or keep the sweeper list-only)", envSweepDeleteEnabled))
+				return fail(fmt.Errorf("%s: bucket has S3 versioning enabled or suspended; delete-mode sweeps only write delete markers there (add a noncurrent-version lifecycle policy, or keep the sweeper list-only)", deleteFlag))
 			}
 		}
 	}
@@ -116,11 +120,16 @@ func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL, loopbackBaseU
 		Threshold:        sweep.ageThreshold,
 		Delete:           sweep.deleteEnabled,
 		DeleteSuperseded: sweep.deleteSuperseded,
+		DeleteLFS:        sweep.deleteLFS,
+		// Quarantine restores take cover reservations + generation
+		// bumps only when quota admission actually consults them
+		// (Codex round 73).
+		QuotaEnforced: packQuotaBytes > 0,
 		// The sweep prunes crash-leaked admission reservations (issue #29)
 		// on its cadence with the same TTL the write gates charge.
 		ReservationTTL: packReservationTTL,
 	}
-	if s3store, ok := blobStore.(*blob.S3); ok && (sweep.deleteEnabled || sweep.deleteSuperseded) {
+	if s3store, ok := blobStore.(*blob.S3); ok && (sweep.deleteEnabled || sweep.deleteSuperseded || sweep.deleteLFS) {
 		// Versioning can be enabled on the bucket while the process runs,
 		// silently turning startup's validation stale; every delete-mode
 		// sweep re-checks and downgrades itself to list-only on drift or
@@ -207,6 +216,10 @@ func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL, loopbackBaseU
 		// pre-receive (issue #21): REST pack writers must not bypass it.
 		PackQuotaBytes:     packQuotaBytes,
 		PackReservationTTL: packReservationTTL,
+		// Shared single-flight cached admission floor (issue #51, Codex
+		// round 21): REST pack writers must not re-list the repo's pack
+		// and LFS prefixes on every write.
+		UsageFloor: usageFloor,
 		// Webhook registration-time SSRF courtesy check (issue #53);
 		// the delivery workers got the same flag via buildServeEventing.
 		WebhookAllowPrivate: webhookAllowPrivate,

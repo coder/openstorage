@@ -605,6 +605,127 @@ func TestResolveServeConfigPackQuota(t *testing.T) {
 	}
 }
 
+// TestResolveServeConfigPackReservationTTL (issue #29; floor-cache bound
+// added in Codex round 36 on #51): the reservation TTL must STRICTLY
+// exceed the usage-floor cache lifetime (githttp.MinPackReservationTTL) —
+// with a TTL at or below it, a cached floor can outlive the reservations
+// covering objects published after that listing, and a subsequent writer
+// sees neither the orphaned bytes nor a live reservation.
+func TestResolveServeConfigPackReservationTTL(t *testing.T) {
+	base := func(extra map[string]string) func(string) string {
+		env := map[string]string{
+			"CODESTORAGE_PG_URL":      "postgres://x",
+			"CODESTORAGE_S3_URL":      "s3://x",
+			"CODESTORAGE_ORG":         "org1",
+			"CODESTORAGE_ORG_PUBKEYS": "/tmp/org.pub.pem",
+		}
+		for k, v := range extra {
+			env[k] = v
+		}
+		return mapEnv(env)
+	}
+
+	t.Run("unset-applies-default", func(t *testing.T) {
+		cfg, err := resolveServeConfig(base(nil), "", "", "/tmp/cache", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.packReservationTTL != defaultPackReservationTTL {
+			t.Fatalf("unset TTL resolved to %v, want default %v", cfg.packReservationTTL, defaultPackReservationTTL)
+		}
+	})
+
+	t.Run("parse-through", func(t *testing.T) {
+		cfg, err := resolveServeConfig(base(map[string]string{envPackReservationTTL: "61s"}), "", "", "/tmp/cache", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.packReservationTTL != 61*time.Second {
+			t.Fatalf("resolved TTL %v, want 61s", cfg.packReservationTTL)
+		}
+	})
+
+	for _, tc := range []struct{ name, val string }{
+		{"malformed", "plenty"},
+		{"zero", "0"},
+		{"negative", "-5m"},
+		{"below-floor-cache", "10s"},
+		{"at-floor-cache-boundary", "30s"},
+		{"inside-handoff-margin", "31s"},
+		{"at-margin-boundary", "60s"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := resolveServeConfig(base(map[string]string{envPackReservationTTL: tc.val}), "", "", "/tmp/cache", "")
+			if err == nil {
+				t.Fatalf("%s=%q resolved without error", envPackReservationTTL, tc.val)
+			}
+			if !strings.Contains(err.Error(), envPackReservationTTL) {
+				t.Fatalf("error %q does not name %s", err, envPackReservationTTL)
+			}
+		})
+	}
+}
+
+func TestResolveServeConfigLFSStaging(t *testing.T) {
+	base := func(extra map[string]string) func(string) string {
+		env := map[string]string{
+			"CODESTORAGE_PG_URL":      "postgres://x",
+			"CODESTORAGE_S3_URL":      "s3://x",
+			"CODESTORAGE_ORG":         "org1",
+			"CODESTORAGE_ORG_PUBKEYS": "/tmp/org.pub.pem",
+		}
+		for k, v := range extra {
+			env[k] = v
+		}
+		return mapEnv(env)
+	}
+
+	t.Run("unset-applies-default", func(t *testing.T) {
+		cfg, err := resolveServeConfig(base(nil), "", "", "/tmp/cache", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.lfsStagingBytes != defaultLFSStagingBytes {
+			t.Fatalf("unset staging budget resolved to %d, want default %d", cfg.lfsStagingBytes, defaultLFSStagingBytes)
+		}
+	})
+
+	t.Run("explicit-zero-disables", func(t *testing.T) {
+		cfg, err := resolveServeConfig(base(map[string]string{envLFSStagingBytes: "0"}), "", "", "/tmp/cache", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.lfsStagingBytes != 0 {
+			t.Fatalf("explicit zero resolved to %d, want 0 (disabled)", cfg.lfsStagingBytes)
+		}
+	})
+
+	t.Run("parse-through", func(t *testing.T) {
+		cfg, err := resolveServeConfig(base(map[string]string{envLFSStagingBytes: "1048576"}), "", "", "/tmp/cache", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.lfsStagingBytes != 1<<20 {
+			t.Fatalf("resolved staging budget %d, want %d", cfg.lfsStagingBytes, 1<<20)
+		}
+	})
+
+	for _, tc := range []struct{ name, val string }{
+		{"malformed", "plenty"},
+		{"negative", "-1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := resolveServeConfig(base(map[string]string{envLFSStagingBytes: tc.val}), "", "", "/tmp/cache", "")
+			if err == nil {
+				t.Fatalf("%s=%q resolved without error", envLFSStagingBytes, tc.val)
+			}
+			if !strings.Contains(err.Error(), envLFSStagingBytes) {
+				t.Fatalf("error %q does not name %s", err, envLFSStagingBytes)
+			}
+		})
+	}
+}
+
 func TestResolveServeConfigMaxPushBytes(t *testing.T) {
 	base := func(extra map[string]string) func(string) string {
 		env := map[string]string{
@@ -804,11 +925,12 @@ func TestResolveServeConfigSweep(t *testing.T) {
 			envSweepAgeThreshold:     "48h",
 			envSweepDeleteEnabled:    "true",
 			envSweepDeleteSuperseded: "false",
+			envSweepDeleteLFS:        "true",
 		}), "", "", "/tmp/cache", "")
 		if err != nil {
 			t.Fatal(err)
 		}
-		want := sweepSettings{interval: 30 * time.Minute, ageThreshold: 48 * time.Hour, deleteEnabled: true}
+		want := sweepSettings{interval: 30 * time.Minute, ageThreshold: 48 * time.Hour, deleteEnabled: true, deleteLFS: true}
 		if cfg.sweep != want {
 			t.Fatalf("sweep = %+v, want %+v", cfg.sweep, want)
 		}
@@ -832,6 +954,7 @@ func TestResolveServeConfigSweep(t *testing.T) {
 			"zero threshold":      {envSweepAgeThreshold: "0"},
 			"negative threshold":  {envSweepAgeThreshold: "-24h"},
 			"malformed delete":    {envSweepDeleteEnabled: "yes please"},
+			"malformed lfs":       {envSweepDeleteLFS: "sure"},
 		}
 		for name, extra := range cases {
 			t.Run(name, func(t *testing.T) {

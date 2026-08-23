@@ -170,8 +170,9 @@ published ports ([configuration reference](docs/reference/configuration.md)).
   commit-signature verification ([git protocol](docs/explanation/git-protocol-and-namespaces.md)),
   behind the same per-org JWT verifier as the API
   ([auth spec](docs/reference/authentication.md)).
-- **Git LFS on the same remote** — no separate LFS server: presigned S3/MinIO transfers,
-  server-proxied in local mode ([git protocol](docs/explanation/git-protocol-and-namespaces.md)).
+- **Git LFS on the same remote** — no separate LFS server: presigned S3/MinIO downloads
+  (server-proxied in local mode) and verified, quota-metered server-proxied uploads
+  ([git protocol](docs/explanation/git-protocol-and-namespaces.md)).
 - **Eventing & sync**: HMAC-signed `push` / `repo.sync.*` webhooks, webhook +
   git-credential CRUD, upstream mirror sync, synchronous forking
   ([webhooks](docs/reference/webhooks.md)).

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -44,6 +45,45 @@ type server struct {
 	// packReservationTTL bounds how long a crashed writer's quota
 	// reservation gates admission (issue #29, ref/ledger.go).
 	packReservationTTL time.Duration
+	// usageFloorFn resolves the pack-admission usage floor (Config.
+	// UsageFloor); nil falls back to a fresh listing per write.
+	usageFloorFn func(ctx context.Context, repo string) (int64, int64, error)
+}
+
+// usageFloor resolves the pack-admission UNCOUNTED-bytes floor: the serve
+// command wires the git server's shared single-flight cached measurement
+// (Codex round 21 — a fresh listing per REST pack write re-scans the
+// repo's pack and LFS prefixes, ~100 pages per write at the LFS object
+// cap). Staleness is safe for the FLOOR: registered bytes are covered by
+// the ledger counter and in-flight writes by reservations; the floor
+// exists for pre-ledger and orphaned bytes (see
+// githttp.Server.CachedUsageFloor). Direct construction without the
+// wiring keeps a fresh measurement: the counter is read BEFORE the
+// listing (the conservative ordering — Codex round 44) and subtracted
+// like every other floor producer, because ReservePackBytes SUMS the
+// floor with its live counter — a raw listing would double-charge every
+// registered byte (Codex round 45).
+func (s *server) usageFloor(ctx context.Context, repo string) (int64, int64, error) {
+	if s.usageFloorFn != nil {
+		return s.usageFloorFn(ctx, repo)
+	}
+	// The generation is read BEFORE the measurement (Codex round 60):
+	// any restore, adoption, or debit committing after this read moves
+	// the generation, and ReservePackBytes' transactional recheck then
+	// rejects the floor rather than admitting against it.
+	gen, err := s.refStore.LFSAdoptionGen(ctx, githttp.BaseRepo(repo))
+	if err != nil {
+		return 0, 0, fmt.Errorf("floor gen read: %w", err)
+	}
+	ls, err := s.refStore.QuotaLedgerState(ctx, blob.QuotaRepoGroup(repo), time.Hour)
+	if err != nil {
+		return 0, 0, fmt.Errorf("usage counter read: %w", err)
+	}
+	listing, err := blob.StorageUsageBytes(ctx, s.blobStore, repo)
+	if err != nil {
+		return 0, 0, err
+	}
+	return max(0, listing-ls.UsageBytes), gen, nil
 }
 
 // triggerRepack runs the repack-threshold check after a successful pack

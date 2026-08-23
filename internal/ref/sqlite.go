@@ -98,12 +98,22 @@ func (s *SQLite) InitSchema(ctx context.Context) error {
 		// statement (sqliteEpochMS), matching the admission predicate.
 		`CREATE TABLE IF NOT EXISTS pack_reservations (key TEXT PRIMARY KEY, repo TEXT NOT NULL,
 		                                               bytes INTEGER NOT NULL, owner TEXT NOT NULL,
-		                                               created_at INTEGER NOT NULL)`,
+		                                               created_at INTEGER NOT NULL,
+		                                               attempts INTEGER NOT NULL DEFAULT 1,
+		                                               gen TEXT NOT NULL DEFAULT '')`,
 		`CREATE INDEX IF NOT EXISTS pack_reservations_repo ON pack_reservations (repo)`,
 		`CREATE TABLE IF NOT EXISTS pack_retained (repo TEXT, key TEXT, bytes INTEGER NOT NULL,
 		                                           superseded_at INTEGER NOT NULL DEFAULT (unixepoch()),
 		                                           PRIMARY KEY (repo, key))`,
 		`CREATE TABLE IF NOT EXISTS pack_usage (repo TEXT PRIMARY KEY, bytes INTEGER NOT NULL DEFAULT 0)`,
+		// Registered LFS objects (issue #51): the LFS sweep registry and
+		// quota settle record — see the PG DDL for the rationale.
+		`CREATE TABLE IF NOT EXISTS lfs_objects (repo TEXT, key TEXT, bytes INTEGER NOT NULL,
+		                                         created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+		                                         PRIMARY KEY (repo, key))`,
+		// O(1) object-count cap reads — see the PG DDL for the rationale.
+		`CREATE TABLE IF NOT EXISTS lfs_object_counts (repo TEXT PRIMARY KEY, count INTEGER NOT NULL DEFAULT 0)`,
+		`CREATE TABLE IF NOT EXISTS lfs_adoption_gens (repo TEXT PRIMARY KEY, gen INTEGER NOT NULL DEFAULT 0)`,
 	} {
 		if _, err := tx.ExecContext(ctx, stmt); err != nil {
 			return fmt.Errorf("sqlite init schema: %w", err)
@@ -124,6 +134,31 @@ func (s *SQLite) InitSchema(ctx context.Context) error {
 			if _, err := tx.ExecContext(ctx, stmt); err != nil {
 				return fmt.Errorf("sqlite init schema: add refs.created_at: %w", err)
 			}
+		}
+	}
+	// Idempotent additive migration for pre-attempt ledgers (issue #51,
+	// Codex round 30): rows minted by older binaries count as one attempt.
+	var haveAttempts int
+	if err := tx.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM pragma_table_info('pack_reservations') WHERE name = 'attempts'`).Scan(&haveAttempts); err != nil {
+		return fmt.Errorf("sqlite init schema: probe pack_reservations.attempts: %w", err)
+	}
+	if haveAttempts == 0 {
+		if _, err := tx.ExecContext(ctx,
+			`ALTER TABLE pack_reservations ADD COLUMN attempts INTEGER NOT NULL DEFAULT 1`); err != nil {
+			return fmt.Errorf("sqlite init schema: add pack_reservations.attempts: %w", err)
+		}
+	}
+	// gen identifies the row incarnation (Codex round 33) — see the PG DDL.
+	var haveGen int
+	if err := tx.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM pragma_table_info('pack_reservations') WHERE name = 'gen'`).Scan(&haveGen); err != nil {
+		return fmt.Errorf("sqlite init schema: probe pack_reservations.gen: %w", err)
+	}
+	if haveGen == 0 {
+		if _, err := tx.ExecContext(ctx,
+			`ALTER TABLE pack_reservations ADD COLUMN gen TEXT NOT NULL DEFAULT ''`); err != nil {
+			return fmt.Errorf("sqlite init schema: add pack_reservations.gen: %w", err)
 		}
 	}
 	// Generation-bump triggers (issue #4): in SCHEMA, not application code,
@@ -318,6 +353,7 @@ func (s *SQLite) RegisterPacks(ctx context.Context, repo string, packs []Pack) e
 	}
 	defer func() { _ = tx.Rollback() }()
 	var credit int64
+	adopted := false
 	for _, p := range packs {
 		assertf(p.ID != "" && p.Key != "", "RegisterPacks: empty pack id/key %+v", p)
 		res, err := tx.ExecContext(ctx,
@@ -336,9 +372,19 @@ func (s *SQLite) RegisterPacks(ctx context.Context, repo string, packs []Pack) e
 				return err
 			}
 			credit += c
+			adopted = adopted || (p.Adopted && c > 0)
 		}
+		// Settlement consumes BOTH era spellings — see the PG twin.
 		if _, err := tx.ExecContext(ctx,
-			`DELETE FROM pack_reservations WHERE key = ?`, p.Key); err != nil {
+			`DELETE FROM pack_reservations WHERE key IN (?, ?)`, reservRowKey(p.Key), p.Key); err != nil {
+			return err
+		}
+	}
+	if adopted {
+		// Atomic with the credit — see the PG twin (Codex round 53).
+		if _, err := tx.ExecContext(ctx, `
+INSERT INTO lfs_adoption_gens (repo, gen) VALUES (?, 1)
+ON CONFLICT (repo) DO UPDATE SET gen = lfs_adoption_gens.gen + 1`, baseRepoOf(repo)); err != nil {
 			return err
 		}
 	}

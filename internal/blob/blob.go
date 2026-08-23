@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -74,6 +75,17 @@ type BlobStore interface {
 	// Stat returns the size of the object at key; missing objects yield an
 	// error matching ErrNotFound via errors.Is.
 	Stat(ctx context.Context, key string) (int64, error)
+	// StatFingerprint returns the size plus an opaque content-version
+	// fingerprint for the object at key: any overwrite changes it (S3
+	// ETag — content-derived, so an attacker cannot preserve it across a
+	// same-length rewrite; file backends fall back to mtime+size).
+	// Verification flows that hash an object across multiple reads use
+	// fingerprint equality to prove the bytes were not REPLACED between
+	// reads (issue #51, Codex round 77): ranged reads spanning a swap
+	// can splice old-prefix+new-suffix into a digest that matches even
+	// though the stored bytes differ. Missing objects yield an error
+	// matching ErrNotFound via errors.Is.
+	StatFingerprint(ctx context.Context, key string) (int64, string, error)
 	// ReadRange returns exactly the length bytes at offset from the object
 	// at key — a ranged point read, never the whole object (repack fold
 	// selection reads exact object counts from 12-byte pack headers with
@@ -121,7 +133,7 @@ const PacksRoot = "packs/"
 // PackPrefix is the listing prefix for a repo's packs.
 func PackPrefix(repo string) string { return PacksRoot + repo + "/" }
 
-// packUsagePageSize bounds one PackUsageBytes listing page, mirroring the
+// packUsagePageSize bounds one StorageUsageBytes listing page, mirroring the
 // sweeper's page-bounded scans so a pathological pack count cannot balloon
 // memory.
 const packUsagePageSize = 1000
@@ -137,7 +149,7 @@ var packNamespaceSuffixes = []string{"+ephemeral", "+import"}
 // QuotaRepoGroup returns repo's quota accounting group: the BASE repository
 // first (suffix stripped), then every docs/explanation/git-protocol-and-namespaces.md namespace that rolls up under
 // it. The ref-store quota ledger (issue #29) keys reservations under
-// group[0] and sums usage over the whole group, mirroring PackUsageBytes'
+// group[0] and sums usage over the whole group, mirroring StorageUsageBytes'
 // rollup so both usage sources measure the same unit.
 func QuotaRepoGroup(repo string) []string {
 	assertf(repo != "", "QuotaRepoGroup: empty repo")
@@ -154,13 +166,14 @@ func QuotaRepoGroup(repo string) []string {
 	return group
 }
 
-// PackUsageBytes sums the sizes of every object under the pack prefixes of
-// repo's BASE repository and all of its namespaces: registered packs plus
-// not-yet-swept orphans AND retained superseded blobs — the packs/ growth
-// the per-repo quota (issue #21) bounds. The suffix, if any, is stripped
-// first, so every namespace write is measured against the same rolled-up
-// usage. Shared by the pre-receive hook, the REST pack writers, and the
-// git surface's pressure check.
+// StorageUsageBytes sums the sizes of every object under the pack prefixes
+// of repo's BASE repository and all of its namespaces PLUS the repo's LFS
+// prefix (issue #51): registered packs and LFS objects, not-yet-swept
+// orphans, AND retained superseded blobs — exactly the durable growth the
+// per-repo storage quota (issue #21) bounds. The suffix, if any, is
+// stripped first, so every namespace write is measured against the same
+// rolled-up usage. Shared by the pre-receive hook, the REST pack writers,
+// the LFS batch/transfer gates, and the git surface's pressure check.
 //
 // Since issue #29 this listing is the admission check's usage FLOOR rather
 // than its sole source: the ref-store ledger (ref.ReservePackBytes) charges
@@ -168,16 +181,38 @@ func QuotaRepoGroup(repo string) []string {
 // concurrent-push overshoot this listing alone admitted. Retained
 // superseded bytes (issue #31) are counted by BOTH sources — here as
 // lingering prefix objects, there as pack_retained rows — until a sweep
-// reclaims them.
-func PackUsageBytes(ctx context.Context, b BlobStore, repo string) (int64, error) {
-	assertf(b != nil && repo != "", "PackUsageBytes: missing blob store or repo")
+// reclaims them. LFS bytes are likewise counted by both once uploads
+// settle (ref.RegisterLFSObject); before #51's ledger existed, only this
+// listing could see them, which is one more reason the floor stays.
+func StorageUsageBytes(ctx context.Context, b BlobStore, repo string) (int64, error) {
+	assertf(b != nil && repo != "", "StorageUsageBytes: missing blob store or repo")
 	base := QuotaRepoGroup(repo)[0]
-	// Two listings cover base + every namespace without matching sibling
-	// repos: "packs/<base>/" is the base prefix, and "packs/<base>+" only
-	// matches this repo's namespace prefixes ('+' cannot start another
-	// repo's key segment).
+	// Three listings cover base + every namespace + LFS without matching
+	// sibling repos: "packs/<base>/" is the base pack prefix,
+	// "packs/<base>+" only matches this repo's namespace prefixes ('+'
+	// cannot start another repo's key segment), and "lfs/<base>/" is the
+	// shared LFS object space every namespace rolls up to (ADR-35).
+	total, err := usageBytes(ctx, b, repo,
+		[]string{PackPrefix(base), PacksRoot + base + "+", LFSPrefix(base)})
+	assertf(err != nil || total >= 0, "StorageUsageBytes: negative total %d for %s", total, repo)
+	return total, err
+}
+
+// Deliberately NO packs-only floor variant for pack admission (issue #51,
+// Codex rounds 17–18): omitting the LFS prefix from the pack writers'
+// floor let a repository's PRE-LEDGER LFS bytes (rowless, so invisible to
+// the usage counter until adopted) admit a full quota of new packs on top.
+// The full listing per push is the accepted cost: it is bounded by the
+// per-repo LFS object cap (≤ ~101 pages) — the same order as the pack
+// prefix listing this path always did — runs once per heavyweight push
+// (the per-TRANSFER amplification lives on the LFS surface, which caches),
+// and the alternative (a sweeper-reconciled per-repo baseline) requires
+// exactly the per-repo sweep state the sweeper's design forbids.
+
+// usageBytes sums object sizes under the given prefixes, page-bounded.
+func usageBytes(ctx context.Context, b BlobStore, repo string, prefixes []string) (int64, error) {
 	var total int64
-	for _, prefix := range []string{PackPrefix(base), PacksRoot + base + "+"} {
+	for _, prefix := range prefixes {
 		err := b.ListPages(ctx, prefix, packUsagePageSize, func(page []ListedObject) error {
 			for _, o := range page {
 				total += o.Size
@@ -185,10 +220,9 @@ func PackUsageBytes(ctx context.Context, b BlobStore, repo string) (int64, error
 			return nil
 		})
 		if err != nil {
-			return 0, fmt.Errorf("list pack usage for %s: %w", repo, err)
+			return 0, fmt.Errorf("list usage for %s: %w", repo, err)
 		}
 	}
-	assertf(total >= 0, "PackUsageBytes: negative total %d for %s", total, repo)
 	return total, nil
 }
 
@@ -197,7 +231,19 @@ func PackUsageBytes(ctx context.Context, b BlobStore, repo string) (int64, error
 // only, never the objects, which this keying yields automatically.
 func LFSKey(repoID, oid string) string {
 	assertf(repoID != "" && oid != "", "LFSKey(%q, %q)", repoID, oid)
-	return "lfs/" + repoID + "/" + oid
+	return LFSRoot + repoID + "/" + oid
+}
+
+// LFSRoot is the listing prefix covering every repo's LFS objects (the
+// orphan sweeper scans it like PacksRoot, issue #51). LFS keys always use
+// the BASE RepoID (ADR-35): namespaces share one object space, so there is
+// no "+suffix" variant to cover.
+const LFSRoot = "lfs/"
+
+// LFSPrefix is the listing prefix for a repo's LFS objects.
+func LFSPrefix(repoID string) string {
+	assertf(repoID != "", "LFSPrefix: empty repo")
+	return LFSRoot + repoID + "/"
 }
 
 // EnsurePublished re-uploads the local file at path to key when key is
@@ -217,19 +263,315 @@ func LFSKey(repoID, oid string) string {
 // client hanging up right after the commit must not skip the check — a
 // skipped verification could leave the persistent pack row pointing at a
 // blob a concurrent sweep just deleted (Codex round 14).
-func EnsurePublished(ctx context.Context, b BlobStore, key, path string) error {
+//
+// A restore re-materializes bytes the usage counter already includes
+// (Codex round 58): a quota floor scanned during the absence subtracted
+// the full counter from a listing missing them, hiding equally sized
+// rowless legacy bytes. onRestore (nil-ok) runs BEFORE the repair upload
+// so the caller can account the returning bytes first (a cover
+// reservation — see the LFS repair in githttp); an onRestore error aborts
+// the restore, leaving the registered-row-without-bytes state the next
+// retry heals. The returned restored flag tells the caller to invalidate
+// cached floors (bump the shared floor generation) after the bytes are
+// back.
+// onRestored (nil-ok) is the invalidation HANDOFF (Codex round 70): it
+// runs under a live, freshly proven cover and is retried — alternating
+// with cover renewals — until it commits or continuity is lost, so a
+// transient ledger failure cannot strand durable restored bytes with
+// neither cover nor invalidation.
+func EnsurePublished(ctx context.Context, b BlobStore, key, path string, onRestore func(context.Context, int64) error, onRestored func(context.Context) error) (restored bool, err error) {
 	assertf(b != nil && key != "" && path != "", "EnsurePublished(%q, %q)", key, path)
 	fi, err := os.Stat(path)
 	if err != nil {
-		return fmt.Errorf("stat local pack %s: %w", path, err)
+		return false, fmt.Errorf("stat local pack %s: %w", path, err)
 	}
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), ensurePublishedTimeout(fi.Size()))
 	defer cancel()
 	_, err = b.Stat(ctx, key)
 	if errors.Is(err, ErrNotFound) {
-		return b.UploadFile(ctx, key, path)
+		if onRestore == nil {
+			if err := b.UploadFile(ctx, key, path); err != nil {
+				return false, err
+			}
+			if onRestored != nil {
+				hctx, hcancel := context.WithTimeout(context.WithoutCancel(ctx), CoverHandoffTimeout)
+				defer hcancel()
+				if herr := onRestored(hctx); herr != nil {
+					return true, fmt.Errorf("hand off restore of %s: %w", key, herr)
+				}
+			}
+			return true, nil
+		}
+		// The cover must exist BEFORE any byte becomes physical and stay
+		// alive until the stale-floor tail closes (Codex rounds 58+59):
+		// the restore allowance deliberately exceeds the minimum
+		// reservation TTL (repairs must finish), so one reservation
+		// cannot span the upload. WithRenewedCover takes the initial
+		// cover itself (anchored inside its continuity discipline —
+		// Codex round 64), renews it through the upload, and refreshes
+		// it after publication — the refresh restarts the TTL clock,
+		// which the config floor guarantees outlives the last
+		// stale-floor commit (usageCacheTTL + handoff margin past
+		// publication).
+		renew := func(rctx context.Context) error { return onRestore(rctx, fi.Size()) }
+		upErr, renewErr := WithRenewedCover(ctx, renew, func(opCtx context.Context) error {
+			return b.UploadFile(opCtx, key, path)
+		}, onRestored)
+		if upErr != nil {
+			return false, fmt.Errorf("restore %s: %w", key, upErr)
+		}
+		if renewErr != nil {
+			// The bytes ARE durably back — report the restore — but the
+			// invalidation handoff never landed under a live cover
+			// (continuity was lost first): surface it, the caller logs.
+			return true, fmt.Errorf("hand off restore of %s: %w", key, renewErr)
+		}
+		return true, nil
 	}
-	return err
+	return false, err
+}
+
+// staleFloorTail is how long an absence-window floor can remain
+// admissible after publication re-materialized the bytes (a var for
+// tests): deflated floors were scanned while the bytes were absent —
+// strictly before publication ended — and every consumer serves a floor
+// for at most its cache lifetime (30s, githttp usageCacheTTL) plus the
+// admission handoff margin (30s, githttp UsageFloorHandoffMargin). Once
+// this tail passes, no floor that could hide the restored bytes can
+// still commit, and abandoning cover/invalidation repairs becomes safe.
+var staleFloorTail = 60 * time.Second
+
+// CoverHandoffTimeout bounds the floor-generation bump a caller runs
+// after a restore (Codex round 69): the bump must COMMIT while the last
+// cover row still lives, and after a broken tail refresh that row's
+// remaining lifetime can be as short as minTTL − coverLapseBudget ≈ 16s
+// (the loss is reported at covered+budget; the row lives to covered+TTL).
+// Ten seconds fits inside that worst case with slack, and trivially
+// inside the fresh full TTL a successful tail refresh leaves.
+const CoverHandoffTimeout = 10 * time.Second
+
+// coverRenewInterval is WithRenewedCover's renewal cadence (a var for
+// tests). Together with coverRenewTimeout and coverLapseBudget it keeps a
+// restore cover continuously alive under the minimum reservation TTL
+// (61s, see ref.MinPackReservationTTL's config gate): a single failed or
+// stalled renewal still leaves the next attempt committing within the
+// prior success's TTL (20s tick + 20s tick + 10s bound = 50s < 61s).
+var coverRenewInterval = 20 * time.Second
+
+// coverRenewTimeout bounds ONE in-progress renewal attempt (Codex round
+// 62): an unbounded renew stalling on a wedged connection would block the
+// renewal loop past the cover's TTL while the restore upload continues on
+// its own healthy connection.
+var coverRenewTimeout = 10 * time.Second
+
+// coverLapseBudget is how long WithRenewedCover tolerates renewal
+// failures before it must assume the cover row expired and ABORT the
+// publication (Codex round 62): declared strictly before the minimum TTL
+// (45s < 61s) so the abort lands while the last successful renewal still
+// covers the bytes — an uncovered restore must never become physical.
+var coverLapseBudget = 45 * time.Second
+
+// WithRenewedCover runs op while keeping a restore's cover reservation
+// alive (Codex round 59): it takes the initial cover itself (round 64),
+// renews it every coverRenewInterval — each attempt deadline-bounded and
+// continuity-checked — for op's duration, and after op succeeds it
+// alternates fresh cover refreshes with bounded attempts of the caller's
+// handoff (the floor invalidation) until the handoff COMMITS under a
+// live cover or continuity is lost (Codex round 70 — a single
+// best-effort handoff could fail and strand durable bytes with neither
+// cover nor invalidation). Renewal failures are tolerated while a recent
+// success still covers the bytes; once coverLapseBudget passes without
+// one, op's context is canceled — the restore aborts rather than
+// publishing uncovered bytes (Codex round 62). opErr reports op's own
+// failure; renewErr reports a handoff that never landed.
+func WithRenewedCover(ctx context.Context, renew func(context.Context) error, op func(context.Context) error, handoff func(context.Context) error) (opErr, renewErr error) {
+	assertf(renew != nil && op != nil, "WithRenewedCover: nil renew or op")
+	opCtx, opCancel := context.WithCancelCause(ctx)
+	defer opCancel(nil)
+	// covered is the conservative anchor of the newest PROVEN cover row:
+	// each accepted attempt anchors at its own START (the row's
+	// created_at is at or after it). The INITIAL cover is taken inside
+	// this function under the same discipline (Codex round 64): a
+	// caller-side reservation anchored at entry let a process suspension
+	// between the caller's commit and entry fabricate a fresh anchor
+	// over an already-aging row. Written by the renewal goroutine, read
+	// by the final-refresh loop strictly after wg.Wait — no concurrent
+	// access.
+	var covered time.Time
+	// attemptRenew runs ONE bounded, continuity-checked renewal: a
+	// renewal proves continuity only if it COMPLETED while the prior
+	// cover still lived (Codex round 63) — a success committing after
+	// the prior row expired leaves an uncovered gap a stale-floor
+	// admission can use. Completion is an upper bound on the commit
+	// time; the budget is strictly under the minimum TTL, so
+	// completion-before-deadline proves commit-before-expiry. The first
+	// success (no prior cover to prove continuity against) is anchored
+	// at its own conservative start. The context is detached: renewals
+	// are restore accounting, not client work.
+	attemptRenew := func() (ok, lost bool, err error) {
+		start := time.Now()
+		// Each attempt is capped at the REMAINING continuity budget
+		// (Codex round 66): continuity is only checked when renew
+		// returns, so an attempt allowed to run past covered+budget
+		// would leave op uncancelled while the prior cover expires
+		// under it — the full per-attempt timeout applies only while
+		// the budget has that much room.
+		bound := coverRenewTimeout
+		if !covered.IsZero() {
+			remaining := time.Until(covered.Add(coverLapseBudget))
+			if remaining <= 0 {
+				return false, true, errors.New("continuity budget exhausted")
+			}
+			bound = min(bound, remaining)
+		}
+		rctx, rcancel := context.WithTimeout(context.WithoutCancel(ctx), bound)
+		err = renew(rctx)
+		rcancel()
+		if err == nil && (covered.IsZero() || time.Since(covered) <= coverLapseBudget) {
+			covered = start
+			return true, false, nil
+		}
+		return false, !covered.IsZero() && time.Since(covered) > coverLapseBudget, err
+	}
+	// No bytes may become physical before the initial cover commits: an
+	// initial failure aborts before op starts.
+	if ok, _, err := attemptRenew(); !ok {
+		return fmt.Errorf("initial restore cover: %w", err), nil
+	}
+	// renew invocations are strictly serialized: the renewal goroutine is
+	// joined before the final refresh, so callers need no concurrency
+	// handling in the callback.
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		t := time.NewTicker(coverRenewInterval)
+		defer t.Stop()
+		for {
+			// The budget deadline is enforced by its own timer (Codex
+			// round 66): a tick-driven check alone lets the budget
+			// expire BETWEEN ticks (quick failures early, the next tick
+			// scheduled past covered+budget) with op still running while
+			// the prior cover ages out.
+			budget := time.NewTimer(time.Until(covered.Add(coverLapseBudget)))
+			select {
+			case <-done:
+				budget.Stop()
+				return
+			case <-budget.C:
+				opCancel(errors.New("restore cover continuity lost (budget expired without a renewed cover)"))
+				return
+			case <-t.C:
+				budget.Stop()
+				if _, lost, err := attemptRenew(); lost {
+					opCancel(fmt.Errorf("restore cover continuity lost (last renewal: %v)", err))
+					return
+				}
+				// A failed attempt inside the budget: the prior cover
+				// still lives, the next tick retries.
+			}
+		}
+	}()
+	opErr = op(opCtx)
+	close(done)
+	wg.Wait()
+	if opErr != nil {
+		if cause := context.Cause(opCtx); cause != nil && !errors.Is(cause, context.Canceled) {
+			opErr = fmt.Errorf("%w (%v)", opErr, cause)
+		}
+		return opErr, nil
+	}
+	// The MANDATORY tail refresh runs under the SAME continuity
+	// discipline (Codex rounds 60+63, security): it must COMMIT while the
+	// prior cover still lives — a single wide-timeout attempt could
+	// finish after that row expired, and the gap before the caller's
+	// generation bump is exactly the uncovered window a stale-floor
+	// admission exploits. Attempts stay bounded and retry on the renewal
+	// cadence while continuity holds; losing it surfaces renewErr (the
+	// bytes are already durable — the caller reports the broken tail and
+	// still bumps the floor generation).
+	pubEnd := time.Now()
+	attemptHandoff := func() error {
+		if handoff == nil {
+			return nil
+		}
+		hctx, hcancel := context.WithTimeout(context.WithoutCancel(ctx), CoverHandoffTimeout)
+		defer hcancel()
+		return handoff(hctx)
+	}
+	lossRegime := false
+	var gap error // first continuity loss, if any — never forgotten
+	for {
+		ok, lost, err := attemptRenew()
+		if ok {
+			lossRegime = false // a proven cover (or re-cover) is live again
+			// The handoff runs under the freshly proven cover, bounded
+			// so a stalled attempt cannot outlive it (Codex rounds
+			// 69+70). A failure keeps the loop alive: the cover is
+			// renewed and the handoff retried until it commits — the
+			// invalidation must LAND, not be logged away.
+			if herr := attemptHandoff(); herr == nil {
+				// A post-gap success repaired what remained repairable —
+				// future admissions are covered and invalidated — but an
+				// UNCOVERED WINDOW existed and a write settled in it
+				// cannot be revoked (Codex round 73): never report a
+				// gapped restore as clean.
+				if gap != nil {
+					return nil, fmt.Errorf("restore repaired after an uncovered cover gap: %w", gap)
+				}
+				return nil, nil
+			}
+			if wait := min(coverRenewInterval, time.Until(covered.Add(coverLapseBudget))); wait > 0 {
+				time.Sleep(wait)
+			}
+			continue
+		}
+		if lost || lossRegime {
+			// CONTINUITY LOST — but abandoning here is premature (Codex
+			// round 72, security): absence-window floors scanned before
+			// publication stay admissible until pubEnd+staleFloorTail,
+			// and the last cover can expire before they do. Both
+			// repairs remain strictly safety-improving, so keep
+			// attempting through the tail: a handoff success
+			// invalidates every stale floor, a renewal success
+			// re-covers the bytes (the anchor is zeroed so the next
+			// success re-anchors without a false continuity claim —
+			// lossRegime keeps failures in this branch meanwhile). Only
+			// when every floor that could hide the restored bytes has
+			// expired is giving up safe.
+			lossRegime = true
+			if gap == nil {
+				gap = fmt.Errorf("cover continuity lost after publication (last renewal: %v)", err)
+			}
+			if time.Since(pubEnd) > staleFloorTail {
+				return nil, fmt.Errorf("restore handoff abandoned after the stale-floor tail: %w", gap)
+			}
+			// A nil handoff has nothing to land: only a successful
+			// re-cover (above, via the zeroed anchor) or the tail's end
+			// exits the loop.
+			if handoff != nil {
+				if herr := attemptHandoff(); herr == nil {
+					return nil, fmt.Errorf("restore repaired after an uncovered cover gap: %w", gap)
+				}
+			}
+			covered = time.Time{}
+			if wait := min(coverRenewInterval, time.Until(pubEnd.Add(staleFloorTail))); wait > 0 {
+				time.Sleep(wait)
+			}
+			continue
+		}
+		// Wake at the earlier of the retry cadence and the budget
+		// deadline (Codex round 67, security): sleeping a full interval
+		// past covered+budget deferred the loss report to ~T+60 on a
+		// 20s cadence while the budget expired at T+45 — under a
+		// just-over-60s TTL the cover could expire before the caller
+		// learned the tail broke and bumped the floor generation. The
+		// next attempt then reports the exhausted budget immediately.
+		if wait := min(coverRenewInterval, time.Until(covered.Add(coverLapseBudget))); wait > 0 {
+			time.Sleep(wait)
+		}
+	}
 }
 
 // ensurePublishedTimeout bounds EnsurePublished's detached verification.
@@ -413,6 +755,11 @@ func (b *S3) SignedURL(ctx context.Context, key, method string, expiry time.Dura
 // Stat returns the size of the object at key (ErrNotFound when absent).
 func (b *S3) Stat(ctx context.Context, key string) (int64, error) {
 	return bucketStat(ctx, b.bucket, key)
+}
+
+// StatFingerprint — see BlobStore.
+func (b *S3) StatFingerprint(ctx context.Context, key string) (int64, string, error) {
+	return bucketStatFingerprint(ctx, b.bucket, key)
 }
 
 // ReadRange returns exactly the length bytes at offset from the object at

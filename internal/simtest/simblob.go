@@ -135,6 +135,23 @@ func (s *SimBlobStore) Stat(ctx context.Context, key string) (int64, error) {
 	}
 }
 
+// StatFingerprint delegates unless a fault is injected; it shares Stat's
+// fault op — it IS a stat with a version fingerprint attached.
+func (s *SimBlobStore) StatFingerprint(ctx context.Context, key string) (int64, string, error) {
+	switch class := s.inj.begin(OpBlobStat); class {
+	case FaultClean:
+		return 0, "", cleanFaultError{op: OpBlobStat}
+	case FaultAmbiguous:
+		return 0, "", ambiguousFaultError{op: OpBlobStat}
+	case FaultNotFound:
+		return 0, "", notFoundFaultError(OpBlobStat)
+	case FaultNone:
+		return s.inner.StatFingerprint(ctx, key)
+	default:
+		panic(fmt.Sprintf("simtest: fault class %v invalid for %s", class, OpBlobStat))
+	}
+}
+
 // ReadRange delegates unless a fault is injected. It deliberately shares
 // OpBlobStat with Stat rather than adding a fault point: both are the
 // repack selection's per-candidate point reads (size, pack-header object

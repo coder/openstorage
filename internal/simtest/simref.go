@@ -146,26 +146,26 @@ func (s *SimRefStore) HasPack(ctx context.Context, repo, key string) (bool, erro
 // ambiguous fault runs the admission (a reservation row may really be
 // inserted — the leaked-reservation class TTL expiry and the sweeper
 // reclaim) and then loses the outcome.
-func (s *SimRefStore) ReservePackBytes(ctx context.Context, group []string, packs []ref.Pack, owner string, usageFloor, quotaBytes int64, ttl time.Duration) (ref.ReserveDecision, error) {
+func (s *SimRefStore) ReservePackBytes(ctx context.Context, group []string, packs []ref.Pack, owner string, usageFloor, floorGen, quotaBytes int64, ttl time.Duration) (ref.ReserveDecision, error) {
 	switch class := s.inj.begin(OpRefReservePacks); class {
 	case FaultClean:
 		return ref.ReserveDecision{}, cleanFaultError{op: OpRefReservePacks}
 	case FaultAmbiguous:
-		dec, err := s.inner.ReservePackBytes(ctx, group, packs, owner, usageFloor, quotaBytes, ttl)
+		dec, err := s.inner.ReservePackBytes(ctx, group, packs, owner, usageFloor, floorGen, quotaBytes, ttl)
 		s.inj.noteInnerOutcome(OpRefReservePacks, fmt.Sprintf("ok=%v err=%v", dec.OK, err))
 		return ref.ReserveDecision{}, ambiguousFaultError{op: OpRefReservePacks}
 	case FaultNone:
-		return s.inner.ReservePackBytes(ctx, group, packs, owner, usageFloor, quotaBytes, ttl)
+		return s.inner.ReservePackBytes(ctx, group, packs, owner, usageFloor, floorGen, quotaBytes, ttl)
 	default:
 		panic(fmt.Sprintf("simtest: fault class %v invalid for %s", class, OpRefReservePacks))
 	}
 }
 
-// ReleasePackReservations delegates to the inner store (no fault point: the
-// release path's failure mode — a leaked reservation — is exactly what the
-// crash ops and TTL expiry already exercise).
-func (s *SimRefStore) ReleasePackReservations(ctx context.Context, keys []string, owner string) error {
-	return s.inner.ReleasePackReservations(ctx, keys, owner)
+// RetirePackAttempts delegates to the inner store (no fault point: a
+// failed retire only leaves a TTL-expiring row, exactly what the crash ops
+// already exercise).
+func (s *SimRefStore) RetirePackAttempts(ctx context.Context, group []string, gens map[string]string) error {
+	return s.inner.RetirePackAttempts(ctx, group, gens)
 }
 
 // SweepExpiredPackReservations delegates to the inner store.
@@ -181,6 +181,63 @@ func (s *SimRefStore) IsRetainedPack(ctx context.Context, repo, key string) (boo
 // ReclaimRetainedPack delegates to the inner store.
 func (s *SimRefStore) ReclaimRetainedPack(ctx context.Context, repo, key string) (int64, error) {
 	return s.inner.ReclaimRetainedPack(ctx, repo, key)
+}
+
+// RegisterAdoptedLFSObject delegates to the inner store.
+func (s *SimRefStore) RegisterAdoptedLFSObject(ctx context.Context, repo, key string, bytes int64) error {
+	return s.inner.RegisterAdoptedLFSObject(ctx, repo, key, bytes)
+}
+
+// BumpLFSAdoptionGen delegates to the inner store.
+func (s *SimRefStore) BumpLFSAdoptionGen(ctx context.Context, repo string) error {
+	return s.inner.BumpLFSAdoptionGen(ctx, repo)
+}
+
+// LFSAdoptionGen delegates to the inner store.
+func (s *SimRefStore) LFSAdoptionGen(ctx context.Context, repo string) (int64, error) {
+	return s.inner.LFSAdoptionGen(ctx, repo)
+}
+
+// RegisterLFSObject delegates to the inner store (the DST does not model
+// LFS transfers yet; delegation keeps the interface honest without adding
+// an unexercised fault point).
+func (s *SimRefStore) RegisterLFSObject(ctx context.Context, repo, key string, bytes int64) error {
+	return s.inner.RegisterLFSObject(ctx, repo, key, bytes)
+}
+
+// HasLFSObject delegates to the inner store.
+func (s *SimRefStore) HasLFSObject(ctx context.Context, repo, key string) (bool, error) {
+	return s.inner.HasLFSObject(ctx, repo, key)
+}
+
+// QuotaLedgerState delegates to the inner store (oracle reads).
+func (s *SimRefStore) QuotaLedgerState(ctx context.Context, group []string, ttl time.Duration, excludeKeys ...string) (ref.PackQuotaLedgerState, error) {
+	return s.inner.QuotaLedgerState(ctx, group, ttl, excludeKeys...)
+}
+
+// TryAdoptionClaim / ReleaseAdoptionClaim pass through without fault
+// injection: adoption claims are an advisory cross-replica dedup (Codex
+// security round 73), not lifecycle state the oracle models.
+func (s *SimRefStore) TryAdoptionClaim(ctx context.Context, repo, key string) (bool, string, error) {
+	return s.inner.TryAdoptionClaim(ctx, repo, key)
+}
+
+func (s *SimRefStore) RenewAdoptionClaim(ctx context.Context, key, owner string) (bool, error) {
+	return s.inner.RenewAdoptionClaim(ctx, key, owner)
+}
+
+func (s *SimRefStore) ReleaseAdoptionClaim(ctx context.Context, key, owner string) error {
+	return s.inner.ReleaseAdoptionClaim(ctx, key, owner)
+}
+
+// GuardedLFSDelete delegates to the inner store.
+func (s *SimRefStore) GuardedLFSDelete(ctx context.Context, repo, key string, del func(context.Context) error) (bool, error) {
+	return s.inner.GuardedLFSDelete(ctx, repo, key, del)
+}
+
+// CountLFSObjects delegates to the inner store.
+func (s *SimRefStore) CountLFSObjects(ctx context.Context, repo string) (int64, error) {
+	return s.inner.CountLFSObjects(ctx, repo)
 }
 
 // GetGeneration delegates to the inner store unless a fault is injected.

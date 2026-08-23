@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -344,18 +345,59 @@ func TestEnsurePublished(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := EnsurePublished(ctx, b, key, src); err != nil {
-		t.Fatalf("EnsurePublished(present): %v", err)
+	// Present: no restore, and onRestore must NOT run (it accounts quota
+	// bytes — a false invocation would reserve for bytes never absent).
+	restored, err := EnsurePublished(ctx, b, key, src, func(context.Context, int64) error {
+		t.Fatal("onRestore ran for a present blob")
+		return nil
+	}, nil)
+	if err != nil || restored {
+		t.Fatalf("EnsurePublished(present) = (%v, %v), want (false, nil)", restored, err)
 	}
 	if err := b.Delete(ctx, key); err != nil {
 		t.Fatal(err)
 	}
-	if err := EnsurePublished(ctx, b, key, src); err != nil {
-		t.Fatalf("EnsurePublished(missing): %v", err)
+	// Missing: onRestore runs BEFORE the upload (the cover must exist by
+	// the time the bytes become physical — Codex round 58) with the local
+	// file's size, the restore is reported, and a post-publication
+	// refresh follows (Codex round 59) once the bytes are back.
+	coverCalls := 0
+	restored, err = EnsurePublished(ctx, b, key, src, func(cctx context.Context, size int64) error {
+		coverCalls++
+		if size != int64(len("pack-bytes")) {
+			t.Fatalf("onRestore size = %d, want %d", size, len("pack-bytes"))
+		}
+		if coverCalls == 1 {
+			// The initial cover must precede publication.
+			if _, serr := b.Stat(cctx, key); !errors.Is(serr, ErrNotFound) {
+				t.Fatalf("bytes already physical when the initial cover ran (stat: %v)", serr)
+			}
+		}
+		return nil
+	}, nil)
+	if err != nil || !restored || coverCalls != 2 {
+		t.Fatalf("EnsurePublished(missing) = (%v, %v), onRestore calls %d; want (true, nil), 2 (initial cover + post-publication refresh)", restored, err, coverCalls)
 	}
 	size, err := b.Stat(ctx, key)
 	if err != nil || size != int64(len("pack-bytes")) {
 		t.Fatalf("Stat after re-publish = %d, %v", size, err)
+	}
+	// An onRestore failure ABORTS the restore: uncovered bytes must never
+	// become physical (the retry converges once the cover succeeds).
+	if err := b.Delete(ctx, key); err != nil {
+		t.Fatal(err)
+	}
+	restored, err = EnsurePublished(ctx, b, key, src, func(context.Context, int64) error {
+		return errors.New("cover denied")
+	}, nil)
+	if err == nil || restored {
+		t.Fatalf("EnsurePublished(cover denied) = (%v, %v), want (false, error)", restored, err)
+	}
+	if _, serr := b.Stat(ctx, key); !errors.Is(serr, ErrNotFound) {
+		t.Fatalf("uncovered restore published bytes anyway (stat: %v)", serr)
+	}
+	if _, err := EnsurePublished(ctx, b, key, src, nil, nil); err != nil {
+		t.Fatal(err) // nil onRestore: re-seed for the next case
 	}
 
 	// A canceled request context must not skip the verification: the
@@ -365,11 +407,395 @@ func TestEnsurePublished(t *testing.T) {
 	}
 	canceled, cancel := context.WithCancel(ctx)
 	cancel()
-	if err := EnsurePublished(canceled, b, key, src); err != nil {
+	if _, err := EnsurePublished(canceled, b, key, src, nil, nil); err != nil {
 		t.Fatalf("EnsurePublished(canceled ctx): %v", err)
 	}
 	if _, err := b.Stat(ctx, key); err != nil {
 		t.Fatalf("Stat after canceled-ctx re-publish: %v", err)
+	}
+}
+
+// slowUploadStore delays UploadFile, simulating a restore that outlives a
+// near-minimum reservation TTL (Codex round 59).
+type slowUploadStore struct {
+	BlobStore
+	delay time.Duration
+}
+
+func (s slowUploadStore) UploadFile(ctx context.Context, key, path string) error {
+	select {
+	case <-time.After(s.delay):
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	return s.BlobStore.UploadFile(ctx, key, path)
+}
+
+// TestEnsurePublishedRenewsCoverThroughPublication (Codex round 59): the
+// restore allowance deliberately exceeds the minimum reservation TTL, so
+// one cover reservation cannot span a slow repair upload — the cover
+// could expire mid-restore, letting a stale-floor admission commit before
+// the bytes become physical. The seam must renew the cover through the
+// upload and refresh it once after publication (the restarted TTL clock
+// outlives the last stale-floor commit); a failed post-publication
+// refresh is surfaced WITH the restore reported, so callers still bump
+// the floor generation.
+func TestEnsurePublishedRenewsCoverThroughPublication(t *testing.T) {
+	ctx := context.Background()
+	oldInterval, oldBudget := coverRenewInterval, coverLapseBudget
+	coverRenewInterval, coverLapseBudget = 20*time.Millisecond, 80*time.Millisecond
+	t.Cleanup(func() { coverRenewInterval, coverLapseBudget = oldInterval, oldBudget })
+
+	key := PackKey("r1", "renewed")
+	b := seededFile(t, key, "pack-bytes")
+	src := filepath.Join(t.TempDir(), "src")
+	if err := os.WriteFile(src, []byte("pack-bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Delete(ctx, key); err != nil {
+		t.Fatal(err)
+	}
+
+	slow := slowUploadStore{BlobStore: b, delay: 110 * time.Millisecond}
+	var calls atomic.Int32
+	restored, err := EnsurePublished(ctx, slow, key, src, func(context.Context, int64) error {
+		calls.Add(1)
+		return nil
+	}, nil)
+	if err != nil || !restored {
+		t.Fatalf("EnsurePublished(slow restore) = (%v, %v), want (true, nil)", restored, err)
+	}
+	// 1 initial + ≥2 mid-upload renewals (110ms across 20ms ticks, half
+	// slack for scheduler noise) + 1 post-publication refresh.
+	if n := calls.Load(); n < 4 {
+		t.Fatalf("cover calls = %d, want ≥ 4 (initial + renewals through the upload + post-publication refresh)", n)
+	}
+
+	// Once every renewal fails, continuity runs out MID-UPLOAD and the
+	// restore aborts (Codex rounds 62+63): uncovered bytes must never
+	// become physical.
+	if err := b.Delete(ctx, key); err != nil {
+		t.Fatal(err)
+	}
+	first := true
+	restored, err = EnsurePublished(ctx, slow, key, src, func(context.Context, int64) error {
+		if first {
+			first = false
+			return nil // the initial cover succeeds
+		}
+		return errors.New("ledger unreachable") // every renewal fails
+	}, nil)
+	if restored || err == nil || !strings.Contains(err.Error(), "restore cover continuity lost") {
+		t.Fatalf("EnsurePublished(dead ledger) = (%v, %v), want an aborted, unpublished restore", restored, err)
+	}
+	if _, serr := b.Stat(ctx, key); !errors.Is(serr, ErrNotFound) {
+		t.Fatalf("aborted restore published anyway (stat: %v)", serr)
+	}
+}
+
+// TestWithRenewedCoverAbortsOnLapse (Codex round 62): a renewal stalling
+// past the cover's TTL used to block the renewal loop while the restore
+// upload continued on its own healthy connection — the cover row expired
+// mid-restore and the uncovered bytes still became physical. Each renewal
+// attempt is now deadline-bounded (a stall costs one attempt, not the
+// loop), and once coverLapseBudget passes without a successful renewal
+// the op's context is canceled: an uncovered restore must never publish.
+func TestWithRenewedCoverAbortsOnLapse(t *testing.T) {
+	oldI, oldT, oldB := coverRenewInterval, coverRenewTimeout, coverLapseBudget
+	coverRenewInterval, coverRenewTimeout, coverLapseBudget = 10*time.Millisecond, 5*time.Millisecond, 40*time.Millisecond
+	t.Cleanup(func() { coverRenewInterval, coverRenewTimeout, coverLapseBudget = oldI, oldT, oldB })
+
+	// The initial cover succeeds; every later renewal stalls until its
+	// per-attempt deadline: the loop must keep making (failing) attempts
+	// and abort the op at the budget.
+	initial := true
+	renew := func(rctx context.Context) error {
+		if initial {
+			initial = false
+			return nil
+		}
+		<-rctx.Done()
+		return rctx.Err()
+	}
+	opErr, renewErr := WithRenewedCover(context.Background(), renew, func(opCtx context.Context) error {
+		select {
+		case <-opCtx.Done():
+			return context.Cause(opCtx)
+		case <-time.After(2 * time.Second):
+			return nil // the abort never came: uncovered bytes would publish
+		}
+	}, nil)
+	if opErr == nil || !strings.Contains(opErr.Error(), "restore cover continuity lost") {
+		t.Fatalf("opErr = %v, want a cover-lapse abort", opErr)
+	}
+	if renewErr != nil {
+		t.Fatalf("renewErr = %v, want nil (op failed, no final refresh)", renewErr)
+	}
+}
+
+// TestWithRenewedCoverRejectsLateSuccess (Codex round 63): a renewal that
+// SUCCEEDS but completes after the prior cover's budget window cannot
+// prove continuity — the prior row may have expired mid-attempt, leaving
+// an uncovered gap a stale-floor admission can commit in — so it must
+// abort exactly like a lapse instead of resetting the coverage anchor.
+func TestWithRenewedCoverRejectsLateSuccess(t *testing.T) {
+	oldI, oldT, oldB := coverRenewInterval, coverRenewTimeout, coverLapseBudget
+	coverRenewInterval, coverRenewTimeout, coverLapseBudget = 10*time.Millisecond, 100*time.Millisecond, 25*time.Millisecond
+	t.Cleanup(func() { coverRenewInterval, coverRenewTimeout, coverLapseBudget = oldI, oldT, oldB })
+
+	// Every renewal SUCCEEDS — but only after the budget window passed.
+	renew := func(context.Context) error {
+		time.Sleep(40 * time.Millisecond)
+		return nil
+	}
+	opErr, _ := WithRenewedCover(context.Background(), renew, func(opCtx context.Context) error {
+		select {
+		case <-opCtx.Done():
+			return context.Cause(opCtx)
+		case <-time.After(2 * time.Second):
+			return nil // late successes were accepted: the gap went unnoticed
+		}
+	}, nil)
+	if opErr == nil || !strings.Contains(opErr.Error(), "restore cover continuity lost") {
+		t.Fatalf("opErr = %v, want a continuity abort on late-completing renewals", opErr)
+	}
+}
+
+// TestWithRenewedCoverBudgetExpiryAbortsBetweenTicks (Codex round 66):
+// the continuity abort was TICK-driven — quick failures early left the
+// next tick scheduled past covered+budget, and an attempt starting near
+// the budget edge could run its full per-attempt timeout — in both cases
+// op kept running while the prior cover aged out, and a publication in
+// that gap landed uncovered. The budget deadline must be enforced by its
+// own timer: op is canceled AT covered+coverLapseBudget, not at whatever
+// later tick happens to notice.
+func TestWithRenewedCoverBudgetExpiryAbortsBetweenTicks(t *testing.T) {
+	oldI, oldT, oldB := coverRenewInterval, coverRenewTimeout, coverLapseBudget
+	// Ticks land far past the budget: only a budget-deadline timer can
+	// abort in time.
+	coverRenewInterval, coverRenewTimeout, coverLapseBudget = 300*time.Millisecond, 10*time.Millisecond, 50*time.Millisecond
+	t.Cleanup(func() { coverRenewInterval, coverRenewTimeout, coverLapseBudget = oldI, oldT, oldB })
+
+	initial := true
+	renew := func(context.Context) error {
+		if initial {
+			initial = false
+			return nil // the initial cover succeeds; nothing renews it
+		}
+		return errors.New("ledger down")
+	}
+	start := time.Now()
+	opErr, _ := WithRenewedCover(context.Background(), renew, func(opCtx context.Context) error {
+		select {
+		case <-opCtx.Done():
+			return context.Cause(opCtx)
+		case <-time.After(2 * time.Second):
+			return nil // never aborted: uncovered bytes would publish
+		}
+	}, nil)
+	elapsed := time.Since(start)
+	if opErr == nil || !strings.Contains(opErr.Error(), "restore cover continuity lost") {
+		t.Fatalf("opErr = %v, want a budget-expiry abort", opErr)
+	}
+	// The abort must come from the budget deadline (~50ms), not the
+	// first tick (~300ms); generous slack for scheduler noise.
+	if elapsed > 200*time.Millisecond {
+		t.Fatalf("abort took %v, want ≈coverLapseBudget (the budget timer, not the next tick)", elapsed)
+	}
+}
+
+// TestWithRenewedCoverTakesInitialCoverItself (Codex round 64): a
+// caller-side initial reservation with the anchor captured at helper
+// entry let a process suspension between the caller's commit and entry
+// fabricate a fresh anchor over an already-aging row — publication could
+// then run past the real cover's expiry. The helper must take the
+// initial cover ITSELF, anchored at the attempt's own start, before any
+// op byte can become physical; an initial-cover failure prevents op
+// entirely.
+func TestWithRenewedCoverTakesInitialCoverItself(t *testing.T) {
+	var renews, opStarts atomic.Int32
+	opErr, renewErr := WithRenewedCover(context.Background(), func(context.Context) error {
+		renews.Add(1)
+		return nil
+	}, func(context.Context) error {
+		if renews.Load() == 0 {
+			t.Fatal("op started before the initial cover committed")
+		}
+		opStarts.Add(1)
+		return nil
+	}, nil)
+	if opErr != nil || renewErr != nil || opStarts.Load() != 1 {
+		t.Fatalf("WithRenewedCover = (%v, %v), op starts %d; want (nil, nil), 1", opErr, renewErr, opStarts.Load())
+	}
+
+	// An initial-cover failure aborts before op runs.
+	opStarts.Store(0)
+	opErr, _ = WithRenewedCover(context.Background(), func(context.Context) error {
+		return errors.New("ledger down")
+	}, func(context.Context) error {
+		opStarts.Add(1)
+		return nil
+	}, nil)
+	if opErr == nil || !strings.Contains(opErr.Error(), "initial restore cover") || opStarts.Load() != 0 {
+		t.Fatalf("WithRenewedCover(initial failure) = %v, op starts %d; want an initial-cover abort with op never run", opErr, opStarts.Load())
+	}
+}
+
+// TestWithRenewedCoverHandoffRetriesUnderLiveCover (Codex round 70): the
+// caller's invalidation used to be one best-effort attempt after the seam
+// returned — if it failed, the durable restored bytes were left with
+// neither cover nor invalidation, permanently (a retry of the original
+// write sees the blob present and never restores again). The handoff now
+// runs INSIDE the seam: each attempt bounded and executed under a freshly
+// proven cover, retried — alternating with renewals — until it commits;
+// only lost continuity gives up (and surfaces renewErr).
+func TestWithRenewedCoverHandoffRetriesUnderLiveCover(t *testing.T) {
+	oldI, oldT, oldB := coverRenewInterval, coverRenewTimeout, coverLapseBudget
+	coverRenewInterval, coverRenewTimeout, coverLapseBudget = 10*time.Millisecond, 50*time.Millisecond, 200*time.Millisecond
+	t.Cleanup(func() { coverRenewInterval, coverRenewTimeout, coverLapseBudget = oldI, oldT, oldB })
+
+	var renews atomic.Int32
+	renew := func(context.Context) error {
+		renews.Add(1)
+		return nil // the cover stays renewable throughout
+	}
+	handoffs := 0
+	lastRenewsSeen := int32(0)
+	handoff := func(hctx context.Context) error {
+		handoffs++
+		if d, ok := hctx.Deadline(); !ok || time.Until(d) > CoverHandoffTimeout+time.Second {
+			t.Fatalf("handoff attempt %d unbounded or over the handoff window", handoffs)
+		}
+		if r := renews.Load(); r <= lastRenewsSeen {
+			t.Fatalf("handoff attempt %d ran without a fresh cover renewal since the last attempt", handoffs)
+		}
+		lastRenewsSeen = renews.Load()
+		if handoffs < 3 {
+			return errors.New("ledger transiently down") // the invalidation must be RETRIED
+		}
+		return nil
+	}
+	opErr, renewErr := WithRenewedCover(context.Background(), renew, func(context.Context) error { return nil }, handoff)
+	if opErr != nil || renewErr != nil {
+		t.Fatalf("WithRenewedCover = (%v, %v), want (nil, nil) once the handoff lands", opErr, renewErr)
+	}
+	if handoffs != 3 {
+		t.Fatalf("handoff attempts = %d, want 3 (two transient failures retried under live covers)", handoffs)
+	}
+}
+
+// TestWithRenewedCoverTailPersistsThroughContinuityLoss (Codex round 72,
+// security): continuity loss after publication used to abandon BOTH
+// repairs immediately, while absence-window floors minted before
+// publication stay admissible for the full stale-floor tail — the last
+// cover could expire with neither invalidation nor re-cover. After a
+// loss the seam must keep attempting both through the tail: a handoff
+// success still invalidates every stale floor.
+func TestWithRenewedCoverTailPersistsThroughContinuityLoss(t *testing.T) {
+	oldI, oldT, oldB, oldTail := coverRenewInterval, coverRenewTimeout, coverLapseBudget, staleFloorTail
+	coverRenewInterval, coverRenewTimeout, coverLapseBudget, staleFloorTail =
+		10*time.Millisecond, 5*time.Millisecond, 25*time.Millisecond, 2*time.Second
+	t.Cleanup(func() {
+		coverRenewInterval, coverRenewTimeout, coverLapseBudget, staleFloorTail = oldI, oldT, oldB, oldTail
+	})
+
+	initial := true
+	renew := func(rctx context.Context) error {
+		if initial {
+			initial = false
+			return nil // the initial cover; every later renewal fails
+		}
+		return errors.New("ledger down")
+	}
+	handoffs := 0
+	handoff := func(context.Context) error {
+		handoffs++
+		if handoffs < 3 {
+			return errors.New("ledger still down") // recovery on the 3rd try
+		}
+		return nil
+	}
+	opErr, renewErr := WithRenewedCover(context.Background(), renew, func(context.Context) error { return nil }, handoff)
+	if opErr != nil {
+		t.Fatalf("opErr = %v, want nil", opErr)
+	}
+	// The repairs landed — but a post-gap success must REPORT the gap
+	// (Codex round 73): a write settled in the uncovered window cannot
+	// be revoked, so a gapped restore is never clean.
+	if renewErr == nil || !strings.Contains(renewErr.Error(), "uncovered cover gap") {
+		t.Fatalf("renewErr = %v, want the gap report on a post-loss repair", renewErr)
+	}
+	if handoffs < 3 {
+		t.Fatalf("handoff attempts = %d, want ≥3 (post-loss retries through the stale-floor tail)", handoffs)
+	}
+}
+
+// TestWithRenewedCoverAbandonsAfterStaleFloorTail (Codex rounds 67+72):
+// when the ledger never recovers, the post-publication loop gives up only
+// once the stale-floor tail has passed — every floor that could hide the
+// restored bytes has expired by then, so abandoning is safe — and the
+// abandonment is reported. It must not give up earlier (round 72: floors
+// outlive the continuity budget) nor persist forever.
+func TestWithRenewedCoverAbandonsAfterStaleFloorTail(t *testing.T) {
+	oldI, oldT, oldB, oldTail := coverRenewInterval, coverRenewTimeout, coverLapseBudget, staleFloorTail
+	coverRenewInterval, coverRenewTimeout, coverLapseBudget, staleFloorTail =
+		10*time.Millisecond, 5*time.Millisecond, 25*time.Millisecond, 150*time.Millisecond
+	t.Cleanup(func() {
+		coverRenewInterval, coverRenewTimeout, coverLapseBudget, staleFloorTail = oldI, oldT, oldB, oldTail
+	})
+
+	initial := true
+	renew := func(context.Context) error {
+		if initial {
+			initial = false
+			return nil // the initial cover succeeds
+		}
+		return errors.New("ledger down") // and never recovers
+	}
+	start := time.Now()
+	opErr, renewErr := WithRenewedCover(context.Background(), renew, func(context.Context) error { return nil },
+		func(context.Context) error { return errors.New("ledger down") })
+	elapsed := time.Since(start)
+	if opErr != nil {
+		t.Fatalf("opErr = %v, want nil (op is instant)", opErr)
+	}
+	if renewErr == nil || !strings.Contains(renewErr.Error(), "abandoned after the stale-floor tail") {
+		t.Fatalf("renewErr = %v, want the tail-abandonment report", renewErr)
+	}
+	// Give-up lands ≈ the tail's end (150ms) — after the continuity
+	// budget (25ms: too early) and well before forever.
+	if elapsed < 100*time.Millisecond || elapsed > time.Second {
+		t.Fatalf("abandonment took %v, want ≈staleFloorTail", elapsed)
+	}
+}
+
+// TestWithRenewedCoverRefreshSurvivesOpDeadline (Codex round 60): the
+// post-publication refresh is MANDATORY tail coverage — its restarted TTL
+// must span the stale-floor tail (floor lifetime + admission handoff
+// margin) — but it used to inherit the operation context. A restore
+// succeeding at its deadline's edge then lost the refresh to that same
+// deadline, leaving the cover's remaining life (TTL minus up to one
+// renewal interval) shorter than the tail. The refresh must run on a
+// fresh bounded context detached from the op's.
+func TestWithRenewedCoverRefreshSurvivesOpDeadline(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var refreshCtxErr error
+	opErr, renewErr := WithRenewedCover(ctx, func(rctx context.Context) error {
+		refreshCtxErr = rctx.Err()
+		return rctx.Err()
+	}, func(context.Context) error {
+		cancel() // the op consumed its whole deadline as it finished
+		return nil
+	}, nil)
+	if opErr != nil {
+		t.Fatalf("opErr = %v, want nil", opErr)
+	}
+	if renewErr != nil {
+		t.Fatalf("post-publication refresh failed on the exhausted op context: %v", renewErr)
+	}
+	if refreshCtxErr != nil {
+		t.Fatalf("refresh ran on the dead op context (ctx err %v), want a fresh bounded context", refreshCtxErr)
 	}
 }
 

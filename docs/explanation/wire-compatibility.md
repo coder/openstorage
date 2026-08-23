@@ -38,7 +38,7 @@ namespaces), and [webhooks](../reference/webhooks.md) (webhooks). By feature gro
 | Deprecated spellings | ✅ | Documented upstream aliases accepted ([below](#deprecated-aliases)) |
 | Git smart-HTTP | ✅ | Clone/fetch/push at `/{repo}.git` (repo ID or URL-encoded name), ref policies, signed-commit verification, atomic pushes ([below](#git-protocol-semantics)) |
 | Namespaces & forks | ✅ | `+ephemeral` / `+import` namespaces; synchronous forks — the full fork-point closure is copied into the new repository (independent storage and [quota](../how-to/storage-lifecycle-and-sweeping.md#pack-quotas), nothing shared with the source). Git-pushed vs REST-written ephemeral state live in separate ref spaces ([deviation](#known-deviations-from-the-vendored-spec)) |
-| Git LFS | ✅ | Batch API on the same remote; presigned S3 transfers with a server-proxied fallback |
+| Git LFS | ✅ | Batch API on the same remote; presigned S3 downloads with a server-proxied fallback, verified server-proxied uploads ([below](#git-lfs-transfer-semantics)) |
 | Webhooks | ✅ | HMAC-signed `push` and `repo.sync.*` events, plus webhook CRUD |
 | Upstream sync & credentials | ✅ | `pull-upstream`, detach base, git-credential CRUD. Local-mode (SQLite) gap: a *git-surface* push does not auto-schedule upstream sync (the hook subprocess cannot reach the in-process queue) — API writes and explicit `pull-upstream` are unaffected |
 | Auth model | ✅ | Customer-signed JWTs (`ES256`/`RS256`/`EdDSA`/`PS256`/`ES384`/`ES512`), scopes `git:read` / `git:write` / `repo:write` / `org:read` (exact matching — no scope implies another), `refs` policy tuples ([auth spec](../reference/authentication.md)) |
@@ -94,6 +94,25 @@ Beyond serving the smart-HTTP wire format, the semantics clients depend on match
   closed per ref when the binary is absent. The repository's supplied container image
   ships both ([#50](https://github.com/coder/code-storage/issues/50)); install them
   yourself if you build a custom image and protect refs with `verify-sig`.
+
+### Git LFS transfer semantics
+
+The batch API speaks the standard LFS `basic` adapter, so any git-lfs client works
+unchanged — but the transfer hrefs it hands out are asymmetric by design
+([#51](https://github.com/coder/code-storage/issues/51)):
+
+- **Downloads** get presigned S3 URLs when the backend can sign (server-proxied
+  fallback otherwise, e.g. local file mode). Reads are never quota-gated.
+- **Uploads** always get a server-proxied href, even on S3: a presigned PUT binds
+  neither content length nor checksum, which would let a writer bypass the repository
+  [storage quota](../how-to/storage-lifecycle-and-sweeping.md#pack-quotas) and publish
+  bytes that do not match their claimed oid. The server verifies the sha256 content
+  address and the actual `Content-Length` before publishing, denies over-quota uploads
+  with per-object `507` errors at the batch (and at the transfer, closing declared-size
+  lies), and registers every verified object for the
+  [orphan sweep](../how-to/storage-lifecycle-and-sweeping.md#the-orphan-sweeper).
+  Upstream may presign uploads; the wire shape is identical either way (the `href` is
+  opaque to clients), so this is a hardening choice, not a compatibility deviation.
 
 ## The architectural difference: single-org
 
