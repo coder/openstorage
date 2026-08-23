@@ -116,6 +116,12 @@ type Server struct {
 	lfsStagingInFlight int64
 	lfsStagingOps      int
 	lfsRepoStagingOps  map[string]int
+	// lfsRepoStagingBytes is each base repository's share of
+	// lfsStagingInFlight (Codex round 38): the global byte budget alone
+	// let one repository's transferred-and-dripping uploads 429 every
+	// other repository — see lfsRepoStagingByteShareDiv. Guarded by
+	// lfsStagingMu.
+	lfsRepoStagingBytes map[string]int64
 	// lfsVerifyOps / lfsRepoVerifyOps count in-flight legacy-verification
 	// buffers (node-wide and per base repo — Codex rounds 26+33); guarded
 	// by lfsStagingMu like the op counters.
@@ -186,8 +192,12 @@ func (s *Server) reserveLFSStaging(repo string, n int64) bool {
 		s.lfsRepoStagingOps = make(map[string]int)
 	}
 	s.lfsRepoStagingOps[repo]++
-	if s.LFSStagingBytes > 0 {
+	if s.LFSStagingBytes > 0 && n > 0 {
 		s.lfsStagingInFlight += n
+		if s.lfsRepoStagingBytes == nil {
+			s.lfsRepoStagingBytes = make(map[string]int64)
+		}
+		s.lfsRepoStagingBytes[repo] += n
 	}
 	return true
 }
@@ -226,13 +236,28 @@ const lfsMaxVerifyBuffers = 32
 // itself.
 const lfsMaxRepoVerifyBuffers = 8
 
+// lfsRepoVerifyShareDiv scales one repository's verification-buffer
+// allowance by the pool's free capacity (Codex round 38, security): the
+// fixed 8-slot shares summed to the 32-slot pool, so git:write tokens for
+// four repositories could park long adoptions and 429 every other
+// repository's legacy uploads on an upgrade node. Same construction as
+// lfsRepoStagingShareDiv: a k-repo coalition equilibrates near
+// pool·k/(div+k) and every victim keeps a free/div allowance, while a
+// quiet node still grants a single repository its full 8-slot share
+// (32/4 = 8).
+const lfsRepoVerifyShareDiv = 4
+
 // reserveLFSVerifyBuffer takes one node-wide verification buffer slot
 // charged to repo's share; ok=false is transient (429).
 func (s *Server) reserveLFSVerifyBuffer(repo string) bool {
 	assertf(repo != "", "reserveLFSVerifyBuffer(%q)", repo)
 	s.lfsStagingMu.Lock()
 	defer s.lfsStagingMu.Unlock()
-	if s.lfsVerifyOps >= lfsMaxVerifyBuffers || s.lfsRepoVerifyOps[repo] >= lfsMaxRepoVerifyBuffers {
+	if s.lfsVerifyOps >= lfsMaxVerifyBuffers {
+		return false
+	}
+	free := lfsMaxVerifyBuffers - s.lfsVerifyOps
+	if s.lfsRepoVerifyOps[repo] >= min(lfsMaxRepoVerifyBuffers, max(1, free/lfsRepoVerifyShareDiv)) {
 		return false
 	}
 	s.lfsVerifyOps++
@@ -256,18 +281,48 @@ func (s *Server) releaseLFSVerifyBuffer(repo string) {
 	}
 }
 
-// growLFSStaging adds n bytes to an existing staging reservation whose op
-// slot is already held; the caller releases the grown total through one
-// releaseLFSStaging call.
-func (s *Server) growLFSStaging(n int64) bool {
-	assertf(n > 0, "growLFSStaging(%d)", n)
+// lfsRepoStagingByteShareDiv scales one repository's staged-BYTE
+// allowance by the byte budget's free capacity, the byte analog of
+// lfsRepoStagingShareDiv (Codex round 38): with only the global budget, a
+// writer for one repository could transfer LFSStagingBytes of real data
+// and drip inside its reserved chunks until the absolute deadline —
+// invalid digests make the traffic repeatable without consuming quota or
+// object-count entries — 429ing every other repository's uploads despite
+// the op-slot shares. Each grow must fit
+// max(lfsStagingChunk, freeBytes/div); bytes get a SMALLER divisor than
+// op slots because the byte allowance bounds the largest stageable
+// object: a solo repository's hold stalls at the B/(div+1) fixed point
+// (div 2 → B/3; the 413 pre-check advertises exactly that bound), so the
+// default budget must be ≈(div+1)× the largest expected object — see
+// defaultLFSStagingBytes. A k-repo coalition equilibrates near
+// B·k/(div+k), leaving every victim a free/div allowance; the residual
+// (arbitrarily many authorized repos exhausting any finite budget) is
+// accepted, with edge rate limiting the operator lever beyond it.
+const lfsRepoStagingByteShareDiv = 2
+
+// growLFSStaging adds n bytes to repo's existing staging reservation
+// whose op slot is already held; the caller releases the grown total
+// through one releaseLFSStaging call.
+func (s *Server) growLFSStaging(repo string, n int64) bool {
+	assertf(repo != "" && n > 0, "growLFSStaging(%q, %d)", repo, n)
 	s.lfsStagingMu.Lock()
 	defer s.lfsStagingMu.Unlock()
 	if s.LFSStagingBytes > 0 {
 		if s.lfsStagingInFlight > s.LFSStagingBytes-n {
 			return false
 		}
+		// The repo byte allowance scales with the budget's free capacity
+		// — see lfsRepoStagingByteShareDiv. The chunk floor keeps a
+		// minimal upload growable while the global budget has room.
+		free := s.LFSStagingBytes - s.lfsStagingInFlight
+		if s.lfsRepoStagingBytes[repo] > max(lfsStagingChunk, free/lfsRepoStagingByteShareDiv)-n {
+			return false
+		}
 		s.lfsStagingInFlight += n
+		if s.lfsRepoStagingBytes == nil {
+			s.lfsRepoStagingBytes = make(map[string]int64)
+		}
+		s.lfsRepoStagingBytes[repo] += n
 	}
 	return true
 }
@@ -283,9 +338,14 @@ func (s *Server) releaseLFSStaging(repo string, n int64) {
 	if s.lfsRepoStagingOps[repo] == 0 {
 		delete(s.lfsRepoStagingOps, repo) // bound the map by active repos
 	}
-	if s.LFSStagingBytes > 0 {
+	if s.LFSStagingBytes > 0 && n > 0 {
 		s.lfsStagingInFlight -= n
 		assertf(s.lfsStagingInFlight >= 0, "releaseLFSStaging(%d): in-flight went negative", n)
+		s.lfsRepoStagingBytes[repo] -= n
+		assertf(s.lfsRepoStagingBytes[repo] >= 0, "releaseLFSStaging(%q, %d): repo bytes went negative", repo, n)
+		if s.lfsRepoStagingBytes[repo] == 0 {
+			delete(s.lfsRepoStagingBytes, repo) // bound the map by active repos
+		}
 	}
 }
 

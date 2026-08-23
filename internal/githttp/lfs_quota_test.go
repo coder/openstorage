@@ -864,30 +864,34 @@ func TestLFSQuota_AtCapAdoptionDeniesBeforeDownload(t *testing.T) {
 }
 
 // TestLFSStaging_DripperCannotPinBudget (Codex security round 5): a PUT
-// declaring the whole staging budget as Content-Length while dripping
-// bytes must NOT reserve the declared size up front — staging grows as
-// data actually arrives (one lfsStagingChunk ahead), so an unrelated
-// upload still admits while the dripper stalls.
+// declaring the largest permissible Content-Length while dripping bytes
+// must NOT reserve the declared size up front — staging grows as data
+// actually arrives (one lfsStagingChunk ahead), so an unrelated upload
+// still admits while the dripper stalls. The budget is 10 chunks (round
+// 38's byte fairness caps a declaration at the budget-third allowance, so
+// the historical whole-budget declaration is 413-rejected outright now —
+// strictly stronger; the drip scenario continues inside the allowance).
 func TestLFSStaging_DripperCannotPinBudget(t *testing.T) {
 	oldChunk := lfsStagingChunk
 	lfsStagingChunk = 4
 	t.Cleanup(func() { lfsStagingChunk = oldChunk })
 
 	srv, _, mint := newLFSQuotaServer(t, 0, time.Hour)
-	srv.LFSStagingBytes = 10
+	srv.LFSStagingBytes = 40
 	tok := mint(auth.ScopeGitWrite)
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
 
-	// The dripper: declares the WHOLE budget, sends one byte, stalls.
-	dripContent := bytes.Repeat([]byte("d"), 10)
+	// The dripper: declares the whole per-repo allowance (40/3 = 13),
+	// sends one byte, stalls.
+	dripContent := bytes.Repeat([]byte("d"), 13)
 	pr, pw := io.Pipe()
 	req, err := http.NewRequest(http.MethodPut,
 		ts.URL+"/"+lfsTestRepoURL+".git/info/lfs/objects/"+sha256Hex(dripContent), pr)
 	if err != nil {
 		t.Fatal(err)
 	}
-	req.ContentLength = 10
+	req.ContentLength = 13
 	req.SetBasicAuth("t", tok)
 	done := make(chan struct{})
 	go func() {
@@ -1175,6 +1179,73 @@ func TestLFSStaging_RepoCoalitionCannotExhaustNode(t *testing.T) {
 	}
 	if !srv.reserveLFSStaging("repo_victim", 0) {
 		t.Fatal("an 8-repo coalition exhausted the node-wide LFS staging pool")
+	}
+}
+
+// TestLFSStaging_RepoByteShareIsolatesRepos (Codex round 38): op-slot
+// shares scale with free capacity, but staged BYTES were only counted
+// globally — one repository's writer could transfer LFSStagingBytes of
+// real data (invalid digests make it repeatable and quota-free) and drip
+// within the reserved chunks until the absolute deadline, 429ing every
+// other repository's uploads. Byte allowances now scale with the free
+// budget (max(chunk, free/lfsRepoStagingByteShareDiv)): a greedy repo
+// stalls at the B/(div+1) fixed point — which is also the single-object
+// capability the 413 pre-check advertises — and a victim repository must
+// still grow a chunk afterwards.
+func TestLFSStaging_RepoByteShareIsolatesRepos(t *testing.T) {
+	const budget = int64(30) << 20 // 30 MiB with the default 8 MiB chunk
+	srv := &Server{LFSStagingBytes: budget}
+	if !srv.reserveLFSStaging("repo_greedy", 0) {
+		t.Fatal("greedy op slot")
+	}
+	var held int64
+	for held < budget {
+		if !srv.growLFSStaging("repo_greedy", 1<<20) {
+			break
+		}
+		held += 1 << 20
+	}
+	if held >= budget {
+		t.Fatalf("one repository grew its staging hold to the whole %d-byte node budget", budget)
+	}
+	// Large-object capability floor: the greedy writer must reach the
+	// documented B/(div+1) fixed point (chunk-granular), not stall early.
+	if want := budget/(lfsRepoStagingByteShareDiv+1) - lfsStagingChunk; held < want {
+		t.Fatalf("solo staging hold stalled at %d bytes, want at least %d", held, want)
+	}
+	// A victim repository still reserves its op slot and grows a chunk.
+	if !srv.reserveLFSStaging("repo_victim", 0) {
+		t.Fatal("victim op slot starved")
+	}
+	if !srv.growLFSStaging("repo_victim", lfsStagingChunk) {
+		t.Fatal("one repository's staging hold starved another repository's byte growth")
+	}
+	srv.releaseLFSStaging("repo_victim", lfsStagingChunk)
+	srv.releaseLFSStaging("repo_greedy", held)
+}
+
+// TestLFSVerify_RepoCoalitionCannotExhaustPool (Codex round 38,
+// security): fixed 8-slot verification shares summed to the 32-slot pool,
+// so git:write tokens for four repositories could park long adoptions and
+// 429 every other repository's legacy uploads on an upgrade node. Like
+// the staging pools, the allowance must shrink with free capacity: a
+// greedy 4-repo coalition runs to denial and an unrelated repository must
+// still reserve a verification buffer.
+func TestLFSVerify_RepoCoalitionCannotExhaustPool(t *testing.T) {
+	srv := &Server{}
+	for {
+		progress := false
+		for i := range 4 {
+			if srv.reserveLFSVerifyBuffer(fmt.Sprintf("coalition_%d", i)) {
+				progress = true
+			}
+		}
+		if !progress {
+			break
+		}
+	}
+	if !srv.reserveLFSVerifyBuffer("repo_victim") {
+		t.Fatal("a 4-repo coalition exhausted the node-wide LFS verification pool")
 	}
 }
 

@@ -28,7 +28,7 @@ never a silently-applied default.
 | [`CODESTORAGE_SECRETS_KEY`](#codestorage_secrets_key) | unset (plaintext) | AES-256 key list for at-rest encryption of stored webhook secrets and upstream credentials |
 | [`CODESTORAGE_SECRETS_MODE`](#codestorage_secrets_mode) | `encrypt` | `decrypt-only` stages the key fleet-wide before encrypted writes begin |
 | [`CODESTORAGE_PACK_QUOTA_BYTES`](#codestorage_pack_quota_bytes) | 10 GiB | Per-repo storage quota, packs + LFS (`0` disables) |
-| [`CODESTORAGE_LFS_STAGING_BYTES`](#codestorage_lfs_staging_bytes) | 10 GiB | Per-replica cap on in-flight LFS upload staging (`0` disables) |
+| [`CODESTORAGE_LFS_STAGING_BYTES`](#codestorage_lfs_staging_bytes) | 32 GiB | Per-replica cap on in-flight LFS upload staging (`0` disables) |
 | [`CODESTORAGE_PACK_RESERVATION_TTL`](#codestorage_pack_reservation_ttl) | `1h` | Lifetime of a crashed writer's quota reservation |
 | [`CODESTORAGE_MAX_PUSH_BYTES`](#codestorage_max_push_bytes) | 2 × pack quota (min 2 MiB) | Decoded-byte cap on one git push (`0` disables) |
 | [`CODESTORAGE_VERIFY_SIG_BUDGET`](#codestorage_verify_sig_budget) | `10000` | Per-push `verify-sig` verified-commit budget (`0` disables) |
@@ -331,12 +331,19 @@ under the replica's `$TMPDIR` before verification and publication — the
 per-repository quota above bounds neither the node (it is per repo) nor anything when
 disabled, so this is the replica's disk-protection bound. The budget is charged
 incrementally as body bytes actually arrive (a stalled upload holds only slightly more
-than it has transferred, not its declared `Content-Length`). Uploads that do not fit
-right now answer `429` with `Retry-After`; an object whose declared size exceeds the
-whole budget answers `413`.
+than it has transferred, not its declared `Content-Length`), and each repository's
+staged bytes are held to a fair share that scales with the budget's free capacity, so
+one repository's uploads cannot occupy the whole replica budget. Uploads that do not
+fit right now answer `429` with `Retry-After`; an object whose declared size exceeds
+the largest hold a single repository can ever reach — one third of the budget —
+answers `413`.
 
-- **Default:** 10 GiB (`10737418240`) — one default-quota-sized object can always
-  stage. **`0` disables the bound**; negative or malformed values are startup errors.
+- **Default:** 32 GiB (`34359738368`). The budget is a **working set, not an
+  object-size cap**: because a single repository's hold tops out at a third of the
+  budget, supporting objects of size `S` needs a budget of about `3 × S` — the default
+  keeps one default-quota-sized (10 GiB) object stageable with cross-repository
+  capacity intact. **`0` disables the bound**; negative or malformed values are
+  startup errors.
 - Size it below the free space you guarantee `$TMPDIR`, minus headroom for git push
   quarantines and fork closures, which stage there too.
 - Each object additionally allows only one in-flight upload per replica (concurrent

@@ -810,6 +810,7 @@ func (s *Server) verifyStoredLFSObject(ctx context.Context, repo, key, oid strin
 // uploads' real bytes while this body streamed.
 type stagingFileWriter struct {
 	s             *Server
+	repo          string
 	f             *os.File
 	contentLength int64
 	written       int64
@@ -826,7 +827,7 @@ func (w *stagingFileWriter) Write(p []byte) (int, error) {
 		// clamped chunk always covers the shortfall.
 		assertf(grow >= need, "stagingFileWriter: grow %d < need %d (CL %d, reserved %d, written %d)",
 			grow, need, w.contentLength, *w.reserved, w.written)
-		if !w.s.growLFSStaging(grow) {
+		if !w.s.growLFSStaging(w.repo, grow) {
 			return 0, errLFSBusy
 		}
 		*w.reserved += grow
@@ -1041,21 +1042,28 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target r
 	// Node-wide staging budget (Codex round 4): every proxy upload stages
 	// its full Content-Length on this replica's disk before verification,
 	// and neither the per-key guard nor the per-repo quota bounds that
-	// node-wide. An object larger than the whole budget can never stage
-	// here (413, permanent); anything that does not fit right now is
-	// transient (429). The reservation is INCREMENTAL (Codex security
-	// round 5): only the op slot plus one chunk is taken before body
-	// bytes arrive, and stagingFileWriter grows it as data actually
-	// lands — an upfront declared-length reservation let one drip-fed
-	// PUT pin the entire budget for the TTL without transferring.
-	if s.LFSStagingBytes > 0 && r.ContentLength > s.LFSStagingBytes {
-		lfsError(w, http.StatusRequestEntityTooLarge, fmt.Sprintf(
-			"object size %d exceeds this server's LFS staging budget (%d bytes)",
-			r.ContentLength, s.LFSStagingBytes))
-		return
+	// node-wide. An object no solo repository allowance can ever hold —
+	// the B/(div+1) fixed point of the byte-fairness growth (round 38;
+	// see lfsRepoStagingByteShareDiv), clamped chunk-granular and never
+	// above the whole budget — is permanent (413); anything that does not
+	// fit right now is transient (429). The reservation is INCREMENTAL
+	// (Codex security round 5): only the op slot plus one chunk is taken
+	// before body bytes arrive, and stagingFileWriter grows it as data
+	// actually lands — an upfront declared-length reservation let one
+	// drip-fed PUT pin the entire budget for the TTL without
+	// transferring.
+	if s.LFSStagingBytes > 0 {
+		bound := min(s.LFSStagingBytes,
+			max(lfsStagingChunk, s.LFSStagingBytes/(lfsRepoStagingByteShareDiv+1)))
+		if r.ContentLength > bound {
+			lfsError(w, http.StatusRequestEntityTooLarge, fmt.Sprintf(
+				"object size %d exceeds this server's LFS staging allowance (%d bytes)",
+				r.ContentLength, bound))
+			return
+		}
 	}
 	if initial := min(r.ContentLength, lfsStagingChunk); initial > 0 {
-		if !s.growLFSStaging(initial) {
+		if !s.growLFSStaging(repoID, initial) {
 			w.Header().Set("Retry-After", "10")
 			lfsError(w, http.StatusTooManyRequests, "server LFS staging budget exhausted, retry")
 			return
@@ -1129,7 +1137,7 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target r
 		body = idle
 	}
 	h := sha256.New()
-	sfw := &stagingFileWriter{s: s, f: f, contentLength: r.ContentLength, reserved: &stagingReserved}
+	sfw := &stagingFileWriter{s: s, repo: repoID, f: f, contentLength: r.ContentLength, reserved: &stagingReserved}
 	n, err := io.Copy(io.MultiWriter(sfw, h), body)
 	if cerr := f.Close(); err == nil {
 		err = cerr

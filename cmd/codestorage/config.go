@@ -143,9 +143,16 @@ const (
 	defaultPackQuotaBytes = int64(10) << 30
 
 	// defaultLFSStagingBytes is the default node-wide LFS upload staging
-	// budget (issue #51) — matches the default per-repo quota's scale so
-	// one default-quota-sized object can always stage.
-	defaultLFSStagingBytes = int64(10) << 30
+	// budget (issue #51). Sized as a WORKING SET, not an object-size cap
+	// (Codex round 38): per-repository byte fairness caps a single
+	// repository's staged hold at budget/(div+1) of the free budget
+	// (githttp's lfsRepoStagingByteShareDiv, div 2), so supporting an
+	// object of size S needs a budget of about (div+1)·S — no budget
+	// equal to the largest object can both stage that object and reserve
+	// capacity for other repositories. 32 GiB keeps one
+	// default-quota-sized (10 GiB) object stageable (32/3 ≈ 10.7 GiB)
+	// with cross-repo capacity intact.
+	defaultLFSStagingBytes = int64(32) << 30
 
 	// defaultPackReservationTTL clears a default-quota-sized (10 GiB)
 	// upload at ~3 MB/s before a live reservation can expire (issue #29).
