@@ -14,6 +14,8 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"os"
+	"strconv"
 	"time"
 )
 
@@ -85,7 +87,27 @@ func NewEventingID(prefix string) string {
 // adopted into the lease regime by a new one (TryBeginSync mixed-fleet
 // staging). The '!' prefix cannot occur in real holder tokens, whose
 // process tag is hostname-pid (RFC 1123 hostnames have no '!').
+//
+// Adopted legacy claims are NEVER stolen by default: a pre-lease binary
+// has neither the ref-update fence nor a holder-guarded FinishSync, so no
+// finite grace can make stealing from a possibly-alive one safe. Stealing
+// them requires EnvSyncStealLegacy — the operator's assertion that no
+// pre-lease replica remains (same fleet-prerequisite pattern as
+// delete-mode sweeping), after which legacy rows can only be pre-upgrade
+// wedges. Claims from lease-aware replicas heal automatically regardless.
 const LegacyClaimHolder = "!legacy-grace"
+
+// EnvSyncStealLegacy enables stealing adopted legacy claims whose grace
+// has lapsed. Any value strconv.ParseBool accepts as true enables it;
+// malformed values stay disabled (the safe direction).
+const EnvSyncStealLegacy = "CODESTORAGE_SYNC_STEAL_LEGACY"
+
+// legacyStealEnabled reads EnvSyncStealLegacy per decision (cheap; tests
+// flip it with t.Setenv).
+func legacyStealEnabled() bool {
+	v, err := strconv.ParseBool(os.Getenv(EnvSyncStealLegacy))
+	return err == nil && v
+}
 
 // EventingStore is the phase-5 persistence surface. Org-scoped methods key
 // by org name (JWT `iss`) and return ErrNotFound for unknown orgs, matching

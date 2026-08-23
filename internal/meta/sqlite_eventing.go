@@ -447,6 +447,14 @@ func (s *SQLite) TryBeginSync(ctx context.Context, repoID, holder string, lease 
 			up = prev // unexpired claim in flight: refused, current row
 			return nil
 		}
+		if prev.Syncing && prev.SyncClaimHolder == LegacyClaimHolder && !legacyStealEnabled() {
+			// A lapsed adoption grace still is not proof against a
+			// paused pre-lease binary, which carries none of the holder
+			// guards — stealing needs the operator's drained-fleet
+			// assertion (EnvSyncStealLegacy).
+			up = prev
+			return nil
+		}
 		reread := func() error {
 			row, err := scanRepoUpstreamSQLite(tx.QueryRowContext(ctx,
 				`SELECT `+repoUpstreamCols+` FROM repo_upstreams WHERE repo_id = ?`, repoID))

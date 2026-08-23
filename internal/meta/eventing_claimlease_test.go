@@ -147,15 +147,29 @@ func testSyncClaimLegacyAdoption(t *testing.T, s Backend) {
 		t.Fatalf("FinishSync: %v", err)
 	}
 
-	// A crashed old-version run: adoption, lapse, then the steal.
+	// A crashed old-version run: adoption, lapse — and WITHOUT the
+	// operator's drained-fleet assertion the claim stays unstealable (a
+	// paused pre-lease binary has no holder guards, so no finite grace
+	// proves it dead).
 	legacyClaim()
 	if _, claimed, _, err := s.TryBeginSync(ctx, repoID, "holder-new", time.Minute); err != nil || claimed {
 		t.Fatalf("adopt crashed legacy = (%v, %v), want adoption", claimed, err)
 	}
 	lapseGrace()
 	up, claimed, stolenFrom, err = s.TryBeginSync(ctx, repoID, "holder-new", time.Minute)
+	if err != nil || claimed || stolenFrom != "" {
+		t.Fatalf("lapsed-grace steal without opt-in = (%v, %q, %v), want refusal", claimed, stolenFrom, err)
+	}
+	if up.SyncClaimHolder != LegacyClaimHolder {
+		t.Errorf("row without opt-in = %+v, want the adopted claim intact", up)
+	}
+
+	// With EnvSyncStealLegacy (fleet drained of pre-lease binaries), the
+	// lapsed legacy claim is stolen and syncing heals.
+	t.Setenv(EnvSyncStealLegacy, "true")
+	up, claimed, stolenFrom, err = s.TryBeginSync(ctx, repoID, "holder-new", time.Minute)
 	if err != nil || !claimed || stolenFrom != LegacyClaimHolder {
-		t.Fatalf("steal after lapsed grace = (%v, %q, %v), want steal from %q", claimed, stolenFrom, err, LegacyClaimHolder)
+		t.Fatalf("opted-in steal after lapsed grace = (%v, %q, %v), want steal from %q", claimed, stolenFrom, err, LegacyClaimHolder)
 	}
 	if up.SyncClaimHolder != "holder-new" {
 		t.Errorf("stolen row = %+v, want the new holder's claim", up)

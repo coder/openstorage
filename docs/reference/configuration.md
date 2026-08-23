@@ -36,6 +36,7 @@ never a silently-applied default.
 | [`CODESTORAGE_SWEEP_DELETE_ENABLED`](#codestorage_sweep_delete_enabled) | `false` | Opt-in: actually delete general orphans (list-only otherwise) |
 | [`CODESTORAGE_SWEEP_DELETE_SUPERSEDED`](#codestorage_sweep_delete_superseded) | `true` | Reap blobs a repack fold provably superseded |
 | [`CODESTORAGE_REPACK_THRESHOLD`](#codestorage_repack_threshold) | `10` | Registered-pack count that triggers a background repack (`0` disables) |
+| [`CODESTORAGE_SYNC_STEAL_LEGACY`](#codestorage_sync_steal_legacy) | `false` | Opt-in: steal pre-lease sync claims after their adoption grace lapses |
 
 \* Required unless derived from `CODESTORAGE_DATA_DIR` / `--data-dir` (local mode).
 
@@ -442,6 +443,20 @@ consolidated pack — the registered object set never shrinks.
   `1` is rejected (folding fewer than two packs is a no-op, so it would busy-loop the
   trigger); negative or malformed values are startup errors.
 - Pack counts converge below the threshold, not necessarily to a single pack.
+
+### `CODESTORAGE_SYNC_STEAL_LEGACY`
+
+Upstream-sync claims are leased: a run that dies mid-sync leaves a claim the next run
+steals automatically once the lease expires. Claims written by **pre-lease builds** carry
+no lease and none of the holder guards that make stealing safe; new replicas adopt them
+under one grace period but will not steal them without this opt-in.
+
+- **Default:** `false` (adopted legacy claims are never stolen). Malformed values stay
+  disabled.
+- **Enable only after the whole fleet runs a lease-aware build** (same fleet prerequisite
+  as [`CODESTORAGE_SWEEP_DELETE_ENABLED`](#codestorage_sweep_delete_enabled)): from then
+  on, legacy claims can only be pre-upgrade crash leftovers, and stealing them heals those
+  wedges without operator row-surgery. Safe to leave enabled permanently afterwards.
 
 ## Internal and test variables
 

@@ -415,6 +415,14 @@ func (s *PG) TryBeginSync(ctx context.Context, repoID, holder string, lease time
 			up = prev // unexpired claim in flight: refused, current row
 			return nil
 		}
+		if prev.Syncing && prev.SyncClaimHolder == LegacyClaimHolder && !legacyStealEnabled() {
+			// A lapsed adoption grace still is not proof against a
+			// paused pre-lease binary, which carries none of the holder
+			// guards — stealing needs the operator's drained-fleet
+			// assertion (EnvSyncStealLegacy).
+			up = prev
+			return nil
+		}
 		if prev.Syncing && prev.SyncClaimHolder == "" {
 			// Legacy claim (pre-lease replica, mixed fleet): adopt with a
 			// full grace instead of stealing what may be a LIVE run — the

@@ -3,6 +3,8 @@ package sync
 import (
 	"context"
 	"fmt"
+	"os"
+	"strconv"
 	stdsync "sync"
 	"time"
 )
@@ -172,6 +174,13 @@ func (m *MemStore) BeginSync(_ context.Context, repoID, holder string, lease tim
 			up.SyncClaimHolder, up.SyncClaimExpiresAt = legacyClaimHolder, time.Now().Add(lease)
 			m.upstreams[repoID] = up
 			return Upstream{}, "", ErrSyncInProgress
+		}
+		if up.SyncClaimHolder == legacyClaimHolder {
+			// Stealing an adopted legacy claim needs the operator's
+			// drained-fleet assertion (meta.EnvSyncStealLegacy).
+			if v, err := strconv.ParseBool(os.Getenv("CODESTORAGE_SYNC_STEAL_LEGACY")); err != nil || !v {
+				return Upstream{}, "", ErrSyncInProgress
+			}
 		}
 		stolenFrom = up.SyncClaimHolder // expired lease (or lapsed grace) stolen (issue #86)
 	}
