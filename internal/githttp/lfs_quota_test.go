@@ -1599,6 +1599,48 @@ func TestLFSCompatCopy_ClaimWinnerRechecksDestination(t *testing.T) {
 	}
 }
 
+// TestLFSCompatCopy_BoundedByOpSlots (Codex round 92): distinct-OID batch
+// touches each launch a size-scaled server-side bridge copy, and the
+// per-key claim dedupes only one OID while quota reservations are
+// per-repository (or disabled) — without a cross-key bound, one
+// write-scoped client could fan out unbounded simultaneous multipart
+// copies and exhaust backend connections despite the op-slot protection on
+// uploads and adoptions. The bridge must take the same repository-fair
+// node-wide operation slot.
+func TestLFSCompatCopy_BoundedByOpSlots(t *testing.T) {
+	oldOps := lfsMaxStagingOps
+	lfsMaxStagingOps = 1
+	t.Cleanup(func() { lfsMaxStagingOps = oldOps })
+	ctx := context.Background()
+	srv, _, _ := newLFSQuotaServer(t, 0, time.Hour)
+	srv.LFSV020WriteCompat = true
+	content := []byte("bridge copy needs an op slot")
+	oid := sha256Hex(content)
+	key := blob.LFSKey(lfsTestRepoID, oid)
+	if err := srv.Blob.UploadFile(ctx, key, writeTempFile(t, content)); err != nil {
+		t.Fatal(err)
+	}
+	// Every op slot is busy (another repository's upload holds it).
+	if !srv.reserveLFSStaging("repo_other", 0) {
+		t.Fatal("seed op slot")
+	}
+	err := srv.maybeLegacyCompatCopy(ctx, lfsTestRepoID, oid, key, int64(len(content)))
+	if !errors.Is(err, errLFSBusy) {
+		t.Fatalf("bridge copy with zero free op slots = %v, want errLFSBusy — unbounded concurrent multipart copies exhaust the backend", err)
+	}
+	if _, serr := srv.Blob.Stat(ctx, blob.LFSLegacyKey(lfsTestRepoID, oid)); !errors.Is(serr, blob.ErrNotFound) {
+		t.Fatalf("copy ran despite op-slot exhaustion (stat err %v)", serr)
+	}
+	// Slot freed: the retry converges.
+	srv.releaseLFSStaging("repo_other", 0)
+	if err := srv.maybeLegacyCompatCopy(ctx, lfsTestRepoID, oid, key, int64(len(content))); err != nil {
+		t.Fatalf("bridge copy with a free slot: %v", err)
+	}
+	if _, serr := srv.Blob.Stat(ctx, blob.LFSLegacyKey(lfsTestRepoID, oid)); serr != nil {
+		t.Fatalf("legacy spelling missing after freed-slot retry: %v", serr)
+	}
+}
+
 // TestLFSCompat_RepairSerializedOnLegacyClaim (Codex security round 85):
 // the batch fast path's bridge repair launched an unserialized full copy —
 // every tiny concurrent touch of the object started another one. Compat
