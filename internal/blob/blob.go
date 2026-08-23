@@ -356,21 +356,39 @@ func WithRenewedCover(ctx context.Context, renew func(context.Context) error, op
 		defer wg.Done()
 		t := time.NewTicker(coverRenewInterval)
 		defer t.Stop()
-		lastSuccess := time.Now() // the caller's initial cover
+		// covered is the conservative anchor of the newest PROVEN cover
+		// row: the caller's initial cover committed before this function
+		// was entered, and each accepted renewal below anchors at its
+		// attempt START (the row's created_at is at or after it).
+		covered := time.Now()
 		for {
 			select {
 			case <-done:
 				return
 			case <-t.C:
+				start := time.Now()
 				rctx, rcancel := context.WithTimeout(ctx, coverRenewTimeout)
 				err := renew(rctx)
 				rcancel()
-				if err == nil {
-					lastSuccess = time.Now()
-				} else if time.Since(lastSuccess) > coverLapseBudget {
-					opCancel(fmt.Errorf("restore cover lapsed (last renewal failure: %w)", err))
+				// A renewal proves CONTINUITY only if it COMPLETED while
+				// the prior cover still lived (Codex round 63): a success
+				// committing after the prior row expired leaves an
+				// uncovered gap a stale-floor admission can use, so it
+				// must abort like a lapse — resetting the anchor on any
+				// success accepted exactly that gap. Completion is an
+				// upper bound on the commit time; the budget is strictly
+				// under the minimum TTL, so completion-before-deadline
+				// proves commit-before-expiry.
+				if err == nil && time.Since(covered) <= coverLapseBudget {
+					covered = start
+					continue
+				}
+				if time.Since(covered) > coverLapseBudget {
+					opCancel(fmt.Errorf("restore cover continuity lost (last renewal: %v)", err))
 					return
 				}
+				// A failed attempt inside the budget: the prior cover
+				// still lives, the next tick retries.
 			}
 		}
 	}()

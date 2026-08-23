@@ -519,11 +519,39 @@ func TestWithRenewedCoverAbortsOnLapse(t *testing.T) {
 			return nil // the abort never came: uncovered bytes would publish
 		}
 	})
-	if opErr == nil || !strings.Contains(opErr.Error(), "restore cover lapsed") {
+	if opErr == nil || !strings.Contains(opErr.Error(), "restore cover continuity lost") {
 		t.Fatalf("opErr = %v, want a cover-lapse abort", opErr)
 	}
 	if renewErr != nil {
 		t.Fatalf("renewErr = %v, want nil (op failed, no final refresh)", renewErr)
+	}
+}
+
+// TestWithRenewedCoverRejectsLateSuccess (Codex round 63): a renewal that
+// SUCCEEDS but completes after the prior cover's budget window cannot
+// prove continuity — the prior row may have expired mid-attempt, leaving
+// an uncovered gap a stale-floor admission can commit in — so it must
+// abort exactly like a lapse instead of resetting the coverage anchor.
+func TestWithRenewedCoverRejectsLateSuccess(t *testing.T) {
+	oldI, oldT, oldB := coverRenewInterval, coverRenewTimeout, coverLapseBudget
+	coverRenewInterval, coverRenewTimeout, coverLapseBudget = 10*time.Millisecond, 100*time.Millisecond, 25*time.Millisecond
+	t.Cleanup(func() { coverRenewInterval, coverRenewTimeout, coverLapseBudget = oldI, oldT, oldB })
+
+	// Every renewal SUCCEEDS — but only after the budget window passed.
+	renew := func(context.Context) error {
+		time.Sleep(40 * time.Millisecond)
+		return nil
+	}
+	opErr, _ := WithRenewedCover(context.Background(), renew, func(opCtx context.Context) error {
+		select {
+		case <-opCtx.Done():
+			return context.Cause(opCtx)
+		case <-time.After(2 * time.Second):
+			return nil // late successes were accepted: the gap went unnoticed
+		}
+	})
+	if opErr == nil || !strings.Contains(opErr.Error(), "restore cover continuity lost") {
+		t.Fatalf("opErr = %v, want a continuity abort on late-completing renewals", opErr)
 	}
 }
 
