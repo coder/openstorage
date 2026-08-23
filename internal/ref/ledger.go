@@ -793,6 +793,14 @@ UPDATE lfs_objects SET key = $1 WHERE repo = $2 AND key = $3
 				key, repo, legacy); err != nil {
 				return err
 			}
+			// Reconcile a TWIN a racing v0.2.0 registration left behind
+			// (Codex round 79): once both spellings have rows, the guard
+			// above never migrates again — delete the legacy row and
+			// refund its count and bytes, or the object stays
+			// double-counted forever.
+			if _, err := reconcileLegacyLFSRowPG(ctx, tx, repo, legacy, key); err != nil {
+				return err
+			}
 		}
 		ct, err := tx.Exec(ctx,
 			`INSERT INTO lfs_objects (repo, key, bytes) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
@@ -833,6 +841,85 @@ ON CONFLICT (repo) DO UPDATE SET gen = lfs_adoption_gens.gen + 1`, repo); err !=
 		}
 		return creditUsagePG(ctx, tx, repo, bytes)
 	})
+}
+
+// reconcileLegacyLFSRowPG deletes repo's legacy-spelled lfs_objects row
+// when its canonical twin exists, refunding the object count and usage
+// bytes it double-charged (ADR-41, Codex round 79). Reports whether a row
+// was reconciled.
+func reconcileLegacyLFSRowPG(ctx context.Context, tx pgx.Tx, repo, legacy, canonical string) (bool, error) {
+	var legacyBytes int64
+	switch err := tx.QueryRow(ctx, `
+DELETE FROM lfs_objects WHERE repo = $1 AND key = $2
+  AND EXISTS (SELECT 1 FROM lfs_objects c WHERE c.repo = $1 AND c.key = $3)
+RETURNING bytes`, repo, legacy, canonical).Scan(&legacyBytes); {
+	case errors.Is(err, pgx.ErrNoRows):
+		return false, nil
+	case err != nil:
+		return false, err
+	}
+	if _, err := tx.Exec(ctx,
+		`UPDATE lfs_object_counts SET count = GREATEST(count - 1, 0) WHERE repo = $1`, repo); err != nil {
+		return false, err
+	}
+	if _, err := tx.Exec(ctx,
+		`UPDATE pack_usage SET bytes = GREATEST(bytes - $2, 0) WHERE repo = $1`, repo, legacyBytes); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// ReconcileLegacyLFSObjects — see RefStore.
+func (s *PG) ReconcileLegacyLFSObjects(ctx context.Context) (int64, error) {
+	rows, err := s.pool.Query(ctx, `
+SELECT l.repo, l.key FROM lfs_objects l
+WHERE strpos(l.key, '/o2/') = 0
+  AND EXISTS (SELECT 1 FROM lfs_objects c WHERE c.repo = l.repo
+    AND c.key = 'lfs/' || l.repo || '/o2/' || substr(l.key, char_length('lfs/' || l.repo || '/') + 1))`)
+	if err != nil {
+		return 0, err
+	}
+	type cand struct{ repo, key string }
+	var cands []cand
+	for rows.Next() {
+		var c cand
+		if err := rows.Scan(&c.repo, &c.key); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		cands = append(cands, c)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	var n int64
+	for _, c := range cands {
+		canonical, ok := canonicalFromLegacyLFSRowKey(c.repo, c.key)
+		if !ok {
+			continue // defensive: candidate selection and Go parsing disagree
+		}
+		if err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+			done, err := reconcileLegacyLFSRowPG(ctx, tx, c.repo, c.key, canonical)
+			if done {
+				n++
+			}
+			return err
+		}); err != nil {
+			return n, err
+		}
+	}
+	return n, nil
+}
+
+// canonicalFromLegacyLFSRowKey maps a legacy row key (lfs/<repo>/<oid>)
+// back to its canonical spelling, the inverse of lfsLegacyRowKey.
+func canonicalFromLegacyLFSRowKey(repo, legacy string) (string, bool) {
+	oid, found := strings.CutPrefix(legacy, "lfs/"+repo+"/")
+	if !found || oid == "" || strings.Contains(oid, "/") {
+		return "", false
+	}
+	return "lfs/" + repo + "/o2/" + oid, true
 }
 
 // GuardedLFSDelete — see RefStore. The counter row lock is the

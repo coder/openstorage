@@ -155,6 +155,14 @@ type RefStore interface {
 	// sweeper calls it on its cadence). olderThan=0 expires everything —
 	// a test/recovery escape hatch. Returns the number of rows deleted.
 	SweepExpiredPackReservations(ctx context.Context, olderThan time.Duration) (int64, error)
+	// ReconcileLegacyLFSObjects deletes legacy-spelled lfs_objects rows
+	// whose canonical twin exists, refunding the count and bytes each
+	// double-charged, and returns how many it reconciled (ADR-41, Codex
+	// round 79): a rolling upgrade can commit a v0.2.0 legacy
+	// registration alongside the canonical row, after which the fast
+	// paths never call registration for the object again — without this
+	// janitor the twin would overstate usage and the object cap forever.
+	ReconcileLegacyLFSObjects(ctx context.Context) (int64, error)
 	// IsRetainedPack reports whether (repo, key) is recorded as a
 	// superseded-by-repack blob (issue #31): its row was folded away by
 	// ReplacePacks but its bytes still occupy the pack prefix. A point

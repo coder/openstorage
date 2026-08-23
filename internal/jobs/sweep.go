@@ -83,6 +83,11 @@ type PackRegistry interface {
 	// crashed pushes (issue #29); expired rows already stopped gating
 	// admission, so this is pure garbage collection.
 	SweepExpiredPackReservations(ctx context.Context, olderThan time.Duration) (int64, error)
+	// ReconcileLegacyLFSObjects deletes legacy-spelled LFS registry rows
+	// whose canonical twin exists, refunding what they double-charged
+	// (ADR-41, Codex round 79) — rolling-upgrade races can strand such
+	// twins where no registration ever runs again.
+	ReconcileLegacyLFSObjects(ctx context.Context) (int64, error)
 }
 
 // SweepConfig controls one sweeper's classification and disposal.
@@ -275,6 +280,14 @@ func (s *Sweeper) Sweep(ctx context.Context) (SweepReport, error) {
 				s.logger.Info("orphan pack sweep: pruned expired pack reservations", "count", n)
 			}
 		}
+	}
+	// Legacy/canonical LFS row twins stranded by rolling-upgrade races
+	// (ADR-41, Codex round 79): no registration ever runs again for
+	// them, so the sweeper is the janitor that ends the double-count.
+	if n, err := s.packs.ReconcileLegacyLFSObjects(ctx); err != nil {
+		deleteErrs.add(fmt.Errorf("sweep: reconcile legacy lfs rows: %w", err))
+	} else if n > 0 {
+		s.logger.Info("orphan pack sweep: reconciled legacy lfs row twins", "count", n)
 	}
 	// Stream packs/ page-wise and classify each object with a point
 	// registry read (PackRegistry.HasPack): both the blob population and a

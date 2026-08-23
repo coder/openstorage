@@ -70,6 +70,9 @@ func (f *fakeInner) ReservePackBytes(context.Context, []string, []ref.Pack, stri
 func (f *fakeInner) SweepExpiredPackReservations(context.Context, time.Duration) (int64, error) {
 	return 0, nil
 }
+func (f *fakeInner) ReconcileLegacyLFSObjects(context.Context) (int64, error) {
+	return 0, nil
+}
 func (f *fakeInner) IsRetainedPack(context.Context, string, string) (bool, error) {
 	return false, nil
 }

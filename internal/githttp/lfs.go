@@ -330,6 +330,17 @@ func (s *Server) lfsBatchDownload(r *http.Request, repoElem string, target repoT
 		key = blob.LFSLegacyKey(target.repo.RepoID, obj.OID)
 	}
 	size, err := s.Blob.Stat(r.Context(), key)
+	if errors.Is(err, blob.ErrNotFound) && !registered {
+		// The registry read races the object's first post-upgrade
+		// adoption (Codex round 79): a commit between the read and this
+		// stat deletes the legacy source, and a plain 404 here would be
+		// false — the verified canonical object is healthy. Re-check and
+		// retry canonically.
+		if reg2, rerr2 := s.Store.HasLFSObject(r.Context(), target.repo.RepoID, blob.LFSKey(target.repo.RepoID, obj.OID)); rerr2 == nil && reg2 {
+			key = blob.LFSKey(target.repo.RepoID, obj.OID)
+			size, err = s.Blob.Stat(r.Context(), key)
+		}
+	}
 	if errors.Is(err, blob.ErrNotFound) {
 		lfsObjectFail(&res, http.StatusNotFound, "object not found")
 		return res
@@ -1314,40 +1325,68 @@ func (s *Server) copyLegacyLFSObject(ctx context.Context, repoID, key, oid, clai
 		// re-upload through the verified proxy.
 		return 0, fmt.Errorf("legacy source %s: %w", legacyKey, err)
 	}
+	doCopy := func(opCtx context.Context) error {
+		// Lease fence: renew immediately before the copy and bound the
+		// copy WELL inside the fresh ref.AdoptionClaimTTL. Only the live
+		// lease holder ever writes the canonical key on the adoption
+		// side, so a stale worker cannot overwrite a successor's
+		// verified or registered canonical bytes — its renewal fails
+		// here instead.
+		rctx, rcancel := context.WithTimeout(opCtx, lfsClaimRenewTimeout)
+		renewed, rerr := s.Store.RenewAdoptionClaim(rctx, key, claimOwner)
+		rcancel()
+		if rerr != nil {
+			return fmt.Errorf("renew claim before canonical copy: %w", rerr)
+		}
+		if !renewed {
+			return errLFSBusy // lease lost: the successor owns the copy now
+		}
+		bound := min(5*time.Minute+time.Duration(size>>20)*time.Second, ref.AdoptionClaimTTL-5*time.Minute)
+		cctx, ccancel := context.WithTimeout(opCtx, bound)
+		defer ccancel()
+		if err := s.Blob.Copy(cctx, key, legacyKey); err != nil {
+			return fmt.Errorf("canonicalize %s: %w", legacyKey, err)
+		}
+		return nil
+	}
+	// Detached from the requester like the verification itself (Codex
+	// round 31's argument applies to the copy equally): a client
+	// canceling mid-copy would otherwise replay multipart copies of a
+	// large object on every retry. The copy stays bounded above and, when
+	// covered below, cancels on cover-continuity loss.
+	dctx := context.WithoutCancel(ctx)
+	if size <= 0 || s.PackQuotaBytes <= 0 {
+		// No floors to protect (quota disabled) or nothing to account.
+		if err := doCopy(dctx); err != nil {
+			return 0, err
+		}
+		return size, nil
+	}
 	// Stale-floor cover (the round-57/58 pattern): the copy creates NEW
 	// physical bytes invisible both to floors scanned before it and to
 	// the usage counter until registration commits — an admission holding
 	// such a floor would under-count by the copy's size for the whole
-	// size-scaled verify window. Account them BEFORE they exist; the TTL
-	// collects the cover (settlement consumes only the blob key's own
-	// spellings). Skipped when quota is disabled: no floors to protect.
-	if size > 0 && s.PackQuotaBytes > 0 {
-		cvCtx, cvCancel := context.WithTimeout(ctx, UsageFloorHandoffMargin)
-		err := ref.ReserveRestoreCover(cvCtx, s.Store, blob.QuotaRepoGroup(repoID), key, size, s.lfsReservationTTL())
-		cvCancel()
-		if err != nil {
-			return 0, fmt.Errorf("adoption copy cover %s: %w", key, err)
-		}
+	// copy window. A ONE-SHOT cover is not enough (Codex round 79): the
+	// reservation TTL may be as short as ~61s while a large multipart
+	// copy legitimately runs for many minutes, so the cover is renewed
+	// through the copy and refreshed for the stale-floor tail by
+	// blob.WithRenewedCover, exactly like the restore paths. Continuity
+	// loss aborts the copy — uncovered bytes must never become physical.
+	// No handoff: the registration that follows bumps the adoption
+	// generation atomically, and a copy whose registration never happens
+	// is re-covered by the next attempt (floors rescan both spellings
+	// meanwhile — conservative).
+	renewCover := func(rctx context.Context) error {
+		return ref.ReserveRestoreCover(rctx, s.Store, blob.QuotaRepoGroup(repoID), key, size, s.lfsReservationTTL())
 	}
-	// Lease fence: renew immediately before the copy and bound the copy
-	// WELL inside the fresh ref.AdoptionClaimTTL. Only the live lease
-	// holder ever writes the canonical key on the adoption side, so a
-	// stale worker cannot overwrite a successor's verified or registered
-	// canonical bytes — its renewal fails here instead.
-	rctx, rcancel := context.WithTimeout(ctx, lfsClaimRenewTimeout)
-	renewed, rerr := s.Store.RenewAdoptionClaim(rctx, key, claimOwner)
-	rcancel()
-	if rerr != nil {
-		return 0, fmt.Errorf("renew claim before canonical copy: %w", rerr)
+	copyErr, renewErr := blob.WithRenewedCover(dctx, renewCover, doCopy, nil)
+	if copyErr != nil {
+		return 0, fmt.Errorf("adoption copy %s: %w", key, copyErr)
 	}
-	if !renewed {
-		return 0, errLFSBusy // lease lost: the successor owns the copy now
-	}
-	bound := min(5*time.Minute+time.Duration(size>>20)*time.Second, ref.AdoptionClaimTTL-5*time.Minute)
-	cctx, ccancel := context.WithTimeout(ctx, bound)
-	defer ccancel()
-	if err := s.Blob.Copy(cctx, key, legacyKey); err != nil {
-		return 0, fmt.Errorf("canonicalize %s: %w", legacyKey, err)
+	if renewErr != nil {
+		// The bytes are durable and the cover tail broke: log like the
+		// restore paths — the next admission's fresh floor lists them.
+		log.Printf("lfs adopt %s: copy cover tail: %v", key, renewErr)
 	}
 	return size, nil
 }
@@ -1499,26 +1538,35 @@ func (s *Server) handleLFSObject(w http.ResponseWriter, r *http.Request, repo, o
 	}
 	key := blob.LFSKey(target.repo.RepoID, oid)
 	if r.Method == http.MethodGet {
-		// Same serve rule as the batch (Codex security round 78):
-		// registered → canonical only; rowless → legacy read-compat,
-		// never a mid-adoption unverified canonical copy.
-		registered, err := s.Store.HasLFSObject(r.Context(), target.repo.RepoID, key)
-		if err != nil {
-			log.Printf("lfs registry %s: %v", key, err)
-			lfsError(w, http.StatusInternalServerError, "object registry unavailable")
-			return
-		}
-		if !registered {
-			key = blob.LFSLegacyKey(target.repo.RepoID, oid)
-		}
-		s.lfsProxyDownload(w, r, key)
+		s.lfsProxyDownload(w, r, target.repo.RepoID, oid)
 		return
 	}
 	s.lfsProxyUpload(w, r, target, key, oid)
 }
 
-func (s *Server) lfsProxyDownload(w http.ResponseWriter, r *http.Request, key string) {
+func (s *Server) lfsProxyDownload(w http.ResponseWriter, r *http.Request, repoID, oid string) {
+	// Same serve rule as the batch (Codex security round 78): registered
+	// → canonical only; rowless → legacy read-compat, never a
+	// mid-adoption unverified canonical copy.
+	key := blob.LFSKey(repoID, oid)
+	registered, rerr := s.Store.HasLFSObject(r.Context(), repoID, key)
+	if rerr != nil {
+		log.Printf("lfs registry %s: %v", key, rerr)
+		lfsError(w, http.StatusInternalServerError, "object registry unavailable")
+		return
+	}
+	if !registered {
+		key = blob.LFSLegacyKey(repoID, oid)
+	}
 	size, err := s.Blob.Stat(r.Context(), key)
+	if errors.Is(err, blob.ErrNotFound) && !registered {
+		// Check-then-use race with the object's first post-upgrade
+		// adoption (Codex round 79) — same recheck as the batch path.
+		if reg2, rerr2 := s.Store.HasLFSObject(r.Context(), repoID, blob.LFSKey(repoID, oid)); rerr2 == nil && reg2 {
+			key = blob.LFSKey(repoID, oid)
+			size, err = s.Blob.Stat(r.Context(), key)
+		}
+	}
 	if errors.Is(err, blob.ErrNotFound) {
 		lfsError(w, http.StatusNotFound, "object not found")
 		return

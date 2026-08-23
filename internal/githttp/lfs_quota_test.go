@@ -730,6 +730,116 @@ func TestLFSAdoption_ImmuneToLegacyPresignReplay(t *testing.T) {
 	}
 }
 
+// staleRegistryOnce returns "not registered" for the FIRST canonical-key
+// registry read, simulating a read that raced the object's adoption
+// commit; every later read delegates.
+type staleRegistryOnce struct {
+	ref.RefStore
+	missed atomic.Bool
+}
+
+func (s *staleRegistryOnce) HasLFSObject(ctx context.Context, repo, key string) (bool, error) {
+	if strings.Contains(key, "/o2/") && !s.missed.Swap(true) {
+		return false, nil
+	}
+	return s.RefStore.HasLFSObject(ctx, repo, key)
+}
+
+// TestLFSDownload_RetriesCanonicalAfterAdoptionRace (Codex round 79): a
+// download's registry read can race the object's first post-upgrade
+// adoption — the read sees no row, the legacy source is deleted by the
+// adoption commit an instant later, and the legacy stat 404s even though
+// the verified canonical object is healthy. Both download surfaces must
+// re-check the registry and retry canonically instead of returning a
+// false 404.
+func TestLFSDownload_RetriesCanonicalAfterAdoptionRace(t *testing.T) {
+	ctx := context.Background()
+	for name, download := range map[string]func(t *testing.T, srv *Server, tok, oid string, size int64){
+		"batch": func(t *testing.T, srv *Server, tok, oid string, size int64) {
+			resp := decodeBatch(t, doLFS(t, srv, http.MethodPost, lfsBatchPath, "basic:"+tok,
+				`{"operation":"download","transfers":["basic"],"objects":[{"oid":"`+oid+`","size":1}]}`))
+			if resp.Objects[0].Error != nil || resp.Objects[0].Actions["download"] == nil {
+				t.Fatalf("raced download batch = %+v, want a download action — the false 404", resp.Objects[0])
+			}
+			if resp.Objects[0].Size != size {
+				t.Fatalf("raced download size = %d, want %d", resp.Objects[0].Size, size)
+			}
+		},
+		"object-get": func(t *testing.T, srv *Server, tok, oid string, size int64) {
+			w := doLFS(t, srv, http.MethodGet, "/"+lfsTestRepoURL+".git/info/lfs/objects/"+oid, "basic:"+tok, "")
+			if w.Code != http.StatusOK {
+				t.Fatalf("raced GET status = %d, body %s — the false 404", w.Code, w.Body)
+			}
+			if int64(w.Body.Len()) != size {
+				t.Fatalf("raced GET body = %d bytes, want %d", w.Body.Len(), size)
+			}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			srv, st, mint := newLFSQuotaServer(t, 0, time.Hour)
+			tok := mint(auth.ScopeGitWrite, auth.ScopeGitRead)
+			content := []byte("adopted an instant before the read")
+			oid := sha256Hex(content)
+			key := blob.LFSKey(lfsTestRepoID, oid)
+			// The post-adoption world: canonical bytes + row, NO legacy.
+			if err := srv.Blob.UploadFile(ctx, key, writeTempFile(t, content)); err != nil {
+				t.Fatal(err)
+			}
+			if err := st.RegisterLFSObject(ctx, lfsTestRepoID, key, int64(len(content))); err != nil {
+				t.Fatal(err)
+			}
+			// The download's first registry read predates the commit.
+			srv.Store = &staleRegistryOnce{RefStore: srv.Store}
+			download(t, srv, tok, oid, int64(len(content)))
+		})
+	}
+}
+
+// coverCountingStore counts repair-cover reservations (key suffix
+// ref.RepairCoverSuffix) passing through ReservePackBytes.
+type coverCountingStore struct {
+	ref.RefStore
+	covers atomic.Int64
+}
+
+func (c *coverCountingStore) ReservePackBytes(ctx context.Context, group []string, packs []ref.Pack, owner string, usageFloor, floorGen, quotaBytes int64, ttl time.Duration) (ref.ReserveDecision, error) {
+	if len(packs) == 1 && strings.HasSuffix(packs[0].Key, ref.RepairCoverSuffix) {
+		c.covers.Add(1)
+	}
+	return c.RefStore.ReservePackBytes(ctx, group, packs, owner, usageFloor, floorGen, quotaBytes, ttl)
+}
+
+// TestLFSAdoption_CopyCoverIsRenewed (Codex round 79): the adoption copy's
+// stale-floor cover must run under blob.WithRenewedCover — a one-shot
+// reservation with a near-minimum TTL (~61s) expires under a multipart
+// copy allowed many minutes, leaving admissions an uncovered window. The
+// renewed seam provably takes the initial cover AND the mandatory
+// post-copy tail refresh (≥2 reservations); the one-shot took exactly 1.
+func TestLFSAdoption_CopyCoverIsRenewed(t *testing.T) {
+	ctx := context.Background()
+	srv, st, mint := newLFSQuotaServer(t, 1<<20, time.Hour) // quota ENABLED: covers required
+	tok := mint(auth.ScopeGitWrite)
+	legacy := []byte("covered adoption copy")
+	oid := sha256Hex(legacy)
+	if err := srv.Blob.UploadFile(ctx, blob.LFSLegacyKey(lfsTestRepoID, oid), writeTempFile(t, legacy)); err != nil {
+		t.Fatal(err)
+	}
+	cs := &coverCountingStore{RefStore: srv.Store}
+	srv.Store = cs
+
+	resp := decodeBatch(t, doLFS(t, srv, http.MethodPost, lfsBatchPath, "basic:"+tok,
+		batchBody("upload", oid, int64(len(legacy)))))
+	if resp.Objects[0].Error != nil || resp.Objects[0].Actions != nil {
+		t.Fatalf("covered adoption failed: %+v", resp.Objects[0])
+	}
+	if has, err := st.HasLFSObject(ctx, lfsTestRepoID, blob.LFSKey(lfsTestRepoID, oid)); err != nil || !has {
+		t.Fatalf("object not adopted: %v, %v", has, err)
+	}
+	if got := cs.covers.Load(); got < 2 {
+		t.Fatalf("cover reservations during the copy = %d, want >= 2 (initial + mandatory tail refresh)", got)
+	}
+}
+
 // TestLFSAdoption_RegistrationRetryReverifiesReplacedBlob (Codex round
 // 77): the round-76 completed-hash memo trusted SIZE alone. During a
 // v0.1.0 rolling upgrade a still-valid legacy presigned PUT can overwrite

@@ -173,6 +173,10 @@ func (s *SimRefStore) SweepExpiredPackReservations(ctx context.Context, olderTha
 	return s.inner.SweepExpiredPackReservations(ctx, olderThan)
 }
 
+func (s *SimRefStore) ReconcileLegacyLFSObjects(ctx context.Context) (int64, error) {
+	return s.inner.ReconcileLegacyLFSObjects(ctx)
+}
+
 // IsRetainedPack delegates to the inner store.
 func (s *SimRefStore) IsRetainedPack(ctx context.Context, repo, key string) (bool, error) {
 	return s.inner.IsRetainedPack(ctx, repo, key)

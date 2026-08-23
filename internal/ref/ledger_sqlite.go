@@ -284,12 +284,16 @@ func (s *SQLite) registerLFSObjectTx(ctx context.Context, repo, key string, byte
 	}
 	defer func() { _ = tx.Rollback() }()
 	// Migrate a v0.2.0 legacy-spelled row in place (zero growth) — see
-	// the PG twin (ADR-41).
+	// the PG twin (ADR-41) — and reconcile a twin a racing v0.2.0
+	// registration left behind (Codex round 79).
 	if legacy, ok := lfsLegacyRowKey(key); ok {
 		if _, err := tx.ExecContext(ctx, `
 UPDATE lfs_objects SET key = ? WHERE repo = ? AND key = ?
   AND NOT EXISTS (SELECT 1 FROM lfs_objects o2 WHERE o2.repo = ? AND o2.key = ?)`,
 			key, repo, legacy, repo, key); err != nil {
+			return err
+		}
+		if _, err := reconcileLegacyLFSRowSQLite(ctx, tx, repo, legacy, key); err != nil {
 			return err
 		}
 	}
@@ -340,6 +344,84 @@ ON CONFLICT (repo) DO UPDATE SET gen = lfs_adoption_gens.gen + 1`, repo); err !=
 		return fmt.Errorf("register lfs object commit: %w", err)
 	}
 	return nil
+}
+
+// reconcileLegacyLFSRowSQLite — see the PG twin (reconcileLegacyLFSRowPG).
+// Two-step under BEGIN IMMEDIATE (single writer): select-then-delete is
+// race-free here.
+func reconcileLegacyLFSRowSQLite(ctx context.Context, tx *sql.Tx, repo, legacy, canonical string) (bool, error) {
+	var legacyBytes int64
+	switch err := tx.QueryRowContext(ctx, `
+SELECT bytes FROM lfs_objects WHERE repo = ? AND key = ?
+  AND EXISTS (SELECT 1 FROM lfs_objects c WHERE c.repo = ? AND c.key = ?)`,
+		repo, legacy, repo, canonical).Scan(&legacyBytes); {
+	case errors.Is(err, sql.ErrNoRows):
+		return false, nil
+	case err != nil:
+		return false, err
+	}
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM lfs_objects WHERE repo = ? AND key = ?`, repo, legacy); err != nil {
+		return false, err
+	}
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE lfs_object_counts SET count = MAX(count - 1, 0) WHERE repo = ?`, repo); err != nil {
+		return false, err
+	}
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE pack_usage SET bytes = MAX(bytes - ?, 0) WHERE repo = ?`, legacyBytes, repo); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// ReconcileLegacyLFSObjects — see RefStore.
+func (s *SQLite) ReconcileLegacyLFSObjects(ctx context.Context) (int64, error) {
+	rows, err := s.db.QueryContext(ctx, `
+SELECT l.repo, l.key FROM lfs_objects l
+WHERE instr(l.key, '/o2/') = 0
+  AND EXISTS (SELECT 1 FROM lfs_objects c WHERE c.repo = l.repo
+    AND c.key = 'lfs/' || l.repo || '/o2/' || substr(l.key, length('lfs/' || l.repo || '/') + 1))`)
+	if err != nil {
+		return 0, err
+	}
+	type cand struct{ repo, key string }
+	var cands []cand
+	for rows.Next() {
+		var c cand
+		if err := rows.Scan(&c.repo, &c.key); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		cands = append(cands, c)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	var n int64
+	for _, c := range cands {
+		canonical, ok := canonicalFromLegacyLFSRowKey(c.repo, c.key)
+		if !ok {
+			continue // defensive: candidate selection and Go parsing disagree
+		}
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return n, err
+		}
+		done, err := reconcileLegacyLFSRowSQLite(ctx, tx, c.repo, c.key, canonical)
+		if err != nil {
+			_ = tx.Rollback()
+			return n, err
+		}
+		if err := tx.Commit(); err != nil {
+			return n, err
+		}
+		if done {
+			n++
+		}
+	}
+	return n, nil
 }
 
 // BumpLFSAdoptionGen — see RefStore (Codex round 49).
