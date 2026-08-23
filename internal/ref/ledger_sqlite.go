@@ -35,18 +35,26 @@ func (s *SQLite) ReservePackBytes(ctx context.Context, group []string, packs []P
 	}
 	// One aggregate read; the IMMEDIATE transaction serializes every
 	// writer, so this snapshot cannot interleave with a concurrent
-	// reserve or register.
-	groupArgs := make([]any, 0, len(group)+2*(len(packs)+2))
+	// reserve or register. The byte SUM excludes BOTH era spellings of
+	// this push's keys while the row-cap COUNT excludes only this
+	// binary's spellings — see the PG twin and reservRowKeys.
+	keys := make([]string, len(packs))
+	for i, p := range packs {
+		keys[i] = p.Key
+	}
+	excludeSum := reservKeySpellings(keys...)
+	excludeCount := reservRowKeys(keys)
+	groupArgs := make([]any, 0, len(group)+4+len(excludeSum)+len(excludeCount))
 	for _, r := range group {
 		groupArgs = append(groupArgs, r)
 	}
-	// Twice: the reserved-bytes SUM and the active-row COUNT repeat the
-	// same predicate (repo, TTL window, excluding this push's keys).
-	for range 2 {
-		groupArgs = append(groupArgs, group[0], ttl.Milliseconds())
-		for _, p := range packs {
-			groupArgs = append(groupArgs, p.Key)
-		}
+	groupArgs = append(groupArgs, group[0], ttl.Milliseconds())
+	for _, k := range excludeSum {
+		groupArgs = append(groupArgs, k)
+	}
+	groupArgs = append(groupArgs, group[0], ttl.Milliseconds())
+	for _, k := range excludeCount {
+		groupArgs = append(groupArgs, k)
 	}
 	var counter, reserved, activeRows int64
 	if err := tx.QueryRowContext(ctx, `
@@ -55,11 +63,11 @@ SELECT
   COALESCE((SELECT SUM(bytes) FROM pack_reservations
             WHERE repo = ?
               AND created_at > `+sqliteEpochMS+` - ?
-              AND key NOT IN (?`+placeholders(len(packs)-1)+`)), 0),
+              AND key NOT IN (?`+placeholders(len(excludeSum)-1)+`)), 0),
   (SELECT COUNT(*) FROM pack_reservations
    WHERE repo = ?
      AND created_at > `+sqliteEpochMS+` - ?
-     AND key NOT IN (?`+placeholders(len(packs)-1)+`))`,
+     AND key NOT IN (?`+placeholders(len(excludeCount)-1)+`))`,
 		groupArgs...).Scan(&counter, &reserved, &activeRows); err != nil {
 		return ReserveDecision{}, fmt.Errorf("reserve pack bytes read: %w", err)
 	}
@@ -72,9 +80,10 @@ SELECT
 		return dec, nil // denied; the deferred rollback discards nothing
 	}
 	for _, p := range packs {
-		// Same-key upsert (see the PG twin): retries refresh, never wedge;
-		// the refresh KEEPS the existing owner (Codex round 5) and gen
-		// (round 33 — the row incarnation the retirement must present),
+		// Same-key upsert (see the PG twin): retries refresh, never
+		// wedge; the row lives under this binary's era spelling (see
+		// reservKeySuffix — the v0.1.0 fence), the refresh KEEPS gen
+		// (round 33 — the row incarnation the retirement must present)
 		// and takes the MAX of the declared byte values (Codex round 7).
 		if _, err := tx.ExecContext(ctx, `
 INSERT INTO pack_reservations (key, repo, bytes, owner, created_at, gen)
@@ -84,13 +93,13 @@ ON CONFLICT (key) DO UPDATE SET repo = excluded.repo,
                                 owner = excluded.owner,
                                 created_at = excluded.created_at,
                                 attempts = pack_reservations.attempts + 1`,
-			p.Key, group[0], p.Size, owner, NewReservationOwner()); err != nil {
+			reservRowKey(p.Key), group[0], p.Size, owner, NewReservationOwner()); err != nil {
 			return ReserveDecision{}, fmt.Errorf("reserve pack bytes insert: %w", err)
 		}
 		var tok ReservationToken
 		var createdMS int64
 		if err := tx.QueryRowContext(ctx,
-			`SELECT gen, created_at FROM pack_reservations WHERE key = ?`, p.Key).Scan(&tok.Gen, &createdMS); err != nil {
+			`SELECT gen, created_at FROM pack_reservations WHERE key = ?`, reservRowKey(p.Key)).Scan(&tok.Gen, &createdMS); err != nil {
 			return ReserveDecision{}, fmt.Errorf("reserve pack bytes gen: %w", err)
 		}
 		tok.CreatedAt = time.UnixMilli(createdMS)
@@ -135,12 +144,12 @@ func (s *SQLite) RetirePackAttempts(ctx context.Context, group []string, gens ma
 	for key, tok := range gens {
 		if _, err := tx.ExecContext(ctx,
 			`UPDATE pack_reservations SET attempts = attempts - 1 WHERE repo = ? AND key = ? AND gen = ?`,
-			group[0], key, tok.Gen); err != nil {
+			group[0], reservRowKey(key), tok.Gen); err != nil {
 			return err
 		}
 		if _, err := tx.ExecContext(ctx,
 			`DELETE FROM pack_reservations WHERE repo = ? AND key = ? AND gen = ? AND attempts <= 0 AND created_at <= ?`,
-			group[0], key, tok.Gen, tok.CreatedAt.UnixMilli()); err != nil {
+			group[0], reservRowKey(key), tok.Gen, tok.CreatedAt.UnixMilli()); err != nil {
 			return err
 		}
 	}
@@ -232,8 +241,9 @@ func (s *SQLite) RegisterLFSObject(ctx context.Context, repo, key string, bytes 
 	validateRegisterLFS(repo, key, bytes)
 	err := s.registerLFSObjectTx(ctx, repo, key, bytes)
 	if errors.Is(err, ErrLFSObjectCapExceeded) {
-		// Retire the cap loser's reservation — see the PG twin.
-		if _, derr := s.db.ExecContext(ctx, `DELETE FROM pack_reservations WHERE key = ?`, key); derr != nil {
+		// Retire the cap loser's reservation — see the PG twin (era
+		// spelling only: nothing was credited).
+		if _, derr := s.db.ExecContext(ctx, `DELETE FROM pack_reservations WHERE key = ?`, reservRowKey(key)); derr != nil {
 			return errors.Join(err, fmt.Errorf("retire cap-denied reservation %s: %w", key, derr))
 		}
 	}
@@ -271,8 +281,9 @@ RETURNING count`, repo).Scan(&count); err != nil {
 			return ErrLFSObjectCapExceeded // the deferred rollback discards insert + increment
 		}
 	}
+	// Settlement consumes BOTH era spellings — see the PG twin.
 	if _, err := tx.ExecContext(ctx,
-		`DELETE FROM pack_reservations WHERE key = ?`, key); err != nil {
+		`DELETE FROM pack_reservations WHERE key IN (?, ?)`, reservRowKey(key), key); err != nil {
 		return err
 	}
 	if inserted > 0 {
@@ -331,6 +342,8 @@ func (s *SQLite) HasLFSObject(ctx context.Context, repo, key string) (bool, erro
 // QuotaLedgerState reads the group's ledger state (see the PG twin).
 func (s *SQLite) QuotaLedgerState(ctx context.Context, group []string, ttl time.Duration, excludeKeys ...string) (PackQuotaLedgerState, error) {
 	assertf(len(group) > 0 && group[0] != "" && ttl > 0, "QuotaLedgerState(%v, %v)", group, ttl)
+	// Both era spellings per excluded key — see the PG twin.
+	excludeKeys = reservKeySpellings(excludeKeys...)
 	exclude := ""
 	args := make([]any, 0, 2*len(group)+2+len(excludeKeys))
 	for _, r := range group {

@@ -343,8 +343,9 @@ func (s *SQLite) RegisterPacks(ctx context.Context, repo string, packs []Pack) e
 			}
 			credit += c
 		}
+		// Settlement consumes BOTH era spellings — see the PG twin.
 		if _, err := tx.ExecContext(ctx,
-			`DELETE FROM pack_reservations WHERE key = ?`, p.Key); err != nil {
+			`DELETE FROM pack_reservations WHERE key IN (?, ?)`, reservRowKey(p.Key), p.Key); err != nil {
 			return err
 		}
 	}

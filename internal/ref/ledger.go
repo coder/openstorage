@@ -4,13 +4,15 @@
 //
 // Three tables (created by InitSchema on both backends):
 //
-//   - pack_reservations(key PK, repo, bytes, owner, created_at): one row
-//     per in-flight incoming pack, keyed by the content-addressed blob key.
-//     Inserted by ReservePackBytes BEFORE the blob upload; consumed
-//     (deleted) by RegisterPacks in the registration transaction; expired
-//     rows are ignored by admission and pruned on the sweeper cadence.
-//     A crash between reserve and register therefore over-reserves for at
-//     most the TTL — admission control, never a byte-exact ledger.
+//   - pack_reservations(key PK, repo, bytes, owner, created_at, attempts,
+//     gen): one row per in-flight incoming pack, keyed by the
+//     content-addressed blob key under this binary's era spelling
+//     (reservRowKey — the v0.1.0 mixed-fleet fence). Inserted by
+//     ReservePackBytes BEFORE the blob upload; consumed (deleted) by
+//     RegisterPacks in the registration transaction; expired rows are
+//     ignored by admission and pruned on the sweeper cadence. A crash
+//     between reserve and register therefore over-reserves for at most
+//     the TTL — admission control, never a byte-exact ledger.
 //   - pack_usage(repo PK, bytes): the maintained per-repo usage counter.
 //     RegisterPacks credits newly inserted rows' sizes; ReplacePacks
 //     credits the fold's consolidated pack; ReclaimRetainedPack debits
@@ -62,14 +64,10 @@
 // retries — a client whose push died between reserve and upload would be
 // locked out for the full TTL, the exact wedge class issue #21's reviews
 // eliminated. Same-key re-reservation instead refreshes the row (bytes
-// counted once — identical keys are identical bytes), KEEPING the original
-// owner (issue #51, Codex round 5): a refresh that took ownership would
-// let the newcomer's failure cleanup free the one row backing the original
-// writer's still-staging upload — an upload-duration-sized window for
-// uncounted growth. The inverse hazard (the original's failure cleanup
-// firing in the instants after a newcomer's refresh) is accepted as the
-// lesser risk: failure and release are one code path, so that window is
-// tiny, and the miss only leaves a TTL-bounded row.
+// counted once — identical keys are identical bytes) and counts the writer
+// in the row's attempts refcount (Codex round 30): clean failures retire
+// attempts token-bound (RetirePackAttempts), and the row ends at
+// settlement, zero attempts, or TTL — never by any owner-scoped delete.
 
 package ref
 
@@ -87,23 +85,71 @@ import (
 )
 
 // NewReservationOwner mints the random owner token stamped on one writer's
-// reservation rows. The owner is provenance only for THIS binary (Codex
-// round 22): rows end by settlement (RegisterPacks/RegisterLFSObject
-// consume by KEY), token-bound retirement, or TTL expiry — same-key rows
-// are shared by every concurrent writer via refresh, so no owner-scoped
-// delete can ever be sound. The refresh deliberately ROTATES the row's
-// owner to the newest writer's token (Codex round 34): pre-round-22
-// binaries (v0.1.0) still run the owner-scoped ReleasePackReservations on
-// clean failures, and rotating the owner makes any row a NEW writer shares
-// unmatchable by a legacy release — the legacy inserter's failure can no
-// longer delete the reservation protecting the new writer mid-upgrade. A
-// row only legacy writers touch keeps legacy semantics.
+// reservation rows. The owner is pure provenance (Codex round 22): rows
+// end by settlement (RegisterPacks/RegisterLFSObject consume by key),
+// token-bound retirement (RetirePackAttempts), or TTL expiry — same-key
+// rows are shared by every concurrent writer via refresh, so no
+// owner-scoped delete can ever be sound. The mixed-fleet fence against
+// v0.1.0's owner-scoped release lives in the row SPELLING, not in this
+// column's value — see reservKeySuffix.
 func NewReservationOwner() string {
 	var b [16]byte
 	if _, err := rand.Read(b[:]); err != nil {
 		panic(fmt.Sprintf("ref assertion failed: reservation owner entropy: %v", err))
 	}
 	return hex.EncodeToString(b[:])
+}
+
+// reservKeySuffix marks reservation rows minted by attempt-protocol
+// binaries (Codex round 35). v0.1.0 replicas address rows by RAW blob key,
+// and their statements are destructive to any row they reach: the legacy
+// upsert CAPTURES a shared row (owner rotated to the legacy token, bytes
+// clobbered — no GREATEST), and the legacy owner-scoped
+// ReleasePackReservations then deletes it on a clean failure — freeing
+// headroom every other same-key writer still stages under. Round 34's
+// owner rotation fenced only the ordering where this binary's refresh ran
+// last; no column VALUE survives a later legacy refresh. So this binary's
+// rows are fenced by SPELLING instead: blob keys are single-line paths
+// (server-generated IDs, hex digests, fixed segments — never a newline),
+// making era rows unreachable by every legacy plain-key statement in
+// EITHER order. Both eras still meet in the repo-scoped admission SUMs,
+// so a cross-era same-key twin double-counts reserved bytes
+// conservatively until the legacy row settles, releases, or expires
+// (deny-safe, and only during the upgrade roll).
+const reservKeySuffix = "\na2"
+
+// reservRowKey maps a blob key to this binary's reservation-row spelling.
+func reservRowKey(key string) string {
+	assertf(key != "" && !strings.Contains(key, "\n"), "reservRowKey(%q)", key)
+	return key + reservKeySuffix
+}
+
+// reservRowKeys maps blob keys to this binary's row spellings — the rows a
+// reserve refreshes rather than inserts (the row-cap exclusion set; a
+// legacy twin stays counted there because it is a physical row the upsert
+// does NOT refresh).
+func reservRowKeys(keys []string) []string {
+	out := make([]string, len(keys))
+	for i, k := range keys {
+		out[i] = reservRowKey(k)
+	}
+	return out
+}
+
+// reservKeySpellings returns every spelling a blob key's reservation may
+// occupy — this binary's era row plus a legacy twin. Settlement consumes
+// both (the key's bytes just moved to the usage counter, so either row is
+// a stale double-count; v0.1.0's own settle consumes by raw key too), and
+// admission byte-SUMs exclude both (the batch's incoming counts those
+// bytes exactly once). Clean-failure retirement must NOT use this set:
+// nothing was credited, and the legacy twin may still protect a live
+// legacy writer — see RetirePackAttempts.
+func reservKeySpellings(keys ...string) []string {
+	out := make([]string, 0, 2*len(keys))
+	for _, k := range keys {
+		out = append(out, reservRowKey(k), k)
+	}
+	return out
 }
 
 // ReserveDecision reports one admission decision. UsedBytes and
@@ -281,7 +327,11 @@ DELETE FROM pack_reservations WHERE repo = $1 AND created_at <= now() - make_int
 		}
 		// ONE statement = one snapshot: a concurrent registration moves a
 		// key's bytes from reservation to counter atomically, so either
-		// side of that move is counted here, never neither.
+		// side of that move is counted here, never neither. The byte SUM
+		// excludes BOTH spellings of this push's keys (a legacy twin's
+		// bytes are this push's own incoming, counted once via `incoming`)
+		// while the row-cap COUNT excludes only this binary's spellings —
+		// see reservRowKeys.
 		var counter, reserved, activeRows int64
 		if err := tx.QueryRow(ctx, `
 SELECT
@@ -293,8 +343,8 @@ SELECT
   (SELECT COUNT(*) FROM pack_reservations
    WHERE repo = $2
      AND created_at > now() - make_interval(secs => $3)
-     AND NOT (key = ANY($4)))`,
-			group, group[0], ttl.Seconds(), keys).Scan(&counter, &reserved, &activeRows); err != nil {
+     AND NOT (key = ANY($5)))`,
+			group, group[0], ttl.Seconds(), reservKeySpellings(keys...), reservRowKeys(keys)).Scan(&counter, &reserved, &activeRows); err != nil {
 			return err
 		}
 		dec = ReserveDecision{UsedBytes: max(counter, usageFloor), ReservedBytes: reserved}
@@ -309,16 +359,16 @@ SELECT
 			// Same-key upsert: a crash-window retry (or a concurrent
 			// identical push) refreshes the row instead of conflicting, so
 			// identical bytes are counted once and retries never wedge.
-			// The refresh deliberately KEEPS the existing owner (Codex
-			// round 5 on #51; owner is now vestigial for LFS keys, whose
-			// rows end only by settle or TTL) and takes the MAXIMUM of the
-			// declared byte values (Codex round 7): declared sizes are
-			// client input, so a shrinking refresh would let a one-byte
-			// same-key PUT free headroom a concurrent larger upload is
-			// still staging under. Monotone growth until settlement is the
-			// conservative side — settlement replaces the row with the
-			// verified actual size in the usage counter, so an inflated
-			// declaration lives at most until settle or TTL.
+			// The row lives under this binary's era spelling (see
+			// reservKeySuffix): no v0.1.0 statement can capture or delete
+			// it. The refresh takes the MAXIMUM of the declared byte
+			// values (Codex round 7): declared sizes are client input, so
+			// a shrinking refresh would let a one-byte same-key PUT free
+			// headroom a concurrent larger upload is still staging under.
+			// Monotone growth until settlement is the conservative side —
+			// settlement replaces the row with the verified actual size in
+			// the usage counter, so an inflated declaration lives at most
+			// until settle or TTL.
 			// attempts counts the live same-key writers sharing this row
 			// (Codex round 30): every reserve/refresh adds one, a clean
 			// failure retires one (RetirePackAttempts), and the row ends
@@ -336,7 +386,7 @@ ON CONFLICT (key) DO UPDATE SET repo = EXCLUDED.repo,
                                 created_at = now(),
                                 attempts = pack_reservations.attempts + 1
 RETURNING gen, created_at`,
-				p.Key, group[0], p.Size, owner, NewReservationOwner()).Scan(&tok.Gen, &tok.CreatedAt); err != nil {
+				reservRowKey(p.Key), group[0], p.Size, owner, NewReservationOwner()).Scan(&tok.Gen, &tok.CreatedAt); err != nil {
 				return err
 			}
 			if dec.Gens == nil {
@@ -368,18 +418,19 @@ func (s *PG) RetirePackAttempts(ctx context.Context, group []string, gens map[st
 			// row created after this caller's expired and was pruned
 			// carries a different gen and is untouched. The DELETE
 			// additionally requires created_at unchanged since this
-			// caller's own reserve — ANY later refresh, including a
-			// pre-attempt binary's (which bumps created_at without
-			// incrementing attempts, the mixed-fleet hazard), retains the
-			// row for the TTL.
+			// caller's own reserve — a later same-key refresh retains the
+			// row for the TTL. Both statements address only this binary's
+			// era spelling: retirement is a clean-FAILURE path (nothing
+			// was credited), so a legacy twin row — possibly protecting a
+			// live legacy writer — is left to its own binary's lifecycle.
 			if _, err := tx.Exec(ctx, `
 UPDATE pack_reservations SET attempts = attempts - 1 WHERE repo = $1 AND key = $2 AND gen = $3`,
-				group[0], key, tok.Gen); err != nil {
+				group[0], reservRowKey(key), tok.Gen); err != nil {
 				return err
 			}
 			if _, err := tx.Exec(ctx, `
 DELETE FROM pack_reservations WHERE repo = $1 AND key = $2 AND gen = $3 AND attempts <= 0 AND created_at <= $4`,
-				group[0], key, tok.Gen, tok.CreatedAt); err != nil {
+				group[0], reservRowKey(key), tok.Gen, tok.CreatedAt); err != nil {
 				return err
 			}
 		}
@@ -495,8 +546,10 @@ func (s *PG) RegisterLFSObject(ctx context.Context, repo, key string, bytes int6
 		// full TTL. Safe against same-key peers still staging: durable
 		// usage requires a fresh pre-publish admission plus a
 		// lease-bounded registration, both of which re-run after this
-		// delete. Best-effort — a failure just leaves TTL behavior.
-		if _, derr := s.pool.Exec(ctx, `DELETE FROM pack_reservations WHERE key = $1`, key); derr != nil {
+		// delete. Era spelling only — this is a clean failure (nothing
+		// credited), so a legacy twin row keeps protecting its own
+		// writer. Best-effort — a failure just leaves TTL behavior.
+		if _, derr := s.pool.Exec(ctx, `DELETE FROM pack_reservations WHERE key = $1`, reservRowKey(key)); derr != nil {
 			return errors.Join(err, fmt.Errorf("retire cap-denied reservation %s: %w", key, derr))
 		}
 	}
@@ -523,8 +576,11 @@ RETURNING count`, repo).Scan(&count); err != nil {
 				return ErrLFSObjectCapExceeded // rolls back insert + increment
 			}
 		}
+		// Settlement consumes BOTH era spellings (see reservKeySpellings):
+		// the key's bytes are in the usage counter now, so a legacy twin
+		// row would only double-count.
 		if _, err := tx.Exec(ctx,
-			`DELETE FROM pack_reservations WHERE key = $1`, key); err != nil {
+			`DELETE FROM pack_reservations WHERE key = ANY($1)`, reservKeySpellings(key)); err != nil {
 			return err
 		}
 		if ct.RowsAffected() == 0 {
@@ -601,9 +657,9 @@ type PackQuotaLedgerState struct {
 // QuotaLedgerState reads the group's ledger state (see PackQuotaLedgerState).
 func (s *PG) QuotaLedgerState(ctx context.Context, group []string, ttl time.Duration, excludeKeys ...string) (PackQuotaLedgerState, error) {
 	assertf(len(group) > 0 && group[0] != "" && ttl > 0, "QuotaLedgerState(%v, %v)", group, ttl)
-	if excludeKeys == nil {
-		excludeKeys = []string{}
-	}
+	// Both era spellings per excluded key — the advisory-admission mirror
+	// of ReservePackBytes' byte-SUM exclusion (see reservKeySpellings).
+	excludeKeys = reservKeySpellings(excludeKeys...)
 	var st PackQuotaLedgerState
 	err := s.pool.QueryRow(ctx, `
 SELECT

@@ -131,10 +131,10 @@ type RefStore interface {
 	// Callers retire only with EVIDENCE of non-publication (the blob
 	// provably absent) — ambiguous outcomes leave the row to settlement
 	// or TTL, and crashes never retire. Absent or re-minted keys are
-	// no-ops. Mixed fleets are safe: the delete also requires created_at
-	// unchanged since the retiring writer's own reserve, and a
-	// pre-attempt binary's refresh bumps created_at, so its same-key
-	// writer keeps the row (see ReservationToken).
+	// no-ops. Mixed fleets are fenced structurally: this binary's rows
+	// live under an era-spelled key (reservKeySuffix) no v0.1.0
+	// statement addresses, and retirement touches only that spelling —
+	// a legacy same-key twin row is left to its own binary's lifecycle.
 	RetirePackAttempts(ctx context.Context, group []string, gens map[string]ReservationToken) error
 	// SweepExpiredPackReservations deletes reservation rows at least
 	// olderThan old (crash-swept leak reclamation, issue #29; the orphan
@@ -649,8 +649,10 @@ func (s *PG) RegisterPacks(ctx context.Context, repo string, packs []Pack) error
 				}
 				credit += c
 			}
+			// Settlement consumes BOTH era spellings (reservKeySpellings):
+			// the key's bytes are in the usage counter now.
 			if _, err := tx.Exec(ctx,
-				`DELETE FROM pack_reservations WHERE key = $1`, p.Key); err != nil {
+				`DELETE FROM pack_reservations WHERE key = ANY($1)`, reservKeySpellings(p.Key)); err != nil {
 				return err
 			}
 		}

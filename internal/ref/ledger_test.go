@@ -5,7 +5,9 @@ package ref
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -280,37 +282,170 @@ func legacyRelease(t *testing.T, s Store, owner, key string) {
 	}
 }
 
-// TestRefreshRotatesOwnerAgainstLegacyRelease (Codex round 34, P1): during
-// a rolling upgrade a v0.1.0 replica still runs the owner-scoped
-// ReleasePackReservations, which ignores attempts/gen/created_at. The new
-// binary's refresh must ROTATE the row's owner so a legacy inserter's
-// clean-failure release no longer matches the shared row — the reservation
-// protecting the new writer survives. A row only the legacy writer touched
-// keeps legacy semantics (its own release still works).
-func TestRefreshRotatesOwnerAgainstLegacyRelease(t *testing.T) {
+// legacyReserve simulates a v0.1.0 binary's ReservePackBytes upsert
+// VERBATIM (git show v0.1.0:internal/ref/ledger*.go): raw blob-key row,
+// owner captured, bytes CLOBBERED (no GREATEST), created_at refreshed,
+// attempts/gen untouched — the statement that captures any row it shares
+// a key with.
+func legacyReserve(t *testing.T, s Store, repo, key string, bytes int64, owner string) {
+	t.Helper()
+	ctx := context.Background()
+	switch st := s.(type) {
+	case *PG:
+		if _, err := st.pool.Exec(ctx, `
+INSERT INTO pack_reservations (key, repo, bytes, owner) VALUES ($1, $2, $3, $4)
+ON CONFLICT (key) DO UPDATE SET repo = EXCLUDED.repo, bytes = EXCLUDED.bytes,
+                                owner = EXCLUDED.owner, created_at = now()`,
+			key, repo, bytes, owner); err != nil {
+			t.Fatalf("legacy reserve: %v", err)
+		}
+	case *SQLite:
+		if _, err := st.db.ExecContext(ctx, `
+INSERT INTO pack_reservations (key, repo, bytes, owner, created_at)
+VALUES (?, ?, ?, ?, `+sqliteEpochMS+`)
+ON CONFLICT (key) DO UPDATE SET repo = excluded.repo, bytes = excluded.bytes,
+                                owner = excluded.owner, created_at = excluded.created_at`,
+			key, repo, bytes, owner); err != nil {
+			t.Fatalf("legacy reserve: %v", err)
+		}
+	default:
+		t.Fatalf("legacyReserve: unknown store %T", s)
+	}
+}
+
+// TestLegacyStatementsCannotEndTargetReservations (Codex rounds 34+35, P1):
+// during the v0.1.0 rolling upgrade both binaries write pack_reservations,
+// and the legacy statements address rows by RAW blob key. The legacy
+// upsert CAPTURES any row it reaches (owner rotated to the legacy token,
+// bytes clobbered — v0.1.0 has no GREATEST), and the legacy owner-scoped
+// ReleasePackReservations then deletes it on a clean failure, freeing
+// headroom the target writer still stages under. Round 34's owner
+// rotation fenced only the legacy-FIRST ordering; with the legacy refresh
+// last, the capture wins regardless of any column value this binary
+// writes (round 35). The fence is therefore the row SPELLING
+// (reservRowKey): no legacy plain-key statement can reach a target-era
+// row in EITHER order, while both eras still meet in the repo-scoped
+// admission SUMs (a cross-era same-key twin double-counts conservatively
+// until the legacy row settles, releases, or expires).
+func TestLegacyStatementsCannotEndTargetReservations(t *testing.T) {
 	runRefBackends(t, func(t *testing.T, s Store) {
 		k := newLedgerKit(t, s)
+
+		// REVERSE ordering (round 35): the target writer reserves first...
 		a := k.pack(k.base(), "aa1", 60)
-		// The legacy replica reserves first (its owner on the row)...
-		if dec := k.reserve([]Pack{a}, "legacy-owner", 0, 100); !dec.OK {
-			t.Fatalf("legacy reserve: %+v", dec)
+		if dec := k.reserve([]Pack{a}, "new-owner", 0, 1000); !dec.OK {
+			t.Fatalf("target reserve: %+v", dec)
 		}
-		// ...a new-binary writer refreshes the shared row...
-		if dec := k.reserve([]Pack{a}, "new-owner", 0, 100); !dec.OK {
-			t.Fatalf("new refresh: %+v", dec)
-		}
-		// ...and the legacy replica's upload fails cleanly, firing its
-		// owner-scoped release. It must not match the rotated row.
+		// ...then a legacy replica reserves the same key. Its upsert must
+		// MISS the target row — a capture would rotate the owner and
+		// clobber bytes 60→1. Both rows now sum (the documented
+		// conservative cross-era double-count).
+		legacyReserve(t, s, k.base(), a.Key, 1, "legacy-owner")
+		k.wantState(0, 61, 0)
+		// The legacy writer's clean failure fires its owner-scoped
+		// release: it must delete ONLY the legacy row. Pre-fence this
+		// read 0 — capture-then-release ended the reservation protecting
+		// the target writer mid-publication.
 		legacyRelease(t, s, "legacy-owner", a.Key)
 		k.wantState(0, 60, 0)
 
-		// A row only the legacy writer touched keeps legacy semantics.
-		b := k.pack(k.base(), "bb2", 20)
-		if dec := k.reserve([]Pack{b}, "legacy-owner", 0, 100); !dec.OK {
-			t.Fatalf("legacy-only reserve: %+v", dec)
+		// FORWARD ordering (round 34): the legacy row exists first, the
+		// target reserve lands beside it, and the legacy release again
+		// takes only its own row.
+		b := k.pack(k.base(), "bb2", 40)
+		legacyReserve(t, s, k.base(), b.Key, 40, "legacy-owner")
+		if dec := k.reserve([]Pack{b}, "new-owner", 0, 1000); !dec.OK {
+			t.Fatalf("target reserve beside legacy row: %+v", dec)
 		}
+		k.wantState(0, 140, 0)
 		legacyRelease(t, s, "legacy-owner", b.Key)
-		k.wantState(0, 60, 0)
+		k.wantState(0, 100, 0)
+
+		// Rows only legacy writers touch keep full legacy semantics.
+		c := k.pack(k.base(), "cc3", 20)
+		legacyReserve(t, s, k.base(), c.Key, 20, "legacy-owner")
+		k.wantState(0, 120, 0)
+		legacyRelease(t, s, "legacy-owner", c.Key)
+		k.wantState(0, 100, 0)
+	})
+}
+
+// TestSettlementConsumesBothEraRows (Codex round 35): settlement credits
+// the key's bytes to the usage counter, so ANY reservation row for that
+// key — this binary's era row AND a legacy twin — becomes a stale
+// double-count the settling transaction must consume (v0.1.0's own settle
+// consumes by raw key the same way). Covers both settlement surfaces.
+func TestSettlementConsumesBothEraRows(t *testing.T) {
+	runRefBackends(t, func(t *testing.T, s Store) {
+		ctx := context.Background()
+		k := newLedgerKit(t, s)
+
+		// RegisterPacks.
+		a := k.pack(k.base(), "aa1", 60)
+		if dec := k.reserve([]Pack{a}, "new-owner", 0, 1000); !dec.OK {
+			t.Fatalf("reserve: %+v", dec)
+		}
+		legacyReserve(t, s, k.base(), a.Key, 60, "legacy-owner")
+		k.wantState(0, 120, 0)
+		k.register(k.base(), a)
+		k.wantState(60, 0, 0)
+
+		// RegisterLFSObject.
+		lfsKey := "lfs/" + k.base() + "/" + strings.Repeat("ab", 32)
+		if dec := k.reserve([]Pack{{Key: lfsKey, Size: 30}}, "new-owner", 0, 1000); !dec.OK {
+			t.Fatalf("lfs reserve: %+v", dec)
+		}
+		legacyReserve(t, s, k.base(), lfsKey, 30, "legacy-owner")
+		k.wantState(60, 60, 0)
+		if err := s.RegisterLFSObject(ctx, k.base(), lfsKey, 30); err != nil {
+			t.Fatalf("RegisterLFSObject: %v", err)
+		}
+		k.wantState(90, 0, 0)
+	})
+}
+
+// TestRetireLeavesLegacyTwinRow (Codex round 35): retirement is a
+// clean-FAILURE path — nothing was credited to usage — so it must end
+// only this binary's era row. The legacy twin may still be protecting a
+// live legacy writer's staging; only its own release, its own settle, or
+// the TTL may end it. Same rule for the cap-denial retire inside
+// RegisterLFSObject (its transaction rolled back: no usage credited).
+func TestRetireLeavesLegacyTwinRow(t *testing.T) {
+	runRefBackends(t, func(t *testing.T, s Store) {
+		ctx := context.Background()
+		k := newLedgerKit(t, s)
+		a := k.pack(k.base(), "aa1", 60)
+		dec := k.reserve([]Pack{a}, "new-owner", 0, 1000)
+		if !dec.OK {
+			t.Fatalf("reserve: %+v", dec)
+		}
+		legacyReserve(t, s, k.base(), a.Key, 60, "legacy-owner")
+		k.wantState(0, 120, 0)
+		if err := s.RetirePackAttempts(ctx, k.group, dec.Gens); err != nil {
+			t.Fatalf("retire: %v", err)
+		}
+		k.wantState(0, 60, 0) // the legacy twin row alone remains
+
+		// Cap-denial retire: consume the cap with one registered object,
+		// then cap-deny a reserved second key that also has a legacy twin.
+		old := MaxLFSObjectsPerRepo
+		MaxLFSObjectsPerRepo = 1
+		t.Cleanup(func() { MaxLFSObjectsPerRepo = old })
+		if err := s.RegisterLFSObject(ctx, k.base(),
+			"lfs/"+k.base()+"/"+strings.Repeat("aa", 32), 10); err != nil {
+			t.Fatal(err)
+		}
+		lfsKey := "lfs/" + k.base() + "/" + strings.Repeat("bb", 32)
+		if dec := k.reserve([]Pack{{Key: lfsKey, Size: 30}}, "new-owner", 0, 1000); !dec.OK {
+			t.Fatalf("lfs reserve: %+v", dec)
+		}
+		legacyReserve(t, s, k.base(), lfsKey, 30, "legacy-owner")
+		if err := s.RegisterLFSObject(ctx, k.base(), lfsKey, 30); !errors.Is(err, ErrLFSObjectCapExceeded) {
+			t.Fatalf("cap-exceeded register err = %v", err)
+		}
+		// usage: 10 (the cap consumer) + 60 legacy pack twin + 30 legacy
+		// LFS twin still reserved; the era row alone was retired.
+		k.wantState(10, 90, 0)
 	})
 }
 
