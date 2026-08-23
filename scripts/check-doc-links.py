@@ -28,7 +28,7 @@ os.chdir(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 # balanced parens; then an optional #fragment and an optional quoted title.
 LINK = re.compile(
     r"\]\(((?:[^()\s#]|\([^()\s]*\))*)(#[^)\s]*)?(?:\s+[\"\x27][^)]*[\"\x27])?\)")
-REFDEF = re.compile(r"^ {0,3}\[[^\]^]+\]:\s")
+REFDEF = re.compile(r"^ {0,3}\[[^\]^]+\]:")
 ANGLE = re.compile(r"\]\(\s*<")
 FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
 HEADING = re.compile(r"^ {0,3}(#{1,6}) +(.*)$")
