@@ -30,7 +30,15 @@ func TestEnforceSyncClaimFence(t *testing.T) {
 	}
 	t.Setenv("CODESTORAGE_PG_URL", dbURL)
 
-	const repoID = "repo_fence"
+	// SetRepoUpstream is guarded on a live repos row (issue #52).
+	if _, err := ms.UpsertOrgWithKeys(ctx, "fence-org", []string{"-----BEGIN PUBLIC KEY-----\ndummy\n-----END PUBLIC KEY-----\n"}); err != nil {
+		t.Fatalf("seed org: %v", err)
+	}
+	repo, err := ms.CreateRepo(ctx, "fence-org", "https://example.com/fence.git", "main")
+	if err != nil {
+		t.Fatalf("CreateRepo: %v", err)
+	}
+	repoID := repo.RepoID
 	if _, err := ms.SetRepoUpstream(ctx, meta.RepoUpstream{
 		RepoID: repoID, Provider: "github", Owner: "o", Name: "n", UpstreamHost: "github.com",
 	}); err != nil {

@@ -42,18 +42,31 @@ func testRepoPurgeMetaSeams(t *testing.T, s Backend) {
 	if err != nil {
 		t.Fatalf("CreateRepo(del-b): %v", err)
 	}
+	// Eventing rows the completion delete must take with it — seeded
+	// while the repo is LIVE: the inserts are guarded on a live repos row.
+	if _, err := s.CreateGitCredential(ctx, GitCredential{RepoID: delA.RepoID, Username: "u", Password: "p"}); err != nil {
+		t.Fatalf("CreateGitCredential: %v", err)
+	}
+	if _, err := s.SetRepoUpstream(ctx, RepoUpstream{RepoID: delA.RepoID, Provider: "github", Owner: "o", Name: "n", UpstreamHost: "github.com"}); err != nil {
+		t.Fatalf("SetRepoUpstream: %v", err)
+	}
 	if _, err := s.SoftDeleteRepo(ctx, org, delA.URL); err != nil {
 		t.Fatalf("SoftDeleteRepo(del-a): %v", err)
 	}
 	if _, err := s.SoftDeleteRepo(ctx, org, delB.URL); err != nil {
 		t.Fatalf("SoftDeleteRepo(del-b): %v", err)
 	}
-	// Eventing rows the completion delete must take with it.
-	if _, err := s.CreateGitCredential(ctx, GitCredential{RepoID: delA.RepoID, Username: "u", Password: "p"}); err != nil {
-		t.Fatalf("CreateGitCredential: %v", err)
+	// A late writer that resolved the repo pre-delete cannot re-attach
+	// metadata after the soft-delete (PR #105 round 6): the guarded
+	// inserts reject deleted, purged, and unknown repos atomically.
+	if _, err := s.CreateGitCredential(ctx, GitCredential{RepoID: delB.RepoID, Password: "late"}); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("CreateGitCredential(deleted) = %v, want ErrNotFound", err)
 	}
-	if _, err := s.SetRepoUpstream(ctx, RepoUpstream{RepoID: delA.RepoID, Provider: "github", Owner: "o", Name: "n", UpstreamHost: "github.com"}); err != nil {
-		t.Fatalf("SetRepoUpstream: %v", err)
+	if _, err := s.SetRepoUpstream(ctx, RepoUpstream{RepoID: delB.RepoID, Provider: "github", Owner: "o", Name: "n", UpstreamHost: "github.com"}); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("SetRepoUpstream(deleted) = %v, want ErrNotFound", err)
+	}
+	if _, err := s.CreateGitCredential(ctx, GitCredential{RepoID: "repo_nonexistent0", Password: "x"}); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("CreateGitCredential(unknown) = %v, want ErrNotFound", err)
 	}
 
 	// PurgeableRepos: a future cutoff sees both soft-deleted repos (never
