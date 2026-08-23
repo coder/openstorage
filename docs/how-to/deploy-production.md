@@ -326,6 +326,16 @@ so a mixed-version fleet mid-roll is expected and fine, with one deliberate exce
 > See the [storage lifecycle guide](storage-lifecycle-and-sweeping.md#before-enabling-delete-mode-fleet-prerequisite)
 > for the exact prerequisite and why list-only mode is safe on any fleet.
 
+Upstream-sync claims are leased: a replica that dies mid-sync leaves a claim that the
+next run steals automatically once the lease expires, so a crash can delay but never
+permanently stop syncing. Claims written by pre-lease replicas (rolling upgrades from
+older builds, or wedges left by crashes before the upgrade) carry no lease and none of
+the holder guards that make stealing safe; new replicas adopt them under a grace period
+and — mirroring the sweep-delete fleet prerequisite above — will not steal them until
+[`CODESTORAGE_SYNC_STEAL_LEGACY`](../reference/configuration.md#codestorage_sync_steal_legacy)
+asserts the fleet is drained of pre-lease builds. A live old-version run therefore always
+finishes undisturbed; pre-upgrade wedges heal automatically once the opt-in is set.
+
 ## JWT keys across the fleet
 
 Tokens are verified against the org's public keys in the database, and each replica

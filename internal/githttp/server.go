@@ -536,7 +536,8 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 		for _, kv := range cmd.Env {
 			if !strings.HasPrefix(kv, EnvAtomic+"=") &&
 				!strings.HasPrefix(kv, EnvVerifyState+"=") &&
-				!strings.HasPrefix(kv, EnvVerifySigBudget+"=") {
+				!strings.HasPrefix(kv, EnvVerifySigBudget+"=") &&
+				!strings.HasPrefix(kv, EnvSyncClaim+"=") {
 				env = append(env, kv)
 			}
 		}
@@ -544,6 +545,12 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 			EnvRepo+"="+target.key,
 			EnvOrg+"="+s.Org,
 		)
+		// Loopback sync pushes carry the run's claim-holder token
+		// (verified JWT claim, issue #86); the update hook fences the ref
+		// CAS on it. Stripped above so operator env can never poison it.
+		if claims.SyncClaim != "" {
+			cmd.Env = append(cmd.Env, EnvSyncClaim+"="+claims.SyncClaim)
+		}
 		// Resolved quota for the pre-receive hook's authoritative
 		// usage+incoming check (quota.go); absent means disabled.
 		if s.PackQuotaBytes > 0 {

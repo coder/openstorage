@@ -11,28 +11,29 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	stdsync "sync"
 	"sync/atomic"
 	"testing"
 	"time"
 )
 
 // gatedUpstreams wraps an UpstreamStore so the test can hold the FIRST run
-// inside the worker's detach barrier (the GetUpstream between fetch and
-// loopback push): while held, that run's fetch snapshot is provably older
-// than upstream commits the test makes.
+// inside the worker's detach/steal barrier (the GetUpstream between fetch
+// and loopback push): while held, that run's fetch snapshot is provably
+// older than upstream commits the test makes. A CAS flag (not sync.Once,
+// whose Do blocks concurrent callers while the first is parked) keeps
+// other runs' barrier reads flowing while the first is held.
 type gatedUpstreams struct {
 	UpstreamStore
 	entered chan struct{} // closed when the first run reaches the barrier
 	release chan struct{} // closed by the test to let it continue
-	once    stdsync.Once
+	first   atomic.Bool
 }
 
 func (g *gatedUpstreams) GetUpstream(ctx context.Context, repoID string) (Upstream, error) {
-	g.once.Do(func() {
+	if g.first.CompareAndSwap(false, true) {
 		close(g.entered)
 		<-g.release
-	})
+	}
 	return g.UpstreamStore.GetUpstream(ctx, repoID)
 }
 
@@ -301,11 +302,11 @@ type flakyFinishUpstreams struct {
 	fails atomic.Int32
 }
 
-func (f *flakyFinishUpstreams) FinishSync(ctx context.Context, repoID string, success bool) (Upstream, error) {
+func (f *flakyFinishUpstreams) FinishSync(ctx context.Context, repoID, holder string, success bool) (Upstream, error) {
 	if f.fails.Add(-1) >= 0 {
 		return Upstream{}, errors.New("transient store blip")
 	}
-	return f.UpstreamStore.FinishSync(ctx, repoID, success)
+	return f.UpstreamStore.FinishSync(ctx, repoID, holder, success)
 }
 
 // A transient FinishSync failure must be retried while the claim is still
