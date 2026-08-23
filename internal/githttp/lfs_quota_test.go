@@ -16,6 +16,8 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -869,6 +871,111 @@ func (b *swapOnPublishBlob) Copy(ctx context.Context, dstKey, srcKey string) err
 	return b.BlobStore.Copy(ctx, dstKey, srcKey)
 }
 
+// readBlobBytes downloads key into memory through the store's own
+// transfer path.
+func readBlobBytes(t *testing.T, bl blob.BlobStore, key string) []byte {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "obj")
+	if err := bl.DownloadFile(context.Background(), key, path); err != nil {
+		t.Fatalf("download %s: %v", key, err)
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+// abaSwapBlob models S3's content-derived ETag semantics for the ABA
+// attack (Codex round 81): the LEGACY key's fingerprint is a function of
+// its CONTENT (identical bytes ⇒ identical ETag), and the wrapper swaps
+// the source to forged bytes exactly while the adoption's canonical
+// publish copy reads it, restoring the true bytes afterwards. Every
+// source fingerprint read therefore sees the TRUE content's value —
+// before/after equality proves nothing about which version the copy
+// carried. The canonical destination's fingerprints pass through
+// unmodified.
+type abaSwapBlob struct {
+	blob.BlobStore
+	legacyKey string
+	trueTmp   string
+	forgedTmp string
+}
+
+func (b *abaSwapBlob) StatFingerprint(ctx context.Context, key string) (int64, string, error) {
+	size, _, err := b.BlobStore.StatFingerprint(ctx, key)
+	if key == b.legacyKey {
+		// Content-derived: both the pre-copy and post-copy reads observe
+		// the true content, so they see one stable value.
+		return size, "content-etag-of-true-bytes", err
+	}
+	return b.BlobStore.StatFingerprint(ctx, key)
+}
+
+func (b *abaSwapBlob) Copy(ctx context.Context, dstKey, srcKey string) error {
+	if srcKey != b.legacyKey {
+		return b.BlobStore.Copy(ctx, dstKey, srcKey)
+	}
+	// A → B: the still-valid legacy PUT lands forged bytes…
+	if err := b.BlobStore.UploadFile(ctx, srcKey, b.forgedTmp); err != nil {
+		return err
+	}
+	// …the copy reads B…
+	if err := b.BlobStore.Copy(ctx, dstKey, srcKey); err != nil {
+		return err
+	}
+	// …B → A: and the true bytes return before any fingerprint check.
+	return b.BlobStore.UploadFile(ctx, srcKey, b.trueTmp)
+}
+
+// TestLFSAdopt_SourceABACannotRegisterForgedBytes (Codex round 81, normal
+// P1 + security P1): source fingerprinting cannot close ABA — with S3's
+// content-derived ETags, swapping true→forged→true around the publish
+// copy restores the original fingerprint, so a before/after sandwich
+// accepts a copy that carried the forged version. Registration must be
+// bound to a digest proof of the bytes actually at the CANONICAL key
+// (which no legacy URL can touch); forged bytes must never end up
+// registered, whatever the source does.
+func TestLFSAdopt_SourceABACannotRegisterForgedBytes(t *testing.T) {
+	ctx := context.Background()
+	srv, st, _ := newLFSQuotaServer(t, 0, time.Hour)
+	trueBytes := []byte("the true content of this object!")
+	oid := sha256Hex(trueBytes)
+	key := blob.LFSKey(lfsTestRepoID, oid)
+	legacyKey := blob.LFSLegacyKey(lfsTestRepoID, oid)
+	forged := []byte("forged bytes of identical length")
+	if len(forged) != len(trueBytes) {
+		t.Fatal("fixture: ABA needs same-size forged bytes")
+	}
+	if err := srv.Blob.UploadFile(ctx, legacyKey, writeTempFile(t, trueBytes)); err != nil {
+		t.Fatal(err)
+	}
+	srv.Blob = &abaSwapBlob{BlobStore: srv.Blob, legacyKey: legacyKey,
+		trueTmp: writeTempFile(t, trueBytes), forgedTmp: writeTempFile(t, forged)}
+
+	err := srv.adoptLFSObject(ctx, lfsTestRepoID, key, oid)
+	registered, herr := st.HasLFSObject(ctx, lfsTestRepoID, key)
+	if herr != nil {
+		t.Fatal(herr)
+	}
+	if registered {
+		if err != nil {
+			t.Fatalf("registered but errored: %v", err)
+		}
+		// Registration is only acceptable if the canonical bytes are the
+		// TRUE content (e.g. a re-verified copy of the restored source).
+		w := readBlobBytes(t, srv.Blob, key)
+		if got := sha256Hex(w); got != oid {
+			t.Fatalf("ABA registered forged canonical bytes (digest %s, want %s)", got, oid)
+		}
+		return
+	}
+	// Not registered: fine — but no forged canonical bytes may linger
+	// served... rowless canonical bytes are never served, so absence OR
+	// any content is acceptable here. The essential property held.
+	t.Logf("adoption returned %v without registering (acceptable fail-closed outcome)", err)
+}
+
 // TestLFSAdopt_PublishSandwichCatchesSourceSwap (Codex round 80): the
 // canonical publish copies the source AFTER verification — if a
 // still-valid legacy presigned PUT swaps the source in that window, the
@@ -897,6 +1004,44 @@ func TestLFSAdopt_PublishSandwichCatchesSourceSwap(t *testing.T) {
 	}
 	if _, serr := srv.Blob.Stat(ctx, key); serr == nil {
 		t.Fatal("suspect canonical copy retained after the sandwich caught the swap")
+	}
+}
+
+// deadlineCapturingBlob records the context deadline its Copy runs under.
+type deadlineCapturingBlob struct {
+	blob.BlobStore
+	budget atomic.Int64 // nanoseconds until the deadline, 0 = none
+}
+
+func (b *deadlineCapturingBlob) Copy(ctx context.Context, dstKey, srcKey string) error {
+	if dl, ok := ctx.Deadline(); ok {
+		b.budget.Store(int64(time.Until(dl)))
+	}
+	return b.BlobStore.Copy(ctx, dstKey, srcKey)
+}
+
+// TestLFSCompatCopy_BudgetScalesWithSize (Codex round 81): the v0.2.0
+// compatibility copy was bounded by the one-minute cleanup timeout, but
+// accepted LFS objects reach many GiB and S3's multipart copy is
+// sequential — the copy was guaranteed to be cancelled for large objects,
+// silently 404ing them on old replicas for the whole roll. The bridge must
+// get the publication-style size-scaled allowance.
+func TestLFSCompatCopy_BudgetScalesWithSize(t *testing.T) {
+	srv, _, _ := newLFSQuotaServer(t, 0, time.Hour)
+	srv.LFSV020WriteCompat = true
+	cb := &deadlineCapturingBlob{BlobStore: srv.Blob}
+	srv.Blob = cb
+	// Seed a canonical object so the copy has a source; the declared size
+	// models a 10 GiB object without staging one.
+	content := []byte("stand-in for a very large object")
+	oid := sha256Hex(content)
+	key := blob.LFSKey(lfsTestRepoID, oid)
+	if err := srv.Blob.UploadFile(context.Background(), key, writeTempFile(t, content)); err != nil {
+		t.Fatal(err)
+	}
+	srv.maybeLegacyCompatCopy(context.Background(), lfsTestRepoID, oid, key, 10<<30)
+	if got := time.Duration(cb.budget.Load()); got < 2*time.Hour {
+		t.Fatalf("compat copy budget = %v for a 10 GiB object, want a size-scaled allowance (>= ~2h51m) — a fixed 1m cap cancels every large copy", got)
 	}
 }
 

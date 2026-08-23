@@ -122,6 +122,16 @@ type SweepConfig struct {
 	// list-only reports stop naming objects that should live. Disposal
 	// runs the same revalidate + quarantine handshake and age threshold.
 	DeleteLFS bool
+	// DeleteLFSLegacy additionally admits LEGACY-SPELLED LFS keys
+	// (lfs/<repo>/<oid>, ADR-41) to DeleteLFS's reap — the explicit
+	// post-roll cleanup opt-in of the two-phase key migration (Codex
+	// round 81). Off, legacy keys are never deleted regardless of every
+	// other flag: during a rolling upgrade old replicas derive only that
+	// spelling, and adoption's retained sources become aged rowless
+	// orphans immediately, so an undiscriminating DeleteLFS would 404
+	// their downloads mid-roll. Enable only once the fleet runs the new
+	// binary (plus presign expiry); requires DeleteLFS.
+	DeleteLFSLegacy bool
 	// DeleteGuard, when set, is consulted before each sweep's destructive
 	// work (Delete and DeleteSuperseded alike). A non-nil error downgrades
 	// that run to list-only (heals still run) and is reported. It

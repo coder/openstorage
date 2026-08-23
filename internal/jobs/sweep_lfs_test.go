@@ -106,6 +106,68 @@ func TestSweepLFS_LegacySpellingSweepsAsLFS(t *testing.T) {
 	}
 }
 
+// TestSweepLFS_LegacyReapNeedsExplicitOptIn (Codex round 81): during a
+// rolling upgrade, old replicas derive ONLY the legacy spelling — but
+// adopting any legacy object older than the sweep threshold immediately
+// makes its retained source an aged rowless orphan, so DeleteLFS alone
+// would reap it mid-roll and 404 those replicas' downloads. Legacy-spelled
+// keys therefore need the SEPARATE post-roll opt-in
+// (CODESTORAGE_SWEEP_DELETE_LFS_LEGACY): the transition gate dominates
+// every other flag combination. Canonical orphans keep sweeping under
+// DeleteLFS alone.
+func TestSweepLFS_LegacyReapNeedsExplicitOptIn(t *testing.T) {
+	seed := func(f *sweepFixture) (canonicalOrphan, legacyOrphan string) {
+		canonicalOrphan = blob.LFSKey("repo_lfs", lfsOID("ee"))
+		f.upload(canonicalOrphan, "aged canonical orphan")
+		f.backdate(canonicalOrphan, 25*time.Hour)
+		legacyOrphan = blob.LFSLegacyKey("repo_lfs", lfsOID("ff"))
+		f.upload(legacyOrphan, "retained legacy source")
+		f.backdate(legacyOrphan, 25*time.Hour)
+		return
+	}
+	t.Run("delete-lfs-alone-spares-legacy", func(t *testing.T) {
+		f := newSweepFixture(t)
+		canonicalOrphan, legacyOrphan := seed(f)
+		report, err := f.sweeper(SweepConfig{Threshold: 24 * time.Hour, Delete: true, DeleteLFS: true}).Sweep(context.Background())
+		if err != nil {
+			t.Fatalf("Sweep: %v", err)
+		}
+		if f.exists(legacyOrphan) == false {
+			t.Fatal("DeleteLFS alone reaped a legacy-spelled key — old replicas' reads break mid-roll")
+		}
+		if f.exists(canonicalOrphan) {
+			t.Fatal("DeleteLFS did not reap the canonical orphan")
+		}
+		if report.Deleted != 1 {
+			t.Fatalf("report = %+v, want deleted=1 (canonical only)", report)
+		}
+	})
+	t.Run("post-roll-opt-in-reaps-legacy", func(t *testing.T) {
+		f := newSweepFixture(t)
+		canonicalOrphan, legacyOrphan := seed(f)
+		report, err := f.sweeper(SweepConfig{Threshold: 24 * time.Hour, DeleteLFS: true, DeleteLFSLegacy: true}).Sweep(context.Background())
+		if err != nil {
+			t.Fatalf("Sweep: %v", err)
+		}
+		if f.exists(legacyOrphan) || f.exists(canonicalOrphan) {
+			t.Fatalf("post-roll opt-in left orphans (legacy exists=%v canonical exists=%v)", f.exists(legacyOrphan), f.exists(canonicalOrphan))
+		}
+		if report.Deleted != 2 {
+			t.Fatalf("report = %+v, want deleted=2", report)
+		}
+	})
+	t.Run("legacy-opt-in-requires-lfs-mode", func(t *testing.T) {
+		f := newSweepFixture(t)
+		_, legacyOrphan := seed(f)
+		if _, err := f.sweeper(SweepConfig{Threshold: 24 * time.Hour, DeleteLFSLegacy: true}).Sweep(context.Background()); err != nil {
+			t.Fatalf("Sweep: %v", err)
+		}
+		if !f.exists(legacyOrphan) {
+			t.Fatal("DeleteLFSLegacy without DeleteLFS reaped an LFS key — the class opt-in must still gate")
+		}
+	})
+}
+
 // TestSweepLFS_GeneralDeleteSparesLFS: the general Delete opt-in must NOT
 // reap LFS orphans — pre-#51 LFS objects have no registry rows, so a fleet
 // already running Delete=true would otherwise reap its entire existing LFS

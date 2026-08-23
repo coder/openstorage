@@ -2243,7 +2243,7 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target r
 		}
 		s.invalidateUsageFloor(repoID)
 	}
-	s.maybeLegacyCompatCopy(ctx, repoID, oid, key)
+	s.maybeLegacyCompatCopy(ctx, repoID, oid, key, n)
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -2255,7 +2255,7 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target r
 // availability bridge, never a correctness dependency (the canonical copy
 // stays the registered truth), and a failure just means old replicas 404
 // this object as they would any post-upgrade upload.
-func (s *Server) maybeLegacyCompatCopy(ctx context.Context, repoID, oid, key string) {
+func (s *Server) maybeLegacyCompatCopy(ctx context.Context, repoID, oid, key string, size int64) {
 	if !s.LFSV020WriteCompat {
 		return
 	}
