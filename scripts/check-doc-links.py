@@ -105,6 +105,10 @@ def check():
                     continue
                 # fragment-only links resolve to the current file
                 resolved = path if not target else posixpath.normpath(posixpath.join(d, target))
+                if resolved == ".." or resolved.startswith("../"):
+                    print(f"BROKEN FILE (escapes repo) {path}:{lineno} -> {target}")
+                    bad += 1
+                    continue
                 if not os.path.exists(resolved):
                     print(f"BROKEN FILE {path}:{lineno} -> {target}")
                     bad += 1
