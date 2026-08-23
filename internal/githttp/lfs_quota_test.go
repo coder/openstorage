@@ -1641,6 +1641,80 @@ func TestLFSCompatCopy_BoundedByOpSlots(t *testing.T) {
 	}
 }
 
+// lateLossStore renews the canonical claim truthfully until registration
+// commits, then reports every renewal as lost — a lease takeover landing
+// exactly in the publication's tail.
+type lateLossStore struct {
+	ref.RefStore
+	key  string
+	lost atomic.Bool
+}
+
+func (s *lateLossStore) RegisterLFSObject(ctx context.Context, repo, key string, n int64) error {
+	err := s.RefStore.RegisterLFSObject(ctx, repo, key, n)
+	if key == s.key {
+		s.lost.Store(true)
+	}
+	return err
+}
+
+func (s *lateLossStore) RenewAdoptionClaim(ctx context.Context, key, owner string) (bool, error) {
+	if key == s.key && s.lost.Load() {
+		return false, nil // expired and taken over
+	}
+	return s.RefStore.RenewAdoptionClaim(ctx, key, owner)
+}
+
+// commitDespiteLossBlob completes the post-registration verify stat
+// exactly as the region is canceled — the backend read that returns
+// success concurrently with the renewer's loss verdict.
+type commitDespiteLossBlob struct {
+	blob.BlobStore
+	key  string
+	lost *atomic.Bool
+}
+
+func (b *commitDespiteLossBlob) Stat(ctx context.Context, key string) (int64, error) {
+	if key == b.key && b.lost.Load() {
+		select {
+		case <-ctx.Done(): // the loss canceled the region; the read already returned
+			return b.BlobStore.Stat(context.WithoutCancel(ctx), key)
+		case <-time.After(5 * time.Second):
+			return 0, fmt.Errorf("lease loss never canceled the publication region")
+		}
+	}
+	return b.BlobStore.Stat(ctx, key)
+}
+
+// TestLFSPut_ClaimLossRejectsSuccessfulPublication (Codex round 93, P1 —
+// the PUT twin of round 88's adoption-copy fix): the publication region's
+// renewer was deferred but never JOINED and checked, and cancellation
+// alone cannot reject work that COMMITS concurrently with a recorded loss
+// — the final region op can return nil as the renewer cancels, and the
+// handler then continues to a 200 on a lease it no longer provably holds,
+// while the claim's successor may be writing different canonical bytes
+// past this worker's verify. The handler must join the renewer and reject
+// any recorded loss before reporting success.
+func TestLFSPut_ClaimLossRejectsSuccessfulPublication(t *testing.T) {
+	oldInterval := lfsAdoptClaimRenewInterval
+	lfsAdoptClaimRenewInterval = 10 * time.Millisecond
+	t.Cleanup(func() { lfsAdoptClaimRenewInterval = oldInterval })
+	srv, st, mint := newLFSQuotaServer(t, 0, time.Hour)
+	tok := mint(auth.ScopeGitWrite)
+	content := []byte("publication outlives its lease")
+	oid := sha256Hex(content)
+	key := blob.LFSKey(lfsTestRepoID, oid)
+	ls := &lateLossStore{RefStore: st, key: key}
+	srv.Store = ls
+	srv.Blob = &commitDespiteLossBlob{BlobStore: srv.Blob, key: key, lost: &ls.lost}
+
+	w := doLFS(t, srv, http.MethodPut, "/"+lfsTestRepoURL+".git/info/lfs/objects/"+oid,
+		"basic:"+tok, string(content))
+	if w.Code == http.StatusOK {
+		t.Fatal("PUT answered 200 on a lease lost during publication — success must be rejected after a recorded claim loss")
+	}
+}
+
 // TestLFSCompat_RepairSerializedOnLegacyClaim (Codex security round 85):
 // the batch fast path's bridge repair launched an unserialized full copy —
 // every tiny concurrent touch of the object started another one. Compat
