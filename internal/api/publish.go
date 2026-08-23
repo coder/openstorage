@@ -159,13 +159,16 @@ func (s *server) publishPack(ctx context.Context, repoID, packID, packPath strin
 		}
 	}
 	restored, err := blob.EnsurePublished(ctx, s.blobStore, key, packPath, cover)
+	// Bump BEFORE the error check (Codex round 59): a restore whose
+	// post-publication cover refresh failed still made the bytes
+	// physical, and cached floors must re-scan regardless.
+	if restored {
+		if berr := s.refStore.BumpLFSAdoptionGen(ctx, githttp.BaseRepo(repoID)); berr != nil {
+			s.logger.Warn("floor generation bump after pack restore", "key", key, "error", berr)
+		}
+	}
 	if err != nil {
 		return errors.Join(regErr, fmt.Errorf("verify pack %s: %w", key, err))
-	}
-	if restored {
-		if err := s.refStore.BumpLFSAdoptionGen(ctx, githttp.BaseRepo(repoID)); err != nil {
-			s.logger.Warn("floor generation bump after pack restore", "key", key, "error", err)
-		}
 	}
 	// Threshold check regardless of regErr (issue #1): an ambiguous
 	// registration error may have committed the row — the same reason the

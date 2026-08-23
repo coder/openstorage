@@ -410,6 +410,7 @@ func preReceive(ctx context.Context) error {
 	// quarantine-restore bump: the bytes ARE back, and a failed bump
 	// leaves only the TTL-bounded staleness the cover already guards.
 	restoredAny := false
+	var verifyErr error
 	for i, p := range packs {
 		var cover func(context.Context, int64) error
 		if quota > 0 {
@@ -418,15 +419,22 @@ func preReceive(ctx context.Context) error {
 			}
 		}
 		restored, err := blob.EnsurePublished(ctx, bl, p.Key, packFiles[i], cover)
-		if err != nil {
-			return errors.Join(regErr, fmt.Errorf("pre-receive: verify %s: %w", p.Key, err))
-		}
+		// Track restores BEFORE the error check (Codex round 59): a
+		// restore whose post-publication cover refresh failed still made
+		// the bytes physical, and the generation bump below must run.
 		restoredAny = restoredAny || restored
+		if err != nil {
+			verifyErr = fmt.Errorf("pre-receive: verify %s: %w", p.Key, err)
+			break
+		}
 	}
 	if restoredAny {
 		if err := st.BumpLFSAdoptionGen(ctx, BaseRepo(repo)); err != nil {
 			fmt.Fprintf(os.Stderr, "codestorage: floor generation bump after pack restore: %v\n", err)
 		}
+	}
+	if verifyErr != nil {
+		return errors.Join(regErr, verifyErr)
 	}
 	return regErr
 }

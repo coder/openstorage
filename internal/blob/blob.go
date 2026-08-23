@@ -272,17 +272,78 @@ func EnsurePublished(ctx context.Context, b BlobStore, key, path string, onResto
 	defer cancel()
 	_, err = b.Stat(ctx, key)
 	if errors.Is(err, ErrNotFound) {
-		if onRestore != nil {
-			if err := onRestore(ctx, fi.Size()); err != nil {
-				return false, fmt.Errorf("account restore of %s: %w", key, err)
+		if onRestore == nil {
+			if err := b.UploadFile(ctx, key, path); err != nil {
+				return false, err
 			}
+			return true, nil
 		}
-		if err := b.UploadFile(ctx, key, path); err != nil {
-			return false, err
+		if err := onRestore(ctx, fi.Size()); err != nil {
+			return false, fmt.Errorf("account restore of %s: %w", key, err)
+		}
+		// The cover must stay alive from here until the stale-floor tail
+		// closes (Codex round 59): this allowance deliberately exceeds
+		// the minimum reservation TTL (repairs must finish), so one
+		// reservation cannot span the upload. Renew it through the
+		// upload and refresh it once after publication — the refresh
+		// restarts the TTL clock, which the config floor guarantees
+		// outlives the last stale-floor commit (usageCacheTTL + handoff
+		// margin past publication).
+		renew := func(rctx context.Context) error { return onRestore(rctx, fi.Size()) }
+		upErr, renewErr := WithRenewedCover(ctx, renew, func() error {
+			return b.UploadFile(ctx, key, path)
+		})
+		if upErr != nil {
+			return false, upErr
+		}
+		if renewErr != nil {
+			// The bytes ARE durably back — report the restore so the
+			// caller still invalidates floors — but surface the failed
+			// post-publication refresh: the cover's tail coverage now
+			// rests on the last mid-upload renewal (at most one renewal
+			// interval short of the full guarantee).
+			return true, fmt.Errorf("refresh restore cover of %s after publication: %w", key, renewErr)
 		}
 		return true, nil
 	}
 	return false, err
+}
+
+// coverRenewInterval is WithRenewedCover's renewal cadence (a var for
+// tests): strictly under a third of the minimum reservation TTL (61s, see
+// ref.MinPackReservationTTL's config gate), so a restore cover stays
+// continuously alive even across two consecutive failed or missed
+// renewals.
+var coverRenewInterval = 20 * time.Second
+
+// WithRenewedCover runs op while keeping a restore's cover reservation
+// alive (Codex round 59): renew is invoked every coverRenewInterval for
+// op's duration (best-effort — the ledger failing renewals is the same
+// ledger competing admissions need) and once more after op succeeds, the
+// post-publication refresh whose restarted TTL outlives every floor
+// scanned during the absence. The caller takes the initial cover BEFORE
+// calling this. opErr reports op's own failure; renewErr reports only the
+// final refresh.
+func WithRenewedCover(ctx context.Context, renew func(context.Context) error, op func() error) (opErr, renewErr error) {
+	assertf(renew != nil && op != nil, "WithRenewedCover: nil renew or op")
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		t := time.NewTicker(coverRenewInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-t.C:
+				_ = renew(ctx) // best-effort; the final refresh is checked
+			}
+		}
+	}()
+	if opErr = op(); opErr != nil {
+		return opErr, nil
+	}
+	return nil, renew(ctx)
 }
 
 // ensurePublishedTimeout bounds EnsurePublished's detached verification.

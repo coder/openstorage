@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -358,20 +359,24 @@ func TestEnsurePublished(t *testing.T) {
 	}
 	// Missing: onRestore runs BEFORE the upload (the cover must exist by
 	// the time the bytes become physical — Codex round 58) with the local
-	// file's size, and the restore is reported.
+	// file's size, the restore is reported, and a post-publication
+	// refresh follows (Codex round 59) once the bytes are back.
 	coverCalls := 0
 	restored, err = EnsurePublished(ctx, b, key, src, func(cctx context.Context, size int64) error {
 		coverCalls++
 		if size != int64(len("pack-bytes")) {
 			t.Fatalf("onRestore size = %d, want %d", size, len("pack-bytes"))
 		}
-		if _, serr := b.Stat(cctx, key); !errors.Is(serr, ErrNotFound) {
-			t.Fatalf("bytes already physical when onRestore ran (stat: %v)", serr)
+		if coverCalls == 1 {
+			// The initial cover must precede publication.
+			if _, serr := b.Stat(cctx, key); !errors.Is(serr, ErrNotFound) {
+				t.Fatalf("bytes already physical when the initial cover ran (stat: %v)", serr)
+			}
 		}
 		return nil
 	})
-	if err != nil || !restored || coverCalls != 1 {
-		t.Fatalf("EnsurePublished(missing) = (%v, %v), onRestore calls %d; want (true, nil), 1", restored, err, coverCalls)
+	if err != nil || !restored || coverCalls != 2 {
+		t.Fatalf("EnsurePublished(missing) = (%v, %v), onRestore calls %d; want (true, nil), 2 (initial cover + post-publication refresh)", restored, err, coverCalls)
 	}
 	size, err := b.Stat(ctx, key)
 	if err != nil || size != int64(len("pack-bytes")) {
@@ -407,6 +412,84 @@ func TestEnsurePublished(t *testing.T) {
 	}
 	if _, err := b.Stat(ctx, key); err != nil {
 		t.Fatalf("Stat after canceled-ctx re-publish: %v", err)
+	}
+}
+
+// slowUploadStore delays UploadFile, simulating a restore that outlives a
+// near-minimum reservation TTL (Codex round 59).
+type slowUploadStore struct {
+	BlobStore
+	delay time.Duration
+}
+
+func (s slowUploadStore) UploadFile(ctx context.Context, key, path string) error {
+	select {
+	case <-time.After(s.delay):
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	return s.BlobStore.UploadFile(ctx, key, path)
+}
+
+// TestEnsurePublishedRenewsCoverThroughPublication (Codex round 59): the
+// restore allowance deliberately exceeds the minimum reservation TTL, so
+// one cover reservation cannot span a slow repair upload — the cover
+// could expire mid-restore, letting a stale-floor admission commit before
+// the bytes become physical. The seam must renew the cover through the
+// upload and refresh it once after publication (the restarted TTL clock
+// outlives the last stale-floor commit); a failed post-publication
+// refresh is surfaced WITH the restore reported, so callers still bump
+// the floor generation.
+func TestEnsurePublishedRenewsCoverThroughPublication(t *testing.T) {
+	ctx := context.Background()
+	oldInterval := coverRenewInterval
+	coverRenewInterval = 20 * time.Millisecond
+	t.Cleanup(func() { coverRenewInterval = oldInterval })
+
+	key := PackKey("r1", "renewed")
+	b := seededFile(t, key, "pack-bytes")
+	src := filepath.Join(t.TempDir(), "src")
+	if err := os.WriteFile(src, []byte("pack-bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Delete(ctx, key); err != nil {
+		t.Fatal(err)
+	}
+
+	slow := slowUploadStore{BlobStore: b, delay: 110 * time.Millisecond}
+	var calls atomic.Int32
+	restored, err := EnsurePublished(ctx, slow, key, src, func(context.Context, int64) error {
+		calls.Add(1)
+		return nil
+	})
+	if err != nil || !restored {
+		t.Fatalf("EnsurePublished(slow restore) = (%v, %v), want (true, nil)", restored, err)
+	}
+	// 1 initial + ≥2 mid-upload renewals (110ms across 20ms ticks, half
+	// slack for scheduler noise) + 1 post-publication refresh.
+	if n := calls.Load(); n < 4 {
+		t.Fatalf("cover calls = %d, want ≥ 4 (initial + renewals through the upload + post-publication refresh)", n)
+	}
+
+	// Renewal-tick failures are tolerated while the upload converges, but
+	// a failed POST-PUBLICATION refresh surfaces with restored=true: the
+	// bytes are durably back and the caller must still invalidate floors.
+	if err := b.Delete(ctx, key); err != nil {
+		t.Fatal(err)
+	}
+	first := true
+	restored, err = EnsurePublished(ctx, slow, key, src, func(context.Context, int64) error {
+		if first {
+			first = false
+			return nil // the initial cover succeeds
+		}
+		return errors.New("ledger unreachable") // every renewal + the final refresh fail
+	})
+	if !restored || err == nil {
+		t.Fatalf("EnsurePublished(failed final refresh) = (%v, %v), want (true, error)", restored, err)
+	}
+	if _, serr := b.Stat(ctx, key); serr != nil {
+		t.Fatalf("restore with failed refresh did not publish: %v", serr)
 	}
 }
 

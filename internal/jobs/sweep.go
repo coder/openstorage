@@ -651,6 +651,7 @@ func (s *Sweeper) restoreFromQuarantine(ctx context.Context, key, qKey string) (
 	// active_reservations instead; the TTL collects it after the last
 	// stale floor can commit. A cover failure aborts the restore (the
 	// next sweep retries with the quarantine backup intact).
+	var renewCover func(context.Context) error
 	if repo, ok := splitSweepKey(key); ok {
 		size, err := s.blobs.Stat(ctx, qKey)
 		if err != nil {
@@ -661,12 +662,31 @@ func (s *Sweeper) restoreFromQuarantine(ctx context.Context, key, qKey string) (
 			if ttl <= 0 {
 				ttl = time.Hour // unwired config: match the write gates' fallback
 			}
-			if err := ref.ReserveRestoreCover(ctx, s.packs, blob.QuotaRepoGroup(repo), key, size, ttl); err != nil {
+			renewCover = func(rctx context.Context) error {
+				return ref.ReserveRestoreCover(rctx, s.packs, blob.QuotaRepoGroup(repo), key, size, ttl)
+			}
+			if err := renewCover(ctx); err != nil {
 				return false, err
 			}
 		}
 	}
-	if err := s.blobs.Copy(ctx, key, qKey); err != nil {
+	if renewCover != nil {
+		// The restore copy can outlive a near-minimum TTL cover (Codex
+		// round 59): renew it through the copy and refresh it after —
+		// the restarted TTL outlives the last stale-floor commit. A
+		// failed final refresh is logged, not fatal: the bytes ARE back
+		// and the generation bump below still runs.
+		copyErr, renewErr := blob.WithRenewedCover(ctx, renewCover, func() error {
+			return s.blobs.Copy(ctx, key, qKey)
+		})
+		if copyErr != nil {
+			return false, copyErr
+		}
+		if renewErr != nil {
+			s.logger.Warn("orphan pack sweep: restore cover refresh after publication failed",
+				"key", key, "error", renewErr)
+		}
+	} else if err := s.blobs.Copy(ctx, key, qKey); err != nil {
 		return false, err
 	}
 	// The restore re-materialized bytes a floor scanned during their
