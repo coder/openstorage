@@ -2536,6 +2536,23 @@ func (s *Server) maybeLegacyCompatCopy(ctx context.Context, repoID, oid, key str
 		return nil
 	}
 	legacyKey := blob.LFSLegacyKey(repoID, oid)
+	// An EXISTING legacy spelling already satisfies the bridge (Codex
+	// round 89): the copy would only overwrite those bytes — zero growth —
+	// while the admission below charges the full size as fresh, so the
+	// zero-growth repair flow (a registered-but-blobless canonical whose
+	// legacy copy survived) spuriously 507'd at the quota edge, forever.
+	// Skipping matches ensureLegacyCompat's semantics: the legacy key
+	// stays writable by v0.1.0 presigned PUTs for its whole retention, so
+	// overwriting it buys no integrity old replicas could rely on.
+	pctx, pcancel := context.WithTimeout(context.WithoutCancel(ctx), lfsProbeTimeout)
+	_, perr := s.Blob.Stat(pctx, legacyKey)
+	pcancel()
+	switch {
+	case perr == nil:
+		return nil
+	case !errors.Is(perr, blob.ErrNotFound):
+		return fmt.Errorf("compat probe %s: %w", legacyKey, perr)
+	}
 	// Compat copies serialize on the LEGACY key's fleet claim (Codex
 	// security round 85): the bridge repair runs from lock-free fast
 	// paths, so without a shared exclusion every tiny concurrent touch of

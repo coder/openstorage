@@ -1319,6 +1319,47 @@ func TestLFSCompatCopy_ChargedAgainstQuota(t *testing.T) {
 	}
 }
 
+// TestLFSCompatCopy_ExistingLegacySkipsAdmission (Codex round 89): a
+// zero-growth repair PUT — registered-but-blobless canonical whose legacy
+// copy survived — reaches the bridge with the legacy spelling ALREADY
+// present: the copy would only overwrite those bytes, yet the admission
+// charged the full size as fresh growth. With canonical restored (S) and
+// legacy retained (S) at quota 2S, the bridge evaluated S+S+S=3S and the
+// otherwise-successful repair 507'd forever. An existing legacy spelling
+// satisfies the bridge (ensureLegacyCompat's semantics: the legacy key is
+// writable by v0.1.0 presigned PUTs, so overwriting buys no integrity).
+func TestLFSCompatCopy_ExistingLegacySkipsAdmission(t *testing.T) {
+	ctx := context.Background()
+	srv, st, mint := newLFSQuotaServer(t, 120, time.Hour)
+	srv.LFSV020WriteCompat = true
+	tok := mint(auth.ScopeGitWrite)
+	content := bytes.Repeat([]byte("r"), 60) // 2×60 fits Q=120 exactly; 3×60 does not
+	oid := sha256Hex(content)
+	key := blob.LFSKey(lfsTestRepoID, oid)
+	legacyKey := blob.LFSLegacyKey(lfsTestRepoID, oid)
+
+	// The repair state: a registered canonical row whose blob is gone,
+	// with its legacy bridge copy intact.
+	if err := st.RegisterLFSObject(ctx, lfsTestRepoID, key, int64(len(content))); err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.Blob.UploadFile(ctx, legacyKey, writeTempFile(t, content)); err != nil {
+		t.Fatal(err)
+	}
+
+	w := doLFS(t, srv, http.MethodPut, "/"+lfsTestRepoURL+".git/info/lfs/objects/"+oid,
+		"basic:"+tok, string(content))
+	if w.Code != http.StatusOK {
+		t.Fatalf("zero-growth repair with an intact legacy copy = %d, body %s — the bridge must not re-charge an overwrite", w.Code, w.Body)
+	}
+	if _, err := srv.Blob.Stat(ctx, key); err != nil {
+		t.Fatalf("canonical bytes missing after repair: %v", err)
+	}
+	if _, err := srv.Blob.Stat(ctx, legacyKey); err != nil {
+		t.Fatalf("legacy bytes missing after repair: %v", err)
+	}
+}
+
 // TestLFSAdopt_CopyChargedAgainstQuota (Codex round 85, P1 + security
 // twin): the adoption copy creates a second size-byte canonical object
 // while the legacy source is retained until the post-roll sweep — with
