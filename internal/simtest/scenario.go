@@ -72,6 +72,9 @@ type Result struct {
 	Deliveries  int // webhook deliveries recorded
 	Faults      int // faults injected
 	Steals      int // expired sync claims stolen (issues #86/#88)
+	// CrashSteals is the subset of Steals whose previous holder actually
+	// crashed mid-run (dead-holder class) rather than outliving its lease.
+	CrashSteals int
 	OpCounts    map[string]int
 }
 
@@ -175,6 +178,11 @@ type sim struct {
 	syncRunCount     map[string]int
 	syncSuccessCount map[string]int
 	syncSteals       int
+	// syncCrashSteals counts steals whose previous holder actually died
+	// between TryBeginSync and FinishSync (the #86 dead-holder class), as
+	// opposed to live runs merely outliving their lease. The vacuity guard
+	// in TestDSTFast keys on this: crash injection must stay live.
+	syncCrashSteals int
 	// clockSkew shifts the logical clock past the step counter; the final
 	// sync quiescence check uses it to provably expire every lease.
 	clockSkew int64
@@ -314,6 +322,7 @@ func (s *sim) result() Result {
 		Deliveries:  len(s.cl.rec.all()),
 		Faults:      len(s.inj.Fired()),
 		Steals:      s.syncSteals,
+		CrashSteals: s.syncCrashSteals,
 		OpCounts:    s.inj.Counts(),
 	}
 }

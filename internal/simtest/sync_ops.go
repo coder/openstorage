@@ -133,6 +133,12 @@ func (s *sim) doSyncClaim(name string, node *simNode, repo *simRepo) error {
 			prev.run.stolen = true // late finisher: its FinishSync must fail
 		}
 		s.syncSteals++
+		if prev.run != nil && prev.run.crashed {
+			// The stolen holder actually died between TryBeginSync and
+			// FinishSync — the #86 dead-holder class (as opposed to a
+			// live run merely outliving its lease).
+			s.syncCrashSteals++
+		}
 		outcome = "stole:" + stolenFrom
 	default: // refused
 		if prev == nil || prevExpired {
@@ -372,6 +378,12 @@ func (s *sim) checkSyncFinal() error {
 		case stolenFrom != "" && (prev == nil || prev.holder != stolenFrom):
 			s.violate("issue-#88 quiescence: %s stole %q, model %s", repo.key, stolenFrom, describeClaim(prev, now))
 			return nil
+		}
+		if stolenFrom != "" {
+			s.syncSteals++
+			if prev.run != nil && prev.run.crashed {
+				s.syncCrashSteals++
+			}
 		}
 		fin, err := s.cl.nodes[0].metaStore.FinishSync(ctx, repo.key, holder, true)
 		if err != nil {
