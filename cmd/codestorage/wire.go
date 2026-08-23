@@ -148,6 +148,7 @@ func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL, loopbackBaseU
 	}
 	sweeper := jobs.NewSweeper(blobStore, refStore, sweepCfg, logger)
 	var schedule *jobs.SweepSchedule
+	var stopReconcile func()
 	if sweep.interval > 0 {
 		schedule = &jobs.SweepSchedule{Sweeper: sweeper, Interval: sweep.interval}
 	} else if err := sweeper.Heal(ctx); err != nil {
@@ -158,6 +159,16 @@ func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL, loopbackBaseU
 		// serving would otherwise fail hydrations of the stranded pack
 		// until another restart anyway (fail-fast beats limping).
 		return fail(fmt.Errorf("startup quarantine heal (sweeping disabled): %w", err))
+	} else {
+		// Heal's twin-row janitor ran once, but a mixed-version rollout
+		// can strand a legacy/canonical LFS row twin at ANY time after
+		// startup (Codex round 88): an old replica touching a retained
+		// legacy key inserts the duplicate, registered fast paths never
+		// re-register, and with sweeping disabled nothing else would
+		// reconcile it — the double count and usage charge would persist
+		// until restart. Keep the janitor alive on the default sweep
+		// cadence; each quiet tick is one point read.
+		stopReconcile = jobs.StartReconcileTicker(sweeper, jobs.ReconcileTickInterval)
 	}
 
 	// Background repack (issue #1): the worker folds over the RAW ref
@@ -226,10 +237,16 @@ func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL, loopbackBaseU
 		WebhookAllowPrivate: webhookAllowPrivate,
 	})
 	if err != nil {
+		if stopReconcile != nil {
+			stopReconcile()
+		}
 		queueCleanup() // stop workers before closing their meta store
 		return fail(err)
 	}
 	cleanup := func() {
+		if stopReconcile != nil {
+			stopReconcile()
+		}
 		queueCleanup() // stop workers before closing their meta store
 		msCleanup()
 	}

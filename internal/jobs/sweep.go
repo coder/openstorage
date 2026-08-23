@@ -817,10 +817,10 @@ func (s *Sweeper) legacySourceInReapGrace(ctx context.Context, repo, key string)
 	return true, nil
 }
 
-// reconcileTickInterval is the always-live twin janitor's cadence when
+// ReconcileTickInterval is the always-live twin janitor's cadence when
 // periodic sweeping is disabled (Codex round 88): one cheap point read per
 // tick when no twins exist, hourly like the default sweep.
-const reconcileTickInterval = time.Hour
+const ReconcileTickInterval = time.Hour
 
 // StartReconcileTicker runs the legacy/canonical LFS row-twin janitor on a
 // background goroutine (Codex round 88 + security twin): with

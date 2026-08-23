@@ -473,7 +473,10 @@ only when explicitly enabled, deletes — unregistered blobs older than the age 
 It also prunes expired quota reservations on the same cadence.
 
 - **Default:** `1h`. **`0` disables sweeping** (a strictly restorative quarantine-heal pass
-  still runs once at startup); negative values are startup errors.
+  still runs once at startup, and an hourly background janitor keeps reconciling
+  legacy/canonical LFS registry-row twins that mixed-version rollouts can strand after
+  startup — without it a duplicate row would double-charge usage and the object cap
+  indefinitely); negative values are startup errors.
 
 ### `CODESTORAGE_SWEEP_AGE_THRESHOLD`
 
