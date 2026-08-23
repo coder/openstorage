@@ -841,6 +841,14 @@ func (s *PG) GuardedLFSDelete(ctx context.Context, repo, key string, del func(co
 	assertf(repo != "" && key != "" && del != nil, "GuardedLFSDelete(%q, %q)", repo, key)
 	deleted := false
 	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		// Lock-first, matching every other row-creating path (PR #105
+		// round 15): the fence check below must be totally ordered
+		// against FenceRepoPurge's insert, or a snapshot read taken just
+		// before the fence commits could run the counter-row upsert after
+		// the purge's ledger cleanup. LFS repos are base repos (ADR-35).
+		if err := lockBaseLedger(ctx, tx, repo); err != nil {
+			return err
+		}
 		// A purge-FENCED repo needs no writer guard at all: the
 		// registrations this guard serializes against are themselves
 		// fenced and can never commit, and the counter-row upsert below
