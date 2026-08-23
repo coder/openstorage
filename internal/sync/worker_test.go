@@ -115,7 +115,7 @@ func newWorkerFixture(t *testing.T) *workerFixture {
 		Events: f.rec,
 		Loopback: Loopback{
 			BaseURL: "file://" + f.loopbackDir,
-			Token:   func(context.Context, string, RepoInfo) (string, error) { return "", nil },
+			Token:   func(context.Context, string, RepoInfo, time.Duration) (string, error) { return "", nil },
 		},
 		Logger:  discardTestLogger(),
 		Timeout: time.Minute,

@@ -26,8 +26,11 @@ import (
 	upsync "github.com/coder/code-storage/internal/sync"
 )
 
-// loopbackTokenTTL bounds the internally minted git:write JWT for one sync
-// run's loopback push (sync runs are capped at 10 minutes).
+// loopbackTokenTTL is the CEILING for the internally minted git:write JWT
+// of one sync run's loopback push (sync runs are capped at 10 minutes).
+// The worker passes a per-run fence TTL derived from its claim lease
+// (issue #86); mint honors the SHORTER of the two, so a zombie run whose
+// claim can be stolen never holds a token that still authenticates.
 const loopbackTokenTTL = 15 * time.Minute
 
 // loopbackKey is the serve process's runtime-generated signing key for
@@ -53,9 +56,15 @@ func newLoopbackKey() (loopbackKey, string, error) {
 }
 
 // mint returns a short-lived repo-scoped git:write token for one loopback
-// push (docs/explanation/git-protocol-and-namespaces.md basic auth `t:<jwt>`).
-func (k loopbackKey) mint(org string, repo upsync.RepoInfo) (string, error) {
+// push (docs/explanation/git-protocol-and-namespaces.md basic auth `t:<jwt>`),
+// capped at min(ttl, loopbackTokenTTL) — ttl is the worker's claim-lease
+// push fence (sync.Loopback.Token contract).
+func (k loopbackKey) mint(org string, repo upsync.RepoInfo, ttl time.Duration) (string, error) {
 	assertf(k.priv != nil, "loopbackKey.mint: missing key")
+	assertf(ttl > 0, "loopbackKey.mint: non-positive ttl %v", ttl)
+	if ttl > loopbackTokenTTL {
+		ttl = loopbackTokenTTL
+	}
 	now := time.Now()
 	return auth.MintToken(k.priv, k.alg, auth.Claims{
 		Iss:    org,
@@ -63,7 +72,7 @@ func (k loopbackKey) mint(org string, repo upsync.RepoInfo) (string, error) {
 		Repo:   repo.URL,
 		Scopes: []string{auth.ScopeGitRead, auth.ScopeGitWrite},
 		Iat:    now.Unix(),
-		Exp:    now.Add(loopbackTokenTTL).Unix(),
+		Exp:    now.Add(ttl).Unix(),
 	})
 }
 
@@ -172,8 +181,10 @@ func buildServeEventing(ctx context.Context, ms meta.Store, dbURL, org, loopback
 		// against this process's in-memory loopback key, so a push routed
 		// through a load balancer could land on a replica that must
 		// reject it.
-		Loopback: upsync.Loopback{BaseURL: loopbackBaseURL, Token: func(_ context.Context, org string, repo upsync.RepoInfo) (string, error) { return key.mint(org, repo) }},
-		Logger:   logger,
+		Loopback: upsync.Loopback{BaseURL: loopbackBaseURL, Token: func(_ context.Context, org string, repo upsync.RepoInfo, ttl time.Duration) (string, error) {
+			return key.mint(org, repo, ttl)
+		}},
+		Logger: logger,
 	}
 
 	cleanup := func() { queue.Close() }

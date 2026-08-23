@@ -237,3 +237,69 @@ func TestStolenClaimAbandonsBeforePush(t *testing.T) {
 	}
 	assertEventTypes(t, f.rec.list(), EventSyncStarted, EventSyncStarted, EventSyncSucceeded)
 }
+
+// The loopback token is FENCED by the claim lease: its TTL must end
+// claimFenceMargin before the lease can be stolen, and a run already
+// inside the fence window must fail cleanly (releasing its own claim)
+// instead of pushing unfenced.
+func TestLoopbackTokenFencedByClaimLease(t *testing.T) {
+	f := newWorkerFixture(t)
+	seedUpstream(t, f.upstreamDir, "own", "proj")
+	f.addLoopbackRepo(t, "repo_fence")
+	f.putUpstream(t, "repo_fence", "own", "proj", "file://"+f.upstreamDir)
+
+	var gotTTL atomic.Int64
+	f.worker.Loopback.Token = func(_ context.Context, _ string, _ RepoInfo, ttl time.Duration) (string, error) {
+		gotTTL.Store(int64(ttl))
+		return "", nil
+	}
+	if err := f.worker.Run(context.Background(), Job{Org: "acme", RepoID: "repo_fence"}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	lease := claimLease(f.worker.Timeout)
+	ttl := time.Duration(gotTTL.Load())
+	if ttl <= 0 || ttl > lease-claimFenceMargin {
+		t.Errorf("token ttl = %v, want in (0, lease-margin=%v]", ttl, lease-claimFenceMargin)
+	}
+
+	// Inside the fence window (lease expiry closer than the margin, claim
+	// still ours): the run must fail WITHOUT minting or pushing, and its
+	// FinishSync must release the claim cleanly.
+	gate := &gatedUpstreams{
+		UpstreamStore: f.store,
+		entered:       make(chan struct{}),
+		release:       make(chan struct{}),
+	}
+	f.worker.Upstreams = gate
+	minted := make(chan struct{}, 1)
+	f.worker.Loopback.Token = func(context.Context, string, RepoInfo, time.Duration) (string, error) {
+		minted <- struct{}{}
+		return "", nil
+	}
+	done := make(chan error, 1)
+	go func() { done <- f.worker.Run(context.Background(), Job{Org: "acme", RepoID: "repo_fence"}) }()
+	<-gate.entered
+	// Shrink the remaining lease into the fence margin (claim untouched).
+	f.store.mu.Lock()
+	row := f.store.upstreams["repo_fence"]
+	row.SyncClaimExpiresAt = time.Now().Add(claimFenceMargin / 2)
+	f.store.upstreams["repo_fence"] = row
+	f.store.mu.Unlock()
+	close(gate.release)
+
+	if err := <-done; err == nil {
+		t.Error("fence-window run returned nil, want the refused-push failure")
+	}
+	select {
+	case <-minted:
+		t.Error("fence-window run minted a loopback token")
+	default:
+	}
+	up, err := f.store.GetUpstream(context.Background(), "repo_fence")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if up.Syncing || up.RunCount != 2 || up.SuccessCount != 1 {
+		t.Errorf("row after fence-window run = %+v, want a cleanly released claim and one counted failed run", up)
+	}
+}

@@ -21,6 +21,7 @@ import (
 	"log/slog"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/coder/code-storage/internal/auth"
 	"github.com/coder/code-storage/internal/meta"
@@ -62,11 +63,11 @@ func TestBootstrapOrgAuth_TwoBootsKeepBothLoopbackKeys(t *testing.T) {
 	}
 
 	repo := upsync.RepoInfo{RepoID: "repo_abc123", URL: "mirror"}
-	tokenA, err := keyA.mint(org, repo)
+	tokenA, err := keyA.mint(org, repo, time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}
-	tokenB, err := keyB.mint(org, repo)
+	tokenB, err := keyB.mint(org, repo, time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}
