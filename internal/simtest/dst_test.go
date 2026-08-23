@@ -16,8 +16,8 @@ import (
 // reproduction instructions.
 func reportRun(t *testing.T, res Result) {
 	t.Helper()
-	t.Logf("seed=%d steps=%d trace=%s transitions=%d deliveries=%d faults=%d",
-		res.Seed, res.Steps, res.TraceHash, res.Transitions, res.Deliveries, res.Faults)
+	t.Logf("seed=%d steps=%d trace=%s transitions=%d deliveries=%d faults=%d steals=%d crash-steals=%d",
+		res.Seed, res.Steps, res.TraceHash, res.Transitions, res.Deliveries, res.Faults, res.Steals, res.CrashSteals)
 	if len(res.Violations) == 0 {
 		return
 	}
@@ -31,6 +31,7 @@ func reportRun(t *testing.T, res Result) {
 // TestDSTFast is the PR-gate run: a fixed handful of seeds inside a small
 // time budget. The extended sweep lives in TestDSTSweep (nightly).
 func TestDSTFast(t *testing.T) {
+	crashSteals := 0
 	for _, seed := range []uint64{1, 2, 3} {
 		res, err := Run(Config{Seed: seed, Steps: 120})
 		if err != nil {
@@ -42,6 +43,15 @@ func TestDSTFast(t *testing.T) {
 		if res.Transitions < 10 || res.Deliveries < 10 || res.Faults < 5 {
 			t.Errorf("seed %d: suspiciously quiet run: %+v", seed, res)
 		}
+		crashSteals += res.CrashSteals
+	}
+	// The sync claim-lease lane must not be vacuous either: across the
+	// fixed fast seeds, at least one claim whose holder actually CRASHED
+	// mid-run must have been stolen (issue #88 — the dead-holder class the
+	// oracle exists for; live runs merely outliving their lease do not
+	// count, so this fails if crash injection goes dead).
+	if crashSteals == 0 {
+		t.Errorf("no dead-holder sync claim steals across the fast seeds: the #88 crash-injection lane is vacuous")
 	}
 }
 

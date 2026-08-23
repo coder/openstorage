@@ -95,10 +95,11 @@ list is in the [configuration reference](configuration.md#internal-and-test-vari
 ## The DST harness
 
 `internal/simtest` is a deterministic, seeded simulation of a multi-node
-cluster — pushes, API writes, hydrations, crashes, restarts, repack races, and
-injected storage faults, all in one process on the local backends, checked
-against invariant oracles (ref/pack consistency, CAS atomicity, webhook
-soundness). **[`internal/simtest/README.md`](../../internal/simtest/README.md)**
+cluster — pushes, API writes, hydrations, crashes, restarts, repack races,
+upstream-sync claim/steal/finish cycles, and injected storage faults, all in
+one process on the local backends, checked against invariant oracles
+(ref/pack consistency, CAS atomicity, webhook soundness, sync claim-lease
+liveness). **[`internal/simtest/README.md`](../../internal/simtest/README.md)**
 is the authoritative description of what it exercises, the oracles, and the
 determinism rules; this section covers how to run and triage it.
 

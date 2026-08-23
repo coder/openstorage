@@ -48,6 +48,10 @@ type SQLite struct {
 	// codec, when non-nil, envelope-encrypts the secret columns
 	// (webhooks.secret, git_credentials.password) — see secrets.go.
 	codec *secrets.Codec
+	// now, when non-nil, replaces time.Now for every stored timestamp and
+	// the sync-claim lease expiry comparison (WithNowFunc; the DST harness
+	// injects its logical clock here).
+	now func() time.Time
 }
 
 var _ Backend = (*SQLite)(nil)
@@ -73,7 +77,8 @@ func OpenSQLite(ctx context.Context, sqliteURL string, opts ...Option) (*SQLite,
 		_ = db.Close()
 		return nil, fmt.Errorf("sqlite ping %s: %w", path, err)
 	}
-	return &SQLite{db: db, codec: resolveOptions(opts).codec}, nil
+	o := resolveOptions(opts)
+	return &SQLite{db: db, codec: o.codec, now: o.now}, nil
 }
 
 func (s *SQLite) Close() { _ = s.db.Close() }
@@ -191,10 +196,15 @@ func (s *SQLite) InitSchema(ctx context.Context) error {
 	return tx.Commit()
 }
 
-// nowNano returns the current instant as stored (unixnano) plus its exact
-// time.Time rendering, so returned rows byte-match later reads.
-func nowNano() (int64, time.Time) {
-	nanos := time.Now().UnixNano()
+// nowNano returns the store's current instant as stored (unixnano) plus its
+// exact time.Time rendering, so returned rows byte-match later reads. Reads
+// the injected clock when set (WithNowFunc), time.Now otherwise.
+func (s *SQLite) nowNano() (int64, time.Time) {
+	now := time.Now()
+	if s.now != nil {
+		now = s.now()
+	}
+	nanos := now.UnixNano()
 	return nanos, time.Unix(0, nanos).UTC()
 }
 
@@ -253,7 +263,7 @@ func (s *SQLite) UpsertOrgWithKeys(ctx context.Context, name string, pemPublicKe
 	for i, pem := range pemPublicKeys {
 		assertf(strings.TrimSpace(pem) != "", "UpsertOrgWithKeys: blank PEM block %d for org %q", i, name)
 	}
-	nanos, _ := nowNano()
+	nanos, _ := s.nowNano()
 	var org Org
 	err := s.inTx(ctx, func(tx *sql.Tx) error {
 		if _, err := tx.ExecContext(ctx,
@@ -351,7 +361,7 @@ func (s *SQLite) CreateRepo(ctx context.Context, org, url, defaultBranch string)
 	if err != nil {
 		return Repo{}, err
 	}
-	nanos, createdAt := nowNano()
+	nanos, createdAt := s.nowNano()
 	r := Repo{RepoID: newRepoID(), OrgID: orgID, URL: url, DefaultBranch: defaultBranch, CreatedAt: createdAt}
 	_, err = s.db.ExecContext(ctx,
 		`INSERT INTO repos (repo_id, org_id, url, default_branch, created_at) VALUES (?, ?, ?, ?, ?)`,
@@ -464,7 +474,7 @@ func (s *SQLite) SoftDeleteRepo(ctx context.Context, org, url string) (Repo, err
 	if err != nil {
 		return Repo{}, err
 	}
-	nanos, _ := nowNano()
+	nanos, _ := s.nowNano()
 	var repo Repo
 	err = s.inTx(ctx, func(tx *sql.Tx) error {
 		res, err := tx.ExecContext(ctx,
@@ -518,7 +528,7 @@ func (s *SQLite) AddSigningKey(ctx context.Context, org, keyText string) (Signin
 	if err != nil {
 		return SigningKey{}, err
 	}
-	nanos, createdAt := nowNano()
+	nanos, createdAt := s.nowNano()
 	k := SigningKey{OrgID: orgID, KeyText: keyText, CreatedAt: createdAt}
 	res, err := s.db.ExecContext(ctx,
 		`INSERT INTO org_signing_keys (org_id, key_text, created_at) VALUES (?, ?, ?)`,
