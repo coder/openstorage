@@ -33,6 +33,7 @@ import (
 	"hash"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -896,6 +897,15 @@ func (s *Server) verifyStoredLFSObject(ctx context.Context, repo, key, oid strin
 	return size, nil
 }
 
+// lfsRepairCoverSuffix distinguishes a zero-growth repair's cover
+// reservation key from the object's settle key (Codex security round 57):
+// settlement consumes the blob key's spellings, and the cover must instead
+// outlive the request until the TTL collects it. LFS blob keys end in
+// exactly the 64-hex oid (blob.LFSKey) and the ledger reserves "\n" for
+// its own era spellings, so this suffix never collides with a real
+// reservation.
+const lfsRepairCoverSuffix = "/repair-cover"
+
 // lfsVerifyResume is a partially completed adoption hash: the verified
 // prefix length and the sha256 midstate over it (Codex round 57).
 type lfsVerifyResume struct {
@@ -1242,6 +1252,15 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target r
 		lfsError(w, http.StatusInternalServerError, "object registry unavailable")
 		return
 	}
+	// repair records whether this PUT is a zero-growth REPAIR — a row
+	// that predates the request whose blob the entry probe found missing
+	// (Codex rounds 56+57): only then did counter-accounted bytes spend
+	// time absent, deflating floors scanned meanwhile. Later re-reads may
+	// flip `registered` when a TWIN registers this key mid-request; that
+	// is fresh growth (the twin publishes before it registers, so the
+	// counter and the listing move together, no absence window) and must
+	// take neither the repair cover nor the generation bump.
+	repair := registered
 	if !registered {
 		count, err := s.Store.CountLFSObjects(ctx, repoID)
 		if err != nil {
@@ -1402,6 +1421,52 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target r
 		}
 		resGens = dec.Gens
 	}
+	if s.PackQuotaBytes > 0 && n > 0 && repair {
+		// Zero-growth repair COVER (Codex security round 57): the
+		// republication below re-materializes counter-accounted bytes,
+		// and the post-publish generation bump only stops FUTURE floor
+		// serves — an admission already holding a floor scanned during
+		// the absence (deflated by up to n, hiding equally sized rowless
+		// legacy bytes) can commit after the bytes are back and durably
+		// exceed quota. No recheck ordering can close that: a repair can
+		// always start after such an admission committed. So the repair
+		// accounts its bytes BEFORE publication with a reservation row
+		// under an unbounded quota (repairs must never be quota-denied —
+		// a registered row must not stay blobless; the key cap still
+		// binds). Every stale-floor admission then sees the repaired
+		// bytes in active_reservations, exactly compensating the
+		// worst-case deflation. The row is left to the TTL: absence
+		// floors were scanned before publication, publication ends
+		// within the lease (≤ ttl−MinPackReservationTTL, round 51), and
+		// scans serve for usageCacheTTL with commits margin-bounded — so
+		// the last stale commit lands before publish+cacheTTL+margin ≤
+		// T0+ttl, inside the cover's life. The distinct suffix keeps
+		// settlement from consuming the cover early (it consumes only
+		// the blob key's own spellings).
+		rsvCtx, rsvCancel := context.WithTimeout(ctx, UsageFloorHandoffMargin)
+		dec, err := s.Store.ReservePackBytes(rsvCtx, blob.QuotaRepoGroup(repoID),
+			[]ref.Pack{{Key: key + lfsRepairCoverSuffix, Size: n}}, ref.NewReservationOwner(),
+			0, math.MaxInt64, s.lfsReservationTTL())
+		rsvCancel()
+		if err != nil {
+			log.Printf("lfs repair cover %s: %v", key, err)
+			lfsError(w, http.StatusInternalServerError, "storage quota check failed")
+			return
+		}
+		if dec.KeyCapExceeded {
+			w.Header().Set("Retry-After", "10")
+			lfsError(w, http.StatusTooManyRequests,
+				"too many in-flight uploads reserved for this repository, retry later")
+			return
+		}
+		if !dec.OK {
+			// Unreachable with an unbounded quota (admission saturates);
+			// fail closed rather than republish uncovered.
+			log.Printf("lfs repair cover %s: denied: %+v", key, dec)
+			lfsError(w, http.StatusInternalServerError, "storage quota check failed")
+			return
+		}
+	}
 	pubCtx, cancel := context.WithDeadline(ctx, pubAnchor.Add(s.lfsPublicationLease()))
 	defer cancel()
 	if err := s.Blob.UploadFile(pubCtx, key, path); err != nil {
@@ -1513,11 +1578,13 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target r
 		lfsError(w, http.StatusInternalServerError, "object registration failed")
 		return
 	}
-	// Zero-growth repair republication (Codex round 56): registered here
-	// means the entry probe found NO blob for a key whose bytes the
-	// usage counter already includes — a floor scanned during that
-	// absence subtracted the full counter from a listing missing these
-	// bytes, hiding equally sized rowless legacy data. The republication
+	// Zero-growth repair republication (Codex round 56): repair means
+	// the entry probe found NO blob for a key whose bytes the usage
+	// counter already included BEFORE this request — a floor scanned
+	// during that absence subtracted the full counter from a listing
+	// missing these bytes, hiding equally sized rowless legacy data
+	// (a twin-flipped `registered` is fresh growth instead — no bump,
+	// see `repair`). The republication
 	// above re-materialized them without touching the counter, so floors
 	// cached in the absence window now undercount physical usage: bump
 	// the shared floor generation — the PUT analogue of the sweeper's
@@ -1525,7 +1592,7 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target r
 	// that bump: the bytes ARE durably back and registered, and a failed
 	// bump leaves only the TTL-bounded staleness a crash right here
 	// would always leave. Zero-byte objects never appear in floors.
-	if registered && n > 0 {
+	if repair && n > 0 {
 		bctx, bcancel := context.WithTimeout(context.WithoutCancel(ctx), lfsCleanupTimeout)
 		defer bcancel()
 		if err := s.Store.BumpLFSAdoptionGen(bctx, BaseRepo(repoID)); err != nil {

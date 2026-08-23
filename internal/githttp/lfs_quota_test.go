@@ -502,6 +502,59 @@ func TestLFSAdoption_ResumesAfterSlowRange(t *testing.T) {
 	}
 }
 
+// TestLFSRepair_CoversRepublishedBytesAgainstStaleFloors (Codex round 57,
+// security): the repair's generation bump only stops FUTURE floor serves —
+// an admission already holding a floor scanned during the blob's absence
+// (deflated by the missing object's size, hiding equally sized rowless
+// legacy bytes) can commit its reservation after the repair republished,
+// durably exceeding quota. The repair must account its bytes BEFORE
+// publication: a cover reservation that every stale-floor admission sees
+// in active_reservations, compensating the worst-case deflation until the
+// TTL outlives every absence-window floor.
+func TestLFSRepair_CoversRepublishedBytesAgainstStaleFloors(t *testing.T) {
+	ctx := context.Background()
+	body := []byte("registered object body, counter-accounted") // 41 bytes
+	quota := int64(len(body)) + 20                              // exactly fits body + the racer
+	srv, st, mint := newLFSQuotaServer(t, quota, time.Hour)
+	tok := mint(auth.ScopeGitWrite)
+
+	oid := sha256Hex(body)
+	key := blob.LFSKey(lfsTestRepoID, oid)
+	objPath := "/" + lfsTestRepoURL + ".git/info/lfs/objects/" + oid
+	if w := doLFS(t, srv, http.MethodPut, objPath, "basic:"+tok, string(body)); w.Code != http.StatusOK {
+		t.Fatalf("upload PUT status = %d, body %s", w.Code, w.Body)
+	}
+	// Rowless legacy bytes a deflated absence-window floor would hide.
+	legacy := []byte("rowless legacy")
+	if err := srv.Blob.UploadFile(ctx, blob.LFSKey(lfsTestRepoID, sha256Hex(legacy)), writeTempFile(t, legacy)); err != nil {
+		t.Fatal(err)
+	}
+	// The registered blob vanishes; a racing admission's floor is scanned
+	// now (deflated to 0) and held as a plain integer across the repair.
+	if err := srv.Blob.Delete(ctx, key); err != nil {
+		t.Fatal(err)
+	}
+	staleFloor := int64(0)
+	// The repair republishes the counter-accounted bytes (zero-growth).
+	if w := doLFS(t, srv, http.MethodPut, objPath, "basic:"+tok, string(body)); w.Code != http.StatusOK {
+		t.Fatalf("repair PUT status = %d, body %s", w.Code, w.Body)
+	}
+	// The racer commits with its stale floor. Without the repair's cover,
+	// counter (41) + floor (0) + reservations (0) + incoming (20) == 61
+	// fits the quota exactly — admitting 20 fresh bytes while the hidden
+	// legacy bytes and the repaired object both occupy storage.
+	dec, err := st.ReservePackBytes(ctx, blob.QuotaRepoGroup(lfsTestRepoID),
+		[]ref.Pack{{Key: "packs/" + lfsTestRepoID + "/racer.pack", Size: 20}},
+		ref.NewReservationOwner(), staleFloor, quota, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dec.OK {
+		t.Fatalf("stale-floor admission passed inside the repair window (used=%d reserved=%d) — repaired bytes must be reserved before republication",
+			dec.UsedBytes, dec.ReservedBytes)
+	}
+}
+
 // TestLFSAdopt_RecheckCatchesRacingSweep (Codex round 1): adoption whose
 // blob a racing sweep reaped before the registration committed must fail
 // the request — the post-registration existence recheck catches it, and the
@@ -726,7 +779,12 @@ func TestLFSUpload_StalledClientReleasesStaging(t *testing.T) {
 
 // TestLFSQuota_ZeroGrowthRepairAtQuota (Codex round 5): a registered
 // object whose blob vanished re-admits without a fresh charge — an
-// at-quota repository must be able to repair itself.
+// at-quota repository must be able to repair itself. Since round 57 the
+// repair leaves a TTL-collected COVER reservation equal to the repaired
+// bytes (usage is still credited once): stale absence-window floors held
+// by concurrent admissions must see the republished bytes in
+// active_reservations, and deny-side conservatism until the TTL is the
+// accepted cost.
 func TestLFSQuota_ZeroGrowthRepairAtQuota(t *testing.T) {
 	srv, st, mint := newLFSQuotaServer(t, 100, time.Hour)
 	tok := mint(auth.ScopeGitWrite)
@@ -749,9 +807,11 @@ func TestLFSQuota_ZeroGrowthRepairAtQuota(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("zero-growth PUT status = %d, body %s", w.Code, w.Body)
 	}
-	// Counted once: usage stays at the original credit, nothing reserved.
-	if ls := ledgerState(t, st, time.Hour); ls.UsageBytes != 100 || ls.ReservedBytes != 0 {
-		t.Fatalf("zero-growth repair changed the ledger: %+v", ls)
+	// Counted once: usage stays at the original credit; the repair's
+	// cover reservation (round 57) holds the republished bytes until the
+	// TTL collects it.
+	if ls := ledgerState(t, st, time.Hour); ls.UsageBytes != 100 || ls.ReservedBytes != 100 {
+		t.Fatalf("ledger after repair = %+v, want usage=100 reserved=100 (the cover)", ls)
 	}
 	if _, err := srv.Blob.Stat(context.Background(), key); err != nil {
 		t.Fatalf("repair did not republish: %v", err)
