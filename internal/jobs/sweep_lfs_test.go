@@ -356,14 +356,49 @@ func TestSweepLFS_LegacyReapSparesFreshAdoptions(t *testing.T) {
 	if !f.exists(legacy) {
 		t.Fatal("aged legacy source reaped moments after adoption — presigned GETs issued against the rowless key just before adoption break mid-lifetime")
 	}
-	// Once the ADOPTION itself has aged past the grace, the source reaps.
-	f.backdate(canonical, 25*time.Hour)
-	report, err := f.sweeper(cfg).Sweep(context.Background())
+	// Once the REGISTRATION itself has aged past the grace, the source
+	// reaps (the clock is the row's created_at, so advance the sweeper's
+	// now past it — blob mtimes are already aged).
+	aged := f.sweeper(cfg)
+	aged.now = func() time.Time { return time.Now().Add(25 * time.Hour) }
+	report, err := aged.Sweep(context.Background())
 	if err != nil {
 		t.Fatalf("Sweep after grace: %v", err)
 	}
 	if f.exists(legacy) {
 		t.Fatalf("aged-adoption legacy source survived the post-grace sweep (report %+v)", report)
+	}
+}
+
+// TestSweepLFS_LegacyReapGraceKeysOnRegistrationTime (Codex round 89): the
+// grace keyed on the canonical BLOB's ModTime — but a rowless canonical
+// copy can be hours old (publication or adoption copied it long ago and
+// only the registration failed) while downloads keep presigning the
+// still-rowless LEGACY key right up to the successful registration RETRY,
+// which verifies the old copy in place without refreshing its ModTime. The
+// grace must key on the row's registration time, not the blob timestamp.
+func TestSweepLFS_LegacyReapGraceKeysOnRegistrationTime(t *testing.T) {
+	f := newSweepFixture(t)
+	content := "old copy, fresh registration"
+	oid := lfsContentOID(content)
+	canonical := blob.LFSKey("repo_lfs", oid)
+	legacy := blob.LFSLegacyKey("repo_lfs", oid)
+	// The rowless-canonical retry state: BOTH blobs are old (the copy
+	// landed hours ago; its registration failed), presigned GETs against
+	// the rowless legacy key were issued moments ago, and the retry
+	// registers NOW without touching the canonical bytes.
+	f.upload(legacy, content)
+	f.backdate(legacy, 48*time.Hour)
+	f.upload(canonical, content)
+	f.backdate(canonical, 48*time.Hour)
+	f.registerLFS("repo_lfs", canonical, int64(len(content)))
+
+	cfg := SweepConfig{Threshold: 24 * time.Hour, DeleteLFS: true, DeleteLFSLegacy: true}
+	if _, err := f.sweeper(cfg).Sweep(context.Background()); err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if !f.exists(legacy) {
+		t.Fatal("legacy source reaped moments after a late registration — the old canonical ModTime says nothing about presigned GETs issued up to the registration retry")
 	}
 }
 
