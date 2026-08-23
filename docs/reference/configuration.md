@@ -376,6 +376,11 @@ reclaims them under its LFS opt-in.
 - **Default:** `false`. The canonical spelling is the secure one — the compat
   copies are exactly as exposed to still-valid legacy upload URLs as everything
   v0.2.0 served — so compat is opt-in and meant to be temporary.
+- With a [storage quota](#codestorage_pack_quota_bytes) enforced, the bridge copy
+  passes real quota admission: each fresh upload effectively costs twice its size
+  for the roll's duration, and an upload whose bridge would exceed the quota
+  answers `507` instead of overshooting (the canonical object stays registered;
+  freeing space lets a retry repair the bridge).
 
 ### `CODESTORAGE_PACK_RESERVATION_TTL`
 

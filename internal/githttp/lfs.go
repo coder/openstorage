@@ -41,6 +41,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/coder/code-storage/internal/auth"
@@ -427,6 +428,16 @@ func (s *Server) lfsBatchUpload(r *http.Request, repoElem string, target repoTar
 				// parked for a registration that (indeterminately)
 				// committed is dead weight; free it and its lease.
 				s.dropLFSVerifyResume(key)
+				// Bridge convergence for the BATCH fast path (Codex round
+				// 84): after a failed compat copy, the natural client
+				// retry is another batch request landing exactly here —
+				// reporting "stored" without repairing the missing legacy
+				// spelling would strand old replicas on 404 with no flow
+				// left to converge.
+				if cerr := s.ensureLegacyCompat(ctx, repoID, obj.OID, key); cerr != nil {
+					log.Printf("lfs compat %s: %v", key, cerr)
+					lfsObjectFail(&results[i], compatFailStatus(cerr), "compatibility copy failed, retry")
+				}
 				continue
 			case !errors.Is(err, blob.ErrNotFound):
 				log.Printf("lfs stat %s: %v", key, err)
@@ -670,6 +681,26 @@ var errLFSContentMismatch = errors.New("stored LFS object does not match its con
 // resources (per-key slot, staging budget) this request needs. Callers
 // answer 429 + Retry-After.
 var errLFSBusy = errors.New("concurrent LFS operation in progress")
+
+// errLFSCompatQuotaExceeded is the v0.2.0 bridge copy's quota denial
+// (Codex security round 84): the bridge doubles a fresh upload's physical
+// bytes for the roll's duration, and at the quota edge the copy is DENIED
+// rather than overshooting — callers map it to 507.
+var errLFSCompatQuotaExceeded = errors.New("repository storage quota exceeded by the v0.2.0 compatibility copy")
+
+// compatFailStatus maps a compat-bridge failure to its response status:
+// quota denials are 507 (the client must free space or finish the roll),
+// contention is 429, everything else is a retryable upstream failure.
+func compatFailStatus(err error) int {
+	switch {
+	case errors.Is(err, errLFSCompatQuotaExceeded):
+		return http.StatusInsufficientStorage
+	case errors.Is(err, errLFSBusy):
+		return http.StatusTooManyRequests
+	default:
+		return http.StatusBadGateway
+	}
+}
 
 // adoptLFSObjectLocked runs adoptLFSObject under the per-key in-flight
 // slot — the batch path's entrance (the PUT path already holds the slot
@@ -942,12 +973,17 @@ func (s *Server) adoptLFSObject(ctx context.Context, repoID, key, oid string) er
 			// provably not the row's content-addressed bytes. Delete
 			// them only while the fingerprint still matches — a
 			// concurrent verified/restore writer moves it, and then its
-			// bytes rightly stand. The conditional's residual race
-			// (fingerprint read → true-bytes republish → delete) at
-			// worst leaves registered-but-blobless, which self-heals
-			// (the publisher's own writer-verify republishes; a client
-			// retry repairs zero-growth) — never forged bytes served
-			// under a trusted OID.
+			// bytes rightly stand. The check-then-delete pair is further
+			// serialized against verified publishers (Codex round 84):
+			// the PUT's publish/register/verify region now holds this
+			// same fleet claim, so no publisher can land valid bytes
+			// between the fingerprint read and this delete — the only
+			// unfenced canonical writer left is the sweeper's quarantine
+			// heal, whose restores are digest-verified content with a
+			// NEW fingerprint (the conditional spares them; the residual
+			// heal-mid-window race at worst leaves
+			// registered-but-blobless, which self-heals zero-growth) —
+			// never forged bytes served under a trusted OID.
 			fctx, fcancel := context.WithTimeout(context.WithoutCancel(ctx), lfsProbeTimeout)
 			_, nowFP, ferr := s.Blob.StatFingerprint(fctx, key)
 			fcancel()
@@ -1498,35 +1534,10 @@ func (s *Server) publishVerifiedLFSObject(ctx context.Context, repoID, key, lega
 // renewal failure is treated as loss (indeterminate is not "held") and
 // cancels op with the loss as its cause.
 func (s *Server) withRenewedAdoptionClaim(ctx context.Context, key, owner string, op func(context.Context) error) error {
-	assertf(key != "" && owner != "", "withRenewedAdoptionClaim(%q, %q)", key, owner)
 	opCtx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
-	done := make(chan struct{})
-	defer close(done)
-	go func() {
-		ticker := time.NewTicker(lfsAdoptClaimRenewInterval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-done:
-				return
-			case <-opCtx.Done():
-				return
-			case <-ticker.C:
-			}
-			rctx, rcancel := context.WithTimeout(opCtx, lfsClaimRenewTimeout)
-			renewed, err := s.Store.RenewAdoptionClaim(rctx, key, owner)
-			rcancel()
-			if err != nil {
-				cancel(fmt.Errorf("renew claim during publish: %w", err))
-				return
-			}
-			if !renewed {
-				cancel(fmt.Errorf("claim for %s expired and was taken over: %w", key, errLFSBusy))
-				return
-			}
-		}
-	}()
+	stop := s.keepAdoptionClaimRenewed(opCtx, cancel, key, owner)
+	defer stop()
 	if err := op(opCtx); err != nil {
 		// Surface the loss cause rather than the bare context error.
 		if cause := context.Cause(opCtx); cause != nil && !errors.Is(cause, context.Canceled) && opCtx.Err() != nil {
@@ -1535,6 +1546,43 @@ func (s *Server) withRenewedAdoptionClaim(ctx context.Context, key, owner string
 		return err
 	}
 	return nil
+}
+
+// keepAdoptionClaimRenewed renews the fleet claim for key on the adoption
+// cadence until the returned stop function runs (or region ends), and
+// cancels the region — with the loss as its cause — on any definitive loss
+// or renewal failure: no canonical write may continue on a lease the
+// process no longer provably holds. Renewal errors are treated as loss
+// (indeterminate is not "held").
+func (s *Server) keepAdoptionClaimRenewed(region context.Context, cancel context.CancelCauseFunc, key, owner string) (stop func()) {
+	assertf(key != "" && owner != "", "keepAdoptionClaimRenewed(%q, %q)", key, owner)
+	done := make(chan struct{})
+	var once sync.Once
+	go func() {
+		ticker := time.NewTicker(lfsAdoptClaimRenewInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-region.Done():
+				return
+			case <-ticker.C:
+			}
+			rctx, rcancel := context.WithTimeout(region, lfsClaimRenewTimeout)
+			renewed, err := s.Store.RenewAdoptionClaim(rctx, key, owner)
+			rcancel()
+			if err != nil {
+				cancel(fmt.Errorf("renew claim for %s: %w", key, err))
+				return
+			}
+			if !renewed {
+				cancel(fmt.Errorf("claim for %s expired and was taken over: %w", key, errLFSBusy))
+				return
+			}
+		}
+	}()
+	return func() { once.Do(func() { close(done) }) }
 }
 
 // releaseAdoptionClaim best-effort frees a fleet adoption claim on a
@@ -2005,6 +2053,40 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target r
 		lfsError(w, http.StatusBadRequest, fmt.Sprintf("content sha256 %s does not match oid %s", got, oid))
 		return
 	}
+	// Canonical-publisher serialization (Codex round 84): from here to
+	// the end of the handler this PUT publishes, registers, and
+	// writer-verifies the canonical key, so it holds the SAME fleet claim
+	// every adoption-side canonical write runs under. The adoption
+	// mismatch path deletes provably-corrupt canonical bytes under a
+	// registered row with a fingerprint-conditional check-then-delete —
+	// which is only sound if no publisher can land valid bytes between
+	// the check and the delete, and the claim is exactly that exclusion:
+	// while adoption holds it, this publisher waits (429, and the
+	// adopter's outcome makes the retry zero-growth); while this
+	// publisher holds it, no adoption reaches its mismatch delete. The
+	// claim is renewed on the adoption cadence for the region's whole
+	// life (publication may legitimately outlast one ref.AdoptionClaimTTL
+	// against a slow backend); a definitive loss cancels the region.
+	claimed, claimOwner, err := s.Store.TryAdoptionClaim(ctx, repoID, key)
+	if err != nil {
+		log.Printf("lfs claim %s: %v", key, err)
+		lfsError(w, http.StatusInternalServerError, "object registry unavailable")
+		return
+	}
+	if !claimed {
+		w.Header().Set("Retry-After", "10")
+		lfsError(w, http.StatusTooManyRequests, "a concurrent operation holds this object, retry")
+		return
+	}
+	defer s.releaseAdoptionClaim(key, claimOwner)
+	// The claim-guarded region is DETACHED from the client (the adoption
+	// side's round-31 discipline): a hangup mid-publish must not abort
+	// work the claim serializes — the publication lease below bounds it
+	// and returns the staging slots either way.
+	regionCtx, regionCancel := context.WithCancelCause(context.WithoutCancel(ctx))
+	defer regionCancel(nil)
+	stopRenew := s.keepAdoptionClaimRenewed(regionCtx, regionCancel, key, claimOwner)
+	defer stopRenew()
 	// Reservation freshness (Codex round 8): the body copy above may have
 	// consumed most of the TTL, and an expired row's headroom is claimable
 	// by other admissions while this object would still become durable.
@@ -2155,7 +2237,7 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target r
 			return
 		}
 	}
-	pubCtx, cancel := context.WithDeadline(ctx, pubAnchor.Add(s.lfsPublicationLease()))
+	pubCtx, cancel := context.WithDeadline(regionCtx, pubAnchor.Add(s.lfsPublicationLease()))
 	defer cancel()
 	if err := s.Blob.UploadFile(pubCtx, key, path); err != nil {
 		// PROVEN-clean failure: retire THIS attempt's share of the
@@ -2247,7 +2329,7 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target r
 	// request with the row — if registration committed — in the
 	// documented zero-growth repair state, which the client's retry
 	// republishes.
-	ectx, ecancel := context.WithDeadline(context.WithoutCancel(ctx), pubAnchor.Add(s.lfsPublicationLease()))
+	ectx, ecancel := context.WithDeadline(regionCtx, pubAnchor.Add(s.lfsPublicationLease()))
 	defer ecancel()
 	restoredHere := false
 	verifyErr := func() error {
@@ -2317,7 +2399,7 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target r
 	// nothing left to converge it.
 	if err := s.maybeLegacyCompatCopy(ctx, repoID, oid, key, n); err != nil {
 		log.Printf("lfs compat %s: %v", key, err)
-		lfsError(w, http.StatusBadGateway, "compatibility copy failed, retry")
+		lfsError(w, compatFailStatus(err), "compatibility copy failed, retry")
 		return
 	}
 	w.WriteHeader(http.StatusOK)
@@ -2359,6 +2441,47 @@ func (s *Server) maybeLegacyCompatCopy(ctx context.Context, repoID, oid, key str
 			return fmt.Errorf("compat copy %s: %w", legacyKey, err)
 		}
 		return nil
+	}
+	// REAL quota admission for the bridge bytes (Codex security round
+	// 84): the copy is fresh growth — a second size-byte object the
+	// canonical upload's reservation never covered — and admitting it
+	// under an unbounded quota let an upload equal to the remaining
+	// headroom leave physical usage near 2Q. Reserve it like any other
+	// admission (floor + generation recheck, real PackQuotaBytes) BEFORE
+	// anything becomes physical; a denial fails the bridge, never
+	// overshoots — the canonical object stays registered and a later
+	// retry repairs the bridge if headroom appears. The row settles by
+	// TTL; the listing floor charges the durable bridge bytes from then
+	// on (rowless legacy copies are floor-accounted, like every retained
+	// source).
+	for attempt := 0; ; attempt++ {
+		floor, floorGen, err := s.cachedUsageFloorGen(dctx, repoID)
+		if err != nil {
+			return fmt.Errorf("compat admission %s: usage listing: %w", legacyKey, err)
+		}
+		rsvCtx, rsvCancel := context.WithTimeout(dctx, UsageFloorHandoffMargin)
+		dec, err := s.Store.ReservePackBytes(rsvCtx, blob.QuotaRepoGroup(repoID),
+			[]ref.Pack{{Key: legacyKey, Size: size}}, ref.NewReservationOwner(),
+			floor, floorGen, s.PackQuotaBytes, s.lfsReservationTTL())
+		rsvCancel()
+		if err != nil {
+			return fmt.Errorf("compat admission %s: %w", legacyKey, err)
+		}
+		if dec.FloorStale {
+			s.invalidateUsageFloor(repoID)
+			if attempt >= 1 {
+				return fmt.Errorf("compat admission %s: usage floor went stale twice", legacyKey)
+			}
+			continue
+		}
+		if dec.KeyCapExceeded {
+			return fmt.Errorf("compat admission %s: %w", legacyKey, errLFSBusy)
+		}
+		if !dec.OK {
+			return fmt.Errorf("compat copy %s: %w (bridge adds %d bytes to %d stored, +%d reserved, quota %d)",
+				legacyKey, errLFSCompatQuotaExceeded, size, dec.UsedBytes, dec.ReservedBytes, s.PackQuotaBytes)
+		}
+		break
 	}
 	// The compat copy materializes ANOTHER size bytes after registration
 	// consumed the canonical upload's reservation (Codex round 82): a
