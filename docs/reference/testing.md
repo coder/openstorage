@@ -139,7 +139,10 @@ Defaults: 150 steps, 3 nodes. Exit codes: `0` clean, `1` invariant violation,
    reported step count too, or a longer sweep's failure point silently falls
    back to the 150-step default:
    `DST_SEED=<seed> DST_STEPS=<steps> go test ./internal/simtest -run 'TestDSTSeed' -v -count=1`
-   must print the same trace hash and pass.
+   must pass. Trace hashes are per-run-content: the failing hash belongs to the
+   *pre-fix* reproduction (the `VIOLATION` line is hashed and stops the run);
+   the fixed run produces a different hash — what determinism guarantees is
+   that repeated runs of the same binary print the *same* one.
 
 ### The nightly sweep
 
