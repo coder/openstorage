@@ -98,11 +98,15 @@ Flags:
 	defer bl.Close()
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
+	purgeReg, ok := rs.(jobs.RepoPurgeRegistry)
+	assertf(ok, "ref store %T lacks the repo purge seams", rs)
+	purgeMeta, ok := ms.(jobs.RepoPurgeMeta)
+	assertf(ok, "meta store %T lacks the repo purge seams", ms)
 	sweepCfg := jobs.SweepConfig{
-		Threshold:        defaultSweepAgeThreshold,
-		RetentionEnabled: true,
-		QuotaEnforced:    quotaBytes > 0,
-		ReservationTTL:   reservationTTL,
+		Threshold:       defaultSweepAgeThreshold,
+		PurgedRepoProbe: purgeReg.IsRepoPurged,
+		QuotaEnforced:   quotaBytes > 0,
+		ReservationTTL:  reservationTTL,
 	}
 	if s3store, ok := bl.(*blob.S3); ok {
 		// Versioned buckets turn deletes into billed delete markers; fail
@@ -119,10 +123,6 @@ Flags:
 		}
 	}
 	sweeper := jobs.NewSweeper(bl, rs, sweepCfg, logger)
-	purgeReg, ok := rs.(jobs.RepoPurgeRegistry)
-	assertf(ok, "ref store %T lacks the repo purge seams", rs)
-	purgeMeta, ok := ms.(jobs.RepoPurgeMeta)
-	assertf(ok, "meta store %T lacks the repo purge seams", ms)
 	purger := jobs.NewRepoPurger(sweeper, purgeReg, purgeMeta, 0, logger)
 
 	// Summarize what would be purged before demanding confirmation, so an

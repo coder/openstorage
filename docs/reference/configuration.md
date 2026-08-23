@@ -531,10 +531,11 @@ command runs the same primitive synchronously for one repository.
   URL-scoped and can outlive any retention window, and a name reuse would let a stale
   token authorize against the successor repository.
 - Purged blob bytes move to quarantine first and are freed when the backups age out
-  (retention counts as a destructive mode for quarantine aging even with every
-  `*_DELETE_*` flag off). On versioned S3 buckets it fails startup exactly like the
-  delete opt-ins. Each purge also write-fences the repository before touching anything,
-  so a still-in-flight pre-delete push fails instead of racing the reclamation.
+  (sweeps are purge-aware even with every `*_DELETE_*` flag off — and independent of
+  this variable, so `purge-repo`-minted fences get the same cleanup). On versioned S3
+  buckets it fails startup exactly like the delete opt-ins. Each purge also write-fences
+  the repository before touching anything, so a still-in-flight pre-delete push fails
+  instead of racing the reclamation.
 
 ### `CODESTORAGE_REPACK_THRESHOLD`
 

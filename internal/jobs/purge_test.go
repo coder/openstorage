@@ -92,6 +92,13 @@ func (f *purgeFixture) purger(sweeper *Sweeper, retention time.Duration) *RepoPu
 	return p
 }
 
+// purgeAwareSweeper builds a sweeper wired like serve: purge-aware via the
+// store's fence probe, every delete flag off.
+func (f *purgeFixture) purgeAwareSweeper() *Sweeper {
+	f.t.Helper()
+	return f.sweeper(SweepConfig{Threshold: 24 * time.Hour, PurgedRepoProbe: f.store.(RepoPurgeRegistry).IsRepoPurged})
+}
+
 // readBlob returns the content at key.
 func (f *purgeFixture) readBlob(key string) string {
 	f.t.Helper()
@@ -165,7 +172,7 @@ func TestRepoPurge_EndToEnd(t *testing.T) {
 	control := f.seedRepo("https://example.com/control.git")
 	f.softDelete(victim.URL)
 
-	sweeper := f.sweeper(SweepConfig{Threshold: 24 * time.Hour, RetentionEnabled: true})
+	sweeper := f.purgeAwareSweeper()
 	packKey, nsKey, lfsKey := repoKeys(victim.RepoID)
 	contents := map[string]string{
 		packKey: f.readBlob(packKey), nsKey: f.readBlob(nsKey), lfsKey: f.readBlob(lfsKey),
@@ -217,7 +224,7 @@ func TestPurgedRepoStragglers(t *testing.T) {
 	repo := f.seedRepo("https://example.com/straggler-blob.git")
 	f.softDelete(repo.URL)
 	probe := f.store.(RepoPurgeRegistry).IsRepoPurged
-	sweeper := f.sweeper(SweepConfig{Threshold: 24 * time.Hour, RetentionEnabled: true, PurgedRepoProbe: probe})
+	sweeper := f.sweeper(SweepConfig{Threshold: 24 * time.Hour, PurgedRepoProbe: probe})
 	purger := f.purger(sweeper, 0)
 	if _, err := purger.PurgeRepo(ctx, repo.RepoID); err != nil {
 		t.Fatalf("PurgeRepo: %v", err)
@@ -285,7 +292,7 @@ func TestPurgeExpired_RespectsRetention(t *testing.T) {
 	f.metaNow = time.Now
 	f.softDelete(recent.URL)
 
-	sweeper := f.sweeper(SweepConfig{Threshold: 24 * time.Hour, RetentionEnabled: true})
+	sweeper := f.purgeAwareSweeper()
 	purger := f.purger(sweeper, time.Hour)
 	purger.now = time.Now // real clock: retention filtering is under test
 
@@ -310,7 +317,7 @@ func TestPurgeRepo_Refusals(t *testing.T) {
 	recent := f.seedRepo("https://example.com/recent.git")
 	f.softDelete(recent.URL)
 
-	sweeper := f.sweeper(SweepConfig{Threshold: 24 * time.Hour, RetentionEnabled: true})
+	sweeper := f.purgeAwareSweeper()
 	purger := f.purger(sweeper, 0)
 	ctx := context.Background()
 
@@ -334,8 +341,9 @@ func TestPurgeRepo_Refusals(t *testing.T) {
 	f.assertIntact(recent.RepoID)
 
 	// A failing delete guard blocks the purge before any destructive step.
-	guarded := f.sweeper(SweepConfig{Threshold: 24 * time.Hour, RetentionEnabled: true,
-		DeleteGuard: func(context.Context) error { return errors.New("versioning drifted") }})
+	guarded := f.sweeper(SweepConfig{Threshold: 24 * time.Hour,
+		PurgedRepoProbe: f.store.(RepoPurgeRegistry).IsRepoPurged,
+		DeleteGuard:     func(context.Context) error { return errors.New("versioning drifted") }})
 	if _, err := f.purger(guarded, 0).PurgeRepo(ctx, recent.RepoID); err == nil || !strings.Contains(err.Error(), "delete guard") {
 		t.Fatalf("guarded purge = %v, want delete-guard error", err)
 	}
@@ -395,7 +403,7 @@ func TestPurgeRepo_CrashResume(t *testing.T) {
 		f := newPurgeFixture(t)
 		repo := f.seedRepo("https://example.com/crash-a.git")
 		f.softDelete(repo.URL)
-		sweeper := f.sweeper(SweepConfig{Threshold: 24 * time.Hour, RetentionEnabled: true})
+		sweeper := f.purgeAwareSweeper()
 		hooks := &purgeRegistryHooks{RepoPurgeRegistry: f.store.(RepoPurgeRegistry), retireErr: errors.New("injected crash")}
 		purger := NewRepoPurger(sweeper, hooks, f.meta.(RepoPurgeMeta), 0, slog.New(slog.DiscardHandler))
 		purger.now = func() time.Time { return time.Now().Add(2 * time.Hour) }
@@ -431,7 +439,7 @@ func TestPurgeRepo_CrashResume(t *testing.T) {
 		f.softDelete(repo.URL)
 		packKey, _, _ := repoKeys(repo.RepoID)
 		blobs := &deleteFailBlobs{BlobStore: f.blobs, failKey: packKey}
-		sweeper := NewSweeper(blobs, f.store, SweepConfig{Threshold: 24 * time.Hour, RetentionEnabled: true}, slog.New(slog.DiscardHandler))
+		sweeper := NewSweeper(blobs, f.store, SweepConfig{Threshold: 24 * time.Hour, PurgedRepoProbe: f.store.(RepoPurgeRegistry).IsRepoPurged}, slog.New(slog.DiscardHandler))
 		hooks := f.store.(RepoPurgeRegistry)
 		purger := NewRepoPurger(sweeper, hooks, f.meta.(RepoPurgeMeta), 0, slog.New(slog.DiscardHandler))
 		purger.now = func() time.Time { return time.Now().Add(2 * time.Hour) }
@@ -457,7 +465,7 @@ func TestPurgeRepo_CrashResume(t *testing.T) {
 		f := newPurgeFixture(t)
 		repo := f.seedRepo("https://example.com/crash-c.git")
 		f.softDelete(repo.URL)
-		sweeper := f.sweeper(SweepConfig{Threshold: 24 * time.Hour, RetentionEnabled: true})
+		sweeper := f.purgeAwareSweeper()
 		hooks := &purgeRegistryHooks{RepoPurgeRegistry: f.store.(RepoPurgeRegistry), ledgerErr: errors.New("injected crash")}
 		purger := NewRepoPurger(sweeper, hooks, f.meta.(RepoPurgeMeta), 0, slog.New(slog.DiscardHandler))
 		purger.now = func() time.Time { return time.Now().Add(2 * time.Hour) }
@@ -484,7 +492,7 @@ func TestPurgeRepo_FenceRejectsLateWriter(t *testing.T) {
 	f.softDelete(repo.URL)
 	packKey, _, lfsKey := repoKeys(repo.RepoID)
 
-	sweeper := f.sweeper(SweepConfig{Threshold: 24 * time.Hour, RetentionEnabled: true})
+	sweeper := f.purgeAwareSweeper()
 	hooks := &purgeRegistryHooks{RepoPurgeRegistry: f.store.(RepoPurgeRegistry)}
 	// An in-flight pre-delete push tries to re-register its pack right
 	// after the tombstoning phase (content-addressed retry: same id, same
@@ -546,7 +554,7 @@ func TestPurgeRepo_StragglerRowsDefer(t *testing.T) {
 	repo := f.seedRepo("https://example.com/straggler.git")
 	f.softDelete(repo.URL)
 
-	sweeper := f.sweeper(SweepConfig{Threshold: 24 * time.Hour, RetentionEnabled: true})
+	sweeper := f.purgeAwareSweeper()
 	hooks := &stragglerRowRegistry{RepoPurgeRegistry: f.store.(RepoPurgeRegistry), stragglers: 1}
 	purger := NewRepoPurger(sweeper, hooks, f.meta.(RepoPurgeMeta), 0, slog.New(slog.DiscardHandler))
 	purger.now = func() time.Time { return time.Now().Add(2 * time.Hour) }
@@ -571,7 +579,7 @@ func TestSweepSchedule_RunsPurge(t *testing.T) {
 	f.softDelete(repo.URL)
 	f.metaNow = time.Now
 
-	sweeper := f.sweeper(SweepConfig{Threshold: 24 * time.Hour, RetentionEnabled: true})
+	sweeper := f.purgeAwareSweeper()
 	purger := NewRepoPurger(sweeper, f.store.(RepoPurgeRegistry), f.meta.(RepoPurgeMeta), time.Hour, slog.New(slog.DiscardHandler))
 	schedule := &SweepSchedule{Sweeper: sweeper, Interval: time.Hour, Purger: purger}
 	if err := schedule.runOnce(context.Background()); err != nil {
@@ -584,7 +592,7 @@ func TestSweep_RetentionModeAgesQuarantine(t *testing.T) {
 	f := newPurgeFixture(t)
 	repo := f.seedRepo("https://example.com/aged.git")
 	f.softDelete(repo.URL)
-	sweeper := f.sweeper(SweepConfig{Threshold: 24 * time.Hour, RetentionEnabled: true})
+	sweeper := f.purgeAwareSweeper()
 	if _, err := f.purger(sweeper, 0).PurgeRepo(context.Background(), repo.RepoID); err != nil {
 		t.Fatalf("PurgeRepo: %v", err)
 	}

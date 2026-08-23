@@ -93,8 +93,9 @@ before its deletion and is still in flight fails its ref update and its pack/LFS
 registration instead of re-registering rows behind the purge, and credential/upstream
 writes only ever attach to live repositories. Such a push may still have *published* its blob
 after the purge's scan (uploads precede registration) — the fence makes those bytes
-provably permanent garbage, so later retention-mode sweeps reap them in every class
-once aged, and re-running `purge-repo` on the purged repository rescans its prefixes
+provably permanent garbage, so later sweeps reap them in every class once aged
+(purge-awareness is built in, independent of the retention setting and the delete
+opt-ins), and re-running `purge-repo` on the purged repository rescans its prefixes
 immediately.
 
 The purge is crash-safe by ordering, the inverse of the write path's
@@ -104,8 +105,8 @@ pointing at missing bytes — only tombstones the next pass (or a `purge-repo` r
 finishes reaping. Blob deletion itself goes through the sweeper's quarantine-first
 handshake: bytes move to `sweep/quarantine/` and are freed once the backups age past
 the purge window on a later sweep, so the moment storage actually shrinks is one sweep
-behind the purge (retention counts as a destructive mode for that aging even when all
-`*_DELETE_*` flags are off).
+behind the purge (purge-aware sweeps age those backups out even when all `*_DELETE_*`
+flags are off).
 
 ## Background repack
 

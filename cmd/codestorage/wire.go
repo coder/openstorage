@@ -125,10 +125,6 @@ func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL, loopbackBaseU
 		Delete:           sweep.deleteEnabled,
 		DeleteSuperseded: sweep.deleteSuperseded,
 		DeleteLFS:        sweep.deleteLFS,
-		// Retention purging counts as a destructive mode so purge-minted
-		// quarantine backups age out even with every delete flag off
-		// (issue #52).
-		RetentionEnabled: sweep.repoRetention > 0,
 		// Quarantine restores take cover reservations + generation
 		// bumps only when quota admission actually consults them
 		// (Codex round 73).
@@ -137,7 +133,7 @@ func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL, loopbackBaseU
 		// on its cadence with the same TTL the write gates charge.
 		ReservationTTL: packReservationTTL,
 	}
-	if s3store, ok := blobStore.(*blob.S3); ok && (sweep.deleteEnabled || sweep.deleteSuperseded || sweep.deleteLFS || sweep.repoRetention > 0) {
+	if s3store, ok := blobStore.(*blob.S3); ok {
 		// Versioning can be enabled on the bucket while the process runs,
 		// silently turning startup's validation stale; every delete-mode
 		// sweep re-checks and downgrades itself to list-only on drift or
@@ -153,23 +149,18 @@ func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL, loopbackBaseU
 			return nil
 		}
 	}
-	// Repo-retention purge (issue #52): rides the sweep schedule over the
-	// same raw stores. The purge seams live on the concrete backends
-	// (ref/purge.go, meta/purge.go), so the raw stores opened above always
-	// satisfy these assertions.
-	var purgeReg jobs.RepoPurgeRegistry
-	var purgeMeta jobs.RepoPurgeMeta
-	if sweep.repoRetention > 0 {
-		pr, ok := refStore.(jobs.RepoPurgeRegistry)
-		assertf(ok, "ref store %T lacks the repo purge seams", refStore)
-		pm, ok := ms.(jobs.RepoPurgeMeta)
-		assertf(ok, "meta store %T lacks the repo purge seams", ms)
-		purgeReg, purgeMeta = pr, pm
-		// Sweeps reap straggler blobs published into purge-fenced repos
-		// after their purge's own prefix scan (uploads precede the fenced
-		// registration and cannot be fenced themselves).
-		sweepCfg.PurgedRepoProbe = pr.IsRepoPurged
-	}
+	// Repository purge seams (issue #52): the concrete backends always
+	// carry them, so the assertions hold on every serve configuration.
+	purgeReg, ok := refStore.(jobs.RepoPurgeRegistry)
+	assertf(ok, "ref store %T lacks the repo purge seams", refStore)
+	purgeMeta, ok := ms.(jobs.RepoPurgeMeta)
+	assertf(ok, "meta store %T lacks the repo purge seams", ms)
+	// Purge-aware sweeps reap straggler blobs published into purge-fenced
+	// repos after their purge's own prefix scan (uploads precede the
+	// fenced registration and cannot be fenced themselves). Wired
+	// INDEPENDENTLY of the retention window: `codestorage purge-repo`
+	// mints fences on retention-less deployments too (PR #105 round 8).
+	sweepCfg.PurgedRepoProbe = purgeReg.IsRepoPurged
 	sweeper := jobs.NewSweeper(blobStore, refStore, sweepCfg, logger)
 	var schedule *jobs.SweepSchedule
 	if sweep.interval > 0 {
