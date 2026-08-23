@@ -169,6 +169,44 @@ func TestEnsureCacheRepo_MemoFallsThroughOnRepoRemoval(t *testing.T) {
 	}
 }
 
+// Duplicate definitions where the TRAILING value is the safe pin (git's
+// last-definition-wins: `unpackLimit = 1` then `= 0` is effectively 0)
+// must keep serving and memoizing — the pre-memo code accepted them, and
+// rejecting would make every EnsureCacheRepo fail because a single-value
+// repair write cannot overwrite multiple values (PR #98 round-6 review).
+// A duplicate whose trailing value is HOSTILE must be repaired.
+func TestEnsureCacheRepo_AcceptsTrailingSafeDuplicateConfig(t *testing.T) {
+	cacheDir := t.TempDir()
+	const repo = "t-ensure-dup"
+	repoPath, err := EnsureCacheRepo(cacheDir, repo)
+	if err != nil {
+		t.Fatalf("EnsureCacheRepo: %v", err)
+	}
+
+	// Stale duplicate BEFORE the effective safe value.
+	mustGit(t, repoPath, "config", "--add", "receive.unpackLimit", "1")
+	mustGit(t, repoPath, "config", "--add", "receive.unpackLimit", "0")
+
+	if _, err := EnsureCacheRepo(cacheDir, repo); err != nil {
+		t.Fatalf("EnsureCacheRepo (trailing-safe duplicates): %v", err)
+	}
+	if _, ok := cacheRepoMemos.Load(repoPath); !ok {
+		t.Fatal("trailing-safe duplicate config was not memoized")
+	}
+	if got := strings.TrimSpace(mustGit(t, repoPath, "config", "--get", "receive.unpackLimit")); got != "0" {
+		t.Fatalf("effective receive.unpackLimit = %q, want 0", got)
+	}
+
+	// Trailing HOSTILE duplicate: must be repaired, not served as-is.
+	mustGit(t, repoPath, "config", "--add", "receive.unpackLimit", "1")
+	if _, err := EnsureCacheRepo(cacheDir, repo); err != nil {
+		t.Fatalf("EnsureCacheRepo (trailing-hostile duplicate): %v", err)
+	}
+	if got := strings.TrimSpace(mustGit(t, repoPath, "config", "--get", "receive.unpackLimit")); got != "0" {
+		t.Fatalf("effective receive.unpackLimit = %q after repair, want 0", got)
+	}
+}
+
 // A local-scope [include] can override the pinned values for receive-pack
 // (which follows includes) while `--local --get` without --includes still
 // reports the direct pins — and the included file lives OUTSIDE the memo's

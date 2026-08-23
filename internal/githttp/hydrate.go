@@ -207,11 +207,14 @@ var errConfigValueMismatch = errors.New("local config value mismatch")
 // follows local [include] directives and takes the LAST definition, so a
 // local include appended after the pins could override them while an
 // include-blind single-value read still reported the pin. Resolving
-// includes and requiring every definition to match makes any effective
-// override fail verification; a config that merely CONTAINS include
-// directives additionally fails with errConfigHasIncludes after the value
-// checks, because the included files could drift later without touching
-// the fingerprinted file.
+// includes and checking the LAST value listed — git's last-definition-wins,
+// which is exactly what receive-pack loads — makes any effective override
+// fail verification, while an earlier stale duplicate followed by the safe
+// pin stays accepted, as the pre-memo code accepted it (PR #98 round-6
+// review). A config that merely CONTAINS include directives additionally
+// fails with errConfigHasIncludes after the value checks, because the
+// included files could drift later without touching the fingerprinted
+// file.
 func verifyLocalConfig(ctx context.Context, repoPath, configPath string) (os.FileInfo, error) {
 	pre, err := os.Stat(configPath)
 	if err != nil {
@@ -226,10 +229,8 @@ func verifyLocalConfig(ctx context.Context, repoPath, configPath string) (os.Fil
 		if len(vals) == 0 || vals[0] == "" {
 			return nil, fmt.Errorf("%w: %s unset, want %q", errConfigValueMismatch, kv[0], kv[1])
 		}
-		for _, got := range vals {
-			if got != kv[1] {
-				return nil, fmt.Errorf("%w: %s = %q, want %q", errConfigValueMismatch, kv[0], got, kv[1])
-			}
+		if got := vals[len(vals)-1]; got != kv[1] {
+			return nil, fmt.Errorf("%w: %s = %q effective, want %q", errConfigValueMismatch, kv[0], got, kv[1])
 		}
 	}
 	// Include scan AFTER the value checks so callers repair values first;
@@ -315,7 +316,10 @@ func EnsureCacheRepoCtx(ctx context.Context, cacheDir, repo string) (string, err
 	configFI, configErr := verifyLocalConfig(ctx, path, configPath)
 	if configErr != nil && !errors.Is(configErr, errConfigHasIncludes) {
 		for _, kv := range cacheRepoConfig {
-			if _, err := runGitCtx(ctx, path, "config", kv[0], kv[1]); err != nil {
+			// --replace-all: a hostile trailing duplicate must collapse to
+			// one pinned definition — a single-value write would fail with
+			// "cannot overwrite multiple values" (PR #98 round-6 review).
+			if _, err := runGitCtx(ctx, path, "config", "--replace-all", kv[0], kv[1]); err != nil {
 				return "", err
 			}
 		}
