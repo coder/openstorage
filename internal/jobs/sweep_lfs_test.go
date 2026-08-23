@@ -289,6 +289,84 @@ func TestSweepLFS_HealRestoresRegisteredFromQuarantine(t *testing.T) {
 	}
 }
 
+// TestSweepLFS_ReconcileTickerReconcilesLateTwins (Codex round 88 +
+// security twin): with CODESTORAGE_SWEEP_INTERVAL=0 the startup Heal was
+// the ONLY reconciliation pass, but a mixed-roll old replica can insert a
+// legacy row beside an existing canonical one at any time after startup —
+// registered fast paths never re-register, so the duplicate count and
+// usage charge persisted indefinitely (507 cap denials until restart).
+// Sweep-disabled deployments need an always-live janitor.
+func TestSweepLFS_ReconcileTickerReconcilesLateTwins(t *testing.T) {
+	f := newSweepFixture(t)
+	oid := lfsOID("cd")
+	canonical := blob.LFSKey("repo_lfs", oid)
+	legacy := blob.LFSLegacyKey("repo_lfs", oid)
+	f.registerLFS("repo_lfs", canonical, 40)
+
+	stop := StartReconcileTicker(f.sweeper(SweepConfig{Threshold: 24 * time.Hour}), 10*time.Millisecond)
+	defer stop()
+	// The twin lands AFTER the ticker started — an old replica writing
+	// mid-roll, past the startup Heal.
+	f.registerLFS("repo_lfs", legacy, 40)
+
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		has, err := f.store.HasLFSObject(context.Background(), "repo_lfs", legacy)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !has {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("legacy twin inserted after startup was never reconciled — sweep-disabled deployments double-charge it forever")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if has, err := f.store.HasLFSObject(context.Background(), "repo_lfs", canonical); err != nil || !has {
+		t.Fatalf("canonical row after ticker reconcile = (%v, %v), want intact", has, err)
+	}
+}
+
+// TestSweepLFS_LegacyReapSparesFreshAdoptions (Codex round 88): a batch
+// can presign a 15-minute GET against a rowless legacy key right up to
+// the moment a concurrent write adopts it — and the retained source's own
+// ModTime is its ORIGINAL upload time, already past any age threshold, so
+// the next post-roll sweep reaped it immediately and broke the fresh URL.
+// The canonical blob's ModTime IS the adoption time: a legacy source with
+// a REGISTERED canonical twin may be reaped only once the canonical copy
+// is older than the reap grace (which dwarfs the URL lifetime).
+func TestSweepLFS_LegacyReapSparesFreshAdoptions(t *testing.T) {
+	f := newSweepFixture(t)
+	content := "just-adopted legacy source"
+	oid := lfsContentOID(content)
+	canonical := blob.LFSKey("repo_lfs", oid)
+	legacy := blob.LFSLegacyKey("repo_lfs", oid)
+	// Seconds after adoption: an AGED legacy source retained beside a
+	// fresh canonical copy under a registered row.
+	f.upload(legacy, content)
+	f.backdate(legacy, 48*time.Hour)
+	f.upload(canonical, content)
+	f.registerLFS("repo_lfs", canonical, int64(len(content)))
+
+	cfg := SweepConfig{Threshold: 24 * time.Hour, DeleteLFS: true, DeleteLFSLegacy: true}
+	if _, err := f.sweeper(cfg).Sweep(context.Background()); err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if !f.exists(legacy) {
+		t.Fatal("aged legacy source reaped moments after adoption — presigned GETs issued against the rowless key just before adoption break mid-lifetime")
+	}
+	// Once the ADOPTION itself has aged past the grace, the source reaps.
+	f.backdate(canonical, 25*time.Hour)
+	report, err := f.sweeper(cfg).Sweep(context.Background())
+	if err != nil {
+		t.Fatalf("Sweep after grace: %v", err)
+	}
+	if f.exists(legacy) {
+		t.Fatalf("aged-adoption legacy source survived the post-grace sweep (report %+v)", report)
+	}
+}
+
 // TestSweepLFS_HealTakesNoCoverWhenQuotaDisabled (Codex round 73): with
 // quota enforcement off, no admission consults floors or covers — a
 // restore-cover row would only burn the per-repo reservation cap, and

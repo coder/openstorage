@@ -497,6 +497,16 @@ func (s *Sweeper) classify(ctx context.Context, repo string, obj blob.ListedObje
 	if !canDelete {
 		return nil
 	}
+	if strings.HasPrefix(obj.Key, blob.LFSRoot) && !strings.Contains(obj.Key, "/o2/") {
+		spared, err := s.legacySourceInReapGrace(ctx, repo, obj.Key)
+		if err != nil {
+			deleteErrs.add(err)
+			return nil
+		}
+		if spared {
+			return nil
+		}
+	}
 	stillOrphan, err := s.revalidateOrphan(ctx, repo, obj.Key)
 	if err != nil {
 		deleteErrs.add(err)
@@ -756,6 +766,96 @@ func (s *Sweeper) restoreFromQuarantine(ctx context.Context, key, qKey string) (
 		}
 	}
 	return true, nil
+}
+
+// legacyReapGraceFloor is the minimum age an ADOPTION (the canonical
+// copy's ModTime) must reach before the retained legacy source may be
+// reaped: presigned legacy GETs live 15 minutes, and the floor holds even
+// when the sweep threshold is tuned lower.
+const legacyReapGraceFloor = time.Hour
+
+// legacySourceInReapGrace reports whether the aged legacy-spelled orphan
+// at key is an adoption-retained source whose adoption is too RECENT to
+// reap (Codex round 88): batch downloads presign the rowless legacy key
+// right up to the adoption moment, and the source's own ModTime is its
+// original upload — already past any threshold — so the candidate age
+// proves nothing about those URLs. The canonical blob's ModTime IS the
+// adoption (or verified-publish) time: the source reaps only once that
+// copy is older than the grace, which dwarfs the presign lifetime.
+// Unknowable canonical state spares the source (conservative; the next
+// sweep re-examines).
+func (s *Sweeper) legacySourceInReapGrace(ctx context.Context, repo, key string) (bool, error) {
+	_, oid, ok := splitLFSKey(key)
+	if !ok {
+		return false, nil
+	}
+	canonical := blob.LFSKey(repo, oid)
+	registered, err := s.packs.HasLFSObject(ctx, repo, canonical)
+	if err != nil {
+		return false, fmt.Errorf("reap-grace twin lookup %s: %w", canonical, err)
+	}
+	if !registered {
+		return false, nil // plain rowless orphan: the age threshold governs
+	}
+	entries, err := s.blobs.List(ctx, canonical)
+	if err != nil {
+		return false, fmt.Errorf("reap-grace canonical list %s: %w", canonical, err)
+	}
+	grace := max(s.cfg.Threshold, legacyReapGraceFloor)
+	for _, e := range entries {
+		if e.Key != canonical {
+			continue
+		}
+		if e.ModTime.IsZero() || s.now().Sub(e.ModTime) < grace {
+			s.logger.Info("orphan pack sweep: sparing adoption-retained legacy source in reap grace", "key", key)
+			return true, nil
+		}
+		return false, nil
+	}
+	// Registered but blobless: spare — deleting the source buys nothing
+	// while the row's repair story is still converging.
+	return true, nil
+}
+
+// reconcileTickInterval is the always-live twin janitor's cadence when
+// periodic sweeping is disabled (Codex round 88): one cheap point read per
+// tick when no twins exist, hourly like the default sweep.
+const reconcileTickInterval = time.Hour
+
+// StartReconcileTicker runs the legacy/canonical LFS row-twin janitor on a
+// background goroutine (Codex round 88 + security twin): with
+// CODESTORAGE_SWEEP_INTERVAL=0 the startup Heal was the ONLY
+// reconciliation, but during a mixed-version rollout an old replica can
+// insert a legacy row beside an existing canonical one at any time after
+// startup — registered fast paths never re-register, so the duplicate
+// object-count and usage charge would persist indefinitely. The returned
+// stop function cancels the loop and waits for an in-flight pass.
+func StartReconcileTicker(sweeper *Sweeper, interval time.Duration) (stop func()) {
+	assertf(sweeper != nil, "StartReconcileTicker: nil sweeper")
+	assertf(interval > 0, "StartReconcileTicker: non-positive interval %v", interval)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			if n, err := sweeper.packs.ReconcileLegacyLFSObjects(ctx); err != nil && ctx.Err() == nil {
+				sweeper.logger.Error("legacy lfs row reconcile failed", "err", err)
+			} else if n > 0 {
+				sweeper.logger.Info("reconciled legacy lfs row twins", "count", n)
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+		}
+	}()
+	return func() {
+		cancel()
+		<-done
+	}
 }
 
 // lfsBackupMatchesOID reports whether the object at qKey hashes to oid.
