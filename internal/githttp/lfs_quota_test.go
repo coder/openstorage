@@ -1898,6 +1898,111 @@ func TestLFSAdopt_AmbiguousCommitContinues(t *testing.T) {
 	}
 }
 
+// flakyAccountingStore fails suffixed-cover reservations and generation
+// bumps a bounded number of times once armed — the transiently unavailable
+// ref store behind an ambiguous-commit recovery.
+type flakyAccountingStore struct {
+	ref.RefStore
+	armed         atomic.Bool
+	coverFails    atomic.Int64
+	bumpFails     atomic.Int64
+	coverAttempts atomic.Int64
+}
+
+func (f *flakyAccountingStore) ReservePackBytes(ctx context.Context, group []string, packs []ref.Pack, owner string, usageFloor, floorGen, quotaBytes int64, ttl time.Duration) (ref.ReserveDecision, error) {
+	if f.armed.Load() && len(packs) == 1 && strings.HasSuffix(packs[0].Key, ref.RepairCoverSuffix) {
+		f.coverAttempts.Add(1)
+		if f.coverFails.Add(-1) >= 0 {
+			return ref.ReserveDecision{}, fmt.Errorf("simulated ref-store outage (cover)")
+		}
+	}
+	return f.RefStore.ReservePackBytes(ctx, group, packs, owner, usageFloor, floorGen, quotaBytes, ttl)
+}
+
+func (f *flakyAccountingStore) BumpLFSAdoptionGen(ctx context.Context, repo string) error {
+	if f.armed.Load() && f.bumpFails.Add(-1) >= 0 {
+		return fmt.Errorf("simulated ref-store outage (bump)")
+	}
+	return f.RefStore.BumpLFSAdoptionGen(ctx, repo)
+}
+
+// armingCommitButFailCopyBlob is commitButFailCopyBlob that also arms the
+// flaky store the moment the ambiguous commit happens.
+type armingCommitButFailCopyBlob struct {
+	blob.BlobStore
+	arm       *atomic.Bool
+	canonical bool // fail the canonical-destination copy instead of legacy
+	failed    atomic.Bool
+}
+
+func (b *armingCommitButFailCopyBlob) Copy(ctx context.Context, dstKey, srcKey string) error {
+	err := b.BlobStore.Copy(ctx, dstKey, srcKey)
+	if err == nil && strings.Contains(dstKey, "/o2/") == b.canonical && !b.failed.Swap(true) {
+		b.arm.Store(true)
+		return fmt.Errorf("simulated lost CopyObject response")
+	}
+	return err
+}
+
+// TestLFSAmbiguousCommit_AccountingConverges (Codex round 97, two P1s):
+// the rounds-95/96 ambiguous-commit recoveries attempted their cover and
+// generation handoff ONCE and swallowed failures — yet every later retry
+// sees the destination present and skips the seam entirely, so a
+// transiently unavailable ref store left the durable bytes floor-invisible
+// forever. The recovery must retry until the accounting lands (or every
+// pre-copy floor has provably aged out).
+func TestLFSAmbiguousCommit_AccountingConverges(t *testing.T) {
+	oldRetry := ambiguousAccountingRetryInterval
+	ambiguousAccountingRetryInterval = 5 * time.Millisecond
+	t.Cleanup(func() { ambiguousAccountingRetryInterval = oldRetry })
+	content := bytes.Repeat([]byte("k"), 50)
+	oid := sha256Hex(content)
+
+	t.Run("bridge-bump-lands", func(t *testing.T) {
+		ctx := context.Background()
+		srv, st, mint := newLFSQuotaServer(t, 1<<20, time.Hour)
+		srv.LFSV020WriteCompat = true
+		tok := mint(auth.ScopeGitWrite)
+		fs := &flakyAccountingStore{RefStore: st}
+		fs.coverFails.Store(1)
+		fs.bumpFails.Store(1)
+		srv.Store = fs
+		srv.Blob = &armingCommitButFailCopyBlob{BlobStore: srv.Blob, arm: &fs.armed}
+		preGen, err := st.LFSAdoptionGen(ctx, lfsTestRepoID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		w := doLFS(t, srv, http.MethodPut, "/"+lfsTestRepoURL+".git/info/lfs/objects/"+oid,
+			"basic:"+tok, string(content))
+		if w.Code != http.StatusOK {
+			t.Fatalf("PUT = %d, body %s", w.Code, w.Body)
+		}
+		if gen, err := st.LFSAdoptionGen(ctx, lfsTestRepoID); err != nil || gen == preGen {
+			t.Fatalf("adoption gen after transiently failing handoff = (%d -> %d, %v), want bumped — a swallowed one-shot failure leaves the durable bytes floor-invisible forever", preGen, gen, err)
+		}
+	})
+	t.Run("adoption-cover-retries", func(t *testing.T) {
+		ctx := context.Background()
+		srv, st, mint := newLFSQuotaServer(t, 1<<20, time.Hour)
+		tok := mint(auth.ScopeGitWrite)
+		if err := srv.Blob.UploadFile(ctx, blob.LFSLegacyKey(lfsTestRepoID, oid), writeTempFile(t, content)); err != nil {
+			t.Fatal(err)
+		}
+		fs := &flakyAccountingStore{RefStore: st}
+		fs.coverFails.Store(1)
+		srv.Store = fs
+		srv.Blob = &armingCommitButFailCopyBlob{BlobStore: srv.Blob, arm: &fs.armed, canonical: true}
+		resp := decodeBatch(t, doLFS(t, srv, http.MethodPost, lfsBatchPath, "basic:"+tok,
+			batchBody("upload", oid, int64(len(content)))))
+		if resp.Objects[0].Error != nil || len(resp.Objects[0].Actions) != 0 {
+			t.Fatalf("adoption = %+v, want stored", resp.Objects[0])
+		}
+		if got := fs.coverAttempts.Load(); got < 2 {
+			t.Fatalf("ambiguous-commit cover attempts = %d, want >= 2 — the recovery must retry until the cover lands before continuing into the re-hash", got)
+		}
+	})
+}
+
 // TestLFSCompat_RepairSerializedOnLegacyClaim (Codex security round 85):
 // the batch fast path's bridge repair launched an unserialized full copy —
 // every tiny concurrent touch of the object started another one. Compat
