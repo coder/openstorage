@@ -167,20 +167,46 @@ const ReserveNoFloorGen int64 = -1
 // AdoptionClaimSuffix distinguishes an adoption claim row (see
 // RefStore.TryAdoptionClaim) from real reservations and covers: LFS keys
 // end in the 64-hex oid, so the suffix never collides, and neither
-// settlement (blob-key spellings) nor retirement (era rows) ever touches
-// it. The admission GC prunes expired claims like any aged row; a live
-// claim contributes one byte to admission sums (deny-side, negligible).
+// settlement (blob-key spellings), retirement (era rows), nor the
+// admission GC (which excludes this suffix — Codex round 74: the GC runs
+// with the ADMISSION ttl, as short as ~61s, while a legitimate hash runs
+// 5m + 1s/MiB) ever touches it. A live claim contributes one byte to
+// admission sums (deny-side, negligible); the sweeper prune reaps claims
+// older than AdoptionClaimTTL.
 const AdoptionClaimSuffix = "/adopt-claim"
 
+// AdoptionClaimTTL is the lease length of one adoption claim: generously
+// longer than the renewal cadence the hashing winner maintains (renewals
+// restart the clock chunk-by-chunk), yet finite so a crashed winner's
+// claim expires and the next write-scoped touch takes over.
+const AdoptionClaimTTL = 30 * time.Minute
+
 // TryAdoptionClaim — see RefStore.
-func (s *PG) TryAdoptionClaim(ctx context.Context, repo, key string, ttl time.Duration) (bool, error) {
-	assertf(repo != "" && key != "" && ttl > 0, "TryAdoptionClaim(%q, %q, %v)", repo, key, ttl)
+func (s *PG) TryAdoptionClaim(ctx context.Context, repo, key string) (bool, string, error) {
+	assertf(repo != "" && key != "", "TryAdoptionClaim(%q, %q)", repo, key)
+	owner := NewReservationOwner()
 	ct, err := s.pool.Exec(ctx, `
 INSERT INTO pack_reservations (key, repo, bytes, owner, created_at, gen)
 VALUES ($1, $2, 1, $3, now(), '')
 ON CONFLICT (key) DO UPDATE SET repo = EXCLUDED.repo, owner = EXCLUDED.owner, created_at = now()
 WHERE pack_reservations.created_at <= now() - make_interval(secs => $4)`,
-		key+AdoptionClaimSuffix, repo, NewReservationOwner(), ttl.Seconds())
+		key+AdoptionClaimSuffix, repo, owner, AdoptionClaimTTL.Seconds())
+	if err != nil {
+		return false, "", err
+	}
+	if ct.RowsAffected() == 0 {
+		return false, "", nil
+	}
+	return true, owner, nil
+}
+
+// RenewAdoptionClaim — see RefStore.
+func (s *PG) RenewAdoptionClaim(ctx context.Context, key, owner string) (bool, error) {
+	assertf(key != "" && owner != "", "RenewAdoptionClaim(%q, %q)", key, owner)
+	ct, err := s.pool.Exec(ctx, `
+UPDATE pack_reservations SET created_at = now()
+WHERE key = $1 AND owner = $2 AND created_at > now() - make_interval(secs => $3)`,
+		key+AdoptionClaimSuffix, owner, AdoptionClaimTTL.Seconds())
 	if err != nil {
 		return false, err
 	}
@@ -188,9 +214,10 @@ WHERE pack_reservations.created_at <= now() - make_interval(secs => $4)`,
 }
 
 // ReleaseAdoptionClaim — see RefStore.
-func (s *PG) ReleaseAdoptionClaim(ctx context.Context, key string) error {
-	assertf(key != "", "ReleaseAdoptionClaim(%q)", key)
-	_, err := s.pool.Exec(ctx, `DELETE FROM pack_reservations WHERE key = $1`, key+AdoptionClaimSuffix)
+func (s *PG) ReleaseAdoptionClaim(ctx context.Context, key, owner string) error {
+	assertf(key != "" && owner != "", "ReleaseAdoptionClaim(%q, %q)", key, owner)
+	_, err := s.pool.Exec(ctx,
+		`DELETE FROM pack_reservations WHERE key = $1 AND owner = $2`, key+AdoptionClaimSuffix, owner)
 	return err
 }
 
@@ -432,7 +459,8 @@ func (s *PG) ReservePackBytes(ctx context.Context, group []string, packs []Pack,
 		// transaction bounds the repo's PHYSICAL row population at the
 		// active-row cap plus one TTL of churn, with no sweeper required.
 		if _, err := tx.Exec(ctx, `
-DELETE FROM pack_reservations WHERE repo = $1 AND created_at <= now() - make_interval(secs => $2)`,
+DELETE FROM pack_reservations WHERE repo = $1 AND created_at <= now() - make_interval(secs => $2)
+  AND key NOT LIKE '%/adopt-claim'`,
 			group[0], ttl.Seconds()); err != nil {
 			return err
 		}
@@ -580,9 +608,11 @@ DELETE FROM pack_reservations WHERE repo = $1 AND key = $2 AND gen = $3 AND atte
 // old.
 func (s *PG) SweepExpiredPackReservations(ctx context.Context, olderThan time.Duration) (int64, error) {
 	assertf(olderThan >= 0, "SweepExpiredPackReservations: negative age %v", olderThan)
-	ct, err := s.pool.Exec(ctx,
-		`DELETE FROM pack_reservations WHERE created_at <= now() - make_interval(secs => $1)`,
-		olderThan.Seconds())
+	ct, err := s.pool.Exec(ctx, `
+DELETE FROM pack_reservations
+WHERE (key NOT LIKE '%/adopt-claim' AND created_at <= now() - make_interval(secs => $1))
+   OR (key LIKE '%/adopt-claim' AND created_at <= now() - make_interval(secs => $2))`,
+		olderThan.Seconds(), AdoptionClaimTTL.Seconds())
 	if err != nil {
 		return 0, err
 	}

@@ -644,7 +644,8 @@ func TestLFSAdopt_FleetClaimDedupesConcurrentHashes(t *testing.T) {
 	srv.Blob = cb
 
 	// "Another replica" holds the fleet claim mid-hash.
-	if claimed, err := st.TryAdoptionClaim(ctx, lfsTestRepoID, key, time.Hour); err != nil || !claimed {
+	claimed, foreignOwner, err := st.TryAdoptionClaim(ctx, lfsTestRepoID, key)
+	if err != nil || !claimed {
 		t.Fatalf("seed claim = (%v, %v), want held", claimed, err)
 	}
 	resp := decodeBatch(t, doLFS(t, srv, http.MethodPost, lfsBatchPath, "basic:"+tok,
@@ -655,8 +656,19 @@ func TestLFSAdopt_FleetClaimDedupesConcurrentHashes(t *testing.T) {
 	if cb.downloads != 0 {
 		t.Fatalf("losing replica performed %d verification reads, want 0 — the whole point is not downloading", cb.downloads)
 	}
-	// The winner releases (crash → TTL expiry); the retry converges.
-	if err := st.ReleaseAdoptionClaim(ctx, key); err != nil {
+	// A stale owner's release must NOT free the live lease (Codex round
+	// 74): the fence keeps a taken-over worker from unlocking the
+	// successor's claim.
+	if err := st.ReleaseAdoptionClaim(ctx, key, "stale-owner"); err != nil {
+		t.Fatal(err)
+	}
+	resp = decodeBatch(t, doLFS(t, srv, http.MethodPost, lfsBatchPath, "basic:"+tok,
+		batchBody("upload", oid, int64(len(legacy)))))
+	if resp.Objects[0].Error == nil {
+		t.Fatal("a stale owner's release freed the live fleet claim")
+	}
+	// The true owner releases (crash → TTL expiry); the retry converges.
+	if err := st.ReleaseAdoptionClaim(ctx, key, foreignOwner); err != nil {
 		t.Fatal(err)
 	}
 	resp = decodeBatch(t, doLFS(t, srv, http.MethodPost, lfsBatchPath, "basic:"+tok,

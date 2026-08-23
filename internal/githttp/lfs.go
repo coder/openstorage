@@ -683,7 +683,7 @@ func (s *Server) adoptLFSObject(ctx context.Context, repoID, key, oid string) er
 	// TTL'd claim; losers deny transiently (the client's retry lands on
 	// the winner's committed registration — zero-growth — or re-claims
 	// after a crash's claim expires).
-	claimed, err := s.Store.TryAdoptionClaim(ctx, repoID, key, lfsAdoptClaimTTL)
+	claimed, claimOwner, err := s.Store.TryAdoptionClaim(ctx, repoID, key)
 	if err != nil {
 		return err
 	}
@@ -692,11 +692,13 @@ func (s *Server) adoptLFSObject(ctx context.Context, repoID, key, oid string) er
 	}
 	// Best-effort early release on every exit (success included: the
 	// committed registration terminalizes the key, so the claim row is
-	// dead weight either way); a crash leaves it to the TTL.
+	// dead weight either way); a crash leaves it to the TTL. Owner-fenced
+	// (Codex round 74): after an expiry takeover, this stale worker's
+	// release must not delete the successor's live lease.
 	defer func() {
 		rctx, rcancel := context.WithTimeout(context.WithoutCancel(ctx), lfsCleanupTimeout)
 		defer rcancel()
-		if rerr := s.Store.ReleaseAdoptionClaim(rctx, key); rerr != nil {
+		if rerr := s.Store.ReleaseAdoptionClaim(rctx, key, claimOwner); rerr != nil {
 			log.Printf("lfs adopt %s: release claim: %v", key, rerr)
 		}
 	}()
@@ -741,7 +743,7 @@ func (s *Server) adoptLFSObject(ctx context.Context, repoID, key, oid string) er
 	// live backend COMPLETES and registers, making the work truly
 	// once-per-object, while a wedged backend still frees the op slot
 	// and verify buffer within one chunk window.
-	verifiedSize, err := s.verifyStoredLFSObject(context.WithoutCancel(ctx), repoID, key, oid)
+	verifiedSize, err := s.verifyStoredLFSObject(context.WithoutCancel(ctx), repoID, key, oid, claimOwner)
 	if err != nil {
 		if !errors.Is(err, errLFSContentMismatch) {
 			return err
@@ -841,7 +843,7 @@ func (s *Server) adoptLFSObject(ctx context.Context, repoID, key, oid string) er
 // as a mismatch (a prefix of different content) — the same safe path as
 // any corrupt legacy blob; the digest covering exactly size bytes is what
 // makes the returned count trustworthy.
-func (s *Server) verifyStoredLFSObject(ctx context.Context, repo, key, oid string) (int64, error) {
+func (s *Server) verifyStoredLFSObject(ctx context.Context, repo, key, oid, claimOwner string) (int64, error) {
 	sctx, scancel := context.WithTimeout(ctx, lfsProbeTimeout)
 	size, err := s.Blob.Stat(sctx, key)
 	scancel()
@@ -902,7 +904,28 @@ func (s *Server) verifyStoredLFSObject(ctx context.Context, repo, key, oid strin
 			h = sha256.New() // defensive: never hash on a half-restored state
 		}
 	}
+	lastRenew := time.Now()
 	for off < size {
+		// The fleet-wide claim must stay live for the hash's whole
+		// size-scaled lifetime (Codex round 74): renew its TTL clock on
+		// a cadence well under ref.AdoptionClaimTTL. A lost lease
+		// (expired and taken over, or a renewal the store rejects)
+		// aborts the hash — continuing would waste the very bandwidth
+		// the claim exists to protect, and the progress is saved for
+		// this replica's next winning attempt.
+		if claimOwner != "" && time.Since(lastRenew) >= lfsAdoptClaimRenewInterval {
+			renewed, rerr := s.Store.RenewAdoptionClaim(vctx, key, claimOwner)
+			if rerr != nil || !renewed {
+				if off > 0 {
+					s.saveLFSVerifyResume(key, size, off, h)
+				}
+				if rerr != nil {
+					return 0, fmt.Errorf("renew adoption claim: %w", rerr)
+				}
+				return 0, errLFSBusy // lease lost: another replica owns the hash now
+			}
+			lastRenew = time.Now()
+		}
 		n := min(lfsStagingChunk, size-off)
 		cctx, ccancel := context.WithTimeout(vctx, lfsVerifyChunkTimeout)
 		chunk, err := s.Blob.ReadRange(cctx, key, off, n)
@@ -926,12 +949,13 @@ func (s *Server) verifyStoredLFSObject(ctx context.Context, repo, key, oid strin
 // restore paths since Codex round 58).
 const lfsRepairCoverSuffix = ref.RepairCoverSuffix
 
-// lfsAdoptClaimTTL bounds a fleet-wide adoption claim (Codex security
-// round 73): generous against the size-scaled verification hash of large
-// legacy objects (the same shape as blob.EnsurePublished's repair
-// allowance at ~10 GiB), yet finite so a crashed winner's claim expires
-// and the next write-scoped touch re-claims.
-var lfsAdoptClaimTTL = 30 * time.Minute
+// lfsAdoptClaimRenewInterval is how often the hashing winner renews its
+// fleet-wide adoption claim (Codex round 74): the size-scaled hash of a
+// large legacy object legitimately outlives any fixed lease, so the
+// verify loop restarts the ref.AdoptionClaimTTL clock on this cadence — a
+// small fraction of the TTL, so scheduler noise and slow chunks never let
+// a LIVE hash's lease expire under it.
+var lfsAdoptClaimRenewInterval = 5 * time.Minute
 
 // lfsVerifyResume is a partially completed adoption hash: the verified
 // prefix length and the sha256 midstate over it (Codex round 57).

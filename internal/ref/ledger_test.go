@@ -727,6 +727,56 @@ func TestGenBumpsSerializeWithAdmissionLock(t *testing.T) {
 	}
 }
 
+// TestAdoptionClaimLease (Codex round 74): the fleet-wide adoption claim
+// must behave as a proper lease — (1) the admission GC, which runs with
+// the ADMISSION ttl (as short as ~61s), must never delete a live claim
+// whose hash legitimately runs 5m + 1s/MiB; (2) renewals and releases are
+// owner-fenced, so a worker whose claim was taken over cannot free or
+// extend the successor's lease.
+func TestAdoptionClaimLease(t *testing.T) {
+	runRefBackends(t, func(t *testing.T, s Store) {
+		ctx := context.Background()
+		k := newLedgerKit(t, s)
+		key := "lfs/" + k.base() + "/" + strings.Repeat("ab", 32)
+
+		claimed, owner, err := s.TryAdoptionClaim(ctx, k.base(), key)
+		if err != nil || !claimed || owner == "" {
+			t.Fatalf("TryAdoptionClaim = (%v, %q, %v), want a held claim", claimed, owner, err)
+		}
+		// An admission whose GC horizon predates the claim's creation
+		// must NOT reap it (the claim is 'aged' relative to a tiny
+		// admission TTL, exactly the near-minimum-TTL hazard).
+		time.Sleep(50 * time.Millisecond)
+		if dec, err := s.ReservePackBytes(ctx, k.group, []Pack{k.pack(k.base(), "gc1", 10)},
+			"gc-admission", 0, ReserveNoFloorGen, 1<<40, 10*time.Millisecond); err != nil || !dec.OK {
+			t.Fatalf("admission = (%+v, %v), want OK", dec, err)
+		}
+		if again, _, err := s.TryAdoptionClaim(ctx, k.base(), key); err != nil || again {
+			t.Fatalf("claim after admission GC = (%v, %v), want still held — the GC must exclude claims", again, err)
+		}
+		// Owner fences: a stale owner can neither renew nor release.
+		if renewed, err := s.RenewAdoptionClaim(ctx, key, "stale-owner"); err != nil || renewed {
+			t.Fatalf("stale renew = (%v, %v), want rejected", renewed, err)
+		}
+		if err := s.ReleaseAdoptionClaim(ctx, key, "stale-owner"); err != nil {
+			t.Fatal(err)
+		}
+		if again, _, err := s.TryAdoptionClaim(ctx, k.base(), key); err != nil || again {
+			t.Fatalf("claim after stale release = (%v, %v), want still held", again, err)
+		}
+		// The true owner renews and releases.
+		if renewed, err := s.RenewAdoptionClaim(ctx, key, owner); err != nil || !renewed {
+			t.Fatalf("owner renew = (%v, %v), want renewed", renewed, err)
+		}
+		if err := s.ReleaseAdoptionClaim(ctx, key, owner); err != nil {
+			t.Fatal(err)
+		}
+		if again, _, err := s.TryAdoptionClaim(ctx, k.base(), key); err != nil || !again {
+			t.Fatalf("claim after owner release = (%v, %v), want claimable", again, err)
+		}
+	})
+}
+
 // TestRetainedBytesGateAdmission is issue #31's drip-write amplification
 // bound: a fold's superseded bytes keep counting against the quota until
 // reclaimed, and reclaiming restores exactly that headroom.

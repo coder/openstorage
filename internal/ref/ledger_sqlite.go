@@ -29,7 +29,8 @@ func (s *SQLite) ReservePackBytes(ctx context.Context, group []string, packs []P
 	defer func() { _ = tx.Rollback() }()
 	// Self-healing GC for expired rows — see the PG twin's rationale.
 	if _, err := tx.ExecContext(ctx,
-		`DELETE FROM pack_reservations WHERE repo = ? AND created_at <= `+sqliteEpochMS+` - ?`,
+		`DELETE FROM pack_reservations WHERE repo = ? AND created_at <= `+sqliteEpochMS+` - ?
+  AND key NOT LIKE '%/adopt-claim'`,
 		group[0], ttl.Milliseconds()); err != nil {
 		return ReserveDecision{}, fmt.Errorf("reserve pack bytes prune: %w", err)
 	}
@@ -174,9 +175,11 @@ func (s *SQLite) RetirePackAttempts(ctx context.Context, group []string, gens ma
 // old.
 func (s *SQLite) SweepExpiredPackReservations(ctx context.Context, olderThan time.Duration) (int64, error) {
 	assertf(olderThan >= 0, "SweepExpiredPackReservations: negative age %v", olderThan)
-	res, err := s.db.ExecContext(ctx,
-		`DELETE FROM pack_reservations WHERE created_at <= `+sqliteEpochMS+` - ?`,
-		olderThan.Milliseconds())
+	res, err := s.db.ExecContext(ctx, `
+DELETE FROM pack_reservations
+WHERE (key NOT LIKE '%/adopt-claim' AND created_at <= `+sqliteEpochMS+` - ?)
+   OR (key LIKE '%/adopt-claim' AND created_at <= `+sqliteEpochMS+` - ?)`,
+		olderThan.Milliseconds(), AdoptionClaimTTL.Milliseconds())
 	if err != nil {
 		return 0, err
 	}
@@ -352,14 +355,35 @@ func (s *SQLite) LFSAdoptionGen(ctx context.Context, repo string) (int64, error)
 // TryAdoptionClaim — see RefStore (Codex security round 73). Local mode is
 // single-process, but the shared-table claim keeps semantics identical to
 // PG (and dedupes across the serve process and hook subprocesses).
-func (s *SQLite) TryAdoptionClaim(ctx context.Context, repo, key string, ttl time.Duration) (bool, error) {
-	assertf(repo != "" && key != "" && ttl > 0, "TryAdoptionClaim(%q, %q, %v)", repo, key, ttl)
+func (s *SQLite) TryAdoptionClaim(ctx context.Context, repo, key string) (bool, string, error) {
+	assertf(repo != "" && key != "", "TryAdoptionClaim(%q, %q)", repo, key)
+	owner := NewReservationOwner()
 	res, err := s.db.ExecContext(ctx, `
 INSERT INTO pack_reservations (key, repo, bytes, owner, created_at, gen)
 VALUES (?, ?, 1, ?, `+sqliteEpochMS+`, '')
 ON CONFLICT (key) DO UPDATE SET repo = excluded.repo, owner = excluded.owner, created_at = excluded.created_at
 WHERE pack_reservations.created_at <= `+sqliteEpochMS+` - ?`,
-		key+AdoptionClaimSuffix, repo, NewReservationOwner(), ttl.Milliseconds())
+		key+AdoptionClaimSuffix, repo, owner, AdoptionClaimTTL.Milliseconds())
+	if err != nil {
+		return false, "", err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, "", err
+	}
+	if n == 0 {
+		return false, "", nil
+	}
+	return true, owner, nil
+}
+
+// RenewAdoptionClaim — see RefStore.
+func (s *SQLite) RenewAdoptionClaim(ctx context.Context, key, owner string) (bool, error) {
+	assertf(key != "" && owner != "", "RenewAdoptionClaim(%q, %q)", key, owner)
+	res, err := s.db.ExecContext(ctx, `
+UPDATE pack_reservations SET created_at = `+sqliteEpochMS+`
+WHERE key = ? AND owner = ? AND created_at > `+sqliteEpochMS+` - ?`,
+		key+AdoptionClaimSuffix, owner, AdoptionClaimTTL.Milliseconds())
 	if err != nil {
 		return false, err
 	}
@@ -371,9 +395,10 @@ WHERE pack_reservations.created_at <= `+sqliteEpochMS+` - ?`,
 }
 
 // ReleaseAdoptionClaim — see RefStore.
-func (s *SQLite) ReleaseAdoptionClaim(ctx context.Context, key string) error {
-	assertf(key != "", "ReleaseAdoptionClaim(%q)", key)
-	_, err := s.db.ExecContext(ctx, `DELETE FROM pack_reservations WHERE key = ?`, key+AdoptionClaimSuffix)
+func (s *SQLite) ReleaseAdoptionClaim(ctx context.Context, key, owner string) error {
+	assertf(key != "" && owner != "", "ReleaseAdoptionClaim(%q, %q)", key, owner)
+	_, err := s.db.ExecContext(ctx,
+		`DELETE FROM pack_reservations WHERE key = ? AND owner = ?`, key+AdoptionClaimSuffix, owner)
 	return err
 }
 

@@ -52,11 +52,15 @@ func (f *fakeInner) ReplacePacks(context.Context, string, []ref.Pack, ref.Pack) 
 func (f *fakeInner) ListPacks(context.Context, string) ([]ref.Pack, error) { return nil, nil }
 func (f *fakeInner) HasPack(context.Context, string, string) (bool, error) { return false, nil }
 func (f *fakeInner) GetGeneration(context.Context, string) (int64, error)  { return 0, nil }
-func (f *fakeInner) TryAdoptionClaim(context.Context, string, string, time.Duration) (bool, error) {
+func (f *fakeInner) TryAdoptionClaim(context.Context, string, string) (bool, string, error) {
+	return true, "o", nil
+}
+
+func (f *fakeInner) RenewAdoptionClaim(context.Context, string, string) (bool, error) {
 	return true, nil
 }
 
-func (f *fakeInner) ReleaseAdoptionClaim(context.Context, string) error {
+func (f *fakeInner) ReleaseAdoptionClaim(context.Context, string, string) error {
 	return nil
 }
 

@@ -225,14 +225,24 @@ type RefStore interface {
 	// size. claimed=false means a live claim exists (another replica is
 	// hashing; the caller denies transiently and the client retries —
 	// usually landing on the winner's committed registration). A claim
-	// older than ttl is expired and taken over; ReleaseAdoptionClaim
-	// frees it early on completion, and the admission GC prunes
-	// leftovers. Claims live in pack_reservations under a suffixed key
-	// no settlement or retirement path matches.
-	TryAdoptionClaim(ctx context.Context, repo, key string, ttl time.Duration) (claimed bool, err error)
-	// ReleaseAdoptionClaim frees key's adoption claim (best-effort: a
-	// crashed winner's claim expires via ttl instead).
-	ReleaseAdoptionClaim(ctx context.Context, key string) error
+	// older than AdoptionClaimTTL is expired and taken over. The
+	// returned owner token fences every later mutation (Codex round 74):
+	// a worker whose claim was taken over must not be able to release or
+	// renew the successor's lease. Claims live in pack_reservations
+	// under a suffixed key that no settlement, retirement, or
+	// admission-GC path touches; only expiry-takeover, owner-fenced
+	// release, and the claim-aware sweeper prune remove them.
+	TryAdoptionClaim(ctx context.Context, repo, key string) (claimed bool, owner string, err error)
+	// RenewAdoptionClaim restarts the claim's TTL clock when key's live
+	// claim still belongs to owner (Codex round 74 — verification is
+	// size-scaled and can outlive any fixed TTL). renewed=false means
+	// the lease was lost (expired and taken over, or released): the
+	// caller must stop hashing.
+	RenewAdoptionClaim(ctx context.Context, key, owner string) (renewed bool, err error)
+	// ReleaseAdoptionClaim frees key's adoption claim if it still
+	// belongs to owner (best-effort: a crashed winner's claim expires
+	// via AdoptionClaimTTL instead).
+	ReleaseAdoptionClaim(ctx context.Context, key, owner string) error
 	// GetGeneration returns repo's mutation generation: 0 for a repo no
 	// mutation ever touched, strictly positive and monotonically increasing
 	// afterwards. It is an invalidation token over committed row changes,

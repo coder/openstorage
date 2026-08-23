@@ -57,11 +57,15 @@ func (s *countingStore) ReplacePacks(context.Context, string, []ref.Pack, ref.Pa
 	panic("Hydrate must never replace packs")
 }
 
-func (s *countingStore) TryAdoptionClaim(context.Context, string, string, time.Duration) (bool, error) {
+func (s *countingStore) TryAdoptionClaim(context.Context, string, string) (bool, string, error) {
+	return true, "o", nil
+}
+
+func (s *countingStore) RenewAdoptionClaim(context.Context, string, string) (bool, error) {
 	return true, nil
 }
 
-func (s *countingStore) ReleaseAdoptionClaim(context.Context, string) error {
+func (s *countingStore) ReleaseAdoptionClaim(context.Context, string, string) error {
 	return nil
 }
 
