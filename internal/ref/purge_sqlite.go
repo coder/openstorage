@@ -8,6 +8,14 @@ import (
 	"fmt"
 )
 
+// inList returns n comma-separated SQL placeholders ("?,?,..."), the full
+// IN-list body (unlike ledger_sqlite.go's comma-PREFIXED placeholders,
+// whose first `?` the caller writes).
+func inList(n int) string {
+	assertf(n > 0, "inList(%d)", n)
+	return "?" + placeholders(n-1)
+}
+
 // purgeGroupArgs converts the group to the []any placeholder args
 // database/sql wants.
 func purgeGroupArgs(group []string) []any {
@@ -22,7 +30,7 @@ func purgeGroupArgs(group []string) []any {
 func (s *SQLite) DropRepoRefs(ctx context.Context, group []string) (int64, error) {
 	validatePurgeGroup(group)
 	res, err := s.db.ExecContext(ctx,
-		`DELETE FROM refs WHERE repo IN (`+placeholders(len(group))+`)`,
+		`DELETE FROM refs WHERE repo IN (`+inList(len(group))+`)`,
 		purgeGroupArgs(group)...)
 	if err != nil {
 		return 0, err
@@ -41,12 +49,12 @@ func (s *SQLite) RetireRepoPacks(ctx context.Context, group []string) (int64, er
 	args := purgeGroupArgs(group)
 	if _, err := tx.ExecContext(ctx, `
 INSERT INTO pack_retained (repo, key, bytes)
-SELECT repo, s3_key, 0 FROM packs WHERE repo IN (`+placeholders(len(group))+`)
+SELECT repo, s3_key, 0 FROM packs WHERE repo IN (`+inList(len(group))+`)
 ON CONFLICT (repo, key) DO NOTHING`, args...); err != nil {
 		return 0, err
 	}
 	res, err := tx.ExecContext(ctx,
-		`DELETE FROM packs WHERE repo IN (`+placeholders(len(group))+`)`, args...)
+		`DELETE FROM packs WHERE repo IN (`+inList(len(group))+`)`, args...)
 	if err != nil {
 		return 0, err
 	}
@@ -70,7 +78,7 @@ func (s *SQLite) DropRepoLFSObjects(ctx context.Context, group []string) (int64,
 	defer func() { _ = tx.Rollback() }()
 	args := purgeGroupArgs(group)
 	res, err := tx.ExecContext(ctx,
-		`DELETE FROM lfs_objects WHERE repo IN (`+placeholders(len(group))+`)`, args...)
+		`DELETE FROM lfs_objects WHERE repo IN (`+inList(len(group))+`)`, args...)
 	if err != nil {
 		return 0, err
 	}
@@ -79,7 +87,7 @@ func (s *SQLite) DropRepoLFSObjects(ctx context.Context, group []string) (int64,
 		return 0, err
 	}
 	if _, err := tx.ExecContext(ctx,
-		`DELETE FROM lfs_object_counts WHERE repo IN (`+placeholders(len(group))+`)`, args...); err != nil {
+		`DELETE FROM lfs_object_counts WHERE repo IN (`+inList(len(group))+`)`, args...); err != nil {
 		return 0, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -91,7 +99,7 @@ func (s *SQLite) DropRepoLFSObjects(ctx context.Context, group []string) (int64,
 // CountRepoRows — see the PG twin.
 func (s *SQLite) CountRepoRows(ctx context.Context, group []string) (int64, error) {
 	validatePurgeGroup(group)
-	ph := placeholders(len(group))
+	ph := inList(len(group))
 	args := purgeGroupArgs(group)
 	args = append(args, purgeGroupArgs(group)...)
 	args = append(args, purgeGroupArgs(group)...)
@@ -111,7 +119,7 @@ func (s *SQLite) PurgeRepoLedger(ctx context.Context, group []string) (int64, er
 		return 0, fmt.Errorf("purge repo ledger begin: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	ph := placeholders(len(group))
+	ph := inList(len(group))
 	args := purgeGroupArgs(group)
 	var total int64
 	for _, table := range []string{
