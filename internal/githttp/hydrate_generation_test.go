@@ -89,6 +89,14 @@ func (s *countingStore) GuardedLFSDelete(context.Context, string, string, func(c
 	panic("Hydrate must never delete LFS blobs")
 }
 
+func (s *countingStore) BumpLFSAdoptionGen(context.Context, string) error {
+	panic("Hydrate must never bump the adoption generation")
+}
+
+func (s *countingStore) LFSAdoptionGen(context.Context, string) (int64, error) {
+	panic("Hydrate must never read the adoption generation")
+}
+
 func (s *countingStore) QuotaLedgerState(context.Context, []string, time.Duration, ...string) (ref.PackQuotaLedgerState, error) {
 	panic("Hydrate must never read the quota ledger")
 }

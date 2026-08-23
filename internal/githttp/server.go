@@ -733,7 +733,7 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 			// into shared-backend listing load). Fail closed: spawning
 			// without the env would just reopen the per-push listing
 			// path via the hook's skew fallback.
-			floor, err := s.CachedUsageFloor(r.Context(), target.key)
+			floor, gen, err := s.cachedUsageFloorGen(r.Context(), target.key)
 			if err != nil {
 				log.Printf("quota: %s: usage floor for receive-pack: %v", target.key, err)
 				httpError(w, http.StatusInternalServerError, "storage quota check failed")
@@ -744,7 +744,12 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 			// runs only after the client's transfer, whose duration the
 			// client controls, so the hook must be able to judge the
 			// floor's age rather than trust an arbitrarily stale value.
-			cmd.Env = append(cmd.Env, EnvUsageFloor+"="+strconv.FormatInt(floor, 10)+":"+strconv.FormatInt(time.Now().Unix(), 10))
+			// It also carries the shared adoption generation its scan
+			// snapshotted (Codex round 49), so the hook can reject a
+			// floor whose listed bytes another replica adopted while the
+			// client transferred.
+			cmd.Env = append(cmd.Env, EnvUsageFloor+"="+strconv.FormatInt(floor, 10)+
+				":"+strconv.FormatInt(time.Now().Unix(), 10)+":"+strconv.FormatInt(gen, 10))
 			if s.PackReservationTTL > 0 {
 				cmd.Env = append(cmd.Env, EnvPackReservationTTL+"="+s.PackReservationTTL.String())
 			}

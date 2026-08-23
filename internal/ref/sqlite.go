@@ -113,6 +113,7 @@ func (s *SQLite) InitSchema(ctx context.Context) error {
 		                                         PRIMARY KEY (repo, key))`,
 		// O(1) object-count cap reads — see the PG DDL for the rationale.
 		`CREATE TABLE IF NOT EXISTS lfs_object_counts (repo TEXT PRIMARY KEY, count INTEGER NOT NULL DEFAULT 0)`,
+		`CREATE TABLE IF NOT EXISTS lfs_adoption_gens (repo TEXT PRIMARY KEY, gen INTEGER NOT NULL DEFAULT 0)`,
 	} {
 		if _, err := tx.ExecContext(ctx, stmt); err != nil {
 			return fmt.Errorf("sqlite init schema: %w", err)

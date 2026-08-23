@@ -191,9 +191,10 @@ type usageCache struct {
 }
 
 type usageEntry struct {
-	usage   int64 // raw listing bytes (the pressure log's view)
-	counter int64 // usage counter at scan start (Codex round 44)
-	expires time.Time
+	usage       int64 // raw listing bytes (the pressure log's view)
+	counter     int64 // usage counter at scan start (Codex round 44)
+	adoptionGen int64 // shared adoption generation at scan start (round 49)
+	expires     time.Time
 }
 
 // uncounted is the entry's admission floor: physical bytes the usage
@@ -215,11 +216,12 @@ func (e usageEntry) uncounted() int64 {
 // inflight entry per repository would survive client disconnects and
 // eventually run a detached listing nobody consumes).
 type usageFlight struct {
-	done    chan struct{}
-	usage   int64 // raw listing bytes (pressure log)
-	counter int64 // usage counter at scan start (Codex round 44)
-	err     error
-	expires time.Time
+	done        chan struct{}
+	usage       int64 // raw listing bytes (pressure log)
+	counter     int64 // usage counter at scan start (Codex round 44)
+	adoptionGen int64 // shared adoption generation at scan start (round 49)
+	err         error
+	expires     time.Time
 
 	abort   chan struct{}
 	waiters int
@@ -243,8 +245,9 @@ func (c *usageCache) clockNow() time.Time {
 // entry, and the flight's own waiters reject the result too (round 41 —
 // usageFlight.expires). Drops expired entries at most once per
 // usageCachePruneInterval. Callers hold c.mu.
-func (c *usageCache) putLocked(repo string, usage, counter int64, scanStart time.Time) {
-	assertf(repo != "" && usage >= 0 && counter >= 0 && !scanStart.IsZero(), "usageCache.putLocked(%q, %d, %d, %v)", repo, usage, counter, scanStart)
+func (c *usageCache) putLocked(repo string, usage, counter, adoptionGen int64, scanStart time.Time) {
+	assertf(repo != "" && usage >= 0 && counter >= 0 && adoptionGen >= 0 && !scanStart.IsZero(),
+		"usageCache.putLocked(%q, %d, %d, %d, %v)", repo, usage, counter, adoptionGen, scanStart)
 	now := c.clockNow()
 	if c.entries == nil {
 		c.entries = make(map[string]usageEntry)
@@ -257,7 +260,7 @@ func (c *usageCache) putLocked(repo string, usage, counter int64, scanStart time
 			}
 		}
 	}
-	c.entries[repo] = usageEntry{usage: usage, counter: counter, expires: scanStart.Add(usageCacheTTL)}
+	c.entries[repo] = usageEntry{usage: usage, counter: counter, adoptionGen: adoptionGen, expires: scanStart.Add(usageCacheTTL)}
 }
 
 // invalidateUsageFloor drops repo's cached floor entry (Codex round 48):
@@ -333,35 +336,44 @@ func (s *Server) refreshUsage(repo string, f *usageFlight) {
 	// A missing Store (bare test servers; NewServer asserts it in
 	// production) degrades to counter 0 — the floor then counts
 	// everything listed, the deny-safe side.
-	var counter int64
+	var counter, adoptionGen int64
 	if s.Store != nil {
+		// The adoption generation is read FIRST (Codex round 49): an
+		// adoption committing after this read is caught by the serve-time
+		// generation check, so no ordering can hide one.
+		gen, gerr := s.Store.LFSAdoptionGen(ctx, BaseRepo(repo))
+		if gerr != nil {
+			s.finishUsageFlight(repo, f, 0, 0, 0, scanStart, fmt.Errorf("adoption gen read: %w", gerr))
+			return
+		}
+		adoptionGen = gen
 		ls, lerr := s.Store.QuotaLedgerState(ctx, blob.QuotaRepoGroup(repo), time.Hour)
 		if lerr != nil {
-			s.finishUsageFlight(repo, f, 0, 0, scanStart, fmt.Errorf("usage counter read: %w", lerr))
+			s.finishUsageFlight(repo, f, 0, 0, 0, scanStart, fmt.Errorf("usage counter read: %w", lerr))
 			return
 		}
 		counter = ls.UsageBytes
 	}
 	usage, err := blob.StorageUsageBytes(ctx, s.Blob, repo)
-	s.finishUsageFlight(repo, f, usage, counter, scanStart, err)
+	s.finishUsageFlight(repo, f, usage, counter, adoptionGen, scanStart, err)
 }
 
 // finishUsageFlight publishes one flight outcome: cache insert on
 // success, inflight removal, and waiter release.
-func (s *Server) finishUsageFlight(repo string, f *usageFlight, usage, counter int64, scanStart time.Time, err error) {
+func (s *Server) finishUsageFlight(repo string, f *usageFlight, usage, counter, adoptionGen int64, scanStart time.Time, err error) {
 	c := &s.usage
 	c.mu.Lock()
 	if c.inflight[repo] == f { // an aborted flight may have been replaced
 		delete(c.inflight, repo)
 	}
 	if err == nil {
-		c.putLocked(repo, usage, counter, scanStart)
+		c.putLocked(repo, usage, counter, adoptionGen, scanStart)
 	}
 	c.mu.Unlock()
 	if err != nil {
 		log.Printf("quota: %s: usage refresh failed: %v", repo, err)
 	}
-	f.usage, f.counter, f.err, f.expires = usage, counter, err, scanStart.Add(usageCacheTTL)
+	f.usage, f.counter, f.adoptionGen, f.err, f.expires = usage, counter, adoptionGen, err, scanStart.Add(usageCacheTTL)
 	close(f.done)
 }
 
@@ -491,16 +503,27 @@ func hookUsageFloor(ctx context.Context, bl blob.BlobStore, st ref.Store, repo s
 	if !ok {
 		return hookSelfListFloor(ctx, bl, st, repo)
 	}
-	val, mint, found := strings.Cut(raw, ":")
+	val, rest, found := strings.Cut(raw, ":")
 	if !found {
 		if _, err := strconv.ParseInt(raw, 10, 64); err != nil {
 			return 0, fmt.Errorf("malformed %s=%q", EnvUsageFloor, raw)
 		}
 		return hookSelfListFloor(ctx, bl, st, repo) // timestampless legacy floor: no age evidence
 	}
+	mint, genStr, hasGen := strings.Cut(rest, ":")
 	floor, ferr := strconv.ParseInt(val, 10, 64)
 	mintUnix, merr := strconv.ParseInt(mint, 10, 64)
 	if ferr != nil || merr != nil || floor < 0 {
+		return 0, fmt.Errorf("malformed %s=%q", EnvUsageFloor, raw)
+	}
+	if !hasGen {
+		// A serve binary predating the adoption generation (Codex round
+		// 49) minted this floor: without generation evidence the hook
+		// self-lists, like every other skew case.
+		return hookSelfListFloor(ctx, bl, st, repo)
+	}
+	mintGen, gerr := strconv.ParseInt(genStr, 10, 64)
+	if gerr != nil || mintGen < 0 {
 		return 0, fmt.Errorf("malformed %s=%q", EnvUsageFloor, raw)
 	}
 	ttl, err := reservationTTL()
@@ -514,6 +537,20 @@ func hookUsageFloor(ctx context.Context, bl blob.BlobStore, st ref.Store, repo s
 	maxAge := min(hookFloorMaxAge, ttl-usageCacheTTL-UsageFloorHandoffMargin)
 	if maxAge <= 0 || time.Since(time.Unix(mintUnix, 0)) > maxAge {
 		return hookSelfListFloor(ctx, bl, st, repo)
+	}
+	// A non-zero floor is trusted only while the shared adoption
+	// generation still matches its scan (Codex round 49): an adoption on
+	// ANY replica during the client's transfer moved listed bytes into
+	// the counter, and summing both would double-count them. Zero floors
+	// cannot double-count, so they skip the point read.
+	if floor > 0 {
+		live, err := st.LFSAdoptionGen(ctx, BaseRepo(repo))
+		if err != nil {
+			return 0, fmt.Errorf("adoption gen read: %w", err)
+		}
+		if live != mintGen {
+			return hookSelfListFloor(ctx, bl, st, repo)
+		}
 	}
 	return floor, nil
 }
@@ -539,36 +576,73 @@ func hookUsageFloor(ctx context.Context, bl blob.BlobStore, st ref.Store, repo s
 // blocks), admission needs a value: a cold entry lists inline, concurrent
 // cold callers share the leader's flight.
 func (s *Server) CachedUsageFloor(ctx context.Context, repo string) (int64, error) {
+	floor, _, err := s.cachedUsageFloorGen(ctx, repo)
+	return floor, err
+}
+
+// cachedUsageFloorGen returns the floor plus the shared adoption
+// generation its scan snapshotted (the receive-pack spawn forwards the
+// generation to the hook — Codex round 49).
+func (s *Server) cachedUsageFloorGen(ctx context.Context, repo string) (int64, int64, error) {
 	assertf(repo != "", "CachedUsageFloor: empty repo")
 	// A flight result whose scan outlived the freshness window is NOT
 	// servable (Codex round 41): under the minimum reservation TTL, an
 	// orphan published after its page was scanned has already lost
-	// reservation cover when such a listing completes. One retry covers a
-	// transiently slow scan; persistently slow scans fail CLOSED (the
-	// deny-safe side) rather than admit against the stale floor.
+	// reservation cover when such a listing completes. A non-zero floor
+	// whose shared adoption generation moved is not servable either
+	// (Codex round 49): another replica's adoption moved listed bytes
+	// into the counter, so the entry would double-count them. One retry
+	// covers either transient; persistent failure is CLOSED (deny-safe)
+	// rather than admitting or denying against the stale floor.
 	for attempt := 0; ; attempt++ {
-		usage, expired, err := s.usageFloorOnce(ctx, repo)
+		usage, gen, expired, err := s.usageFloorOnce(ctx, repo)
 		if err != nil {
-			return 0, err
+			return 0, 0, err
 		}
 		if !expired {
-			return usage, nil
+			// A zero floor cannot double-count: skip the generation
+			// point read on the hot steady-state path.
+			if usage == 0 {
+				return 0, gen, nil
+			}
+			fresh, err := s.floorGenFresh(ctx, repo, gen)
+			if err != nil {
+				return 0, 0, err
+			}
+			if fresh {
+				return usage, gen, nil
+			}
+			s.invalidateUsageFloor(repo) // adopted-elsewhere entry: re-scan
 		}
 		if attempt >= 1 {
-			return 0, fmt.Errorf("usage floor for %s: listing outlived its %v freshness window twice", repo, usageCacheTTL)
+			return 0, 0, fmt.Errorf("usage floor for %s: no fresh measurement after retry (slow scan or concurrent adoption)", repo)
 		}
 	}
 }
 
+// floorGenFresh reports whether the shared adoption generation still
+// matches the one a floor's scan snapshotted (Codex round 49).
+func (s *Server) floorGenFresh(ctx context.Context, repo string, gen int64) (bool, error) {
+	if s.Store == nil {
+		return true, nil // bare test servers; NewServer asserts Store
+	}
+	live, err := s.Store.LFSAdoptionGen(ctx, BaseRepo(repo))
+	if err != nil {
+		return false, fmt.Errorf("adoption gen read: %w", err)
+	}
+	return live == gen, nil
+}
+
 // usageFloorOnce serves one cache read / coalesced-flight wait for
 // CachedUsageFloor. expired=true reports a completed flight whose scan
-// outlived the freshness window (the caller retries or fails closed).
-func (s *Server) usageFloorOnce(ctx context.Context, repo string) (usage int64, expired bool, err error) {
+// outlived the freshness window (the caller retries or fails closed);
+// gen is the shared adoption generation the measurement snapshotted.
+func (s *Server) usageFloorOnce(ctx context.Context, repo string) (usage, gen int64, expired bool, err error) {
 	c := &s.usage
 	c.mu.Lock()
 	if e, ok := c.entries[repo]; ok && !c.clockNow().After(e.expires) {
 		c.mu.Unlock()
-		return e.uncounted(), false, nil
+		return e.uncounted(), e.adoptionGen, false, nil
 	}
 	f := c.inflight[repo]
 	if f == nil {
@@ -616,12 +690,12 @@ func (s *Server) usageFloorOnce(ctx context.Context, repo string) (usage int64, 
 		f.waiters--
 		c.mu.Unlock()
 		if f.err != nil {
-			return 0, false, f.err
+			return 0, 0, false, f.err
 		}
 		if c.clockNow().After(f.expires) {
-			return 0, true, nil
+			return 0, 0, true, nil
 		}
-		return max(0, f.usage-f.counter), false, nil
+		return max(0, f.usage-f.counter), f.adoptionGen, false, nil
 	case <-ctx.Done():
 		c.mu.Lock()
 		f.waiters--
@@ -637,6 +711,6 @@ func (s *Server) usageFloorOnce(ctx context.Context, repo string) (usage int64, 
 			}
 		}
 		c.mu.Unlock()
-		return 0, false, ctx.Err()
+		return 0, 0, false, ctx.Err()
 	}
 }

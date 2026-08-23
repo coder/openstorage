@@ -166,6 +166,18 @@ type RefStore interface {
 	// (a point read mirroring HasPack, for the sweeper's per-object
 	// classification of the lfs/ prefix).
 	HasLFSObject(ctx context.Context, repo, key string) (bool, error)
+	// BumpLFSAdoptionGen increments repo's shared adoption generation
+	// (Codex round 49 on #51): adopting a pre-registry LFS object moves
+	// bytes that physical listings ALREADY contain into the usage
+	// counter, so every replica's cached uncounted floor scanned before
+	// the adoption would double-count them (floor + counter) until
+	// expiry. Floor caches snapshot this generation at scan start and
+	// reject entries whose generation moved — the ref store is the only
+	// state all replicas and hook processes share.
+	BumpLFSAdoptionGen(ctx context.Context, repo string) error
+	// LFSAdoptionGen returns repo's adoption generation (0 before any
+	// adoption) — a point read on the floor-serve path.
+	LFSAdoptionGen(ctx context.Context, repo string) (int64, error)
 	// CountLFSObjects returns repo's registered LFS object count — the
 	// admission-time read behind the per-repo object-count cap (issue
 	// #51): bytes bound row count at nothing, and registered objects are
@@ -389,6 +401,7 @@ CREATE TABLE IF NOT EXISTS lfs_objects (repo text, key text, bytes bigint NOT NU
 -- path must decrement in its own transaction or the cap turns stricter,
 -- never looser.
 CREATE TABLE IF NOT EXISTS lfs_object_counts (repo text PRIMARY KEY, count bigint NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS lfs_adoption_gens (repo text PRIMARY KEY, gen bigint NOT NULL DEFAULT 0);
 -- Idempotent additive migration for pre-p3 dev databases (backfills
 -- existing rows via the NOT NULL DEFAULT).
 ALTER TABLE refs ADD COLUMN IF NOT EXISTS created_at timestamptz NOT NULL DEFAULT now();

@@ -290,6 +290,24 @@ RETURNING count`, repo).Scan(&count); err != nil {
 	return nil
 }
 
+// BumpLFSAdoptionGen — see RefStore (Codex round 49).
+func (s *SQLite) BumpLFSAdoptionGen(ctx context.Context, repo string) error {
+	assertf(repo != "", "BumpLFSAdoptionGen(%q)", repo)
+	_, err := s.db.ExecContext(ctx, `
+INSERT INTO lfs_adoption_gens (repo, gen) VALUES (?, 1)
+ON CONFLICT (repo) DO UPDATE SET gen = lfs_adoption_gens.gen + 1`, repo)
+	return err
+}
+
+// LFSAdoptionGen — see RefStore (Codex round 49).
+func (s *SQLite) LFSAdoptionGen(ctx context.Context, repo string) (int64, error) {
+	assertf(repo != "", "LFSAdoptionGen(%q)", repo)
+	var gen int64
+	err := s.db.QueryRowContext(ctx,
+		`SELECT COALESCE((SELECT gen FROM lfs_adoption_gens WHERE repo = ?), 0)`, repo).Scan(&gen)
+	return gen, err
+}
+
 // GuardedLFSDelete — see the PG twin; BEGIN IMMEDIATE's single writer is
 // the serialization here.
 func (s *SQLite) GuardedLFSDelete(ctx context.Context, repo, key string, del func(context.Context) error) (bool, error) {

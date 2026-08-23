@@ -377,6 +377,42 @@ func TestUsageFloorInvalidatedByAdoption(t *testing.T) {
 	}
 }
 
+// TestUsageFloorInvalidatedAcrossReplicas (Codex round 49): round 48's
+// local map delete cannot reach OTHER replicas' caches, so adoption bumps
+// a shared generation in the ref store and every replica's floor serve is
+// generation-checked. A second Server sharing the same stores (a replica)
+// must stop serving its pre-adoption floor immediately after the adopting
+// replica registers the object.
+func TestUsageFloorInvalidatedAcrossReplicas(t *testing.T) {
+	ctx := context.Background()
+	srv1, st, mint := newLFSQuotaServer(t, 1000, time.Hour)
+	tok := mint(auth.ScopeGitWrite)
+	// The "other replica": its own floor cache, the same shared stores.
+	srv2 := &Server{Blob: srv1.Blob, Store: st}
+
+	legacy := []byte("cross-replica legacy object")
+	oid := sha256Hex(legacy)
+	key := blob.LFSKey(lfsTestRepoID, oid)
+	if err := srv1.Blob.UploadFile(ctx, key, writeTempFile(t, legacy)); err != nil {
+		t.Fatal(err)
+	}
+	// Replica 2 caches the pre-adoption floor.
+	if floor, err := srv2.CachedUsageFloor(ctx, lfsTestRepoID); err != nil || floor != int64(len(legacy)) {
+		t.Fatalf("pre-adoption floor = (%d, %v), want (%d, nil)", floor, err, len(legacy))
+	}
+	// Replica 1 adopts the object (write-scoped batch touch).
+	resp := decodeBatch(t, doLFS(t, srv1, http.MethodPost, lfsBatchPath, "basic:"+tok,
+		batchBody("upload", oid, int64(len(legacy)))))
+	if resp.Objects[0].Error != nil || resp.Objects[0].Actions != nil {
+		t.Fatalf("adoption failed: %+v", resp.Objects[0])
+	}
+	// Replica 2's cached entry must be rejected by the generation check:
+	// a fresh scan sees the bytes counted, so the floor drops to 0.
+	if floor, err := srv2.CachedUsageFloor(ctx, lfsTestRepoID); err != nil || floor != 0 {
+		t.Fatalf("post-adoption remote floor = (%d, %v), want (0, nil) — the shared generation must invalidate", floor, err)
+	}
+}
+
 // TestHookFloorScansAreSlotBoundedAcrossProcesses (Codex round 47): hook
 // self-list scans run in fresh processes the serve-side pool cannot see,
 // so they take flock slot files instead — with every slot held (here by
@@ -524,7 +560,7 @@ func TestPackUsageCachePruneIsTimeBounded(t *testing.T) {
 
 	c.mu.Lock()
 	for i := 0; i < 2000; i++ {
-		c.putLocked(fmt.Sprintf("repo_%04d", i), 1, 0, now)
+		c.putLocked(fmt.Sprintf("repo_%04d", i), 1, 0, 0, now)
 	}
 	if got := len(c.entries); got != 2000 {
 		t.Fatalf("fresh entries pruned early: %d, want 2000", got)
@@ -533,7 +569,7 @@ func TestPackUsageCachePruneIsTimeBounded(t *testing.T) {
 	// Past the prune interval every old entry has also expired (TTL ==
 	// interval); the next insert sweeps them all, keeping only itself.
 	now = now.Add(usageCachePruneInterval + time.Second)
-	c.putLocked("repo_new", 1, 0, now)
+	c.putLocked("repo_new", 1, 0, 0, now)
 	if got := len(c.entries); got != 1 {
 		t.Fatalf("post-interval insert kept %d entries, want 1", got)
 	}
@@ -544,7 +580,7 @@ func TestPackUsageCachePruneIsTimeBounded(t *testing.T) {
 	// Immediately after a sweep, inserts must not sweep again (lastPrune
 	// advanced): an expired straggler survives until the next interval.
 	c.entries["repo_stale"] = usageEntry{usage: 1, expires: now.Add(-time.Second)}
-	c.putLocked("repo_new2", 1, 0, now)
+	c.putLocked("repo_new2", 1, 0, 0, now)
 	if _, ok := c.entries["repo_stale"]; !ok {
 		t.Fatal("insert swept before the prune interval elapsed")
 	}
@@ -646,10 +682,32 @@ func openTestRefStore(t *testing.T) ref.Store {
 func TestHookUsageFloor(t *testing.T) {
 	now := time.Now().Unix()
 	t.Run("fresh-floor-used-without-listing", func(t *testing.T) {
-		t.Setenv(EnvUsageFloor, fmt.Sprintf("1234:%d", now))
-		got, err := hookUsageFloor(context.Background(), nil, nil, "repo_a")
+		t.Setenv(EnvUsageFloor, fmt.Sprintf("1234:%d:0", now))
+		got, err := hookUsageFloor(context.Background(), nil, openTestRefStore(t), "repo_a")
 		if err != nil || got != 1234 {
 			t.Fatalf("hookUsageFloor = (%d, %v), want (1234, nil)", got, err)
+		}
+	})
+	t.Run("stale-adoption-gen-falls-back-to-listing", func(t *testing.T) {
+		// Codex round 49: an adoption on ANY replica during the client's
+		// transfer moved listed bytes into the counter — a floor minted
+		// under the older generation must self-list.
+		st := openTestRefStore(t)
+		if err := st.BumpLFSAdoptionGen(context.Background(), "repo_a"); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv(EnvUsageFloor, fmt.Sprintf("1234:%d:0", now))
+		bl := openTestBlob(t)
+		seedPack(t, bl, "repo_a", "1111", 100)
+		got, err := hookUsageFloor(context.Background(), bl, st, "repo_a")
+		if err != nil || got != 100 {
+			t.Fatalf("stale-gen floor = (%d, %v), want (100, nil) — must self-list", got, err)
+		}
+	})
+	t.Run("malformed-gen-fails-closed", func(t *testing.T) {
+		t.Setenv(EnvUsageFloor, fmt.Sprintf("1234:%d:banana", now))
+		if _, err := hookUsageFloor(context.Background(), nil, nil, "repo_a"); err == nil {
+			t.Fatal("malformed adoption gen did not fail closed")
 		}
 	})
 	for name, raw := range map[string]string{
@@ -670,20 +728,23 @@ func TestHookUsageFloor(t *testing.T) {
 		raw func() string
 		ttl string
 	}{
-		"absent-falls-back-to-listing":        {raw: func() string { return "" }},
-		"stale-floor-falls-back-to-listing":   {raw: func() string { return fmt.Sprintf("1234:%d", time.Now().Add(-hookFloorMaxAge-time.Minute).Unix()) }},
-		"timestampless-falls-back-to-listing": {raw: func() string { return "1234" }},
+		"absent-falls-back-to-listing":      {raw: func() string { return "" }},
+		"stale-floor-falls-back-to-listing": {raw: func() string { return fmt.Sprintf("1234:%d:0", time.Now().Add(-hookFloorMaxAge-time.Minute).Unix()) }},
+		// A serve binary predating the adoption generation (round 49)
+		// minted this two-field floor: no generation evidence, self-list.
+		"genless-legacy-falls-back-to-listing": {raw: func() string { return fmt.Sprintf("1234:%d", time.Now().Unix()) }},
+		"timestampless-falls-back-to-listing":  {raw: func() string { return "1234" }},
 		// Codex round 32: the trusted age never reaches the CONFIGURED
 		// reservation TTL — with a 90s TTL, a 70s-old floor (fresh by the
 		// five-minute default) can no longer see an orphan whose
 		// reservation expired, so it must self-list.
 		"ttl-bounded-age-falls-back-to-listing": {
-			raw: func() string { return fmt.Sprintf("1234:%d", time.Now().Add(-70*time.Second).Unix()) },
+			raw: func() string { return fmt.Sprintf("1234:%d:0", time.Now().Add(-70*time.Second).Unix()) },
 			ttl: "90s",
 		},
 		// A TTL at or below the mint cache's own staleness trusts nothing.
 		"tiny-ttl-always-falls-back-to-listing": {
-			raw: func() string { return fmt.Sprintf("1234:%d", time.Now().Unix()) },
+			raw: func() string { return fmt.Sprintf("1234:%d:0", time.Now().Unix()) },
 			ttl: "30s",
 		},
 		// Codex round 42: the trusted age must also leave the
@@ -691,7 +752,7 @@ func TestHookUsageFloor(t *testing.T) {
 		// 40s-old floor leaves only 90−30−40 = 20s < the 30s margin, so
 		// an orphan's reservation could expire during the reserve call.
 		"handoff-margin-falls-back-to-listing": {
-			raw: func() string { return fmt.Sprintf("1234:%d", time.Now().Add(-40*time.Second).Unix()) },
+			raw: func() string { return fmt.Sprintf("1234:%d:0", time.Now().Add(-40*time.Second).Unix()) },
 			ttl: "90s",
 		},
 	}

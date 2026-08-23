@@ -723,12 +723,18 @@ func (s *Server) adoptLFSObject(ctx context.Context, repoID, key, oid string) er
 	if err := s.Store.RegisterLFSObject(vctx, repoID, key, verifiedSize); err != nil {
 		return err
 	}
-	// Adoption moves already-LISTED bytes into the counter (Codex round
-	// 48): a cached uncounted floor scanned before this registration
-	// still contains them, so the next admission's floor+counter sum
-	// would double-count the object — a false denial preserved for the
-	// cache lifetime and any hook floors minted from it. Drop the entry;
-	// the next admission re-scans post-adoption reality.
+	// Adoption moves already-LISTED bytes into the counter (Codex rounds
+	// 48+49): every replica's cached uncounted floor scanned before this
+	// registration still contains them, so their next admission's
+	// floor+counter sum would double-count the object — a false denial
+	// preserved for the cache lifetime and any hook floors minted from
+	// it. Bump the SHARED adoption generation (all replicas' floor
+	// serves and hook floors are generation-checked) and drop this
+	// replica's entry directly. A failed bump only leaves the remote
+	// staleness the TTL always bounded — best-effort, logged.
+	if err := s.Store.BumpLFSAdoptionGen(vctx, repoID); err != nil {
+		log.Printf("lfs adopt %s: bump adoption gen: %v", key, err)
+	}
 	s.invalidateUsageFloor(repoID)
 	// Post-registration existence recheck (Codex round 1) — the adoption
 	// analogue of blob.EnsurePublished's writer-verify half: a DeleteLFS

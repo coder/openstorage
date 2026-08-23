@@ -183,6 +183,16 @@ func (s *SimRefStore) ReclaimRetainedPack(ctx context.Context, repo, key string)
 	return s.inner.ReclaimRetainedPack(ctx, repo, key)
 }
 
+// BumpLFSAdoptionGen delegates to the inner store.
+func (s *SimRefStore) BumpLFSAdoptionGen(ctx context.Context, repo string) error {
+	return s.inner.BumpLFSAdoptionGen(ctx, repo)
+}
+
+// LFSAdoptionGen delegates to the inner store.
+func (s *SimRefStore) LFSAdoptionGen(ctx context.Context, repo string) (int64, error) {
+	return s.inner.LFSAdoptionGen(ctx, repo)
+}
+
 // RegisterLFSObject delegates to the inner store (the DST does not model
 // LFS transfers yet; delegation keeps the interface honest without adding
 // an unexercised fault point).

@@ -625,6 +625,24 @@ func (s *PG) GuardedLFSDelete(ctx context.Context, repo, key string, del func(co
 	return deleted, err
 }
 
+// BumpLFSAdoptionGen — see RefStore (Codex round 49).
+func (s *PG) BumpLFSAdoptionGen(ctx context.Context, repo string) error {
+	assertf(repo != "", "BumpLFSAdoptionGen(%q)", repo)
+	_, err := s.pool.Exec(ctx, `
+INSERT INTO lfs_adoption_gens (repo, gen) VALUES ($1, 1)
+ON CONFLICT (repo) DO UPDATE SET gen = lfs_adoption_gens.gen + 1`, repo)
+	return err
+}
+
+// LFSAdoptionGen — see RefStore (Codex round 49).
+func (s *PG) LFSAdoptionGen(ctx context.Context, repo string) (int64, error) {
+	assertf(repo != "", "LFSAdoptionGen(%q)", repo)
+	var gen int64
+	err := s.pool.QueryRow(ctx,
+		`SELECT COALESCE((SELECT gen FROM lfs_adoption_gens WHERE repo = $1), 0)`, repo).Scan(&gen)
+	return gen, err
+}
+
 // CountLFSObjects returns repo's registered LFS object count — an O(1)
 // counter-row read (issue #51; the LFS surface's fast-fail pre-checks call
 // it per upload, so it must not scan the attacker-growable object table).
