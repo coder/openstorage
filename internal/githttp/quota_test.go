@@ -413,6 +413,57 @@ func TestUsageFloorInvalidatedAcrossReplicas(t *testing.T) {
 	}
 }
 
+// TestUsageFloorInFlightScanInvalidatedByAdoption (Codex round 49,
+// security): adoption racing a COLD in-flight scan must not hand the
+// scan's waiters a stale floor — the flight snapshotted the generation
+// before scanning, so the serve-time generation check catches the
+// mid-scan adoption, invalidates the repopulated entry, and retries onto
+// a post-adoption scan.
+func TestUsageFloorInFlightScanInvalidatedByAdoption(t *testing.T) {
+	ctx := context.Background()
+	st := openTestRefStore(t)
+	bb := &blockingBlob{BlobStore: openTestBlob(t), release: make(chan struct{})}
+	srv := &Server{Blob: bb, Store: st}
+
+	legacy := []byte("mid-scan adopted legacy object")
+	key := blob.LFSKey("repo_race", strings.Repeat("cd", 32))
+	if err := bb.BlobStore.UploadFile(ctx, key, writeTempFile(t, legacy)); err != nil {
+		t.Fatal(err)
+	}
+
+	// Cold floor request: its flight snapshots gen 0 and parks in the
+	// listing.
+	type res struct {
+		floor int64
+		err   error
+	}
+	done := make(chan res, 1)
+	go func() {
+		floor, err := srv.CachedUsageFloor(ctx, "repo_race")
+		done <- res{floor, err}
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for bb.calls.Load() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("flight never reached the listing")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	// The adoption commits mid-scan (another replica or this one).
+	if err := st.RegisterLFSObject(ctx, "repo_race", key, int64(len(legacy))); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.BumpLFSAdoptionGen(ctx, "repo_race"); err != nil {
+		t.Fatal(err)
+	}
+	close(bb.release)
+
+	r := <-done
+	if r.err != nil || r.floor != 0 {
+		t.Fatalf("mid-scan-adoption floor = (%d, %v), want (0, nil) — the stale flight result must be rejected", r.floor, r.err)
+	}
+}
+
 // TestHookFloorScansAreSlotBoundedAcrossProcesses (Codex round 47): hook
 // self-list scans run in fresh processes the serve-side pool cannot see,
 // so they take flock slot files instead — with every slot held (here by
