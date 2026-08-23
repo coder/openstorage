@@ -266,13 +266,41 @@ type reapOnRegister struct {
 	key string
 }
 
-func (r reapOnRegister) RegisterLFSObject(ctx context.Context, repo, key string, bytes int64) error {
+func (r reapOnRegister) RegisterAdoptedLFSObject(ctx context.Context, repo, key string, bytes int64) error {
 	if key == r.key {
 		if err := r.bl.Delete(ctx, key); err != nil {
 			return fmt.Errorf("test reap: %v", err)
 		}
 	}
-	return r.Store.RegisterLFSObject(ctx, repo, key, bytes)
+	return r.Store.RegisterAdoptedLFSObject(ctx, repo, key, bytes)
+}
+
+// TestLFSPublicationLeaseLeavesFloorCoverage (Codex round 51): the
+// publication lease must end with a FULL floor-freshness-plus-handoff
+// window of reservation cover remaining — a registration failing at the
+// lease's very end otherwise leaves the durable rowless orphan with less
+// cover than a just-scanned floor's usable life, letting a second writer
+// consume the same headroom. 90% binds only when the residual 10% still
+// clears MinPackReservationTTL.
+func TestLFSPublicationLeaseLeavesFloorCoverage(t *testing.T) {
+	for _, tc := range []struct {
+		ttl  time.Duration
+		want time.Duration
+	}{
+		{90 * time.Second, 30 * time.Second},               // absolute reserve binds
+		{10 * time.Minute, 9 * time.Minute},                // boundary: both agree
+		{time.Hour, 54 * time.Minute},                      // 90% binds (6m residue ≥ 60s)
+		{61 * time.Second, time.Second},                    // pathological: clamped nominal
+		{400 * time.Millisecond, time.Second},              // sub-minimum test TTLs clamp
+		{20 * time.Minute, 18 * time.Minute},               // 90% binds
+		{2 * time.Minute, time.Minute},                     // absolute reserve binds
+		{MinPackReservationTTL + time.Second, time.Second}, // just above the config floor
+	} {
+		srv := &Server{PackReservationTTL: tc.ttl}
+		if got := srv.lfsPublicationLease(); got != tc.want {
+			t.Fatalf("lease(ttl=%v) = %v, want %v", tc.ttl, got, tc.want)
+		}
+	}
 }
 
 // TestLFSAdopt_RecheckCatchesRacingSweep (Codex round 1): adoption whose

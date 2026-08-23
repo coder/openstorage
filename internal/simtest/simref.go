@@ -183,6 +183,11 @@ func (s *SimRefStore) ReclaimRetainedPack(ctx context.Context, repo, key string)
 	return s.inner.ReclaimRetainedPack(ctx, repo, key)
 }
 
+// RegisterAdoptedLFSObject delegates to the inner store.
+func (s *SimRefStore) RegisterAdoptedLFSObject(ctx context.Context, repo, key string, bytes int64) error {
+	return s.inner.RegisterAdoptedLFSObject(ctx, repo, key, bytes)
+}
+
 // BumpLFSAdoptionGen delegates to the inner store.
 func (s *SimRefStore) BumpLFSAdoptionGen(ctx context.Context, repo string) error {
 	return s.inner.BumpLFSAdoptionGen(ctx, repo)

@@ -587,6 +587,26 @@ func (s *Server) lfsReservationTTL() time.Duration {
 	return defaultReservationTTL
 }
 
+// lfsPublicationLease bounds publication + registration work anchored at
+// the pre-publish reservation refresh: at most 90% of the TTL, AND never
+// past TTL − MinPackReservationTTL (Codex round 51) — if registration
+// fails at the lease's very end, the durable rowless orphan must still
+// have a FULL floor-freshness-plus-handoff window (60s) of reservation
+// cover left, or a floor scanned just before publication could outlive
+// the reservation and admit a second writer into the same headroom. For
+// TTLs ≥ 10 minutes the 90% bound is the tighter one (10% ≥ 60s); below
+// that the absolute reserve binds. Sub-minimum test TTLs yield a
+// non-positive lease clamped to a nominal second (production TTLs cannot:
+// the config floor is MinPackReservationTTL, exclusive).
+func (s *Server) lfsPublicationLease() time.Duration {
+	ttl := s.lfsReservationTTL()
+	lease := min(ttl*9/10, ttl-MinPackReservationTTL)
+	if lease <= 0 {
+		lease = time.Second
+	}
+	return lease
+}
+
 // errLFSContentMismatch reports a stored blob whose bytes do not hash to
 // its content address — a legacy presigned-era upload that was never
 // digest-verified (issue #51's original hole).
@@ -680,7 +700,7 @@ func (s *Server) adoptLFSObject(ctx context.Context, repoID, key, oid string) er
 	// regardless of the requester's fate; the committed row makes the
 	// work once-per-object. The lease still bounds the op slot against a
 	// wedged backend or a parked connection.
-	vctx, vcancel := context.WithTimeout(context.WithoutCancel(ctx), s.lfsReservationTTL()*9/10)
+	vctx, vcancel := context.WithTimeout(context.WithoutCancel(ctx), s.lfsPublicationLease())
 	defer vcancel()
 	verifiedSize, err := s.verifyStoredLFSObject(vctx, repoID, key, oid)
 	if err != nil {
@@ -720,20 +740,19 @@ func (s *Server) adoptLFSObject(ctx context.Context, repoID, key, oid string) er
 	// and registering the stale Stat size would under-charge pack_usage
 	// (the later idempotent re-registration corrects nothing), minting
 	// phantom headroom until the cached floor refreshes.
-	if err := s.Store.RegisterLFSObject(vctx, repoID, key, verifiedSize); err != nil {
-		return err
-	}
 	// Adoption moves already-LISTED bytes into the counter (Codex rounds
 	// 48+49): every replica's cached uncounted floor scanned before this
 	// registration still contains them, so their next admission's
 	// floor+counter sum would double-count the object — a false denial
 	// preserved for the cache lifetime and any hook floors minted from
-	// it. Bump the SHARED adoption generation (all replicas' floor
-	// serves and hook floors are generation-checked) and drop this
-	// replica's entry directly. A failed bump only leaves the remote
-	// staleness the TTL always bounded — best-effort, logged.
-	if err := s.Store.BumpLFSAdoptionGen(vctx, repoID); err != nil {
-		log.Printf("lfs adopt %s: bump adoption gen: %v", key, err)
+	// it. The registration therefore bumps the SHARED adoption
+	// generation IN ITS OWN TRANSACTION (Codex round 51 — a separate
+	// best-effort bump could time out after the registration committed
+	// and never retry, because this function short-circuits once the row
+	// exists); all replicas' floor serves and hook floors are
+	// generation-checked. This replica's entry is dropped directly.
+	if err := s.Store.RegisterAdoptedLFSObject(vctx, repoID, key, verifiedSize); err != nil {
+		return err
 	}
 	s.invalidateUsageFloor(repoID)
 	// Post-registration existence recheck (Codex round 1) — the adoption
@@ -1264,7 +1283,7 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target r
 		}
 		resGens = dec.Gens
 	}
-	pubCtx, cancel := context.WithDeadline(ctx, pubAnchor.Add(s.lfsReservationTTL()*9/10))
+	pubCtx, cancel := context.WithDeadline(ctx, pubAnchor.Add(s.lfsPublicationLease()))
 	defer cancel()
 	if err := s.Blob.UploadFile(pubCtx, key, path); err != nil {
 		// PROVEN-clean failure: retire THIS attempt's share of the
@@ -1356,7 +1375,7 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target r
 	// request with the row — if registration committed — in the
 	// documented zero-growth repair state, which the client's retry
 	// republishes.
-	ectx, ecancel := context.WithDeadline(context.WithoutCancel(ctx), pubAnchor.Add(s.lfsReservationTTL()*9/10))
+	ectx, ecancel := context.WithDeadline(context.WithoutCancel(ctx), pubAnchor.Add(s.lfsPublicationLease()))
 	defer ecancel()
 	verifyErr := func() error {
 		_, err := s.Blob.Stat(ectx, key)

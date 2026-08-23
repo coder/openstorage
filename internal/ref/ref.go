@@ -162,6 +162,15 @@ type RefStore interface {
 	// inserted row's bytes to the repo's usage counter. bytes may be zero
 	// (the empty object registers without ledger effect).
 	RegisterLFSObject(ctx context.Context, repo, key string, bytes int64) error
+	// RegisterAdoptedLFSObject is RegisterLFSObject for ADOPTED objects
+	// (pre-registry blobs whose bytes physical listings already contain):
+	// the same transaction also bumps the adoption generation (Codex
+	// round 51 — a separate best-effort bump could time out after the
+	// registration committed, leaving remote floors double-counting the
+	// adopted bytes with no retry, because adoption short-circuits once
+	// the row exists). A re-registration of an existing row commits
+	// nothing and bumps nothing.
+	RegisterAdoptedLFSObject(ctx context.Context, repo, key string, bytes int64) error
 	// HasLFSObject reports whether (repo, key) is a registered LFS object
 	// (a point read mirroring HasPack, for the sweeper's per-object
 	// classification of the lfs/ prefix).

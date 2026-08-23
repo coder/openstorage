@@ -206,3 +206,44 @@ func TestHasLFSObject_UnregisteredAndForeignRepo(t *testing.T) {
 		}
 	})
 }
+
+// TestRegisterAdoptedLFSObjectBumpsGenAtomically (Codex round 51): the
+// adoption generation must move in the SAME transaction as an adopted
+// registration — a separate best-effort bump could be lost after the
+// registration committed, leaving remote floors double-counting forever
+// (adoption short-circuits once the row exists). Idempotent
+// re-registration commits nothing and must not bump again; plain
+// (new-upload) registrations never bump.
+func TestRegisterAdoptedLFSObjectBumpsGenAtomically(t *testing.T) {
+	runRefBackends(t, func(t *testing.T, s Store) {
+		ctx := context.Background()
+		k := newLedgerKit(t, s)
+		key := lfsLedgerKey(k, "adop")
+
+		if gen, err := s.LFSAdoptionGen(ctx, k.base()); err != nil || gen != 0 {
+			t.Fatalf("initial gen = (%d, %v), want (0, nil)", gen, err)
+		}
+		if err := s.RegisterAdoptedLFSObject(ctx, k.base(), key, 10); err != nil {
+			t.Fatal(err)
+		}
+		if gen, err := s.LFSAdoptionGen(ctx, k.base()); err != nil || gen != 1 {
+			t.Fatalf("post-adoption gen = (%d, %v), want (1, nil)", gen, err)
+		}
+		k.wantState(10, 0, 0)
+		// Idempotent re-adoption: no new row, no bump, no double credit.
+		if err := s.RegisterAdoptedLFSObject(ctx, k.base(), key, 10); err != nil {
+			t.Fatal(err)
+		}
+		if gen, err := s.LFSAdoptionGen(ctx, k.base()); err != nil || gen != 1 {
+			t.Fatalf("re-adoption gen = (%d, %v), want (1, nil)", gen, err)
+		}
+		k.wantState(10, 0, 0)
+		// A verified NEW upload's registration never bumps.
+		if err := s.RegisterLFSObject(ctx, k.base(), lfsLedgerKey(k, "new1"), 5); err != nil {
+			t.Fatal(err)
+		}
+		if gen, err := s.LFSAdoptionGen(ctx, k.base()); err != nil || gen != 1 {
+			t.Fatalf("new-upload gen = (%d, %v), want (1, nil)", gen, err)
+		}
+	})
+}

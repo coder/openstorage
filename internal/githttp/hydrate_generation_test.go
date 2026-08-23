@@ -93,6 +93,10 @@ func (s *countingStore) BumpLFSAdoptionGen(context.Context, string) error {
 	panic("Hydrate must never bump the adoption generation")
 }
 
+func (s *countingStore) RegisterAdoptedLFSObject(context.Context, string, string, int64) error {
+	panic("Hydrate must never adopt LFS objects")
+}
+
 func (s *countingStore) LFSAdoptionGen(context.Context, string) (int64, error) {
 	panic("Hydrate must never read the adoption generation")
 }

@@ -70,7 +70,10 @@ func (f *fakeInner) HasLFSObject(context.Context, string, string) (bool, error) 
 }
 func (f *fakeInner) CountLFSObjects(context.Context, string) (int64, error) { return 0, nil }
 func (f *fakeInner) BumpLFSAdoptionGen(context.Context, string) error       { return nil }
-func (f *fakeInner) LFSAdoptionGen(context.Context, string) (int64, error)  { return 0, nil }
+func (f *fakeInner) RegisterAdoptedLFSObject(context.Context, string, string, int64) error {
+	return nil
+}
+func (f *fakeInner) LFSAdoptionGen(context.Context, string) (int64, error) { return 0, nil }
 func (f *fakeInner) GuardedLFSDelete(context.Context, string, string, func(context.Context) error) (bool, error) {
 	return false, nil
 }

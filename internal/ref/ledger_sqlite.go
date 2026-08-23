@@ -240,10 +240,17 @@ func (s *SQLite) RegisterLFSObject(ctx context.Context, repo, key string, bytes 
 	validateRegisterLFS(repo, key, bytes)
 	// Cap denial deletes no reservation rows — see the PG twin (Codex
 	// round 37): the cap-denied caller retires its own attempt.
-	return s.registerLFSObjectTx(ctx, repo, key, bytes)
+	return s.registerLFSObjectTx(ctx, repo, key, bytes, false)
 }
 
-func (s *SQLite) registerLFSObjectTx(ctx context.Context, repo, key string, bytes int64) error {
+// RegisterAdoptedLFSObject — see RefStore (Codex round 51): the adoption
+// generation bump commits atomically with the registration.
+func (s *SQLite) RegisterAdoptedLFSObject(ctx context.Context, repo, key string, bytes int64) error {
+	validateRegisterLFS(repo, key, bytes)
+	return s.registerLFSObjectTx(ctx, repo, key, bytes, true)
+}
+
+func (s *SQLite) registerLFSObjectTx(ctx context.Context, repo, key string, bytes int64, adopted bool) error {
 	tx, err := s.db.BeginTx(ctx, nil) // BEGIN IMMEDIATE via _txlock
 	if err != nil {
 		return fmt.Errorf("register lfs object begin: %w", err)
@@ -280,6 +287,14 @@ RETURNING count`, repo).Scan(&count); err != nil {
 		return err
 	}
 	if inserted > 0 {
+		if adopted {
+			// Atomic with the insert+credit — see the PG twin (round 51).
+			if _, err := tx.ExecContext(ctx, `
+INSERT INTO lfs_adoption_gens (repo, gen) VALUES (?, 1)
+ON CONFLICT (repo) DO UPDATE SET gen = lfs_adoption_gens.gen + 1`, repo); err != nil {
+				return err
+			}
+		}
 		if err := creditUsageSQLite(ctx, tx, repo, bytes); err != nil {
 			return err
 		}

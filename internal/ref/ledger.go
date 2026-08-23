@@ -553,10 +553,17 @@ func (s *PG) RegisterLFSObject(ctx context.Context, repo, key string, bytes int6
 	// attempt instead (gen-bound, on evidence of non-publication, like
 	// every other clean failure), so the row still ends promptly at zero
 	// attempts and a crashed loser leaves only the TTL behavior.
-	return s.registerLFSObjectTx(ctx, repo, key, bytes)
+	return s.registerLFSObjectTx(ctx, repo, key, bytes, false)
 }
 
-func (s *PG) registerLFSObjectTx(ctx context.Context, repo, key string, bytes int64) error {
+// RegisterAdoptedLFSObject — see RefStore (Codex round 51): the adoption
+// generation bump commits atomically with the registration.
+func (s *PG) RegisterAdoptedLFSObject(ctx context.Context, repo, key string, bytes int64) error {
+	validateRegisterLFS(repo, key, bytes)
+	return s.registerLFSObjectTx(ctx, repo, key, bytes, true)
+}
+
+func (s *PG) registerLFSObjectTx(ctx context.Context, repo, key string, bytes int64, adopted bool) error {
 	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
 		ct, err := tx.Exec(ctx,
 			`INSERT INTO lfs_objects (repo, key, bytes) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
@@ -585,6 +592,15 @@ RETURNING count`, repo).Scan(&count); err != nil {
 		}
 		if ct.RowsAffected() == 0 {
 			return nil // already registered: bytes already counted
+		}
+		if adopted {
+			// Atomic with the insert+credit (Codex round 51): the bump
+			// must never be lost after the registration committed.
+			if _, err := tx.Exec(ctx, `
+INSERT INTO lfs_adoption_gens (repo, gen) VALUES ($1, 1)
+ON CONFLICT (repo) DO UPDATE SET gen = lfs_adoption_gens.gen + 1`, repo); err != nil {
+				return err
+			}
 		}
 		return creditUsagePG(ctx, tx, repo, bytes)
 	})
