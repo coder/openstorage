@@ -108,10 +108,6 @@ CREATE TABLE IF NOT EXISTS repos (
 -- Keyset pagination index for ListRepos (live rows only).
 CREATE INDEX IF NOT EXISTS repos_org_created_idx
     ON repos (org_id, created_at DESC, repo_id DESC) WHERE deleted_at IS NULL;
--- Retention-purge scan index (issue #52): PurgeableRepos pages soft-deleted
--- rows oldest-deletion-first without touching the live population.
-CREATE INDEX IF NOT EXISTS repos_deleted_idx
-    ON repos (deleted_at, repo_id) WHERE deleted_at IS NOT NULL;
 -- Phase-5 eventing/sync tables (eventing.go): webhook registrations, git
 -- credentials, and repo upstream links.
 CREATE TABLE IF NOT EXISTS webhooks (
@@ -155,6 +151,16 @@ ALTER TABLE repo_upstreams ADD COLUMN IF NOT EXISTS sync_claim_holder text NOT N
 ALTER TABLE repo_upstreams ADD COLUMN IF NOT EXISTS sync_claim_expires_at timestamptz NOT NULL DEFAULT 'epoch';
 -- Upgrade path for repos predating the purge tombstone column (issue #52).
 ALTER TABLE repos ADD COLUMN IF NOT EXISTS purged_at timestamptz;
+-- Retention-purge scan index (issue #52): PurgeableRepos pages PENDING
+-- purges (soft-deleted, not yet stamped) oldest-deletion-first. Excluding
+-- stamped tombstones keeps the scan O(pending) — completed purges keep
+-- their repos rows forever, so an all-deleted index would grow without
+-- bound. Created after the purged_at upgrade above (the predicate needs
+-- the column on pre-upgrade databases); the drop clears this PR's earlier
+-- all-deleted spelling from dev databases.
+DROP INDEX IF EXISTS repos_deleted_idx;
+CREATE INDEX IF NOT EXISTS repos_purgeable_idx
+    ON repos (deleted_at, repo_id) WHERE deleted_at IS NOT NULL AND purged_at IS NULL;
 `)
 		return err
 	})
