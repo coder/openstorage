@@ -200,11 +200,22 @@ func (w *Worker) Run(ctx context.Context, job Job) error {
 		// queued work is already documented as best-effort across
 		// restarts.
 		rqCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		defer cancel()
+		// fin is a snapshot from FinishSync, and the emissions above can
+		// block long enough for another run (e.g. the request's own
+		// queued goroutine claiming the freed row) to consume the marker
+		// and cover every request. Re-read and skip the follow-up when
+		// the marker is already covered or the repo was detached; a
+		// failed read requeues conservatively — an extra run is a
+		// harmless no-op, a dropped request is not.
+		switch up, err := w.Upstreams.GetUpstream(rqCtx, job.RepoID); {
+		case err == nil && !up.SyncPending, errors.Is(err, ErrNotFound):
+			return runErr
+		}
 		if rqErr := w.Requeue(rqCtx, job); rqErr != nil {
 			w.Logger.Warn("requeue pending sync failed",
 				"org", job.Org, "repo", job.RepoID, "err", rqErr)
 		}
-		cancel()
 	}
 	return runErr
 }

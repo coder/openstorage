@@ -211,6 +211,90 @@ func TestStartedEventSurvivesExpiredRunContext(t *testing.T) {
 	assertEventTypes(t, f.rec.list(), EventSyncStarted, EventSyncFailed)
 }
 
+// gatedSink blocks the FIRST emission of gateOn until released, letting
+// the test interleave work inside the finisher's emission window. A CAS
+// flag (not sync.Once, whose Do blocks concurrent callers while the first
+// is parked) keeps later emissions flowing while the first is held.
+type gatedSink struct {
+	inner   EventSink
+	gateOn  string
+	entered chan struct{}
+	release chan struct{}
+	first   atomic.Bool
+}
+
+func (s *gatedSink) Emit(ctx context.Context, org, eventType string, payload []byte) {
+	if eventType == s.gateOn && s.first.CompareAndSwap(false, true) {
+		close(s.entered)
+		<-s.release
+	}
+	s.inner.Emit(ctx, org, eventType, payload)
+}
+
+// The finisher's pending snapshot can go stale while its terminal emission
+// blocks: if another run claims the freed row and consumes the marker in
+// that window, the requeue must be skipped — the coalesced follow-up
+// already happened, and a third run would be pure waste.
+func TestRequeueSkippedWhenMarkerAlreadyCovered(t *testing.T) {
+	f := newWorkerFixture(t)
+	seedUpstream(t, f.upstreamDir, "own", "proj")
+	f.addLoopbackRepo(t, "repo_cov")
+	f.putUpstream(t, "repo_cov", "own", "proj", "file://"+f.upstreamDir)
+
+	upGate := &gatedUpstreams{
+		UpstreamStore: f.store,
+		entered:       make(chan struct{}),
+		release:       make(chan struct{}),
+	}
+	f.worker.Upstreams = upGate
+	sinkGate := &gatedSink{
+		inner:   f.rec,
+		gateOn:  EventSyncSucceeded,
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	f.worker.Events = sinkGate
+
+	var requeues atomic.Int32
+	f.worker.Requeue = func(context.Context, Job) error {
+		requeues.Add(1)
+		return nil
+	}
+
+	job := Job{Org: "acme", RepoID: "repo_cov"}
+	done := make(chan error, 1)
+	go func() { done <- f.worker.Run(context.Background(), job) }()
+	<-upGate.entered // run 1 holds the claim at the detach barrier
+
+	// The 202 path while run 1 is claimed: the marker is pending.
+	if err := f.store.RequestSync(context.Background(), "repo_cov"); err != nil {
+		t.Fatal(err)
+	}
+	close(upGate.release)
+	<-sinkGate.entered // run 1 finished (marker reported pending), now blocked emitting
+
+	// The request's own queued goroutine claims the freed row and covers
+	// the marker while run 1 is stuck in its emission.
+	if err := f.worker.Run(context.Background(), job); err != nil {
+		t.Fatalf("covering run: %v", err)
+	}
+	close(sinkGate.release) // run 1 resumes: re-read sees the marker covered
+
+	if err := <-done; err != nil {
+		t.Fatalf("run 1: %v", err)
+	}
+	if got := requeues.Load(); got != 0 {
+		t.Errorf("requeue ran %d times for an already-covered marker, want 0", got)
+	}
+	up, err := f.store.GetUpstream(context.Background(), "repo_cov")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if up.SyncPending || up.RunCount != 2 {
+		t.Errorf("row after covered marker = %+v, want consumed marker and exactly two runs", up)
+	}
+}
+
 // flakyFinishUpstreams fails the first `fails` FinishSync calls.
 type flakyFinishUpstreams struct {
 	UpstreamStore
