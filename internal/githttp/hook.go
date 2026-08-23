@@ -448,7 +448,12 @@ func preReceive(ctx context.Context) error {
 		}
 	}
 	if restoredAny {
-		if err := st.BumpLFSAdoptionGen(ctx, BaseRepo(repo)); err != nil {
+		// Detached and bounded like the restores it concludes (Codex
+		// security round 68) — a canceled hook context must not skip
+		// the invalidation the covers hand off to.
+		bctx, bcancel := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
+		defer bcancel()
+		if err := st.BumpLFSAdoptionGen(bctx, BaseRepo(repo)); err != nil {
 			fmt.Fprintf(os.Stderr, "codestorage: floor generation bump after pack restore: %v\n", err)
 		}
 	}

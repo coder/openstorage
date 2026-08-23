@@ -175,7 +175,15 @@ func (s *server) publishPack(ctx context.Context, repoID, packID, packPath strin
 	// post-publication cover refresh failed still made the bytes
 	// physical, and cached floors must re-scan regardless.
 	if restored {
-		if berr := s.refStore.BumpLFSAdoptionGen(ctx, githttp.BaseRepo(repoID)); berr != nil {
+		// Detached and bounded like the restore it concludes (Codex
+		// security round 68): EnsurePublished deliberately survives
+		// request cancellation, so a client disconnecting after
+		// registration must not be able to skip the invalidation — with
+		// the bump lost, absence-window floors outlive the covers and a
+		// later writer settles against the deflated floor.
+		bctx, bcancel := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
+		defer bcancel()
+		if berr := s.refStore.BumpLFSAdoptionGen(bctx, githttp.BaseRepo(repoID)); berr != nil {
 			s.logger.Warn("floor generation bump after pack restore", "key", key, "error", berr)
 		}
 	}

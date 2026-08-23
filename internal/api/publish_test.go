@@ -79,6 +79,78 @@ func TestUsageFloorFallbackSubtractsCounter(t *testing.T) {
 	}
 }
 
+// restoreRaceBlob simulates a sweeper racing every existence probe: Stat
+// always reports the key missing, uploads succeed, and the SECOND upload
+// (EnsurePublished's restore) cancels the request context first — a
+// client hanging up while the deliberately-detached restore completes.
+type restoreRaceBlob struct {
+	blob.BlobStore // nil: only the methods below are exercised
+	uploads        int
+	cancel         context.CancelFunc
+}
+
+func (b *restoreRaceBlob) Stat(context.Context, string) (int64, error) {
+	return 0, blob.ErrNotFound
+}
+
+func (b *restoreRaceBlob) UploadFile(context.Context, string, string) error {
+	b.uploads++
+	if b.uploads == 2 {
+		b.cancel()
+	}
+	return nil
+}
+
+// bumpRecordingStore records the liveness of the context the
+// floor-generation bump receives.
+type bumpRecordingStore struct {
+	ref.RefStore // nil: only the methods below are exercised
+	bumped       bool
+	bumpCtxErr   error
+}
+
+func (s *bumpRecordingStore) RegisterPacks(context.Context, string, []ref.Pack) error {
+	return nil
+}
+
+func (s *bumpRecordingStore) BumpLFSAdoptionGen(ctx context.Context, _ string) error {
+	s.bumped = true
+	s.bumpCtxErr = ctx.Err()
+	return ctx.Err()
+}
+
+// TestPublishPackRestoreBumpSurvivesClientCancel (Codex round 68,
+// security): EnsurePublished deliberately survives request cancellation,
+// but the post-restore floor-generation bump reused the request context —
+// a client disconnecting after registration skipped the invalidation, and
+// with the covers expired a later writer could settle against the
+// absence-window floor. The bump must run detached and bounded, like the
+// restore it concludes.
+func TestPublishPackRestoreBumpSurvivesClientCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	packPath := filepath.Join(t.TempDir(), "pack")
+	if err := os.WriteFile(packPath, []byte("pack-bytes"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	st := &bumpRecordingStore{}
+	s := &server{
+		refStore:  st,
+		blobStore: &restoreRaceBlob{cancel: cancel},
+		logger:    discardLogger(),
+		// Quota off: the restore path itself is under test, not admission.
+	}
+	if err := s.publishPack(ctx, "repo_rb", "abcd", packPath); err != nil {
+		t.Fatalf("publishPack: %v", err)
+	}
+	if !st.bumped {
+		t.Fatal("restore did not bump the floor generation")
+	}
+	if st.bumpCtxErr != nil {
+		t.Fatalf("bump ran on the canceled request context (ctx err %v) — it must be detached like the restore", st.bumpCtxErr)
+	}
+}
+
 // TestPublishPackReservationCapIsRetryable (Codex round 43): a
 // KeyCapExceeded denial means the repository's ACTIVE-ROW cap is full —
 // rows expire with the TTL, so the correct client behavior is retry, not
