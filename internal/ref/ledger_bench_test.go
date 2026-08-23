@@ -37,14 +37,14 @@ func BenchmarkReservePackBytesSQLite(b *testing.B) {
 			for i := range seeded {
 				seeded[i] = Pack{Key: fmt.Sprintf("packs/benchrepo/pack-%04d.pack", i), Size: 1 << 20}
 			}
-			if dec, err := s.ReservePackBytes(ctx, group, seeded, NewReservationOwner(), 0, 1<<40, time.Hour); err != nil || !dec.OK {
+			if dec, err := s.ReservePackBytes(ctx, group, seeded, NewReservationOwner(), 0, ReserveNoFloorGen, 1<<40, time.Hour); err != nil || !dec.OK {
 				b.Fatalf("seed ReservePackBytes = (%+v, %v), want admitted", dec, err)
 			}
 			owner := NewReservationOwner()
 			incoming := []Pack{{Key: "packs/benchrepo/pack-incoming.pack", Size: 1 << 20}}
 			b.ReportAllocs()
 			for b.Loop() {
-				dec, err := s.ReservePackBytes(ctx, group, incoming, owner, 1<<30, 1<<40, time.Hour)
+				dec, err := s.ReservePackBytes(ctx, group, incoming, owner, 1<<30, ReserveNoFloorGen, 1<<40, time.Hour)
 				if err != nil {
 					b.Fatalf("ReservePackBytes: %v", err)
 				}
