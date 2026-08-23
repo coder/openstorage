@@ -1850,6 +1850,54 @@ func TestLFSCompatCopy_AmbiguousCommitHandsOff(t *testing.T) {
 	}
 }
 
+// commitButFailCanonicalCopyBlob performs the canonical adoption copy,
+// then reports failure — the committed-but-response-lost outcome on the
+// adoption path.
+type commitButFailCanonicalCopyBlob struct {
+	blob.BlobStore
+	failed atomic.Bool
+}
+
+func (b *commitButFailCanonicalCopyBlob) Copy(ctx context.Context, dstKey, srcKey string) error {
+	err := b.BlobStore.Copy(ctx, dstKey, srcKey)
+	if err == nil && strings.Contains(dstKey, "/o2/") && !b.failed.Swap(true) {
+		return fmt.Errorf("simulated lost CopyObject response")
+	}
+	return err
+}
+
+// TestLFSAdopt_AmbiguousCommitContinues (Codex round 96, P1 — the
+// adoption twin of round 95's bridge fix): a canonical adoption copy can
+// commit its destination and still return an error. Returning immediately
+// skipped the cover tail, leaving the durable ROWLESS canonical bytes
+// invisible to a pre-copy cached floor for its whole serve-and-handoff
+// window — registration's atomic bump only heals after some later retry.
+// A present destination under a still-held lease is a commit: re-cover
+// and continue into the destination re-verify, which digest-proves the
+// bytes exactly as after a clean copy and registers with the atomic
+// handoff.
+func TestLFSAdopt_AmbiguousCommitContinues(t *testing.T) {
+	ctx := context.Background()
+	srv, st, mint := newLFSQuotaServer(t, 1<<20, time.Hour)
+	tok := mint(auth.ScopeGitWrite)
+	content := bytes.Repeat([]byte("h"), 50)
+	oid := sha256Hex(content)
+	key := blob.LFSKey(lfsTestRepoID, oid)
+	if err := srv.Blob.UploadFile(ctx, blob.LFSLegacyKey(lfsTestRepoID, oid), writeTempFile(t, content)); err != nil {
+		t.Fatal(err)
+	}
+	srv.Blob = &commitButFailCanonicalCopyBlob{BlobStore: srv.Blob}
+
+	resp := decodeBatch(t, doLFS(t, srv, http.MethodPost, lfsBatchPath, "basic:"+tok,
+		batchBody("upload", oid, int64(len(content)))))
+	if resp.Objects[0].Error != nil || len(resp.Objects[0].Actions) != 0 {
+		t.Fatalf("adoption whose copy committed despite the error = %+v, want stored — the destination probe proves the commit and the re-verify trusts only the digest", resp.Objects[0])
+	}
+	if has, err := st.HasLFSObject(ctx, lfsTestRepoID, key); err != nil || !has {
+		t.Fatalf("registered = (%v, %v), want adopted", has, err)
+	}
+}
+
 // TestLFSCompat_RepairSerializedOnLegacyClaim (Codex security round 85):
 // the batch fast path's bridge repair launched an unserialized full copy —
 // every tiny concurrent touch of the object started another one. Compat
