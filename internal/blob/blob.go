@@ -368,7 +368,21 @@ func WithRenewedCover(ctx context.Context, renew func(context.Context) error, op
 	// are restore accounting, not client work.
 	attemptRenew := func() (ok, lost bool, err error) {
 		start := time.Now()
-		rctx, rcancel := context.WithTimeout(context.WithoutCancel(ctx), coverRenewTimeout)
+		// Each attempt is capped at the REMAINING continuity budget
+		// (Codex round 66): continuity is only checked when renew
+		// returns, so an attempt allowed to run past covered+budget
+		// would leave op uncancelled while the prior cover expires
+		// under it — the full per-attempt timeout applies only while
+		// the budget has that much room.
+		bound := coverRenewTimeout
+		if !covered.IsZero() {
+			remaining := time.Until(covered.Add(coverLapseBudget))
+			if remaining <= 0 {
+				return false, true, errors.New("continuity budget exhausted")
+			}
+			bound = min(bound, remaining)
+		}
+		rctx, rcancel := context.WithTimeout(context.WithoutCancel(ctx), bound)
 		err = renew(rctx)
 		rcancel()
 		if err == nil && (covered.IsZero() || time.Since(covered) <= coverLapseBudget) {
@@ -393,10 +407,21 @@ func WithRenewedCover(ctx context.Context, renew func(context.Context) error, op
 		t := time.NewTicker(coverRenewInterval)
 		defer t.Stop()
 		for {
+			// The budget deadline is enforced by its own timer (Codex
+			// round 66): a tick-driven check alone lets the budget
+			// expire BETWEEN ticks (quick failures early, the next tick
+			// scheduled past covered+budget) with op still running while
+			// the prior cover ages out.
+			budget := time.NewTimer(time.Until(covered.Add(coverLapseBudget)))
 			select {
 			case <-done:
+				budget.Stop()
+				return
+			case <-budget.C:
+				opCancel(errors.New("restore cover continuity lost (budget expired without a renewed cover)"))
 				return
 			case <-t.C:
+				budget.Stop()
 				if _, lost, err := attemptRenew(); lost {
 					opCancel(fmt.Errorf("restore cover continuity lost (last renewal: %v)", err))
 					return

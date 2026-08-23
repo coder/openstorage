@@ -561,6 +561,49 @@ func TestWithRenewedCoverRejectsLateSuccess(t *testing.T) {
 	}
 }
 
+// TestWithRenewedCoverBudgetExpiryAbortsBetweenTicks (Codex round 66):
+// the continuity abort was TICK-driven — quick failures early left the
+// next tick scheduled past covered+budget, and an attempt starting near
+// the budget edge could run its full per-attempt timeout — in both cases
+// op kept running while the prior cover aged out, and a publication in
+// that gap landed uncovered. The budget deadline must be enforced by its
+// own timer: op is canceled AT covered+coverLapseBudget, not at whatever
+// later tick happens to notice.
+func TestWithRenewedCoverBudgetExpiryAbortsBetweenTicks(t *testing.T) {
+	oldI, oldT, oldB := coverRenewInterval, coverRenewTimeout, coverLapseBudget
+	// Ticks land far past the budget: only a budget-deadline timer can
+	// abort in time.
+	coverRenewInterval, coverRenewTimeout, coverLapseBudget = 300*time.Millisecond, 10*time.Millisecond, 50*time.Millisecond
+	t.Cleanup(func() { coverRenewInterval, coverRenewTimeout, coverLapseBudget = oldI, oldT, oldB })
+
+	initial := true
+	renew := func(context.Context) error {
+		if initial {
+			initial = false
+			return nil // the initial cover succeeds; nothing renews it
+		}
+		return errors.New("ledger down")
+	}
+	start := time.Now()
+	opErr, _ := WithRenewedCover(context.Background(), renew, func(opCtx context.Context) error {
+		select {
+		case <-opCtx.Done():
+			return context.Cause(opCtx)
+		case <-time.After(2 * time.Second):
+			return nil // never aborted: uncovered bytes would publish
+		}
+	})
+	elapsed := time.Since(start)
+	if opErr == nil || !strings.Contains(opErr.Error(), "restore cover continuity lost") {
+		t.Fatalf("opErr = %v, want a budget-expiry abort", opErr)
+	}
+	// The abort must come from the budget deadline (~50ms), not the
+	// first tick (~300ms); generous slack for scheduler noise.
+	if elapsed > 200*time.Millisecond {
+		t.Fatalf("abort took %v, want ≈coverLapseBudget (the budget timer, not the next tick)", elapsed)
+	}
+}
+
 // TestWithRenewedCoverTakesInitialCoverItself (Codex round 64): a
 // caller-side initial reservation with the anchor captured at helper
 // entry let a process suspension between the caller's commit and entry
