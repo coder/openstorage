@@ -148,10 +148,12 @@ Defaults: 150 steps, 3 nodes. Exit codes: `0` clean, `1` invariant violation,
    that repeated runs of the same binary print the *same* one.
 5. **Pin it in a committed test.** The reproduction command guards nothing
    after it scrolls by — `TestDSTSeed` skips when `DST_SEED` is unset, and the
-   nightly sweep derives fresh seeds from each run id. Add the failing
-   seed+steps to the PR gate (`TestDSTFast`'s fixed-seed list in
-   `internal/simtest/dst_test.go` is the pattern) so every future run replays
-   it.
+   nightly sweep derives fresh seeds from each run id. Commit a regression
+   that replays the exact failing configuration in the PR gate: a
+   `Run(Config{Seed: <seed>, Steps: <steps>})` call in
+   `internal/simtest/dst_test.go`, next to `TestDSTFast` — as a dedicated
+   test or a table entry that carries the step count (`TestDSTFast`'s own
+   seed-only list runs everything at 120 steps).
 
 ### The nightly sweep
 
