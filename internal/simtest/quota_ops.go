@@ -59,7 +59,7 @@ func (s *sim) doReserveCrash(name string, node *simNode, repo *simRepo) error {
 
 	mark := s.inj.Seq()
 	dec, rerr := node.simRef.ReservePackBytes(ctx, blob.QuotaRepoGroup(repo.key),
-		[]ref.Pack{pack}, ref.NewReservationOwner(), 0, simQuotaBytes, simReservationTTL)
+		[]ref.Pack{pack}, ref.NewReservationOwner(), 0, ref.ReserveNoFloorGen, simQuotaBytes, simReservationTTL)
 	evs, _ := s.inj.FiredSince(mark)
 	outcome := "crashed-after-reserve"
 	switch {

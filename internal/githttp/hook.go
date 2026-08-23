@@ -307,18 +307,37 @@ func preReceive(ctx context.Context) error {
 			}
 		}
 		if len(unpublished) > 0 {
-			floor, err := hookUsageFloor(ctx, bl, st, repo)
+			floor, floorGen, err := hookUsageFloor(ctx, bl, st, repo)
 			if err != nil {
 				return fmt.Errorf("pre-receive: %w", err)
 			}
-			// Deadline-bounded by the handoff margin (Codex round 42) — see
-			// the LFS PUT twin: the floor's orphan cover must outlive the
-			// admission snapshot.
-			rsvCtx, rsvCancel := context.WithTimeout(ctx, UsageFloorHandoffMargin)
-			dec, err := st.ReservePackBytes(rsvCtx, blob.QuotaRepoGroup(repo), unpublished, ref.NewReservationOwner(), floor, quota, ttl)
-			rsvCancel()
-			if err != nil {
-				return fmt.Errorf("pre-receive: reserve pack bytes: %w", err)
+			var dec ref.ReserveDecision
+			for attempt := 0; ; attempt++ {
+				// Deadline-bounded by the handoff margin (Codex round 42) —
+				// see the LFS PUT twin: the floor's orphan cover must
+				// outlive the admission snapshot.
+				rsvCtx, rsvCancel := context.WithTimeout(ctx, UsageFloorHandoffMargin)
+				dec, err = st.ReservePackBytes(rsvCtx, blob.QuotaRepoGroup(repo), unpublished, ref.NewReservationOwner(), floor, floorGen, quota, ttl)
+				rsvCancel()
+				if err != nil {
+					return fmt.Errorf("pre-receive: reserve pack bytes: %w", err)
+				}
+				if !dec.FloorStale {
+					break
+				}
+				// The ledger's transactional generation recheck rejected
+				// the floor (Codex round 60): a restore, adoption, or
+				// retained-bytes debit moved it between the floor's own
+				// check and the reserve. Self-list a fresh floor (with
+				// its generation) and retry once; a second rejection
+				// fails the push closed — the client retries.
+				if attempt >= 1 {
+					return fmt.Errorf("pre-receive: usage floor went stale during admission twice, retry")
+				}
+				floor, floorGen, err = hookSelfListFloor(ctx, bl, st, repo)
+				if err != nil {
+					return fmt.Errorf("pre-receive: %w", err)
+				}
 			}
 			if dec.KeyCapExceeded {
 				// Transient row-cap denial, not a quota breach (Codex

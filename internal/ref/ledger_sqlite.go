@@ -20,8 +20,8 @@ import (
 const sqliteEpochMS = `CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)`
 
 // ReservePackBytes implements the ledger.go admission check on SQLite.
-func (s *SQLite) ReservePackBytes(ctx context.Context, group []string, packs []Pack, owner string, usageFloor, quotaBytes int64, ttl time.Duration) (ReserveDecision, error) {
-	validateReserve(group, packs, owner, usageFloor, quotaBytes, ttl)
+func (s *SQLite) ReservePackBytes(ctx context.Context, group []string, packs []Pack, owner string, usageFloor, floorGen, quotaBytes int64, ttl time.Duration) (ReserveDecision, error) {
+	validateReserve(group, packs, owner, usageFloor, floorGen, quotaBytes, ttl)
 	tx, err := s.db.BeginTx(ctx, nil) // BEGIN IMMEDIATE via _txlock
 	if err != nil {
 		return ReserveDecision{}, fmt.Errorf("reserve pack bytes begin: %w", err)
@@ -73,6 +73,21 @@ SELECT
 	}
 	// SUM, not max — see the PG twin (Codex round 44).
 	dec := ReserveDecision{UsedBytes: addSat(counter, usageFloor), ReservedBytes: reserved}
+	// Transactional floor-generation recheck — see the PG twin (Codex
+	// round 60, security). The IMMEDIATE transaction serializes against
+	// every generation-bumping writer.
+	if floorGen >= 0 {
+		var gen int64
+		if err := tx.QueryRowContext(ctx,
+			`SELECT COALESCE((SELECT gen FROM lfs_adoption_gens WHERE repo = ?), 0)`,
+			group[0]).Scan(&gen); err != nil {
+			return ReserveDecision{}, fmt.Errorf("reserve pack bytes gen recheck: %w", err)
+		}
+		if gen != floorGen {
+			dec.FloorStale = true
+			return dec, nil // denied; the deferred rollback discards nothing
+		}
+	}
 	if activeRows+int64(len(packs)) > int64(maxActiveReservations) {
 		dec.KeyCapExceeded = true
 		return dec, nil // denied; the deferred rollback discards nothing

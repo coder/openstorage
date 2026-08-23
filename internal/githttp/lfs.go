@@ -1380,27 +1380,44 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target r
 		}
 	}
 	if s.PackQuotaBytes > 0 && n > 0 && !registered {
-		floor, err := s.CachedUsageFloor(ctx, repoID)
-		if err != nil {
-			log.Printf("lfs quota: %s: usage listing failed: %v", repoID, err)
-			lfsError(w, http.StatusInternalServerError, "storage quota check failed")
-			return
-		}
-		// The reserve is deadline-bounded by the handoff margin (Codex
-		// round 42): the floor above may be served up to usageCacheTTL
-		// after its scan, so the admission snapshot must land within the
-		// margin for MinPackReservationTTL's coverage argument to hold —
-		// a stalled database fails the request rather than admitting
-		// against a floor whose orphan cover may have lapsed.
-		rsvCtx, rsvCancel := context.WithTimeout(ctx, UsageFloorHandoffMargin)
-		dec, err := s.Store.ReservePackBytes(rsvCtx, blob.QuotaRepoGroup(repoID),
-			[]ref.Pack{{Key: key, Size: n}}, ref.NewReservationOwner(),
-			floor, s.PackQuotaBytes, s.lfsReservationTTL())
-		rsvCancel()
-		if err != nil {
-			log.Printf("lfs quota: %s: pre-publish refresh failed: %v", repoID, err)
-			lfsError(w, http.StatusInternalServerError, "storage quota check failed")
-			return
+		var dec ref.ReserveDecision
+		for attempt := 0; ; attempt++ {
+			floor, floorGen, err := s.cachedUsageFloorGen(ctx, repoID)
+			if err != nil {
+				log.Printf("lfs quota: %s: usage listing failed: %v", repoID, err)
+				lfsError(w, http.StatusInternalServerError, "storage quota check failed")
+				return
+			}
+			// The reserve is deadline-bounded by the handoff margin (Codex
+			// round 42): the floor above may be served up to usageCacheTTL
+			// after its scan, so the admission snapshot must land within the
+			// margin for MinPackReservationTTL's coverage argument to hold —
+			// a stalled database fails the request rather than admitting
+			// against a floor whose orphan cover may have lapsed.
+			rsvCtx, rsvCancel := context.WithTimeout(ctx, UsageFloorHandoffMargin)
+			dec, err = s.Store.ReservePackBytes(rsvCtx, blob.QuotaRepoGroup(repoID),
+				[]ref.Pack{{Key: key, Size: n}}, ref.NewReservationOwner(),
+				floor, floorGen, s.PackQuotaBytes, s.lfsReservationTTL())
+			rsvCancel()
+			if err != nil {
+				log.Printf("lfs quota: %s: pre-publish refresh failed: %v", repoID, err)
+				lfsError(w, http.StatusInternalServerError, "storage quota check failed")
+				return
+			}
+			if !dec.FloorStale {
+				break
+			}
+			// The ledger's transactional generation recheck rejected the
+			// floor (Codex round 60): a restore, adoption, or
+			// retained-bytes debit moved it between the serve-time check
+			// and the reserve. Invalidate and re-derive once; a second
+			// rejection fails closed (the client retries the PUT).
+			s.invalidateUsageFloor(repoID)
+			if attempt >= 1 {
+				log.Printf("lfs quota: %s: usage floor went stale during admission twice", repoID)
+				lfsError(w, http.StatusInternalServerError, "storage quota check failed")
+				return
+			}
 		}
 		if dec.KeyCapExceeded {
 			w.Header().Set("Retry-After", "10")
@@ -1441,7 +1458,7 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target r
 		rsvCtx, rsvCancel := context.WithTimeout(ctx, UsageFloorHandoffMargin)
 		dec, err := s.Store.ReservePackBytes(rsvCtx, blob.QuotaRepoGroup(repoID),
 			[]ref.Pack{{Key: key + lfsRepairCoverSuffix, Size: n}}, ref.NewReservationOwner(),
-			0, math.MaxInt64, s.lfsReservationTTL())
+			0, ref.ReserveNoFloorGen, math.MaxInt64, s.lfsReservationTTL())
 		rsvCancel()
 		if err != nil {
 			log.Printf("lfs repair cover %s: %v", key, err)

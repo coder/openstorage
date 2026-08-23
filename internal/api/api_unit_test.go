@@ -32,12 +32,12 @@ func discardLogger() *slog.Logger {
 // listing happened (blob.StorageUsageBytes asserts on nil).
 func TestUsageFloorPrefersInjectedHook(t *testing.T) {
 	var gotRepo string
-	s := &server{usageFloorFn: func(_ context.Context, repo string) (int64, error) {
+	s := &server{usageFloorFn: func(_ context.Context, repo string) (int64, int64, error) {
 		gotRepo = repo
-		return 4321, nil
+		return 4321, 7, nil
 	}}
-	floor, err := s.usageFloor(context.Background(), "repo_x")
-	if err != nil || floor != 4321 || gotRepo != "repo_x" {
+	floor, gen, err := s.usageFloor(context.Background(), "repo_x")
+	if err != nil || floor != 4321 || gen != 7 || gotRepo != "repo_x" {
 		t.Fatalf("usageFloor = (%d, %v) for %q, want (4321, nil) for repo_x", floor, err, gotRepo)
 	}
 }
@@ -85,7 +85,7 @@ func TestPublishPack_CanceledUploadStillRetiresReservation(t *testing.T) {
 		logger:             discardLogger(),
 		packQuotaBytes:     1 << 20,
 		packReservationTTL: time.Hour,
-		usageFloorFn:       func(context.Context, string) (int64, error) { return 0, nil },
+		usageFloorFn:       func(context.Context, string) (int64, int64, error) { return 0, ref.ReserveNoFloorGen, nil },
 	}
 	if err := s.publishPack(ctx, "repo_c", "abcd", packPath); err == nil {
 		t.Fatal("canceled publishPack reported success")

@@ -190,7 +190,7 @@ func TestSweep_PrunesExpiredReservations(t *testing.T) {
 	const repo = "r1"
 	dec, err := f.store.ReservePackBytes(ctx, []string{repo},
 		[]ref.Pack{{ID: "aa1", Key: blob.PackKey(repo, "aa1"), Size: 10}},
-		"crashed-push", 0, 1000, time.Hour)
+		"crashed-push", 0, ref.ReserveNoFloorGen, 1000, time.Hour)
 	if err != nil || !dec.OK {
 		t.Fatalf("ReservePackBytes = %+v, %v", dec, err)
 	}

@@ -155,9 +155,9 @@ func cmdServe(ctx context.Context, args []string) error {
 	// verifier the git server needs), and gitSrv is assigned strictly
 	// before the listener serves any request.
 	var gitSrv *githttp.Server
-	usageFloor := func(ctx context.Context, repo string) (int64, error) {
+	usageFloor := func(ctx context.Context, repo string) (int64, int64, error) {
 		assertf(gitSrv != nil, "usageFloor called before the git server was wired")
-		return gitSrv.CachedUsageFloor(ctx, repo)
+		return gitSrv.CachedUsageFloorGen(ctx, repo)
 	}
 	apiHandler, metaStore, verifier, maybeRepack, cleanup, err := buildAPIHandler(ctx, cfg.dbURL, cfg.org, httpBaseURL, loopbackBaseURL, orgPEMBlocks, st, bl, cfg.cacheDir,
 		api.RateLimitConfig{RPS: cfg.rateRPS, Burst: cfg.rateBurst, TrustedProxies: cfg.trustedProxies}, cfg.packQuotaBytes, cfg.packReservationTTL, cfg.sweep, cfg.repackThreshold, cfg.webhookAllowPrivate, cfg.secretsCodec, usageFloor)

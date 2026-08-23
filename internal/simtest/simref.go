@@ -146,16 +146,16 @@ func (s *SimRefStore) HasPack(ctx context.Context, repo, key string) (bool, erro
 // ambiguous fault runs the admission (a reservation row may really be
 // inserted — the leaked-reservation class TTL expiry and the sweeper
 // reclaim) and then loses the outcome.
-func (s *SimRefStore) ReservePackBytes(ctx context.Context, group []string, packs []ref.Pack, owner string, usageFloor, quotaBytes int64, ttl time.Duration) (ref.ReserveDecision, error) {
+func (s *SimRefStore) ReservePackBytes(ctx context.Context, group []string, packs []ref.Pack, owner string, usageFloor, floorGen, quotaBytes int64, ttl time.Duration) (ref.ReserveDecision, error) {
 	switch class := s.inj.begin(OpRefReservePacks); class {
 	case FaultClean:
 		return ref.ReserveDecision{}, cleanFaultError{op: OpRefReservePacks}
 	case FaultAmbiguous:
-		dec, err := s.inner.ReservePackBytes(ctx, group, packs, owner, usageFloor, quotaBytes, ttl)
+		dec, err := s.inner.ReservePackBytes(ctx, group, packs, owner, usageFloor, floorGen, quotaBytes, ttl)
 		s.inj.noteInnerOutcome(OpRefReservePacks, fmt.Sprintf("ok=%v err=%v", dec.OK, err))
 		return ref.ReserveDecision{}, ambiguousFaultError{op: OpRefReservePacks}
 	case FaultNone:
-		return s.inner.ReservePackBytes(ctx, group, packs, owner, usageFloor, quotaBytes, ttl)
+		return s.inner.ReservePackBytes(ctx, group, packs, owner, usageFloor, floorGen, quotaBytes, ttl)
 	default:
 		panic(fmt.Sprintf("simtest: fault class %v invalid for %s", class, OpRefReservePacks))
 	}

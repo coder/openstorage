@@ -116,7 +116,10 @@ type RefStore interface {
 	// the per-repo pack-bytes quota (issue #29), inserting one durable
 	// reservation row per pack key on success. See ledger.go for the
 	// admission formula and serialization discipline.
-	ReservePackBytes(ctx context.Context, group []string, packs []Pack, owner string, usageFloor, quotaBytes int64, ttl time.Duration) (ReserveDecision, error)
+	// The floorGen argument is the shared floor generation the caller's
+	// usageFloor was validated against (ReserveNoFloorGen skips the
+	// transactional recheck — cover reservations only, Codex round 60).
+	ReservePackBytes(ctx context.Context, group []string, packs []Pack, owner string, usageFloor, floorGen, quotaBytes int64, ttl time.Duration) (ReserveDecision, error)
 	// QuotaLedgerState reads one accounting group's quota ledger in one
 	// snapshot (usage counter sum, active reservations, retained bytes).
 	// The LFS batch surface reads it for its ADVISORY fast-fail admission

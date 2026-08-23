@@ -32,7 +32,13 @@ func (k *ledgerKit) base() string { return k.group[0] }
 
 func (k *ledgerKit) reserve(packs []Pack, owner string, floor, quota int64) ReserveDecision {
 	k.t.Helper()
-	dec, err := k.s.ReservePackBytes(context.Background(), k.group, packs, owner, floor, quota, ledgerTTL)
+	// Synthetic test floors carry the CURRENT generation: the recheck
+	// (Codex round 60) must pass except where a test moves it on purpose.
+	gen, err := k.s.LFSAdoptionGen(context.Background(), k.base())
+	if err != nil {
+		k.t.Fatalf("LFSAdoptionGen: %v", err)
+	}
+	dec, err := k.s.ReservePackBytes(context.Background(), k.group, packs, owner, floor, gen, quota, ledgerTTL)
 	if err != nil {
 		k.t.Fatalf("ReservePackBytes: %v", err)
 	}
@@ -117,7 +123,7 @@ func TestReserveConcurrentRace(t *testing.T) {
 			go func() {
 				defer wg.Done()
 				dec, err := s.ReservePackBytes(context.Background(), k.group,
-					[]Pack{packs[i]}, fmt.Sprintf("owner-%d", i), 0, quota, ledgerTTL)
+					[]Pack{packs[i]}, fmt.Sprintf("owner-%d", i), 0, ReserveNoFloorGen, quota, ledgerTTL)
 				if err != nil {
 					t.Errorf("ReservePackBytes: %v", err)
 					return
@@ -563,7 +569,7 @@ func TestReservePrunesExpiredPhysicalRows(t *testing.T) {
 		}
 
 		ttl := 100 * time.Millisecond
-		if dec, err := s.ReservePackBytes(ctx, k.group, []Pack{k.pack(k.base(), "aa1", 10)}, "o1", 0, 1000, ttl); err != nil || !dec.OK {
+		if dec, err := s.ReservePackBytes(ctx, k.group, []Pack{k.pack(k.base(), "aa1", 10)}, "o1", 0, ReserveNoFloorGen, 1000, ttl); err != nil || !dec.OK {
 			t.Fatalf("reserve: %+v, %v", dec, err)
 		}
 		if got := countRows(); got != 1 {
@@ -571,7 +577,7 @@ func TestReservePrunesExpiredPhysicalRows(t *testing.T) {
 		}
 		time.Sleep(2 * ttl)
 		// The next admission prunes the expired row in its own transaction.
-		if dec, err := s.ReservePackBytes(ctx, k.group, []Pack{k.pack(k.base(), "bb2", 10)}, "o2", 0, 1000, ttl); err != nil || !dec.OK {
+		if dec, err := s.ReservePackBytes(ctx, k.group, []Pack{k.pack(k.base(), "bb2", 10)}, "o2", 0, ReserveNoFloorGen, 1000, ttl); err != nil || !dec.OK {
 			t.Fatalf("reserve after expiry: %+v, %v", dec, err)
 		}
 		if got := countRows(); got != 1 {
@@ -590,16 +596,16 @@ func TestReservationExpiryAndSweep(t *testing.T) {
 		const quota = 100
 		leak := k.pack(k.base(), "aa1", 60)
 		ttl := time.Second // generous: the pre-expiry check below must run within it
-		if dec, err := s.ReservePackBytes(ctx, k.group, []Pack{leak}, "crashed", 0, quota, ttl); err != nil || !dec.OK {
+		if dec, err := s.ReservePackBytes(ctx, k.group, []Pack{leak}, "crashed", 0, ReserveNoFloorGen, quota, ttl); err != nil || !dec.OK {
 			t.Fatalf("reserve: %+v, %v", dec, err)
 		}
 		// While live, the leak gates admission.
-		if dec, err := s.ReservePackBytes(ctx, k.group, []Pack{k.pack(k.base(), "bb2", 60)}, "live", 0, quota, ttl); err != nil || dec.OK {
+		if dec, err := s.ReservePackBytes(ctx, k.group, []Pack{k.pack(k.base(), "bb2", 60)}, "live", 0, ReserveNoFloorGen, quota, ttl); err != nil || dec.OK {
 			t.Fatalf("reserve during leak = %+v, %v; want denial", dec, err)
 		}
 		time.Sleep(2 * ttl)
 		// Expired: ignored by admission even before any sweep runs.
-		if dec, err := s.ReservePackBytes(ctx, k.group, []Pack{k.pack(k.base(), "cc3", 60)}, "live", 0, quota, ttl); err != nil || !dec.OK {
+		if dec, err := s.ReservePackBytes(ctx, k.group, []Pack{k.pack(k.base(), "cc3", 60)}, "live", 0, ReserveNoFloorGen, quota, ttl); err != nil || !dec.OK {
 			t.Fatalf("reserve after expiry = %+v, %v; want admission", dec, err)
 		}
 		// The TTL-scoped sweep is now a second line of defense: admission
@@ -615,6 +621,47 @@ func TestReservationExpiryAndSweep(t *testing.T) {
 			t.Fatalf("sweep all = %d, %v; want >= 1", n, err)
 		}
 		k.wantState(0, 0, 0)
+	})
+}
+
+// TestReserveRejectsStaleFloorGen (Codex round 60, security): the
+// admission's floor is validated against the shared floor generation
+// OUTSIDE the reserve transaction — a restore, adoption, or
+// retained-bytes debit can move it between that check and the reserve,
+// and the already-returned integer floor then hides bytes no post-hoc
+// invalidation can reach. ReservePackBytes must recheck the generation
+// TRANSACTIONALLY: a moved generation denies with FloorStale, a matching
+// one admits, and cover reservations (ReserveNoFloorGen) skip the check.
+func TestReserveRejectsStaleFloorGen(t *testing.T) {
+	runRefBackends(t, func(t *testing.T, s Store) {
+		ctx := context.Background()
+		k := newLedgerKit(t, s)
+		gen0, err := s.LFSAdoptionGen(ctx, k.base())
+		if err != nil {
+			t.Fatal(err)
+		}
+		// The generation moves after the caller validated its floor.
+		if err := s.BumpLFSAdoptionGen(ctx, k.base()); err != nil {
+			t.Fatal(err)
+		}
+		dec, err := s.ReservePackBytes(ctx, k.group, []Pack{k.pack(k.base(), "aa1", 10)},
+			"o1", 0, gen0, 1000, ledgerTTL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if dec.OK || !dec.FloorStale {
+			t.Fatalf("stale-gen reserve = %+v, want FloorStale denial", dec)
+		}
+		// A floor validated against the CURRENT generation admits.
+		gen1, err := s.LFSAdoptionGen(ctx, k.base())
+		if err != nil {
+			t.Fatal(err)
+		}
+		dec, err = s.ReservePackBytes(ctx, k.group, []Pack{k.pack(k.base(), "aa1", 10)},
+			"o1", 0, gen1, 1000, ledgerTTL)
+		if err != nil || !dec.OK || dec.FloorStale {
+			t.Fatalf("fresh-gen reserve = %+v, %v, want admission", dec, err)
+		}
 	})
 }
 

@@ -69,10 +69,6 @@ func (s *server) publishPack(ctx context.Context, repoID, packID, packPath strin
 			// overshoot and is consumed by RegisterPacks below. Failed
 			// uploads and crashes alike leave an expiring row the sweeper
 			// prunes (settle-or-TTL, Codex round 22).
-			floor, err := s.usageFloor(ctx, repoID)
-			if err != nil {
-				return fmt.Errorf("pack quota usage: %w", err)
-			}
 			owner := ref.NewReservationOwner()
 			ttl := s.packReservationTTL
 			if ttl <= 0 {
@@ -82,15 +78,31 @@ func (s *server) publishPack(ctx context.Context, repoID, packID, packPath strin
 				// enforcement must never silently weaken.
 				ttl = time.Hour
 			}
-			// Deadline-bounded by the handoff margin (Codex round 42 on
-			// #51) — see the LFS PUT twin: the floor's orphan cover must
-			// outlive the admission snapshot.
-			rsvCtx, rsvCancel := context.WithTimeout(ctx, githttp.UsageFloorHandoffMargin)
-			dec, err := s.refStore.ReservePackBytes(rsvCtx, blob.QuotaRepoGroup(repoID),
-				[]ref.Pack{pack}, owner, floor, s.packQuotaBytes, ttl)
-			rsvCancel()
-			if err != nil {
-				return fmt.Errorf("reserve pack bytes: %w", err)
+			var dec ref.ReserveDecision
+			for attempt := 0; ; attempt++ {
+				floor, floorGen, err := s.usageFloor(ctx, repoID)
+				if err != nil {
+					return fmt.Errorf("pack quota usage: %w", err)
+				}
+				// Deadline-bounded by the handoff margin (Codex round 42 on
+				// #51) — see the LFS PUT twin: the floor's orphan cover must
+				// outlive the admission snapshot.
+				rsvCtx, rsvCancel := context.WithTimeout(ctx, githttp.UsageFloorHandoffMargin)
+				dec, err = s.refStore.ReservePackBytes(rsvCtx, blob.QuotaRepoGroup(repoID),
+					[]ref.Pack{pack}, owner, floor, floorGen, s.packQuotaBytes, ttl)
+				rsvCancel()
+				if err != nil {
+					return fmt.Errorf("reserve pack bytes: %w", err)
+				}
+				if !dec.FloorStale {
+					break
+				}
+				// The ledger's transactional generation recheck rejected
+				// the floor (Codex round 60): re-derive once, then fail
+				// closed (the client retries).
+				if attempt >= 1 {
+					return fmt.Errorf("usage floor went stale during admission twice, retry")
+				}
 			}
 			if dec.KeyCapExceeded {
 				// Transient row-cap denial, not a quota breach (Codex

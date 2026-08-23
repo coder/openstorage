@@ -157,6 +157,13 @@ func reservKeySpellings(keys ...string) []string {
 	return out
 }
 
+// ReserveNoFloorGen skips ReservePackBytes' transactional floor-generation
+// recheck (Codex round 60). Legitimate only where the reservation is not a
+// floor-based admission: restore covers (unbounded quota — the floor input
+// is a constant 0) and quota-disabled maintenance paths. Every real
+// admission must pass the generation its floor was validated against.
+const ReserveNoFloorGen int64 = -1
+
 // RepairCoverSuffix distinguishes a restore's cover reservation key from
 // the restored blob's settle key (Codex rounds 57+58): settlement consumes
 // the blob key's own spellings, and the cover must instead outlive the
@@ -181,7 +188,7 @@ func ReserveRestoreCover(ctx context.Context, st RestoreCoverStore, group []stri
 	assertf(size > 0, "ReserveRestoreCover(%q): size %d", key, size)
 	dec, err := st.ReservePackBytes(ctx, group,
 		[]Pack{{Key: key + RepairCoverSuffix, Size: size}}, NewReservationOwner(),
-		0, math.MaxInt64, ttl)
+		0, ReserveNoFloorGen, math.MaxInt64, ttl)
 	if err != nil {
 		return err
 	}
@@ -201,7 +208,7 @@ func ReserveRestoreCover(ctx context.Context, st RestoreCoverStore, group []stri
 // and the sweeper's narrow PackRegistry — can share the one cover
 // implementation.
 type RestoreCoverStore interface {
-	ReservePackBytes(ctx context.Context, group []string, packs []Pack, owner string, usageFloor, quotaBytes int64, ttl time.Duration) (ReserveDecision, error)
+	ReservePackBytes(ctx context.Context, group []string, packs []Pack, owner string, usageFloor, floorGen, quotaBytes int64, ttl time.Duration) (ReserveDecision, error)
 }
 
 // ReserveDecision reports one admission decision. UsedBytes and
@@ -210,6 +217,16 @@ type RestoreCoverStore interface {
 type ReserveDecision struct {
 	// OK reports whether the reservation was admitted and inserted.
 	OK bool
+	// FloorStale denies because the caller's usage floor was validated
+	// against a shared floor generation that moved before this
+	// transaction (Codex round 60, security): a restore, adoption, or
+	// retained-bytes debit changed what the floor measures between the
+	// caller's generation check and this reserve — the classic
+	// check-then-act window no post-hoc invalidation can reach. The
+	// caller must re-derive a fresh floor (with its generation) and
+	// retry; admitting against the stale integer could durably exceed
+	// quota.
+	FloorStale bool
 	// UsedBytes is the usage the decision charged: the max of the ledger
 	// counter and the caller's listing floor.
 	UsedBytes int64
@@ -271,7 +288,7 @@ const reserveLockClass = int32(0x504B5152)
 // namespaces. packs carry the incoming (unpublished) blobs: distinct keys,
 // positive sizes — an already-published key must not be re-reserved (it
 // contributes zero growth and is dedup-skipped by the caller).
-func validateReserve(group []string, packs []Pack, owner string, usageFloor, quotaBytes int64, ttl time.Duration) {
+func validateReserve(group []string, packs []Pack, owner string, usageFloor, floorGen, quotaBytes int64, ttl time.Duration) {
 	assertf(len(group) > 0 && group[0] != "", "ReservePackBytes: empty repo group")
 	for _, r := range group[1:] {
 		assertf(strings.HasPrefix(r, group[0]), "ReservePackBytes: group member %q not a namespace of base %q", r, group[0])
@@ -285,6 +302,7 @@ func validateReserve(group []string, packs []Pack, owner string, usageFloor, quo
 	}
 	assertf(owner != "", "ReservePackBytes: empty owner")
 	assertf(usageFloor >= 0, "ReservePackBytes: negative usage floor %d", usageFloor)
+	assertf(floorGen >= ReserveNoFloorGen, "ReservePackBytes: invalid floor generation %d", floorGen)
 	assertf(quotaBytes > 0, "ReservePackBytes: non-positive quota %d (0 disables the quota at the caller)", quotaBytes)
 	assertf(ttl > 0, "ReservePackBytes: non-positive ttl %v", ttl)
 }
@@ -348,8 +366,8 @@ func AddSat(a, b int64) int64 { return addSat(a, b) }
 
 // ReservePackBytes implements the admission check documented atop this file
 // on Postgres.
-func (s *PG) ReservePackBytes(ctx context.Context, group []string, packs []Pack, owner string, usageFloor, quotaBytes int64, ttl time.Duration) (ReserveDecision, error) {
-	validateReserve(group, packs, owner, usageFloor, quotaBytes, ttl)
+func (s *PG) ReservePackBytes(ctx context.Context, group []string, packs []Pack, owner string, usageFloor, floorGen, quotaBytes int64, ttl time.Duration) (ReserveDecision, error) {
+	validateReserve(group, packs, owner, usageFloor, floorGen, quotaBytes, ttl)
 	keys := make([]string, len(packs))
 	for i, p := range packs {
 		keys[i] = p.Key
@@ -400,6 +418,26 @@ SELECT
 		// counter. max() hid them whenever uncounted bytes coexisted
 		// with fresh settlements.
 		dec = ReserveDecision{UsedBytes: addSat(counter, usageFloor), ReservedBytes: reserved}
+		// Transactional floor-generation recheck (Codex round 60,
+		// security): the caller validated its floor against a generation
+		// OUTSIDE this transaction, and a restore, adoption, or
+		// retained-bytes debit may have moved it since — the floor
+		// integer then hides bytes no post-hoc bump can protect. A moved
+		// generation denies with FloorStale; the caller re-derives a
+		// fresh floor and retries. Read under the same per-base
+		// serialization lock as the snapshot above.
+		if floorGen >= 0 {
+			var gen int64
+			if err := tx.QueryRow(ctx,
+				`SELECT COALESCE((SELECT gen FROM lfs_adoption_gens WHERE repo = $1), 0)`,
+				group[0]).Scan(&gen); err != nil {
+				return err
+			}
+			if gen != floorGen {
+				dec.FloorStale = true
+				return nil // denied; dec.OK stays false
+			}
+		}
 		if activeRows+int64(len(packs)) > int64(maxActiveReservations) {
 			dec.KeyCapExceeded = true
 			return nil // denied; dec.OK stays false

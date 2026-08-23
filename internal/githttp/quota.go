@@ -446,17 +446,17 @@ func acquireHookFloorScanSlot(ctx context.Context) (unlock func(), err error) {
 // slot-gated across processes and deadline-bounded by the freshness
 // window (Codex rounds 46+47); one retry covers a transient stall, then
 // the push fails closed.
-func hookSelfListFloor(ctx context.Context, bl blob.BlobStore, st ref.Store, repo string) (int64, error) {
+func hookSelfListFloor(ctx context.Context, bl blob.BlobStore, st ref.Store, repo string) (int64, int64, error) {
 	assertf(st != nil, "hookSelfListFloor: nil ref store")
 	var lastErr error
 	for attempt := 0; attempt < 2 && ctx.Err() == nil; attempt++ {
-		floor, err := hookFloorScanOnce(ctx, bl, st, repo)
+		floor, gen, err := hookFloorScanOnce(ctx, bl, st, repo)
 		if err == nil {
-			return floor, nil
+			return floor, gen, nil
 		}
 		lastErr = err
 	}
-	return 0, fmt.Errorf("usage floor for %s: %w", repo, lastErr)
+	return 0, 0, fmt.Errorf("usage floor for %s: %w", repo, lastErr)
 }
 
 // hookFloorScanOnce runs one slot-gated, deadline-bounded floor scan. The
@@ -464,40 +464,40 @@ func hookSelfListFloor(ctx context.Context, bl blob.BlobStore, st ref.Store, rep
 // adoption or sweeper restore committing between the counter read and the
 // listing would skew the subtraction, so a generation moving during the
 // scan rejects the attempt (the caller retries once, then fails closed).
-func hookFloorScanOnce(ctx context.Context, bl blob.BlobStore, st ref.Store, repo string) (int64, error) {
+func hookFloorScanOnce(ctx context.Context, bl blob.BlobStore, st ref.Store, repo string) (int64, int64, error) {
 	actx, cancel := context.WithTimeout(ctx, hookFloorFreshness)
 	defer cancel()
 	unlock, err := acquireHookFloorScanSlot(actx)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	defer unlock()
 	scanStart := time.Now()
 	genBefore, err := st.LFSAdoptionGen(actx, BaseRepo(repo))
 	if err != nil {
-		return 0, fmt.Errorf("floor gen read: %w", err)
+		return 0, 0, fmt.Errorf("floor gen read: %w", err)
 	}
 	ls, err := st.QuotaLedgerState(actx, blob.QuotaRepoGroup(repo), time.Hour)
 	if err != nil {
-		return 0, fmt.Errorf("usage counter read: %w", err)
+		return 0, 0, fmt.Errorf("usage counter read: %w", err)
 	}
 	listing, err := packUsageBytes(actx, bl, repo)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	genAfter, err := st.LFSAdoptionGen(actx, BaseRepo(repo))
 	if err != nil {
-		return 0, fmt.Errorf("floor gen read: %w", err)
+		return 0, 0, fmt.Errorf("floor gen read: %w", err)
 	}
 	if genAfter != genBefore {
-		return 0, fmt.Errorf("floor generation moved during the scan (adoption or restore)")
+		return 0, 0, fmt.Errorf("floor generation moved during the scan (adoption or restore)")
 	}
 	// Defensive backstop: the deadline above should preempt any scan
 	// this check would reject.
 	if time.Since(scanStart) > hookFloorFreshness {
-		return 0, fmt.Errorf("listing outlived its %v freshness window", hookFloorFreshness)
+		return 0, 0, fmt.Errorf("listing outlived its %v freshness window", hookFloorFreshness)
 	}
-	return max(0, listing-ls.UsageBytes), nil
+	return max(0, listing-ls.UsageBytes), genBefore, nil
 }
 
 // hookUsageFloor resolves the pre-receive admission floor — the
@@ -514,7 +514,7 @@ func hookFloorScanOnce(ctx context.Context, bl blob.BlobStore, st ref.Store, rep
 // Malformed values fail closed like a malformed EnvPackQuota: the env
 // comes from our own server, so nonsense means misconfiguration, not
 // client input.
-func hookUsageFloor(ctx context.Context, bl blob.BlobStore, st ref.Store, repo string) (int64, error) {
+func hookUsageFloor(ctx context.Context, bl blob.BlobStore, st ref.Store, repo string) (int64, int64, error) {
 	raw, ok := os.LookupEnv(EnvUsageFloor)
 	if !ok {
 		return hookSelfListFloor(ctx, bl, st, repo)
@@ -522,7 +522,7 @@ func hookUsageFloor(ctx context.Context, bl blob.BlobStore, st ref.Store, repo s
 	val, rest, found := strings.Cut(raw, ":")
 	if !found {
 		if _, err := strconv.ParseInt(raw, 10, 64); err != nil {
-			return 0, fmt.Errorf("malformed %s=%q", EnvUsageFloor, raw)
+			return 0, 0, fmt.Errorf("malformed %s=%q", EnvUsageFloor, raw)
 		}
 		return hookSelfListFloor(ctx, bl, st, repo) // timestampless legacy floor: no age evidence
 	}
@@ -530,7 +530,7 @@ func hookUsageFloor(ctx context.Context, bl blob.BlobStore, st ref.Store, repo s
 	floor, ferr := strconv.ParseInt(val, 10, 64)
 	mintUnix, merr := strconv.ParseInt(mint, 10, 64)
 	if ferr != nil || merr != nil || floor < 0 {
-		return 0, fmt.Errorf("malformed %s=%q", EnvUsageFloor, raw)
+		return 0, 0, fmt.Errorf("malformed %s=%q", EnvUsageFloor, raw)
 	}
 	if !hasGen {
 		// A serve binary predating the adoption generation (Codex round
@@ -540,11 +540,11 @@ func hookUsageFloor(ctx context.Context, bl blob.BlobStore, st ref.Store, repo s
 	}
 	mintGen, gerr := strconv.ParseInt(genStr, 10, 64)
 	if gerr != nil || mintGen < 0 {
-		return 0, fmt.Errorf("malformed %s=%q", EnvUsageFloor, raw)
+		return 0, 0, fmt.Errorf("malformed %s=%q", EnvUsageFloor, raw)
 	}
 	ttl, err := reservationTTL()
 	if err != nil {
-		return 0, err // fail closed, matching the reserve path's own use
+		return 0, 0, err // fail closed, matching the reserve path's own use
 	}
 	// The trusted age leaves the handoff margin too (Codex round 42): the
 	// hook's own reserve call runs after this floor resolves, and an
@@ -571,14 +571,14 @@ func hookUsageFloor(ctx context.Context, bl blob.BlobStore, st ref.Store, repo s
 		// window is consumed — self-list like every other
 		// untrustworthy-floor case. Other failures stay closed.
 		if !errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
-			return 0, fmt.Errorf("floor gen read: %w", err)
+			return 0, 0, fmt.Errorf("floor gen read: %w", err)
 		}
 		return hookSelfListFloor(ctx, bl, st, repo)
 	}
 	if live != mintGen || time.Since(time.Unix(mintUnix, 0)) > maxAge {
 		return hookSelfListFloor(ctx, bl, st, repo)
 	}
-	return floor, nil
+	return floor, mintGen, nil
 }
 
 // CachedUsageFloor returns repo's UNCOUNTED-bytes admission floor — the
@@ -604,6 +604,13 @@ func hookUsageFloor(ctx context.Context, bl blob.BlobStore, st ref.Store, repo s
 func (s *Server) CachedUsageFloor(ctx context.Context, repo string) (int64, error) {
 	floor, _, err := s.cachedUsageFloorGen(ctx, repo)
 	return floor, err
+}
+
+// CachedUsageFloorGen is CachedUsageFloor plus the shared floor generation
+// the served value was validated against — the token admission callers
+// forward into ReservePackBytes' transactional recheck (Codex round 60).
+func (s *Server) CachedUsageFloorGen(ctx context.Context, repo string) (int64, int64, error) {
+	return s.cachedUsageFloorGen(ctx, repo)
 }
 
 // cachedUsageFloorGen returns the floor plus the shared adoption

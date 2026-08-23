@@ -326,7 +326,7 @@ func TestHookSelfListFloorRejectsSlowScans(t *testing.T) {
 	t.Run("retry-covers-a-transient-stall", func(t *testing.T) {
 		bl := &slowListBlob{BlobStore: openTestBlob(t), delay: 100 * time.Millisecond, limit: 1}
 		seedPack(t, bl.BlobStore, "repo_slowhook", "aaaa", 25)
-		got, err := hookSelfListFloor(context.Background(), bl, openTestRefStore(t), "repo_slowhook")
+		got, _, err := hookSelfListFloor(context.Background(), bl, openTestRefStore(t), "repo_slowhook")
 		if err != nil || got != 25 {
 			t.Fatalf("floor after one slow scan = (%d, %v), want (25, nil) via retry", got, err)
 		}
@@ -334,7 +334,7 @@ func TestHookSelfListFloorRejectsSlowScans(t *testing.T) {
 
 	t.Run("persistently-slow-fails-closed", func(t *testing.T) {
 		bl := &slowListBlob{BlobStore: openTestBlob(t), delay: 100 * time.Millisecond, limit: 1 << 30}
-		if got, err := hookSelfListFloor(context.Background(), bl, openTestRefStore(t), "repo_alwaysslow"); err == nil {
+		if got, _, err := hookSelfListFloor(context.Background(), bl, openTestRefStore(t), "repo_alwaysslow"); err == nil {
 			t.Fatalf("persistently slow self-list served floor %d, want fail-closed error", got)
 		}
 	})
@@ -588,7 +588,7 @@ func TestHookSelfListFloorDetectsMidScanAdoption(t *testing.T) {
 	// Attempt 1: counter read 0, adoption fires inside the listing
 	// (listing 30, counter now 30) — the bracketing rejects it. Attempt
 	// 2: counter 30, listing 30 → floor 0.
-	got, err := hookSelfListFloor(ctx, adopting, st, "repo_midscan")
+	got, _, err := hookSelfListFloor(ctx, adopting, st, "repo_midscan")
 	if err != nil || got != 0 {
 		t.Fatalf("mid-scan-adoption self-list floor = (%d, %v), want (0, nil) via retry", got, err)
 	}
@@ -669,7 +669,7 @@ func TestHookFloorScansAreSlotBoundedAcrossProcesses(t *testing.T) {
 
 	cb := &countingBlob{BlobStore: openTestBlob(t)}
 	st := openTestRefStore(t)
-	if _, err := hookSelfListFloor(context.Background(), cb, st, "repo_slots"); err == nil {
+	if _, _, err := hookSelfListFloor(context.Background(), cb, st, "repo_slots"); err == nil {
 		t.Fatal("slot-starved floor scan did not fail closed")
 	}
 	if got := cb.lists.Load(); got != 0 {
@@ -678,7 +678,7 @@ func TestHookFloorScansAreSlotBoundedAcrossProcesses(t *testing.T) {
 
 	// Freeing one slot lets the scan through.
 	unlocks[0]()
-	if floor, err := hookSelfListFloor(context.Background(), cb, st, "repo_slots"); err != nil || floor != 0 {
+	if floor, _, err := hookSelfListFloor(context.Background(), cb, st, "repo_slots"); err != nil || floor != 0 {
 		t.Fatalf("post-release floor = (%d, %v), want (0, nil)", floor, err)
 	}
 	for _, u := range unlocks[1:] {
@@ -915,7 +915,7 @@ func TestHookUsageFloor(t *testing.T) {
 	now := time.Now().Unix()
 	t.Run("fresh-floor-used-without-listing", func(t *testing.T) {
 		t.Setenv(EnvUsageFloor, fmt.Sprintf("1234:%d:0", now))
-		got, err := hookUsageFloor(context.Background(), nil, openTestRefStore(t), "repo_a")
+		got, _, err := hookUsageFloor(context.Background(), nil, openTestRefStore(t), "repo_a")
 		if err != nil || got != 1234 {
 			t.Fatalf("hookUsageFloor = (%d, %v), want (1234, nil)", got, err)
 		}
@@ -931,7 +931,7 @@ func TestHookUsageFloor(t *testing.T) {
 		t.Setenv(EnvUsageFloor, fmt.Sprintf("1234:%d:0", now))
 		bl := openTestBlob(t)
 		seedPack(t, bl, "repo_a", "1111", 100)
-		got, err := hookUsageFloor(context.Background(), bl, st, "repo_a")
+		got, _, err := hookUsageFloor(context.Background(), bl, st, "repo_a")
 		if err != nil || got != 100 {
 			t.Fatalf("stale-gen floor = (%d, %v), want (100, nil) — must self-list", got, err)
 		}
@@ -946,14 +946,14 @@ func TestHookUsageFloor(t *testing.T) {
 		t.Setenv(EnvUsageFloor, fmt.Sprintf("1234:%d:0", time.Now().Add(-29200*time.Millisecond).Unix()))
 		bl := openTestBlob(t)
 		seedPack(t, bl, "repo_a", "1111", 100)
-		got, err := hookUsageFloor(context.Background(), bl, st, "repo_a")
+		got, _, err := hookUsageFloor(context.Background(), bl, st, "repo_a")
 		if err != nil || got != 100 {
 			t.Fatalf("stalled-gen floor = (%d, %v), want (100, nil) — the consumed age must self-list", got, err)
 		}
 	})
 	t.Run("malformed-gen-fails-closed", func(t *testing.T) {
 		t.Setenv(EnvUsageFloor, fmt.Sprintf("1234:%d:banana", now))
-		if _, err := hookUsageFloor(context.Background(), nil, nil, "repo_a"); err == nil {
+		if _, _, err := hookUsageFloor(context.Background(), nil, nil, "repo_a"); err == nil {
 			t.Fatal("malformed adoption gen did not fail closed")
 		}
 	})
@@ -966,7 +966,7 @@ func TestHookUsageFloor(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Setenv(EnvUsageFloor, raw)
-			if _, err := hookUsageFloor(context.Background(), nil, nil, "repo_a"); err == nil {
+			if _, _, err := hookUsageFloor(context.Background(), nil, nil, "repo_a"); err == nil {
 				t.Fatalf("hookUsageFloor(%s=%q) did not fail closed", EnvUsageFloor, raw)
 			}
 		})
@@ -1020,7 +1020,7 @@ func TestHookUsageFloor(t *testing.T) {
 			bl := openTestBlob(t)
 			seedPack(t, bl, "repo_a", "1111", 100)
 			seedLFS(t, bl, "repo_a", strings.Repeat("aa", 32), 7)
-			got, err := hookUsageFloor(context.Background(), bl, openTestRefStore(t), "repo_a")
+			got, _, err := hookUsageFloor(context.Background(), bl, openTestRefStore(t), "repo_a")
 			if err != nil || got != 107 {
 				t.Fatalf("listing fallback = (%d, %v), want (107, nil) — the untrusted floor must not be used", got, err)
 			}

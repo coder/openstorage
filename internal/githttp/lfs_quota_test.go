@@ -193,7 +193,7 @@ func TestLFSQuota_ReservationTTLExpiryFreesAdmission(t *testing.T) {
 	// followed.
 	if dec, err := st.ReservePackBytes(context.Background(), blob.QuotaRepoGroup(lfsTestRepoID),
 		[]ref.Pack{{Key: blob.LFSKey(lfsTestRepoID, sha256Hex(crashed)), Size: 90}},
-		ref.NewReservationOwner(), 0, 100, ttl); err != nil || !dec.OK {
+		ref.NewReservationOwner(), 0, ref.ReserveNoFloorGen, 100, ttl); err != nil || !dec.OK {
 		t.Fatalf("seed reservation: %+v, %v", dec, err)
 	}
 
@@ -535,6 +535,13 @@ func TestLFSRepair_CoversRepublishedBytesAgainstStaleFloors(t *testing.T) {
 		t.Fatal(err)
 	}
 	staleFloor := int64(0)
+	// The racer validated the shared floor generation BEFORE the repair
+	// (the round-60 transactional recheck also rejects gens that move; the
+	// cover must deny even a racer whose recheck token predates the bump).
+	staleGen, err := st.LFSAdoptionGen(ctx, lfsTestRepoID)
+	if err != nil {
+		t.Fatal(err)
+	}
 	// The repair republishes the counter-accounted bytes (zero-growth).
 	if w := doLFS(t, srv, http.MethodPut, objPath, "basic:"+tok, string(body)); w.Code != http.StatusOK {
 		t.Fatalf("repair PUT status = %d, body %s", w.Code, w.Body)
@@ -545,7 +552,7 @@ func TestLFSRepair_CoversRepublishedBytesAgainstStaleFloors(t *testing.T) {
 	// legacy bytes and the repaired object both occupy storage.
 	dec, err := st.ReservePackBytes(ctx, blob.QuotaRepoGroup(lfsTestRepoID),
 		[]ref.Pack{{Key: "packs/" + lfsTestRepoID + "/racer.pack", Size: 20}},
-		ref.NewReservationOwner(), staleFloor, quota, time.Hour)
+		ref.NewReservationOwner(), staleFloor, staleGen, quota, time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1055,7 +1062,7 @@ func TestLFSQuota_RetryAfterFailedPutNotDoubleCounted(t *testing.T) {
 	oid := sha256Hex(content)
 	key := blob.LFSKey(lfsTestRepoID, oid)
 	dec, err := st.ReservePackBytes(context.Background(), blob.QuotaRepoGroup(lfsTestRepoID),
-		[]ref.Pack{{Key: key, Size: 90}}, ref.NewReservationOwner(), 0, 100, time.Hour)
+		[]ref.Pack{{Key: key, Size: 90}}, ref.NewReservationOwner(), 0, ref.ReserveNoFloorGen, 100, time.Hour)
 	if err != nil || !dec.OK {
 		t.Fatalf("seed failed-PUT reservation: %+v, %v", dec, err)
 	}

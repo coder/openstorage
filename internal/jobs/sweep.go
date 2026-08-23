@@ -70,7 +70,7 @@ type PackRegistry interface {
 	// reservation BEFORE they become physical — an admission already
 	// holding a floor scanned during the absence then sees them in
 	// active_reservations instead of committing into hidden headroom.
-	ReservePackBytes(ctx context.Context, group []string, packs []ref.Pack, owner string, usageFloor, quotaBytes int64, ttl time.Duration) (ref.ReserveDecision, error)
+	ReservePackBytes(ctx context.Context, group []string, packs []ref.Pack, owner string, usageFloor, floorGen, quotaBytes int64, ttl time.Duration) (ref.ReserveDecision, error)
 	// IsRetainedPack classifies (repo, key) as superseded-by-repack: a
 	// blob whose registry row a ReplacePacks fold removed. Provably
 	// DB-absent by that CAS — a narrower, safer deletion class than

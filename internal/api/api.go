@@ -97,7 +97,10 @@ type Config struct {
 	// writers do not re-list the repo's pack and LFS prefixes on every
 	// write (issue #51, Codex round 21 — per-write listings amplify at
 	// the LFS object cap). Nil falls back to a fresh listing per write.
-	UsageFloor func(ctx context.Context, repo string) (int64, error)
+	// Returns the floor plus the shared floor generation it was
+	// validated against (forwarded into ReservePackBytes' transactional
+	// recheck — Codex round 60).
+	UsageFloor func(ctx context.Context, repo string) (int64, int64, error)
 
 	// WebhookAllowPrivate relaxes the webhook SSRF guard's private-range
 	// denial (issue #53) for both the registration-time courtesy check

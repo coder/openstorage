@@ -73,7 +73,7 @@ func TestRepack_RetainedBytesAccountedAndSwept(t *testing.T) {
 	// retained bytes hold the headroom...
 	quota := st.UsageBytes + 10
 	dec, err := f.store.ReservePackBytes(ctx, []string{f.repo},
-		[]ref.Pack{{ID: "drip", Key: blob.PackKey(f.repo, "drip"), Size: 20}}, "drip-writer", 0, quota, time.Hour)
+		[]ref.Pack{{ID: "drip", Key: blob.PackKey(f.repo, "drip"), Size: 20}}, "drip-writer", 0, ref.ReserveNoFloorGen, quota, time.Hour)
 	if err != nil || dec.OK {
 		t.Fatalf("drip reservation = %+v, %v; want denial against retained bytes", dec, err)
 	}
@@ -99,7 +99,7 @@ func TestRepack_RetainedBytesAccountedAndSwept(t *testing.T) {
 		t.Fatalf("post-sweep ledger = %+v, %v; want usage=%d retained=0", st, err, foldSize)
 	}
 	dec, err = f.store.ReservePackBytes(ctx, []string{f.repo},
-		[]ref.Pack{{ID: "drip", Key: blob.PackKey(f.repo, "drip"), Size: 20}}, "drip-writer", 0, quota, time.Hour)
+		[]ref.Pack{{ID: "drip", Key: blob.PackKey(f.repo, "drip"), Size: 20}}, "drip-writer", 0, ref.ReserveNoFloorGen, quota, time.Hour)
 	if err != nil || !dec.OK {
 		t.Fatalf("post-sweep reservation = %+v, %v; want admission", dec, err)
 	}

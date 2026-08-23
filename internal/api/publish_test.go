@@ -21,12 +21,16 @@ import (
 // capBusyRefStore returns a KeyCapExceeded denial from every reserve.
 type capBusyRefStore struct{ ref.RefStore }
 
-func (capBusyRefStore) ReservePackBytes(context.Context, []string, []ref.Pack, string, int64, int64, time.Duration) (ref.ReserveDecision, error) {
+func (capBusyRefStore) ReservePackBytes(context.Context, []string, []ref.Pack, string, int64, int64, int64, time.Duration) (ref.ReserveDecision, error) {
 	return ref.ReserveDecision{KeyCapExceeded: true}, nil
 }
 
 func (capBusyRefStore) QuotaLedgerState(context.Context, []string, time.Duration, ...string) (ref.PackQuotaLedgerState, error) {
 	return ref.PackQuotaLedgerState{}, nil // the uncached floor's counter read
+}
+
+func (capBusyRefStore) LFSAdoptionGen(context.Context, string) (int64, error) {
+	return 0, nil // the uncached floor's generation read (Codex round 60)
 }
 
 // TestUsageFloorFallbackSubtractsCounter (Codex round 45): the uncached
@@ -70,8 +74,8 @@ func TestUsageFloorFallbackSubtractsCounter(t *testing.T) {
 	}
 
 	s := &server{refStore: st, blobStore: bl}
-	if floor, err := s.usageFloor(ctx, "repo_fb"); err != nil || floor != 10 {
-		t.Fatalf("fallback floor = (%d, %v), want (10, nil) — registered bytes must not double-charge", floor, err)
+	if floor, gen, err := s.usageFloor(ctx, "repo_fb"); err != nil || floor != 10 || gen != 0 {
+		t.Fatalf("fallback floor = (%d, gen %d, %v), want (10, 0, nil) — registered bytes must not double-charge", floor, gen, err)
 	}
 }
 

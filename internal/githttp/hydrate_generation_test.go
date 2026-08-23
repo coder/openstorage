@@ -57,7 +57,7 @@ func (s *countingStore) ReplacePacks(context.Context, string, []ref.Pack, ref.Pa
 	panic("Hydrate must never replace packs")
 }
 
-func (s *countingStore) ReservePackBytes(context.Context, []string, []ref.Pack, string, int64, int64, time.Duration) (ref.ReserveDecision, error) {
+func (s *countingStore) ReservePackBytes(context.Context, []string, []ref.Pack, string, int64, int64, int64, time.Duration) (ref.ReserveDecision, error) {
 	panic("Hydrate must never reserve pack bytes")
 }
 
