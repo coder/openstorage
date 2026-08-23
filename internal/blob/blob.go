@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -326,9 +327,14 @@ var coverRenewInterval = 20 * time.Second
 // final refresh.
 func WithRenewedCover(ctx context.Context, renew func(context.Context) error, op func() error) (opErr, renewErr error) {
 	assertf(renew != nil && op != nil, "WithRenewedCover: nil renew or op")
+	// renew invocations are strictly serialized: the renewal goroutine is
+	// joined before the final refresh, so callers need no concurrency
+	// handling in the callback.
 	done := make(chan struct{})
-	defer close(done)
+	var wg sync.WaitGroup
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		t := time.NewTicker(coverRenewInterval)
 		defer t.Stop()
 		for {
@@ -340,7 +346,10 @@ func WithRenewedCover(ctx context.Context, renew func(context.Context) error, op
 			}
 		}
 	}()
-	if opErr = op(); opErr != nil {
+	opErr = op()
+	close(done)
+	wg.Wait()
+	if opErr != nil {
 		return opErr, nil
 	}
 	return nil, renew(ctx)
