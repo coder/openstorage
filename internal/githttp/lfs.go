@@ -698,20 +698,22 @@ func (s *Server) adoptLFSObject(ctx context.Context, repoID, key, oid string) er
 	// backend reads over large legacy blobs, one full pass per cancel.
 	// Once adoption starts it runs to completion under the lease
 	// regardless of the requester's fate; the committed row makes the
-	// work once-per-object. The lease still bounds the op slot against a
-	// wedged backend or a parked connection.
-	// Adoption gets its own lease — the FULL 90% of the TTL, not the
-	// publication lease's residual-cover cap (Codex round 52): the
-	// residual-cover requirement protects newly published orphan bytes
-	// whose only quota cover is a reservation, but adoption verifies
-	// bytes that are ALREADY durable and listed (floor-covered), holds no
-	// reservation, and registers atomically or not at all. Capping it
-	// would make any legacy object needing more than TTL−60s to read and
-	// hash permanently unadoptable at near-minimum TTLs, wedging the
-	// documented write-touch migration.
-	vctx, vcancel := context.WithTimeout(context.WithoutCancel(ctx), s.lfsReservationTTL()*9/10)
-	defer vcancel()
-	verifiedSize, err := s.verifyStoredLFSObject(vctx, repoID, key, oid)
+	// work once-per-object.
+	// Adoption is NOT bounded by the reservation TTL at all (Codex round
+	// 52, re-derived in security round 56): it holds no reservation — its
+	// bytes are already durable, listed, and floor-covered — so no
+	// TTL-coverage argument applies, and ANY TTL-derived cap makes some
+	// object size permanently unadoptable: every write touch then replays
+	// the full ranged read up to the cap, releases the per-key slot, and
+	// the next tiny batch restarts it from offset zero — a repeatable,
+	// client-cost-free bandwidth drain that never converges. The hash
+	// must instead be bounded by its own progress (per-chunk stall guard
+	// + size-scaled allowance inside verifyStoredLFSObject, mirroring
+	// blob.EnsurePublished's repair allowance): every attempt against a
+	// live backend COMPLETES and registers, making the work truly
+	// once-per-object, while a wedged backend still frees the op slot
+	// and verify buffer within one chunk window.
+	verifiedSize, err := s.verifyStoredLFSObject(context.WithoutCancel(ctx), repoID, key, oid)
 	if err != nil {
 		if !errors.Is(err, errLFSContentMismatch) {
 			return err
@@ -760,7 +762,12 @@ func (s *Server) adoptLFSObject(ctx context.Context, repoID, key, oid string) er
 	// and never retry, because this function short-circuits once the row
 	// exists); all replicas' floor serves and hook floors are
 	// generation-checked. This replica's entry is dropped directly.
-	if err := s.Store.RegisterAdoptedLFSObject(vctx, repoID, key, verifiedSize); err != nil {
+	// Bounded on its own window (the verify allowance above ended with
+	// the hash): a quick transaction that must not inherit an unbounded
+	// detached context.
+	regCtx, regCancel := context.WithTimeout(context.WithoutCancel(ctx), lfsCleanupTimeout)
+	defer regCancel()
+	if err := s.Store.RegisterAdoptedLFSObject(regCtx, repoID, key, verifiedSize); err != nil {
 		return err
 	}
 	s.invalidateUsageFloor(repoID)
@@ -778,7 +785,7 @@ func (s *Server) adoptLFSObject(ctx context.Context, repoID, key, oid string) er
 	// row and restores the blob itself.
 	// Bounded like the PUT path's probe (Codex round 29): this recheck
 	// runs while the caller holds the per-key slot and an op slot, and it
-	// sits OUTSIDE vctx (registration already committed under it), so a
+	// sits OUTSIDE regCtx (registration already committed under it), so a
 	// wedged backend must hand the slots back within a bounded window
 	// instead of pinning them for as long as the batch client stays
 	// connected. A timeout fails closed: the registration is committed
@@ -807,10 +814,26 @@ func (s *Server) adoptLFSObject(ctx context.Context, repoID, key, oid string) er
 // any corrupt legacy blob; the digest covering exactly size bytes is what
 // makes the returned count trustworthy.
 func (s *Server) verifyStoredLFSObject(ctx context.Context, repo, key, oid string) (int64, error) {
-	size, err := s.Blob.Stat(ctx, key)
+	sctx, scancel := context.WithTimeout(ctx, lfsProbeTimeout)
+	size, err := s.Blob.Stat(sctx, key)
+	scancel()
 	if err != nil {
 		return 0, fmt.Errorf("stat for verification: %w", err)
 	}
+	// The hash is bounded by its own progress, never the reservation TTL
+	// (Codex security round 56): a TTL-derived cap makes objects slower
+	// to read than the cap permanently unadoptable, and every failed
+	// attempt replays the FULL ranged read — a tiny disconnecting batch
+	// per replay drains the repo's verification share and shared backend
+	// bandwidth at no client cost. Two bounds replace it: a size-scaled
+	// absolute allowance (blob.EnsurePublished's repair-allowance shape —
+	// a worst-case ~1 MiB/s floor far below any realistic server→store
+	// link), so any live backend finishes and the committed row makes
+	// the work once-per-object; and a per-chunk stall guard below, so a
+	// WEDGED backend frees the op slot and verify buffer within one
+	// chunk window instead of the whole allowance.
+	vctx, vcancel := context.WithTimeout(ctx, 5*time.Minute+time.Duration(size>>20)*time.Second)
+	defer vcancel()
 	// The ranged reads below buffer up to one chunk in MEMORY, so the
 	// bound must be memory-sized (Codex round 26, security, refining
 	// round 25): the op slots alone admit 256 concurrent 8 MiB buffers
@@ -829,7 +852,9 @@ func (s *Server) verifyStoredLFSObject(ctx context.Context, repo, key, oid strin
 	h := sha256.New()
 	for off := int64(0); off < size; {
 		n := min(lfsStagingChunk, size-off)
-		chunk, err := s.Blob.ReadRange(ctx, key, off, n)
+		cctx, ccancel := context.WithTimeout(vctx, lfsVerifyChunkTimeout)
+		chunk, err := s.Blob.ReadRange(cctx, key, off, n)
+		ccancel()
 		if err != nil {
 			return 0, fmt.Errorf("read for verification [%d,%d): %w", off, off+n, err)
 		}

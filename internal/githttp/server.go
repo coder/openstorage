@@ -233,6 +233,14 @@ var lfsProbeTimeout = time.Minute
 // deadlines still bound the duration.
 var lfsStagingChunk = int64(8 << 20)
 
+// lfsVerifyChunkTimeout bounds ONE ranged read of an adoption
+// verification hash (Codex security round 56). The hash's absolute bound
+// scales with the object so it can always finish (verifyStoredLFSObject);
+// this per-chunk stall guard is what protects the op slot and verify
+// buffer from a WEDGED backend — the slots come back within one chunk
+// window, not the whole size-scaled allowance.
+const lfsVerifyChunkTimeout = time.Minute
+
 // lfsMaxVerifyBuffers caps concurrent legacy-verification buffer slots
 // node-wide (Codex round 26, security): each in-flight verification holds
 // one lfsStagingChunk-sized ReadRange slice in HEAP, a resource the

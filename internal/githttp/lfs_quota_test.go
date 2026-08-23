@@ -389,6 +389,40 @@ func (b slowReadBlob) ReadRange(ctx context.Context, key string, offset, length 
 	return b.BlobStore.ReadRange(ctx, key, offset, length)
 }
 
+// TestLFSAdoption_OutlivesReservationTTL (Codex round 56, security): the
+// adoption hash was bounded by 90% of the reservation TTL, so an object
+// slower to read than that lease could NEVER adopt — every write touch
+// replayed the full ranged read up to the lease, released the per-key
+// slot, and the next tiny disconnecting batch restarted it from offset
+// zero: a repeatable, client-cost-free drain of the repo's verification
+// share and shared backend bandwidth. The verification bound must scale
+// with the object (per-chunk stall guard + size-scaled allowance), never
+// the TTL: an adoption slower than the WHOLE TTL must complete once and
+// register, making every later touch free.
+func TestLFSAdoption_OutlivesReservationTTL(t *testing.T) {
+	ctx := context.Background()
+	srv, st, mint := newLFSQuotaServer(t, 0, 400*time.Millisecond)
+	tok := mint(auth.ScopeGitWrite)
+
+	legacy := []byte("legacy object slower to hash than the whole reservation TTL")
+	oid := sha256Hex(legacy)
+	key := blob.LFSKey(lfsTestRepoID, oid)
+	if err := srv.Blob.UploadFile(ctx, key, writeTempFile(t, legacy)); err != nil {
+		t.Fatal(err)
+	}
+	// The single ranged read takes 2.5× the TTL (~2.8× the old lease).
+	srv.Blob = slowReadBlob{BlobStore: srv.Blob, delay: time.Second}
+
+	resp := decodeBatch(t, doLFS(t, srv, http.MethodPost, lfsBatchPath, "basic:"+tok,
+		batchBody("upload", oid, int64(len(legacy)))))
+	if resp.Objects[0].Error != nil || resp.Objects[0].Actions != nil {
+		t.Fatalf("TTL-outliving adoption failed: %+v", resp.Objects[0])
+	}
+	if has, err := st.HasLFSObject(ctx, lfsTestRepoID, key); err != nil || !has {
+		t.Fatalf("object not adopted: %v, %v", has, err)
+	}
+}
+
 // TestLFSAdopt_RecheckCatchesRacingSweep (Codex round 1): adoption whose
 // blob a racing sweep reaped before the registration committed must fail
 // the request — the post-registration existence recheck catches it, and the
