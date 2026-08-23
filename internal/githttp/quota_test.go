@@ -413,6 +413,55 @@ func TestUsageFloorInvalidatedAcrossReplicas(t *testing.T) {
 	}
 }
 
+// genStallStore stalls the FIRST adoption-generation read via the
+// injected callback (advancing a fake clock or sleeping), simulating a
+// database stall during the serve-time generation check.
+type genStallStore struct {
+	ref.Store
+	stall func()
+	once  sync.Once
+}
+
+func (s *genStallStore) LFSAdoptionGen(ctx context.Context, repo string) (int64, error) {
+	s.once.Do(s.stall)
+	return s.Store.LFSAdoptionGen(ctx, repo)
+}
+
+// TestUsageFloorGenReadStallRechecksExpiry (Codex round 50): the
+// generation check is an unbounded database read — if it stalls, the
+// entry it validated can expire before the caller reserves, reopening the
+// scan-freshness hole for orphans published after the scan. After the
+// generation read, the entry's expiry must be RE-CHECKED: a consumed
+// window forces a fresh scan instead of serving the stale floor.
+func TestUsageFloorGenReadStallRechecksExpiry(t *testing.T) {
+	now := time.Unix(1000, 0)
+	var nowMu sync.Mutex
+	cb := &countingBlob{BlobStore: openTestBlob(t)}
+	st := openTestRefStore(t)
+	srv := &Server{Blob: cb, Store: &genStallStore{Store: st, stall: func() {
+		nowMu.Lock()
+		now = now.Add(usageCacheTTL + time.Second) // the stall consumes the window
+		nowMu.Unlock()
+	}}}
+	srv.usage.now = func() time.Time { nowMu.Lock(); defer nowMu.Unlock(); return now }
+
+	seedPack(t, cb.BlobStore, "repo_genstall", "aaaa", 30)
+	// Warm the entry directly (a fresh scan at t0 with floor 30, gen 0).
+	srv.usage.mu.Lock()
+	srv.usage.putLocked("repo_genstall", 30, 0, 0, now)
+	srv.usage.mu.Unlock()
+
+	// The serve validates the entry, the gen read stalls past its
+	// expiry: the floor must come from a NEW scan (3 listings), never
+	// the stale entry (0 listings).
+	if floor, err := srv.CachedUsageFloor(context.Background(), "repo_genstall"); err != nil || floor != 30 {
+		t.Fatalf("floor after gen-read stall = (%d, %v), want (30, nil)", floor, err)
+	}
+	if got := cb.lists.Load(); got != 3 {
+		t.Fatalf("gen-read stall served after %d listings, want 3 (expiry recheck must force a fresh scan)", got)
+	}
+}
+
 // TestUsageFloorInFlightScanInvalidatedByAdoption (Codex round 49,
 // security): adoption racing a COLD in-flight scan must not hand the
 // scan's waiters a stale floor — the flight snapshotted the generation
@@ -753,6 +802,21 @@ func TestHookUsageFloor(t *testing.T) {
 		got, err := hookUsageFloor(context.Background(), bl, st, "repo_a")
 		if err != nil || got != 100 {
 			t.Fatalf("stale-gen floor = (%d, %v), want (100, nil) — must self-list", got, err)
+		}
+	})
+	t.Run("gen-lookup-stall-rechecks-age", func(t *testing.T) {
+		// Codex round 50: the hook's gen lookup can stall; the trusted
+		// age must be re-evaluated afterwards — a floor whose window the
+		// stall consumed self-lists instead of being trusted.
+		t.Setenv(EnvPackReservationTTL, "90s") // maxAge = 90s − 60s = 30s
+		st := &genStallStore{Store: openTestRefStore(t), stall: func() { time.Sleep(1500 * time.Millisecond) }}
+		// Minted 29.2s ago: inside maxAge at parse, outside after the stall.
+		t.Setenv(EnvUsageFloor, fmt.Sprintf("1234:%d:0", time.Now().Add(-29200*time.Millisecond).Unix()))
+		bl := openTestBlob(t)
+		seedPack(t, bl, "repo_a", "1111", 100)
+		got, err := hookUsageFloor(context.Background(), bl, st, "repo_a")
+		if err != nil || got != 100 {
+			t.Fatalf("stalled-gen floor = (%d, %v), want (100, nil) — the consumed age must self-list", got, err)
 		}
 	})
 	t.Run("malformed-gen-fails-closed", func(t *testing.T) {
