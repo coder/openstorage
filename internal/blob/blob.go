@@ -251,19 +251,38 @@ func LFSPrefix(repoID string) string {
 // client hanging up right after the commit must not skip the check — a
 // skipped verification could leave the persistent pack row pointing at a
 // blob a concurrent sweep just deleted (Codex round 14).
-func EnsurePublished(ctx context.Context, b BlobStore, key, path string) error {
+//
+// A restore re-materializes bytes the usage counter already includes
+// (Codex round 58): a quota floor scanned during the absence subtracted
+// the full counter from a listing missing them, hiding equally sized
+// rowless legacy bytes. onRestore (nil-ok) runs BEFORE the repair upload
+// so the caller can account the returning bytes first (a cover
+// reservation — see the LFS repair in githttp); an onRestore error aborts
+// the restore, leaving the registered-row-without-bytes state the next
+// retry heals. The returned restored flag tells the caller to invalidate
+// cached floors (bump the shared floor generation) after the bytes are
+// back.
+func EnsurePublished(ctx context.Context, b BlobStore, key, path string, onRestore func(context.Context, int64) error) (restored bool, err error) {
 	assertf(b != nil && key != "" && path != "", "EnsurePublished(%q, %q)", key, path)
 	fi, err := os.Stat(path)
 	if err != nil {
-		return fmt.Errorf("stat local pack %s: %w", path, err)
+		return false, fmt.Errorf("stat local pack %s: %w", path, err)
 	}
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), ensurePublishedTimeout(fi.Size()))
 	defer cancel()
 	_, err = b.Stat(ctx, key)
 	if errors.Is(err, ErrNotFound) {
-		return b.UploadFile(ctx, key, path)
+		if onRestore != nil {
+			if err := onRestore(ctx, fi.Size()); err != nil {
+				return false, fmt.Errorf("account restore of %s: %w", key, err)
+			}
+		}
+		if err := b.UploadFile(ctx, key, path); err != nil {
+			return false, err
+		}
+		return true, nil
 	}
-	return err
+	return false, err
 }
 
 // ensurePublishedTimeout bounds EnsurePublished's detached verification.

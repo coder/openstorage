@@ -286,14 +286,17 @@ func preReceive(ctx context.Context) error {
 	// is consumed atomically by RegisterPacks below; a crash anywhere
 	// between here and there leaves an expiring row the sweeper prunes.
 	var reservedGens map[string]string
+	var quota int64 // 0 = quota disabled (restore covers are skipped too)
+	var ttl time.Duration
 	if quotaRaw := os.Getenv(EnvPackQuota); quotaRaw != "" {
-		quota, err := strconv.ParseInt(quotaRaw, 10, 64)
-		if err != nil || quota <= 0 {
+		q, err := strconv.ParseInt(quotaRaw, 10, 64)
+		if err != nil || q <= 0 {
 			// The env is set by our own server (never by the client), but
 			// fail closed on nonsense instead of waving the push through.
 			return fmt.Errorf("pre-receive: malformed %s=%q", EnvPackQuota, quotaRaw)
 		}
-		ttl, err := reservationTTL()
+		quota = q
+		ttl, err = reservationTTL()
 		if err != nil {
 			return fmt.Errorf("pre-receive: %w", err)
 		}
@@ -397,9 +400,32 @@ func preReceive(ctx context.Context) error {
 	if regErr != nil {
 		regErr = fmt.Errorf("pre-receive: register packs: %w", regErr)
 	}
+	// A restore here re-materializes counter-accounted bytes (Codex round
+	// 58, the pack twin of the LFS zero-growth repair): floors scanned
+	// while a registered pack's blob was absent hide equally sized
+	// rowless legacy bytes. Each restore is covered by a reservation
+	// BEFORE its upload (stale-floor admissions see the returning bytes),
+	// and any restore bumps the shared floor generation afterward so
+	// future serves re-scan. The bump is best-effort like the sweeper's
+	// quarantine-restore bump: the bytes ARE back, and a failed bump
+	// leaves only the TTL-bounded staleness the cover already guards.
+	restoredAny := false
 	for i, p := range packs {
-		if err := blob.EnsurePublished(ctx, bl, p.Key, packFiles[i]); err != nil {
+		var cover func(context.Context, int64) error
+		if quota > 0 {
+			cover = func(cctx context.Context, size int64) error {
+				return ref.ReserveRestoreCover(cctx, st, blob.QuotaRepoGroup(repo), p.Key, size, ttl)
+			}
+		}
+		restored, err := blob.EnsurePublished(ctx, bl, p.Key, packFiles[i], cover)
+		if err != nil {
 			return errors.Join(regErr, fmt.Errorf("pre-receive: verify %s: %w", p.Key, err))
+		}
+		restoredAny = restoredAny || restored
+	}
+	if restoredAny {
+		if err := st.BumpLFSAdoptionGen(ctx, BaseRepo(repo)); err != nil {
+			fmt.Fprintf(os.Stderr, "codestorage: floor generation bump after pack restore: %v\n", err)
 		}
 	}
 	return regErr

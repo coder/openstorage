@@ -300,6 +300,9 @@ func (stubLedger) HasLFSObject(context.Context, string, string) (bool, error) {
 func (stubLedger) BumpLFSAdoptionGen(context.Context, string) error {
 	return nil
 }
+func (stubLedger) ReservePackBytes(context.Context, []string, []ref.Pack, string, int64, int64, time.Duration) (ref.ReserveDecision, error) {
+	return ref.ReserveDecision{OK: true}, nil
+}
 
 // GuardedLFSDelete runs del directly and reports it executed: stub-based
 // tests inject races via HasLFSObject call counting, so the guard itself

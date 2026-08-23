@@ -344,18 +344,55 @@ func TestEnsurePublished(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := EnsurePublished(ctx, b, key, src); err != nil {
-		t.Fatalf("EnsurePublished(present): %v", err)
+	// Present: no restore, and onRestore must NOT run (it accounts quota
+	// bytes — a false invocation would reserve for bytes never absent).
+	restored, err := EnsurePublished(ctx, b, key, src, func(context.Context, int64) error {
+		t.Fatal("onRestore ran for a present blob")
+		return nil
+	})
+	if err != nil || restored {
+		t.Fatalf("EnsurePublished(present) = (%v, %v), want (false, nil)", restored, err)
 	}
 	if err := b.Delete(ctx, key); err != nil {
 		t.Fatal(err)
 	}
-	if err := EnsurePublished(ctx, b, key, src); err != nil {
-		t.Fatalf("EnsurePublished(missing): %v", err)
+	// Missing: onRestore runs BEFORE the upload (the cover must exist by
+	// the time the bytes become physical — Codex round 58) with the local
+	// file's size, and the restore is reported.
+	coverCalls := 0
+	restored, err = EnsurePublished(ctx, b, key, src, func(cctx context.Context, size int64) error {
+		coverCalls++
+		if size != int64(len("pack-bytes")) {
+			t.Fatalf("onRestore size = %d, want %d", size, len("pack-bytes"))
+		}
+		if _, serr := b.Stat(cctx, key); !errors.Is(serr, ErrNotFound) {
+			t.Fatalf("bytes already physical when onRestore ran (stat: %v)", serr)
+		}
+		return nil
+	})
+	if err != nil || !restored || coverCalls != 1 {
+		t.Fatalf("EnsurePublished(missing) = (%v, %v), onRestore calls %d; want (true, nil), 1", restored, err, coverCalls)
 	}
 	size, err := b.Stat(ctx, key)
 	if err != nil || size != int64(len("pack-bytes")) {
 		t.Fatalf("Stat after re-publish = %d, %v", size, err)
+	}
+	// An onRestore failure ABORTS the restore: uncovered bytes must never
+	// become physical (the retry converges once the cover succeeds).
+	if err := b.Delete(ctx, key); err != nil {
+		t.Fatal(err)
+	}
+	restored, err = EnsurePublished(ctx, b, key, src, func(context.Context, int64) error {
+		return errors.New("cover denied")
+	})
+	if err == nil || restored {
+		t.Fatalf("EnsurePublished(cover denied) = (%v, %v), want (false, error)", restored, err)
+	}
+	if _, serr := b.Stat(ctx, key); !errors.Is(serr, ErrNotFound) {
+		t.Fatalf("uncovered restore published bytes anyway (stat: %v)", serr)
+	}
+	if _, err := EnsurePublished(ctx, b, key, src, nil); err != nil {
+		t.Fatal(err) // nil onRestore: re-seed for the next case
 	}
 
 	// A canceled request context must not skip the verification: the
@@ -365,7 +402,7 @@ func TestEnsurePublished(t *testing.T) {
 	}
 	canceled, cancel := context.WithCancel(ctx)
 	cancel()
-	if err := EnsurePublished(canceled, b, key, src); err != nil {
+	if _, err := EnsurePublished(canceled, b, key, src, nil); err != nil {
 		t.Fatalf("EnsurePublished(canceled ctx): %v", err)
 	}
 	if _, err := b.Stat(ctx, key); err != nil {

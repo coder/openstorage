@@ -897,14 +897,9 @@ func (s *Server) verifyStoredLFSObject(ctx context.Context, repo, key, oid strin
 	return size, nil
 }
 
-// lfsRepairCoverSuffix distinguishes a zero-growth repair's cover
-// reservation key from the object's settle key (Codex security round 57):
-// settlement consumes the blob key's spellings, and the cover must instead
-// outlive the request until the TTL collects it. LFS blob keys end in
-// exactly the 64-hex oid (blob.LFSKey) and the ledger reserves "\n" for
-// its own era spellings, so this suffix never collides with a real
-// reservation.
-const lfsRepairCoverSuffix = "/repair-cover"
+// lfsRepairCoverSuffix — see ref.RepairCoverSuffix (shared with the pack
+// restore paths since Codex round 58).
+const lfsRepairCoverSuffix = ref.RepairCoverSuffix
 
 // lfsVerifyResume is a partially completed adoption hash: the verified
 // prefix length and the sha256 midstate over it (Codex round 57).
@@ -1561,10 +1556,26 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target r
 	// republishes.
 	ectx, ecancel := context.WithDeadline(context.WithoutCancel(ctx), pubAnchor.Add(s.lfsPublicationLease()))
 	defer ecancel()
+	restoredHere := false
 	verifyErr := func() error {
 		_, err := s.Blob.Stat(ectx, key)
 		if errors.Is(err, blob.ErrNotFound) {
-			return s.Blob.UploadFile(ectx, key, path)
+			// This re-upload restores counter-accounted bytes a racing
+			// sweep just made absent (Codex round 58, the fresh-path twin
+			// of the zero-growth repair): cover it BEFORE publication so
+			// admissions holding an absence-window floor see the
+			// returning bytes. A repair's cover from above still lives
+			// (same TTL), so only the fresh path takes one here.
+			if s.PackQuotaBytes > 0 && n > 0 && !repair {
+				if cerr := ref.ReserveRestoreCover(ectx, s.Store, blob.QuotaRepoGroup(repoID), key, n, s.lfsReservationTTL()); cerr != nil {
+					return cerr
+				}
+			}
+			if uerr := s.Blob.UploadFile(ectx, key, path); uerr != nil {
+				return uerr
+			}
+			restoredHere = true
+			return nil
 		}
 		return err
 	}()
@@ -1592,7 +1603,7 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target r
 	// that bump: the bytes ARE durably back and registered, and a failed
 	// bump leaves only the TTL-bounded staleness a crash right here
 	// would always leave. Zero-byte objects never appear in floors.
-	if repair && n > 0 {
+	if (repair || restoredHere) && n > 0 {
 		bctx, bcancel := context.WithTimeout(context.WithoutCancel(ctx), lfsCleanupTimeout)
 		defer bcancel()
 		if err := s.Store.BumpLFSAdoptionGen(bctx, BaseRepo(repoID)); err != nil {

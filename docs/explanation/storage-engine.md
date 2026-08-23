@@ -126,13 +126,16 @@ registered set, and gating it would deadlock exactly the at-quota repositories t
 compaction most.
 
 Since [#51](https://github.com/coder/code-storage/issues/51) the same ledger admits Git
-LFS uploads: the batch endpoint reserves each missing object's declared size before
-issuing any transfer URL, the verified proxy upload re-admits the request's actual
-`Content-Length` (a same-key reservation refreshes, so honest clients are charged once
-while a declared-size lie re-runs the full check), and settlement — consuming the
-reservation and crediting the counter — happens in one transaction with the object's
-registration. The listing floor covers the `lfs/` prefix alongside the pack prefixes,
-so pre-ledger LFS bytes gate admission too.
+LFS uploads in two stages: the batch endpoint runs an **advisory** admission check
+against each missing object's declared size — failing hopeless requests early with 507
+before issuing any transfer URL, but holding nothing durable — and the verified proxy
+upload performs the **durable** admission after the body has been staged and its sha256
+verified, reserving the actual byte count immediately before publication. Settlement —
+consuming the reservation and crediting the counter — happens in one transaction with
+the object's registration. An upload URL therefore does not hold capacity during
+transfer: two near-quota clients can both receive URLs and one may still be denied at
+upload time; quota is never overshot. The listing floor covers the `lfs/` prefix
+alongside the pack prefixes, so pre-ledger LFS bytes gate admission too.
 
 ## Why deletion is so careful
 

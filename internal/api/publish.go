@@ -142,8 +142,30 @@ func (s *server) publishPack(ctx context.Context, repoID, packID, packPath strin
 	if regErr != nil {
 		regErr = fmt.Errorf("register pack %s: %w", packID, regErr)
 	}
-	if err := blob.EnsurePublished(ctx, s.blobStore, key, packPath); err != nil {
+	// A restore re-materializes counter-accounted bytes (Codex round 58,
+	// the pack twin of the LFS zero-growth repair): cover it with a
+	// reservation BEFORE the upload — stale absence-window floors held by
+	// concurrent admissions must see the returning bytes — and bump the
+	// shared floor generation afterward (best-effort, like the sweeper's
+	// quarantine-restore bump) so future serves re-scan.
+	var cover func(context.Context, int64) error
+	if s.packQuotaBytes > 0 {
+		cover = func(cctx context.Context, size int64) error {
+			ttl := s.packReservationTTL
+			if ttl <= 0 {
+				ttl = time.Hour // unwired server: match the admission fallback above
+			}
+			return ref.ReserveRestoreCover(cctx, s.refStore, blob.QuotaRepoGroup(repoID), key, size, ttl)
+		}
+	}
+	restored, err := blob.EnsurePublished(ctx, s.blobStore, key, packPath, cover)
+	if err != nil {
 		return errors.Join(regErr, fmt.Errorf("verify pack %s: %w", key, err))
+	}
+	if restored {
+		if err := s.refStore.BumpLFSAdoptionGen(ctx, githttp.BaseRepo(repoID)); err != nil {
+			s.logger.Warn("floor generation bump after pack restore", "key", key, "error", err)
+		}
 	}
 	// Threshold check regardless of regErr (issue #1): an ambiguous
 	// registration error may have committed the row — the same reason the

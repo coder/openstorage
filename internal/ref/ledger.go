@@ -157,6 +157,53 @@ func reservKeySpellings(keys ...string) []string {
 	return out
 }
 
+// RepairCoverSuffix distinguishes a restore's cover reservation key from
+// the restored blob's settle key (Codex rounds 57+58): settlement consumes
+// the blob key's own spellings, and the cover must instead outlive the
+// request until the TTL collects it. Pack keys end in ".pack" and LFS keys
+// in the 64-hex oid, while the ledger reserves "\n" for its era spellings,
+// so this suffix never collides with a real reservation.
+const RepairCoverSuffix = "/repair-cover"
+
+// ReserveRestoreCover accounts bytes a writer-side restore is about to
+// re-materialize under an already-registered key (packs and LFS alike,
+// Codex rounds 57+58). The shared floor-generation bump after a restore
+// only stops FUTURE floor serves: an admission already holding a floor
+// scanned during the blob's absence (deflated by the missing object's
+// size, hiding equally sized rowless legacy bytes) can commit after the
+// bytes return and durably exceed quota. The cover makes those admissions
+// see the returning bytes in active_reservations instead. It reserves
+// under an unbounded quota — restores must never be quota-denied, or a
+// registered row stays blobless — but the row cap still binds and any
+// denial fails the restore (the retry converges); the TTL collects the
+// row after the last stale floor can commit.
+func ReserveRestoreCover(ctx context.Context, st RestoreCoverStore, group []string, key string, size int64, ttl time.Duration) error {
+	assertf(size > 0, "ReserveRestoreCover(%q): size %d", key, size)
+	dec, err := st.ReservePackBytes(ctx, group,
+		[]Pack{{Key: key + RepairCoverSuffix, Size: size}}, NewReservationOwner(),
+		0, math.MaxInt64, ttl)
+	if err != nil {
+		return err
+	}
+	if dec.KeyCapExceeded {
+		return fmt.Errorf("restore cover for %s: too many in-flight reservations, retry", key)
+	}
+	if !dec.OK {
+		// Unreachable with an unbounded quota (admission saturates);
+		// fail closed rather than restore uncovered.
+		return fmt.Errorf("restore cover for %s denied: %d used, %d reserved", key, dec.UsedBytes, dec.ReservedBytes)
+	}
+	return nil
+}
+
+// RestoreCoverStore is the single-method ledger slice ReserveRestoreCover
+// needs, so every restore path — server handlers, the pre-receive hook,
+// and the sweeper's narrow PackRegistry — can share the one cover
+// implementation.
+type RestoreCoverStore interface {
+	ReservePackBytes(ctx context.Context, group []string, packs []Pack, owner string, usageFloor, quotaBytes int64, ttl time.Duration) (ReserveDecision, error)
+}
+
 // ReserveDecision reports one admission decision. UsedBytes and
 // ReservedBytes carry the arithmetic the caller folds into its denial
 // message (the client-facing sideband line / 403 detail).

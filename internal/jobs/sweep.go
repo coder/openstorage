@@ -32,6 +32,7 @@ import (
 	"time"
 
 	"github.com/coder/code-storage/internal/blob"
+	"github.com/coder/code-storage/internal/ref"
 )
 
 // PackRegistry is the slice of ref.RefStore the sweeper needs: point
@@ -63,6 +64,13 @@ type PackRegistry interface {
 	// equally sized rowless legacy bytes — so the repair must invalidate
 	// it, or a stale floor admits past quota until expiry.
 	BumpLFSAdoptionGen(ctx context.Context, repo string) error
+	// ReservePackBytes backs ref.ReserveRestoreCover for quarantine
+	// restores (Codex round 58): the generation bump above only stops
+	// FUTURE floor serves, so the returning bytes must be accounted as a
+	// reservation BEFORE they become physical — an admission already
+	// holding a floor scanned during the absence then sees them in
+	// active_reservations instead of committing into hidden headroom.
+	ReservePackBytes(ctx context.Context, group []string, packs []ref.Pack, owner string, usageFloor, quotaBytes int64, ttl time.Duration) (ref.ReserveDecision, error)
 	// IsRetainedPack classifies (repo, key) as superseded-by-repack: a
 	// blob whose registry row a ReplacePacks fold removed. Provably
 	// DB-absent by that CAS — a narrower, safer deletion class than
@@ -633,6 +641,29 @@ func (s *Sweeper) restoreFromQuarantine(ctx context.Context, key, qKey string) (
 			s.logger.Warn("orphan pack sweep: NOT restoring LFS quarantine backup failing content verification",
 				"key", key, "quarantine", qKey)
 			return false, nil
+		}
+	}
+	// Cover the returning bytes BEFORE they become physical (Codex round
+	// 58, security): the generation bump below only stops FUTURE floor
+	// serves — an admission already holding a floor scanned during the
+	// absence can commit after the copy and durably exceed quota. The
+	// cover reservation makes those admissions see the restored bytes in
+	// active_reservations instead; the TTL collects it after the last
+	// stale floor can commit. A cover failure aborts the restore (the
+	// next sweep retries with the quarantine backup intact).
+	if repo, ok := splitSweepKey(key); ok {
+		size, err := s.blobs.Stat(ctx, qKey)
+		if err != nil {
+			return false, fmt.Errorf("stat quarantine %s: %w", qKey, err)
+		}
+		if size > 0 {
+			ttl := s.cfg.ReservationTTL
+			if ttl <= 0 {
+				ttl = time.Hour // unwired config: match the write gates' fallback
+			}
+			if err := ref.ReserveRestoreCover(ctx, s.packs, blob.QuotaRepoGroup(repo), key, size, ttl); err != nil {
+				return false, err
+			}
 		}
 	}
 	if err := s.blobs.Copy(ctx, key, qKey); err != nil {
