@@ -480,11 +480,26 @@ func TestLFSAdoption_ResumesAfterSlowRange(t *testing.T) {
 	if resp.Objects[0].Error == nil {
 		t.Fatalf("stalled adoption reported stored: %+v", resp.Objects[0])
 	}
-	// Attempt 2 converges — and never re-reads the completed range.
+	// The abort PARKED the fleet lease with the saved progress (Codex
+	// round 75): the sha256 midstate lives only in this process, so a
+	// foreign replica claiming the key would restart the hash from
+	// offset zero — retries rotating across replicas could replay
+	// completed ranges forever. The held claim must keep denying them.
+	if again, _, err := st.TryAdoptionClaim(ctx, lfsTestRepoID, key); err != nil || again {
+		t.Fatalf("foreign claim while parked progress exists = (%v, %v), want denied", again, err)
+	}
+	// Attempt 2 converges — and never re-reads the completed range. It
+	// can only proceed by RENEWING the parked lease: the claim row is
+	// live, so a fresh TryAdoptionClaim would be denied.
 	resp = decodeBatch(t, doLFS(t, srv, http.MethodPost, lfsBatchPath, "basic:"+tok,
 		batchBody("upload", oid, int64(len(legacy)))))
 	if resp.Objects[0].Error != nil || resp.Objects[0].Actions != nil {
 		t.Fatalf("resumed adoption failed: %+v", resp.Objects[0])
+	}
+	// Terminal success releases the parked lease (registration makes the
+	// row dead weight); the key is free for whoever wants it.
+	if again, _, err := st.TryAdoptionClaim(ctx, lfsTestRepoID, key); err != nil || !again {
+		t.Fatalf("claim after terminal adoption = (%v, %v), want free", again, err)
 	}
 	if has, err := st.HasLFSObject(ctx, lfsTestRepoID, key); err != nil || !has {
 		t.Fatalf("object not adopted: %v, %v", has, err)
@@ -499,6 +514,50 @@ func TestLFSAdoption_ResumesAfterSlowRange(t *testing.T) {
 	}
 	if zeroReads != 1 {
 		t.Fatalf("offset 0 read %d times across attempts (reads: %v), want exactly 1 — completed ranges must not replay", zeroReads, bl.reads)
+	}
+}
+
+// blockedRenewStore wedges every adoption-claim renewal until its context
+// expires, simulating a stalled ref store mid-verification.
+type blockedRenewStore struct {
+	ref.RefStore
+}
+
+func (b *blockedRenewStore) RenewAdoptionClaim(ctx context.Context, key, owner string) (bool, error) {
+	<-ctx.Done()
+	return false, ctx.Err()
+}
+
+// TestLFSAdoption_RenewalIsBounded (Codex round 75): claim renewals run
+// inside the size-scaled verification window, whose deadline can be hours
+// away for a large object. A wedged ref-store call must abort the attempt
+// within the dedicated renewal timeout — freeing the op slot and verify
+// buffer — never pin them for the whole allowance while the 30-minute
+// claim expires underneath.
+func TestLFSAdoption_RenewalIsBounded(t *testing.T) {
+	ctx := context.Background()
+	oldInterval, oldTimeout := lfsAdoptClaimRenewInterval, lfsClaimRenewTimeout
+	lfsAdoptClaimRenewInterval, lfsClaimRenewTimeout = 0, 50*time.Millisecond
+	t.Cleanup(func() { lfsAdoptClaimRenewInterval, lfsClaimRenewTimeout = oldInterval, oldTimeout })
+
+	srv, _, _ := newLFSQuotaServer(t, 0, time.Hour)
+	legacy := []byte("legacy object whose claim renewal wedges")
+	oid := sha256Hex(legacy)
+	key := blob.LFSKey(lfsTestRepoID, oid)
+	if err := srv.Blob.UploadFile(ctx, key, writeTempFile(t, legacy)); err != nil {
+		t.Fatal(err)
+	}
+	srv.Store = &blockedRenewStore{RefStore: srv.Store}
+
+	errc := make(chan error, 1)
+	go func() { errc <- srv.adoptLFSObject(ctx, lfsTestRepoID, key, oid) }()
+	select {
+	case err := <-errc:
+		if err == nil {
+			t.Fatal("adoption succeeded under a wedged renewal")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("adoption not bounded by the renewal timeout — a wedged ref store pinned the verification slots for the size-scaled allowance")
 	}
 }
 

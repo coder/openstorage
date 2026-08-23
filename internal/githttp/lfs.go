@@ -683,24 +683,54 @@ func (s *Server) adoptLFSObject(ctx context.Context, repoID, key, oid string) er
 	// TTL'd claim; losers deny transiently (the client's retry lands on
 	// the winner's committed registration — zero-growth — or re-claims
 	// after a crash's claim expires).
-	claimed, claimOwner, err := s.Store.TryAdoptionClaim(ctx, repoID, key)
-	if err != nil {
-		return err
-	}
-	if !claimed {
-		return errLFSBusy
-	}
-	// Best-effort early release on every exit (success included: the
-	// committed registration terminalizes the key, so the claim row is
-	// dead weight either way); a crash leaves it to the TTL. Owner-fenced
-	// (Codex round 74): after an expiry takeover, this stale worker's
-	// release must not delete the successor's live lease.
-	defer func() {
-		rctx, rcancel := context.WithTimeout(context.WithoutCancel(ctx), lfsCleanupTimeout)
-		defer rcancel()
-		if rerr := s.Store.ReleaseAdoptionClaim(rctx, key, claimOwner); rerr != nil {
-			log.Printf("lfs adopt %s: release claim: %v", key, rerr)
+	// A prior resumable abort may have PARKED the lease with its saved
+	// progress (Codex round 75): renew the parked token instead of
+	// competing for a fresh claim, so the resume midstate — which lives
+	// only in this process — stays paired with the live lease and no
+	// replica restarts the hash from offset zero.
+	claimOwner := s.takeParkedLFSClaimOwner(key)
+	if claimOwner != "" {
+		rctx, rcancel := context.WithTimeout(ctx, lfsClaimRenewTimeout)
+		renewed, rerr := s.Store.RenewAdoptionClaim(rctx, key, claimOwner)
+		rcancel()
+		if rerr != nil {
+			// Indeterminate: the lease may still be live. Re-park the
+			// token for the next attempt; if a concurrent eviction
+			// discarded the midstate meanwhile, free the lease instead
+			// of orphaning a token nobody can renew or release.
+			if !s.parkLFSClaimOwner(key, claimOwner) {
+				s.releaseAdoptionClaim(key, claimOwner)
+			}
+			return fmt.Errorf("renew parked adoption claim: %w", rerr)
 		}
+		if !renewed {
+			claimOwner = "" // expired or taken over: compete for a fresh claim
+		}
+	}
+	if claimOwner == "" {
+		claimed, owner, err := s.Store.TryAdoptionClaim(ctx, repoID, key)
+		if err != nil {
+			return err
+		}
+		if !claimed {
+			return errLFSBusy
+		}
+		claimOwner = owner
+	}
+	// Best-effort early release on every TERMINAL exit (success included:
+	// the committed registration terminalizes the key, so the claim row
+	// is dead weight either way); a crash leaves it to the TTL.
+	// Owner-fenced (Codex round 74): after an expiry takeover, this stale
+	// worker's release must not delete the successor's live lease. NOT
+	// released when the verification below parked the lease with
+	// resumable progress (Codex round 75): the held claim is what routes
+	// the remaining work back to this process's saved midstate instead of
+	// a foreign replica's offset-zero restart.
+	defer func() {
+		if s.parkedLFSClaimOwner(key) == claimOwner {
+			return // parked: the next attempt renews and resumes
+		}
+		s.releaseAdoptionClaim(key, claimOwner)
 	}()
 	// Legacy blobs were written through presigned PUTs that bound no
 	// digest, so existence does not prove content (Codex round 15).
@@ -914,15 +944,32 @@ func (s *Server) verifyStoredLFSObject(ctx context.Context, repo, key, oid, clai
 		// the claim exists to protect, and the progress is saved for
 		// this replica's next winning attempt.
 		if claimOwner != "" && time.Since(lastRenew) >= lfsAdoptClaimRenewInterval {
-			renewed, rerr := s.Store.RenewAdoptionClaim(vctx, key, claimOwner)
-			if rerr != nil || !renewed {
+			// Each renewal gets its own short deadline (Codex round 75):
+			// inheriting vctx — hours away for a large object — would let
+			// one wedged ref-store call pin the op slot and verify buffer
+			// for the whole allowance while the claim expires under it.
+			rctx, rcancel := context.WithTimeout(vctx, lfsClaimRenewTimeout)
+			renewed, rerr := s.Store.RenewAdoptionClaim(rctx, key, claimOwner)
+			rcancel()
+			if rerr != nil {
+				// Indeterminate: the lease may well still be live (only
+				// this renewal call failed), so PARK it with the progress
+				// — no other replica restarts from zero, and this
+				// replica's next attempt renews the token and resumes.
 				if off > 0 {
-					s.saveLFSVerifyResume(key, size, off, h)
+					s.saveLFSVerifyResume(key, size, off, h, claimOwner)
 				}
-				if rerr != nil {
-					return 0, fmt.Errorf("renew adoption claim: %w", rerr)
+				return 0, fmt.Errorf("renew adoption claim: %w", rerr)
+			}
+			if !renewed {
+				// Lease definitively lost (expired and taken over):
+				// another replica owns the hash now. Keep the midstate
+				// local-only — parking a dead token would skip the
+				// release of a lease this process no longer holds.
+				if off > 0 {
+					s.saveLFSVerifyResume(key, size, off, h, "")
 				}
-				return 0, errLFSBusy // lease lost: another replica owns the hash now
+				return 0, errLFSBusy
 			}
 			lastRenew = time.Now()
 		}
@@ -931,8 +978,10 @@ func (s *Server) verifyStoredLFSObject(ctx context.Context, repo, key, oid, clai
 		chunk, err := s.Blob.ReadRange(cctx, key, off, n)
 		ccancel()
 		if err != nil {
+			// The lease is still this process's: park it with the
+			// progress (Codex round 75) so the retry resumes here.
 			if off > 0 {
-				s.saveLFSVerifyResume(key, size, off, h)
+				s.saveLFSVerifyResume(key, size, off, h, claimOwner)
 			}
 			return 0, fmt.Errorf("read for verification [%d,%d): %w", off, off+n, err)
 		}
@@ -957,12 +1006,30 @@ const lfsRepairCoverSuffix = ref.RepairCoverSuffix
 // a LIVE hash's lease expire under it.
 var lfsAdoptClaimRenewInterval = 5 * time.Minute
 
+// lfsClaimRenewTimeout bounds ONE adoption-claim renewal round-trip (Codex
+// round 75): renewals run inside the size-scaled verification window,
+// whose deadline can be hours away for a large object — inheriting it
+// would let a single wedged ref-store call pin the handler's op slot and
+// verify buffer for the whole allowance while the claim expires
+// underneath. A renewal that cannot complete within this window aborts
+// the attempt with the progress saved.
+var lfsClaimRenewTimeout = 15 * time.Second
+
 // lfsVerifyResume is a partially completed adoption hash: the verified
 // prefix length and the sha256 midstate over it (Codex round 57).
 type lfsVerifyResume struct {
 	size  int64
 	off   int64
 	state []byte
+	// owner, when non-empty, is the fleet adoption-claim lease PARKED
+	// with this progress (Codex round 75): the abort deliberately kept
+	// the claim held, because the midstate lives only in this process —
+	// releasing would route the client's next retry to whichever replica
+	// wins the fresh claim, restarting the hash from offset zero and
+	// discarding the completed ranges. The next attempt on THIS replica
+	// renews the token and resumes; a parked lease nobody retries
+	// expires via ref.AdoptionClaimTTL exactly like a crashed winner's.
+	owner string
 }
 
 // lfsMaxVerifyResumes bounds the resume cache (arbitrary eviction beyond
@@ -971,8 +1038,10 @@ type lfsVerifyResume struct {
 const lfsMaxVerifyResumes = 128
 
 // saveLFSVerifyResume records a verification's progress for the key so
-// the next attempt can continue after the completed ranges.
-func (s *Server) saveLFSVerifyResume(key string, size, off int64, h hash.Hash) {
+// the next attempt can continue after the completed ranges. A non-empty
+// owner parks the fleet adoption-claim lease with the progress (Codex
+// round 75) — pass "" when the lease was definitively lost or never held.
+func (s *Server) saveLFSVerifyResume(key string, size, off int64, h hash.Hash, owner string) {
 	assertf(off > 0 && off < size, "saveLFSVerifyResume(%q): off %d, size %d", key, off, size)
 	m, ok := h.(encoding.BinaryMarshaler)
 	if !ok {
@@ -988,12 +1057,72 @@ func (s *Server) saveLFSVerifyResume(key string, size, off int64, h hash.Hash) {
 		s.lfsVerifyResumes = make(map[string]lfsVerifyResume)
 	}
 	if _, exists := s.lfsVerifyResumes[key]; !exists && len(s.lfsVerifyResumes) >= lfsMaxVerifyResumes {
-		for k := range s.lfsVerifyResumes {
+		for k, victim := range s.lfsVerifyResumes {
 			delete(s.lfsVerifyResumes, k) // arbitrary eviction: resume is an accelerant, not a contract
+			if victim.owner != "" {
+				// The victim parked a live lease and this eviction just
+				// discarded the only copy of its owner token: unlock the
+				// key for the fleet instead of burning the rest of the
+				// 30-minute TTL with a holder nobody can resume.
+				go s.releaseAdoptionClaim(k, victim.owner)
+			}
 			break
 		}
 	}
-	s.lfsVerifyResumes[key] = lfsVerifyResume{size: size, off: off, state: state}
+	s.lfsVerifyResumes[key] = lfsVerifyResume{size: size, off: off, state: state, owner: owner}
+}
+
+// takeParkedLFSClaimOwner consumes the lease owner parked with the key's
+// saved progress, if any, leaving the midstate in place for the
+// verification that is about to run under the renewed lease.
+func (s *Server) takeParkedLFSClaimOwner(key string) string {
+	s.lfsVerifyResumeMu.Lock()
+	defer s.lfsVerifyResumeMu.Unlock()
+	r, ok := s.lfsVerifyResumes[key]
+	if !ok || r.owner == "" {
+		return ""
+	}
+	owner := r.owner
+	r.owner = ""
+	s.lfsVerifyResumes[key] = r
+	return owner
+}
+
+// parkedLFSClaimOwner reads the key's parked lease owner without
+// consuming it.
+func (s *Server) parkedLFSClaimOwner(key string) string {
+	s.lfsVerifyResumeMu.Lock()
+	defer s.lfsVerifyResumeMu.Unlock()
+	return s.lfsVerifyResumes[key].owner
+}
+
+// parkLFSClaimOwner re-attaches a lease owner to the key's saved progress
+// (used when the renewal that consumed it failed indeterminately).
+// Reports whether the entry still existed; false means a concurrent
+// eviction discarded the midstate and the caller should free the lease
+// instead of orphaning the token.
+func (s *Server) parkLFSClaimOwner(key, owner string) bool {
+	assertf(owner != "", "parkLFSClaimOwner(%q): empty owner", key)
+	s.lfsVerifyResumeMu.Lock()
+	defer s.lfsVerifyResumeMu.Unlock()
+	r, ok := s.lfsVerifyResumes[key]
+	if !ok {
+		return false
+	}
+	r.owner = owner
+	s.lfsVerifyResumes[key] = r
+	return true
+}
+
+// releaseAdoptionClaim best-effort frees a fleet adoption claim on a
+// bounded context detached from any request; a failure leaves the row to
+// ref.AdoptionClaimTTL like a crashed winner's.
+func (s *Server) releaseAdoptionClaim(key, owner string) {
+	ctx, cancel := context.WithTimeout(context.Background(), lfsCleanupTimeout)
+	defer cancel()
+	if err := s.Store.ReleaseAdoptionClaim(ctx, key, owner); err != nil {
+		log.Printf("lfs adopt %s: release claim: %v", key, err)
+	}
 }
 
 // takeLFSVerifyResume claims (and removes — single use, re-saved on the
