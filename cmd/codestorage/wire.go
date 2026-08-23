@@ -121,6 +121,7 @@ func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL, loopbackBaseU
 		Delete:           sweep.deleteEnabled,
 		DeleteSuperseded: sweep.deleteSuperseded,
 		DeleteLFS:        sweep.deleteLFS,
+		DeleteLFSLegacy:  sweep.deleteLFSLegacy,
 		// Quarantine restores take cover reservations + generation
 		// bumps only when quota admission actually consults them
 		// (Codex round 73).

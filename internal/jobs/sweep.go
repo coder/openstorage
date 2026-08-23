@@ -264,6 +264,7 @@ func (s *Sweeper) Sweep(ctx context.Context) (SweepReport, error) {
 	// guard covers both destructive modes — a versioned bucket turns
 	// superseded-class deletes into billed delete markers all the same.
 	deleteMode, supersededMode, lfsMode := s.cfg.Delete, s.cfg.DeleteSuperseded, s.cfg.DeleteLFS
+	legacyMode := s.cfg.DeleteLFSLegacy
 	if (deleteMode || supersededMode || lfsMode) && s.cfg.DeleteGuard != nil {
 		if err := s.cfg.DeleteGuard(ctx); err != nil {
 			deleteMode, supersededMode, lfsMode = false, false, false
@@ -319,7 +320,7 @@ func (s *Sweeper) Sweep(ctx context.Context) (SweepReport, error) {
 				s.logger.Warn("orphan pack sweep: skipping foreign key under packs/", "key", obj.Key)
 				continue
 			}
-			if err := s.classify(ctx, repo, obj, deleteMode, supersededMode, lfsMode, &report, &deleteErrs); err != nil {
+			if err := s.classify(ctx, repo, obj, deleteMode, supersededMode, lfsMode, legacyMode, &report, &deleteErrs); err != nil {
 				return err
 			}
 		}
@@ -339,7 +340,7 @@ func (s *Sweeper) Sweep(ctx context.Context) (SweepReport, error) {
 				s.logger.Warn("orphan pack sweep: skipping foreign key under lfs/", "key", obj.Key)
 				continue
 			}
-			if err := s.classify(ctx, repo, obj, deleteMode, supersededMode, lfsMode, &report, &deleteErrs); err != nil {
+			if err := s.classify(ctx, repo, obj, deleteMode, supersededMode, lfsMode, legacyMode, &report, &deleteErrs); err != nil {
 				return err
 			}
 		}
@@ -440,7 +441,7 @@ func (s *Sweeper) registered(ctx context.Context, repo, key string) (bool, error
 // supersededMode too; LFS orphans (issue #51) only under their own
 // lfsMode opt-in. Registry errors abort the sweep (they would
 // misclassify the object); disposal errors accumulate into deleteErrs.
-func (s *Sweeper) classify(ctx context.Context, repo string, obj blob.ListedObject, deleteMode, supersededMode, lfsMode bool, report *SweepReport, deleteErrs *boundedErrs) error {
+func (s *Sweeper) classify(ctx context.Context, repo string, obj blob.ListedObject, deleteMode, supersededMode, lfsMode, legacyMode bool, report *SweepReport, deleteErrs *boundedErrs) error {
 	registered, err := s.registered(ctx, repo, obj.Key)
 	if err != nil {
 		return fmt.Errorf("registry lookup %s: %w", obj.Key, err)
@@ -468,13 +469,20 @@ func (s *Sweeper) classify(ctx context.Context, repo string, obj blob.ListedObje
 	s.logger.Info("orphan pack candidate",
 		"key", obj.Key, "size_bytes", obj.Size, "age", age.Round(time.Second),
 		"delete_enabled", deleteMode, "delete_superseded", supersededMode, "delete_lfs", lfsMode)
-	// Deletion coverage per class: LFS candidates need the lfsMode opt-in;
-	// pack candidates need general delete mode, or — under superseded mode
+	// Deletion coverage per class: LFS candidates need the lfsMode opt-in
+	// — and LEGACY-SPELLED LFS keys additionally need legacyMode, the
+	// explicit post-roll cleanup opt-in of the two-phase key migration
+	// (Codex round 81): adoption retains its source precisely so old
+	// replicas and live presigned GETs keep reading it, and an aged
+	// retained source is otherwise an immediate orphan candidate — an
+	// undiscriminating DeleteLFS would 404 mid-roll downloads. The
+	// transition gate dominates every other flag combination. Pack
+	// candidates need general delete mode, or — under superseded mode
 	// alone — a retained record (one extra point read per aged candidate,
 	// same shape as HasPack).
 	var canDelete bool
 	if strings.HasPrefix(obj.Key, blob.LFSRoot) {
-		canDelete = lfsMode
+		canDelete = lfsMode && (strings.Contains(obj.Key, "/o2/") || legacyMode)
 	} else {
 		canDelete = deleteMode
 		if !canDelete && supersededMode {

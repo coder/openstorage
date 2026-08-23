@@ -98,6 +98,11 @@ const (
 	// Enable only after list-only reports stop naming live objects
 	// (write-scoped touches adopt stored objects into the registry).
 	envSweepDeleteLFS = "CODESTORAGE_SWEEP_DELETE_LFS"
+	// envSweepDeleteLFSLegacy additionally admits LEGACY-SPELLED LFS keys
+	// to the LFS reap — the explicit post-roll cleanup opt-in of the
+	// ADR-41 two-phase key migration (Codex round 81). Keep it off while
+	// any pre-upgrade replica may still serve reads.
+	envSweepDeleteLFSLegacy = "CODESTORAGE_SWEEP_DELETE_LFS_LEGACY"
 
 	// Node-wide LFS upload staging budget (issue #51): proxy uploads
 	// stage their full Content-Length on local disk before verification,
@@ -286,6 +291,7 @@ type sweepSettings struct {
 	deleteEnabled    bool          // false = list-only (the default)
 	deleteSuperseded bool          // true = reap provably-folded blobs (the default, issue #31)
 	deleteLFS        bool          // false = list-only for LFS orphans (the default, issue #51)
+	deleteLFSLegacy  bool          // false = legacy-spelled LFS keys are never reaped (ADR-41 transition gate)
 }
 
 // storageURLs is the resolved storage location set shared by every
@@ -691,6 +697,13 @@ func resolveSweepSettings(getenv func(string) string) (sweepSettings, error) {
 			return sweepSettings{}, fmt.Errorf("%s: %w", envSweepDeleteLFS, err)
 		}
 		s.deleteLFS = v
+	}
+	if raw := getenv(envSweepDeleteLFSLegacy); raw != "" {
+		v, err := strconv.ParseBool(raw)
+		if err != nil {
+			return sweepSettings{}, fmt.Errorf("%s: %w", envSweepDeleteLFSLegacy, err)
+		}
+		s.deleteLFSLegacy = v
 	}
 	return s, nil
 }
