@@ -1066,7 +1066,9 @@ func TestLFSCompatCopy_BudgetScalesWithSize(t *testing.T) {
 	if err := srv.Blob.UploadFile(context.Background(), key, writeTempFile(t, content)); err != nil {
 		t.Fatal(err)
 	}
-	srv.maybeLegacyCompatCopy(context.Background(), lfsTestRepoID, oid, key, 10<<30)
+	if err := srv.maybeLegacyCompatCopy(context.Background(), lfsTestRepoID, oid, key, 10<<30); err != nil {
+		t.Fatalf("compat copy: %v", err)
+	}
 	if got := time.Duration(cb.budget.Load()); got < 2*time.Hour {
 		t.Fatalf("compat copy budget = %v for a 10 GiB object, want a size-scaled allowance (>= ~2h51m) — a fixed 1m cap cancels every large copy", got)
 	}

@@ -365,7 +365,11 @@ replicas running v0.2.0 or older derive only the legacy single-key spelling and
 cannot see canonically stored objects. During a rolling upgrade from v0.2.0, set
 this on the **upgraded** replicas so every verified LFS publication is also copied
 to the legacy key — not-yet-upgraded replicas keep serving those objects for the
-duration of the roll. Drop the variable once the whole fleet is upgraded: the
+duration of the roll. The bridge is enforced, not best-effort: an upload whose
+compat copy fails answers `502` (the canonical object is already durable and
+registered — the client's retry is zero-growth and repairs the copy), and
+write-scoped touches of registered objects repair a missing legacy spelling.
+Drop the variable once the whole fleet is upgraded: the
 compat copies are rowless, so the [orphan sweep](../how-to/storage-lifecycle-and-sweeping.md)
 reclaims them under its LFS opt-in.
 

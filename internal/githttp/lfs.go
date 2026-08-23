@@ -702,6 +702,12 @@ func (s *Server) adoptLFSObject(ctx context.Context, repoID, key, oid string) er
 			// the lease parked for a retry that now has nothing to do
 			// (Codex round 76): free the memo and its lease.
 			s.dropLFSVerifyResume(key)
+			// The registered fast path is the ONLY path retries of a
+			// stored object ever reach, so bridge convergence lives here
+			// (Codex round 83): a compat copy that failed after
+			// registration is repaired by the next write-scoped touch
+			// instead of 404ing on old replicas forever.
+			return s.ensureLegacyCompat(ctx, repoID, oid, key)
 		}
 		return err
 	}
@@ -1056,17 +1062,11 @@ func (s *Server) adoptLFSObject(ctx context.Context, repoID, key, oid string) er
 	// at all (a verified publication whose registration failed or timed
 	// out, registered by this retry) — with the compat bridge active,
 	// old replicas would 404 them despite the flag (Codex round 82).
-	// Ensure the legacy spelling exists; the probe keeps the hot path at
-	// one stat only when compat is on.
-	if s.LFSV020WriteCompat {
-		lctx, lcancel := context.WithTimeout(context.WithoutCancel(ctx), lfsProbeTimeout)
-		_, lerr := s.Blob.Stat(lctx, blob.LFSLegacyKey(repoID, oid))
-		lcancel()
-		if errors.Is(lerr, blob.ErrNotFound) {
-			s.maybeLegacyCompatCopy(ctx, repoID, oid, key, verifiedSize)
-		}
-	}
-	return nil
+	// Ensure the legacy spelling exists; failures PROPAGATE (Codex round
+	// 83) so the client keeps retrying — the registration is committed
+	// and idempotent, and the retry's registered fast path converges the
+	// bridge through the same seam.
+	return s.ensureLegacyCompat(ctx, repoID, oid, key)
 }
 
 // verifyStoredLFSObject streams the blob at key through sha256 in
@@ -1421,12 +1421,17 @@ func (s *Server) parkLFSClaimOwner(key, owner string) bool {
 func (s *Server) publishVerifiedLFSObject(ctx context.Context, repoID, key, legacyKey string, size int64, claimOwner string) error {
 	assertf(claimOwner != "", "publishVerifiedLFSObject(%q)", key)
 	doCopy := func(opCtx context.Context) error {
-		// Lease fence: renew immediately before the copy and bound the
-		// copy WELL inside the fresh ref.AdoptionClaimTTL. Only the live
-		// lease holder ever writes the canonical key on the adoption
-		// side, so a stale worker cannot overwrite a successor's
-		// verified or registered canonical bytes — its renewal fails
-		// here instead.
+		// Lease fence: renew immediately before the copy, then keep the
+		// lease renewed on the adoption cadence for the copy's WHOLE
+		// size-scaled life (Codex security round 83 — the previous
+		// clamp to ref.AdoptionClaimTTL−5m guaranteed cancellation of
+		// every sequential multipart copy slower than 25 minutes,
+		// aborting all completed parts on each retry: a repeatable
+		// full-object cost that never converges for large objects).
+		// Only a live lease holder ever writes the canonical key on the
+		// adoption side; a definitive renewal loss cancels the copy, so
+		// a stale worker still cannot overwrite a successor's verified
+		// or registered canonical bytes.
 		rctx, rcancel := context.WithTimeout(opCtx, lfsClaimRenewTimeout)
 		renewed, rerr := s.Store.RenewAdoptionClaim(rctx, key, claimOwner)
 		rcancel()
@@ -1436,13 +1441,15 @@ func (s *Server) publishVerifiedLFSObject(ctx context.Context, repoID, key, lega
 		if !renewed {
 			return errLFSBusy // lease lost: the successor owns the copy now
 		}
-		bound := min(5*time.Minute+time.Duration(size>>20)*time.Second, ref.AdoptionClaimTTL-5*time.Minute)
-		cctx, ccancel := context.WithTimeout(opCtx, bound)
-		defer ccancel()
-		if err := s.Blob.Copy(cctx, key, legacyKey); err != nil {
-			return fmt.Errorf("canonicalize %s: %w", legacyKey, err)
-		}
-		return nil
+		return s.withRenewedAdoptionClaim(opCtx, key, claimOwner, func(copyCtx context.Context) error {
+			bound := 5*time.Minute + time.Duration(size>>20)*time.Second
+			cctx, ccancel := context.WithTimeout(copyCtx, bound)
+			defer ccancel()
+			if err := s.Blob.Copy(cctx, key, legacyKey); err != nil {
+				return fmt.Errorf("canonicalize %s: %w", legacyKey, err)
+			}
+			return nil
+		})
 	}
 	// Detached from the requester like the verification itself (Codex
 	// round 31's argument applies to the copy equally): a client
@@ -1479,6 +1486,53 @@ func (s *Server) publishVerifiedLFSObject(ctx context.Context, repoID, key, lega
 		// The bytes are durable and the cover tail broke: log like the
 		// restore paths — the next admission's fresh floor lists them.
 		log.Printf("lfs adopt %s: publish cover tail: %v", key, renewErr)
+	}
+	return nil
+}
+
+// withRenewedAdoptionClaim runs op while renewing the fleet claim for key
+// on the adoption cadence (Codex security round 83): work that may
+// legitimately outlast one ref.AdoptionClaimTTL — the size-scaled publish
+// copy — must hold a LIVE lease for its whole duration, or a takeover
+// mid-copy would let two workers write the canonical key concurrently. A
+// renewal failure is treated as loss (indeterminate is not "held") and
+// cancels op with the loss as its cause.
+func (s *Server) withRenewedAdoptionClaim(ctx context.Context, key, owner string, op func(context.Context) error) error {
+	assertf(key != "" && owner != "", "withRenewedAdoptionClaim(%q, %q)", key, owner)
+	opCtx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		ticker := time.NewTicker(lfsAdoptClaimRenewInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-opCtx.Done():
+				return
+			case <-ticker.C:
+			}
+			rctx, rcancel := context.WithTimeout(opCtx, lfsClaimRenewTimeout)
+			renewed, err := s.Store.RenewAdoptionClaim(rctx, key, owner)
+			rcancel()
+			if err != nil {
+				cancel(fmt.Errorf("renew claim during publish: %w", err))
+				return
+			}
+			if !renewed {
+				cancel(fmt.Errorf("claim for %s expired and was taken over: %w", key, errLFSBusy))
+				return
+			}
+		}
+	}()
+	if err := op(opCtx); err != nil {
+		// Surface the loss cause rather than the bare context error.
+		if cause := context.Cause(opCtx); cause != nil && !errors.Is(cause, context.Canceled) && opCtx.Err() != nil {
+			return cause
+		}
+		return err
 	}
 	return nil
 }
@@ -2255,7 +2309,17 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target r
 		s.invalidateUsageFloor(repoID)
 	}
 	releaseUploadResources()
-	s.maybeLegacyCompatCopy(ctx, repoID, oid, key, n)
+	// A failed compat copy FAILS the request (Codex round 83): the
+	// canonical object is durable and registered, so the client's retry
+	// is zero-growth and lands on the registered fast path, whose
+	// ensureLegacyCompat seam repairs the missing spelling — returning
+	// 200 here instead would leave old replicas 404ing this object with
+	// nothing left to converge it.
+	if err := s.maybeLegacyCompatCopy(ctx, repoID, oid, key, n); err != nil {
+		log.Printf("lfs compat %s: %v", key, err)
+		lfsError(w, http.StatusBadGateway, "compatibility copy failed, retry")
+		return
+	}
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -2263,13 +2327,14 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target r
 // upgrade (ADR-41, Codex round 80): with LFSV020WriteCompat set, a
 // verified publication is also copied to the legacy spelling so
 // not-yet-upgraded replicas — which derive only that key — keep serving
-// the object until the fleet rolls. Best-effort and detached: compat is an
-// availability bridge, never a correctness dependency (the canonical copy
-// stays the registered truth), and a failure just means old replicas 404
-// this object as they would any post-upgrade upload.
-func (s *Server) maybeLegacyCompatCopy(ctx context.Context, repoID, oid, key string, size int64) {
+// the object until the fleet rolls. Detached from the client but NOT
+// best-effort (Codex round 83): failures propagate so the request fails
+// and the client retries — the canonical copy stays the registered truth,
+// and the retry converges the bridge through ensureLegacyCompat's
+// registered fast path.
+func (s *Server) maybeLegacyCompatCopy(ctx context.Context, repoID, oid, key string, size int64) error {
 	if !s.LFSV020WriteCompat {
-		return
+		return nil
 	}
 	legacyKey := blob.LFSLegacyKey(repoID, oid)
 	// Size-scaled allowance, not a fixed wall-clock cap (Codex round 81):
@@ -2291,9 +2356,9 @@ func (s *Server) maybeLegacyCompatCopy(ctx context.Context, repoID, oid, key str
 	dctx := context.WithoutCancel(ctx)
 	if size <= 0 || s.PackQuotaBytes <= 0 {
 		if err := doCopy(dctx); err != nil {
-			log.Printf("lfs compat copy %s: %v", key, err)
+			return fmt.Errorf("compat copy %s: %w", legacyKey, err)
 		}
-		return
+		return nil
 	}
 	// The compat copy materializes ANOTHER size bytes after registration
 	// consumed the canonical upload's reservation (Codex round 82): a
@@ -2312,11 +2377,50 @@ func (s *Server) maybeLegacyCompatCopy(ctx context.Context, repoID, oid, key str
 	}
 	copyErr, renewErr := blob.WithRenewedCover(dctx, renewCover, doCopy, bump)
 	if copyErr != nil {
-		log.Printf("lfs compat copy %s: %v", key, copyErr)
-		return
+		// PROPAGATED, not swallowed (Codex round 83): a 200 with no
+		// legacy spelling does not converge — the canonical row is
+		// registered, so no client retry would ever reach a path that
+		// re-attempts this copy without the registered-retry repair seam.
+		// Failing the request keeps the client retrying until
+		// ensureLegacyCompat lands the spelling.
+		return fmt.Errorf("compat copy %s: %w", legacyKey, copyErr)
 	}
 	s.invalidateUsageFloor(repoID)
 	if renewErr != nil {
+		// The bytes ARE durable; only the cover tail broke. Log like the
+		// restore paths.
 		log.Printf("lfs compat copy %s: cover tail: %v", key, renewErr)
 	}
+	return nil
+}
+
+// ensureLegacyCompat repairs a missing legacy spelling for a REGISTERED
+// object (Codex round 83): a compat copy that failed after registration
+// left the object 404ing on old replicas, and every retry lands on the
+// registered fast paths — so those paths must converge the bridge, or
+// nothing ever will. One extra legacy stat per registered write-touch,
+// only while the compat flag is on; the copy budget is derived from the
+// canonical object's stored size.
+func (s *Server) ensureLegacyCompat(ctx context.Context, repoID, oid, key string) error {
+	if !s.LFSV020WriteCompat {
+		return nil
+	}
+	lctx, lcancel := context.WithTimeout(context.WithoutCancel(ctx), lfsProbeTimeout)
+	_, lerr := s.Blob.Stat(lctx, blob.LFSLegacyKey(repoID, oid))
+	lcancel()
+	switch {
+	case lerr == nil:
+		return nil // the spelling exists: nothing to converge
+	case !errors.Is(lerr, blob.ErrNotFound):
+		return fmt.Errorf("compat probe %s: %w", blob.LFSLegacyKey(repoID, oid), lerr)
+	}
+	sctx, scancel := context.WithTimeout(context.WithoutCancel(ctx), lfsProbeTimeout)
+	size, serr := s.Blob.Stat(sctx, key)
+	scancel()
+	if serr != nil {
+		// Registered-but-blobless is the zero-growth repair state; the
+		// compat bridge has nothing to copy until it heals.
+		return fmt.Errorf("compat source %s: %w", key, serr)
+	}
+	return s.maybeLegacyCompatCopy(ctx, repoID, oid, key, size)
 }
