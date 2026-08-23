@@ -1611,7 +1611,38 @@ func (s *Server) publishVerifiedLFSObject(ctx context.Context, repoID, key, lega
 	}
 	copyErr, renewErr := blob.WithRenewedCover(dctx, renewCover, doCopy, nil)
 	if copyErr != nil {
-		return fmt.Errorf("adoption publish %s: %w", key, copyErr)
+		// Ambiguous-commit probe (Codex round 96, the adoption twin of
+		// round 95's bridge fix): the copy can commit its destination and
+		// still return an error — returning here skipped the cover tail,
+		// leaving the durable ROWLESS canonical bytes invisible to a
+		// pre-copy cached floor for its whole serve-and-handoff window
+		// (registration's atomic bump only heals after some later retry
+		// re-verifies and registers). A present destination is a commit —
+		// but only under a still-held lease may this worker CONTINUE into
+		// the re-verify and registration (rounds 88/93: success must
+		// never stand on a lost lease; a renewal failure propagates the
+		// copy error and leaves the key to the claim's successor).
+		actx, acancel := context.WithTimeout(dctx, lfsProbeTimeout)
+		_, aerr := s.Blob.Stat(actx, key)
+		acancel()
+		if aerr != nil {
+			return fmt.Errorf("adoption publish %s: %w", key, copyErr)
+		}
+		lctx, lcancel := context.WithTimeout(dctx, lfsClaimRenewTimeout)
+		renewed, lerr := s.Store.RenewAdoptionClaim(lctx, key, claimOwner)
+		lcancel()
+		if lerr != nil || !renewed {
+			return fmt.Errorf("adoption publish %s: %w", key, copyErr)
+		}
+		if s.PackQuotaBytes > 0 && size > 0 {
+			hctx, hcancel := context.WithTimeout(dctx, blob.CoverHandoffTimeout)
+			if cerr := ref.ReserveRestoreCover(hctx, s.Store, blob.QuotaRepoGroup(repoID), key, size, s.lfsReservationTTL()); cerr != nil {
+				log.Printf("lfs adopt %s: ambiguous-commit cover: %v", key, cerr)
+			}
+			hcancel()
+		}
+		log.Printf("lfs adopt %s: destination committed despite copy error: %v", key, copyErr)
+		return nil // the caller's destination re-verify digest-proves the bytes
 	}
 	if renewErr != nil {
 		// The bytes are durable and the cover tail broke: log like the
