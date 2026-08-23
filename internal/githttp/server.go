@@ -5,6 +5,7 @@
 package githttp
 
 import (
+	"bytes"
 	"compress/gzip"
 	"context"
 	"encoding/json"
@@ -78,6 +79,10 @@ type Server struct {
 	// stream into git (issue #55, pushcap.go); <= 0 disables the cap. Set
 	// by the serve wiring (default: a small multiple of the pack quota).
 	MaxPushBytes int64
+	// uploadPackReadTimeout overrides the fixed gzip negotiation body-read
+	// deadline in tests; zero uses defaultUploadPackReadTimeout. It is not an
+	// operator knob — production always leaves it zero.
+	uploadPackReadTimeout time.Duration
 	// VerifySigBudget caps how many commits one push may signature-verify
 	// (issue #59, verifystate.go); <= 0 disables the budget. Set by the
 	// serve wiring.
@@ -368,6 +373,32 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 		httpError(w, http.StatusRequestEntityTooLarge, capMsg)
 		return
 	}
+	// Bound under-cap clients that stall between gzip members or before EOF.
+	// Production's statusRecorder unwraps to net/http's deadline-capable
+	// writer; unsupported test/custom writers keep functional cap coverage.
+	uploadReadDeadlineSet := false
+	clearUploadReadDeadline := func() {
+		if !uploadReadDeadlineSet {
+			return
+		}
+		if err := http.NewResponseController(w).SetReadDeadline(time.Time{}); err != nil {
+			log.Printf("%s %s: clear negotiation read deadline: %v", service, repo, err)
+		}
+		uploadReadDeadlineSet = false
+	}
+	if uploadCapped {
+		readTimeout := s.uploadPackReadTimeout
+		if readTimeout <= 0 {
+			readTimeout = defaultUploadPackReadTimeout
+		}
+		assertf(readTimeout > 0, "upload-pack read timeout = %v", readTimeout)
+		if err := http.NewResponseController(w).SetReadDeadline(time.Now().Add(readTimeout)); err != nil {
+			log.Printf("%s %s: set negotiation read deadline: %v", service, repo, err)
+		} else {
+			uploadReadDeadlineSet = true
+			defer clearUploadReadDeadline()
+		}
+	}
 	body := io.Reader(r.Body)
 	var wireCap *cappedReader
 	if gzipped {
@@ -397,30 +428,28 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 		body = gz
 	}
 	if uploadCapped {
-		// Spool the whole decoded negotiation under both caps before
-		// hydrate or git upload-pack ever run (uploadcap.go): overflow of
-		// either counter is a deterministic 413, anything else that cuts
-		// the decode short (corrupt member, client hangup) a 400 — git
-		// never sees a byte of a rejected request.
+		// Read the whole decoded negotiation in memory under both caps
+		// BEFORE hydrate or git upload-pack runs (uploadcap.go). This keeps
+		// 413 deterministic without replica-global temp-disk pressure.
 		assertf(wireCap != nil, "uploadCapped without a wire counter")
 		decodedCap := newCappedReader(body, maxUploadPackBytes)
-		buffered, err := bufferUploadPackBody(decodedCap)
+		decoded, err := io.ReadAll(decodedCap)
+		clearUploadReadDeadline()
 		if decodedCap.exceeded || wireCap.exceeded {
 			log.Printf("%s %s: negotiation exceeded the %d-byte cap or its wire allowance, rejected with 413", service, repo, maxUploadPackBytes)
 			httpError(w, http.StatusRequestEntityTooLarge, capMsg)
 			return
 		}
 		if err != nil {
-			if errors.Is(err, errUploadPackSpool) {
-				log.Printf("%s %s: negotiation spool: %v", service, repo, err)
-				httpError(w, http.StatusInternalServerError, "fetch setup failed")
+			var timeoutErr interface{ Timeout() bool }
+			if errors.As(err, &timeoutErr) && timeoutErr.Timeout() {
+				httpError(w, http.StatusRequestTimeout, "fetch negotiation body timed out")
 			} else {
 				httpError(w, http.StatusBadRequest, "bad gzip body: "+err.Error())
 			}
 			return
 		}
-		defer buffered.Close()
-		body = buffered
+		body = bytes.NewReader(decoded)
 	}
 	var pushCap *cappedReader
 	if capped {

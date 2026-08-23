@@ -25,7 +25,7 @@ import (
 // deliberately no knob); testUploadWireLimit pins its compressed-stream
 // allowance. A sizing change must consciously update this test and the
 // deploy-production docs.
-const testUploadPackCap = 64 << 20
+const testUploadPackCap = 4 << 20
 
 var testUploadWireLimit = wirePushLimit(testUploadPackCap)
 

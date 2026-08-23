@@ -12,9 +12,9 @@ import (
 	"crypto"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"testing"
 	"time"
 
@@ -291,51 +291,65 @@ func TestServiceRPC_CrashHeaderRefusedOutsideTestMode(t *testing.T) {
 	}
 }
 
-// Local spool failures are server setup errors, not malformed client gzip:
-// valid gzip must receive the structured 500 without reaching hydration.
-func TestServiceRPC_UploadPackSpoolFailureIs500(t *testing.T) {
+// A gzip negotiation that stays under both byte caps but withholds EOF must
+// not pin the connection indefinitely. The deadline fires before hydration,
+// returns a structured 408, and is test-overridden to keep the unit fast.
+func TestServiceRPC_UploadPackReadTimeoutIs408(t *testing.T) {
 	key, pemBlock := genKeyPEM(t, "ES256")
-	repo := meta.Repo{RepoID: "repo_spool123456", URL: "spool-failure"}
+	repo := meta.Repo{RepoID: "repo_timeout1234", URL: "fetch-timeout"}
 	srv := &Server{
-		// Store/Blob/CacheDir stay zero: the spool verdict must happen
-		// before hydration, and unexpected pass-through fails loudly.
 		Verifier: auth.NewVerifier(memKeys{"org1": {pemBlock}}),
 		Org:      "org1",
 		ResolveRepo: func(_ context.Context, base string) (meta.Repo, bool) {
 			return repo, base == repo.URL
 		},
+		uploadPackReadTimeout: 100 * time.Millisecond,
 	}
+	httpServer := httptest.NewServer(srv.Handler())
+	defer httpServer.Close()
 	token := mintUnitToken(t, key, "ES256", unitClaims("org1", repo.URL, auth.ScopeGitRead))
 
-	var compressed bytes.Buffer
-	zw := gzip.NewWriter(&compressed)
-	if _, err := zw.Write(make([]byte, uploadPackMemBufferMax+1)); err != nil {
-		t.Fatal(err)
-	}
+	var member bytes.Buffer
+	zw := gzip.NewWriter(&member)
 	if err := zw.Close(); err != nil {
 		t.Fatal(err)
 	}
+	pr, pw := io.Pipe()
+	release := make(chan struct{})
+	writerDone := make(chan struct{})
+	go func() {
+		defer close(writerDone)
+		_, _ = pw.Write(member.Bytes())
+		<-release // withhold EOF until the server has answered
+		_ = pw.Close()
+	}()
 
-	previous := createUploadPackTemp
-	createUploadPackTemp = func() (*os.File, error) {
-		return nil, os.ErrPermission
+	req, err := http.NewRequest(http.MethodPost, httpServer.URL+"/fetch-timeout.git/git-upload-pack", pr)
+	if err != nil {
+		t.Fatal(err)
 	}
-	t.Cleanup(func() { createUploadPackTemp = previous })
-
-	req := httptest.NewRequest(http.MethodPost, "/spool-failure.git/git-upload-pack", bytes.NewReader(compressed.Bytes()))
 	req.SetBasicAuth("t", token)
 	req.Header.Set("Content-Type", "application/x-git-upload-pack-request")
 	req.Header.Set("Content-Encoding", "gzip")
-	rec := httptest.NewRecorder()
-	srv.Handler().ServeHTTP(rec, req)
-	if rec.Code != http.StatusInternalServerError {
-		t.Fatalf("status = %d, want 500; body: %s", rec.Code, rec.Body.String())
+	resp, err := httpServer.Client().Do(req)
+	close(release)
+	<-writerDone
+	if err != nil {
+		t.Fatalf("POST git-upload-pack: %v", err)
+	}
+	defer resp.Body.Close()
+	got, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	if resp.StatusCode != http.StatusRequestTimeout {
+		t.Fatalf("status = %d, want 408; body: %s", resp.StatusCode, got)
 	}
 	var body map[string]string
-	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
-		t.Fatalf("decode JSON error: %v; body: %s", err, rec.Body.String())
+	if err := json.Unmarshal(got, &body); err != nil {
+		t.Fatalf("decode JSON error: %v; body: %s", err, got)
 	}
-	if body["error"] != "fetch setup failed" {
-		t.Fatalf("error = %q, want fetch setup failed", body["error"])
+	if body["error"] != "fetch negotiation body timed out" {
+		t.Fatalf("error = %q, want timeout message", body["error"])
 	}
 }
