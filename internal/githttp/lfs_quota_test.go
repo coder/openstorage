@@ -15,6 +15,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -420,6 +422,83 @@ func TestLFSAdoption_OutlivesReservationTTL(t *testing.T) {
 	}
 	if has, err := st.HasLFSObject(ctx, lfsTestRepoID, key); err != nil || !has {
 		t.Fatalf("object not adopted: %v, %v", has, err)
+	}
+}
+
+// stallOnceBlob stalls the first ranged read at stallOff past its context
+// deadline and records every read offset, simulating one slow range on a
+// congested backend.
+type stallOnceBlob struct {
+	blob.BlobStore
+	stallOff int64
+	stalled  atomic.Bool
+	mu       sync.Mutex
+	reads    []int64
+}
+
+func (b *stallOnceBlob) ReadRange(ctx context.Context, key string, offset, length int64) ([]byte, error) {
+	b.mu.Lock()
+	b.reads = append(b.reads, offset)
+	b.mu.Unlock()
+	if offset == b.stallOff && !b.stalled.Swap(true) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	return b.BlobStore.ReadRange(ctx, key, offset, length)
+}
+
+// TestLFSAdoption_ResumesAfterSlowRange (Codex round 57): a ranged read
+// slower than the per-chunk stall guard aborts the verification and
+// releases the per-key slot — if the next attempt restarted from offset
+// zero, chronic per-range slowness would replay completed ranges forever,
+// never adopting and amplifying the congestion that aborted it. Aborts
+// must save their progress: the retry continues after the completed
+// ranges (offset zero is read exactly once across both attempts) and the
+// adoption converges.
+func TestLFSAdoption_ResumesAfterSlowRange(t *testing.T) {
+	ctx := context.Background()
+	oldChunk, oldTimeout := lfsStagingChunk, lfsVerifyChunkTimeout
+	lfsStagingChunk, lfsVerifyChunkTimeout = 4, 100*time.Millisecond
+	t.Cleanup(func() { lfsStagingChunk, lfsVerifyChunkTimeout = oldChunk, oldTimeout })
+
+	srv, st, mint := newLFSQuotaServer(t, 0, time.Hour)
+	tok := mint(auth.ScopeGitWrite)
+
+	legacy := []byte("legacy 12b!!") // three 4-byte chunks
+	oid := sha256Hex(legacy)
+	key := blob.LFSKey(lfsTestRepoID, oid)
+	if err := srv.Blob.UploadFile(ctx, key, writeTempFile(t, legacy)); err != nil {
+		t.Fatal(err)
+	}
+	// The second chunk stalls once: attempt 1 hashes [0,4), aborts on
+	// [4,8), and must save its progress.
+	bl := &stallOnceBlob{BlobStore: srv.Blob, stallOff: 4}
+	srv.Blob = bl
+
+	resp := decodeBatch(t, doLFS(t, srv, http.MethodPost, lfsBatchPath, "basic:"+tok,
+		batchBody("upload", oid, int64(len(legacy)))))
+	if resp.Objects[0].Error == nil {
+		t.Fatalf("stalled adoption reported stored: %+v", resp.Objects[0])
+	}
+	// Attempt 2 converges — and never re-reads the completed range.
+	resp = decodeBatch(t, doLFS(t, srv, http.MethodPost, lfsBatchPath, "basic:"+tok,
+		batchBody("upload", oid, int64(len(legacy)))))
+	if resp.Objects[0].Error != nil || resp.Objects[0].Actions != nil {
+		t.Fatalf("resumed adoption failed: %+v", resp.Objects[0])
+	}
+	if has, err := st.HasLFSObject(ctx, lfsTestRepoID, key); err != nil || !has {
+		t.Fatalf("object not adopted: %v, %v", has, err)
+	}
+	bl.mu.Lock()
+	defer bl.mu.Unlock()
+	zeroReads := 0
+	for _, off := range bl.reads {
+		if off == 0 {
+			zeroReads++
+		}
+	}
+	if zeroReads != 1 {
+		t.Fatalf("offset 0 read %d times across attempts (reads: %v), want exactly 1 — completed ranges must not replay", zeroReads, bl.reads)
 	}
 }
 

@@ -25,10 +25,12 @@ import (
 	"compress/gzip"
 	"context"
 	"crypto/sha256"
+	"encoding"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"log"
 	"net/http"
@@ -849,13 +851,40 @@ func (s *Server) verifyStoredLFSObject(ctx context.Context, repo, key, oid strin
 		return 0, errLFSBusy
 	}
 	defer s.releaseLFSVerifyBuffer(repo)
+	// Resume rather than replay (Codex round 57): an abort below — chunk
+	// stall, allowance expiry, transient read error — released the
+	// per-key slot, so the next write-scoped touch restarted the whole
+	// ranged read from offset zero: chronic per-range slowness (a
+	// congested backend needing over a chunk window per range) could
+	// replay completed ranges forever, never adopting and amplifying the
+	// very congestion that aborted it. Aborts now save the offset and
+	// sha256 midstate; the next attempt continues after the completed
+	// ranges, so total backend reads are bounded by ~one object plus one
+	// lost chunk per abort — monotone progress. The final digest check
+	// stays the correctness authority: resume state is only ever an
+	// accelerant (size-keyed, single-use, evicted on use), and a stale
+	// midstate over a same-size replaced blob at worst yields the
+	// mismatch path, whose guarded delete the concurrent writer's
+	// registration blocks or its writer-verify repairs — the same race
+	// the direct mismatch path already tolerates.
 	h := sha256.New()
-	for off := int64(0); off < size; {
+	var off int64
+	if r, ok := s.takeLFSVerifyResume(key, size); ok {
+		if u, uok := h.(encoding.BinaryUnmarshaler); uok && u.UnmarshalBinary(r.state) == nil {
+			off = r.off
+		} else {
+			h = sha256.New() // defensive: never hash on a half-restored state
+		}
+	}
+	for off < size {
 		n := min(lfsStagingChunk, size-off)
 		cctx, ccancel := context.WithTimeout(vctx, lfsVerifyChunkTimeout)
 		chunk, err := s.Blob.ReadRange(cctx, key, off, n)
 		ccancel()
 		if err != nil {
+			if off > 0 {
+				s.saveLFSVerifyResume(key, size, off, h)
+			}
 			return 0, fmt.Errorf("read for verification [%d,%d): %w", off, off+n, err)
 		}
 		h.Write(chunk)
@@ -865,6 +894,62 @@ func (s *Server) verifyStoredLFSObject(ctx context.Context, repo, key, oid strin
 		return 0, errLFSContentMismatch
 	}
 	return size, nil
+}
+
+// lfsVerifyResume is a partially completed adoption hash: the verified
+// prefix length and the sha256 midstate over it (Codex round 57).
+type lfsVerifyResume struct {
+	size  int64
+	off   int64
+	state []byte
+}
+
+// lfsMaxVerifyResumes bounds the resume cache (arbitrary eviction beyond
+// it). Entries are a few hundred bytes; the cap only exists so unbounded
+// distinct aborting keys cannot grow replica memory.
+const lfsMaxVerifyResumes = 128
+
+// saveLFSVerifyResume records a verification's progress for the key so
+// the next attempt can continue after the completed ranges.
+func (s *Server) saveLFSVerifyResume(key string, size, off int64, h hash.Hash) {
+	assertf(off > 0 && off < size, "saveLFSVerifyResume(%q): off %d, size %d", key, off, size)
+	m, ok := h.(encoding.BinaryMarshaler)
+	if !ok {
+		return
+	}
+	state, err := m.MarshalBinary()
+	if err != nil {
+		return
+	}
+	s.lfsVerifyResumeMu.Lock()
+	defer s.lfsVerifyResumeMu.Unlock()
+	if s.lfsVerifyResumes == nil {
+		s.lfsVerifyResumes = make(map[string]lfsVerifyResume)
+	}
+	if _, exists := s.lfsVerifyResumes[key]; !exists && len(s.lfsVerifyResumes) >= lfsMaxVerifyResumes {
+		for k := range s.lfsVerifyResumes {
+			delete(s.lfsVerifyResumes, k) // arbitrary eviction: resume is an accelerant, not a contract
+			break
+		}
+	}
+	s.lfsVerifyResumes[key] = lfsVerifyResume{size: size, off: off, state: state}
+}
+
+// takeLFSVerifyResume claims (and removes — single use, re-saved on the
+// next abort) the key's saved progress. A size change means the blob was
+// replaced since the abort: the state is discarded and the hash restarts.
+func (s *Server) takeLFSVerifyResume(key string, size int64) (lfsVerifyResume, bool) {
+	s.lfsVerifyResumeMu.Lock()
+	defer s.lfsVerifyResumeMu.Unlock()
+	r, ok := s.lfsVerifyResumes[key]
+	if !ok {
+		return lfsVerifyResume{}, false
+	}
+	delete(s.lfsVerifyResumes, key)
+	if r.size != size {
+		return lfsVerifyResume{}, false
+	}
+	return r, true
 }
 
 // stagingFileWriter covers every byte with staging budget BEFORE it lands

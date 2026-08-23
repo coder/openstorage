@@ -141,6 +141,13 @@ type Server struct {
 	lfsVerifyOps     int
 	lfsRepoVerifyOps map[string]int
 	lfsStagingMu     sync.Mutex
+	// lfsVerifyResumes holds partially completed adoption hashes by blob
+	// key (Codex round 57): an aborted verification saves its offset and
+	// sha256 midstate so the next attempt continues instead of replaying
+	// completed ranges from offset zero. Guarded by lfsVerifyResumeMu;
+	// bounded by lfsMaxVerifyResumes.
+	lfsVerifyResumes  map[string]lfsVerifyResume
+	lfsVerifyResumeMu sync.Mutex
 }
 
 // lfsMaxStagingOps bounds concurrent staging operations per replica
@@ -234,12 +241,14 @@ var lfsProbeTimeout = time.Minute
 var lfsStagingChunk = int64(8 << 20)
 
 // lfsVerifyChunkTimeout bounds ONE ranged read of an adoption
-// verification hash (Codex security round 56). The hash's absolute bound
-// scales with the object so it can always finish (verifyStoredLFSObject);
-// this per-chunk stall guard is what protects the op slot and verify
-// buffer from a WEDGED backend — the slots come back within one chunk
-// window, not the whole size-scaled allowance.
-const lfsVerifyChunkTimeout = time.Minute
+// verification hash (Codex security round 56; a var for tests). The
+// hash's absolute bound scales with the object so it can always finish
+// (verifyStoredLFSObject); this per-chunk stall guard is what protects
+// the op slot and verify buffer from a WEDGED backend — the slots come
+// back within one chunk window, not the whole size-scaled allowance. An
+// abort never discards progress: the saved resume state (Codex round 57)
+// lets the next attempt continue after the completed ranges.
+var lfsVerifyChunkTimeout = time.Minute
 
 // lfsMaxVerifyBuffers caps concurrent legacy-verification buffer slots
 // node-wide (Codex round 26, security): each in-flight verification holds
