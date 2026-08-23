@@ -8,9 +8,11 @@ package sync
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	stdsync "sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -129,4 +131,79 @@ func TestSyncRequestDuringClaimedRunIsObserved(t *testing.T) {
 	<-runDone // the follow-up run completed (its events are recorded)
 	assertEventTypes(t, f.rec.list(),
 		EventSyncStarted, EventSyncSucceeded, EventSyncStarted, EventSyncSucceeded)
+}
+
+// A run whose context expires mid-transfer must still clear its claim:
+// finishSync runs on a context detached from the run's budget. A claim
+// wedged by an expired-context FinishSync would make every later run —
+// including requeued pull-upstream requests — skip at BeginSync forever.
+func TestFinishSyncSurvivesExpiredRunContext(t *testing.T) {
+	f := newWorkerFixture(t)
+	seedUpstream(t, f.upstreamDir, "own", "proj")
+	f.addLoopbackRepo(t, "repo_exp")
+	f.putUpstream(t, "repo_exp", "own", "proj", "file://"+f.upstreamDir)
+
+	gate := &gatedUpstreams{
+		UpstreamStore: f.store,
+		entered:       make(chan struct{}),
+		release:       make(chan struct{}),
+	}
+	f.worker.Upstreams = gate
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- f.worker.Run(ctx, Job{Org: "acme", RepoID: "repo_exp"}) }()
+	<-gate.entered      // the run holds the claim, blocked at the barrier
+	cancel()            // its budget expires while the claim is held
+	close(gate.release) // the remaining transfer fails on the dead context
+
+	if err := <-done; err == nil {
+		t.Error("Run with an expired context returned nil, want the transfer failure")
+	}
+	up, err := f.store.GetUpstream(context.Background(), "repo_exp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if up.Syncing || up.RunCount != 1 || up.SuccessCount != 0 {
+		t.Errorf("row after expired-context run = %+v, want cleared claim and one counted failed run", up)
+	}
+	assertEventTypes(t, f.rec.list(), EventSyncStarted, EventSyncFailed)
+}
+
+// flakyFinishUpstreams fails the first `fails` FinishSync calls.
+type flakyFinishUpstreams struct {
+	UpstreamStore
+	fails atomic.Int32
+}
+
+func (f *flakyFinishUpstreams) FinishSync(ctx context.Context, repoID string, success bool) (Upstream, error) {
+	if f.fails.Add(-1) >= 0 {
+		return Upstream{}, errors.New("transient store blip")
+	}
+	return f.UpstreamStore.FinishSync(ctx, repoID, success)
+}
+
+// A transient FinishSync failure must be retried while the claim is still
+// held — only the holder can clear it.
+func TestFinishSyncRetriesTransientFailure(t *testing.T) {
+	f := newWorkerFixture(t)
+	seedUpstream(t, f.upstreamDir, "own", "proj")
+	f.addLoopbackRepo(t, "repo_flk")
+	f.putUpstream(t, "repo_flk", "own", "proj", "file://"+f.upstreamDir)
+
+	flaky := &flakyFinishUpstreams{UpstreamStore: f.store}
+	flaky.fails.Store(1)
+	f.worker.Upstreams = flaky
+
+	if err := f.worker.Run(context.Background(), Job{Org: "acme", RepoID: "repo_flk"}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	up, err := f.store.GetUpstream(context.Background(), "repo_flk")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if up.Syncing || up.RunCount != 1 || up.SuccessCount != 1 {
+		t.Errorf("row after retried finish = %+v, want cleared claim and one counted successful run", up)
+	}
+	assertEventTypes(t, f.rec.list(), EventSyncStarted, EventSyncSucceeded)
 }

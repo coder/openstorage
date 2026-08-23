@@ -169,7 +169,7 @@ func (w *Worker) Run(ctx context.Context, job Job) error {
 		return nil // detach raced the run: the row is gone, cancel silently
 	}
 
-	fin, err := w.Upstreams.FinishSync(ctx, job.RepoID, runErr == nil)
+	fin, err := w.finishSync(ctx, job.RepoID, runErr == nil)
 	if errors.Is(err, ErrNotFound) {
 		return nil // detached mid-run: cancel silently (docs/reference/webhooks.md)
 	}
@@ -205,6 +205,39 @@ func (w *Worker) Run(ctx context.Context, job Job) error {
 		}
 	}
 	return runErr
+}
+
+// finishSyncAttempts bounds finishSync retries; the backoff between
+// attempt n and n+1 is n seconds.
+const finishSyncAttempts = 3
+
+// finishSync completes the claimed run on a context DETACHED from the
+// run's own budget, retrying transient failures. Only the claim holder can
+// clear Syncing, so a FinishSync failed on the run's already-expired
+// context (the run timeout is the most likely cause of reaching here late)
+// would wedge the row permanently — every later run, including requeued
+// pull-upstream requests, would skip at BeginSync forever. ErrNotFound
+// (detach) returns immediately; exhausting the attempts leaves the row in
+// the documented crash state (claim held until operator action).
+func (w *Worker) finishSync(ctx context.Context, repoID string, success bool) (Upstream, error) {
+	fctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
+	var lastErr error
+	for attempt := 1; attempt <= finishSyncAttempts; attempt++ {
+		fin, err := w.Upstreams.FinishSync(fctx, repoID, success)
+		if err == nil || errors.Is(err, ErrNotFound) {
+			return fin, err
+		}
+		lastErr = err
+		w.Logger.Warn("finish sync failed; retrying while the claim is held",
+			"repo", repoID, "attempt", attempt, "err", err)
+		select {
+		case <-fctx.Done():
+			return Upstream{}, lastErr
+		case <-time.After(time.Duration(attempt) * time.Second):
+		}
+	}
+	return Upstream{}, lastErr
 }
 
 // mirrorRefspecs mirror heads and tags; the leading + lets upstream

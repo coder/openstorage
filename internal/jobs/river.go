@@ -388,13 +388,20 @@ func (w *syncWorker) Work(ctx context.Context, job *river.Job[syncArgs]) error {
 		// Detached mid-flight: nothing to follow up.
 	case err != nil:
 		return completionFailed("pending recheck", err)
-	case up.SyncPending && runErr != nil && preKnown && up.RunCount == preRuns && !up.Syncing:
-		// The run failed BEFORE claiming (post-claim failures count the
-		// run via FinishSync) and no claim holder is live to cover the
-		// pending request — completing would strand the accepted 202.
-		// Snooze retries the whole run, whose claim then consumes the
-		// marker. (Returning without commit rolls the completion back.)
-		w.logger.Warn("sync: run failed before claiming with a pending request; snoozing to retry it",
+	case up.SyncPending && runErr != nil && preKnown && up.RunCount == preRuns:
+		// The run failed without counting a run: either it never claimed
+		// (transient lookup/store error) or it claimed and could not
+		// finish even through finishSync's detached retries. Completing
+		// would strand the accepted 202 — no successor exists and, with
+		// no counted run, no claim holder's gate is guaranteed to cover
+		// it. Snooze retries the whole run: once any live holder finishes
+		// (or the claim was never taken), the retry claims and consumes
+		// the marker. If the claim is truly wedged (crash-equivalent
+		// FinishSync exhaustion), the retry skips cleanly (runErr nil)
+		// and completes, degrading to the documented crash behavior
+		// instead of snoozing forever. (Returning without commit rolls
+		// the completion back.)
+		w.logger.Warn("sync: run failed with an uncovered pending request; snoozing to retry it",
 			"repo", job.Args.RepoID, "err", runErr)
 		return river.JobSnooze(syncFollowUpSnooze)
 	case up.SyncPending && (!preKnown || up.RunCount != preRuns):
