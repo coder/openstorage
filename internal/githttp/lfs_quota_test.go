@@ -2301,6 +2301,50 @@ func TestLFSAdopt_CoverCanceledCommitRejected(t *testing.T) {
 	}
 }
 
+// readCountingBlob counts ranged verification reads per key.
+type readCountingBlob struct {
+	blob.BlobStore
+	reads atomic.Int64
+}
+
+func (b *readCountingBlob) ReadRange(ctx context.Context, key string, offset, length int64) ([]byte, error) {
+	b.reads.Add(1)
+	return b.BlobStore.ReadRange(ctx, key, offset, length)
+}
+
+// TestLFSAdopt_QuotaPreflightSkipsHash (Codex security round 108): the
+// copy admission ran AFTER the full-object verification hash, so an
+// over-quota repository re-read the entire legacy blob on every
+// write-scoped touch — a 1,000-entry batch of one OID re-hashed it 1,000
+// times with no byte ever uploading. A cheap advisory ledger read must
+// fail the hopeless adoption BEFORE any ranged read.
+func TestLFSAdopt_QuotaPreflightSkipsHash(t *testing.T) {
+	ctx := context.Background()
+	srv, st, _ := newLFSQuotaServer(t, 100, time.Hour)
+	// The repo is at quota: an unrelated registered object fills it.
+	filler := bytes.Repeat([]byte("f"), 100)
+	fillerOID := sha256Hex(filler)
+	if err := st.RegisterLFSObject(ctx, lfsTestRepoID, blob.LFSKey(lfsTestRepoID, fillerOID), 100); err != nil {
+		t.Fatal(err)
+	}
+	content := bytes.Repeat([]byte("x"), 50)
+	oid := sha256Hex(content)
+	key := blob.LFSKey(lfsTestRepoID, oid)
+	if err := srv.Blob.UploadFile(ctx, blob.LFSLegacyKey(lfsTestRepoID, oid), writeTempFile(t, content)); err != nil {
+		t.Fatal(err)
+	}
+	rc := &readCountingBlob{BlobStore: srv.Blob}
+	srv.Blob = rc
+
+	aerr := srv.adoptLFSObject(ctx, lfsTestRepoID, key, oid)
+	if !errors.Is(aerr, errLFSAdoptQuotaExceeded) {
+		t.Fatalf("over-quota adoption = %v, want errLFSAdoptQuotaExceeded", aerr)
+	}
+	if n := rc.reads.Load(); n != 0 {
+		t.Fatalf("over-quota adoption performed %d ranged reads before denying — every retry re-reads the whole blob for free", n)
+	}
+}
+
 // TestLFSCompat_RepairSerializedOnLegacyClaim (Codex security round 85):
 // the batch fast path's bridge repair launched an unserialized full copy —
 // every tiny concurrent touch of the object started another one. Compat

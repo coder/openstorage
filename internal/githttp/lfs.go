@@ -920,6 +920,37 @@ func (s *Server) adoptLFSObject(ctx context.Context, repoID, key, oid string) er
 	case terr != nil:
 		return fmt.Errorf("canonical probe %s: %w", key, terr)
 	}
+	// Advisory quota preflight BEFORE the ranged verification hash
+	// (Codex security round 108): the copy admission lives in
+	// publishVerifiedLFSObject — after the full-object hash — so an
+	// over-quota repository re-read entire legacy blobs on every
+	// write-scoped touch (a 1,000-entry batch of one OID re-hashes it
+	// 1,000 times) with no byte ever uploading: repeatable,
+	// client-cost-free blob-store traffic. A cheap ledger read fails the
+	// hopeless adoption first; the real admission below stays
+	// authoritative, and this read takes NO rows (the batch's round-17
+	// advisory shape — a durable hold here would be rotatable). Only the
+	// legacy→canonical copy needs headroom; re-adopting existing
+	// canonical bytes is zero-growth.
+	if target != key && s.PackQuotaBytes > 0 {
+		sctx, scancel := context.WithTimeout(ctx, lfsProbeTimeout)
+		srcSize, serr := s.Blob.Stat(sctx, target)
+		scancel()
+		if serr == nil && srcSize > 0 {
+			floor, ferr := s.CachedUsageFloor(ctx, repoID)
+			if ferr != nil {
+				return fmt.Errorf("adoption preflight %s: usage listing: %w", key, ferr)
+			}
+			ls, lerr := s.Store.QuotaLedgerState(ctx, blob.QuotaRepoGroup(repoID), s.lfsReservationTTL(), key)
+			if lerr != nil {
+				return fmt.Errorf("adoption preflight %s: ledger read: %w", key, lerr)
+			}
+			if used := ref.AddSat(ls.UsageBytes, floor); !ref.Admitted(used, ls.ReservedBytes, srcSize, s.PackQuotaBytes) {
+				return fmt.Errorf("adopt %s: %w (copy adds %d bytes to %d stored, +%d reserved, quota %d)",
+					key, errLFSAdoptQuotaExceeded, srcSize, used, ls.ReservedBytes, s.PackQuotaBytes)
+			}
+		}
+	}
 	// Bounded like publication (Codex round 17) and DETACHED from the
 	// client (Codex round 31, security): adoption is server-side repair
 	// work. A client canceling mid-verification would abort the ranged
