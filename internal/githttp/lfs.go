@@ -922,7 +922,25 @@ func (s *Server) adoptStoredLFSObject(ctx context.Context, repoID, key, oid stri
 			// copy was still in flight — a copy failure then stranded the
 			// legacy spelling with no request left to converge it.
 			s.dropLFSVerifyResume(key)
-			return s.ensureLegacyCompat(ctx, repoID, oid, key)
+			if cerr := s.ensureLegacyCompat(ctx, repoID, oid, key); cerr != nil {
+				return cerr
+			}
+			// Re-arm the grace clock after the size-scaled bridge copy,
+			// exactly like the registered fast path (Codex round 13): the
+			// twin minted this row BEFORE a potentially grace-long copy,
+			// so a scan can mark it mid-copy and a write-scoped 200 must
+			// still be the promise of a freshly touched row. Restores
+			// answer downloads — no pointer-commit promise — and must
+			// never extend an unreferenced row's life.
+			if restore {
+				return nil
+			}
+			if touched, terr := s.Store.TouchLFSObject(ctx, repoID, key); terr != nil {
+				return terr
+			} else if !touched {
+				return errLFSBusy
+			}
+			return nil
 		}
 		// A v0.2.0 legacy-spelled row for THIS oid already holds the
 		// object's cap slot (Codex round 86): registration migrates it in
@@ -1479,7 +1497,28 @@ func (s *Server) adoptStoredLFSObject(ctx context.Context, repoID, key, oid stri
 	// 83) so the client keeps retrying — the registration is committed
 	// and idempotent, and the retry's registered fast path converges the
 	// bridge through the same seam.
-	return s.ensureLegacyCompat(ctx, repoID, oid, key)
+	if cerr := s.ensureLegacyCompat(ctx, repoID, oid, key); cerr != nil {
+		return cerr
+	}
+	// Final liveness re-touch (issue #73, Codex round 13): the
+	// registration above committed BEFORE the sweep-race probe and the
+	// size-scaled bridge copy, either of which can outlast a short GC
+	// grace — a scan can mark the still-unreferenced row meanwhile, and
+	// once the adoption claim lapses a grace-expired mark retires it even
+	// though this success promises the writer it may commit its pointer.
+	// Restores answer downloads — no pointer-commit promise — and must
+	// never extend an unreferenced row's life. touched=false means the
+	// row already vanished: answer retryable so the retry re-registers
+	// instead of promising a retired row.
+	if restore {
+		return nil
+	}
+	if touched, terr := s.Store.TouchLFSObject(ctx, repoID, key); terr != nil {
+		return terr
+	} else if !touched {
+		return errLFSBusy
+	}
+	return nil
 }
 
 // verifyStoredLFSObject streams the blob at key through sha256 in
@@ -3326,6 +3365,22 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target r
 	if cause := context.Cause(regionCtx); cause != nil && !errors.Is(cause, context.Canceled) {
 		log.Printf("lfs claim %s: %v", key, cause)
 		lfsError(w, http.StatusInternalServerError, "object claim lost during publication, retry")
+		return
+	}
+	// Final liveness re-touch (issue #73, Codex round 13): registration
+	// left the row unmarked, but it committed BEFORE the sweep-race
+	// verify and the size-scaled compat copy, either of which can outlast
+	// a short GC grace — a scan can mark the still-unreferenced row
+	// meanwhile. The 200 below promises the client it may commit its
+	// pointer, so it must be the promise of a freshly touched row.
+	// touched=false means the row is already gone: answer retryable so
+	// the retry re-registers instead.
+	if touched, terr := s.Store.TouchLFSObject(ctx, repoID, key); terr != nil {
+		log.Printf("lfs touch %s: %v", key, terr)
+		lfsError(w, http.StatusInternalServerError, "liveness touch failed, retry")
+		return
+	} else if !touched {
+		lfsError(w, http.StatusTooManyRequests, "object retired during upload, retry")
 		return
 	}
 	w.WriteHeader(http.StatusOK)

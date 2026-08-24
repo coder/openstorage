@@ -3,11 +3,13 @@ package githttp
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -206,4 +208,170 @@ func TestLFSDirectPUT_RetiredMidBodyDemotesToNewGrowth(t *testing.T) {
 	if w.Code != http.StatusInsufficientStorage {
 		t.Fatalf("mid-body-retired PUT status = %d, body %s", w.Code, w.Body)
 	}
+}
+
+// markAfterRegisterStore stamps the reclamation mark the moment a
+// registration for key commits — the deterministic stand-in for a scan
+// verdict landing in the window between the registration and the handler's
+// success answer (issue #73, review round 13), which the sweep-race probe
+// and the size-scaled compat copy can stretch past a short grace.
+type markAfterRegisterStore struct {
+	ref.RefStore
+	key string
+}
+
+func (m *markAfterRegisterStore) markNow(ctx context.Context, repo, key string) error {
+	if key != m.key {
+		return nil
+	}
+	if n, err := m.RefStore.(lfsMarkSurface).MarkLFSObjectsUnreferenced(ctx, repo, []string{key}); err != nil || n != 1 {
+		return fmt.Errorf("mid-flight mark = (%d, %v), want 1", n, err)
+	}
+	return nil
+}
+
+func (m *markAfterRegisterStore) RegisterLFSObject(ctx context.Context, repo, key string, bytes int64) error {
+	if err := m.RefStore.RegisterLFSObject(ctx, repo, key, bytes); err != nil {
+		return err
+	}
+	return m.markNow(ctx, repo, key)
+}
+
+func (m *markAfterRegisterStore) RegisterAdoptedLFSObject(ctx context.Context, repo, key string, bytes int64) error {
+	if err := m.RefStore.RegisterAdoptedLFSObject(ctx, repo, key, bytes); err != nil {
+		return err
+	}
+	return m.markNow(ctx, repo, key)
+}
+
+// capRaceCountStore makes the adoption cap precheck observe a full
+// repository whose last slot was just taken by a twin registration of the
+// very key being adopted — with a scan verdict already stamped on the
+// twin's fresh row (issue #73, review round 13).
+type capRaceCountStore struct {
+	ref.RefStore
+	key   string
+	bytes int64
+	once  sync.Once
+	err   error
+}
+
+func (c *capRaceCountStore) CountLFSObjects(ctx context.Context, repo string) (int64, error) {
+	c.once.Do(func() {
+		if err := c.RefStore.RegisterLFSObject(ctx, repo, c.key, c.bytes); err != nil {
+			c.err = err
+			return
+		}
+		if n, err := c.RefStore.(lfsMarkSurface).MarkLFSObjectsUnreferenced(ctx, repo, []string{c.key}); err != nil || n != 1 {
+			c.err = fmt.Errorf("twin mark = (%d, %v), want 1", n, err)
+		}
+	})
+	if c.err != nil {
+		return 0, c.err
+	}
+	return ref.MaxLFSObjectsPerRepo, nil
+}
+
+// assertLFSRowUnmarked fails when key's row is missing or still carries a
+// reclamation mark.
+func assertLFSRowUnmarked(t *testing.T, st ref.RefStore, key, when string) {
+	t.Helper()
+	rows, ok := st.(lfsMarkSurface)
+	if !ok {
+		t.Fatalf("store %T lacks the row listing surface", st)
+	}
+	listed, err := rows.ListRepoLFSObjects(context.Background(), lfsTestRepoID, "", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range listed {
+		if row.Key != key {
+			continue
+		}
+		if !row.UnreferencedSince.IsZero() {
+			t.Fatalf("%s left the reclamation mark: %+v", when, row)
+		}
+		return
+	}
+	t.Fatalf("%s: row %s missing (rows: %+v)", when, key, listed)
+}
+
+// TestLFSDirectPUT_LateAdoptionRegistrationRetouches (issue #73, review
+// round 13): a rowless stored object adopted by a direct PUT registers its
+// row BEFORE the sweep-race probe and bridge copy — a scan verdict landing
+// in that window must not survive the 200, or a short grace could retire
+// the row before the client pushes its pointer.
+func TestLFSDirectPUT_LateAdoptionRegistrationRetouches(t *testing.T) {
+	srv, mint := newLFSServer(t, openFileBlob(t))
+	writeTok := mint("git:write")
+	ctx := context.Background()
+	content := []byte("late adoption retouch bytes")
+	oid := sha256Hex(content)
+	key := blob.LFSKey(lfsTestRepoID, oid)
+
+	scratch := filepath.Join(t.TempDir(), "obj")
+	if err := os.WriteFile(scratch, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.Blob.UploadFile(ctx, key, scratch); err != nil {
+		t.Fatal(err)
+	}
+	inner := srv.Store
+	srv.Store = &markAfterRegisterStore{RefStore: inner, key: key}
+
+	objPath := "/" + lfsTestRepoURL + ".git/info/lfs/objects/" + oid
+	if w := doLFS(t, srv, http.MethodPut, objPath, "basic:"+writeTok, string(content)); w.Code != http.StatusOK {
+		t.Fatalf("adopting PUT status = %d, body %s", w.Code, w.Body)
+	}
+	assertLFSRowUnmarked(t, inner, key, "late adoption registration")
+}
+
+// TestLFSDirectPUT_CapRaceWinnerRetouches (issue #73, review round 13): at
+// the cap boundary a twin can register the adopted key between the entry
+// lookup and the count — the race winner answers success through the
+// bridge seam and must re-arm the twin's row like every other write-scoped
+// 200.
+func TestLFSDirectPUT_CapRaceWinnerRetouches(t *testing.T) {
+	srv, mint := newLFSServer(t, openFileBlob(t))
+	writeTok := mint("git:write")
+	ctx := context.Background()
+	content := []byte("cap race retouch bytes")
+	oid := sha256Hex(content)
+	key := blob.LFSKey(lfsTestRepoID, oid)
+
+	scratch := filepath.Join(t.TempDir(), "obj")
+	if err := os.WriteFile(scratch, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.Blob.UploadFile(ctx, key, scratch); err != nil {
+		t.Fatal(err)
+	}
+	inner := srv.Store
+	srv.Store = &capRaceCountStore{RefStore: inner, key: key, bytes: int64(len(content))}
+
+	objPath := "/" + lfsTestRepoURL + ".git/info/lfs/objects/" + oid
+	if w := doLFS(t, srv, http.MethodPut, objPath, "basic:"+writeTok, string(content)); w.Code != http.StatusOK {
+		t.Fatalf("cap-race PUT status = %d, body %s", w.Code, w.Body)
+	}
+	assertLFSRowUnmarked(t, inner, key, "cap-boundary race winner")
+}
+
+// TestLFSDirectPUT_FreshUploadRetouches (issue #73, review round 13): a
+// fresh proxied upload registers BEFORE the sweep-race verify and compat
+// copy; a scan verdict landing in that window must not survive the 200.
+func TestLFSDirectPUT_FreshUploadRetouches(t *testing.T) {
+	srv, mint := newLFSServer(t, openFileBlob(t))
+	writeTok := mint("git:write")
+	content := []byte("fresh upload retouch bytes")
+	oid := sha256Hex(content)
+	key := blob.LFSKey(lfsTestRepoID, oid)
+
+	inner := srv.Store
+	srv.Store = &markAfterRegisterStore{RefStore: inner, key: key}
+
+	objPath := "/" + lfsTestRepoURL + ".git/info/lfs/objects/" + oid
+	if w := doLFS(t, srv, http.MethodPut, objPath, "basic:"+writeTok, string(content)); w.Code != http.StatusOK {
+		t.Fatalf("fresh PUT status = %d, body %s", w.Code, w.Body)
+	}
+	assertLFSRowUnmarked(t, inner, key, "fresh upload")
 }
