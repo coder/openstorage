@@ -41,7 +41,7 @@ import (
 // mux.Handle("/api/", h). refStore/blobStore/cacheDir back the
 // git:read endpoints — serve passes the same instances the githttp fallback
 // uses so both surfaces share one cache.
-func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL, loopbackBaseURL string, orgPEMBlocks []string, refStore ref.RefStore, blobStore blob.BlobStore, cacheDir string, rate api.RateLimitConfig, packQuotaBytes int64, packReservationTTL time.Duration, sweep sweepSettings, repackThreshold int, webhookAllowPrivate bool, secretsCodec *secrets.Codec, usageFloor func(context.Context, string) (int64, int64, error)) (http.Handler, meta.Store, auth.Verifier, func(ctx context.Context, repo string), func(), error) {
+func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL, loopbackBaseURL string, orgPEMBlocks []string, refStore ref.RefStore, blobStore blob.BlobStore, cacheDir string, rate api.RateLimitConfig, packQuotaBytes int64, packReservationTTL time.Duration, sweep sweepSettings, lfsWriteCompat bool, repackThreshold int, webhookAllowPrivate bool, secretsCodec *secrets.Codec, usageFloor func(context.Context, string) (int64, int64, error)) (http.Handler, meta.Store, auth.Verifier, func(ctx context.Context, repo string), func(), error) {
 	assertf(dbURL != "" && org != "" && httpBaseURL != "" && len(orgPEMBlocks) > 0, "buildAPIHandler: missing dbURL/org/httpBaseURL/keys")
 	assertf(loopbackBaseURL != "", "buildAPIHandler: missing loopbackBaseURL")
 	assertf(refStore != nil && blobStore != nil && cacheDir != "", "buildAPIHandler: missing refStore/blobStore/cacheDir")
@@ -180,7 +180,7 @@ func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL, loopbackBaseU
 		// serving would otherwise fail hydrations of the stranded pack
 		// until another restart anyway (fail-fast beats limping).
 		return fail(fmt.Errorf("startup quarantine heal (sweeping disabled): %w", err))
-	} else {
+	} else if lfsWriteCompat {
 		// Heal's twin-row janitor ran once, but a mixed-version rollout
 		// can strand a legacy/canonical LFS row twin at ANY time after
 		// startup (Codex round 88): an old replica touching a retained
@@ -188,7 +188,13 @@ func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL, loopbackBaseU
 		// re-register, and with sweeping disabled nothing else would
 		// reconcile it — the double count and usage charge would persist
 		// until restart. Keep the janitor alive on the default sweep
-		// cadence; each quiet tick is one point read.
+		// cadence — but ONLY while the compat flag declares a mixed
+		// fleet (Codex round 111): old replicas are the sole twin
+		// creators, the reconcile candidate query has no supporting
+		// index (`strpos(key, '/o2/')`), and an hourly full scan of the
+		// attacker-growable LFS registry is unjustifiable in the steady
+		// sweep-disabled state, where the startup Heal pass already
+		// reconciled any roll-era stragglers.
 		stopReconcile = jobs.StartReconcileTicker(sweeper, jobs.ReconcileTickInterval)
 	}
 

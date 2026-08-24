@@ -436,7 +436,7 @@ func resolveServeConfig(getenv func(string) string, flagListen, flagAddr, flagCa
 	if err != nil {
 		return serveConfig{}, err
 	}
-	if cfg.lfsV020WriteCompat && cfg.sweep.deleteLFS {
+	if cfg.lfsV020WriteCompat && cfg.sweep.deleteLFS && cfg.sweep.interval > 0 {
 		// Rolling-upgrade tripwire (Codex round 101, P1): the compat flag
 		// declares a mixed v0.2.0 fleet, and during that roll DESTRUCTIVE
 		// LFS sweeping must be off FLEET-WIDE — the in-place row
@@ -446,7 +446,11 @@ func resolveServeConfig(getenv func(string) string, flagListen, flagAddr, flagCa
 		// breaking old-replica reads and freshly issued presigned GETs.
 		// Old binaries cannot be guarded retroactively; failing startup
 		// on the nodes we do control forces the staged rollout the docs
-		// describe (list-only during the roll, opt-ins after).
+		// describe (list-only during the roll, opt-ins after). A zero
+		// interval constructs no schedule at all (Codex round 111): the
+		// delete flag is inert then, and rejecting it would block the
+		// documented fleet-wide sweep emergency stop — re-enabling the
+		// interval restarts the process and re-runs this validation.
 		return serveConfig{}, fmt.Errorf(
 			"%s and %s cannot be combined: destructive LFS sweeping must stay disabled fleet-wide (old v0.2.0 sweepers included) until the roll completes and the compat flag is dropped",
 			envLFSV020WriteCompat, envSweepDeleteLFS)

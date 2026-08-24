@@ -377,8 +377,11 @@ reclaims them under its LFS opt-in.
 - **Default:** `false`. The canonical spelling is the secure one — the compat
   copies are exactly as exposed to still-valid legacy upload URLs as everything
   v0.2.0 served — so compat is opt-in and meant to be temporary.
-- **Cannot be combined with [`CODESTORAGE_SWEEP_DELETE_LFS`](#codestorage_sweep_delete_lfs)**
-  (a fail-fast startup error): the flag declares a mixed v0.2.0 fleet, and during
+- **Cannot be combined with [`CODESTORAGE_SWEEP_DELETE_LFS`](#codestorage_sweep_delete_lfs)
+  while a sweep schedule is active** (`CODESTORAGE_SWEEP_INTERVAL` > 0 — a
+  fail-fast startup error; with the interval at `0` no schedule is built, the
+  delete flag is inert, and the fleet-wide sweep emergency stop stays
+  available): the flag declares a mixed v0.2.0 fleet, and during
   that roll destructive LFS sweeping must be off **fleet-wide** — the in-place row
   migration makes a touched object's legacy blob rowless to an old binary's
   sweeper, which has no legacy gate and reaps it immediately, breaking

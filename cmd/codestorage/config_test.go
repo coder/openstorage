@@ -66,6 +66,17 @@ func TestResolveServeConfigCompatForbidsDestructiveLFSSweep(t *testing.T) {
 	if _, err := resolveServeConfig(mapEnv(env), "", "127.0.0.1:0", "/tmp/cache", ""); err == nil {
 		t.Fatal("write-compat + destructive LFS sweeping resolved — the combination breaks v0.2.0 replicas mid-roll and must fail startup")
 	}
+	// The fleet-wide sweep EMERGENCY STOP stays available (Codex round
+	// 111): a zero interval constructs no schedule, the delete flag is
+	// inert, and re-enabling the interval restarts the process and
+	// re-runs this validation — rejecting the combination would block
+	// the documented v0.2.0 rollout for operators who stop sweeping
+	// without also unsetting the stale delete preference.
+	env["CODESTORAGE_SWEEP_INTERVAL"] = "0"
+	if _, err := resolveServeConfig(mapEnv(env), "", "127.0.0.1:0", "/tmp/cache", ""); err != nil {
+		t.Fatalf("write-compat + inert delete flag under the sweep emergency stop: %v", err)
+	}
+	delete(env, "CODESTORAGE_SWEEP_INTERVAL")
 	// Compat with list-only sweeping stays valid.
 	delete(env, "CODESTORAGE_SWEEP_DELETE_LFS")
 	if _, err := resolveServeConfig(mapEnv(env), "", "127.0.0.1:0", "/tmp/cache", ""); err != nil {
