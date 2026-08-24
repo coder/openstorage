@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -18,6 +19,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
+	"github.com/aws/smithy-go/middleware"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 	gcblob "gocloud.dev/blob"
 	"gocloud.dev/blob/s3blob"
 )
@@ -665,14 +668,95 @@ type S3 struct {
 	bucket *gcblob.Bucket
 	client *s3.Client
 	name   string
+	// expectedOwner is the optional 12-digit AWS account ID every S3
+	// request asserts as the bucket owner (issue #58). Empty = disabled.
+	expectedOwner string
 }
 
 var _ BlobStore = (*S3)(nil)
 
+// EnvExpectedBucketOwner optionally pins every S3 request to a bucket
+// owner (issue #58): when set to a 12-digit AWS account ID, the client
+// middleware sends the bucket-owner condition on EVERY operation, so a
+// bucket whose global name was re-registered by another account yields
+// 403 Access Denied instead of silently serving/accepting private packs.
+// Read here (not in cmd config) so every process that opens the store —
+// serve, git hooks (inheriting the serve environment), and the purge CLI
+// — enforces it uniformly; a probe-only or serve-only check would leave
+// the rest of the data plane owner-blind. Empty (the default) attaches no
+// middleware and changes no behavior.
+const EnvExpectedBucketOwner = "CODESTORAGE_S3_EXPECTED_BUCKET_OWNER"
+
+// Bucket-owner condition headers (AWS S3 REST). The source spelling
+// asserts the owner of the bucket named in x-amz-copy-source on
+// CopyObject/UploadPartCopy; all copies here are same-bucket.
+const (
+	expectedOwnerHeader       = "x-amz-expected-bucket-owner"
+	expectedSourceOwnerHeader = "x-amz-source-expected-bucket-owner"
+)
+
+// awsAccountIDPattern is the only valid non-empty shape for the expected
+// owner: exactly 12 digits. A typo'd ID would 403 every operation on real
+// AWS, so misconfiguration is boot-fatal instead (crash-and-burn).
+var awsAccountIDPattern = regexp.MustCompile(`^[0-9]{12}$`)
+
+// expectedBucketOwnerFromEnv reads and validates EnvExpectedBucketOwner.
+func expectedBucketOwnerFromEnv() (string, error) {
+	owner := strings.TrimSpace(os.Getenv(EnvExpectedBucketOwner))
+	if owner != "" && !awsAccountIDPattern.MatchString(owner) {
+		return "", fmt.Errorf("%s must be a 12-digit AWS account ID, got %q", EnvExpectedBucketOwner, owner)
+	}
+	return owner, nil
+}
+
+// expectedBucketOwnerAPIOption returns the client middleware that stamps
+// the bucket-owner condition onto EVERY outgoing S3 request. The client
+// seam makes enforcement structurally all-or-nothing (issue #58): gocloud
+// data operations, transfermanager multipart uploads, the raw-client
+// bucket/copy calls, and presigned URLs all build requests through this
+// one stack, so a future call site cannot forget to thread the condition.
+// The Build step runs after serialization (the copy-source header is
+// visible) and before SigV4 signing, so direct requests sign the headers
+// and presigning hoists them into signed lowercase query parameters (see
+// S3.SignedURL). AWS documents the condition as ignored — not rejected —
+// on the operations that cannot carry it (CreateBucket, ListBuckets).
+func expectedBucketOwnerAPIOption(owner string) func(*middleware.Stack) error {
+	assertf(awsAccountIDPattern.MatchString(owner), "expectedBucketOwnerAPIOption(%q)", owner)
+	return func(stack *middleware.Stack) error {
+		return stack.Build.Add(middleware.BuildMiddlewareFunc("codestorageExpectedBucketOwner",
+			func(ctx context.Context, in middleware.BuildInput, next middleware.BuildHandler) (middleware.BuildOutput, middleware.Metadata, error) {
+				req, ok := in.Request.(*smithyhttp.Request)
+				assertf(ok, "expected-bucket-owner middleware: request type %T", in.Request)
+				req.Header.Set(expectedOwnerHeader, owner)
+				if req.Header.Get("x-amz-copy-source") != "" {
+					req.Header.Set(expectedSourceOwnerHeader, owner)
+				}
+				return next.HandleBuild(ctx, in)
+			}), middleware.After)
+	}
+}
+
+// s3ClientOptions is the shared client wiring for OpenS3 and the unit
+// tests that capture the HTTP requests the SDK actually emits.
+func s3ClientOptions(endpoint, expectedOwner string) func(*s3.Options) {
+	return func(o *s3.Options) {
+		if endpoint != "" {
+			o.BaseEndpoint = aws.String(endpoint)
+		}
+		// MinIO needs path-style addressing; harmless otherwise.
+		o.UsePathStyle = true
+		if expectedOwner != "" {
+			o.APIOptions = append(o.APIOptions, expectedBucketOwnerAPIOption(expectedOwner))
+		}
+	}
+}
+
 // OpenS3 opens a blob URL, e.g.
 // s3://spike?endpoint=http://127.0.0.1:9000&s3ForcePathStyle=true&region=us-east-1
-// Credentials come from the standard AWS env vars. The URL is parsed by hand
-// (bucket = host, endpoint/region = query) so we control path-style behavior
+// Credentials come from the standard AWS env vars, and the optional
+// expected-bucket-owner enforcement comes from EnvExpectedBucketOwner (a
+// malformed value is boot-fatal). The URL is parsed by hand (bucket =
+// host, endpoint/region = query) so we control path-style behavior
 // deterministically against MinIO regardless of gocloud URL-param renames.
 func OpenS3(ctx context.Context, blobURL string) (*S3, error) {
 	assertf(blobURL != "", "OpenS3: empty blob URL")
@@ -687,6 +771,10 @@ func OpenS3(ctx context.Context, blobURL string) (*S3, error) {
 	if bucketName == "" {
 		return nil, errors.New("blob URL has no bucket name")
 	}
+	expectedOwner, err := expectedBucketOwnerFromEnv()
+	if err != nil {
+		return nil, err
+	}
 	q := u.Query()
 	region := q.Get("region")
 	if region == "" {
@@ -696,19 +784,12 @@ func OpenS3(ctx context.Context, blobURL string) (*S3, error) {
 	if err != nil {
 		return nil, fmt.Errorf("aws config: %w", err)
 	}
-	endpoint := q.Get("endpoint")
-	client := s3.NewFromConfig(cfg, func(o *s3.Options) {
-		if endpoint != "" {
-			o.BaseEndpoint = aws.String(endpoint)
-		}
-		// MinIO needs path-style addressing; harmless otherwise.
-		o.UsePathStyle = true
-	})
+	client := s3.NewFromConfig(cfg, s3ClientOptions(q.Get("endpoint"), expectedOwner))
 	bucket, err := s3blob.OpenBucket(ctx, client, bucketName, nil)
 	if err != nil {
 		return nil, fmt.Errorf("open bucket %q: %w", bucketName, err)
 	}
-	return &S3{bucket: bucket, client: client, name: bucketName}, nil
+	return &S3{bucket: bucket, client: client, name: bucketName, expectedOwner: expectedOwner}, nil
 }
 
 func (b *S3) Close() error { return b.bucket.Close() }
@@ -726,25 +807,64 @@ type bucketLifecycleClient interface {
 // role for a pre-provisioned bucket has no s3:CreateBucket, so AccessDenied
 // on create is not proof the bucket is missing: probe it with HeadBucket and
 // accept when reachable. Any other create error, or a denied create with an
-// unreachable bucket, stays boot-fatal.
+// unreachable bucket, stays boot-fatal. With an expected bucket owner
+// configured (issue #58), EVERY accepted outcome additionally passes an
+// owner-conditioned HeadBucket probe, so squatted names and
+// credential/account drift fail boot instead of 403ing data operations.
 func (b *S3) EnsureBucket(ctx context.Context) error {
 	assertf(b.client != nil, "EnsureBucket: S3 opened without a client")
-	return ensureBucket(ctx, b.client, b.name)
+	return ensureBucket(ctx, b.client, b.name, b.expectedOwner)
 }
 
-func ensureBucket(ctx context.Context, client bucketLifecycleClient, name string) error {
+func ensureBucket(ctx context.Context, client bucketLifecycleClient, name, expectedOwner string) error {
 	assertf(name != "", "ensureBucket: empty bucket name")
+	// The probe's HeadBucket carries x-amz-expected-bucket-owner via the
+	// client middleware whenever an owner is configured.
+	probe := func() error {
+		_, err := client.HeadBucket(ctx, &s3.HeadBucketInput{Bucket: aws.String(name)})
+		return err
+	}
 	_, err := client.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(name)})
 	if err == nil {
+		// Created — but S3 ignores the owner condition on CreateBucket
+		// itself, and the new bucket's owner is the CREDENTIALS' account,
+		// which may not be the configured expected owner (Codex round 1:
+		// credential/account drift). Probe so the mismatch fails boot
+		// here instead of 403ing every later data operation.
+		if expectedOwner == "" {
+			return nil
+		}
+		if headErr := probe(); headErr != nil {
+			return fmt.Errorf("created bucket %q but the expected-owner probe (account %s) failed: %w",
+				name, expectedOwner, headErr)
+		}
 		return nil
 	}
 	var apiErr smithy.APIError
 	if errors.As(err, &apiErr) {
 		switch apiErr.ErrorCode() {
 		case "BucketAlreadyOwnedByYou", "BucketAlreadyExists":
+			// AlreadyOwnedByYou proves the CREDENTIALS' account owns the
+			// bucket — not that it matches the configured owner (drift,
+			// as above). AlreadyExists means SOME account owns the name —
+			// exactly the squatting scenario the owner condition targets
+			// (issue #58). Without a configured owner both stay accepted
+			// as-is (compatibility); with one, both must pass the
+			// conditioned probe so a reowned or wrong-account bucket
+			// fails boot.
+			if expectedOwner == "" {
+				return nil
+			}
+			if headErr := probe(); headErr != nil {
+				return fmt.Errorf("bucket %q exists but the expected-owner probe (account %s) failed: %w",
+					name, expectedOwner, headErr)
+			}
 			return nil
 		case "AccessDenied":
-			if _, headErr := client.HeadBucket(ctx, &s3.HeadBucketInput{Bucket: aws.String(name)}); headErr != nil {
+			// Least-privilege roles may lack s3:CreateBucket; the denial
+			// is not proof the bucket is missing. The reachability probe
+			// doubles as the owner check when one is configured.
+			if headErr := probe(); headErr != nil {
 				return fmt.Errorf("create bucket %q denied (%v) and probe failed: %w", name, err, headErr)
 			}
 			return nil
@@ -802,6 +922,14 @@ func (b *S3) VersioningEnabled(ctx context.Context) (bool, error) {
 // Content-Type for PUT, and an unsigned Content-Type means git-lfs's
 // `Content-Type: application/octet-stream` PUT verifies against MinIO/S3
 // SigV4 without extra configuration.
+//
+// With expected-bucket-owner enforcement on, presigning runs through the
+// same client middleware as every other operation and the presigner
+// hoists the x-amz-* header into a SIGNED lowercase query parameter
+// (x-amz-expected-bucket-owner=...), the spelling S3 documents and
+// enforces on presigned requests (aws-sdk-go-v2 #2508). The URL is
+// self-contained: redeemers send no extra header, and stripping or
+// altering the parameter breaks the SigV4 signature.
 func (b *S3) SignedURL(ctx context.Context, key, method string, expiry time.Duration) (string, error) {
 	assertSignedURLArgs(key, method, expiry)
 	return b.bucket.SignedURL(ctx, key, &gcblob.SignedURLOptions{Method: method, Expiry: expiry})
