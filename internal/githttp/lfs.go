@@ -342,6 +342,28 @@ func (s *Server) lfsBatchDownload(r *http.Request, repoElem string, target repoT
 			size, err = s.Blob.Stat(r.Context(), key)
 		}
 	}
+	if errors.Is(err, blob.ErrNotFound) && registered {
+		// Registered but blobless (Codex round 119): the canonical bytes
+		// were lost to storage, yet the adoption-retained legacy copy may
+		// be the object's only surviving bytes — reap grace deliberately
+		// spares exactly this state, and a plain 404 would strand it
+		// until some client re-uploads. Recover through the verified
+		// adoption seam (digest-proof, canonical publish under the fleet
+		// claim, idempotent re-registration): legacy bytes are NEVER
+		// served directly under a registered row (round 78 — presigned
+		// PUTs bound no digest). A concurrent restorer answers 429 so
+		// the client retries into its result; any other failure leaves
+		// the honest 404.
+		switch aerr := s.restoreLFSObjectLocked(r.Context(), target.repo.RepoID, key, obj.OID); {
+		case aerr == nil:
+			size, err = s.Blob.Stat(r.Context(), key)
+		case errors.Is(aerr, errLFSBusy):
+			lfsObjectFail(&res, http.StatusTooManyRequests, "object recovery in progress; retry")
+			return res
+		default:
+			log.Printf("lfs download restore %s: %v", key, aerr)
+		}
+	}
 	if errors.Is(err, blob.ErrNotFound) {
 		lfsObjectFail(&res, http.StatusNotFound, "object not found")
 		return res
@@ -744,6 +766,22 @@ func (s *Server) adoptLFSObjectLocked(ctx context.Context, repoID, key, oid stri
 	return s.adoptLFSObject(ctx, repoID, key, oid)
 }
 
+// restoreLFSObjectLocked re-materializes a REGISTERED object whose
+// canonical blob was lost to storage from its adoption-retained legacy
+// copy (Codex round 119): the registered fast path deliberately
+// short-circuits every ordinary touch, so a download that just proved the
+// canonical spelling absent must bypass it to reach the verify → publish →
+// re-verify → register loop. Zero-growth by construction — the row already
+// holds its cap slot and its bytes stay counted; registration is the
+// documented idempotent no-op.
+func (s *Server) restoreLFSObjectLocked(ctx context.Context, repoID, key, oid string) error {
+	if _, busy := s.lfsUploadsInFlight.LoadOrStore(key, struct{}{}); busy {
+		return errLFSBusy
+	}
+	defer s.lfsUploadsInFlight.Delete(key)
+	return s.adoptStoredLFSObject(ctx, repoID, key, oid, true)
+}
+
 // adoptLFSObject backfills the lfs_objects registry row for an object that
 // is already stored but was never registered (uploads predating issue #51,
 // or a verified upload whose registration failed after publish). Callers
@@ -756,22 +794,34 @@ func (s *Server) adoptLFSObjectLocked(ctx context.Context, repoID, key, oid stri
 // key and has been removed — the caller must treat the object as MISSING
 // and take the verified upload path.
 func (s *Server) adoptLFSObject(ctx context.Context, repoID, key, oid string) error {
+	return s.adoptStoredLFSObject(ctx, repoID, key, oid, false)
+}
+
+// adoptStoredLFSObject is adoptLFSObject with the round-119 restore mode:
+// restore bypasses the registered fast path (which never republishes) so a
+// registered-but-blobless canonical can be re-materialized from its
+// retained legacy source through the full verify → publish → re-verify →
+// register loop. The registered row keeps its cap slot and byte credit, so
+// restore skips the cap precheck; the copy's cover admission stays real —
+// at the quota edge a restore may be conservatively denied, which fails
+// the download honestly rather than overshooting.
+func (s *Server) adoptStoredLFSObject(ctx context.Context, repoID, key, oid string, restore bool) error {
 	registered, err := s.Store.HasLFSObject(ctx, repoID, key)
-	if err != nil || registered {
-		if registered {
-			// A prior attempt's registration may have committed after
-			// its bounded context expired (indeterminate failure), with
-			// the lease parked for a retry that now has nothing to do
-			// (Codex round 76): free the memo and its lease.
-			s.dropLFSVerifyResume(key)
-			// The registered fast path is the ONLY path retries of a
-			// stored object ever reach, so bridge convergence lives here
-			// (Codex round 83): a compat copy that failed after
-			// registration is repaired by the next write-scoped touch
-			// instead of 404ing on old replicas forever.
-			return s.ensureLegacyCompat(ctx, repoID, oid, key)
-		}
+	if err != nil {
 		return err
+	}
+	if registered && !restore {
+		// A prior attempt's registration may have committed after
+		// its bounded context expired (indeterminate failure), with
+		// the lease parked for a retry that now has nothing to do
+		// (Codex round 76): free the memo and its lease.
+		s.dropLFSVerifyResume(key)
+		// The registered fast path is the ONLY path retries of a
+		// stored object ever reach, so bridge convergence lives here
+		// (Codex round 83): a compat copy that failed after
+		// registration is repaired by the next write-scoped touch
+		// instead of 404ing on old replicas forever.
+		return s.ensureLegacyCompat(ctx, repoID, oid, key)
 	}
 	// Fast-fail the object cap BEFORE the verification download (Codex
 	// security round 4): an at-cap repository holding a rowless legacy
@@ -780,9 +830,14 @@ func (s *Server) adoptLFSObject(ctx context.Context, repoID, key, oid string) er
 	// bandwidth/staging drain (a near-budget blob blocks the replica's
 	// unrelated uploads for the whole hash). O(1) counter read; advisory
 	// only — RegisterLFSObject's in-transaction check stays authoritative.
-	count, err := s.Store.CountLFSObjects(ctx, repoID)
-	if err != nil {
-		return err
+	// A registered row already holds its slot (the restore entrance):
+	// zero growth, no precheck.
+	count := int64(0)
+	if !registered {
+		count, err = s.Store.CountLFSObjects(ctx, repoID)
+		if err != nil {
+			return err
+		}
 	}
 	if count >= ref.MaxLFSObjectsPerRepo {
 		// At the boundary the count races a twin registering THIS key
@@ -2299,6 +2354,20 @@ func (s *Server) lfsProxyDownload(w http.ResponseWriter, r *http.Request, repoID
 		if reg2, rerr2 := s.Store.HasLFSObject(r.Context(), repoID, blob.LFSKey(repoID, oid)); rerr2 == nil && reg2 {
 			key = blob.LFSKey(repoID, oid)
 			size, err = s.Blob.Stat(r.Context(), key)
+		}
+	}
+	if errors.Is(err, blob.ErrNotFound) && registered {
+		// Registered but blobless — recover from the retained legacy
+		// copy through the verified adoption seam (Codex round 119),
+		// same as the batch path: never a direct legacy serve.
+		switch aerr := s.restoreLFSObjectLocked(r.Context(), repoID, key, oid); {
+		case aerr == nil:
+			size, err = s.Blob.Stat(r.Context(), key)
+		case errors.Is(aerr, errLFSBusy):
+			lfsError(w, http.StatusTooManyRequests, "object recovery in progress; retry")
+			return
+		default:
+			log.Printf("lfs download restore %s: %v", key, aerr)
 		}
 	}
 	if errors.Is(err, blob.ErrNotFound) {

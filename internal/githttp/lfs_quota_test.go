@@ -832,6 +832,87 @@ func TestLFSDownload_RetriesCanonicalAfterAdoptionRace(t *testing.T) {
 	}
 }
 
+// TestLFSDownload_RegisteredBloblessRecoversFromLegacy (Codex round 119,
+// P2): a registered row whose canonical blob was lost to storage served a
+// plain 404 even though the adoption-retained legacy copy — deliberately
+// spared by reap grace for exactly this state — held the object's only
+// surviving bytes, stranding downloads until some client re-uploaded. The
+// download paths must recover through the verified adoption seam
+// (digest-proof, canonical publish, idempotent re-registration) and serve
+// the restored canonical bytes; legacy bytes are never served directly
+// under a registered row (round 78).
+func TestLFSDownload_RegisteredBloblessRecoversFromLegacy(t *testing.T) {
+	ctx := context.Background()
+	for name, download := range map[string]func(t *testing.T, srv *Server, tok, oid string, size int64){
+		"batch": func(t *testing.T, srv *Server, tok, oid string, size int64) {
+			resp := decodeBatch(t, doLFS(t, srv, http.MethodPost, lfsBatchPath, "basic:"+tok,
+				`{"operation":"download","transfers":["basic"],"objects":[{"oid":"`+oid+`","size":1}]}`))
+			if resp.Objects[0].Error != nil || resp.Objects[0].Actions["download"] == nil {
+				t.Fatalf("registered-blobless download batch = %+v, want a recovery + download action", resp.Objects[0])
+			}
+			if resp.Objects[0].Size != size {
+				t.Fatalf("recovered download size = %d, want %d", resp.Objects[0].Size, size)
+			}
+		},
+		"object-get": func(t *testing.T, srv *Server, tok, oid string, size int64) {
+			w := doLFS(t, srv, http.MethodGet, "/"+lfsTestRepoURL+".git/info/lfs/objects/"+oid, "basic:"+tok, "")
+			if w.Code != http.StatusOK {
+				t.Fatalf("registered-blobless GET status = %d, body %s — the stranding 404", w.Code, w.Body)
+			}
+			if int64(w.Body.Len()) != size {
+				t.Fatalf("recovered GET body = %d bytes, want %d", w.Body.Len(), size)
+			}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			srv, st, mint := newLFSQuotaServer(t, 0, time.Hour)
+			tok := mint(auth.ScopeGitWrite, auth.ScopeGitRead)
+			content := []byte("the only surviving copy is legacy")
+			oid := sha256Hex(content)
+			key := blob.LFSKey(lfsTestRepoID, oid)
+			// Storage loss: the row stands, the canonical blob is gone,
+			// the retained legacy source survives.
+			if err := st.RegisterLFSObject(ctx, lfsTestRepoID, key, int64(len(content))); err != nil {
+				t.Fatal(err)
+			}
+			if err := srv.Blob.UploadFile(ctx, blob.LFSLegacyKey(lfsTestRepoID, oid), writeTempFile(t, content)); err != nil {
+				t.Fatal(err)
+			}
+			download(t, srv, tok, oid, int64(len(content)))
+			// The recovery republished the canonical spelling: the next
+			// touch serves it with no further adoption work.
+			if _, err := srv.Blob.Stat(ctx, key); err != nil {
+				t.Fatalf("canonical bytes not republished by the recovery: %v", err)
+			}
+		})
+	}
+
+	t.Run("corrupt-legacy-stays-404", func(t *testing.T) {
+		// The negative twin: a corrupt legacy survivor proves mismatched,
+		// is removed, and the honest 404 stands — recovery must never
+		// register or serve unverified bytes.
+		srv, st, mint := newLFSQuotaServer(t, 0, time.Hour)
+		tok := mint(auth.ScopeGitWrite, auth.ScopeGitRead)
+		content := []byte("what the pointer expects")
+		oid := sha256Hex(content)
+		key := blob.LFSKey(lfsTestRepoID, oid)
+		if err := st.RegisterLFSObject(ctx, lfsTestRepoID, key, int64(len(content))); err != nil {
+			t.Fatal(err)
+		}
+		if err := srv.Blob.UploadFile(ctx, blob.LFSLegacyKey(lfsTestRepoID, oid), writeTempFile(t, []byte("forged presigned-PUT bytes"))); err != nil {
+			t.Fatal(err)
+		}
+		resp := decodeBatch(t, doLFS(t, srv, http.MethodPost, lfsBatchPath, "basic:"+tok,
+			`{"operation":"download","transfers":["basic"],"objects":[{"oid":"`+oid+`","size":1}]}`))
+		if resp.Objects[0].Error == nil || resp.Objects[0].Error.Code != http.StatusNotFound {
+			t.Fatalf("corrupt-legacy download = %+v, want 404 — unverified bytes must never serve", resp.Objects[0])
+		}
+		if _, err := srv.Blob.Stat(ctx, key); err == nil {
+			t.Fatal("canonical spelling materialized from provably mismatched legacy bytes")
+		}
+	})
+}
+
 // TestLFSAdopt_CorruptCanonicalUnderRegisteredRowIsRemoved (Codex round
 // 80): an adoption's canonical copy can land AFTER a verified publisher's
 // upload+registration (the fleet claim fences only adopters), overwriting
