@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.0](https://github.com/coder/code-storage/compare/v0.4.0...v0.5.0) (2026-08-24)
+
+
+### Features
+
+* **lfs:** reclaim registered-but-unreferenced objects ([#117](https://github.com/coder/code-storage/issues/117)) ([c428e82](https://github.com/coder/code-storage/commit/c428e828ffa82a17fcd9f39bcb30a86070238fb7))
+
 ## [0.4.0](https://github.com/coder/code-storage/compare/v0.3.1...v0.4.0) (2026-08-24)
 
 
