@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -490,6 +491,55 @@ func TestLFSReclaim_RefFanoutChargesBudget(t *testing.T) {
 	}
 	if rep.ReposOverBudget != 1 || rep.ReposScanned != 0 || rep.RowsMarked != 0 {
 		t.Fatalf("fanout run = %+v, want over-budget skip", rep)
+	}
+}
+
+// countCapRegistry captures the limit passed to every CountRefs call.
+type countCapRegistry struct {
+	LFSReclaimRegistry
+	caps []int64
+}
+
+func (c *countCapRegistry) CountRefs(ctx context.Context, repo string, limit int64) (int64, error) {
+	c.caps = append(c.caps, limit)
+	return c.LFSReclaimRegistry.CountRefs(ctx, repo, limit)
+}
+
+// TestLFSReclaim_MaxBudgetRefCountCap (Codex round 17): MaxInt64 is a valid
+// object budget, and the count's one-past-the-remainder sentinel must
+// saturate instead of overflowing — the overflow clamped the cap to 1, so
+// CountRefs reported at most one ref and hydration could materialize an
+// arbitrarily large ref set charged as a single unit.
+func TestLFSReclaim_MaxBudgetRefCountCap(t *testing.T) {
+	ctx := context.Background()
+	store, reg := newReclaimStore(t)
+	base := "max-budget-repo"
+	key := "lfs/" + base + "/o2/" + strings.Repeat("ab", 32)
+	if err := store.RegisterLFSObject(ctx, base, key, 10); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		if won, err := store.CASRef(ctx, base, fmt.Sprintf("refs/heads/b%02d", i), ref.ZeroSHA, strings.Repeat("77", 20)); err != nil || !won {
+			t.Fatalf("CASRef = (%v, %v)", won, err)
+		}
+	}
+	capReg := &countCapRegistry{LFSReclaimRegistry: reg}
+	// Hydration failing keeps the pass short; the captured caps are the
+	// assertion, not the walk outcome.
+	failHydrate := func(context.Context, string, string) (string, error) {
+		return "", fmt.Errorf("hydration unavailable")
+	}
+	r := testReclaimer(t, capReg, failHydrate, time.Hour, math.MaxInt64, true)
+	if _, err := r.Run(ctx); err != nil {
+		t.Logf("run: %v (hydration failure expected)", err)
+	}
+	if len(capReg.caps) == 0 {
+		t.Fatal("CountRefs was never consulted")
+	}
+	for i, c := range capReg.caps {
+		if c < math.MaxInt64-10 {
+			t.Fatalf("CountRefs cap %d = %d, want a saturated near-MaxInt64 cap (overflow clamped it)", i, c)
+		}
 	}
 }
 

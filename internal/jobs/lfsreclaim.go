@@ -16,6 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"time"
 
 	"github.com/coder/code-storage/internal/blob"
@@ -307,10 +308,15 @@ func (r *LFSReclaimer) reclaimRepo(ctx context.Context, base string, budget int6
 		// the count itself walks the ref index, so an uncapped COUNT on
 		// a fanout repo would do budget-scale index work every pass. A
 		// saturated count still pushes walked past the budget, so the
-		// guard below fires with the same over-budget verdict.
-		countCap := budget - walked + 1
-		if countCap < 1 {
-			countCap = 1
+		// guard below fires with the same over-budget verdict. The +1 is
+		// a SATURATING add (Codex round 17): at budget MaxInt64 the
+		// naive sentinel overflowed negative and clamped the cap to 1,
+		// letting hydration materialize an arbitrarily large ref set
+		// charged as a single unit.
+		countCap := budget - walked // ≥ 1: every over-budget path above returned
+		assertf(countCap >= 1, "lfs reclaim: non-positive ref count cap %d (budget %d, walked %d)", countCap, budget, walked)
+		if countCap < math.MaxInt64 {
+			countCap++
 		}
 		refCount, err := r.registry.CountRefs(ctx, member, countCap)
 		if err != nil {
