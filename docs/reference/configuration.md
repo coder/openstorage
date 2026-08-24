@@ -16,6 +16,7 @@ never a silently-applied default.
 |---|---|---|
 | [`CODESTORAGE_PG_URL`](#codestorage_pg_url) | — (required*) | Database URL: refs + metadata (`postgres://`, `postgresql://`, or `sqlite://`) |
 | [`CODESTORAGE_S3_URL`](#codestorage_s3_url) | — (required*) | Pack storage URL (`s3://` or `file://`) |
+| [`CODESTORAGE_S3_EXPECTED_BUCKET_OWNER`](#codestorage_s3_expected_bucket_owner) | unset (disabled) | Assert the bucket-owner AWS account ID on every S3 request |
 | [`CODESTORAGE_DATA_DIR`](#codestorage_data_dir) | — | Local-mode data directory; derives the two URLs above |
 | [`CODESTORAGE_LISTEN`](#codestorage_listen) | `127.0.0.1:0` | Listen address |
 | [`CODESTORAGE_ORG`](#codestorage_org) | — (required) | Org name (JWT `iss` claim) |
@@ -74,6 +75,35 @@ Immutable pack storage URL, opened through [gocloud.dev](https://gocloud.dev/how
   `AWS_SECRET_ACCESS_KEY`, shared config, instance roles).
 - Delete-mode sweeping interacts with bucket versioning — see
   [`CODESTORAGE_SWEEP_DELETE_ENABLED`](#codestorage_sweep_delete_enabled).
+
+### `CODESTORAGE_S3_EXPECTED_BUCKET_OWNER`
+
+Optional [bucket owner
+condition](https://docs.aws.amazon.com/AmazonS3/latest/userguide/bucket-owner-condition.html):
+the 12-digit AWS account ID that must own the `CODESTORAGE_S3_URL` bucket. AWS bucket
+names are global — a deleted bucket name can be re-registered by a third party — and the
+blob layer otherwise trusts whatever the name resolves to. When set, every S3 request the
+server issues carries `x-amz-expected-bucket-owner` via client middleware (the gocloud
+data plane, multipart copies, the startup probe, sweeps, git-hook subprocesses, and the
+purge CLI all share that client seam), so operations against a re-owned bucket fail with
+`403 Access Denied` instead of silently reading from or writing to an attacker's bucket.
+
+- **Default:** unset — no condition parameters are sent; behavior is unchanged.
+- **Format:** exactly 12 digits. Anything else is boot-fatal (a typo'd ID would 403 every
+  operation on AWS, so misconfiguration fails fast instead).
+- **Startup:** when set, a `CreateBucket` answered with `BucketAlreadyExists` is no longer
+  accepted blindly — the bucket is probed with `HeadBucket` under the owner condition, so
+  a squatted name fails boot. (AWS ignores the condition on `CreateBucket` itself; that
+  operation cannot carry it.)
+- **Presigned URLs** (LFS downloads) embed the condition as a signed lowercase
+  `x-amz-expected-bucket-owner` query parameter — the spelling S3 enforces on presigned
+  requests. The URL stays self-contained (clients send no extra header), and stripping or
+  altering the parameter breaks the SigV4 signature.
+- **MinIO and S3 emulators ignore the condition** (no global bucket namespace); the
+  parameter is harmless pass-through there, so the setting is only useful — and only
+  meaningfully enforced — against AWS S3. Pair it with the `aws:ResourceAccount` IAM
+  condition described in [Deploy to production](../how-to/deploy-production.md), which
+  remains the primary control; this application-level check is defense-in-depth.
 
 ### `CODESTORAGE_DATA_DIR`
 

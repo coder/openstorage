@@ -88,8 +88,15 @@ from the standard AWS chain (env vars, shared config, instance roles).
   ```
 
   Self-hosted MinIO has no shared global namespace, so this applies to AWS (and
-  AWS-compatible multi-tenant) deployments. Application-level expected-owner enforcement
-  is tracked in [#58](https://github.com/coder/code-storage/issues/58).
+  AWS-compatible multi-tenant) deployments.
+
+  For defense-in-depth — or when you cannot edit the role's IAM statements — additionally
+  set
+  [`CODESTORAGE_S3_EXPECTED_BUCKET_OWNER`](../reference/configuration.md#codestorage_s3_expected_bucket_owner)
+  to the bucket-owning account ID: the server then sends the S3 bucket owner condition on
+  every operation it issues (including the startup probe and presigned LFS URLs), failing
+  closed with `403` if the bucket's owner ever changes. The IAM condition remains the
+  primary control; the application-level check is independent of role policy.
 
 - Packs are immutable and content-addressed: the server only ever writes new keys and —
   through the sweeper's destructive modes — deletes provably-unreferenced ones. The bytes

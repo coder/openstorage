@@ -168,6 +168,7 @@ func TestEnsureBucket(t *testing.T) {
 
 	cases := map[string]struct {
 		client        *fakeBucketClient
+		expectedOwner string
 		wantErr       []string // substrings; empty = success
 		wantHeadCalls int
 	}{
@@ -179,6 +180,21 @@ func TestEnsureBucket(t *testing.T) {
 		},
 		"already exists": {
 			client: &fakeBucketClient{createErr: apiErr("BucketAlreadyExists")},
+		},
+		"already exists, expected owner set, probe ok": {
+			client:        &fakeBucketClient{createErr: apiErr("BucketAlreadyExists")},
+			expectedOwner: "111122223333",
+			wantHeadCalls: 1,
+		},
+		"already exists, expected owner set, probe 403": {
+			client:        &fakeBucketClient{createErr: apiErr("BucketAlreadyExists"), headErr: apiErr("AccessDenied")},
+			expectedOwner: "111122223333",
+			wantErr:       []string{`bucket "b" exists`, "111122223333", "AccessDenied"},
+			wantHeadCalls: 1,
+		},
+		"already owned by you skips probe even with expected owner": {
+			client:        &fakeBucketClient{createErr: apiErr("BucketAlreadyOwnedByYou")},
+			expectedOwner: "111122223333",
 		},
 		"access denied, bucket reachable": {
 			client:        &fakeBucketClient{createErr: apiErr("AccessDenied")},
@@ -200,7 +216,7 @@ func TestEnsureBucket(t *testing.T) {
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			err := ensureBucket(ctx, tc.client, "b")
+			err := ensureBucket(ctx, tc.client, "b", tc.expectedOwner)
 			if len(tc.wantErr) == 0 {
 				if err != nil {
 					t.Fatalf("ensureBucket: %v", err)
