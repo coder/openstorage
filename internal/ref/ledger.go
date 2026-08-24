@@ -950,9 +950,10 @@ func (s *PG) ReconcileLegacyLFSObjects(ctx context.Context) (int64, error) {
 	// or OOM serving. Each reconcile DELETES its legacy row, so
 	// re-running the bounded query converges without offsets; a
 	// non-empty page that makes no progress fails loudly instead of
-	// spinning.
+	// spinning. The invocation is page-capped (security round 127) so a
+	// live twin-minting old replica cannot hold startup hostage.
 	var n int64
-	for {
+	for page := 0; page < reconcileLegacyLFSMaxPages; page++ {
 		rows, err := s.pool.Query(ctx, `
 SELECT l.repo, l.key FROM lfs_objects l
 WHERE strpos(l.key, '/o2/') = 0
@@ -1000,6 +1001,10 @@ LIMIT $1`, reconcileLegacyLFSBatch)
 			return n, fmt.Errorf("reconcile legacy lfs rows: full page of %d candidates made no progress", len(cands))
 		}
 	}
+	// Page cap exhausted (security round 127): clean partial success —
+	// the remainder falls to the ticker, the next invocation, or the
+	// next startup.
+	return n, nil
 }
 
 // reconcileLegacyLFSBatch bounds one ReconcileLegacyLFSObjects page
@@ -1007,6 +1012,17 @@ LIMIT $1`, reconcileLegacyLFSBatch)
 // reconcile deletes its row — so the loop holds at most one page in
 // memory regardless of fleet-wide twin count.
 var reconcileLegacyLFSBatch = 512
+
+// reconcileLegacyLFSMaxPages bounds one ReconcileLegacyLFSObjects
+// INVOCATION (Codex security round 127): Heal runs the loop synchronously
+// before serving, and an old replica continuously re-registering twins
+// (small compat/adoption objects re-batched by a git:write client) keeps
+// every page full and progressing — the loop otherwise never exits and
+// startup is delayed indefinitely. The cap covers any realistic static
+// backlog (512 pages × 512 rows ≈ 262k twins) while bounding adversarial
+// livelock; a capped invocation returns cleanly and the remainder falls
+// to the ticker, the next startup, or the next invocation.
+var reconcileLegacyLFSMaxPages = 512
 
 // canonicalFromLegacyLFSRowKey maps a legacy row key (lfs/<repo>/<oid>)
 // back to its canonical spelling, the inverse of lfsLegacyRowKey.

@@ -405,7 +405,8 @@ ON CONFLICT (repo) DO UPDATE SET gen = lfs_adoption_gens.gen + 1`, repo); err !=
 // reconcile deletes its row, so re-querying converges without offsets.
 func (s *SQLite) ReconcileLegacyLFSObjects(ctx context.Context) (int64, error) {
 	var n int64
-	for {
+	// Page-capped per invocation like the PG twin (security round 127).
+	for i := 0; i < reconcileLegacyLFSMaxPages; i++ {
 		page, progress, err := s.reconcileLegacyLFSPage(ctx)
 		n += progress
 		if err != nil {
@@ -418,6 +419,8 @@ func (s *SQLite) ReconcileLegacyLFSObjects(ctx context.Context) (int64, error) {
 			return n, fmt.Errorf("reconcile legacy lfs rows: full page of %d candidates made no progress", page)
 		}
 	}
+	// Page cap exhausted — clean partial success, see the PG twin.
+	return n, nil
 }
 
 // reconcileLegacyLFSPage reconciles one bounded candidate page, returning

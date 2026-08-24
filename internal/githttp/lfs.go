@@ -1149,7 +1149,19 @@ func (s *Server) adoptStoredLFSObject(ctx context.Context, repoID, key, oid stri
 			// the unchanged corrupt source skip the full re-hash and
 			// press only the budgeted cleanup below.
 			s.rememberLFSMismatch(target, contentFP)
-			if m, _ := s.legacySourceProvenMismatched(dctx, repoID, target, oid); m {
+			// Claim-renewed, request-detached snapshot region (rounds
+			// 126/127): the re-hash can outlive both the request and
+			// ref.AdoptionClaimTTL, and a recorded lease loss must
+			// cancel the download rather than be stripped.
+			snapCtx, snapCancel := context.WithCancelCause(context.WithoutCancel(ctx))
+			defer snapCancel(nil)
+			stopRenew := s.keepAdoptionClaimRenewed(snapCtx, snapCancel, key, claimOwner)
+			m, _ := s.legacySourceProvenMismatched(snapCtx, repoID, target, oid)
+			stopRenew()
+			if cause := context.Cause(snapCtx); cause != nil && !errors.Is(cause, context.Canceled) {
+				return errLFSContentMismatch // lease lost mid-snapshot: spared, memo stands
+			}
+			if m {
 				// The delete gets its OWN bounded window (Codex round
 				// 116): a size-scaled snapshot can outlive dctx, and a
 				// proven verdict must not lose its delete to the
@@ -1237,7 +1249,17 @@ func (s *Server) adoptStoredLFSObject(ctx context.Context, repoID, key, oid stri
 		// security round 78): a spared survivor is re-copied, re-fails
 		// the digest, and lands back here.
 		legacySrc := blob.LFSLegacyKey(repoID, oid)
-		if m, _ := s.legacySourceProvenMismatched(dctx, repoID, legacySrc, oid); m {
+		// Claim-renewed, request-detached snapshot region (rounds
+		// 126/127) — see the source-mismatch twin above.
+		snapCtx, snapCancel := context.WithCancelCause(context.WithoutCancel(ctx))
+		defer snapCancel(nil)
+		stopRenew := s.keepAdoptionClaimRenewed(snapCtx, snapCancel, key, claimOwner)
+		m, _ := s.legacySourceProvenMismatched(snapCtx, repoID, legacySrc, oid)
+		stopRenew()
+		if cause := context.Cause(snapCtx); cause != nil && !errors.Is(cause, context.Canceled) {
+			return errLFSContentMismatch // lease lost mid-snapshot: spared, memo stands
+		}
+		if m {
 			// The delete gets its OWN bounded window (Codex round 116):
 			// a size-scaled snapshot can outlive dctx, and a proven
 			// verdict must not lose its delete to the consumed parent
@@ -2081,12 +2103,14 @@ func (s *Server) legacySourceProvenMismatched(ctx context.Context, repoID, legac
 	// by MinIO (verified round 84) and the legacy namespace takes no
 	// fleet claims by design (still-valid presigned PUTs, old replicas)
 	// — ADR-41's documented legacy-mutability residual class.
-	// DETACHED from the caller's cleanup window (Codex round 116, P2):
-	// bounded only by the size-scaled allowance below — a parent
-	// lfsCleanupTimeout silently expired large snapshots, permanently
-	// sparing corrupt bytes (registered fast paths never re-run this
-	// cleanup, and the compat bridge skips existing legacy keys).
-	base := context.WithoutCancel(ctx)
+	// The context is CALLER-MANAGED (Codex round 127): every caller
+	// passes a region already detached from the request (round 116's
+	// requirement — a parent lfsCleanupTimeout silently expired large
+	// snapshots, permanently sparing corrupt bytes) yet still carrying
+	// the claim-renewal region's lease-loss cancellation (round 126) —
+	// an internal WithoutCancel here stripped that loss, letting a
+	// multi-hour download run on while a successor redid the same work.
+	base := ctx
 	pctx, pcancel := context.WithTimeout(base, lfsProbeTimeout)
 	size, perr := s.Blob.Stat(pctx, legacyKey)
 	pcancel()
