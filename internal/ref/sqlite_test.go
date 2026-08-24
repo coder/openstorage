@@ -247,23 +247,32 @@ func TestSQLiteRegisterPacksIdempotent(t *testing.T) {
 }
 
 // TestSQLiteListPacksOrdering: oldest first by created_at, id as tie-break
-// within one clock second. An explicitly backdated row (raw SQL — the test
-// owns the schema) must sort ahead of newer rows regardless of id.
+// within one shared timestamp (pinned via raw SQL — the test owns the
+// schema). An explicitly backdated row must sort ahead regardless of id.
 func TestSQLiteListPacksOrdering(t *testing.T) {
 	ctx := context.Background()
 	s, _ := openTestSQLite(t)
 	const repo = "org/repo"
 
-	// Registered out of lexicographic order in the same second → id tie-break.
+	// Registered out of lexicographic order → id tie-break. The created_at
+	// default (unixepoch()) is evaluated per inserted row, so inserts
+	// straddling a second boundary would give b an earlier timestamp and
+	// defeat the tie-break under test (issue #109 flake); pin one shared
+	// timestamp explicitly after registering through the real writer.
 	if err := s.RegisterPacks(ctx, repo, []Pack{
 		{ID: "b", Key: "k-b"}, {ID: "a", Key: "k-a"}, {ID: "c", Key: "k-c"},
 	}); err != nil {
 		t.Fatalf("RegisterPacks: %v", err)
 	}
+	const base = 1_000_000 // fixed epoch seconds; only relative order matters
+	if _, err := s.db.ExecContext(ctx,
+		`UPDATE packs SET created_at = ? WHERE repo = ?`, base, repo); err != nil {
+		t.Fatalf("pin created_at: %v", err)
+	}
 	// Backdate "z" so created_at dominates the id tie-break.
 	if _, err := s.db.ExecContext(ctx,
-		`INSERT INTO packs (repo, id, s3_key, created_at) VALUES (?, 'z', 'k-z', unixepoch() - 100)`,
-		repo); err != nil {
+		`INSERT INTO packs (repo, id, s3_key, created_at) VALUES (?, 'z', 'k-z', ?)`,
+		repo, base-100); err != nil {
 		t.Fatalf("backdate insert: %v", err)
 	}
 
