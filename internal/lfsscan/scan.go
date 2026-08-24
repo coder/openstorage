@@ -114,10 +114,19 @@ func ReachableLFSOIDs(ctx context.Context, repoPath string, budget int64) (map[s
 		return nil, 0, fmt.Errorf("batch stdout: %w", err)
 	}
 
+	started := make([]*exec.Cmd, 0, 3)
 	for _, cmd := range []*exec.Cmd{revList, check, read} {
 		if err := cmd.Start(); err != nil {
+			// Kill the stages already running (Codex round 6): left
+			// alive, a producer fills its unread stdout pipe — or blocks
+			// on a still-open stdin — and the deferred Wait below would
+			// hang the reclamation worker until its context dies.
+			for _, c := range started {
+				_ = c.Process.Kill()
+			}
 			return nil, 0, fmt.Errorf("start %s: %w", strings.Join(cmd.Args[:3], " "), err)
 		}
+		started = append(started, cmd)
 		// Reap on every exit path; pump goroutines Wait first on success.
 		defer func(c *exec.Cmd) { _ = c.Wait() }(cmd)
 	}

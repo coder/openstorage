@@ -306,13 +306,13 @@ func TestLFSReclaim_BudgetResumesNextRun(t *testing.T) {
 		}
 		fixtures[base] = reclaimFixture(t)
 	}
-	// Each fixture walk lists 3 objects (commit+tree+2 blobs = 4? measure:
-	// budget generous for one repo, too small for two).
+	// Measure one fixture's walk units, then grant exactly one repo's full
+	// cost — walk + one ref + one settled row — so the second repo defers.
 	_, perRepo, err := lfsscan.ReachableLFSOIDs(ctx, fixtures["a-repo"], 1_000)
 	if err != nil {
 		t.Fatal(err)
 	}
-	r := testReclaimer(t, reg, staticHydrate(t, fixtures), time.Hour, perRepo+1, true)
+	r := testReclaimer(t, reg, staticHydrate(t, fixtures), time.Hour, perRepo+2, true)
 
 	rep, err := r.Run(ctx)
 	if err != nil {
@@ -416,6 +416,37 @@ func TestLFSReclaim_ExactExhaustionBetweenMembers(t *testing.T) {
 	rows, err := reg.ListRepoLFSObjects(ctx, base, "", 10)
 	if err != nil || len(rows) != 1 || !rows[0].UnreferencedSince.IsZero() {
 		t.Fatalf("rows after exact-exhaustion run = (%+v, %v), want untouched", rows, err)
+	}
+}
+
+// TestLFSReclaim_RefFanoutChargesBudget (Codex round 6): a git:write holder
+// can mint arbitrarily many refs naming one commit — registry
+// materialization, cache sync, and rev-list enumeration all scale with ref
+// count while the walk's unique objects stay tiny. Every ref charges a work
+// unit, so fanout trips the budget before hydration.
+func TestLFSReclaim_RefFanoutChargesBudget(t *testing.T) {
+	ctx := context.Background()
+	store, reg := newReclaimStore(t)
+	base := "fanout-repo"
+	key := "lfs/" + base + "/o2/" + strings.Repeat("ab", 32)
+	if err := store.RegisterLFSObject(ctx, base, key, 10); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 10; i++ {
+		if won, err := store.CASRef(ctx, base, fmt.Sprintf("refs/heads/b%02d", i), ref.ZeroSHA, strings.Repeat("77", 20)); err != nil || !won {
+			t.Fatalf("CASRef = (%v, %v)", won, err)
+		}
+	}
+	// Budget 5 < 10 refs: skipped loudly before any hydration
+	// (staticHydrate fails the test on any hydration attempt).
+	r := testReclaimer(t, reg, staticHydrate(t, nil), time.Hour, 5, true)
+
+	rep, err := r.Run(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.ReposOverBudget != 1 || rep.ReposScanned != 0 || rep.RowsMarked != 0 {
+		t.Fatalf("fanout run = %+v, want over-budget skip", rep)
 	}
 }
 

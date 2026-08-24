@@ -683,9 +683,10 @@ take, so no signal can lose the race silently.
 Caps the work units one reclamation run may spend — each git object a
 reachability walk lists charges one unit plus one more per 4 KiB of its raw
 (inflated) size, so entry-stuffed trees and large blobs pay for the bytes git
-must expand; each registry row settlement examines charges one unit; and
-every attempted repository, including skips, charges at least one — the
-bound that keeps the job's cost predictable on any repository shape. A repository whose own walk exceeds the
+must expand; each ref a scanned namespace holds and each registry row
+settlement examines charges one unit; and every attempted repository,
+including skips, charges at least one — the bound that keeps the job's cost
+predictable on any repository shape. A repository whose own walk exceeds the
 remaining budget is retried first next run with a full budget; one whose walk
 exceeds the FULL budget is skipped loudly until the budget is raised. Nothing
 is ever marked or retired from a partial walk.
