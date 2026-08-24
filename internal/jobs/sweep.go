@@ -1285,9 +1285,14 @@ func (s *Sweeper) Heal(ctx context.Context) error {
 	// need the janitor even when periodic sweeping is disabled (Codex
 	// round 85): no registration fast path ever runs again for a twin, so
 	// this startup pass is the only reconciliation such deployments get —
-	// without it the duplicate usage and object-count charge is permanent.
+	// without it the duplicate usage and object-count charge is
+	// permanent. A failure is therefore FATAL like the quarantine heal
+	// below (Codex round 112): with no ticker to retry (post-roll the
+	// compat flag is off), swallowing the error would let serving start
+	// with permanent double charges — false quota and object-cap denials
+	// until some later restart happens to reconcile.
 	if n, err := s.packs.ReconcileLegacyLFSObjects(ctx); err != nil {
-		s.logger.Error("heal: reconcile legacy lfs rows", "err", err)
+		return fmt.Errorf("reconcile legacy lfs rows: %w", err)
 	} else if n > 0 {
 		s.logger.Info("heal: reconciled legacy lfs row twins", "count", n)
 	}

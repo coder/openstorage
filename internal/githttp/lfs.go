@@ -941,7 +941,13 @@ func (s *Server) adoptLFSObject(ctx context.Context, repoID, key, oid string) er
 			if ferr != nil {
 				return fmt.Errorf("adoption preflight %s: usage listing: %w", key, ferr)
 			}
-			ls, lerr := s.Store.QuotaLedgerState(ctx, blob.QuotaRepoGroup(repoID), s.lfsReservationTTL(), key)
+			// The repair-cover spelling is excluded too (Codex round
+			// 112): a failed covered copy leaves key+suffix reserved
+			// until TTL by design, and the authoritative admission
+			// refills exactly that row — counting it here ON TOP of the
+			// planned copy 507'd every retry at exact headroom for up to
+			// the reservation TTL.
+			ls, lerr := s.Store.QuotaLedgerState(ctx, blob.QuotaRepoGroup(repoID), s.lfsReservationTTL(), key, key+lfsRepairCoverSuffix)
 			if lerr != nil {
 				return fmt.Errorf("adoption preflight %s: ledger read: %w", key, lerr)
 			}
