@@ -1812,7 +1812,7 @@ func (s *Server) uncoveredCleanupProven(ctx context.Context, repoID, key string)
 // the caller's held claim and op slot.
 func (s *Server) legacySourceProvenMismatched(ctx context.Context, legacyKey, oid string) bool {
 	sctx, scancel := context.WithTimeout(ctx, lfsProbeTimeout)
-	size, err := s.Blob.Stat(sctx, legacyKey)
+	size, startFP, err := s.Blob.StatFingerprint(sctx, legacyKey)
 	scancel()
 	if err != nil {
 		return false
@@ -1829,7 +1829,24 @@ func (s *Server) legacySourceProvenMismatched(ctx context.Context, legacyKey, oi
 		_, _ = h.Write(chunk)
 		off += n
 	}
-	return hex.EncodeToString(h.Sum(nil)) != oid
+	if hex.EncodeToString(h.Sum(nil)) == oid {
+		return false
+	}
+	// Fingerprint-stable snapshot (Codex round 110): a replacement
+	// landing BETWEEN ranged reads yields a mixed digest proving nothing
+	// about any single version — the verdict holds only if the object's
+	// same-key fingerprint is unchanged across the whole hash, so every
+	// range came from one version and that version is proven wrong. A
+	// moved fingerprint spares. The residual — a replacement between this
+	// check and the caller's delete — is one RTT and irreducible here:
+	// conditional DELETE If-Match is silently ignored by MinIO (verified
+	// round 84) and the legacy namespace takes no fleet claims by design
+	// (still-valid presigned PUTs, old replicas), which is ADR-41's
+	// documented legacy-mutability residual class.
+	ectx, ecancel := context.WithTimeout(ctx, lfsProbeTimeout)
+	_, endFP, eerr := s.Blob.StatFingerprint(ectx, legacyKey)
+	ecancel()
+	return eerr == nil && endFP == startFP
 }
 
 // withRenewedAdoptionClaim runs op while renewing the fleet claim for key
