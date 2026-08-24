@@ -2644,7 +2644,8 @@ func TestLFSReclaim_SuccessorRegistrationIsNotCleanupProof(t *testing.T) {
 	}
 	// A live successor holds the fleet claim and registers the object
 	// (the crashed-adoption path's zero-growth registration).
-	if claimed, _, err := st.TryAdoptionClaim(ctx, lfsTestRepoID, key); err != nil || !claimed {
+	claimed, successorOwner, err := st.TryAdoptionClaim(ctx, lfsTestRepoID, key)
+	if err != nil || !claimed {
 		t.Fatalf("successor claim = (%v, %v)", claimed, err)
 	}
 	if err := st.RegisterAdoptedLFSObject(ctx, lfsTestRepoID, key, int64(len(content))); err != nil {
@@ -2656,6 +2657,21 @@ func TestLFSReclaim_SuccessorRegistrationIsNotCleanupProof(t *testing.T) {
 	}
 	if _, err := srv.Blob.Stat(ctx, key); err != nil {
 		t.Fatalf("registered bytes deleted by the reclaim: %v — registration is terminal for cleanup, not license to remove a live object", err)
+	}
+
+	// The claimed-arm variant (Codex security round 125): the successor
+	// registers AND releases its claim before the reclaim retries — the
+	// reclaim then WINS the claim and the guarded delete is DECLINED by
+	// the registered row. That verdict must be unproven too; the prior
+	// code returned proven and skipped the accounting fallback.
+	if err := st.ReleaseAdoptionClaim(ctx, key, successorOwner); err != nil {
+		t.Fatal(err)
+	}
+	if srv.reclaimUncoveredCommit(ctx, lfsTestRepoID, key) {
+		t.Fatal("declined delete under a reclaimed claim accepted as proof — the successor's zero-admission registration cannot revoke the gap")
+	}
+	if _, err := srv.Blob.Stat(ctx, key); err != nil {
+		t.Fatalf("registered bytes deleted by the claimed-arm reclaim: %v", err)
 	}
 }
 

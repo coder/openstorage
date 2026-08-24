@@ -1068,7 +1068,8 @@ func (s *Server) adoptStoredLFSObject(ctx context.Context, repoID, key, oid stri
 			case ferr == nil && nowFP == memoFP:
 				dctx, dcancel := context.WithTimeout(context.WithoutCancel(ctx), lfsCleanupTimeout)
 				defer dcancel()
-				if m, _ := s.legacySourceProvenMismatched(dctx, repoID, target, oid); m {
+				switch m, decisive := s.legacySourceProvenMismatched(dctx, repoID, target, oid); {
+				case m:
 					delCtx, delCancel := context.WithTimeout(context.WithoutCancel(ctx), lfsCleanupTimeout)
 					defer delCancel()
 					if err := s.Blob.Delete(delCtx, target); err != nil && !errors.Is(err, blob.ErrNotFound) {
@@ -1076,8 +1077,20 @@ func (s *Server) adoptStoredLFSObject(ctx context.Context, repoID, key, oid stri
 					}
 					s.forgetLFSMismatch(target)
 					log.Printf("lfs adopt %s: removed memoized mismatched legacy blob", key)
+					return errLFSContentMismatch
+				case decisive:
+					// Proven VALID (Codex round 125): the memo itself
+					// can be an A→B→A artifact of its own ranged
+					// verification — retaining it made every touch of a
+					// HEALTHY object re-snapshot forever, and returning
+					// mismatch denied adoption of true bytes. Clear the
+					// memo and fall through: this touch adopts the
+					// now-proven source through the normal full
+					// verification.
+					s.forgetLFSMismatch(target)
+				default:
+					return errLFSContentMismatch // unknowable: spared, memo stands
 				}
-				return errLFSContentMismatch
 			case ferr == nil:
 				s.forgetLFSMismatch(target) // replaced: prove in full
 			}
@@ -1956,13 +1969,21 @@ func (s *Server) reclaimUncoveredCommit(ctx context.Context, repoID, key string)
 		case err != nil:
 			log.Printf("lfs adopt %s: reclaim uncovered commit: %v", key, err)
 		case claimed:
-			proven, _ := s.uncoveredCleanupProven(ctx, repoID, key)
+			proven, deleted := s.uncoveredCleanupProven(ctx, repoID, key)
 			rctx, rcancel := context.WithTimeout(context.WithoutCancel(ctx), lfsClaimRenewTimeout)
 			if rerr := s.Store.ReleaseAdoptionClaim(rctx, key, owner); rerr != nil {
 				log.Printf("lfs adopt %s: release reclaimed claim: %v", key, rerr)
 			}
 			rcancel()
-			return proven
+			// A DECLINED delete here is a successor's registration that
+			// landed before this reclaim won the released claim (Codex
+			// security round 125) — reached through the crashed-adoption
+			// path, zero-growth, NO copy admission: exactly the round-114
+			// verdict arriving through the claimed arm instead of the
+			// waiting arm. Terminal for cleanup, but UNPROVEN: only a
+			// deletion revokes the gap; the caller's accounting fallback
+			// must still run.
+			return proven && deleted
 		default:
 			hctx, hcancel := context.WithTimeout(ctx, lfsProbeTimeout)
 			registered, herr := s.Store.HasLFSObject(hctx, repoID, key)
