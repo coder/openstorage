@@ -58,6 +58,20 @@ func (s *PG) LFSReposWithObjects(ctx context.Context, after string, limit int) (
 	return repos, rows.Err()
 }
 
+// CountRefs prices a namespace member's ref fanout for the reclamation
+// budget without materializing the refs (an attacker can mint millions of
+// same-tip refs; loading them just to count would balloon the worker's heap
+// before the budget could reject the repo).
+func (s *PG) CountRefs(ctx context.Context, repo string) (int64, error) {
+	assertf(repo != "", "CountRefs: empty repo")
+	var n int64
+	if err := s.pool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM refs WHERE repo = $1`, repo).Scan(&n); err != nil {
+		return 0, fmt.Errorf("count refs %s: %w", repo, err)
+	}
+	return n, nil
+}
+
 // ListRepoLFSObjects pages repo's registered LFS object rows (keyset on
 // key, ascending).
 func (s *PG) ListRepoLFSObjects(ctx context.Context, repo, after string, limit int) ([]LFSObjectRow, error) {

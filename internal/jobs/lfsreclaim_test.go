@@ -419,6 +419,39 @@ func TestLFSReclaim_ExactExhaustionBetweenMembers(t *testing.T) {
 	}
 }
 
+// TestLFSReclaim_HydrationDeadline (Codex round 7): hydration downloads and
+// indexes packs before the budgeted walk can start, so each member runs
+// under a fixed deadline — a hydration that cannot finish fails the repo
+// like any other hydration error instead of monopolizing the pass.
+func TestLFSReclaim_HydrationDeadline(t *testing.T) {
+	ctx := context.Background()
+	store, reg := newReclaimStore(t)
+	base := "cold-repo"
+	key := "lfs/" + base + "/o2/" + strings.Repeat("ab", 32)
+	if err := store.RegisterLFSObject(ctx, base, key, 10); err != nil {
+		t.Fatal(err)
+	}
+	if won, err := store.CASRef(ctx, base, "refs/heads/main", ref.ZeroSHA, strings.Repeat("88", 20)); err != nil || !won {
+		t.Fatalf("CASRef = (%v, %v)", won, err)
+	}
+	stuck := func(ctx context.Context, _, _ string) (string, error) {
+		<-ctx.Done() // a hydration that never finishes on its own
+		return "", ctx.Err()
+	}
+	r := NewLFSReclaimer(reg, stuck, lfsscan.ReachableLFSOIDs, alwaysMain,
+		time.Hour, 1_000, true, slog.New(slog.DiscardHandler))
+	r.hydrateTimeout = 50 * time.Millisecond
+
+	_, err := r.Run(ctx)
+	if err == nil || !strings.Contains(err.Error(), "deadline") {
+		t.Fatalf("run err = %v, want hydration deadline", err)
+	}
+	rows, err := reg.ListRepoLFSObjects(ctx, base, "", 10)
+	if err != nil || len(rows) != 1 || !rows[0].UnreferencedSince.IsZero() {
+		t.Fatalf("rows = (%+v, %v), want untouched", rows, err)
+	}
+}
+
 // TestLFSReclaim_RefFanoutChargesBudget (Codex round 6): a git:write holder
 // can mint arbitrarily many refs naming one commit — registry
 // materialization, cache sync, and rev-list enumeration all scale with ref

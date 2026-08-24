@@ -4,6 +4,7 @@ package ref
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -19,6 +20,7 @@ type lfsReclaimStore interface {
 	MarkLFSObjectsUnreferenced(ctx context.Context, repo string, keys []string) (int64, error)
 	ClearLFSObjectsUnreferenced(ctx context.Context, repo string, keys []string) (int64, error)
 	RetireUnreferencedLFSObject(ctx context.Context, repo, key string, pinnedGens map[string]int64, grace time.Duration) (bool, error)
+	CountRefs(ctx context.Context, repo string) (int64, error)
 	FenceRepoPurge(ctx context.Context, base string) error
 }
 
@@ -139,6 +141,27 @@ func TestLFSReclaim_GraceSparesFreshMark(t *testing.T) {
 		}
 		if has, err := s.HasLFSObject(ctx, k.base(), key); err != nil || !has {
 			t.Fatalf("spared row missing (%v, %v)", has, err)
+		}
+	})
+}
+
+// TestLFSReclaim_CountRefs: the reclaimer prices ref fanout with a counting
+// query instead of materializing refs; both backends agree with the rows.
+func TestLFSReclaim_CountRefs(t *testing.T) {
+	runRefBackends(t, func(t *testing.T, s Store) {
+		rs := reclaimStore(t, s)
+		ctx := context.Background()
+		k := newLedgerKit(t, s)
+		if n, err := rs.CountRefs(ctx, k.base()); err != nil || n != 0 {
+			t.Fatalf("CountRefs empty = (%d, %v), want 0", n, err)
+		}
+		for i := 0; i < 3; i++ {
+			if won, err := s.CASRef(ctx, k.base(), fmt.Sprintf("refs/heads/b%d", i), ZeroSHA, strings.Repeat("22", 20)); err != nil || !won {
+				t.Fatalf("CASRef = (%v, %v)", won, err)
+			}
+		}
+		if n, err := rs.CountRefs(ctx, k.base()); err != nil || n != 3 {
+			t.Fatalf("CountRefs = (%d, %v), want 3", n, err)
 		}
 	})
 }

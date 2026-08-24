@@ -46,9 +46,13 @@ type LFSReclaimRegistry interface {
 	// GetGeneration pins each namespace-group member's ref generation
 	// before hydration; retirement re-checks it.
 	GetGeneration(ctx context.Context, repo string) (int64, error)
-	// ListRefs gates hydration: a member with no refs has nothing
-	// reachable and needs no cache.
-	ListRefs(ctx context.Context, repo string) (map[string]string, error)
+	// CountRefs gates hydration — a member with no refs has nothing
+	// reachable and needs no cache — and prices ref fanout WITHOUT
+	// materializing the refs (Codex security round 7): the reclaimer
+	// never needs the ref values, and a counting query keeps a
+	// million-ref repo from ballooning the worker's heap before the
+	// budget can reject it.
+	CountRefs(ctx context.Context, repo string) (int64, error)
 }
 
 // HydrateFunc materializes one namespace repo's git cache from the stores
@@ -102,20 +106,29 @@ const (
 	// DefaultLFSReclaimGrace is how long a row must stay continuously
 	// unreferenced before retirement (CODESTORAGE_LFS_GC_GRACE overrides).
 	DefaultLFSReclaimGrace = 24 * time.Hour
+	// lfsReclaimHydrateTimeout bounds one namespace member's cache
+	// hydration (Codex round 7): on a cold replica, Materialize downloads
+	// and indexes every registered pack before the budgeted walk can even
+	// start, and a writer can fill the pack quota with a few huge packs.
+	// A fixed deadline — the repack budgets' compiled-in pattern — defers
+	// the repo with an error instead of letting one hydration monopolize
+	// the pass. Retried next rotation; a warm cache hydrates in seconds.
+	lfsReclaimHydrateTimeout = 10 * time.Minute
 )
 
 // LFSReclaimer runs the reclamation scan. Construct with NewLFSReclaimer;
 // Run executes one bounded pass on the schedule's cadence.
 type LFSReclaimer struct {
-	registry      LFSReclaimRegistry
-	hydrate       HydrateFunc
-	walk          LFSWalkFunc
-	defaultBranch DefaultBranchFunc
-	grace         time.Duration
-	objectBudget  int64
-	deleteEnabled bool
-	logger        *slog.Logger
-	now           func() time.Time // injectable clock for tests
+	registry       LFSReclaimRegistry
+	hydrate        HydrateFunc
+	walk           LFSWalkFunc
+	defaultBranch  DefaultBranchFunc
+	grace          time.Duration
+	objectBudget   int64
+	deleteEnabled  bool
+	logger         *slog.Logger
+	now            func() time.Time // injectable clock for tests
+	hydrateTimeout time.Duration    // per-member cap, shrinkable in tests
 	// cursor is the last base repo a run attempted (successful or not):
 	// each run resumes strictly after it and wraps on exhaustion, so a
 	// failing or over-budget repo cannot monopolize every run (the
@@ -133,15 +146,16 @@ func NewLFSReclaimer(registry LFSReclaimRegistry, hydrate HydrateFunc, walk LFSW
 	assertf(objectBudget > 0, "NewLFSReclaimer: non-positive object budget %d", objectBudget)
 	assertf(logger != nil, "NewLFSReclaimer: nil logger")
 	return &LFSReclaimer{
-		registry:      registry,
-		hydrate:       hydrate,
-		walk:          walk,
-		defaultBranch: defaultBranch,
-		grace:         grace,
-		objectBudget:  objectBudget,
-		deleteEnabled: deleteEnabled,
-		logger:        logger,
-		now:           time.Now,
+		registry:       registry,
+		hydrate:        hydrate,
+		walk:           walk,
+		defaultBranch:  defaultBranch,
+		grace:          grace,
+		objectBudget:   objectBudget,
+		deleteEnabled:  deleteEnabled,
+		logger:         logger,
+		now:            time.Now,
+		hydrateTimeout: lfsReclaimHydrateTimeout,
 	}
 }
 
@@ -280,17 +294,16 @@ func (r *LFSReclaimer) reclaimRepo(ctx context.Context, base string, budget int6
 	referenced := make(map[string]struct{})
 	var walked int64
 	for _, member := range group {
-		refs, err := r.registry.ListRefs(ctx, member)
+		refCount, err := r.registry.CountRefs(ctx, member)
 		if err != nil {
 			return walked, err
 		}
 		// Every ref charges one work unit (Codex round 6): ref fanout is
 		// attacker-scaled too — millions of same-tip refs cost registry
-		// materialization, cache synchronization, and rev-list ref
-		// enumeration while adding no unique objects for the walk to
-		// charge.
-		walked += int64(len(refs))
-		if len(refs) == 0 {
+		// work, cache synchronization, and rev-list ref enumeration
+		// while adding no unique objects for the walk to charge.
+		walked += refCount
+		if refCount == 0 {
 			continue // nothing reachable, no cache needed
 		}
 		if walked >= budget {
@@ -302,7 +315,7 @@ func (r *LFSReclaimer) reclaimRepo(ctx context.Context, base string, budget int6
 			// whose walk could not even start.
 			return walked, fmt.Errorf("walk %s: %w (budget %d)", member, lfsscan.ErrLFSScanBudget, budget)
 		}
-		repoPath, err := r.hydrate(ctx, member, branch)
+		repoPath, err := r.hydrateBounded(ctx, member, branch)
 		if err != nil {
 			return walked, fmt.Errorf("hydrate %s: %w", member, err)
 		}
@@ -319,6 +332,17 @@ func (r *LFSReclaimer) reclaimRepo(ctx context.Context, base string, budget int6
 	report.ObjectsWalked += walked
 	settled, err := r.settleRepoRows(ctx, base, gens, referenced, budget-walked, report)
 	return walked + settled, err
+}
+
+// hydrateBounded runs the hydrate seam under the fixed per-member deadline
+// so one cold, pack-stuffed repository cannot monopolize a pass with
+// pre-walk download/index work the budget never sees; the timeout fails the
+// repo like any hydration error (deferred, retried next rotation).
+func (r *LFSReclaimer) hydrateBounded(ctx context.Context, member, branch string) (string, error) {
+	assertf(r.hydrateTimeout > 0, "hydrateBounded: non-positive timeout %v", r.hydrateTimeout)
+	hctx, cancel := context.WithTimeout(ctx, r.hydrateTimeout)
+	defer cancel()
+	return r.hydrate(hctx, member, branch)
 }
 
 // settleRepoRows diffs base's registered rows against the referenced OID

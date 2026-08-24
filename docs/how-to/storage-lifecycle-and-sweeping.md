@@ -406,6 +406,13 @@ Two operational notes:
   (`CODESTORAGE_SWEEP_DELETE_LFS`, plus the ADR-41 legacy gate for
   v0.2.0-spelled keys). With sweeping or its LFS gates off, counts and quota
   converge anyway — only the physical bytes wait.
+- **Hydration is deadline-bounded.** Scanning a repository first materializes
+  its git cache (downloading and indexing registered packs on a cold
+  replica). Each namespace member's hydration runs under a fixed 10-minute
+  deadline — compiled in, like the repack budgets — and a repository that
+  cannot hydrate in time fails that pass with an error and is retried on a
+  later rotation. A repository that repeatedly exceeds the deadline needs
+  operator attention (repack it, or accept it stays unreclaimed).
 - **Upgrade the whole fleet first.** The grace guarantee depends on every
   serving replica clearing the reclamation stamp when it answers "already
   stored" on the batch/PUT surfaces. A pre-reclamation replica answers
