@@ -1,0 +1,369 @@
+package jobs
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/coder/code-storage/internal/gitread"
+	"github.com/coder/code-storage/internal/ref"
+)
+
+// lfsReclaimGitEnv pins identity and neuters host config so fixture commits
+// are hermetic (host GIT_* vars and global hooks otherwise leak in).
+var lfsReclaimGitEnv = []string{
+	"GIT_AUTHOR_NAME=Alice Author",
+	"GIT_AUTHOR_EMAIL=alice@example.com",
+	"GIT_COMMITTER_NAME=Bob Committer",
+	"GIT_COMMITTER_EMAIL=bob@example.com",
+	"GIT_CONFIG_GLOBAL=/dev/null",
+	"GIT_CONFIG_SYSTEM=/dev/null",
+}
+
+func reclaimGit(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(), lfsReclaimGitEnv...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+	}
+	return string(out)
+}
+
+func lfsPointerFile(oid string) string {
+	return fmt.Sprintf("version https://git-lfs.github.com/spec/v1\noid sha256:%s\nsize 42\n", oid)
+}
+
+// reclaimFixture builds one git worktree whose main branch references the
+// given OIDs from pointer files, serving as the injected "hydrated cache".
+func reclaimFixture(t *testing.T, oids ...string) string {
+	t.Helper()
+	dir := t.TempDir()
+	reclaimGit(t, dir, "init", "-q", "--initial-branch=main")
+	for i, oid := range oids {
+		name := fmt.Sprintf("asset-%d.bin", i)
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(lfsPointerFile(oid)), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(dir, "README.md"), []byte("# fixture\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	reclaimGit(t, dir, "add", "-A")
+	reclaimGit(t, dir, "commit", "-q", "-m", "fixture")
+	return dir
+}
+
+func newReclaimStore(t *testing.T) (ref.Store, LFSReclaimRegistry) {
+	t.Helper()
+	ctx := context.Background()
+	store, err := ref.Open(ctx, "sqlite://"+filepath.Join(t.TempDir(), "refs.db"))
+	if err != nil {
+		t.Fatalf("ref.Open: %v", err)
+	}
+	t.Cleanup(store.Close)
+	if err := store.InitSchema(ctx); err != nil {
+		t.Fatalf("InitSchema: %v", err)
+	}
+	reg, ok := store.(LFSReclaimRegistry)
+	if !ok {
+		t.Fatalf("store %T lacks the reclamation seams", store)
+	}
+	return store, reg
+}
+
+// staticHydrate returns each repo's pre-built fixture path; repos without a
+// fixture fail the test (the reclaimer must not hydrate ref-less members).
+func staticHydrate(t *testing.T, fixtures map[string]string) HydrateFunc {
+	t.Helper()
+	return func(_ context.Context, repo, defaultBranch string) (string, error) {
+		t.Helper()
+		if defaultBranch != "main" {
+			t.Errorf("hydrate %s: default branch %q, want main", repo, defaultBranch)
+		}
+		path, ok := fixtures[repo]
+		if !ok {
+			t.Errorf("unexpected hydration of %s", repo)
+			return "", fmt.Errorf("unexpected hydration of %s", repo)
+		}
+		return path, nil
+	}
+}
+
+func alwaysMain(context.Context, string) (string, bool, error) { return "main", true, nil }
+
+func testReclaimer(t *testing.T, reg LFSReclaimRegistry, hydrate HydrateFunc, grace time.Duration, budget int64, deleteEnabled bool) *LFSReclaimer {
+	t.Helper()
+	return NewLFSReclaimer(reg, hydrate, gitread.ReachableLFSOIDs, alwaysMain,
+		grace, budget, deleteEnabled, slog.New(slog.DiscardHandler))
+}
+
+// TestLFSReclaim_EndToEnd: the full mark → grace → retire lifecycle over a
+// real SQLite ledger and a real git reachability walk. A referenced object
+// survives every pass; junk rows (both key spellings) are marked on the
+// first pass and retired once the grace window elapses; the object count
+// and usage bytes converge (the 507 unwedge).
+func TestLFSReclaim_EndToEnd(t *testing.T) {
+	ctx := context.Background()
+	store, reg := newReclaimStore(t)
+	base := "e2e-repo"
+	refOID := strings.Repeat("aa", 32)
+	junkOID := strings.Repeat("bb", 32)
+	legacyOID := strings.Repeat("cc", 32)
+
+	keep := "lfs/" + base + "/o2/" + refOID
+	junk := "lfs/" + base + "/o2/" + junkOID
+	legacy := "lfs/" + base + "/" + legacyOID // v0.2.0-era row spelling
+	for _, key := range []string{keep, junk, legacy} {
+		if err := store.RegisterLFSObject(ctx, base, key, 100); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The repo's refs live in the DB authority; the fixture is its cache.
+	if won, err := store.CASRef(ctx, base, "refs/heads/main", ref.ZeroSHA, strings.Repeat("11", 20)); err != nil || !won {
+		t.Fatalf("CASRef = (%v, %v)", won, err)
+	}
+	fixtures := map[string]string{base: reclaimFixture(t, refOID)}
+
+	grace := 300 * time.Millisecond
+	r := testReclaimer(t, reg, staticHydrate(t, fixtures), grace, 1_000, true)
+
+	// Pass 1: junk rows get marked, nothing retires (grace running).
+	rep, err := r.Run(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.ReposScanned != 1 || rep.RowsMarked != 2 || rep.RowsReferenced != 1 || rep.RowsRetired != 0 {
+		t.Fatalf("pass 1 = %+v, want 2 marked / 1 referenced / 0 retired", rep)
+	}
+	if n, _ := store.CountLFSObjects(ctx, base); n != 3 {
+		t.Fatalf("count after pass 1 = %d, want 3", n)
+	}
+
+	// Pass 2 after the grace window: junk rows retire, the referenced row
+	// survives, the count converges.
+	time.Sleep(grace + 1100*time.Millisecond) // SQLite marks have 1s resolution
+	rep, err = r.Run(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.RowsRetired != 2 || rep.BytesRetired != 200 {
+		t.Fatalf("pass 2 = %+v, want 2 retired / 200 bytes", rep)
+	}
+	if has, _ := store.HasLFSObject(ctx, base, keep); !has {
+		t.Fatal("referenced row retired")
+	}
+	for _, key := range []string{junk, legacy} {
+		if has, _ := store.HasLFSObject(ctx, base, key); has {
+			t.Fatalf("junk row %s survived", key)
+		}
+	}
+	if n, _ := store.CountLFSObjects(ctx, base); n != 1 {
+		t.Fatalf("count after pass 2 = %d, want 1", n)
+	}
+	// The repo leaves the work queue once nothing junk remains? No — one
+	// registered object remains, so it stays queued; a third pass is a
+	// no-op.
+	rep, err = r.Run(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.RowsRetired != 0 || rep.RowsReferenced != 1 {
+		t.Fatalf("pass 3 = %+v, want steady state", rep)
+	}
+}
+
+// TestLFSReclaim_DryRunReportsOnly: with deletes disabled the scan marks and
+// reports eligible rows but retires nothing — the staged-rollout mode.
+func TestLFSReclaim_DryRunReportsOnly(t *testing.T) {
+	ctx := context.Background()
+	store, reg := newReclaimStore(t)
+	base := "dryrun-repo"
+	junk := "lfs/" + base + "/o2/" + strings.Repeat("bb", 32)
+	if err := store.RegisterLFSObject(ctx, base, junk, 10); err != nil {
+		t.Fatal(err)
+	}
+	if won, err := store.CASRef(ctx, base, "refs/heads/main", ref.ZeroSHA, strings.Repeat("22", 20)); err != nil || !won {
+		t.Fatalf("CASRef = (%v, %v)", won, err)
+	}
+	fixtures := map[string]string{base: reclaimFixture(t)}
+	r := testReclaimer(t, reg, staticHydrate(t, fixtures), 300*time.Millisecond, 1_000, false)
+
+	if rep, err := r.Run(ctx); err != nil || rep.RowsMarked != 1 || !rep.DryRun {
+		t.Fatalf("dry pass 1 = (%+v, %v), want 1 marked", rep, err)
+	}
+	time.Sleep(1500 * time.Millisecond)
+	rep, err := r.Run(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.RowsEligible != 1 || rep.RowsRetired != 0 {
+		t.Fatalf("dry pass 2 = %+v, want 1 eligible / 0 retired", rep)
+	}
+	if has, _ := store.HasLFSObject(ctx, base, junk); !has {
+		t.Fatal("dry run deleted a row")
+	}
+}
+
+// TestLFSReclaim_ReReferenceClearsMark: a pointer pushed between passes
+// re-references a marked row — the next scan clears the mark instead of
+// letting it age toward retirement.
+func TestLFSReclaim_ReReferenceClearsMark(t *testing.T) {
+	ctx := context.Background()
+	store, reg := newReclaimStore(t)
+	base := "rereference-repo"
+	oid := strings.Repeat("dd", 32)
+	key := "lfs/" + base + "/o2/" + oid
+	if err := store.RegisterLFSObject(ctx, base, key, 10); err != nil {
+		t.Fatal(err)
+	}
+	if won, err := store.CASRef(ctx, base, "refs/heads/main", ref.ZeroSHA, strings.Repeat("33", 20)); err != nil || !won {
+		t.Fatalf("CASRef = (%v, %v)", won, err)
+	}
+	fixture := reclaimFixture(t) // no pointers yet
+	fixtures := map[string]string{base: fixture}
+	grace := 300 * time.Millisecond
+	r := testReclaimer(t, reg, staticHydrate(t, fixtures), grace, 1_000, true)
+
+	if rep, err := r.Run(ctx); err != nil || rep.RowsMarked != 1 {
+		t.Fatalf("pass 1 = (%+v, %v), want 1 marked", rep, err)
+	}
+	// A push lands a pointer referencing the marked OID.
+	if err := os.WriteFile(filepath.Join(fixture, "late.bin"), []byte(lfsPointerFile(oid)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	reclaimGit(t, fixture, "add", "late.bin")
+	reclaimGit(t, fixture, "commit", "-q", "-m", "late pointer")
+
+	time.Sleep(grace + 1100*time.Millisecond)
+	rep, err := r.Run(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.RowsCleared != 1 || rep.RowsRetired != 0 {
+		t.Fatalf("pass 2 = %+v, want 1 cleared / 0 retired", rep)
+	}
+	if has, _ := store.HasLFSObject(ctx, base, key); !has {
+		t.Fatal("re-referenced row retired")
+	}
+}
+
+// TestLFSReclaim_BudgetSkipsRepo: a repo whose walk exceeds the full run
+// budget is skipped loudly — nothing marked, nothing retired, and the run
+// does not error (the report carries the skip).
+func TestLFSReclaim_BudgetSkipsRepo(t *testing.T) {
+	ctx := context.Background()
+	store, reg := newReclaimStore(t)
+	base := "budget-repo"
+	junk := "lfs/" + base + "/o2/" + strings.Repeat("ee", 32)
+	if err := store.RegisterLFSObject(ctx, base, junk, 10); err != nil {
+		t.Fatal(err)
+	}
+	if won, err := store.CASRef(ctx, base, "refs/heads/main", ref.ZeroSHA, strings.Repeat("44", 20)); err != nil || !won {
+		t.Fatalf("CASRef = (%v, %v)", won, err)
+	}
+	fixtures := map[string]string{base: reclaimFixture(t)} // 1 commit+tree+blobs > budget 1
+	r := testReclaimer(t, reg, staticHydrate(t, fixtures), time.Millisecond, 1, true)
+
+	rep, err := r.Run(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.ReposOverBudget != 1 || rep.ReposScanned != 0 || rep.RowsMarked != 0 {
+		t.Fatalf("over-budget run = %+v, want skip with no row work", rep)
+	}
+	rows, err := reg.ListRepoLFSObjects(ctx, base, "", 10)
+	if err != nil || len(rows) != 1 || !rows[0].UnreferencedSince.IsZero() {
+		t.Fatalf("rows after over-budget run = (%+v, %v), want untouched", rows, err)
+	}
+}
+
+// TestLFSReclaim_BudgetResumesNextRun: when a later repo runs out of the
+// pass's REMAINDER, the cursor holds so the next run retries it first with
+// a full budget — bounded AND resumable.
+func TestLFSReclaim_BudgetResumesNextRun(t *testing.T) {
+	ctx := context.Background()
+	store, reg := newReclaimStore(t)
+	// Two repos, alphabetical: a-repo then b-repo.
+	fixtures := map[string]string{}
+	for _, base := range []string{"a-repo", "b-repo"} {
+		key := "lfs/" + base + "/o2/" + strings.Repeat("ab", 32)
+		if err := store.RegisterLFSObject(ctx, base, key, 10); err != nil {
+			t.Fatal(err)
+		}
+		if won, err := store.CASRef(ctx, base, "refs/heads/main", ref.ZeroSHA, strings.Repeat("55", 20)); err != nil || !won {
+			t.Fatalf("CASRef = (%v, %v)", won, err)
+		}
+		fixtures[base] = reclaimFixture(t)
+	}
+	// Each fixture walk lists 3 objects (commit+tree+2 blobs = 4? measure:
+	// budget generous for one repo, too small for two).
+	_, perRepo, err := gitread.ReachableLFSOIDs(ctx, fixtures["a-repo"], 1_000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := testReclaimer(t, reg, staticHydrate(t, fixtures), time.Hour, perRepo+1, true)
+
+	rep, err := r.Run(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// b-repo's deferral is budget exhaustion, not a repo-over-budget skip.
+	if rep.ReposScanned != 1 || rep.ReposOverBudget != 0 {
+		t.Fatalf("run 1 = %+v, want a-repo scanned, b-repo deferred", rep)
+	}
+	if rows, err := reg.ListRepoLFSObjects(ctx, "b-repo", "", 10); err != nil || !rows[0].UnreferencedSince.IsZero() {
+		t.Fatalf("b-repo rows touched by deferred run: (%+v, %v)", rows, err)
+	}
+	// Run 2 starts at the deferred repo with a full budget.
+	rep, err = r.Run(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.ReposScanned != 1 || rep.ReposOverBudget != 0 {
+		t.Fatalf("run 2 = %+v, want b-repo scanned", rep)
+	}
+	for _, base := range []string{"a-repo", "b-repo"} {
+		rows, err := reg.ListRepoLFSObjects(ctx, base, "", 10)
+		if err != nil || len(rows) != 1 || rows[0].UnreferencedSince.IsZero() {
+			t.Fatalf("%s rows = (%+v, %v), want marked", base, rows, err)
+		}
+	}
+}
+
+// TestLFSReclaim_PurgedRepoSkipped: purge-fenced repos are the purge
+// pipeline's problem; the reclaimer never hydrates or touches them.
+func TestLFSReclaim_PurgedRepoSkipped(t *testing.T) {
+	ctx := context.Background()
+	store, reg := newReclaimStore(t)
+	base := "purged-repo"
+	key := "lfs/" + base + "/o2/" + strings.Repeat("ff", 32)
+	if err := store.RegisterLFSObject(ctx, base, key, 10); err != nil {
+		t.Fatal(err)
+	}
+	fencer, ok := store.(interface {
+		FenceRepoPurge(ctx context.Context, base string) error
+	})
+	if !ok {
+		t.Fatalf("store %T lacks FenceRepoPurge", store)
+	}
+	if err := fencer.FenceRepoPurge(ctx, base); err != nil {
+		t.Fatal(err)
+	}
+	r := testReclaimer(t, reg, staticHydrate(t, map[string]string{}), time.Millisecond, 1_000, true)
+	rep, err := r.Run(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.ReposSkipped != 1 || rep.ReposScanned != 0 {
+		t.Fatalf("purged run = %+v, want skipped", rep)
+	}
+}

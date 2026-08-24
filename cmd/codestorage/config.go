@@ -18,6 +18,7 @@ import (
 
 	"github.com/coder/code-storage/internal/githttp"
 	"github.com/coder/code-storage/internal/jobs"
+	"github.com/coder/code-storage/internal/ref"
 	"github.com/coder/code-storage/internal/secrets"
 )
 
@@ -126,6 +127,35 @@ const (
 	// during a rolling upgrade (ADR-41): set to "1"/"true" on upgraded
 	// replicas until the fleet rolls, then drop it.
 	envLFSV020WriteCompat = "CODESTORAGE_LFS_V020_WRITE_COMPAT"
+
+	// Unreferenced-LFS-object reclamation (issue #73): a bounded
+	// background scan walks each repo's reachable pointer files and
+	// retires registered lfs_objects rows no reachable pointer references
+	// once they stay unreferenced for a full grace window — unwedging the
+	// per-repo object-count cap after junk uploads. Interval 0 (the
+	// default) disables the job entirely and is the emergency stop.
+	envLFSGCInterval = "CODESTORAGE_LFS_GC_INTERVAL"
+	// envLFSGCGrace is how long a row must stay CONTINUOUSLY observed
+	// unreferenced before retirement (default 24h). Retirement re-checks
+	// the grace inside the guarded delete, so any liveness signal —
+	// batch/PUT touch, re-registration, a pointer push — restarts the
+	// window.
+	envLFSGCGrace = "CODESTORAGE_LFS_GC_GRACE"
+	// envLFSGCObjectBudget caps the git objects one reclamation run may
+	// list across its reachability walks (default 1,000,000). A repo
+	// whose walk alone exceeds the full budget is skipped (loudly) until
+	// the budget is raised; nothing is ever retired on a partial walk.
+	envLFSGCObjectBudget = "CODESTORAGE_LFS_GC_OBJECT_BUDGET"
+	// envLFSGCDeleteEnabled arms retirement. OFF by default: the scan
+	// then only marks/clears rows and reports what it WOULD retire, so
+	// operators can watch report-only passes before opting in — the same
+	// staged rollout as the sweep delete flags.
+	envLFSGCDeleteEnabled = "CODESTORAGE_LFS_GC_DELETE_ENABLED"
+
+	// Per-repo LFS object-count cap override (issue #73 option 3): the
+	// operator escape hatch that unwedges a cap-exhausted repository
+	// without waiting for reclamation. Default 100000.
+	envLFSMaxObjectsPerRepo = "CODESTORAGE_LFS_MAX_OBJECTS_PER_REPO"
 
 	// Background repack (issue #1): registered-pack count at which a
 	// post-write trigger schedules a fold ("0" disables triggering).
@@ -282,6 +312,14 @@ type serveConfig struct {
 	// sweep configures the periodic orphan-pack sweep (issue #5).
 	sweep sweepSettings
 
+	// lfsGC configures the unreferenced-LFS-object reclamation job
+	// (issue #73); interval 0 disables it.
+	lfsGC lfsGCSettings
+
+	// lfsMaxObjectsPerRepo overrides the per-repo LFS object-count cap
+	// (issue #73 option 3); always positive.
+	lfsMaxObjectsPerRepo int64
+
 	// repackThreshold is the registered-pack count at which a post-write
 	// trigger schedules a background repack (issue #1); 0 disables
 	// triggering (already-queued durable jobs still run).
@@ -306,6 +344,15 @@ type sweepSettings struct {
 	deleteLFS        bool          // false = list-only for LFS orphans (the default, issue #51)
 	deleteLFSLegacy  bool          // false = legacy-spelled LFS keys are never reaped (ADR-41 transition gate)
 	repoRetention    time.Duration // 0 = never purge soft-deleted repos (the default, issue #52)
+}
+
+// lfsGCSettings is the resolved unreferenced-LFS-object reclamation
+// configuration (issue #73).
+type lfsGCSettings struct {
+	interval      time.Duration // 0 = reclamation disabled (the default)
+	grace         time.Duration // > 0; how long a row must stay unreferenced
+	objectBudget  int64         // > 0; git objects one run may walk
+	deleteEnabled bool          // false = report-only marking (the default)
 }
 
 // storageURLs is the resolved storage location set shared by every
@@ -454,6 +501,14 @@ func resolveServeConfig(getenv func(string) string, flagListen, flagAddr, flagCa
 		return serveConfig{}, fmt.Errorf(
 			"%s and %s cannot be combined: destructive LFS sweeping must stay disabled fleet-wide (old v0.2.0 sweepers included) until the roll completes and the compat flag is dropped",
 			envLFSV020WriteCompat, envSweepDeleteLFS)
+	}
+	cfg.lfsGC, err = resolveLFSGCSettings(getenv)
+	if err != nil {
+		return serveConfig{}, err
+	}
+	cfg.lfsMaxObjectsPerRepo, err = resolveLFSMaxObjectsPerRepo(getenv)
+	if err != nil {
+		return serveConfig{}, err
 	}
 	cfg.repackThreshold, err = resolveRepackThreshold(getenv)
 	if err != nil {
@@ -759,6 +814,76 @@ func resolveSweepSettings(getenv func(string) string) (sweepSettings, error) {
 		s.repoRetention = d
 	}
 	return s, nil
+}
+
+// resolveLFSGCSettings parses the unreferenced-LFS-object reclamation
+// knobs (issue #73), fail-fast like the sweep settings.
+func resolveLFSGCSettings(getenv func(string) string) (lfsGCSettings, error) {
+	assertf(getenv != nil, "resolveLFSGCSettings: nil getenv")
+	s := lfsGCSettings{grace: jobs.DefaultLFSReclaimGrace, objectBudget: jobs.DefaultLFSReclaimObjectBudget}
+	if raw := getenv(envLFSGCInterval); raw != "" {
+		d, err := time.ParseDuration(raw)
+		if err != nil {
+			return lfsGCSettings{}, fmt.Errorf("%s: %w", envLFSGCInterval, err)
+		}
+		if d < 0 {
+			return lfsGCSettings{}, fmt.Errorf("%s must be non-negative (0 disables reclamation), got %q", envLFSGCInterval, raw)
+		}
+		s.interval = d
+	}
+	if raw := getenv(envLFSGCGrace); raw != "" {
+		d, err := time.ParseDuration(raw)
+		if err != nil {
+			return lfsGCSettings{}, fmt.Errorf("%s: %w", envLFSGCGrace, err)
+		}
+		if d <= 0 {
+			return lfsGCSettings{}, fmt.Errorf("%s must be positive, got %q", envLFSGCGrace, raw)
+		}
+		s.grace = d
+	}
+	if raw := getenv(envLFSGCObjectBudget); raw != "" {
+		v, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil {
+			return lfsGCSettings{}, fmt.Errorf("%s: %w", envLFSGCObjectBudget, err)
+		}
+		if v <= 0 {
+			return lfsGCSettings{}, fmt.Errorf("%s must be positive, got %q", envLFSGCObjectBudget, raw)
+		}
+		s.objectBudget = v
+	}
+	if raw := getenv(envLFSGCDeleteEnabled); raw != "" {
+		v, err := strconv.ParseBool(raw)
+		if err != nil {
+			return lfsGCSettings{}, fmt.Errorf("%s: %w", envLFSGCDeleteEnabled, err)
+		}
+		if v && s.interval == 0 {
+			// Arming deletes with the job disabled would silently never
+			// retire anything; reject the misconfiguration loudly.
+			return lfsGCSettings{}, fmt.Errorf("%s requires the reclamation schedule enabled (%s > 0)", envLFSGCDeleteEnabled, envLFSGCInterval)
+		}
+		s.deleteEnabled = v
+	}
+	return s, nil
+}
+
+// resolveLFSMaxObjectsPerRepo parses the per-repo LFS object-count cap
+// override (issue #73 option 3). Unset keeps the built-in default; the cap
+// must stay positive — 0 would brick every LFS upload, which is what
+// disabling LFS-less deployments already get for free.
+func resolveLFSMaxObjectsPerRepo(getenv func(string) string) (int64, error) {
+	assertf(getenv != nil, "resolveLFSMaxObjectsPerRepo: nil getenv")
+	raw := getenv(envLFSMaxObjectsPerRepo)
+	if raw == "" {
+		return ref.MaxLFSObjectsPerRepo, nil
+	}
+	v, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("%s: %w", envLFSMaxObjectsPerRepo, err)
+	}
+	if v <= 0 {
+		return 0, fmt.Errorf("%s must be positive, got %q", envLFSMaxObjectsPerRepo, raw)
+	}
+	return v, nil
 }
 
 // resolveRepackThreshold parses CODESTORAGE_REPACK_THRESHOLD. Fail-fast

@@ -94,6 +94,13 @@ func cmdServe(ctx context.Context, args []string) error {
 		}
 	}
 
+	// Per-repo LFS object-count cap override (issue #73 option 3): the
+	// package-level cap is read by every LFS registration transaction and
+	// admission fast-fail, all of which run in THIS serve process (the
+	// hook subprocess registers packs, never LFS objects); set it once
+	// before any store or handler exists.
+	ref.MaxLFSObjectsPerRepo = cfg.lfsMaxObjectsPerRepo
+
 	st, err := ref.Open(ctx, cfg.dbURL)
 	if err != nil {
 		return err
@@ -162,7 +169,7 @@ func cmdServe(ctx context.Context, args []string) error {
 		return gitSrv.CachedUsageFloorGen(ctx, repo)
 	}
 	apiHandler, metaStore, verifier, maybeRepack, cleanup, err := buildAPIHandler(ctx, cfg.dbURL, cfg.org, httpBaseURL, loopbackBaseURL, orgPEMBlocks, st, bl, cfg.cacheDir,
-		api.RateLimitConfig{RPS: cfg.rateRPS, Burst: cfg.rateBurst, TrustedProxies: cfg.trustedProxies}, cfg.packQuotaBytes, cfg.packReservationTTL, cfg.sweep, cfg.lfsV020WriteCompat, cfg.repackThreshold, cfg.webhookAllowPrivate, cfg.secretsCodec, usageFloor)
+		api.RateLimitConfig{RPS: cfg.rateRPS, Burst: cfg.rateBurst, TrustedProxies: cfg.trustedProxies}, cfg.packQuotaBytes, cfg.packReservationTTL, cfg.sweep, cfg.lfsGC, cfg.lfsV020WriteCompat, cfg.repackThreshold, cfg.webhookAllowPrivate, cfg.secretsCodec, usageFloor)
 	if err != nil {
 		return err
 	}
