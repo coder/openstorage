@@ -1920,15 +1920,26 @@ func (s *Server) legacySourceProvenMismatched(ctx context.Context, repoID, legac
 		return false // absent or unknowable spares; the next touch re-examines
 	}
 	// The snapshot is real replica disk: charge it to the staging budget
-	// like every proxy transfer (Codex round 116, P1) — one slot plus
-	// size bytes in a single reservation (adoption's second-slot shape,
-	// round 25: it only makes the cap more conservative). A denied
-	// budget spares: unknowable is never proof, and the next touch
-	// re-examines under a freer budget.
-	if !s.reserveLFSStaging(repoID, size) {
+	// like every proxy transfer (Codex round 116, P1) — a zero-byte slot
+	// first (adoption's second-slot shape, round 25), then the bytes
+	// through growLFSStaging so the PER-REPOSITORY byte-share fairness
+	// applies too (Codex security round 117: the one-shot reservation
+	// checked only the global cap, letting one repository's oversized
+	// mismatch snapshot 429 every other repository's uploads for the
+	// download's whole size-scaled window). A denied budget or share
+	// spares: unknowable is never proof, and the next touch re-examines
+	// under a freer budget.
+	if !s.reserveLFSStaging(repoID, 0) {
 		return false
 	}
-	defer s.releaseLFSStaging(repoID, size)
+	grown := int64(0)
+	defer func() { s.releaseLFSStaging(repoID, grown) }()
+	if size > 0 {
+		if !s.growLFSStaging(repoID, size) {
+			return false
+		}
+		grown = size
+	}
 	dir, err := os.MkdirTemp("", "lfs-mismatch-*")
 	if err != nil {
 		return false
