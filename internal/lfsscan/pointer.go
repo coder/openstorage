@@ -27,9 +27,11 @@ var lfsPointerVersionPrefixes = []string{
 // registered objects that no reachable pointer references, so treating a
 // dubious blob as a pointer merely spares an object, while rejecting a real
 // pointer could retire live data. It therefore requires only the spec's two
-// load-bearing properties — the `version` first line and an `oid sha256:`
-// key line — and ignores unknown keys, ordering, a missing size line, and
-// trailing carriage returns. It never panics on arbitrary input.
+// load-bearing properties — a `version` line before any key line and an
+// `oid sha256:` key line — and ignores leading blank lines (git-lfs itself
+// decodes such files; Codex security round 8), unknown keys, ordering, a
+// missing size line, and trailing carriage returns. It never panics on
+// arbitrary input.
 func ParseLFSPointer(data []byte) (oid string, ok bool) {
 	if len(data) > LFSPointerMaxSize {
 		return "", false
@@ -40,6 +42,12 @@ func ParseLFSPointer(data []byte) (oid string, ok bool) {
 		return "", false
 	}
 	lines := strings.Split(string(data), "\n")
+	for len(lines) > 0 && strings.TrimSpace(lines[0]) == "" {
+		lines = lines[1:] // git-lfs tolerates leading blank lines
+	}
+	if len(lines) == 0 {
+		return "", false
+	}
 	first := strings.TrimSuffix(lines[0], "\r")
 	versioned := false
 	for _, p := range lfsPointerVersionPrefixes {

@@ -134,6 +134,13 @@ type LFSReclaimer struct {
 	// failing or over-budget repo cannot monopolize every run (the
 	// purger's rotation, issue #52). In-memory per process.
 	cursor string
+	// rowCursors resumes settlement past a non-retiring row prefix (Codex
+	// round 8): when the allowance runs out mid-repo, the next attempt
+	// continues after the last examined key instead of re-paging rows
+	// that stay put — referenced, in-grace, or dry-run rows — which would
+	// otherwise starve the tail forever. Cleared when a pass reaches the
+	// end of the keyspace. In-memory per process, like cursor.
+	rowCursors map[string]string
 }
 
 // NewLFSReclaimer wires the reclamation job.
@@ -156,6 +163,7 @@ func NewLFSReclaimer(registry LFSReclaimRegistry, hydrate HydrateFunc, walk LFSW
 		logger:         logger,
 		now:            time.Now,
 		hydrateTimeout: lfsReclaimHydrateTimeout,
+		rowCursors:     make(map[string]string),
 	}
 }
 
@@ -350,14 +358,16 @@ func (r *LFSReclaimer) hydrateBounded(ctx context.Context, member, branch string
 // retires (or, dry-run, counts) rows whose mark outlived the grace window.
 // Every examined row charges one unit of allowance — the same budget the
 // walks draw from — and exhaustion aborts with the budget verdict so the
-// caller defers or skips the repo like an over-budget walk. Rows already
-// settled stay settled; retirement's per-row transactions shrink the key
-// range's front, so successive passes over an oversized repo converge.
+// caller defers or skips the repo like an over-budget walk. Progress is
+// durable two ways: settled rows stay settled, and the per-repo row cursor
+// resumes the next attempt after the last examined key (Codex round 8) —
+// without it, a non-retiring prefix of referenced, in-grace, or dry-run
+// rows would be re-paged forever and the tail never examined.
 func (r *LFSReclaimer) settleRepoRows(ctx context.Context, base string, gens map[string]int64, referenced map[string]struct{}, allowance int64, report *LFSReclaimReport) (int64, error) {
 	assertf(allowance >= 0, "settleRepoRows: negative allowance %d", allowance)
 	var errs boundedErrs
 	var charged int64
-	after := ""
+	after := r.rowCursors[base]
 	for {
 		page := lfsReclaimRowPage
 		if remaining := allowance - charged; remaining < int64(page) {
@@ -374,6 +384,7 @@ func (r *LFSReclaimer) settleRepoRows(ctx context.Context, base string, gens map
 			if len(probe) == 0 {
 				break
 			}
+			r.rowCursors[base] = after // resume here next attempt
 			errs.add(fmt.Errorf("settle %s: %w (budget)", base, lfsscan.ErrLFSScanBudget))
 			return charged, errs.join()
 		}
@@ -440,6 +451,9 @@ func (r *LFSReclaimer) settleRepoRows(ctx context.Context, base string, gens map
 			report.RowsMarked += n
 		}
 	}
+	// End of the keyspace: the rotation is complete (a cursor-resumed pass
+	// covered the tail; the front was covered when the cursor was minted).
+	delete(r.rowCursors, base)
 	return charged, errs.join()
 }
 

@@ -370,6 +370,16 @@ func TestLFSReclaim_SettlementChargesBudget(t *testing.T) {
 	if rep.RowsExamined != 3 || rep.RowsMarked != 3 || rep.ReposOverBudget != 1 {
 		t.Fatalf("bounded settlement run = %+v, want 3 examined/marked and over-budget", rep)
 	}
+
+	// Pass 2 resumes at the stored row cursor (Codex round 8) instead of
+	// re-paging the non-retiring prefix forever: the tail rows get marked.
+	rep, err = r.Run(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.RowsMarked != 2 {
+		t.Fatalf("cursor pass = %+v, want the 2 remaining rows marked", rep)
+	}
 }
 
 // TestLFSReclaim_ExactExhaustionBetweenMembers (Codex round 3): when one
