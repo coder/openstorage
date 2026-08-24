@@ -3448,21 +3448,58 @@ func (s *Server) ensureLegacyCompat(ctx context.Context, repoID, oid, key string
 			return nil // spared; the memo stands for the next touch
 		}
 		defer s.releaseLFSStaging(repoID, 0)
+		// The verdict must be obtained AND acted on under the legacy
+		// fleet claim (Codex security round 123): the process-local
+		// guard above let replica B act on a snapshot predating replica
+		// A's delete+rebridge, deleting A's fresh VALID bridge. The
+		// claim serializes every new-replica legacy actor (round 85);
+		// the owner-fenced renewal just before the delete proves no
+		// peer interleaved (release deletes the row, takeover moves the
+		// owner — renewal succeeds only untouched), so no verdict can
+		// go stale across a peer's action. The fall-through re-bridge
+		// re-acquires the claim itself, safely: after an under-claim
+		// delete the spelling is absent, and every peer's snapshot runs
+		// under the claim too, so none can hold a pre-delete verdict.
+		cctx, ccancel := context.WithTimeout(context.WithoutCancel(ctx), lfsClaimRenewTimeout)
+		claimed, claimOwner, cerr := s.Store.TryAdoptionClaim(cctx, repoID, legacyKey)
+		ccancel()
+		if cerr != nil || !claimed {
+			return nil // held elsewhere or unknowable: spared, memo stands
+		}
+		releaseClaim := func() {
+			rctx, rcancel := context.WithTimeout(context.WithoutCancel(ctx), lfsClaimRenewTimeout)
+			if rerr := s.Store.ReleaseAdoptionClaim(rctx, legacyKey, claimOwner); rerr != nil {
+				log.Printf("lfs compat %s: release cleanup claim: %v", legacyKey, rerr)
+			}
+			rcancel()
+		}
 		dctx, dcancel := context.WithTimeout(context.WithoutCancel(ctx), lfsCleanupTimeout)
 		defer dcancel()
-		switch m, decisive := s.legacySourceProvenMismatched(dctx, repoID, legacyKey, oid); {
+		m, decisive := s.legacySourceProvenMismatched(dctx, repoID, legacyKey, oid)
+		switch {
 		case !decisive:
+			releaseClaim()
 			return nil // spared; the memo stands pending for the next touch
 		case !m:
 			s.forgetLFSMismatch(legacyKey)
+			releaseClaim()
 			return nil // proven VALID: the true object converged
+		}
+		rnCtx, rnCancel := context.WithTimeout(context.WithoutCancel(ctx), lfsClaimRenewTimeout)
+		renewed, rnErr := s.Store.RenewAdoptionClaim(rnCtx, legacyKey, claimOwner)
+		rnCancel()
+		if rnErr != nil || !renewed {
+			releaseClaim()
+			return nil // possibly stale verdict: spared, memo stands
 		}
 		delCtx, delCancel := context.WithTimeout(context.WithoutCancel(ctx), lfsCleanupTimeout)
 		defer delCancel()
 		if err := s.Blob.Delete(delCtx, legacyKey); err != nil && !errors.Is(err, blob.ErrNotFound) {
+			releaseClaim()
 			return fmt.Errorf("remove memoized mismatched legacy object %s: %w", legacyKey, err)
 		}
 		s.forgetLFSMismatch(legacyKey)
+		releaseClaim()
 		log.Printf("lfs compat %s: removed memoized mismatched legacy blob before re-bridging", key)
 		// Fall through: the spelling is now absent and the bridge
 		// repair below republishes the verified canonical bytes.
