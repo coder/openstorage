@@ -1084,15 +1084,26 @@ func (s *Server) adoptLFSObject(ctx context.Context, repoID, key, oid string) er
 			return errLFSContentMismatch
 		}
 		// The forged bytes came from the legacy source (the canonical
-		// copy is adoption-written only): remove it too, unguarded — the
-		// legacy spelling is never registered — so the next touch cannot
-		// re-copy the same provably wrong bytes (Codex security round
-		// 78). Best-effort: a survivor is re-copied, re-fails the
-		// digest, and lands back here.
-		if err := s.Blob.Delete(dctx, blob.LFSLegacyKey(repoID, oid)); err != nil && !errors.Is(err, blob.ErrNotFound) {
-			log.Printf("lfs adopt %s: remove mismatched legacy source: %v", key, err)
+		// copy is adoption-written only) — but the destination's failed
+		// digest proves only what the COPY caught, not what the source
+		// holds NOW (Codex round 108, P2): a legacy presigned PUT can
+		// restore the correct object while the destination verifies, and
+		// an unconditional delete would remove the only valid copy (404s
+		// on old replicas until a client re-uploads). Re-hash the CURRENT
+		// source — fingerprints are cross-key incomparable and ABA-prone,
+		// only a fresh digest is decisive — and delete only proven-wrong
+		// bytes; unknowable state spares. Best-effort like before (Codex
+		// security round 78): a spared survivor is re-copied, re-fails
+		// the digest, and lands back here.
+		legacySrc := blob.LFSLegacyKey(repoID, oid)
+		if s.legacySourceProvenMismatched(dctx, legacySrc, oid) {
+			if err := s.Blob.Delete(dctx, legacySrc); err != nil && !errors.Is(err, blob.ErrNotFound) {
+				log.Printf("lfs adopt %s: remove mismatched legacy source: %v", key, err)
+			}
+			log.Printf("lfs adopt %s: removed legacy blob failing content verification", key)
+		} else {
+			log.Printf("lfs adopt %s: sparing legacy source not proven mismatched", key)
 		}
-		log.Printf("lfs adopt %s: removed legacy blob failing content verification", key)
 		return errLFSContentMismatch
 	}
 	// Register the size of the bytes that were ACTUALLY downloaded and
@@ -1752,6 +1763,35 @@ func (s *Server) publishVerifiedLFSObject(ctx context.Context, repoID, key, lega
 		return fmt.Errorf("adoption publish %s: cover continuity lost: %w", key, renewErr)
 	}
 	return nil
+}
+
+// legacySourceProvenMismatched re-hashes the legacy source at cleanup time
+// (Codex round 108, P2): the destination's failed digest proves the bytes
+// the copy caught were wrong, not that the source still holds them. Only a
+// fresh digest over the CURRENT source content is decisive. Errors report
+// false — unknowable state spares, and the next touch re-examines. Bounded
+// per chunk like verification; runs only on the rare mismatch path, under
+// the caller's held claim and op slot.
+func (s *Server) legacySourceProvenMismatched(ctx context.Context, legacyKey, oid string) bool {
+	sctx, scancel := context.WithTimeout(ctx, lfsProbeTimeout)
+	size, err := s.Blob.Stat(sctx, legacyKey)
+	scancel()
+	if err != nil {
+		return false
+	}
+	h := sha256.New()
+	for off := int64(0); off < size; {
+		n := min(lfsStagingChunk, size-off)
+		cctx, ccancel := context.WithTimeout(ctx, lfsVerifyChunkTimeout)
+		chunk, cerr := s.Blob.ReadRange(cctx, legacyKey, off, n)
+		ccancel()
+		if cerr != nil {
+			return false
+		}
+		_, _ = h.Write(chunk)
+		off += n
+	}
+	return hex.EncodeToString(h.Sum(nil)) != oid
 }
 
 // withRenewedAdoptionClaim runs op while renewing the fleet claim for key

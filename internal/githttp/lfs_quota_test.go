@@ -2345,6 +2345,54 @@ func TestLFSAdopt_QuotaPreflightSkipsHash(t *testing.T) {
 	}
 }
 
+// forgeOnCopyBlob simulates the ABA the destination re-verification
+// exists for: the copy "catches" forged interim bytes — the destination
+// receives them — while the source's good content stands (a presigned PUT
+// restored it during verification).
+type forgeOnCopyBlob struct {
+	blob.BlobStore
+	t      *testing.T
+	forged []byte
+}
+
+func (b *forgeOnCopyBlob) Copy(ctx context.Context, dstKey, srcKey string) error {
+	if strings.Contains(dstKey, "/o2/") {
+		return b.BlobStore.UploadFile(ctx, dstKey, writeTempFile(b.t, b.forged))
+	}
+	return b.BlobStore.Copy(ctx, dstKey, srcKey)
+}
+
+// TestLFSAdopt_MismatchCleanupSparesRestoredSource (Codex round 108, P2):
+// the destination's failed post-copy digest proves only what the COPY
+// caught — the legacy source may have been restored to the correct object
+// while the destination verified, and the unconditional cleanup deleted
+// that only valid copy (404s on old replicas, forced client re-uploads).
+// The cleanup must re-hash the CURRENT source and delete only proven-wrong
+// bytes.
+func TestLFSAdopt_MismatchCleanupSparesRestoredSource(t *testing.T) {
+	ctx := context.Background()
+	srv, st, _ := newLFSQuotaServer(t, 0, time.Hour)
+	content := []byte("the good bytes a presigned PUT restored")
+	oid := sha256Hex(content)
+	key := blob.LFSKey(lfsTestRepoID, oid)
+	legacyKey := blob.LFSLegacyKey(lfsTestRepoID, oid)
+	if err := srv.Blob.UploadFile(ctx, legacyKey, writeTempFile(t, content)); err != nil {
+		t.Fatal(err)
+	}
+	srv.Blob = &forgeOnCopyBlob{BlobStore: srv.Blob, t: t, forged: []byte("forged interim bytes the copy caught")}
+
+	aerr := srv.adoptLFSObject(ctx, lfsTestRepoID, key, oid)
+	if !errors.Is(aerr, errLFSContentMismatch) {
+		t.Fatalf("adoption whose copy caught forged bytes = %v, want errLFSContentMismatch", aerr)
+	}
+	if has, err := st.HasLFSObject(ctx, lfsTestRepoID, key); err != nil || has {
+		t.Fatalf("registered = (%v, %v), want not registered", has, err)
+	}
+	if _, err := srv.Blob.Stat(ctx, legacyKey); err != nil {
+		t.Fatalf("restored legacy source deleted by the mismatch cleanup: %v — it was the object's only valid copy", err)
+	}
+}
+
 // TestLFSCompat_RepairSerializedOnLegacyClaim (Codex security round 85):
 // the batch fast path's bridge repair launched an unserialized full copy —
 // every tiny concurrent touch of the object started another one. Compat
