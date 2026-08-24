@@ -29,6 +29,7 @@ import (
 	"github.com/coder/code-storage/internal/githttp"
 	"github.com/coder/code-storage/internal/gitread"
 	"github.com/coder/code-storage/internal/jobs"
+	"github.com/coder/code-storage/internal/lfsscan"
 	"github.com/coder/code-storage/internal/meta"
 	"github.com/coder/code-storage/internal/ref"
 	"github.com/coder/code-storage/internal/secrets"
@@ -218,7 +219,7 @@ func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL, loopbackBaseU
 			func(ctx context.Context, repo, defaultBranch string) (string, error) {
 				return gitread.Materialize(ctx, refStore, blobStore, cacheDir, repo, defaultBranch)
 			},
-			gitread.ReachableLFSOIDs,
+			lfsscan.ReachableLFSOIDs,
 			func(ctx context.Context, base string) (string, bool, error) {
 				r, err := ms.GetRepoByID(ctx, org, base)
 				if errors.Is(err, meta.ErrNotFound) {

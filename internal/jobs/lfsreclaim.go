@@ -19,7 +19,7 @@ import (
 	"time"
 
 	"github.com/coder/code-storage/internal/blob"
-	"github.com/coder/code-storage/internal/gitread"
+	"github.com/coder/code-storage/internal/lfsscan"
 	"github.com/coder/code-storage/internal/ref"
 )
 
@@ -57,8 +57,8 @@ type LFSReclaimRegistry interface {
 type HydrateFunc func(ctx context.Context, repo, defaultBranch string) (repoPath string, err error)
 
 // LFSWalkFunc computes the reachable pointer OIDs of the cache repo at
-// repoPath (gitread.ReachableLFSOIDs in production). It must return an
-// error wrapping gitread.ErrLFSScanBudget when the walk exceeds budget.
+// repoPath (lfsscan.ReachableLFSOIDs in production). It must return an
+// error wrapping lfsscan.ErrLFSScanBudget when the walk exceeds budget.
 type LFSWalkFunc func(ctx context.Context, repoPath string, budget int64) (oids map[string]struct{}, walked int64, err error)
 
 // DefaultBranchFunc resolves a base repo's default branch from the metadata
@@ -190,7 +190,7 @@ loop:
 			walked, err := r.reclaimRepo(ctx, base, budget, &report)
 			budget -= walked
 			switch {
-			case errors.Is(err, gitread.ErrLFSScanBudget):
+			case errors.Is(err, lfsscan.ErrLFSScanBudget):
 				if hadFullBudget {
 					// The repo alone exceeds a full run budget: count and
 					// skip it (rotation moved past it) and say so — only

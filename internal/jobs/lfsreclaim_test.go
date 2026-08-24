@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/coder/code-storage/internal/gitread"
+	"github.com/coder/code-storage/internal/lfsscan"
 	"github.com/coder/code-storage/internal/ref"
 )
 
@@ -102,7 +102,7 @@ func alwaysMain(context.Context, string) (string, bool, error) { return "main", 
 
 func testReclaimer(t *testing.T, reg LFSReclaimRegistry, hydrate HydrateFunc, grace time.Duration, budget int64, deleteEnabled bool) *LFSReclaimer {
 	t.Helper()
-	return NewLFSReclaimer(reg, hydrate, gitread.ReachableLFSOIDs, alwaysMain,
+	return NewLFSReclaimer(reg, hydrate, lfsscan.ReachableLFSOIDs, alwaysMain,
 		grace, budget, deleteEnabled, slog.New(slog.DiscardHandler))
 }
 
@@ -306,7 +306,7 @@ func TestLFSReclaim_BudgetResumesNextRun(t *testing.T) {
 	}
 	// Each fixture walk lists 3 objects (commit+tree+2 blobs = 4? measure:
 	// budget generous for one repo, too small for two).
-	_, perRepo, err := gitread.ReachableLFSOIDs(ctx, fixtures["a-repo"], 1_000)
+	_, perRepo, err := lfsscan.ReachableLFSOIDs(ctx, fixtures["a-repo"], 1_000)
 	if err != nil {
 		t.Fatal(err)
 	}

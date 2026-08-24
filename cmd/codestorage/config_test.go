@@ -15,6 +15,8 @@ import (
 	"time"
 
 	"github.com/coder/code-storage/internal/auth"
+	"github.com/coder/code-storage/internal/jobs"
+	"github.com/coder/code-storage/internal/ref"
 )
 
 // mapEnv builds a getenv func from a fixed map (no process env mutation).
@@ -1163,5 +1165,79 @@ func TestResolveSecretsCodec(t *testing.T) {
 				t.Fatalf("DecryptOnly = %v, want %v", codec.DecryptOnly, tc.wantDecryptOnly)
 			}
 		})
+	}
+}
+
+// TestResolveLFSGCSettings (issue #73): the reclamation knobs parse
+// fail-fast like the sweep settings; the delete opt-in without a schedule
+// is a loud misconfiguration.
+func TestResolveLFSGCSettings(t *testing.T) {
+	env := func(m map[string]string) func(string) string {
+		return func(k string) string { return m[k] }
+	}
+
+	t.Run("defaults", func(t *testing.T) {
+		s, err := resolveLFSGCSettings(env(nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := lfsGCSettings{grace: jobs.DefaultLFSReclaimGrace, objectBudget: jobs.DefaultLFSReclaimObjectBudget}
+		if s != want {
+			t.Fatalf("defaults = %+v, want %+v (disabled, 24h grace, 1M budget)", s, want)
+		}
+	})
+
+	t.Run("parse-through", func(t *testing.T) {
+		s, err := resolveLFSGCSettings(env(map[string]string{
+			envLFSGCInterval:      "30m",
+			envLFSGCGrace:         "48h",
+			envLFSGCObjectBudget:  "5000",
+			envLFSGCDeleteEnabled: "true",
+		}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := lfsGCSettings{interval: 30 * time.Minute, grace: 48 * time.Hour, objectBudget: 5000, deleteEnabled: true}
+		if s != want {
+			t.Fatalf("settings = %+v, want %+v", s, want)
+		}
+	})
+
+	t.Run("delete-requires-schedule", func(t *testing.T) {
+		if _, err := resolveLFSGCSettings(env(map[string]string{envLFSGCDeleteEnabled: "true"})); err == nil {
+			t.Fatal("delete opt-in with no schedule must fail loudly")
+		}
+	})
+
+	for name, bad := range map[string]map[string]string{
+		"negative interval": {envLFSGCInterval: "-1h"},
+		"zero grace":        {envLFSGCGrace: "0"},
+		"zero budget":       {envLFSGCInterval: "1h", envLFSGCObjectBudget: "0"},
+		"malformed budget":  {envLFSGCObjectBudget: "many"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := resolveLFSGCSettings(env(bad)); err == nil {
+				t.Fatalf("%v must fail", bad)
+			}
+		})
+	}
+}
+
+// TestResolveLFSMaxObjectsPerRepo (issue #73 option 3): the operator escape
+// hatch parses positively or fails loudly.
+func TestResolveLFSMaxObjectsPerRepo(t *testing.T) {
+	env := func(m map[string]string) func(string) string {
+		return func(k string) string { return m[k] }
+	}
+	if v, err := resolveLFSMaxObjectsPerRepo(env(nil)); err != nil || v != ref.MaxLFSObjectsPerRepo {
+		t.Fatalf("default = (%d, %v), want built-in %d", v, err, ref.MaxLFSObjectsPerRepo)
+	}
+	if v, err := resolveLFSMaxObjectsPerRepo(env(map[string]string{envLFSMaxObjectsPerRepo: "250000"})); err != nil || v != 250000 {
+		t.Fatalf("override = (%d, %v), want 250000", v, err)
+	}
+	for _, bad := range []string{"0", "-5", "lots"} {
+		if _, err := resolveLFSMaxObjectsPerRepo(env(map[string]string{envLFSMaxObjectsPerRepo: bad})); err == nil {
+			t.Fatalf("%q must fail", bad)
+		}
 	}
 }

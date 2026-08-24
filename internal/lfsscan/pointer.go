@@ -1,4 +1,4 @@
-package gitread
+package lfsscan
 
 import (
 	"strings"

@@ -1,4 +1,9 @@
-package gitread
+// Package lfsscan is the leaf reachability layer of unreferenced-LFS-object
+// reclamation (issue #73): a lenient Git LFS pointer-file decoder and a
+// bounded `git rev-list`/`cat-file` walk collecting the OIDs reachable
+// pointer files reference. It deliberately sits below internal/gitread —
+// internal/jobs consumes it, and gitread's githttp dependency would cycle.
+package lfsscan
 
 import (
 	"bufio"
@@ -16,6 +21,13 @@ import (
 
 	"github.com/coder/code-storage/internal/ref"
 )
+
+// assertf is a fail-fast invariant check for programming errors only.
+func assertf(cond bool, format string, args ...any) {
+	if !cond {
+		panic(fmt.Sprintf("lfsscan assertion failed: "+format, args...))
+	}
+}
 
 // ErrLFSScanBudget marks a reachability walk aborted because it listed more
 // objects than the caller's budget allows. The partial OID set is unusable

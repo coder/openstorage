@@ -445,6 +445,24 @@ func (s *Server) lfsBatchUpload(r *http.Request, repoElem string, target repoTar
 		if registered {
 			switch _, err := s.Blob.Stat(ctx, key); {
 			case err == nil:
+				// Liveness handshake (issue #73): answering "stored"
+				// promises the client it may commit a pointer file
+				// referencing this OID, so clear the reclamation mark
+				// FIRST — the touch buys the client a full grace window
+				// before retirement can reconsider the row. touched=false
+				// means the reclaimer retired the row between the
+				// registry read above and here: answer retryable instead
+				// of promising a vanished object (the retry re-reads the
+				// registry and issues a real upload action).
+				if touched, terr := s.Store.TouchLFSObject(ctx, repoID, key); terr != nil {
+					log.Printf("lfs touch %s: %v", key, terr)
+					lfsObjectFail(&results[i], http.StatusInternalServerError, "object registry unavailable")
+					continue
+				} else if !touched {
+					lfsObjectFail(&results[i], http.StatusTooManyRequests,
+						"a concurrent operation reclaimed this object, retry")
+					continue
+				}
 				// Registered with canonical bytes present: stored — no
 				// actions means the client skips the upload. A memo
 				// parked for a registration that (indeterminately)

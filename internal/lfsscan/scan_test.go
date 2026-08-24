@@ -1,9 +1,12 @@
-package gitread
+package lfsscan
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -131,5 +134,39 @@ func TestReachableLFSOIDs_EmptyRepo(t *testing.T) {
 	}
 	if len(oids) != 0 || walked != 0 {
 		t.Fatalf("empty repo walk = (%v, %d)", oids, walked)
+	}
+}
+
+// gitEnv pins identity and neuters host config so fixture commits are
+// hermetic.
+var gitEnv = []string{
+	"GIT_AUTHOR_NAME=Alice Author",
+	"GIT_AUTHOR_EMAIL=alice@example.com",
+	"GIT_COMMITTER_NAME=Bob Committer",
+	"GIT_COMMITTER_EMAIL=bob@example.com",
+	"GIT_CONFIG_GLOBAL=/dev/null",
+	"GIT_CONFIG_SYSTEM=/dev/null",
+}
+
+func mustGit(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(), gitEnv...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+	}
+	return string(out)
+}
+
+func writeFile(t *testing.T, dir, name, content string, mode os.FileMode) {
+	t.Helper()
+	path := filepath.Join(dir, name)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(content), mode); err != nil {
+		t.Fatal(err)
 	}
 }
