@@ -385,6 +385,76 @@ func (s *Server) lfsBatchDownload(r *http.Request, repoElem string, target repoT
 	return res
 }
 
+// storedLFSFate is one unique key's settled batch "stored" verdict: a
+// success (zero value), a failure to report on every occurrence, or a
+// fall-through into the zero-growth repair admission for a
+// registered-but-blobless key.
+type storedLFSFate struct {
+	fellThrough bool
+	failed      bool
+	status      int
+	msg         string
+}
+
+// settleStoredLFSBatchEntry runs the batch "stored" fast path for ONE
+// registered key: probe the canonical bytes, clear the reclamation mark,
+// converge the compat bridge, and re-arm the grace clock. Executed once
+// per unique key per batch (Codex security round 15): duplicates share
+// the verdict instead of amplifying a small request body into repeated
+// standalone registry writes and blob probes.
+func (s *Server) settleStoredLFSBatchEntry(ctx context.Context, repoID, oid, key string) storedLFSFate {
+	switch _, err := s.Blob.Stat(ctx, key); {
+	case err == nil:
+	case errors.Is(err, blob.ErrNotFound):
+		// Registered but blobless: the zero-growth repair admission owns
+		// this key.
+		return storedLFSFate{fellThrough: true}
+	default:
+		log.Printf("lfs stat %s: %v", key, err)
+		return storedLFSFate{failed: true, status: http.StatusInternalServerError, msg: "object storage unavailable"}
+	}
+	// Liveness handshake (issue #73): answering "stored" promises the
+	// client it may commit a pointer file referencing this OID, so clear
+	// the reclamation mark FIRST — the touch buys the client a full grace
+	// window before retirement can reconsider the row. touched=false
+	// means the reclaimer retired the row between the caller's registry
+	// read and here: answer retryable instead of promising a vanished
+	// object (the retry re-reads the registry and issues a real upload
+	// action).
+	if touched, terr := s.Store.TouchLFSObject(ctx, repoID, key); terr != nil {
+		log.Printf("lfs touch %s: %v", key, terr)
+		return storedLFSFate{failed: true, status: http.StatusInternalServerError, msg: "object registry unavailable"}
+	} else if !touched {
+		return storedLFSFate{failed: true, status: http.StatusTooManyRequests, msg: "a concurrent operation reclaimed this object, retry"}
+	}
+	// A memo parked for a registration that (indeterminately) committed
+	// is dead weight; free it and its lease.
+	s.dropLFSVerifyResume(key)
+	// Bridge convergence for the BATCH fast path (Codex round 84): after
+	// a failed compat copy, the natural client retry is another batch
+	// request landing exactly here — reporting "stored" without repairing
+	// the missing legacy spelling would strand old replicas on 404 with
+	// no flow left to converge.
+	if cerr := s.ensureLegacyCompat(ctx, repoID, oid, key); cerr != nil {
+		log.Printf("lfs compat %s: %v", key, cerr)
+		return storedLFSFate{failed: true, status: compatFailStatus(cerr), msg: "compatibility copy failed, retry"}
+	}
+	// Re-arm the grace clock immediately before the stored answer (Codex
+	// round 12): the compat copy above is synchronous and size-scaled, so
+	// the entry touch's window may be largely consumed — or, past a short
+	// grace, the row may have been re-marked and retired while the copy
+	// held the claim's spare only for its own duration. The touch is the
+	// LAST registry write before success; touched=false answers
+	// retryable.
+	if touched, terr := s.Store.TouchLFSObject(ctx, repoID, key); terr != nil {
+		log.Printf("lfs touch %s: %v", key, terr)
+		return storedLFSFate{failed: true, status: http.StatusInternalServerError, msg: "object registry unavailable"}
+	} else if !touched {
+		return storedLFSFate{failed: true, status: http.StatusTooManyRequests, msg: "a concurrent operation reclaimed this object, retry"}
+	}
+	return storedLFSFate{}
+}
+
 // lfsBatchUpload resolves a whole upload batch: it validates and Stats each
 // entry, adopts already-stored objects into the LFS registry, admits every
 // missing object's DECLARED size through the durable quota ledger in ONE
@@ -406,6 +476,7 @@ func (s *Server) lfsBatchUpload(r *http.Request, repoElem string, target repoTar
 	zeroGrowth := make(map[string]bool)
 	checked := make(map[string]bool)
 	checkFailed := make(map[string]bool)
+	storedFates := make(map[string]storedLFSFate)
 	var order []string
 	for i, obj := range objs {
 		results[i] = lfsObjectResult{OID: obj.OID, Size: obj.Size}
@@ -443,31 +514,39 @@ func (s *Server) lfsBatchUpload(r *http.Request, repoElem string, target repoTar
 			continue
 		}
 		if registered {
-			switch _, err := s.Blob.Stat(ctx, key); {
-			case err == nil:
-				// Registered with canonical bytes present: stored — no
-				// actions means the client skips the upload. A memo
-				// parked for a registration that (indeterminately)
-				// committed is dead weight; free it and its lease.
-				s.dropLFSVerifyResume(key)
-				// Bridge convergence for the BATCH fast path (Codex round
-				// 84): after a failed compat copy, the natural client
-				// retry is another batch request landing exactly here —
-				// reporting "stored" without repairing the missing legacy
-				// spelling would strand old replicas on 404 with no flow
-				// left to converge.
-				if cerr := s.ensureLegacyCompat(ctx, repoID, obj.OID, key); cerr != nil {
-					log.Printf("lfs compat %s: %v", key, cerr)
-					lfsObjectFail(&results[i], compatFailStatus(cerr), "compatibility copy failed, retry")
+			// One settlement per unique key (Codex security round 15): a
+			// batch may repeat one stored OID hundreds of times, and
+			// running the fast path per OCCURRENCE amplified a small
+			// request into standalone registry writes (two touches each)
+			// plus blob probes and bridge work. The first occurrence does
+			// the work; duplicates share its verdict.
+			fate, seen := storedFates[key]
+			if !seen {
+				fate = s.settleStoredLFSBatchEntry(ctx, repoID, obj.OID, key)
+				storedFates[key] = fate
+				// Cache the registered verdict too (Codex round 16):
+				// stored outcomes continue before the admission memo
+				// below, so duplicates would otherwise re-run the
+				// registry read once per occurrence — a small batch
+				// repeating one OID amplified into per-entry database
+				// round trips. Fall-through keys reach that memo (and
+				// the admission order) themselves.
+				if !fate.fellThrough {
+					checked[key] = true
+					zeroGrowth[key] = true
 				}
+			}
+			switch {
+			case fate.failed:
+				lfsObjectFail(&results[i], fate.status, fate.msg)
 				continue
-			case !errors.Is(err, blob.ErrNotFound):
-				log.Printf("lfs stat %s: %v", key, err)
-				lfsObjectFail(&results[i], http.StatusInternalServerError, "object storage unavailable")
+			case !fate.fellThrough:
+				// Registered with canonical bytes present: stored — no
+				// actions means the client skips the upload.
 				continue
 			}
 			// Registered but blobless: fall through to the zero-growth
-			// repair admission.
+			// repair admission (deduplicated per key by needIdx below).
 		} else {
 			switch _, err := s.Blob.Stat(ctx, blob.LFSLegacyKey(repoID, obj.OID)); {
 			case err == nil:
@@ -811,17 +890,47 @@ func (s *Server) adoptStoredLFSObject(ctx context.Context, repoID, key, oid stri
 		return err
 	}
 	if registered && !restore {
-		// A prior attempt's registration may have committed after
-		// its bounded context expired (indeterminate failure), with
-		// the lease parked for a retry that now has nothing to do
-		// (Codex round 76): free the memo and its lease.
-		s.dropLFSVerifyResume(key)
-		// The registered fast path is the ONLY path retries of a
-		// stored object ever reach, so bridge convergence lives here
-		// (Codex round 83): a compat copy that failed after
-		// registration is repaired by the next write-scoped touch
-		// instead of 404ing on old replicas forever.
-		return s.ensureLegacyCompat(ctx, repoID, oid, key)
+		// Liveness handshake (issue #73, review round 1): this fast path
+		// answers every direct PUT of an already-stored object, and a 200
+		// promises the client it may commit a pointer referencing the
+		// OID — clear the reclamation mark FIRST, exactly like the batch
+		// "stored" answer, so a grace-expired mark cannot let the
+		// reclaimer retire the row before the client pushes. touched=false
+		// means the reclaimer retired the row between the registry read
+		// above and here: fall through to the full adoption below, which
+		// re-verifies the stored bytes and mints a fresh registered row
+		// instead of promising a vanished one.
+		touched, terr := s.Store.TouchLFSObject(ctx, repoID, key)
+		if terr != nil {
+			return terr
+		}
+		if touched {
+			// A prior attempt's registration may have committed after
+			// its bounded context expired (indeterminate failure), with
+			// the lease parked for a retry that now has nothing to do
+			// (Codex round 76): free the memo and its lease.
+			s.dropLFSVerifyResume(key)
+			// The registered fast path is the ONLY path retries of a
+			// stored object ever reach, so bridge convergence lives here
+			// (Codex round 83): a compat copy that failed after
+			// registration is repaired by the next write-scoped touch
+			// instead of 404ing on old replicas forever.
+			if cerr := s.ensureLegacyCompat(ctx, repoID, oid, key); cerr != nil {
+				return cerr
+			}
+			// Re-arm the grace clock after the size-scaled compat copy
+			// (Codex round 12), mirroring the batch stored answer: the
+			// 200 must be the promise of a freshly touched row, not one
+			// whose window the copy consumed. A vanished row answers
+			// retryable; the retry re-verifies and re-registers.
+			if touched, terr := s.Store.TouchLFSObject(ctx, repoID, key); terr != nil {
+				return terr
+			} else if !touched {
+				return errLFSBusy
+			}
+			return nil
+		}
+		registered = false
 	}
 	// Fast-fail the object cap BEFORE the verification download (Codex
 	// security round 4): an at-cap repository holding a rowless legacy
@@ -858,7 +967,30 @@ func (s *Server) adoptStoredLFSObject(ctx context.Context, repoID, key, oid stri
 			// copy was still in flight — a copy failure then stranded the
 			// legacy spelling with no request left to converge it.
 			s.dropLFSVerifyResume(key)
-			return s.ensureLegacyCompat(ctx, repoID, oid, key)
+			if cerr := s.ensureLegacyCompat(ctx, repoID, oid, key); cerr != nil {
+				return cerr
+			}
+			// Re-arm the grace clock after the size-scaled bridge copy,
+			// exactly like the registered fast path (Codex round 13): the
+			// twin minted this row BEFORE a potentially grace-long copy,
+			// so a scan can mark it mid-copy and a write-scoped 200 must
+			// still be the promise of a freshly touched row. Restores
+			// answer downloads — no pointer-commit promise — and must
+			// never extend an unreferenced row's life.
+			if restore {
+				return nil
+			}
+			// Bounded + detached like every post-registration registry
+			// write here: adoption completes under its own lease once
+			// started, so a canceled client must not abort the touch.
+			tctx, tcancel := context.WithTimeout(context.WithoutCancel(ctx), lfsCleanupTimeout)
+			defer tcancel()
+			if touched, terr := s.Store.TouchLFSObject(tctx, repoID, key); terr != nil {
+				return terr
+			} else if !touched {
+				return errLFSBusy
+			}
+			return nil
 		}
 		// A v0.2.0 legacy-spelled row for THIS oid already holds the
 		// object's cap slot (Codex round 86): registration migrates it in
@@ -1415,7 +1547,33 @@ func (s *Server) adoptStoredLFSObject(ctx context.Context, repoID, key, oid stri
 	// 83) so the client keeps retrying — the registration is committed
 	// and idempotent, and the retry's registered fast path converges the
 	// bridge through the same seam.
-	return s.ensureLegacyCompat(ctx, repoID, oid, key)
+	if cerr := s.ensureLegacyCompat(ctx, repoID, oid, key); cerr != nil {
+		return cerr
+	}
+	// Final liveness re-touch (issue #73, Codex round 13): the
+	// registration above committed BEFORE the sweep-race probe and the
+	// size-scaled bridge copy, either of which can outlast a short GC
+	// grace — a scan can mark the still-unreferenced row meanwhile, and
+	// once the adoption claim lapses a grace-expired mark retires it even
+	// though this success promises the writer it may commit its pointer.
+	// Restores answer downloads — no pointer-commit promise — and must
+	// never extend an unreferenced row's life. touched=false means the
+	// row already vanished: answer retryable so the retry re-registers
+	// instead of promising a retired row.
+	if restore {
+		return nil
+	}
+	// Bounded + detached like regCtx/rctx above: adoption completes under
+	// its own lease once started, so a canceled client must not abort the
+	// touch after the registration committed.
+	touchCtx, touchCancel := context.WithTimeout(context.WithoutCancel(ctx), lfsCleanupTimeout)
+	defer touchCancel()
+	if touched, terr := s.Store.TouchLFSObject(touchCtx, repoID, key); terr != nil {
+		return terr
+	} else if !touched {
+		return errLFSBusy
+	}
+	return nil
 }
 
 // verifyStoredLFSObject streams the blob at key through sha256 in
@@ -2950,24 +3108,38 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target r
 	// taken below; the upload-failure path retires against exactly these
 	// (Codex round 33).
 	var resGens map[string]string
-	if s.PackQuotaBytes > 0 && n > 0 && !registered {
-		// The pre-body registered flag can go STALE during the body copy
-		// (Codex round 26): a concurrent identical upload on another
-		// replica can publish and register this OID meanwhile, making
-		// this upload zero-growth — charging n as new growth would 507 a
-		// push whose object is already durably stored, purely because the
-		// twin won. Re-read the registry after verification, immediately
-		// before admission, and skip the reservation when the key is now
-		// registered (registration is terminal for a key, so this read
-		// cannot go stale in the dangerous direction; the reverse race —
-		// registered row losing its blob — is the zero-growth repair
-		// path, whose republication needs no reservation either).
+	if s.PackQuotaBytes > 0 && n > 0 {
+		// The pre-body registered flag can go STALE during the body copy,
+		// in BOTH directions. A concurrent identical upload on another
+		// replica can publish and register this OID meanwhile (Codex
+		// round 26), making this upload zero-growth — charging n as new
+		// growth would 507 a push whose object is already durably stored,
+		// purely because the twin won. And reclamation makes registration
+		// NON-terminal (issue #73, review round 9): a grace-expired row
+		// can retire and refund its bytes while the body streams, and
+		// another admission may already have consumed the freed headroom
+		// — keeping the stale zero-growth verdict would register bytes no
+		// admission covers, pushing usage past the quota. Re-read both
+		// spellings after verification, immediately before admission: a
+		// vanished row demotes this PUT to real new-growth admission, and
+		// it is no longer an absence-window repair (retirement bumped the
+		// adoption generation, invalidating the floors its cover would
+		// have guarded against).
 		registered, err = s.Store.HasLFSObject(ctx, repoID, key)
 		if err != nil {
 			log.Printf("lfs registry %s: %v", key, err)
 			lfsError(w, http.StatusInternalServerError, "object registry unavailable")
 			return
 		}
+		if !registered {
+			registered, err = s.Store.HasLFSObject(ctx, repoID, blob.LFSLegacyKey(repoID, oid))
+			if err != nil {
+				log.Printf("lfs registry %s: %v", key, err)
+				lfsError(w, http.StatusInternalServerError, "object registry unavailable")
+				return
+			}
+		}
+		repair = repair && registered
 	}
 	if s.PackQuotaBytes > 0 && n > 0 && !registered {
 		var dec ref.ReserveDecision
@@ -3248,6 +3420,24 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target r
 	if cause := context.Cause(regionCtx); cause != nil && !errors.Is(cause, context.Canceled) {
 		log.Printf("lfs claim %s: %v", key, cause)
 		lfsError(w, http.StatusInternalServerError, "object claim lost during publication, retry")
+		return
+	}
+	// Final liveness re-touch (issue #73, Codex round 13): registration
+	// left the row unmarked, but it committed BEFORE the sweep-race
+	// verify and the size-scaled compat copy, either of which can outlast
+	// a short GC grace — a scan can mark the still-unreferenced row
+	// meanwhile. The 200 below promises the client it may commit its
+	// pointer, so it must be the promise of a freshly touched row.
+	// touched=false means the row is already gone: answer retryable so
+	// the retry re-registers instead.
+	tctx, tcancel := context.WithTimeout(context.WithoutCancel(ctx), lfsCleanupTimeout)
+	defer tcancel()
+	if touched, terr := s.Store.TouchLFSObject(tctx, repoID, key); terr != nil {
+		log.Printf("lfs touch %s: %v", key, terr)
+		lfsError(w, http.StatusInternalServerError, "liveness touch failed, retry")
+		return
+	} else if !touched {
+		lfsError(w, http.StatusTooManyRequests, "object retired during upload, retry")
 		return
 	}
 	w.WriteHeader(http.StatusOK)

@@ -15,6 +15,8 @@ import (
 	"time"
 
 	"github.com/coder/code-storage/internal/auth"
+	"github.com/coder/code-storage/internal/jobs"
+	"github.com/coder/code-storage/internal/ref"
 )
 
 // mapEnv builds a getenv func from a fixed map (no process env mutation).
@@ -81,6 +83,63 @@ func TestResolveServeConfigCompatForbidsDestructiveLFSSweep(t *testing.T) {
 	delete(env, "CODESTORAGE_SWEEP_DELETE_LFS")
 	if _, err := resolveServeConfig(mapEnv(env), "", "127.0.0.1:0", "/tmp/cache", ""); err != nil {
 		t.Fatalf("write-compat with list-only sweeping: %v", err)
+	}
+}
+
+// TestResolveServeConfigLFSGCDeleteRequiresLFSReap (issue #73, Codex
+// security round 13): retirement refunds the object-cap slot, but only the
+// sweeper's destructive LFS opt-in deletes the stranded canonical blob —
+// without that coupling, a write-scoped token cycles upload → grace →
+// retire → re-upload and grows lfs/<repo>/ far past the cap that quota
+// floors and sweep listings rely on. Delete-mode reclamation therefore
+// requires the reap on an active sweep schedule, with a grace no shorter
+// than the reap cadence.
+func TestResolveServeConfigLFSGCDeleteRequiresLFSReap(t *testing.T) {
+	env := map[string]string{
+		"CODESTORAGE_ORG":                   "org1",
+		"CODESTORAGE_ORG_PUBKEYS":           "/tmp/org.pub.pem",
+		"CODESTORAGE_LFS_GC_INTERVAL":       "1h",
+		"CODESTORAGE_LFS_GC_DELETE_ENABLED": "true",
+	}
+	for k, v := range spikeEnv {
+		env[k] = v
+	}
+	if _, err := resolveServeConfig(mapEnv(env), "", "127.0.0.1:0", "/tmp/cache", ""); err == nil {
+		t.Fatal("delete-mode reclamation without the LFS reap resolved — retirement would refund cap slots while stranding their blobs")
+	}
+	env["CODESTORAGE_SWEEP_DELETE_LFS"] = "true"
+	if _, err := resolveServeConfig(mapEnv(env), "", "127.0.0.1:0", "/tmp/cache", ""); err != nil {
+		t.Fatalf("delete-mode reclamation with the LFS reap armed: %v", err)
+	}
+	// A grace below the reap cadence retires slots faster than the reap
+	// frees their blobs — the same growth, restated as a transient.
+	env["CODESTORAGE_LFS_GC_GRACE"] = "1h" // < the 24h default age threshold
+	if _, err := resolveServeConfig(mapEnv(env), "", "127.0.0.1:0", "/tmp/cache", ""); err == nil {
+		t.Fatal("grace below the reap cadence resolved — refunds would outrun physical deletion")
+	}
+	env["CODESTORAGE_SWEEP_AGE_THRESHOLD"] = "30m" // floor becomes the 1h sweep interval
+	env["CODESTORAGE_LFS_GC_GRACE"] = "1h"
+	if _, err := resolveServeConfig(mapEnv(env), "", "127.0.0.1:0", "/tmp/cache", ""); err != nil {
+		t.Fatalf("grace at the reap cadence: %v", err)
+	}
+	// Quarantine retention binds the floor even when both configured
+	// cadences sit below it (security round 14): every reap strands a
+	// quarantine copy for at least jobs.QuarantinePurgeFloor (1h).
+	env["CODESTORAGE_SWEEP_INTERVAL"] = "20m"
+	env["CODESTORAGE_LFS_GC_GRACE"] = "45m" // ≥ max(30m, 20m), < 1h quarantine floor
+	if _, err := resolveServeConfig(mapEnv(env), "", "127.0.0.1:0", "/tmp/cache", ""); err == nil {
+		t.Fatal("grace below the quarantine retention floor resolved — reaps would strand quarantine generations faster than purging frees them")
+	}
+	env["CODESTORAGE_LFS_GC_GRACE"] = "1h"
+	if _, err := resolveServeConfig(mapEnv(env), "", "127.0.0.1:0", "/tmp/cache", ""); err != nil {
+		t.Fatalf("grace at the quarantine floor: %v", err)
+	}
+	// The fleet-wide sweep emergency stop stays available: with the
+	// schedule stopped the delete flag demotes to report-only at wiring
+	// instead of failing startup.
+	env["CODESTORAGE_SWEEP_INTERVAL"] = "0"
+	if _, err := resolveServeConfig(mapEnv(env), "", "127.0.0.1:0", "/tmp/cache", ""); err != nil {
+		t.Fatalf("sweep emergency stop with armed reclamation delete: %v", err)
 	}
 }
 
@@ -1163,5 +1222,79 @@ func TestResolveSecretsCodec(t *testing.T) {
 				t.Fatalf("DecryptOnly = %v, want %v", codec.DecryptOnly, tc.wantDecryptOnly)
 			}
 		})
+	}
+}
+
+// TestResolveLFSGCSettings (issue #73): the reclamation knobs parse
+// fail-fast like the sweep settings; the delete opt-in without a schedule
+// is a loud misconfiguration.
+func TestResolveLFSGCSettings(t *testing.T) {
+	env := func(m map[string]string) func(string) string {
+		return func(k string) string { return m[k] }
+	}
+
+	t.Run("defaults", func(t *testing.T) {
+		s, err := resolveLFSGCSettings(env(nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := lfsGCSettings{grace: jobs.DefaultLFSReclaimGrace, objectBudget: jobs.DefaultLFSReclaimObjectBudget}
+		if s != want {
+			t.Fatalf("defaults = %+v, want %+v (disabled, 24h grace, 1M budget)", s, want)
+		}
+	})
+
+	t.Run("parse-through", func(t *testing.T) {
+		s, err := resolveLFSGCSettings(env(map[string]string{
+			envLFSGCInterval:      "30m",
+			envLFSGCGrace:         "48h",
+			envLFSGCObjectBudget:  "5000",
+			envLFSGCDeleteEnabled: "true",
+		}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := lfsGCSettings{interval: 30 * time.Minute, grace: 48 * time.Hour, objectBudget: 5000, deleteEnabled: true}
+		if s != want {
+			t.Fatalf("settings = %+v, want %+v", s, want)
+		}
+	})
+
+	t.Run("delete-requires-schedule", func(t *testing.T) {
+		if _, err := resolveLFSGCSettings(env(map[string]string{envLFSGCDeleteEnabled: "true"})); err == nil {
+			t.Fatal("delete opt-in with no schedule must fail loudly")
+		}
+	})
+
+	for name, bad := range map[string]map[string]string{
+		"negative interval": {envLFSGCInterval: "-1h"},
+		"zero grace":        {envLFSGCGrace: "0"},
+		"zero budget":       {envLFSGCInterval: "1h", envLFSGCObjectBudget: "0"},
+		"malformed budget":  {envLFSGCObjectBudget: "many"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := resolveLFSGCSettings(env(bad)); err == nil {
+				t.Fatalf("%v must fail", bad)
+			}
+		})
+	}
+}
+
+// TestResolveLFSMaxObjectsPerRepo (issue #73 option 3): the operator escape
+// hatch parses positively or fails loudly.
+func TestResolveLFSMaxObjectsPerRepo(t *testing.T) {
+	env := func(m map[string]string) func(string) string {
+		return func(k string) string { return m[k] }
+	}
+	if v, err := resolveLFSMaxObjectsPerRepo(env(nil)); err != nil || v != ref.MaxLFSObjectsPerRepo {
+		t.Fatalf("default = (%d, %v), want built-in %d", v, err, ref.MaxLFSObjectsPerRepo)
+	}
+	if v, err := resolveLFSMaxObjectsPerRepo(env(map[string]string{envLFSMaxObjectsPerRepo: "250000"})); err != nil || v != 250000 {
+		t.Fatalf("override = (%d, %v), want 250000", v, err)
+	}
+	for _, bad := range []string{"0", "-5", "lots"} {
+		if _, err := resolveLFSMaxObjectsPerRepo(env(map[string]string{envLFSMaxObjectsPerRepo: bad})); err == nil {
+			t.Fatalf("%q must fail", bad)
+		}
 	}
 }

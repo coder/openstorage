@@ -108,8 +108,11 @@ func (s *SQLite) InitSchema(ctx context.Context) error {
 		`CREATE TABLE IF NOT EXISTS pack_usage (repo TEXT PRIMARY KEY, bytes INTEGER NOT NULL DEFAULT 0)`,
 		// Registered LFS objects (issue #51): the LFS sweep registry and
 		// quota settle record — see the PG DDL for the rationale.
+		// unreferenced_since is the issue #73 reclamation mark (unix
+		// seconds, NULL while referenced or unscanned).
 		`CREATE TABLE IF NOT EXISTS lfs_objects (repo TEXT, key TEXT, bytes INTEGER NOT NULL,
 		                                         created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+		                                         unreferenced_since INTEGER,
 		                                         PRIMARY KEY (repo, key))`,
 		// O(1) object-count cap reads — see the PG DDL for the rationale.
 		`CREATE TABLE IF NOT EXISTS lfs_object_counts (repo TEXT PRIMARY KEY, count INTEGER NOT NULL DEFAULT 0)`,
@@ -167,6 +170,19 @@ func (s *SQLite) InitSchema(ctx context.Context) error {
 		if _, err := tx.ExecContext(ctx,
 			`ALTER TABLE pack_reservations ADD COLUMN gen TEXT NOT NULL DEFAULT ''`); err != nil {
 			return fmt.Errorf("sqlite init schema: add pack_reservations.gen: %w", err)
+		}
+	}
+	// unreferenced_since is the issue #73 reclamation mark; pre-#73 rows
+	// start unmarked (NULL) — a scan must observe them unreferenced first.
+	var haveUnrefSince int
+	if err := tx.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM pragma_table_info('lfs_objects') WHERE name = 'unreferenced_since'`).Scan(&haveUnrefSince); err != nil {
+		return fmt.Errorf("sqlite init schema: probe lfs_objects.unreferenced_since: %w", err)
+	}
+	if haveUnrefSince == 0 {
+		if _, err := tx.ExecContext(ctx,
+			`ALTER TABLE lfs_objects ADD COLUMN unreferenced_since INTEGER`); err != nil {
+			return fmt.Errorf("sqlite init schema: add lfs_objects.unreferenced_since: %w", err)
 		}
 	}
 	// Generation-bump triggers (issue #4): in SCHEMA, not application code,

@@ -226,6 +226,11 @@ func (s *SimRefStore) HasLFSObject(ctx context.Context, repo, key string) (bool,
 	return s.inner.HasLFSObject(ctx, repo, key)
 }
 
+// TouchLFSObject delegates to the inner store.
+func (s *SimRefStore) TouchLFSObject(ctx context.Context, repo, key string) (bool, error) {
+	return s.inner.TouchLFSObject(ctx, repo, key)
+}
+
 // LFSObjectRegisteredAt delegates to the inner store.
 func (s *SimRefStore) LFSObjectRegisteredAt(ctx context.Context, repo, key string) (time.Time, bool, error) {
 	return s.inner.LFSObjectRegisteredAt(ctx, repo, key)

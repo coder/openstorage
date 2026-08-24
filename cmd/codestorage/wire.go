@@ -16,6 +16,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -26,7 +27,9 @@ import (
 	"github.com/coder/code-storage/internal/auth"
 	"github.com/coder/code-storage/internal/blob"
 	"github.com/coder/code-storage/internal/githttp"
+	"github.com/coder/code-storage/internal/gitread"
 	"github.com/coder/code-storage/internal/jobs"
+	"github.com/coder/code-storage/internal/lfsscan"
 	"github.com/coder/code-storage/internal/meta"
 	"github.com/coder/code-storage/internal/ref"
 	"github.com/coder/code-storage/internal/secrets"
@@ -41,7 +44,7 @@ import (
 // mux.Handle("/api/", h). refStore/blobStore/cacheDir back the
 // git:read endpoints — serve passes the same instances the githttp fallback
 // uses so both surfaces share one cache.
-func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL, loopbackBaseURL string, orgPEMBlocks []string, refStore ref.RefStore, blobStore blob.BlobStore, cacheDir string, rate api.RateLimitConfig, packQuotaBytes int64, packReservationTTL time.Duration, sweep sweepSettings, lfsWriteCompat bool, repackThreshold int, webhookAllowPrivate bool, secretsCodec *secrets.Codec, usageFloor func(context.Context, string) (int64, int64, error)) (http.Handler, meta.Store, auth.Verifier, func(ctx context.Context, repo string), func(), error) {
+func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL, loopbackBaseURL string, orgPEMBlocks []string, refStore ref.RefStore, blobStore blob.BlobStore, cacheDir string, rate api.RateLimitConfig, packQuotaBytes int64, packReservationTTL time.Duration, sweep sweepSettings, lfsGC lfsGCSettings, lfsWriteCompat bool, repackThreshold int, webhookAllowPrivate bool, secretsCodec *secrets.Codec, usageFloor func(context.Context, string) (int64, int64, error)) (http.Handler, meta.Store, auth.Verifier, func(ctx context.Context, repo string), func(), error) {
 	assertf(dbURL != "" && org != "" && httpBaseURL != "" && len(orgPEMBlocks) > 0, "buildAPIHandler: missing dbURL/org/httpBaseURL/keys")
 	assertf(loopbackBaseURL != "", "buildAPIHandler: missing loopbackBaseURL")
 	assertf(refStore != nil && blobStore != nil && cacheDir != "", "buildAPIHandler: missing refStore/blobStore/cacheDir")
@@ -202,6 +205,56 @@ func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL, loopbackBaseU
 		stopReconcile = jobs.StartReconcileTicker(sweeper, jobs.ReconcileTickInterval, !lfsWriteCompat)
 	}
 
+	// Unreferenced-LFS-object reclamation (issue #73): its own schedule,
+	// independent of the sweeper's — retiring junk registry rows unwedges
+	// the object-count cap even where blob sweeping stays disabled. Built
+	// over the RAW ref store (row verdicts emit no events, and the seams
+	// live on the concrete backends like the purge seams) plus the shared
+	// blob store and cache dir for the reachability hydrations.
+	var lfsReclaimSchedule *jobs.LFSReclaimSchedule
+	if lfsGC.interval > 0 {
+		reclaimReg, ok := refStore.(jobs.LFSReclaimRegistry)
+		assertf(ok, "ref store %T lacks the lfs reclamation seams", refStore)
+		reclaimDelete := lfsGC.deleteEnabled
+		if reclaimDelete && sweep.interval == 0 {
+			// The sweep emergency stop (interval 0) halts every
+			// destructive storage job fleet-wide — with no LFS reap
+			// running, retirement would refund cap slots while stranding
+			// their blobs indefinitely (Codex security round 13).
+			// Reclamation demotes itself to report-only instead of
+			// failing the stop switch (the round-111 pattern); config
+			// validation enforces the reap prerequisite whenever the
+			// sweep schedule is live.
+			reclaimDelete = false
+			logger.Warn("lfs reclamation demoted to report-only: the sweep schedule is stopped and nothing reaps retired objects' blobs",
+				"env", envSweepInterval)
+		}
+		reclaimer := jobs.NewLFSReclaimer(reclaimReg,
+			func(ctx context.Context, repo, defaultBranch string) (string, error) {
+				return gitread.Materialize(ctx, refStore, blobStore, cacheDir, repo, defaultBranch)
+			},
+			lfsscan.ReachableLFSOIDs,
+			func(ctx context.Context, base string) (string, bool, error) {
+				r, err := ms.GetRepoByID(ctx, org, base)
+				if errors.Is(err, meta.ErrNotFound) {
+					return "", false, nil
+				}
+				if err != nil {
+					return "", false, err
+				}
+				return r.DefaultBranch, true, nil
+			},
+			lfsGC.grace, lfsGC.objectBudget, reclaimDelete, logger)
+		lfsReclaimSchedule = &jobs.LFSReclaimSchedule{Reclaimer: reclaimer, Interval: lfsGC.interval}
+		mode := "report-only"
+		if reclaimDelete {
+			mode = "delete"
+		}
+		logger.Info("lfs unreferenced-object reclamation enabled",
+			"env", envLFSGCInterval, "interval", lfsGC.interval, "grace", lfsGC.grace,
+			"object_budget", lfsGC.objectBudget, "mode", mode)
+	}
+
 	// Background repack (issue #1): the worker folds over the RAW ref
 	// store — ReplacePacks is a pack mutation, no ref events to emit — and
 	// the shared blob store and cache dir. Always constructed so durable
@@ -228,7 +281,7 @@ func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL, loopbackBaseU
 	// schedule one more fold when the count is still at/above it.
 	repacker.FollowUpThreshold = repackThreshold
 
-	queue, decorate, queueCleanup, err := buildServeEventing(ctx, ms, dbURL, org, loopbackBaseURL, key, schedule, repacker, webhookAllowPrivate, logger)
+	queue, decorate, queueCleanup, err := buildServeEventing(ctx, ms, dbURL, org, loopbackBaseURL, key, schedule, lfsReclaimSchedule, repacker, webhookAllowPrivate, logger)
 	if err != nil {
 		// The reconcile ticker predates eventing setup (Codex round 104):
 		// failing without stopping it leaks an hourly ref-store query loop

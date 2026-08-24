@@ -831,7 +831,8 @@ func (s *PG) registerLFSObjectTx(ctx context.Context, repo, key string, bytes in
 			// registration, and the old row's v0.2.0-era timestamp says
 			// nothing about those URLs.
 			if _, err := tx.Exec(ctx, `
-UPDATE lfs_objects SET key = $1, created_at = now() WHERE repo = $2 AND key = $3
+UPDATE lfs_objects SET key = $1, created_at = now(), unreferenced_since = NULL
+  WHERE repo = $2 AND key = $3
   AND NOT EXISTS (SELECT 1 FROM lfs_objects o2 WHERE o2.repo = $2 AND o2.key = $1)`,
 				key, repo, legacy); err != nil {
 				return err
@@ -871,7 +872,16 @@ RETURNING count`, repo).Scan(&count); err != nil {
 			return err
 		}
 		if ct.RowsAffected() == 0 {
-			return nil // already registered: bytes already counted
+			// Already registered: bytes already counted. Re-registration
+			// is the strongest liveness signal, so clear the reclamation
+			// mark atomically with the settlement (issue #73) — a scan
+			// verdict from before this upload must not retire the row.
+			if _, err := tx.Exec(ctx,
+				`UPDATE lfs_objects SET unreferenced_since = NULL WHERE repo = $1 AND key = $2`,
+				repo, key); err != nil {
+				return err
+			}
+			return nil
 		}
 		if adopted {
 			// Atomic with the insert+credit (Codex round 51): the bump

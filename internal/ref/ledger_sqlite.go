@@ -305,7 +305,8 @@ func (s *SQLite) registerLFSObjectTx(ctx context.Context, repo, key string, byte
 		// created_at refreshes to the migration moment — the legacy reap
 		// grace's clock (Codex round 89); see the PG twin.
 		if _, err := tx.ExecContext(ctx, `
-UPDATE lfs_objects SET key = ?, created_at = unixepoch() WHERE repo = ? AND key = ?
+UPDATE lfs_objects SET key = ?, created_at = unixepoch(), unreferenced_since = NULL
+  WHERE repo = ? AND key = ?
   AND NOT EXISTS (SELECT 1 FROM lfs_objects o2 WHERE o2.repo = ? AND o2.key = ?)`,
 			key, repo, legacy, repo, key); err != nil {
 			return err
@@ -343,6 +344,15 @@ RETURNING count`, repo).Scan(&count); err != nil {
 	if _, err := tx.ExecContext(ctx,
 		`DELETE FROM pack_reservations WHERE key IN (?, ?)`, reservRowKey(key), key); err != nil {
 		return err
+	}
+	if inserted == 0 {
+		// Already registered: re-registration clears the reclamation mark
+		// atomically with the settlement (issue #73) — see the PG twin.
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE lfs_objects SET unreferenced_since = NULL WHERE repo = ? AND key = ?`,
+			repo, key); err != nil {
+			return err
+		}
 	}
 	if inserted > 0 {
 		if adopted {

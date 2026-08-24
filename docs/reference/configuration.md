@@ -41,6 +41,11 @@ never a silently-applied default.
 | [`CODESTORAGE_SWEEP_DELETE_LFS`](#codestorage_sweep_delete_lfs) | `false` | Opt-in: actually delete orphan LFS objects (list-only otherwise) |
 | [`CODESTORAGE_SWEEP_DELETE_LFS_LEGACY`](#codestorage_sweep_delete_lfs_legacy) | `false` | Post-roll opt-in: admit legacy-spelled LFS keys to the LFS reap (ADR-41 transition gate) |
 | [`CODESTORAGE_REPO_RETENTION`](#codestorage_repo_retention) | unset | Purge repositories soft-deleted longer than this (unset/`0` keeps them forever) |
+| [`CODESTORAGE_LFS_GC_INTERVAL`](#codestorage_lfs_gc_interval) | unset | Unreferenced-LFS-object reclamation cadence (unset/`0` disables the job) |
+| [`CODESTORAGE_LFS_GC_GRACE`](#codestorage_lfs_gc_grace) | `24h` | How long an object must stay observed-unreferenced before retirement |
+| [`CODESTORAGE_LFS_GC_OBJECT_BUDGET`](#codestorage_lfs_gc_object_budget) | `1000000` | Git objects one reclamation run may walk |
+| [`CODESTORAGE_LFS_GC_DELETE_ENABLED`](#codestorage_lfs_gc_delete_enabled) | `false` | Opt-in: actually retire unreferenced LFS registry rows (report-only otherwise) |
+| [`CODESTORAGE_LFS_MAX_OBJECTS_PER_REPO`](#codestorage_lfs_max_objects_per_repo) | `100000` | Per-repo LFS object-count cap override |
 | [`CODESTORAGE_REPACK_THRESHOLD`](#codestorage_repack_threshold) | `10` | Registered-pack count that triggers a background repack (`0` disables) |
 | [`CODESTORAGE_SYNC_STEAL_LEGACY`](#codestorage_sync_steal_legacy) | `false` | Opt-in: steal pre-lease sync claims after their adoption grace lapses |
 
@@ -630,6 +635,121 @@ command runs the same primitive synchronously for one repository.
   buckets it fails startup exactly like the delete opt-ins. Each purge also write-fences
   the repository before touching anything, so a still-in-flight pre-delete push fails
   instead of racing the reclamation.
+
+### `CODESTORAGE_LFS_GC_INTERVAL`
+
+Cadence of the unreferenced-LFS-object reclamation job
+([#73](https://github.com/coder/code-storage/issues/73),
+[ADR-42](../adr/042-lfs-reclamation-is-mark-and-sweep-over-reachable-pointer-files.md)).
+Registered LFS objects are otherwise permanent, so a `git:write` holder
+direct-PUTting tiny objects nobody references can exhaust the per-repo
+object-count cap for everyone (`507` on every new object). Each run walks the
+reachable pointer files of repositories holding LFS objects (bounded, resumable
+— see the [operations guide](../how-to/storage-lifecycle-and-sweeping.md#reclaiming-unreferenced-lfs-objects)),
+stamps rows no reachable pointer references, and — only with
+[`CODESTORAGE_LFS_GC_DELETE_ENABLED`](#codestorage_lfs_gc_delete_enabled) —
+retires rows whose stamp survived a full
+[grace window](#codestorage_lfs_gc_grace), refunding their object count and
+quota bytes.
+
+- **Default:** unset (`0`) — the job never runs. `0` is also the fleet-wide
+  emergency stop.
+- **Constraints:** a non-negative Go duration.
+- Retirement removes registry rows only; the blobs become ordinary rowless
+  orphans reaped by the
+  [sweeper's LFS delete opt-in](#codestorage_sweep_delete_lfs). Arming
+  retirement therefore
+  [requires that opt-in](#codestorage_lfs_gc_delete_enabled) — refunded cap
+  slots must never outrun physical deletion.
+
+### `CODESTORAGE_LFS_GC_GRACE`
+
+How long an LFS object must stay **continuously** observed as unreferenced
+before reclamation may retire its registry row. The clock starts when a scan
+first finds no reachable pointer referencing the object and resets on every
+liveness signal: a pointer becoming reachable, a re-upload, or a batch/PUT
+answering "already stored" (the client may be about to push a pointer). The
+retirement transaction re-checks the grace under the same lock registrations
+take, so no signal can lose the race silently.
+
+- **Default:** `24h`. **Constraints:** a positive Go duration. Keep it
+  comfortably above your longest expected upload→push gap — a pointer pushed
+  through the normal git-lfs flow always touches the object first, but raw-git
+  pointer pushes only get the reachability scan's protection.
+- With [`CODESTORAGE_LFS_GC_DELETE_ENABLED`](#codestorage_lfs_gc_delete_enabled)
+  set, the grace must also be at least the physical reap cadence —
+  max([`CODESTORAGE_SWEEP_AGE_THRESHOLD`](#codestorage_sweep_age_threshold),
+  [`CODESTORAGE_SWEEP_INTERVAL`](#codestorage_sweep_interval), the 1-hour
+  quarantine retention floor) — a startup error otherwise: cap slots
+  refunded faster than the reap (and its quarantine purge) frees their
+  blobs would let one repository's upload→retire cycles grow the shared
+  storage prefixes without bound.
+- **Granularity:** local mode (SQLite) stamps marks at whole-second
+  resolution, so the effective window rounds up — never down — and may run up
+  to two seconds longer than configured. The window is never shorter than the
+  configured grace on either backend.
+
+### `CODESTORAGE_LFS_GC_OBJECT_BUDGET`
+
+Caps the work units one reclamation run may spend — each git object a
+reachability walk lists charges one unit plus one more per 4 KiB of its raw
+(inflated) size, so entry-stuffed trees and large blobs pay for the bytes git
+must expand; each ref a scanned namespace holds and each registry row
+settlement examines charges one unit; and every attempted repository,
+including skips, charges at least one — the bound that keeps the job's cost
+predictable on any repository shape. A repository whose own walk exceeds the
+remaining budget is retried first next run with a full budget; one whose walk
+exceeds the FULL budget is skipped loudly until the budget is raised. Nothing
+is ever marked or retired from a partial walk.
+
+- **Default:** `1000000`. **Constraints:** a positive integer.
+
+### `CODESTORAGE_LFS_GC_DELETE_ENABLED`
+
+Arms retirement. Off, the job still scans, stamps, and reports what it *would*
+retire (`rows_eligible` in the run report) — the same staged rollout as the
+[sweep delete flags](#codestorage_sweep_delete_enabled): watch report-only runs
+until the eligible rows are the junk you expect, then opt in.
+
+- **Default:** `false`. **Constraints:** must parse as a boolean; requires
+  [`CODESTORAGE_LFS_GC_INTERVAL`](#codestorage_lfs_gc_interval) > 0 (arming a
+  disabled job is a startup error).
+- **Physical-deletion coupling** (security): retirement refunds the
+  object-cap slot, but only the
+  [`CODESTORAGE_SWEEP_DELETE_LFS`](#codestorage_sweep_delete_lfs) reap deletes
+  the stranded blob — decoupled, upload → grace → retire → re-upload cycles
+  would grow `lfs/<repo>/` far past the cap that quota floors and sweep
+  listings rely on to stay bounded. Arming retirement while the sweep
+  schedule is live therefore requires that opt-in, plus a
+  [grace](#codestorage_lfs_gc_grace) of at least the reap cadence, including
+  the 1-hour quarantine retention floor every reap's backup copy is kept for
+  (startup errors otherwise). With the sweep schedule stopped
+  ([`CODESTORAGE_SWEEP_INTERVAL=0`](#codestorage_sweep_interval), the
+  emergency stop), the process starts but demotes retirement to report-only
+  with a warning — nothing would reap the blobs meanwhile.
+- **Mixed-fleet prerequisite:** every replica serving LFS requests must run a
+  build with this feature before retirement is armed — older replicas answer
+  "already stored" without clearing the reclamation stamp, so a grace-expired
+  row could retire before that client pushes its pointer. If report-only
+  scans ran during the roll, also wait one full
+  [grace](#codestorage_lfs_gc_grace) after the last pre-touch replica stops
+  before arming deletes: marks stamped mid-roll may already be grace-expired,
+  and shutdown revokes none of the old replica's outstanding "stored"
+  promises. See
+  [the rollout guidance](../how-to/storage-lifecycle-and-sweeping.md#reclaiming-unreferenced-lfs-objects).
+
+### `CODESTORAGE_LFS_MAX_OBJECTS_PER_REPO`
+
+Per-repository LFS object-count cap (issue
+[#51](https://github.com/coder/code-storage/issues/51)): bytes bound row count
+at nothing, so the registry's population needs its own bound. This override is
+the operator escape hatch of [#73](https://github.com/coder/code-storage/issues/73):
+a repository wedged at the cap by unreferenced junk can be unwedged immediately
+by raising the cap, without waiting for a reclamation grace window.
+
+- **Default:** `100000`. **Constraints:** a positive integer. The cap is
+  enforced at registration inside the serve process, so set it identically on
+  every replica.
 
 ### `CODESTORAGE_REPACK_THRESHOLD`
 

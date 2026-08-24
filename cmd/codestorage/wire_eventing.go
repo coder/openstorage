@@ -151,7 +151,7 @@ func isPGURL(dbURL string) bool {
 // non-nil repack registers the background-repack worker on both backends.
 // The returned cleanup stops the sweep and the queue (waiting for in-flight
 // local work).
-func buildServeEventing(ctx context.Context, ms meta.Store, dbURL, org, loopbackBaseURL string, key loopbackKey, sweep *jobs.SweepSchedule, repack *jobs.Repacker, webhookAllowPrivate bool, logger *slog.Logger) (jobs.Queue, func(inner ref.RefStore) ref.RefStore, func(), error) {
+func buildServeEventing(ctx context.Context, ms meta.Store, dbURL, org, loopbackBaseURL string, key loopbackKey, sweep *jobs.SweepSchedule, lfsReclaim *jobs.LFSReclaimSchedule, repack *jobs.Repacker, webhookAllowPrivate bool, logger *slog.Logger) (jobs.Queue, func(inner ref.RefStore) ref.RefStore, func(), error) {
 	assertf(ms != nil && dbURL != "" && org != "" && loopbackBaseURL != "", "buildServeEventing: missing deps")
 	assertf(logger != nil, "buildServeEventing: nil logger")
 
@@ -200,7 +200,7 @@ func buildServeEventing(ctx context.Context, ms meta.Store, dbURL, org, loopback
 		// worker.Requeue stays nil on pg: river's insert-time uniqueness
 		// would swallow a requeue of a still-running job; the river sync
 		// worker schedules successors transactionally instead (issue #79).
-		q, err := jobs.NewRiver(ctx, dbURL, deliverer, worker.Run, ups, sweep, repack, logger)
+		q, err := jobs.NewRiver(ctx, dbURL, deliverer, worker.Run, ups, sweep, lfsReclaim, repack, logger)
 		if err != nil {
 			return nil, nil, nil, err
 		}
@@ -239,10 +239,20 @@ func buildServeEventing(ctx context.Context, ms meta.Store, dbURL, org, loopback
 		}
 		if sweep != nil {
 			stopSweep := jobs.StartSweepTicker(sweep)
+			prev := cleanup
 			cleanup = func() {
-				recovery.Stop()
 				stopSweep()
-				queue.Close()
+				prev()
+			}
+		}
+		if lfsReclaim != nil {
+			// LFS reclamation ticker (issue #73): local mode's analogue
+			// of the River periodic job.
+			stopReclaim := jobs.StartLFSReclaimTicker(lfsReclaim)
+			prev := cleanup
+			cleanup = func() {
+				stopReclaim()
+				prev()
 			}
 		}
 	}

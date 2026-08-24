@@ -160,7 +160,7 @@ func TestRiverQueueRoundtrip(t *testing.T) {
 	q, err := NewRiver(ctx, pgURL, deliverer, func(context.Context, sync.Job) error {
 		ranSync.Add(1)
 		return nil
-	}, sync.NewMemStore(), nil, nil, slog.New(slog.DiscardHandler))
+	}, sync.NewMemStore(), nil, nil, nil, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatalf("NewRiver: %v", err)
 	}
