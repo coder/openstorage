@@ -35,10 +35,16 @@ func TestParseLFSPointer(t *testing.T) {
 		{"crlf line endings", strings.ReplaceAll(valid, "\n", "\r\n"), oidA, true},
 		{"extension keys ignored", "version https://git-lfs.github.com/spec/v1\next-0-foo sha256:" + oidC + "\noid sha256:" + oidA + "\nsize 1\n", oidA, true},
 		// git-lfs decodes pointers with leading blank lines (Codex security
-		// round 8): rejecting one would retire the live object it names.
+		// round 8) and whitespace-indented version lines (Codex rounds 9):
+		// rejecting one would retire the live object it names.
 		{"leading blank line", "\n" + valid, oidA, true},
 		{"leading whitespace lines", " \r\n\t\n" + valid, oidA, true},
 		{"only blank lines", "\n \n\t\n", "", false},
+		{"space-indented version line", " " + valid, oidA, true},
+		{"tab-indented version line", "\t" + valid, oidA, true},
+		// git-lfs rejects an indented oid line, but sparing MORE is the
+		// safe direction for a deleter's parser.
+		{"indented oid line", "version https://git-lfs.github.com/spec/v1\n  oid sha256:" + oidA + "\n", oidA, true},
 		{"missing size still parses", "version https://git-lfs.github.com/spec/v1\noid sha256:" + oidA + "\n", oidA, true},
 		{"empty", "", "", false},
 		{"no version line", "oid sha256:" + oidA + "\nsize 5\n", "", false},
@@ -64,6 +70,7 @@ func TestParseLFSPointer(t *testing.T) {
 func FuzzLFSPointerParse(f *testing.F) {
 	f.Add([]byte(lfsPointer(oidA, 5)))
 	f.Add([]byte("\n \n" + lfsPointer(oidA, 5)))
+	f.Add([]byte("\t" + lfsPointer(oidA, 5)))
 	f.Add([]byte("version https://hawser.github.com/spec/v1\noid sha256:" + oidB + "\nsize 0\n"))
 	f.Add([]byte("version https://git-lfs.github.com/spec/v1\noid sha256:short\n"))
 	f.Add([]byte("version https://git-lfs.github.com/spec/v1"))

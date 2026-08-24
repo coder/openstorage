@@ -2985,24 +2985,38 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target r
 	// taken below; the upload-failure path retires against exactly these
 	// (Codex round 33).
 	var resGens map[string]string
-	if s.PackQuotaBytes > 0 && n > 0 && !registered {
-		// The pre-body registered flag can go STALE during the body copy
-		// (Codex round 26): a concurrent identical upload on another
-		// replica can publish and register this OID meanwhile, making
-		// this upload zero-growth — charging n as new growth would 507 a
-		// push whose object is already durably stored, purely because the
-		// twin won. Re-read the registry after verification, immediately
-		// before admission, and skip the reservation when the key is now
-		// registered (registration is terminal for a key, so this read
-		// cannot go stale in the dangerous direction; the reverse race —
-		// registered row losing its blob — is the zero-growth repair
-		// path, whose republication needs no reservation either).
+	if s.PackQuotaBytes > 0 && n > 0 {
+		// The pre-body registered flag can go STALE during the body copy,
+		// in BOTH directions. A concurrent identical upload on another
+		// replica can publish and register this OID meanwhile (Codex
+		// round 26), making this upload zero-growth — charging n as new
+		// growth would 507 a push whose object is already durably stored,
+		// purely because the twin won. And reclamation makes registration
+		// NON-terminal (issue #73, review round 9): a grace-expired row
+		// can retire and refund its bytes while the body streams, and
+		// another admission may already have consumed the freed headroom
+		// — keeping the stale zero-growth verdict would register bytes no
+		// admission covers, pushing usage past the quota. Re-read both
+		// spellings after verification, immediately before admission: a
+		// vanished row demotes this PUT to real new-growth admission, and
+		// it is no longer an absence-window repair (retirement bumped the
+		// adoption generation, invalidating the floors its cover would
+		// have guarded against).
 		registered, err = s.Store.HasLFSObject(ctx, repoID, key)
 		if err != nil {
 			log.Printf("lfs registry %s: %v", key, err)
 			lfsError(w, http.StatusInternalServerError, "object registry unavailable")
 			return
 		}
+		if !registered {
+			registered, err = s.Store.HasLFSObject(ctx, repoID, blob.LFSLegacyKey(repoID, oid))
+			if err != nil {
+				log.Printf("lfs registry %s: %v", key, err)
+				lfsError(w, http.StatusInternalServerError, "object registry unavailable")
+				return
+			}
+		}
+		repair = repair && registered
 	}
 	if s.PackQuotaBytes > 0 && n > 0 && !registered {
 		var dec ref.ReserveDecision
