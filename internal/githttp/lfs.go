@@ -524,6 +524,17 @@ func (s *Server) lfsBatchUpload(r *http.Request, repoElem string, target repoTar
 			if !seen {
 				fate = s.settleStoredLFSBatchEntry(ctx, repoID, obj.OID, key)
 				storedFates[key] = fate
+				// Cache the registered verdict too (Codex round 16):
+				// stored outcomes continue before the admission memo
+				// below, so duplicates would otherwise re-run the
+				// registry read once per occurrence — a small batch
+				// repeating one OID amplified into per-entry database
+				// round trips. Fall-through keys reach that memo (and
+				// the admission order) themselves.
+				if !fate.fellThrough {
+					checked[key] = true
+					zeroGrowth[key] = true
+				}
 			}
 			switch {
 			case fate.failed:

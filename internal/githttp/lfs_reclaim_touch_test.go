@@ -376,15 +376,21 @@ func TestLFSDirectPUT_FreshUploadRetouches(t *testing.T) {
 	assertLFSRowUnmarked(t, inner, key, "fresh upload")
 }
 
-// countingTouchStore counts TouchLFSObject calls.
+// countingTouchStore counts TouchLFSObject and HasLFSObject calls.
 type countingTouchStore struct {
 	ref.RefStore
 	touches int
+	reads   int
 }
 
 func (c *countingTouchStore) TouchLFSObject(ctx context.Context, repo, key string) (bool, error) {
 	c.touches++
 	return c.RefStore.TouchLFSObject(ctx, repo, key)
+}
+
+func (c *countingTouchStore) HasLFSObject(ctx context.Context, repo, key string) (bool, error) {
+	c.reads++
+	return c.RefStore.HasLFSObject(ctx, repo, key)
 }
 
 // TestLFSBatchUpload_DuplicateStoredOIDsSettleOnce (issue #73, Codex
@@ -433,5 +439,10 @@ func TestLFSBatchUpload_DuplicateStoredOIDsSettleOnce(t *testing.T) {
 	// the whole batch, not two per occurrence.
 	if counter.touches != 2 {
 		t.Fatalf("stored batch touched %d times, want 2 (one settlement per unique key)", counter.touches)
+	}
+	// One registry read for the whole batch (Codex round 16): the stored
+	// verdict memoizes the registered classification for duplicates too.
+	if counter.reads != 1 {
+		t.Fatalf("stored batch read the registry %d times, want 1 (memoized verdict)", counter.reads)
 	}
 }
