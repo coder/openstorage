@@ -2244,6 +2244,63 @@ func TestLFSAdopt_IndeterminateCleanupRecoversAccounting(t *testing.T) {
 	}
 }
 
+// commitAfterCancelBlob commits the copy only AFTER its context is
+// canceled, then returns the cancellation — S3 durably committing while
+// the response reports the (cover-loss) failure.
+type commitAfterCancelBlob struct {
+	blob.BlobStore
+	dst string
+}
+
+func (b *commitAfterCancelBlob) Copy(ctx context.Context, dst, src string) error {
+	if dst != b.dst {
+		return b.BlobStore.Copy(ctx, dst, src)
+	}
+	<-ctx.Done()
+	if err := b.BlobStore.Copy(context.WithoutCancel(ctx), dst, src); err != nil {
+		return err
+	}
+	return context.Cause(ctx)
+}
+
+// TestLFSAdopt_CoverCanceledCommitRejected (Codex security round 107): a
+// cover-canceled copy surfaces through copyErr — renewErr stays nil — so
+// only the round-96 ambiguous-commit branch saw it: the destination was
+// present, the claim renewable, and the committed-but-uncovered bytes were
+// ACCEPTED and registered although a stale-floor admission may have spent
+// their headroom during the gap. The cover-loss verdict must take round
+// 105's remedy — delete under the held claim and fail — regardless of
+// which return value carried it. Runs the real ~45s continuity budget.
+func TestLFSAdopt_CoverCanceledCommitRejected(t *testing.T) {
+	if testing.Short() {
+		t.Skip("runs the real ~45s cover-continuity budget")
+	}
+	ctx := context.Background()
+	srv, st, _ := newLFSQuotaServer(t, 1<<20, time.Hour)
+	content := []byte("cover-canceled commit")
+	oid := sha256Hex(content)
+	key := blob.LFSKey(lfsTestRepoID, oid)
+	if err := srv.Blob.UploadFile(ctx, blob.LFSLegacyKey(lfsTestRepoID, oid), writeTempFile(t, content)); err != nil {
+		t.Fatal(err)
+	}
+	srv.Store = &coverRenewalOutageStore{RefStore: st}
+	srv.Blob = &commitAfterCancelBlob{BlobStore: srv.Blob, dst: key}
+
+	aerr := srv.adoptLFSObject(ctx, lfsTestRepoID, key, oid)
+	if aerr == nil {
+		t.Fatal("adoption accepted a cover-canceled commit — a stale-floor admission may already have spent this headroom")
+	}
+	if !errors.Is(aerr, blob.ErrCoverContinuityLost) {
+		t.Fatalf("adoption error = %v, want the cover-loss verdict surfaced", aerr)
+	}
+	if has, err := st.HasLFSObject(ctx, lfsTestRepoID, key); err != nil || has {
+		t.Fatalf("registered after a cover-canceled commit = (%v, %v), want not registered", has, err)
+	}
+	if _, err := srv.Blob.Stat(ctx, key); err == nil {
+		t.Fatal("cover-canceled destination retained — physical usage could exceed quota until the sweep")
+	}
+}
+
 // TestLFSCompat_RepairSerializedOnLegacyClaim (Codex security round 85):
 // the batch fast path's bridge repair launched an unserialized full copy —
 // every tiny concurrent touch of the object started another one. Compat

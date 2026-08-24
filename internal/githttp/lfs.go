@@ -1641,6 +1641,36 @@ func (s *Server) publishVerifiedLFSObject(ctx context.Context, repoID, key, lega
 		renewed, lerr := s.Store.RenewAdoptionClaim(lctx, key, claimOwner)
 		lcancel()
 		if lerr != nil || !renewed {
+			if errors.Is(copyErr, blob.ErrCoverContinuityLost) {
+				// No claim, no delete — but a lost COVER's accounting is
+				// key-independent and must still recover (security round
+				// 107): the successor (or a later retry) registers these
+				// bytes without re-admission.
+				s.ensureAmbiguousCommitAccounting(dctx, repoID, key, size, nil)
+			}
+			return fmt.Errorf("adoption publish %s: %w", key, copyErr)
+		}
+		if errors.Is(copyErr, blob.ErrCoverContinuityLost) {
+			// A commit whose error IS the cover cancellation is round
+			// 105's unsafe commit wearing this branch's clothes (Codex
+			// security round 107): WithRenewedCover reports a canceled op
+			// through copyErr — renewErr stays nil — so accepting here
+			// would register bytes a stale-floor admission may already
+			// have spent during the uncovered gap. Same verdict, same
+			// remedy, under the just-renewed claim.
+			delCtx, delCancel := context.WithTimeout(dctx, lfsCleanupTimeout)
+			defer delCancel()
+			if _, derr := s.Store.GuardedLFSDelete(delCtx, repoID, key, func(gctx context.Context) error {
+				if err := s.Blob.Delete(gctx, key); err != nil && !errors.Is(err, blob.ErrNotFound) {
+					return err
+				}
+				return nil
+			}); derr != nil {
+				log.Printf("lfs adopt %s: uncovered-copy cleanup: %v", key, derr)
+				// Indeterminate cleanup: recover the abandoned accounting
+				// exactly like the renewErr twin below.
+				s.ensureAmbiguousCommitAccounting(dctx, repoID, key, size, nil)
+			}
 			return fmt.Errorf("adoption publish %s: %w", key, copyErr)
 		}
 		// The cover must LAND (or the stale-floor window must pass)
@@ -2886,6 +2916,31 @@ func (s *Server) maybeLegacyCompatCopy(ctx context.Context, repoID, oid, key str
 			// converge — the canonical row is registered, so no client
 			// retry would ever reach a path that re-attempts this copy
 			// without the registered-retry repair seam.
+			return fmt.Errorf("compat copy %s: %w", legacyKey, copyErr)
+		}
+		if errors.Is(copyErr, blob.ErrCoverContinuityLost) {
+			// The bridge twin of the adoption rule (Codex security round
+			// 107): a commit whose error IS the cover cancellation is an
+			// unsafe uncovered-gap commit — accepting it would keep bytes
+			// whose headroom a stale-floor admission may already have
+			// spent. Remove it under the registration fence; a DECLINED
+			// or ERRORED cleanup retains bytes round-89's probe will make
+			// every retry skip, so recover their accounting (round 106)
+			// before failing.
+			delCtx, delCancel := context.WithTimeout(dctx, lfsCleanupTimeout)
+			defer delCancel()
+			deleted, derr := s.Store.GuardedLFSDelete(delCtx, repoID, legacyKey, func(gctx context.Context) error {
+				if err := s.Blob.Delete(gctx, legacyKey); err != nil && !errors.Is(err, blob.ErrNotFound) {
+					return err
+				}
+				return nil
+			})
+			if derr != nil {
+				log.Printf("lfs compat copy %s: uncovered-copy cleanup: %v", legacyKey, derr)
+			}
+			if derr != nil || !deleted {
+				s.ensureAmbiguousCommitAccounting(dctx, repoID, legacyKey, size, bump)
+			}
 			return fmt.Errorf("compat copy %s: %w", legacyKey, copyErr)
 		}
 		// The cover AND the handoff must land (or the stale-floor window

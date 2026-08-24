@@ -387,6 +387,14 @@ var coverRenewInterval = 20 * time.Second
 // its own healthy connection.
 var coverRenewTimeout = 10 * time.Second
 
+// ErrCoverContinuityLost marks work canceled by the cover-continuity
+// machinery (Codex security round 107 on #104): callers must be able to
+// distinguish a copy that erred BECAUSE its cover lapsed — whose committed
+// destination is an unsafe, unaccounted commit exactly like a renewErr
+// verdict — from ordinary op failures, because WithRenewedCover reports a
+// canceled op through opErr with renewErr nil.
+var ErrCoverContinuityLost = errors.New("cover continuity lost")
+
 // coverLapseBudget is how long WithRenewedCover tolerates renewal
 // failures before it must assume the cover row expired and ABORT the
 // publication (Codex round 62): declared strictly before the minimum TTL
@@ -483,12 +491,12 @@ func WithRenewedCover(ctx context.Context, renew func(context.Context) error, op
 				budget.Stop()
 				return
 			case <-budget.C:
-				opCancel(errors.New("restore cover continuity lost (budget expired without a renewed cover)"))
+				opCancel(fmt.Errorf("restore %w (budget expired without a renewed cover)", ErrCoverContinuityLost))
 				return
 			case <-t.C:
 				budget.Stop()
 				if _, lost, err := attemptRenew(); lost {
-					opCancel(fmt.Errorf("restore cover continuity lost (last renewal: %v)", err))
+					opCancel(fmt.Errorf("restore %w (last renewal: %v)", ErrCoverContinuityLost, err))
 					return
 				}
 				// A failed attempt inside the budget: the prior cover
@@ -501,7 +509,10 @@ func WithRenewedCover(ctx context.Context, renew func(context.Context) error, op
 	wg.Wait()
 	if opErr != nil {
 		if cause := context.Cause(opCtx); cause != nil && !errors.Is(cause, context.Canceled) {
-			opErr = fmt.Errorf("%w (%v)", opErr, cause)
+			// %w on the cause too (Codex security round 107): an op that
+			// returns the bare cancellation must still let callers match
+			// ErrCoverContinuityLost through opErr.
+			opErr = fmt.Errorf("%w (%w)", opErr, cause)
 		}
 		return opErr, nil
 	}
