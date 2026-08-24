@@ -44,10 +44,12 @@ var ErrLFSScanBudget = errors.New("lfs reachability scan budget exceeded")
 const lfsScanBytesPerUnit = 4096
 
 // ReachableLFSOIDs walks every object reachable from the cache repo's refs
-// (the DB-authority set Materialize just synced), decodes candidate blobs of
-// at most LFSPointerMaxSize bytes as Git LFS pointer files, and returns the
-// set of referenced sha256 OIDs plus the work units the walk charged: one
-// per listed object plus one per lfsScanBytesPerUnit of its raw size.
+// (the DB-authority set Materialize just synced), decodes every non-empty
+// reachable blob's first LFSPointerMaxSize bytes as a Git LFS pointer file
+// (the window git-lfs's own decoder reads, whatever the blob's total size),
+// and returns the set of referenced sha256 OIDs plus the work units the
+// walk charged: one per listed object plus one per lfsScanBytesPerUnit of
+// its raw size — a charge that also prices the content streaming.
 //
 // The walk streams three git subprocesses — rev-list --objects, cat-file
 // --batch-check (type/size), cat-file --batch (candidate contents) — so
@@ -176,7 +178,15 @@ func ReachableLFSOIDs(ctx context.Context, repoPath string, budget int64) (map[s
 				exceeded.Store(true)
 				return fmt.Errorf("%w (budget %d)", ErrLFSScanBudget, budget)
 			}
-			if fields[0] != "blob" || size <= 0 || size > LFSPointerMaxSize {
+			// EVERY non-empty blob is a pointer candidate (Codex security
+			// round 19): git-lfs smudges a blob of any size whose first
+			// blobSizeCutoff bytes decode — a valid header padded past
+			// 1024 bytes checks out fine — so a total-size filter here
+			// hid live OIDs from the scan and retired their objects. The
+			// content stage decodes only the prefix and discards the
+			// rest; the size-proportional charge above already priced
+			// the streaming.
+			if fields[0] != "blob" || size <= 0 {
 				continue
 			}
 			if _, err := io.WriteString(readIn, fields[2]+"\n"); err != nil {
@@ -210,12 +220,20 @@ func ReachableLFSOIDs(ctx context.Context, repoPath string, budget int64) (map[s
 				return fmt.Errorf("batch emitted header %q", header)
 			}
 			size, err := strconv.ParseInt(fields[2], 10, 64)
-			if err != nil || size < 0 || size > LFSPointerMaxSize {
+			if err != nil || size < 0 {
 				return fmt.Errorf("batch emitted header %q", header)
 			}
-			content := buf[:size]
+			// Decode exactly the first LFSPointerMaxSize bytes — the
+			// window git-lfs's own decoder reads — and drain the rest
+			// (Codex security round 19): an oversized blob whose prefix
+			// is a valid pointer smudges in git-lfs, so its OID is live.
+			prefix := min(size, LFSPointerMaxSize)
+			content := buf[:prefix]
 			if _, err := io.ReadFull(br, content); err != nil {
 				return fmt.Errorf("read batch content: %w", err)
+			}
+			if _, err := io.CopyN(io.Discard, br, size-prefix); err != nil {
+				return fmt.Errorf("drain batch content: %w", err)
 			}
 			if nl, err := br.ReadByte(); err != nil || nl != '\n' {
 				return fmt.Errorf("batch record for %s missing trailer", fields[0])

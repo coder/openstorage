@@ -19,6 +19,7 @@ const (
 	oidA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	oidB = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 	oidC = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+	oidD = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
 )
 
 func TestParseLFSPointer(t *testing.T) {
@@ -99,8 +100,11 @@ func TestReachableLFSOIDs(t *testing.T) {
 	mustGit(t, dir, "init", "-q", "--initial-branch=main")
 	writeFile(t, dir, "a.bin", lfsPointer(oidA, 100), 0o644)
 	writeFile(t, dir, "small.txt", "just a small file\n", 0o644)
-	// Pointer-shaped prefix but oversized: excluded by the size cutoff.
-	writeFile(t, dir, "big.txt", lfsPointer(oidC, 1)+strings.Repeat("x", 2000), 0o644)
+	// Pointer-shaped prefix on an oversized blob: COLLECTED (Codex
+	// security round 19) — the scan decodes every blob's first
+	// LFSPointerMaxSize bytes, sparing on the prefix verdict, because a
+	// total-size filter hid padded pointers git-lfs itself smudges.
+	writeFile(t, dir, "big.txt", lfsPointer(oidD, 1)+strings.Repeat("x", 2000), 0o644)
 	mustGit(t, dir, "add", "-A")
 	mustGit(t, dir, "commit", "-q", "-m", "root")
 
@@ -136,10 +140,42 @@ func TestReachableLFSOIDs(t *testing.T) {
 	if _, ok := oids[oidC]; ok {
 		t.Errorf("unreachable pointer OID collected: %v", oids)
 	}
+	if _, ok := oids[oidD]; !ok {
+		t.Errorf("oversized pointer-prefixed blob's OID missing (round 19): %v", oids)
+	}
 
 	// The budget aborts the walk with the sentinel and no OID set.
 	if _, _, err := ReachableLFSOIDs(ctx, dir, 2); !errors.Is(err, ErrLFSScanBudget) {
 		t.Fatalf("budget walk err = %v, want ErrLFSScanBudget", err)
+	}
+}
+
+// TestReachableLFSOIDs_PaddedOversizedPointer (Codex security round 19):
+// git-lfs decodes only the first blobSizeCutoff bytes and smudges a pointer
+// of ANY total size whose window decodes — verified against git-lfs 3.7.1
+// with this exact newline-padded 10,000-byte fixture. A total-size filter
+// hid the live OID from every scan, so the row retired after grace and
+// downloads 404'd. The blob must be collected AND charged by its full size.
+func TestReachableLFSOIDs_PaddedOversizedPointer(t *testing.T) {
+	dir := t.TempDir()
+	mustGit(t, dir, "init", "-q", "--initial-branch=main")
+	padded := lfsPointer(oidA, 12345)
+	padded += strings.Repeat("\n", 10_000-len(padded))
+	writeFile(t, dir, "padded.bin", padded, 0o644)
+	mustGit(t, dir, "add", "-A")
+	mustGit(t, dir, "commit", "-q", "-m", "root")
+
+	oids, walked, err := ReachableLFSOIDs(context.Background(), dir, 1_000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := oids[oidA]; !ok {
+		t.Fatalf("padded oversized pointer's OID missing: %v", oids)
+	}
+	// 1 commit + 1 tree + 1 blob, plus size units: the 10,000-byte blob
+	// charges at least 10000/4096 = 2 extra units.
+	if walked < 5 {
+		t.Fatalf("walked = %d, want the padded blob charged by size", walked)
 	}
 }
 

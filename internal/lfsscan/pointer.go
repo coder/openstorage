@@ -4,11 +4,13 @@ import (
 	"strings"
 )
 
-// LFSPointerMaxSize is the largest blob the reclamation scan treats as a
-// candidate Git LFS pointer file. git-lfs itself refuses to decode blobs of
-// 1024 bytes or more (its blobSizeCutoff); scanning one byte further errs on
-// the inclusive side — a false positive only protects an object from
-// retirement, never endangers one.
+// LFSPointerMaxSize is the pointer-decode window: the prefix of a candidate
+// blob the reclamation scan parses, mirroring git-lfs's blobSizeCutoff —
+// its decoder reads at most this many bytes and accepts a blob of ANY total
+// size whose window decodes (a padded pointer smudges fine, Codex security
+// round 19). The scan therefore parses this window of every reachable blob
+// rather than filtering on total size; a false positive only protects an
+// object from retirement, never endangers one.
 const LFSPointerMaxSize = 1024
 
 // lfsPointerVersionPrefixes are the `version` values a pointer file may
