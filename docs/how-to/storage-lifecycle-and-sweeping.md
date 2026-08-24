@@ -421,10 +421,12 @@ Two operational notes:
   budgets. The walk deadline hard-caps work the object budget cannot see
   coming: `rev-list` must inflate a tree before its children stream, so a
   giant compressible tree burns its expansion before budget cancellation
-  lands. A repository that cannot finish in time fails that pass with an
-  error and is retried on a later rotation; one that repeatedly exceeds the
-  deadlines needs operator attention (repack it, or accept it stays
-  unreclaimed).
+  lands. On Linux the walk's git subprocesses additionally run under a
+  compiled-in 2 GiB heap cap, so a tree too large to inflate kills only its
+  own subprocess instead of the worker. A repository that cannot finish in
+  time (or in memory) fails that pass with an error and is retried on a
+  later rotation; one that repeatedly exceeds the deadlines needs operator
+  attention (repack it, or accept it stays unreclaimed).
 - **Upgrade the whole fleet first.** The grace guarantee depends on every
   serving replica clearing the reclamation stamp when it answers "already
   stored" on the batch/PUT surfaces. A pre-reclamation replica answers

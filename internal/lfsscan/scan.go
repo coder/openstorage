@@ -131,6 +131,21 @@ func ReachableLFSOIDs(ctx context.Context, repoPath string, budget int64) (map[s
 		started = append(started, cmd)
 		// Reap on every exit path; pump goroutines Wait first on success.
 		defer func(c *exec.Cmd) { _ = c.Wait() }(cmd)
+		// Cap the subprocess heap (Codex security round 20): rev-list
+		// must fully inflate a tree before emitting its children, so a
+		// giant highly compressible tree spikes RSS before the metered
+		// size charge can cancel the walk. The heap cap turns that spike
+		// into a subprocess allocation failure: the walk fails and the
+		// repository is deferred — never marked — like every bounded
+		// verdict. Applied immediately after Start; the microseconds
+		// before it lands cover only exec/startup, long before any
+		// attacker-controlled object is inflated.
+		if err := limitGitHeap(cmd.Process.Pid); err != nil {
+			for _, c := range started {
+				_ = c.Process.Kill()
+			}
+			return nil, 0, fmt.Errorf("limit %s heap: %w", strings.Join(cmd.Args[:3], " "), err)
+		}
 	}
 
 	var walked atomic.Int64
