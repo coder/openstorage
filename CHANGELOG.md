@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.0](https://github.com/coder/code-storage/compare/v0.2.0...v0.3.0) (2026-08-23)
+
+
+### Features
+
+* **storage:** reclaim soft-deleted repositories — retention purge + purge-repo CLI ([#105](https://github.com/coder/code-storage/issues/105)) ([eb057d2](https://github.com/coder/code-storage/commit/eb057d2e28d1159789e0bbfca40a64f5b101e428))
+
 ## [0.2.0](https://github.com/coder/code-storage/compare/v0.1.4...v0.2.0) (2026-08-23)
 
 
