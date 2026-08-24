@@ -3419,6 +3419,23 @@ func (s *Server) ensureLegacyCompat(ctx context.Context, repoID, oid, key string
 			}
 			return nil // the spelling exists: nothing to converge
 		}
+		// The registered fast paths reach here with NO op slot and NO
+		// per-key guard (Codex round 122): concurrent batches for this
+		// OID would each launch a snapshot download, bypassing
+		// lfsMaxStagingOps, the repo op share, and same-key dedup. Take
+		// both NON-blockingly — one cleanup per key at a time, one op
+		// slot for its snapshot's bytes to meter against — and a busy
+		// or exhausted verdict spares: the memo stands, the next touch
+		// re-presses (round 121: contention delays cleanup, never
+		// terminalizes it).
+		if _, busy := s.lfsUploadsInFlight.LoadOrStore(legacyKey, struct{}{}); busy {
+			return nil // another worker is pressing this cleanup
+		}
+		defer s.lfsUploadsInFlight.Delete(legacyKey)
+		if !s.reserveLFSStaging(repoID, 0) {
+			return nil // spared; the memo stands for the next touch
+		}
+		defer s.releaseLFSStaging(repoID, 0)
 		dctx, dcancel := context.WithTimeout(context.WithoutCancel(ctx), lfsCleanupTimeout)
 		defer dcancel()
 		if !s.legacySourceProvenMismatched(dctx, repoID, legacyKey, oid) {
