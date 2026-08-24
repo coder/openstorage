@@ -1151,8 +1151,16 @@ func (s *Server) adoptStoredLFSObject(ctx context.Context, repoID, key, oid stri
 			// Memoize the failed verification bound to the observed
 			// fingerprint (Codex security round 118): repeat touches of
 			// the unchanged corrupt source skip the full re-hash and
-			// press only the budgeted cleanup below.
-			s.rememberLFSMismatch(ctx, repoID, target, contentFP)
+			// press only the budgeted cleanup below. The mint is
+			// REQUIRED before the snapshot (Codex security round 134):
+			// the spared and lease-lost arms below return the mismatch
+			// verdict — whose canonical upload registers — trusting
+			// exactly this marker to press the surviving corrupt
+			// spelling later, so a silently failed write laundered the
+			// survivor as implicitly clean.
+			if merr := s.rememberLFSMismatch(ctx, repoID, target, contentFP); merr != nil {
+				return merr
+			}
 			// Claim-renewed, request-detached snapshot region (rounds
 			// 126/127): the re-hash can outlive both the request and
 			// ref.AdoptionClaimTTL, and a recorded lease loss must
@@ -2083,17 +2091,21 @@ func (s *Server) reclaimUncoveredCommit(ctx context.Context, repoID, key string)
 // failed content verification (Codex security round 118; FLEET-persistent
 // through the ref store since round 132 — the process-local map was
 // per-replica and evictable, and a lost marker made a registered object's
-// corrupt legacy spelling implicitly clean forever). Best-effort: a
-// failed write only defers — the next failed verification re-records.
-func (s *Server) rememberLFSMismatch(ctx context.Context, repoID, legacyKey, fp string) {
-	if fp == "" {
-		return
-	}
+// corrupt legacy spelling implicitly clean forever). The write failure
+// PROPAGATES (Codex security round 134): the source-mismatch arms below
+// the mint return the mismatch verdict trusting exactly this marker to
+// press the surviving corrupt spelling after the verdict's upload
+// registers — a swallowed failure left the survivor unmarked, and the
+// compat probes trust marker absence as clean (round 132's rule).
+// Callers must fail the touch instead; the retry re-proves and re-mints.
+func (s *Server) rememberLFSMismatch(ctx context.Context, repoID, legacyKey, fp string) error {
+	assertf(fp != "", "rememberLFSMismatch(%s, %s): empty fingerprint", repoID, legacyKey)
 	rctx, rcancel := context.WithTimeout(context.WithoutCancel(ctx), lfsProbeTimeout)
 	defer rcancel()
 	if err := s.Store.RecordLFSMismatch(rctx, repoID, legacyKey, fp); err != nil {
-		log.Printf("lfs mismatch marker %s: record: %v", legacyKey, err)
+		return fmt.Errorf("record mismatch marker %s: %w", legacyKey, err)
 	}
+	return nil
 }
 
 // lfsMismatchMemo returns the persisted failed-verification fingerprint

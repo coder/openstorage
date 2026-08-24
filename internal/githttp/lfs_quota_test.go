@@ -2510,6 +2510,41 @@ func TestLFSAdopt_UnpersistedMismatchMarkerFailsRequest(t *testing.T) {
 	})
 }
 
+// TestLFSAdopt_SourceMismatchMarkerMustPersist (Codex security round 134,
+// P2, the source-path twin): the source-mismatch memo was minted
+// best-effort, yet the SPARED arm below it (an unadmittable proof
+// snapshot: unprovable is not proven) and the lease-lost arm return the
+// mismatch verdict relying on exactly that marker to press the surviving
+// corrupt spelling after the verdict's upload registers. A failed mint
+// must fail the touch, not launder the survivor as implicitly clean.
+func TestLFSAdopt_SourceMismatchMarkerMustPersist(t *testing.T) {
+	ctx := context.Background()
+	srv, st, _ := newLFSQuotaServer(t, 0, time.Hour)
+	content := bytes.Repeat([]byte("x"), 100)
+	oid := sha256Hex(content)
+	key := blob.LFSKey(lfsTestRepoID, oid)
+	legacyKey := blob.LFSLegacyKey(lfsTestRepoID, oid)
+	if err := srv.Blob.UploadFile(ctx, legacyKey, writeTempFile(t, bytes.Repeat([]byte("y"), 100))); err != nil {
+		t.Fatal(err)
+	}
+	// The spared shape (round 116's budget): the 100-byte proof snapshot
+	// can never be admitted, so pre-fix this arm returned mismatch with
+	// the corrupt source SURVIVING — and the marker write already failed.
+	srv.LFSStagingBytes = 50
+	srv.Store = &recordMismatchFailingStore{RefStore: srv.Store}
+
+	aerr := srv.adoptLFSObject(ctx, lfsTestRepoID, key, oid)
+	if aerr == nil || errors.Is(aerr, errLFSContentMismatch) {
+		t.Fatalf("adoption with an unpersistable memo = %v, want a non-mismatch failure — the spared arm's verdict depends on the marker it could not write", aerr)
+	}
+	if has, err := st.HasLFSObject(ctx, lfsTestRepoID, key); err != nil || has {
+		t.Fatalf("registered = (%v, %v), want not registered", has, err)
+	}
+	if _, serr := srv.Blob.Stat(ctx, legacyKey); serr != nil {
+		t.Fatalf("legacy spelling unexpectedly gone: %v", serr)
+	}
+}
+
 // readCountingBlob counts ranged verification reads per key.
 type readCountingBlob struct {
 	blob.BlobStore
