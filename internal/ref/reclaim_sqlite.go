@@ -38,11 +38,13 @@ func (s *SQLite) LFSReposWithObjects(ctx context.Context, after string, limit in
 }
 
 // CountRefs — see the PG twin.
-func (s *SQLite) CountRefs(ctx context.Context, repo string) (int64, error) {
+func (s *SQLite) CountRefs(ctx context.Context, repo string, limit int64) (int64, error) {
 	assertf(repo != "", "CountRefs: empty repo")
+	assertf(limit > 0, "CountRefs: non-positive limit %d", limit)
 	var n int64
-	if err := s.db.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM refs WHERE repo = ?`, repo).Scan(&n); err != nil {
+	if err := s.db.QueryRowContext(ctx, `
+SELECT COUNT(*) FROM (SELECT 1 FROM refs WHERE repo = ? LIMIT ?) capped`,
+		repo, limit).Scan(&n); err != nil {
 		return 0, fmt.Errorf("count refs %s: %w", repo, err)
 	}
 	return n, nil

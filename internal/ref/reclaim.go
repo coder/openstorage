@@ -62,12 +62,18 @@ func (s *PG) LFSReposWithObjects(ctx context.Context, after string, limit int) (
 // CountRefs prices a namespace member's ref fanout for the reclamation
 // budget without materializing the refs (an attacker can mint millions of
 // same-tip refs; loading them just to count would balloon the worker's heap
-// before the budget could reject the repo).
-func (s *PG) CountRefs(ctx context.Context, repo string) (int64, error) {
+// before the budget could reject the repo). The count stops at limit (Codex
+// round 12): even an index-only COUNT walks every matching entry, so an
+// uncapped count on a fanout repo would do budget-scale index work before
+// the budget could reject it — callers pass one past their remaining
+// budget, and a saturated count yields the same over-budget verdict.
+func (s *PG) CountRefs(ctx context.Context, repo string, limit int64) (int64, error) {
 	assertf(repo != "", "CountRefs: empty repo")
+	assertf(limit > 0, "CountRefs: non-positive limit %d", limit)
 	var n int64
-	if err := s.pool.QueryRow(ctx,
-		`SELECT COUNT(*) FROM refs WHERE repo = $1`, repo).Scan(&n); err != nil {
+	if err := s.pool.QueryRow(ctx, `
+SELECT COUNT(*) FROM (SELECT 1 FROM refs WHERE repo = $1 LIMIT $2) capped`,
+		repo, limit).Scan(&n); err != nil {
 		return 0, fmt.Errorf("count refs %s: %w", repo, err)
 	}
 	return n, nil

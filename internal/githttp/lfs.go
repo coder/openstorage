@@ -477,6 +477,22 @@ func (s *Server) lfsBatchUpload(r *http.Request, repoElem string, target repoTar
 				if cerr := s.ensureLegacyCompat(ctx, repoID, obj.OID, key); cerr != nil {
 					log.Printf("lfs compat %s: %v", key, cerr)
 					lfsObjectFail(&results[i], compatFailStatus(cerr), "compatibility copy failed, retry")
+					continue
+				}
+				// Re-arm the grace clock immediately before the stored
+				// answer (Codex round 12): the compat copy above is
+				// synchronous and size-scaled, so the entry touch's
+				// window may be largely consumed — or, past a short
+				// grace, the row may have been re-marked and retired
+				// while the copy held the claim's spare only for its
+				// own duration. The touch is the LAST registry write
+				// before success; touched=false answers retryable.
+				if touched, terr := s.Store.TouchLFSObject(ctx, repoID, key); terr != nil {
+					log.Printf("lfs touch %s: %v", key, terr)
+					lfsObjectFail(&results[i], http.StatusInternalServerError, "object registry unavailable")
+				} else if !touched {
+					lfsObjectFail(&results[i], http.StatusTooManyRequests,
+						"a concurrent operation reclaimed this object, retry")
 				}
 				continue
 			case !errors.Is(err, blob.ErrNotFound):
@@ -854,7 +870,20 @@ func (s *Server) adoptStoredLFSObject(ctx context.Context, repoID, key, oid stri
 			// (Codex round 83): a compat copy that failed after
 			// registration is repaired by the next write-scoped touch
 			// instead of 404ing on old replicas forever.
-			return s.ensureLegacyCompat(ctx, repoID, oid, key)
+			if cerr := s.ensureLegacyCompat(ctx, repoID, oid, key); cerr != nil {
+				return cerr
+			}
+			// Re-arm the grace clock after the size-scaled compat copy
+			// (Codex round 12), mirroring the batch stored answer: the
+			// 200 must be the promise of a freshly touched row, not one
+			// whose window the copy consumed. A vanished row answers
+			// retryable; the retry re-verifies and re-registers.
+			if touched, terr := s.Store.TouchLFSObject(ctx, repoID, key); terr != nil {
+				return terr
+			} else if !touched {
+				return errLFSBusy
+			}
+			return nil
 		}
 		registered = false
 	}

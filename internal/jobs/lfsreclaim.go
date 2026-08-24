@@ -51,8 +51,9 @@ type LFSReclaimRegistry interface {
 	// materializing the refs (Codex security round 7): the reclaimer
 	// never needs the ref values, and a counting query keeps a
 	// million-ref repo from ballooning the worker's heap before the
-	// budget can reject it.
-	CountRefs(ctx context.Context, repo string) (int64, error)
+	// budget can reject it. The count stops at limit (Codex round 12) so
+	// even the index walk stays budget-bounded.
+	CountRefs(ctx context.Context, repo string, limit int64) (int64, error)
 }
 
 // HydrateFunc materializes one namespace repo's git cache from the stores
@@ -302,7 +303,16 @@ func (r *LFSReclaimer) reclaimRepo(ctx context.Context, base string, budget int6
 	referenced := make(map[string]struct{})
 	var walked int64
 	for _, member := range group {
-		refCount, err := r.registry.CountRefs(ctx, member)
+		// Count at most one past the remaining budget (Codex round 12):
+		// the count itself walks the ref index, so an uncapped COUNT on
+		// a fanout repo would do budget-scale index work every pass. A
+		// saturated count still pushes walked past the budget, so the
+		// guard below fires with the same over-budget verdict.
+		countCap := budget - walked + 1
+		if countCap < 1 {
+			countCap = 1
+		}
+		refCount, err := r.registry.CountRefs(ctx, member, countCap)
 		if err != nil {
 			return walked, err
 		}

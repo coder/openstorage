@@ -20,7 +20,7 @@ type lfsReclaimStore interface {
 	MarkLFSObjectsUnreferenced(ctx context.Context, repo string, keys []string) (int64, error)
 	ClearLFSObjectsUnreferenced(ctx context.Context, repo string, keys []string) (int64, error)
 	RetireUnreferencedLFSObject(ctx context.Context, repo, key string, pinnedGens map[string]int64, grace time.Duration) (bool, error)
-	CountRefs(ctx context.Context, repo string) (int64, error)
+	CountRefs(ctx context.Context, repo string, limit int64) (int64, error)
 	FenceRepoPurge(ctx context.Context, base string) error
 }
 
@@ -197,7 +197,7 @@ func TestLFSReclaim_CountRefs(t *testing.T) {
 		rs := reclaimStore(t, s)
 		ctx := context.Background()
 		k := newLedgerKit(t, s)
-		if n, err := rs.CountRefs(ctx, k.base()); err != nil || n != 0 {
+		if n, err := rs.CountRefs(ctx, k.base(), 10); err != nil || n != 0 {
 			t.Fatalf("CountRefs empty = (%d, %v), want 0", n, err)
 		}
 		for i := 0; i < 3; i++ {
@@ -205,8 +205,13 @@ func TestLFSReclaim_CountRefs(t *testing.T) {
 				t.Fatalf("CASRef = (%v, %v)", won, err)
 			}
 		}
-		if n, err := rs.CountRefs(ctx, k.base()); err != nil || n != 3 {
+		if n, err := rs.CountRefs(ctx, k.base(), 10); err != nil || n != 3 {
 			t.Fatalf("CountRefs = (%d, %v), want 3", n, err)
+		}
+		// The cap bounds the count's own index walk (Codex round 12): a
+		// saturated count reports exactly the limit, never past it.
+		if n, err := rs.CountRefs(ctx, k.base(), 2); err != nil || n != 2 {
+			t.Fatalf("capped CountRefs = (%d, %v), want 2", n, err)
 		}
 	})
 }
