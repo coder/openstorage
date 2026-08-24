@@ -208,6 +208,20 @@ type RefStore interface {
 	// (a point read mirroring HasPack, for the sweeper's per-object
 	// classification of the lfs/ prefix).
 	HasLFSObject(ctx context.Context, repo, key string) (bool, error)
+	// TouchLFSObject clears (repo, key)'s reclamation mark (issue #73)
+	// and reports whether the row still exists. It is the liveness
+	// handshake behind every zero-growth "already have it" answer: a
+	// client that just learned the object is stored may reference it
+	// from a pointer file it pushes NEXT, so the touch guarantees at
+	// least one full reclamation grace window before retirement can
+	// reconsider the row. touched=false means the row is gone — the
+	// caller must fall through to its upload path instead of promising
+	// an object the reclaimer just retired. The single-statement UPDATE
+	// serializes against RetireUnreferencedLFSObject's guarded delete on
+	// the row itself: whichever commits first wins, and the loser
+	// observes it (the retire recheck sees the cleared mark; the touch
+	// sees zero rows).
+	TouchLFSObject(ctx context.Context, repo, key string) (touched bool, err error)
 	// LFSObjectRegisteredAt returns (repo, key)'s registration time — the
 	// row's created_at, which the in-place legacy→canonical migration
 	// REFRESHES (Codex round 89): downloads presign the still-rowless
@@ -469,16 +483,23 @@ CREATE TABLE IF NOT EXISTS pack_usage (repo text PRIMARY KEY, bytes bigint NOT N
 -- The registry the LFS orphan sweep classifies against, and the settle
 -- record that moves reserved bytes into pack_usage. Accounting/registry
 -- state only — LFS objects never affect clone content, so no generation
--- triggers.
+-- triggers. unreferenced_since is the reclamation mark (issue #73): the
+-- moment a reachability scan first observed no reachable pointer file
+-- referencing the row's OID, NULL while referenced or unscanned. Cleared
+-- by every liveness signal (re-registration, zero-growth batch/PUT
+-- touch); retirement requires it to have survived a full grace window.
 CREATE TABLE IF NOT EXISTS lfs_objects (repo text, key text, bytes bigint NOT NULL,
                                         created_at timestamptz NOT NULL DEFAULT now(),
+                                        unreferenced_since timestamptz,
                                         PRIMARY KEY (repo, key));
+ALTER TABLE lfs_objects ADD COLUMN IF NOT EXISTS unreferenced_since timestamptz;
 -- Maintained count of lfs_objects rows per repo (issue #51): the
 -- object-count cap reads it in O(1) instead of COUNT(*)-ing an
 -- attacker-growable table under lock. Incremented transactionally with
--- every row insert; rows are never deleted today — any future deletion
--- path must decrement in its own transaction or the cap turns stricter,
--- never looser.
+-- every row insert; the only deletion paths — repository purge (issue
+-- #52), legacy-twin reconciliation (ADR-41), and unreferenced-object
+-- retirement (issue #73) — decrement or drop it in the same transaction,
+-- so the cap can turn stricter on crash, never looser.
 CREATE TABLE IF NOT EXISTS lfs_object_counts (repo text PRIMARY KEY, count bigint NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS lfs_adoption_gens (repo text PRIMARY KEY, gen bigint NOT NULL DEFAULT 0);
 -- Fleet-persistent LFS mismatch markers (#104, Codex round 132): a FULL
