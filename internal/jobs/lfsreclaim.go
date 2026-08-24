@@ -116,6 +116,15 @@ const (
 	// the repo with an error instead of letting one hydration monopolize
 	// the pass. Retried next rotation; a warm cache hydrates in seconds.
 	lfsReclaimHydrateTimeout = 10 * time.Minute
+	// lfsReclaimWalkTimeout bounds one namespace member's reachability
+	// walk (Codex security round 18): the work-unit budget meters objects
+	// only as cat-file reports them, but rev-list must INFLATE a tree
+	// before its children can stream — a single highly compressible giant
+	// tree burns its whole expansion before cancellation can land. Tree
+	// size is already bounded by the push-decode caps, so the residual is
+	// bounded CPU per pass; the wall-clock deadline hard-caps it like the
+	// hydration deadline, deferring the repo with an error.
+	lfsReclaimWalkTimeout = 10 * time.Minute
 )
 
 // LFSReclaimer runs the reclamation scan. Construct with NewLFSReclaimer;
@@ -131,6 +140,7 @@ type LFSReclaimer struct {
 	logger         *slog.Logger
 	now            func() time.Time // injectable clock for tests
 	hydrateTimeout time.Duration    // per-member cap, shrinkable in tests
+	walkTimeout    time.Duration    // per-member walk cap, shrinkable in tests
 	// cursor is the last base repo a run attempted (successful or not):
 	// each run resumes strictly after it and wraps on exhaustion, so a
 	// failing or over-budget repo cannot monopolize every run (the
@@ -165,6 +175,7 @@ func NewLFSReclaimer(registry LFSReclaimRegistry, hydrate HydrateFunc, walk LFSW
 		logger:         logger,
 		now:            time.Now,
 		hydrateTimeout: lfsReclaimHydrateTimeout,
+		walkTimeout:    lfsReclaimWalkTimeout,
 		rowCursors:     make(map[string]string),
 	}
 }
@@ -343,7 +354,7 @@ func (r *LFSReclaimer) reclaimRepo(ctx context.Context, base string, budget int6
 		if err != nil {
 			return walked, fmt.Errorf("hydrate %s: %w", member, err)
 		}
-		oids, w, err := r.walk(ctx, repoPath, budget-walked)
+		oids, w, err := r.walkBounded(ctx, repoPath, budget-walked)
 		walked += w
 		if err != nil {
 			return walked, fmt.Errorf("walk %s: %w", member, err)
@@ -356,6 +367,20 @@ func (r *LFSReclaimer) reclaimRepo(ctx context.Context, base string, budget int6
 	report.ObjectsWalked += walked
 	settled, err := r.settleRepoRows(ctx, base, gens, referenced, budget-walked, report)
 	return walked + settled, err
+}
+
+// walkBounded runs the walk seam under the fixed per-member deadline
+// (Codex security round 18): the budget cancels the walk only as cat-file
+// meters objects, but rev-list's own tree inflation happens before those
+// lines stream, so a giant compressible tree burns unmetered CPU first.
+// The deadline hard-caps a member's walk wall-clock like hydration; expiry
+// fails the repo (deferred, retried next rotation, skipped loudly if
+// persistent).
+func (r *LFSReclaimer) walkBounded(ctx context.Context, repoPath string, budget int64) (map[string]struct{}, int64, error) {
+	assertf(r.walkTimeout > 0, "walkBounded: non-positive timeout %v", r.walkTimeout)
+	wctx, cancel := context.WithTimeout(ctx, r.walkTimeout)
+	defer cancel()
+	return r.walk(wctx, repoPath, budget)
 }
 
 // hydrateBounded runs the hydrate seam under the fixed per-member deadline

@@ -463,6 +463,44 @@ func TestLFSReclaim_HydrationDeadline(t *testing.T) {
 	}
 }
 
+// TestLFSReclaim_WalkDeadline (Codex security round 18): the budget meters
+// objects only as cat-file reports them, but rev-list inflates each tree
+// before its children stream — a giant compressible tree burns its whole
+// expansion before budget cancellation can land. The compiled-in walk
+// deadline hard-caps a member's walk wall-clock; expiry fails the repo
+// like a hydration timeout and nothing is marked from the partial walk.
+func TestLFSReclaim_WalkDeadline(t *testing.T) {
+	ctx := context.Background()
+	store, reg := newReclaimStore(t)
+	base := "slow-walk-repo"
+	key := "lfs/" + base + "/o2/" + strings.Repeat("ab", 32)
+	if err := store.RegisterLFSObject(ctx, base, key, 10); err != nil {
+		t.Fatal(err)
+	}
+	if won, err := store.CASRef(ctx, base, "refs/heads/main", ref.ZeroSHA, strings.Repeat("88", 20)); err != nil || !won {
+		t.Fatalf("CASRef = (%v, %v)", won, err)
+	}
+	instantHydrate := func(context.Context, string, string) (string, error) {
+		return t.TempDir(), nil
+	}
+	stuckWalk := func(ctx context.Context, _ string, _ int64) (map[string]struct{}, int64, error) {
+		<-ctx.Done() // a walk that never finishes on its own
+		return nil, 0, ctx.Err()
+	}
+	r := NewLFSReclaimer(reg, instantHydrate, stuckWalk, alwaysMain,
+		time.Hour, 1_000, true, slog.New(slog.DiscardHandler))
+	r.walkTimeout = 50 * time.Millisecond
+
+	_, err := r.Run(ctx)
+	if err == nil || !strings.Contains(err.Error(), "deadline") {
+		t.Fatalf("run err = %v, want walk deadline", err)
+	}
+	rows, err := reg.ListRepoLFSObjects(ctx, base, "", 10)
+	if err != nil || len(rows) != 1 || !rows[0].UnreferencedSince.IsZero() {
+		t.Fatalf("rows = (%+v, %v), want untouched", rows, err)
+	}
+}
+
 // TestLFSReclaim_RefFanoutChargesBudget (Codex round 6): a git:write holder
 // can mint arbitrarily many refs naming one commit — registry
 // materialization, cache sync, and rev-list enumeration all scale with ref

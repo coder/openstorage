@@ -414,13 +414,17 @@ Two operational notes:
   and sweep listings rely on. Under the sweep emergency stop
   (`CODESTORAGE_SWEEP_INTERVAL=0`) retirement demotes to report-only with a
   warning.
-- **Hydration is deadline-bounded.** Scanning a repository first materializes
-  its git cache (downloading and indexing registered packs on a cold
-  replica). Each namespace member's hydration runs under a fixed 10-minute
-  deadline — compiled in, like the repack budgets — and a repository that
-  cannot hydrate in time fails that pass with an error and is retried on a
-  later rotation. A repository that repeatedly exceeds the deadline needs
-  operator attention (repack it, or accept it stays unreclaimed).
+- **Hydration and walks are deadline-bounded.** Scanning a repository first
+  materializes its git cache (downloading and indexing registered packs on a
+  cold replica). Each namespace member's hydration AND its reachability walk
+  run under fixed 10-minute deadlines — compiled in, like the repack
+  budgets. The walk deadline hard-caps work the object budget cannot see
+  coming: `rev-list` must inflate a tree before its children stream, so a
+  giant compressible tree burns its expansion before budget cancellation
+  lands. A repository that cannot finish in time fails that pass with an
+  error and is retried on a later rotation; one that repeatedly exceeds the
+  deadlines needs operator attention (repack it, or accept it stays
+  unreclaimed).
 - **Upgrade the whole fleet first.** The grace guarantee depends on every
   serving replica clearing the reclamation stamp when it answers "already
   stored" on the batch/PUT surfaces. A pre-reclamation replica answers
