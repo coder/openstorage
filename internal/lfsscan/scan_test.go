@@ -46,9 +46,13 @@ func TestParseLFSPointer(t *testing.T) {
 		// safe direction for a deleter's parser.
 		{"indented oid line", "version https://git-lfs.github.com/spec/v1\n  oid sha256:" + oidA + "\n", oidA, true},
 		{"missing size still parses", "version https://git-lfs.github.com/spec/v1\noid sha256:" + oidA + "\n", oidA, true},
+		// git-lfs accepts ext-* metadata lines BEFORE version (Codex
+		// security round 10) — ordering can never be load-bearing for a
+		// deleter's parser, so any line order parses.
+		{"ext line before version", "ext-0-foo sha256:" + oidC + "\nversion https://git-lfs.github.com/spec/v1\noid sha256:" + oidA + "\nsize 1\n", oidA, true},
+		{"version not first still parses", "size 5\nversion https://git-lfs.github.com/spec/v1\noid sha256:" + oidA + "\n", oidA, true},
 		{"empty", "", "", false},
 		{"no version line", "oid sha256:" + oidA + "\nsize 5\n", "", false},
-		{"version not first", "size 5\nversion https://git-lfs.github.com/spec/v1\noid sha256:" + oidA + "\n", "", false},
 		{"missing oid", "version https://git-lfs.github.com/spec/v1\nsize 5\n", "", false},
 		{"short oid", "version https://git-lfs.github.com/spec/v1\noid sha256:abcd\n", "", false},
 		{"uppercase oid", "version https://git-lfs.github.com/spec/v1\noid sha256:" + strings.ToUpper(oidA) + "\n", "", false},
@@ -71,6 +75,7 @@ func FuzzLFSPointerParse(f *testing.F) {
 	f.Add([]byte(lfsPointer(oidA, 5)))
 	f.Add([]byte("\n \n" + lfsPointer(oidA, 5)))
 	f.Add([]byte("\t" + lfsPointer(oidA, 5)))
+	f.Add([]byte("ext-0-foo sha256:" + oidB + "\n" + lfsPointer(oidA, 5)))
 	f.Add([]byte("version https://hawser.github.com/spec/v1\noid sha256:" + oidB + "\nsize 0\n"))
 	f.Add([]byte("version https://git-lfs.github.com/spec/v1\noid sha256:short\n"))
 	f.Add([]byte("version https://git-lfs.github.com/spec/v1"))

@@ -27,12 +27,15 @@ var lfsPointerVersionPrefixes = []string{
 // registered objects that no reachable pointer references, so treating a
 // dubious blob as a pointer merely spares an object, while rejecting a real
 // pointer could retire live data. It therefore requires only the spec's two
-// load-bearing properties — a `version` line before any key line and an
-// `oid sha256:` key line — and ignores leading blank lines and per-line
-// indentation (git-lfs itself decodes blank-led files and
-// whitespace-indented version lines; Codex security rounds 8 and 9),
-// unknown keys, ordering, a missing size line, and surrounding
-// whitespace. It never panics on arbitrary input.
+// load-bearing properties — a `version` line and an `oid sha256:` key line,
+// each ANYWHERE in the file — and ignores line ordering entirely, blank
+// lines, per-line indentation, unknown keys, and a missing size line.
+// Ordering blindness is deliberate (Codex security rounds 8-10): git-lfs
+// itself decodes blank-led files, whitespace-indented version lines, and
+// ext-* metadata lines preceding `version`, and each positional requirement
+// this parser carried became a false negative that could retire live data —
+// order-free matching closes the class instead of the instance. It never
+// panics on arbitrary input.
 func ParseLFSPointer(data []byte) (oid string, ok bool) {
 	if len(data) > LFSPointerMaxSize {
 		return "", false
@@ -42,36 +45,30 @@ func ParseLFSPointer(data []byte) (oid string, ok bool) {
 	if strings.IndexByte(string(data), 0) >= 0 {
 		return "", false
 	}
-	lines := strings.Split(string(data), "\n")
-	for len(lines) > 0 && strings.TrimSpace(lines[0]) == "" {
-		lines = lines[1:] // git-lfs tolerates leading blank lines
-	}
-	if len(lines) == 0 {
-		return "", false
-	}
-	first := strings.TrimSpace(lines[0])
 	versioned := false
-	for _, p := range lfsPointerVersionPrefixes {
-		if strings.HasPrefix(first, p) {
-			versioned = true
-			break
+	for _, raw := range strings.Split(string(data), "\n") {
+		line := strings.TrimSpace(raw)
+		if !versioned {
+			for _, p := range lfsPointerVersionPrefixes {
+				if strings.HasPrefix(line, p) {
+					versioned = true
+					break
+				}
+			}
+		}
+		if oid == "" {
+			if rest, found := strings.CutPrefix(line, "oid sha256:"); found {
+				if !validLFSOID(rest) {
+					return "", false
+				}
+				oid = rest
+			}
 		}
 	}
-	if !versioned {
+	if !versioned || oid == "" {
 		return "", false
 	}
-	for _, line := range lines[1:] {
-		line = strings.TrimSpace(line)
-		rest, found := strings.CutPrefix(line, "oid sha256:")
-		if !found {
-			continue
-		}
-		if !validLFSOID(rest) {
-			return "", false
-		}
-		return rest, true
-	}
-	return "", false
+	return oid, true
 }
 
 // validLFSOID reports whether s is a 64-character lowercase hex sha256 OID.
