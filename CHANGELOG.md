@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.0](https://github.com/coder/code-storage/compare/v0.3.1...v0.4.0) (2026-08-24)
+
+
+### Features
+
+* **blob:** optional expected-bucket-owner enforcement across all S3 operations ([#115](https://github.com/coder/code-storage/issues/115)) ([fe39b73](https://github.com/coder/code-storage/commit/fe39b739324e7379ebc213818f553297dc651f65))
+
 ## [0.3.1](https://github.com/coder/code-storage/compare/v0.3.0...v0.3.1) (2026-08-24)
 
 
