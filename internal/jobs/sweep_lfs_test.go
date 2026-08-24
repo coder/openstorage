@@ -305,7 +305,7 @@ func TestSweepLFS_ReconcileTickerReconcilesLateTwins(t *testing.T) {
 	legacy := blob.LFSLegacyKey("repo_lfs", oid)
 	f.registerLFS("repo_lfs", canonical, 40)
 
-	stop := StartReconcileTicker(f.sweeper(SweepConfig{Threshold: 24 * time.Hour}), 10*time.Millisecond)
+	stop := StartReconcileTicker(f.sweeper(SweepConfig{Threshold: 24 * time.Hour}), 10*time.Millisecond, false)
 	defer stop()
 	// The twin lands AFTER the ticker started — an old replica writing
 	// mid-roll, past the startup Heal.

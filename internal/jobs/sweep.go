@@ -889,7 +889,11 @@ const ReconcileTickInterval = time.Hour
 // startup — registered fast paths never re-register, so the duplicate
 // object-count and usage charge would persist indefinitely. The returned
 // stop function cancels the loop and waits for an in-flight pass.
-func StartReconcileTicker(sweeper *Sweeper, interval time.Duration) (stop func()) {
+// drainOnly (Codex round 129) stops the ticker once a pass completes
+// below the page cap: the residual-backlog mode for post-roll compat-off
+// deployments, where no new twins can appear and the hourly unindexed
+// scan must not outlive the drain.
+func StartReconcileTicker(sweeper *Sweeper, interval time.Duration, drainOnly bool) (stop func()) {
 	assertf(sweeper != nil, "StartReconcileTicker: nil sweeper")
 	assertf(interval > 0, "StartReconcileTicker: non-positive interval %v", interval)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -899,10 +903,19 @@ func StartReconcileTicker(sweeper *Sweeper, interval time.Duration) (stop func()
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for {
-			if n, _, err := sweeper.packs.ReconcileLegacyLFSObjects(ctx); err != nil && ctx.Err() == nil {
+			n, partial, err := sweeper.packs.ReconcileLegacyLFSObjects(ctx)
+			if err != nil && ctx.Err() == nil {
 				sweeper.logger.Error("legacy lfs row reconcile failed", "err", err)
 			} else if n > 0 {
 				sweeper.logger.Info("reconciled legacy lfs row twins", "count", n)
+			}
+			if drainOnly && err == nil && !partial {
+				// Residual-backlog mode (Codex round 129): with compat
+				// off, old replicas mint no new twins — once a pass
+				// completes un-capped the backlog is drained, and the
+				// hourly unindexed scan must not run forever.
+				sweeper.logger.Info("legacy lfs reconcile backlog drained; stopping follow-up ticker")
+				return
 			}
 			select {
 			case <-ctx.Done():

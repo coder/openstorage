@@ -199,7 +199,7 @@ func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL, loopbackBaseU
 		// page cap — starts the ticker even with compat off, since
 		// nothing else would ever finish reconciling; each tick is one
 		// capped pass, so the backlog drains boundedly.
-		stopReconcile = jobs.StartReconcileTicker(sweeper, jobs.ReconcileTickInterval)
+		stopReconcile = jobs.StartReconcileTicker(sweeper, jobs.ReconcileTickInterval, !lfsWriteCompat)
 	}
 
 	// Background repack (issue #1): the worker folds over the RAW ref
