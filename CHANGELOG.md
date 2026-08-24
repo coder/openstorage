@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.1](https://github.com/coder/code-storage/compare/v0.3.0...v0.3.1) (2026-08-24)
+
+
+### Bug Fixes
+
+* **lfs:** canonical o2 object keys immune to legacy presigned-PUT replay ([#104](https://github.com/coder/code-storage/issues/104)) ([3cda233](https://github.com/coder/code-storage/commit/3cda233fc435f10220200501dd5b7100bfe3bc92))
+
 ## [0.3.0](https://github.com/coder/code-storage/compare/v0.2.0...v0.3.0) (2026-08-23)
 
 
