@@ -138,6 +138,18 @@ func (s *SQLite) RetireUnreferencedLFSObject(ctx context.Context, repo, key stri
 			return false, nil // refs moved since the scan: verdict is stale
 		}
 	}
+	// A live per-key adoption claim fences retirement — see the PG twin
+	// (Codex round 11). Claims stamp created_at in epoch MILLISECONDS.
+	var claimed bool
+	if err := tx.QueryRowContext(ctx, `
+SELECT EXISTS(SELECT 1 FROM pack_reservations
+  WHERE key = ? AND created_at > `+sqliteEpochMS+` - ?)`,
+		lfsClaimTwin(repo, key)+AdoptionClaimSuffix, AdoptionClaimTTL.Milliseconds()).Scan(&claimed); err != nil {
+		return false, err
+	}
+	if claimed {
+		return false, nil // an active materialization owns this key: spared
+	}
 	// SQLite stamps marks and evaluates "now" at whole-second resolution
 	// (unixepoch()), and both FLOOR: a mark minted at T.999 reads as T, so
 	// a naive elapsed check undercuts the window by up to a second — and

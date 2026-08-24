@@ -145,6 +145,51 @@ func TestLFSReclaim_GraceSparesFreshMark(t *testing.T) {
 	})
 }
 
+// TestLFSReclaim_LiveAdoptionClaimSpares (Codex round 11): every
+// server-side canonical materialization — the PUT publish/register region,
+// adoption and compat copies — holds the per-key fleet adoption claim with
+// renewal, and its zero-growth verdict assumes the row's slot and byte
+// credit survive the region. Retirement must honor a live claim for both
+// row spellings (claims are minted on the canonical key), and retire again
+// once it releases.
+func TestLFSReclaim_LiveAdoptionClaimSpares(t *testing.T) {
+	runRefBackends(t, func(t *testing.T, s Store) {
+		rs := reclaimStore(t, s)
+		ctx := context.Background()
+		k := newLedgerKit(t, s)
+		oid := strings.Repeat("ff", 32)
+		canonical := "lfs/" + k.base() + "/o2/" + oid
+		legacy := "lfs/" + k.base() + "/" + oid
+		for _, key := range []string{canonical, legacy} {
+			if err := s.RegisterLFSObject(ctx, k.base(), key, 10); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := rs.MarkLFSObjectsUnreferenced(ctx, k.base(), []string{key}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		claimed, owner, err := s.TryAdoptionClaim(ctx, k.base(), canonical)
+		if err != nil || !claimed {
+			t.Fatalf("TryAdoptionClaim = (%v, %v)", claimed, err)
+		}
+		gens := pinCurrentGens(t, s, k.group)
+		// Both spellings are spared while the canonical claim lives.
+		for _, key := range []string{canonical, legacy} {
+			if retired, err := rs.RetireUnreferencedLFSObject(ctx, k.base(), key, gens, 0); err != nil || retired {
+				t.Fatalf("retire %s under live claim = (%v, %v), want spared", key, retired, err)
+			}
+		}
+		if err := s.ReleaseAdoptionClaim(ctx, canonical, owner); err != nil {
+			t.Fatal(err)
+		}
+		for _, key := range []string{canonical, legacy} {
+			if retired, err := rs.RetireUnreferencedLFSObject(ctx, k.base(), key, gens, 0); err != nil || !retired {
+				t.Fatalf("retire %s after release = (%v, %v), want retired", key, retired, err)
+			}
+		}
+	})
+}
+
 // TestLFSReclaim_CountRefs: the reclaimer prices ref fanout with a counting
 // query instead of materializing refs; both backends agree with the rows.
 func TestLFSReclaim_CountRefs(t *testing.T) {

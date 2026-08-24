@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -70,6 +71,21 @@ func (s *PG) CountRefs(ctx context.Context, repo string) (int64, error) {
 		return 0, fmt.Errorf("count refs %s: %w", repo, err)
 	}
 	return n, nil
+}
+
+// lfsClaimTwin maps an lfs_objects row key to the canonical key its fleet
+// adoption claims are minted under (the ADR-41 spellings: canonical
+// `lfs/<repo>/o2/<oid>`, legacy `lfs/<repo>/<oid>`) — every server-side
+// canonical materialization claims the canonical spelling, and retiring a
+// legacy twin mid-region invalidates the same zero-growth verdict. An
+// unparseable key maps to itself; the claim probe then finds nothing.
+func lfsClaimTwin(repo, key string) string {
+	oid, ok := strings.CutPrefix(key, "lfs/"+repo+"/")
+	if !ok {
+		return key
+	}
+	oid = strings.TrimPrefix(oid, "o2/")
+	return "lfs/" + repo + "/o2/" + oid
 }
 
 // ListRepoLFSObjects pages repo's registered LFS object rows (keyset on
@@ -184,6 +200,27 @@ func (s *PG) RetireUnreferencedLFSObject(ctx context.Context, repo, key string, 
 			if gen != pinnedGens[member] {
 				return nil // refs moved since the scan: verdict is stale
 			}
+		}
+		// A live per-key adoption claim fences retirement (Codex round
+		// 11): every server-side canonical materialization — the PUT
+		// publish/register region, adoption and compat copies — holds the
+		// fleet claim with cadenced renewal, and its zero-growth verdict
+		// assumes the row's slot and byte credit survive the region.
+		// Retiring a claimed key would refund bytes another admission
+		// could spend before the region's registration re-credits them
+		// uncovered. Claim minting runs under the same base-ledger lock
+		// as this transaction, so the check is totally ordered; sparing
+		// is retryable — the next pass re-examines the row once the claim
+		// releases or expires.
+		var claimed bool
+		if err := tx.QueryRow(ctx, `
+SELECT EXISTS(SELECT 1 FROM pack_reservations
+  WHERE key = $1 AND created_at > now() - make_interval(secs => $2))`,
+			lfsClaimTwin(repo, key)+AdoptionClaimSuffix, AdoptionClaimTTL.Seconds()).Scan(&claimed); err != nil {
+			return err
+		}
+		if claimed {
+			return nil // an active materialization owns this key: spared
 		}
 		var bytes int64
 		switch err := tx.QueryRow(ctx, `
