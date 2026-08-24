@@ -1735,26 +1735,50 @@ func (s *Server) publishVerifiedLFSObject(ctx context.Context, repoID, key, lega
 		// registration somehow landed) and FAIL — the retry re-admits and
 		// re-copies from scratch. A failed cleanup leaves only the
 		// crashed-publisher orphan shape the next fresh floor lists.
-		delCtx, delCancel := context.WithTimeout(dctx, lfsCleanupTimeout)
-		defer delCancel()
-		if _, derr := s.Store.GuardedLFSDelete(delCtx, repoID, key, func(gctx context.Context) error {
+		// Deletion — not accounting — is the recovery that REVOKES the
+		// hazard (Codex round 108, P1): a stale-floor admission that
+		// exploited the uncovered gap may already have settled, and no
+		// new cover or generation bump un-admits it; only removing the
+		// bytes restores the quota invariant. Keep retrying the guarded
+		// delete until the outcome is PROVEN — deleted, already absent,
+		// or spared by a landed registration whose atomic credit counts
+		// the bytes — across the whole stale-floor window.
+		del := func(gctx context.Context) error {
 			if err := s.Blob.Delete(gctx, key); err != nil && !errors.Is(err, blob.ErrNotFound) {
 				return err
 			}
 			return nil
-		}); derr != nil {
+		}
+		proven := false
+		deadline := time.Now().Add(usageCacheTTL + UsageFloorHandoffMargin)
+		for {
+			rctx, rcancel := context.WithTimeout(dctx, lfsCleanupTimeout)
+			_, derr := s.Store.GuardedLFSDelete(rctx, repoID, key, del)
+			rcancel()
+			if derr == nil {
+				proven = true
+				break
+			}
 			log.Printf("lfs adopt %s: uncovered-copy cleanup: %v", key, derr)
-			// An ERRORED delete is indeterminate (Codex round 107, P1 —
-			// the adoption twin of round 106's compat recovery): the
-			// rowless bytes may remain, and the crashed-adoption retry
-			// registers them WITHOUT any copy admission — another writer
-			// may have settled into the uncovered gap, so accepting them
-			// unaccounted leaves physical usage above quota. Recover the
-			// accounting the lost cover abandoned before failing: block
-			// until a fresh cover and the fleet floor invalidation land,
-			// or every pre-copy floor has expired. (A DECLINED delete
-			// needs none of this — it means a registration landed, whose
-			// atomic credit already counts the bytes.)
+			if time.Now().After(deadline) {
+				break
+			}
+			select {
+			case <-dctx.Done():
+			case <-time.After(ambiguousAccountingRetryInterval):
+			}
+			if dctx.Err() != nil {
+				break
+			}
+		}
+		if !proven {
+			// Terminal fallback (Codex round 107): the whole stale-floor
+			// window passed without a proven deletion — the rowless bytes
+			// may remain, and the crashed-adoption retry registers them
+			// WITHOUT any copy admission. Cover them and invalidate
+			// floors so at least no FURTHER admission can omit them; the
+			// gap-exploiting admission that already settled is beyond
+			// recall without the deletion above.
 			s.ensureAmbiguousCommitAccounting(dctx, repoID, key, size, func(bctx context.Context) error {
 				return s.Store.BumpLFSAdoptionGen(bctx, BaseRepo(repoID))
 			})

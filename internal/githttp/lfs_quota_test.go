@@ -2181,7 +2181,9 @@ func TestLFSAdopt_UncoveredGapCommitRejected(t *testing.T) {
 // the accounting recovery's own cover can land.
 type uncoveredCleanupOutageStore struct {
 	ref.RefStore
-	cleanupRan atomic.Bool
+	cleanupRan      atomic.Bool
+	cleanupAttempts atomic.Int32
+	failDeletes     int32 // attempts that fail before the real delete runs
 }
 
 func (s *uncoveredCleanupOutageStore) ReservePackBytes(ctx context.Context, group []string, packs []ref.Pack, owner string, floor, floorGen, quota int64, ttl time.Duration) (ref.ReserveDecision, error) {
@@ -2193,7 +2195,10 @@ func (s *uncoveredCleanupOutageStore) ReservePackBytes(ctx context.Context, grou
 
 func (s *uncoveredCleanupOutageStore) GuardedLFSDelete(ctx context.Context, repo, key string, del func(context.Context) error) (bool, error) {
 	s.cleanupRan.Store(true)
-	return false, fmt.Errorf("simulated indeterminate cleanup outcome")
+	if s.cleanupAttempts.Add(1) <= s.failDeletes {
+		return false, fmt.Errorf("simulated indeterminate cleanup outcome")
+	}
+	return s.RefStore.GuardedLFSDelete(ctx, repo, key, del)
 }
 
 // TestLFSAdopt_IndeterminateCleanupRecoversAccounting (Codex round 107,
@@ -2217,7 +2222,7 @@ func TestLFSAdopt_IndeterminateCleanupRecoversAccounting(t *testing.T) {
 	if err := srv.Blob.UploadFile(ctx, blob.LFSLegacyKey(lfsTestRepoID, oid), writeTempFile(t, content)); err != nil {
 		t.Fatal(err)
 	}
-	srv.Store = &uncoveredCleanupOutageStore{RefStore: st}
+	srv.Store = &uncoveredCleanupOutageStore{RefStore: st, failDeletes: 1 << 30} // never proven: the retry window exhausts
 	preGen, err := st.LFSAdoptionGen(ctx, lfsTestRepoID)
 	if err != nil {
 		t.Fatal(err)
@@ -2342,6 +2347,37 @@ func TestLFSAdopt_QuotaPreflightSkipsHash(t *testing.T) {
 	}
 	if n := rc.reads.Load(); n != 0 {
 		t.Fatalf("over-quota adoption performed %d ranged reads before denying — every retry re-reads the whole blob for free", n)
+	}
+}
+
+// TestLFSAdopt_UncoveredCleanupRetriesUntilProven (Codex round 108, P1):
+// accounting recovery cannot revoke an admission that already exploited
+// the uncovered gap — only deleting the bytes restores the quota
+// invariant. A transiently failing cleanup must therefore be RETRIED until
+// the outcome is proven, not immediately traded for a cover. Runs the real
+// cover-continuity budget plus two retry intervals (~55s).
+func TestLFSAdopt_UncoveredCleanupRetriesUntilProven(t *testing.T) {
+	if testing.Short() {
+		t.Skip("runs the real ~45s cover-continuity budget")
+	}
+	ctx := context.Background()
+	srv, st, _ := newLFSQuotaServer(t, 1<<20, time.Hour)
+	content := []byte("transient cleanup failure resolves by retry")
+	oid := sha256Hex(content)
+	key := blob.LFSKey(lfsTestRepoID, oid)
+	if err := srv.Blob.UploadFile(ctx, blob.LFSLegacyKey(lfsTestRepoID, oid), writeTempFile(t, content)); err != nil {
+		t.Fatal(err)
+	}
+	srv.Store = &uncoveredCleanupOutageStore{RefStore: st, failDeletes: 2}
+
+	if aerr := srv.adoptLFSObject(ctx, lfsTestRepoID, key, oid); aerr == nil {
+		t.Fatal("adoption accepted an uncovered-gap copy")
+	}
+	if _, err := srv.Blob.Stat(ctx, key); err == nil {
+		t.Fatal("uncovered destination survived transient cleanup failures — deletion must be retried until proven, not traded for a cover")
+	}
+	if has, err := st.HasLFSObject(ctx, lfsTestRepoID, key); err != nil || has {
+		t.Fatalf("registered = (%v, %v), want not registered", has, err)
 	}
 }
 
