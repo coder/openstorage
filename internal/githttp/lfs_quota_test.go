@@ -1319,6 +1319,40 @@ func TestLFSCompatCopy_ChargedAgainstQuota(t *testing.T) {
 	}
 }
 
+// TestLFSPut_RegisteredFastPathCompatQuotaDenialIs507 (Codex round 103):
+// a direct PUT of an already-registered canonical object takes
+// adoptLFSObject's registered fast path, whose write-compat repair of a
+// missing legacy spelling can be quota-denied. The PUT switch handled only
+// the adoption copy's sentinel, so the bridge's sentinel fell through to a
+// generic 500 — hiding the documented 507 free-space remedy that the
+// batch and fresh-upload paths already report.
+func TestLFSPut_RegisteredFastPathCompatQuotaDenialIs507(t *testing.T) {
+	ctx := context.Background()
+	srv, st, mint := newLFSQuotaServer(t, 100, time.Hour)
+	srv.LFSV020WriteCompat = true
+	tok := mint(auth.ScopeGitWrite)
+	content := bytes.Repeat([]byte("t"), 60) // 60 registered; the bridge's second 60 exceeds Q=100
+	oid := sha256Hex(content)
+	key := blob.LFSKey(lfsTestRepoID, oid)
+
+	// Registered canonical object with intact bytes and NO legacy copy:
+	// the PUT re-upload lands on the registered fast path and enters the
+	// compat bridge, whose admission (60 stored + 60 incoming > 100)
+	// denies the copy.
+	if err := st.RegisterLFSObject(ctx, lfsTestRepoID, key, int64(len(content))); err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.Blob.UploadFile(ctx, key, writeTempFile(t, content)); err != nil {
+		t.Fatal(err)
+	}
+
+	w := doLFS(t, srv, http.MethodPut, "/"+lfsTestRepoURL+".git/info/lfs/objects/"+oid,
+		"basic:"+tok, string(content))
+	if w.Code != http.StatusInsufficientStorage {
+		t.Fatalf("registered fast-path PUT whose compat copy exceeds the quota = %d, body %s — quota denials are 507, not a generic failure", w.Code, w.Body)
+	}
+}
+
 // TestLFSCompatCopy_ExistingLegacySkipsAdmission (Codex round 89): a
 // zero-growth repair PUT — registered-but-blobless canonical whose legacy
 // copy survived — reaches the bridge with the legacy spelling ALREADY

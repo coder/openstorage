@@ -462,7 +462,10 @@ func (s *Server) lfsBatchUpload(r *http.Request, repoElem string, target repoTar
 					lfsObjectFail(&results[i], http.StatusInsufficientStorage, fmt.Sprintf(
 						"repository LFS object count limit reached (limit %d)", ref.MaxLFSObjectsPerRepo))
 					continue
-				case errors.Is(aerr, errLFSAdoptQuotaExceeded):
+				case errors.Is(aerr, errLFSAdoptQuotaExceeded), errors.Is(aerr, errLFSCompatQuotaExceeded):
+					// See the PUT switch (Codex round 103): adoption's tail
+					// compat repair can surface the bridge's quota
+					// sentinel, a 507 verdict rather than a failure.
 					lfsObjectFail(&results[i], http.StatusInsufficientStorage, aerr.Error())
 					continue
 				case errors.Is(aerr, errLFSBusy):
@@ -2103,7 +2106,12 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target r
 			lfsError(w, http.StatusInsufficientStorage, fmt.Sprintf(
 				"repository LFS object count limit reached (limit %d)", ref.MaxLFSObjectsPerRepo))
 			return
-		case errors.Is(aerr, errLFSAdoptQuotaExceeded):
+		case errors.Is(aerr, errLFSAdoptQuotaExceeded), errors.Is(aerr, errLFSCompatQuotaExceeded):
+			// Both copy denials are quota verdicts (Codex round 103): the
+			// registered fast path surfaces the BRIDGE's sentinel when
+			// write compat repairs a missing legacy spelling, and the
+			// generic 500 hid the documented free-space-or-finish-the-roll
+			// remedy behind a retryable-looking failure.
 			lfsError(w, http.StatusInsufficientStorage, aerr.Error())
 			return
 		case errors.Is(aerr, errLFSBusy):
