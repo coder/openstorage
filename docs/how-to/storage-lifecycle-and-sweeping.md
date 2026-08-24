@@ -429,7 +429,15 @@ Two operational notes:
   does not close that race. Do not set `CODESTORAGE_LFS_GC_DELETE_ENABLED`
   until every replica serving LFS requests runs a build with this feature
   (mixed-fleet staging, same as the
-  [sweep delete flags](#the-orphan-sweeper)).
+  [sweep delete flags](#the-orphan-sweeper)). If report-only scans ran
+  **during** the roll, the marks they stamped may already be grace-expired
+  when the roll finishes, while the last pre-touch replica's final "stored"
+  answers revoke nothing at shutdown: wait one full
+  `CODESTORAGE_LFS_GC_GRACE` after the last pre-touch replica stops before
+  arming deletes, so every promise an old replica issued has had its full
+  window to become a pushed pointer. Leaving `CODESTORAGE_LFS_GC_INTERVAL`
+  unset until the fleet is upgraded avoids the drain step entirely — no
+  scan, no marks.
 - **Stage the rollout.** Leave `CODESTORAGE_LFS_GC_DELETE_ENABLED` off first
   and watch the run reports: `rows_eligible` is what a delete-enabled run
   would have retired. An actively abusive writer can keep re-uploading junk

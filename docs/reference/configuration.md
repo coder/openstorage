@@ -730,7 +730,12 @@ until the eligible rows are the junk you expect, then opt in.
 - **Mixed-fleet prerequisite:** every replica serving LFS requests must run a
   build with this feature before retirement is armed — older replicas answer
   "already stored" without clearing the reclamation stamp, so a grace-expired
-  row could retire before that client pushes its pointer. See
+  row could retire before that client pushes its pointer. If report-only
+  scans ran during the roll, also wait one full
+  [grace](#codestorage_lfs_gc_grace) after the last pre-touch replica stops
+  before arming deletes: marks stamped mid-roll may already be grace-expired,
+  and shutdown revokes none of the old replica's outstanding "stored"
+  promises. See
   [the rollout guidance](../how-to/storage-lifecycle-and-sweeping.md#reclaiming-unreferenced-lfs-objects).
 
 ### `CODESTORAGE_LFS_MAX_OBJECTS_PER_REPO`
