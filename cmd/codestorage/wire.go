@@ -220,6 +220,12 @@ func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL, loopbackBaseU
 
 	queue, decorate, queueCleanup, err := buildServeEventing(ctx, ms, dbURL, org, loopbackBaseURL, key, schedule, repacker, webhookAllowPrivate, logger)
 	if err != nil {
+		// The reconcile ticker predates eventing setup (Codex round 104):
+		// failing without stopping it leaks an hourly ref-store query loop
+		// past fail()'s store close — mirror the api.New error path below.
+		if stopReconcile != nil {
+			stopReconcile()
+		}
 		return fail(err)
 	}
 
