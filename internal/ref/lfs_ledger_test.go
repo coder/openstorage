@@ -6,12 +6,39 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
+	"time"
 )
 
 // lfsKey mints a test LFS blob key under the kit's base repo.
 func lfsLedgerKey(k *ledgerKit, oid string) string {
 	return "lfs/" + k.base() + "/" + oid
+}
+
+// TestQuotaLedgerState_ExcludesAdoptionClaims (Codex round 102): round 95
+// excluded claim leases from ReservePackBytes' admission sums, but
+// QuotaLedgerState still counted them — at exact-headroom boundaries the
+// one-byte lease flipped advisory verdicts (a batch 507s with no upload
+// action and never reaches the authoritative PUT admission) for the
+// claim's whole lifetime. Claims are leases, not storage.
+func TestQuotaLedgerState_ExcludesAdoptionClaims(t *testing.T) {
+	runRefBackends(t, func(t *testing.T, s Store) {
+		k := newLedgerKit(t, s)
+		ctx := context.Background()
+		key := "lfs/" + k.base() + "/o2/" + strings.Repeat("cd", 32)
+		claimed, _, err := s.TryAdoptionClaim(ctx, k.base(), key)
+		if err != nil || !claimed {
+			t.Fatalf("claim = (%v, %v)", claimed, err)
+		}
+		ls, err := s.QuotaLedgerState(ctx, []string{k.base()}, time.Hour)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ls.ReservedBytes != 0 {
+			t.Fatalf("ReservedBytes with only a claim lease = %d, want 0 — claims are leases, not storage", ls.ReservedBytes)
+		}
+	})
 }
 
 // TestRegisterLFSObject_SettlesReservationAndCredits: registration consumes

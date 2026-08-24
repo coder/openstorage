@@ -1171,6 +1171,7 @@ SELECT
   COALESCE((SELECT SUM(bytes) FROM pack_usage WHERE repo = ANY($1)), 0),
   COALESCE((SELECT SUM(bytes) FROM pack_reservations
             WHERE repo = $2 AND created_at > now() - make_interval(secs => $3)
+              AND key NOT LIKE '%`+AdoptionClaimSuffix+`'
               AND NOT (key = ANY($4))), 0),
   COALESCE((SELECT SUM(bytes) FROM pack_retained WHERE repo = ANY($1)), 0)`,
 		group, group[0], ttl.Seconds(), excludeKeys).Scan(&st.UsageBytes, &st.ReservedBytes, &st.RetainedBytes)

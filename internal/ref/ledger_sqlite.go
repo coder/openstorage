@@ -630,7 +630,8 @@ func (s *SQLite) QuotaLedgerState(ctx context.Context, group []string, ttl time.
 SELECT
   COALESCE((SELECT SUM(bytes) FROM pack_usage WHERE repo IN (?`+placeholders(len(group)-1)+`)), 0),
   COALESCE((SELECT SUM(bytes) FROM pack_reservations
-            WHERE repo = ? AND created_at > `+sqliteEpochMS+` - ?`+exclude+`), 0),
+            WHERE repo = ? AND created_at > `+sqliteEpochMS+` - ?
+              AND key NOT LIKE '%`+AdoptionClaimSuffix+`'`+exclude+`), 0),
   COALESCE((SELECT SUM(bytes) FROM pack_retained WHERE repo IN (?`+placeholders(len(group)-1)+`)), 0)`,
 		args...).Scan(&st.UsageBytes, &st.ReservedBytes, &st.RetainedBytes)
 	return st, err
