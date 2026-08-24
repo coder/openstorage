@@ -18,7 +18,7 @@ is ever marked or retired from a partial walk, because an incomplete
 reachable set proves nothing. Reachability is computed per namespace group
 (ADR-35: `+ephemeral`/`+import` share the base repo's object space) from the
 hydrated cache after `Materialize` synced it to the DB ref authority, by
-streaming `git rev-list --objects` (blob-size-prefiltered) through `cat-file`
+streaming an unfiltered `git rev-list --objects` through `cat-file`
 and decoding pointer-sized blobs with a decoder deliberately MORE lenient
 than git-lfs: a false positive spares an object, a false negative could
 retire live data.

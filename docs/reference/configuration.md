@@ -676,9 +676,9 @@ take, so no signal can lose the race silently.
 
 ### `CODESTORAGE_LFS_GC_OBJECT_BUDGET`
 
-Caps the git objects (commits, trees, candidate blobs) one reclamation run may
-list across all its reachability walks — the bound that keeps the job's cost
-predictable on any repository shape. A repository whose own walk exceeds the
+Caps the git objects (commits, trees, and blobs of every size) one reclamation
+run may list across all its reachability walks — the bound that keeps the
+job's cost predictable on any repository shape. A repository whose own walk exceeds the
 remaining budget is retried first next run with a full budget; one whose walk
 exceeds the FULL budget is skipped loudly until the budget is raised. Nothing
 is ever marked or retired from a partial walk.

@@ -40,9 +40,9 @@ var ErrLFSScanBudget = errors.New("lfs reachability scan budget exceeded")
 // at most LFSPointerMaxSize bytes as Git LFS pointer files, and returns the
 // set of referenced sha256 OIDs plus the number of objects the walk listed.
 //
-// The walk streams three git subprocesses — rev-list --objects (with a blob
-// size prefilter), cat-file --batch-check (type/size), cat-file --batch
-// (candidate contents) — so memory stays O(pointers found), not O(objects).
+// The walk streams three git subprocesses — rev-list --objects, cat-file
+// --batch-check (type/size), cat-file --batch (candidate contents) — so
+// memory stays O(pointers found), not O(objects).
 // Aborting past budget kills the pipeline and returns ErrLFSScanBudget; any
 // subprocess failure (including an object reported missing) fails the walk,
 // because reclamation must only ever act on a provably complete scan.
@@ -61,8 +61,16 @@ func ReachableLFSOIDs(ctx context.Context, repoPath string, budget int64) (map[s
 	// the TRUE objects the refs name; the replacement objects themselves
 	// are still listed through their own refs/replace ref (protecting
 	// MORE OIDs, the safe direction).
-	revList := exec.CommandContext(gctx, "git", "--no-replace-objects", "rev-list", "--objects", "--no-object-names",
-		fmt.Sprintf("--filter=blob:limit=%d", LFSPointerMaxSize+1), "--all")
+	//
+	// The listing is deliberately UNFILTERED (Codex round 2): a blob:limit
+	// prefilter would omit oversized blobs from rev-list's output while git
+	// still traverses every one of them, so a writer could stuff trees with
+	// large blobs that consume walk work the budget never sees. Emitting
+	// every reachable object charges each one a budget unit — exceeding the
+	// budget cancels gctx and kills the pipeline mid-walk — and the
+	// batch-check stage below discards oversized blobs before any content
+	// is read.
+	revList := exec.CommandContext(gctx, "git", "--no-replace-objects", "rev-list", "--objects", "--no-object-names", "--all")
 	revList.Dir = repoPath
 	var revErr bytes.Buffer
 	revList.Stderr = &revErr

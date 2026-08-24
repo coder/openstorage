@@ -125,6 +125,43 @@ func TestReachableLFSOIDs(t *testing.T) {
 	}
 }
 
+// TestReachableLFSOIDs_LargeBlobsChargeBudget (Codex round 2): a blob:limit
+// prefilter on rev-list would omit oversized blobs from its output while git
+// still traverses every one of them, so a writer could stuff trees with large
+// blobs that consume unbounded walk work the budget never sees. Every
+// reachable object — including blobs too big to be pointer files — must
+// charge one budget unit.
+func TestReachableLFSOIDs_LargeBlobsChargeBudget(t *testing.T) {
+	dir := t.TempDir()
+	mustGit(t, dir, "init", "-q", "--initial-branch=main")
+	writeFile(t, dir, "a.bin", lfsPointer(oidA, 100), 0o644)
+	for i := 0; i < 8; i++ {
+		writeFile(t, dir, fmt.Sprintf("big-%d.dat", i), strings.Repeat("x", 5000)+fmt.Sprint(i), 0o644)
+	}
+	mustGit(t, dir, "add", "-A")
+	mustGit(t, dir, "commit", "-q", "-m", "root")
+
+	// 1 commit + 1 tree + 1 pointer blob + 8 large blobs = 11 objects. A
+	// size-prefiltered listing would emit only 3 of them and sail past a
+	// budget of 6; charging every reachable object must trip it.
+	if _, _, err := ReachableLFSOIDs(context.Background(), dir, 6); !errors.Is(err, ErrLFSScanBudget) {
+		t.Fatalf("budget walk err = %v, want ErrLFSScanBudget", err)
+	}
+
+	// With enough budget the walk succeeds, the pointer is still collected,
+	// and the walked count proves the large blobs were charged.
+	oids, walked, err := ReachableLFSOIDs(context.Background(), dir, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := oids[oidA]; !ok {
+		t.Errorf("pointer OID missing: %v", oids)
+	}
+	if walked != 11 {
+		t.Fatalf("walked = %d, want 11 (large blobs must charge the budget)", walked)
+	}
+}
+
 // TestReachableLFSOIDs_IgnoresReplacementRefs (Codex security round 1): a
 // git:write pusher can mint refs/replace/* substitutions WITHOUT moving the
 // protected refs they shadow — replacing a commit with a doctored twin
