@@ -1127,6 +1127,44 @@ ON CONFLICT (repo) DO UPDATE SET gen = lfs_adoption_gens.gen + 1`, repo)
 	})
 }
 
+// RecordLFSMismatch — see RefStore (#104, Codex round 132).
+func (s *PG) RecordLFSMismatch(ctx context.Context, repo, key, fingerprint string) error {
+	assertf(repo != "" && key != "" && fingerprint != "", "RecordLFSMismatch(%q, %q)", repo, key)
+	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		if err := lockBaseLedger(ctx, tx, baseRepoOf(repo)); err != nil {
+			return err
+		}
+		// Purge fence: markers are row-creating writes; a purged repo's
+		// legacy blobs are the sweeper's problem, not the bridge's.
+		if fenced, err := repoPurgeFencedPG(ctx, tx, repo); err != nil || fenced {
+			return err
+		}
+		_, err := tx.Exec(ctx, `
+INSERT INTO lfs_mismatches (repo, key, fingerprint) VALUES ($1, $2, $3)
+ON CONFLICT (repo, key) DO UPDATE SET fingerprint = EXCLUDED.fingerprint`, repo, key, fingerprint)
+		return err
+	})
+}
+
+// LFSMismatchFingerprint — see RefStore (#104, Codex round 132).
+func (s *PG) LFSMismatchFingerprint(ctx context.Context, repo, key string) (string, bool, error) {
+	assertf(repo != "" && key != "", "LFSMismatchFingerprint(%q, %q)", repo, key)
+	var fp string
+	err := s.pool.QueryRow(ctx,
+		`SELECT fingerprint FROM lfs_mismatches WHERE repo = $1 AND key = $2`, repo, key).Scan(&fp)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", false, nil
+	}
+	return fp, err == nil, err
+}
+
+// ClearLFSMismatch — see RefStore (#104, Codex round 132).
+func (s *PG) ClearLFSMismatch(ctx context.Context, repo, key string) error {
+	assertf(repo != "" && key != "", "ClearLFSMismatch(%q, %q)", repo, key)
+	_, err := s.pool.Exec(ctx, `DELETE FROM lfs_mismatches WHERE repo = $1 AND key = $2`, repo, key)
+	return err
+}
+
 // LFSAdoptionGen — see RefStore (Codex round 49).
 func (s *PG) LFSAdoptionGen(ctx context.Context, repo string) (int64, error) {
 	assertf(repo != "", "LFSAdoptionGen(%q)", repo)

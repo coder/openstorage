@@ -180,6 +180,7 @@ func (s *PG) PurgeRepoLedger(ctx context.Context, group []string) (int64, error)
 			`DELETE FROM pack_usage        WHERE repo = ANY($1)`,
 			`DELETE FROM lfs_object_counts WHERE repo = ANY($1)`,
 			`DELETE FROM lfs_adoption_gens WHERE repo = ANY($1)`,
+			`DELETE FROM lfs_mismatches WHERE repo = ANY($1)`,
 			`DELETE FROM repo_generations  WHERE repo = ANY($1)`,
 		} {
 			ct, err := tx.Exec(ctx, stmt, group)

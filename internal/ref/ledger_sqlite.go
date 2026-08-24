@@ -488,6 +488,38 @@ ON CONFLICT (repo) DO UPDATE SET gen = lfs_adoption_gens.gen + 1`, repo, baseRep
 	return err
 }
 
+// RecordLFSMismatch — see RefStore (#104, Codex round 132). The purge
+// fence rides the INSERT like BumpLFSAdoptionGen's; BEGIN IMMEDIATE's
+// single writer is the serialization.
+func (s *SQLite) RecordLFSMismatch(ctx context.Context, repo, key, fingerprint string) error {
+	assertf(repo != "" && key != "" && fingerprint != "", "RecordLFSMismatch(%q, %q)", repo, key)
+	_, err := s.db.ExecContext(ctx, `
+INSERT INTO lfs_mismatches (repo, key, fingerprint)
+SELECT ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM purged_repos WHERE repo = ?)
+ON CONFLICT (repo, key) DO UPDATE SET fingerprint = excluded.fingerprint`,
+		repo, key, fingerprint, baseRepoOf(repo))
+	return err
+}
+
+// LFSMismatchFingerprint — see RefStore (#104, Codex round 132).
+func (s *SQLite) LFSMismatchFingerprint(ctx context.Context, repo, key string) (string, bool, error) {
+	assertf(repo != "" && key != "", "LFSMismatchFingerprint(%q, %q)", repo, key)
+	var fp string
+	err := s.db.QueryRowContext(ctx,
+		`SELECT fingerprint FROM lfs_mismatches WHERE repo = ? AND key = ?`, repo, key).Scan(&fp)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	return fp, err == nil, err
+}
+
+// ClearLFSMismatch — see RefStore (#104, Codex round 132).
+func (s *SQLite) ClearLFSMismatch(ctx context.Context, repo, key string) error {
+	assertf(repo != "" && key != "", "ClearLFSMismatch(%q, %q)", repo, key)
+	_, err := s.db.ExecContext(ctx, `DELETE FROM lfs_mismatches WHERE repo = ? AND key = ?`, repo, key)
+	return err
+}
+
 // LFSAdoptionGen — see RefStore (Codex round 49).
 func (s *SQLite) LFSAdoptionGen(ctx context.Context, repo string) (int64, error) {
 	assertf(repo != "", "LFSAdoptionGen(%q)", repo)

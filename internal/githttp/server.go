@@ -131,14 +131,6 @@ type Server struct {
 	// one in-flight upload per key, so concurrent identical PUTs cannot
 	// multiply quota-sized temp files (see lfsProxyUpload).
 	lfsUploadsInFlight sync.Map
-	// lfsMismatchMemos maps a legacy key to the fingerprint its FAILED
-	// content verification observed (Codex security round 118): repeat
-	// adoption touches of an unchanged corrupt source skip the full
-	// re-hash and press only the (budgeted) cleanup, so a client
-	// spamming tiny batches cannot replay whole-object reads for free.
-	// Bounded by lfsMismatchMemoCap; guarded by lfsMismatchMemoMu.
-	lfsMismatchMemoMu sync.Mutex
-	lfsMismatchMemos  map[string]string
 	// lfsStagingInFlight is the aggregate Content-Length currently
 	// reserved against LFSStagingBytes; lfsStagingOps counts the
 	// operations holding it (Codex round 17: tiny Content-Lengths pass a

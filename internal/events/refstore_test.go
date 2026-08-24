@@ -73,6 +73,11 @@ func (f *fakeInner) SweepExpiredPackReservations(context.Context, time.Duration)
 func (f *fakeInner) ReconcileLegacyLFSObjects(context.Context) (int64, bool, error) {
 	return 0, false, nil
 }
+func (f *fakeInner) RecordLFSMismatch(context.Context, string, string, string) error { return nil }
+func (f *fakeInner) LFSMismatchFingerprint(context.Context, string, string) (string, bool, error) {
+	return "", false, nil
+}
+func (f *fakeInner) ClearLFSMismatch(context.Context, string, string) error { return nil }
 func (f *fakeInner) IsRetainedPack(context.Context, string, string) (bool, error) {
 	return false, nil
 }

@@ -1060,7 +1060,11 @@ func (s *Server) adoptStoredLFSObject(ctx context.Context, repoID, key, oid stri
 	// the memo can gate WORK, never a delete). A moved fingerprint
 	// invalidates the memo and the version proves itself in full.
 	if target != key {
-		if memoFP, ok := s.lfsMismatchMemo(target); ok {
+		memoFP, memoOK, memoErr := s.lfsMismatchMemo(ctx, repoID, target)
+		if memoErr != nil {
+			return memoErr // an unreadable marker is never absence (round 132)
+		}
+		if memoOK {
 			fctx, fcancel := context.WithTimeout(ctx, lfsProbeTimeout)
 			_, nowFP, ferr := s.Blob.StatFingerprint(fctx, target)
 			fcancel()
@@ -1086,7 +1090,7 @@ func (s *Server) adoptStoredLFSObject(ctx context.Context, repoID, key, oid stri
 					if err := s.Blob.Delete(delCtx, target); err != nil && !errors.Is(err, blob.ErrNotFound) {
 						return fmt.Errorf("remove mismatched legacy object %s: %w", target, err)
 					}
-					s.forgetLFSMismatch(target)
+					s.forgetLFSMismatch(ctx, repoID, target)
 					log.Printf("lfs adopt %s: removed memoized mismatched legacy blob", key)
 					return errLFSContentMismatch
 				case decisive:
@@ -1098,12 +1102,12 @@ func (s *Server) adoptStoredLFSObject(ctx context.Context, repoID, key, oid stri
 					// memo and fall through: this touch adopts the
 					// now-proven source through the normal full
 					// verification.
-					s.forgetLFSMismatch(target)
+					s.forgetLFSMismatch(ctx, repoID, target)
 				default:
 					return errLFSContentMismatch // unknowable: spared, memo stands
 				}
 			case ferr == nil:
-				s.forgetLFSMismatch(target) // replaced: prove in full
+				s.forgetLFSMismatch(ctx, repoID, target) // replaced: prove in full
 			}
 		}
 	}
@@ -1148,7 +1152,7 @@ func (s *Server) adoptStoredLFSObject(ctx context.Context, repoID, key, oid stri
 			// fingerprint (Codex security round 118): repeat touches of
 			// the unchanged corrupt source skip the full re-hash and
 			// press only the budgeted cleanup below.
-			s.rememberLFSMismatch(target, contentFP)
+			s.rememberLFSMismatch(ctx, repoID, target, contentFP)
 			// Claim-renewed, request-detached snapshot region (rounds
 			// 126/127): the re-hash can outlive both the request and
 			// ref.AdoptionClaimTTL, and a recorded lease loss must
@@ -1171,7 +1175,7 @@ func (s *Server) adoptStoredLFSObject(ctx context.Context, repoID, key, oid stri
 				if err := s.Blob.Delete(delCtx, target); err != nil && !errors.Is(err, blob.ErrNotFound) {
 					return fmt.Errorf("remove mismatched legacy object %s: %w", target, err)
 				}
-				s.forgetLFSMismatch(target)
+				s.forgetLFSMismatch(ctx, repoID, target)
 				log.Printf("lfs adopt %s: removed legacy blob failing content verification", key)
 			} else {
 				log.Printf("lfs adopt %s: sparing legacy source not proven mismatched", key)
@@ -1269,7 +1273,7 @@ func (s *Server) adoptStoredLFSObject(ctx context.Context, repoID, key, oid stri
 			if err := s.Blob.Delete(delCtx, legacySrc); err != nil && !errors.Is(err, blob.ErrNotFound) {
 				log.Printf("lfs adopt %s: remove mismatched legacy source: %v", key, err)
 			}
-			s.forgetLFSMismatch(legacySrc)
+			s.forgetLFSMismatch(ctx, repoID, legacySrc)
 			log.Printf("lfs adopt %s: removed legacy blob failing content verification", key)
 		} else {
 			log.Printf("lfs adopt %s: sparing legacy source not proven mismatched", key)
@@ -2037,47 +2041,42 @@ func (s *Server) reclaimUncoveredCommit(ctx context.Context, repoID, key string)
 	}
 }
 
-// lfsMismatchMemoCap bounds the failed-verification memo map: entries are
-// per corrupt legacy key, and an attacker with git:write can mint OIDs, so
-// the map must not grow with them. Evicting an arbitrary entry on overflow
-// only costs a repeat re-hash for the evicted key.
-const lfsMismatchMemoCap = 1024
-
-// rememberLFSMismatch memoizes that the version of legacyKey carrying fp
-// failed content verification (Codex security round 118).
-func (s *Server) rememberLFSMismatch(legacyKey, fp string) {
+// rememberLFSMismatch persists that the version of legacyKey carrying fp
+// failed content verification (Codex security round 118; FLEET-persistent
+// through the ref store since round 132 — the process-local map was
+// per-replica and evictable, and a lost marker made a registered object's
+// corrupt legacy spelling implicitly clean forever). Best-effort: a
+// failed write only defers — the next failed verification re-records.
+func (s *Server) rememberLFSMismatch(ctx context.Context, repoID, legacyKey, fp string) {
 	if fp == "" {
 		return
 	}
-	s.lfsMismatchMemoMu.Lock()
-	defer s.lfsMismatchMemoMu.Unlock()
-	if s.lfsMismatchMemos == nil {
-		s.lfsMismatchMemos = make(map[string]string)
+	rctx, rcancel := context.WithTimeout(context.WithoutCancel(ctx), lfsProbeTimeout)
+	defer rcancel()
+	if err := s.Store.RecordLFSMismatch(rctx, repoID, legacyKey, fp); err != nil {
+		log.Printf("lfs mismatch marker %s: record: %v", legacyKey, err)
 	}
-	if _, ok := s.lfsMismatchMemos[legacyKey]; !ok && len(s.lfsMismatchMemos) >= lfsMismatchMemoCap {
-		for k := range s.lfsMismatchMemos {
-			delete(s.lfsMismatchMemos, k)
-			break
-		}
-	}
-	s.lfsMismatchMemos[legacyKey] = fp
 }
 
-// lfsMismatchMemo returns the memoized failed-verification fingerprint for
-// legacyKey, if any.
-func (s *Server) lfsMismatchMemo(legacyKey string) (string, bool) {
-	s.lfsMismatchMemoMu.Lock()
-	defer s.lfsMismatchMemoMu.Unlock()
-	fp, ok := s.lfsMismatchMemos[legacyKey]
-	return fp, ok
+// lfsMismatchMemo returns the persisted failed-verification fingerprint
+// for legacyKey, if any. Errors propagate: a marker that cannot be read
+// must never be treated as absent (round 132's rule — absence implies
+// clean on the registered paths).
+func (s *Server) lfsMismatchMemo(ctx context.Context, repoID, legacyKey string) (string, bool, error) {
+	rctx, rcancel := context.WithTimeout(context.WithoutCancel(ctx), lfsProbeTimeout)
+	defer rcancel()
+	return s.Store.LFSMismatchFingerprint(rctx, repoID, legacyKey)
 }
 
-// forgetLFSMismatch drops legacyKey's memo (deleted, or replaced by an
-// unknown version whose next touch must prove itself in full).
-func (s *Server) forgetLFSMismatch(legacyKey string) {
-	s.lfsMismatchMemoMu.Lock()
-	defer s.lfsMismatchMemoMu.Unlock()
-	delete(s.lfsMismatchMemos, legacyKey)
+// forgetLFSMismatch drops legacyKey's marker after a decisive verdict.
+// Best-effort in the safe direction: a lingering marker is re-pressed —
+// and cleared — by the next touch's decisive snapshot.
+func (s *Server) forgetLFSMismatch(ctx context.Context, repoID, legacyKey string) {
+	rctx, rcancel := context.WithTimeout(context.WithoutCancel(ctx), lfsProbeTimeout)
+	defer rcancel()
+	if err := s.Store.ClearLFSMismatch(rctx, repoID, legacyKey); err != nil {
+		log.Printf("lfs mismatch marker %s: clear: %v", legacyKey, err)
+	}
 }
 
 // legacySourceProvenMismatched re-hashes the legacy source at cleanup time
@@ -3239,7 +3238,9 @@ func (s *Server) maybeLegacyCompatCopy(ctx context.Context, repoID, oid, key str
 		// until some other write-scoped touch. Only a REMOVED spelling
 		// proceeds to the re-bridge below; spared or proven-valid
 		// returns as before.
-		if _, ok := s.lfsMismatchMemo(legacyKey); ok {
+		if _, ok, merr := s.lfsMismatchMemo(ctx, repoID, legacyKey); merr != nil {
+			return merr // an unreadable marker is never absence (round 132)
+		} else if ok {
 			switch v, rerr := s.resolveLegacyMismatchMemo(ctx, repoID, oid, key, legacyKey); {
 			case rerr != nil:
 				return rerr
@@ -3572,7 +3573,7 @@ func (s *Server) resolveLegacyMismatchMemo(ctx context.Context, repoID, oid, key
 		releaseClaim()
 		return legacyMemoPending, nil // spared; the memo stands pending for the next touch
 	case !m:
-		s.forgetLFSMismatch(legacyKey)
+		s.forgetLFSMismatch(ctx, repoID, legacyKey)
 		releaseClaim()
 		return legacyMemoValid, nil // proven VALID: the true object converged
 	}
@@ -3589,7 +3590,7 @@ func (s *Server) resolveLegacyMismatchMemo(ctx context.Context, repoID, oid, key
 		releaseClaim()
 		return legacyMemoPending, fmt.Errorf("remove memoized mismatched legacy object %s: %w", legacyKey, err)
 	}
-	s.forgetLFSMismatch(legacyKey)
+	s.forgetLFSMismatch(ctx, repoID, legacyKey)
 	releaseClaim()
 	log.Printf("lfs compat %s: removed memoized mismatched legacy blob before re-bridging", key)
 	return legacyMemoRemoved, nil
@@ -3622,7 +3623,10 @@ func (s *Server) ensureLegacyCompat(ctx context.Context, repoID, oid, key string
 		// a deletion falls through to the bridge repair below, which
 		// republishes verified canonical bytes. A still-spared verdict
 		// keeps the memo for the next touch.
-		if _, ok := s.lfsMismatchMemo(legacyKey); !ok {
+		switch _, ok, merr := s.lfsMismatchMemo(ctx, repoID, legacyKey); {
+		case merr != nil:
+			return merr // an unreadable marker is never absence (round 132)
+		case !ok:
 			return nil // the spelling exists: nothing to converge
 		}
 		switch v, rerr := s.resolveLegacyMismatchMemo(ctx, repoID, oid, key, legacyKey); {
