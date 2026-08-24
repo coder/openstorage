@@ -1030,8 +1030,14 @@ func (s *Server) adoptLFSObject(ctx context.Context, repoID, key, oid string) er
 			// CURRENT content and delete only bytes still proven
 			// mismatched; a spared survivor converges via the next
 			// touch's verification. The canonical key was never written.
-			if s.legacySourceProvenMismatched(dctx, target, oid) {
-				if err := s.Blob.Delete(dctx, target); err != nil && !errors.Is(err, blob.ErrNotFound) {
+			if s.legacySourceProvenMismatched(dctx, repoID, target, oid) {
+				// The delete gets its OWN bounded window (Codex round
+				// 116): a size-scaled snapshot can outlive dctx, and a
+				// proven verdict must not lose its delete to the
+				// consumed parent deadline.
+				delCtx, delCancel := context.WithTimeout(context.WithoutCancel(ctx), lfsCleanupTimeout)
+				defer delCancel()
+				if err := s.Blob.Delete(delCtx, target); err != nil && !errors.Is(err, blob.ErrNotFound) {
 					return fmt.Errorf("remove mismatched legacy object %s: %w", target, err)
 				}
 				log.Printf("lfs adopt %s: removed legacy blob failing content verification", key)
@@ -1111,8 +1117,14 @@ func (s *Server) adoptLFSObject(ctx context.Context, repoID, key, oid string) er
 		// security round 78): a spared survivor is re-copied, re-fails
 		// the digest, and lands back here.
 		legacySrc := blob.LFSLegacyKey(repoID, oid)
-		if s.legacySourceProvenMismatched(dctx, legacySrc, oid) {
-			if err := s.Blob.Delete(dctx, legacySrc); err != nil && !errors.Is(err, blob.ErrNotFound) {
+		if s.legacySourceProvenMismatched(dctx, repoID, legacySrc, oid) {
+			// The delete gets its OWN bounded window (Codex round 116):
+			// a size-scaled snapshot can outlive dctx, and a proven
+			// verdict must not lose its delete to the consumed parent
+			// deadline.
+			delCtx, delCancel := context.WithTimeout(context.WithoutCancel(ctx), lfsCleanupTimeout)
+			defer delCancel()
+			if err := s.Blob.Delete(delCtx, legacySrc); err != nil && !errors.Is(err, blob.ErrNotFound) {
 				log.Printf("lfs adopt %s: remove mismatched legacy source: %v", key, err)
 			}
 			log.Printf("lfs adopt %s: removed legacy blob failing content verification", key)
@@ -1882,27 +1894,41 @@ func (s *Server) reclaimUncoveredCommit(ctx context.Context, repoID, key string)
 // false — unknowable state spares, and the next touch re-examines.
 // Size-scale-bounded; runs only on the rare mismatch path, under the
 // caller's held claim and op slot.
-func (s *Server) legacySourceProvenMismatched(ctx context.Context, legacyKey, oid string) bool {
+func (s *Server) legacySourceProvenMismatched(ctx context.Context, repoID, legacyKey, oid string) bool {
 	// SINGLE-VERSION snapshot by construction (Codex round 115): chunked
 	// ranged reads can interleave with legacy PUTs, and content-derived
 	// fingerprints are ABA-blind (A→B→A restores the fingerprint around
 	// a mixed read), so no read-side stat pinning can prove the ranges
 	// came from one version. One atomic DownloadFile is one GET: the
 	// local snapshot is exactly one stored version's bytes, and the
-	// digest verdict binds to that version. Disk-staged like every proxy
-	// transfer, on the rare attack-gated mismatch path only, under the
-	// caller's held op slot. The residual — a replacement between this
-	// proof and the caller's delete — is one RTT and irreducible here:
-	// conditional DELETE If-Match is silently ignored by MinIO (verified
-	// round 84) and the legacy namespace takes no fleet claims by design
-	// (still-valid presigned PUTs, old replicas) — ADR-41's documented
-	// legacy-mutability residual class.
-	pctx, pcancel := context.WithTimeout(ctx, lfsProbeTimeout)
+	// digest verdict binds to that version. The residual — a replacement
+	// between this proof and the caller's delete — is one RTT and
+	// irreducible here: conditional DELETE If-Match is silently ignored
+	// by MinIO (verified round 84) and the legacy namespace takes no
+	// fleet claims by design (still-valid presigned PUTs, old replicas)
+	// — ADR-41's documented legacy-mutability residual class.
+	// DETACHED from the caller's cleanup window (Codex round 116, P2):
+	// bounded only by the size-scaled allowance below — a parent
+	// lfsCleanupTimeout silently expired large snapshots, permanently
+	// sparing corrupt bytes (registered fast paths never re-run this
+	// cleanup, and the compat bridge skips existing legacy keys).
+	base := context.WithoutCancel(ctx)
+	pctx, pcancel := context.WithTimeout(base, lfsProbeTimeout)
 	size, perr := s.Blob.Stat(pctx, legacyKey)
 	pcancel()
 	if perr != nil {
 		return false // absent or unknowable spares; the next touch re-examines
 	}
+	// The snapshot is real replica disk: charge it to the staging budget
+	// like every proxy transfer (Codex round 116, P1) — one slot plus
+	// size bytes in a single reservation (adoption's second-slot shape,
+	// round 25: it only makes the cap more conservative). A denied
+	// budget spares: unknowable is never proof, and the next touch
+	// re-examines under a freer budget.
+	if !s.reserveLFSStaging(repoID, size) {
+		return false
+	}
+	defer s.releaseLFSStaging(repoID, size)
 	dir, err := os.MkdirTemp("", "lfs-mismatch-*")
 	if err != nil {
 		return false
@@ -1911,7 +1937,7 @@ func (s *Server) legacySourceProvenMismatched(ctx context.Context, legacyKey, oi
 	snap := filepath.Join(dir, "snap")
 	// The size-scaled allowance every LFS transfer uses (round 81's
 	// shape): a live backend finishes, a wedged one is cut loose.
-	dctx, dcancel := context.WithTimeout(ctx, 5*time.Minute+time.Duration(size>>20)*time.Second)
+	dctx, dcancel := context.WithTimeout(base, 5*time.Minute+time.Duration(size>>20)*time.Second)
 	derr := s.Blob.DownloadFile(dctx, legacyKey, snap)
 	dcancel()
 	if derr != nil {
