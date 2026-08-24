@@ -254,8 +254,8 @@ func runAllOps(t *testing.T, store *S3, transport *stubS3Transport) {
 // allOps is every S3 API operation runAllOps must have emitted — a missed
 // label means an operation type silently stopped being exercised.
 var allOps = []string{
-	"CreateBucket", "GetBucketVersioning", "PutObject", "GetObject",
-	"HeadObject", "ListObjectsV2", "DeleteObject", "CopyObject",
+	"CreateBucket", "HeadBucket", "GetBucketVersioning", "PutObject",
+	"GetObject", "HeadObject", "ListObjectsV2", "DeleteObject", "CopyObject",
 	"CreateMultipartUpload", "UploadPartCopy", "CompleteMultipartUpload",
 	"AbortMultipartUpload",
 }

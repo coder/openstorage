@@ -192,9 +192,31 @@ func TestEnsureBucket(t *testing.T) {
 			wantErr:       []string{`bucket "b" exists`, "111122223333", "AccessDenied"},
 			wantHeadCalls: 1,
 		},
-		"already owned by you skips probe even with expected owner": {
+		// CreateBucket success and BucketAlreadyOwnedByYou prove only that
+		// the CREDENTIALS' account owns the bucket, not that it matches
+		// the configured owner (Codex round 1: credential/account drift):
+		// both must pass the conditioned probe too.
+		"created, expected owner set, probe ok": {
+			client:        &fakeBucketClient{},
+			expectedOwner: "111122223333",
+			wantHeadCalls: 1,
+		},
+		"created, expected owner set, probe 403": {
+			client:        &fakeBucketClient{headErr: apiErr("AccessDenied")},
+			expectedOwner: "111122223333",
+			wantErr:       []string{`created bucket "b"`, "111122223333", "AccessDenied"},
+			wantHeadCalls: 1,
+		},
+		"already owned by you, expected owner set, probe ok": {
 			client:        &fakeBucketClient{createErr: apiErr("BucketAlreadyOwnedByYou")},
 			expectedOwner: "111122223333",
+			wantHeadCalls: 1,
+		},
+		"already owned by you, expected owner set, probe 403": {
+			client:        &fakeBucketClient{createErr: apiErr("BucketAlreadyOwnedByYou"), headErr: apiErr("AccessDenied")},
+			expectedOwner: "111122223333",
+			wantErr:       []string{`bucket "b" exists`, "111122223333", "AccessDenied"},
+			wantHeadCalls: 1,
 		},
 		"access denied, bucket reachable": {
 			client:        &fakeBucketClient{createErr: apiErr("AccessDenied")},

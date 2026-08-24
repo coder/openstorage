@@ -807,7 +807,10 @@ type bucketLifecycleClient interface {
 // role for a pre-provisioned bucket has no s3:CreateBucket, so AccessDenied
 // on create is not proof the bucket is missing: probe it with HeadBucket and
 // accept when reachable. Any other create error, or a denied create with an
-// unreachable bucket, stays boot-fatal.
+// unreachable bucket, stays boot-fatal. With an expected bucket owner
+// configured (issue #58), EVERY accepted outcome additionally passes an
+// owner-conditioned HeadBucket probe, so squatted names and
+// credential/account drift fail boot instead of 403ing data operations.
 func (b *S3) EnsureBucket(ctx context.Context) error {
 	assertf(b.client != nil, "EnsureBucket: S3 opened without a client")
 	return ensureBucket(ctx, b.client, b.name, b.expectedOwner)
@@ -815,32 +818,53 @@ func (b *S3) EnsureBucket(ctx context.Context) error {
 
 func ensureBucket(ctx context.Context, client bucketLifecycleClient, name, expectedOwner string) error {
 	assertf(name != "", "ensureBucket: empty bucket name")
+	// The probe's HeadBucket carries x-amz-expected-bucket-owner via the
+	// client middleware whenever an owner is configured.
+	probe := func() error {
+		_, err := client.HeadBucket(ctx, &s3.HeadBucketInput{Bucket: aws.String(name)})
+		return err
+	}
 	_, err := client.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(name)})
 	if err == nil {
+		// Created — but S3 ignores the owner condition on CreateBucket
+		// itself, and the new bucket's owner is the CREDENTIALS' account,
+		// which may not be the configured expected owner (Codex round 1:
+		// credential/account drift). Probe so the mismatch fails boot
+		// here instead of 403ing every later data operation.
+		if expectedOwner == "" {
+			return nil
+		}
+		if headErr := probe(); headErr != nil {
+			return fmt.Errorf("created bucket %q but the expected-owner probe (account %s) failed: %w",
+				name, expectedOwner, headErr)
+		}
 		return nil
 	}
 	var apiErr smithy.APIError
 	if errors.As(err, &apiErr) {
 		switch apiErr.ErrorCode() {
-		case "BucketAlreadyOwnedByYou":
-			return nil
-		case "BucketAlreadyExists":
+		case "BucketAlreadyOwnedByYou", "BucketAlreadyExists":
+			// AlreadyOwnedByYou proves the CREDENTIALS' account owns the
+			// bucket — not that it matches the configured owner (drift,
+			// as above). AlreadyExists means SOME account owns the name —
+			// exactly the squatting scenario the owner condition targets
+			// (issue #58). Without a configured owner both stay accepted
+			// as-is (compatibility); with one, both must pass the
+			// conditioned probe so a reowned or wrong-account bucket
+			// fails boot.
 			if expectedOwner == "" {
 				return nil
 			}
-			// The name is taken by SOME account — exactly the squatting
-			// scenario the owner condition targets (issue #58). AWS
-			// ignores the condition on CreateBucket itself, but the
-			// HeadBucket probe carries x-amz-expected-bucket-owner via
-			// the client middleware, so a reowned bucket fails boot here
-			// instead of 403ing the first data operation.
-			if _, headErr := client.HeadBucket(ctx, &s3.HeadBucketInput{Bucket: aws.String(name)}); headErr != nil {
+			if headErr := probe(); headErr != nil {
 				return fmt.Errorf("bucket %q exists but the expected-owner probe (account %s) failed: %w",
 					name, expectedOwner, headErr)
 			}
 			return nil
 		case "AccessDenied":
-			if _, headErr := client.HeadBucket(ctx, &s3.HeadBucketInput{Bucket: aws.String(name)}); headErr != nil {
+			// Least-privilege roles may lack s3:CreateBucket; the denial
+			// is not proof the bucket is missing. The reachability probe
+			// doubles as the owner check when one is configured.
+			if headErr := probe(); headErr != nil {
 				return fmt.Errorf("create bucket %q denied (%v) and probe failed: %w", name, err, headErr)
 			}
 			return nil

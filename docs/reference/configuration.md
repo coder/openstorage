@@ -91,10 +91,12 @@ purge CLI all share that client seam), so operations against a re-owned bucket f
 - **Default:** unset — no condition parameters are sent; behavior is unchanged.
 - **Format:** exactly 12 digits. Anything else is boot-fatal (a typo'd ID would 403 every
   operation on AWS, so misconfiguration fails fast instead).
-- **Startup:** when set, a `CreateBucket` answered with `BucketAlreadyExists` is no longer
-  accepted blindly — the bucket is probed with `HeadBucket` under the owner condition, so
-  a squatted name fails boot. (AWS ignores the condition on `CreateBucket` itself; that
-  operation cannot carry it.)
+- **Startup:** when set, every accepted `CreateBucket` outcome — success,
+  `BucketAlreadyOwnedByYou`, `BucketAlreadyExists`, or the tolerated `AccessDenied` of a
+  least-privilege role — is followed by a `HeadBucket` probe under the owner condition,
+  so a squatted name *and* credential/account drift (credentials from a different account
+  than the configured owner) both fail boot. (AWS ignores the condition on `CreateBucket`
+  itself; that operation cannot carry it.)
 - **Presigned URLs** (LFS downloads) embed the condition as a signed lowercase
   `x-amz-expected-bucket-owner` query parameter — the spelling S3 enforces on presigned
   requests. The URL stays self-contained (clients send no extra header), and stripping or
