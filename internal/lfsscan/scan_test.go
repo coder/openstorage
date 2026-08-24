@@ -125,6 +125,45 @@ func TestReachableLFSOIDs(t *testing.T) {
 	}
 }
 
+// TestReachableLFSOIDs_IgnoresReplacementRefs (Codex security round 1): a
+// git:write pusher can mint refs/replace/* substitutions WITHOUT moving the
+// protected refs they shadow — replacing a commit with a doctored twin
+// whose tree omits the pointer files would hide their OIDs from a
+// replacement-honoring walk and retire live objects. The walk must read
+// the TRUE objects.
+func TestReachableLFSOIDs_IgnoresReplacementRefs(t *testing.T) {
+	dir := t.TempDir()
+	mustGit(t, dir, "init", "-q", "--initial-branch=main")
+	writeFile(t, dir, "a.bin", lfsPointer(oidA, 100), 0o644)
+	mustGit(t, dir, "add", "-A")
+	mustGit(t, dir, "commit", "-q", "-m", "pointer commit")
+	victim := strings.TrimSpace(mustGit(t, dir, "rev-parse", "HEAD"))
+	pointerBlob := strings.TrimSpace(mustGit(t, dir, "rev-parse", victim+":a.bin"))
+
+	// Doctored twin: same history shape, no pointer file — then a
+	// replacement ref shadowing the victim commit, main unmoved.
+	mustGit(t, dir, "rm", "-q", "a.bin")
+	writeFile(t, dir, "cover.txt", "nothing to see\n", 0o644)
+	mustGit(t, dir, "add", "-A")
+	mustGit(t, dir, "commit", "-q", "-m", "doctored twin")
+	doctored := strings.TrimSpace(mustGit(t, dir, "rev-parse", "HEAD"))
+	mustGit(t, dir, "reset", "-q", "--hard", victim)
+	mustGit(t, dir, "replace", victim, doctored)
+
+	// Sanity: a replacement-honoring walk hides the pointer blob.
+	if honored := mustGit(t, dir, "rev-list", "--objects", "refs/heads/main"); strings.Contains(honored, pointerBlob) {
+		t.Fatalf("fixture broken: replacement did not shadow the pointer blob\n%s", honored)
+	}
+
+	oids, _, err := ReachableLFSOIDs(context.Background(), dir, 1_000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := oids[oidA]; !ok {
+		t.Fatalf("replacement ref hid a reachable pointer OID: %v", oids)
+	}
+}
+
 func TestReachableLFSOIDs_EmptyRepo(t *testing.T) {
 	dir := t.TempDir()
 	mustGit(t, dir, "init", "-q", "--initial-branch=main")
