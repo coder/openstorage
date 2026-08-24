@@ -1926,20 +1926,40 @@ func (s *Server) legacySourceProvenMismatched(ctx context.Context, repoID, legac
 	// applies too (Codex security round 117: the one-shot reservation
 	// checked only the global cap, letting one repository's oversized
 	// mismatch snapshot 429 every other repository's uploads for the
-	// download's whole size-scaled window). A denied budget or share
-	// spares: unknowable is never proof, and the next touch re-examines
-	// under a freer budget.
-	if !s.reserveLFSStaging(repoID, 0) {
-		return false
-	}
+	// download's whole size-scaled window). Contention is PRESSED
+	// through the standard bounded window rather than judged once
+	// (Codex round 118): a one-shot denial spared corrupt legacy bytes
+	// that the imminent verified upload's registration then locks in —
+	// round-89's exists-probe makes every later compat repair skip the
+	// spelling — leaving old replicas serving them for the roll's
+	// remainder after a merely transient busy moment. Persistent
+	// denial through the window still spares: unknowable is never
+	// proof, and the residual equals the background legacy-mutability
+	// exposure (a still-valid presigned PUT can re-corrupt the spelling
+	// at any time regardless).
 	grown := int64(0)
-	defer func() { s.releaseLFSStaging(repoID, grown) }()
-	if size > 0 {
-		if !s.growLFSStaging(repoID, size) {
+	deadline := time.Now().Add(usageCacheTTL + UsageFloorHandoffMargin)
+	for {
+		if s.reserveLFSStaging(repoID, 0) {
+			if size <= 0 {
+				break
+			}
+			if s.growLFSStaging(repoID, size) {
+				grown = size
+				break
+			}
+			s.releaseLFSStaging(repoID, 0)
+		}
+		if ctx.Err() != nil || time.Now().After(deadline) {
 			return false
 		}
-		grown = size
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(ambiguousAccountingRetryInterval):
+		}
 	}
+	defer func() { s.releaseLFSStaging(repoID, grown) }()
 	dir, err := os.MkdirTemp("", "lfs-mismatch-*")
 	if err != nil {
 		return false
