@@ -1068,7 +1068,7 @@ func (s *Server) adoptStoredLFSObject(ctx context.Context, repoID, key, oid stri
 			case ferr == nil && nowFP == memoFP:
 				dctx, dcancel := context.WithTimeout(context.WithoutCancel(ctx), lfsCleanupTimeout)
 				defer dcancel()
-				if s.legacySourceProvenMismatched(dctx, repoID, target, oid) {
+				if m, _ := s.legacySourceProvenMismatched(dctx, repoID, target, oid); m {
 					delCtx, delCancel := context.WithTimeout(context.WithoutCancel(ctx), lfsCleanupTimeout)
 					defer delCancel()
 					if err := s.Blob.Delete(delCtx, target); err != nil && !errors.Is(err, blob.ErrNotFound) {
@@ -1125,7 +1125,7 @@ func (s *Server) adoptStoredLFSObject(ctx context.Context, repoID, key, oid stri
 			// the unchanged corrupt source skip the full re-hash and
 			// press only the budgeted cleanup below.
 			s.rememberLFSMismatch(target, contentFP)
-			if s.legacySourceProvenMismatched(dctx, repoID, target, oid) {
+			if m, _ := s.legacySourceProvenMismatched(dctx, repoID, target, oid); m {
 				// The delete gets its OWN bounded window (Codex round
 				// 116): a size-scaled snapshot can outlive dctx, and a
 				// proven verdict must not lose its delete to the
@@ -1213,7 +1213,7 @@ func (s *Server) adoptStoredLFSObject(ctx context.Context, repoID, key, oid stri
 		// security round 78): a spared survivor is re-copied, re-fails
 		// the digest, and lands back here.
 		legacySrc := blob.LFSLegacyKey(repoID, oid)
-		if s.legacySourceProvenMismatched(dctx, repoID, legacySrc, oid) {
+		if m, _ := s.legacySourceProvenMismatched(dctx, repoID, legacySrc, oid); m {
 			// The delete gets its OWN bounded window (Codex round 116):
 			// a size-scaled snapshot can outlive dctx, and a proven
 			// verdict must not lose its delete to the consumed parent
@@ -2030,11 +2030,13 @@ func (s *Server) forgetLFSMismatch(legacyKey string) {
 // (Codex round 108, P2): the destination's failed digest proves the bytes
 // the copy caught were wrong, not that the source still holds them. Only a
 // fresh digest over one SINGLE stored version is decisive — computed over
-// an atomically downloaded local snapshot (round 115). Errors report
-// false — unknowable state spares, and the next touch re-examines.
+// an atomically downloaded local snapshot (round 115). mismatched is the
+// deletion verdict; decisive separates a PROVEN-VALID version (memo
+// clearing, security round 122) from unknowable state — errors report
+// (false, false), sparing, and the next touch re-examines.
 // Size-scale-bounded; runs only on the rare mismatch path, under the
 // caller's held claim and op slot.
-func (s *Server) legacySourceProvenMismatched(ctx context.Context, repoID, legacyKey, oid string) bool {
+func (s *Server) legacySourceProvenMismatched(ctx context.Context, repoID, legacyKey, oid string) (mismatched, decisive bool) {
 	// SINGLE-VERSION snapshot by construction (Codex round 115): chunked
 	// ranged reads can interleave with legacy PUTs, and content-derived
 	// fingerprints are ABA-blind (A→B→A restores the fingerprint around
@@ -2057,7 +2059,7 @@ func (s *Server) legacySourceProvenMismatched(ctx context.Context, repoID, legac
 	size, perr := s.Blob.Stat(pctx, legacyKey)
 	pcancel()
 	if perr != nil {
-		return false // absent or unknowable spares; the next touch re-examines
+		return false, false // absent or unknowable spares; the next touch re-examines
 	}
 	// The snapshot is real replica disk: charge it to the staging budget
 	// like every proxy transfer (Codex round 116, P1) — bytes grown
@@ -2080,11 +2082,11 @@ func (s *Server) legacySourceProvenMismatched(ctx context.Context, repoID, legac
 		deadline := time.Now().Add(usageCacheTTL + UsageFloorHandoffMargin)
 		for !s.growLFSStaging(repoID, size) {
 			if ctx.Err() != nil || time.Now().After(deadline) {
-				return false
+				return false, false
 			}
 			select {
 			case <-ctx.Done():
-				return false
+				return false, false
 			case <-time.After(ambiguousAccountingRetryInterval):
 			}
 		}
@@ -2092,7 +2094,7 @@ func (s *Server) legacySourceProvenMismatched(ctx context.Context, repoID, legac
 	}
 	dir, err := os.MkdirTemp("", "lfs-mismatch-*")
 	if err != nil {
-		return false
+		return false, false
 	}
 	defer os.RemoveAll(dir)
 	snap := filepath.Join(dir, "snap")
@@ -2107,18 +2109,21 @@ func (s *Server) legacySourceProvenMismatched(ctx context.Context, repoID, legac
 	derr := s.Blob.DownloadFileCapped(dctx, legacyKey, snap, size)
 	dcancel()
 	if derr != nil {
-		return false // unknowable state spares; the next touch re-examines
+		return false, false // unknowable state spares; the next touch re-examines
 	}
 	f, ferr := os.Open(snap)
 	if ferr != nil {
-		return false
+		return false, false
 	}
 	defer f.Close()
 	h := sha256.New()
 	if _, cerr := io.Copy(h, f); cerr != nil {
-		return false
+		return false, false
 	}
-	return hex.EncodeToString(h.Sum(nil)) != oid
+	if hex.EncodeToString(h.Sum(nil)) == oid {
+		return false, true // proven VALID: this version is the true object
+	}
+	return true, true
 }
 
 // withRenewedAdoptionClaim runs op while renewing the fleet claim for key
@@ -3398,7 +3403,7 @@ func (s *Server) ensureLegacyCompat(ctx context.Context, repoID, oid, key string
 	}
 	legacyKey := blob.LFSLegacyKey(repoID, oid)
 	lctx, lcancel := context.WithTimeout(context.WithoutCancel(ctx), lfsProbeTimeout)
-	_, legacyFP, lerr := s.Blob.StatFingerprint(lctx, legacyKey)
+	_, lerr := s.Blob.Stat(lctx, legacyKey)
 	lcancel()
 	switch {
 	case lerr == nil:
@@ -3412,13 +3417,20 @@ func (s *Server) ensureLegacyCompat(ctx context.Context, repoID, oid, key string
 		// a deletion falls through to the bridge repair below, which
 		// republishes verified canonical bytes. A still-spared verdict
 		// keeps the memo for the next touch.
-		memoFP, ok := s.lfsMismatchMemo(legacyKey)
-		if !ok || memoFP != legacyFP {
-			if ok {
-				s.forgetLFSMismatch(legacyKey) // replaced: prove in full next time
-			}
+		if _, ok := s.lfsMismatchMemo(legacyKey); !ok {
 			return nil // the spelling exists: nothing to converge
 		}
+		// A pending memo is cleared ONLY by a decisive verdict on the
+		// CURRENT version (Codex security round 122): the previous
+		// moved-fingerprint arm dropped the memo and returned success,
+		// so replacing memoized corrupt bytes with DIFFERENT corrupt
+		// bytes was accepted unverified forever — no later touch had a
+		// memo to consult. The single-version snapshot below hashes
+		// whatever stands now: proven wrong deletes and re-bridges,
+		// proven valid clears the memo (the true object converged —
+		// also what stops a stale memo from re-hashing a healthy
+		// object on every touch), and unknowable keeps the marker
+		// pending for the next touch.
 		// The registered fast paths reach here with NO op slot and NO
 		// per-key guard (Codex round 122): concurrent batches for this
 		// OID would each launch a snapshot download, bypassing
@@ -3438,8 +3450,12 @@ func (s *Server) ensureLegacyCompat(ctx context.Context, repoID, oid, key string
 		defer s.releaseLFSStaging(repoID, 0)
 		dctx, dcancel := context.WithTimeout(context.WithoutCancel(ctx), lfsCleanupTimeout)
 		defer dcancel()
-		if !s.legacySourceProvenMismatched(dctx, repoID, legacyKey, oid) {
-			return nil // spared again; the memo stands for the next touch
+		switch m, decisive := s.legacySourceProvenMismatched(dctx, repoID, legacyKey, oid); {
+		case !decisive:
+			return nil // spared; the memo stands pending for the next touch
+		case !m:
+			s.forgetLFSMismatch(legacyKey)
+			return nil // proven VALID: the true object converged
 		}
 		delCtx, delCancel := context.WithTimeout(context.WithoutCancel(ctx), lfsCleanupTimeout)
 		defer delCancel()
