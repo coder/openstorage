@@ -829,17 +829,34 @@ func (s *Server) adoptStoredLFSObject(ctx context.Context, repoID, key, oid stri
 		return err
 	}
 	if registered && !restore {
-		// A prior attempt's registration may have committed after
-		// its bounded context expired (indeterminate failure), with
-		// the lease parked for a retry that now has nothing to do
-		// (Codex round 76): free the memo and its lease.
-		s.dropLFSVerifyResume(key)
-		// The registered fast path is the ONLY path retries of a
-		// stored object ever reach, so bridge convergence lives here
-		// (Codex round 83): a compat copy that failed after
-		// registration is repaired by the next write-scoped touch
-		// instead of 404ing on old replicas forever.
-		return s.ensureLegacyCompat(ctx, repoID, oid, key)
+		// Liveness handshake (issue #73, review round 1): this fast path
+		// answers every direct PUT of an already-stored object, and a 200
+		// promises the client it may commit a pointer referencing the
+		// OID — clear the reclamation mark FIRST, exactly like the batch
+		// "stored" answer, so a grace-expired mark cannot let the
+		// reclaimer retire the row before the client pushes. touched=false
+		// means the reclaimer retired the row between the registry read
+		// above and here: fall through to the full adoption below, which
+		// re-verifies the stored bytes and mints a fresh registered row
+		// instead of promising a vanished one.
+		touched, terr := s.Store.TouchLFSObject(ctx, repoID, key)
+		if terr != nil {
+			return terr
+		}
+		if touched {
+			// A prior attempt's registration may have committed after
+			// its bounded context expired (indeterminate failure), with
+			// the lease parked for a retry that now has nothing to do
+			// (Codex round 76): free the memo and its lease.
+			s.dropLFSVerifyResume(key)
+			// The registered fast path is the ONLY path retries of a
+			// stored object ever reach, so bridge convergence lives here
+			// (Codex round 83): a compat copy that failed after
+			// registration is repaired by the next write-scoped touch
+			// instead of 404ing on old replicas forever.
+			return s.ensureLegacyCompat(ctx, repoID, oid, key)
+		}
+		registered = false
 	}
 	// Fast-fail the object cap BEFORE the verification download (Codex
 	// security round 4): an at-cap repository holding a rowless legacy
