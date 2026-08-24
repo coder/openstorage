@@ -1699,11 +1699,20 @@ func (s *Server) publishVerifiedLFSObject(ctx context.Context, repoID, key, lega
 		lcancel()
 		if lerr != nil || !renewed {
 			if errors.Is(copyErr, blob.ErrCoverContinuityLost) {
-				// No claim, no delete — but a lost COVER's accounting is
-				// key-independent and must still recover (security round
-				// 107): the successor (or a later retry) registers these
-				// bytes without re-admission.
-				s.ensureAmbiguousCommitAccounting(dctx, repoID, key, size, nil)
+				// Cover AND claim lost around a committed copy (Codex
+				// round 113, P1): accounting alone is not recovery — a
+				// gap admission may already have settled, and once the
+				// expired claim leaves the rowless bytes unowned, any
+				// later toucher registers them WITHOUT re-admission via
+				// the crashed-adoption path. Press to REACQUIRE the
+				// claim through the floor window and prove deletion or
+				// registration under it; only an unproven window falls
+				// back to accounting (a LIVE successor holding the claim
+				// resolves the key itself: registration counts the
+				// bytes, and its own cover-loss handling deletes them).
+				if !s.reclaimUncoveredCommit(dctx, repoID, key) {
+					s.ensureAmbiguousCommitAccounting(dctx, repoID, key, size, nil)
+				}
 			}
 			return fmt.Errorf("adoption publish %s: %w", key, copyErr)
 		}
@@ -1805,6 +1814,54 @@ func (s *Server) uncoveredCleanupProven(ctx context.Context, repoID, key string)
 		}
 		if ctx.Err() != nil {
 			return false, false
+		}
+	}
+}
+
+// reclaimUncoveredCommit handles the round-113 double loss — cover AND
+// claim gone around a committed canonical copy: it presses to REACQUIRE
+// the fleet claim through the pre-copy floor window and, once held, proves
+// the cleanup verdict under it (mutual exclusion holds again — no
+// successor's publish/verify/register region can be live while we own the
+// claim). A denial means a LIVE holder owns the key: its registration
+// counts the bytes and its own cover-loss handling deletes them, so a
+// registered row observed while waiting is equally proof. Returns false
+// only when the window closes with nothing proven.
+func (s *Server) reclaimUncoveredCommit(ctx context.Context, repoID, key string) bool {
+	deadline := time.Now().Add(usageCacheTTL + UsageFloorHandoffMargin)
+	for {
+		cctx, ccancel := context.WithTimeout(ctx, lfsClaimRenewTimeout)
+		claimed, owner, err := s.Store.TryAdoptionClaim(cctx, repoID, key)
+		ccancel()
+		switch {
+		case err != nil:
+			log.Printf("lfs adopt %s: reclaim uncovered commit: %v", key, err)
+		case claimed:
+			proven, _ := s.uncoveredCleanupProven(ctx, repoID, key)
+			rctx, rcancel := context.WithTimeout(context.WithoutCancel(ctx), lfsClaimRenewTimeout)
+			if rerr := s.Store.ReleaseAdoptionClaim(rctx, key, owner); rerr != nil {
+				log.Printf("lfs adopt %s: release reclaimed claim: %v", key, rerr)
+			}
+			rcancel()
+			return proven
+		default:
+			// Held by a live successor: a registration landing while we
+			// wait is terminal proof (its atomic credit counts the
+			// bytes).
+			hctx, hcancel := context.WithTimeout(ctx, lfsProbeTimeout)
+			registered, herr := s.Store.HasLFSObject(hctx, repoID, key)
+			hcancel()
+			if herr == nil && registered {
+				return true
+			}
+		}
+		if time.Now().After(deadline) || ctx.Err() != nil {
+			return false
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(ambiguousAccountingRetryInterval):
 		}
 	}
 }

@@ -2477,6 +2477,73 @@ func TestLFSAdopt_MismatchCleanupSparesRestoredSource(t *testing.T) {
 	}
 }
 
+// claimLosingOutageStore simulates the round-113 double loss: unbounded
+// cover renewals fail (outage spanning the continuity budget) until the
+// claim loss lands, and the SECOND claim renewal — the copy-error
+// branch's post-commit probe (the first is doCopy's pre-copy lease
+// fence, which must succeed for the copy to run at all) — reports the
+// claim LOST and really releases the underlying row: an expiry/takeover
+// whose successor then crashed, so reacquisition is possible and later
+// accounting can land.
+type claimLosingOutageStore struct {
+	ref.RefStore
+	renews atomic.Int32
+	lost   atomic.Bool
+}
+
+func (s *claimLosingOutageStore) ReservePackBytes(ctx context.Context, group []string, packs []ref.Pack, owner string, floor, floorGen, quota int64, ttl time.Duration) (ref.ReserveDecision, error) {
+	if quota == math.MaxInt64 && !s.lost.Load() {
+		return ref.ReserveDecision{}, fmt.Errorf("simulated cover-renewal outage")
+	}
+	return s.RefStore.ReservePackBytes(ctx, group, packs, owner, floor, floorGen, quota, ttl)
+}
+
+func (s *claimLosingOutageStore) RenewAdoptionClaim(ctx context.Context, key, owner string) (bool, error) {
+	if s.renews.Add(1) == 2 {
+		s.lost.Store(true)
+		_ = s.RefStore.ReleaseAdoptionClaim(ctx, key, owner)
+		return false, nil
+	}
+	return s.RefStore.RenewAdoptionClaim(ctx, key, owner)
+}
+
+// TestLFSAdopt_LostClaimUncoveredCommitReclaimed (Codex round 113, P1):
+// when a canonical copy commits after BOTH the cover and the claim are
+// lost, the lost-claim arm previously created new accounting and returned
+// — but accounting cannot revoke a gap admission, and the unowned rowless
+// bytes are later registered WITHOUT re-admission by any toucher via the
+// crashed-adoption path. The arm must press to reacquire the claim and
+// prove deletion (or registration) under it. Runs the real ~45s budget.
+func TestLFSAdopt_LostClaimUncoveredCommitReclaimed(t *testing.T) {
+	if testing.Short() {
+		t.Skip("runs the real ~45s cover-continuity budget")
+	}
+	ctx := context.Background()
+	srv, st, _ := newLFSQuotaServer(t, 1<<20, time.Hour)
+	content := []byte("double loss: cover and claim")
+	oid := sha256Hex(content)
+	key := blob.LFSKey(lfsTestRepoID, oid)
+	if err := srv.Blob.UploadFile(ctx, blob.LFSLegacyKey(lfsTestRepoID, oid), writeTempFile(t, content)); err != nil {
+		t.Fatal(err)
+	}
+	srv.Store = &claimLosingOutageStore{RefStore: st}
+	srv.Blob = &commitAfterCancelBlob{BlobStore: srv.Blob, dst: key}
+
+	aerr := srv.adoptLFSObject(ctx, lfsTestRepoID, key, oid)
+	if aerr == nil {
+		t.Fatal("adoption accepted a cover-canceled commit on a lost claim")
+	}
+	if !errors.Is(aerr, blob.ErrCoverContinuityLost) {
+		t.Fatalf("adoption error = %v, want the cover-loss verdict (the scenario must reach the lost-claim arm of the cover-loss branch)", aerr)
+	}
+	if has, err := st.HasLFSObject(ctx, lfsTestRepoID, key); err != nil || has {
+		t.Fatalf("registered = (%v, %v), want not registered", has, err)
+	}
+	if _, err := srv.Blob.Stat(ctx, key); err == nil {
+		t.Fatal("unowned uncovered destination retained — any later toucher registers it without re-admission")
+	}
+}
+
 // TestLFSCompat_RepairSerializedOnLegacyClaim (Codex security round 85):
 // the batch fast path's bridge repair launched an unserialized full copy —
 // every tiny concurrent touch of the object started another one. Compat
