@@ -1014,15 +1014,24 @@ func (s *Server) adoptLFSObject(ctx context.Context, repoID, key, oid string) er
 		dctx, dcancel := context.WithTimeout(context.WithoutCancel(ctx), lfsCleanupTimeout)
 		defer dcancel()
 		if target != key {
-			// The legacy SOURCE is provably wrong for its content
-			// address (readers of the rowless object are being served
-			// garbage): remove it, unguarded — the legacy spelling is
-			// never registered — so the next touch cannot re-verify the
-			// same bytes. The canonical key was never written.
-			if err := s.Blob.Delete(dctx, target); err != nil && !errors.Is(err, blob.ErrNotFound) {
-				return fmt.Errorf("remove mismatched legacy object %s: %w", target, err)
+			// The hash just proved the bytes IT READ wrong — but a
+			// still-valid legacy presigned PUT can replace them with the
+			// correct object between the hash and this delete (Codex
+			// round 110, the source twin of round 108's
+			// destination-mismatch guard): deleting unconditionally would
+			// remove the newly valid — and potentially only — copy,
+			// 404ing old replicas and outstanding downloads. Re-hash the
+			// CURRENT content and delete only bytes still proven
+			// mismatched; a spared survivor converges via the next
+			// touch's verification. The canonical key was never written.
+			if s.legacySourceProvenMismatched(dctx, target, oid) {
+				if err := s.Blob.Delete(dctx, target); err != nil && !errors.Is(err, blob.ErrNotFound) {
+					return fmt.Errorf("remove mismatched legacy object %s: %w", target, err)
+				}
+				log.Printf("lfs adopt %s: removed legacy blob failing content verification", key)
+			} else {
+				log.Printf("lfs adopt %s: sparing legacy source not proven mismatched", key)
 			}
-			log.Printf("lfs adopt %s: removed legacy blob failing content verification", key)
 			return errLFSContentMismatch
 		}
 		// Canonical-bytes mismatch. Cross-replica coordination (Codex

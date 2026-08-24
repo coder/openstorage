@@ -2381,6 +2381,54 @@ func TestLFSAdopt_UncoveredCleanupRetriesUntilProven(t *testing.T) {
 	}
 }
 
+// forgedFirstReadBlob serves length-matched forged bytes for the FIRST
+// ranged read only — the verification hash reads a mismatching object that
+// a presigned PUT then restores before the cleanup re-examines it.
+type forgedFirstReadBlob struct {
+	blob.BlobStore
+	served atomic.Bool
+}
+
+func (b *forgedFirstReadBlob) ReadRange(ctx context.Context, key string, offset, length int64) ([]byte, error) {
+	chunk, err := b.BlobStore.ReadRange(ctx, key, offset, length)
+	if err == nil && !b.served.Swap(true) {
+		forged := bytes.Repeat([]byte("z"), len(chunk))
+		return forged, nil
+	}
+	return chunk, err
+}
+
+// TestLFSAdopt_SourceMismatchCleanupSparesRestoredSource (Codex round 110,
+// the source twin of round 108's destination-mismatch guard): the initial
+// source verification proves only the bytes IT READ wrong — a still-valid
+// legacy presigned PUT can restore the correct object between the hash and
+// the cleanup delete, and the unconditional delete removed that newly
+// valid, potentially only, copy. The cleanup must re-hash the CURRENT
+// source and delete only bytes still proven mismatched.
+func TestLFSAdopt_SourceMismatchCleanupSparesRestoredSource(t *testing.T) {
+	ctx := context.Background()
+	srv, st, _ := newLFSQuotaServer(t, 0, time.Hour)
+	content := []byte("restored by a presigned PUT mid-cleanup")
+	oid := sha256Hex(content)
+	key := blob.LFSKey(lfsTestRepoID, oid)
+	legacyKey := blob.LFSLegacyKey(lfsTestRepoID, oid)
+	if err := srv.Blob.UploadFile(ctx, legacyKey, writeTempFile(t, content)); err != nil {
+		t.Fatal(err)
+	}
+	srv.Blob = &forgedFirstReadBlob{BlobStore: srv.Blob}
+
+	aerr := srv.adoptLFSObject(ctx, lfsTestRepoID, key, oid)
+	if !errors.Is(aerr, errLFSContentMismatch) {
+		t.Fatalf("adoption of a mismatching-then-restored source = %v, want errLFSContentMismatch", aerr)
+	}
+	if has, err := st.HasLFSObject(ctx, lfsTestRepoID, key); err != nil || has {
+		t.Fatalf("registered = (%v, %v), want not registered", has, err)
+	}
+	if _, err := srv.Blob.Stat(ctx, legacyKey); err != nil {
+		t.Fatalf("restored legacy source deleted by the source-mismatch cleanup: %v — it was the object's only valid copy", err)
+	}
+}
+
 // forgeOnCopyBlob simulates the ABA the destination re-verification
 // exists for: the copy "catches" forged interim bytes — the destination
 // receives them — while the source's good content stands (a presigned PUT
