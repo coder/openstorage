@@ -274,6 +274,14 @@ func (r *LFSReclaimer) reclaimRepo(ctx context.Context, base string, budget int6
 		if len(refs) == 0 {
 			continue // nothing reachable, no cache needed
 		}
+		if walked >= budget {
+			// An earlier member consumed the whole remainder, and the
+			// walker (rightly) asserts a positive budget (Codex round 3).
+			// Surface the verdict a mid-walk abort would have produced —
+			// the caller defers or skips the repo — without hydrating a
+			// member whose walk could not even start.
+			return walked, fmt.Errorf("walk %s: %w (budget %d)", member, lfsscan.ErrLFSScanBudget, budget)
+		}
 		repoPath, err := r.hydrate(ctx, member, branch)
 		if err != nil {
 			return walked, fmt.Errorf("hydrate %s: %w", member, err)

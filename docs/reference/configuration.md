@@ -695,6 +695,11 @@ until the eligible rows are the junk you expect, then opt in.
 - **Default:** `false`. **Constraints:** must parse as a boolean; requires
   [`CODESTORAGE_LFS_GC_INTERVAL`](#codestorage_lfs_gc_interval) > 0 (arming a
   disabled job is a startup error).
+- **Mixed-fleet prerequisite:** every replica serving LFS requests must run a
+  build with this feature before retirement is armed — older replicas answer
+  "already stored" without clearing the reclamation stamp, so a grace-expired
+  row could retire before that client pushes its pointer. See
+  [the rollout guidance](../how-to/storage-lifecycle-and-sweeping.md#reclaiming-unreferenced-lfs-objects).
 
 ### `CODESTORAGE_LFS_MAX_OBJECTS_PER_REPO`
 

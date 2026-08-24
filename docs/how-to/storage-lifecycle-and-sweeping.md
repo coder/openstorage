@@ -406,6 +406,15 @@ Two operational notes:
   (`CODESTORAGE_SWEEP_DELETE_LFS`, plus the ADR-41 legacy gate for
   v0.2.0-spelled keys). With sweeping or its LFS gates off, counts and quota
   converge anyway — only the physical bytes wait.
+- **Upgrade the whole fleet first.** The grace guarantee depends on every
+  serving replica clearing the reclamation stamp when it answers "already
+  stored" on the batch/PUT surfaces. A pre-reclamation replica answers
+  without clearing, so a client it just told "stored" can lose the row to a
+  retirement racing its pointer push — and report-only mode on the workers
+  does not close that race. Do not set `CODESTORAGE_LFS_GC_DELETE_ENABLED`
+  until every replica serving LFS requests runs a build with this feature
+  (mixed-fleet staging, same as the
+  [sweep delete flags](#the-orphan-sweeper)).
 - **Stage the rollout.** Leave `CODESTORAGE_LFS_GC_DELETE_ENABLED` off first
   and watch the run reports: `rows_eligible` is what a delete-enabled run
   would have retired. An actively abusive writer can keep re-uploading junk

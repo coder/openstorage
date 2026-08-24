@@ -339,6 +339,53 @@ func TestLFSReclaim_BudgetResumesNextRun(t *testing.T) {
 	}
 }
 
+// TestLFSReclaim_ExactExhaustionBetweenMembers (Codex round 3): when one
+// namespace-group member's walk consumes EXACTLY the remaining budget and a
+// later member also has refs, the reclaimer must surface the over-budget
+// verdict instead of hydrating that member and calling the walker with a
+// zero budget — the walker asserts budget > 0, and that panic would kill the
+// local-mode server process.
+func TestLFSReclaim_ExactExhaustionBetweenMembers(t *testing.T) {
+	ctx := context.Background()
+	store, reg := newReclaimStore(t)
+	base := "exact-repo"
+	junk := "lfs/" + base + "/o2/" + strings.Repeat("ab", 32)
+	if err := store.RegisterLFSObject(ctx, base, junk, 10); err != nil {
+		t.Fatal(err)
+	}
+	// Both the base member and its +ephemeral twin hold refs.
+	for _, member := range []string{base, base + "+ephemeral"} {
+		if won, err := store.CASRef(ctx, member, "refs/heads/main", ref.ZeroSHA, strings.Repeat("66", 20)); err != nil || !won {
+			t.Fatalf("CASRef %s = (%v, %v)", member, won, err)
+		}
+	}
+	// Only the base member gets a fixture: the ephemeral member must never
+	// be hydrated once the remainder hits zero (staticHydrate fails the
+	// test on any unexpected hydration).
+	fixtures := map[string]string{base: reclaimFixture(t)}
+	// The budget exactly matches the base member's walk, so the remainder
+	// is zero when the ephemeral member comes up.
+	_, exact, err := lfsscan.ReachableLFSOIDs(ctx, fixtures[base], 1_000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := testReclaimer(t, reg, staticHydrate(t, fixtures), time.Hour, exact, true)
+
+	rep, err := r.Run(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The group needs more than a full budget, so it is skipped loudly with
+	// no row touched — and above all, nothing panicked.
+	if rep.ReposOverBudget != 1 || rep.ReposScanned != 0 || rep.RowsMarked != 0 {
+		t.Fatalf("exact-exhaustion run = %+v, want over-budget skip", rep)
+	}
+	rows, err := reg.ListRepoLFSObjects(ctx, base, "", 10)
+	if err != nil || len(rows) != 1 || !rows[0].UnreferencedSince.IsZero() {
+		t.Fatalf("rows after exact-exhaustion run = (%+v, %v), want untouched", rows, err)
+	}
+}
+
 // TestLFSReclaim_PurgedRepoSkipped: purge-fenced repos are the purge
 // pipeline's problem; the reclaimer never hydrates or touches them.
 func TestLFSReclaim_PurgedRepoSkipped(t *testing.T) {
