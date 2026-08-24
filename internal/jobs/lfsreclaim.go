@@ -125,6 +125,14 @@ const (
 	// bounded CPU per pass; the wall-clock deadline hard-caps it like the
 	// hydration deadline, deferring the repo with an error.
 	lfsReclaimWalkTimeout = 10 * time.Minute
+	// lfsReclaimPassTimeout bounds one whole reclamation pass (Codex
+	// round 19): the per-member deadlines reset for every repository, and
+	// a deadline-expired walk charges almost no budget — many wedged
+	// repositories could otherwise hold one pass for ten minutes each.
+	// The pass cap ends the run with an error; the rotation cursor
+	// resumes strictly after the last attempted repository, so successive
+	// bounded passes still make fair progress across the fleet.
+	lfsReclaimPassTimeout = time.Hour
 )
 
 // LFSReclaimer runs the reclamation scan. Construct with NewLFSReclaimer;
@@ -141,6 +149,7 @@ type LFSReclaimer struct {
 	now            func() time.Time // injectable clock for tests
 	hydrateTimeout time.Duration    // per-member cap, shrinkable in tests
 	walkTimeout    time.Duration    // per-member walk cap, shrinkable in tests
+	passTimeout    time.Duration    // whole-pass cap, shrinkable in tests
 	// cursor is the last base repo a run attempted (successful or not):
 	// each run resumes strictly after it and wraps on exhaustion, so a
 	// failing or over-budget repo cannot monopolize every run (the
@@ -176,6 +185,7 @@ func NewLFSReclaimer(registry LFSReclaimRegistry, hydrate HydrateFunc, walk LFSW
 		now:            time.Now,
 		hydrateTimeout: lfsReclaimHydrateTimeout,
 		walkTimeout:    lfsReclaimWalkTimeout,
+		passTimeout:    lfsReclaimPassTimeout,
 		rowCursors:     make(map[string]string),
 	}
 }
@@ -187,6 +197,12 @@ func NewLFSReclaimer(registry LFSReclaimRegistry, hydrate HydrateFunc, walk LFSW
 // so the job backend records them.
 func (r *LFSReclaimer) Run(ctx context.Context) (LFSReclaimReport, error) {
 	report := LFSReclaimReport{DryRun: !r.deleteEnabled}
+	// Whole-pass wall-clock cap (Codex round 19): per-member deadlines
+	// reset per repository and deadline-expired walks charge almost no
+	// budget, so time — not just work units — must bound the pass.
+	assertf(r.passTimeout > 0, "Run: non-positive pass timeout %v", r.passTimeout)
+	ctx, cancelPass := context.WithTimeout(ctx, r.passTimeout)
+	defer cancelPass()
 	budget := r.objectBudget
 	var errs boundedErrs
 	cursor := r.cursor
