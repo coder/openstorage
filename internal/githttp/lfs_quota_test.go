@@ -2174,6 +2174,76 @@ func TestLFSAdopt_UncoveredGapCommitRejected(t *testing.T) {
 	}
 }
 
+// uncoveredCleanupOutageStore forces the round-107 shape: cover renewals
+// fail (an outage spanning the continuity budget) until the uncovered-copy
+// cleanup runs, whose guarded delete then errors — an INDETERMINATE
+// outcome with the bytes still present. The outage lifts afterwards, so
+// the accounting recovery's own cover can land.
+type uncoveredCleanupOutageStore struct {
+	ref.RefStore
+	cleanupRan atomic.Bool
+}
+
+func (s *uncoveredCleanupOutageStore) ReservePackBytes(ctx context.Context, group []string, packs []ref.Pack, owner string, floor, floorGen, quota int64, ttl time.Duration) (ref.ReserveDecision, error) {
+	if quota == math.MaxInt64 && !s.cleanupRan.Load() {
+		return ref.ReserveDecision{}, fmt.Errorf("simulated cover-renewal outage")
+	}
+	return s.RefStore.ReservePackBytes(ctx, group, packs, owner, floor, floorGen, quota, ttl)
+}
+
+func (s *uncoveredCleanupOutageStore) GuardedLFSDelete(ctx context.Context, repo, key string, del func(context.Context) error) (bool, error) {
+	s.cleanupRan.Store(true)
+	return false, fmt.Errorf("simulated indeterminate cleanup outcome")
+}
+
+// TestLFSAdopt_IndeterminateCleanupRecoversAccounting (Codex round 107,
+// P1 — the adoption twin of round 106's compat recovery): when the
+// uncovered-gap cleanup's guarded delete ERRORS, the outcome is
+// indeterminate — the rowless canonical bytes may remain, and the
+// crashed-adoption retry registers them without any copy admission, so
+// leaving them unaccounted lets physical usage exceed quota for the whole
+// stale-floor window. The failure path must recover the accounting: a
+// fresh cover plus the fleet floor invalidation before the error returns.
+// Runs the real ~45s cover-continuity budget.
+func TestLFSAdopt_IndeterminateCleanupRecoversAccounting(t *testing.T) {
+	if testing.Short() {
+		t.Skip("runs the real ~45s cover-continuity budget")
+	}
+	ctx := context.Background()
+	srv, st, _ := newLFSQuotaServer(t, 1<<20, time.Hour)
+	content := []byte("indeterminate cleanup keeps the charge")
+	oid := sha256Hex(content)
+	key := blob.LFSKey(lfsTestRepoID, oid)
+	if err := srv.Blob.UploadFile(ctx, blob.LFSLegacyKey(lfsTestRepoID, oid), writeTempFile(t, content)); err != nil {
+		t.Fatal(err)
+	}
+	srv.Store = &uncoveredCleanupOutageStore{RefStore: st}
+	preGen, err := st.LFSAdoptionGen(ctx, lfsTestRepoID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if aerr := srv.adoptLFSObject(ctx, lfsTestRepoID, key, oid); aerr == nil {
+		t.Fatal("adoption accepted an uncovered-gap copy")
+	}
+	if has, err := st.HasLFSObject(ctx, lfsTestRepoID, key); err != nil || has {
+		t.Fatalf("registered = (%v, %v), want not registered", has, err)
+	}
+	// The delete never provably ran: the canonical bytes remain — the
+	// recovery must cover their charge AND invalidate cached floors (the
+	// generation bump is the recovery's observable handoff; nothing else
+	// on this failure path bumps it).
+	if _, err := srv.Blob.Stat(ctx, key); err != nil {
+		t.Fatalf("canonical bytes unexpectedly gone: %v", err)
+	}
+	if ls := ledgerState(t, st, time.Hour); ls.ReservedBytes < int64(len(content)) {
+		t.Fatalf("reserved after an indeterminate cleanup = %d, want >= %d — the retained bytes must stay covered until floors refresh", ls.ReservedBytes, len(content))
+	}
+	if gen, err := st.LFSAdoptionGen(ctx, lfsTestRepoID); err != nil || gen == preGen {
+		t.Fatalf("adoption gen after an indeterminate cleanup = (%d -> %d, %v), want bumped — stale floors would hide the retained bytes otherwise", preGen, gen, err)
+	}
+}
+
 // TestLFSCompat_RepairSerializedOnLegacyClaim (Codex security round 85):
 // the batch fast path's bridge repair launched an unserialized full copy —
 // every tiny concurrent touch of the object started another one. Compat

@@ -1672,6 +1672,21 @@ func (s *Server) publishVerifiedLFSObject(ctx context.Context, repoID, key, lega
 			return nil
 		}); derr != nil {
 			log.Printf("lfs adopt %s: uncovered-copy cleanup: %v", key, derr)
+			// An ERRORED delete is indeterminate (Codex round 107, P1 —
+			// the adoption twin of round 106's compat recovery): the
+			// rowless bytes may remain, and the crashed-adoption retry
+			// registers them WITHOUT any copy admission — another writer
+			// may have settled into the uncovered gap, so accepting them
+			// unaccounted leaves physical usage above quota. Recover the
+			// accounting the lost cover abandoned before failing: block
+			// until a fresh cover and the fleet floor invalidation land,
+			// or every pre-copy floor has expired. (A DECLINED delete
+			// needs none of this — it means a registration landed, whose
+			// atomic credit already counts the bytes.)
+			s.ensureAmbiguousCommitAccounting(dctx, repoID, key, size, func(bctx context.Context) error {
+				return s.Store.BumpLFSAdoptionGen(bctx, BaseRepo(repoID))
+			})
+			s.invalidateUsageFloor(repoID)
 		}
 		return fmt.Errorf("adoption publish %s: cover continuity lost: %w", key, renewErr)
 	}
