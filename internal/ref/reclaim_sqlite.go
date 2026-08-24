@@ -127,12 +127,24 @@ func (s *SQLite) RetireUnreferencedLFSObject(ctx context.Context, repo, key stri
 			return false, nil // refs moved since the scan: verdict is stale
 		}
 	}
+	// SQLite stamps marks and evaluates "now" at whole-second resolution
+	// (unixepoch()), and both FLOOR: a mark minted at T.999 reads as T, so
+	// a naive elapsed check undercuts the window by up to a second — and
+	// plain integer division would truncate a sub-second grace to zero
+	// outright, retiring freshly marked rows immediately (Codex round 4).
+	// Rounding the grace up and demanding one extra elapsed second makes
+	// the real elapsed time strictly exceed the configured grace. Zero
+	// stays zero: that caller explicitly waives the window.
+	graceSecs := int64(0)
+	if grace > 0 {
+		graceSecs = (int64(grace)+int64(time.Second)-1)/int64(time.Second) + 1
+	}
 	var bytes int64
 	switch err := tx.QueryRowContext(ctx, `
 DELETE FROM lfs_objects WHERE repo = ? AND key = ?
   AND unreferenced_since IS NOT NULL
   AND unreferenced_since <= unixepoch() - ?
-RETURNING bytes`, repo, key, int64(grace/time.Second)).Scan(&bytes); {
+RETURNING bytes`, repo, key, graceSecs).Scan(&bytes); {
 	case errors.Is(err, sql.ErrNoRows):
 		return false, nil // touched, re-registered, or already retired
 	case err != nil:

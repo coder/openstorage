@@ -150,7 +150,9 @@ func TestLFSReclaim_EndToEnd(t *testing.T) {
 
 	// Pass 2 after the grace window: junk rows retire, the referenced row
 	// survives, the count converges.
-	time.Sleep(grace + 1100*time.Millisecond) // SQLite marks have 1s resolution
+	// SQLite stamps marks at whole-second resolution and the guard demands
+	// strictly more than the (rounded-up) grace: two boundary crossings.
+	time.Sleep(grace + 2100*time.Millisecond)
 	rep, err = r.Run(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -336,6 +338,37 @@ func TestLFSReclaim_BudgetResumesNextRun(t *testing.T) {
 		if err != nil || len(rows) != 1 || rows[0].UnreferencedSince.IsZero() {
 			t.Fatalf("%s rows = (%+v, %v), want marked", base, rows, err)
 		}
+	}
+}
+
+// TestLFSReclaim_SettlementChargesBudget (Codex round 4): settlement work is
+// attacker-scaled too — a ref-less repo walks zero objects yet can hold a
+// cap's worth of registry rows, each potentially one retirement transaction.
+// Examined rows charge the run budget, so one pass touches at most budget
+// rows and surfaces the budget verdict for the rest.
+func TestLFSReclaim_SettlementChargesBudget(t *testing.T) {
+	ctx := context.Background()
+	store, reg := newReclaimStore(t)
+	base := "settle-repo"
+	for _, b := range []string{"aa", "bb", "cc", "dd", "ee"} {
+		key := "lfs/" + base + "/o2/" + strings.Repeat(b, 32)
+		if err := store.RegisterLFSObject(ctx, base, key, 10); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// No refs anywhere in the group: the walk is skipped entirely and the
+	// whole budget is settlement allowance (staticHydrate fails the test on
+	// any hydration attempt).
+	r := testReclaimer(t, reg, staticHydrate(t, nil), time.Hour, 3, true)
+
+	rep, err := r.Run(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 5 rows, budget 3: exactly 3 rows examined and marked; the repo needs
+	// more than a full budget, so it is counted over budget, not failed.
+	if rep.RowsExamined != 3 || rep.RowsMarked != 3 || rep.ReposOverBudget != 1 {
+		t.Fatalf("bounded settlement run = %+v, want 3 examined/marked and over-budget", rep)
 	}
 }
 

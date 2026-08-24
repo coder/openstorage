@@ -143,6 +143,33 @@ func TestLFSReclaim_GraceSparesFreshMark(t *testing.T) {
 	})
 }
 
+// TestLFSReclaim_SubSecondGraceIsNotZero (Codex round 4): SQLite stores
+// reclamation marks at whole-second resolution — a sub-second grace must
+// still hold a freshly marked row through a real window instead of
+// truncating to zero and retiring it immediately.
+func TestLFSReclaim_SubSecondGraceIsNotZero(t *testing.T) {
+	runRefBackends(t, func(t *testing.T, s Store) {
+		rs := reclaimStore(t, s)
+		ctx := context.Background()
+		k := newLedgerKit(t, s)
+		key := canonicalLFSKey(k.base(), "ee")
+		if err := s.RegisterLFSObject(ctx, k.base(), key, 10); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := rs.MarkLFSObjectsUnreferenced(ctx, k.base(), []string{key}); err != nil {
+			t.Fatal(err)
+		}
+		gens := pinCurrentGens(t, s, k.group)
+		if retired, err := rs.RetireUnreferencedLFSObject(ctx, k.base(), key, gens, 300*time.Millisecond); err != nil || retired {
+			t.Fatalf("retire fresh mark at sub-second grace = (%v, %v), want spared", retired, err)
+		}
+		// An explicit zero grace waives the window: the row stays retirable.
+		if retired, err := rs.RetireUnreferencedLFSObject(ctx, k.base(), key, gens, 0); err != nil || !retired {
+			t.Fatalf("retire with waived grace = (%v, %v), want retired", retired, err)
+		}
+	})
+}
+
 // TestLFSReclaim_GenerationFence: a ref mutation anywhere in the namespace
 // group after the scan pinned its generations invalidates the verdict — a
 // pointer file pushed mid-scan lives in a bumped generation by definition.

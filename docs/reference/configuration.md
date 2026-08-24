@@ -673,11 +673,16 @@ take, so no signal can lose the race silently.
   comfortably above your longest expected upload→push gap — a pointer pushed
   through the normal git-lfs flow always touches the object first, but raw-git
   pointer pushes only get the reachability scan's protection.
+- **Granularity:** local mode (SQLite) stamps marks at whole-second
+  resolution, so the effective window rounds up — never down — and may run up
+  to two seconds longer than configured. The window is never shorter than the
+  configured grace on either backend.
 
 ### `CODESTORAGE_LFS_GC_OBJECT_BUDGET`
 
-Caps the git objects (commits, trees, and blobs of every size) one reclamation
-run may list across all its reachability walks — the bound that keeps the
+Caps the work units one reclamation run may spend — each git object a
+reachability walk lists (commits, trees, and blobs of every size) and each
+registry row settlement examines charges one unit — the bound that keeps the
 job's cost predictable on any repository shape. A repository whose own walk exceeds the
 remaining budget is retried first next run with a full budget; one whose walk
 exceeds the FULL budget is skipped loudly until the budget is raised. Nothing

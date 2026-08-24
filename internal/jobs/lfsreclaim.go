@@ -187,8 +187,8 @@ loop:
 			hadFullBudget := budget == r.objectBudget
 			prevCursor := cursor
 			cursor = base // advance the rotation before attempting
-			walked, err := r.reclaimRepo(ctx, base, budget, &report)
-			budget -= walked
+			charged, err := r.reclaimRepo(ctx, base, budget, &report)
+			budget -= charged
 			switch {
 			case errors.Is(err, lfsscan.ErrLFSScanBudget):
 				if hadFullBudget {
@@ -196,7 +196,7 @@ loop:
 					// skip it (rotation moved past it) and say so — only
 					// a raised budget can ever scan it.
 					report.ReposOverBudget++
-					r.logger.Warn("lfs reclaim: repository exceeds the full object budget; raise CODESTORAGE_LFS_GC_OBJECT_BUDGET to scan it",
+					r.logger.Warn("lfs reclaim: repository exceeds the full run budget; raise CODESTORAGE_LFS_GC_OBJECT_BUDGET to scan and settle it in one pass",
 						"repo", base, "budget", r.objectBudget)
 					continue
 				}
@@ -230,10 +230,15 @@ loop:
 }
 
 // reclaimRepo scans one base repo's namespace group and settles its rows.
-// It returns the objects the walks listed (charged against the run budget)
-// and an error for a failed or over-budget scan — in which case NO row was
-// touched: marking on an incomplete reachable set would start grace clocks
-// on referenced objects, and retiring on one would delete live data.
+// It returns the work charged against the run budget — objects the walks
+// listed plus registry rows settlement examined (Codex round 4: settlement
+// transactions are attacker-scaled too; a ref-less cap-filled repo walks
+// nothing yet holds MaxLFSObjectsPerRepo rows) — and an error for a failed
+// or exhausted scan. A walk error means NO row was touched: marking on an
+// incomplete reachable set would start grace clocks on referenced objects,
+// and retiring on one would delete live data. Settlement exhaustion leaves
+// durable partial progress, which is safe: each row's verdict comes from
+// the already-complete reachable set, and the next run recomputes anyway.
 func (r *LFSReclaimer) reclaimRepo(ctx context.Context, base string, budget int64, report *LFSReclaimReport) (int64, error) {
 	if purged, err := r.registry.IsRepoPurged(ctx, base); err != nil {
 		return 0, err
@@ -297,23 +302,50 @@ func (r *LFSReclaimer) reclaimRepo(ctx context.Context, base string, budget int6
 	}
 	report.ReposScanned++
 	report.ObjectsWalked += walked
-	return walked, r.settleRepoRows(ctx, base, gens, referenced, report)
+	settled, err := r.settleRepoRows(ctx, base, gens, referenced, budget-walked, report)
+	return walked + settled, err
 }
 
 // settleRepoRows diffs base's registered rows against the referenced OID
 // set: clears marks on referenced rows, marks unreferenced ones, and
 // retires (or, dry-run, counts) rows whose mark outlived the grace window.
-func (r *LFSReclaimer) settleRepoRows(ctx context.Context, base string, gens map[string]int64, referenced map[string]struct{}, report *LFSReclaimReport) error {
+// Every examined row charges one unit of allowance — the same budget the
+// walks draw from — and exhaustion aborts with the budget verdict so the
+// caller defers or skips the repo like an over-budget walk. Rows already
+// settled stay settled; retirement's per-row transactions shrink the key
+// range's front, so successive passes over an oversized repo converge.
+func (r *LFSReclaimer) settleRepoRows(ctx context.Context, base string, gens map[string]int64, referenced map[string]struct{}, allowance int64, report *LFSReclaimReport) (int64, error) {
+	assertf(allowance >= 0, "settleRepoRows: negative allowance %d", allowance)
 	var errs boundedErrs
+	var charged int64
 	after := ""
 	for {
-		rows, err := r.registry.ListRepoLFSObjects(ctx, base, after, lfsReclaimRowPage)
+		page := lfsReclaimRowPage
+		if remaining := allowance - charged; remaining < int64(page) {
+			page = int(remaining)
+		}
+		if page == 0 {
+			// The allowance is spent, but the settlement may in fact be
+			// complete. One 1-row probe (listed, never processed) tells
+			// which; only genuinely remaining rows defer the repo.
+			probe, err := r.registry.ListRepoLFSObjects(ctx, base, after, 1)
+			if err != nil {
+				return charged, err
+			}
+			if len(probe) == 0 {
+				break
+			}
+			errs.add(fmt.Errorf("settle %s: %w (budget)", base, lfsscan.ErrLFSScanBudget))
+			return charged, errs.join()
+		}
+		rows, err := r.registry.ListRepoLFSObjects(ctx, base, after, page)
 		if err != nil {
-			return err
+			return charged, err
 		}
 		if len(rows) == 0 {
 			break
 		}
+		charged += int64(len(rows))
 		after = rows[len(rows)-1].Key
 		var toMark, toClear []string
 		for _, row := range rows {
@@ -357,19 +389,19 @@ func (r *LFSReclaimer) settleRepoRows(ctx context.Context, base string, gens map
 		if len(toClear) > 0 {
 			n, err := r.registry.ClearLFSObjectsUnreferenced(ctx, base, toClear)
 			if err != nil {
-				return err
+				return charged, err
 			}
 			report.RowsCleared += n
 		}
 		if len(toMark) > 0 {
 			n, err := r.registry.MarkLFSObjectsUnreferenced(ctx, base, toMark)
 			if err != nil {
-				return err
+				return charged, err
 			}
 			report.RowsMarked += n
 		}
 	}
-	return errs.join()
+	return charged, errs.join()
 }
 
 // LFSReclaimSchedule pairs the reclaimer with its cadence — its own
