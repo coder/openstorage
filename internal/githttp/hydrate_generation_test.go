@@ -77,7 +77,7 @@ func (s *countingStore) SweepExpiredPackReservations(context.Context, time.Durat
 	panic("Hydrate must never sweep pack reservations")
 }
 
-func (s *countingStore) ReconcileLegacyLFSObjects(context.Context) (int64, error) {
+func (s *countingStore) ReconcileLegacyLFSObjects(context.Context) (int64, bool, error) {
 	panic("Hydrate must never reconcile LFS rows")
 }
 

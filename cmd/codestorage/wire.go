@@ -172,7 +172,7 @@ func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL, loopbackBaseU
 			logger.Info("soft-deleted repository retention purge enabled",
 				"env", envRepoRetention, "retention", sweep.repoRetention)
 		}
-	} else if err := sweeper.Heal(ctx); err != nil {
+	} else if residual, err := sweeper.Heal(ctx); err != nil {
 		// Disabling the schedule must not strand a registered pack whose
 		// only copy a crashed delete-enabled handshake left in quarantine:
 		// run one strictly restorative heal pass at startup regardless.
@@ -180,7 +180,7 @@ func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL, loopbackBaseU
 		// serving would otherwise fail hydrations of the stranded pack
 		// until another restart anyway (fail-fast beats limping).
 		return fail(fmt.Errorf("startup quarantine heal (sweeping disabled): %w", err))
-	} else if lfsWriteCompat {
+	} else if lfsWriteCompat || residual {
 		// Heal's twin-row janitor ran once, but a mixed-version rollout
 		// can strand a legacy/canonical LFS row twin at ANY time after
 		// startup (Codex round 88): an old replica touching a retained
@@ -194,7 +194,11 @@ func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL, loopbackBaseU
 		// index (`strpos(key, '/o2/')`), and an hourly full scan of the
 		// attacker-growable LFS registry is unjustifiable in the steady
 		// sweep-disabled state, where the startup Heal pass already
-		// reconciled any roll-era stragglers.
+		// reconciled any roll-era stragglers. Exception (Codex round
+		// 128): a PARTIAL startup pass — a post-roll backlog beyond the
+		// page cap — starts the ticker even with compat off, since
+		// nothing else would ever finish reconciling; each tick is one
+		// capped pass, so the backlog drains boundedly.
 		stopReconcile = jobs.StartReconcileTicker(sweeper, jobs.ReconcileTickInterval)
 	}
 

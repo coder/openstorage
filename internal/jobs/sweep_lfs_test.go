@@ -121,7 +121,7 @@ func TestSweepHeal_ReconcilesTwinRows(t *testing.T) {
 	f.registerLFS("repo_lfs", canonical, 40)
 	f.registerLFS("repo_lfs", legacy, 40)
 
-	if err := f.sweeper(SweepConfig{Threshold: 24 * time.Hour}).Heal(context.Background()); err != nil {
+	if _, err := f.sweeper(SweepConfig{Threshold: 24 * time.Hour}).Heal(context.Background()); err != nil {
 		t.Fatalf("Heal: %v", err)
 	}
 	if has, err := f.store.HasLFSObject(context.Background(), "repo_lfs", legacy); err != nil || has {

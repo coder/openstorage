@@ -942,7 +942,7 @@ ON CONFLICT (repo) DO UPDATE SET gen = lfs_adoption_gens.gen + 1`, repo); err !=
 }
 
 // ReconcileLegacyLFSObjects — see RefStore.
-func (s *PG) ReconcileLegacyLFSObjects(ctx context.Context) (int64, error) {
+func (s *PG) ReconcileLegacyLFSObjects(ctx context.Context) (int64, bool, error) {
 	// Paged (Codex round 91): a mixed-version fleet can strand twins
 	// across MANY repositories — no per-repo cap bounds the cross-repo
 	// candidate set, and Heal runs this synchronously at startup when
@@ -961,7 +961,7 @@ WHERE strpos(l.key, '/o2/') = 0
     AND c.key = 'lfs/' || l.repo || '/o2/' || substr(l.key, char_length('lfs/' || l.repo || '/') + 1))
 LIMIT $1`, reconcileLegacyLFSBatch)
 		if err != nil {
-			return n, err
+			return n, false, err
 		}
 		type cand struct{ repo, key string }
 		var cands []cand
@@ -969,13 +969,13 @@ LIMIT $1`, reconcileLegacyLFSBatch)
 			var c cand
 			if err := rows.Scan(&c.repo, &c.key); err != nil {
 				rows.Close()
-				return n, err
+				return n, false, err
 			}
 			cands = append(cands, c)
 		}
 		rows.Close()
 		if err := rows.Err(); err != nil {
-			return n, err
+			return n, false, err
 		}
 		var progress int64
 		for _, c := range cands {
@@ -991,20 +991,22 @@ LIMIT $1`, reconcileLegacyLFSBatch)
 				}
 				return err
 			}); err != nil {
-				return n, err
+				return n, false, err
 			}
 		}
 		if len(cands) < reconcileLegacyLFSBatch {
-			return n, nil
+			return n, false, nil
 		}
 		if progress == 0 {
-			return n, fmt.Errorf("reconcile legacy lfs rows: full page of %d candidates made no progress", len(cands))
+			return n, false, fmt.Errorf("reconcile legacy lfs rows: full page of %d candidates made no progress", len(cands))
 		}
 	}
-	// Page cap exhausted (security round 127): clean partial success —
-	// the remainder falls to the ticker, the next invocation, or the
-	// next startup.
-	return n, nil
+	// Page cap exhausted (security round 127): clean PARTIAL success —
+	// reported so callers can schedule bounded follow-up passes (Codex
+	// round 128: post-roll with sweeping disabled, startup Heal is the
+	// only pass, and silently stranding a >cap backlog double-charges
+	// usage and object count until some restart).
+	return n, true, nil
 }
 
 // reconcileLegacyLFSBatch bounds one ReconcileLegacyLFSObjects page

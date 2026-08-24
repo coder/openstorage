@@ -173,7 +173,7 @@ func (s *SimRefStore) SweepExpiredPackReservations(ctx context.Context, olderTha
 	return s.inner.SweepExpiredPackReservations(ctx, olderThan)
 }
 
-func (s *SimRefStore) ReconcileLegacyLFSObjects(ctx context.Context) (int64, error) {
+func (s *SimRefStore) ReconcileLegacyLFSObjects(ctx context.Context) (int64, bool, error) {
 	return s.inner.ReconcileLegacyLFSObjects(ctx)
 }
 

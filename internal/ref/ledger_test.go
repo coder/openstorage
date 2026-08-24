@@ -811,7 +811,7 @@ func TestReconcileLegacyLFSTwinRows(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		n, err := s.ReconcileLegacyLFSObjects(ctx)
+		n, _, err := s.ReconcileLegacyLFSObjects(ctx)
 		if err != nil || n != 1 {
 			t.Fatalf("ReconcileLegacyLFSObjects = (%d, %v), want (1, nil)", n, err)
 		}
@@ -833,7 +833,7 @@ func TestReconcileLegacyLFSTwinRows(t *testing.T) {
 		if st := k.state(); st.UsageBytes != 40 {
 			t.Fatalf("usage after reconcile = %d, want 40 — the twin's bytes must be refunded", st.UsageBytes)
 		}
-		if n, err := s.ReconcileLegacyLFSObjects(ctx); err != nil || n != 0 {
+		if n, _, err := s.ReconcileLegacyLFSObjects(ctx); err != nil || n != 0 {
 			t.Fatalf("idempotent reconcile = (%d, %v), want (0, nil)", n, err)
 		}
 
@@ -922,7 +922,7 @@ func TestReconcileLegacyLFSObjectsPaged(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		n, err := s.ReconcileLegacyLFSObjects(ctx)
+		n, _, err := s.ReconcileLegacyLFSObjects(ctx)
 		if err != nil || n != int64(len(oids)) {
 			t.Fatalf("paged reconcile = (%d, %v), want (%d, nil) — the loop must run every page to exhaustion", n, err, len(oids))
 		}

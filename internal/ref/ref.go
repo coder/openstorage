@@ -162,7 +162,7 @@ type RefStore interface {
 	// registration alongside the canonical row, after which the fast
 	// paths never call registration for the object again — without this
 	// janitor the twin would overstate usage and the object cap forever.
-	ReconcileLegacyLFSObjects(ctx context.Context) (int64, error)
+	ReconcileLegacyLFSObjects(ctx context.Context) (reconciled int64, partial bool, err error)
 	// IsRetainedPack reports whether (repo, key) is recorded as a
 	// superseded-by-repack blob (issue #31): its row was folded away by
 	// ReplacePacks but its bytes still occupy the pack prefix. A point

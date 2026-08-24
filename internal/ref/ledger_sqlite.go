@@ -403,24 +403,24 @@ ON CONFLICT (repo) DO UPDATE SET gen = lfs_adoption_gens.gen + 1`, repo); err !=
 // ReconcileLegacyLFSObjects — see RefStore. Paged like the PG twin
 // (Codex round 91): one bounded candidate page in memory at a time; each
 // reconcile deletes its row, so re-querying converges without offsets.
-func (s *SQLite) ReconcileLegacyLFSObjects(ctx context.Context) (int64, error) {
+func (s *SQLite) ReconcileLegacyLFSObjects(ctx context.Context) (int64, bool, error) {
 	var n int64
 	// Page-capped per invocation like the PG twin (security round 127).
 	for i := 0; i < reconcileLegacyLFSMaxPages; i++ {
 		page, progress, err := s.reconcileLegacyLFSPage(ctx)
 		n += progress
 		if err != nil {
-			return n, err
+			return n, false, err
 		}
 		if page < reconcileLegacyLFSBatch {
-			return n, nil
+			return n, false, nil
 		}
 		if progress == 0 {
-			return n, fmt.Errorf("reconcile legacy lfs rows: full page of %d candidates made no progress", page)
+			return n, false, fmt.Errorf("reconcile legacy lfs rows: full page of %d candidates made no progress", page)
 		}
 	}
-	// Page cap exhausted — clean partial success, see the PG twin.
-	return n, nil
+	// Page cap exhausted — clean PARTIAL success, see the PG twin.
+	return n, true, nil
 }
 
 // reconcileLegacyLFSPage reconciles one bounded candidate page, returning

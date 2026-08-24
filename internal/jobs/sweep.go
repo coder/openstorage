@@ -92,7 +92,7 @@ type PackRegistry interface {
 	// whose canonical twin exists, refunding what they double-charged
 	// (ADR-41, Codex round 79) — rolling-upgrade races can strand such
 	// twins where no registration ever runs again.
-	ReconcileLegacyLFSObjects(ctx context.Context) (int64, error)
+	ReconcileLegacyLFSObjects(ctx context.Context) (reconciled int64, partial bool, err error)
 }
 
 // SweepConfig controls one sweeper's classification and disposal.
@@ -324,7 +324,7 @@ func (s *Sweeper) Sweep(ctx context.Context) (SweepReport, error) {
 	// Legacy/canonical LFS row twins stranded by rolling-upgrade races
 	// (ADR-41, Codex round 79): no registration ever runs again for
 	// them, so the sweeper is the janitor that ends the double-count.
-	if n, err := s.packs.ReconcileLegacyLFSObjects(ctx); err != nil {
+	if n, _, err := s.packs.ReconcileLegacyLFSObjects(ctx); err != nil {
 		deleteErrs.add(fmt.Errorf("sweep: reconcile legacy lfs rows: %w", err))
 	} else if n > 0 {
 		s.logger.Info("orphan pack sweep: reconciled legacy lfs row twins", "count", n)
@@ -899,7 +899,7 @@ func StartReconcileTicker(sweeper *Sweeper, interval time.Duration) (stop func()
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for {
-			if n, err := sweeper.packs.ReconcileLegacyLFSObjects(ctx); err != nil && ctx.Err() == nil {
+			if n, _, err := sweeper.packs.ReconcileLegacyLFSObjects(ctx); err != nil && ctx.Err() == nil {
 				sweeper.logger.Error("legacy lfs row reconcile failed", "err", err)
 			} else if n > 0 {
 				sweeper.logger.Info("reconciled legacy lfs row twins", "count", n)
@@ -1280,7 +1280,7 @@ func (s *Sweeper) freshModTime(ctx context.Context, key string) (mod time.Time, 
 // and disabling the schedule must not strand it. Purging is forced off
 // regardless of SweepConfig.Delete — interval zero documents "no sweeping",
 // so an emergency stop must never destroy anything.
-func (s *Sweeper) Heal(ctx context.Context) error {
+func (s *Sweeper) Heal(ctx context.Context) (residual bool, err error) {
 	// Legacy/canonical LFS row twins stranded by rolling-upgrade races
 	// need the janitor even when periodic sweeping is disabled (Codex
 	// round 85): no registration fast path ever runs again for a twin, so
@@ -1291,13 +1291,21 @@ func (s *Sweeper) Heal(ctx context.Context) error {
 	// compat flag is off), swallowing the error would let serving start
 	// with permanent double charges — false quota and object-cap denials
 	// until some later restart happens to reconcile.
-	if n, err := s.packs.ReconcileLegacyLFSObjects(ctx); err != nil {
-		return fmt.Errorf("reconcile legacy lfs rows: %w", err)
-	} else if n > 0 {
+	n, partial, rerr := s.packs.ReconcileLegacyLFSObjects(ctx)
+	if rerr != nil {
+		return false, fmt.Errorf("reconcile legacy lfs rows: %w", rerr)
+	}
+	if n > 0 {
 		s.logger.Info("heal: reconciled legacy lfs row twins", "count", n)
 	}
+	if partial {
+		// The page-capped pass left twins behind (Codex round 128): the
+		// caller must schedule bounded follow-up passes — with sweeping
+		// disabled and compat off, nothing else ever reconciles them.
+		s.logger.Warn("heal: legacy lfs reconcile pass was partial; scheduling follow-up passes")
+	}
 	var report SweepReport
-	return s.healQuarantine(ctx, &report, false, false)
+	return partial, s.healQuarantine(ctx, &report, false, false)
 }
 
 // SweepSchedule configures the periodic orphan-pack sweep on a queue
