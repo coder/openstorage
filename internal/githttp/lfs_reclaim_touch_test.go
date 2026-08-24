@@ -375,3 +375,63 @@ func TestLFSDirectPUT_FreshUploadRetouches(t *testing.T) {
 	}
 	assertLFSRowUnmarked(t, inner, key, "fresh upload")
 }
+
+// countingTouchStore counts TouchLFSObject calls.
+type countingTouchStore struct {
+	ref.RefStore
+	touches int
+}
+
+func (c *countingTouchStore) TouchLFSObject(ctx context.Context, repo, key string) (bool, error) {
+	c.touches++
+	return c.RefStore.TouchLFSObject(ctx, repo, key)
+}
+
+// TestLFSBatchUpload_DuplicateStoredOIDsSettleOnce (issue #73, Codex
+// security round 15): a batch may repeat one stored OID hundreds of times,
+// and the stored fast path must run once per unique key — per-occurrence
+// settlement amplified a small request body into standalone registry
+// writes (two touches each) plus blob probes.
+func TestLFSBatchUpload_DuplicateStoredOIDsSettleOnce(t *testing.T) {
+	srv, mint := newLFSServer(t, openFileBlob(t))
+	writeTok := mint("git:write")
+	ctx := context.Background()
+	content := []byte("duplicate batch entry bytes")
+	oid := sha256Hex(content)
+	key := blob.LFSKey(lfsTestRepoID, oid)
+
+	scratch := filepath.Join(t.TempDir(), "obj")
+	if err := os.WriteFile(scratch, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.Blob.UploadFile(ctx, key, scratch); err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.Store.RegisterLFSObject(ctx, lfsTestRepoID, key, int64(len(content))); err != nil {
+		t.Fatal(err)
+	}
+	counter := &countingTouchStore{RefStore: srv.Store}
+	srv.Store = counter
+
+	const dupes = 8
+	entry := fmt.Sprintf(`{"oid":%q,"size":%d}`, oid, len(content))
+	entries := entry
+	for range dupes - 1 {
+		entries += "," + entry
+	}
+	body := `{"operation":"upload","transfers":["basic"],"objects":[` + entries + `]}`
+	resp := decodeBatch(t, doLFS(t, srv, http.MethodPost, lfsBatchPath, "basic:"+writeTok, body))
+	if len(resp.Objects) != dupes {
+		t.Fatalf("batch answered %d objects, want %d", len(resp.Objects), dupes)
+	}
+	for i, o := range resp.Objects {
+		if o.Error != nil || len(o.Actions) != 0 {
+			t.Fatalf("duplicate %d = %+v, want stored (no actions, no error)", i, o)
+		}
+	}
+	// Entry touch + post-compat re-touch: exactly two registry writes for
+	// the whole batch, not two per occurrence.
+	if counter.touches != 2 {
+		t.Fatalf("stored batch touched %d times, want 2 (one settlement per unique key)", counter.touches)
+	}
+}
