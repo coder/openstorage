@@ -4,11 +4,11 @@
 # git (smart-HTTP upload/receive-pack, merges, hook re-execs).
 FROM golang:1.26-alpine AS build
 WORKDIR /src
-COPY go.mod go.sum ./
-RUN --mount=type=cache,target=/go/pkg/mod go mod download
+# Dependencies come from the committed vendor/ tree (issue #114): Go auto-uses
+# -mod=vendor when vendor/modules.txt is consistent, so no `go mod download`
+# layer or module cache is needed and the build works offline.
 COPY . .
-RUN --mount=type=cache,target=/go/pkg/mod \
-    --mount=type=cache,target=/root/.cache/go-build \
+RUN --mount=type=cache,target=/root/.cache/go-build \
     CGO_ENABLED=0 go build -trimpath -o /out/codestorage ./cmd/codestorage
 
 FROM alpine:3.21
