@@ -428,7 +428,7 @@ A reclamation run logs one `lfs reclaim pass finished` line:
 | Field | Meaning |
 |---|---|
 | `repos_scanned` / `repos_skipped` / `repos_over_budget` | work-queue outcomes (skipped = purged or metadata-less; over-budget = the repo's walk plus row settlement exceeds the full budget — raise it) |
-| `objects_walked` | git objects listed across all walks (charged against the run budget) |
+| `objects_walked` | work units the walks charged against the run budget (each object: one, plus one per 4 KiB of raw size) |
 | `rows_examined` / `rows_referenced` | registry rows diffed (each also charges the run budget), and how many a reachable pointer references |
 | `rows_marked` / `rows_cleared` | stamps added / removed this run |
 | `rows_in_grace` | unreferenced rows still inside the grace window |

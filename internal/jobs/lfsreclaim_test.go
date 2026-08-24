@@ -419,6 +419,34 @@ func TestLFSReclaim_ExactExhaustionBetweenMembers(t *testing.T) {
 	}
 }
 
+// TestLFSReclaim_SkippedReposChargeBudget (Codex round 5): soft-deleted
+// repositories keep their registered LFS rows but lose their metadata, so
+// the reclaimer skips them — and each skip must charge the run budget, or
+// an unbounded skipped population (several queries per repo, an entry in
+// the scanned set) would be paged in full on every single pass.
+func TestLFSReclaim_SkippedReposChargeBudget(t *testing.T) {
+	ctx := context.Background()
+	store, reg := newReclaimStore(t)
+	for _, base := range []string{"gone-a", "gone-b", "gone-c", "gone-d", "gone-e"} {
+		key := "lfs/" + base + "/o2/" + strings.Repeat("ab", 32)
+		if err := store.RegisterLFSObject(ctx, base, key, 10); err != nil {
+			t.Fatal(err)
+		}
+	}
+	noMetadata := func(context.Context, string) (string, bool, error) { return "", false, nil }
+	r := NewLFSReclaimer(reg, staticHydrate(t, nil), lfsscan.ReachableLFSOIDs, noMetadata,
+		time.Hour, 3, true, slog.New(slog.DiscardHandler))
+
+	rep, err := r.Run(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 5 metadata-less repos, budget 3: exactly 3 attempted-and-skipped.
+	if rep.ReposSkipped != 3 {
+		t.Fatalf("skip run = %+v, want 3 budget-bounded skips", rep)
+	}
+}
+
 // TestLFSReclaim_PurgedRepoSkipped: purge-fenced repos are the purge
 // pipeline's problem; the reclaimer never hydrates or touches them.
 func TestLFSReclaim_PurgedRepoSkipped(t *testing.T) {

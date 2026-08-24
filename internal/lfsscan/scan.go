@@ -29,16 +29,25 @@ func assertf(cond bool, format string, args ...any) {
 	}
 }
 
-// ErrLFSScanBudget marks a reachability walk aborted because it listed more
-// objects than the caller's budget allows. The partial OID set is unusable
+// ErrLFSScanBudget marks a reachability walk aborted because it charged more
+// work units than the caller's budget allows. The partial OID set is unusable
 // for reclamation — an incomplete reachable set must never retire anything —
 // so callers skip the repository and retry when budget allows.
 var ErrLFSScanBudget = errors.New("lfs reachability scan budget exceeded")
 
+// lfsScanBytesPerUnit is the raw-byte slice that charges one extra work
+// unit per listed object (Codex security round 5): rev-list expands every
+// tree entry but emits each unique OID once, so a 100k-entry tree naming
+// one blob would charge a flat count almost nothing while git inflates
+// megabytes. An object's raw (inflated) size IS that expansion work — tree
+// bytes scale with entry count — so each object charges 1 + size/slice.
+const lfsScanBytesPerUnit = 4096
+
 // ReachableLFSOIDs walks every object reachable from the cache repo's refs
 // (the DB-authority set Materialize just synced), decodes candidate blobs of
 // at most LFSPointerMaxSize bytes as Git LFS pointer files, and returns the
-// set of referenced sha256 OIDs plus the number of objects the walk listed.
+// set of referenced sha256 OIDs plus the work units the walk charged: one
+// per listed object plus one per lfsScanBytesPerUnit of its raw size.
 //
 // The walk streams three git subprocesses — rev-list --objects, cat-file
 // --batch-check (type/size), cat-file --batch (candidate contents) — so
@@ -116,7 +125,9 @@ func ReachableLFSOIDs(ctx context.Context, repoPath string, budget int64) (map[s
 	var walked atomic.Int64
 	var exceeded atomic.Bool
 
-	// Pump 1: reachable object names → batch-check, charging the budget.
+	// Pump 1: reachable object names → batch-check. Budget charging lives
+	// in pump 2 where sizes are known; the bounded pipes between the
+	// stages keep this pump from running unboundedly ahead of the meter.
 	g.Go(func() error {
 		defer checkIn.Close()
 		sc := bufio.NewScanner(revOut)
@@ -124,10 +135,6 @@ func ReachableLFSOIDs(ctx context.Context, repoPath string, budget int64) (map[s
 			sha := sc.Text()
 			if !ref.ValidSHA(sha) {
 				return fmt.Errorf("rev-list emitted %q", sha)
-			}
-			if walked.Add(1) > budget {
-				exceeded.Store(true)
-				return fmt.Errorf("%w (budget %d)", ErrLFSScanBudget, budget)
 			}
 			if _, err := io.WriteString(checkIn, sha+"\n"); err != nil {
 				return fmt.Errorf("feed batch-check: %w", err)
@@ -142,7 +149,8 @@ func ReachableLFSOIDs(ctx context.Context, repoPath string, budget int64) (map[s
 		return nil
 	})
 
-	// Pump 2: pointer-sized blobs → batch content reader.
+	// Pump 2: charge every object's work units, then feed pointer-sized
+	// blobs to the batch content reader.
 	g.Go(func() error {
 		defer readIn.Close()
 		sc := bufio.NewScanner(checkOut)
@@ -151,14 +159,15 @@ func ReachableLFSOIDs(ctx context.Context, repoPath string, budget int64) (map[s
 			if len(fields) != 3 || fields[0] == "missing" || fields[1] == "missing" {
 				return fmt.Errorf("batch-check emitted %q", sc.Text())
 			}
-			if fields[0] != "blob" {
-				continue
-			}
 			size, err := strconv.ParseInt(fields[1], 10, 64)
-			if err != nil {
+			if err != nil || size < 0 {
 				return fmt.Errorf("batch-check emitted size %q", sc.Text())
 			}
-			if size <= 0 || size > LFSPointerMaxSize {
+			if walked.Add(1+size/lfsScanBytesPerUnit) > budget {
+				exceeded.Store(true)
+				return fmt.Errorf("%w (budget %d)", ErrLFSScanBudget, budget)
+			}
+			if fields[0] != "blob" || size <= 0 || size > LFSPointerMaxSize {
 				continue
 			}
 			if _, err := io.WriteString(readIn, fields[2]+"\n"); err != nil {

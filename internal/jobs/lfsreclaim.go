@@ -188,6 +188,14 @@ loop:
 			prevCursor := cursor
 			cursor = base // advance the rotation before attempting
 			charged, err := r.reclaimRepo(ctx, base, budget, &report)
+			if charged == 0 {
+				// Every attempted repository costs at least one unit
+				// (Codex round 5): soft-deleted repos keep their LFS rows
+				// but lose their metadata, and an unbounded population of
+				// such zero-work skips — several queries each — would
+				// otherwise never drain the budget.
+				charged = 1
+			}
 			budget -= charged
 			switch {
 			case errors.Is(err, lfsscan.ErrLFSScanBudget):

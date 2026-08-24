@@ -141,15 +141,16 @@ func TestReachableLFSOIDs_LargeBlobsChargeBudget(t *testing.T) {
 	mustGit(t, dir, "add", "-A")
 	mustGit(t, dir, "commit", "-q", "-m", "root")
 
-	// 1 commit + 1 tree + 1 pointer blob + 8 large blobs = 11 objects. A
-	// size-prefiltered listing would emit only 3 of them and sail past a
+	// 1 commit + 1 tree + 1 pointer blob + 8 large blobs = 11 objects, and
+	// each 5001-byte blob charges an extra size unit: 19 work units. A
+	// size-prefiltered listing would emit only 3 objects and sail past a
 	// budget of 6; charging every reachable object must trip it.
 	if _, _, err := ReachableLFSOIDs(context.Background(), dir, 6); !errors.Is(err, ErrLFSScanBudget) {
 		t.Fatalf("budget walk err = %v, want ErrLFSScanBudget", err)
 	}
 
 	// With enough budget the walk succeeds, the pointer is still collected,
-	// and the walked count proves the large blobs were charged.
+	// and the charged units prove the large blobs were metered by size.
 	oids, walked, err := ReachableLFSOIDs(context.Background(), dir, 100)
 	if err != nil {
 		t.Fatal(err)
@@ -157,8 +158,52 @@ func TestReachableLFSOIDs_LargeBlobsChargeBudget(t *testing.T) {
 	if _, ok := oids[oidA]; !ok {
 		t.Errorf("pointer OID missing: %v", oids)
 	}
-	if walked != 11 {
-		t.Fatalf("walked = %d, want 11 (large blobs must charge the budget)", walked)
+	if walked != 19 {
+		t.Fatalf("walked = %d, want 19 (large blobs must charge size units)", walked)
+	}
+}
+
+// TestReachableLFSOIDs_WideTreesChargeBudget (Codex security round 5): one
+// git-valid tree can name the same blob under arbitrarily many entries, and
+// rev-list expands every entry while emitting each unique OID only once — a
+// flat per-object charge would meter a 100k-entry tree as 3 objects while
+// git inflates megabytes. Objects charge by raw size too (a tree grows ~40
+// bytes per entry), so entry stuffing pays for the expansion it causes.
+func TestReachableLFSOIDs_WideTreesChargeBudget(t *testing.T) {
+	dir := t.TempDir()
+	mustGit(t, dir, "init", "-q", "--initial-branch=main")
+	writeFile(t, dir, "a.bin", lfsPointer(oidA, 100), 0o644)
+	writeFile(t, dir, "junk.dat", "wide junk\n", 0o644)
+	mustGit(t, dir, "add", "-A")
+	mustGit(t, dir, "commit", "-q", "-m", "root")
+
+	// Graft 12k index entries, all naming the junk blob, and commit them
+	// on a second branch: one ~480KB raw tree, no new unique blobs.
+	junkSHA := strings.TrimSpace(mustGit(t, dir, "rev-parse", "HEAD:junk.dat"))
+	var entries strings.Builder
+	for i := 0; i < 12_000; i++ {
+		fmt.Fprintf(&entries, "100644 %s\twide/entry-%06d\n", junkSHA, i)
+	}
+	mustGitStdin(t, dir, entries.String(), "update-index", "--add", "--index-info")
+	treeSHA := strings.TrimSpace(mustGit(t, dir, "write-tree"))
+	commitSHA := strings.TrimSpace(mustGitStdin(t, dir, "wide", "commit-tree", treeSHA, "-p", "HEAD"))
+	mustGit(t, dir, "update-ref", "refs/heads/wide", commitSHA)
+
+	// Flat charging would count ~8 objects and sail far under 60; the
+	// wide subtree alone must charge its raw bytes' worth of units.
+	if _, _, err := ReachableLFSOIDs(context.Background(), dir, 60); !errors.Is(err, ErrLFSScanBudget) {
+		t.Fatalf("budget walk err = %v, want ErrLFSScanBudget", err)
+	}
+
+	oids, walked, err := ReachableLFSOIDs(context.Background(), dir, 1_000_000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := oids[oidA]; !ok {
+		t.Errorf("pointer OID missing: %v", oids)
+	}
+	if walked < 100 {
+		t.Fatalf("walked = %d, want >= 100 (wide tree must charge size units)", walked)
 	}
 }
 
@@ -229,6 +274,19 @@ func mustGit(t *testing.T, dir string, args ...string) string {
 	cmd := exec.Command("git", args...)
 	cmd.Dir = dir
 	cmd.Env = append(os.Environ(), gitEnv...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+	}
+	return string(out)
+}
+
+func mustGitStdin(t *testing.T, dir, stdin string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(), gitEnv...)
+	cmd.Stdin = strings.NewReader(stdin)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
