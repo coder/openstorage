@@ -131,6 +131,14 @@ type Server struct {
 	// one in-flight upload per key, so concurrent identical PUTs cannot
 	// multiply quota-sized temp files (see lfsProxyUpload).
 	lfsUploadsInFlight sync.Map
+	// lfsMismatchMemos maps a legacy key to the fingerprint its FAILED
+	// content verification observed (Codex security round 118): repeat
+	// adoption touches of an unchanged corrupt source skip the full
+	// re-hash and press only the (budgeted) cleanup, so a client
+	// spamming tiny batches cannot replay whole-object reads for free.
+	// Bounded by lfsMismatchMemoCap; guarded by lfsMismatchMemoMu.
+	lfsMismatchMemoMu sync.Mutex
+	lfsMismatchMemos  map[string]string
 	// lfsStagingInFlight is the aggregate Content-Length currently
 	// reserved against LFSStagingBytes; lfsStagingOps counts the
 	// operations holding it (Codex round 17: tiny Content-Lengths pass a
@@ -381,6 +389,25 @@ func (s *Server) growLFSStaging(repo string, n int64) bool {
 		s.lfsRepoStagingBytes[repo] += n
 	}
 	return true
+}
+
+// shrinkLFSStaging returns growLFSStaging bytes WITHOUT releasing an
+// operation slot (Codex round 120 on #104): work that meters extra bytes
+// against its caller's already-held slot — the mismatch snapshot — must
+// not decrement the op count the caller still owns.
+func (s *Server) shrinkLFSStaging(repo string, n int64) {
+	assertf(repo != "" && n > 0, "shrinkLFSStaging(%q, %d)", repo, n)
+	s.lfsStagingMu.Lock()
+	defer s.lfsStagingMu.Unlock()
+	if s.LFSStagingBytes > 0 {
+		s.lfsStagingInFlight -= n
+		assertf(s.lfsStagingInFlight >= 0, "shrinkLFSStaging(%d): in-flight went negative", n)
+		s.lfsRepoStagingBytes[repo] -= n
+		assertf(s.lfsRepoStagingBytes[repo] >= 0, "shrinkLFSStaging(%q, %d): repo bytes went negative", repo, n)
+		if s.lfsRepoStagingBytes[repo] == 0 {
+			delete(s.lfsRepoStagingBytes, repo)
+		}
+	}
 }
 
 // releaseLFSStaging returns a reserveLFSStaging reservation.

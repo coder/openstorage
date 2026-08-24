@@ -1048,6 +1048,41 @@ func (s *Server) adoptStoredLFSObject(ctx context.Context, repoID, key, oid stri
 	// version the copy carried. The destination re-hash costs one extra
 	// ranged read exactly once per object lifetime (the committed row
 	// short-circuits every later touch).
+	// Memoized-mismatch fast path (Codex security round 118): when the
+	// legacy source still carries the exact fingerprint a previous FULL
+	// verification proved wrong, repeating that whole-object read buys
+	// nothing — a client spamming tiny batches for a corrupt object
+	// would replay it for free every touch (deterministically, by
+	// holding the repo's staging share so the cleanup below keeps
+	// sparing). Press only the budgeted cleanup; deletion itself still
+	// requires the single-version snapshot proof (round 115 — the
+	// memo's own verify may have mixed ranged reads across a swap, so
+	// the memo can gate WORK, never a delete). A moved fingerprint
+	// invalidates the memo and the version proves itself in full.
+	if target != key {
+		if memoFP, ok := s.lfsMismatchMemo(target); ok {
+			fctx, fcancel := context.WithTimeout(ctx, lfsProbeTimeout)
+			_, nowFP, ferr := s.Blob.StatFingerprint(fctx, target)
+			fcancel()
+			switch {
+			case ferr == nil && nowFP == memoFP:
+				dctx, dcancel := context.WithTimeout(context.WithoutCancel(ctx), lfsCleanupTimeout)
+				defer dcancel()
+				if s.legacySourceProvenMismatched(dctx, repoID, target, oid) {
+					delCtx, delCancel := context.WithTimeout(context.WithoutCancel(ctx), lfsCleanupTimeout)
+					defer delCancel()
+					if err := s.Blob.Delete(delCtx, target); err != nil && !errors.Is(err, blob.ErrNotFound) {
+						return fmt.Errorf("remove mismatched legacy object %s: %w", target, err)
+					}
+					s.forgetLFSMismatch(target)
+					log.Printf("lfs adopt %s: removed memoized mismatched legacy blob", key)
+				}
+				return errLFSContentMismatch
+			case ferr == nil:
+				s.forgetLFSMismatch(target) // replaced: prove in full
+			}
+		}
+	}
 	var verifiedSize int64
 	var pen *lfsVerifyResume
 	for attempt := 0; ; attempt++ {
@@ -1085,6 +1120,11 @@ func (s *Server) adoptStoredLFSObject(ctx context.Context, repoID, key, oid stri
 			// CURRENT content and delete only bytes still proven
 			// mismatched; a spared survivor converges via the next
 			// touch's verification. The canonical key was never written.
+			// Memoize the failed verification bound to the observed
+			// fingerprint (Codex security round 118): repeat touches of
+			// the unchanged corrupt source skip the full re-hash and
+			// press only the budgeted cleanup below.
+			s.rememberLFSMismatch(target, contentFP)
 			if s.legacySourceProvenMismatched(dctx, repoID, target, oid) {
 				// The delete gets its OWN bounded window (Codex round
 				// 116): a size-scaled snapshot can outlive dctx, and a
@@ -1095,6 +1135,7 @@ func (s *Server) adoptStoredLFSObject(ctx context.Context, repoID, key, oid stri
 				if err := s.Blob.Delete(delCtx, target); err != nil && !errors.Is(err, blob.ErrNotFound) {
 					return fmt.Errorf("remove mismatched legacy object %s: %w", target, err)
 				}
+				s.forgetLFSMismatch(target)
 				log.Printf("lfs adopt %s: removed legacy blob failing content verification", key)
 			} else {
 				log.Printf("lfs adopt %s: sparing legacy source not proven mismatched", key)
@@ -1182,6 +1223,7 @@ func (s *Server) adoptStoredLFSObject(ctx context.Context, repoID, key, oid stri
 			if err := s.Blob.Delete(delCtx, legacySrc); err != nil && !errors.Is(err, blob.ErrNotFound) {
 				log.Printf("lfs adopt %s: remove mismatched legacy source: %v", key, err)
 			}
+			s.forgetLFSMismatch(legacySrc)
 			log.Printf("lfs adopt %s: removed legacy blob failing content verification", key)
 		} else {
 			log.Printf("lfs adopt %s: sparing legacy source not proven mismatched", key)
@@ -1941,6 +1983,49 @@ func (s *Server) reclaimUncoveredCommit(ctx context.Context, repoID, key string)
 	}
 }
 
+// lfsMismatchMemoCap bounds the failed-verification memo map: entries are
+// per corrupt legacy key, and an attacker with git:write can mint OIDs, so
+// the map must not grow with them. Evicting an arbitrary entry on overflow
+// only costs a repeat re-hash for the evicted key.
+const lfsMismatchMemoCap = 1024
+
+// rememberLFSMismatch memoizes that the version of legacyKey carrying fp
+// failed content verification (Codex security round 118).
+func (s *Server) rememberLFSMismatch(legacyKey, fp string) {
+	if fp == "" {
+		return
+	}
+	s.lfsMismatchMemoMu.Lock()
+	defer s.lfsMismatchMemoMu.Unlock()
+	if s.lfsMismatchMemos == nil {
+		s.lfsMismatchMemos = make(map[string]string)
+	}
+	if _, ok := s.lfsMismatchMemos[legacyKey]; !ok && len(s.lfsMismatchMemos) >= lfsMismatchMemoCap {
+		for k := range s.lfsMismatchMemos {
+			delete(s.lfsMismatchMemos, k)
+			break
+		}
+	}
+	s.lfsMismatchMemos[legacyKey] = fp
+}
+
+// lfsMismatchMemo returns the memoized failed-verification fingerprint for
+// legacyKey, if any.
+func (s *Server) lfsMismatchMemo(legacyKey string) (string, bool) {
+	s.lfsMismatchMemoMu.Lock()
+	defer s.lfsMismatchMemoMu.Unlock()
+	fp, ok := s.lfsMismatchMemos[legacyKey]
+	return fp, ok
+}
+
+// forgetLFSMismatch drops legacyKey's memo (deleted, or replaced by an
+// unknown version whose next touch must prove itself in full).
+func (s *Server) forgetLFSMismatch(legacyKey string) {
+	s.lfsMismatchMemoMu.Lock()
+	defer s.lfsMismatchMemoMu.Unlock()
+	delete(s.lfsMismatchMemos, legacyKey)
+}
+
 // legacySourceProvenMismatched re-hashes the legacy source at cleanup time
 // (Codex round 108, P2): the destination's failed digest proves the bytes
 // the copy caught were wrong, not that the source still holds them. Only a
@@ -1975,46 +2060,36 @@ func (s *Server) legacySourceProvenMismatched(ctx context.Context, repoID, legac
 		return false // absent or unknowable spares; the next touch re-examines
 	}
 	// The snapshot is real replica disk: charge it to the staging budget
-	// like every proxy transfer (Codex round 116, P1) — a zero-byte slot
-	// first (adoption's second-slot shape, round 25), then the bytes
+	// like every proxy transfer (Codex round 116, P1) — bytes grown
 	// through growLFSStaging so the PER-REPOSITORY byte-share fairness
-	// applies too (Codex security round 117: the one-shot reservation
-	// checked only the global cap, letting one repository's oversized
-	// mismatch snapshot 429 every other repository's uploads for the
-	// download's whole size-scaled window). Contention is PRESSED
-	// through the standard bounded window rather than judged once
-	// (Codex round 118): a one-shot denial spared corrupt legacy bytes
-	// that the imminent verified upload's registration then locks in —
-	// round-89's exists-probe makes every later compat repair skip the
-	// spelling — leaving old replicas serving them for the roll's
-	// remainder after a merely transient busy moment. Persistent
-	// denial through the window still spares: unknowable is never
-	// proof, and the residual equals the background legacy-mutability
-	// exposure (a still-valid presigned PUT can re-corrupt the spelling
-	// at any time regardless).
-	grown := int64(0)
-	deadline := time.Now().Add(usageCacheTTL + UsageFloorHandoffMargin)
-	for {
-		if s.reserveLFSStaging(repoID, 0) {
-			if size <= 0 {
-				break
+	// applies (Codex security round 117), against the operation slot the
+	// CALLER already holds (Codex round 120: a second slot made a full
+	// cohort of concurrent mismatches livelock the op pool — every
+	// waiter held its first slot while waiting for its second, so none
+	// could progress until their cleanup contexts expired together).
+	// Contention is PRESSED through the standard bounded window rather
+	// than judged once (Codex round 118): a one-shot denial spared
+	// corrupt legacy bytes that the imminent verified upload's
+	// registration then locks in — round-89's exists-probe makes every
+	// later compat repair skip the spelling. Persistent denial through
+	// the window still spares: unknowable is never proof, and the
+	// residual equals the background legacy-mutability exposure (a
+	// still-valid presigned PUT can re-corrupt the spelling at any time
+	// regardless).
+	if size > 0 {
+		deadline := time.Now().Add(usageCacheTTL + UsageFloorHandoffMargin)
+		for !s.growLFSStaging(repoID, size) {
+			if ctx.Err() != nil || time.Now().After(deadline) {
+				return false
 			}
-			if s.growLFSStaging(repoID, size) {
-				grown = size
-				break
+			select {
+			case <-ctx.Done():
+				return false
+			case <-time.After(ambiguousAccountingRetryInterval):
 			}
-			s.releaseLFSStaging(repoID, 0)
 		}
-		if ctx.Err() != nil || time.Now().After(deadline) {
-			return false
-		}
-		select {
-		case <-ctx.Done():
-			return false
-		case <-time.After(ambiguousAccountingRetryInterval):
-		}
+		defer s.shrinkLFSStaging(repoID, size)
 	}
-	defer func() { s.releaseLFSStaging(repoID, grown) }()
 	dir, err := os.MkdirTemp("", "lfs-mismatch-*")
 	if err != nil {
 		return false
