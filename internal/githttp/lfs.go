@@ -3628,12 +3628,17 @@ func (s *Server) ensureLegacyCompat(ctx context.Context, repoID, oid, key string
 		switch v, rerr := s.resolveLegacyMismatchMemo(ctx, repoID, oid, key, legacyKey); {
 		case rerr != nil:
 			return rerr
-		case v != legacyMemoRemoved:
-			// Pending or proven valid: nothing to re-bridge. Pending is
-			// tolerable HERE — the registered fast paths are repeat
-			// touches by construction, so the next touch re-presses
-			// (round 121).
-			return nil
+		case v == legacyMemoValid:
+			return nil // the true object converged; nothing to re-bridge
+		case v == legacyMemoPending:
+			// PENDING propagates as retryable contention here too
+			// (Codex round 131): the PUT tail's 429 sends its retry to
+			// exactly this seam, and mapping pending to success would
+			// close that loop with a 200 over the known-corrupt
+			// spelling. Every caller maps errLFSBusy to a retryable
+			// verdict (429), so clients keep pressing until the cleanup
+			// deletes, proves the version valid, or the memo clears.
+			return fmt.Errorf("compat cleanup pending %s: %w", legacyKey, errLFSBusy)
 		}
 		// Fall through: the spelling is now absent and the bridge
 		// repair below republishes the verified canonical bytes.
