@@ -2439,6 +2439,77 @@ func TestLFSAdopt_FailedLegacyDeleteKeepsMarkerPending(t *testing.T) {
 	}
 }
 
+// statFingerprintFailingBlob fails StatFingerprint for one key — the
+// round-134 marker-persistence outage's probe leg.
+type statFingerprintFailingBlob struct {
+	blob.BlobStore
+	key string
+}
+
+func (b *statFingerprintFailingBlob) StatFingerprint(ctx context.Context, key string) (int64, string, error) {
+	if key == b.key {
+		return 0, "", fmt.Errorf("simulated fingerprint outage for %s", key)
+	}
+	return b.BlobStore.StatFingerprint(ctx, key)
+}
+
+// recordMismatchFailingStore fails RecordLFSMismatch — the round-134
+// marker-persistence outage's write leg.
+type recordMismatchFailingStore struct {
+	ref.RefStore
+}
+
+func (s *recordMismatchFailingStore) RecordLFSMismatch(ctx context.Context, repo, key, fingerprint string) error {
+	return fmt.Errorf("simulated mismatch marker write outage for %s", key)
+}
+
+// TestLFSAdopt_UnpersistedMismatchMarkerFailsRequest (Codex round 134,
+// P2): when the proven-corrupt legacy delete fails AND the pending
+// marker cannot be durably persisted — the fingerprint probe or the
+// marker write itself fails — returning mismatch anyway offers the
+// canonical upload, whose registration makes the compat probes bless
+// the surviving unmarked corrupt spelling for the roll's remainder.
+// The request must FAIL unless the marker was verifiably persisted.
+func TestLFSAdopt_UnpersistedMismatchMarkerFailsRequest(t *testing.T) {
+	setup := func(t *testing.T) (*Server, string, string, string) {
+		ctx := context.Background()
+		srv, _, _ := newLFSQuotaServer(t, 0, time.Hour)
+		content := []byte("what the pointer expects here")
+		oid := sha256Hex(content)
+		key := blob.LFSKey(lfsTestRepoID, oid)
+		legacyKey := blob.LFSLegacyKey(lfsTestRepoID, oid)
+		corrupt := []byte("forged bytes at both spellings")
+		if err := srv.Blob.UploadFile(ctx, key, writeTempFile(t, corrupt)); err != nil {
+			t.Fatal(err)
+		}
+		if err := srv.Blob.UploadFile(ctx, legacyKey, writeTempFile(t, corrupt)); err != nil {
+			t.Fatal(err)
+		}
+		srv.Blob = &failingDeleteBlob{BlobStore: srv.Blob, key: legacyKey}
+		return srv, key, legacyKey, oid
+	}
+	check := func(t *testing.T, srv *Server, key, legacyKey, oid string) {
+		ctx := context.Background()
+		aerr := srv.adoptLFSObject(ctx, lfsTestRepoID, key, oid)
+		if aerr == nil || errors.Is(aerr, errLFSContentMismatch) {
+			t.Fatalf("adoption with an unpersistable mismatch marker = %v, want a non-mismatch failure — a mismatch verdict offers the upload that locks the unmarked corrupt spelling in", aerr)
+		}
+		if _, serr := srv.Blob.Stat(ctx, legacyKey); serr != nil {
+			t.Fatalf("legacy spelling unexpectedly gone: %v", serr)
+		}
+	}
+	t.Run("fingerprint probe fails", func(t *testing.T) {
+		srv, key, legacyKey, oid := setup(t)
+		srv.Blob = &statFingerprintFailingBlob{BlobStore: srv.Blob, key: legacyKey}
+		check(t, srv, key, legacyKey, oid)
+	})
+	t.Run("marker write fails", func(t *testing.T) {
+		srv, key, legacyKey, oid := setup(t)
+		srv.Store = &recordMismatchFailingStore{RefStore: srv.Store}
+		check(t, srv, key, legacyKey, oid)
+	})
+}
+
 // readCountingBlob counts ranged verification reads per key.
 type readCountingBlob struct {
 	blob.BlobStore

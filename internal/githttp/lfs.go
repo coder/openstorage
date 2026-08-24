@@ -1284,8 +1284,30 @@ func (s *Server) adoptStoredLFSObject(ctx context.Context, repoID, key, oid stri
 				fpctx, fpcancel := context.WithTimeout(context.WithoutCancel(ctx), lfsProbeTimeout)
 				_, curFP, fperr := s.Blob.StatFingerprint(fpctx, legacySrc)
 				fpcancel()
-				if fperr == nil {
-					s.rememberLFSMismatch(ctx, repoID, legacySrc, curFP)
+				// The marker's persistence is REQUIRED here, not
+				// best-effort (Codex round 134): this branch still
+				// returns mismatch — the batch offers the canonical
+				// upload, and once it registers, the compat probes
+				// trust marker ABSENCE as clean (round 132's rule). A
+				// swallowed probe or record failure would leave the
+				// surviving proven-corrupt spelling unmarked forever,
+				// so either failure FAILS the request instead: no
+				// upload is offered, the client retries, and the next
+				// touch re-proves and re-presses. Only a vanished
+				// spelling needs no marker — a peer's delete landed,
+				// nothing survives for the probes to bless.
+				switch {
+				case errors.Is(fperr, blob.ErrNotFound):
+					s.forgetLFSMismatch(ctx, repoID, legacySrc)
+				case fperr != nil:
+					return fmt.Errorf("fingerprint surviving mismatched legacy source %s: %w", legacySrc, fperr)
+				default:
+					rctx, rcancel := context.WithTimeout(context.WithoutCancel(ctx), lfsProbeTimeout)
+					rerr := s.Store.RecordLFSMismatch(rctx, repoID, legacySrc, curFP)
+					rcancel()
+					if rerr != nil {
+						return fmt.Errorf("record mismatch marker for surviving legacy source %s: %w", legacySrc, rerr)
+					}
 				}
 			} else {
 				s.forgetLFSMismatch(ctx, repoID, legacySrc)
