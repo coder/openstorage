@@ -1654,9 +1654,26 @@ func (s *Server) publishVerifiedLFSObject(ctx context.Context, repoID, key, lega
 		return nil // the caller's destination re-verify digest-proves the bytes
 	}
 	if renewErr != nil {
-		// The bytes are durable and the cover tail broke: log like the
-		// restore paths — the next admission's fresh floor lists them.
-		log.Printf("lfs adopt %s: publish cover tail: %v", key, renewErr)
+		// An uncovered-gap commit is UNSAFE to accept (Codex round 105,
+		// P1): continuity was lost while — or right after — the copy
+		// committed, so a stale-floor admission may already have consumed
+		// headroom that never accounted these bytes; registering them
+		// would durably exceed the quota. Remove the rowless destination
+		// under the held claim (GuardedLFSDelete spares it if a
+		// registration somehow landed) and FAIL — the retry re-admits and
+		// re-copies from scratch. A failed cleanup leaves only the
+		// crashed-publisher orphan shape the next fresh floor lists.
+		delCtx, delCancel := context.WithTimeout(dctx, lfsCleanupTimeout)
+		defer delCancel()
+		if _, derr := s.Store.GuardedLFSDelete(delCtx, repoID, key, func(gctx context.Context) error {
+			if err := s.Blob.Delete(gctx, key); err != nil && !errors.Is(err, blob.ErrNotFound) {
+				return err
+			}
+			return nil
+		}); derr != nil {
+			log.Printf("lfs adopt %s: uncovered-copy cleanup: %v", key, derr)
+		}
+		return fmt.Errorf("adoption publish %s: cover continuity lost: %w", key, renewErr)
 	}
 	return nil
 }
@@ -2867,9 +2884,27 @@ func (s *Server) maybeLegacyCompatCopy(ctx context.Context, repoID, oid, key str
 	}
 	s.invalidateUsageFloor(repoID)
 	if renewErr != nil {
-		// The bytes ARE durable; only the cover tail broke. Log like the
-		// restore paths.
-		log.Printf("lfs compat copy %s: cover tail: %v", key, renewErr)
+		// The adoption path's round-105 rule applies to the bridge twin:
+		// an uncovered-gap commit (or a handoff that never landed under a
+		// live cover) may already have let a stale-floor admission consume
+		// headroom these bytes never occupied — accepting the copy could
+		// durably exceed the quota. Remove the destination under the held
+		// legacy claim and FAIL; the request's failure keeps the client
+		// retrying until ensureLegacyCompat re-bridges under a fresh
+		// admission. The legacy spelling carries no integrity contract,
+		// so deleting our own copy loses nothing old replicas could
+		// trust.
+		delCtx, delCancel := context.WithTimeout(dctx, lfsCleanupTimeout)
+		defer delCancel()
+		if _, derr := s.Store.GuardedLFSDelete(delCtx, repoID, legacyKey, func(gctx context.Context) error {
+			if err := s.Blob.Delete(gctx, legacyKey); err != nil && !errors.Is(err, blob.ErrNotFound) {
+				return err
+			}
+			return nil
+		}); derr != nil {
+			log.Printf("lfs compat copy %s: uncovered-copy cleanup: %v", legacyKey, derr)
+		}
+		return fmt.Errorf("compat copy %s: cover continuity lost: %w", legacyKey, renewErr)
 	}
 	return nil
 }

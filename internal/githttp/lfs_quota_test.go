@@ -2127,6 +2127,53 @@ func TestLFSPut_CapRaceRechecksLegacyRow(t *testing.T) {
 	}
 }
 
+// coverRenewalOutageStore fails every unbounded cover renewal (the
+// MaxInt64-quota reservations) while real admissions succeed — a ref-store
+// outage spanning the copy's whole cover-continuity budget.
+type coverRenewalOutageStore struct {
+	ref.RefStore
+}
+
+func (s *coverRenewalOutageStore) ReservePackBytes(ctx context.Context, group []string, packs []ref.Pack, owner string, floor, floorGen, quota int64, ttl time.Duration) (ref.ReserveDecision, error) {
+	if quota == math.MaxInt64 {
+		return ref.ReserveDecision{}, fmt.Errorf("simulated cover-renewal outage")
+	}
+	return s.RefStore.ReservePackBytes(ctx, group, packs, owner, floor, floorGen, quota, ttl)
+}
+
+// TestLFSAdopt_UncoveredGapCommitRejected (Codex round 105, P1): a copy
+// can commit while cover continuity is lost — WithRenewedCover surfaces
+// renewErr — and both copy paths merely logged it: the durable bytes were
+// then accepted (and registered) although a stale-floor admission may have
+// consumed headroom that never accounted them, durably exceeding the
+// quota. The adoption must reject the copy, remove the rowless
+// destination, and let the retry re-admit from scratch. Runs the REAL
+// cover-continuity budget (~50s); the bridge twin shares the seam.
+func TestLFSAdopt_UncoveredGapCommitRejected(t *testing.T) {
+	if testing.Short() {
+		t.Skip("runs the real ~45s cover-continuity budget")
+	}
+	ctx := context.Background()
+	srv, st, _ := newLFSQuotaServer(t, 1<<20, time.Hour)
+	content := []byte("uncovered gap commit")
+	oid := sha256Hex(content)
+	key := blob.LFSKey(lfsTestRepoID, oid)
+	if err := srv.Blob.UploadFile(ctx, blob.LFSLegacyKey(lfsTestRepoID, oid), writeTempFile(t, content)); err != nil {
+		t.Fatal(err)
+	}
+	srv.Store = &coverRenewalOutageStore{RefStore: st}
+
+	if aerr := srv.adoptLFSObject(ctx, lfsTestRepoID, key, oid); aerr == nil {
+		t.Fatal("adoption accepted a copy whose cover continuity broke — a stale-floor admission may already have spent this headroom")
+	}
+	if has, err := st.HasLFSObject(ctx, lfsTestRepoID, key); err != nil || has {
+		t.Fatalf("registered after an uncovered-gap copy = (%v, %v), want not registered", has, err)
+	}
+	if _, err := srv.Blob.Stat(ctx, key); err == nil {
+		t.Fatal("rowless uncovered destination retained — physical usage could exceed quota until the sweep")
+	}
+}
+
 // TestLFSCompat_RepairSerializedOnLegacyClaim (Codex security round 85):
 // the batch fast path's bridge repair launched an unserialized full copy —
 // every tiny concurrent touch of the object started another one. Compat
