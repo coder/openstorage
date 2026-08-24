@@ -103,7 +103,7 @@ func TestRiverSyncRequestDuringRunningJobSchedulesSuccessor(t *testing.T) {
 	}
 
 	deliverer := &events.Deliverer{Webhooks: stubWebhooks{}, Logger: slog.New(slog.DiscardHandler)}
-	q, err := NewRiver(ctx, pgURL, deliverer, runner, store, nil, nil, nil, slog.New(slog.DiscardHandler))
+	q, err := NewRiver(ctx, pgURL, deliverer, runner, store, nil, nil, nil, nil, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatalf("NewRiver: %v", err)
 	}
@@ -166,7 +166,7 @@ func TestRiverSyncPendingSurvivesPreClaimFailure(t *testing.T) {
 	}
 
 	deliverer := &events.Deliverer{Webhooks: stubWebhooks{}, Logger: slog.New(slog.DiscardHandler)}
-	q, err := NewRiver(ctx, pgURL, deliverer, runner, store, nil, nil, nil, slog.New(slog.DiscardHandler))
+	q, err := NewRiver(ctx, pgURL, deliverer, runner, store, nil, nil, nil, nil, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatalf("NewRiver: %v", err)
 	}
@@ -227,7 +227,7 @@ func TestRiverSyncSkipWithPendingSnoozesUntilSteal(t *testing.T) {
 	}
 
 	deliverer := &events.Deliverer{Webhooks: stubWebhooks{}, Logger: slog.New(slog.DiscardHandler)}
-	q, err := NewRiver(ctx, pgURL, deliverer, runner, store, nil, nil, nil, slog.New(slog.DiscardHandler))
+	q, err := NewRiver(ctx, pgURL, deliverer, runner, store, nil, nil, nil, nil, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatalf("NewRiver: %v", err)
 	}

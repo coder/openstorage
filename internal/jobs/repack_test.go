@@ -1620,7 +1620,7 @@ func TestRiver_RepackUniqueByRepo(t *testing.T) {
 
 	deliverer := &events.Deliverer{Webhooks: stubWebhooks{}, Logger: slog.New(slog.DiscardHandler)}
 	q, err := NewRiver(ctx, pgURL, deliverer, func(context.Context, sync.Job) error { return nil }, sync.NewMemStore(),
-		nil, nil, r, slog.New(slog.DiscardHandler))
+		nil, nil, nil, r, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatalf("NewRiver: %v", err)
 	}
