@@ -3396,14 +3396,45 @@ func (s *Server) ensureLegacyCompat(ctx context.Context, repoID, oid, key string
 	if !s.LFSV020WriteCompat {
 		return nil
 	}
+	legacyKey := blob.LFSLegacyKey(repoID, oid)
 	lctx, lcancel := context.WithTimeout(context.WithoutCancel(ctx), lfsProbeTimeout)
-	_, lerr := s.Blob.Stat(lctx, blob.LFSLegacyKey(repoID, oid))
+	_, legacyFP, lerr := s.Blob.StatFingerprint(lctx, legacyKey)
 	lcancel()
 	switch {
 	case lerr == nil:
-		return nil // the spelling exists: nothing to converge
+		// Existence is NOT satisfaction while a memoized failed
+		// verification stands (Codex round 121): a corrupt legacy
+		// survivor whose budgeted cleanup was spared by staging
+		// contention would otherwise lock in behind this very probe for
+		// the roll's remainder — the registered fast paths are the ONLY
+		// touches a registered object gets. If the spelling still
+		// carries the proven-wrong fingerprint, press the cleanup here;
+		// a deletion falls through to the bridge repair below, which
+		// republishes verified canonical bytes. A still-spared verdict
+		// keeps the memo for the next touch.
+		memoFP, ok := s.lfsMismatchMemo(legacyKey)
+		if !ok || memoFP != legacyFP {
+			if ok {
+				s.forgetLFSMismatch(legacyKey) // replaced: prove in full next time
+			}
+			return nil // the spelling exists: nothing to converge
+		}
+		dctx, dcancel := context.WithTimeout(context.WithoutCancel(ctx), lfsCleanupTimeout)
+		defer dcancel()
+		if !s.legacySourceProvenMismatched(dctx, repoID, legacyKey, oid) {
+			return nil // spared again; the memo stands for the next touch
+		}
+		delCtx, delCancel := context.WithTimeout(context.WithoutCancel(ctx), lfsCleanupTimeout)
+		defer delCancel()
+		if err := s.Blob.Delete(delCtx, legacyKey); err != nil && !errors.Is(err, blob.ErrNotFound) {
+			return fmt.Errorf("remove memoized mismatched legacy object %s: %w", legacyKey, err)
+		}
+		s.forgetLFSMismatch(legacyKey)
+		log.Printf("lfs compat %s: removed memoized mismatched legacy blob before re-bridging", key)
+		// Fall through: the spelling is now absent and the bridge
+		// repair below republishes the verified canonical bytes.
 	case !errors.Is(lerr, blob.ErrNotFound):
-		return fmt.Errorf("compat probe %s: %w", blob.LFSLegacyKey(repoID, oid), lerr)
+		return fmt.Errorf("compat probe %s: %w", legacyKey, lerr)
 	}
 	sctx, scancel := context.WithTimeout(context.WithoutCancel(ctx), lfsProbeTimeout)
 	size, serr := s.Blob.Stat(sctx, key)
