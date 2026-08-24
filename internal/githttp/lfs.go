@@ -1877,47 +1877,56 @@ func (s *Server) reclaimUncoveredCommit(ctx context.Context, repoID, key string)
 // legacySourceProvenMismatched re-hashes the legacy source at cleanup time
 // (Codex round 108, P2): the destination's failed digest proves the bytes
 // the copy caught were wrong, not that the source still holds them. Only a
-// fresh digest over the CURRENT source content is decisive. Errors report
-// false — unknowable state spares, and the next touch re-examines. Bounded
-// per chunk like verification; runs only on the rare mismatch path, under
-// the caller's held claim and op slot.
+// fresh digest over one SINGLE stored version is decisive — computed over
+// an atomically downloaded local snapshot (round 115). Errors report
+// false — unknowable state spares, and the next touch re-examines.
+// Size-scale-bounded; runs only on the rare mismatch path, under the
+// caller's held claim and op slot.
 func (s *Server) legacySourceProvenMismatched(ctx context.Context, legacyKey, oid string) bool {
-	sctx, scancel := context.WithTimeout(ctx, lfsProbeTimeout)
-	size, startFP, err := s.Blob.StatFingerprint(sctx, legacyKey)
-	scancel()
+	// SINGLE-VERSION snapshot by construction (Codex round 115): chunked
+	// ranged reads can interleave with legacy PUTs, and content-derived
+	// fingerprints are ABA-blind (A→B→A restores the fingerprint around
+	// a mixed read), so no read-side stat pinning can prove the ranges
+	// came from one version. One atomic DownloadFile is one GET: the
+	// local snapshot is exactly one stored version's bytes, and the
+	// digest verdict binds to that version. Disk-staged like every proxy
+	// transfer, on the rare attack-gated mismatch path only, under the
+	// caller's held op slot. The residual — a replacement between this
+	// proof and the caller's delete — is one RTT and irreducible here:
+	// conditional DELETE If-Match is silently ignored by MinIO (verified
+	// round 84) and the legacy namespace takes no fleet claims by design
+	// (still-valid presigned PUTs, old replicas) — ADR-41's documented
+	// legacy-mutability residual class.
+	pctx, pcancel := context.WithTimeout(ctx, lfsProbeTimeout)
+	size, perr := s.Blob.Stat(pctx, legacyKey)
+	pcancel()
+	if perr != nil {
+		return false // absent or unknowable spares; the next touch re-examines
+	}
+	dir, err := os.MkdirTemp("", "lfs-mismatch-*")
 	if err != nil {
 		return false
 	}
-	h := sha256.New()
-	for off := int64(0); off < size; {
-		n := min(lfsStagingChunk, size-off)
-		cctx, ccancel := context.WithTimeout(ctx, lfsVerifyChunkTimeout)
-		chunk, cerr := s.Blob.ReadRange(cctx, legacyKey, off, n)
-		ccancel()
-		if cerr != nil {
-			return false
-		}
-		_, _ = h.Write(chunk)
-		off += n
+	defer os.RemoveAll(dir)
+	snap := filepath.Join(dir, "snap")
+	// The size-scaled allowance every LFS transfer uses (round 81's
+	// shape): a live backend finishes, a wedged one is cut loose.
+	dctx, dcancel := context.WithTimeout(ctx, 5*time.Minute+time.Duration(size>>20)*time.Second)
+	derr := s.Blob.DownloadFile(dctx, legacyKey, snap)
+	dcancel()
+	if derr != nil {
+		return false // unknowable state spares; the next touch re-examines
 	}
-	if hex.EncodeToString(h.Sum(nil)) == oid {
+	f, ferr := os.Open(snap)
+	if ferr != nil {
 		return false
 	}
-	// Fingerprint-stable snapshot (Codex round 110): a replacement
-	// landing BETWEEN ranged reads yields a mixed digest proving nothing
-	// about any single version — the verdict holds only if the object's
-	// same-key fingerprint is unchanged across the whole hash, so every
-	// range came from one version and that version is proven wrong. A
-	// moved fingerprint spares. The residual — a replacement between this
-	// check and the caller's delete — is one RTT and irreducible here:
-	// conditional DELETE If-Match is silently ignored by MinIO (verified
-	// round 84) and the legacy namespace takes no fleet claims by design
-	// (still-valid presigned PUTs, old replicas), which is ADR-41's
-	// documented legacy-mutability residual class.
-	ectx, ecancel := context.WithTimeout(ctx, lfsProbeTimeout)
-	_, endFP, eerr := s.Blob.StatFingerprint(ectx, legacyKey)
-	ecancel()
-	return eerr == nil && endFP == startFP
+	defer f.Close()
+	h := sha256.New()
+	if _, cerr := io.Copy(h, f); cerr != nil {
+		return false
+	}
+	return hex.EncodeToString(h.Sum(nil)) != oid
 }
 
 // withRenewedAdoptionClaim runs op while renewing the fleet claim for key
