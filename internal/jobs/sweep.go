@@ -989,12 +989,36 @@ func (s *Sweeper) safeDelete(ctx context.Context, repo, key string) (bool, error
 		// post-registration writer verify strictly follow the delete and
 		// republish. Pack deletes stay unguarded: their restores are
 		// always correct, so the existing recheck+heal layers suffice.
+		errReapGraceSpared := errors.New("legacy source re-entered the reap grace")
 		deleted, gerr := s.packs.GuardedLFSDelete(hctx, repo, key, func(ctx context.Context) error {
+			// The classify-time grace check races adoption (Codex round
+			// 100): a rowless legacy source can be adopted — canonical
+			// row registered, created_at fresh — between that check and
+			// this handshake, and the guard's own re-read consults only
+			// the LEGACY key, which is never registered. Recheck the
+			// canonical twin HERE: the guard's count-row lock serializes
+			// against registrations, so a committed fresh registration
+			// is always visible and an in-flight one blocks until this
+			// delete commits — in which case the adoption's own copy or
+			// the client's verified retry supplies the bytes.
+			if _, _, ok := splitLFSKey(key); ok {
+				spared, err := s.legacySourceInReapGrace(ctx, repo, key)
+				if err != nil {
+					return err
+				}
+				if spared {
+					return errReapGraceSpared
+				}
+			}
 			if err := s.blobs.Delete(ctx, key); err != nil && !errors.Is(err, blob.ErrNotFound) {
 				return err
 			}
 			return nil
 		})
+		if errors.Is(gerr, errReapGraceSpared) {
+			s.logger.Info("orphan pack sweep: spared legacy source adopted mid-handshake", "key", key)
+			return false, nil
+		}
 		if gerr == nil && !deleted {
 			// A verified upload registered before the guard's re-read: the
 			// delete never executed and its bytes stand. The backup is
