@@ -1271,10 +1271,26 @@ func (s *Server) adoptStoredLFSObject(ctx context.Context, repoID, key, oid stri
 			delCtx, delCancel := context.WithTimeout(context.WithoutCancel(ctx), lfsCleanupTimeout)
 			defer delCancel()
 			if err := s.Blob.Delete(delCtx, legacySrc); err != nil && !errors.Is(err, blob.ErrNotFound) {
+				// A FAILED delete keeps the mismatch PENDING (Codex
+				// round 133): clearing the marker here — while this
+				// best-effort branch still returns mismatch and the
+				// batch offers a canonical upload — let the surviving
+				// proven-corrupt spelling pass the post-registration
+				// compat probes as implicitly clean for the roll's
+				// remainder. Record the fresh verdict instead so the
+				// pending machinery presses the delete on every later
+				// touch until it lands or the version proves valid.
 				log.Printf("lfs adopt %s: remove mismatched legacy source: %v", key, err)
+				fpctx, fpcancel := context.WithTimeout(context.WithoutCancel(ctx), lfsProbeTimeout)
+				_, curFP, fperr := s.Blob.StatFingerprint(fpctx, legacySrc)
+				fpcancel()
+				if fperr == nil {
+					s.rememberLFSMismatch(ctx, repoID, legacySrc, curFP)
+				}
+			} else {
+				s.forgetLFSMismatch(ctx, repoID, legacySrc)
+				log.Printf("lfs adopt %s: removed legacy blob failing content verification", key)
 			}
-			s.forgetLFSMismatch(ctx, repoID, legacySrc)
-			log.Printf("lfs adopt %s: removed legacy blob failing content verification", key)
 		} else {
 			log.Printf("lfs adopt %s: sparing legacy source not proven mismatched", key)
 		}

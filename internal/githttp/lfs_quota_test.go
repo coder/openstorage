@@ -2387,6 +2387,58 @@ func TestLFSAdopt_CoverCanceledCommitRejected(t *testing.T) {
 	}
 }
 
+// failingDeleteBlob fails Delete for one key — the round-133 transient
+// backend failure shape.
+type failingDeleteBlob struct {
+	blob.BlobStore
+	key string
+}
+
+func (b *failingDeleteBlob) Delete(ctx context.Context, key string) error {
+	if key == b.key {
+		return fmt.Errorf("simulated transient delete failure for %s", key)
+	}
+	return b.BlobStore.Delete(ctx, key)
+}
+
+// TestLFSAdopt_FailedLegacyDeleteKeepsMarkerPending (Codex round 133,
+// P2): the canonical-mismatch path's best-effort legacy cleanup cleared
+// the mismatch marker even when the proven-corrupt spelling's Delete
+// FAILED — the caller still returns mismatch, the batch offers a
+// canonical upload, and after that upload registers the compat probes
+// see the surviving legacy key with no marker: implicitly clean for the
+// roll's remainder. A failed delete must leave the mismatch pending.
+func TestLFSAdopt_FailedLegacyDeleteKeepsMarkerPending(t *testing.T) {
+	ctx := context.Background()
+	srv, st, _ := newLFSQuotaServer(t, 0, time.Hour)
+	content := []byte("what the pointer expects here")
+	oid := sha256Hex(content)
+	key := blob.LFSKey(lfsTestRepoID, oid)
+	legacyKey := blob.LFSLegacyKey(lfsTestRepoID, oid)
+	corrupt := []byte("forged bytes at both spellings")
+	// A crashed adoption's residue: corrupt canonical bytes (rowless)
+	// AND the corrupt legacy source they were copied from.
+	if err := srv.Blob.UploadFile(ctx, key, writeTempFile(t, corrupt)); err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.Blob.UploadFile(ctx, legacyKey, writeTempFile(t, corrupt)); err != nil {
+		t.Fatal(err)
+	}
+	srv.Blob = &failingDeleteBlob{BlobStore: srv.Blob, key: legacyKey}
+
+	if aerr := srv.adoptLFSObject(ctx, lfsTestRepoID, key, oid); !errors.Is(aerr, errLFSContentMismatch) {
+		t.Fatalf("adoption of corrupt spellings = %v, want errLFSContentMismatch", aerr)
+	}
+	// The legacy delete failed: the spelling survives, so the PENDING
+	// marker must stand for the compat probes to press.
+	if _, serr := srv.Blob.Stat(ctx, legacyKey); serr != nil {
+		t.Fatalf("legacy spelling unexpectedly gone: %v", serr)
+	}
+	if _, has, err := st.LFSMismatchFingerprint(ctx, lfsTestRepoID, legacyKey); err != nil || !has {
+		t.Fatalf("mismatch marker after a failed delete = (%v, %v), want standing — without it the registered compat probes bless the surviving corrupt spelling", has, err)
+	}
+}
+
 // readCountingBlob counts ranged verification reads per key.
 type readCountingBlob struct {
 	blob.BlobStore
