@@ -1066,9 +1066,20 @@ func (s *Server) adoptStoredLFSObject(ctx context.Context, repoID, key, oid stri
 			fcancel()
 			switch {
 			case ferr == nil && nowFP == memoFP:
-				dctx, dcancel := context.WithTimeout(context.WithoutCancel(ctx), lfsCleanupTimeout)
-				defer dcancel()
-				switch m, decisive := s.legacySourceProvenMismatched(dctx, repoID, target, oid); {
+				// The snapshot can outlive ref.AdoptionClaimTTL (Codex
+				// round 126's hazard on the compat twin): keep the held
+				// canonical claim renewed for its whole size-scaled
+				// life, join before judging (round 88), and spare on a
+				// recorded loss.
+				snapCtx, snapCancel := context.WithCancelCause(context.WithoutCancel(ctx))
+				defer snapCancel(nil)
+				stopRenew := s.keepAdoptionClaimRenewed(snapCtx, snapCancel, key, claimOwner)
+				m, decisive := s.legacySourceProvenMismatched(snapCtx, repoID, target, oid)
+				stopRenew()
+				if cause := context.Cause(snapCtx); cause != nil && !errors.Is(cause, context.Canceled) {
+					return errLFSContentMismatch // lease lost mid-snapshot: spared, memo stands
+				}
+				switch {
 				case m:
 					delCtx, delCancel := context.WithTimeout(context.WithoutCancel(ctx), lfsCleanupTimeout)
 					defer delCancel()
@@ -3494,9 +3505,22 @@ func (s *Server) ensureLegacyCompat(ctx context.Context, repoID, oid, key string
 			}
 			rcancel()
 		}
-		dctx, dcancel := context.WithTimeout(context.WithoutCancel(ctx), lfsCleanupTimeout)
-		defer dcancel()
-		m, decisive := s.legacySourceProvenMismatched(dctx, repoID, legacyKey, oid)
+		// The snapshot's size-scaled life can exceed ref.AdoptionClaimTTL
+		// (Codex round 126): a claim acquired here but first renewed
+		// AFTER a multi-hour download always found an expired row — the
+		// proven-corrupt spelling was spared forever, with every later
+		// touch repeating the full snapshot. Keep the claim renewed on
+		// the adoption cadence for the snapshot's whole life, join
+		// before judging (round 88), and spare on a recorded loss.
+		snapCtx, snapCancel := context.WithCancelCause(context.WithoutCancel(ctx))
+		defer snapCancel(nil)
+		stopRenew := s.keepAdoptionClaimRenewed(snapCtx, snapCancel, legacyKey, claimOwner)
+		m, decisive := s.legacySourceProvenMismatched(snapCtx, repoID, legacyKey, oid)
+		stopRenew()
+		if cause := context.Cause(snapCtx); cause != nil && !errors.Is(cause, context.Canceled) {
+			releaseClaim()
+			return nil // lease lost mid-snapshot: spared, memo stands
+		}
 		switch {
 		case !decisive:
 			releaseClaim()
