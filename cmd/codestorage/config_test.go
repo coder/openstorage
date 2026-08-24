@@ -1280,6 +1280,53 @@ func TestResolveLFSGCSettings(t *testing.T) {
 	}
 }
 
+// TestResolveAbsenceSettings (issue #101): the absence reconciliation
+// knobs parse fail-fast like the sweep settings.
+func TestResolveAbsenceSettings(t *testing.T) {
+	env := func(m map[string]string) func(string) string {
+		return func(k string) string { return m[k] }
+	}
+
+	t.Run("defaults", func(t *testing.T) {
+		s, err := resolveAbsenceSettings(env(nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := absenceSettings{budget: jobs.DefaultAbsenceReconcileBudget}
+		if s != want {
+			t.Fatalf("defaults = %+v, want %+v (disabled, 100k budget)", s, want)
+		}
+	})
+
+	t.Run("parse-through", func(t *testing.T) {
+		s, err := resolveAbsenceSettings(env(map[string]string{
+			envAbsenceReconcileInterval: "45m",
+			envAbsenceReconcileBudget:   "5000",
+		}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := absenceSettings{interval: 45 * time.Minute, budget: 5000}
+		if s != want {
+			t.Fatalf("settings = %+v, want %+v", s, want)
+		}
+	})
+
+	for name, bad := range map[string]map[string]string{
+		"negative interval":  {envAbsenceReconcileInterval: "-1h"},
+		"malformed interval": {envAbsenceReconcileInterval: "soon"},
+		"zero budget":        {envAbsenceReconcileBudget: "0"},
+		"negative budget":    {envAbsenceReconcileBudget: "-5"},
+		"malformed budget":   {envAbsenceReconcileBudget: "many"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := resolveAbsenceSettings(env(bad)); err == nil {
+				t.Fatalf("%v must fail", bad)
+			}
+		})
+	}
+}
+
 // TestResolveLFSMaxObjectsPerRepo (issue #73 option 3): the operator escape
 // hatch parses positively or fails loudly.
 func TestResolveLFSMaxObjectsPerRepo(t *testing.T) {
