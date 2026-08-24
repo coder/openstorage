@@ -93,7 +93,7 @@ func ReachableLFSOIDs(ctx context.Context, repoPath string, budget int64) (map[s
 			return nil, 0, fmt.Errorf("start %s: %w", strings.Join(cmd.Args[:3], " "), err)
 		}
 		// Reap on every exit path; pump goroutines Wait first on success.
-		defer func(c *exec.Cmd) { _ = c.Wait() }(cmd) //nolint:errcheck // best-effort reap after pipeline teardown
+		defer func(c *exec.Cmd) { _ = c.Wait() }(cmd)
 	}
 
 	var walked atomic.Int64
