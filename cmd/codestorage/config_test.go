@@ -44,6 +44,35 @@ func TestEnvFirstPrecedence(t *testing.T) {
 	}
 }
 
+// TestResolveServeConfigCompatForbidsDestructiveLFSSweep (Codex round
+// 101, P1): the write-compat flag declares a mixed v0.2.0 fleet — and
+// during that roll, DESTRUCTIVE LFS sweeping must be off fleet-wide: the
+// in-place row migration makes touched objects' legacy blobs rowless from
+// a v0.2.0 sweeper's perspective, and an old reap-enabled sweeper deletes
+// them immediately (retained sources are commonly past any threshold),
+// breaking old-replica reads mid-roll. Old binaries cannot be guarded
+// retroactively; the new binary's startup tripwire forces the operator to
+// stage the flags correctly.
+func TestResolveServeConfigCompatForbidsDestructiveLFSSweep(t *testing.T) {
+	env := map[string]string{
+		"CODESTORAGE_ORG":                   "org1",
+		"CODESTORAGE_ORG_PUBKEYS":           "/tmp/org.pub.pem",
+		"CODESTORAGE_LFS_V020_WRITE_COMPAT": "true",
+		"CODESTORAGE_SWEEP_DELETE_LFS":      "true",
+	}
+	for k, v := range spikeEnv {
+		env[k] = v
+	}
+	if _, err := resolveServeConfig(mapEnv(env), "", "127.0.0.1:0", "/tmp/cache", ""); err == nil {
+		t.Fatal("write-compat + destructive LFS sweeping resolved — the combination breaks v0.2.0 replicas mid-roll and must fail startup")
+	}
+	// Compat with list-only sweeping stays valid.
+	delete(env, "CODESTORAGE_SWEEP_DELETE_LFS")
+	if _, err := resolveServeConfig(mapEnv(env), "", "127.0.0.1:0", "/tmp/cache", ""); err != nil {
+		t.Fatalf("write-compat with list-only sweeping: %v", err)
+	}
+}
+
 func TestResolveServeConfigLegacyEnvCompat(t *testing.T) {
 	// Legacy PG_URL/BLOB_URL names and the --addr alias still resolve; the
 	// org config is mandatory since ADR-8 dropped git-only serve mode.
