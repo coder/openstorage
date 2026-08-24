@@ -91,8 +91,11 @@ func TestPackKeyHelpers(t *testing.T) {
 	if got, want := PackPrefix("r1"), "packs/r1/"; got != want {
 		t.Fatalf("PackPrefix = %q, want %q", got, want)
 	}
-	if got, want := LFSKey("r1", "abc"), "lfs/r1/abc"; got != want {
+	if got, want := LFSKey("r1", "abc"), "lfs/r1/o2/abc"; got != want {
 		t.Fatalf("LFSKey = %q, want %q", got, want)
+	}
+	if got, want := LFSLegacyKey("r1", "abc"), "lfs/r1/abc"; got != want {
+		t.Fatalf("LFSLegacyKey = %q, want %q", got, want)
 	}
 }
 

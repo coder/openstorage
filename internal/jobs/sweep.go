@@ -47,6 +47,11 @@ type PackRegistry interface {
 	// point membership for lfs/<repo>/<oid> keys, written by verified
 	// uploads (ref.RegisterLFSObject).
 	HasLFSObject(ctx context.Context, repo, key string) (bool, error)
+	// LFSObjectRegisteredAt reads a registered object's registration time
+	// (see ref.RefStore): the legacy reap grace's clock (Codex round 89)
+	// — legacy presigned GETs are minted right up to the registration
+	// moment, and neither blob timestamp bounds that.
+	LFSObjectRegisteredAt(ctx context.Context, repo, key string) (at time.Time, ok bool, err error)
 	// GuardedLFSDelete runs del serialized against LFS registration (see
 	// ref.RefStore): safeDelete's LFS blob delete must go through it, or
 	// a verified upload's register+verify can complete between the
@@ -83,6 +88,11 @@ type PackRegistry interface {
 	// crashed pushes (issue #29); expired rows already stopped gating
 	// admission, so this is pure garbage collection.
 	SweepExpiredPackReservations(ctx context.Context, olderThan time.Duration) (int64, error)
+	// ReconcileLegacyLFSObjects deletes legacy-spelled LFS registry rows
+	// whose canonical twin exists, refunding what they double-charged
+	// (ADR-41, Codex round 79) — rolling-upgrade races can strand such
+	// twins where no registration ever runs again.
+	ReconcileLegacyLFSObjects(ctx context.Context) (reconciled int64, partial bool, err error)
 }
 
 // SweepConfig controls one sweeper's classification and disposal.
@@ -117,6 +127,16 @@ type SweepConfig struct {
 	// list-only reports stop naming objects that should live. Disposal
 	// runs the same revalidate + quarantine handshake and age threshold.
 	DeleteLFS bool
+	// DeleteLFSLegacy additionally admits LEGACY-SPELLED LFS keys
+	// (lfs/<repo>/<oid>, ADR-41) to DeleteLFS's reap — the explicit
+	// post-roll cleanup opt-in of the two-phase key migration (Codex
+	// round 81). Off, legacy keys are never deleted regardless of every
+	// other flag: during a rolling upgrade old replicas derive only that
+	// spelling, and adoption's retained sources become aged rowless
+	// orphans immediately, so an undiscriminating DeleteLFS would 404
+	// their downloads mid-roll. Enable only once the fleet runs the new
+	// binary (plus presign expiry); requires DeleteLFS.
+	DeleteLFSLegacy bool
 	// DeleteGuard, when set, is consulted before each sweep's destructive
 	// work (Delete and DeleteSuperseded alike). A non-nil error downgrades
 	// that run to list-only (heals still run) and is reported. It
@@ -267,6 +287,7 @@ func (s *Sweeper) Sweep(ctx context.Context) (SweepReport, error) {
 	// guard covers both destructive modes — a versioned bucket turns
 	// superseded-class deletes into billed delete markers all the same.
 	deleteMode, supersededMode, lfsMode := s.cfg.Delete, s.cfg.DeleteSuperseded, s.cfg.DeleteLFS
+	legacyMode := s.cfg.DeleteLFSLegacy
 	purgeMode := s.cfg.PurgedRepoProbe != nil
 	if (deleteMode || supersededMode || lfsMode || purgeMode) && s.cfg.DeleteGuard != nil {
 		if err := s.cfg.DeleteGuard(ctx); err != nil {
@@ -300,6 +321,14 @@ func (s *Sweeper) Sweep(ctx context.Context) (SweepReport, error) {
 			}
 		}
 	}
+	// Legacy/canonical LFS row twins stranded by rolling-upgrade races
+	// (ADR-41, Codex round 79): no registration ever runs again for
+	// them, so the sweeper is the janitor that ends the double-count.
+	if n, _, err := s.packs.ReconcileLegacyLFSObjects(ctx); err != nil {
+		deleteErrs.add(fmt.Errorf("sweep: reconcile legacy lfs rows: %w", err))
+	} else if n > 0 {
+		s.logger.Info("orphan pack sweep: reconciled legacy lfs row twins", "count", n)
+	}
 	// Stream packs/ page-wise and classify each object with a point
 	// registry read (PackRegistry.HasPack): both the blob population and a
 	// repo's registered-pack count are attacker-growable (pre-receive
@@ -320,7 +349,7 @@ func (s *Sweeper) Sweep(ctx context.Context) (SweepReport, error) {
 				s.logger.Warn("orphan pack sweep: skipping foreign key under packs/", "key", obj.Key)
 				continue
 			}
-			if err := s.classify(ctx, repo, obj, deleteMode, supersededMode, lfsMode, purgeMode, &report, &deleteErrs); err != nil {
+			if err := s.classify(ctx, repo, obj, deleteMode, supersededMode, lfsMode, legacyMode, purgeMode, &report, &deleteErrs); err != nil {
 				return err
 			}
 		}
@@ -340,7 +369,7 @@ func (s *Sweeper) Sweep(ctx context.Context) (SweepReport, error) {
 				s.logger.Warn("orphan pack sweep: skipping foreign key under lfs/", "key", obj.Key)
 				continue
 			}
-			if err := s.classify(ctx, repo, obj, deleteMode, supersededMode, lfsMode, purgeMode, &report, &deleteErrs); err != nil {
+			if err := s.classify(ctx, repo, obj, deleteMode, supersededMode, lfsMode, legacyMode, purgeMode, &report, &deleteErrs); err != nil {
 				return err
 			}
 		}
@@ -439,11 +468,12 @@ func (s *Sweeper) registered(ctx context.Context, repo, key string) (bool, error
 // deleteMode; retained superseded blobs (a durable pack_retained record
 // written by the fold's own transaction, issue #31) are reaped under
 // supersededMode too; LFS orphans (issue #51) only under their own
-// lfsMode opt-in; blobs of purge-FENCED repos (issue #52, PurgedRepoProbe)
-// under purgeMode in every class. Registry errors abort the sweep
-// (they would misclassify the object); disposal errors accumulate into
-// deleteErrs.
-func (s *Sweeper) classify(ctx context.Context, repo string, obj blob.ListedObject, deleteMode, supersededMode, lfsMode, purgeMode bool, report *SweepReport, deleteErrs *boundedErrs) error {
+// lfsMode opt-in; legacy-spelled LFS keys additionally under legacyMode
+// (ADR-41's transition gate); blobs of purge-FENCED repos (issue #52,
+// PurgedRepoProbe) under purgeMode in every class. Registry errors abort
+// the sweep (they would misclassify the object); disposal errors
+// accumulate into deleteErrs.
+func (s *Sweeper) classify(ctx context.Context, repo string, obj blob.ListedObject, deleteMode, supersededMode, lfsMode, legacyMode, purgeMode bool, report *SweepReport, deleteErrs *boundedErrs) error {
 	registered, err := s.registered(ctx, repo, obj.Key)
 	if err != nil {
 		return fmt.Errorf("registry lookup %s: %w", obj.Key, err)
@@ -471,13 +501,20 @@ func (s *Sweeper) classify(ctx context.Context, repo string, obj blob.ListedObje
 	s.logger.Info("orphan pack candidate",
 		"key", obj.Key, "size_bytes", obj.Size, "age", age.Round(time.Second),
 		"delete_enabled", deleteMode, "delete_superseded", supersededMode, "delete_lfs", lfsMode)
-	// Deletion coverage per class: LFS candidates need the lfsMode opt-in;
-	// pack candidates need general delete mode, or — under superseded mode
+	// Deletion coverage per class: LFS candidates need the lfsMode opt-in
+	// — and LEGACY-SPELLED LFS keys additionally need legacyMode, the
+	// explicit post-roll cleanup opt-in of the two-phase key migration
+	// (Codex round 81): adoption retains its source precisely so old
+	// replicas and live presigned GETs keep reading it, and an aged
+	// retained source is otherwise an immediate orphan candidate — an
+	// undiscriminating DeleteLFS would 404 mid-roll downloads. The
+	// transition gate dominates every other flag combination. Pack
+	// candidates need general delete mode, or — under superseded mode
 	// alone — a retained record (one extra point read per aged candidate,
 	// same shape as HasPack).
 	var canDelete bool
 	if strings.HasPrefix(obj.Key, blob.LFSRoot) {
-		canDelete = lfsMode
+		canDelete = lfsMode && (strings.Contains(obj.Key, "/o2/") || legacyMode)
 	} else {
 		canDelete = deleteMode
 		if !canDelete && supersededMode {
@@ -504,6 +541,16 @@ func (s *Sweeper) classify(ctx context.Context, repo string, obj blob.ListedObje
 	}
 	if !canDelete {
 		return nil
+	}
+	if strings.HasPrefix(obj.Key, blob.LFSRoot) && !strings.Contains(obj.Key, "/o2/") {
+		spared, err := s.legacySourceInReapGrace(ctx, repo, obj.Key)
+		if err != nil {
+			deleteErrs.add(err)
+			return nil
+		}
+		if spared {
+			return nil
+		}
 	}
 	stillOrphan, err := s.revalidateOrphan(ctx, repo, obj.Key)
 	if err != nil {
@@ -611,17 +658,25 @@ func splitSweepKey(key string) (repo string, ok bool) {
 	return splitPackKey(key)
 }
 
-// splitLFSKey validates that key has the exact shape blob.LFSKey produces —
-// lfs/<repo>/<oid> with a 64-hex-char oid and no deeper nesting — and
-// returns the repo segment (always a BASE RepoID, ADR-35) plus the oid
-// (the object's expected sha256, which quarantine restores verify against).
+// splitLFSKey validates that key has the exact shape of one of the two LFS
+// spellings — canonical blob.LFSKey (lfs/<repo>/o2/<oid>) or the v0.1.x
+// blob.LFSLegacyKey (lfs/<repo>/<oid>), each with a 64-hex-char oid and no
+// deeper nesting — and returns the repo segment (always a BASE RepoID,
+// ADR-35) plus the oid (the object's expected sha256, which quarantine
+// restores verify against). Both spellings sweep identically: registered
+// rows always hold canonical keys, so legacy blobs are rowless orphans
+// once adopted (Codex security round 78).
 func splitLFSKey(key string) (repo, oid string, ok bool) {
 	rest, found := strings.CutPrefix(key, blob.LFSRoot)
 	if !found {
 		return "", "", false
 	}
 	repo, oid, found = strings.Cut(rest, "/")
-	if !found || repo == "" || !isLFSOID(oid) {
+	if !found || repo == "" {
+		return "", "", false
+	}
+	oid = strings.TrimPrefix(oid, "o2/")
+	if !isLFSOID(oid) {
 		return "", "", false
 	}
 	return repo, oid, true
@@ -765,6 +820,116 @@ func (s *Sweeper) restoreFromQuarantine(ctx context.Context, key, qKey string) (
 	return true, nil
 }
 
+// legacyReapGraceFloor is the minimum age an ADOPTION (the canonical
+// copy's ModTime) must reach before the retained legacy source may be
+// reaped: presigned legacy GETs live 15 minutes, and the floor holds even
+// when the sweep threshold is tuned lower.
+const legacyReapGraceFloor = time.Hour
+
+// legacySourceInReapGrace reports whether the aged legacy-spelled orphan
+// at key is an adoption-retained source whose REGISTRATION is too RECENT
+// to reap (Codex rounds 88+89): batch downloads presign the rowless legacy
+// key right up to the moment the canonical row exists, and the source's
+// own ModTime is its original upload — already past any threshold — so the
+// candidate age proves nothing about those URLs. Neither does the
+// canonical BLOB's ModTime (round 89): a rowless canonical copy can be
+// hours old — publication or adoption copied it and only the registration
+// failed — while the successful retry verifies it in place without
+// rewriting it. The row's created_at is the clock: registration mints it
+// fresh, and the in-place legacy-row migration refreshes it. The source
+// reaps only once the registration is older than the grace, which dwarfs
+// the presign lifetime. Unknowable state spares the source (conservative;
+// the next sweep re-examines).
+func (s *Sweeper) legacySourceInReapGrace(ctx context.Context, repo, key string) (bool, error) {
+	_, oid, ok := splitLFSKey(key)
+	if !ok {
+		return false, nil
+	}
+	canonical := blob.LFSKey(repo, oid)
+	registeredAt, registered, err := s.packs.LFSObjectRegisteredAt(ctx, repo, canonical)
+	if err != nil {
+		return false, fmt.Errorf("reap-grace twin lookup %s: %w", canonical, err)
+	}
+	if !registered {
+		return false, nil // plain rowless orphan: the age threshold governs
+	}
+	grace := max(s.cfg.Threshold, legacyReapGraceFloor)
+	if registeredAt.IsZero() || s.now().Sub(registeredAt) < grace {
+		s.logger.Info("orphan pack sweep: sparing adoption-retained legacy source in reap grace", "key", key)
+		return true, nil
+	}
+	// The canonical copy must EXIST before the source reaps (round 88's
+	// registered-but-blobless spare, which the registration-time rewrite
+	// must keep): a registered row whose canonical blob was lost serves
+	// reads through the legacy download fallback, and the retained source
+	// may be the object's ONLY remaining bytes — reaping it on row age
+	// alone turns a repairable degradation into data loss. One point
+	// stat, reached only by reap-eligible candidates; unknowable state
+	// spares (the next sweep re-examines).
+	switch _, err := s.blobs.Stat(ctx, canonical); {
+	case errors.Is(err, blob.ErrNotFound):
+		s.logger.Info("orphan pack sweep: sparing last copy of a registered-but-blobless object", "key", key)
+		return true, nil
+	case err != nil:
+		return false, fmt.Errorf("reap-grace canonical stat %s: %w", canonical, err)
+	}
+	return false, nil
+}
+
+// ReconcileTickInterval is the always-live twin janitor's cadence when
+// periodic sweeping is disabled (Codex round 88): one cheap point read per
+// tick when no twins exist, hourly like the default sweep.
+const ReconcileTickInterval = time.Hour
+
+// StartReconcileTicker runs the legacy/canonical LFS row-twin janitor on a
+// background goroutine (Codex round 88 + security twin): with
+// CODESTORAGE_SWEEP_INTERVAL=0 the startup Heal was the ONLY
+// reconciliation, but during a mixed-version rollout an old replica can
+// insert a legacy row beside an existing canonical one at any time after
+// startup — registered fast paths never re-register, so the duplicate
+// object-count and usage charge would persist indefinitely. The returned
+// stop function cancels the loop and waits for an in-flight pass.
+// drainOnly (Codex round 129) stops the ticker once a pass completes
+// below the page cap: the residual-backlog mode for post-roll compat-off
+// deployments, where no new twins can appear and the hourly unindexed
+// scan must not outlive the drain.
+func StartReconcileTicker(sweeper *Sweeper, interval time.Duration, drainOnly bool) (stop func()) {
+	assertf(sweeper != nil, "StartReconcileTicker: nil sweeper")
+	assertf(interval > 0, "StartReconcileTicker: non-positive interval %v", interval)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			n, partial, err := sweeper.packs.ReconcileLegacyLFSObjects(ctx)
+			if err != nil && ctx.Err() == nil {
+				sweeper.logger.Error("legacy lfs row reconcile failed", "err", err)
+			} else if n > 0 {
+				sweeper.logger.Info("reconciled legacy lfs row twins", "count", n)
+			}
+			if drainOnly && err == nil && !partial {
+				// Residual-backlog mode (Codex round 129): with compat
+				// off, old replicas mint no new twins — once a pass
+				// completes un-capped the backlog is drained, and the
+				// hourly unindexed scan must not run forever.
+				sweeper.logger.Info("legacy lfs reconcile backlog drained; stopping follow-up ticker")
+				return
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+		}
+	}()
+	return func() {
+		cancel()
+		<-done
+	}
+}
+
 // lfsBackupMatchesOID reports whether the object at qKey hashes to oid.
 func (s *Sweeper) lfsBackupMatchesOID(ctx context.Context, qKey, oid string) (bool, error) {
 	assertf(isLFSOID(oid), "lfsBackupMatchesOID: bad oid %q", oid)
@@ -837,12 +1002,36 @@ func (s *Sweeper) safeDelete(ctx context.Context, repo, key string) (bool, error
 		// post-registration writer verify strictly follow the delete and
 		// republish. Pack deletes stay unguarded: their restores are
 		// always correct, so the existing recheck+heal layers suffice.
+		errReapGraceSpared := errors.New("legacy source re-entered the reap grace")
 		deleted, gerr := s.packs.GuardedLFSDelete(hctx, repo, key, func(ctx context.Context) error {
+			// The classify-time grace check races adoption (Codex round
+			// 100): a rowless legacy source can be adopted — canonical
+			// row registered, created_at fresh — between that check and
+			// this handshake, and the guard's own re-read consults only
+			// the LEGACY key, which is never registered. Recheck the
+			// canonical twin HERE: the guard's count-row lock serializes
+			// against registrations, so a committed fresh registration
+			// is always visible and an in-flight one blocks until this
+			// delete commits — in which case the adoption's own copy or
+			// the client's verified retry supplies the bytes.
+			if _, _, ok := splitLFSKey(key); ok {
+				spared, err := s.legacySourceInReapGrace(ctx, repo, key)
+				if err != nil {
+					return err
+				}
+				if spared {
+					return errReapGraceSpared
+				}
+			}
 			if err := s.blobs.Delete(ctx, key); err != nil && !errors.Is(err, blob.ErrNotFound) {
 				return err
 			}
 			return nil
 		})
+		if errors.Is(gerr, errReapGraceSpared) {
+			s.logger.Info("orphan pack sweep: spared legacy source adopted mid-handshake", "key", key)
+			return false, nil
+		}
 		if gerr == nil && !deleted {
 			// A verified upload registered before the guard's re-read: the
 			// delete never executed and its bytes stand. The backup is
@@ -1104,9 +1293,32 @@ func (s *Sweeper) freshModTime(ctx context.Context, key string) (mod time.Time, 
 // and disabling the schedule must not strand it. Purging is forced off
 // regardless of SweepConfig.Delete — interval zero documents "no sweeping",
 // so an emergency stop must never destroy anything.
-func (s *Sweeper) Heal(ctx context.Context) error {
+func (s *Sweeper) Heal(ctx context.Context) (residual bool, err error) {
+	// Legacy/canonical LFS row twins stranded by rolling-upgrade races
+	// need the janitor even when periodic sweeping is disabled (Codex
+	// round 85): no registration fast path ever runs again for a twin, so
+	// this startup pass is the only reconciliation such deployments get —
+	// without it the duplicate usage and object-count charge is
+	// permanent. A failure is therefore FATAL like the quarantine heal
+	// below (Codex round 112): with no ticker to retry (post-roll the
+	// compat flag is off), swallowing the error would let serving start
+	// with permanent double charges — false quota and object-cap denials
+	// until some later restart happens to reconcile.
+	n, partial, rerr := s.packs.ReconcileLegacyLFSObjects(ctx)
+	if rerr != nil {
+		return false, fmt.Errorf("reconcile legacy lfs rows: %w", rerr)
+	}
+	if n > 0 {
+		s.logger.Info("heal: reconciled legacy lfs row twins", "count", n)
+	}
+	if partial {
+		// The page-capped pass left twins behind (Codex round 128): the
+		// caller must schedule bounded follow-up passes — with sweeping
+		// disabled and compat off, nothing else ever reconciles them.
+		s.logger.Warn("heal: legacy lfs reconcile pass was partial; scheduling follow-up passes")
+	}
 	var report SweepReport
-	return s.healQuarantine(ctx, &report, false, false)
+	return partial, s.healQuarantine(ctx, &report, false, false)
 }
 
 // SweepSchedule configures the periodic orphan-pack sweep on a queue

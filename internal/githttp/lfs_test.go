@@ -329,8 +329,14 @@ func TestLFS_BatchPresignedHref(t *testing.T) {
 	}
 
 	// Download of a stored object: presigned GET without echoed creds.
+	// Registered — only registered objects serve from the canonical key
+	// (round 78); rowless canonical bytes are never served.
 	if err := srv.Blob.(signedBlob).BlobStore.UploadFile(context.Background(),
 		blob.LFSKey(lfsTestRepoID, oid), writeTempFile(t, content)); err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.Store.RegisterLFSObject(context.Background(), lfsTestRepoID,
+		blob.LFSKey(lfsTestRepoID, oid), int64(len(content))); err != nil {
 		t.Fatal(err)
 	}
 	resp = decodeBatch(t, doLFS(t, srv, http.MethodPost, lfsBatchPath, "basic:"+mint(auth.ScopeGitRead),

@@ -20,7 +20,7 @@ of these classes:
 | **Registered packs** | Every push and REST write publishes a pack and registers it | [Repack](#background-repack) folds many into one (the originals become *retained*) |
 | **Retained (superseded) packs** | A repack fold replaced their registry rows; the blobs linger | Sweeper's superseded reap ([`CODESTORAGE_SWEEP_DELETE_SUPERSEDED`](../reference/configuration.md#codestorage_sweep_delete_superseded), on by default) after the age threshold |
 | **Orphan packs** | Crashed/interrupted writers (pack published, registration never committed), lost repack races | Sweeper — **list-only by default**; deletion is the explicit [`CODESTORAGE_SWEEP_DELETE_ENABLED`](../reference/configuration.md#codestorage_sweep_delete_enabled) opt-in |
-| **LFS objects** (`lfs/<repo_id>/<oid>` keys) | Verified LFS uploads publish the object and register it in the LFS registry | Like registered packs, permanent while the repository lives; the [repository purge](#reclaiming-deleted-repositories) reclaims them with the rest of a deleted repository |
+| **LFS objects** (`lfs/<repo_id>/o2/<oid>` canonical keys; `lfs/<repo_id>/<oid>` legacy pre-adoption keys, ADR-41) | Verified LFS uploads publish the object and register it in the LFS registry | Like registered packs, permanent while the repository lives; the [repository purge](#reclaiming-deleted-repositories) reclaims them with the rest of a deleted repository |
 | **Orphan LFS objects** | Crashed uploads (published, registration never committed) and objects uploaded before the LFS registry existed | Sweeper — **list-only by default**; deletion is the separate [`CODESTORAGE_SWEEP_DELETE_LFS`](../reference/configuration.md#codestorage_sweep_delete_lfs) opt-in (see [the caveat](#lfs-orphans-and-pre-registry-objects)) |
 | **Quarantine copies** (`sweep/quarantine/<nonce>/…` keys) | Delete-mode sweeps copy every blob aside before deleting it | The sweep itself purges backups older than the purge window — `max(age threshold, 1h)` — while a destructive mode is on |
 
@@ -234,7 +234,8 @@ Four independent knobs control what a sweep may *do*:
 | List-only (no flag) | **active** | Reports orphans of every class, deletes nothing |
 | [`CODESTORAGE_SWEEP_DELETE_SUPERSEDED`](../reference/configuration.md#codestorage_sweep_delete_superseded) | `true` | Only blobs a repack fold provably superseded (durable `pack_retained` records); reclaims their quota bytes |
 | [`CODESTORAGE_SWEEP_DELETE_ENABLED`](../reference/configuration.md#codestorage_sweep_delete_enabled) | `false` | General pack orphans (crashed pushes, lost races) — the risky class, hence opt-in |
-| [`CODESTORAGE_SWEEP_DELETE_LFS`](../reference/configuration.md#codestorage_sweep_delete_lfs) | `false` | LFS orphans — separate from the pack opt-in because of the [pre-registry caveat](#lfs-orphans-and-pre-registry-objects) |
+| [`CODESTORAGE_SWEEP_DELETE_LFS`](../reference/configuration.md#codestorage_sweep_delete_lfs) | `false` | LFS orphans — separate from the pack opt-in because of the [pre-registry caveat](#lfs-orphans-and-pre-registry-objects); legacy-spelled keys additionally need the flag below |
+| [`CODESTORAGE_SWEEP_DELETE_LFS_LEGACY`](../reference/configuration.md#codestorage_sweep_delete_lfs_legacy) | `false` | Legacy-spelled LFS keys (ADR-41): the post-roll cleanup opt-in — off, no sweep mode deletes them (retained adoption sources feed old replicas' reads mid-roll) |
 
 ### LFS orphans and pre-registry objects
 
@@ -246,7 +247,12 @@ covered by `CODESTORAGE_SWEEP_DELETE_ENABLED`. Stored objects are adopted into t
 registry whenever a write-scoped touch sees them (an upload batch naming the object, or
 a re-upload of the same content) — after a one-time sha256 verification, since
 presigned-era uploads never proved their content: a mismatched legacy blob is removed
-and re-uploaded through the verified path instead of adopted. Active repositories
+and re-uploaded through the verified path instead of adopted. With a
+[storage quota](../reference/configuration.md#codestorage_pack_quota_bytes) enforced,
+the migration copy passes real quota admission — the retained legacy source keeps
+counting until this sweeper reclaims it, so adopting an object needs headroom for a
+second copy and answers `507` at the quota edge (free space, raise the quota, or run
+the post-roll cleanup to migrate it). Active repositories
 therefore converge on their own. Before
 setting `CODESTORAGE_SWEEP_DELETE_LFS=true`, run list-only until the candidate lines
 stop naming objects that should live; re-pushing a repository's LFS content (batch

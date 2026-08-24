@@ -114,6 +114,10 @@ func (s *SQLite) InitSchema(ctx context.Context) error {
 		// O(1) object-count cap reads — see the PG DDL for the rationale.
 		`CREATE TABLE IF NOT EXISTS lfs_object_counts (repo TEXT PRIMARY KEY, count INTEGER NOT NULL DEFAULT 0)`,
 		`CREATE TABLE IF NOT EXISTS lfs_adoption_gens (repo TEXT PRIMARY KEY, gen INTEGER NOT NULL DEFAULT 0)`,
+		// Fleet-persistent LFS mismatch markers (#104, Codex round
+		// 132): see the PG schema comment.
+		`CREATE TABLE IF NOT EXISTS lfs_mismatches (repo TEXT NOT NULL, key TEXT NOT NULL,
+		    fingerprint TEXT NOT NULL, PRIMARY KEY (repo, key))`,
 		// Repository purge fence (issue #52, PR #105 security round):
 		// see the PG schema comment.
 		`CREATE TABLE IF NOT EXISTS purged_repos (repo TEXT PRIMARY KEY,

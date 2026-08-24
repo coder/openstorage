@@ -99,6 +99,11 @@ const (
 	// Enable only after list-only reports stop naming live objects
 	// (write-scoped touches adopt stored objects into the registry).
 	envSweepDeleteLFS = "CODESTORAGE_SWEEP_DELETE_LFS"
+	// envSweepDeleteLFSLegacy additionally admits LEGACY-SPELLED LFS keys
+	// to the LFS reap — the explicit post-roll cleanup opt-in of the
+	// ADR-41 two-phase key migration (Codex round 81). Keep it off while
+	// any pre-upgrade replica may still serve reads.
+	envSweepDeleteLFSLegacy = "CODESTORAGE_SWEEP_DELETE_LFS_LEGACY"
 
 	// Soft-deleted repository retention (issue #52): how long after its
 	// soft-delete a repository's registry rows and blobs are permanently
@@ -117,6 +122,10 @@ const (
 	// so a replica needs a disk bound independent of the per-repo quota
 	// (which is per-repository and may be disabled). "0" disables.
 	envLFSStagingBytes = "CODESTORAGE_LFS_STAGING_BYTES"
+	// envLFSV020WriteCompat keeps the v0.2.0 LFS read surface alive
+	// during a rolling upgrade (ADR-41): set to "1"/"true" on upgraded
+	// replicas until the fleet rolls, then drop it.
+	envLFSV020WriteCompat = "CODESTORAGE_LFS_V020_WRITE_COMPAT"
 
 	// Background repack (issue #1): registered-pack count at which a
 	// post-write trigger schedules a fold ("0" disables triggering).
@@ -250,6 +259,10 @@ type serveConfig struct {
 	// lfsStagingBytes caps aggregate in-flight LFS upload staging per
 	// replica (issue #51); 0 disables.
 	lfsStagingBytes int64
+
+	// lfsV020WriteCompat dual-publishes LFS objects to the legacy
+	// spelling during a rolling upgrade (ADR-41); default off.
+	lfsV020WriteCompat bool
 	// packQuotaBytes is the per-repo pack-bytes quota on the git surface
 	// (issue #21); 0 disables enforcement.
 	packQuotaBytes int64
@@ -291,6 +304,7 @@ type sweepSettings struct {
 	deleteEnabled    bool          // false = list-only (the default)
 	deleteSuperseded bool          // true = reap provably-folded blobs (the default, issue #31)
 	deleteLFS        bool          // false = list-only for LFS orphans (the default, issue #51)
+	deleteLFSLegacy  bool          // false = legacy-spelled LFS keys are never reaped (ADR-41 transition gate)
 	repoRetention    time.Duration // 0 = never purge soft-deleted repos (the default, issue #52)
 }
 
@@ -404,6 +418,12 @@ func resolveServeConfig(getenv func(string) string, flagListen, flagAddr, flagCa
 	if err != nil {
 		return serveConfig{}, err
 	}
+	if raw := getenv(envLFSV020WriteCompat); raw != "" {
+		cfg.lfsV020WriteCompat, err = strconv.ParseBool(raw)
+		if err != nil {
+			return serveConfig{}, fmt.Errorf("%s: %w", envLFSV020WriteCompat, err)
+		}
+	}
 	cfg.maxPushBytes, err = resolveMaxPushBytes(getenv, cfg.packQuotaBytes)
 	if err != nil {
 		return serveConfig{}, err
@@ -415,6 +435,25 @@ func resolveServeConfig(getenv func(string) string, flagListen, flagAddr, flagCa
 	cfg.sweep, err = resolveSweepSettings(getenv)
 	if err != nil {
 		return serveConfig{}, err
+	}
+	if cfg.lfsV020WriteCompat && cfg.sweep.deleteLFS && cfg.sweep.interval > 0 {
+		// Rolling-upgrade tripwire (Codex round 101, P1): the compat flag
+		// declares a mixed v0.2.0 fleet, and during that roll DESTRUCTIVE
+		// LFS sweeping must be off FLEET-WIDE — the in-place row
+		// migration makes a touched object's legacy blob rowless from a
+		// v0.2.0 sweeper's perspective, and an old reap-enabled sweeper
+		// (whose binary has no legacy gate) deletes it immediately,
+		// breaking old-replica reads and freshly issued presigned GETs.
+		// Old binaries cannot be guarded retroactively; failing startup
+		// on the nodes we do control forces the staged rollout the docs
+		// describe (list-only during the roll, opt-ins after). A zero
+		// interval constructs no schedule at all (Codex round 111): the
+		// delete flag is inert then, and rejecting it would block the
+		// documented fleet-wide sweep emergency stop — re-enabling the
+		// interval restarts the process and re-runs this validation.
+		return serveConfig{}, fmt.Errorf(
+			"%s and %s cannot be combined: destructive LFS sweeping must stay disabled fleet-wide (old v0.2.0 sweepers included) until the roll completes and the compat flag is dropped",
+			envLFSV020WriteCompat, envSweepDeleteLFS)
 	}
 	cfg.repackThreshold, err = resolveRepackThreshold(getenv)
 	if err != nil {
@@ -691,6 +730,13 @@ func resolveSweepSettings(getenv func(string) string) (sweepSettings, error) {
 			return sweepSettings{}, fmt.Errorf("%s: %w", envSweepDeleteLFS, err)
 		}
 		s.deleteLFS = v
+	}
+	if raw := getenv(envSweepDeleteLFSLegacy); raw != "" {
+		v, err := strconv.ParseBool(raw)
+		if err != nil {
+			return sweepSettings{}, fmt.Errorf("%s: %w", envSweepDeleteLFSLegacy, err)
+		}
+		s.deleteLFSLegacy = v
 	}
 	if raw := getenv(envRepoRetention); raw != "" {
 		d, err := time.ParseDuration(raw)

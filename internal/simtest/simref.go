@@ -173,6 +173,22 @@ func (s *SimRefStore) SweepExpiredPackReservations(ctx context.Context, olderTha
 	return s.inner.SweepExpiredPackReservations(ctx, olderThan)
 }
 
+func (s *SimRefStore) RecordLFSMismatch(ctx context.Context, repo, key, fingerprint string) error {
+	return s.inner.RecordLFSMismatch(ctx, repo, key, fingerprint)
+}
+
+func (s *SimRefStore) LFSMismatchFingerprint(ctx context.Context, repo, key string) (string, bool, error) {
+	return s.inner.LFSMismatchFingerprint(ctx, repo, key)
+}
+
+func (s *SimRefStore) ClearLFSMismatch(ctx context.Context, repo, key string) error {
+	return s.inner.ClearLFSMismatch(ctx, repo, key)
+}
+
+func (s *SimRefStore) ReconcileLegacyLFSObjects(ctx context.Context) (int64, bool, error) {
+	return s.inner.ReconcileLegacyLFSObjects(ctx)
+}
+
 // IsRetainedPack delegates to the inner store.
 func (s *SimRefStore) IsRetainedPack(ctx context.Context, repo, key string) (bool, error) {
 	return s.inner.IsRetainedPack(ctx, repo, key)
@@ -208,6 +224,11 @@ func (s *SimRefStore) RegisterLFSObject(ctx context.Context, repo, key string, b
 // HasLFSObject delegates to the inner store.
 func (s *SimRefStore) HasLFSObject(ctx context.Context, repo, key string) (bool, error) {
 	return s.inner.HasLFSObject(ctx, repo, key)
+}
+
+// LFSObjectRegisteredAt delegates to the inner store.
+func (s *SimRefStore) LFSObjectRegisteredAt(ctx context.Context, repo, key string) (time.Time, bool, error) {
+	return s.inner.LFSObjectRegisteredAt(ctx, repo, key)
 }
 
 // QuotaLedgerState delegates to the inner store (oracle reads).

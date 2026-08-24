@@ -29,6 +29,7 @@ never a silently-applied default.
 | [`CODESTORAGE_SECRETS_MODE`](#codestorage_secrets_mode) | `encrypt` | `decrypt-only` stages the key fleet-wide before encrypted writes begin |
 | [`CODESTORAGE_PACK_QUOTA_BYTES`](#codestorage_pack_quota_bytes) | 10 GiB | Per-repo storage quota, packs + LFS (`0` disables) |
 | [`CODESTORAGE_LFS_STAGING_BYTES`](#codestorage_lfs_staging_bytes) | 32 GiB | Per-replica cap on in-flight LFS upload staging (`0` disables) |
+| [`CODESTORAGE_LFS_V020_WRITE_COMPAT`](#codestorage_lfs_v020_write_compat) | `false` | Dual-publish LFS objects to the legacy v0.2.0 key during a rolling upgrade |
 | [`CODESTORAGE_PACK_RESERVATION_TTL`](#codestorage_pack_reservation_ttl) | `1h` | Lifetime of a crashed writer's quota reservation |
 | [`CODESTORAGE_MAX_PUSH_BYTES`](#codestorage_max_push_bytes) | 2 × pack quota (min 2 MiB) | Decoded-byte cap on one git push (`0` disables) |
 | [`CODESTORAGE_VERIFY_SIG_BUDGET`](#codestorage_verify_sig_budget) | `10000` | Per-push `verify-sig` verified-commit budget (`0` disables) |
@@ -37,6 +38,7 @@ never a silently-applied default.
 | [`CODESTORAGE_SWEEP_DELETE_ENABLED`](#codestorage_sweep_delete_enabled) | `false` | Opt-in: actually delete general orphans (list-only otherwise) |
 | [`CODESTORAGE_SWEEP_DELETE_SUPERSEDED`](#codestorage_sweep_delete_superseded) | `true` | Reap blobs a repack fold provably superseded |
 | [`CODESTORAGE_SWEEP_DELETE_LFS`](#codestorage_sweep_delete_lfs) | `false` | Opt-in: actually delete orphan LFS objects (list-only otherwise) |
+| [`CODESTORAGE_SWEEP_DELETE_LFS_LEGACY`](#codestorage_sweep_delete_lfs_legacy) | `false` | Post-roll opt-in: admit legacy-spelled LFS keys to the LFS reap (ADR-41 transition gate) |
 | [`CODESTORAGE_REPO_RETENTION`](#codestorage_repo_retention) | unset | Purge repositories soft-deleted longer than this (unset/`0` keeps them forever) |
 | [`CODESTORAGE_REPACK_THRESHOLD`](#codestorage_repack_threshold) | `10` | Registered-pack count that triggers a background repack (`0` disables) |
 | [`CODESTORAGE_SYNC_STEAL_LEGACY`](#codestorage_sync_steal_legacy) | `false` | Opt-in: steal pre-lease sync claims after their adoption grace lapses |
@@ -356,6 +358,41 @@ answers `413`.
   the TTL's implied floor — ~3 MB/s for 10 GiB at the defaults — cannot finish before
   its admission reservation expires anyway).
 
+### `CODESTORAGE_LFS_V020_WRITE_COMPAT`
+
+Registered LFS objects live at a canonical key old presigned upload URLs cannot
+address ([ADR-41](../adr/041-registered-lfs-objects-live-at-a-canonical-key-legacy-presigned-urls-cannot-address.md));
+replicas running v0.2.0 or older derive only the legacy single-key spelling and
+cannot see canonically stored objects. During a rolling upgrade from v0.2.0, set
+this on the **upgraded** replicas so every verified LFS publication is also copied
+to the legacy key — not-yet-upgraded replicas keep serving those objects for the
+duration of the roll. The bridge is enforced, not best-effort: an upload whose
+compat copy fails answers `502` (the canonical object is already durable and
+registered — the client's retry is zero-growth and repairs the copy), and
+write-scoped touches of registered objects repair a missing legacy spelling.
+Drop the variable once the whole fleet is upgraded: the
+compat copies are rowless, so the [orphan sweep](../how-to/storage-lifecycle-and-sweeping.md)
+reclaims them under its LFS opt-in.
+
+- **Default:** `false`. The canonical spelling is the secure one — the compat
+  copies are exactly as exposed to still-valid legacy upload URLs as everything
+  v0.2.0 served — so compat is opt-in and meant to be temporary.
+- **Cannot be combined with [`CODESTORAGE_SWEEP_DELETE_LFS`](#codestorage_sweep_delete_lfs)
+  while a sweep schedule is active** (`CODESTORAGE_SWEEP_INTERVAL` > 0 — a
+  fail-fast startup error; with the interval at `0` no schedule is built, the
+  delete flag is inert, and the fleet-wide sweep emergency stop stays
+  available): the flag declares a mixed v0.2.0 fleet, and during
+  that roll destructive LFS sweeping must be off **fleet-wide** — the in-place row
+  migration makes a touched object's legacy blob rowless to an old binary's
+  sweeper, which has no legacy gate and reaps it immediately, breaking
+  old-replica reads. The tripwire covers upgraded nodes; disable the flag on the
+  old nodes yourself before rolling.
+- With a [storage quota](#codestorage_pack_quota_bytes) enforced, the bridge copy
+  passes real quota admission: each fresh upload effectively costs twice its size
+  for the roll's duration, and an upload whose bridge would exceed the quota
+  answers `507` instead of overshooting (the canonical object stays registered;
+  freeing space lets a retry repair the bridge).
+
 ### `CODESTORAGE_PACK_RESERVATION_TTL`
 
 How long a crashed writer's quota reservation keeps gating admission (Go duration, e.g.
@@ -447,7 +484,10 @@ only when explicitly enabled, deletes — unregistered blobs older than the age 
 It also prunes expired quota reservations on the same cadence.
 
 - **Default:** `1h`. **`0` disables sweeping** (a strictly restorative quarantine-heal pass
-  still runs once at startup); negative values are startup errors.
+  still runs once at startup, and an hourly background janitor keeps reconciling
+  legacy/canonical LFS registry-row twins that mixed-version rollouts can strand after
+  startup — without it a duplicate row would double-charge usage and the object cap
+  indefinitely); negative values are startup errors.
 
 ### `CODESTORAGE_SWEEP_AGE_THRESHOLD`
 
@@ -502,6 +542,27 @@ on upgrade. Stored objects are adopted into the registry by write-scoped touches
   stop naming objects that should live.
 - Same quarantine-first disposal and heal pass as the pack classes; on versioned S3
   buckets it fails startup exactly like the general delete opt-in.
+- Legacy-spelled keys (`lfs/<repo_id>/<oid>`, ADR-41) are **excluded** from this reap
+  until [`CODESTORAGE_SWEEP_DELETE_LFS_LEGACY`](#codestorage_sweep_delete_lfs_legacy)
+  is also set.
+
+### `CODESTORAGE_SWEEP_DELETE_LFS_LEGACY`
+
+Post-roll cleanup opt-in for **legacy-spelled** LFS keys (`lfs/<repo_id>/<oid>` — the
+v0.2.0-and-older spelling,
+[ADR-41](../adr/041-registered-lfs-objects-live-at-a-canonical-key-legacy-presigned-urls-cannot-address.md)).
+Adoption migrates objects to canonical keys but **retains** the legacy source: old
+replicas derive only that spelling, and a just-issued presigned GET must survive its
+lifetime — so during a rolling upgrade the retained sources are aged rowless orphans
+that [`CODESTORAGE_SWEEP_DELETE_LFS`](#codestorage_sweep_delete_lfs) alone must not
+touch. This flag is the operator's assertion that the transition is over: every
+replica runs the new binary and the last old replica exited more than 15 minutes ago
+(the presign expiry). The transition gate dominates every other flag combination —
+without this flag no sweep mode deletes a legacy-spelled key.
+
+- **Default:** `false` (legacy keys are never deleted). **Constraints:** must parse
+  as a boolean; only meaningful together with `CODESTORAGE_SWEEP_DELETE_LFS`.
+- Same quarantine-first disposal as every destructive class.
 
 ### `CODESTORAGE_REPO_RETENTION`
 

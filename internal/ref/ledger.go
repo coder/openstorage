@@ -243,6 +243,30 @@ func (s *PG) ReleaseAdoptionClaim(ctx context.Context, key, owner string) error 
 	return err
 }
 
+// lfsLegacyRowKey maps a canonical LFS object key — blob.LFSKey's
+// lfs/<repo>/o2/<oid> layout (ADR-41) — to the spelling v0.2.0 stored in
+// lfs_objects rows: lfs/<repo>/<oid>. ok is false for every other key
+// shape. This is deliberately the ledger's only knowledge of the LFS key
+// layout: registration uses it to migrate a legacy row in place (zero
+// growth) instead of double-counting the object.
+func lfsLegacyRowKey(key string) (string, bool) {
+	if !strings.HasPrefix(key, "lfs/") {
+		return "", false
+	}
+	// Split at the LAST "/o2/": the oid is the final slash-free segment
+	// (blob.LFSKey asserts that), so this stays correct for any repo
+	// segment content.
+	i := strings.LastIndex(key, "/o2/")
+	if i < len("lfs/") { // absent, or an empty repo segment
+		return "", false
+	}
+	oid := key[i+len("/o2/"):]
+	if oid == "" || strings.Contains(oid, "/") {
+		return "", false
+	}
+	return key[:i] + "/" + oid, true
+}
+
 // RepairCoverSuffix distinguishes a restore's cover reservation key from
 // the restored blob's settle key (Codex rounds 57+58): settlement consumes
 // the blob key's own spellings, and the cover must instead outlive the
@@ -509,10 +533,12 @@ SELECT
   COALESCE((SELECT SUM(bytes) FROM pack_reservations
             WHERE repo = $2
               AND created_at > now() - make_interval(secs => $3)
+              AND key NOT LIKE '%`+AdoptionClaimSuffix+`'
               AND NOT (key = ANY($4))), 0),
   (SELECT COUNT(*) FROM pack_reservations
    WHERE repo = $2
      AND created_at > now() - make_interval(secs => $3)
+     AND key NOT LIKE '%`+AdoptionClaimSuffix+`'
      AND NOT (key = ANY($5)))`,
 			group, group[0], ttl.Seconds(), reservKeySpellings(keys...), reservRowKeys(keys)).Scan(&counter, &reserved, &activeRows); err != nil {
 			return err
@@ -791,6 +817,34 @@ func (s *PG) registerLFSObjectTx(ctx context.Context, repo, key string, bytes in
 		} else if fenced {
 			return fmt.Errorf("register lfs object %s: %w", key, ErrRepoPurged)
 		}
+		// v0.2.0 registered rows at the single legacy spelling (ADR-41);
+		// this binary registers only canonical `o2/` keys. Migrate a
+		// same-object legacy row in place instead of inserting a
+		// duplicate: its bytes and count are already credited, so this
+		// registration must be zero-growth — a fresh insert would
+		// double-count both ledgers. Guarded against a canonical twin so
+		// the primary key cannot conflict.
+		if legacy, ok := lfsLegacyRowKey(key); ok {
+			// created_at is REFRESHED to the migration moment (Codex
+			// round 89): the row's clock anchors the legacy reap grace —
+			// downloads presign the legacy spelling right up to this
+			// registration, and the old row's v0.2.0-era timestamp says
+			// nothing about those URLs.
+			if _, err := tx.Exec(ctx, `
+UPDATE lfs_objects SET key = $1, created_at = now() WHERE repo = $2 AND key = $3
+  AND NOT EXISTS (SELECT 1 FROM lfs_objects o2 WHERE o2.repo = $2 AND o2.key = $1)`,
+				key, repo, legacy); err != nil {
+				return err
+			}
+			// Reconcile a TWIN a racing v0.2.0 registration left behind
+			// (Codex round 79): once both spellings have rows, the guard
+			// above never migrates again — delete the legacy row and
+			// refund its count and bytes, or the object stays
+			// double-counted forever.
+			if _, err := reconcileLegacyLFSRowPG(ctx, tx, repo, legacy, key); err != nil {
+				return err
+			}
+		}
 		ct, err := tx.Exec(ctx,
 			`INSERT INTO lfs_objects (repo, key, bytes) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
 			repo, key, bytes)
@@ -830,6 +884,156 @@ ON CONFLICT (repo) DO UPDATE SET gen = lfs_adoption_gens.gen + 1`, repo); err !=
 		}
 		return creditUsagePG(ctx, tx, repo, bytes)
 	})
+}
+
+// reconcileLegacyLFSRowPG deletes repo's legacy-spelled lfs_objects row
+// when its canonical twin exists, refunding the object count and usage
+// bytes it double-charged (ADR-41, Codex round 79). Reports whether a row
+// was reconciled.
+func reconcileLegacyLFSRowPG(ctx context.Context, tx pgx.Tx, repo, legacy, canonical string) (bool, error) {
+	// Cheap gate: the serialization below is taken only when a legacy row
+	// actually exists — the hot path (every LFS registration) stays a
+	// point read. A row appearing after this read is caught by the next
+	// registration or the sweeper's janitor.
+	var exists bool
+	if err := tx.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM lfs_objects WHERE repo = $1 AND key = $2)`, repo, legacy).Scan(&exists); err != nil {
+		return false, err
+	}
+	if !exists {
+		return false, nil
+	}
+	// The refund moves counted bytes OUT of the live counter (Codex round
+	// 82, security): a floor cached while the twin double-counted
+	// (listing 2S − counter 2S = 0) would still pass generation checks
+	// after the refund and admit against understated usage. Serialize
+	// with admissions on the base-ledger lock — the same lock the
+	// round-60 floor-generation recheck holds — and bump the generation
+	// ATOMICALLY with the refund, so every stale floor is rejected.
+	// Reentrant under registerLFSObjectTx's adopted path (advisory xact
+	// locks stack within one transaction).
+	if err := lockBaseLedger(ctx, tx, repo); err != nil {
+		return false, err
+	}
+	var legacyBytes int64
+	switch err := tx.QueryRow(ctx, `
+DELETE FROM lfs_objects WHERE repo = $1 AND key = $2
+  AND EXISTS (SELECT 1 FROM lfs_objects c WHERE c.repo = $1 AND c.key = $3)
+RETURNING bytes`, repo, legacy, canonical).Scan(&legacyBytes); {
+	case errors.Is(err, pgx.ErrNoRows):
+		return false, nil
+	case err != nil:
+		return false, err
+	}
+	if _, err := tx.Exec(ctx,
+		`UPDATE lfs_object_counts SET count = GREATEST(count - 1, 0) WHERE repo = $1`, repo); err != nil {
+		return false, err
+	}
+	if _, err := tx.Exec(ctx,
+		`UPDATE pack_usage SET bytes = GREATEST(bytes - $2, 0) WHERE repo = $1`, repo, legacyBytes); err != nil {
+		return false, err
+	}
+	if _, err := tx.Exec(ctx, `
+INSERT INTO lfs_adoption_gens (repo, gen) VALUES ($1, 1)
+ON CONFLICT (repo) DO UPDATE SET gen = lfs_adoption_gens.gen + 1`, repo); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// ReconcileLegacyLFSObjects — see RefStore.
+func (s *PG) ReconcileLegacyLFSObjects(ctx context.Context) (int64, bool, error) {
+	// Paged (Codex round 91): a mixed-version fleet can strand twins
+	// across MANY repositories — no per-repo cap bounds the cross-repo
+	// candidate set, and Heal runs this synchronously at startup when
+	// sweeping is disabled, so materializing every candidate could stall
+	// or OOM serving. Each reconcile DELETES its legacy row, so
+	// re-running the bounded query converges without offsets; a
+	// non-empty page that makes no progress fails loudly instead of
+	// spinning. The invocation is page-capped (security round 127) so a
+	// live twin-minting old replica cannot hold startup hostage.
+	var n int64
+	for page := 0; page < reconcileLegacyLFSMaxPages; page++ {
+		rows, err := s.pool.Query(ctx, `
+SELECT l.repo, l.key FROM lfs_objects l
+WHERE strpos(l.key, '/o2/') = 0
+  AND EXISTS (SELECT 1 FROM lfs_objects c WHERE c.repo = l.repo
+    AND c.key = 'lfs/' || l.repo || '/o2/' || substr(l.key, char_length('lfs/' || l.repo || '/') + 1))
+LIMIT $1`, reconcileLegacyLFSBatch)
+		if err != nil {
+			return n, false, err
+		}
+		type cand struct{ repo, key string }
+		var cands []cand
+		for rows.Next() {
+			var c cand
+			if err := rows.Scan(&c.repo, &c.key); err != nil {
+				rows.Close()
+				return n, false, err
+			}
+			cands = append(cands, c)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return n, false, err
+		}
+		var progress int64
+		for _, c := range cands {
+			canonical, ok := canonicalFromLegacyLFSRowKey(c.repo, c.key)
+			if !ok {
+				continue // defensive: candidate selection and Go parsing disagree
+			}
+			if err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+				done, err := reconcileLegacyLFSRowPG(ctx, tx, c.repo, c.key, canonical)
+				if done {
+					n++
+					progress++
+				}
+				return err
+			}); err != nil {
+				return n, false, err
+			}
+		}
+		if len(cands) < reconcileLegacyLFSBatch {
+			return n, false, nil
+		}
+		if progress == 0 {
+			return n, false, fmt.Errorf("reconcile legacy lfs rows: full page of %d candidates made no progress", len(cands))
+		}
+	}
+	// Page cap exhausted (security round 127): clean PARTIAL success —
+	// reported so callers can schedule bounded follow-up passes (Codex
+	// round 128: post-roll with sweeping disabled, startup Heal is the
+	// only pass, and silently stranding a >cap backlog double-charges
+	// usage and object count until some restart).
+	return n, true, nil
+}
+
+// reconcileLegacyLFSBatch bounds one ReconcileLegacyLFSObjects page
+// (Codex round 91): candidates are re-selected after each page — every
+// reconcile deletes its row — so the loop holds at most one page in
+// memory regardless of fleet-wide twin count.
+var reconcileLegacyLFSBatch = 512
+
+// reconcileLegacyLFSMaxPages bounds one ReconcileLegacyLFSObjects
+// INVOCATION (Codex security round 127): Heal runs the loop synchronously
+// before serving, and an old replica continuously re-registering twins
+// (small compat/adoption objects re-batched by a git:write client) keeps
+// every page full and progressing — the loop otherwise never exits and
+// startup is delayed indefinitely. The cap covers any realistic static
+// backlog (512 pages × 512 rows ≈ 262k twins) while bounding adversarial
+// livelock; a capped invocation returns cleanly and the remainder falls
+// to the ticker, the next startup, or the next invocation.
+var reconcileLegacyLFSMaxPages = 512
+
+// canonicalFromLegacyLFSRowKey maps a legacy row key (lfs/<repo>/<oid>)
+// back to its canonical spelling, the inverse of lfsLegacyRowKey.
+func canonicalFromLegacyLFSRowKey(repo, legacy string) (string, bool) {
+	oid, found := strings.CutPrefix(legacy, "lfs/"+repo+"/")
+	if !found || oid == "" || strings.Contains(oid, "/") {
+		return "", false
+	}
+	return "lfs/" + repo + "/o2/" + oid, true
 }
 
 // GuardedLFSDelete — see RefStore. The counter row lock is the
@@ -923,6 +1127,44 @@ ON CONFLICT (repo) DO UPDATE SET gen = lfs_adoption_gens.gen + 1`, repo)
 	})
 }
 
+// RecordLFSMismatch — see RefStore (#104, Codex round 132).
+func (s *PG) RecordLFSMismatch(ctx context.Context, repo, key, fingerprint string) error {
+	assertf(repo != "" && key != "" && fingerprint != "", "RecordLFSMismatch(%q, %q)", repo, key)
+	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		if err := lockBaseLedger(ctx, tx, baseRepoOf(repo)); err != nil {
+			return err
+		}
+		// Purge fence: markers are row-creating writes; a purged repo's
+		// legacy blobs are the sweeper's problem, not the bridge's.
+		if fenced, err := repoPurgeFencedPG(ctx, tx, repo); err != nil || fenced {
+			return err
+		}
+		_, err := tx.Exec(ctx, `
+INSERT INTO lfs_mismatches (repo, key, fingerprint) VALUES ($1, $2, $3)
+ON CONFLICT (repo, key) DO UPDATE SET fingerprint = EXCLUDED.fingerprint`, repo, key, fingerprint)
+		return err
+	})
+}
+
+// LFSMismatchFingerprint — see RefStore (#104, Codex round 132).
+func (s *PG) LFSMismatchFingerprint(ctx context.Context, repo, key string) (string, bool, error) {
+	assertf(repo != "" && key != "", "LFSMismatchFingerprint(%q, %q)", repo, key)
+	var fp string
+	err := s.pool.QueryRow(ctx,
+		`SELECT fingerprint FROM lfs_mismatches WHERE repo = $1 AND key = $2`, repo, key).Scan(&fp)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", false, nil
+	}
+	return fp, err == nil, err
+}
+
+// ClearLFSMismatch — see RefStore (#104, Codex round 132).
+func (s *PG) ClearLFSMismatch(ctx context.Context, repo, key string) error {
+	assertf(repo != "" && key != "", "ClearLFSMismatch(%q, %q)", repo, key)
+	_, err := s.pool.Exec(ctx, `DELETE FROM lfs_mismatches WHERE repo = $1 AND key = $2`, repo, key)
+	return err
+}
+
 // LFSAdoptionGen — see RefStore (Codex round 49).
 func (s *PG) LFSAdoptionGen(ctx context.Context, repo string) (int64, error) {
 	assertf(repo != "", "LFSAdoptionGen(%q)", repo)
@@ -952,6 +1194,18 @@ func (s *PG) HasLFSObject(ctx context.Context, repo, key string) (bool, error) {
 	return exists, err
 }
 
+// LFSObjectRegisteredAt — see RefStore (Codex round 89).
+func (s *PG) LFSObjectRegisteredAt(ctx context.Context, repo, key string) (time.Time, bool, error) {
+	assertf(repo != "" && key != "", "LFSObjectRegisteredAt(%q, %q)", repo, key)
+	var at time.Time
+	err := s.pool.QueryRow(ctx,
+		`SELECT created_at FROM lfs_objects WHERE repo = $1 AND key = $2`, repo, key).Scan(&at)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return time.Time{}, false, nil
+	}
+	return at, err == nil, err
+}
+
 // PackQuotaLedgerState is a point-in-time read of one accounting group's
 // ledger, for tests, oracles, and operator inspection — NOT part of the
 // admission path (ReservePackBytes reads its own single snapshot).
@@ -973,6 +1227,7 @@ SELECT
   COALESCE((SELECT SUM(bytes) FROM pack_usage WHERE repo = ANY($1)), 0),
   COALESCE((SELECT SUM(bytes) FROM pack_reservations
             WHERE repo = $2 AND created_at > now() - make_interval(secs => $3)
+              AND key NOT LIKE '%`+AdoptionClaimSuffix+`'
               AND NOT (key = ANY($4))), 0),
   COALESCE((SELECT SUM(bytes) FROM pack_retained WHERE repo = ANY($1)), 0)`,
 		group, group[0], ttl.Seconds(), excludeKeys).Scan(&st.UsageBytes, &st.ReservedBytes, &st.RetainedBytes)

@@ -6,12 +6,75 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
+	"time"
 )
 
 // lfsKey mints a test LFS blob key under the kit's base repo.
 func lfsLedgerKey(k *ledgerKit, oid string) string {
 	return "lfs/" + k.base() + "/" + oid
+}
+
+// TestLFSMismatchMarkers (#104, Codex round 132): failed-verification
+// markers must be fleet-persistent — recorded, readable, upserted, and
+// cleared through the ref store — and purge-fenced like every
+// row-creating write (a lost or locally-evicted marker made a registered
+// object's corrupt legacy spelling implicitly clean forever).
+func TestLFSMismatchMarkers(t *testing.T) {
+	runRefBackends(t, func(t *testing.T, s Store) {
+		ctx := context.Background()
+		k := newLedgerKit(t, s)
+		key := lfsLedgerKey(k, strings.Repeat("ef", 32))
+
+		if fp, ok, err := s.LFSMismatchFingerprint(ctx, k.base(), key); err != nil || ok || fp != "" {
+			t.Fatalf("unset marker = (%q, %v, %v), want absent", fp, ok, err)
+		}
+		if err := s.RecordLFSMismatch(ctx, k.base(), key, "fp-1"); err != nil {
+			t.Fatal(err)
+		}
+		if fp, ok, err := s.LFSMismatchFingerprint(ctx, k.base(), key); err != nil || !ok || fp != "fp-1" {
+			t.Fatalf("marker = (%q, %v, %v), want fp-1", fp, ok, err)
+		}
+		// Upsert: a re-proven different version replaces the fingerprint.
+		if err := s.RecordLFSMismatch(ctx, k.base(), key, "fp-2"); err != nil {
+			t.Fatal(err)
+		}
+		if fp, _, err := s.LFSMismatchFingerprint(ctx, k.base(), key); err != nil || fp != "fp-2" {
+			t.Fatalf("upserted marker = (%q, %v), want fp-2", fp, err)
+		}
+		if err := s.ClearLFSMismatch(ctx, k.base(), key); err != nil {
+			t.Fatal(err)
+		}
+		if _, ok, err := s.LFSMismatchFingerprint(ctx, k.base(), key); err != nil || ok {
+			t.Fatalf("cleared marker still present (%v, %v)", ok, err)
+		}
+	})
+}
+
+// TestQuotaLedgerState_ExcludesAdoptionClaims (Codex round 102): round 95
+// excluded claim leases from ReservePackBytes' admission sums, but
+// QuotaLedgerState still counted them — at exact-headroom boundaries the
+// one-byte lease flipped advisory verdicts (a batch 507s with no upload
+// action and never reaches the authoritative PUT admission) for the
+// claim's whole lifetime. Claims are leases, not storage.
+func TestQuotaLedgerState_ExcludesAdoptionClaims(t *testing.T) {
+	runRefBackends(t, func(t *testing.T, s Store) {
+		k := newLedgerKit(t, s)
+		ctx := context.Background()
+		key := "lfs/" + k.base() + "/o2/" + strings.Repeat("cd", 32)
+		claimed, _, err := s.TryAdoptionClaim(ctx, k.base(), key)
+		if err != nil || !claimed {
+			t.Fatalf("claim = (%v, %v)", claimed, err)
+		}
+		ls, err := s.QuotaLedgerState(ctx, []string{k.base()}, time.Hour)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ls.ReservedBytes != 0 {
+			t.Fatalf("ReservedBytes with only a claim lease = %d, want 0 — claims are leases, not storage", ls.ReservedBytes)
+		}
+	})
 }
 
 // TestRegisterLFSObject_SettlesReservationAndCredits: registration consumes

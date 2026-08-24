@@ -49,6 +49,13 @@ type BlobStore interface {
 	// yield an error matching ErrNotFound via errors.Is (the hydration
 	// missing-pack retry keys on it).
 	DownloadFile(ctx context.Context, key, destPath string) error
+	// DownloadFileCapped is DownloadFile bounded to capBytes of local
+	// disk (Codex round 117 on #104): one GET, atomic rename — but a
+	// stream exceeding capBytes aborts with ErrCapExceeded instead of
+	// consuming unreserved space (the caller reserved capBytes BEFORE a
+	// window in which a mutable-key object can be replaced by a larger
+	// version).
+	DownloadFileCapped(ctx context.Context, key, destPath string, capBytes int64) error
 	// List returns all objects under prefix.
 	List(ctx context.Context, prefix string) ([]ListedObject, error)
 	// ListPages streams objects under prefix in lexicographic key order,
@@ -229,8 +236,31 @@ func usageBytes(ctx context.Context, b BlobStore, repo string, prefixes []string
 // LFSKey is the immutable object key for a repo's LFS object with the given
 // sha256 oid. Keys are repo-scoped (docs/explanation/git-protocol-and-namespaces.md): forks inherit LFS pointers
 // only, never the objects, which this keying yields automatically.
+//
+// LFSKey is the CANONICAL object key: bytes here are written only by the
+// server's digest-verified paths (verified proxy uploads, adoption copies,
+// registered-object restores) — never by presigned PUTs. The `o2/` segment
+// makes the spelling unreachable by any v0.1.x presigned upload URL, which
+// signed exactly the bare LFSLegacyKey spelling (Codex security round 78
+// on issue #51): a still-valid legacy URL can overwrite ONLY the legacy
+// key, so registered content — always canonical — is immune to replay for
+// the URL's whole lifetime, with no quiesce-window reasoning. The oid is
+// caller-validated 64-hex (lfsOIDPattern / isLFSOID); the assert rules out
+// path tricks reaching the canonical namespace.
 func LFSKey(repoID, oid string) string {
-	assertf(repoID != "" && oid != "", "LFSKey(%q, %q)", repoID, oid)
+	assertf(repoID != "" && oid != "" && !strings.Contains(oid, "/"),
+		"LFSKey(%q, %q)", repoID, oid)
+	return LFSRoot + repoID + "/o2/" + oid
+}
+
+// LFSLegacyKey is the v0.1.x object spelling — the only one old presigned
+// PUT URLs can address. It is never registered and never served for
+// registered objects: it exists as the adoption SOURCE (rowless pre-#51
+// blobs live here until adopted, then the source is deleted) and as the
+// read-compat location for not-yet-adopted rowless objects.
+func LFSLegacyKey(repoID, oid string) string {
+	assertf(repoID != "" && oid != "" && !strings.Contains(oid, "/"),
+		"LFSLegacyKey(%q, %q)", repoID, oid)
 	return LFSRoot + repoID + "/" + oid
 }
 
@@ -364,6 +394,21 @@ var coverRenewInterval = 20 * time.Second
 // its own healthy connection.
 var coverRenewTimeout = 10 * time.Second
 
+// ErrCapExceeded reports a capped download whose stream exceeded the
+// caller's reserved size (Codex round 117 on #104): on a mutable legacy
+// key, the object can be replaced by a larger version between the
+// caller's Stat and the GET, and streaming past the reservation would
+// consume unbudgeted replica disk.
+var ErrCapExceeded = errors.New("blob: stream exceeds the reserved cap")
+
+// ErrCoverContinuityLost marks work canceled by the cover-continuity
+// machinery (Codex security round 107 on #104): callers must be able to
+// distinguish a copy that erred BECAUSE its cover lapsed — whose committed
+// destination is an unsafe, unaccounted commit exactly like a renewErr
+// verdict — from ordinary op failures, because WithRenewedCover reports a
+// canceled op through opErr with renewErr nil.
+var ErrCoverContinuityLost = errors.New("cover continuity lost")
+
 // coverLapseBudget is how long WithRenewedCover tolerates renewal
 // failures before it must assume the cover row expired and ABORT the
 // publication (Codex round 62): declared strictly before the minimum TTL
@@ -460,12 +505,12 @@ func WithRenewedCover(ctx context.Context, renew func(context.Context) error, op
 				budget.Stop()
 				return
 			case <-budget.C:
-				opCancel(errors.New("restore cover continuity lost (budget expired without a renewed cover)"))
+				opCancel(fmt.Errorf("restore %w (budget expired without a renewed cover)", ErrCoverContinuityLost))
 				return
 			case <-t.C:
 				budget.Stop()
 				if _, lost, err := attemptRenew(); lost {
-					opCancel(fmt.Errorf("restore cover continuity lost (last renewal: %v)", err))
+					opCancel(fmt.Errorf("restore %w (last renewal: %v)", ErrCoverContinuityLost, err))
 					return
 				}
 				// A failed attempt inside the budget: the prior cover
@@ -478,7 +523,10 @@ func WithRenewedCover(ctx context.Context, renew func(context.Context) error, op
 	wg.Wait()
 	if opErr != nil {
 		if cause := context.Cause(opCtx); cause != nil && !errors.Is(cause, context.Canceled) {
-			opErr = fmt.Errorf("%w (%v)", opErr, cause)
+			// %w on the cause too (Codex security round 107): an op that
+			// returns the bare cancellation must still let callers match
+			// ErrCoverContinuityLost through opErr.
+			opErr = fmt.Errorf("%w (%w)", opErr, cause)
 		}
 		return opErr, nil
 	}
@@ -712,7 +760,14 @@ func (b *S3) UploadFile(ctx context.Context, key, path string) error {
 
 // DownloadFile fetches key into destPath atomically (tmp + rename).
 func (b *S3) DownloadFile(ctx context.Context, key, destPath string) error {
-	return bucketDownloadFile(ctx, b.bucket, key, destPath)
+	return bucketDownloadFile(ctx, b.bucket, key, destPath, -1)
+}
+
+// DownloadFileCapped fetches key into destPath atomically, aborting with
+// ErrCapExceeded once the stream would exceed capBytes on disk.
+func (b *S3) DownloadFileCapped(ctx context.Context, key, destPath string, capBytes int64) error {
+	assertf(capBytes >= 0, "DownloadFileCapped(%q, %d)", key, capBytes)
+	return bucketDownloadFile(ctx, b.bucket, key, destPath, capBytes)
 }
 
 // List returns all objects under prefix.

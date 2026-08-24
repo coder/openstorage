@@ -383,7 +383,7 @@ func TestUsageFloorInvalidatedByAdoption(t *testing.T) {
 	legacy := []byte("pre-registry legacy object body")
 	oid := sha256Hex(legacy)
 	key := blob.LFSKey(lfsTestRepoID, oid)
-	if err := srv.Blob.UploadFile(ctx, key, writeTempFile(t, legacy)); err != nil {
+	if err := srv.Blob.UploadFile(ctx, blob.LFSLegacyKey(lfsTestRepoID, oid), writeTempFile(t, legacy)); err != nil {
 		t.Fatal(err)
 	}
 	// Warm the cache: the whole object is uncounted.
@@ -399,9 +399,20 @@ func TestUsageFloorInvalidatedByAdoption(t *testing.T) {
 	if has, err := st.HasLFSObject(ctx, lfsTestRepoID, key); err != nil || !has {
 		t.Fatalf("object not adopted: %v, %v", has, err)
 	}
-	// The stale entry must be gone: a fresh scan sees the bytes counted.
-	if floor, err := srv.CachedUsageFloor(ctx, lfsTestRepoID); err != nil || floor != 0 {
-		t.Fatalf("post-adoption floor = (%d, %v), want (0, nil) — adopted bytes must not double-count", floor, err)
+	// The stale entry must be gone: the next serve RE-SCANS instead of
+	// serving the cached pre-adoption value. The floor VALUE no longer
+	// distinguishes stale from fresh (round 80): the retained legacy
+	// source keeps exactly the adopted size uncounted — physically
+	// stored until the sweeper reclaims it — so the invalidation is
+	// proven by the scan itself.
+	cb := &countingBlob{BlobStore: srv.Blob}
+	srv.Blob = cb
+	floor, err := srv.CachedUsageFloor(ctx, lfsTestRepoID)
+	if err != nil || floor != int64(len(legacy)) {
+		t.Fatalf("post-adoption floor = (%d, %v), want (%d, nil) — the RETAINED source stays uncounted-but-listed until swept", floor, err, len(legacy))
+	}
+	if cb.lists.Load() == 0 {
+		t.Fatal("post-adoption floor served from the stale cache — the adoption generation bump did not invalidate")
 	}
 }
 
@@ -420,8 +431,7 @@ func TestUsageFloorInvalidatedAcrossReplicas(t *testing.T) {
 
 	legacy := []byte("cross-replica legacy object")
 	oid := sha256Hex(legacy)
-	key := blob.LFSKey(lfsTestRepoID, oid)
-	if err := srv1.Blob.UploadFile(ctx, key, writeTempFile(t, legacy)); err != nil {
+	if err := srv1.Blob.UploadFile(ctx, blob.LFSLegacyKey(lfsTestRepoID, oid), writeTempFile(t, legacy)); err != nil {
 		t.Fatal(err)
 	}
 	// Replica 2 caches the pre-adoption floor.
@@ -435,9 +445,17 @@ func TestUsageFloorInvalidatedAcrossReplicas(t *testing.T) {
 		t.Fatalf("adoption failed: %+v", resp.Objects[0])
 	}
 	// Replica 2's cached entry must be rejected by the generation check:
-	// a fresh scan sees the bytes counted, so the floor drops to 0.
-	if floor, err := srv2.CachedUsageFloor(ctx, lfsTestRepoID); err != nil || floor != 0 {
-		t.Fatalf("post-adoption remote floor = (%d, %v), want (0, nil) — the shared generation must invalidate", floor, err)
+	// the serve re-scans (the VALUE alone no longer distinguishes stale
+	// from fresh — the retained source keeps the adopted size listed and
+	// uncounted, round 80).
+	cb := &countingBlob{BlobStore: srv2.Blob}
+	srv2.Blob = cb
+	floor, err := srv2.CachedUsageFloor(ctx, lfsTestRepoID)
+	if err != nil || floor != int64(len(legacy)) {
+		t.Fatalf("post-adoption remote floor = (%d, %v), want (%d, nil) — the retained source stays uncounted-but-listed", floor, err, len(legacy))
+	}
+	if cb.lists.Load() == 0 {
+		t.Fatal("remote floor served from the stale cache — the shared generation must invalidate")
 	}
 }
 

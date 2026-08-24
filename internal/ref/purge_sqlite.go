@@ -155,7 +155,7 @@ func (s *SQLite) PurgeRepoLedger(ctx context.Context, group []string) (int64, er
 	var total int64
 	for _, table := range []string{
 		"pack_reservations", "pack_retained", "pack_usage",
-		"lfs_object_counts", "lfs_adoption_gens", "repo_generations",
+		"lfs_object_counts", "lfs_adoption_gens", "lfs_mismatches", "repo_generations",
 	} {
 		res, err := tx.ExecContext(ctx,
 			`DELETE FROM `+table+` WHERE repo IN (`+ph+`)`, args...)

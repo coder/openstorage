@@ -86,7 +86,14 @@ func (b *File) UploadFile(ctx context.Context, key, path string) error {
 
 // DownloadFile fetches key into destPath atomically (tmp + rename).
 func (b *File) DownloadFile(ctx context.Context, key, destPath string) error {
-	return bucketDownloadFile(ctx, b.bucket, key, destPath)
+	return bucketDownloadFile(ctx, b.bucket, key, destPath, -1)
+}
+
+// DownloadFileCapped fetches key into destPath atomically, aborting with
+// ErrCapExceeded once the stream would exceed capBytes on disk.
+func (b *File) DownloadFileCapped(ctx context.Context, key, destPath string, capBytes int64) error {
+	assertf(capBytes >= 0, "DownloadFileCapped(%q, %d)", key, capBytes)
+	return bucketDownloadFile(ctx, b.bucket, key, destPath, capBytes)
 }
 
 // List returns all objects under prefix.
@@ -157,7 +164,7 @@ func bucketUploadFile(ctx context.Context, bucket *gcblob.Bucket, key, path stri
 // partially downloaded pack is never visible at destPath. Missing keys map
 // onto ErrNotFound (like bucketStat), so callers can tell absence — a pack
 // folded away by a concurrent repack — from transport failures.
-func bucketDownloadFile(ctx context.Context, bucket *gcblob.Bucket, key, destPath string) error {
+func bucketDownloadFile(ctx context.Context, bucket *gcblob.Bucket, key, destPath string, capBytes int64) error {
 	assertf(bucket != nil && key != "", "bucketDownloadFile(%q)", key)
 	r, err := bucket.NewReader(ctx, key, nil)
 	if err != nil {
@@ -175,9 +182,21 @@ func bucketDownloadFile(ctx context.Context, bucket *gcblob.Bucket, key, destPat
 		return err
 	}
 	defer os.Remove(tmp.Name())
-	if _, err := io.Copy(tmp, r); err != nil {
+	src := io.Reader(r)
+	if capBytes >= 0 {
+		// One sentinel byte past the cap distinguishes exactly-at-cap
+		// from over-cap without another round-trip; it is only ever
+		// read when the stream genuinely exceeds the cap.
+		src = io.LimitReader(r, capBytes+1)
+	}
+	n, err := io.Copy(tmp, src)
+	if err != nil {
 		tmp.Close()
 		return fmt.Errorf("download %s: %w", key, err)
+	}
+	if capBytes >= 0 && n > capBytes {
+		tmp.Close()
+		return fmt.Errorf("download %s: %w (stream exceeded %d bytes)", key, ErrCapExceeded, capBytes)
 	}
 	if err := tmp.Close(); err != nil {
 		return err
@@ -202,9 +221,16 @@ func bucketStat(ctx context.Context, bucket *gcblob.Bucket, key string) (int64, 
 
 // bucketStatFingerprint is the single StatFingerprint implementation for
 // gocloud-backed BlobStores: the driver ETag when present (content-derived
-// on S3), else an mtime+size fallback (file backends; local-mode
-// overwrites bump mtime). The fingerprint is OPAQUE — callers may only
-// compare for equality.
+// on S3), else an mtime+size fallback. The fingerprint is OPAQUE — callers
+// may only compare for equality.
+//
+// Granularity caveat: fileblob's ETag is mtime-derived, and filesystem
+// mtimes tick on the kernel's coarse clock (1–10ms), so two same-size
+// rewrites inside one tick can collide. That weakness is acceptable
+// because the adversarial same-size rewriter the fingerprint defends
+// against is a still-valid presigned PUT (ADR-41) — and file backends
+// never issue presigned URLs (ErrSignedURLUnsupported), while S3's
+// content-derived ETag cannot be preserved across a rewrite at all.
 func bucketStatFingerprint(ctx context.Context, bucket *gcblob.Bucket, key string) (int64, string, error) {
 	assertf(bucket != nil && key != "", "bucketStatFingerprint(%q)", key)
 	attrs, err := bucket.Attributes(ctx, key)

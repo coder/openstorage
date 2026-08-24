@@ -70,6 +70,14 @@ func (f *fakeInner) ReservePackBytes(context.Context, []string, []ref.Pack, stri
 func (f *fakeInner) SweepExpiredPackReservations(context.Context, time.Duration) (int64, error) {
 	return 0, nil
 }
+func (f *fakeInner) ReconcileLegacyLFSObjects(context.Context) (int64, bool, error) {
+	return 0, false, nil
+}
+func (f *fakeInner) RecordLFSMismatch(context.Context, string, string, string) error { return nil }
+func (f *fakeInner) LFSMismatchFingerprint(context.Context, string, string) (string, bool, error) {
+	return "", false, nil
+}
+func (f *fakeInner) ClearLFSMismatch(context.Context, string, string) error { return nil }
 func (f *fakeInner) IsRetainedPack(context.Context, string, string) (bool, error) {
 	return false, nil
 }
@@ -79,6 +87,9 @@ func (f *fakeInner) ReclaimRetainedPack(context.Context, string, string) (int64,
 func (f *fakeInner) RegisterLFSObject(context.Context, string, string, int64) error { return nil }
 func (f *fakeInner) HasLFSObject(context.Context, string, string) (bool, error) {
 	return false, nil
+}
+func (f *fakeInner) LFSObjectRegisteredAt(context.Context, string, string) (time.Time, bool, error) {
+	return time.Time{}, false, nil
 }
 func (f *fakeInner) CountLFSObjects(context.Context, string) (int64, error) { return 0, nil }
 func (f *fakeInner) BumpLFSAdoptionGen(context.Context, string) error       { return nil }

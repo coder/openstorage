@@ -727,6 +727,216 @@ func TestGenBumpsSerializeWithAdmissionLock(t *testing.T) {
 	}
 }
 
+// TestRegisterLFSObjectMigratesLegacyRow (ADR-41): v0.2.0 registered
+// lfs_objects rows at the single legacy spelling (lfs/<repo>/<oid>); this
+// binary registers only canonical o2/ keys. Registering an object that
+// already has a legacy row must MIGRATE it in place — same count, same
+// usage — never insert a duplicate: a fresh insert would double both the
+// object-count cap and the usage counter for every v0.2.0-era object
+// touched after the upgrade.
+func TestRegisterLFSObjectMigratesLegacyRow(t *testing.T) {
+	runRefBackends(t, func(t *testing.T, s Store) {
+		ctx := context.Background()
+		k := newLedgerKit(t, s)
+		oid := strings.Repeat("cd", 32)
+		legacyKey := "lfs/" + k.base() + "/" + oid
+		canonicalKey := "lfs/" + k.base() + "/o2/" + oid
+
+		// The v0.2.0 binary registered the legacy spelling.
+		if err := s.RegisterLFSObject(ctx, k.base(), legacyKey, 70); err != nil {
+			t.Fatal(err)
+		}
+		// The upgraded binary adopts/re-registers canonically.
+		if err := s.RegisterAdoptedLFSObject(ctx, k.base(), canonicalKey, 70); err != nil {
+			t.Fatal(err)
+		}
+		if has, err := s.HasLFSObject(ctx, k.base(), canonicalKey); err != nil || !has {
+			t.Fatalf("canonical row after migration = (%v, %v), want present", has, err)
+		}
+		if has, err := s.HasLFSObject(ctx, k.base(), legacyKey); err != nil || has {
+			t.Fatalf("legacy row after migration = (%v, %v), want migrated away", has, err)
+		}
+		if count, err := s.CountLFSObjects(ctx, k.base()); err != nil || count != 1 {
+			t.Fatalf("object count after migration = (%d, %v), want 1 — a duplicate insert double-counts", count, err)
+		}
+		if st := k.state(); st.UsageBytes != 70 {
+			t.Fatalf("usage after migration = %d, want 70 — the object's bytes were already credited", st.UsageBytes)
+		}
+		// Idempotent re-registration stays zero-growth.
+		if err := s.RegisterAdoptedLFSObject(ctx, k.base(), canonicalKey, 70); err != nil {
+			t.Fatal(err)
+		}
+		if count, err := s.CountLFSObjects(ctx, k.base()); err != nil || count != 1 {
+			t.Fatalf("object count after re-registration = (%d, %v), want 1", count, err)
+		}
+		if st := k.state(); st.UsageBytes != 70 {
+			t.Fatalf("usage after re-registration = %d, want 70", st.UsageBytes)
+		}
+	})
+}
+
+// TestReconcileLegacyLFSTwinRows (ADR-41, Codex round 79): during a
+// rolling upgrade an old v0.2.0 replica can commit a legacy-spelled
+// registration ALONGSIDE the canonical row — the migration's NOT EXISTS
+// guard then never fires again, and for orderings where the canonical row
+// landed first, no fast path ever calls registration for the object
+// again. Both reconciliation seams must end the double-count: the
+// registration transaction (when it runs) and the sweeper's janitor
+// (when it never does).
+func TestReconcileLegacyLFSTwinRows(t *testing.T) {
+	runRefBackends(t, func(t *testing.T, s Store) {
+		ctx := context.Background()
+		k := newLedgerKit(t, s)
+		twin := func(oid string) (legacyKey, canonicalKey string) {
+			legacyKey = "lfs/" + k.base() + "/" + oid
+			canonicalKey = "lfs/" + k.base() + "/o2/" + oid
+			// Canonical registration commits first; the old replica's
+			// legacy registration lands after — the stranded-twin
+			// ordering no future registration can observe.
+			if err := s.RegisterAdoptedLFSObject(ctx, k.base(), canonicalKey, 40); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.RegisterLFSObject(ctx, k.base(), legacyKey, 40); err != nil {
+				t.Fatal(err)
+			}
+			return legacyKey, canonicalKey
+		}
+
+		// Seam 1: the sweeper janitor.
+		legacyKey, canonicalKey := twin(strings.Repeat("ef", 32))
+		if count, err := s.CountLFSObjects(ctx, k.base()); err != nil || count != 2 {
+			t.Fatalf("twin precondition count = (%d, %v), want 2", count, err)
+		}
+		preGen, err := s.LFSAdoptionGen(ctx, k.base())
+		if err != nil {
+			t.Fatal(err)
+		}
+		n, _, err := s.ReconcileLegacyLFSObjects(ctx)
+		if err != nil || n != 1 {
+			t.Fatalf("ReconcileLegacyLFSObjects = (%d, %v), want (1, nil)", n, err)
+		}
+		// The refund moves counted bytes out of the live counter: floors
+		// cached while the twin double-counted must be invalidated
+		// atomically with it (Codex round 82, security).
+		if gen, err := s.LFSAdoptionGen(ctx, k.base()); err != nil || gen == preGen {
+			t.Fatalf("adoption gen after janitor refund = (%d -> %d, %v), want bumped", preGen, gen, err)
+		}
+		if has, err := s.HasLFSObject(ctx, k.base(), legacyKey); err != nil || has {
+			t.Fatalf("legacy twin after reconcile = (%v, %v), want gone", has, err)
+		}
+		if has, err := s.HasLFSObject(ctx, k.base(), canonicalKey); err != nil || !has {
+			t.Fatalf("canonical row after reconcile = (%v, %v), want present", has, err)
+		}
+		if count, err := s.CountLFSObjects(ctx, k.base()); err != nil || count != 1 {
+			t.Fatalf("count after reconcile = (%d, %v), want 1", count, err)
+		}
+		if st := k.state(); st.UsageBytes != 40 {
+			t.Fatalf("usage after reconcile = %d, want 40 — the twin's bytes must be refunded", st.UsageBytes)
+		}
+		if n, _, err := s.ReconcileLegacyLFSObjects(ctx); err != nil || n != 0 {
+			t.Fatalf("idempotent reconcile = (%d, %v), want (0, nil)", n, err)
+		}
+
+		// Seam 2: a registration that DOES run reconciles in-transaction.
+		legacyKey2, _ := twin(strings.Repeat("ab", 32))
+		preGen2, err := s.LFSAdoptionGen(ctx, k.base())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s.RegisterAdoptedLFSObject(ctx, k.base(), "lfs/"+k.base()+"/o2/"+strings.Repeat("ab", 32), 40); err != nil {
+			t.Fatal(err)
+		}
+		// The conflicting insert skips the adopted-path bump (inserted ==
+		// 0), so the reconcile's OWN bump is load-bearing here too.
+		if gen, err := s.LFSAdoptionGen(ctx, k.base()); err != nil || gen == preGen2 {
+			t.Fatalf("adoption gen after in-tx refund = (%d -> %d, %v), want bumped", preGen2, gen, err)
+		}
+		if has, err := s.HasLFSObject(ctx, k.base(), legacyKey2); err != nil || has {
+			t.Fatalf("legacy twin after re-registration = (%v, %v), want reconciled away", has, err)
+		}
+		if count, err := s.CountLFSObjects(ctx, k.base()); err != nil || count != 2 {
+			t.Fatalf("count after re-registration = (%d, %v), want 2 (one per oid)", count, err)
+		}
+		if st := k.state(); st.UsageBytes != 80 {
+			t.Fatalf("usage after re-registration = %d, want 80", st.UsageBytes)
+		}
+	})
+}
+
+// TestReserveExcludesAdoptionClaims (Codex round 95): adoption-claim rows
+// carry a bookkeeping byte in pack_reservations, and the admission sums
+// counted it — at a quota exactly equal to the intended post-operation
+// usage, a legitimate reservation was denied as needing one byte more
+// (or two, while both an object's canonical and legacy claims were held).
+// Claims are leases, not storage: both the byte sum and the row-cap count
+// must exclude them.
+func TestReserveExcludesAdoptionClaims(t *testing.T) {
+	runRefBackends(t, func(t *testing.T, s Store) {
+		ctx := context.Background()
+		k := newLedgerKit(t, s)
+		oid := strings.Repeat("cd", 32)
+		for _, key := range []string{
+			"lfs/" + k.base() + "/o2/" + oid,
+			"lfs/" + k.base() + "/" + oid,
+		} {
+			claimed, _, err := s.TryAdoptionClaim(ctx, k.base(), key)
+			if err != nil || !claimed {
+				t.Fatalf("seed claim %s = (%v, %v)", key, claimed, err)
+			}
+		}
+		// The FULL quota must remain reservable under held claims.
+		dec, err := s.ReservePackBytes(ctx, []string{k.base()},
+			[]Pack{{Key: "packs/" + k.base() + "/pack-full.pack", Size: 100}},
+			NewReservationOwner(), 0, ReserveNoFloorGen, 100, time.Hour)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !dec.OK {
+			t.Fatalf("exact-quota reservation under held claims denied: %+v — claim bookkeeping bytes are not storage", dec)
+		}
+	})
+}
+
+// TestReconcileLegacyLFSObjectsPaged (Codex round 91): the janitor
+// materialized EVERY cross-repository candidate before reconciling any —
+// unbounded memory on a large mixed-roll fleet, inside Heal's synchronous
+// startup path. Candidates now process in bounded pages (each reconcile
+// deletes its row, so re-querying converges without offsets); a multi-page
+// backlog must still reconcile everything in one call.
+func TestReconcileLegacyLFSObjectsPaged(t *testing.T) {
+	oldBatch := reconcileLegacyLFSBatch
+	reconcileLegacyLFSBatch = 2
+	t.Cleanup(func() { reconcileLegacyLFSBatch = oldBatch })
+	runRefBackends(t, func(t *testing.T, s Store) {
+		ctx := context.Background()
+		k := newLedgerKit(t, s)
+		oids := []string{
+			strings.Repeat("11", 32), strings.Repeat("22", 32), strings.Repeat("33", 32),
+			strings.Repeat("44", 32), strings.Repeat("55", 32),
+		}
+		for _, oid := range oids {
+			if err := s.RegisterAdoptedLFSObject(ctx, k.base(), "lfs/"+k.base()+"/o2/"+oid, 40); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.RegisterLFSObject(ctx, k.base(), "lfs/"+k.base()+"/"+oid, 40); err != nil {
+				t.Fatal(err)
+			}
+		}
+		n, _, err := s.ReconcileLegacyLFSObjects(ctx)
+		if err != nil || n != int64(len(oids)) {
+			t.Fatalf("paged reconcile = (%d, %v), want (%d, nil) — the loop must run every page to exhaustion", n, err, len(oids))
+		}
+		for _, oid := range oids {
+			if has, err := s.HasLFSObject(ctx, k.base(), "lfs/"+k.base()+"/"+oid); err != nil || has {
+				t.Fatalf("legacy twin %s after paged reconcile = (%v, %v), want gone", oid, has, err)
+			}
+			if has, err := s.HasLFSObject(ctx, k.base(), "lfs/"+k.base()+"/o2/"+oid); err != nil || !has {
+				t.Fatalf("canonical row %s after paged reconcile = (%v, %v), want intact", oid, has, err)
+			}
+		}
+	})
+}
+
 // TestAdoptionClaimLease (Codex round 74): the fleet-wide adoption claim
 // must behave as a proper lease — (1) the admission GC, which runs with
 // the ADMISSION ttl (as short as ~61s), must never delete a live claim

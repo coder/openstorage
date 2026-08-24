@@ -155,6 +155,14 @@ type RefStore interface {
 	// sweeper calls it on its cadence). olderThan=0 expires everything —
 	// a test/recovery escape hatch. Returns the number of rows deleted.
 	SweepExpiredPackReservations(ctx context.Context, olderThan time.Duration) (int64, error)
+	// ReconcileLegacyLFSObjects deletes legacy-spelled lfs_objects rows
+	// whose canonical twin exists, refunding the count and bytes each
+	// double-charged, and returns how many it reconciled (ADR-41, Codex
+	// round 79): a rolling upgrade can commit a v0.2.0 legacy
+	// registration alongside the canonical row, after which the fast
+	// paths never call registration for the object again — without this
+	// janitor the twin would overstate usage and the object cap forever.
+	ReconcileLegacyLFSObjects(ctx context.Context) (reconciled int64, partial bool, err error)
 	// IsRetainedPack reports whether (repo, key) is recorded as a
 	// superseded-by-repack blob (issue #31): its row was folded away by
 	// ReplacePacks but its bytes still occupy the pack prefix. A point
@@ -185,10 +193,32 @@ type RefStore interface {
 	// the row exists). A re-registration of an existing row commits
 	// nothing and bumps nothing.
 	RegisterAdoptedLFSObject(ctx context.Context, repo, key string, bytes int64) error
+	// RecordLFSMismatch persists that a full content verification proved
+	// the legacy blob at key (fingerprint at hash time) wrong for its
+	// OID (#104, Codex round 132): the marker must survive restarts and
+	// be visible fleet-wide, or its loss makes a registered object's
+	// corrupt legacy spelling implicitly clean. Upsert; purge-fenced
+	// repos silently no-op like every row-creating write.
+	RecordLFSMismatch(ctx context.Context, repo, key, fingerprint string) error
+	// LFSMismatchFingerprint returns key's pending mismatch marker.
+	LFSMismatchFingerprint(ctx context.Context, repo, key string) (string, bool, error)
+	// ClearLFSMismatch removes key's marker after a decisive verdict.
+	ClearLFSMismatch(ctx context.Context, repo, key string) error
 	// HasLFSObject reports whether (repo, key) is a registered LFS object
 	// (a point read mirroring HasPack, for the sweeper's per-object
 	// classification of the lfs/ prefix).
 	HasLFSObject(ctx context.Context, repo, key string) (bool, error)
+	// LFSObjectRegisteredAt returns (repo, key)'s registration time — the
+	// row's created_at, which the in-place legacy→canonical migration
+	// REFRESHES (Codex round 89): downloads presign the still-rowless
+	// LEGACY spelling right up to the moment the canonical row exists, so
+	// the row's clock is the only trustworthy "no more legacy URLs are
+	// being minted" anchor. Blob timestamps are not: a rowless canonical
+	// copy can be hours old (publication or adoption copied it and only
+	// the registration failed) while its late registration retry
+	// verifies it in place without rewriting it. ok is false when no row
+	// exists.
+	LFSObjectRegisteredAt(ctx context.Context, repo, key string) (at time.Time, ok bool, err error)
 	// BumpLFSAdoptionGen increments repo's shared adoption generation
 	// (Codex round 49 on #51): adopting a pre-registry LFS object moves
 	// bytes that physical listings ALREADY contain into the usage
@@ -451,6 +481,13 @@ CREATE TABLE IF NOT EXISTS lfs_objects (repo text, key text, bytes bigint NOT NU
 -- never looser.
 CREATE TABLE IF NOT EXISTS lfs_object_counts (repo text PRIMARY KEY, count bigint NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS lfs_adoption_gens (repo text PRIMARY KEY, gen bigint NOT NULL DEFAULT 0);
+-- Fleet-persistent LFS mismatch markers (#104, Codex round 132): a FULL
+-- content verification proved the legacy blob's bytes wrong for their
+-- OID. Process-local markers were per-replica and evictable, and losing
+-- one made a registered object's corrupt legacy spelling implicitly
+-- clean forever. Cleared only by a decisive verdict (deleted spelling or
+-- current version proven valid).
+CREATE TABLE IF NOT EXISTS lfs_mismatches (repo text NOT NULL, key text NOT NULL, fingerprint text NOT NULL, PRIMARY KEY (repo, key));
 -- Repository purge fence (issue #52, PR #105 security round): one row per
 -- BASE repo whose purge began. Pack/LFS registrations check it under the
 -- base-ledger lock and fail closed, so no write settling after the fence

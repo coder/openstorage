@@ -288,11 +288,18 @@ type stubLedger struct{}
 func (stubLedger) IsRetainedPack(context.Context, string, string) (bool, error) {
 	return false, nil
 }
+func (stubLedger) LFSObjectRegisteredAt(context.Context, string, string) (time.Time, bool, error) {
+	return time.Time{}, false, nil
+}
 func (stubLedger) ReclaimRetainedPack(context.Context, string, string) (int64, error) {
 	return 0, nil
 }
 func (stubLedger) SweepExpiredPackReservations(context.Context, time.Duration) (int64, error) {
 	return 0, nil
+}
+
+func (stubLedger) ReconcileLegacyLFSObjects(context.Context) (int64, bool, error) {
+	return 0, false, nil
 }
 func (stubLedger) HasLFSObject(context.Context, string, string) (bool, error) {
 	return false, nil
@@ -457,7 +464,7 @@ func TestSweeper_HealStandalone(t *testing.T) {
 	f.backdate(quarantinePrefix+"00112233aabbccdd/"+stale, 25*time.Hour)
 
 	// Delete=true on purpose: the standalone heal must force purging off.
-	if err := f.sweeper(SweepConfig{Threshold: 24 * time.Hour, Delete: true}).Heal(context.Background()); err != nil {
+	if _, err := f.sweeper(SweepConfig{Threshold: 24 * time.Hour, Delete: true}).Heal(context.Background()); err != nil {
 		t.Fatalf("Heal: %v", err)
 	}
 	if !f.exists(lost) {

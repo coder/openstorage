@@ -162,7 +162,7 @@ func cmdServe(ctx context.Context, args []string) error {
 		return gitSrv.CachedUsageFloorGen(ctx, repo)
 	}
 	apiHandler, metaStore, verifier, maybeRepack, cleanup, err := buildAPIHandler(ctx, cfg.dbURL, cfg.org, httpBaseURL, loopbackBaseURL, orgPEMBlocks, st, bl, cfg.cacheDir,
-		api.RateLimitConfig{RPS: cfg.rateRPS, Burst: cfg.rateBurst, TrustedProxies: cfg.trustedProxies}, cfg.packQuotaBytes, cfg.packReservationTTL, cfg.sweep, cfg.repackThreshold, cfg.webhookAllowPrivate, cfg.secretsCodec, usageFloor)
+		api.RateLimitConfig{RPS: cfg.rateRPS, Burst: cfg.rateBurst, TrustedProxies: cfg.trustedProxies}, cfg.packQuotaBytes, cfg.packReservationTTL, cfg.sweep, cfg.lfsV020WriteCompat, cfg.repackThreshold, cfg.webhookAllowPrivate, cfg.secretsCodec, usageFloor)
 	if err != nil {
 		return err
 	}
@@ -188,6 +188,7 @@ func cmdServe(ctx context.Context, args []string) error {
 	// same canonical base the API's http_url values use.
 	srv.BaseURL = httpBaseURL
 	srv.LFSStagingBytes = cfg.lfsStagingBytes
+	srv.LFSV020WriteCompat = cfg.lfsV020WriteCompat
 	srv.MaxPushBytes = cfg.maxPushBytes
 	srv.VerifySigBudget = cfg.verifySigBudget
 	// docs/explanation/git-protocol-and-namespaces.md git URLs address repos by repo_id (name-style urls accepted

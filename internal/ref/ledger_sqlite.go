@@ -70,10 +70,12 @@ SELECT
   COALESCE((SELECT SUM(bytes) FROM pack_reservations
             WHERE repo = ?
               AND created_at > `+sqliteEpochMS+` - ?
+              AND key NOT LIKE '%`+AdoptionClaimSuffix+`'
               AND key NOT IN (?`+placeholders(len(excludeSum)-1)+`)), 0),
   (SELECT COUNT(*) FROM pack_reservations
    WHERE repo = ?
      AND created_at > `+sqliteEpochMS+` - ?
+     AND key NOT LIKE '%`+AdoptionClaimSuffix+`'
      AND key NOT IN (?`+placeholders(len(excludeCount)-1)+`))`,
 		groupArgs...).Scan(&counter, &reserved, &activeRows); err != nil {
 		return ReserveDecision{}, fmt.Errorf("reserve pack bytes read: %w", err)
@@ -296,6 +298,22 @@ func (s *SQLite) registerLFSObjectTx(ctx context.Context, repo, key string, byte
 	} else if fenced {
 		return fmt.Errorf("register lfs object %s: %w", key, ErrRepoPurged)
 	}
+	// Migrate a v0.2.0 legacy-spelled row in place (zero growth) — see
+	// the PG twin (ADR-41) — and reconcile a twin a racing v0.2.0
+	// registration left behind (Codex round 79).
+	if legacy, ok := lfsLegacyRowKey(key); ok {
+		// created_at refreshes to the migration moment — the legacy reap
+		// grace's clock (Codex round 89); see the PG twin.
+		if _, err := tx.ExecContext(ctx, `
+UPDATE lfs_objects SET key = ?, created_at = unixepoch() WHERE repo = ? AND key = ?
+  AND NOT EXISTS (SELECT 1 FROM lfs_objects o2 WHERE o2.repo = ? AND o2.key = ?)`,
+			key, repo, legacy, repo, key); err != nil {
+			return err
+		}
+		if _, err := reconcileLegacyLFSRowSQLite(ctx, tx, repo, legacy, key); err != nil {
+			return err
+		}
+	}
 	res, err := tx.ExecContext(ctx,
 		`INSERT INTO lfs_objects (repo, key, bytes) VALUES (?, ?, ?) ON CONFLICT DO NOTHING`,
 		repo, key, bytes)
@@ -345,6 +363,117 @@ ON CONFLICT (repo) DO UPDATE SET gen = lfs_adoption_gens.gen + 1`, repo); err !=
 	return nil
 }
 
+// reconcileLegacyLFSRowSQLite — see the PG twin (reconcileLegacyLFSRowPG).
+// Two-step under BEGIN IMMEDIATE (single writer): select-then-delete is
+// race-free here.
+func reconcileLegacyLFSRowSQLite(ctx context.Context, tx *sql.Tx, repo, legacy, canonical string) (bool, error) {
+	var legacyBytes int64
+	switch err := tx.QueryRowContext(ctx, `
+SELECT bytes FROM lfs_objects WHERE repo = ? AND key = ?
+  AND EXISTS (SELECT 1 FROM lfs_objects c WHERE c.repo = ? AND c.key = ?)`,
+		repo, legacy, repo, canonical).Scan(&legacyBytes); {
+	case errors.Is(err, sql.ErrNoRows):
+		return false, nil
+	case err != nil:
+		return false, err
+	}
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM lfs_objects WHERE repo = ? AND key = ?`, repo, legacy); err != nil {
+		return false, err
+	}
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE lfs_object_counts SET count = MAX(count - 1, 0) WHERE repo = ?`, repo); err != nil {
+		return false, err
+	}
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE pack_usage SET bytes = MAX(bytes - ?, 0) WHERE repo = ?`, legacyBytes, repo); err != nil {
+		return false, err
+	}
+	// Atomic floor invalidation with the refund (Codex round 82,
+	// security) — see the PG twin; BEGIN IMMEDIATE is the admission
+	// serialization here.
+	if _, err := tx.ExecContext(ctx, `
+INSERT INTO lfs_adoption_gens (repo, gen) VALUES (?, 1)
+ON CONFLICT (repo) DO UPDATE SET gen = lfs_adoption_gens.gen + 1`, repo); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// ReconcileLegacyLFSObjects — see RefStore. Paged like the PG twin
+// (Codex round 91): one bounded candidate page in memory at a time; each
+// reconcile deletes its row, so re-querying converges without offsets.
+func (s *SQLite) ReconcileLegacyLFSObjects(ctx context.Context) (int64, bool, error) {
+	var n int64
+	// Page-capped per invocation like the PG twin (security round 127).
+	for i := 0; i < reconcileLegacyLFSMaxPages; i++ {
+		page, progress, err := s.reconcileLegacyLFSPage(ctx)
+		n += progress
+		if err != nil {
+			return n, false, err
+		}
+		if page < reconcileLegacyLFSBatch {
+			return n, false, nil
+		}
+		if progress == 0 {
+			return n, false, fmt.Errorf("reconcile legacy lfs rows: full page of %d candidates made no progress", page)
+		}
+	}
+	// Page cap exhausted — clean PARTIAL success, see the PG twin.
+	return n, true, nil
+}
+
+// reconcileLegacyLFSPage reconciles one bounded candidate page, returning
+// the page size and the rows actually reconciled.
+func (s *SQLite) reconcileLegacyLFSPage(ctx context.Context) (int, int64, error) {
+	rows, err := s.db.QueryContext(ctx, `
+SELECT l.repo, l.key FROM lfs_objects l
+WHERE instr(l.key, '/o2/') = 0
+  AND EXISTS (SELECT 1 FROM lfs_objects c WHERE c.repo = l.repo
+    AND c.key = 'lfs/' || l.repo || '/o2/' || substr(l.key, length('lfs/' || l.repo || '/') + 1))
+LIMIT ?`, reconcileLegacyLFSBatch)
+	if err != nil {
+		return 0, 0, err
+	}
+	type cand struct{ repo, key string }
+	var cands []cand
+	for rows.Next() {
+		var c cand
+		if err := rows.Scan(&c.repo, &c.key); err != nil {
+			rows.Close()
+			return 0, 0, err
+		}
+		cands = append(cands, c)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, 0, err
+	}
+	var n int64
+	for _, c := range cands {
+		canonical, ok := canonicalFromLegacyLFSRowKey(c.repo, c.key)
+		if !ok {
+			continue // defensive: candidate selection and Go parsing disagree
+		}
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return len(cands), n, err
+		}
+		done, err := reconcileLegacyLFSRowSQLite(ctx, tx, c.repo, c.key, canonical)
+		if err != nil {
+			_ = tx.Rollback()
+			return len(cands), n, err
+		}
+		if err := tx.Commit(); err != nil {
+			return len(cands), n, err
+		}
+		if done {
+			n++
+		}
+	}
+	return len(cands), n, nil
+}
+
 // BumpLFSAdoptionGen — see RefStore (Codex round 49). The purge-fence
 // guard is inside the single upsert statement (issue #52, PR #105 round
 // 10; see the PG twin's rationale): no row proposed for a fenced repo
@@ -356,6 +485,38 @@ func (s *SQLite) BumpLFSAdoptionGen(ctx context.Context, repo string) error {
 INSERT INTO lfs_adoption_gens (repo, gen)
 SELECT ?, 1 WHERE NOT EXISTS (SELECT 1 FROM purged_repos WHERE repo = ?)
 ON CONFLICT (repo) DO UPDATE SET gen = lfs_adoption_gens.gen + 1`, repo, baseRepoOf(repo))
+	return err
+}
+
+// RecordLFSMismatch — see RefStore (#104, Codex round 132). The purge
+// fence rides the INSERT like BumpLFSAdoptionGen's; BEGIN IMMEDIATE's
+// single writer is the serialization.
+func (s *SQLite) RecordLFSMismatch(ctx context.Context, repo, key, fingerprint string) error {
+	assertf(repo != "" && key != "" && fingerprint != "", "RecordLFSMismatch(%q, %q)", repo, key)
+	_, err := s.db.ExecContext(ctx, `
+INSERT INTO lfs_mismatches (repo, key, fingerprint)
+SELECT ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM purged_repos WHERE repo = ?)
+ON CONFLICT (repo, key) DO UPDATE SET fingerprint = excluded.fingerprint`,
+		repo, key, fingerprint, baseRepoOf(repo))
+	return err
+}
+
+// LFSMismatchFingerprint — see RefStore (#104, Codex round 132).
+func (s *SQLite) LFSMismatchFingerprint(ctx context.Context, repo, key string) (string, bool, error) {
+	assertf(repo != "" && key != "", "LFSMismatchFingerprint(%q, %q)", repo, key)
+	var fp string
+	err := s.db.QueryRowContext(ctx,
+		`SELECT fingerprint FROM lfs_mismatches WHERE repo = ? AND key = ?`, repo, key).Scan(&fp)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	return fp, err == nil, err
+}
+
+// ClearLFSMismatch — see RefStore (#104, Codex round 132).
+func (s *SQLite) ClearLFSMismatch(ctx context.Context, repo, key string) error {
+	assertf(repo != "" && key != "", "ClearLFSMismatch(%q, %q)", repo, key)
+	_, err := s.db.ExecContext(ctx, `DELETE FROM lfs_mismatches WHERE repo = ? AND key = ?`, repo, key)
 	return err
 }
 
@@ -463,6 +624,22 @@ func (s *SQLite) HasLFSObject(ctx context.Context, repo, key string) (bool, erro
 	return exists, err
 }
 
+// LFSObjectRegisteredAt — see RefStore (Codex round 89). created_at is
+// unixepoch() seconds in the SQLite schema.
+func (s *SQLite) LFSObjectRegisteredAt(ctx context.Context, repo, key string) (time.Time, bool, error) {
+	assertf(repo != "" && key != "", "LFSObjectRegisteredAt(%q, %q)", repo, key)
+	var secs int64
+	err := s.db.QueryRowContext(ctx,
+		`SELECT created_at FROM lfs_objects WHERE repo = ? AND key = ?`, repo, key).Scan(&secs)
+	if errors.Is(err, sql.ErrNoRows) {
+		return time.Time{}, false, nil
+	}
+	if err != nil {
+		return time.Time{}, false, err
+	}
+	return time.Unix(secs, 0), true, nil
+}
+
 // QuotaLedgerState reads the group's ledger state (see the PG twin).
 func (s *SQLite) QuotaLedgerState(ctx context.Context, group []string, ttl time.Duration, excludeKeys ...string) (PackQuotaLedgerState, error) {
 	assertf(len(group) > 0 && group[0] != "" && ttl > 0, "QuotaLedgerState(%v, %v)", group, ttl)
@@ -488,7 +665,8 @@ func (s *SQLite) QuotaLedgerState(ctx context.Context, group []string, ttl time.
 SELECT
   COALESCE((SELECT SUM(bytes) FROM pack_usage WHERE repo IN (?`+placeholders(len(group)-1)+`)), 0),
   COALESCE((SELECT SUM(bytes) FROM pack_reservations
-            WHERE repo = ? AND created_at > `+sqliteEpochMS+` - ?`+exclude+`), 0),
+            WHERE repo = ? AND created_at > `+sqliteEpochMS+` - ?
+              AND key NOT LIKE '%`+AdoptionClaimSuffix+`'`+exclude+`), 0),
   COALESCE((SELECT SUM(bytes) FROM pack_retained WHERE repo IN (?`+placeholders(len(group)-1)+`)), 0)`,
 		args...).Scan(&st.UsageBytes, &st.ReservedBytes, &st.RetainedBytes)
 	return st, err

@@ -336,11 +336,31 @@ and are carried forward by repack
 ([why](../explanation/storage-engine.md#why-repack-packs-the-union-not-reachable-objects));
 a client retry of the same push deduplicates against it and makes it reachable.
 Schema upgrades ride the same boot-time locking as [above](#concurrent-boot-schema-setup-and-migrations),
-so a mixed-version fleet mid-roll is expected and fine, with one deliberate exception:
+so a mixed-version fleet mid-roll is expected and fine, with two deliberate exceptions:
 
 > **Do not enable delete-mode sweeping until the whole fleet runs a build that has it.**
 > See the [storage lifecycle guide](storage-lifecycle-and-sweeping.md#before-enabling-delete-mode-fleet-prerequisite)
 > for the exact prerequisite and why list-only mode is safe on any fleet.
+
+> **Upgrading from v0.2.0 or older with Git LFS in use: set
+> [`CODESTORAGE_LFS_V020_WRITE_COMPAT`](../reference/configuration.md#codestorage_lfs_v020_write_compat)
+> on the upgraded replicas for the duration of the roll, then drop it.** Registered
+> LFS objects now live at a canonical key old replicas cannot derive (ADR-41); the
+> compat flag dual-publishes to the legacy key so old replicas keep serving LFS
+> reads until the fleet is fully rolled. **Disable
+> [`CODESTORAGE_SWEEP_DELETE_LFS`](../reference/configuration.md#codestorage_sweep_delete_lfs)
+> on EVERY replica — the not-yet-upgraded v0.2.0 ones included — for the duration
+> of the roll**: the upgrade migrates registry rows to the canonical spelling in
+> place, which makes a touched object's legacy blob look rowless to an old
+> binary's sweeper, and old binaries have no legacy gate — a reap-enabled v0.2.0
+> sweeper deletes it immediately and breaks old-replica reads mid-roll (upgraded
+> replicas refuse to start with both flags set, but only the old nodes' sweepers
+> are the hazard, so stage the flags before rolling). After the roll, re-enable
+> LFS sweeping if desired; legacy-spelled keys (adoption sources, compat copies)
+> are reclaimed only by the separate post-roll
+> [`CODESTORAGE_SWEEP_DELETE_LFS_LEGACY`](../reference/configuration.md#codestorage_sweep_delete_lfs_legacy)
+> opt-in, whose transition gate dominates every sweep flag on upgraded binaries.
+> Enable it only once the last old replica has been gone ≥ 15 minutes.
 
 Upstream-sync claims are leased: a replica that dies mid-sync leaves a claim that the
 next run steals automatically once the lease expires, so a crash can delay but never
