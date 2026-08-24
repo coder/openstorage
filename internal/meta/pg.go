@@ -97,6 +97,12 @@ CREATE TABLE IF NOT EXISTS repos (
     default_branch text NOT NULL,
     created_at     timestamptz NOT NULL DEFAULT now(),
     deleted_at     timestamptz,
+    -- purged_at marks a completed storage purge (issue #52). The row is
+    -- KEPT as a permanent name tombstone: JWT repo claims are URL-scoped
+    -- and can outlive any retention (Codex security round on #105), so
+    -- releasing the burned (org, url) name would let a stale token
+    -- authorize against a successor repository created at that URL.
+    purged_at      timestamptz,
     CONSTRAINT repos_org_id_url_key UNIQUE (org_id, url)
 );
 -- Keyset pagination index for ListRepos (live rows only).
@@ -143,6 +149,18 @@ CREATE TABLE IF NOT EXISTS repo_upstreams (
 ALTER TABLE repo_upstreams ADD COLUMN IF NOT EXISTS sync_pending boolean NOT NULL DEFAULT false;
 ALTER TABLE repo_upstreams ADD COLUMN IF NOT EXISTS sync_claim_holder text NOT NULL DEFAULT '';
 ALTER TABLE repo_upstreams ADD COLUMN IF NOT EXISTS sync_claim_expires_at timestamptz NOT NULL DEFAULT 'epoch';
+-- Upgrade path for repos predating the purge tombstone column (issue #52).
+ALTER TABLE repos ADD COLUMN IF NOT EXISTS purged_at timestamptz;
+-- Retention-purge scan index (issue #52): PurgeableRepos pages PENDING
+-- purges (soft-deleted, not yet stamped) oldest-deletion-first. Excluding
+-- stamped tombstones keeps the scan O(pending) — completed purges keep
+-- their repos rows forever, so an all-deleted index would grow without
+-- bound. Created after the purged_at upgrade above (the predicate needs
+-- the column on pre-upgrade databases); the drop clears this PR's earlier
+-- all-deleted spelling from dev databases.
+DROP INDEX IF EXISTS repos_deleted_idx;
+CREATE INDEX IF NOT EXISTS repos_purgeable_idx
+    ON repos (deleted_at, repo_id) WHERE deleted_at IS NOT NULL AND purged_at IS NULL;
 `)
 		return err
 	})

@@ -206,9 +206,14 @@ func (s *SQLite) CreateGitCredential(ctx context.Context, cred GitCredential) (G
 	nanos, createdAt := s.nowNano()
 	cred.ID = NewEventingID("ggc")
 	cred.CreatedAt = createdAt
-	_, err = s.db.ExecContext(ctx,
-		`INSERT INTO git_credentials (id, repo_id, username, password, created_at) VALUES (?, ?, ?, ?, ?)`,
-		cred.ID, cred.RepoID, cred.Username, stored, nanos)
+	// Live-repo guard (issue #52, PR #105 round 6): SQLite's single-writer
+	// lock totally orders this statement against SoftDeleteRepo /
+	// PurgeRepoMeta — see the PG twin's rationale.
+	res, err := s.db.ExecContext(ctx,
+		`INSERT INTO git_credentials (id, repo_id, username, password, created_at)
+		 SELECT ?, ?, ?, ?, ?
+		 WHERE EXISTS (SELECT 1 FROM repos WHERE repo_id = ? AND deleted_at IS NULL)`,
+		cred.ID, cred.RepoID, cred.Username, stored, nanos, cred.RepoID)
 	// A unique violation here can only be repo_id: an id collision would be
 	// SQLITE_CONSTRAINT_PRIMARYKEY, a different extended code.
 	if isUniqueViolation(err) {
@@ -216,6 +221,11 @@ func (s *SQLite) CreateGitCredential(ctx context.Context, cred GitCredential) (G
 	}
 	if err != nil {
 		return GitCredential{}, fmt.Errorf("create credential for repo %q: %w", cred.RepoID, err)
+	}
+	if n, err := res.RowsAffected(); err != nil {
+		return GitCredential{}, fmt.Errorf("create credential for repo %q: rows: %w", cred.RepoID, err)
+	} else if n == 0 {
+		return GitCredential{}, fmt.Errorf("credential for deleted or unknown repo %q: %w", cred.RepoID, ErrNotFound)
 	}
 	return cred, nil
 }
@@ -344,18 +354,26 @@ func (s *SQLite) SetRepoUpstream(ctx context.Context, up RepoUpstream) (RepoUpst
 	up.RunCount, up.SuccessCount, up.Syncing, up.SyncPending = 0, 0, false, false
 	up.SyncClaimHolder, up.SyncClaimExpiresAt = "", time.Unix(0, 0).UTC()
 	up.CreatedAt = createdAt
-	_, err := s.db.ExecContext(ctx,
+	// Live-repo guard — see CreateGitCredential (issue #52, PR #105
+	// round 6).
+	res, err := s.db.ExecContext(ctx,
 		`INSERT INTO repo_upstreams (repo_id, provider, owner, name, upstream_host,
 		        run_count, success_count, syncing, sync_pending,
 		        sync_claim_holder, sync_claim_expires_at, created_at)
-		 VALUES (?, ?, ?, ?, ?, 0, 0, 0, 0, '', 0, ?)`,
-		up.RepoID, up.Provider, up.Owner, up.Name, up.UpstreamHost, nanos)
+		 SELECT ?, ?, ?, ?, ?, 0, 0, 0, 0, '', 0, ?
+		 WHERE EXISTS (SELECT 1 FROM repos WHERE repo_id = ? AND deleted_at IS NULL)`,
+		up.RepoID, up.Provider, up.Owner, up.Name, up.UpstreamHost, nanos, up.RepoID)
 	// The only constraint on repo_upstreams is the repo_id PRIMARY KEY.
 	if isPrimaryKeyViolation(err) {
 		return RepoUpstream{}, fmt.Errorf("upstream for repo %q: %w", up.RepoID, ErrAlreadyExists)
 	}
 	if err != nil {
 		return RepoUpstream{}, fmt.Errorf("set upstream for repo %q: %w", up.RepoID, err)
+	}
+	if n, err := res.RowsAffected(); err != nil {
+		return RepoUpstream{}, fmt.Errorf("set upstream for repo %q: rows: %w", up.RepoID, err)
+	} else if n == 0 {
+		return RepoUpstream{}, fmt.Errorf("upstream for deleted or unknown repo %q: %w", up.RepoID, ErrNotFound)
 	}
 	return up, nil
 }

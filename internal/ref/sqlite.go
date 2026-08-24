@@ -114,6 +114,10 @@ func (s *SQLite) InitSchema(ctx context.Context) error {
 		// O(1) object-count cap reads — see the PG DDL for the rationale.
 		`CREATE TABLE IF NOT EXISTS lfs_object_counts (repo TEXT PRIMARY KEY, count INTEGER NOT NULL DEFAULT 0)`,
 		`CREATE TABLE IF NOT EXISTS lfs_adoption_gens (repo TEXT PRIMARY KEY, gen INTEGER NOT NULL DEFAULT 0)`,
+		// Repository purge fence (issue #52, PR #105 security round):
+		// see the PG schema comment.
+		`CREATE TABLE IF NOT EXISTS purged_repos (repo TEXT PRIMARY KEY,
+		    fenced_at INTEGER NOT NULL DEFAULT 0)`,
 	} {
 		if _, err := tx.ExecContext(ctx, stmt); err != nil {
 			return fmt.Errorf("sqlite init schema: %w", err)
@@ -251,11 +255,19 @@ func (s *SQLite) GetRef(ctx context.Context, repo, name string) (string, error) 
 // CASRef performs the compare-and-swap ref update. Returns won=false (no
 // error) when the precondition failed, i.e. someone else won the race.
 // Refs only ever change inside these single statements, so a broken/partial
-// ref state is impossible by construction. A won swap also bumps the repo
-// generation via the InitSchema-installed triggers — inside the same
-// implicit transaction, so the statement stays the single unit of commit
-// and the IdempotentCAS ambiguity classification (idempotent.go) is
-// unchanged.
+// ref state is impossible by construction; the statement runs inside an
+// explicit BEGIN IMMEDIATE transaction whose only other work — the purge-
+// fence read below — happens strictly BEFORE it, so the statement remains
+// the single mutation unit and the IdempotentCAS ambiguity classification
+// (idempotent.go) is unchanged: pre-statement failures are tagged
+// notExecuted, and a lost COMMIT stays ambiguous (recovered by the
+// recheck). A won swap also bumps the repo generation via the
+// InitSchema-installed triggers inside the same transaction.
+//
+// The transaction rejects purge-fenced repos with ErrRepoPurged (issue
+// #52, PR #105 security round; see the PG twin's rationale): BEGIN
+// IMMEDIATE takes the database write lock at begin, totally ordering the
+// fence read + CAS pair against FenceRepoPurge's insert.
 //
 // Under WithSyncClaimFence (ref.go) the statement additionally requires
 // the repo's sync claim to be held by the fencing holder: SQLite's
@@ -285,6 +297,21 @@ func (s *SQLite) CASRef(ctx context.Context, repo, name, old, new string) (won b
 		return false, fmt.Errorf("cas %s/%s: %w", repo, name, notExecuted(cerr))
 	}
 
+	// Everything up to (but excluding) the CAS statement is provably
+	// non-executing: an error here means the mutation was never sent.
+	tx, err := conn.BeginTx(ctx, nil) // BEGIN IMMEDIATE via _txlock
+	if err != nil {
+		return false, fmt.Errorf("cas begin %s/%s: %w", repo, name, notExecuted(err))
+	}
+	defer func() { _ = tx.Rollback() }()
+	purged, err := repoPurgeFencedSQLite(ctx, tx, repo)
+	if err != nil {
+		return false, fmt.Errorf("cas %s/%s: purge fence: %w", repo, name, notExecuted(err))
+	}
+	if purged {
+		return false, fmt.Errorf("cas %s/%s: %w", repo, name, notExecuted(ErrRepoPurged))
+	}
+
 	fence, fenced := casFence(ctx, repo)
 	var tag string
 	var res sql.Result
@@ -293,12 +320,12 @@ func (s *SQLite) CASRef(ctx context.Context, repo, name, old, new string) (won b
 		// created_at set explicitly (not via column default): databases
 		// migrated by the InitSchema ALTER have no default on the column.
 		// SHA updates below never touch it.
-		res, err = conn.ExecContext(ctx,
+		res, err = tx.ExecContext(ctx,
 			`INSERT INTO refs (repo, name, sha, created_at) VALUES (?, ?, ?, unixepoch()) ON CONFLICT DO NOTHING`,
 			repo, name, new)
 		tag = "create"
 	case old == ZeroSHA: // fenced create
-		res, err = conn.ExecContext(ctx,
+		res, err = tx.ExecContext(ctx,
 			`INSERT INTO refs (repo, name, sha, created_at)
 			 SELECT ?, ?, ?, unixepoch()
 			 WHERE EXISTS (SELECT 1 FROM repo_upstreams WHERE repo_id = ? AND sync_claim_holder = ?)
@@ -306,23 +333,23 @@ func (s *SQLite) CASRef(ctx context.Context, repo, name, old, new string) (won b
 			repo, name, new, repo, fence.holder)
 		tag = "fenced create"
 	case new == ZeroSHA && !fenced: // delete
-		res, err = conn.ExecContext(ctx,
+		res, err = tx.ExecContext(ctx,
 			`DELETE FROM refs WHERE repo = ? AND name = ? AND sha = ?`,
 			repo, name, old)
 		tag = "delete"
 	case new == ZeroSHA: // fenced delete
-		res, err = conn.ExecContext(ctx,
+		res, err = tx.ExecContext(ctx,
 			`DELETE FROM refs WHERE repo = ? AND name = ? AND sha = ?
 			 AND EXISTS (SELECT 1 FROM repo_upstreams WHERE repo_id = ? AND sync_claim_holder = ?)`,
 			repo, name, old, repo, fence.holder)
 		tag = "fenced delete"
 	case !fenced: // update
-		res, err = conn.ExecContext(ctx,
+		res, err = tx.ExecContext(ctx,
 			`UPDATE refs SET sha = ? WHERE repo = ? AND name = ? AND sha = ?`,
 			new, repo, name, old)
 		tag = "update"
 	default: // fenced update
-		res, err = conn.ExecContext(ctx,
+		res, err = tx.ExecContext(ctx,
 			`UPDATE refs SET sha = ? WHERE repo = ? AND name = ? AND sha = ?
 			 AND EXISTS (SELECT 1 FROM repo_upstreams WHERE repo_id = ? AND sync_claim_holder = ?)`,
 			new, repo, name, old, repo, fence.holder)
@@ -330,6 +357,12 @@ func (s *SQLite) CASRef(ctx context.Context, repo, name, old, new string) (won b
 	}
 	if err != nil {
 		return false, fmt.Errorf("cas %s %s/%s: %w", tag, repo, name, err)
+	}
+	// A commit failure is NOT notExecuted: the response may have been
+	// lost after the backend committed — exactly the ambiguity class the
+	// IdempotentCAS recovery recheck exists for.
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("cas %s %s/%s: commit: %w", tag, repo, name, err)
 	}
 	n, err := res.RowsAffected()
 	if err != nil {
@@ -352,6 +385,13 @@ func (s *SQLite) RegisterPacks(ctx context.Context, repo string, packs []Pack) e
 		return fmt.Errorf("register packs begin: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+	// Purge fence (issue #52): the single-writer transaction orders this
+	// read against FenceRepoPurge's insert — see the PG twin.
+	if fenced, err := repoPurgeFencedSQLite(ctx, tx, repo); err != nil {
+		return err
+	} else if fenced {
+		return fmt.Errorf("register packs %s: %w", repo, ErrRepoPurged)
+	}
 	var credit int64
 	adopted := false
 	for _, p := range packs {

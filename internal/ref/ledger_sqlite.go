@@ -27,6 +27,12 @@ func (s *SQLite) ReservePackBytes(ctx context.Context, group []string, packs []P
 		return ReserveDecision{}, fmt.Errorf("reserve pack bytes begin: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+	// Purge fence — see the PG twin (issue #52, PR #105 round 9).
+	if fenced, err := repoPurgeFencedSQLite(ctx, tx, group[0]); err != nil {
+		return ReserveDecision{}, err
+	} else if fenced {
+		return ReserveDecision{}, fmt.Errorf("reserve pack bytes %s: %w", group[0], ErrRepoPurged)
+	}
 	// Self-healing GC for expired rows — see the PG twin's rationale.
 	if _, err := tx.ExecContext(ctx,
 		`DELETE FROM pack_reservations WHERE repo = ? AND created_at <= `+sqliteEpochMS+` - ?
@@ -285,6 +291,13 @@ func (s *SQLite) registerLFSObjectTx(ctx context.Context, repo, key string, byte
 		return fmt.Errorf("register lfs object begin: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+	// Purge fence (issue #52): the single-writer transaction orders this
+	// read against FenceRepoPurge's insert — see the PG twin.
+	if fenced, err := repoPurgeFencedSQLite(ctx, tx, repo); err != nil {
+		return err
+	} else if fenced {
+		return fmt.Errorf("register lfs object %s: %w", key, ErrRepoPurged)
+	}
 	// Migrate a v0.2.0 legacy-spelled row in place (zero growth) — see
 	// the PG twin (ADR-41) — and reconcile a twin a racing v0.2.0
 	// registration left behind (Codex round 79).
@@ -458,12 +471,17 @@ LIMIT ?`, reconcileLegacyLFSBatch)
 	return len(cands), n, nil
 }
 
-// BumpLFSAdoptionGen — see RefStore (Codex round 49).
+// BumpLFSAdoptionGen — see RefStore (Codex round 49). The purge-fence
+// guard is inside the single upsert statement (issue #52, PR #105 round
+// 10; see the PG twin's rationale): no row proposed for a fenced repo
+// means no conflict and no update, and SQLite's single writer totally
+// orders the statement against FenceRepoPurge's insert.
 func (s *SQLite) BumpLFSAdoptionGen(ctx context.Context, repo string) error {
 	assertf(repo != "", "BumpLFSAdoptionGen(%q)", repo)
 	_, err := s.db.ExecContext(ctx, `
-INSERT INTO lfs_adoption_gens (repo, gen) VALUES (?, 1)
-ON CONFLICT (repo) DO UPDATE SET gen = lfs_adoption_gens.gen + 1`, repo)
+INSERT INTO lfs_adoption_gens (repo, gen)
+SELECT ?, 1 WHERE NOT EXISTS (SELECT 1 FROM purged_repos WHERE repo = ?)
+ON CONFLICT (repo) DO UPDATE SET gen = lfs_adoption_gens.gen + 1`, repo, baseRepoOf(repo))
 	return err
 }
 
@@ -484,12 +502,15 @@ func (s *SQLite) LFSAdoptionGen(ctx context.Context, repo string) (int64, error)
 func (s *SQLite) TryAdoptionClaim(ctx context.Context, repo, key string) (bool, string, error) {
 	assertf(repo != "" && key != "", "TryAdoptionClaim(%q, %q)", repo, key)
 	owner := NewReservationOwner()
+	// Purge-fence guard inside the statement — see the PG twin (issue
+	// #52, PR #105 round 13); the single writer totally orders it.
 	res, err := s.db.ExecContext(ctx, `
 INSERT INTO pack_reservations (key, repo, bytes, owner, created_at, gen)
-VALUES (?, ?, 1, ?, `+sqliteEpochMS+`, '')
+SELECT ?, ?, 1, ?, `+sqliteEpochMS+`, ''
+WHERE NOT EXISTS (SELECT 1 FROM purged_repos WHERE repo = ?)
 ON CONFLICT (key) DO UPDATE SET repo = excluded.repo, owner = excluded.owner, created_at = excluded.created_at
 WHERE pack_reservations.created_at <= `+sqliteEpochMS+` - ?`,
-		key+AdoptionClaimSuffix, repo, owner, AdoptionClaimTTL.Milliseconds())
+		key+AdoptionClaimSuffix, repo, owner, baseRepoOf(repo), AdoptionClaimTTL.Milliseconds())
 	if err != nil {
 		return false, "", err
 	}

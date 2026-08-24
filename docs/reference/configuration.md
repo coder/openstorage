@@ -39,6 +39,7 @@ never a silently-applied default.
 | [`CODESTORAGE_SWEEP_DELETE_SUPERSEDED`](#codestorage_sweep_delete_superseded) | `true` | Reap blobs a repack fold provably superseded |
 | [`CODESTORAGE_SWEEP_DELETE_LFS`](#codestorage_sweep_delete_lfs) | `false` | Opt-in: actually delete orphan LFS objects (list-only otherwise) |
 | [`CODESTORAGE_SWEEP_DELETE_LFS_LEGACY`](#codestorage_sweep_delete_lfs_legacy) | `false` | Post-roll opt-in: admit legacy-spelled LFS keys to the LFS reap (ADR-41 transition gate) |
+| [`CODESTORAGE_REPO_RETENTION`](#codestorage_repo_retention) | unset | Purge repositories soft-deleted longer than this (unset/`0` keeps them forever) |
 | [`CODESTORAGE_REPACK_THRESHOLD`](#codestorage_repack_threshold) | `10` | Registered-pack count that triggers a background repack (`0` disables) |
 | [`CODESTORAGE_SYNC_STEAL_LEGACY`](#codestorage_sync_steal_legacy) | `false` | Opt-in: steal pre-lease sync claims after their adoption grace lapses |
 
@@ -552,6 +553,41 @@ without this flag no sweep mode deletes a legacy-spelled key.
 - **Default:** `false` (legacy keys are never deleted). **Constraints:** must parse
   as a boolean; only meaningful together with `CODESTORAGE_SWEEP_DELETE_LFS`.
 - Same quarantine-first disposal as every destructive class.
+
+### `CODESTORAGE_REPO_RETENTION`
+
+Retention window for soft-deleted repositories: once a repository has been deleted
+longer than this, a purge pass on the sweep cadence **permanently** removes its
+registry and eventing rows (refs, packs, LFS objects, credentials, upstream link) and
+deletes its blobs through the same quarantine-first discipline as every other sweep
+class. Only the repository row itself is retained, stamped as a purge tombstone — see
+the name-burn note below. The [`codestorage purge-repo`](cli.md#codestorage-purge-repo)
+command runs the same primitive synchronously for one repository.
+
+- **Default:** unset (`0`) — soft-deleted repositories are kept forever.
+- **Constraints:** a Go duration of at least `1h` (shorter values are startup errors:
+  the purge always waits at least an hour after deletion so no in-flight pre-delete
+  push can race it), and sweeping must be enabled
+  ([`CODESTORAGE_SWEEP_INTERVAL`](#codestorage_sweep_interval) > 0) — the purge rides
+  the sweep schedule.
+- **Fleet-upgrade prerequisite:** enable only once **every** node — serve replicas *and*
+  hook-running git nodes — runs a build with the purge write fence (ref updates and
+  pack/LFS registrations reject purged repositories). Older binaries do not check the
+  fence, so on a mixed fleet a write accepted by an old node can commit after the
+  purge's verification and be stranded behind the completed purge while reporting
+  success. The same prerequisite applies to running
+  [`codestorage purge-repo`](cli.md#codestorage-purge-repo). Leaving retention unset is
+  safe on any fleet.
+- **Purged repositories cannot be restored.** The repository row is kept as a permanent
+  tombstone, so the burned `(org, url)` name is never released: JWT repo claims are
+  URL-scoped and can outlive any retention window, and a name reuse would let a stale
+  token authorize against the successor repository.
+- Purged blob bytes move to quarantine first and are freed when the backups age out
+  (sweeps are purge-aware even with every `*_DELETE_*` flag off — and independent of
+  this variable, so `purge-repo`-minted fences get the same cleanup). On versioned S3
+  buckets it fails startup exactly like the delete opt-ins. Each purge also write-fences
+  the repository before touching anything, so a still-in-flight pre-delete push fails
+  instead of racing the reclamation.
 
 ### `CODESTORAGE_REPACK_THRESHOLD`
 

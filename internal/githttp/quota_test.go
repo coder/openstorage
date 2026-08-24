@@ -151,17 +151,21 @@ func TestPackUsageCacheBoundsListings(t *testing.T) {
 }
 
 // blockingBlob parks every ListPages call until release is closed,
-// counting entries, so tests can hold refresh slots deterministically.
+// counting entries and completions, so tests can hold refresh slots
+// deterministically and converge on finished listings.
 type blockingBlob struct {
 	blob.BlobStore
 	release chan struct{}
-	calls   atomic.Int64
+	calls   atomic.Int64 // entered listings (parked flights count here)
+	done    atomic.Int64 // completed listings (the delegated call returned)
 }
 
 func (b *blockingBlob) ListPages(ctx context.Context, prefix string, pageSize int, fn func([]blob.ListedObject) error) error {
 	b.calls.Add(1)
 	<-b.release
-	return b.BlobStore.ListPages(ctx, prefix, pageSize, fn)
+	err := b.BlobStore.ListPages(ctx, prefix, pageSize, fn)
+	b.done.Add(1)
+	return err
 }
 
 // TestPackUsageRefreshConcurrencyBounded (Codex round 10): background
@@ -169,6 +173,13 @@ func (b *blockingBlob) ListPages(ctx context.Context, prefix string, pageSize in
 // peeks beyond the pool size start NO goroutine (deterministic: no flight
 // exists, so nothing can list) and are picked up once slots free.
 func TestPackUsageRefreshConcurrencyBounded(t *testing.T) {
+	// Test-local slot pool (the swap pattern the usage-floor slot tests
+	// below use): the flights spawned here release their slots only after
+	// the final convergence check has already passed, so they must not
+	// hold the package-global pool into subsequent tests.
+	oldSlots := usageRefreshSlots
+	usageRefreshSlots = make(chan struct{}, 4)
+	t.Cleanup(func() { usageRefreshSlots = oldSlots })
 	slots := cap(usageRefreshSlots)
 	bb := &blockingBlob{BlobStore: openTestBlob(t), release: make(chan struct{})}
 	srv := &Server{Blob: bb}
@@ -201,9 +212,26 @@ func TestPackUsageRefreshConcurrencyBounded(t *testing.T) {
 		t.Fatalf("refreshed usage = %d, want 0 (empty repo)", got)
 	}
 	// Each completed refresh lists three times (base + namespace + LFS
-	// prefixes).
-	if got := bb.calls.Load(); got != int64(slots+1)*3 {
-		t.Fatalf("total listings = %d, want %d", got, (slots+1)*3)
+	// prefixes). Converge on COMPLETED listings instead of reading the
+	// counter right after the single awaited peek: a slot frees as soon
+	// as ONE released flight finishes, so repo_extra can publish while
+	// other flights are still mid-scan on a loaded runner (issue #106) —
+	// and an entry count alone can hit its target while the last
+	// delegated listing is still running, letting teardown close the
+	// bucket under it. Exactly slots+1 flights exist — the pool-exhausted
+	// assertion above proved no extra flight started — so the completion
+	// count is stable once reached, and an entry overshoot (a bound
+	// regression) still fails the equality check below.
+	want := int64(slots+1) * 3
+	deadline = time.Now().Add(5 * time.Second)
+	for bb.done.Load() < want && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := bb.done.Load(); got != want {
+		t.Fatalf("completed listings = %d, want %d", got, want)
+	}
+	if got := bb.calls.Load(); got != want {
+		t.Fatalf("total listings = %d, want %d", got, want)
 	}
 }
 

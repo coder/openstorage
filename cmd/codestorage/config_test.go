@@ -946,6 +946,24 @@ func TestResolveServeConfigSweep(t *testing.T) {
 		}
 	})
 
+	t.Run("repo-retention", func(t *testing.T) {
+		cfg, err := resolveServeConfig(base(map[string]string{envRepoRetention: "720h"}), "", "", "/tmp/cache", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.sweep.repoRetention != 720*time.Hour {
+			t.Fatalf("repoRetention = %v, want 720h", cfg.sweep.repoRetention)
+		}
+		// "0" keeps the background purge disabled explicitly.
+		cfg, err = resolveServeConfig(base(map[string]string{envRepoRetention: "0"}), "", "", "/tmp/cache", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.sweep.repoRetention != 0 {
+			t.Fatalf("repoRetention = %v, want 0 (disabled)", cfg.sweep.repoRetention)
+		}
+	})
+
 	t.Run("errors", func(t *testing.T) {
 		cases := map[string]map[string]string{
 			"malformed interval":  {envSweepInterval: "soon"},
@@ -955,6 +973,12 @@ func TestResolveServeConfigSweep(t *testing.T) {
 			"negative threshold":  {envSweepAgeThreshold: "-24h"},
 			"malformed delete":    {envSweepDeleteEnabled: "yes please"},
 			"malformed lfs":       {envSweepDeleteLFS: "sure"},
+			// Repo retention (issue #52): fail fast on values below the
+			// in-flight-writer floor or with sweeping disabled.
+			"malformed retention":        {envRepoRetention: "forever"},
+			"negative retention":         {envRepoRetention: "-24h"},
+			"retention below floor":      {envRepoRetention: "30m"},
+			"retention without sweeping": {envRepoRetention: "72h", envSweepInterval: "0"},
 		}
 		for name, extra := range cases {
 			t.Run(name, func(t *testing.T) {

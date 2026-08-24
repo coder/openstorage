@@ -203,10 +203,22 @@ func (s *PG) CreateGitCredential(ctx context.Context, cred GitCredential) (GitCr
 		return GitCredential{}, fmt.Errorf("create credential for repo %q: %w", cred.RepoID, err)
 	}
 	cred.ID = NewEventingID("ggc")
+	// The insert is guarded on a LIVE repos row, locked FOR UPDATE inside
+	// the statement (issue #52, PR #105 round 6): a request that resolved
+	// the repo before its soft-delete could otherwise insert after the
+	// purge deleted this table's rows, permanently attaching a secret to
+	// a purged repository. The row lock totally orders the insert against
+	// SoftDeleteRepo/PurgeRepoMeta — it either commits while the repo is
+	// live (the purge then deletes it) or re-evaluates to zero rows.
 	err = s.pool.QueryRow(ctx,
-		`INSERT INTO git_credentials (id, repo_id, username, password) VALUES ($1, $2, $3, $4)
+		`INSERT INTO git_credentials (id, repo_id, username, password)
+		 SELECT $1, $2, $3, $4
+		 WHERE EXISTS (SELECT 1 FROM repos WHERE repo_id = $2 AND deleted_at IS NULL FOR UPDATE)
 		 RETURNING created_at`,
 		cred.ID, cred.RepoID, cred.Username, stored).Scan(&cred.CreatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return GitCredential{}, fmt.Errorf("credential for deleted or unknown repo %q: %w", cred.RepoID, ErrNotFound)
+	}
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) && pgErr.Code == pgUniqueViolation && pgErr.ConstraintName == gitCredentialRepoConstraint {
 		return GitCredential{}, fmt.Errorf("credential for repo %q: %w", cred.RepoID, ErrAlreadyExists)
@@ -317,10 +329,18 @@ func (s *PG) SetRepoUpstream(ctx context.Context, up RepoUpstream) (RepoUpstream
 	assertf(up.RepoID != "", "SetRepoUpstream: empty repo id")
 	up.RunCount, up.SuccessCount, up.Syncing, up.SyncPending = 0, 0, false, false
 	up.SyncClaimHolder, up.SyncClaimExpiresAt = "", time.Unix(0, 0).UTC()
+	// Live-repo guard with FOR UPDATE — see CreateGitCredential (issue
+	// #52, PR #105 round 6): no upstream link may attach to a deleted or
+	// purged repository.
 	err := s.pool.QueryRow(ctx,
 		`INSERT INTO repo_upstreams (repo_id, provider, owner, name, upstream_host)
-		 VALUES ($1, $2, $3, $4, $5) RETURNING created_at`,
+		 SELECT $1, $2, $3, $4, $5
+		 WHERE EXISTS (SELECT 1 FROM repos WHERE repo_id = $1 AND deleted_at IS NULL FOR UPDATE)
+		 RETURNING created_at`,
 		up.RepoID, up.Provider, up.Owner, up.Name, up.UpstreamHost).Scan(&up.CreatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return RepoUpstream{}, fmt.Errorf("upstream for deleted or unknown repo %q: %w", up.RepoID, ErrNotFound)
+	}
 	// The only unique constraint on repo_upstreams is the repo_id PK.
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) && pgErr.Code == pgUniqueViolation {

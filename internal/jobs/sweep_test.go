@@ -964,7 +964,10 @@ func TestStartSweepTicker_ReapsOrphan(t *testing.T) {
 	f.upload(orphan, "orphan")
 	f.backdate(orphan, 25*time.Hour)
 
-	stop := StartSweepTicker(f.sweeper(SweepConfig{Threshold: 24 * time.Hour, Delete: true}), 10*time.Millisecond)
+	stop := StartSweepTicker(&SweepSchedule{
+		Sweeper:  f.sweeper(SweepConfig{Threshold: 24 * time.Hour, Delete: true}),
+		Interval: 10 * time.Millisecond,
+	})
 	defer stop()
 	waitFor(t, "ticker sweep to reap the orphan", func() bool { return !f.exists(orphan) })
 	if !f.exists(liveKey) {

@@ -29,8 +29,10 @@ package simtest
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/coder/code-storage/internal/meta"
@@ -77,6 +79,26 @@ func (s *sim) initSync(ctx context.Context) error {
 	s.syncPending = make(map[string]bool)
 	s.syncRunCount = make(map[string]int)
 	s.syncSuccessCount = make(map[string]int)
+	// SetRepoUpstream is guarded on a LIVE repos row (issue #52). The sim
+	// seeds those rows directly with its deterministic repo keys — the
+	// store's CreateRepo mints crypto/rand IDs, which a DST run must not
+	// depend on — via raw SQL on the shared sqlite file.
+	db, err := sql.Open("sqlite", strings.TrimPrefix(s.cl.metaURL, "sqlite://"))
+	if err != nil {
+		return fmt.Errorf("open meta db for repo seeding: %w", err)
+	}
+	defer func() { _ = db.Close() }()
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO orgs (id, name, created_at) VALUES (1, 'dst', 0) ON CONFLICT DO NOTHING`); err != nil {
+		return fmt.Errorf("seed sim org: %w", err)
+	}
+	for _, r := range s.repos {
+		if _, err := db.ExecContext(ctx, `
+INSERT INTO repos (repo_id, org_id, url, default_branch, created_at)
+VALUES (?, 1, ?, 'main', 0) ON CONFLICT DO NOTHING`, r.key, "dst/"+r.key); err != nil {
+			return fmt.Errorf("seed sim repo row %s: %w", r.key, err)
+		}
+	}
 	for _, r := range s.repos {
 		up := meta.RepoUpstream{RepoID: r.key, Provider: "github", Owner: "dst", Name: r.key, UpstreamHost: "github.invalid"}
 		if _, err := s.cl.oracleMeta.SetRepoUpstream(ctx, up); err != nil {
