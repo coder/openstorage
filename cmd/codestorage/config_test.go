@@ -118,8 +118,21 @@ func TestResolveServeConfigLFSGCDeleteRequiresLFSReap(t *testing.T) {
 		t.Fatal("grace below the reap cadence resolved — refunds would outrun physical deletion")
 	}
 	env["CODESTORAGE_SWEEP_AGE_THRESHOLD"] = "30m" // floor becomes the 1h sweep interval
+	env["CODESTORAGE_LFS_GC_GRACE"] = "1h"
 	if _, err := resolveServeConfig(mapEnv(env), "", "127.0.0.1:0", "/tmp/cache", ""); err != nil {
 		t.Fatalf("grace at the reap cadence: %v", err)
+	}
+	// Quarantine retention binds the floor even when both configured
+	// cadences sit below it (security round 14): every reap strands a
+	// quarantine copy for at least jobs.QuarantinePurgeFloor (1h).
+	env["CODESTORAGE_SWEEP_INTERVAL"] = "20m"
+	env["CODESTORAGE_LFS_GC_GRACE"] = "45m" // ≥ max(30m, 20m), < 1h quarantine floor
+	if _, err := resolveServeConfig(mapEnv(env), "", "127.0.0.1:0", "/tmp/cache", ""); err == nil {
+		t.Fatal("grace below the quarantine retention floor resolved — reaps would strand quarantine generations faster than purging frees them")
+	}
+	env["CODESTORAGE_LFS_GC_GRACE"] = "1h"
+	if _, err := resolveServeConfig(mapEnv(env), "", "127.0.0.1:0", "/tmp/cache", ""); err != nil {
+		t.Fatalf("grace at the quarantine floor: %v", err)
 	}
 	// The fleet-wide sweep emergency stop stays available: with the
 	// schedule stopped the delete flag demotes to report-only at wiring

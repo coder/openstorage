@@ -407,10 +407,11 @@ Two operational notes:
   v0.2.0-spelled keys). Startup enforces the coupling: arming
   `CODESTORAGE_LFS_GC_DELETE_ENABLED` on a live sweep schedule requires the
   LFS reap and a grace no shorter than the reap cadence
-  (max(`CODESTORAGE_SWEEP_AGE_THRESHOLD`, `CODESTORAGE_SWEEP_INTERVAL`)) —
-  refunded cap slots whose blobs nothing deletes would let upload → retire →
-  re-upload cycles grow the `lfs/` prefix past the cap that quota floors and
-  sweep listings rely on. Under the sweep emergency stop
+  (max(`CODESTORAGE_SWEEP_AGE_THRESHOLD`, `CODESTORAGE_SWEEP_INTERVAL`, the
+  1-hour quarantine retention floor)) — refunded cap slots whose blobs (or
+  quarantine backups) nothing deletes in time would let upload → retire →
+  re-upload cycles grow the storage prefixes past the cap that quota floors
+  and sweep listings rely on. Under the sweep emergency stop
   (`CODESTORAGE_SWEEP_INTERVAL=0`) retirement demotes to report-only with a
   warning.
 - **Hydration is deadline-bounded.** Scanning a repository first materializes

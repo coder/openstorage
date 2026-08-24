@@ -522,11 +522,16 @@ func resolveServeConfig(getenv func(string) string, flagListen, flagAddr, flagCa
 		// The refund cadence must not outrun physical reap eligibility: a
 		// grace shorter than the sweeper's age threshold or its cadence
 		// retires slots faster than the reap frees their blobs,
-		// re-opening attacker-scaled transient growth of the prefix.
-		if floor := max(cfg.sweep.ageThreshold, cfg.sweep.interval); cfg.lfsGC.grace < floor {
+		// re-opening attacker-scaled transient growth of the prefix. The
+		// floor also covers quarantine retention (Codex security round
+		// 14): every reap strands one globally-scanned quarantine copy
+		// for at least jobs.QuarantinePurgeFloor, so sub-hour cadences
+		// would pile up quarantine generations the purge cannot free in
+		// time.
+		if floor := max(cfg.sweep.ageThreshold, cfg.sweep.interval, jobs.QuarantinePurgeFloor); cfg.lfsGC.grace < floor {
 			return serveConfig{}, fmt.Errorf(
-				"%s (%s) must be at least the physical reap cadence — max(%s, %s) = %s — when %s is set",
-				envLFSGCGrace, cfg.lfsGC.grace, envSweepAgeThreshold, envSweepInterval, floor, envLFSGCDeleteEnabled)
+				"%s (%s) must be at least the physical reap cadence — max(%s, %s, quarantine retention %s) = %s — when %s is set",
+				envLFSGCGrace, cfg.lfsGC.grace, envSweepAgeThreshold, envSweepInterval, jobs.QuarantinePurgeFloor, floor, envLFSGCDeleteEnabled)
 		}
 		// A stopped sweep schedule (interval 0, the fleet-wide destructive
 		// emergency stop) is deliberately NOT rejected: reclamation

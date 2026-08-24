@@ -58,8 +58,10 @@ quota floors and sweep listings walk, so retirement without a running reap
 would let upload → grace → retire → re-upload cycles grow the prefix without
 bound. Startup therefore rejects `CODESTORAGE_LFS_GC_DELETE_ENABLED` on a
 live sweep schedule unless the LFS reap is armed and the grace is at least
-the reap cadence (max of the sweep age threshold and interval, so slots
-refund no faster than blobs become reap-eligible); under the sweep emergency
+the reap cadence (max of the sweep age threshold, the sweep interval, and
+the quarantine retention floor — every reap strands one quarantine backup
+for at least an hour — so slots refund no faster than blobs AND their
+backups become purgeable); under the sweep emergency
 stop (interval 0) reclamation demotes itself to report-only with a warning
 rather than crash-looping the fleet. The job ships dark (interval 0) with
 report-only marking as the second

@@ -637,7 +637,7 @@ func TestSweep_DeleteGuardFailsClosed(t *testing.T) {
 	f.backdate(key, 25*time.Hour)
 	aged := quarantinePrefix + "00112233aabbccdd/" + blob.PackKey("r1", "stale")
 	f.upload(aged, "stale-bytes")
-	f.backdate(aged, quarantinePurgeFloor+time.Hour)
+	f.backdate(aged, QuarantinePurgeFloor+time.Hour)
 
 	guardErr := errors.New("simulated: versioning enabled mid-flight")
 	s := f.sweeper(SweepConfig{
@@ -673,7 +673,7 @@ func TestSweep_DeleteGuardFailsClosed(t *testing.T) {
 
 // A tiny classification threshold must not shrink the quarantine purge
 // age below the handshake-lifetime floor: a backup older than the
-// threshold but younger than quarantinePurgeFloor may still be an
+// threshold but younger than QuarantinePurgeFloor may still be an
 // in-flight handshake's restore source (Codex round 19).
 func TestSweep_PurgeEnforcesFloorUnderTinyThreshold(t *testing.T) {
 	f := newSweepFixture(t)
@@ -682,7 +682,7 @@ func TestSweep_PurgeEnforcesFloorUnderTinyThreshold(t *testing.T) {
 	f.backdate(young, 10*time.Minute) // aged past the 1m threshold, under the floor
 	old := quarantinePrefix + "ddeeff0011223344/" + blob.PackKey("r1", "old")
 	f.upload(old, "old-bytes")
-	f.backdate(old, quarantinePurgeFloor+time.Hour) // past the floor too
+	f.backdate(old, QuarantinePurgeFloor+time.Hour) // past the floor too
 
 	report, err := f.sweeper(SweepConfig{Threshold: time.Minute, Delete: true}).Sweep(context.Background())
 	if err != nil {

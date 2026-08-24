@@ -436,19 +436,22 @@ var maxOrphanSample = 100
 // the largest supported packs.
 const sweepRecoveryTimeout = 15 * time.Minute
 
-// quarantinePurgeFloor is the minimum age before a quarantine backup may
+// QuarantinePurgeFloor is the minimum age before a quarantine backup may
 // be purged, independent of the configured classification threshold: a
 // backup is safe to purge only once its handshake is provably dead, and
 // safeDelete bounds a handshake's lifetime at 2×sweepRecoveryTimeout from
-// the backup's write. 2× that bound doubles the margin.
-const quarantinePurgeFloor = 4 * sweepRecoveryTimeout
+// the backup's write. 2× that bound doubles the margin. Exported because
+// the LFS reclamation refund floor must cover it (Codex security round
+// 14): every reap strands one quarantine copy for at least this long, so
+// cap slots must refund no faster than quarantine purging frees them.
+const QuarantinePurgeFloor = 4 * sweepRecoveryTimeout
 
 // quarantinePurgeAge is the age gate for purging quarantine backups: the
-// configured threshold, floored at quarantinePurgeFloor (the threshold is
+// configured threshold, floored at QuarantinePurgeFloor (the threshold is
 // an orphan-classification knob an operator may tune far below any safe
 // purge age).
 func (s *Sweeper) quarantinePurgeAge() time.Duration {
-	return max(s.cfg.Threshold, quarantinePurgeFloor)
+	return max(s.cfg.Threshold, QuarantinePurgeFloor)
 }
 
 // registered dispatches the authoritative membership lookup by key class:
@@ -965,7 +968,7 @@ func (s *Sweeper) lfsBackupMatchesOID(ctx context.Context, qKey, oid string) (bo
 // phase runs under a sweepRecoveryTimeout deadline and the recovery phase
 // under another, so from the moment the backup is written (its ModTime) to
 // the last possible restore from it, at most 2×sweepRecoveryTimeout
-// elapses. quarantinePurgeFloor is derived from that bound — the age gate
+// elapses. QuarantinePurgeFloor is derived from that bound — the age gate
 // is a proof, not a heuristic.
 func (s *Sweeper) safeDelete(ctx context.Context, repo, key string) (bool, error) {
 	qKey := quarantineKey(key)

@@ -679,10 +679,11 @@ take, so no signal can lose the race silently.
 - With [`CODESTORAGE_LFS_GC_DELETE_ENABLED`](#codestorage_lfs_gc_delete_enabled)
   set, the grace must also be at least the physical reap cadence —
   max([`CODESTORAGE_SWEEP_AGE_THRESHOLD`](#codestorage_sweep_age_threshold),
-  [`CODESTORAGE_SWEEP_INTERVAL`](#codestorage_sweep_interval)) — a startup
-  error otherwise: cap slots refunded faster than the reap frees their blobs
-  would let one repository's upload→retire cycles grow the shared `lfs/`
-  prefix without bound.
+  [`CODESTORAGE_SWEEP_INTERVAL`](#codestorage_sweep_interval), the 1-hour
+  quarantine retention floor) — a startup error otherwise: cap slots
+  refunded faster than the reap (and its quarantine purge) frees their
+  blobs would let one repository's upload→retire cycles grow the shared
+  storage prefixes without bound.
 - **Granularity:** local mode (SQLite) stamps marks at whole-second
   resolution, so the effective window rounds up — never down — and may run up
   to two seconds longer than configured. The window is never shorter than the
@@ -720,8 +721,9 @@ until the eligible rows are the junk you expect, then opt in.
   would grow `lfs/<repo>/` far past the cap that quota floors and sweep
   listings rely on to stay bounded. Arming retirement while the sweep
   schedule is live therefore requires that opt-in, plus a
-  [grace](#codestorage_lfs_gc_grace) of at least the reap cadence (startup
-  errors otherwise). With the sweep schedule stopped
+  [grace](#codestorage_lfs_gc_grace) of at least the reap cadence, including
+  the 1-hour quarantine retention floor every reap's backup copy is kept for
+  (startup errors otherwise). With the sweep schedule stopped
   ([`CODESTORAGE_SWEEP_INTERVAL=0`](#codestorage_sweep_interval), the
   emergency stop), the process starts but demotes retirement to report-only
   with a warning — nothing would reap the blobs meanwhile.
