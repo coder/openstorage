@@ -464,3 +464,74 @@ A reclamation run logs one `lfs reclaim pass finished` line:
 | `rows_eligible` / `rows_retired` / `rows_spared` | grace-expired rows; how many actually retired; how many the guarded delete declined at the last moment (concurrent touch, ref movement, purge fence) |
 | `bytes_retired` | quota bytes refunded |
 | `dry_run` | `true` while `CODESTORAGE_LFS_GC_DELETE_ENABLED` is off |
+
+## Reconciling registered-but-missing bytes
+
+Every deletion path in codestorage quarantines before it deletes and heals
+through digest-verified restores, so the registry and blob storage normally
+never disagree. Storage-layer data loss — a bucket lifecycle rule, an
+operator `rm`, a storage incident — can still leave a **registered row whose
+bytes are physically absent**. That state is doubly bad:
+
+- **Integrity:** a missing registered pack may be referenced by committed
+  refs (clones fail); a missing LFS object 404s until a restore source
+  appears.
+- **Quota visibility** ([#101](https://github.com/coder/code-storage/issues/101)):
+  the admission floor is `max(0, listing − counter)`, and the counter still
+  includes the absent bytes the listing lacks — the floor deflates by the
+  missing size, hiding up to that many rowless legacy bytes from admission.
+  A write admitted through that deflated view is durable; when the missing
+  object is later restored (download-time restore, a re-push, quarantine
+  healing), physical usage can exceed the quota by the once-hidden amount.
+
+The absence reconciliation job
+([ADR-43](../adr/043-absence-reconciliation-covers-registered-but-missing-bytes.md))
+closes that window to one pass. Enable it with
+[`CODESTORAGE_ABSENCE_RECONCILE_INTERVAL`](../reference/configuration.md#codestorage_absence_reconcile_interval);
+each pass pages `lfs_objects` and `packs` rows from persistent-shape keyset
+cursors (budget-limited, resumable — the sweeper's inverse direction) and
+`HEAD`s each row's blob:
+
+- **Present** — nothing happens; the common case costs one probe per row.
+- **LFS row absent under its registered spelling but present under its
+  ADR-41 twin** (canonical `lfs/<repo>/o2/<oid>` vs legacy
+  `lfs/<repo>/<oid>`) — reported (`lfs_rows_twin_only`), never charged: the
+  twin's bytes are still physically listed, and download-time restore heals
+  the spelling.
+- **Truly absent** — logged loudly and, when quota is enforced, charged as a
+  TTL'd restore cover (the same reservation row restore paths renew) plus a
+  floor-generation bump, so every admission sees the missing bytes until
+  they are restored or their row is retired/purged. Covers refresh each
+  pass; keep the cadence at or below
+  [`CODESTORAGE_PACK_RESERVATION_TTL`](../reference/configuration.md#codestorage_pack_reservation_ttl)
+  or losses go invisible between passes.
+- **Absent pack rows registered before this feature** carry no recorded
+  size (`pack_rows_unsized`): the loss is reported but cannot be charged
+  until a repack fold rewrites the row with its size.
+
+The job is non-destructive everywhere — it inserts/refreshes reservation
+rows and bumps a generation counter, nothing else — so it is safe to run
+continuously. Purge-fenced repositories are skipped (their rows and blobs
+are already on their way out), and superseded `pack_retained` blobs are
+deliberately out of scope: nothing ever restores them, so a deflated floor
+is their true permanent state.
+
+A reconciliation pass logs one `absence reconcile pass finished` line:
+
+| Field | Meaning |
+|---|---|
+| `lfs_rows_examined` / `pack_rows_examined` | registry rows point-checked this pass (each charges the budget) |
+| `lfs_rows_absent` | LFS rows missing under BOTH spellings — genuine storage loss |
+| `lfs_rows_twin_only` | rows present only under their ADR-41 twin spelling (restorable, not charged) |
+| `pack_rows_absent` / `pack_rows_unsized` | missing registered packs (integrity!); how many predate size recording and cannot be charged |
+| `covers_charged` / `bytes_covered` | restore covers charged/refreshed this pass and their total bytes |
+| `cover_errors` / `stat_errors` | covers that failed (e.g. the per-repo reservation-row cap) and probes that errored — both retried next pass |
+| `rows_skipped_purged` | rows of purge-fenced repositories skipped |
+| `quota_enforced` | `false` means detection-only (no quota admission to protect) |
+
+Any nonzero `lfs_rows_absent` or `pack_rows_absent` means storage lost
+registered bytes: investigate the storage layer, and expect the loss to
+either heal (restores re-register and the covers expire) or converge to
+removal (unreferenced LFS rows retire through
+[reclamation](#reclaiming-unreferenced-lfs-objects); purges drop whole
+repositories).
