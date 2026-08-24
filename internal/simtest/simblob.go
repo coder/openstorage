@@ -75,6 +75,25 @@ func (s *SimBlobStore) DownloadFile(ctx context.Context, key, destPath string) e
 	}
 }
 
+// DownloadFileCapped shares DownloadFile's fault point: the cap is a
+// local disk-budget concern, not a distinct backend operation.
+func (s *SimBlobStore) DownloadFileCapped(ctx context.Context, key, destPath string, capBytes int64) error {
+	switch class := s.inj.begin(OpBlobDownloadFile); class {
+	case FaultClean:
+		return cleanFaultError{op: OpBlobDownloadFile}
+	case FaultAmbiguous:
+		err := s.inner.DownloadFileCapped(ctx, key, destPath, capBytes)
+		s.inj.noteInnerOutcome(OpBlobDownloadFile, fmt.Sprintf("err=%v", err))
+		return ambiguousFaultError{op: OpBlobDownloadFile}
+	case FaultNotFound:
+		return notFoundFaultError(OpBlobDownloadFile)
+	case FaultNone:
+		return s.inner.DownloadFileCapped(ctx, key, destPath, capBytes)
+	default:
+		panic(fmt.Sprintf("simtest: fault class %v invalid for %s", class, OpBlobDownloadFile))
+	}
+}
+
 // List delegates to the inner store unless a fault is injected.
 func (s *SimBlobStore) List(ctx context.Context, prefix string) ([]blob.ListedObject, error) {
 	switch class := s.inj.begin(OpBlobList); class {

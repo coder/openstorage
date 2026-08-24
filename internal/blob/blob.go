@@ -49,6 +49,13 @@ type BlobStore interface {
 	// yield an error matching ErrNotFound via errors.Is (the hydration
 	// missing-pack retry keys on it).
 	DownloadFile(ctx context.Context, key, destPath string) error
+	// DownloadFileCapped is DownloadFile bounded to capBytes of local
+	// disk (Codex round 117 on #104): one GET, atomic rename — but a
+	// stream exceeding capBytes aborts with ErrCapExceeded instead of
+	// consuming unreserved space (the caller reserved capBytes BEFORE a
+	// window in which a mutable-key object can be replaced by a larger
+	// version).
+	DownloadFileCapped(ctx context.Context, key, destPath string, capBytes int64) error
 	// List returns all objects under prefix.
 	List(ctx context.Context, prefix string) ([]ListedObject, error)
 	// ListPages streams objects under prefix in lexicographic key order,
@@ -386,6 +393,13 @@ var coverRenewInterval = 20 * time.Second
 // renewal loop past the cover's TTL while the restore upload continues on
 // its own healthy connection.
 var coverRenewTimeout = 10 * time.Second
+
+// ErrCapExceeded reports a capped download whose stream exceeded the
+// caller's reserved size (Codex round 117 on #104): on a mutable legacy
+// key, the object can be replaced by a larger version between the
+// caller's Stat and the GET, and streaming past the reservation would
+// consume unbudgeted replica disk.
+var ErrCapExceeded = errors.New("blob: stream exceeds the reserved cap")
 
 // ErrCoverContinuityLost marks work canceled by the cover-continuity
 // machinery (Codex security round 107 on #104): callers must be able to
@@ -746,7 +760,14 @@ func (b *S3) UploadFile(ctx context.Context, key, path string) error {
 
 // DownloadFile fetches key into destPath atomically (tmp + rename).
 func (b *S3) DownloadFile(ctx context.Context, key, destPath string) error {
-	return bucketDownloadFile(ctx, b.bucket, key, destPath)
+	return bucketDownloadFile(ctx, b.bucket, key, destPath, -1)
+}
+
+// DownloadFileCapped fetches key into destPath atomically, aborting with
+// ErrCapExceeded once the stream would exceed capBytes on disk.
+func (b *S3) DownloadFileCapped(ctx context.Context, key, destPath string, capBytes int64) error {
+	assertf(capBytes >= 0, "DownloadFileCapped(%q, %d)", key, capBytes)
+	return bucketDownloadFile(ctx, b.bucket, key, destPath, capBytes)
 }
 
 // List returns all objects under prefix.

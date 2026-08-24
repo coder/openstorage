@@ -1936,9 +1936,14 @@ func (s *Server) legacySourceProvenMismatched(ctx context.Context, repoID, legac
 	defer os.RemoveAll(dir)
 	snap := filepath.Join(dir, "snap")
 	// The size-scaled allowance every LFS transfer uses (round 81's
-	// shape): a live backend finishes, a wedged one is cut loose.
+	// shape): a live backend finishes, a wedged one is cut loose. The
+	// download is CAPPED at the reserved size (Codex round 117, P1): a
+	// still-valid presigned PUT can replace the object with a larger
+	// version between the Stat above and the GET, and an uncapped
+	// stream would consume unreserved replica disk. A cap abort means
+	// the version changed — unknowable, spared, re-examined next touch.
 	dctx, dcancel := context.WithTimeout(base, 5*time.Minute+time.Duration(size>>20)*time.Second)
-	derr := s.Blob.DownloadFile(dctx, legacyKey, snap)
+	derr := s.Blob.DownloadFileCapped(dctx, legacyKey, snap, size)
 	dcancel()
 	if derr != nil {
 		return false // unknowable state spares; the next touch re-examines

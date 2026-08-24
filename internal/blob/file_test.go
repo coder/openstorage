@@ -43,6 +43,30 @@ func seededFile(t *testing.T, key, content string) BlobStore {
 	return b
 }
 
+// TestDownloadFileCapped (Codex round 117 on #104): a mutable legacy key
+// can grow between a caller's Stat and the GET; the capped download must
+// abort with ErrCapExceeded instead of consuming unreserved disk, while
+// an exactly-at-cap object still downloads whole.
+func TestDownloadFileCapped(t *testing.T) {
+	ctx := context.Background()
+	b := seededFile(t, "k", "0123456789") // 10 bytes
+	dest := filepath.Join(t.TempDir(), "snap")
+
+	if err := b.DownloadFileCapped(ctx, "k", dest, 10); err != nil {
+		t.Fatalf("cap == size: %v, want success", err)
+	}
+	if got, err := os.ReadFile(dest); err != nil || string(got) != "0123456789" {
+		t.Fatalf("capped download content = (%q, %v)", got, err)
+	}
+	err := b.DownloadFileCapped(ctx, "k", filepath.Join(t.TempDir(), "snap2"), 9)
+	if !errors.Is(err, ErrCapExceeded) {
+		t.Fatalf("cap < size: %v, want ErrCapExceeded — the stream must not outgrow the reservation", err)
+	}
+	if err := b.DownloadFileCapped(ctx, "missing", dest, 10); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("missing key: %v, want ErrNotFound", err)
+	}
+}
+
 func TestOpenFile_URLValidation(t *testing.T) {
 	cases := map[string]struct {
 		url     string
