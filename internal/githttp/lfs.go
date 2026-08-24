@@ -2896,13 +2896,26 @@ func (s *Server) maybeLegacyCompatCopy(ctx context.Context, repoID, oid, key str
 		// trust.
 		delCtx, delCancel := context.WithTimeout(dctx, lfsCleanupTimeout)
 		defer delCancel()
-		if _, derr := s.Store.GuardedLFSDelete(delCtx, repoID, legacyKey, func(gctx context.Context) error {
+		deleted, derr := s.Store.GuardedLFSDelete(delCtx, repoID, legacyKey, func(gctx context.Context) error {
 			if err := s.Blob.Delete(gctx, legacyKey); err != nil && !errors.Is(err, blob.ErrNotFound) {
 				return err
 			}
 			return nil
-		}); derr != nil {
+		})
+		if derr != nil {
 			log.Printf("lfs compat copy %s: uncovered-copy cleanup: %v", legacyKey, derr)
+		}
+		if derr != nil || !deleted {
+			// The bytes (may) remain: a DECLINED delete means an old
+			// replica registered this spelling mid-roll (Codex round 106,
+			// P1) and the fence rightly spared it; an ERRORED delete is
+			// indeterminate. Either way round-89's legacy-present probe
+			// makes every retry skip this seam, so no later flow would
+			// account the retained bytes — recover the accounting the
+			// lost cover abandoned before failing: block until a fresh
+			// cover and the fleet floor invalidation land, or every
+			// pre-copy floor has expired.
+			s.ensureAmbiguousCommitAccounting(dctx, repoID, legacyKey, size, bump)
 		}
 		return fmt.Errorf("compat copy %s: cover continuity lost: %w", legacyKey, renewErr)
 	}
