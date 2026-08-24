@@ -1699,18 +1699,11 @@ func (s *Server) publishVerifiedLFSObject(ctx context.Context, repoID, key, lega
 			// through copyErr — renewErr stays nil — so accepting here
 			// would register bytes a stale-floor admission may already
 			// have spent during the uncovered gap. Same verdict, same
-			// remedy, under the just-renewed claim.
-			delCtx, delCancel := context.WithTimeout(dctx, lfsCleanupTimeout)
-			defer delCancel()
-			if _, derr := s.Store.GuardedLFSDelete(delCtx, repoID, key, func(gctx context.Context) error {
-				if err := s.Blob.Delete(gctx, key); err != nil && !errors.Is(err, blob.ErrNotFound) {
-					return err
-				}
-				return nil
-			}); derr != nil {
-				log.Printf("lfs adopt %s: uncovered-copy cleanup: %v", key, derr)
-				// Indeterminate cleanup: recover the abandoned accounting
-				// exactly like the renewErr twin below.
+			// remedy, under the just-renewed claim: deletion pressed
+			// until proven, accounting only as the unproven-past-window
+			// fallback (the round-108 shared seam — see the renewErr twin
+			// below).
+			if proven, _ := s.uncoveredCleanupProven(dctx, repoID, key); !proven {
 				s.ensureAmbiguousCommitAccounting(dctx, repoID, key, size, nil)
 			}
 			return fmt.Errorf("adoption publish %s: %w", key, copyErr)
@@ -1743,35 +1736,7 @@ func (s *Server) publishVerifiedLFSObject(ctx context.Context, repoID, key, lega
 		// delete until the outcome is PROVEN — deleted, already absent,
 		// or spared by a landed registration whose atomic credit counts
 		// the bytes — across the whole stale-floor window.
-		del := func(gctx context.Context) error {
-			if err := s.Blob.Delete(gctx, key); err != nil && !errors.Is(err, blob.ErrNotFound) {
-				return err
-			}
-			return nil
-		}
-		proven := false
-		deadline := time.Now().Add(usageCacheTTL + UsageFloorHandoffMargin)
-		for {
-			rctx, rcancel := context.WithTimeout(dctx, lfsCleanupTimeout)
-			_, derr := s.Store.GuardedLFSDelete(rctx, repoID, key, del)
-			rcancel()
-			if derr == nil {
-				proven = true
-				break
-			}
-			log.Printf("lfs adopt %s: uncovered-copy cleanup: %v", key, derr)
-			if time.Now().After(deadline) {
-				break
-			}
-			select {
-			case <-dctx.Done():
-			case <-time.After(ambiguousAccountingRetryInterval):
-			}
-			if dctx.Err() != nil {
-				break
-			}
-		}
-		if !proven {
+		if proven, _ := s.uncoveredCleanupProven(dctx, repoID, key); !proven {
 			// Terminal fallback (Codex round 107): the whole stale-floor
 			// window passed without a proven deletion — the rowless bytes
 			// may remain, and the crashed-adoption retry registers them
@@ -1787,6 +1752,46 @@ func (s *Server) publishVerifiedLFSObject(ctx context.Context, repoID, key, lega
 		return fmt.Errorf("adoption publish %s: cover continuity lost: %w", key, renewErr)
 	}
 	return nil
+}
+
+// uncoveredCleanupProven presses the guarded delete of an uncovered-gap
+// commit until its outcome is PROVEN — deleted, already absent, or spared
+// by a landed registration whose atomic credit counts the bytes — across
+// the whole stale-floor window (Codex round 108, P1): deletion, not
+// accounting, is the only recovery that REVOKES the hazard, because no
+// cover or generation bump un-admits a stale-floor admission that already
+// exploited the gap. One shared seam for all four uncovered-commit sites
+// (adoption/compat × copyErr/renewErr) — the verdict is identical, so the
+// remedy must be too. proven=false means the window closed with no proven
+// outcome; callers fall back to accounting recovery (visibility is the
+// only repair left, and past the window fresh floors list the bytes).
+func (s *Server) uncoveredCleanupProven(ctx context.Context, repoID, key string) (proven, deleted bool) {
+	del := func(gctx context.Context) error {
+		if err := s.Blob.Delete(gctx, key); err != nil && !errors.Is(err, blob.ErrNotFound) {
+			return err
+		}
+		return nil
+	}
+	deadline := time.Now().Add(usageCacheTTL + UsageFloorHandoffMargin)
+	for {
+		rctx, rcancel := context.WithTimeout(ctx, lfsCleanupTimeout)
+		d, derr := s.Store.GuardedLFSDelete(rctx, repoID, key, del)
+		rcancel()
+		if derr == nil {
+			return true, d
+		}
+		log.Printf("lfs uncovered-copy cleanup %s: %v", key, derr)
+		if time.Now().After(deadline) {
+			return false, false
+		}
+		select {
+		case <-ctx.Done():
+		case <-time.After(ambiguousAccountingRetryInterval):
+		}
+		if ctx.Err() != nil {
+			return false, false
+		}
+	}
 }
 
 // legacySourceProvenMismatched re-hashes the legacy source at cleanup time
@@ -3021,19 +3026,10 @@ func (s *Server) maybeLegacyCompatCopy(ctx context.Context, repoID, oid, key str
 			// spent. Remove it under the registration fence; a DECLINED
 			// or ERRORED cleanup retains bytes round-89's probe will make
 			// every retry skip, so recover their accounting (round 106)
-			// before failing.
-			delCtx, delCancel := context.WithTimeout(dctx, lfsCleanupTimeout)
-			defer delCancel()
-			deleted, derr := s.Store.GuardedLFSDelete(delCtx, repoID, legacyKey, func(gctx context.Context) error {
-				if err := s.Blob.Delete(gctx, legacyKey); err != nil && !errors.Is(err, blob.ErrNotFound) {
-					return err
-				}
-				return nil
-			})
-			if derr != nil {
-				log.Printf("lfs compat copy %s: uncovered-copy cleanup: %v", legacyKey, derr)
-			}
-			if derr != nil || !deleted {
+			// before failing. Deletion is pressed until proven (the
+			// round-108 shared seam): only removing the bytes revokes the
+			// gap's spent headroom.
+			if proven, deleted := s.uncoveredCleanupProven(dctx, repoID, legacyKey); !proven || !deleted {
 				s.ensureAmbiguousCommitAccounting(dctx, repoID, legacyKey, size, bump)
 			}
 			return fmt.Errorf("compat copy %s: %w", legacyKey, copyErr)
@@ -3059,27 +3055,17 @@ func (s *Server) maybeLegacyCompatCopy(ctx context.Context, repoID, oid, key str
 		// admission. The legacy spelling carries no integrity contract,
 		// so deleting our own copy loses nothing old replicas could
 		// trust.
-		delCtx, delCancel := context.WithTimeout(dctx, lfsCleanupTimeout)
-		defer delCancel()
-		deleted, derr := s.Store.GuardedLFSDelete(delCtx, repoID, legacyKey, func(gctx context.Context) error {
-			if err := s.Blob.Delete(gctx, legacyKey); err != nil && !errors.Is(err, blob.ErrNotFound) {
-				return err
-			}
-			return nil
-		})
-		if derr != nil {
-			log.Printf("lfs compat copy %s: uncovered-copy cleanup: %v", legacyKey, derr)
-		}
-		if derr != nil || !deleted {
+		if proven, deleted := s.uncoveredCleanupProven(dctx, repoID, legacyKey); !proven || !deleted {
 			// The bytes (may) remain: a DECLINED delete means an old
 			// replica registered this spelling mid-roll (Codex round 106,
-			// P1) and the fence rightly spared it; an ERRORED delete is
-			// indeterminate. Either way round-89's legacy-present probe
-			// makes every retry skip this seam, so no later flow would
-			// account the retained bytes — recover the accounting the
-			// lost cover abandoned before failing: block until a fresh
-			// cover and the fleet floor invalidation land, or every
-			// pre-copy floor has expired.
+			// P1) and the fence rightly spared it; an UNPROVEN one closed
+			// the round-108 retry window with the outcome unknown. Either
+			// way round-89's legacy-present probe makes every retry skip
+			// this seam, so no later flow would account the retained
+			// bytes — recover the accounting the lost cover abandoned
+			// before failing: block until a fresh cover and the fleet
+			// floor invalidation land, or every pre-copy floor has
+			// expired.
 			s.ensureAmbiguousCommitAccounting(dctx, repoID, legacyKey, size, bump)
 		}
 		return fmt.Errorf("compat copy %s: cover continuity lost: %w", legacyKey, renewErr)
