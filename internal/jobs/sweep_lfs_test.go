@@ -488,6 +488,43 @@ func TestSweepLFS_LegacyReapRechecksTwinInsideGuard(t *testing.T) {
 	}
 }
 
+// TestSweepLFS_PurgeVsLegacyGate pins the #105 × ADR-41 intersection: a
+// WHOLE-REPO purge dominates the legacy transition gate (a deleted repo
+// has no read-availability contract left — its legacy keys are permanent
+// garbage like every other class), while for LIVE repos the transition
+// gate keeps dominating even with the purge probe wired.
+func TestSweepLFS_PurgeVsLegacyGate(t *testing.T) {
+	t.Run("purged-repo-legacy-reaps-without-optins", func(t *testing.T) {
+		f := newSweepFixture(t)
+		legacy := blob.LFSLegacyKey("repo_purged", lfsOID("aa"))
+		f.upload(legacy, "purged repo legacy source")
+		f.backdate(legacy, 25*time.Hour)
+		if err := f.store.(RepoPurgeRegistry).FenceRepoPurge(context.Background(), "repo_purged"); err != nil {
+			t.Fatal(err)
+		}
+		cfg := SweepConfig{Threshold: 24 * time.Hour, PurgedRepoProbe: f.store.(RepoPurgeRegistry).IsRepoPurged}
+		if _, err := f.sweeper(cfg).Sweep(context.Background()); err != nil {
+			t.Fatalf("Sweep: %v", err)
+		}
+		if f.exists(legacy) {
+			t.Fatal("purge-fenced repo's legacy key survived the purge-aware sweep — whole-repo reclamation includes legacy spellings, no opt-in needed")
+		}
+	})
+	t.Run("live-repo-legacy-gate-holds-with-purge-wired", func(t *testing.T) {
+		f := newSweepFixture(t)
+		legacy := blob.LFSLegacyKey("repo_live", lfsOID("bb"))
+		f.upload(legacy, "live repo legacy source")
+		f.backdate(legacy, 25*time.Hour)
+		cfg := SweepConfig{Threshold: 24 * time.Hour, DeleteLFS: true, PurgedRepoProbe: f.store.(RepoPurgeRegistry).IsRepoPurged}
+		if _, err := f.sweeper(cfg).Sweep(context.Background()); err != nil {
+			t.Fatalf("Sweep: %v", err)
+		}
+		if !f.exists(legacy) {
+			t.Fatal("live repo's legacy key reaped without CODESTORAGE_SWEEP_DELETE_LFS_LEGACY — the transition gate must dominate even with the purge probe wired")
+		}
+	})
+}
+
 // TestSweepLFS_HealTakesNoCoverWhenQuotaDisabled (Codex round 73): with
 // quota enforcement off, no admission consults floors or covers — a
 // restore-cover row would only burn the per-repo reservation cap, and
