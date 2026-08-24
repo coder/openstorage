@@ -215,6 +215,20 @@ func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL, loopbackBaseU
 	if lfsGC.interval > 0 {
 		reclaimReg, ok := refStore.(jobs.LFSReclaimRegistry)
 		assertf(ok, "ref store %T lacks the lfs reclamation seams", refStore)
+		reclaimDelete := lfsGC.deleteEnabled
+		if reclaimDelete && sweep.interval == 0 {
+			// The sweep emergency stop (interval 0) halts every
+			// destructive storage job fleet-wide — with no LFS reap
+			// running, retirement would refund cap slots while stranding
+			// their blobs indefinitely (Codex security round 13).
+			// Reclamation demotes itself to report-only instead of
+			// failing the stop switch (the round-111 pattern); config
+			// validation enforces the reap prerequisite whenever the
+			// sweep schedule is live.
+			reclaimDelete = false
+			logger.Warn("lfs reclamation demoted to report-only: the sweep schedule is stopped and nothing reaps retired objects' blobs",
+				"env", envSweepInterval)
+		}
 		reclaimer := jobs.NewLFSReclaimer(reclaimReg,
 			func(ctx context.Context, repo, defaultBranch string) (string, error) {
 				return gitread.Materialize(ctx, refStore, blobStore, cacheDir, repo, defaultBranch)
@@ -230,10 +244,10 @@ func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL, loopbackBaseU
 				}
 				return r.DefaultBranch, true, nil
 			},
-			lfsGC.grace, lfsGC.objectBudget, lfsGC.deleteEnabled, logger)
+			lfsGC.grace, lfsGC.objectBudget, reclaimDelete, logger)
 		lfsReclaimSchedule = &jobs.LFSReclaimSchedule{Reclaimer: reclaimer, Interval: lfsGC.interval}
 		mode := "report-only"
-		if lfsGC.deleteEnabled {
+		if reclaimDelete {
 			mode = "delete"
 		}
 		logger.Info("lfs unreferenced-object reclamation enabled",

@@ -400,12 +400,19 @@ verified bytes re-register.
 
 Two operational notes:
 
-- **Rows first, bytes second.** Retirement only deletes registry rows. The
+- **Rows and bytes retire together.** Retirement deletes registry rows; the
   blobs become ordinary rowless orphans that the [sweeper](#the-orphan-sweeper)
   reaps under its own aged, quarantine-first delete gates
   (`CODESTORAGE_SWEEP_DELETE_LFS`, plus the ADR-41 legacy gate for
-  v0.2.0-spelled keys). With sweeping or its LFS gates off, counts and quota
-  converge anyway — only the physical bytes wait.
+  v0.2.0-spelled keys). Startup enforces the coupling: arming
+  `CODESTORAGE_LFS_GC_DELETE_ENABLED` on a live sweep schedule requires the
+  LFS reap and a grace no shorter than the reap cadence
+  (max(`CODESTORAGE_SWEEP_AGE_THRESHOLD`, `CODESTORAGE_SWEEP_INTERVAL`)) —
+  refunded cap slots whose blobs nothing deletes would let upload → retire →
+  re-upload cycles grow the `lfs/` prefix past the cap that quota floors and
+  sweep listings rely on. Under the sweep emergency stop
+  (`CODESTORAGE_SWEEP_INTERVAL=0`) retirement demotes to report-only with a
+  warning.
 - **Hydration is deadline-bounded.** Scanning a repository first materializes
   its git cache (downloading and indexing registered packs on a cold
   replica). Each namespace member's hydration runs under a fixed 10-minute

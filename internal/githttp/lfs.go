@@ -935,7 +935,12 @@ func (s *Server) adoptStoredLFSObject(ctx context.Context, repoID, key, oid stri
 			if restore {
 				return nil
 			}
-			if touched, terr := s.Store.TouchLFSObject(ctx, repoID, key); terr != nil {
+			// Bounded + detached like every post-registration registry
+			// write here: adoption completes under its own lease once
+			// started, so a canceled client must not abort the touch.
+			tctx, tcancel := context.WithTimeout(context.WithoutCancel(ctx), lfsCleanupTimeout)
+			defer tcancel()
+			if touched, terr := s.Store.TouchLFSObject(tctx, repoID, key); terr != nil {
 				return terr
 			} else if !touched {
 				return errLFSBusy
@@ -1513,7 +1518,12 @@ func (s *Server) adoptStoredLFSObject(ctx context.Context, repoID, key, oid stri
 	if restore {
 		return nil
 	}
-	if touched, terr := s.Store.TouchLFSObject(ctx, repoID, key); terr != nil {
+	// Bounded + detached like regCtx/rctx above: adoption completes under
+	// its own lease once started, so a canceled client must not abort the
+	// touch after the registration committed.
+	touchCtx, touchCancel := context.WithTimeout(context.WithoutCancel(ctx), lfsCleanupTimeout)
+	defer touchCancel()
+	if touched, terr := s.Store.TouchLFSObject(touchCtx, repoID, key); terr != nil {
 		return terr
 	} else if !touched {
 		return errLFSBusy
@@ -3375,7 +3385,9 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target r
 	// pointer, so it must be the promise of a freshly touched row.
 	// touched=false means the row is already gone: answer retryable so
 	// the retry re-registers instead.
-	if touched, terr := s.Store.TouchLFSObject(ctx, repoID, key); terr != nil {
+	tctx, tcancel := context.WithTimeout(context.WithoutCancel(ctx), lfsCleanupTimeout)
+	defer tcancel()
+	if touched, terr := s.Store.TouchLFSObject(tctx, repoID, key); terr != nil {
 		log.Printf("lfs touch %s: %v", key, terr)
 		lfsError(w, http.StatusInternalServerError, "liveness touch failed, retry")
 		return

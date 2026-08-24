@@ -656,8 +656,11 @@ quota bytes.
   emergency stop.
 - **Constraints:** a non-negative Go duration.
 - Retirement removes registry rows only; the blobs become ordinary rowless
-  orphans the [sweeper](#codestorage_sweep_interval) reaps under its own
-  delete gates.
+  orphans reaped by the
+  [sweeper's LFS delete opt-in](#codestorage_sweep_delete_lfs). Arming
+  retirement therefore
+  [requires that opt-in](#codestorage_lfs_gc_delete_enabled) — refunded cap
+  slots must never outrun physical deletion.
 
 ### `CODESTORAGE_LFS_GC_GRACE`
 
@@ -673,6 +676,13 @@ take, so no signal can lose the race silently.
   comfortably above your longest expected upload→push gap — a pointer pushed
   through the normal git-lfs flow always touches the object first, but raw-git
   pointer pushes only get the reachability scan's protection.
+- With [`CODESTORAGE_LFS_GC_DELETE_ENABLED`](#codestorage_lfs_gc_delete_enabled)
+  set, the grace must also be at least the physical reap cadence —
+  max([`CODESTORAGE_SWEEP_AGE_THRESHOLD`](#codestorage_sweep_age_threshold),
+  [`CODESTORAGE_SWEEP_INTERVAL`](#codestorage_sweep_interval)) — a startup
+  error otherwise: cap slots refunded faster than the reap frees their blobs
+  would let one repository's upload→retire cycles grow the shared `lfs/`
+  prefix without bound.
 - **Granularity:** local mode (SQLite) stamps marks at whole-second
   resolution, so the effective window rounds up — never down — and may run up
   to two seconds longer than configured. The window is never shorter than the
@@ -703,6 +713,18 @@ until the eligible rows are the junk you expect, then opt in.
 - **Default:** `false`. **Constraints:** must parse as a boolean; requires
   [`CODESTORAGE_LFS_GC_INTERVAL`](#codestorage_lfs_gc_interval) > 0 (arming a
   disabled job is a startup error).
+- **Physical-deletion coupling** (security): retirement refunds the
+  object-cap slot, but only the
+  [`CODESTORAGE_SWEEP_DELETE_LFS`](#codestorage_sweep_delete_lfs) reap deletes
+  the stranded blob — decoupled, upload → grace → retire → re-upload cycles
+  would grow `lfs/<repo>/` far past the cap that quota floors and sweep
+  listings rely on to stay bounded. Arming retirement while the sweep
+  schedule is live therefore requires that opt-in, plus a
+  [grace](#codestorage_lfs_gc_grace) of at least the reap cadence (startup
+  errors otherwise). With the sweep schedule stopped
+  ([`CODESTORAGE_SWEEP_INTERVAL=0`](#codestorage_sweep_interval), the
+  emergency stop), the process starts but demotes retirement to report-only
+  with a warning — nothing would reap the blobs meanwhile.
 - **Mixed-fleet prerequisite:** every replica serving LFS requests must run a
   build with this feature before retirement is armed — older replicas answer
   "already stored" without clearing the reclamation stamp, so a grace-expired

@@ -86,6 +86,50 @@ func TestResolveServeConfigCompatForbidsDestructiveLFSSweep(t *testing.T) {
 	}
 }
 
+// TestResolveServeConfigLFSGCDeleteRequiresLFSReap (issue #73, Codex
+// security round 13): retirement refunds the object-cap slot, but only the
+// sweeper's destructive LFS opt-in deletes the stranded canonical blob —
+// without that coupling, a write-scoped token cycles upload → grace →
+// retire → re-upload and grows lfs/<repo>/ far past the cap that quota
+// floors and sweep listings rely on. Delete-mode reclamation therefore
+// requires the reap on an active sweep schedule, with a grace no shorter
+// than the reap cadence.
+func TestResolveServeConfigLFSGCDeleteRequiresLFSReap(t *testing.T) {
+	env := map[string]string{
+		"CODESTORAGE_ORG":                   "org1",
+		"CODESTORAGE_ORG_PUBKEYS":           "/tmp/org.pub.pem",
+		"CODESTORAGE_LFS_GC_INTERVAL":       "1h",
+		"CODESTORAGE_LFS_GC_DELETE_ENABLED": "true",
+	}
+	for k, v := range spikeEnv {
+		env[k] = v
+	}
+	if _, err := resolveServeConfig(mapEnv(env), "", "127.0.0.1:0", "/tmp/cache", ""); err == nil {
+		t.Fatal("delete-mode reclamation without the LFS reap resolved — retirement would refund cap slots while stranding their blobs")
+	}
+	env["CODESTORAGE_SWEEP_DELETE_LFS"] = "true"
+	if _, err := resolveServeConfig(mapEnv(env), "", "127.0.0.1:0", "/tmp/cache", ""); err != nil {
+		t.Fatalf("delete-mode reclamation with the LFS reap armed: %v", err)
+	}
+	// A grace below the reap cadence retires slots faster than the reap
+	// frees their blobs — the same growth, restated as a transient.
+	env["CODESTORAGE_LFS_GC_GRACE"] = "1h" // < the 24h default age threshold
+	if _, err := resolveServeConfig(mapEnv(env), "", "127.0.0.1:0", "/tmp/cache", ""); err == nil {
+		t.Fatal("grace below the reap cadence resolved — refunds would outrun physical deletion")
+	}
+	env["CODESTORAGE_SWEEP_AGE_THRESHOLD"] = "30m" // floor becomes the 1h sweep interval
+	if _, err := resolveServeConfig(mapEnv(env), "", "127.0.0.1:0", "/tmp/cache", ""); err != nil {
+		t.Fatalf("grace at the reap cadence: %v", err)
+	}
+	// The fleet-wide sweep emergency stop stays available: with the
+	// schedule stopped the delete flag demotes to report-only at wiring
+	// instead of failing startup.
+	env["CODESTORAGE_SWEEP_INTERVAL"] = "0"
+	if _, err := resolveServeConfig(mapEnv(env), "", "127.0.0.1:0", "/tmp/cache", ""); err != nil {
+		t.Fatalf("sweep emergency stop with armed reclamation delete: %v", err)
+	}
+}
+
 func TestResolveServeConfigLegacyEnvCompat(t *testing.T) {
 	// Legacy PG_URL/BLOB_URL names and the --addr alias still resolve; the
 	// org config is mandatory since ADR-8 dropped git-only serve mode.

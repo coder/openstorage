@@ -52,7 +52,17 @@ machinery and its gates (`CODESTORAGE_SWEEP_DELETE_LFS`, ADR-41's legacy
 transition gate); #104's download-time restore is registered-row-gated, so a
 retired row is not restorable through download paths, while never-migrated
 legacy bytes simply return to the pre-registry read-compat class they came
-from. The job ships dark (interval 0) with report-only marking as the second
+from. That split makes the coupling load-bearing (Codex security round 13):
+the refunded cap slot is the only bound on the `lfs/<repo>/` prefix that
+quota floors and sweep listings walk, so retirement without a running reap
+would let upload → grace → retire → re-upload cycles grow the prefix without
+bound. Startup therefore rejects `CODESTORAGE_LFS_GC_DELETE_ENABLED` on a
+live sweep schedule unless the LFS reap is armed and the grace is at least
+the reap cadence (max of the sweep age threshold and interval, so slots
+refund no faster than blobs become reap-eligible); under the sweep emergency
+stop (interval 0) reclamation demotes itself to report-only with a warning
+rather than crash-looping the fleet. The job ships dark (interval 0) with
+report-only marking as the second
 gate (`CODESTORAGE_LFS_GC_DELETE_ENABLED`), mirroring the sweep flags'
 staged rollout; `CODESTORAGE_LFS_MAX_OBJECTS_PER_REPO` is the orthogonal
 operator escape hatch that unwedges a repository immediately. An actively

@@ -506,6 +506,33 @@ func resolveServeConfig(getenv func(string) string, flagListen, flagAddr, flagCa
 	if err != nil {
 		return serveConfig{}, err
 	}
+	if cfg.lfsGC.deleteEnabled && cfg.sweep.interval > 0 {
+		// Slot refunds must couple to bounded physical deletion (Codex
+		// security round 13): retirement refunds the object-cap slot the
+		// moment the row drops, but the stranded canonical blob is reaped
+		// only by the sweeper's destructive LFS opt-in. Without it, a
+		// write-scoped token can cycle upload → grace → retire →
+		// re-upload and grow lfs/<repo>/ far past the cap that quota
+		// floors and sweep listings rely on to stay bounded.
+		if !cfg.sweep.deleteLFS {
+			return serveConfig{}, fmt.Errorf(
+				"%s requires destructive LFS sweeping (%s=true): retirement refunds object-cap slots whose stranded blobs only the LFS reap deletes — enable the reap, or keep reclamation report-only",
+				envLFSGCDeleteEnabled, envSweepDeleteLFS)
+		}
+		// The refund cadence must not outrun physical reap eligibility: a
+		// grace shorter than the sweeper's age threshold or its cadence
+		// retires slots faster than the reap frees their blobs,
+		// re-opening attacker-scaled transient growth of the prefix.
+		if floor := max(cfg.sweep.ageThreshold, cfg.sweep.interval); cfg.lfsGC.grace < floor {
+			return serveConfig{}, fmt.Errorf(
+				"%s (%s) must be at least the physical reap cadence — max(%s, %s) = %s — when %s is set",
+				envLFSGCGrace, cfg.lfsGC.grace, envSweepAgeThreshold, envSweepInterval, floor, envLFSGCDeleteEnabled)
+		}
+		// A stopped sweep schedule (interval 0, the fleet-wide destructive
+		// emergency stop) is deliberately NOT rejected: reclamation
+		// demotes itself to report-only at wiring instead (the round-111
+		// pattern — the stop switch must never crash-loop the fleet).
+	}
 	cfg.lfsMaxObjectsPerRepo, err = resolveLFSMaxObjectsPerRepo(getenv)
 	if err != nil {
 		return serveConfig{}, err
