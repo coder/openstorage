@@ -3240,13 +3240,24 @@ func (s *Server) maybeLegacyCompatCopy(ctx context.Context, repoID, oid, key str
 		// proceeds to the re-bridge below; spared or proven-valid
 		// returns as before.
 		if _, ok := s.lfsMismatchMemo(legacyKey); ok {
-			removed, rerr := s.resolveLegacyMismatchMemo(ctx, repoID, oid, key, legacyKey)
-			if rerr != nil {
+			switch v, rerr := s.resolveLegacyMismatchMemo(ctx, repoID, oid, key, legacyKey); {
+			case rerr != nil:
 				return rerr
+			case v == legacyMemoRemoved:
+				// The corrupt spelling is gone: re-bridge below.
+			case v == legacyMemoValid:
+				return nil // the true object converged
+			default:
+				// PENDING must not become 200 (Codex security round
+				// 129): this is the verified PUT's tail — after success
+				// the client never touches the object again, so a
+				// spared cleanup would leave old replicas on the
+				// known-corrupt bytes for the roll. Answer retryable
+				// contention; the client's retry lands on the
+				// registered fast path, which re-presses the cleanup.
+				return fmt.Errorf("compat cleanup pending %s: %w", legacyKey, errLFSBusy)
 			}
-			if removed {
-				break // the corrupt spelling is gone: re-bridge below
-			}
+			break
 		}
 		return nil
 	case !errors.Is(perr, blob.ErrNotFound):
@@ -3463,6 +3474,19 @@ func (s *Server) maybeLegacyCompatCopy(ctx context.Context, repoID, oid, key str
 	return nil
 }
 
+// legacyMemoVerdict is resolveLegacyMismatchMemo's outcome: pending
+// (spared — guard busy, budget denied, claim held, lease lost, or the
+// snapshot unknowable; the memo stands), valid (the current version
+// decisively proved true; memo cleared), or removed (the corrupt
+// spelling was deleted; the caller may re-bridge).
+type legacyMemoVerdict int
+
+const (
+	legacyMemoPending legacyMemoVerdict = iota
+	legacyMemoValid
+	legacyMemoRemoved
+)
+
 // resolveLegacyMismatchMemo presses the memoized-mismatch cleanup for
 // legacyKey — the rounds 121-127 machinery: per-key guard and op slot
 // taken non-blockingly, legacy fleet claim fencing the verdict, a
@@ -3471,10 +3495,9 @@ func (s *Server) maybeLegacyCompatCopy(ctx context.Context, repoID, oid, key str
 // BOTH compat probes (Codex round 129: the PUT tail reaches
 // maybeLegacyCompatCopy directly, never ensureLegacyCompat, so a memo
 // pending there was ignored and the known-corrupt spelling served old
-// replicas for the roll's remainder). Returns removed=true when the
-// corrupt spelling was deleted and the caller may re-bridge; false with
-// nil error when spared (memo pending) or proven valid (memo cleared).
-func (s *Server) resolveLegacyMismatchMemo(ctx context.Context, repoID, oid, key, legacyKey string) (removed bool, err error) {
+// replicas for the roll's remainder). See legacyMemoVerdict for the
+// three-way outcome (Codex security round 129).
+func (s *Server) resolveLegacyMismatchMemo(ctx context.Context, repoID, oid, key, legacyKey string) (legacyMemoVerdict, error) {
 	// A pending memo is cleared ONLY by a decisive verdict on the
 	// CURRENT version (Codex security round 122): the previous
 	// moved-fingerprint arm dropped the memo and returned success,
@@ -3496,11 +3519,11 @@ func (s *Server) resolveLegacyMismatchMemo(ctx context.Context, repoID, oid, key
 	// re-presses (round 121: contention delays cleanup, never
 	// terminalizes it).
 	if _, busy := s.lfsUploadsInFlight.LoadOrStore(legacyKey, struct{}{}); busy {
-		return false, nil // another worker is pressing this cleanup
+		return legacyMemoPending, nil // another worker is pressing this cleanup
 	}
 	defer s.lfsUploadsInFlight.Delete(legacyKey)
 	if !s.reserveLFSStaging(repoID, 0) {
-		return false, nil // spared; the memo stands for the next touch
+		return legacyMemoPending, nil // spared; the memo stands for the next touch
 	}
 	defer s.releaseLFSStaging(repoID, 0)
 	// The verdict must be obtained AND acted on under the legacy
@@ -3519,7 +3542,7 @@ func (s *Server) resolveLegacyMismatchMemo(ctx context.Context, repoID, oid, key
 	claimed, claimOwner, cerr := s.Store.TryAdoptionClaim(cctx, repoID, legacyKey)
 	ccancel()
 	if cerr != nil || !claimed {
-		return false, nil // held elsewhere or unknowable: spared, memo stands
+		return legacyMemoPending, nil // held elsewhere or unknowable: spared, memo stands
 	}
 	releaseClaim := func() {
 		rctx, rcancel := context.WithTimeout(context.WithoutCancel(ctx), lfsClaimRenewTimeout)
@@ -3542,34 +3565,34 @@ func (s *Server) resolveLegacyMismatchMemo(ctx context.Context, repoID, oid, key
 	stopRenew()
 	if cause := context.Cause(snapCtx); cause != nil && !errors.Is(cause, context.Canceled) {
 		releaseClaim()
-		return false, nil // lease lost mid-snapshot: spared, memo stands
+		return legacyMemoPending, nil // lease lost mid-snapshot: spared, memo stands
 	}
 	switch {
 	case !decisive:
 		releaseClaim()
-		return false, nil // spared; the memo stands pending for the next touch
+		return legacyMemoPending, nil // spared; the memo stands pending for the next touch
 	case !m:
 		s.forgetLFSMismatch(legacyKey)
 		releaseClaim()
-		return false, nil // proven VALID: the true object converged
+		return legacyMemoValid, nil // proven VALID: the true object converged
 	}
 	rnCtx, rnCancel := context.WithTimeout(context.WithoutCancel(ctx), lfsClaimRenewTimeout)
 	renewed, rnErr := s.Store.RenewAdoptionClaim(rnCtx, legacyKey, claimOwner)
 	rnCancel()
 	if rnErr != nil || !renewed {
 		releaseClaim()
-		return false, nil // possibly stale verdict: spared, memo stands
+		return legacyMemoPending, nil // possibly stale verdict: spared, memo stands
 	}
 	delCtx, delCancel := context.WithTimeout(context.WithoutCancel(ctx), lfsCleanupTimeout)
 	defer delCancel()
 	if err := s.Blob.Delete(delCtx, legacyKey); err != nil && !errors.Is(err, blob.ErrNotFound) {
 		releaseClaim()
-		return false, fmt.Errorf("remove memoized mismatched legacy object %s: %w", legacyKey, err)
+		return legacyMemoPending, fmt.Errorf("remove memoized mismatched legacy object %s: %w", legacyKey, err)
 	}
 	s.forgetLFSMismatch(legacyKey)
 	releaseClaim()
 	log.Printf("lfs compat %s: removed memoized mismatched legacy blob before re-bridging", key)
-	return true, nil
+	return legacyMemoRemoved, nil
 }
 
 // ensureLegacyCompat repairs a missing legacy spelling for a REGISTERED
@@ -3602,11 +3625,15 @@ func (s *Server) ensureLegacyCompat(ctx context.Context, repoID, oid, key string
 		if _, ok := s.lfsMismatchMemo(legacyKey); !ok {
 			return nil // the spelling exists: nothing to converge
 		}
-		switch removed, rerr := s.resolveLegacyMismatchMemo(ctx, repoID, oid, key, legacyKey); {
+		switch v, rerr := s.resolveLegacyMismatchMemo(ctx, repoID, oid, key, legacyKey); {
 		case rerr != nil:
 			return rerr
-		case !removed:
-			return nil // spared or proven valid; nothing to re-bridge
+		case v != legacyMemoRemoved:
+			// Pending or proven valid: nothing to re-bridge. Pending is
+			// tolerable HERE — the registered fast paths are repeat
+			// touches by construction, so the next touch re-presses
+			// (round 121).
+			return nil
 		}
 		// Fall through: the spelling is now absent and the bridge
 		// repair below republishes the verified canonical bytes.
