@@ -2544,6 +2544,40 @@ func TestLFSAdopt_LostClaimUncoveredCommitReclaimed(t *testing.T) {
 	}
 }
 
+// TestLFSReclaim_SuccessorRegistrationIsNotCleanupProof (Codex round 114,
+// P1): a successor that claims the rowless canonical key reaches it
+// through the crashed-adoption path — zero-growth, NO copy admission — so
+// its registration only credits the bytes; it cannot revoke a writer
+// admitted against a stale pre-copy floor during the uncovered gap.
+// Treating it as terminal cleanup proof skipped the caller's accounting
+// fallback entirely; the reclaim must report the cleanup UNPROVEN.
+func TestLFSReclaim_SuccessorRegistrationIsNotCleanupProof(t *testing.T) {
+	ctx := context.Background()
+	srv, st, _ := newLFSQuotaServer(t, 1<<20, time.Hour)
+	content := []byte("successor registered mid-reclaim")
+	oid := sha256Hex(content)
+	key := blob.LFSKey(lfsTestRepoID, oid)
+	// The uncovered commit left physical rowless canonical bytes.
+	if err := srv.Blob.UploadFile(ctx, key, writeTempFile(t, content)); err != nil {
+		t.Fatal(err)
+	}
+	// A live successor holds the fleet claim and registers the object
+	// (the crashed-adoption path's zero-growth registration).
+	if claimed, _, err := st.TryAdoptionClaim(ctx, lfsTestRepoID, key); err != nil || !claimed {
+		t.Fatalf("successor claim = (%v, %v)", claimed, err)
+	}
+	if err := st.RegisterAdoptedLFSObject(ctx, lfsTestRepoID, key, int64(len(content))); err != nil {
+		t.Fatal(err)
+	}
+
+	if srv.reclaimUncoveredCommit(ctx, lfsTestRepoID, key) {
+		t.Fatal("successor registration accepted as cleanup proof — it credits the bytes but cannot revoke a gap admission, so the accounting fallback must still run")
+	}
+	if _, err := srv.Blob.Stat(ctx, key); err != nil {
+		t.Fatalf("registered bytes deleted by the reclaim: %v — registration is terminal for cleanup, not license to remove a live object", err)
+	}
+}
+
 // TestLFSCompat_RepairSerializedOnLegacyClaim (Codex security round 85):
 // the batch fast path's bridge repair launched an unserialized full copy —
 // every tiny concurrent touch of the object started another one. Compat

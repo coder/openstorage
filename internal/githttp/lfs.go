@@ -1823,10 +1823,20 @@ func (s *Server) uncoveredCleanupProven(ctx context.Context, repoID, key string)
 // the fleet claim through the pre-copy floor window and, once held, proves
 // the cleanup verdict under it (mutual exclusion holds again — no
 // successor's publish/verify/register region can be live while we own the
-// claim). A denial means a LIVE holder owns the key: its registration
-// counts the bytes and its own cover-loss handling deletes them, so a
-// registered row observed while waiting is equally proof. Returns false
-// only when the window closes with nothing proven.
+// claim). A denial means a LIVE holder owns the key; keep pressing — its
+// release (or expiry) lets a later iteration win. A registration observed
+// while waiting is NOT proof (Codex round 114, P1): the successor reached
+// these rowless bytes through the crashed-adoption path, which skips copy
+// admission as zero-growth, so its registration only CREDITS the bytes —
+// it cannot revoke a writer already admitted against a stale pre-copy
+// floor during the uncovered gap. It is terminal, though: registered
+// bytes are live objects no cleanup may delete, so the caller's
+// accounting fallback is all that remains (over-covering an already
+// credited object is the safe side and expires by TTL), and the residual
+// — a successor registering before the claim could be won — is a
+// one-time, size-bounded, fully COUNTED overshoot that future admissions
+// see and deny against, not an invisible leak. Returns false whenever
+// deletion was not proven.
 func (s *Server) reclaimUncoveredCommit(ctx context.Context, repoID, key string) bool {
 	deadline := time.Now().Add(usageCacheTTL + UsageFloorHandoffMargin)
 	for {
@@ -1845,14 +1855,12 @@ func (s *Server) reclaimUncoveredCommit(ctx context.Context, repoID, key string)
 			rcancel()
 			return proven
 		default:
-			// Held by a live successor: a registration landing while we
-			// wait is terminal proof (its atomic credit counts the
-			// bytes).
 			hctx, hcancel := context.WithTimeout(ctx, lfsProbeTimeout)
 			registered, herr := s.Store.HasLFSObject(hctx, repoID, key)
 			hcancel()
 			if herr == nil && registered {
-				return true
+				log.Printf("lfs adopt %s: successor registered the uncovered commit before the claim could be reclaimed — bytes credited, gap admission unrevoked", key)
+				return false
 			}
 		}
 		if time.Now().After(deadline) || ctx.Err() != nil {
