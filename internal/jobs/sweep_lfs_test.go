@@ -10,10 +10,12 @@ import (
 	"encoding/hex"
 	"log/slog"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/coder/code-storage/internal/blob"
+	"github.com/coder/code-storage/internal/ref"
 )
 
 // lfsOID mints a deterministic 64-hex oid from a two-hex-char seed.
@@ -429,6 +431,60 @@ func TestSweepLFS_LegacyReapSparesLastCopyOfBloblessRow(t *testing.T) {
 	}
 	if !f.exists(legacy) {
 		t.Fatal("reaped the ONLY copy of a registered-but-blobless object — fallback reads lose the bytes and the row can never converge")
+	}
+}
+
+// adoptOnQuarantineCopyBlob registers the canonical twin exactly as the
+// reap's quarantine copy runs — an adoption completing between classify's
+// grace check and the destructive handshake.
+type adoptOnQuarantineCopyBlob struct {
+	blob.BlobStore
+	store     ref.Store
+	repo      string
+	canonical string
+	legacy    string
+	size      int64
+	done      atomic.Bool
+}
+
+func (b *adoptOnQuarantineCopyBlob) Copy(ctx context.Context, dstKey, srcKey string) error {
+	if srcKey == b.legacy && strings.HasPrefix(dstKey, quarantinePrefix) && !b.done.Swap(true) {
+		if err := b.store.RegisterAdoptedLFSObject(ctx, b.repo, b.canonical, b.size); err != nil {
+			return err
+		}
+	}
+	return b.BlobStore.Copy(ctx, dstKey, srcKey)
+}
+
+// TestSweepLFS_LegacyReapRechecksTwinInsideGuard (Codex round 100):
+// classify's reap-grace check races adoption — a rowless legacy source can
+// be adopted (canonical registered, created_at fresh) between the check
+// and safeDelete's destructive handshake, whose revalidation and guard
+// consult only the LEGACY key. The just-retained source was then reaped
+// inside the fresh presigned-GET window despite the grace. The guarded
+// delete must recheck the canonical twin's grace: the guard's count-row
+// lock blocks in-flight registrations from committing mid-handshake, so a
+// committed fresh registration is always visible there.
+func TestSweepLFS_LegacyReapRechecksTwinInsideGuard(t *testing.T) {
+	f := newSweepFixture(t)
+	content := "adopted mid-handshake"
+	oid := lfsContentOID(content)
+	canonical := blob.LFSKey("repo_lfs", oid)
+	legacy := blob.LFSLegacyKey("repo_lfs", oid)
+	f.upload(legacy, content)
+	f.backdate(legacy, 48*time.Hour)
+	f.upload(canonical, content)
+
+	wrapped := &adoptOnQuarantineCopyBlob{
+		BlobStore: f.blobs, store: f.store, repo: "repo_lfs",
+		canonical: canonical, legacy: legacy, size: int64(len(content)),
+	}
+	sw := NewSweeper(wrapped, f.store, SweepConfig{Threshold: 24 * time.Hour, DeleteLFS: true, DeleteLFSLegacy: true}, slog.New(slog.DiscardHandler))
+	if _, err := sw.Sweep(context.Background()); err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if !f.exists(legacy) {
+		t.Fatal("retained source reaped despite an adoption registering mid-handshake — presigned GETs issued before the adoption break inside the grace window")
 	}
 }
 
