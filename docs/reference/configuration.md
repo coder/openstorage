@@ -377,6 +377,13 @@ reclaims them under its LFS opt-in.
 - **Default:** `false`. The canonical spelling is the secure one — the compat
   copies are exactly as exposed to still-valid legacy upload URLs as everything
   v0.2.0 served — so compat is opt-in and meant to be temporary.
+- **Cannot be combined with [`CODESTORAGE_SWEEP_DELETE_LFS`](#codestorage_sweep_delete_lfs)**
+  (a fail-fast startup error): the flag declares a mixed v0.2.0 fleet, and during
+  that roll destructive LFS sweeping must be off **fleet-wide** — the in-place row
+  migration makes a touched object's legacy blob rowless to an old binary's
+  sweeper, which has no legacy gate and reaps it immediately, breaking
+  old-replica reads. The tripwire covers upgraded nodes; disable the flag on the
+  old nodes yourself before rolling.
 - With a [storage quota](#codestorage_pack_quota_bytes) enforced, the bridge copy
   passes real quota admission: each fresh upload effectively costs twice its size
   for the roll's duration, and an upload whose bridge would exceed the quota

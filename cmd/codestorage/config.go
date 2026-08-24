@@ -436,6 +436,21 @@ func resolveServeConfig(getenv func(string) string, flagListen, flagAddr, flagCa
 	if err != nil {
 		return serveConfig{}, err
 	}
+	if cfg.lfsV020WriteCompat && cfg.sweep.deleteLFS {
+		// Rolling-upgrade tripwire (Codex round 101, P1): the compat flag
+		// declares a mixed v0.2.0 fleet, and during that roll DESTRUCTIVE
+		// LFS sweeping must be off FLEET-WIDE — the in-place row
+		// migration makes a touched object's legacy blob rowless from a
+		// v0.2.0 sweeper's perspective, and an old reap-enabled sweeper
+		// (whose binary has no legacy gate) deletes it immediately,
+		// breaking old-replica reads and freshly issued presigned GETs.
+		// Old binaries cannot be guarded retroactively; failing startup
+		// on the nodes we do control forces the staged rollout the docs
+		// describe (list-only during the roll, opt-ins after).
+		return serveConfig{}, fmt.Errorf(
+			"%s and %s cannot be combined: destructive LFS sweeping must stay disabled fleet-wide (old v0.2.0 sweepers included) until the roll completes and the compat flag is dropped",
+			envLFSV020WriteCompat, envSweepDeleteLFS)
+	}
 	cfg.repackThreshold, err = resolveRepackThreshold(getenv)
 	if err != nil {
 		return serveConfig{}, err
