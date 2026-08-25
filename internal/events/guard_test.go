@@ -72,7 +72,7 @@ func TestTargetGuardRejectsDeniedDialTargets(t *testing.T) {
 				dialed.Add(1)
 				return nil, errors.New("unexpected dial")
 			}}
-			_, err := guard.dialContext(context.Background(), "tcp", net.JoinHostPort(raw, "80"))
+			_, err := guard.DialContext(context.Background(), "tcp", net.JoinHostPort(raw, "80"))
 			if err == nil {
 				t.Fatalf("dial to denied target %s succeeded", raw)
 			}
@@ -115,7 +115,7 @@ func TestTargetGuardFailsClosedOnResolutionProblems(t *testing.T) {
 					return nil, errors.New("unexpected dial")
 				},
 			}
-			_, err := guard.dialContext(context.Background(), "tcp", "webhook.example:443")
+			_, err := guard.DialContext(context.Background(), "tcp", "webhook.example:443")
 			if err == nil {
 				t.Fatal("dial succeeded; want fail-closed rejection")
 			}
@@ -141,7 +141,7 @@ func TestTargetGuardRejectsMalformedDialInputs(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
-			if _, err := guard.dialContext(context.Background(), tc.network, tc.addr); err == nil {
+			if _, err := guard.DialContext(context.Background(), tc.network, tc.addr); err == nil {
 				t.Fatalf("dialContext(%q, %q) succeeded", tc.network, tc.addr)
 			}
 		})
@@ -336,7 +336,7 @@ func TestTargetGuardAllowPrivateScope(t *testing.T) {
 					return nil, wantDial
 				},
 			}
-			_, err := guard.dialContext(context.Background(), "tcp", net.JoinHostPort(raw, "80"))
+			_, err := guard.DialContext(context.Background(), "tcp", net.JoinHostPort(raw, "80"))
 			if !errors.Is(err, wantDial) {
 				t.Fatalf("dial error = %v, want admitted address to reach dialer", err)
 			}
@@ -373,7 +373,7 @@ func TestTargetGuardAllowPrivateScope(t *testing.T) {
 					return nil, errors.New("unexpected dial")
 				},
 			}
-			if _, err := guard.dialContext(context.Background(), "tcp", net.JoinHostPort(raw, "80")); err == nil {
+			if _, err := guard.DialContext(context.Background(), "tcp", net.JoinHostPort(raw, "80")); err == nil {
 				t.Fatalf("AllowPrivate admitted %s", raw)
 			}
 			if got := dialed.Load(); got != 0 {

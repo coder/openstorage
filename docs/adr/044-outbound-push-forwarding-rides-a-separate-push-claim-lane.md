@@ -83,6 +83,18 @@ local until the next authorized trigger converges the mirror. The
 `forward_pushes` decision itself is made at repo creation by a
 `repo:write` holder.
 
+**Egress is guarded at dial time.** `upstream_host` is caller-linked data,
+and outbound pushes are a WRITE primitive into whatever network the server
+can reach — strictly stronger than the pull lane's read/credential-echo
+exposure — so every http(s) forward dials through a short-lived loopback
+vetting proxy applying the webhook TargetGuard policy (issue #53): deny
+loopback/private/link-local/ULA/metadata/special-purpose destinations,
+re-resolving and vetting at connect time (no DNS-rebinding TOCTOU).
+`CODESTORAGE_SYNC_PUSH_ALLOW_PRIVATE` relaxes only the private receiver
+classes for internal-forge deployments; a denied destination fails the run
+permanently as configuration. The pull lane's egress predates this ADR and
+is tracked separately for a unified policy.
+
 **Failure semantics.** The forward itself is atomic (`git push --atomic`):
 a batch with one refused ref leaves the upstream entirely untouched, so a
 failed run never strands a partially-updated upstream that no mirror-back

@@ -5,11 +5,17 @@ package sync
 // fetches from, and the upstream dir holds the destination bare repo.
 
 import (
+	"bufio"
 	"context"
+	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -352,6 +358,108 @@ func TestPushRunDetachDuringUpstreamPushKillsSubprocess(t *testing.T) {
 	// started was emitted before the detach; the canceled run emits no
 	// terminal event.
 	assertEventTypes(t, f.rec.list(), EventSyncStarted)
+}
+
+// TestPushRunPrivateUpstreamDeniedByDefault: with the production egress
+// policy (PushEgressAllowPrivate off), a loopback/private upstream_host is
+// refused at dial time by the vetting proxy — the upstream is NEVER
+// contacted — and the run fails permanently as configuration (no retry,
+// no re-marked pending level): upstream_host is caller-linked data, so
+// unguarded egress would be an SSRF/write primitive into the server's
+// network.
+func TestPushRunPrivateUpstreamDeniedByDefault(t *testing.T) {
+	f := newWorkerFixture(t)
+	seedLocalRepo(t, f, "repo_pe2")
+	var reached atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		reached.Store(true)
+		http.Error(w, "unreachable", http.StatusTeapot)
+	}))
+	defer srv.Close()
+	f.putUpstream(t, "repo_pe2", "own", "proj", srv.URL)
+	f.worker.PushEgressAllowPrivate = false // production default
+
+	err := f.worker.RunPush(context.Background(), Job{Org: "acme", RepoID: "repo_pe2"})
+	if err == nil {
+		t.Fatal("RunPush succeeded against a policy-denied private upstream")
+	}
+	if TransientPushFailure(err) {
+		t.Fatalf("egress denial classified transient: %v", err)
+	}
+	if reached.Load() {
+		t.Fatal("denied egress still reached the private upstream")
+	}
+	events := f.rec.list()
+	assertEventTypes(t, events, EventSyncStarted, EventSyncFailed)
+	if events[1].Error != FailConfig {
+		t.Fatalf("error = %q, want %q", events[1].Error, FailConfig)
+	}
+	up, err := f.store.GetUpstream(context.Background(), "repo_pe2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if up.PushPending != PushPendingNone {
+		t.Fatalf("permanent egress denial re-marked pending: %+v", up)
+	}
+}
+
+// TestEgressProxyConnectTunnel exercises the CONNECT arm (https upstreams)
+// hermetically: a vetted tunnel splices bytes end-to-end, and a denied
+// target is refused before any dial.
+func TestEgressProxyConnectTunnel(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("tunneled"))
+	}))
+	defer backend.Close()
+
+	p, err := startEgressProxy(true) // loopback backend needs the hatch
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+
+	connect := func(target string) (net.Conn, string, error) {
+		conn, err := net.Dial("tcp", p.ln.Addr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		fmt.Fprintf(conn, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", target, target)
+		br := bufio.NewReader(conn)
+		resp, err := http.ReadResponse(br, &http.Request{Method: http.MethodConnect})
+		if err != nil {
+			conn.Close()
+			return nil, "", err
+		}
+		defer resp.Body.Close()
+		return conn, resp.Status, nil
+	}
+
+	backendAddr := strings.TrimPrefix(backend.URL, "http://")
+	conn, status, err := connect(backendAddr)
+	if err != nil {
+		t.Fatalf("CONNECT: %v", err)
+	}
+	defer conn.Close()
+	if !strings.HasPrefix(status, "200") {
+		t.Fatalf("CONNECT status = %q, want 200", status)
+	}
+	// Speak HTTP through the established tunnel.
+	fmt.Fprintf(conn, "GET / HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", backendAddr)
+	tunneled, err := io.ReadAll(conn)
+	if err != nil {
+		t.Fatalf("read through tunnel: %v", err)
+	}
+	if !strings.Contains(string(tunneled), "tunneled") {
+		t.Fatalf("tunneled response = %q, want backend body", tunneled)
+	}
+
+	// Metadata addresses stay denied even with the private hatch on.
+	if _, status, err := connect("169.254.169.254:443"); err == nil && !strings.HasPrefix(status, "403") {
+		t.Fatalf("metadata CONNECT status = %q, want 403", status)
+	}
+	if p.deniedReason() == "" {
+		t.Fatal("denied CONNECT left no recorded denial")
+	}
 }
 
 func TestPushRunOverlappingRunSkips(t *testing.T) {

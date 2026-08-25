@@ -122,6 +122,11 @@ func newWorkerFixture(t *testing.T) *workerFixture {
 		// The hermetic fixture endpoints are file:// URLs, which the
 		// production default ("http:https") deliberately blocks.
 		AllowProtocol: "http:https:file",
+		// Fixture upstreams that ARE network endpoints live on
+		// 127.0.0.1 (httptest), which the egress guard's production
+		// default denies; the escape hatch routes them through the
+		// vetting proxy like an internal-forge deployment would.
+		PushEgressAllowPrivate: true,
 	}
 	return f
 }

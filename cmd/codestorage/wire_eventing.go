@@ -272,7 +272,7 @@ func isPGURL(dbURL string) bool {
 // non-nil repack registers the background-repack worker on both backends.
 // The returned cleanup stops the sweep and the queue (waiting for in-flight
 // local work).
-func buildServeEventing(ctx context.Context, ms meta.Store, dbURL, org, loopbackBaseURL string, key loopbackKey, sweep *jobs.SweepSchedule, lfsReclaim *jobs.LFSReclaimSchedule, absence *jobs.AbsenceReconcileSchedule, repack *jobs.Repacker, webhookAllowPrivate bool, logger *slog.Logger) (jobs.Queue, func(inner ref.RefStore) ref.RefStore, func(), error) {
+func buildServeEventing(ctx context.Context, ms meta.Store, dbURL, org, loopbackBaseURL string, key loopbackKey, sweep *jobs.SweepSchedule, lfsReclaim *jobs.LFSReclaimSchedule, absence *jobs.AbsenceReconcileSchedule, repack *jobs.Repacker, webhookAllowPrivate, syncPushAllowPrivate bool, logger *slog.Logger) (jobs.Queue, func(inner ref.RefStore) ref.RefStore, func(), error) {
 	assertf(ms != nil && dbURL != "" && org != "" && loopbackBaseURL != "", "buildServeEventing: missing deps")
 	assertf(logger != nil, "buildServeEventing: nil logger")
 
@@ -314,6 +314,10 @@ func buildServeEventing(ctx context.Context, ms meta.Store, dbURL, org, loopback
 			return key.mint(org, repo, ttl, holder)
 		}},
 		Logger: logger,
+		// Outbound push egress guard escape hatch (see upsync/egress.go):
+		// operators syncing to genuinely internal forges opt private
+		// receiver classes in; metadata/special ranges stay denied.
+		PushEgressAllowPrivate: syncPushAllowPrivate,
 	}
 	// The mirror-back pull after every successful outbound run (issue
 	// #90; explicit runs included — see the AfterForward field doc)

@@ -14,11 +14,14 @@ package sync
 // deliberately avoids --mirror; this lane deliberately avoids --prune and
 // delete refspecs).
 //
-// Egress posture: the push targets exactly the CloneURL the pull lane
-// already fetches from — a host validated at link time (providerHosts /
+// Egress posture: the push targets the CloneURL the pull lane already
+// fetches from — a host validated at link time (providerHosts /
 // validUpstreamHost) — under the same hermetic environment and
-// GIT_ALLOW_PROTOCOL pin. No new egress class is introduced; see
-// docs/adr/044.
+// GIT_ALLOW_PROTOCOL pin, PLUS a dial-time destination guard (egress.go):
+// writes into private networks are a stronger SSRF primitive than the
+// pull lane's reads, so every http(s) push dials through a vetting proxy
+// that denies private/special destinations unless the operator opts in
+// (CODESTORAGE_SYNC_PUSH_ALLOW_PRIVATE); see docs/adr/044.
 
 import (
 	"context"
@@ -444,6 +447,20 @@ func (w *Worker) transferPush(ctx context.Context, job Job, repo RepoInfo, up Up
 	if err != nil {
 		return nil, &syncFailure{code: FailInternal, cause: err}
 	}
+	// Egress guard (egress.go): every network push dials through the
+	// vetting proxy — upstream_host is caller-linked data, so unguarded
+	// egress would be an SSRF/write primitive into private networks.
+	// file:// upstreams (tests; GIT_ALLOW_PROTOCOL-blocked in production)
+	// have no network egress to guard.
+	var egress *egressProxy
+	if u := up.CloneURL(); strings.HasPrefix(u, "http://") || strings.HasPrefix(u, "https://") {
+		egress, err = startEgressProxy(w.PushEgressAllowPrivate)
+		if err != nil {
+			return nil, &syncFailure{code: FailInternal, cause: err}
+		}
+		defer egress.Close()
+		pushEnv = proxyEnv(pushEnv, egress.URL())
+	}
 	refspecs := pushRefspecs
 	if force {
 		refspecs = mirrorRefspecs
@@ -506,6 +523,14 @@ func (w *Worker) transferPush(ctx context.Context, job Job, repo RepoInfo, up Up
 	default:
 	}
 	if err != nil {
+		// A recorded policy denial dominates every other classification:
+		// the destination is refused by configuration, so retrying (or
+		// reading rejection porcelain) would be noise.
+		if egress != nil {
+			if reason := egress.deniedReason(); reason != "" {
+				return nil, &syncFailure{code: FailConfig, cause: fmt.Errorf("push egress denied: %s", reason)}
+			}
+		}
 		if rejected := parsePushRejections(stdout); len(rejected) > 0 {
 			return rejected, &syncFailure{code: FailRejected, cause: fmt.Errorf(
 				"git push: %d ref(s) rejected by upstream: %w", len(rejected), err)}

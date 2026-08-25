@@ -180,6 +180,14 @@ type Worker struct {
 	// subprocess when the repo is detached or the claim stolen mid-push
 	// (issue #90); 0 means defaultDetachPoll. Only tests shorten it.
 	DetachPoll time.Duration
+
+	// PushEgressAllowPrivate relaxes the outbound push egress guard's
+	// private receiver classes (CODESTORAGE_SYNC_PUSH_ALLOW_PRIVATE, see
+	// egress.go): loopback/RFC1918/link-local/ULA upstreams for genuinely
+	// internal forges. Metadata and the special-purpose registry stay
+	// denied either way — every http(s) push dials through the guard's
+	// vetting proxy. Tests set it (fixture upstreams are 127.0.0.1).
+	PushEgressAllowPrivate bool
 }
 
 // allowProtocol resolves the effective GIT_ALLOW_PROTOCOL value.
