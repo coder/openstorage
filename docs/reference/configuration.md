@@ -810,10 +810,11 @@ stretches individual probes.
   the exact new total is charged; the old row expires within one TTL); a
   re-verification backlog (`absent_refreshed` below `absent_tracked`) only
   delays shrinking, never cover renewal. Losses beyond the repository
-  capacity or the 100,000-row memory cap get one-shot covers renewed on
-  rotation revisits (`absent_untracked`), and a renewal aborted by the
-  pass deadline drops its unrenewed bases loudly (`absent_dropped`) for
-  rotation rediscovery rather than leaving covers to lapse silently.
+  capacity or the 100,000-row memory cap aggregate into one pass-scoped
+  overflow cover per repository, renewed on rotation revisits
+  (`absent_untracked`), and a renewal aborted by the pass deadline drops
+  its unrenewed bases loudly (`absent_dropped`) for rotation rediscovery
+  rather than leaving covers to lapse silently.
 - **Multi-replica PostgreSQL fleets:** the refresh set and rotation
   cursors are per-process, and the River periodic job may run on any
   replica ([#125](https://github.com/coder/code-storage/issues/125) tracks

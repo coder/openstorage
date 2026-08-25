@@ -306,6 +306,15 @@ type absencePassState struct {
 	// mint one upsert per absent row. A gen rotation or byte growth
 	// re-charges.
 	baseCovered map[string]coveredAggregate
+	// overflowKeys/overflowBytes aggregate UNTRACKED losses (beyond the
+	// base capacity or memory cap) into one pass-scoped cover row per
+	// base (Codex round 7, security): per-row one-shot covers would
+	// re-collide with the per-base reservation-row cap on a huge
+	// single-base loss. Pass-scoped keys are GREATEST-safe — a pass's
+	// running total only grows — and each expires by TTL, bounding the
+	// row population at TTL/interval rows per overflow base.
+	overflowKeys  map[string]string
+	overflowBytes map[string]int64
 }
 
 // coveredAggregate is one pass's per-base charge memo.
@@ -316,11 +325,13 @@ type coveredAggregate struct {
 
 func newAbsencePassState() *absencePassState {
 	return &absencePassState{
-		purged:      make(map[string]bool),
-		probeFailed: make(map[string]bool),
-		coverSkip:   make(map[string]bool),
-		settled:     make(map[string]bool),
-		baseCovered: make(map[string]coveredAggregate),
+		purged:        make(map[string]bool),
+		probeFailed:   make(map[string]bool),
+		coverSkip:     make(map[string]bool),
+		settled:       make(map[string]bool),
+		baseCovered:   make(map[string]coveredAggregate),
+		overflowKeys:  make(map[string]string),
+		overflowBytes: make(map[string]int64),
 	}
 }
 
@@ -750,14 +761,8 @@ func (r *AbsenceReconciler) settleLFSRow(ctx context.Context, row ref.AbsenceLFS
 	// restore (PR #104) heals the spelling through the digest-verified
 	// adopt pipeline — report, never cover. A SHORT twin compensates only
 	// its physical size; the remainder is covered like truncation.
-	coverKey := row.Key
 	if repoID, oid, ok := splitLFSKey(row.Key); ok {
 		canonical, legacy := blob.LFSKey(repoID, oid), blob.LFSLegacyKey(repoID, oid)
-		// Cover under the canonical spelling regardless of the row's: it
-		// is the reservation row the restore paths renew, so a restore
-		// racing this pass refreshes the same key instead of double
-		// charging.
-		coverKey = canonical
 		twin := legacy
 		if row.Key == legacy {
 			twin = canonical
@@ -788,9 +793,7 @@ func (r *AbsenceReconciler) settleLFSRow(ctx context.Context, row ref.AbsenceLFS
 	if r.trackAbsent(absentRow{repo: row.Repo, key: row.Key, bytes: row.Bytes, registered: row.Bytes}, report) {
 		r.coverBase(ctx, base, report, st, errs)
 	} else {
-		// Memory-cap overflow: a one-shot cover under the canonical
-		// spelling (the row the restore paths renew).
-		r.coverRow(ctx, base, coverKey, row.Bytes, report, st, errs)
+		r.coverOverflow(ctx, base, row.Bytes, report, st, errs)
 	}
 	return charged
 }
@@ -807,7 +810,7 @@ func (r *AbsenceReconciler) coverDeficit(ctx context.Context, base string, row a
 	if r.trackAbsent(row, report) {
 		r.coverBase(ctx, base, report, st, errs)
 	} else {
-		r.coverRow(ctx, base, row.key, row.bytes, report, st, errs)
+		r.coverOverflow(ctx, base, row.bytes, report, st, errs)
 	}
 }
 
@@ -855,7 +858,7 @@ func (r *AbsenceReconciler) settlePackRow(ctx context.Context, row ref.AbsencePa
 	if r.trackAbsent(absentRow{repo: row.Repo, id: row.ID, key: row.Key, bytes: row.Bytes, registered: row.Bytes, pack: true}, report) {
 		r.coverBase(ctx, base, report, st, errs)
 	} else {
-		r.coverRow(ctx, base, row.Key, row.Bytes, report, st, errs)
+		r.coverOverflow(ctx, base, row.Bytes, report, st, errs)
 	}
 	return charged
 }
@@ -904,15 +907,24 @@ func (r *AbsenceReconciler) coverBase(ctx context.Context, base string, report *
 	st.baseCovered[base] = coveredAggregate{key: agg.coverKey, bytes: agg.bytes}
 }
 
-// coverRow charges one untracked loss (memory-cap overflow) as a one-shot
-// per-key cover: it expires by TTL and renews only when the rotation
-// revisits the row — the documented residual beyond absentTrackedCap.
-func (r *AbsenceReconciler) coverRow(ctx context.Context, base, key string, size int64, report *AbsenceReport, st *absencePassState, errs *boundedErrs) {
+// coverOverflow charges one UNTRACKED loss (beyond the base capacity or
+// memory cap) into its base's pass-scoped overflow aggregate: one bounded
+// reservation row per base per pass regardless of how many rows the base
+// lost (Codex round 7, security — per-row one-shot covers re-collided
+// with the reservation-row cap). It expires by TTL and renews only when
+// the rotation revisits the rows — the documented overflow residual.
+func (r *AbsenceReconciler) coverOverflow(ctx context.Context, base string, size int64, report *AbsenceReport, st *absencePassState, errs *boundedErrs) {
 	if !r.quotaEnforced {
 		return
 	}
-	assertf(size > 0, "coverRow: non-positive size %d for %s", size, key)
-	r.chargeCover(ctx, base, key, size, report, st, errs)
+	assertf(size > 0, "coverOverflow: non-positive size %d for %s", size, base)
+	key, ok := st.overflowKeys[base]
+	if !ok {
+		key = absenceCoverKey(base)
+		st.overflowKeys[base] = key
+	}
+	st.overflowBytes[base] += size
+	r.chargeCover(ctx, base, key, st.overflowBytes[base], report, st, errs)
 }
 
 // chargeCover reserves size bytes under key's repair-cover spelling and
