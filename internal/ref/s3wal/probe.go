@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 )
 
 // ProbeKey is the scratch-key PREFIX the boot-time probe exercises. Plan
@@ -74,6 +75,20 @@ func probeAtKey(ctx context.Context, c *Client, keyPrefix string) error {
 	assertf(c != nil, "probeAtKey: nil client")
 	assertf(keyPrefix != "", "probeAtKey: empty key prefix")
 	key := probeScratchKey(keyPrefix)
+
+	// Best-effort cleanup on EVERY exit path: early step failures — and
+	// even an ambiguous create whose bytes may have landed despite the
+	// error return — would otherwise strand objects on nonce keys that no
+	// later probe revisits, so boot retries against a noncompliant or
+	// flaky store would accumulate unreachable scratch forever. The
+	// independent bounded context survives probe-context cancellation;
+	// cleanup failure never changes the verdict (a leftover is inert
+	// scratch under the dedicated probe prefix).
+	defer func() {
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		_ = c.Delete(cleanupCtx, key)
+	}()
 
 	// Step 1: create must succeed. The key carries a fresh per-invocation
 	// nonce, so no stale leftover from a prior boot can exist and no
@@ -171,11 +186,6 @@ func probeAtKey(ctx context.Context, c *Client, keyPrefix string) error {
 			Diagnosis: "no racing advance succeeded — the store over-rejects or livelocks conditional writes"}
 	}
 
-	// Cleanup is best-effort: a leftover probe object is inert scratch
-	// under the dedicated probe prefix (per-invocation nonce keys are
-	// never revisited), so a failed delete costs one orphaned object per
-	// probe run, nothing more.
-	_ = c.Delete(ctx, key)
 	return nil
 }
 
