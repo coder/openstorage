@@ -1298,6 +1298,147 @@ func TestAbsenceReconcile_FailedFenceArmSuppressesHealthStamp(t *testing.T) {
 	}
 }
 
+// TestAbsenceReconcile_DirtyRecoveryRotationKeepsFenceArmed (Codex round
+// 31, P1): a recovery rotation spanning multiple passes whose EARLY pass
+// hits a cover-charge error must not release the admission fence when a
+// LATER error-free pass crosses the origin — the failed row was neither
+// verified nor covered, and only the persisted Dirty flag remembers it.
+// Fence release gates on the CLEAN traversal counter: the dirty rotation
+// never advances it, and the next fully clean rotation does.
+func TestAbsenceReconcile_DirtyRecoveryRotationKeepsFenceArmed(t *testing.T) {
+	f := newSweepFixture(t)
+	ctx := context.Background()
+	reg := absenceRegistry(t, f)
+	// Multi-pass LFS keyspace: 30 rows, budget 12. Row 0 sorts first
+	// and is registered but MISSING — its deficit charge is the error
+	// injection target for the rotation's first pass.
+	for i := 0; i < 30; i++ {
+		key := blob.LFSKey("a-fill", strings.Repeat(fmt.Sprintf("%02x", i), 32))
+		registerLFS(t, f, "a-fill", key, 10)
+		if i != 0 {
+			f.upload(key, strings.Repeat("x", 10))
+		}
+	}
+
+	// Pass 1: no health watermark — the fence arms (unprovable
+	// continuity) with a zero clean-counter snapshot. The missing row's
+	// deficit charge fails (settle, then the range-end retry), so the
+	// rotation is durably DIRTY.
+	pinLFSLeader(t, f)
+	flaky := &flakyRegistry{AbsenceRegistry: reg, failLeft: 2}
+	rec := NewAbsenceReconciler(flaky, f.blobs, true, 12, time.Hour, time.Minute, slog.New(slog.DiscardHandler))
+	if _, err := rec.Run(ctx); err == nil {
+		t.Fatal("pass 1: want the injected charge failures reported")
+	}
+	if _, ok, err := reg.GetJobScanState(ctx, ref.ScanJobAbsence, ref.ScanScopeAbsenceAdmissionFence); err != nil || !ok {
+		t.Fatalf("fence after pass 1 = (ok=%v, %v), want armed", ok, err)
+	}
+
+	// Error-free passes complete the dirty rotation. At its origin
+	// crossing the raw counter advances but the CLEAN counter must not —
+	// the fence stays armed even though this pass itself saw no error.
+	wrapped := false
+	for pass := 2; pass <= 8 && !wrapped; pass++ {
+		rec := testReconciler(t, f, true, 12)
+		if _, err := rec.Run(ctx); err != nil {
+			t.Fatalf("pass %d: %v", pass, err)
+		}
+		wrapped = rec.lfs.Traversals >= 1
+		if wrapped && rec.lfs.CleanTraversals != 0 {
+			t.Fatalf("clean traversals after dirty rotation = %d, want 0", rec.lfs.CleanTraversals)
+		}
+	}
+	if !wrapped {
+		t.Fatal("dirty rotation never crossed the origin")
+	}
+	if _, ok, err := reg.GetJobScanState(ctx, ref.ScanJobAbsence, ref.ScanScopeAbsenceAdmissionFence); err != nil || !ok {
+		t.Fatalf("fence after dirty rotation wrap = (ok=%v, %v), want STILL armed", ok, err)
+	}
+
+	// The next rotation is fully clean (the deficit charged successfully
+	// once the injection lapsed) and releases the fence.
+	cleared := false
+	for pass := 0; pass < 8 && !cleared; pass++ {
+		rec := testReconciler(t, f, true, 12)
+		if _, err := rec.Run(ctx); err != nil {
+			t.Fatalf("recovery pass %d: %v", pass, err)
+		}
+		_, ok, err := reg.GetJobScanState(ctx, ref.ScanJobAbsence, ref.ScanScopeAbsenceAdmissionFence)
+		if err != nil {
+			t.Fatalf("recovery pass %d fence read: %v", pass, err)
+		}
+		cleared = !ok
+	}
+	if !cleared {
+		t.Fatal("fence never cleared after a fully clean rotation")
+	}
+}
+
+// TestAbsenceReconcile_StaleCursorRestartPreservesFenceCounters (Codex
+// round 31, P1): a stale-cursor restart under an ARMED fence must
+// preserve the lifetime traversal counters — zeroing them would leave
+// settleAdmissionFence comparing a restart-at-zero count against the old
+// arming snapshot, blocking finite quota admissions for as many extra
+// rotations as the job ever completed. One clean rotation from the reset
+// origin must still release the fence.
+func TestAbsenceReconcile_StaleCursorRestartPreservesFenceCounters(t *testing.T) {
+	f := newSweepFixture(t)
+	ctx := context.Background()
+	reg := absenceRegistry(t, f)
+	base := "repo-stale-fence"
+	for i := byte(0); i < 6; i++ {
+		key := blob.LFSKey(base, absenceOID('a'+i))
+		registerLFS(t, f, base, key, 10)
+		f.upload(key, strings.Repeat("x", 10))
+	}
+
+	// Passes 1-3 build up clean-traversal history (pass 1 arms on the
+	// missing health watermark and settles the same pass: tiny keyspace).
+	pinLFSLeader(t, f)
+	var built int64
+	for pass := 1; pass <= 3; pass++ {
+		rec := testReconciler(t, f, true, 100)
+		if _, err := rec.Run(ctx); err != nil {
+			t.Fatalf("pass %d: %v", pass, err)
+		}
+		built = rec.lfs.CleanTraversals
+	}
+	if built == 0 {
+		t.Fatal("no clean traversals accumulated")
+	}
+
+	// Deleting the health watermark makes pass 4's SUCCESSFUL touch
+	// unprovable — the fence arms with the accumulated counters as its
+	// snapshot, and the budget-starved pass parks mid-rotation without
+	// settling. Health is freshly restamped.
+	if err := reg.DeleteJobScanState(ctx, ref.ScanJobAbsence, ref.ScanScopeAbsenceRenewalHealth); err != nil {
+		t.Fatalf("drop health watermark: %v", err)
+	}
+	rec4 := testReconciler(t, f, true, 4)
+	if _, err := rec4.Run(ctx); err != nil {
+		t.Fatalf("pass 4: %v", err)
+	}
+	if _, ok, err := reg.GetJobScanState(ctx, ref.ScanJobAbsence, ref.ScanScopeAbsenceAdmissionFence); err != nil || !ok {
+		t.Fatalf("fence after pass 4 = (ok=%v, %v), want armed", ok, err)
+	}
+
+	// A recovery pause outlives the (shrunk) cursor bound while renewal
+	// health stays young: the restart must keep the counters, so ONE
+	// clean rotation from origin releases the fence.
+	rec5 := testReconciler(t, f, true, 100)
+	rec5.cursorStaleAge = time.Millisecond
+	time.Sleep(1200 * time.Millisecond) // cross SQLite's second stamp
+	if _, err := rec5.Run(ctx); err != nil {
+		t.Fatalf("recovery pass: %v", err)
+	}
+	if rec5.lfs.CleanTraversals <= built {
+		t.Fatalf("clean traversals after restart = %d, want counters preserved past %d", rec5.lfs.CleanTraversals, built)
+	}
+	if _, ok, err := reg.GetJobScanState(ctx, ref.ScanJobAbsence, ref.ScanScopeAbsenceAdmissionFence); err != nil || ok {
+		t.Fatalf("fence after one clean restarted rotation = (ok=%v, %v), want cleared", ok, err)
+	}
+}
+
 // TestAbsenceReconcile_GapMutationDefersLegacyRetirement (Codex rounds
 // 19-20): a foreign mutation landing while the cursor is parked mid-range
 // breaks fence continuity — the resumed completion must NOT prove the

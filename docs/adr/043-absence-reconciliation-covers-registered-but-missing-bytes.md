@@ -197,9 +197,14 @@ only while covers survive until the NEXT attempt, Codex round 27) arms a
 durable admission fence that fails finite quota-gated
 admissions closed — unbounded restore/cover reservations stay exempt so
 recovery can proceed — until a healthy error-free pass advances both
-class rotations through one full recovery traversal past the fence's
-arming snapshot (persisted counters, frozen during failing passes, so
-wraps completed while renewal was still failing never count). A
+class rotations through one full CLEAN recovery traversal past the
+fence's arming snapshot (persisted clean-traversal counters, frozen
+during failing passes and never advanced by dirty or quota-off
+rotations, so wraps completed while renewal was failing — or spanning a
+pass whose stat/cover error only the persisted dirty flag remembers —
+never count, Codex round 31; a stale-cursor restart preserves the
+lifetime counters so an armed fence still releases after one clean
+rotation from origin instead of re-earning the whole history). A
 SUCCESSFUL touch arms the same fence when the prior watermark is absent
 or a full TTL old (Codex round 29): the strict-TTL update deliberately
 leaves already-lapsed rows dead, so continuity across a paused fleet or

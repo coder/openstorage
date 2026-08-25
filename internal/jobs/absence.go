@@ -387,6 +387,15 @@ type absenceCursorState struct {
 	AfterKey string `json:"after_key"`
 	// Traversals counts completed origin-to-origin rotations.
 	Traversals int64 `json:"traversals"`
+	// CleanTraversals counts completed rotations that hit NO stat or
+	// cover error in ANY contributing pass and ran with quota
+	// enforcement on (Codex round 31, P1): the admission fence releases
+	// only on this counter — a dirty rotation proves nothing about the
+	// rows whose stat or cover charge failed, and a quota-off rotation
+	// performs no cover maintenance at all. Dirty persists with the
+	// cursor, so an early pass's error poisons the whole multi-pass
+	// rotation for fence purposes.
+	CleanTraversals int64 `json:"clean_traversals"`
 	// Dirty records that the CURRENT traversal hit a stat or cover error
 	// somewhere; a dirty traversal cannot flip HasClean.
 	Dirty bool `json:"dirty"`
@@ -625,7 +634,21 @@ func (r *AbsenceReconciler) loadState(ctx context.Context, errs *boundedErrs) {
 			reason = "cursor outlived the cover-renewal guarantee"
 		}
 		if reason != "" {
-			*c.into = absenceCursorState{}
+			// Restart the POSITION only: the lifetime traversal counters
+			// survive (Codex round 31, P1). An armed admission fence
+			// snapshots those counters at arming — discarding them here
+			// would leave settleAdmissionFence comparing a restart-at-zero
+			// count against the old snapshot, blocking finite quota
+			// admissions for as many extra rotations as the job ever
+			// completed. Preserving them is safe in the fail-closed
+			// direction: release still requires the CLEAN counter to
+			// advance past the snapshot, and advancing it takes a complete
+			// error-free rotation from the origin this reset parks at.
+			*c.into = absenceCursorState{
+				Traversals:      c.into.Traversals,
+				CleanTraversals: c.into.CleanTraversals,
+				HasClean:        c.into.HasClean,
+			}
 			r.logger.Warn("absence reconcile: restarting rotation from origin", "scope", c.scope, "reason", reason)
 			continue
 		}
@@ -669,7 +692,7 @@ func (r *AbsenceReconciler) loadState(ctx context.Context, errs *boundedErrs) {
 		errs.add(fmt.Errorf("absence reconcile: read admission fence: %w", err))
 	} else if ok {
 		r.fenceArmed = true
-		r.fenceLFS, r.fencePacks = r.lfs.Traversals, r.packs.Traversals
+		r.fenceLFS, r.fencePacks = r.lfs.CleanTraversals, r.packs.CleanTraversals
 		var snap map[string]int64
 		if err := json.Unmarshal([]byte(st.Payload), &snap); err == nil {
 			r.fenceLFS, r.fencePacks = snap["lfs"], snap["packs"]
@@ -883,12 +906,13 @@ func (r *AbsenceReconciler) saveProofs(sctx context.Context, errs *boundedErrs) 
 // marker fails finite quota-gated admissions closed (see
 // ReserveDecision.RenewalDegraded) until settleAdmissionFence proves a
 // complete recovery rotation. Its payload snapshots the PERSISTED class
-// traversal counters — frozen during failing passes because saveState
-// suppresses cursor stamps — so wraps completed while renewal was still
-// failing can never count as recovery. Writes run on a bounded detached
-// context: the failure being reacted to may already have burned the pass
-// deadline. An unreadable watermark age arms too — the failure evidence
-// at hand outranks an unprovable freshness claim.
+// CLEAN traversal counters — frozen during failing passes because
+// saveState suppresses cursor stamps, and never advanced by dirty or
+// quota-off rotations (Codex round 31) — so wraps completed while
+// renewal was still failing can never count as recovery. Writes run on
+// a bounded detached context: the failure being reacted to may already
+// have burned the pass deadline. An unreadable watermark age arms too —
+// the failure evidence at hand outranks an unprovable freshness claim.
 func (r *AbsenceReconciler) armAdmissionFence(ctx context.Context, errs *boundedErrs) {
 	if !r.quotaEnforced {
 		return
@@ -917,31 +941,35 @@ func (r *AbsenceReconciler) armAdmissionFence(ctx context.Context, errs *bounded
 func (r *AbsenceReconciler) armFence(ctx context.Context, errs *boundedErrs, why string) bool {
 	sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), scanStateWriteTimeout)
 	defer cancel()
-	snap, mErr := json.Marshal(map[string]int64{"lfs": r.lfs.Traversals, "packs": r.packs.Traversals})
+	snap, mErr := json.Marshal(map[string]int64{"lfs": r.lfs.CleanTraversals, "packs": r.packs.CleanTraversals})
 	assertf(mErr == nil, "absence reconcile: marshal fence snapshot: %v", mErr)
 	if err := r.registry.PutJobScanState(sctx, ref.ScanJobAbsence, ref.ScanScopeAbsenceAdmissionFence, string(snap), 0); err != nil {
 		errs.add(fmt.Errorf("absence reconcile: arm admission fence: %w", err))
 		return false
 	}
-	r.fenceArmed, r.fenceLFS, r.fencePacks = true, r.lfs.Traversals, r.packs.Traversals
+	r.fenceArmed, r.fenceLFS, r.fencePacks = true, r.lfs.CleanTraversals, r.packs.CleanTraversals
 	r.logger.Warn("absence reconcile: "+why+" — finite quota admissions fenced until a complete recovery rotation",
-		"lfs_traversals", r.fenceLFS, "packs_traversals", r.fencePacks)
+		"lfs_clean_traversals", r.fenceLFS, "packs_clean_traversals", r.fencePacks)
 	return true
 }
 
 // settleAdmissionFence clears the admission fence after one healthy,
-// error-free pass has advanced BOTH persisted class traversal counters
-// past the marker's arming snapshot: a full origin-to-origin rotation of
-// each registry re-covered every registered-but-missing byte the lapse
-// may have uncovered (dirty ranges charge deficits as they go), so
-// strict-TTL admission arithmetic is trustworthy again. Runs after
-// saveState so the compared counters are the durably stamped ones.
+// error-free pass has advanced BOTH persisted class CLEAN traversal
+// counters past the marker's arming snapshot: a full origin-to-origin
+// rotation of each registry that hit no stat or cover error re-covered
+// every registered-but-missing byte the lapse may have uncovered (dirty
+// ranges charge deficits as they go), so strict-TTL admission arithmetic
+// is trustworthy again. A rotation any contributing pass dirtied never
+// counts (Codex round 31, P1): the failed row was neither verified nor
+// covered, and Dirty rides the persisted cursor across passes and
+// workers precisely so a later error-free pass cannot launder it. Runs
+// after saveState so the compared counters are the durably stamped ones.
 func (r *AbsenceReconciler) settleAdmissionFence(ctx context.Context, errs *boundedErrs) {
 	if !r.fenceArmed || !r.quotaEnforced || r.touchFailed || !errs.ok() {
 		return
 	}
-	if r.lfs.Traversals <= r.fenceLFS || r.packs.Traversals <= r.fencePacks {
-		return // recovery rotation not yet complete: stay fail-closed
+	if r.lfs.CleanTraversals <= r.fenceLFS || r.packs.CleanTraversals <= r.fencePacks {
+		return // clean recovery rotation not yet complete: stay fail-closed
 	}
 	sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), scanStateWriteTimeout)
 	defer cancel()
@@ -1757,6 +1785,13 @@ func (r *AbsenceReconciler) tickTraversal(cur *absenceCursorState, class string,
 	clean := !cur.Dirty
 	if clean {
 		cur.HasClean = true
+		if r.quotaEnforced {
+			// Only quota-enforced clean rotations count toward fence
+			// release (Codex round 31): quota-off passes advance the
+			// cursor but perform no cover maintenance, so their wraps
+			// prove nothing about admission arithmetic.
+			cur.CleanTraversals++
+		}
 	}
 	r.logger.Info("absence reconcile: rotation traversal completed",
 		"class", class, "traversal", cur.Traversals, "clean", clean)
