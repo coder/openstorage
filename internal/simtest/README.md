@@ -29,7 +29,16 @@ processes on a host):
   sim steps, no real git), with seeded crash injection between claim and
   finish; node crashes kill the node's in-flight runs too. The meta store
   runs on the simulation's logical clock (`meta.WithNowFunc`), so lease
-  expiry is a pure function of the seed.
+  expiry is a pure function of the seed;
+- **outbound push-forward claim leases and pending markers** (issue #136,
+  `push-request` / `push-claim` / `push-rescue`): the push_* lane PR #137
+  added, driven the same way (RequestPush/TryBeginPush/FinishPush against
+  the real meta store on the logical clock) with seeded transfer outcomes
+  mirroring the worker's failure taxonomy — success, transient failure
+  (the actor re-marks the durable pending level with the run's force,
+  like `schedulePushRetry`), terminal non-FF rejection (no retry) — plus
+  a boot-recovery op mirroring local-mode rescue (`PendingPushRepoIDs` +
+  plain re-mark).
 
 Storage calls pass through `SimRefStore`/`SimBlobStore`, which inject:
 
@@ -74,7 +83,25 @@ Checked from clean (never fault-injected) handles:
    pending marker, and both counters — so any unmodeled change violates at
    the next observation; and after quiescence (clock jumped past every
    lease) one final claim per repo must succeed and finish cleanly — a
-   refusal is exactly the pre-#86 wedged row.
+   refusal is exactly the pre-#86 wedged row;
+8. **sync-forward oracle over the outbound lane** (issue #136,
+   `push_ops.go`), the four #136 invariants: *convergence* — refs are
+   abstracted to a per-repo version counter (requests bump it, claims
+   snapshot it, successful finishes cover through their snapshot); at
+   quiescence every accepted request must be covered by a postdating
+   successful run, terminally rejected, or still carried by the pending
+   marker or an orphaned claim, and the final claim+finish converges
+   covered == local; *force monotonicity* — the pending level only
+   coalesces upward until a claim consumes it whole, the force
+   TryBeginPush reports must equal the model mandate (marker force OR
+   inherited from a dead claim's persisted `push_claim_force`), and the
+   `push-rescue` op exercises the documented plain re-mark downgrade whose
+   mandate must survive on the claim row alone; *lease safety* — the #88
+   liveness/steal/late-finish choreography, push edition; *lane isolation*
+   — one shared full-row mirror (`checkUpstreamMirror`) compares every
+   sync_* AND push_* column after every mutation point in either lane, so
+   a pull-lane transition touching push-lane columns (or vice versa)
+   violates at the next observation.
 
 ## Entry points
 
@@ -120,10 +147,20 @@ The harness must catch re-broken variants of the fixes it guards. Locally
   guard to `if prev.Syncing {`) — the sweep reports an `issue-#88 lease
   liveness` violation on the first claim attempt after a crashed holder's
   lease expires (and an `issue-#88 quiescence` violation on seeds whose
-  crashes go unprobed in-run).
+  crashes go unprobed in-run);
+- break the #136 rescue semantics: make `TryBeginPush` in
+  `internal/meta/sqlite_eventing.go` not inherit the dead claim's force
+  (change the mandate to `force = prev.PushPending == 2`) — the sweep
+  reports an `issue-#136 force monotonicity` violation on the first steal
+  of a crashed forced claim;
+- break #136 lane isolation: make `FinishSync` also reset a push-lane
+  column (e.g. add `push_claim_force = 0` to its UPDATE) — the shared
+  full-row mirror reports a push-claim-state divergence at the next
+  observation after a sync finish overlapping a forced push claim.
 
-The first two were validated when this harness landed and the #86 one when
-the sync oracle landed; the landing PRs document the detecting seeds.
+The first two were validated when this harness landed, the #86 one when
+the sync oracle landed, and the #136 ones when the push-lane oracle
+landed; the landing PRs document the detecting seeds.
 
 ## Determinism rules
 

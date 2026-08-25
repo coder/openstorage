@@ -16,8 +16,9 @@ import (
 // reproduction instructions.
 func reportRun(t *testing.T, res Result) {
 	t.Helper()
-	t.Logf("seed=%d steps=%d trace=%s transitions=%d deliveries=%d faults=%d steals=%d crash-steals=%d",
-		res.Seed, res.Steps, res.TraceHash, res.Transitions, res.Deliveries, res.Faults, res.Steals, res.CrashSteals)
+	t.Logf("seed=%d steps=%d trace=%s transitions=%d deliveries=%d faults=%d steals=%d crash-steals=%d push-steals=%d push-crash-steals=%d push-forced-rescues=%d",
+		res.Seed, res.Steps, res.TraceHash, res.Transitions, res.Deliveries, res.Faults, res.Steals, res.CrashSteals,
+		res.PushSteals, res.PushCrashSteals, res.PushForcedRescues)
 	if len(res.Violations) == 0 {
 		return
 	}
@@ -31,7 +32,7 @@ func reportRun(t *testing.T, res Result) {
 // TestDSTFast is the PR-gate run: a fixed handful of seeds inside a small
 // time budget. The extended sweep lives in TestDSTSweep (nightly).
 func TestDSTFast(t *testing.T) {
-	crashSteals := 0
+	crashSteals, pushCrashSteals, pushForcedRescues := 0, 0, 0
 	for _, seed := range []uint64{1, 2, 3} {
 		res, err := Run(Config{Seed: seed, Steps: 120})
 		if err != nil {
@@ -44,6 +45,8 @@ func TestDSTFast(t *testing.T) {
 			t.Errorf("seed %d: suspiciously quiet run: %+v", seed, res)
 		}
 		crashSteals += res.CrashSteals
+		pushCrashSteals += res.PushCrashSteals
+		pushForcedRescues += res.PushForcedRescues
 	}
 	// The sync claim-lease lane must not be vacuous either: across the
 	// fixed fast seeds, at least one claim whose holder actually CRASHED
@@ -52,6 +55,16 @@ func TestDSTFast(t *testing.T) {
 	// count, so this fails if crash injection goes dead).
 	if crashSteals == 0 {
 		t.Errorf("no dead-holder sync claim steals across the fast seeds: the #88 crash-injection lane is vacuous")
+	}
+	// Same for the outbound lane (issue #136): dead-holder push steals
+	// must occur, and at least one of them must have rescued a force
+	// mandate carried ONLY by the dead claim's push_claim_force — the
+	// inheritance class the force-monotonicity oracle exists for.
+	if pushCrashSteals == 0 {
+		t.Errorf("no dead-holder push claim steals across the fast seeds: the #136 crash-injection lane is vacuous")
+	}
+	if pushForcedRescues == 0 {
+		t.Errorf("no force-inheriting push claim steals across the fast seeds: the #136 rescue lane is vacuous")
 	}
 }
 

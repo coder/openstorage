@@ -212,17 +212,20 @@ func (s *sim) checkSyncRow(ctx context.Context, repoKey string, now time.Time, o
 			s.step, op, repoKey, cur.SyncClaimHolder, cur.SyncClaimExpiresAt, now)
 		return nil
 	}
-	return s.checkSyncMirror(ctx, repoKey, op)
+	return s.checkUpstreamMirror(ctx, repoKey, op)
 }
 
-// checkSyncMirror compares the repo's row field-for-field against the
-// model: claim state (syncing/holder/expiry), the pending marker, and both
-// counters. Called after every sync mutation point once the model reflects
-// the intended outcome, it turns ANY unmodeled field change — by a claim,
-// a refusal, a finish, or a late finisher — into a violation at the very
-// next observation. One uniform check instead of per-call-site field
-// lists, so no observation point can miss a field.
-func (s *sim) checkSyncMirror(ctx context.Context, repoKey, op string) error {
+// checkUpstreamMirror compares the repo's row field-for-field against the
+// model, BOTH lanes at once: claim state (syncing/holder/expiry, plus the
+// push lane's persisted force mandate), the pending markers, and all four
+// counters. Called after every sync- or push-lane mutation point once the
+// model reflects the intended outcome, it turns ANY unmodeled field change
+// — by a claim, a refusal, a finish, or a late finisher, in EITHER lane —
+// into a violation at the very next observation. One uniform check instead
+// of per-call-site field lists, so no observation point can miss a field
+// and no lane transition can silently touch the other lane's columns
+// (issue #136 lane isolation).
+func (s *sim) checkUpstreamMirror(ctx context.Context, repoKey, op string) error {
 	cur, err := s.cl.oracleMeta.GetRepoUpstream(ctx, repoKey)
 	if err != nil {
 		return fmt.Errorf("step %d: oracle GetRepoUpstream %s: %w", s.step, repoKey, err)
@@ -244,6 +247,27 @@ func (s *sim) checkSyncMirror(ctx context.Context, repoKey, op string) error {
 	if cur.RunCount != s.syncRunCount[repoKey] || cur.SuccessCount != s.syncSuccessCount[repoKey] {
 		s.violate("step %d: %s: %s counters %d/%d, model %d/%d",
 			s.step, op, repoKey, cur.RunCount, cur.SuccessCount, s.syncRunCount[repoKey], s.syncSuccessCount[repoKey])
+		return nil
+	}
+	wantPSyncing, wantPHolder, wantPExpires, wantPForce := false, "", time.Unix(0, 0).UTC(), false
+	if cl := s.pushClaims[repoKey]; cl != nil {
+		wantPSyncing, wantPHolder, wantPExpires, wantPForce = true, cl.holder, cl.expires, cl.force
+	}
+	if cur.PushSyncing != wantPSyncing || cur.PushClaimHolder != wantPHolder ||
+		!cur.PushClaimExpiresAt.Equal(wantPExpires) || cur.PushClaimForce != wantPForce {
+		s.violate("step %d: %s: %s push claim state (syncing=%t holder=%q expires=%v force=%t) diverged from the model (syncing=%t holder=%q expires=%v force=%t)",
+			s.step, op, repoKey, cur.PushSyncing, cur.PushClaimHolder, cur.PushClaimExpiresAt, cur.PushClaimForce,
+			wantPSyncing, wantPHolder, wantPExpires, wantPForce)
+		return nil
+	}
+	if cur.PushPending != s.pushPending[repoKey] {
+		s.violate("step %d: %s: %s push pending level %d, model %d",
+			s.step, op, repoKey, cur.PushPending, s.pushPending[repoKey])
+		return nil
+	}
+	if cur.PushRunCount != s.pushRunCount[repoKey] || cur.PushSuccessCount != s.pushSuccessCount[repoKey] {
+		s.violate("step %d: %s: %s push counters %d/%d, model %d/%d",
+			s.step, op, repoKey, cur.PushRunCount, cur.PushSuccessCount, s.pushRunCount[repoKey], s.pushSuccessCount[repoKey])
 	}
 	return nil
 }
@@ -259,7 +283,7 @@ func (s *sim) doSyncRequest(name string, node *simNode, repo *simRepo) error {
 		return fmt.Errorf("step %d: RequestSync %s: %w", s.step, repo.key, err)
 	}
 	s.syncPending[repo.key] = true
-	if err := s.checkSyncMirror(ctx, repo.key, "sync-request"); err != nil {
+	if err := s.checkUpstreamMirror(ctx, repo.key, "sync-request"); err != nil {
 		return err
 	}
 	s.tracef("step=%04d op=%s node=%d repo=%s out=ok", s.step, name, node.id, repo.key)
@@ -323,7 +347,7 @@ func (s *sim) finishSyncRun(ctx context.Context, run *simSyncRun) error {
 			s.syncSuccessCount[run.repo]++
 		}
 		delete(s.syncClaims, run.repo)
-		if err := s.checkSyncMirror(ctx, run.repo, "sync-finish"); err != nil {
+		if err := s.checkUpstreamMirror(ctx, run.repo, "sync-finish"); err != nil {
 			return err
 		}
 		outcome = fmt.Sprintf("finished ok=%t", run.success)
@@ -335,7 +359,7 @@ func (s *sim) finishSyncRun(ctx context.Context, run *simSyncRun) error {
 		}
 		// The late finisher must have changed nothing: the mirror still
 		// expects the thief's claim, counters, and pending marker intact.
-		if err := s.checkSyncMirror(ctx, run.repo, "sync-finish-late"); err != nil {
+		if err := s.checkUpstreamMirror(ctx, run.repo, "sync-finish-late"); err != nil {
 			return err
 		}
 		outcome = "claim-lost"
@@ -347,7 +371,7 @@ func (s *sim) finishSyncRun(ctx context.Context, run *simSyncRun) error {
 				s.step, run.repo, run.holder, run.stolen, describeClaim(s.syncClaims[run.repo], s.simNow()))
 			return nil
 		}
-		if err := s.checkSyncMirror(ctx, run.repo, "sync-finish-late"); err != nil {
+		if err := s.checkUpstreamMirror(ctx, run.repo, "sync-finish-late"); err != nil {
 			return err
 		}
 		outcome = "claim-gone"
@@ -416,7 +440,7 @@ func (s *sim) checkSyncFinal() error {
 		// leaking into them violates here.
 		s.syncClaims[repo.key] = &simSyncClaim{holder: holder, expires: now.Add(simSyncLease)}
 		s.syncPending[repo.key] = false
-		if err := s.checkSyncMirror(ctx, repo.key, "sync-quiesce-claim"); err != nil {
+		if err := s.checkUpstreamMirror(ctx, repo.key, "sync-quiesce-claim"); err != nil {
 			return err
 		}
 		if s.stopped {
@@ -429,7 +453,7 @@ func (s *sim) checkSyncFinal() error {
 		s.syncRunCount[repo.key]++
 		s.syncSuccessCount[repo.key]++
 		delete(s.syncClaims, repo.key)
-		if err := s.checkSyncMirror(ctx, repo.key, "sync-quiesce-finish"); err != nil {
+		if err := s.checkUpstreamMirror(ctx, repo.key, "sync-quiesce-finish"); err != nil {
 			return err
 		}
 		if s.stopped {
