@@ -362,13 +362,13 @@ func (s *sim) result() Result {
 		executed = s.cfg.Steps
 	}
 	return Result{
-		Seed:        s.cfg.Seed,
-		Steps:       executed,
-		TraceHash:   hex.EncodeToString(s.hasher.Sum(nil)),
-		Violations:  s.violations,
-		Transitions: len(s.observed),
-		Deliveries:  len(s.cl.rec.all()),
-		Faults:      len(s.inj.Fired()),
+		Seed:              s.cfg.Seed,
+		Steps:             executed,
+		TraceHash:         hex.EncodeToString(s.hasher.Sum(nil)),
+		Violations:        s.violations,
+		Transitions:       len(s.observed),
+		Deliveries:        len(s.cl.rec.all()),
+		Faults:            len(s.inj.Fired()),
 		Steals:            s.syncSteals,
 		CrashSteals:       s.syncCrashSteals,
 		PushSteals:        s.pushSteals,
