@@ -32,6 +32,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -511,32 +512,38 @@ func surfaceRawRoundTrip(t *testing.T, e *qualEnv) []verdict {
 
 // gocloudWriteReadBack writes content through the gocloud writer and
 // verifies readback size + SHA-256 digest (never assuming multipart ETag ==
-// MD5).
-func gocloudWriteReadBack(t *testing.T, e *qualEnv, name, key string, content []byte, opts *gcblob.WriterOptions) []verdict {
+// MD5). The stored object's raw-SDK HeadObject ETag is returned alongside
+// the verdicts ("" on failure) so callers can record path evidence such as
+// the multipart part-count suffix.
+func gocloudWriteReadBack(t *testing.T, e *qualEnv, name, key string, content []byte, opts *gcblob.WriterOptions) ([]verdict, string) {
 	t.Helper()
 	ctx := context.Background()
 	w, err := e.gcb.NewWriter(ctx, key, opts)
 	if err != nil {
-		return []verdict{{name, verdictError, fmt.Sprintf("NewWriter: %v", err)}}
+		return []verdict{{name, verdictError, fmt.Sprintf("NewWriter: %v", err)}}, ""
 	}
 	if _, err := w.Write(content); err != nil {
 		_ = w.Close()
-		return []verdict{{name, rejectVerdict(err), fmt.Sprintf("Write: %v", err)}}
+		return []verdict{{name, rejectVerdict(err), fmt.Sprintf("Write: %v", err)}}, ""
 	}
 	if err := w.Close(); err != nil {
-		return []verdict{{name, rejectVerdict(err), fmt.Sprintf("Close: %v", err)}}
+		return []verdict{{name, rejectVerdict(err), fmt.Sprintf("Close: %v", err)}}, ""
 	}
 	back, err := e.gcb.ReadAll(ctx, key)
 	if err != nil {
-		return []verdict{{name, verdictError, fmt.Sprintf("ReadAll: %v", err)}}
+		return []verdict{{name, verdictError, fmt.Sprintf("ReadAll: %v", err)}}, ""
 	}
 	if len(back) != len(content) || sha256.Sum256(back) != sha256.Sum256(content) {
-		return []verdict{{name, verdictMishandles, fmt.Sprintf("readback %d bytes, want %d with identical SHA-256", len(back), len(content))}}
+		return []verdict{{name, verdictMishandles, fmt.Sprintf("readback %d bytes, want %d with identical SHA-256", len(back), len(content))}}, ""
+	}
+	head, err := e.raw.HeadObject(ctx, &s3.HeadObjectInput{Bucket: aws.String(e.bucket), Key: aws.String(key)})
+	if err != nil {
+		return []verdict{{name, verdictError, fmt.Sprintf("HeadObject for ETag evidence: %v", err)}}, ""
 	}
 	if err := e.gcb.Delete(ctx, key); err != nil {
-		return []verdict{{name, verdictError, fmt.Sprintf("Delete: %v", err)}}
+		return []verdict{{name, verdictError, fmt.Sprintf("Delete: %v", err)}}, ""
 	}
-	return []verdict{vPass(name)}
+	return []verdict{vPass(name)}, aws.ToString(head.ETag)
 }
 
 func surfaceGocloudSmall(t *testing.T, e *qualEnv) []verdict {
@@ -545,26 +552,47 @@ func surfaceGocloudSmall(t *testing.T, e *qualEnv) []verdict {
 	if _, err := rand.Read(content); err != nil {
 		t.Fatal(err)
 	}
-	return gocloudWriteReadBack(t, e, "gocloud-write-small", e.prefix+"gocloud-small-"+randomHexTB(t, 4), content, nil)
+	vs, _ := gocloudWriteReadBack(t, e, "gocloud-write-small", e.prefix+"gocloud-small-"+randomHexTB(t, 4), content, nil)
+	return vs
 }
 
-// surfaceGocloudMultipart forces the multipart path deterministically:
-// BufferSize is the s3blob part size, so 12 MiB at 5 MiB parts is ≥3 parts
-// by construction, not inference.
+// surfaceGocloudMultipart forces the multipart path deterministically. The
+// vendored transfer manager takes the multipart path only when the body
+// reaches its FIXED 16 MiB MultipartUploadThreshold — independent of the
+// part size, and not configurable through gocloud (s3blob's
+// WriterOptions.BufferSize sets only PartSizeBytes) — so the body must
+// exceed 16 MiB: 20 MiB at 5 MiB parts is exactly 4 parts by construction.
+// (A previous 12 MiB body sat under the threshold and was silently
+// uploaded as one PutObject — the surface passed without exercising
+// multipart at all.) The stored ETag's shape is recorded as store-side
+// evidence of which path ran; the hard assertions remain readback size +
+// SHA-256.
 func surfaceGocloudMultipart(t *testing.T, e *qualEnv) []verdict {
 	t.Helper()
-	content := make([]byte, 12<<20)
+	content := make([]byte, 20<<20)
 	if _, err := rand.Read(content); err != nil {
 		t.Fatal(err)
 	}
-	vs := gocloudWriteReadBack(t, e, "gocloud-write-multipart", e.prefix+"gocloud-multipart-"+randomHexTB(t, 4),
+	vs, etag := gocloudWriteReadBack(t, e, "gocloud-write-multipart", e.prefix+"gocloud-multipart-"+randomHexTB(t, 4),
 		content, &gcblob.WriterOptions{BufferSize: 5 << 20})
 	for i := range vs {
 		if vs[i].class == verdictPass {
-			vs[i].detail = "forced multipart: 12 MiB body at 5 MiB part size (≥3 parts)"
+			vs[i].detail = "forced multipart: 20 MiB body above the transfer manager's fixed 16 MiB threshold at 5 MiB part size (4 parts); " +
+				multipartETagEvidence(etag)
 		}
 	}
 	return vs
+}
+
+// multipartETagEvidence describes the stored ETag's shape: S3-compatible
+// stores mark multipart-assembled objects with a `-<partCount>` ETag
+// suffix. A store may legitimately use another shape, so the observed form
+// is recorded as evidence rather than hard-failed.
+func multipartETagEvidence(etag string) string {
+	if m := regexp.MustCompile(`-([0-9]+)"?$`).FindStringSubmatch(etag); m != nil {
+		return fmt.Sprintf("stored ETag %s carries the multipart part-count suffix (%s parts)", etag, m[1])
+	}
+	return fmt.Sprintf("stored ETag %s has no multipart part-count suffix (store-specific shape)", etag)
 }
 
 // surfaceGocloudIfNotExist: the gocloud IfNotExist duplicate-write must be
