@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 )
 
 func scanStateStore(t *testing.T, s Store) ScanStateStore {
@@ -27,6 +29,7 @@ type absenceCoverStore interface {
 	Store
 	RenewAbsenceCovers(ctx context.Context, ttl time.Duration) (int64, error)
 	CASAbsenceCoverOwner(ctx context.Context, rawKey, expectedOwner string, expectedBytes int64, newOwner string) (bool, error)
+	LapsedAbsenceCoverExists(ctx context.Context, ttl time.Duration) (bool, error)
 	ListAbsenceCovers(ctx context.Context, afterRaw string, limit int, ttl time.Duration) ([]AbsenceCoverRow, error)
 	AbsenceCoverHead(ctx context.Context, prefix string, ttl time.Duration) (AbsenceCoverRow, bool, error)
 	DeleteAbsenceCover(ctx context.Context, key string) error
@@ -280,6 +283,95 @@ func TestAbsenceCovers_ListHeadDelete(t *testing.T) {
 			t.Fatalf("head after delete = (%+v, %v, %v), want the e1 row", head, ok, err)
 		}
 	})
+}
+
+// TestLapsedAbsenceCoverExists (Codex round 32 on PR #132, security): the
+// probe backing evidence-based fence arming — a physically present cover
+// row aged past the ttl is lapse evidence; live rows, folded nonces
+// (deliberate decay), and foreign reservation spellings are not. The
+// probe is deliberately fleet-global (one boolean over the whole cover
+// keyspace), so the strict empty/foreign/folded assertions need a
+// PRIVATE keyspace: the shared pg lane hosts sibling tests' cover rows,
+// all "expired" under a nanosecond window. The sqlite lane is fresh per
+// test; the pg lane gets a dedicated database on the package container.
+func TestLapsedAbsenceCoverExists(t *testing.T) {
+	t.Run("pg", func(t *testing.T) {
+		pgTestStore(t) // boot the package container
+		ctx := context.Background()
+		conn, err := pgx.Connect(ctx, pgTestURL)
+		if err != nil {
+			t.Fatalf("connect: %v", err)
+		}
+		if _, err := conn.Exec(ctx, "CREATE DATABASE lapsed_probe"); err != nil {
+			t.Fatalf("create database: %v", err)
+		}
+		_ = conn.Close(ctx)
+		privURL := strings.Replace(pgTestURL, "/postgres?", "/lapsed_probe?", 1)
+		if privURL == pgTestURL {
+			t.Fatalf("could not derive a private database URL from %q", pgTestURL)
+		}
+		s, err := OpenPG(ctx, privURL)
+		if err != nil {
+			t.Fatalf("open private pg: %v", err)
+		}
+		t.Cleanup(s.Close)
+		if err := s.InitSchema(ctx); err != nil {
+			t.Fatalf("init schema: %v", err)
+		}
+		testLapsedAbsenceCoverExists(t, s)
+	})
+	t.Run("sqlite", func(t *testing.T) {
+		s, _ := openTestSQLite(t)
+		testLapsedAbsenceCoverExists(t, s)
+	})
+}
+
+func testLapsedAbsenceCoverExists(t *testing.T, s Store) {
+	{
+		cs := coverStore(t, s)
+		ctx := context.Background()
+		k := newLedgerKit(t, s)
+		base := k.base()
+
+		// Empty keyspace: no evidence.
+		if ok, err := cs.LapsedAbsenceCoverExists(ctx, time.Nanosecond); err != nil || ok {
+			t.Fatalf("empty probe = (%v, %v), want false", ok, err)
+		}
+		// A foreign spelling under the prefix is never evidence, however
+		// old.
+		foreign := AbsenceCoverPrefix + base + "/zz-foreign"
+		if dec, err := s.ReservePackBytes(ctx, k.group, []Pack{{Key: foreign, Size: 5}}, NewReservationOwner(), 0, ReserveNoFloorGen, 1<<40, time.Hour); err != nil || !dec.OK {
+			t.Fatalf("plant foreign row: (%+v, %v)", dec, err)
+		}
+		if ok, err := cs.LapsedAbsenceCoverExists(ctx, time.Nanosecond); err != nil || ok {
+			t.Fatalf("foreign-only probe = (%v, %v), want false", ok, err)
+		}
+		// A cover row is not evidence within its liveness window, and IS
+		// once the window elapses (the row was stamped in the past, so a
+		// nanosecond window has always elapsed — no sleeping).
+		legacyKey := AbsenceCoverPrefix + base + "/0123456789abcdef0123"
+		if err := ReserveRestoreCover(ctx, s, k.group, legacyKey, 30, time.Hour); err != nil {
+			t.Fatalf("cover: %v", err)
+		}
+		if ok, err := cs.LapsedAbsenceCoverExists(ctx, time.Hour); err != nil || ok {
+			t.Fatalf("live probe = (%v, %v), want false", ok, err)
+		}
+		if ok, err := cs.LapsedAbsenceCoverExists(ctx, time.Nanosecond); err != nil || !ok {
+			t.Fatalf("elapsed probe = (%v, %v), want true", ok, err)
+		}
+		// Folding the nonce removes it from evidence: its decay is
+		// deliberate retirement, not a lapse.
+		listed, err := cs.ListAbsenceCovers(ctx, "", 10, time.Hour)
+		if err != nil || len(listed) != 1 {
+			t.Fatalf("list = (%+v, %v), want the nonce", listed, err)
+		}
+		if ok, err := cs.CASAbsenceCoverOwner(ctx, listed[0].RawKey, listed[0].Owner, listed[0].Bytes, AbsenceFoldedOwner); err != nil || !ok {
+			t.Fatalf("fold = (%v, %v)", ok, err)
+		}
+		if ok, err := cs.LapsedAbsenceCoverExists(ctx, time.Nanosecond); err != nil || ok {
+			t.Fatalf("folded probe = (%v, %v), want false", ok, err)
+		}
+	}
 }
 
 // TestRetireUnreferencedLFSObject_ReapWatermarkGate (issue #120): the

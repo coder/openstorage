@@ -146,6 +146,26 @@ WHERE key > ? AND key < ?
 	return total + n, nil
 }
 
+// LapsedAbsenceCoverExists — see the PG twin (Codex round 32, security).
+func (s *SQLite) LapsedAbsenceCoverExists(ctx context.Context, ttl time.Duration) (bool, error) {
+	assertf(ttl > 0, "LapsedAbsenceCoverExists: non-positive ttl %v", ttl)
+	var exists bool
+	err := s.db.QueryRowContext(ctx, `
+SELECT EXISTS (
+  SELECT 1 FROM pack_reservations
+  WHERE key > ? AND key < ?
+    AND substr(key, -?) = ?
+    AND owner <> ?
+    AND created_at <= `+sqliteEpochMS+` - ?)`,
+		AbsenceCoverPrefix, absenceCoverRangeEnd,
+		len(absenceCoverRawSuffix), absenceCoverRawSuffix,
+		AbsenceFoldedOwner, ttl.Milliseconds()).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("lapsed absence cover exists: %w", err)
+	}
+	return exists, nil
+}
+
 // CASAbsenceCoverOwner — see the PG twin.
 func (s *SQLite) CASAbsenceCoverOwner(ctx context.Context, rawKey, expectedOwner string, expectedBytes int64, newOwner string) (bool, error) {
 	assertf(strings.HasPrefix(rawKey, AbsenceCoverPrefix), "CASAbsenceCoverOwner(%q)", rawKey)

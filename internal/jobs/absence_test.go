@@ -1202,10 +1202,12 @@ func TestAbsenceReconcile_UnprovableContinuitySuccessArmsFence(t *testing.T) {
 		f.upload(key, strings.Repeat("x", 10))
 	}
 
-	// Pass 1: the touch succeeds but NO health watermark exists —
-	// continuity is unprovable, so the fence arms and health stamps.
+	// Pass 1: the touch succeeds but NO health watermark exists AND the
+	// lapse probe finds an expired cover (injected) — recovery, so the
+	// fence arms and health stamps. Without evidence the absent
+	// watermark alone must not arm (round 32; see the upgrade test).
 	pinLFSLeader(t, f)
-	rec := testReconciler(t, f, true, 12)
+	rec := NewAbsenceReconciler(&lapsedRegistry{reg}, f.blobs, true, 12, time.Hour, time.Minute, slog.New(slog.DiscardHandler))
 	if _, err := rec.Run(ctx); err != nil {
 		t.Fatalf("pass 1: %v", err)
 	}
@@ -1251,6 +1253,58 @@ func TestAbsenceReconcile_UnprovableContinuitySuccessArmsFence(t *testing.T) {
 	}
 }
 
+// TestAbsenceReconcile_UpgradeFirstPassKeepsAdmissionOpen (Codex round
+// 32, security): the very first pass under this feature finds no
+// renewal-health watermark — the upgrade/first-enable signature, not
+// lapse evidence. With no expired cover row present the fleet-global
+// admission fence must NOT arm: on a multi-pass registry it would
+// reject EVERY tenant's finite reservations until a later scheduled
+// pass completes the recovery rotation. Health stamps and finite
+// admission stays open.
+func TestAbsenceReconcile_UpgradeFirstPassKeepsAdmissionOpen(t *testing.T) {
+	f := newSweepFixture(t)
+	ctx := context.Background()
+	reg := absenceRegistry(t, f)
+	// Multi-pass keyspace: an armed fence would outlive this pass.
+	for i := 0; i < 30; i++ {
+		key := blob.LFSKey("a-fill", strings.Repeat(fmt.Sprintf("%02x", i), 32))
+		registerLFS(t, f, "a-fill", key, 10)
+		f.upload(key, strings.Repeat("x", 10))
+	}
+	pinLFSLeader(t, f)
+	rec := testReconciler(t, f, true, 12)
+	if _, err := rec.Run(ctx); err != nil {
+		t.Fatalf("first pass: %v", err)
+	}
+	if _, ok, err := reg.GetJobScanState(ctx, ref.ScanJobAbsence, ref.ScanScopeAbsenceAdmissionFence); err != nil || ok {
+		t.Fatalf("fence after evidence-free first pass = (ok=%v, %v), want NOT armed", ok, err)
+	}
+	if _, ok, err := reg.GetJobScanState(ctx, ref.ScanJobAbsence, ref.ScanScopeAbsenceRenewalHealth); err != nil || !ok {
+		t.Fatalf("health watermark = (ok=%v, %v), want stamped", ok, err)
+	}
+	res, ok := f.store.(ref.RestoreCoverStore)
+	if !ok {
+		t.Fatalf("store %T lacks ReservePackBytes", f.store)
+	}
+	dec, err := res.ReservePackBytes(ctx, blob.QuotaRepoGroup("a-fill"),
+		[]ref.Pack{{Key: blob.PackKey("a-fill", "p1"), Size: 10}}, ref.NewReservationOwner(),
+		0, ref.ReserveNoFloorGen, 10_000, time.Hour)
+	if err != nil || !dec.OK || dec.RenewalDegraded {
+		t.Fatalf("first-pass finite reserve = (%+v, %v), want admitted", dec, err)
+	}
+}
+
+// lapsedRegistry injects positive lapse evidence: the probe consulted at
+// a first health stamp (Codex round 32, security) reports an expired
+// cover row exists, so absent-watermark arming proceeds.
+type lapsedRegistry struct {
+	AbsenceRegistry
+}
+
+func (lr *lapsedRegistry) LapsedAbsenceCoverExists(context.Context, time.Duration) (bool, error) {
+	return true, nil
+}
+
 // failFenceArmRegistry injects one transient failure into the
 // admission-fence arm write, leaving every other scan-state write intact.
 type failFenceArmRegistry struct {
@@ -1277,7 +1331,7 @@ func TestAbsenceReconcile_FailedFenceArmSuppressesHealthStamp(t *testing.T) {
 	f := newSweepFixture(t)
 	ctx := context.Background()
 	reg := absenceRegistry(t, f)
-	fr := &failFenceArmRegistry{AbsenceRegistry: reg, fail: true}
+	fr := &failFenceArmRegistry{AbsenceRegistry: &lapsedRegistry{reg}, fail: true}
 	r := NewAbsenceReconciler(fr, f.blobs, true, 100, time.Hour, time.Minute, slog.New(slog.DiscardHandler))
 	if _, err := r.Run(ctx); err == nil {
 		t.Fatal("Run 1: want the injected fence-arm failure reported")
@@ -1320,12 +1374,12 @@ func TestAbsenceReconcile_DirtyRecoveryRotationKeepsFenceArmed(t *testing.T) {
 		}
 	}
 
-	// Pass 1: no health watermark — the fence arms (unprovable
-	// continuity) with a zero clean-counter snapshot. The missing row's
+	// Pass 1: no health watermark and injected lapse evidence — the
+	// fence arms with a zero clean-counter snapshot. The missing row's
 	// deficit charge fails (settle, then the range-end retry), so the
 	// rotation is durably DIRTY.
 	pinLFSLeader(t, f)
-	flaky := &flakyRegistry{AbsenceRegistry: reg, failLeft: 2}
+	flaky := &flakyRegistry{AbsenceRegistry: &lapsedRegistry{reg}, failLeft: 2}
 	rec := NewAbsenceReconciler(flaky, f.blobs, true, 12, time.Hour, time.Minute, slog.New(slog.DiscardHandler))
 	if _, err := rec.Run(ctx); err == nil {
 		t.Fatal("pass 1: want the injected charge failures reported")
@@ -1407,14 +1461,14 @@ func TestAbsenceReconcile_StaleCursorRestartPreservesFenceCounters(t *testing.T)
 		t.Fatal("no clean traversals accumulated")
 	}
 
-	// Deleting the health watermark makes pass 4's SUCCESSFUL touch
-	// unprovable — the fence arms with the accumulated counters as its
-	// snapshot, and the budget-starved pass parks mid-rotation without
-	// settling. Health is freshly restamped.
+	// Deleting the health watermark plus injected lapse evidence makes
+	// pass 4's SUCCESSFUL touch arm the fence with the accumulated
+	// counters as its snapshot; the budget-starved pass parks
+	// mid-rotation without settling. Health is freshly restamped.
 	if err := reg.DeleteJobScanState(ctx, ref.ScanJobAbsence, ref.ScanScopeAbsenceRenewalHealth); err != nil {
 		t.Fatalf("drop health watermark: %v", err)
 	}
-	rec4 := testReconciler(t, f, true, 4)
+	rec4 := NewAbsenceReconciler(&lapsedRegistry{reg}, f.blobs, true, 4, time.Hour, time.Minute, slog.New(slog.DiscardHandler))
 	if _, err := rec4.Run(ctx); err != nil {
 		t.Fatalf("pass 4: %v", err)
 	}

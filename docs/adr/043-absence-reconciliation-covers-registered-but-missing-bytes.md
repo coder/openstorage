@@ -205,11 +205,20 @@ pass whose stat/cover error only the persisted dirty flag remembers —
 never count, Codex round 31; a stale-cursor restart preserves the
 lifetime counters so an armed fence still releases after one clean
 rotation from origin instead of re-earning the whole history). A
-SUCCESSFUL touch arms the same fence when the prior watermark is absent
-or a full TTL old (Codex round 29): the strict-TTL update deliberately
+SUCCESSFUL touch arms the same fence when the prior watermark EXISTS but
+is a full TTL old (Codex round 29): the strict-TTL update deliberately
 leaves already-lapsed rows dead, so continuity across a paused fleet or
-a quota-off period is unprovable and health must not be stamped
-unfenced — the fence arms first, then the stamp records the touch.
+a quota-off period (nothing deletes the health row; it ages) is
+unprovable and health must not be stamped unfenced — the fence arms
+first, then the stamp records the touch. An ABSENT watermark is the
+upgrade/first-enable signature, not fleet-wide lapse evidence (Codex
+round 32): arming on it alone would turn every first pass under this
+feature into a multi-pass cross-tenant write outage, so the first stamp
+instead probes for a physically present un-folded cover row aged past
+the TTL and arms only on that positive evidence (or a failed probe,
+which must fail closed). Rows a writer's per-base expired-row GC pruned
+before the probe are an accepted residual: that base's admission
+re-derives its own floor.
 
 Resolved residual (issue #125, with #121): the original design kept the
 known-absent set and rotation cursors in process memory, making refresh

@@ -257,6 +257,37 @@ WHERE key COLLATE "C" > $1 AND key COLLATE "C" < $2
 	return total + tag.RowsAffected(), nil
 }
 
+// LapsedAbsenceCoverExists reports whether any physically present
+// absence-cover row — deterministic incarnation or un-folded legacy
+// nonce — has aged past the ttl: positive evidence that cover
+// protection lapsed while no renewal was running (Codex round 32 on PR
+// #132, security). Folded nonces are excluded: their decay is
+// deliberate retirement, not a lapse. Consulted when the renewal-health
+// watermark is ABSENT — the upgrade/first-enable signature — where
+// arming the fleet-global admission fence without evidence would turn
+// every first pass under this feature into a cross-tenant write outage.
+// Rows GC'd before the probe (admission's per-base expired-row pruning)
+// are a best-effort residual: those bases' writers re-derive their own
+// floors at admission time.
+func (s *PG) LapsedAbsenceCoverExists(ctx context.Context, ttl time.Duration) (bool, error) {
+	assertf(ttl > 0, "LapsedAbsenceCoverExists: non-positive ttl %v", ttl)
+	var exists bool
+	err := s.pool.QueryRow(ctx, `
+SELECT EXISTS (
+  SELECT 1 FROM pack_reservations
+  WHERE key COLLATE "C" > $1 AND key COLLATE "C" < $2
+    AND right(key, $3) = $4
+    AND owner <> $5
+    AND created_at <= now() - make_interval(secs => $6))`,
+		AbsenceCoverPrefix, absenceCoverRangeEnd,
+		len(absenceCoverRawSuffix), absenceCoverRawSuffix,
+		AbsenceFoldedOwner, ttl.Seconds()).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("lapsed absence cover exists: %w", err)
+	}
+	return exists, nil
+}
+
 // AbsenceFoldedOwner is the sentinel owner the reconciler CASes onto a
 // legacy nonce cover once both registry rotations proved its base's true
 // deficits within one pass (the recomputed ground truth subsumes whatever

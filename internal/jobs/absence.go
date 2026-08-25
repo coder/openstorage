@@ -102,6 +102,13 @@ type AbsenceRegistry interface {
 	// through (Codex rounds 15+18+19): a CAS miss proves a concurrent
 	// re-charge, which must win.
 	CASAbsenceCoverOwner(ctx context.Context, rawKey, expectedOwner string, expectedBytes int64, newOwner string) (bool, error)
+	// LapsedAbsenceCoverExists reports whether any physically present,
+	// un-folded cover row aged past the ttl — the positive lapse
+	// evidence required to arm the admission fence when the
+	// renewal-health watermark is absent (Codex round 32, security):
+	// an absent watermark alone is the upgrade/first-enable signature,
+	// not proof of a fleet-wide lapse.
+	LapsedAbsenceCoverExists(ctx context.Context, ttl time.Duration) (bool, error)
 	// ListAbsenceCovers pages the live absence-cover reservation rows —
 	// the durable tracking state the renewal phase re-derives its
 	// obligations from every pass (issue #125). ttl is the liveness
@@ -1133,22 +1140,46 @@ func (r *AbsenceReconciler) renewCovers(ctx context.Context, budget int64, repor
 		// A successful touch proves covers stayed alive only when
 		// NOTHING could have lapsed before it ran (Codex round 29):
 		// the strict-TTL bulk update deliberately leaves already-dead
-		// rows dead, so a watermark gap of a full TTL — a fleet paused
-		// past the TTL, or quota enforcement re-enabled after an off
-		// period whose passes never stamped — means RECOVERY, not
-		// health. The fence arms BEFORE the stamp (a crash in between
-		// leaves the fail-closed side) and outlives it until a full
-		// recovery rotation completes; an unreadable prior age arms
-		// too. A prior age strictly under the TTL proves continuity:
-		// every row was re-TTL'd then, and rows minted since carry
-		// their own fresh TTL.
-		age, ok, err := r.registry.JobScanStateAge(ctx, ref.ScanJobAbsence, ref.ScanScopeAbsenceRenewalHealth)
-		if err != nil {
-			errs.add(fmt.Errorf("absence reconcile: read renewal health: %w", err))
-			ok = false
+		// rows dead, so a watermark EXISTING but a full TTL old — a
+		// fleet paused past the TTL, or quota enforcement re-enabled
+		// after an off period whose passes never stamped (nothing ever
+		// deletes the health row, so a prior on-era leaves it aging) —
+		// means RECOVERY, not health. The fence arms BEFORE the stamp
+		// (a crash in between leaves the fail-closed side) and outlives
+		// it until a full recovery rotation completes; an unreadable
+		// prior age arms too. A prior age strictly under the TTL proves
+		// continuity: every row was re-TTL'd then, and rows minted
+		// since carry their own fresh TTL. An ABSENT watermark is NOT
+		// lapse evidence by itself (Codex round 32, security): it is
+		// the upgrade/first-enable signature, and arming the
+		// fleet-global fence on it would turn every first pass under
+		// this feature into a multi-pass cross-tenant write outage.
+		// Instead the first stamp probes for positive evidence — a
+		// physically present un-folded cover row aged past the TTL —
+		// and arms only when a lapse provably happened (or the probe
+		// itself failed, where fail-closed is the only safe answer).
+		age, ok, hErr := r.registry.JobScanStateAge(ctx, ref.ScanJobAbsence, ref.ScanScopeAbsenceRenewalHealth)
+		arm, why := false, ""
+		switch {
+		case hErr != nil:
+			errs.add(fmt.Errorf("absence reconcile: read renewal health: %w", hErr))
+			arm, why = true, "renewal health unreadable at a successful touch"
+		case ok && age >= r.coverTTL:
+			arm, why = true, "renewal continuity unprovable at a successful touch — covers may have lapsed while no pass was stamping"
+		case !ok:
+			lapsed, pErr := r.registry.LapsedAbsenceCoverExists(ctx, r.coverTTL)
+			switch {
+			case pErr != nil:
+				errs.add(fmt.Errorf("absence reconcile: probe lapsed covers: %w", pErr))
+				arm, why = true, "lapse evidence unreadable at the first health stamp"
+			case lapsed:
+				arm, why = true, "expired covers present at the first health stamp — protection lapsed before this watermark regime began"
+			default:
+				r.logger.Info("absence reconcile: first renewal-health stamp — no lapsed covers found, admission stays open")
+			}
 		}
-		if !ok || age >= r.coverTTL {
-			if !r.armFence(ctx, errs, "renewal continuity unprovable at a successful touch — covers may have lapsed while no pass was stamping") {
+		if arm {
+			if !r.armFence(ctx, errs, why) {
 				// The required fence write is NOT proven durable: do
 				// not stamp health over the stale watermark (Codex
 				// round 30) — a fresh stamp would make the next pass
