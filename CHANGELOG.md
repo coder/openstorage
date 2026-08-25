@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.0](https://github.com/coder/code-storage/compare/v0.7.0...v0.8.0) (2026-08-25)
+
+
+### Features
+
+* **sync:** unify sync egress policy behind one dial-time destination guard ([#144](https://github.com/coder/code-storage/issues/144)) ([5ce9f8f](https://github.com/coder/code-storage/commit/5ce9f8ff946a55a627da1bcd9a087759b6cdafc0)), closes [#139](https://github.com/coder/code-storage/issues/139)
+
 ## [0.7.0](https://github.com/coder/code-storage/compare/v0.6.2...v0.7.0) (2026-08-25)
 
 
