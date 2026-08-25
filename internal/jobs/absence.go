@@ -305,15 +305,24 @@ type AbsenceReconciler struct {
 	// legacyRows is this pass's harvest of live pre-#125 nonce covers
 	// still awaiting retirement (Codex round 19): the renewal listing
 	// records them as-listed, and the pass end folds exactly those whose
-	// base BOTH rotations proved clean within this same pass.
+	// base holds BOTH class proofs (cleanBases).
 	legacyRows []ref.AbsenceCoverRow
-	// cleanBases[class][base] records that class's rotation completed a
-	// clean proof for base THIS PASS: a fence-continuous start-to-end
-	// range observation with no stat/charge errors — single-pass, or
-	// resumed with the base group's mutation fence verified across
-	// every park gap (Codex rounds 19-20) — or a row-less keyset gap.
-	// Only proofs completing this pass may retire legacy covers.
+	// cleanBases[class][base] records that class holds a clean proof
+	// for base THIS PASS: a fence-continuous start-to-end range
+	// observation with no stat/charge errors — single-pass, or resumed
+	// with the base group's mutation fence verified across every park
+	// gap (Codex rounds 19-20) — a row-less keyset gap, or a PERSISTED
+	// proof from an earlier pass whose fence still holds (Codex round
+	// 21: the two classes traverse independent populations, so their
+	// completions for one base can stay out of phase indefinitely — a
+	// half-proof waits under the same generation fence until its
+	// counterpart lands). Retirement needs both classes in one map.
 	cleanBases map[string]map[string]bool
+	// proofGens[base][class] is the surviving persisted half-proof set
+	// loaded (and fence-validated) this pass — the retention source for
+	// saveState when an incomplete renewal listing leaves legacyRows
+	// non-authoritative.
+	proofGens map[string]map[string]int64
 	// touchFailed records that this pass's bulk cover renewal FAILED:
 	// the rotation cursors must not be re-stamped by saveState (Codex
 	// round 19, P1) — a cursor row's DB-clock freshness is the loadState
@@ -504,6 +513,7 @@ func (r *AbsenceReconciler) loadState(ctx context.Context, errs *boundedErrs) {
 		absenceClassLFS:   make(map[string]bool),
 		absenceClassPacks: make(map[string]bool),
 	}
+	r.proofGens = make(map[string]map[string]int64)
 	r.touchFailed = false
 	for _, c := range []struct {
 		scope string
@@ -581,6 +591,63 @@ func (r *AbsenceReconciler) loadState(ctx context.Context, errs *boundedErrs) {
 	} else if ok {
 		r.renewCursor, r.passes = st.Payload, st.Generation
 	}
+	r.loadProofs(ctx, errs)
+}
+
+// loadProofs restores persisted per-class half-proofs (Codex round 21):
+// a class's fenced proof for a base waits durably until the counterpart
+// class completes — their rotations traverse independent populations and
+// can stay out of phase indefinitely, so requiring both to land in one
+// pass would leave both-class-large bases permanently unprovable. Each
+// entry re-validates against the CURRENT group generation at pass start,
+// before this pass makes any bump of its own: the persisted gen was
+// snapshotted at a previous pass's end, so a mismatch proves a foreign
+// mutation landed in between and the half-proof is dropped (re-proven by
+// a later traversal). Surviving entries seed cleanBases exactly like
+// proofs completed this pass.
+func (r *AbsenceReconciler) loadProofs(ctx context.Context, errs *boundedErrs) {
+	if !r.quotaEnforced {
+		return
+	}
+	st, ok, err := r.registry.GetJobScanState(ctx, ref.ScanJobAbsence, ref.ScanScopeAbsenceProofs)
+	if err != nil {
+		errs.add(fmt.Errorf("absence reconcile: read proof state: %w", err))
+		return
+	}
+	if !ok || st.Payload == "" {
+		return
+	}
+	var stored map[string]map[string]int64
+	if err := json.Unmarshal([]byte(st.Payload), &stored); err != nil {
+		r.logger.Warn("absence reconcile: discarding undecodable proof state", "err", err)
+		return
+	}
+	for base, classes := range stored {
+		if base == "" {
+			continue
+		}
+		gen, err := r.rangeFence(ctx, base)
+		if err != nil {
+			// Unverifiable: dropped, re-proven by a later traversal.
+			errs.add(fmt.Errorf("absence reconcile: validate proof fence for %s: %w", base, err))
+			continue
+		}
+		for class, proofGen := range classes {
+			if class != absenceClassLFS && class != absenceClassPacks {
+				continue
+			}
+			if proofGen != gen {
+				r.logger.Info("absence reconcile: persisted proof invalidated",
+					"base", base, "class", class, "reason", "base group mutated since the proof")
+				continue
+			}
+			r.cleanBases[class][base] = true
+			if r.proofGens[base] == nil {
+				r.proofGens[base] = make(map[string]int64)
+			}
+			r.proofGens[base][class] = proofGen
+		}
+	}
 }
 
 // saveState parks the durable cursors on a bounded DETACHED context: the
@@ -627,6 +694,69 @@ func (r *AbsenceReconciler) saveState(ctx context.Context, errs *boundedErrs) {
 	}
 	if err := r.registry.PutJobScanState(sctx, ref.ScanJobAbsence, ref.ScanScopeAbsenceRenewal, r.renewCursor, r.passes); err != nil {
 		errs.add(fmt.Errorf("absence reconcile: park renewal cursor: %w", err))
+	}
+	r.saveProofs(sctx, errs)
+}
+
+// absenceProofCap bounds the persisted half-proof payload: entries exist
+// only for bases with live legacy nonces awaiting retirement, a
+// population that shrinks to zero as folds proceed. Overflow drops the
+// byte-largest bases (loudly) — strictly a retirement deferral.
+const absenceProofCap = 512
+
+// saveProofs persists per-base half-proofs for the next pass (Codex
+// round 21): every base with an un-folded legacy nonce recorded this
+// pass whose proof completed in exactly ONE class carries that class's
+// proof forward under a fresh fence snapshot — read here, after every
+// bump this pass made, so the next pass's load-time validation covers
+// exactly the parked gap. Bases whose BOTH proofs landed were folded
+// this pass (a CAS miss means a re-charge won: it must re-prove from
+// scratch), and bases with no live nonce need no proof. When the renewal
+// listing did not complete, this pass's legacyRows are not authoritative
+// — previously persisted bases are retained rather than dropped blind.
+func (r *AbsenceReconciler) saveProofs(sctx context.Context, errs *boundedErrs) {
+	if !r.quotaEnforced {
+		return
+	}
+	bases := make(map[string]bool, len(r.legacyRows))
+	for i := range r.legacyRows {
+		bases[r.legacyRows[i].Base] = true
+	}
+	if !r.renewalComplete {
+		for base := range r.proofGens {
+			bases[base] = true
+		}
+	}
+	keep := make(map[string]map[string]int64)
+	for base := range bases {
+		lfsClean, packsClean := r.cleanBases[absenceClassLFS][base], r.cleanBases[absenceClassPacks][base]
+		if lfsClean == packsClean {
+			continue // none: nothing to carry; both: the fold ran this pass
+		}
+		if len(keep) >= absenceProofCap {
+			r.logger.Warn("absence reconcile: half-proof cap exceeded; excess proofs dropped",
+				"cap", absenceProofCap)
+			break
+		}
+		gen, err := r.rangeFence(sctx, base)
+		if err != nil {
+			errs.add(fmt.Errorf("absence reconcile: snapshot proof fence for %s: %w", base, err))
+			continue
+		}
+		class := absenceClassLFS
+		if packsClean {
+			class = absenceClassPacks
+		}
+		keep[base] = map[string]int64{class: gen}
+	}
+	payload := ""
+	if len(keep) > 0 {
+		b, err := json.Marshal(keep)
+		assertf(err == nil, "absence reconcile: marshal proof state: %v", err)
+		payload = string(b)
+	}
+	if err := r.registry.PutJobScanState(sctx, ref.ScanJobAbsence, ref.ScanScopeAbsenceProofs, payload, 0); err != nil {
+		errs.add(fmt.Errorf("absence reconcile: park proof state: %w", err))
 	}
 }
 
@@ -922,7 +1052,9 @@ func (r *AbsenceReconciler) recordLegacyCover(row *ref.AbsenceCoverRow, report *
 // Multi-pass observations count exactly when the base group's mutation
 // fence held across every park gap (round 20, P1: a base larger than one
 // pass's class allowance can only ever complete resumed); a broken fence
-// taints the range and the retirement waits for the next traversal.
+// taints the range and the retirement waits for the next traversal. A
+// completed class proof WAITS for its out-of-phase counterpart under the
+// same fence, persisted across passes (round 21, P1; see loadProofs).
 func (r *AbsenceReconciler) foldRedundantLegacy(ctx context.Context, report *AbsenceReport, st *absencePassState, errs *boundedErrs) {
 	for i := range r.legacyRows {
 		row := &r.legacyRows[i]

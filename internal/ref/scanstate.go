@@ -42,10 +42,13 @@ const (
 	// cursors and cover-renewal cursor (issue #125).
 	ScanJobAbsence = "absence_reconcile"
 	// ScanScopeAbsenceLFS/Packs are the two registry rotation cursors;
-	// ScanScopeAbsenceRenewal is the cover-renewal listing cursor.
+	// ScanScopeAbsenceRenewal is the cover-renewal listing cursor;
+	// ScanScopeAbsenceProofs carries per-base fenced class proofs
+	// awaiting their counterpart class (Codex round 21 on PR #132).
 	ScanScopeAbsenceLFS     = "lfs"
 	ScanScopeAbsencePacks   = "packs"
 	ScanScopeAbsenceRenewal = "renewal"
+	ScanScopeAbsenceProofs  = "proofs"
 	// ScanJobSweep owns the sweeper's watermarks. The destructive-reap
 	// scope's updated_at is the "last completed destructive LFS pass"
 	// watermark (issue #120): written only when a sweep ran with the LFS

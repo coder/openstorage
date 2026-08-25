@@ -135,13 +135,18 @@ periodic same-key TTL refresh, which overwrites the row's owner, as new
 deficit and re-added it each pass toward a wedged admission. Instead each
 nonce row IS its own cover: it rides the pass-start bulk touch (Codex
 round 15: a nonce minted just behind the cursor must not lapse before the
-rotation ever reaches it) until BOTH classes' proofs complete in one
-pass — a clean fence-continuous start-to-end range observation (single
-pass, or resumed with the mutation fence verified across every park gap)
+rotation ever reaches it) until BOTH classes hold proofs in one pass — a
+clean fence-continuous start-to-end range observation (single pass, or
+resumed with the mutation fence verified across every park gap)
 recomputes the base's true deficit from the registry itself and charges
 it into the deterministic head, and a row-less keyset gap proves a zero
-deficit the same way — at which point the ground truth subsumes whatever
-the nonce
+deficit the same way. The two rotations traverse independent populations,
+so their completions for one base can stay out of phase indefinitely
+(Codex round 21): a completed class proof therefore WAITS durably (one
+bounded `job_scan_state` row keyed by base and class) under the same
+generation fence — re-validated at every pass start before the pass's own
+bumps, dropped on any parked-gap mutation — until its counterpart lands.
+With both proofs in hand the ground truth subsumes whatever the nonce
 aggregated and the folded sentinel is CAS'd into the row's owner column,
 guarded on the LISTED (owner, bytes): every re-charge overwrites owner
 and GREATEST-grows bytes, so a CAS miss proves a newer reliance arrived

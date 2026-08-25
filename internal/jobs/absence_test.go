@@ -574,6 +574,62 @@ func TestAbsenceReconcile_MultiPassBaseRetiresLegacy(t *testing.T) {
 	}
 }
 
+// TestAbsenceReconcile_OutOfPhaseClassProofsRetireLegacy (Codex round
+// 21, P1): the two class rotations traverse independent populations, so
+// their clean completions for one base can land in DIFFERENT passes
+// indefinitely — requiring both in one pass would leave the nonce
+// bulk-renewed forever. Here the LFS proof completes in pass 2 and the
+// packs proof only in pass 3: the persisted (fence-validated) LFS
+// half-proof must carry across and retire the nonce in pass 3.
+func TestAbsenceReconcile_OutOfPhaseClassProofsRetireLegacy(t *testing.T) {
+	f := newSweepFixture(t)
+	ctx := context.Background()
+	base := "repo-out-of-phase"
+	for i := byte(0); i < 6; i++ {
+		key := blob.LFSKey(base, absenceOID('a'+i))
+		registerLFS(t, f, base, key, 10)
+		f.upload(key, strings.Repeat("x", 10))
+	}
+	for i := byte(0); i < 9; i++ {
+		id := fmt.Sprintf("p%d", i)
+		key := blob.PackKey(base, id)
+		size := f.upload(key, strings.Repeat("y", 10))
+		if err := f.store.RegisterPacks(ctx, base, []ref.Pack{{ID: id, Key: key, Size: size}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	legacyKey := ref.AbsenceCoverPrefix + base + "/" + ref.NewReservationOwner()
+	if err := ref.ReserveRestoreCover(ctx, absenceRegistry(t, f), blob.QuotaRepoGroup(base), legacyKey, 555, time.Hour); err != nil {
+		t.Fatalf("seed legacy cover: %v", err)
+	}
+
+	pinLFSLeader(t, f)
+	run := func(pass int) AbsenceReport {
+		t.Helper()
+		worker := testReconciler(t, f, true, 8)
+		report, err := worker.Run(ctx)
+		if err != nil {
+			t.Fatalf("pass %d: %v", pass, err)
+		}
+		return report
+	}
+	// Pass 1: both rotations park mid-range. Pass 2: LFS completes its
+	// proof; packs is still mid-range — no retirement yet.
+	for pass := 1; pass <= 2; pass++ {
+		if report := run(pass); report.CoversDecaying != 0 {
+			t.Fatalf("pass %d: premature retirement (decaying=%d)", pass, report.CoversDecaying)
+		}
+	}
+	// Pass 3: packs completes; the persisted LFS half-proof (fence
+	// intact across the quiet gaps) completes the pair.
+	if report := run(3); report.CoversDecaying != 1 {
+		t.Fatalf("pass 3 report = %+v, want the nonce retired via the persisted out-of-phase proof", report)
+	}
+	if got := ledgerReserved(t, f, base); got != 555 {
+		t.Fatalf("reserved = %d, want only the decaying nonce", got)
+	}
+}
+
 // TestAbsenceReconcile_GapMutationDefersLegacyRetirement (Codex rounds
 // 19-20): a foreign mutation landing while the cursor is parked mid-range
 // breaks fence continuity — the resumed completion must NOT prove the
