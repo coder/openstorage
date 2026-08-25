@@ -72,6 +72,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -185,9 +186,11 @@ type AbsenceReport struct {
 	RenewalIncomplete bool `json:"renewal_incomplete"`
 	// RenewalOverBudget reports renewal charged more than its soft
 	// allocation (half the budget): every live cover still renewed —
-	// renewal is the correctness core and never lapses on budget — but
-	// discovery was starved this pass. Raise the budget above twice the
-	// live cover population.
+	// renewal is the correctness core and never lapses on budget — while
+	// discovery keeps its guaranteed half-budget allowance (Codex round
+	// 14: a zero-allowance clamp would be an absorbing state under the
+	// bulk touch). Raise the budget above twice the live cover
+	// population.
 	RenewalOverBudget bool `json:"renewal_over_budget"`
 	// LFSTraversals/PacksTraversals are the classes' completed rotation
 	// counts (durable bookkeeping, useful for tracking convergence).
@@ -493,14 +496,18 @@ func (r *AbsenceReconciler) Run(ctx context.Context) (AbsenceReport, error) {
 	var errs boundedErrs
 	st := newAbsencePassState()
 	r.loadState(ctx, &errs)
-	// The renewal gets at most half the budget so a large cover
-	// population cannot starve discovery entirely; while the live cover
-	// rows fit within that half every cover refreshes every pass, and
-	// beyond it the round-robin cursor bounds every row's renewal period
-	// (RenewalIncomplete flags the backlog).
+	// The renewal is ALLOCATED half the budget but always offers the full
+	// listing (a bounded round-robin would lapse covers); discovery gets
+	// a GUARANTEED floor of the other half regardless of the overrun
+	// (Codex round 14, security): with the bulk touch keeping every live
+	// cover fresh, a cover population at or beyond the budget would
+	// otherwise clamp the rotation allowance to zero on every pass — an
+	// absorbing state where further losses stay uncovered indefinitely.
+	// The pass wall clock (TTL/4) bounds total work either way;
+	// RenewalOverBudget flags the sizing problem loudly.
 	remaining := r.budget - r.renewCovers(ctx, r.budget-r.budget/2, &report, st, &errs)
-	if remaining < 0 {
-		remaining = 0
+	if floor := r.budget / 2; remaining < floor {
+		remaining = floor
 	}
 	half := remaining - remaining/2
 	if r.passes%2 == 0 {
@@ -646,7 +653,7 @@ func (r *AbsenceReconciler) renewCovers(ctx context.Context, budget int64, repor
 	overrun := func() {
 		if charged > budget && !report.RenewalOverBudget {
 			report.RenewalOverBudget = true
-			r.logger.Warn("absence reconcile: cover renewal overran its budget allocation; discovery is starved this pass — raise CODESTORAGE_ABSENCE_RECONCILE_BUDGET above twice the live cover population",
+			r.logger.Warn("absence reconcile: cover renewal overran its budget allocation (discovery keeps its guaranteed half-budget allowance) — raise CODESTORAGE_ABSENCE_RECONCILE_BUDGET above twice the live cover population",
 				"allocation", budget, "charged", charged)
 		}
 	}
@@ -842,6 +849,7 @@ func (r *AbsenceReconciler) rotationPhase(ctx context.Context, cur *absenceCurso
 	startRepo, startKey := cur.AfterRepo, cur.AfterKey
 	startedAtZero := startRepo == "" && startKey == ""
 	wrapped := startedAtZero
+	coverBases := r.sortedCoverBases(tr.class)
 	// Restore the pending range parked with the cursor (Codex rounds
 	// 1+2, P1): resuming mid-range must neither read the first resumed
 	// row as a range transition (the suffix's total would masquerade as
@@ -879,7 +887,7 @@ func (r *AbsenceReconciler) rotationPhase(ctx context.Context, cur *absenceCurso
 			// no base after it holds any rows in this class.
 			prevBase := tr.base
 			r.endRange(ctx, tr, report, st, errs)
-			r.releaseZeroRowCovers(ctx, tr.class, prevBase, "", report, errs)
+			r.releaseZeroRowCovers(ctx, tr.class, coverBases, prevBase, "", report, errs)
 			r.tickTraversal(cur, tr.class, report)
 			cur.AfterRepo, cur.AfterKey = "", ""
 			if wrapped {
@@ -912,7 +920,7 @@ func (r *AbsenceReconciler) rotationPhase(ctx context.Context, cur *absenceCurso
 			if b := baseOf(repos[i]); b != tr.base {
 				prevBase := tr.base
 				r.endRange(ctx, tr, report, st, errs)
-				r.releaseZeroRowCovers(ctx, tr.class, prevBase, b, report, errs)
+				r.releaseZeroRowCovers(ctx, tr.class, coverBases, prevBase, b, report, errs)
 				tr.base, tr.started, tr.dirty, tr.running = b, true, false, 0
 			}
 			charged += settle[i]()
@@ -920,6 +928,21 @@ func (r *AbsenceReconciler) rotationPhase(ctx context.Context, cur *absenceCurso
 		}
 	}
 	return charged
+}
+
+// sortedCoverBases snapshots one class's harvested cover bases in key
+// order — the rotation's O(log C) window index for releaseZeroRowCovers
+// (Codex round 14, P1: scanning the whole harvest map at every base
+// boundary made a pass O(C×R)). Covers folded in AFTER the snapshot are
+// only ever for bases the rotation is currently processing (which have
+// rows), so missing one merely defers its release to a later pass.
+func (r *AbsenceReconciler) sortedCoverBases(class string) []string {
+	bases := make([]string, 0, len(r.liveCovers[class]))
+	for base := range r.liveCovers[class] {
+		bases = append(bases, base)
+	}
+	sort.Strings(bases)
+	return bases
 }
 
 // releaseZeroRowCovers releases this class's covers for bases the rotation
@@ -930,13 +953,25 @@ func (r *AbsenceReconciler) rotationPhase(ctx context.Context, cur *absenceCurso
 // folds would otherwise pin its cover forever). The proof is the page
 // adjacency itself, so it holds regardless of traversal or harvest
 // completeness; covers this pass's harvest missed are released on a later
-// pass. Deletion is single-writer-safe like every cover delete.
-func (r *AbsenceReconciler) releaseZeroRowCovers(ctx context.Context, class, lo, hi string, report *AbsenceReport, errs *boundedErrs) {
+// pass. Deletion is single-writer-safe like every cover delete. bases is
+// the phase's sorted harvest snapshot: only the (lo, hi) window is
+// examined (binary search), so a traversal's total release work is
+// O(R log C + C), not O(C×R); already-released entries skip via the map
+// membership check.
+func (r *AbsenceReconciler) releaseZeroRowCovers(ctx context.Context, class string, bases []string, lo, hi string, report *AbsenceReport, errs *boundedErrs) {
 	if !r.quotaEnforced {
 		return
 	}
-	for base, cover := range r.liveCovers[class] {
-		if cover.key == "" || (lo != "" && base <= lo) || (hi != "" && base >= hi) {
+	for i := sort.SearchStrings(bases, lo); i < len(bases); i++ {
+		base := bases[i]
+		if base <= lo && lo != "" {
+			continue // the boundary base itself: it has rows
+		}
+		if hi != "" && base >= hi {
+			return
+		}
+		cover, live := r.liveCovers[class][base]
+		if !live || cover.key == "" {
 			continue
 		}
 		// Same warm-floor invalidation before deletion as endRange's

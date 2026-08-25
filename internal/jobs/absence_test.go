@@ -442,7 +442,10 @@ func TestAbsenceReconcile_RenewalNeverLapsesOnBudget(t *testing.T) {
 
 	// Pass 2 at budget 100: the renewal allocation (50) is smaller than
 	// the 60 live covers — every cover still renews, loudly over budget,
-	// and discovery gets only the leftover 40 units (20 two-unit rows).
+	// and discovery keeps its GUARANTEED half-budget allowance (50
+	// units = 25 two-unit rows; Codex round 14: the overrun must never
+	// clamp discovery toward zero, an absorbing state under the bulk
+	// touch).
 	r.budget = 100
 	report, err = r.Run(context.Background())
 	if err != nil {
@@ -451,8 +454,8 @@ func TestAbsenceReconcile_RenewalNeverLapsesOnBudget(t *testing.T) {
 	if !report.RenewalOverBudget || report.CoversRenewed != 60 || report.RenewalIncomplete {
 		t.Fatalf("pass 2 report = %+v, want all 60 covers renewed over budget", report)
 	}
-	if report.LFSRowsExamined != 20 {
-		t.Fatalf("pass 2 report = %+v, want discovery squeezed to the 40-unit remainder", report)
+	if report.LFSRowsExamined != 25 {
+		t.Fatalf("pass 2 report = %+v, want discovery kept at the guaranteed half-budget allowance", report)
 	}
 
 	// Pass 3 with the budget raised: renewal fits its allocation again.
@@ -935,6 +938,41 @@ func (fr *flakyRegistry) ReservePackBytes(ctx context.Context, group []string, p
 		return ref.ReserveDecision{}, fmt.Errorf("flaky: injected reserve failure")
 	}
 	return fr.AbsenceRegistry.ReservePackBytes(ctx, group, packs, owner, usageFloor, floorGen, quotaBytes, ttl)
+}
+
+// TestAbsenceReconcile_DiscoveryRunsWhenCoversExceedBudget (Codex round
+// 14, security): renewal always offers the full cover listing, so a live
+// population at or beyond the whole budget used to clamp the rotation
+// allowance to zero — and the bulk touch keeps those covers live, making
+// starvation an absorbing state. Discovery must retain a guaranteed
+// allowance: a fresh loss is still found and covered in the same pass.
+func TestAbsenceReconcile_DiscoveryRunsWhenCoversExceedBudget(t *testing.T) {
+	f := newSweepFixture(t)
+	ctx := context.Background()
+	// 8 live deterministic covers = the whole budget.
+	for i := 0; i < 8; i++ {
+		base := fmt.Sprintf("repo-crowd-%d", i)
+		if err := ref.ReserveRestoreCover(ctx, absenceRegistry(t, f), blob.QuotaRepoGroup(base), absenceIncarnationKey(base, absenceClassLFS, 1), 10, time.Hour); err != nil {
+			t.Fatalf("seed cover %d: %v", i, err)
+		}
+	}
+	base := "repo-fresh-loss"
+	registerLFS(t, f, base, blob.LFSKey(base, absenceOID('j')), 100)
+
+	r := testReconciler(t, f, true, 8)
+	report, err := r.Run(ctx)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !report.RenewalOverBudget {
+		t.Fatalf("report = %+v, want the overrun flagged", report)
+	}
+	if report.LFSRowsExamined == 0 || report.LFSRowsAbsent == 0 {
+		t.Fatalf("report = %+v, want discovery to run despite the cover crowd", report)
+	}
+	if got := ledgerReserved(t, f, base); got != 100 {
+		t.Fatalf("fresh loss reserved = %d, want covered in the same pass", got)
+	}
 }
 
 // TestAbsenceReconcile_LegacyRefoldAfterHeadsReleased (Codex round 13,

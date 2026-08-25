@@ -63,9 +63,13 @@ healed repository already shed (Codex round 6) — and is left to the
 ledger's expired-row cleanup; a still-real loss is simply rediscovered
 by the rotation and charged under a fresh incarnation. Renewal never
 lapses on budget: it always offers the full listing, and a population
-beyond its allocation squeezes discovery for the pass, loudly
-(`renewal_over_budget`) — a bounded round-robin would let a big enough
-backlog outlive the cover TTL between one row's renewals. Only the pass
+beyond its allocation overruns loudly (`renewal_over_budget`) — a bounded
+round-robin would let a big enough backlog outlive the cover TTL between
+one row's renewals — while discovery keeps a GUARANTEED half-budget
+allowance regardless of the overrun (Codex round 14: the bulk touch keeps
+covers live, so a zero-allowance clamp would be an absorbing state where
+new losses stay uncovered forever; the pass wall clock bounds total work
+either way). Only the pass
 deadline — or a legacy cover that could NEITHER fold nor renew (Codex
 round 8) — cuts the listing short (`renewal_incomplete`), parked strictly
 before the unprotected row and resumed first next pass on the durable
