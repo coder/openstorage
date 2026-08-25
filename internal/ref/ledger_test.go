@@ -337,6 +337,13 @@ ON CONFLICT (key) DO UPDATE SET repo = excluded.repo, bytes = excluded.bytes,
 // until the legacy row settles, releases, or expires).
 func TestLegacyStatementsCannotEndTargetReservations(t *testing.T) {
 	runRefBackends(t, func(t *testing.T, s Store) {
+		if _, ok := s.(*S3WAL); ok {
+			// s3wal predates no manifest-era binary: there are no legacy
+			// SQL era rows or raw-key statements to fence against, and
+			// reservations key on plain blob keys by design (documented
+			// divergence — s3walstore_quota.go).
+			t.Skip("s3wal has no legacy SQL era rows")
+		}
 		k := newLedgerKit(t, s)
 
 		// REVERSE ordering (round 35): the target writer reserves first...
@@ -385,6 +392,14 @@ func TestLegacyStatementsCannotEndTargetReservations(t *testing.T) {
 // consumes by raw key the same way). Covers both settlement surfaces.
 func TestSettlementConsumesBothEraRows(t *testing.T) {
 	runRefBackends(t, func(t *testing.T, s Store) {
+		if _, ok := s.(*S3WAL); ok {
+			// No legacy era rows on s3wal (see
+			// TestLegacyStatementsCannotEndTargetReservations); plain-key
+			// settlement stays covered there by
+			// TestRegisterConsumesReservation and
+			// TestRegisterLFSObject_SettlesReservationAndCredits.
+			t.Skip("s3wal has no legacy SQL era rows")
+		}
 		ctx := context.Background()
 		k := newLedgerKit(t, s)
 
@@ -422,6 +437,14 @@ func TestSettlementConsumesBothEraRows(t *testing.T) {
 // caller retires its own attempt with its gen token instead.
 func TestRetireLeavesLegacyTwinRow(t *testing.T) {
 	runRefBackends(t, func(t *testing.T, s Store) {
+		if _, ok := s.(*S3WAL); ok {
+			// No legacy era rows on s3wal (see
+			// TestLegacyStatementsCannotEndTargetReservations). The
+			// gen-token retire semantics this test also touches stay
+			// covered on s3wal via TestRetireIsGenerationBound, which is
+			// interface-only and NOT skipped.
+			t.Skip("s3wal has no legacy SQL era rows")
+		}
 		ctx := context.Background()
 		k := newLedgerKit(t, s)
 		a := k.pack(k.base(), "aa1", 60)
@@ -564,6 +587,15 @@ func TestReservePrunesExpiredPhysicalRows(t *testing.T) {
 					`SELECT COUNT(*) FROM pack_reservations WHERE repo = ?`, k.base()).Scan(&n); err != nil {
 					t.Fatal(err)
 				}
+			case *S3WAL:
+				// Physical rows = the group manifest's reservation entries
+				// (the pack_reservations table twin; the manifest IS
+				// repo-scoped).
+				m, err := st.viewManifest(ctx, k.base())
+				if err != nil {
+					t.Fatal(err)
+				}
+				n = len(m.Reservations)
 			default:
 				t.Fatalf("unknown store %T", s)
 			}

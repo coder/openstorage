@@ -346,9 +346,12 @@ type Store interface {
 //
 //	postgres:// or postgresql://  → OpenPG
 //	sqlite:///abs/path/db.sqlite  → pure-Go SQLite store
+//	s3wal://bucket?endpoint=…     → manifest-CAS store over conditional S3
 //
 // Open never runs InitSchema: hooks reconstruct stores from env URLs and
-// must not run DDL — the serve/wire seam owns schema init.
+// must not run DDL — the serve/wire seam owns schema init (for s3wal that
+// includes the §2.6 conditional-write probe: Open performs no network I/O
+// on that scheme — ADR-12).
 func Open(ctx context.Context, dbURL string) (Store, error) {
 	assertf(dbURL != "", "Open: empty ref store URL")
 	u, err := url.Parse(dbURL)
@@ -360,8 +363,10 @@ func Open(ctx context.Context, dbURL string) (Store, error) {
 		return OpenPG(ctx, dbURL)
 	case "sqlite":
 		return OpenSQLite(ctx, dbURL)
+	case "s3wal":
+		return openS3WALStore(ctx, dbURL)
 	default:
-		return nil, fmt.Errorf("ref store URL scheme %q unsupported (want postgres, postgresql, or sqlite)", u.Scheme)
+		return nil, fmt.Errorf("ref store URL scheme %q unsupported (want postgres, postgresql, sqlite, or s3wal)", u.Scheme)
 	}
 }
 

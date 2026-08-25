@@ -19,7 +19,7 @@ func TestOpenSchemeDispatch(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), `scheme "mysql" unsupported`) {
 		t.Fatalf("want unsupported-scheme error, got %v", err)
 	}
-	for _, scheme := range []string{"postgres", "postgresql", "sqlite"} {
+	for _, scheme := range []string{"postgres", "postgresql", "sqlite", "s3wal"} {
 		if !strings.Contains(err.Error(), scheme) {
 			t.Fatalf("unsupported-scheme error must list %q, got %v", scheme, err)
 		}
@@ -38,6 +38,17 @@ func TestOpenSchemeDispatch(t *testing.T) {
 	}
 	if _, ok := st.(*SQLite); !ok {
 		t.Fatalf("sqlite:// must open the SQLite backend, got %T", st)
+	}
+	st.Close()
+
+	// s3wal:// opens without ANY network I/O (ADR-12: the §2.6 probe runs
+	// at InitSchema, never Open) — a dead endpoint must still open.
+	st, err = Open(ctx, "s3wal://bucket?endpoint=http://127.0.0.1:1")
+	if err != nil {
+		t.Fatalf("s3wal:// must open network-free, got %v", err)
+	}
+	if _, ok := st.(*S3WAL); !ok {
+		t.Fatalf("s3wal:// must open the S3WAL backend, got %T", st)
 	}
 	st.Close()
 }
