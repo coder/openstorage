@@ -45,6 +45,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/coder/code-storage/internal/meta"
@@ -222,12 +223,14 @@ func (s *sim) doPushClaim(name string, node *simNode, repo *simRepo) error {
 		s.pushSteals++
 		if prev.run != nil && prev.run.crashed {
 			s.pushCrashSteals++
-		}
-		if prev.force && pendingWas < 2 {
-			// The force mandate survived ONLY on the dead claim's
-			// persisted push_claim_force — the #136 rescue class the
-			// inheritance rule exists for.
-			s.pushForcedRescues++
+			if prev.force && pendingWas < 2 {
+				// The force mandate survived ONLY on the DEAD holder's
+				// persisted push_claim_force — the #136 rescue class the
+				// inheritance rule exists for. Live holders merely
+				// outliving their lease inherit too, but only crashed
+				// ones count as rescues (the vacuity guard's promise).
+				s.pushForcedRescues++
+			}
 		}
 		out = "stole:" + stolenFrom
 	default: // refused
@@ -307,11 +310,14 @@ func (s *sim) doPushRescue(name string, node *simNode) error {
 	}
 	// The listed set must be exactly the repos the model says owe a run.
 	var want []string
-	for _, r := range s.repos { // deterministic order; store lists sorted repo_ids and sim keys sort by index
+	for _, r := range s.repos {
 		if s.pushPending[r.key] > 0 || s.pushClaims[r.key] != nil {
 			want = append(want, r.key)
 		}
 	}
+	// The store lists repo_ids in byte order; the sim's creation order
+	// diverges from it at >= 11 repos (simrepo10 < simrepo2).
+	sort.Strings(want)
 	if len(ids) != len(want) {
 		s.violate("step %d: push-rescue: PendingPushRepoIDs = %v, model owes %v", s.step, ids, want)
 		return nil
@@ -526,9 +532,9 @@ func (s *sim) checkPushFinal() error {
 			s.pushSteals++
 			if prev.run != nil && prev.run.crashed {
 				s.pushCrashSteals++
-			}
-			if prev.force && pendingWas < 2 {
-				s.pushForcedRescues++
+				if prev.force && pendingWas < 2 {
+					s.pushForcedRescues++
+				}
 			}
 		}
 		// The final claim now owns the row: mirror the model through the
