@@ -56,6 +56,13 @@ const (
 	backendLocal = "local"
 )
 
+// Static dummy credentials for the pg lane's SeaweedFS S3 gateway (the
+// container is throwaway and unreachable beyond the mapped test port).
+const (
+	s3AccessKey = "codestorage-e2e"
+	s3SecretKey = "codestorage-e2e-secret"
+)
+
 var (
 	binPath      string
 	testBackend  string // resolved CODESTORAGE_TEST_BACKEND (backendPG or backendLocal)
@@ -157,16 +164,27 @@ func testMainInner(m *testing.M) int {
 		}
 
 		// Qualified SeaweedFS recipe (docs/plans/s3wal-phase1a-results.md):
-		// pinned image, one-process `weed server -s3`, anonymous auth. The
+		// pinned image, one-process `weed server -s3`, S3 gateway on 8333.
+		// A static identity (s3.config) turns on SigV4 validation so the
+		// LFS round-trip's presigned download keeps failing on a bad or
+		// missing signature, exactly like the MinIO container it replaced
+		// — an anonymous gateway would serve unsigned requests too. The
 		// wait strategy only proves the gateway port accepts TCP — weed
-		// starts master/volume/filer/s3 asynchronously — so the EnsureBucket
-		// retry below is the actual readiness signal.
+		// starts master/volume/filer/s3 asynchronously — so the
+		// EnsureBucket retry below is the actual readiness signal.
+		s3Config := fmt.Sprintf(`{"identities":[{"name":"e2e","credentials":[{"accessKey":%q,"secretKey":%q}],"actions":["Admin","Read","List","Tagging","Write"]}]}`,
+			s3AccessKey, s3SecretKey)
 		seaweedC, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
 			ContainerRequest: testcontainers.ContainerRequest{
 				Image:        "chrislusf/seaweedfs:4.42",
 				ExposedPorts: []string{"8333/tcp"},
-				Cmd:          []string{"server", "-s3", "-dir=/data", "-ip.bind=0.0.0.0"},
-				WaitingFor:   wait.ForListeningPort("8333/tcp").WithStartupTimeout(2 * time.Minute),
+				Cmd:          []string{"server", "-s3", "-dir=/data", "-ip.bind=0.0.0.0", "-s3.config=/etc/seaweedfs/s3.json"},
+				Files: []testcontainers.ContainerFile{{
+					Reader:            strings.NewReader(s3Config),
+					ContainerFilePath: "/etc/seaweedfs/s3.json",
+					FileMode:          0o444,
+				}},
+				WaitingFor: wait.ForListeningPort("8333/tcp").WithStartupTimeout(2 * time.Minute),
 			},
 			Started: true,
 		})
@@ -183,10 +201,8 @@ func testMainInner(m *testing.M) int {
 			panic(err)
 		}
 		blobURL = fmt.Sprintf("s3://githttp-test?endpoint=http://%s:%s&s3ForcePathStyle=true&region=us-east-1", s3Host, s3Port.Port())
-		// The gateway is anonymous, but the SDK refuses to sign without
-		// credentials: any non-empty static values work.
-		os.Setenv("AWS_ACCESS_KEY_ID", "codestorage-test")
-		os.Setenv("AWS_SECRET_ACCESS_KEY", "codestorage-test")
+		os.Setenv("AWS_ACCESS_KEY_ID", s3AccessKey)
+		os.Setenv("AWS_SECRET_ACCESS_KEY", s3SecretKey)
 	case backendLocal:
 		testBackend = backendLocal
 		localDataDir = filepath.Join(scratch, "data")
