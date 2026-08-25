@@ -30,6 +30,9 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
 )
 
 // EnvTestS3URL names the external S3 endpoint the tests in this file run
@@ -49,8 +52,21 @@ func openS3Endpoint(t *testing.T) *S3 {
 		t.Fatalf("OpenS3(%s): %v", blobURL, err)
 	}
 	t.Cleanup(func() { _ = b.Close() })
-	if err := b.EnsureBucket(ctx); err != nil {
-		t.Fatalf("EnsureBucket: %v", err)
+	// Create the bucket only on emulator endpoints (endpoint= set).
+	// Against real S3 the bucket must already exist: EnsureBucket's
+	// CreateBucket-first flow would succeed on an owned us-east-1 bucket
+	// and reset its ACLs (see BucketAlreadyOwnedByYou in the AWS SDK) —
+	// the tests must never mutate a user-supplied bucket.
+	u, err := url.Parse(blobURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u.Query().Get("endpoint") != "" {
+		if err := b.EnsureBucket(ctx); err != nil {
+			t.Fatalf("EnsureBucket: %v", err)
+		}
+	} else if _, err := b.client.HeadBucket(ctx, &awss3.HeadBucketInput{Bucket: aws.String(b.name)}); err != nil {
+		t.Fatalf("bucket %q must already exist on real S3 (refusing to create or mutate it): %v", b.name, err)
 	}
 	return b
 }

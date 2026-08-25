@@ -273,6 +273,8 @@ CODESTORAGE_TEST_S3_URL='s3://floci-test?endpoint=http://127.0.0.1:4566&s3ForceP
 
 The same tests run against real S3: point `CODESTORAGE_TEST_S3_URL` at an
 existing bucket (`s3://my-bucket?region=us-east-1`) with real credentials in
-the environment. Keys are uniquely suffixed and cleaned up, but use a
-scratch bucket, not a production one.
+the environment. Without an `endpoint` query parameter the bucket is only
+probed, never created — re-creating an owned us-east-1 bucket would reset
+its ACLs. Keys are uniquely suffixed and cleaned up, but use a scratch
+bucket, not a production one.
 
