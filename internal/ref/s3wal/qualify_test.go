@@ -43,6 +43,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go"
 	"github.com/testcontainers/testcontainers-go"
 	tcminio "github.com/testcontainers/testcontainers-go/modules/minio"
 	"github.com/testcontainers/testcontainers-go/wait"
@@ -540,6 +541,18 @@ func surfaceGocloudIfNotExist(t *testing.T, e *qualEnv) []verdict {
 	case gcerrors.Code(err) == gcerrors.FailedPrecondition:
 		return []verdict{vPass(name)}
 	default:
+		// The surface qualifies the STORE, so the wire evidence is
+		// authoritative: a smithy 412 PreconditionFailed is a correct
+		// rejection even when gocloud's gcerrors mapping misfires.
+		// (s3blob's ErrorCode treats any operation error whose text
+		// contains "301" as a NoSuchBucket redirect, so a store request
+		// ID containing "301" mismaps the 412 to NotFound — a client-side
+		// gocloud quirk recorded in the results doc, not store behavior.)
+		var ae smithy.APIError
+		if errors.As(err, &ae) && ae.ErrorCode() == "PreconditionFailed" {
+			return []verdict{{name, verdictPass, fmt.Sprintf(
+				"store rejected with 412 PreconditionFailed; gocloud gcerrors mapped it to %v (s3blob \"301\" redirect heuristic)", gcerrors.Code(err))}}
+		}
 		return []verdict{{name, verdictRejects, fmt.Sprintf("want FailedPrecondition, got: %v", err)}}
 	}
 }
@@ -932,6 +945,7 @@ type contentionResult struct {
 	lostRaces      int64
 	contentionErrs int64
 	ambiguous      int64
+	busyRetries    int64 // SQLite lane only: definitive SQLITE_BUSY rejections retried
 	maxStarve      time.Duration
 }
 
@@ -976,6 +990,21 @@ func runContentionWindow(tb testing.TB, cas *Client, key string, writers int, wi
 				maxStarve                         time.Duration
 			)
 			lastSuccess := start
+			// Merge in a defer so a writer that errors out mid-window
+			// still contributes its recorded wins: discarding them would
+			// desync the detector's final-seq accounting and report a
+			// phantom update that never happened.
+			defer func() {
+				maxStarve = max(maxStarve, time.Since(lastSuccess))
+				mu.Lock()
+				res.latencies = append(res.latencies, localLat...)
+				transitions = append(transitions, localTrans...)
+				res.lostRaces += lostRaces
+				res.contentionErrs += contentions
+				res.ambiguous += ambiguous
+				res.maxStarve = max(res.maxStarve, maxStarve)
+				mu.Unlock()
+			}()
 			reRead := func() (Object, bool) {
 				obj, err := wcas.Get(ctx, key)
 				if err != nil {
@@ -1030,15 +1059,6 @@ func runContentionWindow(tb testing.TB, cas *Client, key string, writers int, wi
 					}
 				}
 			}
-			maxStarve = max(maxStarve, time.Since(lastSuccess))
-			mu.Lock()
-			res.latencies = append(res.latencies, localLat...)
-			transitions = append(transitions, localTrans...)
-			res.lostRaces += lostRaces
-			res.contentionErrs += contentions
-			res.ambiguous += ambiguous
-			res.maxStarve = max(res.maxStarve, maxStarve)
-			mu.Unlock()
 		}()
 	}
 	wg.Wait()

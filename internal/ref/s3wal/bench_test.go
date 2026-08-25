@@ -32,6 +32,8 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"modernc.org/sqlite"
+	sqlite3 "modernc.org/sqlite/lib"
 
 	"github.com/coder/code-storage/internal/ref"
 )
@@ -445,7 +447,7 @@ func BenchmarkHotRepoContention(b *testing.B) {
 	for _, writers := range writersMatrix {
 		b.Run(fmt.Sprintf("store=sqlite/writers=%d", writers), func(b *testing.B) {
 			rec := &latencyRecorder{}
-			var wins, lostRaces int64
+			var wins, lostRaces, busyRetries int64
 			var maxStarve time.Duration
 			var wall time.Duration
 			for b.Loop() {
@@ -454,22 +456,35 @@ func BenchmarkHotRepoContention(b *testing.B) {
 				rec.samples = append(rec.samples, res.latencies...)
 				wins += int64(res.wins)
 				lostRaces += res.lostRaces
+				busyRetries += res.busyRetries
 				maxStarve = max(maxStarve, res.maxStarve)
 				wall += window
 			}
 			rec.report(b, 50, 99)
 			b.ReportMetric(float64(wins)/wall.Seconds(), "adv/s")
 			b.ReportMetric(float64(lostRaces), "lost-races")
+			b.ReportMetric(float64(busyRetries), "busy-retries")
 			b.ReportMetric(ms(maxStarve), "max-starve-ms")
 			rec.csvDump(b)
 		})
 	}
 }
 
+// isSQLiteBusy reports whether err is a definitive SQLITE_BUSY rejection
+// (the busy_timeout expired while another writer held the file lock). The
+// backend responded, so the statement provably did not commit (see
+// internal/ref's ambiguousError taxonomy) — the contention runner may
+// safely retry without corrupting the lost-update detector's accounting.
+func isSQLiteBusy(err error) bool {
+	var se *sqlite.Error
+	return errors.As(err, &se) && se.Code() == sqlite3.SQLITE_BUSY
+}
+
 // runSQLiteContentionWindow is the SQLite twin of runContentionWindow: N
 // goroutines race GetRef+CASRef on one ref whose sha encodes the seq, with
 // the same lost-update detector (won=false is the lost race; SQLite has no
-// ambiguous class on this path — errors fail the run).
+// ambiguous class on this path — errors fail the run, except SQLITE_BUSY,
+// which is a definitive not-committed rejection and is retried/counted).
 func runSQLiteContentionWindow(tb testing.TB, st *ref.SQLite, repo, name string, writers int, window time.Duration) contentionResult {
 	tb.Helper()
 	assertf(writers > 0, "runSQLiteContentionWindow: %d writers", writers)
@@ -491,12 +506,27 @@ func runSQLiteContentionWindow(tb testing.TB, st *ref.SQLite, repo, name string,
 		go func() {
 			defer wg.Done()
 			var (
-				localLat   []time.Duration
-				localTrans []seqTransition
-				lostRaces  int64
-				maxStarve  time.Duration
+				localLat    []time.Duration
+				localTrans  []seqTransition
+				lostRaces   int64
+				busyRetries int64
+				maxStarve   time.Duration
 			)
 			lastSuccess := start
+			// Merge in a defer so a writer that errors out mid-window
+			// still contributes its recorded wins: discarding them would
+			// desync the detector's final-seq accounting and report a
+			// phantom update that never happened.
+			defer func() {
+				maxStarve = max(maxStarve, time.Since(lastSuccess))
+				mu.Lock()
+				res.latencies = append(res.latencies, localLat...)
+				transitions = append(transitions, localTrans...)
+				res.lostRaces += lostRaces
+				res.busyRetries += busyRetries
+				res.maxStarve = max(res.maxStarve, maxStarve)
+				mu.Unlock()
+			}()
 			cur, err := st.GetRef(ctx, repo, name)
 			if err != nil {
 				tb.Errorf("contention: GetRef: %v", err)
@@ -506,11 +536,20 @@ func runSQLiteContentionWindow(tb testing.TB, st *ref.SQLite, repo, name string,
 				next := parseSeqSHA(tb, cur) + 1
 				t0 := time.Now()
 				won, err := st.CASRef(ctx, repo, name, cur, seqSHA(next))
-				if err != nil {
+				switch {
+				case err != nil && isSQLiteBusy(err):
+					// The 5 s busy_timeout expired while another writer
+					// held the lock — expected under sustained hot-key
+					// hammering. A *sqlite.Error is a definitive backend
+					// rejection (the CAS did NOT commit; see internal/ref
+					// ambiguousError), so retrying the same attempt is
+					// accounting-safe for the lost-update detector.
+					busyRetries++
+					continue
+				case err != nil:
 					tb.Errorf("contention: CASRef: %v", err)
 					return
-				}
-				if won {
+				case won:
 					now := time.Now()
 					localLat = append(localLat, now.Sub(t0))
 					localTrans = append(localTrans, seqTransition{to: next})
@@ -520,18 +559,20 @@ func runSQLiteContentionWindow(tb testing.TB, st *ref.SQLite, repo, name string,
 					continue
 				}
 				lostRaces++
-				if cur, err = st.GetRef(ctx, repo, name); err != nil {
-					tb.Errorf("contention: re-read: %v", err)
-					return
+				reread, err := st.GetRef(ctx, repo, name)
+				if err != nil {
+					if !isSQLiteBusy(err) {
+						tb.Errorf("contention: re-read: %v", err)
+						return
+					}
+					// Busy re-read: retry the CAS with the stale sha —
+					// it just loses the race again and re-reads (may
+					// slightly inflate lost-races under busy storms).
+					busyRetries++
+				} else {
+					cur = reread
 				}
 			}
-			maxStarve = max(maxStarve, time.Since(lastSuccess))
-			mu.Lock()
-			res.latencies = append(res.latencies, localLat...)
-			transitions = append(transitions, localTrans...)
-			res.lostRaces += lostRaces
-			res.maxStarve = max(res.maxStarve, maxStarve)
-			mu.Unlock()
 		}()
 	}
 	wg.Wait()
