@@ -246,6 +246,11 @@ func (s *SimRefStore) LFSObjectRegisteredAt(ctx context.Context, repo, key strin
 	return s.inner.LFSObjectRegisteredAt(ctx, repo, key)
 }
 
+// PackRegisteredBytes delegates to the inner store.
+func (s *SimRefStore) PackRegisteredBytes(ctx context.Context, repo, key string) (int64, bool, error) {
+	return s.inner.PackRegisteredBytes(ctx, repo, key)
+}
+
 // QuotaLedgerState delegates to the inner store (oracle reads).
 func (s *SimRefStore) QuotaLedgerState(ctx context.Context, group []string, ttl time.Duration, excludeKeys ...string) (ref.PackQuotaLedgerState, error) {
 	return s.inner.QuotaLedgerState(ctx, group, ttl, excludeKeys...)

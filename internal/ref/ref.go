@@ -256,6 +256,13 @@ type RefStore interface {
 	// canonical copy is SHORTER than registered, not merely present. ok
 	// is false when no row exists.
 	LFSObjectRegisteredAt(ctx context.Context, repo, key string) (at time.Time, bytes int64, ok bool, err error)
+	// PackRegisteredBytes is LFSObjectRegisteredAt's size half for the
+	// pack registry: the packs.bytes column for (repo, key), the
+	// quarantine heal's completeness yardstick (issue #129). bytes is 0
+	// for rows registered before the column existed (issue #101) — the
+	// caller must treat 0 as size-UNKNOWN, never as "complete at any
+	// length". ok is false when no row exists.
+	PackRegisteredBytes(ctx context.Context, repo, key string) (bytes int64, ok bool, err error)
 	// BumpLFSAdoptionGen increments repo's shared adoption generation
 	// (Codex round 49 on #51): adopting a pre-registry LFS object moves
 	// bytes that physical listings ALREADY contain into the usage
@@ -1092,6 +1099,22 @@ func (s *PG) HasPack(ctx context.Context, repo, key string) (bool, error) {
 	err := s.pool.QueryRow(ctx,
 		`SELECT EXISTS (SELECT 1 FROM packs WHERE repo = $1 AND s3_key = $2)`, repo, key).Scan(&exists)
 	return exists, err
+}
+
+// PackRegisteredBytes returns the registered pack's recorded size — see
+// RefStore (0 = pre-#101 row, size unknown).
+func (s *PG) PackRegisteredBytes(ctx context.Context, repo, key string) (int64, bool, error) {
+	assertf(repo != "" && key != "", "PackRegisteredBytes(%q, %q)", repo, key)
+	var bytes int64
+	err := s.pool.QueryRow(ctx,
+		`SELECT bytes FROM packs WHERE repo = $1 AND s3_key = $2`, repo, key).Scan(&bytes)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, fmt.Errorf("pack registered bytes %s %s: %w", repo, key, err)
+	}
+	return bytes, true, nil
 }
 
 // GetGeneration returns repo's mutation generation (0 = never mutated).

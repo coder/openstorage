@@ -583,6 +583,22 @@ func (s *SQLite) HasPack(ctx context.Context, repo, key string) (bool, error) {
 	return exists, err
 }
 
+// PackRegisteredBytes returns the registered pack's recorded size — see
+// RefStore (0 = pre-#101 row, size unknown).
+func (s *SQLite) PackRegisteredBytes(ctx context.Context, repo, key string) (int64, bool, error) {
+	assertf(repo != "" && key != "", "PackRegisteredBytes(%q, %q)", repo, key)
+	var bytes int64
+	err := s.db.QueryRowContext(ctx,
+		`SELECT bytes FROM packs WHERE repo = ? AND s3_key = ?`, repo, key).Scan(&bytes)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, fmt.Errorf("pack registered bytes %s %s: %w", repo, key, err)
+	}
+	return bytes, true, nil
+}
+
 // GetGeneration returns repo's mutation generation (0 = never mutated).
 func (s *SQLite) GetGeneration(ctx context.Context, repo string) (int64, error) {
 	assertf(repo != "", "GetGeneration: empty repo")

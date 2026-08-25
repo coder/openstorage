@@ -29,6 +29,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/coder/code-storage/internal/blob"
@@ -53,6 +54,23 @@ type PackRegistry interface {
 	// moment, and neither blob timestamp bounds that. bytes is the
 	// registered size, the reap gate's completeness yardstick (#127).
 	LFSObjectRegisteredAt(ctx context.Context, repo, key string) (at time.Time, bytes int64, ok bool, err error)
+	// PackRegisteredBytes reads a registered pack's recorded size (see
+	// ref.RefStore): the quarantine heal's completeness yardstick for
+	// pack keys (issue #129). bytes=0 means the row predates the size
+	// column (issue #101) — size UNKNOWN, never "complete at any length".
+	PackRegisteredBytes(ctx context.Context, repo, key string) (bytes int64, ok bool, err error)
+	// TryAdoptionClaim / RenewAdoptionClaim / ReleaseAdoptionClaim (see
+	// ref.RefStore) fence the heal's truncated-original overwrite (issue
+	// #129): rewriting a PRESENT canonical LFS key is a canonical
+	// materialization, so it must hold the same per-key fleet claim as
+	// every other one (PUT publish/register/verify region, adoption
+	// copy) — the adopter's corrupt-canonical check→delete is only safe
+	// under that mutual exclusion. The into-absence restore stays
+	// deliberately unfenced: it deletes nothing and writes
+	// digest-verified true bytes with a fresh fingerprint.
+	TryAdoptionClaim(ctx context.Context, repo, key string) (claimed bool, owner string, err error)
+	RenewAdoptionClaim(ctx context.Context, key, owner string) (renewed bool, err error)
+	ReleaseAdoptionClaim(ctx context.Context, key, owner string) error
 	// GuardedLFSDelete runs del serialized against LFS registration (see
 	// ref.RefStore): safeDelete's LFS blob delete must go through it, or
 	// a verified upload's register+verify can complete between the
@@ -1167,7 +1185,8 @@ func (s *Sweeper) healQuarantineEntry(ctx context.Context, q blob.ListedObject, 
 		return fmt.Errorf("sweep: heal %s: has pack: %w", orig, err)
 	}
 	if registered {
-		if _, err := s.blobs.Stat(ctx, orig); errors.Is(err, blob.ErrNotFound) {
+		switch size, err := s.blobs.Stat(ctx, orig); {
+		case errors.Is(err, blob.ErrNotFound):
 			switch restored, err := s.restoreFromQuarantine(ctx, orig, q.Key); {
 			case errors.Is(err, blob.ErrNotFound):
 				// The entry vanished between listing and restore: a
@@ -1189,8 +1208,24 @@ func (s *Sweeper) healQuarantineEntry(ctx context.Context, q blob.ListedObject, 
 			// bytes) — never restored over a registered row; the row stays in
 			// the zero-growth repair state and the aged purge below still
 			// collects the backup.
-		} else if err != nil {
+		case err != nil:
 			return fmt.Errorf("sweep: heal %s: stat: %w", orig, err)
+		default:
+			// The original EXISTS — but existence proves nothing (issue
+			// #129, the same size-blind pattern as #127): a still-valid
+			// v0.1 presigned PUT or storage-layer damage can leave a
+			// registered blob SHORTER than registered while this backup
+			// holds the object's only complete bytes, and the aged purge
+			// below would collect it. Classify against the registered
+			// size and heal a truncated original first; spare the backup
+			// whenever completeness cannot be re-established this pass.
+			spare, err := s.healPresentOriginal(ctx, repo, orig, q.Key, size)
+			if err != nil {
+				return err
+			}
+			if spare {
+				return nil
+			}
 		}
 	} else if _, err := s.blobs.Stat(ctx, orig); errors.Is(err, blob.ErrNotFound) {
 		// Crash self-heal for the reap ledger (issue #31): a safeDelete
@@ -1252,6 +1287,210 @@ func (s *Sweeper) healQuarantineEntry(ctx context.Context, q blob.ListedObject, 
 	}
 	return nil
 }
+
+// registeredSize dispatches the authoritative size lookup by key class
+// (registered's twin, issue #129): LFS rows always record their verified
+// byte size, while pack rows record it only since issue #101 — bytes=0 is
+// a pre-migration row whose size is UNKNOWN (a zero-length pack file
+// cannot exist: pack headers alone are non-empty). ok=false means the
+// size cannot be classified: the row vanished mid-heal or predates the
+// size column.
+func (s *Sweeper) registeredSize(ctx context.Context, repo, key string) (int64, bool, error) {
+	if strings.HasPrefix(key, blob.LFSRoot) {
+		_, bytes, ok, err := s.packs.LFSObjectRegisteredAt(ctx, repo, key)
+		return bytes, ok, err
+	}
+	bytes, ok, err := s.packs.PackRegisteredBytes(ctx, repo, key)
+	if bytes == 0 {
+		ok = false // pre-#101 row: 0 means "unknown", never "empty pack"
+	}
+	return bytes, ok, err
+}
+
+// healPresentOriginal classifies a PRESENT registered original against its
+// registered size and heals a truncated one from its quarantine backup
+// (issue #129, the size-aware tier from #123/#127): a registered blob
+// shorter than registered serves corrupt reads while this backup may hold
+// the object's only complete bytes. Returns spare=true when the caller
+// must NOT let the age purge collect the backup this pass:
+//
+//   - the registered size is unknowable (pre-#101 pack row, or the row
+//     vanished mid-heal) — never purge on unknown; a repack fold later
+//     rewrites the row with its size, a vanished row reclassifies as
+//     unregistered next sweep;
+//   - the original is truncated but could not be healed (another worker
+//     holds the key's claim, or a pack backup is itself too short to
+//     complete it) — the next sweep re-examines.
+//
+// A successful heal (and a complete original) returns spare=false: the
+// original provably holds registered-size bytes again, so the strictly
+// age-based purge below is safe. An LFS backup failing the key's own
+// digest also returns spare=false — bytes that cannot be the registered
+// content follow the same aged-purge policy as the into-absence mismatch.
+func (s *Sweeper) healPresentOriginal(ctx context.Context, repo, orig, qKey string, physical int64) (spare bool, err error) {
+	assertf(repo != "" && orig != "" && qKey != "" && physical >= 0,
+		"healPresentOriginal(%q, %q, %q, %d)", repo, orig, qKey, physical)
+	registeredBytes, known, err := s.registeredSize(ctx, repo, orig)
+	if err != nil {
+		return false, fmt.Errorf("sweep: heal %s: registered size: %w", orig, err)
+	}
+	if !known {
+		s.logger.Info("orphan pack sweep: sparing backup of a registered object with unknowable size",
+			"key", orig, "quarantine", qKey)
+		return true, nil
+	}
+	if physical >= registeredBytes {
+		return false, nil // complete: the age purge below governs
+	}
+	if !strings.HasPrefix(orig, blob.LFSRoot) {
+		// Pack keys are content-addressed to server-built packs, so
+		// restoreFromQuarantine copies pack backups unconditionally — but
+		// a backup can itself descend from an already-truncated original,
+		// and restoring a SHORTER backup over a longer prefix would
+		// regress it. Only a backup holding at least the registered size
+		// can complete the original; anything less is spared unrestored
+		// (it may still be the longest surviving prefix).
+		switch qSize, err := s.blobs.Stat(ctx, qKey); {
+		case errors.Is(err, blob.ErrNotFound):
+			return true, nil // a peer purged or consumed the entry
+		case err != nil:
+			return false, fmt.Errorf("sweep: heal %s: stat quarantine %s: %w", orig, qKey, err)
+		case qSize < registeredBytes:
+			s.logger.Warn("orphan pack sweep: sparing short backup of a truncated registered pack",
+				"key", orig, "physical_bytes", physical, "registered_bytes", registeredBytes, "backup_bytes", qSize)
+			return true, nil
+		}
+		return s.finishTruncatedHeal(ctx, orig, qKey, physical, registeredBytes)
+	}
+	// Overwriting a PRESENT canonical LFS key is a canonical
+	// materialization: it must hold the per-key fleet adoption claim
+	// (ADR-41/#104) — the adopter's corrupt-canonical check→delete is
+	// only sound while no other writer can land bytes inside its
+	// check-to-delete window, and every other canonical writer (PUT
+	// publish region, adoption copy) already serializes on this claim.
+	// claimed=false means such a writer is live right now: it will
+	// converge the key itself, so skip and keep the backup.
+	claimed, owner, err := s.packs.TryAdoptionClaim(ctx, repo, orig)
+	if err != nil {
+		return false, fmt.Errorf("sweep: heal %s: adoption claim: %w", orig, err)
+	}
+	if !claimed {
+		s.logger.Info("orphan pack sweep: sparing backup of a truncated object while another worker holds its claim",
+			"key", orig)
+		return true, nil
+	}
+	defer func() {
+		// Best-effort, detached and bounded like the restore's own
+		// invalidation handoff: a lost release expires via the TTL.
+		rctx, rcancel := context.WithTimeout(context.WithoutCancel(ctx), blob.CoverHandoffTimeout)
+		defer rcancel()
+		if rerr := s.packs.ReleaseAdoptionClaim(rctx, orig, owner); rerr != nil {
+			s.logger.Warn("orphan pack sweep: releasing adoption claim failed", "key", orig, "error", rerr)
+		}
+	}()
+	// The restore digest-verifies the whole backup before copying — a
+	// size-scaled walk that can outlive any fixed claim TTL against a
+	// slow backend (Codex round 74 discipline), so the claim is renewed
+	// on the adoption cadence and a definitive lease loss aborts the
+	// overwrite: it must never run outside the claim's exclusion.
+	cctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	stopRenew := s.keepClaimRenewed(cctx, cancel, orig, owner)
+	spare, err = s.finishTruncatedHeal(cctx, orig, qKey, physical, registeredBytes)
+	// Join the renewer BEFORE judging success, and let a recorded lease
+	// loss override a successful copy (the adoption pipeline's
+	// discipline): a loss recorded while the copy was in flight means
+	// the successor's claim-fenced window may have deleted the key after
+	// these bytes landed, so the heal is unproven — keep the backup and
+	// let the next sweep re-examine.
+	stopRenew()
+	if err == nil && !spare {
+		if cause := context.Cause(cctx); cause != nil {
+			s.logger.Warn("orphan pack sweep: sparing backup after losing the adoption claim mid-heal",
+				"key", orig, "cause", cause)
+			return true, nil
+		}
+	}
+	return spare, err
+}
+
+// finishTruncatedHeal runs the shared tail of a truncated-original heal:
+// the guarded restore (digest verification for LFS backups, cover
+// reservation, floor-generation handoff — restoreFromQuarantine's full
+// pipeline; the cover conservatively reserves the backup's whole size even
+// though the truncated prefix is already physically listed, a transient
+// over-count on the safe side) and the spare verdict for the purge below.
+func (s *Sweeper) finishTruncatedHeal(ctx context.Context, orig, qKey string, physical, registeredBytes int64) (spare bool, err error) {
+	switch restored, err := s.restoreFromQuarantine(ctx, orig, qKey); {
+	case errors.Is(err, blob.ErrNotFound):
+		return true, nil // a peer purged or consumed the entry
+	case err != nil:
+		if cause := context.Cause(ctx); cause != nil && !errors.Is(err, cause) {
+			err = errors.Join(err, cause)
+		}
+		return false, fmt.Errorf("sweep: heal %s: restore over truncated original: %w", orig, err)
+	case restored:
+		s.logger.Warn("orphan pack sweep: healed truncated registered object from quarantine",
+			"key", orig, "physical_bytes", physical, "registered_bytes", registeredBytes)
+		return false, nil // complete again: the age purge below governs
+	default:
+		// An LFS backup failing the key's own digest: never restored
+		// over a registered row, and never spared — bytes that cannot be
+		// the registered content are collectible once aged, exactly like
+		// the into-absence mismatch.
+		return false, nil
+	}
+}
+
+// keepClaimRenewed keeps the sweeper's adoption claim on key renewed while
+// a truncated-original overwrite runs (the sweeper-side twin of the LFS
+// handlers' renewal loop): renewal failures cancel ctx with a cause so the
+// restore aborts instead of writing outside the claim. The returned stop
+// joins the renewal goroutine.
+func (s *Sweeper) keepClaimRenewed(ctx context.Context, cancel context.CancelCauseFunc, key, owner string) (stop func()) {
+	assertf(key != "" && owner != "", "keepClaimRenewed(%q, %q)", key, owner)
+	done := make(chan struct{})
+	exited := make(chan struct{})
+	var once sync.Once
+	go func() {
+		defer close(exited)
+		ticker := time.NewTicker(sweepClaimRenewInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+			rctx, rcancel := context.WithTimeout(ctx, sweepClaimRenewTimeout)
+			renewed, err := s.packs.RenewAdoptionClaim(rctx, key, owner)
+			rcancel()
+			if err != nil {
+				cancel(fmt.Errorf("renew claim for %s: %w", key, err))
+				return
+			}
+			if !renewed {
+				cancel(fmt.Errorf("claim for %s expired and was taken over", key))
+				return
+			}
+		}
+	}()
+	return func() {
+		once.Do(func() { close(done) })
+		<-exited
+	}
+}
+
+// sweepClaimRenewInterval / sweepClaimRenewTimeout mirror the LFS
+// handlers' adoption-claim renewal cadence: several renewals fit inside
+// one ref.AdoptionClaimTTL, and each attempt is bounded so a stalled
+// registry cannot silently let the lease lapse mid-overwrite. The
+// interval is a var so tests can force a renewal inside a fast restore.
+var sweepClaimRenewInterval = 5 * time.Minute
+
+const sweepClaimRenewTimeout = 15 * time.Second
 
 // revalidateOrphan re-checks one delete candidate against live state,
 // discarding the sweep's initial snapshot: first a fresh registry lookup

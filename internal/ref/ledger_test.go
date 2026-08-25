@@ -1106,3 +1106,32 @@ func TestReserveUsageFloor(t *testing.T) {
 		}
 	})
 }
+
+// TestPackRegisteredBytes (issue #129): the quarantine heal classifies a
+// present original's completeness against the packs.bytes column — both
+// backends must return the recorded size, report pre-#101 rows as 0
+// (size unknown), and absence as ok=false.
+func TestPackRegisteredBytes(t *testing.T) {
+	runRefBackends(t, func(t *testing.T, s Store) {
+		ctx := context.Background()
+		repo := t.Name()
+		sized := "packs/" + repo + "/pack-sized.pack"
+		unsized := "packs/" + repo + "/pack-unsized.pack"
+
+		if bytes, ok, err := s.PackRegisteredBytes(ctx, repo, sized); err != nil || ok || bytes != 0 {
+			t.Fatalf("unregistered = (%d, %v, %v), want absent", bytes, ok, err)
+		}
+		if err := s.RegisterPacks(ctx, repo, []Pack{
+			{ID: "sized", Key: sized, Size: 1234},
+			{ID: "unsized", Key: unsized}, // pre-#101 row shape: bytes 0
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if bytes, ok, err := s.PackRegisteredBytes(ctx, repo, sized); err != nil || !ok || bytes != 1234 {
+			t.Fatalf("sized = (%d, %v, %v), want (1234, true, nil)", bytes, ok, err)
+		}
+		if bytes, ok, err := s.PackRegisteredBytes(ctx, repo, unsized); err != nil || !ok || bytes != 0 {
+			t.Fatalf("unsized = (%d, %v, %v), want (0, true, nil) — size unknown", bytes, ok, err)
+		}
+	})
+}

@@ -301,6 +301,18 @@ func (stubLedger) SweepExpiredPackReservations(context.Context, time.Duration) (
 func (stubLedger) ReconcileLegacyLFSObjects(context.Context) (int64, bool, error) {
 	return 0, false, nil
 }
+func (stubLedger) PackRegisteredBytes(context.Context, string, string) (int64, bool, error) {
+	return 0, false, nil
+}
+func (stubLedger) TryAdoptionClaim(context.Context, string, string) (bool, string, error) {
+	return true, "stub-owner", nil
+}
+func (stubLedger) RenewAdoptionClaim(context.Context, string, string) (bool, error) {
+	return true, nil
+}
+func (stubLedger) ReleaseAdoptionClaim(context.Context, string, string) error {
+	return nil
+}
 func (stubLedger) HasLFSObject(context.Context, string, string) (bool, error) {
 	return false, nil
 }
@@ -525,6 +537,106 @@ func TestSweep_HealQuarantine(t *testing.T) {
 	// restore-then-purge is net zero and must not be credited.
 	if want := int64(len("stale-bytes")); report.BytesReclaimed != want {
 		t.Fatalf("BytesReclaimed = %d, want %d (stale purge only)", report.BytesReclaimed, want)
+	}
+}
+
+// content reads key's full bytes (test-sized objects only).
+func (f *sweepFixture) content(key string) string {
+	f.t.Helper()
+	size, err := f.blobs.Stat(context.Background(), key)
+	if err != nil {
+		f.t.Fatalf("Stat(%q): %v", key, err)
+	}
+	b, err := f.blobs.ReadRange(context.Background(), key, 0, size)
+	if err != nil {
+		f.t.Fatalf("ReadRange(%q): %v", key, err)
+	}
+	return string(b)
+}
+
+// registerSized records the pack with its byte size (packs.bytes > 0), the
+// post-#101 shape the size-aware heal classifies against.
+func (f *sweepFixture) registerSized(repo, id, key string, size int64) {
+	f.t.Helper()
+	if err := f.store.RegisterPacks(context.Background(), repo, []ref.Pack{{ID: id, Key: key, Size: size}}); err != nil {
+		f.t.Fatalf("RegisterPacks(%q): %v", repo, err)
+	}
+}
+
+// A registered pack that is PRESENT but SHORTER than its registered size
+// (issue #129: still-valid presigned overwrite, storage-layer damage) must
+// be healed from an aged quarantine backup holding the complete bytes —
+// mere existence of the original must not let the age purge collect the
+// object's only complete copy.
+func TestSweep_HealRestoresTruncatedRegisteredPack(t *testing.T) {
+	f := newSweepFixture(t)
+	full := "complete-pack-bytes"
+	key := blob.PackKey("r1", "shorted")
+	f.upload(key, full[:5])
+	f.registerSized("r1", "shorted", key, int64(len(full)))
+	qKey := quarantinePrefix + "00112233aabbccdd/" + key
+	f.upload(qKey, full)
+	f.backdate(qKey, 25*time.Hour)
+
+	if _, err := f.sweeper(SweepConfig{Threshold: 24 * time.Hour, Delete: true}).Sweep(context.Background()); err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if got := f.content(key); got != full {
+		t.Fatalf("truncated registered pack %q = %q after sweep, want the backup's complete bytes restored", key, got)
+	}
+	// Healed => the original is complete again; the aged backup purges.
+	if f.exists(qKey) {
+		t.Fatalf("aged backup %q survived after the truncated original was healed", qKey)
+	}
+}
+
+// A registered pack row that predates the packs.bytes migration (bytes=0)
+// makes completeness unknowable: the aged purge must SPARE the backup —
+// it may hold the object's only complete bytes and nothing can prove the
+// original whole (issue #129's conservative unknown-size rule).
+func TestSweep_HealSparesBackupOfUnknownSizePack(t *testing.T) {
+	f := newSweepFixture(t)
+	key := blob.PackKey("r1", "presize")
+	f.upload(key, "maybe-truncated")
+	f.register("r1", "presize", key) // Size 0 => pre-migration row shape
+	qKey := quarantinePrefix + "00112233aabbccdd/" + key
+	f.upload(qKey, "possibly-the-only-complete-copy")
+	f.backdate(qKey, 25*time.Hour)
+
+	if _, err := f.sweeper(SweepConfig{Threshold: 24 * time.Hour, Delete: true}).Sweep(context.Background()); err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if !f.exists(qKey) {
+		t.Fatalf("aged backup %q of an unknown-size registered pack was purged — completeness was unverifiable", qKey)
+	}
+	// Unknown size classifies nothing: the original must not be rewritten.
+	if got := f.content(key); got != "maybe-truncated" {
+		t.Fatalf("unknown-size original %q = %q, want untouched", key, got)
+	}
+}
+
+// A truncated registered pack whose backup is ALSO shorter than the
+// registered size cannot be completed by a restore: the heal must not
+// rewrite the original (the restore could even regress a longer prefix),
+// and the purge must spare the backup (issue #129).
+func TestSweep_HealSparesTruncatedPackWithShortBackup(t *testing.T) {
+	f := newSweepFixture(t)
+	full := "complete-pack-bytes"
+	key := blob.PackKey("r1", "bothshort")
+	f.upload(key, full[:10])
+	f.registerSized("r1", "bothshort", key, int64(len(full)))
+	qKey := quarantinePrefix + "00112233aabbccdd/" + key
+	f.upload(qKey, full[:7])
+	f.backdate(qKey, 25*time.Hour)
+
+	if _, err := f.sweeper(SweepConfig{Threshold: 24 * time.Hour, Delete: true}).Sweep(context.Background()); err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if got := f.content(key); got != full[:10] {
+		t.Fatalf("original %q = %q, want untouched (backup cannot complete it)", key, got)
+	}
+	if !f.exists(qKey) {
+		t.Fatalf("backup %q was purged while the registered original is provably incomplete", qKey)
 	}
 }
 
