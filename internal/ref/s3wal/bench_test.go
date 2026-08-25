@@ -13,7 +13,7 @@
 // Benches follow the nightly conventions (bench-nightly.yml): heavy lanes
 // skip under -short/no Docker; the contention window defaults to 5 s per N
 // (CODESTORAGE_BENCH_CONTENTION_SECS=60 for the plan §3 sustained runs).
-package s3wal
+package s3wal_test
 
 import (
 	"bytes"
@@ -36,11 +36,21 @@ import (
 	sqlite3 "modernc.org/sqlite/lib"
 
 	"github.com/coder/code-storage/internal/ref"
+	"github.com/coder/code-storage/internal/ref/s3wal"
+	"github.com/coder/code-storage/internal/ref/s3wal/s3waltest"
 )
+
+// assertf is the local fail-fast invariant check (the package-internal
+// one is invisible to this external test package).
+func assertf(cond bool, format string, args ...any) {
+	if !cond {
+		panic(fmt.Sprintf("s3wal bench assertion failed: "+format, args...))
+	}
+}
 
 const (
 	// EnvBenchS3URL names the real-S3 endpoint for the §3 Gate 1a-B lane
-	// (same URL grammar as EnvTestS3WALURL). Unset skips — results are
+	// (same URL grammar as s3waltest.EnvTestS3WALURL). Unset skips — results are
 	// never fabricated.
 	EnvBenchS3URL = "CODESTORAGE_BENCH_S3_URL"
 	// EnvBenchCSVDir, when set, receives one raw per-op CSV per bench cell
@@ -118,7 +128,7 @@ func (r *latencyRecorder) csvDump(b *testing.B) {
 type s3BenchLane struct {
 	name   string
 	skip   string
-	cas    *Client
+	cas    *s3wal.Client
 	raw    *s3.Client
 	bucket string
 	prefix string
@@ -133,11 +143,11 @@ func benchS3Lanes(b *testing.B) []*s3BenchLane {
 	if testing.Short() {
 		lanes = append(lanes, &s3BenchLane{name: "seaweedfs", skip: "-short skips the SeaweedFS container lane"})
 	} else {
-		endpoint := startSeaweedFS(b)
-		raw := rawS3Client(b, endpoint, "us-east-1", "seaweedfs", "seaweedfs")
-		ensureBucket(b, raw, "s3wal-bench")
-		cas := New(raw, "s3wal-bench")
-		cas.DecodeSeq = decodeSeq
+		endpoint := s3waltest.StartSeaweedFS(b)
+		raw := s3waltest.RawS3Client(endpoint, "us-east-1", "seaweedfs", "seaweedfs")
+		s3waltest.MustEnsureBucket(b, raw, "s3wal-bench")
+		cas := s3wal.New(raw, "s3wal-bench")
+		cas.DecodeSeq = s3waltest.DecodeSeq
 		lanes = append(lanes, &s3BenchLane{name: "seaweedfs", cas: cas, raw: raw, bucket: "s3wal-bench"})
 	}
 	if blobURL := os.Getenv(EnvBenchS3URL); blobURL == "" {
@@ -146,11 +156,11 @@ func benchS3Lanes(b *testing.B) []*s3BenchLane {
 			skip: fmt.Sprintf("set %s (s3://bucket?region=…) plus AWS credentials to run the real-S3 gate lane — results are never fabricated", EnvBenchS3URL),
 		})
 	} else {
-		raw, bucket := openExternalS3(b, blobURL)
-		prefix := "bench/" + randomHexTB(b, 8) + "/"
-		b.Cleanup(func() { deleteAllPrefix(b, raw, bucket, prefix) })
-		cas := New(raw, bucket)
-		cas.DecodeSeq = decodeSeq
+		raw, bucket := s3waltest.OpenExternalS3(b, blobURL)
+		prefix := "bench/" + s3waltest.RandomHex(b, 8) + "/"
+		b.Cleanup(func() { s3waltest.DeleteAllPrefix(b, raw, bucket, prefix) })
+		cas := s3wal.New(raw, bucket)
+		cas.DecodeSeq = s3waltest.DecodeSeq
 		lanes = append(lanes, &s3BenchLane{name: "s3", cas: cas, raw: raw, bucket: bucket, prefix: prefix})
 	}
 	return lanes
@@ -215,15 +225,15 @@ func BenchmarkCASAdvance(b *testing.B) {
 				if lane.skip != "" {
 					b.Skip(lane.skip)
 				}
-				key := lane.prefix + "_wal/repo/adv-" + randomHexTB(b, 6)
+				key := lane.prefix + "_wal/repo/adv-" + s3waltest.RandomHex(b, 6)
 				seq := int64(1)
-				etag, err := lane.cas.Create(ctx, key, encodePayload(b, seq, size.bytes))
+				etag, err := lane.cas.Create(ctx, key, s3waltest.EncodePayload(b, seq, size.bytes))
 				if err != nil {
 					b.Fatalf("create: %v", err)
 				}
 				for range benchWarmupOps {
 					seq++
-					if etag, err = lane.cas.Advance(ctx, key, encodePayload(b, seq, size.bytes), etag); err != nil {
+					if etag, err = lane.cas.Advance(ctx, key, s3waltest.EncodePayload(b, seq, size.bytes), etag); err != nil {
 						b.Fatalf("warmup advance: %v", err)
 					}
 				}
@@ -232,7 +242,7 @@ func BenchmarkCASAdvance(b *testing.B) {
 				b.SetBytes(int64(size.bytes))
 				for b.Loop() {
 					seq++
-					body := encodePayload(b, seq, size.bytes)
+					body := s3waltest.EncodePayload(b, seq, size.bytes)
 					t0 := time.Now()
 					etag, err = lane.cas.Advance(ctx, key, body, etag)
 					rec.record(time.Since(t0))
@@ -295,10 +305,10 @@ func BenchmarkSimulatedPush(b *testing.B) {
 			if lane.skip != "" {
 				b.Skip(lane.skip)
 			}
-			id := randomHexTB(b, 6)
+			id := s3waltest.RandomHex(b, 6)
 			manifest := lane.prefix + "_wal/repo/push-" + id
 			seq := int64(1)
-			if _, err := lane.cas.Create(ctx, manifest, encodePayload(b, seq, 1<<10)); err != nil {
+			if _, err := lane.cas.Create(ctx, manifest, s3waltest.EncodePayload(b, seq, 1<<10)); err != nil {
 				b.Fatalf("create manifest: %v", err)
 			}
 			i := 0
@@ -317,12 +327,12 @@ func BenchmarkSimulatedPush(b *testing.B) {
 					b.Fatalf("put pack: %v", err)
 				}
 				seq++
-				etag, err := lane.cas.Advance(ctx, manifest, encodePayload(b, seq, 1<<10), obj.ETag)
+				etag, err := lane.cas.Advance(ctx, manifest, s3waltest.EncodePayload(b, seq, 1<<10), obj.ETag)
 				if err != nil {
 					b.Fatalf("advance 1: %v", err)
 				}
 				seq++
-				if _, err := lane.cas.Advance(ctx, manifest, encodePayload(b, seq, 1<<10), etag); err != nil {
+				if _, err := lane.cas.Advance(ctx, manifest, s3waltest.EncodePayload(b, seq, 1<<10), etag); err != nil {
 					b.Fatalf("advance 2: %v", err)
 				}
 				d := time.Since(t0)
@@ -426,7 +436,7 @@ func BenchmarkHotRepoContention(b *testing.B) {
 				var maxStarve time.Duration
 				var elapsed time.Duration
 				for b.Loop() {
-					key := lane.prefix + "_wal/repo/hot-" + randomHexTB(b, 6)
+					key := lane.prefix + "_wal/repo/hot-" + s3waltest.RandomHex(b, 6)
 					res := runContentionWindow(b, lane.cas, key, writers, window, 1<<10)
 					rec.samples = append(rec.samples, res.latencies...)
 					wins += int64(res.wins)
@@ -461,7 +471,7 @@ func BenchmarkHotRepoContention(b *testing.B) {
 			var elapsed time.Duration
 			for b.Loop() {
 				st := benchSQLite(b)
-				res := runSQLiteContentionWindow(b, st, "benchrepo", "refs/heads/hot-"+randomHexTB(b, 4), writers, window)
+				res := runSQLiteContentionWindow(b, st, "benchrepo", "refs/heads/hot-"+s3waltest.RandomHex(b, 4), writers, window)
 				rec.samples = append(rec.samples, res.latencies...)
 				wins += int64(res.wins)
 				lostRaces += res.lostRaces
@@ -664,8 +674,8 @@ func BenchmarkGenerationRead(b *testing.B) {
 				if lane.skip != "" {
 					b.Skip(lane.skip)
 				}
-				key := lane.prefix + "_wal/repo/gen-" + randomHexTB(b, 6)
-				etag, err := lane.cas.Create(ctx, key, encodePayload(b, 1, 1<<10))
+				key := lane.prefix + "_wal/repo/gen-" + s3waltest.RandomHex(b, 6)
+				etag, err := lane.cas.Create(ctx, key, s3waltest.EncodePayload(b, 1, 1<<10))
 				if err != nil {
 					b.Fatalf("create: %v", err)
 				}
@@ -677,8 +687,8 @@ func BenchmarkGenerationRead(b *testing.B) {
 						}
 						return
 					}
-					if _, err := lane.cas.GetIfChanged(ctx, key, etag); !errors.Is(err, ErrNotModified) {
-						b.Fatalf("GetIfChanged = %v, want ErrNotModified", err)
+					if _, err := lane.cas.GetIfChanged(ctx, key, etag); !errors.Is(err, s3wal.ErrNotModified) {
+						b.Fatalf("GetIfChanged = %v, want s3wal.ErrNotModified", err)
 					}
 				}
 				for range benchWarmupOps {

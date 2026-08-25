@@ -16,7 +16,7 @@
 // Every verdict is logged as `VERDICT store=… surface=… verdict=… detail=…`
 // so a lane transcript is the raw material for the §5-R7 qualification
 // matrix (docs/plans/s3wal-phase1a-results.md).
-package s3wal
+package s3wal_test
 
 import (
 	"bytes"
@@ -30,7 +30,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"os"
 	"regexp"
 	"strings"
@@ -39,33 +38,28 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
-	"github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
-	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
-	"github.com/testcontainers/testcontainers-go"
-	tcminio "github.com/testcontainers/testcontainers-go/modules/minio"
-	"github.com/testcontainers/testcontainers-go/wait"
 	gcblob "gocloud.dev/blob"
 	"gocloud.dev/blob/s3blob"
 	"gocloud.dev/gcerrors"
 	"golang.org/x/sync/errgroup"
+
+	"github.com/coder/code-storage/internal/ref/s3wal"
+
+	"github.com/coder/code-storage/internal/ref/s3wal/s3waltest"
 )
 
 // EnvTestS3WALURL names an external S3 endpoint the qualification lane runs
-// against (same URL grammar as CODESTORAGE_TEST_S3_URL in internal/blob;
-// distinct variable so blob-package and s3wal runs never collide on
-// cleanup). Unset skips the lane.
-const EnvTestS3WALURL = "CODESTORAGE_TEST_S3WAL_URL"
+// against — see s3waltest.EnvTestS3WALURL. Unset skips the lane.
+const EnvTestS3WALURL = s3waltest.EnvTestS3WALURL
 
 // Store image pins. SeaweedFS is the self-hosted store of record (plan
 // §5-R7); the MinIO pin is the repo's legacy CI image, kept in the matrix
 // only to document its conditional-write behavior empirically.
 const (
-	seaweedFSImage   = "chrislusf/seaweedfs:4.42"
-	minioLegacyImage = "minio/minio:RELEASE.2024-01-16T16-07-38Z"
+	seaweedFSImage   = s3waltest.SeaweedFSImage
+	minioLegacyImage = s3waltest.MinIOLegacyImage
 )
 
 // ---------------------------------------------------------------------------
@@ -140,195 +134,37 @@ func randomHexTB(tb testing.TB, n int) string {
 }
 
 // ---------------------------------------------------------------------------
-// Store lifecycles: containers + client construction.
+// Store lifecycles: containers + client construction. The concrete
+// fixtures live in the s3waltest subpackage (shared with the bench harness
+// and package ref's conformance lane — s3waltest never imports s3wal, so
+// these internal tests may import it); the thin wrappers below keep the
+// original call sites unchanged.
 
-// startSeaweedFS runs the pinned SeaweedFS image (`weed server -s3`:
-// master + volume + filer + S3 gateway in one process; versioning and
-// object-lock never enabled — seaweedfs#8073 avoidance) and returns the S3
-// endpoint URL. The gateway components start asynchronously after the port
-// listens, so callers must treat the first successful CreateBucket as the
-// readiness signal (ensureBucket retries).
-func startSeaweedFS(tb testing.TB) string {
-	tb.Helper()
-	ctx := context.Background()
-	c, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
-		ContainerRequest: testcontainers.ContainerRequest{
-			Image:        seaweedFSImage,
-			ExposedPorts: []string{"8333/tcp"},
-			Cmd:          []string{"server", "-s3", "-dir=/data", "-ip.bind=0.0.0.0"},
-			WaitingFor:   wait.ForListeningPort("8333/tcp").WithStartupTimeout(2 * time.Minute),
-		},
-		Started: true,
-	})
-	if err != nil {
-		tb.Fatalf("start seaweedfs container: %v", err)
-	}
-	tb.Cleanup(func() { _ = c.Terminate(context.Background()) })
-	host, err := c.Host(ctx)
-	if err != nil {
-		tb.Fatalf("seaweedfs host: %v", err)
-	}
-	port, err := c.MappedPort(ctx, "8333/tcp")
-	if err != nil {
-		tb.Fatalf("seaweedfs mapped port: %v", err)
-	}
-	return fmt.Sprintf("http://%s:%s", host, port.Port())
-}
+func startSeaweedFS(tb testing.TB) string { return s3waltest.StartSeaweedFS(tb) }
 
-// startMinIOLegacy runs the repo's legacy MinIO CI pin exactly like
-// internal/blob/minio_test.go does.
 func startMinIOLegacy(tb testing.TB) (endpoint, user, pass string) {
-	tb.Helper()
-	ctx := context.Background()
-	minioC, err := tcminio.Run(ctx, minioLegacyImage)
-	if err != nil {
-		tb.Fatalf("start minio container: %v", err)
-	}
-	tb.Cleanup(func() { _ = minioC.Terminate(context.Background()) })
-	addr, err := minioC.ConnectionString(ctx)
-	if err != nil {
-		tb.Fatalf("minio connection string: %v", err)
-	}
-	return "http://" + addr, minioC.Username, minioC.Password
+	return s3waltest.StartMinIOLegacy(tb)
 }
 
-// harnessHTTPClient is shared by every harness S3 client. The SDK default
-// transport keeps only a handful of idle connections per host; the 60 s
-// contention campaign (writers=32, CODESTORAGE_BENCH_CONTENTION_SECS=60)
-// churns thousands of short-lived connections through one endpoint, piling
-// up TIME_WAIT sockets until the kernel runs out of ephemeral ports and
-// dials fail pre-send with "connect: cannot assign requested address".
-// Pooling well above the maximum harness concurrency keeps connections
-// reused instead of recreated. (casobj.New derives its no-retry client from
-// Options(), so the pooled client propagates to CAS calls too.)
-var harnessHTTPClient = awshttp.NewBuildableClient().WithTransportOptions(func(t *http.Transport) {
-	t.MaxIdleConns = 256
-	t.MaxIdleConnsPerHost = 256
-})
-
-// rawS3Client builds a path-style SigV4 client with static credentials —
-// the same wiring shape as internal/blob's s3ClientOptions, but with
-// explicit credentials so container lanes never depend on process env.
 func rawS3Client(tb testing.TB, endpoint, region, accessKey, secretKey string) *s3.Client {
 	tb.Helper()
-	cfg := aws.Config{
-		Region:      region,
-		Credentials: credentials.NewStaticCredentialsProvider(accessKey, secretKey, ""),
-		HTTPClient:  harnessHTTPClient,
-	}
-	return s3.NewFromConfig(cfg, func(o *s3.Options) {
-		o.BaseEndpoint = aws.String(endpoint)
-		o.UsePathStyle = true
-	})
+	return s3waltest.RawS3Client(endpoint, region, accessKey, secretKey)
 }
 
-// ensureBucket creates the bucket, retrying while the store boots (the
-// SeaweedFS S3 gateway accepts TCP before the filer is ready) and
-// tolerating already-owned rejections, then verifies it with HeadBucket —
-// the harness's bucket bootstrap/health-check surface.
 func ensureBucket(tb testing.TB, client *s3.Client, bucket string) {
 	tb.Helper()
-	ctx := context.Background()
-	deadline := time.Now().Add(60 * time.Second)
-	for {
-		_, err := client.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(bucket)})
-		if err == nil {
-			break
-		}
-		var owned *s3types.BucketAlreadyOwnedByYou
-		var exists *s3types.BucketAlreadyExists
-		if errors.As(err, &owned) || errors.As(err, &exists) {
-			break
-		}
-		if time.Now().After(deadline) {
-			tb.Fatalf("CreateBucket(%s) never succeeded (store not ready?): %v", bucket, err)
-		}
-		time.Sleep(250 * time.Millisecond)
-	}
-	if _, err := client.HeadBucket(ctx, &s3.HeadBucketInput{Bucket: aws.String(bucket)}); err != nil {
-		tb.Fatalf("HeadBucket(%s) after create: %v", bucket, err)
-	}
+	s3waltest.MustEnsureBucket(tb, client, bucket)
 }
 
-// openExternalS3 opens an externally provided endpoint from a blob-style
-// URL (s3://bucket?endpoint=…&region=…&s3ForcePathStyle=true; credentials
-// from the standard AWS env). Real-endpoint safety follows
-// internal/blob/s3endpoint_test.go: buckets are created only on emulator
-// endpoints (endpoint= present); against real S3 the bucket must already
-// exist (HeadBucket only — never CreateBucket, which can reset ACLs on an
-// owned us-east-1 bucket), and versioned buckets are refused because the
-// per-key DeleteObject cleanup would silently accumulate noncurrent
-// versions.
 func openExternalS3(tb testing.TB, blobURL string) (*s3.Client, string) {
 	tb.Helper()
-	ctx := context.Background()
-	u, err := url.Parse(blobURL)
-	if err != nil {
-		tb.Fatalf("parse %s: %v", blobURL, err)
-	}
-	if u.Scheme != "s3" || u.Host == "" {
-		tb.Fatalf("external URL %q must be s3://bucket?endpoint=…&region=…", blobURL)
-	}
-	bucket := u.Host
-	q := u.Query()
-	region := q.Get("region")
-	if region == "" {
-		region = "us-east-1"
-	}
-	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(region), config.WithHTTPClient(harnessHTTPClient))
-	if err != nil {
-		tb.Fatalf("aws config: %v", err)
-	}
-	client := s3.NewFromConfig(cfg, func(o *s3.Options) {
-		if ep := q.Get("endpoint"); ep != "" {
-			o.BaseEndpoint = aws.String(ep)
-		}
-		o.UsePathStyle = true
-	})
-	if q.Get("endpoint") != "" {
-		ensureBucket(tb, client, bucket)
-	} else if _, err := client.HeadBucket(ctx, &s3.HeadBucketInput{Bucket: aws.String(bucket)}); err != nil {
-		tb.Fatalf("bucket %q must already exist on real S3 (refusing to create or mutate it): %v", bucket, err)
-	}
-	ver, err := client.GetBucketVersioning(ctx, &s3.GetBucketVersioningInput{Bucket: aws.String(bucket)})
-	if err != nil {
-		tb.Fatalf("GetBucketVersioning(%s): %v", bucket, err)
-	}
-	if ver.Status == s3types.BucketVersioningStatusEnabled || ver.Status == s3types.BucketVersioningStatusSuspended {
-		tb.Fatalf("bucket %q has versioning enabled or suspended; the harness relies on DeleteObject cleanup — use an unversioned scratch bucket", bucket)
-	}
-	return client, bucket
+	return s3waltest.OpenExternalS3(tb, blobURL)
 }
 
-// deleteAllPrefix lists then deletes every key under prefix, reporting real
-// deletion failures so a PASS can never silently leak objects into a
-// user-supplied bucket.
 func deleteAllPrefix(tb testing.TB, client *s3.Client, bucket, prefix string) {
 	tb.Helper()
 	assertf(prefix != "", "deleteAllPrefix: empty prefix would delete the whole bucket")
-	ctx := context.Background()
-	var keys []string
-	p := s3.NewListObjectsV2Paginator(client, &s3.ListObjectsV2Input{
-		Bucket: aws.String(bucket),
-		Prefix: aws.String(prefix),
-	})
-	for p.HasMorePages() {
-		page, err := p.NextPage(ctx)
-		if err != nil {
-			tb.Errorf("cleanup list %s: %v", prefix, err)
-			return
-		}
-		for _, o := range page.Contents {
-			keys = append(keys, aws.ToString(o.Key))
-		}
-	}
-	for _, k := range keys {
-		if _, err := client.DeleteObject(ctx, &s3.DeleteObjectInput{
-			Bucket: aws.String(bucket), Key: aws.String(k),
-		}); err != nil {
-			tb.Errorf("cleanup delete %s: %v", k, err)
-		}
-	}
+	s3waltest.DeleteAllPrefix(tb, client, bucket, prefix)
 }
 
 // ---------------------------------------------------------------------------
@@ -359,7 +195,7 @@ func vPass(surface string) verdict { return verdict{surface, verdictPass, ""} }
 // verdictRejects is reserved for DEFINITIVE store responses proving the
 // store rejected the operation: a Client sentinel minted from a specific
 // store status (412/409-exhausted/404/304) or an SDK error carrying a real
-// 4xx HTTP response. Everything else — AmbiguousError (post-send
+// 4xx HTTP response. Everything else — s3wal.AmbiguousError (post-send
 // 5xx/timeout: the write may have landed), raw 5xx responses, and
 // transport/timeout failures that never produced a store verdict — is
 // verdictError: the surface could not establish how the store behaves, so
@@ -367,16 +203,16 @@ func vPass(surface string) verdict { return verdict{surface, verdictPass, ""} }
 // behavioral finding it never observed.
 func rejectVerdict(err error) string {
 	assertf(err != nil, "rejectVerdict: nil error")
-	var amb *AmbiguousError
+	var amb *s3wal.AmbiguousError
 	if errors.As(err, &amb) {
 		return verdictError
 	}
-	for _, definitive := range []error{ErrExists, ErrLostRace, ErrCASContention, ErrNotExist, ErrNotModified} {
+	for _, definitive := range []error{s3wal.ErrExists, s3wal.ErrLostRace, s3wal.ErrCASContention, s3wal.ErrNotExist, s3wal.ErrNotModified} {
 		if errors.Is(err, definitive) {
 			return verdictRejects
 		}
 	}
-	if status, code := errorStatus(err); status >= 400 && status < 500 {
+	if status, code := s3wal.ErrorStatus(err); status >= 400 && status < 500 {
 		// A missing bucket is a bootstrap/infrastructure failure: the
 		// store answered definitively, but about the environment, not the
 		// probed operation — never a recordable behavioral finding.
@@ -392,9 +228,9 @@ type qualEnv struct {
 	label    string
 	bucket   string
 	prefix   string // key namespace; "" on disposable containers
-	probeKey string // probe scratch-key PREFIX (probeAtKey appends a per-invocation nonce)
+	probeKey string // probe scratch-key PREFIX (s3wal.ProbeAtKey appends a per-invocation nonce)
 	raw      *s3.Client
-	cas      *Client
+	cas      *s3wal.Client
 	gcb      *gcblob.Bucket
 	presign  *s3.PresignClient
 }
@@ -406,7 +242,7 @@ func newQualEnv(t *testing.T, label string, raw *s3.Client, bucket, prefix, prob
 		t.Fatalf("open gocloud bucket: %v", err)
 	}
 	t.Cleanup(func() { _ = gcb.Close() })
-	cas := New(raw, bucket)
+	cas := s3wal.New(raw, bucket)
 	cas.DecodeSeq = decodeSeq
 	return &qualEnv{
 		label:    label,
@@ -500,12 +336,12 @@ func surfaceRawRoundTrip(t *testing.T, e *qualEnv) []verdict {
 		return []verdict{{name, verdictError, fmt.Sprintf("DeleteObject: %v", err)}}
 	}
 	switch _, err := e.cas.Get(ctx, key); {
-	case errors.Is(err, ErrNotExist):
+	case errors.Is(err, s3wal.ErrNotExist):
 		// The delete took effect.
 	case err == nil:
-		return []verdict{{name, verdictMishandles, "GET after DELETE served the object, want 404/ErrNotExist"}}
+		return []verdict{{name, verdictMishandles, "GET after DELETE served the object, want 404/s3wal.ErrNotExist"}}
 	default:
-		return []verdict{{name, rejectVerdict(err), fmt.Sprintf("GET after DELETE = %v, want 404/ErrNotExist", err)}}
+		return []verdict{{name, rejectVerdict(err), fmt.Sprintf("GET after DELETE = %v, want 404/s3wal.ErrNotExist", err)}}
 	}
 	return []verdict{vPass(name)}
 }
@@ -631,7 +467,7 @@ func surfaceGocloudIfNotExist(t *testing.T, e *qualEnv) []verdict {
 }
 
 // surfaceConditionalCreate: raw-SDK If-None-Match: * create on a fresh key
-// must succeed; the duplicate must fail 412 (ErrExists).
+// must succeed; the duplicate must fail 412 (s3wal.ErrExists).
 func surfaceConditionalCreate(t *testing.T, e *qualEnv) []verdict {
 	t.Helper()
 	ctx := context.Background()
@@ -647,16 +483,16 @@ func surfaceConditionalCreate(t *testing.T, e *qualEnv) []verdict {
 	switch _, err := e.cas.Create(ctx, key, encodePayload(t, 1, 64)); {
 	case err == nil:
 		vs = append(vs, verdict{"conditional-create-duplicate", verdictIgnores, "store accepted a duplicate If-None-Match: * create (silent-corruption class)"})
-	case errors.Is(err, ErrExists):
+	case errors.Is(err, s3wal.ErrExists):
 		vs = append(vs, vPass("conditional-create-duplicate"))
 	default:
-		vs = append(vs, verdict{"conditional-create-duplicate", rejectVerdict(err), fmt.Sprintf("want 412/ErrExists, got: %v", err)})
+		vs = append(vs, verdict{"conditional-create-duplicate", rejectVerdict(err), fmt.Sprintf("want 412/s3wal.ErrExists, got: %v", err)})
 	}
 	return vs
 }
 
 // surfaceConditionalAdvance: matched If-Match must succeed with a NEW ETag;
-// a stale If-Match must fail 412 (ErrLostRace).
+// a stale If-Match must fail 412 (s3wal.ErrLostRace).
 func surfaceConditionalAdvance(t *testing.T, e *qualEnv) []verdict {
 	t.Helper()
 	ctx := context.Background()
@@ -685,10 +521,10 @@ func surfaceConditionalAdvance(t *testing.T, e *qualEnv) []verdict {
 	switch _, err := e.cas.Advance(ctx, key, encodePayload(t, 3, 64), etag1); {
 	case err == nil:
 		vs = append(vs, verdict{"conditional-advance-stale", verdictIgnores, "store accepted an advance conditioned on a superseded ETag (silent-corruption class)"})
-	case errors.Is(err, ErrLostRace):
+	case errors.Is(err, s3wal.ErrLostRace):
 		vs = append(vs, vPass("conditional-advance-stale"))
 	default:
-		vs = append(vs, verdict{"conditional-advance-stale", rejectVerdict(err), fmt.Sprintf("want 412/ErrLostRace, got: %v", err)})
+		vs = append(vs, verdict{"conditional-advance-stale", rejectVerdict(err), fmt.Sprintf("want 412/s3wal.ErrLostRace, got: %v", err)})
 	}
 	return vs
 }
@@ -710,19 +546,19 @@ func surfaceGetIfNoneMatch(t *testing.T, e *qualEnv) []verdict {
 	defer func() { _ = e.cas.Delete(ctx, key) }()
 	vs := []verdict{}
 	switch _, err := e.cas.GetIfChanged(ctx, key, etag); {
-	case errors.Is(err, ErrNotModified):
+	case errors.Is(err, s3wal.ErrNotModified):
 		vs = append(vs, vPass("get-304-matched"))
 	case err == nil:
 		vs = append(vs, verdict{"get-304-matched", verdictIgnores, "store served the full body for a matching If-None-Match ETag (no 304 path)"})
 	default:
-		vs = append(vs, verdict{"get-304-matched", rejectVerdict(err), fmt.Sprintf("want 304/ErrNotModified, got: %v", err)})
+		vs = append(vs, verdict{"get-304-matched", rejectVerdict(err), fmt.Sprintf("want 304/s3wal.ErrNotModified, got: %v", err)})
 	}
 	switch obj, err := e.cas.GetIfChanged(ctx, key, `"d41d8cd98f00b204e9800998ecf8427e"`); {
 	case err == nil && bytes.Equal(obj.Body, body):
 		vs = append(vs, vPass("get-304-changed"))
 	case err == nil:
 		vs = append(vs, verdict{"get-304-changed", verdictMishandles, fmt.Sprintf("store served %d bytes for a non-matching If-None-Match GET, want the original %d", len(obj.Body), len(body))})
-	case errors.Is(err, ErrNotModified):
+	case errors.Is(err, s3wal.ErrNotModified):
 		vs = append(vs, verdict{"get-304-changed", verdictMishandles, "store returned 304 for a NON-matching If-None-Match ETag"})
 	default:
 		vs = append(vs, verdict{"get-304-changed", rejectVerdict(err), fmt.Sprintf("want the body, got: %v", err)})
@@ -736,7 +572,7 @@ var probeStepNames = [5]string{"create", "duplicate-create-412", "matched-advanc
 // five step rows of the qualification matrix.
 func surfaceProbe(t *testing.T, e *qualEnv) []verdict {
 	t.Helper()
-	err := probeAtKey(context.Background(), e.cas, e.probeKey)
+	err := s3wal.ProbeAtKey(context.Background(), e.cas, e.probeKey)
 	vs := make([]verdict, 0, 5)
 	stepName := func(i int) string { return fmt.Sprintf("probe-step-%d-%s", i, probeStepNames[i-1]) }
 	if err == nil {
@@ -745,15 +581,15 @@ func surfaceProbe(t *testing.T, e *qualEnv) []verdict {
 		}
 		return vs
 	}
-	var pe *ProbeError
+	var pe *s3wal.ProbeError
 	if !errors.As(err, &pe) {
 		return []verdict{{"probe", verdictError, err.Error()}}
 	}
 	classMap := map[string]string{
-		ProbeIgnored:      verdictIgnores,
-		ProbeRejected:     verdictRejects,
-		ProbeMishandled:   verdictMishandles,
-		ProbeInconclusive: verdictError,
+		s3wal.ProbeIgnored:      verdictIgnores,
+		s3wal.ProbeRejected:     verdictRejects,
+		s3wal.ProbeMishandled:   verdictMishandles,
+		s3wal.ProbeInconclusive: verdictError,
 	}
 	for i := 1; i <= 5; i++ {
 		switch {
@@ -973,7 +809,7 @@ func TestQualifySeaweedFS(t *testing.T) {
 	endpoint := startSeaweedFS(t)
 	raw := rawS3Client(t, endpoint, "us-east-1", "seaweedfs", "seaweedfs")
 	ensureBucket(t, raw, "s3wal-qualify")
-	e := newQualEnv(t, "seaweedfs-4.42", raw, "s3wal-qualify", "", ProbeKey)
+	e := newQualEnv(t, "seaweedfs-4.42", raw, "s3wal-qualify", "", s3wal.ProbeKey)
 	runQualification(t, e, true)
 }
 
@@ -989,7 +825,7 @@ func TestQualifyMinIOLegacy(t *testing.T) {
 	endpoint, user, pass := startMinIOLegacy(t)
 	raw := rawS3Client(t, endpoint, "us-east-1", user, pass)
 	ensureBucket(t, raw, "s3wal-qualify")
-	e := newQualEnv(t, "minio-legacy-2024-01", raw, "s3wal-qualify", "", ProbeKey)
+	e := newQualEnv(t, "minio-legacy-2024-01", raw, "s3wal-qualify", "", s3wal.ProbeKey)
 	runQualification(t, e, false)
 }
 
@@ -1050,7 +886,7 @@ type contentionResult struct {
 // wins, lost races, and the detector's seq/winner baseline — belongs to
 // the measured window only (the warmup key's transitions are never
 // recorded, and the measured seed is created fresh after warmup).
-func runContentionWindow(tb testing.TB, cas *Client, key string, writers int, window time.Duration, payloadSize int) contentionResult {
+func runContentionWindow(tb testing.TB, cas *s3wal.Client, key string, writers int, window time.Duration, payloadSize int) contentionResult {
 	tb.Helper()
 	assertf(writers > 0, "runContentionWindow: %d writers", writers)
 	warmupContention(tb, cas, key+"-warmup", writers, payloadSize)
@@ -1074,7 +910,7 @@ func runContentionWindow(tb testing.TB, cas *Client, key string, writers int, wi
 		// Per-writer client: the read-side seq assert is session-scoped
 		// (casobj.go DecodeSeq), and concurrent writers sharing one Client
 		// would trip it on benign response reordering.
-		wcas := perSessionClient(cas)
+		wcas := s3wal.PerSessionClient(cas)
 		go func() {
 			defer wg.Done()
 			var (
@@ -1099,11 +935,11 @@ func runContentionWindow(tb testing.TB, cas *Client, key string, writers int, wi
 				res.maxStarve = max(res.maxStarve, maxStarve)
 				mu.Unlock()
 			}()
-			reRead := func() (Object, bool) {
+			reRead := func() (s3wal.Object, bool) {
 				obj, err := wcas.Get(ctx, key)
 				if err != nil {
 					tb.Errorf("contention: re-read %s: %v", key, err)
-					return Object{}, false
+					return s3wal.Object{}, false
 				}
 				return obj, true
 			}
@@ -1132,19 +968,19 @@ func runContentionWindow(tb testing.TB, cas *Client, key string, writers int, wi
 					lastSuccess = now
 					// The winner knows the new state: keep advancing from
 					// the local copy without a re-read.
-					obj = Object{Body: next, ETag: newETag}
-				case errors.Is(err, ErrLostRace):
+					obj = s3wal.Object{Body: next, ETag: newETag}
+				case errors.Is(err, s3wal.ErrLostRace):
 					lostRaces++
 					if obj, ok = reRead(); !ok {
 						return
 					}
-				case errors.Is(err, ErrCASContention):
+				case errors.Is(err, s3wal.ErrCASContention):
 					contentions++
 					if obj, ok = reRead(); !ok {
 						return
 					}
 				default:
-					var amb *AmbiguousError
+					var amb *s3wal.AmbiguousError
 					if !errors.As(err, &amb) {
 						tb.Errorf("contention: advance %s: %v", key, err)
 						return
@@ -1181,7 +1017,7 @@ func runContentionWindow(tb testing.TB, cas *Client, key string, writers int, wi
 // the full advance+re-read path, which is what needs warming). Warmup
 // state is fully separate from the measured window: distinct key,
 // throwaway per-session clients, and no accounting of any kind.
-func warmupContention(tb testing.TB, cas *Client, warmupKey string, writers int, payloadSize int) {
+func warmupContention(tb testing.TB, cas *s3wal.Client, warmupKey string, writers int, payloadSize int) {
 	tb.Helper()
 	assertf(writers > 0, "warmupContention: %d writers", writers)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
@@ -1193,7 +1029,7 @@ func warmupContention(tb testing.TB, cas *Client, warmupKey string, writers int,
 	var wg sync.WaitGroup
 	for range writers {
 		wg.Add(1)
-		wcas := perSessionClient(cas)
+		wcas := s3wal.PerSessionClient(cas)
 		go func() {
 			defer wg.Done()
 			obj, err := wcas.Get(ctx, warmupKey)
@@ -1210,7 +1046,7 @@ func warmupContention(tb testing.TB, cas *Client, warmupKey string, writers int,
 				next := encodePayloadNonce(tb, p.Seq+1, newNonce(tb), payloadSize)
 				newETag, err := wcas.Advance(ctx, warmupKey, next, obj.ETag)
 				if err == nil {
-					obj = Object{Body: next, ETag: newETag}
+					obj = s3wal.Object{Body: next, ETag: newETag}
 					continue
 				}
 				// Lost race, contention, or ambiguity: re-read and keep
@@ -1225,21 +1061,6 @@ func warmupContention(tb testing.TB, cas *Client, warmupKey string, writers int,
 	}
 	wg.Wait()
 	_ = cas.Delete(ctx, warmupKey)
-}
-
-// perSessionClient derives a Client sharing c's transport, bucket, backoff
-// and decoder but with its own session-scoped seq map (see the DecodeSeq
-// doc: the read-side assert is sound only per sequential session).
-func perSessionClient(c *Client) *Client {
-	assertf(c != nil, "perSessionClient: nil client")
-	return &Client{
-		s3:          c.s3,
-		bucket:      c.bucket,
-		backoffBase: c.backoffBase,
-		backoffCap:  c.backoffCap,
-		maxAttempts: c.maxAttempts,
-		DecodeSeq:   c.DecodeSeq,
-	}
 }
 
 // verifyTransitions is the lost-update detector shared by the S3 and SQLite
@@ -1294,7 +1115,7 @@ func TestContentionLostUpdateDetectorSeaweedFS(t *testing.T) {
 	endpoint := startSeaweedFS(t)
 	raw := rawS3Client(t, endpoint, "us-east-1", "seaweedfs", "seaweedfs")
 	ensureBucket(t, raw, "s3wal-detect")
-	cas := New(raw, "s3wal-detect")
+	cas := s3wal.New(raw, "s3wal-detect")
 	cas.DecodeSeq = decodeSeq
 	res := runContentionWindow(t, cas, "_wal/repo/detect", 8, 3*time.Second, 256)
 	if res.wins == 0 {
@@ -1389,11 +1210,10 @@ func (f *fakeStore) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // stubClient wraps a CAS client around a stub server with fast backoff so
 // exhaustion paths stay quick.
-func stubClient(tb testing.TB, endpoint string) *Client {
+func stubClient(tb testing.TB, endpoint string) *s3wal.Client {
 	tb.Helper()
-	c := New(rawS3Client(tb, endpoint, "us-east-1", "stub", "stub"), "stub")
-	c.backoffBase = 500 * time.Microsecond
-	c.backoffCap = 2 * time.Millisecond
+	c := s3wal.New(rawS3Client(tb, endpoint, "us-east-1", "stub", "stub"), "stub")
+	s3wal.SetTestBackoff(c, 500*time.Microsecond, 2*time.Millisecond)
 	return c
 }
 
@@ -1401,7 +1221,7 @@ func stubClient(tb testing.TB, endpoint string) *Client {
 // Docker — that the §2.6 probe refuses a store that ignores or mishandles
 // the conditional headers, naming the failing step and diagnosis class,
 // and that non-definitive failures (post-send 5xx, unreachable endpoint)
-// surface as ProbeInconclusive rather than accusing the store.
+// surface as s3wal.ProbeInconclusive rather than accusing the store.
 func TestProbeRefusesNonCompliantStore(t *testing.T) {
 	cases := []struct {
 		name      string
@@ -1411,20 +1231,20 @@ func TestProbeRefusesNonCompliantStore(t *testing.T) {
 		preClose  bool // close the server before probing (dial failure)
 	}{
 		{"compliant-store-passes", &fakeStore{}, 0, "", false},
-		{"ignores-if-none-match", &fakeStore{ignoreIfNoneMatch: true}, 2, ProbeIgnored, false},
-		{"ignores-if-match", &fakeStore{ignoreIfMatch: true}, 4, ProbeIgnored, false},
+		{"ignores-if-none-match", &fakeStore{ignoreIfNoneMatch: true}, 2, s3wal.ProbeIgnored, false},
+		{"ignores-if-match", &fakeStore{ignoreIfMatch: true}, 4, s3wal.ProbeIgnored, false},
 		// A 403 on a stale advance is a REAL rejection with the wrong
 		// error — loud-but-wrong is the rejects class, not mishandling.
-		{"rejects-stale-advance-403", &fakeStore{staleAdvanceStatus: http.StatusForbidden}, 4, ProbeRejected, false},
+		{"rejects-stale-advance-403", &fakeStore{staleAdvanceStatus: http.StatusForbidden}, 4, s3wal.ProbeRejected, false},
 		// An unchanged ETag after a matched advance is a definitive
 		// non-rejection divergence — mishandling (CAS chaining would ABA).
-		{"mishandles-static-etag", &fakeStore{staticETag: true}, 3, ProbeMishandled, false},
-		// A post-send 503 on the step-1 create is an AmbiguousError (the
+		{"mishandles-static-etag", &fakeStore{staticETag: true}, 3, s3wal.ProbeMishandled, false},
+		// A post-send 503 on the step-1 create is an s3wal.AmbiguousError (the
 		// write may have landed) — inconclusive, not store behavior.
-		{"inconclusive-put-5xx", &fakeStore{putStatus: http.StatusServiceUnavailable}, 1, ProbeInconclusive, false},
+		{"inconclusive-put-5xx", &fakeStore{putStatus: http.StatusServiceUnavailable}, 1, s3wal.ProbeInconclusive, false},
 		// An unreachable endpoint means the step-1 create is never
 		// executed (dial-class failure) — inconclusive.
-		{"inconclusive-unreachable-endpoint", &fakeStore{}, 1, ProbeInconclusive, true},
+		{"inconclusive-unreachable-endpoint", &fakeStore{}, 1, s3wal.ProbeInconclusive, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1433,16 +1253,16 @@ func TestProbeRefusesNonCompliantStore(t *testing.T) {
 			if tc.preClose {
 				srv.Close()
 			}
-			err := Probe(context.Background(), stubClient(t, srv.URL))
+			err := s3wal.Probe(context.Background(), stubClient(t, srv.URL))
 			if tc.wantStep == 0 {
 				if err != nil {
 					t.Fatalf("probe on a compliant store = %v, want nil", err)
 				}
 				return
 			}
-			var pe *ProbeError
+			var pe *s3wal.ProbeError
 			if !errors.As(err, &pe) {
-				t.Fatalf("probe = %v, want *ProbeError", err)
+				t.Fatalf("probe = %v, want *s3wal.ProbeError", err)
 			}
 			if pe.Step != tc.wantStep || pe.Class != tc.wantClass {
 				t.Fatalf("probe failed step %d class %s (%s), want step %d class %s", pe.Step, pe.Class, pe.Diagnosis, tc.wantStep, tc.wantClass)
@@ -1511,7 +1331,7 @@ func (s *scriptedS3) wireAttempts() int {
 // conditional write (NopRetryer by construction).
 func TestCASTaxonomy(t *testing.T) {
 	ctx := context.Background()
-	newScripted := func(t *testing.T, queue ...scriptedResponse) (*scriptedS3, *Client) {
+	newScripted := func(t *testing.T, queue ...scriptedResponse) (*scriptedS3, *s3wal.Client) {
 		t.Helper()
 		s := &scriptedS3{queue: queue}
 		srv := httptest.NewServer(s)
@@ -1532,19 +1352,19 @@ func TestCASTaxonomy(t *testing.T) {
 
 	t.Run("get-not-exist", func(t *testing.T) {
 		_, c := newScripted(t, scriptedResponse{status: 404, code: "NoSuchKey"})
-		if _, err := c.Get(ctx, "k"); !errors.Is(err, ErrNotExist) {
-			t.Fatalf("Get = %v, want ErrNotExist", err)
+		if _, err := c.Get(ctx, "k"); !errors.Is(err, s3wal.ErrNotExist) {
+			t.Fatalf("Get = %v, want s3wal.ErrNotExist", err)
 		}
 	})
 
 	t.Run("get-404-nosuchbucket-not-a-missing-object", func(t *testing.T) {
 		_, c := newScripted(t, scriptedResponse{status: 404, code: "NoSuchBucket"})
 		_, err := c.Get(ctx, "k")
-		var amb *AmbiguousError
+		var amb *s3wal.AmbiguousError
 		switch {
 		case err == nil:
 			t.Fatal("Get = nil, want a definitive infrastructure error")
-		case errors.Is(err, ErrNotExist):
+		case errors.Is(err, s3wal.ErrNotExist):
 			t.Fatalf("Get = %v — a NoSuchBucket 404 must not classify as a missing object", err)
 		case errors.As(err, &amb):
 			t.Fatalf("Get = %v, want a plain definitive error (the store executed and answered)", err)
@@ -1555,8 +1375,8 @@ func TestCASTaxonomy(t *testing.T) {
 
 	t.Run("get-if-changed-304", func(t *testing.T) {
 		s, c := newScripted(t, scriptedResponse{status: 304})
-		if _, err := c.GetIfChanged(ctx, "k", `"e1"`); !errors.Is(err, ErrNotModified) {
-			t.Fatalf("GetIfChanged = %v, want ErrNotModified", err)
+		if _, err := c.GetIfChanged(ctx, "k", `"e1"`); !errors.Is(err, s3wal.ErrNotModified) {
+			t.Fatalf("GetIfChanged = %v, want s3wal.ErrNotModified", err)
 		}
 		if s.lastIfNoneMatch != `"e1"` {
 			t.Fatalf("If-None-Match on the wire = %q, want %q", s.lastIfNoneMatch, `"e1"`)
@@ -1565,8 +1385,8 @@ func TestCASTaxonomy(t *testing.T) {
 
 	t.Run("create-duplicate-412", func(t *testing.T) {
 		s, c := newScripted(t, scriptedResponse{status: 412, code: "PreconditionFailed"})
-		if _, err := c.Create(ctx, "k", []byte("b")); !errors.Is(err, ErrExists) {
-			t.Fatalf("Create = %v, want ErrExists", err)
+		if _, err := c.Create(ctx, "k", []byte("b")); !errors.Is(err, s3wal.ErrExists) {
+			t.Fatalf("Create = %v, want s3wal.ErrExists", err)
 		}
 		if s.lastIfNoneMatch != "*" {
 			t.Fatalf("If-None-Match on the wire = %q, want *", s.lastIfNoneMatch)
@@ -1578,8 +1398,8 @@ func TestCASTaxonomy(t *testing.T) {
 
 	t.Run("advance-lost-race-412", func(t *testing.T) {
 		s, c := newScripted(t, scriptedResponse{status: 412, code: "PreconditionFailed"})
-		if _, err := c.Advance(ctx, "k", []byte("b"), `"e1"`); !errors.Is(err, ErrLostRace) {
-			t.Fatalf("Advance = %v, want ErrLostRace", err)
+		if _, err := c.Advance(ctx, "k", []byte("b"), `"e1"`); !errors.Is(err, s3wal.ErrLostRace) {
+			t.Fatalf("Advance = %v, want s3wal.ErrLostRace", err)
 		}
 		if s.lastIfMatch != `"e1"` {
 			t.Fatalf("If-Match on the wire = %q, want %q", s.lastIfMatch, `"e1"`)
@@ -1605,25 +1425,25 @@ func TestCASTaxonomy(t *testing.T) {
 	})
 
 	t.Run("conflict-409-exhaustion", func(t *testing.T) {
-		queue := make([]scriptedResponse, defaultMaxAttempts)
+		queue := make([]scriptedResponse, s3wal.DefaultMaxAttempts)
 		for i := range queue {
 			queue[i] = scriptedResponse{status: 409, code: "ConditionalRequestConflict"}
 		}
 		s, c := newScripted(t, queue...)
-		if _, err := c.Create(ctx, "k", []byte("b")); !errors.Is(err, ErrCASContention) {
-			t.Fatalf("Create = %v, want ErrCASContention", err)
+		if _, err := c.Create(ctx, "k", []byte("b")); !errors.Is(err, s3wal.ErrCASContention) {
+			t.Fatalf("Create = %v, want s3wal.ErrCASContention", err)
 		}
-		if s.wireAttempts() != defaultMaxAttempts {
-			t.Fatalf("wire attempts = %d, want the full budget %d", s.wireAttempts(), defaultMaxAttempts)
+		if s.wireAttempts() != s3wal.DefaultMaxAttempts {
+			t.Fatalf("wire attempts = %d, want the full budget %d", s.wireAttempts(), s3wal.DefaultMaxAttempts)
 		}
 	})
 
 	t.Run("server-5xx-ambiguous-single-attempt", func(t *testing.T) {
 		s, c := newScripted(t, scriptedResponse{status: 500, code: "InternalError"})
 		_, err := c.Advance(ctx, "k", []byte("b"), `"e1"`)
-		var amb *AmbiguousError
+		var amb *s3wal.AmbiguousError
 		if !errors.As(err, &amb) {
-			t.Fatalf("Advance = %v, want AmbiguousError", err)
+			t.Fatalf("Advance = %v, want s3wal.AmbiguousError", err)
 		}
 		// One wire attempt proves SDK auto-retry is disabled by
 		// construction: a silent SDK re-send after a 5xx could turn our own
@@ -1636,8 +1456,8 @@ func TestCASTaxonomy(t *testing.T) {
 	t.Run("definitive-4xx-plain-error", func(t *testing.T) {
 		_, c := newScripted(t, scriptedResponse{status: 403, code: "AccessDenied"})
 		_, err := c.Advance(ctx, "k", []byte("b"), `"e1"`)
-		var amb *AmbiguousError
-		if err == nil || errors.As(err, &amb) || errors.Is(err, ErrLostRace) || errors.Is(err, ErrNotExecuted) {
+		var amb *s3wal.AmbiguousError
+		if err == nil || errors.As(err, &amb) || errors.Is(err, s3wal.ErrLostRace) || errors.Is(err, s3wal.ErrNotExecuted) {
 			t.Fatalf("Advance = %v, want a plain definitive error (not ambiguous, not a sentinel)", err)
 		}
 	})
@@ -1646,8 +1466,8 @@ func TestCASTaxonomy(t *testing.T) {
 		// Port 1 refuses immediately: the request provably never reached a
 		// store, so the write is not-executed — never ambiguous.
 		c := stubClient(t, "http://127.0.0.1:1")
-		if _, err := c.Create(ctx, "k", []byte("b")); !errors.Is(err, ErrNotExecuted) {
-			t.Fatalf("Create = %v, want ErrNotExecuted", err)
+		if _, err := c.Create(ctx, "k", []byte("b")); !errors.Is(err, s3wal.ErrNotExecuted) {
+			t.Fatalf("Create = %v, want s3wal.ErrNotExecuted", err)
 		}
 	})
 
@@ -1655,8 +1475,8 @@ func TestCASTaxonomy(t *testing.T) {
 		s, c := newScripted(t)
 		expired, cancel := context.WithCancel(ctx)
 		cancel()
-		if _, err := c.Advance(expired, "k", []byte("b"), `"e1"`); !errors.Is(err, ErrNotExecuted) {
-			t.Fatalf("Advance = %v, want ErrNotExecuted", err)
+		if _, err := c.Advance(expired, "k", []byte("b"), `"e1"`); !errors.Is(err, s3wal.ErrNotExecuted) {
+			t.Fatalf("Advance = %v, want s3wal.ErrNotExecuted", err)
 		}
 		if s.wireAttempts() != 0 {
 			t.Fatalf("wire attempts = %d, want 0 (expired before dispatch)", s.wireAttempts())
