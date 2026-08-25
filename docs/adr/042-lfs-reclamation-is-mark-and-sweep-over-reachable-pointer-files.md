@@ -61,9 +61,17 @@ live sweep schedule unless the LFS reap is armed and the grace is at least
 the reap cadence (max of the sweep age threshold, the sweep interval, and
 the quarantine retention floor — every reap strands one quarantine backup
 for at least an hour — so slots refund no faster than blobs AND their
-backups become purgeable); under the sweep emergency
-stop (interval 0) reclamation demotes itself to report-only with a warning
-rather than crash-looping the fleet. The job ships dark (interval 0) with
+backups become purgeable). The coupling is additionally OBSERVED at
+runtime, not merely configured (issue #120): every destructive LFS sweep
+pass that finishes its keyspace with zero recorded errors persists a
+fleet-wide watermark (`job_scan_state`), the retirement transaction
+re-reads it before refunding, and both the pass and the per-row verdict
+demote to report-only whenever no clean destructive pass completed within
+the grace window — covering armed-but-failing sweeps, passes that outlast
+the reclamation cycle, and the versioning guard demoting a run mid-flight.
+The sweep emergency stop (interval 0) is the planned instance of the same
+demotion: the watermark stales and reclamation reports instead of
+crash-looping the fleet. The job ships dark (interval 0) with
 report-only marking as the second
 gate (`CODESTORAGE_LFS_GC_DELETE_ENABLED`), mirroring the sweep flags'
 staged rollout; `CODESTORAGE_LFS_MAX_OBJECTS_PER_REPO` is the orthogonal

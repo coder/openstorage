@@ -772,7 +772,16 @@ until the eligible rows are the junk you expect, then opt in.
   schedule is live therefore requires that opt-in, plus a
   [grace](#codestorage_lfs_gc_grace) of at least the reap cadence, including
   the 1-hour quarantine retention floor every reap's backup copy is kept for
-  (startup errors otherwise). With the sweep schedule stopped
+  (startup errors otherwise). The coupling is also OBSERVED at runtime
+  ([#120](https://github.com/coder/code-storage/issues/120)): each
+  destructive LFS sweep pass that completes its keyspace with zero errors
+  records a durable fleet-wide watermark, and retirement refunds slots only
+  while that watermark is fresher than the grace window — armed-but-failing
+  sweeps, passes outrunning the reclamation cycle, and mid-flight guard
+  demotions all freeze refunds automatically (`reap_watermark_stale` /
+  `rows_deferred_reap_stale` in the run report). A fresh deployment stays
+  report-only until its first clean destructive LFS sweep completes. With
+  the sweep schedule stopped
   ([`CODESTORAGE_SWEEP_INTERVAL=0`](#codestorage_sweep_interval), the
   emergency stop), the process starts but demotes retirement to report-only
   with a warning — nothing would reap the blobs meanwhile.
@@ -846,29 +855,25 @@ stretches individual probes.
 - **Default:** `100000`. **Constraints:** an integer of at least `100`
   (one row can cost up to three units, so degenerate budgets cannot
   guarantee progress on both registries).
-- Tracked losses are covered by ONE aggregate reservation row per affected
-  repository, renewed every pass at one work unit per repository — and the
-  tracked-repository population is capped at HALF the renewal phase's
-  allocation (`budget/4`; 25,000 at the default), so every tracked
-  aggregate provably renews every pass with the other half left for
-  registry revalidation, and the per-repo reservation-row cap cannot bind.
-  Round-robin re-verification then shrinks aggregates as losses heal,
-  retire, or purge (a shrink re-mints the aggregate's reservation key so
-  the exact new total is charged; the old row expires within one TTL); a
-  re-verification backlog (`absent_refreshed` below `absent_tracked`) only
-  delays shrinking, never cover renewal. Losses beyond the repository
-  capacity or the 100,000-row memory cap aggregate into one pass-scoped
-  overflow cover per repository, renewed on rotation revisits
-  (`absent_untracked`), and a renewal aborted by the pass deadline drops
-  its unrenewed bases loudly (`absent_dropped`) for rotation rediscovery
-  rather than leaving covers to lapse silently.
-- **Multi-replica PostgreSQL fleets:** the refresh set and rotation
-  cursors are per-process, and the River periodic job may run on any
-  replica ([#125](https://github.com/coder/code-storage/issues/125) tracks
-  fleet persistence with [#121](https://github.com/coder/code-storage/issues/121)).
-  Size the budget at or above the fleet's total registered row count —
-  every pass is then a complete rotation and any replica re-covers every
-  loss fleet-wide.
+- Discovered losses are covered by ONE aggregate reservation row per
+  affected repository and registry class, and the cover rows themselves
+  are the durable tracking state
+  ([#125](https://github.com/coder/code-storage/issues/125)): the renewal
+  phase lists the live rows and re-charges each at one work unit per row,
+  entirely database-derived, so the per-repo reservation-row cap cannot
+  bind and any replica keeps every cover alive. Each full rotation over a
+  repository's rows re-derives its exact deficit total — growing the live
+  cover in place, re-minting the key with the exact smaller total when
+  heals shrink it (`covers_rotated`; the stale row is deleted), and
+  releasing it outright when everything healed (`covers_released`). Shrink
+  therefore lags by at most one rotation (conservative), never renewal.
+- **Sizing:** keep half the budget above the live cover-row population —
+  beyond it, renewal round-robins across passes on a durable cursor and
+  flags `renewal_incomplete`, and a cover's renewal gap must stay within
+  the reservation TTL. Rotation cursors, traversal bookkeeping, and the
+  alternating-leader parity are all fleet-persistent (`job_scan_state`),
+  so multi-replica PostgreSQL fleets share one rotation regardless of
+  which replica River schedules.
 
 ### `CODESTORAGE_REPACK_THRESHOLD`
 

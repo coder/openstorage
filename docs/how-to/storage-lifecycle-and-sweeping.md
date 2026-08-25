@@ -533,29 +533,29 @@ cursors (budget-limited, resumable — the sweeper's inverse direction) and
 - **Truly absent** — logged loudly and, when quota is enforced, charged as a
   TTL'd restore cover (the same reservation row restore paths renew) plus a
   floor-generation bump, so every admission sees the missing bytes until
-  they are restored or their row is retired/purged. Discovered losses join
-  a per-process **known-absent set** whose bytes aggregate into one cover
-  reservation row per affected repository, renewed FIRST every pass (one
-  work unit per repository, with the tracked-repository population capped
-  at that renewal allocation — tracked ⇒ renewed every pass) — so the
-  per-repository reservation-row cap cannot bind regardless of how many
-  rows were lost. Round-robin re-verification then shrinks aggregates as
-  losses heal (rotating the reservation key so exact totals are charged);
-  a backlog there delays shrinking (conservative), never renewal. On
-  PostgreSQL the job runs on its own reserved single-worker River queue,
-  so tenant-scalable work (webhook deliveries to slow endpoints) cannot
-  delay a renewal past the cover TTL. Startup
-  enforces the cadence-vs-TTL coupling (interval ≤ TTL/2, pass wall clock
-  ≤ TTL/4), so renewals always land before live covers can lapse. The set
-  is in-memory per worker:
-  a restart loses it and the rotation rediscovers losses within one full
-  rotation — a convergence delay, never corruption. On multi-replica
-  PostgreSQL fleets the periodic job may run on any replica, so refresh
-  continuity is per-replica until
-  [#125](https://github.com/coder/code-storage/issues/125) lands fleet
-  persistence — size the budget at or above the fleet's total registered
-  row count there, making every pass a complete rotation on whichever
-  replica runs it.
+  they are restored or their row is retired/purged. Discovered losses
+  aggregate into ONE cover reservation row per affected repository and
+  registry class — so the per-repository reservation-row cap cannot bind
+  regardless of how many rows were lost — and the cover rows THEMSELVES are
+  the durable tracking state: every pass starts by listing the live cover
+  rows and re-charging each one (`covers_renewed`), one work unit per row,
+  under half the pass budget. Because renewal derives entirely from the
+  database, any replica of a multi-replica PostgreSQL fleet — or a freshly
+  restarted worker — keeps every discovered loss covered; nothing lives in
+  process memory. Aggregates stay EXACT: each full traversal of a
+  repository's rows recomputes its deficit total from scratch, growing the
+  live cover in place as losses appear, minting the next incarnation of
+  the key (and deleting the stale row — `covers_rotated`) when heals
+  shrink the total, and releasing the row outright (`covers_released`)
+  when everything healed. A cover population larger than the renewal
+  half-budget renews round-robin on a durable cursor and flags
+  `renewal_incomplete` — raise the budget so every cover renews every
+  pass. On PostgreSQL the job runs on its own reserved single-worker River
+  queue, so tenant-scalable work (webhook deliveries to slow endpoints)
+  cannot delay a renewal past the cover TTL, and the unique periodic job
+  serializes passes fleet-wide. Startup enforces the cadence-vs-TTL
+  coupling (interval ≤ TTL/2, pass wall clock ≤ TTL/4), so renewals always
+  land before live covers can lapse.
 - **Absent pack rows registered before this feature** carry no recorded
   size (`pack_rows_unsized`): the loss is reported but cannot be charged
   until a repack fold rewrites the row with its size.
@@ -579,10 +579,10 @@ A reconciliation pass logs one `absence reconcile pass finished` line:
 | `covers_charged` / `bytes_covered` | restore covers charged/refreshed this pass and their total bytes |
 | `cover_errors` / `stat_errors` | covers that failed (e.g. the per-repo reservation-row cap) and probes that errored — both retried next pass |
 | `rows_skipped_purged` | rows of purge-fenced repositories skipped |
-| `absent_tracked` | known-absent set size at pass end: losses whose per-repository aggregate covers renew every pass |
-| `absent_refreshed` | tracked losses re-verified this pass — below `absent_tracked` means heal-detection (cover shrinking) spans multiple passes; renewal is unaffected |
-| `absent_untracked` | losses beyond the tracked-repository capacity (`budget/4`) or the 100,000-entry memory cap — aggregated into one pass-scoped overflow cover per repository, renewed only on rotation revisits. Renewal above capacity cannot fit ANY bounded budget by definition: size the budget at ≥ 4× the worst simultaneously-affected repository count you need continuous covers for (the 100,000 default covers 25,000 repositories) |
-| `absent_dropped` | tracked rows dropped because their repository's aggregate could not be renewed this pass (pass deadline / ledger failure) — rediscovered by rotation; investigate the ledger if persistent |
+| `covers_renewed` | live cover rows re-charged by the renewal phase (fleet-derived from the durable cover listing — any replica renews every cover) |
+| `covers_rotated` / `covers_released` | shrink re-mints (heals reduced a repository's exact re-derived total; the stale row was deleted) and outright releases (fully healed, folded away, or a superseded/legacy row retired) |
+| `renewal_incomplete` | the live cover population outran the renewal half-budget — covers renew round-robin across passes on a durable cursor; raise the budget so every cover renews every pass |
+| `lfs_traversals` / `pack_traversals` | completed origin-to-origin rotations per registry (fleet-durable; heals shed within one clean traversal) |
 | `quota_enforced` | `false` means detection-only (no quota admission to protect) |
 
 Any nonzero `lfs_rows_absent` or `pack_rows_absent` means storage lost

@@ -21,10 +21,11 @@ storage listings and point-probes the registry (`HasPack`,
 over each table's primary key — `(repo, key)` and `(repo, id)` — so every
 page is one index range scan, budget-limited passes park the cursor and
 resume strictly after it, and the rotation wraps at the end of the keyspace
-(the reclaimer/purger discipline). Cursors are in-memory per process;
-issue #121's fleet-persistent cursor work can store the two pairs as-is. A
-lost cursor only delays convergence: verdicts are recomputed, never trusted
-from state.
+(the reclaimer/purger discipline). Cursors — with per-class traversal
+bookkeeping — persist fleet-wide in the ref store's `job_scan_state` rows
+(issues #121/#125), so a pass scheduled on any replica resumes the one
+shared scan. A lost row only delays convergence: verdicts are recomputed,
+never trusted from state.
 
 Classification precedes flagging (ADR-41): an LFS row absent under its
 registered spelling probes the canonical/legacy twin first. FULLY
@@ -40,56 +41,63 @@ partial absence.
 
 Discovery is rotation-bounded, but refresh is not (Codex round 1): covers
 are TTL'd, and on a registry larger than one pass's budget the rotation
-returns to a row less often than its cover survives — so every discovered
-loss joins a per-process known-absent set whose bytes AGGREGATE into one
-cover reservation row per affected base repository (Codex round 4):
-per-row covers would scale renewal work with the loss population and
-collide with the per-base active-reservation-row cap, so a big enough
-incident would either outrun the renewal cycle or be denied outright. The
-refresh phase runs FIRST each pass, renewal before re-verification:
-renewing every base aggregate costs one work unit per REPOSITORY, and the
-tracked-base population is capped at HALF the refresh allocation (Codex
-rounds 5+6) — tracked ⇒ renewed every pass by construction, with the
-other half reserved for revalidation so dead rows always untrack. The
-guarantee is enforced from both sides: a renewal the pass deadline or a
-ledger failure aborts DROPS its unrenewed bases (loud, counted, rotation
-rediscovers) rather than tracking losses it cannot keep covered. A shrink
-(heal, retirement, fold, purge) re-mints the aggregate's reservation key:
-the ledger's same-key upsert keeps GREATEST(old, new) and refreshes the
-TTL, so renewing a smaller total under the old key would pin healed bytes
-reserved forever — and the incarnation is crypto-random, never a
-resettable counter, so an aggregate that empties and re-forms (or a
-restarted process) can never re-adopt a stale GREATEST-pinned row.
-Round-robin re-verification (`HasPack`/`HasLFSObject` + stats) only
-SHRINKS covers, so its backlog delays convergence, never visibility. Losses are
-storage-incident-scaled, never attacker-mintable; beyond the base
-capacity or the 100,000-row memory bound, overflow aggregates into one
-PASS-SCOPED cover row per base (per-row covers would re-collide with the
-reservation-row cap), renewed on rotation revisits (`absent_untracked`).
-Shrink-driven key rotations are likewise coalesced to one fresh
-incarnation per base per pass, so heal/miss interleaving cannot mint
-row-cap many keys. The set is in-memory like the cursors: a restart loses it and
-the rotation rediscovers — convergence delay, never corruption. Renewal
-timing is enforced end to end (Codex round 3, security): covers renew at
-pass starts, periodic ticks that fire mid-pass coalesce (River uniqueness
-includes the running state), and a pass's wall clock is capped at a
-quarter of the TTL while configuration rejects intervals above half the
-TTL — so the gap between one cover's renewals (pass + interval + next
-refresh phase) stays within the TTL even under degraded blob stores. The rotation leader
-alternates between the two registries each pass, since a twin probe can
-overdraw the leader's allocation by a unit; a configuration floor
-(`MinAbsenceReconcileBudget`) keeps budgets out of single-row-overdraw
-territory.
+returns to a row less often than its cover survives — so discovered
+losses AGGREGATE into one cover reservation row per affected base
+repository and registry class (Codex round 4: per-row covers would scale
+renewal work with the loss population and collide with the per-base
+active-reservation-row cap, so a big enough incident would either outrun
+the renewal cycle or be denied outright), and the cover rows THEMSELVES
+are the durable tracking state (issue #125). The renewal phase runs FIRST
+each pass: it LISTS the live cover rows and re-charges each — one work
+unit per row, entirely database-derived, so any replica and any restart
+keeps every discovered loss covered without process memory. A population
+beyond the renewal half-budget renews round-robin on a durable cursor,
+loudly (`renewal_incomplete`); sizing the budget above the live cover
+population keeps every cover renewed every pass.
 
-Known residual (issue #125, with #121): on multi-replica PostgreSQL
-fleets the River periodic job may run on any replica, and per-process
-state makes refresh continuity per-replica — a cover discovered on one
-replica can lapse before that replica's next turn. Never a regression
-versus pre-#101 (every replica's own rotation independently rediscovers
-and re-covers), and fully mitigated by sizing the budget at or above the
-fleet's registered row count so every pass is a complete rotation;
-fleet-persistent state belongs to the #121 bundle rather than a parallel
-mechanism here.
+Aggregates stay exact through deterministic INCARNATION keys
+(`absence-lost/<base>/<class>-e<n>`, zero-padded): each full traversal of
+a base's row range recomputes its deficit total from scratch and grows the
+live incarnation in place — the charge is always the recomputed total,
+never `live + delta`, so crash replays over-cover transiently instead of
+compounding. When a traversal observed the WHOLE range within one pass
+with no stat or charge errors, a smaller total mints incarnation n+1
+charged exactly and deletes the stale GREATEST-pinned row (mint first —
+never a coverage gap), and a zero total deletes the row outright. Deletes
+are safe because only this job writes under the prefix and River's unique
+periodic jobs serialize passes fleet-wide; incarnation numbers restart
+only after the previous row was deleted, so a stale GREATEST-pinned row
+can never be silently re-adopted (the round-6 counter hazard). Ranges
+that span pass boundaries skip shrink evaluation (their in-memory totals
+are partial) and shed healed bytes on a later traversal; error-dirty
+traversals never shrink and never count as clean. Shrink latency is
+therefore one rotation, which only delays convergence, never visibility.
+Renewal timing is enforced end to end (Codex round 3, security): covers
+renew at pass starts, periodic ticks that fire mid-pass coalesce (River
+uniqueness includes the running state), and a pass's wall clock is capped
+at a quarter of the TTL while configuration rejects intervals above half
+the TTL — so the gap between one cover's renewals (pass + interval + next
+renewal phase) stays within the TTL even under degraded blob stores. The
+rotation leader alternates between the two registries each pass (durable
+parity), since a twin probe can overdraw the leader's allocation by a
+unit; a configuration floor (`MinAbsenceReconcileBudget`) keeps budgets
+out of single-row-overdraw territory. Legacy nonce-keyed covers minted by
+pre-#125 workers renew until both registries complete one clean
+traversal — by which point every still-absent loss lives in incarnation
+keys — then are released.
+
+Resolved residual (issue #125, with #121): the original design kept the
+known-absent set and rotation cursors in process memory, making refresh
+continuity per-replica on multi-replica PostgreSQL fleets. Both now live
+in durable state — cursors in `job_scan_state`, tracking in the cover
+rows themselves — so any replica renews every cover and resumes the one
+fleet-shared rotation. The remaining residual is narrower: a row whose
+settlement stat-errors on every traversal keeps its base's traversals
+dirty, so heals in that base shed only after a clean traversal (loud via
+`stat_errors`, conservative direction), and a base whose row range
+exceeds one pass's rotation allocation never completes in-pass range
+evaluation, so its heals shed only after a budget raise (the documented
+sizing rule).
 
 A genuine loss is charged through the existing round-57/58 seam,
 `ref.ReserveRestoreCover`, under the canonical spelling plus
