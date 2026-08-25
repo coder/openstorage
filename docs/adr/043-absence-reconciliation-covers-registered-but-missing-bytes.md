@@ -91,21 +91,29 @@ silently re-adopted (the round-6 counter hazard). The pending range parks
 WITH the durable cursor (base, started/dirty flags, running total), so a
 range spanning any number of budget-limited passes accumulates exactly
 for GROW charging, and crash replays re-derive identical totals from the
-parked cursor. Shrink, release, and proof verdicts additionally require
-FENCE CONTINUITY (Codex rounds 19-20): the park snapshots the base
-group's summed shared adoption generation — after every bump the parking
-pass itself made — and the next pass re-reads it at load, before making
-any of its own; the job is fleet-unique, so a mismatch proves a FOREIGN
-mutation (restore, push, LFS write, adoption, retirement) landed while
-the cursor was parked, and the range is TAINTED: still exact for grow
-charging, never a verdict, right-sized by the next traversal instead. A
-verified chain of segments is as trustworthy as a single-pass observation
-— and without it, a base larger than one pass's class allowance could
-never complete unresumed, so its covers could never shrink and its legacy
-nonces would be bulk-renewed forever (round 20, P1). The fence sees only
-database-visible mutations: out-of-band byte loss during a park gap
-carries the same accepted residual as loss striking mid-pass behind an
-in-pass cursor — the next traversal rediscovers and re-covers it.
+parked cursor. Verdicts (shrink, release, retirement proofs) come from
+FRESH evidence only (Codex rounds 19-21): a resumed range's completion is
+merely a TRIGGER — its accumulated total spans park gaps where
+out-of-band byte loss is invisible to any database fence, so relaxing
+compensation from it directly could spend headroom a gap loss reopened.
+The trigger fires a bounded VERIFICATION: a scoped re-enumeration of the
+base's class rows with a storage stat per row — exactly the evidence a
+single-pass observation yields — and the verdicts use that observation
+alone (a gap loss is thereby seen, covered, and only then judged).
+Verification work draws on a shared per-pass pool of one budget's worth,
+so verdict work cannot multiply the pass bound; a base whose class
+outgrows the pool defers loudly (raise the budget above the largest
+base's combined class rows) with its covers left protectively oversized —
+without this path, a base larger than one pass's class allowance could
+never complete unresumed, never shrink its covers, and never retire its
+legacy nonces (round 20, P1). Two cheap pre-filters keep the pool for
+verdicts that matter: a mutation fence (the park snapshots the base
+group's summed shared adoption generation after every bump the parking
+pass itself made; the next pass re-reads it at load before making any of
+its own — the job is fleet-unique, so a mismatch proves a FOREIGN
+mutation landed while parked and TAINTS the range, which then waits for
+the next traversal), and a relevance gate (verification is spent only on
+a live shrinkable head or a base with legacy nonces awaiting retirement).
 Error-dirty ranges and traversals never shrink and never
 count as clean — but a dirty range whose running total went UNCHARGED
 (the charge itself failed) gets one bounded grow-only retry at range end,
@@ -135,18 +143,19 @@ periodic same-key TTL refresh, which overwrites the row's owner, as new
 deficit and re-added it each pass toward a wedged admission. Instead each
 nonce row IS its own cover: it rides the pass-start bulk touch (Codex
 round 15: a nonce minted just behind the cursor must not lapse before the
-rotation ever reaches it) until BOTH classes hold proofs in one pass — a
-clean fence-continuous start-to-end range observation (single pass, or
-resumed with the mutation fence verified across every park gap)
-recomputes the base's true deficit from the registry itself and charges
-it into the deterministic head, and a row-less keyset gap proves a zero
-deficit the same way. The two rotations traverse independent populations,
-so their completions for one base can stay out of phase indefinitely
-(Codex round 21): a completed class proof therefore WAITS durably (one
-bounded `job_scan_state` row keyed by base and class) under the same
-generation fence — re-validated at every pass start before the pass's own
-bumps, dropped on any parked-gap mutation — until its counterpart lands.
-With both proofs in hand the ground truth subsumes whatever the nonce
+rotation ever reaches it) until BOTH classes hold FRESH proofs in one
+pass — a clean single-pass start-to-end range observation, a resumed
+completion's fresh verification, or a row-less keyset gap — each
+recomputing the base's true deficit from the registry and storage and
+charging it into the deterministic head. The two rotations traverse
+independent populations, so their completions for one base can stay out
+of phase indefinitely (Codex round 21): a completed class proof
+therefore WAITS durably as a TRIGGER (one bounded `job_scan_state` row
+keyed by base and class) under the same generation fence — re-validated
+at every pass start before the pass's own bumps, dropped on any
+parked-gap mutation — until its counterpart lands, and consuming it for
+retirement re-verifies that class fresh at fold time. With both fresh
+proofs in hand the ground truth subsumes whatever the nonce
 aggregated and the folded sentinel is CAS'd into the row's owner column,
 guarded on the LISTED (owner, bytes): every re-charge overwrites owner
 and GREATEST-grows bytes, so a CAS miss proves a newer reliance arrived

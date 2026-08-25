@@ -576,25 +576,41 @@ func TestAbsenceReconcile_MultiPassBaseRetiresLegacy(t *testing.T) {
 
 // TestAbsenceReconcile_OutOfPhaseClassProofsRetireLegacy (Codex round
 // 21, P1): the two class rotations traverse independent populations, so
-// their clean completions for one base can land in DIFFERENT passes
-// indefinitely — requiring both in one pass would leave the nonce
-// bulk-renewed forever. Here the LFS proof completes in pass 2 and the
-// packs proof only in pass 3: the persisted (fence-validated) LFS
-// half-proof must carry across and retire the nonce in pass 3.
+// their clean completions for one base need not coincide — half-proofs
+// persist (loadProofs/saveProofs) and completions trigger fresh
+// verification, so a multi-pass base in BOTH classes still retires its
+// nonce within a bounded number of passes (budget covers the combined
+// class rows, per the sizing rule).
 func TestAbsenceReconcile_OutOfPhaseClassProofsRetireLegacy(t *testing.T) {
 	f := newSweepFixture(t)
 	ctx := context.Background()
-	base := "repo-out-of-phase"
+	base := "m-target"
 	for i := byte(0); i < 6; i++ {
 		key := blob.LFSKey(base, absenceOID('a'+i))
 		registerLFS(t, f, base, key, 10)
 		f.upload(key, strings.Repeat("x", 10))
 	}
 	for i := byte(0); i < 9; i++ {
-		id := fmt.Sprintf("p%d", i)
+		id := fmt.Sprintf("p%02d", i)
 		key := blob.PackKey(base, id)
 		size := f.upload(key, strings.Repeat("y", 10))
 		if err := f.store.RegisterPacks(ctx, base, []ref.Pack{{ID: id, Key: key, Size: size}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Fleet filler surrounding the target in keyset order: the class
+	// rotations spend their per-pass allocations here, so the target's
+	// two class ranges complete in DIFFERENT passes.
+	for i := byte(0); i < 20; i++ {
+		key := blob.LFSKey("a-filler", absenceOID('a'+i))
+		registerLFS(t, f, "a-filler", key, 10)
+		f.upload(key, strings.Repeat("x", 10))
+	}
+	for i := byte(0); i < 20; i++ {
+		id := fmt.Sprintf("zp%02d", i)
+		key := blob.PackKey("z-filler", id)
+		size := f.upload(key, strings.Repeat("y", 10))
+		if err := f.store.RegisterPacks(ctx, "z-filler", []ref.Pack{{ID: id, Key: key, Size: size}}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -604,29 +620,153 @@ func TestAbsenceReconcile_OutOfPhaseClassProofsRetireLegacy(t *testing.T) {
 	}
 
 	pinLFSLeader(t, f)
-	run := func(pass int) AbsenceReport {
-		t.Helper()
-		worker := testReconciler(t, f, true, 8)
+	// Pass 1 parks both rotations inside the filler/target: no
+	// retirement.
+	worker := testReconciler(t, f, true, 20)
+	report, err := worker.Run(ctx)
+	if err != nil {
+		t.Fatalf("pass 1: %v", err)
+	}
+	if report.CoversDecaying != 0 {
+		t.Fatalf("pass 1: premature retirement (%+v)", report)
+	}
+	// The class completions land in different passes; the persisted
+	// half-proof carries the earlier one and the fold converges within
+	// a bounded number of passes (budget 20 covers the target's
+	// combined class rows, 6+9, per the sizing rule).
+	retired := false
+	for pass := 2; pass <= 8 && !retired; pass++ {
+		worker := testReconciler(t, f, true, 20)
 		report, err := worker.Run(ctx)
 		if err != nil {
 			t.Fatalf("pass %d: %v", pass, err)
 		}
-		return report
-	}
-	// Pass 1: both rotations park mid-range. Pass 2: LFS completes its
-	// proof; packs is still mid-range — no retirement yet.
-	for pass := 1; pass <= 2; pass++ {
-		if report := run(pass); report.CoversDecaying != 0 {
-			t.Fatalf("pass %d: premature retirement (decaying=%d)", pass, report.CoversDecaying)
+		switch report.CoversDecaying {
+		case 0:
+		case 1:
+			retired = true
+		default:
+			t.Fatalf("pass %d: retired %d covers, want 1 total", pass, report.CoversDecaying)
 		}
 	}
-	// Pass 3: packs completes; the persisted LFS half-proof (fence
-	// intact across the quiet gaps) completes the pair.
-	if report := run(3); report.CoversDecaying != 1 {
-		t.Fatalf("pass 3 report = %+v, want the nonce retired via the persisted out-of-phase proof", report)
+	if !retired {
+		t.Fatal("nonce never retired within 6 passes")
 	}
 	if got := ledgerReserved(t, f, base); got != 555 {
 		t.Fatalf("reserved = %d, want only the decaying nonce", got)
+	}
+}
+
+// TestAbsenceReconcile_PersistedProofRetiresWithFreshVerification (Codex
+// round 21): a persisted half-proof is a TRIGGER — consuming it for
+// retirement re-verifies the class fresh at fold time. Here the LFS
+// rotation is still mid-range in the only pass run, so retirement can
+// come ONLY from the persisted half-proof plus its fold-time
+// verification (the packs gap proof is fresh every pass).
+func TestAbsenceReconcile_PersistedProofRetiresWithFreshVerification(t *testing.T) {
+	f := newSweepFixture(t)
+	ctx := context.Background()
+	base := "repo-persisted-proof"
+	reg := absenceRegistry(t, f)
+	for i := byte(0); i < 6; i++ {
+		key := blob.LFSKey(base, absenceOID('a'+i))
+		registerLFS(t, f, base, key, 10)
+		f.upload(key, strings.Repeat("x", 10))
+	}
+	if err := ref.ReserveRestoreCover(ctx, reg, blob.QuotaRepoGroup(base),
+		ref.AbsenceCoverPrefix+base+"/"+ref.NewReservationOwner(), 555, time.Hour); err != nil {
+		t.Fatalf("seed legacy cover: %v", err)
+	}
+	// Simulate an earlier pass's parked half-proof: the LFS class proved
+	// clean at the current group generation.
+	var gen int64
+	for _, repo := range blob.QuotaRepoGroup(base) {
+		g, err := reg.LFSAdoptionGen(ctx, repo)
+		if err != nil {
+			t.Fatal(err)
+		}
+		gen += g
+	}
+	payload := fmt.Sprintf(`{"%s":{"%s":%d}}`, base, absenceClassLFS, gen)
+	if err := reg.PutJobScanState(ctx, ref.ScanJobAbsence, ref.ScanScopeAbsenceProofs, payload, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	// One pass, budget 8: the LFS rotation parks mid-range (allocation
+	// 4 of 6 rows), so only the persisted half-proof can complete the
+	// pair — after fold-time fresh verification of all 6 rows.
+	r := testReconciler(t, f, true, 8)
+	report, err := r.Run(ctx)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if report.CoversDecaying != 1 {
+		t.Fatalf("report = %+v, want the nonce retired via the persisted trigger", report)
+	}
+	if report.RowsVerified < 6 {
+		t.Fatalf("report = %+v, want the full base re-verified before retirement", report)
+	}
+	if got := ledgerReserved(t, f, base); got != 555 {
+		t.Fatalf("reserved = %d, want only the decaying nonce", got)
+	}
+}
+
+// TestAbsenceReconcile_GapLossCaughtByVerification (Codex round 21,
+// security): out-of-band byte loss during a park gap has no DB event, so
+// the generation fence alone cannot see it — the verdict-time fresh
+// verification must. A row settled in pass 1 loses its bytes while the
+// cursor is parked; pass 2's resumed completion triggers verification,
+// which observes the loss, covers it, and only then retires the nonce.
+func TestAbsenceReconcile_GapLossCaughtByVerification(t *testing.T) {
+	f := newSweepFixture(t)
+	ctx := context.Background()
+	base := "m-gap-loss"
+	// Filler sorting BEFORE the target keeps pass 2's wrapped tail away
+	// from the lost row: only the verification may observe it.
+	for i := byte(0); i < 10; i++ {
+		key := blob.LFSKey("a-filler", absenceOID('a'+i))
+		registerLFS(t, f, "a-filler", key, 10)
+		f.upload(key, strings.Repeat("x", 10))
+	}
+	for i := byte(0); i < 6; i++ {
+		key := blob.LFSKey(base, absenceOID('a'+i))
+		registerLFS(t, f, base, key, 10)
+		f.upload(key, strings.Repeat("x", 10))
+	}
+	legacyKey := ref.AbsenceCoverPrefix + base + "/" + ref.NewReservationOwner()
+	if err := ref.ReserveRestoreCover(ctx, absenceRegistry(t, f), blob.QuotaRepoGroup(base), legacyKey, 555, time.Hour); err != nil {
+		t.Fatalf("seed legacy cover: %v", err)
+	}
+
+	// Pass 1 (LFS allocation 13) settles the filler plus target rows
+	// a, b, c and parks: b is behind the cursor, observed present.
+	pinLFSLeader(t, f)
+	workerA := testReconciler(t, f, true, 27)
+	if _, err := workerA.Run(ctx); err != nil {
+		t.Fatalf("worker A: %v", err)
+	}
+
+	// Out-of-band loss behind the parked cursor: no DB mutation, the
+	// generation fence stays intact.
+	if err := f.blobs.Delete(ctx, blob.LFSKey(base, absenceOID('b'))); err != nil {
+		t.Fatal(err)
+	}
+
+	// Pass 2: the rotation settles only the unvisited suffix (d, e, f)
+	// and its wrapped tail stays inside the filler — it never revisits
+	// b. ONLY the completion-triggered fresh verification can observe
+	// the loss, and it must: the deficit is covered before the nonce
+	// retires — never a false retirement.
+	workerB := testReconciler(t, f, true, 12)
+	report, err := workerB.Run(ctx)
+	if err != nil {
+		t.Fatalf("worker B: %v", err)
+	}
+	if report.CoversDecaying != 1 || report.LFSRowsAbsent == 0 || report.RowsVerified < 7 {
+		t.Fatalf("pass 2 report = %+v, want the loss observed by verification and the nonce retired", report)
+	}
+	if got := ledgerReserved(t, f, base); got != 555+10 {
+		t.Fatalf("reserved = %d, want the decaying nonce plus the fresh loss cover", got)
 	}
 }
 

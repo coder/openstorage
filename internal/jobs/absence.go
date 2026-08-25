@@ -183,6 +183,10 @@ type AbsenceReport struct {
 	// one pass (foldRedundantLegacy): never deleted — a not-yet-upgraded
 	// replica may still depend on them mid-roll.
 	CoversDecaying int64 `json:"covers_decaying"`
+	// RowsVerified counts registry rows re-observed by verifyAndJudge —
+	// the fresh storage-visible evidence behind every verdict whose
+	// trigger spanned a pass boundary (Codex round 21).
+	RowsVerified int64 `json:"rows_verified"`
 	// CoversTouched counts live deterministic cover rows whose TTL the
 	// pass-start bulk touch re-stamped (Codex round 9): protection never
 	// depends on the keyset listing completing within the TTL, so a
@@ -305,8 +309,10 @@ type AbsenceReconciler struct {
 	// legacyRows is this pass's harvest of live pre-#125 nonce covers
 	// still awaiting retirement (Codex round 19): the renewal listing
 	// records them as-listed, and the pass end folds exactly those whose
-	// base holds BOTH class proofs (cleanBases).
-	legacyRows []ref.AbsenceCoverRow
+	// base holds BOTH class proofs (cleanBases). legacyBases indexes
+	// their bases for the endRange verification relevance gate.
+	legacyRows  []ref.AbsenceCoverRow
+	legacyBases map[string]bool
 	// cleanBases[class][base] records that class holds a clean proof
 	// for base THIS PASS: a fence-continuous start-to-end range
 	// observation with no stat/charge errors — single-pass, or resumed
@@ -319,10 +325,18 @@ type AbsenceReconciler struct {
 	// counterpart lands). Retirement needs both classes in one map.
 	cleanBases map[string]map[string]bool
 	// proofGens[base][class] is the surviving persisted half-proof set
-	// loaded (and fence-validated) this pass — the retention source for
+	// loaded (and fence-validated) this pass. Entries are TRIGGERS, not
+	// authority: consuming one for retirement first re-verifies the
+	// class fresh (verifyAndJudge, which deletes the entry via
+	// markCleanBase on success). Also the retention source for
 	// saveState when an incomplete renewal listing leaves legacyRows
 	// non-authoritative.
 	proofGens map[string]map[string]int64
+	// verifyPool bounds the pass's total fresh-verification work (one
+	// budget's worth, shared by every verifyAndJudge): verification is
+	// per-verdict full-base work, so without a pool a pass completing
+	// many small ranges could multiply its row budget.
+	verifyPool int64
 	// touchFailed records that this pass's bulk cover renewal FAILED:
 	// the rotation cursors must not be re-stamped by saveState (Codex
 	// round 19, P1) — a cursor row's DB-clock freshness is the loadState
@@ -405,12 +419,20 @@ type rangeTracker struct {
 	// running total may under-count, so shrink/release must not fire.
 	dirty   bool
 	running int64
+	// resumed: the range was restored from a parked cursor, so segments
+	// of its observation predate this pass (Codex rounds 19-21): the
+	// accumulated total stays EXACT for grow charging, but verdicts
+	// (markCleanBase, shrink, release) never come from it directly —
+	// completion triggers verifyAndJudge, whose FRESH re-observation is
+	// the verdict authority (out-of-band byte loss in a park gap is
+	// invisible to any DB fence).
+	resumed bool
 	// tainted: the range's observation lost fence continuity across a
 	// park gap (Codex rounds 19-20): a foreign mutation bumped the base
 	// group's adoption generation while the cursor was parked, or the
-	// fence could not be read/written. The accumulated total stays
-	// EXACT for grow charging, but shrink, release, and legacy-fold
-	// proofs must wait for the next traversal's continuous observation.
+	// fence could not be read/written. Still exact for grow charging,
+	// but not even a verification trigger — the group demonstrably
+	// changed, so the next traversal re-observes from scratch.
 	tainted bool
 }
 
@@ -509,11 +531,13 @@ func (r *AbsenceReconciler) loadState(ctx context.Context, errs *boundedErrs) {
 	r.lfsRange = rangeTracker{class: absenceClassLFS}
 	r.packsRange = rangeTracker{class: absenceClassPacks}
 	r.legacyRows = nil
+	r.legacyBases = make(map[string]bool)
 	r.cleanBases = map[string]map[string]bool{
 		absenceClassLFS:   make(map[string]bool),
 		absenceClassPacks: make(map[string]bool),
 	}
 	r.proofGens = make(map[string]map[string]int64)
+	r.verifyPool = r.budget
 	r.touchFailed = false
 	for _, c := range []struct {
 		scope string
@@ -730,8 +754,8 @@ func (r *AbsenceReconciler) saveProofs(sctx context.Context, errs *boundedErrs) 
 	keep := make(map[string]map[string]int64)
 	for base := range bases {
 		lfsClean, packsClean := r.cleanBases[absenceClassLFS][base], r.cleanBases[absenceClassPacks][base]
-		if lfsClean == packsClean {
-			continue // none: nothing to carry; both: the fold ran this pass
+		if !lfsClean && !packsClean {
+			continue // nothing to carry
 		}
 		if len(keep) >= absenceProofCap {
 			r.logger.Warn("absence reconcile: half-proof cap exceeded; excess proofs dropped",
@@ -743,11 +767,18 @@ func (r *AbsenceReconciler) saveProofs(sctx context.Context, errs *boundedErrs) 
 			errs.add(fmt.Errorf("absence reconcile: snapshot proof fence for %s: %w", base, err))
 			continue
 		}
-		class := absenceClassLFS
-		if packsClean {
-			class = absenceClassPacks
+		// Both-clean bases persist BOTH halves: their fold either
+		// consumed the nonces (the entry evicts next pass with the
+		// listing) or deferred (verification pool/CAS), and dropping
+		// the halves would discard the convergence progress.
+		entry := make(map[string]int64, 2)
+		if lfsClean {
+			entry[absenceClassLFS] = gen
 		}
-		keep[base] = map[string]int64{class: gen}
+		if packsClean {
+			entry[absenceClassPacks] = gen
+		}
+		keep[base] = entry
 	}
 	payload := ""
 	if len(keep) > 0 {
@@ -845,6 +876,7 @@ func (r *AbsenceReconciler) Run(ctx context.Context) (AbsenceReport, error) {
 		"covers_released", report.CoversReleased,
 		"covers_decaying", report.CoversDecaying,
 		"covers_touched", report.CoversTouched,
+		"rows_verified", report.RowsVerified,
 		"renewal_incomplete", report.RenewalIncomplete,
 		"renewal_over_budget", report.RenewalOverBudget,
 		"lfs_traversals", report.LFSTraversals,
@@ -1036,6 +1068,7 @@ func (r *AbsenceReconciler) recordLegacyCover(row *ref.AbsenceCoverRow, report *
 		return
 	}
 	r.legacyRows = append(r.legacyRows, *row)
+	r.legacyBases[row.Base] = true
 }
 
 // foldRedundantLegacy retires this pass's recorded legacy nonce covers
@@ -1056,10 +1089,32 @@ func (r *AbsenceReconciler) recordLegacyCover(row *ref.AbsenceCoverRow, report *
 // completed class proof WAITS for its out-of-phase counterpart under the
 // same fence, persisted across passes (round 21, P1; see loadProofs).
 func (r *AbsenceReconciler) foldRedundantLegacy(ctx context.Context, report *AbsenceReport, st *absencePassState, errs *boundedErrs) {
+	attempted := make(map[string]bool)
 	for i := range r.legacyRows {
 		row := &r.legacyRows[i]
 		if !r.cleanBases[absenceClassLFS][row.Base] || !r.cleanBases[absenceClassPacks][row.Base] {
 			continue // no completed double proof yet: stays live, retried later
+		}
+		// Persisted half-proofs are triggers only (Codex round 21,
+		// security): their evidence predates this pass, so each such
+		// class is re-verified FRESH before it may retire anything —
+		// success supersedes the entry (markCleanBase); a deferred or
+		// dirty verification leaves it, and the nonce stays live.
+		stale := false
+		for _, class := range []string{absenceClassLFS, absenceClassPacks} {
+			if _, persisted := r.proofGens[row.Base][class]; !persisted {
+				continue
+			}
+			if key := row.Base + "\x00" + class; !attempted[key] {
+				attempted[key] = true
+				r.verifyAndJudge(ctx, row.Base, class, report, st, errs)
+			}
+			if _, still := r.proofGens[row.Base][class]; still {
+				stale = true
+			}
+		}
+		if stale {
+			continue
 		}
 		if st.purged[row.Base] {
 			continue // the purge pipeline owns the base's rows
@@ -1075,13 +1130,21 @@ func (r *AbsenceReconciler) foldRedundantLegacy(ctx context.Context, report *Abs
 	}
 }
 
-// markCleanBase records a completed clean proof for one (class, base) —
-// see cleanBases.
+// markCleanBase records a completed FRESH clean proof for one
+// (class, base) — see cleanBases. A fresh proof supersedes a persisted
+// half-proof for the same pair: the trigger entry is dropped so fold
+// consumers know the class needs no re-verification this pass.
 func (r *AbsenceReconciler) markCleanBase(class, base string) {
 	if base == "" {
 		return
 	}
 	r.cleanBases[class][base] = true
+	if m := r.proofGens[base]; m != nil {
+		delete(m, class)
+		if len(m) == 0 {
+			delete(r.proofGens, base)
+		}
+	}
 }
 
 // foldIntoIncarnation grows one class's live incarnation to at least
@@ -1145,7 +1208,7 @@ func (r *AbsenceReconciler) rotationPhase(ctx context.Context, cur *absenceCurso
 	// GROW charging unconditionally, and for shrink/release/fold proofs
 	// exactly when loadState verified fence continuity across every park
 	// gap (Codex rounds 19-20; see absenceCursorState.RangeGen).
-	*tr = rangeTracker{class: tr.class, base: cur.RangeBase, started: cur.RangeStarted, dirty: cur.RangeDirty, running: cur.RangeRunning, tainted: cur.RangeTainted}
+	*tr = rangeTracker{class: tr.class, base: cur.RangeBase, started: cur.RangeStarted, dirty: cur.RangeDirty, running: cur.RangeRunning, resumed: cur.RangeStarted, tainted: cur.RangeTainted}
 	if tr.base == "" && !startedAtZero {
 		// Legacy parked cursor without range state (rows written before
 		// this fix): treat the pending range as unstarted, never exact.
@@ -1208,7 +1271,7 @@ func (r *AbsenceReconciler) rotationPhase(ctx context.Context, cur *absenceCurso
 				prevBase := tr.base
 				r.endRange(ctx, tr, report, st, errs)
 				r.releaseZeroRowCovers(ctx, tr.class, coverBases, legacyBases, prevBase, b, report, errs)
-				tr.base, tr.started, tr.dirty, tr.running, tr.tainted = b, true, false, 0, false
+				tr.base, tr.started, tr.dirty, tr.running, tr.resumed, tr.tainted = b, true, false, 0, false, false
 			}
 			charged += settle[i]()
 			cur.AfterRepo, cur.AfterKey = repos[i], keys[i]
@@ -1307,23 +1370,45 @@ func (r *AbsenceReconciler) releaseZeroRowCovers(ctx context.Context, class stri
 	}
 }
 
+// classPage lists one keyset page of a registry class as (repo, cursorKey)
+// pairs plus a settle callback per row bound to tr — the shared adapter
+// under both the rotation phases and verifyAndJudge.
+func (r *AbsenceReconciler) classPage(ctx context.Context, class string, tr *rangeTracker, afterRepo, afterKey string, limit int, report *AbsenceReport, st *absencePassState, errs *boundedErrs) ([]string, []string, []func() int64, error) {
+	if class == absenceClassLFS {
+		rows, err := r.registry.ListFleetLFSObjects(ctx, afterRepo, afterKey, limit)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		repos := make([]string, len(rows))
+		keys := make([]string, len(rows))
+		settle := make([]func() int64, len(rows))
+		for i := range rows {
+			row := rows[i]
+			repos[i], keys[i] = row.Repo, row.Key
+			settle[i] = func() int64 { return r.settleLFSRow(ctx, row, tr, report, st, errs) }
+		}
+		return repos, keys, settle, nil
+	}
+	rows, err := r.registry.ListFleetPacks(ctx, afterRepo, afterKey, limit)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	repos := make([]string, len(rows))
+	keys := make([]string, len(rows))
+	settle := make([]func() int64, len(rows))
+	for i := range rows {
+		row := rows[i]
+		repos[i], keys[i] = row.Repo, row.ID
+		settle[i] = func() int64 { return r.settlePackRow(ctx, row, tr, report, st, errs) }
+	}
+	return repos, keys, settle, nil
+}
+
 // lfsPhase adapts the lfs_objects registry into rotationPhase.
 func (r *AbsenceReconciler) lfsPhase(ctx context.Context, budget int64, report *AbsenceReport, st *absencePassState, errs *boundedErrs) int64 {
 	return r.rotationPhase(ctx, &r.lfs, &r.lfsRange, budget, report, st, errs,
 		func(ctx context.Context, afterRepo, afterKey string, limit int) ([]string, []string, []func() int64, error) {
-			rows, err := r.registry.ListFleetLFSObjects(ctx, afterRepo, afterKey, limit)
-			if err != nil {
-				return nil, nil, nil, err
-			}
-			repos := make([]string, len(rows))
-			keys := make([]string, len(rows))
-			settle := make([]func() int64, len(rows))
-			for i := range rows {
-				row := rows[i]
-				repos[i], keys[i] = row.Repo, row.Key
-				settle[i] = func() int64 { return r.settleLFSRow(ctx, row, &r.lfsRange, report, st, errs) }
-			}
-			return repos, keys, settle, nil
+			return r.classPage(ctx, absenceClassLFS, &r.lfsRange, afterRepo, afterKey, limit, report, st, errs)
 		})
 }
 
@@ -1331,20 +1416,76 @@ func (r *AbsenceReconciler) lfsPhase(ctx context.Context, budget int64, report *
 func (r *AbsenceReconciler) packPhase(ctx context.Context, budget int64, report *AbsenceReport, st *absencePassState, errs *boundedErrs) int64 {
 	return r.rotationPhase(ctx, &r.packs, &r.packsRange, budget, report, st, errs,
 		func(ctx context.Context, afterRepo, afterID string, limit int) ([]string, []string, []func() int64, error) {
-			rows, err := r.registry.ListFleetPacks(ctx, afterRepo, afterID, limit)
-			if err != nil {
-				return nil, nil, nil, err
-			}
-			repos := make([]string, len(rows))
-			keys := make([]string, len(rows))
-			settle := make([]func() int64, len(rows))
-			for i := range rows {
-				row := rows[i]
-				repos[i], keys[i] = row.Repo, row.ID
-				settle[i] = func() int64 { return r.settlePackRow(ctx, row, &r.packsRange, report, st, errs) }
-			}
-			return repos, keys, settle, nil
+			return r.classPage(ctx, absenceClassPacks, &r.packsRange, afterRepo, afterID, limit, report, st, errs)
 		})
+}
+
+// verifyAndJudge re-observes one (base, class) FRESH — a bounded scoped
+// enumeration of the class's current registry rows with a storage stat
+// per row, exactly the evidence a single-pass range observation yields —
+// and applies the range verdicts (markCleanBase, shrink, release) from
+// that observation alone (Codex round 21, security). Resumed completions
+// and persisted half-proofs are only TRIGGERS: their accumulated totals
+// span park gaps where out-of-band byte loss is invisible to any DB
+// fence, so compensation is never relaxed from them directly. The work
+// draws on the shared per-pass verification pool (one budget's worth):
+// a class whose base outgrows the pool defers its verdicts LOUDLY — the
+// operator sizes CODESTORAGE_ABSENCE_RECONCILE_BUDGET so the largest
+// base's combined class rows fit — and its covers stay protectively
+// oversized meanwhile, strictly the conservative direction.
+func (r *AbsenceReconciler) verifyAndJudge(ctx context.Context, base, class string, report *AbsenceReport, st *absencePassState, errs *boundedErrs) {
+	assertf(base != "" && (class == absenceClassLFS || class == absenceClassPacks),
+		"verifyAndJudge(%q, %q)", base, class)
+	vtr := rangeTracker{class: class, base: base, started: true}
+	// Keyset start strictly before the base group's first row: members
+	// are base plus suffixed namespaces, all sorting at or after
+	// (base, "").
+	afterRepo, afterKey := base, ""
+	for {
+		if ctx.Err() != nil {
+			errs.add(ctx.Err())
+			return
+		}
+		if r.verifyPool <= 0 {
+			r.logger.Warn("absence reconcile: verification pool exhausted — verdict deferred; raise CODESTORAGE_ABSENCE_RECONCILE_BUDGET above the largest base's combined class rows if persistent",
+				"base", base, "class", class)
+			return
+		}
+		repos, keys, settle, err := r.classPage(ctx, class, &vtr, afterRepo, afterKey, r.pageLimit(r.verifyPool), report, st, errs)
+		if err != nil {
+			errs.add(fmt.Errorf("absence reconcile: verify %s/%s: %w", base, class, err))
+			return
+		}
+		if len(repos) == 0 {
+			break // keyspace end: the whole base range was re-observed
+		}
+		done := false
+		for i := range repos {
+			if baseOf(repos[i]) != base {
+				done = true
+				break
+			}
+			if ctx.Err() != nil {
+				errs.add(ctx.Err())
+				return
+			}
+			if r.verifyPool <= 0 {
+				r.logger.Warn("absence reconcile: verification pool exhausted — verdict deferred; raise CODESTORAGE_ABSENCE_RECONCILE_BUDGET above the largest base's combined class rows if persistent",
+					"base", base, "class", class)
+				return
+			}
+			charged := settle[i]()
+			r.verifyPool -= charged
+			report.RowsVerified += charged
+			afterRepo, afterKey = repos[i], keys[i]
+		}
+		if done {
+			break
+		}
+	}
+	// The fresh observation is a complete, error-free-or-dirty range in
+	// its own right: the normal fresh-range verdict path judges it.
+	r.endRange(ctx, &vtr, report, st, errs)
 }
 
 // tickTraversal records an origin crossing for one registry class.
@@ -1368,7 +1509,7 @@ func (r *AbsenceReconciler) tickTraversal(cur *absenceCursorState, class string,
 // the running total is partial). Grow charges already made remain valid —
 // they only ever raise a cover toward the true total.
 func (tr *rangeTracker) abandon() {
-	tr.base, tr.started, tr.dirty, tr.running, tr.tainted = "", false, false, 0, false
+	tr.base, tr.started, tr.dirty, tr.running, tr.resumed, tr.tainted = "", false, false, 0, false, false
 }
 
 // endRange completes the pending base range: when the WHOLE range was
@@ -1376,7 +1517,7 @@ func (tr *rangeTracker) abandon() {
 // the cover lifecycle may shrink or release the base's aggregate.
 func (r *AbsenceReconciler) endRange(ctx context.Context, tr *rangeTracker, report *AbsenceReport, st *absencePassState, errs *boundedErrs) {
 	base, class := tr.base, tr.class
-	started, dirty, running, tainted := tr.started, tr.dirty, tr.running, tr.tainted
+	started, dirty, running, resumed, tainted := tr.started, tr.dirty, tr.running, tr.resumed, tr.tainted
 	tr.abandon()
 	if base == "" || !started || !r.quotaEnforced {
 		return
@@ -1398,21 +1539,36 @@ func (r *AbsenceReconciler) endRange(ctx context.Context, tr *rangeTracker, repo
 	if tainted {
 		// The observation lost fence continuity across a park gap
 		// (Codex rounds 19-20): a foreign mutation changed the base
-		// group while no segment was watching, so the accumulated total
-		// may be stale against it — exact for the grow charges already
-		// made, but never a shrink, release, or fold proof. The next
-		// traversal's fence-continuous observation right-sizes.
+		// group while no segment was watching — exact for the grow
+		// charges already made, but not even a verification trigger.
+		// The next traversal re-observes from scratch.
 		return
 	}
 	if st.purged[base] || st.coverSkip[base] {
 		return // the total may under-count: never shrink on it
 	}
-	// A clean fence-continuous start-to-end observation — one pass, or
-	// a verified chain of segments (Codex rounds 19-20): the base's true
-	// current deficit was recomputed from the registry and is charged
-	// (chargeDeficit grows the head incrementally; a charge failure
-	// dirties the range) — this class's ground-truth proof for legacy
-	// retirement.
+	if resumed {
+		// A fence-continuous multi-pass completion (Codex rounds
+		// 20-21): the DB fence proves the group's ROWS did not change
+		// across the park gaps, but out-of-band byte loss has no DB
+		// event, so the accumulated total must not relax compensation
+		// directly. Completion is the TRIGGER; the verdict authority is
+		// a bounded fresh re-observation of the whole base range —
+		// spent only when something consumes the verdict (a live head
+		// that could shrink, or a legacy nonce awaiting retirement):
+		// healthy bases completing resumed ranges are common and must
+		// not drain the verification pool.
+		head, ok := r.resolveHead(ctx, base, class, st, errs)
+		if (ok && head.key != "") || r.legacyBases[base] {
+			r.verifyAndJudge(ctx, base, class, report, st, errs)
+		}
+		return
+	}
+	// A clean single-pass start-to-end observation: the base's true
+	// current deficit was recomputed from the registry and storage just
+	// now and is charged (chargeDeficit grows the head incrementally; a
+	// charge failure dirties the range) — this class's ground-truth
+	// proof for legacy retirement.
 	r.markCleanBase(class, base)
 	head, ok := r.resolveHead(ctx, base, class, st, errs)
 	if !ok || head.key == "" {
