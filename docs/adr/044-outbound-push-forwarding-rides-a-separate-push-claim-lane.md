@@ -83,8 +83,12 @@ local until the next authorized trigger converges the mirror. The
 `forward_pushes` decision itself is made at repo creation by a
 `repo:write` holder.
 
-**Failure semantics.** A local push never fails because the upstream is
-down — forwarding is asynchronous. Transient failures (upstream
+**Failure semantics.** The forward itself is atomic (`git push --atomic`):
+a batch with one refused ref leaves the upstream entirely untouched, so a
+failed run never strands a partially-updated upstream that no mirror-back
+would converge (failed runs schedule none). A local push never fails
+because the upstream is down — forwarding is asynchronous. Transient
+failures (upstream
 unreachable) re-mark the durable pending level and retry with exponential
 backoff (1m…16m, 5 attempts per trigger; River schedules delayed
 successors transactionally, local mode arms single-flight timers, and the

@@ -61,7 +61,10 @@ wire (no `direction` field), so absence means pull. Push-direction payloads may
 additionally carry `forced: true` (the run used force refspecs) and, on
 `repo.sync.failed` with `error: "push rejected by upstream"`, a
 `rejected_refs: [{ref, reason}]` array naming each ref the upstream refused
-(e.g. `non-fast-forward`). Push-direction `error` values reuse the strings
+(e.g. `non-fast-forward`). The forward is atomic: one refused ref fails the
+whole batch and the upstream is left untouched, so the array also lists the
+innocent refs with reason `atomic push failed`. Push-direction `error`
+values reuse the strings
 above plus `"failed to push to upstream"` (generic outbound push failure) and
 `"push rejected by upstream"`. `run_count`/`is_first_sync` count outbound runs
 independently of inbound ones.

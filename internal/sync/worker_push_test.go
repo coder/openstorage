@@ -100,7 +100,13 @@ func divergeUpstream(t *testing.T, bare string) string {
 	return testGit(t, work, "rev-parse", "HEAD")
 }
 
-func TestPushRunNonFastForwardFailsPerRef(t *testing.T) {
+// TestPushRunNonFastForwardRejectsAtomically: the local snapshot carries a
+// stale main AND a brand-new tag; the refused main must fail the WHOLE
+// forward (--atomic) — the innocent tag reports "atomic push failed" in
+// rejected_refs and never lands upstream, because a partially-updated
+// upstream behind a failed run would have no mirror-back scheduled to
+// converge it.
+func TestPushRunNonFastForwardRejectsAtomically(t *testing.T) {
 	f := newWorkerFixture(t)
 	seedLocalRepo(t, f, "repo_pb")
 	bare := addEmptyUpstream(t, f.upstreamDir, "own", "proj")
@@ -117,15 +123,23 @@ func TestPushRunNonFastForwardFailsPerRef(t *testing.T) {
 	if failed.Error != FailRejected || failed.Direction != DirectionPush {
 		t.Fatalf("bad failed event: %+v", failed)
 	}
-	if len(failed.RejectedRefs) != 1 || failed.RejectedRefs[0].Ref != "refs/heads/main" {
-		t.Fatalf("rejected_refs = %+v, want exactly refs/heads/main", failed.RejectedRefs)
+	reasons := map[string]string{}
+	for _, r := range failed.RejectedRefs {
+		if r.Reason == "" {
+			t.Fatalf("rejected ref carries no reason: %+v", failed.RejectedRefs)
+		}
+		reasons[r.Ref] = r.Reason
 	}
-	if failed.RejectedRefs[0].Reason == "" {
-		t.Fatalf("rejected ref carries no reason: %+v", failed.RejectedRefs)
+	if len(reasons) != 2 || reasons["refs/heads/main"] == "" || reasons["refs/tags/v1"] == "" {
+		t.Fatalf("rejected_refs = %+v, want refs/heads/main + refs/tags/v1", failed.RejectedRefs)
 	}
-	// Upstream history was NOT rewritten.
+	// Upstream history was NOT rewritten AND the innocent tag did not
+	// land: the batch is one transaction.
 	if got := testGit(t, f.upstreamDir, "-C", bare, "rev-parse", "refs/heads/main"); got != upstreamHead {
 		t.Fatalf("upstream main = %s, want untouched %s", got, upstreamHead)
+	}
+	if refs := testGit(t, f.upstreamDir, "-C", bare, "for-each-ref", "refs/tags"); refs != "" {
+		t.Fatalf("atomic rejection still landed tags upstream: %q", refs)
 	}
 }
 

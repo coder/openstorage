@@ -6,8 +6,10 @@ package sync
 // through the front door too), and performs a real `git push` of
 // refs/heads/* + refs/tags/* to the linked upstream with the stored
 // credential. Non-force by default — a ref the upstream refuses fails the
-// run with per-ref reasons (FailRejected + rejected_refs) instead of
-// rewriting upstream history; force is an explicit, marker-carried opt-in.
+// run ATOMICALLY (--atomic: the forward is one remote transaction, so a
+// refused batch leaves the upstream untouched) with per-ref reasons
+// (FailRejected + rejected_refs) instead of rewriting upstream history;
+// force is an explicit, marker-carried opt-in.
 // Ref DELETIONS are not propagated in either direction (the pull lane
 // deliberately avoids --mirror; this lane deliberately avoids --prune and
 // delete refspecs).
@@ -448,7 +450,15 @@ func (w *Worker) transferPush(ctx context.Context, job Job, repo RepoInfo, up Up
 	}
 	// --porcelain makes per-ref outcomes parseable (stdout) so a refused
 	// non-fast-forward names the exact refs in the failed event.
-	pushArgs := append([]string{"push", "--porcelain", up.CloneURL()}, refspecs...)
+	// --atomic makes the multi-ref forward all-or-nothing: without it, a
+	// batch with one refused ref PARTIALLY updates the upstream while the
+	// run still fails — and a failed run schedules no mirror-back, so a
+	// concurrent pull that fetched pre-forward could permanently clobber
+	// the refs that did land. With the transaction, a failed run means
+	// the upstream is untouched and skipping AfterForward is sound; the
+	// innocent refs in a refused batch report "atomic push failed" in
+	// rejected_refs.
+	pushArgs := append([]string{"push", "--porcelain", "--atomic", up.CloneURL()}, refspecs...)
 	// Detach/steal watchdog for the push itself: the barrier above cannot
 	// cover a DELETE /repos/base (or a steal) that commits while `git
 	// push` is already talking to a slow upstream — without it, the
