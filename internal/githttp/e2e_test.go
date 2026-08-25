@@ -192,15 +192,13 @@ func testMainInner(m *testing.M) int {
 			panic("start seaweedfs container: " + err.Error())
 		}
 		defer func() { _ = seaweedC.Terminate(ctx) }()
-		s3Host, err := seaweedC.Host(ctx)
+		// PortEndpoint brackets IPv6 hosts (net.JoinHostPort), so the
+		// address stays a valid URL host under IPv6 Docker daemons.
+		s3Addr, err := seaweedC.PortEndpoint(ctx, "8333/tcp", "")
 		if err != nil {
 			panic(err)
 		}
-		s3Port, err := seaweedC.MappedPort(ctx, "8333/tcp")
-		if err != nil {
-			panic(err)
-		}
-		blobURL = fmt.Sprintf("s3://githttp-test?endpoint=http://%s:%s&s3ForcePathStyle=true&region=us-east-1", s3Host, s3Port.Port())
+		blobURL = fmt.Sprintf("s3://githttp-test?endpoint=http://%s&s3ForcePathStyle=true&region=us-east-1", s3Addr)
 		os.Setenv("AWS_ACCESS_KEY_ID", s3AccessKey)
 		os.Setenv("AWS_SECRET_ACCESS_KEY", s3SecretKey)
 	case backendLocal:

@@ -84,15 +84,13 @@ func startSeaweedFS(t *testing.T, enforceAuth bool) string {
 		t.Fatalf("start seaweedfs container: %v", err)
 	}
 	t.Cleanup(func() { _ = c.Terminate(context.Background()) })
-	host, err := c.Host(ctx)
+	// PortEndpoint brackets IPv6 hosts (net.JoinHostPort), so the address
+	// stays a valid URL host under IPv6 Docker daemons.
+	addr, err := c.PortEndpoint(ctx, "8333/tcp", "")
 	if err != nil {
-		t.Fatalf("seaweedfs host: %v", err)
+		t.Fatalf("seaweedfs endpoint: %v", err)
 	}
-	port, err := c.MappedPort(ctx, "8333/tcp")
-	if err != nil {
-		t.Fatalf("seaweedfs mapped port: %v", err)
-	}
-	return fmt.Sprintf("%s:%s", host, port.Port())
+	return addr
 }
 
 // ensureBucketReady retries EnsureBucket until the gateway chain behind the
