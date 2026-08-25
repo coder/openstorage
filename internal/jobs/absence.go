@@ -981,7 +981,11 @@ func (r *AbsenceReconciler) chargeDeficit(ctx context.Context, tr *rangeTracker,
 	}
 	head, ok := r.resolveHead(ctx, tr.base, tr.class, st, errs)
 	if !ok {
-		tr.dirty = true // unaccounted deficit: never shrink on this range
+		// Unaccounted deficit: never shrink on this range, and the
+		// traversal is not clean (Codex round 4, security P2: a cover
+		// failure must dirty the durable class cursor like a stat error,
+		// or the traversal-completed bookkeeping over-reports health).
+		tr.dirty, r.cursorFor(tr.class).Dirty = true, true
 		return
 	}
 	if tr.running <= head.bytes {
@@ -991,7 +995,7 @@ func (r *AbsenceReconciler) chargeDeficit(ctx context.Context, tr *rangeTracker,
 		head = liveCover{key: absenceIncarnationKey(tr.base, tr.class, 1), n: 1}
 	}
 	if !r.chargeCover(ctx, tr.base, head.key, tr.running, report, st, errs) {
-		tr.dirty = true
+		tr.dirty, r.cursorFor(tr.class).Dirty = true, true
 		return
 	}
 	head.bytes = tr.running
