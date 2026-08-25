@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.1](https://github.com/coder/code-storage/compare/v0.5.0...v0.5.1) (2026-08-25)
+
+
+### Bug Fixes
+
+* **githttp:** bound ref materialization in the shared hydration path ([#124](https://github.com/coder/code-storage/issues/124)) ([366d609](https://github.com/coder/code-storage/commit/366d609600a54e1eec4942d8af1078ce189b70c2)), closes [#119](https://github.com/coder/code-storage/issues/119)
+
 ## [0.5.0](https://github.com/coder/code-storage/compare/v0.4.0...v0.5.0) (2026-08-24)
 
 
