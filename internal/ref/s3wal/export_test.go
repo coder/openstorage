@@ -17,7 +17,8 @@ var ErrorStatus = errorStatus
 // SetTestBackoff shrinks a client's contention backoff so exhaustion paths
 // stay fast in tests.
 func SetTestBackoff(c *Client, base, cap time.Duration) {
-	assertf(c != nil && base > 0 && cap >= base, "SetTestBackoff(%v, %v)", base, cap)
+	assertf(c != nil, "SetTestBackoff: nil client")
+	assertf(base > 0 && cap >= base, "SetTestBackoff(%v, %v)", base, cap)
 	c.backoffBase = base
 	c.backoffCap = cap
 }

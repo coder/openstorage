@@ -54,13 +54,10 @@ import (
 // against — see s3waltest.EnvTestS3WALURL. Unset skips the lane.
 const EnvTestS3WALURL = s3waltest.EnvTestS3WALURL
 
-// Store image pins. SeaweedFS is the self-hosted store of record (plan
-// §5-R7); the MinIO pin is the repo's legacy CI image, kept in the matrix
-// only to document its conditional-write behavior empirically.
-const (
-	seaweedFSImage   = s3waltest.SeaweedFSImage
-	minioLegacyImage = s3waltest.MinIOLegacyImage
-)
+// Store image pins live in s3waltest (SeaweedFSImage / MinIOLegacyImage):
+// SeaweedFS is the self-hosted store of record (plan §5-R7); the MinIO pin
+// is the repo's legacy CI image, kept in the matrix only to document its
+// conditional-write behavior empirically.
 
 // ---------------------------------------------------------------------------
 // {seq, nonce} payload codec — the Phase 1a stand-in for the Phase 1b
