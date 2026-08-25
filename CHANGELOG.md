@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.0](https://github.com/coder/code-storage/compare/v0.6.2...v0.7.0) (2026-08-25)
+
+
+### Features
+
+* **sync:** forward local pushes to the linked upstream (push-upstream) ([#137](https://github.com/coder/code-storage/issues/137)) ([3f985b5](https://github.com/coder/code-storage/commit/3f985b5be5dde9ee031e726d96f0d9aeba584c1f))
+
 ## [0.6.2](https://github.com/coder/code-storage/compare/v0.6.1...v0.6.2) (2026-08-25)
 
 
