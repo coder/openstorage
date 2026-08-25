@@ -79,8 +79,19 @@ func TestPushUpstreamLifecycle(t *testing.T) {
 
 		// Local commit, then the explicit outbound trigger: exact 202 body.
 		localHead := pushLocalCommit(t, s, repoID)
-		writeToken := s.e.mint(t, tokenSpec{iss: s.org, repo: repoURL, scopes: []string{auth.ScopeGitWrite}})
-		resp, respBody := s.req(t, http.MethodPost, "/api/v1/repos/push-upstream", writeToken, nil)
+		// A write-only token is refused before any work: the forward
+		// exports every local head/tag, so it demands the caller's own
+		// git:read (a write-only principal must not exfiltrate content
+		// it cannot clone to an upstream it can read).
+		writeOnly := s.e.mint(t, tokenSpec{iss: s.org, repo: repoURL, scopes: []string{auth.ScopeGitWrite}})
+		resp, respBody := s.req(t, http.MethodPost, "/api/v1/repos/push-upstream", writeOnly, nil)
+		if resp.StatusCode != http.StatusForbidden {
+			t.Fatalf("write-only push-upstream status %d: %s", resp.StatusCode, respBody)
+		}
+		s.assertNoEvent(t)
+
+		writeToken := s.e.mint(t, tokenSpec{iss: s.org, repo: repoURL, scopes: []string{auth.ScopeGitWrite, auth.ScopeGitRead}})
+		resp, respBody = s.req(t, http.MethodPost, "/api/v1/repos/push-upstream", writeToken, nil)
 		if resp.StatusCode != http.StatusAccepted {
 			t.Fatalf("push-upstream status %d: %s", resp.StatusCode, respBody)
 		}
@@ -106,7 +117,7 @@ func TestPushUpstreamLifecycle(t *testing.T) {
 		// Policed callers fail closed, mirroring pull-upstream: the run
 		// would publish every local head/tag with the stored credential.
 		policedToken := s.e.mint(t, tokenSpec{iss: s.org, repo: repoURL,
-			scopes: []string{auth.ScopeGitWrite}, refs: `[["main", ["no-push"]]]`})
+			scopes: []string{auth.ScopeGitWrite, auth.ScopeGitRead}, refs: `[["main", ["no-push"]]]`})
 		resp, respBody = s.req(t, http.MethodPost, "/api/v1/repos/push-upstream", policedToken, nil)
 		if resp.StatusCode != http.StatusForbidden {
 			t.Fatalf("policed push-upstream status %d: %s", resp.StatusCode, respBody)
@@ -159,7 +170,7 @@ func TestPushUpstreamRequiresBaseRepo(t *testing.T) {
 		s := newUsyncStack(t, e)
 		repoURL := "team/plain-" + randomHex(t, 4)
 		s.createRepo(t, repoURL, nil)
-		token := s.e.mint(t, tokenSpec{iss: s.org, repo: repoURL, scopes: []string{auth.ScopeGitWrite}})
+		token := s.e.mint(t, tokenSpec{iss: s.org, repo: repoURL, scopes: []string{auth.ScopeGitWrite, auth.ScopeGitRead}})
 		resp, respBody := s.req(t, http.MethodPost, "/api/v1/repos/push-upstream", token, nil)
 		if resp.StatusCode != http.StatusBadRequest {
 			t.Fatalf("status %d: %s", resp.StatusCode, respBody)

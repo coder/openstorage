@@ -99,7 +99,7 @@ func aliasRoutes() []aliasRoute {
 		// Sync + credentials (requireAuth with the {"error"} envelope, per
 		// their v1 registrations).
 		read(http.MethodPost, "/pull-upstream", "/api/v1/repos/pull-upstream", auth.ScopeGitWrite),
-		read(http.MethodPost, "/push-upstream", "/api/v1/repos/push-upstream", auth.ScopeGitWrite),
+		read(http.MethodPost, "/push-upstream", "/api/v1/repos/push-upstream", auth.ScopeGitWrite, auth.ScopeGitRead),
 		read(http.MethodDelete, "/base", "/api/v1/repos/base", auth.ScopeRepoWrite),
 		read(http.MethodPost, "/git-credentials", "/api/v1/repos/git-credentials", auth.ScopeRepoWrite),
 		{method: http.MethodPut, suffix: "/git-credentials", v1Path: "/api/v1/repos/git-credentials",

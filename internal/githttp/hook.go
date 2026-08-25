@@ -31,6 +31,13 @@ const (
 	EnvSyncClaim  = "CODESTORAGE_SYNC_CLAIM"
 	EnvRefsPolicy = "CODESTORAGE_GIT_REFS_POLICY"
 	EnvOps        = "CODESTORAGE_GIT_OPS"
+	// EnvScopes carries the pushing token's scope list (JSON array) into
+	// the hook subprocess. The update hook itself never consults it; the
+	// hook-side forward_on_push poke does (issue #90): auto-forwarding
+	// exports every local head/tag upstream, so a write-only token's push
+	// must not trigger it (the same git:read gate the explicit
+	// push-upstream route enforces).
+	EnvScopes = "CODESTORAGE_GIT_SCOPES"
 	// EnvOrg names the org whose signing keys verify-sig loads. Shared with
 	// the serve config on purpose: the server sets it explicitly for hooks.
 	EnvOrg = "CODESTORAGE_ORG"

@@ -116,16 +116,17 @@ Default notes ref `refs/notes/commits`; bare names resolve to `refs/notes/<name>
 | Method & path | Scope | Notes |
 |---|---|---|
 | `POST /repos/pull-upstream` | git:write | `{ref?}` → **202 Accepted** (async); only for repos with `base_repo`. A 202 is never dropped: a request that arrives while a sync run is already in flight coalesces into one follow-up run, so some run observes upstream as of the request or later |
-| `POST /repos/push-upstream` | git:write | `{force?}` → **202 Accepted** (async); only for repos with `base_repo`. Our extension (upstream forwards implicitly — see [wire compatibility](../explanation/wire-compatibility.md)): publishes local `refs/heads/*` and `refs/tags/*` to the upstream with the stored credential. Non-force by default — a ref the upstream refuses (non-fast-forward) fails the run with per-ref reasons in the `repo.sync.failed` event's `rejected_refs`; `force: true` opts into `+refs`. Ref deletions are not propagated. The 202 coalescing guarantee matches pull-upstream, and `force` survives coalescing (a forced request is never downgraded). An unreachable upstream retries with exponential backoff (1–16 min, 5 attempts); auth/config/rejection failures do not retry. A successful run schedules one follow-up inbound sync, so a pull that raced the forward cannot strand a stale local snapshot |
+| `POST /repos/push-upstream` | git:write + git:read | `{force?}` → **202 Accepted** (async); only for repos with `base_repo`. Requires BOTH scopes: the run exports every local head/tag, so a write-only token must not be able to publish content it cannot clone. Our extension (upstream forwards implicitly — see [wire compatibility](../explanation/wire-compatibility.md)): publishes local `refs/heads/*` and `refs/tags/*` to the upstream with the stored credential. Non-force by default — a ref the upstream refuses (non-fast-forward) fails the run with per-ref reasons in the `repo.sync.failed` event's `rejected_refs`; `force: true` opts into `+refs`. Ref deletions are not propagated. The 202 coalescing guarantee matches pull-upstream, and `force` survives coalescing (a forced request is never downgraded). An unreachable upstream retries with exponential backoff (1–16 min, 5 attempts); auth/config/rejection failures do not retry. A successful run schedules one follow-up inbound sync, so a pull that raced the forward cannot strand a stale local snapshot |
 
 Outbound runs emit the same `repo.sync.*` events with `direction: "push"` (see
 [webhooks](webhooks.md)). `DELETE /repos/base` cancels in-flight runs in both
 directions silently. Ref policies fail closed on both triggers: any policy op
 denies pull-upstream and push-upstream alike. The same gate covers
 `forward_pushes` auto-forwarding: a git push accepted from a token carrying
-any ref-policy op does not trigger the forward (it would publish every head
-and tag, not just the refs that token may touch) — the write stays local and
-the repository converges on the next unpoliced trigger.
+any ref-policy op, or lacking git:read, does not trigger the forward (it
+would publish every head and tag, not just the refs that token may touch or
+read) — the write stays local and the repository converges on the next
+authorized trigger.
 
 ## Status-code contract (what clients key on)
 

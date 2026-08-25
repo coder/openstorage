@@ -72,14 +72,16 @@ A sync run's own loopback pushes carry the sync
 claim in the hook environment and poke nothing, which terminates the
 forward↔pull cycle. Full-mirror forwarding (not just the pushed ref) is
 deliberate: converging to local state is the contract, and per-ref pending
-queues would be unbounded state for no correctness gain. A policed caller
-cannot trigger either direction: the explicit endpoints fail closed (like
-pull-upstream), and the automatic poke skips the forward for a write
-accepted from a token carrying any ref-policy op — full-mirror forwarding
-publishes refs that caller could not push itself, so the policed write
-stays local until the next unpoliced trigger converges the mirror. The
-`forward_pushes` decision itself is made at repo creation by a `repo:write`
-holder.
+queues would be unbounded state for no correctness gain. A policed or
+write-only caller cannot trigger either direction: the explicit endpoint
+fails closed (ref-policy ops like pull-upstream, plus a required git:read
+— the run exports every local head/tag, so a write-only token must not
+exfiltrate content it cannot clone to an upstream it can read), and the
+automatic poke applies the same denial to the pushing token (serve-path
+claims; hook-path env, including the scope list) — the denied write stays
+local until the next authorized trigger converges the mirror. The
+`forward_pushes` decision itself is made at repo creation by a
+`repo:write` holder.
 
 **Failure semantics.** A local push never fails because the upstream is
 down — forwarding is asynchronous. Transient failures (upstream

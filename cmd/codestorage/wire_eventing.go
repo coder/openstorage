@@ -15,6 +15,7 @@ import (
 	"log/slog"
 	"net/url"
 	"os"
+	"slices"
 	"strconv"
 	"time"
 
@@ -134,20 +135,21 @@ func (s webhookSink) Emit(ctx context.Context, org, eventType string, payload []
 // run's own loopback pushes carry the sync claim, which suppresses the
 // hook-side poke entirely (wireHookEventing).
 //
-// callerPoliced gates the FORWARD reroute only (Codex round 3): the
-// forward publishes every local head and tag with the stored upstream
-// credential, so a caller whose token carries ANY ref-policy op — one
-// allowed to update only the refs its policies name — must not implicitly
-// trigger publication of refs it could not push itself. The explicit
-// POST /repos/push-upstream fails closed for such callers
-// (policyDeniesPullUpstream coarseness); the poke matches it. The write
-// itself was policy-accepted and stays local; convergence resumes on the
-// next unpoliced trigger. Deliberately NOT falling through to the pull
-// poke: pulling now would force-revert the write that was just accepted.
-// The pull poke stays unpoliced — documented invariant-11 behavior this
-// slice does not change.
-func enqueueSyncOrForward(ms meta.EventingStore, enqueuePull, enqueuePush func(ctx context.Context, job upsync.Job) error, org string, callerPoliced func(ctx context.Context) bool) func(ctx context.Context, repoID string) error {
-	assertf(ms != nil && enqueuePull != nil && enqueuePush != nil && org != "" && callerPoliced != nil,
+// callerDenied gates the FORWARD reroute only (Codex rounds 3 + security
+// on #90): the forward publishes every local head and tag with the stored
+// upstream credential, so it must not be implicitly triggerable by (a) a
+// caller whose token carries ANY ref-policy op — one allowed to update
+// only the refs its policies name — or (b) a write-only token lacking
+// git:read, which could otherwise exfiltrate repository content it cannot
+// clone to an upstream it can read. The explicit POST /repos/push-upstream
+// fails closed on both (policyDeniesPullUpstream coarseness + required
+// git:read scope); the poke matches it. The write itself was accepted and
+// stays local; convergence resumes on the next authorized trigger.
+// Deliberately NOT falling through to the pull poke: pulling now would
+// force-revert the write that was just accepted. The pull poke stays
+// ungated — documented invariant-11 behavior this slice does not change.
+func enqueueSyncOrForward(ms meta.EventingStore, enqueuePull, enqueuePush func(ctx context.Context, job upsync.Job) error, org string, callerDenied func(ctx context.Context) bool) func(ctx context.Context, repoID string) error {
+	assertf(ms != nil && enqueuePull != nil && enqueuePush != nil && org != "" && callerDenied != nil,
 		"enqueueSyncOrForward: missing deps")
 	return func(ctx context.Context, repoID string) error {
 		up, err := ms.GetRepoUpstream(ctx, repoID)
@@ -158,7 +160,7 @@ func enqueueSyncOrForward(ms meta.EventingStore, enqueuePull, enqueuePush func(c
 			return err
 		}
 		if up.ForwardOnPush {
-			if callerPoliced(ctx) {
+			if callerDenied(ctx) {
 				return nil // fail closed: no implicit full-mirror publication (see doc)
 			}
 			if err := ms.RequestPush(ctx, repoID, false); err != nil {
@@ -188,17 +190,22 @@ func anyRefPolicyOps(policies []auth.RefPolicy) bool {
 	return false
 }
 
-// refPolicedFromContext resolves enqueueSyncOrForward's callerPoliced for
-// the serve process, whose ref mutations run under the request context:
-// the auth middleware injects the verified claims, and absent claims mean
-// a server-initiated write (import machinery, maintenance), which is
-// unpoliced by definition. A refs claim that fails to parse counts as
-// POLICED — a malformed policy must not grant a broader implicit trigger
-// than a parseable one.
-func refPolicedFromContext(ctx context.Context) bool {
+// forwardDeniedFromContext resolves enqueueSyncOrForward's callerDenied
+// for the serve process, whose ref mutations run under the request
+// context: the auth middleware injects the verified claims, and absent
+// claims mean a server-initiated write (import machinery, maintenance),
+// which is trusted by definition. A caller is denied when its token lacks
+// git:read (write-only tokens must not export the repo — see the
+// enqueueSyncOrForward doc) or carries any ref-policy op. A refs claim
+// that fails to parse counts as DENIED — a malformed policy must not
+// grant a broader implicit trigger than a parseable one.
+func forwardDeniedFromContext(ctx context.Context) bool {
 	claims, ok := auth.ClaimsFromContext(ctx)
 	if !ok {
 		return false
+	}
+	if !claims.HasScope(auth.ScopeGitRead) {
+		return true
 	}
 	var policies []auth.RefPolicy
 	if len(claims.Refs) > 0 {
@@ -211,13 +218,23 @@ func refPolicedFromContext(ctx context.Context) bool {
 	return anyRefPolicyOps(auth.FoldOps(policies, claims.Ops))
 }
 
-// hookCallerPoliced is refPolicedFromContext for the hook subprocess,
-// whose caller identity arrives as environment (the same EnvRefsPolicy /
-// EnvOps the update hook's enforceRefPolicy consumes; both are set only
-// when the claim is non-empty). Malformed values count as policed — the
-// update hook fails such pushes anyway, but the poke must not assume it
-// ran first.
-func hookCallerPoliced() bool {
+// hookCallerDeniedForward is forwardDeniedFromContext for the hook
+// subprocess, whose caller identity arrives as environment (the same
+// EnvRefsPolicy / EnvOps the update hook's enforceRefPolicy consumes,
+// plus EnvScopes; all set only when the claim is non-empty). Malformed
+// values count as denied — the update hook fails malformed-policy pushes
+// anyway, but the poke must not assume it ran first — and so does a
+// missing/unparseable scope list: only a proven git:read forwards.
+func hookCallerDeniedForward() bool {
+	var scopes []string
+	if raw := os.Getenv(githttp.EnvScopes); raw != "" {
+		if err := json.Unmarshal([]byte(raw), &scopes); err != nil {
+			return true // fail closed
+		}
+	}
+	if !slices.Contains(scopes, auth.ScopeGitRead) {
+		return true
+	}
 	policyJSON := os.Getenv(githttp.EnvRefsPolicy)
 	opsJSON := os.Getenv(githttp.EnvOps)
 	if policyJSON == "" && opsJSON == "" {
@@ -412,7 +429,7 @@ func buildServeEventing(ctx context.Context, ms meta.Store, dbURL, org, loopback
 			Repos:           ms,
 			Webhooks:        whStore,
 			EnqueueDelivery: queue.EnqueueWebhookDelivery,
-			EnqueueSync:     enqueueSyncOrForward(ms, queue.EnqueueSync, queue.EnqueuePush, org, refPolicedFromContext),
+			EnqueueSync:     enqueueSyncOrForward(ms, queue.EnqueueSync, queue.EnqueuePush, org, forwardDeniedFromContext),
 			Logger:          logger,
 		})
 	}
@@ -509,10 +526,10 @@ func wireHookEventing(ctx context.Context, logger *slog.Logger) func() {
 		cleanups = append(cleanups, q.Close)
 		enqueueDelivery = q.EnqueueWebhookDelivery
 		// The hook subprocess serves exactly one push by one caller, so
-		// the policed verdict is a process-wide constant from its env.
-		policed := hookCallerPoliced()
+		// the denial verdict is a process-wide constant from its env.
+		denied := hookCallerDeniedForward()
 		enqueueSync = enqueueSyncOrForward(ms, q.EnqueueSync, q.EnqueuePush, org,
-			func(context.Context) bool { return policed })
+			func(context.Context) bool { return denied })
 		if os.Getenv(githttp.EnvSyncClaim) != "" {
 			// This receive-pack IS a sync run's own loopback push (the
 			// claim-fenced token, issue #86): poking the sync seam from it

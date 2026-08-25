@@ -919,6 +919,14 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 		if len(claims.Refs) > 0 {
 			cmd.Env = append(cmd.Env, EnvRefsPolicy+"="+string(claims.Refs))
 		}
+		// Scopes feed the hook-side forward_on_push poke's git:read gate
+		// (see EnvScopes doc); receive-pack callers always carry at least
+		// git:write, so the marshal is never empty in practice.
+		if len(claims.Scopes) > 0 {
+			scopes, err := json.Marshal(claims.Scopes)
+			assertf(err == nil, "marshal scopes claim: %v", err)
+			cmd.Env = append(cmd.Env, EnvScopes+"="+string(scopes))
+		}
 		// Deprecated repo-wide ops claim: folded into the ref policies by
 		// the hook (docs/reference/authentication.md fallback semantics).
 		if len(claims.Ops) > 0 {
