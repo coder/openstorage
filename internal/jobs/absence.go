@@ -731,12 +731,21 @@ func (r *AbsenceReconciler) renewCovers(ctx context.Context, budget int64, repor
 // landed (Codex round 8, P1) and the caller must park the renewal cursor
 // before the row.
 func (r *AbsenceReconciler) migrateLegacyCover(ctx context.Context, row *ref.AbsenceCoverRow, report *AbsenceReport, st *absencePassState, errs *boundedErrs) bool {
-	if folded, seen := r.migratedLegacy[row.RawKey]; seen && row.Bytes <= folded {
+	if folded, seen := r.migratedLegacy[row.RawKey]; seen && row.Bytes <= folded && r.foldedHeadsLive(ctx, row.Base, st, errs) {
 		// Already folded up to this total by this process: decay on. A
 		// LARGER listed total re-folds (Codex round 7, P1): an old
 		// replica can re-grow the same nonce mid-roll after the first
 		// fold, and that growth must reach the incarnations before the
-		// nonce decays.
+		// nonce decays. And the shortcut holds only while BOTH
+		// deterministic heads still exist in the ledger (Codex round 13,
+		// P1): the lifecycle can have released them after a heal — by
+		// ANY worker, so a process-local memo invalidation could not
+		// cover it — and an old replica re-charging the same nonce at an
+		// equal total is a NEW incident the released incarnations no
+		// longer compensate. Right-sized (smaller) heads still shortcut:
+		// a clean range's exact re-derivation supersedes the nonce's
+		// stale aggregate, and re-grown deficits follow normal discovery
+		// latency like any fresh loss.
 		report.CoversDecaying++
 		return true
 	}
@@ -768,6 +777,23 @@ func (r *AbsenceReconciler) migrateLegacyCover(ctx context.Context, row *ref.Abs
 		return true
 	}
 	return false
+}
+
+// foldedHeadsLive reports whether BOTH deterministic class incarnations
+// exist in the ledger right now — the DB-authoritative validity check for
+// the legacy-fold memo shortcut (Codex round 13). A failed lookup reads as
+// not-live: the caller re-folds (grow-only, idempotent) or falls to the
+// nonce renewal, both fail-safe. A base with zero rows in one class
+// re-folds each pass while a live nonce keeps being re-charged (the gap
+// proof keeps releasing the row-less twin) — bounded by the nonce TTL,
+// rollout-only, and strictly conservative.
+func (r *AbsenceReconciler) foldedHeadsLive(ctx context.Context, base string, st *absencePassState, errs *boundedErrs) bool {
+	for _, class := range []string{absenceClassLFS, absenceClassPacks} {
+		if head, ok := r.resolveHead(ctx, base, class, st, errs); !ok || head.key == "" {
+			return false
+		}
+	}
+	return true
 }
 
 // foldIntoIncarnation grows one class's live incarnation to at least bytes,

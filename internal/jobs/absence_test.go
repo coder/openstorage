@@ -937,6 +937,74 @@ func (fr *flakyRegistry) ReservePackBytes(ctx context.Context, group []string, p
 	return fr.AbsenceRegistry.ReservePackBytes(ctx, group, packs, owner, usageFloor, floorGen, quotaBytes, ttl)
 }
 
+// TestAbsenceReconcile_LegacyRefoldAfterHeadsReleased (Codex round 13,
+// P1): the legacy-fold memo shortcut is process-local, but the
+// incarnations it vouches for can be RELEASED by any worker after a heal.
+// When an old replica then re-charges the SAME nonce at an EQUAL total
+// for a NEW incident, the shortcut must notice the missing heads
+// (DB-authoritative) and re-fold — otherwise the nonce decays with no
+// compensation left.
+func TestAbsenceReconcile_LegacyRefoldAfterHeadsReleased(t *testing.T) {
+	f := newSweepFixture(t)
+	ctx := context.Background()
+	base := "repo-refold"
+	lfsKey := blob.LFSKey(base, absenceOID('i'))
+	registerLFS(t, f, base, lfsKey, 100)
+	packKey := blob.PackKey(base, "lost")
+	if err := f.store.RegisterPacks(ctx, base, []ref.Pack{{ID: "lost", Key: packKey, Size: 200}}); err != nil {
+		t.Fatal(err)
+	}
+	legacyKey := ref.AbsenceCoverPrefix + base + "/" + ref.NewReservationOwner()
+	if err := ref.ReserveRestoreCover(ctx, absenceRegistry(t, f), blob.QuotaRepoGroup(base), legacyKey, 555, time.Hour); err != nil {
+		t.Fatalf("seed legacy cover: %v", err)
+	}
+
+	// Pass 1: fold + right-size both incarnations (555 -> 100 lfs,
+	// 555 -> 200 packs).
+	r := testReconciler(t, f, true, 1000)
+	if _, err := r.Run(ctx); err != nil {
+		t.Fatalf("Run 1: %v", err)
+	}
+
+	// Every byte heals; pass 2 releases both incarnations (the nonce
+	// keeps decaying under the memo — its heads were live at renewal).
+	f.upload(lfsKey, strings.Repeat("a", 100))
+	f.upload(packKey, strings.Repeat("b", 200))
+	report, err := r.Run(ctx)
+	if err != nil {
+		t.Fatalf("Run 2: %v", err)
+	}
+	if report.CoversReleased != 2 {
+		t.Fatalf("pass 2 report = %+v, want both healed incarnations released", report)
+	}
+
+	// The bytes disappear AGAIN and an old replica — whose in-memory
+	// absentBase survived — re-charges the SAME nonce at the SAME total.
+	if err := f.blobs.Delete(ctx, lfsKey); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.blobs.Delete(ctx, packKey); err != nil {
+		t.Fatal(err)
+	}
+	if err := ref.ReserveRestoreCover(ctx, absenceRegistry(t, f), blob.QuotaRepoGroup(base), legacyKey, 555, time.Hour); err != nil {
+		t.Fatalf("re-charge legacy cover: %v", err)
+	}
+
+	// Pass 3 (same process, same memo): the equal-total shortcut must
+	// fail its heads-live check and re-fold — both incarnations are
+	// re-minted and right-sized by the same pass's clean ranges.
+	report, err = r.Run(ctx)
+	if err != nil {
+		t.Fatalf("Run 3: %v", err)
+	}
+	if report.CoversDecaying != 1 || report.CoversRotated != 2 {
+		t.Fatalf("pass 3 report = %+v, want the nonce re-folded and both incarnations right-sized", report)
+	}
+	if got := ledgerReserved(t, f, base); got != 555+100+200 {
+		t.Fatalf("reserved = %d, want the decaying nonce plus both re-minted right-sized incarnations", got)
+	}
+}
+
 // bumpFailRegistry injects failures into BumpLFSAdoptionGen while fail is
 // set — the floor-invalidation seam every compensation-shrinking delete
 // must prove first (Codex round 12).
