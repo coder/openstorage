@@ -1204,16 +1204,17 @@ func (s *PG) HasLFSObject(ctx context.Context, repo, key string) (bool, error) {
 	return exists, err
 }
 
-// LFSObjectRegisteredAt — see RefStore (Codex round 89).
-func (s *PG) LFSObjectRegisteredAt(ctx context.Context, repo, key string) (time.Time, bool, error) {
+// LFSObjectRegisteredAt — see RefStore (Codex round 89; bytes since #127).
+func (s *PG) LFSObjectRegisteredAt(ctx context.Context, repo, key string) (time.Time, int64, bool, error) {
 	assertf(repo != "" && key != "", "LFSObjectRegisteredAt(%q, %q)", repo, key)
 	var at time.Time
+	var bytes int64
 	err := s.pool.QueryRow(ctx,
-		`SELECT created_at FROM lfs_objects WHERE repo = $1 AND key = $2`, repo, key).Scan(&at)
+		`SELECT created_at, bytes FROM lfs_objects WHERE repo = $1 AND key = $2`, repo, key).Scan(&at, &bytes)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return time.Time{}, false, nil
+		return time.Time{}, 0, false, nil
 	}
-	return at, err == nil, err
+	return at, bytes, err == nil, err
 }
 
 // PackQuotaLedgerState is a point-in-time read of one accounting group's

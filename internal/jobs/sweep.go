@@ -50,8 +50,9 @@ type PackRegistry interface {
 	// LFSObjectRegisteredAt reads a registered object's registration time
 	// (see ref.RefStore): the legacy reap grace's clock (Codex round 89)
 	// — legacy presigned GETs are minted right up to the registration
-	// moment, and neither blob timestamp bounds that.
-	LFSObjectRegisteredAt(ctx context.Context, repo, key string) (at time.Time, ok bool, err error)
+	// moment, and neither blob timestamp bounds that. bytes is the
+	// registered size, the reap gate's completeness yardstick (#127).
+	LFSObjectRegisteredAt(ctx context.Context, repo, key string) (at time.Time, bytes int64, ok bool, err error)
 	// GuardedLFSDelete runs del serialized against LFS registration (see
 	// ref.RefStore): safeDelete's LFS blob delete must go through it, or
 	// a verified upload's register+verify can complete between the
@@ -849,7 +850,7 @@ func (s *Sweeper) legacySourceInReapGrace(ctx context.Context, repo, key string)
 		return false, nil
 	}
 	canonical := blob.LFSKey(repo, oid)
-	registeredAt, registered, err := s.packs.LFSObjectRegisteredAt(ctx, repo, canonical)
+	registeredAt, registeredBytes, registered, err := s.packs.LFSObjectRegisteredAt(ctx, repo, canonical)
 	if err != nil {
 		return false, fmt.Errorf("reap-grace twin lookup %s: %w", canonical, err)
 	}
@@ -861,20 +862,29 @@ func (s *Sweeper) legacySourceInReapGrace(ctx context.Context, repo, key string)
 		s.logger.Info("orphan pack sweep: sparing adoption-retained legacy source in reap grace", "key", key)
 		return true, nil
 	}
-	// The canonical copy must EXIST before the source reaps (round 88's
-	// registered-but-blobless spare, which the registration-time rewrite
-	// must keep): a registered row whose canonical blob was lost serves
-	// reads through the legacy download fallback, and the retained source
-	// may be the object's ONLY remaining bytes — reaping it on row age
-	// alone turns a repairable degradation into data loss. One point
-	// stat, reached only by reap-eligible candidates; unknowable state
-	// spares (the next sweep re-examines).
-	switch _, err := s.blobs.Stat(ctx, canonical); {
+	// The canonical copy must be COMPLETE before the source reaps (round
+	// 88's registered-but-blobless spare, which the registration-time
+	// rewrite must keep; size-aware since issue #127): a registered row
+	// whose canonical blob was lost — or TRUNCATED by a still-valid v0.1
+	// presigned PUT or storage-layer damage — serves reads through the
+	// legacy download fallback, and the retained source may be the
+	// object's ONLY complete bytes — reaping it on row age alone turns a
+	// repairable degradation (download-time restore adopts the full
+	// twin, PR #104) into data loss. Mere existence proves nothing:
+	// classify against the registered size, the same cheap-check tier
+	// the absence reconciler uses (PR #123). One point stat, reached
+	// only by reap-eligible candidates; unknowable state spares (the
+	// next sweep re-examines).
+	switch size, err := s.blobs.Stat(ctx, canonical); {
 	case errors.Is(err, blob.ErrNotFound):
 		s.logger.Info("orphan pack sweep: sparing last copy of a registered-but-blobless object", "key", key)
 		return true, nil
 	case err != nil:
 		return false, fmt.Errorf("reap-grace canonical stat %s: %w", canonical, err)
+	case size < registeredBytes:
+		s.logger.Info("orphan pack sweep: sparing last complete copy of a truncated registered object",
+			"key", key, "canonical_bytes", size, "registered_bytes", registeredBytes)
+		return true, nil
 	}
 	return false, nil
 }

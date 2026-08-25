@@ -434,6 +434,55 @@ func TestSweepLFS_LegacyReapSparesLastCopyOfBloblessRow(t *testing.T) {
 	}
 }
 
+// TestSweepLFS_LegacyReapSparesLastCompleteCopyOfTruncatedCanonical
+// (issue #127, Codex round 14 on PR #123): round 88's
+// registered-but-blobless spare checked mere EXISTENCE of the canonical
+// copy — a TRUNCATED canonical blob (corrupted by a still-valid v0.1
+// presigned PUT, or storage-layer damage) passed the gate and the
+// post-grace sweep reaped the complete legacy twin that was the object's
+// only full copy, turning a repairable degradation (download-time restore
+// adopts the full twin, PR #104) into permanent data loss. The gate must
+// compare the canonical copy's size against the REGISTERED size and spare
+// the source while the canonical copy is deficient.
+func TestSweepLFS_LegacyReapSparesLastCompleteCopyOfTruncatedCanonical(t *testing.T) {
+	f := newSweepFixture(t)
+	content := "the only complete copy of these bytes"
+	oid := lfsContentOID(content)
+	canonical := blob.LFSKey("repo_lfs", oid)
+	legacy := blob.LFSLegacyKey("repo_lfs", oid)
+	// An old registration (past any grace) whose canonical blob is SHORT
+	// of the registered size: only the retained legacy source still
+	// holds the full bytes.
+	f.upload(legacy, content)
+	f.backdate(legacy, 48*time.Hour)
+	f.upload(canonical, content[:len(content)/2])
+	f.backdate(canonical, 48*time.Hour)
+	f.registerLFS("repo_lfs", canonical, int64(len(content)))
+
+	cfg := SweepConfig{Threshold: 24 * time.Hour, DeleteLFS: true, DeleteLFSLegacy: true}
+	aged := f.sweeper(cfg)
+	aged.now = func() time.Time { return time.Now().Add(25 * time.Hour) }
+	if _, err := aged.Sweep(context.Background()); err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if !f.exists(legacy) {
+		t.Fatal("reaped the last COMPLETE copy of a registered object whose canonical blob is truncated — the existence-only gate turns repairable corruption into data loss")
+	}
+	// Once the canonical copy is whole again the gate opens: the aged
+	// source reaps as today.
+	f.upload(canonical, content)
+	f.backdate(canonical, 48*time.Hour)
+	healed := f.sweeper(cfg)
+	healed.now = func() time.Time { return time.Now().Add(25 * time.Hour) }
+	report, err := healed.Sweep(context.Background())
+	if err != nil {
+		t.Fatalf("Sweep after canonical repair: %v", err)
+	}
+	if f.exists(legacy) {
+		t.Fatalf("aged legacy source survived the sweep after its canonical copy became complete (report %+v)", report)
+	}
+}
+
 // adoptOnQuarantineCopyBlob registers the canonical twin exactly as the
 // reap's quarantine copy runs — an adoption completing between classify's
 // grace check and the destructive handshake.
