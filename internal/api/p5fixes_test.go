@@ -103,16 +103,28 @@ func (failingSyncQueue) EnqueueSync(context.Context, upsync.Job) error {
 	return errors.New("queue down")
 }
 
+func (failingSyncQueue) EnqueuePush(context.Context, upsync.Job) error {
+	return errors.New("queue down")
+}
+
 // recordingSyncQueue captures enqueued jobs.
 type recordingSyncQueue struct {
-	mu   stdsync.Mutex
-	jobs []upsync.Job
+	mu       stdsync.Mutex
+	jobs     []upsync.Job
+	pushJobs []upsync.Job
 }
 
 func (q *recordingSyncQueue) EnqueueSync(_ context.Context, job upsync.Job) error {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	q.jobs = append(q.jobs, job)
+	return nil
+}
+
+func (q *recordingSyncQueue) EnqueuePush(_ context.Context, job upsync.Job) error {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.pushJobs = append(q.pushJobs, job)
 	return nil
 }
 

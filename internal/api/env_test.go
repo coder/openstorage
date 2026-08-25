@@ -54,6 +54,8 @@ type envSyncQueue struct{}
 
 func (envSyncQueue) EnqueueSync(context.Context, upsync.Job) error { return nil }
 
+func (envSyncQueue) EnqueuePush(context.Context, upsync.Job) error { return nil }
+
 type testKeys struct {
 	es256 *ecdsa.PrivateKey
 	es384 *ecdsa.PrivateKey

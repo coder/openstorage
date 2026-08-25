@@ -117,7 +117,7 @@ func TestLocalQueueRoundtrip(t *testing.T) {
 	q := NewLocal(deliverer, func(context.Context, sync.Job) error {
 		ranSync.Add(1)
 		return nil
-	}, nil, slog.New(slog.DiscardHandler))
+	}, func(context.Context, sync.Job) error { return nil }, nil, slog.New(slog.DiscardHandler))
 
 	runQueue(t, q, rc, &ranSync)
 	q.Close()
@@ -160,7 +160,7 @@ func TestRiverQueueRoundtrip(t *testing.T) {
 	q, err := NewRiver(ctx, pgURL, deliverer, func(context.Context, sync.Job) error {
 		ranSync.Add(1)
 		return nil
-	}, sync.NewMemStore(), nil, nil, nil, nil, slog.New(slog.DiscardHandler))
+	}, func(context.Context, sync.Job) error { return nil }, sync.NewMemStore(), nil, nil, nil, nil, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatalf("NewRiver: %v", err)
 	}

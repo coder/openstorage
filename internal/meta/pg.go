@@ -138,6 +138,13 @@ CREATE TABLE IF NOT EXISTS repo_upstreams (
     sync_pending  boolean NOT NULL DEFAULT false,
     sync_claim_holder     text NOT NULL DEFAULT '',
     sync_claim_expires_at timestamptz NOT NULL DEFAULT 'epoch',
+    forward_on_push       boolean NOT NULL DEFAULT false,
+    push_pending          integer NOT NULL DEFAULT 0,
+    push_syncing          boolean NOT NULL DEFAULT false,
+    push_claim_holder     text NOT NULL DEFAULT '',
+    push_claim_expires_at timestamptz NOT NULL DEFAULT 'epoch',
+    push_run_count        integer NOT NULL DEFAULT 0,
+    push_success_count    integer NOT NULL DEFAULT 0,
     created_at    timestamptz NOT NULL DEFAULT now()
 );
 -- Upgrade path for deployments whose repo_upstreams predates the
@@ -149,6 +156,15 @@ CREATE TABLE IF NOT EXISTS repo_upstreams (
 ALTER TABLE repo_upstreams ADD COLUMN IF NOT EXISTS sync_pending boolean NOT NULL DEFAULT false;
 ALTER TABLE repo_upstreams ADD COLUMN IF NOT EXISTS sync_claim_holder text NOT NULL DEFAULT '';
 ALTER TABLE repo_upstreams ADD COLUMN IF NOT EXISTS sync_claim_expires_at timestamptz NOT NULL DEFAULT 'epoch';
+-- Outbound push-forwarding lane (issue #90): pending level 0/1/2 (force
+-- coalesces upward), its own claim lease, and per-direction counters.
+ALTER TABLE repo_upstreams ADD COLUMN IF NOT EXISTS forward_on_push boolean NOT NULL DEFAULT false;
+ALTER TABLE repo_upstreams ADD COLUMN IF NOT EXISTS push_pending integer NOT NULL DEFAULT 0;
+ALTER TABLE repo_upstreams ADD COLUMN IF NOT EXISTS push_syncing boolean NOT NULL DEFAULT false;
+ALTER TABLE repo_upstreams ADD COLUMN IF NOT EXISTS push_claim_holder text NOT NULL DEFAULT '';
+ALTER TABLE repo_upstreams ADD COLUMN IF NOT EXISTS push_claim_expires_at timestamptz NOT NULL DEFAULT 'epoch';
+ALTER TABLE repo_upstreams ADD COLUMN IF NOT EXISTS push_run_count integer NOT NULL DEFAULT 0;
+ALTER TABLE repo_upstreams ADD COLUMN IF NOT EXISTS push_success_count integer NOT NULL DEFAULT 0;
 -- Upgrade path for repos predating the purge tombstone column (issue #52).
 ALTER TABLE repos ADD COLUMN IF NOT EXISTS purged_at timestamptz;
 -- Retention-purge scan index (issue #52): PurgeableRepos pages PENDING

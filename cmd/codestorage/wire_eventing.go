@@ -110,17 +110,30 @@ func (s webhookSink) Emit(ctx context.Context, org, eventType string, payload []
 	}
 }
 
-// enqueueSyncIfDue implements the events.RefStoreOptions.EnqueueSync
-// contract (docs/explanation/domain-model.md invariant 11): a won persistent ref update schedules a
-// sync only when the repo has an upstream row AND no run is currently in
-// flight — the in-flight check is what keeps the sync worker's own loopback
-// pushes from re-triggering themselves. Deliberately NO RequestSync here
-// (issue #79): the pending marker would turn every loopback push into a
-// follow-up run, self-perpetuating the sync chain. Push-triggered syncs
-// carry no 202 promise, so dropping one under an in-flight claim stays the
-// documented invariant-11 behavior.
-func enqueueSyncIfDue(ms meta.EventingStore, enqueue func(ctx context.Context, job upsync.Job) error, org string) func(ctx context.Context, repoID string) error {
-	assertf(ms != nil && enqueue != nil && org != "", "enqueueSyncIfDue: missing deps")
+// enqueueSyncOrForward implements the events.RefStoreOptions.EnqueueSync
+// contract (docs/explanation/domain-model.md invariant 11): a won persistent
+// ref update pokes the sync machinery when the repo has an upstream row.
+//
+// Default (pull) direction: schedule an inbound sync only when no run is
+// currently in flight — the in-flight check is what keeps the sync worker's
+// own loopback pushes from re-triggering themselves. Deliberately NO
+// RequestSync here (issue #79): the pending marker would turn every
+// loopback push into a follow-up run, self-perpetuating the sync chain.
+// Push-triggered syncs carry no 202 promise, so dropping one under an
+// in-flight claim stays the documented invariant-11 behavior.
+//
+// forward_on_push repos (issue #90) REROUTE the poke outbound instead:
+// pulling first would force local refs back to the upstream's pre-push
+// state (the loopback push uses upstream-wins refspecs) and the forward's
+// later snapshot would then silently lose the very push it was meant to
+// publish. The worker schedules the mirror-back pull strictly AFTER a
+// successful forward (Worker.AfterForward). Unlike the pull poke, the
+// forward poke IS marked durable (RequestPush): marking cannot
+// self-perpetuate here — forward runs never CAS local refs, and a sync
+// run's own loopback pushes carry the sync claim, which suppresses the
+// hook-side poke entirely (wireHookEventing).
+func enqueueSyncOrForward(ms meta.EventingStore, enqueuePull, enqueuePush func(ctx context.Context, job upsync.Job) error, org string) func(ctx context.Context, repoID string) error {
+	assertf(ms != nil && enqueuePull != nil && enqueuePush != nil && org != "", "enqueueSyncOrForward: missing deps")
 	return func(ctx context.Context, repoID string) error {
 		up, err := ms.GetRepoUpstream(ctx, repoID)
 		if errors.Is(err, meta.ErrNotFound) {
@@ -129,10 +142,19 @@ func enqueueSyncIfDue(ms meta.EventingStore, enqueue func(ctx context.Context, j
 		if err != nil {
 			return err
 		}
+		if up.ForwardOnPush {
+			if err := ms.RequestPush(ctx, repoID, false); err != nil {
+				if errors.Is(err, meta.ErrNotFound) {
+					return nil // detached between the reads: nothing to forward
+				}
+				return err
+			}
+			return enqueuePush(ctx, upsync.Job{Org: org, RepoID: repoID})
+		}
 		if up.Syncing {
 			return nil // run in flight (or our own loopback push): skip
 		}
-		return enqueue(ctx, upsync.Job{Org: org, RepoID: repoID})
+		return enqueuePull(ctx, upsync.Job{Org: org, RepoID: repoID})
 	}
 }
 
@@ -194,29 +216,39 @@ func buildServeEventing(ctx context.Context, ms meta.Store, dbURL, org, loopback
 		}},
 		Logger: logger,
 	}
+	// The mirror-back pull after a successful forward on a forward_on_push
+	// repo (issue #90) enqueues through the same late-bound queue.
+	worker.AfterForward = func(ctx context.Context, job upsync.Job) error {
+		assertf(queue != nil, "eventing: forward finished before queue construction")
+		return queue.EnqueueSync(ctx, job)
+	}
 
 	cleanup := func() { queue.Close() }
 	if isPGURL(dbURL) {
-		// worker.Requeue stays nil on pg: river's insert-time uniqueness
-		// would swallow a requeue of a still-running job; the river sync
-		// worker schedules successors transactionally instead (issue #79).
-		q, err := jobs.NewRiver(ctx, dbURL, deliverer, worker.Run, ups, sweep, lfsReclaim, absence, repack, logger)
+		// worker.Requeue/RequeuePush stay nil on pg: river's insert-time
+		// uniqueness would swallow a requeue of a still-running job; the
+		// river sync/push workers schedule successors transactionally
+		// instead (issue #79).
+		q, err := jobs.NewRiver(ctx, dbURL, deliverer, worker.Run, worker.RunPush, ups, sweep, lfsReclaim, absence, repack, logger)
 		if err != nil {
 			return nil, nil, nil, err
 		}
 		queue = q
 	} else {
-		queue = jobs.NewLocal(deliverer, worker.Run, repack, logger)
+		queue = jobs.NewLocal(deliverer, worker.Run, worker.RunPush, repack, logger)
 		// Pending pull-upstream requests that arrive while a run is in
 		// flight are re-enqueued by the finishing run (issue #79); the
 		// in-process queue never deduplicates against a running run, so
-		// a plain re-enqueue is sound here.
+		// a plain re-enqueue is sound here. The push lane mirrors it and
+		// additionally drives the transient-retry backoff timers (#90).
 		worker.Requeue = queue.EnqueueSync
+		worker.RequeuePush = queue.EnqueuePush
 		// Boot recovery (issue #86): queued local work and deferred retry
-		// timers die with the process, but the SyncPending marker is
-		// durable — re-enqueue marked repos so accepted pull-upstream
-		// requests survive restarts (in particular the restart that
-		// applies CODESTORAGE_SYNC_STEAL_LEGACY). Delayed so the loopback
+		// timers die with the process, but the SyncPending/PushPending
+		// markers are durable — re-enqueue marked repos so accepted
+		// pull-upstream and push-upstream (#90) requests survive restarts
+		// (in particular the restart that applies
+		// CODESTORAGE_SYNC_STEAL_LEGACY). Delayed so the loopback
 		// listener is serving before the first recovered run pushes; a
 		// run that still meets a held claim re-arms the deferred retry.
 		recovery := time.AfterFunc(pendingSyncRecoveryDelay, func() {
@@ -225,11 +257,21 @@ func buildServeEventing(ctx context.Context, ms meta.Store, dbURL, org, loopback
 			ids, err := ms.PendingSyncRepoIDs(rctx)
 			if err != nil {
 				logger.Warn("pending sync boot recovery failed", "err", err)
+			} else {
+				for _, id := range ids {
+					if err := queue.EnqueueSync(rctx, upsync.Job{Org: org, RepoID: id}); err != nil {
+						logger.Warn("pending sync boot recovery enqueue failed", "repo", id, "err", err)
+					}
+				}
+			}
+			pushIDs, err := ms.PendingPushRepoIDs(rctx)
+			if err != nil {
+				logger.Warn("pending push boot recovery failed", "err", err)
 				return
 			}
-			for _, id := range ids {
-				if err := queue.EnqueueSync(rctx, upsync.Job{Org: org, RepoID: id}); err != nil {
-					logger.Warn("pending sync boot recovery enqueue failed", "repo", id, "err", err)
+			for _, id := range pushIDs {
+				if err := queue.EnqueuePush(rctx, upsync.Job{Org: org, RepoID: id}); err != nil {
+					logger.Warn("pending push boot recovery enqueue failed", "repo", id, "err", err)
 				}
 			}
 		})
@@ -273,7 +315,7 @@ func buildServeEventing(ctx context.Context, ms meta.Store, dbURL, org, loopback
 			Repos:           ms,
 			Webhooks:        whStore,
 			EnqueueDelivery: queue.EnqueueWebhookDelivery,
-			EnqueueSync:     enqueueSyncIfDue(ms, queue.EnqueueSync, org),
+			EnqueueSync:     enqueueSyncOrForward(ms, queue.EnqueueSync, queue.EnqueuePush, org),
 			Logger:          logger,
 		})
 	}
@@ -369,7 +411,16 @@ func wireHookEventing(ctx context.Context, logger *slog.Logger) func() {
 		}
 		cleanups = append(cleanups, q.Close)
 		enqueueDelivery = q.EnqueueWebhookDelivery
-		enqueueSync = enqueueSyncIfDue(ms, q.EnqueueSync, org)
+		enqueueSync = enqueueSyncOrForward(ms, q.EnqueueSync, q.EnqueuePush, org)
+		if os.Getenv(githttp.EnvSyncClaim) != "" {
+			// This receive-pack IS a sync run's own loopback push (the
+			// claim-fenced token, issue #86): poking the sync seam from it
+			// would chain runs. The pull poke was already suppressed by the
+			// in-flight claim check; the forward poke (issue #90) must be
+			// suppressed here or every inbound mirror update would enqueue
+			// an outbound no-op forward. Push webhooks still emit.
+			enqueueSync = nil
+		}
 	} else {
 		// Local mode: deliver synchronously (bounded) before hook exit.
 		deliverer := &events.Deliverer{
@@ -382,12 +433,13 @@ func wireHookEventing(ctx context.Context, logger *slog.Logger) func() {
 			AllowPrivate: hookWebhookAllowPrivate(logger),
 			Logger:       logger,
 		}
-		local := jobs.NewLocal(deliverer, func(context.Context, upsync.Job) error {
+		neverRun := func(context.Context, upsync.Job) error {
 			panic("local hook queue must never run sync jobs")
-		}, nil /* hook subprocesses never fold */, logger)
+		}
+		local := jobs.NewLocal(deliverer, neverRun, neverRun, nil /* hook subprocesses never fold */, logger)
 		cleanups = append(cleanups, local.Close) // waits for in-flight deliveries
+		enqueueSync = nil                        // documented local-mode gap (see doc comment)
 		enqueueDelivery = local.EnqueueWebhookDelivery
-		enqueueSync = nil // documented local-mode gap (see doc comment)
 	}
 
 	githttp.WrapHookRefStore = func(_ context.Context, st ref.RefStore) ref.RefStore {

@@ -139,7 +139,7 @@ func TestInProcessQueueRunsAndCoalesces(t *testing.T) {
 		<-block
 		ran <- job
 		return nil
-	}, discardTestLogger())
+	}, func(context.Context, Job) error { return nil }, discardTestLogger())
 
 	ctx := context.Background()
 	if err := q.EnqueueSync(ctx, Job{Org: "acme", RepoID: "repo_q"}); err != nil {

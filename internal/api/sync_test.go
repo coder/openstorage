@@ -212,7 +212,7 @@ func newUsyncStack(t *testing.T, e *testEnv) *usyncStack {
 		Logger:  discardLogger(),
 		Timeout: time.Minute,
 	}
-	queue := upsync.NewInProcessQueue(worker.Run, discardLogger())
+	queue := upsync.NewInProcessQueue(worker.Run, worker.RunPush, discardLogger())
 	t.Cleanup(queue.Close)
 
 	ss := newSyncServer(e.store, s.mem, s.mem, queue, testHTTPBaseURL, discardLogger())

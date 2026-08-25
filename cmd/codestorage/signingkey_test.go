@@ -185,6 +185,22 @@ func (failingStore) FinishSync(context.Context, string, string, bool) (meta.Repo
 	panic("not used by signing-key CLI")
 }
 
+func (failingStore) RequestPush(context.Context, string, bool) error {
+	panic("not used by signing-key CLI")
+}
+
+func (failingStore) PendingPushRepoIDs(context.Context) ([]string, error) {
+	panic("not used by signing-key CLI")
+}
+
+func (failingStore) TryBeginPush(context.Context, string, string, time.Duration) (meta.RepoUpstream, bool, bool, string, error) {
+	panic("not used by signing-key CLI")
+}
+
+func (failingStore) FinishPush(context.Context, string, string, bool) (meta.RepoUpstream, error) {
+	panic("not used by signing-key CLI")
+}
+
 func (s *memSigningStore) AddSigningKey(_ context.Context, org, keyText string) (meta.SigningKey, error) {
 	if org != s.org {
 		return meta.SigningKey{}, meta.ErrNotFound

@@ -32,7 +32,7 @@ contract with implementation notes the spec lacks.
 
 | Method & path | Scope | Notes |
 |---|---|---|
-| `POST /repos` | repo:write (repo=new id) | Body optional: `{default_branch?, base_repo?}`. Query `default_branch` is a fallback used only when the body omits it. `base_repo`: `{provider, owner, name, operation?: "fork", auth?: {token}\|{auth_type:"public"}, ref?, sha?, default_branch?, upstream_host?}`. Providers: `code, github, gitlab, bitbucket, gitea, forgejo, codeberg, sr.ht` (+generic w/ `upstream_host`). → `{repo_id, repo_name, http_url, message}`. 409 = exists. |
+| `POST /repos` | repo:write (repo=new id) | Body optional: `{default_branch?, base_repo?}`. Query `default_branch` is a fallback used only when the body omits it. `base_repo`: `{provider, owner, name, operation?: "fork", auth?: {token}\|{auth_type:"public"}, ref?, sha?, default_branch?, upstream_host?, forward_pushes?}`. Providers: `code, github, gitlab, bitbucket, gitea, forgejo, codeberg, sr.ht` (+generic w/ `upstream_host`). `forward_pushes: true` (default false, our extension) schedules a push-upstream run after every won local push — see "Upstream sync". → `{repo_id, repo_name, http_url, message}`. 409 = exists. |
 | `GET /repos` | org:read (repo="org") | Query `cursor, limit, q` (case-insensitive substring on repo `url`). → `{repos: [{repo_id, repo_name, url (deprecated mirror), default_branch, created_at, base_repo?}], next_cursor, has_more}` |
 | `GET /repo` | git:read (repo from JWT) | → `{repo_id, repo_name, url (deprecated mirror), default_branch, created_at}`; 404 → SDK returns null |
 | `PATCH /repo` | repo:write | Update the default branch. Body `{default_branch}` required, non-empty; a plain branch name (qualified to `refs/heads/<name>` at hydrate time) or its `refs/heads/`-qualified spelling (stored verbatim). Other ref namespaces (tags/notes) → 400 — the default names a branch. The branch is never created by this call and may be unborn (clones then see a dangling `HEAD`, like a fresh repo). CAS against the previously read value → 409 on a concurrent change; `no-push` ref policies covering `HEAD` or the target deny with 403. → `{repo_id, id (deprecated mirror), repo_name, url (deprecated mirror), default_branch}` (no `created_at`, per the live spec). Clone `HEAD` follows on the next hydrate of each node's cache. |
@@ -116,13 +116,19 @@ Default notes ref `refs/notes/commits`; bare names resolve to `refs/notes/<name>
 | Method & path | Scope | Notes |
 |---|---|---|
 | `POST /repos/pull-upstream` | git:write | `{ref?}` → **202 Accepted** (async); only for repos with `base_repo`. A 202 is never dropped: a request that arrives while a sync run is already in flight coalesces into one follow-up run, so some run observes upstream as of the request or later |
+| `POST /repos/push-upstream` | git:write | `{force?}` → **202 Accepted** (async); only for repos with `base_repo`. Our extension (upstream forwards implicitly — see [wire compatibility](../explanation/wire-compatibility.md)): publishes local `refs/heads/*` and `refs/tags/*` to the upstream with the stored credential. Non-force by default — a ref the upstream refuses (non-fast-forward) fails the run with per-ref reasons in the `repo.sync.failed` event's `rejected_refs`; `force: true` opts into `+refs`. Ref deletions are not propagated. The 202 coalescing guarantee matches pull-upstream, and `force` survives coalescing (a forced request is never downgraded). An unreachable upstream retries with exponential backoff (1–16 min, 5 attempts); auth/config/rejection failures do not retry |
+
+Outbound runs emit the same `repo.sync.*` events with `direction: "push"` (see
+[webhooks](webhooks.md)). `DELETE /repos/base` cancels in-flight runs in both
+directions silently. Ref policies fail closed on both triggers: any policy op
+denies pull-upstream and push-upstream alike.
 
 ## Status-code contract (what clients key on)
 
 | Status | Meaning to clients |
 |---|---|
 | 200/201 | success (201 accepted by SDKs on create endpoints) |
-| 202 | pull-upstream accepted |
+| 202 | pull-upstream / push-upstream accepted |
 | 206/304/412/416 | file conditional/range results (passed through) |
 | 400 | invalid input; also "custom notes refs not enabled" |
 | 401 / 403 | auth failed / permission or ref-policy denied |

@@ -78,7 +78,7 @@ func TestSyncRequestDuringClaimedRunIsObserved(t *testing.T) {
 		err := f.worker.Run(ctx, job)
 		runDone <- struct{}{}
 		return err
-	}, discardTestLogger())
+	}, f.worker.RunPush, discardTestLogger())
 	defer q.Close()
 	// Production local-mode wiring (cmd/codestorage/wire_eventing.go):
 	// the finisher reschedules pending requests through the queue.

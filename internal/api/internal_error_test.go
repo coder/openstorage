@@ -127,6 +127,18 @@ func (f failingStore) FinishSync(context.Context, string, string, bool) (meta.Re
 	return meta.RepoUpstream{}, f.err
 }
 
+func (f failingStore) RequestPush(context.Context, string, bool) error { return f.err }
+
+func (f failingStore) PendingPushRepoIDs(context.Context) ([]string, error) { return nil, f.err }
+
+func (f failingStore) TryBeginPush(context.Context, string, string, time.Duration) (meta.RepoUpstream, bool, bool, string, error) {
+	return meta.RepoUpstream{}, false, false, "", f.err
+}
+
+func (f failingStore) FinishPush(context.Context, string, string, bool) (meta.RepoUpstream, error) {
+	return meta.RepoUpstream{}, f.err
+}
+
 func TestInternalErrorsAreSanitized(t *testing.T) {
 	const secret = "SQLSTATE 28P01: password authentication failed"
 

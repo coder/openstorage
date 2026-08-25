@@ -52,3 +52,4 @@ has moved on, the linked issues/PRs in each record's text are the trail.
 | ADR-41 | [Registered LFS objects live at a canonical key legacy presigned URLs cannot address](041-registered-lfs-objects-live-at-a-canonical-key-legacy-presigned-urls-cannot-address.md) | issue #51, PR #61 |
 | ADR-42 | [LFS reclamation is mark-and-sweep over reachable pointer files](042-lfs-reclamation-is-mark-and-sweep-over-reachable-pointer-files.md) | issue #73, PR #117 |
 | ADR-43 | [Absence reconciliation covers registered-but-missing bytes](043-absence-reconciliation-covers-registered-but-missing-bytes.md) | issue #101 |
+| ADR-44 | [Outbound push forwarding rides a separate push-claim lane](044-outbound-push-forwarding-rides-a-separate-push-claim-lane.md) | issue #90 |

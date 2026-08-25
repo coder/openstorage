@@ -150,6 +150,21 @@ type Worker struct {
 	// this job's row is still running, so the river sync worker schedules
 	// successors transactionally at job completion instead (jobs/river.go).
 	Requeue func(ctx context.Context, job Job) error
+
+	// RequeuePush is the outbound lane's Requeue (issue #90): follow-up
+	// AND transient-retry scheduling for push-upstream runs. Same wiring
+	// split: local mode points it at EnqueuePush, river leaves it nil and
+	// schedules successors transactionally (jobs/river.go pushWorker).
+	RequeuePush func(ctx context.Context, job Job) error
+	// AfterForward, when non-nil, enqueues one inbound sync after a
+	// SUCCESSFUL outbound run on a ForwardOnPush repo — the mirror-back
+	// half of the upstream model ("pushes are proxied to the provider and
+	// changes mirrored back"): forward-on-push repos have their push->pull
+	// poke rerouted to the forward (cmd wiring), so this restores the
+	// freshness pull strictly AFTER the forward landed, never racing it.
+	// Best-effort like the poke it replaces: no pending marker, failures
+	// logged. Both wirings point it at the queue's EnqueueSync.
+	AfterForward func(ctx context.Context, job Job) error
 }
 
 // allowProtocol resolves the effective GIT_ALLOW_PROTOCOL value.
@@ -565,40 +580,67 @@ func (w *Worker) transfer(ctx context.Context, job Job, repo RepoInfo, up Upstre
 	return nil
 }
 
-// classifyFetchFailure maps git fetch stderr onto the documented failure
-// strings. Auth is checked first (an unreachable-looking 403 is still auth),
-// then network reachability; everything else is a generic clone failure.
-func classifyFetchFailure(stderr string) string {
+// authFailureMarkers/networkFailureMarkers classify git transport stderr
+// for both transfer directions. Auth is checked first (an
+// unreachable-looking 403 is still auth), then network reachability.
+var authFailureMarkers = []string{
+	"authentication failed",
+	"terminal prompts disabled", // 401 with no credential: git can't prompt
+	"invalid username or password",
+	"access denied",
+	"returned error: 401",
+	"returned error: 403",
+}
+
+var networkFailureMarkers = []string{
+	"could not resolve host",
+	"connection refused",
+	"couldn't connect to server",
+	"could not connect to server",
+	"failed to connect to",
+	"unable to connect",
+	"connection timed out",
+	"operation timed out",
+	"network is unreachable",
+	"no route to host",
+}
+
+func containsAnyMarker(stderr string, markers []string) bool {
 	s := strings.ToLower(stderr)
-	for _, marker := range []string{
-		"authentication failed",
-		"terminal prompts disabled", // 401 with no credential: git can't prompt
-		"invalid username or password",
-		"access denied",
-		"returned error: 401",
-		"returned error: 403",
-	} {
+	for _, marker := range markers {
 		if strings.Contains(s, marker) {
-			return FailAuth
+			return true
 		}
 	}
-	for _, marker := range []string{
-		"could not resolve host",
-		"connection refused",
-		"couldn't connect to server",
-		"could not connect to server",
-		"failed to connect to",
-		"unable to connect",
-		"connection timed out",
-		"operation timed out",
-		"network is unreachable",
-		"no route to host",
-	} {
-		if strings.Contains(s, marker) {
-			return FailUnreachable
-		}
+	return false
+}
+
+// classifyFetchFailure maps git fetch stderr onto the documented failure
+// strings; everything past auth/network is a generic clone failure.
+func classifyFetchFailure(stderr string) string {
+	switch {
+	case containsAnyMarker(stderr, authFailureMarkers):
+		return FailAuth
+	case containsAnyMarker(stderr, networkFailureMarkers):
+		return FailUnreachable
+	default:
+		return FailClone
 	}
-	return FailClone
+}
+
+// classifyPushFailure is the outbound twin (issue #90): a `git push` to the
+// upstream that failed WITHOUT per-ref rejections (those map to
+// FailRejected before this runs) is auth, network, or a generic forward
+// failure.
+func classifyPushFailure(stderr string) string {
+	switch {
+	case containsAnyMarker(stderr, authFailureMarkers):
+		return FailAuth
+	case containsAnyMarker(stderr, networkFailureMarkers):
+		return FailUnreachable
+	default:
+		return FailForward
+	}
 }
 
 // hermeticGitEnv is the base environment for worker git invocations:

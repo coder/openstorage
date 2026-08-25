@@ -43,6 +43,10 @@ var (
 	// ErrSyncInProgress: BeginSync while a run is already in flight —
 	// callers skip silently (invariant 11: no overlapping runs).
 	ErrSyncInProgress = errors.New("sync already in progress")
+	// ErrPushInProgress: BeginPush while an outbound run is already in
+	// flight — callers skip silently (issue #90: at most one active
+	// forward per repo; the claim's finisher covers pending requests).
+	ErrPushInProgress = errors.New("push already in progress")
 	// ErrClaimLost: FinishSync by a holder whose expired claim was stolen
 	// (issue #86) — the late finisher abandons silently; the thief owns
 	// the run lifecycle now.
@@ -82,8 +86,42 @@ type Upstream struct {
 	// only recovery when the holder process died mid-run.
 	SyncClaimHolder    string
 	SyncClaimExpiresAt time.Time
+	// ForwardOnPush opts the repo into scheduling an outbound
+	// push-upstream run for every won local push (issue #90,
+	// base_repo.forward_pushes). Default off: forwarding stays
+	// explicit-trigger.
+	ForwardOnPush bool
+	// PushPending is the outbound analogue of SyncPending (issue #90): a
+	// three-level durable marker (PushPendingNone/Normal/Force) set by
+	// RequestPush and consumed by BeginPush. Levels coalesce by MAX so a
+	// forced request is never downgraded by a later plain one; the level
+	// must ride the durable marker (not the queue job) because queue
+	// deduplication is keyed by repo only and a crash-rescued job must
+	// still remember force.
+	PushPending int
+	// PushSyncing/PushClaimHolder/PushClaimExpiresAt lease the outbound
+	// claim exactly like the inbound triple leases Syncing. The lanes are
+	// deliberately SEPARATE: the inbound claim protects local refs (the
+	// loopback force-push), the outbound claim protects upstream refs —
+	// sharing one claim would couple the two lanes' liveness without
+	// protecting anything the non-force outbound push does not already
+	// protect. No legacy adoption exists for this lane: no pre-#90 binary
+	// ever holds a push claim.
+	PushSyncing        bool
+	PushClaimHolder    string
+	PushClaimExpiresAt time.Time
+	PushRunCount       int // completed outbound runs (success + failure)
+	PushSuccessCount   int // completed successful outbound runs
 	CreatedAt          time.Time
 }
+
+// PushPending levels (issue #90). Force must dominate: markers coalesce by
+// MAX at RequestPush and are consumed whole by BeginPush.
+const (
+	PushPendingNone  = 0
+	PushPendingPush  = 1
+	PushPendingForce = 2
+)
 
 // CloneURL builds the upstream fetch URL, https://{host}/{owner}/{name}.git
 // (docs/reference/http-api.md). A host that already carries a scheme (self-host upstreams,
@@ -188,6 +226,27 @@ type UpstreamStore interface {
 	// caller's expired claim was stolen: the late finisher abandons
 	// without touching the thief's claim or the counters.
 	FinishSync(ctx context.Context, repoID, holder string, success bool) (Upstream, error)
+
+	// RequestPush marks a pending outbound push request (issue #90),
+	// raising PushPending to at least PushPendingPush (PushPendingForce
+	// when force) — levels only ever coalesce upward, mirroring the
+	// RequestSync-before-enqueue protocol: callers that promise a push
+	// (POST /repos/push-upstream 202, the forward-on-push poke) mark
+	// BEFORE enqueueing so a request that coalesces with a run that
+	// already claimed survives to that run's FinishPush. ErrNotFound
+	// when detached.
+	RequestPush(ctx context.Context, repoID string, force bool) error
+	// BeginPush atomically claims an outbound run under a lease —
+	// TryBeginSync semantics on the push_* lane — and consumes
+	// PushPending, returning whether the consumed marker demanded force.
+	// ErrNotFound when detached; ErrPushInProgress when an unexpired
+	// outbound run is already in flight.
+	BeginPush(ctx context.Context, repoID, holder string, lease time.Duration) (up Upstream, force bool, stolenFrom string, err error)
+	// FinishPush completes the outbound run claimed by holder —
+	// FinishSync semantics on the push_* lane. PushPending is NOT
+	// touched; a set level on the returned row means requests arrived
+	// after this run claimed and a follow-up run is due.
+	FinishPush(ctx context.Context, repoID, holder string, success bool) (Upstream, error)
 }
 
 // EventSink receives one repo.sync.* event for fan-out to the org's
@@ -201,10 +260,14 @@ type EventSink interface {
 // Job is one queued sync request. Ref is the optional pull-upstream hint
 // (docs/reference/http-api.md {ref?}); the worker currently performs a full mirror sync — a
 // superset of any single-ref request — so Ref is carried for logging only.
+// Retry counts consecutive transient-failure retries of an outbound push
+// run (issue #90): it selects the backoff delay and bounds the retry chain,
+// and deliberately does NOT participate in queue deduplication.
 type Job struct {
 	Org    string // org name (JWT iss)
 	RepoID string
 	Ref    string
+	Retry  int
 }
 
 // Queue schedules sync runs. The Postgres deployment backs this with the
@@ -212,4 +275,8 @@ type Job struct {
 // local-mode implementation.
 type Queue interface {
 	EnqueueSync(ctx context.Context, job Job) error
+	// EnqueuePush schedules one outbound push-upstream run (issue #90).
+	// Deduplication mirrors EnqueueSync: callers that promise the push
+	// mark it first via UpstreamStore.RequestPush.
+	EnqueuePush(ctx context.Context, job Job) error
 }

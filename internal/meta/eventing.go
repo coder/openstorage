@@ -69,6 +69,26 @@ type RepoUpstream struct {
 	// expiry at the zero instant, epoch/0 in storage).
 	SyncClaimHolder    string
 	SyncClaimExpiresAt time.Time
+	// ForwardOnPush opts the repo into forwarding won local pushes to the
+	// upstream (issue #90, base_repo.forward_pushes; default off).
+	ForwardOnPush bool
+	// PushPending is the outbound lane's pending marker (issue #90): a
+	// three-level value (0 none / 1 push / 2 force) that coalesces upward
+	// via RequestPush and is consumed by TryBeginPush. The level lives on
+	// the durable row — not the queue job — because job deduplication is
+	// keyed by repo and a crash-rescued job must still remember force.
+	PushPending int
+	// PushSyncing/PushClaimHolder/PushClaimExpiresAt lease the outbound
+	// claim exactly like the inbound triple. The lanes are separate on
+	// purpose: the inbound claim protects local refs (the loopback
+	// force-push), the outbound claim protects upstream refs. No legacy
+	// adoption exists here — no pre-#90 binary ever holds a push claim,
+	// so an expired push lease is always stealable.
+	PushSyncing        bool
+	PushClaimHolder    string
+	PushClaimExpiresAt time.Time
+	PushRunCount       int // completed outbound runs (success + failure)
+	PushSuccessCount   int // completed successful outbound runs
 	CreatedAt          time.Time
 }
 
@@ -209,4 +229,23 @@ type EventingStore interface {
 	// was stolen, and the late finisher must abandon without touching the
 	// thief's claim or the counters.
 	FinishSync(ctx context.Context, repoID, holder string, success bool) (RepoUpstream, error)
+
+	// RequestPush raises PushPending to at least 1 (2 when force) —
+	// levels only coalesce upward (issue #90). Same mark-before-enqueue
+	// protocol as RequestSync. ErrNotFound when detached.
+	RequestPush(ctx context.Context, repoID string, force bool) error
+	// PendingPushRepoIDs lists repos whose PushPending level is set —
+	// accepted push-upstream requests not yet covered by a claimed run
+	// (local-mode boot recovery, mirroring PendingSyncRepoIDs).
+	PendingPushRepoIDs(ctx context.Context) ([]string, error)
+	// TryBeginPush is TryBeginSync on the push_* lane: it claims the
+	// outbound run under a lease, consumes PushPending whole, and reports
+	// whether the consumed level demanded force. There is no legacy
+	// adoption — an expired push lease is stolen outright. A crash
+	// between claim and finish loses the consumed force bit; the rescued
+	// re-run downgrades to non-force, which fails honestly per ref
+	// instead of force-pushing on a stale mandate.
+	TryBeginPush(ctx context.Context, repoID, holder string, lease time.Duration) (up RepoUpstream, claimed bool, force bool, stolenFrom string, err error)
+	// FinishPush is FinishSync on the push_* lane.
+	FinishPush(ctx context.Context, repoID, holder string, success bool) (RepoUpstream, error)
 }
