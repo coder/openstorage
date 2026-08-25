@@ -36,15 +36,18 @@ members contend with each other) and manifest-size growth; both are measured and
   the **raw `s3.Client` for the CAS core** (clean 412/409 taxonomy, no transfer-manager
   indirection) and keep gocloud for bulk pack/LFS I/O unchanged. See §5-R1.
 - Self-hosted store: **SeaweedFS replaces MinIO** as the repo's self-hosted S3
-  implementation (user directive 2026-08-25; §5-R7). SeaweedFS implements conditional
-  PUT with real per-object CAS serialization (seaweedfs#7154); our MinIO CI pin
-  `minio/minio:RELEASE.2024-01-16T16-07-38Z` predates conditional-write support
-  entirely (a header-ignoring store is the worst, silent failure mode) and even modern
-  MinIO ignores `If-Match` on DELETE ⇒ the protocol **never relies on conditional
-  DELETE** (§2.7, §5-R2). A mandatory boot-time conditional-write probe proves actual
-  behavior on any store either way (§2.6). s3wal additionally requires strong
-  read-after-write and list consistency of the store (real S3 guarantees both since
-  2020; documented as a hard requirement for compatible stores).
+  implementation (user directive 2026-08-25; §5-R7), with the repo-wide swap landing
+  only after Phase 1a empirical qualification (qualification-first ordering, §4).
+  SeaweedFS implements conditional PUT with real per-object CAS serialization
+  (seaweedfs#7154); our MinIO CI pin `minio/minio:RELEASE.2024-01-16T16-07-38Z`
+  predates known conditional-write support and must be assumed non-compliant until
+  the Phase 1a matrix documents its actual behavior (header-ignoring is the worst,
+  silent failure mode), and even modern MinIO ignores `If-Match` on DELETE ⇒ the
+  protocol **never relies on conditional DELETE** (§2.7, §5-R2). A mandatory
+  boot-time conditional-write probe proves actual behavior on any store either way
+  (§2.6). s3wal additionally requires strong read-after-write and list consistency of
+  the store (real S3 guarantees both since 2020; documented as a hard requirement for
+  compatible stores).
 
 **Kill criteria (measured, §3):** single-writer push p50 > 500 ms or p99 > 2 s on real
 S3; sustained hot-repo CAS-advance throughput < 3/s at N=8 pushers or any pusher starved
@@ -444,27 +447,47 @@ Every phase captures reviewer-verifiable dogfooding evidence: terminal recording
 (agent-tty) of the drills, screenshots/artifacts of bench tables and CI runs, attached
 to the phase's PR or gate report.
 
-**Phase 1a — CAS primitive + bench go/no-go (before the full driver).**
-- Pre-work (separate mechanical PR, lands first): replace the repo's MinIO
-  testcontainers with SeaweedFS (`internal/githttp/e2e_test.go:158` image pin,
-  `internal/blob/minio_test.go`) so the codebase standardizes on one self-hosted S3
-  store (§5-R7 decision); validated by the full existing e2e/blob suites going green
-  unchanged.
+**Phase 1a — store qualification + CAS primitive + bench go/no-go (before the full
+driver). Ordering is qualification-first: SeaweedFS is empirically qualified BEFORE
+the repo-wide container swap lands.**
+- Step 1 — neutral S3 compatibility harness (store-agnostic, endpoint-parameterized;
+  runnable against SeaweedFS, MinIO old/new, real AWS S3, optionally LocalStack).
+  "Existing suites green" is NOT sufficient swap validation; the harness explicitly
+  covers the surfaces the existing gocloud-based suites under-exercise:
+  - basic `PutObject`/`GetObject`/`HeadObject`/`DeleteObject` round-trips;
+  - gocloud writer behavior at small AND multipart sizes (verify readback size +
+    digest; never assume multipart ETag == MD5);
+  - gocloud `IfNotExist` (`If-None-Match: *`) duplicate-write rejection;
+  - the raw-SDK §2.6 conditional-write probe (create / duplicate-412 / matched
+    advance / stale-412 / racing writers, exactly one winner);
+  - `ListObjectsV2` with >1000 keys, `Prefix`, `StartAfter`, lexicographic order,
+    including the §1 `_wal/repo/<base>` member-contiguity assumptions;
+  - presigned GET (the LFS download path);
+  - path-style endpoint + SigV4 compatibility, bucket bootstrap/health-check startup.
+- Step 2 — qualify SeaweedFS: harness + §3 contention lost-update detector. If
+  SeaweedFS fails, **gate-stopping escalation back to the desk before any swap**
+  (fallback ranking in §5-R7).
+- Step 3 — repo-wide swap PR (mechanical, lands only after step 2 passes): replace
+  MinIO testcontainers with SeaweedFS (`internal/githttp/e2e_test.go:158`,
+  `internal/blob/minio_test.go`); pin the exact SeaweedFS image+version and
+  `weed server -s3` command/flags; versioning + object-lock disabled (seaweedfs#8073
+  avoidance); health-check + bucket bootstrap wired; container logs archived on
+  failure. Validated by the full existing e2e/blob suites green PLUS the step-1
+  harness running in CI.
 - Files: `internal/ref/s3wal/casobj.go` (raw `s3.Client` conditional GET/PUT + §2.3
-  error taxonomy; ~200 lines), `probe.go` (§2.6 probe), `bench_test.go` (§3 harness).
-- Deliverable: the §3 tables (SeaweedFS + real S3) to the desk, **plus the §5-R7
-  store-qualification matrix** — the probe (§2.6) and the contention lost-update
-  detector run against SeaweedFS (empirically validating the decided store), old+new
-  MinIO (documenting why it was dropped and proving the probe refuses header-ignoring
-  stores), and optionally LocalStack (emulator cross-check). If SeaweedFS itself fails
-  the probe/harness, that is a gate-stopping escalation back to the desk (fallback
-  ranking in §5-R7). **Gate: kill thresholds pass, desk says continue.** This
-  front-loads the falsification risk before the driver is built.
-- Known gate dependency: **no AWS credentials in the dev environment** (verified
-  2026-08-25) — the real-S3 half of the §3 tables needs a scoped test bucket +
-  credentials from the desk. The SeaweedFS lane, probe, and qualification matrix
-  proceed without them; the gate report flags the real-S3 columns as blocked if
-  credentials haven't arrived.
+  error taxonomy; ~200 lines), `probe.go` (§2.6 probe), `qualify_test.go` (step-1
+  harness), `bench_test.go` (§3 harness).
+- Deliverable: the §3 tables + the §5-R7 store-qualification matrix (SeaweedFS
+  validated; old+new MinIO documented — whether each rejects, ignores, or mishandles
+  conditional headers — proving the probe refuses non-compliant stores).
+- **Gate 1a-A (self-hosted correctness):** SeaweedFS passes harness + probe +
+  contention detector ⇒ unblocks the step-3 swap PR and Phase 1b driver work.
+- **Gate 1a-B (real-S3 performance):** the §3 kill thresholds measured on real S3.
+  Required before any promote/keep verdict (Phase 4) — NOT required to continue
+  implementation. Known dependency: **no AWS credentials in the dev environment**
+  (verified 2026-08-25); needs a scoped test bucket + credentials from the desk. If
+  absent at reporting time, the gate report says "provisionally continue; real-S3
+  gate blocked" — never "gate passed".
 
 **Phase 1b — driver skeleton + conformance on SeaweedFS.**
 - Files: `internal/ref/s3wal/` — `memcas.go` (in-memory CAS fake with per-op fault
@@ -569,12 +592,13 @@ to the phase's PR or gate report.
   CAS headers we depend on makes every deployment a latent correctness hazard that
   must be perpetually re-validated; MinIO's community edition has also stagnated.
   SeaweedFS is the self-hosted store of record for CI, dev, and the deployment guide,
-  and the repo-wide testcontainer replacement is **in scope** (Phase 1a pre-work PR;
-  touches `internal/githttp/e2e_test.go:158` and `internal/blob/minio_test.go`).
-  Phase 1a still runs the probe (§2.6) + sustained contention lost-update detector
-  against the plausible stores and publishes the qualification matrix — now as
-  empirical validation of the decision and deployment-guide input, not as an open
-  selection. Evidence:
+  and the repo-wide testcontainer replacement is **in scope** (Phase 1a step-3 swap
+  PR — landing only AFTER step-2 empirical qualification passes; touches
+  `internal/githttp/e2e_test.go:158` and `internal/blob/minio_test.go`).
+  Phase 1a still runs the compatibility harness + probe (§2.6) + sustained contention
+  lost-update detector against the plausible stores and publishes the qualification
+  matrix — now as empirical validation of the decision and deployment-guide input,
+  not as an open selection. Evidence:
   - **SeaweedFS — decided:** implemented conditional PUT (seaweedfs#7154) with
     per-object owner-filer serialization (a real CAS design, not a best-effort check);
     known defect only with versioning+object-lock enabled (seaweedfs#8073) — a
@@ -582,12 +606,14 @@ to the phase's PR or gate report.
     easy testcontainer. Implementation freshness is the residual risk; the probe +
     contention harness validates it empirically at the Phase 1a gate, and a failure
     there is a gate-stopping escalation back to the desk.
-  - **MinIO — dropped:** our CI pin lies about conditional headers (accepts the
-    write); modern (≥ 2025) releases support conditional PUT but still ignore
-    If-Match on DELETE and carry the quorum-degraded conditional bypass minio#21603;
-    community-edition stagnation makes betting on fixes a strategic risk. Kept in the
-    Phase 1a matrix only to document behavior and prove the probe refuses lying
-    stores.
+  - **MinIO — dropped:** our CI pin predates known conditional-write support and
+    must be assumed non-compliant until the Phase 1a matrix documents whether it
+    rejects, ignores, or mishandles the headers (header-ignoring being the
+    silent-corruption case); modern (≥ 2025) releases support conditional PUT but
+    still ignore If-Match on DELETE (verified during adoption work) and carry the
+    quorum-degraded conditional bypass minio#21603; community-edition stagnation
+    makes betting on fixes a strategic risk. Kept in the Phase 1a matrix only to
+    document behavior and prove the probe refuses non-compliant stores.
   - **Garage:** no conditional-PUT support — unimplemented surface returns 501, and
     ecosystem workarounds exist specifically to strip If-None-Match for it; its
     CRDT/AP metadata design makes linearizable CAS architecturally unlikely soon.
@@ -601,6 +627,15 @@ to the phase's PR or gate report.
   The zero-infra deployment guide will document *qualified* stores (probe-passing:
   SeaweedFS and AWS S3) and explicitly warn that the serve-time probe refuses
   unqualified ones.
+  **Support posture (explicit):** plain blob storage (packs/LFS under PG/SQLite
+  modes) remains generic S3-compatible via gocloud — no intentional break for
+  existing PG/SQLite blob-store MinIO deployments, though MinIO is now
+  best-effort/untested — and MinIO ceases to be the tested reference store: release
+  notes and
+  deployment docs state SeaweedFS is the tested self-hosted store, MinIO moves to
+  untested/best-effort status for plain blob storage, and s3wal authority mode
+  refuses any store that fails the boot probe regardless of vendor. The swap PR's
+  release-note entry carries this statement.
 - **Q5 CI cost** — the s3wal conformance lane adds one SeaweedFS container to
   `internal/ref` tests (today PG-only + sqlite). Mitigation: share one container
   package-wide like `pgTestStore` does; elsewhere the swap replaces MinIO one-for-one,
@@ -686,7 +721,7 @@ low-rate CRUD is ID/PRED; `TryBeginSync`/`FinishSync` write through to base mani
 
 ---
 
-## Appendix B — advisor review log (4 rounds, endorsed)
+## Appendix B — advisor review log (6 rounds, endorsed)
 
 The plan was iterated through a mandatory strong-model advisor loop; each objection and
 its resolution:
@@ -719,3 +754,23 @@ stalled-delete/late-register race tests.
 Final polish applied: honest wording that a sent DELETE may complete server-side after
 the client deadline (the blocking margin fences it), this log, and the per-phase
 dogfooding-evidence rule.
+
+**Round 5 (SeaweedFS amendment review; 6 required edits → all applied):** desk
+directive made SeaweedFS the store of record; advisor directionally endorsed but
+required: qualification-first ordering (harness/probe before the repo-wide swap, not
+after) → Phase 1a restructured into steps 1–3; "existing suites green" insufficient →
+explicit neutral compatibility harness (`qualify_test.go`) covering multipart/ETag,
+IfNotExist, conditional probe, ListObjectsV2 >1000-key pagination + `_wal` contiguity,
+presigned GET, path-style/SigV4, bootstrap; missing MinIO support posture → R7
+statement (no intentional break for existing PG/SQLite blob-store MinIO deployments;
+best-effort/untested; release-note entry); single gate hides blocked real-S3 kill
+criteria → split Gates 1a-A (self-hosted correctness) / 1a-B (real-S3 performance,
+required before any promote/keep verdict, "provisionally continue" wording when
+credentials are absent); unverified "lies/accepts the write" claims → softened to
+assumed-non-compliant-until-probed; missing operational pinning → exact image/version,
+`weed server -s3` flags, versioning+object-lock disabled, health-check/bootstrap,
+archived logs.
+
+**Round 6: amendment approved — no blocking objections remaining.** One non-blocking
+precision tweak applied (support posture states "no intentional break", not an
+unverified compatibility guarantee).
