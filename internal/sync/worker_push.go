@@ -180,16 +180,40 @@ func (w *Worker) RunPush(ctx context.Context, job Job) error {
 		// unrelated future trigger.
 		afCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), detachedOpTimeout)
 		defer cancel()
-		switch err := w.Upstreams.RequestSync(afCtx, job.RepoID); {
-		case errors.Is(err, ErrNotFound):
+		// The marker write gets bounded retries (finishPush's rationale):
+		// it is load-bearing exactly when a pull is ALREADY in flight —
+		// the enqueue below is then swallowed by queue deduplication and
+		// only the marker reaches that run's completion gate — so a
+		// transient meta blip must not silently downgrade the promise to
+		// an unmarked enqueue.
+		var markErr error
+		for attempt := 1; attempt <= finishSyncAttempts; attempt++ {
+			markErr = w.Upstreams.RequestSync(afCtx, job.RepoID)
+			if markErr == nil || errors.Is(markErr, ErrNotFound) {
+				break
+			}
+			w.Logger.Warn("mirror-back pending mark failed; retrying",
+				"org", job.Org, "repo", job.RepoID, "attempt", attempt, "err", markErr)
+			select {
+			case <-afCtx.Done():
+			case <-time.After(time.Duration(attempt) * time.Second):
+			}
+			if afCtx.Err() != nil {
+				break
+			}
+		}
+		switch {
+		case errors.Is(markErr, ErrNotFound):
 			// Detached after the forward: the mirror-back is moot.
 		default:
-			if err != nil {
-				// Marker write failed: enqueue anyway — an unmarked
-				// mirror-back still covers the uncontended common case,
-				// and dropping both would break the promise outright.
-				w.Logger.Warn("mirror-back pending mark failed; enqueueing unmarked",
-					"org", job.Org, "repo", job.RepoID, "err", err)
+			if markErr != nil {
+				// Marker write failed even with retries: enqueue anyway —
+				// an unmarked mirror-back still covers the uncontended
+				// common case, and dropping both would break the promise
+				// outright. Residual: an in-flight pull racing a meta
+				// outage that outlives the retries.
+				w.Logger.Warn("mirror-back pending mark failed after retries; enqueueing unmarked",
+					"org", job.Org, "repo", job.RepoID, "err", markErr)
 			}
 			if afErr := w.AfterForward(afCtx, Job{Org: job.Org, RepoID: job.RepoID}); afErr != nil {
 				w.Logger.Warn("mirror-back sync enqueue failed",

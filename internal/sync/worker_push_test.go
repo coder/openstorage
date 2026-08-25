@@ -580,6 +580,60 @@ func TestPushRunAfterForwardSchedulesMirrorBack(t *testing.T) {
 	}
 }
 
+// flakyRequestSyncStore fails RequestSync a fixed number of times before
+// delegating — the transient meta blip the mirror-back marker retries
+// must absorb.
+type flakyRequestSyncStore struct {
+	*MemStore
+	failures int
+	calls    int
+}
+
+func (s *flakyRequestSyncStore) RequestSync(ctx context.Context, repoID string) error {
+	s.calls++
+	if s.calls <= s.failures {
+		return fmt.Errorf("transient meta blip %d", s.calls)
+	}
+	return s.MemStore.RequestSync(ctx, repoID)
+}
+
+// TestPushRunMirrorBackMarkerRetries: a transient RequestSync failure must
+// not downgrade the mirror-back to an unmarked enqueue (which queue
+// deduplication swallows whenever a pull is in flight) — the marker write
+// retries and the enqueue still happens with SyncPending durably set.
+func TestPushRunMirrorBackMarkerRetries(t *testing.T) {
+	f := newWorkerFixture(t)
+	seedLocalRepo(t, f, "repo_pr")
+	addEmptyUpstream(t, f.upstreamDir, "own", "proj")
+	if _, err := f.store.PutUpstream(context.Background(), Upstream{
+		RepoID: "repo_pr", Provider: "gitea", Owner: "own", Name: "proj",
+		UpstreamHost: "file://" + f.upstreamDir, ForwardOnPush: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	flaky := &flakyRequestSyncStore{MemStore: f.store, failures: 1}
+	f.worker.Upstreams = flaky
+	var markedAtEnqueue []bool
+	f.worker.AfterForward = func(ctx context.Context, job Job) error {
+		up, err := f.store.GetUpstream(ctx, job.RepoID)
+		if err != nil {
+			t.Errorf("GetUpstream inside AfterForward: %v", err)
+		}
+		markedAtEnqueue = append(markedAtEnqueue, up.SyncPending)
+		return nil
+	}
+
+	if err := f.worker.RunPush(context.Background(), Job{Org: "acme", RepoID: "repo_pr"}); err != nil {
+		t.Fatalf("RunPush: %v", err)
+	}
+	if flaky.calls < 2 {
+		t.Fatalf("RequestSync calls = %d, want a retry after the transient failure", flaky.calls)
+	}
+	if len(markedAtEnqueue) != 1 || !markedAtEnqueue[0] {
+		t.Fatalf("markedAtEnqueue = %v, want one enqueue with the durable marker set", markedAtEnqueue)
+	}
+}
+
 func TestPushRunPendingFollowUpRequeues(t *testing.T) {
 	f := newWorkerFixture(t)
 	seedLocalRepo(t, f, "repo_pm")

@@ -728,7 +728,23 @@ func classifyPushFailure(stderr string) string {
 // API-layer validation.
 func hermeticGitEnv(allowProtocol string) []string {
 	assertf(allowProtocol != "", "hermeticGitEnv: empty allowProtocol")
-	return append(os.Environ(),
+	// Strip EVERY inherited GIT_* variable before setting the controlled
+	// ones: hosts export credential and config injectors — GIT_ASKPASS,
+	// GIT_SSH_COMMAND, GIT_CONFIG_COUNT/KEY/VALUE — that run arbitrary
+	// helpers inside the worker's git subprocesses (observed: a
+	// workspace-agent GIT_ASKPASS answering a 401 by phoning its own
+	// auth server through the push egress proxy, which misclassified the
+	// auth failure as a transient dial outage). Nulling the config FILES
+	// alone does not close the env channel.
+	env := os.Environ()
+	out := make([]string, 0, len(env)+4)
+	for _, kv := range env {
+		if strings.HasPrefix(kv, "GIT_") {
+			continue
+		}
+		out = append(out, kv)
+	}
+	return append(out,
 		"GIT_TERMINAL_PROMPT=0",
 		"GIT_CONFIG_GLOBAL=/dev/null",
 		"GIT_CONFIG_SYSTEM=/dev/null",

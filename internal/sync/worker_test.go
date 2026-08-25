@@ -334,6 +334,45 @@ func TestWorkerPullForwardOnPushPropagatesHookDeclines(t *testing.T) {
 	}
 }
 
+// TestHermeticGitEnvStripsInheritedGitVars: host environments export
+// credential/config injectors (GIT_ASKPASS, GIT_SSH_COMMAND,
+// GIT_CONFIG_COUNT/KEY/VALUE) that would run arbitrary helpers inside the
+// worker's git subprocesses — a workspace-agent GIT_ASKPASS answering a
+// 401 by phoning home through the push egress proxy misclassified an auth
+// failure as a transient dial outage. Every inherited GIT_* must go; the
+// controlled values must survive.
+func TestHermeticGitEnvStripsInheritedGitVars(t *testing.T) {
+	t.Setenv("GIT_ASKPASS", "/host/injected-helper")
+	t.Setenv("GIT_CONFIG_COUNT", "1")
+	t.Setenv("UNRELATED_VAR", "kept")
+
+	got := map[string]string{}
+	for _, kv := range hermeticGitEnv("http:https") {
+		if k, v, ok := strings.Cut(kv, "="); ok {
+			got[k] = v
+		}
+	}
+	if v, ok := got["GIT_ASKPASS"]; ok {
+		t.Fatalf("inherited GIT_ASKPASS survived: %q", v)
+	}
+	if _, ok := got["GIT_CONFIG_COUNT"]; ok {
+		t.Fatal("inherited GIT_CONFIG_COUNT survived")
+	}
+	if got["UNRELATED_VAR"] != "kept" {
+		t.Fatal("non-GIT_ environment was not preserved")
+	}
+	for k, want := range map[string]string{
+		"GIT_TERMINAL_PROMPT": "0",
+		"GIT_CONFIG_GLOBAL":   "/dev/null",
+		"GIT_CONFIG_SYSTEM":   "/dev/null",
+		"GIT_ALLOW_PROTOCOL":  "http:https",
+	} {
+		if got[k] != want {
+			t.Fatalf("%s = %q, want %q", k, got[k], want)
+		}
+	}
+}
+
 func TestWorkerDetachedBeforeRunIsSilent(t *testing.T) {
 	f := newWorkerFixture(t)
 	if err := f.worker.Run(context.Background(), Job{Org: "acme", RepoID: "repo_cc"}); err != nil {

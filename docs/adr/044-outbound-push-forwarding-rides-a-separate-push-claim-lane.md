@@ -92,6 +92,19 @@ local until the next authorized trigger converges the mirror. The
 `forward_pushes` decision itself is made at repo creation by a
 `repo:write` holder.
 
+The reroute and the local-wins rule are replica-local code, so they are
+only as strong as the fleet is uniform: a pre-#90 replica that accepts a
+push on a `forward_pushes` repo still runs the legacy poke — an inbound
+force-mirror ("upstream wins") that an old worker executes as a force
+rewind of the accepted write (a new worker's local-wins preserves it, but
+no forward is scheduled either way). The claim-lane columns need no
+adoption story (no old binary ever holds a push claim), but the poke
+cannot be gated in the database, so the prerequisite is
+documentation-enforced like the project's other mixed-fleet upgrade
+orderings: roll every replica to a #90-capable binary before creating
+repositories with `forward_pushes: true`. Repositories without the flag
+are unaffected — old and new replicas agree on their pull-only behavior.
+
 **Egress is guarded at dial time.** `upstream_host` is caller-linked data,
 and outbound pushes are a WRITE primitive into whatever network the server
 can reach — strictly stronger than the pull lane's read/credential-echo

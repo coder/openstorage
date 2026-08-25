@@ -128,6 +128,16 @@ would publish every head and tag, not just the refs that token may touch or
 read) — the write stays local and the repository converges on the next
 authorized trigger.
 
+**Mixed-fleet prerequisite** (documentation-enforced, like the other
+[upgrade orderings](configuration.md)): complete the rolling upgrade of
+every replica to a build with this feature **before creating repositories
+with `forward_pushes: true`**. The forward reroute and the local-wins pull
+rule are replica-local code — a pre-feature replica that accepts a push on
+such a repository still schedules the legacy inbound force-mirror
+("upstream wins"), which can rewind the just-accepted write, and no forward
+is scheduled either way. Repositories without the flag are unaffected: old
+and new replicas agree on their pull-only behavior.
+
 ## Status-code contract (what clients key on)
 
 | Status | Meaning to clients |
