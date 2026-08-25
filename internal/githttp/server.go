@@ -861,11 +861,22 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 			// EnvUsageFloor, EnvVerifyState, and EnvVerifySigBudget are
 			// stripped for the same reason: the hook trusts them as THIS
 			// push's admission floor and verification state/budget.
+			// EnvScopes/EnvRefsPolicy/EnvOps carry THIS caller's verified
+			// authority (Codex round 6 on #90): duplicates resolve
+			// first-match in Go children, so an inherited stale value
+			// would SHADOW the appended verified one — e.g. an inherited
+			// scope list containing git:read would let a write-only
+			// caller trigger full-repository forwarding, and an inherited
+			// permissive policy would shadow the caller's restrictive
+			// one.
 			if !strings.HasPrefix(kv, EnvAtomic+"=") &&
 				!strings.HasPrefix(kv, EnvUsageFloor+"=") &&
 				!strings.HasPrefix(kv, EnvVerifyState+"=") &&
 				!strings.HasPrefix(kv, EnvVerifySigBudget+"=") &&
-				!strings.HasPrefix(kv, EnvSyncClaim+"=") {
+				!strings.HasPrefix(kv, EnvSyncClaim+"=") &&
+				!strings.HasPrefix(kv, EnvScopes+"=") &&
+				!strings.HasPrefix(kv, EnvRefsPolicy+"=") &&
+				!strings.HasPrefix(kv, EnvOps+"=") {
 				env = append(env, kv)
 			}
 		}

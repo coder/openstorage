@@ -655,19 +655,37 @@ func (w *pushWorker) Work(ctx context.Context, job *river.Job[pushArgs]) error {
 		w.logger.Warn("push: uncovered pending request; snoozing to retry it",
 			"repo", job.Args.RepoID, "delay", delay, "claimHeld", up.PushSyncing, "err", runErr)
 		return river.JobSnooze(delay)
-	case up.PushPending != sync.PushPendingNone && (!preKnown || up.PushRunCount != preRuns):
-		successor := pushArgs{Org: job.Args.Org, RepoID: job.Args.RepoID}
-		var opts *river.InsertOpts
-		if runErr != nil && sync.TransientPushFailure(runErr) && job.Args.Retry < sync.MaxPushTransientRetries {
-			// The failed run re-marked its own retry (RunPush): schedule
-			// the successor on the backoff cadence. Fresh requests that
-			// coalesced into the marker ride along — the upstream is
-			// unreachable for them too.
-			successor.Retry = job.Args.Retry + 1
-			opts = &river.InsertOpts{ScheduledAt: time.Now().Add(sync.PushRetryDelay(successor.Retry))}
+	default:
+		if up.PushPending != sync.PushPendingNone && (!preKnown || up.PushRunCount != preRuns) {
+			successor := pushArgs{Org: job.Args.Org, RepoID: job.Args.RepoID}
+			var opts *river.InsertOpts
+			if runErr != nil && sync.TransientPushFailure(runErr) && job.Args.Retry < sync.MaxPushTransientRetries {
+				// The failed run re-marked its own retry (RunPush):
+				// schedule the successor on the backoff cadence. Fresh
+				// requests that coalesced into the marker ride along —
+				// the upstream is unreachable for them too.
+				successor.Retry = job.Args.Retry + 1
+				opts = &river.InsertOpts{ScheduledAt: time.Now().Add(sync.PushRetryDelay(successor.Retry))}
+			}
+			if _, err := river.ClientFromContext[pgx.Tx](ctx).InsertTx(ctx, tx, successor, opts); err != nil {
+				return completionFailed("insert successor", err)
+			}
 		}
-		if _, err := river.ClientFromContext[pgx.Tx](ctx).InsertTx(ctx, tx, successor, opts); err != nil {
-			return completionFailed("insert successor", err)
+		// Stranded mirror-back rescue (Codex round 6): RunPush marks the
+		// mirror-back durable (RequestSync) BEFORE its direct enqueue,
+		// but on pg that enqueue is a plain insert with no boot-recovery
+		// scan behind it — if it fails transiently while no pull is in
+		// flight, the sync_pending marker has no job left to consume it,
+		// and a pull that fetched the pre-forward upstream could stand
+		// divergent forever. Covering the marker here makes mirror-back
+		// scheduling part of this push job's durable completion: the
+		// insert deduplicates against any live sync job (unique by
+		// repo), whose own completion gate re-checks the marker.
+		if up.SyncPending {
+			if _, err := river.ClientFromContext[pgx.Tx](ctx).InsertTx(ctx, tx,
+				syncArgs{Org: job.Args.Org, RepoID: job.Args.RepoID}, nil); err != nil {
+				return completionFailed("insert mirror-back", err)
+			}
 		}
 	}
 	if err := tx.Commit(ctx); err != nil {
