@@ -660,6 +660,44 @@ func TestAbsenceReconcile_TruncationPartialHeal(t *testing.T) {
 	}
 }
 
+// TestAbsenceReconcile_PartialLossBecomesTotal (Codex round 9, security):
+// a tracked short blob that later disappears entirely must replace its
+// tracked deficit with the full registered size — the existing-key fast
+// path must not renew the stale 1-byte deficit forever.
+func TestAbsenceReconcile_PartialLossBecomesTotal(t *testing.T) {
+	f := newSweepFixture(t)
+	base := "repo-part-to-total"
+	key := blob.LFSKey(base, absenceOID('6'))
+	f.upload(key, strings.Repeat("s", 99)) // 99 of 100 bytes
+	registerLFS(t, f, base, key, 100)      // deficit 1
+
+	r := testReconciler(t, f, true, 1000)
+	if _, err := r.Run(context.Background()); err != nil {
+		t.Fatalf("Run 1: %v", err)
+	}
+	if got := ledgerReserved(t, f, base); got != 1 {
+		t.Fatalf("reserved = %d, want the 1-byte deficit", got)
+	}
+
+	// The remaining bytes vanish: the tracked deficit must become 100.
+	if err := f.blobs.Delete(context.Background(), key); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	var last int64
+	for pass := 2; pass <= 3; pass++ {
+		if _, err := r.Run(context.Background()); err != nil {
+			t.Fatalf("Run %d: %v", pass, err)
+		}
+		last = ledgerReserved(t, f, base)
+		if last >= 100 {
+			break
+		}
+	}
+	if last < 100 {
+		t.Fatalf("reserved = %d, want the full 100-byte loss covered after the deficit replacement", last)
+	}
+}
+
 // TestAbsenceReconcile_ShortTwinCovered: a row absent under its registered
 // spelling whose twin holds FEWER bytes than registered is a partial loss —
 // only the twin's physical size compensates the floor.

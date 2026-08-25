@@ -510,8 +510,15 @@ func (r *AbsenceReconciler) trackAbsent(row absentRow, report *AbsenceReport) bo
 	if !r.quotaEnforced {
 		return false
 	}
-	if _, ok := r.knownAbsent[row.key]; ok {
-		return true // already aggregated; the caller renews the base cover
+	if existing, ok := r.knownAbsent[row.key]; ok {
+		if existing.bytes == row.bytes {
+			return true // already aggregated; the caller renews the base cover
+		}
+		// The row's deficit CHANGED — e.g. a partial loss became total
+		// (Codex round 9, security): keeping the old entry would renew
+		// the stale smaller amount forever. Replace it so the base
+		// aggregate stays exact.
+		r.untrackAbsent(row.key)
 	}
 	if len(r.knownAbsent) >= absentTrackedCap {
 		report.AbsentUntracked++
@@ -807,13 +814,10 @@ func (r *AbsenceReconciler) settleLFSRow(ctx context.Context, row ref.AbsenceLFS
 
 // coverDeficit tracks and covers a PARTIAL loss (truncated or short-twin
 // bytes): the tracked entry's bytes are the deficit, re-derived on every
-// re-verification — an existing entry with a different deficit is replaced
-// so its base aggregate stays exact.
+// re-verification — trackAbsent replaces an existing entry whose deficit
+// changed so the base aggregate stays exact.
 func (r *AbsenceReconciler) coverDeficit(ctx context.Context, base string, row absentRow, report *AbsenceReport, st *absencePassState, errs *boundedErrs) {
 	assertf(row.bytes > 0, "coverDeficit: non-positive deficit %d for %s", row.bytes, row.key)
-	if existing, ok := r.knownAbsent[row.key]; ok && existing.bytes != row.bytes {
-		r.untrackAbsent(row.key)
-	}
 	if r.trackAbsent(row, report) {
 		r.coverBase(ctx, base, report, st, errs)
 	} else {
