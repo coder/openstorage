@@ -354,6 +354,33 @@ type verdict struct {
 
 func vPass(surface string) verdict { return verdict{surface, verdictPass, ""} }
 
+// rejectVerdict classifies an unexpected operation error for the matrix.
+// verdictRejects is reserved for DEFINITIVE store responses proving the
+// store rejected the operation: a Client sentinel minted from a specific
+// store status (412/409-exhausted/404/304) or an SDK error carrying a real
+// 4xx HTTP response. Everything else — AmbiguousError (post-send
+// 5xx/timeout: the write may have landed), raw 5xx responses, and
+// transport/timeout failures that never produced a store verdict — is
+// verdictError: the surface could not establish how the store behaves, so
+// the lane fails in BOTH require and record modes instead of recording a
+// behavioral finding it never observed.
+func rejectVerdict(err error) string {
+	assertf(err != nil, "rejectVerdict: nil error")
+	var amb *AmbiguousError
+	if errors.As(err, &amb) {
+		return verdictError
+	}
+	for _, definitive := range []error{ErrExists, ErrLostRace, ErrCASContention, ErrNotExist, ErrNotModified} {
+		if errors.Is(err, definitive) {
+			return verdictRejects
+		}
+	}
+	if status, _ := errorStatus(err); status >= 400 && status < 500 {
+		return verdictRejects
+	}
+	return verdictError
+}
+
 type qualEnv struct {
 	label    string
 	bucket   string
@@ -465,8 +492,13 @@ func surfaceRawRoundTrip(t *testing.T, e *qualEnv) []verdict {
 	if _, err := e.raw.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(e.bucket), Key: aws.String(key)}); err != nil {
 		return []verdict{{name, verdictError, fmt.Sprintf("DeleteObject: %v", err)}}
 	}
-	if _, err := e.cas.Get(ctx, key); !errors.Is(err, ErrNotExist) {
-		return []verdict{{name, verdictMishandles, fmt.Sprintf("GET after DELETE = %v, want 404/ErrNotExist", err)}}
+	switch _, err := e.cas.Get(ctx, key); {
+	case errors.Is(err, ErrNotExist):
+		// The delete took effect.
+	case err == nil:
+		return []verdict{{name, verdictMishandles, "GET after DELETE served the object, want 404/ErrNotExist"}}
+	default:
+		return []verdict{{name, rejectVerdict(err), fmt.Sprintf("GET after DELETE = %v, want 404/ErrNotExist", err)}}
 	}
 	return []verdict{vPass(name)}
 }
@@ -483,10 +515,10 @@ func gocloudWriteReadBack(t *testing.T, e *qualEnv, name, key string, content []
 	}
 	if _, err := w.Write(content); err != nil {
 		_ = w.Close()
-		return []verdict{{name, verdictRejects, fmt.Sprintf("Write: %v", err)}}
+		return []verdict{{name, rejectVerdict(err), fmt.Sprintf("Write: %v", err)}}
 	}
 	if err := w.Close(); err != nil {
-		return []verdict{{name, verdictRejects, fmt.Sprintf("Close: %v", err)}}
+		return []verdict{{name, rejectVerdict(err), fmt.Sprintf("Close: %v", err)}}
 	}
 	back, err := e.gcb.ReadAll(ctx, key)
 	if err != nil {
@@ -560,7 +592,7 @@ func surfaceGocloudIfNotExist(t *testing.T, e *qualEnv) []verdict {
 			return []verdict{{name, verdictPass, fmt.Sprintf(
 				"store rejected with 412 PreconditionFailed; gocloud gcerrors mapped it to %v (s3blob \"301\" redirect heuristic)", gcerrors.Code(err))}}
 		}
-		return []verdict{{name, verdictRejects, fmt.Sprintf("want FailedPrecondition, got: %v", err)}}
+		return []verdict{{name, rejectVerdict(err), fmt.Sprintf("want FailedPrecondition, got: %v", err)}}
 	}
 }
 
@@ -572,7 +604,7 @@ func surfaceConditionalCreate(t *testing.T, e *qualEnv) []verdict {
 	key := e.prefix + "cond-create-" + randomHexTB(t, 4)
 	if _, err := e.cas.Create(ctx, key, encodePayload(t, 1, 64)); err != nil {
 		return []verdict{
-			{"conditional-create-fresh", verdictRejects, fmt.Sprintf("create on a fresh key failed: %v", err)},
+			{"conditional-create-fresh", rejectVerdict(err), fmt.Sprintf("create on a fresh key failed: %v", err)},
 			{"conditional-create-duplicate", verdictNotReached, ""},
 		}
 	}
@@ -584,7 +616,7 @@ func surfaceConditionalCreate(t *testing.T, e *qualEnv) []verdict {
 	case errors.Is(err, ErrExists):
 		vs = append(vs, vPass("conditional-create-duplicate"))
 	default:
-		vs = append(vs, verdict{"conditional-create-duplicate", verdictRejects, fmt.Sprintf("want 412/ErrExists, got: %v", err)})
+		vs = append(vs, verdict{"conditional-create-duplicate", rejectVerdict(err), fmt.Sprintf("want 412/ErrExists, got: %v", err)})
 	}
 	return vs
 }
@@ -606,7 +638,7 @@ func surfaceConditionalAdvance(t *testing.T, e *qualEnv) []verdict {
 	etag2, err := e.cas.Advance(ctx, key, encodePayload(t, 2, 64), etag1)
 	if err != nil {
 		return []verdict{
-			{"conditional-advance-matched", verdictRejects, fmt.Sprintf("advance with the current ETag failed: %v", err)},
+			{"conditional-advance-matched", rejectVerdict(err), fmt.Sprintf("advance with the current ETag failed: %v", err)},
 			{"conditional-advance-stale", verdictNotReached, ""},
 		}
 	}
@@ -622,7 +654,7 @@ func surfaceConditionalAdvance(t *testing.T, e *qualEnv) []verdict {
 	case errors.Is(err, ErrLostRace):
 		vs = append(vs, vPass("conditional-advance-stale"))
 	default:
-		vs = append(vs, verdict{"conditional-advance-stale", verdictRejects, fmt.Sprintf("want 412/ErrLostRace, got: %v", err)})
+		vs = append(vs, verdict{"conditional-advance-stale", rejectVerdict(err), fmt.Sprintf("want 412/ErrLostRace, got: %v", err)})
 	}
 	return vs
 }
@@ -649,15 +681,17 @@ func surfaceGetIfNoneMatch(t *testing.T, e *qualEnv) []verdict {
 	case err == nil:
 		vs = append(vs, verdict{"get-304-matched", verdictIgnores, "store served the full body for a matching If-None-Match ETag (no 304 path)"})
 	default:
-		vs = append(vs, verdict{"get-304-matched", verdictRejects, fmt.Sprintf("want 304/ErrNotModified, got: %v", err)})
+		vs = append(vs, verdict{"get-304-matched", rejectVerdict(err), fmt.Sprintf("want 304/ErrNotModified, got: %v", err)})
 	}
 	switch obj, err := e.cas.GetIfChanged(ctx, key, `"d41d8cd98f00b204e9800998ecf8427e"`); {
 	case err == nil && bytes.Equal(obj.Body, body):
 		vs = append(vs, vPass("get-304-changed"))
+	case err == nil:
+		vs = append(vs, verdict{"get-304-changed", verdictMishandles, fmt.Sprintf("store served %d bytes for a non-matching If-None-Match GET, want the original %d", len(obj.Body), len(body))})
 	case errors.Is(err, ErrNotModified):
 		vs = append(vs, verdict{"get-304-changed", verdictMishandles, "store returned 304 for a NON-matching If-None-Match ETag"})
 	default:
-		vs = append(vs, verdict{"get-304-changed", verdictRejects, fmt.Sprintf("want the body, got: %v", err)})
+		vs = append(vs, verdict{"get-304-changed", rejectVerdict(err), fmt.Sprintf("want the body, got: %v", err)})
 	}
 	return vs
 }
@@ -748,7 +782,7 @@ func surfaceList(t *testing.T, e *qualEnv) []verdict {
 	all, pages, err := collect(&s3.ListObjectsV2Input{Bucket: aws.String(e.bucket), Prefix: aws.String(listPrefix)})
 	switch {
 	case err != nil:
-		vs = append(vs, verdict{"list-pagination", verdictRejects, fmt.Sprintf("paginated listing failed: %v", err)},
+		vs = append(vs, verdict{"list-pagination", rejectVerdict(err), fmt.Sprintf("paginated listing failed: %v", err)},
 			verdict{"list-order", verdictNotReached, ""})
 	case len(all) != n || pages < 2:
 		vs = append(vs, verdict{"list-pagination", verdictMishandles, fmt.Sprintf("listed %d keys over %d pages, want %d keys over ≥2 pages", len(all), pages, n)},
@@ -768,7 +802,7 @@ func surfaceList(t *testing.T, e *qualEnv) []verdict {
 	narrow, _, err := collect(&s3.ListObjectsV2Input{Bucket: aws.String(e.bucket), Prefix: aws.String(listPrefix + "k0000")})
 	switch {
 	case err != nil:
-		vs = append(vs, verdict{"list-prefix", verdictRejects, fmt.Sprintf("Prefix listing failed: %v", err)})
+		vs = append(vs, verdict{"list-prefix", rejectVerdict(err), fmt.Sprintf("Prefix listing failed: %v", err)})
 	case len(narrow) != 10 || narrow[0] != expected[0] || narrow[9] != expected[9]:
 		vs = append(vs, verdict{"list-prefix", verdictMishandles, fmt.Sprintf("Prefix=%sk0000 returned %d keys, want exactly k00000..k00009", listPrefix, len(narrow))})
 	default:
@@ -780,7 +814,7 @@ func surfaceList(t *testing.T, e *qualEnv) []verdict {
 	})
 	switch {
 	case err != nil:
-		vs = append(vs, verdict{"list-startafter", verdictRejects, fmt.Sprintf("StartAfter listing failed: %v", err)})
+		vs = append(vs, verdict{"list-startafter", rejectVerdict(err), fmt.Sprintf("StartAfter listing failed: %v", err)})
 	case len(after) != n-550 || after[0] != expected[550]:
 		vs = append(vs, verdict{"list-startafter", verdictMishandles, fmt.Sprintf("StartAfter=%s returned %d keys starting %q, want %d starting %q", expected[549], len(after), first(after), n-550, expected[550])})
 	default:
@@ -824,7 +858,7 @@ func surfaceMemberContiguity(t *testing.T, e *qualEnv) []verdict {
 	t.Cleanup(func() { deleteAllPrefix(t, e.raw, e.bucket, fam) })
 	out, err := e.raw.ListObjectsV2(ctx, &s3.ListObjectsV2Input{Bucket: aws.String(e.bucket), Prefix: aws.String(fam)})
 	if err != nil {
-		return []verdict{{name, verdictRejects, fmt.Sprintf("listing failed: %v", err)}}
+		return []verdict{{name, rejectVerdict(err), fmt.Sprintf("listing failed: %v", err)}}
 	}
 	got := make([]string, 0, len(out.Contents))
 	for _, o := range out.Contents {
@@ -862,7 +896,9 @@ func surfacePresignedGet(t *testing.T, e *qualEnv) []verdict {
 		Bucket: aws.String(e.bucket), Key: aws.String(key),
 	}, s3.WithPresignExpires(15*time.Minute))
 	if err != nil {
-		return []verdict{{name, verdictRejects, fmt.Sprintf("presign: %v", err)}}
+		// Presigning is a local signing operation — no store response is
+		// involved, so a failure can never be store behavior.
+		return []verdict{{name, verdictError, fmt.Sprintf("presign: %v", err)}}
 	}
 	resp, err := http.Get(signed.URL)
 	if err != nil {
@@ -885,7 +921,7 @@ func surfaceBucketBootstrap(t *testing.T, e *qualEnv) []verdict {
 	t.Helper()
 	const name = "bucket-bootstrap"
 	if _, err := e.raw.HeadBucket(context.Background(), &s3.HeadBucketInput{Bucket: aws.String(e.bucket)}); err != nil {
-		return []verdict{{name, verdictRejects, fmt.Sprintf("HeadBucket: %v", err)}}
+		return []verdict{{name, rejectVerdict(err), fmt.Sprintf("HeadBucket: %v", err)}}
 	}
 	return []verdict{vPass(name)}
 }
