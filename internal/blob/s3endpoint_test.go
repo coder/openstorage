@@ -80,6 +80,23 @@ func openS3Endpoint(t *testing.T) *S3 {
 	return b
 }
 
+// cleanupDelete registers a cleanup that reports real deletion failures:
+// a transiently rejected DeleteObject must not let a PASS silently leak
+// objects into a user-supplied real bucket. Missing keys are tolerated —
+// the tampered-PUT key is never created, and the round-trip deletes one
+// key mid-test.
+func cleanupDelete(t *testing.T, b *S3, keys ...string) {
+	t.Helper()
+	t.Cleanup(func() {
+		ctx := context.Background()
+		for _, k := range keys {
+			if err := b.Delete(ctx, k); err != nil && !errors.Is(err, ErrNotFound) {
+				t.Errorf("cleanup Delete(%s): %v", k, err)
+			}
+		}
+	})
+}
+
 // randomHex returns n crypto-random bytes hex-encoded, so keys stay unique
 // across reruns against a shared long-lived bucket (real S3).
 func randomHex(t *testing.T, n int) string {
@@ -125,10 +142,7 @@ func TestS3Endpoint_RoundTrip(t *testing.T) {
 	repo := "endpoint-rt-" + randomHex(t, 8) + "+import"
 	key := PackKey(repo, "rt")
 	quarantined := "sweep/quarantine/" + key
-	t.Cleanup(func() {
-		_ = b.Delete(ctx, key)
-		_ = b.Delete(ctx, quarantined)
-	})
+	cleanupDelete(t, b, key, quarantined)
 
 	content := []byte("s3 endpoint round trip")
 	src := filepath.Join(t.TempDir(), "src.pack")
@@ -178,11 +192,7 @@ func TestS3Endpoint_PresignedSigV4(t *testing.T) {
 	key := PackKey(base, "get")
 	putKey := PackKey(base, "put")
 	deniedKey := PackKey(base, "denied")
-	t.Cleanup(func() {
-		for _, k := range []string{key, putKey, deniedKey} {
-			_ = b.Delete(ctx, k)
-		}
-	})
+	cleanupDelete(t, b, key, putKey, deniedKey)
 
 	content := make([]byte, 1024)
 	if _, err := rand.Read(content); err != nil {
