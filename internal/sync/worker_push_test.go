@@ -372,42 +372,55 @@ func TestPushRunIndependentOfPullClaim(t *testing.T) {
 	assertEventTypes(t, f.rec.list(), EventSyncStarted, EventSyncSucceeded)
 }
 
-// TestPushRunAfterForwardSchedulesMirrorBack: a successful forward on a
-// ForwardOnPush repo enqueues exactly one inbound sync, and the request is
-// marked durable (SyncPending) BEFORE the enqueue — an enqueue that
-// coalesces with an in-flight pull run must survive to that run's
-// completion gate. Explicit-trigger repos (ForwardOnPush off) enqueue
-// nothing.
+// TestPushRunAfterForwardSchedulesMirrorBack: EVERY successful outbound
+// run enqueues exactly one inbound sync — ForwardOnPush repos for the
+// documented mirror-back, explicit push-upstream repos because a
+// concurrent pull that fetched pre-forward would otherwise force-write
+// its stale snapshot locally with nothing scheduled to converge it — and
+// the request is marked durable (SyncPending) BEFORE the enqueue, so an
+// enqueue that coalesces with an in-flight pull run survives to that
+// run's completion gate.
 func TestPushRunAfterForwardSchedulesMirrorBack(t *testing.T) {
-	f := newWorkerFixture(t)
-	seedLocalRepo(t, f, "repo_pl")
-	addEmptyUpstream(t, f.upstreamDir, "own", "proj")
-	if _, err := f.store.PutUpstream(context.Background(), Upstream{
-		RepoID: "repo_pl", Provider: "gitea", Owner: "own", Name: "proj",
-		UpstreamHost: "file://" + f.upstreamDir, ForwardOnPush: true,
-	}); err != nil {
-		t.Fatal(err)
-	}
-	var mirrored []Job
-	var markedAtEnqueue []bool
-	f.worker.AfterForward = func(ctx context.Context, job Job) error {
-		up, err := f.store.GetUpstream(ctx, job.RepoID)
-		if err != nil {
-			t.Errorf("GetUpstream inside AfterForward: %v", err)
-		}
-		markedAtEnqueue = append(markedAtEnqueue, up.SyncPending)
-		mirrored = append(mirrored, job)
-		return nil
-	}
+	for _, tc := range []struct {
+		name    string
+		repoID  string
+		forward bool
+	}{
+		{"forward_on_push", "repo_pl", true},
+		{"explicit_push_upstream", "repo_pl2", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newWorkerFixture(t)
+			seedLocalRepo(t, f, tc.repoID)
+			addEmptyUpstream(t, f.upstreamDir, "own", "proj")
+			if _, err := f.store.PutUpstream(context.Background(), Upstream{
+				RepoID: tc.repoID, Provider: "gitea", Owner: "own", Name: "proj",
+				UpstreamHost: "file://" + f.upstreamDir, ForwardOnPush: tc.forward,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			var mirrored []Job
+			var markedAtEnqueue []bool
+			f.worker.AfterForward = func(ctx context.Context, job Job) error {
+				up, err := f.store.GetUpstream(ctx, job.RepoID)
+				if err != nil {
+					t.Errorf("GetUpstream inside AfterForward: %v", err)
+				}
+				markedAtEnqueue = append(markedAtEnqueue, up.SyncPending)
+				mirrored = append(mirrored, job)
+				return nil
+			}
 
-	if err := f.worker.RunPush(context.Background(), Job{Org: "acme", RepoID: "repo_pl"}); err != nil {
-		t.Fatalf("RunPush: %v", err)
-	}
-	if len(mirrored) != 1 || mirrored[0].RepoID != "repo_pl" {
-		t.Fatalf("mirror-back jobs = %+v, want exactly one for repo_pl", mirrored)
-	}
-	if !markedAtEnqueue[0] {
-		t.Fatal("mirror-back enqueued without the durable SyncPending marker (RequestSync-before-enqueue)")
+			if err := f.worker.RunPush(context.Background(), Job{Org: "acme", RepoID: tc.repoID}); err != nil {
+				t.Fatalf("RunPush: %v", err)
+			}
+			if len(mirrored) != 1 || mirrored[0].RepoID != tc.repoID {
+				t.Fatalf("mirror-back jobs = %+v, want exactly one for %s", mirrored, tc.repoID)
+			}
+			if !markedAtEnqueue[0] {
+				t.Fatal("mirror-back enqueued without the durable SyncPending marker (RequestSync-before-enqueue)")
+			}
+		})
 	}
 }
 

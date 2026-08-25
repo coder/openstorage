@@ -64,6 +64,10 @@ changes mirrored back"). The mirror-back is marked durable (`RequestSync`)
 before it is enqueued: a request that coalesces with an in-flight pull run
 survives to that run's completion gate instead of being swallowed by queue
 deduplication, so the pull cannot strand a pre-forward snapshot locally.
+Every successful outbound run schedules it — explicit `push-upstream`
+included — because the same pull‖push interleaving exists there: a pull
+that fetched before the forward would otherwise force-write its
+pre-forward snapshot back with nothing left to converge the divergence.
 A sync run's own loopback pushes carry the sync
 claim in the hook environment and poke nothing, which terminates the
 forward↔pull cycle. Full-mirror forwarding (not just the pushed ref) is

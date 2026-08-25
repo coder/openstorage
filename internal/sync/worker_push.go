@@ -157,17 +157,22 @@ func (w *Worker) RunPush(ctx context.Context, job Job) error {
 			"org", job.Org, "repo", job.RepoID, "error", terminal.Error, "cause", runErr)
 	}
 
-	if runErr == nil && fin.ForwardOnPush && w.AfterForward != nil {
-		// Mirror-back pull for forward-on-push repos (see the AfterForward
-		// field doc): scheduled strictly after the forward landed, and
-		// marked durable BEFORE enqueueing (the RequestSync-before-enqueue
-		// protocol). If the enqueue coalesces with a pull run that already
-		// claimed — river's insert-time uniqueness swallows the insert, a
-		// held local claim skips the run — the marker survives to that
-		// run's FinishSync and its completion gate schedules the follow-up.
-		// Without it, a pull that fetched upstream BEFORE this forward
-		// could write its pre-forward snapshot afterward and leave the
-		// repo silently divergent from the refs it just published.
+	if runErr == nil && w.AfterForward != nil {
+		// Mirror-back pull after EVERY successful outbound run (see the
+		// AfterForward field doc): scheduled strictly after the forward
+		// landed, and marked durable BEFORE enqueueing (the
+		// RequestSync-before-enqueue protocol). If the enqueue coalesces
+		// with a pull run that already claimed — river's insert-time
+		// uniqueness swallows the insert, a held local claim skips the
+		// run — the marker survives to that run's FinishSync and its
+		// completion gate schedules the follow-up. Without it, a pull
+		// that fetched upstream BEFORE this forward could write its
+		// pre-forward snapshot afterward and leave the repo silently
+		// divergent from the refs it just published — which is why the
+		// mirror-back is NOT limited to ForwardOnPush repos: an explicit
+		// push-upstream racing a poke-scheduled pull needs the same
+		// convergence, or the stale pull's force-write stands until some
+		// unrelated future trigger.
 		afCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), detachedOpTimeout)
 		defer cancel()
 		switch err := w.Upstreams.RequestSync(afCtx, job.RepoID); {

@@ -298,8 +298,9 @@ func buildServeEventing(ctx context.Context, ms meta.Store, dbURL, org, loopback
 		}},
 		Logger: logger,
 	}
-	// The mirror-back pull after a successful forward on a forward_on_push
-	// repo (issue #90) enqueues through the same late-bound queue.
+	// The mirror-back pull after every successful outbound run (issue
+	// #90; explicit runs included — see the AfterForward field doc)
+	// enqueues through the same late-bound queue.
 	worker.AfterForward = func(ctx context.Context, job upsync.Job) error {
 		assertf(queue != nil, "eventing: forward finished before queue construction")
 		return queue.EnqueueSync(ctx, job)

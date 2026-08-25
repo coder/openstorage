@@ -156,12 +156,16 @@ type Worker struct {
 	// split: local mode points it at EnqueuePush, river leaves it nil and
 	// schedules successors transactionally (jobs/river.go pushWorker).
 	RequeuePush func(ctx context.Context, job Job) error
-	// AfterForward, when non-nil, enqueues one inbound sync after a
-	// SUCCESSFUL outbound run on a ForwardOnPush repo — the mirror-back
-	// half of the upstream model ("pushes are proxied to the provider and
-	// changes mirrored back"): forward-on-push repos have their push->pull
-	// poke rerouted to the forward (cmd wiring), so this restores the
+	// AfterForward, when non-nil, enqueues one inbound sync after every
+	// SUCCESSFUL outbound run. On ForwardOnPush repos it is the
+	// mirror-back half of the upstream model ("pushes are proxied to the
+	// provider and changes mirrored back"): their push->pull poke is
+	// rerouted to the forward (cmd wiring), so this restores the
 	// freshness pull strictly AFTER the forward landed, never racing it.
+	// On explicit push-upstream runs it heals the pull‖push interleaving:
+	// a concurrent pull that fetched upstream BEFORE the forward would
+	// otherwise force-write its pre-forward snapshot locally and stand
+	// divergent until some unrelated future trigger.
 	// RunPush marks the request durable (RequestSync) BEFORE invoking
 	// this hook — an enqueue that coalesces with an in-flight pull run
 	// (river insert-time uniqueness, a held local claim) then survives to
