@@ -1182,6 +1182,75 @@ func TestAbsenceReconcile_StaleRenewalFailureFencesAdmission(t *testing.T) {
 	}
 }
 
+// TestAbsenceReconcile_UnprovableContinuitySuccessArmsFence (Codex round
+// 29, P1): a SUCCESSFUL bulk touch proves covers stayed alive only when
+// the prior health watermark shows nothing could have lapsed before it
+// ran — the strict-TTL update leaves already-dead rows dead. A fleet
+// paused past the TTL, or quota enforcement re-enabled after an off
+// period (no watermark at all), must arm the recovery fence BEFORE
+// stamping fresh health, and the fence must hold across passes until a
+// full rotation of both classes completes on a multi-pass registry.
+func TestAbsenceReconcile_UnprovableContinuitySuccessArmsFence(t *testing.T) {
+	f := newSweepFixture(t)
+	ctx := context.Background()
+	reg := absenceRegistry(t, f)
+	// Multi-pass LFS keyspace: 30 rows, budget 12 — the first pass
+	// parks mid-rotation, so the armed fence is observable at pass end.
+	for i := 0; i < 30; i++ {
+		key := blob.LFSKey("a-fill", strings.Repeat(fmt.Sprintf("%02x", i), 32))
+		registerLFS(t, f, "a-fill", key, 10)
+		f.upload(key, strings.Repeat("x", 10))
+	}
+
+	// Pass 1: the touch succeeds but NO health watermark exists —
+	// continuity is unprovable, so the fence arms and health stamps.
+	pinLFSLeader(t, f)
+	rec := testReconciler(t, f, true, 12)
+	if _, err := rec.Run(ctx); err != nil {
+		t.Fatalf("pass 1: %v", err)
+	}
+	if _, ok, err := reg.GetJobScanState(ctx, ref.ScanJobAbsence, ref.ScanScopeAbsenceAdmissionFence); err != nil || !ok {
+		t.Fatalf("fence after unprovable-continuity success = (ok=%v, %v), want armed", ok, err)
+	}
+	if _, ok, err := reg.GetJobScanState(ctx, ref.ScanJobAbsence, ref.ScanScopeAbsenceRenewalHealth); err != nil || !ok {
+		t.Fatalf("health watermark = (ok=%v, %v), want stamped", ok, err)
+	}
+	res, ok := f.store.(ref.RestoreCoverStore)
+	if !ok {
+		t.Fatalf("store %T lacks ReservePackBytes", f.store)
+	}
+	dec, err := res.ReservePackBytes(ctx, blob.QuotaRepoGroup("a-fill"),
+		[]ref.Pack{{Key: blob.PackKey("a-fill", "p1"), Size: 10}}, ref.NewReservationOwner(),
+		0, ref.ReserveNoFloorGen, 10_000, time.Hour)
+	if err != nil || dec.OK || !dec.RenewalDegraded {
+		t.Fatalf("fenced finite reserve = (%+v, %v), want RenewalDegraded denial", dec, err)
+	}
+
+	// Later passes have provable continuity (fresh watermark) and clear
+	// the fence once both rotations complete a full recovery traversal.
+	cleared := false
+	for pass := 2; pass <= 6 && !cleared; pass++ {
+		rec := testReconciler(t, f, true, 12)
+		if _, err := rec.Run(ctx); err != nil {
+			t.Fatalf("pass %d: %v", pass, err)
+		}
+		_, ok, err := reg.GetJobScanState(ctx, ref.ScanJobAbsence, ref.ScanScopeAbsenceAdmissionFence)
+		if err != nil {
+			t.Fatalf("pass %d fence read: %v", pass, err)
+		}
+		cleared = !ok
+	}
+	if !cleared {
+		t.Fatal("fence never cleared after full recovery rotations")
+	}
+	dec, err = res.ReservePackBytes(ctx, blob.QuotaRepoGroup("a-fill"),
+		[]ref.Pack{{Key: blob.PackKey("a-fill", "p2"), Size: 10}}, ref.NewReservationOwner(),
+		0, ref.ReserveNoFloorGen, 10_000, time.Hour)
+	if err != nil || !dec.OK {
+		t.Fatalf("post-recovery finite reserve = (%+v, %v), want admitted", dec, err)
+	}
+}
+
 // TestAbsenceReconcile_GapMutationDefersLegacyRetirement (Codex rounds
 // 19-20): a foreign mutation landing while the cursor is parked mid-range
 // breaks fence continuity — the resumed completion must NOT prove the

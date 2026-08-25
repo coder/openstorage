@@ -199,7 +199,12 @@ admissions closed — unbounded restore/cover reservations stay exempt so
 recovery can proceed — until a healthy error-free pass advances both
 class rotations through one full recovery traversal past the fence's
 arming snapshot (persisted counters, frozen during failing passes, so
-wraps completed while renewal was still failing never count).
+wraps completed while renewal was still failing never count). A
+SUCCESSFUL touch arms the same fence when the prior watermark is absent
+or a full TTL old (Codex round 29): the strict-TTL update deliberately
+leaves already-lapsed rows dead, so continuity across a paused fleet or
+a quota-off period is unprovable and health must not be stamped
+unfenced — the fence arms first, then the stamp records the touch.
 
 Resolved residual (issue #125, with #121): the original design kept the
 known-absent set and rotation cursors in process memory, making refresh

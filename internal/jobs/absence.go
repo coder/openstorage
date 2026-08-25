@@ -904,6 +904,18 @@ func (r *AbsenceReconciler) armAdmissionFence(ctx context.Context, errs *bounded
 		// strict-TTL bulk update already excludes the row.
 		return // renewed recently: covers survive until the NEXT attempt
 	}
+	r.armFence(ctx, errs, "cover renewal degraded past the lapse safety bound")
+}
+
+// armFence durably arms the admission fence (see armAdmissionFence for
+// the failure-path judgment and renewCovers for the success-path
+// continuity check, Codex round 29). Idempotent: re-arming refreshes the
+// traversal snapshot to the current persisted counters, which only
+// extends the required recovery rotation — the conservative direction.
+// Writes run on a bounded detached context.
+func (r *AbsenceReconciler) armFence(ctx context.Context, errs *boundedErrs, why string) {
+	sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), scanStateWriteTimeout)
+	defer cancel()
 	snap, mErr := json.Marshal(map[string]int64{"lfs": r.lfs.Traversals, "packs": r.packs.Traversals})
 	assertf(mErr == nil, "absence reconcile: marshal fence snapshot: %v", mErr)
 	if err := r.registry.PutJobScanState(sctx, ref.ScanJobAbsence, ref.ScanScopeAbsenceAdmissionFence, string(snap), 0); err != nil {
@@ -911,7 +923,7 @@ func (r *AbsenceReconciler) armAdmissionFence(ctx context.Context, errs *bounded
 		return
 	}
 	r.fenceArmed, r.fenceLFS, r.fencePacks = true, r.lfs.Traversals, r.packs.Traversals
-	r.logger.Warn("absence reconcile: cover renewal degraded past the lapse safety bound — finite quota admissions fenced until a complete recovery rotation",
+	r.logger.Warn("absence reconcile: "+why+" — finite quota admissions fenced until a complete recovery rotation",
 		"lfs_traversals", r.fenceLFS, "packs_traversals", r.fencePacks)
 }
 
@@ -1088,6 +1100,26 @@ func (r *AbsenceReconciler) renewCovers(ctx context.Context, budget int64, repor
 		return 0
 	}
 	if r.quotaEnforced {
+		// A successful touch proves covers stayed alive only when
+		// NOTHING could have lapsed before it ran (Codex round 29):
+		// the strict-TTL bulk update deliberately leaves already-dead
+		// rows dead, so a watermark gap of a full TTL — a fleet paused
+		// past the TTL, or quota enforcement re-enabled after an off
+		// period whose passes never stamped — means RECOVERY, not
+		// health. The fence arms BEFORE the stamp (a crash in between
+		// leaves the fail-closed side) and outlives it until a full
+		// recovery rotation completes; an unreadable prior age arms
+		// too. A prior age strictly under the TTL proves continuity:
+		// every row was re-TTL'd then, and rows minted since carry
+		// their own fresh TTL.
+		age, ok, err := r.registry.JobScanStateAge(ctx, ref.ScanJobAbsence, ref.ScanScopeAbsenceRenewalHealth)
+		if err != nil {
+			errs.add(fmt.Errorf("absence reconcile: read renewal health: %w", err))
+			ok = false
+		}
+		if !ok || age >= r.coverTTL {
+			r.armFence(ctx, errs, "renewal continuity unprovable at a successful touch — covers may have lapsed while no pass was stamping")
+		}
 		// Stamp the DB-clock renewal-health watermark: the durable
 		// proof that every live cover was re-TTL'd just now (Codex
 		// round 26, security). A stamp failure leaves the watermark
