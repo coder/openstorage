@@ -389,8 +389,12 @@ func newQualEnv(t *testing.T, label string, raw *s3.Client, bucket, prefix, prob
 // runQualification executes every surface and logs one structured VERDICT
 // line per matrix row. require=true (SeaweedFS, external endpoint) turns
 // any non-pass verdict into a test failure; require=false (legacy MinIO)
-// records findings only — the store's behavior is the deliverable, not a
-// gate.
+// records behavioral findings (ignores/mishandles/rejects/not-reached)
+// only — the store's behavior is the deliverable, not a gate. verdictError
+// fails the test in BOTH modes: an error means the surface could not
+// produce a verdict at all (failed seed, listing, presigned request, …),
+// never a recordable behavioral finding — passing would green-light an
+// incomplete qualification run.
 func runQualification(t *testing.T, e *qualEnv, require bool) {
 	t.Helper()
 	surfaces := []struct {
@@ -413,7 +417,10 @@ func runQualification(t *testing.T, e *qualEnv, require bool) {
 	for _, s := range surfaces {
 		for _, v := range s.run(t, e) {
 			t.Logf("VERDICT store=%s surface=%s verdict=%s detail=%q", e.label, v.surface, v.class, v.detail)
-			if require && v.class != verdictPass {
+			switch {
+			case v.class == verdictError:
+				t.Errorf("store %s surface %s could not produce a verdict: %s — infrastructure/harness error, fails in both require and record modes", e.label, v.surface, v.detail)
+			case require && v.class != verdictPass:
 				t.Errorf("required store %s failed surface %s: %s (%s)", e.label, v.surface, v.class, v.detail)
 			}
 		}
@@ -902,7 +909,9 @@ func TestQualifySeaweedFS(t *testing.T) {
 
 // TestQualifyMinIOLegacy is the record-mode lane for the old MinIO CI pin:
 // its behavior — compliant or not — is a documented finding for the §5-R7
-// matrix, never a test failure.
+// matrix, never a test failure. Infrastructure/harness errors (verdictError)
+// still fail: they mean a surface produced no verdict, so the matrix row
+// would be incomplete, not a finding.
 func TestQualifyMinIOLegacy(t *testing.T) {
 	if testing.Short() {
 		t.Skip("minio qualification needs docker")
