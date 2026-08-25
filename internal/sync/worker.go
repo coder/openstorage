@@ -596,8 +596,32 @@ func (w *Worker) transfer(ctx context.Context, job Job, repo RepoInfo, up Upstre
 	// The upstream FETCH above keeps proxy env untouched on purpose.
 	pushEnv = append(pushEnv, "NO_PROXY=*", "no_proxy=*")
 	pushURL := strings.TrimRight(w.Loopback.BaseURL, "/") + "/" + repo.RepoID + ".git"
-	pushArgs := append([]string{"push", pushURL}, mirrorRefspecs...)
-	if stderr, err := runGit(ctx, mirror, pushEnv, pushArgs...); err != nil {
+	// forward_on_push repos invert the conflict rule (issue #90, Codex
+	// round 7): LOCAL wins. An inbound pull whose upstream fetch predates
+	// a just-accepted local push must not force-rewind it — the poke
+	// reroutes to the forward lane, but a pull already in flight raced
+	// it, and any scheduling-side coordination leaves a window. Making
+	// the loopback push fast-forward-only closes it structurally: an
+	// accepted local push can never be erased by a stale snapshot, and
+	// genuine upstream additions still land as fast-forwards. Refused
+	// refs are the converged local-wins outcome, not a failure; upstream
+	// rewinds/divergence then surface on the next forward as its
+	// documented FailRejected, where a human decides force. Residual
+	// (documented in ADR-44): a FORCE-accepted local rewind to an
+	// ancestor of the stale snapshot is itself fast-forwardable, so a
+	// concurrent pull can still undo exactly that shape.
+	refspecs := mirrorRefspecs
+	if up.ForwardOnPush {
+		refspecs = pushRefspecs
+	}
+	pushArgs := append([]string{"push", "--porcelain", pushURL}, refspecs...)
+	stdout, stderr, err := runGitOut(ctx, mirror, pushEnv, pushArgs...)
+	if err != nil {
+		if rejected := parsePushRejections(stdout); up.ForwardOnPush && len(rejected) > 0 {
+			w.Logger.Info("mirror-back kept newer local refs (forward-on-push: local wins)",
+				"org", job.Org, "repo", job.RepoID, "refused", len(rejected))
+			return nil
+		}
 		return &syncFailure{code: FailPush, cause: fmt.Errorf("git push: %w: %s", err, stderr)}
 	}
 	return nil

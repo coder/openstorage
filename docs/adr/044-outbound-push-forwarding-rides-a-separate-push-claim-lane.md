@@ -60,7 +60,16 @@ would be a data-loss race: pull-first rewinds the local push before the
 forward's snapshot sees it. So the poke schedules the FORWARD, and the
 worker schedules the mirror-back pull strictly after a successful forward —
 upstream's own documented model ("pushes are proxied to the provider and
-changes mirrored back"). The mirror-back is marked durable (`RequestSync`)
+changes mirrored back"). Rerouting alone cannot serialize a pull that was
+ALREADY in flight when the local push won its CAS, so the conflict rule is
+structural: on forward_on_push repos every inbound loopback push is
+fast-forward-only (LOCAL wins) — a stale snapshot's refused refs are the
+converged outcome, genuine upstream additions still land, and upstream
+rewinds surface on the next forward as its documented FailRejected for a
+human force decision. Residual: a FORCE-accepted local rewind to an
+ancestor of a concurrently in-flight pull's snapshot is itself
+fast-forwardable and can still be undone by that pull.
+The mirror-back is marked durable (`RequestSync`)
 before it is enqueued: a request that coalesces with an in-flight pull run
 survives to that run's completion gate instead of being swallowed by queue
 deduplication, so the pull cannot strand a pre-forward snapshot locally.

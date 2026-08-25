@@ -259,6 +259,50 @@ func TestWorkerSecondRunCountsAndForceUpdates(t *testing.T) {
 	}
 }
 
+// TestWorkerPullKeepsNewerLocalRefsOnForwardOnPush (issue #90, Codex
+// round 7): on a forward_on_push repo, LOCAL wins — an inbound pull whose
+// fetch snapshot predates a just-accepted local push must not force-rewind
+// it (the loopback push is fast-forward-only there), while genuine
+// upstream additions still land. The refused refs are the converged
+// outcome: the run succeeds.
+func TestWorkerPullKeepsNewerLocalRefsOnForwardOnPush(t *testing.T) {
+	f := newWorkerFixture(t)
+	seedUpstream(t, f.upstreamDir, "own", "proj")
+	// A genuine upstream addition: a feature branch the pull must import.
+	bare := filepath.Join(f.upstreamDir, "own", "proj.git")
+	fwork := t.TempDir()
+	testGit(t, fwork, "init", "-b", "feature")
+	if err := os.WriteFile(filepath.Join(fwork, "feat.txt"), []byte("feat\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	testGit(t, fwork, "add", ".")
+	testGit(t, fwork, "commit", "-m", "feature c1")
+	testGit(t, fwork, "push", "file://"+bare, "feature")
+	featureHead := testGit(t, fwork, "rev-parse", "HEAD")
+
+	// Local refs are NEWER than the upstream snapshot (the raced-push
+	// shape: the pull fetched before a local push won its CAS).
+	localHead := seedLocalRepo(t, f, "repo_lw")
+	loop := filepath.Join(f.loopbackDir, "repo_lw.git")
+	if _, err := f.store.PutUpstream(context.Background(), Upstream{
+		RepoID: "repo_lw", Provider: "gitea", Owner: "own", Name: "proj",
+		UpstreamHost: "file://" + f.upstreamDir, ForwardOnPush: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := f.worker.Run(context.Background(), Job{Org: "acme", RepoID: "repo_lw"}); err != nil {
+		t.Fatalf("pull run: %v", err)
+	}
+	assertEventTypes(t, f.rec.list(), EventSyncStarted, EventSyncSucceeded)
+	if got := testGit(t, f.loopbackDir, "-C", loop, "rev-parse", "refs/heads/main"); got != localHead {
+		t.Fatalf("local main = %s, want preserved %s (stale pull rewound an accepted local push)", got, localHead)
+	}
+	if got := testGit(t, f.loopbackDir, "-C", loop, "rev-parse", "refs/heads/feature"); got != featureHead {
+		t.Fatalf("local feature = %s, want imported %s", got, featureHead)
+	}
+}
+
 func TestWorkerDetachedBeforeRunIsSilent(t *testing.T) {
 	f := newWorkerFixture(t)
 	if err := f.worker.Run(context.Background(), Job{Org: "acme", RepoID: "repo_cc"}); err != nil {
