@@ -911,14 +911,16 @@ func (r *AbsenceReconciler) coverBase(ctx context.Context, base string, report *
 		// Apply the pending shrink rotation, coalesced to at most one
 		// fresh incarnation per base per pass (Codex round 8): heals
 		// interleaved with re-charges could otherwise mint row-cap many
-		// keys in one pass. A shrink after this pass's rotation keeps the
-		// current key until the NEXT pass — one pass of over-cover at
-		// this pass's GREATEST, then exact.
+		// keys in one pass. A shrink after this pass's rotation stays
+		// PENDING (Codex round 9: clearing it here would strand the
+		// smaller total on the GREATEST-pinned intermediate key forever)
+		// and rotates on the next pass — one pass of over-cover at this
+		// pass's GREATEST, then exact.
 		if !st.rotated[base] {
 			agg.coverKey = absenceCoverKey(base)
 			st.rotated[base] = true
+			agg.shrunk = false
 		}
-		agg.shrunk = false
 	}
 	if prev, done := st.baseCovered[base]; done && prev.key == agg.coverKey && agg.bytes <= prev.bytes {
 		return

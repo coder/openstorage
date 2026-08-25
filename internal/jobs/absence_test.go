@@ -528,6 +528,21 @@ func TestAbsenceShrinkRotationCoalesced(t *testing.T) {
 	if len(distinct) > 1 {
 		t.Fatalf("pass minted %d distinct aggregate incarnations (%v), want at most 1", len(distinct), reg.reserved)
 	}
+
+	// Shrinks after this pass's rotation stay PENDING (Codex round 9):
+	// the next pass must rotate once more so the final 10-byte total
+	// leaves the GREATEST-pinned intermediate key.
+	passOneCharges := len(reg.reserved)
+	r.coverBase(ctx, base, &report, newAbsencePassState(), &errs)
+	if err := errs.join(); err != nil {
+		t.Fatalf("coverBase pass 2: %v", err)
+	}
+	if len(reg.reserved) != passOneCharges+1 {
+		t.Fatalf("pass 2 charged %d times, want exactly 1", len(reg.reserved)-passOneCharges)
+	}
+	if last := reg.reserved[len(reg.reserved)-1]; distinct[last] {
+		t.Fatalf("pass 2 reused a pass-1 incarnation %q — the pending shrink was lost", last)
+	}
 }
 
 // TestAbsenceUntrackSwapRemove: O(1) removal keeps the map and ring
