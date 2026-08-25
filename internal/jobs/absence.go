@@ -248,16 +248,25 @@ func absenceCoverKey(base string) string {
 	return "absence-lost/" + base + "/" + ref.NewReservationOwner()
 }
 
-// absentRow is one tracked truly-absent registry row: everything the
-// refresh needs to re-verify registration and re-settle it, plus its
+// absentRow is one tracked truly-absent-or-short registry row: everything
+// the refresh needs to re-verify registration and re-settle it, plus its
 // position in the round-robin ring.
 type absentRow struct {
-	repo  string
-	id    string // packs keyset component; empty for LFS rows
-	key   string // the row's blob key
+	repo string
+	id   string // packs keyset component; empty for LFS rows
+	key  string // the row's blob key
+	// bytes is the row's COVERED DEFICIT — its contribution to the base
+	// aggregate: the full registered size for absence, the shortfall for
+	// truncation.
 	bytes int64
-	pack  bool
-	idx   int // position in refreshRing, maintained by track/untrack
+	// registered is the row's authoritative registry size (Codex round
+	// 5, security): re-verification must compare a fresh Stat against
+	// THIS, never against the tracked deficit — a truncated row that
+	// partially heals would otherwise compare physical bytes to the old
+	// shortfall and untrack while bytes are still missing.
+	registered int64
+	pack       bool
+	idx        int // position in refreshRing, maintained by track/untrack
 }
 
 // NewAbsenceReconciler wires the reconciliation job.
@@ -462,9 +471,9 @@ func (r *AbsenceReconciler) refreshKnownAbsent(ctx context.Context, budget int64
 		report.AbsentRefreshed++
 		before := len(r.refreshRing)
 		if row.pack {
-			charged += r.settlePackRow(ctx, ref.AbsencePackRow{Repo: row.repo, ID: row.id, Key: row.key, Bytes: row.bytes}, report, st, errs)
+			charged += r.settlePackRow(ctx, ref.AbsencePackRow{Repo: row.repo, ID: row.id, Key: row.key, Bytes: row.registered}, report, st, errs)
 		} else {
-			charged += r.settleLFSRow(ctx, ref.AbsenceLFSRow{Repo: row.repo, Key: row.key, Bytes: row.bytes}, report, st, errs)
+			charged += r.settleLFSRow(ctx, ref.AbsenceLFSRow{Repo: row.repo, Key: row.key, Bytes: row.registered}, report, st, errs)
 		}
 		if len(r.refreshRing) == before {
 			r.refreshPos++ // entry survived (still absent): advance past it
@@ -727,7 +736,7 @@ func (r *AbsenceReconciler) settleLFSRow(ctx context.Context, row ref.AbsenceLFS
 		report.LFSRowsTruncated++
 		r.logger.Error("absence reconcile: registered lfs object is shorter than its registered size",
 			"repo", row.Repo, "key", row.Key, "registered", row.Bytes, "physical", size)
-		r.coverDeficit(ctx, base, absentRow{repo: row.Repo, key: row.Key, bytes: row.Bytes - size}, report, st, errs)
+		r.coverDeficit(ctx, base, absentRow{repo: row.Repo, key: row.Key, bytes: row.Bytes - size, registered: row.Bytes}, report, st, errs)
 		return charged
 	} else if !errors.Is(err, blob.ErrNotFound) {
 		report.StatErrors++
@@ -765,7 +774,7 @@ func (r *AbsenceReconciler) settleLFSRow(ctx context.Context, row ref.AbsenceLFS
 			report.LFSRowsTruncated++
 			r.logger.Error("absence reconcile: registered lfs object survives only as a short twin",
 				"repo", row.Repo, "key", row.Key, "twin", twin, "registered", row.Bytes, "physical", size)
-			r.coverDeficit(ctx, base, absentRow{repo: row.Repo, key: row.Key, bytes: row.Bytes - size}, report, st, errs)
+			r.coverDeficit(ctx, base, absentRow{repo: row.Repo, key: row.Key, bytes: row.Bytes - size, registered: row.Bytes}, report, st, errs)
 			return charged
 		} else if !errors.Is(err, blob.ErrNotFound) {
 			report.StatErrors++
@@ -776,7 +785,7 @@ func (r *AbsenceReconciler) settleLFSRow(ctx context.Context, row ref.AbsenceLFS
 	report.LFSRowsAbsent++
 	r.logger.Error("absence reconcile: registered lfs object bytes are missing from blob storage",
 		"repo", row.Repo, "key", row.Key, "bytes", row.Bytes)
-	if r.trackAbsent(absentRow{repo: row.Repo, key: row.Key, bytes: row.Bytes}, report) {
+	if r.trackAbsent(absentRow{repo: row.Repo, key: row.Key, bytes: row.Bytes, registered: row.Bytes}, report) {
 		r.coverBase(ctx, base, report, st, errs)
 	} else {
 		// Memory-cap overflow: a one-shot cover under the canonical
@@ -825,7 +834,7 @@ func (r *AbsenceReconciler) settlePackRow(ctx context.Context, row ref.AbsencePa
 		report.PackRowsTruncated++
 		r.logger.Error("absence reconcile: registered pack is shorter than its registered size — committed refs may reference this pack",
 			"repo", row.Repo, "key", row.Key, "registered", row.Bytes, "physical", size)
-		r.coverDeficit(ctx, base, absentRow{repo: row.Repo, id: row.ID, key: row.Key, bytes: row.Bytes - size, pack: true}, report, st, errs)
+		r.coverDeficit(ctx, base, absentRow{repo: row.Repo, id: row.ID, key: row.Key, bytes: row.Bytes - size, registered: row.Bytes, pack: true}, report, st, errs)
 		return charged
 	} else if !errors.Is(err, blob.ErrNotFound) {
 		report.StatErrors++
@@ -843,7 +852,7 @@ func (r *AbsenceReconciler) settlePackRow(ctx context.Context, row ref.AbsencePa
 		report.PackRowsUnsized++
 		return charged
 	}
-	if r.trackAbsent(absentRow{repo: row.Repo, id: row.ID, key: row.Key, bytes: row.Bytes, pack: true}, report) {
+	if r.trackAbsent(absentRow{repo: row.Repo, id: row.ID, key: row.Key, bytes: row.Bytes, registered: row.Bytes, pack: true}, report) {
 		r.coverBase(ctx, base, report, st, errs)
 	} else {
 		r.coverRow(ctx, base, row.Key, row.Bytes, report, st, errs)

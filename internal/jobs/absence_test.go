@@ -429,7 +429,7 @@ func TestAbsenceRefreshRingOrder(t *testing.T) {
 	for i := range keys {
 		oid := strings.Repeat("b", 63) + string([]byte{'0' + byte(i)})
 		keys[i] = blob.LFSKey("base", oid)
-		r.trackAbsent(absentRow{repo: "base", key: keys[i], bytes: 10}, &report)
+		r.trackAbsent(absentRow{repo: "base", key: keys[i], bytes: 10, registered: 10}, &report)
 	}
 
 	refresh := func(budget int64) []string {
@@ -490,7 +490,7 @@ func TestAbsenceUntrackSwapRemove(t *testing.T) {
 	for i := range keys {
 		oid := strings.Repeat("c", 63) + string([]byte{'0' + byte(i)})
 		keys[i] = blob.LFSKey("base", oid)
-		r.trackAbsent(absentRow{repo: "base", key: keys[i], bytes: 10}, &report)
+		r.trackAbsent(absentRow{repo: "base", key: keys[i], bytes: 10, registered: 10}, &report)
 	}
 	r.untrackAbsent(keys[1])
 	r.untrackAbsent(keys[1]) // idempotent
@@ -551,6 +551,47 @@ func TestAbsenceReconcile_TruncatedCovered(t *testing.T) {
 	}
 	if report.AbsentTracked != 0 || report.LFSRowsTruncated != 0 || report.PackRowsTruncated != 0 {
 		t.Fatalf("pass 2 report = %+v, want healed truncations released", report)
+	}
+}
+
+// TestAbsenceReconcile_TruncationPartialHeal (Codex round 5, security): a
+// tracked truncation stores its DEFICIT, but re-verification must compare
+// fresh Stats against the authoritative REGISTERED size — comparing
+// against the deficit would untrack a partially healed row while bytes
+// are still missing.
+func TestAbsenceReconcile_TruncationPartialHeal(t *testing.T) {
+	f := newSweepFixture(t)
+	base := "repo-partial-heal"
+	key := blob.LFSKey(base, absenceOID('5'))
+	f.upload(key, "short")           // 5 of 40 bytes
+	registerLFS(t, f, base, key, 40) // deficit 35
+
+	r := testReconciler(t, f, true, 1000)
+	if _, err := r.Run(context.Background()); err != nil {
+		t.Fatalf("Run 1: %v", err)
+	}
+	if got := ledgerReserved(t, f, base); got != 35 {
+		t.Fatalf("reserved = %d, want the 35-byte deficit", got)
+	}
+
+	// Partial heal: 25 of 40 bytes now physical. Deficit-relative
+	// comparison would see 25 >= 35-deficit... wrong on every axis; the
+	// registered-size comparison keeps a 15-byte deficit tracked.
+	if got := f.upload(key, strings.Repeat("p", 25)); got != 25 {
+		t.Fatalf("healed to %d bytes, want 25", got)
+	}
+	var report AbsenceReport
+	var err error
+	for pass := 2; pass <= 3; pass++ {
+		if report, err = r.Run(context.Background()); err != nil {
+			t.Fatalf("Run %d: %v", pass, err)
+		}
+	}
+	if report.AbsentTracked != 1 || report.LFSRowsTruncated == 0 {
+		t.Fatalf("report = %+v, want the 15-byte residual deficit still tracked", report)
+	}
+	if got := ledgerReserved(t, f, base); got < 15 {
+		t.Fatalf("reserved = %d, want at least the residual 15-byte deficit", got)
 	}
 }
 
@@ -714,7 +755,7 @@ func TestAbsenceRefreshDropsUnrenewedBases(t *testing.T) {
 	var report AbsenceReport
 	for i := 0; i < 3; i++ {
 		base := fmt.Sprintf("repo-drop-%d", i)
-		r.trackAbsent(absentRow{repo: base, key: blob.LFSKey(base, absenceOID('a')), bytes: 10}, &report)
+		r.trackAbsent(absentRow{repo: base, key: blob.LFSKey(base, absenceOID('a')), bytes: 10, registered: 10}, &report)
 	}
 	if len(r.knownAbsent) != 3 || len(r.baseRing) != 3 {
 		t.Fatalf("tracked %d rows / %d bases, want 3/3", len(r.knownAbsent), len(r.baseRing))
