@@ -508,6 +508,75 @@ func TestAbsenceUntrackSwapRemove(t *testing.T) {
 	}
 }
 
+// TestAbsenceReconcile_TruncatedCovered (Codex round 4, security): a blob
+// physically present but SHORTER than its registered size deflates the
+// floor by the deficit — covered and tracked exactly like partial absence,
+// and released once the full bytes return.
+func TestAbsenceReconcile_TruncatedCovered(t *testing.T) {
+	f := newSweepFixture(t)
+	base := "repo-truncated"
+	lfsKey := blob.LFSKey(base, absenceOID('7'))
+	f.upload(lfsKey, "short")           // 5 physical bytes
+	registerLFS(t, f, base, lfsKey, 40) // registered as 40
+	packKey := blob.PackKey(base, "trunc")
+	f.upload(packKey, "abc") // 3 physical bytes
+	if err := f.store.RegisterPacks(context.Background(), base, []ref.Pack{{ID: "trunc", Key: packKey, Size: 9}}); err != nil {
+		t.Fatal(err)
+	}
+
+	r := testReconciler(t, f, true, 1000)
+	report, err := r.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if report.LFSRowsTruncated != 1 || report.PackRowsTruncated != 1 || report.LFSRowsAbsent != 0 {
+		t.Fatalf("report = %+v, want one truncated row per registry", report)
+	}
+	if got := ledgerReserved(t, f, base); got != (40-5)+(9-3) {
+		t.Fatalf("reserved = %d, want the 41-byte deficit aggregate", got)
+	}
+
+	// Full bytes return: one final renewal precedes the re-verification
+	// that releases the tracking.
+	if got := f.upload(lfsKey, strings.Repeat("x", 40)); got != 40 {
+		t.Fatalf("healed to %d bytes, want 40", got)
+	}
+	if got := f.upload(packKey, strings.Repeat("y", 9)); got != 9 {
+		t.Fatalf("healed to %d bytes, want 9", got)
+	}
+	report, err = r.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run 2: %v", err)
+	}
+	if report.AbsentTracked != 0 || report.LFSRowsTruncated != 0 || report.PackRowsTruncated != 0 {
+		t.Fatalf("pass 2 report = %+v, want healed truncations released", report)
+	}
+}
+
+// TestAbsenceReconcile_ShortTwinCovered: a row absent under its registered
+// spelling whose twin holds FEWER bytes than registered is a partial loss —
+// only the twin's physical size compensates the floor.
+func TestAbsenceReconcile_ShortTwinCovered(t *testing.T) {
+	f := newSweepFixture(t)
+	base := "repo-shorttwin"
+	oid := absenceOID('8')
+	canonical := blob.LFSKey(base, oid)
+	f.upload(blob.LFSLegacyKey(base, oid), "tiny") // 4 of 32 bytes survive
+	registerLFS(t, f, base, canonical, 32)
+
+	r := testReconciler(t, f, true, 1000)
+	report, err := r.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if report.LFSRowsTruncated != 1 || report.LFSRowsTwinOnly != 0 || report.LFSRowsAbsent != 0 {
+		t.Fatalf("report = %+v, want the short twin classified as truncation", report)
+	}
+	if got := ledgerReserved(t, f, base); got != 28 {
+		t.Fatalf("reserved = %d, want the 28-byte deficit", got)
+	}
+}
+
 // TestAbsenceReconcile_RefreshDropsHealedRows: a tracked loss whose bytes
 // return leaves the refresh set on the next pass.
 func TestAbsenceReconcile_RefreshDropsHealedRows(t *testing.T) {

@@ -70,11 +70,18 @@ type AbsenceReport struct {
 	// LFSRowsAbsent counts rows whose bytes are missing under BOTH ADR-41
 	// spellings — genuine storage loss.
 	LFSRowsAbsent int64 `json:"lfs_rows_absent"`
+	// LFSRowsTruncated counts rows physically present (under either
+	// spelling) but SHORTER than their registered size — a partial loss
+	// whose deficit deflates the floor exactly like full absence (Codex
+	// round 4, security).
+	LFSRowsTruncated int64 `json:"lfs_rows_truncated"`
 	// LFSRowsTwinOnly counts rows absent under their registered spelling
-	// but present under the canonical/legacy twin: physically listed (no
-	// floor deflation), healed by download-time restore (PR #104).
-	LFSRowsTwinOnly int64 `json:"lfs_rows_twin_only"`
-	PackRowsAbsent  int64 `json:"pack_rows_absent"`
+	// but fully present under the canonical/legacy twin: physically
+	// listed (no floor deflation), healed by download-time restore (PR
+	// #104).
+	LFSRowsTwinOnly   int64 `json:"lfs_rows_twin_only"`
+	PackRowsAbsent    int64 `json:"pack_rows_absent"`
+	PackRowsTruncated int64 `json:"pack_rows_truncated"`
 	// PackRowsUnsized counts absent pack rows registered before the
 	// packs.bytes migration: the loss is reported but uncoverable until a
 	// repack fold rewrites the row with its size.
@@ -317,8 +324,10 @@ func (r *AbsenceReconciler) Run(ctx context.Context) (AbsenceReport, error) {
 		"lfs_rows_examined", report.LFSRowsExamined,
 		"pack_rows_examined", report.PackRowsExamined,
 		"lfs_rows_absent", report.LFSRowsAbsent,
+		"lfs_rows_truncated", report.LFSRowsTruncated,
 		"lfs_rows_twin_only", report.LFSRowsTwinOnly,
 		"pack_rows_absent", report.PackRowsAbsent,
+		"pack_rows_truncated", report.PackRowsTruncated,
 		"pack_rows_unsized", report.PackRowsUnsized,
 		"covers_charged", report.CoversCharged,
 		"bytes_covered", report.BytesCovered,
@@ -617,9 +626,22 @@ func (r *AbsenceReconciler) settleLFSRow(ctx context.Context, row ref.AbsenceLFS
 		// without a probe.
 		return charged
 	}
-	if _, err := r.blobs.Stat(ctx, row.Key); err == nil {
-		r.untrackAbsent(row.Key)
-		return charged // physically present under the registered spelling
+	if size, err := r.blobs.Stat(ctx, row.Key); err == nil {
+		if size >= row.Bytes {
+			r.untrackAbsent(row.Key)
+			return charged // fully present under the registered spelling
+		}
+		// Present but SHORT (Codex round 4, security): a truncated blob —
+		// e.g. a still-valid v0.1 presigned PUT overwriting a legacy key
+		// with fewer bytes — deflates the floor by the deficit exactly
+		// like partial absence. Cover the deficit; a full twin could
+		// compensate, but probing it here would trade a rare short-lived
+		// over-cover for an extra request on a corruption path.
+		report.LFSRowsTruncated++
+		r.logger.Error("absence reconcile: registered lfs object is shorter than its registered size",
+			"repo", row.Repo, "key", row.Key, "registered", row.Bytes, "physical", size)
+		r.coverDeficit(ctx, base, absentRow{repo: row.Repo, key: row.Key, bytes: row.Bytes - size}, report, st, errs)
+		return charged
 	} else if !errors.Is(err, blob.ErrNotFound) {
 		report.StatErrors++
 		errs.add(fmt.Errorf("absence reconcile: stat %s: %w", row.Key, err))
@@ -627,10 +649,11 @@ func (r *AbsenceReconciler) settleLFSRow(ctx context.Context, row ref.AbsenceLFS
 	}
 	// The registered spelling is absent — classify the ADR-41 twin before
 	// flagging: a canonical-missing object may be legacy-present (or the
-	// reverse for a pre-migration legacy row). The twin's bytes are still
+	// reverse for a pre-migration legacy row). A FULL twin's bytes are
 	// physically listed, so the floor is NOT deflated, and download-time
 	// restore (PR #104) heals the spelling through the digest-verified
-	// adopt pipeline — report, never cover.
+	// adopt pipeline — report, never cover. A SHORT twin compensates only
+	// its physical size; the remainder is covered like truncation.
 	coverKey := row.Key
 	if repoID, oid, ok := splitLFSKey(row.Key); ok {
 		canonical, legacy := blob.LFSKey(repoID, oid), blob.LFSLegacyKey(repoID, oid)
@@ -644,11 +667,18 @@ func (r *AbsenceReconciler) settleLFSRow(ctx context.Context, row ref.AbsenceLFS
 			twin = canonical
 		}
 		charged++
-		if _, err := r.blobs.Stat(ctx, twin); err == nil {
-			report.LFSRowsTwinOnly++
-			r.untrackAbsent(row.Key)
-			r.logger.Warn("absence reconcile: registered lfs object present only under its twin spelling",
-				"repo", row.Repo, "key", row.Key, "twin", twin, "bytes", row.Bytes)
+		if size, err := r.blobs.Stat(ctx, twin); err == nil {
+			if size >= row.Bytes {
+				report.LFSRowsTwinOnly++
+				r.untrackAbsent(row.Key)
+				r.logger.Warn("absence reconcile: registered lfs object present only under its twin spelling",
+					"repo", row.Repo, "key", row.Key, "twin", twin, "bytes", row.Bytes)
+				return charged
+			}
+			report.LFSRowsTruncated++
+			r.logger.Error("absence reconcile: registered lfs object survives only as a short twin",
+				"repo", row.Repo, "key", row.Key, "twin", twin, "registered", row.Bytes, "physical", size)
+			r.coverDeficit(ctx, base, absentRow{repo: row.Repo, key: row.Key, bytes: row.Bytes - size}, report, st, errs)
 			return charged
 		} else if !errors.Is(err, blob.ErrNotFound) {
 			report.StatErrors++
@@ -669,6 +699,22 @@ func (r *AbsenceReconciler) settleLFSRow(ctx context.Context, row ref.AbsenceLFS
 	return charged
 }
 
+// coverDeficit tracks and covers a PARTIAL loss (truncated or short-twin
+// bytes): the tracked entry's bytes are the deficit, re-derived on every
+// re-verification — an existing entry with a different deficit is replaced
+// so its base aggregate stays exact.
+func (r *AbsenceReconciler) coverDeficit(ctx context.Context, base string, row absentRow, report *AbsenceReport, st *absencePassState, errs *boundedErrs) {
+	assertf(row.bytes > 0, "coverDeficit: non-positive deficit %d for %s", row.bytes, row.key)
+	if existing, ok := r.knownAbsent[row.key]; ok && existing.bytes != row.bytes {
+		r.untrackAbsent(row.key)
+	}
+	if r.trackAbsent(row, report) {
+		r.coverBase(ctx, base, report, st, errs)
+	} else {
+		r.coverRow(ctx, base, row.key, row.bytes, report, st, errs)
+	}
+}
+
 // settlePackRow point-checks one packs row and covers a genuine loss.
 func (r *AbsenceReconciler) settlePackRow(ctx context.Context, row ref.AbsencePackRow, report *AbsenceReport, st *absencePassState, errs *boundedErrs) (charged int64) {
 	charged = 1
@@ -684,8 +730,15 @@ func (r *AbsenceReconciler) settlePackRow(ctx context.Context, row ref.AbsencePa
 		r.untrackAbsent(row.Key)
 		return charged
 	}
-	if _, err := r.blobs.Stat(ctx, row.Key); err == nil {
-		r.untrackAbsent(row.Key)
+	if size, err := r.blobs.Stat(ctx, row.Key); err == nil {
+		if row.Bytes == 0 || size >= row.Bytes {
+			r.untrackAbsent(row.Key)
+			return charged // fully present (or pre-#101 row: size unknown)
+		}
+		report.PackRowsTruncated++
+		r.logger.Error("absence reconcile: registered pack is shorter than its registered size — committed refs may reference this pack",
+			"repo", row.Repo, "key", row.Key, "registered", row.Bytes, "physical", size)
+		r.coverDeficit(ctx, base, absentRow{repo: row.Repo, id: row.ID, key: row.Key, bytes: row.Bytes - size, pack: true}, report, st, errs)
 		return charged
 	} else if !errors.Is(err, blob.ErrNotFound) {
 		report.StatErrors++

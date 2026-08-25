@@ -27,11 +27,16 @@ lost cursor only delays convergence: verdicts are recomputed, never trusted
 from state.
 
 Classification precedes flagging (ADR-41): an LFS row absent under its
-registered spelling probes the canonical/legacy twin first. Twin-present
-rows are physically listed — the floor is not deflated — and download-time
-restore (PR #104) heals the spelling through the digest-verified adopt
-pipeline, so they are reported (`lfs_rows_twin_only`), never charged. Only
-rows absent under BOTH spellings are genuine loss.
+registered spelling probes the canonical/legacy twin first. FULLY
+twin-present rows are physically listed — the floor is not deflated — and
+download-time restore (PR #104) heals the spelling through the
+digest-verified adopt pipeline, so they are reported
+(`lfs_rows_twin_only`), never charged. Only rows absent under BOTH
+spellings are full loss — and the point check compares sizes, not mere
+existence (Codex round 4, security): a blob present but SHORTER than its
+registered size (truncated, or surviving only as a short twin) deflates
+the floor by the deficit, which is covered and tracked exactly like
+partial absence.
 
 Discovery is rotation-bounded, but refresh is not (Codex round 1): covers
 are TTL'd, and on a registry larger than one pass's budget the rotation

@@ -493,11 +493,15 @@ cursors (budget-limited, resumable — the sweeper's inverse direction) and
 `HEAD`s each row's blob:
 
 - **Present** — nothing happens; the common case costs one probe per row.
-- **LFS row absent under its registered spelling but present under its
-  ADR-41 twin** (canonical `lfs/<repo>/o2/<oid>` vs legacy
+- **LFS row absent under its registered spelling but FULLY present under
+  its ADR-41 twin** (canonical `lfs/<repo>/o2/<oid>` vs legacy
   `lfs/<repo>/<oid>`) — reported (`lfs_rows_twin_only`), never charged: the
   twin's bytes are still physically listed, and download-time restore heals
   the spelling.
+- **Physically present but SHORTER than registered** (a truncated blob, or
+  a short surviving twin) — a partial loss: the deficit deflates the floor
+  exactly like absence and is covered/tracked the same way
+  (`lfs_rows_truncated` / `pack_rows_truncated`).
 - **Truly absent** — logged loudly and, when quota is enforced, charged as a
   TTL'd restore cover (the same reservation row restore paths renew) plus a
   floor-generation bump, so every admission sees the missing bytes until
@@ -537,7 +541,8 @@ A reconciliation pass logs one `absence reconcile pass finished` line:
 |---|---|
 | `lfs_rows_examined` / `pack_rows_examined` | registry rows point-checked this pass (each charges the budget) |
 | `lfs_rows_absent` | LFS rows missing under BOTH spellings — genuine storage loss |
-| `lfs_rows_twin_only` | rows present only under their ADR-41 twin spelling (restorable, not charged) |
+| `lfs_rows_truncated` / `pack_rows_truncated` | rows physically present but shorter than registered — the deficit is covered like absence |
+| `lfs_rows_twin_only` | rows fully present only under their ADR-41 twin spelling (restorable, not charged) |
 | `pack_rows_absent` / `pack_rows_unsized` | missing registered packs (integrity!); how many predate size recording and cannot be charged |
 | `covers_charged` / `bytes_covered` | restore covers charged/refreshed this pass and their total bytes |
 | `cover_errors` / `stat_errors` | covers that failed (e.g. the per-repo reservation-row cap) and probes that errored — both retried next pass |
