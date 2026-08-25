@@ -213,10 +213,36 @@ func (s *SQLite) RetirePackAttempts(ctx context.Context, group []string, gens ma
 }
 
 // SweepExpiredPackReservations prunes reservation rows at least olderThan
-// old.
+// old. The marker insert runs BEFORE the delete inside one IMMEDIATE
+// transaction: deleting an expired un-folded absence-cover row destroys
+// the physical lapse evidence the reconciler's first-health-stamp probe
+// arms on, and the scheduled sweep is a second consumer of that evidence
+// beside ReservePackBytes' admission-time GC (Codex rounds 33+34 on
+// PR #132). The sweeper passes the admission TTL as olderThan, so every
+// doomed cover row is exactly a lapsed cover; folded rows never mark.
 func (s *SQLite) SweepExpiredPackReservations(ctx context.Context, olderThan time.Duration) (int64, error) {
 	assertf(olderThan >= 0, "SweepExpiredPackReservations: negative age %v", olderThan)
-	res, err := s.db.ExecContext(ctx, `
+	tx, err := s.db.BeginTx(ctx, nil) // BEGIN IMMEDIATE via _txlock
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx, `
+INSERT INTO job_scan_state (job, scope, payload, generation, updated_at)
+SELECT ?, ?, key, 0, `+sqliteEpochMS+` FROM pack_reservations
+WHERE key NOT LIKE '%/adopt-claim' AND created_at <= `+sqliteEpochMS+` - ?
+  AND key > ? AND key < ?
+  AND substr(key, -?) = ?
+  AND owner <> ?
+LIMIT 1
+ON CONFLICT (job, scope) DO UPDATE SET payload = excluded.payload, updated_at = `+sqliteEpochMS+``,
+		ScanJobAbsence, ScanScopeAbsenceLapse,
+		olderThan.Milliseconds(),
+		AbsenceCoverPrefix, absenceCoverRangeEnd,
+		len(absenceCoverRawSuffix), absenceCoverRawSuffix, AbsenceFoldedOwner); err != nil {
+		return 0, fmt.Errorf("sweep reservations lapse marker: %w", err)
+	}
+	res, err := tx.ExecContext(ctx, `
 DELETE FROM pack_reservations
 WHERE (key NOT LIKE '%/adopt-claim' AND created_at <= `+sqliteEpochMS+` - ?)
    OR (key LIKE '%/adopt-claim' AND created_at <= `+sqliteEpochMS+` - ?)`,
@@ -224,7 +250,11 @@ WHERE (key NOT LIKE '%/adopt-claim' AND created_at <= `+sqliteEpochMS+` - ?)
 	if err != nil {
 		return 0, err
 	}
-	return res.RowsAffected()
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	return n, tx.Commit()
 }
 
 // IsRetainedPack reports whether (repo, key) is a recorded superseded blob.

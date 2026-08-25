@@ -708,18 +708,40 @@ DELETE FROM pack_reservations WHERE repo = $1 AND key = $2 AND gen = $3 AND atte
 }
 
 // SweepExpiredPackReservations prunes reservation rows at least olderThan
-// old.
+// old. Deleting an expired UN-FOLDED absence-cover row destroys the
+// physical lapse evidence the reconciler's first-health-stamp probe arms
+// on — the scheduled sweep is a second consumer of that evidence beside
+// ReservePackBytes' admission-time GC (Codex rounds 33+34 on PR #132) —
+// so the statement records the durable lapse-evidence marker atomically.
+// The sweeper passes the admission TTL as olderThan, so every doomed
+// cover row is exactly a lapsed cover; folded rows decay deliberately
+// and never mark.
 func (s *PG) SweepExpiredPackReservations(ctx context.Context, olderThan time.Duration) (int64, error) {
 	assertf(olderThan >= 0, "SweepExpiredPackReservations: negative age %v", olderThan)
-	ct, err := s.pool.Exec(ctx, `
-DELETE FROM pack_reservations
-WHERE (key NOT LIKE '%/adopt-claim' AND created_at <= now() - make_interval(secs => $1))
-   OR (key LIKE '%/adopt-claim' AND created_at <= now() - make_interval(secs => $2))`,
-		olderThan.Seconds(), AdoptionClaimTTL.Seconds())
+	var n int64
+	err := s.pool.QueryRow(ctx, `
+WITH doomed AS (
+  DELETE FROM pack_reservations
+  WHERE (key NOT LIKE '%/adopt-claim' AND created_at <= now() - make_interval(secs => $1))
+     OR (key LIKE '%/adopt-claim' AND created_at <= now() - make_interval(secs => $2))
+  RETURNING key, owner
+), marked AS (
+  INSERT INTO job_scan_state (job, scope, payload, generation, updated_at)
+  SELECT $3, $4, key, 0, now() FROM doomed
+  WHERE key COLLATE "C" > $5 AND key COLLATE "C" < $6
+    AND right(key, $7) = $8 AND owner <> $9
+  LIMIT 1
+  ON CONFLICT (job, scope) DO UPDATE SET payload = EXCLUDED.payload, updated_at = now()
+)
+SELECT count(*) FROM doomed`,
+		olderThan.Seconds(), AdoptionClaimTTL.Seconds(),
+		ScanJobAbsence, ScanScopeAbsenceLapse,
+		AbsenceCoverPrefix, absenceCoverRangeEnd,
+		len(absenceCoverRawSuffix), absenceCoverRawSuffix, AbsenceFoldedOwner).Scan(&n)
 	if err != nil {
 		return 0, err
 	}
-	return ct.RowsAffected(), nil
+	return n, nil
 }
 
 // IsRetainedPack reports whether (repo, key) is a recorded superseded blob.

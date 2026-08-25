@@ -223,12 +223,14 @@ which must fail closed).
 Resolved residual (Codex round 33 on PR #132): the first-stamp probe's
 physical evidence was destructible by the very writers the fence should
 block — `ReservePackBytes` GC-deletes a base's expired reservation rows
-at admission time, expired un-folded covers included. The GC now records
-a durable lapse-evidence marker (`job_scan_state`) in the same
-transaction whenever it consumes such a row (folded nonces decay
-deliberately and are never evidence); the first stamp consults the
-marker BEFORE the physical probe, and the settlement that proves a full
-recovery rotation deletes the marker with the fence. Arming is also safe
+at admission time, expired un-folded covers included, and the scheduled
+reservation sweep (`SweepExpiredPackReservations`, round 34) is a second
+consumer of the same evidence. Both now record a durable lapse-evidence
+marker (`job_scan_state`) in the same transaction whenever they consume
+such a row (folded nonces decay deliberately and are never evidence);
+the first stamp consults the marker BEFORE the physical probe, and the
+settlement that proves a full recovery rotation deletes the marker with
+the fence. Arming is also safe
 against its own bookkeeping failing: a pass whose durable cursor or
 fence reads error holds untrustworthy in-memory counters, so it arms
 with an unknown sentinel (`-1`) instead of snapshotting them — the next

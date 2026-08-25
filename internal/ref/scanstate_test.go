@@ -667,3 +667,96 @@ func TestReservePackBytes_GCRecordsLapseEvidence(t *testing.T) {
 		}
 	})
 }
+
+// TestSweepExpiredPackReservations_RecordsLapseEvidence (Codex round 34
+// on PR #132, P1): the SCHEDULED reservation sweep is a second consumer
+// of the physical lapse evidence beside ReservePackBytes' admission-time
+// GC — running after covers expire but before the reconciler's first
+// health stamp, it would delete every expired un-folded cover and leave
+// the probe nothing to arm on. The sweep must record the durable marker
+// atomically; folded nonces and foreign spellings are never evidence.
+// The sweep is fleet-global (no repo scoping), so the strict no-marker
+// assertions need a private keyspace on the shared pg lane — the
+// TestLapsedAbsenceCoverExists pattern.
+func TestSweepExpiredPackReservations_RecordsLapseEvidence(t *testing.T) {
+	t.Run("pg", func(t *testing.T) {
+		pgTestStore(t) // boot the package container
+		ctx := context.Background()
+		conn, err := pgx.Connect(ctx, pgTestURL)
+		if err != nil {
+			t.Fatalf("connect: %v", err)
+		}
+		if _, err := conn.Exec(ctx, "CREATE DATABASE sweep_lapse_probe"); err != nil {
+			t.Fatalf("create database: %v", err)
+		}
+		_ = conn.Close(ctx)
+		privURL := strings.Replace(pgTestURL, "/postgres?", "/sweep_lapse_probe?", 1)
+		if privURL == pgTestURL {
+			t.Fatalf("could not derive a private database URL from %q", pgTestURL)
+		}
+		s, err := OpenPG(ctx, privURL)
+		if err != nil {
+			t.Fatalf("open private pg: %v", err)
+		}
+		t.Cleanup(s.Close)
+		if err := s.InitSchema(ctx); err != nil {
+			t.Fatalf("init schema: %v", err)
+		}
+		testSweepRecordsLapseEvidence(t, s)
+	})
+	t.Run("sqlite", func(t *testing.T) {
+		s, _ := openTestSQLite(t)
+		testSweepRecordsLapseEvidence(t, s)
+	})
+}
+
+func testSweepRecordsLapseEvidence(t *testing.T, s Store) {
+	ss := scanStateStore(t, s)
+	cs := coverStore(t, s)
+	ctx := context.Background()
+	k := newLedgerKit(t, s)
+	base := k.base()
+
+	// Expired FOREIGN spelling and FOLDED nonce: swept without evidence.
+	foreign := AbsenceCoverPrefix + base + "/zz-foreign"
+	if dec, err := s.ReservePackBytes(ctx, k.group, []Pack{{Key: foreign, Size: 5}}, NewReservationOwner(), 0, ReserveNoFloorGen, 1<<40, time.Hour); err != nil || !dec.OK {
+		t.Fatalf("plant foreign row: (%+v, %v)", dec, err)
+	}
+	foldKey := AbsenceCoverPrefix + base + "/0123456789abcdef0123"
+	if err := ReserveRestoreCover(ctx, s, k.group, foldKey, 30, time.Hour); err != nil {
+		t.Fatalf("plant folded cover: %v", err)
+	}
+	listed, err := cs.ListAbsenceCovers(ctx, "", 10, time.Hour)
+	if err != nil || len(listed) != 1 || listed[0].Key != foldKey {
+		t.Fatalf("listing for fold = (%+v, %v), want our nonce", listed, err)
+	}
+	if ok, err := cs.CASAbsenceCoverOwner(ctx, listed[0].RawKey, listed[0].Owner, listed[0].Bytes, AbsenceFoldedOwner); err != nil || !ok {
+		t.Fatalf("fold = (%v, %v)", ok, err)
+	}
+	if n, err := s.SweepExpiredPackReservations(ctx, 0); err != nil || n != 2 {
+		t.Fatalf("sweep folded/foreign = (%d, %v), want 2 rows", n, err)
+	}
+	if _, ok, err := ss.GetJobScanState(ctx, ScanJobAbsence, ScanScopeAbsenceLapse); err != nil || ok {
+		t.Fatalf("marker after folded/foreign sweep = (ok=%v, %v), want absent", ok, err)
+	}
+
+	// An expired UN-FOLDED cover: the sweep must record the marker in
+	// the same statement/transaction it consumes the evidence.
+	coverKey := AbsenceCoverPrefix + base + "/lfs-e0000000000000000001"
+	if err := ReserveRestoreCover(ctx, s, k.group, coverKey, 40, time.Hour); err != nil {
+		t.Fatalf("plant un-folded cover: %v", err)
+	}
+	if n, err := s.SweepExpiredPackReservations(ctx, 0); err != nil || n != 1 {
+		t.Fatalf("sweep un-folded = (%d, %v), want 1 row", n, err)
+	}
+	if _, ok, err := cs.AbsenceCoverHead(ctx, coverKey, time.Hour); err != nil || ok {
+		t.Fatalf("cover after sweep = (ok=%v, %v), want pruned", ok, err)
+	}
+	st, ok, err := ss.GetJobScanState(ctx, ScanJobAbsence, ScanScopeAbsenceLapse)
+	if err != nil || !ok {
+		t.Fatalf("marker after un-folded sweep = (ok=%v, %v), want present", ok, err)
+	}
+	if !strings.HasPrefix(st.Payload, coverKey) {
+		t.Fatalf("marker payload = %q, want the consumed cover's raw key", st.Payload)
+	}
+}

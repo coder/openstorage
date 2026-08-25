@@ -658,6 +658,83 @@ func TestLFSReclaim_PassDeadline(t *testing.T) {
 	}
 }
 
+// TestLFSReclaim_VanishedRefundsSettleDespiteBurnedDeadline (Codex round
+// 34 on PR #132, P2): a base whose LAST row retired vanishes from
+// LFSReposWithObjects, so its deferred refunds settle EXCLUSIVELY through
+// the end-of-pass vanished-refund path — which must run on a detached
+// bounded context: the main rotation regularly burns the whole pass
+// deadline, and inheriting the expired context would leave such refunds
+// charged indefinitely, blocking uploads against phantom usage.
+func TestLFSReclaim_VanishedRefundsSettleDespiteBurnedDeadline(t *testing.T) {
+	ctx := context.Background()
+	store, reg := newReclaimStore(t)
+
+	// The vanished base: one row registered, retired (refund parked in
+	// its epoch bucket, counters still charged), then a covering sweep.
+	vanished := "vanished-repo"
+	vkey := "lfs/" + vanished + "/o2/" + strings.Repeat("cd", 32)
+	if err := store.RegisterLFSObject(ctx, vanished, vkey, 100); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := reg.MarkLFSObjectsUnreferenced(ctx, vanished, []string{vkey}); err != nil || n != 1 {
+		t.Fatalf("mark = (%d, %v)", n, err)
+	}
+	gens := make(map[string]int64)
+	for _, member := range blob.QuotaRepoGroup(vanished) {
+		g, err := store.GetGeneration(ctx, member)
+		if err != nil {
+			t.Fatalf("GetGeneration(%q): %v", member, err)
+		}
+		gens[member] = g
+	}
+	if retired, err := reg.RetireUnreferencedLFSObject(ctx, vanished, vkey, gens, 0, time.Hour); err != nil || !retired {
+		t.Fatalf("retire = (%v, %v), want retired", retired, err)
+	}
+	if n, err := store.CountLFSObjects(ctx, vanished); err != nil || n != 1 {
+		t.Fatalf("count after retire = (%d, %v), want still 1 (deferred)", n, err)
+	}
+	simulateCoveringSweep(t, reg, true)
+
+	// A wedged repo that sorts FIRST burns the whole pass deadline
+	// before the rotation can reach the vanished base — and because a
+	// remainder-exhausted rotation HOLDS its cursor to retry the wedged
+	// repo first next pass, the visit-time settlement in reclaimRepo
+	// never runs for the vanished base: the end-of-pass vanished path is
+	// its exclusive settlement route, exactly the degraded-walk scenario
+	// (Codex round 34).
+	wedged := "a-wedged"
+	wkey := "lfs/" + wedged + "/o2/" + strings.Repeat("ab", 32)
+	if err := store.RegisterLFSObject(ctx, wedged, wkey, 10); err != nil {
+		t.Fatal(err)
+	}
+	if won, err := store.CASRef(ctx, wedged, "refs/heads/main", ref.ZeroSHA, strings.Repeat("88", 20)); err != nil || !won {
+		t.Fatalf("CASRef = (%v, %v)", won, err)
+	}
+	instantHydrate := func(context.Context, string, string) (string, error) {
+		return t.TempDir(), nil
+	}
+	stuckWalk := func(ctx context.Context, _ string, _ int64) (map[string]struct{}, int64, error) {
+		<-ctx.Done()
+		return nil, 0, ctx.Err()
+	}
+	r := NewLFSReclaimer(reg, instantHydrate, stuckWalk, alwaysMain,
+		time.Hour, 1_000, true, true, slog.New(slog.DiscardHandler))
+	r.walkTimeout = time.Hour
+	r.passTimeout = 50 * time.Millisecond
+
+	report, err := r.Run(ctx)
+	if err == nil {
+		t.Fatal("want the burned pass deadline reported")
+	}
+	// The vanished base's refund settled anyway, on the detached context.
+	if report.RefundRowsSettled != 1 || report.RefundBytesSettled != 100 {
+		t.Fatalf("settled = (%d rows, %d bytes), want the vanished base's refund", report.RefundRowsSettled, report.RefundBytesSettled)
+	}
+	if n, err := store.CountLFSObjects(ctx, vanished); err != nil || n != 0 {
+		t.Fatalf("count after settle = (%d, %v), want 0", n, err)
+	}
+}
+
 // TestLFSReclaim_RefFanoutChargesBudget (Codex round 6): a git:write holder
 // can mint arbitrarily many refs naming one commit — registry
 // materialization, cache sync, and rev-list enumeration all scale with ref

@@ -268,6 +268,13 @@ func NewLFSReclaimer(registry LFSReclaimRegistry, hydrate HydrateFunc, walk LFSW
 // lfsRefundScopePage bounds one pass's vanished-base refund listing.
 const lfsRefundScopePage = 512
 
+// refundSettleTimeout bounds the detached end-of-pass vanished-refund
+// settlement (Codex round 34): generous for one scope page of per-base
+// point transactions, small next to the pass timeout, and independent of
+// the pass deadline the main rotation may already have burned. An
+// unfinished settle only defers those refunds to the next pass.
+const refundSettleTimeout = time.Minute
+
 // settleRefunds settles one base's matured refund buckets into the
 // report. A settlement failure only defers refunds — logged, never fatal
 // to the pass.
@@ -476,8 +483,14 @@ loop:
 	// LFSReposWithObjects, so its pending refunds would otherwise wait
 	// forever. One bounded keyset page of bucket scopes per pass, with a
 	// durable rotation cursor of its own; settled buckets vanish, so the
-	// population self-drains.
-	r.settleVanishedRefunds(ctx, scanned, &report, &errs)
+	// population self-drains. Runs on a bounded DETACHED context (Codex
+	// round 34): the main rotation regularly burns the whole pass
+	// deadline, this is the ONLY settlement path for vanished bases, and
+	// inheriting the expired pass context would defer their refunds
+	// indefinitely on every deadline-bound deployment.
+	settleCtx, cancelSettle := context.WithTimeout(context.WithoutCancel(ctx), refundSettleTimeout)
+	defer cancelSettle()
+	r.settleVanishedRefunds(settleCtx, scanned, &report, &errs)
 	// Park the rotation durably for whichever replica runs the next pass
 	// (issue #121), on a bounded DETACHED context: the pass regularly
 	// ends by burning its own deadline, and losing the park would replay
