@@ -80,10 +80,10 @@ Aggregates stay exact through deterministic INCARNATION keys
 a base's row range recomputes its deficit total from scratch and grows the
 live incarnation in place — the charge is always the recomputed total,
 never `live + delta`, so crash replays over-cover transiently instead of
-compounding. When ONE PASS observed the WHOLE range with no stat
-or charge errors, a smaller total mints incarnation n+1 charged exactly
-and deletes the stale GREATEST-pinned row (mint first — never a coverage
-gap), and a zero total deletes the row outright. Deletes are safe because
+compounding. When a FENCE-CONTINUOUS observation covered the WHOLE range
+with no stat or charge errors, a smaller total mints incarnation n+1
+charged exactly and deletes the stale GREATEST-pinned row (mint first —
+never a coverage gap), and a zero total deletes the row outright. Deletes are safe because
 only this job writes under the prefix and River's unique periodic jobs
 serialize passes fleet-wide; incarnation numbers restart only after the
 previous row was deleted, so a stale GREATEST-pinned row can never be
@@ -91,10 +91,22 @@ silently re-adopted (the round-6 counter hazard). The pending range parks
 WITH the durable cursor (base, started/dirty flags, running total), so a
 range spanning any number of budget-limited passes accumulates exactly
 for GROW charging, and crash replays re-derive identical totals from the
-parked cursor — but a RESUMED range never shrinks, releases, or proves a
-base (Codex round 19): rows settled in an earlier segment may have gone
-absent since, so those verdicts require a range observed start-to-end
-within one pass. Error-dirty ranges and traversals never shrink and never
+parked cursor. Shrink, release, and proof verdicts additionally require
+FENCE CONTINUITY (Codex rounds 19-20): the park snapshots the base
+group's summed shared adoption generation — after every bump the parking
+pass itself made — and the next pass re-reads it at load, before making
+any of its own; the job is fleet-unique, so a mismatch proves a FOREIGN
+mutation (restore, push, LFS write, adoption, retirement) landed while
+the cursor was parked, and the range is TAINTED: still exact for grow
+charging, never a verdict, right-sized by the next traversal instead. A
+verified chain of segments is as trustworthy as a single-pass observation
+— and without it, a base larger than one pass's class allowance could
+never complete unresumed, so its covers could never shrink and its legacy
+nonces would be bulk-renewed forever (round 20, P1). The fence sees only
+database-visible mutations: out-of-band byte loss during a park gap
+carries the same accepted residual as loss striking mid-pass behind an
+in-pass cursor — the next traversal rediscovers and re-covers it.
+Error-dirty ranges and traversals never shrink and never
 count as clean — but a dirty range whose running total went UNCHARGED
 (the charge itself failed) gets one bounded grow-only retry at range end,
 forced past the per-pass denial memo (Codex round 8): an under-counted
@@ -123,11 +135,13 @@ periodic same-key TTL refresh, which overwrites the row's owner, as new
 deficit and re-added it each pass toward a wedged admission. Instead each
 nonce row IS its own cover: it rides the pass-start bulk touch (Codex
 round 15: a nonce minted just behind the cursor must not lapse before the
-rotation ever reaches it) until BOTH classes prove its base within ONE
-pass — a clean single-pass start-to-end range observation recomputes the
-base's true deficit from the registry itself and charges it into the
-deterministic head, and a row-less keyset gap proves a zero deficit the
-same way — at which point the ground truth subsumes whatever the nonce
+rotation ever reaches it) until BOTH classes' proofs complete in one
+pass — a clean fence-continuous start-to-end range observation (single
+pass, or resumed with the mutation fence verified across every park gap)
+recomputes the base's true deficit from the registry itself and charges
+it into the deterministic head, and a row-less keyset gap proves a zero
+deficit the same way — at which point the ground truth subsumes whatever
+the nonce
 aggregated and the folded sentinel is CAS'd into the row's owner column,
 guarded on the LISTED (owner, bytes): every re-charge overwrites owner
 and GREATEST-grows bytes, so a CAS miss proves a newer reliance arrived

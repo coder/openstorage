@@ -121,6 +121,11 @@ type AbsenceRegistry interface {
 	// BumpLFSAdoptionGen invalidates cached usage floors after a cover
 	// made absent bytes visible to admission.
 	BumpLFSAdoptionGen(ctx context.Context, repo string) error
+	// LFSAdoptionGen reads one repo's shared adoption generation — the
+	// mutation fence resumed ranges verify across park gaps (Codex
+	// round 20 on PR #132): summed over the base group, any bump while
+	// the cursor was parked taints the pending range's observation.
+	LFSAdoptionGen(ctx context.Context, repo string) (int64, error)
 	// ReservePackBytes is the ref.RestoreCoverStore seam
 	// ref.ReserveRestoreCover charges covers through.
 	ReservePackBytes(ctx context.Context, group []string, packs []ref.Pack, owner string, usageFloor, floorGen, quotaBytes int64, ttl time.Duration) (ref.ReserveDecision, error)
@@ -302,12 +307,12 @@ type AbsenceReconciler struct {
 	// records them as-listed, and the pass end folds exactly those whose
 	// base BOTH rotations proved clean within this same pass.
 	legacyRows []ref.AbsenceCoverRow
-	// cleanBases[class][base] records that class's rotation observed a
-	// clean single-pass proof for base THIS PASS: a start-to-end range
-	// observation with no stat/charge errors that began and ended in
-	// this pass, or a row-less keyset gap. Only same-pass proofs may
-	// retire legacy covers — a proof spanning a pass boundary can be
-	// stale against storage loss (Codex round 19, P2).
+	// cleanBases[class][base] records that class's rotation completed a
+	// clean proof for base THIS PASS: a fence-continuous start-to-end
+	// range observation with no stat/charge errors — single-pass, or
+	// resumed with the base group's mutation fence verified across
+	// every park gap (Codex rounds 19-20) — or a row-less keyset gap.
+	// Only proofs completing this pass may retire legacy covers.
 	cleanBases map[string]map[string]bool
 	// touchFailed records that this pass's bulk cover renewal FAILED:
 	// the rotation cursors must not be re-stamped by saveState (Codex
@@ -339,8 +344,8 @@ type absenceCursorState struct {
 	Dirty bool `json:"dirty"`
 	// HasClean records that some traversal completed with no errors
 	// since the scan state was minted (observability; legacy-cover
-	// retirement gates on SAME-PASS per-base proofs, not this flag —
-	// see foldRedundantLegacy).
+	// retirement gates on per-base fence-continuous proofs, not this
+	// flag — see foldRedundantLegacy).
 	HasClean bool `json:"has_clean"`
 	// The pending base range parks WITH the cursor (Codex round 2 on PR
 	// #132, P1): a base whose rows span multiple phase allocations must
@@ -349,13 +354,26 @@ type absenceCursorState struct {
 	// recomputed total, never additive) could never reach the true sum.
 	// Parking the whole tracker keeps multi-pass ranges EXACT for GROW
 	// charging; shrink, release, and legacy-retirement proofs
-	// additionally require the range observed start-to-end within ONE
-	// pass (the resumed flag — Codex round 19, P2: rows settled in an
-	// earlier segment may have gone absent since).
+	// additionally require FENCE CONTINUITY (Codex rounds 19-20):
+	// RangeGen snapshots the base group's summed adoption generation at
+	// park time — after every bump the parking pass itself made — and
+	// loadState re-reads it at the next pass start, before this job
+	// makes any. The job is fleet-unique, so a mismatch proves a
+	// FOREIGN mutation (restore, upload, adoption, delete) landed while
+	// the cursor was parked, and the range is TAINTED: still exact for
+	// grow charging, never a shrink/release/fold proof. A verified
+	// chain of segments is as trustworthy as a single-pass observation
+	// — without it, a base larger than one pass's class allowance could
+	// NEVER prove itself and its legacy covers would be bulk-renewed
+	// forever (round 20, P1). RangeGenOK distinguishes a real snapshot
+	// from a park whose fence read failed (conservatively tainted).
 	RangeBase    string `json:"range_base,omitempty"`
 	RangeStarted bool   `json:"range_started,omitempty"`
 	RangeDirty   bool   `json:"range_dirty,omitempty"`
 	RangeRunning int64  `json:"range_running,omitempty"`
+	RangeGen     int64  `json:"range_gen,omitempty"`
+	RangeGenOK   bool   `json:"range_gen_ok,omitempty"`
+	RangeTainted bool   `json:"range_tainted,omitempty"`
 	// Quota records whether quota enforcement was ON when the cursor
 	// parked (Codex round 17, security): quota-off passes advance the
 	// cursors but skip all cover maintenance, so a cursor parked under
@@ -378,13 +396,13 @@ type rangeTracker struct {
 	// running total may under-count, so shrink/release must not fire.
 	dirty   bool
 	running int64
-	// resumed: the range was restored from a parked cursor, so its
-	// observation spans a pass boundary (Codex round 19, P2): the
-	// accumulated total stays EXACT for grow charging, but rows settled
-	// in an earlier pass's segment may have gone absent since — no DB
-	// fence can see storage loss — so shrink, release, and legacy-fold
-	// proofs require a range started AND ended within one pass.
-	resumed bool
+	// tainted: the range's observation lost fence continuity across a
+	// park gap (Codex rounds 19-20): a foreign mutation bumped the base
+	// group's adoption generation while the cursor was parked, or the
+	// fence could not be read/written. The accumulated total stays
+	// EXACT for grow charging, but shrink, release, and legacy-fold
+	// proofs must wait for the next traversal's continuous observation.
+	tainted bool
 }
 
 // absenceIncarnationKey builds the deterministic aggregate cover key for
@@ -531,6 +549,31 @@ func (r *AbsenceReconciler) loadState(ctx context.Context, errs *boundedErrs) {
 		if reason != "" {
 			*c.into = absenceCursorState{}
 			r.logger.Warn("absence reconcile: restarting rotation from origin", "scope", c.scope, "reason", reason)
+			continue
+		}
+		// Fence continuity for the parked range (Codex round 20, P1):
+		// this runs BEFORE the pass makes any generation bump of its
+		// own, and the park snapshot ran AFTER the previous pass's last
+		// — the job is fleet-unique, so the window between them is
+		// exactly the parked gap, and a mismatch proves a FOREIGN
+		// mutation. A verified resume keeps the range proof-eligible:
+		// a base larger than one pass's class allowance can only ever
+		// complete resumed, and a blanket denial would bulk-renew its
+		// legacy covers forever. Taint is sticky until the range ends.
+		if c.into.RangeStarted && !c.into.RangeTainted {
+			reason := ""
+			if !c.into.RangeGenOK {
+				reason = "range parked without a fence snapshot"
+			} else if gen, err := r.rangeFence(ctx, c.into.RangeBase); err != nil {
+				errs.add(fmt.Errorf("absence reconcile: read %s range fence: %w", c.scope, err))
+				reason = "range fence unreadable"
+			} else if gen != c.into.RangeGen {
+				reason = "base group mutated while parked"
+			}
+			if reason != "" {
+				c.into.RangeTainted = true
+				r.logger.Info("absence reconcile: pending range tainted", "scope", c.scope, "base", c.into.RangeBase, "reason", reason)
+			}
 		}
 	}
 	if st, ok, err := r.registry.GetJobScanState(ctx, ref.ScanJobAbsence, ref.ScanScopeAbsenceRenewal); err != nil {
@@ -562,6 +605,19 @@ func (r *AbsenceReconciler) saveState(ctx context.Context, errs *boundedErrs) {
 			from  *absenceCursorState
 		}{{ref.ScanScopeAbsenceLFS, &r.lfs}, {ref.ScanScopeAbsencePacks, &r.packs}} {
 			c.from.Quota = r.quotaEnforced // see absenceCursorState.Quota
+			// Snapshot the fence WITH the park (Codex round 20): read
+			// after every generation bump this pass made, so only a
+			// foreign mutation inside the parked gap can move it. An
+			// unreadable fence parks without one — the resume taints,
+			// strictly a deferral.
+			c.from.RangeGen, c.from.RangeGenOK = 0, false
+			if c.from.RangeStarted && !c.from.RangeTainted && r.quotaEnforced {
+				if gen, err := r.rangeFence(sctx, c.from.RangeBase); err != nil {
+					errs.add(fmt.Errorf("absence reconcile: snapshot %s range fence: %w", c.scope, err))
+				} else {
+					c.from.RangeGen, c.from.RangeGenOK = gen, true
+				}
+			}
 			payload, err := json.Marshal(c.from)
 			assertf(err == nil, "absence reconcile: marshal %s cursor: %v", c.scope, err)
 			if err := r.registry.PutJobScanState(sctx, ref.ScanJobAbsence, c.scope, string(payload), 0); err != nil {
@@ -572,6 +628,31 @@ func (r *AbsenceReconciler) saveState(ctx context.Context, errs *boundedErrs) {
 	if err := r.registry.PutJobScanState(sctx, ref.ScanJobAbsence, ref.ScanScopeAbsenceRenewal, r.renewCursor, r.passes); err != nil {
 		errs.add(fmt.Errorf("absence reconcile: park renewal cursor: %w", err))
 	}
+}
+
+// rangeFence reads the mutation fence for one base's pending range: the
+// base group's summed shared adoption generation (the same group every
+// cover charge pins). Every DB-visible mutation that could change a
+// base's registered rows or their compensation — restores, uploads,
+// adoptions, retirements, cover lifecycle — bumps a member's generation,
+// so an unchanged sum across a park gap proves the group was quiescent
+// while no segment was watching (Codex round 20 on PR #132).
+// Out-of-band byte loss has no DB event and is invisible to ANY fence;
+// it carries the same accepted residual as a loss striking mid-pass
+// behind an in-pass cursor: rediscovered and re-covered by the next
+// traversal.
+func (r *AbsenceReconciler) rangeFence(ctx context.Context, base string) (int64, error) {
+	assertf(base != "", "rangeFence: empty base")
+	var sum int64
+	for _, repo := range blob.QuotaRepoGroup(base) {
+		gen, err := r.registry.LFSAdoptionGen(ctx, repo)
+		if err != nil {
+			return 0, err
+		}
+		assertf(gen >= 0, "rangeFence: negative generation %d for %s", gen, repo)
+		sum += gen
+	}
+	return sum, nil
 }
 
 // Run executes one bounded reconciliation pass. Order (Codex round 1 on
@@ -608,9 +689,9 @@ func (r *AbsenceReconciler) Run(ctx context.Context) (AbsenceReport, error) {
 		charged := r.packPhase(ctx, half, &report, st, &errs)
 		r.lfsPhase(ctx, remaining-charged, &report, st, &errs)
 	}
-	// Retire legacy nonce covers whose base both rotations just proved
-	// clean within THIS pass (Codex round 19) — after the phases, so
-	// every same-pass proof is in.
+	// Retire legacy nonce covers whose base both rotations' proofs
+	// completed THIS pass (Codex rounds 19-20) — after the phases, so
+	// every proof is in.
 	r.foldRedundantLegacy(ctx, &report, st, &errs)
 	r.passes++
 	r.saveState(ctx, &errs)
@@ -649,8 +730,8 @@ func (r *AbsenceReconciler) Run(ctx context.Context) (AbsenceReport, error) {
 // nonce-keyed covers from pre-#125 workers are RECORDED for retirement
 // (recordLegacyCover, Codex rounds 4+19): each nonce row is itself the
 // cover for whatever it aggregates, kept alive by the pass-start bulk
-// touch until both rotations prove it redundant within one pass
-// (foldRedundantLegacy) — an old replica can mint or re-charge nonces at
+// touch until both rotations prove it redundant (foldRedundantLegacy)
+// — an old replica can mint or re-charge nonces at
 // any point of a mixed roll, and deleting or aging them out early could
 // lapse them while the rotation is still far away. Renewal
 // is the correctness core (a lapsed cover silently reopens the admission
@@ -828,23 +909,25 @@ func (r *AbsenceReconciler) recordLegacyCover(row *ref.AbsenceCoverRow, report *
 }
 
 // foldRedundantLegacy retires this pass's recorded legacy nonce covers
-// whose base BOTH rotations proved clean WITHIN THIS SAME PASS (Codex
-// round 19): a clean single-pass start-to-end range observation recomputes
-// the base's true current deficit from the registry itself and charges it
-// into the deterministic head — ground truth that subsumes whatever the
-// nonce once aggregated — and a row-less keyset gap proves a zero deficit
-// the same way. Only then is the nonce redundant and safe to let decay.
-// The fold is a CAS on the LISTED (owner, bytes): every old-replica
-// re-charge overwrites owner and GREATEST-grows bytes, so a CAS miss
-// proves a newer reliance arrived after the listing — it wins, the row
-// stays live (bulk-touched), and a later pass re-proves. Same-pass proof
-// only: a proof spanning a pass boundary can be stale against storage
-// loss that struck rows already behind the parked cursor (round 19, P2).
+// whose base BOTH rotations' proofs completed THIS PASS (Codex rounds
+// 19-20): a clean fence-continuous start-to-end range observation
+// recomputes the base's true current deficit from the registry itself and
+// charges it into the deterministic head — ground truth that subsumes
+// whatever the nonce once aggregated — and a row-less keyset gap proves a
+// zero deficit the same way. Only then is the nonce redundant and safe to
+// let decay. The fold is a CAS on the LISTED (owner, bytes): every
+// old-replica re-charge overwrites owner and GREATEST-grows bytes, so a
+// CAS miss proves a newer reliance arrived after the listing — it wins,
+// the row stays live (bulk-touched), and a later pass re-proves.
+// Multi-pass observations count exactly when the base group's mutation
+// fence held across every park gap (round 20, P1: a base larger than one
+// pass's class allowance can only ever complete resumed); a broken fence
+// taints the range and the retirement waits for the next traversal.
 func (r *AbsenceReconciler) foldRedundantLegacy(ctx context.Context, report *AbsenceReport, st *absencePassState, errs *boundedErrs) {
 	for i := range r.legacyRows {
 		row := &r.legacyRows[i]
 		if !r.cleanBases[absenceClassLFS][row.Base] || !r.cleanBases[absenceClassPacks][row.Base] {
-			continue // no same-pass double proof yet: stays live, retried later
+			continue // no completed double proof yet: stays live, retried later
 		}
 		if st.purged[row.Base] {
 			continue // the purge pipeline owns the base's rows
@@ -860,7 +943,7 @@ func (r *AbsenceReconciler) foldRedundantLegacy(ctx context.Context, report *Abs
 	}
 }
 
-// markCleanBase records a same-pass clean proof for one (class, base) —
+// markCleanBase records a completed clean proof for one (class, base) —
 // see cleanBases.
 func (r *AbsenceReconciler) markCleanBase(class, base string) {
 	if base == "" {
@@ -927,10 +1010,10 @@ func (r *AbsenceReconciler) rotationPhase(ctx context.Context, cur *absenceCurso
 	// under-accumulate and the cover could never grow to the true sum).
 	// The parked tracker carries base, started, dirty, and the running
 	// total, so ranges spanning any number of passes stay exact — for
-	// GROW charging; the resumed flag denies shrink/release/fold proofs
-	// (Codex round 19, P2: an earlier segment's rows may have gone
-	// absent since it was observed).
-	*tr = rangeTracker{class: tr.class, base: cur.RangeBase, started: cur.RangeStarted, dirty: cur.RangeDirty, running: cur.RangeRunning, resumed: cur.RangeStarted}
+	// GROW charging unconditionally, and for shrink/release/fold proofs
+	// exactly when loadState verified fence continuity across every park
+	// gap (Codex rounds 19-20; see absenceCursorState.RangeGen).
+	*tr = rangeTracker{class: tr.class, base: cur.RangeBase, started: cur.RangeStarted, dirty: cur.RangeDirty, running: cur.RangeRunning, tainted: cur.RangeTainted}
 	if tr.base == "" && !startedAtZero {
 		// Legacy parked cursor without range state (rows written before
 		// this fix): treat the pending range as unstarted, never exact.
@@ -938,9 +1021,9 @@ func (r *AbsenceReconciler) rotationPhase(ctx context.Context, cur *absenceCurso
 	}
 	assertf(startedAtZero == (tr.base == "" && !tr.started), "rotationPhase(%s): cursor/range state disagree (%q vs %+v)", tr.class, startRepo, tr)
 	// Park the tracker back into the durable state on every exit; the
-	// end-of-pass saveState persists it.
+	// end-of-pass saveState persists it (and snapshots the fence).
 	defer func() {
-		cur.RangeBase, cur.RangeStarted, cur.RangeDirty, cur.RangeRunning = tr.base, tr.started, tr.dirty, tr.running
+		cur.RangeBase, cur.RangeStarted, cur.RangeDirty, cur.RangeRunning, cur.RangeTainted = tr.base, tr.started, tr.dirty, tr.running, tr.tainted
 		tr.abandon()
 	}()
 	for charged < budget {
@@ -993,7 +1076,7 @@ func (r *AbsenceReconciler) rotationPhase(ctx context.Context, cur *absenceCurso
 				prevBase := tr.base
 				r.endRange(ctx, tr, report, st, errs)
 				r.releaseZeroRowCovers(ctx, tr.class, coverBases, legacyBases, prevBase, b, report, errs)
-				tr.base, tr.started, tr.dirty, tr.running, tr.resumed = b, true, false, 0, false
+				tr.base, tr.started, tr.dirty, tr.running, tr.tainted = b, true, false, 0, false
 			}
 			charged += settle[i]()
 			cur.AfterRepo, cur.AfterKey = repos[i], keys[i]
@@ -1153,7 +1236,7 @@ func (r *AbsenceReconciler) tickTraversal(cur *absenceCursorState, class string,
 // the running total is partial). Grow charges already made remain valid —
 // they only ever raise a cover toward the true total.
 func (tr *rangeTracker) abandon() {
-	tr.base, tr.started, tr.dirty, tr.running, tr.resumed = "", false, false, 0, false
+	tr.base, tr.started, tr.dirty, tr.running, tr.tainted = "", false, false, 0, false
 }
 
 // endRange completes the pending base range: when the WHOLE range was
@@ -1161,7 +1244,7 @@ func (tr *rangeTracker) abandon() {
 // the cover lifecycle may shrink or release the base's aggregate.
 func (r *AbsenceReconciler) endRange(ctx context.Context, tr *rangeTracker, report *AbsenceReport, st *absencePassState, errs *boundedErrs) {
 	base, class := tr.base, tr.class
-	started, dirty, running, resumed := tr.started, tr.dirty, tr.running, tr.resumed
+	started, dirty, running, tainted := tr.started, tr.dirty, tr.running, tr.tainted
 	tr.abandon()
 	if base == "" || !started || !r.quotaEnforced {
 		return
@@ -1180,22 +1263,24 @@ func (r *AbsenceReconciler) endRange(ctx context.Context, tr *rangeTracker, repo
 		}
 		return
 	}
-	if resumed {
-		// Observed across a pass boundary (Codex round 19, P2): exact
-		// for the grow charges already made, but rows settled in an
-		// earlier segment may have gone absent since — never shrink,
-		// release, or prove a fold on it. The next traversal's
-		// single-pass observation right-sizes.
+	if tainted {
+		// The observation lost fence continuity across a park gap
+		// (Codex rounds 19-20): a foreign mutation changed the base
+		// group while no segment was watching, so the accumulated total
+		// may be stale against it — exact for the grow charges already
+		// made, but never a shrink, release, or fold proof. The next
+		// traversal's fence-continuous observation right-sizes.
 		return
 	}
 	if st.purged[base] || st.coverSkip[base] {
 		return // the total may under-count: never shrink on it
 	}
-	// A clean single-pass start-to-end observation: the base's true
+	// A clean fence-continuous start-to-end observation — one pass, or
+	// a verified chain of segments (Codex rounds 19-20): the base's true
 	// current deficit was recomputed from the registry and is charged
 	// (chargeDeficit grows the head incrementally; a charge failure
 	// dirties the range) — this class's ground-truth proof for legacy
-	// retirement (Codex round 19).
+	// retirement.
 	r.markCleanBase(class, base)
 	head, ok := r.resolveHead(ctx, base, class, st, errs)
 	if !ok || head.key == "" {

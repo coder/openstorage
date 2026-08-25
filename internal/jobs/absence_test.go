@@ -475,6 +475,7 @@ func TestAbsenceReconcile_RenewalNeverLapsesOnBudget(t *testing.T) {
 // un-cover still-missing rows in the skipped prefix.
 func TestAbsenceReconcile_ResumedRangeNeverShrinks(t *testing.T) {
 	f := newSweepFixture(t)
+	ctx := context.Background()
 	base := "repo-resume"
 	// Two ABSENT rows sorting first, two present rows after them.
 	registerLFS(t, f, base, blob.LFSKey(base, absenceOID('a')), 10)
@@ -488,7 +489,7 @@ func TestAbsenceReconcile_ResumedRangeNeverShrinks(t *testing.T) {
 	// Pass 1 (budget 8 → LFS allocation 4): examines exactly the two
 	// absent rows (2 units each), covers 20, parks mid-range.
 	workerA := testReconciler(t, f, true, 8)
-	report, err := workerA.Run(context.Background())
+	report, err := workerA.Run(ctx)
 	if err != nil {
 		t.Fatalf("worker A: %v", err)
 	}
@@ -499,20 +500,135 @@ func TestAbsenceReconcile_ResumedRangeNeverShrinks(t *testing.T) {
 		t.Fatalf("reserved = %d, want 20", got)
 	}
 
+	// A FOREIGN mutation lands while the cursor is parked (an
+	// application restore bumping the base's floor generation): the
+	// resumed range loses fence continuity.
+	if err := absenceRegistry(t, f).BumpLFSAdoptionGen(ctx, base); err != nil {
+		t.Fatalf("foreign bump: %v", err)
+	}
+
 	// Pass 2 (fresh worker): resumes on the present suffix and reaches
-	// the range end with a zero running total — but the range began
-	// before this pass, so the cover MUST survive.
+	// the range end with running still 20 — but the observation is
+	// TAINTED, so no shrink, release, or proof may fire.
 	pinLFSLeader(t, f)
 	workerB := testReconciler(t, f, true, 100)
-	report, err = workerB.Run(context.Background())
+	report, err = workerB.Run(ctx)
 	if err != nil {
 		t.Fatalf("worker B: %v", err)
 	}
 	if report.CoversReleased != 0 || report.CoversRotated != 0 {
-		t.Fatalf("worker B report = %+v, want no shrink from a resumed partial range", report)
+		t.Fatalf("worker B report = %+v, want no shrink from a tainted resumed range", report)
 	}
 	if got := ledgerReserved(t, f, base); got != 20 {
 		t.Fatalf("reserved = %d, want the prefix losses still covered", got)
+	}
+}
+
+// TestAbsenceReconcile_MultiPassBaseRetiresLegacy (Codex round 20, P1): a
+// base whose row range exceeds one pass's class allowance can only ever
+// complete its range RESUMED — a blanket resumed-proof denial would
+// bulk-renew its legacy nonce forever. With the base group's mutation
+// fence verified across the park gap, the resumed completion is a
+// legitimate clean proof and the nonce retires.
+func TestAbsenceReconcile_MultiPassBaseRetiresLegacy(t *testing.T) {
+	f := newSweepFixture(t)
+	ctx := context.Background()
+	base := "repo-multipass"
+	// Six present rows: more than pass 1's LFS allocation can settle.
+	for i := byte(0); i < 6; i++ {
+		key := blob.LFSKey(base, absenceOID('a'+i))
+		registerLFS(t, f, base, key, 10)
+		f.upload(key, strings.Repeat("x", 10))
+	}
+	legacyKey := ref.AbsenceCoverPrefix + base + "/" + ref.NewReservationOwner()
+	if err := ref.ReserveRestoreCover(ctx, absenceRegistry(t, f), blob.QuotaRepoGroup(base), legacyKey, 555, time.Hour); err != nil {
+		t.Fatalf("seed legacy cover: %v", err)
+	}
+
+	// Pass 1 parks mid-range (budget 8: the nonce renewal charges 1,
+	// the LFS allocation settles 4 of 6 rows). The packs gap proof
+	// alone must not retire the nonce.
+	pinLFSLeader(t, f)
+	workerA := testReconciler(t, f, true, 8)
+	report, err := workerA.Run(ctx)
+	if err != nil {
+		t.Fatalf("worker A: %v", err)
+	}
+	if report.CoversDecaying != 0 {
+		t.Fatalf("pass 1 report = %+v, want no retirement before the LFS range completes", report)
+	}
+
+	// Pass 2 (fresh worker — another replica): the fence held across
+	// the gap, the resumed range completes cleanly, and the double
+	// proof retires the nonce.
+	workerB := testReconciler(t, f, true, 100)
+	report, err = workerB.Run(ctx)
+	if err != nil {
+		t.Fatalf("worker B: %v", err)
+	}
+	if report.CoversDecaying != 1 {
+		t.Fatalf("pass 2 report = %+v, want the nonce retired on the fence-continuous proof", report)
+	}
+	if got := ledgerReserved(t, f, base); got != 555 {
+		t.Fatalf("reserved = %d, want only the decaying nonce (no deficits, no heads)", got)
+	}
+}
+
+// TestAbsenceReconcile_GapMutationDefersLegacyRetirement (Codex rounds
+// 19-20): a foreign mutation landing while the cursor is parked mid-range
+// breaks fence continuity — the resumed completion must NOT prove the
+// base (rows may have changed while no segment was watching), so the
+// nonce stays live. The next traversal's continuous observation retires
+// it.
+func TestAbsenceReconcile_GapMutationDefersLegacyRetirement(t *testing.T) {
+	f := newSweepFixture(t)
+	ctx := context.Background()
+	base := "repo-gap-mutation"
+	for i := byte(0); i < 6; i++ {
+		key := blob.LFSKey(base, absenceOID('a'+i))
+		registerLFS(t, f, base, key, 10)
+		f.upload(key, strings.Repeat("x", 10))
+	}
+	legacyKey := ref.AbsenceCoverPrefix + base + "/" + ref.NewReservationOwner()
+	if err := ref.ReserveRestoreCover(ctx, absenceRegistry(t, f), blob.QuotaRepoGroup(base), legacyKey, 555, time.Hour); err != nil {
+		t.Fatalf("seed legacy cover: %v", err)
+	}
+
+	// Pass 1 parks mid-range; a foreign mutation bumps the group while
+	// parked.
+	pinLFSLeader(t, f)
+	workerA := testReconciler(t, f, true, 8)
+	if _, err := workerA.Run(ctx); err != nil {
+		t.Fatalf("worker A: %v", err)
+	}
+	if err := absenceRegistry(t, f).BumpLFSAdoptionGen(ctx, base); err != nil {
+		t.Fatalf("foreign bump: %v", err)
+	}
+
+	// Pass 2: the resumed range completes but is tainted — no proof, no
+	// retirement.
+	workerB := testReconciler(t, f, true, 100)
+	report, err := workerB.Run(ctx)
+	if err != nil {
+		t.Fatalf("worker B: %v", err)
+	}
+	if report.CoversDecaying != 0 {
+		t.Fatalf("pass 2 report = %+v, want retirement deferred on the broken fence", report)
+	}
+
+	// Pass 3: the next observation completes with the fence intact (its
+	// fresh range began in pass 2's wrapped tail and the park gap
+	// stayed quiet) and retires the nonce.
+	workerC := testReconciler(t, f, true, 100)
+	report, err = workerC.Run(ctx)
+	if err != nil {
+		t.Fatalf("worker C: %v", err)
+	}
+	if report.CoversDecaying != 1 {
+		t.Fatalf("pass 3 report = %+v, want the nonce retired after the continuous re-observation", report)
+	}
+	if got := ledgerReserved(t, f, base); got != 555 {
+		t.Fatalf("reserved = %d, want only the decaying nonce", got)
 	}
 }
 
