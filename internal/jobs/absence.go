@@ -44,16 +44,16 @@ package jobs
 //     Fresh incidents mint their first incarnation immediately, so a new
 //     loss is admission-visible at discovery.
 //   - SHRINK/RELEASE: when a traversal observed a base's ENTIRE row range
-//     within one pass with no stat/charge errors, its running total is
-//     exact. A smaller total mints incarnation n+1 charged exactly and
-//     deletes the old row (mint first — never a coverage gap); a zero
-//     total deletes the row outright. Deletes are safe because the
-//     reconciler is the only writer under the prefix and River's unique
-//     jobs serialize passes fleet-wide. Ranges that span pass boundaries
-//     skip evaluation (their in-memory running total is partial) and shed
-//     healed bytes on a later traversal; a base whose row count exceeds
-//     one pass's phase allocation sheds only after a budget raise — the
-//     documented sizing residual.
+//     with no stat/charge errors, its running total is exact. A smaller
+//     total mints incarnation n+1 charged exactly and deletes the old row
+//     (mint first — never a coverage gap); a zero total deletes the row
+//     outright. Deletes are safe because the reconciler is the only
+//     writer under the prefix and River's unique jobs serialize passes
+//     fleet-wide. The pending range PARKS WITH the durable cursor (base,
+//     started flag, dirty flag, running total — Codex round 2), so a
+//     range spanning any number of budget-limited passes accumulates and
+//     evaluates exactly; crash replays re-derive the same totals from the
+//     parked cursor (idempotent, never compounding).
 //   - RENEW: the renewal phase re-charges each (base, class)'s
 //     highest-incarnation live row from the durable listing — one unit per
 //     row, from ANY replica — deleting superseded lower incarnations left
@@ -289,6 +289,18 @@ type absenceCursorState struct {
 	// gate: after both classes have one clean traversal, every
 	// still-absent loss provably lives in incarnation keys.
 	HasClean bool `json:"has_clean"`
+	// The pending base range parks WITH the cursor (Codex round 2 on PR
+	// #132, P1): a base whose rows span multiple phase allocations must
+	// carry its partial deficit total across passes, or each resumed
+	// chunk would restart at zero and the grow charge (always the
+	// recomputed total, never additive) could never reach the true sum.
+	// Parking the whole tracker keeps multi-pass ranges EXACT: the
+	// range-end evaluation only needs an error-free observed
+	// start-to-end range, regardless of how many passes it spanned.
+	RangeBase    string `json:"range_base,omitempty"`
+	RangeStarted bool   `json:"range_started,omitempty"`
+	RangeDirty   bool   `json:"range_dirty,omitempty"`
+	RangeRunning int64  `json:"range_running,omitempty"`
 }
 
 // rangeTracker follows one rotation's current base range within a pass.
@@ -660,18 +672,27 @@ func (r *AbsenceReconciler) rotationPhase(ctx context.Context, cur *absenceCurso
 	startRepo, startKey := cur.AfterRepo, cur.AfterKey
 	startedAtZero := startRepo == "" && startKey == ""
 	wrapped := startedAtZero
-	// The pending range (if any) began before this pass: never evaluate
-	// it — its in-memory running total would be partial. Resuming
-	// mid-keyspace therefore pre-seeds the tracker with the CURSOR's own
-	// base, unstarted (Codex round 1, P1): without it the first resumed
-	// row would read as a range transition and the suffix's total would
-	// masquerade as the whole range's, shrinking covers that still
-	// protect rows in the skipped prefix.
-	*tr = rangeTracker{class: tr.class}
-	if !startedAtZero {
+	// Restore the pending range parked with the cursor (Codex rounds
+	// 1+2, P1): resuming mid-range must neither read the first resumed
+	// row as a range transition (the suffix's total would masquerade as
+	// the whole range's and shrink covers protecting the skipped prefix)
+	// nor restart the running total at zero (each resumed chunk would
+	// under-accumulate and the cover could never grow to the true sum).
+	// The parked tracker carries base, started, dirty, and the running
+	// total, so ranges spanning any number of passes stay exact.
+	*tr = rangeTracker{class: tr.class, base: cur.RangeBase, started: cur.RangeStarted, dirty: cur.RangeDirty, running: cur.RangeRunning}
+	if tr.base == "" && !startedAtZero {
+		// Legacy parked cursor without range state (rows written before
+		// this fix): treat the pending range as unstarted, never exact.
 		tr.base = baseOf(startRepo)
 	}
-	defer func() { tr.abandon() }()
+	assertf(startedAtZero == (tr.base == "" && !tr.started), "rotationPhase(%s): cursor/range state disagree (%q vs %+v)", tr.class, startRepo, tr)
+	// Park the tracker back into the durable state on every exit; the
+	// end-of-pass saveState persists it.
+	defer func() {
+		cur.RangeBase, cur.RangeStarted, cur.RangeDirty, cur.RangeRunning = tr.base, tr.started, tr.dirty, tr.running
+		tr.abandon()
+	}()
 	for charged < budget {
 		if ctx.Err() != nil {
 			errs.add(ctx.Err())

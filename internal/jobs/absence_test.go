@@ -933,3 +933,62 @@ func TestAbsenceIncarnationKeyRoundTrip(t *testing.T) {
 		t.Fatalf("foreign prefix parsed as a cover key")
 	}
 }
+
+// TestAbsenceReconcile_MultiPassRangeAccumulates (Codex round 2, P1): a
+// base whose missing rows span multiple phase allocations must accumulate
+// its deficit ACROSS passes — the pending range parks with the durable
+// cursor, so resumed chunks continue the running total instead of
+// restarting at zero (which could never grow the cover past one chunk's
+// subtotal). Once everything heals, a full clean traversal releases the
+// cover exactly.
+func TestAbsenceReconcile_MultiPassRangeAccumulates(t *testing.T) {
+	f := newSweepFixture(t)
+	base := "repo-multipass"
+	keys := make([]string, 4)
+	for i, b := range []byte{'a', 'b', 'c', 'd'} {
+		keys[i] = blob.LFSKey(base, absenceOID(b))
+		registerLFS(t, f, base, keys[i], 10) // all absent
+	}
+
+	// Budget 8 → LFS allocation 4 → two 2-unit absent rows per pass.
+	workerA := testReconciler(t, f, true, 8)
+	if _, err := workerA.Run(context.Background()); err != nil {
+		t.Fatalf("worker A: %v", err)
+	}
+	if got := ledgerReserved(t, f, base); got != 20 {
+		t.Fatalf("reserved after pass 1 = %d, want the first chunk's 20", got)
+	}
+
+	// A FRESH worker resumes mid-range: the parked running total (20)
+	// continues through the remaining rows, growing the cover to the
+	// true 40-byte sum. Pre-fix, the restarted total (10, 20) never
+	// exceeded the live 20 and the cover stayed under-reserved forever.
+	pinLFSLeader(t, f)
+	workerB := testReconciler(t, f, true, 8)
+	if _, err := workerB.Run(context.Background()); err != nil {
+		t.Fatalf("worker B: %v", err)
+	}
+	if got := ledgerReserved(t, f, base); got != 40 {
+		t.Fatalf("reserved after pass 2 = %d, want the accumulated 40", got)
+	}
+
+	// Everything heals: a fresh worker's full clean traversal re-derives
+	// a zero total and releases the cover outright.
+	for _, key := range keys {
+		if got := f.upload(key, strings.Repeat("h", 10)); got != 10 {
+			t.Fatalf("heal %s: %d bytes", key, got)
+		}
+	}
+	pinLFSLeader(t, f)
+	workerC := testReconciler(t, f, true, 100)
+	report, err := workerC.Run(context.Background())
+	if err != nil {
+		t.Fatalf("worker C: %v", err)
+	}
+	if report.CoversReleased != 1 {
+		t.Fatalf("worker C report = %+v, want the healed cover released", report)
+	}
+	if got := ledgerReserved(t, f, base); got != 0 {
+		t.Fatalf("reserved after heal = %d, want 0", got)
+	}
+}

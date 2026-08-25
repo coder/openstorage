@@ -63,17 +63,19 @@ Aggregates stay exact through deterministic INCARNATION keys
 a base's row range recomputes its deficit total from scratch and grows the
 live incarnation in place — the charge is always the recomputed total,
 never `live + delta`, so crash replays over-cover transiently instead of
-compounding. When a traversal observed the WHOLE range within one pass
-with no stat or charge errors, a smaller total mints incarnation n+1
-charged exactly and deletes the stale GREATEST-pinned row (mint first —
-never a coverage gap), and a zero total deletes the row outright. Deletes
-are safe because only this job writes under the prefix and River's unique
-periodic jobs serialize passes fleet-wide; incarnation numbers restart
-only after the previous row was deleted, so a stale GREATEST-pinned row
-can never be silently re-adopted (the round-6 counter hazard). Ranges
-that span pass boundaries skip shrink evaluation (their in-memory totals
-are partial) and shed healed bytes on a later traversal; error-dirty
-traversals never shrink and never count as clean. Shrink latency is
+compounding. When a traversal observed the WHOLE range with no stat
+or charge errors, a smaller total mints incarnation n+1 charged exactly
+and deletes the stale GREATEST-pinned row (mint first — never a coverage
+gap), and a zero total deletes the row outright. Deletes are safe because
+only this job writes under the prefix and River's unique periodic jobs
+serialize passes fleet-wide; incarnation numbers restart only after the
+previous row was deleted, so a stale GREATEST-pinned row can never be
+silently re-adopted (the round-6 counter hazard). The pending range parks
+WITH the durable cursor (base, started/dirty flags, running total), so a
+range spanning any number of budget-limited passes accumulates and
+evaluates exactly, and crash replays re-derive identical totals from the
+parked cursor; error-dirty ranges and traversals never shrink and never
+count as clean. Shrink latency is
 therefore one rotation, which only delays convergence, never visibility.
 Renewal timing is enforced end to end (Codex round 3, security): covers
 renew at pass starts, periodic ticks that fire mid-pass coalesce (River
@@ -98,12 +100,9 @@ continuity per-replica on multi-replica PostgreSQL fleets. Both now live
 in durable state — cursors in `job_scan_state`, tracking in the cover
 rows themselves — so any replica renews every cover and resumes the one
 fleet-shared rotation. The remaining residual is narrower: a row whose
-settlement stat-errors on every traversal keeps its base's traversals
-dirty, so heals in that base shed only after a clean traversal (loud via
-`stat_errors`, conservative direction), and a base whose row range
-exceeds one pass's rotation allocation never completes in-pass range
-evaluation, so its heals shed only after a budget raise (the documented
-sizing rule).
+settlement stat-errors on every traversal keeps its base's ranges dirty,
+so heals in that base shed only after a clean traversal (loud via
+`stat_errors`, conservative direction).
 
 A genuine loss is charged through the existing round-57/58 seam,
 `ref.ReserveRestoreCover`, under the canonical spelling plus
