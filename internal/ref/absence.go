@@ -42,6 +42,11 @@ type AbsenceCoverRow struct {
 	Base string
 	// Bytes is the row's reserved size (GREATEST-pinned across charges).
 	Bytes int64
+	// Folded reports the row carries the AbsenceFoldedOwner sentinel: its
+	// total is provably folded into the deterministic incarnations and no
+	// re-charge has arrived since (every re-charge overwrites owner).
+	// Meaningful for legacy nonce rows; deterministic rows read false.
+	Folded bool
 }
 
 // AbsenceLFSRow is one registered LFS object as the absence reconciler
@@ -139,12 +144,12 @@ func (s *PG) ListAbsenceCovers(ctx context.Context, afterRaw string, limit int, 
 	// the refs_repo_name_c pattern. Foreign spellings are excluded in
 	// SQL so a page can never filter to empty while covers remain.
 	rows, err := s.pool.Query(ctx, `
-SELECT key, repo, bytes FROM pack_reservations
+SELECT key, repo, bytes, owner = $6 FROM pack_reservations
 WHERE key COLLATE "C" > $1 AND key COLLATE "C" < $2
   AND right(key, $3) = $4
   AND created_at > now() - make_interval(secs => $5)
-ORDER BY key COLLATE "C" ASC LIMIT $6`,
-		afterRaw, absenceCoverRangeEnd, len(absenceCoverRawSuffix), absenceCoverRawSuffix, ttl.Seconds(), limit)
+ORDER BY key COLLATE "C" ASC LIMIT $7`,
+		afterRaw, absenceCoverRangeEnd, len(absenceCoverRawSuffix), absenceCoverRawSuffix, ttl.Seconds(), AbsenceFoldedOwner, limit)
 	if err != nil {
 		return nil, fmt.Errorf("list absence covers: %w", err)
 	}
@@ -152,7 +157,7 @@ ORDER BY key COLLATE "C" ASC LIMIT $6`,
 	var out []AbsenceCoverRow
 	for rows.Next() {
 		var r AbsenceCoverRow
-		if err := rows.Scan(&r.RawKey, &r.Base, &r.Bytes); err != nil {
+		if err := rows.Scan(&r.RawKey, &r.Base, &r.Bytes, &r.Folded); err != nil {
 			return nil, err
 		}
 		var ok bool

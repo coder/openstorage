@@ -281,17 +281,6 @@ type AbsenceReconciler struct {
 	// proves no live cover exists).
 	liveCovers      map[string]map[string]liveCover
 	renewalComplete bool
-	// migratedLegacy memoizes the byte WATERMARK this PROCESS already
-	// folded per nonce-keyed cover. Purely an optimization: every fresh
-	// worker re-folds each live nonce once (GREATEST-safe over-cover the
-	// rotation right-sizes within one clean range), but re-folding every
-	// pass would inflate and re-rotate the incarnation endlessly while
-	// the nonce decays. A watermark, not a boolean (Codex round 7, P1):
-	// an old replica can re-grow the same nonce mid-roll AFTER this
-	// process folded it, and a key-only memo would strand the growth in
-	// a decaying row the incarnations never absorbed. Process-lifetime,
-	// deliberately not per-pass — correctness never depends on it.
-	migratedLegacy map[string]int64
 	// lfsRange/packsRange track the base range each rotation is
 	// streaming through, in memory only: shrink/release verdicts are
 	// evaluated exclusively for ranges observed START to END within one
@@ -399,14 +388,13 @@ func NewAbsenceReconciler(registry AbsenceRegistry, blobs BlobStatter, quotaEnfo
 		passTimeout = quarter // see absencePassTimeout: renewal gap ≤ TTL
 	}
 	return &AbsenceReconciler{
-		registry:       registry,
-		blobs:          blobs,
-		quotaEnforced:  quotaEnforced,
-		budget:         budget,
-		coverTTL:       coverTTL,
-		logger:         logger,
-		passTimeout:    passTimeout,
-		migratedLegacy: make(map[string]int64),
+		registry:      registry,
+		blobs:         blobs,
+		quotaEnforced: quotaEnforced,
+		budget:        budget,
+		coverTTL:      coverTTL,
+		logger:        logger,
+		passTimeout:   passTimeout,
 	}
 }
 
@@ -734,37 +722,24 @@ func (r *AbsenceReconciler) renewCovers(ctx context.Context, budget int64, repor
 // classes' deficits with no class split (Codex round 5, P1), so the total
 // folds into BOTH class incarnations: each class's own next clean range
 // right-sizes (or row-less-releases) its copy, and until then the transient
-// over-cover only tightens admission. The nonce row then decays by TTL,
-// un-renewed — but only once both folds are proven durable; if either
-// fails, the legacy row is renewed as-is so nothing lapses, and the next
-// pass retries (grow-only merges make the retry idempotent). Reports
-// whether the row's protection is secured for this pass (folded, renewed,
-// or the base is purge-fenced); false means NEITHER fold nor renewal
-// landed (Codex round 8, P1) and the caller must park the renewal cursor
-// before the row.
+// over-cover only tightens admission. The row's OWN durable fold marker
+// (row.Folded, the sentinel owner) is the sole fold state — rounds 7, 13,
+// and the round-15 security follow-up each broke a process-local memo the
+// same way (an old replica's re-charge changed what the nonce means while
+// the memo said "done"), and the marker closes the class: every re-charge
+// overwrites owner, so a marked row is EXACTLY one with no reliance newer
+// than its last proven fold. Marked rows decay by TTL (skipped here);
+// un-marked rows fold (grow-only, idempotent) and mark, and the transient
+// per-pass re-fold while old replicas keep re-charging is bounded by the
+// rollout window. If a fold cannot be proven, the row is renewed as-is so
+// nothing lapses; the next pass retries. Reports whether the row's
+// protection is secured for this pass (decaying, folded, renewed, or the
+// base is purge-fenced); false means NEITHER fold nor renewal landed
+// (Codex round 8, P1) and the caller must park the renewal cursor before
+// the row.
 func (r *AbsenceReconciler) migrateLegacyCover(ctx context.Context, row *ref.AbsenceCoverRow, report *AbsenceReport, st *absencePassState, errs *boundedErrs) bool {
-	if folded, seen := r.migratedLegacy[row.RawKey]; seen && row.Bytes <= folded && r.foldedHeadsLive(ctx, row.Base, st, errs) {
-		// Already folded up to this total by this process: decay on. A
-		// LARGER listed total re-folds (Codex round 7, P1): an old
-		// replica can re-grow the same nonce mid-roll after the first
-		// fold, and that growth must reach the incarnations before the
-		// nonce decays. And the shortcut holds only while BOTH
-		// deterministic heads still exist in the ledger (Codex round 13,
-		// P1): the lifecycle can have released them after a heal — by
-		// ANY worker, so a process-local memo invalidation could not
-		// cover it — and an old replica re-charging the same nonce at an
-		// equal total is a NEW incident the released incarnations no
-		// longer compensate. Right-sized (smaller) heads still shortcut:
-		// a clean range's exact re-derivation supersedes the nonce's
-		// stale aggregate, and re-grown deficits follow normal discovery
-		// latency like any fresh loss. Re-mark on every visit (idempotent
-		// UPDATE): an old replica's re-charge overwrote owner, and an
-		// un-marked row would be bulk-touched forever instead of
-		// decaying once the fleet finishes rolling.
-		if err := r.registry.MarkAbsenceCoverFolded(ctx, row.RawKey); err != nil {
-			errs.add(fmt.Errorf("absence reconcile: re-mark legacy cover folded %s: %w", row.Key, err))
-		}
-		report.CoversDecaying++
+	if row.Folded {
+		report.CoversDecaying++ // no re-charge since the last proven fold
 		return true
 	}
 	migrated := true
@@ -776,15 +751,14 @@ func (r *AbsenceReconciler) migrateLegacyCover(ctx context.Context, row *ref.Abs
 	}
 	if migrated {
 		// Mark the nonce folded so the bulk touch stops renewing it and
-		// TTL decay begins (Codex round 15). Memoize only after the mark
-		// proves durable: an unmarked nonce keeps being bulk-touched, so
-		// on mark failure the next pass re-folds (grow-only, idempotent)
-		// and retries the mark — protection is intact either way.
+		// TTL decay begins (Codex round 15). On mark failure the nonce
+		// stays un-marked and bulk-touched, and the next pass re-folds
+		// (grow-only, idempotent) and retries the mark — protection is
+		// intact either way.
 		if err := r.registry.MarkAbsenceCoverFolded(ctx, row.RawKey); err != nil {
 			errs.add(fmt.Errorf("absence reconcile: mark legacy cover folded %s: %w", row.Key, err))
 			return true
 		}
-		r.migratedLegacy[row.RawKey] = row.Bytes
 		report.CoversDecaying++
 		return true
 	}
@@ -804,23 +778,6 @@ func (r *AbsenceReconciler) migrateLegacyCover(ctx context.Context, row *ref.Abs
 		return true
 	}
 	return false
-}
-
-// foldedHeadsLive reports whether BOTH deterministic class incarnations
-// exist in the ledger right now — the DB-authoritative validity check for
-// the legacy-fold memo shortcut (Codex round 13). A failed lookup reads as
-// not-live: the caller re-folds (grow-only, idempotent) or falls to the
-// nonce renewal, both fail-safe. A base with zero rows in one class
-// re-folds each pass while a live nonce keeps being re-charged (the gap
-// proof keeps releasing the row-less twin) — bounded by the nonce TTL,
-// rollout-only, and strictly conservative.
-func (r *AbsenceReconciler) foldedHeadsLive(ctx context.Context, base string, st *absencePassState, errs *boundedErrs) bool {
-	for _, class := range []string{absenceClassLFS, absenceClassPacks} {
-		if head, ok := r.resolveHead(ctx, base, class, st, errs); !ok || head.key == "" {
-			return false
-		}
-	}
-	return true
 }
 
 // foldIntoIncarnation grows one class's live incarnation to at least bytes,

@@ -870,8 +870,8 @@ func TestAbsenceReconcile_LegacyCoverMigrated(t *testing.T) {
 	}
 
 	// An old replica re-grows the SAME nonce mid-roll (Codex round 7,
-	// P1): the fold memo is a byte watermark, not a boolean — the grown
-	// total must re-fold into both incarnations before the nonce decays.
+	// P1): the re-charge overwrote the fold marker, so the grown total
+	// must re-fold into both incarnations before the nonce decays.
 	// Pass 3 re-inflates both incarnations to 900 and its own clean
 	// ranges right-size them again (a rotate per class proves the
 	// re-fold happened); the nonce decays at its grown total.
@@ -976,12 +976,11 @@ func TestAbsenceReconcile_DiscoveryRunsWhenCoversExceedBudget(t *testing.T) {
 }
 
 // TestAbsenceReconcile_LegacyRefoldAfterHeadsReleased (Codex round 13,
-// P1): the legacy-fold memo shortcut is process-local, but the
-// incarnations it vouches for can be RELEASED by any worker after a heal.
-// When an old replica then re-charges the SAME nonce at an EQUAL total
-// for a NEW incident, the shortcut must notice the missing heads
-// (DB-authoritative) and re-fold — otherwise the nonce decays with no
-// compensation left.
+// P1): the incarnations a fold produced can be RELEASED by any worker
+// after a heal. When an old replica then re-charges the SAME nonce at an
+// EQUAL total for a NEW incident, the re-charge un-marks the row (owner
+// overwritten), so the visit re-folds — otherwise the nonce would decay
+// with no compensation left.
 func TestAbsenceReconcile_LegacyRefoldAfterHeadsReleased(t *testing.T) {
 	f := newSweepFixture(t)
 	ctx := context.Background()
@@ -1005,7 +1004,7 @@ func TestAbsenceReconcile_LegacyRefoldAfterHeadsReleased(t *testing.T) {
 	}
 
 	// Every byte heals; pass 2 releases both incarnations (the nonce
-	// keeps decaying under the memo — its heads were live at renewal).
+	// keeps decaying under its durable fold marker).
 	f.upload(lfsKey, strings.Repeat("a", 100))
 	f.upload(packKey, strings.Repeat("b", 200))
 	report, err := r.Run(ctx)
@@ -1028,9 +1027,9 @@ func TestAbsenceReconcile_LegacyRefoldAfterHeadsReleased(t *testing.T) {
 		t.Fatalf("re-charge legacy cover: %v", err)
 	}
 
-	// Pass 3 (same process, same memo): the equal-total shortcut must
-	// fail its heads-live check and re-fold — both incarnations are
-	// re-minted and right-sized by the same pass's clean ranges.
+	// Pass 3 (same process): the re-charge un-marked the row, so the
+	// visit re-folds — both incarnations are re-minted and right-sized
+	// by the same pass's clean ranges.
 	report, err = r.Run(ctx)
 	if err != nil {
 		t.Fatalf("Run 3: %v", err)

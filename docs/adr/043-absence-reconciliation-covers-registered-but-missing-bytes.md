@@ -123,11 +123,13 @@ ever folds it), and an old replica's re-charge overwrites the sentinel —
 a re-charge is a new reliance, so the row re-enters the touch until the
 listing re-folds and re-marks it. Never
 deleted: an old replica may still depend on its own nonce rows mid-roll.
-Migration is memoized per worker process as a byte WATERMARK (not a
-correctness dependency): a nonce an old replica re-grows after the first
-fold re-folds at its larger total, so mid-roll growth reaches the
-incarnations before the nonce decays; replays only re-inflate
-transiently.
+The fold marker is the SOLE fold state — no process-local memo: three
+review rounds broke memo variants the same way (an old replica's
+re-charge changed what the nonce means while the memo said "done"), and
+the marker closes the class because a marked row is exactly one with no
+reliance newer than its last proven fold. Un-marked rows re-fold every
+visit (grow-only GREATEST merges keep replays and rollout churn
+transient and convergent).
 
 Resolved residual (issue #125, with #121): the original design kept the
 known-absent set and rotation cursors in process memory, making refresh

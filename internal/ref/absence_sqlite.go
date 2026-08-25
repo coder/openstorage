@@ -48,12 +48,12 @@ func (s *SQLite) ListAbsenceCovers(ctx context.Context, afterRaw string, limit i
 	// characters. Expired rows are excluded like the PG twin (Codex
 	// round 6): created_at is epoch milliseconds (sqliteEpochMS).
 	rows, err := s.db.QueryContext(ctx, `
-SELECT key, repo, bytes FROM pack_reservations
+SELECT key, repo, bytes, owner = ? FROM pack_reservations
 WHERE key > ? AND key < ?
   AND substr(key, -?) = ?
   AND created_at > `+sqliteEpochMS+` - ?
 ORDER BY key ASC LIMIT ?`,
-		afterRaw, absenceCoverRangeEnd, len(absenceCoverRawSuffix), absenceCoverRawSuffix, ttl.Milliseconds(), limit)
+		AbsenceFoldedOwner, afterRaw, absenceCoverRangeEnd, len(absenceCoverRawSuffix), absenceCoverRawSuffix, ttl.Milliseconds(), limit)
 	if err != nil {
 		return nil, fmt.Errorf("list absence covers: %w", err)
 	}
@@ -61,7 +61,7 @@ ORDER BY key ASC LIMIT ?`,
 	var out []AbsenceCoverRow
 	for rows.Next() {
 		var r AbsenceCoverRow
-		if err := rows.Scan(&r.RawKey, &r.Base, &r.Bytes); err != nil {
+		if err := rows.Scan(&r.RawKey, &r.Base, &r.Bytes, &r.Folded); err != nil {
 			return nil, err
 		}
 		var ok bool
