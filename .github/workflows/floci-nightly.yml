@@ -1,5 +1,5 @@
 # Nightly S3 lane against Floci (issue #112). The PR pipeline's S3-over-HTTP
-# coverage is the MinIO testcontainer lane inside `go test ./internal/blob`;
+# coverage is the SeaweedFS testcontainer lane inside `go test ./internal/blob`;
 # this workflow additionally boots floci/floci — a lightweight AWS
 # wire-protocol emulator — with FLOCI_SERVICES_S3_ENFORCE_AUTH=true,
 # provisions an IAM access key through the IAM API, and runs the blob suite
