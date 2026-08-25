@@ -947,6 +947,7 @@ type contentionResult struct {
 	ambiguous      int64
 	busyRetries    int64 // SQLite lane only: definitive SQLITE_BUSY rejections retried
 	maxStarve      time.Duration
+	elapsed        time.Duration // window start → last worker completion (throughput denominator)
 }
 
 // runContentionWindow races `writers` goroutines advancing ONE object for a
@@ -954,9 +955,8 @@ type contentionResult struct {
 // detector: every winning transition seq must have exactly one recorded
 // winner, the final seq must equal initial + wins, the winner set must be
 // contiguous, and the final nonce must belong to the last recorded winner.
-// Ambiguous outcomes (possible on real S3) relax the exact accounting —
-// uniqueness stays enforced — because an ambiguous write may have landed
-// without a recorded win.
+// A window containing any ambiguous outcome (possible on real S3) is
+// INCONCLUSIVE and fails the run — see verifyTransitions.
 func runContentionWindow(tb testing.TB, cas *Client, key string, writers int, window time.Duration, payloadSize int) contentionResult {
 	tb.Helper()
 	assertf(writers > 0, "runContentionWindow: %d writers", writers)
@@ -1062,6 +1062,7 @@ func runContentionWindow(tb testing.TB, cas *Client, key string, writers int, wi
 		}()
 	}
 	wg.Wait()
+	res.elapsed = time.Since(start)
 	res.wins = len(transitions)
 
 	final, err := cas.Get(ctx, key)
@@ -1094,6 +1095,16 @@ func perSessionClient(c *Client) *Client {
 // verifyTransitions is the lost-update detector shared by the S3 and SQLite
 // contention runners. finalNonce == "" skips the last-winner nonce check
 // (the SQLite analog encodes seq directly in the sha and has no nonce).
+//
+// A window containing any ambiguous outcome is INCONCLUSIVE for the
+// correctness verdict: an ambiguous write may have landed without a
+// recorded winner, so the exactly-once checks would hold only vacuously
+// and could mask a real lost update. Rather than weaken the checks, the
+// detector fails such a run outright — re-run until an ambiguity-free
+// window is observed. Winner uniqueness is still checked first because a
+// duplicate recorded winner is a definite violation regardless of
+// ambiguity. Ambiguous outcomes stay counted in contentionResult as a
+// metric.
 func verifyTransitions(tb testing.TB, initialSeq, finalSeq int64, finalNonce string, transitions []seqTransition, ambiguous int64) {
 	tb.Helper()
 	wins := int64(len(transitions))
@@ -1105,11 +1116,7 @@ func verifyTransitions(tb testing.TB, initialSeq, finalSeq int64, finalNonce str
 		winners[tr.to] = tr.nonce
 	}
 	if ambiguous > 0 {
-		tb.Logf("contention: %d ambiguous outcomes — relaxing exact accounting (winner uniqueness still enforced)", ambiguous)
-		if finalSeq < initialSeq+wins {
-			tb.Fatalf("LOST UPDATE: final seq %d < initial %d + recorded wins %d", finalSeq, initialSeq, wins)
-		}
-		return
+		tb.Fatalf("INCONCLUSIVE: %d ambiguous outcomes in the window — a possibly-landed write has no recorded winner, so the exactly-once checks cannot render a verdict; re-run until an ambiguity-free window is observed", ambiguous)
 	}
 	if finalSeq != initialSeq+wins {
 		tb.Fatalf("LOST/PHANTOM UPDATE: final seq %d != initial %d + recorded wins %d", finalSeq, initialSeq, wins)

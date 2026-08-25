@@ -424,7 +424,7 @@ func BenchmarkHotRepoContention(b *testing.B) {
 				rec := &latencyRecorder{}
 				var wins, lostRaces, contentionErrs int64
 				var maxStarve time.Duration
-				var wall time.Duration
+				var elapsed time.Duration
 				for b.Loop() {
 					key := lane.prefix + "_wal/repo/hot-" + randomHexTB(b, 6)
 					res := runContentionWindow(b, lane.cas, key, writers, window, 1<<10)
@@ -433,10 +433,19 @@ func BenchmarkHotRepoContention(b *testing.B) {
 					lostRaces += res.lostRaces
 					contentionErrs += res.contentionErrs
 					maxStarve = max(maxStarve, res.maxStarve)
-					wall += window
+					// Throughput divides by the runner's ACTUAL elapsed time
+					// (window start → last worker completion), not the
+					// configured window: an advance started just before the
+					// deadline can retry for seconds and its late success
+					// still counts in wins, which would overstate sustained
+					// adv/s against the configured duration.
+					elapsed += res.elapsed
 				}
 				rec.report(b, 50, 99)
-				b.ReportMetric(float64(wins)/wall.Seconds(), "adv/s")
+				assertf(elapsed > 0, "contention: zero elapsed time")
+				b.ReportMetric(float64(wins)/elapsed.Seconds(), "adv/s")
+				b.ReportMetric(float64(wins), "wins")
+				b.ReportMetric(elapsed.Seconds(), "elapsed-s")
 				b.ReportMetric(float64(lostRaces), "lost-races")
 				b.ReportMetric(float64(contentionErrs), "contention-errors")
 				b.ReportMetric(ms(maxStarve), "max-starve-ms")
@@ -449,7 +458,7 @@ func BenchmarkHotRepoContention(b *testing.B) {
 			rec := &latencyRecorder{}
 			var wins, lostRaces, busyRetries int64
 			var maxStarve time.Duration
-			var wall time.Duration
+			var elapsed time.Duration
 			for b.Loop() {
 				st := benchSQLite(b)
 				res := runSQLiteContentionWindow(b, st, "benchrepo", "refs/heads/hot-"+randomHexTB(b, 4), writers, window)
@@ -458,10 +467,15 @@ func BenchmarkHotRepoContention(b *testing.B) {
 				lostRaces += res.lostRaces
 				busyRetries += res.busyRetries
 				maxStarve = max(maxStarve, res.maxStarve)
-				wall += window
+				// Actual elapsed, not the configured window — see the S3
+				// loop above (a near-deadline CAS can win late).
+				elapsed += res.elapsed
 			}
 			rec.report(b, 50, 99)
-			b.ReportMetric(float64(wins)/wall.Seconds(), "adv/s")
+			assertf(elapsed > 0, "contention: zero elapsed time")
+			b.ReportMetric(float64(wins)/elapsed.Seconds(), "adv/s")
+			b.ReportMetric(float64(wins), "wins")
+			b.ReportMetric(elapsed.Seconds(), "elapsed-s")
 			b.ReportMetric(float64(lostRaces), "lost-races")
 			b.ReportMetric(float64(busyRetries), "busy-retries")
 			b.ReportMetric(ms(maxStarve), "max-starve-ms")
@@ -576,6 +590,7 @@ func runSQLiteContentionWindow(tb testing.TB, st *ref.SQLite, repo, name string,
 		}()
 	}
 	wg.Wait()
+	res.elapsed = time.Since(start)
 	res.wins = len(transitions)
 	final, err := st.GetRef(ctx, repo, name)
 	if err != nil {
