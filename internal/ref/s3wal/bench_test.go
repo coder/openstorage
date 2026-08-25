@@ -548,7 +548,6 @@ func runSQLiteContentionWindow(tb testing.TB, st *ref.SQLite, repo, name string,
 			}
 			for time.Now().Before(deadline) {
 				next := parseSeqSHA(tb, cur) + 1
-				t0 := time.Now()
 				won, err := st.CASRef(ctx, repo, name, cur, seqSHA(next))
 				switch {
 				case err != nil && isSQLiteBusy(err):
@@ -565,7 +564,10 @@ func runSQLiteContentionWindow(tb testing.TB, st *ref.SQLite, repo, name string,
 					return
 				case won:
 					now := time.Now()
-					localLat = append(localLat, now.Sub(t0))
+					// Per-push success latency: previous win (or worker
+					// start) → this win, spanning intervening lost races,
+					// busy retries, and re-reads (see contentionResult).
+					localLat = append(localLat, now.Sub(lastSuccess))
 					localTrans = append(localTrans, seqTransition{to: next})
 					maxStarve = max(maxStarve, now.Sub(lastSuccess))
 					lastSuccess = now

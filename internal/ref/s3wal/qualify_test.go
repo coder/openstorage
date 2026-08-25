@@ -1019,7 +1019,13 @@ type seqTransition struct {
 }
 
 type contentionResult struct {
-	latencies      []time.Duration // one per successful advance
+	// latencies holds one PER-PUSH SUCCESS latency sample per win: the
+	// logical attempt runs from the pusher's previous win (worker start
+	// for its first) until this win, INCLUDING every lost race, re-read,
+	// and backoff in between — the plan §3 quantity. A lone successful
+	// Advance call's duration would be CAS-attempt latency and understate
+	// the real push wait under contention.
+	latencies      []time.Duration
 	wins           int
 	lostRaces      int64
 	contentionErrs int64
@@ -1104,12 +1110,14 @@ func runContentionWindow(tb testing.TB, cas *Client, key string, writers int, wi
 				}
 				nonce := newNonce(tb)
 				next := encodePayloadNonce(tb, p.Seq+1, nonce, payloadSize)
-				t0 := time.Now()
 				newETag, err := wcas.Advance(ctx, key, next, obj.ETag)
 				switch {
 				case err == nil:
 					now := time.Now()
-					localLat = append(localLat, now.Sub(t0))
+					// Per-push success latency: previous win (or worker
+					// start) → this win, spanning intervening lost races,
+					// re-reads, and backoffs (see contentionResult).
+					localLat = append(localLat, now.Sub(lastSuccess))
 					localTrans = append(localTrans, seqTransition{to: p.Seq + 1, nonce: nonce})
 					maxStarve = max(maxStarve, now.Sub(lastSuccess))
 					lastSuccess = now
