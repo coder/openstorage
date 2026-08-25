@@ -163,8 +163,8 @@ func testMainInner(m *testing.M) int {
 			panic(err)
 		}
 
-		// Qualified SeaweedFS recipe (docs/plans/s3wal-phase1a-results.md):
-		// pinned image, one-process `weed server -s3`, S3 gateway on 8333.
+		// Qualified SeaweedFS recipe (Gate 1a-A, PR #142): pinned image,
+		// one-process `weed server -s3`, S3 gateway on 8333.
 		// A static identity (s3.config) turns on SigV4 validation so the
 		// LFS round-trip's presigned download keeps failing on a bad or
 		// missing signature, exactly like the MinIO container it replaced

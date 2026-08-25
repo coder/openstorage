@@ -2,8 +2,9 @@
 // the jobs river tests): the multipart Copy path — which unit tests cannot
 // reach through fileblob — plus copy-source escaping for namespaced keys.
 // SeaweedFS is the repo's tested reference self-hosted S3 store (issue
-// #133, qualified in docs/plans/s3wal-phase1a-results.md); MinIO remains
-// best-effort compatible but is no longer exercised in CI.
+// #133, qualified in the Gate 1a-A campaign — PR #142, which adds
+// docs/plans/s3wal-phase1a-results.md); MinIO remains best-effort
+// compatible but is no longer exercised in CI.
 package blob
 
 import (
@@ -28,8 +29,8 @@ import (
 	"github.com/testcontainers/testcontainers-go/wait"
 )
 
-// Qualified SeaweedFS recipe (docs/plans/s3wal-phase1a-results.md): pinned
-// image, one-process `weed server -s3`, S3 gateway on 8333. Versioning and
+// Qualified SeaweedFS recipe (Gate 1a-A, PR #142): pinned image,
+// one-process `weed server -s3`, S3 gateway on 8333. Versioning and
 // object-lock are never enabled on data buckets (seaweedfs#8073 avoidance).
 const seaweedFSImage = "chrislusf/seaweedfs:4.42"
 
