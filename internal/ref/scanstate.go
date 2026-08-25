@@ -24,6 +24,7 @@ package ref
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -84,6 +85,13 @@ type JobScanState struct {
 type ScanStateStore interface {
 	// GetJobScanState reads one row; ok=false when absent.
 	GetJobScanState(ctx context.Context, job, scope string) (JobScanState, bool, error)
+	// JobScanStateAge reports how long ago (job, scope) was last
+	// written, measured entirely on the DATABASE clock — freshness
+	// verdicts must never compare a DB-stamped updated_at against an
+	// application clock (Codex round 10 on PR #132: a replica skewed
+	// ahead by more than the bound would permanently misjudge a
+	// DB-fresh watermark as stale). ok=false when the row is absent.
+	JobScanStateAge(ctx context.Context, job, scope string) (time.Duration, bool, error)
 	// PutJobScanState atomically upserts one row, stamping updated_at
 	// with the database clock.
 	PutJobScanState(ctx context.Context, job, scope, payload string, generation int64) error
@@ -105,6 +113,22 @@ func (s *PG) GetJobScanState(ctx context.Context, job, scope string) (JobScanSta
 		return JobScanState{}, false, err
 	}
 	return st, true, nil
+}
+
+// JobScanStateAge — see ScanStateStore.
+func (s *PG) JobScanStateAge(ctx context.Context, job, scope string) (time.Duration, bool, error) {
+	assertf(job != "" && scope != "", "JobScanStateAge(%q, %q)", job, scope)
+	var secs float64
+	err := s.pool.QueryRow(ctx,
+		`SELECT EXTRACT(EPOCH FROM (now() - updated_at))::float8 FROM job_scan_state WHERE job = $1 AND scope = $2`,
+		job, scope).Scan(&secs)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, fmt.Errorf("job scan state age %s/%s: %w", job, scope, err)
+	}
+	return time.Duration(secs * float64(time.Second)), true, nil
 }
 
 func (s *PG) PutJobScanState(ctx context.Context, job, scope, payload string, generation int64) error {

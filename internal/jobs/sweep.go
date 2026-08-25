@@ -417,6 +417,20 @@ func (s *Sweeper) Sweep(ctx context.Context) (SweepReport, error) {
 	// unacknowledged failures, so "stranded LFS blobs actually get
 	// reaped" is observed, not assumed. Recorded before the report log so
 	// a recording failure is visible in the same pass's error join.
+	// Re-consult the destructive guard IMMEDIATELY before recording the
+	// watermark (Codex round 10, P2): the precondition can drift DURING a
+	// long pass — e.g. S3 versioning enabled mid-sweep turns deletes into
+	// delete markers that "succeed" without removing bytes — and a
+	// watermark recorded under the drifted precondition would let
+	// reclamation refund slots for up to the grace window on reaps that
+	// did not physically happen.
+	if lfsMode && deleteErrs.ok() && s.cfg.RecordLFSReapComplete != nil && s.cfg.DeleteGuard != nil {
+		if err := s.cfg.DeleteGuard(ctx); err != nil {
+			lfsMode = false
+			deleteErrs.add(fmt.Errorf("sweep: delete guard drifted during the pass, withholding the reap watermark: %w", err))
+			s.logger.Error("orphan pack sweep: destructive precondition drifted during the pass; withholding the reap watermark", "err", err)
+		}
+	}
 	if lfsMode && deleteErrs.ok() && s.cfg.RecordLFSReapComplete != nil {
 		if err := s.cfg.RecordLFSReapComplete(ctx); err != nil {
 			deleteErrs.add(fmt.Errorf("sweep: record lfs reap watermark: %w", err))

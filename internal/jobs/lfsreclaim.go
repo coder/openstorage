@@ -267,14 +267,20 @@ func (r *LFSReclaimer) Run(ctx context.Context) (LFSReclaimReport, error) {
 	// retire transaction's own watermark recheck on the database clock.
 	r.reapStale = false
 	if r.deleteEnabled {
-		mark, ok, err := r.registry.GetJobScanState(ctx, ref.ScanJobSweep, ref.ScanScopeLFSDestructiveReap)
+		// Freshness is measured entirely on the DATABASE clock (Codex
+		// round 10, P2): the watermark's updated_at is DB-stamped, so
+		// comparing it against this replica's time.Now would let a
+		// clock skewed ahead by more than the bound permanently demote
+		// every pass here while the transactional gate (both ends DB
+		// clock) would proceed.
+		age, ok, err := r.registry.JobScanStateAge(ctx, ref.ScanJobSweep, ref.ScanScopeLFSDestructiveReap)
 		switch {
 		case err != nil:
 			// Fail toward report-only: the in-transaction gate would
 			// refuse refunds on the same broken table anyway.
 			errs.add(fmt.Errorf("lfs reclaim: read reap watermark: %w", err))
 			r.reapStale = true
-		case !ok || r.now().Sub(mark.UpdatedAt) > r.reapMaxAge():
+		case !ok || age > r.reapMaxAge():
 			r.reapStale = true
 		}
 		if r.reapStale {

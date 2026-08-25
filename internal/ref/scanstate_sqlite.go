@@ -8,6 +8,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"time"
 )
 
@@ -26,6 +27,25 @@ func (s *SQLite) GetJobScanState(ctx context.Context, job, scope string) (JobSca
 	}
 	st.UpdatedAt = time.UnixMilli(updatedMS)
 	return st, true, nil
+}
+
+// JobScanStateAge — see ScanStateStore. updated_at is epoch milliseconds
+// at SECOND precision (strftime %s × 1000), so the age can over-read by up
+// to a second; every freshness bound comparing it has a ≥1 minute floor
+// (jobs.reapWatermarkMinFreshness).
+func (s *SQLite) JobScanStateAge(ctx context.Context, job, scope string) (time.Duration, bool, error) {
+	assertf(job != "" && scope != "", "JobScanStateAge(%q, %q)", job, scope)
+	var ms int64
+	err := s.db.QueryRowContext(ctx,
+		`SELECT `+sqliteEpochMS+` - updated_at FROM job_scan_state WHERE job = ? AND scope = ?`,
+		job, scope).Scan(&ms)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, fmt.Errorf("job scan state age %s/%s: %w", job, scope, err)
+	}
+	return time.Duration(ms) * time.Millisecond, true, nil
 }
 
 func (s *SQLite) PutJobScanState(ctx context.Context, job, scope, payload string, generation int64) error {

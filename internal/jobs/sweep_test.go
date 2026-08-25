@@ -783,6 +783,50 @@ func TestSweep_DeleteGuardFailsClosed(t *testing.T) {
 	}
 }
 
+// TestSweep_WatermarkWithheldOnGuardDrift (Codex round 10 on PR #132): the
+// destructive guard is re-consulted IMMEDIATELY before recording the reap
+// watermark — a precondition that drifts DURING the pass (e.g. S3
+// versioning enabled mid-sweep turns deletes into delete markers) must
+// withhold the watermark, or reclamation refunds slots for up to the grace
+// window on reaps that did not physically happen.
+func TestSweep_WatermarkWithheldOnGuardDrift(t *testing.T) {
+	f := newSweepFixture(t)
+	guardCalls, recorded := 0, 0
+	s := f.sweeper(SweepConfig{
+		Threshold: 24 * time.Hour,
+		DeleteLFS: true,
+		DeleteGuard: func(context.Context) error {
+			guardCalls++
+			if guardCalls > 1 {
+				return errors.New("simulated: versioning enabled mid-pass")
+			}
+			return nil
+		},
+		RecordLFSReapComplete: func(context.Context) error { recorded++; return nil },
+	})
+	if _, err := s.Sweep(context.Background()); err == nil {
+		t.Fatal("Sweep: want the drifted guard surfaced in the error join")
+	}
+	if recorded != 0 || guardCalls != 2 {
+		t.Fatalf("recorded=%d guardCalls=%d, want the watermark withheld after the start + pre-record consults", recorded, guardCalls)
+	}
+
+	// Control: a steady guard records the watermark exactly once.
+	recorded = 0
+	s2 := f.sweeper(SweepConfig{
+		Threshold:             24 * time.Hour,
+		DeleteLFS:             true,
+		DeleteGuard:           func(context.Context) error { return nil },
+		RecordLFSReapComplete: func(context.Context) error { recorded++; return nil },
+	})
+	if _, err := s2.Sweep(context.Background()); err != nil {
+		t.Fatalf("Sweep with steady guard: %v", err)
+	}
+	if recorded != 1 {
+		t.Fatalf("recorded=%d, want exactly one watermark write under a steady guard", recorded)
+	}
+}
+
 // A tiny classification threshold must not shrink the quarantine purge
 // age below the handshake-lifetime floor: a backup older than the
 // threshold but younger than QuarantinePurgeFloor may still be an

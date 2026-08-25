@@ -112,6 +112,15 @@ func TestJobScanState_ScopesIsolated(t *testing.T) {
 		if st, ok, _ := ss.GetJobScanState(ctx, "job-b", scope); !ok || st.Payload != "b" || st.Generation != 2 {
 			t.Fatalf("job-b row = (%+v, %v), want untouched by job-a's delete", st, ok)
 		}
+		// DB-clock age (Codex round 10 on PR #132): a fresh row reads a
+		// small non-negative age regardless of this process's clock; an
+		// absent row reads ok=false.
+		if age, ok, err := ss.JobScanStateAge(ctx, "job-b", scope); err != nil || !ok || age < 0 || age > time.Minute {
+			t.Fatalf("age = (%v, %v, %v), want a fresh non-negative DB-clock age", age, ok, err)
+		}
+		if _, ok, err := ss.JobScanStateAge(ctx, "job-a", scope); err != nil || ok {
+			t.Fatalf("age of deleted row = (ok=%v, %v), want absent", ok, err)
+		}
 	})
 }
 
