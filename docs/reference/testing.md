@@ -246,10 +246,11 @@ provisions an IAM access key through the IAM API, and runs
 variable gates the endpoint tests in `internal/blob/s3endpoint_test.go`
 (skipped everywhere else): a CRUD round-trip through the real `blob.S3`
 surface, plus the presigned-URL SigV4 test — valid signature ⇒ 200 with the
-exact bytes, corrupted signature ⇒ `403 SignatureDoesNotMatch`. This is the
-only lane where presign rejection is pinned against a backend enforcing
-SigV4 on every request with a provisioned (non-root) key; the SeaweedFS
-container lane and `docker-compose.yml` stay unchanged.
+exact bytes, corrupted signature ⇒ `403 SignatureDoesNotMatch`. The
+per-PR SeaweedFS container test also pins presign accept/reject live (with
+a static enforcing identity); this nightly lane adds the external-endpoint
+path with a key provisioned through a real IAM API rather than a static
+config, against a second, independent wire-protocol implementation.
 
 Known Floci 1.7.0 gaps, so nobody extends this lane into them: it does not
 evaluate IAM policies on S3 actions (a `Deny` still succeeds) and it ignores
