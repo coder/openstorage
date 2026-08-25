@@ -529,8 +529,9 @@ func (s *server) handleListRepos(w http.ResponseWriter, r *http.Request) {
 }
 
 type deleteRepoResponse struct {
-	RepoID  string `json:"repo_id"`
-	Message string `json:"message"`
+	RepoID   string `json:"repo_id"` // deprecated upstream: use repo_name
+	RepoName string `json:"repo_name"`
+	Message  string `json:"message"`
 }
 
 // handleDeleteRepo implements DELETE /api/v1/repos/delete (scope
@@ -565,8 +566,10 @@ func (s *server) handleDeleteRepo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	assertf(repo.RepoID != "", "store returned deleted repo with empty RepoID")
+	assertf(repo.URL != "", "store returned deleted repo %s with empty URL", repo.RepoID)
 	writeJSON(w, http.StatusOK, deleteRepoResponse{
-		RepoID:  repo.RepoID,
-		Message: "repository deleted",
+		RepoID:   repo.RepoID,
+		RepoName: repo.URL,
+		Message:  "repository deleted",
 	})
 }

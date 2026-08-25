@@ -132,6 +132,26 @@ func TestAliasWriteThrough(t *testing.T) {
 	})
 }
 
+// TestAliasDeleteRepo proves DELETE /api/repos/{repo_name} re-dispatches to
+// the v1 delete handler and answers the upstream-required 200 shape
+// {repo_name, repo_id (deprecated upstream), message} — byte-identical to
+// the v1 route by construction (issue #147). The v1 route's own shape is
+// asserted in testCRUDHappyPath.
+func TestAliasDeleteRepo(t *testing.T) {
+	runBackends(t, func(t *testing.T, e *testEnv) {
+		org := e.newOrg(t)
+		repoURL := "alias/delete-" + randomHex(t, 4)
+		created := createRepo(t, e, org, repoURL, nil, http.StatusOK)
+		writeTok := e.mint(t, tokenSpec{iss: org, repo: repoURL, scopes: []string{auth.ScopeRepoWrite}})
+
+		resp, body := e.doReq(t, http.MethodDelete, "/api/repos/"+url.PathEscape(repoURL), writeTok, nil, "")
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("DELETE alias = %d (%s), want 200", resp.StatusCode, body)
+		}
+		requireDeleteRepoShape(t, body, created.RepoID, repoURL)
+	})
+}
+
 // TestAliasNotFound covers the alias-layer 404s: unknown path name, path
 // repo != claim repo (read and write envelope flavors), and a claim that no
 // longer resolves. Mismatches answer 404 — not 403 — so a foreign token

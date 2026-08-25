@@ -41,6 +41,21 @@ func createRepo(t *testing.T, e *testEnv, org, urlClaim string, body []byte, wan
 	return out
 }
 
+// requireDeleteRepoShape asserts the exact delete-repo wire shape: exactly
+// {repo_id, repo_name, message} (upstream openapi.yaml requires all three;
+// repo_id is deprecated upstream but still present). Shared by the v1 and
+// named-repo (alias) delete route tests.
+func requireDeleteRepoShape(t *testing.T, body []byte, wantID, wantName string) {
+	t.Helper()
+	var got map[string]string
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatalf("decode delete response %q: %v", body, err)
+	}
+	if len(got) != 3 || got["repo_id"] != wantID || got["repo_name"] != wantName || got["message"] != "repository deleted" {
+		t.Fatalf("delete response = %s, want exactly {repo_id: %q, repo_name: %q, message: \"repository deleted\"}", body, wantID, wantName)
+	}
+}
+
 func TestCRUDHappyPath(t *testing.T) { runBackends(t, testCRUDHappyPath) }
 
 func testCRUDHappyPath(t *testing.T, e *testEnv) {
@@ -124,9 +139,10 @@ func testCRUDHappyPath(t *testing.T, e *testEnv) {
 	if err := json.Unmarshal(body, &deleted); err != nil {
 		t.Fatal(err)
 	}
-	if deleted.RepoID != created.RepoID || deleted.Message == "" {
+	if deleted.RepoID != created.RepoID || deleted.RepoName != repoURL || deleted.Message == "" {
 		t.Fatalf("delete response = %+v", deleted)
 	}
+	requireDeleteRepoShape(t, body, created.RepoID, repoURL)
 
 	// Soft-deleted: GET -> 404, hidden from list, re-delete -> 409,
 	// re-create same url -> 409.
