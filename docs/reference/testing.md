@@ -235,3 +235,48 @@ runs the sweep daily (04:23 UTC) and uploads the output as the
 budget (compare runs with `benchstat`, which wants `count` around 10). One
 caveat when reading results: `BenchmarkAdmitReserve/parallelism=N` scales
 `b.SetParallelism`, so the worker count is N × GOMAXPROCS, not N.
+
+## The Floci S3 lane
+
+[`floci-nightly.yml`](../../.github/workflows/floci-nightly.yml) runs daily
+(03:53 UTC): it boots [Floci](https://hub.docker.com/r/floci/floci) — a
+lightweight AWS wire-protocol emulator — with S3 auth enforcement on,
+provisions an IAM access key through the IAM API, and runs
+`go test ./internal/blob` with `CODESTORAGE_TEST_S3_URL` pointed at it. That
+variable gates the endpoint tests in `internal/blob/s3endpoint_test.go`
+(skipped everywhere else): a CRUD round-trip through the real `blob.S3`
+surface, plus the presigned-URL SigV4 test — valid signature ⇒ 200 with the
+exact bytes, corrupted signature ⇒ `403 SignatureDoesNotMatch`. This is the
+only lane where presign rejection is pinned against a backend enforcing
+SigV4 on every request with a provisioned (non-root) key; the MinIO
+container lane and `docker-compose.yml` stay unchanged.
+
+Known Floci 1.7.0 gaps, so nobody extends this lane into them: it does not
+evaluate IAM policies on S3 actions (a `Deny` still succeeds) and it ignores
+`x-amz-expected-bucket-owner` — both stay covered by unit-test seams.
+
+Run it locally (Docker + the `aws` CLI):
+
+```sh
+docker run -d --name floci -p 4566:4566 \
+  -e FLOCI_SERVICES_S3_ENFORCE_AUTH=true floci/floci:latest
+
+# IAM accepts any credentials; only S3 enforces auth.
+export AWS_ACCESS_KEY_ID=root AWS_SECRET_ACCESS_KEY=root AWS_DEFAULT_REGION=us-east-1
+aws --endpoint-url http://127.0.0.1:4566 iam create-user --user-name blobtest
+aws --endpoint-url http://127.0.0.1:4566 iam create-access-key --user-name blobtest
+# export the returned AccessKeyId / SecretAccessKey, then:
+
+CODESTORAGE_TEST_S3_URL='s3://floci-test?endpoint=http://127.0.0.1:4566&s3ForcePathStyle=true&region=us-east-1' \
+  go test ./internal/blob -run 'TestS3Endpoint' -count=1 -race -v
+```
+
+The same tests run against real S3: point `CODESTORAGE_TEST_S3_URL` at an
+existing bucket (`s3://my-bucket?region=us-east-1`) with real credentials in
+the environment. Without an `endpoint` query parameter the bucket is only
+probed, never created — re-creating an owned us-east-1 bucket would reset
+its ACLs. Versioned (or version-suspended) buckets are refused, because
+cleanup relies on `DeleteObject` actually reclaiming the test keys rather
+than writing delete markers. Keys are uniquely suffixed and cleaned up, but
+use an unversioned scratch bucket, not a production one.
+
