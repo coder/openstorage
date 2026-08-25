@@ -929,6 +929,50 @@ func (fr *flakyRegistry) ReservePackBytes(ctx context.Context, group []string, p
 	return fr.AbsenceRegistry.ReservePackBytes(ctx, group, packs, owner, usageFloor, floorGen, quotaBytes, ttl)
 }
 
+// touchRecorder proves the bulk touch runs strictly before the renewal
+// listing and keeps covers protected even when the listing fails outright
+// (Codex round 9).
+type touchRecorder struct {
+	AbsenceRegistry
+	calls []string
+}
+
+func (rec *touchRecorder) RenewAbsenceCovers(ctx context.Context, ttl time.Duration) (int64, error) {
+	rec.calls = append(rec.calls, "touch")
+	return rec.AbsenceRegistry.RenewAbsenceCovers(ctx, ttl)
+}
+
+func (rec *touchRecorder) ListAbsenceCovers(ctx context.Context, afterRaw string, limit int, ttl time.Duration) ([]ref.AbsenceCoverRow, error) {
+	rec.calls = append(rec.calls, "list")
+	return nil, fmt.Errorf("flaky: injected list failure")
+}
+
+// TestAbsenceReconcile_BulkTouchPrecedesListing (Codex round 9, P1): cover
+// TTL protection must not depend on the keyset renewal listing — the
+// DB-clock bulk touch re-stamps every live deterministic cover FIRST, so
+// even a pass whose listing fails outright (or round-robins across many
+// passes) cannot let a live cover lapse.
+func TestAbsenceReconcile_BulkTouchPrecedesListing(t *testing.T) {
+	f := newSweepFixture(t)
+	ctx := context.Background()
+	base := "repo-touch"
+	if err := ref.ReserveRestoreCover(ctx, absenceRegistry(t, f), blob.QuotaRepoGroup(base), absenceIncarnationKey(base, absenceClassLFS, 1), 100, time.Hour); err != nil {
+		t.Fatalf("seed cover: %v", err)
+	}
+	rec := &touchRecorder{AbsenceRegistry: absenceRegistry(t, f)}
+	r := NewAbsenceReconciler(rec, f.blobs, true, 1000, time.Hour, slog.New(slog.DiscardHandler))
+	report, err := r.Run(ctx)
+	if err == nil {
+		t.Fatal("Run: want the injected listing failure reported")
+	}
+	if report.CoversTouched != 1 || !report.RenewalIncomplete {
+		t.Fatalf("report = %+v, want the live cover touched and the listing marked incomplete", report)
+	}
+	if len(rec.calls) < 2 || rec.calls[0] != "touch" || rec.calls[1] != "list" {
+		t.Fatalf("calls = %v, want the bulk touch strictly before the listing", rec.calls)
+	}
+}
+
 // TestAbsenceReconcile_ChargeFailureRetriedAtRangeEnd (Codex round 8, P1):
 // a transient charge failure on a range's last deficits leaves the running
 // total accumulated but UNCHARGED; the bounded range-end retry — forced

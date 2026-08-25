@@ -98,6 +98,34 @@ ORDER BY key DESC LIMIT 1`,
 	return r, true, nil
 }
 
+// RenewAbsenceCovers — see the PG twin. SQLite lacks regexp by default;
+// GLOB is case-sensitive and supports [0-9] classes, so one pattern per
+// class replaces the PG alternation (the suffix contains no GLOB
+// metacharacters).
+func (s *SQLite) RenewAbsenceCovers(ctx context.Context, ttl time.Duration) (int64, error) {
+	assertf(ttl > 0, "RenewAbsenceCovers: non-positive ttl %v", ttl)
+	digits := strings.Repeat("[0-9]", 19)
+	var total int64
+	for _, class := range []string{"lfs", "packs"} {
+		res, err := s.db.ExecContext(ctx, `
+UPDATE pack_reservations SET created_at = `+sqliteEpochMS+`
+WHERE key > ? AND key < ?
+  AND key GLOB ?
+  AND created_at > `+sqliteEpochMS+` - ?`,
+			AbsenceCoverPrefix, absenceCoverRangeEnd,
+			AbsenceCoverPrefix+"*/"+class+"-e"+digits+absenceCoverRawSuffix, ttl.Milliseconds())
+		if err != nil {
+			return total, fmt.Errorf("renew absence covers: %w", err)
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return total, fmt.Errorf("renew absence covers: rows affected: %w", err)
+		}
+		total += n
+	}
+	return total, nil
+}
+
 // DeleteAbsenceCover — see the PG twin.
 func (s *SQLite) DeleteAbsenceCover(ctx context.Context, key string) error {
 	assertf(strings.HasPrefix(key, AbsenceCoverPrefix), "DeleteAbsenceCover(%q): not an absence cover key", key)

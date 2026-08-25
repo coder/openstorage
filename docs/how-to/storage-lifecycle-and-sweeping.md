@@ -537,9 +537,12 @@ cursors (budget-limited, resumable — the sweeper's inverse direction) and
   aggregate into ONE cover reservation row per affected repository and
   registry class — so the per-repository reservation-row cap cannot bind
   regardless of how many rows were lost — and the cover rows THEMSELVES are
-  the durable tracking state: every pass starts by listing the live cover
-  rows and re-charging each one (`covers_renewed`), one work unit per row,
-  under half the pass budget. Because renewal derives entirely from the
+  the durable tracking state: every pass starts by re-stamping every live
+  cover's TTL in one database-clock statement (`covers_touched` — so
+  protection never depends on the per-row work completing within the TTL),
+  then lists the live cover rows and re-charges each one
+  (`covers_renewed`), one work unit per row, under half the pass budget.
+  Because renewal derives entirely from the
   database, any replica of a multi-replica PostgreSQL fleet — or a freshly
   restarted worker — keeps every discovered loss covered; nothing lives in
   process memory. Aggregates stay EXACT: each full traversal of a
@@ -580,6 +583,7 @@ A reconciliation pass logs one `absence reconcile pass finished` line:
 | `covers_charged` / `bytes_covered` | restore covers charged/refreshed this pass and their total bytes |
 | `cover_errors` / `stat_errors` | covers that failed (e.g. the per-repo reservation-row cap) and probes that errored — both retried next pass |
 | `rows_skipped_purged` | rows of purge-fenced repositories skipped |
+| `covers_touched` | live deterministic cover rows whose TTL the pass-start bulk touch re-stamped in one database-clock statement (protection never waits on the per-row listing) |
 | `covers_renewed` | live cover rows re-charged by the renewal phase (fleet-derived from the durable cover listing — any replica renews every cover) |
 | `covers_rotated` / `covers_released` | shrink re-mints (heals reduced a repository's exact re-derived total; the stale row was deleted) and outright releases (fully healed, emptied of registry rows, or a superseded incarnation retired) |
 | `covers_decaying` | pre-upgrade nonce-keyed covers folded into deterministic incarnations and left to expire by TTL (never deleted — an old replica may still depend on them mid-roll) |

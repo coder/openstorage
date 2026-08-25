@@ -48,9 +48,14 @@ renewal work with the loss population and collide with the per-base
 active-reservation-row cap, so a big enough incident would either outrun
 the renewal cycle or be denied outright), and the cover rows THEMSELVES
 are the durable tracking state (issue #125). The renewal phase runs FIRST
-each pass: it LISTS the live cover rows and re-charges each — one work
-unit per row, entirely database-derived, so any replica and any restart
-keeps every discovered loss covered without process memory. "Live" is
+each pass, in two steps (Codex round 9): a single DB-clock statement
+bulk-touches every live deterministic cover's TTL — so protection never
+depends on the keyset work below completing within the TTL — and then the
+keyset listing re-charges each row (byte re-pinning, legacy folds,
+superseded-row cleanup, the harvest). One work unit per row, entirely
+database-derived, so any replica and any restart keeps every discovered
+loss covered without process memory; an incomplete listing can delay
+lifecycle work but cannot lapse a live cover. "Live" is
 admission's own liveness window (the reservation TTL, filtered in SQL):
 a cover row that outlived its TTL is DEAD — admission stopped counting
 it, so renewing or migrating it would resurrect a stale reservation a

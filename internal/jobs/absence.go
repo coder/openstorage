@@ -89,6 +89,12 @@ type AbsenceRegistry interface {
 	// ListFleetPacks pages packs rows fleet-wide, keyset on the
 	// (repo, id) primary key ascending.
 	ListFleetPacks(ctx context.Context, afterRepo, afterID string, limit int) ([]ref.AbsencePackRow, error)
+	// RenewAbsenceCovers re-stamps every LIVE deterministic cover row's
+	// TTL in one DB-clock statement — the pass-start bulk touch that
+	// makes cover protection independent of the keyset listing
+	// completing within the TTL (Codex round 9). Strict TTL: expired
+	// rows stay dead; legacy nonce rows keep decaying.
+	RenewAbsenceCovers(ctx context.Context, ttl time.Duration) (int64, error)
 	// ListAbsenceCovers pages the live absence-cover reservation rows —
 	// the durable tracking state the renewal phase re-derives its
 	// obligations from every pass (issue #125). ttl is the liveness
@@ -165,6 +171,12 @@ type AbsenceReport struct {
 	// traversal: never deleted — a not-yet-upgraded replica may still
 	// depend on them mid-roll.
 	CoversDecaying int64 `json:"covers_decaying"`
+	// CoversTouched counts live deterministic cover rows whose TTL the
+	// pass-start bulk touch re-stamped (Codex round 9): protection never
+	// depends on the keyset listing completing within the TTL, so a
+	// multi-pass listing round robin can delay lifecycle work
+	// (fold/shrink/release) but cannot lapse a live cover.
+	CoversTouched int64 `json:"covers_touched"`
 	// RenewalIncomplete reports the renewal listing was cut short by the
 	// pass deadline (never by budget): un-renewed rows resume first on
 	// the durable cursor next pass. Investigate the blob store or ledger
@@ -519,6 +531,7 @@ func (r *AbsenceReconciler) Run(ctx context.Context) (AbsenceReport, error) {
 		"covers_rotated", report.CoversRotated,
 		"covers_released", report.CoversReleased,
 		"covers_decaying", report.CoversDecaying,
+		"covers_touched", report.CoversTouched,
 		"renewal_incomplete", report.RenewalIncomplete,
 		"renewal_over_budget", report.RenewalOverBudget,
 		"lfs_traversals", report.LFSTraversals,
@@ -552,6 +565,23 @@ func (r *AbsenceReconciler) Run(ctx context.Context) (AbsenceReport, error) {
 func (r *AbsenceReconciler) renewCovers(ctx context.Context, budget int64, report *AbsenceReport, st *absencePassState, errs *boundedErrs) (charged int64) {
 	if !r.quotaEnforced {
 		r.renewalComplete = true // nothing consults reservations (Codex round 73)
+		return 0
+	}
+	// Bulk touch FIRST (Codex round 9): one DB-clock statement re-stamps
+	// every live deterministic cover's TTL, so protection never depends
+	// on the keyset listing below completing within the TTL — a large
+	// population or degraded ledger latency can turn that listing into a
+	// multi-pass round robin, and a row aging past the TTL mid-cycle
+	// would be excluded as expired and silently never renewed. The
+	// listing remains the precise mechanism for everything else: legacy
+	// folds, superseded-row cleanup, byte re-pinning, and the liveCovers
+	// harvest. On failure the cursor is untouched and the pass carries
+	// the renewal-incomplete flag.
+	touched, err := r.registry.RenewAbsenceCovers(ctx, r.coverTTL)
+	report.CoversTouched = touched
+	if err != nil {
+		errs.add(fmt.Errorf("absence reconcile: bulk-renew covers: %w", err))
+		report.RenewalIncomplete = true
 		return 0
 	}
 	after := r.renewCursor

@@ -23,6 +23,7 @@ func scanStateStore(t *testing.T, s Store) ScanStateStore {
 // the absence reconciler drives it).
 type absenceCoverStore interface {
 	Store
+	RenewAbsenceCovers(ctx context.Context, ttl time.Duration) (int64, error)
 	ListAbsenceCovers(ctx context.Context, afterRaw string, limit int, ttl time.Duration) ([]AbsenceCoverRow, error)
 	AbsenceCoverHead(ctx context.Context, prefix string, ttl time.Duration) (AbsenceCoverRow, bool, error)
 	DeleteAbsenceCover(ctx context.Context, key string) error
@@ -198,6 +199,23 @@ func TestAbsenceCovers_ListHeadDelete(t *testing.T) {
 		}
 		if _, ok, err := cs.AbsenceCoverHead(ctx, AbsenceCoverPrefix+base+"/lfs-e", time.Nanosecond); err != nil || ok {
 			t.Fatalf("expired head = (ok=%v, %v), want absent", ok, err)
+		}
+
+		// Bulk touch (Codex round 9 on PR #132): exactly the LIVE
+		// deterministic incarnation rows are re-stamped — the planted
+		// foreign spellings and a legacy nonce row (which must keep
+		// decaying after its fold) are untouched, and an elapsed
+		// liveness window touches nothing (expired rows stay dead).
+		legacyKey := AbsenceCoverPrefix + base + "/0123456789abcdef0123"
+		cover(legacyKey, 30)
+		if n, err := cs.RenewAbsenceCovers(ctx, time.Hour); err != nil || n != 3 {
+			t.Fatalf("bulk touch = (%d, %v), want the 3 deterministic rows only", n, err)
+		}
+		if n, err := cs.RenewAbsenceCovers(ctx, time.Nanosecond); err != nil || n != 0 {
+			t.Fatalf("expired bulk touch = (%d, %v), want zero rows", n, err)
+		}
+		if err := cs.DeleteAbsenceCover(ctx, legacyKey); err != nil {
+			t.Fatalf("clean up legacy row: %v", err)
 		}
 
 		// Targeted release: only the named row disappears; re-deleting is

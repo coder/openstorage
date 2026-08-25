@@ -203,6 +203,39 @@ ORDER BY key COLLATE "C" DESC LIMIT 1`,
 	return r, true, nil
 }
 
+// RenewAbsenceCovers re-stamps created_at on every LIVE deterministic
+// absence-cover row in one DB-clock statement (Codex round 9 on PR #132):
+// cover protection must never depend on the keyset renewal listing
+// completing within the TTL — a large population or degraded ledger
+// latency turns that listing into a multi-pass round robin, and a row
+// aging past the TTL mid-cycle would be excluded as expired and silently
+// never renewed. The strict TTL predicate is the round-6 invariant:
+// already-expired rows stay dead. Only rows matching the reconciler's
+// deterministic incarnation tail (`/<class>-e<19 digits>`) are touched —
+// legacy nonce rows must keep decaying by TTL after their fold, and the
+// keyset listing remains their (and the lifecycle's) precise mechanism.
+// Returns the number of rows re-stamped.
+func (s *PG) RenewAbsenceCovers(ctx context.Context, ttl time.Duration) (int64, error) {
+	assertf(ttl > 0, "RenewAbsenceCovers: non-positive ttl %v", ttl)
+	tag, err := s.pool.Exec(ctx, `
+UPDATE pack_reservations SET created_at = now()
+WHERE key COLLATE "C" > $1 AND key COLLATE "C" < $2
+  AND key ~ $3
+  AND created_at > now() - make_interval(secs => $4)`,
+		AbsenceCoverPrefix, absenceCoverRangeEnd, absenceIncarnationTailRegexp, ttl.Seconds())
+	if err != nil {
+		return 0, fmt.Errorf("renew absence covers: %w", err)
+	}
+	return tag.RowsAffected(), nil
+}
+
+// absenceIncarnationTailRegexp matches the raw-row tail of a deterministic
+// incarnation key: /<class>-e<19 zero-padded digits> followed by the
+// repair-cover reservation suffix at end of string. The suffix contains no
+// regex metacharacters (a literal newline matches itself; PG's $ anchors
+// at end of string in default mode).
+var absenceIncarnationTailRegexp = "/(lfs|packs)-e[0-9]{19}" + absenceCoverRawSuffix + "$"
+
 // DeleteAbsenceCover removes one absence-cover reservation row by its
 // synthetic key; deleting an absent row is a no-op. Only the absence
 // reconciler mints and owns rows under AbsenceCoverPrefix, and River's
