@@ -1,5 +1,5 @@
-// Env-gated S3 endpoint tests (issue #112): unlike the MinIO container
-// tests in minio_test.go, these run against an externally provided S3
+// Env-gated S3 endpoint tests (issue #112): unlike the SeaweedFS container
+// tests in seaweedfs_test.go, these run against an externally provided S3
 // endpoint named by CODESTORAGE_TEST_S3_URL (a full s3:// blob URL;
 // credentials come from the standard AWS environment). The nightly Floci
 // lane (.github/workflows/floci-nightly.yml) points them at floci/floci

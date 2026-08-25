@@ -1,13 +1,13 @@
 # Deploy a two-replica stack with Docker Compose
 
 **Goal:** a running two-replica codestorage deployment — two stateless server nodes
-(`node-a`, `node-b`) sharing one Postgres (ref CAS + metadata) and one MinIO (immutable
-packs) — and proof that a write through one node is immediately visible through the other.
+(`node-a`, `node-b`) sharing one Postgres (ref CAS + metadata) and one SeaweedFS (immutable
+packs, via its S3 gateway) — and proof that a write through one node is immediately visible through the other.
 
 > **This is a development stack, not deployment guidance.** It uses default credentials,
 > publishes the backing-service ports, and speaks plain HTTP. One flow is not functional
 > from the host: **Git LFS downloads** — the batch API presigns download URLs for the
-> container-only endpoint `http://minio:9000`, which host-side clients cannot resolve
+> container-only endpoint `http://seaweedfs:8333`, which host-side clients cannot resolve
 > (uploads work: they proxy through the server,
 > [#51](https://github.com/coder/code-storage/issues/51)). Everything else works,
 > including **upstream mirror sync** (`pull-upstream`): since
@@ -21,7 +21,7 @@ packs) — and proof that a write through one node is immediately visible throug
 > hardening differs.
 
 Everything below runs against the repository's [`docker-compose.yml`](../../docker-compose.yml):
-the default `docker compose up` boots only Postgres + MinIO (for running the server on the
+the default `docker compose up` boots only Postgres + SeaweedFS (for running the server on the
 host); the opt-in `replicas` profile adds the two server nodes, built from the repo
 [`Dockerfile`](../../Dockerfile).
 
@@ -32,7 +32,7 @@ host); the opt-in `replicas` profile adds the two server nodes, built from the r
   tokens.
 - If sibling checkouts share your Docker daemon, pick unique host ports and a unique
   compose project name (`-p`); every published port is env-overridable (`PGPORT`,
-  `MINIOPORT`, `NODEA_PORT`, `NODEB_PORT` — see the compose file header).
+  `S3PORT`, `NODEA_PORT`, `NODEB_PORT` — see the compose file header).
 
 ## 1. Build the binary and generate the org keypair
 
@@ -52,8 +52,8 @@ mkdir -p compose-keys && ./codestorage keygen --out ./compose-keys/cs-key
 docker compose --profile replicas up -d --wait --build
 ```
 
-`--wait` blocks until every healthcheck passes: Postgres (`pg_isready`), MinIO
-(`/minio/health/live`), and both nodes (unauthenticated
+`--wait` blocks until every healthcheck passes: Postgres (`pg_isready`), SeaweedFS (an
+anonymous ListBuckets against the S3 gateway), and both nodes (unauthenticated
 [`GET /healthz`](deploy-production.md#health-checks)). Node A publishes on `:8081`, node B
 on `:8082`; both containers listen on `0.0.0.0:8080` internally.
 
@@ -119,22 +119,22 @@ docker compose --profile replicas down -v   # -v also removes the anonymous data
 ```
 
 This stack is disposable by design: the compose file declares **no named data volumes**
-for Postgres or MinIO, so `down` (with or without `-v`) discards repository state and
+for Postgres or SeaweedFS, so `down` (with or without `-v`) discards repository state and
 the next `up` starts empty. To pause instead of discard, use
 `docker compose --profile replicas stop` / `start`, which keeps the containers and their
 data; steady-state restarts skip schema setup.
 
 ## Variation: server on the host, backing services in Docker
 
-For fast iteration on the server itself, boot only Postgres + MinIO and run `serve` on the
+For fast iteration on the server itself, boot only Postgres + SeaweedFS and run `serve` on the
 host against the published ports:
 
 ```sh
 docker compose up -d --wait
 CODESTORAGE_ORG=selfhost CODESTORAGE_ORG_PUBKEYS=./compose-keys/cs-key.pub.pem \
 CODESTORAGE_PG_URL="postgres://postgres:postgres@127.0.0.1:${PGPORT:-15432}/postgres" \
-CODESTORAGE_S3_URL="s3://codestorage?endpoint=http://127.0.0.1:${MINIOPORT:-19000}&s3ForcePathStyle=true&region=us-east-1" \
-AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin \
+CODESTORAGE_S3_URL="s3://codestorage?endpoint=http://127.0.0.1:${S3PORT:-18333}&s3ForcePathStyle=true&region=us-east-1" \
+AWS_ACCESS_KEY_ID=codestorage AWS_SECRET_ACCESS_KEY=codestorage \
   ./codestorage serve --listen 127.0.0.1:8080
 ```
 
@@ -145,6 +145,6 @@ Every variable is documented in the [configuration reference](../reference/confi
 | Symptom | Cause / fix |
 |---|---|
 | `up --wait` times out on a node healthcheck | The node crashed at startup — `docker compose --profile replicas logs node-a`. Startup validation is fail-fast and names the offending variable ([configuration reference](../reference/configuration.md)). A common cause: no `compose-keys/cs-key.pub.pem` (step 1 not run), so `CODESTORAGE_ORG_PUBKEYS` points at nothing. |
-| Host port already in use | Override `PGPORT` / `MINIOPORT` / `NODEA_PORT` / `NODEB_PORT` and pass a unique `-p <project>` so parallel checkouts don't collide. |
+| Host port already in use | Override `PGPORT` / `S3PORT` / `NODEA_PORT` / `NODEB_PORT` and pass a unique `-p <project>` so parallel checkouts don't collide. |
 | `401`/`403` from curl or git | Token minted with the wrong `--iss` (must equal `CODESTORAGE_ORG`, here `selfhost`), the wrong key, or missing scopes. Repo routes need a token whose `repo` claim matches the target repo. |
 | Rotated the keypair but old tokens still verify | Each node registers the key set from its mounted file **at boot** — restart the nodes (`docker compose --profile replicas restart node-a node-b`) after changing `compose-keys/`. |

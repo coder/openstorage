@@ -2,10 +2,10 @@
 // middleware must stamp x-amz-expected-bucket-owner onto EVERY HTTP
 // request the SDK emits — gocloud data operations, raw-client bucket and
 // multipart-copy calls, and presigned URLs — and stamp
-// x-amz-source-expected-bucket-owner onto copy requests. Neither MinIO nor
-// any emulator enforces the condition, so these tests capture the real
+// x-amz-source-expected-bucket-owner onto copy requests. No self-hosted
+// store or emulator enforces the condition, so these tests capture the real
 // SDK-serialized HTTP requests with a stub transport and assert the
-// headers directly; the MinIO integration test proves the header is
+// headers directly; the SeaweedFS integration test proves the header is
 // harmless pass-through. The unset lane pins the load-bearing
 // compatibility claim: no owner configured = no condition headers at all.
 package blob
@@ -309,7 +309,7 @@ func TestExpectedBucketOwner_ThreadedOnEveryOperation(t *testing.T) {
 // requests (aws-sdk-go-v2 #2508: header-in-SignedHeaders or lowercase
 // query param; the SDK emits the latter). The parameter sits before
 // X-Amz-Signature in the canonical request, so stripping or altering it
-// breaks the signature (the MinIO integration test proves that live).
+// breaks the signature (the SeaweedFS integration test proves that live).
 // This test also pins the hoisting behavior across SDK upgrades: if a
 // future SDK stopped hoisting (leaving the header in SignedHeaders),
 // redeemers would suddenly need to send the header and this fails loudly.

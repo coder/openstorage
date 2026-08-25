@@ -1,6 +1,6 @@
 # Merge gate for coder/code-storage (issue #7): lint, build, and the full
 # uncached race test suite. Postgres-dependent tests (river jobs, pg ref CAS,
-# githttp e2e pg lane) boot their own postgres/minio containers via
+# githttp e2e pg lane) boot their own postgres/seaweedfs containers via
 # testcontainers, so they only need Docker on the runner — no service
 # containers. The local lane covers the zero-container sqlite+fileblob e2e
 # tests that are skipped in the default pg lane.

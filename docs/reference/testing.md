@@ -11,7 +11,7 @@ One test suite, two storage stacks. Which stack a test run uses is decided in
 
 | Lane | Command | Backends | Needs |
 |---|---|---|---|
-| **Default (`pg`)** | `go test ./... -count=1 -race -timeout=30m` | Postgres 17 + MinIO, booted per run via [testcontainers](https://golang.testcontainers.org/) | Docker, git, git-lfs |
+| **Default (`pg`)** | `go test ./... -count=1 -race -timeout=30m` | Postgres 17 + SeaweedFS, booted per run via [testcontainers](https://golang.testcontainers.org/) | Docker, git, git-lfs |
 | **Local** | `CODESTORAGE_TEST_BACKEND=local go test ./internal/githttp -count=1 -race -timeout=15m` | SQLite (`sqlite://`) + plain-file blobs (`file://`) | git, git-lfs — **no Docker** |
 | **Backend fan-out** | part of the default lane | `internal/api`, `internal/meta`, and `internal/ref` run every integration/conformance test twice, as `/pg` and `/sqlite` subtests | Docker (for the `/pg` half) |
 
@@ -248,7 +248,7 @@ variable gates the endpoint tests in `internal/blob/s3endpoint_test.go`
 surface, plus the presigned-URL SigV4 test — valid signature ⇒ 200 with the
 exact bytes, corrupted signature ⇒ `403 SignatureDoesNotMatch`. This is the
 only lane where presign rejection is pinned against a backend enforcing
-SigV4 on every request with a provisioned (non-root) key; the MinIO
+SigV4 on every request with a provisioned (non-root) key; the SeaweedFS
 container lane and `docker-compose.yml` stay unchanged.
 
 Known Floci 1.7.0 gaps, so nobody extends this lane into them: it does not

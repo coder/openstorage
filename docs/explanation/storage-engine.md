@@ -13,7 +13,7 @@ All durable state splits across two systems with very different guarantees:
 - **The database (Postgres; SQLite in local mode)** is the *authority*: refs, the pack
   registry, metadata, quota accounting. Refs advance only through compare-and-swap — every
   writer states the value it expects, and exactly one concurrent writer wins.
-- **The blob store (S3/MinIO; plain files in local mode)** holds *immutable,
+- **The blob store (S3-compatible; plain files in local mode)** holds *immutable,
   content-addressed packs*. The bytes under a key never change; concurrent replicas
   racing the deliberate non-atomic exists-check may re-PUT the *identical* content to
   the same key — semantically harmless, though on a versioned bucket each re-PUT leaves

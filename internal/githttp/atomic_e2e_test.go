@@ -33,7 +33,7 @@ func TestAtomicPush_MixedPolicyStoresNothing(t *testing.T) {
 		t.Fatalf("denial does not name the atomic gate:\n%s", out)
 	}
 	t.Logf("atomic mixed push output:\n%s", out)
-	if objs := minioPacks(t, repo); len(objs) != 0 {
+	if objs := s3Packs(t, repo); len(objs) != 0 {
 		t.Fatalf("atomic mixed push left pack blobs: %v", objs)
 	}
 	if packs := pgPacks(t, repo); len(packs) != 0 {

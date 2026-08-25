@@ -5,7 +5,7 @@ Computer Company's git-native storage service — built from the specification i
 [`docs/`](docs/README.md). One Go binary serves the `/api/v1` HTTP API and the production
 git smart-HTTP path (clone/push, LFS) behind customer-signed JWTs; the official SDKs drop
 in via their `apiBaseUrl` / `storageBaseUrl` overrides without changing client code. Run it
-as a fleet of stateless nodes on Postgres + S3/MinIO, or as a single zero-dependency
+as a fleet of stateless nodes on Postgres + S3-compatible object storage, or as a single zero-dependency
 process on SQLite + plain files.
 
 ## Architecture at a glance
@@ -21,7 +21,7 @@ flowchart TB
     end
 
     refs[("Postgres — ref CAS + metadata<br/>(local mode: SQLite)")]
-    packs[("S3 / MinIO — immutable packs<br/>(local mode: plain files)")]
+    packs[("S3-compatible store — immutable packs<br/>(local mode: plain files)")]
 
     clients --> api
     clients --> git
@@ -84,7 +84,7 @@ three; a bare binary brings none — install them on the host.
 ## Quickstart: local mode (60 seconds)
 
 Requires only the `codestorage` binary ([install](#install)) and git — no Docker, no
-Postgres, no MinIO. One flag derives the whole storage stack:
+Postgres, no object store. One flag derives the whole storage stack:
 `sqlite://<dir>/codestorage.db` (refs + metadata), `file://<dir>/blobs` (packs as plain
 files), and `<dir>/cache` (rebuildable cache).
 
@@ -119,7 +119,7 @@ survive restarts, so it doubles as a tiny durable git server.
 
 ## Quickstart: multi-node with Docker Compose
 
-Two stateless server replicas (`node-a`, `node-b`) share one Postgres + MinIO stack, built
+Two stateless server replicas (`node-a`, `node-b`) share one Postgres + SeaweedFS stack, built
 from the repo `Dockerfile` — a push through one node is immediately visible through the
 other. This is a **development stack** for demonstrating multi-node statelessness (default
 credentials, published backing-service ports, plain HTTP) — not a hardened deployment
@@ -148,11 +148,11 @@ git clone "http://t:${TOK_GIT}@127.0.0.1:8082/demo.git" /tmp/demo-b
 curl -s http://127.0.0.1:8081/api/v1/repo    -H "Authorization: Bearer $TOK_GIT"
 curl -s http://127.0.0.1:8082/api/repos/demo -H "Authorization: Bearer $TOK_GIT"
 
-# 6. Teardown (drops the Postgres/MinIO volumes too).
+# 6. Teardown (drops the Postgres/SeaweedFS volumes too).
 docker compose --profile replicas down -v
 ```
 
-Host ports and key locations are env-overridable (`PGPORT`, `MINIOPORT`, `NODEA_PORT`,
+Host ports and key locations are env-overridable (`PGPORT`, `S3PORT`, `NODEA_PORT`,
 `NODEB_PORT`, `CS_KEYS_DIR`) — see the [`docker-compose.yml`](docker-compose.yml) header.
 To run the server on the host against just the backing services, boot them with plain
 `docker compose up -d --wait` and point `CODESTORAGE_PG_URL` / `CODESTORAGE_S3_URL` at the
@@ -170,7 +170,7 @@ published ports ([configuration reference](docs/reference/configuration.md)).
   commit-signature verification ([git protocol](docs/explanation/git-protocol-and-namespaces.md)),
   behind the same per-org JWT verifier as the API
   ([auth spec](docs/reference/authentication.md)).
-- **Git LFS on the same remote** — no separate LFS server: presigned S3/MinIO downloads
+- **Git LFS on the same remote** — no separate LFS server: presigned S3 downloads
   (server-proxied in local mode) and verified, quota-metered server-proxied uploads
   ([git protocol](docs/explanation/git-protocol-and-namespaces.md)).
 - **Eventing & sync**: HMAC-signed `push` / `repo.sync.*` webhooks, webhook +
@@ -214,7 +214,7 @@ legacy aliases — with defaults and validation constraints:
 ## Contributing & testing
 
 ```sh
-go test ./...   # needs Docker: boots real Postgres + MinIO via testcontainers
+go test ./...   # needs Docker: boots real Postgres + SeaweedFS via testcontainers
 ```
 
 Zero-container lanes cover the same surfaces on the local backends: the api integration
@@ -238,13 +238,13 @@ depth: **[testing reference](docs/reference/testing.md)**.
 | `internal/api` | `/api/v1` HTTP handlers, JWT middleware, `{"error"}` envelope |
 | `internal/auth` | JWT verification contract (per-org public keys, allowed algorithms) |
 | `internal/meta` | Metadata store: orgs, org public keys, repos, webhooks, git credentials, upstream links |
-| `internal/blob` | `BlobStore` contract + S3/MinIO and local-file implementations (immutable packs) |
+| `internal/blob` | `BlobStore` contract + S3 and local-file implementations (immutable packs) |
 | `internal/ref` | `RefStore` contract + Postgres and SQLite implementations (CAS ref authority) |
 | `internal/gitread` | Read-side git plumbing (ls-tree, log, diff, blame, grep, archive) over the hydrated cache repo |
 | `internal/githttp` | Git smart-HTTP server + LFS batch API, policy/verify-sig hooks, cache hydration, e2e suite |
 | `internal/events` | Outbound webhooks: HMAC-signed delivery + the push-event `RefStore` decorator |
 | `internal/sync` | Upstream mirror sync worker (fetch + loopback push), credential/upstream contracts |
 | `internal/jobs` | Background queue seam: durable River jobs (Postgres) or in-process (local mode) |
-| `docker-compose.yml` | Postgres + MinIO for local dogfooding, plus an opt-in two-replica `replicas` profile |
+| `docker-compose.yml` | Postgres + SeaweedFS for local dogfooding, plus an opt-in two-replica `replicas` profile |
 
 </details>

@@ -1,10 +1,11 @@
-# Local infra for codestorage: Postgres (ref authority + metadata) and MinIO
-# (immutable pack storage). The service itself runs on the host:
+# Local infra for codestorage: Postgres (ref authority + metadata) and
+# SeaweedFS (immutable pack storage via its S3 gateway; the tested reference
+# self-hosted store — issue #133). The service itself runs on the host:
 #   go run ./cmd/codestorage serve   (see README.md quickstart)
 #
 # Host ports are env-overridable because sibling checkouts/agents may share
 # the docker daemon; pick a unique compose project name too:
-#   PGPORT=15499 MINIOPORT=19499 docker compose -p codestorage-$(whoami) up -d --wait
+#   PGPORT=15499 S3PORT=18499 docker compose -p codestorage-$(whoami) up -d --wait
 services:
   postgres:
     image: postgres:17-alpine
@@ -17,26 +18,31 @@ services:
       interval: 2s
       timeout: 3s
       retries: 15
-  minio:
-    image: minio/minio:latest
-    command: server /data
-    environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin
+  seaweedfs:
+    # Qualified recipe (docs/plans/s3wal-phase1a-results.md): pinned image,
+    # one-process `weed server -s3`, anonymous auth (clients still need
+    # non-empty dummy AWS credentials for SigV4 signing). Never enable
+    # versioning or object-lock on data buckets (seaweedfs#8073 avoidance).
+    image: chrislusf/seaweedfs:4.42
+    command: server -s3 -dir=/data -ip.bind=0.0.0.0
     ports:
-      - "${MINIOPORT:-19000}:9000"
+      - "${S3PORT:-18333}:8333"
     healthcheck:
-      test: ["CMD-SHELL", "mc ready local || curl -sf http://127.0.0.1:9000/minio/health/live"]
+      # An anonymous ListBuckets against the S3 gateway: it 200s only once
+      # the filer chain behind the gateway can actually serve (the port
+      # accepts TCP well before that).
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8333/"]
       interval: 2s
       timeout: 3s
-      retries: 15
+      retries: 30
 
   # Opt-in two-replica app profile (`docker compose --profile replicas up`):
-  # two stateless nodes on the same Postgres+MinIO stack, proving multi-node
-  # statelessness in the README quickstart. Default `docker compose up` still
-  # boots only the backing services above. The nodes are identical except the
-  # host port mapping (and the base URL that embeds it). Keys come from the
-  # host (`./codestorage keygen --out ./compose-keys/cs-key`, see README).
+  # two stateless nodes on the same Postgres+SeaweedFS stack, proving
+  # multi-node statelessness in the README quickstart. Default
+  # `docker compose up` still boots only the backing services above. The
+  # nodes are identical except the host port mapping (and the base URL that
+  # embeds it). Keys come from the host
+  # (`./codestorage keygen --out ./compose-keys/cs-key`, see README).
   node-a: &node
     build: .
     profiles: ["replicas"]
@@ -44,13 +50,14 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-      minio:
+      seaweedfs:
         condition: service_healthy
     environment: &node-env
       CODESTORAGE_PG_URL: postgres://postgres:postgres@postgres:5432/postgres
-      CODESTORAGE_S3_URL: "s3://codestorage?endpoint=http://minio:9000&s3ForcePathStyle=true&region=us-east-1"
-      AWS_ACCESS_KEY_ID: minioadmin
-      AWS_SECRET_ACCESS_KEY: minioadmin
+      CODESTORAGE_S3_URL: "s3://codestorage?endpoint=http://seaweedfs:8333&s3ForcePathStyle=true&region=us-east-1"
+      # The gateway is anonymous; the SDK just needs non-empty credentials.
+      AWS_ACCESS_KEY_ID: codestorage
+      AWS_SECRET_ACCESS_KEY: codestorage
       CODESTORAGE_ORG: selfhost
       CODESTORAGE_ORG_PUBKEYS: /keys/cs-key.pub.pem
       CODESTORAGE_LISTEN: 0.0.0.0:8080
