@@ -70,7 +70,8 @@ rather than conflicts — see the table's last row:
 | JWT claim | `refs` policy tuples | `ops` (deprecated repo-wide op list; merged into the `"*"` pattern's policy alongside any `refs` tuples) |
 
 Responses mirror the legacy names alongside the current ones where upstream does (e.g.
-`url` mirrors `repo_name`, deleted-branch responses carry both `target_branch` and
+`url` mirrors `repo_name`, delete-repo responses carry `repo_name` plus the deprecated
+`repo_id`, deleted-branch responses carry both `target_branch` and
 `name`), so older SDK response parsing keeps working.
 
 ### Git protocol semantics
