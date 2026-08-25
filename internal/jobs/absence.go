@@ -45,6 +45,11 @@ type AbsenceRegistry interface {
 	// IsRepoPurged probes the repository purge fence (issue #52): fenced
 	// repos' rows are on their way out and are never covered.
 	IsRepoPurged(ctx context.Context, base string) (bool, error)
+	// HasPack and HasLFSObject are the sweeper's point probes, reused by
+	// the known-absent refresh to drop tracked rows that were retired,
+	// folded away, or purged since their discovery.
+	HasPack(ctx context.Context, repo, key string) (bool, error)
+	HasLFSObject(ctx context.Context, repo, key string) (bool, error)
 	// BumpLFSAdoptionGen invalidates cached usage floors after a cover
 	// made absent bytes visible to admission.
 	BumpLFSAdoptionGen(ctx context.Context, repo string) error
@@ -79,7 +84,13 @@ type AbsenceReport struct {
 	CoverErrors       int64 `json:"cover_errors"`
 	StatErrors        int64 `json:"stat_errors"`
 	RowsSkippedPurged int64 `json:"rows_skipped_purged"`
-	QuotaEnforced     bool  `json:"quota_enforced"`
+	// AbsentTracked is the known-absent refresh set's size at pass end:
+	// discovered losses whose covers re-charge every pass.
+	AbsentTracked int64 `json:"absent_tracked"`
+	// AbsentUntracked counts absent rows seen while the refresh set was
+	// full — covered on discovery, refreshed only by rotation revisits.
+	AbsentUntracked int64 `json:"absent_untracked"`
+	QuotaEnforced   bool  `json:"quota_enforced"`
 }
 
 const (
@@ -91,10 +102,24 @@ const (
 	// point Stats — remote HEAD requests, not row reads — so a default
 	// pass stays minutes, not hours.
 	DefaultAbsenceReconcileBudget = int64(100_000)
+	// MinAbsenceReconcileBudget is the configuration floor (Codex round
+	// 1, P2): one row can cost up to three units (registration probe +
+	// stat + twin probe), so a degenerate budget cannot guarantee the
+	// refresh/rotation split makes progress on both registries. The
+	// floor keeps every configurable budget far above single-row
+	// overdraw territory.
+	MinAbsenceReconcileBudget = int64(100)
 	// absencePassTimeout bounds one whole pass (the reclaimer's pattern):
 	// work units meter requests, but a degraded blob store can stretch
 	// each one — time, not just work, must bound the pass.
 	absencePassTimeout = time.Hour
+	// absentMemoCap bounds the known-absent refresh set (Codex round 1,
+	// P1): each tracked row costs up to three probes per pass, so the
+	// memo must not scale with an unbounded loss population. Losses
+	// discovered while the memo is full are covered on discovery but
+	// refreshed only by the rotation — a storage incident that large is
+	// operator territory regardless, and the pass logs the overflow.
+	absentMemoCap = 10_000
 )
 
 // AbsenceReconciler runs the reconciliation scan. Construct with
@@ -120,6 +145,32 @@ type AbsenceReconciler struct {
 	// fleet persistence). Empty = start of the keyspace.
 	lfsAfterRepo, lfsAfterKey  string
 	packAfterRepo, packAfterID string
+	// knownAbsent tracks rows a prior pass proved truly absent, keyed by
+	// the row's blob key (Codex round 1, P1): covers are TTL'd, and on a
+	// registry larger than one pass's budget the rotation returns to a
+	// row less often than its cover survives — the visibility window
+	// would silently reopen between visits. Every pass re-settles this
+	// set FIRST, independent of the rotation, so a discovered loss stays
+	// covered at the pass cadence (wiring warns when the cadence exceeds
+	// the TTL). In-memory per process like the cursors: a restart loses
+	// it and the rotation rediscovers — convergence delay, never
+	// corruption (#121 tracks fleet persistence).
+	knownAbsent map[string]absentRow
+	// passes counts completed Run invocations to alternate phase order
+	// (Codex round 1, P2): a twin probe can overdraw the LFS allocation
+	// by one unit, and at degenerate budgets a fixed order would hand
+	// the pack phase zero units forever.
+	passes int64
+}
+
+// absentRow is one tracked truly-absent registry row: everything the
+// refresh needs to re-verify registration and re-settle it.
+type absentRow struct {
+	repo  string
+	id    string // packs keyset component; empty for LFS rows
+	key   string // the row's blob key
+	bytes int64
+	pack  bool
 }
 
 // NewAbsenceReconciler wires the reconciliation job.
@@ -137,6 +188,7 @@ func NewAbsenceReconciler(registry AbsenceRegistry, blobs BlobStatter, quotaEnfo
 		coverTTL:      coverTTL,
 		logger:        logger,
 		passTimeout:   absencePassTimeout,
+		knownAbsent:   make(map[string]absentRow),
 	}
 }
 
@@ -147,6 +199,7 @@ type absencePassState struct {
 	purged      map[string]bool // memoized purge-fence probes
 	probeFailed map[string]bool // probe errored: reported once, fence deferred to the reserve
 	coverSkip   map[string]bool // one cover denial skips the base for the rest of the pass
+	settled     map[string]bool // rows settled this pass: the rotation skips refresh-visited rows
 }
 
 func newAbsencePassState() *absencePassState {
@@ -154,15 +207,18 @@ func newAbsencePassState() *absencePassState {
 		purged:      make(map[string]bool),
 		probeFailed: make(map[string]bool),
 		coverSkip:   make(map[string]bool),
+		settled:     make(map[string]bool),
 	}
 }
 
-// Run executes one bounded reconciliation pass: page lfs_objects rows from
-// the LFS cursor, then packs rows from the pack cursor, point-checking
-// each row's bytes and covering genuine losses. The budget is split so the
-// pack registry can never starve behind an LFS registry larger than a
-// whole budget (both tables are attacker-growable): LFS gets the first
-// half, packs the second half plus any LFS leftover.
+// Run executes one bounded reconciliation pass. Order (Codex round 1):
+// the known-absent set is re-settled FIRST — keeping already-discovered
+// losses covered is the correctness core and must not wait on the
+// rotation — then the two registry rotations split the remaining budget.
+// The leading rotation alternates between passes: a twin probe can
+// overdraw the leader's allocation by one unit, and at degenerate budgets
+// a fixed order would starve the trailing table forever; alternation
+// guarantees each table leads every other pass.
 func (r *AbsenceReconciler) Run(ctx context.Context) (AbsenceReport, error) {
 	report := AbsenceReport{QuotaEnforced: r.quotaEnforced}
 	assertf(r.passTimeout > 0, "Run: non-positive pass timeout %v", r.passTimeout)
@@ -170,9 +226,24 @@ func (r *AbsenceReconciler) Run(ctx context.Context) (AbsenceReport, error) {
 	defer cancelPass()
 	var errs boundedErrs
 	st := newAbsencePassState()
-	lfsBudget := r.budget - r.budget/2
-	charged := r.lfsPhase(ctx, lfsBudget, &report, st, &errs)
-	r.packPhase(ctx, r.budget-charged, &report, st, &errs)
+	// The refresh gets at most half the budget so a large tracked set
+	// cannot starve discovery entirely; while 3×tracked stays within that
+	// half every tracked cover refreshes every pass (map order randomizes
+	// which entries wait when it does not).
+	remaining := r.budget - r.refreshKnownAbsent(ctx, r.budget-r.budget/2, &report, st, &errs)
+	if remaining < 0 {
+		remaining = 0
+	}
+	half := remaining - remaining/2
+	if r.passes%2 == 0 {
+		charged := r.lfsPhase(ctx, half, &report, st, &errs)
+		r.packPhase(ctx, remaining-charged, &report, st, &errs)
+	} else {
+		charged := r.packPhase(ctx, half, &report, st, &errs)
+		r.lfsPhase(ctx, remaining-charged, &report, st, &errs)
+	}
+	r.passes++
+	report.AbsentTracked = int64(len(r.knownAbsent))
 	r.logger.Info("absence reconcile pass finished",
 		"lfs_rows_examined", report.LFSRowsExamined,
 		"pack_rows_examined", report.PackRowsExamined,
@@ -185,8 +256,69 @@ func (r *AbsenceReconciler) Run(ctx context.Context) (AbsenceReport, error) {
 		"cover_errors", report.CoverErrors,
 		"stat_errors", report.StatErrors,
 		"rows_skipped_purged", report.RowsSkippedPurged,
+		"absent_tracked", report.AbsentTracked,
 		"quota_enforced", report.QuotaEnforced)
 	return report, errs.join()
+}
+
+// refreshKnownAbsent re-settles every tracked truly-absent row within
+// budget: verify the registry row still exists (retired, folded-away, and
+// purge-completed rows are dropped), then re-settle it exactly like a
+// rotation visit — re-charging the cover while the bytes stay absent, and
+// dropping the row from the set the moment it heals. Entries the budget
+// cannot reach this pass stay tracked for the next one.
+func (r *AbsenceReconciler) refreshKnownAbsent(ctx context.Context, budget int64, report *AbsenceReport, st *absencePassState, errs *boundedErrs) (charged int64) {
+	for key, row := range r.knownAbsent {
+		if ctx.Err() != nil {
+			errs.add(ctx.Err())
+			return charged
+		}
+		if charged >= budget {
+			return charged
+		}
+		charged++ // the registration probe
+		var registered bool
+		var err error
+		if row.pack {
+			registered, err = r.registry.HasPack(ctx, row.repo, row.key)
+		} else {
+			registered, err = r.registry.HasLFSObject(ctx, row.repo, row.key)
+		}
+		if err != nil {
+			errs.add(fmt.Errorf("absence reconcile: refresh registration probe %s: %w", key, err))
+			continue // still tracked; retried next pass
+		}
+		if !registered {
+			delete(r.knownAbsent, key)
+			continue
+		}
+		if row.pack {
+			charged += r.settlePackRow(ctx, ref.AbsencePackRow{Repo: row.repo, ID: row.id, Key: row.key, Bytes: row.bytes}, report, st, errs)
+		} else {
+			charged += r.settleLFSRow(ctx, ref.AbsenceLFSRow{Repo: row.repo, Key: row.key, Bytes: row.bytes}, report, st, errs)
+		}
+	}
+	return charged
+}
+
+// trackAbsent records a truly-absent row for per-pass cover refresh. Only
+// coverable rows are tracked: with quota unenforced or an unknown size
+// there is no cover to keep alive, and the rotation's detection logging
+// already covers reporting.
+func (r *AbsenceReconciler) trackAbsent(row absentRow, report *AbsenceReport) {
+	if !r.quotaEnforced {
+		return
+	}
+	if _, ok := r.knownAbsent[row.key]; ok {
+		return
+	}
+	if len(r.knownAbsent) >= absentMemoCap {
+		report.AbsentUntracked++
+		r.logger.Warn("absence reconcile: known-absent set is full; this loss refreshes only on rotation revisits",
+			"key", row.key, "cap", absentMemoCap)
+		return
+	}
+	r.knownAbsent[row.key] = row
 }
 
 // cursorAfter reports whether (repoB, keyB) sorts strictly after
@@ -250,28 +382,27 @@ func (r *AbsenceReconciler) lfsPhase(ctx context.Context, budget int64, report *
 }
 
 // packPhase mirrors lfsPhase over packs rows.
-func (r *AbsenceReconciler) packPhase(ctx context.Context, budget int64, report *AbsenceReport, st *absencePassState, errs *boundedErrs) {
+func (r *AbsenceReconciler) packPhase(ctx context.Context, budget int64, report *AbsenceReport, st *absencePassState, errs *boundedErrs) (charged int64) {
 	afterRepo, afterID := r.packAfterRepo, r.packAfterID
 	startRepo, startID := afterRepo, afterID
 	startedAtZero := afterRepo == "" && afterID == ""
 	wrapped := startedAtZero
 	defer func() { r.packAfterRepo, r.packAfterID = afterRepo, afterID }()
-	var charged int64
 	for charged < budget {
 		if ctx.Err() != nil {
 			errs.add(ctx.Err())
-			return
+			return charged
 		}
 		limit := r.pageLimit(budget - charged)
 		rows, err := r.registry.ListFleetPacks(ctx, afterRepo, afterID, limit)
 		if err != nil {
 			errs.add(fmt.Errorf("absence reconcile: list packs: %w", err))
-			return
+			return charged
 		}
 		if len(rows) == 0 {
 			if wrapped {
 				afterRepo, afterID = "", ""
-				return
+				return charged
 			}
 			afterRepo, afterID, wrapped = "", "", true
 			continue
@@ -279,19 +410,20 @@ func (r *AbsenceReconciler) packPhase(ctx context.Context, budget int64, report 
 		for _, row := range rows {
 			if wrapped && !startedAtZero && cursorAfter(startRepo, startID, row.Repo, row.ID) {
 				afterRepo, afterID = "", ""
-				return
+				return charged
 			}
 			if ctx.Err() != nil {
 				errs.add(ctx.Err())
-				return
+				return charged
 			}
 			if charged >= budget {
-				return
+				return charged
 			}
 			charged += r.settlePackRow(ctx, row, report, st, errs)
 			afterRepo, afterID = row.Repo, row.ID
 		}
 	}
+	return charged
 }
 
 func (r *AbsenceReconciler) pageLimit(remaining int64) int {
@@ -308,11 +440,16 @@ func (r *AbsenceReconciler) pageLimit(remaining int64) int {
 // twin-spelling probe.
 func (r *AbsenceReconciler) settleLFSRow(ctx context.Context, row ref.AbsenceLFSRow, report *AbsenceReport, st *absencePassState, errs *boundedErrs) (charged int64) {
 	charged = 1
-	report.LFSRowsExamined++
 	assertf(row.Repo != "" && row.Key != "" && row.Bytes >= 0, "settleLFSRow: bad row %+v", row)
+	if st.settled[row.Key] {
+		return charged // the refresh already settled this row this pass
+	}
+	st.settled[row.Key] = true
+	report.LFSRowsExamined++
 	base := baseOf(row.Repo)
 	if r.repoPurged(ctx, base, st, errs) {
 		report.RowsSkippedPurged++
+		delete(r.knownAbsent, row.Key)
 		return charged
 	}
 	if row.Bytes == 0 {
@@ -322,6 +459,7 @@ func (r *AbsenceReconciler) settleLFSRow(ctx context.Context, row ref.AbsenceLFS
 		return charged
 	}
 	if _, err := r.blobs.Stat(ctx, row.Key); err == nil {
+		delete(r.knownAbsent, row.Key)
 		return charged // physically present under the registered spelling
 	} else if !errors.Is(err, blob.ErrNotFound) {
 		report.StatErrors++
@@ -349,6 +487,7 @@ func (r *AbsenceReconciler) settleLFSRow(ctx context.Context, row ref.AbsenceLFS
 		charged++
 		if _, err := r.blobs.Stat(ctx, twin); err == nil {
 			report.LFSRowsTwinOnly++
+			delete(r.knownAbsent, row.Key)
 			r.logger.Warn("absence reconcile: registered lfs object present only under its twin spelling",
 				"repo", row.Repo, "key", row.Key, "twin", twin, "bytes", row.Bytes)
 			return charged
@@ -361,6 +500,7 @@ func (r *AbsenceReconciler) settleLFSRow(ctx context.Context, row ref.AbsenceLFS
 	report.LFSRowsAbsent++
 	r.logger.Error("absence reconcile: registered lfs object bytes are missing from blob storage",
 		"repo", row.Repo, "key", row.Key, "bytes", row.Bytes)
+	r.trackAbsent(absentRow{repo: row.Repo, key: row.Key, bytes: row.Bytes}, report)
 	r.cover(ctx, base, coverKey, row.Bytes, report, st, errs)
 	return charged
 }
@@ -368,14 +508,20 @@ func (r *AbsenceReconciler) settleLFSRow(ctx context.Context, row ref.AbsenceLFS
 // settlePackRow point-checks one packs row and covers a genuine loss.
 func (r *AbsenceReconciler) settlePackRow(ctx context.Context, row ref.AbsencePackRow, report *AbsenceReport, st *absencePassState, errs *boundedErrs) (charged int64) {
 	charged = 1
-	report.PackRowsExamined++
 	assertf(row.Repo != "" && row.ID != "" && row.Key != "" && row.Bytes >= 0, "settlePackRow: bad row %+v", row)
+	if st.settled[row.Key] {
+		return charged // the refresh already settled this row this pass
+	}
+	st.settled[row.Key] = true
+	report.PackRowsExamined++
 	base := baseOf(row.Repo)
 	if r.repoPurged(ctx, base, st, errs) {
 		report.RowsSkippedPurged++
+		delete(r.knownAbsent, row.Key)
 		return charged
 	}
 	if _, err := r.blobs.Stat(ctx, row.Key); err == nil {
+		delete(r.knownAbsent, row.Key)
 		return charged
 	} else if !errors.Is(err, blob.ErrNotFound) {
 		report.StatErrors++
@@ -393,6 +539,7 @@ func (r *AbsenceReconciler) settlePackRow(ctx context.Context, row ref.AbsencePa
 		report.PackRowsUnsized++
 		return charged
 	}
+	r.trackAbsent(absentRow{repo: row.Repo, id: row.ID, key: row.Key, bytes: row.Bytes, pack: true}, report)
 	r.cover(ctx, base, row.Key, row.Bytes, report, st, errs)
 	return charged
 }

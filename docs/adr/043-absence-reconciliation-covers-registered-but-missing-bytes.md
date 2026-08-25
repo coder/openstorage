@@ -33,6 +33,20 @@ restore (PR #104) heals the spelling through the digest-verified adopt
 pipeline, so they are reported (`lfs_rows_twin_only`), never charged. Only
 rows absent under BOTH spellings are genuine loss.
 
+Discovery is rotation-bounded, but refresh is not (Codex round 1): covers
+are TTL'd, and on a registry larger than one pass's budget the rotation
+returns to a row less often than its cover survives — so every discovered
+loss joins a bounded per-process known-absent set (10,000 rows) that each
+pass re-settles FIRST, within half the budget: re-verify the registry row
+still exists (`HasPack`/`HasLFSObject`; retired, folded-away, and purged
+rows drop out), then re-settle it exactly like a rotation visit. The set is
+in-memory like the cursors: a restart loses it and the rotation
+rediscovers — convergence delay, never corruption. The rotation leader
+alternates between the two registries each pass, since a twin probe can
+overdraw the leader's allocation by a unit; a configuration floor
+(`MinAbsenceReconcileBudget`) keeps budgets out of single-row-overdraw
+territory.
+
 A genuine loss is charged through the existing round-57/58 seam,
 `ref.ReserveRestoreCover`, under the canonical spelling plus
 `/repair-cover` — the same reservation row the restore paths renew, so a

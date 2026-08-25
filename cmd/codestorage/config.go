@@ -945,8 +945,11 @@ func resolveAbsenceSettings(getenv func(string) string) (absenceSettings, error)
 		if err != nil {
 			return absenceSettings{}, fmt.Errorf("%s: %w", envAbsenceReconcileBudget, err)
 		}
-		if v <= 0 {
-			return absenceSettings{}, fmt.Errorf("%s must be positive, got %q", envAbsenceReconcileBudget, raw)
+		if v < jobs.MinAbsenceReconcileBudget {
+			// One row can cost up to three units, so a degenerate budget
+			// cannot guarantee the refresh/rotation split progresses on
+			// both registries — reject it loudly.
+			return absenceSettings{}, fmt.Errorf("%s must be at least %d, got %q", envAbsenceReconcileBudget, jobs.MinAbsenceReconcileBudget, raw)
 		}
 		s.budget = v
 	}

@@ -784,15 +784,22 @@ integrity loss logged loudly: committed refs may reference it). See the
 ### `CODESTORAGE_ABSENCE_RECONCILE_BUDGET`
 
 Caps the work units one reconciliation pass may charge: one per registry row
-examined plus one per extra twin-spelling probe — each unit is at most one
-blob-store HEAD request. A budget-limited pass parks its keyset cursor and
-the next pass resumes strictly after it, so arbitrarily large registries
-reconcile across passes. The budget is split between the two registries (the
-pack phase gets half plus the LFS phase's leftover), and a one-hour
-wall-clock cap bounds the pass even when a degraded blob store stretches
-individual probes.
+examined plus one per extra registration or twin-spelling probe — each unit
+is at most one blob-store HEAD or registry point read. A budget-limited pass
+parks its keyset cursor and the next pass resumes strictly after it, so
+arbitrarily large registries reconcile across passes. Within a pass, up to
+half the budget first **re-settles already-discovered losses** (keeping
+their covers refreshed every pass, independent of the rotation), then the
+two registry rotations split the remainder with an alternating leader; a
+one-hour wall-clock cap bounds the pass even when a degraded blob store
+stretches individual probes.
 
-- **Default:** `100000`. **Constraints:** a positive integer.
+- **Default:** `100000`. **Constraints:** an integer of at least `100`
+  (one row can cost up to three units, so degenerate budgets cannot
+  guarantee progress on both registries).
+- Keep the budget's refresh half comfortably above three units per
+  concurrently tracked loss (`absent_tracked` in the pass report; capped
+  at 10,000) so every known loss re-covers every pass.
 
 ### `CODESTORAGE_REPACK_THRESHOLD`
 

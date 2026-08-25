@@ -1317,6 +1317,7 @@ func TestResolveAbsenceSettings(t *testing.T) {
 		"malformed interval": {envAbsenceReconcileInterval: "soon"},
 		"zero budget":        {envAbsenceReconcileBudget: "0"},
 		"negative budget":    {envAbsenceReconcileBudget: "-5"},
+		"sub-floor budget":   {envAbsenceReconcileBudget: "99"},
 		"malformed budget":   {envAbsenceReconcileBudget: "many"},
 	} {
 		t.Run(name, func(t *testing.T) {
