@@ -88,13 +88,15 @@ parity), since a twin probe can overdraw the leader's allocation by a
 unit; a configuration floor (`MinAbsenceReconcileBudget`) keeps budgets
 out of single-row-overdraw territory. Legacy nonce-keyed covers minted by
 pre-#125 workers — at any point of a mixed-version roll — are MIGRATED on
-first sight: their totals fold into the base's deterministic LFS-class
-incarnation via the ledger's GREATEST merge (grow-only; the rotation
-right-sizes the merged row within one clean range observation), after
-which the nonce row decays by TTL. Never deleted: an old replica may
-still depend on its own nonce rows mid-roll. Migration is re-applied at
-most once per worker process (a memo, not a correctness dependency), so
-replays only re-inflate transiently.
+first sight: a pre-#125 cover aggregates BOTH classes' deficits with no
+class split, so its total folds into BOTH of the base's deterministic
+class incarnations via the ledger's GREATEST merge (grow-only; each
+class's own rotation right-sizes or row-less-releases its copy within one
+clean range observation, and the transient over-cover until then only
+tightens admission), after which the nonce row decays by TTL. Never
+deleted: an old replica may still depend on its own nonce rows mid-roll.
+Migration is re-applied at most once per worker process (a memo, not a
+correctness dependency), so replays only re-inflate transiently.
 
 Resolved residual (issue #125, with #121): the original design kept the
 known-absent set and rotation cursors in process memory, making refresh

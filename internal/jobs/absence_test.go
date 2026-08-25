@@ -795,28 +795,36 @@ func TestAbsenceReconcile_SplitShortCopiesClassifiedTruncated(t *testing.T) {
 	}
 }
 
-// TestAbsenceReconcile_LegacyCoverMigrated (Codex round 4, P1): nonce-keyed
-// covers minted by pre-#125 workers — at ANY point of a mixed-version roll
-// — are folded into the base's deterministic incarnation on first sight,
-// which every new-replica pass keeps renewed; the nonce row itself is
-// never deleted (an old replica may depend on it) and expires by TTL.
+// TestAbsenceReconcile_LegacyCoverMigrated (Codex round 4+5, P1s):
+// nonce-keyed covers minted by pre-#125 workers — at ANY point of a
+// mixed-version roll — are folded into the base's deterministic
+// incarnations on first sight, which every new-replica pass keeps renewed;
+// the nonce row itself is never deleted (an old replica may depend on it)
+// and expires by TTL. A pre-#125 cover aggregates BOTH classes' deficits,
+// so the total folds into BOTH class incarnations and each class's own
+// clean range right-sizes its copy — the pack portion must survive the
+// nonce's decay even though the fold happens during the LFS-keyed renewal.
 func TestAbsenceReconcile_LegacyCoverMigrated(t *testing.T) {
 	f := newSweepFixture(t)
 	ctx := context.Background()
 	base := "repo-legacy-cover"
-	// A registered-but-missing row keeps the base's range alive so the
-	// migrated incarnation is not released as row-less; the legacy cover
-	// carries a LARGER total (the old replica had seen more losses).
+	// Registered-but-missing rows in BOTH classes keep the base's ranges
+	// alive so neither migrated incarnation is released as row-less; the
+	// legacy cover carries a LARGER total (the old replica had seen more
+	// losses) than either class's exact deficit.
 	registerLFS(t, f, base, blob.LFSKey(base, absenceOID('a')), 100)
+	if err := f.store.RegisterPacks(ctx, base, []ref.Pack{{ID: "lost", Key: blob.PackKey(base, "lost"), Size: 200}}); err != nil {
+		t.Fatal(err)
+	}
 	legacyKey := ref.AbsenceCoverPrefix + base + "/" + ref.NewReservationOwner()
 	if err := ref.ReserveRestoreCover(ctx, absenceRegistry(t, f), blob.QuotaRepoGroup(base), legacyKey, 555, time.Hour); err != nil {
 		t.Fatalf("seed legacy cover: %v", err)
 	}
 
 	// Pass 1: the renewal listing migrates the 555-byte legacy total into
-	// the deterministic lfs incarnation (grow-only GREATEST merge) and
-	// stops renewing the nonce row; the rotation's own discovery keeps
-	// charging the same incarnation.
+	// BOTH deterministic incarnations (grow-only GREATEST merges) and
+	// stops renewing the nonce row; the rotations' own discovery keeps
+	// charging the same incarnations.
 	r := testReconciler(t, f, true, 1000)
 	report, err := r.Run(ctx)
 	if err != nil {
@@ -825,27 +833,28 @@ func TestAbsenceReconcile_LegacyCoverMigrated(t *testing.T) {
 	if report.CoversDecaying != 1 {
 		t.Fatalf("pass 1 report = %+v, want the legacy cover migrated and decaying", report)
 	}
-	// The same pass's clean full-range observation right-sizes the
-	// migrated 555 down to the registry-exact 100 (rotate + release the
-	// superseded row). Ledger: nonce row (555, decaying inside its TTL)
-	// + right-sized incarnation (100).
-	if report.CoversRotated != 1 {
-		t.Fatalf("pass 1 report = %+v, want the migrated total right-sized by the rotation", report)
+	// The same pass's clean full-range observations right-size each
+	// migrated 555 down to its class's registry-exact deficit (rotate +
+	// release the superseded rows). Ledger: nonce row (555, decaying
+	// inside its TTL) + right-sized lfs (100) and packs (200)
+	// incarnations.
+	if report.CoversRotated != 2 {
+		t.Fatalf("pass 1 report = %+v, want both migrated totals right-sized by the rotations", report)
 	}
-	if got := ledgerReserved(t, f, base); got != 555+100 {
-		t.Fatalf("reserved = %d, want the decaying nonce row plus the right-sized incarnation", got)
+	if got := ledgerReserved(t, f, base); got != 555+100+200 {
+		t.Fatalf("reserved = %d, want the decaying nonce row plus both right-sized incarnations", got)
 	}
 
-	// Pass 2: steady state — the exact incarnation renews; the nonce row
+	// Pass 2: steady state — the exact incarnations renew; the nonce row
 	// keeps decaying (never deleted, still inside its TTL).
 	report, err = r.Run(ctx)
 	if err != nil {
 		t.Fatalf("Run 2: %v", err)
 	}
-	if report.CoversDecaying != 1 || report.CoversRenewed == 0 || report.CoversReleased != 0 {
-		t.Fatalf("pass 2 report = %+v, want incarnation renewed and nonce still decaying", report)
+	if report.CoversDecaying != 1 || report.CoversRenewed < 2 || report.CoversReleased != 0 {
+		t.Fatalf("pass 2 report = %+v, want incarnations renewed and nonce still decaying", report)
 	}
-	if got := ledgerReserved(t, f, base); got != 555+100 {
+	if got := ledgerReserved(t, f, base); got != 555+100+200 {
 		t.Fatalf("reserved after pass 2 = %d, want unchanged", got)
 	}
 }

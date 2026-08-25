@@ -661,33 +661,31 @@ func (r *AbsenceReconciler) renewCovers(ctx context.Context, budget int64, repor
 }
 
 // migrateLegacyCover folds one pre-#125 nonce-keyed cover into its base's
-// deterministic LFS-class incarnation (Codex round 4, P1): the ledger's
-// GREATEST merge grows the incarnation to at least the legacy total —
-// same-universe totals, so max is the right merge — and the rotation
-// right-sizes it within one clean range observation. The nonce row then
-// decays by TTL, un-renewed. If anything fails, the legacy row is renewed
-// as-is so nothing lapses; the next pass retries the migration.
+// deterministic incarnations (Codex round 4, P1): the ledger's GREATEST
+// merge grows each incarnation to at least the legacy total — same-universe
+// totals, so max is the right merge. A pre-#125 cover aggregates BOTH
+// classes' deficits with no class split (Codex round 5, P1), so the total
+// folds into BOTH class incarnations: each class's own next clean range
+// right-sizes (or row-less-releases) its copy, and until then the transient
+// over-cover only tightens admission. The nonce row then decays by TTL,
+// un-renewed — but only once both folds are proven durable; if either
+// fails, the legacy row is renewed as-is so nothing lapses, and the next
+// pass retries (grow-only merges make the retry idempotent).
 func (r *AbsenceReconciler) migrateLegacyCover(ctx context.Context, row *ref.AbsenceCoverRow, report *AbsenceReport, st *absencePassState, errs *boundedErrs) {
 	if r.migratedLegacy[row.RawKey] {
 		report.CoversDecaying++ // already folded by this process: decay on
 		return
 	}
-	head, ok := r.resolveHead(ctx, row.Base, absenceClassLFS, st, errs)
-	migrated := false
-	if ok {
-		target := head
-		if target.key == "" {
-			target = liveCover{key: absenceIncarnationKey(row.Base, absenceClassLFS, 1), n: 1}
+	migrated := true
+	for _, class := range []string{absenceClassLFS, absenceClassPacks} {
+		if !r.foldIntoIncarnation(ctx, row.Base, class, row.Bytes, report, st, errs) {
+			migrated = false
+			break
 		}
-		if r.chargeCover(ctx, row.Base, target.key, row.Bytes, report, st, errs) {
-			if row.Bytes > target.bytes {
-				target.bytes = row.Bytes
-			}
-			r.liveCovers[absenceClassLFS][row.Base] = target
-			r.migratedLegacy[row.RawKey] = true
-			report.CoversDecaying++
-			migrated = true
-		}
+	}
+	if migrated {
+		r.migratedLegacy[row.RawKey] = true
+		report.CoversDecaying++
 	}
 	if !migrated {
 		// Migration could not be proven durable (head lookup or charge
@@ -701,6 +699,29 @@ func (r *AbsenceReconciler) migrateLegacyCover(ctx context.Context, row *ref.Abs
 			report.CoversRenewed++
 		}
 	}
+}
+
+// foldIntoIncarnation grows one class's live incarnation to at least bytes,
+// minting incarnation 1 when the class has none. Reports whether the grown
+// total is proven durable in the ledger.
+func (r *AbsenceReconciler) foldIntoIncarnation(ctx context.Context, base, class string, bytes int64, report *AbsenceReport, st *absencePassState, errs *boundedErrs) bool {
+	assertf(bytes >= 0, "foldIntoIncarnation: negative total %d for %s/%s", bytes, base, class)
+	head, ok := r.resolveHead(ctx, base, class, st, errs)
+	if !ok {
+		return false
+	}
+	target := head
+	if target.key == "" {
+		target = liveCover{key: absenceIncarnationKey(base, class, 1), n: 1}
+	}
+	if !r.chargeCover(ctx, base, target.key, bytes, report, st, errs) {
+		return false
+	}
+	if bytes > target.bytes {
+		target.bytes = bytes
+	}
+	r.liveCovers[class][base] = target
+	return true
 }
 
 // cursorAfter reports whether (repoB, keyB) sorts strictly after
