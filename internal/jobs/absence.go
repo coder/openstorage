@@ -282,6 +282,12 @@ type AbsenceReconciler struct {
 	// bound stays strictly conservative (no floor; SQLite's ±1s age
 	// over-read only resets earlier). Shrinkable in tests.
 	cursorStaleAge time.Duration
+	// renewalSafeAge bounds how old the renewal-health watermark may be
+	// for a renewal FAILURE to stay provably harmless: coverTTL minus
+	// the scheduling interval minus the pass wall clock, so covers
+	// outlive even a fully wasted attempt until the next one (Codex
+	// round 27). A failure past the bound arms the admission fence.
+	renewalSafeAge time.Duration
 
 	// Per-pass scratch, loaded from durable state at Run start and parked
 	// at Run end.
@@ -494,12 +500,16 @@ func parseAbsenceCoverKey(key string) (base, class string, n int64, legacy, ok b
 	return base, "", 0, true, true // legacy or foreign segment: renew-then-retire class
 }
 
-// NewAbsenceReconciler wires the reconciliation job.
-func NewAbsenceReconciler(registry AbsenceRegistry, blobs BlobStatter, quotaEnforced bool, budget int64, coverTTL time.Duration, logger *slog.Logger) *AbsenceReconciler {
+// NewAbsenceReconciler wires the reconciliation job. interval is the
+// scheduling cadence between passes: the admission fence's lapse safety
+// bound must cover the time until the NEXT renewal attempt (Codex round
+// 27 on PR #132), not just the current pass.
+func NewAbsenceReconciler(registry AbsenceRegistry, blobs BlobStatter, quotaEnforced bool, budget int64, coverTTL, interval time.Duration, logger *slog.Logger) *AbsenceReconciler {
 	assertf(registry != nil, "NewAbsenceReconciler: nil registry")
 	assertf(blobs != nil, "NewAbsenceReconciler: nil blob statter")
 	assertf(budget > 0, "NewAbsenceReconciler: non-positive budget %d", budget)
 	assertf(coverTTL > 0, "NewAbsenceReconciler: non-positive cover TTL %v", coverTTL)
+	assertf(interval > 0, "NewAbsenceReconciler: non-positive interval %v", interval)
 	assertf(logger != nil, "NewAbsenceReconciler: nil logger")
 	passTimeout := absencePassTimeout
 	if quarter := coverTTL / 4; quarter < passTimeout {
@@ -507,6 +517,19 @@ func NewAbsenceReconciler(registry AbsenceRegistry, blobs BlobStatter, quotaEnfo
 	}
 	staleAge := coverTTL - passTimeout
 	assertf(staleAge > 0, "NewAbsenceReconciler: non-positive cursor stale bound %v", staleAge)
+	// A renewal failure is provably harmless only while the last
+	// successful touch is fresh enough that covers survive until the
+	// NEXT attempt even if this one accomplished nothing: the next
+	// touch lands within interval (cadence) + passTimeout (a coalesced
+	// tick waiting out a running pass) of the failure, so the bound is
+	// TTL minus both (Codex round 27: bounding by the current pass
+	// alone left a gap — at the documented maximum interval of TTL/2 a
+	// failure at age TTL/2 stayed unfenced, and by the next attempt
+	// the covers were already past the TTL, where the strict-TTL bulk
+	// touch cannot resurrect them).
+	renewalSafeAge := coverTTL - interval - passTimeout
+	assertf(renewalSafeAge > 0,
+		"NewAbsenceReconciler: interval %v + pass timeout %v must stay below cover TTL %v", interval, passTimeout, coverTTL)
 	return &AbsenceReconciler{
 		registry:       registry,
 		blobs:          blobs,
@@ -516,6 +539,7 @@ func NewAbsenceReconciler(registry AbsenceRegistry, blobs BlobStatter, quotaEnfo
 		logger:         logger,
 		passTimeout:    passTimeout,
 		cursorStaleAge: staleAge,
+		renewalSafeAge: renewalSafeAge,
 	}
 }
 
@@ -851,7 +875,8 @@ func (r *AbsenceReconciler) saveProofs(sctx context.Context, errs *boundedErrs) 
 // armAdmissionFence writes the durable admission-fence marker when a
 // bulk-renewal failure can no longer be proven harmless (Codex round 26,
 // security): if the renewal-health watermark is absent or older than the
-// cover-lapse safety bound (cursorStaleAge = coverTTL - passTimeout),
+// cover-lapse safety bound (renewalSafeAge — TTL minus the cadence to
+// the next attempt minus the pass wall clock, Codex round 27),
 // live covers may lapse un-renewed before the next successful pass, and
 // strict-TTL admission queries would silently under-count them —
 // reopening the exact quota headroom the covers exist to close. The
@@ -873,8 +898,8 @@ func (r *AbsenceReconciler) armAdmissionFence(ctx context.Context, errs *bounded
 	age, ok, err := r.registry.JobScanStateAge(sctx, ref.ScanJobAbsence, ref.ScanScopeAbsenceRenewalHealth)
 	if err != nil {
 		errs.add(fmt.Errorf("absence reconcile: read renewal health: %w", err))
-	} else if ok && age <= r.cursorStaleAge {
-		return // renewed recently: no cover can lapse before the next pass
+	} else if ok && age <= r.renewalSafeAge {
+		return // renewed recently: covers survive until the NEXT attempt
 	}
 	snap, mErr := json.Marshal(map[string]int64{"lfs": r.lfs.Traversals, "packs": r.packs.Traversals})
 	assertf(mErr == nil, "absence reconcile: marshal fence snapshot: %v", mErr)

@@ -308,9 +308,12 @@ func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL, loopbackBaseU
 		assertf(ok, "ref store %T lacks the absence reconciliation seams", refStore)
 		// Cadence-vs-TTL safety is enforced at config resolution
 		// (interval ≤ TTL/2) and inside the constructor (pass wall-clock
-		// ≤ TTL/4), so covers renew before they can lapse.
+		// ≤ TTL/4), so covers renew before they can lapse. The interval
+		// also feeds the admission fence's lapse safety bound (Codex
+		// round 27 on PR #132): a renewal failure is harmless only while
+		// covers survive until the NEXT scheduled attempt.
 		reconciler := jobs.NewAbsenceReconciler(absenceReg, blobStore,
-			packQuotaBytes > 0, absence.budget, packReservationTTL, logger)
+			packQuotaBytes > 0, absence.budget, packReservationTTL, absence.interval, logger)
 		absenceSchedule = &jobs.AbsenceReconcileSchedule{Reconciler: reconciler, Interval: absence.interval}
 		logger.Info("registry-vs-storage absence reconciliation enabled",
 			"env", envAbsenceReconcileInterval, "interval", absence.interval,

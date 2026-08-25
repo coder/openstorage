@@ -27,7 +27,7 @@ func absenceRegistry(t *testing.T, f *sweepFixture) AbsenceRegistry {
 
 func testReconciler(t *testing.T, f *sweepFixture, quotaEnforced bool, budget int64) *AbsenceReconciler {
 	t.Helper()
-	return NewAbsenceReconciler(absenceRegistry(t, f), f.blobs, quotaEnforced, budget, time.Hour, slog.New(slog.DiscardHandler))
+	return NewAbsenceReconciler(absenceRegistry(t, f), f.blobs, quotaEnforced, budget, time.Hour, time.Minute, slog.New(slog.DiscardHandler))
 }
 
 // pinLFSLeader resets the durable pass counter so the next pass leads with
@@ -1055,7 +1055,7 @@ func TestAbsenceReconcile_HintFoldPrecedesRotations(t *testing.T) {
 
 	pinLFSLeader(t, f)
 	r := NewAbsenceReconciler(&cancelOnRotationRegistry{AbsenceRegistry: reg, cancel: cancel},
-		f.blobs, true, 100, time.Hour, slog.New(slog.DiscardHandler))
+		f.blobs, true, 100, time.Hour, time.Minute, slog.New(slog.DiscardHandler))
 	report, err := r.Run(ctx)
 	if err == nil {
 		t.Fatal("Run: want the injected rotation-start cancellation reported")
@@ -1081,12 +1081,43 @@ func TestAbsenceReconcile_RenewalBlipDoesNotFenceAdmission(t *testing.T) {
 		t.Fatal(err)
 	}
 	ft := &failTouchRegistry{AbsenceRegistry: reg, fail: true}
-	r := NewAbsenceReconciler(ft, f.blobs, true, 100, time.Hour, slog.New(slog.DiscardHandler))
+	r := NewAbsenceReconciler(ft, f.blobs, true, 100, time.Hour, time.Minute, slog.New(slog.DiscardHandler))
 	if _, err := r.Run(ctx); err == nil {
 		t.Fatal("Run: want the injected renewal failure reported")
 	}
 	if _, ok, err := reg.GetJobScanState(ctx, ref.ScanJobAbsence, ref.ScanScopeAbsenceAdmissionFence); err != nil || ok {
 		t.Fatalf("fence after fresh-watermark blip = (ok=%v, %v), want unarmed", ok, err)
+	}
+}
+
+// TestAbsenceReconcile_SafetyBoundCoversNextCadence (Codex round 27,
+// P1): a renewal failure is provably harmless only while the covers
+// survive until the NEXT scheduled attempt — the safety bound must
+// subtract the cadence AND the pass wall clock from the TTL, not just
+// the pass. At the documented maximum interval (TTL/2), a failure at
+// age ~TTL/2 must fence: by the next attempt the covers are past the
+// TTL, where the strict-TTL bulk touch cannot resurrect them, yet it
+// would stamp renewal health and leave admissions consuming the
+// uncovered headroom while recovery is still rotations away.
+func TestAbsenceReconcile_SafetyBoundCoversNextCadence(t *testing.T) {
+	f := newSweepFixture(t)
+	ctx := context.Background()
+	reg := absenceRegistry(t, f)
+	if err := reg.PutJobScanState(ctx, ref.ScanJobAbsence, ref.ScanScopeAbsenceRenewalHealth, "", 0); err != nil {
+		t.Fatal(err)
+	}
+	// coverTTL 8s → pass wall clock 2s; interval 4s → safety bound 2s.
+	// An age of ~3s is fresh under a pass-only bound (TTL−pass = 6s)
+	// but PAST the cadence-aware bound: the next attempt lands up to
+	// interval+pass = 6s out, when these covers are already 9s old.
+	time.Sleep(3 * time.Second)
+	ft := &failTouchRegistry{AbsenceRegistry: reg, fail: true}
+	r := NewAbsenceReconciler(ft, f.blobs, true, 100, 8*time.Second, 4*time.Second, slog.New(slog.DiscardHandler))
+	if _, err := r.Run(ctx); err == nil {
+		t.Fatal("Run: want the injected renewal failure reported")
+	}
+	if _, ok, err := reg.GetJobScanState(ctx, ref.ScanJobAbsence, ref.ScanScopeAbsenceAdmissionFence); err != nil || !ok {
+		t.Fatalf("fence after mid-cadence-stale failure = (ok=%v, %v), want armed", ok, err)
 	}
 }
 
@@ -1108,7 +1139,7 @@ func TestAbsenceReconcile_StaleRenewalFailureFencesAdmission(t *testing.T) {
 	f.upload(key, strings.Repeat("x", 10))
 
 	ft := &failTouchRegistry{AbsenceRegistry: reg, fail: true}
-	rec := NewAbsenceReconciler(ft, f.blobs, true, 100, time.Hour, slog.New(slog.DiscardHandler))
+	rec := NewAbsenceReconciler(ft, f.blobs, true, 100, time.Hour, time.Minute, slog.New(slog.DiscardHandler))
 	if _, err := rec.Run(ctx); err == nil {
 		t.Fatal("Run 1: want the injected renewal failure reported")
 	}
@@ -1215,11 +1246,11 @@ func TestAbsenceReconcile_GapMutationDefersLegacyRetirement(t *testing.T) {
 func TestAbsencePassTimeoutClampedToTTL(t *testing.T) {
 	f := newSweepFixture(t)
 	log := slog.New(slog.DiscardHandler)
-	r := NewAbsenceReconciler(absenceRegistry(t, f), f.blobs, true, 100, 40*time.Minute, log)
+	r := NewAbsenceReconciler(absenceRegistry(t, f), f.blobs, true, 100, 40*time.Minute, time.Minute, log)
 	if r.passTimeout != 10*time.Minute {
 		t.Fatalf("passTimeout = %v with a 40m TTL, want 10m (TTL/4)", r.passTimeout)
 	}
-	r = NewAbsenceReconciler(absenceRegistry(t, f), f.blobs, true, 100, 8*time.Hour, log)
+	r = NewAbsenceReconciler(absenceRegistry(t, f), f.blobs, true, 100, 8*time.Hour, time.Minute, log)
 	if r.passTimeout != time.Hour {
 		t.Fatalf("passTimeout = %v with an 8h TTL, want the 1h ceiling", r.passTimeout)
 	}
@@ -1815,7 +1846,7 @@ func TestAbsenceReconcile_RechargeRaceLosesFoldCAS(t *testing.T) {
 			t.Fatalf("re-charge nonce: %v", err)
 		}
 	}
-	r := NewAbsenceReconciler(reg, f.blobs, true, 1000, time.Hour, slog.New(slog.DiscardHandler))
+	r := NewAbsenceReconciler(reg, f.blobs, true, 1000, time.Hour, time.Minute, slog.New(slog.DiscardHandler))
 	report, err := r.Run(ctx)
 	if err != nil {
 		t.Fatalf("Run 1: %v", err)
@@ -1854,7 +1885,7 @@ func TestAbsenceReconcile_MarkFailureRetried(t *testing.T) {
 		t.Fatalf("seed nonce: %v", err)
 	}
 	reg := &foldCASRegistry{AbsenceRegistry: absenceRegistry(t, f), failMarkOnce: true}
-	r := NewAbsenceReconciler(reg, f.blobs, true, 1000, time.Hour, slog.New(slog.DiscardHandler))
+	r := NewAbsenceReconciler(reg, f.blobs, true, 1000, time.Hour, time.Minute, slog.New(slog.DiscardHandler))
 	report, err := r.Run(ctx)
 	if err == nil || report.CoversDecaying != 0 {
 		t.Fatalf("run 1 = (%+v, %v), want the injected mark failure reported and no decay", report, err)
@@ -1999,7 +2030,7 @@ func TestAbsenceReconcile_ShrinkRetainsCoverOnBumpFailure(t *testing.T) {
 
 	// Pass 1: the full 300-byte loss is covered.
 	reg := &bumpFailRegistry{AbsenceRegistry: absenceRegistry(t, f)}
-	r := NewAbsenceReconciler(reg, f.blobs, true, 1000, time.Hour, slog.New(slog.DiscardHandler))
+	r := NewAbsenceReconciler(reg, f.blobs, true, 1000, time.Hour, time.Minute, slog.New(slog.DiscardHandler))
 	if _, err := r.Run(ctx); err != nil {
 		t.Fatalf("Run 1: %v", err)
 	}
@@ -2027,7 +2058,7 @@ func TestAbsenceReconcile_ShrinkRetainsCoverOnBumpFailure(t *testing.T) {
 	// the superseded cleanup completes the rotation bump-first and the
 	// ledger converges to the exact 100-byte deficit.
 	reg.fail = false
-	r2 := NewAbsenceReconciler(reg, f.blobs, true, 1000, time.Hour, slog.New(slog.DiscardHandler))
+	r2 := NewAbsenceReconciler(reg, f.blobs, true, 1000, time.Hour, time.Minute, slog.New(slog.DiscardHandler))
 	report, err := r2.Run(ctx)
 	if err != nil {
 		t.Fatalf("Run 3: %v", err)
@@ -2071,7 +2102,7 @@ func TestAbsenceReconcile_BulkTouchPrecedesListing(t *testing.T) {
 		t.Fatalf("seed cover: %v", err)
 	}
 	rec := &touchRecorder{AbsenceRegistry: absenceRegistry(t, f)}
-	r := NewAbsenceReconciler(rec, f.blobs, true, 1000, time.Hour, slog.New(slog.DiscardHandler))
+	r := NewAbsenceReconciler(rec, f.blobs, true, 1000, time.Hour, time.Minute, slog.New(slog.DiscardHandler))
 	report, err := r.Run(ctx)
 	if err == nil {
 		t.Fatal("Run: want the injected listing failure reported")
@@ -2130,7 +2161,7 @@ func TestAbsenceReconcile_TouchFailureSkipsCursorStamp(t *testing.T) {
 	// Pass 2's bulk renewal fails: the rotation advances in memory but
 	// the durable cursor must stay at the pass-1 park.
 	reg := &failTouchRegistry{AbsenceRegistry: store, fail: true}
-	r2 := NewAbsenceReconciler(reg, f.blobs, true, 4, time.Hour, slog.New(slog.DiscardHandler))
+	r2 := NewAbsenceReconciler(reg, f.blobs, true, 4, time.Hour, time.Minute, slog.New(slog.DiscardHandler))
 	report, err := r2.Run(ctx)
 	if err == nil || !report.RenewalIncomplete {
 		t.Fatalf("Run 2 = (%+v, %v), want the injected renewal failure reported", report, err)
@@ -2162,7 +2193,7 @@ func TestAbsenceReconcile_ChargeFailureRetriedAtRangeEnd(t *testing.T) {
 	base := "repo-flaky-charge"
 	registerLFS(t, f, base, blob.LFSKey(base, absenceOID('f')), 100)
 	reg := &flakyRegistry{AbsenceRegistry: absenceRegistry(t, f), failLeft: 1}
-	r := NewAbsenceReconciler(reg, f.blobs, true, 1000, time.Hour, slog.New(slog.DiscardHandler))
+	r := NewAbsenceReconciler(reg, f.blobs, true, 1000, time.Hour, time.Minute, slog.New(slog.DiscardHandler))
 	report, err := r.Run(ctx)
 	if err == nil {
 		t.Fatal("Run: want the injected charge failure reported")
@@ -2195,7 +2226,7 @@ func TestAbsenceReconcile_DirtyRangeDefersLegacyRetirement(t *testing.T) {
 	// (settle, then the range-end retry) — the range stays dirty and
 	// unproven.
 	reg := &flakyRegistry{AbsenceRegistry: absenceRegistry(t, f), failLeft: 2}
-	r := NewAbsenceReconciler(reg, f.blobs, true, 1000, time.Hour, slog.New(slog.DiscardHandler))
+	r := NewAbsenceReconciler(reg, f.blobs, true, 1000, time.Hour, time.Minute, slog.New(slog.DiscardHandler))
 	report, err := r.Run(ctx)
 	if err == nil {
 		t.Fatal("Run 1: want the injected failures reported")

@@ -191,8 +191,10 @@ Resolved residual (Codex round 26 on PR #132, security): sustained
 renewal failure approaching the cover TTL could let covers lapse while
 strict-TTL admission arithmetic silently under-counted them. Successful
 renewals now stamp a DB-clock health watermark; a renewal failure that
-finds it absent or older than the lapse safety bound (TTL minus the pass
-wall clock) arms a durable admission fence that fails finite quota-gated
+finds it absent or older than the lapse safety bound (TTL minus the
+scheduling cadence minus the pass wall clock — the failure is harmless
+only while covers survive until the NEXT attempt, Codex round 27) arms a
+durable admission fence that fails finite quota-gated
 admissions closed — unbounded restore/cover reservations stay exempt so
 recovery can proceed — until a healthy error-free pass advances both
 class rotations through one full recovery traversal past the fence's

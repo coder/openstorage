@@ -847,7 +847,9 @@ integrity loss logged loudly: committed refs may reference it). See the
 - **Degraded-renewal admission fence** (quota enforcement on): every
   successful pass stamps a renewal-health watermark. If a pass's cover
   renewal FAILS while that watermark is absent or older than the
-  cover-lapse safety bound, covers may lapse un-renewed and quota
+  cover-lapse safety bound (the TTL minus this interval minus the pass
+  wall clock — a failure is harmless only while covers survive until the
+  NEXT attempt), covers may lapse un-renewed and quota
   arithmetic would silently under-count them — the job then fails finite
   quota-gated writes closed (pushes, LFS uploads, adoptions answer
   "quota accounting temporarily degraded, retry later") until a healthy
