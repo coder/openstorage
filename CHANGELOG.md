@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.10.0](https://github.com/coder/code-storage/compare/v0.9.0...v0.10.0) (2026-08-25)
+
+
+### Features
+
+* **api:** emit the IETF RateLimit header alongside Retry-After on every 429 ([#151](https://github.com/coder/code-storage/issues/151)) ([d1e8d71](https://github.com/coder/code-storage/commit/d1e8d71acd04a4899c616023fe1d9e72602d2410)), closes [#150](https://github.com/coder/code-storage/issues/150)
+* **s3wal:** store qualification harness, conditional CAS primitive, and Phase 1a benches ([#142](https://github.com/coder/code-storage/issues/142)) ([39f1ba7](https://github.com/coder/code-storage/commit/39f1ba7d567cc0a916a75f6e383f53069d6ec84f))
+
 ## [0.9.0](https://github.com/coder/code-storage/compare/v0.8.0...v0.9.0) (2026-08-25)
 
 
