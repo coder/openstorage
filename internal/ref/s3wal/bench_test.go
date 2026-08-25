@@ -484,6 +484,52 @@ func BenchmarkHotRepoContention(b *testing.B) {
 	}
 }
 
+// warmupSQLiteContention is the SQLite twin of warmupContention: `writers`
+// goroutines race a bounded number of GetRef+CASRef rounds on a separate
+// warmup ref (collectively ≥ benchWarmupOps operations) so page-cache,
+// WAL, and statement first-touch costs land before the measured timer.
+// No accounting of any kind; busy rejections are simply retried.
+func warmupSQLiteContention(tb testing.TB, st *ref.SQLite, repo, name string, writers int) {
+	tb.Helper()
+	assertf(writers > 0, "warmupSQLiteContention: %d writers", writers)
+	ctx := context.Background()
+	if won, err := st.CASRef(ctx, repo, name, ref.ZeroSHA, seqSHA(1)); err != nil || !won {
+		tb.Fatalf("warmup seed CASRef = (%v, %v), want won", won, err)
+	}
+	perWorker := (benchWarmupOps + writers - 1) / writers
+	var wg sync.WaitGroup
+	for range writers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			cur := seqSHA(1)
+			for range perWorker {
+				next := parseSeqSHA(tb, cur) + 1
+				won, err := st.CASRef(ctx, repo, name, cur, seqSHA(next))
+				switch {
+				case err != nil && isSQLiteBusy(err):
+					continue
+				case err != nil:
+					tb.Errorf("warmup CASRef: %v", err)
+					return
+				case won:
+					cur = seqSHA(next)
+					continue
+				}
+				reread, err := st.GetRef(ctx, repo, name)
+				switch {
+				case err == nil:
+					cur = reread
+				case !isSQLiteBusy(err):
+					tb.Errorf("warmup re-read: %v", err)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+}
+
 // isSQLiteBusy reports whether err is a definitive SQLITE_BUSY rejection
 // (the busy_timeout expired while another writer held the file lock). The
 // backend responded, so the statement provably did not commit (see
@@ -499,9 +545,13 @@ func isSQLiteBusy(err error) bool {
 // the same lost-update detector (won=false is the lost race; SQLite has no
 // ambiguous class on this path — errors fail the run, except SQLITE_BUSY,
 // which is a definitive not-committed rejection and is retried/counted).
+// Like the S3 runner, the measured window is preceded by an untimed warmup
+// on a separate scratch ref (page cache, WAL, statement paths) with no
+// accounting; the measured seed and detector baseline start fresh after.
 func runSQLiteContentionWindow(tb testing.TB, st *ref.SQLite, repo, name string, writers int, window time.Duration) contentionResult {
 	tb.Helper()
 	assertf(writers > 0, "runSQLiteContentionWindow: %d writers", writers)
+	warmupSQLiteContention(tb, st, repo, name+"-warmup", writers)
 	ctx := context.Background()
 	const initialSeq = int64(1)
 	if won, err := st.CASRef(ctx, repo, name, ref.ZeroSHA, seqSHA(initialSeq)); err != nil || !won {

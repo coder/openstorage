@@ -1042,9 +1042,18 @@ type contentionResult struct {
 // contiguous, and the final nonce must belong to the last recorded winner.
 // A window containing any ambiguous outcome (possible on real S3) is
 // INCONCLUSIVE and fails the run — see verifyTransitions.
+//
+// The measured window is preceded by an UNTIMED warmup on a separate
+// scratch key (warmupContention): connection setup, pool fill, and
+// first-request costs land before the timer starts, honoring the
+// campaign's 20-op-warmup methodology. All accounting — latency samples,
+// wins, lost races, and the detector's seq/winner baseline — belongs to
+// the measured window only (the warmup key's transitions are never
+// recorded, and the measured seed is created fresh after warmup).
 func runContentionWindow(tb testing.TB, cas *Client, key string, writers int, window time.Duration, payloadSize int) contentionResult {
 	tb.Helper()
 	assertf(writers > 0, "runContentionWindow: %d writers", writers)
+	warmupContention(tb, cas, key+"-warmup", writers, payloadSize)
 	ctx, cancel := context.WithTimeout(context.Background(), window+2*time.Minute)
 	defer cancel()
 	const initialSeq = int64(1)
@@ -1162,6 +1171,60 @@ func runContentionWindow(tb testing.TB, cas *Client, key string, writers int, wi
 	}
 	verifyTransitions(tb, initialSeq, fp.Seq, fp.Nonce, transitions, res.ambiguous)
 	return res
+}
+
+// warmupContention primes the concurrent CAS path before a measured
+// contention window: `writers` goroutines race a bounded number of
+// advances on a separate warmup scratch key so connection setup, pool
+// fill, and first-request costs happen before the measured timer starts
+// (collectively ≥ benchWarmupOps operations; a lost race still exercises
+// the full advance+re-read path, which is what needs warming). Warmup
+// state is fully separate from the measured window: distinct key,
+// throwaway per-session clients, and no accounting of any kind.
+func warmupContention(tb testing.TB, cas *Client, warmupKey string, writers int, payloadSize int) {
+	tb.Helper()
+	assertf(writers > 0, "warmupContention: %d writers", writers)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	if _, err := cas.Create(ctx, warmupKey, encodePayload(tb, 1, payloadSize)); err != nil {
+		tb.Fatalf("contention warmup: create %s: %v", warmupKey, err)
+	}
+	perWorker := (benchWarmupOps + writers - 1) / writers
+	var wg sync.WaitGroup
+	for range writers {
+		wg.Add(1)
+		wcas := perSessionClient(cas)
+		go func() {
+			defer wg.Done()
+			obj, err := wcas.Get(ctx, warmupKey)
+			if err != nil {
+				tb.Errorf("contention warmup: get %s: %v", warmupKey, err)
+				return
+			}
+			for range perWorker {
+				p, ok := decodePayload(obj.Body)
+				if !ok {
+					tb.Errorf("contention warmup: undecodable payload on %s", warmupKey)
+					return
+				}
+				next := encodePayloadNonce(tb, p.Seq+1, newNonce(tb), payloadSize)
+				newETag, err := wcas.Advance(ctx, warmupKey, next, obj.ETag)
+				if err == nil {
+					obj = Object{Body: next, ETag: newETag}
+					continue
+				}
+				// Lost race, contention, or ambiguity: re-read and keep
+				// going — warmup records nothing, so no accounting can be
+				// corrupted.
+				if obj, err = wcas.Get(ctx, warmupKey); err != nil {
+					tb.Errorf("contention warmup: re-read %s: %v", warmupKey, err)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	_ = cas.Delete(ctx, warmupKey)
 }
 
 // perSessionClient derives a Client sharing c's transport, bucket, backoff
