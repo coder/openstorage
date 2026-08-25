@@ -50,6 +50,13 @@ type MemCASHooks struct {
 	// the seq watermark must catch. Reads of keys with no previous
 	// version serve normally.
 	StaleGet func(key string) bool
+	// AfterPut, when set, runs after every conditional PUT attempt
+	// (op is "create" or "advance"), OUTSIDE the store lock and
+	// regardless of the attempt's outcome: recovery tests use it to
+	// interleave a competing writer between a faulted PUT and the
+	// driver's recovery read. Unlike PutFault, it MAY call back into
+	// the MemCAS.
+	AfterPut func(op, key string)
 }
 
 type memVersion struct {
@@ -115,6 +122,14 @@ func (m *MemCAS) GetIfChanged(ctx context.Context, key, etag string) (Object, er
 // Create writes key iff absent (the If-None-Match: * semantics).
 func (m *MemCAS) Create(_ context.Context, key string, body []byte) (string, error) {
 	assertf(key != "" && body != nil, "MemCAS.Create(%q)", key)
+	etag, err := m.createLocked(key, body)
+	if m.Hooks.AfterPut != nil {
+		m.Hooks.AfterPut("create", key)
+	}
+	return etag, err
+}
+
+func (m *MemCAS) createLocked(key string, body []byte) (string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if _, ok := m.cur[key]; ok {
@@ -132,6 +147,14 @@ func (m *MemCAS) Create(_ context.Context, key string, body []byte) (string, err
 // Advance overwrites key iff etag is current (the If-Match semantics).
 func (m *MemCAS) Advance(_ context.Context, key string, body []byte, etag string) (string, error) {
 	assertf(key != "" && body != nil && etag != "", "MemCAS.Advance(%q)", key)
+	newETag, err := m.advanceLocked(key, body, etag)
+	if m.Hooks.AfterPut != nil {
+		m.Hooks.AfterPut("advance", key)
+	}
+	return newETag, err
+}
+
+func (m *MemCAS) advanceLocked(key string, body []byte, etag string) (string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	cur, ok := m.cur[key]
