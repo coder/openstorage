@@ -1,10 +1,9 @@
 // Hydrate short-circuit tests (issue #4): an unchanged repo generation skips
-// ListPacks/ListRefs (and therefore every SyncRefs subprocess — SyncRefs is
-// only reachable with a ListRefs result), a mutation-bumped generation
-// invalidates the marker, the TTL forces a periodic full sync, and the
-// marker advances only after a fully successful hydrate. The countable fake
-// store keeps these container-free; they run identically on both TestMain
-// lanes.
+// ListPacks and the paged ListRefsAfter scan (and therefore every ref-sync
+// subprocess), a mutation-bumped generation invalidates the marker, the TTL
+// forces a periodic full sync, and the marker advances only after a fully
+// successful hydrate. The countable fake store keeps these container-free;
+// they run identically on both TestMain lanes.
 package githttp
 
 import (
@@ -12,6 +11,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -29,8 +29,8 @@ type countingStore struct {
 	gen  int64
 	refs map[string]string
 
-	refsErr  error         // returned by ListRefs when set
-	refsGate chan struct{} // when set, ListRefs blocks until it closes
+	refsErr  error         // returned by ListRefsAfter when set
+	refsGate chan struct{} // when set, ListRefsAfter blocks until it closes
 
 	listPacksCalls, listRefsCalls, getGenerationCalls int
 }
@@ -141,6 +141,10 @@ func (s *countingStore) RetirePackAttempts(context.Context, []string, map[string
 }
 
 func (s *countingStore) ListRefs(context.Context, string) (map[string]string, error) {
+	panic("countingStore: Hydrate must not call ListRefs (issue #119: full syncs page via ListRefsAfter)")
+}
+
+func (s *countingStore) ListRefsAfter(_ context.Context, _ string, after string, limit int) ([]ref.RefEntry, error) {
 	s.mu.Lock()
 	s.listRefsCalls++
 	gate := s.refsGate
@@ -153,9 +157,19 @@ func (s *countingStore) ListRefs(context.Context, string) (map[string]string, er
 	if s.refsErr != nil {
 		return nil, s.refsErr
 	}
-	out := make(map[string]string, len(s.refs))
-	for k, v := range s.refs {
-		out[k] = v
+	names := make([]string, 0, len(s.refs))
+	for name := range s.refs {
+		if name > after {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	if len(names) > limit {
+		names = names[:limit]
+	}
+	out := make([]ref.RefEntry, 0, len(names))
+	for _, name := range names {
+		out = append(out, ref.RefEntry{Name: name, SHA: s.refs[name]})
 	}
 	return out, nil
 }
@@ -232,7 +246,7 @@ func TestHydrate_ShortCircuitsOnUnchangedGeneration(t *testing.T) {
 	}
 
 	// Idle repo, back-to-back reads: one generation point-read each, zero
-	// ListPacks/ListRefs (and no SyncRefs, which needs a ListRefs result).
+	// ListPacks/ListRefsAfter (and no ref-sync subprocesses).
 	for i := 0; i < 3; i++ {
 		if again := mustHydrate(t, st, bl, cacheDir, repo); again != repoPath {
 			t.Fatalf("repoPath changed on short-circuit: %q != %q", again, repoPath)
@@ -526,7 +540,7 @@ func TestHydrate_MarkerWrittenOnlyAfterSuccess(t *testing.T) {
 		t.Fatalf("failed hydrate left a marker (stat err %v)", err)
 	}
 
-	// Failure leg 2: ListRefs succeeds but SyncRefs cannot apply the result
+	// Failure leg 2: the ref scan succeeds but the sync cannot apply it
 	// (ref points at an object the cache repo does not have). refsErr is
 	// reported and the marker still must not advance.
 	st.refsErr = nil

@@ -73,6 +73,14 @@ type RefInfo struct {
 	CreatedAt time.Time // UTC
 }
 
+// RefEntry is one (name, sha) ref row — the bounded-enumeration unit
+// (issue #119): pages of these replace whole-repo ref materialization on
+// the hydration path.
+type RefEntry struct {
+	Name string
+	SHA  string
+}
+
 // RefStore is the ref-authority contract: refs only ever change through
 // CASRef, and packs are registered strictly after their bytes are durable
 // in blob storage.
@@ -82,6 +90,18 @@ type RefStore interface {
 	// ListRefsWithMeta returns all refs for repo sorted by name ascending,
 	// including creation timestamps (the read API's branches/tags source).
 	ListRefsWithMeta(ctx context.Context, repo string) ([]RefInfo, error)
+	// ListRefsAfter returns up to limit refs for repo whose name is
+	// byte-wise greater than after, in ascending BYTE order of name (the
+	// order git's own ref iteration uses, so hydration can merge-join
+	// pages against for-each-ref output — issue #119). A page shorter
+	// than limit means the scan is complete. Each call is one consistent
+	// snapshot; cross-page consistency is the CALLER's contract:
+	// githttp.Hydrate binds a paged scan to the repo generation read
+	// before it, so any concurrent ref mutation bumps the generation,
+	// invalidates the marker the sync publishes, and forces the next
+	// hydrate down the full path — healing whatever a torn scan
+	// mis-synced.
+	ListRefsAfter(ctx context.Context, repo, after string, limit int) ([]RefEntry, error)
 	// GetRef returns the current sha of one ref (a point-read: the
 	// IdempotentCAS recovery recheck must not scan the repo's whole ref
 	// table). Returns ErrNotFound when the ref does not exist.
@@ -358,24 +378,26 @@ func OpenPG(ctx context.Context, pgURL string) (*PG, error) {
 
 func (s *PG) Close() { s.pool.Close() }
 
-// InitSchema creates the ref/pack tables (idempotent). The packs_repo_s3_key
-// index is deliberately NOT part of the transactional DDL: it is built
+// InitSchema creates the ref/pack tables (idempotent). The
+// concurrentIndexes entries (packs_repo_s3_key, refs_repo_name_c) are
+// deliberately NOT part of the transactional DDL: they are built
 // out-of-transaction with CREATE INDEX CONCURRENTLY (issue #24, rationale on
-// buildPacksIndexLocked). Once the index is valid — every boot after the
-// first — only the transactional DDL runs. While the index is missing or
+// buildIndexesLocked). Once every index is valid — every boot after the
+// first — only the transactional DDL runs. While an index is missing or
 // invalid, a SESSION advisory lock is held across BOTH the transactional DDL
-// and the index build: the DDL takes ACCESS EXCLUSIVE locks on packs (DROP
-// TRIGGER), and a concurrent replica's CONCURRENTLY build both conflicts
-// with them and waits out every older transaction snapshot, so letting the
-// two phases interleave across replicas deadlocks (SQLSTATE 40P01, found via
-// the concurrent-boot test). Skipping the lock when the index is valid is
-// sound because builders re-check state under the lock and never build over
-// a valid index — a valid read means no build can be running.
+// and the index builds: the DDL takes ACCESS EXCLUSIVE locks on refs/packs
+// (DROP TRIGGER), and a concurrent replica's CONCURRENTLY build both
+// conflicts with them and waits out every older transaction snapshot, so
+// letting the two phases interleave across replicas deadlocks (SQLSTATE
+// 40P01, found via the concurrent-boot test). Skipping the lock when every
+// index is valid is sound because builders re-check state under the lock
+// and never build over a valid index — a valid read means no build can be
+// running.
 func (s *PG) InitSchema(ctx context.Context) error {
-	if exists, valid, err := packsIndexState(ctx, s.pool); err != nil {
+	if allValid, err := concurrentIndexesState(ctx, s.pool); err != nil {
 		return err
-	} else if exists && valid {
-		return initSchemaTx(ctx, s.pool) // steady state: index built by an earlier boot
+	} else if allValid {
+		return initSchemaTx(ctx, s.pool) // steady state: indexes built by an earlier boot
 	}
 
 	// First boot (or crashed-build repair): one dedicated conn owns the
@@ -389,21 +411,21 @@ func (s *PG) InitSchema(ctx context.Context) error {
 	// re-checks state so waiters finish as soon as the builder commits.
 	conn, err := s.pool.Acquire(ctx)
 	if err != nil {
-		return fmt.Errorf("packs index: acquire lock conn: %w", err)
+		return fmt.Errorf("schema indexes: acquire lock conn: %w", err)
 	}
 	defer conn.Release()
 	for {
 		var locked bool
 		if err := conn.QueryRow(ctx, `SELECT pg_try_advisory_lock(0x5350494458)`).Scan(&locked); err != nil { // "SPIDX"
-			return fmt.Errorf("packs index: try advisory lock: %w", err)
+			return fmt.Errorf("schema indexes: try advisory lock: %w", err)
 		}
 		if locked {
 			break
 		}
-		if exists, valid, err := packsIndexState(ctx, conn); err != nil {
+		if allValid, err := concurrentIndexesState(ctx, conn); err != nil {
 			return err
-		} else if exists && valid {
-			return initSchemaTx(ctx, conn) // the lock holder finished the build while we waited
+		} else if allValid {
+			return initSchemaTx(ctx, conn) // the lock holder finished the builds while we waited
 		}
 		select {
 		case <-ctx.Done():
@@ -427,7 +449,7 @@ func (s *PG) InitSchema(ctx context.Context) error {
 	if err := initSchemaTx(ctx, conn); err != nil {
 		return err
 	}
-	return buildPacksIndexLocked(ctx, conn)
+	return buildIndexesLocked(ctx, conn)
 }
 
 // initSchemaTx is InitSchema's transactional DDL, run on db: the pool on
@@ -556,76 +578,116 @@ CREATE CONSTRAINT TRIGGER packs_bump_generation
 	})
 }
 
-// packsIndexState reports whether packs_repo_s3_key exists and is valid.
+// concurrentIndexes are the catalog-managed indexes built OUT of the
+// transactional DDL with CREATE INDEX CONCURRENTLY (issue #24 rationale on
+// buildIndexesLocked):
+//
+//   - packs_repo_s3_key serves the orphan sweeper's per-object membership
+//     check (HasPack, issue #5), which filters on (repo, s3_key) — the
+//     (repo, id) primary key cannot serve it, and without it a sweep over
+//     a repo with attacker-growable pack count turns O(N²).
+//   - refs_repo_name_c serves hydration's bounded byte-ordered keyset
+//     enumeration (ListRefsAfter, issue #119): the (repo, name) primary
+//     key is built with the database's default collation, so it cannot
+//     serve COLLATE "C" range scans — without this index every page would
+//     re-sort the repo's whole remaining ref set, turning an
+//     attacker-scaled ref fanout into quadratic server work.
+var concurrentIndexes = []struct{ name, create string }{
+	{"packs_repo_s3_key", `CREATE INDEX CONCURRENTLY IF NOT EXISTS packs_repo_s3_key ON packs (repo, s3_key)`},
+	{"refs_repo_name_c", `CREATE INDEX CONCURRENTLY IF NOT EXISTS refs_repo_name_c ON refs (repo, name COLLATE "C")`},
+}
+
+// indexState reports whether the named index exists and is valid.
 // to_regclass resolves via search_path and yields NULL (no row) when the
 // index does not exist.
-func packsIndexState(ctx context.Context, q interface {
+func indexState(ctx context.Context, q interface {
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
-}) (exists, valid bool, err error) {
+}, name string) (exists, valid bool, err error) {
 	err = q.QueryRow(ctx,
-		`SELECT i.indisvalid FROM pg_index i WHERE i.indexrelid = to_regclass('packs_repo_s3_key')`).Scan(&valid)
+		`SELECT i.indisvalid FROM pg_index i WHERE i.indexrelid = to_regclass($1)`, name).Scan(&valid)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return false, false, nil
 	}
 	if err != nil {
-		return false, false, fmt.Errorf("packs index state: %w", err)
+		return false, false, fmt.Errorf("%s index state: %w", name, err)
 	}
 	return true, valid, nil
 }
 
-// buildPacksIndexLocked builds packs_repo_s3_key with CREATE INDEX
-// CONCURRENTLY on conn, which must hold the SPIDX session lock (issue #24).
-// The index serves the orphan sweeper's per-object membership check
-// (HasPack, issue #5), which filters on (repo, s3_key) — the (repo, id)
-// primary key cannot serve it, and without it a sweep over a repo with
-// attacker-growable pack count turns O(N²). A plain transactional CREATE
-// INDEX holds a SHARE lock on packs for the whole build, so the FIRST
-// rollout against a database with a large pre-existing packs table would
-// block every pack registration (pre-receive RegisterPacks) until the
-// build finished.
+// concurrentIndexesState reports whether every managed index exists and is
+// valid.
+func concurrentIndexesState(ctx context.Context, q interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}) (allValid bool, err error) {
+	for _, idx := range concurrentIndexes {
+		exists, valid, err := indexState(ctx, q, idx.name)
+		if err != nil {
+			return false, err
+		}
+		if !exists || !valid {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+// buildIndexesLocked builds every missing concurrentIndexes entry with
+// CREATE INDEX CONCURRENTLY on conn, which must hold the SPIDX session lock
+// (issue #24). A plain transactional CREATE INDEX holds a SHARE lock on the
+// table for the whole build, so the FIRST rollout against a database with a
+// large pre-existing table would block every writer (pre-receive
+// RegisterPacks on packs; every push's CASRef on refs) until the build
+// finished.
 //
 // Crash repair: a failed or interrupted CONCURRENTLY build leaves the index
 // behind as INVALID (still maintained by writers, never used by queries) —
 // and CREATE INDEX CONCURRENTLY IF NOT EXISTS silently SKIPS such a
 // leftover instead of fixing it. Each attempt therefore checks
 // pg_index.indisvalid first and drops an invalid leftover with DROP INDEX
-// CONCURRENTLY (the plain form queues an ACCESS EXCLUSIVE lock on packs
+// CONCURRENTLY (the plain form queues an ACCESS EXCLUSIVE lock on the table
 // behind running writers and stalls everyone queued after it — the very
 // stall this path exists to avoid). The session lock makes the drop safe:
-// no other InitSchema can be mid-build, and nothing else creates this
-// index. Statements run one per Exec: pgx sends zero-arg Execs over the
+// no other InitSchema can be mid-build, and nothing else creates these
+// indexes. Statements run one per Exec: pgx sends zero-arg Execs over the
 // simple protocol, where a multi-statement string is one implicit
 // transaction block, which CONCURRENTLY rejects.
-func buildPacksIndexLocked(ctx context.Context, conn *pgxpool.Conn) error {
-	// check → drop-invalid → build, re-verified from the catalog each
-	// iteration (the build's own failure can leave a fresh INVALID entry,
-	// which the next iteration repairs). Three iterations = the success
-	// path (build, verify) plus one full repair cycle.
-	var lastErr error
-	for range 3 {
-		exists, valid, err := packsIndexState(ctx, conn)
-		if err != nil {
-			return err
-		}
-		if exists && valid {
-			return nil
-		}
-		if exists {
-			if _, err := conn.Exec(ctx, `DROP INDEX CONCURRENTLY IF EXISTS packs_repo_s3_key`); err != nil {
-				lastErr = fmt.Errorf("packs index: drop invalid leftover: %w", err)
+func buildIndexesLocked(ctx context.Context, conn *pgxpool.Conn) error {
+	for _, idx := range concurrentIndexes {
+		// check → drop-invalid → build, re-verified from the catalog each
+		// iteration (the build's own failure can leave a fresh INVALID
+		// entry, which the next iteration repairs). Three iterations = the
+		// success path (build, verify) plus one full repair cycle.
+		var lastErr error
+		built := false
+		for range 3 {
+			exists, valid, err := indexState(ctx, conn, idx.name)
+			if err != nil {
+				return err
+			}
+			if exists && valid {
+				built = true
+				break
+			}
+			if exists {
+				if _, err := conn.Exec(ctx, `DROP INDEX CONCURRENTLY IF EXISTS `+idx.name); err != nil {
+					lastErr = fmt.Errorf("%s index: drop invalid leftover: %w", idx.name, err)
+					continue
+				}
+			}
+			if _, err := conn.Exec(ctx, idx.create); err != nil {
+				lastErr = fmt.Errorf("%s index: concurrent build: %w", idx.name, err)
 				continue
 			}
 		}
-		if _, err := conn.Exec(ctx,
-			`CREATE INDEX CONCURRENTLY IF NOT EXISTS packs_repo_s3_key ON packs (repo, s3_key)`); err != nil {
-			lastErr = fmt.Errorf("packs index: concurrent build: %w", err)
+		if built {
 			continue
 		}
+		if lastErr == nil {
+			lastErr = fmt.Errorf("%s index: still not valid after repeated builds", idx.name)
+		}
+		return lastErr
 	}
-	if lastErr == nil {
-		lastErr = errors.New("packs index: still not valid after repeated builds")
-	}
-	return lastErr
+	return nil
 }
 
 // ListRefs returns all refs for repo as name -> sha.
@@ -664,6 +726,34 @@ func (s *PG) ListRefsWithMeta(ctx context.Context, repo string) ([]RefInfo, erro
 		assertf(ValidSHA(r.SHA), "refs table holds malformed sha %q for %s/%s", r.SHA, repo, r.Name)
 		r.CreatedAt = r.CreatedAt.UTC()
 		refs = append(refs, r)
+	}
+	return refs, rows.Err()
+}
+
+// ListRefsAfter returns up to limit refs for repo above the after cursor in
+// ascending byte order (issue #119). COLLATE "C" pins byte-wise comparison
+// regardless of the database's default collation — the order git's ref
+// iteration uses and the only one hydration's merge-join can trust; the
+// refs_repo_name_c index (see concurrentIndexes) serves the keyset scan so
+// a page never sorts the repo's whole remaining ref set.
+func (s *PG) ListRefsAfter(ctx context.Context, repo, after string, limit int) ([]RefEntry, error) {
+	assertf(repo != "", "ListRefsAfter: empty repo")
+	assertf(limit > 0, "ListRefsAfter: non-positive limit %d", limit)
+	rows, err := s.pool.Query(ctx,
+		`SELECT name, sha FROM refs WHERE repo = $1 AND name COLLATE "C" > $2
+		 ORDER BY name COLLATE "C" LIMIT $3`, repo, after, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var refs []RefEntry
+	for rows.Next() {
+		var e RefEntry
+		if err := rows.Scan(&e.Name, &e.SHA); err != nil {
+			return nil, err
+		}
+		assertf(ValidSHA(e.SHA), "refs table holds malformed sha %q for %s/%s", e.SHA, repo, e.Name)
+		refs = append(refs, e)
 	}
 	return refs, rows.Err()
 }

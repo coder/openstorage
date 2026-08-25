@@ -170,3 +170,14 @@ with the current generation (and current default branch) is provably fresh and c
 after one database point read; anything else triggers hydration — download missing packs,
 rebuild refs — under a local file lock, with the marker written only after complete
 success. Losing a cache directory is an efficiency event, never a correctness event.
+
+Ref rebuilds are **bounded**: a full sync never materializes a repository's whole ref set
+in memory, because ref fanout is attacker-scaled (millions of same-tip refs cost one row
+each). The database side streams byte-ordered keyset pages, the cache side streams git's
+own sorted ref listing, and a merge-join between them applies deletions and updates in
+bounded batches — all deletions strictly before any update, so directory/file renames
+among ref names can't wedge the sync. Every page is an individually consistent snapshot;
+if refs change while pages stream, the mutation's generation bump outruns the marker this
+sync writes, so the next read repeats the full sync and converges. That is the same
+staleness window a single-snapshot rebuild always had — bounded memory costs no
+additional semantics.

@@ -11,18 +11,25 @@ package ref
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 )
 
-// mustPacksIndexState reads the index state through the store's own pool.
-func mustPacksIndexState(t *testing.T, s *PG) (exists, valid bool) {
+// mustIndexState reads one managed index's state through the store's pool.
+func mustIndexState(t *testing.T, s *PG, name string) (exists, valid bool) {
 	t.Helper()
-	exists, valid, err := packsIndexState(context.Background(), s.pool)
+	exists, valid, err := indexState(context.Background(), s.pool, name)
 	if err != nil {
-		t.Fatalf("packs index state: %v", err)
+		t.Fatalf("%s index state: %v", name, err)
 	}
 	return exists, valid
+}
+
+// mustPacksIndexState reads the packs index state through the store's pool.
+func mustPacksIndexState(t *testing.T, s *PG) (exists, valid bool) {
+	t.Helper()
+	return mustIndexState(t, s, "packs_repo_s3_key")
 }
 
 func TestPGInitSchema_RepairsInvalidPacksIndex(t *testing.T) {
@@ -122,5 +129,60 @@ func TestPGInitSchema_SingleConnPoolBuildsIndex(t *testing.T) {
 	}
 	if exists, valid := mustPacksIndexState(t, s); !exists || !valid {
 		t.Fatalf("after single-conn repair: exists=%v valid=%v, want a valid index", exists, valid)
+	}
+}
+
+// TestPGInitSchema_RepairsInvalidRefsNameIndex covers the second managed
+// index (refs_repo_name_c, issue #119) through the same detect-drop-rebuild
+// path, and pins the property the index exists for: ListRefsAfter's keyset
+// page must be an index range scan in byte order, never a sort of the
+// repo's whole remaining ref set (attacker-scaled fanout would turn paging
+// quadratic).
+func TestPGInitSchema_RepairsInvalidRefsNameIndex(t *testing.T) {
+	s := pgTestStore(t)
+	ctx := context.Background()
+
+	if exists, valid := mustIndexState(t, s, "refs_repo_name_c"); !exists || !valid {
+		t.Fatalf("after boot: refs name index exists=%v valid=%v, want a valid index", exists, valid)
+	}
+
+	if _, err := s.pool.Exec(ctx,
+		`UPDATE pg_index SET indisvalid = false WHERE indexrelid = to_regclass('refs_repo_name_c')`); err != nil {
+		t.Fatalf("inject invalid index: %v", err)
+	}
+	if err := s.InitSchema(ctx); err != nil {
+		t.Fatalf("InitSchema over invalid refs index: %v", err)
+	}
+	if exists, valid := mustIndexState(t, s, "refs_repo_name_c"); !exists || !valid {
+		t.Fatalf("after repair: exists=%v valid=%v, want a valid index", exists, valid)
+	}
+
+	// The planner must serve the COLLATE "C" keyset page from the index.
+	// EXPLAIN with generic-plan-defeating literals mirrors production
+	// parameterized queries closely enough to catch a collation mismatch
+	// (a default-collation PK cannot serve this ORDER BY).
+	rows, err := s.pool.Query(ctx, `EXPLAIN SELECT name, sha FROM refs
+		WHERE repo = 'r' AND name COLLATE "C" > 'refs/heads/a'
+		ORDER BY name COLLATE "C" LIMIT 100`)
+	if err != nil {
+		t.Fatalf("explain: %v", err)
+	}
+	defer rows.Close()
+	var plan string
+	for rows.Next() {
+		var line string
+		if err := rows.Scan(&line); err != nil {
+			t.Fatalf("scan plan: %v", err)
+		}
+		plan += line + "\n"
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("plan rows: %v", err)
+	}
+	if !strings.Contains(plan, "refs_repo_name_c") {
+		t.Fatalf("ListRefsAfter page not served by refs_repo_name_c:\n%s", plan)
+	}
+	if strings.Contains(plan, "Sort") {
+		t.Fatalf("ListRefsAfter page plans a sort (index should stream byte order):\n%s", plan)
 	}
 }
