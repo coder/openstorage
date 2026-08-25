@@ -747,34 +747,24 @@ func (r *AbsenceReconciler) settleLFSRow(ctx context.Context, row ref.AbsenceLFS
 		// without a probe.
 		return charged
 	}
+	// The deficit is registered bytes minus EVERY physical copy across the
+	// ADR-41 spellings (Codex rounds 4+12): both copies are in the usage
+	// listing, so any surviving bytes — full or short, registered spelling
+	// or twin — compensate the floor and must not be re-covered (a
+	// tracked over-cover would renew indefinitely, not one TTL).
+	physical := int64(0)
 	if size, err := r.blobs.Stat(ctx, row.Key); err == nil {
 		if size >= row.Bytes {
 			r.untrackAbsent(row.Key)
 			return charged // fully present under the registered spelling
 		}
-		// Present but SHORT (Codex round 4, security): a truncated blob —
-		// e.g. a still-valid v0.1 presigned PUT overwriting a legacy key
-		// with fewer bytes — deflates the floor by the deficit exactly
-		// like partial absence. Cover the deficit; a full twin could
-		// compensate, but probing it here would trade a rare short-lived
-		// over-cover for an extra request on a corruption path.
-		report.LFSRowsTruncated++
-		r.logger.Error("absence reconcile: registered lfs object is shorter than its registered size",
-			"repo", row.Repo, "key", row.Key, "registered", row.Bytes, "physical", size)
-		r.coverDeficit(ctx, base, absentRow{repo: row.Repo, key: row.Key, bytes: row.Bytes - size, registered: row.Bytes}, report, st, errs)
-		return charged
+		physical = size
 	} else if !errors.Is(err, blob.ErrNotFound) {
 		report.StatErrors++
 		errs.add(fmt.Errorf("absence reconcile: stat %s: %w", row.Key, err))
 		return charged
 	}
-	// The registered spelling is absent — classify the ADR-41 twin before
-	// flagging: a canonical-missing object may be legacy-present (or the
-	// reverse for a pre-migration legacy row). A FULL twin's bytes are
-	// physically listed, so the floor is NOT deflated, and download-time
-	// restore (PR #104) heals the spelling through the digest-verified
-	// adopt pipeline — report, never cover. A SHORT twin compensates only
-	// its physical size; the remainder is covered like truncation.
+	twinPhysical := int64(0)
 	if repoID, oid, ok := splitLFSKey(row.Key); ok {
 		canonical, legacy := blob.LFSKey(repoID, oid), blob.LFSLegacyKey(repoID, oid)
 		twin := legacy
@@ -783,23 +773,30 @@ func (r *AbsenceReconciler) settleLFSRow(ctx context.Context, row ref.AbsenceLFS
 		}
 		charged++
 		if size, err := r.blobs.Stat(ctx, twin); err == nil {
-			if size >= row.Bytes {
-				report.LFSRowsTwinOnly++
-				r.untrackAbsent(row.Key)
-				r.logger.Warn("absence reconcile: registered lfs object present only under its twin spelling",
-					"repo", row.Repo, "key", row.Key, "twin", twin, "bytes", row.Bytes)
-				return charged
-			}
-			report.LFSRowsTruncated++
-			r.logger.Error("absence reconcile: registered lfs object survives only as a short twin",
-				"repo", row.Repo, "key", row.Key, "twin", twin, "registered", row.Bytes, "physical", size)
-			r.coverDeficit(ctx, base, absentRow{repo: row.Repo, key: row.Key, bytes: row.Bytes - size, registered: row.Bytes}, report, st, errs)
-			return charged
+			twinPhysical = size
 		} else if !errors.Is(err, blob.ErrNotFound) {
 			report.StatErrors++
 			errs.add(fmt.Errorf("absence reconcile: stat twin %s: %w", twin, err))
 			return charged
 		}
+	}
+	deficit := row.Bytes - physical - twinPhysical
+	switch {
+	case deficit <= 0:
+		// The surviving copies compensate the whole registered size:
+		// physically listed, no floor deflation; download-time restore
+		// (PR #104) heals the registered spelling.
+		report.LFSRowsTwinOnly++
+		r.untrackAbsent(row.Key)
+		r.logger.Warn("absence reconcile: registered lfs object compensated by its twin spelling",
+			"repo", row.Repo, "key", row.Key, "registered", row.Bytes, "physical", physical, "twin_physical", twinPhysical)
+		return charged
+	case physical > 0 || twinPhysical > 0:
+		report.LFSRowsTruncated++
+		r.logger.Error("absence reconcile: registered lfs object is shorter than its registered size across all spellings",
+			"repo", row.Repo, "key", row.Key, "registered", row.Bytes, "physical", physical, "twin_physical", twinPhysical)
+		r.coverDeficit(ctx, base, absentRow{repo: row.Repo, key: row.Key, bytes: deficit, registered: row.Bytes}, report, st, errs)
+		return charged
 	}
 	report.LFSRowsAbsent++
 	r.logger.Error("absence reconcile: registered lfs object bytes are missing from blob storage",

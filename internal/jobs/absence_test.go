@@ -722,6 +722,32 @@ func TestAbsenceReconcile_ShortTwinCovered(t *testing.T) {
 	}
 }
 
+// TestAbsenceReconcile_ShortSpellingFullTwinNotCovered (Codex round 12): a
+// truncated registered spelling whose twin still holds the COMPLETE bytes
+// is physically compensated — both copies are in the usage listing, so a
+// tracked deficit would over-cover indefinitely, not one TTL.
+func TestAbsenceReconcile_ShortSpellingFullTwinNotCovered(t *testing.T) {
+	f := newSweepFixture(t)
+	base := "repo-fulltwin"
+	oid := absenceOID('9')
+	canonical := blob.LFSKey(base, oid)
+	f.upload(canonical, "tiny")                                     // 4 of 32 bytes
+	f.upload(blob.LFSLegacyKey(base, oid), strings.Repeat("f", 32)) // full twin
+	registerLFS(t, f, base, canonical, 32)
+
+	r := testReconciler(t, f, true, 1000)
+	report, err := r.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if report.LFSRowsTwinOnly != 1 || report.LFSRowsTruncated != 0 || report.CoversCharged != 0 {
+		t.Fatalf("report = %+v, want twin compensation without covers", report)
+	}
+	if got := ledgerReserved(t, f, base); got != 0 {
+		t.Fatalf("reserved = %d, want 0", got)
+	}
+}
+
 // TestAbsenceReconcile_AggregateShrinksOnPartialHeal (Codex round 5): the
 // ledger's same-key upsert keeps GREATEST(old, new), so a shrinking
 // aggregate must rotate its reservation key — the healed bytes' old row
