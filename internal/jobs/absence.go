@@ -85,10 +85,15 @@ type AbsenceReport struct {
 	StatErrors        int64 `json:"stat_errors"`
 	RowsSkippedPurged int64 `json:"rows_skipped_purged"`
 	// AbsentTracked is the known-absent refresh set's size at pass end:
-	// discovered losses whose covers re-charge every pass.
+	// discovered losses the round-robin refresh renews across passes.
 	AbsentTracked int64 `json:"absent_tracked"`
+	// AbsentRefreshed counts tracked losses the refresh re-settled this
+	// pass; when it stays below AbsentTracked, renewal spans multiple
+	// passes (raise the budget if that period approaches the TTL).
+	AbsentRefreshed int64 `json:"absent_refreshed"`
 	// AbsentUntracked counts absent rows seen while the refresh set was
-	// full — covered on discovery, refreshed only by rotation revisits.
+	// at its memory cap — covered on discovery, refreshed only by
+	// rotation revisits.
 	AbsentUntracked int64 `json:"absent_untracked"`
 	QuotaEnforced   bool  `json:"quota_enforced"`
 }
@@ -111,15 +116,28 @@ const (
 	MinAbsenceReconcileBudget = int64(100)
 	// absencePassTimeout bounds one whole pass (the reclaimer's pattern):
 	// work units meter requests, but a degraded blob store can stretch
-	// each one — time, not just work, must bound the pass.
+	// each one — time, not just work, must bound the pass. The
+	// constructor tightens it to a quarter of the cover TTL (Codex round
+	// 3, security): tracked covers renew at pass STARTS, and River
+	// coalesces periodic ticks that fire while a pass runs, so the gap
+	// between one row's renewals is bounded by pass duration + interval
+	// + the next refresh phase — with the pass capped at TTL/4 and the
+	// interval validated at ≤ TTL/2 (config), that gap stays within the
+	// TTL and a long scan can never let live covers lapse. A timed-out
+	// pass parks its cursors and resumes, exactly like a budget-limited
+	// one.
 	absencePassTimeout = time.Hour
-	// absentRowWorstCost is one tracked row's worst-case refresh cost in
-	// work units: the registration probe, the stat, and the LFS twin
-	// probe. The tracking capacity divides the refresh half-budget by it
-	// (Codex round 2, P1): a set larger than what the refresh can
-	// re-settle in ONE pass would leave randomly-iterated stragglers
-	// whose covers lapse before their next visit.
-	absentRowWorstCost = 3
+	// absentTrackedCap bounds the tracked-loss population as a MEMORY
+	// bound only (Codex rounds 2+3): losses are storage-incident-scaled,
+	// never attacker-mintable (every software deletion path quarantines
+	// first), so the cap exists to keep a catastrophic incident from
+	// growing the worker heap without bound — not to match the per-pass
+	// refresh capacity. One tracked row's worst-case refresh cost is 3
+	// units (registration probe + stat + twin probe), so tracked losses
+	// beyond one pass's refresh half-budget still renew deterministically
+	// via the round-robin ring, once per ceil(3×tracked/(budget/2))
+	// passes.
+	absentTrackedCap = 100_000
 )
 
 // AbsenceReconciler runs the reconciliation scan. Construct with
@@ -150,17 +168,20 @@ type AbsenceReconciler struct {
 	// registry larger than one pass's budget the rotation returns to a
 	// row less often than its cover survives — the visibility window
 	// would silently reopen between visits. Every pass re-settles this
-	// set FIRST, independent of the rotation, so a discovered loss stays
-	// covered at the pass cadence (wiring warns when the cadence exceeds
-	// the TTL). In-memory per process like the cursors: a restart loses
-	// it and the rotation rediscovers — convergence delay, never
-	// corruption (issue #125 tracks fleet persistence with #121).
-	knownAbsent map[string]absentRow
-	// absentCap bounds knownAbsent at the refresh half-budget's one-pass
-	// capacity (Codex round 2, P1): tracked ⇒ provably re-settled every
-	// pass. Losses beyond it are covered on discovery, refreshed by
-	// rotation revisits, and reported as absent_untracked.
-	absentCap int64
+	// set FIRST, independent of the rotation. In-memory per process like
+	// the cursors: a restart loses it and the rotation rediscovers —
+	// convergence delay, never corruption (issue #125 tracks fleet
+	// persistence with #121).
+	knownAbsent map[string]*absentRow
+	// refreshRing is knownAbsent's round-robin schedule (Codex round 3,
+	// P1): a set larger than one pass's refresh capacity must not leave
+	// stragglers to unbounded map-iteration luck — the persistent ring
+	// cursor guarantees every tracked loss renews at least once per
+	// ceil(3×tracked / (budget/2)) passes (at most twice that under
+	// swap-remove churn). Entries hold their ring index for O(1)
+	// removal.
+	refreshRing []*absentRow
+	refreshPos  int
 	// passes counts completed Run invocations to alternate phase order
 	// (Codex round 1, P2): a twin probe can overdraw the LFS allocation
 	// by one unit, and at degenerate budgets a fixed order would hand
@@ -169,13 +190,15 @@ type AbsenceReconciler struct {
 }
 
 // absentRow is one tracked truly-absent registry row: everything the
-// refresh needs to re-verify registration and re-settle it.
+// refresh needs to re-verify registration and re-settle it, plus its
+// position in the round-robin ring.
 type absentRow struct {
 	repo  string
 	id    string // packs keyset component; empty for LFS rows
 	key   string // the row's blob key
 	bytes int64
 	pack  bool
+	idx   int // position in refreshRing, maintained by track/untrack
 }
 
 // NewAbsenceReconciler wires the reconciliation job.
@@ -185,6 +208,10 @@ func NewAbsenceReconciler(registry AbsenceRegistry, blobs BlobStatter, quotaEnfo
 	assertf(budget > 0, "NewAbsenceReconciler: non-positive budget %d", budget)
 	assertf(coverTTL > 0, "NewAbsenceReconciler: non-positive cover TTL %v", coverTTL)
 	assertf(logger != nil, "NewAbsenceReconciler: nil logger")
+	passTimeout := absencePassTimeout
+	if quarter := coverTTL / 4; quarter < passTimeout {
+		passTimeout = quarter // see absencePassTimeout: renewal gap ≤ TTL
+	}
 	return &AbsenceReconciler{
 		registry:      registry,
 		blobs:         blobs,
@@ -192,9 +219,8 @@ func NewAbsenceReconciler(registry AbsenceRegistry, blobs BlobStatter, quotaEnfo
 		budget:        budget,
 		coverTTL:      coverTTL,
 		logger:        logger,
-		passTimeout:   absencePassTimeout,
-		knownAbsent:   make(map[string]absentRow),
-		absentCap:     (budget - budget/2) / absentRowWorstCost,
+		passTimeout:   passTimeout,
+		knownAbsent:   make(map[string]*absentRow),
 	}
 }
 
@@ -263,18 +289,24 @@ func (r *AbsenceReconciler) Run(ctx context.Context) (AbsenceReport, error) {
 		"stat_errors", report.StatErrors,
 		"rows_skipped_purged", report.RowsSkippedPurged,
 		"absent_tracked", report.AbsentTracked,
+		"absent_refreshed", report.AbsentRefreshed,
+		"absent_untracked", report.AbsentUntracked,
 		"quota_enforced", report.QuotaEnforced)
 	return report, errs.join()
 }
 
-// refreshKnownAbsent re-settles every tracked truly-absent row within
-// budget: verify the registry row still exists (retired, folded-away, and
-// purge-completed rows are dropped), then re-settle it exactly like a
-// rotation visit — re-charging the cover while the bytes stay absent, and
-// dropping the row from the set the moment it heals. Entries the budget
-// cannot reach this pass stay tracked for the next one.
+// refreshKnownAbsent re-settles tracked truly-absent rows within budget,
+// in round-robin ring order resuming at the persistent cursor: verify the
+// registry row still exists (retired, folded-away, and purge-completed
+// rows drop out), then re-settle it exactly like a rotation visit —
+// re-charging the cover while the bytes stay absent, and dropping the row
+// the moment it heals. Entries the budget cannot reach this pass are
+// exactly the ones the cursor starts from next pass.
 func (r *AbsenceReconciler) refreshKnownAbsent(ctx context.Context, budget int64, report *AbsenceReport, st *absencePassState, errs *boundedErrs) (charged int64) {
-	for key, row := range r.knownAbsent {
+	// Visit at most the ring's population at entry: untracks shrink the
+	// ring mid-loop, and without the visit bound a key that keeps
+	// re-settling could loop past every other entry.
+	for visits := len(r.refreshRing); visits > 0 && len(r.refreshRing) > 0; visits-- {
 		if ctx.Err() != nil {
 			errs.add(ctx.Err())
 			return charged
@@ -282,6 +314,10 @@ func (r *AbsenceReconciler) refreshKnownAbsent(ctx context.Context, budget int64
 		if charged >= budget {
 			return charged
 		}
+		if r.refreshPos >= len(r.refreshRing) {
+			r.refreshPos = 0
+		}
+		row := r.refreshRing[r.refreshPos]
 		charged++ // the registration probe
 		var registered bool
 		var err error
@@ -291,26 +327,32 @@ func (r *AbsenceReconciler) refreshKnownAbsent(ctx context.Context, budget int64
 			registered, err = r.registry.HasLFSObject(ctx, row.repo, row.key)
 		}
 		if err != nil {
-			errs.add(fmt.Errorf("absence reconcile: refresh registration probe %s: %w", key, err))
-			continue // still tracked; retried next pass
-		}
-		if !registered {
-			delete(r.knownAbsent, key)
+			errs.add(fmt.Errorf("absence reconcile: refresh registration probe %s: %w", row.key, err))
+			r.refreshPos++ // still tracked; retried on the next rotation
 			continue
 		}
+		if !registered {
+			r.untrackAbsent(row.key)
+			continue // the swap-removed replacement now sits at refreshPos
+		}
+		report.AbsentRefreshed++
+		before := len(r.refreshRing)
 		if row.pack {
 			charged += r.settlePackRow(ctx, ref.AbsencePackRow{Repo: row.repo, ID: row.id, Key: row.key, Bytes: row.bytes}, report, st, errs)
 		} else {
 			charged += r.settleLFSRow(ctx, ref.AbsenceLFSRow{Repo: row.repo, Key: row.key, Bytes: row.bytes}, report, st, errs)
 		}
+		if len(r.refreshRing) == before {
+			r.refreshPos++ // entry survived (still absent): advance past it
+		}
 	}
 	return charged
 }
 
-// trackAbsent records a truly-absent row for per-pass cover refresh. Only
-// coverable rows are tracked: with quota unenforced or an unknown size
-// there is no cover to keep alive, and the rotation's detection logging
-// already covers reporting.
+// trackAbsent records a truly-absent row for round-robin cover refresh.
+// Only coverable rows are tracked: with quota unenforced or an unknown
+// size there is no cover to keep alive, and the rotation's detection
+// logging already covers reporting.
 func (r *AbsenceReconciler) trackAbsent(row absentRow, report *AbsenceReport) {
 	if !r.quotaEnforced {
 		return
@@ -318,13 +360,35 @@ func (r *AbsenceReconciler) trackAbsent(row absentRow, report *AbsenceReport) {
 	if _, ok := r.knownAbsent[row.key]; ok {
 		return
 	}
-	if int64(len(r.knownAbsent)) >= r.absentCap {
+	if len(r.knownAbsent) >= absentTrackedCap {
 		report.AbsentUntracked++
-		r.logger.Warn("absence reconcile: known-absent set is at the refresh capacity; this loss refreshes only on rotation revisits — raise CODESTORAGE_ABSENCE_RECONCILE_BUDGET",
-			"key", row.key, "cap", r.absentCap)
+		r.logger.Warn("absence reconcile: known-absent set is at its memory cap; this loss refreshes only on rotation revisits",
+			"key", row.key, "cap", absentTrackedCap)
 		return
 	}
-	r.knownAbsent[row.key] = row
+	row.idx = len(r.refreshRing)
+	tracked := &row
+	r.refreshRing = append(r.refreshRing, tracked)
+	r.knownAbsent[row.key] = tracked
+}
+
+// untrackAbsent drops a tracked row (healed, twin-present, retired, or
+// purged) with an O(1) ring swap-remove; the moved entry inherits the
+// vacated index. assertf-checked consistency: the map and ring must agree.
+func (r *AbsenceReconciler) untrackAbsent(key string) {
+	row, ok := r.knownAbsent[key]
+	if !ok {
+		return
+	}
+	assertf(row.idx >= 0 && row.idx < len(r.refreshRing) && r.refreshRing[row.idx] == row,
+		"untrackAbsent(%q): ring index %d inconsistent", key, row.idx)
+	last := len(r.refreshRing) - 1
+	moved := r.refreshRing[last]
+	r.refreshRing[row.idx] = moved
+	moved.idx = row.idx
+	r.refreshRing[last] = nil
+	r.refreshRing = r.refreshRing[:last]
+	delete(r.knownAbsent, key)
 }
 
 // cursorAfter reports whether (repoB, keyB) sorts strictly after
@@ -455,7 +519,7 @@ func (r *AbsenceReconciler) settleLFSRow(ctx context.Context, row ref.AbsenceLFS
 	base := baseOf(row.Repo)
 	if r.repoPurged(ctx, base, st, errs) {
 		report.RowsSkippedPurged++
-		delete(r.knownAbsent, row.Key)
+		r.untrackAbsent(row.Key)
 		return charged
 	}
 	if row.Bytes == 0 {
@@ -465,7 +529,7 @@ func (r *AbsenceReconciler) settleLFSRow(ctx context.Context, row ref.AbsenceLFS
 		return charged
 	}
 	if _, err := r.blobs.Stat(ctx, row.Key); err == nil {
-		delete(r.knownAbsent, row.Key)
+		r.untrackAbsent(row.Key)
 		return charged // physically present under the registered spelling
 	} else if !errors.Is(err, blob.ErrNotFound) {
 		report.StatErrors++
@@ -493,7 +557,7 @@ func (r *AbsenceReconciler) settleLFSRow(ctx context.Context, row ref.AbsenceLFS
 		charged++
 		if _, err := r.blobs.Stat(ctx, twin); err == nil {
 			report.LFSRowsTwinOnly++
-			delete(r.knownAbsent, row.Key)
+			r.untrackAbsent(row.Key)
 			r.logger.Warn("absence reconcile: registered lfs object present only under its twin spelling",
 				"repo", row.Repo, "key", row.Key, "twin", twin, "bytes", row.Bytes)
 			return charged
@@ -523,11 +587,11 @@ func (r *AbsenceReconciler) settlePackRow(ctx context.Context, row ref.AbsencePa
 	base := baseOf(row.Repo)
 	if r.repoPurged(ctx, base, st, errs) {
 		report.RowsSkippedPurged++
-		delete(r.knownAbsent, row.Key)
+		r.untrackAbsent(row.Key)
 		return charged
 	}
 	if _, err := r.blobs.Stat(ctx, row.Key); err == nil {
-		delete(r.knownAbsent, row.Key)
+		r.untrackAbsent(row.Key)
 		return charged
 	} else if !errors.Is(err, blob.ErrNotFound) {
 		report.StatErrors++

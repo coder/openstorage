@@ -265,14 +265,9 @@ func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL, loopbackBaseU
 	if absence.interval > 0 {
 		absenceReg, ok := refStore.(jobs.AbsenceRegistry)
 		assertf(ok, "ref store %T lacks the absence reconciliation seams", refStore)
-		if absence.interval > packReservationTTL {
-			// A cover is visible to an admission only while its
-			// created_at is within the ADMITTING call's TTL, and each
-			// pass refreshes it; a cadence beyond the TTL leaves
-			// visibility gaps between re-charges.
-			logger.Warn("absence reconcile interval exceeds the reservation TTL: covered losses go invisible between passes",
-				"env", envAbsenceReconcileInterval, "interval", absence.interval, "ttl", packReservationTTL)
-		}
+		// Cadence-vs-TTL safety is enforced at config resolution
+		// (interval ≤ TTL/2) and inside the constructor (pass wall-clock
+		// ≤ TTL/4), so covers renew before they can lapse.
 		reconciler := jobs.NewAbsenceReconciler(absenceReg, blobStore,
 			packQuotaBytes > 0, absence.budget, packReservationTTL, logger)
 		absenceSchedule = &jobs.AbsenceReconcileSchedule{Reconciler: reconciler, Interval: absence.interval}

@@ -569,6 +569,18 @@ func resolveServeConfig(getenv func(string) string, flagListen, flagAddr, flagCa
 	if err != nil {
 		return serveConfig{}, err
 	}
+	if cfg.absence.interval > 0 && cfg.absence.interval*2 > cfg.packReservationTTL {
+		// Covers renew at pass starts and a pass may run up to a quarter
+		// of the TTL (jobs.NewAbsenceReconciler), so the renewal gap is
+		// bounded by pass duration + interval + the next refresh phase —
+		// an interval above TTL/2 breaks that bound and lets live covers
+		// lapse between passes (Codex round 3, security). Reject the
+		// misconfiguration loudly instead of reopening the window it
+		// exists to close.
+		return serveConfig{}, fmt.Errorf(
+			"%s (%s) must be at most half of %s (%s): absence covers are TTL'd reservations renewed once per pass, and a longer cadence lets them lapse between passes",
+			envAbsenceReconcileInterval, cfg.absence.interval, envPackReservationTTL, cfg.packReservationTTL)
+	}
 	cfg.repackThreshold, err = resolveRepackThreshold(getenv)
 	if err != nil {
 		return serveConfig{}, err

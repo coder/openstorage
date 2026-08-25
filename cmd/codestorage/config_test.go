@@ -1328,6 +1328,35 @@ func TestResolveAbsenceSettings(t *testing.T) {
 	}
 }
 
+// TestResolveServeConfigAbsenceIntervalTTLCoupling (issue #101, Codex
+// round 3 security): absence covers are TTL'd reservations renewed once
+// per pass, a pass may run up to a quarter of the TTL, and River coalesces
+// ticks that fire mid-pass — an interval above TTL/2 therefore lets live
+// covers lapse between renewals, reopening the window the job closes.
+func TestResolveServeConfigAbsenceIntervalTTLCoupling(t *testing.T) {
+	env := map[string]string{
+		"CODESTORAGE_ORG":                        "org1",
+		"CODESTORAGE_ORG_PUBKEYS":                "/tmp/org.pub.pem",
+		"CODESTORAGE_PACK_RESERVATION_TTL":       "90s",
+		"CODESTORAGE_ABSENCE_RECONCILE_INTERVAL": "60s",
+	}
+	for k, v := range spikeEnv {
+		env[k] = v
+	}
+	if _, err := resolveServeConfig(mapEnv(env), "", "127.0.0.1:0", "/tmp/cache", ""); err == nil {
+		t.Fatal("interval > TTL/2 resolved — covers would lapse between renewals")
+	}
+	env["CODESTORAGE_ABSENCE_RECONCILE_INTERVAL"] = "45s"
+	if _, err := resolveServeConfig(mapEnv(env), "", "127.0.0.1:0", "/tmp/cache", ""); err != nil {
+		t.Fatalf("interval = TTL/2 must resolve: %v", err)
+	}
+	// Disabled reconciliation never couples to the TTL.
+	env["CODESTORAGE_ABSENCE_RECONCILE_INTERVAL"] = "0"
+	if _, err := resolveServeConfig(mapEnv(env), "", "127.0.0.1:0", "/tmp/cache", ""); err != nil {
+		t.Fatalf("disabled reconciliation must not couple to the TTL: %v", err)
+	}
+}
+
 // TestResolveLFSMaxObjectsPerRepo (issue #73 option 3): the operator escape
 // hatch parses positively or fails loudly.
 func TestResolveLFSMaxObjectsPerRepo(t *testing.T) {

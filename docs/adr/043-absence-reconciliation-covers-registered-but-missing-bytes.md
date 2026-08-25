@@ -39,12 +39,21 @@ returns to a row less often than its cover survives — so every discovered
 loss joins a per-process known-absent set that each pass re-settles FIRST,
 within half the budget: re-verify the registry row still exists
 (`HasPack`/`HasLFSObject`; retired, folded-away, and purged rows drop
-out), then re-settle it exactly like a rotation visit. The set is capped
-at the refresh half-budget's one-pass capacity (`budget/6` rows, Codex
-round 2), so tracked ⇒ provably re-settled every pass; overflow is
-covered on discovery, rotation-refreshed, and reported. The set is
-in-memory like the cursors: a restart loses it and the rotation
-rediscovers — convergence delay, never corruption. The rotation leader
+out), then re-settle it exactly like a rotation visit. Renewal is
+round-robin from a persistent ring cursor (Codex rounds 2+3): a set larger
+than one pass's refresh capacity degrades to a deterministic
+`ceil(3×tracked/(budget/2))`-pass renewal period instead of leaving
+stragglers to map-iteration luck — losses are storage-incident-scaled,
+never attacker-mintable, so the set's only hard cap is a 100,000-entry
+memory bound (overflow is covered on discovery, rotation-refreshed, and
+reported). The set is in-memory like the cursors: a restart loses it and
+the rotation rediscovers — convergence delay, never corruption. Renewal
+timing is enforced end to end (Codex round 3, security): covers renew at
+pass starts, periodic ticks that fire mid-pass coalesce (River uniqueness
+includes the running state), and a pass's wall clock is capped at a
+quarter of the TTL while configuration rejects intervals above half the
+TTL — so the gap between one cover's renewals (pass + interval + next
+refresh phase) stays within the TTL even under degraded blob stores. The rotation leader
 alternates between the two registries each pass, since a twin probe can
 overdraw the leader's allocation by a unit; a configuration floor
 (`MinAbsenceReconcileBudget`) keeps budgets out of single-row-overdraw

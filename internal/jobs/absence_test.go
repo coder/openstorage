@@ -339,25 +339,156 @@ func TestAbsenceReconcile_RefreshDropsRemovedRows(t *testing.T) {
 	}
 }
 
-// TestAbsenceReconcile_TrackingCapacity (Codex round 2, P1): the tracked
-// set is capped at what the refresh half-budget can re-settle in one pass
-// (budget/6), so every tracked cover provably refreshes every pass; losses
-// beyond it are reported as untracked.
-func TestAbsenceReconcile_TrackingCapacity(t *testing.T) {
+// TestAbsenceReconcile_RefreshRoundRobin (Codex rounds 2+3, P1): a tracked
+// set larger than one pass's refresh capacity renews deterministically —
+// the ring cursor persists across passes, so the entries a pass could not
+// reach are exactly where the next pass starts.
+func TestAbsenceReconcile_RefreshRoundRobin(t *testing.T) {
 	f := newSweepFixture(t)
-	base := "repo-capacity"
+	base := "repo-roundrobin"
 	for i := 0; i < 18; i++ {
 		oid := strings.Repeat("a", 62) + string([]byte{'0' + byte(i/10), '0' + byte(i%10)})
 		registerLFS(t, f, base, blob.LFSKey(base, oid), 10)
 	}
 
-	r := testReconciler(t, f, true, 100) // capacity = (100-50)/3 = 16
+	// Refresh half-budget 50 at the 3-unit worst cost refreshes 17 of the
+	// 18 tracked losses per pass (the last entry may start with any
+	// budget remainder, overdrawing by design like the rotations).
+	r := testReconciler(t, f, true, 100)
 	report, err := r.Run(context.Background())
 	if err != nil {
-		t.Fatalf("Run: %v", err)
+		t.Fatalf("Run 1: %v", err)
 	}
-	if report.LFSRowsAbsent != 18 || report.AbsentTracked != 16 || report.AbsentUntracked != 2 {
-		t.Fatalf("report = %+v, want 18 absent with 16 tracked / 2 untracked at capacity", report)
+	if report.LFSRowsAbsent != 18 || report.AbsentTracked != 18 || report.AbsentUntracked != 0 {
+		t.Fatalf("pass 1 report = %+v, want all 18 losses tracked", report)
+	}
+	for pass := 2; pass <= 3; pass++ {
+		report, err = r.Run(context.Background())
+		if err != nil {
+			t.Fatalf("Run %d: %v", pass, err)
+		}
+		if report.AbsentRefreshed != 17 || report.AbsentTracked != 18 {
+			t.Fatalf("pass %d report = %+v, want 17 of 18 tracked losses refreshed (ring capacity)", pass, report)
+		}
+	}
+}
+
+// stubAbsenceRegistry/stubStatter drive the ring mechanics without a store:
+// every row stays registered and absent, and covers always admit.
+type stubAbsenceRegistry struct{}
+
+func (stubAbsenceRegistry) ListFleetLFSObjects(context.Context, string, string, int) ([]ref.AbsenceLFSRow, error) {
+	return nil, nil
+}
+
+func (stubAbsenceRegistry) ListFleetPacks(context.Context, string, string, int) ([]ref.AbsencePackRow, error) {
+	return nil, nil
+}
+func (stubAbsenceRegistry) IsRepoPurged(context.Context, string) (bool, error)    { return false, nil }
+func (stubAbsenceRegistry) BumpLFSAdoptionGen(context.Context, string) error      { return nil }
+func (stubAbsenceRegistry) HasPack(context.Context, string, string) (bool, error) { return true, nil }
+func (stubAbsenceRegistry) HasLFSObject(context.Context, string, string) (bool, error) {
+	return true, nil
+}
+
+func (stubAbsenceRegistry) ReservePackBytes(context.Context, []string, []ref.Pack, string, int64, int64, int64, time.Duration) (ref.ReserveDecision, error) {
+	return ref.ReserveDecision{OK: true}, nil
+}
+
+type stubStatter struct{ stats []string }
+
+func (s *stubStatter) Stat(_ context.Context, key string) (int64, error) {
+	s.stats = append(s.stats, key)
+	return 0, blob.ErrNotFound
+}
+
+// TestAbsenceRefreshRingOrder: the refresh visits tracked losses in ring
+// order across calls, resuming at the persistent cursor and wrapping.
+func TestAbsenceRefreshRingOrder(t *testing.T) {
+	statter := &stubStatter{}
+	r := NewAbsenceReconciler(stubAbsenceRegistry{}, statter, true, 100, time.Hour, slog.New(slog.DiscardHandler))
+	keys := make([]string, 5)
+	var report AbsenceReport
+	for i := range keys {
+		oid := strings.Repeat("b", 63) + string([]byte{'0' + byte(i)})
+		keys[i] = blob.LFSKey("base", oid)
+		r.trackAbsent(absentRow{repo: "base", key: keys[i], bytes: 10}, &report)
+	}
+
+	refresh := func(budget int64) []string {
+		statter.stats = nil
+		var errs boundedErrs
+		rep := AbsenceReport{QuotaEnforced: true}
+		r.refreshKnownAbsent(context.Background(), budget, &rep, newAbsencePassState(), &errs)
+		if err := errs.join(); err != nil {
+			t.Fatalf("refresh: %v", err)
+		}
+		var primaries []string
+		for _, s := range statter.stats {
+			if strings.Contains(s, "/o2/") {
+				primaries = append(primaries, s)
+			}
+		}
+		return primaries
+	}
+	assertSeq := func(got, want []string) {
+		t.Helper()
+		if len(got) != len(want) {
+			t.Fatalf("visited %v, want %v", got, want)
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Fatalf("visited %v, want %v", got, want)
+			}
+		}
+	}
+	// Budget 6 = two rows per call at the 3-unit worst cost.
+	assertSeq(refresh(6), []string{keys[0], keys[1]})
+	assertSeq(refresh(6), []string{keys[2], keys[3]})
+	assertSeq(refresh(6), []string{keys[4], keys[0]}) // wrapped
+}
+
+// TestAbsencePassTimeoutClampedToTTL (Codex round 3, security): the pass
+// wall-clock cap tightens to a quarter of the cover TTL so a long scan can
+// never hold the next renewal past a live cover's expiry.
+func TestAbsencePassTimeoutClampedToTTL(t *testing.T) {
+	log := slog.New(slog.DiscardHandler)
+	r := NewAbsenceReconciler(stubAbsenceRegistry{}, &stubStatter{}, true, 100, 40*time.Minute, log)
+	if r.passTimeout != 10*time.Minute {
+		t.Fatalf("passTimeout = %v with a 40m TTL, want 10m (TTL/4)", r.passTimeout)
+	}
+	r = NewAbsenceReconciler(stubAbsenceRegistry{}, &stubStatter{}, true, 100, 8*time.Hour, log)
+	if r.passTimeout != time.Hour {
+		t.Fatalf("passTimeout = %v with an 8h TTL, want the 1h ceiling", r.passTimeout)
+	}
+}
+
+// TestAbsenceUntrackSwapRemove: O(1) removal keeps the map and ring
+// consistent, and the refresh still renews every survivor.
+func TestAbsenceUntrackSwapRemove(t *testing.T) {
+	statter := &stubStatter{}
+	r := NewAbsenceReconciler(stubAbsenceRegistry{}, statter, true, 100, time.Hour, slog.New(slog.DiscardHandler))
+	var report AbsenceReport
+	keys := make([]string, 4)
+	for i := range keys {
+		oid := strings.Repeat("c", 63) + string([]byte{'0' + byte(i)})
+		keys[i] = blob.LFSKey("base", oid)
+		r.trackAbsent(absentRow{repo: "base", key: keys[i], bytes: 10}, &report)
+	}
+	r.untrackAbsent(keys[1])
+	r.untrackAbsent(keys[1]) // idempotent
+	r.untrackAbsent(keys[3])
+	if len(r.knownAbsent) != 2 || len(r.refreshRing) != 2 {
+		t.Fatalf("tracked=%d ring=%d, want 2/2", len(r.knownAbsent), len(r.refreshRing))
+	}
+	var errs boundedErrs
+	rep := AbsenceReport{QuotaEnforced: true}
+	r.refreshKnownAbsent(context.Background(), 100, &rep, newAbsencePassState(), &errs)
+	if err := errs.join(); err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+	if rep.AbsentRefreshed != 2 {
+		t.Fatalf("refreshed %d survivors, want 2", rep.AbsentRefreshed)
 	}
 }
 

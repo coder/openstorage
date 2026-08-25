@@ -770,11 +770,13 @@ integrity loss logged loudly: committed refs may reference it). See the
 [operations guide](../how-to/storage-lifecycle-and-sweeping.md#reconciling-registered-but-missing-bytes).
 
 - **Default:** unset (`0`) — the job never runs.
-- **Constraints:** a non-negative Go duration. Keep the cadence at or below
-  [`CODESTORAGE_PACK_RESERVATION_TTL`](#codestorage_pack_reservation_ttl):
-  covers are ordinary TTL'd reservations refreshed by each pass, so a
-  cadence beyond the TTL leaves visibility gaps between passes (startup
-  warns).
+- **Constraints:** a non-negative Go duration, at most half of
+  [`CODESTORAGE_PACK_RESERVATION_TTL`](#codestorage_pack_reservation_ttl)
+  (a startup error otherwise): covers are ordinary TTL'd reservations
+  renewed once per pass, a pass's wall clock is capped at a quarter of the
+  TTL, and periodic ticks that fire mid-pass coalesce — together those
+  bound every tracked cover's renewal gap within the TTL, so a long scan
+  can never let a live cover lapse.
 - The job is non-destructive on every path: it only inserts/refreshes
   reservation rows and bumps the shared floor generation. With quota
   enforcement disabled
@@ -797,11 +799,14 @@ stretches individual probes.
 - **Default:** `100000`. **Constraints:** an integer of at least `100`
   (one row can cost up to three units, so degenerate budgets cannot
   guarantee progress on both registries).
-- The tracked-loss set is capped at what the refresh half-budget can
-  re-settle in one pass (`budget/6` entries; 16,666 at the default), so
-  every tracked cover provably refreshes every pass. Losses beyond the cap
-  are covered on discovery, refreshed only by rotation revisits, and
-  reported as `absent_untracked` — raise the budget if that stays nonzero.
+- Tracked losses renew round-robin from a persistent ring cursor: every
+  tracked cover re-charges at least once per `ceil(3 × absent_tracked /
+  (budget/2))` passes — one pass whenever `3 × absent_tracked ≤ budget/2`
+  (a 100,000 default budget covers ~16k concurrent losses per pass). Keep
+  that renewal period times the interval below the reservation TTL; the
+  pass report's `absent_refreshed` vs `absent_tracked` shows the actual
+  cadence. The set is memory-capped at 100,000 losses
+  (`absent_untracked` reports overflow — storage-incident territory).
 - **Multi-replica PostgreSQL fleets:** the refresh set and rotation
   cursors are per-process, and the River periodic job may run on any
   replica ([#125](https://github.com/coder/code-storage/issues/125) tracks
