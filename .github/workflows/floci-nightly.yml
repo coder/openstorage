@@ -57,8 +57,13 @@ jobs:
             --user-name blob-nightly --output json)
           access_key_id=$(jq -r '.AccessKey.AccessKeyId // empty' <<<"$key_json")
           secret_key=$(jq -r '.AccessKey.SecretAccessKey // empty' <<<"$key_json")
-          if [ -z "$access_key_id" ] || [ -z "$secret_key" ]; then
-            echo "::error::IAM CreateAccessKey returned no key: $key_json"
+          # The image tag is mutable, so the returned JSON is untrusted:
+          # full-string-validate both values before writing them to
+          # GITHUB_ENV — an embedded newline would otherwise inject extra
+          # variables (e.g. GOCACHEPROG) into every later step. Bash [[ =~ ]]
+          # anchors span the whole string, so newlines cannot hide inside.
+          if [[ ! "$access_key_id" =~ ^[A-Z0-9]{16,32}$ ]] || [[ ! "$secret_key" =~ ^[A-Za-z0-9/+=]{20,64}$ ]]; then
+            echo "::error::IAM CreateAccessKey returned missing or malformed credentials"
             exit 1
           fi
           {
