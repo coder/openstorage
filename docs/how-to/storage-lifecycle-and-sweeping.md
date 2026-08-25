@@ -550,7 +550,8 @@ A reconciliation pass logs one `absence reconcile pass finished` line:
 | `rows_skipped_purged` | rows of purge-fenced repositories skipped |
 | `absent_tracked` | known-absent set size at pass end: losses whose per-repository aggregate covers renew every pass |
 | `absent_refreshed` | tracked losses re-verified this pass — below `absent_tracked` means heal-detection (cover shrinking) spans multiple passes; renewal is unaffected |
-| `absent_untracked` | losses seen while the set was at its 100,000-entry memory cap — one-shot covers renewed only on rotation revisits |
+| `absent_untracked` | losses beyond the tracked-repository capacity (`budget/4`) or the 100,000-entry memory cap — one-shot covers renewed only on rotation revisits |
+| `absent_dropped` | tracked rows dropped because their repository's aggregate could not be renewed this pass (pass deadline / ledger failure) — rediscovered by rotation; investigate the ledger if persistent |
 | `quota_enforced` | `false` means detection-only (no quota admission to protect) |
 
 Any nonzero `lfs_rows_absent` or `pack_rows_absent` means storage lost

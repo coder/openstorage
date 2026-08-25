@@ -639,30 +639,95 @@ func TestAbsenceReconcile_AggregateShrinksOnPartialHeal(t *testing.T) {
 // one-shot covers and report as untracked.
 func TestAbsenceReconcile_BaseRenewalCapacity(t *testing.T) {
 	f := newSweepFixture(t)
-	// Budget 100 → base capacity 50. Mint 52 bases with one 10-byte
-	// absent LFS row each.
-	for i := 0; i < 52; i++ {
+	// Budget 100 → base capacity 25 (half the refresh allocation, so
+	// revalidation always keeps the other half). Mint 27 bases with one
+	// 10-byte absent LFS row each.
+	for i := 0; i < 27; i++ {
 		base := fmt.Sprintf("repo-cap-%02d", i)
 		registerLFS(t, f, base, blob.LFSKey(base, absenceOID('a')), 10)
 	}
 
 	r := testReconciler(t, f, true, 100)
-	var tracked, untracked int64
-	for pass := 0; pass < 4; pass++ {
+	var tracked, untrackedTotal int64
+	for pass := 0; pass < 6; pass++ {
 		report, err := r.Run(context.Background())
 		if err != nil {
 			t.Fatalf("Run %d: %v", pass, err)
 		}
-		tracked, untracked = report.AbsentTracked, report.AbsentUntracked
-		if tracked == 50 {
+		tracked = report.AbsentTracked
+		untrackedTotal += report.AbsentUntracked
+		if tracked == 25 && untrackedTotal > 0 {
 			break
 		}
 	}
-	if tracked != 50 {
-		t.Fatalf("tracked = %d, want the 50-base renewal capacity", tracked)
+	if tracked != 25 {
+		t.Fatalf("tracked = %d, want the 25-base renewal capacity", tracked)
 	}
-	if untracked == 0 {
+	if untrackedTotal == 0 {
 		t.Fatal("losses beyond the base capacity must report as untracked one-shot covers")
+	}
+}
+
+// TestAbsenceReconcile_AggregateKeyNotReusedAfterEmpty (Codex round 6): a
+// base whose aggregate empties and re-forms within one TTL must mint a
+// FRESH reservation key — a resettable counter would re-adopt the stale
+// GREATEST-pinned row and renew the old larger total forever.
+func TestAbsenceReconcile_AggregateKeyNotReusedAfterEmpty(t *testing.T) {
+	f := newSweepFixture(t)
+	base := "repo-key-reuse"
+	bigKey := blob.LFSKey(base, absenceOID('3'))
+	registerLFS(t, f, base, bigKey, 100)
+
+	r := testReconciler(t, f, true, 1000)
+	if _, err := r.Run(context.Background()); err != nil {
+		t.Fatalf("Run 1: %v", err)
+	}
+	if got := ledgerReserved(t, f, base); got != 100 {
+		t.Fatalf("reserved = %d, want 100", got)
+	}
+
+	// Heal the loss entirely (aggregate empties), then lose a SMALLER
+	// object; its fresh aggregate must charge 10 on a new key.
+	if got := f.upload(bigKey, strings.Repeat("q", 100)); got != 100 {
+		t.Fatalf("healed to %d bytes, want 100", got)
+	}
+	registerLFS(t, f, base, blob.LFSKey(base, absenceOID('4')), 10)
+	for pass := 2; pass <= 3; pass++ {
+		if _, err := r.Run(context.Background()); err != nil {
+			t.Fatalf("Run %d: %v", pass, err)
+		}
+	}
+	// Stale 100-byte row (inside its TTL) + fresh 10-byte row. Key reuse
+	// would GREATEST-pin the total at 100 instead.
+	if got := ledgerReserved(t, f, base); got != 110 {
+		t.Fatalf("reserved = %d, want 110 (dying 100-byte row + fresh 10-byte incarnation)", got)
+	}
+}
+
+// TestAbsenceRefreshDropsUnrenewedBases (Codex round 6): tracking must
+// never outlive its renewal guarantee — a renewal aborted by the pass
+// deadline drops the unrenewed bases' rows (loudly) instead of leaving
+// covers to lapse silently.
+func TestAbsenceRefreshDropsUnrenewedBases(t *testing.T) {
+	statter := &stubStatter{}
+	r := NewAbsenceReconciler(stubAbsenceRegistry{}, statter, true, 100, time.Hour, slog.New(slog.DiscardHandler))
+	var report AbsenceReport
+	for i := 0; i < 3; i++ {
+		base := fmt.Sprintf("repo-drop-%d", i)
+		r.trackAbsent(absentRow{repo: base, key: blob.LFSKey(base, absenceOID('a')), bytes: 10}, &report)
+	}
+	if len(r.knownAbsent) != 3 || len(r.baseRing) != 3 {
+		t.Fatalf("tracked %d rows / %d bases, want 3/3", len(r.knownAbsent), len(r.baseRing))
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // the pass deadline already expired: zero renewals possible
+	var errs boundedErrs
+	rep := AbsenceReport{QuotaEnforced: true}
+	r.refreshKnownAbsent(ctx, 100, &rep, newAbsencePassState(), &errs)
+	if rep.AbsentDropped != 3 || len(r.knownAbsent) != 0 || len(r.baseRing) != 0 {
+		t.Fatalf("dropped=%d tracked=%d bases=%d, want everything dropped when nothing renewed",
+			rep.AbsentDropped, len(r.knownAbsent), len(r.baseRing))
 	}
 }
 

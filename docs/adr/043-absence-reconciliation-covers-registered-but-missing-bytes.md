@@ -48,15 +48,20 @@ collide with the per-base active-reservation-row cap, so a big enough
 incident would either outrun the renewal cycle or be denied outright. The
 refresh phase runs FIRST each pass, renewal before re-verification:
 renewing every base aggregate costs one work unit per REPOSITORY, and the
-tracked-base population is capped at exactly that renewal allocation
-(Codex round 5) — tracked ⇒ renewed every pass, by construction. A shrink
-(heal, retirement, fold, purge) rotates the aggregate's reservation key:
+tracked-base population is capped at HALF the refresh allocation (Codex
+rounds 5+6) — tracked ⇒ renewed every pass by construction, with the
+other half reserved for revalidation so dead rows always untrack. The
+guarantee is enforced from both sides: a renewal the pass deadline or a
+ledger failure aborts DROPS its unrenewed bases (loud, counted, rotation
+rediscovers) rather than tracking losses it cannot keep covered. A shrink
+(heal, retirement, fold, purge) re-mints the aggregate's reservation key:
 the ledger's same-key upsert keeps GREATEST(old, new) and refreshes the
 TTL, so renewing a smaller total under the old key would pin healed bytes
-reserved forever — the fresh key charges the exact total and the old row
-expires within one TTL (the deliberate tail every cover has). Round-robin
-re-verification (`HasPack`/`HasLFSObject` + stats) only SHRINKS covers,
-so its backlog delays convergence, never visibility. Losses are
+reserved forever — and the incarnation is crypto-random, never a
+resettable counter, so an aggregate that empties and re-forms (or a
+restarted process) can never re-adopt a stale GREATEST-pinned row.
+Round-robin re-verification (`HasPack`/`HasLFSObject` + stats) only
+SHRINKS covers, so its backlog delays convergence, never visibility. Losses are
 storage-incident-scaled, never attacker-mintable; beyond the base
 capacity or the 100,000-row memory bound, overflow gets one-shot per-row
 covers renewed on rotation revisits (`absent_untracked`). The set is in-memory like the cursors: a restart loses it and
