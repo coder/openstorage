@@ -97,13 +97,20 @@ ORDER BY repo ASC, key ASC LIMIT $3`,
 // scan: the prefix with its final byte incremented ('/'+1).
 var absenceCoverRangeEnd = AbsenceCoverPrefix[:len(AbsenceCoverPrefix)-1] + "0"
 
+// absenceCoverRawSuffix is the reservation-row suffix every cover minted
+// through ReserveRestoreCover carries. The queries filter on it in SQL
+// (Codex round 3 on PR #132): a Go-side filter could return an EMPTY page
+// for a stretch of foreign spellings under the prefix, which callers
+// would misread as the end of the keyspace — silently skipping live
+// covers whose renewals then lapse.
+var absenceCoverRawSuffix = RepairCoverSuffix + reservKeySuffix
+
 // stripAbsenceCoverRow maps one pack_reservations row in the absence-cover
-// range back to the synthetic key it was charged under. ok=false for
-// foreign spellings (rows not minted through ReserveRestoreCover — nothing
-// this binary wrote); such rows are skipped and left to reservation
-// expiry.
+// range back to the synthetic key it was charged under. The SQL filters
+// guarantee the shape; ok=false is a defensive residual for rows that
+// somehow carry the suffix without the prefix.
 func stripAbsenceCoverRow(rawKey string) (key string, ok bool) {
-	key, ok = strings.CutSuffix(rawKey, RepairCoverSuffix+reservKeySuffix)
+	key, ok = strings.CutSuffix(rawKey, absenceCoverRawSuffix)
 	if !ok || !strings.HasPrefix(key, AbsenceCoverPrefix) {
 		return "", false
 	}
@@ -123,12 +130,14 @@ func (s *PG) ListAbsenceCovers(ctx context.Context, afterRaw string, limit int) 
 	// COLLATE "C" pins the range scan and cursor order to BYTE order
 	// (reservation spellings embed "\n"; locale collations order it
 	// unpredictably), served by the pack_reservations_key_c index —
-	// the refs_repo_name_c pattern.
+	// the refs_repo_name_c pattern. Foreign spellings are excluded in
+	// SQL so a page can never filter to empty while covers remain.
 	rows, err := s.pool.Query(ctx, `
 SELECT key, repo, bytes FROM pack_reservations
 WHERE key COLLATE "C" > $1 AND key COLLATE "C" < $2
-ORDER BY key COLLATE "C" ASC LIMIT $3`,
-		afterRaw, absenceCoverRangeEnd, limit)
+  AND right(key, $3) = $4
+ORDER BY key COLLATE "C" ASC LIMIT $5`,
+		afterRaw, absenceCoverRangeEnd, len(absenceCoverRawSuffix), absenceCoverRawSuffix, limit)
 	if err != nil {
 		return nil, fmt.Errorf("list absence covers: %w", err)
 	}
@@ -167,8 +176,9 @@ func (s *PG) AbsenceCoverHead(ctx context.Context, prefix string) (AbsenceCoverR
 	err := s.pool.QueryRow(ctx, `
 SELECT key, repo, bytes FROM pack_reservations
 WHERE key COLLATE "C" >= $1 AND key COLLATE "C" < $2
+  AND right(key, $3) = $4
 ORDER BY key COLLATE "C" DESC LIMIT 1`,
-		prefix, coverRangeEnd(prefix)).Scan(&r.RawKey, &r.Base, &r.Bytes)
+		prefix, coverRangeEnd(prefix), len(absenceCoverRawSuffix), absenceCoverRawSuffix).Scan(&r.RawKey, &r.Base, &r.Bytes)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return AbsenceCoverRow{}, false, nil
 	}

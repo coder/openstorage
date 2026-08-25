@@ -41,11 +41,15 @@ func (s *SQLite) ListAbsenceCovers(ctx context.Context, afterRaw string, limit i
 	if afterRaw == "" {
 		afterRaw = AbsenceCoverPrefix // no real row key sorts at the bare prefix
 	}
+	// Foreign spellings are excluded in SQL — see the PG twin (Codex
+	// round 3 on PR #132). substr with a negative start is the last-N
+	// characters.
 	rows, err := s.db.QueryContext(ctx, `
 SELECT key, repo, bytes FROM pack_reservations
 WHERE key > ? AND key < ?
+  AND substr(key, -?) = ?
 ORDER BY key ASC LIMIT ?`,
-		afterRaw, absenceCoverRangeEnd, limit)
+		afterRaw, absenceCoverRangeEnd, len(absenceCoverRawSuffix), absenceCoverRawSuffix, limit)
 	if err != nil {
 		return nil, fmt.Errorf("list absence covers: %w", err)
 	}
@@ -72,8 +76,9 @@ func (s *SQLite) AbsenceCoverHead(ctx context.Context, prefix string) (AbsenceCo
 	err := s.db.QueryRowContext(ctx, `
 SELECT key, repo, bytes FROM pack_reservations
 WHERE key >= ? AND key < ?
+  AND substr(key, -?) = ?
 ORDER BY key DESC LIMIT 1`,
-		prefix, coverRangeEnd(prefix)).Scan(&r.RawKey, &r.Base, &r.Bytes)
+		prefix, coverRangeEnd(prefix), len(absenceCoverRawSuffix), absenceCoverRawSuffix).Scan(&r.RawKey, &r.Base, &r.Bytes)
 	if errors.Is(err, sql.ErrNoRows) {
 		return AbsenceCoverRow{}, false, nil
 	}

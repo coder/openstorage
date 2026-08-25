@@ -136,6 +136,19 @@ func TestAbsenceCovers_ListHeadDelete(t *testing.T) {
 		cover(keyLow, 100)
 		cover(keyHigh, 60)
 		cover(keyPacks, 40)
+		// Foreign reservation spellings under the prefix (no repair-cover
+		// suffix) must be invisible to the listing, the head lookup, and
+		// — critically — pagination: a page of foreign rows must never
+		// read as the end of the keyspace (Codex round 3 on PR #132).
+		// One sorts between the covers, one above every incarnation key.
+		for _, foreign := range []string{
+			AbsenceCoverPrefix + base + "/lfs-e0000000000000000001x-foreign",
+			AbsenceCoverPrefix + base + "/zz-foreign",
+		} {
+			if dec, err := s.ReservePackBytes(ctx, k.group, []Pack{{Key: foreign, Size: 5}}, NewReservationOwner(), 0, ReserveNoFloorGen, 1<<40, time.Hour); err != nil || !dec.OK {
+				t.Fatalf("plant foreign row %s: (%+v, %v)", foreign, dec, err)
+			}
+		}
 
 		// Paged listing: one row per page, cursor round-trips opaquely.
 		var got []AbsenceCoverRow
@@ -163,7 +176,8 @@ func TestAbsenceCovers_ListHeadDelete(t *testing.T) {
 			}
 		}
 
-		// Head lookup: the highest incarnation under the class prefix.
+		// Head lookup: the highest incarnation under the class prefix —
+		// the planted foreign row sorting above it must not shadow it.
 		head, ok, err := cs.AbsenceCoverHead(ctx, AbsenceCoverPrefix+base+"/lfs-e")
 		if err != nil || !ok || head.Key != keyHigh || head.Bytes != 60 {
 			t.Fatalf("head = (%+v, %v, %v), want the e2 row", head, ok, err)
