@@ -287,7 +287,12 @@ type AbsenceReconciler struct {
 	// and must not wait for the resumed traversal to wrap. A false reset
 	// only costs a fresh traversal; a false resume is the bug, so the
 	// bound stays strictly conservative (no floor; SQLite's ±1s age
-	// over-read only resets earlier). Shrinkable in tests.
+	// over-read only resets earlier). Shrinkable in tests. The SAME
+	// bound is the success-path renewal-continuity limit (Codex round
+	// 32, P1): the health watermark stamps up to one pass wall clock
+	// after the bulk touch it records, so a watermark age at or past
+	// coverTTL-passTimeout no longer proves the touched covers are
+	// still alive.
 	cursorStaleAge time.Duration
 	// renewalSafeAge bounds how old the renewal-health watermark may be
 	// for a renewal FAILURE to stay provably harmless: coverTTL minus
@@ -1147,9 +1152,19 @@ func (r *AbsenceReconciler) renewCovers(ctx context.Context, budget int64, repor
 		// means RECOVERY, not health. The fence arms BEFORE the stamp
 		// (a crash in between leaves the fail-closed side) and outlives
 		// it until a full recovery rotation completes; an unreadable
-		// prior age arms too. A prior age strictly under the TTL proves
-		// continuity: every row was re-TTL'd then, and rows minted
-		// since carry their own fresh TTL. An ABSENT watermark is NOT
+		// prior age arms too. Continuity needs the prior age strictly
+		// under the TTL MINUS one pass wall clock (Codex round 32, P1):
+		// the watermark stamps up to a pass after the touch it records
+		// — the touch and the stamp are separate statements under the
+		// pass deadline — so covers can be a full pass older than the
+		// watermark claims, and a pause landing in that gap expires
+		// them while the raw TTL bound still reads as proven. The
+		// bound is exactly the cursor-staleness one (same touch-to-
+		// stamp delay); this pass's own touch ran BEFORE this age
+		// read, so the measured age only overestimates — the
+		// conservative direction. Within it, every row was re-TTL'd
+		// then, and rows minted since carry their own fresh TTL. An
+		// ABSENT watermark is NOT
 		// lapse evidence by itself (Codex round 32, security): it is
 		// the upgrade/first-enable signature, and arming the
 		// fleet-global fence on it would turn every first pass under
@@ -1164,7 +1179,7 @@ func (r *AbsenceReconciler) renewCovers(ctx context.Context, budget int64, repor
 		case hErr != nil:
 			errs.add(fmt.Errorf("absence reconcile: read renewal health: %w", hErr))
 			arm, why = true, "renewal health unreadable at a successful touch"
-		case ok && age >= r.coverTTL:
+		case ok && age >= r.cursorStaleAge:
 			arm, why = true, "renewal continuity unprovable at a successful touch — covers may have lapsed while no pass was stamping"
 		case !ok:
 			lapsed, pErr := r.registry.LapsedAbsenceCoverExists(ctx, r.coverTTL)

@@ -1294,6 +1294,52 @@ func TestAbsenceReconcile_UpgradeFirstPassKeepsAdmissionOpen(t *testing.T) {
 	}
 }
 
+// TestAbsenceReconcile_ContinuityBoundCoversStampDelay (Codex round 32,
+// P1): the health watermark stamps up to one pass wall clock AFTER the
+// bulk touch it records, so a watermark age inside [coverTTL-passTimeout,
+// coverTTL) does NOT prove the touched covers are still alive — a pause
+// landing in that gap can expire them while the raw TTL bound reads as
+// continuity. A successful touch at such an age must arm the fence.
+// Real clocks: coverTTL=8s → passTimeout=2s → continuity bound 6s; the
+// 6.5s pause lands in the gap the raw bound would wave through.
+func TestAbsenceReconcile_ContinuityBoundCoversStampDelay(t *testing.T) {
+	f := newSweepFixture(t)
+	ctx := context.Background()
+	reg := absenceRegistry(t, f)
+	base := "repo-stamp-delay"
+	for i := byte(0); i < 6; i++ {
+		key := blob.LFSKey(base, absenceOID('a'+i))
+		registerLFS(t, f, base, key, 10)
+		f.upload(key, strings.Repeat("x", 10))
+	}
+
+	// Pass 1 (first ever): no watermark, no lapse evidence — the fence
+	// must NOT arm (round 32 upgrade path) and health stamps.
+	pinLFSLeader(t, f)
+	rec := NewAbsenceReconciler(reg, f.blobs, true, 4, 8*time.Second, time.Second, slog.New(slog.DiscardHandler))
+	if _, err := rec.Run(ctx); err != nil {
+		t.Fatalf("pass 1: %v", err)
+	}
+	if _, ok, err := reg.GetJobScanState(ctx, ref.ScanJobAbsence, ref.ScanScopeAbsenceAdmissionFence); err != nil || ok {
+		t.Fatalf("fence after first pass = (ok=%v, %v), want NOT armed", ok, err)
+	}
+
+	// The pause: longer than coverTTL-passTimeout, shorter than
+	// coverTTL. Covers touched a pass before the stamp may be dead.
+	time.Sleep(6500 * time.Millisecond)
+
+	// Pass 2: the touch succeeds but continuity is no longer provable —
+	// the fence arms, and the budget-starved rotation cannot settle it
+	// within the pass.
+	rec2 := NewAbsenceReconciler(reg, f.blobs, true, 4, 8*time.Second, time.Second, slog.New(slog.DiscardHandler))
+	if _, err := rec2.Run(ctx); err != nil {
+		t.Fatalf("pass 2: %v", err)
+	}
+	if _, ok, err := reg.GetJobScanState(ctx, ref.ScanJobAbsence, ref.ScanScopeAbsenceAdmissionFence); err != nil || !ok {
+		t.Fatalf("fence after in-gap touch = (ok=%v, %v), want armed", ok, err)
+	}
+}
+
 // lapsedRegistry injects positive lapse evidence: the probe consulted at
 // a first health stamp (Codex round 32, security) reports an expired
 // cover row exists, so absent-watermark arming proceeds.
