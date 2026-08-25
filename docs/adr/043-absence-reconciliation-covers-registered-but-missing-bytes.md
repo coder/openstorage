@@ -61,8 +61,10 @@ lapses on budget: it always offers the full listing, and a population
 beyond its allocation squeezes discovery for the pass, loudly
 (`renewal_over_budget`) — a bounded round-robin would let a big enough
 backlog outlive the cover TTL between one row's renewals. Only the pass
-deadline can cut the listing short (`renewal_incomplete`, resumed first
-next pass on the durable cursor).
+deadline — or a legacy cover that could NEITHER fold nor renew (Codex
+round 8) — cuts the listing short (`renewal_incomplete`), parked strictly
+before the unprotected row and resumed first next pass on the durable
+cursor.
 
 Aggregates stay exact through deterministic INCARNATION keys
 (`absence-lost/<base>/<class>-e<n>`, zero-padded): each full traversal of
@@ -81,7 +83,12 @@ WITH the durable cursor (base, started/dirty flags, running total), so a
 range spanning any number of budget-limited passes accumulates and
 evaluates exactly, and crash replays re-derive identical totals from the
 parked cursor; error-dirty ranges and traversals never shrink and never
-count as clean. Shrink latency is
+count as clean — but a dirty range whose running total went UNCHARGED
+(the charge itself failed) gets one bounded grow-only retry at range end,
+forced past the per-pass denial memo (Codex round 8): an under-counted
+total can only grow the cover less than the truth, and without the retry
+a transient failure on the range's last deficits would wait a whole class
+traversal while admission stays under-reserved. Shrink latency is
 therefore one rotation, which only delays convergence, never visibility.
 Renewal timing is enforced end to end (Codex round 3, security): covers
 renew at pass starts, periodic ticks that fire mid-pass coalesce (River

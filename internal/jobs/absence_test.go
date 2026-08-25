@@ -913,6 +913,89 @@ func TestAbsenceChargeCover_SameKeyBypassesSkip(t *testing.T) {
 	}
 }
 
+// flakyRegistry injects failures into cover reservations (only rows under
+// the absence-cover prefix, so registry fixtures build normally): the first
+// failLeft cover charges error out, everything after succeeds.
+type flakyRegistry struct {
+	AbsenceRegistry
+	failLeft int
+}
+
+func (fr *flakyRegistry) ReservePackBytes(ctx context.Context, group []string, packs []ref.Pack, owner string, usageFloor, floorGen, quotaBytes int64, ttl time.Duration) (ref.ReserveDecision, error) {
+	if fr.failLeft > 0 && len(packs) == 1 && strings.HasPrefix(packs[0].Key, ref.AbsenceCoverPrefix) {
+		fr.failLeft--
+		return ref.ReserveDecision{}, fmt.Errorf("flaky: injected reserve failure")
+	}
+	return fr.AbsenceRegistry.ReservePackBytes(ctx, group, packs, owner, usageFloor, floorGen, quotaBytes, ttl)
+}
+
+// TestAbsenceReconcile_ChargeFailureRetriedAtRangeEnd (Codex round 8, P1):
+// a transient charge failure on a range's last deficits leaves the running
+// total accumulated but UNCHARGED; the bounded range-end retry — forced
+// past the coverSkip memo — must cover it within the same pass instead of
+// waiting a whole class traversal.
+func TestAbsenceReconcile_ChargeFailureRetriedAtRangeEnd(t *testing.T) {
+	f := newSweepFixture(t)
+	ctx := context.Background()
+	base := "repo-flaky-charge"
+	registerLFS(t, f, base, blob.LFSKey(base, absenceOID('f')), 100)
+	reg := &flakyRegistry{AbsenceRegistry: absenceRegistry(t, f), failLeft: 1}
+	r := NewAbsenceReconciler(reg, f.blobs, true, 1000, time.Hour, slog.New(slog.DiscardHandler))
+	report, err := r.Run(ctx)
+	if err == nil {
+		t.Fatal("Run: want the injected charge failure reported")
+	}
+	if report.CoverErrors == 0 {
+		t.Fatalf("report = %+v, want the injected failure counted", report)
+	}
+	if got := ledgerReserved(t, f, base); got != 100 {
+		t.Fatalf("reserved = %d, want the deficit covered by the range-end retry", got)
+	}
+}
+
+// TestAbsenceReconcile_FailedLegacyMigrationReoffered (Codex round 8, P1):
+// when one legacy cover can NEITHER fold nor renew, the renewal cursor
+// parks strictly before it — the next pass re-offers the nonce first
+// instead of letting it decay unprotected until the listing wraps.
+func TestAbsenceReconcile_FailedLegacyMigrationReoffered(t *testing.T) {
+	f := newSweepFixture(t)
+	ctx := context.Background()
+	base := "repo-flaky-legacy"
+	registerLFS(t, f, base, blob.LFSKey(base, absenceOID('g')), 100)
+	legacyKey := ref.AbsenceCoverPrefix + base + "/" + ref.NewReservationOwner()
+	if err := ref.ReserveRestoreCover(ctx, absenceRegistry(t, f), blob.QuotaRepoGroup(base), legacyKey, 555, time.Hour); err != nil {
+		t.Fatalf("seed legacy cover: %v", err)
+	}
+
+	// Pass 1: the lfs fold's mint AND the fallback nonce renewal both
+	// fail (injected). The renewal phase must abort parked BEFORE the
+	// nonce rather than skipping past it.
+	reg := &flakyRegistry{AbsenceRegistry: absenceRegistry(t, f), failLeft: 2}
+	r := NewAbsenceReconciler(reg, f.blobs, true, 1000, time.Hour, slog.New(slog.DiscardHandler))
+	report, err := r.Run(ctx)
+	if err == nil {
+		t.Fatal("Run 1: want the injected failures reported")
+	}
+	if !report.RenewalIncomplete || report.CoversDecaying != 0 || report.CoversRenewed != 0 {
+		t.Fatalf("pass 1 report = %+v, want renewal parked before the failed nonce", report)
+	}
+
+	// Pass 2 (fresh reconciler, same durable state — another replica):
+	// the parked cursor re-offers the nonce first; the migration folds
+	// it into both incarnations and the rotations right-size them.
+	r2 := testReconciler(t, f, true, 1000)
+	report, err = r2.Run(ctx)
+	if err != nil {
+		t.Fatalf("Run 2: %v", err)
+	}
+	if report.CoversDecaying != 1 {
+		t.Fatalf("pass 2 report = %+v, want the re-offered nonce migrated and decaying", report)
+	}
+	if got := ledgerReserved(t, f, base); got != 555+100 {
+		t.Fatalf("reserved after pass 2 = %d, want the decaying nonce plus the right-sized lfs cover", got)
+	}
+}
+
 // TestAbsenceReconcile_PurgedRepoSkipped: rows of a purge-fenced repo are
 // skipped — the purge drops them and reaps their blobs.
 func TestAbsenceReconcile_PurgedRepoSkipped(t *testing.T) {

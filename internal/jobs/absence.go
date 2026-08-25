@@ -656,7 +656,17 @@ func (r *AbsenceReconciler) renewCovers(ctx context.Context, budget int64, repor
 			}
 			if legacy {
 				flushHeld(row)
-				r.migrateLegacyCover(ctx, row, report, st, errs)
+				if !r.migrateLegacyCover(ctx, row, report, st, errs) {
+					// Neither folded nor renewed (Codex round 8, P1):
+					// the nonce's TTL keeps ticking while one or both
+					// incarnations may be unfunded. Park strictly
+					// BEFORE it — the held-row abort semantics — so
+					// the next pass re-offers it first instead of
+					// waiting a full listing wrap.
+					after = prevAfter
+					abort(fmt.Errorf("absence reconcile: legacy cover %s neither folded nor renewed", row.Key))
+					return charged
+				}
 				continue
 			}
 			flushHeld(row)
@@ -675,8 +685,12 @@ func (r *AbsenceReconciler) renewCovers(ctx context.Context, budget int64, repor
 // over-cover only tightens admission. The nonce row then decays by TTL,
 // un-renewed — but only once both folds are proven durable; if either
 // fails, the legacy row is renewed as-is so nothing lapses, and the next
-// pass retries (grow-only merges make the retry idempotent).
-func (r *AbsenceReconciler) migrateLegacyCover(ctx context.Context, row *ref.AbsenceCoverRow, report *AbsenceReport, st *absencePassState, errs *boundedErrs) {
+// pass retries (grow-only merges make the retry idempotent). Reports
+// whether the row's protection is secured for this pass (folded, renewed,
+// or the base is purge-fenced); false means NEITHER fold nor renewal
+// landed (Codex round 8, P1) and the caller must park the renewal cursor
+// before the row.
+func (r *AbsenceReconciler) migrateLegacyCover(ctx context.Context, row *ref.AbsenceCoverRow, report *AbsenceReport, st *absencePassState, errs *boundedErrs) bool {
 	if folded, seen := r.migratedLegacy[row.RawKey]; seen && row.Bytes <= folded {
 		// Already folded up to this total by this process: decay on. A
 		// LARGER listed total re-folds (Codex round 7, P1): an old
@@ -684,11 +698,11 @@ func (r *AbsenceReconciler) migrateLegacyCover(ctx context.Context, row *ref.Abs
 		// fold, and that growth must reach the incarnations before the
 		// nonce decays.
 		report.CoversDecaying++
-		return
+		return true
 	}
 	migrated := true
 	for _, class := range []string{absenceClassLFS, absenceClassPacks} {
-		if !r.foldIntoIncarnation(ctx, row.Base, class, row.Bytes, report, st, errs) {
+		if !r.foldIntoIncarnation(ctx, row.Base, class, row.Bytes, false, report, st, errs) {
 			migrated = false
 			break
 		}
@@ -696,29 +710,32 @@ func (r *AbsenceReconciler) migrateLegacyCover(ctx context.Context, row *ref.Abs
 	if migrated {
 		r.migratedLegacy[row.RawKey] = row.Bytes
 		report.CoversDecaying++
+		return true
 	}
-	if !migrated {
-		// Migration could not be proven durable (head lookup or charge
-		// failed, or the base is purge-fenced — where nothing must be
-		// re-minted): renew the nonce row as-is so nothing lapses, except
-		// for purged bases, whose rows are on their way out anyway. The
-		// renewal is a same-key re-charge of a listed row, so it bypasses
-		// the pass-level coverSkip the failed fold may have just set
-		// (Codex round 7, P1): the ledger excludes the incoming key from
-		// its row-cap count, so this can succeed where a mint was denied.
-		if st.purged[row.Base] {
-			return
-		}
-		if r.chargeCover(ctx, row.Base, row.Key, row.Bytes, true, report, st, errs) {
-			report.CoversRenewed++
-		}
+	// Migration could not be proven durable (head lookup or charge
+	// failed, or the base is purge-fenced — where nothing must be
+	// re-minted): renew the nonce row as-is so nothing lapses, except
+	// for purged bases, whose rows are on their way out anyway. The
+	// renewal is a same-key re-charge of a listed row, so it bypasses
+	// the pass-level coverSkip the failed fold may have just set
+	// (Codex round 7, P1): the ledger excludes the incoming key from
+	// its row-cap count, so this can succeed where a mint was denied.
+	if st.purged[row.Base] {
+		return true
 	}
+	if r.chargeCover(ctx, row.Base, row.Key, row.Bytes, true, report, st, errs) {
+		report.CoversRenewed++
+		return true
+	}
+	return false
 }
 
 // foldIntoIncarnation grows one class's live incarnation to at least bytes,
 // minting incarnation 1 when the class has none. Reports whether the grown
-// total is proven durable in the ledger.
-func (r *AbsenceReconciler) foldIntoIncarnation(ctx context.Context, base, class string, bytes int64, report *AbsenceReport, st *absencePassState, errs *boundedErrs) bool {
+// total is proven durable in the ledger. bypassSkip forces the charge past
+// the pass-level coverSkip memo even for a mint (the bounded endRange
+// retry); same-key grows of an existing head always bypass.
+func (r *AbsenceReconciler) foldIntoIncarnation(ctx context.Context, base, class string, bytes int64, bypassSkip bool, report *AbsenceReport, st *absencePassState, errs *boundedErrs) bool {
 	assertf(bytes >= 0, "foldIntoIncarnation: negative total %d for %s/%s", bytes, base, class)
 	head, ok := r.resolveHead(ctx, base, class, st, errs)
 	if !ok {
@@ -728,7 +745,7 @@ func (r *AbsenceReconciler) foldIntoIncarnation(ctx context.Context, base, class
 	if target.key == "" {
 		target = liveCover{key: absenceIncarnationKey(base, class, 1), n: 1}
 	}
-	if !r.chargeCover(ctx, base, target.key, bytes, head.key != "", report, st, errs) {
+	if !r.chargeCover(ctx, base, target.key, bytes, head.key != "" || bypassSkip, report, st, errs) {
 		return false
 	}
 	if bytes > target.bytes {
@@ -939,7 +956,21 @@ func (r *AbsenceReconciler) endRange(ctx context.Context, tr *rangeTracker, repo
 	if base == "" || !started || !r.quotaEnforced {
 		return
 	}
-	if dirty || st.purged[base] || st.coverSkip[base] {
+	if dirty {
+		// The total may under-count: never shrink on it. But it can
+		// still be UNCHARGED (Codex round 8, P1): a charge failure on
+		// the range's last deficits leaves running accumulated but not
+		// covered, and the next retry would otherwise wait a whole
+		// class traversal. One bounded grow-only retry per range —
+		// forced past the coverSkip memo — closes the transient case;
+		// an under-counted running only grows the cover less than the
+		// truth, never shrinks it.
+		if running > 0 && !st.purged[base] {
+			r.foldIntoIncarnation(ctx, base, class, running, true, report, st, errs)
+		}
+		return
+	}
+	if st.purged[base] || st.coverSkip[base] {
 		return // the total may under-count: never shrink on it
 	}
 	head, ok := r.resolveHead(ctx, base, class, st, errs)
@@ -1215,14 +1246,18 @@ func (r *AbsenceReconciler) repoPurged(ctx context.Context, base string, st *abs
 // FIRST, then bump (the round 57/58 order): an admission already holding
 // a floor scanned during the absence sees the cover in
 // active_reservations, while the bump only stops FUTURE serves of cached
-// deflated floors. Returns whether the cover row was charged. sameKey
-// marks a re-charge of a row KNOWN to exist (renewal, fallback renewal,
-// grow of a resolved head): it bypasses the pass-level coverSkip memo
-// (Codex round 7, P1) because the ledger excludes the incoming key from
-// its active-row-cap count — a same-key re-charge can succeed where the
-// denial that set the memo was a fresh mint hitting the cap.
-func (r *AbsenceReconciler) chargeCover(ctx context.Context, base, key string, size int64, sameKey bool, report *AbsenceReport, st *absencePassState, errs *boundedErrs) bool {
-	if st.coverSkip[base] && !sameKey {
+// deflated floors. Returns whether the cover row was charged. bypassSkip
+// exempts this charge from the pass-level coverSkip memo, for exactly two
+// bounded justifications: (a) a same-key re-charge of a row KNOWN to
+// exist — renewal, fallback renewal, grow of a resolved head — succeeds
+// where the denial that set the memo was a fresh mint hitting the
+// active-row cap, because the ledger excludes the incoming key from that
+// count (Codex round 7, P1); (b) the once-per-range endRange retry of an
+// uncharged dirty total (Codex round 8, P1) — one forced attempt, not the
+// budget-many the memo exists to prevent. Denials still SET the memo in
+// every mode.
+func (r *AbsenceReconciler) chargeCover(ctx context.Context, base, key string, size int64, bypassSkip bool, report *AbsenceReport, st *absencePassState, errs *boundedErrs) bool {
+	if st.coverSkip[base] && !bypassSkip {
 		report.CoverErrors++
 		return false
 	}
