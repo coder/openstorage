@@ -995,6 +995,79 @@ func TestAbsenceReconcile_CandidacySurvivesSelfRenewalBumps(t *testing.T) {
 	}
 }
 
+// cancelOnRotationRegistry kills the pass the moment a ROTATION listing
+// starts (the origin keyset call): fold-phase re-stats list from
+// (base, "") and pass through untouched, so a retirement observed
+// despite the cancel proves the hint-driven fold ran BEFORE the
+// rotations.
+type cancelOnRotationRegistry struct {
+	AbsenceRegistry
+	cancel context.CancelFunc
+}
+
+func (c *cancelOnRotationRegistry) ListFleetLFSObjects(ctx context.Context, afterRepo, afterKey string, limit int) ([]ref.AbsenceLFSRow, error) {
+	if afterRepo == "" && afterKey == "" {
+		c.cancel()
+		return nil, context.Canceled
+	}
+	return c.AbsenceRegistry.ListFleetLFSObjects(ctx, afterRepo, afterKey, limit)
+}
+
+// TestAbsenceReconcile_HintFoldPrecedesRotations (Codex round 25,
+// security): the fold-time re-stat is pool-unbounded but
+// wall-clock-bounded and non-resumable (same-pass evidence only), so
+// hint-driven candidacies must fold BEFORE the rotations consume the
+// pass deadline — otherwise a large base's re-stat starts on an expiring
+// context every pass, never reaches the folded CAS, and the bulk-renewed
+// nonce retains its stale over-reservation indefinitely. Here the pass
+// dies the moment the rotations begin: retirement can only come from the
+// pre-rotation fold.
+func TestAbsenceReconcile_HintFoldPrecedesRotations(t *testing.T) {
+	f := newSweepFixture(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	base := "m-priority"
+	reg := absenceRegistry(t, f)
+	for i := byte(0); i < 6; i++ {
+		key := blob.LFSKey(base, absenceOID('a'+i))
+		registerLFS(t, f, base, key, 10)
+		f.upload(key, strings.Repeat("x", 10))
+	}
+	legacyKey := ref.AbsenceCoverPrefix + base + "/" + ref.NewReservationOwner()
+	if err := ref.ReserveRestoreCover(ctx, reg, blob.QuotaRepoGroup(base), legacyKey, 555, time.Hour); err != nil {
+		t.Fatalf("seed nonce: %v", err)
+	}
+	// Both class candidacies persisted by earlier passes (the packs
+	// side is a row-less re-stat).
+	var gen int64
+	for _, repo := range blob.QuotaRepoGroup(base) {
+		g, err := reg.LFSAdoptionGen(ctx, repo)
+		if err != nil {
+			t.Fatal(err)
+		}
+		gen += g
+	}
+	payload := fmt.Sprintf(`{"%s":{"%s":{"gen":%d},"%s":{"gen":%d}}}`,
+		base, absenceClassLFS, gen, absenceClassPacks, gen)
+	if err := reg.PutJobScanState(ctx, ref.ScanJobAbsence, ref.ScanScopeAbsenceProofs, payload, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	pinLFSLeader(t, f)
+	r := NewAbsenceReconciler(&cancelOnRotationRegistry{AbsenceRegistry: reg, cancel: cancel},
+		f.blobs, true, 100, time.Hour, slog.New(slog.DiscardHandler))
+	report, err := r.Run(ctx)
+	if err == nil {
+		t.Fatal("Run: want the injected rotation-start cancellation reported")
+	}
+	if report.CoversDecaying != 1 {
+		t.Fatalf("report = %+v, want the nonce retired by the pre-rotation fold", report)
+	}
+	if report.RowsVerified < 6 {
+		t.Fatalf("report = %+v, want the fold-time re-stat of the target's rows", report)
+	}
+}
+
 // TestAbsenceReconcile_GapMutationDefersLegacyRetirement (Codex rounds
 // 19-20): a foreign mutation landing while the cursor is parked mid-range
 // breaks fence continuity — the resumed completion must NOT prove the

@@ -165,7 +165,14 @@ re-charge lists as ordinary liveness; Codex rounds 23-24). Fold-time
 re-verification runs each started candidate base to completion past the
 shared verification pool — starts gate on a non-exhausted pool, bounding
 the overshoot to one base's rows — so a base whose combined class rows
-outgrow one pass's pool still converges. With both fresh
+outgrow one pass's pool still converges. Hint-driven candidacies fold
+BEFORE the pass's rotations (with a second fold after them for same-pass
+completions): the re-stat is non-resumable — same-pass evidence only —
+so it takes first claim on the pass wall clock rather than starting on
+whatever deadline the rotations leave behind (Codex round 25, security);
+a re-stat the deadline still kills warns loudly that the pass wall clock
+(a quarter of the cover TTL) must accommodate the largest base. With
+both fresh
 proofs in hand the ground truth subsumes whatever the nonce
 aggregated and the folded sentinel is CAS'd into the row's owner column,
 guarded on the LISTED (owner, bytes): every re-charge overwrites owner

@@ -341,6 +341,11 @@ type AbsenceReconciler struct {
 	// pool blocks further base starts but never abandons a started
 	// fold candidate mid-verification.
 	verifyPool int64
+	// foldAttempted dedupes fold-time re-stats per (base, class) across
+	// the pass's two foldRedundantLegacy invocations (round 25,
+	// security): a class re-statted dirty by the pre-rotation fold must
+	// not be re-statted again by the post-rotation one.
+	foldAttempted map[string]bool
 	// touchFailed records that this pass's bulk cover renewal FAILED:
 	// the rotation cursors must not be re-stamped by saveState (Codex
 	// round 19, P1) — a cursor row's DB-clock freshness is the loadState
@@ -542,6 +547,7 @@ func (r *AbsenceReconciler) loadState(ctx context.Context, errs *boundedErrs) {
 	}
 	r.proofGens = make(map[string]map[string]absenceProofEntry)
 	r.verifyPool = r.budget
+	r.foldAttempted = make(map[string]bool)
 	r.touchFailed = false
 	for _, c := range []struct {
 		scope string
@@ -867,6 +873,14 @@ func (r *AbsenceReconciler) Run(ctx context.Context) (AbsenceReport, error) {
 	if floor := r.budget / 2; remaining < floor {
 		remaining = floor
 	}
+	// Hint-driven candidacies fold FIRST (Codex round 25, security):
+	// the fold-time re-stat is pool-unbounded but wall-clock-bounded
+	// and non-resumable — same-pass evidence only (round 24), so
+	// durable partial verification progress is not an option — and
+	// running it after the rotations would let them consume the pass
+	// deadline every pass, starving a large base's re-stat forever.
+	// Same-pass fresh completions fold in the second invocation below.
+	r.foldRedundantLegacy(ctx, &report, st, &errs)
 	half := remaining - remaining/2
 	if r.passes%2 == 0 {
 		charged := r.lfsPhase(ctx, half, &report, st, &errs)
@@ -877,7 +891,8 @@ func (r *AbsenceReconciler) Run(ctx context.Context) (AbsenceReport, error) {
 	}
 	// Retire legacy nonce covers whose base both rotations' proofs
 	// completed THIS pass (Codex rounds 19-20) — after the phases, so
-	// every proof is in.
+	// every proof is in. (Second invocation: the pass-level attempted
+	// memo keeps the two from re-statting the same class twice.)
 	r.foldRedundantLegacy(ctx, &report, st, &errs)
 	r.passes++
 	r.saveState(ctx, &errs)
@@ -1113,9 +1128,12 @@ func (r *AbsenceReconciler) recordLegacyCover(row *ref.AbsenceCoverRow, report *
 // CANDIDACY (round 21, P1; see loadProofs) that is re-statted fresh here
 // before anything retires, run-to-completion per started base so bases
 // whose combined class rows outgrow the verification pool still converge
-// (round 23, P1).
+// (round 23, P1). Run invokes the fold twice per pass: once before the
+// rotations so hint-driven re-stats get first claim on the pass wall
+// clock (round 25, security), and once after so same-pass completions
+// retire without an extra pass; r.foldAttempted dedupes across the two.
 func (r *AbsenceReconciler) foldRedundantLegacy(ctx context.Context, report *AbsenceReport, st *absencePassState, errs *boundedErrs) {
-	attempted := make(map[string]bool)
+	attempted := r.foldAttempted
 	started := false
 	for i := range r.legacyRows {
 		row := &r.legacyRows[i]
@@ -1495,6 +1513,7 @@ func (r *AbsenceReconciler) verifyAndJudge(ctx context.Context, base, class stri
 	afterRepo, afterKey := base, ""
 	for {
 		if ctx.Err() != nil {
+			r.warnVerifyDeadline(runToCompletion, base, class)
 			errs.add(ctx.Err())
 			return
 		}
@@ -1522,6 +1541,7 @@ func (r *AbsenceReconciler) verifyAndJudge(ctx context.Context, base, class stri
 				break
 			}
 			if ctx.Err() != nil {
+				r.warnVerifyDeadline(runToCompletion, base, class)
 				errs.add(ctx.Err())
 				return
 			}
@@ -1542,6 +1562,22 @@ func (r *AbsenceReconciler) verifyAndJudge(ctx context.Context, base, class stri
 	// The fresh observation is a complete, error-free-or-dirty range in
 	// its own right: the normal fresh-range verdict path judges it.
 	r.endRange(ctx, &vtr, report, st, errs)
+}
+
+// warnVerifyDeadline reports a fold-commitment re-stat killed by the
+// pass deadline (Codex round 25, security): the candidacy survives and
+// the next pass's PRE-rotation fold retries it with first claim on the
+// wall clock, but a base whose single-class re-stat outgrows one whole
+// pass can never produce the same-pass evidence retirement requires —
+// the operator must raise the pass wall clock (a quarter of the cover
+// TTL, capped at an hour; see NewAbsenceReconciler). Covers stay
+// protectively oversized meanwhile.
+func (r *AbsenceReconciler) warnVerifyDeadline(runToCompletion bool, base, class string) {
+	if !runToCompletion {
+		return
+	}
+	r.logger.Warn("absence reconcile: fold verification hit the pass deadline — retried with wall-clock priority next pass; raise CODESTORAGE_PACK_RESERVATION_TTL (the pass wall clock is a quarter of it, capped at an hour) so one pass can re-stat the largest base if persistent",
+		"base", base, "class", class)
 }
 
 // tickTraversal records an origin crossing for one registry class.
