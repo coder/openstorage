@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"github.com/coder/code-storage/internal/auth"
+	"github.com/coder/code-storage/internal/events"
 	"github.com/coder/code-storage/internal/meta"
 	upsync "github.com/coder/code-storage/internal/sync"
 )
@@ -40,11 +41,15 @@ type syncServer struct {
 	creds       upsync.CredentialStore
 	ups         upsync.UpstreamStore
 	queue       upsync.Queue
-	httpBaseURL string       // no trailing slash; POST /repos response http_url
-	logger      *slog.Logger // never nil
+	httpBaseURL string // no trailing slash; POST /repos response http_url
+	// guard runs the registration-time egress courtesy check on base_repo
+	// upstream_host (issue #139), configured with the effective pull-lane
+	// policy; the sync worker's dial-time vetting proxy stays authoritative.
+	guard  events.TargetGuard
+	logger *slog.Logger // never nil
 }
 
-func newSyncServer(store meta.Store, creds upsync.CredentialStore, ups upsync.UpstreamStore, queue upsync.Queue, httpBaseURL string, logger *slog.Logger) *syncServer {
+func newSyncServer(store meta.Store, creds upsync.CredentialStore, ups upsync.UpstreamStore, queue upsync.Queue, httpBaseURL string, guard events.TargetGuard, logger *slog.Logger) *syncServer {
 	assertf(store != nil, "newSyncServer: nil store")
 	assertf(creds != nil, "newSyncServer: nil credential store")
 	assertf(ups != nil, "newSyncServer: nil upstream store")
@@ -57,6 +62,7 @@ func newSyncServer(store meta.Store, creds upsync.CredentialStore, ups upsync.Up
 		ups:         ups,
 		queue:       queue,
 		httpBaseURL: httpBaseURL,
+		guard:       guard,
 		logger:      logger,
 	}
 }

@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"strings"
 	stdsync "sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -123,10 +124,12 @@ func newWorkerFixture(t *testing.T) *workerFixture {
 		// production default ("http:https") deliberately blocks.
 		AllowProtocol: "http:https:file",
 		// Fixture upstreams that ARE network endpoints live on
-		// 127.0.0.1 (httptest), which the egress guard's production
-		// default denies; the escape hatch routes them through the
-		// vetting proxy like an internal-forge deployment would.
+		// 127.0.0.1 (httptest), which the egress guard's strict policy
+		// denies; the escape hatch routes them through the vetting
+		// proxy like an internal-forge deployment would (the pull
+		// side's transitional serve default is also allow, issue #139).
 		PushEgressAllowPrivate: true,
+		PullEgressAllowPrivate: true,
 	}
 	return f
 }
@@ -464,6 +467,82 @@ func TestWorkerUnreachableUpstream(t *testing.T) {
 	// Port 1 is reserved and never listening: connection refused.
 	f.putUpstream(t, "repo_hh", "own", "proj", "http://127.0.0.1:1")
 	_ = f.worker.Run(context.Background(), Job{Org: "acme", RepoID: "repo_hh"})
+	events := f.rec.list()
+	assertEventTypes(t, events, EventSyncStarted, EventSyncFailed)
+	if events[1].Error != FailUnreachable {
+		t.Fatalf("error = %q, want %q", events[1].Error, FailUnreachable)
+	}
+}
+
+// TestWorkerPrivateUpstreamDeniedInStrictMode: with the strict sync egress
+// policy (PullEgressAllowPrivate off — today's explicit
+// CODESTORAGE_SYNC_ALLOW_PRIVATE=false, the announced future default), a
+// loopback/private upstream_host is refused at dial time by the vetting
+// proxy — the upstream is NEVER contacted — and the run fails as
+// configuration: upstream_host is caller-linked data, so unguarded fetch
+// egress would be an SSRF read/credential-echo primitive into the
+// server's network (issue #139).
+func TestWorkerPrivateUpstreamDeniedInStrictMode(t *testing.T) {
+	var reached atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		reached.Store(true)
+		http.Error(w, "unreachable", http.StatusTeapot)
+	}))
+	defer srv.Close()
+
+	f := newWorkerFixture(t)
+	f.putUpstream(t, "repo_ge", "own", "proj", srv.URL)
+	f.worker.PullEgressAllowPrivate = false // strict policy
+
+	if err := f.worker.Run(context.Background(), Job{Org: "acme", RepoID: "repo_ge"}); err == nil {
+		t.Fatal("Run succeeded against a policy-denied private upstream")
+	}
+	if reached.Load() {
+		t.Fatal("denied egress still reached the private upstream")
+	}
+	events := f.rec.list()
+	assertEventTypes(t, events, EventSyncStarted, EventSyncFailed)
+	if events[1].Error != FailConfig {
+		t.Fatalf("error = %q, want %q", events[1].Error, FailConfig)
+	}
+}
+
+// TestWorkerPrivateUpstreamAllowedByTransitionalDefault: with the
+// allow-private pull policy (the transitional serve default this release,
+// issue #139), the same private upstream IS dialed — through the vetting
+// proxy — preserving released 0.6.x internal-forge deployments. The fetch
+// still fails here (not a git server), but as an ordinary clone failure,
+// never an egress denial.
+func TestWorkerPrivateUpstreamAllowedByTransitionalDefault(t *testing.T) {
+	var reached atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		reached.Store(true)
+		http.Error(w, "not a git server", http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	f := newWorkerFixture(t) // fixture default: PullEgressAllowPrivate on
+	f.putUpstream(t, "repo_gf", "own", "proj", srv.URL)
+	_ = f.worker.Run(context.Background(), Job{Org: "acme", RepoID: "repo_gf"})
+	if !reached.Load() {
+		t.Fatal("allow-private policy did not dial the private upstream")
+	}
+	events := f.rec.list()
+	assertEventTypes(t, events, EventSyncStarted, EventSyncFailed)
+	if events[1].Error != FailClone {
+		t.Fatalf("error = %q, want %q", events[1].Error, FailClone)
+	}
+}
+
+// TestWorkerHTTPSUpstreamDialFailureStaysUnreachable: a transient dial
+// failure INSIDE the pull egress proxy's CONNECT arm (https upstream on a
+// refused port) must keep the documented FailUnreachable classification —
+// git only sees an opaque proxy HTTP error, so the classification rides
+// the proxy's recorded dial failure, not stderr phrasing (issue #139).
+func TestWorkerHTTPSUpstreamDialFailureStaysUnreachable(t *testing.T) {
+	f := newWorkerFixture(t)
+	f.putUpstream(t, "repo_gh", "own", "proj", "https://127.0.0.1:1")
+	_ = f.worker.Run(context.Background(), Job{Org: "acme", RepoID: "repo_gh"})
 	events := f.rec.list()
 	assertEventTypes(t, events, EventSyncStarted, EventSyncFailed)
 	if events[1].Error != FailUnreachable {

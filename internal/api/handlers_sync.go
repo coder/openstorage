@@ -136,6 +136,20 @@ func validUpstreamHost(host string) bool {
 	return u.Host != "" && u.User == nil && u.RawQuery == "" && u.Fragment == ""
 }
 
+// upstreamHostname extracts the hostname the sync fetch will dial from a
+// validUpstreamHost-validated value (bare host[:port] or http(s):// base
+// URL) for the registration-time egress courtesy check (issue #139).
+func upstreamHostname(host string) string {
+	assertf(host != "", "upstreamHostname: empty host")
+	raw := host
+	if !strings.Contains(raw, "://") {
+		raw = "https://" + raw
+	}
+	u, err := neturl.Parse(raw)
+	assertf(err == nil && u.Hostname() != "", "upstreamHostname: unvalidated host %q", host)
+	return u.Hostname()
+}
+
 // handleCreateRepo is the base_repo-aware POST /api/v1/repos (scope
 // repo:write). It mirrors the frozen (*server).handleCreateRepo flow —
 // claims, fail-closed ref policies, body/branch validation, store error
@@ -181,6 +195,15 @@ func (s *syncServer) handleCreateRepo(w http.ResponseWriter, r *http.Request) {
 		var errMsg string
 		if upstreamHost, errMsg = validateSyncBaseRepo(spec); errMsg != "" {
 			writeErr(w, http.StatusBadRequest, errMsg)
+			return
+		}
+		// Registration-time egress courtesy check (issue #139), mirroring
+		// webhook CheckRegistration: fast feedback for upstream hosts the
+		// pull lane's dial-time vetting proxy would deny anyway, before any
+		// rows exist. Fail-open on resolution errors — acceptance is not a
+		// reachability promise; the worker's guard is authoritative.
+		if err := s.guard.CheckHost(r.Context(), upstreamHostname(upstreamHost)); err != nil {
+			writeErr(w, http.StatusBadRequest, "base_repo upstream_host denied by sync egress policy: "+err.Error())
 			return
 		}
 	}

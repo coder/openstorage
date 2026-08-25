@@ -182,12 +182,25 @@ type Worker struct {
 	DetachPoll time.Duration
 
 	// PushEgressAllowPrivate relaxes the outbound push egress guard's
-	// private receiver classes (CODESTORAGE_SYNC_PUSH_ALLOW_PRIVATE, see
-	// egress.go): loopback/RFC1918/link-local/ULA upstreams for genuinely
-	// internal forges. Metadata and the special-purpose registry stay
-	// denied either way — every http(s) push dials through the guard's
-	// vetting proxy. Tests set it (fixture upstreams are 127.0.0.1).
+	// private receiver classes (resolved from CODESTORAGE_SYNC_ALLOW_PRIVATE
+	// with CODESTORAGE_SYNC_PUSH_ALLOW_PRIVATE as the deprecated push-only
+	// spelling, see egress.go): loopback/RFC1918/link-local/ULA upstreams
+	// for genuinely internal forges. Metadata and the special-purpose
+	// registry stay denied either way — every http(s) push dials through
+	// the guard's vetting proxy. Tests set it (fixture upstreams are
+	// 127.0.0.1).
 	PushEgressAllowPrivate bool
+
+	// PullEgressAllowPrivate is the inbound twin (issue #139): every
+	// http(s) upstream fetch dials through the same vetting proxy, and
+	// this relaxes only its private receiver classes. The serve wiring
+	// resolves it from the unified CODESTORAGE_SYNC_ALLOW_PRIVATE knob,
+	// whose TRANSITIONAL default keeps it true — internal-forge mirrors
+	// are a mainstream released deployment shape, and a future release
+	// flips the unset default to deny (boot warning announces the flip).
+	// Metadata and the special-purpose registry stay denied either way.
+	// Tests set it (fixture upstreams are 127.0.0.1).
+	PullEgressAllowPrivate bool
 }
 
 // allowProtocol resolves the effective GIT_ALLOW_PROTOCOL value.
@@ -535,8 +548,37 @@ func (w *Worker) transfer(ctx context.Context, job Job, repo RepoInfo, up Upstre
 	if err != nil {
 		return &syncFailure{code: FailInternal, cause: err}
 	}
+	// Egress guard (egress.go, issue #139): the inbound fetch dials
+	// through the same vetting proxy as outbound pushes — upstream_host
+	// is caller-linked data, so unguarded egress is an SSRF read/
+	// stored-credential-echo primitive into the server's network.
+	// file:// upstreams (tests; GIT_ALLOW_PROTOCOL-blocked in production)
+	// have no network egress to guard. Ambient HTTP(S)_PROXY settings no
+	// longer reach the upstream fetch: the guard dials destinations
+	// directly, exactly like webhook delivery and push forwarding.
+	var egress *egressProxy
+	if u := up.CloneURL(); strings.HasPrefix(u, "http://") || strings.HasPrefix(u, "https://") {
+		egress, err = startEgressProxy(w.PullEgressAllowPrivate)
+		if err != nil {
+			return &syncFailure{code: FailInternal, cause: err}
+		}
+		defer egress.Close()
+		fetchEnv = proxyEnv(fetchEnv, egress.URL())
+	}
 	fetchArgs := append([]string{"fetch", "--prune", up.CloneURL()}, mirrorRefspecs...)
 	if stderr, err := runGit(ctx, mirror, fetchEnv, fetchArgs...); err != nil {
+		// The proxy's recorded verdicts outrank stderr phrasing — git only
+		// saw an opaque proxy HTTP error (same split as the push lane): a
+		// policy denial is permanent configuration, a non-policy dial
+		// failure is the documented transient-outage classification.
+		if egress != nil {
+			if reason := egress.deniedReason(); reason != "" {
+				return &syncFailure{code: FailConfig, cause: fmt.Errorf("fetch egress denied: %s", reason)}
+			}
+			if dialErr := egress.dialFailure(); dialErr != "" {
+				return &syncFailure{code: FailUnreachable, cause: fmt.Errorf("fetch egress dial: %s", dialErr)}
+			}
+		}
 		return &syncFailure{code: classifyFetchFailure(stderr), cause: fmt.Errorf("git fetch: %w: %s", err, stderr)}
 	}
 
@@ -593,7 +635,8 @@ func (w *Worker) transfer(ctx context.Context, job Job, repo RepoInfo, up Upstre
 	// must never reroute it through a load balancer, where the token could
 	// land on a replica that cannot verify it (issue #45). os/exec keeps
 	// the last duplicate env entry, so these override inherited settings.
-	// The upstream FETCH above keeps proxy env untouched on purpose.
+	// (The upstream FETCH above instead dials through its own vetting
+	// proxy — issue #139.)
 	pushEnv = append(pushEnv, "NO_PROXY=*", "no_proxy=*")
 	pushURL := strings.TrimRight(w.Loopback.BaseURL, "/") + "/" + repo.RepoID + ".git"
 	// forward_on_push repos invert the conflict rule (issue #90, Codex

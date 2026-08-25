@@ -109,6 +109,15 @@ type Config struct {
 	// strict (the safe default). The serve command plumbs it from
 	// CODESTORAGE_WEBHOOK_ALLOW_PRIVATE.
 	WebhookAllowPrivate bool
+
+	// SyncPullAllowPrivate mirrors the resolved pull-lane sync egress
+	// policy (issue #139) for the registration-time courtesy check on
+	// base_repo upstream_host; the authoritative dial-time enforcement is
+	// the sync worker's vetting proxy, plumbed separately. The serve
+	// command resolves it from CODESTORAGE_SYNC_ALLOW_PRIVATE, whose
+	// transitional unset default keeps it TRUE (0.6.x compatibility), so
+	// unlike the webhook knob the zero value here is the STRICT policy.
+	SyncPullAllowPrivate bool
 }
 
 // New builds the full HTTP handler: recover -> request log -> router, with
@@ -147,7 +156,8 @@ func New(cfg Config) (http.Handler, error) {
 	// the frozen create flow with base_repo support, backed by the durable
 	// meta rows through the sync-package adapters.
 	creds, ups := upsync.MetaStores(cfg.Store)
-	ss := newSyncServer(cfg.Store, creds, ups, cfg.SyncQueue, strings.TrimRight(cfg.HTTPBaseURL, "/"), logger)
+	ss := newSyncServer(cfg.Store, creds, ups, cfg.SyncQueue, strings.TrimRight(cfg.HTTPBaseURL, "/"),
+		events.TargetGuard{AllowPrivate: cfg.SyncPullAllowPrivate}, logger)
 
 	// Pre-auth rate limiting (docs/reference/http-api.md; ratelimit.go). rl is nil when
 	// disabled; rl.limit(...) is valid either way and wraps every REST
