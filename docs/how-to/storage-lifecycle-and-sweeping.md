@@ -513,7 +513,10 @@ cursors (budget-limited, resumable — the sweeper's inverse direction) and
   per-repository reservation-row cap cannot bind regardless of how many
   rows were lost. Round-robin re-verification then shrinks aggregates as
   losses heal (rotating the reservation key so exact totals are charged);
-  a backlog there delays shrinking (conservative), never renewal. Startup
+  a backlog there delays shrinking (conservative), never renewal. On
+  PostgreSQL the job runs on its own reserved single-worker River queue,
+  so tenant-scalable work (webhook deliveries to slow endpoints) cannot
+  delay a renewal past the cover TTL. Startup
   enforces the cadence-vs-TTL coupling (interval ≤ TTL/2, pass wall clock
   ≤ TTL/4), so renewals always land before live covers can lapse. The set
   is in-memory per worker:

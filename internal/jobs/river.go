@@ -143,6 +143,18 @@ func (w *lfsReclaimWorker) Work(ctx context.Context, _ *river.Job[lfsReclaimArgs
 	return err
 }
 
+// absenceQueue is the reserved single-worker River queue absence
+// reconciliation runs on (Codex round 11, security): cover renewal is
+// TTL-coupled, and the default queue's eight workers are shared with
+// tenant-scalable work — webhook deliveries fan out per push to
+// attacker-controlled endpoints that can hold each attempt for its full
+// timeout, delaying a default-queue renewal past the cover TTL. A
+// reserved queue bounds renewal latency by the job's own runtime (the
+// TTL/4 pass cap), not by tenant traffic. The sweep/reclaim jobs stay on
+// the default queue deliberately: starving them delays convergence, never
+// a safety property.
+const absenceQueue = "absence_reconcile"
+
 // absenceReconcileArgs is one scheduled registry-vs-storage absence
 // reconciliation pass (issue #101), unique across the active states like
 // sweepArgs so concurrently booting replicas cannot pile up overlapping
@@ -153,6 +165,7 @@ func (absenceReconcileArgs) Kind() string { return "absence_reconcile" }
 
 func (absenceReconcileArgs) InsertOpts() river.InsertOpts {
 	return river.InsertOpts{
+		Queue:       absenceQueue,
 		MaxAttempts: 1,
 		UniqueOpts: river.UniqueOpts{
 			ByArgs: true,
@@ -648,8 +661,14 @@ func NewRiver(ctx context.Context, pgURL string, deliverer *events.Deliverer, ru
 			&river.PeriodicJobOpts{RunOnStart: true},
 		))
 	}
+	queues := map[string]river.QueueConfig{river.QueueDefault: {MaxWorkers: 8}}
+	if absence != nil {
+		// Reserved queue — see absenceQueue: cover renewal is TTL-coupled
+		// and must not wait behind tenant-scalable default-queue work.
+		queues[absenceQueue] = river.QueueConfig{MaxWorkers: 1}
+	}
 	client, err := river.NewClient(driver, &river.Config{
-		Queues:       map[string]river.QueueConfig{river.QueueDefault: {MaxWorkers: 8}},
+		Queues:       queues,
 		Workers:      workers,
 		PeriodicJobs: periodic,
 		Logger:       logger,
