@@ -63,8 +63,12 @@ restarted process) can never re-adopt a stale GREATEST-pinned row.
 Round-robin re-verification (`HasPack`/`HasLFSObject` + stats) only
 SHRINKS covers, so its backlog delays convergence, never visibility. Losses are
 storage-incident-scaled, never attacker-mintable; beyond the base
-capacity or the 100,000-row memory bound, overflow gets one-shot per-row
-covers renewed on rotation revisits (`absent_untracked`). The set is in-memory like the cursors: a restart loses it and
+capacity or the 100,000-row memory bound, overflow aggregates into one
+PASS-SCOPED cover row per base (per-row covers would re-collide with the
+reservation-row cap), renewed on rotation revisits (`absent_untracked`).
+Shrink-driven key rotations are likewise coalesced to one fresh
+incarnation per base per pass, so heal/miss interleaving cannot mint
+row-cap many keys. The set is in-memory like the cursors: a restart loses it and
 the rotation rediscovers — convergence delay, never corruption. Renewal
 timing is enforced end to end (Codex round 3, security): covers renew at
 pass starts, periodic ticks that fire mid-pass coalesce (River uniqueness

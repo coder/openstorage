@@ -224,7 +224,7 @@ type absentBase struct {
 	rows  int64
 	idx   int // position in baseRing, maintained by track/untrack
 	// coverKey is the aggregate's reservation-key incarnation, re-minted
-	// whenever bytes SHRINK (Codex round 5): ReservePackBytes' same-key
+	// after bytes SHRINK (Codex round 5): ReservePackBytes' same-key
 	// upsert keeps GREATEST(old, new) and refreshes the TTL, so renewing
 	// a smaller aggregate under the old key would pin healed bytes
 	// reserved forever. A fresh key charges the exact total and the old
@@ -233,10 +233,13 @@ type absentBase struct {
 	// crypto-random, NEVER a resettable counter (Codex round 6): a
 	// counter restarts at zero when the aggregate empties and re-forms
 	// (or across process restarts) while the stale GREATEST-pinned row
-	// is still alive, silently re-adopting it. Rows are minted only when
-	// a key is actually charged (at most twice per base per pass), so
-	// rotation cannot grow the row population past a handful per TTL.
+	// is still alive, silently re-adopting it. Rotation is COALESCED to
+	// at most once per base per pass, applied lazily at the next charge
+	// (Codex round 8): rotating eagerly on every heal interleaved with
+	// re-charges could mint row-cap many incarnations in one pass —
+	// shrunk marks the pending rotation instead.
 	coverKey string
+	shrunk   bool
 }
 
 // absenceCoverKey mints a fresh synthetic per-base aggregate key (used
@@ -315,6 +318,9 @@ type absencePassState struct {
 	// row population at TTL/interval rows per overflow base.
 	overflowKeys  map[string]string
 	overflowBytes map[string]int64
+	// rotated coalesces shrink-driven key rotations to one fresh
+	// incarnation per base per pass (Codex round 8).
+	rotated map[string]bool
 }
 
 // coveredAggregate is one pass's per-base charge memo.
@@ -332,6 +338,7 @@ func newAbsencePassState() *absencePassState {
 		baseCovered:   make(map[string]coveredAggregate),
 		overflowKeys:  make(map[string]string),
 		overflowBytes: make(map[string]int64),
+		rotated:       make(map[string]bool),
 	}
 }
 
@@ -578,10 +585,10 @@ func (r *AbsenceReconciler) untrackAbsent(key string) {
 		"untrackAbsent(%q): base aggregate %s inconsistent (%+v)", key, base, agg)
 	agg.bytes -= row.bytes
 	agg.rows--
-	// Bytes shrank: re-mint the reservation key (see absentBase.coverKey)
-	// so the next renewal charges the exact new total instead of
-	// refreshing the GREATEST-pinned old one.
-	agg.coverKey = absenceCoverKey(base)
+	// Bytes shrank: mark the pending key rotation (see
+	// absentBase.coverKey) — applied lazily, coalesced to once per pass,
+	// at the next charge.
+	agg.shrunk = true
 	if agg.rows == 0 {
 		assertf(agg.bytes == 0, "untrackAbsent(%q): empty base %s holds %d bytes", key, base, agg.bytes)
 		assertf(agg.idx >= 0 && agg.idx < len(r.baseRing) && r.baseRing[agg.idx] == agg,
@@ -900,6 +907,19 @@ func (r *AbsenceReconciler) coverBase(ctx context.Context, base string, report *
 		return // nothing tracked for this base (untracked rows use coverRow)
 	}
 	assertf(agg.bytes > 0 && agg.rows > 0, "coverBase(%s): empty aggregate %+v", base, agg)
+	if agg.shrunk {
+		// Apply the pending shrink rotation, coalesced to at most one
+		// fresh incarnation per base per pass (Codex round 8): heals
+		// interleaved with re-charges could otherwise mint row-cap many
+		// keys in one pass. A shrink after this pass's rotation keeps the
+		// current key until the NEXT pass — one pass of over-cover at
+		// this pass's GREATEST, then exact.
+		if !st.rotated[base] {
+			agg.coverKey = absenceCoverKey(base)
+			st.rotated[base] = true
+		}
+		agg.shrunk = false
+	}
 	if prev, done := st.baseCovered[base]; done && prev.key == agg.coverKey && agg.bytes <= prev.bytes {
 		return
 	}

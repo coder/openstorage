@@ -412,6 +412,19 @@ func (stubAbsenceRegistry) ReservePackBytes(context.Context, []string, []ref.Pac
 	return ref.ReserveDecision{OK: true}, nil
 }
 
+// recordingAbsenceRegistry wraps the stub to capture reserved keys.
+type recordingAbsenceRegistry struct {
+	stubAbsenceRegistry
+	reserved []string
+}
+
+func (r *recordingAbsenceRegistry) ReservePackBytes(_ context.Context, _ []string, packs []ref.Pack, _ string, _, _, _ int64, _ time.Duration) (ref.ReserveDecision, error) {
+	for _, p := range packs {
+		r.reserved = append(r.reserved, p.Key)
+	}
+	return ref.ReserveDecision{OK: true}, nil
+}
+
 type stubStatter struct{ stats []string }
 
 func (s *stubStatter) Stat(_ context.Context, key string) (int64, error) {
@@ -477,6 +490,43 @@ func TestAbsencePassTimeoutClampedToTTL(t *testing.T) {
 	r = NewAbsenceReconciler(stubAbsenceRegistry{}, &stubStatter{}, true, 100, 8*time.Hour, log)
 	if r.passTimeout != time.Hour {
 		t.Fatalf("passTimeout = %v with an 8h TTL, want the 1h ceiling", r.passTimeout)
+	}
+}
+
+// TestAbsenceShrinkRotationCoalesced (Codex round 8): heals interleaved
+// with re-charges within one pass must mint at most ONE fresh aggregate
+// incarnation per base — eager per-heal rotation could fill the per-base
+// reservation-row cap in a single pass.
+func TestAbsenceShrinkRotationCoalesced(t *testing.T) {
+	reg := &recordingAbsenceRegistry{}
+	r := NewAbsenceReconciler(reg, &stubStatter{}, true, 1000, time.Hour, slog.New(slog.DiscardHandler))
+	var report AbsenceReport
+	base := "repo-coalesce"
+	keys := make([]string, 8)
+	for i := range keys {
+		oid := strings.Repeat("d", 63) + string([]byte{'0' + byte(i)})
+		keys[i] = blob.LFSKey(base, oid)
+		r.trackAbsent(absentRow{repo: base, key: keys[i], bytes: 10, registered: 10}, &report)
+	}
+
+	// One pass state: alternate heal (untrack → shrink) with a re-charge
+	// (coverBase), eight times.
+	st := newAbsencePassState()
+	var errs boundedErrs
+	ctx := context.Background()
+	for i := 0; i < 7; i++ {
+		r.untrackAbsent(keys[i])
+		r.coverBase(ctx, base, &report, st, &errs)
+	}
+	if err := errs.join(); err != nil {
+		t.Fatalf("coverBase: %v", err)
+	}
+	distinct := map[string]bool{}
+	for _, k := range reg.reserved {
+		distinct[k] = true
+	}
+	if len(distinct) > 1 {
+		t.Fatalf("pass minted %d distinct aggregate incarnations (%v), want at most 1", len(distinct), reg.reserved)
 	}
 }
 
