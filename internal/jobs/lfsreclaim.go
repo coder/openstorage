@@ -41,8 +41,12 @@ type LFSReclaimRegistry interface {
 	ClearLFSObjectsUnreferenced(ctx context.Context, repo string, keys []string) (int64, error)
 	// RetireUnreferencedLFSObject is the guarded verdict — see the ref
 	// store contract (generation fence, purge fence, in-transaction grace
-	// recheck, reap-watermark freshness, count/usage refund).
+	// recheck, reap-watermark freshness, deferred refund bucketing).
 	RetireUnreferencedLFSObject(ctx context.Context, repo, key string, pinnedGens map[string]int64, grace, reapMaxAge time.Duration) (bool, error)
+	// SettleLFSRefunds releases a base's pending retirement refunds
+	// covered by a completed destructive sweep (Codex round 33 on PR
+	// #132) — see the ref store contract.
+	SettleLFSRefunds(ctx context.Context, repo string) (ref.SettledLFSRefunds, error)
 	// ScanStateStore persists the rotation cursor, the per-repo
 	// row-settlement cursors, and serves the sweeper's destructive-reap
 	// watermark (issues #120/#121): River may run each pass on any
@@ -115,6 +119,16 @@ type LFSReclaimReport struct {
 	// (Codex round 17 on PR #132). Their blobs would never be physically
 	// reaped, so refunding their slots would grow storage past the cap.
 	RowsDeferredLegacyUnarmed int64 `json:"rows_deferred_legacy_unarmed"`
+	// RefundRowsSettled/RefundBytesSettled count deferred retirement
+	// refunds released this pass: a destructive sweep with a strictly
+	// greater epoch completed since the rows were retired, proving their
+	// orphaned blobs were visible to a full clean reap (Codex round 33
+	// on PR #132).
+	RefundRowsSettled  int64 `json:"refund_rows_settled"`
+	RefundBytesSettled int64 `json:"refund_bytes_settled"`
+	// RefundBucketsPending counts buckets still awaiting a covering
+	// completion at their settlement attempts this pass.
+	RefundBucketsPending int `json:"refund_buckets_pending"`
 }
 
 const (
@@ -251,6 +265,68 @@ func NewLFSReclaimer(registry LFSReclaimRegistry, hydrate HydrateFunc, walk LFSW
 	}
 }
 
+// lfsRefundScopePage bounds one pass's vanished-base refund listing.
+const lfsRefundScopePage = 512
+
+// settleRefunds settles one base's matured refund buckets into the
+// report. A settlement failure only defers refunds — logged, never fatal
+// to the pass.
+func (r *LFSReclaimer) settleRefunds(ctx context.Context, base string, report *LFSReclaimReport) {
+	settled, err := r.registry.SettleLFSRefunds(ctx, base)
+	if err != nil {
+		r.logger.Warn("lfs reclaim: settling refund buckets failed; refunds deferred", "repo", base, "err", err)
+		return
+	}
+	report.RefundRowsSettled += settled.Rows
+	report.RefundBytesSettled += settled.Bytes
+	report.RefundBucketsPending += settled.Pending
+}
+
+// settleVanishedRefunds pages the refund bucket keyspace behind a durable
+// rotation cursor and settles bases the repo rotation did not visit this
+// pass (Codex round 33): a base whose last row retired vanishes from
+// LFSReposWithObjects while its pending refunds still hold quota.
+func (r *LFSReclaimer) settleVanishedRefunds(ctx context.Context, scanned map[string]bool, report *LFSReclaimReport, errs *boundedErrs) {
+	after := ""
+	if st, ok, err := r.registry.GetJobScanState(ctx, ref.ScanJobLFSReclaim, ref.ScanScopeReclaimRefundRotation); err != nil {
+		errs.add(fmt.Errorf("lfs reclaim: read refund rotation cursor: %w", err))
+		return
+	} else if ok {
+		after = st.Payload
+	}
+	scopes, err := r.registry.ListJobScanStateScopes(ctx, ref.ScanJobLFSReclaim, ref.ScanScopeReclaimRefundRoot, after, lfsRefundScopePage)
+	if err != nil {
+		errs.add(fmt.Errorf("lfs reclaim: list refund buckets: %w", err))
+		return
+	}
+	next := "" // a short page drained the tail: wrap to origin
+	if len(scopes) == lfsRefundScopePage {
+		next = scopes[len(scopes)-1]
+	}
+	done := make(map[string]bool)
+	for _, scope := range scopes {
+		rest := strings.TrimPrefix(scope, ref.ScanScopeReclaimRefundRoot)
+		// The epoch suffix is the LAST "/e<digits>" segment: base names
+		// are opaque and may themselves contain "/e".
+		idx := strings.LastIndex(rest, "/e")
+		if idx <= 0 {
+			r.logger.Warn("lfs reclaim: skipping unparseable refund bucket scope", "scope", scope)
+			continue
+		}
+		base := rest[:idx]
+		if scanned[base] || done[base] {
+			continue // already settled by this pass's repo visit
+		}
+		done[base] = true
+		r.settleRefunds(ctx, base, report)
+	}
+	parkCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), scanStateWriteTimeout)
+	defer cancel()
+	if err := r.registry.PutJobScanState(parkCtx, ref.ScanJobLFSReclaim, ref.ScanScopeReclaimRefundRotation, next, 0); err != nil {
+		errs.add(fmt.Errorf("lfs reclaim: park refund rotation cursor: %w", err))
+	}
+}
+
 // gensFence folds pinned namespace-group generations into the row-cursor
 // invalidation fence. Generations only ever increment (schema triggers), so
 // the SUM is strictly monotone under any member's bump: equality proves no
@@ -319,7 +395,7 @@ func (r *LFSReclaimer) Run(ctx context.Context) (LFSReclaimReport, error) {
 			if st, ok, err := r.registry.GetJobScanState(ctx, ref.ScanJobSweep, ref.ScanScopeLFSDestructiveReap); err != nil {
 				errs.add(fmt.Errorf("lfs reclaim: read reap watermark payload: %w", err))
 			} else if ok {
-				r.legacyReapArmed = st.Payload == ref.ReapWatermarkLegacy
+				r.legacyReapArmed = ref.DecodeReapWatermark(st.Payload).Legacy
 			}
 		}
 	}
@@ -395,6 +471,13 @@ loop:
 			}
 		}
 	}
+	// Settle refund buckets of bases that vanished from the work queue
+	// (Codex round 33): a base whose LAST row retired never reappears in
+	// LFSReposWithObjects, so its pending refunds would otherwise wait
+	// forever. One bounded keyset page of bucket scopes per pass, with a
+	// durable rotation cursor of its own; settled buckets vanish, so the
+	// population self-drains.
+	r.settleVanishedRefunds(ctx, scanned, &report, &errs)
 	// Park the rotation durably for whichever replica runs the next pass
 	// (issue #121), on a bounded DETACHED context: the pass regularly
 	// ends by burning its own deadline, and losing the park would replay
@@ -421,7 +504,10 @@ loop:
 		"dry_run", report.DryRun,
 		"reap_watermark_stale", report.ReapWatermarkStale,
 		"rows_deferred_reap_stale", report.RowsDeferredReapStale,
-		"rows_deferred_legacy_unarmed", report.RowsDeferredLegacyUnarmed)
+		"rows_deferred_legacy_unarmed", report.RowsDeferredLegacyUnarmed,
+		"refund_rows_settled", report.RefundRowsSettled,
+		"refund_bytes_settled", report.RefundBytesSettled,
+		"refund_buckets_pending", report.RefundBucketsPending)
 	return report, errs.join()
 }
 
@@ -448,6 +534,11 @@ func (r *LFSReclaimer) reclaimRepo(ctx context.Context, base string, budget int6
 		}
 		return 0, nil
 	}
+	// Settle refund buckets a completed destructive sweep now covers
+	// (Codex round 33): visited bases settle here; bases that vanished
+	// from the work queue (every row retired) settle via the refund
+	// rotation in Run.
+	r.settleRefunds(ctx, base, report)
 	branch, ok, err := r.defaultBranch(ctx, base)
 	if err != nil {
 		return 0, err

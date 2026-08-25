@@ -6,9 +6,11 @@ package jobs
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1294,6 +1296,98 @@ func TestAbsenceReconcile_UpgradeFirstPassKeepsAdmissionOpen(t *testing.T) {
 	}
 }
 
+// TestAbsenceReconcile_AdmissionGCDurableLapseMarker (Codex round 33 on
+// PR #132, P1): ReservePackBytes' self-healing GC deletes a base's
+// expired reservation rows at admission time — the very writers the
+// admission fence should block destroy the physical evidence the
+// first-health-stamp probe arms on. The GC records a durable
+// lapse-evidence marker in the same transaction; the reconciler consults
+// it BEFORE the physical probe, arms the fence, and consumes the marker
+// only when the recovery rotation settles.
+func TestAbsenceReconcile_AdmissionGCDurableLapseMarker(t *testing.T) {
+	f := newSweepFixture(t)
+	ctx := context.Background()
+	reg := absenceRegistry(t, f)
+	// Multi-pass keyspace (an armed fence must outlive one pass) plus one
+	// ABSENT row whose cover is the future lapse evidence.
+	for i := 0; i < 30; i++ {
+		key := blob.LFSKey("a-fill", strings.Repeat(fmt.Sprintf("%02x", i), 32))
+		registerLFS(t, f, "a-fill", key, 10)
+		f.upload(key, strings.Repeat("x", 10))
+	}
+	lost := blob.LFSKey("z-lost", absenceOID('f'))
+	registerLFS(t, f, "z-lost", lost, 10)
+
+	// Pass 1 (generous budget): full rotation charges the z-lost cover
+	// and stamps first health with admission open (no lapse anywhere).
+	pinLFSLeader(t, f)
+	if _, err := testReconciler(t, f, true, 100).Run(ctx); err != nil {
+		t.Fatalf("pass 1: %v", err)
+	}
+	if covers, err := reg.ListAbsenceCovers(ctx, "", 10, time.Hour); err != nil || len(covers) != 1 || covers[0].Base != "z-lost" {
+		t.Fatalf("covers after pass 1 = (%+v, %v), want the z-lost cover", covers, err)
+	}
+
+	// Simulate the pre-watermark regime: no health row was ever stamped.
+	if err := reg.DeleteJobScanState(ctx, ref.ScanJobAbsence, ref.ScanScopeAbsenceRenewalHealth); err != nil {
+		t.Fatal(err)
+	}
+
+	// An ordinary finite admission under a tiny TTL: the GC prunes the
+	// now-expired cover row — the marker must survive the consumption.
+	res, ok := f.store.(ref.RestoreCoverStore)
+	if !ok {
+		t.Fatalf("store %T lacks ReservePackBytes", f.store)
+	}
+	dec, err := res.ReservePackBytes(ctx, blob.QuotaRepoGroup("z-lost"),
+		[]ref.Pack{{Key: blob.PackKey("z-lost", "p1"), Size: 1}}, ref.NewReservationOwner(),
+		0, ref.ReserveNoFloorGen, 10_000, time.Nanosecond)
+	if err != nil || !dec.OK {
+		t.Fatalf("gc reserve = (%+v, %v), want admitted", dec, err)
+	}
+	if lapsed, err := reg.LapsedAbsenceCoverExists(ctx, time.Nanosecond); err != nil || lapsed {
+		t.Fatalf("physical probe after GC = (%v, %v), want no evidence left", lapsed, err)
+	}
+	if _, ok, err := reg.GetJobScanState(ctx, ref.ScanJobAbsence, ref.ScanScopeAbsenceLapse); err != nil || !ok {
+		t.Fatalf("lapse marker after GC = (ok=%v, %v), want recorded", ok, err)
+	}
+
+	// Pass 2 (budget-starved): the first health stamp finds the marker —
+	// the fence arms and holds past the pass; finite admission fails
+	// closed.
+	if _, err := testReconciler(t, f, true, 12).Run(ctx); err != nil {
+		t.Fatalf("pass 2: %v", err)
+	}
+	if _, ok, err := reg.GetJobScanState(ctx, ref.ScanJobAbsence, ref.ScanScopeAbsenceAdmissionFence); err != nil || !ok {
+		t.Fatalf("fence after marker-armed pass = (ok=%v, %v), want armed", ok, err)
+	}
+	dec, err = res.ReservePackBytes(ctx, blob.QuotaRepoGroup("a-fill"),
+		[]ref.Pack{{Key: blob.PackKey("a-fill", "p1"), Size: 10}}, ref.NewReservationOwner(),
+		0, ref.ReserveNoFloorGen, 10_000, time.Hour)
+	if err != nil || dec.OK || !dec.RenewalDegraded {
+		t.Fatalf("fenced finite reserve = (%+v, %v), want RenewalDegraded denial", dec, err)
+	}
+
+	// Recovery rotations clear the fence AND consume the marker.
+	cleared := false
+	for pass := 3; pass <= 10 && !cleared; pass++ {
+		if _, err := testReconciler(t, f, true, 12).Run(ctx); err != nil {
+			t.Fatalf("pass %d: %v", pass, err)
+		}
+		_, ok, err := reg.GetJobScanState(ctx, ref.ScanJobAbsence, ref.ScanScopeAbsenceAdmissionFence)
+		if err != nil {
+			t.Fatalf("pass %d fence read: %v", pass, err)
+		}
+		cleared = !ok
+	}
+	if !cleared {
+		t.Fatal("fence never cleared after full recovery rotations")
+	}
+	if _, ok, err := reg.GetJobScanState(ctx, ref.ScanJobAbsence, ref.ScanScopeAbsenceLapse); err != nil || ok {
+		t.Fatalf("lapse marker after settlement = (ok=%v, %v), want consumed", ok, err)
+	}
+}
+
 // TestAbsenceReconcile_ContinuityBoundCoversStampDelay (Codex round 32,
 // P1): the health watermark stamps up to one pass wall clock AFTER the
 // bulk touch it records, so a watermark age inside [coverTTL-passTimeout,
@@ -1395,6 +1489,308 @@ func TestAbsenceReconcile_FailedFenceArmSuppressesHealthStamp(t *testing.T) {
 	}
 	if _, ok, err := reg.GetJobScanState(ctx, ref.ScanJobAbsence, ref.ScanScopeAbsenceRenewalHealth); err != nil || !ok {
 		t.Fatalf("health after durable arm = (ok=%v, %v), want stamped", ok, err)
+	}
+}
+
+// failCursorReadRegistry injects transient failures into the durable
+// class-cursor reads, leaving every other scan-state access intact.
+type failCursorReadRegistry struct {
+	AbsenceRegistry
+	fail bool
+}
+
+func (fr *failCursorReadRegistry) GetJobScanState(ctx context.Context, job, scope string) (ref.JobScanState, bool, error) {
+	if fr.fail && job == ref.ScanJobAbsence && (scope == ref.ScanScopeAbsenceLFS || scope == ref.ScanScopeAbsencePacks) {
+		return ref.JobScanState{}, false, fmt.Errorf("flaky: injected cursor read failure")
+	}
+	return fr.AbsenceRegistry.GetJobScanState(ctx, job, scope)
+}
+
+// durableCleanTraversals decodes one persisted class cursor's lifetime
+// clean-traversal counter.
+func durableCleanTraversals(t *testing.T, reg AbsenceRegistry, scope string) int64 {
+	t.Helper()
+	st, ok, err := reg.GetJobScanState(context.Background(), ref.ScanJobAbsence, scope)
+	if err != nil || !ok {
+		t.Fatalf("read %s cursor = (ok=%v, %v)", scope, ok, err)
+	}
+	var cur absenceCursorState
+	if err := json.Unmarshal([]byte(st.Payload), &cur); err != nil {
+		t.Fatalf("decode %s cursor: %v", scope, err)
+	}
+	return cur.CleanTraversals
+}
+
+// TestAbsenceReconcile_TransientCursorReadErrorSnapshotSentinel (Codex
+// round 33, P1): a pass whose durable cursor reads fail transiently holds
+// untrustworthy in-memory zeros — arming the admission fence that pass
+// must write the UNKNOWN sentinel (-1), never snapshot the zeros: the
+// next healthy pass would reload the real (large) clean counters and
+// settle the fence instantly without any recovery rotation. The failing
+// pass must also leave the durable cursor rows un-stamped, or the
+// counters themselves would be destroyed. The sentinel re-anchors at the
+// next healthy load's counters, so release still requires one full fresh
+// clean rotation — and eventually happens (liveness).
+func TestAbsenceReconcile_TransientCursorReadErrorSnapshotSentinel(t *testing.T) {
+	f := newSweepFixture(t)
+	ctx := context.Background()
+	reg := absenceRegistry(t, f)
+	// Multi-pass keyspace: 30 present rows, so a budget-12 pass cannot
+	// complete the recovery rotation the sentinel demands.
+	for i := 0; i < 30; i++ {
+		key := blob.LFSKey("a-fill", strings.Repeat(fmt.Sprintf("%02x", i), 32))
+		registerLFS(t, f, "a-fill", key, 10)
+		f.upload(key, strings.Repeat("x", 10))
+	}
+	pinLFSLeader(t, f)
+	// Passes 1-2 (generous budget) accumulate durable clean counters —
+	// the zeros-vs-reality gap the defect exploited.
+	for pass := 1; pass <= 2; pass++ {
+		if _, err := testReconciler(t, f, true, 100).Run(ctx); err != nil {
+			t.Fatalf("pass %d: %v", pass, err)
+		}
+	}
+	cleanLFS := durableCleanTraversals(t, reg, ref.ScanScopeAbsenceLFS)
+	if cleanLFS == 0 {
+		t.Fatal("fixture accumulated no clean traversals")
+	}
+
+	// Health vanishes (fleet-pause simulation); pass 3's cursor reads
+	// fail while injected lapse evidence forces an arm.
+	if err := reg.DeleteJobScanState(ctx, ref.ScanJobAbsence, ref.ScanScopeAbsenceRenewalHealth); err != nil {
+		t.Fatal(err)
+	}
+	fr := &failCursorReadRegistry{AbsenceRegistry: &lapsedRegistry{reg}, fail: true}
+	rec3 := NewAbsenceReconciler(fr, f.blobs, true, 100, time.Hour, time.Minute, slog.New(slog.DiscardHandler))
+	if _, err := rec3.Run(ctx); err == nil {
+		t.Fatal("pass 3: want the injected read failures reported")
+	}
+	st, ok, err := reg.GetJobScanState(ctx, ref.ScanJobAbsence, ref.ScanScopeAbsenceAdmissionFence)
+	if err != nil || !ok {
+		t.Fatalf("fence after failing pass = (ok=%v, %v), want armed", ok, err)
+	}
+	var snap map[string]int64
+	if err := json.Unmarshal([]byte(st.Payload), &snap); err != nil {
+		t.Fatalf("decode fence snapshot: %v", err)
+	}
+	if snap["lfs"] != -1 || snap["packs"] != -1 {
+		t.Fatalf("fence snapshot = %v, want the unknown sentinel", snap)
+	}
+	// The unreadable cursors were NOT re-stamped: the durable lifetime
+	// counters survive the failing pass.
+	if got := durableCleanTraversals(t, reg, ref.ScanScopeAbsenceLFS); got != cleanLFS {
+		t.Fatalf("durable clean traversals after failing pass = %d, want %d preserved", got, cleanLFS)
+	}
+
+	// Pass 4 (healthy, budget-starved): the sentinel re-anchors at the
+	// counters just loaded — a zero snapshot would have compared the
+	// reloaded counters against 0 and cleared instantly.
+	if _, err := testReconciler(t, f, true, 12).Run(ctx); err != nil {
+		t.Fatalf("pass 4: %v", err)
+	}
+	if _, ok, err := reg.GetJobScanState(ctx, ref.ScanJobAbsence, ref.ScanScopeAbsenceAdmissionFence); err != nil || !ok {
+		t.Fatalf("fence after one starved healthy pass = (ok=%v, %v), want still armed", ok, err)
+	}
+	// Liveness: complete fresh clean rotations still release it.
+	cleared := false
+	for pass := 5; pass <= 12 && !cleared; pass++ {
+		if _, err := testReconciler(t, f, true, 12).Run(ctx); err != nil {
+			t.Fatalf("pass %d: %v", pass, err)
+		}
+		_, ok, err := reg.GetJobScanState(ctx, ref.ScanJobAbsence, ref.ScanScopeAbsenceAdmissionFence)
+		if err != nil {
+			t.Fatalf("pass %d fence read: %v", pass, err)
+		}
+		cleared = !ok
+	}
+	if !cleared {
+		t.Fatal("fence never cleared after full recovery rotations")
+	}
+}
+
+// TestAbsenceReconcile_SeededCandidaciesRetainedPastCap (Codex round 33,
+// P2): saveProofs enforced the candidacy cap over an UNORDERED map walk,
+// so a long-waiting seeded half-proof could be evicted by fresh
+// candidacies pass after pass — its base's legacy nonce then bulk-renews
+// forever. Retention is now deterministic and seeded-first. Exercised at
+// the saveProofs seam (the pass-level candidacy machinery has its own
+// tests); repeated iterations make a random-order regression essentially
+// certain to surface.
+func TestAbsenceReconcile_SeededCandidaciesRetainedPastCap(t *testing.T) {
+	f := newSweepFixture(t)
+	ctx := context.Background()
+	reg := absenceRegistry(t, f)
+	rec := testReconciler(t, f, true, 100)
+	rec.proofCap = 1
+	for iter := 0; iter < 10; iter++ {
+		rec.legacyRows = nil
+		rec.proofGens = map[string]map[string]absenceProofEntry{}
+		rec.cleanBases = map[string]map[string]bool{absenceClassLFS: {}, absenceClassPacks: {}}
+		rec.renewalComplete = true
+		// 40 fresh candidacies, every one sorting BEFORE the seeded base.
+		for i := 0; i < 40; i++ {
+			base := fmt.Sprintf("a-fresh-%02d", i)
+			rec.legacyRows = append(rec.legacyRows, ref.AbsenceCoverRow{Base: base})
+			rec.cleanBases[absenceClassLFS][base] = true
+		}
+		rec.legacyRows = append(rec.legacyRows, ref.AbsenceCoverRow{Base: "zz-seeded"})
+		rec.proofGens["zz-seeded"] = map[string]absenceProofEntry{absenceClassLFS: {}}
+		var errs boundedErrs
+		rec.saveProofs(ctx, &errs)
+		if !errs.ok() {
+			t.Fatalf("iteration %d: saveProofs errors: %v", iter, errs.join())
+		}
+		st, ok, err := reg.GetJobScanState(ctx, ref.ScanJobAbsence, ref.ScanScopeAbsenceProofs)
+		if err != nil || !ok {
+			t.Fatalf("iteration %d: proofs row = (ok=%v, %v)", iter, ok, err)
+		}
+		var kept map[string]map[string]absenceProofEntry
+		if err := json.Unmarshal([]byte(st.Payload), &kept); err != nil {
+			t.Fatalf("iteration %d: decode proofs: %v", iter, err)
+		}
+		if len(kept) != 1 || kept["zz-seeded"] == nil {
+			t.Fatalf("iteration %d: kept %v, want exactly the seeded candidacy", iter, kept)
+		}
+	}
+}
+
+// recordingStatter records every statted key, pass-through otherwise.
+type recordingStatter struct {
+	inner BlobStatter
+	mu    sync.Mutex
+	keys  []string
+}
+
+func (rs *recordingStatter) Stat(ctx context.Context, key string) (int64, error) {
+	rs.mu.Lock()
+	rs.keys = append(rs.keys, key)
+	rs.mu.Unlock()
+	return rs.inner.Stat(ctx, key)
+}
+
+func (rs *recordingStatter) statted(substr string) bool {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	for _, k := range rs.keys {
+		if strings.Contains(k, substr) {
+			return true
+		}
+	}
+	return false
+}
+
+// TestAbsenceReconcile_FencedPassDefersFoldsToRecovery (Codex round 33,
+// P2 security): the pre-rotation hint fold's re-stat is run-to-completion
+// and can burn the whole pass deadline on one large base — while the
+// admission fence is armed, that starves the recovery rotations whose
+// CLEAN traversal advance is the only thing that settles the fence,
+// denying finite quota-gated writes fleet-wide indefinitely. A fenced
+// pass must not fold at all (deferral is always safe: hints persist
+// seeded-first, nonces keep renewing); once the fence settles, folding
+// resumes and the deferred candidacy completes.
+func TestAbsenceReconcile_FencedPassDefersFoldsToRecovery(t *testing.T) {
+	f := newSweepFixture(t)
+	ctx := context.Background()
+	reg := absenceRegistry(t, f)
+	// Budget-starved keyspace: 30 a-fill rows sort BEFORE zz-legacy's,
+	// so any zz-legacy Stat in the fenced pass can only come from a fold
+	// re-stat.
+	for i := 0; i < 30; i++ {
+		key := blob.LFSKey("a-fill", strings.Repeat(fmt.Sprintf("%02x", i), 32))
+		registerLFS(t, f, "a-fill", key, 10)
+		f.upload(key, strings.Repeat("x", 10))
+	}
+	lkey := blob.LFSKey("zz-legacy", absenceOID('e'))
+	registerLFS(t, f, "zz-legacy", lkey, 10)
+	f.upload(lkey, strings.Repeat("x", 10))
+	nonce := ref.AbsenceCoverPrefix + "zz-legacy/0123456789abcdef0123"
+	res, ok := f.store.(ref.RestoreCoverStore)
+	if !ok {
+		t.Fatalf("store %T lacks ReserveRestoreCover", f.store)
+	}
+	if err := ref.ReserveRestoreCover(ctx, res, blob.QuotaRepoGroup("zz-legacy"), nonce, 10, time.Hour); err != nil {
+		t.Fatalf("plant legacy nonce: %v", err)
+	}
+	// Persist a complete two-class fold candidacy at the CURRENT fence
+	// generation — the mixed-version half-proof waiting for commitment.
+	var gen int64
+	for _, member := range blob.QuotaRepoGroup("zz-legacy") {
+		g, err := f.store.LFSAdoptionGen(ctx, member)
+		if err != nil {
+			t.Fatalf("LFSAdoptionGen(%q): %v", member, err)
+		}
+		gen += g
+	}
+	payload := fmt.Sprintf(`{"zz-legacy":{"lfs":{"gen":%d},"packs":{"gen":%d}}}`, gen, gen)
+	if err := reg.PutJobScanState(ctx, ref.ScanJobAbsence, ref.ScanScopeAbsenceProofs, payload, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	// Pass 1: no health watermark plus injected lapse evidence — the
+	// fence arms at renewal, BEFORE the fold decision. The fenced pass
+	// must spend its deadline on recovery only: no zz-legacy re-stat, no
+	// fold, nonce stays live.
+	pinLFSLeader(t, f)
+	rs := &recordingStatter{inner: f.blobs}
+	rec := NewAbsenceReconciler(&lapsedRegistry{reg}, rs, true, 12, time.Hour, time.Minute, slog.New(slog.DiscardHandler))
+	if _, err := rec.Run(ctx); err != nil {
+		t.Fatalf("fenced pass: %v", err)
+	}
+	if _, ok, err := reg.GetJobScanState(ctx, ref.ScanJobAbsence, ref.ScanScopeAbsenceAdmissionFence); err != nil || !ok {
+		t.Fatalf("fence after pass 1 = (ok=%v, %v), want armed", ok, err)
+	}
+	if rs.statted("zz-legacy") {
+		t.Fatal("fenced pass re-statted the fold candidate: fold work stole the recovery deadline")
+	}
+	nonceState := func() (live, folded bool) {
+		t.Helper()
+		for after := ""; ; {
+			listed, err := reg.ListAbsenceCovers(ctx, after, 100, time.Hour)
+			if err != nil {
+				t.Fatalf("list covers: %v", err)
+			}
+			if len(listed) == 0 {
+				return live, folded
+			}
+			for _, row := range listed {
+				if row.Key == nonce {
+					live = true
+					folded = row.Folded
+				}
+			}
+			after = listed[len(listed)-1].RawKey
+		}
+	}
+	if live, folded := nonceState(); !live || folded {
+		t.Fatalf("nonce after fenced pass = (live=%v, folded=%v), want live un-folded", live, folded)
+	}
+
+	// Recovery rotations settle the fence; the deferred candidacy then
+	// folds on a later un-fenced pass (hints persisted seeded-first).
+	cleared := false
+	for pass := 2; pass <= 10 && !cleared; pass++ {
+		if _, err := testReconciler(t, f, true, 12).Run(ctx); err != nil {
+			t.Fatalf("pass %d: %v", pass, err)
+		}
+		_, ok, err := reg.GetJobScanState(ctx, ref.ScanJobAbsence, ref.ScanScopeAbsenceAdmissionFence)
+		if err != nil {
+			t.Fatalf("pass %d fence read: %v", pass, err)
+		}
+		cleared = !ok
+	}
+	if !cleared {
+		t.Fatal("fence never cleared after full recovery rotations")
+	}
+	foldedYet := false
+	for pass := 0; pass < 4 && !foldedYet; pass++ {
+		if _, err := testReconciler(t, f, true, 100).Run(ctx); err != nil {
+			t.Fatalf("post-clear pass: %v", err)
+		}
+		live, folded := nonceState()
+		foldedYet = !live || folded
+	}
+	if !foldedYet {
+		t.Fatal("deferred candidacy never folded after the fence settled")
 	}
 }
 

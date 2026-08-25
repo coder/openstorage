@@ -23,6 +23,7 @@ package ref
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -60,6 +61,15 @@ const (
 	// rotation of both registry classes.
 	ScanScopeAbsenceRenewalHealth  = "renewal-health"
 	ScanScopeAbsenceAdmissionFence = "admission-fence"
+	// ScanScopeAbsenceLapse is the durable lapse-evidence marker (Codex
+	// round 33 on PR #132): ReservePackBytes' expired-row GC records it
+	// in the same transaction whenever it deletes an expired UN-FOLDED
+	// absence-cover row — physical evidence the reconciler's
+	// first-health-stamp probe would otherwise never see, because the
+	// very writers the admission fence should block prune it first.
+	// Consumed (deleted) when the fence settles after a full recovery
+	// rotation.
+	ScanScopeAbsenceLapse = "lapse-evidence"
 	// ScanJobSweep owns the sweeper's watermarks. The destructive-reap
 	// scope's updated_at is the "last completed destructive LFS pass"
 	// watermark (issue #120): written only when a sweep ran with the LFS
@@ -68,6 +78,23 @@ const (
 	// by RetireUnreferencedLFSObject before any slot refund.
 	ScanJobSweep                = "sweep"
 	ScanScopeLFSDestructiveReap = "lfs-destructive-reap"
+	// ScanScopeLFSDestructiveReapLegacy mirrors the completion watermark
+	// but is written ONLY by legacy-armed sweeps (Codex round 33 on PR
+	// #132): a later canonical-only completion overwrites the main
+	// scope's payload, and legacy refund settlement must not lose the
+	// proof that a legacy-armed sweep completed at some epoch.
+	ScanScopeLFSDestructiveReapLegacy = "lfs-destructive-reap-legacy"
+	// ScanScopeLFSReapEpoch holds the monotone destructive-sweep epoch
+	// in its GENERATION column (Codex round 33 on PR #132): every
+	// destructive LFS sweep increments it at pass START, committed
+	// before the blob listing begins. Retirement records the epoch it
+	// ran under; a completion watermark whose epoch is STRICTLY GREATER
+	// proves a full clean sweep began after the retirement committed —
+	// the only sound "the orphan was visible to that sweep" relation
+	// (wall-clock comparison is not: PG now() is transaction-start
+	// time, and a sweep can start between a retire's now() and its
+	// commit).
+	ScanScopeLFSReapEpoch = "lfs-reap-epoch"
 )
 
 // ErrReapWatermarkStale reports that a retirement verdict refused to
@@ -78,19 +105,36 @@ const (
 // pass; nothing was written.
 var ErrReapWatermarkStale = errors.New("destructive LFS sweep watermark is stale: slot refund deferred")
 
-// ReapWatermarkLegacy is the destructive-reap watermark payload recorded
-// when the certified sweep also had the LEGACY LFS delete class armed
-// (CODESTORAGE_SWEEP_DELETE_LFS_LEGACY). Legacy-spelled registry rows may
-// only be retired under this payload (Codex round 17 on PR #132): with the
-// legacy class off, the sweeper deliberately spares legacy-spelled orphan
-// blobs, so retiring a legacy row would refund an object-cap slot for
-// bytes that are never physically reaped — repeated cycles grow storage
-// past the cap. An empty payload certifies canonical-only reaping.
-const ReapWatermarkLegacy = "legacy"
+// ReapWatermark is the destructive-reap completion watermark's JSON
+// payload. Epoch is the pass's ScanScopeLFSReapEpoch value, stamped at
+// sweep START — refund settlement requires a completion whose epoch
+// strictly exceeds a retirement's recorded epoch (Codex round 33 on PR
+// #132). Legacy certifies the sweep also had the LEGACY LFS delete class
+// armed (CODESTORAGE_SWEEP_DELETE_LFS_LEGACY): legacy-spelled registry
+// rows may only be retired, and their refunds settled, under legacy-armed
+// certification (Codex round 17) — with the legacy class off, the sweeper
+// deliberately spares legacy-spelled orphan blobs, so refunding their
+// slots would grow storage past the cap.
+type ReapWatermark struct {
+	Epoch  int64 `json:"epoch"`
+	Legacy bool  `json:"legacy,omitempty"`
+}
+
+// DecodeReapWatermark parses a completion watermark payload. Undecodable
+// payloads (never written by this binary) fail toward zero values —
+// canonical-only certification at epoch 0, which defers every settlement
+// and legacy retirement: strictly the conservative direction.
+func DecodeReapWatermark(payload string) ReapWatermark {
+	var wm ReapWatermark
+	if err := json.Unmarshal([]byte(payload), &wm); err != nil || wm.Epoch < 0 {
+		return ReapWatermark{}
+	}
+	return wm
+}
 
 // ErrLegacyReapUnarmed reports that a retirement verdict refused to retire
 // a LEGACY-SPELLED registry row because the freshest destructive-reap
-// watermark does not certify legacy reaping (see ReapWatermarkLegacy). The
+// watermark does not certify legacy reaping (see ReapWatermark). The
 // caller defers the row; it retires once a legacy-armed sweep completes.
 var ErrLegacyReapUnarmed = errors.New("legacy LFS reaping is not armed: legacy row retirement deferred")
 
@@ -99,6 +143,54 @@ var ErrLegacyReapUnarmed = errors.New("legacy LFS reaping is not armed: legacy r
 func ScanScopeReclaimRepo(base string) string {
 	assertf(base != "", "ScanScopeReclaimRepo: empty base")
 	return "repo/" + base
+}
+
+// ScanScopeReclaimRefundRoot prefixes every pending-refund bucket scope —
+// the reclaimer's rotation pages it to settle bases that vanished from
+// LFSReposWithObjects (all rows retired).
+const ScanScopeReclaimRefundRoot = "refund/"
+
+// ScanScopeReclaimRefundRotation is the reclaimer's durable cursor over
+// the refund bucket keyspace ('-' sorts below '/': the cursor row never
+// collides with the ScanScopeReclaimRefundRoot listing range).
+const ScanScopeReclaimRefundRotation = "refund-rotation"
+
+// ScanScopeReclaimRefundPrefix prefixes one base's pending-refund bucket
+// scopes (Codex round 33 on PR #132): retirement no longer refunds
+// count/usage in its own transaction — a completion watermark only proves
+// a sweep that ran BEFORE the deletion, which necessarily spared the
+// blob. Refunds park in per-epoch buckets and settle once a clean sweep
+// with a STRICTLY GREATER epoch completes.
+func ScanScopeReclaimRefundPrefix(base string) string {
+	assertf(base != "", "ScanScopeReclaimRefundPrefix: empty base")
+	return ScanScopeReclaimRefundRoot + base + "/e"
+}
+
+// ScanScopeReclaimRefund is the pending-refund bucket scope for one base
+// and retirement epoch. Zero-padded so bucket scopes list in epoch order.
+func ScanScopeReclaimRefund(base string, epoch int64) string {
+	assertf(epoch >= 0, "ScanScopeReclaimRefund: negative epoch %d", epoch)
+	return fmt.Sprintf("%s%019d", ScanScopeReclaimRefundPrefix(base), epoch)
+}
+
+// LFSRefundBucket is one pending-refund bucket's JSON payload: the
+// canonical- and legacy-spelled row counts and byte totals retired under
+// the bucket's epoch (the row's generation column). Legacy parts settle
+// only under a legacy-armed completion — canonical-only sweeps spare
+// legacy orphans.
+type LFSRefundBucket struct {
+	Rows        int64 `json:"rows,omitempty"`
+	Bytes       int64 `json:"bytes,omitempty"`
+	LegacyRows  int64 `json:"legacy_rows,omitempty"`
+	LegacyBytes int64 `json:"legacy_bytes,omitempty"`
+}
+
+// SettledLFSRefunds is one SettleLFSRefunds call's outcome.
+type SettledLFSRefunds struct {
+	Rows  int64 // object-cap slots refunded
+	Bytes int64 // usage bytes refunded
+	// Pending counts buckets left unsettled (no covering completion yet).
+	Pending int
 }
 
 // JobScanState is one durable scan-state row.
@@ -141,6 +233,23 @@ type ScanStateStore interface {
 	// no-ops. On SQLite the conditional upsert is one single-writer
 	// statement.
 	ParkRepoJobScanState(ctx context.Context, job, scope, payload string, generation int64, base string) error
+	// ListJobScanStateScopes pages one job's scopes in byte order,
+	// keyset from max(after, prefix), bounded to scopes carrying the
+	// prefix (Codex round 33 on PR #132): the seam refund-bucket and
+	// candidacy rotations page durable populations through.
+	ListJobScanStateScopes(ctx context.Context, job, prefix, after string, limit int) ([]string, error)
+	// BeginLFSReapEpoch atomically increments and returns the monotone
+	// destructive-sweep epoch (see ScanScopeLFSReapEpoch). Called at
+	// destructive LFS sweep START, before any blob listing; the write's
+	// row lock serializes against in-flight retirements' epoch reads,
+	// so every retirement recorded under an older epoch committed
+	// before this sweep's listing began.
+	BeginLFSReapEpoch(ctx context.Context) (int64, error)
+	// RecordLFSReapComplete writes the destructive-reap completion
+	// watermark (see ReapWatermark) — and, when legacy-armed, the
+	// separate legacy completion scope — after a clean destructive LFS
+	// pass.
+	RecordLFSReapComplete(ctx context.Context, epoch int64, legacyArmed bool) error
 }
 
 func (s *PG) GetJobScanState(ctx context.Context, job, scope string) (JobScanState, bool, error) {
@@ -184,6 +293,67 @@ ON CONFLICT (job, scope) DO UPDATE SET payload = EXCLUDED.payload,
                                        updated_at = now()`,
 		job, scope, payload, generation)
 	return err
+}
+
+// ListJobScanStateScopes — see ScanStateStore.
+func (s *PG) ListJobScanStateScopes(ctx context.Context, job, prefix, after string, limit int) ([]string, error) {
+	assertf(job != "" && prefix != "", "ListJobScanStateScopes(%q, %q)", job, prefix)
+	assertf(limit > 0, "ListJobScanStateScopes: non-positive limit %d", limit)
+	if after < prefix {
+		after = prefix
+	}
+	rows, err := s.pool.Query(ctx, `
+SELECT scope FROM job_scan_state
+WHERE job = $1 AND scope COLLATE "C" > $2 AND left(scope, length($3)) = $3
+ORDER BY scope COLLATE "C" ASC LIMIT $4`,
+		job, after, prefix, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list job scan state scopes %s/%s: %w", job, prefix, err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var scope string
+		if err := rows.Scan(&scope); err != nil {
+			return nil, err
+		}
+		out = append(out, scope)
+	}
+	return out, rows.Err()
+}
+
+// BeginLFSReapEpoch — see ScanStateStore.
+func (s *PG) BeginLFSReapEpoch(ctx context.Context) (int64, error) {
+	var epoch int64
+	err := s.pool.QueryRow(ctx, `
+INSERT INTO job_scan_state (job, scope, payload, generation, updated_at)
+VALUES ($1, $2, '', 1, now())
+ON CONFLICT (job, scope) DO UPDATE SET generation = job_scan_state.generation + 1,
+                                       updated_at = now()
+RETURNING generation`,
+		ScanJobSweep, ScanScopeLFSReapEpoch).Scan(&epoch)
+	if err != nil {
+		return 0, fmt.Errorf("begin lfs reap epoch: %w", err)
+	}
+	assertf(epoch > 0, "begin lfs reap epoch: non-positive epoch %d", epoch)
+	return epoch, nil
+}
+
+// RecordLFSReapComplete — see ScanStateStore.
+func (s *PG) RecordLFSReapComplete(ctx context.Context, epoch int64, legacyArmed bool) error {
+	assertf(epoch >= 0, "RecordLFSReapComplete: negative epoch %d", epoch)
+	payload, err := json.Marshal(ReapWatermark{Epoch: epoch, Legacy: legacyArmed})
+	assertf(err == nil, "RecordLFSReapComplete: marshal watermark: %v", err)
+	if err := s.PutJobScanState(ctx, ScanJobSweep, ScanScopeLFSDestructiveReap, string(payload), epoch); err != nil {
+		return err
+	}
+	if legacyArmed {
+		// Written second: a crash in between leaves only the main
+		// watermark — legacy settlement defers until the next
+		// legacy-armed completion, strictly the conservative direction.
+		return s.PutJobScanState(ctx, ScanJobSweep, ScanScopeLFSDestructiveReapLegacy, string(payload), epoch)
+	}
+	return nil
 }
 
 func (s *PG) DeleteJobScanState(ctx context.Context, job, scope string) error {

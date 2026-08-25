@@ -196,16 +196,13 @@ func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL, loopbackBaseU
 	// armed pass records it through the shared scan-state rows.
 	scanState, ok := refStore.(ref.ScanStateStore)
 	assertf(ok, "ref store %T lacks the scan-state seams", refStore)
-	sweepCfg.RecordLFSReapComplete = func(ctx context.Context, legacyArmed bool) error {
-		// The payload certifies which delete classes the recorded sweep
-		// reaped: legacy-spelled registry rows may only be retired under
-		// a legacy-armed watermark (Codex round 17 on PR #132).
-		payload := ""
-		if legacyArmed {
-			payload = ref.ReapWatermarkLegacy
-		}
-		return scanState.PutJobScanState(ctx, ref.ScanJobSweep, ref.ScanScopeLFSDestructiveReap, payload, 0)
-	}
+	// The epoch pins WHEN the certified sweep began (Codex round 33 on
+	// PR #132): retirement refunds settle only under completions with a
+	// strictly greater epoch. The payload certifies which delete classes
+	// the recorded sweep reaped: legacy-spelled registry rows may only
+	// be retired under a legacy-armed watermark (Codex round 17).
+	sweepCfg.BeginLFSReapEpoch = scanState.BeginLFSReapEpoch
+	sweepCfg.RecordLFSReapComplete = scanState.RecordLFSReapComplete
 	sweeper := jobs.NewSweeper(blobStore, refStore, sweepCfg, logger)
 	var schedule *jobs.SweepSchedule
 	var stopReconcile func()

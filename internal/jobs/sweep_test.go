@@ -802,7 +802,7 @@ func TestSweep_WatermarkWithheldOnGuardDrift(t *testing.T) {
 			}
 			return nil
 		},
-		RecordLFSReapComplete: func(context.Context, bool) error { recorded++; return nil },
+		RecordLFSReapComplete: func(context.Context, int64, bool) error { recorded++; return nil },
 	})
 	if _, err := s.Sweep(context.Background()); err == nil {
 		t.Fatal("Sweep: want the drifted guard surfaced in the error join")
@@ -817,7 +817,7 @@ func TestSweep_WatermarkWithheldOnGuardDrift(t *testing.T) {
 		Threshold:             24 * time.Hour,
 		DeleteLFS:             true,
 		DeleteGuard:           func(context.Context) error { return nil },
-		RecordLFSReapComplete: func(context.Context, bool) error { recorded++; return nil },
+		RecordLFSReapComplete: func(context.Context, int64, bool) error { recorded++; return nil },
 	})
 	if _, err := s2.Sweep(context.Background()); err != nil {
 		t.Fatalf("Sweep with steady guard: %v", err)

@@ -218,9 +218,34 @@ round 32): arming on it alone would turn every first pass under this
 feature into a multi-pass cross-tenant write outage, so the first stamp
 instead probes for a physically present un-folded cover row aged past
 the TTL and arms only on that positive evidence (or a failed probe,
-which must fail closed). Rows a writer's per-base expired-row GC pruned
-before the probe are an accepted residual: that base's admission
-re-derives its own floor.
+which must fail closed).
+
+Resolved residual (Codex round 33 on PR #132): the first-stamp probe's
+physical evidence was destructible by the very writers the fence should
+block — `ReservePackBytes` GC-deletes a base's expired reservation rows
+at admission time, expired un-folded covers included. The GC now records
+a durable lapse-evidence marker (`job_scan_state`) in the same
+transaction whenever it consumes such a row (folded nonces decay
+deliberately and are never evidence); the first stamp consults the
+marker BEFORE the physical probe, and the settlement that proves a full
+recovery rotation deletes the marker with the fence. Arming is also safe
+against its own bookkeeping failing: a pass whose durable cursor or
+fence reads error holds untrustworthy in-memory counters, so it arms
+with an unknown sentinel (`-1`) instead of snapshotting them — the next
+healthy load ignores the sentinel and re-anchors the fence at its
+freshly loaded counters, still demanding one complete clean rotation —
+and it leaves the unreadable cursor rows un-stamped, so the lifetime
+traversal counters an armed fence compares against survive the failing
+pass. A fenced pass also defers ALL legacy folding: the fold-time
+re-stat is run-to-completion and can burn the whole pass deadline on
+one large base, starving the recovery rotations whose clean-traversal
+advance is the only thing that settles the fence — and fold deferral is
+always safe (hints persist, nonces keep renewing), so recovery owns the
+entire fenced deadline. Independently, fold candidacies past the persisted cap are now
+retained deterministically and seeded-first: a carried half-proof
+survives until consumed by a fold or invalidated by a mutation, so
+out-of-phase class completions converge under sustained cap pressure
+instead of a random map walk evicting long-waiting candidacies.
 
 Resolved residual (issue #125, with #121): the original design kept the
 known-absent set and rotation cursors in process memory, making refresh

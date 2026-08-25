@@ -211,8 +211,20 @@ type SweepConfig struct {
 	// (DeleteLFSLegacy): legacy registry rows may only be retired under
 	// a legacy-armed watermark (Codex round 17 on PR #132) — an unarmed
 	// pass deliberately spares legacy orphan blobs, so its watermark
-	// must not certify their refunds.
-	RecordLFSReapComplete func(ctx context.Context, legacyArmed bool) error
+	// must not certify their refunds. epoch is the pass's
+	// BeginLFSReapEpoch value: refund settlement releases only buckets
+	// whose retirement epoch is STRICTLY below a completion's (Codex
+	// round 33 on PR #132) — a completion proves reaping only for
+	// orphans that existed when its pass STARTED.
+	RecordLFSReapComplete func(ctx context.Context, epoch int64, legacyArmed bool) error
+	// BeginLFSReapEpoch, when set alongside RecordLFSReapComplete,
+	// increments the fleet's destructive-sweep epoch at pass START,
+	// before any blob listing (Codex round 33): retirements pin the
+	// epoch they run under, and the increment's row lock serializes
+	// against in-flight retire commits. A stamp failure withholds this
+	// pass's completion watermark (refunds defer — the conservative
+	// direction) without stopping the sweep itself.
+	BeginLFSReapEpoch func(ctx context.Context) (int64, error)
 }
 
 // OrphanPack is one orphan candidate found by a sweep.
@@ -334,6 +346,22 @@ func (s *Sweeper) Sweep(ctx context.Context) (SweepReport, error) {
 			s.logger.Error("orphan pack sweep: delete guard failed; this run is list-only", "err", err)
 		}
 	}
+	// Stamp the destructive-sweep epoch BEFORE any blob listing (Codex
+	// round 33 on PR #132): retirements pin the epoch they run under,
+	// and refund settlement releases only buckets strictly below a
+	// completion's epoch — the proof that the completed pass began
+	// after those deletions. A stamp failure withholds this pass's
+	// completion watermark (refunds defer, the conservative direction)
+	// while the sweep itself proceeds.
+	reapEpoch, reapEpochOK := int64(0), false
+	if lfsMode && s.cfg.RecordLFSReapComplete != nil && s.cfg.BeginLFSReapEpoch != nil {
+		if epoch, err := s.cfg.BeginLFSReapEpoch(ctx); err != nil {
+			deleteErrs.add(fmt.Errorf("sweep: stamp reap epoch: %w", err))
+			s.logger.Error("orphan pack sweep: stamping the destructive-sweep epoch failed; this pass's completion watermark is withheld", "err", err)
+		} else {
+			reapEpoch, reapEpochOK = epoch, true
+		}
+	}
 	// Quarantine purging rides on the DELETE modes: backups only exist
 	// because some destructive pass created them, and the purge-age proof
 	// (write-once nonce keys) is class-agnostic. Purge-aware mode alone
@@ -436,8 +464,8 @@ func (s *Sweeper) Sweep(ctx context.Context) (SweepReport, error) {
 			s.logger.Error("orphan pack sweep: destructive precondition drifted during the pass; withholding the reap watermark", "err", err)
 		}
 	}
-	if lfsMode && deleteErrs.ok() && s.cfg.RecordLFSReapComplete != nil {
-		if err := s.cfg.RecordLFSReapComplete(ctx, legacyMode); err != nil {
+	if lfsMode && deleteErrs.ok() && s.cfg.RecordLFSReapComplete != nil && (reapEpochOK || s.cfg.BeginLFSReapEpoch == nil) {
+		if err := s.cfg.RecordLFSReapComplete(ctx, reapEpoch, legacyMode); err != nil {
 			deleteErrs.add(fmt.Errorf("sweep: record lfs reap watermark: %w", err))
 			s.logger.Error("orphan pack sweep: recording the destructive LFS reap watermark failed; reclamation slot refunds will defer once it stales", "err", err)
 		}

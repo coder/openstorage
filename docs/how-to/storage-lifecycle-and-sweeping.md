@@ -396,9 +396,13 @@ naming its OID. Every
    [`CODESTORAGE_LFS_GC_DELETE_ENABLED`](../reference/configuration.md#codestorage_lfs_gc_delete_enabled) —
    retires rows whose stamp survived a full
    [`CODESTORAGE_LFS_GC_GRACE`](../reference/configuration.md#codestorage_lfs_gc_grace)
-   window, refunding the object count and quota bytes in the same
-   transaction. A previously `507`-wedged repository accepts new objects
-   again the moment enough junk rows retire.
+   window. The freed object count and quota bytes are refunded
+   separately: each retirement parks its refund durably, and a later run
+   settles it once a destructive LFS sweep that **started after** the
+   retirement completes cleanly — only then is the orphaned blob provably
+   reaped. A previously `507`-wedged repository accepts new objects again
+   once enough junk rows retire and a covering sweep settles their
+   refunds.
 
 Retirement is defended in depth: the delete re-checks the stamp and the
 pinned ref generations inside the same lock registrations take, and every
@@ -432,7 +436,16 @@ Two operational notes:
   freeze refunds automatically until a clean destructive pass completes;
   the sweep emergency stop (`CODESTORAGE_SWEEP_INTERVAL=0`) is just the
   planned instance of the same demotion. A fresh deployment stays
-  report-only until its first clean destructive LFS sweep completes.
+  report-only until its first clean destructive LFS sweep completes. The
+  same observed coupling gates each refund individually: a completion
+  watermark only proves a sweep that listed blobs *before* a given
+  retirement — that sweep saw the registry row and spared the blob — so
+  every retirement records the monotone sweep epoch it ran under and its
+  refund waits in a durable per-epoch bucket until a destructive pass
+  with a strictly greater epoch completes cleanly (legacy-spelled rows
+  additionally wait for a legacy-armed completion). Run reports surface
+  the flow as `refund_rows_settled` / `refund_bytes_settled` /
+  `refund_buckets_pending`.
 - **Hydration and walks are deadline-bounded.** Scanning a repository first
   materializes its git cache (downloading and indexing registered packs on a
   cold replica). Each namespace member's hydration AND its reachability walk

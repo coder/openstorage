@@ -36,9 +36,24 @@ grace window to push. Retirement itself runs in the GuardedLFSDelete guard
 class (#61): under the base-ledger lock it re-checks the purge fence, the
 namespace group's pinned ref generations (`FOR UPDATE`, so a concurrent
 push's deferred generation bump serializes against the verdict), and the
-stamp's age, then deletes the row, decrements `lfs_object_counts`, refunds
-`pack_usage`, and bumps the adoption generation atomically — the ADR-41
-twin-refund discipline, which is what unwedges a `507`'d repository. The
+stamp's age, then deletes the row. The count and byte refund is DEFERRED
+(Codex round 33 on PR #132): a fresh completion watermark only certifies a
+sweep that listed blobs BEFORE this deletion — that sweep saw the registry
+row and spared the blob — so refunding in the verdict would hand back
+capacity the bytes still occupy. The verdict instead parks the refund in a
+durable per-epoch bucket (`job_scan_state`), keyed by the monotone
+destructive-sweep epoch it pinned under the same lock (every destructive
+pass increments the epoch at START, before its blob listing), and a later
+reclamation pass settles it — decrementing `lfs_object_counts`, refunding
+`pack_usage`, and bumping the adoption generation atomically, the ADR-41
+twin-refund discipline that unwedges a `507`'d repository — only once a
+destructive sweep with a STRICTLY greater epoch (one that provably began
+after the deletion committed) completes cleanly. Legacy-spelled parts
+settle only under a legacy-armed completion, which keeps its own scope so
+a later canonical-only pass cannot erase the proof; bases that vanish from
+the work queue (every row retired) settle through a dedicated durable
+rotation over the bucket keyspace, and a repository purge drops its
+buckets with the rest of the ledger. The
 accepted residual: on Postgres, a raw-git pointer push (no batch handshake)
 whose commit began after the generation recheck locked the rows can land
 after the verdict commits; the window is microseconds, requires referencing

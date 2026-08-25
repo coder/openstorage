@@ -294,6 +294,9 @@ type AbsenceReconciler struct {
 	// coverTTL-passTimeout no longer proves the touched covers are
 	// still alive.
 	cursorStaleAge time.Duration
+	// proofCap is the effective fold-candidacy cap (absenceProofCap in
+	// production; shrinkable in tests).
+	proofCap int
 	// renewalSafeAge bounds how old the renewal-health watermark may be
 	// for a renewal FAILURE to stay provably harmless: coverTTL minus
 	// the scheduling interval minus the pass wall clock, so covers
@@ -364,6 +367,13 @@ type AbsenceReconciler struct {
 	// security): a class re-statted dirty by the pre-rotation fold must
 	// not be re-statted again by the post-rotation one.
 	foldAttempted map[string]bool
+	// lfsLoaded/packsLoaded/fenceLoaded record whether loadState READ
+	// each durable row successfully this pass (absent rows load fine as
+	// zero values; only read ERRORS clear them, Codex round 33): arming
+	// the fence while a load failed must not snapshot in-memory zeros —
+	// the next healthy pass would reload large clean counters and
+	// settle immediately without any recovery rotation.
+	lfsLoaded, packsLoaded, fenceLoaded bool
 	// fenceArmed mirrors the durable admission-fence marker (Codex
 	// round 26, security; see ref.ScanScopeAbsenceAdmissionFence):
 	// while armed, finite quota-gated admissions fail closed because
@@ -561,6 +571,7 @@ func NewAbsenceReconciler(registry AbsenceRegistry, blobs BlobStatter, quotaEnfo
 		passTimeout:    passTimeout,
 		cursorStaleAge: staleAge,
 		renewalSafeAge: renewalSafeAge,
+		proofCap:       absenceProofCap,
 	}
 }
 
@@ -604,13 +615,16 @@ func (r *AbsenceReconciler) loadState(ctx context.Context, errs *boundedErrs) {
 	r.verifyPool = r.budget
 	r.foldAttempted = make(map[string]bool)
 	r.touchFailed = false
+	r.lfsLoaded, r.packsLoaded, r.fenceLoaded = true, true, true
 	for _, c := range []struct {
-		scope string
-		into  *absenceCursorState
-	}{{ref.ScanScopeAbsenceLFS, &r.lfs}, {ref.ScanScopeAbsencePacks, &r.packs}} {
+		scope  string
+		into   *absenceCursorState
+		loaded *bool
+	}{{ref.ScanScopeAbsenceLFS, &r.lfs, &r.lfsLoaded}, {ref.ScanScopeAbsencePacks, &r.packs, &r.packsLoaded}} {
 		st, ok, err := r.registry.GetJobScanState(ctx, ref.ScanJobAbsence, c.scope)
 		if err != nil {
 			errs.add(fmt.Errorf("absence reconcile: read %s cursor: %w", c.scope, err))
+			*c.loaded = false
 			continue
 		}
 		if !ok {
@@ -702,12 +716,24 @@ func (r *AbsenceReconciler) loadState(ctx context.Context, errs *boundedErrs) {
 	r.fenceArmed, r.fenceLFS, r.fencePacks = false, 0, 0
 	if st, ok, err := r.registry.GetJobScanState(ctx, ref.ScanJobAbsence, ref.ScanScopeAbsenceAdmissionFence); err != nil {
 		errs.add(fmt.Errorf("absence reconcile: read admission fence: %w", err))
+		r.fenceLoaded = false
 	} else if ok {
 		r.fenceArmed = true
 		r.fenceLFS, r.fencePacks = r.lfs.CleanTraversals, r.packs.CleanTraversals
 		var snap map[string]int64
 		if err := json.Unmarshal([]byte(st.Payload), &snap); err == nil {
-			r.fenceLFS, r.fencePacks = snap["lfs"], snap["packs"]
+			// Accept only a complete non-negative snapshot (Codex round
+			// 33): a fence armed while cursor reads were failing wrote
+			// the UNKNOWN sentinel (-1), and missing keys decode as
+			// zero — both would let stale-but-large reloaded counters
+			// settle instantly. The default above re-anchors at the
+			// counters just loaded: release requires a fresh clean
+			// rotation from here, strictly the conservative direction.
+			lfs, lok := snap["lfs"]
+			packs, pok := snap["packs"]
+			if lok && pok && lfs >= 0 && packs >= 0 {
+				r.fenceLFS, r.fencePacks = lfs, packs
+			}
 		}
 	}
 	r.loadProofs(ctx, errs)
@@ -799,9 +825,23 @@ func (r *AbsenceReconciler) saveState(ctx context.Context, errs *boundedErrs) {
 		r.logger.Warn("absence reconcile: bulk renewal failed; rotation cursors not re-stamped")
 	} else {
 		for _, c := range []struct {
-			scope string
-			from  *absenceCursorState
-		}{{ref.ScanScopeAbsenceLFS, &r.lfs}, {ref.ScanScopeAbsencePacks, &r.packs}} {
+			scope  string
+			from   *absenceCursorState
+			loaded bool
+		}{{ref.ScanScopeAbsenceLFS, &r.lfs, r.lfsLoaded}, {ref.ScanScopeAbsencePacks, &r.packs, r.packsLoaded}} {
+			if !c.loaded {
+				// The load ERROR left this class's in-memory state at
+				// zero values (Codex round 33): stamping it would
+				// destroy the durable lifetime traversal counters an
+				// armed fence's snapshot is compared against —
+				// re-blocking admissions for as many extra rotations as
+				// the job ever completed. Leave the old row aging: this
+				// pass's segment was an idempotent re-examination, and
+				// repeated failures trip the stale-age reset, which
+				// preserves the counters.
+				r.logger.Warn("absence reconcile: cursor unreadable this pass; not re-stamped", "scope", c.scope)
+				continue
+			}
 			c.from.Quota = r.quotaEnforced // see absenceCursorState.Quota
 			// Snapshot the fence WITH the park (Codex round 20): read
 			// after every generation bump this pass made, so only a
@@ -869,8 +909,26 @@ func (r *AbsenceReconciler) saveProofs(sctx context.Context, errs *boundedErrs) 
 			bases[base] = true
 		}
 	}
-	keep := make(map[string]map[string]absenceProofEntry)
+	// Deterministic seeded-first retention past the cap (Codex round 33,
+	// P2): a previously seeded candidacy survives until consumed or
+	// invalidated — every fold frees a slot, so waiting fresh bases
+	// eventually seed — and fresh candidacies fill the remainder in byte
+	// order. An unordered map walk gave no such guarantee: a base's
+	// half-proof could be evicted before its counterpart rotation
+	// completed, bulk-renewing its legacy nonce forever.
+	seededBases := make([]string, 0, len(bases))
+	freshBases := make([]string, 0, len(bases))
 	for base := range bases {
+		if len(r.proofGens[base]) > 0 {
+			seededBases = append(seededBases, base)
+		} else {
+			freshBases = append(freshBases, base)
+		}
+	}
+	sort.Strings(seededBases)
+	sort.Strings(freshBases)
+	keep := make(map[string]map[string]absenceProofEntry)
+	for _, base := range append(seededBases, freshBases...) {
 		carried := make([]string, 0, 2)
 		for _, class := range []string{absenceClassLFS, absenceClassPacks} {
 			if _, seeded := r.proofGens[base][class]; seeded || r.cleanBases[class][base] {
@@ -880,9 +938,11 @@ func (r *AbsenceReconciler) saveProofs(sctx context.Context, errs *boundedErrs) 
 		if len(carried) == 0 {
 			continue // nothing to carry
 		}
-		if len(keep) >= absenceProofCap {
-			r.logger.Warn("absence reconcile: candidacy cap exceeded; excess entries dropped",
-				"cap", absenceProofCap)
+		if len(keep) >= r.proofCap {
+			// Deterministic order makes the first overflow final: every
+			// later base sorts past the cap too.
+			r.logger.Warn("absence reconcile: candidacy cap exceeded; excess FRESH entries deferred to later rotations",
+				"cap", r.proofCap)
 			break
 		}
 		gen, err := r.rangeFence(sctx, base)
@@ -953,15 +1013,33 @@ func (r *AbsenceReconciler) armAdmissionFence(ctx context.Context, errs *bounded
 func (r *AbsenceReconciler) armFence(ctx context.Context, errs *boundedErrs, why string) bool {
 	sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), scanStateWriteTimeout)
 	defer cancel()
-	snap, mErr := json.Marshal(map[string]int64{"lfs": r.lfs.CleanTraversals, "packs": r.packs.CleanTraversals})
+	lfsSnap, packsSnap := r.lfs.CleanTraversals, r.packs.CleanTraversals
+	switch {
+	case !r.lfsLoaded || !r.packsLoaded || !r.fenceLoaded:
+		// A failed cursor or fence-row read left the in-memory counters
+		// untrustworthy (Codex round 33, P1): snapshotting them — or
+		// overwriting an unreadable existing snapshot — could LOWER the
+		// baseline and let the next healthy pass settle instantly. Arm
+		// with the UNKNOWN sentinel instead; the next successful load
+		// re-anchors at its freshly loaded counters. Settlement this
+		// pass is impossible regardless: the failed read already made
+		// errs non-ok, which settleAdmissionFence requires.
+		assertf(!errs.ok(), "armFence: unknown snapshot without a recorded load error")
+		lfsSnap, packsSnap = -1, -1
+	case r.fenceArmed:
+		// Never lower an existing snapshot: re-arming only extends the
+		// required recovery rotation.
+		lfsSnap, packsSnap = max(lfsSnap, r.fenceLFS), max(packsSnap, r.fencePacks)
+	}
+	snap, mErr := json.Marshal(map[string]int64{"lfs": lfsSnap, "packs": packsSnap})
 	assertf(mErr == nil, "absence reconcile: marshal fence snapshot: %v", mErr)
 	if err := r.registry.PutJobScanState(sctx, ref.ScanJobAbsence, ref.ScanScopeAbsenceAdmissionFence, string(snap), 0); err != nil {
 		errs.add(fmt.Errorf("absence reconcile: arm admission fence: %w", err))
 		return false
 	}
-	r.fenceArmed, r.fenceLFS, r.fencePacks = true, r.lfs.CleanTraversals, r.packs.CleanTraversals
+	r.fenceArmed, r.fenceLFS, r.fencePacks = true, lfsSnap, packsSnap
 	r.logger.Warn("absence reconcile: "+why+" — finite quota admissions fenced until a complete recovery rotation",
-		"lfs_clean_traversals", r.fenceLFS, "packs_clean_traversals", r.fencePacks)
+		"lfs_clean_traversals", lfsSnap, "packs_clean_traversals", packsSnap)
 	return true
 }
 
@@ -988,6 +1066,13 @@ func (r *AbsenceReconciler) settleAdmissionFence(ctx context.Context, errs *boun
 	if err := r.registry.DeleteJobScanState(sctx, ref.ScanJobAbsence, ref.ScanScopeAbsenceAdmissionFence); err != nil {
 		errs.add(fmt.Errorf("absence reconcile: clear admission fence: %w", err))
 		return
+	}
+	// The recovery rotation consumed the lapse evidence too (Codex round
+	// 33): every loss the GC'd covers compensated was rediscovered and
+	// re-covered. A failed delete only leaves the marker for the next
+	// settle — first-stamp arming never fires again once health exists.
+	if err := r.registry.DeleteJobScanState(sctx, ref.ScanJobAbsence, ref.ScanScopeAbsenceLapse); err != nil {
+		errs.add(fmt.Errorf("absence reconcile: clear lapse-evidence marker: %w", err))
 	}
 	r.fenceArmed = false
 	r.logger.Info("absence reconcile: recovery rotation complete — admission fence cleared")
@@ -1051,7 +1136,18 @@ func (r *AbsenceReconciler) Run(ctx context.Context) (AbsenceReport, error) {
 	// running it after the rotations would let them consume the pass
 	// deadline every pass, starving a large base's re-stat forever.
 	// Same-pass fresh completions fold in the second invocation below.
-	r.foldRedundantLegacy(ctx, &report, st, &errs)
+	// EXCEPT while the admission fence is armed (Codex round 33,
+	// security): the run-to-completion re-stat can burn the whole pass
+	// deadline on one large base, and a rotation that never gets the
+	// clock never advances the CLEAN traversal counters the fence's
+	// settlement gates on — a fleet-global denial of finite quota-gated
+	// writes that outlives the pass. Folding is strictly a retirement
+	// deferral (hints persist seeded-first, nonces keep renewing), so
+	// fenced passes give recovery the entire deadline and fold again
+	// once the fence settles.
+	if !r.fenceArmed {
+		r.foldRedundantLegacy(ctx, &report, st, &errs)
+	}
 	half := remaining - remaining/2
 	if r.passes%2 == 0 {
 		charged := r.lfsPhase(ctx, half, &report, st, &errs)
@@ -1063,8 +1159,13 @@ func (r *AbsenceReconciler) Run(ctx context.Context) (AbsenceReport, error) {
 	// Retire legacy nonce covers whose base both rotations' proofs
 	// completed THIS pass (Codex rounds 19-20) — after the phases, so
 	// every proof is in. (Second invocation: the pass-level attempted
-	// memo keeps the two from re-statting the same class twice.)
-	r.foldRedundantLegacy(ctx, &report, st, &errs)
+	// memo keeps the two from re-statting the same class twice.) Fenced
+	// passes skip this one too (round 33): its hint re-stats would burn
+	// deadline a fenced pass owes to nothing but recovery, and a fence
+	// armed mid-pass by renewCovers must not fold on the way out either.
+	if !r.fenceArmed {
+		r.foldRedundantLegacy(ctx, &report, st, &errs)
+	}
 	r.passes++
 	r.saveState(ctx, &errs)
 	r.settleAdmissionFence(ctx, &errs)
@@ -1182,8 +1283,24 @@ func (r *AbsenceReconciler) renewCovers(ctx context.Context, budget int64, repor
 		case ok && age >= r.cursorStaleAge:
 			arm, why = true, "renewal continuity unprovable at a successful touch — covers may have lapsed while no pass was stamping"
 		case !ok:
-			lapsed, pErr := r.registry.LapsedAbsenceCoverExists(ctx, r.coverTTL)
+			// The physical probe alone is insufficient (Codex round 33,
+			// P1): ReservePackBytes GC-deletes a base's expired
+			// reservation rows at admission time — the very writers the
+			// fence should block destroy the evidence first. The GC now
+			// records a durable lapse-evidence marker in the same
+			// transaction whenever it deletes an expired un-folded
+			// cover row; consult it BEFORE the physical probe.
+			_, marked, mErr := r.registry.GetJobScanState(ctx, ref.ScanJobAbsence, ref.ScanScopeAbsenceLapse)
+			lapsed, pErr := false, error(nil)
+			if mErr == nil && !marked {
+				lapsed, pErr = r.registry.LapsedAbsenceCoverExists(ctx, r.coverTTL)
+			}
 			switch {
+			case mErr != nil:
+				errs.add(fmt.Errorf("absence reconcile: read lapse-evidence marker: %w", mErr))
+				arm, why = true, "lapse evidence unreadable at the first health stamp"
+			case marked:
+				arm, why = true, "admission GC recorded expired covers — protection lapsed before this watermark regime began"
 			case pErr != nil:
 				errs.add(fmt.Errorf("absence reconcile: probe lapsed covers: %w", pErr))
 				arm, why = true, "lapse evidence unreadable at the first health stamp"

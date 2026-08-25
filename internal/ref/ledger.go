@@ -541,10 +541,28 @@ func (s *PG) ReservePackBytes(ctx context.Context, group []string, packs []Pack,
 		// base repo's expired rows inside the serialized admission
 		// transaction bounds the repo's PHYSICAL row population at the
 		// active-row cap plus one TTL of churn, with no sweeper required.
+		// Deleting an expired UN-FOLDED absence-cover row destroys the
+		// physical lapse evidence the reconciler's first-health-stamp
+		// probe arms on (Codex round 33 on PR #132) — the CTE records
+		// the durable lapse-evidence marker in the same statement, so
+		// the evidence survives its own consumption. Folded rows decay
+		// deliberately and are never evidence.
 		if _, err := tx.Exec(ctx, `
-DELETE FROM pack_reservations WHERE repo = $1 AND created_at <= now() - make_interval(secs => $2)
-  AND key NOT LIKE '%/adopt-claim'`,
-			group[0], ttl.Seconds()); err != nil {
+WITH doomed AS (
+  DELETE FROM pack_reservations WHERE repo = $1 AND created_at <= now() - make_interval(secs => $2)
+    AND key NOT LIKE '%/adopt-claim'
+  RETURNING key, owner
+)
+INSERT INTO job_scan_state (job, scope, payload, generation, updated_at)
+SELECT $3, $4, key, 0, now() FROM doomed
+WHERE key COLLATE "C" > $5 AND key COLLATE "C" < $6
+  AND right(key, $7) = $8 AND owner <> $9
+LIMIT 1
+ON CONFLICT (job, scope) DO UPDATE SET payload = EXCLUDED.payload, updated_at = now()`,
+			group[0], ttl.Seconds(),
+			ScanJobAbsence, ScanScopeAbsenceLapse,
+			AbsenceCoverPrefix, absenceCoverRangeEnd,
+			len(absenceCoverRawSuffix), absenceCoverRawSuffix, AbsenceFoldedOwner); err != nil {
 			return err
 		}
 		// ONE statement = one snapshot: a concurrent registration moves a

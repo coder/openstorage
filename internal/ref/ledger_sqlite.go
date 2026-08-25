@@ -49,6 +49,24 @@ func (s *SQLite) ReservePackBytes(ctx context.Context, group []string, packs []P
 		}
 	}
 	// Self-healing GC for expired rows — see the PG twin's rationale.
+	// Record the lapse-evidence marker BEFORE the delete consumes the
+	// physical evidence (Codex round 33 on PR #132); the IMMEDIATE
+	// transaction makes the pair atomic.
+	if _, err := tx.ExecContext(ctx, `
+INSERT INTO job_scan_state (job, scope, payload, generation, updated_at)
+SELECT ?, ?, key, 0, `+sqliteEpochMS+` FROM pack_reservations
+WHERE repo = ? AND created_at <= `+sqliteEpochMS+` - ?
+  AND key > ? AND key < ?
+  AND substr(key, -?) = ?
+  AND owner <> ?
+LIMIT 1
+ON CONFLICT (job, scope) DO UPDATE SET payload = excluded.payload, updated_at = `+sqliteEpochMS+``,
+		ScanJobAbsence, ScanScopeAbsenceLapse,
+		group[0], ttl.Milliseconds(),
+		AbsenceCoverPrefix, absenceCoverRangeEnd,
+		len(absenceCoverRawSuffix), absenceCoverRawSuffix, AbsenceFoldedOwner); err != nil {
+		return ReserveDecision{}, fmt.Errorf("reserve pack bytes lapse marker: %w", err)
+	}
 	if _, err := tx.ExecContext(ctx,
 		`DELETE FROM pack_reservations WHERE repo = ? AND created_at <= `+sqliteEpochMS+` - ?
   AND key NOT LIKE '%/adopt-claim'`,

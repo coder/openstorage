@@ -7,6 +7,7 @@ package ref
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -58,6 +59,66 @@ ON CONFLICT (job, scope) DO UPDATE SET payload = excluded.payload,
                                        updated_at = excluded.updated_at`,
 		job, scope, payload, generation)
 	return err
+}
+
+// ListJobScanStateScopes — see ScanStateStore. SQLite TEXT compares by
+// byte order natively.
+func (s *SQLite) ListJobScanStateScopes(ctx context.Context, job, prefix, after string, limit int) ([]string, error) {
+	assertf(job != "" && prefix != "", "ListJobScanStateScopes(%q, %q)", job, prefix)
+	assertf(limit > 0, "ListJobScanStateScopes: non-positive limit %d", limit)
+	if after < prefix {
+		after = prefix
+	}
+	rows, err := s.db.QueryContext(ctx, `
+SELECT scope FROM job_scan_state
+WHERE job = ? AND scope > ? AND substr(scope, 1, length(?)) = ?
+ORDER BY scope ASC LIMIT ?`,
+		job, after, prefix, prefix, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list job scan state scopes %s/%s: %w", job, prefix, err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var scope string
+		if err := rows.Scan(&scope); err != nil {
+			return nil, err
+		}
+		out = append(out, scope)
+	}
+	return out, rows.Err()
+}
+
+// BeginLFSReapEpoch — see ScanStateStore. Single-writer statements make
+// the increment atomic; retirements' epoch reads serialize behind it.
+func (s *SQLite) BeginLFSReapEpoch(ctx context.Context) (int64, error) {
+	var epoch int64
+	err := s.db.QueryRowContext(ctx, `
+INSERT INTO job_scan_state (job, scope, payload, generation, updated_at)
+VALUES (?, ?, '', 1, `+sqliteEpochMS+`)
+ON CONFLICT (job, scope) DO UPDATE SET generation = job_scan_state.generation + 1,
+                                       updated_at = `+sqliteEpochMS+`
+RETURNING generation`,
+		ScanJobSweep, ScanScopeLFSReapEpoch).Scan(&epoch)
+	if err != nil {
+		return 0, fmt.Errorf("begin lfs reap epoch: %w", err)
+	}
+	assertf(epoch > 0, "begin lfs reap epoch: non-positive epoch %d", epoch)
+	return epoch, nil
+}
+
+// RecordLFSReapComplete — see the PG twin.
+func (s *SQLite) RecordLFSReapComplete(ctx context.Context, epoch int64, legacyArmed bool) error {
+	assertf(epoch >= 0, "RecordLFSReapComplete: negative epoch %d", epoch)
+	payload, err := json.Marshal(ReapWatermark{Epoch: epoch, Legacy: legacyArmed})
+	assertf(err == nil, "RecordLFSReapComplete: marshal watermark: %v", err)
+	if err := s.PutJobScanState(ctx, ScanJobSweep, ScanScopeLFSDestructiveReap, string(payload), epoch); err != nil {
+		return err
+	}
+	if legacyArmed {
+		return s.PutJobScanState(ctx, ScanJobSweep, ScanScopeLFSDestructiveReapLegacy, string(payload), epoch)
+	}
+	return nil
 }
 
 func (s *SQLite) DeleteJobScanState(ctx context.Context, job, scope string) error {

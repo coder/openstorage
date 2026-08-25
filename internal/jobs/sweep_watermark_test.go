@@ -24,13 +24,8 @@ func wireReapRecorder(t *testing.T, f *sweepFixture, cfg SweepConfig) SweepConfi
 	if !ok {
 		t.Fatalf("store %T lacks the scan-state seams", f.store)
 	}
-	cfg.RecordLFSReapComplete = func(ctx context.Context, legacyArmed bool) error {
-		payload := ""
-		if legacyArmed {
-			payload = ref.ReapWatermarkLegacy
-		}
-		return scanState.PutJobScanState(ctx, ref.ScanJobSweep, ref.ScanScopeLFSDestructiveReap, payload, 0)
-	}
+	cfg.BeginLFSReapEpoch = scanState.BeginLFSReapEpoch
+	cfg.RecordLFSReapComplete = scanState.RecordLFSReapComplete
 	return cfg
 }
 
@@ -87,16 +82,16 @@ func TestSweepReapWatermark_LegacyArming(t *testing.T) {
 	if _, err := f.sweeper(cfg).Sweep(context.Background()); err != nil {
 		t.Fatalf("Sweep: %v", err)
 	}
-	if st, ok := reapWatermark(t, f); !ok || st.Payload != ref.ReapWatermarkLegacy {
-		t.Fatalf("watermark after legacy-armed pass = (%+v, %v), want the legacy payload", st, ok)
+	if st, ok := reapWatermark(t, f); !ok || !ref.DecodeReapWatermark(st.Payload).Legacy {
+		t.Fatalf("watermark after legacy-armed pass = (%+v, %v), want legacy-armed payload", st, ok)
 	}
 
 	cfg = wireReapRecorder(t, f, SweepConfig{Threshold: 24 * time.Hour, DeleteLFS: true})
 	if _, err := f.sweeper(cfg).Sweep(context.Background()); err != nil {
 		t.Fatalf("Sweep: %v", err)
 	}
-	if st, ok := reapWatermark(t, f); !ok || st.Payload != "" {
-		t.Fatalf("watermark after unarmed pass = (%+v, %v), want the canonical-only payload", st, ok)
+	if st, ok := reapWatermark(t, f); !ok || ref.DecodeReapWatermark(st.Payload).Legacy {
+		t.Fatalf("watermark after unarmed pass = (%+v, %v), want canonical-only payload", st, ok)
 	}
 }
 
@@ -158,7 +153,7 @@ func TestSweepReapWatermark_NotRecordedOnDeleteFailure(t *testing.T) {
 func TestSweepReapWatermark_RecorderFailureReported(t *testing.T) {
 	f := newSweepFixture(t)
 	cfg := SweepConfig{Threshold: 24 * time.Hour, DeleteLFS: true}
-	cfg.RecordLFSReapComplete = func(context.Context, bool) error {
+	cfg.RecordLFSReapComplete = func(context.Context, int64, bool) error {
 		return fmt.Errorf("scan-state write refused")
 	}
 	if _, err := f.sweeper(cfg).Sweep(context.Background()); err == nil || !strings.Contains(err.Error(), "record lfs reap watermark") {

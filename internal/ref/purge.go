@@ -202,6 +202,17 @@ func (s *PG) PurgeRepoLedger(ctx context.Context, group []string) (int64, error)
 			return err
 		}
 		total += ct.RowsAffected()
+		// Pending refund buckets die with the ledger too (Codex round
+		// 33): the counter rows they would have decremented are dropped
+		// wholesale above, so a surviving bucket would decrement a
+		// resurrected-name counter it never charged.
+		ct, err = tx.Exec(ctx,
+			`DELETE FROM job_scan_state WHERE job = $1 AND left(scope, length($2)) = $2`,
+			ScanJobLFSReclaim, ScanScopeReclaimRefundPrefix(purgeBaseOf(group)))
+		if err != nil {
+			return err
+		}
+		total += ct.RowsAffected()
 		return nil
 	})
 	if err != nil {

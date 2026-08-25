@@ -9,6 +9,7 @@ package ref
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
@@ -17,6 +18,11 @@ import (
 
 	"github.com/jackc/pgx/v5"
 )
+
+// lfsRefundBucketPage bounds one settlement's bucket listing: the
+// population is bases-with-pending-refunds × sweep epochs between
+// settlements, drained every reclaimer pass.
+const lfsRefundBucketPage = 1024
 
 // LFSObjectRow is one registered LFS object as the reclamation scan sees it:
 // the row key (canonical or v0.2.0 legacy spelling), its counted bytes, and
@@ -149,8 +155,13 @@ func (s *PG) ClearLFSObjectsUnreferenced(ctx context.Context, repo string, keys 
 }
 
 // RetireUnreferencedLFSObject deletes one registered LFS object row whose
-// reclamation mark has survived a full grace window, refunding its object
-// count and usage bytes — the issue #73 GC verdict. It is the same guard
+// reclamation mark has survived a full grace window — the issue #73 GC
+// verdict. The object-count and usage-byte refund is DEFERRED (Codex
+// round 33 on PR #132): it parks in a per-epoch refund bucket and settles
+// through SettleLFSRefunds only after a destructive sweep whose epoch
+// strictly exceeds this verdict's — a sweep that provably listed blobs
+// after this deletion, so the orphan was reaped (or the key re-registered
+// with fresh accounting) before the capacity is handed back. It is the same guard
 // class as GuardedLFSDelete: the whole verdict runs under the base-ledger
 // lock RegisterLFSObject serializes on, and the delete predicate re-checks
 // the mark IN the transaction, so an object re-uploaded or touched mid-scan
@@ -207,8 +218,26 @@ SELECT payload FROM job_scan_state
 		// A legacy-spelled row's blob is only reaped by legacy-armed
 		// sweeps (Codex round 17 on PR #132): the fresh watermark must
 		// certify that class or the refund is unbacked.
-		if reapPayload != ReapWatermarkLegacy && !strings.Contains(key, "/o2/") {
+		legacyRow := !strings.Contains(key, "/o2/")
+		if legacyRow && !DecodeReapWatermark(reapPayload).Legacy {
 			return ErrLegacyReapUnarmed
+		}
+		// Pin the destructive-sweep epoch this retirement runs under
+		// (Codex round 33 on PR #132): FOR SHARE lets concurrent
+		// retirements read together while forcing BeginLFSReapEpoch's
+		// increment to wait for in-flight retire commits — so a sweep
+		// with a strictly greater epoch provably listed blobs AFTER
+		// this row's deletion became visible, the relation refund
+		// settlement gates on. Absent row (no destructive sweep ever
+		// started) pins epoch 0; the first completion carries epoch ≥ 1.
+		var reapEpoch int64
+		switch err := tx.QueryRow(ctx, `
+SELECT generation FROM job_scan_state WHERE job = $1 AND scope = $2 FOR SHARE`,
+			ScanJobSweep, ScanScopeLFSReapEpoch).Scan(&reapEpoch); {
+		case errors.Is(err, pgx.ErrNoRows):
+			reapEpoch = 0
+		case err != nil:
+			return err
 		}
 		// A purge-fenced repo's rows belong to the purge pipeline
 		// (issue #52): it drops them wholesale with the counter row.
@@ -269,21 +298,44 @@ RETURNING bytes`, repo, key, grace.Seconds()).Scan(&bytes); {
 		case err != nil:
 			return err
 		}
-		// Refund count and bytes and bump the adoption generation
-		// atomically with the delete, mirroring the ADR-41 twin refund:
-		// a floor cached while the row's bytes were counted must be
-		// rejected once the counter shrinks.
-		if _, err := tx.Exec(ctx,
-			`UPDATE lfs_object_counts SET count = GREATEST(count - 1, 0) WHERE repo = $1`, repo); err != nil {
+		// Park the refund in the epoch bucket instead of refunding here
+		// (Codex round 33 on PR #132): the fresh completion watermark
+		// only proves a sweep that ran BEFORE this deletion — it saw
+		// the registry row and spared the blob, so an immediate refund
+		// hands back capacity while the bytes still exist physically.
+		// The count and usage stay charged until SettleLFSRefunds
+		// observes a completion with a STRICTLY GREATER epoch. The
+		// read-modify-write is serialized by the base-ledger lock every
+		// bucket writer holds.
+		scope := ScanScopeReclaimRefund(repo, reapEpoch)
+		var bucket LFSRefundBucket
+		var payload string
+		switch err := tx.QueryRow(ctx,
+			`SELECT payload FROM job_scan_state WHERE job = $1 AND scope = $2`,
+			ScanJobLFSReclaim, scope).Scan(&payload); {
+		case errors.Is(err, pgx.ErrNoRows):
+		case err != nil:
 			return err
+		default:
+			if err := json.Unmarshal([]byte(payload), &bucket); err != nil {
+				// Undecodable bucket (never written by this binary):
+				// fail the verdict rather than silently dropping or
+				// double-counting pending refunds.
+				return fmt.Errorf("undecodable refund bucket %s: %w", scope, err)
+			}
 		}
-		if _, err := tx.Exec(ctx,
-			`UPDATE pack_usage SET bytes = GREATEST(bytes - $2, 0) WHERE repo = $1`, repo, bytes); err != nil {
-			return err
+		if legacyRow {
+			bucket.LegacyRows, bucket.LegacyBytes = bucket.LegacyRows+1, bucket.LegacyBytes+bytes
+		} else {
+			bucket.Rows, bucket.Bytes = bucket.Rows+1, bucket.Bytes+bytes
 		}
+		merged, mErr := json.Marshal(bucket)
+		assertf(mErr == nil, "retire lfs object: marshal refund bucket: %v", mErr)
 		if _, err := tx.Exec(ctx, `
-INSERT INTO lfs_adoption_gens (repo, gen) VALUES ($1, 1)
-ON CONFLICT (repo) DO UPDATE SET gen = lfs_adoption_gens.gen + 1`, repo); err != nil {
+INSERT INTO job_scan_state (job, scope, payload, generation, updated_at)
+VALUES ($1, $2, $3, $4, now())
+ON CONFLICT (job, scope) DO UPDATE SET payload = EXCLUDED.payload, updated_at = now()`,
+			ScanJobLFSReclaim, scope, string(merged), reapEpoch); err != nil {
 			return err
 		}
 		retired = true
@@ -293,6 +345,134 @@ ON CONFLICT (repo) DO UPDATE SET gen = lfs_adoption_gens.gen + 1`, repo); err !=
 		return false, fmt.Errorf("retire lfs object %s: %w", key, err)
 	}
 	return retired, nil
+}
+
+// SettleLFSRefunds refunds this base's pending retirement buckets that a
+// completed destructive sweep now covers (Codex round 33 on PR #132): a
+// bucket's canonical part settles under any completion whose epoch
+// strictly exceeds the bucket's, its legacy part only under a
+// legacy-armed completion's epoch (canonical-only sweeps spare legacy
+// orphans). The count/usage decrements and the adoption-generation bump
+// (floor-cache invalidation, the ADR-41 refund pattern) run atomically
+// with the bucket rewrite under the base-ledger lock. Purge-fenced repos
+// settle nothing: the purge drops the whole ledger, buckets included.
+func (s *PG) SettleLFSRefunds(ctx context.Context, repo string) (SettledLFSRefunds, error) {
+	assertf(repo != "", "SettleLFSRefunds: empty repo")
+	var out SettledLFSRefunds
+	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		out = SettledLFSRefunds{}
+		if err := lockBaseLedger(ctx, tx, repo); err != nil {
+			return err
+		}
+		if fenced, err := repoPurgeFencedPG(ctx, tx, repo); err != nil || fenced {
+			return err
+		}
+		epochFor := func(scope string) (int64, error) {
+			var payload string
+			switch err := tx.QueryRow(ctx,
+				`SELECT payload FROM job_scan_state WHERE job = $1 AND scope = $2`,
+				ScanJobSweep, scope).Scan(&payload); {
+			case errors.Is(err, pgx.ErrNoRows):
+				return 0, nil
+			case err != nil:
+				return 0, err
+			}
+			return DecodeReapWatermark(payload).Epoch, nil
+		}
+		canonEpoch, err := epochFor(ScanScopeLFSDestructiveReap)
+		if err != nil {
+			return err
+		}
+		legacyEpoch, err := epochFor(ScanScopeLFSDestructiveReapLegacy)
+		if err != nil {
+			return err
+		}
+		prefix := ScanScopeReclaimRefundPrefix(repo)
+		type bucketRow struct {
+			scope   string
+			payload string
+			epoch   int64
+		}
+		var buckets []bucketRow
+		rows, err := tx.Query(ctx, `
+SELECT scope, payload, generation FROM job_scan_state
+WHERE job = $1 AND left(scope, length($2)) = $2
+ORDER BY scope COLLATE "C" ASC LIMIT $3`,
+			ScanJobLFSReclaim, prefix, lfsRefundBucketPage)
+		if err != nil {
+			return err
+		}
+		for rows.Next() {
+			var b bucketRow
+			if err := rows.Scan(&b.scope, &b.payload, &b.epoch); err != nil {
+				rows.Close()
+				return err
+			}
+			buckets = append(buckets, b)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		var refundRows, refundBytes int64
+		for _, b := range buckets {
+			var bucket LFSRefundBucket
+			if err := json.Unmarshal([]byte(b.payload), &bucket); err != nil {
+				return fmt.Errorf("undecodable refund bucket %s: %w", b.scope, err)
+			}
+			settled := false
+			if b.epoch < canonEpoch && (bucket.Rows > 0 || bucket.Bytes > 0) {
+				refundRows, refundBytes = refundRows+bucket.Rows, refundBytes+bucket.Bytes
+				bucket.Rows, bucket.Bytes = 0, 0
+				settled = true
+			}
+			if b.epoch < legacyEpoch && (bucket.LegacyRows > 0 || bucket.LegacyBytes > 0) {
+				refundRows, refundBytes = refundRows+bucket.LegacyRows, refundBytes+bucket.LegacyBytes
+				bucket.LegacyRows, bucket.LegacyBytes = 0, 0
+				settled = true
+			}
+			switch {
+			case bucket == (LFSRefundBucket{}):
+				if _, err := tx.Exec(ctx,
+					`DELETE FROM job_scan_state WHERE job = $1 AND scope = $2`,
+					ScanJobLFSReclaim, b.scope); err != nil {
+					return err
+				}
+			case settled:
+				merged, mErr := json.Marshal(bucket)
+				assertf(mErr == nil, "settle lfs refunds: marshal bucket: %v", mErr)
+				if _, err := tx.Exec(ctx,
+					`UPDATE job_scan_state SET payload = $3, updated_at = now() WHERE job = $1 AND scope = $2`,
+					ScanJobLFSReclaim, b.scope, string(merged)); err != nil {
+					return err
+				}
+				out.Pending++
+			default:
+				out.Pending++
+			}
+		}
+		if refundRows > 0 || refundBytes > 0 {
+			if _, err := tx.Exec(ctx,
+				`UPDATE lfs_object_counts SET count = GREATEST(count - $2, 0) WHERE repo = $1`, repo, refundRows); err != nil {
+				return err
+			}
+			if _, err := tx.Exec(ctx,
+				`UPDATE pack_usage SET bytes = GREATEST(bytes - $2, 0) WHERE repo = $1`, repo, refundBytes); err != nil {
+				return err
+			}
+			if _, err := tx.Exec(ctx, `
+INSERT INTO lfs_adoption_gens (repo, gen) VALUES ($1, 1)
+ON CONFLICT (repo) DO UPDATE SET gen = lfs_adoption_gens.gen + 1`, repo); err != nil {
+				return err
+			}
+		}
+		out.Rows, out.Bytes = refundRows, refundBytes
+		return nil
+	})
+	if err != nil {
+		return SettledLFSRefunds{}, fmt.Errorf("settle lfs refunds %s: %w", repo, err)
+	}
+	return out, nil
 }
 
 // TouchLFSObject — see RefStore.

@@ -92,8 +92,23 @@ func seedReapWatermark(t *testing.T, reg LFSReclaimRegistry) {
 	// Legacy-armed payload: the scan fixtures model a fully-armed fleet
 	// (testReclaimer passes legacyDelete=true) so rows of BOTH key
 	// spellings retire; the legacy-unarmed regime has its own test.
-	if err := reg.PutJobScanState(context.Background(), ref.ScanJobSweep, ref.ScanScopeLFSDestructiveReap, ref.ReapWatermarkLegacy, 0); err != nil {
-		t.Fatalf("seed reap watermark: %v", err)
+	// A real begin/complete pair: retirements pin the epoch row, and a
+	// completion fabricated without its begin would spuriously cover
+	// them (Codex round 33).
+	simulateCoveringSweep(t, reg, true)
+}
+
+// simulateCoveringSweep advances the destructive-sweep epoch and records a
+// clean completion at it — the covering pair that lets SettleLFSRefunds
+// release buckets parked under earlier epochs (Codex round 33).
+func simulateCoveringSweep(t *testing.T, reg LFSReclaimRegistry, legacy bool) {
+	t.Helper()
+	epoch, err := reg.BeginLFSReapEpoch(context.Background())
+	if err != nil {
+		t.Fatalf("begin reap epoch: %v", err)
+	}
+	if err := reg.RecordLFSReapComplete(context.Background(), epoch, legacy); err != nil {
+		t.Fatalf("record reap completion: %v", err)
 	}
 }
 
@@ -185,18 +200,32 @@ func TestLFSReclaim_EndToEnd(t *testing.T) {
 			t.Fatalf("junk row %s survived", key)
 		}
 	}
-	if n, _ := store.CountLFSObjects(ctx, base); n != 1 {
-		t.Fatalf("count after pass 2 = %d, want 1", n)
+	// Refunds are DEFERRED past retirement (Codex round 33): the count
+	// converges only after a destructive sweep that STARTED after the
+	// retirement completes and the next pass settles the buckets.
+	if n, _ := store.CountLFSObjects(ctx, base); n != 3 {
+		t.Fatalf("count after pass 2 = %d, want still 3 (deferred refunds)", n)
 	}
-	// The repo leaves the work queue once nothing junk remains? No — one
-	// registered object remains, so it stays queued; a third pass is a
-	// no-op.
+	// Pass 2's settle attempt ran at visit start, BEFORE its own
+	// retirements parked buckets: nothing settled.
+	if rep.RefundRowsSettled != 0 {
+		t.Fatalf("pass 2 refunds = %+v, want none settled", rep)
+	}
+	simulateCoveringSweep(t, reg, true)
+	// Pass 3 settles the covered buckets at the repo visit; the
+	// referenced row keeps the repo queued; retirement stays steady.
 	rep, err = r.Run(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if rep.RowsRetired != 0 || rep.RowsReferenced != 1 {
 		t.Fatalf("pass 3 = %+v, want steady state", rep)
+	}
+	if rep.RefundRowsSettled != 2 || rep.RefundBytesSettled != 200 || rep.RefundBucketsPending != 0 {
+		t.Fatalf("pass 3 refunds = %+v, want both rows settled", rep)
+	}
+	if n, _ := store.CountLFSObjects(ctx, base); n != 1 {
+		t.Fatalf("count after settlement = %d, want 1", n)
 	}
 }
 
@@ -782,7 +811,7 @@ func TestLFSReclaim_LegacyRowsDeferredWhenUnarmed(t *testing.T) {
 	}
 
 	// Watermark half unarmed: same deferral with the config flag on.
-	if err := reg.PutJobScanState(ctx, ref.ScanJobSweep, ref.ScanScopeLFSDestructiveReap, "", 0); err != nil {
+	if err := reg.RecordLFSReapComplete(ctx, 1, false); err != nil {
 		t.Fatal(err)
 	}
 	if rep := run(true); rep.RowsDeferredLegacyUnarmed != 1 || rep.RowsRetired != 0 {

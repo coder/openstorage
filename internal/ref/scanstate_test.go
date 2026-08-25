@@ -404,7 +404,7 @@ func TestRetireUnreferencedLFSObject_ReapWatermarkGate(t *testing.T) {
 		}
 
 		// A stale watermark (older than the bound) refuses identically.
-		if err := rs.PutJobScanState(ctx, ScanJobSweep, ScanScopeLFSDestructiveReap, "", 0); err != nil {
+		if err := rs.RecordLFSReapComplete(ctx, 1, false); err != nil {
 			t.Fatal(err)
 		}
 		time.Sleep(1100 * time.Millisecond) // cross SQLite's second stamp
@@ -413,7 +413,7 @@ func TestRetireUnreferencedLFSObject_ReapWatermarkGate(t *testing.T) {
 		}
 
 		// Fresh watermark within the bound: the verdict commits.
-		if err := rs.PutJobScanState(ctx, ScanJobSweep, ScanScopeLFSDestructiveReap, "", 0); err != nil {
+		if err := rs.RecordLFSReapComplete(ctx, 1, false); err != nil {
 			t.Fatal(err)
 		}
 		if retired, err := rs.RetireUnreferencedLFSObject(ctx, k.base(), key, gens, 0, time.Hour); err != nil || !retired {
@@ -434,7 +434,7 @@ func TestRetireUnreferencedLFSObject_LegacyReapGate(t *testing.T) {
 		rs := reclaimStore(t, s)
 		ctx := context.Background()
 		// A fresh watermark whose payload records a legacy-UNARMED sweep.
-		if err := rs.PutJobScanState(ctx, ScanJobSweep, ScanScopeLFSDestructiveReap, "", 0); err != nil {
+		if err := rs.RecordLFSReapComplete(ctx, 1, false); err != nil {
 			t.Fatal(err)
 		}
 		k := newLedgerKit(t, s)
@@ -463,7 +463,7 @@ func TestRetireUnreferencedLFSObject_LegacyReapGate(t *testing.T) {
 		}
 
 		// Legacy-armed payload: the same legacy verdict commits.
-		if err := rs.PutJobScanState(ctx, ScanJobSweep, ScanScopeLFSDestructiveReap, ReapWatermarkLegacy, 0); err != nil {
+		if err := rs.RecordLFSReapComplete(ctx, 1, true); err != nil {
 			t.Fatal(err)
 		}
 		if retired, err := rs.RetireUnreferencedLFSObject(ctx, k.base(), legacy, gens, 0, time.Hour); err != nil || !retired {
@@ -580,6 +580,90 @@ func TestReservePackBytes_RenewalDegradedFence(t *testing.T) {
 		}
 		if dec := k.reserve([]Pack{k.pack(k.base(), "p4", 10)}, NewReservationOwner(), 0, 1_000); !dec.OK {
 			t.Fatalf("post-clear reserve = %+v, want admitted", dec)
+		}
+	})
+}
+
+// TestReservePackBytes_GCRecordsLapseEvidence (Codex round 33 on PR #132,
+// P1): ReservePackBytes' self-healing GC prunes a base's expired
+// reservation rows at admission time — the very writers the admission
+// fence should block would destroy the physical lapse evidence the
+// reconciler's first-health-stamp probe arms on. Consuming an expired
+// UN-FOLDED absence-cover row must record the durable lapse-evidence
+// marker in the same transaction; folded nonces (deliberate decay) and
+// foreign spellings under the prefix are never evidence.
+func TestReservePackBytes_GCRecordsLapseEvidence(t *testing.T) {
+	runRefBackends(t, func(t *testing.T, s Store) {
+		ss := scanStateStore(t, s)
+		cs := coverStore(t, s)
+		ctx := context.Background()
+		k := newLedgerKit(t, s)
+		base := k.base()
+		// The marker scope is fleet-global: clear leftovers from sibling
+		// tests sharing the pg database.
+		if err := ss.DeleteJobScanState(ctx, ScanJobAbsence, ScanScopeAbsenceLapse); err != nil {
+			t.Fatal(err)
+		}
+
+		// Expired FOREIGN spelling and FOLDED cover: pruned silently.
+		foreign := AbsenceCoverPrefix + base + "/zz-foreign"
+		if dec, err := s.ReservePackBytes(ctx, k.group, []Pack{{Key: foreign, Size: 5}}, NewReservationOwner(), 0, ReserveNoFloorGen, 1<<40, time.Hour); err != nil || !dec.OK {
+			t.Fatalf("plant foreign row: (%+v, %v)", dec, err)
+		}
+		foldKey := AbsenceCoverPrefix + base + "/0123456789abcdef0123"
+		if err := ReserveRestoreCover(ctx, s, k.group, foldKey, 30, time.Hour); err != nil {
+			t.Fatalf("plant folded cover: %v", err)
+		}
+		// List (the row surface carrying Owner) and fold OUR nonce; the
+		// listing is fleet-global on the shared pg lane, so filter by key.
+		folded := false
+		for after := ""; !folded; {
+			listed, err := cs.ListAbsenceCovers(ctx, after, 100, time.Hour)
+			if err != nil || len(listed) == 0 {
+				t.Fatalf("listing for fold = (%+v, %v), want our nonce", listed, err)
+			}
+			for _, row := range listed {
+				if row.Key != foldKey {
+					continue
+				}
+				if ok, err := cs.CASAbsenceCoverOwner(ctx, row.RawKey, row.Owner, row.Bytes, AbsenceFoldedOwner); err != nil || !ok {
+					t.Fatalf("fold = (%v, %v)", ok, err)
+				}
+				folded = true
+			}
+			after = listed[len(listed)-1].RawKey
+		}
+		// A nanosecond TTL expires every existing row: the GC prunes
+		// both, and neither is lapse evidence.
+		if dec, err := s.ReservePackBytes(ctx, k.group, []Pack{k.pack(base, "g1", 1)}, NewReservationOwner(), 0, ReserveNoFloorGen, 1<<40, time.Nanosecond); err != nil || !dec.OK {
+			t.Fatalf("gc reserve 1: (%+v, %v)", dec, err)
+		}
+		if _, ok, err := ss.GetJobScanState(ctx, ScanJobAbsence, ScanScopeAbsenceLapse); err != nil || ok {
+			t.Fatalf("marker after folded/foreign GC = (ok=%v, %v), want absent", ok, err)
+		}
+
+		// An expired UN-FOLDED cover: the GC that consumes it must
+		// record the marker atomically, payload = the doomed raw key.
+		coverKey := AbsenceCoverPrefix + base + "/lfs-e0000000000000000001"
+		if err := ReserveRestoreCover(ctx, s, k.group, coverKey, 40, time.Hour); err != nil {
+			t.Fatalf("plant un-folded cover: %v", err)
+		}
+		if dec, err := s.ReservePackBytes(ctx, k.group, []Pack{k.pack(base, "g2", 1)}, NewReservationOwner(), 0, ReserveNoFloorGen, 1<<40, time.Nanosecond); err != nil || !dec.OK {
+			t.Fatalf("gc reserve 2: (%+v, %v)", dec, err)
+		}
+		if _, ok, err := cs.AbsenceCoverHead(ctx, coverKey, time.Hour); err != nil || ok {
+			t.Fatalf("cover after GC = (ok=%v, %v), want pruned", ok, err)
+		}
+		st, ok, err := ss.GetJobScanState(ctx, ScanJobAbsence, ScanScopeAbsenceLapse)
+		if err != nil || !ok {
+			t.Fatalf("marker after un-folded GC = (ok=%v, %v), want present", ok, err)
+		}
+		if !strings.HasPrefix(st.Payload, coverKey) {
+			t.Fatalf("marker payload = %q, want the consumed cover's raw key", st.Payload)
+		}
+		// Hygiene for the shared lane.
+		if err := ss.DeleteJobScanState(ctx, ScanJobAbsence, ScanScopeAbsenceLapse); err != nil {
+			t.Fatal(err)
 		}
 	})
 }
