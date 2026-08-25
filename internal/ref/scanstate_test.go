@@ -5,6 +5,7 @@ package ref
 import (
 	"context"
 	"errors"
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -452,6 +453,41 @@ func TestParkRepoJobScanState_PurgeFence(t *testing.T) {
 		}
 		if _, ok, err := ss.GetJobScanState(ctx, ScanJobLFSReclaim, scope); err != nil || ok {
 			t.Fatalf("cursor after fenced park = (ok=%v, %v), want absent", ok, err)
+		}
+	})
+}
+
+// TestReservePackBytes_RenewalDegradedFence (Codex round 26 on PR #132,
+// security): while the absence reconciler's admission-fence marker is
+// present, finite quota-gated admissions fail closed with the distinct
+// RenewalDegraded verdict — TTL'd covers may have lapsed un-renewed and
+// the strict-TTL reservation SUM under-counts them — while unbounded
+// internal reservations (restores, covers) proceed so recovery can
+// re-cover. Clearing the marker restores admission.
+func TestReservePackBytes_RenewalDegradedFence(t *testing.T) {
+	runRefBackends(t, func(t *testing.T, s Store) {
+		ss := scanStateStore(t, s)
+		ctx := context.Background()
+		k := newLedgerKit(t, s)
+
+		if dec := k.reserve([]Pack{k.pack(k.base(), "p1", 10)}, NewReservationOwner(), 0, 1_000); !dec.OK {
+			t.Fatalf("unfenced reserve = %+v, want admitted", dec)
+		}
+		if err := ss.PutJobScanState(ctx, ScanJobAbsence, ScanScopeAbsenceAdmissionFence, "{}", 0); err != nil {
+			t.Fatal(err)
+		}
+		dec := k.reserve([]Pack{k.pack(k.base(), "p2", 10)}, NewReservationOwner(), 0, 1_000)
+		if dec.OK || !dec.RenewalDegraded {
+			t.Fatalf("fenced finite reserve = %+v, want RenewalDegraded denial", dec)
+		}
+		if dec := k.reserve([]Pack{k.pack(k.base(), "p3", 10)}, NewReservationOwner(), 0, math.MaxInt64); !dec.OK || dec.RenewalDegraded {
+			t.Fatalf("fenced unbounded reserve = %+v, want exempt", dec)
+		}
+		if err := ss.DeleteJobScanState(ctx, ScanJobAbsence, ScanScopeAbsenceAdmissionFence); err != nil {
+			t.Fatal(err)
+		}
+		if dec := k.reserve([]Pack{k.pack(k.base(), "p4", 10)}, NewReservationOwner(), 0, 1_000); !dec.OK {
+			t.Fatalf("post-clear reserve = %+v, want admitted", dec)
 		}
 	})
 }

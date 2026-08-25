@@ -1068,6 +1068,89 @@ func TestAbsenceReconcile_HintFoldPrecedesRotations(t *testing.T) {
 	}
 }
 
+// TestAbsenceReconcile_RenewalBlipDoesNotFenceAdmission (Codex round 26,
+// security): a renewal failure while the health watermark is FRESH
+// cannot have let any cover lapse — every live cover carries a full TTL
+// from the last successful renewal — so the admission fence must stay
+// unarmed and quota-gated writes unaffected.
+func TestAbsenceReconcile_RenewalBlipDoesNotFenceAdmission(t *testing.T) {
+	f := newSweepFixture(t)
+	ctx := context.Background()
+	reg := absenceRegistry(t, f)
+	if err := reg.PutJobScanState(ctx, ref.ScanJobAbsence, ref.ScanScopeAbsenceRenewalHealth, "", 0); err != nil {
+		t.Fatal(err)
+	}
+	ft := &failTouchRegistry{AbsenceRegistry: reg, fail: true}
+	r := NewAbsenceReconciler(ft, f.blobs, true, 100, time.Hour, slog.New(slog.DiscardHandler))
+	if _, err := r.Run(ctx); err == nil {
+		t.Fatal("Run: want the injected renewal failure reported")
+	}
+	if _, ok, err := reg.GetJobScanState(ctx, ref.ScanJobAbsence, ref.ScanScopeAbsenceAdmissionFence); err != nil || ok {
+		t.Fatalf("fence after fresh-watermark blip = (ok=%v, %v), want unarmed", ok, err)
+	}
+}
+
+// TestAbsenceReconcile_StaleRenewalFailureFencesAdmission (Codex round
+// 26, security): a renewal failure with NO health watermark (or a stale
+// one) may let TTL'd covers lapse un-renewed — strict-TTL admission
+// arithmetic would silently under-count them, reopening the quota
+// headroom they compensate. The fence arms durably, fails finite
+// quota-gated admissions closed while unbounded internal reservations
+// proceed, and clears only after a healthy pass completes a full
+// recovery rotation of both classes.
+func TestAbsenceReconcile_StaleRenewalFailureFencesAdmission(t *testing.T) {
+	f := newSweepFixture(t)
+	ctx := context.Background()
+	reg := absenceRegistry(t, f)
+	base := "repo-fence"
+	key := blob.LFSKey(base, absenceOID('a'))
+	registerLFS(t, f, base, key, 10)
+	f.upload(key, strings.Repeat("x", 10))
+
+	ft := &failTouchRegistry{AbsenceRegistry: reg, fail: true}
+	rec := NewAbsenceReconciler(ft, f.blobs, true, 100, time.Hour, slog.New(slog.DiscardHandler))
+	if _, err := rec.Run(ctx); err == nil {
+		t.Fatal("Run 1: want the injected renewal failure reported")
+	}
+	if _, ok, err := reg.GetJobScanState(ctx, ref.ScanJobAbsence, ref.ScanScopeAbsenceAdmissionFence); err != nil || !ok {
+		t.Fatalf("fence after unproven-freshness failure = (ok=%v, %v), want armed", ok, err)
+	}
+
+	// Finite quota-gated admission fails closed with the distinct
+	// verdict; unbounded internal reservations (restores, covers) are
+	// exempt so recovery itself can proceed.
+	res, ok := f.store.(ref.RestoreCoverStore)
+	if !ok {
+		t.Fatalf("store %T lacks ReservePackBytes", f.store)
+	}
+	dec, err := res.ReservePackBytes(ctx, blob.QuotaRepoGroup(base),
+		[]ref.Pack{{Key: blob.PackKey(base, "p1"), Size: 10}}, ref.NewReservationOwner(),
+		0, ref.ReserveNoFloorGen, 1000, time.Hour)
+	if err != nil || dec.OK || !dec.RenewalDegraded {
+		t.Fatalf("fenced finite reserve = (%+v, %v), want RenewalDegraded denial", dec, err)
+	}
+	if err := ref.ReserveRestoreCover(ctx, reg, blob.QuotaRepoGroup(base), key, 5, time.Hour); err != nil {
+		t.Fatalf("unbounded reserve under fence: %v", err)
+	}
+
+	// A healthy pass completes a full rotation of both classes (tiny
+	// keyspace: one wrap per pass) and clears the fence.
+	pinLFSLeader(t, f)
+	rec2 := testReconciler(t, f, true, 100)
+	if _, err := rec2.Run(ctx); err != nil {
+		t.Fatalf("recovery pass: %v", err)
+	}
+	if _, ok, err := reg.GetJobScanState(ctx, ref.ScanJobAbsence, ref.ScanScopeAbsenceAdmissionFence); err != nil || ok {
+		t.Fatalf("fence after recovery rotation = (ok=%v, %v), want cleared", ok, err)
+	}
+	dec, err = res.ReservePackBytes(ctx, blob.QuotaRepoGroup(base),
+		[]ref.Pack{{Key: blob.PackKey(base, "p2"), Size: 10}}, ref.NewReservationOwner(),
+		0, ref.ReserveNoFloorGen, 1000, time.Hour)
+	if err != nil || !dec.OK || dec.RenewalDegraded {
+		t.Fatalf("post-recovery finite reserve = (%+v, %v), want admitted", dec, err)
+	}
+}
+
 // TestAbsenceReconcile_GapMutationDefersLegacyRetirement (Codex rounds
 // 19-20): a foreign mutation landing while the cursor is parked mid-range
 // breaks fence continuity — the resumed completion must NOT prove the

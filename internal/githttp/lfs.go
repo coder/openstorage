@@ -819,6 +819,11 @@ var errLFSContentMismatch = errors.New("stored LFS object does not match its con
 // answer 429 + Retry-After.
 var errLFSBusy = errors.New("concurrent LFS operation in progress")
 
+// errLFSQuotaDegraded fails quota-gated LFS writes closed while the
+// absence reconciler's cover renewal is degraded (Codex round 26 on
+// PR #132, security): transient — the client retries after recovery.
+var errLFSQuotaDegraded = errors.New("storage quota accounting temporarily degraded, retry later")
+
 // errLFSCompatQuotaExceeded is the v0.2.0 bridge copy's quota denial
 // (Codex security round 84): the bridge doubles a fresh upload's physical
 // bytes for the roll's duration, and at the quota edge the copy is DENIED
@@ -2042,6 +2047,9 @@ func (s *Server) publishVerifiedLFSObject(ctx context.Context, repoID, key, lega
 			if dec.KeyCapExceeded {
 				return fmt.Errorf("adoption admission %s: %w", key, errLFSBusy)
 			}
+			if dec.RenewalDegraded {
+				return fmt.Errorf("adoption admission %s: %w", key, errLFSQuotaDegraded)
+			}
 			if !dec.OK {
 				return fmt.Errorf("adopt %s: %w (copy adds %d bytes to %d stored, +%d reserved, quota %d)",
 					key, errLFSAdoptQuotaExceeded, size, dec.UsedBytes, dec.ReservedBytes, s.PackQuotaBytes)
@@ -3192,6 +3200,14 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target r
 				"too many in-flight uploads reserved for this repository, retry later")
 			return
 		}
+		if dec.RenewalDegraded {
+			// Fail-closed while quota accounting is degraded (Codex
+			// round 26 on PR #132, security): transient, retry.
+			w.Header().Set("Retry-After", "60")
+			lfsError(w, http.StatusServiceUnavailable,
+				"storage quota accounting temporarily degraded, retry later")
+			return
+		}
 		if !dec.OK {
 			lfsError(w, http.StatusInsufficientStorage, fmt.Sprintf(
 				"repository storage quota exceeded: upload adds %d bytes to %d bytes stored (+%d bytes reserved by in-flight uploads), quota is %d bytes",
@@ -3630,6 +3646,9 @@ func (s *Server) maybeLegacyCompatCopy(ctx context.Context, repoID, oid, key str
 			}
 			if dec.KeyCapExceeded {
 				return fmt.Errorf("compat admission %s: %w", legacyKey, errLFSBusy)
+			}
+			if dec.RenewalDegraded {
+				return fmt.Errorf("compat admission %s: %w", legacyKey, errLFSQuotaDegraded)
 			}
 			if !dec.OK {
 				return fmt.Errorf("compat copy %s: %w (bridge adds %d bytes to %d stored, +%d reserved, quota %d)",

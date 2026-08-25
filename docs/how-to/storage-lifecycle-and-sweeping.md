@@ -564,7 +564,15 @@ cursors (budget-limited, resumable — the sweeper's inverse direction) and
   cannot delay a renewal past the cover TTL, and the unique periodic job
   serializes passes fleet-wide. Startup enforces the cadence-vs-TTL
   coupling (interval ≤ TTL/2, pass wall clock ≤ TTL/4), so renewals always
-  land before live covers can lapse.
+  land before live covers can lapse. Renewal is additionally guarded by a
+  fail-closed admission fence: each successful renewal stamps a
+  database-clock health watermark, and a renewal FAILURE that finds the
+  watermark absent or stale (covers could lapse before the next pass)
+  fences finite quota-gated writes — pushes, LFS uploads, adoptions
+  answer a transient "quota accounting temporarily degraded, retry
+  later" — until a healthy pass completes one full recovery rotation of
+  both registries; internal restore and cover reservations stay exempt
+  so recovery can proceed.
 - **Absent pack rows registered before this feature** carry no recorded
   size (`pack_rows_unsized`): the loss is reported but cannot be charged
   until a repack fold rewrites the row with its size.

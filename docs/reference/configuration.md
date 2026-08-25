@@ -844,6 +844,16 @@ integrity loss logged loudly: committed refs may reference it). See the
   enforcement disabled
   ([`CODESTORAGE_PACK_QUOTA_BYTES=0`](#codestorage_pack_quota_bytes)) it
   detects and reports without charging anything.
+- **Degraded-renewal admission fence** (quota enforcement on): every
+  successful pass stamps a renewal-health watermark. If a pass's cover
+  renewal FAILS while that watermark is absent or older than the
+  cover-lapse safety bound, covers may lapse un-renewed and quota
+  arithmetic would silently under-count them — the job then fails finite
+  quota-gated writes closed (pushes, LFS uploads, adoptions answer
+  "quota accounting temporarily degraded, retry later") until a healthy
+  pass completes one full recovery rotation of both registries.
+  Transient renewal blips within the safety bound never fence; internal
+  restore/cover reservations are always exempt so recovery can proceed.
 
 ### `CODESTORAGE_ABSENCE_RECONCILE_BUDGET`
 

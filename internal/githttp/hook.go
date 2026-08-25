@@ -376,6 +376,11 @@ func preReceive(ctx context.Context) error {
 				// whose arithmetic may even show the push fits.
 				return fmt.Errorf("pre-receive: too many in-flight uploads reserved for this repository, retry later")
 			}
+			if dec.RenewalDegraded {
+				// Fail-closed while quota accounting is degraded (Codex
+				// round 26 on PR #132, security): transient, retry.
+				return fmt.Errorf("pre-receive: storage quota accounting temporarily degraded, retry later")
+			}
 			if !dec.OK {
 				return fmt.Errorf("pre-receive: repository pack quota exceeded: push adds %d bytes to %d bytes stored (+%d bytes reserved by in-flight pushes), quota is %d bytes",
 					ref.IncomingBytes(unpublished), dec.UsedBytes, dec.ReservedBytes, quota)

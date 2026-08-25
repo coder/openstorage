@@ -346,6 +346,16 @@ type AbsenceReconciler struct {
 	// security): a class re-statted dirty by the pre-rotation fold must
 	// not be re-statted again by the post-rotation one.
 	foldAttempted map[string]bool
+	// fenceArmed mirrors the durable admission-fence marker (Codex
+	// round 26, security; see ref.ScanScopeAbsenceAdmissionFence):
+	// while armed, finite quota-gated admissions fail closed because
+	// TTL'd covers may have lapsed un-renewed. fenceLFS/fencePacks are
+	// the marker's PERSISTED traversal snapshot at arming: the fence
+	// clears only after a healthy error-free pass advances BOTH class
+	// traversals past it — one complete recovery rotation re-covering
+	// every registered-but-missing byte the lapse may have uncovered.
+	fenceArmed           bool
+	fenceLFS, fencePacks int64
 	// touchFailed records that this pass's bulk cover renewal FAILED:
 	// the rotation cursors must not be re-stamped by saveState (Codex
 	// round 19, P1) — a cursor row's DB-clock freshness is the loadState
@@ -625,6 +635,22 @@ func (r *AbsenceReconciler) loadState(ctx context.Context, errs *boundedErrs) {
 	} else if ok {
 		r.renewCursor, r.passes = st.Payload, st.Generation
 	}
+	// Mirror the durable admission-fence marker (Codex round 26,
+	// security): its payload is the traversal snapshot at arming. An
+	// unreadable or undecodable snapshot re-anchors at the CURRENT
+	// persisted counters — requiring a fresh full rotation from here,
+	// strictly the conservative direction.
+	r.fenceArmed, r.fenceLFS, r.fencePacks = false, 0, 0
+	if st, ok, err := r.registry.GetJobScanState(ctx, ref.ScanJobAbsence, ref.ScanScopeAbsenceAdmissionFence); err != nil {
+		errs.add(fmt.Errorf("absence reconcile: read admission fence: %w", err))
+	} else if ok {
+		r.fenceArmed = true
+		r.fenceLFS, r.fencePacks = r.lfs.Traversals, r.packs.Traversals
+		var snap map[string]int64
+		if err := json.Unmarshal([]byte(st.Payload), &snap); err == nil {
+			r.fenceLFS, r.fencePacks = snap["lfs"], snap["packs"]
+		}
+	}
 	r.loadProofs(ctx, errs)
 }
 
@@ -822,6 +848,69 @@ func (r *AbsenceReconciler) saveProofs(sctx context.Context, errs *boundedErrs) 
 	}
 }
 
+// armAdmissionFence writes the durable admission-fence marker when a
+// bulk-renewal failure can no longer be proven harmless (Codex round 26,
+// security): if the renewal-health watermark is absent or older than the
+// cover-lapse safety bound (cursorStaleAge = coverTTL - passTimeout),
+// live covers may lapse un-renewed before the next successful pass, and
+// strict-TTL admission queries would silently under-count them —
+// reopening the exact quota headroom the covers exist to close. The
+// marker fails finite quota-gated admissions closed (see
+// ReserveDecision.RenewalDegraded) until settleAdmissionFence proves a
+// complete recovery rotation. Its payload snapshots the PERSISTED class
+// traversal counters — frozen during failing passes because saveState
+// suppresses cursor stamps — so wraps completed while renewal was still
+// failing can never count as recovery. Writes run on a bounded detached
+// context: the failure being reacted to may already have burned the pass
+// deadline. An unreadable watermark age arms too — the failure evidence
+// at hand outranks an unprovable freshness claim.
+func (r *AbsenceReconciler) armAdmissionFence(ctx context.Context, errs *boundedErrs) {
+	if !r.quotaEnforced {
+		return
+	}
+	sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), scanStateWriteTimeout)
+	defer cancel()
+	age, ok, err := r.registry.JobScanStateAge(sctx, ref.ScanJobAbsence, ref.ScanScopeAbsenceRenewalHealth)
+	if err != nil {
+		errs.add(fmt.Errorf("absence reconcile: read renewal health: %w", err))
+	} else if ok && age <= r.cursorStaleAge {
+		return // renewed recently: no cover can lapse before the next pass
+	}
+	snap, mErr := json.Marshal(map[string]int64{"lfs": r.lfs.Traversals, "packs": r.packs.Traversals})
+	assertf(mErr == nil, "absence reconcile: marshal fence snapshot: %v", mErr)
+	if err := r.registry.PutJobScanState(sctx, ref.ScanJobAbsence, ref.ScanScopeAbsenceAdmissionFence, string(snap), 0); err != nil {
+		errs.add(fmt.Errorf("absence reconcile: arm admission fence: %w", err))
+		return
+	}
+	r.fenceArmed, r.fenceLFS, r.fencePacks = true, r.lfs.Traversals, r.packs.Traversals
+	r.logger.Warn("absence reconcile: cover renewal degraded past the lapse safety bound — finite quota admissions fenced until a complete recovery rotation",
+		"lfs_traversals", r.fenceLFS, "packs_traversals", r.fencePacks)
+}
+
+// settleAdmissionFence clears the admission fence after one healthy,
+// error-free pass has advanced BOTH persisted class traversal counters
+// past the marker's arming snapshot: a full origin-to-origin rotation of
+// each registry re-covered every registered-but-missing byte the lapse
+// may have uncovered (dirty ranges charge deficits as they go), so
+// strict-TTL admission arithmetic is trustworthy again. Runs after
+// saveState so the compared counters are the durably stamped ones.
+func (r *AbsenceReconciler) settleAdmissionFence(ctx context.Context, errs *boundedErrs) {
+	if !r.fenceArmed || !r.quotaEnforced || r.touchFailed || !errs.ok() {
+		return
+	}
+	if r.lfs.Traversals <= r.fenceLFS || r.packs.Traversals <= r.fencePacks {
+		return // recovery rotation not yet complete: stay fail-closed
+	}
+	sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), scanStateWriteTimeout)
+	defer cancel()
+	if err := r.registry.DeleteJobScanState(sctx, ref.ScanJobAbsence, ref.ScanScopeAbsenceAdmissionFence); err != nil {
+		errs.add(fmt.Errorf("absence reconcile: clear admission fence: %w", err))
+		return
+	}
+	r.fenceArmed = false
+	r.logger.Info("absence reconcile: recovery rotation complete — admission fence cleared")
+}
+
 // rangeFence reads the mutation fence for one base's pending range: the
 // base group's summed shared adoption generation (the same group every
 // cover charge pins). Every DB-visible mutation that could change a
@@ -896,6 +985,7 @@ func (r *AbsenceReconciler) Run(ctx context.Context) (AbsenceReport, error) {
 	r.foldRedundantLegacy(ctx, &report, st, &errs)
 	r.passes++
 	r.saveState(ctx, &errs)
+	r.settleAdmissionFence(ctx, &errs)
 	report.LFSTraversals, report.PackTraversals = r.lfs.Traversals, r.packs.Traversals
 	r.logger.Info("absence reconcile pass finished",
 		"lfs_rows_examined", report.LFSRowsExamined,
@@ -966,7 +1056,18 @@ func (r *AbsenceReconciler) renewCovers(ctx context.Context, budget int64, repor
 		errs.add(fmt.Errorf("absence reconcile: bulk-renew covers: %w", err))
 		report.RenewalIncomplete = true
 		r.touchFailed = true // saveState must not re-stamp rotation cursors
+		r.armAdmissionFence(ctx, errs)
 		return 0
+	}
+	if r.quotaEnforced {
+		// Stamp the DB-clock renewal-health watermark: the durable
+		// proof that every live cover was re-TTL'd just now (Codex
+		// round 26, security). A stamp failure leaves the watermark
+		// aging, which only moves the fleet TOWARD the fail-closed
+		// admission fence — the conservative direction.
+		if err := r.registry.PutJobScanState(ctx, ref.ScanJobAbsence, ref.ScanScopeAbsenceRenewalHealth, "", 0); err != nil {
+			errs.add(fmt.Errorf("absence reconcile: stamp renewal health: %w", err))
+		}
 	}
 	after := r.renewCursor
 	startRaw := after

@@ -187,6 +187,18 @@ process-local memo: three review rounds broke memo variants the same way
 said "done"), and the sentinel closes the class because a marked row is
 exactly one with no reliance newer than its last proof.
 
+Resolved residual (Codex round 26 on PR #132, security): sustained
+renewal failure approaching the cover TTL could let covers lapse while
+strict-TTL admission arithmetic silently under-counted them. Successful
+renewals now stamp a DB-clock health watermark; a renewal failure that
+finds it absent or older than the lapse safety bound (TTL minus the pass
+wall clock) arms a durable admission fence that fails finite quota-gated
+admissions closed — unbounded restore/cover reservations stay exempt so
+recovery can proceed — until a healthy error-free pass advances both
+class rotations through one full recovery traversal past the fence's
+arming snapshot (persisted counters, frozen during failing passes, so
+wraps completed while renewal was still failing never count).
+
 Resolved residual (issue #125, with #121): the original design kept the
 known-absent set and rotation cursors in process memory, making refresh
 continuity per-replica on multi-replica PostgreSQL fleets. Both now live

@@ -11,6 +11,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"math"
 	"time"
 )
 
@@ -32,6 +33,20 @@ func (s *SQLite) ReservePackBytes(ctx context.Context, group []string, packs []P
 		return ReserveDecision{}, err
 	} else if fenced {
 		return ReserveDecision{}, fmt.Errorf("reserve pack bytes %s: %w", group[0], ErrRepoPurged)
+	}
+	// Cover-renewal degraded fence — see the PG twin (Codex round 26 on
+	// PR #132, security): finite quota-gated admissions fail closed
+	// while armed; unbounded internal reservations proceed.
+	if quotaBytes != math.MaxInt64 {
+		var degraded bool
+		if err := tx.QueryRowContext(ctx,
+			`SELECT EXISTS (SELECT 1 FROM job_scan_state WHERE job = ? AND scope = ?)`,
+			ScanJobAbsence, ScanScopeAbsenceAdmissionFence).Scan(&degraded); err != nil {
+			return ReserveDecision{}, fmt.Errorf("reserve pack bytes degraded fence: %w", err)
+		}
+		if degraded {
+			return ReserveDecision{RenewalDegraded: true}, nil
+		}
 	}
 	// Self-healing GC for expired rows — see the PG twin's rationale.
 	if _, err := tx.ExecContext(ctx,

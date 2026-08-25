@@ -49,6 +49,17 @@ const (
 	ScanScopeAbsencePacks   = "packs"
 	ScanScopeAbsenceRenewal = "renewal"
 	ScanScopeAbsenceProofs  = "proofs"
+	// ScanScopeAbsenceRenewalHealth is a DB-clock watermark stamped
+	// after every SUCCESSFUL bulk cover renewal; its age is the proof
+	// that TTL'd absence covers cannot have lapsed un-renewed.
+	// ScanScopeAbsenceAdmissionFence, while present, fails finite
+	// quota-gated admissions closed (Codex round 26 on PR #132,
+	// security): it is armed when a renewal failure finds the health
+	// watermark absent or older than the cover-lapse safety bound, and
+	// cleared only after a healthy pass completes a full recovery
+	// rotation of both registry classes.
+	ScanScopeAbsenceRenewalHealth  = "renewal-health"
+	ScanScopeAbsenceAdmissionFence = "admission-fence"
 	// ScanJobSweep owns the sweeper's watermarks. The destructive-reap
 	// scope's updated_at is the "last completed destructive LFS pass"
 	// watermark (issue #120): written only when a sweep ran with the LFS

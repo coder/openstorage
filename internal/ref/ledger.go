@@ -347,6 +347,16 @@ type ReserveDecision struct {
 	// failed tiny same-key upload pairs wedge the row cap). Set only when
 	// OK.
 	Gens map[string]string
+	// RenewalDegraded denies because the absence reconciler's cover
+	// renewal is in a degraded window (Codex round 26 on PR #132,
+	// security): the TTL'd compensation covers this admission counts in
+	// active_reservations may have lapsed un-renewed, deflating the
+	// quota floor, so finite quota-gated admissions fail closed until a
+	// complete recovery rotation re-covers every registered-but-missing
+	// byte. Unbounded internal reservations (restores, covers — quota
+	// math.MaxInt64) are exempt so recovery itself can proceed.
+	// Transient from the client's perspective: retry later.
+	RenewalDegraded bool
 	// KeyCapExceeded reports that the denial was the per-repo cap on
 	// ACTIVE reservation ROWS, not byte arithmetic (Codex security round
 	// on #51): declared bytes bound row count at nothing — 1-byte LFS
@@ -506,6 +516,24 @@ func (s *PG) ReservePackBytes(ctx context.Context, group []string, packs []Pack,
 			return err
 		} else if fenced {
 			return fmt.Errorf("reserve pack bytes %s: %w", group[0], ErrRepoPurged)
+		}
+		// Cover-renewal degraded fence (Codex round 26 on PR #132,
+		// security): while armed, TTL'd absence covers may have lapsed
+		// un-renewed and this transaction's strict-TTL reservation SUM
+		// under-counts them — finite quota-gated admissions fail
+		// closed (see ReserveDecision.RenewalDegraded); unbounded
+		// internal reservations proceed so recovery can re-cover.
+		if quotaBytes != math.MaxInt64 {
+			var degraded bool
+			if err := tx.QueryRow(ctx,
+				`SELECT EXISTS (SELECT 1 FROM job_scan_state WHERE job = $1 AND scope = $2)`,
+				ScanJobAbsence, ScanScopeAbsenceAdmissionFence).Scan(&degraded); err != nil {
+				return err
+			}
+			if degraded {
+				dec = ReserveDecision{RenewalDegraded: true}
+				return nil
+			}
 		}
 		// Self-healing GC (Codex round 5 on #51): expired rows already
 		// stopped gating admission, but they occupy physical rows the
