@@ -4,6 +4,7 @@ package jobs
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"strings"
 	"testing"
@@ -574,6 +575,94 @@ func TestAbsenceReconcile_ShortTwinCovered(t *testing.T) {
 	}
 	if got := ledgerReserved(t, f, base); got != 28 {
 		t.Fatalf("reserved = %d, want the 28-byte deficit", got)
+	}
+}
+
+// TestAbsenceReconcile_AggregateShrinksOnPartialHeal (Codex round 5): the
+// ledger's same-key upsert keeps GREATEST(old, new), so a shrinking
+// aggregate must rotate its reservation key — the healed bytes' old row
+// expires by TTL while the fresh row charges the exact remaining total.
+func TestAbsenceReconcile_AggregateShrinksOnPartialHeal(t *testing.T) {
+	f := newSweepFixture(t)
+	base := "repo-shrink"
+	small := blob.LFSKey(base, absenceOID('1'))
+	big := blob.LFSKey(base, absenceOID('2'))
+	registerLFS(t, f, base, small, 30)
+	registerLFS(t, f, base, big, 70)
+
+	r := testReconciler(t, f, true, 1000)
+	report, err := r.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run 1: %v", err)
+	}
+	// Discovery charges the aggregate as it grows mid-pass (30, then
+	// 100); the same-key upsert nets ONE 100-byte reservation row.
+	if report.AbsentTracked != 2 {
+		t.Fatalf("pass 1 report = %+v, want both losses tracked", report)
+	}
+	if got := ledgerReserved(t, f, base); got != 100 {
+		t.Fatalf("reserved = %d, want the netted 100-byte aggregate", got)
+	}
+
+	// Heal the 70-byte loss. Pass 2's renewal (which precedes
+	// re-verification) still charges the pre-heal 100; re-verification
+	// then shrinks the aggregate and rotates its key.
+	if got := f.upload(big, strings.Repeat("z", 70)); got != 70 {
+		t.Fatalf("healed to %d bytes, want 70", got)
+	}
+	report, err = r.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run 2: %v", err)
+	}
+	if report.AbsentTracked != 1 {
+		t.Fatalf("pass 2 report = %+v, want the healed loss released", report)
+	}
+
+	// Pass 3 renews under the rotated key with the exact 30-byte total;
+	// the stale 100-byte row lingers only to its TTL. A GREATEST-pinned
+	// single key would renew 100 forever instead.
+	report, err = r.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run 3: %v", err)
+	}
+	if report.BytesCovered != 30 || report.CoversCharged != 1 {
+		t.Fatalf("pass 3 report = %+v, want one 30-byte renewal on the rotated key", report)
+	}
+	if got := ledgerReserved(t, f, base); got != 130 {
+		t.Fatalf("reserved = %d, want 130 (fresh 30-byte row + the dying 100-byte row inside its TTL)", got)
+	}
+}
+
+// TestAbsenceReconcile_BaseRenewalCapacity (Codex round 5): tracked bases
+// are capped at the renewal phase's per-pass allocation so every tracked
+// aggregate provably renews every pass; losses in bases beyond it get
+// one-shot covers and report as untracked.
+func TestAbsenceReconcile_BaseRenewalCapacity(t *testing.T) {
+	f := newSweepFixture(t)
+	// Budget 100 → base capacity 50. Mint 52 bases with one 10-byte
+	// absent LFS row each.
+	for i := 0; i < 52; i++ {
+		base := fmt.Sprintf("repo-cap-%02d", i)
+		registerLFS(t, f, base, blob.LFSKey(base, absenceOID('a')), 10)
+	}
+
+	r := testReconciler(t, f, true, 100)
+	var tracked, untracked int64
+	for pass := 0; pass < 4; pass++ {
+		report, err := r.Run(context.Background())
+		if err != nil {
+			t.Fatalf("Run %d: %v", pass, err)
+		}
+		tracked, untracked = report.AbsentTracked, report.AbsentUntracked
+		if tracked == 50 {
+			break
+		}
+	}
+	if tracked != 50 {
+		t.Fatalf("tracked = %d, want the 50-base renewal capacity", tracked)
+	}
+	if untracked == 0 {
+		t.Fatal("losses beyond the base capacity must report as untracked one-shot covers")
 	}
 }
 

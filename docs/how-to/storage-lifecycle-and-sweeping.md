@@ -508,11 +508,12 @@ cursors (budget-limited, resumable — the sweeper's inverse direction) and
   they are restored or their row is retired/purged. Discovered losses join
   a per-process **known-absent set** whose bytes aggregate into one cover
   reservation row per affected repository, renewed FIRST every pass (one
-  work unit per repository) — so covers renew at the pass cadence for any
-  realistic incident regardless of how many rows were lost, and the
-  per-repository reservation-row cap cannot bind. Round-robin
-  re-verification then shrinks aggregates as losses heal; a backlog there
-  delays shrinking (conservative), never renewal. Startup
+  work unit per repository, with the tracked-repository population capped
+  at that renewal allocation — tracked ⇒ renewed every pass) — so the
+  per-repository reservation-row cap cannot bind regardless of how many
+  rows were lost. Round-robin re-verification then shrinks aggregates as
+  losses heal (rotating the reservation key so exact totals are charged);
+  a backlog there delays shrinking (conservative), never renewal. Startup
   enforces the cadence-vs-TTL coupling (interval ≤ TTL/2, pass wall clock
   ≤ TTL/4), so renewals always land before live covers can lapse. The set
   is in-memory per worker:

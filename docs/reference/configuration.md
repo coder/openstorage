@@ -800,15 +800,17 @@ stretches individual probes.
   (one row can cost up to three units, so degenerate budgets cannot
   guarantee progress on both registries).
 - Tracked losses are covered by ONE aggregate reservation row per affected
-  repository, renewed every pass (one work unit per repository, so the
-  refresh half-budget covers incidents across tens of thousands of
-  repositories regardless of how many rows each lost — and the per-repo
-  reservation-row cap cannot bind). Round-robin re-verification then
-  shrinks aggregates as losses heal, retire, or purge; a re-verification
-  backlog (`absent_refreshed` below `absent_tracked`) only delays
-  shrinking, never cover renewal. The set is memory-capped at 100,000
-  losses (`absent_untracked` reports overflow — such rows get one-shot
-  covers renewed on rotation revisits).
+  repository, renewed every pass at one work unit per repository — and the
+  tracked-repository population is capped at the renewal phase's per-pass
+  allocation (`budget/2`; 50,000 at the default), so every tracked
+  aggregate provably renews every pass and the per-repo reservation-row
+  cap cannot bind. Round-robin re-verification then shrinks aggregates as
+  losses heal, retire, or purge (a shrink rotates the aggregate's
+  reservation key so the exact new total is charged; the old row expires
+  within one TTL); a re-verification backlog (`absent_refreshed` below
+  `absent_tracked`) only delays shrinking, never cover renewal. Losses
+  beyond the repository capacity or the 100,000-row memory cap get
+  one-shot covers renewed on rotation revisits (`absent_untracked`).
 - **Multi-replica PostgreSQL fleets:** the refresh set and rotation
   cursors are per-process, and the River periodic job may run on any
   replica ([#125](https://github.com/coder/code-storage/issues/125) tracks

@@ -47,14 +47,19 @@ per-row covers would scale renewal work with the loss population and
 collide with the per-base active-reservation-row cap, so a big enough
 incident would either outrun the renewal cycle or be denied outright. The
 refresh phase runs FIRST each pass, renewal before re-verification:
-renewing every base aggregate costs one work unit per REPOSITORY — within
-the refresh half-budget for any realistic incident — while round-robin
-re-verification (`HasPack`/`HasLFSObject` + stats; healed, retired,
-folded-away, and purged rows drop out of their aggregate) only SHRINKS
-covers, so its backlog delays convergence, never visibility. Losses are
-storage-incident-scaled, never attacker-mintable, so the set's only hard
-cap is a 100,000-entry memory bound (overflow gets one-shot per-row
-covers renewed on rotation revisits, reported as `absent_untracked`). The set is in-memory like the cursors: a restart loses it and
+renewing every base aggregate costs one work unit per REPOSITORY, and the
+tracked-base population is capped at exactly that renewal allocation
+(Codex round 5) — tracked ⇒ renewed every pass, by construction. A shrink
+(heal, retirement, fold, purge) rotates the aggregate's reservation key:
+the ledger's same-key upsert keeps GREATEST(old, new) and refreshes the
+TTL, so renewing a smaller total under the old key would pin healed bytes
+reserved forever — the fresh key charges the exact total and the old row
+expires within one TTL (the deliberate tail every cover has). Round-robin
+re-verification (`HasPack`/`HasLFSObject` + stats) only SHRINKS covers,
+so its backlog delays convergence, never visibility. Losses are
+storage-incident-scaled, never attacker-mintable; beyond the base
+capacity or the 100,000-row memory bound, overflow gets one-shot per-row
+covers renewed on rotation revisits (`absent_untracked`). The set is in-memory like the cursors: a restart loses it and
 the rotation rediscovers — convergence delay, never corruption. Renewal
 timing is enforced end to end (Codex round 3, security): covers renew at
 pass starts, periodic ticks that fire mid-pass coalesce (River uniqueness

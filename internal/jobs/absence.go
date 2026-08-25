@@ -218,6 +218,16 @@ type absentBase struct {
 	bytes int64
 	rows  int64
 	idx   int // position in baseRing, maintained by track/untrack
+	// gen rotates the aggregate's reservation key whenever bytes SHRINK
+	// (Codex round 5): ReservePackBytes' same-key upsert keeps
+	// GREATEST(old, new) and refreshes the TTL, so renewing a smaller
+	// aggregate under the old key would pin healed bytes reserved
+	// forever. A fresh key charges the exact new total and the old row
+	// expires by TTL — at most one TTL of over-cover per shrink, the
+	// same deliberate tail every cover has. Rows are minted only when a
+	// gen is actually charged (at most twice per base per pass), so
+	// rotation cannot grow the row population past a handful per TTL.
+	gen int64
 }
 
 // absenceCoverKey is the synthetic per-base key the aggregate cover is
@@ -225,7 +235,9 @@ type absentBase struct {
 // collide: pack keys live under "packs/", LFS keys under "lfs/", and the
 // suffix keeps the row in the repair-cover class settlement never
 // consumes — the TTL collects it after the last tracked loss heals.
-func absenceCoverKey(base string) string { return "absence-lost/" + base }
+func absenceCoverKey(base string, gen int64) string {
+	return fmt.Sprintf("absence-lost/%s/%d", base, gen)
+}
 
 // absentRow is one tracked truly-absent registry row: everything the
 // refresh needs to re-verify registration and re-settle it, plus its
@@ -271,11 +283,15 @@ type absencePassState struct {
 	probeFailed map[string]bool // probe errored: reported once, fence deferred to the reserve
 	coverSkip   map[string]bool // one cover denial skips the base for the rest of the pass
 	settled     map[string]bool // rows settled this pass: the rotation skips refresh-visited rows
-	// baseCovered memoizes the aggregate bytes charged per base this
-	// pass: renewal and every discovery re-charge would otherwise mint
-	// one upsert per absent row.
-	baseCovered map[string]int64
+	// baseCovered memoizes the aggregate (gen, bytes) charged per base
+	// this pass: renewal and every discovery re-charge would otherwise
+	// mint one upsert per absent row. A gen rotation or byte growth
+	// re-charges.
+	baseCovered map[string]coveredAggregate
 }
+
+// coveredAggregate is one pass's per-base charge memo.
+type coveredAggregate struct{ gen, bytes int64 }
 
 func newAbsencePassState() *absencePassState {
 	return &absencePassState{
@@ -283,7 +299,7 @@ func newAbsencePassState() *absencePassState {
 		probeFailed: make(map[string]bool),
 		coverSkip:   make(map[string]bool),
 		settled:     make(map[string]bool),
-		baseCovered: make(map[string]int64),
+		baseCovered: make(map[string]coveredAggregate),
 	}
 }
 
@@ -433,20 +449,40 @@ func (r *AbsenceReconciler) trackAbsent(row absentRow, report *AbsenceReport) bo
 			"key", row.key, "cap", absentTrackedCap)
 		return false
 	}
-	row.idx = len(r.refreshRing)
-	tracked := &row
-	r.refreshRing = append(r.refreshRing, tracked)
-	r.knownAbsent[row.key] = tracked
 	base := baseOf(row.repo)
 	agg, ok := r.absentBases[base]
 	if !ok {
+		// One aggregate = one renewal work unit per pass, so the tracked
+		// BASE population must stay within the renewal phase's budget
+		// allocation (Codex round 5): beyond it, some aggregate would
+		// wait multiple passes and its cover could lapse. A new base past
+		// that capacity gets one-shot covers instead — reported, renewed
+		// on rotation revisits — while rows joining EXISTING aggregates
+		// add no renewal work and always track.
+		if int64(len(r.absentBases)) >= r.baseCapacity() {
+			report.AbsentUntracked++
+			r.logger.Warn("absence reconcile: tracked losses span more repositories than the per-pass renewal capacity; this repository's losses get one-shot covers — raise CODESTORAGE_ABSENCE_RECONCILE_BUDGET",
+				"repo", base, "capacity", r.baseCapacity())
+			return false
+		}
 		agg = &absentBase{base: base, idx: len(r.baseRing)}
 		r.baseRing = append(r.baseRing, agg)
 		r.absentBases[base] = agg
 	}
+	row.idx = len(r.refreshRing)
+	tracked := &row
+	r.refreshRing = append(r.refreshRing, tracked)
+	r.knownAbsent[row.key] = tracked
 	agg.bytes += row.bytes
 	agg.rows++
 	return true
+}
+
+// baseCapacity is the renewal phase's per-pass budget allocation — the
+// refresh half-budget — and therefore the maximum tracked-base population
+// whose aggregates provably renew every pass.
+func (r *AbsenceReconciler) baseCapacity() int64 {
+	return r.budget - r.budget/2
 }
 
 // untrackAbsent drops a tracked row (healed, twin-present, retired, or
@@ -475,6 +511,10 @@ func (r *AbsenceReconciler) untrackAbsent(key string) {
 		"untrackAbsent(%q): base aggregate %s inconsistent (%+v)", key, base, agg)
 	agg.bytes -= row.bytes
 	agg.rows--
+	// Bytes shrank: rotate the reservation key (see absentBase.gen) so
+	// the next renewal charges the exact new total instead of refreshing
+	// the GREATEST-pinned old one.
+	agg.gen++
 	if agg.rows == 0 {
 		assertf(agg.bytes == 0, "untrackAbsent(%q): empty base %s holds %d bytes", key, base, agg.bytes)
 		assertf(agg.idx >= 0 && agg.idx < len(r.baseRing) && r.baseRing[agg.idx] == agg,
@@ -801,11 +841,11 @@ func (r *AbsenceReconciler) coverBase(ctx context.Context, base string, report *
 		return // nothing tracked for this base (untracked rows use coverRow)
 	}
 	assertf(agg.bytes > 0 && agg.rows > 0, "coverBase(%s): empty aggregate %+v", base, agg)
-	if prev, done := st.baseCovered[base]; done && agg.bytes <= prev {
+	if prev, done := st.baseCovered[base]; done && prev.gen == agg.gen && agg.bytes <= prev.bytes {
 		return
 	}
-	r.chargeCover(ctx, base, absenceCoverKey(base), agg.bytes, report, st, errs)
-	st.baseCovered[base] = agg.bytes
+	r.chargeCover(ctx, base, absenceCoverKey(base, agg.gen), agg.bytes, report, st, errs)
+	st.baseCovered[base] = coveredAggregate{gen: agg.gen, bytes: agg.bytes}
 }
 
 // coverRow charges one untracked loss (memory-cap overflow) as a one-shot
