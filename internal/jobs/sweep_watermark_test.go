@@ -24,8 +24,12 @@ func wireReapRecorder(t *testing.T, f *sweepFixture, cfg SweepConfig) SweepConfi
 	if !ok {
 		t.Fatalf("store %T lacks the scan-state seams", f.store)
 	}
-	cfg.RecordLFSReapComplete = func(ctx context.Context) error {
-		return scanState.PutJobScanState(ctx, ref.ScanJobSweep, ref.ScanScopeLFSDestructiveReap, "", 0)
+	cfg.RecordLFSReapComplete = func(ctx context.Context, legacyArmed bool) error {
+		payload := ""
+		if legacyArmed {
+			payload = ref.ReapWatermarkLegacy
+		}
+		return scanState.PutJobScanState(ctx, ref.ScanJobSweep, ref.ScanScopeLFSDestructiveReap, payload, 0)
 	}
 	return cfg
 }
@@ -69,6 +73,30 @@ func TestSweepReapWatermark_RecordedOnCleanArmedPass(t *testing.T) {
 	}
 	if _, ok := reapWatermark(t, f); !ok {
 		t.Fatal("clean armed pass did not record the reap watermark")
+	}
+}
+
+// TestSweepReapWatermark_LegacyArming (Codex round 17 on PR #132): the
+// watermark's payload certifies which delete classes the recorded sweep
+// reaped — a legacy-armed pass records the legacy payload, and a later
+// unarmed pass overwrites it, so legacy row retirement pauses until the
+// next legacy-armed sweep.
+func TestSweepReapWatermark_LegacyArming(t *testing.T) {
+	f := newSweepFixture(t)
+	cfg := wireReapRecorder(t, f, SweepConfig{Threshold: 24 * time.Hour, DeleteLFS: true, DeleteLFSLegacy: true})
+	if _, err := f.sweeper(cfg).Sweep(context.Background()); err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if st, ok := reapWatermark(t, f); !ok || st.Payload != ref.ReapWatermarkLegacy {
+		t.Fatalf("watermark after legacy-armed pass = (%+v, %v), want the legacy payload", st, ok)
+	}
+
+	cfg = wireReapRecorder(t, f, SweepConfig{Threshold: 24 * time.Hour, DeleteLFS: true})
+	if _, err := f.sweeper(cfg).Sweep(context.Background()); err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if st, ok := reapWatermark(t, f); !ok || st.Payload != "" {
+		t.Fatalf("watermark after unarmed pass = (%+v, %v), want the canonical-only payload", st, ok)
 	}
 }
 
@@ -130,7 +158,7 @@ func TestSweepReapWatermark_NotRecordedOnDeleteFailure(t *testing.T) {
 func TestSweepReapWatermark_RecorderFailureReported(t *testing.T) {
 	f := newSweepFixture(t)
 	cfg := SweepConfig{Threshold: 24 * time.Hour, DeleteLFS: true}
-	cfg.RecordLFSReapComplete = func(context.Context) error {
+	cfg.RecordLFSReapComplete = func(context.Context, bool) error {
 		return fmt.Errorf("scan-state write refused")
 	}
 	if _, err := f.sweeper(cfg).Sweep(context.Background()); err == nil || !strings.Contains(err.Error(), "record lfs reap watermark") {

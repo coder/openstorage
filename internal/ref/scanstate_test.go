@@ -5,6 +5,7 @@ package ref
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 )
@@ -299,6 +300,56 @@ func TestRetireUnreferencedLFSObject_ReapWatermarkGate(t *testing.T) {
 		}
 		if retired, err := rs.RetireUnreferencedLFSObject(ctx, k.base(), key, gens, 0, time.Hour); err != nil || !retired {
 			t.Fatalf("retire with fresh watermark = (%v, %v), want retired", retired, err)
+		}
+	})
+}
+
+// TestRetireUnreferencedLFSObject_LegacyReapGate (Codex round 17 on PR
+// #132): a LEGACY-SPELLED row may only retire under a fresh watermark
+// whose payload certifies a legacy-armed sweep — an unarmed sweep
+// deliberately spares legacy orphan blobs, so its watermark must not back
+// their slot refunds (the blob would never be physically reaped and
+// upload/retire cycles could grow storage past the object cap). Canonical
+// rows retire under either payload.
+func TestRetireUnreferencedLFSObject_LegacyReapGate(t *testing.T) {
+	runRefBackends(t, func(t *testing.T, s Store) {
+		rs := reclaimStore(t, s)
+		ctx := context.Background()
+		// A fresh watermark whose payload records a legacy-UNARMED sweep.
+		if err := rs.PutJobScanState(ctx, ScanJobSweep, ScanScopeLFSDestructiveReap, "", 0); err != nil {
+			t.Fatal(err)
+		}
+		k := newLedgerKit(t, s)
+		legacy := "lfs/" + k.base() + "/" + strings.Repeat("ab", 32)
+		canonical := canonicalLFSKey(k.base(), "cd")
+		for _, key := range []string{legacy, canonical} {
+			if err := s.RegisterLFSObject(ctx, k.base(), key, 100); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if n, err := rs.MarkLFSObjectsUnreferenced(ctx, k.base(), []string{legacy, canonical}); err != nil || n != 2 {
+			t.Fatalf("mark = (%d, %v)", n, err)
+		}
+		gens := pinCurrentGens(t, s, k.group)
+
+		// Unarmed payload: the legacy row defers with the distinct
+		// sentinel and stays intact; the canonical row retires.
+		if retired, err := rs.RetireUnreferencedLFSObject(ctx, k.base(), legacy, gens, 0, time.Hour); !errors.Is(err, ErrLegacyReapUnarmed) || retired {
+			t.Fatalf("retire legacy row unarmed = (%v, %v), want ErrLegacyReapUnarmed", retired, err)
+		}
+		if has, err := s.HasLFSObject(ctx, k.base(), legacy); err != nil || !has {
+			t.Fatalf("legacy row after refusal = (%v, %v), want intact", has, err)
+		}
+		if retired, err := rs.RetireUnreferencedLFSObject(ctx, k.base(), canonical, gens, 0, time.Hour); err != nil || !retired {
+			t.Fatalf("retire canonical row unarmed = (%v, %v), want retired", retired, err)
+		}
+
+		// Legacy-armed payload: the same legacy verdict commits.
+		if err := rs.PutJobScanState(ctx, ScanJobSweep, ScanScopeLFSDestructiveReap, ReapWatermarkLegacy, 0); err != nil {
+			t.Fatal(err)
+		}
+		if retired, err := rs.RetireUnreferencedLFSObject(ctx, k.base(), legacy, gens, 0, time.Hour); err != nil || !retired {
+			t.Fatalf("retire legacy row armed = (%v, %v), want retired", retired, err)
 		}
 	})
 }

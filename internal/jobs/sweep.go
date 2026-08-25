@@ -206,8 +206,13 @@ type SweepConfig struct {
 	// quarantine backups are not draining or the listing machinery is
 	// degraded, and the cost of a false freeze is only deferred refunds
 	// — fail closed. A recording failure is reported like any sweep
-	// error; the watermark simply does not advance.
-	RecordLFSReapComplete func(context.Context) error
+	// error; the watermark simply does not advance. legacyArmed reports
+	// whether the pass also reaped LEGACY-SPELLED LFS keys
+	// (DeleteLFSLegacy): legacy registry rows may only be retired under
+	// a legacy-armed watermark (Codex round 17 on PR #132) — an unarmed
+	// pass deliberately spares legacy orphan blobs, so its watermark
+	// must not certify their refunds.
+	RecordLFSReapComplete func(ctx context.Context, legacyArmed bool) error
 }
 
 // OrphanPack is one orphan candidate found by a sweep.
@@ -432,7 +437,7 @@ func (s *Sweeper) Sweep(ctx context.Context) (SweepReport, error) {
 		}
 	}
 	if lfsMode && deleteErrs.ok() && s.cfg.RecordLFSReapComplete != nil {
-		if err := s.cfg.RecordLFSReapComplete(ctx); err != nil {
+		if err := s.cfg.RecordLFSReapComplete(ctx, legacyMode); err != nil {
 			deleteErrs.add(fmt.Errorf("sweep: record lfs reap watermark: %w", err))
 			s.logger.Error("orphan pack sweep: recording the destructive LFS reap watermark failed; reclamation slot refunds will defer once it stales", "err", err)
 		}

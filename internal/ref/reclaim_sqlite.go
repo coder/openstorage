@@ -125,16 +125,21 @@ func (s *SQLite) RetireUnreferencedLFSObject(ctx context.Context, repo, key stri
 	defer func() { _ = tx.Rollback() }()
 	// Observed reap coupling (issue #120) — see the PG twin. The
 	// watermark stamps updated_at in epoch MILLISECONDS.
-	var reapFresh bool
-	if err := tx.QueryRowContext(ctx, `
-SELECT EXISTS(SELECT 1 FROM job_scan_state
+	var reapPayload string
+	switch err := tx.QueryRowContext(ctx, `
+SELECT payload FROM job_scan_state
   WHERE job = ? AND scope = ?
-    AND updated_at > `+sqliteEpochMS+` - ?)`,
-		ScanJobSweep, ScanScopeLFSDestructiveReap, reapMaxAge.Milliseconds()).Scan(&reapFresh); err != nil {
+    AND updated_at > `+sqliteEpochMS+` - ?`,
+		ScanJobSweep, ScanScopeLFSDestructiveReap, reapMaxAge.Milliseconds()).Scan(&reapPayload); {
+	case errors.Is(err, sql.ErrNoRows):
+		return false, fmt.Errorf("retire lfs object %s: %w", key, ErrReapWatermarkStale)
+	case err != nil:
 		return false, err
 	}
-	if !reapFresh {
-		return false, fmt.Errorf("retire lfs object %s: %w", key, ErrReapWatermarkStale)
+	// Legacy-spelled rows need a legacy-armed watermark — see the PG twin
+	// (Codex round 17 on PR #132).
+	if reapPayload != ReapWatermarkLegacy && !strings.Contains(key, "/o2/") {
+		return false, fmt.Errorf("retire lfs object %s: %w", key, ErrLegacyReapUnarmed)
 	}
 	if fenced, err := repoPurgeFencedSQLite(ctx, tx, repo); err != nil {
 		return false, err

@@ -484,6 +484,7 @@ A reclamation run logs one `lfs reclaim pass finished` line:
 | `bytes_retired` | quota bytes refunded |
 | `dry_run` | `true` while `CODESTORAGE_LFS_GC_DELETE_ENABLED` is off |
 | `reap_watermark_stale` / `rows_deferred_reap_stale` | `true` (and the eligible rows deferred) when no destructive LFS sweep completed cleanly within the grace window — refunds resume once one does |
+| `rows_deferred_legacy_unarmed` | eligible LEGACY-spelled rows deferred because legacy reaping is not armed end-to-end (`CODESTORAGE_SWEEP_DELETE_LFS_LEGACY` off, or the fresh watermark records a legacy-unarmed sweep) — their blobs would never be physically reaped, so the slot refund would be unbacked |
 
 Scan progress is fleet-durable: the rotation cursor and each repository's
 row-settlement resume point persist in the ref store (`job_scan_state`), so

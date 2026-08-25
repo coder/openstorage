@@ -111,35 +111,46 @@ unit; a configuration floor (`MinAbsenceReconcileBudget`) keeps budgets
 out of single-row-overdraw territory. Legacy nonce-keyed covers minted by
 pre-#125 workers — at any point of a mixed-version roll — are MIGRATED on
 first sight: a pre-#125 cover aggregates BOTH classes' deficits with no
-class split, so its total folds into BOTH of the base's deterministic
-class incarnations via the ledger's GREATEST merge (grow-only; each
-class's own rotation right-sizes or row-less-releases its copy within one
-clean range observation, and the transient over-cover until then only
-tightens admission), after which the nonce row is MARKED folded (a
-sentinel owner) and decays by TTL. Un-folded nonces ride the pass-start
-bulk touch until their first listing visit (Codex round 15: a nonce
-minted just behind the cursor must not lapse before an upgraded worker
-ever folds it), and an old replica's re-charge overwrites the sentinel —
-a re-charge is a new reliance, so the row re-enters the touch until the
-listing re-folds and re-marks it. Never
+class split, so its credit is transferred into BOTH of the base's
+deterministic class incarnations ADDITIVELY, head+nonce per class — never
+a GREATEST toward the largest nonce, because pre-#125 workers minted one
+nonce per replica/pass, several live nonces can cover DISJOINT deficits
+that admission sums, and a max-merge would leave at most max(nonces) per
+class once the marked rows decay (each class's own rotation right-sizes
+or row-less-releases its copy within one clean range observation, and the
+transient over-cover until then only tightens admission). After a proven
+transfer the nonce row is MARKED folded (a sentinel owner) and decays by
+TTL. Un-folded nonces ride the pass-start bulk touch until their first
+listing visit (Codex round 15: a nonce minted just behind the cursor must
+not lapse before an upgraded worker ever folds it), and an old replica's
+re-charge overwrites the sentinel — a re-charge is a new reliance, so the
+row re-enters the touch until the listing re-folds and re-marks it. Never
 deleted: an old replica may still depend on its own nonce rows mid-roll.
 The fold marker is the SOLE fold state — no process-local memo: three
 review rounds broke memo variants the same way (an old replica's
 re-charge changed what the nonce means while the memo said "done"), and
 the marker closes the class because a marked row is exactly one with no
-reliance newer than its last proven fold. Un-marked rows re-fold every
-visit (grow-only GREATEST merges keep replays and rollout churn
-transient and convergent).
+reliance newer than its last proven fold. Un-marked rows re-transfer
+every visit; replays after mark failures or re-charges only re-add —
+over-cover, conservative and error-visible, right-sized by the next clean
+range.
 
 Resolved residual (issue #125, with #121): the original design kept the
 known-absent set and rotation cursors in process memory, making refresh
 continuity per-replica on multi-replica PostgreSQL fleets. Both now live
 in durable state — cursors in `job_scan_state`, tracking in the cover
 rows themselves — so any replica renews every cover and resumes the one
-fleet-shared rotation. The remaining residual is narrower: a row whose
-settlement stat-errors on every traversal keeps its base's ranges dirty,
-so heals in that base shed only after a clean traversal (loud via
-`stat_errors`, conservative direction).
+fleet-shared rotation. Durable cursors resume only while the covers they
+left behind are provably standing (Codex round 17): a cursor row whose
+DB-clock age outlives the renewal guarantee (cover TTL minus the pass
+timeout — a fleet pause) may have covers expired behind it, and a cursor
+parked while quota enforcement was off (the payload records the mode) had
+no cover maintenance at all, so both reset the rotation to origin —
+strictly a fairness cost — instead of letting the uncovered losses wait a
+full wrap while admission spends the reopened headroom. The remaining
+residual is narrower: a row whose settlement stat-errors on every
+traversal keeps its base's ranges dirty, so heals in that base shed only
+after a clean traversal (loud via `stat_errors`, conservative direction).
 
 A genuine loss is charged through the existing round-57/58 seam,
 `ref.ReserveRestoreCover`, under the canonical spelling plus

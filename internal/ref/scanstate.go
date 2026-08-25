@@ -64,6 +64,22 @@ const (
 // pass; nothing was written.
 var ErrReapWatermarkStale = errors.New("destructive LFS sweep watermark is stale: slot refund deferred")
 
+// ReapWatermarkLegacy is the destructive-reap watermark payload recorded
+// when the certified sweep also had the LEGACY LFS delete class armed
+// (CODESTORAGE_SWEEP_DELETE_LFS_LEGACY). Legacy-spelled registry rows may
+// only be retired under this payload (Codex round 17 on PR #132): with the
+// legacy class off, the sweeper deliberately spares legacy-spelled orphan
+// blobs, so retiring a legacy row would refund an object-cap slot for
+// bytes that are never physically reaped — repeated cycles grow storage
+// past the cap. An empty payload certifies canonical-only reaping.
+const ReapWatermarkLegacy = "legacy"
+
+// ErrLegacyReapUnarmed reports that a retirement verdict refused to retire
+// a LEGACY-SPELLED registry row because the freshest destructive-reap
+// watermark does not certify legacy reaping (see ReapWatermarkLegacy). The
+// caller defers the row; it retires once a legacy-armed sweep completes.
+var ErrLegacyReapUnarmed = errors.New("legacy LFS reaping is not armed: legacy row retirement deferred")
+
 // ScanScopeReclaimRepo is the reclaimer's per-repo row-settlement cursor
 // scope for one base repository.
 func ScanScopeReclaimRepo(base string) string {

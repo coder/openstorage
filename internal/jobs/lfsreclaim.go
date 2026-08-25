@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"strings"
 	"time"
 
 	"github.com/coder/code-storage/internal/blob"
@@ -107,6 +108,13 @@ type LFSReclaimReport struct {
 	// retirement was deferred by the stale watermark; they retire on a
 	// later pass once destructive sweeps demonstrably complete again.
 	RowsDeferredReapStale int64 `json:"rows_deferred_reap_stale"`
+	// RowsDeferredLegacyUnarmed counts grace-expired eligible
+	// LEGACY-SPELLED rows deferred because legacy reaping is not armed
+	// end-to-end — this replica's CODESTORAGE_SWEEP_DELETE_LFS_LEGACY is
+	// off, or the fresh watermark does not certify a legacy-armed sweep
+	// (Codex round 17 on PR #132). Their blobs would never be physically
+	// reaped, so refunding their slots would grow storage past the cap.
+	RowsDeferredLegacyUnarmed int64 `json:"rows_deferred_legacy_unarmed"`
 }
 
 const (
@@ -173,13 +181,20 @@ func (r *LFSReclaimer) reapMaxAge() time.Duration {
 // LFSReclaimer runs the reclamation scan. Construct with NewLFSReclaimer;
 // Run executes one bounded pass on the schedule's cadence.
 type LFSReclaimer struct {
-	registry       LFSReclaimRegistry
-	hydrate        HydrateFunc
-	walk           LFSWalkFunc
-	defaultBranch  DefaultBranchFunc
-	grace          time.Duration
-	objectBudget   int64
-	deleteEnabled  bool
+	registry      LFSReclaimRegistry
+	hydrate       HydrateFunc
+	walk          LFSWalkFunc
+	defaultBranch DefaultBranchFunc
+	grace         time.Duration
+	objectBudget  int64
+	deleteEnabled bool
+	// legacyDelete mirrors the fleet's CODESTORAGE_SWEEP_DELETE_LFS_LEGACY
+	// arming (Codex round 17 on PR #132): legacy-spelled rows may only be
+	// retired while THIS replica's config arms legacy reaping AND the
+	// fresh watermark certifies a legacy-armed sweep — a fresh legacy
+	// watermark from before the flag was switched off must not keep legacy
+	// refunds flowing for its freshness window.
+	legacyDelete   bool
 	logger         *slog.Logger
 	now            func() time.Time // injectable clock for tests
 	hydrateTimeout time.Duration    // per-member cap, shrinkable in tests
@@ -191,6 +206,12 @@ type LFSReclaimer struct {
 	// The authoritative gate is RetireUnreferencedLFSObject's own
 	// in-transaction watermark recheck.
 	reapStale bool
+	// legacyReapArmed is the pass-local advisory twin for legacy-spelled
+	// rows: the watermark's payload said the certified sweep had the
+	// legacy delete class armed. Config (legacyDelete) is process-static
+	// and checked directly at each row; the DB-racing payload half is
+	// re-checked inside the retire transaction.
+	legacyReapArmed bool
 	// Scan progress — the rotation cursor (last base repo a run
 	// attempted, resumed strictly after; the purger's rotation, issue
 	// #52) and the per-repo row-settlement cursors (Codex round 8:
@@ -203,8 +224,9 @@ type LFSReclaimer struct {
 	// any generation bump (fresh scan, never a resume across a fence).
 }
 
-// NewLFSReclaimer wires the reclamation job.
-func NewLFSReclaimer(registry LFSReclaimRegistry, hydrate HydrateFunc, walk LFSWalkFunc, defaultBranch DefaultBranchFunc, grace time.Duration, objectBudget int64, deleteEnabled bool, logger *slog.Logger) *LFSReclaimer {
+// NewLFSReclaimer wires the reclamation job. legacyDelete mirrors the
+// sweeper's CODESTORAGE_SWEEP_DELETE_LFS_LEGACY arming — see the field.
+func NewLFSReclaimer(registry LFSReclaimRegistry, hydrate HydrateFunc, walk LFSWalkFunc, defaultBranch DefaultBranchFunc, grace time.Duration, objectBudget int64, deleteEnabled, legacyDelete bool, logger *slog.Logger) *LFSReclaimer {
 	assertf(registry != nil, "NewLFSReclaimer: nil registry")
 	assertf(hydrate != nil, "NewLFSReclaimer: nil hydrate seam")
 	assertf(walk != nil, "NewLFSReclaimer: nil walk seam")
@@ -220,6 +242,7 @@ func NewLFSReclaimer(registry LFSReclaimRegistry, hydrate HydrateFunc, walk LFSW
 		grace:          grace,
 		objectBudget:   objectBudget,
 		deleteEnabled:  deleteEnabled,
+		legacyDelete:   legacyDelete,
 		logger:         logger,
 		now:            time.Now,
 		hydrateTimeout: lfsReclaimHydrateTimeout,
@@ -265,7 +288,7 @@ func (r *LFSReclaimer) Run(ctx context.Context) (LFSReclaimReport, error) {
 	// destructive sweep). The demotion only skips retire transactions
 	// that would refuse anyway; the authoritative, race-free gate is the
 	// retire transaction's own watermark recheck on the database clock.
-	r.reapStale = false
+	r.reapStale, r.legacyReapArmed = false, false
 	if r.deleteEnabled {
 		// Freshness is measured entirely on the DATABASE clock (Codex
 		// round 10, P2): the watermark's updated_at is DB-stamped, so
@@ -287,6 +310,17 @@ func (r *LFSReclaimer) Run(ctx context.Context) (LFSReclaimReport, error) {
 			report.ReapWatermarkStale = true
 			r.logger.Warn("lfs reclaim: no destructive LFS sweep completed within the grace window; this pass is report-only and slot refunds are deferred",
 				"bound", r.reapMaxAge())
+		} else if r.legacyDelete {
+			// Legacy-spelled rows additionally need the certified
+			// sweep to have reaped legacy keys (Codex round 17): the
+			// payload half is advisory here — read failure defers
+			// conservatively — and re-checked inside the retire
+			// transaction.
+			if st, ok, err := r.registry.GetJobScanState(ctx, ref.ScanJobSweep, ref.ScanScopeLFSDestructiveReap); err != nil {
+				errs.add(fmt.Errorf("lfs reclaim: read reap watermark payload: %w", err))
+			} else if ok {
+				r.legacyReapArmed = st.Payload == ref.ReapWatermarkLegacy
+			}
 		}
 	}
 	// Resume the fleet-persistent rotation (issue #121); a lost or
@@ -386,7 +420,8 @@ loop:
 		"bytes_retired", report.BytesRetired,
 		"dry_run", report.DryRun,
 		"reap_watermark_stale", report.ReapWatermarkStale,
-		"rows_deferred_reap_stale", report.RowsDeferredReapStale)
+		"rows_deferred_reap_stale", report.RowsDeferredReapStale,
+		"rows_deferred_legacy_unarmed", report.RowsDeferredLegacyUnarmed)
 	return report, errs.join()
 }
 
@@ -623,12 +658,25 @@ func (r *LFSReclaimer) settleRepoRows(ctx context.Context, base string, gens map
 				report.RowsDeferredReapStale++
 				continue
 			}
+			if !r.legacyReapArmed && !strings.Contains(row.Key, "/o2/") {
+				// Legacy-spelled row without end-to-end legacy arming
+				// (Codex round 17): its blob would never be physically
+				// reaped, so the slot refund is unbacked. Config half
+				// is process-static; the watermark half is re-checked
+				// inside the retire transaction.
+				report.RowsDeferredLegacyUnarmed++
+				continue
+			}
 			retired, err := r.registry.RetireUnreferencedLFSObject(ctx, base, row.Key, gens, r.grace, r.reapMaxAge())
 			switch {
 			case errors.Is(err, ref.ErrReapWatermarkStale):
 				// The in-transaction gate fired (the pass outlived the
 				// watermark's freshness): deferred, not an error.
 				report.RowsDeferredReapStale++
+			case errors.Is(err, ref.ErrLegacyReapUnarmed):
+				// The in-transaction payload recheck fired (the
+				// watermark rolled to an unarmed sweep mid-pass).
+				report.RowsDeferredLegacyUnarmed++
 			case err != nil:
 				errs.add(err)
 			case retired:

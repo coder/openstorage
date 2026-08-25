@@ -193,16 +193,22 @@ func (s *PG) RetireUnreferencedLFSObject(ctx context.Context, repo, key string, 
 		if err := lockBaseLedger(ctx, tx, repo); err != nil {
 			return err
 		}
-		var reapFresh bool
-		if err := tx.QueryRow(ctx, `
-SELECT EXISTS(SELECT 1 FROM job_scan_state
+		var reapPayload string
+		switch err := tx.QueryRow(ctx, `
+SELECT payload FROM job_scan_state
   WHERE job = $1 AND scope = $2
-    AND updated_at > now() - make_interval(secs => $3))`,
-			ScanJobSweep, ScanScopeLFSDestructiveReap, reapMaxAge.Seconds()).Scan(&reapFresh); err != nil {
+    AND updated_at > now() - make_interval(secs => $3)`,
+			ScanJobSweep, ScanScopeLFSDestructiveReap, reapMaxAge.Seconds()).Scan(&reapPayload); {
+		case errors.Is(err, pgx.ErrNoRows):
+			return ErrReapWatermarkStale
+		case err != nil:
 			return err
 		}
-		if !reapFresh {
-			return ErrReapWatermarkStale
+		// A legacy-spelled row's blob is only reaped by legacy-armed
+		// sweeps (Codex round 17 on PR #132): the fresh watermark must
+		// certify that class or the refund is unbacked.
+		if reapPayload != ReapWatermarkLegacy && !strings.Contains(key, "/o2/") {
+			return ErrLegacyReapUnarmed
 		}
 		// A purge-fenced repo's rows belong to the purge pipeline
 		// (issue #52): it drops them wholesale with the counter row.

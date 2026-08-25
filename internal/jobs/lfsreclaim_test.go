@@ -89,7 +89,10 @@ func newReclaimStore(t *testing.T) (ref.Store, LFSReclaimRegistry) {
 
 func seedReapWatermark(t *testing.T, reg LFSReclaimRegistry) {
 	t.Helper()
-	if err := reg.PutJobScanState(context.Background(), ref.ScanJobSweep, ref.ScanScopeLFSDestructiveReap, "", 0); err != nil {
+	// Legacy-armed payload: the scan fixtures model a fully-armed fleet
+	// (testReclaimer passes legacyDelete=true) so rows of BOTH key
+	// spellings retire; the legacy-unarmed regime has its own test.
+	if err := reg.PutJobScanState(context.Background(), ref.ScanJobSweep, ref.ScanScopeLFSDestructiveReap, ref.ReapWatermarkLegacy, 0); err != nil {
 		t.Fatalf("seed reap watermark: %v", err)
 	}
 }
@@ -117,7 +120,7 @@ func alwaysMain(context.Context, string) (string, bool, error) { return "main", 
 func testReclaimer(t *testing.T, reg LFSReclaimRegistry, hydrate HydrateFunc, grace time.Duration, budget int64, deleteEnabled bool) *LFSReclaimer {
 	t.Helper()
 	return NewLFSReclaimer(reg, hydrate, lfsscan.ReachableLFSOIDs, alwaysMain,
-		grace, budget, deleteEnabled, slog.New(slog.DiscardHandler))
+		grace, budget, deleteEnabled, true, slog.New(slog.DiscardHandler))
 }
 
 // TestLFSReclaim_EndToEnd: the full mark → grace → retire lifecycle over a
@@ -463,7 +466,7 @@ func TestLFSReclaim_HydrationDeadline(t *testing.T) {
 		return "", ctx.Err()
 	}
 	r := NewLFSReclaimer(reg, stuck, lfsscan.ReachableLFSOIDs, alwaysMain,
-		time.Hour, 1_000, true, slog.New(slog.DiscardHandler))
+		time.Hour, 1_000, true, true, slog.New(slog.DiscardHandler))
 	r.hydrateTimeout = 50 * time.Millisecond
 
 	_, err := r.Run(ctx)
@@ -501,7 +504,7 @@ func TestLFSReclaim_WalkDeadline(t *testing.T) {
 		return nil, 0, ctx.Err()
 	}
 	r := NewLFSReclaimer(reg, instantHydrate, stuckWalk, alwaysMain,
-		time.Hour, 1_000, true, slog.New(slog.DiscardHandler))
+		time.Hour, 1_000, true, true, slog.New(slog.DiscardHandler))
 	r.walkTimeout = 50 * time.Millisecond
 
 	_, err := r.Run(ctx)
@@ -539,7 +542,7 @@ func TestLFSReclaim_PassDeadline(t *testing.T) {
 		return nil, 0, ctx.Err()
 	}
 	r := NewLFSReclaimer(reg, instantHydrate, stuckWalk, alwaysMain,
-		time.Hour, 1_000, true, slog.New(slog.DiscardHandler))
+		time.Hour, 1_000, true, true, slog.New(slog.DiscardHandler))
 	// Per-member deadline generous, pass deadline tiny: the pass cap must
 	// end the run — without it, three wedged repos would serially consume
 	// three per-member windows.
@@ -655,7 +658,7 @@ func TestLFSReclaim_SkippedReposChargeBudget(t *testing.T) {
 	}
 	noMetadata := func(context.Context, string) (string, bool, error) { return "", false, nil }
 	r := NewLFSReclaimer(reg, staticHydrate(t, nil), lfsscan.ReachableLFSOIDs, noMetadata,
-		time.Hour, 3, true, slog.New(slog.DiscardHandler))
+		time.Hour, 3, true, true, slog.New(slog.DiscardHandler))
 
 	rep, err := r.Run(ctx)
 	if err != nil {
@@ -664,6 +667,62 @@ func TestLFSReclaim_SkippedReposChargeBudget(t *testing.T) {
 	// 5 metadata-less repos, budget 3: exactly 3 attempted-and-skipped.
 	if rep.ReposSkipped != 3 {
 		t.Fatalf("skip run = %+v, want 3 budget-bounded skips", rep)
+	}
+}
+
+// TestLFSReclaim_LegacyRowsDeferredWhenUnarmed (Codex round 17 on PR
+// #132): legacy-spelled registry rows retire only when legacy reaping is
+// armed END-TO-END — this replica's CODESTORAGE_SWEEP_DELETE_LFS_LEGACY
+// AND a watermark payload certifying a legacy-armed sweep. Either half
+// missing defers the row with the distinct counter: its blob would never
+// be physically reaped, so the slot refund would be unbacked.
+func TestLFSReclaim_LegacyRowsDeferredWhenUnarmed(t *testing.T) {
+	ctx := context.Background()
+	store, reg := newReclaimStore(t) // seeds a legacy-armed watermark
+	base := "legacy-defer-repo"
+	canonical := "lfs/" + base + "/o2/" + strings.Repeat("aa", 32)
+	legacy := "lfs/" + base + "/" + strings.Repeat("bb", 32)
+	for _, key := range []string{canonical, legacy} {
+		if err := store.RegisterLFSObject(ctx, base, key, 100); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n, err := reg.MarkLFSObjectsUnreferenced(ctx, base, []string{canonical, legacy}); err != nil || n != 2 {
+		t.Fatalf("mark = (%d, %v)", n, err)
+	}
+
+	run := func(legacyDelete bool) LFSReclaimReport {
+		t.Helper()
+		// No refs, so nothing hydrates; the marks are grace-expired on
+		// the scan's (injected) clock. The retire transaction's DB-clock
+		// grace recheck spares the canonical row — irrelevant here: the
+		// deferral under test fires BEFORE any transaction.
+		r := NewLFSReclaimer(reg, staticHydrate(t, nil), lfsscan.ReachableLFSOIDs, alwaysMain,
+			time.Hour, 1_000, true, legacyDelete, slog.New(slog.DiscardHandler))
+		r.now = func() time.Time { return time.Now().Add(2 * time.Hour) }
+		rep, err := r.Run(ctx)
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+		return rep
+	}
+
+	// Config half off: the legacy row defers even under a legacy-armed
+	// watermark — a fresh pre-flip watermark must not keep legacy
+	// refunds flowing for its freshness window.
+	if rep := run(false); rep.RowsDeferredLegacyUnarmed != 1 || rep.RowsRetired != 0 {
+		t.Fatalf("config-off run = %+v, want the legacy row deferred and nothing retired", rep)
+	}
+
+	// Watermark half unarmed: same deferral with the config flag on.
+	if err := reg.PutJobScanState(ctx, ref.ScanJobSweep, ref.ScanScopeLFSDestructiveReap, "", 0); err != nil {
+		t.Fatal(err)
+	}
+	if rep := run(true); rep.RowsDeferredLegacyUnarmed != 1 || rep.RowsRetired != 0 {
+		t.Fatalf("unarmed-watermark run = %+v, want the legacy row deferred and nothing retired", rep)
+	}
+	if has, err := store.HasLFSObject(ctx, base, legacy); err != nil || !has {
+		t.Fatalf("legacy row = (%v, %v), want intact after both deferrals", has, err)
 	}
 }
 

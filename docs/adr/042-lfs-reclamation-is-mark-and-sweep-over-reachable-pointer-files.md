@@ -71,8 +71,14 @@ the grace window — covering armed-but-failing sweeps, passes that outlast
 the reclamation cycle, and the versioning guard demoting a run mid-flight.
 The sweep emergency stop (interval 0) is the planned instance of the same
 demotion: the watermark stales and reclamation reports instead of
-crash-looping the fleet. The job ships dark (interval 0) with
-report-only marking as the second
+crash-looping the fleet. The watermark's payload also records whether the
+certified sweep had the LEGACY delete class armed
+(`CODESTORAGE_SWEEP_DELETE_LFS_LEGACY`): legacy-spelled registry rows
+retire only under a legacy-armed watermark AND a replica whose own config
+arms the flag — an unarmed sweep deliberately spares legacy orphan blobs,
+so refunding their slots would let upload/retire cycles grow storage past
+the object cap (deferred distinctly as `rows_deferred_legacy_unarmed`).
+The job ships dark (interval 0) with report-only marking as the second
 gate (`CODESTORAGE_LFS_GC_DELETE_ENABLED`), mirroring the sweep flags'
 staged rollout; `CODESTORAGE_LFS_MAX_OBJECTS_PER_REPO` is the orthogonal
 operator escape hatch that unwedges a repository immediately. An actively

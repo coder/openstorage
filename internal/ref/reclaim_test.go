@@ -32,8 +32,10 @@ func reclaimStore(t *testing.T, s Store) lfsReclaimStore {
 		t.Fatalf("store %T lacks the reclamation surface", s)
 	}
 	// Retirement gates on a fresh destructive-reap watermark (issue
-	// #120); seed one so verdict tests exercise their own guards.
-	if err := rs.PutJobScanState(context.Background(), ScanJobSweep, ScanScopeLFSDestructiveReap, "", 0); err != nil {
+	// #120); seed a legacy-armed one (a fully-armed fleet, so rows of
+	// both key spellings retire) so verdict tests exercise their own
+	// guards. The legacy-unarmed regime has its own gate test.
+	if err := rs.PutJobScanState(context.Background(), ScanJobSweep, ScanScopeLFSDestructiveReap, ReapWatermarkLegacy, 0); err != nil {
 		t.Fatalf("seed reap watermark: %v", err)
 	}
 	return rs

@@ -196,8 +196,15 @@ func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL, loopbackBaseU
 	// armed pass records it through the shared scan-state rows.
 	scanState, ok := refStore.(ref.ScanStateStore)
 	assertf(ok, "ref store %T lacks the scan-state seams", refStore)
-	sweepCfg.RecordLFSReapComplete = func(ctx context.Context) error {
-		return scanState.PutJobScanState(ctx, ref.ScanJobSweep, ref.ScanScopeLFSDestructiveReap, "", 0)
+	sweepCfg.RecordLFSReapComplete = func(ctx context.Context, legacyArmed bool) error {
+		// The payload certifies which delete classes the recorded sweep
+		// reaped: legacy-spelled registry rows may only be retired under
+		// a legacy-armed watermark (Codex round 17 on PR #132).
+		payload := ""
+		if legacyArmed {
+			payload = ref.ReapWatermarkLegacy
+		}
+		return scanState.PutJobScanState(ctx, ref.ScanJobSweep, ref.ScanScopeLFSDestructiveReap, payload, 0)
 	}
 	sweeper := jobs.NewSweeper(blobStore, refStore, sweepCfg, logger)
 	var schedule *jobs.SweepSchedule
@@ -278,7 +285,7 @@ func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL, loopbackBaseU
 				}
 				return r.DefaultBranch, true, nil
 			},
-			lfsGC.grace, lfsGC.objectBudget, reclaimDelete, logger)
+			lfsGC.grace, lfsGC.objectBudget, reclaimDelete, sweep.deleteLFSLegacy, logger)
 		lfsReclaimSchedule = &jobs.LFSReclaimSchedule{Reclaimer: reclaimer, Interval: lfsGC.interval}
 		mode := "report-only"
 		if reclaimDelete {

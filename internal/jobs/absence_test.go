@@ -832,10 +832,10 @@ func TestAbsenceReconcile_LegacyCoverMigrated(t *testing.T) {
 		t.Fatalf("seed legacy cover: %v", err)
 	}
 
-	// Pass 1: the renewal listing migrates the 555-byte legacy total into
-	// BOTH deterministic incarnations (grow-only GREATEST merges) and
-	// stops renewing the nonce row; the rotations' own discovery keeps
-	// charging the same incarnations.
+	// Pass 1: the renewal listing transfers the 555-byte legacy credit
+	// into BOTH deterministic incarnations (additively — Codex round 17)
+	// and stops renewing the nonce row; the rotations' own discovery
+	// keeps charging the same incarnations.
 	r := testReconciler(t, f, true, 1000)
 	report, err := r.Run(ctx)
 	if err != nil {
@@ -1039,6 +1039,181 @@ func TestAbsenceReconcile_LegacyRefoldAfterHeadsReleased(t *testing.T) {
 	}
 	if got := ledgerReserved(t, f, base); got != 555+100+200 {
 		t.Fatalf("reserved = %d, want the decaying nonce plus both re-minted right-sized incarnations", got)
+	}
+}
+
+// TestAbsenceReconcile_LegacyCoversFoldAdditively (Codex round 17,
+// security): pre-#125 workers minted one random nonce PER REPLICA/PASS, so
+// several live nonces can cover DISJOINT deficits — admission sums them —
+// and each transfer must ADD the nonce's credit to the heads. A GREATEST
+// toward the largest nonce would leave at most max(nonces) per class once
+// the marked rows decay, below the summed protection. Credits must also
+// stack across decay epochs: a nonce minted after earlier folds' rows
+// decayed adds on top of the previous heads. The renewal phase runs alone
+// here (no rotations), so nothing right-sizes the heads and the fold
+// arithmetic itself is observable.
+func TestAbsenceReconcile_LegacyCoversFoldAdditively(t *testing.T) {
+	f := newSweepFixture(t)
+	ctx := context.Background()
+	base := "repo-additive-fold"
+	reg := absenceRegistry(t, f)
+	for _, nonce := range []struct {
+		key   string
+		bytes int64
+	}{
+		{ref.AbsenceCoverPrefix + base + "/" + ref.NewReservationOwner(), 555},
+		{ref.AbsenceCoverPrefix + base + "/" + ref.NewReservationOwner(), 300},
+	} {
+		if err := ref.ReserveRestoreCover(ctx, reg, blob.QuotaRepoGroup(base), nonce.key, nonce.bytes, time.Hour); err != nil {
+			t.Fatalf("seed nonce: %v", err)
+		}
+	}
+
+	r := testReconciler(t, f, true, 1000)
+	renew := func() *AbsenceReport {
+		t.Helper()
+		errs := &boundedErrs{}
+		report := &AbsenceReport{}
+		r.loadState(ctx, errs)
+		r.renewCovers(ctx, 1000, report, newAbsencePassState(), errs)
+		if err := errs.join(); err != nil {
+			t.Fatalf("renewCovers: %v", err)
+		}
+		return report
+	}
+	if report := renew(); report.CoversDecaying != 2 {
+		t.Fatalf("report = %+v, want both nonces folded and decaying", report)
+	}
+	for _, class := range []string{absenceClassLFS, absenceClassPacks} {
+		head, ok, err := reg.AbsenceCoverHead(ctx, absenceIncarnationPrefix(base, class), time.Hour)
+		if err != nil || !ok || head.Bytes != 555+300 {
+			t.Fatalf("%s head = (%+v, %v, %v), want the SUMMED nonce credits", class, head, ok, err)
+		}
+	}
+
+	// Decay epoch: both folded rows expire, then an old replica mints a
+	// THIRD nonce — its credit lands on top of the previous heads.
+	rows, err := reg.ListAbsenceCovers(ctx, "", 10, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range rows {
+		if _, _, _, legacy, ok := parseAbsenceCoverKey(row.Key); ok && legacy {
+			if err := reg.DeleteAbsenceCover(ctx, row.Key); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if err := ref.ReserveRestoreCover(ctx, reg, blob.QuotaRepoGroup(base),
+		ref.AbsenceCoverPrefix+base+"/"+ref.NewReservationOwner(), 100, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if report := renew(); report.CoversDecaying != 1 {
+		t.Fatalf("report = %+v, want the epoch-2 nonce folded and decaying", report)
+	}
+	for _, class := range []string{absenceClassLFS, absenceClassPacks} {
+		head, ok, err := reg.AbsenceCoverHead(ctx, absenceIncarnationPrefix(base, class), time.Hour)
+		if err != nil || !ok || head.Bytes != 555+300+100 {
+			t.Fatalf("%s head after decay epoch = (%+v, %v, %v), want stacked credits", class, head, ok, err)
+		}
+	}
+}
+
+// TestAbsenceReconcile_StaleCursorRestartsFromOrigin (Codex round 17,
+// security): a rotation cursor whose row's DB-clock age outlives the
+// cover-renewal guarantee (a fleet pause approaching the cover TTL) may
+// have covers expired behind it — the losses they compensated are
+// uncovered, so loadState must restart discovery from origin instead of
+// resuming mid-keyspace and letting them wait a full wrap.
+func TestAbsenceReconcile_StaleCursorRestartsFromOrigin(t *testing.T) {
+	f := newSweepFixture(t)
+	ctx := context.Background()
+	base := "repo-stale-cursor"
+	for i := byte(0); i < 6; i++ {
+		key := blob.LFSKey(base, absenceOID('a'+i))
+		registerLFS(t, f, base, key, 10)
+		f.upload(key, strings.Repeat("x", 10))
+	}
+	// A budget-limited pass parks the LFS cursor mid-keyspace.
+	r := testReconciler(t, f, true, 4)
+	pinLFSLeader(t, f)
+	if _, err := r.Run(ctx); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if r.lfs.AfterRepo == "" {
+		t.Fatalf("lfs cursor = %+v, want parked mid-keyspace", r.lfs)
+	}
+
+	// Fresh cursor rows resume under the production bound.
+	errs := &boundedErrs{}
+	r.loadState(ctx, errs)
+	if err := errs.join(); err != nil {
+		t.Fatal(err)
+	}
+	if r.lfs.AfterRepo == "" {
+		t.Fatal("fresh cursor was reset, want resumed")
+	}
+
+	// The same rows outliving the (shrunk) bound reset to origin.
+	r.cursorStaleAge = time.Millisecond
+	time.Sleep(1200 * time.Millisecond) // cross SQLite's second stamp
+	r.loadState(ctx, errs)
+	if err := errs.join(); err != nil {
+		t.Fatal(err)
+	}
+	if r.lfs.AfterRepo != "" || r.lfs.AfterKey != "" {
+		t.Fatalf("stale cursor = %+v, want reset to origin", r.lfs)
+	}
+}
+
+// TestAbsenceReconcile_QuotaFlipRestartsFromOrigin (Codex round 17,
+// security): quota-off passes advance the rotation cursors but skip all
+// cover maintenance, so a cursor parked under quota-off must not be
+// resumed once enforcement turns on — losses its traversal already passed
+// were never covered.
+func TestAbsenceReconcile_QuotaFlipRestartsFromOrigin(t *testing.T) {
+	f := newSweepFixture(t)
+	ctx := context.Background()
+	base := "repo-quota-flip"
+	for i := byte(0); i < 6; i++ {
+		key := blob.LFSKey(base, absenceOID('a'+i))
+		registerLFS(t, f, base, key, 10)
+		f.upload(key, strings.Repeat("x", 10))
+	}
+	rOff := testReconciler(t, f, false, 4)
+	pinLFSLeader(t, f)
+	if _, err := rOff.Run(ctx); err != nil {
+		t.Fatalf("Run off: %v", err)
+	}
+	if rOff.lfs.AfterRepo == "" {
+		t.Fatalf("lfs cursor = %+v, want parked mid-keyspace", rOff.lfs)
+	}
+
+	// Enforcement turns on: the off-parked cursor resets to origin.
+	rOn := testReconciler(t, f, true, 4)
+	errs := &boundedErrs{}
+	rOn.loadState(ctx, errs)
+	if err := errs.join(); err != nil {
+		t.Fatal(err)
+	}
+	if rOn.lfs.AfterRepo != "" || rOn.lfs.AfterKey != "" {
+		t.Fatalf("off-parked cursor = %+v, want reset to origin", rOn.lfs)
+	}
+
+	// An on-parked cursor resumes under enforcement (control).
+	if _, err := rOn.Run(ctx); err != nil {
+		t.Fatalf("Run on: %v", err)
+	}
+	if rOn.lfs.AfterRepo == "" {
+		t.Fatalf("on cursor = %+v, want parked mid-keyspace", rOn.lfs)
+	}
+	rOn2 := testReconciler(t, f, true, 4)
+	rOn2.loadState(ctx, errs)
+	if err := errs.join(); err != nil {
+		t.Fatal(err)
+	}
+	if rOn2.lfs.AfterRepo == "" {
+		t.Fatal("on-parked cursor was reset, want resumed")
 	}
 }
 

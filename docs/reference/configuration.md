@@ -780,7 +780,13 @@ until the eligible rows are the junk you expect, then opt in.
   sweeps, passes outrunning the reclamation cycle, and mid-flight guard
   demotions all freeze refunds automatically (`reap_watermark_stale` /
   `rows_deferred_reap_stale` in the run report). A fresh deployment stays
-  report-only until its first clean destructive LFS sweep completes. With
+  report-only until its first clean destructive LFS sweep completes.
+  Legacy-spelled rows (pre-ADR-41 `lfs/<repo>/<oid>` keys) are gated one
+  step further: their blobs are only reaped when
+  [`CODESTORAGE_SWEEP_DELETE_LFS_LEGACY`](#codestorage_sweep_delete_lfs_legacy)
+  is also armed, so they retire only while that flag is set AND the fresh
+  watermark records a legacy-armed sweep — otherwise they defer with
+  `rows_deferred_legacy_unarmed` in the run report. With
   the sweep schedule stopped
   ([`CODESTORAGE_SWEEP_INTERVAL=0`](#codestorage_sweep_interval), the
   emergency stop), the process starts but demotes retirement to report-only

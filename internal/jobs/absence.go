@@ -72,6 +72,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -262,6 +263,16 @@ type AbsenceReconciler struct {
 	coverTTL    time.Duration
 	logger      *slog.Logger
 	passTimeout time.Duration // whole-pass cap, shrinkable in tests
+	// cursorStaleAge bounds how old a parked rotation cursor may be
+	// before loadState resets it to origin (Codex round 17, security):
+	// covers renew at pass START and cursors park at pass END, so a
+	// cursor older than coverTTL-passTimeout means some cover MAY have
+	// expired since the last renewal — the loss it covered is uncovered
+	// and must not wait for the resumed traversal to wrap. A false reset
+	// only costs a fresh traversal; a false resume is the bug, so the
+	// bound stays strictly conservative (no floor; SQLite's ±1s age
+	// over-read only resets earlier). Shrinkable in tests.
+	cursorStaleAge time.Duration
 
 	// Per-pass scratch, loaded from durable state at Run start and parked
 	// at Run end.
@@ -322,6 +333,15 @@ type absenceCursorState struct {
 	RangeStarted bool   `json:"range_started,omitempty"`
 	RangeDirty   bool   `json:"range_dirty,omitempty"`
 	RangeRunning int64  `json:"range_running,omitempty"`
+	// Quota records whether quota enforcement was ON when the cursor
+	// parked (Codex round 17, security): quota-off passes advance the
+	// cursors but skip all cover maintenance, so a cursor parked under
+	// quota-off must not be resumed once enforcement turns on — losses
+	// its traversal already passed were never covered and would wait a
+	// full wrap. loadState resets such cursors to origin. Pre-upgrade
+	// payloads lack the field (reads false): one fresh traversal after
+	// the roll, conservative.
+	Quota bool `json:"quota,omitempty"`
 }
 
 // rangeTracker follows one rotation's current base range within a pass.
@@ -387,14 +407,17 @@ func NewAbsenceReconciler(registry AbsenceRegistry, blobs BlobStatter, quotaEnfo
 	if quarter := coverTTL / 4; quarter < passTimeout {
 		passTimeout = quarter // see absencePassTimeout: renewal gap ≤ TTL
 	}
+	staleAge := coverTTL - passTimeout
+	assertf(staleAge > 0, "NewAbsenceReconciler: non-positive cursor stale bound %v", staleAge)
 	return &AbsenceReconciler{
-		registry:      registry,
-		blobs:         blobs,
-		quotaEnforced: quotaEnforced,
-		budget:        budget,
-		coverTTL:      coverTTL,
-		logger:        logger,
-		passTimeout:   passTimeout,
+		registry:       registry,
+		blobs:          blobs,
+		quotaEnforced:  quotaEnforced,
+		budget:         budget,
+		coverTTL:       coverTTL,
+		logger:         logger,
+		passTimeout:    passTimeout,
+		cursorStaleAge: staleAge,
 	}
 }
 
@@ -445,6 +468,33 @@ func (r *AbsenceReconciler) loadState(ctx context.Context, errs *boundedErrs) {
 			// fresh scan, loudly.
 			*c.into = absenceCursorState{}
 			r.logger.Warn("absence reconcile: discarding undecodable cursor state", "scope", c.scope, "err", err)
+			continue
+		}
+		if !r.quotaEnforced {
+			continue // nothing consults covers: any resume point serves detection
+		}
+		// A resumed cursor must prove the covers it left behind are still
+		// standing (Codex round 17, security): a fleet pause longer than
+		// the cover TTL expires covers — the pass-start bulk touch
+		// rightly refuses to resurrect them — so the losses they
+		// compensated are uncovered, and resuming mid-keyspace would
+		// leave them undiscovered until the traversal wraps while
+		// admission spends the reopened headroom. Both staleness (the
+		// cursor row's DB-clock age outliving the renewal guarantee) and
+		// a quota-off parking (cover maintenance was skipped entirely)
+		// reset the rotation to origin: strictly a fairness cost.
+		reason := ""
+		if !c.into.Quota {
+			reason = "cursor parked while quota enforcement was off"
+		} else if age, live, err := r.registry.JobScanStateAge(ctx, ref.ScanJobAbsence, c.scope); err != nil {
+			errs.add(fmt.Errorf("absence reconcile: read %s cursor age: %w", c.scope, err))
+			reason = "cursor age unreadable"
+		} else if !live || age > r.cursorStaleAge {
+			reason = "cursor outlived the cover-renewal guarantee"
+		}
+		if reason != "" {
+			*c.into = absenceCursorState{}
+			r.logger.Warn("absence reconcile: restarting rotation from origin", "scope", c.scope, "reason", reason)
 		}
 	}
 	if st, ok, err := r.registry.GetJobScanState(ctx, ref.ScanJobAbsence, ref.ScanScopeAbsenceRenewal); err != nil {
@@ -465,6 +515,7 @@ func (r *AbsenceReconciler) saveState(ctx context.Context, errs *boundedErrs) {
 		scope string
 		from  *absenceCursorState
 	}{{ref.ScanScopeAbsenceLFS, &r.lfs}, {ref.ScanScopeAbsencePacks, &r.packs}} {
+		c.from.Quota = r.quotaEnforced // see absenceCursorState.Quota
 		payload, err := json.Marshal(c.from)
 		assertf(err == nil, "absence reconcile: marshal %s cursor: %v", c.scope, err)
 		if err := r.registry.PutJobScanState(sctx, ref.ScanJobAbsence, c.scope, string(payload), 0); err != nil {
@@ -715,28 +766,34 @@ func (r *AbsenceReconciler) renewCovers(ctx context.Context, budget int64, repor
 	}
 }
 
-// migrateLegacyCover folds one pre-#125 nonce-keyed cover into its base's
-// deterministic incarnations (Codex round 4, P1): the ledger's GREATEST
-// merge grows each incarnation to at least the legacy total — same-universe
-// totals, so max is the right merge. A pre-#125 cover aggregates BOTH
+// migrateLegacyCover transfers one pre-#125 nonce-keyed cover into its
+// base's deterministic incarnations (Codex round 4, P1). The transfer is
+// ADDITIVE — each incarnation grows to head+nonce, not GREATEST(head,
+// nonce) (Codex round 17, security): pre-#125 workers minted one random
+// nonce PER REPLICA/PASS, so several live nonces can cover DISJOINT
+// deficits and admission sums them — folding all of them toward the same
+// heads by max would leave at most max(nonces) per class once the marked
+// nonces expire, below the summed protection they provided. Additive
+// transfer preserves each nonce's credit independent of what other nonces
+// (or earlier decay epochs) contributed. A pre-#125 cover aggregates BOTH
 // classes' deficits with no class split (Codex round 5, P1), so the total
-// folds into BOTH class incarnations: each class's own next clean range
-// right-sizes (or row-less-releases) its copy, and until then the transient
-// over-cover only tightens admission. The row's OWN durable fold marker
-// (row.Folded, the sentinel owner) is the sole fold state — rounds 7, 13,
-// and the round-15 security follow-up each broke a process-local memo the
-// same way (an old replica's re-charge changed what the nonce means while
-// the memo said "done"), and the marker closes the class: every re-charge
-// overwrites owner, so a marked row is EXACTLY one with no reliance newer
-// than its last proven fold. Marked rows decay by TTL (skipped here);
-// un-marked rows fold (grow-only, idempotent) and mark, and the transient
-// per-pass re-fold while old replicas keep re-charging is bounded by the
-// rollout window. If a fold cannot be proven, the row is renewed as-is so
-// nothing lapses; the next pass retries. Reports whether the row's
-// protection is secured for this pass (decaying, folded, renewed, or the
-// base is purge-fenced); false means NEITHER fold nor renewal landed
-// (Codex round 8, P1) and the caller must park the renewal cursor before
-// the row.
+// is transferred into BOTH class incarnations: each class's own next clean
+// range right-sizes (or row-less-releases) its copy, and until then the
+// transient over-cover only tightens admission — which is also why replays
+// (a mark failure, or an old replica's re-charge un-marking the row) may
+// re-add and only ever over-cover, conservatively and error-visibly.
+// The row's OWN durable fold marker (row.Folded, the sentinel owner) is
+// the sole fold state — rounds 7, 13, and the round-15 security follow-up
+// each broke a process-local memo the same way (an old replica's re-charge
+// changed what the nonce means while the memo said "done"), and the marker
+// closes the class: every re-charge overwrites owner, so a marked row is
+// EXACTLY one with no reliance newer than its last proven fold. Marked
+// rows decay by TTL (skipped here); un-marked rows transfer and mark. If a
+// transfer cannot be proven, the row is renewed as-is so nothing lapses;
+// the next pass retries. Reports whether the row's protection is secured
+// for this pass (decaying, folded, renewed, or the base is purge-fenced);
+// false means NEITHER fold nor renewal landed (Codex round 8, P1) and the
+// caller must park the renewal cursor before the row.
 func (r *AbsenceReconciler) migrateLegacyCover(ctx context.Context, row *ref.AbsenceCoverRow, report *AbsenceReport, st *absencePassState, errs *boundedErrs) bool {
 	if row.Folded {
 		report.CoversDecaying++ // no re-charge since the last proven fold
@@ -744,7 +801,7 @@ func (r *AbsenceReconciler) migrateLegacyCover(ctx context.Context, row *ref.Abs
 	}
 	migrated := true
 	for _, class := range []string{absenceClassLFS, absenceClassPacks} {
-		if !r.foldIntoIncarnation(ctx, row.Base, class, row.Bytes, false, report, st, errs) {
+		if !r.foldIntoIncarnation(ctx, row.Base, class, row.Bytes, false, true, report, st, errs) {
 			migrated = false
 			break
 		}
@@ -780,12 +837,17 @@ func (r *AbsenceReconciler) migrateLegacyCover(ctx context.Context, row *ref.Abs
 	return false
 }
 
-// foldIntoIncarnation grows one class's live incarnation to at least bytes,
-// minting incarnation 1 when the class has none. Reports whether the grown
-// total is proven durable in the ledger. bypassSkip forces the charge past
-// the pass-level coverSkip memo even for a mint (the bounded endRange
-// retry); same-key grows of an existing head always bypass.
-func (r *AbsenceReconciler) foldIntoIncarnation(ctx context.Context, base, class string, bytes int64, bypassSkip bool, report *AbsenceReport, st *absencePassState, errs *boundedErrs) bool {
+// foldIntoIncarnation grows one class's live incarnation, minting
+// incarnation 1 when the class has none. With additive=false the head
+// grows to at least bytes (the ledger's GREATEST merge — the endRange
+// grow-retry's recomputed-total semantics); with additive=true it grows to
+// head+bytes, saturating (legacy nonce transfer, Codex round 17: the
+// nonce's credit stacks on whatever the head already compensates). Reports
+// whether the grown total is proven durable in the ledger. bypassSkip
+// forces the charge past the pass-level coverSkip memo even for a mint
+// (the bounded endRange retry); same-key grows of an existing head always
+// bypass.
+func (r *AbsenceReconciler) foldIntoIncarnation(ctx context.Context, base, class string, bytes int64, bypassSkip, additive bool, report *AbsenceReport, st *absencePassState, errs *boundedErrs) bool {
 	assertf(bytes >= 0, "foldIntoIncarnation: negative total %d for %s/%s", bytes, base, class)
 	head, ok := r.resolveHead(ctx, base, class, st, errs)
 	if !ok {
@@ -795,11 +857,18 @@ func (r *AbsenceReconciler) foldIntoIncarnation(ctx context.Context, base, class
 	if target.key == "" {
 		target = liveCover{key: absenceIncarnationKey(base, class, 1), n: 1}
 	}
-	if !r.chargeCover(ctx, base, target.key, bytes, head.key != "" || bypassSkip, report, st, errs) {
+	total := bytes
+	if additive {
+		total = target.bytes + bytes
+		if total < target.bytes { // saturate, never wrap
+			total = math.MaxInt64
+		}
+	}
+	if !r.chargeCover(ctx, base, target.key, total, head.key != "" || bypassSkip, report, st, errs) {
 		return false
 	}
-	if bytes > target.bytes {
-		target.bytes = bytes
+	if total > target.bytes {
+		target.bytes = total
 	}
 	r.liveCovers[class][base] = target
 	return true
@@ -1051,7 +1120,7 @@ func (r *AbsenceReconciler) endRange(ctx context.Context, tr *rangeTracker, repo
 		// an under-counted running only grows the cover less than the
 		// truth, never shrinks it.
 		if running > 0 && !st.purged[base] {
-			r.foldIntoIncarnation(ctx, base, class, running, true, report, st, errs)
+			r.foldIntoIncarnation(ctx, base, class, running, true, false, report, st, errs)
 		}
 		return
 	}
