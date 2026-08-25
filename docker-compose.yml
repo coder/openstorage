@@ -20,18 +20,23 @@ services:
       retries: 15
   seaweedfs:
     # Qualified recipe (issue #133 Gate 1a-A, PR #142): pinned image,
-    # one-process `weed server -s3`, anonymous auth (clients still need
-    # non-empty dummy AWS credentials for SigV4 signing). Never enable
-    # versioning or object-lock on data buckets (seaweedfs#8073 avoidance).
+    # one-process `weed server -s3`. The static identity below keeps the
+    # published gateway credential-gated (dev-stack parity with the MinIO
+    # root user it replaced); unauthenticated requests get 403. Never
+    # enable versioning or object-lock on data buckets (seaweedfs#8073
+    # avoidance).
     image: chrislusf/seaweedfs:4.42
-    command: server -s3 -dir=/data -ip.bind=0.0.0.0
+    command: server -s3 -dir=/data -ip.bind=0.0.0.0 -s3.config=/etc/seaweedfs/s3.json
+    configs:
+      - source: seaweedfs-s3
+        target: /etc/seaweedfs/s3.json
     ports:
       - "${S3PORT:-18333}:8333"
     healthcheck:
-      # An anonymous ListBuckets against the S3 gateway: it 200s only once
-      # the filer chain behind the gateway can actually serve (the port
-      # accepts TCP well before that).
-      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8333/"]
+      # The gateway's unauthenticated /healthz: it 200s only once the S3
+      # gateway is actually serving (the port accepts TCP before that),
+      # and it needs no credentials even with SigV4 enforcement on.
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8333/healthz"]
       interval: 2s
       timeout: 3s
       retries: 30
@@ -55,7 +60,7 @@ services:
     environment: &node-env
       CODESTORAGE_PG_URL: postgres://postgres:postgres@postgres:5432/postgres
       CODESTORAGE_S3_URL: "s3://codestorage?endpoint=http://seaweedfs:8333&s3ForcePathStyle=true&region=us-east-1"
-      # The gateway is anonymous; the SDK just needs non-empty credentials.
+      # Must match the static identity in the seaweedfs-s3 config below.
       AWS_ACCESS_KEY_ID: codestorage
       AWS_SECRET_ACCESS_KEY: codestorage
       CODESTORAGE_ORG: selfhost
@@ -81,3 +86,11 @@ services:
       CODESTORAGE_BASE_URL: http://127.0.0.1:${NODEB_PORT:-8082}
     ports:
       - "${NODEB_PORT:-8082}:8080"
+
+configs:
+  # Static S3 identity for the dev stack (development credentials, like the
+  # Postgres password above — not deployment guidance).
+  seaweedfs-s3:
+    content: |
+      {"identities":[{"name":"codestorage","credentials":[{"accessKey":"codestorage","secretKey":"codestorage"}],"actions":["Admin","Read","List","Tagging","Write"]}]}
+

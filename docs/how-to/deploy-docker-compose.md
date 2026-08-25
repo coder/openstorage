@@ -52,8 +52,8 @@ mkdir -p compose-keys && ./codestorage keygen --out ./compose-keys/cs-key
 docker compose --profile replicas up -d --wait --build
 ```
 
-`--wait` blocks until every healthcheck passes: Postgres (`pg_isready`), SeaweedFS (an
-anonymous ListBuckets against the S3 gateway), and both nodes (unauthenticated
+`--wait` blocks until every healthcheck passes: Postgres (`pg_isready`), SeaweedFS (the
+S3 gateway's unauthenticated `/healthz`), and both nodes (unauthenticated
 [`GET /healthz`](deploy-production.md#health-checks)). Node A publishes on `:8081`, node B
 on `:8082`; both containers listen on `0.0.0.0:8080` internally.
 
