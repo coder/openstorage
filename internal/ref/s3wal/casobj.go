@@ -120,6 +120,11 @@ type Client struct {
 
 	seqMu   sync.Mutex
 	lastSeq map[string]int64 // allocated lazily, only used when DecodeSeq is set
+
+	// httpCloser, when non-nil, is the Dial-owned pooled HTTP client whose
+	// idle connections Close releases. Nil for Clients wrapped around
+	// caller-owned s3.Clients.
+	httpCloser interface{ CloseIdleConnections() }
 }
 
 // New wraps an s3.Client for conditional object operations on one bucket.
