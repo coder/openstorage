@@ -857,6 +857,60 @@ func TestAbsenceReconcile_LegacyCoverMigrated(t *testing.T) {
 	if got := ledgerReserved(t, f, base); got != 555+100+200 {
 		t.Fatalf("reserved after pass 2 = %d, want unchanged", got)
 	}
+
+	// An old replica re-grows the SAME nonce mid-roll (Codex round 7,
+	// P1): the fold memo is a byte watermark, not a boolean — the grown
+	// total must re-fold into both incarnations before the nonce decays.
+	// Pass 3 re-inflates both incarnations to 900 and its own clean
+	// ranges right-size them again (a rotate per class proves the
+	// re-fold happened); the nonce decays at its grown total.
+	if err := ref.ReserveRestoreCover(ctx, absenceRegistry(t, f), blob.QuotaRepoGroup(base), legacyKey, 900, time.Hour); err != nil {
+		t.Fatalf("re-grow legacy cover: %v", err)
+	}
+	report, err = r.Run(ctx)
+	if err != nil {
+		t.Fatalf("Run 3: %v", err)
+	}
+	if report.CoversDecaying != 1 || report.CoversRotated != 2 {
+		t.Fatalf("pass 3 report = %+v, want the grown nonce re-folded and both incarnations right-sized", report)
+	}
+	if got := ledgerReserved(t, f, base); got != 900+100+200 {
+		t.Fatalf("reserved after pass 3 = %d, want the grown nonce plus right-sized incarnations", got)
+	}
+}
+
+// TestAbsenceChargeCover_SameKeyBypassesSkip (Codex round 7, P1): the
+// pass-level coverSkip memo predicts that further fresh MINTS for a base
+// would fail like the denial that set it (e.g. the active-row cap) — but a
+// same-key re-charge of an existing row is excluded from that cap by the
+// ledger, so renewals and fallback renewals must bypass the memo or a
+// transient denial lets live covers decay.
+func TestAbsenceChargeCover_SameKeyBypassesSkip(t *testing.T) {
+	f := newSweepFixture(t)
+	ctx := context.Background()
+	base := "repo-cover-skip"
+	r := testReconciler(t, f, true, 1000)
+	existing := absenceIncarnationKey(base, absenceClassLFS, 1)
+	if err := ref.ReserveRestoreCover(ctx, absenceRegistry(t, f), blob.QuotaRepoGroup(base), existing, 100, time.Hour); err != nil {
+		t.Fatalf("seed cover: %v", err)
+	}
+
+	st := newAbsencePassState()
+	st.coverSkip[base] = true
+	report := &AbsenceReport{}
+	errs := &boundedErrs{}
+	if r.chargeCover(ctx, base, absenceIncarnationKey(base, absenceClassPacks, 1), 50, false, report, st, errs) {
+		t.Fatal("fresh mint under coverSkip succeeded, want skipped")
+	}
+	if report.CoverErrors != 1 {
+		t.Fatalf("report = %+v, want the skipped mint counted as a cover error", report)
+	}
+	if !r.chargeCover(ctx, base, existing, 100, true, report, st, errs) {
+		t.Fatalf("same-key re-charge under coverSkip failed, want bypass (errs=%v)", errs.errs)
+	}
+	if got := ledgerReserved(t, f, base); got != 100 {
+		t.Fatalf("reserved = %d, want only the renewed existing cover", got)
+	}
 }
 
 // TestAbsenceReconcile_PurgedRepoSkipped: rows of a purge-fenced repo are

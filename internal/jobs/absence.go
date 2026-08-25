@@ -261,14 +261,17 @@ type AbsenceReconciler struct {
 	// proves no live cover exists).
 	liveCovers      map[string]map[string]liveCover
 	renewalComplete bool
-	// migratedLegacy memoizes nonce-keyed covers this PROCESS already
-	// folded into deterministic incarnations. Purely an optimization:
-	// every fresh worker re-folds each live nonce once (GREATEST-safe
-	// over-cover the rotation right-sizes within one clean range), but
-	// re-folding every pass would inflate and re-rotate the incarnation
-	// endlessly while the nonce decays. Process-lifetime, deliberately
-	// not per-pass — correctness never depends on it.
-	migratedLegacy map[string]bool
+	// migratedLegacy memoizes the byte WATERMARK this PROCESS already
+	// folded per nonce-keyed cover. Purely an optimization: every fresh
+	// worker re-folds each live nonce once (GREATEST-safe over-cover the
+	// rotation right-sizes within one clean range), but re-folding every
+	// pass would inflate and re-rotate the incarnation endlessly while
+	// the nonce decays. A watermark, not a boolean (Codex round 7, P1):
+	// an old replica can re-grow the same nonce mid-roll AFTER this
+	// process folded it, and a key-only memo would strand the growth in
+	// a decaying row the incarnations never absorbed. Process-lifetime,
+	// deliberately not per-pass — correctness never depends on it.
+	migratedLegacy map[string]int64
 	// lfsRange/packsRange track the base range each rotation is
 	// streaming through, in memory only: shrink/release verdicts are
 	// evaluated exclusively for ranges observed START to END within one
@@ -383,7 +386,7 @@ func NewAbsenceReconciler(registry AbsenceRegistry, blobs BlobStatter, quotaEnfo
 		coverTTL:       coverTTL,
 		logger:         logger,
 		passTimeout:    passTimeout,
-		migratedLegacy: make(map[string]bool),
+		migratedLegacy: make(map[string]int64),
 	}
 }
 
@@ -592,7 +595,7 @@ func (r *AbsenceReconciler) renewCovers(ctx context.Context, budget int64, repor
 				return
 			}
 		}
-		if r.chargeCover(ctx, held.Base, held.Key, held.Bytes, report, st, errs) {
+		if r.chargeCover(ctx, held.Base, held.Key, held.Bytes, true, report, st, errs) {
 			report.CoversRenewed++
 		}
 		if prev, seen := r.liveCovers[class][base]; !seen || n > prev.n {
@@ -674,8 +677,13 @@ func (r *AbsenceReconciler) renewCovers(ctx context.Context, budget int64, repor
 // fails, the legacy row is renewed as-is so nothing lapses, and the next
 // pass retries (grow-only merges make the retry idempotent).
 func (r *AbsenceReconciler) migrateLegacyCover(ctx context.Context, row *ref.AbsenceCoverRow, report *AbsenceReport, st *absencePassState, errs *boundedErrs) {
-	if r.migratedLegacy[row.RawKey] {
-		report.CoversDecaying++ // already folded by this process: decay on
+	if folded, seen := r.migratedLegacy[row.RawKey]; seen && row.Bytes <= folded {
+		// Already folded up to this total by this process: decay on. A
+		// LARGER listed total re-folds (Codex round 7, P1): an old
+		// replica can re-grow the same nonce mid-roll after the first
+		// fold, and that growth must reach the incarnations before the
+		// nonce decays.
+		report.CoversDecaying++
 		return
 	}
 	migrated := true
@@ -686,18 +694,22 @@ func (r *AbsenceReconciler) migrateLegacyCover(ctx context.Context, row *ref.Abs
 		}
 	}
 	if migrated {
-		r.migratedLegacy[row.RawKey] = true
+		r.migratedLegacy[row.RawKey] = row.Bytes
 		report.CoversDecaying++
 	}
 	if !migrated {
 		// Migration could not be proven durable (head lookup or charge
 		// failed, or the base is purge-fenced — where nothing must be
 		// re-minted): renew the nonce row as-is so nothing lapses, except
-		// for purged bases, whose rows are on their way out anyway.
+		// for purged bases, whose rows are on their way out anyway. The
+		// renewal is a same-key re-charge of a listed row, so it bypasses
+		// the pass-level coverSkip the failed fold may have just set
+		// (Codex round 7, P1): the ledger excludes the incoming key from
+		// its row-cap count, so this can succeed where a mint was denied.
 		if st.purged[row.Base] {
 			return
 		}
-		if r.chargeCover(ctx, row.Base, row.Key, row.Bytes, report, st, errs) {
+		if r.chargeCover(ctx, row.Base, row.Key, row.Bytes, true, report, st, errs) {
 			report.CoversRenewed++
 		}
 	}
@@ -716,7 +728,7 @@ func (r *AbsenceReconciler) foldIntoIncarnation(ctx context.Context, base, class
 	if target.key == "" {
 		target = liveCover{key: absenceIncarnationKey(base, class, 1), n: 1}
 	}
-	if !r.chargeCover(ctx, base, target.key, bytes, report, st, errs) {
+	if !r.chargeCover(ctx, base, target.key, bytes, head.key != "", report, st, errs) {
 		return false
 	}
 	if bytes > target.bytes {
@@ -949,7 +961,7 @@ func (r *AbsenceReconciler) endRange(ctx context.Context, tr *rangeTracker, repo
 		// row. A crash between the two leaves both; the next renewal
 		// deletes the superseded one.
 		next := liveCover{key: absenceIncarnationKey(base, class, head.n+1), n: head.n + 1, bytes: running}
-		if !r.chargeCover(ctx, base, next.key, running, report, st, errs) {
+		if !r.chargeCover(ctx, base, next.key, running, false, report, st, errs) {
 			return // retried next traversal; the old row keeps covering
 		}
 		if err := r.registry.DeleteAbsenceCover(ctx, head.key); err != nil {
@@ -1014,6 +1026,7 @@ func (r *AbsenceReconciler) chargeDeficit(ctx context.Context, tr *rangeTracker,
 	if tr.running <= head.bytes {
 		return // still within the live cover: renewal keeps it fresh
 	}
+	sameKey := head.key != ""
 	if head.key == "" {
 		// No LIVE incarnation (Codex round 6: expired rows are filtered
 		// as dead). Minting can collide with a lingering expired row of
@@ -1023,7 +1036,7 @@ func (r *AbsenceReconciler) chargeDeficit(ctx context.Context, tr *rangeTracker,
 		// expired-row cleanup removes lingering rows).
 		head = liveCover{key: absenceIncarnationKey(tr.base, tr.class, 1), n: 1}
 	}
-	if !r.chargeCover(ctx, tr.base, head.key, tr.running, report, st, errs) {
+	if !r.chargeCover(ctx, tr.base, head.key, tr.running, sameKey, report, st, errs) {
 		tr.dirty, r.cursorFor(tr.class).Dirty = true, true
 		return
 	}
@@ -1202,9 +1215,14 @@ func (r *AbsenceReconciler) repoPurged(ctx context.Context, base string, st *abs
 // FIRST, then bump (the round 57/58 order): an admission already holding
 // a floor scanned during the absence sees the cover in
 // active_reservations, while the bump only stops FUTURE serves of cached
-// deflated floors. Returns whether the cover row was charged.
-func (r *AbsenceReconciler) chargeCover(ctx context.Context, base, key string, size int64, report *AbsenceReport, st *absencePassState, errs *boundedErrs) bool {
-	if st.coverSkip[base] {
+// deflated floors. Returns whether the cover row was charged. sameKey
+// marks a re-charge of a row KNOWN to exist (renewal, fallback renewal,
+// grow of a resolved head): it bypasses the pass-level coverSkip memo
+// (Codex round 7, P1) because the ledger excludes the incoming key from
+// its active-row-cap count — a same-key re-charge can succeed where the
+// denial that set the memo was a fresh mint hitting the cap.
+func (r *AbsenceReconciler) chargeCover(ctx context.Context, base, key string, size int64, sameKey bool, report *AbsenceReport, st *absencePassState, errs *boundedErrs) bool {
+	if st.coverSkip[base] && !sameKey {
 		report.CoverErrors++
 		return false
 	}
