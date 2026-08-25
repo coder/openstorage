@@ -569,7 +569,10 @@ func resolveServeConfig(getenv func(string) string, flagListen, flagAddr, flagCa
 	if err != nil {
 		return serveConfig{}, err
 	}
-	if cfg.absence.interval > 0 && cfg.absence.interval*2 > cfg.packReservationTTL {
+	// Compare against TTL/2 by DIVISION (Codex round 7): interval*2 on an
+	// absurd-but-parseable duration overflows time.Duration negative and
+	// waves the misconfiguration through.
+	if cfg.absence.interval > 0 && cfg.absence.interval > cfg.packReservationTTL/2 {
 		// Covers renew at pass starts and a pass may run up to a quarter
 		// of the TTL (jobs.NewAbsenceReconciler), so the renewal gap is
 		// bounded by pass duration + interval + the next refresh phase —

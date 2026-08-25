@@ -1350,6 +1350,12 @@ func TestResolveServeConfigAbsenceIntervalTTLCoupling(t *testing.T) {
 	if _, err := resolveServeConfig(mapEnv(env), "", "127.0.0.1:0", "/tmp/cache", ""); err != nil {
 		t.Fatalf("interval = TTL/2 must resolve: %v", err)
 	}
+	// Overflow guard (Codex round 7): interval*2 on an absurd duration
+	// wraps negative; the division form must still reject it.
+	env["CODESTORAGE_ABSENCE_RECONCILE_INTERVAL"] = "2000000h"
+	if _, err := resolveServeConfig(mapEnv(env), "", "127.0.0.1:0", "/tmp/cache", ""); err == nil {
+		t.Fatal("overflow-scale interval resolved — the cadence bound must reject it")
+	}
 	// Disabled reconciliation never couples to the TTL.
 	env["CODESTORAGE_ABSENCE_RECONCILE_INTERVAL"] = "0"
 	if _, err := resolveServeConfig(mapEnv(env), "", "127.0.0.1:0", "/tmp/cache", ""); err != nil {
