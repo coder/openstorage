@@ -1251,6 +1251,53 @@ func TestAbsenceReconcile_UnprovableContinuitySuccessArmsFence(t *testing.T) {
 	}
 }
 
+// failFenceArmRegistry injects one transient failure into the
+// admission-fence arm write, leaving every other scan-state write intact.
+type failFenceArmRegistry struct {
+	AbsenceRegistry
+	fail bool
+}
+
+func (fr *failFenceArmRegistry) PutJobScanState(ctx context.Context, job, scope, payload string, generation int64) error {
+	if fr.fail && job == ref.ScanJobAbsence && scope == ref.ScanScopeAbsenceAdmissionFence {
+		fr.fail = false
+		return fmt.Errorf("flaky: injected fence-arm failure")
+	}
+	return fr.AbsenceRegistry.PutJobScanState(ctx, job, scope, payload, generation)
+}
+
+// TestAbsenceReconcile_FailedFenceArmSuppressesHealthStamp (Codex round
+// 30, P1): when continuity is unprovable and the required fence arm
+// FAILS transiently, the fresh health stamp must not run — it would make
+// the next pass treat renewal as continuous and never retry arming,
+// leaving admissions open while expired covers stay dead. The stale
+// watermark instead re-detects the unprovable continuity next pass, the
+// arm retries, and only a durable arm lets health stamp.
+func TestAbsenceReconcile_FailedFenceArmSuppressesHealthStamp(t *testing.T) {
+	f := newSweepFixture(t)
+	ctx := context.Background()
+	reg := absenceRegistry(t, f)
+	fr := &failFenceArmRegistry{AbsenceRegistry: reg, fail: true}
+	r := NewAbsenceReconciler(fr, f.blobs, true, 100, time.Hour, time.Minute, slog.New(slog.DiscardHandler))
+	if _, err := r.Run(ctx); err == nil {
+		t.Fatal("Run 1: want the injected fence-arm failure reported")
+	}
+	if _, ok, err := reg.GetJobScanState(ctx, ref.ScanJobAbsence, ref.ScanScopeAbsenceRenewalHealth); err != nil || ok {
+		t.Fatalf("health after failed arm = (ok=%v, %v), want NOT stamped", ok, err)
+	}
+
+	// Pass 2 (no injection): the stale watermark re-detects the
+	// unprovable continuity, the arm succeeds durably, health stamps,
+	// and the tiny registry's same-pass full rotation clears the fence.
+	r2 := NewAbsenceReconciler(fr, f.blobs, true, 100, time.Hour, time.Minute, slog.New(slog.DiscardHandler))
+	if _, err := r2.Run(ctx); err != nil {
+		t.Fatalf("Run 2: %v", err)
+	}
+	if _, ok, err := reg.GetJobScanState(ctx, ref.ScanJobAbsence, ref.ScanScopeAbsenceRenewalHealth); err != nil || !ok {
+		t.Fatalf("health after durable arm = (ok=%v, %v), want stamped", ok, err)
+	}
+}
+
 // TestAbsenceReconcile_GapMutationDefersLegacyRetirement (Codex rounds
 // 19-20): a foreign mutation landing while the cursor is parked mid-range
 // breaks fence continuity — the resumed completion must NOT prove the

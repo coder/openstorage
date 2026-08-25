@@ -907,24 +907,26 @@ func (r *AbsenceReconciler) armAdmissionFence(ctx context.Context, errs *bounded
 	r.armFence(ctx, errs, "cover renewal degraded past the lapse safety bound")
 }
 
-// armFence durably arms the admission fence (see armAdmissionFence for
-// the failure-path judgment and renewCovers for the success-path
-// continuity check, Codex round 29). Idempotent: re-arming refreshes the
-// traversal snapshot to the current persisted counters, which only
-// extends the required recovery rotation — the conservative direction.
-// Writes run on a bounded detached context.
-func (r *AbsenceReconciler) armFence(ctx context.Context, errs *boundedErrs, why string) {
+// armFence durably arms the admission fence and reports whether the
+// write proved durable (see armAdmissionFence for the failure-path
+// judgment and renewCovers for the success-path continuity check, Codex
+// rounds 29-30). Idempotent: re-arming refreshes the traversal snapshot
+// to the current persisted counters, which only extends the required
+// recovery rotation — the conservative direction. Writes run on a
+// bounded detached context.
+func (r *AbsenceReconciler) armFence(ctx context.Context, errs *boundedErrs, why string) bool {
 	sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), scanStateWriteTimeout)
 	defer cancel()
 	snap, mErr := json.Marshal(map[string]int64{"lfs": r.lfs.Traversals, "packs": r.packs.Traversals})
 	assertf(mErr == nil, "absence reconcile: marshal fence snapshot: %v", mErr)
 	if err := r.registry.PutJobScanState(sctx, ref.ScanJobAbsence, ref.ScanScopeAbsenceAdmissionFence, string(snap), 0); err != nil {
 		errs.add(fmt.Errorf("absence reconcile: arm admission fence: %w", err))
-		return
+		return false
 	}
 	r.fenceArmed, r.fenceLFS, r.fencePacks = true, r.lfs.Traversals, r.packs.Traversals
 	r.logger.Warn("absence reconcile: "+why+" — finite quota admissions fenced until a complete recovery rotation",
 		"lfs_traversals", r.fenceLFS, "packs_traversals", r.fencePacks)
+	return true
 }
 
 // settleAdmissionFence clears the admission fence after one healthy,
@@ -1118,13 +1120,22 @@ func (r *AbsenceReconciler) renewCovers(ctx context.Context, budget int64, repor
 			ok = false
 		}
 		if !ok || age >= r.coverTTL {
-			r.armFence(ctx, errs, "renewal continuity unprovable at a successful touch — covers may have lapsed while no pass was stamping")
+			if !r.armFence(ctx, errs, "renewal continuity unprovable at a successful touch — covers may have lapsed while no pass was stamping") {
+				// The required fence write is NOT proven durable: do
+				// not stamp health over the stale watermark (Codex
+				// round 30) — a fresh stamp would make the next pass
+				// treat renewal as continuous and never retry arming.
+				// Leaving the watermark stale re-detects the
+				// unprovable continuity next pass and retries.
+				return 0
+			}
 		}
 		// Stamp the DB-clock renewal-health watermark: the durable
 		// proof that every live cover was re-TTL'd just now (Codex
-		// round 26, security). A stamp failure leaves the watermark
-		// aging, which only moves the fleet TOWARD the fail-closed
-		// admission fence — the conservative direction.
+		// round 26, security) — written only AFTER any required fence
+		// arm proved durable (round 30). A stamp failure leaves the
+		// watermark aging, which only moves the fleet TOWARD the
+		// fail-closed admission fence — the conservative direction.
 		if err := r.registry.PutJobScanState(ctx, ref.ScanJobAbsence, ref.ScanScopeAbsenceRenewalHealth, "", 0); err != nil {
 			errs.add(fmt.Errorf("absence reconcile: stamp renewal health: %w", err))
 		}
