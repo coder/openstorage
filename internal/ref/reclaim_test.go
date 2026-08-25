@@ -19,9 +19,10 @@ type lfsReclaimStore interface {
 	ListRepoLFSObjects(ctx context.Context, repo, after string, limit int) ([]LFSObjectRow, error)
 	MarkLFSObjectsUnreferenced(ctx context.Context, repo string, keys []string) (int64, error)
 	ClearLFSObjectsUnreferenced(ctx context.Context, repo string, keys []string) (int64, error)
-	RetireUnreferencedLFSObject(ctx context.Context, repo, key string, pinnedGens map[string]int64, grace time.Duration) (bool, error)
+	RetireUnreferencedLFSObject(ctx context.Context, repo, key string, pinnedGens map[string]int64, grace, reapMaxAge time.Duration) (bool, error)
 	CountRefs(ctx context.Context, repo string, limit int64) (int64, error)
 	FenceRepoPurge(ctx context.Context, base string) error
+	ScanStateStore
 }
 
 func reclaimStore(t *testing.T, s Store) lfsReclaimStore {
@@ -29,6 +30,11 @@ func reclaimStore(t *testing.T, s Store) lfsReclaimStore {
 	rs, ok := s.(lfsReclaimStore)
 	if !ok {
 		t.Fatalf("store %T lacks the reclamation surface", s)
+	}
+	// Retirement gates on a fresh destructive-reap watermark (issue
+	// #120); seed one so verdict tests exercise their own guards.
+	if err := rs.PutJobScanState(context.Background(), ScanJobSweep, ScanScopeLFSDestructiveReap, "", 0); err != nil {
+		t.Fatalf("seed reap watermark: %v", err)
 	}
 	return rs
 }
@@ -93,12 +99,12 @@ func TestLFSReclaim_MarkClearRetire(t *testing.T) {
 
 		gens := pinCurrentGens(t, s, k.group)
 		// The cleared row is spared even at zero grace.
-		if retired, err := rs.RetireUnreferencedLFSObject(ctx, k.base(), keep, gens, 0); err != nil || retired {
+		if retired, err := rs.RetireUnreferencedLFSObject(ctx, k.base(), keep, gens, 0, time.Hour); err != nil || retired {
 			t.Fatalf("retire cleared row = (%v, %v), want spared", retired, err)
 		}
 		// The marked row retires: row gone, count and usage refunded,
 		// adoption generation bumped.
-		if retired, err := rs.RetireUnreferencedLFSObject(ctx, k.base(), junk, gens, 0); err != nil || !retired {
+		if retired, err := rs.RetireUnreferencedLFSObject(ctx, k.base(), junk, gens, 0, time.Hour); err != nil || !retired {
 			t.Fatalf("retire marked row = (%v, %v), want retired", retired, err)
 		}
 		if has, err := s.HasLFSObject(ctx, k.base(), junk); err != nil || has {
@@ -114,7 +120,7 @@ func TestLFSReclaim_MarkClearRetire(t *testing.T) {
 			t.Fatalf("adoption gen after retire = (%d, %v), want %d", gen, err, genBefore+1)
 		}
 		// Retiring again is a no-op verdict.
-		if retired, err := rs.RetireUnreferencedLFSObject(ctx, k.base(), junk, gens, 0); err != nil || retired {
+		if retired, err := rs.RetireUnreferencedLFSObject(ctx, k.base(), junk, gens, 0, time.Hour); err != nil || retired {
 			t.Fatalf("re-retire = (%v, %v), want no-op", retired, err)
 		}
 	})
@@ -136,7 +142,7 @@ func TestLFSReclaim_GraceSparesFreshMark(t *testing.T) {
 			t.Fatal(err)
 		}
 		gens := pinCurrentGens(t, s, k.group)
-		if retired, err := rs.RetireUnreferencedLFSObject(ctx, k.base(), key, gens, time.Hour); err != nil || retired {
+		if retired, err := rs.RetireUnreferencedLFSObject(ctx, k.base(), key, gens, time.Hour, time.Hour); err != nil || retired {
 			t.Fatalf("retire fresh mark = (%v, %v), want spared", retired, err)
 		}
 		if has, err := s.HasLFSObject(ctx, k.base(), key); err != nil || !has {
@@ -175,7 +181,7 @@ func TestLFSReclaim_LiveAdoptionClaimSpares(t *testing.T) {
 		gens := pinCurrentGens(t, s, k.group)
 		// Both spellings are spared while the canonical claim lives.
 		for _, key := range []string{canonical, legacy} {
-			if retired, err := rs.RetireUnreferencedLFSObject(ctx, k.base(), key, gens, 0); err != nil || retired {
+			if retired, err := rs.RetireUnreferencedLFSObject(ctx, k.base(), key, gens, 0, time.Hour); err != nil || retired {
 				t.Fatalf("retire %s under live claim = (%v, %v), want spared", key, retired, err)
 			}
 		}
@@ -183,7 +189,7 @@ func TestLFSReclaim_LiveAdoptionClaimSpares(t *testing.T) {
 			t.Fatal(err)
 		}
 		for _, key := range []string{canonical, legacy} {
-			if retired, err := rs.RetireUnreferencedLFSObject(ctx, k.base(), key, gens, 0); err != nil || !retired {
+			if retired, err := rs.RetireUnreferencedLFSObject(ctx, k.base(), key, gens, 0, time.Hour); err != nil || !retired {
 				t.Fatalf("retire %s after release = (%v, %v), want retired", key, retired, err)
 			}
 		}
@@ -233,11 +239,11 @@ func TestLFSReclaim_SubSecondGraceIsNotZero(t *testing.T) {
 			t.Fatal(err)
 		}
 		gens := pinCurrentGens(t, s, k.group)
-		if retired, err := rs.RetireUnreferencedLFSObject(ctx, k.base(), key, gens, 300*time.Millisecond); err != nil || retired {
+		if retired, err := rs.RetireUnreferencedLFSObject(ctx, k.base(), key, gens, 300*time.Millisecond, time.Hour); err != nil || retired {
 			t.Fatalf("retire fresh mark at sub-second grace = (%v, %v), want spared", retired, err)
 		}
 		// An explicit zero grace waives the window: the row stays retirable.
-		if retired, err := rs.RetireUnreferencedLFSObject(ctx, k.base(), key, gens, 0); err != nil || !retired {
+		if retired, err := rs.RetireUnreferencedLFSObject(ctx, k.base(), key, gens, 0, time.Hour); err != nil || !retired {
 			t.Fatalf("retire with waived grace = (%v, %v), want retired", retired, err)
 		}
 	})
@@ -263,12 +269,12 @@ func TestLFSReclaim_GenerationFence(t *testing.T) {
 		if won, err := s.CASRef(ctx, k.base(), "refs/heads/main", ZeroSHA, strings.Repeat("11", 20)); err != nil || !won {
 			t.Fatalf("CASRef = (%v, %v)", won, err)
 		}
-		if retired, err := rs.RetireUnreferencedLFSObject(ctx, k.base(), key, gens, 0); err != nil || retired {
+		if retired, err := rs.RetireUnreferencedLFSObject(ctx, k.base(), key, gens, 0, time.Hour); err != nil || retired {
 			t.Fatalf("retire with stale generations = (%v, %v), want spared", retired, err)
 		}
 		// Re-pinned generations pass.
 		gens = pinCurrentGens(t, s, k.group)
-		if retired, err := rs.RetireUnreferencedLFSObject(ctx, k.base(), key, gens, 0); err != nil || !retired {
+		if retired, err := rs.RetireUnreferencedLFSObject(ctx, k.base(), key, gens, 0, time.Hour); err != nil || !retired {
 			t.Fatalf("retire with fresh generations = (%v, %v), want retired", retired, err)
 		}
 	})
@@ -294,7 +300,7 @@ func TestLFSReclaim_TouchSpares(t *testing.T) {
 			t.Fatalf("touch = (%v, %v), want touched", touched, err)
 		}
 		gens := pinCurrentGens(t, s, k.group)
-		if retired, err := rs.RetireUnreferencedLFSObject(ctx, k.base(), key, gens, 0); err != nil || retired {
+		if retired, err := rs.RetireUnreferencedLFSObject(ctx, k.base(), key, gens, 0, time.Hour); err != nil || retired {
 			t.Fatalf("retire touched row = (%v, %v), want spared", retired, err)
 		}
 		// A touch of a vanished row reports the miss.
@@ -350,7 +356,7 @@ func TestLFSReclaim_PurgeFenceSkips(t *testing.T) {
 		if err := rs.FenceRepoPurge(ctx, k.base()); err != nil {
 			t.Fatal(err)
 		}
-		if retired, err := rs.RetireUnreferencedLFSObject(ctx, k.base(), key, gens, 0); err != nil || retired {
+		if retired, err := rs.RetireUnreferencedLFSObject(ctx, k.base(), key, gens, 0, time.Hour); err != nil || retired {
 			t.Fatalf("retire fenced repo = (%v, %v), want declined", retired, err)
 		}
 		if has, err := s.HasLFSObject(ctx, k.base(), key); err != nil || !has {
@@ -398,7 +404,7 @@ func TestLFSReclaim_RepoPaging(t *testing.T) {
 			t.Fatal(err)
 		}
 		gens := pinCurrentGens(t, s, k.group)
-		if retired, err := rs.RetireUnreferencedLFSObject(ctx, k.base(), key, gens, 0); err != nil || !retired {
+		if retired, err := rs.RetireUnreferencedLFSObject(ctx, k.base(), key, gens, 0, time.Hour); err != nil || !retired {
 			t.Fatalf("retire = (%v, %v)", retired, err)
 		}
 		for _, r := range page("") {

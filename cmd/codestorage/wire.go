@@ -191,6 +191,14 @@ func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL, loopbackBaseU
 	// INDEPENDENTLY of the retention window: `codestorage purge-repo`
 	// mints fences on retention-less deployments too (PR #105 round 8).
 	sweepCfg.PurgedRepoProbe = purgeReg.IsRepoPurged
+	// Destructive-reap watermark (issue #120): LFS reclamation's slot
+	// refunds gate on OBSERVED destructive-sweep completion; every clean
+	// armed pass records it through the shared scan-state rows.
+	scanState, ok := refStore.(ref.ScanStateStore)
+	assertf(ok, "ref store %T lacks the scan-state seams", refStore)
+	sweepCfg.RecordLFSReapComplete = func(ctx context.Context) error {
+		return scanState.PutJobScanState(ctx, ref.ScanJobSweep, ref.ScanScopeLFSDestructiveReap, "", 0)
+	}
 	sweeper := jobs.NewSweeper(blobStore, refStore, sweepCfg, logger)
 	var schedule *jobs.SweepSchedule
 	var stopReconcile func()

@@ -11,8 +11,11 @@ package ref
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
+
+	"github.com/jackc/pgx/v5"
 )
 
 // AbsenceCoverPrefix is the synthetic blob-key namespace the absence
@@ -143,6 +146,56 @@ ORDER BY key COLLATE "C" ASC LIMIT $3`,
 		out = append(out, r)
 	}
 	return out, rows.Err()
+}
+
+// coverRangeEnd is the exclusive upper bound matching every raw row whose
+// synthetic key starts with prefix (the appended reservation suffixes only
+// extend the key, so the prefix range covers them all).
+func coverRangeEnd(prefix string) string {
+	assertf(prefix != "" && prefix[len(prefix)-1] < 0xff, "coverRangeEnd(%q)", prefix)
+	return prefix[:len(prefix)-1] + string(prefix[len(prefix)-1]+1)
+}
+
+// AbsenceCoverHead returns the HIGHEST live cover row whose synthetic key
+// starts with prefix (byte order; the reconciler's zero-padded incarnation
+// spelling makes byte order numeric order). ok=false when none exists.
+// This is the reconciler's point lookup for a base's current aggregate
+// incarnation before charging into it (issue #125).
+func (s *PG) AbsenceCoverHead(ctx context.Context, prefix string) (AbsenceCoverRow, bool, error) {
+	assertf(strings.HasPrefix(prefix, AbsenceCoverPrefix), "AbsenceCoverHead(%q): not an absence cover prefix", prefix)
+	var r AbsenceCoverRow
+	err := s.pool.QueryRow(ctx, `
+SELECT key, repo, bytes FROM pack_reservations
+WHERE key COLLATE "C" >= $1 AND key COLLATE "C" < $2
+ORDER BY key COLLATE "C" DESC LIMIT 1`,
+		prefix, coverRangeEnd(prefix)).Scan(&r.RawKey, &r.Base, &r.Bytes)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return AbsenceCoverRow{}, false, nil
+	}
+	if err != nil {
+		return AbsenceCoverRow{}, false, fmt.Errorf("absence cover head %s: %w", prefix, err)
+	}
+	var ok bool
+	if r.Key, ok = stripAbsenceCoverRow(r.RawKey); !ok {
+		return AbsenceCoverRow{}, false, nil // foreign spelling: not ours
+	}
+	return r, true, nil
+}
+
+// DeleteAbsenceCover removes one absence-cover reservation row by its
+// synthetic key; deleting an absent row is a no-op. Only the absence
+// reconciler mints and owns rows under AbsenceCoverPrefix, and River's
+// unique periodic jobs serialize its passes fleet-wide, so the delete
+// cannot race another writer of the row; an admission racing the delete
+// sees the same outcome as the row's TTL expiry.
+func (s *PG) DeleteAbsenceCover(ctx context.Context, key string) error {
+	assertf(strings.HasPrefix(key, AbsenceCoverPrefix), "DeleteAbsenceCover(%q): not an absence cover key", key)
+	_, err := s.pool.Exec(ctx,
+		`DELETE FROM pack_reservations WHERE key = $1`, reservRowKey(key+RepairCoverSuffix))
+	if err != nil {
+		return fmt.Errorf("delete absence cover %s: %w", key, err)
+	}
+	return nil
 }
 
 // ListFleetPacks pages registered pack rows fleet-wide, keyset on the

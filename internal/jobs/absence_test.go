@@ -1,5 +1,7 @@
-// Absence reconciler tests (issue #101): SQLite + fileblob, reusing the
-// sweep fixture (same package) for the store/blob pair.
+// Absence reconciler tests (issues #101 + #125): SQLite + fileblob, reusing
+// the sweep fixture (same package) for the store/blob pair. All cross-pass
+// state is fleet-durable, so several tests hand the same fixture to a FRESH
+// reconciler to simulate River scheduling a pass on another replica.
 package jobs
 
 import (
@@ -14,13 +16,36 @@ import (
 	"github.com/coder/code-storage/internal/ref"
 )
 
-func testReconciler(t *testing.T, f *sweepFixture, quotaEnforced bool, budget int64) *AbsenceReconciler {
+func absenceRegistry(t *testing.T, f *sweepFixture) AbsenceRegistry {
 	t.Helper()
 	reg, ok := f.store.(AbsenceRegistry)
 	if !ok {
 		t.Fatalf("store %T lacks the absence reconciliation seams", f.store)
 	}
-	return NewAbsenceReconciler(reg, f.blobs, quotaEnforced, budget, time.Hour, slog.New(slog.DiscardHandler))
+	return reg
+}
+
+func testReconciler(t *testing.T, f *sweepFixture, quotaEnforced bool, budget int64) *AbsenceReconciler {
+	t.Helper()
+	return NewAbsenceReconciler(absenceRegistry(t, f), f.blobs, quotaEnforced, budget, time.Hour, slog.New(slog.DiscardHandler))
+}
+
+// pinLFSLeader resets the durable pass counter so the next pass leads with
+// the LFS phase (alternation is durable state now, not a struct field).
+func pinLFSLeader(t *testing.T, f *sweepFixture) {
+	t.Helper()
+	reg := absenceRegistry(t, f)
+	st, ok, err := reg.GetJobScanState(context.Background(), ref.ScanJobAbsence, ref.ScanScopeAbsenceRenewal)
+	if err != nil {
+		t.Fatalf("read renewal state: %v", err)
+	}
+	payload := ""
+	if ok {
+		payload = st.Payload
+	}
+	if err := reg.PutJobScanState(context.Background(), ref.ScanJobAbsence, ref.ScanScopeAbsenceRenewal, payload, 0); err != nil {
+		t.Fatalf("pin leader: %v", err)
+	}
 }
 
 func absenceOID(b byte) string { return strings.Repeat(string([]byte{b, b}), 32)[:64] }
@@ -74,6 +99,9 @@ func TestAbsenceReconcile_AllPresent(t *testing.T) {
 		report.LFSRowsAbsent != 0 || report.PackRowsAbsent != 0 || report.CoversCharged != 0 {
 		t.Fatalf("report = %+v, want 1+1 examined, none absent", report)
 	}
+	if report.LFSTraversals != 1 || report.PackTraversals != 1 {
+		t.Fatalf("report = %+v, want one completed traversal per class", report)
+	}
 	if got := ledgerReserved(t, f, base); got != 0 {
 		t.Fatalf("reserved = %d, want 0", got)
 	}
@@ -85,7 +113,7 @@ func TestAbsenceReconcile_AllPresent(t *testing.T) {
 // TestAbsenceReconcile_LFSAbsentCoversAndBumps is the core issue-#101
 // behavior: a registered LFS object missing under both spellings is
 // charged as a restore cover visible to admission, the floor generation is
-// bumped, and re-running re-charges the same cover row without doubling.
+// bumped, and re-running renews the same cover row without doubling.
 func TestAbsenceReconcile_LFSAbsentCoversAndBumps(t *testing.T) {
 	f := newSweepFixture(t)
 	base := "repo-lfs-lost"
@@ -108,17 +136,17 @@ func TestAbsenceReconcile_LFSAbsentCoversAndBumps(t *testing.T) {
 		t.Fatalf("adoption gen = %d, want a bump past %d", gen, genBefore)
 	}
 
-	// Re-running refreshes the same-key cover row: still one cover's
-	// bytes, not two.
+	// Re-running renews the same incarnation key: still one cover's
+	// bytes, not two — steady-state cover stays EXACT (1×).
 	report, err = r.Run(context.Background())
 	if err != nil {
 		t.Fatalf("Run 2: %v", err)
 	}
-	if report.CoversCharged != 1 {
-		t.Fatalf("second pass covers = %d, want 1 (re-charge)", report.CoversCharged)
+	if report.CoversRenewed != 1 || report.CoversCharged != 1 {
+		t.Fatalf("second pass = %+v, want exactly the renewal charge", report)
 	}
 	if got := ledgerReserved(t, f, base); got != 1000 {
-		t.Fatalf("reserved after re-charge = %d, want 1000 (same-key refresh)", got)
+		t.Fatalf("reserved after renewal = %d, want 1000 (same-key refresh)", got)
 	}
 }
 
@@ -202,41 +230,67 @@ func TestAbsenceReconcile_PackAbsent(t *testing.T) {
 	}
 }
 
-// TestAbsenceReconcile_BudgetResume: a budget-limited pass advances the
-// flat cursor and the next pass resumes strictly after it, reaching rows
-// past the first pass's horizon.
-func TestAbsenceReconcile_BudgetResume(t *testing.T) {
+// TestAbsenceReconcile_HandoffResumesCursorAndCovers (issue #125): the
+// rotation cursor and cover renewal both derive from durable state, so a
+// pass on a DIFFERENT worker resumes exactly where the previous one
+// parked — no re-examined prefix — and keeps discovered covers alive.
+func TestAbsenceReconcile_HandoffResumesCursorAndCovers(t *testing.T) {
 	f := newSweepFixture(t)
-	base := "repo-budget"
+	base := "repo-handoff"
 	first := blob.LFSKey(base, absenceOID('a'))
 	second := blob.LFSKey(base, absenceOID('b')) // sorts after first; bytes lost
 	size := f.upload(first, "present-bytes")
 	registerLFS(t, f, base, first, size)
 	registerLFS(t, f, base, second, 400)
 
-	// Budget 2: the leading LFS phase gets 1 unit per pass — one row each.
-	r := testReconciler(t, f, true, 2)
-	report, err := r.Run(context.Background())
+	// Worker A: budget 2 → the leading LFS phase gets 1 unit — the
+	// present first row only; the cursor parks durably after it.
+	workerA := testReconciler(t, f, true, 2)
+	report, err := workerA.Run(context.Background())
 	if err != nil {
-		t.Fatalf("Run 1: %v", err)
+		t.Fatalf("worker A: %v", err)
 	}
 	if report.LFSRowsExamined != 1 || report.LFSRowsAbsent != 0 {
-		t.Fatalf("pass 1 report = %+v, want the present first row only", report)
+		t.Fatalf("worker A report = %+v, want the present first row only", report)
 	}
-	r.passes = 0 // pin the LFS phase as leader; alternation is tested separately
-	report, err = r.Run(context.Background())
+
+	// Worker B is a FRESH reconciler (a different replica): it must
+	// resume strictly after the parked cursor and discover the loss
+	// without re-examining the prefix.
+	pinLFSLeader(t, f)
+	workerB := testReconciler(t, f, true, 2)
+	report, err = workerB.Run(context.Background())
 	if err != nil {
-		t.Fatalf("Run 2: %v", err)
+		t.Fatalf("worker B: %v", err)
 	}
 	if report.LFSRowsExamined != 1 || report.LFSRowsAbsent != 1 || report.CoversCharged != 1 {
-		t.Fatalf("pass 2 report = %+v, want the resumed absent row covered", report)
+		t.Fatalf("worker B report = %+v, want the resumed absent row covered", report)
+	}
+	if got := ledgerReserved(t, f, base); got != 400 {
+		t.Fatalf("reserved = %d, want the 400-byte cover", got)
+	}
+
+	// Worker C (fresh again, rotation nowhere near the row): the renewal
+	// phase re-derives the cover from the durable listing and re-charges
+	// it — the exact continuity issue #125 closes.
+	workerC := testReconciler(t, f, true, 6)
+	report, err = workerC.Run(context.Background())
+	if err != nil {
+		t.Fatalf("worker C: %v", err)
+	}
+	if report.CoversRenewed != 1 {
+		t.Fatalf("worker C report = %+v, want the cover renewed from durable state", report)
+	}
+	if got := ledgerReserved(t, f, base); got != 400 {
+		t.Fatalf("reserved after handoff renewal = %d, want 400", got)
 	}
 }
 
 // TestAbsenceReconcile_PhaseAlternation (Codex round 1, P2): a twin probe
 // can overdraw the leading LFS allocation at degenerate budgets; the
-// leading phase alternates so the pack registry still gets examined every
-// other pass. Quota is disabled so the refresh set cannot skew budgets.
+// leading phase alternates (durably) so the pack registry still gets
+// examined every other pass. Quota is disabled so renewal cannot skew
+// budgets.
 func TestAbsenceReconcile_PhaseAlternation(t *testing.T) {
 	f := newSweepFixture(t)
 	base := "repo-alternate"
@@ -264,12 +318,13 @@ func TestAbsenceReconcile_PhaseAlternation(t *testing.T) {
 	}
 }
 
-// TestAbsenceReconcile_RefreshKeepsCoversAlive (Codex round 1, P1): a
-// discovered loss re-charges its cover every pass through the known-absent
-// refresh, independent of where the bounded rotation happens to be.
-func TestAbsenceReconcile_RefreshKeepsCoversAlive(t *testing.T) {
+// TestAbsenceReconcile_RenewalKeepsCoversAliveWithoutRevisit (Codex round 1
+// on PR #123, P1): a discovered loss re-charges its cover every pass
+// through the renewal listing, independent of where the bounded rotation
+// happens to be.
+func TestAbsenceReconcile_RenewalKeepsCoversAliveWithoutRevisit(t *testing.T) {
 	f := newSweepFixture(t)
-	base := "repo-refresh"
+	base := "repo-renewal"
 	for _, b := range []byte{'a', 'b', 'c'} {
 		key := blob.LFSKey(base, absenceOID(b))
 		size := f.upload(key, "present-"+string(b))
@@ -283,33 +338,35 @@ func TestAbsenceReconcile_RefreshKeepsCoversAlive(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run 1: %v", err)
 	}
-	if report.CoversCharged != 1 || report.AbsentTracked != 1 {
-		t.Fatalf("pass 1 report = %+v, want the loss covered and tracked", report)
+	if report.CoversCharged != 1 || report.LFSRowsAbsent != 1 {
+		t.Fatalf("pass 1 report = %+v, want the loss covered", report)
 	}
 
-	// Pass 2 with budget 6: the refresh (3 units) re-charges the cover;
-	// the rotation's remainder is exhausted by the three present rows and
-	// never reaches the lost row itself.
+	// Pass 2 with budget 6: the renewal re-charges the cover; the
+	// rotation's remainder is exhausted by the present rows and never
+	// reaches the lost row itself.
+	pinLFSLeader(t, f)
 	r.budget = 6
 	report, err = r.Run(context.Background())
 	if err != nil {
 		t.Fatalf("Run 2: %v", err)
 	}
-	if report.CoversCharged != 1 || report.AbsentTracked != 1 {
-		t.Fatalf("pass 2 report = %+v, want the refresh to re-charge the cover", report)
+	if report.CoversRenewed != 1 || report.LFSRowsAbsent != 0 {
+		t.Fatalf("pass 2 report = %+v, want the renewal to re-charge the cover without revisiting the row", report)
 	}
 	if got := ledgerReserved(t, f, base); got != 900 {
-		t.Fatalf("reserved = %d, want the refreshed 900-byte cover", got)
+		t.Fatalf("reserved = %d, want the renewed 900-byte cover", got)
 	}
 }
 
-// TestAbsenceReconcile_RefreshDropsRemovedRows: a tracked loss whose
-// registry row disappears (repack fold, retirement, purge completion) is
-// dropped from the refresh set instead of being covered forever.
-func TestAbsenceReconcile_RefreshDropsRemovedRows(t *testing.T) {
+// TestAbsenceReconcile_FoldedAwayRowReleasesCover: a covered loss whose
+// registry row disappears (repack fold, retirement, purge completion) has
+// its cover RELEASED once a full range re-derivation proves nothing is
+// missing — never renewed forever.
+func TestAbsenceReconcile_FoldedAwayRowReleasesCover(t *testing.T) {
 	f := newSweepFixture(t)
 	ctx := context.Background()
-	base := "repo-refresh-drop"
+	base := "repo-fold"
 	lostPack := ref.Pack{ID: "old", Key: blob.PackKey(base, "old"), Size: 500}
 	if err := f.store.RegisterPacks(ctx, base, []ref.Pack{lostPack}); err != nil {
 		t.Fatal(err)
@@ -320,8 +377,8 @@ func TestAbsenceReconcile_RefreshDropsRemovedRows(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run 1: %v", err)
 	}
-	if report.PackRowsAbsent != 1 || report.AbsentTracked != 1 {
-		t.Fatalf("pass 1 report = %+v, want the pack loss tracked", report)
+	if report.PackRowsAbsent != 1 || report.CoversCharged != 1 {
+		t.Fatalf("pass 1 report = %+v, want the pack loss covered", report)
 	}
 
 	// A repack fold replaces the lost row; the successor's bytes exist.
@@ -335,11 +392,14 @@ func TestAbsenceReconcile_RefreshDropsRemovedRows(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run 2: %v", err)
 	}
-	// The renewal sub-phase re-charges the base aggregate once before
-	// re-verification discovers the fold and drops the row (conservative
-	// over-cover for at most one TTL); the tracking itself must be gone.
-	if report.AbsentTracked != 0 || report.CoversCharged != 1 || report.PackRowsAbsent != 0 {
-		t.Fatalf("pass 2 report = %+v, want the folded-away row dropped from the refresh set", report)
+	// The renewal re-charges once (conservative), then the rotation's
+	// full range re-derivation finds nothing missing and RELEASES the
+	// row — no TTL tail.
+	if report.CoversReleased != 1 || report.PackRowsAbsent != 0 {
+		t.Fatalf("pass 2 report = %+v, want the folded-away loss's cover released", report)
+	}
+	if got := ledgerReserved(t, f, base); got != 0 {
+		t.Fatalf("reserved = %d, want 0 after the release", got)
 	}
 	report, err = r.Run(ctx)
 	if err != nil {
@@ -350,234 +410,69 @@ func TestAbsenceReconcile_RefreshDropsRemovedRows(t *testing.T) {
 	}
 }
 
-// TestAbsenceReconcile_RefreshRoundRobin (Codex rounds 2+3, P1): a tracked
-// set larger than one pass's refresh capacity renews deterministically —
-// the ring cursor persists across passes, so the entries a pass could not
-// reach are exactly where the next pass starts.
-func TestAbsenceReconcile_RefreshRoundRobin(t *testing.T) {
+// TestAbsenceReconcile_RenewalRoundRobin (issue #125): a live cover
+// population larger than the renewal half-budget renews round-robin across
+// passes on the DURABLE cursor, loudly flagged; a raised budget renews all.
+func TestAbsenceReconcile_RenewalRoundRobin(t *testing.T) {
 	f := newSweepFixture(t)
-	base := "repo-roundrobin"
-	for i := 0; i < 18; i++ {
-		oid := strings.Repeat("a", 62) + string([]byte{'0' + byte(i/10), '0' + byte(i%10)})
-		registerLFS(t, f, base, blob.LFSKey(base, oid), 10)
+	for i := 0; i < 60; i++ {
+		base := fmt.Sprintf("repo-rr-%02d", i)
+		registerLFS(t, f, base, blob.LFSKey(base, absenceOID('a')), 10)
 	}
 
-	// Refresh half-budget 50 at the 3-unit worst cost refreshes 17 of the
-	// 18 tracked losses per pass (the last entry may start with any
-	// budget remainder, overdrawing by design like the rotations).
-	r := testReconciler(t, f, true, 100)
+	// Pass 1: a large budget discovers and covers all 60 losses.
+	r := testReconciler(t, f, true, 400)
 	report, err := r.Run(context.Background())
 	if err != nil {
 		t.Fatalf("Run 1: %v", err)
 	}
-	if report.LFSRowsAbsent != 18 || report.AbsentTracked != 18 || report.AbsentUntracked != 0 {
-		t.Fatalf("pass 1 report = %+v, want all 18 losses tracked", report)
-	}
-	// All 18 losses aggregate into ONE per-base cover row totaling their
-	// bytes (Codex round 4: per-key rows would collide with the per-base
-	// active-reservation-row cap on big incidents).
-	if got := ledgerReserved(t, f, base); got != 180 {
-		t.Fatalf("reserved = %d, want the 180-byte base aggregate", got)
-	}
-	for pass := 2; pass <= 3; pass++ {
-		report, err = r.Run(context.Background())
-		if err != nil {
-			t.Fatalf("Run %d: %v", pass, err)
-		}
-		if report.AbsentRefreshed != 17 || report.AbsentTracked != 18 {
-			t.Fatalf("pass %d report = %+v, want 17 of 18 tracked losses refreshed (ring capacity)", pass, report)
-		}
-	}
-}
-
-// stubAbsenceRegistry/stubStatter drive the ring mechanics without a store:
-// every row stays registered and absent, and covers always admit.
-type stubAbsenceRegistry struct{}
-
-func (stubAbsenceRegistry) ListFleetLFSObjects(context.Context, string, string, int) ([]ref.AbsenceLFSRow, error) {
-	return nil, nil
-}
-
-func (stubAbsenceRegistry) ListFleetPacks(context.Context, string, string, int) ([]ref.AbsencePackRow, error) {
-	return nil, nil
-}
-func (stubAbsenceRegistry) IsRepoPurged(context.Context, string) (bool, error)    { return false, nil }
-func (stubAbsenceRegistry) BumpLFSAdoptionGen(context.Context, string) error      { return nil }
-func (stubAbsenceRegistry) HasPack(context.Context, string, string) (bool, error) { return true, nil }
-func (stubAbsenceRegistry) HasLFSObject(context.Context, string, string) (bool, error) {
-	return true, nil
-}
-
-func (stubAbsenceRegistry) ReservePackBytes(context.Context, []string, []ref.Pack, string, int64, int64, int64, time.Duration) (ref.ReserveDecision, error) {
-	return ref.ReserveDecision{OK: true}, nil
-}
-
-// recordingAbsenceRegistry wraps the stub to capture reserved keys.
-type recordingAbsenceRegistry struct {
-	stubAbsenceRegistry
-	reserved []string
-}
-
-func (r *recordingAbsenceRegistry) ReservePackBytes(_ context.Context, _ []string, packs []ref.Pack, _ string, _, _, _ int64, _ time.Duration) (ref.ReserveDecision, error) {
-	for _, p := range packs {
-		r.reserved = append(r.reserved, p.Key)
-	}
-	return ref.ReserveDecision{OK: true}, nil
-}
-
-type stubStatter struct{ stats []string }
-
-func (s *stubStatter) Stat(_ context.Context, key string) (int64, error) {
-	s.stats = append(s.stats, key)
-	return 0, blob.ErrNotFound
-}
-
-// TestAbsenceRefreshRingOrder: the refresh visits tracked losses in ring
-// order across calls, resuming at the persistent cursor and wrapping.
-func TestAbsenceRefreshRingOrder(t *testing.T) {
-	statter := &stubStatter{}
-	r := NewAbsenceReconciler(stubAbsenceRegistry{}, statter, true, 100, time.Hour, slog.New(slog.DiscardHandler))
-	keys := make([]string, 5)
-	var report AbsenceReport
-	for i := range keys {
-		oid := strings.Repeat("b", 63) + string([]byte{'0' + byte(i)})
-		keys[i] = blob.LFSKey("base", oid)
-		r.trackAbsent(absentRow{repo: "base", key: keys[i], bytes: 10, registered: 10}, &report)
+	if report.LFSRowsAbsent != 60 || report.CoversCharged != 60 {
+		t.Fatalf("pass 1 report = %+v, want 60 losses covered", report)
 	}
 
-	refresh := func(budget int64) []string {
-		statter.stats = nil
-		var errs boundedErrs
-		rep := AbsenceReport{QuotaEnforced: true}
-		r.refreshKnownAbsent(context.Background(), budget, &rep, newAbsencePassState(), &errs)
-		if err := errs.join(); err != nil {
-			t.Fatalf("refresh: %v", err)
-		}
-		var primaries []string
-		for _, s := range statter.stats {
-			if strings.Contains(s, "/o2/") {
-				primaries = append(primaries, s)
-			}
-		}
-		return primaries
+	// Pass 2 at budget 100: the renewal half (50) cannot renew 60 rows —
+	// round-robin, loud.
+	r.budget = 100
+	report, err = r.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run 2: %v", err)
 	}
-	assertSeq := func(got, want []string) {
-		t.Helper()
-		if len(got) != len(want) {
-			t.Fatalf("visited %v, want %v", got, want)
-		}
-		for i := range want {
-			if got[i] != want[i] {
-				t.Fatalf("visited %v, want %v", got, want)
-			}
-		}
+	if !report.RenewalIncomplete || report.CoversRenewed != 50 {
+		t.Fatalf("pass 2 report = %+v, want a loud 50-row renewal backlog", report)
 	}
-	// Budget 6 = two rows per call at the 3-unit worst cost.
-	assertSeq(refresh(6), []string{keys[0], keys[1]})
-	assertSeq(refresh(6), []string{keys[2], keys[3]})
-	assertSeq(refresh(6), []string{keys[4], keys[0]}) // wrapped
+
+	// Pass 3 with the budget raised: the durable cursor resumes at the
+	// un-renewed tail first, then wraps — every cover renews.
+	r.budget = 400
+	report, err = r.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run 3: %v", err)
+	}
+	if report.RenewalIncomplete || report.CoversRenewed != 60 {
+		t.Fatalf("pass 3 report = %+v, want all 60 covers renewed", report)
+	}
 }
 
 // TestAbsencePassTimeoutClampedToTTL (Codex round 3, security): the pass
 // wall-clock cap tightens to a quarter of the cover TTL so a long scan can
 // never hold the next renewal past a live cover's expiry.
 func TestAbsencePassTimeoutClampedToTTL(t *testing.T) {
+	f := newSweepFixture(t)
 	log := slog.New(slog.DiscardHandler)
-	r := NewAbsenceReconciler(stubAbsenceRegistry{}, &stubStatter{}, true, 100, 40*time.Minute, log)
+	r := NewAbsenceReconciler(absenceRegistry(t, f), f.blobs, true, 100, 40*time.Minute, log)
 	if r.passTimeout != 10*time.Minute {
 		t.Fatalf("passTimeout = %v with a 40m TTL, want 10m (TTL/4)", r.passTimeout)
 	}
-	r = NewAbsenceReconciler(stubAbsenceRegistry{}, &stubStatter{}, true, 100, 8*time.Hour, log)
+	r = NewAbsenceReconciler(absenceRegistry(t, f), f.blobs, true, 100, 8*time.Hour, log)
 	if r.passTimeout != time.Hour {
 		t.Fatalf("passTimeout = %v with an 8h TTL, want the 1h ceiling", r.passTimeout)
 	}
 }
 
-// TestAbsenceShrinkRotationCoalesced (Codex round 8): heals interleaved
-// with re-charges within one pass must mint at most ONE fresh aggregate
-// incarnation per base — eager per-heal rotation could fill the per-base
-// reservation-row cap in a single pass.
-func TestAbsenceShrinkRotationCoalesced(t *testing.T) {
-	reg := &recordingAbsenceRegistry{}
-	r := NewAbsenceReconciler(reg, &stubStatter{}, true, 1000, time.Hour, slog.New(slog.DiscardHandler))
-	var report AbsenceReport
-	base := "repo-coalesce"
-	keys := make([]string, 8)
-	for i := range keys {
-		oid := strings.Repeat("d", 63) + string([]byte{'0' + byte(i)})
-		keys[i] = blob.LFSKey(base, oid)
-		r.trackAbsent(absentRow{repo: base, key: keys[i], bytes: 10, registered: 10}, &report)
-	}
-
-	// One pass state: alternate heal (untrack → shrink) with a re-charge
-	// (coverBase), eight times.
-	st := newAbsencePassState()
-	var errs boundedErrs
-	ctx := context.Background()
-	for i := 0; i < 7; i++ {
-		r.untrackAbsent(keys[i])
-		r.coverBase(ctx, base, &report, st, &errs)
-	}
-	if err := errs.join(); err != nil {
-		t.Fatalf("coverBase: %v", err)
-	}
-	distinct := map[string]bool{}
-	for _, k := range reg.reserved {
-		distinct[k] = true
-	}
-	if len(distinct) > 1 {
-		t.Fatalf("pass minted %d distinct aggregate incarnations (%v), want at most 1", len(distinct), reg.reserved)
-	}
-
-	// Shrinks after this pass's rotation stay PENDING (Codex round 9):
-	// the next pass must rotate once more so the final 10-byte total
-	// leaves the GREATEST-pinned intermediate key.
-	passOneCharges := len(reg.reserved)
-	r.coverBase(ctx, base, &report, newAbsencePassState(), &errs)
-	if err := errs.join(); err != nil {
-		t.Fatalf("coverBase pass 2: %v", err)
-	}
-	if len(reg.reserved) != passOneCharges+1 {
-		t.Fatalf("pass 2 charged %d times, want exactly 1", len(reg.reserved)-passOneCharges)
-	}
-	if last := reg.reserved[len(reg.reserved)-1]; distinct[last] {
-		t.Fatalf("pass 2 reused a pass-1 incarnation %q — the pending shrink was lost", last)
-	}
-}
-
-// TestAbsenceUntrackSwapRemove: O(1) removal keeps the map and ring
-// consistent, and the refresh still renews every survivor.
-func TestAbsenceUntrackSwapRemove(t *testing.T) {
-	statter := &stubStatter{}
-	r := NewAbsenceReconciler(stubAbsenceRegistry{}, statter, true, 100, time.Hour, slog.New(slog.DiscardHandler))
-	var report AbsenceReport
-	keys := make([]string, 4)
-	for i := range keys {
-		oid := strings.Repeat("c", 63) + string([]byte{'0' + byte(i)})
-		keys[i] = blob.LFSKey("base", oid)
-		r.trackAbsent(absentRow{repo: "base", key: keys[i], bytes: 10, registered: 10}, &report)
-	}
-	r.untrackAbsent(keys[1])
-	r.untrackAbsent(keys[1]) // idempotent
-	r.untrackAbsent(keys[3])
-	if len(r.knownAbsent) != 2 || len(r.refreshRing) != 2 {
-		t.Fatalf("tracked=%d ring=%d, want 2/2", len(r.knownAbsent), len(r.refreshRing))
-	}
-	var errs boundedErrs
-	rep := AbsenceReport{QuotaEnforced: true}
-	r.refreshKnownAbsent(context.Background(), 100, &rep, newAbsencePassState(), &errs)
-	if err := errs.join(); err != nil {
-		t.Fatalf("refresh: %v", err)
-	}
-	if rep.AbsentRefreshed != 2 {
-		t.Fatalf("refreshed %d survivors, want 2", rep.AbsentRefreshed)
-	}
-}
-
 // TestAbsenceReconcile_TruncatedCovered (Codex round 4, security): a blob
 // physically present but SHORTER than its registered size deflates the
-// floor by the deficit — covered and tracked exactly like partial absence,
-// and released once the full bytes return.
+// floor by the deficit — covered exactly like partial absence, and
+// RELEASED once the full bytes return.
 func TestAbsenceReconcile_TruncatedCovered(t *testing.T) {
 	f := newSweepFixture(t)
 	base := "repo-truncated"
@@ -599,11 +494,11 @@ func TestAbsenceReconcile_TruncatedCovered(t *testing.T) {
 		t.Fatalf("report = %+v, want one truncated row per registry", report)
 	}
 	if got := ledgerReserved(t, f, base); got != (40-5)+(9-3) {
-		t.Fatalf("reserved = %d, want the 41-byte deficit aggregate", got)
+		t.Fatalf("reserved = %d, want the 41-byte deficit across both classes", got)
 	}
 
-	// Full bytes return: one final renewal precedes the re-verification
-	// that releases the tracking.
+	// Full bytes return: the next pass's range re-derivation releases
+	// both covers outright — no TTL tail.
 	if got := f.upload(lfsKey, strings.Repeat("x", 40)); got != 40 {
 		t.Fatalf("healed to %d bytes, want 40", got)
 	}
@@ -614,16 +509,18 @@ func TestAbsenceReconcile_TruncatedCovered(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run 2: %v", err)
 	}
-	if report.AbsentTracked != 0 || report.LFSRowsTruncated != 0 || report.PackRowsTruncated != 0 {
-		t.Fatalf("pass 2 report = %+v, want healed truncations released", report)
+	if report.CoversReleased != 2 || report.LFSRowsTruncated != 0 || report.PackRowsTruncated != 0 {
+		t.Fatalf("pass 2 report = %+v, want both healed covers released", report)
+	}
+	if got := ledgerReserved(t, f, base); got != 0 {
+		t.Fatalf("reserved = %d, want 0 after the releases", got)
 	}
 }
 
-// TestAbsenceReconcile_TruncationPartialHeal (Codex round 5, security): a
-// tracked truncation stores its DEFICIT, but re-verification must compare
-// fresh Stats against the authoritative REGISTERED size — comparing
-// against the deficit would untrack a partially healed row while bytes
-// are still missing.
+// TestAbsenceReconcile_TruncationPartialHeal (Codex round 5, security): the
+// re-derived total compares fresh Stats against the authoritative
+// REGISTERED size, so a partial heal shrinks the cover to the residual
+// deficit — never releases it while bytes are still missing.
 func TestAbsenceReconcile_TruncationPartialHeal(t *testing.T) {
 	f := newSweepFixture(t)
 	base := "repo-partial-heal"
@@ -639,31 +536,28 @@ func TestAbsenceReconcile_TruncationPartialHeal(t *testing.T) {
 		t.Fatalf("reserved = %d, want the 35-byte deficit", got)
 	}
 
-	// Partial heal: 25 of 40 bytes now physical. Deficit-relative
-	// comparison would see 25 >= 35-deficit... wrong on every axis; the
-	// registered-size comparison keeps a 15-byte deficit tracked.
+	// Partial heal: 25 of 40 bytes now physical → residual deficit 15.
+	// The next pass's exact re-derivation ROTATES the cover down to 15
+	// and deletes the stale 35-byte row.
 	if got := f.upload(key, strings.Repeat("p", 25)); got != 25 {
 		t.Fatalf("healed to %d bytes, want 25", got)
 	}
-	var report AbsenceReport
-	var err error
-	for pass := 2; pass <= 3; pass++ {
-		if report, err = r.Run(context.Background()); err != nil {
-			t.Fatalf("Run %d: %v", pass, err)
-		}
+	report, err := r.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run 2: %v", err)
 	}
-	if report.AbsentTracked != 1 || report.LFSRowsTruncated == 0 {
-		t.Fatalf("report = %+v, want the 15-byte residual deficit still tracked", report)
+	if report.CoversRotated != 1 || report.LFSRowsTruncated != 1 {
+		t.Fatalf("pass 2 report = %+v, want the cover rotated to the residual deficit", report)
 	}
-	if got := ledgerReserved(t, f, base); got < 15 {
-		t.Fatalf("reserved = %d, want at least the residual 15-byte deficit", got)
+	if got := ledgerReserved(t, f, base); got != 15 {
+		t.Fatalf("reserved = %d, want exactly the residual 15-byte deficit", got)
 	}
 }
 
 // TestAbsenceReconcile_PartialLossBecomesTotal (Codex round 9, security):
-// a tracked short blob that later disappears entirely must replace its
-// tracked deficit with the full registered size — the existing-key fast
-// path must not renew the stale 1-byte deficit forever.
+// a covered short blob that later disappears entirely must grow its cover
+// to the full registered size — the same-key grow path recomputes totals,
+// never renews a stale smaller deficit forever.
 func TestAbsenceReconcile_PartialLossBecomesTotal(t *testing.T) {
 	f := newSweepFixture(t)
 	base := "repo-part-to-total"
@@ -679,22 +573,15 @@ func TestAbsenceReconcile_PartialLossBecomesTotal(t *testing.T) {
 		t.Fatalf("reserved = %d, want the 1-byte deficit", got)
 	}
 
-	// The remaining bytes vanish: the tracked deficit must become 100.
+	// The remaining bytes vanish: the cover must grow to 100.
 	if err := f.blobs.Delete(context.Background(), key); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
-	var last int64
-	for pass := 2; pass <= 3; pass++ {
-		if _, err := r.Run(context.Background()); err != nil {
-			t.Fatalf("Run %d: %v", pass, err)
-		}
-		last = ledgerReserved(t, f, base)
-		if last >= 100 {
-			break
-		}
+	if _, err := r.Run(context.Background()); err != nil {
+		t.Fatalf("Run 2: %v", err)
 	}
-	if last < 100 {
-		t.Fatalf("reserved = %d, want the full 100-byte loss covered after the deficit replacement", last)
+	if got := ledgerReserved(t, f, base); got != 100 {
+		t.Fatalf("reserved = %d, want the full 100-byte loss covered", got)
 	}
 }
 
@@ -725,7 +612,7 @@ func TestAbsenceReconcile_ShortTwinCovered(t *testing.T) {
 // TestAbsenceReconcile_ShortSpellingFullTwinNotCovered (Codex round 12): a
 // truncated registered spelling whose twin still holds the COMPLETE bytes
 // is physically compensated — both copies are in the usage listing, so a
-// tracked deficit would over-cover indefinitely, not one TTL.
+// covered deficit would over-cover indefinitely.
 func TestAbsenceReconcile_ShortSpellingFullTwinNotCovered(t *testing.T) {
 	f := newSweepFixture(t)
 	base := "repo-fulltwin"
@@ -748,13 +635,13 @@ func TestAbsenceReconcile_ShortSpellingFullTwinNotCovered(t *testing.T) {
 	}
 }
 
-// TestAbsenceReconcile_AggregateShrinksOnPartialHeal (Codex round 5): the
-// ledger's same-key upsert keeps GREATEST(old, new), so a shrinking
-// aggregate must rotate its reservation key — the healed bytes' old row
-// expires by TTL while the fresh row charges the exact remaining total.
-func TestAbsenceReconcile_AggregateShrinksOnPartialHeal(t *testing.T) {
+// TestAbsenceReconcile_AggregateGrowsInPlace (Codex round 5 on PR #123):
+// multiple losses in one base aggregate into ONE cover row that grows
+// in place as the traversal discovers them — per-key rows would collide
+// with the per-base reservation-row cap on big incidents.
+func TestAbsenceReconcile_AggregateGrowsInPlace(t *testing.T) {
 	f := newSweepFixture(t)
-	base := "repo-shrink"
+	base := "repo-aggregate"
 	small := blob.LFSKey(base, absenceOID('1'))
 	big := blob.LFSKey(base, absenceOID('2'))
 	registerLFS(t, f, base, small, 30)
@@ -767,16 +654,15 @@ func TestAbsenceReconcile_AggregateShrinksOnPartialHeal(t *testing.T) {
 	}
 	// Discovery charges the aggregate as it grows mid-pass (30, then
 	// 100); the same-key upsert nets ONE 100-byte reservation row.
-	if report.AbsentTracked != 2 {
-		t.Fatalf("pass 1 report = %+v, want both losses tracked", report)
+	if report.LFSRowsAbsent != 2 {
+		t.Fatalf("pass 1 report = %+v, want both losses discovered", report)
 	}
 	if got := ledgerReserved(t, f, base); got != 100 {
 		t.Fatalf("reserved = %d, want the netted 100-byte aggregate", got)
 	}
 
-	// Heal the 70-byte loss. Pass 2's renewal (which precedes
-	// re-verification) still charges the pre-heal 100; re-verification
-	// then shrinks the aggregate and rotates its key.
+	// Heal the 70-byte loss: the next pass's exact re-derivation rotates
+	// the aggregate down to 30 and deletes the stale 100-byte row.
 	if got := f.upload(big, strings.Repeat("z", 70)); got != 70 {
 		t.Fatalf("healed to %d bytes, want 70", got)
 	}
@@ -784,65 +670,29 @@ func TestAbsenceReconcile_AggregateShrinksOnPartialHeal(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run 2: %v", err)
 	}
-	if report.AbsentTracked != 1 {
-		t.Fatalf("pass 2 report = %+v, want the healed loss released", report)
+	if report.CoversRotated != 1 {
+		t.Fatalf("pass 2 report = %+v, want the healed loss rotated out", report)
+	}
+	if got := ledgerReserved(t, f, base); got != 30 {
+		t.Fatalf("reserved = %d, want the exact 30-byte residual", got)
 	}
 
-	// Pass 3 renews under the rotated key with the exact 30-byte total;
-	// the stale 100-byte row lingers only to its TTL. A GREATEST-pinned
-	// single key would renew 100 forever instead.
+	// Steady state: the next pass renews the rotated key at 30.
 	report, err = r.Run(context.Background())
 	if err != nil {
 		t.Fatalf("Run 3: %v", err)
 	}
-	if report.BytesCovered != 30 || report.CoversCharged != 1 {
+	if report.CoversRenewed != 1 || report.BytesCovered != 30 {
 		t.Fatalf("pass 3 report = %+v, want one 30-byte renewal on the rotated key", report)
 	}
-	if got := ledgerReserved(t, f, base); got != 130 {
-		t.Fatalf("reserved = %d, want 130 (fresh 30-byte row + the dying 100-byte row inside its TTL)", got)
-	}
 }
 
-// TestAbsenceReconcile_BaseRenewalCapacity (Codex round 5): tracked bases
-// are capped at the renewal phase's per-pass allocation so every tracked
-// aggregate provably renews every pass; losses in bases beyond it get
-// one-shot covers and report as untracked.
-func TestAbsenceReconcile_BaseRenewalCapacity(t *testing.T) {
-	f := newSweepFixture(t)
-	// Budget 100 → base capacity 25 (half the refresh allocation, so
-	// revalidation always keeps the other half). Mint 27 bases with one
-	// 10-byte absent LFS row each.
-	for i := 0; i < 27; i++ {
-		base := fmt.Sprintf("repo-cap-%02d", i)
-		registerLFS(t, f, base, blob.LFSKey(base, absenceOID('a')), 10)
-	}
-
-	r := testReconciler(t, f, true, 100)
-	var tracked, untrackedTotal int64
-	for pass := 0; pass < 6; pass++ {
-		report, err := r.Run(context.Background())
-		if err != nil {
-			t.Fatalf("Run %d: %v", pass, err)
-		}
-		tracked = report.AbsentTracked
-		untrackedTotal += report.AbsentUntracked
-		if tracked == 25 && untrackedTotal > 0 {
-			break
-		}
-	}
-	if tracked != 25 {
-		t.Fatalf("tracked = %d, want the 25-base renewal capacity", tracked)
-	}
-	if untrackedTotal == 0 {
-		t.Fatal("losses beyond the base capacity must report as untracked one-shot covers")
-	}
-}
-
-// TestAbsenceReconcile_AggregateKeyNotReusedAfterEmpty (Codex round 6): a
-// base whose aggregate empties and re-forms within one TTL must mint a
-// FRESH reservation key — a resettable counter would re-adopt the stale
-// GREATEST-pinned row and renew the old larger total forever.
-func TestAbsenceReconcile_AggregateKeyNotReusedAfterEmpty(t *testing.T) {
+// TestAbsenceReconcile_HealedThenNewLossRotatesKey (Codex round 6 on PR
+// #123): a base whose loss heals entirely and later loses a SMALLER object
+// must not re-adopt the old GREATEST-pinned row. The release deletes the
+// old row and the re-derivation rotates to a fresh incarnation charged
+// exactly.
+func TestAbsenceReconcile_HealedThenNewLossRotatesKey(t *testing.T) {
 	f := newSweepFixture(t)
 	base := "repo-key-reuse"
 	bigKey := blob.LFSKey(base, absenceOID('3'))
@@ -856,48 +706,18 @@ func TestAbsenceReconcile_AggregateKeyNotReusedAfterEmpty(t *testing.T) {
 		t.Fatalf("reserved = %d, want 100", got)
 	}
 
-	// Heal the loss entirely (aggregate empties), then lose a SMALLER
-	// object; its fresh aggregate must charge 10 on a new key.
+	// Heal the loss entirely, then lose a SMALLER object.
 	if got := f.upload(bigKey, strings.Repeat("q", 100)); got != 100 {
 		t.Fatalf("healed to %d bytes, want 100", got)
 	}
 	registerLFS(t, f, base, blob.LFSKey(base, absenceOID('4')), 10)
-	for pass := 2; pass <= 3; pass++ {
-		if _, err := r.Run(context.Background()); err != nil {
-			t.Fatalf("Run %d: %v", pass, err)
-		}
+	if _, err := r.Run(context.Background()); err != nil {
+		t.Fatalf("Run 2: %v", err)
 	}
-	// Stale 100-byte row (inside its TTL) + fresh 10-byte row. Key reuse
-	// would GREATEST-pin the total at 100 instead.
-	if got := ledgerReserved(t, f, base); got != 110 {
-		t.Fatalf("reserved = %d, want 110 (dying 100-byte row + fresh 10-byte incarnation)", got)
-	}
-}
-
-// TestAbsenceRefreshDropsUnrenewedBases (Codex round 6): tracking must
-// never outlive its renewal guarantee — a renewal aborted by the pass
-// deadline drops the unrenewed bases' rows (loudly) instead of leaving
-// covers to lapse silently.
-func TestAbsenceRefreshDropsUnrenewedBases(t *testing.T) {
-	statter := &stubStatter{}
-	r := NewAbsenceReconciler(stubAbsenceRegistry{}, statter, true, 100, time.Hour, slog.New(slog.DiscardHandler))
-	var report AbsenceReport
-	for i := 0; i < 3; i++ {
-		base := fmt.Sprintf("repo-drop-%d", i)
-		r.trackAbsent(absentRow{repo: base, key: blob.LFSKey(base, absenceOID('a')), bytes: 10, registered: 10}, &report)
-	}
-	if len(r.knownAbsent) != 3 || len(r.baseRing) != 3 {
-		t.Fatalf("tracked %d rows / %d bases, want 3/3", len(r.knownAbsent), len(r.baseRing))
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel() // the pass deadline already expired: zero renewals possible
-	var errs boundedErrs
-	rep := AbsenceReport{QuotaEnforced: true}
-	r.refreshKnownAbsent(ctx, 100, &rep, newAbsencePassState(), &errs)
-	if rep.AbsentDropped != 3 || len(r.knownAbsent) != 0 || len(r.baseRing) != 0 {
-		t.Fatalf("dropped=%d tracked=%d bases=%d, want everything dropped when nothing renewed",
-			rep.AbsentDropped, len(r.knownAbsent), len(r.baseRing))
+	// The exact re-derivation charges 10, never the old GREATEST-pinned
+	// 100 (the stale row was rotated away or released).
+	if got := ledgerReserved(t, f, base); got != 10 {
+		t.Fatalf("reserved = %d, want exactly the fresh 10-byte cover", got)
 	}
 }
 
@@ -923,41 +743,45 @@ func TestAbsenceReconcile_SplitShortCopiesClassifiedTruncated(t *testing.T) {
 	}
 }
 
-// TestAbsenceReconcile_RefreshDropsHealedRows: a tracked loss whose bytes
-// return leaves the refresh set on the next pass.
-func TestAbsenceReconcile_RefreshDropsHealedRows(t *testing.T) {
+// TestAbsenceReconcile_LegacyCoverRetired: nonce-keyed covers minted by
+// pre-#125 workers renew until both classes complete one clean traversal,
+// then are released — their losses live in incarnation keys by then.
+func TestAbsenceReconcile_LegacyCoverRetired(t *testing.T) {
 	f := newSweepFixture(t)
-	base := "repo-refresh-heal"
-	lost := blob.LFSKey(base, absenceOID('d'))
-	registerLFS(t, f, base, lost, 12)
+	ctx := context.Background()
+	base := "repo-legacy-cover"
+	// Seed a legacy-format aggregate cover the way a pre-#125 worker
+	// minted it: absence-lost/<base>/<random-owner-nonce>.
+	legacyKey := ref.AbsenceCoverPrefix + base + "/" + ref.NewReservationOwner()
+	if err := ref.ReserveRestoreCover(ctx, absenceRegistry(t, f), blob.QuotaRepoGroup(base), legacyKey, 555, time.Hour); err != nil {
+		t.Fatalf("seed legacy cover: %v", err)
+	}
+	if got := ledgerReserved(t, f, base); got != 555 {
+		t.Fatalf("reserved = %d, want the seeded 555", got)
+	}
 
-	r := testReconciler(t, f, true, 100)
-	report, err := r.Run(context.Background())
+	// Pass 1: no clean traversals recorded yet — the legacy cover is
+	// renewed conservatively while its rows' rediscovery is unproven.
+	r := testReconciler(t, f, true, 1000)
+	report, err := r.Run(ctx)
 	if err != nil {
 		t.Fatalf("Run 1: %v", err)
 	}
-	if report.AbsentTracked != 1 {
-		t.Fatalf("pass 1 report = %+v, want the loss tracked", report)
+	if report.CoversRenewed != 1 || report.CoversReleased != 0 {
+		t.Fatalf("pass 1 report = %+v, want the legacy cover renewed", report)
 	}
 
-	if got := f.upload(lost, "healed-bytes"); got != 12 {
-		t.Fatalf("restored %d bytes, want 12", got)
-	}
-	report, err = r.Run(context.Background())
+	// Pass 1 completed clean traversals of both (empty) registries, so
+	// pass 2 retires the legacy spelling outright.
+	report, err = r.Run(ctx)
 	if err != nil {
 		t.Fatalf("Run 2: %v", err)
 	}
-	// One final conservative renewal charge precedes the re-verification
-	// that observes the heal; the tracking must end empty.
-	if report.AbsentTracked != 0 || report.CoversCharged != 1 {
-		t.Fatalf("pass 2 report = %+v, want the healed row dropped from the refresh set", report)
+	if report.CoversReleased != 1 || report.CoversRenewed != 0 {
+		t.Fatalf("pass 2 report = %+v, want the legacy cover released", report)
 	}
-	report, err = r.Run(context.Background())
-	if err != nil {
-		t.Fatalf("Run 3: %v", err)
-	}
-	if report.AbsentTracked != 0 || report.CoversCharged != 0 {
-		t.Fatalf("pass 3 report = %+v, want steady state with nothing tracked or charged", report)
+	if got := ledgerReserved(t, f, base); got != 0 {
+		t.Fatalf("reserved = %d, want 0 after the legacy release", got)
 	}
 }
 
@@ -1025,5 +849,32 @@ func TestAbsenceReconcile_ZeroSizeSkipped(t *testing.T) {
 	}
 	if report.LFSRowsExamined != 1 || report.LFSRowsAbsent != 0 || report.CoversCharged != 0 {
 		t.Fatalf("report = %+v, want the zero-size row examined and skipped", report)
+	}
+}
+
+// TestAbsenceIncarnationKeyRoundTrip: the deterministic cover-key spelling
+// parses back exactly, and every other segment under the prefix classifies
+// as legacy.
+func TestAbsenceIncarnationKeyRoundTrip(t *testing.T) {
+	key := absenceIncarnationKey("base/repo", absenceClassPacks, 42)
+	base, class, n, legacy, ok := parseAbsenceCoverKey(key)
+	if !ok || legacy || base != "base/repo" || class != absenceClassPacks || n != 42 {
+		t.Fatalf("parse(%q) = (%q, %q, %d, legacy=%v, ok=%v)", key, base, class, n, legacy, ok)
+	}
+	// Zero-padding makes byte order numeric order across magnitudes.
+	if k9, k10 := absenceIncarnationKey("b", absenceClassLFS, 9), absenceIncarnationKey("b", absenceClassLFS, 10); !(k9 < k10) {
+		t.Fatalf("incarnation keys out of order: %q >= %q", k9, k10)
+	}
+	for _, legacyKey := range []string{
+		ref.AbsenceCoverPrefix + "b/" + ref.NewReservationOwner(), // pre-#125 nonce
+		ref.AbsenceCoverPrefix + "b/lfs-e1",                       // unpadded: not ours
+		ref.AbsenceCoverPrefix + "b/packs-exyz",                   // malformed number
+	} {
+		if _, _, _, legacy, ok := parseAbsenceCoverKey(legacyKey); !ok || !legacy {
+			t.Fatalf("parse(%q): want legacy classification, got legacy=%v ok=%v", legacyKey, legacy, ok)
+		}
+	}
+	if _, _, _, _, ok := parseAbsenceCoverKey("packs/other/prefix"); ok {
+		t.Fatalf("foreign prefix parsed as a cover key")
 	}
 }

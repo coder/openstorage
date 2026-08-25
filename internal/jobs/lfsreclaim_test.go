@@ -2,6 +2,7 @@ package jobs
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math"
@@ -12,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/coder/code-storage/internal/blob"
 	"github.com/coder/code-storage/internal/lfsscan"
 	"github.com/coder/code-storage/internal/ref"
 )
@@ -78,7 +80,18 @@ func newReclaimStore(t *testing.T) (ref.Store, LFSReclaimRegistry) {
 	if !ok {
 		t.Fatalf("store %T lacks the reclamation seams", store)
 	}
+	// Retirement gates on a fresh destructive-reap watermark (issue
+	// #120); seed one so scan tests exercise their own guards. The
+	// watermark-staleness tests delete it again explicitly.
+	seedReapWatermark(t, reg)
 	return store, reg
+}
+
+func seedReapWatermark(t *testing.T, reg LFSReclaimRegistry) {
+	t.Helper()
+	if err := reg.PutJobScanState(context.Background(), ref.ScanJobSweep, ref.ScanScopeLFSDestructiveReap, "", 0); err != nil {
+		t.Fatalf("seed reap watermark: %v", err)
+	}
 }
 
 // staticHydrate returns each repo's pre-built fixture path; repos without a
@@ -541,8 +554,8 @@ func TestLFSReclaim_PassDeadline(t *testing.T) {
 	if elapsed := time.Since(start); elapsed > 10*time.Second {
 		t.Fatalf("pass ran %v, want the pass cap to end it promptly", elapsed)
 	}
-	if r.cursor == "" {
-		t.Fatal("rotation cursor did not advance; the next pass would retry the same repo first")
+	if st, ok, err := reg.GetJobScanState(ctx, ref.ScanJobLFSReclaim, ref.ScanScopeReclaimRotation); err != nil || !ok || st.Payload == "" {
+		t.Fatalf("rotation cursor = (%+v, %v, %v); want a durably parked advance so the next pass does not retry the same repo first", st, ok, err)
 	}
 }
 
@@ -680,5 +693,209 @@ func TestLFSReclaim_PurgedRepoSkipped(t *testing.T) {
 	}
 	if rep.ReposSkipped != 1 || rep.ReposScanned != 0 {
 		t.Fatalf("purged run = %+v, want skipped", rep)
+	}
+}
+
+// TestLFSReclaim_SettlementHandoffResumes (issue #121): the per-repo
+// row-settlement cursor is fleet-persistent, so a budget-limited pass on
+// worker A parks it durably and a FRESH reclaimer (River scheduling the
+// next pass on another replica) resumes strictly past the settled prefix
+// instead of re-examining it forever.
+func TestLFSReclaim_SettlementHandoffResumes(t *testing.T) {
+	ctx := context.Background()
+	store, reg := newReclaimStore(t)
+	base := "handoff-repo"
+	for i := 0; i < 6; i++ {
+		key := "lfs/" + base + "/o2/" + strings.Repeat(string(rune('a'+i)), 64)
+		if err := store.RegisterLFSObject(ctx, base, key, 10); err != nil {
+			t.Fatal(err)
+		}
+	}
+	gens := map[string]int64{base: 0}
+	for _, member := range blob.QuotaRepoGroup(base) {
+		g, err := reg.GetGeneration(ctx, member)
+		if err != nil {
+			t.Fatal(err)
+		}
+		gens[member] = g
+	}
+
+	// Worker A: allowance 3 settles half the rows and parks the cursor.
+	workerA := testReclaimer(t, reg, staticHydrate(t, nil), time.Hour, 1_000, false)
+	var report LFSReclaimReport
+	if _, err := workerA.settleRepoRows(ctx, base, gens, nil, 3, &report); err == nil || !errors.Is(err, lfsscan.ErrLFSScanBudget) {
+		t.Fatalf("worker A settle err = %v, want the budget verdict", err)
+	}
+	if report.RowsExamined != 3 || report.RowsMarked != 3 {
+		t.Fatalf("worker A report = %+v, want 3 rows settled", report)
+	}
+	if st, ok, err := reg.GetJobScanState(ctx, ref.ScanJobLFSReclaim, ref.ScanScopeReclaimRepo(base)); err != nil || !ok || st.Payload == "" {
+		t.Fatalf("row cursor = (%+v, %v, %v), want a durably parked cursor", st, ok, err)
+	}
+
+	// Worker B (fresh process): resumes past the settled prefix — only
+	// the 3 tail rows are examined — and completion clears the cursor.
+	workerB := testReclaimer(t, reg, staticHydrate(t, nil), time.Hour, 1_000, false)
+	report = LFSReclaimReport{}
+	if _, err := workerB.settleRepoRows(ctx, base, gens, nil, 100, &report); err != nil {
+		t.Fatalf("worker B settle: %v", err)
+	}
+	if report.RowsExamined != 3 || report.RowsMarked != 3 {
+		t.Fatalf("worker B report = %+v, want ONLY the 3 unsettled tail rows", report)
+	}
+	if _, ok, err := reg.GetJobScanState(ctx, ref.ScanJobLFSReclaim, ref.ScanScopeReclaimRepo(base)); err != nil || ok {
+		t.Fatalf("row cursor survived settlement completion (ok=%v, err=%v)", ok, err)
+	}
+
+	// Worker C: a completed settlement starts the next rotation from the
+	// top of the keyspace.
+	workerC := testReclaimer(t, reg, staticHydrate(t, nil), time.Hour, 1_000, false)
+	report = LFSReclaimReport{}
+	if _, err := workerC.settleRepoRows(ctx, base, gens, nil, 100, &report); err != nil {
+		t.Fatalf("worker C settle: %v", err)
+	}
+	if report.RowsExamined != 6 {
+		t.Fatalf("worker C report = %+v, want a fresh full scan", report)
+	}
+}
+
+// TestLFSReclaim_RowCursorGenerationFence (issue #121): a parked settlement
+// cursor is fenced by the pinned generations — refs moving invalidates it,
+// restarting settlement from the top of the keyspace instead of resuming
+// across the fence.
+func TestLFSReclaim_RowCursorGenerationFence(t *testing.T) {
+	ctx := context.Background()
+	store, reg := newReclaimStore(t)
+	base := "fence-repo"
+	for i := 0; i < 4; i++ {
+		key := "lfs/" + base + "/o2/" + strings.Repeat(string(rune('a'+i)), 64)
+		if err := store.RegisterLFSObject(ctx, base, key, 10); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pin := func() map[string]int64 {
+		gens := map[string]int64{}
+		for _, member := range blob.QuotaRepoGroup(base) {
+			g, err := reg.GetGeneration(ctx, member)
+			if err != nil {
+				t.Fatal(err)
+			}
+			gens[member] = g
+		}
+		return gens
+	}
+
+	r := testReclaimer(t, reg, staticHydrate(t, nil), time.Hour, 1_000, false)
+	var report LFSReclaimReport
+	if _, err := r.settleRepoRows(ctx, base, pin(), nil, 2, &report); !errors.Is(err, lfsscan.ErrLFSScanBudget) {
+		t.Fatalf("settle err = %v, want the budget verdict", err)
+	}
+	if report.RowsExamined != 2 {
+		t.Fatalf("report = %+v, want 2 rows settled before parking", report)
+	}
+
+	// Refs move: the generation bump (schema trigger) invalidates the
+	// parked cursor, so the next attempt re-pins and restarts from the
+	// top — never a resume across the fence.
+	if won, err := store.CASRef(ctx, base, "refs/heads/main", ref.ZeroSHA, strings.Repeat("77", 20)); err != nil || !won {
+		t.Fatalf("CASRef = (%v, %v)", won, err)
+	}
+	report = LFSReclaimReport{}
+	if _, err := r.settleRepoRows(ctx, base, pin(), nil, 100, &report); err != nil {
+		t.Fatalf("settle after fence bump: %v", err)
+	}
+	if report.RowsExamined != 4 {
+		t.Fatalf("report = %+v, want a FULL restart after the fence bump", report)
+	}
+}
+
+// TestLFSReclaim_WatermarkStaleDefersRetirement (issue #120): with deletes
+// enabled but no destructive LFS sweep completed within the grace window,
+// eligible rows are deferred — loudly and distinctly — and retire again
+// once a completed sweep refreshes the watermark.
+func TestLFSReclaim_WatermarkStaleDefersRetirement(t *testing.T) {
+	ctx := context.Background()
+	store, reg := newReclaimStore(t)
+	base := "wm-stale-repo"
+	junk := "lfs/" + base + "/o2/" + strings.Repeat("dd", 32)
+	if err := store.RegisterLFSObject(ctx, base, junk, 10); err != nil {
+		t.Fatal(err)
+	}
+	// No refs: nothing reachable, so the row is junk without any git
+	// fixture; grace 300ms makes it eligible after a short sleep.
+	grace := 300 * time.Millisecond
+	r := testReclaimer(t, reg, staticHydrate(t, nil), grace, 1_000, true)
+
+	if rep, err := r.Run(ctx); err != nil || rep.RowsMarked != 1 {
+		t.Fatalf("pass 1 = (%+v, %v), want the row marked", rep, err)
+	}
+	time.Sleep(grace + 2100*time.Millisecond)
+
+	// The sweeper stops completing destructive passes: the watermark
+	// disappears past the grace bound, so the pass demotes itself.
+	if err := reg.DeleteJobScanState(ctx, ref.ScanJobSweep, ref.ScanScopeLFSDestructiveReap); err != nil {
+		t.Fatal(err)
+	}
+	rep, err := r.Run(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rep.ReapWatermarkStale || rep.RowsDeferredReapStale != 1 || rep.RowsRetired != 0 {
+		t.Fatalf("stale pass = %+v, want the eligible row deferred distinctly", rep)
+	}
+	if has, _ := store.HasLFSObject(ctx, base, junk); !has {
+		t.Fatal("row retired while the reap watermark was stale")
+	}
+
+	// A destructive sweep completes again: refunds resume.
+	seedReapWatermark(t, reg)
+	rep, err = r.Run(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.ReapWatermarkStale || rep.RowsRetired != 1 {
+		t.Fatalf("recovered pass = %+v, want the row retired", rep)
+	}
+	if has, _ := store.HasLFSObject(ctx, base, junk); has {
+		t.Fatal("row survived the recovered pass")
+	}
+}
+
+// TestLFSReclaim_RotationHandoffResumes (issue #121): the rotation cursor
+// is fleet-persistent — a fresh reclaimer resumes strictly after the last
+// attempted repository instead of restarting its own rotation.
+func TestLFSReclaim_RotationHandoffResumes(t *testing.T) {
+	ctx := context.Background()
+	store, reg := newReclaimStore(t)
+	// Two ref-less junk repos: each pass scans within budget; budget 3
+	// covers one repo's charge (1 unit skip floor + rows).
+	for _, base := range []string{"rot-a", "rot-b"} {
+		key := "lfs/" + base + "/o2/" + strings.Repeat("ee", 32)
+		if err := store.RegisterLFSObject(ctx, base, key, 10); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	workerA := testReclaimer(t, reg, staticHydrate(t, nil), time.Hour, 1, false)
+	if rep, err := workerA.Run(ctx); err != nil || rep.ReposScanned != 1 {
+		t.Fatalf("worker A = (%+v, %v), want exactly one repo scanned before the budget ran out", rep, err)
+	}
+	st, ok, err := reg.GetJobScanState(ctx, ref.ScanJobLFSReclaim, ref.ScanScopeReclaimRotation)
+	if err != nil || !ok || st.Payload != "rot-a" {
+		t.Fatalf("rotation cursor = (%+v, %v, %v), want parked on rot-a", st, ok, err)
+	}
+
+	// A fresh worker resumes after rot-a and scans rot-b first.
+	workerB := testReclaimer(t, reg, staticHydrate(t, nil), time.Hour, 1_000, false)
+	rep, err := workerB.Run(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.ReposScanned != 2 {
+		t.Fatalf("worker B = %+v, want the full rotation (resumed tail + wrap)", rep)
+	}
+	rows, err := reg.ListRepoLFSObjects(ctx, "rot-b", "", 10)
+	if err != nil || len(rows) != 1 || rows[0].UnreferencedSince.IsZero() {
+		t.Fatalf("rot-b rows = (%+v, %v), want marked by the resumed rotation", rows, err)
 	}
 }

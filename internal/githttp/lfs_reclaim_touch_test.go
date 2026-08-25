@@ -149,11 +149,16 @@ func TestLFSDirectPUT_RetiredMidBodyDemotesToNewGrowth(t *testing.T) {
 	}
 	retire, ok := srv.Store.(interface {
 		MarkLFSObjectsUnreferenced(ctx context.Context, repo string, keys []string) (int64, error)
-		RetireUnreferencedLFSObject(ctx context.Context, repo, key string, pinnedGens map[string]int64, grace time.Duration) (bool, error)
+		RetireUnreferencedLFSObject(ctx context.Context, repo, key string, pinnedGens map[string]int64, grace, reapMaxAge time.Duration) (bool, error)
 		GetGeneration(ctx context.Context, repo string) (int64, error)
+		PutJobScanState(ctx context.Context, job, scope, payload string, generation int64) error
 	})
 	if !ok {
 		t.Fatalf("store %T lacks the retirement surface", srv.Store)
+	}
+	// Retirement gates on a fresh destructive-reap watermark (issue #120).
+	if err := retire.PutJobScanState(ctx, ref.ScanJobSweep, ref.ScanScopeLFSDestructiveReap, "", 0); err != nil {
+		t.Fatalf("seed reap watermark: %v", err)
 	}
 
 	pr, pw := io.Pipe()
@@ -188,7 +193,7 @@ func TestLFSDirectPUT_RetiredMidBodyDemotesToNewGrowth(t *testing.T) {
 		}
 		gens[member] = g
 	}
-	if retired, err := retire.RetireUnreferencedLFSObject(ctx, lfsTestRepoID, key, gens, 0); err != nil || !retired {
+	if retired, err := retire.RetireUnreferencedLFSObject(ctx, lfsTestRepoID, key, gens, 0, time.Hour); err != nil || !retired {
 		t.Fatalf("retire = (%v, %v), want retired", retired, err)
 	}
 	other := blob.LFSKey(lfsTestRepoID, sha256Hex([]byte("other")))

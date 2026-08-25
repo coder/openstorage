@@ -151,7 +151,24 @@ const (
 	// pass contexts regularly end by expiring, and the park must not
 	// inherit that death, nor hang unbounded.
 	scanStateWriteTimeout = 10 * time.Second
+	// reapWatermarkMinFreshness floors the observed-coupling staleness
+	// bound (issue #120). Production graces are ≥ 1h (the boot interlock
+	// floors them at the quarantine retention), so the bound is simply
+	// the grace there; the floor only matters for sub-minute test graces,
+	// where SQLite's whole-second watermark stamps would otherwise demote
+	// a just-completed sweep spuriously.
+	reapWatermarkMinFreshness = time.Minute
 )
+
+// reapMaxAge is the watermark staleness bound refunds gate on: refunds
+// flow only while a destructive LFS pass completed within roughly one
+// grace window (see reapWatermarkMinFreshness for the floor).
+func (r *LFSReclaimer) reapMaxAge() time.Duration {
+	if r.grace > reapWatermarkMinFreshness {
+		return r.grace
+	}
+	return reapWatermarkMinFreshness
+}
 
 // LFSReclaimer runs the reclamation scan. Construct with NewLFSReclaimer;
 // Run executes one bounded pass on the schedule's cadence.
@@ -257,13 +274,13 @@ func (r *LFSReclaimer) Run(ctx context.Context) (LFSReclaimReport, error) {
 			// refuse refunds on the same broken table anyway.
 			errs.add(fmt.Errorf("lfs reclaim: read reap watermark: %w", err))
 			r.reapStale = true
-		case !ok || r.now().Sub(mark.UpdatedAt) > r.grace:
+		case !ok || r.now().Sub(mark.UpdatedAt) > r.reapMaxAge():
 			r.reapStale = true
 		}
 		if r.reapStale {
 			report.ReapWatermarkStale = true
 			r.logger.Warn("lfs reclaim: no destructive LFS sweep completed within the grace window; this pass is report-only and slot refunds are deferred",
-				"grace", r.grace)
+				"bound", r.reapMaxAge())
 		}
 	}
 	// Resume the fleet-persistent rotation (issue #121); a lost or
@@ -600,7 +617,7 @@ func (r *LFSReclaimer) settleRepoRows(ctx context.Context, base string, gens map
 				report.RowsDeferredReapStale++
 				continue
 			}
-			retired, err := r.registry.RetireUnreferencedLFSObject(ctx, base, row.Key, gens, r.grace, r.grace)
+			retired, err := r.registry.RetireUnreferencedLFSObject(ctx, base, row.Key, gens, r.grace, r.reapMaxAge())
 			switch {
 			case errors.Is(err, ref.ErrReapWatermarkStale):
 				// The in-transaction gate fired (the pass outlived the

@@ -414,16 +414,25 @@ Two operational notes:
   blobs become ordinary rowless orphans that the [sweeper](#the-orphan-sweeper)
   reaps under its own aged, quarantine-first delete gates
   (`CODESTORAGE_SWEEP_DELETE_LFS`, plus the ADR-41 legacy gate for
-  v0.2.0-spelled keys). Startup enforces the coupling: arming
-  `CODESTORAGE_LFS_GC_DELETE_ENABLED` on a live sweep schedule requires the
-  LFS reap and a grace no shorter than the reap cadence
-  (max(`CODESTORAGE_SWEEP_AGE_THRESHOLD`, `CODESTORAGE_SWEEP_INTERVAL`, the
-  1-hour quarantine retention floor)) — refunded cap slots whose blobs (or
-  quarantine backups) nothing deletes in time would let upload → retire →
-  re-upload cycles grow the storage prefixes past the cap that quota floors
-  and sweep listings rely on. Under the sweep emergency stop
-  (`CODESTORAGE_SWEEP_INTERVAL=0`) retirement demotes to report-only with a
-  warning.
+  v0.2.0-spelled keys). The coupling is enforced twice. Startup validates
+  the CONFIGURED regime: arming `CODESTORAGE_LFS_GC_DELETE_ENABLED` on a
+  live sweep schedule requires the LFS reap and a grace no shorter than the
+  reap cadence (max(`CODESTORAGE_SWEEP_AGE_THRESHOLD`,
+  `CODESTORAGE_SWEEP_INTERVAL`, the 1-hour quarantine retention floor)) —
+  refunded cap slots whose blobs (or quarantine backups) nothing deletes in
+  time would let upload → retire → re-upload cycles grow the storage
+  prefixes past the cap that quota floors and sweep listings rely on. At
+  runtime the coupling is OBSERVED, not assumed: every destructive LFS
+  sweep pass that finishes its keyspace with zero errors records a durable
+  fleet-wide watermark, and retirement refuses to refund slots — demoting
+  to report-only, `reap_watermark_stale` in the run report — whenever no
+  such pass completed within the grace window. Sweeps that are armed but
+  failing (blob-store delete outages, passes outrunning the reclamation
+  cycle, the S3 versioning guard demoting a run to list-only) therefore
+  freeze refunds automatically until a clean destructive pass completes;
+  the sweep emergency stop (`CODESTORAGE_SWEEP_INTERVAL=0`) is just the
+  planned instance of the same demotion. A fresh deployment stays
+  report-only until its first clean destructive LFS sweep completes.
 - **Hydration and walks are deadline-bounded.** Scanning a repository first
   materializes its git cache (downloading and indexing registered packs on a
   cold replica). Each namespace member's hydration AND its reachability walk
@@ -474,6 +483,15 @@ A reclamation run logs one `lfs reclaim pass finished` line:
 | `rows_eligible` / `rows_retired` / `rows_spared` | grace-expired rows; how many actually retired; how many the guarded delete declined at the last moment (concurrent touch, ref movement, purge fence) |
 | `bytes_retired` | quota bytes refunded |
 | `dry_run` | `true` while `CODESTORAGE_LFS_GC_DELETE_ENABLED` is off |
+| `reap_watermark_stale` / `rows_deferred_reap_stale` | `true` (and the eligible rows deferred) when no destructive LFS sweep completed cleanly within the grace window — refunds resume once one does |
+
+Scan progress is fleet-durable: the rotation cursor and each repository's
+row-settlement resume point persist in the ref store (`job_scan_state`), so
+on multi-replica PostgreSQL fleets a pass scheduled on any replica — or
+after a rolling restart — resumes exactly where the previous pass parked
+instead of re-examining the same prefix forever. A settlement cursor is
+fenced by the repository's pinned generations: any ref movement invalidates
+it and settlement restarts from the top of that repository's keyspace.
 
 ## Reconciling registered-but-missing bytes
 
