@@ -388,6 +388,7 @@ func TestAbsenceReconcile_FoldedAwayRowReleasesCover(t *testing.T) {
 		t.Fatalf("ReplacePacks = (%v, %v), want won", won, err)
 	}
 
+	genBefore := adoptionGen(t, f, base)
 	report, err = r.Run(ctx)
 	if err != nil {
 		t.Fatalf("Run 2: %v", err)
@@ -400,6 +401,13 @@ func TestAbsenceReconcile_FoldedAwayRowReleasesCover(t *testing.T) {
 	}
 	if got := ledgerReserved(t, f, base); got != 0 {
 		t.Fatalf("reserved = %d, want 0 after the release", got)
+	}
+	// Releasing the compensating cover must invalidate warm floors FIRST
+	// (Codex security round): a floor measured while the bytes were
+	// absent may still be cached, and deleting the compensation while it
+	// validates would let admission overshoot.
+	if genAfter := adoptionGen(t, f, base); genAfter <= genBefore {
+		t.Fatalf("adoption gen = %d -> %d across the release, want a bump invalidating warm floors", genBefore, genAfter)
 	}
 	report, err = r.Run(ctx)
 	if err != nil {

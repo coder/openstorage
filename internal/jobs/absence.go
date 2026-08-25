@@ -903,6 +903,13 @@ func (r *AbsenceReconciler) releaseZeroRowCovers(ctx context.Context, class, lo,
 		if cover.key == "" || (lo != "" && base <= lo) || (hi != "" && base >= hi) {
 			continue
 		}
+		// Same warm-floor invalidation before deletion as endRange's
+		// healed release: never delete a compensating reservation while
+		// a deflated floor may still validate.
+		if err := r.registry.BumpLFSAdoptionGen(ctx, base); err != nil {
+			errs.add(fmt.Errorf("absence reconcile: invalidate floors before releasing cover %s: %w", cover.key, err))
+			continue
+		}
 		if err := r.registry.DeleteAbsenceCover(ctx, cover.key); err != nil {
 			errs.add(fmt.Errorf("absence reconcile: release row-less cover %s: %w", cover.key, err))
 			continue
@@ -1009,7 +1016,19 @@ func (r *AbsenceReconciler) endRange(ctx context.Context, tr *rangeTracker, repo
 	}
 	switch {
 	case running == 0:
-		// Fully healed (or rows retired/folded away): release the row.
+		// Fully healed (or rows retired/folded away): release the row —
+		// but invalidate warm floors FIRST (Codex security round on
+		// PR #132): a usage floor measured while the bytes were absent
+		// can still be cached, and the cover is what compensated for its
+		// deflation. Application restores bump the generation themselves,
+		// but backend-side recovery (bytes reappearing out of band)
+		// bypasses them — deleting the compensation while the deflated
+		// floor still validates would let admission overshoot quota. If
+		// the bump fails, retain the cover; the next clean range retries.
+		if err := r.registry.BumpLFSAdoptionGen(ctx, base); err != nil {
+			errs.add(fmt.Errorf("absence reconcile: invalidate floors before releasing cover %s: %w", head.key, err))
+			return
+		}
 		if err := r.registry.DeleteAbsenceCover(ctx, head.key); err != nil {
 			errs.add(fmt.Errorf("absence reconcile: release healed cover %s: %w", head.key, err))
 			return
