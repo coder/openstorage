@@ -48,16 +48,18 @@ const localRepackWorkers = 4
 var _ Queue = (*Local)(nil)
 
 // NewLocal builds the in-process queue. deliverer must be configured with
-// the webhook lookup; runSync is normally sync.(*Worker).Run. repacker may
-// be nil (repack disabled or not wired, e.g. hook-subprocess queues that
-// must never fold); EnqueueRepack is then refused.
-func NewLocal(deliverer *events.Deliverer, runSync SyncRunner, repacker *Repacker, logger *slog.Logger) *Local {
+// the webhook lookup; runSync is normally sync.(*Worker).Run and runPush
+// sync.(*Worker).RunPush (issue #90). repacker may be nil (repack disabled
+// or not wired, e.g. hook-subprocess queues that must never fold);
+// EnqueueRepack is then refused.
+func NewLocal(deliverer *events.Deliverer, runSync, runPush SyncRunner, repacker *Repacker, logger *slog.Logger) *Local {
 	assertf(deliverer != nil, "NewLocal: nil deliverer")
 	assertf(runSync != nil, "NewLocal: nil sync runner")
+	assertf(runPush != nil, "NewLocal: nil push runner")
 	assertf(logger != nil, "NewLocal: nil logger")
 	return &Local{
 		deliverer:     deliverer,
-		syncq:         sync.NewInProcessQueue(runSync, logger),
+		syncq:         sync.NewInProcessQueue(runSync, runPush, logger),
 		repacker:      repacker,
 		logger:        logger,
 		repacking:     make(map[string]bool),
@@ -94,6 +96,17 @@ func (q *Local) EnqueueSync(ctx context.Context, job sync.Job) error {
 		return errors.New("jobs queue is closed")
 	}
 	return q.syncq.EnqueueSync(ctx, job)
+}
+
+// EnqueuePush delegates to the in-process queue's outbound lane (issue #90).
+func (q *Local) EnqueuePush(ctx context.Context, job sync.Job) error {
+	q.mu.Lock()
+	closed := q.closed
+	q.mu.Unlock()
+	if closed {
+		return errors.New("jobs queue is closed")
+	}
+	return q.syncq.EnqueuePush(ctx, job)
 }
 
 // EnqueueRepack runs one fold attempt on a background goroutine with a

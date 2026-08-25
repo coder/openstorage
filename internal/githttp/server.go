@@ -861,11 +861,22 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 			// EnvUsageFloor, EnvVerifyState, and EnvVerifySigBudget are
 			// stripped for the same reason: the hook trusts them as THIS
 			// push's admission floor and verification state/budget.
+			// EnvScopes/EnvRefsPolicy/EnvOps carry THIS caller's verified
+			// authority (Codex round 6 on #90): duplicates resolve
+			// first-match in Go children, so an inherited stale value
+			// would SHADOW the appended verified one — e.g. an inherited
+			// scope list containing git:read would let a write-only
+			// caller trigger full-repository forwarding, and an inherited
+			// permissive policy would shadow the caller's restrictive
+			// one.
 			if !strings.HasPrefix(kv, EnvAtomic+"=") &&
 				!strings.HasPrefix(kv, EnvUsageFloor+"=") &&
 				!strings.HasPrefix(kv, EnvVerifyState+"=") &&
 				!strings.HasPrefix(kv, EnvVerifySigBudget+"=") &&
-				!strings.HasPrefix(kv, EnvSyncClaim+"=") {
+				!strings.HasPrefix(kv, EnvSyncClaim+"=") &&
+				!strings.HasPrefix(kv, EnvScopes+"=") &&
+				!strings.HasPrefix(kv, EnvRefsPolicy+"=") &&
+				!strings.HasPrefix(kv, EnvOps+"=") {
 				env = append(env, kv)
 			}
 		}
@@ -918,6 +929,14 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 		// the update hook owns parsing and fails closed on malformed JSON.
 		if len(claims.Refs) > 0 {
 			cmd.Env = append(cmd.Env, EnvRefsPolicy+"="+string(claims.Refs))
+		}
+		// Scopes feed the hook-side forward_on_push poke's git:read gate
+		// (see EnvScopes doc); receive-pack callers always carry at least
+		// git:write, so the marshal is never empty in practice.
+		if len(claims.Scopes) > 0 {
+			scopes, err := json.Marshal(claims.Scopes)
+			assertf(err == nil, "marshal scopes claim: %v", err)
+			cmd.Env = append(cmd.Env, EnvScopes+"="+string(scopes))
 		}
 		// Deprecated repo-wide ops claim: folded into the ref policies by
 		// the hook (docs/reference/authentication.md fallback semantics).

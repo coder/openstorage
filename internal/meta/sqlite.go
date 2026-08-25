@@ -163,6 +163,14 @@ func (s *SQLite) InitSchema(ctx context.Context) error {
 		    sync_pending  INTEGER NOT NULL DEFAULT 0,
 		    sync_claim_holder     TEXT NOT NULL DEFAULT '',
 		    sync_claim_expires_at INTEGER NOT NULL DEFAULT 0,
+		    forward_on_push       INTEGER NOT NULL DEFAULT 0,
+		    push_pending          INTEGER NOT NULL DEFAULT 0,
+		    push_syncing          INTEGER NOT NULL DEFAULT 0,
+		    push_claim_holder     TEXT NOT NULL DEFAULT '',
+		    push_claim_expires_at INTEGER NOT NULL DEFAULT 0,
+		    push_claim_force      INTEGER NOT NULL DEFAULT 0,
+		    push_run_count        INTEGER NOT NULL DEFAULT 0,
+		    push_success_count    INTEGER NOT NULL DEFAULT 0,
 		    created_at    INTEGER NOT NULL
 		)`,
 	} {
@@ -180,6 +188,16 @@ func (s *SQLite) InitSchema(ctx context.Context) error {
 		{"repo_upstreams", "sync_pending", `sync_pending INTEGER NOT NULL DEFAULT 0`},
 		{"repo_upstreams", "sync_claim_holder", `sync_claim_holder TEXT NOT NULL DEFAULT ''`},
 		{"repo_upstreams", "sync_claim_expires_at", `sync_claim_expires_at INTEGER NOT NULL DEFAULT 0`},
+		// Outbound push-forwarding lane (issue #90) for data dirs
+		// predating it: pending level 0/1/2, claim lease, counters.
+		{"repo_upstreams", "forward_on_push", `forward_on_push INTEGER NOT NULL DEFAULT 0`},
+		{"repo_upstreams", "push_pending", `push_pending INTEGER NOT NULL DEFAULT 0`},
+		{"repo_upstreams", "push_syncing", `push_syncing INTEGER NOT NULL DEFAULT 0`},
+		{"repo_upstreams", "push_claim_holder", `push_claim_holder TEXT NOT NULL DEFAULT ''`},
+		{"repo_upstreams", "push_claim_expires_at", `push_claim_expires_at INTEGER NOT NULL DEFAULT 0`},
+		{"repo_upstreams", "push_claim_force", `push_claim_force INTEGER NOT NULL DEFAULT 0`},
+		{"repo_upstreams", "push_run_count", `push_run_count INTEGER NOT NULL DEFAULT 0`},
+		{"repo_upstreams", "push_success_count", `push_success_count INTEGER NOT NULL DEFAULT 0`},
 		// Purge tombstone column (issue #52) for data dirs predating it.
 		{"repos", "purged_at", `purged_at INTEGER`},
 	} {

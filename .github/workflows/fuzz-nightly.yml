@@ -51,6 +51,7 @@ jobs:
             ./internal/jobs:FuzzPackObjectCount
             ./internal/api:FuzzClientKey
             ./internal/api:FuzzCoreCursor
+            ./internal/sync:FuzzParsePushRejections
           "
           failed=0
           for t in $targets; do

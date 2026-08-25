@@ -52,13 +52,17 @@ func scanGitCredentialSQLite(row sqlRow) (GitCredential, error) {
 // from INTEGER 0/1 into bool; timestamps from unixnano).
 func scanRepoUpstreamSQLite(row sqlRow) (RepoUpstream, error) {
 	var up RepoUpstream
-	var claimExpires, createdAt int64
+	var claimExpires, pushClaimExpires, createdAt int64
 	if err := row.Scan(&up.RepoID, &up.Provider, &up.Owner, &up.Name, &up.UpstreamHost,
 		&up.RunCount, &up.SuccessCount, &up.Syncing, &up.SyncPending,
-		&up.SyncClaimHolder, &claimExpires, &createdAt); err != nil {
+		&up.SyncClaimHolder, &claimExpires,
+		&up.ForwardOnPush, &up.PushPending, &up.PushSyncing,
+		&up.PushClaimHolder, &pushClaimExpires, &up.PushClaimForce,
+		&up.PushRunCount, &up.PushSuccessCount, &createdAt); err != nil {
 		return RepoUpstream{}, err
 	}
 	up.SyncClaimExpiresAt = time.Unix(0, claimExpires).UTC()
+	up.PushClaimExpiresAt = time.Unix(0, pushClaimExpires).UTC()
 	up.CreatedAt = time.Unix(0, createdAt).UTC()
 	return up, nil
 }
@@ -353,16 +357,18 @@ func (s *SQLite) SetRepoUpstream(ctx context.Context, up RepoUpstream) (RepoUpst
 	nanos, createdAt := s.nowNano()
 	up.RunCount, up.SuccessCount, up.Syncing, up.SyncPending = 0, 0, false, false
 	up.SyncClaimHolder, up.SyncClaimExpiresAt = "", time.Unix(0, 0).UTC()
+	up.PushPending, up.PushSyncing, up.PushRunCount, up.PushSuccessCount = 0, false, 0, 0
+	up.PushClaimHolder, up.PushClaimExpiresAt, up.PushClaimForce = "", time.Unix(0, 0).UTC(), false
 	up.CreatedAt = createdAt
 	// Live-repo guard — see CreateGitCredential (issue #52, PR #105
 	// round 6).
 	res, err := s.db.ExecContext(ctx,
 		`INSERT INTO repo_upstreams (repo_id, provider, owner, name, upstream_host,
 		        run_count, success_count, syncing, sync_pending,
-		        sync_claim_holder, sync_claim_expires_at, created_at)
-		 SELECT ?, ?, ?, ?, ?, 0, 0, 0, 0, '', 0, ?
+		        sync_claim_holder, sync_claim_expires_at, forward_on_push, created_at)
+		 SELECT ?, ?, ?, ?, ?, 0, 0, 0, 0, '', 0, ?, ?
 		 WHERE EXISTS (SELECT 1 FROM repos WHERE repo_id = ? AND deleted_at IS NULL)`,
-		up.RepoID, up.Provider, up.Owner, up.Name, up.UpstreamHost, nanos, up.RepoID)
+		up.RepoID, up.Provider, up.Owner, up.Name, up.UpstreamHost, up.ForwardOnPush, nanos, up.RepoID)
 	// The only constraint on repo_upstreams is the repo_id PRIMARY KEY.
 	if isPrimaryKeyViolation(err) {
 		return RepoUpstream{}, fmt.Errorf("upstream for repo %q: %w", up.RepoID, ErrAlreadyExists)
@@ -597,6 +603,170 @@ func (s *SQLite) FinishSync(ctx context.Context, repoID, holder string, success 
 	})
 	if err != nil {
 		return RepoUpstream{}, fmt.Errorf("finish sync for repo %q: %w", repoID, err)
+	}
+	return up, nil
+}
+
+// RequestPush raises the outbound pending level (issue #90); levels only
+// coalesce upward so force is never downgraded. ErrNotFound when detached.
+func (s *SQLite) RequestPush(ctx context.Context, repoID string, force bool) error {
+	assertf(repoID != "", "RequestPush: empty repo id")
+	level := 1
+	if force {
+		level = 2
+	}
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE repo_upstreams SET push_pending = MAX(push_pending, ?) WHERE repo_id = ?`,
+		level, repoID)
+	if err != nil {
+		return fmt.Errorf("request push for repo %q: %w", repoID, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("request push for repo %q: %w", repoID, err)
+	}
+	if n == 0 {
+		return fmt.Errorf("upstream for repo %q: %w", repoID, ErrNotFound)
+	}
+	assertf(n == 1, "UPDATE by primary key affected %d rows", n)
+	return nil
+}
+
+// PendingPushRepoIDs lists repos owing an outbound run at boot — pending
+// marker set OR orphaned in-flight claim (see the EventingStore contract;
+// local-mode boot recovery, issue #90).
+func (s *SQLite) PendingPushRepoIDs(ctx context.Context) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT repo_id FROM repo_upstreams WHERE push_pending > 0 OR push_syncing = 1 ORDER BY repo_id`)
+	if err != nil {
+		return nil, fmt.Errorf("list pending push repos: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("list pending push repos: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list pending push repos: %w", err)
+	}
+	return ids, nil
+}
+
+// TryBeginPush is TryBeginSync on the push_* lane (issue #90): BEGIN
+// IMMEDIATE read-check-write on Go wall time (single-host topology). No
+// legacy adoption exists here — push claims only ever come from #90-aware
+// binaries, so an expired lease is always provably dead. A steal inherits
+// the dead claim's persisted force mandate (push_claim_force), so a crash
+// between claim and finish cannot downgrade an accepted forced request.
+func (s *SQLite) TryBeginPush(ctx context.Context, repoID, holder string, lease time.Duration) (RepoUpstream, bool, bool, string, error) {
+	assertf(repoID != "", "TryBeginPush: empty repo id")
+	assertf(holder != "", "TryBeginPush: empty holder")
+	assertf(lease > 0, "TryBeginPush: non-positive lease %v", lease)
+	nowNanos, _ := s.nowNano()
+	var up RepoUpstream
+	var claimed, force bool
+	var stolenFrom string
+	err := s.inTx(ctx, func(tx *sql.Tx) error {
+		prev, err := scanRepoUpstreamSQLite(tx.QueryRowContext(ctx,
+			`SELECT `+repoUpstreamCols+` FROM repo_upstreams WHERE repo_id = ?`, repoID))
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		if err != nil {
+			return err
+		}
+		now := time.Unix(0, nowNanos)
+		if prev.PushSyncing && prev.PushClaimExpiresAt.After(now) {
+			up = prev // unexpired claim in flight: refused, current row
+			return nil
+		}
+		force = prev.PushPending == 2 || (prev.PushSyncing && prev.PushClaimForce)
+		forceInt := 0
+		if force {
+			forceInt = 1
+		}
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE repo_upstreams
+			 SET push_syncing = 1, push_pending = 0, push_claim_holder = ?, push_claim_expires_at = ?, push_claim_force = ?
+			 WHERE repo_id = ?`,
+			holder, nowNanos+lease.Nanoseconds(), forceInt, repoID); err != nil {
+			return err
+		}
+		row, err := scanRepoUpstreamSQLite(tx.QueryRowContext(ctx,
+			`SELECT `+repoUpstreamCols+` FROM repo_upstreams WHERE repo_id = ?`, repoID))
+		if err != nil {
+			return err
+		}
+		up = row
+		assertf(up.PushSyncing && up.PushClaimHolder == holder,
+			"claimed row %q returned holder %q push_syncing=%v", repoID, up.PushClaimHolder, up.PushSyncing)
+		claimed = true
+		if prev.PushSyncing {
+			stolenFrom = prev.PushClaimHolder // expired lease stolen
+		}
+		return nil
+	})
+	if err != nil {
+		return RepoUpstream{}, false, false, "", fmt.Errorf("begin push for repo %q: %w", repoID, err)
+	}
+	return up, claimed, force, stolenFrom, nil
+}
+
+// FinishPush is FinishSync on the push_* lane: holder-guarded completion,
+// per-direction counters, ErrClaimLost for stolen claims.
+func (s *SQLite) FinishPush(ctx context.Context, repoID, holder string, success bool) (RepoUpstream, error) {
+	assertf(repoID != "", "FinishPush: empty repo id")
+	assertf(holder != "", "FinishPush: empty holder")
+	successInc := 0
+	if success {
+		successInc = 1
+	}
+	var up RepoUpstream
+	err := s.inTx(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx,
+			`UPDATE repo_upstreams
+			 SET push_syncing = 0, push_run_count = push_run_count + 1,
+			     push_success_count = push_success_count + ?,
+			     push_claim_holder = '', push_claim_expires_at = 0, push_claim_force = 0
+			 WHERE repo_id = ? AND push_syncing = 1 AND push_claim_holder = ?`,
+			successInc, repoID, holder)
+		if err != nil {
+			return err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			// Guard miss: classify inside the same transaction.
+			cur, err := scanRepoUpstreamSQLite(tx.QueryRowContext(ctx,
+				`SELECT `+repoUpstreamCols+` FROM repo_upstreams WHERE repo_id = ?`, repoID))
+			if errors.Is(err, sql.ErrNoRows) {
+				return ErrNotFound
+			}
+			if err != nil {
+				return err
+			}
+			if cur.PushSyncing && cur.PushClaimHolder != holder {
+				return fmt.Errorf("now held by %q: %w", cur.PushClaimHolder, ErrClaimLost)
+			}
+			return ErrNotFound
+		}
+		assertf(n == 1, "finish push for %q affected %d rows", repoID, n)
+		row, err := scanRepoUpstreamSQLite(tx.QueryRowContext(ctx,
+			`SELECT `+repoUpstreamCols+` FROM repo_upstreams WHERE repo_id = ?`, repoID))
+		if err != nil {
+			return err
+		}
+		up = row
+		return nil
+	})
+	if err != nil {
+		return RepoUpstream{}, fmt.Errorf("finish push for repo %q: %w", repoID, err)
 	}
 	return up, nil
 }

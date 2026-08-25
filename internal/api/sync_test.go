@@ -211,8 +211,11 @@ func newUsyncStack(t *testing.T, e *testEnv) *usyncStack {
 		},
 		Logger:  discardLogger(),
 		Timeout: time.Minute,
+		// Fixture upstreams are 127.0.0.1 CGI servers, denied by the
+		// egress guard's production default.
+		PushEgressAllowPrivate: true,
 	}
-	queue := upsync.NewInProcessQueue(worker.Run, discardLogger())
+	queue := upsync.NewInProcessQueue(worker.Run, worker.RunPush, discardLogger())
 	t.Cleanup(queue.Close)
 
 	ss := newSyncServer(e.store, s.mem, s.mem, queue, testHTTPBaseURL, discardLogger())

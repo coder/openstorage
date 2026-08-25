@@ -1238,7 +1238,7 @@ func TestLocalQueue_TriggerInExitWindowNotLost(t *testing.T) {
 	r := NewRepacker(shim, f.blobs, fixtureMaterialize(f.blobs, t.TempDir()), slog.New(slog.DiscardHandler))
 	r.FollowUpThreshold = 2
 	deliverer := &events.Deliverer{Webhooks: stubWebhooks{}, Logger: slog.New(slog.DiscardHandler)}
-	q := NewLocal(deliverer, func(context.Context, sync.Job) error { return nil }, r, slog.New(slog.DiscardHandler))
+	q := NewLocal(deliverer, func(context.Context, sync.Job) error { return nil }, func(context.Context, sync.Job) error { return nil }, r, slog.New(slog.DiscardHandler))
 
 	r.BeforeSwap = func(context.Context, ref.Pack) error {
 		// Arm mid-fold: the NEXT ListPacks is the post-fold NeedsFollowUp
@@ -1356,7 +1356,7 @@ func TestLocalQueue_RepackWorkersCapped(t *testing.T) {
 		return "", errors.New("gated fixture materialize: fold aborts after the concurrency probe")
 	}, slog.New(slog.DiscardHandler))
 	deliverer := &events.Deliverer{Webhooks: stubWebhooks{}, Logger: slog.New(slog.DiscardHandler)}
-	q := NewLocal(deliverer, func(context.Context, sync.Job) error { return nil }, r, slog.New(slog.DiscardHandler))
+	q := NewLocal(deliverer, func(context.Context, sync.Job) error { return nil }, func(context.Context, sync.Job) error { return nil }, r, slog.New(slog.DiscardHandler))
 
 	// Seed rows (with real backing blobs — selection point-reads their
 	// size and 12-byte pack header) for N distinct repo keys so every
@@ -1430,7 +1430,7 @@ func TestLocalQueue_CloseSkipsParkedFolds(t *testing.T) {
 		return "", errors.New("gated")
 	}, slog.New(slog.DiscardHandler))
 	deliverer := &events.Deliverer{Webhooks: stubWebhooks{}, Logger: slog.New(slog.DiscardHandler)}
-	q := NewLocal(deliverer, func(context.Context, sync.Job) error { return nil }, r, slog.New(slog.DiscardHandler))
+	q := NewLocal(deliverer, func(context.Context, sync.Job) error { return nil }, func(context.Context, sync.Job) error { return nil }, r, slog.New(slog.DiscardHandler))
 
 	// Fill every slot plus park several waiters.
 	seed := filepath.Join(t.TempDir(), "seed.pack")
@@ -1619,7 +1619,7 @@ func TestRiver_RepackUniqueByRepo(t *testing.T) {
 	r.FollowUpThreshold = 2 // successor gate: mid-run rows demand a follow-up
 
 	deliverer := &events.Deliverer{Webhooks: stubWebhooks{}, Logger: slog.New(slog.DiscardHandler)}
-	q, err := NewRiver(ctx, pgURL, deliverer, func(context.Context, sync.Job) error { return nil }, sync.NewMemStore(),
+	q, err := NewRiver(ctx, pgURL, deliverer, func(context.Context, sync.Job) error { return nil }, func(context.Context, sync.Job) error { return nil }, sync.NewMemStore(),
 		nil, nil, nil, r, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatalf("NewRiver: %v", err)
@@ -1736,7 +1736,7 @@ func TestLocalQueue_TriggerMidFoldConvergesToOne(t *testing.T) {
 	r := f.repacker(t.TempDir())
 	r.FollowUpThreshold = 2
 	deliverer := &events.Deliverer{Webhooks: stubWebhooks{}, Logger: slog.New(slog.DiscardHandler)}
-	q := NewLocal(deliverer, func(context.Context, sync.Job) error { return nil }, r, slog.New(slog.DiscardHandler))
+	q := NewLocal(deliverer, func(context.Context, sync.Job) error { return nil }, func(context.Context, sync.Job) error { return nil }, r, slog.New(slog.DiscardHandler))
 	defer q.Close()
 	trigger := NewRepackTrigger(f.store, 2, q.EnqueueRepack, slog.New(slog.DiscardHandler))
 
@@ -1800,7 +1800,7 @@ func TestLocalQueue_LateRegistrationBelowThresholdSettles(t *testing.T) {
 	r := f.repacker(t.TempDir())
 	r.FollowUpThreshold = 3
 	deliverer := &events.Deliverer{Webhooks: stubWebhooks{}, Logger: slog.New(slog.DiscardHandler)}
-	q := NewLocal(deliverer, func(context.Context, sync.Job) error { return nil }, r, slog.New(slog.DiscardHandler))
+	q := NewLocal(deliverer, func(context.Context, sync.Job) error { return nil }, func(context.Context, sync.Job) error { return nil }, r, slog.New(slog.DiscardHandler))
 	defer q.Close()
 	trigger := NewRepackTrigger(f.store, 3, q.EnqueueRepack, slog.New(slog.DiscardHandler))
 
@@ -1859,7 +1859,7 @@ func TestLocalQueue_RepackCoalescesPerRepo(t *testing.T) {
 		return nil
 	}
 	deliverer := &events.Deliverer{Webhooks: stubWebhooks{}, Logger: slog.New(slog.DiscardHandler)}
-	q := NewLocal(deliverer, func(context.Context, sync.Job) error { return nil }, r, slog.New(slog.DiscardHandler))
+	q := NewLocal(deliverer, func(context.Context, sync.Job) error { return nil }, func(context.Context, sync.Job) error { return nil }, r, slog.New(slog.DiscardHandler))
 
 	// Three triggers while the first fold is parked in its race window:
 	// exactly one goroutine may run (River-equivalent unique-by-repo).
@@ -1918,7 +1918,7 @@ func TestLocalQueue_RepackCoalescesPerRepo(t *testing.T) {
 	r2 := f2.repacker(t.TempDir())
 	r2.MaxFoldObjects = 7 // two 3-object push packs per fold
 	r2.FollowUpThreshold = 2
-	q2 := NewLocal(deliverer, func(context.Context, sync.Job) error { return nil }, r2, slog.New(slog.DiscardHandler))
+	q2 := NewLocal(deliverer, func(context.Context, sync.Job) error { return nil }, func(context.Context, sync.Job) error { return nil }, r2, slog.New(slog.DiscardHandler))
 	if err := q2.EnqueueRepack(ctx, f2.repo); err != nil {
 		t.Fatalf("enqueue backlog repack: %v", err)
 	}
@@ -1936,7 +1936,7 @@ func TestLocalQueue_RepackCoalescesPerRepo(t *testing.T) {
 	f2.checkColdHydrate(t)
 
 	// A queue without a repacker must refuse rather than silently drop.
-	bare := NewLocal(deliverer, func(context.Context, sync.Job) error { return nil }, nil, slog.New(slog.DiscardHandler))
+	bare := NewLocal(deliverer, func(context.Context, sync.Job) error { return nil }, func(context.Context, sync.Job) error { return nil }, nil, slog.New(slog.DiscardHandler))
 	defer bare.Close()
 	if err := bare.EnqueueRepack(ctx, f.repo); err == nil {
 		t.Fatal("EnqueueRepack without a repacker must fail")

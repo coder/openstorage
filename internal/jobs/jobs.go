@@ -48,6 +48,10 @@ type Queue interface {
 	// UpstreamStore.RequestSync, and the in-flight run's finisher schedules
 	// the coalesced follow-up run.
 	EnqueueSync(ctx context.Context, job sync.Job) error
+	// EnqueuePush schedules one outbound push-upstream run (issue #90).
+	// Deduplication and the mark-before-enqueue protocol mirror
+	// EnqueueSync on the push lane (UpstreamStore.RequestPush).
+	EnqueuePush(ctx context.Context, job sync.Job) error
 	// EnqueueRepack schedules one background repack of repo's registered
 	// packs (issue #1). Jobs for the same repo are deduplicated while
 	// active (River unique-by-args jobs / in-process in-flight skip); a

@@ -84,6 +84,40 @@ func (syncArgs) InsertOpts() river.InsertOpts {
 	}
 }
 
+// pushArgs is one durable outbound push-upstream job (issue #90), unique
+// per repo across the active states exactly like syncArgs. Force does NOT
+// ride the args — uniqueness is keyed by repo, so a forced insert can be
+// deduplicated against a queued plain job; the durable push_pending level
+// (UpstreamStore.RequestPush, consumed by BeginPush) carries it instead.
+// Retry counts consecutive transient-failure retries: it selects the
+// successor's backoff and is deliberately excluded from uniqueness.
+type pushArgs struct {
+	Org    string `json:"org"`
+	RepoID string `json:"repo_id" river:"unique"`
+	Retry  int    `json:"retry,omitempty"`
+}
+
+func (pushArgs) Kind() string { return "upstream_push" }
+
+func (pushArgs) InsertOpts() river.InsertOpts {
+	return river.InsertOpts{
+		// Rescue semantics mirror syncArgs: a healthy worker completes
+		// every job exactly once; only crash-orphaned jobs are re-run,
+		// and that re-run is the marked request's only follow-up.
+		MaxAttempts: syncRescueAttempts,
+		UniqueOpts: river.UniqueOpts{
+			ByArgs: true,
+			ByState: []rivertype.JobState{
+				rivertype.JobStateAvailable,
+				rivertype.JobStatePending,
+				rivertype.JobStateRetryable,
+				rivertype.JobStateRunning,
+				rivertype.JobStateScheduled,
+			},
+		},
+	}
+}
+
 // sweepArgs is one orphan-pack sweep run. No payload: the sweep always
 // covers the whole packs/ space. Unique across the active states so the
 // periodic schedulers of concurrently running replicas cannot pile up
@@ -543,6 +577,123 @@ func (w *syncWorker) Work(ctx context.Context, job *river.Job[syncArgs]) error {
 	return nil
 }
 
+// pushSnoozeDelay is syncSnoozeDelay for the outbound lane: wake just past
+// the observed push-claim expiry when one is held (no legacy pacing — push
+// claims are never legacy).
+func pushSnoozeDelay(up sync.Upstream) time.Duration {
+	delay := syncFollowUpSnooze
+	if !up.PushSyncing {
+		return delay
+	}
+	if until := time.Until(up.PushClaimExpiresAt) + time.Second; until > delay {
+		delay = until
+	}
+	if delay > 30*time.Minute {
+		delay = 30 * time.Minute
+	}
+	return delay
+}
+
+// pushWorker executes one outbound push-upstream run (issue #90). It is
+// syncWorker's mirror on the push_* lane: the run owns outcomes and events,
+// and completion is transactional with a gated successor insert — the
+// swallowed-request coverage argument in syncWorker.Work applies verbatim
+// with RequestPush/BeginPush/push_pending substituted. One addition: a run
+// that failed TRANSIENTLY (upstream unreachable) re-marked its own pending
+// level (sync.Worker.RunPush), so the gate schedules its successor with the
+// worker-defined exponential backoff and an incremented retry counter
+// instead of immediately, bounding retry pressure during upstream outages.
+type pushWorker struct {
+	river.WorkerDefaults[pushArgs]
+	run       SyncRunner
+	upstreams sync.UpstreamStore
+	pool      *pgxpool.Pool
+	logger    *slog.Logger
+}
+
+func (w *pushWorker) Work(ctx context.Context, job *river.Job[pushArgs]) error {
+	// Pre-run baseline — see syncWorker.Work: PushRunCount changing across
+	// this job proves a claimed run completed while it was active.
+	preRuns, preKnown := 0, false
+	switch up, err := w.upstreams.GetUpstream(ctx, job.Args.RepoID); {
+	case err == nil:
+		preRuns, preKnown = up.PushRunCount, true
+	case !errors.Is(err, sync.ErrNotFound):
+		w.logger.Warn("push: pre-run upstream read failed",
+			"repo", job.Args.RepoID, "err", err)
+	}
+
+	runErr := w.run(ctx, sync.Job{Org: job.Args.Org, RepoID: job.Args.RepoID, Retry: job.Args.Retry})
+	if runErr != nil {
+		w.logger.Warn("push run finished with error",
+			"org", job.Args.Org, "repo", job.Args.RepoID, "err", runErr)
+	}
+
+	assertf(w.pool != nil, "pushWorker: pool not wired")
+	completionFailed := func(stage string, err error) error {
+		w.logger.Warn("push: atomic completion failed; snoozing to retry it",
+			"repo", job.Args.RepoID, "stage", stage, "err", err)
+		return river.JobSnooze(syncFollowUpSnooze)
+	}
+	tx, err := w.pool.Begin(ctx)
+	if err != nil {
+		return completionFailed("begin", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := river.JobCompleteTx[*riverpgxv5.Driver](ctx, tx, job); err != nil {
+		return completionFailed("complete", err)
+	}
+	switch up, err := w.upstreams.GetUpstream(ctx, job.Args.RepoID); {
+	case errors.Is(err, sync.ErrNotFound):
+		// Detached mid-flight: nothing to follow up.
+	case err != nil:
+		return completionFailed("pending recheck", err)
+	case up.PushPending != sync.PushPendingNone && preKnown && up.PushRunCount == preRuns && (runErr != nil || up.PushSyncing):
+		// Uncovered pending request (no counted run) — see the matching
+		// syncWorker case: completing would strand the accepted 202.
+		delay := pushSnoozeDelay(up)
+		w.logger.Warn("push: uncovered pending request; snoozing to retry it",
+			"repo", job.Args.RepoID, "delay", delay, "claimHeld", up.PushSyncing, "err", runErr)
+		return river.JobSnooze(delay)
+	default:
+		if up.PushPending != sync.PushPendingNone && (!preKnown || up.PushRunCount != preRuns) {
+			successor := pushArgs{Org: job.Args.Org, RepoID: job.Args.RepoID}
+			var opts *river.InsertOpts
+			if runErr != nil && sync.TransientPushFailure(runErr) && job.Args.Retry < sync.MaxPushTransientRetries {
+				// The failed run re-marked its own retry (RunPush):
+				// schedule the successor on the backoff cadence. Fresh
+				// requests that coalesced into the marker ride along —
+				// the upstream is unreachable for them too.
+				successor.Retry = job.Args.Retry + 1
+				opts = &river.InsertOpts{ScheduledAt: time.Now().Add(sync.PushRetryDelay(successor.Retry))}
+			}
+			if _, err := river.ClientFromContext[pgx.Tx](ctx).InsertTx(ctx, tx, successor, opts); err != nil {
+				return completionFailed("insert successor", err)
+			}
+		}
+		// Stranded mirror-back rescue (Codex round 6): RunPush marks the
+		// mirror-back durable (RequestSync) BEFORE its direct enqueue,
+		// but on pg that enqueue is a plain insert with no boot-recovery
+		// scan behind it — if it fails transiently while no pull is in
+		// flight, the sync_pending marker has no job left to consume it,
+		// and a pull that fetched the pre-forward upstream could stand
+		// divergent forever. Covering the marker here makes mirror-back
+		// scheduling part of this push job's durable completion: the
+		// insert deduplicates against any live sync job (unique by
+		// repo), whose own completion gate re-checks the marker.
+		if up.SyncPending {
+			if _, err := river.ClientFromContext[pgx.Tx](ctx).InsertTx(ctx, tx,
+				syncArgs{Org: job.Args.Org, RepoID: job.Args.RepoID}, nil); err != nil {
+				return completionFailed("insert mirror-back", err)
+			}
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return completionFailed("commit", err)
+	}
+	return nil
+}
+
 // River is the durable Postgres queue (plan Decision 1). The serve process
 // runs it in full mode (migrations + workers); hook subprocesses run
 // insert-only clients against the same database, which is how git-surface
@@ -566,9 +717,10 @@ var _ Queue = (*River)(nil)
 // the background-repack worker; nil rejects EnqueueRepack (repacking
 // disabled or not wired, e.g. insert-only hook clients that must never
 // fold).
-func NewRiver(ctx context.Context, pgURL string, deliverer *events.Deliverer, runSync SyncRunner, upstreams sync.UpstreamStore, sweep *SweepSchedule, lfsReclaim *LFSReclaimSchedule, absence *AbsenceReconcileSchedule, repack *Repacker, logger *slog.Logger) (*River, error) {
+func NewRiver(ctx context.Context, pgURL string, deliverer *events.Deliverer, runSync, runPush SyncRunner, upstreams sync.UpstreamStore, sweep *SweepSchedule, lfsReclaim *LFSReclaimSchedule, absence *AbsenceReconcileSchedule, repack *Repacker, logger *slog.Logger) (*River, error) {
 	assertf(deliverer != nil, "NewRiver: nil deliverer")
 	assertf(runSync != nil, "NewRiver: nil sync runner")
+	assertf(runPush != nil, "NewRiver: nil push runner")
 	assertf(upstreams != nil, "NewRiver: nil upstream store")
 	assertf(sweep == nil || (sweep.Sweeper != nil && sweep.Interval > 0),
 		"NewRiver: sweep schedule missing sweeper or interval: %+v", sweep)
@@ -622,6 +774,7 @@ func NewRiver(ctx context.Context, pgURL string, deliverer *events.Deliverer, ru
 	workers := river.NewWorkers()
 	river.AddWorker(workers, &deliveryWorker{deliverer: deliverer})
 	river.AddWorker(workers, &syncWorker{run: runSync, upstreams: upstreams, pool: pool, logger: logger})
+	river.AddWorker(workers, &pushWorker{run: runPush, upstreams: upstreams, pool: pool, logger: logger})
 	if repack != nil {
 		river.AddWorker(workers, &repackWorker{repacker: repack, pool: pool})
 	}
@@ -712,6 +865,14 @@ func (q *River) EnqueueWebhookDelivery(ctx context.Context, d events.Delivery) e
 
 func (q *River) EnqueueSync(ctx context.Context, job sync.Job) error {
 	_, err := q.client.Insert(ctx, syncArgs{Org: job.Org, RepoID: job.RepoID, Ref: job.Ref}, nil)
+	return err
+}
+
+// EnqueuePush inserts one unique-by-repo outbound push job (issue #90).
+// Insert works on insert-only hook clients too — workers are only needed
+// to execute, not to enqueue.
+func (q *River) EnqueuePush(ctx context.Context, job sync.Job) error {
+	_, err := q.client.Insert(ctx, pushArgs{Org: job.Org, RepoID: job.RepoID, Retry: job.Retry}, nil)
 	return err
 }
 

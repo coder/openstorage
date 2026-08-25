@@ -150,6 +150,44 @@ type Worker struct {
 	// this job's row is still running, so the river sync worker schedules
 	// successors transactionally at job completion instead (jobs/river.go).
 	Requeue func(ctx context.Context, job Job) error
+
+	// RequeuePush is the outbound lane's Requeue (issue #90): follow-up
+	// AND transient-retry scheduling for push-upstream runs. Same wiring
+	// split: local mode points it at EnqueuePush, river leaves it nil and
+	// schedules successors transactionally (jobs/river.go pushWorker).
+	RequeuePush func(ctx context.Context, job Job) error
+	// AfterForward, when non-nil, enqueues one inbound sync after every
+	// SUCCESSFUL outbound run. On ForwardOnPush repos it is the
+	// mirror-back half of the upstream model ("pushes are proxied to the
+	// provider and changes mirrored back"): their push->pull poke is
+	// rerouted to the forward (cmd wiring), so this restores the
+	// freshness pull strictly AFTER the forward landed, never racing it.
+	// On explicit push-upstream runs it heals the pull‖push interleaving:
+	// a concurrent pull that fetched upstream BEFORE the forward would
+	// otherwise force-write its pre-forward snapshot locally and stand
+	// divergent until some unrelated future trigger.
+	// RunPush marks the request durable (RequestSync) BEFORE invoking
+	// this hook — an enqueue that coalesces with an in-flight pull run
+	// (river insert-time uniqueness, a held local claim) then survives to
+	// that run's completion gate instead of silently dropping the
+	// promised mirror. Enqueue failures are logged; the marker carries
+	// the request to boot recovery or the next finisher. Both wirings
+	// point it at the queue's EnqueueSync.
+	AfterForward func(ctx context.Context, job Job) error
+
+	// DetachPoll is the cadence of the outbound push watchdog that
+	// re-reads the upstream row WHILE `git push` runs and kills the
+	// subprocess when the repo is detached or the claim stolen mid-push
+	// (issue #90); 0 means defaultDetachPoll. Only tests shorten it.
+	DetachPoll time.Duration
+
+	// PushEgressAllowPrivate relaxes the outbound push egress guard's
+	// private receiver classes (CODESTORAGE_SYNC_PUSH_ALLOW_PRIVATE, see
+	// egress.go): loopback/RFC1918/link-local/ULA upstreams for genuinely
+	// internal forges. Metadata and the special-purpose registry stay
+	// denied either way — every http(s) push dials through the guard's
+	// vetting proxy. Tests set it (fixture upstreams are 127.0.0.1).
+	PushEgressAllowPrivate bool
 }
 
 // allowProtocol resolves the effective GIT_ALLOW_PROTOCOL value.
@@ -558,47 +596,127 @@ func (w *Worker) transfer(ctx context.Context, job Job, repo RepoInfo, up Upstre
 	// The upstream FETCH above keeps proxy env untouched on purpose.
 	pushEnv = append(pushEnv, "NO_PROXY=*", "no_proxy=*")
 	pushURL := strings.TrimRight(w.Loopback.BaseURL, "/") + "/" + repo.RepoID + ".git"
-	pushArgs := append([]string{"push", pushURL}, mirrorRefspecs...)
-	if stderr, err := runGit(ctx, mirror, pushEnv, pushArgs...); err != nil {
+	// forward_on_push repos invert the conflict rule (issue #90, Codex
+	// round 7): LOCAL wins. An inbound pull whose upstream fetch predates
+	// a just-accepted local push must not force-rewind it — the poke
+	// reroutes to the forward lane, but a pull already in flight raced
+	// it, and any scheduling-side coordination leaves a window. Making
+	// the loopback push fast-forward-only closes it structurally: an
+	// accepted local push can never be erased by a stale snapshot, and
+	// genuine upstream additions still land as fast-forwards. Refused
+	// refs are the converged local-wins outcome, not a failure; upstream
+	// rewinds/divergence then surface on the next forward as its
+	// documented FailRejected, where a human decides force. Residual
+	// (documented in ADR-44): a FORCE-accepted local rewind to an
+	// ancestor of the stale snapshot is itself fast-forwardable, so a
+	// concurrent pull can still undo exactly that shape.
+	refspecs := mirrorRefspecs
+	if up.ForwardOnPush {
+		refspecs = pushRefspecs
+	}
+	pushArgs := append([]string{"push", "--porcelain", pushURL}, refspecs...)
+	stdout, stderr, err := runGitOut(ctx, mirror, pushEnv, pushArgs...)
+	if err != nil {
+		// Local-wins tolerance is scoped to the rejection REASONS: only
+		// stale-snapshot shapes (the client-side fast-forward/exists
+		// checks) mean "the loopback already has newer content", which is
+		// the converged forward-on-push outcome. Server-side rejections
+		// (hook declines: quota, persistence failures) mean upstream refs
+		// were NOT installed — succeeding on those would emit
+		// repo.sync.succeeded for a run that synced nothing.
+		if rejected := parsePushRejections(stdout); up.ForwardOnPush && allLocalWins(rejected) {
+			w.Logger.Info("mirror-back kept newer local refs (forward-on-push: local wins)",
+				"org", job.Org, "repo", job.RepoID, "refused", len(rejected))
+			return nil
+		}
 		return &syncFailure{code: FailPush, cause: fmt.Errorf("git push: %w: %s", err, stderr)}
 	}
 	return nil
 }
 
-// classifyFetchFailure maps git fetch stderr onto the documented failure
-// strings. Auth is checked first (an unreachable-looking 403 is still auth),
-// then network reachability; everything else is a generic clone failure.
-func classifyFetchFailure(stderr string) string {
+// allLocalWins reports whether every porcelain rejection is a
+// stale-snapshot shape — git's client-side refusal phrasings for "the
+// destination ref moved past this snapshot" ("non-fast-forward", "fetch
+// first") or "the destination already has a different tag" ("already
+// exists"). Empty input is false: an error without tolerated rejections
+// is a real failure.
+func allLocalWins(rejected []RejectedRef) bool {
+	if len(rejected) == 0 {
+		return false
+	}
+	for _, r := range rejected {
+		switch {
+		case strings.Contains(r.Reason, "non-fast-forward"),
+			strings.Contains(r.Reason, "fetch first"),
+			strings.Contains(r.Reason, "already exists"):
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// authFailureMarkers/networkFailureMarkers classify git transport stderr
+// for both transfer directions. Auth is checked first (an
+// unreachable-looking 403 is still auth), then network reachability.
+var authFailureMarkers = []string{
+	"authentication failed",
+	"terminal prompts disabled", // 401 with no credential: git can't prompt
+	"invalid username or password",
+	"access denied",
+	"returned error: 401",
+	"returned error: 403",
+}
+
+var networkFailureMarkers = []string{
+	"could not resolve host",
+	"connection refused",
+	"couldn't connect to server",
+	"could not connect to server",
+	"failed to connect to",
+	"unable to connect",
+	"connection timed out",
+	"operation timed out",
+	"network is unreachable",
+	"no route to host",
+}
+
+func containsAnyMarker(stderr string, markers []string) bool {
 	s := strings.ToLower(stderr)
-	for _, marker := range []string{
-		"authentication failed",
-		"terminal prompts disabled", // 401 with no credential: git can't prompt
-		"invalid username or password",
-		"access denied",
-		"returned error: 401",
-		"returned error: 403",
-	} {
+	for _, marker := range markers {
 		if strings.Contains(s, marker) {
-			return FailAuth
+			return true
 		}
 	}
-	for _, marker := range []string{
-		"could not resolve host",
-		"connection refused",
-		"couldn't connect to server",
-		"could not connect to server",
-		"failed to connect to",
-		"unable to connect",
-		"connection timed out",
-		"operation timed out",
-		"network is unreachable",
-		"no route to host",
-	} {
-		if strings.Contains(s, marker) {
-			return FailUnreachable
-		}
+	return false
+}
+
+// classifyFetchFailure maps git fetch stderr onto the documented failure
+// strings; everything past auth/network is a generic clone failure.
+func classifyFetchFailure(stderr string) string {
+	switch {
+	case containsAnyMarker(stderr, authFailureMarkers):
+		return FailAuth
+	case containsAnyMarker(stderr, networkFailureMarkers):
+		return FailUnreachable
+	default:
+		return FailClone
 	}
-	return FailClone
+}
+
+// classifyPushFailure is the outbound twin (issue #90): a `git push` to the
+// upstream that failed WITHOUT per-ref rejections (those map to
+// FailRejected before this runs) is auth, network, or a generic forward
+// failure.
+func classifyPushFailure(stderr string) string {
+	switch {
+	case containsAnyMarker(stderr, authFailureMarkers):
+		return FailAuth
+	case containsAnyMarker(stderr, networkFailureMarkers):
+		return FailUnreachable
+	default:
+		return FailForward
+	}
 }
 
 // hermeticGitEnv is the base environment for worker git invocations:
@@ -610,7 +728,23 @@ func classifyFetchFailure(stderr string) string {
 // API-layer validation.
 func hermeticGitEnv(allowProtocol string) []string {
 	assertf(allowProtocol != "", "hermeticGitEnv: empty allowProtocol")
-	return append(os.Environ(),
+	// Strip EVERY inherited GIT_* variable before setting the controlled
+	// ones: hosts export credential and config injectors — GIT_ASKPASS,
+	// GIT_SSH_COMMAND, GIT_CONFIG_COUNT/KEY/VALUE — that run arbitrary
+	// helpers inside the worker's git subprocesses (observed: a
+	// workspace-agent GIT_ASKPASS answering a 401 by phoning its own
+	// auth server through the push egress proxy, which misclassified the
+	// auth failure as a transient dial outage). Nulling the config FILES
+	// alone does not close the env channel.
+	env := os.Environ()
+	out := make([]string, 0, len(env)+4)
+	for _, kv := range env {
+		if strings.HasPrefix(kv, "GIT_") {
+			continue
+		}
+		out = append(out, kv)
+	}
+	return append(out,
 		"GIT_TERMINAL_PROMPT=0",
 		"GIT_CONFIG_GLOBAL=/dev/null",
 		"GIT_CONFIG_SYSTEM=/dev/null",
@@ -660,6 +794,13 @@ func runGitOut(ctx context.Context, dir string, env []string, args ...string) (s
 	cmd.Stdout = &outBuf
 	cmd.Stderr = &errBuf
 	cmd.Stdin = bytes.NewReader(nil)
+	// Cancellation must kill git's whole process group (setProcGroup):
+	// the transfer lives in a git-remote-http(s) CHILD, which would
+	// otherwise keep pushing/fetching after the parent died — and keep
+	// the output pipes open, blocking Run indefinitely. WaitDelay is the
+	// portable backstop for any pipe holder that still survives.
+	setProcGroup(cmd)
+	cmd.WaitDelay = 10 * time.Second
 	err = cmd.Run()
 	if err != nil && ctx.Err() != nil {
 		err = fmt.Errorf("%w (%v)", ctx.Err(), err)

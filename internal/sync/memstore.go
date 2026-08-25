@@ -218,3 +218,75 @@ func (m *MemStore) FinishSync(_ context.Context, repoID, holder string, success 
 	m.upstreams[repoID] = up
 	return up, nil
 }
+
+func (m *MemStore) RequestPush(_ context.Context, repoID string, force bool) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	up, ok := m.upstreams[repoID]
+	if !ok {
+		return ErrNotFound
+	}
+	level := PushPendingPush
+	if force {
+		level = PushPendingForce
+	}
+	// Levels only coalesce upward: a forced request is never downgraded.
+	if level > up.PushPending {
+		up.PushPending = level
+	}
+	m.upstreams[repoID] = up
+	return nil
+}
+
+func (m *MemStore) BeginPush(_ context.Context, repoID, holder string, lease time.Duration) (Upstream, bool, string, error) {
+	assertf(holder != "", "BeginPush: empty holder")
+	assertf(lease > 0, "BeginPush: non-positive lease %v", lease)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	up, ok := m.upstreams[repoID]
+	if !ok {
+		return Upstream{}, false, "", ErrNotFound
+	}
+	stolenFrom := ""
+	inheritForce := false
+	if up.PushSyncing {
+		if time.Now().Before(up.PushClaimExpiresAt) {
+			return Upstream{}, false, "", ErrPushInProgress
+		}
+		stolenFrom = up.PushClaimHolder // expired lease stolen (no legacy grace on this lane)
+		// The dead claim still owes its consumed force mandate: inherit it
+		// so a crash cannot downgrade an accepted forced request.
+		inheritForce = up.PushClaimForce
+	}
+	// The claim consumes the pending marker whole; the consumed level's
+	// force bit rides the run AND persists on the claim until FinishPush.
+	force := up.PushPending == PushPendingForce || inheritForce
+	up.PushSyncing, up.PushPending, up.PushClaimForce = true, PushPendingNone, force
+	up.PushClaimHolder, up.PushClaimExpiresAt = holder, time.Now().Add(lease)
+	m.upstreams[repoID] = up
+	return up, force, stolenFrom, nil
+}
+
+func (m *MemStore) FinishPush(_ context.Context, repoID, holder string, success bool) (Upstream, error) {
+	assertf(holder != "", "FinishPush: empty holder")
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	up, ok := m.upstreams[repoID]
+	if !ok {
+		return Upstream{}, ErrNotFound
+	}
+	if !up.PushSyncing {
+		return Upstream{}, fmt.Errorf("no push run in flight for %q: %w", repoID, ErrNotFound)
+	}
+	if up.PushClaimHolder != holder {
+		return Upstream{}, fmt.Errorf("now held by %q: %w", up.PushClaimHolder, ErrClaimLost)
+	}
+	up.PushSyncing, up.PushClaimForce = false, false
+	up.PushClaimHolder, up.PushClaimExpiresAt = "", time.Time{}
+	up.PushRunCount++
+	if success {
+		up.PushSuccessCount++
+	}
+	m.upstreams[repoID] = up
+	return up, nil
+}

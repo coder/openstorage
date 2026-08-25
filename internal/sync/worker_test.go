@@ -122,6 +122,11 @@ func newWorkerFixture(t *testing.T) *workerFixture {
 		// The hermetic fixture endpoints are file:// URLs, which the
 		// production default ("http:https") deliberately blocks.
 		AllowProtocol: "http:https:file",
+		// Fixture upstreams that ARE network endpoints live on
+		// 127.0.0.1 (httptest), which the egress guard's production
+		// default denies; the escape hatch routes them through the
+		// vetting proxy like an internal-forge deployment would.
+		PushEgressAllowPrivate: true,
 	}
 	return f
 }
@@ -251,6 +256,120 @@ func TestWorkerSecondRunCountsAndForceUpdates(t *testing.T) {
 	}
 	if got := testGit(t, f.loopbackDir, "-C", loop, "rev-parse", "refs/heads/main"); got != newHead {
 		t.Fatalf("loopback main = %s, want force-updated %s", got, newHead)
+	}
+}
+
+// TestWorkerPullKeepsNewerLocalRefsOnForwardOnPush (issue #90, Codex
+// round 7): on a forward_on_push repo, LOCAL wins — an inbound pull whose
+// fetch snapshot predates a just-accepted local push must not force-rewind
+// it (the loopback push is fast-forward-only there), while genuine
+// upstream additions still land. The refused refs are the converged
+// outcome: the run succeeds.
+func TestWorkerPullKeepsNewerLocalRefsOnForwardOnPush(t *testing.T) {
+	f := newWorkerFixture(t)
+	seedUpstream(t, f.upstreamDir, "own", "proj")
+	// A genuine upstream addition: a feature branch the pull must import.
+	bare := filepath.Join(f.upstreamDir, "own", "proj.git")
+	fwork := t.TempDir()
+	testGit(t, fwork, "init", "-b", "feature")
+	if err := os.WriteFile(filepath.Join(fwork, "feat.txt"), []byte("feat\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	testGit(t, fwork, "add", ".")
+	testGit(t, fwork, "commit", "-m", "feature c1")
+	testGit(t, fwork, "push", "file://"+bare, "feature")
+	featureHead := testGit(t, fwork, "rev-parse", "HEAD")
+
+	// Local refs are NEWER than the upstream snapshot (the raced-push
+	// shape: the pull fetched before a local push won its CAS).
+	localHead := seedLocalRepo(t, f, "repo_lw")
+	loop := filepath.Join(f.loopbackDir, "repo_lw.git")
+	if _, err := f.store.PutUpstream(context.Background(), Upstream{
+		RepoID: "repo_lw", Provider: "gitea", Owner: "own", Name: "proj",
+		UpstreamHost: "file://" + f.upstreamDir, ForwardOnPush: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := f.worker.Run(context.Background(), Job{Org: "acme", RepoID: "repo_lw"}); err != nil {
+		t.Fatalf("pull run: %v", err)
+	}
+	assertEventTypes(t, f.rec.list(), EventSyncStarted, EventSyncSucceeded)
+	if got := testGit(t, f.loopbackDir, "-C", loop, "rev-parse", "refs/heads/main"); got != localHead {
+		t.Fatalf("local main = %s, want preserved %s (stale pull rewound an accepted local push)", got, localHead)
+	}
+	if got := testGit(t, f.loopbackDir, "-C", loop, "rev-parse", "refs/heads/feature"); got != featureHead {
+		t.Fatalf("local feature = %s, want imported %s", got, featureHead)
+	}
+}
+
+// TestWorkerPullForwardOnPushPropagatesHookDeclines: local-wins tolerance
+// is scoped to stale-snapshot rejections — a server-side hook decline
+// (quota, persistence failure) on a forward_on_push repo means upstream
+// refs were NOT installed and must fail the run, never emit
+// repo.sync.succeeded.
+func TestWorkerPullForwardOnPushPropagatesHookDeclines(t *testing.T) {
+	f := newWorkerFixture(t)
+	seedUpstream(t, f.upstreamDir, "own", "proj")
+	loop := f.addLoopbackRepo(t, "repo_hd")
+	hook := filepath.Join(loop, "hooks", "pre-receive")
+	if err := os.WriteFile(hook, []byte("#!/bin/sh\necho quota exceeded >&2\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.PutUpstream(context.Background(), Upstream{
+		RepoID: "repo_hd", Provider: "gitea", Owner: "own", Name: "proj",
+		UpstreamHost: "file://" + f.upstreamDir, ForwardOnPush: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	err := f.worker.Run(context.Background(), Job{Org: "acme", RepoID: "repo_hd"})
+	if err == nil {
+		t.Fatal("pull run succeeded although the loopback hook declined every ref")
+	}
+	events := f.rec.list()
+	assertEventTypes(t, events, EventSyncStarted, EventSyncFailed)
+	if events[1].Error != FailPush {
+		t.Fatalf("error = %q, want %q", events[1].Error, FailPush)
+	}
+}
+
+// TestHermeticGitEnvStripsInheritedGitVars: host environments export
+// credential/config injectors (GIT_ASKPASS, GIT_SSH_COMMAND,
+// GIT_CONFIG_COUNT/KEY/VALUE) that would run arbitrary helpers inside the
+// worker's git subprocesses — a workspace-agent GIT_ASKPASS answering a
+// 401 by phoning home through the push egress proxy misclassified an auth
+// failure as a transient dial outage. Every inherited GIT_* must go; the
+// controlled values must survive.
+func TestHermeticGitEnvStripsInheritedGitVars(t *testing.T) {
+	t.Setenv("GIT_ASKPASS", "/host/injected-helper")
+	t.Setenv("GIT_CONFIG_COUNT", "1")
+	t.Setenv("UNRELATED_VAR", "kept")
+
+	got := map[string]string{}
+	for _, kv := range hermeticGitEnv("http:https") {
+		if k, v, ok := strings.Cut(kv, "="); ok {
+			got[k] = v
+		}
+	}
+	if v, ok := got["GIT_ASKPASS"]; ok {
+		t.Fatalf("inherited GIT_ASKPASS survived: %q", v)
+	}
+	if _, ok := got["GIT_CONFIG_COUNT"]; ok {
+		t.Fatal("inherited GIT_CONFIG_COUNT survived")
+	}
+	if got["UNRELATED_VAR"] != "kept" {
+		t.Fatal("non-GIT_ environment was not preserved")
+	}
+	for k, want := range map[string]string{
+		"GIT_TERMINAL_PROMPT": "0",
+		"GIT_CONFIG_GLOBAL":   "/dev/null",
+		"GIT_CONFIG_SYSTEM":   "/dev/null",
+		"GIT_ALLOW_PROTOCOL":  "http:https",
+	} {
+		if got[k] != want {
+			t.Fatalf("%s = %q, want %q", k, got[k], want)
+		}
 	}
 }
 

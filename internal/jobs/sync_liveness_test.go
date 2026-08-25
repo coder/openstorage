@@ -103,7 +103,7 @@ func TestRiverSyncRequestDuringRunningJobSchedulesSuccessor(t *testing.T) {
 	}
 
 	deliverer := &events.Deliverer{Webhooks: stubWebhooks{}, Logger: slog.New(slog.DiscardHandler)}
-	q, err := NewRiver(ctx, pgURL, deliverer, runner, store, nil, nil, nil, nil, slog.New(slog.DiscardHandler))
+	q, err := NewRiver(ctx, pgURL, deliverer, runner, func(context.Context, sync.Job) error { return nil }, store, nil, nil, nil, nil, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatalf("NewRiver: %v", err)
 	}
@@ -133,6 +133,70 @@ func TestRiverSyncRequestDuringRunningJobSchedulesSuccessor(t *testing.T) {
 	if up.SyncPending {
 		t.Errorf("SyncPending still set after the successor run: %+v", up)
 	}
+}
+
+// TestRiverPushCompletionRescuesStrandedMirrorBack (Codex round 6 on #90):
+// RunPush marks the mirror-back durable (RequestSync) before its direct
+// enqueue, but pg has no boot scan of PendingSyncRepoIDs — if that direct
+// insert fails while no pull is in flight, only the push job's
+// transactional completion can give the marker a vehicle. The push runner
+// below mimics exactly that shape: successful forward, marker set, no
+// direct enqueue.
+func TestRiverPushCompletionRescuesStrandedMirrorBack(t *testing.T) {
+	ctx := context.Background()
+	pgURL := livenessPG(t, ctx)
+
+	store := sync.NewMemStore()
+	if _, err := store.PutUpstream(ctx, sync.Upstream{
+		RepoID: "repo_mb", Provider: "gitea", Owner: "o", Name: "n",
+		UpstreamHost: "example.test", ForwardOnPush: true,
+	}); err != nil {
+		t.Fatalf("PutUpstream: %v", err)
+	}
+
+	var pullSeq, pullClaims atomic.Int32
+	pullRunner := func(ctx context.Context, job sync.Job) error {
+		holder := fmt.Sprintf("pull-%d", pullSeq.Add(1))
+		if _, _, err := store.BeginSync(ctx, job.RepoID, holder, time.Minute); err != nil {
+			if errors.Is(err, sync.ErrSyncInProgress) {
+				return nil
+			}
+			return err
+		}
+		pullClaims.Add(1)
+		_, err := store.FinishSync(ctx, job.RepoID, holder, true)
+		return err
+	}
+	pushRunner := func(ctx context.Context, job sync.Job) error {
+		holder := "push-h"
+		if _, _, _, err := store.BeginPush(ctx, job.RepoID, holder, time.Minute); err != nil {
+			return err
+		}
+		if _, err := store.FinishPush(ctx, job.RepoID, holder, true); err != nil {
+			return err
+		}
+		// Mirror-back marked durable; the direct enqueue "fails" (the
+		// real worker logs and moves on), stranding the marker unless
+		// the push completion gate covers it.
+		return store.RequestSync(ctx, job.RepoID)
+	}
+
+	deliverer := &events.Deliverer{Webhooks: stubWebhooks{}, Logger: slog.New(slog.DiscardHandler)}
+	q, err := NewRiver(ctx, pgURL, deliverer, pullRunner, pushRunner, store, nil, nil, nil, nil, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("NewRiver: %v", err)
+	}
+	defer q.Close()
+
+	if err := q.EnqueuePush(ctx, sync.Job{Org: "org", RepoID: "repo_mb"}); err != nil {
+		t.Fatalf("enqueue push: %v", err)
+	}
+
+	waitFor(t, "rescued mirror-back pull", func() bool { return pullClaims.Load() >= 1 })
+	waitFor(t, "sync_pending consumed", func() bool {
+		up, err := store.GetUpstream(ctx, "repo_mb")
+		return err == nil && !up.SyncPending
+	})
 }
 
 // A run that fails BEFORE claiming (transient repo-lookup/store error)
@@ -166,7 +230,7 @@ func TestRiverSyncPendingSurvivesPreClaimFailure(t *testing.T) {
 	}
 
 	deliverer := &events.Deliverer{Webhooks: stubWebhooks{}, Logger: slog.New(slog.DiscardHandler)}
-	q, err := NewRiver(ctx, pgURL, deliverer, runner, store, nil, nil, nil, nil, slog.New(slog.DiscardHandler))
+	q, err := NewRiver(ctx, pgURL, deliverer, runner, func(context.Context, sync.Job) error { return nil }, store, nil, nil, nil, nil, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatalf("NewRiver: %v", err)
 	}
@@ -227,7 +291,7 @@ func TestRiverSyncSkipWithPendingSnoozesUntilSteal(t *testing.T) {
 	}
 
 	deliverer := &events.Deliverer{Webhooks: stubWebhooks{}, Logger: slog.New(slog.DiscardHandler)}
-	q, err := NewRiver(ctx, pgURL, deliverer, runner, store, nil, nil, nil, nil, slog.New(slog.DiscardHandler))
+	q, err := NewRiver(ctx, pgURL, deliverer, runner, func(context.Context, sync.Job) error { return nil }, store, nil, nil, nil, nil, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatalf("NewRiver: %v", err)
 	}

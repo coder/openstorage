@@ -9,11 +9,13 @@ package main
 import (
 	"context"
 	"crypto"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net/url"
 	"os"
+	"slices"
 	"strconv"
 	"time"
 
@@ -110,17 +112,45 @@ func (s webhookSink) Emit(ctx context.Context, org, eventType string, payload []
 	}
 }
 
-// enqueueSyncIfDue implements the events.RefStoreOptions.EnqueueSync
-// contract (docs/explanation/domain-model.md invariant 11): a won persistent ref update schedules a
-// sync only when the repo has an upstream row AND no run is currently in
-// flight — the in-flight check is what keeps the sync worker's own loopback
-// pushes from re-triggering themselves. Deliberately NO RequestSync here
-// (issue #79): the pending marker would turn every loopback push into a
-// follow-up run, self-perpetuating the sync chain. Push-triggered syncs
-// carry no 202 promise, so dropping one under an in-flight claim stays the
-// documented invariant-11 behavior.
-func enqueueSyncIfDue(ms meta.EventingStore, enqueue func(ctx context.Context, job upsync.Job) error, org string) func(ctx context.Context, repoID string) error {
-	assertf(ms != nil && enqueue != nil && org != "", "enqueueSyncIfDue: missing deps")
+// enqueueSyncOrForward implements the events.RefStoreOptions.EnqueueSync
+// contract (docs/explanation/domain-model.md invariant 11): a won persistent
+// ref update pokes the sync machinery when the repo has an upstream row.
+//
+// Default (pull) direction: schedule an inbound sync only when no run is
+// currently in flight — the in-flight check is what keeps the sync worker's
+// own loopback pushes from re-triggering themselves. Deliberately NO
+// RequestSync here (issue #79): the pending marker would turn every
+// loopback push into a follow-up run, self-perpetuating the sync chain.
+// Push-triggered syncs carry no 202 promise, so dropping one under an
+// in-flight claim stays the documented invariant-11 behavior.
+//
+// forward_on_push repos (issue #90) REROUTE the poke outbound instead:
+// pulling first would force local refs back to the upstream's pre-push
+// state (the loopback push uses upstream-wins refspecs) and the forward's
+// later snapshot would then silently lose the very push it was meant to
+// publish. The worker schedules the mirror-back pull strictly AFTER a
+// successful forward (Worker.AfterForward). Unlike the pull poke, the
+// forward poke IS marked durable (RequestPush): marking cannot
+// self-perpetuate here — forward runs never CAS local refs, and a sync
+// run's own loopback pushes carry the sync claim, which suppresses the
+// hook-side poke entirely (wireHookEventing).
+//
+// callerDenied gates the FORWARD reroute only (Codex rounds 3 + security
+// on #90): the forward publishes every local head and tag with the stored
+// upstream credential, so it must not be implicitly triggerable by (a) a
+// caller whose token carries ANY ref-policy op — one allowed to update
+// only the refs its policies name — or (b) a write-only token lacking
+// git:read, which could otherwise exfiltrate repository content it cannot
+// clone to an upstream it can read. The explicit POST /repos/push-upstream
+// fails closed on both (policyDeniesPullUpstream coarseness + required
+// git:read scope); the poke matches it. The write itself was accepted and
+// stays local; convergence resumes on the next authorized trigger.
+// Deliberately NOT falling through to the pull poke: pulling now would
+// force-revert the write that was just accepted. The pull poke stays
+// ungated — documented invariant-11 behavior this slice does not change.
+func enqueueSyncOrForward(ms meta.EventingStore, enqueuePull, enqueuePush func(ctx context.Context, job upsync.Job) error, org string, callerDenied func(ctx context.Context) bool) func(ctx context.Context, repoID string) error {
+	assertf(ms != nil && enqueuePull != nil && enqueuePush != nil && org != "" && callerDenied != nil,
+		"enqueueSyncOrForward: missing deps")
 	return func(ctx context.Context, repoID string) error {
 		up, err := ms.GetRepoUpstream(ctx, repoID)
 		if errors.Is(err, meta.ErrNotFound) {
@@ -129,11 +159,102 @@ func enqueueSyncIfDue(ms meta.EventingStore, enqueue func(ctx context.Context, j
 		if err != nil {
 			return err
 		}
+		if up.ForwardOnPush {
+			if callerDenied(ctx) {
+				return nil // fail closed: no implicit full-mirror publication (see doc)
+			}
+			if err := ms.RequestPush(ctx, repoID, false); err != nil {
+				if errors.Is(err, meta.ErrNotFound) {
+					return nil // detached between the reads: nothing to forward
+				}
+				return err
+			}
+			return enqueuePush(ctx, upsync.Job{Org: org, RepoID: repoID})
+		}
 		if up.Syncing {
 			return nil // run in flight (or our own loopback push): skip
 		}
-		return enqueue(ctx, upsync.Job{Org: org, RepoID: repoID})
+		return enqueuePull(ctx, upsync.Job{Org: org, RepoID: repoID})
 	}
+}
+
+// anyRefPolicyOps reports whether any parsed policy rule carries ops — the
+// same coarseness as the API's policyDeniesPullUpstream: the pattern is
+// not consulted because the forward publishes every synced ref.
+func anyRefPolicyOps(policies []auth.RefPolicy) bool {
+	for _, rule := range policies {
+		if len(rule.Ops) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// forwardDeniedFromContext resolves enqueueSyncOrForward's callerDenied
+// for the serve process, whose ref mutations run under the request
+// context: the auth middleware injects the verified claims, and absent
+// claims mean a server-initiated write (import machinery, maintenance),
+// which is trusted by definition. A caller is denied when its token lacks
+// git:read (write-only tokens must not export the repo — see the
+// enqueueSyncOrForward doc) or carries any ref-policy op. A refs claim
+// that fails to parse counts as DENIED — a malformed policy must not
+// grant a broader implicit trigger than a parseable one.
+func forwardDeniedFromContext(ctx context.Context) bool {
+	claims, ok := auth.ClaimsFromContext(ctx)
+	if !ok {
+		return false
+	}
+	if !claims.HasScope(auth.ScopeGitRead) {
+		return true
+	}
+	var policies []auth.RefPolicy
+	if len(claims.Refs) > 0 {
+		var err error
+		policies, err = auth.ParseRefPolicies(string(claims.Refs))
+		if err != nil {
+			return true // fail closed
+		}
+	}
+	return anyRefPolicyOps(auth.FoldOps(policies, claims.Ops))
+}
+
+// hookCallerDeniedForward is forwardDeniedFromContext for the hook
+// subprocess, whose caller identity arrives as environment (the same
+// EnvRefsPolicy / EnvOps the update hook's enforceRefPolicy consumes,
+// plus EnvScopes; all set only when the claim is non-empty). Malformed
+// values count as denied — the update hook fails malformed-policy pushes
+// anyway, but the poke must not assume it ran first — and so does a
+// missing/unparseable scope list: only a proven git:read forwards.
+func hookCallerDeniedForward() bool {
+	var scopes []string
+	if raw := os.Getenv(githttp.EnvScopes); raw != "" {
+		if err := json.Unmarshal([]byte(raw), &scopes); err != nil {
+			return true // fail closed
+		}
+	}
+	if !slices.Contains(scopes, auth.ScopeGitRead) {
+		return true
+	}
+	policyJSON := os.Getenv(githttp.EnvRefsPolicy)
+	opsJSON := os.Getenv(githttp.EnvOps)
+	if policyJSON == "" && opsJSON == "" {
+		return false
+	}
+	var policies []auth.RefPolicy
+	if policyJSON != "" {
+		var err error
+		policies, err = auth.ParseRefPolicies(policyJSON)
+		if err != nil {
+			return true // fail closed
+		}
+	}
+	var ops []string
+	if opsJSON != "" {
+		if err := json.Unmarshal([]byte(opsJSON), &ops); err != nil {
+			return true // fail closed
+		}
+	}
+	return anyRefPolicyOps(auth.FoldOps(policies, ops))
 }
 
 // isPGURL dispatches queue construction on the metadata DB scheme, exactly
@@ -151,7 +272,7 @@ func isPGURL(dbURL string) bool {
 // non-nil repack registers the background-repack worker on both backends.
 // The returned cleanup stops the sweep and the queue (waiting for in-flight
 // local work).
-func buildServeEventing(ctx context.Context, ms meta.Store, dbURL, org, loopbackBaseURL string, key loopbackKey, sweep *jobs.SweepSchedule, lfsReclaim *jobs.LFSReclaimSchedule, absence *jobs.AbsenceReconcileSchedule, repack *jobs.Repacker, webhookAllowPrivate bool, logger *slog.Logger) (jobs.Queue, func(inner ref.RefStore) ref.RefStore, func(), error) {
+func buildServeEventing(ctx context.Context, ms meta.Store, dbURL, org, loopbackBaseURL string, key loopbackKey, sweep *jobs.SweepSchedule, lfsReclaim *jobs.LFSReclaimSchedule, absence *jobs.AbsenceReconcileSchedule, repack *jobs.Repacker, webhookAllowPrivate, syncPushAllowPrivate bool, logger *slog.Logger) (jobs.Queue, func(inner ref.RefStore) ref.RefStore, func(), error) {
 	assertf(ms != nil && dbURL != "" && org != "" && loopbackBaseURL != "", "buildServeEventing: missing deps")
 	assertf(logger != nil, "buildServeEventing: nil logger")
 
@@ -193,30 +314,45 @@ func buildServeEventing(ctx context.Context, ms meta.Store, dbURL, org, loopback
 			return key.mint(org, repo, ttl, holder)
 		}},
 		Logger: logger,
+		// Outbound push egress guard escape hatch (see upsync/egress.go):
+		// operators syncing to genuinely internal forges opt private
+		// receiver classes in; metadata/special ranges stay denied.
+		PushEgressAllowPrivate: syncPushAllowPrivate,
+	}
+	// The mirror-back pull after every successful outbound run (issue
+	// #90; explicit runs included — see the AfterForward field doc)
+	// enqueues through the same late-bound queue.
+	worker.AfterForward = func(ctx context.Context, job upsync.Job) error {
+		assertf(queue != nil, "eventing: forward finished before queue construction")
+		return queue.EnqueueSync(ctx, job)
 	}
 
 	cleanup := func() { queue.Close() }
 	if isPGURL(dbURL) {
-		// worker.Requeue stays nil on pg: river's insert-time uniqueness
-		// would swallow a requeue of a still-running job; the river sync
-		// worker schedules successors transactionally instead (issue #79).
-		q, err := jobs.NewRiver(ctx, dbURL, deliverer, worker.Run, ups, sweep, lfsReclaim, absence, repack, logger)
+		// worker.Requeue/RequeuePush stay nil on pg: river's insert-time
+		// uniqueness would swallow a requeue of a still-running job; the
+		// river sync/push workers schedule successors transactionally
+		// instead (issue #79).
+		q, err := jobs.NewRiver(ctx, dbURL, deliverer, worker.Run, worker.RunPush, ups, sweep, lfsReclaim, absence, repack, logger)
 		if err != nil {
 			return nil, nil, nil, err
 		}
 		queue = q
 	} else {
-		queue = jobs.NewLocal(deliverer, worker.Run, repack, logger)
+		queue = jobs.NewLocal(deliverer, worker.Run, worker.RunPush, repack, logger)
 		// Pending pull-upstream requests that arrive while a run is in
 		// flight are re-enqueued by the finishing run (issue #79); the
 		// in-process queue never deduplicates against a running run, so
-		// a plain re-enqueue is sound here.
+		// a plain re-enqueue is sound here. The push lane mirrors it and
+		// additionally drives the transient-retry backoff timers (#90).
 		worker.Requeue = queue.EnqueueSync
+		worker.RequeuePush = queue.EnqueuePush
 		// Boot recovery (issue #86): queued local work and deferred retry
-		// timers die with the process, but the SyncPending marker is
-		// durable — re-enqueue marked repos so accepted pull-upstream
-		// requests survive restarts (in particular the restart that
-		// applies CODESTORAGE_SYNC_STEAL_LEGACY). Delayed so the loopback
+		// timers die with the process, but the SyncPending/PushPending
+		// markers are durable — re-enqueue marked repos so accepted
+		// pull-upstream and push-upstream (#90) requests survive restarts
+		// (in particular the restart that applies
+		// CODESTORAGE_SYNC_STEAL_LEGACY). Delayed so the loopback
 		// listener is serving before the first recovered run pushes; a
 		// run that still meets a held claim re-arms the deferred retry.
 		recovery := time.AfterFunc(pendingSyncRecoveryDelay, func() {
@@ -225,11 +361,35 @@ func buildServeEventing(ctx context.Context, ms meta.Store, dbURL, org, loopback
 			ids, err := ms.PendingSyncRepoIDs(rctx)
 			if err != nil {
 				logger.Warn("pending sync boot recovery failed", "err", err)
+			} else {
+				for _, id := range ids {
+					if err := queue.EnqueueSync(rctx, upsync.Job{Org: org, RepoID: id}); err != nil {
+						logger.Warn("pending sync boot recovery enqueue failed", "repo", id, "err", err)
+					}
+				}
+			}
+			pushIDs, err := ms.PendingPushRepoIDs(rctx)
+			if err != nil {
+				logger.Warn("pending push boot recovery failed", "err", err)
 				return
 			}
-			for _, id := range ids {
-				if err := queue.EnqueueSync(rctx, upsync.Job{Org: org, RepoID: id}); err != nil {
-					logger.Warn("pending sync boot recovery enqueue failed", "repo", id, "err", err)
+			for _, id := range pushIDs {
+				// Re-mark BEFORE enqueueing: the listing includes repos
+				// whose previous process died AFTER its claim consumed
+				// the marker (orphaned push_syncing rows — always dead
+				// here, local mode is single-process). Their recovered
+				// run meets the unexpired dead lease and skips; only a
+				// set marker arms the deferred retry that steals it
+				// after expiry. MAX-coalescing keeps any existing level
+				// (never downgrades force), and the dead claim's own
+				// force mandate is inherited at the steal regardless
+				// (push_claim_force).
+				if err := ms.RequestPush(rctx, id, false); err != nil {
+					logger.Warn("pending push boot recovery re-mark failed", "repo", id, "err", err)
+					continue
+				}
+				if err := queue.EnqueuePush(rctx, upsync.Job{Org: org, RepoID: id}); err != nil {
+					logger.Warn("pending push boot recovery enqueue failed", "repo", id, "err", err)
 				}
 			}
 		})
@@ -273,7 +433,7 @@ func buildServeEventing(ctx context.Context, ms meta.Store, dbURL, org, loopback
 			Repos:           ms,
 			Webhooks:        whStore,
 			EnqueueDelivery: queue.EnqueueWebhookDelivery,
-			EnqueueSync:     enqueueSyncIfDue(ms, queue.EnqueueSync, org),
+			EnqueueSync:     enqueueSyncOrForward(ms, queue.EnqueueSync, queue.EnqueuePush, org, forwardDeniedFromContext),
 			Logger:          logger,
 		})
 	}
@@ -369,7 +529,20 @@ func wireHookEventing(ctx context.Context, logger *slog.Logger) func() {
 		}
 		cleanups = append(cleanups, q.Close)
 		enqueueDelivery = q.EnqueueWebhookDelivery
-		enqueueSync = enqueueSyncIfDue(ms, q.EnqueueSync, org)
+		// The hook subprocess serves exactly one push by one caller, so
+		// the denial verdict is a process-wide constant from its env.
+		denied := hookCallerDeniedForward()
+		enqueueSync = enqueueSyncOrForward(ms, q.EnqueueSync, q.EnqueuePush, org,
+			func(context.Context) bool { return denied })
+		if os.Getenv(githttp.EnvSyncClaim) != "" {
+			// This receive-pack IS a sync run's own loopback push (the
+			// claim-fenced token, issue #86): poking the sync seam from it
+			// would chain runs. The pull poke was already suppressed by the
+			// in-flight claim check; the forward poke (issue #90) must be
+			// suppressed here or every inbound mirror update would enqueue
+			// an outbound no-op forward. Push webhooks still emit.
+			enqueueSync = nil
+		}
 	} else {
 		// Local mode: deliver synchronously (bounded) before hook exit.
 		deliverer := &events.Deliverer{
@@ -382,12 +555,13 @@ func wireHookEventing(ctx context.Context, logger *slog.Logger) func() {
 			AllowPrivate: hookWebhookAllowPrivate(logger),
 			Logger:       logger,
 		}
-		local := jobs.NewLocal(deliverer, func(context.Context, upsync.Job) error {
+		neverRun := func(context.Context, upsync.Job) error {
 			panic("local hook queue must never run sync jobs")
-		}, nil /* hook subprocesses never fold */, logger)
+		}
+		local := jobs.NewLocal(deliverer, neverRun, neverRun, nil /* hook subprocesses never fold */, logger)
 		cleanups = append(cleanups, local.Close) // waits for in-flight deliveries
+		enqueueSync = nil                        // documented local-mode gap (see doc comment)
 		enqueueDelivery = local.EnqueueWebhookDelivery
-		enqueueSync = nil // documented local-mode gap (see doc comment)
 	}
 
 	githttp.WrapHookRefStore = func(_ context.Context, st ref.RefStore) ref.RefStore {

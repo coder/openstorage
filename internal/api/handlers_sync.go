@@ -40,6 +40,14 @@ func registerSyncRoutes(mux *http.ServeMux, verifier auth.Verifier, org string, 
 	assertf(s != nil, "registerSyncRoutes: nil syncServer")
 	mux.Handle("POST /api/v1/repos/pull-upstream",
 		rl.limit(routeRead)(requireAuth(verifier, org, false, auth.ScopeGitWrite)(http.HandlerFunc(s.handlePullUpstream))))
+	// push-upstream requires git:read ON TOP of git:write (Codex security
+	// round on #90): the forward exports every local head and tag to the
+	// upstream, so a write-only token could otherwise exfiltrate
+	// repository content it cannot clone — the worker self-mints its
+	// loopback read token, so the caller's own read authority is the only
+	// gate. requireAuth demands ALL listed scopes.
+	mux.Handle("POST /api/v1/repos/push-upstream",
+		rl.limit(routeRead)(requireAuth(verifier, org, false, auth.ScopeGitWrite, auth.ScopeGitRead)(http.HandlerFunc(s.handlePushUpstream))))
 	mux.Handle("DELETE /api/v1/repos/base",
 		rl.limit(routeRead)(requireAuth(verifier, org, false, auth.ScopeRepoWrite)(http.HandlerFunc(s.handleDetachBase))))
 }
@@ -55,6 +63,11 @@ type usyncBaseRepo struct {
 	DefaultBranch string             `json:"default_branch"`
 	UpstreamHost  string             `json:"upstream_host"`
 	Auth          *usyncBaseRepoAuth `json:"auth"`
+	// ForwardPushes opts the repo into forwarding won local pushes to the
+	// upstream (issue #90; our extension — upstream forwards implicitly in
+	// GitHub App mode). Default off: forwarding stays explicit-trigger via
+	// POST /repos/push-upstream.
+	ForwardPushes bool `json:"forward_pushes"`
 }
 
 type usyncBaseRepoAuth struct {
@@ -221,11 +234,12 @@ func (s *syncServer) handleCreateRepo(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if _, err := s.ups.PutUpstream(r.Context(), upsync.Upstream{
-			RepoID:       repo.RepoID,
-			Provider:     spec.Provider,
-			Owner:        spec.Owner,
-			Name:         spec.Name,
-			UpstreamHost: upstreamHost,
+			RepoID:        repo.RepoID,
+			Provider:      spec.Provider,
+			Owner:         spec.Owner,
+			Name:          spec.Name,
+			UpstreamHost:  upstreamHost,
+			ForwardOnPush: spec.ForwardPushes,
 		}); err != nil {
 			s.createAbandon(r.Context(), claims.Iss, url, repo.RepoID)
 			s.internalErr(w, r, "store base_repo upstream", err)
@@ -385,6 +399,83 @@ func (s *syncServer) handlePullUpstream(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	writeJSON(w, http.StatusAccepted, map[string]string{"message": pullUpstreamAcceptedMsg})
+}
+
+type usyncPushUpstreamRequest struct {
+	// Force opts into force refspecs (+refs/...): without it a
+	// non-fast-forward ref is rejected per ref by the upstream and the
+	// run fails with rejected_refs detail (issue #90).
+	Force bool `json:"force"`
+}
+
+// pushUpstreamAcceptedMsg mirrors pullUpstreamAcceptedMsg for the outbound
+// direction (our extension: upstream has no explicit push trigger).
+const pushUpstreamAcceptedMsg = "Repository push initiated successfully"
+
+// handlePushUpstream implements POST /api/v1/repos/push-upstream (scope
+// git:write, issue #90): mark + enqueue an outbound push of refs/heads/* and
+// refs/tags/* to the linked upstream. 400 when the repo has no upstream
+// base_repo. Ref policies fail closed exactly like pull-upstream — the
+// outbound run publishes EVERY local head and tag with the stored upstream
+// credential, so a caller restricted on any ref must not be able to cause
+// refs to be published upstream (policyDeniesPullUpstream's op coarseness
+// applies unchanged: the run may touch any synced ref).
+func (s *syncServer) handlePushUpstream(w http.ResponseWriter, r *http.Request) {
+	assertf(s != nil && s.store != nil && s.ups != nil && s.queue != nil,
+		"handlePushUpstream: nil syncServer deps")
+	claims := mustClaims(r)
+	policies, err := refPolicies(claims)
+	if err != nil {
+		writeErr(w, http.StatusForbidden, err.Error())
+		return
+	}
+	if op, denied := policyDeniesPullUpstream(policies); denied {
+		writeErr(w, http.StatusForbidden, "ref policy op "+strconv.Quote(op)+" denies push-upstream")
+		return
+	}
+	var req usyncPushUpstreamRequest
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBodyBytes))
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "read request body: "+err.Error())
+		return
+	}
+	if len(body) > 0 {
+		if err := json.Unmarshal(body, &req); err != nil {
+			writeErr(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
+			return
+		}
+	}
+	repo, err := meta.ResolveRepoKey(r.Context(), s.store, claims.Iss, claims.Repo)
+	switch {
+	case errors.Is(err, meta.ErrNotFound):
+		writeErr(w, http.StatusNotFound, "repository not found")
+		return
+	case err != nil:
+		s.internalErr(w, r, "resolve push-upstream repo", err)
+		return
+	}
+	// RequestPush doubles as the has-upstream precheck AND makes the 202
+	// promise durable, mirroring pull-upstream's RequestSync-before-enqueue
+	// protocol (issue #79): a request that coalesces with a run that
+	// already claimed survives to that run's FinishPush. Force rides the
+	// durable marker, not the job — queue deduplication is keyed by repo.
+	err = s.ups.RequestPush(r.Context(), repo.RepoID, req.Force)
+	switch {
+	case errors.Is(err, upsync.ErrNotFound):
+		writeErr(w, http.StatusBadRequest, "repository has no upstream base_repo")
+		return
+	case err != nil:
+		s.internalErr(w, r, "request push", err)
+		return
+	}
+	if err := s.queue.EnqueuePush(r.Context(), upsync.Job{
+		Org:    claims.Iss,
+		RepoID: repo.RepoID,
+	}); err != nil {
+		s.internalErr(w, r, "enqueue push", err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]string{"message": pushUpstreamAcceptedMsg})
 }
 
 // handleDetachBase implements DELETE /api/v1/repos/base (scope repo:write):

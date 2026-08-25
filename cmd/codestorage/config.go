@@ -178,6 +178,10 @@ const (
 	// internal deployments. Default off; the redirect refusal is NOT
 	// relaxed. Enabling it logs a boot-time warning.
 	envWebhookAllowPrivate = "CODESTORAGE_WEBHOOK_ALLOW_PRIVATE"
+	// envSyncPushAllowPrivate relaxes the outbound push egress guard's
+	// private receiver classes (issue #90) — the sync twin of the
+	// webhook escape hatch above.
+	envSyncPushAllowPrivate = "CODESTORAGE_SYNC_PUSH_ALLOW_PRIVATE"
 
 	// At-rest envelope encryption for the metadata store's secret columns
 	// (issue #54): comma-separated base64 32-byte AES-256 keys, first =
@@ -344,7 +348,8 @@ type serveConfig struct {
 	// webhookAllowPrivate relaxes the webhook delivery SSRF guard's
 	// private-range denial (issue #53); false (the default) keeps it
 	// strict.
-	webhookAllowPrivate bool
+	webhookAllowPrivate  bool
+	syncPushAllowPrivate bool
 
 	// secretsCodec envelope-encrypts the metadata store's secret columns
 	// (issue #54); nil (the default) keeps them plaintext.
@@ -589,6 +594,10 @@ func resolveServeConfig(getenv func(string) string, flagListen, flagAddr, flagCa
 		return serveConfig{}, err
 	}
 	cfg.webhookAllowPrivate, err = resolveWebhookAllowPrivate(getenv)
+	if err != nil {
+		return serveConfig{}, err
+	}
+	cfg.syncPushAllowPrivate, err = resolveBoolEnv(getenv, envSyncPushAllowPrivate)
 	if err != nil {
 		return serveConfig{}, err
 	}
@@ -1018,13 +1027,21 @@ func resolveRepackThreshold(getenv func(string) string) (int, error) {
 // fallback in either direction.
 func resolveWebhookAllowPrivate(getenv func(string) string) (bool, error) {
 	assertf(getenv != nil, "resolveWebhookAllowPrivate: nil getenv")
-	raw := getenv(envWebhookAllowPrivate)
+	return resolveBoolEnv(getenv, envWebhookAllowPrivate)
+}
+
+// resolveBoolEnv parses one boolean escape-hatch env var with fail-fast
+// semantics: unset means false, a malformed value is a boot error — never
+// a silent fallback in either direction.
+func resolveBoolEnv(getenv func(string) string, name string) (bool, error) {
+	assertf(getenv != nil && name != "", "resolveBoolEnv: missing getenv/name")
+	raw := getenv(name)
 	if raw == "" {
 		return false, nil
 	}
 	v, err := strconv.ParseBool(raw)
 	if err != nil {
-		return false, fmt.Errorf("%s: %w", envWebhookAllowPrivate, err)
+		return false, fmt.Errorf("%s: %w", name, err)
 	}
 	return v, nil
 }

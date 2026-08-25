@@ -69,7 +69,33 @@ type RepoUpstream struct {
 	// expiry at the zero instant, epoch/0 in storage).
 	SyncClaimHolder    string
 	SyncClaimExpiresAt time.Time
-	CreatedAt          time.Time
+	// ForwardOnPush opts the repo into forwarding won local pushes to the
+	// upstream (issue #90, base_repo.forward_pushes; default off).
+	ForwardOnPush bool
+	// PushPending is the outbound lane's pending marker (issue #90): a
+	// three-level value (0 none / 1 push / 2 force) that coalesces upward
+	// via RequestPush and is consumed by TryBeginPush. The level lives on
+	// the durable row — not the queue job — because job deduplication is
+	// keyed by repo and a crash-rescued job must still remember force.
+	PushPending int
+	// PushSyncing/PushClaimHolder/PushClaimExpiresAt lease the outbound
+	// claim exactly like the inbound triple. The lanes are separate on
+	// purpose: the inbound claim protects local refs (the loopback
+	// force-push), the outbound claim protects upstream refs. No legacy
+	// adoption exists here — no pre-#90 binary ever holds a push claim,
+	// so an expired push lease is always stealable.
+	PushSyncing        bool
+	PushClaimHolder    string
+	PushClaimExpiresAt time.Time
+	// PushClaimForce persists the force mandate the in-flight claim
+	// consumed from the marker, until FinishPush clears it: a claim whose
+	// holder crashed still owes the accepted forced request, so stealing
+	// an expired claim inherits its force (OR-ed with the thief's own
+	// consumed level) instead of silently downgrading the rescue.
+	PushClaimForce   bool
+	PushRunCount     int // completed outbound runs (success + failure)
+	PushSuccessCount int // completed successful outbound runs
+	CreatedAt        time.Time
 }
 
 // NewEventingID returns "<prefix>_<16 hex>" — the shared ID shape for
@@ -209,4 +235,28 @@ type EventingStore interface {
 	// was stolen, and the late finisher must abandon without touching the
 	// thief's claim or the counters.
 	FinishSync(ctx context.Context, repoID, holder string, success bool) (RepoUpstream, error)
+
+	// RequestPush raises PushPending to at least 1 (2 when force) —
+	// levels only coalesce upward (issue #90). Same mark-before-enqueue
+	// protocol as RequestSync. ErrNotFound when detached.
+	RequestPush(ctx context.Context, repoID string, force bool) error
+	// PendingPushRepoIDs lists repos owing an outbound run at boot: a set
+	// PushPending level (accepted requests not yet covered by a claimed
+	// run) OR an in-flight claim (PushSyncing) — in local single-process
+	// mode any claim observed at boot belongs to the previous process and
+	// is provably dead, and its consumed marker means the plain pending
+	// scan would strand the accepted push. Local-mode boot recovery
+	// re-marks and re-enqueues these; the pg deployment recovers through
+	// River's durable job rescue instead and never calls this.
+	PendingPushRepoIDs(ctx context.Context) ([]string, error)
+	// TryBeginPush is TryBeginSync on the push_* lane: it claims the
+	// outbound run under a lease and consumes PushPending whole,
+	// reporting whether the run must force. There is no legacy adoption —
+	// an expired push lease is stolen outright, and the steal INHERITS
+	// the dead claim's persisted force mandate (PushClaimForce), so a
+	// crash between claim and finish cannot silently downgrade an
+	// accepted forced request.
+	TryBeginPush(ctx context.Context, repoID, holder string, lease time.Duration) (up RepoUpstream, claimed bool, force bool, stolenFrom string, err error)
+	// FinishPush is FinishSync on the push_* lane.
+	FinishPush(ctx context.Context, repoID, holder string, success bool) (RepoUpstream, error)
 }

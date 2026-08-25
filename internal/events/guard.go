@@ -2,6 +2,7 @@ package events
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -11,6 +12,12 @@ import (
 	"syscall"
 	"time"
 )
+
+// ErrTargetDenied marks dial-time policy denials (as opposed to ordinary
+// resolution/connect failures) so callers routing OTHER traffic through
+// the guard — the outbound push egress proxy (issue #90) — can classify a
+// refused destination as a configuration error rather than weather.
+var ErrTargetDenied = errors.New("target denied by egress policy")
 
 // TargetGuard decides which network addresses webhook traffic may reach
 // (issue #53). Webhook URLs are attacker-controlled data — any org-level
@@ -184,7 +191,7 @@ func (g TargetGuard) lookup(ctx context.Context, host string) ([]netip.Addr, err
 func (g TargetGuard) vetHost(ctx context.Context, host string) ([]netip.Addr, error) {
 	if ip, err := netip.ParseAddr(host); err == nil {
 		if reason := g.deniedReason(ip); reason != "" {
-			return nil, fmt.Errorf("webhook target %s denied: %s", host, reason)
+			return nil, fmt.Errorf("egress target %s denied: %s: %w", host, reason, ErrTargetDenied)
 		}
 		return []netip.Addr{ip.Unmap()}, nil
 	}
@@ -198,7 +205,7 @@ func (g TargetGuard) vetHost(ctx context.Context, host string) ([]netip.Addr, er
 	vetted := make([]netip.Addr, len(addrs))
 	for i, ip := range addrs {
 		if reason := g.deniedReason(ip); reason != "" {
-			return nil, fmt.Errorf("webhook target %s resolves to denied address %s: %s", host, ip, reason)
+			return nil, fmt.Errorf("egress target %s resolves to denied address %s: %s: %w", host, ip, reason, ErrTargetDenied)
 		}
 		vetted[i] = ip.Unmap()
 	}
@@ -258,7 +265,7 @@ func (g TargetGuard) CheckRegistration(ctx context.Context, rawURL string) error
 // policy at that proxy rather than bypass this direct-dial guard.
 func (g TargetGuard) NewClient() *http.Client {
 	transport := &http.Transport{
-		DialContext:           g.dialContext,
+		DialContext:           g.DialContext,
 		DisableKeepAlives:     true, // re-resolve and re-vet every attempt
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
@@ -273,11 +280,13 @@ func (g TargetGuard) NewClient() *http.Client {
 	}
 }
 
-// dialContext is the authoritative enforcement point: resolve, vet every
+// DialContext is the authoritative enforcement point: resolve, vet every
 // candidate, then dial only the vetted literals — handing the hostname to
 // a re-resolving dialer here would reopen the rebinding window vetHost
-// just closed.
-func (g TargetGuard) dialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+// just closed. Exported for the outbound push egress proxy (issue #90),
+// which applies the same dial-time policy to `git push` traffic; policy
+// denials wrap ErrTargetDenied.
+func (g TargetGuard) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
 	switch network {
 	case "tcp", "tcp4", "tcp6":
 	default:

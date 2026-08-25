@@ -60,7 +60,7 @@ func TestDeadHolderClaimIsStolenAndSyncHeals(t *testing.T) {
 		t.Fatalf("dead-holder claim: %v", err)
 	}
 
-	q := NewInProcessQueue(f.worker.Run, discardTestLogger())
+	q := NewInProcessQueue(f.worker.Run, f.worker.RunPush, discardTestLogger())
 	defer q.Close()
 	f.worker.Requeue = q.EnqueueSync
 
@@ -111,7 +111,7 @@ func TestDeadHolderUnexpiredLeaseDefersRetry(t *testing.T) {
 		t.Fatalf("dead-holder claim: %v", err)
 	}
 
-	q := NewInProcessQueue(f.worker.Run, discardTestLogger())
+	q := NewInProcessQueue(f.worker.Run, f.worker.RunPush, discardTestLogger())
 	defer q.Close()
 	f.worker.Requeue = q.EnqueueSync
 

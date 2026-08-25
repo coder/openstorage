@@ -26,6 +26,7 @@ never a silently-applied default.
 | [`CODESTORAGE_RATE_BURST`](#codestorage_rate_rps--codestorage_rate_burst) | unset (disabled) | Rate-limit token-bucket depth |
 | [`CODESTORAGE_TRUSTED_PROXIES`](#codestorage_trusted_proxies) | unset | CIDR allowlist of reverse proxies for rate-limit client identity |
 | [`CODESTORAGE_WEBHOOK_ALLOW_PRIVATE`](#codestorage_webhook_allow_private) | `false` | Permit private-network webhook receivers (metadata and redirects stay blocked) |
+| [`CODESTORAGE_SYNC_PUSH_ALLOW_PRIVATE`](#codestorage_sync_push_allow_private) | `false` | Permit private-network push-upstream destinations (metadata stays blocked) |
 | [`CODESTORAGE_SECRETS_KEY`](#codestorage_secrets_key) | unset (plaintext) | AES-256 key list for at-rest encryption of stored webhook secrets and upstream credentials |
 | [`CODESTORAGE_SECRETS_MODE`](#codestorage_secrets_mode) | `encrypt` | `decrypt-only` stages the key fleet-wide before encrypted writes begin |
 | [`CODESTORAGE_PACK_QUOTA_BYTES`](#codestorage_pack_quota_bytes) | 10 GiB | Per-repo storage quota, packs + LFS (`0` disables) |
@@ -195,6 +196,21 @@ proxies whose forwarded client identity the rate limiters may trust.
 - **List only proxies that set or append `X-Forwarded-For` themselves** — trusting a proxy
   that forwards client-supplied values verbatim lets any client mint fresh rate-limit
   buckets.
+
+### `CODESTORAGE_SYNC_PUSH_ALLOW_PRIVATE`
+
+Controls the outbound push-upstream egress guard. **Default: `false`.** `upstream_host`
+is caller-linked data, so outbound forwarding (`POST /repos/push-upstream`,
+`forward_pushes`) routes every http(s) `git push` through a dial-time vetting proxy that
+applies the same destination policy as webhook delivery: private, loopback, link-local,
+metadata, and special-purpose targets are denied, with every DNS answer re-resolved and
+vetted at connect time. A denied destination fails the run permanently as
+`invalid sync configuration` (no retry) and the upstream is never contacted.
+
+Set `true` only for deployments that legitimately forward to internal self-hosted forges
+(RFC 1918/loopback/ULA). Cloud-metadata and special-purpose ranges stay denied either way.
+Inbound pull-upstream fetches are not affected by this flag (see the tracking issue for a
+unified sync egress policy).
 
 ### `CODESTORAGE_WEBHOOK_ALLOW_PRIVATE`
 

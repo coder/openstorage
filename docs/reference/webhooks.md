@@ -54,6 +54,21 @@ metadata; `repo.sync.failed` additionally has `error`, one of:
 `"internal error"`, `"session unavailable"`, `"sync failed"`.
 See [`../upstream/guides/webhooks.md`](../upstream/guides/webhooks.md) for the exact field tables.
 
+Outbound push-upstream runs (our extension — see the
+[HTTP API](http-api.md) "Upstream sync") reuse these three event types with a
+`direction: "push"` discriminator; inbound pull payloads are unchanged on the
+wire (no `direction` field), so absence means pull. Push-direction payloads may
+additionally carry `forced: true` (the run used force refspecs) and, on
+`repo.sync.failed` with `error: "push rejected by upstream"`, a
+`rejected_refs: [{ref, reason}]` array naming each ref the upstream refused
+(e.g. `non-fast-forward`). The forward is atomic: one refused ref fails the
+whole batch and the upstream is left untouched, so the array also lists the
+innocent refs with reason `atomic push failed`. Push-direction `error`
+values reuse the strings
+above plus `"failed to push to upstream"` (generic outbound push failure) and
+`"push rejected by upstream"`. `run_count`/`is_first_sync` count outbound runs
+independently of inbound ones.
+
 ### Unknown events
 
 SDKs pass through unrecognized `X-Pierre-Event` values as `{type, raw}` — safe to add new

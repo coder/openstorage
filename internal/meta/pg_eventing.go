@@ -21,7 +21,7 @@ const (
 	// scanRepoUpstream (shared with sqlite_eventing.go like repoCols).
 	webhookCols       = "id, org_id, url, secret, created_at"
 	gitCredentialCols = "id, repo_id, username, password, created_at"
-	repoUpstreamCols  = "repo_id, provider, owner, name, upstream_host, run_count, success_count, syncing, sync_pending, sync_claim_holder, sync_claim_expires_at, created_at"
+	repoUpstreamCols  = "repo_id, provider, owner, name, upstream_host, run_count, success_count, syncing, sync_pending, sync_claim_holder, sync_claim_expires_at, forward_on_push, push_pending, push_syncing, push_claim_holder, push_claim_expires_at, push_claim_force, push_run_count, push_success_count, created_at"
 )
 
 // scanWebhook scans one row of webhookCols; CreatedAt normalized to UTC.
@@ -49,10 +49,14 @@ func scanRepoUpstream(row pgx.Row) (RepoUpstream, error) {
 	var up RepoUpstream
 	if err := row.Scan(&up.RepoID, &up.Provider, &up.Owner, &up.Name, &up.UpstreamHost,
 		&up.RunCount, &up.SuccessCount, &up.Syncing, &up.SyncPending,
-		&up.SyncClaimHolder, &up.SyncClaimExpiresAt, &up.CreatedAt); err != nil {
+		&up.SyncClaimHolder, &up.SyncClaimExpiresAt,
+		&up.ForwardOnPush, &up.PushPending, &up.PushSyncing,
+		&up.PushClaimHolder, &up.PushClaimExpiresAt, &up.PushClaimForce,
+		&up.PushRunCount, &up.PushSuccessCount, &up.CreatedAt); err != nil {
 		return RepoUpstream{}, err
 	}
 	up.SyncClaimExpiresAt = up.SyncClaimExpiresAt.UTC()
+	up.PushClaimExpiresAt = up.PushClaimExpiresAt.UTC()
 	up.CreatedAt = up.CreatedAt.UTC()
 	return up, nil
 }
@@ -329,15 +333,17 @@ func (s *PG) SetRepoUpstream(ctx context.Context, up RepoUpstream) (RepoUpstream
 	assertf(up.RepoID != "", "SetRepoUpstream: empty repo id")
 	up.RunCount, up.SuccessCount, up.Syncing, up.SyncPending = 0, 0, false, false
 	up.SyncClaimHolder, up.SyncClaimExpiresAt = "", time.Unix(0, 0).UTC()
+	up.PushPending, up.PushSyncing, up.PushRunCount, up.PushSuccessCount = 0, false, 0, 0
+	up.PushClaimHolder, up.PushClaimExpiresAt, up.PushClaimForce = "", time.Unix(0, 0).UTC(), false
 	// Live-repo guard with FOR UPDATE — see CreateGitCredential (issue
 	// #52, PR #105 round 6): no upstream link may attach to a deleted or
 	// purged repository.
 	err := s.pool.QueryRow(ctx,
-		`INSERT INTO repo_upstreams (repo_id, provider, owner, name, upstream_host)
-		 SELECT $1, $2, $3, $4, $5
+		`INSERT INTO repo_upstreams (repo_id, provider, owner, name, upstream_host, forward_on_push)
+		 SELECT $1, $2, $3, $4, $5, $6
 		 WHERE EXISTS (SELECT 1 FROM repos WHERE repo_id = $1 AND deleted_at IS NULL FOR UPDATE)
 		 RETURNING created_at`,
-		up.RepoID, up.Provider, up.Owner, up.Name, up.UpstreamHost).Scan(&up.CreatedAt)
+		up.RepoID, up.Provider, up.Owner, up.Name, up.UpstreamHost, up.ForwardOnPush).Scan(&up.CreatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return RepoUpstream{}, fmt.Errorf("upstream for deleted or unknown repo %q: %w", up.RepoID, ErrNotFound)
 	}
@@ -544,6 +550,143 @@ func (s *PG) FinishSync(ctx context.Context, repoID, holder string, success bool
 	case cur.Syncing && cur.SyncClaimHolder != holder:
 		return RepoUpstream{}, fmt.Errorf("upstream for repo %q now held by %q: %w",
 			repoID, cur.SyncClaimHolder, ErrClaimLost)
+	default:
+		return RepoUpstream{}, fmt.Errorf("upstream for repo %q: %w", repoID, ErrNotFound)
+	}
+}
+
+// RequestPush raises the outbound pending level (issue #90); levels only
+// coalesce upward so force is never downgraded. ErrNotFound when detached.
+func (s *PG) RequestPush(ctx context.Context, repoID string, force bool) error {
+	assertf(repoID != "", "RequestPush: empty repo id")
+	level := 1
+	if force {
+		level = 2
+	}
+	tag, err := s.pool.Exec(ctx,
+		`UPDATE repo_upstreams SET push_pending = GREATEST(push_pending, $2) WHERE repo_id = $1`,
+		repoID, level)
+	if err != nil {
+		return fmt.Errorf("request push for repo %q: %w", repoID, err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("upstream for repo %q: %w", repoID, ErrNotFound)
+	}
+	assertf(tag.RowsAffected() == 1, "UPDATE by primary key affected %d rows", tag.RowsAffected())
+	return nil
+}
+
+// PendingPushRepoIDs lists repos owing an outbound run at boot — pending
+// marker set OR orphaned in-flight claim (see the EventingStore contract;
+// local-mode boot recovery, issue #90).
+func (s *PG) PendingPushRepoIDs(ctx context.Context) ([]string, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT repo_id FROM repo_upstreams WHERE push_pending > 0 OR push_syncing ORDER BY repo_id`)
+	if err != nil {
+		return nil, fmt.Errorf("list pending push repos: %w", err)
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("list pending push repos: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list pending push repos: %w", err)
+	}
+	return ids, nil
+}
+
+// TryBeginPush is TryBeginSync on the push_* lane (issue #90): row-locked
+// read-check-write on the database clock, expired leases stolen atomically.
+// No legacy adoption exists here — push claims only ever come from
+// #90-aware binaries, so an expired lease is always provably dead. A steal
+// inherits the dead claim's persisted force mandate (push_claim_force), so
+// a crash between claim and finish cannot downgrade an accepted forced
+// request.
+func (s *PG) TryBeginPush(ctx context.Context, repoID, holder string, lease time.Duration) (RepoUpstream, bool, bool, string, error) {
+	assertf(repoID != "", "TryBeginPush: empty repo id")
+	assertf(holder != "", "TryBeginPush: empty holder")
+	assertf(lease > 0, "TryBeginPush: non-positive lease %v", lease)
+	var up RepoUpstream
+	var claimed, force bool
+	var stolenFrom string
+	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		prev, err := scanRepoUpstream(tx.QueryRow(ctx,
+			`SELECT `+repoUpstreamCols+` FROM repo_upstreams WHERE repo_id = $1 FOR UPDATE`, repoID))
+		if errors.Is(err, pgx.ErrNoRows) {
+			return fmt.Errorf("upstream for repo %q: %w", repoID, ErrNotFound)
+		}
+		if err != nil {
+			return err
+		}
+		var dbNow time.Time
+		if err := tx.QueryRow(ctx, `SELECT now()`).Scan(&dbNow); err != nil {
+			return err
+		}
+		if prev.PushSyncing && prev.PushClaimExpiresAt.After(dbNow) {
+			up = prev // unexpired claim in flight: refused, current row
+			return nil
+		}
+		force = prev.PushPending == 2 || (prev.PushSyncing && prev.PushClaimForce)
+		row, err := scanRepoUpstream(tx.QueryRow(ctx,
+			`UPDATE repo_upstreams
+			 SET push_syncing = true, push_pending = 0,
+			     push_claim_holder = $2,
+			     push_claim_expires_at = now() + make_interval(secs => $3),
+			     push_claim_force = $4
+			 WHERE repo_id = $1
+			 RETURNING `+repoUpstreamCols, repoID, holder, lease.Seconds(), force))
+		if err != nil {
+			return err
+		}
+		assertf(row.PushSyncing && row.PushClaimHolder == holder,
+			"claimed row %q returned holder %q push_syncing=%v", repoID, row.PushClaimHolder, row.PushSyncing)
+		up, claimed = row, true
+		if prev.PushSyncing {
+			stolenFrom = prev.PushClaimHolder // expired lease stolen
+		}
+		return nil
+	})
+	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			return RepoUpstream{}, false, false, "", err
+		}
+		return RepoUpstream{}, false, false, "", fmt.Errorf("begin push for repo %q: %w", repoID, err)
+	}
+	return up, claimed, force, stolenFrom, nil
+}
+
+// FinishPush is FinishSync on the push_* lane: holder-guarded completion,
+// per-direction counters, ErrClaimLost for stolen claims.
+func (s *PG) FinishPush(ctx context.Context, repoID, holder string, success bool) (RepoUpstream, error) {
+	assertf(repoID != "", "FinishPush: empty repo id")
+	assertf(holder != "", "FinishPush: empty holder")
+	up, err := scanRepoUpstream(s.pool.QueryRow(ctx,
+		`UPDATE repo_upstreams
+		 SET push_syncing = false, push_run_count = push_run_count + 1,
+		     push_success_count = push_success_count + CASE WHEN $3 THEN 1 ELSE 0 END,
+		     push_claim_holder = '', push_claim_expires_at = 'epoch', push_claim_force = false
+		 WHERE repo_id = $1 AND push_syncing = true AND push_claim_holder = $2
+		 RETURNING `+repoUpstreamCols, repoID, holder, success))
+	if err == nil {
+		return up, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return RepoUpstream{}, fmt.Errorf("finish push for repo %q: %w", repoID, err)
+	}
+	// Guard miss: classify (same harmless approximation as FinishSync).
+	switch cur, err := s.GetRepoUpstream(ctx, repoID); {
+	case errors.Is(err, ErrNotFound):
+		return RepoUpstream{}, err
+	case err != nil:
+		return RepoUpstream{}, fmt.Errorf("finish push for repo %q: %w", repoID, err)
+	case cur.PushSyncing && cur.PushClaimHolder != holder:
+		return RepoUpstream{}, fmt.Errorf("upstream for repo %q now held by %q: %w",
+			repoID, cur.PushClaimHolder, ErrClaimLost)
 	default:
 		return RepoUpstream{}, fmt.Errorf("upstream for repo %q: %w", repoID, ErrNotFound)
 	}

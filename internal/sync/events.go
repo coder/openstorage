@@ -23,7 +23,16 @@ const (
 	FailInternal    = "internal error"
 	FailSession     = "session unavailable"
 	FailGeneric     = "sync failed"
+	// Outbound push-upstream failure strings (issue #90, direction
+	// "push"). FailRejected carries per-ref reasons in rejected_refs.
+	FailForward  = "failed to push to upstream"
+	FailRejected = "push rejected by upstream"
 )
+
+// DirectionPush marks outbound (local -> upstream) runs in event payloads
+// (issue #90). Inbound runs omit the field entirely so pre-#90 pull event
+// bodies stay byte-identical on the wire.
+const DirectionPush = "push"
 
 // Event is the repo.sync.* webhook payload (docs/upstream/guides/webhooks.md
 // field tables). CompletedAt/Error are only present on terminal events.
@@ -35,6 +44,21 @@ type Event struct {
 	StartedAt   string          `json:"started_at"`
 	CompletedAt string          `json:"completed_at,omitempty"`
 	Error       string          `json:"error,omitempty"`
+	// Direction discriminates outbound runs (DirectionPush, issue #90).
+	// Absent means inbound pull — the pre-#90 payload shape.
+	Direction string `json:"direction,omitempty"`
+	// Forced reports that an outbound run used force refspecs.
+	Forced bool `json:"forced,omitempty"`
+	// RejectedRefs carries per-ref rejection reasons on FailRejected
+	// outbound failures (issue #90: a non-fast-forward ref fails with a
+	// clear reason instead of silently rewriting upstream history).
+	RejectedRefs []RejectedRef `json:"rejected_refs,omitempty"`
+}
+
+// RejectedRef is one upstream-rejected ref of an outbound push run.
+type RejectedRef struct {
+	Ref    string `json:"ref"`
+	Reason string `json:"reason"`
 }
 
 // EventRepository identifies the synced repo: id = repo_id, url = the JWT
@@ -59,6 +83,11 @@ func (e Event) marshal() []byte {
 	assertf(e.StartedAt != "", "marshal: missing started_at")
 	assertf((e.Type == EventSyncFailed) == (e.Error != ""), "marshal: error field mismatch for %s", e.Type)
 	assertf((e.Type != EventSyncStarted) == (e.CompletedAt != ""), "marshal: completed_at mismatch for %s", e.Type)
+	assertf(e.Direction == "" || e.Direction == DirectionPush, "marshal: bad direction %q", e.Direction)
+	assertf(e.Direction == DirectionPush || (!e.Forced && len(e.RejectedRefs) == 0),
+		"marshal: push-only fields on a pull event")
+	assertf(len(e.RejectedRefs) == 0 || e.Error == FailRejected,
+		"marshal: rejected_refs without %q error", FailRejected)
 	buf, err := json.Marshal(e)
 	assertf(err == nil, "marshal event: %v", err)
 	return buf

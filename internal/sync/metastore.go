@@ -98,6 +98,10 @@ func fromMetaUpstream(u meta.RepoUpstream) Upstream {
 		UpstreamHost: u.UpstreamHost, RunCount: u.RunCount, SuccessCount: u.SuccessCount,
 		Syncing: u.Syncing, SyncPending: u.SyncPending,
 		SyncClaimHolder: u.SyncClaimHolder, SyncClaimExpiresAt: u.SyncClaimExpiresAt,
+		ForwardOnPush: u.ForwardOnPush, PushPending: u.PushPending,
+		PushSyncing: u.PushSyncing, PushClaimHolder: u.PushClaimHolder,
+		PushClaimExpiresAt: u.PushClaimExpiresAt, PushClaimForce: u.PushClaimForce,
+		PushRunCount: u.PushRunCount, PushSuccessCount: u.PushSuccessCount,
 		CreatedAt: u.CreatedAt,
 	}
 }
@@ -105,7 +109,7 @@ func fromMetaUpstream(u meta.RepoUpstream) Upstream {
 func (s metaUpstreams) PutUpstream(ctx context.Context, up Upstream) (Upstream, error) {
 	row, err := s.ms.SetRepoUpstream(ctx, meta.RepoUpstream{
 		RepoID: up.RepoID, Provider: up.Provider, Owner: up.Owner, Name: up.Name,
-		UpstreamHost: up.UpstreamHost,
+		UpstreamHost: up.UpstreamHost, ForwardOnPush: up.ForwardOnPush,
 	})
 	if err != nil {
 		return Upstream{}, mapMetaErr(err, ErrNotFound, ErrUpstreamExists)
@@ -142,6 +146,32 @@ func (s metaUpstreams) BeginSync(ctx context.Context, repoID, holder string, lea
 
 func (s metaUpstreams) FinishSync(ctx context.Context, repoID, holder string, success bool) (Upstream, error) {
 	row, err := s.ms.FinishSync(ctx, repoID, holder, success)
+	if errors.Is(err, meta.ErrClaimLost) {
+		return Upstream{}, fmt.Errorf("%w: %v", ErrClaimLost, err)
+	}
+	if err != nil {
+		return Upstream{}, mapMetaErr(err, ErrNotFound, nil)
+	}
+	return fromMetaUpstream(row), nil
+}
+
+func (s metaUpstreams) RequestPush(ctx context.Context, repoID string, force bool) error {
+	return mapMetaErr(s.ms.RequestPush(ctx, repoID, force), ErrNotFound, nil)
+}
+
+func (s metaUpstreams) BeginPush(ctx context.Context, repoID, holder string, lease time.Duration) (Upstream, bool, string, error) {
+	row, claimed, force, stolenFrom, err := s.ms.TryBeginPush(ctx, repoID, holder, lease)
+	if err != nil {
+		return Upstream{}, false, "", mapMetaErr(err, ErrNotFound, nil)
+	}
+	if !claimed {
+		return Upstream{}, false, "", fmt.Errorf("%w: repo %s", ErrPushInProgress, repoID)
+	}
+	return fromMetaUpstream(row), force, stolenFrom, nil
+}
+
+func (s metaUpstreams) FinishPush(ctx context.Context, repoID, holder string, success bool) (Upstream, error) {
+	row, err := s.ms.FinishPush(ctx, repoID, holder, success)
 	if errors.Is(err, meta.ErrClaimLost) {
 		return Upstream{}, fmt.Errorf("%w: %v", ErrClaimLost, err)
 	}
