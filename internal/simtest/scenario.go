@@ -75,7 +75,13 @@ type Result struct {
 	// CrashSteals is the subset of Steals whose previous holder actually
 	// crashed mid-run (dead-holder class) rather than outliving its lease.
 	CrashSteals int
-	OpCounts    map[string]int
+	// PushSteals/PushCrashSteals are the outbound-lane counterparts
+	// (issue #136); PushForcedRescues counts steals that inherited a force
+	// mandate carried only by the dead claim's push_claim_force.
+	PushSteals        int
+	PushCrashSteals   int
+	PushForcedRescues int
+	OpCounts          map[string]int
 }
 
 // defaultFaultProfile arms the injector with the standing probabilistic
@@ -114,6 +120,9 @@ const (
 	opReserveSweep
 	opSyncClaim
 	opSyncRequest
+	opPushRequest
+	opPushClaim
+	opPushRescue
 )
 
 var opTable = []struct {
@@ -135,6 +144,9 @@ var opTable = []struct {
 	{opReserveSweep, "reserve-sweep", 3},
 	{opSyncClaim, "sync-claim", 10},
 	{opSyncRequest, "sync-request", 4},
+	{opPushRequest, "push-request", 6},
+	{opPushClaim, "push-claim", 10},
+	{opPushRescue, "push-rescue", 3},
 }
 
 // simRepo is one simulated repository: its storage key plus the scratch
@@ -183,6 +195,30 @@ type sim struct {
 	// opposed to live runs merely outliving their lease. The vacuity guard
 	// in TestDSTFast keys on this: crash injection must stay live.
 	syncCrashSteals int
+
+	// Outbound push-lane model state (issue #136, push_ops.go): the model
+	// claim per repo, runs pending their FinishPush in claim order, the
+	// expected three-level pending marker and counters, plus the abstract
+	// version frontiers behind the convergence oracle (local = accepted
+	// requests, covered = highest version a successful run's claim-time
+	// snapshot pushed, rejected = highest version a terminal non-FF
+	// rejection consumed).
+	pushClaims       map[string]*simPushClaim
+	pushRuns         []*simPushRun
+	pushPending      map[string]int
+	pushRunCount     map[string]int
+	pushSuccessCount map[string]int
+	pushLocalVer     map[string]int
+	pushCoveredVer   map[string]int
+	pushRejectedVer  map[string]int
+	pushSteals       int
+	// pushCrashSteals is the dead-holder subset of pushSteals (vacuity
+	// guard, like syncCrashSteals).
+	pushCrashSteals int
+	// pushForcedRescues counts steals whose force mandate survived ONLY on
+	// the dead claim's persisted push_claim_force (pending < force at
+	// steal time) — the #136 rescue class the inheritance rule exists for.
+	pushForcedRescues int
 	// clockSkew shifts the logical clock past the step counter; the final
 	// sync quiescence check uses it to provably expire every lease.
 	clockSkew int64
@@ -254,9 +290,16 @@ func Run(cfg Config) (Result, error) {
 	if err := s.initSync(context.Background()); err != nil {
 		return Result{}, err
 	}
+	s.initPush()
 
 	for s.step = 1; s.step <= cfg.Steps; s.step++ {
 		if err := s.processSyncFinishes(); err != nil {
+			return s.result(), err
+		}
+		if s.stopped {
+			break
+		}
+		if err := s.processPushFinishes(); err != nil {
 			return s.result(), err
 		}
 		if s.stopped {
@@ -303,6 +346,11 @@ func Run(cfg Config) (Result, error) {
 		}
 	}
 	if !s.stopped {
+		if err := s.checkPushFinal(); err != nil {
+			return s.result(), err
+		}
+	}
+	if !s.stopped {
 		s.checkDeliveries()
 	}
 	return s.result(), nil
@@ -314,16 +362,19 @@ func (s *sim) result() Result {
 		executed = s.cfg.Steps
 	}
 	return Result{
-		Seed:        s.cfg.Seed,
-		Steps:       executed,
-		TraceHash:   hex.EncodeToString(s.hasher.Sum(nil)),
-		Violations:  s.violations,
-		Transitions: len(s.observed),
-		Deliveries:  len(s.cl.rec.all()),
-		Faults:      len(s.inj.Fired()),
-		Steals:      s.syncSteals,
-		CrashSteals: s.syncCrashSteals,
-		OpCounts:    s.inj.Counts(),
+		Seed:              s.cfg.Seed,
+		Steps:             executed,
+		TraceHash:         hex.EncodeToString(s.hasher.Sum(nil)),
+		Violations:        s.violations,
+		Transitions:       len(s.observed),
+		Deliveries:        len(s.cl.rec.all()),
+		Faults:            len(s.inj.Fired()),
+		Steals:            s.syncSteals,
+		CrashSteals:       s.syncCrashSteals,
+		PushSteals:        s.pushSteals,
+		PushCrashSteals:   s.pushCrashSteals,
+		PushForcedRescues: s.pushForcedRescues,
+		OpCounts:          s.inj.Counts(),
 	}
 }
 
@@ -412,6 +463,12 @@ func (s *sim) doStep() error {
 		return s.doSyncClaim(name, node, repo)
 	case opSyncRequest:
 		return s.doSyncRequest(name, node, repo)
+	case opPushRequest:
+		return s.doPushRequest(name, node, repo)
+	case opPushClaim:
+		return s.doPushClaim(name, node, repo)
+	case opPushRescue:
+		return s.doPushRescue(name, node)
 	}
 	panic(fmt.Sprintf("simtest: unhandled op kind %d", kind))
 }
@@ -659,9 +716,10 @@ func (s *sim) refreshBelief(node *simNode, repoKey, refName string) {
 // lease expires and a later claimant steals them.
 func (s *sim) doCrash(name string, node *simNode, cold bool) error {
 	killed := s.syncKillNode(node.id)
+	pushKilled := s.pushKillNode(node.id)
 	if err := s.cl.crashNode(node, cold); err != nil {
 		return fmt.Errorf("step %d: crash node %d: %w", s.step, node.id, err)
 	}
-	s.tracef("step=%04d op=%s node=%d sync-killed=%d", s.step, name, node.id, killed)
+	s.tracef("step=%04d op=%s node=%d sync-killed=%d push-killed=%d", s.step, name, node.id, killed, pushKilled)
 	return nil
 }
