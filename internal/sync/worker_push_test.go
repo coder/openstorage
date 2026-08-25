@@ -403,6 +403,40 @@ func TestPushRunPrivateUpstreamDeniedByDefault(t *testing.T) {
 	}
 }
 
+// TestPushRunProxyDialFailureStaysTransient: a transient dial failure
+// INSIDE the egress proxy (https CONNECT to a refused port) must keep the
+// documented FailUnreachable classification and backoff re-mark — git only
+// sees an opaque proxy HTTP error, so the classification rides the proxy's
+// recorded dial failure, not stderr phrasing.
+func TestPushRunProxyDialFailureStaysTransient(t *testing.T) {
+	f := newWorkerFixture(t)
+	seedLocalRepo(t, f, "repo_pt")
+	f.putUpstream(t, "repo_pt", "own", "proj", "https://127.0.0.1:1")
+	if err := f.store.RequestPush(context.Background(), "repo_pt", false); err != nil {
+		t.Fatal(err)
+	}
+
+	err := f.worker.RunPush(context.Background(), Job{Org: "acme", RepoID: "repo_pt"})
+	if err == nil {
+		t.Fatal("RunPush succeeded against a refused https upstream")
+	}
+	if !TransientPushFailure(err) {
+		t.Fatalf("proxy dial failure not classified transient: %v", err)
+	}
+	events := f.rec.list()
+	assertEventTypes(t, events, EventSyncStarted, EventSyncFailed)
+	if events[1].Error != FailUnreachable {
+		t.Fatalf("error = %q, want %q", events[1].Error, FailUnreachable)
+	}
+	up, err := f.store.GetUpstream(context.Background(), "repo_pt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if up.PushPending != PushPendingPush {
+		t.Fatalf("transient proxy dial failure did not re-mark pending: %+v", up)
+	}
+}
+
 // TestEgressProxyConnectTunnel exercises the CONNECT arm (https upstreams)
 // hermetically: a vetted tunnel splices bytes end-to-end, and a denied
 // target is refused before any dial.

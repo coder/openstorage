@@ -303,6 +303,37 @@ func TestWorkerPullKeepsNewerLocalRefsOnForwardOnPush(t *testing.T) {
 	}
 }
 
+// TestWorkerPullForwardOnPushPropagatesHookDeclines: local-wins tolerance
+// is scoped to stale-snapshot rejections — a server-side hook decline
+// (quota, persistence failure) on a forward_on_push repo means upstream
+// refs were NOT installed and must fail the run, never emit
+// repo.sync.succeeded.
+func TestWorkerPullForwardOnPushPropagatesHookDeclines(t *testing.T) {
+	f := newWorkerFixture(t)
+	seedUpstream(t, f.upstreamDir, "own", "proj")
+	loop := f.addLoopbackRepo(t, "repo_hd")
+	hook := filepath.Join(loop, "hooks", "pre-receive")
+	if err := os.WriteFile(hook, []byte("#!/bin/sh\necho quota exceeded >&2\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.PutUpstream(context.Background(), Upstream{
+		RepoID: "repo_hd", Provider: "gitea", Owner: "own", Name: "proj",
+		UpstreamHost: "file://" + f.upstreamDir, ForwardOnPush: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	err := f.worker.Run(context.Background(), Job{Org: "acme", RepoID: "repo_hd"})
+	if err == nil {
+		t.Fatal("pull run succeeded although the loopback hook declined every ref")
+	}
+	events := f.rec.list()
+	assertEventTypes(t, events, EventSyncStarted, EventSyncFailed)
+	if events[1].Error != FailPush {
+		t.Fatalf("error = %q, want %q", events[1].Error, FailPush)
+	}
+}
+
 func TestWorkerDetachedBeforeRunIsSilent(t *testing.T) {
 	f := newWorkerFixture(t)
 	if err := f.worker.Run(context.Background(), Job{Org: "acme", RepoID: "repo_cc"}); err != nil {

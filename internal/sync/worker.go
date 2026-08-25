@@ -617,7 +617,14 @@ func (w *Worker) transfer(ctx context.Context, job Job, repo RepoInfo, up Upstre
 	pushArgs := append([]string{"push", "--porcelain", pushURL}, refspecs...)
 	stdout, stderr, err := runGitOut(ctx, mirror, pushEnv, pushArgs...)
 	if err != nil {
-		if rejected := parsePushRejections(stdout); up.ForwardOnPush && len(rejected) > 0 {
+		// Local-wins tolerance is scoped to the rejection REASONS: only
+		// stale-snapshot shapes (the client-side fast-forward/exists
+		// checks) mean "the loopback already has newer content", which is
+		// the converged forward-on-push outcome. Server-side rejections
+		// (hook declines: quota, persistence failures) mean upstream refs
+		// were NOT installed — succeeding on those would emit
+		// repo.sync.succeeded for a run that synced nothing.
+		if rejected := parsePushRejections(stdout); up.ForwardOnPush && allLocalWins(rejected) {
 			w.Logger.Info("mirror-back kept newer local refs (forward-on-push: local wins)",
 				"org", job.Org, "repo", job.RepoID, "refused", len(rejected))
 			return nil
@@ -625,6 +632,28 @@ func (w *Worker) transfer(ctx context.Context, job Job, repo RepoInfo, up Upstre
 		return &syncFailure{code: FailPush, cause: fmt.Errorf("git push: %w: %s", err, stderr)}
 	}
 	return nil
+}
+
+// allLocalWins reports whether every porcelain rejection is a
+// stale-snapshot shape — git's client-side refusal phrasings for "the
+// destination ref moved past this snapshot" ("non-fast-forward", "fetch
+// first") or "the destination already has a different tag" ("already
+// exists"). Empty input is false: an error without tolerated rejections
+// is a real failure.
+func allLocalWins(rejected []RejectedRef) bool {
+	if len(rejected) == 0 {
+		return false
+	}
+	for _, r := range rejected {
+		switch {
+		case strings.Contains(r.Reason, "non-fast-forward"),
+			strings.Contains(r.Reason, "fetch first"),
+			strings.Contains(r.Reason, "already exists"):
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // authFailureMarkers/networkFailureMarkers classify git transport stderr

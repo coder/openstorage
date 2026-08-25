@@ -535,6 +535,17 @@ func (w *Worker) transferPush(ctx context.Context, job Job, repo RepoInfo, up Up
 			return rejected, &syncFailure{code: FailRejected, cause: fmt.Errorf(
 				"git push: %d ref(s) rejected by upstream: %w", len(rejected), err)}
 		}
+		// A recorded non-policy proxy dial failure IS the outage signal:
+		// git itself only saw an opaque proxy HTTP error, whose stderr
+		// would misclassify the transient failure as permanent and skip
+		// the documented backoff retry. Checked after rejections — a
+		// completed push conversation's per-ref verdicts outrank a blip
+		// on some other connection.
+		if egress != nil {
+			if dialErr := egress.dialFailure(); dialErr != "" {
+				return nil, &syncFailure{code: FailUnreachable, cause: fmt.Errorf("push egress dial: %s", dialErr)}
+			}
+		}
 		return nil, &syncFailure{code: classifyPushFailure(stderr), cause: fmt.Errorf("git push: %w: %s", err, stderr)}
 	}
 	return nil, nil

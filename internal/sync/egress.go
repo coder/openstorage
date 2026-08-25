@@ -37,8 +37,9 @@ type egressProxy struct {
 	srv   *http.Server
 	guard events.TargetGuard
 
-	mu     stdsync.Mutex
-	denial string
+	mu      stdsync.Mutex
+	denial  string
+	dialErr string
 }
 
 func startEgressProxy(allowPrivate bool) (*egressProxy, error) {
@@ -68,21 +69,33 @@ func (p *egressProxy) deniedReason() string {
 	return p.denial
 }
 
-func (p *egressProxy) recordDenial(err error) {
+// dialFailure returns the first recorded NON-policy dial error (DNS
+// resolution, refused/timed-out connect). The worker maps it to the
+// transient FailUnreachable classification: git only sees an opaque proxy
+// HTTP error, whose stderr phrasing would otherwise misclassify an outage
+// as permanent and skip the documented backoff retry.
+func (p *egressProxy) dialFailure() string {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.denial == "" {
-		p.denial = err.Error()
-	}
+	return p.dialErr
 }
 
-// vetted wraps the guarded dial, recording policy denials (and only
-// policy denials: an unreachable-but-allowed target must keep its
-// transient classification).
+// vetted wraps the guarded dial, recording policy denials and ordinary
+// dial failures separately — the two must classify differently (permanent
+// configuration vs transient outage).
 func (p *egressProxy) vetted(ctx context.Context, network, addr string) (net.Conn, error) {
 	conn, err := p.guard.DialContext(ctx, network, addr)
-	if err != nil && errors.Is(err, events.ErrTargetDenied) {
-		p.recordDenial(err)
+	if err != nil {
+		p.mu.Lock()
+		switch {
+		case errors.Is(err, events.ErrTargetDenied):
+			if p.denial == "" {
+				p.denial = err.Error()
+			}
+		case p.dialErr == "":
+			p.dialErr = err.Error()
+		}
+		p.mu.Unlock()
 	}
 	return conn, err
 }
@@ -121,11 +134,17 @@ func proxyEnv(env []string, proxyURL string) []string {
 }
 
 // serveConnect vets and dials the tunnel target, then splices bytes. The
-// dial happens BEFORE the 200 so a denial reaches git as a proxy error.
+// dial happens BEFORE the 200 so a failure reaches git as a proxy error —
+// 403 for policy denials, 502 for ordinary dial failures (the recorded
+// split is what the worker classifies on; the statuses are observability).
 func (p *egressProxy) serveConnect(w http.ResponseWriter, r *http.Request) {
 	upstream, err := p.vetted(r.Context(), "tcp", r.Host)
 	if err != nil {
-		http.Error(w, "egress denied: "+err.Error(), http.StatusForbidden)
+		status := http.StatusBadGateway
+		if errors.Is(err, events.ErrTargetDenied) {
+			status = http.StatusForbidden
+		}
+		http.Error(w, "egress: "+err.Error(), status)
 		return
 	}
 	defer upstream.Close()
