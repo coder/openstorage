@@ -24,6 +24,7 @@ func scanStateStore(t *testing.T, s Store) ScanStateStore {
 type absenceCoverStore interface {
 	Store
 	RenewAbsenceCovers(ctx context.Context, ttl time.Duration) (int64, error)
+	MarkAbsenceCoverFolded(ctx context.Context, rawKey string) error
 	ListAbsenceCovers(ctx context.Context, afterRaw string, limit int, ttl time.Duration) ([]AbsenceCoverRow, error)
 	AbsenceCoverHead(ctx context.Context, prefix string, ttl time.Duration) (AbsenceCoverRow, bool, error)
 	DeleteAbsenceCover(ctx context.Context, key string) error
@@ -210,18 +211,30 @@ func TestAbsenceCovers_ListHeadDelete(t *testing.T) {
 			t.Fatalf("expired head = (ok=%v, %v), want absent", ok, err)
 		}
 
-		// Bulk touch (Codex round 9 on PR #132): exactly the LIVE
-		// deterministic incarnation rows are re-stamped — the planted
-		// foreign spellings and a legacy nonce row (which must keep
-		// decaying after its fold) are untouched, and an elapsed
-		// liveness window touches nothing (expired rows stay dead).
+		// Bulk touch (Codex rounds 9+15 on PR #132): LIVE deterministic
+		// incarnation rows AND un-folded legacy nonce rows are
+		// re-stamped — planted foreign spellings never, an elapsed
+		// liveness window touches nothing (expired rows stay dead), a
+		// folded mark removes the nonce from the touch, and a re-charge
+		// (owner overwritten) un-marks it.
 		legacyKey := AbsenceCoverPrefix + base + "/0123456789abcdef0123"
+		legacyRaw := reservRowKey(legacyKey + RepairCoverSuffix)
 		cover(legacyKey, 30)
-		if n, err := cs.RenewAbsenceCovers(ctx, time.Hour); err != nil || n != 3 {
-			t.Fatalf("bulk touch = (%d, %v), want the 3 deterministic rows only", n, err)
+		if n, err := cs.RenewAbsenceCovers(ctx, time.Hour); err != nil || n != 4 {
+			t.Fatalf("bulk touch = (%d, %v), want 3 deterministic + 1 un-folded legacy row", n, err)
 		}
 		if n, err := cs.RenewAbsenceCovers(ctx, time.Nanosecond); err != nil || n != 0 {
 			t.Fatalf("expired bulk touch = (%d, %v), want zero rows", n, err)
+		}
+		if err := cs.MarkAbsenceCoverFolded(ctx, legacyRaw); err != nil {
+			t.Fatalf("mark folded: %v", err)
+		}
+		if n, err := cs.RenewAbsenceCovers(ctx, time.Hour); err != nil || n != 3 {
+			t.Fatalf("bulk touch after fold mark = (%d, %v), want the marked nonce left to decay", n, err)
+		}
+		cover(legacyKey, 30) // an old replica re-charges: owner overwritten
+		if n, err := cs.RenewAbsenceCovers(ctx, time.Hour); err != nil || n != 4 {
+			t.Fatalf("bulk touch after re-charge = (%d, %v), want the un-marked nonce touched again", n, err)
 		}
 		if err := cs.DeleteAbsenceCover(ctx, legacyKey); err != nil {
 			t.Fatalf("clean up legacy row: %v", err)

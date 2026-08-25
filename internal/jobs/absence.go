@@ -90,12 +90,17 @@ type AbsenceRegistry interface {
 	// ListFleetPacks pages packs rows fleet-wide, keyset on the
 	// (repo, id) primary key ascending.
 	ListFleetPacks(ctx context.Context, afterRepo, afterID string, limit int) ([]ref.AbsencePackRow, error)
-	// RenewAbsenceCovers re-stamps every LIVE deterministic cover row's
-	// TTL in one DB-clock statement — the pass-start bulk touch that
-	// makes cover protection independent of the keyset listing
-	// completing within the TTL (Codex round 9). Strict TTL: expired
-	// rows stay dead; legacy nonce rows keep decaying.
+	// RenewAbsenceCovers re-stamps the TTL of every LIVE deterministic
+	// cover row AND every un-folded legacy nonce row in DB-clock
+	// statements — the pass-start bulk touch that makes cover protection
+	// independent of the keyset listing completing within the TTL (Codex
+	// rounds 9+15). Strict TTL: expired rows stay dead; nonce rows
+	// marked folded decay.
 	RenewAbsenceCovers(ctx context.Context, ttl time.Duration) (int64, error)
+	// MarkAbsenceCoverFolded removes one legacy nonce row from the bulk
+	// touch once its total is provably folded into both incarnations
+	// (Codex round 15); an old replica's re-charge un-marks it.
+	MarkAbsenceCoverFolded(ctx context.Context, rawKey string) error
 	// ListAbsenceCovers pages the live absence-cover reservation rows —
 	// the durable tracking state the renewal phase re-derives its
 	// obligations from every pass (issue #125). ttl is the liveness
@@ -752,7 +757,13 @@ func (r *AbsenceReconciler) migrateLegacyCover(ctx context.Context, row *ref.Abs
 		// longer compensate. Right-sized (smaller) heads still shortcut:
 		// a clean range's exact re-derivation supersedes the nonce's
 		// stale aggregate, and re-grown deficits follow normal discovery
-		// latency like any fresh loss.
+		// latency like any fresh loss. Re-mark on every visit (idempotent
+		// UPDATE): an old replica's re-charge overwrote owner, and an
+		// un-marked row would be bulk-touched forever instead of
+		// decaying once the fleet finishes rolling.
+		if err := r.registry.MarkAbsenceCoverFolded(ctx, row.RawKey); err != nil {
+			errs.add(fmt.Errorf("absence reconcile: re-mark legacy cover folded %s: %w", row.Key, err))
+		}
 		report.CoversDecaying++
 		return true
 	}
@@ -764,6 +775,15 @@ func (r *AbsenceReconciler) migrateLegacyCover(ctx context.Context, row *ref.Abs
 		}
 	}
 	if migrated {
+		// Mark the nonce folded so the bulk touch stops renewing it and
+		// TTL decay begins (Codex round 15). Memoize only after the mark
+		// proves durable: an unmarked nonce keeps being bulk-touched, so
+		// on mark failure the next pass re-folds (grow-only, idempotent)
+		// and retries the mark — protection is intact either way.
+		if err := r.registry.MarkAbsenceCoverFolded(ctx, row.RawKey); err != nil {
+			errs.add(fmt.Errorf("absence reconcile: mark legacy cover folded %s: %w", row.Key, err))
+			return true
+		}
 		r.migratedLegacy[row.RawKey] = row.Bytes
 		report.CoversDecaying++
 		return true

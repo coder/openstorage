@@ -203,17 +203,21 @@ ORDER BY key COLLATE "C" DESC LIMIT 1`,
 	return r, true, nil
 }
 
-// RenewAbsenceCovers re-stamps created_at on every LIVE deterministic
-// absence-cover row in one DB-clock statement (Codex round 9 on PR #132):
-// cover protection must never depend on the keyset renewal listing
-// completing within the TTL — a large population or degraded ledger
-// latency turns that listing into a multi-pass round robin, and a row
-// aging past the TTL mid-cycle would be excluded as expired and silently
-// never renewed. The strict TTL predicate is the round-6 invariant:
-// already-expired rows stay dead. Only rows matching the reconciler's
-// deterministic incarnation tail (`/<class>-e<19 digits>`) are touched —
-// legacy nonce rows must keep decaying by TTL after their fold, and the
-// keyset listing remains their (and the lifecycle's) precise mechanism.
+// RenewAbsenceCovers re-stamps created_at on every LIVE absence-cover row
+// the reconciler is responsible for keeping alive, in DB-clock statements
+// (Codex round 9 on PR #132): cover protection must never depend on the
+// keyset renewal listing completing within the TTL — a large population
+// or degraded ledger latency turns that listing into a multi-pass round
+// robin, and a row aging past the TTL mid-cycle would be excluded as
+// expired and silently never renewed. The strict TTL predicate is the
+// round-6 invariant: already-expired rows stay dead. Two row classes are
+// touched: deterministic incarnation rows (`/<class>-e<19 digits>` tail),
+// and legacy nonce rows NOT yet marked folded (Codex round 15: an
+// un-folded nonce minted just behind the listing cursor must not lapse
+// before its first visit). A proven fold marks the nonce
+// (MarkAbsenceCoverFolded) which removes it from the touch so it decays
+// by TTL — and any old replica re-charging its nonce overwrites owner,
+// un-marking it, exactly matching "a re-charge is a new reliance".
 // Returns the number of rows re-stamped.
 func (s *PG) RenewAbsenceCovers(ctx context.Context, ttl time.Duration) (int64, error) {
 	assertf(ttl > 0, "RenewAbsenceCovers: non-positive ttl %v", ttl)
@@ -226,7 +230,42 @@ WHERE key COLLATE "C" > $1 AND key COLLATE "C" < $2
 	if err != nil {
 		return 0, fmt.Errorf("renew absence covers: %w", err)
 	}
-	return tag.RowsAffected(), nil
+	total := tag.RowsAffected()
+	tag, err = s.pool.Exec(ctx, `
+UPDATE pack_reservations SET created_at = now()
+WHERE key COLLATE "C" > $1 AND key COLLATE "C" < $2
+  AND right(key, $3) = $4
+  AND key !~ $5
+  AND owner <> $6
+  AND created_at > now() - make_interval(secs => $7)`,
+		AbsenceCoverPrefix, absenceCoverRangeEnd, len(absenceCoverRawSuffix), absenceCoverRawSuffix,
+		absenceIncarnationTailRegexp, AbsenceFoldedOwner, ttl.Seconds())
+	if err != nil {
+		return total, fmt.Errorf("renew legacy absence covers: %w", err)
+	}
+	return total + tag.RowsAffected(), nil
+}
+
+// AbsenceFoldedOwner is the sentinel owner MarkAbsenceCoverFolded stamps
+// on a legacy nonce cover once its total is provably folded into both
+// deterministic incarnations: marked rows leave the bulk touch and decay
+// by TTL. Reservation owners are 32 hex chars (NewReservationOwner), so
+// the sentinel cannot collide, and every ReserveRestoreCover re-charge
+// overwrites owner — an old replica re-charging its nonce un-marks it.
+const AbsenceFoldedOwner = "absence-folded"
+
+// MarkAbsenceCoverFolded stamps the folded sentinel on one legacy cover
+// row by its raw reservation-row key (Codex round 15 on PR #132). Marking
+// an absent row is a no-op: the fold that just proved durable is the
+// protection either way.
+func (s *PG) MarkAbsenceCoverFolded(ctx context.Context, rawKey string) error {
+	assertf(strings.HasPrefix(rawKey, AbsenceCoverPrefix), "MarkAbsenceCoverFolded(%q)", rawKey)
+	_, err := s.pool.Exec(ctx,
+		`UPDATE pack_reservations SET owner = $1 WHERE key = $2`, AbsenceFoldedOwner, rawKey)
+	if err != nil {
+		return fmt.Errorf("mark absence cover folded %s: %w", rawKey, err)
+	}
+	return nil
 }
 
 // absenceIncarnationTailRegexp matches the raw-row tail of a deterministic

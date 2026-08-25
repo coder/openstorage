@@ -105,15 +105,16 @@ ORDER BY key DESC LIMIT 1`,
 func (s *SQLite) RenewAbsenceCovers(ctx context.Context, ttl time.Duration) (int64, error) {
 	assertf(ttl > 0, "RenewAbsenceCovers: non-positive ttl %v", ttl)
 	digits := strings.Repeat("[0-9]", 19)
+	lfsGlob := AbsenceCoverPrefix + "*/lfs-e" + digits + absenceCoverRawSuffix
+	packsGlob := AbsenceCoverPrefix + "*/packs-e" + digits + absenceCoverRawSuffix
 	var total int64
-	for _, class := range []string{"lfs", "packs"} {
+	for _, glob := range []string{lfsGlob, packsGlob} {
 		res, err := s.db.ExecContext(ctx, `
 UPDATE pack_reservations SET created_at = `+sqliteEpochMS+`
 WHERE key > ? AND key < ?
   AND key GLOB ?
   AND created_at > `+sqliteEpochMS+` - ?`,
-			AbsenceCoverPrefix, absenceCoverRangeEnd,
-			AbsenceCoverPrefix+"*/"+class+"-e"+digits+absenceCoverRawSuffix, ttl.Milliseconds())
+			AbsenceCoverPrefix, absenceCoverRangeEnd, glob, ttl.Milliseconds())
 		if err != nil {
 			return total, fmt.Errorf("renew absence covers: %w", err)
 		}
@@ -123,7 +124,36 @@ WHERE key > ? AND key < ?
 		}
 		total += n
 	}
-	return total, nil
+	// Un-folded legacy nonce rows — see the PG twin (Codex round 15).
+	res, err := s.db.ExecContext(ctx, `
+UPDATE pack_reservations SET created_at = `+sqliteEpochMS+`
+WHERE key > ? AND key < ?
+  AND substr(key, -?) = ?
+  AND NOT (key GLOB ? OR key GLOB ?)
+  AND owner <> ?
+  AND created_at > `+sqliteEpochMS+` - ?`,
+		AbsenceCoverPrefix, absenceCoverRangeEnd,
+		len(absenceCoverRawSuffix), absenceCoverRawSuffix,
+		lfsGlob, packsGlob, AbsenceFoldedOwner, ttl.Milliseconds())
+	if err != nil {
+		return total, fmt.Errorf("renew legacy absence covers: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return total, fmt.Errorf("renew legacy absence covers: rows affected: %w", err)
+	}
+	return total + n, nil
+}
+
+// MarkAbsenceCoverFolded — see the PG twin.
+func (s *SQLite) MarkAbsenceCoverFolded(ctx context.Context, rawKey string) error {
+	assertf(strings.HasPrefix(rawKey, AbsenceCoverPrefix), "MarkAbsenceCoverFolded(%q)", rawKey)
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE pack_reservations SET owner = ? WHERE key = ?`, AbsenceFoldedOwner, rawKey)
+	if err != nil {
+		return fmt.Errorf("mark absence cover folded %s: %w", rawKey, err)
+	}
+	return nil
 }
 
 // DeleteAbsenceCover — see the PG twin.

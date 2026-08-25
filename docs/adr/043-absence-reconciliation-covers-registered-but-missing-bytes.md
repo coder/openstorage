@@ -115,7 +115,13 @@ class split, so its total folds into BOTH of the base's deterministic
 class incarnations via the ledger's GREATEST merge (grow-only; each
 class's own rotation right-sizes or row-less-releases its copy within one
 clean range observation, and the transient over-cover until then only
-tightens admission), after which the nonce row decays by TTL. Never
+tightens admission), after which the nonce row is MARKED folded (a
+sentinel owner) and decays by TTL. Un-folded nonces ride the pass-start
+bulk touch until their first listing visit (Codex round 15: a nonce
+minted just behind the cursor must not lapse before an upgraded worker
+ever folds it), and an old replica's re-charge overwrites the sentinel —
+a re-charge is a new reliance, so the row re-enters the touch until the
+listing re-folds and re-marks it. Never
 deleted: an old replica may still depend on its own nonce rows mid-roll.
 Migration is memoized per worker process as a byte WATERMARK (not a
 correctness dependency): a nonce an old replica re-grows after the first
