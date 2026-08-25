@@ -259,6 +259,14 @@ type AbsenceReconciler struct {
 	// proves no live cover exists).
 	liveCovers      map[string]map[string]liveCover
 	renewalComplete bool
+	// migratedLegacy memoizes nonce-keyed covers this PROCESS already
+	// folded into deterministic incarnations. Purely an optimization:
+	// every fresh worker re-folds each live nonce once (GREATEST-safe
+	// over-cover the rotation right-sizes within one clean range), but
+	// re-folding every pass would inflate and re-rotate the incarnation
+	// endlessly while the nonce decays. Process-lifetime, deliberately
+	// not per-pass — correctness never depends on it.
+	migratedLegacy map[string]bool
 	// lfsRange/packsRange track the base range each rotation is
 	// streaming through, in memory only: shrink/release verdicts are
 	// evaluated exclusively for ranges observed START to END within one
@@ -285,9 +293,8 @@ type absenceCursorState struct {
 	// somewhere; a dirty traversal cannot flip HasClean.
 	Dirty bool `json:"dirty"`
 	// HasClean records that some traversal completed with no errors
-	// since the scan state was minted — the legacy-cover retirement
-	// gate: after both classes have one clean traversal, every
-	// still-absent loss provably lives in incarnation keys.
+	// since the scan state was minted (observability; legacy-cover
+	// handling migrates rather than gating on it — see renewCovers).
 	HasClean bool `json:"has_clean"`
 	// The pending base range parks WITH the cursor (Codex round 2 on PR
 	// #132, P1): a base whose rows span multiple phase allocations must
@@ -367,13 +374,14 @@ func NewAbsenceReconciler(registry AbsenceRegistry, blobs BlobStatter, quotaEnfo
 		passTimeout = quarter // see absencePassTimeout: renewal gap ≤ TTL
 	}
 	return &AbsenceReconciler{
-		registry:      registry,
-		blobs:         blobs,
-		quotaEnforced: quotaEnforced,
-		budget:        budget,
-		coverTTL:      coverTTL,
-		logger:        logger,
-		passTimeout:   passTimeout,
+		registry:       registry,
+		blobs:          blobs,
+		quotaEnforced:  quotaEnforced,
+		budget:         budget,
+		coverTTL:       coverTTL,
+		logger:         logger,
+		passTimeout:    passTimeout,
+		migratedLegacy: make(map[string]bool),
 	}
 }
 
@@ -517,18 +525,25 @@ func (r *AbsenceReconciler) Run(ctx context.Context) (AbsenceReport, error) {
 // renewCovers re-charges each (base, class)'s highest-incarnation live
 // cover row — one listing page plus one reserve per row, all derived from
 // durable state, so ANY replica keeps every aggregate alive (issue #125).
-// Superseded lower incarnations (crash leftovers) are deleted; legacy
-// nonce-keyed covers from pre-#125 workers renew until both classes have
-// one clean traversal, then decay by TTL (never deleted: during a rolling
-// upgrade an old replica may still mint and depend on them — Codex round
-// 1, P1). Renewal is the correctness core (a lapsed cover silently
-// reopens the admission window), so it always offers the FULL listing:
-// budget only sets the soft allocation, and overrunning it — flagged
-// loudly — starves the discovery rotation for the pass rather than
-// letting live covers lapse (Codex round 1, P1: a round-robin backlog
-// could exceed the TTL between one row's renewals). Only a context abort
-// leaves the listing incomplete, parked on the durable cursor. Returns
-// the work charged: one unit per listed row.
+// Superseded lower incarnations (crash leftovers) are deleted. Legacy
+// nonce-keyed covers from pre-#125 workers are MIGRATED on sight (Codex
+// round 4, P1): their bytes fold into the base's deterministic LFS-class
+// incarnation via the ledger's GREATEST merge — grow-only, and the
+// rotation right-sizes the merged row within one clean range observation
+// — after which the nonce row decays by TTL. Migration needs no rollout
+// fence: an old replica can mint nonce covers at any point of a mixed
+// roll, and every new-replica pass immediately re-protects them under a
+// key its own renewals keep alive (deleting or merely aging-out nonce
+// rows could lapse them while the rotation is still far away). Renewal
+// is the correctness core (a lapsed cover silently reopens the admission
+// window), so it always offers the FULL listing: budget only sets the
+// soft allocation, and overrunning it — flagged loudly — starves the
+// discovery rotation for the pass rather than letting live covers lapse
+// (Codex round 1, P1). Only a context abort leaves the listing
+// incomplete, parked STRICTLY BEFORE any row whose renewal did not
+// happen (Codex round 4, P1: parking past an unrenewed held row would
+// skip it until the next full wrap). Returns the work charged: one unit
+// per listed row.
 func (r *AbsenceReconciler) renewCovers(ctx context.Context, budget int64, report *AbsenceReport, st *absencePassState, errs *boundedErrs) (charged int64) {
 	if !r.quotaEnforced {
 		r.renewalComplete = true // nothing consults reservations (Codex round 73)
@@ -539,11 +554,22 @@ func (r *AbsenceReconciler) renewCovers(ctx context.Context, budget int64, repor
 	startedAtZero := after == ""
 	wrapped := startedAtZero
 	defer func() { r.renewCursor = after }()
-	renewLegacy := !(r.lfs.HasClean && r.packs.HasClean)
 	// held delays each epoch-keyed row one step: a following row with the
 	// same (base, class) supersedes it (higher incarnation, zero-padded
 	// byte order), so the held row is a crash leftover to delete.
+	// heldPrev remembers the cursor position strictly BEFORE the held
+	// row: abort paths park there, so a renewal the dead context skipped
+	// is re-offered first thing next pass (Codex round 4, P1).
 	var held *ref.AbsenceCoverRow
+	heldPrev := after
+	abort := func(err error) {
+		if held != nil {
+			after = heldPrev // the held row was never renewed: re-offer it
+			held = nil
+		}
+		errs.add(err)
+		report.RenewalIncomplete = true
+	}
 	flushHeld := func(supersededBy *ref.AbsenceCoverRow) {
 		if held == nil {
 			return
@@ -581,18 +607,15 @@ func (r *AbsenceReconciler) renewCovers(ctx context.Context, budget int64, repor
 	}
 	for {
 		if ctx.Err() != nil {
-			// The ONLY incomplete-renewal path: parked on the durable
-			// cursor, resumed (and completed) by the next pass's renewal.
-			errs.add(ctx.Err())
-			flushHeld(nil)
-			report.RenewalIncomplete = true
+			// The ONLY incomplete-renewal paths: parked on the durable
+			// cursor — before the held row, whose renewal did not
+			// happen — and resumed first thing next pass.
+			abort(ctx.Err())
 			return charged
 		}
 		rows, err := r.registry.ListAbsenceCovers(ctx, after, absencePageSize)
 		if err != nil {
-			errs.add(fmt.Errorf("absence reconcile: list covers: %w", err))
-			flushHeld(nil)
-			report.RenewalIncomplete = true
+			abort(fmt.Errorf("absence reconcile: list covers: %w", err))
 			return charged
 		}
 		if len(rows) == 0 {
@@ -616,12 +639,11 @@ func (r *AbsenceReconciler) renewCovers(ctx context.Context, budget int64, repor
 				return charged
 			}
 			if ctx.Err() != nil {
-				errs.add(ctx.Err())
-				flushHeld(nil)
-				report.RenewalIncomplete = true
+				abort(ctx.Err())
 				return charged
 			}
 			charged++
+			prevAfter := after
 			after = row.RawKey
 			_, _, _, legacy, ok := parseAbsenceCoverKey(row.Key)
 			if !ok {
@@ -629,24 +651,54 @@ func (r *AbsenceReconciler) renewCovers(ctx context.Context, budget int64, repor
 			}
 			if legacy {
 				flushHeld(row)
-				if renewLegacy {
-					if r.chargeCover(ctx, row.Base, row.Key, row.Bytes, report, st, errs) {
-						report.CoversRenewed++
-					}
-					continue
-				}
-				// Both classes completed a clean traversal: every
-				// still-absent loss lives in incarnation keys, so the
-				// pre-#125 spelling stops renewing and expires by TTL.
-				// Never deleted: a not-yet-upgraded replica may still be
-				// minting and depending on nonce-keyed covers mid-roll,
-				// and deleting one before the rotation rediscovers its
-				// rows would uncover them (Codex round 1, P1).
-				report.CoversDecaying++
+				r.migrateLegacyCover(ctx, row, report, st, errs)
 				continue
 			}
 			flushHeld(row)
-			held = row
+			held, heldPrev = row, prevAfter
+		}
+	}
+}
+
+// migrateLegacyCover folds one pre-#125 nonce-keyed cover into its base's
+// deterministic LFS-class incarnation (Codex round 4, P1): the ledger's
+// GREATEST merge grows the incarnation to at least the legacy total —
+// same-universe totals, so max is the right merge — and the rotation
+// right-sizes it within one clean range observation. The nonce row then
+// decays by TTL, un-renewed. If anything fails, the legacy row is renewed
+// as-is so nothing lapses; the next pass retries the migration.
+func (r *AbsenceReconciler) migrateLegacyCover(ctx context.Context, row *ref.AbsenceCoverRow, report *AbsenceReport, st *absencePassState, errs *boundedErrs) {
+	if r.migratedLegacy[row.RawKey] {
+		report.CoversDecaying++ // already folded by this process: decay on
+		return
+	}
+	head, ok := r.resolveHead(ctx, row.Base, absenceClassLFS, st, errs)
+	migrated := false
+	if ok {
+		target := head
+		if target.key == "" {
+			target = liveCover{key: absenceIncarnationKey(row.Base, absenceClassLFS, 1), n: 1}
+		}
+		if r.chargeCover(ctx, row.Base, target.key, row.Bytes, report, st, errs) {
+			if row.Bytes > target.bytes {
+				target.bytes = row.Bytes
+			}
+			r.liveCovers[absenceClassLFS][row.Base] = target
+			r.migratedLegacy[row.RawKey] = true
+			report.CoversDecaying++
+			migrated = true
+		}
+	}
+	if !migrated {
+		// Migration could not be proven durable (head lookup or charge
+		// failed, or the base is purge-fenced — where nothing must be
+		// re-minted): renew the nonce row as-is so nothing lapses, except
+		// for purged bases, whose rows are on their way out anyway.
+		if st.purged[row.Base] {
+			return
+		}
+		if r.chargeCover(ctx, row.Base, row.Key, row.Bytes, report, st, errs) {
+			report.CoversRenewed++
 		}
 	}
 }
@@ -705,8 +757,11 @@ func (r *AbsenceReconciler) rotationPhase(ctx context.Context, cur *absenceCurso
 		}
 		if len(repos) == 0 {
 			// Origin crossing: the traversal is complete. Every pending
-			// range ends AT the keyspace end.
+			// range ends AT the keyspace end, and the empty page proves
+			// no base after it holds any rows in this class.
+			prevBase := tr.base
 			r.endRange(ctx, tr, report, st, errs)
+			r.releaseZeroRowCovers(ctx, tr.class, prevBase, "", report, errs)
 			r.tickTraversal(cur, tr.class, report)
 			cur.AfterRepo, cur.AfterKey = "", ""
 			if wrapped {
@@ -733,9 +788,13 @@ func (r *AbsenceReconciler) rotationPhase(ctx context.Context, cur *absenceCurso
 			}
 			// Base-range boundary: rows are keyset-ordered by repo, and
 			// a base's namespace members (base, base+suffix) sort
-			// contiguously, so a base change ends the previous range.
+			// contiguously, so a base change ends the previous range —
+			// and the keyset adjacency proves every base BETWEEN the two
+			// holds no rows in this class at all.
 			if b := baseOf(repos[i]); b != tr.base {
+				prevBase := tr.base
 				r.endRange(ctx, tr, report, st, errs)
+				r.releaseZeroRowCovers(ctx, tr.class, prevBase, b, report, errs)
 				tr.base, tr.started, tr.dirty, tr.running = b, true, false, 0
 			}
 			charged += settle[i]()
@@ -743,6 +802,32 @@ func (r *AbsenceReconciler) rotationPhase(ctx context.Context, cur *absenceCurso
 		}
 	}
 	return charged
+}
+
+// releaseZeroRowCovers releases this class's covers for bases the rotation
+// just proved ROW-LESS: the keyset stream moved from base lo directly to
+// base hi (""=keyspace edge), so any live cover base strictly between them
+// has zero registered rows in this class — nothing left to protect, and no
+// range evaluation would ever visit it (a base emptied by retirement or
+// folds would otherwise pin its cover forever). The proof is the page
+// adjacency itself, so it holds regardless of traversal or harvest
+// completeness; covers this pass's harvest missed are released on a later
+// pass. Deletion is single-writer-safe like every cover delete.
+func (r *AbsenceReconciler) releaseZeroRowCovers(ctx context.Context, class, lo, hi string, report *AbsenceReport, errs *boundedErrs) {
+	if !r.quotaEnforced {
+		return
+	}
+	for base, cover := range r.liveCovers[class] {
+		if cover.key == "" || (lo != "" && base <= lo) || (hi != "" && base >= hi) {
+			continue
+		}
+		if err := r.registry.DeleteAbsenceCover(ctx, cover.key); err != nil {
+			errs.add(fmt.Errorf("absence reconcile: release row-less cover %s: %w", cover.key, err))
+			continue
+		}
+		report.CoversReleased++
+		delete(r.liveCovers[class], base)
+	}
 }
 
 // lfsPhase adapts the lfs_objects registry into rotationPhase.

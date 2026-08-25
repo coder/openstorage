@@ -581,7 +581,8 @@ A reconciliation pass logs one `absence reconcile pass finished` line:
 | `cover_errors` / `stat_errors` | covers that failed (e.g. the per-repo reservation-row cap) and probes that errored — both retried next pass |
 | `rows_skipped_purged` | rows of purge-fenced repositories skipped |
 | `covers_renewed` | live cover rows re-charged by the renewal phase (fleet-derived from the durable cover listing — any replica renews every cover) |
-| `covers_rotated` / `covers_released` | shrink re-mints (heals reduced a repository's exact re-derived total; the stale row was deleted) and outright releases (fully healed, folded away, or a superseded/legacy row retired) |
+| `covers_rotated` / `covers_released` | shrink re-mints (heals reduced a repository's exact re-derived total; the stale row was deleted) and outright releases (fully healed, emptied of registry rows, or a superseded incarnation retired) |
+| `covers_decaying` | pre-upgrade nonce-keyed covers folded into deterministic incarnations and left to expire by TTL (never deleted — an old replica may still depend on them mid-roll) |
 | `renewal_over_budget` | the live cover population outran the renewal allocation — every cover still renewed (discovery squeezed); raise the budget above twice the live cover population |
 | `renewal_incomplete` | the pass deadline cut the renewal listing short (resumed first next pass on the durable cursor) — investigate the store if persistent, covers lapse if renewals cannot land within the TTL |
 | `lfs_traversals` / `pack_traversals` | completed origin-to-origin rotations per registry (fleet-durable; heals shed within one clean traversal) |
