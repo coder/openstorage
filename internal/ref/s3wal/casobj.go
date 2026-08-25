@@ -161,12 +161,24 @@ func (c *Client) get(ctx context.Context, key, ifNoneMatch string) (Object, erro
 	}
 	out, err := c.s3.GetObject(ctx, in)
 	if err != nil {
-		status, _ := errorStatus(err)
-		switch status {
-		case 304:
+		status, code := errorStatus(err)
+		switch {
+		case status == 304:
 			return Object{}, fmt.Errorf("get %s: %w", key, ErrNotModified)
-		case 404:
+		case status == 404 && code == "NoSuchKey":
+			// Only the object-level miss is ErrNotExist. GetObject 404s
+			// carry an error code (the codeless-404 shape exists only on
+			// HeadObject, which this client never issues), so gating on
+			// NoSuchKey is safe here.
 			return Object{}, fmt.Errorf("get %s: %w", key, ErrNotExist)
+		case status == 404:
+			// A non-key 404 (NoSuchBucket, …) executed with a definitive
+			// response but reports broken infrastructure, not a missing
+			// object: callers must not follow the create path, and the
+			// GET-after-DELETE surface must not read a bootstrap failure
+			// as a clean miss. Plain definitive error naming the code —
+			// never ErrNotExist, never ambiguous.
+			return Object{}, fmt.Errorf("s3wal: get %s: 404 %s is not a missing object: %w", key, code, err)
 		}
 		return Object{}, fmt.Errorf("s3wal: get %s: %w", key, err)
 	}

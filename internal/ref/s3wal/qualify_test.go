@@ -375,7 +375,13 @@ func rejectVerdict(err error) string {
 			return verdictRejects
 		}
 	}
-	if status, _ := errorStatus(err); status >= 400 && status < 500 {
+	if status, code := errorStatus(err); status >= 400 && status < 500 {
+		// A missing bucket is a bootstrap/infrastructure failure: the
+		// store answered definitively, but about the environment, not the
+		// probed operation — never a recordable behavioral finding.
+		if code == "NoSuchBucket" {
+			return verdictError
+		}
 		return verdictRejects
 	}
 	return verdictError
@@ -385,7 +391,7 @@ type qualEnv struct {
 	label    string
 	bucket   string
 	prefix   string // key namespace; "" on disposable containers
-	probeKey string
+	probeKey string // probe scratch-key PREFIX (probeAtKey appends a per-invocation nonce)
 	raw      *s3.Client
 	cas      *Client
 	gcb      *gcblob.Bucket
@@ -1317,8 +1323,8 @@ func TestProbeRefusesNonCompliantStore(t *testing.T) {
 		// A post-send 503 on the step-1 create is an AmbiguousError (the
 		// write may have landed) — inconclusive, not store behavior.
 		{"inconclusive-put-5xx", &fakeStore{putStatus: http.StatusServiceUnavailable}, 1, ProbeInconclusive, false},
-		// An unreachable endpoint fails the step-1 scratch cleanup before
-		// any conditional surface is tested — inconclusive.
+		// An unreachable endpoint means the step-1 create is never
+		// executed (dial-class failure) — inconclusive.
 		{"inconclusive-unreachable-endpoint", &fakeStore{}, 1, ProbeInconclusive, true},
 	}
 	for _, tc := range cases {
@@ -1429,6 +1435,22 @@ func TestCASTaxonomy(t *testing.T) {
 		_, c := newScripted(t, scriptedResponse{status: 404, code: "NoSuchKey"})
 		if _, err := c.Get(ctx, "k"); !errors.Is(err, ErrNotExist) {
 			t.Fatalf("Get = %v, want ErrNotExist", err)
+		}
+	})
+
+	t.Run("get-404-nosuchbucket-not-a-missing-object", func(t *testing.T) {
+		_, c := newScripted(t, scriptedResponse{status: 404, code: "NoSuchBucket"})
+		_, err := c.Get(ctx, "k")
+		var amb *AmbiguousError
+		switch {
+		case err == nil:
+			t.Fatal("Get = nil, want a definitive infrastructure error")
+		case errors.Is(err, ErrNotExist):
+			t.Fatalf("Get = %v — a NoSuchBucket 404 must not classify as a missing object", err)
+		case errors.As(err, &amb):
+			t.Fatalf("Get = %v, want a plain definitive error (the store executed and answered)", err)
+		case !strings.Contains(err.Error(), "NoSuchBucket"):
+			t.Fatalf("Get = %v, want the diagnostic to name the NoSuchBucket code", err)
 		}
 	})
 

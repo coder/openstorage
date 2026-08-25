@@ -7,9 +7,14 @@ import (
 	"fmt"
 )
 
-// ProbeKey is the fixed scratch key the boot-time probe exercises (plan
-// §2.1). It lives outside `_wal/repo/` so probe writes can never collide
-// with a manifest.
+// ProbeKey is the scratch-key PREFIX the boot-time probe exercises. Plan
+// §2.1 names the fixed key `_wal/probe`; the code refines that with a
+// per-invocation `/<128-bit-hex-nonce>` suffix because two instances
+// probing one bucket simultaneously on a shared fixed key can interleave —
+// one deleting/recreating it between the other's steps — forging
+// ErrExists/ErrLostRace outcomes that falsely reject a compliant store and
+// block replica startup. The prefix lives outside `_wal/repo/` so probe
+// writes can never collide with a manifest.
 const ProbeKey = "_wal/probe"
 
 // Probe failure classes: how a probe step failed. The distinction matters
@@ -61,23 +66,19 @@ func Probe(ctx context.Context, c *Client) error {
 	return probeAtKey(ctx, c, ProbeKey)
 }
 
-// probeAtKey carries the probe logic at an arbitrary key so the external
-// endpoint qualification lane can isolate under a random prefix without
-// touching a real deployment's ProbeKey.
-func probeAtKey(ctx context.Context, c *Client, key string) error {
+// probeAtKey carries the probe logic under an arbitrary scratch-key prefix
+// so the external-endpoint qualification lane can isolate under a random
+// namespace without touching a real deployment's ProbeKey prefix.
+func probeAtKey(ctx context.Context, c *Client, keyPrefix string) error {
 	assertf(c != nil, "probeAtKey: nil client")
-	assertf(key != "", "probeAtKey: empty key")
+	assertf(keyPrefix != "", "probeAtKey: empty key prefix")
+	key := probeScratchKey(keyPrefix)
 
-	// Step 1: scratch-clean, then create must succeed. The delete is pure
-	// cleanup so a leftover object from a prior boot cannot fake a step-2
-	// verdict — explicitly NOT a conditional-delete correctness dependency
-	// (§2.7 stands: the protocol never conditions a DELETE).
-	if err := c.Delete(ctx, key); err != nil {
-		// A failed cleanup proves nothing about conditional-write fidelity —
-		// the probe simply never got to test it.
-		return &ProbeError{Step: 1, Surface: "unconditional delete (scratch cleanup)", Class: ProbeInconclusive,
-			Diagnosis: fmt.Sprintf("probe-key cleanup delete failed before any conditional surface was tested: %v", err)}
-	}
+	// Step 1: create must succeed. The key carries a fresh per-invocation
+	// nonce, so no stale leftover from a prior boot can exist and no
+	// pre-clean delete is needed; a create conflict on the fresh key is
+	// therefore a REAL verdict (the store claims a never-written key
+	// exists), not tolerated noise.
 	etag1, err := c.Create(ctx, key, probeBody())
 	if err != nil {
 		return probeStepError(1, "create with If-None-Match: *", err,
@@ -153,8 +154,10 @@ func probeAtKey(ctx context.Context, c *Client, key string) error {
 			Diagnosis: "no racing advance succeeded — the store over-rejects or livelocks conditional writes"}
 	}
 
-	// Cleanup is best-effort: a leftover probe object is inert scratch and
-	// the next probe deletes it first.
+	// Cleanup is best-effort: a leftover probe object is inert scratch
+	// under the dedicated probe prefix (per-invocation nonce keys are
+	// never revisited), so a failed delete costs one orphaned object per
+	// probe run, nothing more.
 	_ = c.Delete(ctx, key)
 	return nil
 }
@@ -203,6 +206,16 @@ func definitiveRejection(err error) bool {
 	}
 	status, _ := errorStatus(err)
 	return status >= 400 && status < 500
+}
+
+// probeScratchKey derives the per-invocation scratch key: the prefix plus a
+// fresh 128-bit hex nonce.
+func probeScratchKey(prefix string) string {
+	assertf(prefix != "", "probeScratchKey: empty prefix")
+	nonce := make([]byte, 16)
+	_, err := rand.Read(nonce)
+	assertf(err == nil, "probeScratchKey: crypto/rand failed: %v", err)
+	return fmt.Sprintf("%s/%x", prefix, nonce)
 }
 
 // probeBody returns a fresh random-nonce body so every accepted probe write
