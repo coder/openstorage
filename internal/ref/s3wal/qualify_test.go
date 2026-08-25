@@ -716,10 +716,10 @@ func surfaceProbe(t *testing.T, e *qualEnv) []verdict {
 		return []verdict{{"probe", verdictError, err.Error()}}
 	}
 	classMap := map[string]string{
-		ProbeIgnored:    verdictIgnores,
-		ProbeRejected:   verdictRejects,
-		ProbeMishandled: verdictMishandles,
-		ProbeAmbiguous:  verdictError,
+		ProbeIgnored:      verdictIgnores,
+		ProbeRejected:     verdictRejects,
+		ProbeMishandled:   verdictMishandles,
+		ProbeInconclusive: verdictError,
 	}
 	for i := 1; i <= 5; i++ {
 		switch {
@@ -1220,6 +1220,7 @@ type fakeStore struct {
 	ignoreIfNoneMatch  bool
 	ignoreIfMatch      bool
 	staleAdvanceStatus int // when >0, a stale If-Match gets this status instead of 412
+	putStatus          int // when >0, every PUT gets this status (post-send failure injection)
 }
 
 func (f *fakeStore) etag(v int) string { return fmt.Sprintf("%q", fmt.Sprintf("v%d", v)) }
@@ -1234,6 +1235,10 @@ func (f *fakeStore) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	switch r.Method {
 	case http.MethodPut:
+		if f.putStatus != 0 {
+			writeS3Error(w, f.putStatus, "SlowDown")
+			return
+		}
 		cur, exists := f.objs[key]
 		if inm := r.Header.Get("If-None-Match"); inm == "*" && exists && !f.ignoreIfNoneMatch {
 			writeS3Error(w, http.StatusPreconditionFailed, "PreconditionFailed")
@@ -1281,23 +1286,35 @@ func stubClient(tb testing.TB, endpoint string) *Client {
 
 // TestProbeRefusesNonCompliantStore proves — deterministically, without
 // Docker — that the §2.6 probe refuses a store that ignores or mishandles
-// the conditional headers, naming the failing step and diagnosis class.
+// the conditional headers, naming the failing step and diagnosis class,
+// and that non-definitive failures (post-send 5xx, unreachable endpoint)
+// surface as ProbeInconclusive rather than accusing the store.
 func TestProbeRefusesNonCompliantStore(t *testing.T) {
 	cases := []struct {
 		name      string
 		store     *fakeStore
 		wantStep  int // 0 = probe must pass
 		wantClass string
+		preClose  bool // close the server before probing (dial failure)
 	}{
-		{"compliant-store-passes", &fakeStore{}, 0, ""},
-		{"ignores-if-none-match", &fakeStore{ignoreIfNoneMatch: true}, 2, ProbeIgnored},
-		{"ignores-if-match", &fakeStore{ignoreIfMatch: true}, 4, ProbeIgnored},
-		{"mishandles-stale-advance", &fakeStore{staleAdvanceStatus: http.StatusForbidden}, 4, ProbeMishandled},
+		{"compliant-store-passes", &fakeStore{}, 0, "", false},
+		{"ignores-if-none-match", &fakeStore{ignoreIfNoneMatch: true}, 2, ProbeIgnored, false},
+		{"ignores-if-match", &fakeStore{ignoreIfMatch: true}, 4, ProbeIgnored, false},
+		{"mishandles-stale-advance", &fakeStore{staleAdvanceStatus: http.StatusForbidden}, 4, ProbeMishandled, false},
+		// A post-send 503 on the step-1 create is an AmbiguousError (the
+		// write may have landed) — inconclusive, not store behavior.
+		{"inconclusive-put-5xx", &fakeStore{putStatus: http.StatusServiceUnavailable}, 1, ProbeInconclusive, false},
+		// An unreachable endpoint fails the step-1 scratch cleanup before
+		// any conditional surface is tested — inconclusive.
+		{"inconclusive-unreachable-endpoint", &fakeStore{}, 1, ProbeInconclusive, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			srv := httptest.NewServer(tc.store)
 			defer srv.Close()
+			if tc.preClose {
+				srv.Close()
+			}
 			err := Probe(context.Background(), stubClient(t, srv.URL))
 			if tc.wantStep == 0 {
 				if err != nil {

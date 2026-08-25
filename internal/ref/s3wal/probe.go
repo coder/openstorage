@@ -12,16 +12,21 @@ import (
 // with a manifest.
 const ProbeKey = "_wal/probe"
 
-// Probe failure classes: how the store deviated on a probe step. The
-// distinction matters operationally — "ignored" is the silent-corruption
-// class (the store accepted a write the condition forbids), "rejected" is
-// loud-but-wrong, "mishandled" is any other divergence, and "ambiguous"
-// means the probe could not obtain a definitive verdict.
+// Probe failure classes: how a probe step failed. The distinction matters
+// operationally — the first three are DEFINITIVE store behavior ("ignored"
+// is the silent-corruption class: the store accepted a write the condition
+// forbids; "rejected" is loud-but-wrong; "mishandled" is any other
+// definitive divergence) and mean the store is non-compliant. "inconclusive"
+// means the probe could not obtain a definitive store verdict at all
+// (ambiguous post-send failure where the write may have landed, a
+// transport/not-executed failure, or a failed scratch cleanup): the store
+// is NOT proven non-compliant, but a boot probe must be conclusive (§2.6),
+// so serving is refused pending a retry.
 const (
-	ProbeRejected   = "rejected"
-	ProbeIgnored    = "ignored"
-	ProbeMishandled = "mishandled"
-	ProbeAmbiguous  = "ambiguous"
+	ProbeRejected     = "rejected"
+	ProbeIgnored      = "ignored"
+	ProbeMishandled   = "mishandled"
+	ProbeInconclusive = "inconclusive"
 )
 
 // ProbeError is the refuse-to-serve verdict from a failed conditional-write
@@ -29,11 +34,15 @@ const (
 type ProbeError struct {
 	Step      int    // 1-5, the §2.6 step that deviated
 	Surface   string // the conditional surface under test
-	Class     string // ProbeRejected | ProbeIgnored | ProbeMishandled | ProbeAmbiguous
+	Class     string // ProbeRejected | ProbeIgnored | ProbeMishandled | ProbeInconclusive
 	Diagnosis string
 }
 
 func (e *ProbeError) Error() string {
+	if e.Class == ProbeInconclusive {
+		return fmt.Sprintf("s3wal: conditional-write probe step %d (%s) was inconclusive: %s — cannot certify the store (transient/infrastructure, not proven non-compliant); refusing to serve",
+			e.Step, e.Surface, e.Diagnosis)
+	}
 	return fmt.Sprintf("s3wal: store failed conditional-write probe step %d (%s): %s: %s — refusing to serve",
 		e.Step, e.Surface, e.Class, e.Diagnosis)
 }
@@ -61,8 +70,10 @@ func probeAtKey(ctx context.Context, c *Client, key string) error {
 	// verdict — explicitly NOT a conditional-delete correctness dependency
 	// (§2.7 stands: the protocol never conditions a DELETE).
 	if err := c.Delete(ctx, key); err != nil {
-		return &ProbeError{Step: 1, Surface: "unconditional delete (scratch cleanup)", Class: ProbeRejected,
-			Diagnosis: fmt.Sprintf("store rejected the probe-key cleanup delete: %v", err)}
+		// A failed cleanup proves nothing about conditional-write fidelity —
+		// the probe simply never got to test it.
+		return &ProbeError{Step: 1, Surface: "unconditional delete (scratch cleanup)", Class: ProbeInconclusive,
+			Diagnosis: fmt.Sprintf("probe-key cleanup delete failed before any conditional surface was tested: %v", err)}
 	}
 	etag1, err := c.Create(ctx, key, probeBody())
 	if err != nil {
@@ -145,14 +156,25 @@ func probeAtKey(ctx context.Context, c *Client, key string) error {
 	return nil
 }
 
-// probeStepError classifies an unexpected step error: an ambiguous outcome
-// means the probe cannot certify the store (a boot probe must be
-// conclusive); anything else is a mishandled conditional.
+// probeStepError classifies an unexpected step error. ProbeMishandled is
+// reserved for DEFINITIVE store responses (a wrong-step sentinel, a
+// definitive non-conditional 4xx, exhausted 409 contention) — the store
+// answered, wrongly. An AmbiguousError (post-send 5xx/timeout: the write
+// may have landed) or a failure that never produced a store verdict
+// (ErrNotExecuted: expired context or dial-class transport failure) is
+// ProbeInconclusive — a boot probe must be conclusive (§2.6), so serving
+// is refused, but the store is not accused of non-compliance. Those two
+// shapes are exhaustive for non-definitive Create/Advance outcomes by the
+// §2.3 taxonomy (see putConditional/classifyTransport).
 func probeStepError(step int, surface string, err error, want string) *ProbeError {
 	var amb *AmbiguousError
 	if errors.As(err, &amb) {
-		return &ProbeError{Step: step, Surface: surface, Class: ProbeAmbiguous,
-			Diagnosis: fmt.Sprintf("ambiguous outcome during probe — cannot certify the store: %v", err)}
+		return &ProbeError{Step: step, Surface: surface, Class: ProbeInconclusive,
+			Diagnosis: fmt.Sprintf("ambiguous outcome — the write may have landed without a definitive store response: %v", err)}
+	}
+	if errors.Is(err, ErrNotExecuted) {
+		return &ProbeError{Step: step, Surface: surface, Class: ProbeInconclusive,
+			Diagnosis: fmt.Sprintf("step was never executed — no store verdict was produced: %v", err)}
 	}
 	return &ProbeError{Step: step, Surface: surface, Class: ProbeMishandled,
 		Diagnosis: fmt.Sprintf("%s; got: %v", want, err)}
