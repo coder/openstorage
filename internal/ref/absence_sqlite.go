@@ -48,12 +48,12 @@ func (s *SQLite) ListAbsenceCovers(ctx context.Context, afterRaw string, limit i
 	// characters. Expired rows are excluded like the PG twin (Codex
 	// round 6): created_at is epoch milliseconds (sqliteEpochMS).
 	rows, err := s.db.QueryContext(ctx, `
-SELECT key, repo, bytes, owner = ? FROM pack_reservations
+SELECT key, repo, bytes, owner FROM pack_reservations
 WHERE key > ? AND key < ?
   AND substr(key, -?) = ?
   AND created_at > `+sqliteEpochMS+` - ?
 ORDER BY key ASC LIMIT ?`,
-		AbsenceFoldedOwner, afterRaw, absenceCoverRangeEnd, len(absenceCoverRawSuffix), absenceCoverRawSuffix, ttl.Milliseconds(), limit)
+		afterRaw, absenceCoverRangeEnd, len(absenceCoverRawSuffix), absenceCoverRawSuffix, ttl.Milliseconds(), limit)
 	if err != nil {
 		return nil, fmt.Errorf("list absence covers: %w", err)
 	}
@@ -61,9 +61,10 @@ ORDER BY key ASC LIMIT ?`,
 	var out []AbsenceCoverRow
 	for rows.Next() {
 		var r AbsenceCoverRow
-		if err := rows.Scan(&r.RawKey, &r.Base, &r.Bytes, &r.Folded); err != nil {
+		if err := rows.Scan(&r.RawKey, &r.Base, &r.Bytes, &r.Owner); err != nil {
 			return nil, err
 		}
+		r.Folded = r.Owner == AbsenceFoldedOwner
 		var ok bool
 		if r.Key, ok = stripAbsenceCoverRow(r.RawKey); !ok {
 			continue // foreign spelling: left to reservation expiry
@@ -145,15 +146,21 @@ WHERE key > ? AND key < ?
 	return total + n, nil
 }
 
-// MarkAbsenceCoverFolded — see the PG twin.
-func (s *SQLite) MarkAbsenceCoverFolded(ctx context.Context, rawKey string) error {
-	assertf(strings.HasPrefix(rawKey, AbsenceCoverPrefix), "MarkAbsenceCoverFolded(%q)", rawKey)
-	_, err := s.db.ExecContext(ctx,
-		`UPDATE pack_reservations SET owner = ? WHERE key = ?`, AbsenceFoldedOwner, rawKey)
+// CASAbsenceCoverOwner — see the PG twin.
+func (s *SQLite) CASAbsenceCoverOwner(ctx context.Context, rawKey, expectedOwner string, expectedBytes int64, newOwner string) (bool, error) {
+	assertf(strings.HasPrefix(rawKey, AbsenceCoverPrefix), "CASAbsenceCoverOwner(%q)", rawKey)
+	assertf(newOwner != "", "CASAbsenceCoverOwner(%q): empty new owner", rawKey)
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE pack_reservations SET owner = ? WHERE key = ? AND owner = ? AND bytes = ?`,
+		newOwner, rawKey, expectedOwner, expectedBytes)
 	if err != nil {
-		return fmt.Errorf("mark absence cover folded %s: %w", rawKey, err)
+		return false, fmt.Errorf("cas absence cover owner %s: %w", rawKey, err)
 	}
-	return nil
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("cas absence cover owner %s: rows affected: %w", rawKey, err)
+	}
+	return n > 0, nil
 }
 
 // DeleteAbsenceCover — see the PG twin.

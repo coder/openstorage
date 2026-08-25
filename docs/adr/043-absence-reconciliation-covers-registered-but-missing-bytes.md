@@ -118,22 +118,28 @@ nonce per replica/pass, several live nonces can cover DISJOINT deficits
 that admission sums, and a max-merge would leave at most max(nonces) per
 class once the marked rows decay (each class's own rotation right-sizes
 or row-less-releases its copy within one clean range observation, and the
-transient over-cover until then only tightens admission). After a proven
-transfer the nonce row is MARKED folded (a sentinel owner) and decays by
-TTL. Un-folded nonces ride the pass-start bulk touch until their first
-listing visit (Codex round 15: a nonce minted just behind the cursor must
-not lapse before an upgraded worker ever folds it), and an old replica's
-re-charge overwrites the sentinel — a re-charge is a new reliance, so the
-row re-enters the touch until the listing re-folds and re-marks it. Never
-deleted: an old replica may still depend on its own nonce rows mid-roll.
-The fold marker is the SOLE fold state — no process-local memo: three
-review rounds broke memo variants the same way (an old replica's
-re-charge changed what the nonce means while the memo said "done"), and
-the marker closes the class because a marked row is exactly one with no
-reliance newer than its last proven fold. Un-marked rows re-transfer
-every visit; replays after mark failures or re-charges only re-add —
-over-cover, conservative and error-visible, right-sized by the next clean
-range.
+transient over-cover until then only tightens admission). The addition is
+retry-idempotent through a durable per-nonce intent (Codex round 18):
+before any charge, the absolute per-class targets are CASed into the
+nonce row's own owner column; the charges grow each class's current head
+to those recorded absolute totals (GREATEST — replaying the same total is
+a no-op), and a second CAS flips the owner to the folded sentinel, which
+starts TTL decay. Any mid-sequence failure retries against the recorded
+intent instead of re-adding — without it, a transient ledger error could
+double the reservation every pass until quota admission wedged. Both
+CASes are guarded on the listed (owner, bytes): every re-charge
+overwrites owner and grows bytes, so a CAS miss proves an old replica's
+concurrent re-charge, which wins — a re-charge is a new reliance, and the
+next visit recomputes fresh targets from the grown row. Un-folded nonces
+(including intent-marked ones) ride the pass-start bulk touch until their
+transfer completes (Codex round 15: a nonce minted just behind the cursor
+must not lapse before an upgraded worker ever folds it). Never deleted:
+an old replica may still depend on its own nonce rows mid-roll. The owner
+column is the SOLE fold state — no process-local memo: three review
+rounds broke memo variants the same way (an old replica's re-charge
+changed what the nonce means while the memo said "done"), and the folded
+sentinel closes the class because a marked row is exactly one with no
+reliance newer than its last proven transfer.
 
 Resolved residual (issue #125, with #121): the original design kept the
 known-absent set and rotation cursors in process memory, making refresh

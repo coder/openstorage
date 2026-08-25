@@ -98,10 +98,11 @@ type AbsenceRegistry interface {
 	// rounds 9+15). Strict TTL: expired rows stay dead; nonce rows
 	// marked folded decay.
 	RenewAbsenceCovers(ctx context.Context, ttl time.Duration) (int64, error)
-	// MarkAbsenceCoverFolded removes one legacy nonce row from the bulk
-	// touch once its total is provably folded into both incarnations
-	// (Codex round 15); an old replica's re-charge un-marks it.
-	MarkAbsenceCoverFolded(ctx context.Context, rawKey string) error
+	// CASAbsenceCoverOwner rewrites one legacy nonce row's owner guarded
+	// on the listed (owner, bytes) — the seam the durable fold intents
+	// and the final folded sentinel go through (Codex rounds 15+18): a
+	// CAS miss proves a concurrent re-charge, which must win.
+	CASAbsenceCoverOwner(ctx context.Context, rawKey, expectedOwner string, expectedBytes int64, newOwner string) (bool, error)
 	// ListAbsenceCovers pages the live absence-cover reservation rows —
 	// the durable tracking state the renewal phase re-derives its
 	// obligations from every pass (issue #125). ttl is the liveness
@@ -779,75 +780,149 @@ func (r *AbsenceReconciler) renewCovers(ctx context.Context, budget int64, repor
 // classes' deficits with no class split (Codex round 5, P1), so the total
 // is transferred into BOTH class incarnations: each class's own next clean
 // range right-sizes (or row-less-releases) its copy, and until then the
-// transient over-cover only tightens admission — which is also why replays
-// (a mark failure, or an old replica's re-charge un-marking the row) may
-// re-add and only ever over-cover, conservatively and error-visibly.
-// The row's OWN durable fold marker (row.Folded, the sentinel owner) is
-// the sole fold state — rounds 7, 13, and the round-15 security follow-up
-// each broke a process-local memo the same way (an old replica's re-charge
-// changed what the nonce means while the memo said "done"), and the marker
-// closes the class: every re-charge overwrites owner, so a marked row is
-// EXACTLY one with no reliance newer than its last proven fold. Marked
-// rows decay by TTL (skipped here); un-marked rows transfer and mark. If a
-// transfer cannot be proven, the row is renewed as-is so nothing lapses;
-// the next pass retries. Reports whether the row's protection is secured
-// for this pass (decaying, folded, renewed, or the base is purge-fenced);
-// false means NEITHER fold nor renewal landed (Codex round 8, P1) and the
-// caller must park the renewal cursor before the row.
+// transient over-cover only tightens admission.
+//
+// The addition is RETRY-IDEMPOTENT through a durable per-nonce intent
+// (Codex round 18, P1): before any charge, the absolute per-class targets
+// head+nonce are CASed into the nonce row's own owner column; the charges
+// then grow each class's CURRENT head to those recorded ABSOLUTE totals
+// (the ledger's GREATEST merge — charging the same total twice is a
+// no-op, and a concurrently grown or right-sized head still ends ≥ the
+// intent), and only after both proven charges does a second CAS flip the
+// owner to the folded sentinel, starting TTL decay. A retry after ANY
+// mid-sequence failure re-reads the intent and re-charges the SAME
+// totals — without the intent, each retry of a partial transfer (or of a
+// failed final mark) would re-ADD the nonce, and a transient ledger error
+// could double the reservation every pass until quota admission wedged.
+// Both CASes are guarded on the LISTED (owner, bytes): every re-charge
+// overwrites owner and GREATEST-grows bytes, so a CAS miss proves an old
+// replica re-charged concurrently — the new reliance wins, and the next
+// visit recomputes fresh targets from the grown row (a bounded,
+// intentional re-add). The owner column is the SOLE fold state — rounds
+// 7, 13, and the round-15 security follow-up each broke a process-local
+// memo the same way (an old replica's re-charge changed what the nonce
+// means while the memo said "done").
+//
+// Failure semantics: marked rows decay (skipped here); a benign CAS miss
+// returns true (nothing pending — the row is re-offered once the listing
+// next visits it, and the pass-start bulk touch keeps every un-folded
+// nonce alive regardless, Codex round 15); errors return false so the
+// caller parks the renewal cursor strictly BEFORE the row (Codex round
+// 8) for a prompt idempotent retry. The pre-round-18 failure path
+// re-charged the nonce same-key as a fallback renewal — that upsert
+// overwrites owner and would destroy the intent, so it is gone; the bulk
+// touch is the renewal.
 func (r *AbsenceReconciler) migrateLegacyCover(ctx context.Context, row *ref.AbsenceCoverRow, report *AbsenceReport, st *absencePassState, errs *boundedErrs) bool {
 	if row.Folded {
 		report.CoversDecaying++ // no re-charge since the last proven fold
 		return true
 	}
-	migrated := true
-	for _, class := range []string{absenceClassLFS, absenceClassPacks} {
-		if !r.foldIntoIncarnation(ctx, row.Base, class, row.Bytes, false, true, report, st, errs) {
-			migrated = false
-			break
-		}
-	}
-	if migrated {
-		// Mark the nonce folded so the bulk touch stops renewing it and
-		// TTL decay begins (Codex round 15). On mark failure the nonce
-		// stays un-marked and bulk-touched, and the next pass re-folds
-		// (grow-only, idempotent) and retries the mark — protection is
-		// intact either way.
-		if err := r.registry.MarkAbsenceCoverFolded(ctx, row.RawKey); err != nil {
-			errs.add(fmt.Errorf("absence reconcile: mark legacy cover folded %s: %w", row.Key, err))
-			return true
-		}
-		report.CoversDecaying++
-		return true
-	}
-	// Migration could not be proven durable (head lookup or charge
-	// failed, or the base is purge-fenced — where nothing must be
-	// re-minted): renew the nonce row as-is so nothing lapses, except
-	// for purged bases, whose rows are on their way out anyway. The
-	// renewal is a same-key re-charge of a listed row, so it bypasses
-	// the pass-level coverSkip the failed fold may have just set
-	// (Codex round 7, P1): the ledger excludes the incoming key from
-	// its row-cap count, so this can succeed where a mint was denied.
 	if st.purged[row.Base] {
-		return true
+		return true // the purge pipeline owns the base's rows; never re-mint
 	}
-	if r.chargeCover(ctx, row.Base, row.Key, row.Bytes, true, report, st, errs) {
-		report.CoversRenewed++
-		return true
+	tLFS, tPacks, ok := parseFoldIntent(row.Owner)
+	if !ok {
+		if strings.HasPrefix(row.Owner, absenceFoldIntentPrefix) {
+			// A prefixed owner this binary cannot parse (never written
+			// by it): fail closed, loudly — recomputing would discard
+			// whatever the record meant.
+			errs.add(fmt.Errorf("absence reconcile: malformed fold intent on %s: %q", row.Key, row.Owner))
+			return false
+		}
+		// Fresh transfer: record the absolute per-class targets FIRST —
+		// no charge may happen without a durable record making its
+		// retry idempotent.
+		hLFS, ok1 := r.resolveHead(ctx, row.Base, absenceClassLFS, st, errs)
+		hPacks, ok2 := r.resolveHead(ctx, row.Base, absenceClassPacks, st, errs)
+		if !ok1 || !ok2 {
+			return false
+		}
+		tLFS, tPacks = satAdd(hLFS.bytes, row.Bytes), satAdd(hPacks.bytes, row.Bytes)
+		cas, err := r.registry.CASAbsenceCoverOwner(ctx, row.RawKey, row.Owner, row.Bytes, foldIntentOwner(tLFS, tPacks))
+		if err != nil {
+			errs.add(fmt.Errorf("absence reconcile: record fold intent for %s: %w", row.Key, err))
+			return false
+		}
+		if !cas {
+			return true // re-charged since listing: the new reliance wins; revisit recomputes
+		}
 	}
-	return false
+	for _, c := range []struct {
+		class string
+		total int64
+	}{{absenceClassLFS, tLFS}, {absenceClassPacks, tPacks}} {
+		if !r.foldIntoIncarnation(ctx, row.Base, c.class, c.total, false, report, st, errs) {
+			if st.purged[row.Base] {
+				return true // fence discovered mid-transfer: rows are on their way out
+			}
+			return false
+		}
+	}
+	cas, err := r.registry.CASAbsenceCoverOwner(ctx, row.RawKey, foldIntentOwner(tLFS, tPacks), row.Bytes, ref.AbsenceFoldedOwner)
+	if err != nil {
+		errs.add(fmt.Errorf("absence reconcile: mark legacy cover folded %s: %w", row.Key, err))
+		return false
+	}
+	if !cas {
+		return true // re-charged mid-transfer: stays un-folded, revisit recomputes
+	}
+	report.CoversDecaying++
+	return true
 }
 
-// foldIntoIncarnation grows one class's live incarnation, minting
-// incarnation 1 when the class has none. With additive=false the head
-// grows to at least bytes (the ledger's GREATEST merge — the endRange
-// grow-retry's recomputed-total semantics); with additive=true it grows to
-// head+bytes, saturating (legacy nonce transfer, Codex round 17: the
-// nonce's credit stacks on whatever the head already compensates). Reports
+// absenceFoldIntentPrefix versions the durable fold-intent record the
+// reconciler CASes into a legacy nonce's owner column (Codex round 18).
+const absenceFoldIntentPrefix = "absence-fold:v1:"
+
+// foldIntentOwner encodes the absolute per-class transfer targets.
+func foldIntentOwner(tLFS, tPacks int64) string {
+	assertf(tLFS >= 0 && tPacks >= 0, "foldIntentOwner(%d, %d)", tLFS, tPacks)
+	return absenceFoldIntentPrefix + "lfs=" + strconv.FormatInt(tLFS, 10) + ":packs=" + strconv.FormatInt(tPacks, 10)
+}
+
+// parseFoldIntent decodes a fold-intent owner; ok=false for anything else
+// (random reservation tokens, the folded sentinel, malformed records).
+func parseFoldIntent(owner string) (tLFS, tPacks int64, ok bool) {
+	rest, found := strings.CutPrefix(owner, absenceFoldIntentPrefix)
+	if !found {
+		return 0, 0, false
+	}
+	lfsPart, packsPart, found := strings.Cut(rest, ":")
+	if !found {
+		return 0, 0, false
+	}
+	lfsVal, foundLFS := strings.CutPrefix(lfsPart, "lfs=")
+	packsVal, foundPacks := strings.CutPrefix(packsPart, "packs=")
+	if !foundLFS || !foundPacks {
+		return 0, 0, false
+	}
+	var err error
+	if tLFS, err = strconv.ParseInt(lfsVal, 10, 64); err != nil || tLFS < 0 {
+		return 0, 0, false
+	}
+	if tPacks, err = strconv.ParseInt(packsVal, 10, 64); err != nil || tPacks < 0 {
+		return 0, 0, false
+	}
+	return tLFS, tPacks, true
+}
+
+// satAdd is saturating int64 addition (cover totals never wrap).
+func satAdd(a, b int64) int64 {
+	assertf(a >= 0 && b >= 0, "satAdd(%d, %d)", a, b)
+	if sum := a + b; sum >= a {
+		return sum
+	}
+	return math.MaxInt64
+}
+
+// foldIntoIncarnation grows one class's live incarnation to at least
+// bytes (the ledger's GREATEST merge — an ABSOLUTE total, so replays are
+// idempotent), minting incarnation 1 when the class has none. Reports
 // whether the grown total is proven durable in the ledger. bypassSkip
 // forces the charge past the pass-level coverSkip memo even for a mint
 // (the bounded endRange retry); same-key grows of an existing head always
 // bypass.
-func (r *AbsenceReconciler) foldIntoIncarnation(ctx context.Context, base, class string, bytes int64, bypassSkip, additive bool, report *AbsenceReport, st *absencePassState, errs *boundedErrs) bool {
+func (r *AbsenceReconciler) foldIntoIncarnation(ctx context.Context, base, class string, bytes int64, bypassSkip bool, report *AbsenceReport, st *absencePassState, errs *boundedErrs) bool {
 	assertf(bytes >= 0, "foldIntoIncarnation: negative total %d for %s/%s", bytes, base, class)
 	head, ok := r.resolveHead(ctx, base, class, st, errs)
 	if !ok {
@@ -857,18 +932,11 @@ func (r *AbsenceReconciler) foldIntoIncarnation(ctx context.Context, base, class
 	if target.key == "" {
 		target = liveCover{key: absenceIncarnationKey(base, class, 1), n: 1}
 	}
-	total := bytes
-	if additive {
-		total = target.bytes + bytes
-		if total < target.bytes { // saturate, never wrap
-			total = math.MaxInt64
-		}
-	}
-	if !r.chargeCover(ctx, base, target.key, total, head.key != "" || bypassSkip, report, st, errs) {
+	if !r.chargeCover(ctx, base, target.key, bytes, head.key != "" || bypassSkip, report, st, errs) {
 		return false
 	}
-	if total > target.bytes {
-		target.bytes = total
+	if bytes > target.bytes {
+		target.bytes = bytes
 	}
 	r.liveCovers[class][base] = target
 	return true
@@ -1120,7 +1188,7 @@ func (r *AbsenceReconciler) endRange(ctx context.Context, tr *rangeTracker, repo
 		// an under-counted running only grows the cover less than the
 		// truth, never shrinks it.
 		if running > 0 && !st.purged[base] {
-			r.foldIntoIncarnation(ctx, base, class, running, true, false, report, st, errs)
+			r.foldIntoIncarnation(ctx, base, class, running, true, report, st, errs)
 		}
 		return
 	}

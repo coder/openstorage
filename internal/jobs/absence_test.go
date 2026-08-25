@@ -1119,6 +1119,123 @@ func TestAbsenceReconcile_LegacyCoversFoldAdditively(t *testing.T) {
 	}
 }
 
+// foldFailRegistry injects one selective failure into the legacy-transfer
+// sequence: the Nth absence-cover charge (1-based), or the final folded
+// CAS. Everything else passes through.
+type foldFailRegistry struct {
+	AbsenceRegistry
+	failNthCharge int // 1-based; 0 = no charge failure
+	chargeSeen    int
+	failMarkOnce  bool
+}
+
+func (fr *foldFailRegistry) ReservePackBytes(ctx context.Context, group []string, packs []ref.Pack, owner string, usageFloor, floorGen, quotaBytes int64, ttl time.Duration) (ref.ReserveDecision, error) {
+	if len(packs) == 1 && strings.HasPrefix(packs[0].Key, ref.AbsenceCoverPrefix) {
+		fr.chargeSeen++
+		if fr.chargeSeen == fr.failNthCharge {
+			return ref.ReserveDecision{}, fmt.Errorf("flaky: injected charge failure")
+		}
+	}
+	return fr.AbsenceRegistry.ReservePackBytes(ctx, group, packs, owner, usageFloor, floorGen, quotaBytes, ttl)
+}
+
+func (fr *foldFailRegistry) CASAbsenceCoverOwner(ctx context.Context, rawKey, expectedOwner string, expectedBytes int64, newOwner string) (bool, error) {
+	if fr.failMarkOnce && newOwner == ref.AbsenceFoldedOwner {
+		fr.failMarkOnce = false
+		return false, fmt.Errorf("flaky: injected mark failure")
+	}
+	return fr.AbsenceRegistry.CASAbsenceCoverOwner(ctx, rawKey, expectedOwner, expectedBytes, newOwner)
+}
+
+// TestAbsenceReconcile_PartialLegacyTransferRetryIdempotent (Codex round
+// 18, P1): the LFS-class charge lands but the packs-class charge fails —
+// the retry must re-charge the SAME recorded absolute targets, not add the
+// nonce to the LFS head a second time. Without the durable intent, every
+// retry of a partial transfer would re-add and a transient ledger error
+// could double the reservation each pass until quota admission wedged.
+func TestAbsenceReconcile_PartialLegacyTransferRetryIdempotent(t *testing.T) {
+	f := newSweepFixture(t)
+	ctx := context.Background()
+	base := "repo-partial-fold"
+	if err := ref.ReserveRestoreCover(ctx, absenceRegistry(t, f), blob.QuotaRepoGroup(base),
+		ref.AbsenceCoverPrefix+base+"/"+ref.NewReservationOwner(), 555, time.Hour); err != nil {
+		t.Fatalf("seed nonce: %v", err)
+	}
+	reg := &foldFailRegistry{AbsenceRegistry: absenceRegistry(t, f), failNthCharge: 2}
+	r := NewAbsenceReconciler(reg, f.blobs, true, 1000, time.Hour, slog.New(slog.DiscardHandler))
+
+	renew := func() (*AbsenceReport, error) {
+		t.Helper()
+		errs := &boundedErrs{}
+		report := &AbsenceReport{}
+		r.loadState(ctx, errs)
+		r.renewCovers(ctx, 1000, report, newAbsencePassState(), errs)
+		return report, errs.join()
+	}
+	if _, err := renew(); err == nil {
+		t.Fatal("run 1: want the injected packs-charge failure reported")
+	}
+	head, ok, err := reg.AbsenceCoverHead(ctx, absenceIncarnationPrefix(base, absenceClassLFS), time.Hour)
+	if err != nil || !ok || head.Bytes != 555 {
+		t.Fatalf("lfs head after partial transfer = (%+v, %v, %v), want the single credit", head, ok, err)
+	}
+
+	report, err := renew()
+	if err != nil {
+		t.Fatalf("run 2: %v", err)
+	}
+	if report.CoversDecaying != 1 {
+		t.Fatalf("run 2 report = %+v, want the nonce transferred and decaying", report)
+	}
+	for _, class := range []string{absenceClassLFS, absenceClassPacks} {
+		head, ok, err := reg.AbsenceCoverHead(ctx, absenceIncarnationPrefix(base, class), time.Hour)
+		if err != nil || !ok || head.Bytes != 555 {
+			t.Fatalf("%s head after retry = (%+v, %v, %v), want the SAME single credit (no re-add)", class, head, ok, err)
+		}
+	}
+}
+
+// TestAbsenceReconcile_MarkFailureRetryIdempotent (Codex round 18, P1):
+// both class charges land but the final folded CAS fails — the retry must
+// leave the heads untouched (idempotent re-charges to the recorded
+// targets) and only redo the mark.
+func TestAbsenceReconcile_MarkFailureRetryIdempotent(t *testing.T) {
+	f := newSweepFixture(t)
+	ctx := context.Background()
+	base := "repo-mark-fail"
+	if err := ref.ReserveRestoreCover(ctx, absenceRegistry(t, f), blob.QuotaRepoGroup(base),
+		ref.AbsenceCoverPrefix+base+"/"+ref.NewReservationOwner(), 555, time.Hour); err != nil {
+		t.Fatalf("seed nonce: %v", err)
+	}
+	reg := &foldFailRegistry{AbsenceRegistry: absenceRegistry(t, f), failMarkOnce: true}
+	r := NewAbsenceReconciler(reg, f.blobs, true, 1000, time.Hour, slog.New(slog.DiscardHandler))
+
+	renew := func() (*AbsenceReport, error) {
+		t.Helper()
+		errs := &boundedErrs{}
+		report := &AbsenceReport{}
+		r.loadState(ctx, errs)
+		r.renewCovers(ctx, 1000, report, newAbsencePassState(), errs)
+		return report, errs.join()
+	}
+	if report, err := renew(); err == nil || report.CoversDecaying != 0 {
+		t.Fatalf("run 1 = (%+v, %v), want the injected mark failure reported and no decay", report, err)
+	}
+	report, err := renew()
+	if err != nil {
+		t.Fatalf("run 2: %v", err)
+	}
+	if report.CoversDecaying != 1 {
+		t.Fatalf("run 2 report = %+v, want the nonce marked on retry", report)
+	}
+	for _, class := range []string{absenceClassLFS, absenceClassPacks} {
+		head, ok, err := reg.AbsenceCoverHead(ctx, absenceIncarnationPrefix(base, class), time.Hour)
+		if err != nil || !ok || head.Bytes != 555 {
+			t.Fatalf("%s head after mark retry = (%+v, %v, %v), want the SAME single credit", class, head, ok, err)
+		}
+	}
+}
+
 // TestAbsenceReconcile_StaleCursorRestartsFromOrigin (Codex round 17,
 // security): a rotation cursor whose row's DB-clock age outlives the
 // cover-renewal guarantee (a fleet pause approaching the cover TTL) may
@@ -1370,9 +1487,12 @@ func TestAbsenceReconcile_FailedLegacyMigrationReoffered(t *testing.T) {
 		t.Fatalf("seed legacy cover: %v", err)
 	}
 
-	// Pass 1: the lfs fold's mint AND the fallback nonce renewal both
-	// fail (injected). The renewal phase must abort parked BEFORE the
-	// nonce rather than skipping past it.
+	// Pass 1: the lfs transfer's mint fails (injected; the second
+	// injected failure lands on the rotation's own discovery charge).
+	// The renewal phase must abort parked BEFORE the nonce rather than
+	// skipping past it — the durable intent recorded before the charge
+	// makes the pass-2 retry idempotent, and the pass-start bulk touch
+	// keeps the nonce alive meanwhile.
 	reg := &flakyRegistry{AbsenceRegistry: absenceRegistry(t, f), failLeft: 2}
 	r := NewAbsenceReconciler(reg, f.blobs, true, 1000, time.Hour, slog.New(slog.DiscardHandler))
 	report, err := r.Run(ctx)

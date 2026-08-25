@@ -25,7 +25,7 @@ func scanStateStore(t *testing.T, s Store) ScanStateStore {
 type absenceCoverStore interface {
 	Store
 	RenewAbsenceCovers(ctx context.Context, ttl time.Duration) (int64, error)
-	MarkAbsenceCoverFolded(ctx context.Context, rawKey string) error
+	CASAbsenceCoverOwner(ctx context.Context, rawKey, expectedOwner string, expectedBytes int64, newOwner string) (bool, error)
 	ListAbsenceCovers(ctx context.Context, afterRaw string, limit int, ttl time.Duration) ([]AbsenceCoverRow, error)
 	AbsenceCoverHead(ctx context.Context, prefix string, ttl time.Duration) (AbsenceCoverRow, bool, error)
 	DeleteAbsenceCover(ctx context.Context, key string) error
@@ -227,8 +227,33 @@ func TestAbsenceCovers_ListHeadDelete(t *testing.T) {
 		if n, err := cs.RenewAbsenceCovers(ctx, time.Nanosecond); err != nil || n != 0 {
 			t.Fatalf("expired bulk touch = (%d, %v), want zero rows", n, err)
 		}
-		if err := cs.MarkAbsenceCoverFolded(ctx, legacyRaw); err != nil {
-			t.Fatalf("mark folded: %v", err)
+		// The folded mark is a CAS on the LISTED (owner, bytes) — Codex
+		// round 18: a drifted owner or bytes (concurrent re-charge)
+		// must lose, writing nothing.
+		listed, err := cs.ListAbsenceCovers(ctx, "", 10, time.Hour)
+		if err != nil {
+			t.Fatalf("list for CAS: %v", err)
+		}
+		listedOwner := ""
+		for _, row := range listed {
+			if row.RawKey == legacyRaw {
+				listedOwner = row.Owner
+			}
+		}
+		if listedOwner == "" {
+			t.Fatal("legacy row missing from listing")
+		}
+		if ok, err := cs.CASAbsenceCoverOwner(ctx, legacyRaw, "some-stale-owner", 30, AbsenceFoldedOwner); err != nil || ok {
+			t.Fatalf("stale-owner CAS = (%v, %v), want a miss", ok, err)
+		}
+		if ok, err := cs.CASAbsenceCoverOwner(ctx, legacyRaw, listedOwner, 31, AbsenceFoldedOwner); err != nil || ok {
+			t.Fatalf("stale-bytes CAS = (%v, %v), want a miss", ok, err)
+		}
+		if n, err := cs.RenewAbsenceCovers(ctx, time.Hour); err != nil || n != 4 {
+			t.Fatalf("bulk touch after missed CAS = (%d, %v), want the row still un-folded", n, err)
+		}
+		if ok, err := cs.CASAbsenceCoverOwner(ctx, legacyRaw, listedOwner, 30, AbsenceFoldedOwner); err != nil || !ok {
+			t.Fatalf("matched CAS = (%v, %v), want the fold mark written", ok, err)
 		}
 		if n, err := cs.RenewAbsenceCovers(ctx, time.Hour); err != nil || n != 3 {
 			t.Fatalf("bulk touch after fold mark = (%d, %v), want the marked nonce left to decay", n, err)
