@@ -3436,6 +3436,9 @@ func TestLFSUpload_SameKeyConcurrencyBounded(t *testing.T) {
 	if w.Header().Get("Retry-After") == "" {
 		t.Fatal("429 without Retry-After")
 	}
+	if rl := w.Header().Get("RateLimit"); rl != `"default";r=0;t=10` {
+		t.Fatalf("429 RateLimit = %q, want %q (issue #150)", rl, `"default";r=0;t=10`)
+	}
 
 	// Let the winner finish; the retry now succeeds (adoption path).
 	if _, err := pw.Write(content[4:]); err != nil {
@@ -3491,6 +3494,9 @@ func TestLFSUpload_NodeStagingBudget(t *testing.T) {
 		"basic:"+tok, string(second))
 	if w.Code != http.StatusTooManyRequests || w.Header().Get("Retry-After") == "" {
 		t.Fatalf("budget-exhausted PUT = %d (Retry-After %q), want 429 with Retry-After", w.Code, w.Header().Get("Retry-After"))
+	}
+	if rl := w.Header().Get("RateLimit"); rl != `"default";r=0;t=10` {
+		t.Fatalf("429 RateLimit = %q, want %q (issue #150)", rl, `"default";r=0;t=10`)
 	}
 
 	// The winner finishes and releases its reservation; the retry fits.

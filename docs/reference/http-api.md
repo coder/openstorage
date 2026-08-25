@@ -20,6 +20,11 @@ contract with implementation notes the spec lacks.
 - **Errors**: `{"error": "<unstable human string>"}` + status code. Write endpoints that move
   refs return the richer `result` envelope ([streaming protocols](../explanation/streaming-commit-protocols.md)) even on
   4xx/5xx statuses `[400,401,403,404,408,409,412,422,429,499,500,502,503,504]`.
+- **Throttling**: every `429` — the gateway [rate limiter](configuration.md#rate-limiting)
+  and transient busy/backpressure answers — carries `Retry-After` (delay-seconds) plus the
+  IETF `RateLimit` service-limit field (`"default";r=0;t=<retry-after-secs>`, current
+  draft-ietf-httpapi-ratelimit-headers shape). `Retry-After` takes precedence over the
+  `RateLimit` effective window; no `RateLimit-Policy` is advertised.
 - **Booleans in query strings** are literal `"true"` / `"false"`.
 - **Repeated params**: `path` may repeat on diff endpoints; `range` may repeat on blame.
 - **No client retries**: none of the SDKs retry; every error surfaces immediately. Timeouts

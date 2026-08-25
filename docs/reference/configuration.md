@@ -169,7 +169,9 @@ real deployment or reverse proxy.
 ### `CODESTORAGE_RATE_RPS` / `CODESTORAGE_RATE_BURST`
 
 Per-client-IP token-bucket rate limit applied to the REST surface **and** — with separate
-bucket state — the git smart-HTTP surface. Exceeding it yields `429` with `Retry-After`.
+bucket state — the git smart-HTTP surface. Exceeding it yields `429` with `Retry-After`
+plus the IETF `RateLimit` header (`"default";r=0;t=<retry-after-secs>`), the pair
+documented upstream on every 429.
 
 - **Default:** both unset — limiting disabled.
 - **Constraints (fail-fast at startup):** `RPS` must be a non-negative finite number;
@@ -423,7 +425,7 @@ incrementally as body bytes actually arrive (a stalled upload holds only slightl
 than it has transferred, not its declared `Content-Length`), and each repository's
 staged bytes are held to a fair share that scales with the budget's free capacity, so
 one repository's uploads cannot occupy the whole replica budget. Uploads that do not
-fit right now answer `429` with `Retry-After`; an object whose declared size exceeds
+fit right now answer `429` with `Retry-After` + `RateLimit`; an object whose declared size exceeds
 the largest hold a single repository can ever reach — one third of the budget —
 answers `413`.
 

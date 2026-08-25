@@ -14,10 +14,42 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 )
+
+// assertRateLimited verifies a 429 carries the upstream-documented header
+// pair (issue #150): Retry-After delay-seconds plus the IETF RateLimit
+// service-limit item whose effective window matches Retry-After exactly.
+func assertRateLimited(t *testing.T, h http.Header) {
+	t.Helper()
+	ra := h.Get("Retry-After")
+	secs, err := strconv.Atoi(ra)
+	if err != nil || secs < 1 {
+		t.Fatalf("Retry-After = %q, want integer delay-seconds >= 1", ra)
+	}
+	want := fmt.Sprintf(`"default";r=0;t=%d`, secs)
+	if rl := h.Get("RateLimit"); rl != want {
+		t.Fatalf("RateLimit = %q, want %q", rl, want)
+	}
+}
+
+// TestRateLimitedHeaderShape pins the exact wire shape of the throttling
+// header pair every 429 site emits through rateLimited — the REST and git
+// limiter middlewares plus the busy/backpressure handlers (fork, merge,
+// commit, notes) that pass a fixed 10s hint.
+func TestRateLimitedHeaderShape(t *testing.T) {
+	w := httptest.NewRecorder()
+	rateLimited(w, 7)
+	if ra := w.Header().Get("Retry-After"); ra != "7" {
+		t.Errorf("Retry-After = %q, want %q", ra, "7")
+	}
+	if rl := w.Header().Get("RateLimit"); rl != `"default";r=0;t=7` {
+		t.Errorf("RateLimit = %q, want %q", rl, `"default";r=0;t=7`)
+	}
+}
 
 // okHandler is the downstream handler admitted requests must reach.
 func okHandler() http.Handler {
@@ -99,6 +131,7 @@ func TestRateLimit429ReadEnvelope(t *testing.T) {
 	if ra := w.Header().Get("Retry-After"); ra != "1" {
 		t.Errorf("Retry-After = %q, want %q", ra, "1")
 	}
+	assertRateLimited(t, w.Header())
 	if ct := w.Header().Get("Content-Type"); ct != "application/json" {
 		t.Errorf("Content-Type = %q, want application/json", ct)
 	}
@@ -127,6 +160,7 @@ func TestRateLimit429WriteEnvelope(t *testing.T) {
 	if ra := w.Header().Get("Retry-After"); ra == "" {
 		t.Error("Retry-After header missing")
 	}
+	assertRateLimited(t, w.Header())
 	var body struct {
 		Result struct {
 			Success bool   `json:"success"`
@@ -399,6 +433,7 @@ func TestGitRateLimit429Envelope(t *testing.T) {
 	if w.Header().Get("Retry-After") == "" {
 		t.Fatal("429 must carry Retry-After")
 	}
+	assertRateLimited(t, w.Header())
 	var body errorEnvelope
 	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil || body.Error == "" {
 		t.Fatalf("expected {\"error\"} envelope, got %q (err %v)", w.Body.String(), err)

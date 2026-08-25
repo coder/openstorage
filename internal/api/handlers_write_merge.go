@@ -705,7 +705,7 @@ func (s *server) handleMerge(w http.ResponseWriter, r *http.Request) {
 	}
 	if errors.Is(err, errPackReservationsBusy) {
 		// Transient row-cap denial (Codex round 43): retryable.
-		w.Header().Set("Retry-After", "10")
+		rateLimited(w, 10)
 		wmFail(w, http.StatusTooManyRequests, "busy", err.Error(), req.TargetBranch, targetSHA)
 		return
 	}

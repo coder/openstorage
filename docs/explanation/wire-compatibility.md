@@ -41,6 +41,7 @@ namespaces), and [webhooks](../reference/webhooks.md) (webhooks). By feature gro
 | Git LFS | ✅ | Batch API on the same remote; presigned S3 downloads with a server-proxied fallback, verified server-proxied uploads ([below](#git-lfs-transfer-semantics)) |
 | Webhooks | ✅ | HMAC-signed `push` and `repo.sync.*` events, plus webhook CRUD |
 | Upstream sync & credentials | ✅ | `pull-upstream`, `push-upstream` (outbound forwarding — explicit trigger plus opt-in `base_repo.forward_pushes`; trigger semantics differ from upstream's implicit forwarding, see the [deviation](#known-deviations-from-the-vendored-spec)), detach base, git-credential CRUD. Local-mode (SQLite) gap: a *git-surface* push does not auto-schedule sync or forwarding (the hook subprocess cannot reach the in-process queue) — API writes and the explicit `pull-upstream`/`push-upstream` triggers are unaffected |
+| Throttled responses | ✅ | Every HTTP-level `429` (gateway [rate limiter](../reference/configuration.md#rate-limiting) and busy/backpressure paths) carries the two upstream-documented headers: `Retry-After` (delay-seconds) and the IETF `RateLimit` service-limit field (`"default";r=0;t=<retry-after-secs>`); `Retry-After` takes precedence |
 | Auth model | ✅ | Customer-signed JWTs (`ES256`/`RS256`/`EdDSA`/`PS256`/`ES384`/`ES512`), scopes `git:read` / `git:write` / `repo:write` / `org:read` (exact matching — no scope implies another), `refs` policy tuples ([auth spec](../reference/authentication.md)) |
 
 ### Deprecated aliases
