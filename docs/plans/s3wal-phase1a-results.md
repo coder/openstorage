@@ -131,22 +131,27 @@ CODESTORAGE_BENCH_CONTENTION_SECS=60 CODESTORAGE_BENCH_CSV_DIR=… \
 One 60 s window per N (never combined with a multi-iteration benchtime).
 Every window enforces the lost-update detector: strict seq monotonicity,
 exactly one recorded winner per seq, final seq == initial + total wins,
-final nonce == last winner’s. **Zero violations in every cell.**
+final nonce == last winner’s; a window containing any ambiguous outcome
+is inconclusive and fails the run (zero ambiguity in every cell here).
+`adv/s` divides wins by the runner’s actual elapsed time (window start →
+last worker completion), reported per cell. **Zero violations in every
+cell.** Re-recorded with the post-review accounting fixes (anomalies &
+findings item 5).
 
-| Store / writers | success p50 | success p99 | adv/s | wins (success samples) | lost races | contention errors | busy retries | max starve |
-|---|---|---|---|---|---|---|---|---|
-| SeaweedFS, N=2 | 1.91 ms | 3.06 ms | 534.5 | 32,073 | 28,082 | 0 | — | 2.91 s |
-| SeaweedFS, N=8 | 1.33 ms | 2.55 ms | 683.8 | 41,028 | 229,911 | 0 | — | 1.62 s |
-| SeaweedFS, N=32 | 1.88 ms | 4.22 ms | 465.9 | 27,951 | 544,245 | 0 | — | 2.92 s |
-| SQLite, N=2 | 0.19 ms | 0.56 ms | 4,495 | 269,690 | 38 | — | 3 | 7.04 s |
-| SQLite, N=8 | 0.19 ms | 0.96 ms | 3,974 | 238,462 | 181 | — | 34 | 15.65 s |
-| SQLite, N=32 | 0.19 ms | 0.54 ms | 4,337 | 260,218 | 903 | — | 142 | 20.85 s |
-| real S3 | blocked: credentials pending | | | | | | | |
+| Store / writers | success p50 | success p99 | adv/s | wins (success samples) | elapsed | lost races | contention errors | busy retries | max starve |
+|---|---|---|---|---|---|---|---|---|---|
+| SeaweedFS, N=2 | 1.95 ms | 3.04 ms | 525.6 | 31,539 | 60.00 s | 27,661 | 0 | — | 3.33 s |
+| SeaweedFS, N=8 | 1.37 ms | 2.60 ms | 663.6 | 39,820 | 60.00 s | 223,597 | 0 | — | 1.36 s |
+| SeaweedFS, N=32 | 1.84 ms | 3.88 ms | 475.5 | 28,535 | 60.01 s | 550,373 | 0 | — | 2.15 s |
+| SQLite, N=2 | 0.19 ms | 0.55 ms | 4,516 | 271,267 | 60.06 s | 36 | — | 5 | 8.24 s |
+| SQLite, N=8 | 0.19 ms | 0.63 ms | 4,215 | 253,229 | 60.08 s | 203 | — | 27 | 13.85 s |
+| SQLite, N=32 | 0.20 ms | 0.73 ms | 3,958 | 237,834 | 60.09 s | 892 | — | 141 | 18.75 s |
+| real S3 | blocked: credentials pending | | | | | | | | |
 
 Bounded fast variant (runs in default `go test`, Docker required):
 `TestContentionLostUpdateDetectorSeaweedFS`, N=8 for 3 s at 256 B —
-wins=2,008, lostRaces=11,227, contention errors=0, ambiguous=0, max
-starve=648 ms, zero detector violations.
+wins=2,019, lostRaces=11,078, contention errors=0, ambiguous=0, max
+starve=717 ms, zero detector violations.
 
 ### Scenario 4 — generation-read latency
 
@@ -167,15 +172,15 @@ NOT the Gate 1a-B verdict.** For orientation against the thresholds:
 
 - (2) push p50 > 500 ms / p99 > 2 s: SeaweedFS-local measured 92 ms / 111 ms.
 - (3) N=8 aggregate ≥ 3 adv/s and no pusher starved > 30 s: SeaweedFS-local
-  measured 683.8 adv/s, max starve 1.6 s. At N=32 throughput dropped to
-  465.9 adv/s — below the N=8 figure on this loopback setup, with retries
+  measured 663.6 adv/s, max starve 1.4 s. At N=32 throughput dropped to
+  475.5 adv/s — below the N=8 figure on this loopback setup, with retries
   growing with N but bounded (zero `ErrCASContention` exhaustions in 60 s;
   no livelock). Whether that constitutes “throughput collapse” must be
   judged on real S3, where the RTT-to-contention-window ratio differs
   completely.
 - (4) 304-path p99 > 100 ms: SeaweedFS-local measured 3.0 ms.
 - (1) semantic divergence caught by the harness: none on SeaweedFS —
-  no lost update, no phantom write, exactly-once winners across ~101,000
+  no lost update, no phantom write, exactly-once winners across ~100,000
   winning advances and ~800,000 lost races in the 60 s campaign plus every
   qualification/probe run.
 
@@ -220,17 +225,36 @@ ready (`CODESTORAGE_BENCH_S3_URL`, `CODESTORAGE_TEST_S3WAL_URL`).
    SQLite 60 s transcript). Both runners now merge recorded transitions in
    a `defer`. Recorded here because the first (failing) transcript exists;
    the published numbers come from the fixed harness.
+5. **Two more harness-accounting fixes after PR review (scenario 3
+   re-recorded).** (a) A contention window containing any ambiguous
+   outcome is now INCONCLUSIVE and fails the detector run: a
+   possibly-landed ambiguous write has no recorded winner, so the previous
+   “relaxed accounting” let the exactly-once checks hold vacuously and
+   could have masked a real lost update. Ambiguity stays counted/reported
+   as a metric; local-container windows are empirically ambiguity-free,
+   real-S3 windows may need re-runs until an ambiguity-free window is
+   observed. (b) Contention `adv/s` now divides wins by the runner’s
+   actual elapsed time (window start → last worker completion) instead of
+   the configured window — an advance started just before the deadline can
+   retry 409s for seconds and its late success still counts in wins,
+   overstating sustained throughput near the 3 adv/s kill threshold. Both
+   wins and the elapsed used are reported per cell. The scenario-3 table
+   and fast-variant line above were re-recorded with the fixed harness;
+   on loopback the actual elapsed ≈ the configured 60 s, so the local
+   numbers moved only by run-to-run variance — the fix matters on real S3.
 
 ## Artifacts (referenced, not committed)
 
 Transcripts (`script -q -e -c … /tmp/s3wal-phase1a-5a685e03c4/…`):
 `qualify-full.typescript` (qualification, all lanes, verdict lines),
 `bench-latency.typescript` (scenarios 1/2/4, 220 samples per cell),
-`bench-contention.typescript` (scenario 3, 60 s per N). Skip paths are
+`bench-contention.typescript` (scenario 3, 60 s per N — superseded by the
+re-record below). Skip paths are
 demonstrated in the same transcripts (`CODESTORAGE_TEST_S3WAL_URL` /
 `CODESTORAGE_BENCH_S3_URL` unset ⇒ clean skips).
 
-Raw per-op CSVs (14 files, `/tmp/s3wal-phase1a-5a685e03c4/csv/`), SHA-256:
+Raw per-op CSVs for scenarios 1/2/4 (8 files,
+`/tmp/s3wal-phase1a-5a685e03c4/csv/`), SHA-256:
 
 ```
 f3a05a8cedfe6f3d56738a0c423975d6bebee47e2cd5cc48c94419becfd779c0  BenchmarkCASAdvance__store-seaweedfs__size-1KB.csv
@@ -239,14 +263,21 @@ f3a05a8cedfe6f3d56738a0c423975d6bebee47e2cd5cc48c94419becfd779c0  BenchmarkCASAd
 279c5a70b3f672886f9429e977b46f9a02c8a5cc5b15a25958b5f0262f99530e  BenchmarkGenerationRead__store-seaweedfs__mode-304.csv
 d5533ec66349542feb21eaad1211b43ece53f45e5781e8bbdb278becd5ff9dd3  BenchmarkGenerationRead__store-seaweedfs__mode-get.csv
 0d3ad418a28043bcd5f3dbefbc191d5648e5157c05300e3a361a862f46c0e5ab  BenchmarkGenerationRead__store-sqlite__mode-get.csv
-d6217acd22d26c7fdd14f8a619c9db4df00e90d1c9a5827fe7efa209c51694c4  BenchmarkHotRepoContention__store-seaweedfs__writers-2.csv
-50b724b6a8c9a8125da93cb3e699cada9f62f7535b85ed40824487be9bb0763a  BenchmarkHotRepoContention__store-seaweedfs__writers-8.csv
-160ff063194dcbe2e52b9308e04a473bc2942eb9aa5311afce68014a8a74c457  BenchmarkHotRepoContention__store-seaweedfs__writers-32.csv
-d3ef46af2710f23c45ace7a58ec1e55957c80d4e86abb6246e48912f47d28eb8  BenchmarkHotRepoContention__store-sqlite__writers-2.csv
-9bae67394a38567050510f83eb1404cb01caae08706905c24180dd227d5eba85  BenchmarkHotRepoContention__store-sqlite__writers-8.csv
-b99945613cc6a35131807ca33afd29d5f797bd137086033a89d22782ffb76120  BenchmarkHotRepoContention__store-sqlite__writers-32.csv
 6e389df1fce88574671f4ee124ed27618fea320756ef444d64fc891855449c62  BenchmarkSimulatedPush__store-seaweedfs.csv
 af04703df6a86f24a3753a5ccb33ef8c7c67b0d1d907fbe1a924c5f55e2e1ab6  BenchmarkSimulatedPush__store-sqlite.csv
+```
+
+Scenario-3 re-record with the fixed accounting (anomalies & findings
+item 5): log `/tmp/s3wal-fix-2ab6ce9508/bench-contention.log`, raw per-op
+CSVs (6 files, `/tmp/s3wal-fix-2ab6ce9508/csv/`), SHA-256:
+
+```
+912488c1166a1d1828d84cb909b58314cf0e24d6fe9056145b556141531c26ad  BenchmarkHotRepoContention__store-seaweedfs__writers-2.csv
+fcedb007d81ebb095b0b89c15439f567dfc71d9e4dfe529b77014a56ac8676b8  BenchmarkHotRepoContention__store-seaweedfs__writers-8.csv
+52ccea9b580e148047c77b23033a4e73f5b7c29612b701f1b77b7ff0227edb3a  BenchmarkHotRepoContention__store-seaweedfs__writers-32.csv
+f0e3d322ae67431cbd1a02b4869ceed2f010b4990ebd2f668f73a98d0df3ae44  BenchmarkHotRepoContention__store-sqlite__writers-2.csv
+08d024ca3a09a1458c469c490586fb18da6daadb3f427f17ec7eb50bd9d453f6  BenchmarkHotRepoContention__store-sqlite__writers-8.csv
+997b0f8895152c2d530a0c5cbf5a4cbf859c65b6664732081da62099aa8d2b79  BenchmarkHotRepoContention__store-sqlite__writers-32.csv
 ```
 
 Method deviation noted for falsifiability: plan §3 asks for ≥3 runs on
