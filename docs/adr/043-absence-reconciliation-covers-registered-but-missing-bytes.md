@@ -50,7 +50,13 @@ the renewal cycle or be denied outright), and the cover rows THEMSELVES
 are the durable tracking state (issue #125). The renewal phase runs FIRST
 each pass: it LISTS the live cover rows and re-charges each — one work
 unit per row, entirely database-derived, so any replica and any restart
-keeps every discovered loss covered without process memory. Renewal never
+keeps every discovered loss covered without process memory. "Live" is
+admission's own liveness window (the reservation TTL, filtered in SQL):
+a cover row that outlived its TTL is DEAD — admission stopped counting
+it, so renewing or migrating it would resurrect a stale reservation a
+healed repository already shed (Codex round 6) — and is left to the
+ledger's expired-row cleanup; a still-real loss is simply rediscovered
+by the rotation and charged under a fresh incarnation. Renewal never
 lapses on budget: it always offers the full listing, and a population
 beyond its allocation squeezes discovery for the pass, loudly
 (`renewal_over_budget`) — a bounded round-robin would let a big enough

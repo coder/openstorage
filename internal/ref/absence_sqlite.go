@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 )
 
 // ListFleetLFSObjects — see the PG twin.
@@ -36,20 +37,23 @@ ORDER BY repo ASC, key ASC LIMIT ?`,
 // ListAbsenceCovers — see the PG twin. SQLite's default BINARY collation
 // is already byte order, so the plain range scan matches the PG COLLATE
 // "C" semantics.
-func (s *SQLite) ListAbsenceCovers(ctx context.Context, afterRaw string, limit int) ([]AbsenceCoverRow, error) {
+func (s *SQLite) ListAbsenceCovers(ctx context.Context, afterRaw string, limit int, ttl time.Duration) ([]AbsenceCoverRow, error) {
 	validateAbsencePage(limit)
+	assertf(ttl > 0, "ListAbsenceCovers: non-positive ttl %v", ttl)
 	if afterRaw == "" {
 		afterRaw = AbsenceCoverPrefix // no real row key sorts at the bare prefix
 	}
 	// Foreign spellings are excluded in SQL — see the PG twin (Codex
 	// round 3 on PR #132). substr with a negative start is the last-N
-	// characters.
+	// characters. Expired rows are excluded like the PG twin (Codex
+	// round 6): created_at is epoch milliseconds (sqliteEpochMS).
 	rows, err := s.db.QueryContext(ctx, `
 SELECT key, repo, bytes FROM pack_reservations
 WHERE key > ? AND key < ?
   AND substr(key, -?) = ?
+  AND created_at > `+sqliteEpochMS+` - ?
 ORDER BY key ASC LIMIT ?`,
-		afterRaw, absenceCoverRangeEnd, len(absenceCoverRawSuffix), absenceCoverRawSuffix, limit)
+		afterRaw, absenceCoverRangeEnd, len(absenceCoverRawSuffix), absenceCoverRawSuffix, ttl.Milliseconds(), limit)
 	if err != nil {
 		return nil, fmt.Errorf("list absence covers: %w", err)
 	}
@@ -70,15 +74,17 @@ ORDER BY key ASC LIMIT ?`,
 }
 
 // AbsenceCoverHead — see the PG twin.
-func (s *SQLite) AbsenceCoverHead(ctx context.Context, prefix string) (AbsenceCoverRow, bool, error) {
+func (s *SQLite) AbsenceCoverHead(ctx context.Context, prefix string, ttl time.Duration) (AbsenceCoverRow, bool, error) {
 	assertf(strings.HasPrefix(prefix, AbsenceCoverPrefix), "AbsenceCoverHead(%q): not an absence cover prefix", prefix)
+	assertf(ttl > 0, "AbsenceCoverHead: non-positive ttl %v", ttl)
 	var r AbsenceCoverRow
 	err := s.db.QueryRowContext(ctx, `
 SELECT key, repo, bytes FROM pack_reservations
 WHERE key >= ? AND key < ?
   AND substr(key, -?) = ?
+  AND created_at > `+sqliteEpochMS+` - ?
 ORDER BY key DESC LIMIT 1`,
-		prefix, coverRangeEnd(prefix), len(absenceCoverRawSuffix), absenceCoverRawSuffix).Scan(&r.RawKey, &r.Base, &r.Bytes)
+		prefix, coverRangeEnd(prefix), len(absenceCoverRawSuffix), absenceCoverRawSuffix, ttl.Milliseconds()).Scan(&r.RawKey, &r.Base, &r.Bytes)
 	if errors.Is(err, sql.ErrNoRows) {
 		return AbsenceCoverRow{}, false, nil
 	}

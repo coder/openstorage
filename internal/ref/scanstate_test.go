@@ -23,8 +23,8 @@ func scanStateStore(t *testing.T, s Store) ScanStateStore {
 // the absence reconciler drives it).
 type absenceCoverStore interface {
 	Store
-	ListAbsenceCovers(ctx context.Context, afterRaw string, limit int) ([]AbsenceCoverRow, error)
-	AbsenceCoverHead(ctx context.Context, prefix string) (AbsenceCoverRow, bool, error)
+	ListAbsenceCovers(ctx context.Context, afterRaw string, limit int, ttl time.Duration) ([]AbsenceCoverRow, error)
+	AbsenceCoverHead(ctx context.Context, prefix string, ttl time.Duration) (AbsenceCoverRow, bool, error)
 	DeleteAbsenceCover(ctx context.Context, key string) error
 }
 
@@ -154,7 +154,7 @@ func TestAbsenceCovers_ListHeadDelete(t *testing.T) {
 		var got []AbsenceCoverRow
 		after := ""
 		for {
-			rows, err := cs.ListAbsenceCovers(ctx, after, 1)
+			rows, err := cs.ListAbsenceCovers(ctx, after, 1, time.Hour)
 			if err != nil {
 				t.Fatalf("list: %v", err)
 			}
@@ -178,12 +178,26 @@ func TestAbsenceCovers_ListHeadDelete(t *testing.T) {
 
 		// Head lookup: the highest incarnation under the class prefix —
 		// the planted foreign row sorting above it must not shadow it.
-		head, ok, err := cs.AbsenceCoverHead(ctx, AbsenceCoverPrefix+base+"/lfs-e")
+		head, ok, err := cs.AbsenceCoverHead(ctx, AbsenceCoverPrefix+base+"/lfs-e", time.Hour)
 		if err != nil || !ok || head.Key != keyHigh || head.Bytes != 60 {
 			t.Fatalf("head = (%+v, %v, %v), want the e2 row", head, ok, err)
 		}
-		if _, ok, err := cs.AbsenceCoverHead(ctx, AbsenceCoverPrefix+base+"/nope-e"); err != nil || ok {
+		if _, ok, err := cs.AbsenceCoverHead(ctx, AbsenceCoverPrefix+base+"/nope-e", time.Hour); err != nil || ok {
 			t.Fatalf("head of empty prefix = (ok=%v, %v), want absent", ok, err)
+		}
+
+		// Expired rows are invisible to both reads (Codex round 6 on
+		// PR #132): under a liveness window that already elapsed, the
+		// same rows must not be listed (renewal would resurrect a stale
+		// reservation admission no longer counts) nor returned as the
+		// head (charging would resurrect its GREATEST-pinned total).
+		// The rows were stamped above, so a nanosecond window has
+		// always elapsed — no sleeping, no backdating.
+		if rows, err := cs.ListAbsenceCovers(ctx, "", 10, time.Nanosecond); err != nil || len(rows) != 0 {
+			t.Fatalf("expired listing = (%+v, %v), want empty", rows, err)
+		}
+		if _, ok, err := cs.AbsenceCoverHead(ctx, AbsenceCoverPrefix+base+"/lfs-e", time.Nanosecond); err != nil || ok {
+			t.Fatalf("expired head = (ok=%v, %v), want absent", ok, err)
 		}
 
 		// Targeted release: only the named row disappears; re-deleting is
@@ -194,7 +208,7 @@ func TestAbsenceCovers_ListHeadDelete(t *testing.T) {
 		if err := cs.DeleteAbsenceCover(ctx, keyHigh); err != nil {
 			t.Fatalf("re-delete: %v", err)
 		}
-		head, ok, err = cs.AbsenceCoverHead(ctx, AbsenceCoverPrefix+base+"/lfs-e")
+		head, ok, err = cs.AbsenceCoverHead(ctx, AbsenceCoverPrefix+base+"/lfs-e", time.Hour)
 		if err != nil || !ok || head.Key != keyLow || head.Bytes != 100 {
 			t.Fatalf("head after delete = (%+v, %v, %v), want the e1 row", head, ok, err)
 		}

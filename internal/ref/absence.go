@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 )
@@ -121,9 +122,14 @@ func stripAbsenceCoverRow(rawKey string) (key string, ok bool) {
 // on the raw reservation key ascending (afterRaw "" starts the scan). The
 // rows are the DURABLE tracking state of discovered losses: the renewal
 // phase re-derives its obligations from this listing every pass, so any
-// replica keeps every charged aggregate alive (issue #125).
-func (s *PG) ListAbsenceCovers(ctx context.Context, afterRaw string, limit int) ([]AbsenceCoverRow, error) {
+// replica keeps every charged aggregate alive (issue #125). ttl is the
+// liveness window admission consults (PackReservationTTL): rows older than
+// it are EXPIRED — admission no longer counts them, so renewing or
+// migrating one would resurrect a stale reservation (Codex round 6 on
+// PR #132) — and are left to the ledger's expired-row cleanup.
+func (s *PG) ListAbsenceCovers(ctx context.Context, afterRaw string, limit int, ttl time.Duration) ([]AbsenceCoverRow, error) {
 	validateAbsencePage(limit)
+	assertf(ttl > 0, "ListAbsenceCovers: non-positive ttl %v", ttl)
 	if afterRaw == "" {
 		afterRaw = AbsenceCoverPrefix // no real row key sorts at the bare prefix
 	}
@@ -136,8 +142,9 @@ func (s *PG) ListAbsenceCovers(ctx context.Context, afterRaw string, limit int) 
 SELECT key, repo, bytes FROM pack_reservations
 WHERE key COLLATE "C" > $1 AND key COLLATE "C" < $2
   AND right(key, $3) = $4
-ORDER BY key COLLATE "C" ASC LIMIT $5`,
-		afterRaw, absenceCoverRangeEnd, len(absenceCoverRawSuffix), absenceCoverRawSuffix, limit)
+  AND created_at > now() - make_interval(secs => $5)
+ORDER BY key COLLATE "C" ASC LIMIT $6`,
+		afterRaw, absenceCoverRangeEnd, len(absenceCoverRawSuffix), absenceCoverRawSuffix, ttl.Seconds(), limit)
 	if err != nil {
 		return nil, fmt.Errorf("list absence covers: %w", err)
 	}
@@ -169,16 +176,20 @@ func coverRangeEnd(prefix string) string {
 // starts with prefix (byte order; the reconciler's zero-padded incarnation
 // spelling makes byte order numeric order). ok=false when none exists.
 // This is the reconciler's point lookup for a base's current aggregate
-// incarnation before charging into it (issue #125).
-func (s *PG) AbsenceCoverHead(ctx context.Context, prefix string) (AbsenceCoverRow, bool, error) {
+// incarnation before charging into it (issue #125). ttl filters expired
+// rows exactly like ListAbsenceCovers: charging into an expired higher
+// incarnation would resurrect its stale GREATEST-pinned total.
+func (s *PG) AbsenceCoverHead(ctx context.Context, prefix string, ttl time.Duration) (AbsenceCoverRow, bool, error) {
 	assertf(strings.HasPrefix(prefix, AbsenceCoverPrefix), "AbsenceCoverHead(%q): not an absence cover prefix", prefix)
+	assertf(ttl > 0, "AbsenceCoverHead: non-positive ttl %v", ttl)
 	var r AbsenceCoverRow
 	err := s.pool.QueryRow(ctx, `
 SELECT key, repo, bytes FROM pack_reservations
 WHERE key COLLATE "C" >= $1 AND key COLLATE "C" < $2
   AND right(key, $3) = $4
+  AND created_at > now() - make_interval(secs => $5)
 ORDER BY key COLLATE "C" DESC LIMIT 1`,
-		prefix, coverRangeEnd(prefix), len(absenceCoverRawSuffix), absenceCoverRawSuffix).Scan(&r.RawKey, &r.Base, &r.Bytes)
+		prefix, coverRangeEnd(prefix), len(absenceCoverRawSuffix), absenceCoverRawSuffix, ttl.Seconds()).Scan(&r.RawKey, &r.Base, &r.Bytes)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return AbsenceCoverRow{}, false, nil
 	}

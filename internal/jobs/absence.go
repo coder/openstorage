@@ -91,12 +91,14 @@ type AbsenceRegistry interface {
 	ListFleetPacks(ctx context.Context, afterRepo, afterID string, limit int) ([]ref.AbsencePackRow, error)
 	// ListAbsenceCovers pages the live absence-cover reservation rows —
 	// the durable tracking state the renewal phase re-derives its
-	// obligations from every pass (issue #125).
-	ListAbsenceCovers(ctx context.Context, afterRaw string, limit int) ([]ref.AbsenceCoverRow, error)
-	// AbsenceCoverHead point-reads the highest live incarnation under a
+	// obligations from every pass (issue #125). ttl is the liveness
+	// window admission consults: expired rows are excluded (renewing or
+	// migrating one would resurrect a stale reservation, Codex round 6).
+	ListAbsenceCovers(ctx context.Context, afterRaw string, limit int, ttl time.Duration) ([]ref.AbsenceCoverRow, error)
+	// AbsenceCoverHead point-reads the highest LIVE incarnation under a
 	// synthetic-key prefix — the charge path's fallback when the renewal
-	// listing did not cover the base this pass.
-	AbsenceCoverHead(ctx context.Context, prefix string) (ref.AbsenceCoverRow, bool, error)
+	// listing did not cover the base this pass. Same ttl semantics.
+	AbsenceCoverHead(ctx context.Context, prefix string, ttl time.Duration) (ref.AbsenceCoverRow, bool, error)
 	// DeleteAbsenceCover releases one cover row (healed loss, superseded
 	// incarnation, or retired legacy spelling).
 	DeleteAbsenceCover(ctx context.Context, key string) error
@@ -613,7 +615,7 @@ func (r *AbsenceReconciler) renewCovers(ctx context.Context, budget int64, repor
 			abort(ctx.Err())
 			return charged
 		}
-		rows, err := r.registry.ListAbsenceCovers(ctx, after, absencePageSize)
+		rows, err := r.registry.ListAbsenceCovers(ctx, after, absencePageSize, r.coverTTL)
 		if err != nil {
 			abort(fmt.Errorf("absence reconcile: list covers: %w", err))
 			return charged
@@ -970,7 +972,7 @@ func (r *AbsenceReconciler) resolveHead(ctx context.Context, base, class string,
 	if r.renewalComplete {
 		return liveCover{}, true // the full harvest proves no live cover
 	}
-	row, found, err := r.registry.AbsenceCoverHead(ctx, absenceIncarnationPrefix(base, class))
+	row, found, err := r.registry.AbsenceCoverHead(ctx, absenceIncarnationPrefix(base, class), r.coverTTL)
 	if err != nil {
 		errs.add(fmt.Errorf("absence reconcile: cover head %s/%s: %w", base, class, err))
 		return liveCover{}, false
@@ -1013,6 +1015,12 @@ func (r *AbsenceReconciler) chargeDeficit(ctx context.Context, tr *rangeTracker,
 		return // still within the live cover: renewal keeps it fresh
 	}
 	if head.key == "" {
+		// No LIVE incarnation (Codex round 6: expired rows are filtered
+		// as dead). Minting can collide with a lingering expired row of
+		// the same key: the upsert's GREATEST then transiently
+		// resurrects its stale total — bounded like a crash replay (the
+		// clean-range rotate right-sizes it, and the ledger's
+		// expired-row cleanup removes lingering rows).
 		head = liveCover{key: absenceIncarnationKey(tr.base, tr.class, 1), n: 1}
 	}
 	if !r.chargeCover(ctx, tr.base, head.key, tr.running, report, st, errs) {
