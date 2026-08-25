@@ -293,9 +293,13 @@ your (disabled) deletion and deserves investigation before you consider enabling
 When a sweep does delete, it never hard-deletes directly: every blob is first copied to a
 `sweep/quarantine/<nonce>/…` key, the registry is re-checked *after* the delete (a registration that
 landed mid-delete is restored on the spot), and **every** sweep — list-only included —
-starts by restoring any registered-but-missing pack from quarantine. Rolling back to
+starts by restoring any registered-but-missing **or truncated** pack from quarantine.
+The heal is size-aware: a registered blob that exists but is *shorter* than its
+registered size (a stale presigned overwrite, storage-layer damage) is healed from a
+backup holding the complete bytes, not trusted on existence alone. Rolling back to
 list-only after a scare therefore still repairs anything a delete-enabled crash left
-behind; look for `orphan pack sweep: healed registered pack from quarantine`. LFS
+behind; look for `orphan pack sweep: healed registered pack from quarantine` and
+`healed truncated registered object from quarantine`. LFS
 restores are additionally digest-verified against the key's OID: a backup taken from a
 pre-registry blob whose bytes never hashed to its OID is *never* restored (logged as
 `NOT restoring LFS quarantine backup failing content verification`) — a registered
@@ -306,6 +310,12 @@ after the delete. Quarantine
 backups are purged only while a destructive mode is on, and only once older than
 `max(age threshold, 1h)` — the floor guarantees a delete handshake is provably dead
 before its backup goes away, so tuning the age threshold low does not shorten it.
+The purge additionally never collects a backup while the registered original cannot be
+verified complete: pack rows registered before the size column existed record no size
+(`bytes=0`), so their backups are spared until a repack fold records one (logged as
+`sparing backup of a registered object with unknowable size`), and a truncated
+original the heal could not repair this pass (its backup is itself short, or another
+worker holds the object's claim) keeps its backup for the next sweep to re-examine.
 
 ### S3 bucket versioning
 

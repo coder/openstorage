@@ -301,6 +301,18 @@ func (stubLedger) SweepExpiredPackReservations(context.Context, time.Duration) (
 func (stubLedger) ReconcileLegacyLFSObjects(context.Context) (int64, bool, error) {
 	return 0, false, nil
 }
+func (stubLedger) PackRegisteredBytes(context.Context, string, string) (int64, bool, error) {
+	return 0, false, nil
+}
+func (stubLedger) TryAdoptionClaim(context.Context, string, string) (bool, string, error) {
+	return true, "stub-owner", nil
+}
+func (stubLedger) RenewAdoptionClaim(context.Context, string, string) (bool, error) {
+	return true, nil
+}
+func (stubLedger) ReleaseAdoptionClaim(context.Context, string, string) error {
+	return nil
+}
 func (stubLedger) HasLFSObject(context.Context, string, string) (bool, error) {
 	return false, nil
 }

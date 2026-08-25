@@ -100,6 +100,9 @@ func (f *fakeInner) TouchLFSObject(context.Context, string, string) (bool, error
 func (f *fakeInner) LFSObjectRegisteredAt(context.Context, string, string) (time.Time, int64, bool, error) {
 	return time.Time{}, 0, false, nil
 }
+func (f *fakeInner) PackRegisteredBytes(context.Context, string, string) (int64, bool, error) {
+	return 0, false, nil
+}
 func (f *fakeInner) CountLFSObjects(context.Context, string) (int64, error) { return 0, nil }
 func (f *fakeInner) BumpLFSAdoptionGen(context.Context, string) error       { return nil }
 func (f *fakeInner) RegisterAdoptedLFSObject(context.Context, string, string, int64) error {
