@@ -806,23 +806,23 @@ func TestAbsenceReconcile_SplitShortCopiesClassifiedTruncated(t *testing.T) {
 	}
 }
 
-// TestAbsenceReconcile_LegacyCoverMigrated (Codex round 4+5, P1s):
-// nonce-keyed covers minted by pre-#125 workers — at ANY point of a
-// mixed-version roll — are folded into the base's deterministic
-// incarnations on first sight, which every new-replica pass keeps renewed;
-// the nonce row itself is never deleted (an old replica may depend on it)
-// and expires by TTL. A pre-#125 cover aggregates BOTH classes' deficits,
-// so the total folds into BOTH class incarnations and each class's own
-// clean range right-sizes its copy — the pack portion must survive the
-// nonce's decay even though the fold happens during the LFS-keyed renewal.
-func TestAbsenceReconcile_LegacyCoverMigrated(t *testing.T) {
+// TestAbsenceReconcile_LegacyCoverRetiredOnProof (Codex rounds 4, 5, 17,
+// 18, 19): a nonce-keyed cover minted by a pre-#125 worker is ITSELF the
+// cover for whatever it aggregates — no bytes are ever transferred into
+// the deterministic incarnations (every transfer scheme re-interpreted an
+// old worker's periodic same-key refresh as new deficit and re-added it,
+// round 19 P1). The row stays live (bulk-touched) until BOTH rotations
+// prove its base clean within one pass — the recount charges the true
+// deficits into the deterministic heads, subsuming the nonce — and then
+// decays by TTL under the folded sentinel; the row itself is never
+// deleted (an old replica may depend on it mid-roll).
+func TestAbsenceReconcile_LegacyCoverRetiredOnProof(t *testing.T) {
 	f := newSweepFixture(t)
 	ctx := context.Background()
 	base := "repo-legacy-cover"
-	// Registered-but-missing rows in BOTH classes keep the base's ranges
-	// alive so neither migrated incarnation is released as row-less; the
-	// legacy cover carries a LARGER total (the old replica had seen more
-	// losses) than either class's exact deficit.
+	// Registered-but-missing rows in BOTH classes: the rotations charge
+	// their exact deficits into the deterministic heads; the legacy
+	// cover carries a LARGER total (the old replica had seen more).
 	registerLFS(t, f, base, blob.LFSKey(base, absenceOID('a')), 100)
 	if err := f.store.RegisterPacks(ctx, base, []ref.Pack{{ID: "lost", Key: blob.PackKey(base, "lost"), Size: 200}}); err != nil {
 		t.Fatal(err)
@@ -832,31 +832,22 @@ func TestAbsenceReconcile_LegacyCoverMigrated(t *testing.T) {
 		t.Fatalf("seed legacy cover: %v", err)
 	}
 
-	// Pass 1: the renewal listing transfers the 555-byte legacy credit
-	// into BOTH deterministic incarnations (additively — Codex round 17)
-	// and stops renewing the nonce row; the rotations' own discovery
-	// keeps charging the same incarnations.
+	// Pass 1: discovery charges the exact per-class deficits; both clean
+	// same-pass ranges prove the nonce redundant, and it starts decaying
+	// at its own 555 — never re-added anywhere.
 	r := testReconciler(t, f, true, 1000)
 	report, err := r.Run(ctx)
 	if err != nil {
 		t.Fatalf("Run 1: %v", err)
 	}
-	if report.CoversDecaying != 1 {
-		t.Fatalf("pass 1 report = %+v, want the legacy cover migrated and decaying", report)
-	}
-	// The same pass's clean full-range observations right-size each
-	// migrated 555 down to its class's registry-exact deficit (rotate +
-	// release the superseded rows). Ledger: nonce row (555, decaying
-	// inside its TTL) + right-sized lfs (100) and packs (200)
-	// incarnations.
-	if report.CoversRotated != 2 {
-		t.Fatalf("pass 1 report = %+v, want both migrated totals right-sized by the rotations", report)
+	if report.CoversDecaying != 1 || report.CoversRotated != 0 {
+		t.Fatalf("pass 1 report = %+v, want the nonce retired without any transfer or right-sizing", report)
 	}
 	if got := ledgerReserved(t, f, base); got != 555+100+200 {
-		t.Fatalf("reserved = %d, want the decaying nonce row plus both right-sized incarnations", got)
+		t.Fatalf("reserved = %d, want the decaying nonce plus both exact incarnations", got)
 	}
 
-	// Pass 2: steady state — the exact incarnations renew; the nonce row
+	// Pass 2: steady state — the exact incarnations renew; the nonce
 	// keeps decaying (never deleted, still inside its TTL).
 	report, err = r.Run(ctx)
 	if err != nil {
@@ -869,12 +860,11 @@ func TestAbsenceReconcile_LegacyCoverMigrated(t *testing.T) {
 		t.Fatalf("reserved after pass 2 = %d, want unchanged", got)
 	}
 
-	// An old replica re-grows the SAME nonce mid-roll (Codex round 7,
-	// P1): the re-charge overwrote the fold marker, so the grown total
-	// must re-fold into both incarnations before the nonce decays.
-	// Pass 3 re-inflates both incarnations to 900 and its own clean
-	// ranges right-size them again (a rotate per class proves the
-	// re-fold happened); the nonce decays at its grown total.
+	// An old replica re-charges the SAME nonce mid-roll at a GROWN total
+	// (Codex rounds 7+19): the re-charge overwrites the folded sentinel —
+	// a new reliance — so pass 3 re-proves the base and re-retires the
+	// nonce at its grown total. The deterministic heads must NOT grow:
+	// the nonce's own row admits its claim until it decays.
 	if err := ref.ReserveRestoreCover(ctx, absenceRegistry(t, f), blob.QuotaRepoGroup(base), legacyKey, 900, time.Hour); err != nil {
 		t.Fatalf("re-grow legacy cover: %v", err)
 	}
@@ -882,11 +872,11 @@ func TestAbsenceReconcile_LegacyCoverMigrated(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run 3: %v", err)
 	}
-	if report.CoversDecaying != 1 || report.CoversRotated != 2 {
-		t.Fatalf("pass 3 report = %+v, want the grown nonce re-folded and both incarnations right-sized", report)
+	if report.CoversDecaying != 1 || report.CoversRotated != 0 {
+		t.Fatalf("pass 3 report = %+v, want the re-charged nonce re-retired without transfers", report)
 	}
 	if got := ledgerReserved(t, f, base); got != 900+100+200 {
-		t.Fatalf("reserved after pass 3 = %d, want the grown nonce plus right-sized incarnations", got)
+		t.Fatalf("reserved after pass 3 = %d, want the grown nonce plus unchanged incarnations", got)
 	}
 }
 
@@ -975,12 +965,13 @@ func TestAbsenceReconcile_DiscoveryRunsWhenCoversExceedBudget(t *testing.T) {
 	}
 }
 
-// TestAbsenceReconcile_LegacyRefoldAfterHeadsReleased (Codex round 13,
-// P1): the incarnations a fold produced can be RELEASED by any worker
-// after a heal. When an old replica then re-charges the SAME nonce at an
-// EQUAL total for a NEW incident, the re-charge un-marks the row (owner
-// overwritten), so the visit re-folds — otherwise the nonce would decay
-// with no compensation left.
+// TestAbsenceReconcile_LegacyRefoldAfterHeadsReleased (Codex rounds
+// 13+19): the deterministic incarnations can be RELEASED by any worker
+// after a heal. When the bytes vanish AGAIN and an old replica re-charges
+// the SAME nonce at an EQUAL total for the new incident, the re-charge
+// un-marks the row (owner overwritten) — so the next pass must re-prove
+// the base (discovery re-charges the exact deficits) before the nonce may
+// decay again.
 func TestAbsenceReconcile_LegacyRefoldAfterHeadsReleased(t *testing.T) {
 	f := newSweepFixture(t)
 	ctx := context.Background()
@@ -996,8 +987,8 @@ func TestAbsenceReconcile_LegacyRefoldAfterHeadsReleased(t *testing.T) {
 		t.Fatalf("seed legacy cover: %v", err)
 	}
 
-	// Pass 1: fold + right-size both incarnations (555 -> 100 lfs,
-	// 555 -> 200 packs).
+	// Pass 1: discovery charges the exact deficits (100 lfs, 200 packs)
+	// and the clean double proof retires the nonce.
 	r := testReconciler(t, f, true, 1000)
 	if _, err := r.Run(ctx); err != nil {
 		t.Fatalf("Run 1: %v", err)
@@ -1027,179 +1018,141 @@ func TestAbsenceReconcile_LegacyRefoldAfterHeadsReleased(t *testing.T) {
 		t.Fatalf("re-charge legacy cover: %v", err)
 	}
 
-	// Pass 3 (same process): the re-charge un-marked the row, so the
-	// visit re-folds — both incarnations are re-minted and right-sized
-	// by the same pass's clean ranges.
+	// Pass 3 (same process): the re-charge un-marked the row; discovery
+	// re-charges the exact deficits and the clean double proof retires
+	// the nonce again — nothing is ever transferred from it.
 	report, err = r.Run(ctx)
 	if err != nil {
 		t.Fatalf("Run 3: %v", err)
 	}
-	if report.CoversDecaying != 1 || report.CoversRotated != 2 {
-		t.Fatalf("pass 3 report = %+v, want the nonce re-folded and both incarnations right-sized", report)
+	if report.CoversDecaying != 1 || report.CoversRotated != 0 {
+		t.Fatalf("pass 3 report = %+v, want the nonce re-retired after the fresh proof", report)
 	}
 	if got := ledgerReserved(t, f, base); got != 555+100+200 {
-		t.Fatalf("reserved = %d, want the decaying nonce plus both re-minted right-sized incarnations", got)
+		t.Fatalf("reserved = %d, want the decaying nonce plus both re-minted exact incarnations", got)
 	}
 }
 
-// TestAbsenceReconcile_LegacyCoversFoldAdditively (Codex round 17,
-// security): pre-#125 workers minted one random nonce PER REPLICA/PASS, so
-// several live nonces can cover DISJOINT deficits — admission sums them —
-// and each transfer must ADD the nonce's credit to the heads. A GREATEST
-// toward the largest nonce would leave at most max(nonces) per class once
-// the marked rows decay, below the summed protection. Credits must also
-// stack across decay epochs: a nonce minted after earlier folds' rows
-// decayed adds on top of the previous heads. The renewal phase runs alone
-// here (no rotations), so nothing right-sizes the heads and the fold
-// arithmetic itself is observable.
-func TestAbsenceReconcile_LegacyCoversFoldAdditively(t *testing.T) {
+// TestAbsenceReconcile_RowlessLegacyCoversRetiredByGapProof (Codex rounds
+// 17+19): pre-#125 workers minted one random nonce PER REPLICA/PASS, so
+// several live nonces can compensate DISJOINT deficits that admission
+// sums — no transfer into the deterministic heads can reconcile that with
+// old replicas still re-charging their own rows mid-roll (rounds 17-18
+// tried GREATEST- and additive-transfer variants; round 19 P1 broke
+// both), so each nonce row stays live as its own cover until proven
+// redundant. Here the base holds no rows in EITHER class, so the proof is
+// the row-less keyset gap: both rotations' page adjacency proves a zero
+// deficit, ALL of the base's nonces retire in the same pass, and no
+// deterministic head is ever minted — nothing is transferred anywhere.
+func TestAbsenceReconcile_RowlessLegacyCoversRetiredByGapProof(t *testing.T) {
 	f := newSweepFixture(t)
 	ctx := context.Background()
-	base := "repo-additive-fold"
+	base := "repo-rowless-legacy"
 	reg := absenceRegistry(t, f)
-	for _, nonce := range []struct {
-		key   string
-		bytes int64
-	}{
-		{ref.AbsenceCoverPrefix + base + "/" + ref.NewReservationOwner(), 555},
-		{ref.AbsenceCoverPrefix + base + "/" + ref.NewReservationOwner(), 300},
-	} {
-		if err := ref.ReserveRestoreCover(ctx, reg, blob.QuotaRepoGroup(base), nonce.key, nonce.bytes, time.Hour); err != nil {
+	for _, bytes := range []int64{555, 300} {
+		if err := ref.ReserveRestoreCover(ctx, reg, blob.QuotaRepoGroup(base),
+			ref.AbsenceCoverPrefix+base+"/"+ref.NewReservationOwner(), bytes, time.Hour); err != nil {
 			t.Fatalf("seed nonce: %v", err)
 		}
 	}
 
 	r := testReconciler(t, f, true, 1000)
-	renew := func() *AbsenceReport {
-		t.Helper()
-		errs := &boundedErrs{}
-		report := &AbsenceReport{}
-		r.loadState(ctx, errs)
-		r.renewCovers(ctx, 1000, report, newAbsencePassState(), errs)
-		if err := errs.join(); err != nil {
-			t.Fatalf("renewCovers: %v", err)
-		}
-		return report
-	}
-	if report := renew(); report.CoversDecaying != 2 {
-		t.Fatalf("report = %+v, want both nonces folded and decaying", report)
-	}
-	for _, class := range []string{absenceClassLFS, absenceClassPacks} {
-		head, ok, err := reg.AbsenceCoverHead(ctx, absenceIncarnationPrefix(base, class), time.Hour)
-		if err != nil || !ok || head.Bytes != 555+300 {
-			t.Fatalf("%s head = (%+v, %v, %v), want the SUMMED nonce credits", class, head, ok, err)
-		}
-	}
-
-	// Decay epoch: both folded rows expire, then an old replica mints a
-	// THIRD nonce — its credit lands on top of the previous heads.
-	rows, err := reg.ListAbsenceCovers(ctx, "", 10, time.Hour)
+	report, err := r.Run(ctx)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("Run: %v", err)
 	}
-	for _, row := range rows {
-		if _, _, _, legacy, ok := parseAbsenceCoverKey(row.Key); ok && legacy {
-			if err := reg.DeleteAbsenceCover(ctx, row.Key); err != nil {
-				t.Fatal(err)
-			}
-		}
-	}
-	if err := ref.ReserveRestoreCover(ctx, reg, blob.QuotaRepoGroup(base),
-		ref.AbsenceCoverPrefix+base+"/"+ref.NewReservationOwner(), 100, time.Hour); err != nil {
-		t.Fatal(err)
-	}
-	if report := renew(); report.CoversDecaying != 1 {
-		t.Fatalf("report = %+v, want the epoch-2 nonce folded and decaying", report)
+	if report.CoversDecaying != 2 {
+		t.Fatalf("report = %+v, want both nonces retired by the gap proof", report)
 	}
 	for _, class := range []string{absenceClassLFS, absenceClassPacks} {
-		head, ok, err := reg.AbsenceCoverHead(ctx, absenceIncarnationPrefix(base, class), time.Hour)
-		if err != nil || !ok || head.Bytes != 555+300+100 {
-			t.Fatalf("%s head after decay epoch = (%+v, %v, %v), want stacked credits", class, head, ok, err)
+		if _, ok, err := reg.AbsenceCoverHead(ctx, absenceIncarnationPrefix(base, class), time.Hour); err != nil || ok {
+			t.Fatalf("%s head = (%v, %v), want no deterministic head minted", class, ok, err)
 		}
+	}
+	if got := ledgerReserved(t, f, base); got != 555+300 {
+		t.Fatalf("reserved = %d, want only the decaying nonces (nothing transferred)", got)
 	}
 }
 
-// foldFailRegistry injects one selective failure into the legacy-transfer
-// sequence: the Nth absence-cover charge (1-based), or the final folded
-// CAS. Everything else passes through.
-type foldFailRegistry struct {
+// foldCASRegistry intercepts the fold CAS: hook (if set) runs once
+// strictly before the first attempt — simulating an old replica's
+// re-charge racing the listing — and failMarkOnce injects one transient
+// CAS error. Everything else passes through.
+type foldCASRegistry struct {
 	AbsenceRegistry
-	failNthCharge int // 1-based; 0 = no charge failure
-	chargeSeen    int
-	failMarkOnce  bool
+	hook         func()
+	failMarkOnce bool
 }
 
-func (fr *foldFailRegistry) ReservePackBytes(ctx context.Context, group []string, packs []ref.Pack, owner string, usageFloor, floorGen, quotaBytes int64, ttl time.Duration) (ref.ReserveDecision, error) {
-	if len(packs) == 1 && strings.HasPrefix(packs[0].Key, ref.AbsenceCoverPrefix) {
-		fr.chargeSeen++
-		if fr.chargeSeen == fr.failNthCharge {
-			return ref.ReserveDecision{}, fmt.Errorf("flaky: injected charge failure")
+func (fr *foldCASRegistry) CASAbsenceCoverOwner(ctx context.Context, rawKey, expectedOwner string, expectedBytes int64, newOwner string) (bool, error) {
+	if newOwner == ref.AbsenceFoldedOwner {
+		if fr.hook != nil {
+			hook := fr.hook
+			fr.hook = nil
+			hook()
 		}
-	}
-	return fr.AbsenceRegistry.ReservePackBytes(ctx, group, packs, owner, usageFloor, floorGen, quotaBytes, ttl)
-}
-
-func (fr *foldFailRegistry) CASAbsenceCoverOwner(ctx context.Context, rawKey, expectedOwner string, expectedBytes int64, newOwner string) (bool, error) {
-	if fr.failMarkOnce && newOwner == ref.AbsenceFoldedOwner {
-		fr.failMarkOnce = false
-		return false, fmt.Errorf("flaky: injected mark failure")
+		if fr.failMarkOnce {
+			fr.failMarkOnce = false
+			return false, fmt.Errorf("flaky: injected mark failure")
+		}
 	}
 	return fr.AbsenceRegistry.CASAbsenceCoverOwner(ctx, rawKey, expectedOwner, expectedBytes, newOwner)
 }
 
-// TestAbsenceReconcile_PartialLegacyTransferRetryIdempotent (Codex round
-// 18, P1): the LFS-class charge lands but the packs-class charge fails —
-// the retry must re-charge the SAME recorded absolute targets, not add the
-// nonce to the LFS head a second time. Without the durable intent, every
-// retry of a partial transfer would re-add and a transient ledger error
-// could double the reservation each pass until quota admission wedged.
-func TestAbsenceReconcile_PartialLegacyTransferRetryIdempotent(t *testing.T) {
+// TestAbsenceReconcile_RechargeRaceLosesFoldCAS (Codex round 19, P1): an
+// old replica's periodic same-key TTL refresh re-charges the nonce
+// BETWEEN the renewal listing and the fold CAS — the refresh overwrites
+// owner (and may GREATEST-grow bytes), so the CAS must miss: the row is a
+// newer reliance, stays live under the bulk touch, and nothing is written
+// — the transfer designs this model replaced re-interpreted exactly this
+// refresh as fresh deficit and re-added it every pass. The next pass
+// re-proves and retires the refreshed row.
+func TestAbsenceReconcile_RechargeRaceLosesFoldCAS(t *testing.T) {
 	f := newSweepFixture(t)
 	ctx := context.Background()
-	base := "repo-partial-fold"
-	if err := ref.ReserveRestoreCover(ctx, absenceRegistry(t, f), blob.QuotaRepoGroup(base),
-		ref.AbsenceCoverPrefix+base+"/"+ref.NewReservationOwner(), 555, time.Hour); err != nil {
+	base := "repo-recharge-race"
+	legacyKey := ref.AbsenceCoverPrefix + base + "/" + ref.NewReservationOwner()
+	if err := ref.ReserveRestoreCover(ctx, absenceRegistry(t, f), blob.QuotaRepoGroup(base), legacyKey, 555, time.Hour); err != nil {
 		t.Fatalf("seed nonce: %v", err)
 	}
-	reg := &foldFailRegistry{AbsenceRegistry: absenceRegistry(t, f), failNthCharge: 2}
+	reg := &foldCASRegistry{AbsenceRegistry: absenceRegistry(t, f)}
+	reg.hook = func() {
+		// The old replica refreshes its nonce at a grown total.
+		if err := ref.ReserveRestoreCover(ctx, absenceRegistry(t, f), blob.QuotaRepoGroup(base), legacyKey, 700, time.Hour); err != nil {
+			t.Fatalf("re-charge nonce: %v", err)
+		}
+	}
 	r := NewAbsenceReconciler(reg, f.blobs, true, 1000, time.Hour, slog.New(slog.DiscardHandler))
-
-	renew := func() (*AbsenceReport, error) {
-		t.Helper()
-		errs := &boundedErrs{}
-		report := &AbsenceReport{}
-		r.loadState(ctx, errs)
-		r.renewCovers(ctx, 1000, report, newAbsencePassState(), errs)
-		return report, errs.join()
-	}
-	if _, err := renew(); err == nil {
-		t.Fatal("run 1: want the injected packs-charge failure reported")
-	}
-	head, ok, err := reg.AbsenceCoverHead(ctx, absenceIncarnationPrefix(base, absenceClassLFS), time.Hour)
-	if err != nil || !ok || head.Bytes != 555 {
-		t.Fatalf("lfs head after partial transfer = (%+v, %v, %v), want the single credit", head, ok, err)
-	}
-
-	report, err := renew()
+	report, err := r.Run(ctx)
 	if err != nil {
-		t.Fatalf("run 2: %v", err)
+		t.Fatalf("Run 1: %v", err)
+	}
+	if report.CoversDecaying != 0 {
+		t.Fatalf("pass 1 report = %+v, want the raced fold CAS to miss", report)
+	}
+	if got := ledgerReserved(t, f, base); got != 700 {
+		t.Fatalf("reserved = %d, want only the refreshed nonce (no head, no re-add)", got)
+	}
+
+	// Pass 2: no race — the refreshed row is re-proven and retired.
+	report, err = r.Run(ctx)
+	if err != nil {
+		t.Fatalf("Run 2: %v", err)
 	}
 	if report.CoversDecaying != 1 {
-		t.Fatalf("run 2 report = %+v, want the nonce transferred and decaying", report)
+		t.Fatalf("pass 2 report = %+v, want the refreshed nonce retired", report)
 	}
-	for _, class := range []string{absenceClassLFS, absenceClassPacks} {
-		head, ok, err := reg.AbsenceCoverHead(ctx, absenceIncarnationPrefix(base, class), time.Hour)
-		if err != nil || !ok || head.Bytes != 555 {
-			t.Fatalf("%s head after retry = (%+v, %v, %v), want the SAME single credit (no re-add)", class, head, ok, err)
-		}
+	if got := ledgerReserved(t, f, base); got != 700 {
+		t.Fatalf("reserved after pass 2 = %d, want unchanged", got)
 	}
 }
 
-// TestAbsenceReconcile_MarkFailureRetryIdempotent (Codex round 18, P1):
-// both class charges land but the final folded CAS fails — the retry must
-// leave the heads untouched (idempotent re-charges to the recorded
-// targets) and only redo the mark.
-func TestAbsenceReconcile_MarkFailureRetryIdempotent(t *testing.T) {
+// TestAbsenceReconcile_MarkFailureRetried (Codex rounds 18+19): a
+// transient error on the fold CAS leaves the nonce un-marked — still
+// live, still bulk-touched, nothing else written — and the next pass
+// simply re-proves and retires it. There is no partial state to repair:
+// retirement is a single CAS, never a byte transfer.
+func TestAbsenceReconcile_MarkFailureRetried(t *testing.T) {
 	f := newSweepFixture(t)
 	ctx := context.Background()
 	base := "repo-mark-fail"
@@ -1207,32 +1160,21 @@ func TestAbsenceReconcile_MarkFailureRetryIdempotent(t *testing.T) {
 		ref.AbsenceCoverPrefix+base+"/"+ref.NewReservationOwner(), 555, time.Hour); err != nil {
 		t.Fatalf("seed nonce: %v", err)
 	}
-	reg := &foldFailRegistry{AbsenceRegistry: absenceRegistry(t, f), failMarkOnce: true}
+	reg := &foldCASRegistry{AbsenceRegistry: absenceRegistry(t, f), failMarkOnce: true}
 	r := NewAbsenceReconciler(reg, f.blobs, true, 1000, time.Hour, slog.New(slog.DiscardHandler))
-
-	renew := func() (*AbsenceReport, error) {
-		t.Helper()
-		errs := &boundedErrs{}
-		report := &AbsenceReport{}
-		r.loadState(ctx, errs)
-		r.renewCovers(ctx, 1000, report, newAbsencePassState(), errs)
-		return report, errs.join()
-	}
-	if report, err := renew(); err == nil || report.CoversDecaying != 0 {
+	report, err := r.Run(ctx)
+	if err == nil || report.CoversDecaying != 0 {
 		t.Fatalf("run 1 = (%+v, %v), want the injected mark failure reported and no decay", report, err)
 	}
-	report, err := renew()
+	report, err = r.Run(ctx)
 	if err != nil {
 		t.Fatalf("run 2: %v", err)
 	}
 	if report.CoversDecaying != 1 {
 		t.Fatalf("run 2 report = %+v, want the nonce marked on retry", report)
 	}
-	for _, class := range []string{absenceClassLFS, absenceClassPacks} {
-		head, ok, err := reg.AbsenceCoverHead(ctx, absenceIncarnationPrefix(base, class), time.Hour)
-		if err != nil || !ok || head.Bytes != 555 {
-			t.Fatalf("%s head after mark retry = (%+v, %v, %v), want the SAME single credit", class, head, ok, err)
-		}
+	if got := ledgerReserved(t, f, base); got != 555 {
+		t.Fatalf("reserved = %d, want only the decaying nonce", got)
 	}
 }
 
@@ -1449,6 +1391,73 @@ func TestAbsenceReconcile_BulkTouchPrecedesListing(t *testing.T) {
 	}
 }
 
+// failTouchRegistry fails the pass-start bulk cover renewal once.
+type failTouchRegistry struct {
+	AbsenceRegistry
+	fail bool
+}
+
+func (ft *failTouchRegistry) RenewAbsenceCovers(ctx context.Context, ttl time.Duration) (int64, error) {
+	if ft.fail {
+		ft.fail = false
+		return 0, fmt.Errorf("flaky: injected bulk-renew failure")
+	}
+	return ft.AbsenceRegistry.RenewAbsenceCovers(ctx, ttl)
+}
+
+// TestAbsenceReconcile_TouchFailureSkipsCursorStamp (Codex round 19, P1):
+// a pass whose bulk cover renewal FAILED must not re-stamp the advanced
+// rotation cursors — the cursor row's fresh DB-clock age is loadState's
+// proof that the covers behind it were renewed within the pass timeout,
+// and re-stamping it without renewing would keep a fleet whose renewals
+// keep failing looking perpetually fresh while every cover ages toward
+// expiry. The rotation cursors stay parked at their previous rows; the
+// segment is merely re-examined next pass.
+func TestAbsenceReconcile_TouchFailureSkipsCursorStamp(t *testing.T) {
+	f := newSweepFixture(t)
+	ctx := context.Background()
+	base := "repo-touch-skip"
+	for i := byte(0); i < 6; i++ {
+		key := blob.LFSKey(base, absenceOID('a'+i))
+		registerLFS(t, f, base, key, 10)
+		f.upload(key, strings.Repeat("x", 10))
+	}
+	// Pass 1 parks the lfs cursor mid-keyspace.
+	pinLFSLeader(t, f)
+	r1 := testReconciler(t, f, true, 4)
+	if _, err := r1.Run(ctx); err != nil {
+		t.Fatalf("Run 1: %v", err)
+	}
+	store := absenceRegistry(t, f)
+	parked, ok, err := store.GetJobScanState(ctx, ref.ScanJobAbsence, ref.ScanScopeAbsenceLFS)
+	if err != nil || !ok || parked.Payload == "" {
+		t.Fatalf("parked cursor = (%+v, %v, %v)", parked, ok, err)
+	}
+
+	// Pass 2's bulk renewal fails: the rotation advances in memory but
+	// the durable cursor must stay at the pass-1 park.
+	reg := &failTouchRegistry{AbsenceRegistry: store, fail: true}
+	r2 := NewAbsenceReconciler(reg, f.blobs, true, 4, time.Hour, slog.New(slog.DiscardHandler))
+	report, err := r2.Run(ctx)
+	if err == nil || !report.RenewalIncomplete {
+		t.Fatalf("Run 2 = (%+v, %v), want the injected renewal failure reported", report, err)
+	}
+	after, ok, err := store.GetJobScanState(ctx, ref.ScanJobAbsence, ref.ScanScopeAbsenceLFS)
+	if err != nil || !ok || after.Payload != parked.Payload {
+		t.Fatalf("cursor after failed touch = (%+v, %v, %v), want the pass-1 park unchanged", after, ok, err)
+	}
+
+	// Control: a healthy pass re-stamps and advances the cursor.
+	r3 := testReconciler(t, f, true, 4)
+	if _, err := r3.Run(ctx); err != nil {
+		t.Fatalf("Run 3: %v", err)
+	}
+	after, ok, err = store.GetJobScanState(ctx, ref.ScanJobAbsence, ref.ScanScopeAbsenceLFS)
+	if err != nil || !ok || after.Payload == parked.Payload {
+		t.Fatalf("cursor after healthy pass = (%+v, %v, %v), want advanced", after, ok, err)
+	}
+}
+
 // TestAbsenceReconcile_ChargeFailureRetriedAtRangeEnd (Codex round 8, P1):
 // a transient charge failure on a range's last deficits leaves the running
 // total accumulated but UNCHARGED; the bounded range-end retry — forced
@@ -1473,11 +1482,13 @@ func TestAbsenceReconcile_ChargeFailureRetriedAtRangeEnd(t *testing.T) {
 	}
 }
 
-// TestAbsenceReconcile_FailedLegacyMigrationReoffered (Codex round 8, P1):
-// when one legacy cover can NEITHER fold nor renew, the renewal cursor
-// parks strictly before it — the next pass re-offers the nonce first
-// instead of letting it decay unprotected until the listing wraps.
-func TestAbsenceReconcile_FailedLegacyMigrationReoffered(t *testing.T) {
+// TestAbsenceReconcile_DirtyRangeDefersLegacyRetirement (Codex rounds
+// 8+19): a class whose range observation is DIRTY — here the deficit
+// charge fails at settle AND at the bounded range-end retry — yields no
+// ground-truth proof, so the base's legacy nonce must NOT retire this
+// pass: the packs-class gap proof alone is not enough, and the nonce
+// stays live under the bulk touch until a clean observation lands.
+func TestAbsenceReconcile_DirtyRangeDefersLegacyRetirement(t *testing.T) {
 	f := newSweepFixture(t)
 	ctx := context.Background()
 	base := "repo-flaky-legacy"
@@ -1487,35 +1498,35 @@ func TestAbsenceReconcile_FailedLegacyMigrationReoffered(t *testing.T) {
 		t.Fatalf("seed legacy cover: %v", err)
 	}
 
-	// Pass 1: the lfs transfer's mint fails (injected; the second
-	// injected failure lands on the rotation's own discovery charge).
-	// The renewal phase must abort parked BEFORE the nonce rather than
-	// skipping past it — the durable intent recorded before the charge
-	// makes the pass-2 retry idempotent, and the pass-start bulk touch
-	// keeps the nonce alive meanwhile.
+	// Pass 1: both injected failures land on the lfs deficit charge
+	// (settle, then the range-end retry) — the range stays dirty and
+	// unproven.
 	reg := &flakyRegistry{AbsenceRegistry: absenceRegistry(t, f), failLeft: 2}
 	r := NewAbsenceReconciler(reg, f.blobs, true, 1000, time.Hour, slog.New(slog.DiscardHandler))
 	report, err := r.Run(ctx)
 	if err == nil {
 		t.Fatal("Run 1: want the injected failures reported")
 	}
-	if !report.RenewalIncomplete || report.CoversDecaying != 0 || report.CoversRenewed != 0 {
-		t.Fatalf("pass 1 report = %+v, want renewal parked before the failed nonce", report)
+	if report.CoversDecaying != 0 {
+		t.Fatalf("pass 1 report = %+v, want retirement deferred on the dirty range", report)
+	}
+	if got := ledgerReserved(t, f, base); got != 555 {
+		t.Fatalf("reserved after pass 1 = %d, want only the live nonce", got)
 	}
 
 	// Pass 2 (fresh reconciler, same durable state — another replica):
-	// the parked cursor re-offers the nonce first; the migration folds
-	// it into both incarnations and the rotations right-size them.
+	// the clean observation charges the exact deficit into the lfs head,
+	// the packs gap proof completes the pair, and the nonce retires.
 	r2 := testReconciler(t, f, true, 1000)
 	report, err = r2.Run(ctx)
 	if err != nil {
 		t.Fatalf("Run 2: %v", err)
 	}
 	if report.CoversDecaying != 1 {
-		t.Fatalf("pass 2 report = %+v, want the re-offered nonce migrated and decaying", report)
+		t.Fatalf("pass 2 report = %+v, want the nonce retired after the clean proof", report)
 	}
 	if got := ledgerReserved(t, f, base); got != 555+100 {
-		t.Fatalf("reserved after pass 2 = %d, want the decaying nonce plus the right-sized lfs cover", got)
+		t.Fatalf("reserved after pass 2 = %d, want the decaying nonce plus the exact lfs cover", got)
 	}
 }
 

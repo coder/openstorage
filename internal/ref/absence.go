@@ -43,14 +43,13 @@ type AbsenceCoverRow struct {
 	// Bytes is the row's reserved size (GREATEST-pinned across charges).
 	Bytes int64
 	// Owner is the row's current owner column verbatim: a random
-	// reservation token, the AbsenceFoldedOwner sentinel, or the
-	// reconciler's durable fold-intent record (Codex round 18 on PR
-	// #132). Every re-charge overwrites it, so CAS on the listed value
-	// detects concurrent re-charges.
+	// reservation token or the AbsenceFoldedOwner sentinel (Codex
+	// rounds 18-19 on PR #132). Every re-charge overwrites it, so CAS
+	// on the listed value detects concurrent re-charges.
 	Owner string
-	// Folded reports the row carries the AbsenceFoldedOwner sentinel: its
-	// total is provably folded into the deterministic incarnations and no
-	// re-charge has arrived since (every re-charge overwrites owner).
+	// Folded reports the row carries the AbsenceFoldedOwner sentinel:
+	// both rotations proved the row redundant and no re-charge has
+	// arrived since (every re-charge overwrites owner).
 	// Meaningful for legacy nonce rows; deterministic rows read false.
 	Folded bool
 }
@@ -259,20 +258,21 @@ WHERE key COLLATE "C" > $1 AND key COLLATE "C" < $2
 }
 
 // AbsenceFoldedOwner is the sentinel owner the reconciler CASes onto a
-// legacy nonce cover once its total is provably transferred into both
-// deterministic incarnations: marked rows leave the bulk touch and decay
-// by TTL. Reservation owners are 32 hex chars (NewReservationOwner), so
-// the sentinel cannot collide, and every ReserveRestoreCover re-charge
+// legacy nonce cover once both registry rotations proved its base's true
+// deficits within one pass (the recomputed ground truth subsumes whatever
+// the nonce aggregated): marked rows leave the bulk touch and decay by
+// TTL. Reservation owners are 32 hex chars (NewReservationOwner), so the
+// sentinel cannot collide, and every ReserveRestoreCover re-charge
 // overwrites owner — an old replica re-charging its nonce un-marks it.
 const AbsenceFoldedOwner = "absence-folded"
 
 // CASAbsenceCoverOwner rewrites one legacy cover row's owner by its raw
 // reservation-row key, guarded on the (owner, bytes) the caller listed
-// (Codex round 18 on PR #132): every ReserveRestoreCover re-charge
+// (Codex rounds 18-19 on PR #132): every ReserveRestoreCover re-charge
 // overwrites owner and GREATEST-grows bytes, so a matched CAS proves no
-// re-charge landed between the listing and this write — the reconciler's
-// fold intents and the final folded sentinel must never clobber a newer
-// reliance. ok=false when the row vanished or drifted; nothing is written.
+// re-charge landed between the listing and this write — the folded
+// sentinel must never clobber a newer reliance. ok=false when the row
+// vanished or drifted; nothing is written.
 func (s *PG) CASAbsenceCoverOwner(ctx context.Context, rawKey, expectedOwner string, expectedBytes int64, newOwner string) (bool, error) {
 	assertf(strings.HasPrefix(rawKey, AbsenceCoverPrefix), "CASAbsenceCoverOwner(%q)", rawKey)
 	assertf(newOwner != "", "CASAbsenceCoverOwner(%q): empty new owner", rawKey)

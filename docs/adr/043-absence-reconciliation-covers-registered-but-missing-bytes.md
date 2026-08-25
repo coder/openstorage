@@ -51,8 +51,8 @@ are the durable tracking state (issue #125). The renewal phase runs FIRST
 each pass, in two steps (Codex round 9): a single DB-clock statement
 bulk-touches every live deterministic cover's TTL — so protection never
 depends on the keyset work below completing within the TTL — and then the
-keyset listing re-charges each row (byte re-pinning, legacy folds,
-superseded-row cleanup, the harvest). One work unit per row, entirely
+keyset listing re-charges each row (byte re-pinning, superseded-row
+cleanup, the cover and legacy-nonce harvest). One work unit per row, entirely
 database-derived, so any replica and any restart keeps every discovered
 loss covered without process memory; an incomplete listing can delay
 lifecycle work but cannot lapse a live cover. "Live" is
@@ -70,17 +70,17 @@ allowance regardless of the overrun (Codex round 14: the bulk touch keeps
 covers live, so a zero-allowance clamp would be an absorbing state where
 new losses stay uncovered forever; the pass wall clock bounds total work
 either way). Only the pass
-deadline — or a legacy cover that could NEITHER fold nor renew (Codex
-round 8) — cuts the listing short (`renewal_incomplete`), parked strictly
-before the unprotected row and resumed first next pass on the durable
-cursor.
+deadline or a listing failure cuts the listing short
+(`renewal_incomplete`), parked strictly before the first row whose
+renewal did not happen (Codex round 8) and resumed first next pass on the
+durable cursor.
 
 Aggregates stay exact through deterministic INCARNATION keys
 (`absence-lost/<base>/<class>-e<n>`, zero-padded): each full traversal of
 a base's row range recomputes its deficit total from scratch and grows the
 live incarnation in place — the charge is always the recomputed total,
 never `live + delta`, so crash replays over-cover transiently instead of
-compounding. When a traversal observed the WHOLE range with no stat
+compounding. When ONE PASS observed the WHOLE range with no stat
 or charge errors, a smaller total mints incarnation n+1 charged exactly
 and deletes the stale GREATEST-pinned row (mint first — never a coverage
 gap), and a zero total deletes the row outright. Deletes are safe because
@@ -89,9 +89,12 @@ serialize passes fleet-wide; incarnation numbers restart only after the
 previous row was deleted, so a stale GREATEST-pinned row can never be
 silently re-adopted (the round-6 counter hazard). The pending range parks
 WITH the durable cursor (base, started/dirty flags, running total), so a
-range spanning any number of budget-limited passes accumulates and
-evaluates exactly, and crash replays re-derive identical totals from the
-parked cursor; error-dirty ranges and traversals never shrink and never
+range spanning any number of budget-limited passes accumulates exactly
+for GROW charging, and crash replays re-derive identical totals from the
+parked cursor — but a RESUMED range never shrinks, releases, or proves a
+base (Codex round 19): rows settled in an earlier segment may have gone
+absent since, so those verdicts require a range observed start-to-end
+within one pass. Error-dirty ranges and traversals never shrink and never
 count as clean — but a dirty range whose running total went UNCHARGED
 (the charge itself failed) gets one bounded grow-only retry at range end,
 forced past the per-pass denial memo (Codex round 8): an under-counted
@@ -109,37 +112,34 @@ rotation leader alternates between the two registries each pass (durable
 parity), since a twin probe can overdraw the leader's allocation by a
 unit; a configuration floor (`MinAbsenceReconcileBudget`) keeps budgets
 out of single-row-overdraw territory. Legacy nonce-keyed covers minted by
-pre-#125 workers — at any point of a mixed-version roll — are MIGRATED on
-first sight: a pre-#125 cover aggregates BOTH classes' deficits with no
-class split, so its credit is transferred into BOTH of the base's
-deterministic class incarnations ADDITIVELY, head+nonce per class — never
-a GREATEST toward the largest nonce, because pre-#125 workers minted one
-nonce per replica/pass, several live nonces can cover DISJOINT deficits
-that admission sums, and a max-merge would leave at most max(nonces) per
-class once the marked rows decay (each class's own rotation right-sizes
-or row-less-releases its copy within one clean range observation, and the
-transient over-cover until then only tightens admission). The addition is
-retry-idempotent through a durable per-nonce intent (Codex round 18):
-before any charge, the absolute per-class targets are CASed into the
-nonce row's own owner column; the charges grow each class's current head
-to those recorded absolute totals (GREATEST — replaying the same total is
-a no-op), and a second CAS flips the owner to the folded sentinel, which
-starts TTL decay. Any mid-sequence failure retries against the recorded
-intent instead of re-adding — without it, a transient ledger error could
-double the reservation every pass until quota admission wedged. Both
-CASes are guarded on the listed (owner, bytes): every re-charge
-overwrites owner and grows bytes, so a CAS miss proves an old replica's
-concurrent re-charge, which wins — a re-charge is a new reliance, and the
-next visit recomputes fresh targets from the grown row. Un-folded nonces
-(including intent-marked ones) ride the pass-start bulk touch until their
-transfer completes (Codex round 15: a nonce minted just behind the cursor
-must not lapse before an upgraded worker ever folds it). Never deleted:
-an old replica may still depend on its own nonce rows mid-roll. The owner
-column is the SOLE fold state — no process-local memo: three review
-rounds broke memo variants the same way (an old replica's re-charge
-changed what the nonce means while the memo said "done"), and the folded
-sentinel closes the class because a marked row is exactly one with no
-reliance newer than its last proven transfer.
+pre-#125 workers — at any point of a mixed-version roll — are RETIRED on
+proof, never transferred: a pre-#125 cover aggregates BOTH classes'
+deficits with no class split, pre-#125 workers minted one nonce per
+replica/pass so several live nonces can compensate DISJOINT deficits that
+admission sums, and old replicas keep re-charging their own rows mid-roll
+— every transfer scheme tried (a GREATEST merge, then additive credits
+with durable intents; Codex rounds 4-19) re-interpreted an old worker's
+periodic same-key TTL refresh, which overwrites the row's owner, as new
+deficit and re-added it each pass toward a wedged admission. Instead each
+nonce row IS its own cover: it rides the pass-start bulk touch (Codex
+round 15: a nonce minted just behind the cursor must not lapse before the
+rotation ever reaches it) until BOTH classes prove its base within ONE
+pass — a clean single-pass start-to-end range observation recomputes the
+base's true deficit from the registry itself and charges it into the
+deterministic head, and a row-less keyset gap proves a zero deficit the
+same way — at which point the ground truth subsumes whatever the nonce
+aggregated and the folded sentinel is CAS'd into the row's owner column,
+guarded on the LISTED (owner, bytes): every re-charge overwrites owner
+and GREATEST-grows bytes, so a CAS miss proves a newer reliance arrived
+after the listing — it wins, the row stays live and bulk-touched, and a
+later pass re-proves. Marked rows leave the touch and decay by TTL; never
+deleted — an old replica may still depend on its own nonce rows mid-roll,
+and its re-charge overwrites the sentinel, making the row live again
+until re-proven. The owner column is the SOLE fold state — no
+process-local memo: three review rounds broke memo variants the same way
+(an old replica's re-charge changed what the nonce means while the memo
+said "done"), and the sentinel closes the class because a marked row is
+exactly one with no reliance newer than its last proof.
 
 Resolved residual (issue #125, with #121): the original design kept the
 known-absent set and rotation cursors in process memory, making refresh
