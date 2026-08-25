@@ -576,11 +576,11 @@ func TestAbsenceReconcile_MultiPassBaseRetiresLegacy(t *testing.T) {
 
 // TestAbsenceReconcile_OutOfPhaseClassProofsRetireLegacy (Codex round
 // 21, P1): the two class rotations traverse independent populations, so
-// their clean completions for one base need not coincide — half-proofs
-// persist (loadProofs/saveProofs) and completions trigger fresh
-// verification, so a multi-pass base in BOTH classes still retires its
-// nonce within a bounded number of passes (budget covers the combined
-// class rows, per the sizing rule).
+// their clean completions for one base need not coincide — fold
+// candidacies persist (loadProofs/saveProofs) and completions trigger
+// fresh verification, so a multi-pass base in BOTH classes still retires
+// its nonce within a bounded number of passes (budget covers the
+// combined class rows, per the sizing rule).
 func TestAbsenceReconcile_OutOfPhaseClassProofsRetireLegacy(t *testing.T) {
 	f := newSweepFixture(t)
 	ctx := context.Background()
@@ -687,7 +687,7 @@ func TestAbsenceReconcile_PersistedProofRetiresWithFreshVerification(t *testing.
 		}
 		gen += g
 	}
-	payload := fmt.Sprintf(`{"%s":{"%s":{"gen":%d,"age":9}}}`, base, absenceClassLFS, gen)
+	payload := fmt.Sprintf(`{"%s":{"%s":{"gen":%d}}}`, base, absenceClassLFS, gen)
 	if err := reg.PutJobScanState(ctx, ref.ScanJobAbsence, ref.ScanScopeAbsenceProofs, payload, 0); err != nil {
 		t.Fatal(err)
 	}
@@ -770,14 +770,13 @@ func TestAbsenceReconcile_GapLossCaughtByVerification(t *testing.T) {
 	}
 }
 
-// TestAbsenceReconcile_CombinedClassesExceedingPoolConverge (Codex round
-// 23, P1): a base whose combined class verification work exceeds the
-// per-pass pool must still converge — one class's fresh verification is
-// consumable for exactly one following pass (age-1, fence-checked across
-// its single gap), so the two verifications may land in adjacent passes
-// instead of demanding one pass fit both. Without that window, the
-// LFS-first fold order would drain the pool on the same class every pass
-// and the packs verification could never complete.
+// TestAbsenceReconcile_CombinedClassesExceedingPoolConverge (Codex
+// rounds 23-24): a base whose combined class verification work exceeds
+// the per-pass pool must still converge — whichever class goes fresh in
+// a pass persists a fold candidacy, and the fold re-stats the other
+// class run-to-completion past the pool once started (starts gate on a
+// non-exhausted pool). Without that, the fold order would drain the pool
+// on the same class every pass and the counterpart could never complete.
 func TestAbsenceReconcile_CombinedClassesExceedingPoolConverge(t *testing.T) {
 	f := newSweepFixture(t)
 	ctx := context.Background()
@@ -823,6 +822,84 @@ func TestAbsenceReconcile_CombinedClassesExceedingPoolConverge(t *testing.T) {
 	}
 	if got := ledgerReserved(t, f, base); got != 555 {
 		t.Fatalf("reserved = %d, want only the decaying nonce", got)
+	}
+}
+
+// TestAbsenceReconcile_StaleHintLossRechargeReverifiedAtFold (Codex
+// round 24, P1 + security): a persisted class candidacy spans a park gap
+// no DB fence can vouch for — out-of-band byte loss has no DB event, and
+// an old worker's nonce recharge before this pass's listing shows up as
+// ordinary liveness whose (owner, bytes) the fold CAS would match. The
+// fold must re-stat the hinted class FRESH: the re-stat observes the
+// loss and charges it into the deterministic head BEFORE the recharged
+// nonce may retire — never a retirement that leaves the loss
+// uncompensated (the pre-fix age shortcut folded without re-stat,
+// deflating the floor until the class rotation returned).
+func TestAbsenceReconcile_StaleHintLossRechargeReverifiedAtFold(t *testing.T) {
+	f := newSweepFixture(t)
+	ctx := context.Background()
+	base := "m-stale-hint"
+	reg := absenceRegistry(t, f)
+	// Filler sorting BEFORE the target: the pass's LFS rotation spends
+	// its whole allocation there and parks, so only the fold-time
+	// re-stat can observe the target this pass.
+	for i := byte(0); i < 10; i++ {
+		key := blob.LFSKey("a-filler", absenceOID('a'+i))
+		registerLFS(t, f, "a-filler", key, 10)
+		f.upload(key, strings.Repeat("x", 10))
+	}
+	for i := byte(0); i < 6; i++ {
+		key := blob.LFSKey(base, absenceOID('a'+i))
+		registerLFS(t, f, base, key, 10)
+		f.upload(key, strings.Repeat("x", 10))
+	}
+	legacyKey := ref.AbsenceCoverPrefix + base + "/" + ref.NewReservationOwner()
+	if err := ref.ReserveRestoreCover(ctx, reg, blob.QuotaRepoGroup(base), legacyKey, 555, time.Hour); err != nil {
+		t.Fatalf("seed nonce: %v", err)
+	}
+	// The old worker's recharge: a same-key TTL refresh at a grown
+	// total, overwriting owner — listed by this pass as ordinary
+	// liveness the fold CAS matches.
+	if err := ref.ReserveRestoreCover(ctx, reg, blob.QuotaRepoGroup(base), legacyKey, 700, time.Hour); err != nil {
+		t.Fatalf("recharge nonce: %v", err)
+	}
+	// The persisted candidacy from an earlier pass, fenced at the
+	// current group generation — the out-of-band loss below has no DB
+	// event, so the fence stays valid.
+	var gen int64
+	for _, repo := range blob.QuotaRepoGroup(base) {
+		g, err := reg.LFSAdoptionGen(ctx, repo)
+		if err != nil {
+			t.Fatal(err)
+		}
+		gen += g
+	}
+	payload := fmt.Sprintf(`{"%s":{"%s":{"gen":%d}}}`, base, absenceClassLFS, gen)
+	if err := reg.PutJobScanState(ctx, ref.ScanJobAbsence, ref.ScanScopeAbsenceProofs, payload, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.blobs.Delete(ctx, blob.LFSKey(base, absenceOID('b'))); err != nil {
+		t.Fatal(err)
+	}
+
+	// One pass: the LFS rotation parks inside the filler (never reaching
+	// the target), the target's packs proof is a fresh row-less gap, and
+	// the candidacy schedules the fold-time LFS re-stat — which observes
+	// the loss and covers it before the recharged nonce retires.
+	pinLFSLeader(t, f)
+	worker := testReconciler(t, f, true, 12)
+	report, err := worker.Run(ctx)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if report.LFSRowsAbsent == 0 || report.RowsVerified < 6 {
+		t.Fatalf("report = %+v, want the loss observed by the fold-time re-stat, never trusted from the hint", report)
+	}
+	if report.CoversDecaying != 1 {
+		t.Fatalf("report = %+v, want the recharged nonce retired only WITH the loss covered", report)
+	}
+	if got := ledgerReserved(t, f, base); got != 700+10 {
+		t.Fatalf("reserved = %d, want the decaying nonce plus the fresh loss cover", got)
 	}
 }
 

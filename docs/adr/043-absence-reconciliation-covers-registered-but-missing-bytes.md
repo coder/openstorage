@@ -154,7 +154,14 @@ therefore WAITS durably as a TRIGGER (one bounded `job_scan_state` row
 keyed by base and class) under the same generation fence — re-validated
 at every pass start before the pass's own bumps, dropped on any
 parked-gap mutation — until its counterpart lands, and consuming it for
-retirement re-verifies that class fresh at fold time. With both fresh
+retirement re-verifies that class fresh at fold time (never trusted
+directly, whatever its age: the parked gap it spans is invisible to any
+DB fence — out-of-band loss has no DB event and an old worker's nonce
+re-charge lists as ordinary liveness; Codex rounds 23-24). Fold-time
+re-verification runs each started candidate base to completion past the
+shared verification pool — starts gate on a non-exhausted pool, bounding
+the overshoot to one base's rows — so a base whose combined class rows
+outgrow one pass's pool still converges. With both fresh
 proofs in hand the ground truth subsumes whatever the nonce
 aggregated and the folded sentinel is CAS'd into the row's owner column,
 guarded on the LISTED (owner, bytes): every re-charge overwrites owner

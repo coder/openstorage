@@ -313,35 +313,33 @@ type AbsenceReconciler struct {
 	// their bases for the endRange verification relevance gate.
 	legacyRows  []ref.AbsenceCoverRow
 	legacyBases map[string]bool
-	// cleanBases[class][base] records that class holds a clean proof
-	// for base THIS PASS: a fence-continuous start-to-end range
-	// observation with no stat/charge errors — single-pass, or resumed
-	// with the base group's mutation fence verified across every park
-	// gap (Codex rounds 19-20) — a row-less keyset gap, or a PERSISTED
-	// proof from an earlier pass whose fence still holds (Codex round
-	// 21: the two classes traverse independent populations, so their
-	// completions for one base can stay out of phase indefinitely — a
-	// half-proof waits under the same generation fence until its
-	// counterpart lands). Retirement needs both classes in one map.
+	// cleanBases[class][base] records that class holds SAME-PASS
+	// storage-visible evidence for base: a fence-continuous
+	// start-to-end range observation with no stat/charge errors —
+	// single-pass only (Codex rounds 19-20) — a row-less keyset gap,
+	// or a fresh verifyAndJudge re-observation completed THIS pass.
+	// Nothing persisted or resumed lands here directly: evidence older
+	// than this pass spans a park gap where out-of-band byte loss has
+	// no DB event, so no fence can vouch for it (Codex round 24).
+	// Retirement needs both classes in one map, same pass.
 	cleanBases map[string]map[string]bool
-	// proofGens[base][class] is the surviving persisted half-proof set
-	// loaded (and fence-validated) this pass, with each entry's age in
-	// passes since its class's evidence was FRESH. An age-1 entry —
-	// written by the immediately preceding pass's fresh observation or
-	// verification, fence-checked across its single park gap — is
-	// consumable for retirement directly (Codex round 23: without this
-	// one-gap window, a base whose combined class verification exceeds
-	// the pool would re-verify one class every pass and never complete
-	// the other). Older entries are TRIGGERS only: consuming one first
-	// re-verifies the class fresh (verifyAndJudge, which deletes the
-	// entry via markCleanBase on success). Also the retention source
-	// for saveState when an incomplete renewal listing leaves
-	// legacyRows non-authoritative.
+	// proofGens[base][class] is the surviving persisted candidacy set
+	// loaded (and fence-validated) this pass. Entries are SCHEDULING
+	// HINTS only (Codex round 24): a hint nominates its class for
+	// commitment-time re-verification at fold, and is never itself
+	// evidence — verifyAndJudge deletes it via markCleanBase when the
+	// fresh re-observation succeeds. Also the retention source for
+	// saveState when an incomplete renewal listing leaves legacyRows
+	// non-authoritative.
 	proofGens map[string]map[string]absenceProofEntry
 	// verifyPool bounds the pass's total fresh-verification work (one
 	// budget's worth, shared by every verifyAndJudge): verification is
 	// per-verdict full-base work, so without a pool a pass completing
-	// many small ranges could multiply its row budget.
+	// many small ranges could multiply its row budget. Fold-phase
+	// verification may overshoot it by at most one base's combined
+	// class rows (run-to-completion, Codex rounds 23+24): an exhausted
+	// pool blocks further base starts but never abandons a started
+	// fold candidate mid-verification.
 	verifyPool int64
 	// touchFailed records that this pass's bulk cover renewal FAILED:
 	// the rotation cursors must not be re-stamped by saveState (Codex
@@ -624,17 +622,21 @@ func (r *AbsenceReconciler) loadState(ctx context.Context, errs *boundedErrs) {
 	r.loadProofs(ctx, errs)
 }
 
-// loadProofs restores persisted per-class half-proofs (Codex round 21):
-// a class's fenced proof for a base waits durably until the counterpart
-// class completes — their rotations traverse independent populations and
-// can stay out of phase indefinitely, so requiring both to land in one
-// pass would leave both-class-large bases permanently unprovable. Each
-// entry re-validates against the CURRENT group generation at pass start,
-// before this pass makes any bump of its own: the persisted gen was
-// snapshotted at a previous pass's end, so a mismatch proves a foreign
-// mutation landed in between and the half-proof is dropped (re-proven by
-// a later traversal). Surviving entries seed cleanBases exactly like
-// proofs completed this pass.
+// loadProofs restores persisted per-class fold candidacies (Codex rounds
+// 21+24): a class's fenced completion for a base waits durably until the
+// counterpart class completes — their rotations traverse independent
+// populations and can stay out of phase indefinitely, so requiring both
+// to land in one pass would leave both-class-large bases permanently
+// unprovable. Each entry re-validates against the CURRENT group
+// generation at pass start, before this pass makes any bump of its own:
+// the persisted gen was snapshotted at a previous pass's end, so a
+// mismatch proves a foreign mutation landed in between and the candidacy
+// is dropped (re-proven by a later traversal). Surviving entries are
+// scheduling hints ONLY — they never seed cleanBases, because the park
+// gap they span is invisible to any DB fence (out-of-band byte loss has
+// no DB event, and an old worker's nonce recharge lists as ordinary
+// liveness): fold re-stats every hinted class fresh before retiring
+// anything.
 func (r *AbsenceReconciler) loadProofs(ctx context.Context, errs *boundedErrs) {
 	if !r.quotaEnforced {
 		return
@@ -671,33 +673,22 @@ func (r *AbsenceReconciler) loadProofs(ctx context.Context, errs *boundedErrs) {
 					"base", base, "class", class, "reason", "base group mutated since the proof")
 				continue
 			}
-			r.cleanBases[class][base] = true
 			if r.proofGens[base] == nil {
 				r.proofGens[base] = make(map[string]absenceProofEntry)
 			}
-			// One pass boundary was just crossed since the entry was
-			// written: age it at load.
-			age := entry.Age + 1
-			if age > absenceProofMaxAge {
-				age = absenceProofMaxAge
-			}
-			r.proofGens[base][class] = absenceProofEntry{Gen: entry.Gen, Age: age}
+			r.proofGens[base][class] = absenceProofEntry{Gen: entry.Gen}
 		}
 	}
 }
 
-// absenceProofEntry is one persisted (base, class) proof: the group
-// generation it was fenced at, and its age in passes since the class's
-// evidence was FRESH (0 = written by the very pass that observed or
-// verified the class). loadProofs increments the age; fold consumes
-// age-1 entries directly and re-verifies anything older.
+// absenceProofEntry is one persisted (base, class) fold candidacy: the
+// group generation the class's evidence was fenced at. It schedules a
+// commitment-time fresh re-verification and is never itself evidence
+// (Codex round 24) — the fence bounds retention (a mutated group evicts
+// the hint at load), not trust.
 type absenceProofEntry struct {
 	Gen int64 `json:"gen"`
-	Age int   `json:"age,omitempty"`
 }
-
-// absenceProofMaxAge saturates entry aging (only "1" vs "older" matters).
-const absenceProofMaxAge = 9
 
 // saveState parks the durable cursors on a bounded DETACHED context: the
 // pass regularly ends by burning its own deadline, and losing the park
@@ -753,16 +744,20 @@ func (r *AbsenceReconciler) saveState(ctx context.Context, errs *boundedErrs) {
 // byte-largest bases (loudly) — strictly a retirement deferral.
 const absenceProofCap = 512
 
-// saveProofs persists per-base half-proofs for the next pass (Codex
-// round 21): every base with an un-folded legacy nonce recorded this
-// pass whose proof completed in exactly ONE class carries that class's
-// proof forward under a fresh fence snapshot — read here, after every
-// bump this pass made, so the next pass's load-time validation covers
-// exactly the parked gap. Bases whose BOTH proofs landed were folded
-// this pass (a CAS miss means a re-charge won: it must re-prove from
-// scratch), and bases with no live nonce need no proof. When the renewal
-// listing did not complete, this pass's legacyRows are not authoritative
-// — previously persisted bases are retained rather than dropped blind.
+// saveProofs persists per-base fold candidacies for the next pass (Codex
+// rounds 21+24): every base with an un-folded legacy nonce recorded this
+// pass carries forward each class holding either FRESH same-pass
+// evidence (under a fence snapshot read here, after every bump this pass
+// made, so the next pass's load-time validation covers exactly the
+// parked gap) or a surviving seeded hint (under its ORIGINAL fence, so a
+// bump this pass made evicts it at the next load). Candidacies only
+// schedule commitment-time re-verification — fold re-stats every hinted
+// class before retiring anything. Bases whose fold succeeded still
+// persist (the entry evicts next pass with the listing); a CAS miss
+// means a re-charge won and the re-stat repeats. Bases with no live
+// nonce need no candidacy. When the renewal listing did not complete,
+// this pass's legacyRows are not authoritative — previously persisted
+// bases are retained rather than dropped blind.
 func (r *AbsenceReconciler) saveProofs(sctx context.Context, errs *boundedErrs) {
 	if !r.quotaEnforced {
 		return
@@ -778,37 +773,32 @@ func (r *AbsenceReconciler) saveProofs(sctx context.Context, errs *boundedErrs) 
 	}
 	keep := make(map[string]map[string]absenceProofEntry)
 	for base := range bases {
-		lfsClean, packsClean := r.cleanBases[absenceClassLFS][base], r.cleanBases[absenceClassPacks][base]
-		if !lfsClean && !packsClean {
+		fresh := make([]string, 0, 2)
+		entry := make(map[string]absenceProofEntry, 2)
+		for _, class := range []string{absenceClassLFS, absenceClassPacks} {
+			if r.cleanBases[class][base] {
+				fresh = append(fresh, class)
+			} else if seeded, ok := r.proofGens[base][class]; ok {
+				entry[class] = seeded
+			}
+		}
+		if len(fresh) == 0 && len(entry) == 0 {
 			continue // nothing to carry
 		}
 		if len(keep) >= absenceProofCap {
-			r.logger.Warn("absence reconcile: half-proof cap exceeded; excess proofs dropped",
+			r.logger.Warn("absence reconcile: candidacy cap exceeded; excess entries dropped",
 				"cap", absenceProofCap)
 			break
 		}
-		gen, err := r.rangeFence(sctx, base)
-		if err != nil {
-			errs.add(fmt.Errorf("absence reconcile: snapshot proof fence for %s: %w", base, err))
-			continue
-		}
-		// Both-clean bases persist BOTH halves: their fold either
-		// consumed the nonces (the entry evicts next pass with the
-		// listing) or deferred (verification pool/CAS), and dropping
-		// the halves would discard the convergence progress. A class
-		// whose evidence is FRESH this pass (observed or verified —
-		// nothing seeded survives for it) writes age 0; a surviving
-		// seeded entry carries its load-time age forward.
-		entry := make(map[string]absenceProofEntry, 2)
-		for _, class := range []string{absenceClassLFS, absenceClassPacks} {
-			if !r.cleanBases[class][base] {
+		if len(fresh) > 0 {
+			gen, err := r.rangeFence(sctx, base)
+			if err != nil {
+				errs.add(fmt.Errorf("absence reconcile: snapshot proof fence for %s: %w", base, err))
 				continue
 			}
-			age := 0
-			if seeded, ok := r.proofGens[base][class]; ok {
-				age = seeded.Age
+			for _, class := range fresh {
+				entry[class] = absenceProofEntry{Gen: gen}
 			}
-			entry[class] = absenceProofEntry{Gen: gen, Age: age}
 		}
 		keep[base] = entry
 	}
@@ -1114,48 +1104,65 @@ func (r *AbsenceReconciler) recordLegacyCover(row *ref.AbsenceCoverRow, report *
 // old-replica re-charge overwrites owner and GREATEST-grows bytes, so a
 // CAS miss proves a newer reliance arrived after the listing — it wins,
 // the row stays live (bulk-touched), and a later pass re-proves.
-// Multi-pass observations count exactly when the base group's mutation
-// fence held across every park gap (round 20, P1: a base larger than one
-// pass's class allowance can only ever complete resumed); a broken fence
-// taints the range and the retirement waits for the next traversal. A
-// completed class proof WAITS for its out-of-phase counterpart under the
-// same fence, persisted across passes (round 21, P1; see loadProofs).
+// Both classes' evidence must be storage-visible from THIS pass (round
+// 24: a persisted or resumed total spans a park gap no DB fence can
+// vouch for) — a class completed in an earlier pass persists only a fold
+// CANDIDACY (round 21, P1; see loadProofs) that is re-statted fresh here
+// before anything retires, run-to-completion per started base so bases
+// whose combined class rows outgrow the verification pool still converge
+// (round 23, P1).
 func (r *AbsenceReconciler) foldRedundantLegacy(ctx context.Context, report *AbsenceReport, st *absencePassState, errs *boundedErrs) {
 	attempted := make(map[string]bool)
+	started := false
 	for i := range r.legacyRows {
 		row := &r.legacyRows[i]
-		if !r.cleanBases[absenceClassLFS][row.Base] || !r.cleanBases[absenceClassPacks][row.Base] {
-			continue // no completed double proof yet: stays live, retried later
-		}
-		// Persisted half-proofs older than one pass are triggers only
-		// (Codex round 21, security): each such class is re-verified
-		// FRESH before it may retire anything — success supersedes the
-		// entry (markCleanBase); a deferred or dirty verification
-		// leaves it, and the nonce stays live. An AGE-1 entry — the
-		// immediately preceding pass's fresh evidence, fence-checked
-		// across its single gap — consumes directly (Codex round 23:
-		// re-verifying it here would let a base whose combined class
-		// verification exceeds the pool livelock, one class draining
-		// the pool every pass while the other never completes).
-		stale := false
+		// Candidacy: each class needs SAME-PASS storage-visible
+		// evidence (cleanBases) or a persisted scheduling hint. A hint
+		// is never evidence (Codex round 24): the park gap it spans is
+		// invisible to any DB fence — out-of-band byte loss has no DB
+		// event, and an old worker's nonce recharge before this pass's
+		// listing lists as ordinary liveness the fold CAS would match.
+		need := make([]string, 0, 2)
+		eligible := true
 		for _, class := range []string{absenceClassLFS, absenceClassPacks} {
-			entry, persisted := r.proofGens[row.Base][class]
-			if !persisted || entry.Age <= 1 {
+			if r.cleanBases[class][row.Base] {
 				continue
 			}
-			if key := row.Base + "\x00" + class; !attempted[key] {
-				attempted[key] = true
-				r.verifyAndJudge(ctx, row.Base, class, report, st, errs)
+			if _, hint := r.proofGens[row.Base][class]; !hint {
+				eligible = false
+				break
 			}
-			if e, still := r.proofGens[row.Base][class]; still && e.Age > 1 {
-				stale = true
+			if !attempted[row.Base+"\x00"+class] {
+				need = append(need, class)
 			}
 		}
-		if stale {
-			continue
+		if !eligible {
+			continue // no complete candidacy yet: stays live, retried later
 		}
 		if st.purged[row.Base] {
 			continue // the purge pipeline owns the base's rows
+		}
+		// Commitment-time evidence: every hinted class is re-statted
+		// NOW, all-or-nothing per base and run-to-completion once
+		// started — an exhausted pool blocks further base STARTS but
+		// never abandons a started candidate, so each pass completes
+		// at least its first candidate even when the base's combined
+		// class rows outgrow the pool (Codex round 23) and rotation-
+		// triggered verification cannot starve the fold path. Success
+		// lands in cleanBases (markCleanBase); a dirty or failed
+		// re-stat leaves the nonce live for a later pass.
+		if len(need) > 0 {
+			if started && r.verifyPool <= 0 {
+				continue // pool exhausted: deferred, candidacy persists
+			}
+			started = true
+			for _, class := range need {
+				attempted[row.Base+"\x00"+class] = true
+				r.verifyAndJudge(ctx, row.Base, class, true, report, st, errs)
+			}
+		}
+		if !r.cleanBases[absenceClassLFS][row.Base] || !r.cleanBases[absenceClassPacks][row.Base] {
+			continue // re-stat dirty, failed, or deferred: stays live
 		}
 		cas, err := r.registry.CASAbsenceCoverOwner(ctx, row.RawKey, row.Owner, row.Bytes, ref.AbsenceFoldedOwner)
 		if err != nil {
@@ -1463,15 +1470,19 @@ func (r *AbsenceReconciler) packPhase(ctx context.Context, budget int64, report 
 // per row, exactly the evidence a single-pass range observation yields —
 // and applies the range verdicts (markCleanBase, shrink, release) from
 // that observation alone (Codex round 21, security). Resumed completions
-// and persisted half-proofs are only TRIGGERS: their accumulated totals
-// span park gaps where out-of-band byte loss is invisible to any DB
-// fence, so compensation is never relaxed from them directly. The work
-// draws on the shared per-pass verification pool (one budget's worth):
-// a class whose base outgrows the pool defers its verdicts LOUDLY — the
-// operator sizes CODESTORAGE_ABSENCE_RECONCILE_BUDGET so the largest
-// base's combined class rows fit — and its covers stay protectively
-// oversized meanwhile, strictly the conservative direction.
-func (r *AbsenceReconciler) verifyAndJudge(ctx context.Context, base, class string, report *AbsenceReport, st *absencePassState, errs *boundedErrs) {
+// and persisted fold candidacies are only TRIGGERS: their accumulated
+// totals span park gaps where out-of-band byte loss is invisible to any
+// DB fence, so compensation is never relaxed from them directly. The
+// work draws on the shared per-pass verification pool (one budget's
+// worth). Without runToCompletion (rotation-triggered), a class whose
+// base outgrows the pool defers its verdicts LOUDLY — the operator sizes
+// CODESTORAGE_ABSENCE_RECONCILE_BUDGET so the largest base's combined
+// class rows fit — and its covers stay protectively oversized meanwhile,
+// strictly the conservative direction. With runToCompletion (fold
+// commitment, Codex rounds 23+24), the verification still charges the
+// pool but never aborts on exhaustion: the caller bounds the overshoot
+// to one base by gating STARTS on a non-exhausted pool.
+func (r *AbsenceReconciler) verifyAndJudge(ctx context.Context, base, class string, runToCompletion bool, report *AbsenceReport, st *absencePassState, errs *boundedErrs) {
 	assertf(base != "" && (class == absenceClassLFS || class == absenceClassPacks),
 		"verifyAndJudge(%q, %q)", base, class)
 	vtr := rangeTracker{class: class, base: base, started: true}
@@ -1484,12 +1495,16 @@ func (r *AbsenceReconciler) verifyAndJudge(ctx context.Context, base, class stri
 			errs.add(ctx.Err())
 			return
 		}
-		if r.verifyPool <= 0 {
-			r.logger.Warn("absence reconcile: verification pool exhausted — verdict deferred; raise CODESTORAGE_ABSENCE_RECONCILE_BUDGET above the largest base's combined class rows if persistent",
-				"base", base, "class", class)
-			return
+		remaining := int64(absencePageSize)
+		if !runToCompletion {
+			if r.verifyPool <= 0 {
+				r.logger.Warn("absence reconcile: verification pool exhausted — verdict deferred; raise CODESTORAGE_ABSENCE_RECONCILE_BUDGET above the largest base's combined class rows if persistent",
+					"base", base, "class", class)
+				return
+			}
+			remaining = r.verifyPool
 		}
-		repos, keys, settle, err := r.classPage(ctx, class, &vtr, afterRepo, afterKey, r.pageLimit(r.verifyPool), report, st, errs)
+		repos, keys, settle, err := r.classPage(ctx, class, &vtr, afterRepo, afterKey, r.pageLimit(remaining), report, st, errs)
 		if err != nil {
 			errs.add(fmt.Errorf("absence reconcile: verify %s/%s: %w", base, class, err))
 			return
@@ -1507,7 +1522,7 @@ func (r *AbsenceReconciler) verifyAndJudge(ctx context.Context, base, class stri
 				errs.add(ctx.Err())
 				return
 			}
-			if r.verifyPool <= 0 {
+			if !runToCompletion && r.verifyPool <= 0 {
 				r.logger.Warn("absence reconcile: verification pool exhausted — verdict deferred; raise CODESTORAGE_ABSENCE_RECONCILE_BUDGET above the largest base's combined class rows if persistent",
 					"base", base, "class", class)
 				return
@@ -1598,7 +1613,7 @@ func (r *AbsenceReconciler) endRange(ctx context.Context, tr *rangeTracker, repo
 		// not drain the verification pool.
 		head, ok := r.resolveHead(ctx, base, class, st, errs)
 		if (ok && head.key != "") || r.legacyBases[base] {
-			r.verifyAndJudge(ctx, base, class, report, st, errs)
+			r.verifyAndJudge(ctx, base, class, false, report, st, errs)
 		}
 		return
 	}
