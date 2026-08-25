@@ -38,6 +38,7 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -189,6 +190,20 @@ func startMinIOLegacy(tb testing.TB) (endpoint, user, pass string) {
 	return "http://" + addr, minioC.Username, minioC.Password
 }
 
+// harnessHTTPClient is shared by every harness S3 client. The SDK default
+// transport keeps only a handful of idle connections per host; the 60 s
+// contention campaign (writers=32, CODESTORAGE_BENCH_CONTENTION_SECS=60)
+// churns thousands of short-lived connections through one endpoint, piling
+// up TIME_WAIT sockets until the kernel runs out of ephemeral ports and
+// dials fail pre-send with "connect: cannot assign requested address".
+// Pooling well above the maximum harness concurrency keeps connections
+// reused instead of recreated. (casobj.New derives its no-retry client from
+// Options(), so the pooled client propagates to CAS calls too.)
+var harnessHTTPClient = awshttp.NewBuildableClient().WithTransportOptions(func(t *http.Transport) {
+	t.MaxIdleConns = 256
+	t.MaxIdleConnsPerHost = 256
+})
+
 // rawS3Client builds a path-style SigV4 client with static credentials —
 // the same wiring shape as internal/blob's s3ClientOptions, but with
 // explicit credentials so container lanes never depend on process env.
@@ -197,6 +212,7 @@ func rawS3Client(tb testing.TB, endpoint, region, accessKey, secretKey string) *
 	cfg := aws.Config{
 		Region:      region,
 		Credentials: credentials.NewStaticCredentialsProvider(accessKey, secretKey, ""),
+		HTTPClient:  harnessHTTPClient,
 	}
 	return s3.NewFromConfig(cfg, func(o *s3.Options) {
 		o.BaseEndpoint = aws.String(endpoint)
@@ -257,7 +273,7 @@ func openExternalS3(tb testing.TB, blobURL string) (*s3.Client, string) {
 	if region == "" {
 		region = "us-east-1"
 	}
-	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(region))
+	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(region), config.WithHTTPClient(harnessHTTPClient))
 	if err != nil {
 		tb.Fatalf("aws config: %v", err)
 	}
