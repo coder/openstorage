@@ -947,6 +947,10 @@ func runContentionWindow(tb testing.TB, cas *Client, key string, writers int, wi
 	var wg sync.WaitGroup
 	for range writers {
 		wg.Add(1)
+		// Per-writer client: the read-side seq assert is session-scoped
+		// (casobj.go DecodeSeq), and concurrent writers sharing one Client
+		// would trip it on benign response reordering.
+		wcas := perSessionClient(cas)
 		go func() {
 			defer wg.Done()
 			var (
@@ -957,7 +961,7 @@ func runContentionWindow(tb testing.TB, cas *Client, key string, writers int, wi
 			)
 			lastSuccess := start
 			reRead := func() (Object, bool) {
-				obj, err := cas.Get(ctx, key)
+				obj, err := wcas.Get(ctx, key)
 				if err != nil {
 					tb.Errorf("contention: re-read %s: %v", key, err)
 					return Object{}, false
@@ -977,7 +981,7 @@ func runContentionWindow(tb testing.TB, cas *Client, key string, writers int, wi
 				nonce := newNonce(tb)
 				next := encodePayloadNonce(tb, p.Seq+1, nonce, payloadSize)
 				t0 := time.Now()
-				newETag, err := cas.Advance(ctx, key, next, obj.ETag)
+				newETag, err := wcas.Advance(ctx, key, next, obj.ETag)
 				switch {
 				case err == nil:
 					now := time.Now()
@@ -1010,7 +1014,7 @@ func runContentionWindow(tb testing.TB, cas *Client, key string, writers int, wi
 					}
 				}
 			}
-			maxStarve = max(maxStarve, time.Now().Sub(lastSuccess))
+			maxStarve = max(maxStarve, time.Since(lastSuccess))
 			mu.Lock()
 			res.latencies = append(res.latencies, localLat...)
 			transitions = append(transitions, localTrans...)
@@ -1034,6 +1038,21 @@ func runContentionWindow(tb testing.TB, cas *Client, key string, writers int, wi
 	}
 	verifyTransitions(tb, initialSeq, fp.Seq, fp.Nonce, transitions, res.ambiguous)
 	return res
+}
+
+// perSessionClient derives a Client sharing c's transport, bucket, backoff
+// and decoder but with its own session-scoped seq map (see the DecodeSeq
+// doc: the read-side assert is sound only per sequential session).
+func perSessionClient(c *Client) *Client {
+	assertf(c != nil, "perSessionClient: nil client")
+	return &Client{
+		s3:          c.s3,
+		bucket:      c.bucket,
+		backoffBase: c.backoffBase,
+		backoffCap:  c.backoffCap,
+		maxAttempts: c.maxAttempts,
+		DecodeSeq:   c.DecodeSeq,
+	}
 }
 
 // verifyTransitions is the lost-update detector shared by the S3 and SQLite

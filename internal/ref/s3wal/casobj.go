@@ -105,6 +105,14 @@ type Client struct {
 	// assert: a per-key seq regression means the store served a stale read —
 	// fail loudly. Phase 1b plugs in the manifest decoder; Phase 1a tests
 	// and benches decode their {seq, nonce} payloads.
+	//
+	// The assert is SESSION-scoped: it compares reads made through this
+	// Client, which processes responses sequentially per caller. Two
+	// goroutines sharing one Client can legitimately process responses out
+	// of store-serialization order (an older read's response arriving after
+	// a newer read's — benign reordering, not store staleness), so give
+	// each concurrent reader of a hot key its own Client. Phase 1b must
+	// keep this in mind when sharing a Client across request handlers.
 	DecodeSeq func(body []byte) (seq int64, ok bool)
 
 	seqMu   sync.Mutex
