@@ -155,14 +155,26 @@ type AbsenceReport struct {
 	// total came in below its live row, so a fresh incarnation charged
 	// the exact total and the stale row was deleted.
 	CoversRotated int64 `json:"covers_rotated"`
-	// CoversReleased counts cover rows DELETED: fully healed bases,
-	// superseded incarnations left by crashes, and retired legacy
-	// spellings.
+	// CoversReleased counts cover rows DELETED: fully healed bases and
+	// superseded incarnations left by crashes.
 	CoversReleased int64 `json:"covers_released"`
-	// RenewalIncomplete reports the renewal listing outran its budget
-	// half: un-renewed rows renew round-robin on later passes, and the
-	// budget should be raised so every cover renews every pass.
+	// CoversDecaying counts listed legacy (pre-#125 nonce-keyed) covers
+	// left to expire by TTL once both registries completed a clean
+	// traversal: never deleted — a not-yet-upgraded replica may still
+	// depend on them mid-roll.
+	CoversDecaying int64 `json:"covers_decaying"`
+	// RenewalIncomplete reports the renewal listing was cut short by the
+	// pass deadline (never by budget): un-renewed rows resume first on
+	// the durable cursor next pass. Investigate the blob store or ledger
+	// if persistent — covers lapse if renewals cannot land within the
+	// TTL.
 	RenewalIncomplete bool `json:"renewal_incomplete"`
+	// RenewalOverBudget reports renewal charged more than its soft
+	// allocation (half the budget): every live cover still renewed —
+	// renewal is the correctness core and never lapses on budget — but
+	// discovery was starved this pass. Raise the budget above twice the
+	// live cover population.
+	RenewalOverBudget bool `json:"renewal_over_budget"`
 	// LFSTraversals/PacksTraversals are the classes' completed rotation
 	// counts (durable bookkeeping, useful for tracking convergence).
 	LFSTraversals  int64 `json:"lfs_traversals"`
@@ -481,7 +493,9 @@ func (r *AbsenceReconciler) Run(ctx context.Context) (AbsenceReport, error) {
 		"covers_renewed", report.CoversRenewed,
 		"covers_rotated", report.CoversRotated,
 		"covers_released", report.CoversReleased,
+		"covers_decaying", report.CoversDecaying,
 		"renewal_incomplete", report.RenewalIncomplete,
+		"renewal_over_budget", report.RenewalOverBudget,
 		"lfs_traversals", report.LFSTraversals,
 		"pack_traversals", report.PackTraversals,
 		"quota_enforced", report.QuotaEnforced)
@@ -493,8 +507,16 @@ func (r *AbsenceReconciler) Run(ctx context.Context) (AbsenceReport, error) {
 // durable state, so ANY replica keeps every aggregate alive (issue #125).
 // Superseded lower incarnations (crash leftovers) are deleted; legacy
 // nonce-keyed covers from pre-#125 workers renew until both classes have
-// one clean traversal, then are released. Returns the work charged: one
-// unit per listed row.
+// one clean traversal, then decay by TTL (never deleted: during a rolling
+// upgrade an old replica may still mint and depend on them — Codex round
+// 1, P1). Renewal is the correctness core (a lapsed cover silently
+// reopens the admission window), so it always offers the FULL listing:
+// budget only sets the soft allocation, and overrunning it — flagged
+// loudly — starves the discovery rotation for the pass rather than
+// letting live covers lapse (Codex round 1, P1: a round-robin backlog
+// could exceed the TTL between one row's renewals). Only a context abort
+// leaves the listing incomplete, parked on the durable cursor. Returns
+// the work charged: one unit per listed row.
 func (r *AbsenceReconciler) renewCovers(ctx context.Context, budget int64, report *AbsenceReport, st *absencePassState, errs *boundedErrs) (charged int64) {
 	if !r.quotaEnforced {
 		r.renewalComplete = true // nothing consults reservations (Codex round 73)
@@ -505,7 +527,7 @@ func (r *AbsenceReconciler) renewCovers(ctx context.Context, budget int64, repor
 	startedAtZero := after == ""
 	wrapped := startedAtZero
 	defer func() { r.renewCursor = after }()
-	retireLegacy := r.lfs.HasClean && r.packs.HasClean
+	renewLegacy := !(r.lfs.HasClean && r.packs.HasClean)
 	// held delays each epoch-keyed row one step: a following row with the
 	// same (base, class) supersedes it (higher incarnation, zero-padded
 	// byte order), so the held row is a crash leftover to delete.
@@ -538,28 +560,27 @@ func (r *AbsenceReconciler) renewCovers(ctx context.Context, budget int64, repor
 		}
 		held = nil
 	}
+	overrun := func() {
+		if charged > budget && !report.RenewalOverBudget {
+			report.RenewalOverBudget = true
+			r.logger.Warn("absence reconcile: cover renewal overran its budget allocation; discovery is starved this pass — raise CODESTORAGE_ABSENCE_RECONCILE_BUDGET above twice the live cover population",
+				"allocation", budget, "charged", charged)
+		}
+	}
 	for {
 		if ctx.Err() != nil {
+			// The ONLY incomplete-renewal path: parked on the durable
+			// cursor, resumed (and completed) by the next pass's renewal.
 			errs.add(ctx.Err())
 			flushHeld(nil)
-			return charged
-		}
-		if charged >= budget {
-			// Backlog: more live covers than the renewal half renews in
-			// one pass. The cursor round-robins so every row's renewal
-			// period stays bounded, but the budget should cover the
-			// population.
-			flushHeld(nil)
 			report.RenewalIncomplete = true
-			r.logger.Warn("absence reconcile: cover renewal outran its budget half; covers renew round-robin across passes — raise CODESTORAGE_ABSENCE_RECONCILE_BUDGET",
-				"budget", budget)
 			return charged
 		}
-		limit := r.pageLimit(budget - charged)
-		rows, err := r.registry.ListAbsenceCovers(ctx, after, limit)
+		rows, err := r.registry.ListAbsenceCovers(ctx, after, absencePageSize)
 		if err != nil {
 			errs.add(fmt.Errorf("absence reconcile: list covers: %w", err))
 			flushHeld(nil)
+			report.RenewalIncomplete = true
 			return charged
 		}
 		if len(rows) == 0 {
@@ -567,6 +588,7 @@ func (r *AbsenceReconciler) renewCovers(ctx context.Context, budget int64, repor
 			if wrapped {
 				after = ""
 				r.renewalComplete = startedAtZero
+				overrun()
 				return charged
 			}
 			after, wrapped = "", true
@@ -578,18 +600,13 @@ func (r *AbsenceReconciler) renewCovers(ctx context.Context, budget int64, repor
 				flushHeld(nil)
 				after = ""
 				r.renewalComplete = true // full listing offered this pass
+				overrun()
 				return charged
 			}
 			if ctx.Err() != nil {
 				errs.add(ctx.Err())
 				flushHeld(nil)
-				return charged
-			}
-			if charged >= budget {
-				flushHeld(nil)
 				report.RenewalIncomplete = true
-				r.logger.Warn("absence reconcile: cover renewal outran its budget half; covers renew round-robin across passes — raise CODESTORAGE_ABSENCE_RECONCILE_BUDGET",
-					"budget", budget)
 				return charged
 			}
 			charged++
@@ -600,20 +617,20 @@ func (r *AbsenceReconciler) renewCovers(ctx context.Context, budget int64, repor
 			}
 			if legacy {
 				flushHeld(row)
-				if retireLegacy {
-					// Both classes completed a clean traversal: every
-					// still-absent loss lives in incarnation keys, so
-					// the pre-#125 spelling is retired.
-					if err := r.registry.DeleteAbsenceCover(ctx, row.Key); err != nil {
-						errs.add(fmt.Errorf("absence reconcile: release legacy cover %s: %w", row.Key, err))
-					} else {
-						report.CoversReleased++
+				if renewLegacy {
+					if r.chargeCover(ctx, row.Base, row.Key, row.Bytes, report, st, errs) {
+						report.CoversRenewed++
 					}
 					continue
 				}
-				if r.chargeCover(ctx, row.Base, row.Key, row.Bytes, report, st, errs) {
-					report.CoversRenewed++
-				}
+				// Both classes completed a clean traversal: every
+				// still-absent loss lives in incarnation keys, so the
+				// pre-#125 spelling stops renewing and expires by TTL.
+				// Never deleted: a not-yet-upgraded replica may still be
+				// minting and depending on nonce-keyed covers mid-roll,
+				// and deleting one before the rotation rediscovers its
+				// rows would uncover them (Codex round 1, P1).
+				report.CoversDecaying++
 				continue
 			}
 			flushHeld(row)
@@ -644,8 +661,16 @@ func (r *AbsenceReconciler) rotationPhase(ctx context.Context, cur *absenceCurso
 	startedAtZero := startRepo == "" && startKey == ""
 	wrapped := startedAtZero
 	// The pending range (if any) began before this pass: never evaluate
-	// it (its in-memory running total would be partial).
+	// it — its in-memory running total would be partial. Resuming
+	// mid-keyspace therefore pre-seeds the tracker with the CURSOR's own
+	// base, unstarted (Codex round 1, P1): without it the first resumed
+	// row would read as a range transition and the suffix's total would
+	// masquerade as the whole range's, shrinking covers that still
+	// protect rows in the skipped prefix.
 	*tr = rangeTracker{class: tr.class}
+	if !startedAtZero {
+		tr.base = baseOf(startRepo)
+	}
 	defer func() { tr.abandon() }()
 	for charged < budget {
 		if ctx.Err() != nil {

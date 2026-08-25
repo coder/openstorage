@@ -234,3 +234,30 @@ func TestRetireUnreferencedLFSObject_ReapWatermarkGate(t *testing.T) {
 		}
 	})
 }
+
+// TestPurgeRepoLedger_DropsSettlementCursor (Codex round 1 on PR #132, P2):
+// a purge that runs between reclamation passes must drop the repo's parked
+// settlement cursor with the rest of its ledger rows — the reclaimer never
+// revisits a repo whose registry rows are gone, so nothing else would.
+func TestPurgeRepoLedger_DropsSettlementCursor(t *testing.T) {
+	runRefBackends(t, func(t *testing.T, s Store) {
+		ss := scanStateStore(t, s)
+		ctx := context.Background()
+		k := newLedgerKit(t, s)
+		purger, ok := s.(interface {
+			PurgeRepoLedger(ctx context.Context, group []string) (int64, error)
+		})
+		if !ok {
+			t.Fatalf("store %T lacks PurgeRepoLedger", s)
+		}
+		if err := ss.PutJobScanState(ctx, ScanJobLFSReclaim, ScanScopeReclaimRepo(k.base()), "parked-row-key", 42); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := purger.PurgeRepoLedger(ctx, k.group); err != nil {
+			t.Fatalf("PurgeRepoLedger: %v", err)
+		}
+		if _, ok, err := ss.GetJobScanState(ctx, ScanJobLFSReclaim, ScanScopeReclaimRepo(k.base())); err != nil || ok {
+			t.Fatalf("settlement cursor after purge = (ok=%v, %v), want dropped", ok, err)
+		}
+	})
+}

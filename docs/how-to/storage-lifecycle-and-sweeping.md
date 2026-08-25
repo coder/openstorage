@@ -547,10 +547,11 @@ cursors (budget-limited, resumable — the sweeper's inverse direction) and
   live cover in place as losses appear, minting the next incarnation of
   the key (and deleting the stale row — `covers_rotated`) when heals
   shrink the total, and releasing the row outright (`covers_released`)
-  when everything healed. A cover population larger than the renewal
-  half-budget renews round-robin on a durable cursor and flags
-  `renewal_incomplete` — raise the budget so every cover renews every
-  pass. On PostgreSQL the job runs on its own reserved single-worker River
+  when everything healed. Renewal is the correctness core, so it always
+  offers the FULL cover listing: a population beyond its budget
+  allocation still renews every pass — flagged `renewal_over_budget`,
+  squeezing discovery — rather than round-robining past the TTL; raise
+  the budget above twice the live cover population. On PostgreSQL the job runs on its own reserved single-worker River
   queue, so tenant-scalable work (webhook deliveries to slow endpoints)
   cannot delay a renewal past the cover TTL, and the unique periodic job
   serializes passes fleet-wide. Startup enforces the cadence-vs-TTL
@@ -581,7 +582,8 @@ A reconciliation pass logs one `absence reconcile pass finished` line:
 | `rows_skipped_purged` | rows of purge-fenced repositories skipped |
 | `covers_renewed` | live cover rows re-charged by the renewal phase (fleet-derived from the durable cover listing — any replica renews every cover) |
 | `covers_rotated` / `covers_released` | shrink re-mints (heals reduced a repository's exact re-derived total; the stale row was deleted) and outright releases (fully healed, folded away, or a superseded/legacy row retired) |
-| `renewal_incomplete` | the live cover population outran the renewal half-budget — covers renew round-robin across passes on a durable cursor; raise the budget so every cover renews every pass |
+| `renewal_over_budget` | the live cover population outran the renewal allocation — every cover still renewed (discovery squeezed); raise the budget above twice the live cover population |
+| `renewal_incomplete` | the pass deadline cut the renewal listing short (resumed first next pass on the durable cursor) — investigate the store if persistent, covers lapse if renewals cannot land within the TTL |
 | `lfs_traversals` / `pack_traversals` | completed origin-to-origin rotations per registry (fleet-durable; heals shed within one clean traversal) |
 | `quota_enforced` | `false` means detection-only (no quota admission to protect) |
 

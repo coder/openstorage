@@ -867,10 +867,11 @@ stretches individual probes.
   heals shrink it (`covers_rotated`; the stale row is deleted), and
   releasing it outright when everything healed (`covers_released`). Shrink
   therefore lags by at most one rotation (conservative), never renewal.
-- **Sizing:** keep half the budget above the live cover-row population —
-  beyond it, renewal round-robins across passes on a durable cursor and
-  flags `renewal_incomplete`, and a cover's renewal gap must stay within
-  the reservation TTL. Rotation cursors, traversal bookkeeping, and the
+- **Sizing:** keep the budget above twice the live cover-row population.
+  Renewal never lapses on budget — it always offers the full cover
+  listing, squeezing discovery when it overruns its allocation
+  (`renewal_over_budget`) — but a squeezed rotation slows loss discovery
+  and heal shedding. Rotation cursors, traversal bookkeeping, and the
   alternating-leader parity are all fleet-persistent (`job_scan_state`),
   so multi-replica PostgreSQL fleets share one rotation regardless of
   which replica River schedules.

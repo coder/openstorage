@@ -16,6 +16,7 @@ package ref
 import (
 	"context"
 	"errors"
+	"strings"
 
 	"github.com/jackc/pgx/v5"
 )
@@ -189,10 +190,32 @@ func (s *PG) PurgeRepoLedger(ctx context.Context, group []string) (int64, error)
 			}
 			total += ct.RowsAffected()
 		}
+		// The reclaimer's parked settlement cursor is per-BASE scan state
+		// (issue #121): scan-state rows must not outlive their repo, and
+		// only this ledger cleanup reliably runs after the LFS rows drop
+		// (a purge between reclamation passes would otherwise strand the
+		// row forever — Codex round 1 on PR #132).
+		ct, err := tx.Exec(ctx,
+			`DELETE FROM job_scan_state WHERE job = $1 AND scope = $2`,
+			ScanJobLFSReclaim, ScanScopeReclaimRepo(purgeBaseOf(group)))
+		if err != nil {
+			return err
+		}
+		total += ct.RowsAffected()
 		return nil
 	})
 	if err != nil {
 		return 0, err
 	}
 	return total, nil
+}
+
+// purgeBaseOf returns the group's BASE repo (scan-state scope key): quota
+// groups are [base, base+suffix...], asserted rather than assumed.
+func purgeBaseOf(group []string) string {
+	base := group[0]
+	for _, r := range group[1:] {
+		assertf(strings.HasPrefix(r, base+"+"), "purge: group %v does not lead with its base", group)
+	}
+	return base
 }

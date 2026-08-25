@@ -50,10 +50,13 @@ the renewal cycle or be denied outright), and the cover rows THEMSELVES
 are the durable tracking state (issue #125). The renewal phase runs FIRST
 each pass: it LISTS the live cover rows and re-charges each — one work
 unit per row, entirely database-derived, so any replica and any restart
-keeps every discovered loss covered without process memory. A population
-beyond the renewal half-budget renews round-robin on a durable cursor,
-loudly (`renewal_incomplete`); sizing the budget above the live cover
-population keeps every cover renewed every pass.
+keeps every discovered loss covered without process memory. Renewal never
+lapses on budget: it always offers the full listing, and a population
+beyond its allocation squeezes discovery for the pass, loudly
+(`renewal_over_budget`) — a bounded round-robin would let a big enough
+backlog outlive the cover TTL between one row's renewals. Only the pass
+deadline can cut the listing short (`renewal_incomplete`, resumed first
+next pass on the durable cursor).
 
 Aggregates stay exact through deterministic INCARNATION keys
 (`absence-lost/<base>/<class>-e<n>`, zero-padded): each full traversal of
@@ -84,7 +87,10 @@ unit; a configuration floor (`MinAbsenceReconcileBudget`) keeps budgets
 out of single-row-overdraw territory. Legacy nonce-keyed covers minted by
 pre-#125 workers renew until both registries complete one clean
 traversal — by which point every still-absent loss lives in incarnation
-keys — then are released.
+keys — then stop renewing and expire by TTL. Never deleted: during a
+rolling upgrade a not-yet-upgraded replica can still mint nonce-keyed
+covers and depend on them, and deleting one before the rotation
+rediscovers its rows would uncover them.
 
 Resolved residual (issue #125, with #121): the original design kept the
 known-absent set and rotation cursors in process memory, making refresh

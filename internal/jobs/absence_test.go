@@ -410,10 +410,12 @@ func TestAbsenceReconcile_FoldedAwayRowReleasesCover(t *testing.T) {
 	}
 }
 
-// TestAbsenceReconcile_RenewalRoundRobin (issue #125): a live cover
-// population larger than the renewal half-budget renews round-robin across
-// passes on the DURABLE cursor, loudly flagged; a raised budget renews all.
-func TestAbsenceReconcile_RenewalRoundRobin(t *testing.T) {
+// TestAbsenceReconcile_RenewalNeverLapsesOnBudget (Codex round 1, P1): a
+// live cover population larger than the renewal allocation still renews IN
+// FULL every pass — renewal is the correctness core (a lapsed cover
+// silently reopens the admission window), so overruns starve discovery
+// loudly instead of letting covers round-robin past their TTL.
+func TestAbsenceReconcile_RenewalNeverLapsesOnBudget(t *testing.T) {
 	f := newSweepFixture(t)
 	for i := 0; i < 60; i++ {
 		base := fmt.Sprintf("repo-rr-%02d", i)
@@ -430,26 +432,76 @@ func TestAbsenceReconcile_RenewalRoundRobin(t *testing.T) {
 		t.Fatalf("pass 1 report = %+v, want 60 losses covered", report)
 	}
 
-	// Pass 2 at budget 100: the renewal half (50) cannot renew 60 rows —
-	// round-robin, loud.
+	// Pass 2 at budget 100: the renewal allocation (50) is smaller than
+	// the 60 live covers — every cover still renews, loudly over budget,
+	// and discovery gets only the leftover 40 units (20 two-unit rows).
 	r.budget = 100
 	report, err = r.Run(context.Background())
 	if err != nil {
 		t.Fatalf("Run 2: %v", err)
 	}
-	if !report.RenewalIncomplete || report.CoversRenewed != 50 {
-		t.Fatalf("pass 2 report = %+v, want a loud 50-row renewal backlog", report)
+	if !report.RenewalOverBudget || report.CoversRenewed != 60 || report.RenewalIncomplete {
+		t.Fatalf("pass 2 report = %+v, want all 60 covers renewed over budget", report)
+	}
+	if report.LFSRowsExamined != 20 {
+		t.Fatalf("pass 2 report = %+v, want discovery squeezed to the 40-unit remainder", report)
 	}
 
-	// Pass 3 with the budget raised: the durable cursor resumes at the
-	// un-renewed tail first, then wraps — every cover renews.
+	// Pass 3 with the budget raised: renewal fits its allocation again.
 	r.budget = 400
 	report, err = r.Run(context.Background())
 	if err != nil {
 		t.Fatalf("Run 3: %v", err)
 	}
-	if report.RenewalIncomplete || report.CoversRenewed != 60 {
-		t.Fatalf("pass 3 report = %+v, want all 60 covers renewed", report)
+	if report.RenewalOverBudget || report.CoversRenewed != 60 {
+		t.Fatalf("pass 3 report = %+v, want all 60 covers renewed within budget", report)
+	}
+}
+
+// TestAbsenceReconcile_ResumedRangeNeverShrinks (Codex round 1, P1): a
+// pass whose cursor resumes INSIDE a repository's row range must not treat
+// the observed suffix as the whole range — releasing/shrinking on it would
+// un-cover still-missing rows in the skipped prefix.
+func TestAbsenceReconcile_ResumedRangeNeverShrinks(t *testing.T) {
+	f := newSweepFixture(t)
+	base := "repo-resume"
+	// Two ABSENT rows sorting first, two present rows after them.
+	registerLFS(t, f, base, blob.LFSKey(base, absenceOID('a')), 10)
+	registerLFS(t, f, base, blob.LFSKey(base, absenceOID('b')), 10)
+	for _, b := range []byte{'c', 'd'} {
+		key := blob.LFSKey(base, absenceOID(b))
+		size := f.upload(key, "present-"+string(b))
+		registerLFS(t, f, base, key, size)
+	}
+
+	// Pass 1 (budget 8 → LFS allocation 4): examines exactly the two
+	// absent rows (2 units each), covers 20, parks mid-range.
+	workerA := testReconciler(t, f, true, 8)
+	report, err := workerA.Run(context.Background())
+	if err != nil {
+		t.Fatalf("worker A: %v", err)
+	}
+	if report.LFSRowsAbsent != 2 || report.BytesCovered != 10+20 {
+		t.Fatalf("worker A report = %+v, want both losses covered (grow-charged 10 then 20)", report)
+	}
+	if got := ledgerReserved(t, f, base); got != 20 {
+		t.Fatalf("reserved = %d, want 20", got)
+	}
+
+	// Pass 2 (fresh worker): resumes on the present suffix and reaches
+	// the range end with a zero running total — but the range began
+	// before this pass, so the cover MUST survive.
+	pinLFSLeader(t, f)
+	workerB := testReconciler(t, f, true, 100)
+	report, err = workerB.Run(context.Background())
+	if err != nil {
+		t.Fatalf("worker B: %v", err)
+	}
+	if report.CoversReleased != 0 || report.CoversRotated != 0 {
+		t.Fatalf("worker B report = %+v, want no shrink from a resumed partial range", report)
+	}
+	if got := ledgerReserved(t, f, base); got != 20 {
+		t.Fatalf("reserved = %d, want the prefix losses still covered", got)
 	}
 }
 
@@ -745,7 +797,9 @@ func TestAbsenceReconcile_SplitShortCopiesClassifiedTruncated(t *testing.T) {
 
 // TestAbsenceReconcile_LegacyCoverRetired: nonce-keyed covers minted by
 // pre-#125 workers renew until both classes complete one clean traversal,
-// then are released — their losses live in incarnation keys by then.
+// then stop renewing and expire by TTL — never deleted, because a
+// not-yet-upgraded replica can still mint and depend on them mid-roll
+// (Codex round 1, P1).
 func TestAbsenceReconcile_LegacyCoverRetired(t *testing.T) {
 	f := newSweepFixture(t)
 	ctx := context.Background()
@@ -772,16 +826,17 @@ func TestAbsenceReconcile_LegacyCoverRetired(t *testing.T) {
 	}
 
 	// Pass 1 completed clean traversals of both (empty) registries, so
-	// pass 2 retires the legacy spelling outright.
+	// pass 2 stops renewing the legacy spelling — but never deletes it
+	// (its row stays until the TTL collects it).
 	report, err = r.Run(ctx)
 	if err != nil {
 		t.Fatalf("Run 2: %v", err)
 	}
-	if report.CoversReleased != 1 || report.CoversRenewed != 0 {
-		t.Fatalf("pass 2 report = %+v, want the legacy cover released", report)
+	if report.CoversDecaying != 1 || report.CoversRenewed != 0 || report.CoversReleased != 0 {
+		t.Fatalf("pass 2 report = %+v, want the legacy cover decaying, not deleted", report)
 	}
-	if got := ledgerReserved(t, f, base); got != 0 {
-		t.Fatalf("reserved = %d, want 0 after the legacy release", got)
+	if got := ledgerReserved(t, f, base); got != 555 {
+		t.Fatalf("reserved = %d, want the un-renewed row still inside its TTL", got)
 	}
 }
 
