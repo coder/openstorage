@@ -784,12 +784,21 @@ func (r *AbsenceReconciler) settleLFSRow(ctx context.Context, row ref.AbsenceLFS
 	switch {
 	case deficit <= 0:
 		// The surviving copies compensate the whole registered size:
-		// physically listed, no floor deflation; download-time restore
-		// (PR #104) heals the registered spelling.
-		report.LFSRowsTwinOnly++
+		// physically listed, no floor deflation, nothing to charge. The
+		// CLASSIFICATION still depends on whether a complete copy exists
+		// (Codex round 13): only a full twin is restorable via
+		// download-time restore (PR #104) — split short copies are an
+		// integrity loss even though quota accounting is whole.
 		r.untrackAbsent(row.Key)
-		r.logger.Warn("absence reconcile: registered lfs object compensated by its twin spelling",
-			"repo", row.Repo, "key", row.Key, "registered", row.Bytes, "physical", physical, "twin_physical", twinPhysical)
+		if twinPhysical >= row.Bytes {
+			report.LFSRowsTwinOnly++
+			r.logger.Warn("absence reconcile: registered lfs object compensated by its full twin spelling",
+				"repo", row.Repo, "key", row.Key, "registered", row.Bytes, "physical", physical, "twin_physical", twinPhysical)
+		} else {
+			report.LFSRowsTruncated++
+			r.logger.Error("absence reconcile: no complete copy of registered lfs object survives, although listed bytes cover its size",
+				"repo", row.Repo, "key", row.Key, "registered", row.Bytes, "physical", physical, "twin_physical", twinPhysical)
+		}
 		return charged
 	case physical > 0 || twinPhysical > 0:
 		report.LFSRowsTruncated++

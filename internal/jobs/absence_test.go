@@ -901,6 +901,28 @@ func TestAbsenceRefreshDropsUnrenewedBases(t *testing.T) {
 	}
 }
 
+// TestAbsenceReconcile_SplitShortCopiesClassifiedTruncated (Codex round
+// 13): two individually short copies whose sizes sum past the registered
+// size charge nothing (all bytes are listed) but must classify as
+// truncation — neither spelling is complete, so nothing can restore it.
+func TestAbsenceReconcile_SplitShortCopiesClassifiedTruncated(t *testing.T) {
+	f := newSweepFixture(t)
+	base := "repo-split-short"
+	oid := absenceOID('e')
+	f.upload(blob.LFSKey(base, oid), strings.Repeat("a", 60))
+	f.upload(blob.LFSLegacyKey(base, oid), strings.Repeat("b", 40))
+	registerLFS(t, f, base, blob.LFSKey(base, oid), 100)
+
+	r := testReconciler(t, f, true, 1000)
+	report, err := r.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if report.LFSRowsTruncated != 1 || report.LFSRowsTwinOnly != 0 || report.CoversCharged != 0 {
+		t.Fatalf("report = %+v, want split short copies reported as truncation without covers", report)
+	}
+}
+
 // TestAbsenceReconcile_RefreshDropsHealedRows: a tracked loss whose bytes
 // return leaves the refresh set on the next pass.
 func TestAbsenceReconcile_RefreshDropsHealedRows(t *testing.T) {
