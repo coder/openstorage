@@ -325,13 +325,19 @@ type AbsenceReconciler struct {
 	// counterpart lands). Retirement needs both classes in one map.
 	cleanBases map[string]map[string]bool
 	// proofGens[base][class] is the surviving persisted half-proof set
-	// loaded (and fence-validated) this pass. Entries are TRIGGERS, not
-	// authority: consuming one for retirement first re-verifies the
-	// class fresh (verifyAndJudge, which deletes the entry via
-	// markCleanBase on success). Also the retention source for
-	// saveState when an incomplete renewal listing leaves legacyRows
-	// non-authoritative.
-	proofGens map[string]map[string]int64
+	// loaded (and fence-validated) this pass, with each entry's age in
+	// passes since its class's evidence was FRESH. An age-1 entry —
+	// written by the immediately preceding pass's fresh observation or
+	// verification, fence-checked across its single park gap — is
+	// consumable for retirement directly (Codex round 23: without this
+	// one-gap window, a base whose combined class verification exceeds
+	// the pool would re-verify one class every pass and never complete
+	// the other). Older entries are TRIGGERS only: consuming one first
+	// re-verifies the class fresh (verifyAndJudge, which deletes the
+	// entry via markCleanBase on success). Also the retention source
+	// for saveState when an incomplete renewal listing leaves
+	// legacyRows non-authoritative.
+	proofGens map[string]map[string]absenceProofEntry
 	// verifyPool bounds the pass's total fresh-verification work (one
 	// budget's worth, shared by every verifyAndJudge): verification is
 	// per-verdict full-base work, so without a pool a pass completing
@@ -536,7 +542,7 @@ func (r *AbsenceReconciler) loadState(ctx context.Context, errs *boundedErrs) {
 		absenceClassLFS:   make(map[string]bool),
 		absenceClassPacks: make(map[string]bool),
 	}
-	r.proofGens = make(map[string]map[string]int64)
+	r.proofGens = make(map[string]map[string]absenceProofEntry)
 	r.verifyPool = r.budget
 	r.touchFailed = false
 	for _, c := range []struct {
@@ -641,7 +647,7 @@ func (r *AbsenceReconciler) loadProofs(ctx context.Context, errs *boundedErrs) {
 	if !ok || st.Payload == "" {
 		return
 	}
-	var stored map[string]map[string]int64
+	var stored map[string]map[string]absenceProofEntry
 	if err := json.Unmarshal([]byte(st.Payload), &stored); err != nil {
 		r.logger.Warn("absence reconcile: discarding undecodable proof state", "err", err)
 		return
@@ -656,23 +662,42 @@ func (r *AbsenceReconciler) loadProofs(ctx context.Context, errs *boundedErrs) {
 			errs.add(fmt.Errorf("absence reconcile: validate proof fence for %s: %w", base, err))
 			continue
 		}
-		for class, proofGen := range classes {
+		for class, entry := range classes {
 			if class != absenceClassLFS && class != absenceClassPacks {
 				continue
 			}
-			if proofGen != gen {
+			if entry.Gen != gen {
 				r.logger.Info("absence reconcile: persisted proof invalidated",
 					"base", base, "class", class, "reason", "base group mutated since the proof")
 				continue
 			}
 			r.cleanBases[class][base] = true
 			if r.proofGens[base] == nil {
-				r.proofGens[base] = make(map[string]int64)
+				r.proofGens[base] = make(map[string]absenceProofEntry)
 			}
-			r.proofGens[base][class] = proofGen
+			// One pass boundary was just crossed since the entry was
+			// written: age it at load.
+			age := entry.Age + 1
+			if age > absenceProofMaxAge {
+				age = absenceProofMaxAge
+			}
+			r.proofGens[base][class] = absenceProofEntry{Gen: entry.Gen, Age: age}
 		}
 	}
 }
+
+// absenceProofEntry is one persisted (base, class) proof: the group
+// generation it was fenced at, and its age in passes since the class's
+// evidence was FRESH (0 = written by the very pass that observed or
+// verified the class). loadProofs increments the age; fold consumes
+// age-1 entries directly and re-verifies anything older.
+type absenceProofEntry struct {
+	Gen int64 `json:"gen"`
+	Age int   `json:"age,omitempty"`
+}
+
+// absenceProofMaxAge saturates entry aging (only "1" vs "older" matters).
+const absenceProofMaxAge = 9
 
 // saveState parks the durable cursors on a bounded DETACHED context: the
 // pass regularly ends by burning its own deadline, and losing the park
@@ -751,7 +776,7 @@ func (r *AbsenceReconciler) saveProofs(sctx context.Context, errs *boundedErrs) 
 			bases[base] = true
 		}
 	}
-	keep := make(map[string]map[string]int64)
+	keep := make(map[string]map[string]absenceProofEntry)
 	for base := range bases {
 		lfsClean, packsClean := r.cleanBases[absenceClassLFS][base], r.cleanBases[absenceClassPacks][base]
 		if !lfsClean && !packsClean {
@@ -770,13 +795,20 @@ func (r *AbsenceReconciler) saveProofs(sctx context.Context, errs *boundedErrs) 
 		// Both-clean bases persist BOTH halves: their fold either
 		// consumed the nonces (the entry evicts next pass with the
 		// listing) or deferred (verification pool/CAS), and dropping
-		// the halves would discard the convergence progress.
-		entry := make(map[string]int64, 2)
-		if lfsClean {
-			entry[absenceClassLFS] = gen
-		}
-		if packsClean {
-			entry[absenceClassPacks] = gen
+		// the halves would discard the convergence progress. A class
+		// whose evidence is FRESH this pass (observed or verified —
+		// nothing seeded survives for it) writes age 0; a surviving
+		// seeded entry carries its load-time age forward.
+		entry := make(map[string]absenceProofEntry, 2)
+		for _, class := range []string{absenceClassLFS, absenceClassPacks} {
+			if !r.cleanBases[class][base] {
+				continue
+			}
+			age := 0
+			if seeded, ok := r.proofGens[base][class]; ok {
+				age = seeded.Age
+			}
+			entry[class] = absenceProofEntry{Gen: gen, Age: age}
 		}
 		keep[base] = entry
 	}
@@ -1095,21 +1127,27 @@ func (r *AbsenceReconciler) foldRedundantLegacy(ctx context.Context, report *Abs
 		if !r.cleanBases[absenceClassLFS][row.Base] || !r.cleanBases[absenceClassPacks][row.Base] {
 			continue // no completed double proof yet: stays live, retried later
 		}
-		// Persisted half-proofs are triggers only (Codex round 21,
-		// security): their evidence predates this pass, so each such
-		// class is re-verified FRESH before it may retire anything —
-		// success supersedes the entry (markCleanBase); a deferred or
-		// dirty verification leaves it, and the nonce stays live.
+		// Persisted half-proofs older than one pass are triggers only
+		// (Codex round 21, security): each such class is re-verified
+		// FRESH before it may retire anything — success supersedes the
+		// entry (markCleanBase); a deferred or dirty verification
+		// leaves it, and the nonce stays live. An AGE-1 entry — the
+		// immediately preceding pass's fresh evidence, fence-checked
+		// across its single gap — consumes directly (Codex round 23:
+		// re-verifying it here would let a base whose combined class
+		// verification exceeds the pool livelock, one class draining
+		// the pool every pass while the other never completes).
 		stale := false
 		for _, class := range []string{absenceClassLFS, absenceClassPacks} {
-			if _, persisted := r.proofGens[row.Base][class]; !persisted {
+			entry, persisted := r.proofGens[row.Base][class]
+			if !persisted || entry.Age <= 1 {
 				continue
 			}
 			if key := row.Base + "\x00" + class; !attempted[key] {
 				attempted[key] = true
 				r.verifyAndJudge(ctx, row.Base, class, report, st, errs)
 			}
-			if _, still := r.proofGens[row.Base][class]; still {
+			if e, still := r.proofGens[row.Base][class]; still && e.Age > 1 {
 				stale = true
 			}
 		}

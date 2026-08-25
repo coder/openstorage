@@ -687,7 +687,7 @@ func TestAbsenceReconcile_PersistedProofRetiresWithFreshVerification(t *testing.
 		}
 		gen += g
 	}
-	payload := fmt.Sprintf(`{"%s":{"%s":%d}}`, base, absenceClassLFS, gen)
+	payload := fmt.Sprintf(`{"%s":{"%s":{"gen":%d,"age":9}}}`, base, absenceClassLFS, gen)
 	if err := reg.PutJobScanState(ctx, ref.ScanJobAbsence, ref.ScanScopeAbsenceProofs, payload, 0); err != nil {
 		t.Fatal(err)
 	}
@@ -767,6 +767,62 @@ func TestAbsenceReconcile_GapLossCaughtByVerification(t *testing.T) {
 	}
 	if got := ledgerReserved(t, f, base); got != 555+10 {
 		t.Fatalf("reserved = %d, want the decaying nonce plus the fresh loss cover", got)
+	}
+}
+
+// TestAbsenceReconcile_CombinedClassesExceedingPoolConverge (Codex round
+// 23, P1): a base whose combined class verification work exceeds the
+// per-pass pool must still converge — one class's fresh verification is
+// consumable for exactly one following pass (age-1, fence-checked across
+// its single gap), so the two verifications may land in adjacent passes
+// instead of demanding one pass fit both. Without that window, the
+// LFS-first fold order would drain the pool on the same class every pass
+// and the packs verification could never complete.
+func TestAbsenceReconcile_CombinedClassesExceedingPoolConverge(t *testing.T) {
+	f := newSweepFixture(t)
+	ctx := context.Background()
+	base := "repo-combined"
+	// 12 LFS rows + 16 pack rows: each class fits the pool (budget 20)
+	// alone, never together (12+16 > 20).
+	for i := byte(0); i < 12; i++ {
+		key := blob.LFSKey(base, absenceOID('a'+i))
+		registerLFS(t, f, base, key, 10)
+		f.upload(key, strings.Repeat("x", 10))
+	}
+	for i := byte(0); i < 16; i++ {
+		id := fmt.Sprintf("p%02d", i)
+		key := blob.PackKey(base, id)
+		size := f.upload(key, strings.Repeat("y", 10))
+		if err := f.store.RegisterPacks(ctx, base, []ref.Pack{{ID: id, Key: key, Size: size}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	legacyKey := ref.AbsenceCoverPrefix + base + "/" + ref.NewReservationOwner()
+	if err := ref.ReserveRestoreCover(ctx, absenceRegistry(t, f), blob.QuotaRepoGroup(base), legacyKey, 555, time.Hour); err != nil {
+		t.Fatalf("seed legacy cover: %v", err)
+	}
+
+	pinLFSLeader(t, f)
+	retired := false
+	for pass := 1; pass <= 10 && !retired; pass++ {
+		worker := testReconciler(t, f, true, 20)
+		report, err := worker.Run(ctx)
+		if err != nil {
+			t.Fatalf("pass %d: %v", pass, err)
+		}
+		switch report.CoversDecaying {
+		case 0:
+		case 1:
+			retired = true
+		default:
+			t.Fatalf("pass %d: retired %d covers, want 1 total", pass, report.CoversDecaying)
+		}
+	}
+	if !retired {
+		t.Fatal("nonce never retired within 10 passes: combined-class verification livelocked")
+	}
+	if got := ledgerReserved(t, f, base); got != 555 {
+		t.Fatalf("reserved = %d, want only the decaying nonce", got)
 	}
 }
 
