@@ -30,7 +30,11 @@ one claim would couple the lanes' liveness — a stuck pull starving all
 forwarding — while protecting nothing the non-force outbound push does not
 already protect: concurrent pull‖push interleavings converge because a push
 of a stale snapshot is refused as a non-fast-forward by the upstream, and
-the next trigger republishes current state.
+the next trigger republishes current state. A run re-checks the row between
+the local fetch and the upstream push, and the push itself runs under a
+detach/steal watchdog that kills the subprocess mid-transfer — a
+`DELETE /repos/base` that lands while a slow upstream is still receiving
+refs cancels the transfer within one poll interval instead of after it.
 
 **Force rides durable state, not the queue job.** `push_pending` is a
 three-level marker (none/push/force) coalescing upward via `RequestPush`;
@@ -56,7 +60,11 @@ would be a data-loss race: pull-first rewinds the local push before the
 forward's snapshot sees it. So the poke schedules the FORWARD, and the
 worker schedules the mirror-back pull strictly after a successful forward —
 upstream's own documented model ("pushes are proxied to the provider and
-changes mirrored back"). A sync run's own loopback pushes carry the sync
+changes mirrored back"). The mirror-back is marked durable (`RequestSync`)
+before it is enqueued: a request that coalesces with an in-flight pull run
+survives to that run's completion gate instead of being swallowed by queue
+deduplication, so the pull cannot strand a pre-forward snapshot locally.
+A sync run's own loopback pushes carry the sync
 claim in the hook environment and poke nothing, which terminates the
 forward↔pull cycle. Full-mirror forwarding (not just the pushed ref) is
 deliberate: converging to local state is the contract, and per-ref pending

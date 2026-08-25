@@ -162,9 +162,20 @@ type Worker struct {
 	// changes mirrored back"): forward-on-push repos have their push->pull
 	// poke rerouted to the forward (cmd wiring), so this restores the
 	// freshness pull strictly AFTER the forward landed, never racing it.
-	// Best-effort like the poke it replaces: no pending marker, failures
-	// logged. Both wirings point it at the queue's EnqueueSync.
+	// RunPush marks the request durable (RequestSync) BEFORE invoking
+	// this hook — an enqueue that coalesces with an in-flight pull run
+	// (river insert-time uniqueness, a held local claim) then survives to
+	// that run's completion gate instead of silently dropping the
+	// promised mirror. Enqueue failures are logged; the marker carries
+	// the request to boot recovery or the next finisher. Both wirings
+	// point it at the queue's EnqueueSync.
 	AfterForward func(ctx context.Context, job Job) error
+
+	// DetachPoll is the cadence of the outbound push watchdog that
+	// re-reads the upstream row WHILE `git push` runs and kills the
+	// subprocess when the repo is detached or the claim stolen mid-push
+	// (issue #90); 0 means defaultDetachPoll. Only tests shorten it.
+	DetachPoll time.Duration
 }
 
 // allowProtocol resolves the effective GIT_ALLOW_PROTOCOL value.
@@ -702,6 +713,13 @@ func runGitOut(ctx context.Context, dir string, env []string, args ...string) (s
 	cmd.Stdout = &outBuf
 	cmd.Stderr = &errBuf
 	cmd.Stdin = bytes.NewReader(nil)
+	// Cancellation must kill git's whole process group (setProcGroup):
+	// the transfer lives in a git-remote-http(s) CHILD, which would
+	// otherwise keep pushing/fetching after the parent died — and keep
+	// the output pipes open, blocking Run indefinitely. WaitDelay is the
+	// portable backstop for any pipe holder that still survives.
+	setProcGroup(cmd)
+	cmd.WaitDelay = 10 * time.Second
 	err = cmd.Run()
 	if err != nil && ctx.Err() != nil {
 		err = fmt.Errorf("%w (%v)", ctx.Err(), err)

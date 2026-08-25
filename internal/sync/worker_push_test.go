@@ -292,6 +292,54 @@ func TestPushRunDetachMidRunEmitsNoTerminalEvent(t *testing.T) {
 	}
 }
 
+// TestPushRunDetachDuringUpstreamPushKillsSubprocess: DELETE /repos/base
+// committing while `git push` is already talking to a slow upstream must
+// interrupt the subprocess (the mid-push watchdog): the detach response
+// claims cancellation, so the upstream must not be able to accept refs
+// afterward.
+func TestPushRunDetachDuringUpstreamPushKillsSubprocess(t *testing.T) {
+	f := newWorkerFixture(t)
+	seedLocalRepo(t, f, "repo_pw")
+	started := make(chan struct{}, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		select {
+		case started <- struct{}{}:
+		default:
+		}
+		<-r.Context().Done() // stall the transfer until the client dies
+	}))
+	defer srv.Close()
+	defer srv.CloseClientConnections() // LIFO: unblock the stalled handler first
+	f.putUpstream(t, "repo_pw", "own", "proj", srv.URL)
+	f.worker.DetachPoll = 10 * time.Millisecond
+
+	done := make(chan error, 1)
+	go func() {
+		done <- f.worker.RunPush(context.Background(), Job{Org: "acme", RepoID: "repo_pw"})
+	}()
+	select {
+	case <-started:
+	case err := <-done:
+		t.Fatalf("RunPush returned before the upstream transfer started: %v", err)
+	case <-time.After(30 * time.Second):
+		t.Fatal("upstream transfer never started")
+	}
+	if err := f.store.DeleteUpstream(context.Background(), "repo_pw"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("RunPush after mid-push detach: %v", err)
+		}
+	case <-time.After(30 * time.Second): // well under the 1m run timeout: the watchdog, not the deadline, must kill it
+		t.Fatal("detach did not interrupt the in-flight push (watchdog dead?)")
+	}
+	// started was emitted before the detach; the canceled run emits no
+	// terminal event.
+	assertEventTypes(t, f.rec.list(), EventSyncStarted)
+}
+
 func TestPushRunOverlappingRunSkips(t *testing.T) {
 	f := newWorkerFixture(t)
 	seedLocalRepo(t, f, "repo_pj")
@@ -325,8 +373,11 @@ func TestPushRunIndependentOfPullClaim(t *testing.T) {
 }
 
 // TestPushRunAfterForwardSchedulesMirrorBack: a successful forward on a
-// ForwardOnPush repo enqueues exactly one inbound sync; explicit-trigger
-// repos (ForwardOnPush off) do not.
+// ForwardOnPush repo enqueues exactly one inbound sync, and the request is
+// marked durable (SyncPending) BEFORE the enqueue — an enqueue that
+// coalesces with an in-flight pull run must survive to that run's
+// completion gate. Explicit-trigger repos (ForwardOnPush off) enqueue
+// nothing.
 func TestPushRunAfterForwardSchedulesMirrorBack(t *testing.T) {
 	f := newWorkerFixture(t)
 	seedLocalRepo(t, f, "repo_pl")
@@ -338,7 +389,13 @@ func TestPushRunAfterForwardSchedulesMirrorBack(t *testing.T) {
 		t.Fatal(err)
 	}
 	var mirrored []Job
-	f.worker.AfterForward = func(_ context.Context, job Job) error {
+	var markedAtEnqueue []bool
+	f.worker.AfterForward = func(ctx context.Context, job Job) error {
+		up, err := f.store.GetUpstream(ctx, job.RepoID)
+		if err != nil {
+			t.Errorf("GetUpstream inside AfterForward: %v", err)
+		}
+		markedAtEnqueue = append(markedAtEnqueue, up.SyncPending)
 		mirrored = append(mirrored, job)
 		return nil
 	}
@@ -348,6 +405,9 @@ func TestPushRunAfterForwardSchedulesMirrorBack(t *testing.T) {
 	}
 	if len(mirrored) != 1 || mirrored[0].RepoID != "repo_pl" {
 		t.Fatalf("mirror-back jobs = %+v, want exactly one for repo_pl", mirrored)
+	}
+	if !markedAtEnqueue[0] {
+		t.Fatal("mirror-back enqueued without the durable SyncPending marker (RequestSync-before-enqueue)")
 	}
 }
 

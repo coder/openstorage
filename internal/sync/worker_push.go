@@ -58,6 +58,11 @@ func TransientPushFailure(err error) bool {
 // mirrorRefspecs (the + variants).
 var pushRefspecs = []string{"refs/heads/*:refs/heads/*", "refs/tags/*:refs/tags/*"}
 
+// defaultDetachPoll is the production cadence of the mid-push
+// detach/steal watchdog (Worker.DetachPoll): one cheap upstream-row read
+// every few seconds only while `git push` is actually running.
+const defaultDetachPoll = 2 * time.Second
+
 // RunPush executes one outbound push-upstream run for job. Lifecycle,
 // abandonment, and event semantics mirror Run: detach cancels silently at
 // every stage, a stolen claim abandons loudly without terminal events, and
@@ -154,12 +159,32 @@ func (w *Worker) RunPush(ctx context.Context, job Job) error {
 
 	if runErr == nil && fin.ForwardOnPush && w.AfterForward != nil {
 		// Mirror-back pull for forward-on-push repos (see the AfterForward
-		// field doc): scheduled strictly after the forward landed.
+		// field doc): scheduled strictly after the forward landed, and
+		// marked durable BEFORE enqueueing (the RequestSync-before-enqueue
+		// protocol). If the enqueue coalesces with a pull run that already
+		// claimed — river's insert-time uniqueness swallows the insert, a
+		// held local claim skips the run — the marker survives to that
+		// run's FinishSync and its completion gate schedules the follow-up.
+		// Without it, a pull that fetched upstream BEFORE this forward
+		// could write its pre-forward snapshot afterward and leave the
+		// repo silently divergent from the refs it just published.
 		afCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), detachedOpTimeout)
 		defer cancel()
-		if afErr := w.AfterForward(afCtx, Job{Org: job.Org, RepoID: job.RepoID}); afErr != nil {
-			w.Logger.Warn("mirror-back sync enqueue failed",
-				"org", job.Org, "repo", job.RepoID, "err", afErr)
+		switch err := w.Upstreams.RequestSync(afCtx, job.RepoID); {
+		case errors.Is(err, ErrNotFound):
+			// Detached after the forward: the mirror-back is moot.
+		default:
+			if err != nil {
+				// Marker write failed: enqueue anyway — an unmarked
+				// mirror-back still covers the uncontended common case,
+				// and dropping both would break the promise outright.
+				w.Logger.Warn("mirror-back pending mark failed; enqueueing unmarked",
+					"org", job.Org, "repo", job.RepoID, "err", err)
+			}
+			if afErr := w.AfterForward(afCtx, Job{Org: job.Org, RepoID: job.RepoID}); afErr != nil {
+				w.Logger.Warn("mirror-back sync enqueue failed",
+					"org", job.Org, "repo", job.RepoID, "err", afErr)
+			}
 		}
 	}
 
@@ -376,13 +401,15 @@ func (w *Worker) transferPush(ctx context.Context, job Job, repo RepoInfo, up Up
 	// Detach/steal barrier between the local fetch and the upstream push:
 	// DELETE /repos/base cancels in-flight outbound runs silently, and a
 	// stolen claim must not publish this run's stale local snapshot over
-	// the thief's newer push. Residual zombie window (a worker frozen past
-	// this barrier): the run context kills git via exec.CommandContext,
-	// and a non-force zombie push of stale refs is refused per ref by the
-	// upstream itself; only a FORCED zombie inside that window could
-	// rewind the upstream — same residual class the pull lane documents
-	// for its fence margin, minus the token expiry (upstream credentials
-	// are static).
+	// the thief's newer push. The push itself then runs under a
+	// detach/steal WATCHDOG (below) that kills the subprocess mid-flight,
+	// so the residual exposure is one poll interval, not the whole push.
+	// Residual zombie window (a worker frozen past both): the run context
+	// kills git via exec.CommandContext, and a non-force zombie push of
+	// stale refs is refused per ref by the upstream itself; only a FORCED
+	// zombie inside that window could rewind the upstream — same residual
+	// class the pull lane documents for its fence margin, minus the token
+	// expiry (upstream credentials are static).
 	switch cur, err := w.Upstreams.GetUpstream(ctx, job.RepoID); {
 	case errors.Is(err, ErrNotFound):
 		return nil, errDetached
@@ -417,7 +444,52 @@ func (w *Worker) transferPush(ctx context.Context, job Job, repo RepoInfo, up Up
 	// --porcelain makes per-ref outcomes parseable (stdout) so a refused
 	// non-fast-forward names the exact refs in the failed event.
 	pushArgs := append([]string{"push", "--porcelain", up.CloneURL()}, refspecs...)
-	stdout, stderr, err := runGitOut(ctx, mirror, pushEnv, pushArgs...)
+	// Detach/steal watchdog for the push itself: the barrier above cannot
+	// cover a DELETE /repos/base (or a steal) that commits while `git
+	// push` is already talking to a slow upstream — without it, the
+	// detach response claims cancellation while the subprocess keeps
+	// publishing refs. Poll the row and kill the subprocess through its
+	// context. Read ERRORS never kill a healthy push: the watchdog is a
+	// guard, not a dependency, and a meta blip must not fail a forward.
+	poll := w.DetachPoll
+	if poll <= 0 {
+		poll = defaultDetachPoll
+	}
+	pushCtx, cancelPush := context.WithCancel(ctx)
+	defer cancelPush()
+	watch := make(chan error, 1)
+	go func() {
+		ticker := time.NewTicker(poll)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-pushCtx.Done():
+				return
+			case <-ticker.C:
+				switch cur, err := w.Upstreams.GetUpstream(pushCtx, job.RepoID); {
+				case errors.Is(err, ErrNotFound):
+					watch <- errDetached
+					cancelPush()
+					return
+				case err != nil:
+					continue
+				case cur.PushClaimHolder != holder:
+					watch <- errClaimStolen
+					cancelPush()
+					return
+				}
+			}
+		}
+	}()
+	stdout, stderr, err := runGitOut(pushCtx, mirror, pushEnv, pushArgs...)
+	cancelPush()
+	select {
+	case werr := <-watch:
+		// Killed (or raced) by the watchdog: abandon silently/loudly per
+		// the verdict — never emit a failed event for a canceled run.
+		return nil, werr
+	default:
+	}
 	if err != nil {
 		if rejected := parsePushRejections(stdout); len(rejected) > 0 {
 			return rejected, &syncFailure{code: FailRejected, cause: fmt.Errorf(
