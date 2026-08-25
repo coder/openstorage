@@ -937,6 +937,77 @@ func (fr *flakyRegistry) ReservePackBytes(ctx context.Context, group []string, p
 	return fr.AbsenceRegistry.ReservePackBytes(ctx, group, packs, owner, usageFloor, floorGen, quotaBytes, ttl)
 }
 
+// bumpFailRegistry injects failures into BumpLFSAdoptionGen while fail is
+// set — the floor-invalidation seam every compensation-shrinking delete
+// must prove first (Codex round 12).
+type bumpFailRegistry struct {
+	AbsenceRegistry
+	fail bool
+}
+
+func (br *bumpFailRegistry) BumpLFSAdoptionGen(ctx context.Context, repo string) error {
+	if br.fail {
+		return fmt.Errorf("flaky: injected bump failure")
+	}
+	return br.AbsenceRegistry.BumpLFSAdoptionGen(ctx, repo)
+}
+
+// TestAbsenceReconcile_ShrinkRetainsCoverOnBumpFailure (Codex round 12,
+// P2): rotating a cover DOWN deletes the larger row — compensation
+// shrinks by the healed delta, so the delete must not proceed unless the
+// floor-generation invalidation is proven. On bump failure both rows
+// stay; a later pass's superseded cleanup completes the rotation under
+// the same proven-bump rule.
+func TestAbsenceReconcile_ShrinkRetainsCoverOnBumpFailure(t *testing.T) {
+	f := newSweepFixture(t)
+	ctx := context.Background()
+	base := "repo-bump-fail"
+	key := blob.LFSKey(base, absenceOID('h'))
+	registerLFS(t, f, base, key, 300)
+
+	// Pass 1: the full 300-byte loss is covered.
+	reg := &bumpFailRegistry{AbsenceRegistry: absenceRegistry(t, f)}
+	r := NewAbsenceReconciler(reg, f.blobs, true, 1000, time.Hour, slog.New(slog.DiscardHandler))
+	if _, err := r.Run(ctx); err != nil {
+		t.Fatalf("Run 1: %v", err)
+	}
+	if got := ledgerReserved(t, f, base); got != 300 {
+		t.Fatalf("reserved = %d, want the full loss covered", got)
+	}
+
+	// Bytes partially reappear OUTSIDE the application restore path
+	// (backend-side recovery): the row is now a 200-byte prefix of its
+	// 300 registered bytes — deficit 100.
+	f.upload(key, strings.Repeat("x", 200))
+
+	// Pass 2 with the invalidation seam broken: the smaller replacement
+	// may mint, but the LARGER row must survive — deleting it without a
+	// proven bump would leave a warm deflated floor under-compensated.
+	reg.fail = true
+	if _, err := r.Run(ctx); err == nil {
+		t.Fatal("Run 2: want the injected bump failure surfaced")
+	}
+	if got := ledgerReserved(t, f, base); got < 300 {
+		t.Fatalf("reserved = %d after a failed invalidation, want the larger cover retained (>= 300)", got)
+	}
+
+	// Pass 3 with the seam healed (fresh reconciler — another replica):
+	// the superseded cleanup completes the rotation bump-first and the
+	// ledger converges to the exact 100-byte deficit.
+	reg.fail = false
+	r2 := NewAbsenceReconciler(reg, f.blobs, true, 1000, time.Hour, slog.New(slog.DiscardHandler))
+	report, err := r2.Run(ctx)
+	if err != nil {
+		t.Fatalf("Run 3: %v", err)
+	}
+	if report.CoversReleased == 0 {
+		t.Fatalf("pass 3 report = %+v, want the superseded larger row released once the bump lands", report)
+	}
+	if got := ledgerReserved(t, f, base); got != 100 {
+		t.Fatalf("reserved = %d after convergence, want the exact remaining deficit", got)
+	}
+}
+
 // touchRecorder proves the bulk touch runs strictly before the renewal
 // listing and keeps covers protected even when the listing fails outright
 // (Codex round 9).

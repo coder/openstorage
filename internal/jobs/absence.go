@@ -615,14 +615,24 @@ func (r *AbsenceReconciler) renewCovers(ctx context.Context, budget int64, repor
 			b2, c2, _, legacy2, ok2 := parseAbsenceCoverKey(supersededBy.Key)
 			if ok2 && !legacy2 && b2 == base && c2 == class {
 				// A higher incarnation exists: this row is a crash
-				// leftover — release it.
-				if err := r.registry.DeleteAbsenceCover(ctx, held.Key); err != nil {
-					errs.add(fmt.Errorf("absence reconcile: release superseded cover %s: %w", held.Key, err))
+				// leftover (rotate minted the successor but the delete —
+				// or its floor invalidation — never landed) — release
+				// it, under the same proven bump-before-delete as every
+				// compensation-shrinking delete (Codex round 12). On
+				// bump failure, fall through to the normal renewal: the
+				// leftover stays alive and protective until a bump
+				// lands.
+				if err := r.registry.BumpLFSAdoptionGen(ctx, base); err != nil {
+					errs.add(fmt.Errorf("absence reconcile: invalidate floors before releasing superseded cover %s: %w", held.Key, err))
 				} else {
-					report.CoversReleased++
+					if err := r.registry.DeleteAbsenceCover(ctx, held.Key); err != nil {
+						errs.add(fmt.Errorf("absence reconcile: release superseded cover %s: %w", held.Key, err))
+					} else {
+						report.CoversReleased++
+					}
+					held = nil
+					return
 				}
-				held = nil
-				return
 			}
 		}
 		if r.chargeCover(ctx, held.Base, held.Key, held.Bytes, true, report, st, errs) {
@@ -1043,6 +1053,19 @@ func (r *AbsenceReconciler) endRange(ctx context.Context, tr *rangeTracker, repo
 		next := liveCover{key: absenceIncarnationKey(base, class, head.n+1), n: head.n + 1, bytes: running}
 		if !r.chargeCover(ctx, base, next.key, running, false, report, st, errs) {
 			return // retried next traversal; the old row keeps covering
+		}
+		// Deleting the larger row SHRINKS compensation by the healed
+		// delta, so it needs a PROVEN floor invalidation first (Codex
+		// round 12): chargeCover's own bump is best-effort — sufficient
+		// for grows, where a stale floor is only over-compensated — but
+		// a cached floor measured during the larger absence stays
+		// deflated by bytes the smaller cover no longer compensates. On
+		// bump failure both rows stay; the next renewal's superseded
+		// cleanup retries under the same proven-bump rule.
+		if err := r.registry.BumpLFSAdoptionGen(ctx, base); err != nil {
+			errs.add(fmt.Errorf("absence reconcile: invalidate floors before rotating cover %s: %w", head.key, err))
+			r.liveCovers[class][base] = next
+			return
 		}
 		if err := r.registry.DeleteAbsenceCover(ctx, head.key); err != nil {
 			errs.add(fmt.Errorf("absence reconcile: release shrunk cover %s: %w", head.key, err))
