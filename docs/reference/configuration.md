@@ -799,14 +799,16 @@ stretches individual probes.
 - **Default:** `100000`. **Constraints:** an integer of at least `100`
   (one row can cost up to three units, so degenerate budgets cannot
   guarantee progress on both registries).
-- Tracked losses renew round-robin from a persistent ring cursor: every
-  tracked cover re-charges at least once per `ceil(3 × absent_tracked /
-  (budget/2))` passes — one pass whenever `3 × absent_tracked ≤ budget/2`
-  (a 100,000 default budget covers ~16k concurrent losses per pass). Keep
-  that renewal period times the interval below the reservation TTL; the
-  pass report's `absent_refreshed` vs `absent_tracked` shows the actual
-  cadence. The set is memory-capped at 100,000 losses
-  (`absent_untracked` reports overflow — storage-incident territory).
+- Tracked losses are covered by ONE aggregate reservation row per affected
+  repository, renewed every pass (one work unit per repository, so the
+  refresh half-budget covers incidents across tens of thousands of
+  repositories regardless of how many rows each lost — and the per-repo
+  reservation-row cap cannot bind). Round-robin re-verification then
+  shrinks aggregates as losses heal, retire, or purge; a re-verification
+  backlog (`absent_refreshed` below `absent_tracked`) only delays
+  shrinking, never cover renewal. The set is memory-capped at 100,000
+  losses (`absent_untracked` reports overflow — such rows get one-shot
+  covers renewed on rotation revisits).
 - **Multi-replica PostgreSQL fleets:** the refresh set and rotation
   cursors are per-process, and the River periodic job may run on any
   replica ([#125](https://github.com/coder/code-storage/issues/125) tracks

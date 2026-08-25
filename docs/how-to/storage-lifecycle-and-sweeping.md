@@ -502,12 +502,13 @@ cursors (budget-limited, resumable — the sweeper's inverse direction) and
   TTL'd restore cover (the same reservation row restore paths renew) plus a
   floor-generation bump, so every admission sees the missing bytes until
   they are restored or their row is retired/purged. Discovered losses join
-  a per-process **known-absent set** that every pass re-settles first, in
-  round-robin order from a persistent ring cursor — covers renew at the
-  pass cadence while `3 × absent_tracked ≤ budget/2`, and degrade to a
-  deterministic multi-pass renewal period (never map-iteration luck)
-  beyond that, even when the registry is far larger than one pass's
-  budget and the rotation returns to a row only occasionally. Startup
+  a per-process **known-absent set** whose bytes aggregate into one cover
+  reservation row per affected repository, renewed FIRST every pass (one
+  work unit per repository) — so covers renew at the pass cadence for any
+  realistic incident regardless of how many rows were lost, and the
+  per-repository reservation-row cap cannot bind. Round-robin
+  re-verification then shrinks aggregates as losses heal; a backlog there
+  delays shrinking (conservative), never renewal. Startup
   enforces the cadence-vs-TTL coupling (interval ≤ TTL/2, pass wall clock
   ≤ TTL/4), so renewals always land before live covers can lapse. The set
   is in-memory per worker:
@@ -541,9 +542,9 @@ A reconciliation pass logs one `absence reconcile pass finished` line:
 | `covers_charged` / `bytes_covered` | restore covers charged/refreshed this pass and their total bytes |
 | `cover_errors` / `stat_errors` | covers that failed (e.g. the per-repo reservation-row cap) and probes that errored — both retried next pass |
 | `rows_skipped_purged` | rows of purge-fenced repositories skipped |
-| `absent_tracked` | known-absent set size at pass end: losses the round-robin refresh renews across passes |
-| `absent_refreshed` | tracked losses re-settled this pass — below `absent_tracked` means renewal spans multiple passes; raise the budget if that period × interval approaches the reservation TTL |
-| `absent_untracked` | losses seen while the set was at its 100,000-entry memory cap — covered on discovery, refreshed only by rotation revisits |
+| `absent_tracked` | known-absent set size at pass end: losses whose per-repository aggregate covers renew every pass |
+| `absent_refreshed` | tracked losses re-verified this pass — below `absent_tracked` means heal-detection (cover shrinking) spans multiple passes; renewal is unaffected |
+| `absent_untracked` | losses seen while the set was at its 100,000-entry memory cap — one-shot covers renewed only on rotation revisits |
 | `quota_enforced` | `false` means detection-only (no quota admission to protect) |
 
 Any nonzero `lfs_rows_absent` or `pack_rows_absent` means storage lost

@@ -36,17 +36,20 @@ rows absent under BOTH spellings are genuine loss.
 Discovery is rotation-bounded, but refresh is not (Codex round 1): covers
 are TTL'd, and on a registry larger than one pass's budget the rotation
 returns to a row less often than its cover survives — so every discovered
-loss joins a per-process known-absent set that each pass re-settles FIRST,
-within half the budget: re-verify the registry row still exists
-(`HasPack`/`HasLFSObject`; retired, folded-away, and purged rows drop
-out), then re-settle it exactly like a rotation visit. Renewal is
-round-robin from a persistent ring cursor (Codex rounds 2+3): a set larger
-than one pass's refresh capacity degrades to a deterministic
-`ceil(3×tracked/(budget/2))`-pass renewal period instead of leaving
-stragglers to map-iteration luck — losses are storage-incident-scaled,
-never attacker-mintable, so the set's only hard cap is a 100,000-entry
-memory bound (overflow is covered on discovery, rotation-refreshed, and
-reported). The set is in-memory like the cursors: a restart loses it and
+loss joins a per-process known-absent set whose bytes AGGREGATE into one
+cover reservation row per affected base repository (Codex round 4):
+per-row covers would scale renewal work with the loss population and
+collide with the per-base active-reservation-row cap, so a big enough
+incident would either outrun the renewal cycle or be denied outright. The
+refresh phase runs FIRST each pass, renewal before re-verification:
+renewing every base aggregate costs one work unit per REPOSITORY — within
+the refresh half-budget for any realistic incident — while round-robin
+re-verification (`HasPack`/`HasLFSObject` + stats; healed, retired,
+folded-away, and purged rows drop out of their aggregate) only SHRINKS
+covers, so its backlog delays convergence, never visibility. Losses are
+storage-incident-scaled, never attacker-mintable, so the set's only hard
+cap is a 100,000-entry memory bound (overflow gets one-shot per-row
+covers renewed on rotation revisits, reported as `absent_untracked`). The set is in-memory like the cursors: a restart loses it and
 the rotation rediscovers — convergence delay, never corruption. Renewal
 timing is enforced end to end (Codex round 3, security): covers renew at
 pass starts, periodic ticks that fire mid-pass coalesce (River uniqueness

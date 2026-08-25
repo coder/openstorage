@@ -334,8 +334,18 @@ func TestAbsenceReconcile_RefreshDropsRemovedRows(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run 2: %v", err)
 	}
-	if report.AbsentTracked != 0 || report.CoversCharged != 0 || report.PackRowsAbsent != 0 {
+	// The renewal sub-phase re-charges the base aggregate once before
+	// re-verification discovers the fold and drops the row (conservative
+	// over-cover for at most one TTL); the tracking itself must be gone.
+	if report.AbsentTracked != 0 || report.CoversCharged != 1 || report.PackRowsAbsent != 0 {
 		t.Fatalf("pass 2 report = %+v, want the folded-away row dropped from the refresh set", report)
+	}
+	report, err = r.Run(ctx)
+	if err != nil {
+		t.Fatalf("Run 3: %v", err)
+	}
+	if report.CoversCharged != 0 {
+		t.Fatalf("pass 3 report = %+v, want no covers once nothing is tracked", report)
 	}
 }
 
@@ -361,6 +371,12 @@ func TestAbsenceReconcile_RefreshRoundRobin(t *testing.T) {
 	}
 	if report.LFSRowsAbsent != 18 || report.AbsentTracked != 18 || report.AbsentUntracked != 0 {
 		t.Fatalf("pass 1 report = %+v, want all 18 losses tracked", report)
+	}
+	// All 18 losses aggregate into ONE per-base cover row totaling their
+	// bytes (Codex round 4: per-key rows would collide with the per-base
+	// active-reservation-row cap on big incidents).
+	if got := ledgerReserved(t, f, base); got != 180 {
+		t.Fatalf("reserved = %d, want the 180-byte base aggregate", got)
 	}
 	for pass := 2; pass <= 3; pass++ {
 		report, err = r.Run(context.Background())
@@ -516,8 +532,17 @@ func TestAbsenceReconcile_RefreshDropsHealedRows(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run 2: %v", err)
 	}
-	if report.AbsentTracked != 0 || report.CoversCharged != 0 {
+	// One final conservative renewal charge precedes the re-verification
+	// that observes the heal; the tracking must end empty.
+	if report.AbsentTracked != 0 || report.CoversCharged != 1 {
 		t.Fatalf("pass 2 report = %+v, want the healed row dropped from the refresh set", report)
+	}
+	report, err = r.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run 3: %v", err)
+	}
+	if report.AbsentTracked != 0 || report.CoversCharged != 0 {
+		t.Fatalf("pass 3 report = %+v, want steady state with nothing tracked or charged", report)
 	}
 }
 
