@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.2](https://github.com/coder/code-storage/compare/v0.6.1...v0.6.2) (2026-08-25)
+
+
+### Bug Fixes
+
+* **jobs:** heal truncated registered originals from quarantine and never purge unverifiable backups ([#135](https://github.com/coder/code-storage/issues/135)) ([ca608f0](https://github.com/coder/code-storage/commit/ca608f0eb9810488732ef0cfb59fcaa59dcf4eba))
+
 ## [0.6.1](https://github.com/coder/code-storage/compare/v0.6.0...v0.6.1) (2026-08-25)
 
 
