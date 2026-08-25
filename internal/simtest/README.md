@@ -156,7 +156,11 @@ The harness must catch re-broken variants of the fixes it guards. Locally
 - break #136 lane isolation: make `FinishSync` also reset a push-lane
   column (e.g. add `push_claim_force = 0` to its UPDATE) — the shared
   full-row mirror reports a push-claim-state divergence at the next
-  observation after a sync finish overlapping a forced push claim.
+  observation after a sync finish overlapping a forced push claim;
+- break #136 marker monotonicity: make `RequestPush` overwrite instead of
+  coalesce (`SET push_pending = ?` instead of `MAX(push_pending, ?)`) —
+  the mirror reports a pending-level divergence at the first plain
+  request or rescue re-mark that lands on an unconsumed force marker.
 
 The first two were validated when this harness landed, the #86 one when
 the sync oracle landed, and the #136 ones when the push-lane oracle
