@@ -399,6 +399,73 @@ func TestLFSReclaim_SettlementChargesBudget(t *testing.T) {
 	}
 }
 
+// purgeOnProbeRegistry commits a purge (fence + ledger cleanup) the
+// moment the budget-exhaustion probe (the 1-row listing) observes the
+// target repo — the exact window Codex round 26 flagged: the probe sees
+// remaining rows, the purge deletes the repo's scan state, and an
+// unfenced cursor park would then recreate a row nothing ever removes.
+type purgeOnProbeRegistry struct {
+	LFSReclaimRegistry
+	t     *testing.T
+	store ref.Store
+	base  string
+	fired bool
+}
+
+func (p *purgeOnProbeRegistry) ListRepoLFSObjects(ctx context.Context, repo, after string, limit int) ([]ref.LFSObjectRow, error) {
+	rows, err := p.LFSReclaimRegistry.ListRepoLFSObjects(ctx, repo, after, limit)
+	if err == nil && !p.fired && repo == p.base && limit == 1 {
+		p.fired = true
+		purger, ok := p.store.(interface {
+			FenceRepoPurge(ctx context.Context, base string) error
+			PurgeRepoLedger(ctx context.Context, group []string) (int64, error)
+		})
+		if !ok {
+			p.t.Fatalf("store %T lacks the purge seams", p.store)
+		}
+		if err := purger.FenceRepoPurge(ctx, p.base); err != nil {
+			p.t.Fatalf("FenceRepoPurge: %v", err)
+		}
+		if _, err := purger.PurgeRepoLedger(ctx, []string{p.base}); err != nil {
+			p.t.Fatalf("PurgeRepoLedger: %v", err)
+		}
+	}
+	return rows, err
+}
+
+// TestLFSReclaim_ParkRacingPurgeLeavesNoCursor (Codex round 26): a purge
+// committing between the settlement probe and the cursor park must not
+// leave an orphaned job_scan_state row — the purged repo is never listed
+// again, so nothing else would ever remove it.
+func TestLFSReclaim_ParkRacingPurgeLeavesNoCursor(t *testing.T) {
+	ctx := context.Background()
+	store, reg := newReclaimStore(t)
+	base := "race-repo"
+	for _, b := range []string{"aa", "bb", "cc", "dd", "ee"} {
+		key := "lfs/" + base + "/o2/" + strings.Repeat(b, 32)
+		if err := store.RegisterLFSObject(ctx, base, key, 10); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Ref-less: the whole budget (3 < 5 rows) is settlement allowance,
+	// so the probe fires — and the hook purges before the park.
+	wrapped := &purgeOnProbeRegistry{LFSReclaimRegistry: reg, t: t, store: store, base: base}
+	r := testReclaimer(t, wrapped, staticHydrate(t, nil), time.Hour, 3, true)
+	rep, err := r.Run(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !wrapped.fired {
+		t.Fatal("probe hook never fired: the park path was not exercised")
+	}
+	if rep.ReposOverBudget != 1 {
+		t.Fatalf("run = %+v, want the repo counted over budget", rep)
+	}
+	if _, ok, err := reg.GetJobScanState(ctx, ref.ScanJobLFSReclaim, ref.ScanScopeReclaimRepo(base)); err != nil || ok {
+		t.Fatalf("cursor after racing purge = (ok=%v, %v), want no orphaned row", ok, err)
+	}
+}
+
 // TestLFSReclaim_ExactExhaustionBetweenMembers (Codex round 3): when one
 // namespace-group member's walk consumes EXACTLY the remaining budget and a
 // later member also has refs, the reclaimer must surface the over-budget

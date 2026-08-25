@@ -117,6 +117,19 @@ type ScanStateStore interface {
 	// DeleteJobScanState removes one row; deleting an absent row is a
 	// no-op.
 	DeleteJobScanState(ctx context.Context, job, scope string) error
+	// ParkRepoJobScanState upserts one PER-REPO row exactly like
+	// PutJobScanState, but consults base's purge fence in the same
+	// transaction and silently skips the write when fenced (Codex
+	// round 26 on PR #132): the purge's ledger cleanup deletes the
+	// repo's scan state, and an unfenced park racing the purge would
+	// recreate a row nothing ever removes — the purged repo is never
+	// listed again. On PG the check holds the base-ledger advisory
+	// lock, totally ordering it against FenceRepoPurge: a park ordered
+	// before the fence commits before it, so the later ledger cleanup
+	// still sweeps the row; a park ordered after sees the fence and
+	// no-ops. On SQLite the conditional upsert is one single-writer
+	// statement.
+	ParkRepoJobScanState(ctx context.Context, job, scope, payload string, generation int64, base string) error
 }
 
 func (s *PG) GetJobScanState(ctx context.Context, job, scope string) (JobScanState, bool, error) {
@@ -167,4 +180,28 @@ func (s *PG) DeleteJobScanState(ctx context.Context, job, scope string) error {
 	_, err := s.pool.Exec(ctx,
 		`DELETE FROM job_scan_state WHERE job = $1 AND scope = $2`, job, scope)
 	return err
+}
+
+func (s *PG) ParkRepoJobScanState(ctx context.Context, job, scope, payload string, generation int64, base string) error {
+	assertf(job != "" && scope != "" && base != "", "ParkRepoJobScanState(%q, %q, %q)", job, scope, base)
+	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		if err := lockBaseLedger(ctx, tx, base); err != nil {
+			return err
+		}
+		fenced, err := repoPurgeFencedPG(ctx, tx, base)
+		if err != nil {
+			return err
+		}
+		if fenced {
+			return nil // rows die with the purge: never recreate the cursor
+		}
+		_, err = tx.Exec(ctx, `
+INSERT INTO job_scan_state (job, scope, payload, generation, updated_at)
+VALUES ($1, $2, $3, $4, now())
+ON CONFLICT (job, scope) DO UPDATE SET payload = EXCLUDED.payload,
+                                       generation = EXCLUDED.generation,
+                                       updated_at = now()`,
+			job, scope, payload, generation)
+		return err
+	})
 }

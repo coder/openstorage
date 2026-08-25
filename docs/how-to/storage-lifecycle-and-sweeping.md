@@ -493,6 +493,9 @@ after a rolling restart — resumes exactly where the previous pass parked
 instead of re-examining the same prefix forever. A settlement cursor is
 fenced by the repository's pinned generations: any ref movement invalidates
 it and settlement restarts from the top of that repository's keyspace.
+Cursor parking also consults the repository purge fence in the same
+transaction, so a purge racing a mid-settlement park can never resurrect a
+cursor row for a repository that will never be scanned again.
 
 ## Reconciling registered-but-missing bytes
 

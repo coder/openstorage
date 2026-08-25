@@ -405,3 +405,53 @@ func TestPurgeRepoLedger_DropsSettlementCursor(t *testing.T) {
 		}
 	})
 }
+
+// TestParkRepoJobScanState_PurgeFence (Codex round 26 on PR #132): the
+// purge's ledger cleanup deletes the repo's settlement cursor, but a
+// park racing the purge — probe observes rows, purge commits, park
+// writes — would recreate the row, and a purged repo is never listed
+// again, so nothing would ever remove it. The fenced park must skip the
+// write once the base is purge-fenced; unfenced bases park normally.
+func TestParkRepoJobScanState_PurgeFence(t *testing.T) {
+	runRefBackends(t, func(t *testing.T, s Store) {
+		ss := scanStateStore(t, s)
+		ctx := context.Background()
+		k := newLedgerKit(t, s)
+		purger, ok := s.(interface {
+			FenceRepoPurge(ctx context.Context, base string) error
+			PurgeRepoLedger(ctx context.Context, group []string) (int64, error)
+		})
+		if !ok {
+			t.Fatalf("store %T lacks the purge seams", s)
+		}
+		scope := ScanScopeReclaimRepo(k.base())
+
+		// Unfenced: the park behaves exactly like PutJobScanState,
+		// insert and update alike.
+		if err := ss.ParkRepoJobScanState(ctx, ScanJobLFSReclaim, scope, "cursor-1", 7, k.base()); err != nil {
+			t.Fatalf("park: %v", err)
+		}
+		if err := ss.ParkRepoJobScanState(ctx, ScanJobLFSReclaim, scope, "cursor-2", 9, k.base()); err != nil {
+			t.Fatalf("re-park: %v", err)
+		}
+		st, ok2, err := ss.GetJobScanState(ctx, ScanJobLFSReclaim, scope)
+		if err != nil || !ok2 || st.Payload != "cursor-2" || st.Generation != 9 {
+			t.Fatalf("get = (%+v, %v, %v), want cursor-2/9", st, ok2, err)
+		}
+
+		// The straggler interleaving: purge fences and cleans up, THEN
+		// the in-flight park lands — it must not recreate the row.
+		if err := purger.FenceRepoPurge(ctx, k.base()); err != nil {
+			t.Fatalf("FenceRepoPurge: %v", err)
+		}
+		if _, err := purger.PurgeRepoLedger(ctx, k.group); err != nil {
+			t.Fatalf("PurgeRepoLedger: %v", err)
+		}
+		if err := ss.ParkRepoJobScanState(ctx, ScanJobLFSReclaim, scope, "orphan", 11, k.base()); err != nil {
+			t.Fatalf("fenced park: %v", err)
+		}
+		if _, ok, err := ss.GetJobScanState(ctx, ScanJobLFSReclaim, scope); err != nil || ok {
+			t.Fatalf("cursor after fenced park = (ok=%v, %v), want absent", ok, err)
+		}
+	})
+}

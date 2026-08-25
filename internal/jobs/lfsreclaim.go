@@ -607,8 +607,12 @@ func (r *LFSReclaimer) settleRepoRows(ctx context.Context, base string, gens map
 				break
 			}
 			// Park the cursor durably: the next attempt — on ANY
-			// replica — resumes here (issue #121).
-			if err := r.registry.PutJobScanState(ctx, ref.ScanJobLFSReclaim, cursorScope, after, fence); err != nil {
+			// replica — resumes here (issue #121). The park is
+			// purge-FENCED (Codex round 26): a purge committing
+			// between the probe above and this write already deleted
+			// the repo's scan state, and an unfenced upsert would
+			// recreate a row nothing ever removes.
+			if err := r.registry.ParkRepoJobScanState(ctx, ref.ScanJobLFSReclaim, cursorScope, after, fence, base); err != nil {
 				return charged, err
 			}
 			errs.add(fmt.Errorf("settle %s: %w (budget)", base, lfsscan.ErrLFSScanBudget))

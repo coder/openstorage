@@ -66,3 +66,18 @@ func (s *SQLite) DeleteJobScanState(ctx context.Context, job, scope string) erro
 		`DELETE FROM job_scan_state WHERE job = ? AND scope = ?`, job, scope)
 	return err
 }
+
+func (s *SQLite) ParkRepoJobScanState(ctx context.Context, job, scope, payload string, generation int64, base string) error {
+	assertf(job != "" && scope != "" && base != "", "ParkRepoJobScanState(%q, %q, %q)", job, scope, base)
+	// One single-writer statement: the fence check and the upsert are
+	// atomic under SQLite's database lock (see the interface contract).
+	_, err := s.db.ExecContext(ctx, `
+INSERT INTO job_scan_state (job, scope, payload, generation, updated_at)
+SELECT ?, ?, ?, ?, strftime('%s','now') * 1000
+WHERE NOT EXISTS (SELECT 1 FROM purged_repos WHERE repo = ?)
+ON CONFLICT (job, scope) DO UPDATE SET payload = excluded.payload,
+                                       generation = excluded.generation,
+                                       updated_at = excluded.updated_at`,
+		job, scope, payload, generation, base)
+	return err
+}
