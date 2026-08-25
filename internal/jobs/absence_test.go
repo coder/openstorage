@@ -339,6 +339,28 @@ func TestAbsenceReconcile_RefreshDropsRemovedRows(t *testing.T) {
 	}
 }
 
+// TestAbsenceReconcile_TrackingCapacity (Codex round 2, P1): the tracked
+// set is capped at what the refresh half-budget can re-settle in one pass
+// (budget/6), so every tracked cover provably refreshes every pass; losses
+// beyond it are reported as untracked.
+func TestAbsenceReconcile_TrackingCapacity(t *testing.T) {
+	f := newSweepFixture(t)
+	base := "repo-capacity"
+	for i := 0; i < 18; i++ {
+		oid := strings.Repeat("a", 62) + string([]byte{'0' + byte(i/10), '0' + byte(i%10)})
+		registerLFS(t, f, base, blob.LFSKey(base, oid), 10)
+	}
+
+	r := testReconciler(t, f, true, 100) // capacity = (100-50)/3 = 16
+	report, err := r.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if report.LFSRowsAbsent != 18 || report.AbsentTracked != 16 || report.AbsentUntracked != 2 {
+		t.Fatalf("report = %+v, want 18 absent with 16 tracked / 2 untracked at capacity", report)
+	}
+}
+
 // TestAbsenceReconcile_RefreshDropsHealedRows: a tracked loss whose bytes
 // return leaves the refresh set on the next pass.
 func TestAbsenceReconcile_RefreshDropsHealedRows(t *testing.T) {

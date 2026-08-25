@@ -113,13 +113,13 @@ const (
 	// work units meter requests, but a degraded blob store can stretch
 	// each one — time, not just work, must bound the pass.
 	absencePassTimeout = time.Hour
-	// absentMemoCap bounds the known-absent refresh set (Codex round 1,
-	// P1): each tracked row costs up to three probes per pass, so the
-	// memo must not scale with an unbounded loss population. Losses
-	// discovered while the memo is full are covered on discovery but
-	// refreshed only by the rotation — a storage incident that large is
-	// operator territory regardless, and the pass logs the overflow.
-	absentMemoCap = 10_000
+	// absentRowWorstCost is one tracked row's worst-case refresh cost in
+	// work units: the registration probe, the stat, and the LFS twin
+	// probe. The tracking capacity divides the refresh half-budget by it
+	// (Codex round 2, P1): a set larger than what the refresh can
+	// re-settle in ONE pass would leave randomly-iterated stragglers
+	// whose covers lapse before their next visit.
+	absentRowWorstCost = 3
 )
 
 // AbsenceReconciler runs the reconciliation scan. Construct with
@@ -154,8 +154,13 @@ type AbsenceReconciler struct {
 	// covered at the pass cadence (wiring warns when the cadence exceeds
 	// the TTL). In-memory per process like the cursors: a restart loses
 	// it and the rotation rediscovers — convergence delay, never
-	// corruption (#121 tracks fleet persistence).
+	// corruption (issue #125 tracks fleet persistence with #121).
 	knownAbsent map[string]absentRow
+	// absentCap bounds knownAbsent at the refresh half-budget's one-pass
+	// capacity (Codex round 2, P1): tracked ⇒ provably re-settled every
+	// pass. Losses beyond it are covered on discovery, refreshed by
+	// rotation revisits, and reported as absent_untracked.
+	absentCap int64
 	// passes counts completed Run invocations to alternate phase order
 	// (Codex round 1, P2): a twin probe can overdraw the LFS allocation
 	// by one unit, and at degenerate budgets a fixed order would hand
@@ -189,6 +194,7 @@ func NewAbsenceReconciler(registry AbsenceRegistry, blobs BlobStatter, quotaEnfo
 		logger:        logger,
 		passTimeout:   absencePassTimeout,
 		knownAbsent:   make(map[string]absentRow),
+		absentCap:     (budget - budget/2) / absentRowWorstCost,
 	}
 }
 
@@ -312,10 +318,10 @@ func (r *AbsenceReconciler) trackAbsent(row absentRow, report *AbsenceReport) {
 	if _, ok := r.knownAbsent[row.key]; ok {
 		return
 	}
-	if len(r.knownAbsent) >= absentMemoCap {
+	if int64(len(r.knownAbsent)) >= r.absentCap {
 		report.AbsentUntracked++
-		r.logger.Warn("absence reconcile: known-absent set is full; this loss refreshes only on rotation revisits",
-			"key", row.key, "cap", absentMemoCap)
+		r.logger.Warn("absence reconcile: known-absent set is at the refresh capacity; this loss refreshes only on rotation revisits — raise CODESTORAGE_ABSENCE_RECONCILE_BUDGET",
+			"key", row.key, "cap", r.absentCap)
 		return
 	}
 	r.knownAbsent[row.key] = row

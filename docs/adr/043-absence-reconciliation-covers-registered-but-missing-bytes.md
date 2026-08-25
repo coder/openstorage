@@ -36,16 +36,29 @@ rows absent under BOTH spellings are genuine loss.
 Discovery is rotation-bounded, but refresh is not (Codex round 1): covers
 are TTL'd, and on a registry larger than one pass's budget the rotation
 returns to a row less often than its cover survives — so every discovered
-loss joins a bounded per-process known-absent set (10,000 rows) that each
-pass re-settles FIRST, within half the budget: re-verify the registry row
-still exists (`HasPack`/`HasLFSObject`; retired, folded-away, and purged
-rows drop out), then re-settle it exactly like a rotation visit. The set is
+loss joins a per-process known-absent set that each pass re-settles FIRST,
+within half the budget: re-verify the registry row still exists
+(`HasPack`/`HasLFSObject`; retired, folded-away, and purged rows drop
+out), then re-settle it exactly like a rotation visit. The set is capped
+at the refresh half-budget's one-pass capacity (`budget/6` rows, Codex
+round 2), so tracked ⇒ provably re-settled every pass; overflow is
+covered on discovery, rotation-refreshed, and reported. The set is
 in-memory like the cursors: a restart loses it and the rotation
 rediscovers — convergence delay, never corruption. The rotation leader
 alternates between the two registries each pass, since a twin probe can
 overdraw the leader's allocation by a unit; a configuration floor
 (`MinAbsenceReconcileBudget`) keeps budgets out of single-row-overdraw
 territory.
+
+Known residual (issue #125, with #121): on multi-replica PostgreSQL
+fleets the River periodic job may run on any replica, and per-process
+state makes refresh continuity per-replica — a cover discovered on one
+replica can lapse before that replica's next turn. Never a regression
+versus pre-#101 (every replica's own rotation independently rediscovers
+and re-covers), and fully mitigated by sizing the budget at or above the
+fleet's registered row count so every pass is a complete rotation;
+fleet-persistent state belongs to the #121 bundle rather than a parallel
+mechanism here.
 
 A genuine loss is charged through the existing round-57/58 seam,
 `ref.ReserveRestoreCover`, under the canonical spelling plus

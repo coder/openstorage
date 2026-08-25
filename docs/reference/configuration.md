@@ -797,9 +797,18 @@ stretches individual probes.
 - **Default:** `100000`. **Constraints:** an integer of at least `100`
   (one row can cost up to three units, so degenerate budgets cannot
   guarantee progress on both registries).
-- Keep the budget's refresh half comfortably above three units per
-  concurrently tracked loss (`absent_tracked` in the pass report; capped
-  at 10,000) so every known loss re-covers every pass.
+- The tracked-loss set is capped at what the refresh half-budget can
+  re-settle in one pass (`budget/6` entries; 16,666 at the default), so
+  every tracked cover provably refreshes every pass. Losses beyond the cap
+  are covered on discovery, refreshed only by rotation revisits, and
+  reported as `absent_untracked` — raise the budget if that stays nonzero.
+- **Multi-replica PostgreSQL fleets:** the refresh set and rotation
+  cursors are per-process, and the River periodic job may run on any
+  replica ([#125](https://github.com/coder/code-storage/issues/125) tracks
+  fleet persistence with [#121](https://github.com/coder/code-storage/issues/121)).
+  Size the budget at or above the fleet's total registered row count —
+  every pass is then a complete rotation and any replica re-covers every
+  loss fleet-wide.
 
 ### `CODESTORAGE_REPACK_THRESHOLD`
 
