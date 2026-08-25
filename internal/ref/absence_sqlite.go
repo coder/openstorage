@@ -30,6 +30,38 @@ ORDER BY repo ASC, key ASC LIMIT ?`,
 	return out, rows.Err()
 }
 
+// ListAbsenceCovers — see the PG twin. SQLite's default BINARY collation
+// is already byte order, so the plain range scan matches the PG COLLATE
+// "C" semantics.
+func (s *SQLite) ListAbsenceCovers(ctx context.Context, afterRaw string, limit int) ([]AbsenceCoverRow, error) {
+	validateAbsencePage(limit)
+	if afterRaw == "" {
+		afterRaw = AbsenceCoverPrefix // no real row key sorts at the bare prefix
+	}
+	rows, err := s.db.QueryContext(ctx, `
+SELECT key, repo, bytes FROM pack_reservations
+WHERE key > ? AND key < ?
+ORDER BY key ASC LIMIT ?`,
+		afterRaw, absenceCoverRangeEnd, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list absence covers: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var out []AbsenceCoverRow
+	for rows.Next() {
+		var r AbsenceCoverRow
+		if err := rows.Scan(&r.RawKey, &r.Base, &r.Bytes); err != nil {
+			return nil, err
+		}
+		var ok bool
+		if r.Key, ok = stripAbsenceCoverRow(r.RawKey); !ok {
+			continue // foreign spelling: left to reservation expiry
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
 // ListFleetPacks — see the PG twin.
 func (s *SQLite) ListFleetPacks(ctx context.Context, afterRepo, afterID string, limit int) ([]AbsencePackRow, error) {
 	validateAbsencePage(limit)

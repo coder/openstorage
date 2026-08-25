@@ -113,15 +113,29 @@ func (s *SQLite) ClearLFSObjectsUnreferenced(ctx context.Context, repo string, k
 }
 
 // RetireUnreferencedLFSObject — see the PG twin for the full contract.
-func (s *SQLite) RetireUnreferencedLFSObject(ctx context.Context, repo, key string, pinnedGens map[string]int64, grace time.Duration) (bool, error) {
+func (s *SQLite) RetireUnreferencedLFSObject(ctx context.Context, repo, key string, pinnedGens map[string]int64, grace, reapMaxAge time.Duration) (bool, error) {
 	assertf(repo != "" && key != "", "RetireUnreferencedLFSObject: empty repo/key")
 	assertf(len(pinnedGens) > 0, "RetireUnreferencedLFSObject: no pinned generations")
 	assertf(grace >= 0, "RetireUnreferencedLFSObject: negative grace %v", grace)
+	assertf(reapMaxAge > 0, "RetireUnreferencedLFSObject: non-positive reap watermark bound %v", reapMaxAge)
 	tx, err := s.db.BeginTx(ctx, nil) // BEGIN IMMEDIATE via _txlock
 	if err != nil {
 		return false, fmt.Errorf("retire lfs object begin: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+	// Observed reap coupling (issue #120) — see the PG twin. The
+	// watermark stamps updated_at in epoch MILLISECONDS.
+	var reapFresh bool
+	if err := tx.QueryRowContext(ctx, `
+SELECT EXISTS(SELECT 1 FROM job_scan_state
+  WHERE job = ? AND scope = ?
+    AND updated_at > `+sqliteEpochMS+` - ?)`,
+		ScanJobSweep, ScanScopeLFSDestructiveReap, reapMaxAge.Milliseconds()).Scan(&reapFresh); err != nil {
+		return false, err
+	}
+	if !reapFresh {
+		return false, fmt.Errorf("retire lfs object %s: %w", key, ErrReapWatermarkStale)
+	}
 	if fenced, err := repoPurgeFencedSQLite(ctx, tx, repo); err != nil {
 		return false, err
 	} else if fenced {

@@ -168,17 +168,41 @@ func (s *PG) ClearLFSObjectsUnreferenced(ctx context.Context, repo string, keys 
 // grace-expired marked object inside that window is exposed, because
 // git-lfs clients always touch via the batch API first.
 //
+// reapMaxAge is the observed-coupling bound (issue #120): the verdict
+// re-reads the sweeper's "last completed destructive LFS pass" watermark
+// (job_scan_state, ScanJobSweep/ScanScopeLFSDestructiveReap) INSIDE the
+// transaction and refuses with ErrReapWatermarkStale when the watermark is
+// absent or older than the bound. Refunding an object-cap slot is only
+// sound while the physical reap is demonstrably completing — a configured
+// sweep cadence says nothing when deletes fail, a pass outruns the
+// reclamation cycle, or the versioning guard demotes sweeps to list-only
+// mid-run. The comparison runs on the database clock at both ends (the
+// watermark is stamped with now()), so replica clock skew cannot widen the
+// window.
+//
 // retired=false means the verdict lost — fence drift, purge fence, cleared
 // or young mark, or a vanished row — and the caller moves on; the next scan
 // re-derives everything from durable state.
-func (s *PG) RetireUnreferencedLFSObject(ctx context.Context, repo, key string, pinnedGens map[string]int64, grace time.Duration) (bool, error) {
+func (s *PG) RetireUnreferencedLFSObject(ctx context.Context, repo, key string, pinnedGens map[string]int64, grace, reapMaxAge time.Duration) (bool, error) {
 	assertf(repo != "" && key != "", "RetireUnreferencedLFSObject: empty repo/key")
 	assertf(len(pinnedGens) > 0, "RetireUnreferencedLFSObject: no pinned generations")
 	assertf(grace >= 0, "RetireUnreferencedLFSObject: negative grace %v", grace)
+	assertf(reapMaxAge > 0, "RetireUnreferencedLFSObject: non-positive reap watermark bound %v", reapMaxAge)
 	retired := false
 	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
 		if err := lockBaseLedger(ctx, tx, repo); err != nil {
 			return err
+		}
+		var reapFresh bool
+		if err := tx.QueryRow(ctx, `
+SELECT EXISTS(SELECT 1 FROM job_scan_state
+  WHERE job = $1 AND scope = $2
+    AND updated_at > now() - make_interval(secs => $3))`,
+			ScanJobSweep, ScanScopeLFSDestructiveReap, reapMaxAge.Seconds()).Scan(&reapFresh); err != nil {
+			return err
+		}
+		if !reapFresh {
+			return ErrReapWatermarkStale
 		}
 		// A purge-fenced repo's rows belong to the purge pipeline
 		// (issue #52): it drops them wholesale with the counter row.

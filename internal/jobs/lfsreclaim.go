@@ -40,8 +40,13 @@ type LFSReclaimRegistry interface {
 	ClearLFSObjectsUnreferenced(ctx context.Context, repo string, keys []string) (int64, error)
 	// RetireUnreferencedLFSObject is the guarded verdict — see the ref
 	// store contract (generation fence, purge fence, in-transaction grace
-	// recheck, count/usage refund).
-	RetireUnreferencedLFSObject(ctx context.Context, repo, key string, pinnedGens map[string]int64, grace time.Duration) (bool, error)
+	// recheck, reap-watermark freshness, count/usage refund).
+	RetireUnreferencedLFSObject(ctx context.Context, repo, key string, pinnedGens map[string]int64, grace, reapMaxAge time.Duration) (bool, error)
+	// ScanStateStore persists the rotation cursor, the per-repo
+	// row-settlement cursors, and serves the sweeper's destructive-reap
+	// watermark (issues #120/#121): River may run each pass on any
+	// replica, so scan progress must not live in process memory.
+	ref.ScanStateStore
 	// IsRepoPurged skips purge-fenced repos (their rows die with the purge).
 	IsRepoPurged(ctx context.Context, base string) (bool, error)
 	// GetGeneration pins each namespace-group member's ref generation
@@ -93,6 +98,15 @@ type LFSReclaimReport struct {
 	RowsSpared   int64 `json:"rows_spared"`
 	BytesRetired int64 `json:"bytes_retired"`
 	DryRun       bool  `json:"dry_run"`
+	// ReapWatermarkStale reports the pass ran report-only because the
+	// sweeper's last completed destructive LFS pass is older than the
+	// grace window (or has never happened) — refunds gate on OBSERVED
+	// reap completion, not configured cadence (issue #120).
+	ReapWatermarkStale bool `json:"reap_watermark_stale"`
+	// RowsDeferredReapStale counts grace-expired eligible rows whose
+	// retirement was deferred by the stale watermark; they retire on a
+	// later pass once destructive sweeps demonstrably complete again.
+	RowsDeferredReapStale int64 `json:"rows_deferred_reap_stale"`
 }
 
 const (
@@ -133,6 +147,10 @@ const (
 	// resumes strictly after the last attempted repository, so successive
 	// bounded passes still make fair progress across the fleet.
 	lfsReclaimPassTimeout = time.Hour
+	// scanStateWriteTimeout bounds the detached end-of-pass cursor park:
+	// pass contexts regularly end by expiring, and the park must not
+	// inherit that death, nor hang unbounded.
+	scanStateWriteTimeout = 10 * time.Second
 )
 
 // LFSReclaimer runs the reclamation scan. Construct with NewLFSReclaimer;
@@ -150,18 +168,22 @@ type LFSReclaimer struct {
 	hydrateTimeout time.Duration    // per-member cap, shrinkable in tests
 	walkTimeout    time.Duration    // per-member walk cap, shrinkable in tests
 	passTimeout    time.Duration    // whole-pass cap, shrinkable in tests
-	// cursor is the last base repo a run attempted (successful or not):
-	// each run resumes strictly after it and wraps on exhaustion, so a
-	// failing or over-budget repo cannot monopolize every run (the
-	// purger's rotation, issue #52). In-memory per process.
-	cursor string
-	// rowCursors resumes settlement past a non-retiring row prefix (Codex
-	// round 8): when the allowance runs out mid-repo, the next attempt
-	// continues after the last examined key instead of re-paging rows
-	// that stay put — referenced, in-grace, or dry-run rows — which would
-	// otherwise starve the tail forever. Cleared when a pass reaches the
-	// end of the keyspace. In-memory per process, like cursor.
-	rowCursors map[string]string
+	// reapStale is the pass-local advisory demotion (issue #120): set at
+	// pass start when the sweeper's destructive-reap watermark is stale,
+	// so settlement skips retire transactions that would only refuse.
+	// The authoritative gate is RetireUnreferencedLFSObject's own
+	// in-transaction watermark recheck.
+	reapStale bool
+	// Scan progress — the rotation cursor (last base repo a run
+	// attempted, resumed strictly after; the purger's rotation, issue
+	// #52) and the per-repo row-settlement cursors (Codex round 8:
+	// resume past a non-retiring row prefix, or the tail starves) — is
+	// FLEET-PERSISTENT via the registry's job_scan_state rows (issue
+	// #121): River may run each pass on any replica, and in-process
+	// cursors made a repo whose settlement spans multiple budget-limited
+	// passes re-examine its prefix forever under worker turnover. Row
+	// cursors carry the pinned-generation fence and are invalidated by
+	// any generation bump (fresh scan, never a resume across a fence).
 }
 
 // NewLFSReclaimer wires the reclamation job.
@@ -186,8 +208,22 @@ func NewLFSReclaimer(registry LFSReclaimRegistry, hydrate HydrateFunc, walk LFSW
 		hydrateTimeout: lfsReclaimHydrateTimeout,
 		walkTimeout:    lfsReclaimWalkTimeout,
 		passTimeout:    lfsReclaimPassTimeout,
-		rowCursors:     make(map[string]string),
 	}
+}
+
+// gensFence folds pinned namespace-group generations into the row-cursor
+// invalidation fence. Generations only ever increment (schema triggers), so
+// the SUM is strictly monotone under any member's bump: equality proves no
+// member's refs moved since the cursor was parked, and any drift restarts
+// settlement from the top of the keyspace.
+func gensFence(gens map[string]int64) int64 {
+	assertf(len(gens) > 0, "gensFence: no pinned generations")
+	var sum int64
+	for _, gen := range gens {
+		assertf(gen >= 0, "gensFence: negative generation %d", gen)
+		sum += gen
+	}
+	return sum
 }
 
 // Run executes one bounded reclamation pass: page LFS-holding repos from
@@ -205,7 +241,40 @@ func (r *LFSReclaimer) Run(ctx context.Context) (LFSReclaimReport, error) {
 	defer cancelPass()
 	budget := r.objectBudget
 	var errs boundedErrs
-	cursor := r.cursor
+	// Observed reap coupling, advisory half (issue #120): with deletes
+	// enabled, demote the pass to report-only when the sweeper's last
+	// completed destructive LFS pass is older than the grace window (or
+	// missing — a fresh deployment reports until its first clean
+	// destructive sweep). The demotion only skips retire transactions
+	// that would refuse anyway; the authoritative, race-free gate is the
+	// retire transaction's own watermark recheck on the database clock.
+	r.reapStale = false
+	if r.deleteEnabled {
+		mark, ok, err := r.registry.GetJobScanState(ctx, ref.ScanJobSweep, ref.ScanScopeLFSDestructiveReap)
+		switch {
+		case err != nil:
+			// Fail toward report-only: the in-transaction gate would
+			// refuse refunds on the same broken table anyway.
+			errs.add(fmt.Errorf("lfs reclaim: read reap watermark: %w", err))
+			r.reapStale = true
+		case !ok || r.now().Sub(mark.UpdatedAt) > r.grace:
+			r.reapStale = true
+		}
+		if r.reapStale {
+			report.ReapWatermarkStale = true
+			r.logger.Warn("lfs reclaim: no destructive LFS sweep completed within the grace window; this pass is report-only and slot refunds are deferred",
+				"grace", r.grace)
+		}
+	}
+	// Resume the fleet-persistent rotation (issue #121); a lost or
+	// unreadable cursor restarts the rotation from the top, which only
+	// costs fairness, never correctness.
+	cursor := ""
+	if st, ok, err := r.registry.GetJobScanState(ctx, ref.ScanJobLFSReclaim, ref.ScanScopeReclaimRotation); err != nil {
+		errs.add(fmt.Errorf("lfs reclaim: read rotation cursor: %w", err))
+	} else if ok {
+		cursor = st.Payload
+	}
 	wrapped := cursor == ""
 	scanned := make(map[string]bool)
 loop:
@@ -269,7 +338,15 @@ loop:
 			}
 		}
 	}
-	r.cursor = cursor
+	// Park the rotation durably for whichever replica runs the next pass
+	// (issue #121), on a bounded DETACHED context: the pass regularly
+	// ends by burning its own deadline, and losing the park would replay
+	// this pass's whole rotation segment. Best-effort beyond that.
+	parkCtx, cancelPark := context.WithTimeout(context.WithoutCancel(ctx), scanStateWriteTimeout)
+	defer cancelPark()
+	if err := r.registry.PutJobScanState(parkCtx, ref.ScanJobLFSReclaim, ref.ScanScopeReclaimRotation, cursor, 0); err != nil {
+		errs.add(fmt.Errorf("lfs reclaim: park rotation cursor: %w", err))
+	}
 	r.logger.Info("lfs reclaim pass finished",
 		"repos_scanned", report.ReposScanned,
 		"repos_skipped", report.ReposSkipped,
@@ -284,7 +361,9 @@ loop:
 		"rows_retired", report.RowsRetired,
 		"rows_spared", report.RowsSpared,
 		"bytes_retired", report.BytesRetired,
-		"dry_run", report.DryRun)
+		"dry_run", report.DryRun,
+		"reap_watermark_stale", report.ReapWatermarkStale,
+		"rows_deferred_reap_stale", report.RowsDeferredReapStale)
 	return report, errs.join()
 }
 
@@ -303,6 +382,12 @@ func (r *LFSReclaimer) reclaimRepo(ctx context.Context, base string, budget int6
 		return 0, err
 	} else if purged {
 		report.ReposSkipped++ // the purge pipeline owns fenced repos' rows
+		// Drop any parked settlement cursor with the repo: the purge
+		// pipeline drops the registry rows the cursor pointed into, and
+		// scan-state rows must not outlive their repo (idempotent).
+		if err := r.registry.DeleteJobScanState(ctx, ref.ScanJobLFSReclaim, ref.ScanScopeReclaimRepo(base)); err != nil {
+			return 0, err
+		}
 		return 0, nil
 	}
 	branch, ok, err := r.defaultBranch(ctx, base)
@@ -419,12 +504,34 @@ func (r *LFSReclaimer) hydrateBounded(ctx context.Context, member, branch string
 // durable two ways: settled rows stay settled, and the per-repo row cursor
 // resumes the next attempt after the last examined key (Codex round 8) —
 // without it, a non-retiring prefix of referenced, in-grace, or dry-run
-// rows would be re-paged forever and the tail never examined.
+// rows would be re-paged forever and the tail never examined. The cursor
+// is a fleet-persistent job_scan_state row (issue #121) fenced by the
+// pinned generations: any member's ref movement invalidates it, restarting
+// settlement from the top of the keyspace — never a resume across a fence.
+// Resumption is safe regardless because every verdict below derives from
+// THIS pass's freshly computed reachable set; the cursor only skips a
+// prefix whose rows were settled against an equally valid earlier set.
 func (r *LFSReclaimer) settleRepoRows(ctx context.Context, base string, gens map[string]int64, referenced map[string]struct{}, allowance int64, report *LFSReclaimReport) (int64, error) {
 	assertf(allowance >= 0, "settleRepoRows: negative allowance %d", allowance)
 	var errs boundedErrs
 	var charged int64
-	after := r.rowCursors[base]
+	after := ""
+	fence := gensFence(gens)
+	cursorScope := ref.ScanScopeReclaimRepo(base)
+	switch st, ok, err := r.registry.GetJobScanState(ctx, ref.ScanJobLFSReclaim, cursorScope); {
+	case err != nil:
+		return 0, err
+	case ok && st.Generation == fence:
+		after = st.Payload // resume past the settled prefix
+	case ok:
+		// Refs moved since the cursor was parked: the fence invalidates
+		// it — fresh scan. Deleting is cosmetic (a park or completion
+		// below rewrites it) but keeps stale rows from lingering when
+		// the repo never parks again.
+		if err := r.registry.DeleteJobScanState(ctx, ref.ScanJobLFSReclaim, cursorScope); err != nil {
+			return 0, err
+		}
+	}
 	for {
 		page := lfsReclaimRowPage
 		if remaining := allowance - charged; remaining < int64(page) {
@@ -441,7 +548,11 @@ func (r *LFSReclaimer) settleRepoRows(ctx context.Context, base string, gens map
 			if len(probe) == 0 {
 				break
 			}
-			r.rowCursors[base] = after // resume here next attempt
+			// Park the cursor durably: the next attempt — on ANY
+			// replica — resumes here (issue #121).
+			if err := r.registry.PutJobScanState(ctx, ref.ScanJobLFSReclaim, cursorScope, after, fence); err != nil {
+				return charged, err
+			}
 			errs.add(fmt.Errorf("settle %s: %w (budget)", base, lfsscan.ErrLFSScanBudget))
 			return charged, errs.join()
 		}
@@ -482,8 +593,19 @@ func (r *LFSReclaimer) settleRepoRows(ctx context.Context, base string, gens map
 			if !r.deleteEnabled {
 				continue
 			}
-			retired, err := r.registry.RetireUnreferencedLFSObject(ctx, base, row.Key, gens, r.grace)
+			if r.reapStale {
+				// Advisory demotion (issue #120): the retire transaction
+				// would refuse with the same verdict; skip the round
+				// trip and report the deferral distinctly.
+				report.RowsDeferredReapStale++
+				continue
+			}
+			retired, err := r.registry.RetireUnreferencedLFSObject(ctx, base, row.Key, gens, r.grace, r.grace)
 			switch {
+			case errors.Is(err, ref.ErrReapWatermarkStale):
+				// The in-transaction gate fired (the pass outlived the
+				// watermark's freshness): deferred, not an error.
+				report.RowsDeferredReapStale++
 			case err != nil:
 				errs.add(err)
 			case retired:
@@ -510,7 +632,9 @@ func (r *LFSReclaimer) settleRepoRows(ctx context.Context, base string, gens map
 	}
 	// End of the keyspace: the rotation is complete (a cursor-resumed pass
 	// covered the tail; the front was covered when the cursor was minted).
-	delete(r.rowCursors, base)
+	if err := r.registry.DeleteJobScanState(ctx, ref.ScanJobLFSReclaim, cursorScope); err != nil {
+		return charged, err
+	}
 	return charged, errs.join()
 }
 

@@ -126,6 +126,12 @@ func (s *SQLite) InitSchema(ctx context.Context) error {
 		// see the PG schema comment.
 		`CREATE TABLE IF NOT EXISTS purged_repos (repo TEXT PRIMARY KEY,
 		    fenced_at INTEGER NOT NULL DEFAULT 0)`,
+		// Fleet-persistent background-job scan state (issues
+		// #120/#121/#125): see the PG schema comment. updated_at is unix
+		// milliseconds, the reservation tables' clock convention.
+		`CREATE TABLE IF NOT EXISTS job_scan_state (job TEXT NOT NULL, scope TEXT NOT NULL,
+		    payload TEXT NOT NULL DEFAULT '', generation INTEGER NOT NULL DEFAULT 0,
+		    updated_at INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (job, scope))`,
 	} {
 		if _, err := tx.ExecContext(ctx, stmt); err != nil {
 			return fmt.Errorf("sqlite init schema: %w", err)

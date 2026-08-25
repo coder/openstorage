@@ -194,6 +194,20 @@ type SweepConfig struct {
 	// same TTL the write gates charge so pruning never races a live
 	// reservation.
 	ReservationTTL time.Duration
+	// RecordLFSReapComplete, when set, persists the fleet's "last
+	// completed destructive LFS pass" watermark (issue #120) — the
+	// observed evidence LFS reclamation's slot refunds gate on
+	// (RetireUnreferencedLFSObject refuses refunds when it goes stale).
+	// Called only when this pass ran with the LFS delete class ARMED at
+	// pass end (DeleteLFS configured and not demoted by the delete
+	// guard) and finished BOTH keyspace listings with zero recorded
+	// errors. Whole-pass cleanliness is deliberately stricter than
+	// LFS-class cleanliness: a heal or pack-class failure may mean
+	// quarantine backups are not draining or the listing machinery is
+	// degraded, and the cost of a false freeze is only deferred refunds
+	// — fail closed. A recording failure is reported like any sweep
+	// error; the watermark simply does not advance.
+	RecordLFSReapComplete func(context.Context) error
 }
 
 // OrphanPack is one orphan candidate found by a sweep.
@@ -397,6 +411,18 @@ func (s *Sweeper) Sweep(ctx context.Context) (SweepReport, error) {
 	if err != nil {
 		return report, fmt.Errorf("sweep: list %s: %w", blob.LFSRoot, err)
 	}
+	// The destructive-reap watermark (issue #120): this pass offered the
+	// FULL keyspace (both listings completed — a listing error returned
+	// above) with the LFS delete class armed end-to-end and no
+	// unacknowledged failures, so "stranded LFS blobs actually get
+	// reaped" is observed, not assumed. Recorded before the report log so
+	// a recording failure is visible in the same pass's error join.
+	if lfsMode && deleteErrs.ok() && s.cfg.RecordLFSReapComplete != nil {
+		if err := s.cfg.RecordLFSReapComplete(ctx); err != nil {
+			deleteErrs.add(fmt.Errorf("sweep: record lfs reap watermark: %w", err))
+			s.logger.Error("orphan pack sweep: recording the destructive LFS reap watermark failed; reclamation slot refunds will defer once it stales", "err", err)
+		}
+	}
 
 	s.logger.Info("orphan pack sweep finished",
 		"live", report.Live, "fresh", report.Fresh,
@@ -435,6 +461,11 @@ func (b *boundedErrs) add(err error) {
 		return
 	}
 	b.elided++
+}
+
+// ok reports that no error was recorded (retained or elided).
+func (b *boundedErrs) ok() bool {
+	return len(b.errs) == 0 && b.elided == 0
 }
 
 func (b *boundedErrs) join() error {
