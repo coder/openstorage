@@ -275,6 +275,8 @@ The same tests run against real S3: point `CODESTORAGE_TEST_S3_URL` at an
 existing bucket (`s3://my-bucket?region=us-east-1`) with real credentials in
 the environment. Without an `endpoint` query parameter the bucket is only
 probed, never created — re-creating an owned us-east-1 bucket would reset
-its ACLs. Keys are uniquely suffixed and cleaned up, but use a scratch
-bucket, not a production one.
+its ACLs. Versioned (or version-suspended) buckets are refused, because
+cleanup relies on `DeleteObject` actually reclaiming the test keys rather
+than writing delete markers. Keys are uniquely suffixed and cleaned up, but
+use an unversioned scratch bucket, not a production one.
 

@@ -68,6 +68,15 @@ func openS3Endpoint(t *testing.T) *S3 {
 	} else if _, err := b.client.HeadBucket(ctx, &awss3.HeadBucketInput{Bucket: aws.String(b.name)}); err != nil {
 		t.Fatalf("bucket %q must already exist on real S3 (refusing to create or mutate it): %v", b.name, err)
 	}
+	// Refuse versioned buckets: with versioning enabled (or suspended —
+	// suspension retains every stored version) DeleteObject only writes
+	// delete markers, so the per-test cleanup below would silently
+	// accumulate noncurrent versions on a real bucket run after run.
+	if versioned, err := b.VersioningEnabled(ctx); err != nil {
+		t.Fatalf("VersioningEnabled: %v", err)
+	} else if versioned {
+		t.Fatalf("bucket %q has versioning enabled or suspended; these tests rely on DeleteObject cleanup — use an unversioned scratch bucket", b.name)
+	}
 	return b
 }
 
