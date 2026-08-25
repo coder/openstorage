@@ -15,8 +15,11 @@ const ProbeKey = "_wal/probe"
 // Probe failure classes: how a probe step failed. The distinction matters
 // operationally — the first three are DEFINITIVE store behavior ("ignored"
 // is the silent-corruption class: the store accepted a write the condition
-// forbids; "rejected" is loud-but-wrong; "mishandled" is any other
-// definitive divergence) and mean the store is non-compliant. "inconclusive"
+// forbids; "rejected" is loud-but-wrong: a real rejection response that is
+// not the required precondition outcome, such as a 403 or the wrong
+// conditional sentinel; "mishandled" is any other definitive divergence,
+// such as success where failure was required or an unchanged ETag after an
+// advance) and mean the store is non-compliant. "inconclusive"
 // means the probe could not obtain a definitive store verdict at all
 // (ambiguous post-send failure where the write may have landed, a
 // transport/not-executed failure, or a failed scratch cleanup): the store
@@ -156,16 +159,18 @@ func probeAtKey(ctx context.Context, c *Client, key string) error {
 	return nil
 }
 
-// probeStepError classifies an unexpected step error. ProbeMishandled is
-// reserved for DEFINITIVE store responses (a wrong-step sentinel, a
-// definitive non-conditional 4xx, exhausted 409 contention) — the store
-// answered, wrongly. An AmbiguousError (post-send 5xx/timeout: the write
-// may have landed) or a failure that never produced a store verdict
-// (ErrNotExecuted: expired context or dial-class transport failure) is
-// ProbeInconclusive — a boot probe must be conclusive (§2.6), so serving
-// is refused, but the store is not accused of non-compliance. Those two
-// shapes are exhaustive for non-definitive Create/Advance outcomes by the
-// §2.3 taxonomy (see putConditional/classifyTransport).
+// probeStepError classifies an unexpected step error. An AmbiguousError
+// (post-send 5xx/timeout: the write may have landed) or a failure that
+// never produced a store verdict (ErrNotExecuted: expired context or
+// dial-class transport failure) is ProbeInconclusive — a boot probe must
+// be conclusive (§2.6), so serving is refused, but the store is not
+// accused of non-compliance; those two shapes are exhaustive for
+// non-definitive Create/Advance outcomes by the §2.3 taxonomy (see
+// putConditional/classifyTransport). Among DEFINITIVE responses, a
+// rejection that is simply the wrong one for the step — an unexpected
+// conditional-write sentinel or a real non-conditional 4xx — is
+// ProbeRejected (loud-but-wrong); any other definitive divergence is
+// ProbeMishandled.
 func probeStepError(step int, surface string, err error, want string) *ProbeError {
 	var amb *AmbiguousError
 	if errors.As(err, &amb) {
@@ -176,8 +181,28 @@ func probeStepError(step int, surface string, err error, want string) *ProbeErro
 		return &ProbeError{Step: step, Surface: surface, Class: ProbeInconclusive,
 			Diagnosis: fmt.Sprintf("step was never executed — no store verdict was produced: %v", err)}
 	}
+	if definitiveRejection(err) {
+		return &ProbeError{Step: step, Surface: surface, Class: ProbeRejected,
+			Diagnosis: fmt.Sprintf("%s; got a definitive-but-wrong rejection: %v", want, err)}
+	}
 	return &ProbeError{Step: step, Surface: surface, Class: ProbeMishandled,
 		Diagnosis: fmt.Sprintf("%s; got: %v", want, err)}
+}
+
+// definitiveRejection reports whether err is a REAL store rejection that is
+// merely the wrong one for the probe step: an unexpected conditional-write
+// sentinel (each minted from a definitive store status: 412 or exhausted
+// 409s) or an SDK error carrying a real 4xx HTTP response. The expected
+// sentinel of every step is consumed by the probe before classification,
+// so any sentinel reaching here is the wrong one.
+func definitiveRejection(err error) bool {
+	for _, sentinel := range []error{ErrExists, ErrLostRace, ErrCASContention} {
+		if errors.Is(err, sentinel) {
+			return true
+		}
+	}
+	status, _ := errorStatus(err)
+	return status >= 400 && status < 500
 }
 
 // probeBody returns a fresh random-nonce body so every accepted probe write

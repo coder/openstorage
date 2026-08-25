@@ -1219,8 +1219,9 @@ type fakeStore struct {
 	next               int
 	ignoreIfNoneMatch  bool
 	ignoreIfMatch      bool
-	staleAdvanceStatus int // when >0, a stale If-Match gets this status instead of 412
-	putStatus          int // when >0, every PUT gets this status (post-send failure injection)
+	staleAdvanceStatus int  // when >0, a stale If-Match gets this status instead of 412
+	putStatus          int  // when >0, every PUT gets this status (post-send failure injection)
+	staticETag         bool // respond to every accepted PUT with the same ETag (CAS-chaining defect)
 }
 
 func (f *fakeStore) etag(v int) string { return fmt.Sprintf("%q", fmt.Sprintf("v%d", v)) }
@@ -1256,7 +1257,14 @@ func (f *fakeStore) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		f.next++
 		f.objs[key] = f.next
-		w.Header().Set("ETag", f.etag(f.next))
+		// staticETag pins only the RESPONSE ETag (internal versioning stays
+		// consistent) so a matched advance appears to return an unchanged
+		// ETag — the CAS-chaining defect the probe's step 3 must catch.
+		if f.staticETag {
+			w.Header().Set("ETag", f.etag(1))
+		} else {
+			w.Header().Set("ETag", f.etag(f.next))
+		}
 		w.WriteHeader(http.StatusOK)
 	case http.MethodGet:
 		cur, exists := f.objs[key]
@@ -1300,7 +1308,12 @@ func TestProbeRefusesNonCompliantStore(t *testing.T) {
 		{"compliant-store-passes", &fakeStore{}, 0, "", false},
 		{"ignores-if-none-match", &fakeStore{ignoreIfNoneMatch: true}, 2, ProbeIgnored, false},
 		{"ignores-if-match", &fakeStore{ignoreIfMatch: true}, 4, ProbeIgnored, false},
-		{"mishandles-stale-advance", &fakeStore{staleAdvanceStatus: http.StatusForbidden}, 4, ProbeMishandled, false},
+		// A 403 on a stale advance is a REAL rejection with the wrong
+		// error — loud-but-wrong is the rejects class, not mishandling.
+		{"rejects-stale-advance-403", &fakeStore{staleAdvanceStatus: http.StatusForbidden}, 4, ProbeRejected, false},
+		// An unchanged ETag after a matched advance is a definitive
+		// non-rejection divergence — mishandling (CAS chaining would ABA).
+		{"mishandles-static-etag", &fakeStore{staticETag: true}, 3, ProbeMishandled, false},
 		// A post-send 503 on the step-1 create is an AmbiguousError (the
 		// write may have landed) — inconclusive, not store behavior.
 		{"inconclusive-put-5xx", &fakeStore{putStatus: http.StatusServiceUnavailable}, 1, ProbeInconclusive, false},
