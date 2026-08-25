@@ -103,8 +103,11 @@ type Client struct {
 	// DecodeSeq optionally decodes a payload sequence number from a fetched
 	// body. When set, Get/GetIfChanged enforce the §2.3 read-side defensive
 	// assert: a per-key seq regression means the store served a stale read —
-	// fail loudly. Phase 1b plugs in the manifest decoder; Phase 1a tests
-	// and benches decode their {seq, nonce} payloads.
+	// fail loudly. Acknowledged Create/Advance writes also RAISE the per-key
+	// watermark to the seq of the body they wrote (see raiseSeq), so a read
+	// older than this session's own accepted write trips the assert too.
+	// Phase 1b plugs in the manifest decoder; Phase 1a tests and benches
+	// decode their {seq, nonce} payloads.
 	//
 	// The assert is SESSION-scoped: it compares reads made through this
 	// Client, which processes responses sequentially per caller. Two
@@ -217,6 +220,33 @@ func (c *Client) checkSeq(key string, body []byte) {
 	}
 }
 
+// raiseSeq lifts the per-key watermark to the seq encoded in an
+// ACKNOWLEDGED write's body (when DecodeSeq is configured): once the store
+// accepts our conditional write of seq N, any later read serving < N is a
+// stale read. Without this write-side raise the watermark trails at the
+// last READ seq — after reading 4 and advancing to 5, a stale seq-4 GET
+// would pass checkSeq, and chained wins leave the watermark further
+// behind, defeating the fail-loud defense. Monotonic raise only: a write
+// never lowers the watermark, and unlike the read side it never asserts
+// (an acknowledgment makes no ordering claim against other sessions).
+func (c *Client) raiseSeq(key string, body []byte) {
+	if c.DecodeSeq == nil {
+		return
+	}
+	seq, ok := c.DecodeSeq(body)
+	if !ok {
+		return
+	}
+	c.seqMu.Lock()
+	defer c.seqMu.Unlock()
+	if c.lastSeq == nil {
+		c.lastSeq = make(map[string]int64)
+	}
+	if seq > c.lastSeq[key] {
+		c.lastSeq[key] = seq
+	}
+}
+
 // Create writes key with If-None-Match: * — it succeeds only when the key
 // does not exist. A 412 rejection returns ErrExists (not executed).
 func (c *Client) Create(ctx context.Context, key string, body []byte) (string, error) {
@@ -259,6 +289,7 @@ func (c *Client) putConditional(ctx context.Context, op, key string, body []byte
 		if err == nil {
 			etag := aws.ToString(out.ETag)
 			assertf(etag != "", "%s %s: store accepted the write but returned no ETag", op, key)
+			c.raiseSeq(key, body)
 			return etag, nil
 		}
 		status, code := errorStatus(err)

@@ -1617,4 +1617,28 @@ func TestCASTaxonomy(t *testing.T) {
 		}()
 		_, _ = c.Get(ctx, "k")
 	})
+
+	t.Run("stale-read-after-own-write-panics", func(t *testing.T) {
+		nonce := newNonce(t)
+		staleBody := string(encodePayloadNonce(t, 4, nonce, 0))
+		_, c := newScripted(t,
+			scriptedResponse{status: 200, etag: `"e4"`, body: staleBody}, // read seq 4
+			scriptedResponse{status: 200, etag: `"e5"`},                  // acknowledged advance to seq 5
+			scriptedResponse{status: 200, etag: `"e4"`, body: staleBody}, // stale read: seq 4 again
+		)
+		c.DecodeSeq = decodeSeq
+		obj, err := c.Get(ctx, "k")
+		if err != nil {
+			t.Fatalf("first Get: %v", err)
+		}
+		if _, err := c.Advance(ctx, "k", encodePayloadNonce(t, 5, nonce, 0), obj.ETag); err != nil {
+			t.Fatalf("Advance: %v", err)
+		}
+		defer func() {
+			if recover() == nil {
+				t.Fatal("stale read (seq 4 after this session's ACKNOWLEDGED write of seq 5) must trip the assert — the write path must raise the watermark")
+			}
+		}()
+		_, _ = c.Get(ctx, "k")
+	})
 }
