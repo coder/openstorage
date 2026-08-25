@@ -1396,8 +1396,22 @@ func (s *Sweeper) healPresentOriginal(ctx context.Context, repo, orig, qKey stri
 	cctx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
 	stopRenew := s.keepClaimRenewed(cctx, cancel, orig, owner)
-	defer stopRenew()
-	return s.finishTruncatedHeal(cctx, orig, qKey, physical, registeredBytes)
+	spare, err = s.finishTruncatedHeal(cctx, orig, qKey, physical, registeredBytes)
+	// Join the renewer BEFORE judging success, and let a recorded lease
+	// loss override a successful copy (the adoption pipeline's
+	// discipline): a loss recorded while the copy was in flight means
+	// the successor's claim-fenced window may have deleted the key after
+	// these bytes landed, so the heal is unproven — keep the backup and
+	// let the next sweep re-examine.
+	stopRenew()
+	if err == nil && !spare {
+		if cause := context.Cause(cctx); cause != nil {
+			s.logger.Warn("orphan pack sweep: sparing backup after losing the adoption claim mid-heal",
+				"key", orig, "cause", cause)
+			return true, nil
+		}
+	}
+	return spare, err
 }
 
 // finishTruncatedHeal runs the shared tail of a truncated-original heal:
@@ -1472,11 +1486,11 @@ func (s *Sweeper) keepClaimRenewed(ctx context.Context, cancel context.CancelCau
 // sweepClaimRenewInterval / sweepClaimRenewTimeout mirror the LFS
 // handlers' adoption-claim renewal cadence: several renewals fit inside
 // one ref.AdoptionClaimTTL, and each attempt is bounded so a stalled
-// registry cannot silently let the lease lapse mid-overwrite.
-const (
-	sweepClaimRenewInterval = 5 * time.Minute
-	sweepClaimRenewTimeout  = 15 * time.Second
-)
+// registry cannot silently let the lease lapse mid-overwrite. The
+// interval is a var so tests can force a renewal inside a fast restore.
+var sweepClaimRenewInterval = 5 * time.Minute
+
+const sweepClaimRenewTimeout = 15 * time.Second
 
 // revalidateOrphan re-checks one delete candidate against live state,
 // discarding the sweep's initial snapshot: first a fresh registry lookup

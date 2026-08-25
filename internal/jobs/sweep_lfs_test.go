@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"log/slog"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -359,6 +360,66 @@ func TestSweepLFS_HealTruncatedSkipsWhileClaimHeld(t *testing.T) {
 	}
 	if !f.exists(qKey) {
 		t.Fatalf("backup %q was purged while the truncated original is unhealed", qKey)
+	}
+}
+
+// lostLeaseLedger reports the adoption-claim lease LOST on the first
+// renewal attempt after the restore's copy begins (blocking renewals until
+// then), simulating an expiry takeover racing the overwrite.
+type lostLeaseLedger struct {
+	PackRegistry
+	copyStarted chan struct{}
+}
+
+func (l *lostLeaseLedger) RenewAdoptionClaim(context.Context, string, string) (bool, error) {
+	<-l.copyStarted
+	return false, nil
+}
+
+// copyStartSignal delegates to the real store but signals when the
+// restore's Copy begins and detaches it from cancellation, so a lease
+// loss recorded mid-copy cannot abort the copy itself — forcing the
+// "successful copy under a lost lease" interleaving.
+type copyStartSignal struct {
+	blob.BlobStore
+	started chan struct{}
+	once    sync.Once
+}
+
+func (b *copyStartSignal) Copy(ctx context.Context, dst, src string) error {
+	b.once.Do(func() { close(b.started) })
+	time.Sleep(50 * time.Millisecond) // let the renewer record the loss
+	return b.BlobStore.Copy(context.WithoutCancel(ctx), dst, src)
+}
+
+// A lease lost while the overwrite copy is in flight must override the
+// successful copy (Codex P1 on this PR, the adoption pipeline's
+// discipline): the successor's claim-fenced window may delete the key
+// after the unfenced bytes land, so the heal is unproven and the aged
+// purge must spare the backup for the next sweep to re-examine.
+func TestSweepLFS_HealTruncatedLostLeaseSparesBackup(t *testing.T) {
+	f := newSweepFixture(t)
+	content := "lost-lease-lfs-bytes"
+	key := blob.LFSKey("repo_lfs", lfsContentOID(content))
+	f.upload(key, content[:4])
+	f.registerLFS("repo_lfs", key, int64(len(content)))
+	qKey := quarantineKey(key)
+	f.upload(qKey, content)
+	f.backdate(qKey, 25*time.Hour)
+
+	oldInterval := sweepClaimRenewInterval
+	sweepClaimRenewInterval = time.Millisecond
+	t.Cleanup(func() { sweepClaimRenewInterval = oldInterval })
+
+	started := make(chan struct{})
+	packs := &lostLeaseLedger{PackRegistry: f.store, copyStarted: started}
+	blobs := &copyStartSignal{BlobStore: f.blobs, started: started}
+	s := NewSweeper(blobs, packs, SweepConfig{Threshold: 24 * time.Hour, DeleteLFS: true}, slog.New(slog.DiscardHandler))
+	if _, err := s.Sweep(context.Background()); err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if !f.exists(qKey) {
+		t.Fatalf("backup %q was purged although the lease was lost mid-copy — the heal is unproven", qKey)
 	}
 }
 
