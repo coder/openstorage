@@ -184,7 +184,7 @@ safe; no external migration job or leader election is needed:
 | Metadata schema | transaction-scoped `0x4D455441` (`"META"`) |
 | Ref-store schema | transaction-scoped `0x5350494B45` (`"SPIKE"`) |
 | River job-queue migrations | session-scoped `0x5249564552` (`"RIVER"`) |
-| `packs` covering index (`CREATE INDEX CONCURRENTLY`) | session-scoped `0x5350494458` (`"SPIDX"`), waiters poll once per second |
+| `packs`/`refs` covering indexes (`CREATE INDEX CONCURRENTLY`) | session-scoped `0x5350494458` (`"SPIDX"`), waiters poll once per second |
 
 What you observe: the first boot on a fresh (or upgraded) database does the DDL on one
 replica while the others wait on the locks and proceed once released; steady-state boots

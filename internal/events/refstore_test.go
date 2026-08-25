@@ -33,6 +33,12 @@ type fakeInner struct {
 func (f *fakeInner) ListRefs(context.Context, string) (map[string]string, error) {
 	return map[string]string{"refs/heads/main": shaA}, nil
 }
+func (f *fakeInner) ListRefsAfter(_ context.Context, _ string, after string, _ int) ([]ref.RefEntry, error) {
+	if after >= "refs/heads/main" {
+		return nil, nil
+	}
+	return []ref.RefEntry{{Name: "refs/heads/main", SHA: shaA}}, nil
+}
 func (f *fakeInner) ListRefsWithMeta(context.Context, string) ([]ref.RefInfo, error) {
 	return nil, nil
 }

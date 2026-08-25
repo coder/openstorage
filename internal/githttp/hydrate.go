@@ -1,6 +1,7 @@
 package githttp
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
@@ -681,70 +682,365 @@ func HeadTarget(defaultBranch string) string {
 	return "refs/heads/" + defaultBranch
 }
 
-// SyncRefs makes the local ref store match PG exactly (PG wins): updates
-// changed refs, deletes locals that PG does not know, and points HEAD at
-// headTarget (the repo's default branch per the meta row, qualified by
-// HeadTarget). Must run after HydratePacks so targets exist locally.
-func SyncRefs(repoPath string, want map[string]string, headTarget string) error {
-	assertf(strings.HasPrefix(headTarget, "refs/"), "SyncRefs: unqualified HEAD target %q", headTarget)
-	out, err := runGit(repoPath, "for-each-ref", "--format=%(refname) %(objectname)")
+// syncRefsBatch bounds ref synchronization's working set (issue #119): the
+// store enumeration page size, the update-ref transaction size, and the
+// in-memory update spool are all capped at this many refs, so a full sync
+// over attacker-scaled ref fanout holds O(batch) heap instead of
+// materializing the repo's whole ref set. Compiled-in like the repack
+// budgets: it prices a structural bound, not a tunable policy.
+const syncRefsBatch = 10_000
+
+// refSeq is a pull iterator over (name, sha) rows in strictly ascending
+// byte order of name — the merge-join order shared by ListRefsAfter pages
+// and for-each-ref output. next returns ok=false at end of stream.
+type refSeq interface {
+	next() (name, sha string, ok bool, err error)
+}
+
+// storeRefSeq streams a repo's refs from the store in syncRefsBatch-sized
+// keyset pages. Each page is one consistent snapshot; cross-page tearing
+// under concurrent mutation is healed by the generation marker (any
+// mutation bumps the generation past the value this sync publishes, so the
+// next hydrate takes the full path again — see ref.RefStore.ListRefsAfter).
+type storeRefSeq struct {
+	ctx      context.Context
+	st       ref.RefStore
+	repo     string
+	pageSize int
+	page     []ref.RefEntry
+	i        int
+	last     string // keyset cursor: last name yielded
+	done     bool
+}
+
+// refScanError marks a store-side enumeration failure inside the streaming
+// sync. Hydrate surfaces it as an infrastructure error (err), never as a
+// ref-application failure (refsErr): the receive path tolerates refsErr as
+// cache staleness git re-validates, and a store outage is not staleness —
+// exactly the split the pre-#119 code had between ListRefs and SyncRefs
+// errors.
+type refScanError struct{ err error }
+
+func (e *refScanError) Error() string { return e.err.Error() }
+func (e *refScanError) Unwrap() error { return e.err }
+
+func (s *storeRefSeq) next() (string, string, bool, error) {
+	if s.i >= len(s.page) {
+		if s.done {
+			return "", "", false, nil
+		}
+		assertf(s.pageSize > 0, "storeRefSeq: non-positive page size %d", s.pageSize)
+		page, err := s.st.ListRefsAfter(s.ctx, s.repo, s.last, s.pageSize)
+		if err != nil {
+			return "", "", false, &refScanError{err: err}
+		}
+		s.page, s.i = page, 0
+		s.done = len(page) < s.pageSize
+		if len(page) == 0 {
+			return "", "", false, nil
+		}
+	}
+	e := s.page[s.i]
+	s.i++
+	// Cross-page monotonicity is this layer's stitching invariant: a
+	// page regressing below the cursor could re-yield or skip rows.
+	assertf(e.Name > s.last, "ListRefsAfter yielded %q not above cursor %q", e.Name, s.last)
+	s.last = e.Name
+	return e.Name, e.SHA, true, nil
+}
+
+// sliceRefSeq yields a pre-sorted in-memory ref set (the SyncRefs map
+// adapter and tests).
+type sliceRefSeq struct {
+	names []string
+	shas  map[string]string
+	i     int
+}
+
+func (s *sliceRefSeq) next() (string, string, bool, error) {
+	if s.i >= len(s.names) {
+		return "", "", false, nil
+	}
+	name := s.names[s.i]
+	s.i++
+	return name, s.shas[name], true, nil
+}
+
+// localRefSeq streams `git for-each-ref` output without materializing it:
+// the local cache repo's ref count equals the store's fanout, so buffering
+// the whole listing would reintroduce the unbounded materialization this
+// sync exists to avoid (issue #119). for-each-ref's default refname sort is
+// strcmp order — the same byte order storeRefSeq pages in — asserted row by
+// row. Stderr is captured separately so git warnings never contaminate the
+// parsed stream.
+type localRefSeq struct {
+	cmd    *exec.Cmd
+	sc     *bufio.Scanner
+	stderr bytes.Buffer
+	prev   string
+	waited bool
+}
+
+func startLocalRefSeq(ctx context.Context, repoPath string) (*localRefSeq, error) {
+	l := &localRefSeq{}
+	args := []string{"for-each-ref", "--format=%(refname) %(objectname)"}
+	observeGitSpawn(repoPath, args)
+	l.cmd = exec.CommandContext(ctx, "git", args...)
+	l.cmd.Dir = repoPath
+	l.cmd.Stderr = &l.stderr
+	stdout, err := l.cmd.StdoutPipe()
+	if err != nil {
+		return nil, err
+	}
+	if err := l.cmd.Start(); err != nil {
+		return nil, fmt.Errorf("git for-each-ref: %w", err)
+	}
+	l.sc = bufio.NewScanner(stdout)
+	// Refnames are practically short, but the scanner's default 64KiB max
+	// token would fail loudly rather than mis-parse; give it headroom.
+	l.sc.Buffer(make([]byte, 0, 64<<10), 1<<20)
+	return l, nil
+}
+
+func (l *localRefSeq) next() (string, string, bool, error) {
+	if l.sc.Scan() {
+		line := l.sc.Text()
+		name, sha, ok := strings.Cut(line, " ")
+		assertf(ok && ref.ValidSHA(sha), "for-each-ref emitted %q", line)
+		assertf(name > l.prev, "for-each-ref order regressed: %q after %q", name, l.prev)
+		l.prev = name
+		return name, sha, true, nil
+	}
+	if err := l.sc.Err(); err != nil {
+		return "", "", false, fmt.Errorf("git for-each-ref: %w", err)
+	}
+	l.waited = true
+	if err := l.cmd.Wait(); err != nil {
+		return "", "", false, fmt.Errorf("git for-each-ref: %w: %s", err, strings.TrimSpace(l.stderr.String()))
+	}
+	return "", "", false, nil
+}
+
+// close reaps the subprocess after an early exit; a no-op once next hit
+// EOF and waited.
+func (l *localRefSeq) close() {
+	if l.waited {
+		return
+	}
+	l.waited = true
+	_ = l.cmd.Process.Kill()
+	_ = l.cmd.Wait()
+}
+
+// refCmdBatch accumulates update-ref --stdin commands and flushes them in
+// syncRefsBatch-sized transactions.
+type refCmdBatch struct {
+	repoPath string
+	cap      int
+	cmds     strings.Builder
+	n        int
+}
+
+func (b *refCmdBatch) add(cmd string) error {
+	assertf(b.cap > 0, "refCmdBatch: non-positive cap %d", b.cap)
+	b.cmds.WriteString(cmd)
+	b.n++
+	if b.n < b.cap {
+		return nil
+	}
+	return b.flush()
+}
+
+func (b *refCmdBatch) flush() error {
+	if b.n == 0 {
+		return nil
+	}
+	cmds := b.cmds.String()
+	b.cmds.Reset()
+	b.n = 0
+	return updateRefStdin(b.repoPath, cmds)
+}
+
+// syncRefsStreamed makes the local ref store match the given stream exactly
+// (the store wins): updates changed refs, deletes locals the store does not
+// know, and points HEAD at headTarget — in O(syncRefsBatch) memory.
+//
+// One merge-join pass over the two byte-ordered streams detects both
+// deletions and updates. Deletions flush in batches DURING the pass;
+// updates spool and flush strictly AFTER it, because all deletions must
+// precede all updates: git's files backend cannot delete refs/heads/foo and
+// create refs/heads/foo/bar in one transaction (the doomed loose ref still
+// blocks the new ref's lock file), so a D/F rename in the store would wedge
+// local sync forever otherwise. When the update spool overflows one batch
+// (mass change: a cold cache's first hydration), the pass completes
+// deletions only and a SECOND pass over fresh streams applies updates in
+// batches — still strictly after every deletion. Batches are separate
+// update-ref transactions; partial application is fine — the sync is
+// idempotent over a rebuildable cache and callers retry.
+func syncRefsStreamed(ctx context.Context, repoPath, headTarget string, newStore func() refSeq, batch int) error {
+	assertf(strings.HasPrefix(headTarget, "refs/"), "syncRefsStreamed: unqualified HEAD target %q", headTarget)
+	assertf(batch > 0, "syncRefsStreamed: non-positive batch %d", batch)
+	overflow, err := syncRefsPassOne(ctx, repoPath, newStore(), batch)
 	if err != nil {
 		return err
 	}
-	have := make(map[string]string)
-	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
-		if line == "" {
-			continue
-		}
-		name, sha, ok := strings.Cut(line, " ")
-		assertf(ok && ref.ValidSHA(sha), "for-each-ref emitted %q", line)
-		have[name] = sha
-	}
-	// Deletions run first, in their own update-ref transaction: git's files
-	// backend cannot delete refs/heads/foo and create refs/heads/foo/bar in
-	// one transaction (the doomed loose ref still blocks the new ref's lock
-	// file), so a D/F rename in PG would wedge local sync forever otherwise.
-	// Partial application is fine — SyncRefs is idempotent over a
-	// rebuildable cache and callers retry. Sorted for deterministic order.
-	var dels []string
-	for name := range have {
-		if _, ok := want[name]; !ok {
-			dels = append(dels, name)
-		}
-	}
-	sort.Strings(dels)
-	if len(dels) > 0 {
-		var b strings.Builder
-		for _, name := range dels {
-			fmt.Fprintf(&b, "delete %s\n", name)
-		}
-		if err := updateRefStdin(repoPath, b.String()); err != nil {
-			return err
-		}
-	}
-	var b strings.Builder
-	// Deterministic order for debuggability.
-	names := make([]string, 0, len(want))
-	for name := range want {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	for _, name := range names {
-		if have[name] != want[name] {
-			fmt.Fprintf(&b, "update %s %s\n", name, want[name])
-		}
-	}
-	if b.Len() > 0 {
-		if err := updateRefStdin(repoPath, b.String()); err != nil {
+	if overflow {
+		if err := syncRefsPassUpdates(ctx, repoPath, newStore(), batch); err != nil {
 			return err
 		}
 	}
 	// HEAD follows the meta row's default branch (issue #18). git tolerates
 	// a dangling target: an unborn default branch advertises no HEAD.
-	if _, err := runGit(repoPath, "symbolic-ref", "HEAD", headTarget); err != nil {
+	if _, err := runGitCtx(ctx, repoPath, "symbolic-ref", "HEAD", headTarget); err != nil {
 		return err
 	}
 	return nil
+}
+
+// syncRefsPassOne merge-joins the store stream against the local listing:
+// deletions flush in batches during the pass; updates spool up to one batch
+// and flush after every deletion has been applied. Returns overflow=true
+// when the spool capacity was exceeded — updates were then discarded and
+// the caller owns running syncRefsPassUpdates.
+func syncRefsPassOne(ctx context.Context, repoPath string, store refSeq, batch int) (overflow bool, err error) {
+	local, err := startLocalRefSeq(ctx, repoPath)
+	if err != nil {
+		return false, err
+	}
+	defer local.close()
+	dels := &refCmdBatch{repoPath: repoPath, cap: batch}
+	var upds []string
+	spool := func(name, sha string) {
+		if overflow {
+			return
+		}
+		if len(upds) == batch {
+			overflow, upds = true, nil
+			return
+		}
+		upds = append(upds, fmt.Sprintf("update %s %s\n", name, sha))
+	}
+	var ln, ls string
+	var lok bool
+	var lerr error
+	advance := func() bool {
+		ln, ls, lok, lerr = local.next()
+		return lerr == nil
+	}
+	if !advance() {
+		return false, lerr
+	}
+	for {
+		sn, ss, sok, serr := store.next()
+		if serr != nil {
+			return false, serr
+		}
+		if !sok {
+			break
+		}
+		for lok && ln < sn {
+			if err := dels.add(fmt.Sprintf("delete %s\n", ln)); err != nil {
+				return false, err
+			}
+			if !advance() {
+				return false, lerr
+			}
+		}
+		if lok && ln == sn {
+			if ls != ss {
+				spool(sn, ss)
+			}
+			if !advance() {
+				return false, lerr
+			}
+		} else {
+			spool(sn, ss)
+		}
+	}
+	for lok {
+		if err := dels.add(fmt.Sprintf("delete %s\n", ln)); err != nil {
+			return false, err
+		}
+		if !advance() {
+			return false, lerr
+		}
+	}
+	if err := dels.flush(); err != nil {
+		return false, err
+	}
+	if overflow {
+		return true, nil
+	}
+	for _, cmd := range upds {
+		// Under the spool cap by construction: one flush at the end.
+		if err := dels.add(cmd); err != nil {
+			return false, err
+		}
+	}
+	return false, dels.flush()
+}
+
+// syncRefsPassUpdates applies store rows that are missing or changed
+// locally, in batches, over fresh streams (the local listing reflects pass
+// one's deletions). Local-only rows are NOT deleted here: interleaving
+// delete and update batches would break the all-deletions-first ordering,
+// and a row deleted from the store between passes is healed by the next
+// full sync (its deletion bumped the generation past this sync's marker).
+func syncRefsPassUpdates(ctx context.Context, repoPath string, store refSeq, batch int) error {
+	local, err := startLocalRefSeq(ctx, repoPath)
+	if err != nil {
+		return err
+	}
+	defer local.close()
+	upds := &refCmdBatch{repoPath: repoPath, cap: batch}
+	ln, ls, lok, lerr := local.next()
+	if lerr != nil {
+		return lerr
+	}
+	for {
+		sn, ss, sok, serr := store.next()
+		if serr != nil {
+			return serr
+		}
+		if !sok {
+			break
+		}
+		for lok && ln < sn {
+			if ln, ls, lok, lerr = local.next(); lerr != nil {
+				return lerr
+			}
+		}
+		if lok && ln == sn {
+			if ls != ss {
+				if err := upds.add(fmt.Sprintf("update %s %s\n", sn, ss)); err != nil {
+					return err
+				}
+			}
+			if ln, ls, lok, lerr = local.next(); lerr != nil {
+				return lerr
+			}
+		} else if err := upds.add(fmt.Sprintf("update %s %s\n", sn, ss)); err != nil {
+			return err
+		}
+	}
+	return upds.flush()
+}
+
+// SyncRefs makes the local ref store match want exactly (the store wins):
+// updates changed refs, deletes locals that want does not know, and points
+// HEAD at headTarget (the repo's default branch per the meta row, qualified
+// by HeadTarget). Must run after HydratePacks so targets exist locally.
+// Callers holding an already-bounded ref set use this map form; Hydrate
+// streams pages straight from the ref store instead (issue #119) so a
+// repo's ref fanout never materializes in memory.
+func SyncRefs(repoPath string, want map[string]string, headTarget string) error {
+	names := make([]string, 0, len(want))
+	for name := range want {
+		names = append(names, name)
+	}
+	sort.Strings(names) // byte order, matching for-each-ref
+	newStore := func() refSeq { return &sliceRefSeq{names: names, shas: want} }
+	return syncRefsStreamed(context.Background(), repoPath, headTarget, newStore, syncRefsBatch)
 }
 
 // updateRefStdin feeds commands to one `git update-ref --stdin` transaction.
@@ -838,7 +1134,8 @@ func writeGenerationMarker(repoPath string, gen int64, head string) {
 // written by the last fully successful hydrate — and the marker is within
 // its TTL — the packs, refs, and HEAD are provably unchanged and Hydrate
 // returns after one point-read, skipping ListPacks, per-pack stats,
-// ListRefs, and the for-each-ref/update-ref/symbolic-ref subprocesses.
+// the paged ListRefsAfter scan, and the for-each-ref/update-ref/
+// symbolic-ref subprocesses.
 // EnsureCacheRepo still runs unconditionally: hook and config repair must
 // stay verified on every request (the hook script embeds this binary's
 // path, which changes across deployments), and it touches no DB state.
@@ -901,13 +1198,25 @@ func Hydrate(ctx context.Context, st ref.RefStore, bl blob.BlobStore, cacheDir, 
 	if err := HydratePacks(ctx, st, bl, repoPath, repo); err != nil {
 		return "", nil, err
 	}
-	refs, err := st.ListRefs(ctx, repo)
-	if err != nil {
-		return "", nil, err
-	}
+	// Refs stream straight from the store in bounded pages (issue #119):
+	// ref fanout is attacker-scaled, so the serving path must never
+	// materialize a repo's whole ref set. The generation read above binds
+	// the paged scan: any ref minted or moved while pages stream bumps the
+	// generation past the marker this sync publishes, so the next hydrate
+	// takes the full path again and heals whatever the torn scan missed —
+	// the same staleness window a point-snapshot ListRefs already had
+	// between its read and the marker write.
+	newStore := func() refSeq { return &storeRefSeq{ctx: ctx, st: st, repo: repo, pageSize: syncRefsBatch} }
 	for attempt := 0; attempt < 3; attempt++ {
-		if refsErr = SyncRefs(repoPath, refs, headTarget); refsErr == nil {
+		if refsErr = syncRefsStreamed(ctx, repoPath, headTarget, newStore, syncRefsBatch); refsErr == nil {
 			break
+		}
+		// A store-side scan failure is an infrastructure error, not local
+		// ref staleness: surface it like the pre-#119 ListRefs error (no
+		// marker, no retries — the store is down, not the cache racing).
+		var scan *refScanError
+		if errors.As(refsErr, &scan) {
+			return "", nil, scan.Unwrap()
 		}
 		time.Sleep(50 * time.Millisecond)
 	}

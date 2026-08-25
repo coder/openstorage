@@ -234,6 +234,33 @@ func (s *SQLite) ListRefs(ctx context.Context, repo string) (map[string]string, 
 	return refs, rows.Err()
 }
 
+// ListRefsAfter returns up to limit refs for repo above the after cursor in
+// ascending byte order (issue #119). The name column's default BINARY
+// collation is byte-wise comparison — matching PG's COLLATE "C" page order
+// and git's own ref iteration order — and the (repo, name) primary key
+// serves the keyset scan directly.
+func (s *SQLite) ListRefsAfter(ctx context.Context, repo, after string, limit int) ([]RefEntry, error) {
+	assertf(repo != "", "ListRefsAfter: empty repo")
+	assertf(limit > 0, "ListRefsAfter: non-positive limit %d", limit)
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT name, sha FROM refs WHERE repo = ? AND name > ? ORDER BY name LIMIT ?`,
+		repo, after, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var refs []RefEntry
+	for rows.Next() {
+		var e RefEntry
+		if err := rows.Scan(&e.Name, &e.SHA); err != nil {
+			return nil, err
+		}
+		assertf(ValidSHA(e.SHA), "refs table holds malformed sha %q for %s/%s", e.SHA, repo, e.Name)
+		refs = append(refs, e)
+	}
+	return refs, rows.Err()
+}
+
 // ListRefsWithMeta returns all refs for repo sorted by name ascending.
 func (s *SQLite) ListRefsWithMeta(ctx context.Context, repo string) ([]RefInfo, error) {
 	rows, err := s.db.QueryContext(ctx,

@@ -49,6 +49,16 @@ func (s *SimRefStore) ListRefs(ctx context.Context, repo string) (map[string]str
 	return s.inner.ListRefs(ctx, repo)
 }
 
+// ListRefsAfter delegates to the inner store unless a fault is injected.
+// It shares OpRefListRefs with ListRefs: both are the same ref-enumeration
+// read surface, just bounded vs whole-repo (issue #119).
+func (s *SimRefStore) ListRefsAfter(ctx context.Context, repo, after string, limit int) ([]ref.RefEntry, error) {
+	if class := s.inj.begin(OpRefListRefs); class != FaultNone {
+		return nil, refReadFault(OpRefListRefs, class)
+	}
+	return s.inner.ListRefsAfter(ctx, repo, after, limit)
+}
+
 // ListRefsWithMeta delegates to the inner store unless a fault is injected.
 func (s *SimRefStore) ListRefsWithMeta(ctx context.Context, repo string) ([]ref.RefInfo, error) {
 	if class := s.inj.begin(OpRefListRefsWithMeta); class != FaultNone {
