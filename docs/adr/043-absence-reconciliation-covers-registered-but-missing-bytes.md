@@ -153,7 +153,11 @@ of phase indefinitely (Codex round 21): a completed class proof
 therefore WAITS durably as a TRIGGER (one bounded `job_scan_state` row
 keyed by base and class) under the same generation fence — re-validated
 at every pass start before the pass's own bumps, dropped on any
-parked-gap mutation — until its counterpart lands, and consuming it for
+parked-gap mutation, and re-snapshotted at every pass end because the
+pass's own cover-renewal re-charge bumps the group each pass for bases
+holding live deterministic covers, and a self-bump must not expire a
+scheduling-only candidacy (Codex round 25) — until its counterpart
+lands, and consuming it for
 retirement re-verifies that class fresh at fold time (never trusted
 directly, whatever its age: the parked gap it spans is invisible to any
 DB fence — out-of-band loss has no DB event and an old worker's nonce

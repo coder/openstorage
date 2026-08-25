@@ -747,10 +747,17 @@ const absenceProofCap = 512
 // saveProofs persists per-base fold candidacies for the next pass (Codex
 // rounds 21+24): every base with an un-folded legacy nonce recorded this
 // pass carries forward each class holding either FRESH same-pass
-// evidence (under a fence snapshot read here, after every bump this pass
-// made, so the next pass's load-time validation covers exactly the
-// parked gap) or a surviving seeded hint (under its ORIGINAL fence, so a
-// bump this pass made evicts it at the next load). Candidacies only
+// evidence or a surviving seeded hint. EVERY carried class is
+// re-snapshotted under a fence read here, after every bump this pass
+// made, so the next load-time validation covers exactly the parked gap —
+// seeded hints included (Codex round 25): the pass's own renewal
+// re-charge bumps the group generation every pass for bases holding live
+// deterministic covers (chargeCover pairs each charge with a generation
+// bump), so retaining a seeded entry's original fence would self-expire
+// the candidacy after one carry and out-of-phase completions more than
+// one pass apart could never converge. Re-snapshotting is sound because
+// a candidacy is scheduling-only (round 24): commitment evidence always
+// comes from the fold-time re-stat, never the fence. Candidacies only
 // schedule commitment-time re-verification — fold re-stats every hinted
 // class before retiring anything. Bases whose fold succeeded still
 // persist (the entry evicts next pass with the listing); a CAS miss
@@ -773,16 +780,13 @@ func (r *AbsenceReconciler) saveProofs(sctx context.Context, errs *boundedErrs) 
 	}
 	keep := make(map[string]map[string]absenceProofEntry)
 	for base := range bases {
-		fresh := make([]string, 0, 2)
-		entry := make(map[string]absenceProofEntry, 2)
+		carried := make([]string, 0, 2)
 		for _, class := range []string{absenceClassLFS, absenceClassPacks} {
-			if r.cleanBases[class][base] {
-				fresh = append(fresh, class)
-			} else if seeded, ok := r.proofGens[base][class]; ok {
-				entry[class] = seeded
+			if _, seeded := r.proofGens[base][class]; seeded || r.cleanBases[class][base] {
+				carried = append(carried, class)
 			}
 		}
-		if len(fresh) == 0 && len(entry) == 0 {
+		if len(carried) == 0 {
 			continue // nothing to carry
 		}
 		if len(keep) >= absenceProofCap {
@@ -790,15 +794,14 @@ func (r *AbsenceReconciler) saveProofs(sctx context.Context, errs *boundedErrs) 
 				"cap", absenceProofCap)
 			break
 		}
-		if len(fresh) > 0 {
-			gen, err := r.rangeFence(sctx, base)
-			if err != nil {
-				errs.add(fmt.Errorf("absence reconcile: snapshot proof fence for %s: %w", base, err))
-				continue
-			}
-			for _, class := range fresh {
-				entry[class] = absenceProofEntry{Gen: gen}
-			}
+		gen, err := r.rangeFence(sctx, base)
+		if err != nil {
+			errs.add(fmt.Errorf("absence reconcile: snapshot proof fence for %s: %w", base, err))
+			continue
+		}
+		entry := make(map[string]absenceProofEntry, len(carried))
+		for _, class := range carried {
+			entry[class] = absenceProofEntry{Gen: gen}
 		}
 		keep[base] = entry
 	}

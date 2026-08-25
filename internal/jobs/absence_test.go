@@ -903,6 +903,98 @@ func TestAbsenceReconcile_StaleHintLossRechargeReverifiedAtFold(t *testing.T) {
 	}
 }
 
+// TestAbsenceReconcile_CandidacySurvivesSelfRenewalBumps (Codex round
+// 25, P1): a base holding a live deterministic cover gets its group
+// generation bumped by the reconciler's OWN renewal re-charge every pass
+// (chargeCover pairs each charge with a BumpLFSAdoptionGen). A carried
+// candidacy must be re-snapshotted at save time, not retained under its
+// original fence — otherwise it self-expires after one carry and
+// out-of-phase class completions more than one pass apart can never
+// converge, keeping the legacy nonce bulk-renewed forever.
+func TestAbsenceReconcile_CandidacySurvivesSelfRenewalBumps(t *testing.T) {
+	f := newSweepFixture(t)
+	ctx := context.Background()
+	base := "m-carry"
+	reg := absenceRegistry(t, f)
+	// LFS filler large enough that the LFS rotation NEVER reaches the
+	// target: only the candidacy can ever complete the LFS side.
+	for i := 0; i < 60; i++ {
+		key := blob.LFSKey("a-fill", strings.Repeat(fmt.Sprintf("%02x", i), 32))
+		registerLFS(t, f, "a-fill", key, 10)
+		f.upload(key, strings.Repeat("x", 10))
+	}
+	// Pack filler the packs rotation needs multiple passes to cross;
+	// the target has NO pack rows, so its packs proof is the row-less
+	// window of the traversal that finally wraps.
+	for i := byte(0); i < 10; i++ {
+		id := fmt.Sprintf("fp%02d", i)
+		key := blob.PackKey("a-fill", id)
+		size := f.upload(key, strings.Repeat("y", 10))
+		if err := f.store.RegisterPacks(ctx, "a-fill", []ref.Pack{{ID: id, Key: key, Size: size}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := byte(0); i < 6; i++ {
+		key := blob.LFSKey(base, absenceOID('a'+i))
+		registerLFS(t, f, base, key, 10)
+		f.upload(key, strings.Repeat("x", 10))
+	}
+	// The live deterministic cover whose per-pass renewal re-charge
+	// bumps the base's group generation.
+	if err := ref.ReserveRestoreCover(ctx, reg, blob.QuotaRepoGroup(base),
+		absenceIncarnationKey(base, absenceClassLFS, 1), 50, time.Hour); err != nil {
+		t.Fatalf("seed deterministic cover: %v", err)
+	}
+	legacyKey := ref.AbsenceCoverPrefix + base + "/" + ref.NewReservationOwner()
+	if err := ref.ReserveRestoreCover(ctx, reg, blob.QuotaRepoGroup(base), legacyKey, 555, time.Hour); err != nil {
+		t.Fatalf("seed nonce: %v", err)
+	}
+	// The LFS candidacy from an earlier pass, fenced at the current
+	// group generation.
+	var gen int64
+	for _, repo := range blob.QuotaRepoGroup(base) {
+		g, err := reg.LFSAdoptionGen(ctx, repo)
+		if err != nil {
+			t.Fatal(err)
+		}
+		gen += g
+	}
+	payload := fmt.Sprintf(`{"%s":{"%s":{"gen":%d}}}`, base, absenceClassLFS, gen)
+	if err := reg.PutJobScanState(ctx, ref.ScanJobAbsence, ref.ScanScopeAbsenceProofs, payload, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	// Two small passes: both rotations stay parked inside the filler,
+	// so the candidacy must be CARRIED across two self-renewal bumps.
+	pinLFSLeader(t, f)
+	for pass := 1; pass <= 2; pass++ {
+		worker := testReconciler(t, f, true, 12)
+		report, err := worker.Run(ctx)
+		if err != nil {
+			t.Fatalf("pass %d: %v", pass, err)
+		}
+		if report.CoversDecaying != 0 {
+			t.Fatalf("pass %d report = %+v, want no retirement while packs is unproven", pass, report)
+		}
+	}
+
+	// A moderate pass: the packs rotation finishes the filler and wraps
+	// (the target's row-less window goes fresh) while the LFS rotation
+	// is still inside its filler — retirement is possible ONLY through
+	// the carried candidacy plus its fold-time re-stat.
+	worker := testReconciler(t, f, true, 40)
+	report, err := worker.Run(ctx)
+	if err != nil {
+		t.Fatalf("final pass: %v", err)
+	}
+	if report.CoversDecaying != 1 {
+		t.Fatalf("final report = %+v, want the nonce retired via the carried candidacy", report)
+	}
+	if report.RowsVerified < 6 {
+		t.Fatalf("final report = %+v, want the fold-time re-stat of the target's LFS rows", report)
+	}
+}
+
 // TestAbsenceReconcile_GapMutationDefersLegacyRetirement (Codex rounds
 // 19-20): a foreign mutation landing while the cursor is parked mid-range
 // breaks fence continuity — the resumed completion must NOT prove the
