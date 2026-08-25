@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.0](https://github.com/coder/code-storage/compare/v0.5.1...v0.6.0) (2026-08-25)
+
+
+### Features
+
+* **jobs:** reconcile registered-but-missing blobs against the quota ledger ([#123](https://github.com/coder/code-storage/issues/123)) ([d73e087](https://github.com/coder/code-storage/commit/d73e08746aaeca3cf1dd3fbd546f657856abd80c))
+
 ## [0.5.1](https://github.com/coder/code-storage/compare/v0.5.0...v0.5.1) (2026-08-25)
 
 
