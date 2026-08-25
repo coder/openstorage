@@ -9,6 +9,7 @@ package main
 import (
 	"context"
 	"crypto"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -132,8 +133,22 @@ func (s webhookSink) Emit(ctx context.Context, org, eventType string, payload []
 // self-perpetuate here — forward runs never CAS local refs, and a sync
 // run's own loopback pushes carry the sync claim, which suppresses the
 // hook-side poke entirely (wireHookEventing).
-func enqueueSyncOrForward(ms meta.EventingStore, enqueuePull, enqueuePush func(ctx context.Context, job upsync.Job) error, org string) func(ctx context.Context, repoID string) error {
-	assertf(ms != nil && enqueuePull != nil && enqueuePush != nil && org != "", "enqueueSyncOrForward: missing deps")
+//
+// callerPoliced gates the FORWARD reroute only (Codex round 3): the
+// forward publishes every local head and tag with the stored upstream
+// credential, so a caller whose token carries ANY ref-policy op — one
+// allowed to update only the refs its policies name — must not implicitly
+// trigger publication of refs it could not push itself. The explicit
+// POST /repos/push-upstream fails closed for such callers
+// (policyDeniesPullUpstream coarseness); the poke matches it. The write
+// itself was policy-accepted and stays local; convergence resumes on the
+// next unpoliced trigger. Deliberately NOT falling through to the pull
+// poke: pulling now would force-revert the write that was just accepted.
+// The pull poke stays unpoliced — documented invariant-11 behavior this
+// slice does not change.
+func enqueueSyncOrForward(ms meta.EventingStore, enqueuePull, enqueuePush func(ctx context.Context, job upsync.Job) error, org string, callerPoliced func(ctx context.Context) bool) func(ctx context.Context, repoID string) error {
+	assertf(ms != nil && enqueuePull != nil && enqueuePush != nil && org != "" && callerPoliced != nil,
+		"enqueueSyncOrForward: missing deps")
 	return func(ctx context.Context, repoID string) error {
 		up, err := ms.GetRepoUpstream(ctx, repoID)
 		if errors.Is(err, meta.ErrNotFound) {
@@ -143,6 +158,9 @@ func enqueueSyncOrForward(ms meta.EventingStore, enqueuePull, enqueuePush func(c
 			return err
 		}
 		if up.ForwardOnPush {
+			if callerPoliced(ctx) {
+				return nil // fail closed: no implicit full-mirror publication (see doc)
+			}
 			if err := ms.RequestPush(ctx, repoID, false); err != nil {
 				if errors.Is(err, meta.ErrNotFound) {
 					return nil // detached between the reads: nothing to forward
@@ -156,6 +174,70 @@ func enqueueSyncOrForward(ms meta.EventingStore, enqueuePull, enqueuePush func(c
 		}
 		return enqueuePull(ctx, upsync.Job{Org: org, RepoID: repoID})
 	}
+}
+
+// anyRefPolicyOps reports whether any parsed policy rule carries ops — the
+// same coarseness as the API's policyDeniesPullUpstream: the pattern is
+// not consulted because the forward publishes every synced ref.
+func anyRefPolicyOps(policies []auth.RefPolicy) bool {
+	for _, rule := range policies {
+		if len(rule.Ops) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// refPolicedFromContext resolves enqueueSyncOrForward's callerPoliced for
+// the serve process, whose ref mutations run under the request context:
+// the auth middleware injects the verified claims, and absent claims mean
+// a server-initiated write (import machinery, maintenance), which is
+// unpoliced by definition. A refs claim that fails to parse counts as
+// POLICED — a malformed policy must not grant a broader implicit trigger
+// than a parseable one.
+func refPolicedFromContext(ctx context.Context) bool {
+	claims, ok := auth.ClaimsFromContext(ctx)
+	if !ok {
+		return false
+	}
+	var policies []auth.RefPolicy
+	if len(claims.Refs) > 0 {
+		var err error
+		policies, err = auth.ParseRefPolicies(string(claims.Refs))
+		if err != nil {
+			return true // fail closed
+		}
+	}
+	return anyRefPolicyOps(auth.FoldOps(policies, claims.Ops))
+}
+
+// hookCallerPoliced is refPolicedFromContext for the hook subprocess,
+// whose caller identity arrives as environment (the same EnvRefsPolicy /
+// EnvOps the update hook's enforceRefPolicy consumes; both are set only
+// when the claim is non-empty). Malformed values count as policed — the
+// update hook fails such pushes anyway, but the poke must not assume it
+// ran first.
+func hookCallerPoliced() bool {
+	policyJSON := os.Getenv(githttp.EnvRefsPolicy)
+	opsJSON := os.Getenv(githttp.EnvOps)
+	if policyJSON == "" && opsJSON == "" {
+		return false
+	}
+	var policies []auth.RefPolicy
+	if policyJSON != "" {
+		var err error
+		policies, err = auth.ParseRefPolicies(policyJSON)
+		if err != nil {
+			return true // fail closed
+		}
+	}
+	var ops []string
+	if opsJSON != "" {
+		if err := json.Unmarshal([]byte(opsJSON), &ops); err != nil {
+			return true // fail closed
+		}
+	}
+	return anyRefPolicyOps(auth.FoldOps(policies, ops))
 }
 
 // isPGURL dispatches queue construction on the metadata DB scheme, exactly
@@ -329,7 +411,7 @@ func buildServeEventing(ctx context.Context, ms meta.Store, dbURL, org, loopback
 			Repos:           ms,
 			Webhooks:        whStore,
 			EnqueueDelivery: queue.EnqueueWebhookDelivery,
-			EnqueueSync:     enqueueSyncOrForward(ms, queue.EnqueueSync, queue.EnqueuePush, org),
+			EnqueueSync:     enqueueSyncOrForward(ms, queue.EnqueueSync, queue.EnqueuePush, org, refPolicedFromContext),
 			Logger:          logger,
 		})
 	}
@@ -425,7 +507,11 @@ func wireHookEventing(ctx context.Context, logger *slog.Logger) func() {
 		}
 		cleanups = append(cleanups, q.Close)
 		enqueueDelivery = q.EnqueueWebhookDelivery
-		enqueueSync = enqueueSyncOrForward(ms, q.EnqueueSync, q.EnqueuePush, org)
+		// The hook subprocess serves exactly one push by one caller, so
+		// the policed verdict is a process-wide constant from its env.
+		policed := hookCallerPoliced()
+		enqueueSync = enqueueSyncOrForward(ms, q.EnqueueSync, q.EnqueuePush, org,
+			func(context.Context) bool { return policed })
 		if os.Getenv(githttp.EnvSyncClaim) != "" {
 			// This receive-pack IS a sync run's own loopback push (the
 			// claim-fenced token, issue #86): poking the sync seam from it

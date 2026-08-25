@@ -69,10 +69,13 @@ claim in the hook environment and poke nothing, which terminates the
 forward↔pull cycle. Full-mirror forwarding (not just the pushed ref) is
 deliberate: converging to local state is the contract, and per-ref pending
 queues would be unbounded state for no correctness gain. A policed caller
-cannot trigger either direction (fail-closed, like pull-upstream); the
+cannot trigger either direction: the explicit endpoints fail closed (like
+pull-upstream), and the automatic poke skips the forward for a write
+accepted from a token carrying any ref-policy op — full-mirror forwarding
+publishes refs that caller could not push itself, so the policed write
+stays local until the next unpoliced trigger converges the mirror. The
 `forward_pushes` decision itself is made at repo creation by a `repo:write`
-holder, and every ref auto-forwarding publishes was already accepted by the
-receive path's policy checks.
+holder.
 
 **Failure semantics.** A local push never fails because the upstream is
 down — forwarding is asynchronous. Transient failures (upstream

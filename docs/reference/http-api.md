@@ -121,7 +121,11 @@ Default notes ref `refs/notes/commits`; bare names resolve to `refs/notes/<name>
 Outbound runs emit the same `repo.sync.*` events with `direction: "push"` (see
 [webhooks](webhooks.md)). `DELETE /repos/base` cancels in-flight runs in both
 directions silently. Ref policies fail closed on both triggers: any policy op
-denies pull-upstream and push-upstream alike.
+denies pull-upstream and push-upstream alike. The same gate covers
+`forward_pushes` auto-forwarding: a git push accepted from a token carrying
+any ref-policy op does not trigger the forward (it would publish every head
+and tag, not just the refs that token may touch) — the write stays local and
+the repository converges on the next unpoliced trigger.
 
 ## Status-code contract (what clients key on)
 
