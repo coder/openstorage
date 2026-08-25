@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"sync"
 )
 
 // ProbeKey is the scratch-key PREFIX the boot-time probe exercises. Plan
@@ -123,14 +124,30 @@ func probeAtKey(ctx context.Context, c *Client, keyPrefix string) error {
 	}
 
 	// Step 5: two racing advances from one snapshot ETag — exactly one may
-	// win; the loser must observe a definitive lost-race rejection.
+	// win; the loser must observe a definitive lost-race rejection. Both
+	// goroutines park on a start barrier and are released together:
+	// without it the first Advance can complete before the second is even
+	// scheduled, degrading this step into a repeat of step 4's SEQUENTIAL
+	// stale-write test that a non-atomic check-then-write store would
+	// pass. The barrier maximizes client-side overlap but cannot
+	// guarantee server-side concurrency on one sample — that residual is
+	// covered by the sustained contention lost-update detector recorded
+	// in the results doc.
 	results := make(chan error, 2)
+	startBarrier := make(chan struct{})
+	var parked sync.WaitGroup
+	parked.Add(2)
 	for range 2 {
 		go func() {
-			_, err := c.Advance(ctx, key, probeBody(), etag3)
+			body := probeBody()
+			parked.Done()
+			<-startBarrier
+			_, err := c.Advance(ctx, key, body, etag3)
 			results <- err
 		}()
 	}
+	parked.Wait()
+	close(startBarrier)
 	wins := 0
 	for range 2 {
 		switch err := <-results; {
