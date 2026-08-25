@@ -280,7 +280,7 @@ func (s *server) handleForkRepo(w http.ResponseWriter, r *http.Request, verifier
 		}
 		if errors.Is(err, errPackReservationsBusy) {
 			// Transient row-cap denial (Codex round 43): retryable.
-			w.Header().Set("Retry-After", "10")
+			rateLimited(w, 10)
 			writeErr(w, http.StatusTooManyRequests, err.Error())
 			return
 		}

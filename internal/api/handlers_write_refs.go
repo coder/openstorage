@@ -770,7 +770,7 @@ func (s *server) wrefHandleNote(w http.ResponseWriter, r *http.Request, deleteNo
 		}
 		if errors.Is(err, errPackReservationsBusy) {
 			// Transient row-cap denial (Codex round 43): retryable.
-			w.Header().Set("Retry-After", "10")
+			rateLimited(w, 10)
 			wrefNoteFail(w, http.StatusTooManyRequests, err.Error(), objectSHA, targetRef, old, oldOrZero)
 			return
 		}

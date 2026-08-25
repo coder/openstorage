@@ -166,9 +166,21 @@ type lfsBatchResponse struct {
 	HashAlgo string            `json:"hash_algo"`
 }
 
+// lfsRetryAfterSecs is the uniform come-back-shortly hint on every LFS
+// surface 429: staging-budget exhaustion, per-object in-flight contention,
+// and restore/adoption races are all transient conditions expected to clear
+// within seconds.
+const lfsRetryAfterSecs = 10
+
 // lfsError writes an LFS-spec error body ({"message": ...}) with the LFS
-// media type, so git-lfs surfaces the message to the user.
+// media type, so git-lfs surfaces the message to the user. Throttled
+// responses uniformly carry the Retry-After + RateLimit header pair
+// (SetRateLimited, issue #150) — stamped here so no 429 path can forget
+// them.
 func lfsError(w http.ResponseWriter, status int, msg string) {
+	if status == http.StatusTooManyRequests {
+		SetRateLimited(w.Header(), lfsRetryAfterSecs)
+	}
 	w.Header().Set("Content-Type", lfsMediaType)
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(map[string]string{"message": msg})
@@ -2762,7 +2774,6 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target r
 	// not multiply staging files, and concurrent adoption verifications
 	// of one legacy key must not race each other's mismatch deletes.
 	if _, busy := s.lfsUploadsInFlight.LoadOrStore(key, struct{}{}); busy {
-		w.Header().Set("Retry-After", "10")
 		lfsError(w, http.StatusTooManyRequests, "an operation for this object is already in progress")
 		return
 	}
@@ -2795,7 +2806,6 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target r
 	// briefly takes a second slot of its own — it must hold one on the
 	// batch path too — which only makes the cap more conservative.)
 	if !s.reserveLFSStaging(repoID, 0) {
-		w.Header().Set("Retry-After", "10")
 		lfsError(w, http.StatusTooManyRequests, "server LFS staging budget exhausted, retry")
 		s.lfsUploadsInFlight.Delete(key)
 		uploadResourcesReleased = true // nothing else was acquired
@@ -2857,7 +2867,6 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target r
 			lfsError(w, http.StatusInsufficientStorage, aerr.Error())
 			return
 		case errors.Is(aerr, errLFSBusy):
-			w.Header().Set("Retry-After", "10")
 			lfsError(w, http.StatusTooManyRequests, "server LFS staging budget exhausted, retry")
 			return
 		case errors.Is(aerr, errLFSContentMismatch):
@@ -2906,7 +2915,6 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target r
 	}
 	if initial := min(r.ContentLength, s.lfsStagingQuantum()); initial > 0 {
 		if !s.growLFSStaging(repoID, initial) {
-			w.Header().Set("Retry-After", "10")
 			lfsError(w, http.StatusTooManyRequests, "server LFS staging budget exhausted, retry")
 			return
 		}
@@ -3027,7 +3035,6 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target r
 		if errors.Is(err, errLFSBusy) {
 			// The budget filled while this body streamed (other uploads'
 			// real bytes claimed it): transient, like the entry check.
-			w.Header().Set("Retry-After", "10")
 			lfsError(w, http.StatusTooManyRequests, "server LFS staging budget exhausted, retry")
 			return
 		}
@@ -3064,7 +3071,6 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target r
 		return
 	}
 	if !claimed {
-		w.Header().Set("Retry-After", "10")
 		lfsError(w, http.StatusTooManyRequests, "a concurrent operation holds this object, retry")
 		return
 	}
@@ -3182,7 +3188,6 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target r
 			}
 		}
 		if dec.KeyCapExceeded {
-			w.Header().Set("Retry-After", "10")
 			lfsError(w, http.StatusTooManyRequests,
 				"too many in-flight uploads reserved for this repository, retry later")
 			return
@@ -3228,7 +3233,6 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target r
 			return
 		}
 		if dec.KeyCapExceeded {
-			w.Header().Set("Retry-After", "10")
 			lfsError(w, http.StatusTooManyRequests,
 				"too many in-flight uploads reserved for this repository, retry later")
 			return

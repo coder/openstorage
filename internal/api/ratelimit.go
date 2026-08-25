@@ -22,11 +22,20 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/coder/code-storage/internal/githttp"
 )
+
+// rateLimited stamps the Retry-After + RateLimit header pair on a throttled
+// response. githttp.SetRateLimited is the single source of truth for the
+// wire shape (upstream documents BOTH headers on every 429 — issue #150);
+// this wrapper just saves each REST 429 site the Header() plumbing.
+func rateLimited(w http.ResponseWriter, retryAfterSecs int) {
+	githttp.SetRateLimited(w.Header(), retryAfterSecs)
+}
 
 // RateLimitConfig enables per-client-IP rate limiting when RPS > 0; the zero
 // value disables limiting entirely (the middleware becomes the identity).
@@ -158,7 +167,7 @@ func rateLimitExempt(ctx context.Context) context.Context {
 
 // limit returns the pre-auth middleware for one REST route; flavor picks the
 // 429 envelope shape and must match the route's auth-failure envelope.
-// 429 responses carry a Retry-After header.
+// 429 responses carry the Retry-After + RateLimit header pair.
 func (l *rateLimiter) limit(flavor routeFlavor) middleware {
 	assertf(flavor == routeRead || flavor == routeWrite, "limit: unknown flavor %d", flavor)
 	if l == nil {
@@ -172,7 +181,7 @@ func (l *rateLimiter) limit(flavor routeFlavor) middleware {
 			}
 			ok, retryAfter := l.admit(l.clientKey(r))
 			if !ok {
-				w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
+				rateLimited(w, retryAfter)
 				const msg = "rate limit exceeded"
 				if flavor == routeRead {
 					writeErr(w, http.StatusTooManyRequests, msg)
@@ -399,7 +408,7 @@ const gitMinBurst = 8
 // git transfers are far heavier per request, so one surface exhausting its
 // budget must not starve the other. The configured burst is raised to
 // gitMinBurst so a single protocol exchange can always complete. 429
-// responses carry Retry-After and the git surface's plain {"error"}
+// responses carry the Retry-After + RateLimit pair and the git surface's plain {"error"}
 // envelope (git clients surface the status line, not the body). The zero
 // config yields the identity middleware; invalid config is a startup error,
 // mirroring newRateLimiter.
@@ -430,7 +439,7 @@ func NewGitRateLimit(cfg RateLimitConfig) (func(http.Handler) http.Handler, erro
 			// a complete git operation fits (admitReserve).
 			ok, retryAfter := l.admitReserve(l.clientKey(r), gitMinBurst)
 			if !ok {
-				w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
+				rateLimited(w, retryAfter)
 				writeErr(w, http.StatusTooManyRequests, "rate limit exceeded")
 				return
 			}

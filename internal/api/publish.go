@@ -30,7 +30,7 @@ var errPackQuotaExceeded = errors.New("repository pack quota exceeded")
 // errPackReservationsBusy marks a publishPack denial by the ACTIVE
 // reservation-row cap (issue #51, Codex round 43): rows expire with the
 // TTL, so unlike the byte-quota denial this is transient — handlers
-// answer 429 with Retry-After, never the permanent 403 whose quota
+// answer 429 with the Retry-After + RateLimit pair, never the permanent 403 whose quota
 // arithmetic may even show the write fits.
 var errPackReservationsBusy = errors.New("too many in-flight uploads reserved for this repository, retry later")
 

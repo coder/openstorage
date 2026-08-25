@@ -773,7 +773,7 @@ func (s *server) wcFinishCommit(w http.ResponseWriter, r *http.Request, sc *wcSc
 	}
 	if errors.Is(err, errPackReservationsBusy) {
 		// Transient row-cap denial (Codex round 43): retryable.
-		w.Header().Set("Retry-After", "10")
+		rateLimited(w, 10)
 		wcFail(w, http.StatusTooManyRequests, "busy", err.Error(), md.TargetBranch, plan.oldSHA)
 		return
 	}
