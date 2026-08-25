@@ -1,0 +1,85 @@
+# Nightly S3 lane against Floci (issue #112). The PR pipeline's S3-over-HTTP
+# coverage is the MinIO testcontainer lane inside `go test ./internal/blob`;
+# this workflow additionally boots floci/floci — a lightweight AWS
+# wire-protocol emulator — with FLOCI_SERVICES_S3_ENFORCE_AUTH=true,
+# provisions an IAM access key through the IAM API, and runs the blob suite
+# with CODESTORAGE_TEST_S3_URL pointed at it. That gates the env-gated
+# endpoint tests (internal/blob/s3endpoint_test.go), which pin real SigV4
+# verification on presigned URLs: valid signature ⇒ 200 + exact bytes,
+# corrupted signature ⇒ 403 SignatureDoesNotMatch. Known Floci 1.7.0 gaps
+# (no IAM policy evaluation on S3 actions, x-amz-expected-bucket-owner
+# ignored) are documented in that test file — do not extend this lane to
+# cover them. Local repro: docs/reference/testing.md (The Floci S3 lane).
+name: floci-nightly
+
+on:
+  schedule:
+    - cron: "53 3 * * *" # daily, 03:53 UTC (between dst-nightly and bench-nightly)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  s3-lane:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: boot floci
+        run: |
+          docker run -d --name floci -p 4566:4566 \
+            -e FLOCI_SERVICES_S3_ENFORCE_AUTH=true \
+            floci/floci:latest
+          for i in $(seq 1 60); do
+            if curl -s -o /dev/null http://127.0.0.1:4566/; then
+              echo "floci ready after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::floci did not become ready"
+          docker logs floci
+          exit 1
+      - name: provision IAM access key
+        # The IAM control plane accepts any credentials; only the S3 data
+        # plane enforces auth, and it only honors keys minted through IAM.
+        env:
+          AWS_ACCESS_KEY_ID: root
+          AWS_SECRET_ACCESS_KEY: root
+          AWS_DEFAULT_REGION: us-east-1
+        run: |
+          aws --endpoint-url http://127.0.0.1:4566 iam create-user --user-name blob-nightly
+          key_json=$(aws --endpoint-url http://127.0.0.1:4566 iam create-access-key \
+            --user-name blob-nightly --output json)
+          access_key_id=$(jq -r '.AccessKey.AccessKeyId // empty' <<<"$key_json")
+          secret_key=$(jq -r '.AccessKey.SecretAccessKey // empty' <<<"$key_json")
+          if [ -z "$access_key_id" ] || [ -z "$secret_key" ]; then
+            echo "::error::IAM CreateAccessKey returned no key: $key_json"
+            exit 1
+          fi
+          {
+            echo "AWS_ACCESS_KEY_ID=$access_key_id"
+            echo "AWS_SECRET_ACCESS_KEY=$secret_key"
+          } >> "$GITHUB_ENV"
+      - name: blob suite with the endpoint tests against floci
+        shell: bash # explicit: pipefail so the tee cannot mask go test's exit code
+        env:
+          AWS_REGION: us-east-1
+          CODESTORAGE_TEST_S3_URL: s3://codestorage-nightly?endpoint=http://127.0.0.1:4566&s3ForcePathStyle=true&region=us-east-1
+        run: |
+          go test ./internal/blob -count=1 -race -v -timeout=25m 2>&1 | tee /tmp/floci-lane.log
+      - name: assert the endpoint tests ran (a skip means broken env plumbing)
+        run: |
+          for t in TestS3Endpoint_RoundTrip TestS3Endpoint_PresignedSigV4; do
+            if ! grep -q "^--- PASS: $t" /tmp/floci-lane.log; then
+              echo "::error::$t did not run against floci (renamed gate or broken env plumbing?)"
+              exit 1
+            fi
+          done
+      - name: floci logs
+        if: failure()
+        run: docker logs floci
