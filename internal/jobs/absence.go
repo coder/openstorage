@@ -898,7 +898,10 @@ func (r *AbsenceReconciler) armAdmissionFence(ctx context.Context, errs *bounded
 	age, ok, err := r.registry.JobScanStateAge(sctx, ref.ScanJobAbsence, ref.ScanScopeAbsenceRenewalHealth)
 	if err != nil {
 		errs.add(fmt.Errorf("absence reconcile: read renewal health: %w", err))
-	} else if ok && age <= r.renewalSafeAge {
+	} else if ok && age < r.renewalSafeAge {
+		// Strictly less (Codex round 27, security): at age == bound the
+		// next attempt can land exactly at the TTL boundary, where the
+		// strict-TTL bulk update already excludes the row.
 		return // renewed recently: covers survive until the NEXT attempt
 	}
 	snap, mErr := json.Marshal(map[string]int64{"lfs": r.lfs.Traversals, "packs": r.packs.Traversals})
