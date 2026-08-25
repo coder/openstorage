@@ -1280,6 +1280,89 @@ func TestResolveLFSGCSettings(t *testing.T) {
 	}
 }
 
+// TestResolveAbsenceSettings (issue #101): the absence reconciliation
+// knobs parse fail-fast like the sweep settings.
+func TestResolveAbsenceSettings(t *testing.T) {
+	env := func(m map[string]string) func(string) string {
+		return func(k string) string { return m[k] }
+	}
+
+	t.Run("defaults", func(t *testing.T) {
+		s, err := resolveAbsenceSettings(env(nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := absenceSettings{budget: jobs.DefaultAbsenceReconcileBudget}
+		if s != want {
+			t.Fatalf("defaults = %+v, want %+v (disabled, 100k budget)", s, want)
+		}
+	})
+
+	t.Run("parse-through", func(t *testing.T) {
+		s, err := resolveAbsenceSettings(env(map[string]string{
+			envAbsenceReconcileInterval: "45m",
+			envAbsenceReconcileBudget:   "5000",
+		}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := absenceSettings{interval: 45 * time.Minute, budget: 5000}
+		if s != want {
+			t.Fatalf("settings = %+v, want %+v", s, want)
+		}
+	})
+
+	for name, bad := range map[string]map[string]string{
+		"negative interval":  {envAbsenceReconcileInterval: "-1h"},
+		"malformed interval": {envAbsenceReconcileInterval: "soon"},
+		"zero budget":        {envAbsenceReconcileBudget: "0"},
+		"negative budget":    {envAbsenceReconcileBudget: "-5"},
+		"sub-floor budget":   {envAbsenceReconcileBudget: "99"},
+		"malformed budget":   {envAbsenceReconcileBudget: "many"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := resolveAbsenceSettings(env(bad)); err == nil {
+				t.Fatalf("%v must fail", bad)
+			}
+		})
+	}
+}
+
+// TestResolveServeConfigAbsenceIntervalTTLCoupling (issue #101, Codex
+// round 3 security): absence covers are TTL'd reservations renewed once
+// per pass, a pass may run up to a quarter of the TTL, and River coalesces
+// ticks that fire mid-pass — an interval above TTL/2 therefore lets live
+// covers lapse between renewals, reopening the window the job closes.
+func TestResolveServeConfigAbsenceIntervalTTLCoupling(t *testing.T) {
+	env := map[string]string{
+		"CODESTORAGE_ORG":                        "org1",
+		"CODESTORAGE_ORG_PUBKEYS":                "/tmp/org.pub.pem",
+		"CODESTORAGE_PACK_RESERVATION_TTL":       "90s",
+		"CODESTORAGE_ABSENCE_RECONCILE_INTERVAL": "60s",
+	}
+	for k, v := range spikeEnv {
+		env[k] = v
+	}
+	if _, err := resolveServeConfig(mapEnv(env), "", "127.0.0.1:0", "/tmp/cache", ""); err == nil {
+		t.Fatal("interval > TTL/2 resolved — covers would lapse between renewals")
+	}
+	env["CODESTORAGE_ABSENCE_RECONCILE_INTERVAL"] = "45s"
+	if _, err := resolveServeConfig(mapEnv(env), "", "127.0.0.1:0", "/tmp/cache", ""); err != nil {
+		t.Fatalf("interval = TTL/2 must resolve: %v", err)
+	}
+	// Overflow guard (Codex round 7): interval*2 on an absurd duration
+	// wraps negative; the division form must still reject it.
+	env["CODESTORAGE_ABSENCE_RECONCILE_INTERVAL"] = "2000000h"
+	if _, err := resolveServeConfig(mapEnv(env), "", "127.0.0.1:0", "/tmp/cache", ""); err == nil {
+		t.Fatal("overflow-scale interval resolved — the cadence bound must reject it")
+	}
+	// Disabled reconciliation never couples to the TTL.
+	env["CODESTORAGE_ABSENCE_RECONCILE_INTERVAL"] = "0"
+	if _, err := resolveServeConfig(mapEnv(env), "", "127.0.0.1:0", "/tmp/cache", ""); err != nil {
+		t.Fatalf("disabled reconciliation must not couple to the TTL: %v", err)
+	}
+}
+
 // TestResolveLFSMaxObjectsPerRepo (issue #73 option 3): the operator escape
 // hatch parses positively or fails loudly.
 func TestResolveLFSMaxObjectsPerRepo(t *testing.T) {

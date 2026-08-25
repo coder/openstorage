@@ -83,7 +83,8 @@ func (s *SQLite) InitSchema(ctx context.Context) error {
 		// byte-comparable with the PG backend (see Pack). created_at is
 		// INTEGER unix seconds; ORDER BY created_at, id keeps the tie-break.
 		`CREATE TABLE IF NOT EXISTS packs (repo TEXT, id TEXT, s3_key TEXT NOT NULL,
-		                                   created_at INTEGER DEFAULT (unixepoch()), PRIMARY KEY (repo, id))`,
+		                                   created_at INTEGER DEFAULT (unixepoch()),
+		                                   bytes INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (repo, id))`,
 		// The orphan sweeper's HasPack filters on (repo, s3_key); the
 		// (repo, id) primary key cannot serve it (see the PG DDL).
 		`CREATE INDEX IF NOT EXISTS packs_repo_s3_key ON packs (repo, s3_key)`,
@@ -170,6 +171,20 @@ func (s *SQLite) InitSchema(ctx context.Context) error {
 		if _, err := tx.ExecContext(ctx,
 			`ALTER TABLE pack_reservations ADD COLUMN gen TEXT NOT NULL DEFAULT ''`); err != nil {
 			return fmt.Errorf("sqlite init schema: add pack_reservations.gen: %w", err)
+		}
+	}
+	// bytes records the registered pack's size (issue #101) so the absence
+	// reconciler can cover a missing pack's bytes; pre-#101 rows keep 0
+	// (size unknown — reported, never covered).
+	var havePackBytes int
+	if err := tx.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM pragma_table_info('packs') WHERE name = 'bytes'`).Scan(&havePackBytes); err != nil {
+		return fmt.Errorf("sqlite init schema: probe packs.bytes: %w", err)
+	}
+	if havePackBytes == 0 {
+		if _, err := tx.ExecContext(ctx,
+			`ALTER TABLE packs ADD COLUMN bytes INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return fmt.Errorf("sqlite init schema: add packs.bytes: %w", err)
 		}
 	}
 	// unreferenced_since is the issue #73 reclamation mark; pre-#73 rows
@@ -444,8 +459,8 @@ func (s *SQLite) RegisterPacks(ctx context.Context, repo string, packs []Pack) e
 	for _, p := range packs {
 		assertf(p.ID != "" && p.Key != "", "RegisterPacks: empty pack id/key %+v", p)
 		res, err := tx.ExecContext(ctx,
-			`INSERT INTO packs (repo, id, s3_key) VALUES (?, ?, ?) ON CONFLICT DO NOTHING`,
-			repo, p.ID, p.Key)
+			`INSERT INTO packs (repo, id, s3_key, bytes) VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING`,
+			repo, p.ID, p.Key, p.Size)
 		if err != nil {
 			return err
 		}
@@ -535,8 +550,8 @@ ON CONFLICT (repo, key) DO UPDATE SET bytes = excluded.bytes, superseded_at = un
 		}
 	}
 	res, err := tx.ExecContext(ctx,
-		`INSERT INTO packs (repo, id, s3_key) VALUES (?, ?, ?) ON CONFLICT DO NOTHING`,
-		repo, newPack.ID, newPack.Key)
+		`INSERT INTO packs (repo, id, s3_key, bytes) VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING`,
+		repo, newPack.ID, newPack.Key, newPack.Size)
 	if err != nil {
 		return false, fmt.Errorf("replace packs %s: %w", repo, err)
 	}

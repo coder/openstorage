@@ -44,7 +44,7 @@ import (
 // mux.Handle("/api/", h). refStore/blobStore/cacheDir back the
 // git:read endpoints — serve passes the same instances the githttp fallback
 // uses so both surfaces share one cache.
-func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL, loopbackBaseURL string, orgPEMBlocks []string, refStore ref.RefStore, blobStore blob.BlobStore, cacheDir string, rate api.RateLimitConfig, packQuotaBytes int64, packReservationTTL time.Duration, sweep sweepSettings, lfsGC lfsGCSettings, lfsWriteCompat bool, repackThreshold int, webhookAllowPrivate bool, secretsCodec *secrets.Codec, usageFloor func(context.Context, string) (int64, int64, error)) (http.Handler, meta.Store, auth.Verifier, func(ctx context.Context, repo string), func(), error) {
+func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL, loopbackBaseURL string, orgPEMBlocks []string, refStore ref.RefStore, blobStore blob.BlobStore, cacheDir string, rate api.RateLimitConfig, packQuotaBytes int64, packReservationTTL time.Duration, sweep sweepSettings, lfsGC lfsGCSettings, absence absenceSettings, lfsWriteCompat bool, repackThreshold int, webhookAllowPrivate bool, secretsCodec *secrets.Codec, usageFloor func(context.Context, string) (int64, int64, error)) (http.Handler, meta.Store, auth.Verifier, func(ctx context.Context, repo string), func(), error) {
 	assertf(dbURL != "" && org != "" && httpBaseURL != "" && len(orgPEMBlocks) > 0, "buildAPIHandler: missing dbURL/org/httpBaseURL/keys")
 	assertf(loopbackBaseURL != "", "buildAPIHandler: missing loopbackBaseURL")
 	assertf(refStore != nil && blobStore != nil && cacheDir != "", "buildAPIHandler: missing refStore/blobStore/cacheDir")
@@ -255,6 +255,27 @@ func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL, loopbackBaseU
 			"object_budget", lfsGC.objectBudget, "mode", mode)
 	}
 
+	// Registry-vs-storage absence reconciliation (issue #101): its own
+	// schedule, independent of the sweeper's — detecting registered rows
+	// whose bytes storage lost is useful even where blob sweeping stays
+	// disabled. Built over the RAW ref store like the reclamation seams;
+	// covers and generation bumps are charged only when quota admission
+	// actually consults them.
+	var absenceSchedule *jobs.AbsenceReconcileSchedule
+	if absence.interval > 0 {
+		absenceReg, ok := refStore.(jobs.AbsenceRegistry)
+		assertf(ok, "ref store %T lacks the absence reconciliation seams", refStore)
+		// Cadence-vs-TTL safety is enforced at config resolution
+		// (interval ≤ TTL/2) and inside the constructor (pass wall-clock
+		// ≤ TTL/4), so covers renew before they can lapse.
+		reconciler := jobs.NewAbsenceReconciler(absenceReg, blobStore,
+			packQuotaBytes > 0, absence.budget, packReservationTTL, logger)
+		absenceSchedule = &jobs.AbsenceReconcileSchedule{Reconciler: reconciler, Interval: absence.interval}
+		logger.Info("registry-vs-storage absence reconciliation enabled",
+			"env", envAbsenceReconcileInterval, "interval", absence.interval,
+			"budget", absence.budget, "quota_enforced", packQuotaBytes > 0)
+	}
+
 	// Background repack (issue #1): the worker folds over the RAW ref
 	// store — ReplacePacks is a pack mutation, no ref events to emit — and
 	// the shared blob store and cache dir. Always constructed so durable
@@ -281,7 +302,7 @@ func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL, loopbackBaseU
 	// schedule one more fold when the count is still at/above it.
 	repacker.FollowUpThreshold = repackThreshold
 
-	queue, decorate, queueCleanup, err := buildServeEventing(ctx, ms, dbURL, org, loopbackBaseURL, key, schedule, lfsReclaimSchedule, repacker, webhookAllowPrivate, logger)
+	queue, decorate, queueCleanup, err := buildServeEventing(ctx, ms, dbURL, org, loopbackBaseURL, key, schedule, lfsReclaimSchedule, absenceSchedule, repacker, webhookAllowPrivate, logger)
 	if err != nil {
 		// The reconcile ticker predates eventing setup (Codex round 104):
 		// failing without stopping it leaks an hourly ref-store query loop

@@ -471,7 +471,13 @@ func initSchemaTx(ctx context.Context, db interface {
 CREATE TABLE IF NOT EXISTS refs  (repo text, name text, sha text NOT NULL,
                                   created_at timestamptz NOT NULL DEFAULT now(), PRIMARY KEY (repo, name));
 CREATE TABLE IF NOT EXISTS packs (repo text, id text, s3_key text NOT NULL,
-                                  created_at timestamptz DEFAULT now(), PRIMARY KEY (repo, id));
+                                  created_at timestamptz DEFAULT now(),
+                                  bytes bigint NOT NULL DEFAULT 0, PRIMARY KEY (repo, id));
+-- Registered pack size (issue #101): written by RegisterPacks/ReplacePacks
+-- so the absence reconciler can charge a missing pack's bytes as a restore
+-- cover. Rows registered before this migration keep 0 (size unknown —
+-- reported, never covered); repack folds rewrite them with real sizes.
+ALTER TABLE packs ADD COLUMN IF NOT EXISTS bytes bigint NOT NULL DEFAULT 0;
 -- Per-repo mutation generation (issue #4). No row means "never mutated"
 -- (GetGeneration reports 0); the first bump creates the row at 1, so a
 -- hydrate marker taken before the first mutation can never match the state
@@ -966,8 +972,8 @@ func (s *PG) RegisterPacks(ctx context.Context, repo string, packs []Pack) error
 		for _, p := range packs {
 			assertf(p.ID != "" && p.Key != "", "RegisterPacks: empty pack id/key %+v", p)
 			ct, err := tx.Exec(ctx,
-				`INSERT INTO packs (repo, id, s3_key) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
-				repo, p.ID, p.Key)
+				`INSERT INTO packs (repo, id, s3_key, bytes) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING`,
+				repo, p.ID, p.Key, p.Size)
 			if err != nil {
 				return err
 			}
@@ -1053,8 +1059,8 @@ ON CONFLICT (repo, key) DO UPDATE SET bytes = EXCLUDED.bytes, superseded_at = no
 			}
 		}
 		ct, err = tx.Exec(ctx,
-			`INSERT INTO packs (repo, id, s3_key) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
-			repo, newPack.ID, newPack.Key)
+			`INSERT INTO packs (repo, id, s3_key, bytes) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING`,
+			repo, newPack.ID, newPack.Key, newPack.Size)
 		if err != nil {
 			return err
 		}

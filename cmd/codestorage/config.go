@@ -157,6 +157,18 @@ const (
 	// without waiting for reclamation. Default 100000.
 	envLFSMaxObjectsPerRepo = "CODESTORAGE_LFS_MAX_OBJECTS_PER_REPO"
 
+	// Registry-vs-storage absence reconciliation (issue #101): a bounded
+	// background scan pages registered lfs_objects/packs rows and
+	// point-checks their bytes still exist in blob storage; truly absent
+	// bytes are charged as TTL'd restore covers so quota admission sees
+	// them while they are missing. Interval 0 (the default) disables the
+	// job entirely.
+	envAbsenceReconcileInterval = "CODESTORAGE_ABSENCE_RECONCILE_INTERVAL"
+	// envAbsenceReconcileBudget caps the work units one pass may charge
+	// (default 100,000): one per row examined plus one per extra
+	// twin-spelling probe — each unit is at most one blob-store HEAD.
+	envAbsenceReconcileBudget = "CODESTORAGE_ABSENCE_RECONCILE_BUDGET"
+
 	// Background repack (issue #1): registered-pack count at which a
 	// post-write trigger schedules a fold ("0" disables triggering).
 	envRepackThreshold = "CODESTORAGE_REPACK_THRESHOLD"
@@ -320,6 +332,10 @@ type serveConfig struct {
 	// (issue #73 option 3); always positive.
 	lfsMaxObjectsPerRepo int64
 
+	// absence configures the registry-vs-storage absence reconciliation
+	// job (issue #101); interval 0 disables it.
+	absence absenceSettings
+
 	// repackThreshold is the registered-pack count at which a post-write
 	// trigger schedules a background repack (issue #1); 0 disables
 	// triggering (already-queued durable jobs still run).
@@ -353,6 +369,13 @@ type lfsGCSettings struct {
 	grace         time.Duration // > 0; how long a row must stay unreferenced
 	objectBudget  int64         // > 0; git objects one run may walk
 	deleteEnabled bool          // false = report-only marking (the default)
+}
+
+// absenceSettings is the resolved registry-vs-storage absence
+// reconciliation configuration (issue #101).
+type absenceSettings struct {
+	interval time.Duration // 0 = reconciliation disabled (the default)
+	budget   int64         // > 0; work units one pass may charge
 }
 
 // storageURLs is the resolved storage location set shared by every
@@ -541,6 +564,25 @@ func resolveServeConfig(getenv func(string) string, flagListen, flagAddr, flagCa
 	cfg.lfsMaxObjectsPerRepo, err = resolveLFSMaxObjectsPerRepo(getenv)
 	if err != nil {
 		return serveConfig{}, err
+	}
+	cfg.absence, err = resolveAbsenceSettings(getenv)
+	if err != nil {
+		return serveConfig{}, err
+	}
+	// Compare against TTL/2 by DIVISION (Codex round 7): interval*2 on an
+	// absurd-but-parseable duration overflows time.Duration negative and
+	// waves the misconfiguration through.
+	if cfg.absence.interval > 0 && cfg.absence.interval > cfg.packReservationTTL/2 {
+		// Covers renew at pass starts and a pass may run up to a quarter
+		// of the TTL (jobs.NewAbsenceReconciler), so the renewal gap is
+		// bounded by pass duration + interval + the next refresh phase —
+		// an interval above TTL/2 breaks that bound and lets live covers
+		// lapse between passes (Codex round 3, security). Reject the
+		// misconfiguration loudly instead of reopening the window it
+		// exists to close.
+		return serveConfig{}, fmt.Errorf(
+			"%s (%s) must be at most half of %s (%s): absence covers are TTL'd reservations renewed once per pass, and a longer cadence lets them lapse between passes",
+			envAbsenceReconcileInterval, cfg.absence.interval, envPackReservationTTL, cfg.packReservationTTL)
 	}
 	cfg.repackThreshold, err = resolveRepackThreshold(getenv)
 	if err != nil {
@@ -894,6 +936,37 @@ func resolveLFSGCSettings(getenv func(string) string) (lfsGCSettings, error) {
 			return lfsGCSettings{}, fmt.Errorf("%s requires the reclamation schedule enabled (%s > 0)", envLFSGCDeleteEnabled, envLFSGCInterval)
 		}
 		s.deleteEnabled = v
+	}
+	return s, nil
+}
+
+// resolveAbsenceSettings parses the registry-vs-storage absence
+// reconciliation knobs (issue #101), fail-fast like the sweep settings.
+func resolveAbsenceSettings(getenv func(string) string) (absenceSettings, error) {
+	assertf(getenv != nil, "resolveAbsenceSettings: nil getenv")
+	s := absenceSettings{budget: jobs.DefaultAbsenceReconcileBudget}
+	if raw := getenv(envAbsenceReconcileInterval); raw != "" {
+		d, err := time.ParseDuration(raw)
+		if err != nil {
+			return absenceSettings{}, fmt.Errorf("%s: %w", envAbsenceReconcileInterval, err)
+		}
+		if d < 0 {
+			return absenceSettings{}, fmt.Errorf("%s must be non-negative (0 disables reconciliation), got %q", envAbsenceReconcileInterval, raw)
+		}
+		s.interval = d
+	}
+	if raw := getenv(envAbsenceReconcileBudget); raw != "" {
+		v, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil {
+			return absenceSettings{}, fmt.Errorf("%s: %w", envAbsenceReconcileBudget, err)
+		}
+		if v < jobs.MinAbsenceReconcileBudget {
+			// One row can cost up to three units, so a degenerate budget
+			// cannot guarantee the refresh/rotation split progresses on
+			// both registries — reject it loudly.
+			return absenceSettings{}, fmt.Errorf("%s must be at least %d, got %q", envAbsenceReconcileBudget, jobs.MinAbsenceReconcileBudget, raw)
+		}
+		s.budget = v
 	}
 	return s, nil
 }

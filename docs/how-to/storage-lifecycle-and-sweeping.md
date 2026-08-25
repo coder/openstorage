@@ -464,3 +464,102 @@ A reclamation run logs one `lfs reclaim pass finished` line:
 | `rows_eligible` / `rows_retired` / `rows_spared` | grace-expired rows; how many actually retired; how many the guarded delete declined at the last moment (concurrent touch, ref movement, purge fence) |
 | `bytes_retired` | quota bytes refunded |
 | `dry_run` | `true` while `CODESTORAGE_LFS_GC_DELETE_ENABLED` is off |
+
+## Reconciling registered-but-missing bytes
+
+Every deletion path in codestorage quarantines before it deletes and heals
+through digest-verified restores, so the registry and blob storage normally
+never disagree. Storage-layer data loss — a bucket lifecycle rule, an
+operator `rm`, a storage incident — can still leave a **registered row whose
+bytes are physically absent**. That state is doubly bad:
+
+- **Integrity:** a missing registered pack may be referenced by committed
+  refs (clones fail); a missing LFS object 404s until a restore source
+  appears.
+- **Quota visibility** ([#101](https://github.com/coder/code-storage/issues/101)):
+  the admission floor is `max(0, listing − counter)`, and the counter still
+  includes the absent bytes the listing lacks — the floor deflates by the
+  missing size, hiding up to that many rowless legacy bytes from admission.
+  A write admitted through that deflated view is durable; when the missing
+  object is later restored (download-time restore, a re-push, quarantine
+  healing), physical usage can exceed the quota by the once-hidden amount.
+
+The absence reconciliation job
+([ADR-43](../adr/043-absence-reconciliation-covers-registered-but-missing-bytes.md))
+closes that window to one pass. Enable it with
+[`CODESTORAGE_ABSENCE_RECONCILE_INTERVAL`](../reference/configuration.md#codestorage_absence_reconcile_interval);
+each pass pages `lfs_objects` and `packs` rows from persistent-shape keyset
+cursors (budget-limited, resumable — the sweeper's inverse direction) and
+`HEAD`s each row's blob:
+
+- **Present** — nothing happens; the common case costs one probe per row.
+- **LFS row absent under its registered spelling but FULLY present under
+  its ADR-41 twin** (canonical `lfs/<repo>/o2/<oid>` vs legacy
+  `lfs/<repo>/<oid>`) — reported (`lfs_rows_twin_only`), never charged: the
+  twin's bytes are still physically listed, and download-time restore heals
+  the spelling.
+- **Physically present but SHORTER than registered** (a truncated blob, or
+  a short surviving twin) — a partial loss: the deficit deflates the floor
+  exactly like absence and is covered/tracked the same way
+  (`lfs_rows_truncated` / `pack_rows_truncated`).
+- **Truly absent** — logged loudly and, when quota is enforced, charged as a
+  TTL'd restore cover (the same reservation row restore paths renew) plus a
+  floor-generation bump, so every admission sees the missing bytes until
+  they are restored or their row is retired/purged. Discovered losses join
+  a per-process **known-absent set** whose bytes aggregate into one cover
+  reservation row per affected repository, renewed FIRST every pass (one
+  work unit per repository, with the tracked-repository population capped
+  at that renewal allocation — tracked ⇒ renewed every pass) — so the
+  per-repository reservation-row cap cannot bind regardless of how many
+  rows were lost. Round-robin re-verification then shrinks aggregates as
+  losses heal (rotating the reservation key so exact totals are charged);
+  a backlog there delays shrinking (conservative), never renewal. On
+  PostgreSQL the job runs on its own reserved single-worker River queue,
+  so tenant-scalable work (webhook deliveries to slow endpoints) cannot
+  delay a renewal past the cover TTL. Startup
+  enforces the cadence-vs-TTL coupling (interval ≤ TTL/2, pass wall clock
+  ≤ TTL/4), so renewals always land before live covers can lapse. The set
+  is in-memory per worker:
+  a restart loses it and the rotation rediscovers losses within one full
+  rotation — a convergence delay, never corruption. On multi-replica
+  PostgreSQL fleets the periodic job may run on any replica, so refresh
+  continuity is per-replica until
+  [#125](https://github.com/coder/code-storage/issues/125) lands fleet
+  persistence — size the budget at or above the fleet's total registered
+  row count there, making every pass a complete rotation on whichever
+  replica runs it.
+- **Absent pack rows registered before this feature** carry no recorded
+  size (`pack_rows_unsized`): the loss is reported but cannot be charged
+  until a repack fold rewrites the row with its size.
+
+The job is non-destructive everywhere — it inserts/refreshes reservation
+rows and bumps a generation counter, nothing else — so it is safe to run
+continuously. Purge-fenced repositories are skipped (their rows and blobs
+are already on their way out), and superseded `pack_retained` blobs are
+deliberately out of scope: nothing ever restores them, so a deflated floor
+is their true permanent state.
+
+A reconciliation pass logs one `absence reconcile pass finished` line:
+
+| Field | Meaning |
+|---|---|
+| `lfs_rows_examined` / `pack_rows_examined` | registry rows point-checked this pass (each charges the budget) |
+| `lfs_rows_absent` | LFS rows missing under BOTH spellings — genuine storage loss |
+| `lfs_rows_truncated` / `pack_rows_truncated` | rows physically present but shorter than registered — the deficit is covered like absence |
+| `lfs_rows_twin_only` | rows fully present only under their ADR-41 twin spelling (restorable, not charged) |
+| `pack_rows_absent` / `pack_rows_unsized` | missing registered packs (integrity!); how many predate size recording and cannot be charged |
+| `covers_charged` / `bytes_covered` | restore covers charged/refreshed this pass and their total bytes |
+| `cover_errors` / `stat_errors` | covers that failed (e.g. the per-repo reservation-row cap) and probes that errored — both retried next pass |
+| `rows_skipped_purged` | rows of purge-fenced repositories skipped |
+| `absent_tracked` | known-absent set size at pass end: losses whose per-repository aggregate covers renew every pass |
+| `absent_refreshed` | tracked losses re-verified this pass — below `absent_tracked` means heal-detection (cover shrinking) spans multiple passes; renewal is unaffected |
+| `absent_untracked` | losses beyond the tracked-repository capacity (`budget/4`) or the 100,000-entry memory cap — aggregated into one pass-scoped overflow cover per repository, renewed only on rotation revisits. Renewal above capacity cannot fit ANY bounded budget by definition: size the budget at ≥ 4× the worst simultaneously-affected repository count you need continuous covers for (the 100,000 default covers 25,000 repositories) |
+| `absent_dropped` | tracked rows dropped because their repository's aggregate could not be renewed this pass (pass deadline / ledger failure) — rediscovered by rotation; investigate the ledger if persistent |
+| `quota_enforced` | `false` means detection-only (no quota admission to protect) |
+
+Any nonzero `lfs_rows_absent` or `pack_rows_absent` means storage lost
+registered bytes: investigate the storage layer, and expect the loss to
+either heal (restores re-register and the covers expire) or converge to
+removal (unreferenced LFS rows retire through
+[reclamation](#reclaiming-unreferenced-lfs-objects); purges drop whole
+repositories).

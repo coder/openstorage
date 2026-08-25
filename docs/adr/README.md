@@ -50,3 +50,5 @@ has moved on, the linked issues/PRs in each record's text are the trail.
 | ADR-39 | [Replicas are an opt-in profile of the dev compose file, symmetric by construction](039-replicas-are-an-opt-in-profile-of-the-dev-compose-file-symmetric-by-construction.md) | [`16-phase7-implementation-notes.md`](../archive/phases/16-phase7-implementation-notes.md) |
 | ADR-40 | [River migrations run under a session-level advisory lock](040-river-migrations-run-under-a-session-level-advisory-lock.md) | [`16-phase7-implementation-notes.md`](../archive/phases/16-phase7-implementation-notes.md) |
 | ADR-41 | [Registered LFS objects live at a canonical key legacy presigned URLs cannot address](041-registered-lfs-objects-live-at-a-canonical-key-legacy-presigned-urls-cannot-address.md) | issue #51, PR #61 |
+| ADR-42 | [LFS reclamation is mark-and-sweep over reachable pointer files](042-lfs-reclamation-is-mark-and-sweep-over-reachable-pointer-files.md) | issue #73, PR #117 |
+| ADR-43 | [Absence reconciliation covers registered-but-missing bytes](043-absence-reconciliation-covers-registered-but-missing-bytes.md) | issue #101 |

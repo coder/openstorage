@@ -46,6 +46,8 @@ never a silently-applied default.
 | [`CODESTORAGE_LFS_GC_OBJECT_BUDGET`](#codestorage_lfs_gc_object_budget) | `1000000` | Git objects one reclamation run may walk |
 | [`CODESTORAGE_LFS_GC_DELETE_ENABLED`](#codestorage_lfs_gc_delete_enabled) | `false` | Opt-in: actually retire unreferenced LFS registry rows (report-only otherwise) |
 | [`CODESTORAGE_LFS_MAX_OBJECTS_PER_REPO`](#codestorage_lfs_max_objects_per_repo) | `100000` | Per-repo LFS object-count cap override |
+| [`CODESTORAGE_ABSENCE_RECONCILE_INTERVAL`](#codestorage_absence_reconcile_interval) | unset | Registry-vs-storage absence reconciliation cadence (unset/`0` disables the job) |
+| [`CODESTORAGE_ABSENCE_RECONCILE_BUDGET`](#codestorage_absence_reconcile_budget) | `100000` | Work units one reconciliation pass may charge |
 | [`CODESTORAGE_REPACK_THRESHOLD`](#codestorage_repack_threshold) | `10` | Registered-pack count that triggers a background repack (`0` disables) |
 | [`CODESTORAGE_SYNC_STEAL_LEGACY`](#codestorage_sync_steal_legacy) | `false` | Opt-in: steal pre-lease sync claims after their adoption grace lapses |
 
@@ -750,6 +752,76 @@ by raising the cap, without waiting for a reclamation grace window.
 - **Default:** `100000`. **Constraints:** a positive integer. The cap is
   enforced at registration inside the serve process, so set it identically on
   every replica.
+
+### `CODESTORAGE_ABSENCE_RECONCILE_INTERVAL`
+
+Cadence of the registry-vs-storage absence reconciliation job
+([#101](https://github.com/coder/code-storage/issues/101),
+[ADR-43](../adr/043-absence-reconciliation-covers-registered-but-missing-bytes.md)).
+Each pass pages registered rows — `lfs_objects` and `packs` — and
+point-checks their bytes still physically exist in blob storage. While a
+registered blob's bytes are absent (storage-layer loss; every software
+deletion path quarantines first), the quota admission floor is deflated by
+the absent size, hiding equally sized rowless legacy bytes; the pass makes
+the loss visible again by charging it as a TTL'd restore cover and
+invalidating cached floors — and it is the mechanism that *detects*
+registered-but-missing bytes at all (a missing registered pack is an
+integrity loss logged loudly: committed refs may reference it). See the
+[operations guide](../how-to/storage-lifecycle-and-sweeping.md#reconciling-registered-but-missing-bytes).
+
+- **Default:** unset (`0`) — the job never runs.
+- **Constraints:** a non-negative Go duration, at most half of
+  [`CODESTORAGE_PACK_RESERVATION_TTL`](#codestorage_pack_reservation_ttl)
+  (a startup error otherwise): covers are ordinary TTL'd reservations
+  renewed once per pass, a pass's wall clock is capped at a quarter of the
+  TTL, and periodic ticks that fire mid-pass coalesce — together those
+  bound every tracked cover's renewal gap within the TTL, so a long scan
+  can never let a live cover lapse.
+- The job is non-destructive on every path: it only inserts/refreshes
+  reservation rows and bumps the shared floor generation. With quota
+  enforcement disabled
+  ([`CODESTORAGE_PACK_QUOTA_BYTES=0`](#codestorage_pack_quota_bytes)) it
+  detects and reports without charging anything.
+
+### `CODESTORAGE_ABSENCE_RECONCILE_BUDGET`
+
+Caps the work units one reconciliation pass may charge: one per registry row
+examined plus one per extra registration or twin-spelling probe — each unit
+is at most one blob-store HEAD or registry point read. A budget-limited pass
+parks its keyset cursor and the next pass resumes strictly after it, so
+arbitrarily large registries reconcile across passes. Within a pass, up to
+half the budget first **re-settles already-discovered losses** (keeping
+their covers refreshed every pass, independent of the rotation), then the
+two registry rotations split the remainder with an alternating leader; a
+one-hour wall-clock cap bounds the pass even when a degraded blob store
+stretches individual probes.
+
+- **Default:** `100000`. **Constraints:** an integer of at least `100`
+  (one row can cost up to three units, so degenerate budgets cannot
+  guarantee progress on both registries).
+- Tracked losses are covered by ONE aggregate reservation row per affected
+  repository, renewed every pass at one work unit per repository — and the
+  tracked-repository population is capped at HALF the renewal phase's
+  allocation (`budget/4`; 25,000 at the default), so every tracked
+  aggregate provably renews every pass with the other half left for
+  registry revalidation, and the per-repo reservation-row cap cannot bind.
+  Round-robin re-verification then shrinks aggregates as losses heal,
+  retire, or purge (a shrink re-mints the aggregate's reservation key so
+  the exact new total is charged; the old row expires within one TTL); a
+  re-verification backlog (`absent_refreshed` below `absent_tracked`) only
+  delays shrinking, never cover renewal. Losses beyond the repository
+  capacity or the 100,000-row memory cap aggregate into one pass-scoped
+  overflow cover per repository, renewed on rotation revisits
+  (`absent_untracked`), and a renewal aborted by the pass deadline drops
+  its unrenewed bases loudly (`absent_dropped`) for rotation rediscovery
+  rather than leaving covers to lapse silently.
+- **Multi-replica PostgreSQL fleets:** the refresh set and rotation
+  cursors are per-process, and the River periodic job may run on any
+  replica ([#125](https://github.com/coder/code-storage/issues/125) tracks
+  fleet persistence with [#121](https://github.com/coder/code-storage/issues/121)).
+  Size the budget at or above the fleet's total registered row count —
+  every pass is then a complete rotation and any replica re-covers every
+  loss fleet-wide.
 
 ### `CODESTORAGE_REPACK_THRESHOLD`
 
