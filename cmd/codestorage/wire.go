@@ -35,6 +35,31 @@ import (
 	"github.com/coder/code-storage/internal/secrets"
 )
 
+// logSyncEgressWarnings emits the boot-time sync egress policy notices
+// (issue #139) beside the webhook hatch warning: a relaxed guard must never
+// be silent, the transitional pull default announces its future flip to
+// deny, and the deprecated push-only spelling names its replacement.
+func logSyncEgressWarnings(logger *slog.Logger, s syncEgressSettings) {
+	assertf(logger != nil, "logSyncEgressWarnings: nil logger")
+	switch {
+	case s.pullTransitional:
+		logger.Warn("sync egress guard transitional default: pull-upstream fetches may target loopback/private/link-local upstreams (0.6.x compatibility); a future release flips this default to deny — set the policy explicitly to keep internal-forge pulls (true) or adopt strict mode early (false)",
+			"env", envSyncAllowPrivate)
+	case s.pullAllowPrivate:
+		logger.Warn("sync egress guard relaxed: pull and push transfers may target loopback/private/link-local upstreams",
+			"env", envSyncAllowPrivate)
+	}
+	if s.legacyPushFlagSet {
+		if s.pullTransitional {
+			logger.Warn("deprecated env var: prefer "+envSyncAllowPrivate+", which governs both sync directions",
+				"env", envSyncPushAllowPrivate)
+		} else {
+			logger.Warn("deprecated env var ignored: "+envSyncAllowPrivate+" is set and governs both sync directions",
+				"env", envSyncPushAllowPrivate)
+		}
+	}
+}
+
 // buildAPIHandler opens the metadata store, bootstraps the single org with
 // its PEM public key blocks (idempotent upsert), and returns the /api/v1
 // handler, the store (for the git path's repo_id->url resolution), the
@@ -44,7 +69,7 @@ import (
 // mux.Handle("/api/", h). refStore/blobStore/cacheDir back the
 // git:read endpoints — serve passes the same instances the githttp fallback
 // uses so both surfaces share one cache.
-func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL, loopbackBaseURL string, orgPEMBlocks []string, refStore ref.RefStore, blobStore blob.BlobStore, cacheDir string, rate api.RateLimitConfig, packQuotaBytes int64, packReservationTTL time.Duration, sweep sweepSettings, lfsGC lfsGCSettings, absence absenceSettings, lfsWriteCompat bool, repackThreshold int, webhookAllowPrivate, syncPushAllowPrivate bool, secretsCodec *secrets.Codec, usageFloor func(context.Context, string) (int64, int64, error)) (http.Handler, meta.Store, auth.Verifier, func(ctx context.Context, repo string), func(), error) {
+func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL, loopbackBaseURL string, orgPEMBlocks []string, refStore ref.RefStore, blobStore blob.BlobStore, cacheDir string, rate api.RateLimitConfig, packQuotaBytes int64, packReservationTTL time.Duration, sweep sweepSettings, lfsGC lfsGCSettings, absence absenceSettings, lfsWriteCompat bool, repackThreshold int, webhookAllowPrivate bool, syncEgress syncEgressSettings, secretsCodec *secrets.Codec, usageFloor func(context.Context, string) (int64, int64, error)) (http.Handler, meta.Store, auth.Verifier, func(ctx context.Context, repo string), func(), error) {
 	assertf(dbURL != "" && org != "" && httpBaseURL != "" && len(orgPEMBlocks) > 0, "buildAPIHandler: missing dbURL/org/httpBaseURL/keys")
 	assertf(loopbackBaseURL != "", "buildAPIHandler: missing loopbackBaseURL")
 	assertf(refStore != nil && blobStore != nil && cacheDir != "", "buildAPIHandler: missing refStore/blobStore/cacheDir")
@@ -70,6 +95,7 @@ func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL, loopbackBaseU
 		logger.Warn("webhook SSRF guard relaxed: deliveries may target loopback/private/link-local addresses",
 			"env", envWebhookAllowPrivate)
 	}
+	logSyncEgressWarnings(logger, syncEgress)
 
 	// Secrets at-rest encryption status (issue #54): one boot line so
 	// operators can confirm the key list and mode parsed — key ids are
@@ -302,7 +328,7 @@ func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL, loopbackBaseU
 	// schedule one more fold when the count is still at/above it.
 	repacker.FollowUpThreshold = repackThreshold
 
-	queue, decorate, queueCleanup, err := buildServeEventing(ctx, ms, dbURL, org, loopbackBaseURL, key, schedule, lfsReclaimSchedule, absenceSchedule, repacker, webhookAllowPrivate, syncPushAllowPrivate, logger)
+	queue, decorate, queueCleanup, err := buildServeEventing(ctx, ms, dbURL, org, loopbackBaseURL, key, schedule, lfsReclaimSchedule, absenceSchedule, repacker, webhookAllowPrivate, syncEgress, logger)
 	if err != nil {
 		// The reconcile ticker predates eventing setup (Codex round 104):
 		// failing without stopping it leaks an hourly ref-store query loop
@@ -346,6 +372,10 @@ func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL, loopbackBaseU
 		// Webhook registration-time SSRF courtesy check (issue #53);
 		// the delivery workers got the same flag via buildServeEventing.
 		WebhookAllowPrivate: webhookAllowPrivate,
+		// Sync registration-time egress courtesy check on base_repo
+		// upstream_host (issue #139); the sync worker got the same
+		// resolved policy via buildServeEventing.
+		SyncPullAllowPrivate: syncEgress.pullAllowPrivate,
 	})
 	if err != nil {
 		if stopReconcile != nil {

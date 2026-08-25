@@ -178,9 +178,21 @@ const (
 	// internal deployments. Default off; the redirect refusal is NOT
 	// relaxed. Enabling it logs a boot-time warning.
 	envWebhookAllowPrivate = "CODESTORAGE_WEBHOOK_ALLOW_PRIVATE"
+	// envSyncAllowPrivate is the unified sync egress policy knob (issue
+	// #139): it governs BOTH git transfer directions — inbound pull
+	// fetches and outbound push forwards. "true" admits loopback/private/
+	// link-local/ULA upstreams (metadata/special-purpose stay denied);
+	// "false" denies the private classes in both directions. Unset is the
+	// transitional compatibility default: pushes stay strict (the
+	// deprecated per-direction spelling below may relax them) while pulls
+	// ALLOW private upstreams with a boot warning — internal-forge
+	// mirrors are a mainstream released 0.6.x deployment shape, and a
+	// future release flips the unset pull default to deny.
+	envSyncAllowPrivate = "CODESTORAGE_SYNC_ALLOW_PRIVATE"
 	// envSyncPushAllowPrivate relaxes the outbound push egress guard's
-	// private receiver classes (issue #90) — the sync twin of the
-	// webhook escape hatch above.
+	// private receiver classes (issue #90). Deprecated spelling: it stays
+	// push-only (its historical meaning), and envSyncAllowPrivate wins
+	// for both directions when set.
 	envSyncPushAllowPrivate = "CODESTORAGE_SYNC_PUSH_ALLOW_PRIVATE"
 
 	// At-rest envelope encryption for the metadata store's secret columns
@@ -348,8 +360,10 @@ type serveConfig struct {
 	// webhookAllowPrivate relaxes the webhook delivery SSRF guard's
 	// private-range denial (issue #53); false (the default) keeps it
 	// strict.
-	webhookAllowPrivate  bool
-	syncPushAllowPrivate bool
+	webhookAllowPrivate bool
+	// syncEgress is the resolved sync egress policy (issue #139): one
+	// dial-time destination guard governs both git transfer directions.
+	syncEgress syncEgressSettings
 
 	// secretsCodec envelope-encrypts the metadata store's secret columns
 	// (issue #54); nil (the default) keeps them plaintext.
@@ -597,7 +611,7 @@ func resolveServeConfig(getenv func(string) string, flagListen, flagAddr, flagCa
 	if err != nil {
 		return serveConfig{}, err
 	}
-	cfg.syncPushAllowPrivate, err = resolveBoolEnv(getenv, envSyncPushAllowPrivate)
+	cfg.syncEgress, err = resolveSyncEgress(getenv)
 	if err != nil {
 		return serveConfig{}, err
 	}
@@ -1028,6 +1042,55 @@ func resolveRepackThreshold(getenv func(string) string) (int, error) {
 func resolveWebhookAllowPrivate(getenv func(string) string) (bool, error) {
 	assertf(getenv != nil, "resolveWebhookAllowPrivate: nil getenv")
 	return resolveBoolEnv(getenv, envWebhookAllowPrivate)
+}
+
+// syncEgressSettings is the resolved unified sync egress policy (issue
+// #139): both git transfer directions dial through the destination guard
+// (internal/sync/egress.go); these fields relax only its private receiver
+// classes per direction.
+type syncEgressSettings struct {
+	pushAllowPrivate bool
+	pullAllowPrivate bool
+	// pullTransitional marks the compatibility default: envSyncAllowPrivate
+	// is unset, so pulls allow private upstreams (released 0.6.x behavior)
+	// and boot warns about the future default flip to deny.
+	pullTransitional bool
+	// legacyPushFlagSet records that the deprecated push-only spelling was
+	// present, for the boot-time deprecation notice (when the unified knob
+	// is also set the legacy value is ignored entirely).
+	legacyPushFlagSet bool
+}
+
+// resolveSyncEgress resolves the unified sync egress policy (issue #139).
+// Both spellings parse fail-fast even when losing (a malformed boolean is
+// a boot error, never a silent fallback); the unified knob wins for both
+// directions. Unset keeps the transitional compatibility default: strict
+// pushes (unless the deprecated push-only spelling relaxes them) and
+// allow-private pulls, with wire.go warning about the future flip.
+func resolveSyncEgress(getenv func(string) string) (syncEgressSettings, error) {
+	assertf(getenv != nil, "resolveSyncEgress: nil getenv")
+	legacy, err := resolveBoolEnv(getenv, envSyncPushAllowPrivate)
+	if err != nil {
+		return syncEgressSettings{}, err
+	}
+	legacySet := getenv(envSyncPushAllowPrivate) != ""
+	if getenv(envSyncAllowPrivate) == "" {
+		return syncEgressSettings{
+			pushAllowPrivate:  legacy,
+			pullAllowPrivate:  true,
+			pullTransitional:  true,
+			legacyPushFlagSet: legacySet,
+		}, nil
+	}
+	unified, err := resolveBoolEnv(getenv, envSyncAllowPrivate)
+	if err != nil {
+		return syncEgressSettings{}, err
+	}
+	return syncEgressSettings{
+		pushAllowPrivate:  unified,
+		pullAllowPrivate:  unified,
+		legacyPushFlagSet: legacySet,
+	}, nil
 }
 
 // resolveBoolEnv parses one boolean escape-hatch env var with fail-fast

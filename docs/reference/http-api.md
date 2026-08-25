@@ -115,7 +115,7 @@ Default notes ref `refs/notes/commits`; bare names resolve to `refs/notes/<name>
 
 | Method & path | Scope | Notes |
 |---|---|---|
-| `POST /repos/pull-upstream` | git:write | `{ref?}` → **202 Accepted** (async); only for repos with `base_repo`. A 202 is never dropped: a request that arrives while a sync run is already in flight coalesces into one follow-up run, so some run observes upstream as of the request or later |
+| `POST /repos/pull-upstream` | git:write | `{ref?}` → **202 Accepted** (async); only for repos with `base_repo`. A 202 is never dropped: a request that arrives while a sync run is already in flight coalesces into one follow-up run, so some run observes upstream as of the request or later. Fetch egress is policy-guarded (see below) |
 | `POST /repos/push-upstream` | git:write + git:read | `{force?}` → **202 Accepted** (async); only for repos with `base_repo`. Requires BOTH scopes: the run exports every local head/tag, so a write-only token must not be able to publish content it cannot clone. Our extension (upstream forwards implicitly — see [wire compatibility](../explanation/wire-compatibility.md)): publishes local `refs/heads/*` and `refs/tags/*` to the upstream with the stored credential. Non-force by default — a ref the upstream refuses (non-fast-forward) fails the run with per-ref reasons in the `repo.sync.failed` event's `rejected_refs`; the push is atomic (one refused ref fails the whole batch and the upstream is left untouched); `force: true` opts into `+refs`. Ref deletions are not propagated. The 202 coalescing guarantee matches pull-upstream, and `force` survives coalescing (a forced request is never downgraded). An unreachable upstream retries with exponential backoff (1–16 min, 5 attempts); auth/config/rejection failures do not retry. A successful run schedules one follow-up inbound sync, so a pull that raced the forward cannot strand a stale local snapshot. Egress is guarded at dial time: private/special destinations are denied (permanent `invalid sync configuration` failure) unless [`CODESTORAGE_SYNC_PUSH_ALLOW_PRIVATE`](configuration.md#codestorage_sync_push_allow_private) opts internal forges in |
 
 Outbound runs emit the same `repo.sync.*` events with `direction: "push"` (see
@@ -127,6 +127,18 @@ any ref-policy op, or lacking git:read, does not trigger the forward (it
 would publish every head and tag, not just the refs that token may touch or
 read) — the write stays local and the repository converges on the next
 authorized trigger.
+
+**Egress policy** (ADR-45): `upstream_host` is caller-linked data, so every
+http(s) sync transfer in either direction — pull-upstream fetches (including
+the first sync at `POST /repos` and freshness pokes) and push-upstream
+forwards — dials through a vetting proxy applying the webhook delivery
+destination policy, governed by
+[`CODESTORAGE_SYNC_ALLOW_PRIVATE`](configuration.md#codestorage_sync_allow_private)
+(transitional default: pulls allow private upstreams, pushes deny). A denied
+pull destination fails the run as `repository configuration error`; a denied
+push destination as `invalid sync configuration`. `POST /repos` with
+`base_repo` additionally rejects an upstream_host the pull policy denies at
+registration time with 400 (courtesy check; dial time is authoritative).
 
 **Mixed-fleet prerequisite** (documentation-enforced, like the other
 [upgrade orderings](configuration.md)): complete the rolling upgrade of

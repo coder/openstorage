@@ -272,6 +272,55 @@ func TestTargetGuardRegistrationCourtesyCheck(t *testing.T) {
 	}
 }
 
+// TestTargetGuardCheckHostCourtesyCheck mirrors the registration courtesy
+// semantics for the bare-hostname twin (sync base_repo upstream_host,
+// issue #139): denied literals and currently-denied DNS answers reject,
+// resolution failures fail open, and the policy scales with AllowPrivate —
+// the pull lane's transitional default admits private forges while still
+// refusing metadata literals.
+func TestTargetGuardCheckHostCourtesyCheck(t *testing.T) {
+	t.Parallel()
+
+	lookup := func(_ context.Context, host string) ([]netip.Addr, error) {
+		switch host {
+		case "private.example":
+			return []netip.Addr{netip.MustParseAddr("10.0.0.1")}, nil
+		case "unresolved.example":
+			return nil, errors.New("temporary resolver failure")
+		default:
+			return []netip.Addr{netip.MustParseAddr("8.8.8.8")}, nil
+		}
+	}
+	for name, tc := range map[string]struct {
+		host         string
+		allowPrivate bool
+		wantOK       bool
+	}{
+		"strict denies private literal":       {host: "192.168.1.2"},
+		"strict denies loopback literal":      {host: "127.0.0.1"},
+		"strict denies private resolution":    {host: "private.example"},
+		"strict accepts public resolution":    {host: "public.example", wantOK: true},
+		"allow admits private literal":        {host: "192.168.1.2", allowPrivate: true, wantOK: true},
+		"allow admits private resolution":     {host: "private.example", allowPrivate: true, wantOK: true},
+		"allow still denies metadata literal": {host: "169.254.169.254", allowPrivate: true},
+		// Courtesy-only: a temporary resolution failure does not promise
+		// reachability; dial time later fails closed.
+		"resolution failure accepted": {host: "unresolved.example", wantOK: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			guard := TargetGuard{AllowPrivate: tc.allowPrivate, LookupNetIP: lookup}
+			err := guard.CheckHost(context.Background(), tc.host)
+			if tc.wantOK && err != nil {
+				t.Fatalf("CheckHost: %v", err)
+			}
+			if !tc.wantOK && err == nil {
+				t.Fatal("CheckHost succeeded, want denial")
+			}
+		})
+	}
+}
+
 func TestTargetGuardRefusesRedirectsEvenWhenPrivateAllowed(t *testing.T) {
 	for _, status := range []int{
 		http.StatusMovedPermanently,

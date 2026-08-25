@@ -17,6 +17,7 @@ import (
 	"testing"
 
 	"github.com/coder/code-storage/internal/auth"
+	"github.com/coder/code-storage/internal/events"
 	"github.com/coder/code-storage/internal/meta"
 	upsync "github.com/coder/code-storage/internal/sync"
 )
@@ -145,7 +146,7 @@ func newP5FixStack(t *testing.T, e *testEnv, queue upsync.Queue) (string, *httpt
 	org := e.newOrg(t)
 	verifier := auth.NewVerifier(e.store)
 	mem := upsync.NewMemStore()
-	ss := newSyncServer(e.store, mem, mem, queue, testHTTPBaseURL, discardLogger())
+	ss := newSyncServer(e.store, mem, mem, queue, testHTTPBaseURL, events.TargetGuard{AllowPrivate: true}, discardLogger())
 	mux := http.NewServeMux()
 	mux.Handle("POST /api/v1/repos",
 		requireAuth(verifier, org, false, auth.ScopeRepoWrite)(http.HandlerFunc(ss.handleCreateRepo)))
@@ -265,7 +266,7 @@ func testCreateAbandonCleansSiblingRows(t *testing.T, e *testEnv) {
 		t.Fatalf("PutUpstream: %v", err)
 	}
 
-	ss := newSyncServer(e.store, creds, ups, envSyncQueue{}, testHTTPBaseURL, discardLogger())
+	ss := newSyncServer(e.store, creds, ups, envSyncQueue{}, testHTTPBaseURL, events.TargetGuard{AllowPrivate: true}, discardLogger())
 	ss.createAbandon(ctx, org, repoURL, repo.RepoID)
 
 	if _, err := e.store.GetRepoByURL(ctx, org, repoURL); !errors.Is(err, meta.ErrNotFound) {

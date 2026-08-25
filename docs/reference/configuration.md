@@ -26,7 +26,8 @@ never a silently-applied default.
 | [`CODESTORAGE_RATE_BURST`](#codestorage_rate_rps--codestorage_rate_burst) | unset (disabled) | Rate-limit token-bucket depth |
 | [`CODESTORAGE_TRUSTED_PROXIES`](#codestorage_trusted_proxies) | unset | CIDR allowlist of reverse proxies for rate-limit client identity |
 | [`CODESTORAGE_WEBHOOK_ALLOW_PRIVATE`](#codestorage_webhook_allow_private) | `false` | Permit private-network webhook receivers (metadata and redirects stay blocked) |
-| [`CODESTORAGE_SYNC_PUSH_ALLOW_PRIVATE`](#codestorage_sync_push_allow_private) | `false` | Permit private-network push-upstream destinations (metadata stays blocked) |
+| [`CODESTORAGE_SYNC_ALLOW_PRIVATE`](#codestorage_sync_allow_private) | unset (transitional) | Unified sync egress policy: permit private-network upstreams for pull and push (metadata stays blocked) |
+| [`CODESTORAGE_SYNC_PUSH_ALLOW_PRIVATE`](#codestorage_sync_push_allow_private) | `false` | **Deprecated** push-only spelling of the sync egress policy |
 | [`CODESTORAGE_SECRETS_KEY`](#codestorage_secrets_key) | unset (plaintext) | AES-256 key list for at-rest encryption of stored webhook secrets and upstream credentials |
 | [`CODESTORAGE_SECRETS_MODE`](#codestorage_secrets_mode) | `encrypt` | `decrypt-only` stages the key fleet-wide before encrypted writes begin |
 | [`CODESTORAGE_PACK_QUOTA_BYTES`](#codestorage_pack_quota_bytes) | 10 GiB | Per-repo storage quota, packs + LFS (`0` disables) |
@@ -197,20 +198,48 @@ proxies whose forwarded client identity the rate limiters may trust.
   that forwards client-supplied values verbatim lets any client mint fresh rate-limit
   buckets.
 
+### `CODESTORAGE_SYNC_ALLOW_PRIVATE`
+
+Unified sync egress policy for BOTH git transfer directions (ADR-45). `upstream_host` is
+caller-linked data, so every http(s) sync transfer — inbound pull-upstream fetches
+(`POST /repos/pull-upstream`, the first sync at `POST /repos`, freshness pokes) and
+outbound push forwards (`POST /repos/push-upstream`, `forward_pushes`) — routes through a
+dial-time vetting proxy that applies the same destination policy as webhook delivery:
+private, loopback, link-local, metadata, and special-purpose targets are denied, with
+every DNS answer re-resolved and vetted at connect time. A denied destination fails the
+run as `repository configuration error` (pull) / `invalid sync configuration` (push, no
+retry) and the upstream is never contacted. Registration (`POST /repos` with `base_repo`)
+additionally runs a fast-feedback courtesy check against the same pull-lane policy;
+dial-time enforcement stays authoritative.
+
+- `true` — both directions may target internal self-hosted forges
+  (RFC 1918/loopback/ULA/link-local). Cloud-metadata and special-purpose ranges stay
+  denied either way.
+- `false` — strict in both directions: only public upstreams are dialable.
+- **Unset (the transitional default):** pushes stay strict (the deprecated
+  [`CODESTORAGE_SYNC_PUSH_ALLOW_PRIVATE`](#codestorage_sync_push_allow_private) may relax
+  them), while pulls ALLOW private upstreams and `serve` logs a boot warning. Syncing
+  from internal forges is a mainstream released 0.6.x deployment shape, so this release
+  does not break it; **a future release flips the unset pull default to deny.** Set the
+  variable explicitly now: `true` to keep internal-forge pulls working across the flip,
+  `false` to adopt the strict policy early.
+
+Migration notes (0.7.x): pull-upstream fetches previously had no destination policy.
+They now always dial through the vetting proxy, which also means ambient
+`HTTP_PROXY`/`HTTPS_PROXY` settings no longer apply to upstream fetches — the guard
+dials destinations directly, exactly like webhook delivery and push forwarding.
+Operators that require proxied egress must enforce an equivalent destination policy at
+that proxy; there is no supported way to chain the guard through an external proxy.
+Malformed boolean values are startup errors.
+
 ### `CODESTORAGE_SYNC_PUSH_ALLOW_PRIVATE`
 
-Controls the outbound push-upstream egress guard. **Default: `false`.** `upstream_host`
-is caller-linked data, so outbound forwarding (`POST /repos/push-upstream`,
-`forward_pushes`) routes every http(s) `git push` through a dial-time vetting proxy that
-applies the same destination policy as webhook delivery: private, loopback, link-local,
-metadata, and special-purpose targets are denied, with every DNS answer re-resolved and
-vetted at connect time. A denied destination fails the run permanently as
-`invalid sync configuration` (no retry) and the upstream is never contacted.
-
-Set `true` only for deployments that legitimately forward to internal self-hosted forges
-(RFC 1918/loopback/ULA). Cloud-metadata and special-purpose ranges stay denied either way.
-Inbound pull-upstream fetches are not affected by this flag (see the tracking issue for a
-unified sync egress policy).
+**Deprecated** push-only spelling of the sync egress policy, kept for released 0.6.x
+deployments. **Default: `false`.** When
+[`CODESTORAGE_SYNC_ALLOW_PRIVATE`](#codestorage_sync_allow_private) is unset, `true`
+relaxes the private receiver classes for outbound push forwards only (its historical
+meaning); when the unified variable is set, this one is ignored. Either state logs a
+boot-time deprecation notice naming the replacement.
 
 ### `CODESTORAGE_WEBHOOK_ALLOW_PRIVATE`
 

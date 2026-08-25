@@ -27,7 +27,7 @@ namespace question ADR-3 answered for *refs* gets the opposite answer for LFS *o
 > presigned PUT binds neither content length nor digest, which left LFS outside the
 > storage-quota perimeter — and every verified upload is admitted through the quota
 > ledger and registered for the orphan sweep. See the
-> [wire-compatibility notes](explanation/wire-compatibility.md#git-lfs-transfer-semantics).
+> [wire-compatibility notes](../../explanation/wire-compatibility.md#git-lfs-transfer-semantics).
 
 docs/05 puts LFS on the git remote itself: git-lfs discovers
 `POST /{repo}.git/info/lfs/objects/batch` relative to the clone URL. Decision: **the

@@ -250,6 +250,35 @@ func (g TargetGuard) CheckRegistration(ctx context.Context, rawURL string) error
 	return nil
 }
 
+// CheckHost is CheckRegistration's generic twin for non-webhook egress
+// registrations (sync base_repo upstream_host, issue #139): host is a bare
+// hostname or IP literal, already stripped of scheme/port/path by the
+// caller's own shape validation. Same layered semantics — reject denied
+// literals or currently-denied DNS answers as fast feedback, fail OPEN on
+// resolution errors, and never treat acceptance as a promise: the
+// dial-time guard (the sync worker's vetting proxy) is authoritative.
+func (g TargetGuard) CheckHost(ctx context.Context, host string) error {
+	assertf(host != "", "CheckHost: empty host")
+	if ip, err := netip.ParseAddr(host); err == nil {
+		if reason := g.deniedReason(ip); reason != "" {
+			return fmt.Errorf("egress target %s denied: %s", host, reason)
+		}
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, registrationLookupTimeout)
+	defer cancel()
+	addrs, err := g.lookup(ctx, host)
+	if err != nil {
+		return nil // courtesy check only; dial time enforces
+	}
+	for _, ip := range addrs {
+		if reason := g.deniedReason(ip); reason != "" {
+			return fmt.Errorf("egress target %s resolves to denied address %s: %s", host, ip, reason)
+		}
+	}
+	return nil
+}
+
 // NewClient builds the delivery client every webhook POST must go through:
 // a 30s overall timeout (a receiver that never responds must not wedge a
 // delivery worker), NO redirect following, and the guarded dialer.

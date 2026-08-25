@@ -1,16 +1,19 @@
 package sync
 
-// Outbound push egress guard (Codex security round on #90): upstream_host
-// is caller-linked data, so without a guard the forward is a server-side
-// request forgery path — a repo:write tenant could point a repository at a
-// loopback/RFC1918 git service and have the server publish attacker refs
-// there with force. git does its own dialing, so the dial-time policy the
-// webhook TargetGuard pioneered (issue #53) cannot be applied in-process;
-// instead every http(s) push runs through a short-lived loopback forward
-// proxy whose dials go through TargetGuard.DialContext. The operator
-// escape hatch (CODESTORAGE_SYNC_PUSH_ALLOW_PRIVATE) relaxes only the
-// private receiver classes, exactly like the webhook hatch: metadata,
-// broadcast, and the special-purpose registry stay denied.
+// Sync egress guard (Codex security round on #90; unified with the pull
+// lane in issue #139): upstream_host is caller-linked data, so without a
+// guard the transfer is a server-side request forgery path — a repo:write
+// tenant could point a repository at a loopback/RFC1918 git service and
+// have the server publish attacker refs there with force (outbound push)
+// or probe it and echo the stored credential (inbound fetch). git does
+// its own dialing, so the dial-time policy the webhook TargetGuard
+// pioneered (issue #53) cannot be applied in-process; instead every
+// http(s) transfer runs through a short-lived loopback forward proxy
+// whose dials go through TargetGuard.DialContext. The operator escape
+// hatch (CODESTORAGE_SYNC_ALLOW_PRIVATE; deprecated push-only spelling
+// CODESTORAGE_SYNC_PUSH_ALLOW_PRIVATE) relaxes only the private receiver
+// classes, exactly like the webhook hatch: metadata, broadcast, and the
+// special-purpose registry stay denied.
 
 import (
 	"context"
@@ -27,11 +30,12 @@ import (
 	"github.com/coder/code-storage/internal/events"
 )
 
-// egressProxy fronts exactly one outbound `git push`. Plain-http upstreams
-// arrive as absolute-form requests and are round-tripped with the guarded
-// dialer; https upstreams arrive as CONNECT and get a guarded tunnel (TLS
-// stays end-to-end). Denials are recorded so the worker can classify the
-// failed push as configuration, not weather.
+// egressProxy fronts exactly one git transfer (an outbound `git push` or
+// an inbound `git fetch`). Plain-http upstreams arrive as absolute-form
+// requests and are round-tripped with the guarded dialer; https upstreams
+// arrive as CONNECT and get a guarded tunnel (TLS stays end-to-end).
+// Denials are recorded so the worker can classify the failed transfer as
+// configuration, not weather.
 type egressProxy struct {
 	ln    net.Listener
 	srv   *http.Server

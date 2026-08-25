@@ -1,11 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/pem"
+	"log/slog"
 	"math"
 	"os"
 	"path/filepath"
@@ -1177,6 +1179,67 @@ func TestResolveWebhookAllowPrivate(t *testing.T) {
 	}
 }
 
+// TestResolveSyncEgress covers the unified sync egress policy resolution
+// (issue #139): the unified knob governs both directions when set; unset
+// keeps the transitional compatibility default (strict pushes unless the
+// deprecated push-only spelling relaxes them, allow-private pulls with the
+// boot warning); malformed values are boot errors for BOTH spellings.
+func TestResolveSyncEgress(t *testing.T) {
+	for name, tc := range map[string]struct {
+		env     map[string]string
+		want    syncEgressSettings
+		wantErr string // env var name the error must contain
+	}{
+		"unset keeps transitional default": {
+			want: syncEgressSettings{pullAllowPrivate: true, pullTransitional: true},
+		},
+		"legacy true relaxes push only": {
+			env:  map[string]string{envSyncPushAllowPrivate: "true"},
+			want: syncEgressSettings{pushAllowPrivate: true, pullAllowPrivate: true, pullTransitional: true, legacyPushFlagSet: true},
+		},
+		"legacy false stays transitional": {
+			env:  map[string]string{envSyncPushAllowPrivate: "false"},
+			want: syncEgressSettings{pullAllowPrivate: true, pullTransitional: true, legacyPushFlagSet: true},
+		},
+		"unified true relaxes both": {
+			env:  map[string]string{envSyncAllowPrivate: "true"},
+			want: syncEgressSettings{pushAllowPrivate: true, pullAllowPrivate: true},
+		},
+		"unified false strict both": {
+			env:  map[string]string{envSyncAllowPrivate: "false"},
+			want: syncEgressSettings{},
+		},
+		"unified wins over legacy": {
+			env:  map[string]string{envSyncAllowPrivate: "false", envSyncPushAllowPrivate: "true"},
+			want: syncEgressSettings{legacyPushFlagSet: true},
+		},
+		"malformed unified is a boot error": {
+			env:     map[string]string{envSyncAllowPrivate: "sometimes"},
+			wantErr: envSyncAllowPrivate,
+		},
+		"malformed legacy is a boot error even when losing": {
+			env:     map[string]string{envSyncAllowPrivate: "true", envSyncPushAllowPrivate: "sometimes"},
+			wantErr: envSyncPushAllowPrivate,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			got, err := resolveSyncEgress(mapEnv(tc.env))
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("error = %v, want one naming %s", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != tc.want {
+				t.Fatalf("resolveSyncEgress(%v) = %+v, want %+v", tc.env, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestResolveSecretsCodec(t *testing.T) {
 	// 32 zero bytes, base64 — a syntactically valid AES-256 key.
 	validKey := base64.StdEncoding.EncodeToString(make([]byte, 32))
@@ -1379,5 +1442,56 @@ func TestResolveLFSMaxObjectsPerRepo(t *testing.T) {
 		if _, err := resolveLFSMaxObjectsPerRepo(env(map[string]string{envLFSMaxObjectsPerRepo: bad})); err == nil {
 			t.Fatalf("%q must fail", bad)
 		}
+	}
+}
+
+// TestLogSyncEgressWarnings covers the boot-warning paths (issue #139):
+// the transitional default announces the future flip, an explicit relaxed
+// policy is loud like the webhook hatch, the deprecated spelling names its
+// replacement (and whether it was ignored), and the explicit strict policy
+// boots silently.
+func TestLogSyncEgressWarnings(t *testing.T) {
+	for name, tc := range map[string]struct {
+		settings syncEgressSettings
+		want     []string // substrings that must appear, in any order
+		silent   bool
+	}{
+		"transitional default warns about the flip": {
+			settings: syncEgressSettings{pullAllowPrivate: true, pullTransitional: true},
+			want:     []string{"transitional default", "future release flips", envSyncAllowPrivate},
+		},
+		"explicit relaxed policy warns": {
+			settings: syncEgressSettings{pushAllowPrivate: true, pullAllowPrivate: true},
+			want:     []string{"sync egress guard relaxed", envSyncAllowPrivate},
+		},
+		"deprecated spelling still honored names replacement": {
+			settings: syncEgressSettings{pushAllowPrivate: true, pullAllowPrivate: true, pullTransitional: true, legacyPushFlagSet: true},
+			want:     []string{"deprecated env var", envSyncPushAllowPrivate, envSyncAllowPrivate},
+		},
+		"deprecated spelling ignored when unified set": {
+			settings: syncEgressSettings{legacyPushFlagSet: true},
+			want:     []string{"deprecated env var ignored", envSyncPushAllowPrivate},
+		},
+		"explicit strict policy boots silently": {
+			settings: syncEgressSettings{},
+			silent:   true,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var buf bytes.Buffer
+			logSyncEgressWarnings(slog.New(slog.NewTextHandler(&buf, nil)), tc.settings)
+			out := buf.String()
+			if tc.silent {
+				if out != "" {
+					t.Fatalf("expected no warnings, got %q", out)
+				}
+				return
+			}
+			for _, want := range tc.want {
+				if !strings.Contains(out, want) {
+					t.Fatalf("warnings %q missing %q", out, want)
+				}
+			}
+		})
 	}
 }

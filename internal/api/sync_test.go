@@ -31,6 +31,7 @@ import (
 	"time"
 
 	"github.com/coder/code-storage/internal/auth"
+	"github.com/coder/code-storage/internal/events"
 	"github.com/coder/code-storage/internal/meta"
 	upsync "github.com/coder/code-storage/internal/sync"
 )
@@ -212,13 +213,14 @@ func newUsyncStack(t *testing.T, e *testEnv) *usyncStack {
 		Logger:  discardLogger(),
 		Timeout: time.Minute,
 		// Fixture upstreams are 127.0.0.1 CGI servers, denied by the
-		// egress guard's production default.
+		// egress guard's strict policy in both directions.
 		PushEgressAllowPrivate: true,
+		PullEgressAllowPrivate: true,
 	}
 	queue := upsync.NewInProcessQueue(worker.Run, worker.RunPush, discardLogger())
 	t.Cleanup(queue.Close)
 
-	ss := newSyncServer(e.store, s.mem, s.mem, queue, testHTTPBaseURL, discardLogger())
+	ss := newSyncServer(e.store, s.mem, s.mem, queue, testHTTPBaseURL, events.TargetGuard{AllowPrivate: true}, discardLogger())
 	mux := http.NewServeMux()
 	// The frozen api.New will swap its POST /repos route to this handler;
 	// the test mux registers the same shape.
@@ -502,6 +504,12 @@ func TestCreateRepoBaseRepoValidation(t *testing.T) {
 			{"ext transport upstream_host", `{"provider":"gitea","owner":"o","name":"n","upstream_host":"ext::sh -c id"}`, `invalid base_repo upstream_host "ext::sh -c id"`},
 			{"userinfo upstream_host", `{"provider":"github","owner":"o","name":"n","upstream_host":"https://u:p@github.com"}`, `invalid base_repo upstream_host "https://u:p@github.com"`},
 			{"path in bare upstream_host", `{"provider":"gitea","owner":"o","name":"n","upstream_host":"host.example/../../etc"}`, `invalid base_repo upstream_host "host.example/../../etc"`},
+			// Registration-time egress courtesy check (issue #139): the
+			// stack's transitional allow-private guard admits loopback and
+			// RFC 1918 forges, but metadata literals are denied up front —
+			// in bare and URL shapes alike.
+			{"metadata upstream_host", `{"provider":"gitea","owner":"o","name":"n","upstream_host":"169.254.169.254"}`, `base_repo upstream_host denied by sync egress policy: egress target 169.254.169.254 denied: cloud metadata address`},
+			{"metadata url upstream_host", `{"provider":"gitea","owner":"o","name":"n","upstream_host":"http://169.254.169.254:8080/git"}`, `base_repo upstream_host denied by sync egress policy: egress target 169.254.169.254 denied: cloud metadata address`},
 		}
 		for _, c := range cases {
 			t.Run(c.name, func(t *testing.T) {
