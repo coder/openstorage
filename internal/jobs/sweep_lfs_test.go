@@ -291,6 +291,102 @@ func TestSweepLFS_HealRestoresRegisteredFromQuarantine(t *testing.T) {
 	}
 }
 
+// A registered LFS object that is PRESENT but SHORTER than its registered
+// size (issue #129: a still-valid v0.1 presigned PUT, storage-layer damage)
+// must be healed from an aged quarantine backup whose bytes hash to the
+// key's oid — mere existence of the truncated original must not let the
+// age purge collect the object's only complete copy.
+func TestSweepLFS_HealRestoresTruncatedRegisteredObject(t *testing.T) {
+	f := newSweepFixture(t)
+	content := "complete-lfs-bytes"
+	key := blob.LFSKey("repo_lfs", lfsContentOID(content))
+	f.upload(key, content[:4])
+	f.registerLFS("repo_lfs", key, int64(len(content)))
+	qKey := quarantineKey(key)
+	f.upload(qKey, content)
+	f.backdate(qKey, 25*time.Hour)
+
+	cfg := SweepConfig{Threshold: 24 * time.Hour, DeleteLFS: true, QuotaEnforced: true}
+	if _, err := f.sweeper(cfg).Sweep(context.Background()); err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if got := f.content(key); got != content {
+		t.Fatalf("truncated registered object %q = %q after sweep, want the backup's complete bytes restored", key, got)
+	}
+	// Healed => the original is complete again; the aged backup purges.
+	if f.exists(qKey) {
+		t.Fatalf("aged backup %q survived after the truncated original was healed", qKey)
+	}
+	// The overwrite re-materializes bytes exactly like the into-absence
+	// restore: floors scanned before the heal must be invalidated and the
+	// returning delta covered (Codex rounds 54/58 discipline).
+	if gen, err := f.store.LFSAdoptionGen(context.Background(), "repo_lfs"); err != nil || gen == 0 {
+		t.Fatalf("floor generation after truncated heal = (%d, %v), want > 0", gen, err)
+	}
+	ls, err := f.store.QuotaLedgerState(context.Background(), blob.QuotaRepoGroup("repo_lfs"), time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ls.ReservedBytes != int64(len(content)) {
+		t.Fatalf("ledger after truncated heal = %+v, want the %d-byte cover reserved", ls, len(content))
+	}
+}
+
+// The truncated-original overwrite is a canonical LFS materialization: it
+// must run under the per-key fleet adoption claim (ADR-41/#104 exclusion
+// with the adopter's corrupt-canonical check→delete). While another
+// worker holds the claim, the heal must neither rewrite the original nor
+// let the purge collect the backup (the next sweep re-examines).
+func TestSweepLFS_HealTruncatedSkipsWhileClaimHeld(t *testing.T) {
+	f := newSweepFixture(t)
+	content := "claim-held-lfs-bytes"
+	key := blob.LFSKey("repo_lfs", lfsContentOID(content))
+	f.upload(key, content[:4])
+	f.registerLFS("repo_lfs", key, int64(len(content)))
+	qKey := quarantineKey(key)
+	f.upload(qKey, content)
+	f.backdate(qKey, 25*time.Hour)
+
+	claimed, _, err := f.store.TryAdoptionClaim(context.Background(), "repo_lfs", key)
+	if err != nil || !claimed {
+		t.Fatalf("TryAdoptionClaim = (%v, %v), want the test to hold the claim", claimed, err)
+	}
+	if _, err := f.sweeper(SweepConfig{Threshold: 24 * time.Hour, DeleteLFS: true}).Sweep(context.Background()); err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if got := f.content(key); got != content[:4] {
+		t.Fatalf("original %q = %q, want untouched while the claim is held", key, got)
+	}
+	if !f.exists(qKey) {
+		t.Fatalf("backup %q was purged while the truncated original is unhealed", qKey)
+	}
+}
+
+// A truncated registered original whose backup fails the key's own digest
+// gets no restore (pre-registry legacy bytes must never launder into a
+// registered row) and no spare: bytes that cannot be the registered
+// content follow the same aged-purge policy as the into-absence mismatch.
+func TestSweepLFS_HealTruncatedPurgesMismatchedBackup(t *testing.T) {
+	f := newSweepFixture(t)
+	content := "mismatch-lfs-bytes"
+	key := blob.LFSKey("repo_lfs", lfsContentOID(content))
+	f.upload(key, content[:4])
+	f.registerLFS("repo_lfs", key, int64(len(content)))
+	qKey := quarantineKey(key)
+	f.upload(qKey, "bytes that never hashed to the oid")
+	f.backdate(qKey, 25*time.Hour)
+
+	if _, err := f.sweeper(SweepConfig{Threshold: 24 * time.Hour, DeleteLFS: true}).Sweep(context.Background()); err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if got := f.content(key); got != content[:4] {
+		t.Fatalf("original %q = %q, want untouched (mismatched backup must not restore)", key, got)
+	}
+	if f.exists(qKey) {
+		t.Fatalf("aged digest-mismatched backup %q was spared — it cannot be the registered content", qKey)
+	}
+}
+
 // TestSweepLFS_ReconcileTickerReconcilesLateTwins (Codex round 88 +
 // security twin): with CODESTORAGE_SWEEP_INTERVAL=0 the startup Heal was
 // the ONLY reconciliation pass, but a mixed-roll old replica can insert a
