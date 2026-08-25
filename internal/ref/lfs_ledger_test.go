@@ -344,3 +344,32 @@ func TestRegisterPacksAdoptedBumpsGen(t *testing.T) {
 		k.wantState(30, 0, 0)
 	})
 }
+
+// TestLFSObjectRegisteredAt_ReturnsRegisteredBytes (issue #127): the
+// sweeper's legacy reap gate classifies a canonical copy's completeness
+// against the row's registered size — both backends must return it
+// alongside the registration clock, and report absence as ok=false.
+func TestLFSObjectRegisteredAt_ReturnsRegisteredBytes(t *testing.T) {
+	runRefBackends(t, func(t *testing.T, s Store) {
+		ctx := context.Background()
+		k := newLedgerKit(t, s)
+		key := lfsLedgerKey(k, strings.Repeat("ab", 32))
+
+		if at, bytes, ok, err := s.LFSObjectRegisteredAt(ctx, k.base(), key); err != nil || ok || bytes != 0 || !at.IsZero() {
+			t.Fatalf("unregistered = (%v, %d, %v, %v), want absent", at, bytes, ok, err)
+		}
+		if err := s.RegisterLFSObject(ctx, k.base(), key, 1234); err != nil {
+			t.Fatal(err)
+		}
+		at, bytes, ok, err := s.LFSObjectRegisteredAt(ctx, k.base(), key)
+		if err != nil || !ok {
+			t.Fatalf("registered = (%v, %v), want a row", ok, err)
+		}
+		if bytes != 1234 {
+			t.Fatalf("registered bytes = %d, want 1234", bytes)
+		}
+		if at.IsZero() {
+			t.Fatal("registration time is zero")
+		}
+	})
+}

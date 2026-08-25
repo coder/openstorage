@@ -108,7 +108,7 @@ func (s *countingStore) TouchLFSObject(context.Context, string, string) (bool, e
 	panic("Hydrate must never touch LFS objects")
 }
 
-func (s *countingStore) LFSObjectRegisteredAt(context.Context, string, string) (time.Time, bool, error) {
+func (s *countingStore) LFSObjectRegisteredAt(context.Context, string, string) (time.Time, int64, bool, error) {
 	panic("Hydrate must never read LFS objects")
 }
 

@@ -634,20 +634,20 @@ func (s *SQLite) HasLFSObject(ctx context.Context, repo, key string) (bool, erro
 	return exists, err
 }
 
-// LFSObjectRegisteredAt — see RefStore (Codex round 89). created_at is
-// unixepoch() seconds in the SQLite schema.
-func (s *SQLite) LFSObjectRegisteredAt(ctx context.Context, repo, key string) (time.Time, bool, error) {
+// LFSObjectRegisteredAt — see RefStore (Codex round 89; bytes since
+// #127). created_at is unixepoch() seconds in the SQLite schema.
+func (s *SQLite) LFSObjectRegisteredAt(ctx context.Context, repo, key string) (time.Time, int64, bool, error) {
 	assertf(repo != "" && key != "", "LFSObjectRegisteredAt(%q, %q)", repo, key)
-	var secs int64
+	var secs, bytes int64
 	err := s.db.QueryRowContext(ctx,
-		`SELECT created_at FROM lfs_objects WHERE repo = ? AND key = ?`, repo, key).Scan(&secs)
+		`SELECT created_at, bytes FROM lfs_objects WHERE repo = ? AND key = ?`, repo, key).Scan(&secs, &bytes)
 	if errors.Is(err, sql.ErrNoRows) {
-		return time.Time{}, false, nil
+		return time.Time{}, 0, false, nil
 	}
 	if err != nil {
-		return time.Time{}, false, err
+		return time.Time{}, 0, false, err
 	}
-	return time.Unix(secs, 0), true, nil
+	return time.Unix(secs, 0), bytes, true, nil
 }
 
 // QuotaLedgerState reads the group's ledger state (see the PG twin).

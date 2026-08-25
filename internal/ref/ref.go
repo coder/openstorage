@@ -250,9 +250,12 @@ type RefStore interface {
 	// being minted" anchor. Blob timestamps are not: a rowless canonical
 	// copy can be hours old (publication or adoption copied it and only
 	// the registration failed) while its late registration retry
-	// verifies it in place without rewriting it. ok is false when no row
-	// exists.
-	LFSObjectRegisteredAt(ctx context.Context, repo, key string) (at time.Time, ok bool, err error)
+	// verifies it in place without rewriting it. bytes is the row's
+	// registered size, the sweeper's completeness yardstick (issue
+	// #127): the reap gate must spare a retained legacy source whose
+	// canonical copy is SHORTER than registered, not merely present. ok
+	// is false when no row exists.
+	LFSObjectRegisteredAt(ctx context.Context, repo, key string) (at time.Time, bytes int64, ok bool, err error)
 	// BumpLFSAdoptionGen increments repo's shared adoption generation
 	// (Codex round 49 on #51): adopting a pre-registry LFS object moves
 	// bytes that physical listings ALREADY contain into the usage
