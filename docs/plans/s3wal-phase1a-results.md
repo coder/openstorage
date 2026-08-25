@@ -53,7 +53,7 @@ in **record** mode (its behavior is the deliverable).
 |---|---|---|---|
 | raw-roundtrip (Put/Get/Head/Delete) | pass | pass | blocked: credentials pending |
 | gocloud-write-small (1 KiB) | pass | pass | blocked: credentials pending |
-| gocloud-write-multipart (12 MiB at 5 MiB part size ⇒ ≥3 parts) | pass | pass | blocked: credentials pending |
+| gocloud-write-multipart (20 MiB above the transfer manager’s fixed 16 MiB multipart threshold, 5 MiB part size ⇒ 4 parts; see erratum, item 6) | pass — stored ETag carries the `-4` part-count suffix | pass — stored ETag carries the `-4` part-count suffix | blocked: credentials pending |
 | gocloud-ifnotexist (duplicate rejected) | pass | **ignores** — accepted an IfNotExist duplicate write | blocked: credentials pending |
 | conditional-create-fresh (`If-None-Match: *`) | pass | pass | blocked: credentials pending |
 | conditional-create-duplicate (must 412) | pass | **ignores** — accepted a duplicate create | blocked: credentials pending |
@@ -242,6 +242,21 @@ ready (`CODESTORAGE_BENCH_S3_URL`, `CODESTORAGE_TEST_S3WAL_URL`).
    and fast-variant line above were re-recorded with the fixed harness;
    on loopback the actual elapsed ≈ the configured 60 s, so the local
    numbers moved only by run-to-run variance — the fix matters on real S3.
+6. **Erratum: the original multipart row never exercised multipart.** The
+   surface wrote 12 MiB with `WriterOptions.BufferSize` = 5 MiB, but that
+   option sets only the transfer manager’s PART size; its independent
+   multipart THRESHOLD is fixed at 16 MiB (vendored
+   `transfermanager.defaultMultipartUploadThreshold`, not configurable
+   through gocloud). The 12 MiB body hit EOF below the threshold and was
+   uploaded as a single PutObject — the row’s original “≥3 parts” claim
+   was wrong and the pass verdict proved nothing about multipart. The
+   surface now writes 20 MiB (> 16 MiB threshold, 5 MiB parts ⇒ exactly
+   4 parts) and records store-side evidence in the verdict detail: the
+   stored object’s HeadObject ETag shape. Re-recorded on both container
+   stores — SeaweedFS ETag `…-4` and MinIO legacy ETag `…-4` both carry
+   the multipart part-count suffix, proving 4-part assembly. Hard
+   assertions remain readback size + SHA-256; the ETag shape is recorded,
+   not hard-failed, since a store may legitimately use another form.
 
 ## Artifacts (referenced, not committed)
 
