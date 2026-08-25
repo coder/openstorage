@@ -32,15 +32,22 @@ already protect: concurrent pull‖push interleavings converge because a push
 of a stale snapshot is refused as a non-fast-forward by the upstream, and
 the next trigger republishes current state.
 
-**Force rides the durable marker, not the queue job.** `push_pending` is a
+**Force rides durable state, not the queue job.** `push_pending` is a
 three-level marker (none/push/force) coalescing upward via `RequestPush`;
 `BeginPush` consumes it whole and returns the force bit. Queue
 deduplication is keyed by repo only, so a forced enqueue can coalesce into
-a queued plain job — the marker is the only place force survives that, and
-a crash-rescued job re-reads it durably. The residual crash window (claim
-consumed the force bit, process died before the push) deliberately
-downgrades the rescued re-run to non-force: it fails honestly per ref
-instead of force-pushing on a stale mandate.
+a queued plain job — the marker is the only place force survives that. The
+claim then PERSISTS its consumed mandate (`push_claim_force`) until
+`FinishPush` clears it: a holder that crashes mid-run still owes the
+accepted forced request, so stealing an expired claim inherits its force
+(OR-ed with the thief's own consumed level) instead of silently downgrading
+the rescue. Local-mode boot recovery closes the same crash window from the
+other side: `PendingPushRepoIDs` lists orphaned in-flight claims (always
+dead in a single-process deployment) alongside marked rows, and recovery
+re-marks before re-enqueueing so the deferred retry can steal the dead
+lease once it expires; the pg deployment recovers through River's durable
+job rescue, whose default stuck-job window comfortably exceeds the claim
+lease.
 
 **forward_on_push reroutes the push→pull poke.** Without forwarding, a won
 local push schedules an *inbound* mirror — which force-resets local refs to

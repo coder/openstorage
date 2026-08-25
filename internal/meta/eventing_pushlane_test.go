@@ -79,6 +79,99 @@ func testPushClaimLease(t *testing.T, s Backend) {
 	}
 }
 
+func TestPushClaimForceInheritance(t *testing.T) { runBackends(t, testPushClaimForceInheritance) }
+
+// A crash between a forced claim and its finish must not downgrade the
+// accepted forced request: the claim persists the consumed mandate
+// (push_claim_force) and the steal inherits it.
+func testPushClaimForceInheritance(t *testing.T, s Backend) {
+	ctx := t.Context()
+	repoID := testRepoID(t, s, "")
+	if _, err := s.SetRepoUpstream(ctx, RepoUpstream{
+		RepoID: repoID, Provider: "github", Owner: "acme", Name: "demo", UpstreamHost: "github.com",
+	}); err != nil {
+		t.Fatalf("SetRepoUpstream: %v", err)
+	}
+
+	// Forced request, claimed by a holder that then "crashes" (1ns lease,
+	// never finishes). The claim consumed the marker but persists force.
+	if err := s.RequestPush(ctx, repoID, true); err != nil {
+		t.Fatal(err)
+	}
+	row, claimed, force, _, err := s.TryBeginPush(ctx, repoID, "holder-crash", time.Nanosecond)
+	if err != nil || !claimed || !force {
+		t.Fatalf("forced claim = (%v, %v, %v), want forced claim", claimed, force, err)
+	}
+	if !row.PushClaimForce || row.PushPending != 0 {
+		t.Fatalf("claimed row = %+v, want persisted force with consumed marker", row)
+	}
+
+	// The rescue steals the expired claim with NO fresh marker: force must
+	// be inherited from the dead claim, not silently dropped.
+	row, claimed, force, stolenFrom, err := s.TryBeginPush(ctx, repoID, "holder-rescue", time.Minute)
+	if err != nil || !claimed || stolenFrom != "holder-crash" {
+		t.Fatalf("steal = (%v, %q, %v), want steal from holder-crash", claimed, stolenFrom, err)
+	}
+	if !force || !row.PushClaimForce {
+		t.Fatalf("steal dropped the inherited force mandate: force=%v row=%+v", force, row)
+	}
+
+	// FinishPush clears the mandate; the next claim is non-forced.
+	if _, err := s.FinishPush(ctx, repoID, "holder-rescue", true); err != nil {
+		t.Fatalf("FinishPush: %v", err)
+	}
+	row, claimed, force, _, err = s.TryBeginPush(ctx, repoID, "holder-next", time.Minute)
+	if err != nil || !claimed || force || row.PushClaimForce {
+		t.Fatalf("post-finish claim = (%v, %v, %+v), want clean non-force claim", claimed, force, row)
+	}
+}
+
+func TestPendingPushIncludesOrphanedClaims(t *testing.T) { runBackends(t, testPendingPushOrphans) }
+
+// Local-mode boot recovery must see repos whose previous process died AFTER
+// its claim consumed the pending marker: PendingPushRepoIDs lists in-flight
+// claims too, not only marked rows.
+func testPendingPushOrphans(t *testing.T, s Backend) {
+	ctx := t.Context()
+	repoID := testRepoID(t, s, "")
+	if _, err := s.SetRepoUpstream(ctx, RepoUpstream{
+		RepoID: repoID, Provider: "github", Owner: "acme", Name: "demo", UpstreamHost: "github.com",
+	}); err != nil {
+		t.Fatalf("SetRepoUpstream: %v", err)
+	}
+	if err := s.RequestPush(ctx, repoID, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, claimed, _, _, err := s.TryBeginPush(ctx, repoID, "holder-orphan", time.Minute); err != nil || !claimed {
+		t.Fatalf("claim = (%v, %v), want claimed", claimed, err)
+	}
+	// Marker consumed, claim in flight — the crashed-process row shape.
+	ids, err := s.PendingPushRepoIDs(ctx)
+	if err != nil {
+		t.Fatalf("PendingPushRepoIDs: %v", err)
+	}
+	found := false
+	for _, id := range ids {
+		found = found || id == repoID
+	}
+	if !found {
+		t.Fatalf("PendingPushRepoIDs = %v, want to include orphan-claimed %s", ids, repoID)
+	}
+	// A finished run clears the row out of the listing.
+	if _, err := s.FinishPush(ctx, repoID, "holder-orphan", true); err != nil {
+		t.Fatal(err)
+	}
+	ids, err = s.PendingPushRepoIDs(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range ids {
+		if id == repoID {
+			t.Fatalf("idle repo %s still listed for recovery", repoID)
+		}
+	}
+}
+
 func TestPushPendingLevels(t *testing.T) { runBackends(t, testPushPendingLevels) }
 
 func testPushPendingLevels(t *testing.T, s Backend) {

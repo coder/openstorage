@@ -270,6 +270,20 @@ func buildServeEventing(ctx context.Context, ms meta.Store, dbURL, org, loopback
 				return
 			}
 			for _, id := range pushIDs {
+				// Re-mark BEFORE enqueueing: the listing includes repos
+				// whose previous process died AFTER its claim consumed
+				// the marker (orphaned push_syncing rows — always dead
+				// here, local mode is single-process). Their recovered
+				// run meets the unexpired dead lease and skips; only a
+				// set marker arms the deferred retry that steals it
+				// after expiry. MAX-coalescing keeps any existing level
+				// (never downgrades force), and the dead claim's own
+				// force mandate is inherited at the steal regardless
+				// (push_claim_force).
+				if err := ms.RequestPush(rctx, id, false); err != nil {
+					logger.Warn("pending push boot recovery re-mark failed", "repo", id, "err", err)
+					continue
+				}
 				if err := queue.EnqueuePush(rctx, upsync.Job{Org: org, RepoID: id}); err != nil {
 					logger.Warn("pending push boot recovery enqueue failed", "repo", id, "err", err)
 				}

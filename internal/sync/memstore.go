@@ -248,18 +248,20 @@ func (m *MemStore) BeginPush(_ context.Context, repoID, holder string, lease tim
 		return Upstream{}, false, "", ErrNotFound
 	}
 	stolenFrom := ""
+	inheritForce := false
 	if up.PushSyncing {
 		if time.Now().Before(up.PushClaimExpiresAt) {
 			return Upstream{}, false, "", ErrPushInProgress
 		}
 		stolenFrom = up.PushClaimHolder // expired lease stolen (no legacy grace on this lane)
+		// The dead claim still owes its consumed force mandate: inherit it
+		// so a crash cannot downgrade an accepted forced request.
+		inheritForce = up.PushClaimForce
 	}
 	// The claim consumes the pending marker whole; the consumed level's
-	// force bit rides the run. A crash between claim and finish loses the
-	// bit — the rescued re-run downgrades to non-force, which fails
-	// honestly per ref instead of force-pushing on a stale mandate.
-	force := up.PushPending == PushPendingForce
-	up.PushSyncing, up.PushPending = true, PushPendingNone
+	// force bit rides the run AND persists on the claim until FinishPush.
+	force := up.PushPending == PushPendingForce || inheritForce
+	up.PushSyncing, up.PushPending, up.PushClaimForce = true, PushPendingNone, force
 	up.PushClaimHolder, up.PushClaimExpiresAt = holder, time.Now().Add(lease)
 	m.upstreams[repoID] = up
 	return up, force, stolenFrom, nil
@@ -279,7 +281,7 @@ func (m *MemStore) FinishPush(_ context.Context, repoID, holder string, success 
 	if up.PushClaimHolder != holder {
 		return Upstream{}, fmt.Errorf("now held by %q: %w", up.PushClaimHolder, ErrClaimLost)
 	}
-	up.PushSyncing = false
+	up.PushSyncing, up.PushClaimForce = false, false
 	up.PushClaimHolder, up.PushClaimExpiresAt = "", time.Time{}
 	up.PushRunCount++
 	if success {

@@ -143,6 +143,7 @@ CREATE TABLE IF NOT EXISTS repo_upstreams (
     push_syncing          boolean NOT NULL DEFAULT false,
     push_claim_holder     text NOT NULL DEFAULT '',
     push_claim_expires_at timestamptz NOT NULL DEFAULT 'epoch',
+    push_claim_force      boolean NOT NULL DEFAULT false,
     push_run_count        integer NOT NULL DEFAULT 0,
     push_success_count    integer NOT NULL DEFAULT 0,
     created_at    timestamptz NOT NULL DEFAULT now()
@@ -163,6 +164,7 @@ ALTER TABLE repo_upstreams ADD COLUMN IF NOT EXISTS push_pending integer NOT NUL
 ALTER TABLE repo_upstreams ADD COLUMN IF NOT EXISTS push_syncing boolean NOT NULL DEFAULT false;
 ALTER TABLE repo_upstreams ADD COLUMN IF NOT EXISTS push_claim_holder text NOT NULL DEFAULT '';
 ALTER TABLE repo_upstreams ADD COLUMN IF NOT EXISTS push_claim_expires_at timestamptz NOT NULL DEFAULT 'epoch';
+ALTER TABLE repo_upstreams ADD COLUMN IF NOT EXISTS push_claim_force boolean NOT NULL DEFAULT false;
 ALTER TABLE repo_upstreams ADD COLUMN IF NOT EXISTS push_run_count integer NOT NULL DEFAULT 0;
 ALTER TABLE repo_upstreams ADD COLUMN IF NOT EXISTS push_success_count integer NOT NULL DEFAULT 0;
 -- Upgrade path for repos predating the purge tombstone column (issue #52).

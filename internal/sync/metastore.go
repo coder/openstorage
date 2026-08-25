@@ -100,8 +100,8 @@ func fromMetaUpstream(u meta.RepoUpstream) Upstream {
 		SyncClaimHolder: u.SyncClaimHolder, SyncClaimExpiresAt: u.SyncClaimExpiresAt,
 		ForwardOnPush: u.ForwardOnPush, PushPending: u.PushPending,
 		PushSyncing: u.PushSyncing, PushClaimHolder: u.PushClaimHolder,
-		PushClaimExpiresAt: u.PushClaimExpiresAt,
-		PushRunCount:       u.PushRunCount, PushSuccessCount: u.PushSuccessCount,
+		PushClaimExpiresAt: u.PushClaimExpiresAt, PushClaimForce: u.PushClaimForce,
+		PushRunCount: u.PushRunCount, PushSuccessCount: u.PushSuccessCount,
 		CreatedAt: u.CreatedAt,
 	}
 }

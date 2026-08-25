@@ -57,7 +57,7 @@ func scanRepoUpstreamSQLite(row sqlRow) (RepoUpstream, error) {
 		&up.RunCount, &up.SuccessCount, &up.Syncing, &up.SyncPending,
 		&up.SyncClaimHolder, &claimExpires,
 		&up.ForwardOnPush, &up.PushPending, &up.PushSyncing,
-		&up.PushClaimHolder, &pushClaimExpires,
+		&up.PushClaimHolder, &pushClaimExpires, &up.PushClaimForce,
 		&up.PushRunCount, &up.PushSuccessCount, &createdAt); err != nil {
 		return RepoUpstream{}, err
 	}
@@ -358,7 +358,7 @@ func (s *SQLite) SetRepoUpstream(ctx context.Context, up RepoUpstream) (RepoUpst
 	up.RunCount, up.SuccessCount, up.Syncing, up.SyncPending = 0, 0, false, false
 	up.SyncClaimHolder, up.SyncClaimExpiresAt = "", time.Unix(0, 0).UTC()
 	up.PushPending, up.PushSyncing, up.PushRunCount, up.PushSuccessCount = 0, false, 0, 0
-	up.PushClaimHolder, up.PushClaimExpiresAt = "", time.Unix(0, 0).UTC()
+	up.PushClaimHolder, up.PushClaimExpiresAt, up.PushClaimForce = "", time.Unix(0, 0).UTC(), false
 	up.CreatedAt = createdAt
 	// Live-repo guard — see CreateGitCredential (issue #52, PR #105
 	// round 6).
@@ -632,11 +632,12 @@ func (s *SQLite) RequestPush(ctx context.Context, repoID string, force bool) err
 	return nil
 }
 
-// PendingPushRepoIDs lists repos with an outbound pending level set (boot
-// recovery for accepted push-upstream requests, issue #90).
+// PendingPushRepoIDs lists repos owing an outbound run at boot — pending
+// marker set OR orphaned in-flight claim (see the EventingStore contract;
+// local-mode boot recovery, issue #90).
 func (s *SQLite) PendingPushRepoIDs(ctx context.Context) ([]string, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT repo_id FROM repo_upstreams WHERE push_pending > 0 ORDER BY repo_id`)
+		`SELECT repo_id FROM repo_upstreams WHERE push_pending > 0 OR push_syncing = 1 ORDER BY repo_id`)
 	if err != nil {
 		return nil, fmt.Errorf("list pending push repos: %w", err)
 	}
@@ -658,7 +659,9 @@ func (s *SQLite) PendingPushRepoIDs(ctx context.Context) ([]string, error) {
 // TryBeginPush is TryBeginSync on the push_* lane (issue #90): BEGIN
 // IMMEDIATE read-check-write on Go wall time (single-host topology). No
 // legacy adoption exists here — push claims only ever come from #90-aware
-// binaries, so an expired lease is always provably dead.
+// binaries, so an expired lease is always provably dead. A steal inherits
+// the dead claim's persisted force mandate (push_claim_force), so a crash
+// between claim and finish cannot downgrade an accepted forced request.
 func (s *SQLite) TryBeginPush(ctx context.Context, repoID, holder string, lease time.Duration) (RepoUpstream, bool, bool, string, error) {
 	assertf(repoID != "", "TryBeginPush: empty repo id")
 	assertf(holder != "", "TryBeginPush: empty holder")
@@ -681,11 +684,16 @@ func (s *SQLite) TryBeginPush(ctx context.Context, repoID, holder string, lease 
 			up = prev // unexpired claim in flight: refused, current row
 			return nil
 		}
+		force = prev.PushPending == 2 || (prev.PushSyncing && prev.PushClaimForce)
+		forceInt := 0
+		if force {
+			forceInt = 1
+		}
 		if _, err := tx.ExecContext(ctx,
 			`UPDATE repo_upstreams
-			 SET push_syncing = 1, push_pending = 0, push_claim_holder = ?, push_claim_expires_at = ?
+			 SET push_syncing = 1, push_pending = 0, push_claim_holder = ?, push_claim_expires_at = ?, push_claim_force = ?
 			 WHERE repo_id = ?`,
-			holder, nowNanos+lease.Nanoseconds(), repoID); err != nil {
+			holder, nowNanos+lease.Nanoseconds(), forceInt, repoID); err != nil {
 			return err
 		}
 		row, err := scanRepoUpstreamSQLite(tx.QueryRowContext(ctx,
@@ -697,7 +705,6 @@ func (s *SQLite) TryBeginPush(ctx context.Context, repoID, holder string, lease 
 		assertf(up.PushSyncing && up.PushClaimHolder == holder,
 			"claimed row %q returned holder %q push_syncing=%v", repoID, up.PushClaimHolder, up.PushSyncing)
 		claimed = true
-		force = prev.PushPending == 2
 		if prev.PushSyncing {
 			stolenFrom = prev.PushClaimHolder // expired lease stolen
 		}
@@ -724,7 +731,7 @@ func (s *SQLite) FinishPush(ctx context.Context, repoID, holder string, success 
 			`UPDATE repo_upstreams
 			 SET push_syncing = 0, push_run_count = push_run_count + 1,
 			     push_success_count = push_success_count + ?,
-			     push_claim_holder = '', push_claim_expires_at = 0
+			     push_claim_holder = '', push_claim_expires_at = 0, push_claim_force = 0
 			 WHERE repo_id = ? AND push_syncing = 1 AND push_claim_holder = ?`,
 			successInc, repoID, holder)
 		if err != nil {

@@ -21,7 +21,7 @@ const (
 	// scanRepoUpstream (shared with sqlite_eventing.go like repoCols).
 	webhookCols       = "id, org_id, url, secret, created_at"
 	gitCredentialCols = "id, repo_id, username, password, created_at"
-	repoUpstreamCols  = "repo_id, provider, owner, name, upstream_host, run_count, success_count, syncing, sync_pending, sync_claim_holder, sync_claim_expires_at, forward_on_push, push_pending, push_syncing, push_claim_holder, push_claim_expires_at, push_run_count, push_success_count, created_at"
+	repoUpstreamCols  = "repo_id, provider, owner, name, upstream_host, run_count, success_count, syncing, sync_pending, sync_claim_holder, sync_claim_expires_at, forward_on_push, push_pending, push_syncing, push_claim_holder, push_claim_expires_at, push_claim_force, push_run_count, push_success_count, created_at"
 )
 
 // scanWebhook scans one row of webhookCols; CreatedAt normalized to UTC.
@@ -51,7 +51,7 @@ func scanRepoUpstream(row pgx.Row) (RepoUpstream, error) {
 		&up.RunCount, &up.SuccessCount, &up.Syncing, &up.SyncPending,
 		&up.SyncClaimHolder, &up.SyncClaimExpiresAt,
 		&up.ForwardOnPush, &up.PushPending, &up.PushSyncing,
-		&up.PushClaimHolder, &up.PushClaimExpiresAt,
+		&up.PushClaimHolder, &up.PushClaimExpiresAt, &up.PushClaimForce,
 		&up.PushRunCount, &up.PushSuccessCount, &up.CreatedAt); err != nil {
 		return RepoUpstream{}, err
 	}
@@ -334,7 +334,7 @@ func (s *PG) SetRepoUpstream(ctx context.Context, up RepoUpstream) (RepoUpstream
 	up.RunCount, up.SuccessCount, up.Syncing, up.SyncPending = 0, 0, false, false
 	up.SyncClaimHolder, up.SyncClaimExpiresAt = "", time.Unix(0, 0).UTC()
 	up.PushPending, up.PushSyncing, up.PushRunCount, up.PushSuccessCount = 0, false, 0, 0
-	up.PushClaimHolder, up.PushClaimExpiresAt = "", time.Unix(0, 0).UTC()
+	up.PushClaimHolder, up.PushClaimExpiresAt, up.PushClaimForce = "", time.Unix(0, 0).UTC(), false
 	// Live-repo guard with FOR UPDATE — see CreateGitCredential (issue
 	// #52, PR #105 round 6): no upstream link may attach to a deleted or
 	// purged repository.
@@ -576,11 +576,12 @@ func (s *PG) RequestPush(ctx context.Context, repoID string, force bool) error {
 	return nil
 }
 
-// PendingPushRepoIDs lists repos with an outbound pending level set (boot
-// recovery for accepted push-upstream requests, issue #90).
+// PendingPushRepoIDs lists repos owing an outbound run at boot — pending
+// marker set OR orphaned in-flight claim (see the EventingStore contract;
+// local-mode boot recovery, issue #90).
 func (s *PG) PendingPushRepoIDs(ctx context.Context) ([]string, error) {
 	rows, err := s.pool.Query(ctx,
-		`SELECT repo_id FROM repo_upstreams WHERE push_pending > 0 ORDER BY repo_id`)
+		`SELECT repo_id FROM repo_upstreams WHERE push_pending > 0 OR push_syncing ORDER BY repo_id`)
 	if err != nil {
 		return nil, fmt.Errorf("list pending push repos: %w", err)
 	}
@@ -602,7 +603,10 @@ func (s *PG) PendingPushRepoIDs(ctx context.Context) ([]string, error) {
 // TryBeginPush is TryBeginSync on the push_* lane (issue #90): row-locked
 // read-check-write on the database clock, expired leases stolen atomically.
 // No legacy adoption exists here — push claims only ever come from
-// #90-aware binaries, so an expired lease is always provably dead.
+// #90-aware binaries, so an expired lease is always provably dead. A steal
+// inherits the dead claim's persisted force mandate (push_claim_force), so
+// a crash between claim and finish cannot downgrade an accepted forced
+// request.
 func (s *PG) TryBeginPush(ctx context.Context, repoID, holder string, lease time.Duration) (RepoUpstream, bool, bool, string, error) {
 	assertf(repoID != "", "TryBeginPush: empty repo id")
 	assertf(holder != "", "TryBeginPush: empty holder")
@@ -627,20 +631,21 @@ func (s *PG) TryBeginPush(ctx context.Context, repoID, holder string, lease time
 			up = prev // unexpired claim in flight: refused, current row
 			return nil
 		}
+		force = prev.PushPending == 2 || (prev.PushSyncing && prev.PushClaimForce)
 		row, err := scanRepoUpstream(tx.QueryRow(ctx,
 			`UPDATE repo_upstreams
 			 SET push_syncing = true, push_pending = 0,
 			     push_claim_holder = $2,
-			     push_claim_expires_at = now() + make_interval(secs => $3)
+			     push_claim_expires_at = now() + make_interval(secs => $3),
+			     push_claim_force = $4
 			 WHERE repo_id = $1
-			 RETURNING `+repoUpstreamCols, repoID, holder, lease.Seconds()))
+			 RETURNING `+repoUpstreamCols, repoID, holder, lease.Seconds(), force))
 		if err != nil {
 			return err
 		}
 		assertf(row.PushSyncing && row.PushClaimHolder == holder,
 			"claimed row %q returned holder %q push_syncing=%v", repoID, row.PushClaimHolder, row.PushSyncing)
 		up, claimed = row, true
-		force = prev.PushPending == 2
 		if prev.PushSyncing {
 			stolenFrom = prev.PushClaimHolder // expired lease stolen
 		}
@@ -664,7 +669,7 @@ func (s *PG) FinishPush(ctx context.Context, repoID, holder string, success bool
 		`UPDATE repo_upstreams
 		 SET push_syncing = false, push_run_count = push_run_count + 1,
 		     push_success_count = push_success_count + CASE WHEN $3 THEN 1 ELSE 0 END,
-		     push_claim_holder = '', push_claim_expires_at = 'epoch'
+		     push_claim_holder = '', push_claim_expires_at = 'epoch', push_claim_force = false
 		 WHERE repo_id = $1 AND push_syncing = true AND push_claim_holder = $2
 		 RETURNING `+repoUpstreamCols, repoID, holder, success))
 	if err == nil {

@@ -390,6 +390,31 @@ func (m *markPendingOnFinish) FinishPush(ctx context.Context, repoID, holder str
 	return m.MemStore.FinishPush(ctx, repoID, holder, success)
 }
 
+// TestMemStoreForceInheritance keeps the test double honest against the
+// durable backends' steal semantics (meta eventing_pushlane_test.go): a
+// stolen expired claim inherits its persisted force mandate.
+func TestMemStoreForceInheritance(t *testing.T) {
+	ctx := context.Background()
+	m := NewMemStore()
+	if _, err := m.PutUpstream(ctx, Upstream{RepoID: "r1", Provider: "github", Owner: "o", Name: "n", UpstreamHost: "github.com"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.RequestPush(ctx, "r1", true); err != nil {
+		t.Fatal(err)
+	}
+	if _, force, _, err := m.BeginPush(ctx, "r1", "h-crash", time.Nanosecond); err != nil || !force {
+		t.Fatalf("forced claim = (%v, %v), want forced", force, err)
+	}
+	time.Sleep(2 * time.Millisecond) // let the 1ns lease expire
+	up, force, stolenFrom, err := m.BeginPush(ctx, "r1", "h-rescue", time.Minute)
+	if err != nil || stolenFrom != "h-crash" || !force || !up.PushClaimForce {
+		t.Fatalf("steal = (%+v, %v, %q, %v), want inherited force", up, force, stolenFrom, err)
+	}
+	if fin, err := m.FinishPush(ctx, "r1", "h-rescue", true); err != nil || fin.PushClaimForce {
+		t.Fatalf("finish = (%+v, %v), want cleared mandate", fin, err)
+	}
+}
+
 func TestPushRetryDelayBackoff(t *testing.T) {
 	want := []time.Duration{time.Minute, 2 * time.Minute, 4 * time.Minute, 8 * time.Minute, 16 * time.Minute}
 	for i, w := range want {

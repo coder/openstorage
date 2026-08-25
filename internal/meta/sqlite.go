@@ -168,6 +168,7 @@ func (s *SQLite) InitSchema(ctx context.Context) error {
 		    push_syncing          INTEGER NOT NULL DEFAULT 0,
 		    push_claim_holder     TEXT NOT NULL DEFAULT '',
 		    push_claim_expires_at INTEGER NOT NULL DEFAULT 0,
+		    push_claim_force      INTEGER NOT NULL DEFAULT 0,
 		    push_run_count        INTEGER NOT NULL DEFAULT 0,
 		    push_success_count    INTEGER NOT NULL DEFAULT 0,
 		    created_at    INTEGER NOT NULL
@@ -194,6 +195,7 @@ func (s *SQLite) InitSchema(ctx context.Context) error {
 		{"repo_upstreams", "push_syncing", `push_syncing INTEGER NOT NULL DEFAULT 0`},
 		{"repo_upstreams", "push_claim_holder", `push_claim_holder TEXT NOT NULL DEFAULT ''`},
 		{"repo_upstreams", "push_claim_expires_at", `push_claim_expires_at INTEGER NOT NULL DEFAULT 0`},
+		{"repo_upstreams", "push_claim_force", `push_claim_force INTEGER NOT NULL DEFAULT 0`},
 		{"repo_upstreams", "push_run_count", `push_run_count INTEGER NOT NULL DEFAULT 0`},
 		{"repo_upstreams", "push_success_count", `push_success_count INTEGER NOT NULL DEFAULT 0`},
 		// Purge tombstone column (issue #52) for data dirs predating it.

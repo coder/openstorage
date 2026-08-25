@@ -110,9 +110,13 @@ type Upstream struct {
 	PushSyncing        bool
 	PushClaimHolder    string
 	PushClaimExpiresAt time.Time
-	PushRunCount       int // completed outbound runs (success + failure)
-	PushSuccessCount   int // completed successful outbound runs
-	CreatedAt          time.Time
+	// PushClaimForce persists the in-flight claim's consumed force mandate
+	// until FinishPush (meta.RepoUpstream.PushClaimForce): steals inherit
+	// it so crashes cannot downgrade an accepted forced request.
+	PushClaimForce   bool
+	PushRunCount     int // completed outbound runs (success + failure)
+	PushSuccessCount int // completed successful outbound runs
+	CreatedAt        time.Time
 }
 
 // PushPending levels (issue #90). Force must dominate: markers coalesce by
