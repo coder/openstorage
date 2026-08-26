@@ -28,6 +28,7 @@ import (
 	"github.com/coder/code-storage/internal/githttp"
 	"github.com/coder/code-storage/internal/meta"
 	"github.com/coder/code-storage/internal/ref"
+	"github.com/coder/code-storage/internal/ref/s3wal"
 	"github.com/coder/code-storage/internal/version"
 )
 
@@ -72,6 +73,11 @@ func fatalf(format string, args ...any) {
 	os.Exit(1)
 }
 
+// leaseReleaseTimeout bounds the shutdown-path instance-lease Release —
+// long enough for one Get + Delete round trip, short enough that a stalled
+// store never hangs an otherwise graceful shutdown.
+const leaseReleaseTimeout = 5 * time.Second
+
 func cmdServe(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	listen := fs.String("listen", "", "listen address (falls back to --addr, then $"+envListen+", then "+defaultListen+")")
@@ -109,6 +115,41 @@ func cmdServe(ctx context.Context, args []string) error {
 	if err := st.InitSchema(ctx); err != nil {
 		return fmt.Errorf("init ref schema: %w", err)
 	}
+
+	// Instance lease (issue #133, plan §2.11): the best-effort dual-serve
+	// guard for the zero-infra mode, s3wal scheme only. Acquired AFTER
+	// InitSchema so the §2.6 probe has already proven the store's
+	// conditional-write fidelity — the lease CAS means nothing on a store
+	// that ignores the headers. Refuses startup over a fresh foreign
+	// lease; on heartbeat loss the process fail-stops (crash, not limp —
+	// two live writers would corrupt nothing, CAS serializes every state
+	// change, but §2.4 TTL verdicts and caches degrade silently).
+	if s3, ok := st.(*ref.S3WAL); ok {
+		if cfg.s3walLeaseTTL < 0 {
+			// Explicit "0": test suites deliberately run several
+			// processes against one bucket. Never silent.
+			fmt.Fprintf(os.Stderr, "warning: %s=0 disables the s3wal instance lease — accidental dual-serve topologies will NOT be detected\n", envS3WALLeaseTTL)
+		} else {
+			lease, err := s3wal.AcquireInstanceLease(ctx, s3.ConditionalStore(), s3wal.LeaseConfig{TTL: cfg.s3walLeaseTTL})
+			if err != nil {
+				return err
+			}
+			defer func() {
+				// Release is best-effort by design (an abandoned lease
+				// expires on its TTL), so bound it: a stalled endpoint
+				// must not hang an otherwise graceful shutdown.
+				rctx, cancel := context.WithTimeout(context.Background(), leaseReleaseTimeout)
+				defer cancel()
+				lease.Release(rctx)
+			}()
+			go func() {
+				if err := lease.Heartbeat(ctx); err != nil {
+					fatalf("codestorage serve: %v", err)
+				}
+			}()
+		}
+	}
+
 	bl, err := blob.Open(ctx, cfg.blobURL)
 	if err != nil {
 		return err

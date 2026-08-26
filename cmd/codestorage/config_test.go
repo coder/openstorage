@@ -48,6 +48,63 @@ func TestEnvFirstPrecedence(t *testing.T) {
 	}
 }
 
+// TestResolveServeConfigZeroInfraPairing (issue #133 Phase 3): an s3wal
+// database URL demands an s3:// blob URL — the zero-infra premise is that
+// the bucket is the sole durable authority, so a file:// blob store (or a
+// data-dir derived one) would silently reintroduce a local-disk authority
+// that a restart-from-bucket-only cannot reconstruct. The same bucket for
+// both URLs is the expected topology (packs/, lfs/, _wal/ coexist).
+func TestResolveServeConfigZeroInfraPairing(t *testing.T) {
+	base := map[string]string{
+		"CODESTORAGE_ORG":         "org1",
+		"CODESTORAGE_ORG_PUBKEYS": "/tmp/org.pub.pem",
+		"CODESTORAGE_PG_URL":      "s3wal://bkt?endpoint=http://127.0.0.1:8333&region=us-east-1",
+	}
+	t.Run("file blob refused", func(t *testing.T) {
+		env := map[string]string{"CODESTORAGE_S3_URL": "file:///var/blobs"}
+		for k, v := range base {
+			env[k] = v
+		}
+		_, err := resolveServeConfig(mapEnv(env), "", "127.0.0.1:0", "/tmp/cache", "")
+		if err == nil || !strings.Contains(err.Error(), "s3://") {
+			t.Fatalf("s3wal + file:// blob store must refuse with the zero-infra pairing error, got %v", err)
+		}
+	})
+	t.Run("data-dir derived file blob refused", func(t *testing.T) {
+		env := map[string]string{}
+		for k, v := range base {
+			env[k] = v
+		}
+		// --data-dir fills the empty blob slot with file://…/blobs; the
+		// pairing rule must catch the derived URL too.
+		if _, err := resolveServeConfig(mapEnv(env), "", "127.0.0.1:0", "/tmp/cache", t.TempDir()); err == nil {
+			t.Fatal("s3wal + data-dir-derived file:// blob store resolved — local disk sneaks back in as an authority")
+		}
+	})
+	t.Run("s3 blob accepted", func(t *testing.T) {
+		env := map[string]string{"CODESTORAGE_S3_URL": "s3://bkt?endpoint=http://127.0.0.1:8333"}
+		for k, v := range base {
+			env[k] = v
+		}
+		cfg, err := resolveServeConfig(mapEnv(env), "", "127.0.0.1:0", "/tmp/cache", "")
+		if err != nil {
+			t.Fatalf("s3wal + s3:// (same bucket) must resolve: %v", err)
+		}
+		if !isS3WALURL(cfg.dbURL) {
+			t.Fatalf("isS3WALURL(%q) = false", cfg.dbURL)
+		}
+	})
+	t.Run("non-s3wal untouched", func(t *testing.T) {
+		env := map[string]string{
+			"CODESTORAGE_ORG":         "org1",
+			"CODESTORAGE_ORG_PUBKEYS": "/tmp/org.pub.pem",
+		}
+		if _, err := resolveServeConfig(mapEnv(env), "", "127.0.0.1:0", "/tmp/cache", t.TempDir()); err != nil {
+			t.Fatalf("local mode (sqlite + file) must keep resolving: %v", err)
+		}
+	})
+}
+
 // TestResolveServeConfigCompatForbidsDestructiveLFSSweep (Codex round
 // 101, P1): the write-compat flag declares a mixed v0.2.0 fleet — and
 // during that roll, DESTRUCTIVE LFS sweeping must be off fleet-wide: the
@@ -765,6 +822,79 @@ func TestResolveServeConfigPackReservationTTL(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestResolveServeConfigS3WALLeaseTTL (PR #168 P2): the lease-TTL env is
+// an s3wal-only knob. A PG/SQLite deployment inheriting the variable —
+// even an invalid value — must ignore it rather than refuse startup; the
+// s3wal backend still parses and validates it.
+func TestResolveServeConfigS3WALLeaseTTL(t *testing.T) {
+	resolve := func(t *testing.T, dbURL, blobURL, leaseTTL string) (serveConfig, error) {
+		t.Helper()
+		return resolveServeConfig(mapEnv(map[string]string{
+			"CODESTORAGE_PG_URL":      dbURL,
+			"CODESTORAGE_S3_URL":      blobURL,
+			"CODESTORAGE_ORG":         "org1",
+			"CODESTORAGE_ORG_PUBKEYS": "/tmp/org.pub.pem",
+			envS3WALLeaseTTL:          leaseTTL,
+		}), "", "", "/tmp/cache", "")
+	}
+	const s3walURL = "s3wal://bkt?endpoint=http://127.0.0.1:8333&region=us-east-1"
+
+	t.Run("postgres ignores a malformed value", func(t *testing.T) {
+		cfg, err := resolve(t, "postgres://x", "s3://x", "bogus")
+		if err != nil {
+			t.Fatalf("postgres backend must ignore the s3wal-only knob: %v", err)
+		}
+		if cfg.s3walLeaseTTL != 0 {
+			t.Fatalf("ignored knob left s3walLeaseTTL = %v, want 0", cfg.s3walLeaseTTL)
+		}
+	})
+	t.Run("sqlite ignores a below-floor value", func(t *testing.T) {
+		if _, err := resolve(t, "sqlite:///tmp/x.db", "file:///tmp/blobs", "500ms"); err != nil {
+			t.Fatalf("sqlite backend must ignore the s3wal-only knob: %v", err)
+		}
+	})
+	t.Run("s3wal still refuses invalid values", func(t *testing.T) {
+		for _, val := range []string{"bogus", "500ms"} {
+			_, err := resolve(t, s3walURL, "s3://bkt", val)
+			if err == nil || !strings.Contains(err.Error(), envS3WALLeaseTTL) {
+				t.Fatalf("%s=%q on s3wal: want an error naming the variable, got %v", envS3WALLeaseTTL, val, err)
+			}
+		}
+	})
+	t.Run("s3wal parses valid values", func(t *testing.T) {
+		cfg, err := resolve(t, s3walURL, "s3://bkt", "30s")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.s3walLeaseTTL != 30*time.Second {
+			t.Fatalf("resolved lease TTL %v, want 30s", cfg.s3walLeaseTTL)
+		}
+	})
+	t.Run("s3wal textual zeros disable", func(t *testing.T) {
+		for _, val := range []string{"0", "0s", "0.0s", "+0m"} {
+			cfg, err := resolve(t, s3walURL, "s3://bkt", val)
+			if err != nil {
+				t.Fatalf("%s=%q: %v", envS3WALLeaseTTL, val, err)
+			}
+			if cfg.s3walLeaseTTL != -1 {
+				t.Fatalf("%s=%q resolved to %v, want the -1 disable sentinel", envS3WALLeaseTTL, val, cfg.s3walLeaseTTL)
+			}
+		}
+	})
+	t.Run("s3wal sub-nanosecond truncation must not disable", func(t *testing.T) {
+		// time.ParseDuration truncates these to a parsed 0 (PR #168 round
+		// 2): a malformed nonzero value must be refused under the 1s
+		// floor, never read as the explicit disable sentinel — that would
+		// silently switch the dual-serve guard off.
+		for _, val := range []string{"0.5ns", "-0.1ns", "0.0000000001s"} {
+			_, err := resolve(t, s3walURL, "s3://bkt", val)
+			if err == nil || !strings.Contains(err.Error(), envS3WALLeaseTTL) {
+				t.Fatalf("%s=%q: want a refusal naming the variable, got %v", envS3WALLeaseTTL, val, err)
+			}
+		}
+	})
 }
 
 func TestResolveServeConfigLFSStaging(t *testing.T) {

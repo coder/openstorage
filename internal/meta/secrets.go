@@ -26,8 +26,13 @@ var ErrReservedSecret = fmt.Errorf("secret values must not start with the reserv
 type Option func(*storeOptions)
 
 type storeOptions struct {
-	codec *secrets.Codec
-	now   func() time.Time
+	codec     *secrets.Codec
+	now       func() time.Time
+	claimSink SyncClaimSink
+	// keyRefreshEvery overrides the s3wal org-key snapshot refresh cadence
+	// (withKeyRefreshInterval, s3walmeta.go — in-package tests only; the
+	// SQL backends ignore it). Zero keeps s3walKeyRefreshInterval.
+	keyRefreshEvery time.Duration
 }
 
 // WithSecretsCodec enables envelope encryption of the secret columns
@@ -47,6 +52,14 @@ func WithSecretsCodec(c *secrets.Codec) Option {
 func WithNowFunc(now func() time.Time) Option {
 	assertf(now != nil, "WithNowFunc: nil clock")
 	return func(o *storeOptions) { o.now = now }
+}
+
+// WithSyncClaimSink wires the §2.8 sync-claim write-through sink
+// (ref.S3WAL in zero-infra mode). Only the s3wal meta backend consumes
+// it; the SQL backends ignore it because their CASRef fence reads the
+// shared repo_upstreams row directly. Nil restores today's behavior.
+func WithSyncClaimSink(sink SyncClaimSink) Option {
+	return func(o *storeOptions) { o.claimSink = sink }
 }
 
 func resolveOptions(opts []Option) storeOptions {

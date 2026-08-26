@@ -54,9 +54,13 @@ const (
 const (
 	backendPG    = "pg"
 	backendLocal = "local"
+	// backendS3WAL is the zero-infra lane (issue #133 Phase 3): ONE
+	// SeaweedFS bucket carries the s3wal ref+meta authority (_wal/) AND
+	// the packs/lfs blobs — the expected production topology.
+	backendS3WAL = "s3wal"
 )
 
-// Static dummy credentials for the pg lane's SeaweedFS S3 gateway (the
+// Static dummy credentials for the SeaweedFS S3 gateway lanes (the
 // container is throwaway and unreachable beyond the mapped test port).
 const (
 	s3AccessKey = "codestorage-e2e"
@@ -163,41 +167,8 @@ func testMainInner(m *testing.M) int {
 			panic(err)
 		}
 
-		// Qualified SeaweedFS recipe (Gate 1a-A, PR #142): pinned image,
-		// one-process `weed server -s3`, S3 gateway on 8333.
-		// A static identity (s3.config) turns on SigV4 validation so the
-		// LFS round-trip's presigned download keeps failing on a bad or
-		// missing signature, exactly like the MinIO container it replaced
-		// — an anonymous gateway would serve unsigned requests too. The
-		// wait strategy only proves the gateway port accepts TCP — weed
-		// starts master/volume/filer/s3 asynchronously — so the
-		// EnsureBucket retry below is the actual readiness signal.
-		s3Config := fmt.Sprintf(`{"identities":[{"name":"e2e","credentials":[{"accessKey":%q,"secretKey":%q}],"actions":["Admin","Read","List","Tagging","Write"]}]}`,
-			s3AccessKey, s3SecretKey)
-		seaweedC, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
-			ContainerRequest: testcontainers.ContainerRequest{
-				Image:        "chrislusf/seaweedfs:4.42",
-				ExposedPorts: []string{"8333/tcp"},
-				Cmd:          []string{"server", "-s3", "-dir=/data", "-ip.bind=0.0.0.0", "-s3.config=/etc/seaweedfs/s3.json"},
-				Files: []testcontainers.ContainerFile{{
-					Reader:            strings.NewReader(s3Config),
-					ContainerFilePath: "/etc/seaweedfs/s3.json",
-					FileMode:          0o444,
-				}},
-				WaitingFor: wait.ForListeningPort("8333/tcp").WithStartupTimeout(2 * time.Minute),
-			},
-			Started: true,
-		})
-		if err != nil {
-			panic("start seaweedfs container: " + err.Error())
-		}
-		defer func() { _ = seaweedC.Terminate(ctx) }()
-		// PortEndpoint brackets IPv6 hosts (net.JoinHostPort), so the
-		// address stays a valid URL host under IPv6 Docker daemons.
-		s3Addr, err := seaweedC.PortEndpoint(ctx, "8333/tcp", "")
-		if err != nil {
-			panic(err)
-		}
+		s3Addr, terminate := startSeaweedFS(ctx)
+		defer terminate()
 		blobURL = fmt.Sprintf("s3://githttp-test?endpoint=http://%s&s3ForcePathStyle=true&region=us-east-1", s3Addr)
 		os.Setenv("AWS_ACCESS_KEY_ID", s3AccessKey)
 		os.Setenv("AWS_SECRET_ACCESS_KEY", s3SecretKey)
@@ -206,8 +177,42 @@ func testMainInner(m *testing.M) int {
 		localDataDir = filepath.Join(scratch, "data")
 		dbURL = "sqlite://" + filepath.Join(localDataDir, "codestorage.db")
 		blobURL = "file://" + filepath.Join(localDataDir, "blobs")
+	case backendS3WAL:
+		testBackend = backendS3WAL
+
+		// Zero-infra topology (issue #133 Phase 3): ONE bucket serves the
+		// s3wal ref+meta authority (_wal/ prefix) AND the packs/lfs
+		// blobs; the child serve processes get one s3wal:// URL for both
+		// stores plus the paired s3:// blob URL.
+		s3Addr, terminate := startSeaweedFS(ctx)
+		defer terminate()
+		const bucket = "githttp-s3wal"
+		dbURL = fmt.Sprintf("s3wal://%s?endpoint=http://%s&region=us-east-1", bucket, s3Addr)
+		blobURL = fmt.Sprintf("s3://%s?endpoint=http://%s&s3ForcePathStyle=true&region=us-east-1", bucket, s3Addr)
+		os.Setenv("AWS_ACCESS_KEY_ID", s3AccessKey)
+		os.Setenv("AWS_SECRET_ACCESS_KEY", s3SecretKey)
+
+		// The bucket must exist BEFORE testStore.InitSchema below: the
+		// s3wal boot probe writes _wal/probe into it. This poll doubles
+		// as the lane's S3 readiness gate (same rationale as the shared
+		// EnsureBucket retry below, which then succeeds immediately).
+		b, err := blob.Open(ctx, blobURL)
+		if err != nil {
+			panic(err)
+		}
+		for deadline := time.Now().Add(60 * time.Second); ; {
+			err := b.EnsureBucket(ctx)
+			if err == nil {
+				break
+			}
+			if time.Now().After(deadline) {
+				panic("EnsureBucket never succeeded (SeaweedFS not ready?): " + err.Error())
+			}
+			time.Sleep(250 * time.Millisecond)
+		}
+		b.Close()
 	default:
-		panic(fmt.Sprintf("CODESTORAGE_TEST_BACKEND=%q: unknown backend (want %q, %q, or unset)", v, backendPG, backendLocal))
+		panic(fmt.Sprintf("CODESTORAGE_TEST_BACKEND=%q: unknown backend (want %q, %q, %q, or unset)", v, backendPG, backendLocal, backendS3WAL))
 	}
 
 	// Runtime-generated org keys (never committed). testOrg registers two
@@ -274,6 +279,44 @@ func testMainInner(m *testing.M) int {
 	return m.Run()
 }
 
+// startSeaweedFS boots the qualified SeaweedFS recipe (Gate 1a-A, PR
+// #142): pinned image, one-process `weed server -s3`, S3 gateway on 8333.
+// A static identity (s3.config) turns on SigV4 validation so the LFS
+// round-trip's presigned download keeps failing on a bad or missing
+// signature, exactly like the MinIO container it replaced — an anonymous
+// gateway would serve unsigned requests too. The wait strategy only proves
+// the gateway port accepts TCP — weed starts master/volume/filer/s3
+// asynchronously — so the callers' EnsureBucket retry is the actual
+// readiness signal. Shared by the pg and s3wal lanes.
+func startSeaweedFS(ctx context.Context) (s3Addr string, terminate func()) {
+	s3Config := fmt.Sprintf(`{"identities":[{"name":"e2e","credentials":[{"accessKey":%q,"secretKey":%q}],"actions":["Admin","Read","List","Tagging","Write"]}]}`,
+		s3AccessKey, s3SecretKey)
+	seaweedC, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
+		ContainerRequest: testcontainers.ContainerRequest{
+			Image:        "chrislusf/seaweedfs:4.42",
+			ExposedPorts: []string{"8333/tcp"},
+			Cmd:          []string{"server", "-s3", "-dir=/data", "-ip.bind=0.0.0.0", "-s3.config=/etc/seaweedfs/s3.json"},
+			Files: []testcontainers.ContainerFile{{
+				Reader:            strings.NewReader(s3Config),
+				ContainerFilePath: "/etc/seaweedfs/s3.json",
+				FileMode:          0o444,
+			}},
+			WaitingFor: wait.ForListeningPort("8333/tcp").WithStartupTimeout(2 * time.Minute),
+		},
+		Started: true,
+	})
+	if err != nil {
+		panic("start seaweedfs container: " + err.Error())
+	}
+	// PortEndpoint brackets IPv6 hosts (net.JoinHostPort), so the
+	// address stays a valid URL host under IPv6 Docker daemons.
+	s3Addr, err = seaweedC.PortEndpoint(ctx, "8333/tcp", "")
+	if err != nil {
+		panic(err)
+	}
+	return s3Addr, func() { _ = seaweedC.Terminate(ctx) }
+}
+
 func mustGenKey(alg string) crypto.Signer {
 	key, err := auth.GenerateKey(alg)
 	if err != nil {
@@ -317,6 +360,14 @@ func startNode(cacheDir string, extraEnv ...string) (*testNode, error) {
 		"CODESTORAGE_ORG_PUBKEYS="+orgKeysPath,
 		"CODESTORAGE_TEST_MODE=1",
 	)
+	if testBackend == backendS3WAL {
+		// The suite legitimately runs several serve processes against
+		// the one lane bucket (nodeA plus per-test nodes), which is
+		// exactly what the §2.11 instance lease exists to refuse —
+		// disable it by default; the dual-serve drill re-enables it via
+		// extraEnv (later duplicate wins).
+		cmd.Env = append(cmd.Env, "CODESTORAGE_S3WAL_LEASE_TTL=0")
+	}
 	cmd.Env = append(cmd.Env, extraEnv...)
 	cmd.Stderr = os.Stderr
 	stdout, err := cmd.StdoutPipe()

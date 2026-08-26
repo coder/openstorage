@@ -574,6 +574,7 @@ func (s *Sweeper) registered(ctx context.Context, repo, key string) (bool, error
 // the sweep (they would misclassify the object); disposal errors
 // accumulate into deleteErrs.
 func (s *Sweeper) classify(ctx context.Context, repo string, obj blob.ListedObject, deleteMode, supersededMode, lfsMode, legacyMode, purgeMode bool, report *SweepReport, deleteErrs *boundedErrs) error {
+	assertNotWAL(obj.Key)
 	registered, err := s.registered(ctx, repo, obj.Key)
 	if err != nil {
 		return fmt.Errorf("registry lookup %s: %w", obj.Key, err)
@@ -700,6 +701,17 @@ func (s *Sweeper) classify(ctx context.Context, repo string, obj blob.ListedObje
 		}
 	}
 	return nil
+}
+
+// assertNotWAL fail-fasts when a sweep/purge path is about to classify,
+// delete, or heal a key under the s3wal authority prefix (issue #133
+// Phase 3): "_wal/" holds the manifest-CAS objects — repository authority
+// state, never blob payloads — and no classifying prefix (packs/, lfs/,
+// sweep/quarantine/) overlaps it, so a _wal/ key reaching these paths
+// means a listing or key-parsing bug that could destroy authority state.
+// Crash instead of trusting downstream guards.
+func assertNotWAL(key string) {
+	assertf(!strings.HasPrefix(key, "_wal/"), "sweep touched reserved s3wal authority key %q", key)
 }
 
 // quarantinePrefix roots the sweeper's pre-delete backups: safeDelete
@@ -857,6 +869,7 @@ const lfsVerifyChunkSize = 8 << 20
 // its writer's post-registration verify or the zero-growth repair path.
 func (s *Sweeper) restoreFromQuarantine(ctx context.Context, key, qKey string) (restored bool, err error) {
 	assertf(key != "" && qKey != "", "restoreFromQuarantine(%q, %q)", key, qKey)
+	assertNotWAL(key)
 	if _, oid, ok := splitLFSKey(key); ok {
 		match, err := s.lfsBackupMatchesOID(ctx, qKey, oid)
 		if err != nil {
@@ -1094,6 +1107,7 @@ func (s *Sweeper) lfsBackupMatchesOID(ctx context.Context, qKey, oid string) (bo
 // elapses. QuarantinePurgeFloor is derived from that bound — the age gate
 // is a proof, not a heuristic.
 func (s *Sweeper) safeDelete(ctx context.Context, repo, key string) (bool, error) {
+	assertNotWAL(key)
 	qKey := quarantineKey(key)
 	if err := s.blobs.Copy(ctx, qKey, key); err != nil {
 		if errors.Is(err, blob.ErrNotFound) {
@@ -1275,6 +1289,7 @@ func (s *Sweeper) healQuarantineEntry(ctx context.Context, q blob.ListedObject, 
 		s.logger.Warn("orphan pack sweep: skipping foreign quarantine key", "key", q.Key)
 		return nil
 	}
+	assertNotWAL(orig)
 	registered, err := s.registered(ctx, repo, orig)
 	if err != nil {
 		return fmt.Errorf("sweep: heal %s: has pack: %w", orig, err)

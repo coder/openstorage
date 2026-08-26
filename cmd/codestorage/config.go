@@ -54,6 +54,13 @@ const (
 	// closes. Unset applies the one-hour default; must be positive.
 	envPackReservationTTL = "CODESTORAGE_PACK_RESERVATION_TTL"
 
+	// Instance-lease TTL for the s3wal dual-serve guard (issue #133,
+	// plan §2.11). s3wal mode only; unset applies the 2-minute default.
+	// The heartbeat cadence is derived (TTL/4). Lowering it mainly serves
+	// tests/drills — a too-small TTL makes transient S3 hiccups fail-stop
+	// the node, so the floor refuses sub-second values.
+	envS3WALLeaseTTL = "CODESTORAGE_S3WAL_LEASE_TTL"
+
 	// Decoded-byte cap on one git push (issue #55): receive-pack requests
 	// whose body (after any gzip decode) exceeds this many bytes are
 	// rejected with 413 before the stream reaches git. Unset derives the
@@ -368,6 +375,12 @@ type serveConfig struct {
 	// secretsCodec envelope-encrypts the metadata store's secret columns
 	// (issue #54); nil (the default) keeps them plaintext.
 	secretsCodec *secrets.Codec
+
+	// s3walLeaseTTL overrides the s3wal instance-lease TTL (issue #133,
+	// §2.11 dual-serve guard): 0 applies the lease default (2 minutes),
+	// negative disables the lease entirely (explicit env "0" — a test
+	// escape hatch, warned loudly). Ignored outside s3wal mode.
+	s3walLeaseTTL time.Duration
 }
 
 // sweepSettings is the resolved orphan-pack sweep configuration.
@@ -440,6 +453,34 @@ func resolveStorageURLs(getenv func(string) string, flagDataDir string) (storage
 	return u, nil
 }
 
+// isS3WALURL reports whether dbURL selects the s3wal zero-infrastructure
+// backend (issue #133): one bucket-hosted CAS store drives BOTH the ref and
+// meta stores, dispatched by ref.Open/meta.Open on the same scheme.
+func isS3WALURL(dbURL string) bool {
+	u, err := url.Parse(dbURL)
+	return err == nil && u.Scheme == "s3wal"
+}
+
+// validateZeroInfraPairing enforces the s3wal storage topology: the mode's
+// whole premise is that the bucket is the SOLE durable authority (a cold
+// process reconstructs full service from the bucket alone), so the blob
+// store must be s3:// too — a file:// blob store would silently
+// reintroduce a local-disk authority that a restart-from-bucket-only
+// cannot reconstruct. The same bucket for both URLs is the expected
+// topology: the packs/, lfs/, and _wal/ key prefixes coexist without
+// overlap (docs/plans/s3wal-plan.md §2.1).
+func validateZeroInfraPairing(dbURL, blobURL string) error {
+	if !isS3WALURL(dbURL) {
+		return nil
+	}
+	assertf(blobURL != "", "validateZeroInfraPairing: empty blobURL (caller checks first)")
+	u, err := url.Parse(blobURL)
+	if err != nil || u.Scheme != "s3" {
+		return fmt.Errorf("s3wal database URL requires an s3:// blob URL (zero-infra mode: the bucket is the sole durable authority, so %s must not point at local disk; the s3wal bucket itself is the expected target), got %q", envBlobURL[0], blobURL)
+	}
+	return nil
+}
+
 // errDBURLRequired/errBlobURLRequired are the shared missing-slot errors so
 // every subcommand names the same remediation (env URL or local mode).
 func errDBURLRequired() error {
@@ -477,6 +518,9 @@ func resolveServeConfig(getenv func(string) string, flagListen, flagAddr, flagCa
 	if cfg.blobURL == "" {
 		return serveConfig{}, errBlobURLRequired()
 	}
+	if err := validateZeroInfraPairing(cfg.dbURL, cfg.blobURL); err != nil {
+		return serveConfig{}, err
+	}
 	if cfg.org == "" || cfg.orgKeysPath == "" {
 		return serveConfig{}, fmt.Errorf("%s and %s must both be set (single-org serve mode)", envOrg, envOrgPubKeys)
 	}
@@ -506,6 +550,15 @@ func resolveServeConfig(getenv func(string) string, flagListen, flagAddr, flagCa
 	cfg.lfsStagingBytes, err = resolveLFSStagingBytes(getenv)
 	if err != nil {
 		return serveConfig{}, err
+	}
+	// s3wal-only knob: a PG/SQLite deployment inheriting the variable
+	// (even an invalid value) must ignore it, not refuse startup — serve
+	// never reads cfg.s3walLeaseTTL outside the s3wal backend.
+	if isS3WALURL(cfg.dbURL) {
+		cfg.s3walLeaseTTL, err = resolveS3WALLeaseTTL(getenv)
+		if err != nil {
+			return serveConfig{}, err
+		}
 	}
 	if raw := getenv(envLFSV020WriteCompat); raw != "" {
 		cfg.lfsV020WriteCompat, err = strconv.ParseBool(raw)
@@ -809,6 +862,46 @@ func resolvePackReservationTTL(getenv func(string) string) (time.Duration, error
 	if d <= githttp.MinPackReservationTTL {
 		return 0, fmt.Errorf("%s must exceed the %v usage-floor freshness budget (cache lifetime + admission handoff margin), got %q",
 			envPackReservationTTL, githttp.MinPackReservationTTL, raw)
+	}
+	return d, nil
+}
+
+// resolveS3WALLeaseTTL parses CODESTORAGE_S3WAL_LEASE_TTL (issue #133,
+// §2.11): the s3wal instance-lease TTL. Unset returns 0 (the lease
+// default, 2 minutes, applies); an explicit "0" returns -1 — the lease is
+// DISABLED, a deliberate escape hatch for test suites that intentionally
+// run several processes against one bucket (serve warns loudly). Other
+// values below one second are refused: the derived heartbeat cadence
+// (TTL/4) would fail-stop the node on ordinary S3 latency jitter. Called
+// only when the dbURL selects s3wal — other backends must treat an
+// inherited (even invalid) value as inert.
+func resolveS3WALLeaseTTL(getenv func(string) string) (time.Duration, error) {
+	assertf(getenv != nil, "resolveS3WALLeaseTTL: nil getenv")
+	raw := getenv(envS3WALLeaseTTL)
+	if raw == "" {
+		return 0, nil
+	}
+	if raw == "0" {
+		return -1, nil
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		return 0, fmt.Errorf("%s: %w", envS3WALLeaseTTL, err)
+	}
+	if d == 0 {
+		// ParseDuration TRUNCATES sub-nanosecond magnitudes to zero
+		// ("0.5ns", "-0.1ns", "0.0000000001s" all parse to 0), so a
+		// parsed zero is not proof the operator wrote zero — and a
+		// malformed value must never silently disable the dual-serve
+		// guard (PR #168 round 2). Only textual zeros ("0s", "0.0s",
+		// "+0m") disable; anything carrying a nonzero digit falls to the
+		// one-second floor below and is refused.
+		if !strings.ContainsAny(raw, "123456789") {
+			return -1, nil
+		}
+	}
+	if d < time.Second {
+		return 0, fmt.Errorf("%s must be at least 1s (or exactly 0 to disable the dual-serve guard), got %q", envS3WALLeaseTTL, raw)
 	}
 	return d, nil
 }

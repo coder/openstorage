@@ -10,11 +10,16 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"os"
+	"regexp"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/smithy-go/middleware"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 )
 
 // ConditionalStore is the conditional-object surface the manifest driver
@@ -85,6 +90,58 @@ func (c *Client) Close() {
 	}
 }
 
+// envExpectedBucketOwner is blob.EnvExpectedBucketOwner's twin (issue #58;
+// see internal/blob/blob.go for the full rationale): the SAME environment
+// variable pins every S3 request to a 12-digit bucket-owner account ID,
+// and the conditional client must enforce it too (PR #168 security
+// review) — the _wal/ authority objects (manifests, meta.json carrying
+// the org public keys, the instance lease, scan state) are exactly what a
+// deleted-and-re-registered bucket name could otherwise swap out from
+// under a role that was granted access by the squatter. Read here in the
+// package, not in cmd config, so every dialer — serve's ref and meta
+// stores alike — inherits enforcement uniformly. Empty (the default)
+// attaches no middleware and changes no behavior.
+const envExpectedBucketOwner = "CODESTORAGE_S3_EXPECTED_BUCKET_OWNER"
+
+// expectedOwnerHeader is the AWS bucket-owner condition header. Unlike
+// internal/blob there is no x-amz-source-expected-bucket-owner spelling:
+// this client issues no copy-source requests (no CopyObject or
+// UploadPartCopy).
+const expectedOwnerHeader = "x-amz-expected-bucket-owner"
+
+// awsAccountIDPattern mirrors blob.go: the only valid non-empty owner is
+// exactly 12 digits. A typo'd ID would 403 every operation on real AWS,
+// so misconfiguration is boot-fatal instead (crash-and-burn).
+var awsAccountIDPattern = regexp.MustCompile(`^[0-9]{12}$`)
+
+// expectedBucketOwnerFromEnv reads and validates envExpectedBucketOwner.
+func expectedBucketOwnerFromEnv() (string, error) {
+	owner := strings.TrimSpace(os.Getenv(envExpectedBucketOwner))
+	if owner != "" && !awsAccountIDPattern.MatchString(owner) {
+		return "", fmt.Errorf("%s must be a 12-digit AWS account ID, got %q", envExpectedBucketOwner, owner)
+	}
+	return owner, nil
+}
+
+// expectedBucketOwnerAPIOption stamps the bucket-owner condition onto
+// EVERY request this client emits — the same structurally all-or-nothing
+// client seam as internal/blob (a future call site cannot forget to
+// thread it). The Build step runs after serialization and before SigV4
+// signing, so the header is signed. New's derived no-retry client copies
+// the source client's options, so the middleware survives re-derivation.
+func expectedBucketOwnerAPIOption(owner string) func(*middleware.Stack) error {
+	assertf(awsAccountIDPattern.MatchString(owner), "expectedBucketOwnerAPIOption(%q)", owner)
+	return func(stack *middleware.Stack) error {
+		return stack.Build.Add(middleware.BuildMiddlewareFunc("s3walExpectedBucketOwner",
+			func(ctx context.Context, in middleware.BuildInput, next middleware.BuildHandler) (middleware.BuildOutput, middleware.Metadata, error) {
+				req, ok := in.Request.(*smithyhttp.Request)
+				assertf(ok, "expected-bucket-owner middleware: request type %T", in.Request)
+				req.Header.Set(expectedOwnerHeader, owner)
+				return next.HandleBuild(ctx, in)
+			}), middleware.After)
+	}
+}
+
 // Dial opens an s3wal store URL and returns the conditional CAS client for
 // its bucket, with the manifest seq watermark armed:
 //
@@ -93,8 +150,11 @@ func (c *Client) Close() {
 // The URL grammar mirrors blob.OpenS3 (bucket = host, endpoint/region =
 // query, credentials from the standard AWS env chain, path-style always on
 // for self-hosted stores); the legacy s3ForcePathStyle query key is
-// accepted and ignored for symmetry. Dial performs no network I/O — probe
-// and reachability run at InitSchema (ADR-12: Open never runs DDL).
+// accepted and ignored for symmetry. The optional expected-bucket-owner
+// enforcement comes from envExpectedBucketOwner — the same knob as
+// internal/blob, and a malformed value is boot-fatal here too. Dial
+// performs no network I/O — probe and reachability run at InitSchema
+// (ADR-12: Open never runs DDL).
 func Dial(ctx context.Context, rawURL string) (*Client, error) {
 	assertf(rawURL != "", "Dial: empty s3wal URL")
 	u, err := url.Parse(rawURL)
@@ -107,6 +167,10 @@ func Dial(ctx context.Context, rawURL string) (*Client, error) {
 	bucket := u.Host
 	if bucket == "" {
 		return nil, fmt.Errorf("s3wal URL has no bucket name")
+	}
+	expectedOwner, err := expectedBucketOwnerFromEnv()
+	if err != nil {
+		return nil, err
 	}
 	q := u.Query()
 	region := q.Get("region")
@@ -131,6 +195,9 @@ func Dial(ctx context.Context, rawURL string) (*Client, error) {
 			o.BaseEndpoint = aws.String(ep)
 		}
 		o.UsePathStyle = true
+		if expectedOwner != "" {
+			o.APIOptions = append(o.APIOptions, expectedBucketOwnerAPIOption(expectedOwner))
+		}
 	})
 	c := New(s3c, bucket)
 	c.DecodeSeq = DecodeSeq

@@ -13,6 +13,7 @@ One test suite, two storage stacks. Which stack a test run uses is decided in
 |---|---|---|---|
 | **Default (`pg`)** | `go test ./... -count=1 -race -timeout=30m` | Postgres 17 + SeaweedFS, booted per run via [testcontainers](https://golang.testcontainers.org/) | Docker, git, git-lfs |
 | **Local** | `CODESTORAGE_TEST_BACKEND=local go test ./internal/githttp -count=1 -race -timeout=15m` | SQLite (`sqlite://`) + plain-file blobs (`file://`) | git, git-lfs — **no Docker** |
+| **s3wal** | `CODESTORAGE_TEST_BACKEND=s3wal go test ./internal/githttp -count=1 -race -timeout=25m` | ONE SeaweedFS bucket carrying refs + metadata (`s3wal://`, the `_wal/` prefix) AND the blobs (`s3://`) — the zero-infra topology (ADR-46), plus its lane-only drills (restart-from-bucket-only, dual-serve refusal) | Docker, git, git-lfs |
 | **Backend fan-out** | part of the default lane | `internal/api`, `internal/meta`, and `internal/ref` run every integration/conformance test twice, as `/pg` and `/sqlite` subtests | Docker (for the `/pg` half) |
 
 These are exactly the CI jobs in
@@ -21,8 +22,11 @@ default lane, `test-local` runs the local lane, and `lint` / `image` complete
 the required set. CI asserts `git lfs version` up front so a missing LFS client
 fails the job instead of silently skipping LFS coverage.
 
-`CODESTORAGE_TEST_BACKEND` accepts `pg` (or unset) and `local`; anything else
-panics in `TestMain` (`internal/githttp/e2e_test.go`). The `internal/githttp`
+`CODESTORAGE_TEST_BACKEND` accepts `pg` (or unset), `local`, and `s3wal`; anything
+else panics in `TestMain` (`internal/githttp/e2e_test.go`). On the s3wal lane the
+suite's nodes run with the instance lease disabled (`CODESTORAGE_S3WAL_LEASE_TTL=0`)
+because the shared-bucket multi-node tests are exactly the topology the lease refuses;
+the dual-serve drill re-enables it explicitly. The `internal/githttp`
 e2e harness builds the real `codestorage` binary, boots the chosen backends,
 starts server nodes as subprocesses, and drives them with plain `git`, `curl`-level
 HTTP, and a real `git lfs` client.

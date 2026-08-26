@@ -11,6 +11,24 @@ import (
 	upsync "github.com/coder/code-storage/internal/sync"
 )
 
+// TestIsPGURLRoutesS3WALToLocalQueue pins the jobs routing contract for
+// the zero-infra mode (issue #133 Phase 3): buildServeEventing constructs
+// the River queue only for postgres URLs, so s3wal:// must land on the
+// in-process local queue and the background tickers — River's DDL and
+// LISTEN/NOTIFY have no substrate on a bucket.
+func TestIsPGURLRoutesS3WALToLocalQueue(t *testing.T) {
+	for url, want := range map[string]bool{
+		"postgres://u@h/db":                             true,
+		"postgresql://u@h/db":                           true,
+		"sqlite:///tmp/x.db":                            false,
+		"s3wal://bucket?endpoint=http://127.0.0.1:8333": false,
+	} {
+		if got := isPGURL(url); got != want {
+			t.Errorf("isPGURL(%q) = %v, want %v", url, got, want)
+		}
+	}
+}
+
 // forwardPokeStore backs enqueueSyncOrForward tests: one canned upstream
 // row plus a recording RequestPush; everything else inherits failingStore's
 // panics so unexpected store traffic fails loudly.

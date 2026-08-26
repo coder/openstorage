@@ -163,10 +163,12 @@ type Backend interface {
 //
 //	postgres:// or postgresql://  → OpenPG
 //	sqlite:///abs/path/db.sqlite  → pure-Go SQLite store
+//	s3wal://bucket?endpoint=…     → single-object CAS store over conditional S3
 //
 // Open never runs InitSchema: hooks reconstruct stores from env URLs and
-// must not run DDL — the serve/wire seam owns schema init. Options
-// (WithSecretsCodec) apply to either backend.
+// must not run DDL — the serve/wire seam owns schema init (for s3wal that
+// means the conditional-write probe). Options (WithSecretsCodec) apply to
+// any backend.
 func Open(ctx context.Context, dbURL string, opts ...Option) (Backend, error) {
 	assertf(dbURL != "", "Open: empty metadata store URL")
 	u, err := url.Parse(dbURL)
@@ -178,7 +180,9 @@ func Open(ctx context.Context, dbURL string, opts ...Option) (Backend, error) {
 		return OpenPG(ctx, dbURL, opts...)
 	case "sqlite":
 		return OpenSQLite(ctx, dbURL, opts...)
+	case "s3wal":
+		return OpenS3WAL(ctx, dbURL, opts...)
 	default:
-		return nil, fmt.Errorf("metadata store URL scheme %q unsupported (want postgres, postgresql, or sqlite)", u.Scheme)
+		return nil, fmt.Errorf("metadata store URL scheme %q unsupported (want postgres, postgresql, sqlite, or s3wal)", u.Scheme)
 	}
 }
