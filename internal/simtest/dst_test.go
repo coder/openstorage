@@ -54,6 +54,7 @@ func TestDSTFast(t *testing.T) {
 		t.Run(string(backend), func(t *testing.T) {
 			crashSteals, pushCrashSteals, pushForcedRescues, casFaults := 0, 0, 0, 0
 			casCalls := make(map[string]int)
+			casFaultOps := make(map[string]int)
 			for _, seed := range []uint64{1, 2, 3} {
 				res, err := Run(Config{Seed: seed, Steps: 120, RefBackend: backend})
 				if err != nil {
@@ -71,6 +72,9 @@ func TestDSTFast(t *testing.T) {
 				casFaults += res.CASFaults
 				for op, n := range res.OpCounts {
 					casCalls[op] += n
+				}
+				for op, n := range res.CASFaultOps {
+					casFaultOps[op] += n
 				}
 			}
 			// The sync claim-lease lane must not be vacuous either: across the
@@ -101,13 +105,19 @@ func TestDSTFast(t *testing.T) {
 				t.Errorf("cas.* transport faults on the SQLite lane: %d", casFaults)
 			}
 			// Per-op coverage: every advertised cas.* fault-plan surface
-			// must actually be CALLED on the s3wal lane — cas.List in
-			// particular only flows through the node-routed reservation
-			// sweep (Codex round 2 on PR #159).
+			// must be CALLED — cas.List in particular only flows through
+			// the node-routed reservation sweep (Codex round 2 on PR
+			// #159) — and must FIRE at least once, which the
+			// deterministic seedCASFaultFloor one-shots guarantee per
+			// run; an aggregate-only fault guard would pass with a
+			// surface's failure path disabled (Codex round 3).
 			if backend == RefBackendS3WAL {
 				for _, op := range []string{OpCASGet, OpCASCreate, OpCASAdvance, OpCASList} {
 					if casCalls[op] == 0 {
 						t.Errorf("no %s calls across the fast seeds: that fault-plan surface is vacuous", op)
+					}
+					if casFaultOps[op] == 0 {
+						t.Errorf("no %s faults fired across the fast seeds: that failure path is untested", op)
 					}
 				}
 			}

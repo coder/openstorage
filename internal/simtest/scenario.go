@@ -99,8 +99,11 @@ type Result struct {
 	// CASFaults is the subset of Faults injected at the s3wal
 	// conditional-store transport layer (cas.* ops; zero on the SQLite
 	// backend) — the vacuity guard for the Phase 2 fault plan.
-	CASFaults int
-	Steals    int // expired sync claims stolen (issues #86/#88)
+	// CASFaultOps breaks it down per op so every advertised surface can
+	// be required to FIRE, not merely be called.
+	CASFaults   int
+	CASFaultOps map[string]int
+	Steals      int // expired sync claims stolen (issues #86/#88)
 	// CrashSteals is the subset of Steals whose previous holder actually
 	// crashed mid-run (dead-holder class) rather than outliving its lease.
 	CrashSteals int
@@ -140,6 +143,22 @@ func defaultFaultProfile(inj *Injector) {
 	inj.SetProbs(OpCASList, Probs{Clean: 0.01})
 	inj.SetProbs(OpCASCreate, Probs{Clean: 0.01, Ambiguous: 0.03})
 	inj.SetProbs(OpCASAdvance, Probs{Clean: 0.01, Ambiguous: 0.04})
+}
+
+// seedCASFaultFloor queues one deterministic one-shot fault per advertised
+// cas.* surface (s3wal lane only): the probabilistic profile alone cannot
+// guarantee that rare surfaces — cas.List is called only by reservation
+// sweeps, cas.Create only by virgin-manifest writes — exercise their
+// FAILURE paths within a bounded run, and the per-op vacuity guards in
+// TestDSTFast require every surface to fire, not merely be called (Codex
+// round 3 on PR #159). One-shot plans take precedence over probability
+// draws and consume nothing from the PRNG stream, so run determinism and
+// the SQLite lane are untouched.
+func seedCASFaultFloor(inj *Injector) {
+	inj.FailNext(OpCASGet, FaultClean)
+	inj.FailNext(OpCASCreate, FaultAmbiguous)
+	inj.FailNext(OpCASAdvance, FaultAmbiguous)
+	inj.FailNext(OpCASList, FaultClean)
 }
 
 // Scheduler op kinds and weights. The table is fixed (never map-ordered) so
@@ -297,6 +316,9 @@ func Run(cfg Config) (Result, error) {
 
 	inj := NewInjector(cfg.Seed)
 	defaultFaultProfile(inj)
+	if cfg.RefBackend == RefBackendS3WAL {
+		seedCASFaultFloor(inj)
+	}
 	s := &sim{
 		cfg:       cfg,
 		rng:       rand.New(rand.NewPCG(cfg.Seed, 0x5C4E_D01E_5EED_0001)), //nolint:gosec // deterministic scheduler PRNG
@@ -403,9 +425,11 @@ func (s *sim) result() Result {
 		executed = s.cfg.Steps
 	}
 	casFaults := 0
+	casFaultOps := make(map[string]int)
 	for _, ev := range s.inj.Fired() {
 		if strings.HasPrefix(ev.Op, "cas.") {
 			casFaults++
+			casFaultOps[ev.Op]++
 		}
 	}
 	return Result{
@@ -418,6 +442,7 @@ func (s *sim) result() Result {
 		Deliveries:        len(s.cl.rec.all()),
 		Faults:            len(s.inj.Fired()),
 		CASFaults:         casFaults,
+		CASFaultOps:       casFaultOps,
 		Steals:            s.syncSteals,
 		CrashSteals:       s.syncCrashSteals,
 		PushSteals:        s.pushSteals,
