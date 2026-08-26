@@ -440,6 +440,34 @@ func resolveStorageURLs(getenv func(string) string, flagDataDir string) (storage
 	return u, nil
 }
 
+// isS3WALURL reports whether dbURL selects the s3wal zero-infrastructure
+// backend (issue #133): one bucket-hosted CAS store drives BOTH the ref and
+// meta stores, dispatched by ref.Open/meta.Open on the same scheme.
+func isS3WALURL(dbURL string) bool {
+	u, err := url.Parse(dbURL)
+	return err == nil && u.Scheme == "s3wal"
+}
+
+// validateZeroInfraPairing enforces the s3wal storage topology: the mode's
+// whole premise is that the bucket is the SOLE durable authority (a cold
+// process reconstructs full service from the bucket alone), so the blob
+// store must be s3:// too — a file:// blob store would silently
+// reintroduce a local-disk authority that a restart-from-bucket-only
+// cannot reconstruct. The same bucket for both URLs is the expected
+// topology: the packs/, lfs/, and _wal/ key prefixes coexist without
+// overlap (docs/plans/s3wal-plan.md §2.1).
+func validateZeroInfraPairing(dbURL, blobURL string) error {
+	if !isS3WALURL(dbURL) {
+		return nil
+	}
+	assertf(blobURL != "", "validateZeroInfraPairing: empty blobURL (caller checks first)")
+	u, err := url.Parse(blobURL)
+	if err != nil || u.Scheme != "s3" {
+		return fmt.Errorf("s3wal database URL requires an s3:// blob URL (zero-infra mode: the bucket is the sole durable authority, so %s must not point at local disk; the s3wal bucket itself is the expected target), got %q", envBlobURL[0], blobURL)
+	}
+	return nil
+}
+
 // errDBURLRequired/errBlobURLRequired are the shared missing-slot errors so
 // every subcommand names the same remediation (env URL or local mode).
 func errDBURLRequired() error {
@@ -476,6 +504,9 @@ func resolveServeConfig(getenv func(string) string, flagListen, flagAddr, flagCa
 	}
 	if cfg.blobURL == "" {
 		return serveConfig{}, errBlobURLRequired()
+	}
+	if err := validateZeroInfraPairing(cfg.dbURL, cfg.blobURL); err != nil {
+		return serveConfig{}, err
 	}
 	if cfg.org == "" || cfg.orgKeysPath == "" {
 		return serveConfig{}, fmt.Errorf("%s and %s must both be set (single-org serve mode)", envOrg, envOrgPubKeys)

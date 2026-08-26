@@ -73,7 +73,21 @@ func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL, loopbackBaseU
 	assertf(dbURL != "" && org != "" && httpBaseURL != "" && len(orgPEMBlocks) > 0, "buildAPIHandler: missing dbURL/org/httpBaseURL/keys")
 	assertf(loopbackBaseURL != "", "buildAPIHandler: missing loopbackBaseURL")
 	assertf(refStore != nil && blobStore != nil && cacheDir != "", "buildAPIHandler: missing refStore/blobStore/cacheDir")
-	ms, msCleanup, err := openMetaStore(ctx, dbURL, secretsCodec)
+	// §2.8 sync-claim write-through (zero-infra mode, issue #133): the
+	// s3wal meta backend mirrors inbound sync-claim transitions into the
+	// base repo group's ref manifest so a fenced CASRef checks the holder
+	// in the very object it CASes. One URL drives both stores, so the ref
+	// store is *ref.S3WAL exactly when the meta scheme is s3wal — the type
+	// assertion IS the wiring condition. Hook subprocesses need no sink:
+	// they only READ the fence (enforceSyncClaimFence's GetRepoUpstream
+	// plus the fenced CASRef against the manifest token) — TryBeginSync/
+	// FinishSync, the only sink writers, run exclusively in this serve
+	// process's sync worker (local-queue mode; River requires pg).
+	var metaOpts []meta.Option
+	if s3, ok := refStore.(*ref.S3WAL); ok {
+		metaOpts = append(metaOpts, meta.WithSyncClaimSink(s3))
+	}
+	ms, msCleanup, err := openMetaStore(ctx, dbURL, secretsCodec, metaOpts...)
 	if err != nil {
 		return nil, nil, nil, nil, nil, err
 	}
@@ -459,9 +473,10 @@ func bootstrapOrgAuth(ctx context.Context, ms meta.Store, org string, orgPEMBloc
 // buildAPIHandler) and the signing-key CLI, which talks to the database
 // directly — there is no HTTP surface for the signing-key registry
 // (docs/reference/authentication.md: upstream manages keys in its dashboard).
-func openMetaStore(ctx context.Context, dbURL string, secretsCodec *secrets.Codec) (meta.Store, func(), error) {
+// extra options (serve's §2.8 sync-claim sink) apply on top of the codec.
+func openMetaStore(ctx context.Context, dbURL string, secretsCodec *secrets.Codec, extra ...meta.Option) (meta.Store, func(), error) {
 	assertf(dbURL != "", "openMetaStore: empty dbURL")
-	ms, err := meta.Open(ctx, dbURL, meta.WithSecretsCodec(secretsCodec))
+	ms, err := meta.Open(ctx, dbURL, append([]meta.Option{meta.WithSecretsCodec(secretsCodec)}, extra...)...)
 	if err != nil {
 		return nil, nil, fmt.Errorf("open metadata store: %w", err)
 	}

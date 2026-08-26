@@ -48,6 +48,63 @@ func TestEnvFirstPrecedence(t *testing.T) {
 	}
 }
 
+// TestResolveServeConfigZeroInfraPairing (issue #133 Phase 3): an s3wal
+// database URL demands an s3:// blob URL — the zero-infra premise is that
+// the bucket is the sole durable authority, so a file:// blob store (or a
+// data-dir derived one) would silently reintroduce a local-disk authority
+// that a restart-from-bucket-only cannot reconstruct. The same bucket for
+// both URLs is the expected topology (packs/, lfs/, _wal/ coexist).
+func TestResolveServeConfigZeroInfraPairing(t *testing.T) {
+	base := map[string]string{
+		"CODESTORAGE_ORG":         "org1",
+		"CODESTORAGE_ORG_PUBKEYS": "/tmp/org.pub.pem",
+		"CODESTORAGE_PG_URL":      "s3wal://bkt?endpoint=http://127.0.0.1:8333&region=us-east-1",
+	}
+	t.Run("file blob refused", func(t *testing.T) {
+		env := map[string]string{"CODESTORAGE_S3_URL": "file:///var/blobs"}
+		for k, v := range base {
+			env[k] = v
+		}
+		_, err := resolveServeConfig(mapEnv(env), "", "127.0.0.1:0", "/tmp/cache", "")
+		if err == nil || !strings.Contains(err.Error(), "s3://") {
+			t.Fatalf("s3wal + file:// blob store must refuse with the zero-infra pairing error, got %v", err)
+		}
+	})
+	t.Run("data-dir derived file blob refused", func(t *testing.T) {
+		env := map[string]string{}
+		for k, v := range base {
+			env[k] = v
+		}
+		// --data-dir fills the empty blob slot with file://…/blobs; the
+		// pairing rule must catch the derived URL too.
+		if _, err := resolveServeConfig(mapEnv(env), "", "127.0.0.1:0", "/tmp/cache", t.TempDir()); err == nil {
+			t.Fatal("s3wal + data-dir-derived file:// blob store resolved — local disk sneaks back in as an authority")
+		}
+	})
+	t.Run("s3 blob accepted", func(t *testing.T) {
+		env := map[string]string{"CODESTORAGE_S3_URL": "s3://bkt?endpoint=http://127.0.0.1:8333"}
+		for k, v := range base {
+			env[k] = v
+		}
+		cfg, err := resolveServeConfig(mapEnv(env), "", "127.0.0.1:0", "/tmp/cache", "")
+		if err != nil {
+			t.Fatalf("s3wal + s3:// (same bucket) must resolve: %v", err)
+		}
+		if !isS3WALURL(cfg.dbURL) {
+			t.Fatalf("isS3WALURL(%q) = false", cfg.dbURL)
+		}
+	})
+	t.Run("non-s3wal untouched", func(t *testing.T) {
+		env := map[string]string{
+			"CODESTORAGE_ORG":         "org1",
+			"CODESTORAGE_ORG_PUBKEYS": "/tmp/org.pub.pem",
+		}
+		if _, err := resolveServeConfig(mapEnv(env), "", "127.0.0.1:0", "/tmp/cache", t.TempDir()); err != nil {
+			t.Fatalf("local mode (sqlite + file) must keep resolving: %v", err)
+		}
+	})
+}
+
 // TestResolveServeConfigCompatForbidsDestructiveLFSSweep (Codex round
 // 101, P1): the write-compat flag declares a mixed v0.2.0 fleet — and
 // during that roll, DESTRUCTIVE LFS sweeping must be off fleet-wide: the
