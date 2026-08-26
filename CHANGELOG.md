@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.12.0](https://github.com/coder/code-storage/compare/v0.11.1...v0.12.0) (2026-08-26)
+
+
+### Features
+
+* **blob:** SeaweedFS replaces MinIO as the tested self-hosted S3 store ([#145](https://github.com/coder/code-storage/issues/145)) ([0eb03e0](https://github.com/coder/code-storage/commit/0eb03e06fb42a685a75596fa2133af169ace295c))
+
 ## [0.11.1](https://github.com/coder/code-storage/compare/v0.11.0...v0.11.1) (2026-08-26)
 
 
