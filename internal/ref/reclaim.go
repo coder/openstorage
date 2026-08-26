@@ -19,10 +19,13 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-// lfsRefundBucketPage bounds one settlement's bucket listing: the
-// population is bases-with-pending-refunds × sweep epochs between
-// settlements, drained every reclaimer pass.
-const lfsRefundBucketPage = 1024
+// lfsRefundBucketPage bounds one settlement PAGE of the bucket listing;
+// settlement keyset-pages through the whole per-repo keyspace (Codex
+// round 35 on PR #132). The population is sweep epochs with retirements
+// between settlements — operator-bounded — and drained every reclaimer
+// pass. A var so tests can exercise the paging without minting a
+// thousand epochs.
+var lfsRefundBucketPage = 1024
 
 // LFSObjectRow is one registered LFS object as the reclamation scan sees it:
 // the row key (canonical or v0.2.0 legacy spelling), its counted bytes, and
@@ -393,63 +396,76 @@ func (s *PG) SettleLFSRefunds(ctx context.Context, repo string) (SettledLFSRefun
 			payload string
 			epoch   int64
 		}
-		var buckets []bucketRow
-		rows, err := tx.Query(ctx, `
+		var refundRows, refundBytes int64
+		// Keyset-page the WHOLE per-repo bucket keyspace (Codex round 35):
+		// scopes are epoch-ordered, so a single fixed page could pin the
+		// scan on old buckets whose legacy halves cannot settle (legacy
+		// reaping disabled after repeated failures) while newer
+		// canonical-only buckets waited past the limit forever. Settled
+		// buckets vanish and stuck ones accumulate at most one per
+		// destructive-sweep epoch, so the walk stays operator-bounded.
+		for after := prefix; ; {
+			var buckets []bucketRow
+			rows, err := tx.Query(ctx, `
 SELECT scope, payload, generation FROM job_scan_state
-WHERE job = $1 AND left(scope, length($2)) = $2
-ORDER BY scope COLLATE "C" ASC LIMIT $3`,
-			ScanJobLFSReclaim, prefix, lfsRefundBucketPage)
-		if err != nil {
-			return err
-		}
-		for rows.Next() {
-			var b bucketRow
-			if err := rows.Scan(&b.scope, &b.payload, &b.epoch); err != nil {
-				rows.Close()
+WHERE job = $1 AND left(scope, length($2)) = $2 AND scope COLLATE "C" > $3
+ORDER BY scope COLLATE "C" ASC LIMIT $4`,
+				ScanJobLFSReclaim, prefix, after, lfsRefundBucketPage)
+			if err != nil {
 				return err
 			}
-			buckets = append(buckets, b)
-		}
-		rows.Close()
-		if err := rows.Err(); err != nil {
-			return err
-		}
-		var refundRows, refundBytes int64
-		for _, b := range buckets {
-			var bucket LFSRefundBucket
-			if err := json.Unmarshal([]byte(b.payload), &bucket); err != nil {
-				return fmt.Errorf("undecodable refund bucket %s: %w", b.scope, err)
-			}
-			settled := false
-			if b.epoch < canonEpoch && (bucket.Rows > 0 || bucket.Bytes > 0) {
-				refundRows, refundBytes = refundRows+bucket.Rows, refundBytes+bucket.Bytes
-				bucket.Rows, bucket.Bytes = 0, 0
-				settled = true
-			}
-			if b.epoch < legacyEpoch && (bucket.LegacyRows > 0 || bucket.LegacyBytes > 0) {
-				refundRows, refundBytes = refundRows+bucket.LegacyRows, refundBytes+bucket.LegacyBytes
-				bucket.LegacyRows, bucket.LegacyBytes = 0, 0
-				settled = true
-			}
-			switch {
-			case bucket == (LFSRefundBucket{}):
-				if _, err := tx.Exec(ctx,
-					`DELETE FROM job_scan_state WHERE job = $1 AND scope = $2`,
-					ScanJobLFSReclaim, b.scope); err != nil {
+			for rows.Next() {
+				var b bucketRow
+				if err := rows.Scan(&b.scope, &b.payload, &b.epoch); err != nil {
+					rows.Close()
 					return err
 				}
-			case settled:
-				merged, mErr := json.Marshal(bucket)
-				assertf(mErr == nil, "settle lfs refunds: marshal bucket: %v", mErr)
-				if _, err := tx.Exec(ctx,
-					`UPDATE job_scan_state SET payload = $3, updated_at = now() WHERE job = $1 AND scope = $2`,
-					ScanJobLFSReclaim, b.scope, string(merged)); err != nil {
-					return err
-				}
-				out.Pending++
-			default:
-				out.Pending++
+				buckets = append(buckets, b)
 			}
+			rows.Close()
+			if err := rows.Err(); err != nil {
+				return err
+			}
+			for _, b := range buckets {
+				var bucket LFSRefundBucket
+				if err := json.Unmarshal([]byte(b.payload), &bucket); err != nil {
+					return fmt.Errorf("undecodable refund bucket %s: %w", b.scope, err)
+				}
+				settled := false
+				if b.epoch < canonEpoch && (bucket.Rows > 0 || bucket.Bytes > 0) {
+					refundRows, refundBytes = refundRows+bucket.Rows, refundBytes+bucket.Bytes
+					bucket.Rows, bucket.Bytes = 0, 0
+					settled = true
+				}
+				if b.epoch < legacyEpoch && (bucket.LegacyRows > 0 || bucket.LegacyBytes > 0) {
+					refundRows, refundBytes = refundRows+bucket.LegacyRows, refundBytes+bucket.LegacyBytes
+					bucket.LegacyRows, bucket.LegacyBytes = 0, 0
+					settled = true
+				}
+				switch {
+				case bucket == (LFSRefundBucket{}):
+					if _, err := tx.Exec(ctx,
+						`DELETE FROM job_scan_state WHERE job = $1 AND scope = $2`,
+						ScanJobLFSReclaim, b.scope); err != nil {
+						return err
+					}
+				case settled:
+					merged, mErr := json.Marshal(bucket)
+					assertf(mErr == nil, "settle lfs refunds: marshal bucket: %v", mErr)
+					if _, err := tx.Exec(ctx,
+						`UPDATE job_scan_state SET payload = $3, updated_at = now() WHERE job = $1 AND scope = $2`,
+						ScanJobLFSReclaim, b.scope, string(merged)); err != nil {
+						return err
+					}
+					out.Pending++
+				default:
+					out.Pending++
+				}
+			}
+			if len(buckets) < lfsRefundBucketPage {
+				break
+			}
+			after = buckets[len(buckets)-1].scope
 		}
 		if refundRows > 0 || refundBytes > 0 {
 			if _, err := tx.Exec(ctx,

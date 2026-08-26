@@ -4,6 +4,7 @@ package ref
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"testing"
@@ -244,6 +245,69 @@ func TestLFSReclaim_RefundDeferredUntilPostRetirementSweep(t *testing.T) {
 		}
 		if st := k.state(); st.UsageBytes != 0 {
 			t.Fatalf("final usage = %d, want 0", st.UsageBytes)
+		}
+	})
+}
+
+// seedRefundBucket plants one refund bucket row directly — the shape
+// RetireUnreferencedLFSObject parks (payload JSON, generation = epoch).
+func seedRefundBucket(t *testing.T, rs lfsReclaimStore, base string, epoch int64, bucket LFSRefundBucket) {
+	t.Helper()
+	payload, err := json.Marshal(bucket)
+	if err != nil {
+		t.Fatalf("marshal bucket: %v", err)
+	}
+	if err := rs.PutJobScanState(context.Background(), ScanJobLFSReclaim, ScanScopeReclaimRefund(base, epoch), string(payload), epoch); err != nil {
+		t.Fatalf("seed bucket e%d: %v", epoch, err)
+	}
+}
+
+// TestLFSReclaim_SettleRefundsPagesPastStuckBuckets (Codex round 35 on
+// PR #132, P2): bucket scopes are epoch-ordered, so a settlement that
+// examined only one fixed first page could pin itself on old buckets
+// whose legacy halves cannot settle (legacy reaping disabled after
+// failures) while newer canonical-only buckets past the limit stayed
+// charged forever, wedging uploads. Settlement must keyset-page the
+// whole per-repo keyspace.
+func TestLFSReclaim_SettleRefundsPagesPastStuckBuckets(t *testing.T) {
+	old := lfsRefundBucketPage
+	lfsRefundBucketPage = 2
+	t.Cleanup(func() { lfsRefundBucketPage = old })
+	runRefBackends(t, func(t *testing.T, s Store) {
+		rs := reclaimStore(t, s)
+		ctx := context.Background()
+		k := newLedgerKit(t, s)
+		// Counters the newer bucket's refund is observed against.
+		for _, b := range []string{"aa", "bb"} {
+			if err := s.RegisterLFSObject(ctx, k.base(), canonicalLFSKey(k.base(), b), 100); err != nil {
+				t.Fatal(err)
+			}
+		}
+		// Pin known epochs: canon = legacy = e after this pair.
+		e := advanceReapEpochAndComplete(t, rs, true)
+		// Three STUCK buckets (legacy halves at epochs >= the legacy
+		// completion, which never advances again), sorting BEFORE one
+		// newer canonical-only bucket. Page size 2: the old scan would
+		// only ever see the first two stuck buckets.
+		for i := int64(0); i < 3; i++ {
+			seedRefundBucket(t, rs, k.base(), e+i, LFSRefundBucket{LegacyRows: 1, LegacyBytes: 10})
+		}
+		seedRefundBucket(t, rs, k.base(), e+3, LFSRefundBucket{Rows: 2, Bytes: 200})
+		// Four canonical-only sweeps: canon reaches e+4 > e+3, legacy
+		// stays at e.
+		for i := 0; i < 4; i++ {
+			advanceReapEpochAndComplete(t, rs, false)
+		}
+
+		settled, err := rs.SettleLFSRefunds(ctx, k.base())
+		if err != nil || settled.Rows != 2 || settled.Bytes != 200 || settled.Pending != 3 {
+			t.Fatalf("paged settle = (%+v, %v), want the newer canonical bucket released past the stuck pages", settled, err)
+		}
+		if n, err := s.CountLFSObjects(ctx, k.base()); err != nil || n != 0 {
+			t.Fatalf("count after settle = (%d, %v), want 0", n, err)
+		}
+		if st := k.state(); st.UsageBytes != 0 {
+			t.Fatalf("usage after settle = %d, want 0", st.UsageBytes)
 		}
 	})
 }
