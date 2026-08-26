@@ -305,9 +305,10 @@ type AbsenceReconciler struct {
 	proofCap int
 	// renewalSafeAge bounds how old the renewal-health watermark may be
 	// for a renewal FAILURE to stay provably harmless: coverTTL minus
-	// the scheduling interval minus the pass wall clock, so covers
-	// outlive even a fully wasted attempt until the next one (Codex
-	// round 27). A failure past the bound arms the admission fence.
+	// the scheduling interval minus TWICE the pass wall clock — one
+	// pass for the wasted attempt until the next touch (Codex round
+	// 27), one for the stamp trailing the touch it records (Codex
+	// round 38, security). A failure past the bound arms the fence.
 	renewalSafeAge time.Duration
 
 	// Per-pass scratch, loaded from durable state at Run start and parked
@@ -558,15 +559,23 @@ func NewAbsenceReconciler(registry AbsenceRegistry, blobs BlobStatter, quotaEnfo
 	// successful touch is fresh enough that covers survive until the
 	// NEXT attempt even if this one accomplished nothing: the next
 	// touch lands within interval (cadence) + passTimeout (a coalesced
-	// tick waiting out a running pass) of the failure, so the bound is
-	// TTL minus both (Codex round 27: bounding by the current pass
-	// alone left a gap — at the documented maximum interval of TTL/2 a
-	// failure at age TTL/2 stayed unfenced, and by the next attempt
-	// the covers were already past the TTL, where the strict-TTL bulk
-	// touch cannot resurrect them).
-	renewalSafeAge := coverTTL - interval - passTimeout
-	assertf(renewalSafeAge > 0,
-		"NewAbsenceReconciler: interval %v + pass timeout %v must stay below cover TTL %v", interval, passTimeout, coverTTL)
+	// tick waiting out a running pass) of the failure (Codex round 27:
+	// bounding by the current pass alone left a gap — at the documented
+	// maximum interval of TTL/2 a failure at age TTL/2 stayed unfenced,
+	// and by the next attempt the covers were already past the TTL,
+	// where the strict-TTL bulk touch cannot resurrect them). The
+	// watermark additionally TRAILS the touch it records by up to one
+	// more pass (Codex round 38, security — the failure-path twin of
+	// the success path's cursorStaleAge, round 32: the touch and the
+	// stamp are separate statements under the pass deadline, so the
+	// observed age under-reports the covers' true age by up to
+	// passTimeout). The bound subtracts all three. At the documented
+	// configuration maximum (interval TTL/2, pass wall clock TTL/4) it
+	// collapses to zero and EVERY failure arms — the honest answer:
+	// no failure is provably harmless there.
+	renewalSafeAge := coverTTL - interval - 2*passTimeout
+	assertf(renewalSafeAge >= 0,
+		"NewAbsenceReconciler: interval %v + twice the pass timeout %v must not exceed cover TTL %v", interval, passTimeout, coverTTL)
 	return &AbsenceReconciler{
 		registry:       registry,
 		blobs:          blobs,
@@ -977,7 +986,8 @@ func (r *AbsenceReconciler) saveProofs(sctx context.Context, errs *boundedErrs) 
 // bulk-renewal failure can no longer be proven harmless (Codex round 26,
 // security): if the renewal-health watermark is absent or older than the
 // cover-lapse safety bound (renewalSafeAge — TTL minus the cadence to
-// the next attempt minus the pass wall clock, Codex round 27),
+// the next attempt minus twice the pass wall clock: the wasted attempt,
+// Codex round 27, and the stamp trailing its touch, round 38),
 // live covers may lapse un-renewed before the next successful pass, and
 // strict-TTL admission queries would silently under-count them —
 // reopening the exact quota headroom the covers exist to close. The

@@ -1123,6 +1123,39 @@ func TestAbsenceReconcile_SafetyBoundCoversNextCadence(t *testing.T) {
 	}
 }
 
+// TestAbsenceReconcile_SafetyBoundCoversTouchToStampLag (Codex round 38,
+// security — the failure-path twin of round 32's success-path bound):
+// the health watermark stamps up to a pass AFTER the touch it records
+// (separate statements under the pass deadline), so the observed age
+// under-reports the covers' true age by up to the pass wall clock. A
+// failure accepted just inside a cadence-only bound could let covers
+// expire before the next attempt, letting finite writes reserve against
+// the deflated floor; the bound must subtract the lag too.
+func TestAbsenceReconcile_SafetyBoundCoversTouchToStampLag(t *testing.T) {
+	f := newSweepFixture(t)
+	ctx := context.Background()
+	reg := absenceRegistry(t, f)
+	if err := reg.PutJobScanState(ctx, ref.ScanJobAbsence, ref.ScanScopeAbsenceRenewalHealth, "", 0); err != nil {
+		t.Fatal(err)
+	}
+	// coverTTL 8s → pass wall clock 2s; interval 2s → cadence-only
+	// bound 4s, lag-aware bound 2s. An age of ~3s is fresh under the
+	// cadence-only bound but PAST the lag-aware one: the recorded touch
+	// may have run a full pass before the stamp, so the covers can
+	// already be ~5s old, and the next attempt lands up to
+	// interval+pass = 4s out — past the 8s TTL, where the strict-TTL
+	// bulk touch cannot resurrect them.
+	time.Sleep(3 * time.Second)
+	ft := &failTouchRegistry{AbsenceRegistry: reg, fail: true}
+	r := NewAbsenceReconciler(ft, f.blobs, true, 100, 8*time.Second, 2*time.Second, slog.New(slog.DiscardHandler))
+	if _, err := r.Run(ctx); err == nil {
+		t.Fatal("Run: want the injected renewal failure reported")
+	}
+	if _, ok, err := reg.GetJobScanState(ctx, ref.ScanJobAbsence, ref.ScanScopeAbsenceAdmissionFence); err != nil || !ok {
+		t.Fatalf("fence after lag-window failure = (ok=%v, %v), want armed", ok, err)
+	}
+}
+
 // TestAbsenceReconcile_StaleRenewalFailureFencesAdmission (Codex round
 // 26, security): a renewal failure with NO health watermark (or a stale
 // one) may let TTL'd covers lapse un-renewed — strict-TTL admission
