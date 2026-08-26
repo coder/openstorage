@@ -14,8 +14,9 @@ never a silently-applied default.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| [`CODESTORAGE_PG_URL`](#codestorage_pg_url) | — (required*) | Database URL: refs + metadata (`postgres://`, `postgresql://`, or `sqlite://`) |
+| [`CODESTORAGE_PG_URL`](#codestorage_pg_url) | — (required*) | Database URL: refs + metadata (`postgres://`, `postgresql://`, `sqlite://`, or the experimental `s3wal://`) |
 | [`CODESTORAGE_S3_URL`](#codestorage_s3_url) | — (required*) | Pack storage URL (`s3://` or `file://`) |
+| [`CODESTORAGE_S3WAL_LEASE_TTL`](#codestorage_s3wal_lease_ttl) | `2m` | s3wal mode only: instance-lease TTL for the dual-serve guard (`0` disables) |
 | [`CODESTORAGE_S3_EXPECTED_BUCKET_OWNER`](#codestorage_s3_expected_bucket_owner) | unset (disabled) | Assert the bucket-owner AWS account ID on every S3 request |
 | [`CODESTORAGE_DATA_DIR`](#codestorage_data_dir) | — | Local-mode data directory; derives the two URLs above |
 | [`CODESTORAGE_LISTEN`](#codestorage_listen) | `127.0.0.1:0` | Listen address |
@@ -62,13 +63,25 @@ never a silently-applied default.
 Database URL for the ref authority (CAS) and metadata store.
 
 - **Schemes:** `postgres://` or `postgresql://` (production, any number of stateless
-  replicas) or `sqlite://<absolute-path>` (local mode, single node).
+  replicas), `sqlite://<absolute-path>` (local mode, single node), or
+  `s3wal://bucket?endpoint=…&region=…` (**experimental** zero-infra mode, single node:
+  refs and metadata live in conditional-CAS objects under the bucket's `_wal/` prefix —
+  [ADR-46](../adr/046-s3wal-refs-and-metadata-ride-one-conditional-cas-object-per-repo-group.md)).
 - **Legacy aliases** (scanned left to right, first non-empty wins): `SPIKE_PG_URL`, `PG_URL`.
 - **Default:** none. Startup fails unless set explicitly or derived from the data dir
   (`sqlite://<dir>/codestorage.db`).
 - On Postgres, schema setup (including the durable [River](https://riverqueue.com) job
   tables) runs automatically at startup and is advisory-lock-serialized, so concurrently
   booting replicas are safe.
+- **`s3wal://` pairing rule:** the scheme requires an `s3://`
+  [`CODESTORAGE_S3_URL`](#codestorage_s3_url) — `file://` (including the data-dir
+  derivation) is refused at startup, because the mode's whole premise is that the bucket
+  is the *sole* durable authority. Pointing both URLs at the **same bucket** is the
+  expected topology (the `packs/`, `lfs/`, and `_wal/` key prefixes coexist without
+  overlap; the `_wal/` prefix is reserved). Credentials come from the standard AWS env
+  chain; at startup a conditional-write probe refuses any store that does not implement
+  `If-Match`/`If-None-Match` PUTs faithfully (qualified: AWS S3 and SeaweedFS). Jobs run
+  on the in-process queue and tickers, exactly like local mode.
 
 ### `CODESTORAGE_S3_URL`
 
@@ -86,6 +99,27 @@ Immutable pack storage URL, opened through [gocloud.dev](https://gocloud.dev/how
   `AWS_SECRET_ACCESS_KEY`, shared config, instance roles).
 - Delete-mode sweeping interacts with bucket versioning — see
   [`CODESTORAGE_SWEEP_DELETE_ENABLED`](#codestorage_sweep_delete_enabled).
+- With an `s3wal://` database URL this **must** be `s3://` — see the
+  [pairing rule](#codestorage_pg_url); the same bucket is the expected target.
+
+### `CODESTORAGE_S3WAL_LEASE_TTL`
+
+s3wal mode only: the TTL of the `_wal/instance-lease` dual-serve guard
+([ADR-46](../adr/046-s3wal-refs-and-metadata-ride-one-conditional-cas-object-per-repo-group.md)
+§2.11). At startup, serve refuses to run while another process holds a fresh lease on the
+bucket; while running, it heartbeats the lease every TTL/4 and **fail-stops** if the lease
+is stolen or unrenewable — a crashed node's successor can start once the stale lease ages
+past the TTL.
+
+- **Default:** unset — 2 minutes (30-second heartbeats).
+- **Validation:** a [duration](https://pkg.go.dev/time#ParseDuration) of at least `1s` —
+  the derived heartbeat cadence must tolerate ordinary S3 latency jitter — or exactly `0`,
+  which **disables** the lease entirely (a test-suite escape hatch for deliberately
+  running several processes against one bucket; serve warns loudly, and accidental
+  dual-serve topologies then go undetected).
+- The lease is best-effort *detection*: correctness never depends on it (every state
+  change is CAS-serialized regardless), so tuning it can only change how quickly an
+  accidental second writer is noticed. Ignored outside s3wal mode.
 
 ### `CODESTORAGE_S3_EXPECTED_BUCKET_OWNER`
 

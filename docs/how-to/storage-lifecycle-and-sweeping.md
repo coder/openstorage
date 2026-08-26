@@ -28,6 +28,14 @@ One more growth source sits outside this lifecycle: on versioned S3 buckets, **o
 object versions** (the reason destructive sweeping
 [refuses versioned buckets](#s3-bucket-versioning)).
 
+In the experimental zero-infra mode
+([ADR-46](../adr/046-s3wal-refs-and-metadata-ride-one-conditional-cas-object-per-repo-group.md))
+the bucket also carries the **reserved `_wal/` prefix** — the ref/metadata authority
+objects themselves, never blob payloads. They are small, sit outside every class above,
+and are invisible to the sweeper (its listing prefixes are `packs/`, `lfs/`, and
+`sweep/quarantine/`, and its disposal paths fail-fast assert that no `_wal/` key ever
+reaches them). Never write to or delete under `_wal/` yourself.
+
 Also note what does *not* reclaim space: **deleting branches** — repack preserves the
 whole registered object set, so unreachable objects are carried forward by design
 ([why](../explanation/storage-engine.md#why-repack-packs-the-union-not-reachable-objects)) —
@@ -80,7 +88,10 @@ only the repository row itself is retained, stamped as a purge tombstone:
 Both are **irreversible** — there is no restore after a purge. The repository row is
 kept as a permanent tombstone, so the burned `(org, url)` name is **never released**:
 an unexpired token carries the repository URL in its claim and would otherwise
-authorize against a new repository created at that URL. Both also share the
+authorize against a new repository created at that URL. (In s3wal mode the tombstone is
+the repository group's `_wal/repo/<id>` manifest with its terminal `purged_at` fence —
+equally permanent; deleting the object by hand would un-burn the name and reopen exactly
+those races.) Both also share the
 [fleet-upgrade prerequisite](../reference/configuration.md#codestorage_repo_retention):
 every serve replica and hook-running git node must run a fence-aware build before the
 first purge.

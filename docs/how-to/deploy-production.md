@@ -428,3 +428,49 @@ the [storage lifecycle guide](storage-lifecycle-and-sweeping.md).
 | `repack: folded packs` / `repack trigger: scheduled fold` log lines | Repack progress; a repo that triggers but never folds warrants a look |
 | `codestorage hook: pre-receive: repository pack quota exceeded` (client-visible) / `quota: receive-pack … at/over quota` (server log) | Tenants hitting the [pack quota](../reference/configuration.md#codestorage_pack_quota_bytes) |
 | Postgres availability + advisory-lock waits at boot | The database is the single authority; boot hangs show in `pg_locks` |
+
+## Zero-infrastructure mode (experimental): one bucket, one node
+
+Everything above assumes the production topology: Postgres plus a bucket. The
+**experimental** `s3wal://` mode
+([ADR-46](../adr/046-s3wal-refs-and-metadata-ride-one-conditional-cas-object-per-repo-group.md),
+issue [#133](https://github.com/coder/code-storage/issues/133)) removes Postgres *and*
+local disk from the durability story: refs and metadata live in conditional-CAS objects
+under the bucket's reserved `_wal/` prefix, next to the ordinary `packs/` and `lfs/`
+payloads. One S3-compatible bucket is the sole durable authority — kill the process,
+lose the machine, and a fresh node pointed at the bucket reconstructs full service (the
+cache dir stays a rebuildable cache, exactly like every other mode).
+
+```sh
+CODESTORAGE_PG_URL='s3wal://my-bucket?endpoint=https://s3.example.net&region=us-east-1' \
+CODESTORAGE_S3_URL='s3://my-bucket?endpoint=https://s3.example.net&s3ForcePathStyle=true&region=us-east-1' \
+CODESTORAGE_ORG=org1 CODESTORAGE_ORG_PUBKEYS=/etc/codestorage/org.pub.pem \
+codestorage serve --listen 0.0.0.0:8080 --cache-dir /var/cache/codestorage
+```
+
+The same bucket for both URLs is the expected layout; a `file://` blob URL is refused at
+startup ([pairing rule](../reference/configuration.md#codestorage_pg_url)). Never write
+to the `_wal/` prefix yourself, and never point two serve processes at one bucket — the
+[instance lease](../reference/configuration.md#codestorage_s3wal_lease_ttl) exists to
+detect exactly that mistake (startup refusal / fail-stop), best-effort.
+
+**Store requirements.** The mode depends on faithful conditional writes
+(`If-Match` / `If-None-Match: *`). A boot-time probe refuses stores that fail it.
+Qualified: **AWS S3** and **SeaweedFS** (the tested self-hosted reference). MinIO and
+other S3-compatible stores are not qualified for `s3wal://` even where they work fine as
+plain [`CODESTORAGE_S3_URL`](../reference/configuration.md#codestorage_s3_url) blob
+storage. Do not enable bucket versioning or object lock on the bucket.
+
+**Honest scaling boundaries** — this mode trades throughput for zero infrastructure, and
+it is a deliberate single-node design:
+
+| Boundary | Consequence |
+|---|---|
+| One node, ever | No replicas, no failover process — recovery is "start a new node against the bucket". The instance lease detects accidental dual-serve; it does not make it safe. |
+| One CAS point per repository group | Concurrent pushes to the *same* repository serialize on one object; hot-repo write throughput is a handful of ref flips per second, and contention shows up as CAS retries. Different repositories don't contend. |
+| Every ref/metadata operation is an S3 round trip | Latency floors are S3 latency, not local-disk or Postgres latency. Same-region compute is assumed. |
+| Manifest size | A repository group's whole registry lives in one JSON object: soft warning at 4 MiB, new registrations refused at 16 MiB (roughly: thousands of refs + packs + LFS objects per repo, not tens of thousands). |
+| Background jobs are in-process | Like local mode: tickers, no durable River queue; queued local work dies with the process (durable request markers are re-enqueued at boot). |
+
+If any of these bind, use local mode (SQLite on a persistent volume) or the Postgres
+topology above. Small single-tenant deployments — the target — sit far below them.
