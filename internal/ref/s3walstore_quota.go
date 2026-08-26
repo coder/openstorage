@@ -297,11 +297,16 @@ func (s *S3WAL) ReservePackBytes(ctx context.Context, group []string, packs []Pa
 // here — the in-CAS pre-read already denied — so marker PRESENCE is the
 // entire changed-vs-pre-read signal.
 //
-// If armed, the admission CAS-deletes its own just-committed rows, keyed
-// by owner AND op-ID: entries re-reserved, registered, or swept in the
-// meantime no longer match and are left alone, so no foreign attempts or
-// op-IDs are refunded (the ops-ring record of our landed CAS stays — it
-// is bounded ambiguity history, not accounting). The verdict then
+// If armed, the admission CAS-undoes its own just-committed attempts,
+// keyed by owner AND op-ID: entries re-reserved, registered, or swept in
+// the meantime no longer match and are left alone, so no foreign attempts
+// or op-IDs are refunded (the ops-ring record of our landed CAS stays —
+// it is bounded ambiguity history, not accounting). Concurrent identical
+// uploads SHARE one row (each admission increments Attempts while
+// rotating Owner/OpID), so the undo decrements our attempt and deletes
+// only at zero (Codex round 11 on PR #156, security) — deleting outright
+// would strip the earlier in-flight pushes' quota cover and let a
+// post-recovery admission over-commit the quota. The verdict then
 // demotes to the armed fence's fail-closed deny. This restores the PG
 // twin's guarantee shape: every finite admission either fails closed on
 // fence evidence or commits early enough that the post-arm recovery pass
@@ -325,13 +330,20 @@ func (s *S3WAL) s3walRevalidateFence(ctx context.Context, base string, packs []P
 	}
 	err = s.mutate(ctx, base, s3walMutation{
 		op: "revoke fenced reservation",
-		// ID class: re-applying deletes nothing twice, and the
-		// owner+op-ID predicate skips rows anyone else touched since.
+		// ID class: the owner+op-ID predicate skips rows anyone else
+		// touched since, and a surviving row's OpID rotates on the undo
+		// so a CAS re-run of this revocation can never double-decrement
+		// (the re-apply match must die with the first application).
 		fn: func(m *s3wal.Manifest, clk time.Time) (bool, error) {
 			changed := false
 			for _, p := range packs {
 				if r := m.Reservations[p.Key]; r != nil && r.Owner == owner && r.OpID == opID {
-					delete(m.Reservations, p.Key)
+					r.Attempts--
+					if r.Attempts <= 0 {
+						delete(m.Reservations, p.Key)
+					} else {
+						r.OpID = s3wal.NewOpID()
+					}
 					changed = true
 				}
 			}

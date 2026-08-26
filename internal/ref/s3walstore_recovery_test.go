@@ -1536,6 +1536,47 @@ func TestS3WALRecoveryCrossProcessFence(t *testing.T) {
 		}
 	})
 
+	t.Run("revocation preserves earlier shared attempts", func(t *testing.T) {
+		// Codex round 11 on PR #156 (security): concurrent identical
+		// uploads share one reservation row — each admission increments
+		// Attempts and rotates Owner/OpID. Revoking the LATEST attempt
+		// by deleting the row would also strip the earlier in-flight
+		// push's quota cover: after recovery clears the fence, a new
+		// admission could fit before the older publisher registers, and
+		// both then credit usage beyond quota. Undo only our attempt.
+		const base = "r-xfence-shared"
+		mc, a, b := newRecoveryStores(t)
+		if won, err := a.CASRef(ctx, base, branch, ZeroSHA, testSHA(0x11)); err != nil || !won {
+			t.Fatalf("seed ref = (%v, %v)", won, err)
+		}
+		// The earlier identical upload holds the shared row (Attempts=1).
+		if dec, err := a.ReservePackBytes(ctx, []string{base}, pack("k1", 10), "o1", 0, ReserveNoFloorGen, 1000, time.Hour); err != nil || !dec.OK {
+			t.Fatalf("first reserve = (%+v, %v), want granted", dec, err)
+		}
+		armed := false
+		mc.Hooks.AfterPut = func(op, key string) {
+			if armed || key != s3wal.ManifestKey(base) {
+				return
+			}
+			armed = true
+			if err := b.ArmAbsenceAdmissionFence(ctx, "lapse-evidence"); err != nil {
+				t.Errorf("arm during admission: %v", err)
+			}
+		}
+		defer func() { mc.Hooks.AfterPut = nil }()
+		dec, err := a.ReservePackBytes(ctx, []string{base}, pack("k1", 10), "o2", 0, ReserveNoFloorGen, 1000, time.Hour)
+		if err != nil || dec.OK || !dec.RenewalDegraded {
+			t.Fatalf("fenced second reserve = (%+v, %v), want the fail-closed deny", dec, err)
+		}
+		if !armed {
+			t.Fatal("the arming hook never fired")
+		}
+		r := mustManifest(t, a, base).Reservations["k1"]
+		if r == nil || r.Attempts != 1 {
+			t.Fatalf("shared reservation = %+v, want preserved with Attempts=1 (the first pusher's quota cover)", r)
+		}
+	})
+
 	t.Run("fence armed before the admission denies with no write", func(t *testing.T) {
 		const base = "r-xfence-pre"
 		_, a, b := newRecoveryStores(t)
