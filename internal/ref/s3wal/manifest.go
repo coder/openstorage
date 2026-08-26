@@ -313,9 +313,11 @@ func Elapsed(localNow, clk, stamp time.Time) time.Duration {
 //
 // Jumps within the bound are acceptable: the conservative grace floors
 // (§2.4-4) absorb them as noise. Wall jumps predating this process are
-// invisible to both arms; the §2.4-3 S3 Date cross-check is the designed
-// absolute witness for those, and a dead prior process's leases guard no
-// in-flight work under the single-writer decree.
+// invisible to both arms — an AT-BOOT-wrong clock reports ~zero drift
+// and an old manifest clock reads as a quiet repo — so destructive
+// verdicts additionally cross-check the §2.4-3 store-Date witness
+// (DateOK, wired in ref.S3WAL), the absolute clock reading no local
+// trouble can forge.
 func SkewOK(localNow, clk time.Time, wallDrift, ttl time.Duration) bool {
 	assertf(ttl > 0, "SkewOK: non-positive ttl %v", ttl)
 	bound := ttl / 4
@@ -346,6 +348,56 @@ func DriftOK(wallDrift, ttl time.Duration) bool {
 		wallDrift = -wallDrift
 	}
 	return wallDrift <= bound
+}
+
+// DateTolerance is the resolution floor of the §2.4-3 store-Date
+// witness: HTTP Date carries 1s resolution, so agreement bounds tighter
+// than ±2s cannot distinguish skew from truncation noise.
+const DateTolerance = 2 * time.Second
+
+// DateSkewBound is the §2.4-3 agreement bound for the store-Date
+// witness: min(15min, ttl/4), the same scaling as SkewOK's arms. A
+// degenerate bound below DateTolerance (ttl < 4·tolerance = 8s — the
+// conformance suite's sub-second windows) returns 0 = arm DISABLED:
+// at that scale legitimate second-boundary truncation is
+// indistinguishable from skew, and every production window (delete
+// locks ~2.75m, claims 30m, graces ≥1h) sits far above it.
+func DateSkewBound(ttl time.Duration) time.Duration {
+	assertf(ttl > 0, "DateSkewBound: non-positive ttl %v", ttl)
+	bound := ttl / 4
+	if bound > 15*time.Minute {
+		bound = 15 * time.Minute
+	}
+	if bound < DateTolerance {
+		return 0
+	}
+	return bound
+}
+
+// DateOK is the §2.4-3 store-clock cross-check for destructive/steal
+// verdicts: false — demote to report-only, log loudly — when the local
+// clock disagrees with the store's Date witness by more than
+// DateSkewBound. This is the only arm that catches an AT-BOOT-wrong
+// local clock (SkewOK's drift arm anchors at process start; its
+// manifest arm reads an old clk as a quiet repo). Deliberately scoped
+// to destructive verdicts rather than asserted on every CAS as the
+// plan's crash-and-burn sketch suggested: mild skew is routine and a
+// per-operation assert would DoS every read under it, while destruction
+// is where wrongness is irreversible. Freshness of the witness is the
+// caller's obligation (ref.S3WAL requires an observation younger than
+// its per-verdict bound and fails closed without one).
+func DateOK(localNow, date time.Time, ttl time.Duration) bool {
+	assertf(!localNow.IsZero(), "DateOK: zero local time")
+	bound := DateSkewBound(ttl)
+	if bound == 0 {
+		return true
+	}
+	assertf(!date.IsZero(), "DateOK: zero store date with an active bound")
+	delta := localNow.Sub(date)
+	if delta < 0 {
+		delta = -delta
+	}
+	return delta <= bound
 }
 
 // ManifestKey builds the extension-free manifest object key for one BASE

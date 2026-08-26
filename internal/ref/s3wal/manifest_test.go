@@ -221,6 +221,34 @@ func TestSkewGuard(t *testing.T) {
 	}
 }
 
+// TestDateGuard pins the §2.4-3 store-Date witness arm: local-vs-store
+// disagreement past min(15min, ttl/4) demotes destruction in either
+// direction; sub-8s windows disable the arm (1s Date resolution).
+func TestDateGuard(t *testing.T) {
+	now := time.Now().UTC()
+	if got := DateSkewBound(time.Hour); got != 15*time.Minute {
+		t.Fatalf("DateSkewBound(1h) = %v, want the 15m cap", got)
+	}
+	if got := DateSkewBound(time.Minute); got != 15*time.Second {
+		t.Fatalf("DateSkewBound(1m) = %v, want ttl/4", got)
+	}
+	if got := DateSkewBound(7 * time.Second); got != 0 {
+		t.Fatalf("DateSkewBound(7s) = %v, want 0 (disabled below 4x the 2s tolerance)", got)
+	}
+	if !DateOK(now, now.Add(10*time.Second), time.Minute) {
+		t.Fatal("10s disagreement within a 15s bound must pass")
+	}
+	if DateOK(now, now.Add(-20*time.Second), time.Minute) {
+		t.Fatal("a local clock 20s AHEAD of the store (boot skew) must trip")
+	}
+	if DateOK(now, now.Add(20*time.Second), time.Minute) {
+		t.Fatal("the arm is symmetric: a local clock BEHIND the store must trip too")
+	}
+	if !DateOK(now, now.Add(-24*time.Hour), time.Second) {
+		t.Fatal("a degenerate sub-8s window disables the Date arm")
+	}
+}
+
 // TestManifestKeyAlphabet pins the §2.9 member-contiguity lemma for the key
 // shapes conformance tests actually use (test-derived names with slashes,
 // underscores, uppercase) plus the prefix families the plan calls out:

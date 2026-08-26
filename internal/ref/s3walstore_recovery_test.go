@@ -578,10 +578,11 @@ func TestS3WALRecoveryDeleteLease(t *testing.T) {
 	key := "lfs/" + base + "/" + strings.Repeat("cd", 32)
 
 	t.Run("registration blocked for the full fencing window, expiry unblocks", func(t *testing.T) {
-		_, a, b := newRecoveryStores(t)
+		mc, a, b := newRecoveryStores(t)
 		t0 := time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)
 		clock := newFakeClock(t0)
 		a.now, b.now = clock.now, clock.now
+		mc.Now = clock.now // store clock agrees (§2.4-3 Date witness)
 
 		// A foreign delete lease, injected as if its holder crashed after
 		// its last renewal at t0.
@@ -814,9 +815,10 @@ func TestS3WALRecoverySkewGuard(t *testing.T) {
 	key := "lfs/" + base + "/" + strings.Repeat("aa", 32)
 	t0 := time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)
 
-	_, a, b := newRecoveryStores(t)
+	mc, a, b := newRecoveryStores(t)
 	clock := newFakeClock(t0)
 	a.now, b.now = clock.now, clock.now
+	mc.Now = clock.now // store clock agrees (§2.4-3 Date witness)
 
 	claimed, owner1, err := a.TryAdoptionClaim(ctx, base, key)
 	if err != nil || !claimed {
@@ -864,9 +866,10 @@ func TestS3WALRecoveryForwardJumpGuard(t *testing.T) {
 	t.Run("delete lease survives a jump past its fencing window", func(t *testing.T) {
 		const base = "r-jump-lease"
 		key := "lfs/" + base + "/" + strings.Repeat("ef", 32)
-		_, a, b := newRecoveryStores(t)
+		mc, a, b := newRecoveryStores(t)
 		clock := newFakeClock(t0)
 		a.now, b.now = clock.now, clock.now
+		mc.Now = clock.now // store clock follows: this test exercises the DRIFT arm
 
 		// An ACTIVE foreign delete lease renewed moments ago: its
 		// guarded DELETE may still be in flight.
@@ -903,9 +906,10 @@ func TestS3WALRecoveryForwardJumpGuard(t *testing.T) {
 	t.Run("adoption claim survives a jump past its TTL", func(t *testing.T) {
 		const base = "r-jump-claim"
 		key := "lfs/" + base + "/" + strings.Repeat("ab", 32)
-		_, a, _ := newRecoveryStores(t)
+		mc, a, _ := newRecoveryStores(t)
 		clock := newFakeClock(t0)
 		a.now = clock.now
+		mc.Now = clock.now // store clock follows: this test exercises the DRIFT arm
 
 		claimed, owner1, err := a.TryAdoptionClaim(ctx, base, key)
 		if err != nil || !claimed {
@@ -972,6 +976,196 @@ func TestS3WALRecoveryStaleReadPanics(t *testing.T) {
 		}
 	}()
 	_, _ = a.ListRefs(ctx, base)
+}
+
+// TestS3WALRecoveryBootClockGuard (Codex round 2 on PR #156): a process
+// that BOOTS with its wall clock already ahead reports ~zero
+// wall-vs-monotonic drift, and the manifest-ahead arm reads an old clk as
+// a quiet repo — so only the §2.4-3 store-Date witness can catch it.
+// Store b plays the previous, correctly clocked process; store a boots
+// wall-ahead beyond every bound. Every destructive verdict class must
+// demote to report-only; once local and store clocks agree again the
+// same expiries proceed normally.
+func TestS3WALRecoveryBootClockGuard(t *testing.T) {
+	ctx := context.Background()
+	t0 := time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)
+	const skew = 2 * time.Hour // beyond the 15m cap of every §2.4 bound
+
+	// bootSkewed builds the two-process scene: b (and the store's Date
+	// witness) run on the true clock, a boots ahead by skew.
+	bootSkewed := func(t *testing.T) (store, local *fakeClock, a, b *S3WAL) {
+		t.Helper()
+		store, local = newFakeClock(t0), newFakeClock(t0.Add(skew))
+		mc, sa, sb := newRecoveryStores(t)
+		sa.now, sb.now, mc.Now = local.now, store.now, store.now
+		return store, local, sa, sb
+	}
+	// agree advances both clocks to the same instant: the witness
+	// agrees again and genuinely elapsed windows may expire.
+	agree := func(store, local *fakeClock, at time.Time) {
+		store.set(at)
+		local.set(at)
+	}
+
+	t.Run("delete lease", func(t *testing.T) {
+		const base = "r-boot-lease"
+		key := "lfs/" + base + "/" + strings.Repeat("cd", 32)
+		store, local, a, b := bootSkewed(t)
+		recoveryEdit(t, b, base, func(m *s3wal.Manifest, clk time.Time) {
+			m.DeleteLocks = map[string]*s3wal.DeleteLock{key: {Owner: "deleter", OpID: "op-b", CreatedAt: clk}}
+		})
+		// The lease is seconds old in true time; a's clock alone says
+		// the whole window elapsed. Registration must stay fenced.
+		blockedCtx, cancel := context.WithTimeout(ctx, 250*time.Millisecond)
+		defer cancel()
+		err := a.RegisterLFSObject(blockedCtx, base, key, 5)
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("register on a boot-skewed clock = %v, want ctx deadline (still fenced)", err)
+		}
+		if lock := mustManifest(t, a, base).DeleteLocks[key]; lock == nil || lock.Owner != "deleter" {
+			t.Fatalf("lock = %+v, want untouched", lock)
+		}
+		// Clocks agree and the window has truly elapsed: proceed.
+		agree(store, local, t0.Add(s3walDeleteLockWindow()+time.Minute))
+		if err := a.RegisterLFSObject(ctx, base, key, 5); err != nil {
+			t.Fatalf("register after clocks agree: %v", err)
+		}
+	})
+
+	t.Run("adoption claim steal", func(t *testing.T) {
+		const base = "r-boot-claim"
+		key := "lfs/" + base + "/" + strings.Repeat("ab", 32)
+		store, local, a, b := bootSkewed(t)
+		claimed, owner1, err := b.TryAdoptionClaim(ctx, base, key)
+		if err != nil || !claimed {
+			t.Fatalf("seed claim = (%v, %v)", claimed, err)
+		}
+		seqBefore := mustManifest(t, a, base).Seq
+		claimed, _, err = a.TryAdoptionClaim(ctx, base, key)
+		if err != nil || claimed {
+			t.Fatalf("steal on a boot-skewed clock = (%v, %v), want demoted to report-only", claimed, err)
+		}
+		m := mustManifest(t, a, base)
+		if m.Seq != seqBefore {
+			t.Fatalf("seq %d -> %d: a demoted verdict must write NOTHING", seqBefore, m.Seq)
+		}
+		if r := m.Reservations[key+AdoptionClaimSuffix]; r == nil || r.Owner != owner1 {
+			t.Fatalf("claim = %+v, want owner %q untouched", r, owner1)
+		}
+		agree(store, local, t0.Add(skew))
+		claimed, owner2, err := a.TryAdoptionClaim(ctx, base, key)
+		if err != nil || !claimed || owner2 == owner1 {
+			t.Fatalf("steal after clocks agree = (%v, %q, %v), want fresh owner", claimed, owner2, err)
+		}
+	})
+
+	t.Run("reservation prune", func(t *testing.T) {
+		const base = "r-boot-resv"
+		store, local, a, b := bootSkewed(t)
+		ttl := time.Hour
+		if dec, err := b.ReservePackBytes(ctx, []string{base}, []Pack{{Key: "k1", Size: 10}}, "crashed", 0, ReserveNoFloorGen, 1000, ttl); err != nil || !dec.OK {
+			t.Fatalf("seed reserve = (%+v, %v)", dec, err)
+		}
+		if n, err := a.SweepExpiredPackReservations(ctx, ttl); err != nil || n != 0 {
+			t.Fatalf("sweep on a boot-skewed clock = (%d, %v), want 0 pruned", n, err)
+		}
+		if r := mustManifest(t, a, base).Reservations["k1"]; r == nil {
+			t.Fatal("reservation must survive the boot-skewed sweep")
+		}
+		agree(store, local, t0.Add(skew))
+		if n, err := a.SweepExpiredPackReservations(ctx, ttl); err != nil || n != 1 {
+			t.Fatalf("sweep after clocks agree = (%d, %v), want 1 pruned", n, err)
+		}
+	})
+
+	t.Run("unreferenced reap", func(t *testing.T) {
+		const base = "r-boot-reap"
+		key := "lfs/" + base + "/" + strings.Repeat("ef", 32)
+		store, local, a, b := bootSkewed(t)
+		if err := b.RegisterLFSObject(ctx, base, key, 5); err != nil {
+			t.Fatalf("seed register: %v", err)
+		}
+		if n, err := b.MarkLFSObjectsUnreferenced(ctx, base, []string{key}); err != nil || n != 1 {
+			t.Fatalf("mark = (%d, %v)", n, err)
+		}
+		// A fresh legacy-armed reap watermark stamped from a's OWN
+		// frame: the scan-state freshness gate is a separate lane, and
+		// this subtest isolates the grace verdict's Date arm.
+		if err := a.RecordLFSReapComplete(ctx, 1, true); err != nil {
+			t.Fatalf("stamp reap watermark: %v", err)
+		}
+		gens := map[string]int64{base: 0}
+		retired, err := a.RetireUnreferencedLFSObject(ctx, base, key, gens, time.Hour, time.Hour)
+		if err != nil || retired {
+			t.Fatalf("retire on a boot-skewed clock = (%v, %v), want spared", retired, err)
+		}
+		agree(store, local, t0.Add(skew))
+		retired, err = a.RetireUnreferencedLFSObject(ctx, base, key, gens, time.Hour, time.Hour)
+		if err != nil || !retired {
+			t.Fatalf("retire after clocks agree = (%v, %v), want retired", retired, err)
+		}
+	})
+}
+
+// TestS3WALRecoveryDeleteLeaseReap (Codex round 2 on PR #156): a leaked
+// delete lease — an ambiguous DELETE or failed post-delete clear leaves
+// its entry, and registration used to only IGNORE expired ones — must be
+// reaped once strictly past the full blocking window: by the reservation
+// sweep and opportunistically by the registration path itself.
+func TestS3WALRecoveryDeleteLeaseReap(t *testing.T) {
+	ctx := context.Background()
+	t0 := time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	t.Run("sweep reaps only past the full window", func(t *testing.T) {
+		const base = "r-reap-sweep"
+		key := "lfs/" + base + "/" + strings.Repeat("aa", 32)
+		mc, a, b := newRecoveryStores(t)
+		clock := newFakeClock(t0)
+		a.now, b.now, mc.Now = clock.now, clock.now, clock.now
+		recoveryEdit(t, b, base, func(m *s3wal.Manifest, clk time.Time) {
+			m.DeleteLocks = map[string]*s3wal.DeleteLock{key: {Owner: "crashed", OpID: "op-x", CreatedAt: clk}}
+		})
+
+		// Inside the window — even under the olderThan=0 hatch — the
+		// lease survives: it may fence an in-flight DELETE.
+		clock.set(t0.Add(s3walDeleteLockWindow() - time.Millisecond))
+		if _, err := a.SweepExpiredPackReservations(ctx, 0); err != nil {
+			t.Fatalf("in-window sweep: %v", err)
+		}
+		if lock := mustManifest(t, a, base).DeleteLocks[key]; lock == nil {
+			t.Fatal("an in-window lease must survive the sweep (it may fence an in-flight DELETE)")
+		}
+
+		clock.set(t0.Add(s3walDeleteLockWindow()))
+		if _, err := a.SweepExpiredPackReservations(ctx, time.Hour); err != nil {
+			t.Fatalf("post-window sweep: %v", err)
+		}
+		if lock := mustManifest(t, a, base).DeleteLocks[key]; lock != nil {
+			t.Fatalf("lock = %+v, want reaped past the full window", lock)
+		}
+	})
+
+	t.Run("registration clears the observed expired lease", func(t *testing.T) {
+		const base = "r-reap-register"
+		key := "lfs/" + base + "/" + strings.Repeat("bb", 32)
+		mc, a, b := newRecoveryStores(t)
+		clock := newFakeClock(t0)
+		a.now, b.now, mc.Now = clock.now, clock.now, clock.now
+		recoveryEdit(t, b, base, func(m *s3wal.Manifest, clk time.Time) {
+			m.DeleteLocks = map[string]*s3wal.DeleteLock{key: {Owner: "crashed", OpID: "op-y", CreatedAt: clk}}
+		})
+		clock.set(t0.Add(s3walDeleteLockWindow()))
+		if err := a.RegisterLFSObject(ctx, base, key, 5); err != nil {
+			t.Fatalf("register past the window: %v", err)
+		}
+		m := mustManifest(t, a, base)
+		if lock := m.DeleteLocks[key]; lock != nil {
+			t.Fatalf("lock = %+v, want opportunistically reaped by registration", lock)
+		}
+		if m.LFS.Objects[key] == nil {
+			t.Fatal("registration must have landed alongside the reap")
+		}
+	})
 }
 
 // TestS3WALRecoveryCrossProcessFence (Codex on PR #156, security): the

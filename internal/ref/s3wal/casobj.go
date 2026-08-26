@@ -14,6 +14,7 @@ import (
 	"io"
 	"math/rand/v2"
 	"net"
+	"net/http"
 	"sync"
 	"time"
 
@@ -21,6 +22,8 @@ import (
 	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/smithy-go"
+	"github.com/aws/smithy-go/middleware"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 )
 
 // assertf is a fail-fast invariant check (crash-and-burn style).
@@ -125,6 +128,13 @@ type Client struct {
 	// idle connections Close releases. Nil for Clients wrapped around
 	// caller-owned s3.Clients.
 	httpCloser interface{ CloseIdleConnections() }
+
+	// Store-clock witness (§2.4-3): the freshest HTTP Date header
+	// observed on any response through this client, plus the LOCAL
+	// monotonic-anchored instant it was observed. See StoreDate.
+	dateMu      sync.Mutex
+	storeDate   time.Time
+	storeDateAt time.Time
 }
 
 // New wraps an s3.Client for conditional object operations on one bucket.
@@ -137,14 +147,55 @@ type Client struct {
 func New(s3c *s3.Client, bucket string) *Client {
 	assertf(s3c != nil, "New: nil s3 client")
 	assertf(bucket != "", "New: empty bucket")
-	noRetry := s3.New(s3c.Options(), func(o *s3.Options) { o.Retryer = aws.NopRetryer{} })
-	return &Client{
-		s3:          noRetry,
+	c := &Client{
 		bucket:      bucket,
 		backoffBase: defaultBackoffBase,
 		backoffCap:  defaultBackoffCap,
 		maxAttempts: defaultMaxAttempts,
 	}
+	c.s3 = s3.New(s3c.Options(), func(o *s3.Options) {
+		o.Retryer = aws.NopRetryer{}
+		o.APIOptions = append(o.APIOptions, c.captureStoreDate)
+	})
+	return c
+}
+
+// captureStoreDate installs the §2.4-3 store-clock witness: every S3
+// response — success or error, GET and PUT alike — carries an HTTP Date
+// header stamped by the store, an absolute wall-clock reading no local
+// clock trouble can forge. A deserialize-step middleware is the cleanest
+// SDK seam: the typed outputs carry no Date field, and the raw
+// *smithyhttp.Response is visible here for every operation uniformly.
+func (c *Client) captureStoreDate(stack *middleware.Stack) error {
+	return stack.Deserialize.Add(middleware.DeserializeMiddlewareFunc("s3walStoreDate",
+		func(ctx context.Context, in middleware.DeserializeInput, next middleware.DeserializeHandler) (middleware.DeserializeOutput, middleware.Metadata, error) {
+			out, md, err := next.HandleDeserialize(ctx, in)
+			if resp, ok := out.RawResponse.(*smithyhttp.Response); ok && resp != nil && resp.Response != nil {
+				if d, perr := http.ParseTime(resp.Header.Get("Date")); perr == nil {
+					c.recordStoreDate(d, time.Now())
+				}
+			}
+			return out, md, err
+		}), middleware.Before)
+}
+
+// recordStoreDate stores the witness; last write wins (the observation
+// instants of concurrently processed responses differ by jitter far
+// below the ±DateTolerance resolution floor).
+func (c *Client) recordStoreDate(date, observedAt time.Time) {
+	c.dateMu.Lock()
+	defer c.dateMu.Unlock()
+	c.storeDate, c.storeDateAt = date, observedAt
+}
+
+// StoreDate returns the freshest observed store wall clock (HTTP Date,
+// 1s resolution), the local monotonic-anchored instant it was observed,
+// and whether any observation exists yet — the §2.4-3 absolute clock
+// witness destructive TTL verdicts cross-check (see ref.S3WAL).
+func (c *Client) StoreDate() (date, observedAt time.Time, ok bool) {
+	c.dateMu.Lock()
+	defer c.dateMu.Unlock()
+	return c.storeDate, c.storeDateAt, !c.storeDateAt.IsZero()
 }
 
 // Get fetches key unconditionally. Missing keys return ErrNotExist.

@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
@@ -34,6 +35,12 @@ type ConditionalStore interface {
 	// List returns up to limit keys under prefix, strictly byte-ordered,
 	// strictly greater than startAfter ("" = from the beginning).
 	List(ctx context.Context, prefix, startAfter string, limit int) ([]string, error)
+	// StoreDate returns the store wall clock freshest observed on this
+	// client's responses (the HTTP Date header, 1s resolution), the
+	// local monotonic-anchored instant of the observation, and whether
+	// any observation exists — the §2.4-3 absolute clock witness that
+	// destructive TTL verdicts cross-check against the local clock.
+	StoreDate() (date, observedAt time.Time, ok bool)
 }
 
 var _ ConditionalStore = (*Client)(nil)

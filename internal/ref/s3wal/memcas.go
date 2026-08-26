@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"time"
 )
 
 // PutFault directs one MemCAS conditional PUT attempt.
@@ -71,6 +72,38 @@ type MemCAS struct {
 	cur   map[string]memVersion
 	prev  map[string]memVersion
 	Hooks MemCASHooks
+
+	// Now, when set, is the fake STORE wall clock served as the §2.4-3
+	// Date witness: like the real store, every operation records an
+	// observation (StoreDate). Nil serves the real clock — correct for
+	// every real-clock test, while fake-clock tests wire Now to their
+	// local fake (agreeing clocks) or to a second clock to simulate
+	// boot skew in either direction.
+	Now func() time.Time
+
+	dateMu      sync.Mutex
+	storeDate   time.Time
+	storeDateAt time.Time
+}
+
+// observeDate records the fake Date witness for one operation, exactly
+// when the real client would (response processing time).
+func (m *MemCAS) observeDate() {
+	now := time.Now()
+	date := now
+	if m.Now != nil {
+		date = m.Now()
+	}
+	m.dateMu.Lock()
+	defer m.dateMu.Unlock()
+	m.storeDate, m.storeDateAt = date, now
+}
+
+// StoreDate — see ConditionalStore.
+func (m *MemCAS) StoreDate() (date, observedAt time.Time, ok bool) {
+	m.dateMu.Lock()
+	defer m.dateMu.Unlock()
+	return m.storeDate, m.storeDateAt, !m.storeDateAt.IsZero()
 }
 
 var _ ConditionalStore = (*MemCAS)(nil)
@@ -93,6 +126,7 @@ func memETag(body []byte) string {
 // Get fetches key (possibly the injected stale version).
 func (m *MemCAS) Get(_ context.Context, key string) (Object, error) {
 	assertf(key != "", "MemCAS.Get: empty key")
+	m.observeDate()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.Hooks.StaleGet != nil && m.Hooks.StaleGet(key) {
@@ -110,6 +144,7 @@ func (m *MemCAS) Get(_ context.Context, key string) (Object, error) {
 // GetIfChanged fetches key unless etag is still current.
 func (m *MemCAS) GetIfChanged(ctx context.Context, key, etag string) (Object, error) {
 	assertf(etag != "", "MemCAS.GetIfChanged: empty etag")
+	m.observeDate()
 	m.mu.Lock()
 	if v, ok := m.cur[key]; ok && v.etag == etag {
 		m.mu.Unlock()
@@ -122,6 +157,7 @@ func (m *MemCAS) GetIfChanged(ctx context.Context, key, etag string) (Object, er
 // Create writes key iff absent (the If-None-Match: * semantics).
 func (m *MemCAS) Create(_ context.Context, key string, body []byte) (string, error) {
 	assertf(key != "" && body != nil, "MemCAS.Create(%q)", key)
+	m.observeDate()
 	etag, err := m.createLocked(key, body)
 	if m.Hooks.AfterPut != nil {
 		m.Hooks.AfterPut("create", key)
@@ -147,6 +183,7 @@ func (m *MemCAS) createLocked(key string, body []byte) (string, error) {
 // Advance overwrites key iff etag is current (the If-Match semantics).
 func (m *MemCAS) Advance(_ context.Context, key string, body []byte, etag string) (string, error) {
 	assertf(key != "" && body != nil && etag != "", "MemCAS.Advance(%q)", key)
+	m.observeDate()
 	newETag, err := m.advanceLocked(key, body, etag)
 	if m.Hooks.AfterPut != nil {
 		m.Hooks.AfterPut("advance", key)
@@ -208,6 +245,7 @@ func (m *MemCAS) apply(key string, body []byte) {
 // Delete removes key unconditionally.
 func (m *MemCAS) Delete(_ context.Context, key string) error {
 	assertf(key != "", "MemCAS.Delete: empty key")
+	m.observeDate()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.cur, key)
@@ -220,6 +258,7 @@ func (m *MemCAS) Delete(_ context.Context, key string) error {
 func (m *MemCAS) List(_ context.Context, prefix, startAfter string, limit int) ([]string, error) {
 	assertf(prefix != "", "MemCAS.List: empty prefix")
 	assertf(limit > 0, "MemCAS.List: non-positive limit %d", limit)
+	m.observeDate()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	var keys []string

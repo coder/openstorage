@@ -1122,6 +1122,47 @@ func TestContentionLostUpdateDetectorSeaweedFS(t *testing.T) {
 		res.wins, res.lostRaces, res.contentionErrs, res.ambiguous, res.maxStarve)
 }
 
+// TestStoreDateWitnessSeaweedFS qualifies the §2.4-3 Date-capture
+// middleware against a real store: after any operation the client must
+// hold a fresh witness agreeing with the local clock (the container
+// shares the host clock). Destructive verdicts FAIL CLOSED without a
+// witness, so a silently broken capture would demote every genuine
+// expiry fleet-wide — this is the direct gate on the seam itself.
+func TestStoreDateWitnessSeaweedFS(t *testing.T) {
+	if testing.Short() {
+		t.Skip("store-date qualification needs docker")
+	}
+	endpoint := startSeaweedFS(t)
+	raw := rawS3Client(t, endpoint, "us-east-1", "seaweedfs", "seaweedfs")
+	ensureBucket(t, raw, "s3wal-date")
+	cas := s3wal.New(raw, "s3wal-date")
+	if _, _, ok := cas.StoreDate(); ok {
+		t.Fatal("a fresh client must hold no witness before its first operation")
+	}
+	ctx := context.Background()
+	if _, err := cas.Create(ctx, "_wal/repo/date-witness", []byte(`{"seq":1}`)); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	assertWitness := func(op string) {
+		t.Helper()
+		date, observedAt, ok := cas.StoreDate()
+		if !ok {
+			t.Fatalf("no store-date witness after %s", op)
+		}
+		if age := time.Since(observedAt); age < 0 || age > time.Minute {
+			t.Fatalf("witness observation age after %s = %v, want fresh", op, age)
+		}
+		if delta := time.Since(date); delta < -time.Minute || delta > time.Minute {
+			t.Fatalf("store date after %s = %v, disagrees with the local clock by %v", op, date, time.Since(date))
+		}
+	}
+	assertWitness("create")
+	if _, err := cas.Get(ctx, "_wal/repo/date-witness"); err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	assertWitness("get")
+}
+
 // ---------------------------------------------------------------------------
 // Deterministic stub servers: probe refusal + §2.3 taxonomy without Docker.
 

@@ -55,7 +55,35 @@ func (s *S3WAL) s3walReservationLive(m *s3wal.Manifest, stamp time.Time, ttl tim
 	if s3wal.Elapsed(s.now(), m.Clk, stamp) < ttl {
 		return true
 	}
-	return ttl > 0 && !s3wal.DriftOK(s.wallDrift(), ttl)
+	return ttl > 0 && (!s3wal.DriftOK(s.wallDrift(), ttl) || !s.s3walDateOK(ttl))
+}
+
+// s3walDateWitnessMaxAge bounds how stale the §2.4-3 store-Date witness
+// may be for a TTL verdict: every verdict runs inside a mutate/view whose
+// manifest read just produced an observation through the same client, so
+// a live path's witness is microseconds old — 30s tolerates slow bodies
+// and GC loops without ever accepting a witness from an unrelated
+// earlier pass. Real (monotonic) age deliberately, never the injectable
+// clock: freshness measures THIS PROCESS's observation pipeline, not the
+// clock under suspicion.
+const s3walDateWitnessMaxAge = 30 * time.Second
+
+// s3walDateOK is the §2.4-3 store-clock witness arm (see s3wal.DateOK):
+// the absolute cross-check that catches AT-BOOT-wrong local clocks,
+// which report ~zero drift and read old manifest clocks as quiet repos.
+// A missing or stale witness fails closed for active bounds — the
+// manifest read preceding every verdict observes one, so absence means
+// the store stopped serving Date headers, and destruction must not
+// proceed on an unwitnessed clock.
+func (s *S3WAL) s3walDateOK(ttl time.Duration) bool {
+	if s3wal.DateSkewBound(ttl) == 0 {
+		return true // degenerate window: arm disabled (DateSkewBound)
+	}
+	date, observedAt, ok := s.cas.StoreDate()
+	if !ok || time.Since(observedAt) > s3walDateWitnessMaxAge {
+		return false
+	}
+	return s3wal.DateOK(s.now(), date, ttl)
 }
 
 // s3walExpiryAllowed gates DESTRUCTIVE expiry verdicts (prune, steal,
@@ -70,7 +98,7 @@ func (s *S3WAL) s3walExpiryAllowed(base string, m *s3wal.Manifest, stamp time.Ti
 	if s3wal.Elapsed(now, m.Clk, stamp) < ttl {
 		return false
 	}
-	if !s3wal.SkewOK(now, m.Clk, s.wallDrift(), ttl) {
+	if !s3wal.SkewOK(now, m.Clk, s.wallDrift(), ttl) || !s.s3walDateOK(ttl) {
 		// Fail closed: over-retention is the only reachable failure
 		// direction. Loud, then report-only (plan §2.4).
 		s.warnSkew(base, m, ttl, what)
@@ -82,9 +110,11 @@ func (s *S3WAL) s3walExpiryAllowed(base string, m *s3wal.Manifest, stamp time.Ti
 // warnSkew logs the §2.4 skew-guard demotion loudly (expiry passes retry
 // on their cadence, so verdicts stay report-only until clocks agree).
 func (s *S3WAL) warnSkew(base string, m *s3wal.Manifest, ttl time.Duration, what string) {
+	date, observedAt, _ := s.cas.StoreDate()
 	slog.Warn("s3wal clock skew guard tripped: demoting expiry verdict to report-only",
 		"base", base, "what", what, "manifest_clk", m.Clk, "local_now", s.now(),
-		"wall_drift", s.wallDrift(), "ttl", ttl)
+		"wall_drift", s.wallDrift(), "store_date", date,
+		"store_date_age", time.Since(observedAt), "ttl", ttl)
 }
 
 // s3walIsClaimKey reports whether a reservation map key is an adoption
@@ -408,7 +438,25 @@ func (s *S3WAL) SweepExpiredPackReservations(ctx context.Context, olderThan time
 						return false, fmt.Errorf("sweep reservations lapse marker: %w", err)
 					}
 				}
-				return pruned > 0, nil
+				// s3wal-internal divergence from the SQL twins, which
+				// have no W6 delete-lease protocol (Codex on PR #156):
+				// a leaked lease — an ambiguous DELETE or a failed
+				// post-delete clear leaves its entry, and registration
+				// only ignores expired ones — is reaped once strictly
+				// past the FULL blocking window, under the same guarded
+				// clock rules as every destructive verdict. The
+				// olderThan=0 test/recovery hatch never waives this
+				// window: an in-window lease may fence an in-flight
+				// DELETE. Reaped leases are not counted in the returned
+				// reservation total.
+				locksReaped := 0
+				for key, lock := range m.DeleteLocks {
+					if s.s3walExpiryAllowed(base, m, lock.CreatedAt, s3walDeleteLockWindow(), "delete lease reap") {
+						delete(m.DeleteLocks, key)
+						locksReaped++
+					}
+				}
+				return pruned > 0 || locksReaped > 0, nil
 			},
 			// ID: re-applying deletes nothing twice; the count may
 			// under-report on an ambiguous landed write, which only

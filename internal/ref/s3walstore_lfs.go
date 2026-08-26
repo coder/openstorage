@@ -77,6 +77,14 @@ func (s *S3WAL) registerLFSObject(ctx context.Context, repo, key string, bytes i
 					return false, errS3WALDeleteLockBlocked
 				}
 				changed := false
+				// An EXPIRED lease observed here is a leak (ambiguous
+				// DELETE / failed post-delete clear — Codex on PR #156):
+				// reap it opportunistically instead of ignoring it, or
+				// the entry outlives every window until the sweep runs.
+				if _, leaked := m.DeleteLocks[key]; leaked {
+					delete(m.DeleteLocks, key)
+					changed = true
+				}
 				// Legacy-spelling migration + twin reconcile (ADR-41).
 				if legacy, ok := lfsLegacyRowKey(key); ok {
 					if lrow := m.LFS.Objects[legacy]; lrow != nil {
