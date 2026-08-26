@@ -16,8 +16,8 @@ import (
 // reproduction instructions.
 func reportRun(t *testing.T, res Result) {
 	t.Helper()
-	t.Logf("seed=%d steps=%d trace=%s transitions=%d deliveries=%d faults=%d steals=%d crash-steals=%d push-steals=%d push-crash-steals=%d push-forced-rescues=%d",
-		res.Seed, res.Steps, res.TraceHash, res.Transitions, res.Deliveries, res.Faults, res.Steals, res.CrashSteals,
+	t.Logf("seed=%d steps=%d trace=%s transitions=%d deliveries=%d faults=%d cas-faults=%d steals=%d crash-steals=%d push-steals=%d push-crash-steals=%d push-forced-rescues=%d",
+		res.Seed, res.Steps, res.TraceHash, res.Transitions, res.Deliveries, res.Faults, res.CASFaults, res.Steals, res.CrashSteals,
 		res.PushSteals, res.PushCrashSteals, res.PushForcedRescues)
 	if len(res.Violations) == 0 {
 		return
@@ -25,68 +25,105 @@ func reportRun(t *testing.T, res Result) {
 	for _, v := range res.Violations {
 		t.Errorf("violation: %s", v)
 	}
-	t.Errorf("reproduce: DST_SEED=%d DST_STEPS=%d go test ./internal/simtest -run 'TestDSTSeed' -v  (or: go run ./cmd/dst -seed %d -steps %d -v)",
-		res.Seed, res.Steps, res.Seed, res.Steps)
+	t.Errorf("reproduce: DST_SEED=%d DST_STEPS=%d DST_REF_BACKEND=%s go test ./internal/simtest -run 'TestDSTSeed' -v  (or: go run ./cmd/dst -seed %d -steps %d -backend %s -v)",
+		res.Seed, res.Steps, res.Backend, res.Seed, res.Steps, res.Backend)
 }
 
-// TestDSTFast is the PR-gate run: a fixed handful of seeds inside a small
-// time budget. The extended sweep lives in TestDSTSweep (nightly).
+// dstBackends are the authority-store lanes every DST entry point covers.
+var dstBackends = []RefBackend{RefBackendSQLite, RefBackendS3WAL}
+
+// envRefBackend resolves the DST_REF_BACKEND lane override ("" = sqlite).
+func envRefBackend(t *testing.T) RefBackend {
+	t.Helper()
+	switch v := os.Getenv("DST_REF_BACKEND"); v {
+	case "", string(RefBackendSQLite):
+		return RefBackendSQLite
+	case string(RefBackendS3WAL):
+		return RefBackendS3WAL
+	default:
+		t.Fatalf("bad DST_REF_BACKEND %q (want sqlite or s3wal)", v)
+		return ""
+	}
+}
+
+// TestDSTFast is the PR-gate run: a fixed handful of seeds per backend
+// lane inside a small time budget. The extended sweep lives in
+// TestDSTSweep (nightly).
 func TestDSTFast(t *testing.T) {
-	crashSteals, pushCrashSteals, pushForcedRescues := 0, 0, 0
-	for _, seed := range []uint64{1, 2, 3} {
-		res, err := Run(Config{Seed: seed, Steps: 120})
-		if err != nil {
-			t.Fatalf("seed %d: infra error: %v", seed, err)
-		}
-		reportRun(t, res)
-		// Guard against a vacuous simulation: faults must fire and refs
-		// must actually move.
-		if res.Transitions < 10 || res.Deliveries < 10 || res.Faults < 5 {
-			t.Errorf("seed %d: suspiciously quiet run: %+v", seed, res)
-		}
-		crashSteals += res.CrashSteals
-		pushCrashSteals += res.PushCrashSteals
-		pushForcedRescues += res.PushForcedRescues
-	}
-	// The sync claim-lease lane must not be vacuous either: across the
-	// fixed fast seeds, at least one claim whose holder actually CRASHED
-	// mid-run must have been stolen (issue #88 — the dead-holder class the
-	// oracle exists for; live runs merely outliving their lease do not
-	// count, so this fails if crash injection goes dead).
-	if crashSteals == 0 {
-		t.Errorf("no dead-holder sync claim steals across the fast seeds: the #88 crash-injection lane is vacuous")
-	}
-	// Same for the outbound lane (issue #136): dead-holder push steals
-	// must occur, and at least one of them must have rescued a force
-	// mandate carried ONLY by the dead claim's push_claim_force — the
-	// inheritance class the force-monotonicity oracle exists for.
-	if pushCrashSteals == 0 {
-		t.Errorf("no dead-holder push claim steals across the fast seeds: the #136 crash-injection lane is vacuous")
-	}
-	if pushForcedRescues == 0 {
-		t.Errorf("no force-inheriting push claim steals across the fast seeds: the #136 rescue lane is vacuous")
+	for _, backend := range dstBackends {
+		t.Run(string(backend), func(t *testing.T) {
+			crashSteals, pushCrashSteals, pushForcedRescues, casFaults := 0, 0, 0, 0
+			for _, seed := range []uint64{1, 2, 3} {
+				res, err := Run(Config{Seed: seed, Steps: 120, RefBackend: backend})
+				if err != nil {
+					t.Fatalf("seed %d: infra error: %v", seed, err)
+				}
+				reportRun(t, res)
+				// Guard against a vacuous simulation: faults must fire and refs
+				// must actually move.
+				if res.Transitions < 10 || res.Deliveries < 10 || res.Faults < 5 {
+					t.Errorf("seed %d: suspiciously quiet run: %+v", seed, res)
+				}
+				crashSteals += res.CrashSteals
+				pushCrashSteals += res.PushCrashSteals
+				pushForcedRescues += res.PushForcedRescues
+				casFaults += res.CASFaults
+			}
+			// The sync claim-lease lane must not be vacuous either: across the
+			// fixed fast seeds, at least one claim whose holder actually CRASHED
+			// mid-run must have been stolen (issue #88 — the dead-holder class the
+			// oracle exists for; live runs merely outliving their lease do not
+			// count, so this fails if crash injection goes dead).
+			if crashSteals == 0 {
+				t.Errorf("no dead-holder sync claim steals across the fast seeds: the #88 crash-injection lane is vacuous")
+			}
+			// Same for the outbound lane (issue #136): dead-holder push steals
+			// must occur, and at least one of them must have rescued a force
+			// mandate carried ONLY by the dead claim's push_claim_force — the
+			// inheritance class the force-monotonicity oracle exists for.
+			if pushCrashSteals == 0 {
+				t.Errorf("no dead-holder push claim steals across the fast seeds: the #136 crash-injection lane is vacuous")
+			}
+			if pushForcedRescues == 0 {
+				t.Errorf("no force-inheriting push claim steals across the fast seeds: the #136 rescue lane is vacuous")
+			}
+			// The s3wal lane must actually inject conditional-store transport
+			// faults (plan §4 Phase 2's fault plan); the SQLite lane must not
+			// see any.
+			if backend == RefBackendS3WAL && casFaults == 0 {
+				t.Errorf("no cas.* transport faults across the fast seeds: the s3wal fault plan is vacuous")
+			}
+			if backend == RefBackendSQLite && casFaults != 0 {
+				t.Errorf("cas.* transport faults on the SQLite lane: %d", casFaults)
+			}
+		})
 	}
 }
 
-// TestDSTDeterminism runs the same seed twice and demands identical traces
-// (acceptance criterion: same seed, same op sequence, same outcome).
+// TestDSTDeterminism runs the same seed twice per backend lane and demands
+// identical traces (acceptance criterion: same seed, same op sequence,
+// same outcome).
 func TestDSTDeterminism(t *testing.T) {
-	run := func() Result {
-		res, err := Run(Config{Seed: 7, Steps: 80})
-		if err != nil {
-			t.Fatalf("infra error: %v", err)
-		}
-		return res
+	for _, backend := range dstBackends {
+		t.Run(string(backend), func(t *testing.T) {
+			run := func() Result {
+				res, err := Run(Config{Seed: 7, Steps: 80, RefBackend: backend})
+				if err != nil {
+					t.Fatalf("infra error: %v", err)
+				}
+				return res
+			}
+			a, b := run(), run()
+			if a.TraceHash != b.TraceHash {
+				t.Fatalf("same seed diverged: %s vs %s", a.TraceHash, b.TraceHash)
+			}
+			if a.Transitions != b.Transitions || a.Deliveries != b.Deliveries || a.Faults != b.Faults {
+				t.Fatalf("same seed diverged in stats: %+v vs %+v", a, b)
+			}
+			reportRun(t, a)
+			reportRun(t, b)
+		})
 	}
-	a, b := run(), run()
-	if a.TraceHash != b.TraceHash {
-		t.Fatalf("same seed diverged: %s vs %s", a.TraceHash, b.TraceHash)
-	}
-	if a.Transitions != b.Transitions || a.Deliveries != b.Deliveries || a.Faults != b.Faults {
-		t.Fatalf("same seed diverged in stats: %+v vs %+v", a, b)
-	}
-	reportRun(t, a)
-	reportRun(t, b)
 }
 
 // TestDSTSeed reproduces one seed exactly: the triage entry point.
@@ -101,7 +138,7 @@ func TestDSTSeed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("bad DST_SEED %q: %v", seedStr, err)
 	}
-	cfg := Config{Seed: seed}
+	cfg := Config{Seed: seed, RefBackend: envRefBackend(t)}
 	if v := os.Getenv("DST_STEPS"); v != "" {
 		cfg.Steps, err = strconv.Atoi(v)
 		if err != nil {
@@ -145,9 +182,10 @@ func TestDSTSweep(t *testing.T) {
 			t.Fatalf("bad DST_STEPS %q: %v", v, err)
 		}
 	}
+	backend := envRefBackend(t)
 	for i := 0; i < count; i++ {
 		seed := base + uint64(i)
-		res, err := Run(Config{Seed: seed, Steps: steps})
+		res, err := Run(Config{Seed: seed, Steps: steps, RefBackend: backend})
 		if err != nil {
 			t.Fatalf("seed %d: infra error: %v", seed, err)
 		}

@@ -18,6 +18,21 @@ import (
 	"github.com/coder/code-storage/internal/ref"
 )
 
+// RefBackend names the authority-store lane a simulation runs on.
+type RefBackend string
+
+const (
+	// RefBackendSQLite is the default lane: every node opens the one
+	// shared SQLite database file.
+	RefBackendSQLite RefBackend = "sqlite"
+	// RefBackendS3WAL runs the s3wal manifest-CAS driver over one SHARED
+	// in-memory conditional store (plan §4 Phase 2's multi-node
+	// shared-fake topology). This is stricter than the backend's
+	// single-node deployment decree on purpose: it exercises every
+	// PROTOCOL race between manifest writers, not deployment races.
+	RefBackendS3WAL RefBackend = "s3wal"
+)
+
 // Config parameterizes one deterministic simulation run. The zero value of
 // every field defaults sensibly (see withDefaults); Seed 0 is a valid seed.
 type Config struct {
@@ -26,6 +41,10 @@ type Config struct {
 	Nodes    int // simulated server nodes sharing one SQLite+fileblob (default 3)
 	Repos    int // simulated repos (default 2)
 	Branches int // branches per repo (default 3)
+	// RefBackend selects the authority store under test (default
+	// RefBackendSQLite). The meta store (sync/push claim lanes) and the
+	// fileblob store are backend-independent and stay SQLite/file.
+	RefBackend RefBackend
 	// FullCheckEvery runs the expensive cold-hydrate oracle every N steps
 	// (default 50). It always also runs once after the last step.
 	FullCheckEvery int
@@ -55,8 +74,13 @@ func (c Config) withDefaults() Config {
 	if c.FullCheckEvery == 0 {
 		c.FullCheckEvery = 50
 	}
+	if c.RefBackend == "" {
+		c.RefBackend = RefBackendSQLite
+	}
 	assertf(c.Steps > 0 && c.Nodes > 0 && c.Repos > 0 && c.Branches > 0 && c.FullCheckEvery > 0,
 		"Config: non-positive dimension %+v", c)
+	assertf(c.RefBackend == RefBackendSQLite || c.RefBackend == RefBackendS3WAL,
+		"Config: unknown ref backend %q", c.RefBackend)
 	return c
 }
 
@@ -65,13 +89,18 @@ func (c Config) withDefaults() Config {
 // same Config must produce identical hashes).
 type Result struct {
 	Seed        uint64
-	Steps       int // steps executed (< Config.Steps when a violation stopped the run)
+	Backend     RefBackend // authority-store lane the run executed on
+	Steps       int        // steps executed (< Config.Steps when a violation stopped the run)
 	TraceHash   string
 	Violations  []string
 	Transitions int // distinct committed ref transitions observed
 	Deliveries  int // webhook deliveries recorded
 	Faults      int // faults injected
-	Steals      int // expired sync claims stolen (issues #86/#88)
+	// CASFaults is the subset of Faults injected at the s3wal
+	// conditional-store transport layer (cas.* ops; zero on the SQLite
+	// backend) — the vacuity guard for the Phase 2 fault plan.
+	CASFaults int
+	Steals    int // expired sync claims stolen (issues #86/#88)
 	// CrashSteals is the subset of Steals whose previous holder actually
 	// crashed mid-run (dead-holder class) rather than outliving its lease.
 	CrashSteals int
@@ -99,6 +128,18 @@ func defaultFaultProfile(inj *Injector) {
 	inj.SetProbs(OpBlobUploadFile, Probs{Clean: 0.02, Ambiguous: 0.03})
 	inj.SetProbs(OpBlobDownloadFile, Probs{Clean: 0.02})
 	inj.SetProbs(OpRefReservePacks, Probs{Clean: 0.03, Ambiguous: 0.05})
+
+	// s3wal conditional-store transport faults (SimCAS; plan §4 Phase 2).
+	// Armed unconditionally: probabilistic draws happen once per MATCHING
+	// call, so the SQLite lane — which never issues cas.* ops — consumes
+	// nothing from the PRNG stream and keeps its historical traces. The
+	// probabilities are per-call and every driver op issues several cas
+	// calls (read + CAS + recovery reads), so they stay well below the
+	// SimRefStore-level rates.
+	inj.SetProbs(OpCASGet, Probs{Clean: 0.01})
+	inj.SetProbs(OpCASList, Probs{Clean: 0.01})
+	inj.SetProbs(OpCASCreate, Probs{Clean: 0.01, Ambiguous: 0.03})
+	inj.SetProbs(OpCASAdvance, Probs{Clean: 0.01, Ambiguous: 0.04})
 }
 
 // Scheduler op kinds and weights. The table is fixed (never map-ordered) so
@@ -270,7 +311,7 @@ func Run(cfg Config) (Result, error) {
 		return Result{}, err
 	}
 
-	cl, err := newCluster(dir, cfg.Nodes, inj, s.simNow)
+	cl, err := newCluster(dir, cfg.Nodes, inj, s.simNow, cfg.RefBackend)
 	if err != nil {
 		return Result{}, err
 	}
@@ -361,14 +402,22 @@ func (s *sim) result() Result {
 	if executed > s.cfg.Steps {
 		executed = s.cfg.Steps
 	}
+	casFaults := 0
+	for _, ev := range s.inj.Fired() {
+		if strings.HasPrefix(ev.Op, "cas.") {
+			casFaults++
+		}
+	}
 	return Result{
 		Seed:              s.cfg.Seed,
+		Backend:           s.cfg.RefBackend,
 		Steps:             executed,
 		TraceHash:         hex.EncodeToString(s.hasher.Sum(nil)),
 		Violations:        s.violations,
 		Transitions:       len(s.observed),
 		Deliveries:        len(s.cl.rec.all()),
 		Faults:            len(s.inj.Fired()),
+		CASFaults:         casFaults,
 		Steals:            s.syncSteals,
 		CrashSteals:       s.syncCrashSteals,
 		PushSteals:        s.pushSteals,
@@ -719,6 +768,21 @@ func (s *sim) doCrash(name string, node *simNode, cold bool) error {
 	pushKilled := s.pushKillNode(node.id)
 	if err := s.cl.crashNode(node, cold); err != nil {
 		return fmt.Errorf("step %d: crash node %d: %w", s.step, node.id, err)
+	}
+	stale := 0
+	if s.cl.backend == RefBackendS3WAL {
+		// Half the reboots arm one stale first read on the fresh driver
+		// instance — the only point a stale read is legal (a live
+		// instance's seq watermark makes it process-fatal by design;
+		// see SimCAS). The draw is unconditional in this lane so the
+		// scheduler stream stays aligned across seeds.
+		if s.rng.IntN(2) == 0 {
+			node.simCAS.armStaleGet()
+			stale = 1
+		}
+		s.tracef("step=%04d op=%s node=%d sync-killed=%d push-killed=%d stale-armed=%d",
+			s.step, name, node.id, killed, pushKilled, stale)
+		return nil
 	}
 	s.tracef("step=%04d op=%s node=%d sync-killed=%d push-killed=%d", s.step, name, node.id, killed, pushKilled)
 	return nil

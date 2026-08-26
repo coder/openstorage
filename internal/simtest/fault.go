@@ -45,6 +45,11 @@ const (
 	// executing it (transient missing-object; only valid on
 	// OpBlobDownloadFile, OpBlobStat, OpBlobDelete, and OpBlobCopy).
 	FaultNotFound
+	// FaultStale serves an older version of the object on a read (only
+	// valid on OpCASGet, and only via SimCAS.armStaleGet — never through
+	// the per-op plans, because a stale read is process-fatal for a live
+	// s3wal driver instance by design and must target a fresh one).
+	FaultStale
 )
 
 // String returns the fault class name for traces.
@@ -58,6 +63,8 @@ func (c FaultClass) String() string {
 		return "ambiguous"
 	case FaultNotFound:
 		return "notfound"
+	case FaultStale:
+		return "stale"
 	}
 	return fmt.Sprintf("FaultClass(%d)", int(c))
 }
@@ -83,6 +90,14 @@ const (
 	OpBlobEnsureBucket = "blob.EnsureBucket"
 	OpBlobDelete       = "blob.Delete"
 	OpBlobCopy         = "blob.Copy"
+
+	// s3wal conditional-store transport ops (SimCAS, RefBackendS3WAL):
+	// these sit BELOW the driver, so their faults exercise the driver's
+	// own §2.3 recovery machinery rather than ref.IdempotentCAS.
+	OpCASGet     = "cas.Get"
+	OpCASCreate  = "cas.Create"
+	OpCASAdvance = "cas.Advance"
+	OpCASList    = "cas.List"
 )
 
 // Sentinel errors for injected faults; match with errors.Is. The concrete
@@ -294,15 +309,41 @@ func (in *Injector) record(op string, class FaultClass) {
 	in.fired = append(in.fired, FaultEvent{Seq: in.seq, Op: op, Class: class})
 }
 
+// noteInjected records one externally-armed fault against the CURRENT call
+// (the caller has just begun it): SimCAS's targeted stale reads bypass the
+// per-op plan/probability machinery because they must hit one specific
+// node, but still belong in the fired log for traces and vacuity guards.
+func (in *Injector) noteInjected(op string, class FaultClass) {
+	in.mu.Lock()
+	defer in.mu.Unlock()
+	in.record(op, class)
+}
+
+// coin draws one deterministic boolean from the injector's stream (SimCAS
+// splits ambiguous conditional PUTs into applied/dropped with it).
+func (in *Injector) coin() bool {
+	in.mu.Lock()
+	defer in.mu.Unlock()
+	return in.rng.Float64() < 0.5
+}
+
 // noteInnerOutcome attaches the backing store's real outcome to the most
-// recent fired event (ambiguous faults execute the op after begin returns).
+// recent fired event OF THAT OP (ambiguous faults execute the op after
+// begin returns). The search runs backwards because layered decorators —
+// SimRefStore over the s3wal driver over SimCAS — can append INNER fault
+// events between an outer ambiguous fault's begin and its outcome note;
+// op namespaces never nest recursively (ref.* vs cas.*), so the latest
+// matching event is always the caller's own.
 func (in *Injector) noteInnerOutcome(op, outcome string) {
 	in.mu.Lock()
 	defer in.mu.Unlock()
-	assertf(len(in.fired) > 0, "noteInnerOutcome(%s): no fired events", op)
-	last := &in.fired[len(in.fired)-1]
-	assertf(last.Op == op, "noteInnerOutcome(%s): last fired event is %s", op, last.Op)
-	last.InnerOutcome = outcome
+	for i := len(in.fired) - 1; i >= 0; i-- {
+		if in.fired[i].Op == op {
+			in.fired[i].InnerOutcome = outcome
+			return
+		}
+	}
+	panic(fmt.Sprintf("simtest assertion failed: noteInnerOutcome(%s): no fired event for op", op))
 }
 
 // assertf is a fail-fast invariant check (crash-and-burn style).

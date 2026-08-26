@@ -242,6 +242,21 @@ func (m *MemCAS) apply(key string, body []byte) {
 	m.cur[key] = memVersion{body: stored, etag: memETag(stored)}
 }
 
+// Prev returns key's most recently superseded version, if one exists. The
+// DST harness (internal/simtest) serves it for targeted stale-read
+// injection against fresh driver instances; in-package recovery tests use
+// the StaleGet hook instead.
+func (m *MemCAS) Prev(key string) (Object, bool) {
+	assertf(key != "", "MemCAS.Prev: empty key")
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	v, ok := m.prev[key]
+	if !ok {
+		return Object{}, false
+	}
+	return Object{Body: append([]byte(nil), v.body...), ETag: v.etag}, true
+}
+
 // Delete removes key unconditionally.
 func (m *MemCAS) Delete(_ context.Context, key string) error {
 	assertf(key != "", "MemCAS.Delete: empty key")
