@@ -28,6 +28,7 @@ import (
 	"github.com/coder/code-storage/internal/githttp"
 	"github.com/coder/code-storage/internal/meta"
 	"github.com/coder/code-storage/internal/ref"
+	"github.com/coder/code-storage/internal/ref/s3wal"
 	"github.com/coder/code-storage/internal/version"
 )
 
@@ -109,6 +110,28 @@ func cmdServe(ctx context.Context, args []string) error {
 	if err := st.InitSchema(ctx); err != nil {
 		return fmt.Errorf("init ref schema: %w", err)
 	}
+
+	// Instance lease (issue #133, plan §2.11): the best-effort dual-serve
+	// guard for the zero-infra mode, s3wal scheme only. Acquired AFTER
+	// InitSchema so the §2.6 probe has already proven the store's
+	// conditional-write fidelity — the lease CAS means nothing on a store
+	// that ignores the headers. Refuses startup over a fresh foreign
+	// lease; on heartbeat loss the process fail-stops (crash, not limp —
+	// two live writers would corrupt nothing, CAS serializes every state
+	// change, but §2.4 TTL verdicts and caches degrade silently).
+	if s3, ok := st.(*ref.S3WAL); ok {
+		lease, err := s3wal.AcquireInstanceLease(ctx, s3.ConditionalStore(), s3wal.LeaseConfig{TTL: cfg.s3walLeaseTTL})
+		if err != nil {
+			return err
+		}
+		defer lease.Release(context.Background())
+		go func() {
+			if err := lease.Heartbeat(ctx); err != nil {
+				fatalf("codestorage serve: %v", err)
+			}
+		}()
+	}
+
 	bl, err := blob.Open(ctx, cfg.blobURL)
 	if err != nil {
 		return err

@@ -209,6 +209,13 @@ func (s *S3WAL) Close() {
 	}
 }
 
+// ConditionalStore exposes the underlying CAS substrate for the serve-time
+// instance lease (§2.11) — one lease object per bucket, managed by
+// s3wal.AcquireInstanceLease outside the driver's manifest protocol. Not
+// for state access: every manifest/scan mutation must go through the
+// driver's locking and recovery machinery.
+func (s *S3WAL) ConditionalStore() s3wal.ConditionalStore { return s.cas }
+
 // s3walKeyLock is one refcounted per-key mutex table entry: refs counts
 // holders plus waiters, and the entry is retired at zero so the table is
 // bounded by CONCURRENT lock use, not by every key ever seen (Codex round

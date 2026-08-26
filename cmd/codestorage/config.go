@@ -54,6 +54,13 @@ const (
 	// closes. Unset applies the one-hour default; must be positive.
 	envPackReservationTTL = "CODESTORAGE_PACK_RESERVATION_TTL"
 
+	// Instance-lease TTL for the s3wal dual-serve guard (issue #133,
+	// plan §2.11). s3wal mode only; unset applies the 2-minute default.
+	// The heartbeat cadence is derived (TTL/4). Lowering it mainly serves
+	// tests/drills — a too-small TTL makes transient S3 hiccups fail-stop
+	// the node, so the floor refuses sub-second values.
+	envS3WALLeaseTTL = "CODESTORAGE_S3WAL_LEASE_TTL"
+
 	// Decoded-byte cap on one git push (issue #55): receive-pack requests
 	// whose body (after any gzip decode) exceeds this many bytes are
 	// rejected with 413 before the stream reaches git. Unset derives the
@@ -368,6 +375,11 @@ type serveConfig struct {
 	// secretsCodec envelope-encrypts the metadata store's secret columns
 	// (issue #54); nil (the default) keeps them plaintext.
 	secretsCodec *secrets.Codec
+
+	// s3walLeaseTTL overrides the s3wal instance-lease TTL (issue #133,
+	// §2.11 dual-serve guard); 0 applies the lease default (2 minutes).
+	// Ignored outside s3wal mode.
+	s3walLeaseTTL time.Duration
 }
 
 // sweepSettings is the resolved orphan-pack sweep configuration.
@@ -535,6 +547,10 @@ func resolveServeConfig(getenv func(string) string, flagListen, flagAddr, flagCa
 		return serveConfig{}, err
 	}
 	cfg.lfsStagingBytes, err = resolveLFSStagingBytes(getenv)
+	if err != nil {
+		return serveConfig{}, err
+	}
+	cfg.s3walLeaseTTL, err = resolveS3WALLeaseTTL(getenv)
 	if err != nil {
 		return serveConfig{}, err
 	}
@@ -840,6 +856,27 @@ func resolvePackReservationTTL(getenv func(string) string) (time.Duration, error
 	if d <= githttp.MinPackReservationTTL {
 		return 0, fmt.Errorf("%s must exceed the %v usage-floor freshness budget (cache lifetime + admission handoff margin), got %q",
 			envPackReservationTTL, githttp.MinPackReservationTTL, raw)
+	}
+	return d, nil
+}
+
+// resolveS3WALLeaseTTL parses CODESTORAGE_S3WAL_LEASE_TTL (issue #133,
+// §2.11): the s3wal instance-lease TTL. Unset defers to the lease default
+// (2 minutes); explicit values below one second are refused — the derived
+// heartbeat cadence (TTL/4) would fail-stop the node on ordinary S3
+// latency jitter.
+func resolveS3WALLeaseTTL(getenv func(string) string) (time.Duration, error) {
+	assertf(getenv != nil, "resolveS3WALLeaseTTL: nil getenv")
+	raw := getenv(envS3WALLeaseTTL)
+	if raw == "" {
+		return 0, nil
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		return 0, fmt.Errorf("%s: %w", envS3WALLeaseTTL, err)
+	}
+	if d < time.Second {
+		return 0, fmt.Errorf("%s must be at least 1s, got %q", envS3WALLeaseTTL, raw)
 	}
 	return d, nil
 }
