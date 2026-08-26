@@ -1322,3 +1322,55 @@ func TestSweep_StreamsAcrossPages(t *testing.T) {
 		}
 	}
 }
+
+// TestSweepNeverTouchesWALPrefix (issue #133 Phase 3): a zero-infra bucket
+// mixes the s3wal authority objects (_wal/…) with packs/, lfs/, and
+// sweep/quarantine/. A destructive pass over such a bucket must reap its
+// orphans while never listing, classifying, quarantining, or deleting a
+// _wal/ key — the sweeper's prefixes cannot even see them, and the
+// assertNotWAL guards crash the pass if a listing or key-parsing bug ever
+// routes one into a disposal path.
+func TestSweepNeverTouchesWALPrefix(t *testing.T) {
+	f := newSweepFixture(t)
+
+	walKeys := []string{
+		"_wal/probe",
+		"_wal/instance-lease",
+		"_wal/meta.json",
+		"_wal/repo/r1",
+		"_wal/scan/lfs-reap/global",
+	}
+	for _, k := range walKeys {
+		f.upload(k, "authority state at "+k)
+		f.backdate(k, 48*time.Hour) // ancient: age alone must never matter
+	}
+	orphanPack := blob.PackKey("r1", "orphan")
+	f.upload(orphanPack, "orphan-pack-bytes")
+	f.backdate(orphanPack, 25*time.Hour)
+	orphanLFS := blob.LFSKey("r1", lfsOID("ab"))
+	f.upload(orphanLFS, "orphan-lfs-bytes")
+	f.backdate(orphanLFS, 25*time.Hour)
+
+	report, err := f.sweeper(SweepConfig{Threshold: 24 * time.Hour, Delete: true, DeleteLFS: true}).Sweep(context.Background())
+	if err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	// Vacuity guard: the pass really ran destructively.
+	if report.Deleted != 2 || f.exists(orphanPack) || f.exists(orphanLFS) {
+		t.Fatalf("report = %+v (pack exists=%v, lfs exists=%v), want both orphans reaped", report, f.exists(orphanPack), f.exists(orphanLFS))
+	}
+	for _, k := range walKeys {
+		if !f.exists(k) {
+			t.Fatalf("sweep deleted reserved authority key %q", k)
+		}
+	}
+	// The heal pass over the quarantine backups must spare them too.
+	if _, err := f.sweeper(SweepConfig{Threshold: 24 * time.Hour}).Heal(context.Background()); err != nil {
+		t.Fatalf("Heal: %v", err)
+	}
+	for _, k := range walKeys {
+		if !f.exists(k) {
+			t.Fatalf("quarantine heal deleted reserved authority key %q", k)
+		}
+	}
+}
