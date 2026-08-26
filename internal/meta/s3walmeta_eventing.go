@@ -25,10 +25,11 @@
 //     FinishSync clears the manifest token (owner-guarded, so a thief's
 //     token is never touched) BEFORE finalizing the meta row; a failure
 //     there aborts the finish (retryable; expiry recovers the lease).
-//     DeleteRepoUpstream revokes the token around the row delete
-//     (pre-clear plus a captured-holder post-delete clear; ordering
-//     proof on the method) so a detached upstream's in-flight worker
-//     can never publish after the detach committed.
+//     DeleteRepoUpstream revokes the token through a resumable
+//     three-phase detach (durable Detaching mark → owner-guarded clear →
+//     row delete; ordering proof on the method) so a detached upstream's
+//     in-flight worker can never publish after the detach committed and
+//     no crash leaves the cleanup holder only in process memory.
 //     The push lane has no write-through: the outbound claim protects
 //     upstream refs, which no local CASRef fences.
 package meta
@@ -496,79 +497,149 @@ func (s *S3WAL) GetRepoUpstream(ctx context.Context, repoID string) (RepoUpstrea
 	return u.toRepoUpstream(repoID), nil
 }
 
-// DeleteRepoUpstream detaches the repo; ErrNotFound when already
-// detached. Recovery class PRED: the deleted row is identified by its
-// creation stamp, so a row re-linked after our landed delete is never
-// re-deleted by a recovery re-run.
+// DeleteRepoUpstream detaches the repo; ErrNotFound when never linked or
+// already detached. Recovery class PRED per phase: rows are identified
+// by their creation stamp, so a row re-linked after a landed delete is
+// never re-deleted by a recovery re-run.
 //
-// With a SyncClaimSink wired, detach also revokes the §2.8 manifest
-// fence. The SQL twins get that for free — their fence reads the very
-// repo_upstreams row this delete removes — but here the token lives in
+// With a SyncClaimSink wired, detach must also revoke the §2.8 manifest
+// fence — the SQL twins get that for free (their fence reads the very
+// repo_upstreams row the delete removes), but here the token lives in
 // the ref manifest, and a token outliving the detach would let the
 // detached upstream's in-flight sync worker publish AFTER the detach
-// committed. The ordering mirrors FinishSync: the observed holder's
-// token is cleared BEFORE the meta delete, so a clear failure aborts
-// the detach with nothing consumed (row intact, plainly retryable).
-// The pre-clear alone is not sufficient: a TryBeginSync that commits
-// its meta claim, installs its fence, and revalidates entirely between
-// our observation and our landed delete passes revalidation (the row
-// is still present) and leaves a live token the pre-clear never saw —
-// even the SAME holder's install can land after our pre-clear no-oped
-// on its not-yet-written token. The delete therefore captures the
-// holder recorded on the snapshot the landed CAS destroyed (inside fn:
-// mutate re-runs fn on conflicts, so only the landed run's capture
-// survives) and clears it again, owner-guarded, AFTER the delete.
-// Claimants whose revalidation runs after the delete self-revoke on
-// the missing row instead; one crashing between install and
-// revalidation leaves an inert token (its claim was never handed out,
-// and a fence token only fails OTHER holders closed). A post-delete
-// clear failure is surfaced as an error — a clean detach is never
-// reported over a possibly-live fence. A detach failing AFTER the
-// pre-clear may have revoked a live holder's fence: a liveness cost
-// only (that run's fenced writes lose cleanly), never a safety one.
+// committed. The revocation must be RESUMABLE: no intermediate state
+// may hold the holder needed for cleanup only in a dead process's
+// memory (a post-delete clear failure would otherwise hide a live token
+// behind an ErrNotFound the API reads as idempotent success). Hence
+// three phases, each durable before the next:
+//
+//  1. Mark the row Detaching (one CAS), capturing the row's claim holder
+//     atomically with the mark (a resuming retry re-captures it fresh
+//     from the still-marked row). The mark is never unset and, once
+//     durable, TryBeginSync refuses the row — in its claim fn AND in its
+//     post-install revalidation — so no NEW fence can be installed and
+//     handed out from here on; by meta-first ordering, every claim
+//     committed before the mark already has its holder on the row.
+//  2. Clear that holder's manifest token (owner-guarded). A failure
+//     aborts the detach with the marked row — and thus the holder — still
+//     durable in the doc: a retry from ANY process re-enters at the no-op
+//     mark and re-runs this clear; ErrNotFound is never returned with the
+//     fence possibly live. A token installed AFTER this clear belongs to
+//     a claim still awaiting revalidation (installs precede revalidation),
+//     which then sees the mark or the missing row and self-revokes; a
+//     claimant crashing between install and revalidation leaves a
+//     never-handed-out token, inert by construction (a fence token only
+//     refuses OTHER holders). Post-mark the row's holder only ever
+//     transitions to empty (FinishSync and the claim rollback clear it;
+//     nothing re-installs), so the captured holder cannot go stale.
+//  3. Delete the marked row (one CAS, creation-stamp predicate; a row
+//     gone or replaced means a concurrent detach completed — the same
+//     terminal state). Landing requires phases 1-2 durable, so a later
+//     call's ErrNotFound proves every handed-out fence was revoked.
+//
+// Residual, NOT widened by detach (the pre-existing expired-victim steal
+// window): a pre-mark steal whose fence install is still in flight
+// leaves the superseded victim's token in the manifest under a row
+// naming the thief; phase 2 clears the thief's name and no-ops on the
+// victim's token, which only the thief's own install overwrites —
+// exactly the window in which the manifest fence, unlike the SQL row
+// fence, still honors an expired victim.
+//
+// Audit of the remaining row ops against the mark: RequestSync and
+// RequestPush raise pending flags that die with the row; TryBeginPush
+// hands out the outbound claim, which has no fence write-through (file
+// comment) — an in-flight push worker surviving detach is the SQL twins'
+// exposure too; SetRepoUpstream refuses a detaching row with
+// ErrAlreadyExists until a detach retry completes it. SQL-parity
+// divergence, accepted: a midway-crashed s3wal detach leaves the row
+// visible (and claim-refusing) until the next detach call resumes it,
+// where SQL's atomic delete would have left it fully live.
+//
+// Without a sink there is no write-through in the topology (hook
+// processes only read the fence and never detach), so the single-CAS
+// delete is complete on its own.
 func (s *S3WAL) DeleteRepoUpstream(ctx context.Context, repoID string) error {
 	assertf(repoID != "", "DeleteRepoUpstream: empty repo id")
-	if s.sink != nil {
-		up, err := s.GetRepoUpstream(ctx, repoID)
-		if err != nil {
-			return err
-		}
-		if up.SyncClaimHolder != "" {
-			if cerr := s.sink.ClearSyncClaim(ctx, repoID, up.SyncClaimHolder); cerr != nil {
-				return fmt.Errorf("detach upstream for repo %q: clear sync-claim fence: %w", repoID, cerr)
-			}
-		}
+	if s.sink == nil {
+		var targetCreatedAt int64
+		targeted := false
+		return s.mutate(ctx, s3walMetaMutation{
+			op: "delete upstream",
+			fn: func(doc *s3walMetaDoc) (bool, error) {
+				u := doc.Upstreams[repoID]
+				if u == nil || (targeted && u.CreatedAt != targetCreatedAt) {
+					return false, fmt.Errorf("upstream for repo %q: %w", repoID, ErrNotFound)
+				}
+				targetCreatedAt, targeted = u.CreatedAt, true
+				delete(doc.Upstreams, repoID)
+				return true, nil
+			},
+			recover: func(doc *s3walMetaDoc) s3walMetaVerdict {
+				if u := doc.Upstreams[repoID]; u == nil || u.CreatedAt != targetCreatedAt {
+					return s3walMetaApplied
+				}
+				return s3walMetaRerun
+			},
+		})
 	}
-	var targetCreatedAt int64
-	targeted := false
-	deletedHolder := ""
+
+	// Phase 1 — mark. Recovery class PRED: (creation stamp, Detaching)
+	// on the fresh snapshot proves a durable mark; a missing or replaced
+	// row means a concurrent detach completed ours.
+	var createdAt int64
+	var holder string
 	err := s.mutate(ctx, s3walMetaMutation{
-		op: "delete upstream",
+		op: "mark upstream detaching",
 		fn: func(doc *s3walMetaDoc) (bool, error) {
 			u := doc.Upstreams[repoID]
-			if u == nil || (targeted && u.CreatedAt != targetCreatedAt) {
+			if u == nil {
 				return false, fmt.Errorf("upstream for repo %q: %w", repoID, ErrNotFound)
 			}
 			assertNoLegacyClaim(repoID, u)
-			targetCreatedAt, targeted = u.CreatedAt, true
-			deletedHolder = u.SyncClaimHolder
+			createdAt, holder = u.CreatedAt, u.SyncClaimHolder
+			if u.Detaching {
+				return false, nil // resume of an interrupted detach: mark already durable
+			}
+			u.Detaching = true
+			return true, nil
+		},
+		recover: func(doc *s3walMetaDoc) s3walMetaVerdict {
+			if u := doc.Upstreams[repoID]; u != nil && u.CreatedAt == createdAt && !u.Detaching {
+				return s3walMetaRerun
+			}
+			return s3walMetaApplied
+		},
+	})
+	if err != nil {
+		return err
+	}
+
+	// Phase 2 — revoke the fence (see the ordering proof above).
+	if holder != "" {
+		if cerr := s.sink.ClearSyncClaim(ctx, repoID, holder); cerr != nil {
+			return fmt.Errorf("detach upstream for repo %q: clear sync-claim fence: %w", repoID, cerr)
+		}
+	}
+
+	// Phase 3 — delete the marked row.
+	return s.mutate(ctx, s3walMetaMutation{
+		op: "delete upstream",
+		fn: func(doc *s3walMetaDoc) (bool, error) {
+			u := doc.Upstreams[repoID]
+			if u == nil || u.CreatedAt != createdAt {
+				return false, nil // a concurrent detach completed ours: same terminal state
+			}
+			assertf(u.Detaching, "s3walmeta: detaching mark vanished for repo %q (nothing unmarks)", repoID)
 			delete(doc.Upstreams, repoID)
 			return true, nil
 		},
 		recover: func(doc *s3walMetaDoc) s3walMetaVerdict {
-			if u := doc.Upstreams[repoID]; u == nil || u.CreatedAt != targetCreatedAt {
+			if u := doc.Upstreams[repoID]; u == nil || u.CreatedAt != createdAt {
 				return s3walMetaApplied
 			}
 			return s3walMetaRerun
 		},
 	})
-	if err != nil || s.sink == nil || deletedHolder == "" {
-		return err
-	}
-	if cerr := s.sink.ClearSyncClaim(ctx, repoID, deletedHolder); cerr != nil {
-		return fmt.Errorf("detach upstream for repo %q: clear sync-claim fence after delete: %w", repoID, cerr)
-	}
-	return nil
 }
 
 // RequestSync marks a pending sync request (issue #79 protocol);
@@ -656,6 +727,12 @@ func (s *S3WAL) TryBeginSync(ctx context.Context, repoID, holder string, lease t
 				return false, err
 			}
 			assertNoLegacyClaim(repoID, u)
+			if u.Detaching {
+				// A durable detaching mark refuses new claims so no new
+				// fence can be installed once DeleteRepoUpstream's phase 1
+				// landed: the row is logically detached already.
+				return false, fmt.Errorf("upstream for repo %q: %w", repoID, ErrNotFound)
+			}
 			if u.Syncing && u.SyncClaimExpiresAt > nowNanos {
 				up = u.toRepoUpstream(repoID) // unexpired claim in flight: refused
 				return false, nil
@@ -704,9 +781,22 @@ func (s *S3WAL) TryBeginSync(ctx context.Context, repoID, holder string, lease t
 	// landing AFTER the thief's), the thief's fence was just overwritten
 	// — clear our token (owner-guarded: the thief's own re-install is
 	// never touched) and refuse the claim, so a stolen holder can never
-	// write under a late-reinstalled fence.
-	fresh, gerr := s.GetRepoUpstream(ctx, repoID)
-	if gerr == nil && fresh.Syncing && fresh.SyncClaimHolder == holder &&
+	// write under a late-reinstalled fence. A detaching (or already
+	// deleted) row refuses the same way: DeleteRepoUpstream's fence
+	// revocation may have preceded our install, so handing the claim out
+	// could outlive the detach — self-revoking here closes that arm of
+	// its ordering proof.
+	var fresh RepoUpstream
+	detaching := false
+	freshDoc, gerr := s.viewDoc(ctx)
+	if gerr == nil {
+		if u, lerr := lookupUpstream(freshDoc, repoID); lerr != nil {
+			gerr = lerr
+		} else {
+			fresh, detaching = u.toRepoUpstream(repoID), u.Detaching
+		}
+	}
+	if gerr == nil && !detaching && fresh.Syncing && fresh.SyncClaimHolder == holder &&
 		fresh.SyncClaimExpiresAt.Equal(time.Unix(0, expiry).UTC()) {
 		return up, true, stolenFrom, nil
 	}

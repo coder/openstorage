@@ -168,6 +168,13 @@ type s3walMetaUpstream struct {
 	PushRunCount       int    `json:"push_run_count,omitempty"`
 	PushSuccessCount   int    `json:"push_success_count,omitempty"`
 	CreatedAt          int64  `json:"created_at"`
+	// Detaching marks a sink-wired DeleteRepoUpstream in flight (phase 1
+	// of the fence-revoking detach; ordering proof on that method): once
+	// durable, TryBeginSync refuses the row so no new fence can be
+	// installed, and only the detach's final phase removes the row. Never
+	// unset. No legacy-schema concern: no pre-s3walmeta binary exists
+	// (the package-wide argument), so absent means false, never unknown.
+	Detaching bool `json:"detaching,omitempty"`
 }
 
 // toRepoUpstream renders the stored row as the interface type, converting
