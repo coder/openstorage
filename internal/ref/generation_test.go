@@ -1,10 +1,11 @@
 // Generation-counter conformance tests (issue #4): every mutation path on
 // the RefStore surface bumps the per-repo generation in the same atomic unit
 // as the mutation, lost CAS races bump nothing, and GetGeneration is a
-// point-read. Test bodies fan out over BOTH backends via runRefBackends —
-// the pg lane lazily boots one testcontainers-go Postgres for the whole
-// package (sqlite-filtered runs boot zero containers) and doubles as direct
-// PG coverage for the CTE-based CASRef statements.
+// point-read. Test bodies fan out over ALL backends via runRefBackends —
+// the pg lane lazily boots one testcontainers-go Postgres and the s3wal
+// lane one SeaweedFS for the whole package (sqlite-filtered runs boot zero
+// containers) — and double as direct coverage for the CTE-based PG CASRef
+// statements and the manifest-CAS driver (issue #133).
 package ref
 
 import (
@@ -15,6 +16,9 @@ import (
 	"testing"
 
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
+
+	"github.com/coder/code-storage/internal/ref/s3wal"
+	"github.com/coder/code-storage/internal/ref/s3wal/s3waltest"
 )
 
 var (
@@ -76,24 +80,73 @@ func pgTestStore(t *testing.T) *PG {
 	return pgStore
 }
 
+var (
+	s3walOnce    sync.Once
+	s3walErr     error
+	s3walStore   *S3WAL
+	s3walCleanup []func()
+)
+
+// s3walTestStore lazily boots the package-wide SeaweedFS container and the
+// manifest-CAS store (issue #133), running InitSchema — the §2.6
+// conditional-write probe — once at boot, exactly like the real serve
+// path. Same Docker requirement as the pg lane: s3wal-filtered-out runs
+// boot zero containers.
+func s3walTestStore(t *testing.T) *S3WAL {
+	t.Helper()
+	s3walOnce.Do(func() {
+		ctx := context.Background()
+
+		endpoint, terminate, err := s3waltest.StartSeaweedFSContainer(ctx)
+		if err != nil {
+			s3walErr = fmt.Errorf("start seaweedfs container: %w", err)
+			return
+		}
+		s3walCleanup = append(s3walCleanup, terminate)
+
+		raw := s3waltest.RawS3Client(endpoint, "us-east-1", s3waltest.SeaweedFSAccessKey, s3waltest.SeaweedFSSecretKey)
+		if err := s3waltest.EnsureBucket(ctx, raw, "s3wal-ref-conformance"); err != nil {
+			s3walErr = err
+			return
+		}
+		c := s3wal.New(raw, "s3wal-ref-conformance")
+		c.DecodeSeq = s3wal.DecodeSeq // arm the read-side seq watermark
+		store := newS3WALStore(c, func(ctx context.Context) error { return s3wal.Probe(ctx, c) }, c.Close)
+		s3walCleanup = append(s3walCleanup, store.Close)
+		if err := store.InitSchema(ctx); err != nil {
+			s3walErr = fmt.Errorf("s3wal InitSchema: %w", err)
+			return
+		}
+		s3walStore = store
+	})
+	if s3walErr != nil {
+		t.Fatalf("s3wal backend: %v", s3walErr)
+	}
+	return s3walStore
+}
+
 func TestMain(m *testing.M) {
 	code := m.Run()
 	for i := len(pgCleanup) - 1; i >= 0; i-- {
 		pgCleanup[i]()
 	}
+	for i := len(s3walCleanup) - 1; i >= 0; i-- {
+		s3walCleanup[i]()
+	}
 	os.Exit(code)
 }
 
-// runRefBackends fans one conformance test body out over both Store
-// implementations. The pg lane shares one container-wide store — tests
-// isolate by repo name (t.Name() is subtest-unique) — and the sqlite lane
-// gets a fresh DB file per subtest.
+// runRefBackends fans one conformance test body out over every Store
+// implementation. The pg and s3wal lanes share one container-wide store
+// each — tests isolate by repo name (t.Name() is subtest-unique) — and the
+// sqlite lane gets a fresh DB file per subtest.
 func runRefBackends(t *testing.T, fn func(t *testing.T, s Store)) {
 	t.Run("pg", func(t *testing.T) { fn(t, pgTestStore(t)) })
 	t.Run("sqlite", func(t *testing.T) {
 		s, _ := openTestSQLite(t)
 		fn(t, s)
 	})
+	t.Run("s3wal", func(t *testing.T) { fn(t, s3walTestStore(t)) })
 }
 
 func TestGenerationBumpsOnEveryMutation(t *testing.T) {
@@ -206,6 +259,13 @@ func TestGenerationLegacyWriterStillBumps(t *testing.T) {
 }
 
 func testGenerationLegacyWriterStillBumps(t *testing.T, s Store) {
+	if _, ok := s.(*S3WAL); ok {
+		// s3wal has no SQL schema, hence no legacy binary that could write
+		// raw DML around the driver: the driver's per-row bumps are the
+		// ONLY write path, so the trigger rollout-safety property this
+		// test pins does not exist there.
+		t.Skip("s3wal has no SQL triggers or legacy raw-DML writers")
+	}
 	ctx := context.Background()
 	repo := t.Name()
 
