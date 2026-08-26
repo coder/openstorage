@@ -30,9 +30,24 @@
 // nightly runs bounded; CODESTORAGE_BENCH_PUSH_SECS=60 gives the plan §3
 // campaign windows.
 //
-// While a window runs, an untimed observer goroutine polls ls-remote
-// (~4/s, negligible against ~30 push/s) and validates every observation
-// against the pre-generated chains — see pushObserver.
+// The bench has two mutually exclusive campaign modes (Codex round-3: a
+// mid-window ls-remote observer is itself a reader contending with the
+// measured pushes, and each poll can hydrate the shared cache repo — the
+// very mechanism behind issue #170 — so observation must not share a
+// window with performance measurement):
+//   - performance mode (default): no observer runs inside the window; the
+//     end-of-window accepted-tips check still verifies durability. These
+//     are the published performance numbers and the nightly benchstat
+//     series.
+//   - correctness mode (CODESTORAGE_BENCH_OBSERVE=1): the pushObserver
+//     polls ls-remote mid-window (~4/s) and validates every observation
+//     against the pre-generated chains. Latency/throughput from these
+//     runs are NOT performance results and are reported separately.
+//
+// A truly noninterfering observation path does not exist: any read
+// through the serve node shares the hydration path with the pushers, and
+// reading the bucket directly would bypass the authority semantics
+// (hydration, generation reads) the detector must witness.
 package githttp
 
 import (
@@ -69,9 +84,17 @@ const (
 	// writer that still exhausts its chain ends participation early and
 	// is counted in exhausted-writers.
 	benchChainPushRate = 18
-	// benchObserverInterval is the mid-window ls-remote poll cadence.
+	// benchObserverInterval is the mid-window ls-remote poll cadence
+	// (correctness mode only).
 	benchObserverInterval = 250 * time.Millisecond
+	// envBenchObserve selects correctness mode: "1" runs the mid-window
+	// pushObserver, anything else keeps the window observer-free (the
+	// performance mode; see the package comment).
+	envBenchObserve = "CODESTORAGE_BENCH_OBSERVE"
 )
+
+// benchObserveMode reports whether this run is a correctness campaign.
+func benchObserveMode() bool { return os.Getenv(envBenchObserve) == "1" }
 
 func benchPushWindow(b *testing.B) time.Duration {
 	b.Helper()
@@ -501,47 +524,51 @@ func runPushWindow(b *testing.B, writers int, window time.Duration) pushWindowRe
 	}
 	warmed.Wait()
 
-	// Mid-window observer: untimed ls-remote polls validating every
-	// observation against the chains (~4/s — negligible against the push
-	// rate; a transient contained between two polls stays undetectable).
-	obs := newPushObserver(chains)
+	// Mid-window observer — correctness mode only: the observer is itself
+	// a reader contending with the measured pushes, and each poll may
+	// hydrate the shared cache repo (the issue #170 mechanism), so it
+	// never shares a window with performance measurement (a transient
+	// contained between two polls stays undetectable either way).
 	obsStop := make(chan struct{})
 	var obsDone sync.WaitGroup
-	obsDone.Add(1)
-	go func() {
-		defer obsDone.Done()
-		ticker := time.NewTicker(benchObserverInterval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-obsStop:
-				return
-			case <-ticker.C:
-			}
-			ackedBefore := make([]int, writers)
-			for i := range writers {
-				ackedBefore[i] = int(acked[i].Load())
-			}
-			out, err := tryGit(seed, "ls-remote", url)
-			if err != nil {
-				b.Logf("observer ls-remote: %v\n%s", err, out)
-				continue
-			}
-			res.polls++
-			tips := map[string]string{}
-			for line := range strings.Lines(out) {
-				if sha, ref, ok := strings.Cut(strings.TrimSpace(line), "\t"); ok {
-					tips[ref] = sha
+	if benchObserveMode() {
+		obs := newPushObserver(chains)
+		obsDone.Add(1)
+		go func() {
+			defer obsDone.Done()
+			ticker := time.NewTicker(benchObserverInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-obsStop:
+					return
+				case <-ticker.C:
+				}
+				ackedBefore := make([]int, writers)
+				for i := range writers {
+					ackedBefore[i] = int(acked[i].Load())
+				}
+				out, err := tryGit(seed, "ls-remote", url)
+				if err != nil {
+					b.Logf("observer ls-remote: %v\n%s", err, out)
+					continue
+				}
+				res.polls++
+				tips := map[string]string{}
+				for line := range strings.Lines(out) {
+					if sha, ref, ok := strings.Cut(strings.TrimSpace(line), "\t"); ok {
+						tips[ref] = sha
+					}
+				}
+				for i := range writers {
+					tip := tips[fmt.Sprintf("refs/heads/w%d", i)]
+					if err := obs.observe(i, tip, int(attempted[i].Load()), ackedBefore[i]); err != nil {
+						b.Errorf("observer poll %d: %v", res.polls, err)
+					}
 				}
 			}
-			for i := range writers {
-				tip := tips[fmt.Sprintf("refs/heads/w%d", i)]
-				if err := obs.observe(i, tip, int(attempted[i].Load()), ackedBefore[i]); err != nil {
-					b.Errorf("observer poll %d: %v", res.polls, err)
-				}
-			}
-		}
-	}()
+		}()
+	}
 
 	start = time.Now()
 	b.StartTimer()

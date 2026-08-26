@@ -55,7 +55,11 @@ jobs:
         # SQLite lane in the sweep above; this re-runs it against the s3wal
         # zero-infra backend (TestMain boots a SeaweedFS container). Kept
         # at the default 5 s window per cell — the plan §3 60 s campaign
-        # windows are an on-demand run, not a nightly cost.
+        # windows are an on-demand run, not a nightly cost. Nightly runs
+        # performance mode only (CODESTORAGE_BENCH_OBSERVE unset): the
+        # mid-window correctness observer would contend with the measured
+        # pushes; correctness campaigns are on-demand (see
+        # docs/plans/s3wal-bench-results.md).
         shell: bash
         env:
           CODESTORAGE_TEST_BACKEND: s3wal

@@ -145,30 +145,43 @@ a ≥ 20-push collective warmup. Serve-side background jobs (e.g. the
 10-pack repack fold) run during the windows — deliberately: that is the
 production push path.
 
-Two lost-update detectors verify every window:
+The bench has two mutually exclusive campaign modes (Codex round-3: a
+mid-window reader is itself load — 4 polls/s against 7 push/s at N=1 is
+not negligible — and each `ls-remote` poll may hydrate the shared cache
+repo, the very mechanism behind issue #170, so the bench could induce the
+failures it reports; a truly noninterfering observation path does not
+exist, because any read through the serve node shares the hydration path
+with the pushers and reading the bucket directly would bypass the
+authority semantics the detector must witness):
 
-- **Final check:** a post-window `ls-remote` verifies every writer's branch
-  holds one of that writer's ACCEPTED tips: a successful push collapses the
-  set to its acknowledged tip; a failed push appends its attempted tip (the
-  client cannot distinguish a definitive rejection from a transport failure
-  — or the issue #170 spurious-rejection race — whose ref update landed, so
-  either outcome is legal). No writer is ever skipped; any value outside
-  the set is a violation, and writers ending on an ambiguous (>1-tip) set
-  are reported as `ambiguous-final-tips`.
-- **Mid-window observer:** an untimed goroutine polls `ls-remote` every
-  250 ms (~4/s, negligible against the push rate; `observer-polls` counts
-  the rounds) and validates each observation against the pre-generated
-  chains: an observed tip must be on the writer's chain, must not exceed
-  the writer's attempted pushes, and — once an acknowledged tip has been
-  observed — must never fall below it. This catches an acknowledged update
-  that is transiently dropped and later restored by a descendant push,
-  which the final check alone cannot see (Codex round-2). Honest limit: a
-  rewind fully contained between two polls remains undetectable.
-  `TestPushObserverLegality` red-checks the legality rules synthetically.
+- **Performance mode (default, `CODESTORAGE_BENCH_OBSERVE` unset):** no
+  observer runs inside the window; these runs are the published
+  performance tables and the nightly benchstat series. A post-window
+  `ls-remote` (outside the timed window) still verifies durability: every
+  writer's branch must hold one of that writer's ACCEPTED tips — a
+  successful push collapses the set to its acknowledged tip; a failed push
+  appends its attempted tip (the client cannot distinguish a definitive
+  rejection from a transport failure — or the issue #170 race — whose ref
+  update landed, so either outcome is legal). No writer is ever skipped;
+  any value outside the set is a violation, and writers ending on an
+  ambiguous (>1-tip) set are reported as `ambiguous-final-tips`.
+- **Correctness mode (`CODESTORAGE_BENCH_OBSERVE=1`):** additionally, an
+  observer goroutine polls `ls-remote` every 250 ms (`observer-polls`
+  counts the rounds) and validates each observation against the
+  pre-generated chains: an observed tip must be on the writer's chain,
+  must not exceed the writer's attempted pushes, and — once an
+  acknowledged tip has been observed — must never fall below it. This
+  catches an acknowledged update transiently dropped and later restored by
+  a descendant push, which the final check alone cannot see (Codex
+  round-2). Honest limit: a rewind fully contained between two polls
+  remains undetectable. `TestPushObserverLegality` red-checks the legality
+  rules synthetically. Latency/throughput from correctness runs are NOT
+  performance results (see the separate subsection below).
 
-**Zero violations from either detector in every cell.**
+**Zero violations from either detector in every cell of both campaigns.**
 
-Commands (one lane per invocation; the lane lands in the benchmark name):
+Commands (one lane per invocation; the lane lands in the benchmark name;
+add `CODESTORAGE_BENCH_OBSERVE=1` for a correctness-mode run):
 
 ```
 CODESTORAGE_TEST_BACKEND=s3wal CODESTORAGE_BENCH_PUSH_SECS=60 CODESTORAGE_BENCH_CSV_DIR=… \
@@ -177,42 +190,58 @@ CODESTORAGE_TEST_BACKEND=local CODESTORAGE_BENCH_PUSH_SECS=60 CODESTORAGE_BENCH_
   go test ./internal/githttp/ -run '^$' -bench 'BenchmarkPushE2E' -benchtime 1x
 ```
 
-### s3wal (zero-infra: SeaweedFS bucket = ref+meta authority AND blob store)
+### s3wal (zero-infra: SeaweedFS bucket = ref+meta authority AND blob store) — performance mode
 
 | Writers | p50 | p95 | p99 | push/s | samples | rejected pushes | max starve |
 |---|---|---|---|---|---|---|---|
-| 1 (uncontended floor) | 140.2 ms | 176.2 ms | 186.5 ms | 7.1 | 424 | 0 | 0.21 s |
-| 2 | 166.0 ms | 232.1 ms | 264.3 ms | 11.9 | 716 | 0 | 0.28 s |
-| 8 | 317.0 ms | 644.4 ms | 874.2 ms | 23.2 | 1,403 | 0 | 3.38 s |
-| 32 | 836.6 ms | 3.29 s | 5.21 s | 26.8 | 1,673 | 1 | 14.2 s |
+| 1 (uncontended floor) | 138.4 ms | 173.2 ms | 182.1 ms | 7.2 | 431 | 0 | 0.20 s |
+| 2 | 167.3 ms | 229.3 ms | 260.8 ms | 11.9 | 714 | 0 | 0.29 s |
+| 8 | 318.9 ms | 601.3 ms | 858.9 ms | 23.2 | 1,402 | 0 | 2.74 s |
+| 32 | 832.5 ms | 3.22 s | 5.75 s | 26.7 | 1,679 | 1 | 12.5 s |
 
-### SQLite (local mode: `sqlite://` + `file://`)
+### SQLite (local mode: `sqlite://` + `file://`) — performance mode
 
 | Writers | p50 | p95 | p99 | push/s | samples | rejected pushes | max starve |
 |---|---|---|---|---|---|---|---|
-| 1 (uncontended floor) | 110.7 ms | 139.5 ms | 145.9 ms | 9.0 | 541 | 0 | 0.16 s |
-| 2 | 134.0 ms | 190.1 ms | 203.4 ms | 14.9 | 894 | 0 | 0.23 s |
-| 8 | 267.2 ms | 440.8 ms | 477.4 ms | 29.6 | 1,790 | 0 | 0.55 s |
-| 32 | 707.4 ms | 1.23 s | 1.32 s | 44.6 | 2,694 | 0 | 1.58 s |
+| 1 (uncontended floor) | 112.1 ms | 140.8 ms | 150.1 ms | 8.9 | 537 | 0 | 0.16 s |
+| 2 | 135.6 ms | 236.8 ms | 285.8 ms | 14.2 | 856 | 0 | 0.37 s |
+| 8 | 308.5 ms | 476.6 ms | 730.2 ms | 25.5 | 1,542 | 0 | 1.02 s |
+| 32 | 736.6 ms | 1.49 s | 2.82 s | 41.6 | 2,529 | 0 | 3.91 s |
 
-Reading: the uncontended zero-infra push costs ~30 ms (+27%) over local
-mode (140 vs 111 ms p50) — the backend is a minority of the push path,
+Reading: the uncontended zero-infra push costs ~26 ms (+23%) over local
+mode (138 vs 112 ms p50) — the backend is a minority of the push path,
 which is dominated by git subprocesses and HTTP round-trips on both lanes.
-Under hot-group contention the gap widens in the tail (N=32 p99 5.2 s vs
-1.32 s) and throughput keeps scaling on SQLite (44.6 push/s) while s3wal
-saturates around 27 push/s. Removing client-side commit generation from
-the window (the re-measurement) raised throughput on both lanes — writers
-now issue pushes back-to-back — while per-push latency stayed in the same
-band. All of this is a same-host loopback floor for the backend cost; a
-real client would add its own network RTT to every number equally.
+Under hot-group contention the gap widens in the tail (N=32 p99 5.8 s vs
+2.8 s) and throughput keeps scaling on SQLite (41.6 push/s) while s3wal
+saturates around 27 push/s. All of this is a same-host loopback floor for
+the backend cost; a real client would add its own network RTT to every
+number equally.
+
+### Correctness campaign (observer on — NOT performance numbers)
+
+Re-run of the interesting contention cells with the mid-window observer
+polling `ls-remote` every 250 ms; latency/throughput here carry the
+observer's own load and hydration pressure and are reported only as
+context for the correctness verdict:
+
+| Cell | observer polls | observer violations | rejected pushes | ambiguous final tips | pushes |
+|---|---|---|---|---|---|
+| s3wal, N=8 | 246 | 0 | 1 | 0 | 1,370 |
+| s3wal, N=32 | 161 | 0 | 3 | 0 | 1,696 |
+| SQLite, N=32 | 241 | 0 | 0 | 0 | 2,704 |
+
+648 polls, all legality-clean: no foreign tips, no tips beyond attempted
+pushes, no rewind below an observed acknowledged tip. (The s3wal N=32
+observer completed fewer rounds in its 60 s because polls slow under
+peak load.)
 
 ### Retry evidence (contention surfacing to the client)
 
-At N=32 on s3wal, 1 of 1,674 measured pushes was rejected when the hook's
-manifest CAS exhausted its bounded retry budget — a clean, git-native
-rejection, not a hang or a lost update (the ambiguous-tips detector
-accounted for it; the first recording of these cells surfaced 3 such
-rejections in its 60 s window):
+At N=32 on s3wal, 1 of 1,680 measured performance-mode pushes (and 3 in
+the correctness-mode re-run) was rejected when the hook's manifest CAS
+exhausted its bounded retry budget — a clean, git-native rejection, not a
+hang or a lost update (the accepted-tips detector accounts for every such
+rejection):
 
 ```
 remote: codestorage hook: s3wal cas ref repo_…: 16 attempts: s3wal: conditional-write contention retries exhausted
@@ -253,8 +282,8 @@ SeaweedFS-loopback numbers are quoted as directional evidence only:
   self-hosted store: **none observed.** Exactly-once winners across
   101,728 winning advances and 788,919 lost races in the 60 s microbench
   cells, plus a clean ls-remote lost-update detector across all 8 e2e push
-  cells (~10,100 real pushes, plus ~1,800 mid-window observer polls all
-  legality-clean).
+  cells (~15,500 real pushes across the performance and correctness
+  campaigns, plus 648 correctness-mode observer polls all legality-clean).
 
 **Verdict input:** nothing in the SeaweedFS or SQLite data trips any
 threshold that can be measured locally; the real-S3 thresholds remain
@@ -268,9 +297,12 @@ continue; real-S3 gate blocked.**
 the SQLite lane (default 5 s windows) and the s3wal microbenches (SeaweedFS
 container — the runner has Docker, the sweep already depended on it). A
 second step re-runs `BenchmarkPushE2E` with `CODESTORAGE_TEST_BACKEND=s3wal`
-so both lanes produce a nightly series. The 60 s §3 campaign windows stay
-on-demand (`workflow_dispatch` / local runs) — they are a measurement
-campaign, not a nightly regression signal.
+so both lanes produce a nightly series. Nightly runs performance mode only
+(`CODESTORAGE_BENCH_OBSERVE` unset): the benchstat series must never carry
+the correctness observer's interference. The 60 s §3 campaign windows and
+the observer-on correctness campaign stay on-demand (`workflow_dispatch` /
+local runs) — they are measurement campaigns, not a nightly regression
+signal.
 
 ## Raw data
 
