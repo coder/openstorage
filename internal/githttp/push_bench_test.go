@@ -15,13 +15,24 @@
 // the SQLite write lock, or PG row locks) without git-level
 // non-fast-forward rejections.
 //
-// Only the `git push` subprocess is timed — commit creation is untimed —
-// so each sample includes one git process startup (a few ms), documented
-// in docs/plans/s3wal-bench-results.md. Per-op CSVs land in
+// Only the `git push` subprocess runs (and is timed) inside the sustained
+// window: every writer's commit chain is pre-generated during setup, so no
+// other git subprocess shares the measured interval. Each sample still
+// includes one git process startup (a few ms), documented in
+// docs/plans/s3wal-bench-results.md. The standard benchmark timer is
+// stopped for all orchestration (registration, seeding, clones, chain
+// generation, warmup, verification) and runs only across the sustained
+// windows; the reported ns/op is overridden to timed-window wall time per
+// successful push (the reciprocal of push/s) so benchstat tracks
+// throughput, not orchestration. Per-op CSVs land in
 // CODESTORAGE_BENCH_CSV_DIR when set (same contract as the s3wal
 // microbenches). The sustained window defaults to 5 s per cell to keep
 // nightly runs bounded; CODESTORAGE_BENCH_PUSH_SECS=60 gives the plan §3
 // campaign windows.
+//
+// While a window runs, an untimed observer goroutine polls ls-remote
+// (~4/s, negligible against ~30 push/s) and validates every observation
+// against the pre-generated chains — see pushObserver.
 package githttp
 
 import (
@@ -34,6 +45,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -50,6 +62,15 @@ const (
 	// benchPushWarmup is the untimed collective warmup before each
 	// measured window (plan §3 method: ≥ 20 ops discarded per cell).
 	benchPushWarmup = 20
+	// benchChainPushRate is the assumed per-writer ceiling on sustained
+	// push throughput, used to size the pre-generated commit chains (no
+	// `git commit` may run inside the window). Uncontended loopback
+	// pushes bottom out around 100 ms (≈ 10/s); 18/s adds headroom. A
+	// writer that still exhausts its chain ends participation early and
+	// is counted in exhausted-writers.
+	benchChainPushRate = 18
+	// benchObserverInterval is the mid-window ls-remote poll cadence.
+	benchObserverInterval = 250 * time.Millisecond
 )
 
 func benchPushWindow(b *testing.B) time.Duration {
@@ -74,7 +95,9 @@ type pushSample struct {
 
 // pushWindowResult aggregates one sustained window. ambiguous counts
 // writers whose final accepted-tip set held more than one value (trailing
-// failed pushes — the detector accepted any of them; see runPushWindow).
+// failed pushes — the detector accepted any of them; see runPushWindow);
+// exhausted counts writers that ran out of pre-generated commits before
+// the deadline; polls counts successful observer ls-remote rounds.
 type pushWindowResult struct {
 	samples   []pushSample
 	failures  int64
@@ -82,6 +105,8 @@ type pushWindowResult struct {
 	elapsed   time.Duration
 	packBytes int
 	ambiguous int64
+	exhausted int64
+	polls     int64
 }
 
 func benchMS(d time.Duration) float64 { return float64(d) / float64(time.Millisecond) }
@@ -142,8 +167,7 @@ func benchSeedRepo(b *testing.B) string {
 }
 
 // benchCommitOp rewrites the tracked data file and commits, returning the
-// new HEAD. Errors are returned, not fataled: writer goroutines may not
-// call FailNow.
+// new HEAD (used for the pack-size measurement on the seed repo).
 func benchCommitOp(dir string, writer, op int) (string, error) {
 	content := fmt.Sprintf("writer %d op %d\n", writer, op)
 	if err := os.WriteFile(filepath.Join(dir, "data.txt"), []byte(content), 0o644); err != nil {
@@ -178,26 +202,153 @@ func benchPackBytes(b *testing.B, dir, base, head string) int {
 	return len(out)
 }
 
+// benchGenerateChain pre-generates n linear commits on the writer's
+// checked-out branch and returns their shas oldest-first: the writers only
+// ever run `git push` inside the sustained window, so client-side commit
+// generation can never leak onto the timed path.
+func benchGenerateChain(dir string, writer, n int) ([]string, error) {
+	if n <= 0 {
+		return nil, fmt.Errorf("benchGenerateChain: n=%d", n)
+	}
+	for op := 1; op <= n; op++ {
+		content := fmt.Sprintf("writer %d op %d\n", writer, op)
+		if err := os.WriteFile(filepath.Join(dir, "data.txt"), []byte(content), 0o644); err != nil {
+			return nil, err
+		}
+		if out, err := tryGit(dir, "commit", "-a", "-q", "-m", fmt.Sprintf("w%d op %d", writer, op)); err != nil {
+			return nil, fmt.Errorf("commit %d: %w\n%s", op, err, out)
+		}
+	}
+	// Limiting applies before --reverse: the newest n commits, oldest
+	// first — exactly the generated chain.
+	out, err := tryGit(dir, "log", "-n", strconv.Itoa(n), "--reverse", "--format=%H")
+	if err != nil {
+		return nil, fmt.Errorf("log: %w\n%s", err, out)
+	}
+	shas := strings.Fields(out)
+	if len(shas) != n {
+		return nil, fmt.Errorf("chain length %d, want %d", len(shas), n)
+	}
+	return shas, nil
+}
+
+// pushObserver validates mid-window ls-remote observations against the
+// writers' pre-generated commit chains. The end-of-window detector alone
+// cannot see an acknowledged update that is transiently dropped and later
+// restored by a descendant push; the observer closes that gap up to its
+// poll cadence (a rewind fully contained between two polls remains
+// undetectable — stated in the results doc rather than overclaimed).
+// Rules per writer branch:
+//  1. the observed tip must be "" (absent) or on the writer's chain —
+//     anything else is a foreign write;
+//  2. the tip's chain index must not exceed the writer's highest attempted
+//     push (the server cannot hold a commit never sent);
+//  3. once an ACKED tip has been observed, later observations must never
+//     fall below its index: chains are linear and pushes fast-forward
+//     only, so an acked index a ≥ i proves chain[i-1] is committed
+//     history, and any later observation < i is a lost acknowledged
+//     update even if the final state ends up legal.
+type pushObserver struct {
+	idx   []map[string]int // per writer: sha → 1-based chain index
+	floor []int            // per writer: highest observed acked index
+}
+
+func newPushObserver(chains [][]string) *pushObserver {
+	o := &pushObserver{idx: make([]map[string]int, len(chains)), floor: make([]int, len(chains))}
+	for i, chain := range chains {
+		m := make(map[string]int, len(chain))
+		for j, sha := range chain {
+			m[sha] = j + 1
+		}
+		o.idx[i] = m
+	}
+	return o
+}
+
+// observe validates one observation for writer i; sha is the server tip
+// ("" = branch absent). attempted must be loaded AFTER the ls-remote
+// completed (it can only overcount what the server could have seen) and
+// acked BEFORE it started (an ack landing mid-poll may not be visible yet
+// and must not raise the floor).
+func (o *pushObserver) observe(writer int, sha string, attempted, acked int) error {
+	idx := 0
+	if sha != "" {
+		var ok bool
+		if idx, ok = o.idx[writer][sha]; !ok {
+			return fmt.Errorf("writer %d: foreign tip %q on the server", writer, sha)
+		}
+	}
+	if idx > attempted {
+		return fmt.Errorf("writer %d: server tip %q is chain index %d, beyond the %d attempted pushes", writer, sha, idx, attempted)
+	}
+	if idx < o.floor[writer] {
+		return fmt.Errorf("writer %d: server tip rewound to chain index %d, below observed-acked index %d", writer, idx, o.floor[writer])
+	}
+	if idx <= acked && idx > o.floor[writer] {
+		o.floor[writer] = idx
+	}
+	return nil
+}
+
+// TestPushObserverLegality red-checks the observer's legality rules with a
+// synthetic observation sequence. The decisive case is the transient
+// rewind: an acknowledged tip is observed, the branch rewinds below it,
+// and a later descendant push restores a legal-looking final state — the
+// end-of-window accepted-tips check alone would pass such a window, so
+// only the observer can flag it.
+func TestPushObserverLegality(t *testing.T) {
+	chain := []string{"aaa", "bbb", "ccc", "ddd"}
+	o := newPushObserver([][]string{chain})
+	steps := []struct {
+		name             string
+		sha              string
+		attempted, acked int
+		wantErr          bool
+	}{
+		{"absent before any push", "", 0, 0, false},
+		{"attempted-but-unacked tip visible", "aaa", 1, 0, false},
+		{"acked tip observed (raises the floor)", "bbb", 2, 2, false},
+		{"foreign tip", "zzz", 2, 2, true},
+		{"tip beyond attempted pushes", "ddd", 3, 2, true},
+		{"holding at the floor", "bbb", 3, 2, false},
+		{"transient rewind below the observed-acked tip", "aaa", 3, 2, true},
+		{"branch vanished below the observed-acked tip", "", 3, 2, true},
+		{"descendant restores a legal final state (final check alone would pass)", "ccc", 3, 3, false},
+	}
+	for _, s := range steps {
+		if err := o.observe(0, s.sha, s.attempted, s.acked); (err != nil) != s.wantErr {
+			t.Errorf("%s: observe(%q, attempted=%d, acked=%d) = %v, wantErr=%v",
+				s.name, s.sha, s.attempted, s.acked, err, s.wantErr)
+		}
+	}
+}
+
 // runPushWindow registers a fresh repo, seeds refs/heads/main, clones one
-// working dir per writer (local clone — object transfer is untimed), runs
-// the collective warmup, then lets the writers push continuously for the
-// window. Each writer owns refs/heads/w<i>. After the window one ls-remote
-// acts as the lost-update detector: a writer's branch must hold one of the
-// writer's ACCEPTED tips. On a successful push the set collapses to that
-// acknowledged tip; a failed push APPENDS its attempted tip instead of
-// being dropped, because the client cannot distinguish a definitive
-// rejection from a transport failure — or the issue #170 spurious-rejection
-// race — whose ref update already landed. Every legal server state (the
-// last ack, or any tip stacked by ambiguously-failed pushes since) is
-// therefore in the set, every writer is always verified, and any THIRD
-// value is a violation. This keeps such windows detector-valid instead of
-// inconclusive; the count of writers that ended on an ambiguous set is
-// reported as ambiguous-final-tips.
+// working dir per writer (local clone — object transfer is untimed),
+// pre-generates every writer's commit chain, runs the collective warmup,
+// then lets the writers push continuously for the window while the
+// pushObserver polls. Each writer owns refs/heads/w<i>. After the window
+// one ls-remote acts as the final lost-update detector: a writer's branch
+// must hold one of the writer's ACCEPTED tips. On a successful push the
+// set collapses to that acknowledged tip; a failed push APPENDS its
+// attempted tip instead of being dropped, because the client cannot
+// distinguish a definitive rejection from a transport failure — or the
+// issue #170 spurious-rejection race — whose ref update already landed.
+// Every legal server state (the last ack, or any tip stacked by
+// ambiguously-failed pushes since) is therefore in the set, every writer
+// is always verified, and any THIRD value is a violation. This keeps such
+// windows detector-valid instead of inconclusive; the count of writers
+// that ended on an ambiguous set is reported as ambiguous-final-tips.
+// Mid-window legality (including transient rewinds the final check cannot
+// see) is the observer's job.
 func runPushWindow(b *testing.B, writers int, window time.Duration) pushWindowResult {
 	b.Helper()
 	if writers <= 0 {
 		b.Fatalf("runPushWindow: %d writers", writers)
 	}
+	// Orchestration stays off the standard benchmark timer; only the
+	// sustained window below is timed.
+	b.StopTimer()
 	repo := benchRegisterRepo(b, fmt.Sprintf("bench-push-w%d-%d", writers, time.Now().UnixNano()))
 	token := benchMintToken(b, repo)
 	url := remoteURL(nodeA, repo, token)
@@ -205,11 +356,29 @@ func runPushWindow(b *testing.B, writers int, window time.Duration) pushWindowRe
 	seed := benchSeedRepo(b)
 	benchGit(b, seed, "push", url, "HEAD:refs/heads/main")
 
+	perWriter := (benchPushWarmup + writers - 1) / writers
+	chainLen := int(window.Seconds()*benchChainPushRate) + perWriter + 5
 	dirs := make([]string, writers)
+	chains := make([][]string, writers)
+	var genWG sync.WaitGroup
 	for i := range dirs {
 		dirs[i] = filepath.Join(b.TempDir(), fmt.Sprintf("w%d", i))
 		benchGit(b, "", "clone", seed, dirs[i])
 		benchGit(b, dirs[i], "checkout", "-b", fmt.Sprintf("w%d", i))
+		genWG.Add(1)
+		go func(i int) {
+			defer genWG.Done()
+			chain, err := benchGenerateChain(dirs[i], i, chainLen)
+			if err != nil {
+				b.Errorf("writer %d chain: %v", i, err)
+				return
+			}
+			chains[i] = chain
+		}(i)
+	}
+	genWG.Wait()
+	if b.Failed() {
+		b.FailNow()
 	}
 
 	var res pushWindowResult
@@ -229,8 +398,12 @@ func runPushWindow(b *testing.B, writers int, window time.Duration) pushWindowRe
 		// for writer i (see the function comment). "" means the branch
 		// may not exist (no push ever acknowledged or attempted).
 		acceptedTips = make([][]string, writers)
+		// attempted/acked publish each writer's progress as 1-based chain
+		// indices for the observer (see pushObserver.observe for the
+		// required load ordering).
+		attempted = make([]atomic.Int64, writers)
+		acked     = make([]atomic.Int64, writers)
 	)
-	perWriter := (benchPushWarmup + writers - 1) / writers
 	var start time.Time // written before close(startCh); read after receive
 	startCh := make(chan struct{})
 	var warmed, done sync.WaitGroup
@@ -239,20 +412,21 @@ func runPushWindow(b *testing.B, writers int, window time.Duration) pushWindowRe
 		done.Add(1)
 		go func(i int) {
 			defer done.Done()
-			dir := dirs[i]
-			refspec := fmt.Sprintf("HEAD:refs/heads/w%d", i)
+			dir, chain := dirs[i], chains[i]
+			branch := fmt.Sprintf("refs/heads/w%d", i)
 			accepted := []string{""}
+			k := 0 // chain commits pushed so far; chain[k] is next
 			var (
 				localSamples []pushSample
 				failures     int64
 				maxStarve    time.Duration
+				exhausted    int64
 				lastSuccess  time.Time // zero until the measured window starts
 			)
-			// Merge in a defer so a writer that errors out at ANY point —
-			// warmup included — still contributes its recorded pushes and
-			// its accepted-tip set (mirrors the s3wal contention runner's
-			// accounting; dropping the set would let an unaccounted server
-			// update pass the detector).
+			// Merge in a defer so a writer that stops at ANY point still
+			// contributes its recorded pushes and its accepted-tip set
+			// (dropping the set would let an unaccounted server update
+			// pass the detector).
 			defer func() {
 				if !lastSuccess.IsZero() {
 					maxStarve = max(maxStarve, time.Since(lastSuccess))
@@ -261,62 +435,60 @@ func runPushWindow(b *testing.B, writers int, window time.Duration) pushWindowRe
 				res.samples = append(res.samples, localSamples...)
 				res.failures += failures
 				res.maxStarve = max(res.maxStarve, maxStarve)
+				res.exhausted += exhausted
 				acceptedTips[i] = accepted
 				mu.Unlock()
 			}()
-			op := 0
-			warmupOK := true
-			for range perWriter {
-				op++
-				head, err := benchCommitOp(dir, i, op)
+			// pushNext sends the next pre-generated commit, publishing the
+			// attempt index BEFORE contacting the server so the observer
+			// can bound what it may legally see there.
+			pushNext := func() (time.Duration, string, error) {
+				sha := chain[k]
+				k++
+				attempted[i].Store(int64(k))
+				t0 := time.Now()
+				out, err := tryGit(dir, "push", url, sha+":"+branch)
+				d := time.Since(t0)
 				if err != nil {
-					b.Errorf("writer %d warmup: %v", i, err)
-					warmupOK = false
-					break
+					// The attempted tip stays accepted: the rejection may
+					// have been ambiguous — a transport failure or the
+					// issue #170 spurious-rejection race — and the ref
+					// update may have landed. The next push fast-forwards
+					// over it either way.
+					accepted = append(accepted, sha)
+					return d, out, err
 				}
-				if out, err := tryGit(dir, "push", url, refspec); err != nil {
-					// Tolerated like the measured loop: under hot-group
-					// load a push can be spuriously rejected even though
-					// the hook committed the ref (issue #170: a concurrent
-					// request's hydration syncs the just-committed ref
-					// into the cache repo before receive-pack's own local
-					// ref update — "cannot lock ref: reference already
-					// exists" on branch creation). The next op stacks a
-					// commit and fast-forwards over it.
-					accepted = append(accepted, head)
-					b.Logf("writer %d warmup push rejected (op %d): %v\n%s", i, op, err, out)
-				} else {
-					accepted = []string{head}
+				acked[i].Store(int64(k))
+				accepted = []string{sha}
+				return d, out, nil
+			}
+			for range perWriter {
+				if _, out, err := pushNext(); err != nil {
+					// Tolerated like the measured loop (see pushNext).
+					b.Logf("writer %d warmup push rejected (op %d): %v\n%s", i, k, err, out)
 				}
 			}
 			warmed.Done()
 			<-startCh
-			if !warmupOK {
-				return
-			}
 			deadline := start.Add(window)
 			lastSuccess = start
 			for time.Now().Before(deadline) {
-				op++
-				head, err := benchCommitOp(dir, i, op)
-				if err != nil {
-					b.Errorf("writer %d: %v", i, err)
-					return
+				if k >= len(chain) {
+					// Generating more commits here would put a git
+					// subprocess back inside the timed window: end this
+					// writer's participation early and record it.
+					exhausted = 1
+					b.Logf("writer %d exhausted its %d-commit chain before the deadline", i, len(chain))
+					break
 				}
-				t0 := time.Now()
-				out, err := tryGit(dir, "push", url, refspec)
-				d := time.Since(t0)
+				d, out, err := pushNext()
 				if err != nil {
 					// A rejected push is a real result under sustained
 					// contention (e.g. SQLITE_BUSY surfacing through the
-					// hook), not a harness bug: count it and keep going —
-					// the next op stacks another commit on this branch.
-					// Its tip stays accepted: the rejection may have been
-					// ambiguous and the ref update may have landed.
+					// hook), not a harness bug: count it and keep going.
 					failures++
-					accepted = append(accepted, head)
 					if failures == 1 {
-						b.Logf("writer %d first push failure (op %d): %v\n%s", i, op, err, out)
+						b.Logf("writer %d first push failure (op %d): %v\n%s", i, k, err, out)
 					}
 					continue
 				}
@@ -324,20 +496,61 @@ func runPushWindow(b *testing.B, writers int, window time.Duration) pushWindowRe
 				localSamples = append(localSamples, pushSample{writer: i, latency: d})
 				maxStarve = max(maxStarve, now.Sub(lastSuccess))
 				lastSuccess = now
-				accepted = []string{head}
 			}
 		}(i)
 	}
 	warmed.Wait()
-	if b.Failed() {
-		close(startCh)
-		done.Wait()
-		b.FailNow()
-	}
+
+	// Mid-window observer: untimed ls-remote polls validating every
+	// observation against the chains (~4/s — negligible against the push
+	// rate; a transient contained between two polls stays undetectable).
+	obs := newPushObserver(chains)
+	obsStop := make(chan struct{})
+	var obsDone sync.WaitGroup
+	obsDone.Add(1)
+	go func() {
+		defer obsDone.Done()
+		ticker := time.NewTicker(benchObserverInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-obsStop:
+				return
+			case <-ticker.C:
+			}
+			ackedBefore := make([]int, writers)
+			for i := range writers {
+				ackedBefore[i] = int(acked[i].Load())
+			}
+			out, err := tryGit(seed, "ls-remote", url)
+			if err != nil {
+				b.Logf("observer ls-remote: %v\n%s", err, out)
+				continue
+			}
+			res.polls++
+			tips := map[string]string{}
+			for line := range strings.Lines(out) {
+				if sha, ref, ok := strings.Cut(strings.TrimSpace(line), "\t"); ok {
+					tips[ref] = sha
+				}
+			}
+			for i := range writers {
+				tip := tips[fmt.Sprintf("refs/heads/w%d", i)]
+				if err := obs.observe(i, tip, int(attempted[i].Load()), ackedBefore[i]); err != nil {
+					b.Errorf("observer poll %d: %v", res.polls, err)
+				}
+			}
+		}
+	}()
+
 	start = time.Now()
+	b.StartTimer()
 	close(startCh)
 	done.Wait()
+	b.StopTimer()
 	res.elapsed = time.Since(start)
+	close(obsStop)
+	obsDone.Wait()
 
 	// Lost-update detector: every writer's branch on the server must hold
 	// one of that writer's accepted tips — no writer is ever skipped, and
@@ -357,6 +570,10 @@ func runPushWindow(b *testing.B, writers int, window time.Duration) pushWindowRe
 			b.Errorf("lost update: server %s = %q, want one of writer %d's accepted tips %q", branch, got, i, acceptedTips[i])
 		}
 	}
+	// Hand a running timer back to b.Loop (which stops it itself after the
+	// final iteration); the caller's metric aggregation costs microseconds
+	// and the published ns/op is overridden regardless.
+	b.StartTimer()
 	return res
 }
 
@@ -395,6 +612,8 @@ func BenchmarkPushE2E(b *testing.B) {
 				elapsed   time.Duration
 				packBytes int
 				ambiguous int64
+				exhausted int64
+				polls     int64
 			)
 			for b.Loop() {
 				res := runPushWindow(b, writers, window)
@@ -404,6 +623,8 @@ func BenchmarkPushE2E(b *testing.B) {
 				elapsed += res.elapsed
 				packBytes = res.packBytes
 				ambiguous += res.ambiguous
+				exhausted += res.exhausted
+				polls += res.polls
 			}
 			if len(all) == 0 {
 				b.Fatal("no successful pushes recorded")
@@ -420,10 +641,18 @@ func BenchmarkPushE2E(b *testing.B) {
 			if elapsed <= 0 {
 				b.Fatal("zero elapsed window time")
 			}
+			// Override the built-in ns/op with timed-window wall time per
+			// successful push (the reciprocal of push/s): the standard
+			// timer already covers only the sustained windows, but per
+			// window-iteration it would report the window duration —
+			// per-push time is the benchstat-meaningful unit.
+			b.ReportMetric(float64(elapsed.Nanoseconds())/float64(len(all)), "ns/op")
 			b.ReportMetric(float64(len(all))/elapsed.Seconds(), "push/s")
 			b.ReportMetric(elapsed.Seconds(), "elapsed-s")
 			b.ReportMetric(float64(failures), "push-failures")
 			b.ReportMetric(float64(ambiguous), "ambiguous-final-tips")
+			b.ReportMetric(float64(exhausted), "exhausted-writers")
+			b.ReportMetric(float64(polls), "observer-polls")
 			b.ReportMetric(benchMS(maxStarve), "max-starve-ms")
 			b.ReportMetric(float64(packBytes), "pack-bytes")
 			pushCSVDump(b, all)

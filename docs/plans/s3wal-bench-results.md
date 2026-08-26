@@ -129,28 +129,44 @@ uncontended floor (single pusher, its own repo); `writers=2/8/32` are N
 concurrent pushers on ONE repo, each on its own branch, so every push
 contends on the repo group's ref authority (the s3wal manifest CAS / the
 SQLite write lock) without git-level non-fast-forward rejections. Each push
-carries one small commit (one ~20-byte file rewrite): **pack size 325–327
+carries one small commit (one ~20-byte file rewrite): **pack size 324–327
 bytes** (commit + tree + blob), measured with `git pack-objects` on the
 identical object set. Timed region = the `git push` subprocess only
-(includes a few ms of git client startup); commit creation is untimed.
-Windows are 60 s sustained per cell after a ≥ 20-push collective warmup.
-Serve-side background jobs (e.g. the 10-pack repack fold) run during the
-windows — deliberately: that is the production push path.
+(includes a few ms of git client startup). Every writer's commit chain is
+**pre-generated during setup** (Codex round-2: no `git commit` subprocess
+runs inside the sustained window — the tables below are the re-measured
+numbers after excluding client-side commit generation; a writer that
+exhausts its chain ends participation early and is counted in
+`exhausted-writers`, zero in every cell). The standard benchmark timer
+covers only the sustained windows, and the published ns/op is overridden
+to timed-window wall time per successful push (the reciprocal of push/s)
+so benchstat tracks throughput. Windows are 60 s sustained per cell after
+a ≥ 20-push collective warmup. Serve-side background jobs (e.g. the
+10-pack repack fold) run during the windows — deliberately: that is the
+production push path.
 
-A post-window `ls-remote` lost-update detector verifies every writer's
-branch holds one of that writer's ACCEPTED tips: a successful push
-collapses the set to its acknowledged tip; a failed push appends its
-attempted tip (the client cannot distinguish a definitive rejection from a
-transport failure — or the issue #170 spurious-rejection race — whose ref
-update landed, so either outcome is legal). No writer is ever skipped; any
-value outside the set is a violation, and writers ending on an ambiguous
-(>1-tip) set are reported as `ambiguous-final-tips`. **Zero violations in
-every cell.** (Detector semantics were tightened after the recorded runs —
-Codex round-1 finding: the original detector skipped a writer whose final
-push failed, which could mask an unaccounted server update. The change
-affects verification only, not timing; the recorded numbers stand, and a
-re-run s3wal writers=8 cell confirms the reworked detector on real
-traffic.)
+Two lost-update detectors verify every window:
+
+- **Final check:** a post-window `ls-remote` verifies every writer's branch
+  holds one of that writer's ACCEPTED tips: a successful push collapses the
+  set to its acknowledged tip; a failed push appends its attempted tip (the
+  client cannot distinguish a definitive rejection from a transport failure
+  — or the issue #170 spurious-rejection race — whose ref update landed, so
+  either outcome is legal). No writer is ever skipped; any value outside
+  the set is a violation, and writers ending on an ambiguous (>1-tip) set
+  are reported as `ambiguous-final-tips`.
+- **Mid-window observer:** an untimed goroutine polls `ls-remote` every
+  250 ms (~4/s, negligible against the push rate; `observer-polls` counts
+  the rounds) and validates each observation against the pre-generated
+  chains: an observed tip must be on the writer's chain, must not exceed
+  the writer's attempted pushes, and — once an acknowledged tip has been
+  observed — must never fall below it. This catches an acknowledged update
+  that is transiently dropped and later restored by a descendant push,
+  which the final check alone cannot see (Codex round-2). Honest limit: a
+  rewind fully contained between two polls remains undetectable.
+  `TestPushObserverLegality` red-checks the legality rules synthetically.
+
+**Zero violations from either detector in every cell.**
 
 Commands (one lane per invocation; the lane lands in the benchmark name):
 
@@ -165,34 +181,38 @@ CODESTORAGE_TEST_BACKEND=local CODESTORAGE_BENCH_PUSH_SECS=60 CODESTORAGE_BENCH_
 
 | Writers | p50 | p95 | p99 | push/s | samples | rejected pushes | max starve |
 |---|---|---|---|---|---|---|---|
-| 1 (uncontended floor) | 132.2 ms | 205.9 ms | 222.9 ms | 5.3 | 318 | 0 | 0.33 s |
-| 2 | 147.9 ms | 211.2 ms | 231.5 ms | 9.9 | 594 | 0 | 0.32 s |
-| 8 | 284.2 ms | 531.6 ms | 766.7 ms | 22.5 | 1,360 | 0 | 1.94 s |
-| 32 | 779.1 ms | 2.75 s | 5.83 s | 27.0 | 1,685 | 3 | 13.0 s |
+| 1 (uncontended floor) | 140.2 ms | 176.2 ms | 186.5 ms | 7.1 | 424 | 0 | 0.21 s |
+| 2 | 166.0 ms | 232.1 ms | 264.3 ms | 11.9 | 716 | 0 | 0.28 s |
+| 8 | 317.0 ms | 644.4 ms | 874.2 ms | 23.2 | 1,403 | 0 | 3.38 s |
+| 32 | 836.6 ms | 3.29 s | 5.21 s | 26.8 | 1,673 | 1 | 14.2 s |
 
 ### SQLite (local mode: `sqlite://` + `file://`)
 
 | Writers | p50 | p95 | p99 | push/s | samples | rejected pushes | max starve |
 |---|---|---|---|---|---|---|---|
-| 1 (uncontended floor) | 102.4 ms | 125.8 ms | 136.5 ms | 6.5 | 390 | 0 | 0.25 s |
-| 2 | 121.0 ms | 162.4 ms | 174.1 ms | 11.7 | 700 | 0 | 0.24 s |
-| 8 | 237.4 ms | 391.2 ms | 416.3 ms | 27.3 | 1,641 | 0 | 0.53 s |
-| 32 | 657.5 ms | 1.16 s | 1.35 s | 42.9 | 2,605 | 0 | 1.84 s |
+| 1 (uncontended floor) | 110.7 ms | 139.5 ms | 145.9 ms | 9.0 | 541 | 0 | 0.16 s |
+| 2 | 134.0 ms | 190.1 ms | 203.4 ms | 14.9 | 894 | 0 | 0.23 s |
+| 8 | 267.2 ms | 440.8 ms | 477.4 ms | 29.6 | 1,790 | 0 | 0.55 s |
+| 32 | 707.4 ms | 1.23 s | 1.32 s | 44.6 | 2,694 | 0 | 1.58 s |
 
-Reading: the uncontended zero-infra push costs ~30 ms (+29%) over local
-mode (132 vs 102 ms p50) — the backend is a minority of the push path,
+Reading: the uncontended zero-infra push costs ~30 ms (+27%) over local
+mode (140 vs 111 ms p50) — the backend is a minority of the push path,
 which is dominated by git subprocesses and HTTP round-trips on both lanes.
-Under hot-group contention the gap widens in the tail (N=32 p99 5.8 s vs
-1.35 s) and throughput keeps scaling on SQLite (42.9 push/s) while s3wal
-saturates around 27 push/s. All of this is a same-host loopback floor for
-the backend cost; a real client would add its own network RTT to every
-number equally.
+Under hot-group contention the gap widens in the tail (N=32 p99 5.2 s vs
+1.32 s) and throughput keeps scaling on SQLite (44.6 push/s) while s3wal
+saturates around 27 push/s. Removing client-side commit generation from
+the window (the re-measurement) raised throughput on both lanes — writers
+now issue pushes back-to-back — while per-push latency stayed in the same
+band. All of this is a same-host loopback floor for the backend cost; a
+real client would add its own network RTT to every number equally.
 
 ### Retry evidence (contention surfacing to the client)
 
-At N=32 on s3wal, 3 of 1,688 measured pushes were rejected when the hook's
+At N=32 on s3wal, 1 of 1,674 measured pushes was rejected when the hook's
 manifest CAS exhausted its bounded retry budget — a clean, git-native
-rejection, not a hang or a lost update:
+rejection, not a hang or a lost update (the ambiguous-tips detector
+accounted for it; the first recording of these cells surfaced 3 such
+rejections in its 60 s window):
 
 ```
 remote: codestorage hook: s3wal cas ref repo_…: 16 attempts: s3wal: conditional-write contention retries exhausted
@@ -223,7 +243,7 @@ SeaweedFS-loopback numbers are quoted as directional evidence only:
   At N=32 throughput dropped to 465.0 adv/s, below the N=8 figure on this
   loopback setup (same shape as Phase 1a: 478.5 vs 654.8) with retries
   growing but bounded (~19 lost races per win, zero retry-budget
-  exhaustions in the microbench; 3 clean rejections in 60 s in the e2e
+  exhaustions in the microbench; 1 clean rejection in 60 s in the e2e
   bench). Whether that constitutes "throughput collapse" must be judged on
   real S3, where the RTT-to-contention-window ratio differs completely.
 - **(4)** 304-path p99 > 100 ms *(real S3 only — not evaluable)*:
@@ -233,7 +253,8 @@ SeaweedFS-loopback numbers are quoted as directional evidence only:
   self-hosted store: **none observed.** Exactly-once winners across
   101,728 winning advances and 788,919 lost races in the 60 s microbench
   cells, plus a clean ls-remote lost-update detector across all 8 e2e push
-  cells (~9,300 real pushes).
+  cells (~10,100 real pushes, plus ~1,800 mid-window observer polls all
+  legality-clean).
 
 **Verdict input:** nothing in the SeaweedFS or SQLite data trips any
 threshold that can be measured locally; the real-S3 thresholds remain
