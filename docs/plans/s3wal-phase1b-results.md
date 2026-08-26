@@ -146,3 +146,70 @@ so recovery tests can interleave a competing writer between a faulted PUT
 and the driver's recovery read (unlike `PutFault`, it may call back into
 the MemCAS). This is the minimal seam that makes every recovery verdict
 above deterministic; no production code carries test scaffolding.
+
+## 9. Post-#132 addendum — scan-state, absence-cover, and reclamation surfaces
+
+Commit `36be9e63` (rebased over #145's SeaweedFS swap, #132's
+fleet-persistent scan state, and #154's read-deadline disarm) implements
+the post-#132 store surface on `ref.S3WAL`:
+
+- **`ScanStateStore`** (`s3walstore_scanstate.go`): `GetJobScanState`,
+  `JobScanStateAge`, `PutJobScanState`, `DeleteJobScanState`,
+  `ParkRepoJobScanState`, `ListJobScanStateScopes`, `BeginLFSReapEpoch`,
+  `RecordLFSReapComplete`, plus `ArmAbsenceAdmissionFence` — one
+  CAS-advanced side object per (job, scope).
+- **Absence covers** (`s3walstore_absence.go`): `ListAbsenceCovers`,
+  `AbsenceCoverHead`, `RenewAbsenceCovers`, `LapsedAbsenceCoverExists`,
+  `CASAbsenceCoverOwner`, `DeleteAbsenceCover` — a fleet `_wal/repo/`
+  prefix walk over the manifests' ordinary reservation entries, never a
+  separate table.
+- **Reclamation growth**: `RetireUnreferencedLFSObject` gains the
+  `reapMaxAge` destructive-reap watermark gate, legacy certification, the
+  epoch pin, and deferred-refund parking; `SettleLFSRefunds` lands;
+  `ReservePackBytes` fails finite admissions closed under the armed
+  absence admission fence; expired un-folded covers consumed by
+  reservation GC (and `SweepExpiredPackReservations`) record lapse
+  evidence; `PurgeRepoLedger` sweeps the base's settlement cursor and
+  refund buckets after the manifest CAS.
+
+Design decisions, in the same spirit as §3–§4:
+
+- **Keys are `_wal/scan/<job>/<hex(scope)>`.** The plan's "path-escaped"
+  sketch is deliberately replaced: `url.PathEscape` reorders `%` (0x25)
+  against literal bytes, while lowercase hex is a strictly monotone,
+  fixed-width (2:1), reversible injection — bucket listing order over
+  encoded keys IS byte order over the unencoded scopes, which is exactly
+  the `ORDER BY scope COLLATE "C"` contract `ListJobScanStateScopes`
+  promises on the SQL backends. No `.json` extension, per the §2.1
+  ordering argument.
+- **Clock story.** The SQL backends stamp `updated_at` with the DATABASE
+  clock so freshness verdicts never mix application clocks. Under the
+  single-process decree every scan-state reader and writer shares ONE
+  process clock, so "DB clock at both ends" collapses to the local clock
+  honestly: stamps are ClkNext-monotone per object (a backward clock jump
+  never regresses `updated_at`) and ages clamp at zero.
+- **Conflict policy (plan §2.10).** Per-key in-process locks serialize
+  same-process writers of one scan key; a CAS conflict that still reaches
+  the store is dual-serve evidence — loud error, never retried. Ambiguous
+  PUTs resolve via a fresh per-write writer nonce, which also makes the
+  non-idempotent `BeginLFSReapEpoch` increment exactly-once.
+- **Non-atomic splits, ordered fail-closed.** Retire deletes the registry
+  row in one manifest CAS, THEN parks the refund in the per-epoch bucket
+  (a crash between the two leaks a slot conservatively — capacity stays
+  charged); settle drains buckets FIRST as side-object CASes, then applies
+  the accumulated count/usage refund and adoption-generation bump in ONE
+  manifest CAS (a crash between loses the drained refund, again
+  conservative; the reverse order could refund twice). `reapEpochMu` and
+  `absenceFenceMu` mirror PG's FOR SHARE epoch pin and the fleet-global
+  fence advisory-lock pair within the one process.
+- **RawKey spelling.** Manifests key reservations on PLAIN blob keys (the
+  §4 divergence), but the absence-cover surface still emits the
+  fleet-uniform decorated `RawKey` spelling and strips it at the boundary:
+  RawKey is a persisted cursor and fold-CAS identity, so its observable
+  shape must not depend on which backend minted it.
+
+Conformance-matrix update: the 15 tests the post-#132 corpus added that
+previously failed on the s3wal lane — the 12 `TestLFSReclaim_*` tests,
+`TestJobScanState_RoundTrip`, `TestJobScanState_ScopesIsolated`, and
+`TestAbsenceCovers_ListHeadDelete` — now pass, with **zero test changes
+needed**; the pg/sqlite lanes are unchanged.
