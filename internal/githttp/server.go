@@ -1016,19 +1016,66 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 		// round 17; a deadline error just resolves the push from whatever
 		// the counters saw) — so oversized bodies uniformly reach the 413
 		// path.
-		if err := http.NewResponseController(w).SetReadDeadline(time.Now().Add(pushDrainTimeout)); err != nil {
-			log.Printf("%s %s: set drain deadline: %v", service, repo, err)
+		drainTimeout := pushDrainTimeout
+		if s.TestMode {
+			// Test knob: shrink the drain window below an injected hook
+			// delay (EnvHookDelay) so the e2e lane can prove hook phases
+			// outlive it (issue #141's receive-pack sibling).
+			if ms := os.Getenv(EnvPushDrainMS); ms != "" {
+				n, err := strconv.Atoi(ms)
+				assertf(err == nil && n > 0, "bad %s=%q", EnvPushDrainMS, ms)
+				drainTimeout = time.Duration(n) * time.Millisecond
+			}
 		}
-		if _, err := io.Copy(io.Discard, body); err != nil && !errors.Is(err, errPushTooLarge) {
-			log.Printf("%s %s: request body drain: %v", service, repo, err)
+		drainDeadlineSet := false
+		if err := http.NewResponseController(w).SetReadDeadline(time.Now().Add(drainTimeout)); err != nil {
+			log.Printf("%s %s: set drain deadline: %v", service, repo, err)
+		} else {
+			drainDeadlineSet = true
+		}
+		// drainedToEOF tracks whether the drains actually observed the wire
+		// body's EOF — the deadline may only be disarmed then (Codex P1 on
+		// this PR): an overflow (errPushTooLarge) or read error stops the
+		// drain with unread bytes still on the wire, the post-handler body
+		// close reads more of them, and production serves without a global
+		// read timeout, so a client that overflows the cap and stalls would
+		// pin that goroutine indefinitely if the deadline were cleared here.
+		drainedToEOF := false
+		if _, err := io.Copy(io.Discard, body); err != nil {
+			if !errors.Is(err, errPushTooLarge) {
+				log.Printf("%s %s: request body drain: %v", service, repo, err)
+			}
+		} else {
+			drainedToEOF = true
 		}
 		// The decoded drain stops at the first gzip framing error without
 		// consuming the wire underneath: a valid push + corrupt member +
 		// padding would evade both counters (Codex round 14). Drain the
-		// compressed side too, bounded by the wire limit.
+		// compressed side too, bounded by the wire limit. Its verdict alone
+		// decides EOF here: it reads the raw wire past wherever the decoded
+		// drain stopped, so a clean finish means the wire is exhausted and
+		// an error (cap trip, timeout, hangup) means it is not.
 		if wireCap != nil {
-			if _, err := io.Copy(io.Discard, wireCap); err != nil && !errors.Is(err, errPushTooLarge) {
-				log.Printf("%s %s: wire body drain: %v", service, repo, err)
+			drainedToEOF = false
+			if _, err := io.Copy(io.Discard, wireCap); err != nil {
+				if !errors.Is(err, errPushTooLarge) {
+					log.Printf("%s %s: wire body drain: %v", service, repo, err)
+				}
+			} else {
+				drainedToEOF = true
+			}
+		}
+		// The body is fully received: DISARM the deadline (issue #141's
+		// receive-pack sibling). net/http's background connection read
+		// starts at body EOF and sits blocked with this deadline armed; on
+		// expiry it cancels r.Context() (connReader.handleReadError), and
+		// CommandContext translates that into killing receive-pack mid-hook
+		// phase — which can legitimately outlive any fixed drain bound (the
+		// sideband-progress note above). Only server-side work remains;
+		// nothing reads the body after this point.
+		if drainDeadlineSet && drainedToEOF {
+			if err := http.NewResponseController(w).SetReadDeadline(time.Time{}); err != nil {
+				log.Printf("%s %s: clear drain deadline: %v", service, repo, err)
 			}
 		}
 		_ = stdin.Close()

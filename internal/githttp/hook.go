@@ -51,6 +51,10 @@ const (
 	EnvTestMode  = "CODESTORAGE_TEST_MODE"
 	EnvCrash     = "CODESTORAGE_TEST_CRASH"
 	EnvHookDelay = "CODESTORAGE_TEST_HOOK_DELAY_MS"
+	// EnvPushDrainMS shrinks the post-copy drain read deadline
+	// (pushDrainTimeout) so the e2e lane can prove hook phases outlive it
+	// (issue #141's receive-pack sibling); ignored outside test mode.
+	EnvPushDrainMS = "CODESTORAGE_TEST_PUSH_DRAIN_MS"
 	// EnvCASDrop/EnvCASDropHard hold a marker-file path; the first update
 	// hook to create the marker lets its CAS statement commit, then reports
 	// a synthetic connection-drop error (issue #2's ambiguous outcome).

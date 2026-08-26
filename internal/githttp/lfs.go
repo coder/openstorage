@@ -3079,8 +3079,10 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target r
 	body := io.Reader(r.Body)
 	rc := http.NewResponseController(w)
 	idle := idleDeadlineBody{r: r.Body, rc: rc, absolute: time.Now().Add(s.lfsReservationTTL())}
+	idleArmed := false
 	if err := rc.SetReadDeadline(idle.deadline(time.Now())); err == nil {
 		body = idle
+		idleArmed = true
 	}
 	h := sha256.New()
 	sfw := &stagingFileWriter{s: s, repo: repoID, f: f, contentLength: r.ContentLength, reserved: &stagingReserved}
@@ -3097,6 +3099,20 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target r
 		}
 		lfsError(w, http.StatusBadRequest, "reading upload body failed: "+err.Error())
 		return
+	}
+	// The body is fully consumed: DISARM the idle deadline (issue #141).
+	// net/http starts a background connection read the moment a handler
+	// drains the body to EOF, and that read hitting a still-armed deadline
+	// cancels the REQUEST CONTEXT (connReader.handleReadError) — one idle
+	// window after the last chunk, every later ctx-bound step (the adoption
+	// claim, registry reads, quota admission) starts failing with `context
+	// canceled` on a healthy, fully-delivered upload, surfacing as a 500.
+	// The stall the deadline guards against is over — only server-side work
+	// remains, bounded by its own deadlines (the publication lease below).
+	if idleArmed {
+		if derr := rc.SetReadDeadline(time.Time{}); derr != nil {
+			log.Printf("lfs upload %s: clear idle read deadline: %v", key, derr)
+		}
 	}
 	// The server-enforced Content-Length cap makes n <= ContentLength; a
 	// short body errors above. Assert rather than assume.
