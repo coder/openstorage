@@ -29,6 +29,10 @@ type storeOptions struct {
 	codec     *secrets.Codec
 	now       func() time.Time
 	claimSink SyncClaimSink
+	// keyRefreshEvery overrides the s3wal org-key snapshot refresh cadence
+	// (withKeyRefreshInterval, s3walmeta.go — in-package tests only; the
+	// SQL backends ignore it). Zero keeps s3walKeyRefreshInterval.
+	keyRefreshEvery time.Duration
 }
 
 // WithSecretsCodec enables envelope encryption of the secret columns

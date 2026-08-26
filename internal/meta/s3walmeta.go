@@ -61,6 +61,28 @@ const s3walMetaKey = "_wal/meta.json"
 // or writes.
 const s3walMetaVersion = 1
 
+// s3walKeyRefreshInterval is the org public-key snapshot's background
+// refresh cadence — the cross-process staleness bound for
+// PublicKeysForOrg: a key written by ANOTHER process becomes visible here
+// within one interval (plus one conditional GET). 15s keeps a quiet
+// store's cost negligible (four 304-answered conditional GETs per minute)
+// while bounding foreign-rotation lag far below token lifetimes. The
+// bound is acceptable in the zero-infra topology: production org keys are
+// written only by this process's own serve bootstrap (immediately visible
+// — mutate installs the snapshot synchronously) and the instance lease
+// fail-stops dual serves, so long-lived foreign writers exist only in
+// multi-process test fixtures, which disable the lease and tolerate the
+// interval.
+const s3walKeyRefreshInterval = 15 * time.Second
+
+// withKeyRefreshInterval overrides the org-key snapshot refresh cadence.
+// In-package tests only — production always runs the documented
+// s3walKeyRefreshInterval.
+func withKeyRefreshInterval(d time.Duration) Option {
+	assertf(d > 0, "withKeyRefreshInterval: non-positive interval %v", d)
+	return func(o *storeOptions) { o.keyRefreshEvery = d }
+}
+
 // s3walMetaDoc is the whole metadata state — every table of the SQL
 // schema as one JSON document. Timestamps are int64 unixnano written
 // Go-side (the sqlite.go storage convention, so rows round-trip exactly
@@ -268,24 +290,54 @@ type S3WAL struct {
 	cacheETag string
 	cacheBody []byte
 	lastSeq   int64
+
+	// orgKeys is the in-memory org public-key snapshot (PR #168 security
+	// P2): PublicKeysForOrg is auth.KeySource — the verifier selects keys
+	// from the UNVERIFIED iss claim of every bearer token BEFORE checking
+	// the signature, so resolving it through readDoc would let
+	// unauthenticated JWT floods serialize legitimate work on mu across
+	// S3 round-trips and drive object-store request costs. adoptOrgKeys
+	// installs the snapshot (under mu, so installs follow observation
+	// order) from every fresh read, confirmed-missing object, and CAS
+	// success; orgKeyRefreshLoop keeps it warm across processes. nil
+	// means never populated — the cold-start lookup blocks on one real
+	// read. orgKeysMu guards only the map pointer, never spanning I/O.
+	orgKeysMu sync.RWMutex
+	orgKeys   map[string][]string
+	// keyRefreshEvery is the refresh cadence (s3walKeyRefreshInterval
+	// unless a test overrides it); refreshCancel/refreshDone bound the
+	// refresher goroutine's lifetime to Close.
+	keyRefreshEvery time.Duration
+	refreshCancel   context.CancelFunc
+	refreshDone     chan struct{}
 }
 
 var _ Backend = (*S3WAL)(nil)
 
 // newS3WALStore wraps a conditional store; probe and closeFn may be nil.
+// Every store runs one org-key refresher goroutine until Close.
 func newS3WALStore(cs s3wal.ConditionalStore, probe func(ctx context.Context) error, closeFn func(), o storeOptions) *S3WAL {
 	assertf(cs != nil, "newS3WALStore: nil conditional store")
-	return &S3WAL{
-		cas:         cs,
-		probe:       probe,
-		closeFn:     closeFn,
-		codec:       o.codec,
-		now:         o.now,
-		sink:        o.claimSink,
-		casAttempts: 16,
-		backoffBase: 10 * time.Millisecond,
-		backoffCap:  2 * time.Second,
+	s := &S3WAL{
+		cas:             cs,
+		probe:           probe,
+		closeFn:         closeFn,
+		codec:           o.codec,
+		now:             o.now,
+		sink:            o.claimSink,
+		casAttempts:     16,
+		backoffBase:     10 * time.Millisecond,
+		backoffCap:      2 * time.Second,
+		keyRefreshEvery: o.keyRefreshEvery,
+		refreshDone:     make(chan struct{}),
 	}
+	if s.keyRefreshEvery == 0 {
+		s.keyRefreshEvery = s3walKeyRefreshInterval
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	s.refreshCancel = cancel
+	go s.orgKeyRefreshLoop(ctx)
+	return s
 }
 
 // NewS3WAL wraps an injectable conditional store, probe-less: the
@@ -324,9 +376,35 @@ func (s *S3WAL) InitSchema(ctx context.Context) error {
 	return nil
 }
 
+// Close stops the org-key refresher — joining its goroutine, so no
+// background read outlives Close — and releases the underlying store.
+// Idempotent.
 func (s *S3WAL) Close() {
+	s.refreshCancel()
+	<-s.refreshDone
 	if s.closeFn != nil {
 		s.closeFn()
+	}
+}
+
+// orgKeyRefreshLoop keeps the org-key snapshot warm across processes: one
+// goroutine, one conditional GET per keyRefreshEvery (304-answered while
+// the document is quiet), single-flight by construction — it can never
+// stampede the store. Refresh errors are dropped deliberately: lookups
+// fail static on the last good snapshot, the next tick retries, and
+// foreground operations surface persistent store failures on their own
+// reads.
+func (s *S3WAL) orgKeyRefreshLoop(ctx context.Context) {
+	defer close(s.refreshDone)
+	ticker := time.NewTicker(s.keyRefreshEvery)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			_, _ = s.viewDoc(ctx) // adoptOrgKeys runs on every fresh read
+		}
 	}
 }
 
@@ -369,7 +447,12 @@ func (s *S3WAL) readDoc(ctx context.Context) (*s3walMetaDoc, string, error) {
 	if s.cacheETag == "" {
 		obj, err := s.cas.Get(ctx, s3walMetaKey)
 		if errors.Is(err, s3wal.ErrNotExist) {
-			return newS3WALMetaDoc(), "", nil
+			// A confirmed-missing object is the confirmed-empty org set:
+			// populate the snapshot so pre-bootstrap key lookups also
+			// answer (ErrNotFound) without touching the store.
+			doc := newS3WALMetaDoc()
+			s.adoptOrgKeys(doc)
+			return doc, "", nil
 		}
 		if err != nil {
 			return nil, "", fmt.Errorf("s3walmeta read: %w", err)
@@ -397,7 +480,9 @@ func (s *S3WAL) readDoc(ctx context.Context) (*s3walMetaDoc, string, error) {
 }
 
 // adoptRead decodes a freshly fetched body, checks the seq watermark, and
-// installs it as the new cache. Caller holds mu.
+// installs it as the new cache (plus the org-key snapshot — readDoc's 304
+// path needs no install because the snapshot always matches the cache it
+// revalidated). Caller holds mu.
 func (s *S3WAL) adoptRead(obj s3wal.Object) (*s3walMetaDoc, string, error) {
 	doc, err := decodeS3WALMetaDoc(obj.Body)
 	if err != nil {
@@ -405,7 +490,23 @@ func (s *S3WAL) adoptRead(obj s3wal.Object) (*s3walMetaDoc, string, error) {
 	}
 	s.checkSeq(doc.Seq)
 	s.cacheBody, s.cacheETag = obj.Body, obj.ETag
+	s.adoptOrgKeys(doc)
 	return doc, obj.ETag, nil
+}
+
+// adoptOrgKeys installs the org public-key snapshot from a document this
+// process just observed (fresh read, confirmed-missing object, or our own
+// CAS success). Caller holds mu, so installs are serialized in
+// observation order; the deep copy keeps the snapshot from aliasing
+// document rows a mutation closure may still hold.
+func (s *S3WAL) adoptOrgKeys(doc *s3walMetaDoc) {
+	snap := make(map[string][]string, len(doc.Orgs))
+	for name, org := range doc.Orgs {
+		snap[name] = append([]string(nil), org.PublicKeys...)
+	}
+	s.orgKeysMu.Lock()
+	s.orgKeys = snap
+	s.orgKeysMu.Unlock()
 }
 
 // viewDoc is the read-only entry point: lock, fetch, return.
@@ -485,6 +586,12 @@ func (s *S3WAL) mutate(ctx context.Context, mu s3walMetaMutation) error {
 		if werr == nil {
 			s.checkSeq(ourSeq)
 			s.cacheBody, s.cacheETag = body, newETag
+			// Our CAS landed: the mutated doc IS the latest observed
+			// state, so a local key registration is visible to the very
+			// next lookup (read-your-writes). The ambiguity paths below
+			// need no install — they resolve through readDoc, whose
+			// fresh reads adopt.
+			s.adoptOrgKeys(doc)
 			return nil
 		}
 		switch {
@@ -611,17 +718,37 @@ func (s *S3WAL) UpsertOrgWithKeys(ctx context.Context, name string, pemPublicKey
 }
 
 // PublicKeysForOrg returns the org's registered PEM public key blocks in
-// registration order.
+// registration order — served from the in-memory snapshot, never a
+// synchronous store read (PR #168 security P2; see the orgKeys field
+// comment for the flood argument). Unknown orgs — including flooded
+// unverified iss values — answer ErrNotFound from memory. Freshness:
+// same-process writes are visible immediately (mutate installs the
+// snapshot before returning); foreign writes within
+// s3walKeyRefreshInterval. Cold start (nil snapshot) blocks on one real
+// read: production serving populates the snapshot during bootstrap
+// (UpsertOrgWithKeys runs before the listener starts), and Open must stay
+// I/O-free (ADR-12), so this path only serves CLI/hook processes.
 func (s *S3WAL) PublicKeysForOrg(ctx context.Context, name string) ([]string, error) {
-	doc, err := s.viewDoc(ctx)
-	if err != nil {
-		return nil, err
+	assertf(name != "", "PublicKeysForOrg: empty org name")
+	s.orgKeysMu.RLock()
+	snap := s.orgKeys
+	s.orgKeysMu.RUnlock()
+	if snap == nil {
+		doc, err := s.viewDoc(ctx) // populates the snapshot via adoptOrgKeys
+		if err != nil {
+			return nil, err
+		}
+		org, err := lookupOrg(doc, name)
+		if err != nil {
+			return nil, err
+		}
+		return append([]string(nil), org.PublicKeys...), nil
 	}
-	org, err := lookupOrg(doc, name)
-	if err != nil {
-		return nil, err
+	keys, ok := snap[name]
+	if !ok {
+		return nil, fmt.Errorf("org %q: %w", name, ErrNotFound)
 	}
-	return append([]string(nil), org.PublicKeys...), nil
+	return append([]string(nil), keys...), nil
 }
 
 // OrgNames returns every org row's name, ordered by name.

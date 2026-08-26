@@ -28,7 +28,9 @@ import (
 // subtest (like the sqlite lane's fresh DB file).
 func s3walBackend(t *testing.T) Backend {
 	t.Helper()
-	return NewS3WAL(s3wal.NewMemCAS())
+	st := NewS3WAL(s3wal.NewMemCAS())
+	t.Cleanup(st.Close) // joins the org-key refresher goroutine
+	return st
 }
 
 // TestS3WALMetaConformance runs every shared Backend conformance body
