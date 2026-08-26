@@ -546,3 +546,209 @@ func TestS3WALMetaWriteThroughDetachLateInstall(t *testing.T) {
 		t.Fatalf("row after detach: %v, want ErrNotFound", err)
 	}
 }
+
+// TestS3WALMetaWriteThroughStealPreClearsVictimFence closes the
+// expired-victim window: a thief that commits its meta steal and then
+// "crashes" (every subsequent write faulted) before installing its own
+// fence must ALREADY have cleared the victim's token — otherwise the
+// expired-but-alive victim would keep writing under a claim it lost,
+// where the SQL row fence excludes it atomically with the steal.
+func TestS3WALMetaWriteThroughStealPreClearsVictimFence(t *testing.T) {
+	ctx := context.Background()
+	cas, metaStore, refStore := newWriteThroughStores(t)
+	repoID := seedS3WALUpstream(t, metaStore)
+
+	// The victim is handed out under an instantly-expired lease and is
+	// still alive: its fenced writes pass while its token stands.
+	if _, claimed, _, err := metaStore.TryBeginSync(ctx, repoID, "h-victim", time.Nanosecond); err != nil || !claimed {
+		t.Fatalf("victim claim = (%v, %v), want claimed", claimed, err)
+	}
+	if won, err := refStore.CASRef(ref.WithSyncClaimFence(ctx, repoID, "h-victim"), repoID, "refs/heads/main", ref.ZeroSHA, testSHA1); err != nil || !won {
+		t.Fatalf("victim's fenced CASRef under its token = (%v, %v), want win", won, err)
+	}
+
+	// The thief is a second full stack over the same bucket.
+	thiefRef := ref.NewS3WAL(cas, nil)
+	thiefStore := NewS3WAL(cas, WithSyncClaimSink(thiefRef))
+	t.Cleanup(func() { thiefStore.Close(); thiefRef.Close() })
+
+	// The instant the thief's steal CAS lands (the first meta advance
+	// after arming), capture the manifest token and "crash" the thief:
+	// every later write fails, so neither its fence install nor its
+	// rollback can land — the meta claim strands with the dead thief.
+	tokenAtSteal := "unset"
+	crashed := false
+	cas.Hooks.AfterPut = func(op, key string) {
+		if key != s3walMetaKey || crashed {
+			return
+		}
+		crashed = true
+		tokenAtSteal = manifestSyncClaim(t, cas, repoID)
+		cas.Hooks.PutFault = func(op, key string) s3wal.PutFault {
+			if key == s3walMetaKey {
+				return s3wal.FaultAmbiguousDropped
+			}
+			return s3wal.FaultContention
+		}
+	}
+	t.Cleanup(func() { cas.Hooks = s3wal.MemCASHooks{} })
+
+	if _, claimed, _, err := thiefStore.TryBeginSync(ctx, repoID, "h-thief", time.Nanosecond); err == nil || claimed {
+		t.Fatalf("crashed thief claim = (%v, %v), want write-through failure", claimed, err)
+	}
+	if !crashed {
+		t.Fatal("the thief never committed its steal — the crash was not reproduced")
+	}
+	cas.Hooks = s3wal.MemCASHooks{}
+
+	// The victim's token was gone BEFORE the steal committed, nothing
+	// reinstalled it, and the stranded claim names the dead thief.
+	if tokenAtSteal != "" {
+		t.Fatalf("manifest token at steal commit = %q, want already cleared", tokenAtSteal)
+	}
+	if tok := manifestSyncClaim(t, cas, repoID); tok != "" {
+		t.Fatalf("manifest token after thief crash = %q, want none", tok)
+	}
+	got, gerr := metaStore.GetRepoUpstream(ctx, repoID)
+	if gerr != nil || !got.Syncing || got.SyncClaimHolder != "h-thief" {
+		t.Fatalf("row after thief crash = (%+v, %v), want the stranded stolen claim", got, gerr)
+	}
+	// The expired-but-alive victim is now excluded, exactly like SQL.
+	if won, err := refStore.CASRef(ref.WithSyncClaimFence(ctx, repoID, "h-victim"), repoID, "refs/heads/main", testSHA1, testSHA2); err != nil || won {
+		t.Fatalf("victim's fenced CASRef after steal = (%v, %v), want clean loss", won, err)
+	}
+	// The lease recovers the crash: a later thief steals the stranded
+	// claim (its pre-clear no-ops on the token-less manifest).
+	if _, claimed, stolenFrom, err := metaStore.TryBeginSync(ctx, repoID, "h-thief2", time.Minute); err != nil || !claimed || stolenFrom != "h-thief" {
+		t.Fatalf("recovery steal = (%v, %q, %v), want steal from h-thief", claimed, stolenFrom, err)
+	}
+	if tok := manifestSyncClaim(t, cas, repoID); tok != "h-thief2" {
+		t.Fatalf("manifest token after recovery steal = %q, want h-thief2", tok)
+	}
+}
+
+// TestS3WALMetaWriteThroughStealPreClearFailureAborts: when the victim's
+// fence cannot be cleared, the steal must abort with NOTHING consumed —
+// the victim's expired claim and token stay intact — and a retry after
+// the manifest heals completes the steal.
+func TestS3WALMetaWriteThroughStealPreClearFailureAborts(t *testing.T) {
+	ctx := context.Background()
+	cas, metaStore, _ := newWriteThroughStores(t)
+	repoID := seedS3WALUpstream(t, metaStore)
+
+	if _, claimed, _, err := metaStore.TryBeginSync(ctx, repoID, "h-victim", time.Nanosecond); err != nil || !claimed {
+		t.Fatalf("victim claim = (%v, %v), want claimed", claimed, err)
+	}
+
+	// Every manifest PUT fails definitively; the meta object is untouched.
+	cas.Hooks.PutFault = func(op, key string) s3wal.PutFault {
+		if strings.HasPrefix(key, s3wal.RepoPrefix) {
+			return s3wal.FaultContention
+		}
+		return s3wal.FaultNone
+	}
+	t.Cleanup(func() { cas.Hooks = s3wal.MemCASHooks{} })
+
+	if _, claimed, _, err := metaStore.TryBeginSync(ctx, repoID, "h-thief", time.Minute); err == nil || claimed {
+		t.Fatalf("steal with failing victim clear = (%v, %v), want abort", claimed, err)
+	}
+	got, gerr := metaStore.GetRepoUpstream(ctx, repoID)
+	if gerr != nil || !got.Syncing || got.SyncClaimHolder != "h-victim" {
+		t.Fatalf("row after aborted steal = (%+v, %v), want the victim's intact claim", got, gerr)
+	}
+	if tok := manifestSyncClaim(t, cas, repoID); tok != "h-victim" {
+		t.Fatalf("manifest token after aborted steal = %q, want the victim's intact token", tok)
+	}
+
+	// The aborted steal is plainly retryable once the manifest heals.
+	cas.Hooks = s3wal.MemCASHooks{}
+	if _, claimed, stolenFrom, err := metaStore.TryBeginSync(ctx, repoID, "h-thief", time.Minute); err != nil || !claimed || stolenFrom != "h-victim" {
+		t.Fatalf("retried steal = (%v, %q, %v), want steal from h-victim", claimed, stolenFrom, err)
+	}
+	if tok := manifestSyncClaim(t, cas, repoID); tok != "h-thief" {
+		t.Fatalf("manifest token after retried steal = %q, want h-thief", tok)
+	}
+}
+
+// TestS3WALMetaWriteThroughStealVsFinishRace: the victim's FinishSync
+// racing the thief's pre-clear stays correct — FinishSync's own clear
+// no-ops on the already-removed token (owner-guarded idempotence), the
+// finish lands because the meta claim is still the victim's, and the
+// thief then takes the FRESH-claim path (no steal) on the finished row.
+func TestS3WALMetaWriteThroughStealVsFinishRace(t *testing.T) {
+	ctx := context.Background()
+	cas, metaStore, _ := newWriteThroughStores(t)
+	repoID := seedS3WALUpstream(t, metaStore)
+
+	if _, claimed, _, err := metaStore.TryBeginSync(ctx, repoID, "h-victim", time.Nanosecond); err != nil || !claimed {
+		t.Fatalf("victim claim = (%v, %v), want claimed", claimed, err)
+	}
+
+	// The thief is a second full stack over the same bucket (its own ref
+	// store, so the interposed FinishSync shares no in-process locks with
+	// the pre-clear it interrupts).
+	thiefRef := ref.NewS3WAL(cas, nil)
+	thiefStore := NewS3WAL(cas, WithSyncClaimSink(thiefRef))
+	t.Cleanup(func() { thiefStore.Close(); thiefRef.Close() })
+
+	// The thief's pre-clear PUT (the first manifest advance after arming,
+	// removing the victim's token) wakes the victim, which finishes its
+	// run before the steal CAS is attempted.
+	var finished RepoUpstream
+	var finishErr error
+	interposing, interposed := false, false
+	cas.Hooks.AfterPut = func(op, key string) {
+		if !strings.HasPrefix(key, s3wal.RepoPrefix) || interposing || interposed {
+			return
+		}
+		interposing = true
+		defer func() { interposing = false }()
+		interposed = true
+		finished, finishErr = metaStore.FinishSync(ctx, repoID, "h-victim", true)
+	}
+	t.Cleanup(func() { cas.Hooks = s3wal.MemCASHooks{} })
+
+	up, claimed, stolenFrom, err := thiefStore.TryBeginSync(ctx, repoID, "h-thief", time.Minute)
+	if err != nil || !claimed || stolenFrom != "" {
+		t.Fatalf("thief claim = (%+v, %v, %q, %v), want a fresh (non-steal) claim", up, claimed, stolenFrom, err)
+	}
+	if !interposed {
+		t.Fatal("the victim's finish never interposed — the race was not reproduced")
+	}
+	cas.Hooks = s3wal.MemCASHooks{}
+
+	// The interposed finish landed on the victim's still-live meta claim.
+	if finishErr != nil || finished.RunCount != 1 || finished.SuccessCount != 1 || finished.Syncing {
+		t.Fatalf("interposed FinishSync = (%+v, %v), want a clean finish", finished, finishErr)
+	}
+	if tok := manifestSyncClaim(t, cas, repoID); tok != "h-thief" {
+		t.Fatalf("manifest token after fresh claim = %q, want h-thief", tok)
+	}
+}
+
+// TestS3WALMetaWriteThroughSameHolderReclaim pins the uniform handling of
+// a same-holder re-claim after expiry (test-only: production holders are
+// per-run unique): the pre-clear removes the holder's own stale token and
+// the post-commit write-through reinstalls it, so the re-claimed holder's
+// fenced writes win again.
+func TestS3WALMetaWriteThroughSameHolderReclaim(t *testing.T) {
+	ctx := context.Background()
+	cas, metaStore, refStore := newWriteThroughStores(t)
+	repoID := seedS3WALUpstream(t, metaStore)
+
+	if _, claimed, _, err := metaStore.TryBeginSync(ctx, repoID, "h1", time.Nanosecond); err != nil || !claimed {
+		t.Fatalf("claim = (%v, %v), want claimed", claimed, err)
+	}
+	if _, claimed, stolenFrom, err := metaStore.TryBeginSync(ctx, repoID, "h1", time.Minute); err != nil || !claimed || stolenFrom != "h1" {
+		t.Fatalf("same-holder re-claim = (%v, %q, %v), want a self-steal", claimed, stolenFrom, err)
+	}
+	if tok := manifestSyncClaim(t, cas, repoID); tok != "h1" {
+		t.Fatalf("manifest token after re-claim = %q, want the reinstalled h1", tok)
+	}
+	if won, err := refStore.CASRef(ref.WithSyncClaimFence(ctx, repoID, "h1"), repoID, "refs/heads/main", ref.ZeroSHA, testSHA1); err != nil || !won {
+		t.Fatalf("re-claimed holder's fenced CASRef = (%v, %v), want win", won, err)
+	}
+	if _, err := metaStore.FinishSync(ctx, repoID, "h1", true); err != nil {
+		t.Fatalf("FinishSync after re-claim: %v", err)
+	}
+}

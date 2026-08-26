@@ -22,6 +22,11 @@
 //     install (our manifest write landing after the thief's) is detected,
 //     the fence is cleared owner-guarded, and the claim is refused — so a
 //     stolen holder can never write under a late-reinstalled fence.
+//     Stealing an expired claim additionally clears the victim's manifest
+//     token BEFORE the steal CAS commits, so no thief crash can leave a
+//     superseded (expired-but-alive) victim still fenced in — the SQL
+//     twins exclude the victim atomically because their fence reads the
+//     stolen row itself.
 //     FinishSync clears the manifest token (owner-guarded, so a thief's
 //     token is never touched) BEFORE finalizing the meta row; a failure
 //     there aborts the finish (retryable; expiry recovers the lease).
@@ -36,6 +41,7 @@ package meta
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -537,13 +543,16 @@ func (s *S3WAL) GetRepoUpstream(ctx context.Context, repoID string) (RepoUpstrea
 //     terminal state). Landing requires phases 1-2 durable, so a later
 //     call's ErrNotFound proves every handed-out fence was revoked.
 //
-// Residual, NOT widened by detach (the pre-existing expired-victim steal
-// window): a pre-mark steal whose fence install is still in flight
-// leaves the superseded victim's token in the manifest under a row
-// naming the thief; phase 2 clears the thief's name and no-ops on the
-// victim's token, which only the thief's own install overwrites —
-// exactly the window in which the manifest fence, unlike the SQL row
-// fence, still honors an expired victim.
+// Steal interaction (window CLOSED by TryBeginSync's steal pre-clear):
+// a steal only commits after the superseded victim's manifest token is
+// durably cleared, so a pre-mark steal cannot strand the victim's token
+// under a row naming the thief. The only tokens that can outlive phase
+// 2's clear of the marked row's holder are therefore late installs by
+// claims still awaiting revalidation, which self-revoke on the mark or
+// the missing row — or linger inert when the claimant crashes first,
+// never having been handed out. Remaining assumption: fence tokens are
+// only ever installed by TryBeginSync's write-through and only honored
+// for its returned, revalidated holders.
 //
 // Audit of the remaining row ops against the mark: RequestSync and
 // RequestPush raise pending flags that die with the row; TryBeginPush
@@ -689,6 +698,11 @@ func assertNoLegacyClaim(repoID string, u *s3walMetaUpstream) {
 		"s3walmeta: repo %q claim held by %q (no legacy adoption lane exists here)", repoID, LegacyClaimHolder)
 }
 
+// errStealVictimUncleared aborts a begin-sync CAS (nothing written) whose
+// expired victim's fence token has not been pre-cleared yet; TryBeginSync
+// intercepts it, clears the observed victim, and retries the claim.
+var errStealVictimUncleared = errors.New("steal victim fence not yet cleared")
+
 // TryBeginSync atomically claims a sync run under a lease, consuming
 // sync_pending; an EXPIRED claim is stolen in the same CAS (the
 // read-check-write atomicity the SQL twins buy with row locks is the
@@ -704,7 +718,24 @@ func assertNoLegacyClaim(repoID string, u *s3walMetaUpstream) {
 //
 // With a SyncClaimSink wired, the §2.8 write-through runs after the meta
 // claim commits — see the file comment for the ordering and fail-closed
-// argument.
+// argument. A STEAL additionally clears the expired victim's manifest
+// token BEFORE the meta steal CAS commits (owner-guarded, so a victim
+// concurrently finishing makes it a no-op): otherwise a thief crashing
+// after its meta commit but before its own fence install would leave
+// the superseded victim's token authorizing an expired-but-alive
+// victim's writes — the one place the manifest fence lagged the SQL row
+// fence, which excludes the victim atomically with the steal. The claim
+// fn refuses to commit a steal whose victim it cannot prove pre-cleared
+// (errStealVictimUncleared aborts the CAS with nothing written; the
+// caller clears the observed victim and retries), so on every committed
+// steal the clear is already durable. A crash between the clear and the
+// steal CAS strands the victim fenceless with its expired claim intact:
+// fail-closed (its writes reject; its FinishSync clear no-ops; the
+// expired lease was already stealable — nothing regresses). A clear
+// failure aborts the attempt retryably with nothing consumed. The
+// fresh-claim path pays no extra sink call, and the same-holder re-claim
+// (per-run tokens make it test-only) is handled uniformly: the holder's
+// old token is cleared and the post-commit write-through reinstalls it.
 func (s *S3WAL) TryBeginSync(ctx context.Context, repoID, holder string, lease time.Duration) (RepoUpstream, bool, string, error) {
 	assertf(repoID != "", "TryBeginSync: empty repo id")
 	assertf(holder != "", "TryBeginSync: empty holder")
@@ -718,43 +749,73 @@ func (s *S3WAL) TryBeginSync(ctx context.Context, repoID, holder string, lease t
 	var claimed bool
 	var stolenFrom string
 	var prevPending bool
-	err := s.mutate(ctx, s3walMetaMutation{
-		op: "begin sync",
-		fn: func(doc *s3walMetaDoc) (bool, error) {
-			claimed, stolenFrom, prevPending = false, "", false
-			u, err := lookupUpstream(doc, repoID)
-			if err != nil {
-				return false, err
-			}
-			assertNoLegacyClaim(repoID, u)
-			if u.Detaching {
-				// A durable detaching mark refuses new claims so no new
-				// fence can be installed once DeleteRepoUpstream's phase 1
-				// landed: the row is logically detached already.
-				return false, fmt.Errorf("upstream for repo %q: %w", repoID, ErrNotFound)
-			}
-			if u.Syncing && u.SyncClaimExpiresAt > nowNanos {
-				up = u.toRepoUpstream(repoID) // unexpired claim in flight: refused
-				return false, nil
-			}
-			if u.Syncing {
-				stolenFrom = u.SyncClaimHolder // expired lease stolen
-			}
-			prevPending = u.SyncPending
-			u.Syncing, u.SyncPending = true, false
-			u.SyncClaimHolder, u.SyncClaimExpiresAt = holder, expiry
-			up = u.toRepoUpstream(repoID)
-			claimed = true
-			return true, nil
-		},
-		recover: func(doc *s3walMetaDoc) s3walMetaVerdict {
-			if u := doc.Upstreams[repoID]; u != nil && u.Syncing &&
-				u.SyncClaimHolder == holder && u.SyncClaimExpiresAt == expiry {
-				return s3walMetaApplied // fn's outputs from the landed run stand
-			}
-			return s3walMetaRerun
-		},
-	})
+	var stealVictim string
+	clearedVictim := ""
+	var err error
+	for tries := 0; ; tries++ {
+		err = s.mutate(ctx, s3walMetaMutation{
+			op: "begin sync",
+			fn: func(doc *s3walMetaDoc) (bool, error) {
+				claimed, stolenFrom, prevPending = false, "", false
+				u, err := lookupUpstream(doc, repoID)
+				if err != nil {
+					return false, err
+				}
+				assertNoLegacyClaim(repoID, u)
+				if u.Detaching {
+					// A durable detaching mark refuses new claims so no new
+					// fence can be installed once DeleteRepoUpstream's phase 1
+					// landed: the row is logically detached already. Checked
+					// before the steal pre-clear below, so a detaching row
+					// never draws sink calls from the claim path.
+					return false, fmt.Errorf("upstream for repo %q: %w", repoID, ErrNotFound)
+				}
+				if u.Syncing && u.SyncClaimExpiresAt > nowNanos {
+					up = u.toRepoUpstream(repoID) // unexpired claim in flight: refused
+					return false, nil
+				}
+				if u.Syncing {
+					if s.sink != nil && u.SyncClaimHolder != clearedVictim {
+						// Steal pre-clear (see the method comment): never
+						// commit a steal before the victim's manifest token
+						// is provably revoked.
+						stealVictim = u.SyncClaimHolder
+						return false, errStealVictimUncleared
+					}
+					stolenFrom = u.SyncClaimHolder // expired lease stolen
+				}
+				prevPending = u.SyncPending
+				u.Syncing, u.SyncPending = true, false
+				u.SyncClaimHolder, u.SyncClaimExpiresAt = holder, expiry
+				up = u.toRepoUpstream(repoID)
+				claimed = true
+				return true, nil
+			},
+			recover: func(doc *s3walMetaDoc) s3walMetaVerdict {
+				if u := doc.Upstreams[repoID]; u != nil && u.Syncing &&
+					u.SyncClaimHolder == holder && u.SyncClaimExpiresAt == expiry {
+					return s3walMetaApplied // fn's outputs from the landed run stand
+				}
+				return s3walMetaRerun
+			},
+		})
+		if !errors.Is(err, errStealVictimUncleared) {
+			break
+		}
+		// The victim can only change identity through a full intervening
+		// claim-and-expire cycle, so this loop converges immediately in
+		// practice; the bound is a defensive backstop.
+		if tries+1 >= s.casAttempts {
+			return RepoUpstream{}, false, "", fmt.Errorf("begin sync for repo %q: steal victim changed across %d fence pre-clear attempts", repoID, s.casAttempts)
+		}
+		if cerr := s.sink.ClearSyncClaim(ctx, repoID, stealVictim); cerr != nil {
+			// Nothing consumed: the steal CAS was never attempted, the
+			// victim's expired claim and token are intact — plainly
+			// retryable.
+			return RepoUpstream{}, false, "", fmt.Errorf("begin sync for repo %q: clear expired victim fence: %w", repoID, cerr)
+		}
+		clearedVictim = stealVictim
+	}
 	if err != nil {
 		return RepoUpstream{}, false, "", fmt.Errorf("begin sync for repo %q: %w", repoID, err)
 	}
