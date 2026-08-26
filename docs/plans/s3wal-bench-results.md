@@ -138,8 +138,19 @@ Serve-side background jobs (e.g. the 10-pack repack fold) run during the
 windows — deliberately: that is the production push path.
 
 A post-window `ls-remote` lost-update detector verifies every writer's
-branch equals its last successfully pushed head. **Zero violations in every
-cell.**
+branch holds one of that writer's ACCEPTED tips: a successful push
+collapses the set to its acknowledged tip; a failed push appends its
+attempted tip (the client cannot distinguish a definitive rejection from a
+transport failure — or the issue #170 spurious-rejection race — whose ref
+update landed, so either outcome is legal). No writer is ever skipped; any
+value outside the set is a violation, and writers ending on an ambiguous
+(>1-tip) set are reported as `ambiguous-final-tips`. **Zero violations in
+every cell.** (Detector semantics were tightened after the recorded runs —
+Codex round-1 finding: the original detector skipped a writer whose final
+push failed, which could mask an unaccounted server update. The change
+affects verification only, not timing; the recorded numbers stand, and a
+re-run s3wal writers=8 cell confirms the reworked detector on real
+traffic.)
 
 Commands (one lane per invocation; the lane lands in the benchmark name):
 

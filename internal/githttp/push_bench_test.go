@@ -72,13 +72,16 @@ type pushSample struct {
 	latency time.Duration
 }
 
-// pushWindowResult aggregates one sustained window.
+// pushWindowResult aggregates one sustained window. ambiguous counts
+// writers whose final accepted-tip set held more than one value (trailing
+// failed pushes — the detector accepted any of them; see runPushWindow).
 type pushWindowResult struct {
 	samples   []pushSample
 	failures  int64
 	maxStarve time.Duration
 	elapsed   time.Duration
 	packBytes int
+	ambiguous int64
 }
 
 func benchMS(d time.Duration) float64 { return float64(d) / float64(time.Millisecond) }
@@ -179,10 +182,17 @@ func benchPackBytes(b *testing.B, dir, base, head string) int {
 // working dir per writer (local clone — object transfer is untimed), runs
 // the collective warmup, then lets the writers push continuously for the
 // window. Each writer owns refs/heads/w<i>. After the window one ls-remote
-// acts as the lost-update detector: a writer's branch must equal its last
-// successfully pushed head. The check is skipped for a writer whose LAST
-// attempt failed, because a transport-ambiguous failure can legally leave
-// the server ahead of the client's accounting.
+// acts as the lost-update detector: a writer's branch must hold one of the
+// writer's ACCEPTED tips. On a successful push the set collapses to that
+// acknowledged tip; a failed push APPENDS its attempted tip instead of
+// being dropped, because the client cannot distinguish a definitive
+// rejection from a transport failure — or the issue #170 spurious-rejection
+// race — whose ref update already landed. Every legal server state (the
+// last ack, or any tip stacked by ambiguously-failed pushes since) is
+// therefore in the set, every writer is always verified, and any THIRD
+// value is a violation. This keeps such windows detector-valid instead of
+// inconclusive; the count of writers that ended on an ambiguous set is
+// reported as ambiguous-final-tips.
 func runPushWindow(b *testing.B, writers int, window time.Duration) pushWindowResult {
 	b.Helper()
 	if writers <= 0 {
@@ -214,9 +224,11 @@ func runPushWindow(b *testing.B, writers int, window time.Duration) pushWindowRe
 	res.packBytes = benchPackBytes(b, seed, base, head)
 
 	var (
-		mu              sync.Mutex
-		lastPushed      = make([]string, writers)
-		trailingFailure = make([]bool, writers)
+		mu sync.Mutex
+		// acceptedTips[i] holds every tip the server may legally end on
+		// for writer i (see the function comment). "" means the branch
+		// may not exist (no push ever acknowledged or attempted).
+		acceptedTips = make([][]string, writers)
 	)
 	perWriter := (benchPushWarmup + writers - 1) / writers
 	var start time.Time // written before close(startCh); read after receive
@@ -229,11 +241,35 @@ func runPushWindow(b *testing.B, writers int, window time.Duration) pushWindowRe
 			defer done.Done()
 			dir := dirs[i]
 			refspec := fmt.Sprintf("HEAD:refs/heads/w%d", i)
+			accepted := []string{""}
+			var (
+				localSamples []pushSample
+				failures     int64
+				maxStarve    time.Duration
+				lastSuccess  time.Time // zero until the measured window starts
+			)
+			// Merge in a defer so a writer that errors out at ANY point —
+			// warmup included — still contributes its recorded pushes and
+			// its accepted-tip set (mirrors the s3wal contention runner's
+			// accounting; dropping the set would let an unaccounted server
+			// update pass the detector).
+			defer func() {
+				if !lastSuccess.IsZero() {
+					maxStarve = max(maxStarve, time.Since(lastSuccess))
+				}
+				mu.Lock()
+				res.samples = append(res.samples, localSamples...)
+				res.failures += failures
+				res.maxStarve = max(res.maxStarve, maxStarve)
+				acceptedTips[i] = accepted
+				mu.Unlock()
+			}()
 			op := 0
 			warmupOK := true
 			for range perWriter {
 				op++
-				if _, err := benchCommitOp(dir, i, op); err != nil {
+				head, err := benchCommitOp(dir, i, op)
+				if err != nil {
 					b.Errorf("writer %d warmup: %v", i, err)
 					warmupOK = false
 					break
@@ -241,13 +277,16 @@ func runPushWindow(b *testing.B, writers int, window time.Duration) pushWindowRe
 				if out, err := tryGit(dir, "push", url, refspec); err != nil {
 					// Tolerated like the measured loop: under hot-group
 					// load a push can be spuriously rejected even though
-					// the hook committed the ref (a concurrent request's
-					// hydration syncs the just-committed ref into the
-					// cache repo before receive-pack's own local ref
-					// update — observed as "cannot lock ref: reference
-					// already exists" on branch creation). The next op
-					// stacks a commit and fast-forwards over it.
+					// the hook committed the ref (issue #170: a concurrent
+					// request's hydration syncs the just-committed ref
+					// into the cache repo before receive-pack's own local
+					// ref update — "cannot lock ref: reference already
+					// exists" on branch creation). The next op stacks a
+					// commit and fast-forwards over it.
+					accepted = append(accepted, head)
 					b.Logf("writer %d warmup push rejected (op %d): %v\n%s", i, op, err, out)
+				} else {
+					accepted = []string{head}
 				}
 			}
 			warmed.Done()
@@ -256,27 +295,7 @@ func runPushWindow(b *testing.B, writers int, window time.Duration) pushWindowRe
 				return
 			}
 			deadline := start.Add(window)
-			var (
-				localSamples []pushSample
-				failures     int64
-				maxStarve    time.Duration
-				lastHead     string
-				lastFailed   bool
-			)
-			lastSuccess := start
-			// Merge in a defer so a writer that errors out mid-window
-			// still contributes its recorded pushes (mirrors the s3wal
-			// contention runner's accounting).
-			defer func() {
-				maxStarve = max(maxStarve, time.Since(lastSuccess))
-				mu.Lock()
-				res.samples = append(res.samples, localSamples...)
-				res.failures += failures
-				res.maxStarve = max(res.maxStarve, maxStarve)
-				lastPushed[i] = lastHead
-				trailingFailure[i] = lastFailed
-				mu.Unlock()
-			}()
+			lastSuccess = start
 			for time.Now().Before(deadline) {
 				op++
 				head, err := benchCommitOp(dir, i, op)
@@ -292,8 +311,10 @@ func runPushWindow(b *testing.B, writers int, window time.Duration) pushWindowRe
 					// contention (e.g. SQLITE_BUSY surfacing through the
 					// hook), not a harness bug: count it and keep going —
 					// the next op stacks another commit on this branch.
+					// Its tip stays accepted: the rejection may have been
+					// ambiguous and the ref update may have landed.
 					failures++
-					lastFailed = true
+					accepted = append(accepted, head)
 					if failures == 1 {
 						b.Logf("writer %d first push failure (op %d): %v\n%s", i, op, err, out)
 					}
@@ -303,8 +324,7 @@ func runPushWindow(b *testing.B, writers int, window time.Duration) pushWindowRe
 				localSamples = append(localSamples, pushSample{writer: i, latency: d})
 				maxStarve = max(maxStarve, now.Sub(lastSuccess))
 				lastSuccess = now
-				lastHead = head
-				lastFailed = false
+				accepted = []string{head}
 			}
 		}(i)
 	}
@@ -319,8 +339,9 @@ func runPushWindow(b *testing.B, writers int, window time.Duration) pushWindowRe
 	done.Wait()
 	res.elapsed = time.Since(start)
 
-	// Lost-update detector: every writer's branch on the server must equal
-	// its last successfully pushed head.
+	// Lost-update detector: every writer's branch on the server must hold
+	// one of that writer's accepted tips — no writer is ever skipped, and
+	// a value outside the set is always a violation.
 	server := map[string]string{}
 	for line := range strings.Lines(benchGit(b, seed, "ls-remote", url)) {
 		if sha, ref, ok := strings.Cut(strings.TrimSpace(line), "\t"); ok {
@@ -328,12 +349,12 @@ func runPushWindow(b *testing.B, writers int, window time.Duration) pushWindowRe
 		}
 	}
 	for i := range writers {
-		if lastPushed[i] == "" || trailingFailure[i] {
-			continue
+		if len(acceptedTips[i]) > 1 {
+			res.ambiguous++
 		}
 		branch := fmt.Sprintf("refs/heads/w%d", i)
-		if got := server[branch]; got != lastPushed[i] {
-			b.Errorf("lost update: server %s = %q, want writer %d's last pushed %q", branch, got, i, lastPushed[i])
+		if got := server[branch]; !slices.Contains(acceptedTips[i], got) {
+			b.Errorf("lost update: server %s = %q, want one of writer %d's accepted tips %q", branch, got, i, acceptedTips[i])
 		}
 	}
 	return res
@@ -373,6 +394,7 @@ func BenchmarkPushE2E(b *testing.B) {
 				maxStarve time.Duration
 				elapsed   time.Duration
 				packBytes int
+				ambiguous int64
 			)
 			for b.Loop() {
 				res := runPushWindow(b, writers, window)
@@ -381,6 +403,7 @@ func BenchmarkPushE2E(b *testing.B) {
 				maxStarve = max(maxStarve, res.maxStarve)
 				elapsed += res.elapsed
 				packBytes = res.packBytes
+				ambiguous += res.ambiguous
 			}
 			if len(all) == 0 {
 				b.Fatal("no successful pushes recorded")
@@ -400,6 +423,7 @@ func BenchmarkPushE2E(b *testing.B) {
 			b.ReportMetric(float64(len(all))/elapsed.Seconds(), "push/s")
 			b.ReportMetric(elapsed.Seconds(), "elapsed-s")
 			b.ReportMetric(float64(failures), "push-failures")
+			b.ReportMetric(float64(ambiguous), "ambiguous-final-tips")
 			b.ReportMetric(benchMS(maxStarve), "max-starve-ms")
 			b.ReportMetric(float64(packBytes), "pack-bytes")
 			pushCSVDump(b, all)
