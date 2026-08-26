@@ -112,7 +112,8 @@ func (s *S3WAL) ReservePackBytes(ctx context.Context, group []string, packs []Pa
 	opID := s3wal.NewOpID()
 	// Finite quota-gated admissions hold the read side of the fence lock
 	// across the fence check and the admission CAS (Codex rounds 26+35 on
-	// PR #132) — see absenceFenceMu and ArmAbsenceAdmissionFence.
+	// PR #132) — the in-process fast path; the cross-process guarantee
+	// is the post-commit re-read in s3walRevalidateFence below.
 	finite := quotaBytes != math.MaxInt64
 	if finite {
 		s.absenceFenceMu.RLock()
@@ -233,7 +234,72 @@ func (s *S3WAL) ReservePackBytes(ctx context.Context, group []string, packs []Pa
 	if err != nil {
 		return ReserveDecision{}, err
 	}
+	if finite && dec.OK {
+		if err := s.s3walRevalidateFence(ctx, base, packs, owner, opID, &dec); err != nil {
+			return ReserveDecision{}, err
+		}
+	}
 	return dec, nil
+}
+
+// s3walRevalidateFence is the storage-coordinated half of the admission
+// fence (Codex on PR #156, security). absenceFenceMu serializes the fence
+// check and the admission CAS in-process only; git receive hooks run in
+// FRESH processes with separate S3WAL instances (Phase 3), where the
+// arming pass can land its marker between this admission's in-CAS
+// pre-read and its commit — spending the exact deflated headroom the
+// fence exists to close. The cross-process guarantee is this post-commit
+// re-read: S3 reads are strongly consistent, so any arm completing
+// before our CAS is visible to the GET. A pre-armed marker never reaches
+// here — the in-CAS pre-read already denied — so marker PRESENCE is the
+// entire changed-vs-pre-read signal.
+//
+// If armed, the admission CAS-deletes its own just-committed rows, keyed
+// by owner AND op-ID: entries re-reserved, registered, or swept in the
+// meantime no longer match and are left alone, so no foreign attempts or
+// op-IDs are refunded (the ops-ring record of our landed CAS stays — it
+// is bounded ambiguity history, not accounting). The verdict then
+// demotes to the armed fence's fail-closed deny. This restores the PG
+// twin's guarantee shape: every finite admission either fails closed on
+// fence evidence or commits early enough that the post-arm recovery pass
+// observes its row — an arm+recover+disarm cycle completing INSIDE this
+// window implies recovery either rewrote our base's manifest (whose CAS
+// chain then re-read our committed row first) or never needed to, in
+// which case this group's sums were never deflated.
+//
+// A failed re-read or revocation errors the whole admission: the caller
+// must not treat the reservation as granted; the orphaned rows expire on
+// the TTL like any crashed push's (over-count only — the safe
+// direction).
+func (s *S3WAL) s3walRevalidateFence(ctx context.Context, base string, packs []Pack, owner, opID string, dec *ReserveDecision) error {
+	assertf(dec.OK, "s3walRevalidateFence: non-granted decision %+v", *dec)
+	_, armed, err := s.scanGet(ctx, ScanJobAbsence, ScanScopeAbsenceAdmissionFence)
+	if err != nil {
+		return fmt.Errorf("reserve pack bytes %s: fence re-validation: %w", base, err)
+	}
+	if !armed {
+		return nil
+	}
+	err = s.mutate(ctx, base, s3walMutation{
+		op: "revoke fenced reservation",
+		// ID class: re-applying deletes nothing twice, and the
+		// owner+op-ID predicate skips rows anyone else touched since.
+		fn: func(m *s3wal.Manifest, clk time.Time) (bool, error) {
+			changed := false
+			for _, p := range packs {
+				if r := m.Reservations[p.Key]; r != nil && r.Owner == owner && r.OpID == opID {
+					delete(m.Reservations, p.Key)
+					changed = true
+				}
+			}
+			return changed, nil
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("reserve pack bytes %s: fence revocation: %w", base, err)
+	}
+	*dec = ReserveDecision{RenewalDegraded: true}
+	return nil
 }
 
 // QuotaLedgerState reads the group's ledger state in one snapshot (see

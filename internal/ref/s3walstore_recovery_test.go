@@ -11,6 +11,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"sync"
 	"testing"
@@ -971,6 +972,151 @@ func TestS3WALRecoveryStaleReadPanics(t *testing.T) {
 		}
 	}()
 	_, _ = a.ListRefs(ctx, base)
+}
+
+// TestS3WALRecoveryCrossProcessFence (Codex on PR #156, security): the
+// in-process absenceFenceMu cannot serialize a receive-hook process
+// against the serve process's arming pass, so the finite reserve path
+// re-reads the fence marker AFTER its CAS commits and revokes its own
+// rows when the marker is armed. Store b plays the arming process: its
+// separate mutex is exactly the cross-process hole.
+func TestS3WALRecoveryCrossProcessFence(t *testing.T) {
+	ctx := context.Background()
+	const branch = "refs/heads/main"
+	pack := func(key string, size int64) []Pack { return []Pack{{Key: key, Size: size}} }
+
+	t.Run("fence armed between pre-read and post-read revokes the admission", func(t *testing.T) {
+		const base = "r-xfence-mid"
+		mc, a, b := newRecoveryStores(t)
+		if won, err := a.CASRef(ctx, base, branch, ZeroSHA, testSHA(0x11)); err != nil || !won {
+			t.Fatalf("seed ref = (%v, %v)", won, err)
+		}
+		// The OTHER process arms the fence the instant our admission
+		// CAS hits the store — after the in-CAS pre-read, before the
+		// post-commit re-read. One-shot and scoped to the manifest key
+		// so the arm's own scan-object PUT and the revocation CAS do
+		// not recurse.
+		armed := false
+		mc.Hooks.AfterPut = func(op, key string) {
+			if armed || key != s3wal.ManifestKey(base) {
+				return
+			}
+			armed = true
+			if err := b.ArmAbsenceAdmissionFence(ctx, "lapse-evidence"); err != nil {
+				t.Errorf("arm during admission: %v", err)
+			}
+		}
+		defer func() { mc.Hooks.AfterPut = nil }()
+
+		dec, err := a.ReservePackBytes(ctx, []string{base}, pack("k1", 10), "o1", 0, ReserveNoFloorGen, 1000, time.Hour)
+		if err != nil || dec.OK || !dec.RenewalDegraded {
+			t.Fatalf("mid-window fenced reserve = (%+v, %v), want the fail-closed RenewalDegraded deny", dec, err)
+		}
+		if !armed {
+			t.Fatal("the arming hook never fired: the admission CAS was not observed")
+		}
+		m := mustManifest(t, a, base)
+		if r := m.Reservations["k1"]; r != nil {
+			t.Fatalf("reservation = %+v, want revoked (self-undo)", r)
+		}
+		if _, ok, err := a.scanGet(ctx, ScanJobAbsence, ScanScopeAbsenceAdmissionFence); err != nil || !ok {
+			t.Fatalf("fence marker = (ok=%v, %v), want still armed", ok, err)
+		}
+	})
+
+	t.Run("revocation spares foreign rows", func(t *testing.T) {
+		const base = "r-xfence-foreign"
+		mc, a, b := newRecoveryStores(t)
+		// A live foreign reservation on a DIFFERENT key must survive
+		// the self-undo untouched (owner+op-ID keyed delete).
+		if dec, err := a.ReservePackBytes(ctx, []string{base}, pack("kf", 7), "other", 0, ReserveNoFloorGen, 1000, time.Hour); err != nil || !dec.OK {
+			t.Fatalf("foreign reserve = (%+v, %v)", dec, err)
+		}
+		armed := false
+		mc.Hooks.AfterPut = func(op, key string) {
+			if armed || key != s3wal.ManifestKey(base) {
+				return
+			}
+			armed = true
+			if err := b.ArmAbsenceAdmissionFence(ctx, "lapse-evidence"); err != nil {
+				t.Errorf("arm during admission: %v", err)
+			}
+		}
+		defer func() { mc.Hooks.AfterPut = nil }()
+		dec, err := a.ReservePackBytes(ctx, []string{base}, pack("k1", 10), "o1", 0, ReserveNoFloorGen, 1000, time.Hour)
+		if err != nil || dec.OK || !dec.RenewalDegraded {
+			t.Fatalf("mid-window fenced reserve = (%+v, %v), want deny", dec, err)
+		}
+		m := mustManifest(t, a, base)
+		if m.Reservations["k1"] != nil {
+			t.Fatalf("reservation = %+v, want revoked", m.Reservations["k1"])
+		}
+		if r := m.Reservations["kf"]; r == nil || r.Owner != "other" || r.Bytes != 7 {
+			t.Fatalf("foreign reservation = %+v, want untouched", r)
+		}
+	})
+
+	t.Run("fence armed before the admission denies with no write", func(t *testing.T) {
+		const base = "r-xfence-pre"
+		_, a, b := newRecoveryStores(t)
+		if won, err := a.CASRef(ctx, base, branch, ZeroSHA, testSHA(0x11)); err != nil || !won {
+			t.Fatalf("seed ref = (%v, %v)", won, err)
+		}
+		if err := b.ArmAbsenceAdmissionFence(ctx, "lapse-evidence"); err != nil {
+			t.Fatalf("arm: %v", err)
+		}
+		seqBefore := mustManifest(t, a, base).Seq
+		dec, err := a.ReservePackBytes(ctx, []string{base}, pack("k1", 10), "o1", 0, ReserveNoFloorGen, 1000, time.Hour)
+		if err != nil || dec.OK || !dec.RenewalDegraded {
+			t.Fatalf("pre-armed reserve = (%+v, %v), want deny", dec, err)
+		}
+		if seq := mustManifest(t, a, base).Seq; seq != seqBefore {
+			t.Fatalf("seq %d -> %d: a pre-armed deny must write NOTHING", seqBefore, seq)
+		}
+	})
+
+	t.Run("no fence: exactly one manifest write plus the post-read GET", func(t *testing.T) {
+		const base = "r-xfence-clean"
+		mc, a, _ := newRecoveryStores(t)
+		if won, err := a.CASRef(ctx, base, branch, ZeroSHA, testSHA(0x11)); err != nil || !won {
+			t.Fatalf("seed ref = (%v, %v)", won, err)
+		}
+		writes := 0
+		mc.Hooks.AfterPut = func(op, key string) {
+			if key == s3wal.ManifestKey(base) {
+				writes++
+			}
+		}
+		defer func() { mc.Hooks.AfterPut = nil }()
+		dec, err := a.ReservePackBytes(ctx, []string{base}, pack("k1", 10), "o1", 0, ReserveNoFloorGen, 1000, time.Hour)
+		if err != nil || !dec.OK {
+			t.Fatalf("clean reserve = (%+v, %v), want granted", dec, err)
+		}
+		if writes != 1 {
+			t.Fatalf("manifest writes = %d, want exactly 1 on the happy path", writes)
+		}
+		if r := mustManifest(t, a, base).Reservations["k1"]; r == nil || r.Owner != "o1" {
+			t.Fatalf("reservation = %+v, want granted row", r)
+		}
+	})
+
+	t.Run("unbounded internal admissions are exempt from the fence", func(t *testing.T) {
+		const base = "r-xfence-internal"
+		_, a, b := newRecoveryStores(t)
+		if err := b.ArmAbsenceAdmissionFence(ctx, "lapse-evidence"); err != nil {
+			t.Fatalf("arm: %v", err)
+		}
+		// The SQL twins fence only finite quota-gated admissions;
+		// unbounded internal reservations proceed so recovery can
+		// re-cover — same scoping here, pre-read and post-read alike.
+		dec, err := a.ReservePackBytes(ctx, []string{base}, pack("k1", 10), "o1", 0, ReserveNoFloorGen, math.MaxInt64, time.Hour)
+		if err != nil || !dec.OK {
+			t.Fatalf("internal reserve under an armed fence = (%+v, %v), want granted", dec, err)
+		}
+		if r := mustManifest(t, a, base).Reservations["k1"]; r == nil {
+			t.Fatal("internal reservation must survive the armed fence")
+		}
+	})
 }
 
 func TestS3WALRecoverySizeCap(t *testing.T) {

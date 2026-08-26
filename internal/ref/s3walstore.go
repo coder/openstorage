@@ -110,7 +110,11 @@ type S3WAL struct {
 	// absenceFenceMu mirrors PG's fleet-global admission-fence advisory
 	// lock pair (Codex round 35 on PR #132): finite admissions hold the
 	// read side across their fence check and admission CAS;
-	// ArmAbsenceAdmissionFence takes the write side.
+	// ArmAbsenceAdmissionFence takes the write side. In-process fast
+	// path ONLY — separate processes (Phase 3 receive hooks) hold
+	// separate mutexes, so the cross-process guarantee is the
+	// post-commit marker re-read in s3walRevalidateFence (Codex on
+	// PR #156, security).
 	absenceFenceMu sync.RWMutex
 }
 
