@@ -872,13 +872,27 @@ func TestResolveServeConfigS3WALLeaseTTL(t *testing.T) {
 			t.Fatalf("resolved lease TTL %v, want 30s", cfg.s3walLeaseTTL)
 		}
 	})
-	t.Run("s3wal explicit 0 disables", func(t *testing.T) {
-		cfg, err := resolve(t, s3walURL, "s3://bkt", "0")
-		if err != nil {
-			t.Fatal(err)
+	t.Run("s3wal textual zeros disable", func(t *testing.T) {
+		for _, val := range []string{"0", "0s", "0.0s", "+0m"} {
+			cfg, err := resolve(t, s3walURL, "s3://bkt", val)
+			if err != nil {
+				t.Fatalf("%s=%q: %v", envS3WALLeaseTTL, val, err)
+			}
+			if cfg.s3walLeaseTTL != -1 {
+				t.Fatalf("%s=%q resolved to %v, want the -1 disable sentinel", envS3WALLeaseTTL, val, cfg.s3walLeaseTTL)
+			}
 		}
-		if cfg.s3walLeaseTTL != -1 {
-			t.Fatalf("explicit 0 resolved to %v, want the -1 disable sentinel", cfg.s3walLeaseTTL)
+	})
+	t.Run("s3wal sub-nanosecond truncation must not disable", func(t *testing.T) {
+		// time.ParseDuration truncates these to a parsed 0 (PR #168 round
+		// 2): a malformed nonzero value must be refused under the 1s
+		// floor, never read as the explicit disable sentinel — that would
+		// silently switch the dual-serve guard off.
+		for _, val := range []string{"0.5ns", "-0.1ns", "0.0000000001s"} {
+			_, err := resolve(t, s3walURL, "s3://bkt", val)
+			if err == nil || !strings.Contains(err.Error(), envS3WALLeaseTTL) {
+				t.Fatalf("%s=%q: want a refusal naming the variable, got %v", envS3WALLeaseTTL, val, err)
+			}
 		}
 	})
 }

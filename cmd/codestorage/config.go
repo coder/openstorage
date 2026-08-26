@@ -889,7 +889,16 @@ func resolveS3WALLeaseTTL(getenv func(string) string) (time.Duration, error) {
 		return 0, fmt.Errorf("%s: %w", envS3WALLeaseTTL, err)
 	}
 	if d == 0 {
-		return -1, nil // "0s" spellings disable too
+		// ParseDuration TRUNCATES sub-nanosecond magnitudes to zero
+		// ("0.5ns", "-0.1ns", "0.0000000001s" all parse to 0), so a
+		// parsed zero is not proof the operator wrote zero — and a
+		// malformed value must never silently disable the dual-serve
+		// guard (PR #168 round 2). Only textual zeros ("0s", "0.0s",
+		// "+0m") disable; anything carrying a nonzero digit falls to the
+		// one-second floor below and is refused.
+		if !strings.ContainsAny(raw, "123456789") {
+			return -1, nil
+		}
 	}
 	if d < time.Second {
 		return 0, fmt.Errorf("%s must be at least 1s (or exactly 0 to disable the dual-serve guard), got %q", envS3WALLeaseTTL, raw)
