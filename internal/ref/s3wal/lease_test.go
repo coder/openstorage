@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -238,6 +239,112 @@ func TestInstanceLeaseHeartbeatLossDetection(t *testing.T) {
 			}
 		}
 	})
+}
+
+// hangingStore wraps a ConditionalStore; once armed, Advance and Get
+// block until ctx cancellation — an endpoint that accepts requests and
+// never responds. The SDK surfaces ctx expiry as an error, which the
+// wrapper mimics with the ambiguous class (no response ever arrived).
+type hangingStore struct {
+	ConditionalStore
+	armed atomic.Bool
+}
+
+func (s *hangingStore) Advance(ctx context.Context, key string, body []byte, etag string) (string, error) {
+	if s.armed.Load() {
+		<-ctx.Done()
+		return "", &AmbiguousError{Op: "advance", Key: key, Cause: ctx.Err()}
+	}
+	return s.ConditionalStore.Advance(ctx, key, body, etag)
+}
+
+func (s *hangingStore) Get(ctx context.Context, key string) (Object, error) {
+	if s.armed.Load() {
+		<-ctx.Done()
+		return Object{}, &AmbiguousError{Op: "get", Key: key, Cause: ctx.Err()}
+	}
+	return s.ConditionalStore.Get(ctx, key)
+}
+
+// TestInstanceLeaseHungStoreFailStops (PR #168 round 2, P1): an endpoint
+// that accepts renewal requests and never responds must not park the
+// heartbeat forever — each attempt is bounded by one cadence, so the
+// headroom check still runs and the fail-stop verdict lands at least one
+// cadence before the lease turns stealable on the store clock. Real
+// clocks: the per-attempt bound is a real context deadline.
+func TestInstanceLeaseHungStoreFailStops(t *testing.T) {
+	ctx := context.Background()
+	hs := &hangingStore{ConditionalStore: NewMemCAS()}
+	l, err := AcquireInstanceLease(ctx, hs, LeaseConfig{TTL: 400 * time.Millisecond, Cadence: 100 * time.Millisecond})
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	hs.armed.Store(true)
+	done := make(chan error, 1)
+	go func() { done <- l.Heartbeat(ctx) }()
+	// Expected verdict ≈ ttl−cadence (300ms); scheduling delays only age
+	// the baseline further, so the ceiling is pure slack.
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "unrenewable") {
+			t.Fatalf("heartbeat against a hung store: want an unrenewable fail-stop verdict, got %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("heartbeat still parked after 5s — a hung endpoint suppressed the fail-stop")
+	}
+}
+
+// TestInstanceLeaseRecoveredRenewalKeepsMonotonicBaseline (PR #168 round
+// 2, P2): renewals recovered through the re-read path must keep renewedAt
+// a LOCAL clock observation — production observations carry a monotonic
+// reading (String() shows an " m=±…" suffix) that a JSON-decoded stamp
+// never has. Adopting the decoded stamp silently switches the headroom
+// check to wall arithmetic: a backward NTP step would extend perceived
+// freshness past ttl−cadence while a successor (judging on the store
+// clock) steals. Landed writes restore headroom to the attempt-start
+// instant; dropped writes must keep the old baseline aging.
+func TestInstanceLeaseRecoveredRenewalKeepsMonotonicBaseline(t *testing.T) {
+	for name, fault := range map[string]PutFault{
+		"ambiguous landed":  FaultAmbiguousApplied,
+		"ambiguous dropped": FaultAmbiguousDropped,
+	} {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			cas := NewMemCAS()
+			// Real clock: only time.Now observations carry the monotonic
+			// reading this test guards.
+			l, err := AcquireInstanceLease(ctx, cas, LeaseConfig{TTL: 2 * time.Minute})
+			if err != nil {
+				t.Fatalf("acquire: %v", err)
+			}
+			base := l.renewedAt
+			if !strings.Contains(base.String(), " m=") {
+				t.Fatalf("acquire baseline %v carries no monotonic reading", base)
+			}
+			cas.Hooks.PutFault = func(op, key string) PutFault {
+				if key == LeaseKey && op == "advance" {
+					return fault
+				}
+				return FaultNone
+			}
+			if err := l.renew(ctx); err != nil {
+				t.Fatalf("recovered renew: %v", err)
+			}
+			if !strings.Contains(l.renewedAt.String(), " m=") {
+				t.Fatalf("recovered renewedAt %v lost its monotonic reading: headroom fell back to wall arithmetic", l.renewedAt)
+			}
+			switch fault {
+			case FaultAmbiguousApplied:
+				if l.renewedAt.Before(base) {
+					t.Fatalf("landed renewal moved the baseline backward: %v < %v", l.renewedAt, base)
+				}
+			case FaultAmbiguousDropped:
+				if l.renewedAt != base {
+					t.Fatalf("dropped renewal refreshed the baseline: %v, want the untouched %v", l.renewedAt, base)
+				}
+			}
+		})
+	}
 }
 
 func TestInstanceLeaseCleanRelease(t *testing.T) {

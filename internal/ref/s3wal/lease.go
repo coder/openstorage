@@ -263,10 +263,25 @@ func (l *InstanceLease) Heartbeat(ctx context.Context) error {
 // exclusivity can no longer be proven. Transient store trouble inside
 // that window returns nil and retries next tick.
 func (l *InstanceLease) renew(ctx context.Context) error {
-	now := l.now()
-	etag, werr := l.cs.Advance(ctx, LeaseKey, l.encode(now), l.etag)
+	// Bound each attempt by one cadence (PR #168 round 2, P1): the
+	// conditional client sets no HTTP timeout, so an endpoint that
+	// accepts and never responds would otherwise block this call forever
+	// — the headroom check below never runs, no fail-stop fires, and the
+	// holder keeps serving after a successor steals the expired lease.
+	// The SDK honors ctx cancellation on both the write and the re-read.
+	// Bound proof (renewedAt = T0, threshold ttl−cadence, 2·cadence ≤
+	// ttl asserted at acquire): a permanently hung store makes each
+	// attempt consume exactly its cadence budget, so ticks coalesce and
+	// attempt k runs T0+k·c → T0+(k+1)·c; the FRESH now read at the
+	// failed check therefore crosses ttl−c during the attempt that ends
+	// at T0+ttl−c — the fail-stop verdict lands at least one full
+	// cadence before the lease turns stealable at T0+ttl.
+	ctx, cancel := context.WithTimeout(ctx, l.cadence)
+	defer cancel()
+	start := l.now()
+	etag, werr := l.cs.Advance(ctx, LeaseKey, l.encode(start), l.etag)
 	if werr == nil {
-		l.etag, l.renewedAt = etag, now
+		l.etag, l.renewedAt = etag, start
 		return nil
 	}
 	obj, gerr := l.cs.Get(ctx, LeaseKey)
@@ -279,12 +294,25 @@ func (l *InstanceLease) renew(ctx context.Context) error {
 		if doc.Holder != l.holder {
 			return fmt.Errorf("s3wal instance lease stolen by holder %.8s…: another serve process is running against this bucket (dual-serve): fail-stop", doc.Holder)
 		}
-		// Our own write is current: adopt its ETag and the stamp it
-		// actually carries, then FALL THROUGH to the freshness check —
-		// an ambiguous-applied write refreshed the stamp (headroom
-		// restored), while a dropped write left the old stamp aging
-		// toward stealability despite the healthy read.
-		l.etag, l.renewedAt = obj.ETag, doc.Stamp
+		// Our own write is current: adopt its ETag, then FALL THROUGH to
+		// the freshness check. renewedAt must stay a LOCAL observation —
+		// production clocks carry a monotonic reading that the
+		// JSON-decoded stamp never has (PR #168 round 2, P2): adopting
+		// doc.Stamp would silently switch the headroom arithmetic to
+		// wall time, and a backward NTP step would then extend perceived
+		// freshness past ttl−cadence while a successor (judging on the
+		// store clock) steals. A re-read carrying THIS attempt's stamp
+		// proves the ambiguous write landed: restore headroom to the
+		// attempt-start instant (the write happened after it, so
+		// renewedAt ≤ the actual renewal time and the check can only
+		// fire early, never late — recovery-time now() would overstate
+		// freshness). Any other stamp is an older write of ours still
+		// current (this attempt's write dropped): keep the existing
+		// baseline aging toward the fail-stop.
+		l.etag = obj.ETag
+		if doc.Stamp.Equal(start) {
+			l.renewedAt = start
+		}
 	case errors.Is(gerr, ErrNotExist):
 		select {
 		case <-l.stop:
@@ -293,7 +321,7 @@ func (l *InstanceLease) renew(ctx context.Context) error {
 		}
 		return fmt.Errorf("s3wal instance lease: %s vanished while held (foreign delete): fail-stop", LeaseKey)
 	}
-	if now.Sub(l.renewedAt) >= l.ttl-l.cadence {
+	if now := l.now(); now.Sub(l.renewedAt) >= l.ttl-l.cadence {
 		return fmt.Errorf("s3wal instance lease unrenewable since %v ago (ttl %v): exclusivity can no longer be proven before expiry: fail-stop (write: %v; read: %v)", now.Sub(l.renewedAt).Round(time.Second), l.ttl, werr, gerr)
 	}
 	return nil // renewal trouble with headroom left: retry next tick
