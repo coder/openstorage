@@ -48,12 +48,12 @@ count is exact on the shared store).
 `internal/ref/s3walstore_recovery_test.go` — Docker-free, over the MemCAS
 fault fake; competing writers are a second `S3WAL` driver sharing the same
 MemCAS, interleaved between a faulted PUT and the recovery read via the
-`AfterPut` hook (§8). 61 passing cases + 1 justified skip (grown across
+`AfterPut` hook (§8). 63 passing cases + 1 justified skip (grown across
 review rounds; the class rows below list the load-bearing cases):
 
 | Appendix A class | Cases |
 |---|---|
-| CAS (`CASRef`) | 4 — ambiguous applied ⇒ nonce win; applied-then-superseded ⇒ fail closed (ambiguity surfaced for the `IdempotentCAS` point-read recheck); real 412 (stale-read-induced) + ref moved ⇒ clean `won=false`, never retried; 412 + still-matching ⇒ retried win. |
+| CAS (`CASRef`) | 6 — ambiguous applied ⇒ nonce win; applied-then-superseded ⇒ fail closed (ambiguity surfaced for the `IdempotentCAS` point-read recheck); real 412 (stale-read-induced) + ref moved ⇒ clean `won=false`, never retried; 412 + still-matching ⇒ retried win; a DEFINITIVELY rejected PUT (exhausted contention) carries the not-executed marker so `IdempotentCAS` never recovers it as a fabricated win when a competitor meanwhile placed `new`; never-sent refusals (pre-PUT read, size cap) carry the same marker. |
 | PRED | 11 — `RegisterPacks` applied/dropped (zero-growth rerun; single credit and gen bump); `ReplacePacks` applied ⇒ recovered won, dropped + old intact ⇒ rerun win, inconclusive (competing fold consumed the old set) ⇒ fail closed; `ReclaimRetainedPack` nonce win reports bytes, applied-then-superseded reports 0 with no double debit (the documented degraded report); `TryAdoptionClaim` applied ⇒ recovered claim, dropped + competitor claimed ⇒ clean loss; `RenewAdoptionClaim` dropped ⇒ rerun until the stamp provably advances (owner match alone is no proof — renewal changes only `CreatedAt`), stolen-while-ambiguous ⇒ clean lease-lost. |
 | OPS | 5 — `ReservePackBytes` ring hit (decision stands, attempts stay 1) and both-miss ⇒ fail-closed retryable error, entry never blindly re-applied; `RetirePackAttempts` ring hit (single decrement), entry-op-ID hit after FORCED ring eviction (>64 foreign ops; asserts the full ring), both-miss ⇒ fail closed with the row intact. |
 | LEASE (§2.5 W6) | 3 + 1 skip — registration blocked at `TTL + deleteIOTimeout + safety − 1ms` and unblocked at exactly the window (stale-lock expiry, no unconditional sleep); renewal loss while the DELETE is in flight refuses `deleted=true`; persistently dropped renewal PUTs are proven un-landed (stamp advancement, not owner match) and likewise refuse `deleted=true`; **skip**: renewal-loss-before-dispatch — the pre-dispatch check sits microseconds after lease acquisition with no seam the fake can reach without production-code scaffolding; the rule it double-checks is pinned by the in-flight case. |

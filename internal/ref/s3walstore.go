@@ -308,25 +308,34 @@ func (s *S3WAL) mutate(ctx context.Context, base string, mu s3walMutation) error
 	unlock := s.lockBase(base)
 	defer unlock()
 	key := s3wal.ManifestKey(base)
+	// Taxonomy note (Codex round 9 on PR #156): every return on this loop's
+	// never-sent and definitively-rejected paths carries the not-executed
+	// marker (SafeToRetry), or IdempotentCAS's ambiguity recheck could
+	// recover a CASRef whose PUT the store REJECTED as a fabricated win
+	// when a competitor meanwhile placed `new`. Only genuinely ambiguous
+	// outcomes (a failed recovery read, the fail-closed verdict) stay
+	// unmarked. Entering iteration N+1 implies attempt N provably did not
+	// land (412, never-sent, or a rerun verdict), so pre-PUT failures are
+	// not-executed on every iteration, not just the first.
 	for attempt := 0; attempt < s.casAttempts; attempt++ {
 		m, etag, err := s.readManifest(ctx, base)
 		if err != nil {
-			return err
+			return notExecuted(err) // pre-PUT read: nothing sent
 		}
 		clk := s3wal.ClkNext(s.now(), m.Clk)
 		apply, err := mu.fn(m, clk)
 		if err != nil {
-			return err
+			return err // fn owns its taxonomy (nothing was written)
 		}
 		if !apply {
 			return nil
 		}
 		body, err := m.EncodeAdvance(clk)
 		if err != nil {
-			return fmt.Errorf("s3wal %s %s: %w", mu.op, base, err)
+			return fmt.Errorf("s3wal %s %s: %w", mu.op, base, notExecuted(err))
 		}
 		if err := s.checkManifestSize(base, mu, len(body)); err != nil {
-			return err
+			return notExecuted(err) // size refusal: never sent
 		}
 		ourNonce, ourSeq := m.Writer, m.Seq
 		var werr error
@@ -354,8 +363,10 @@ func (s *S3WAL) mutate(ctx context.Context, base string, mu s3walMutation) error
 		var amb *s3wal.AmbiguousError
 		if !errors.As(werr, &amb) {
 			// Definitive non-conditional failure (auth, bucket, …) or
-			// exhausted 409 contention: surface.
-			return fmt.Errorf("s3wal %s %s: %w", mu.op, base, werr)
+			// exhausted 409 contention: the store responded with a
+			// rejection, so the write did not take effect (5xx and
+			// transport losses are classified ambiguous upstream).
+			return fmt.Errorf("s3wal %s %s: %w", mu.op, base, notExecuted(werr))
 		}
 		// Ambiguous: the write MAY have landed. Re-read and resolve.
 		fresh, _, rerr := s.readManifest(ctx, base)
@@ -381,7 +392,9 @@ func (s *S3WAL) mutate(ctx context.Context, base string, mu s3walMutation) error
 			continue // re-run fn on a fresh snapshot
 		}
 	}
-	return fmt.Errorf("s3wal %s %s: %d attempts: %w", mu.op, base, s.casAttempts, s3wal.ErrCASContention)
+	// Every attempt was definitively not landed (412 re-reads and rerun
+	// verdicts only reach here): exhaustion is not-executed.
+	return fmt.Errorf("s3wal %s %s: %d attempts: %w", mu.op, base, s.casAttempts, notExecuted(s3wal.ErrCASContention))
 }
 
 // checkManifestSize enforces the §2.2 growth thresholds on growing

@@ -1883,3 +1883,52 @@ func TestS3WALRecoveryLapseMarkerContention(t *testing.T) {
 		t.Fatalf("marker = (%+v, %v, %v), want our cover's raw spelling", st, ok, err)
 	}
 }
+
+// TestS3WALRecoveryDefinitiveErrorTaxonomy (Codex round 9 on PR #156):
+// mutate's definitive failures (rejected PUTs, never-sent attempts) must
+// carry the not-executed marker or IdempotentCAS's ambiguity recheck can
+// recover them: with a competitor meanwhile placing `new`, the point read
+// shows current == new and fabricates won=true — a successful update and
+// its webhook — for a PUT the store definitively rejected.
+func TestS3WALRecoveryDefinitiveErrorTaxonomy(t *testing.T) {
+	ctx := context.Background()
+	const base = "r-taxonomy"
+	const branch = "refs/heads/main"
+	sha1, sha2 := testSHA(0x11), testSHA(0x22)
+
+	t.Run("definitive rejection is never recovered as a win", func(t *testing.T) {
+		mc, a, b := newRecoveryStores(t)
+		if won, err := a.CASRef(ctx, base, branch, ZeroSHA, sha1); err != nil || !won {
+			t.Fatalf("seed = (%v, %v)", won, err)
+		}
+		// Our PUT is DEFINITIVELY rejected (exhausted 409 contention from
+		// the conditional client); the competitor then commits the same
+		// transition before the IdempotentCAS recheck reads.
+		armPutFault(mc, s3wal.FaultContention)
+		armAfterPut(mc, func() {
+			if won, err := b.CASRef(ctx, base, branch, sha1, sha2); err != nil || !won {
+				t.Errorf("competitor CAS = (%v, %v)", won, err)
+			}
+		})
+		won, err := IdempotentCAS{RefStore: a}.CASRef(ctx, base, branch, sha1, sha2)
+		if won {
+			t.Fatal("IdempotentCAS recovered a definitively rejected PUT as won: fabricated update")
+		}
+		if !errors.Is(err, s3wal.ErrCASContention) {
+			t.Fatalf("err = %v, want the surfaced definitive failure", err)
+		}
+	})
+
+	t.Run("never-sent refusals carry the not-executed marker", func(t *testing.T) {
+		_, a, _ := newRecoveryStores(t)
+		if won, err := a.CASRef(ctx, base, branch, ZeroSHA, sha1); err != nil || !won {
+			t.Fatalf("seed = (%v, %v)", won, err)
+		}
+		a.hardCapBytes = 1
+		_, err := a.CASRef(ctx, base, "refs/heads/new", ZeroSHA, sha1)
+		var ne interface{ SafeToRetry() bool }
+		if err == nil || !errors.As(err, &ne) || !ne.SafeToRetry() {
+			t.Fatalf("size-cap refusal = %v, want the not-executed marker (never sent)", err)
+		}
+	})
+}
