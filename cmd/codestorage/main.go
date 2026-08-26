@@ -120,16 +120,22 @@ func cmdServe(ctx context.Context, args []string) error {
 	// two live writers would corrupt nothing, CAS serializes every state
 	// change, but §2.4 TTL verdicts and caches degrade silently).
 	if s3, ok := st.(*ref.S3WAL); ok {
-		lease, err := s3wal.AcquireInstanceLease(ctx, s3.ConditionalStore(), s3wal.LeaseConfig{TTL: cfg.s3walLeaseTTL})
-		if err != nil {
-			return err
-		}
-		defer lease.Release(context.Background())
-		go func() {
-			if err := lease.Heartbeat(ctx); err != nil {
-				fatalf("codestorage serve: %v", err)
+		if cfg.s3walLeaseTTL < 0 {
+			// Explicit "0": test suites deliberately run several
+			// processes against one bucket. Never silent.
+			fmt.Fprintf(os.Stderr, "warning: %s=0 disables the s3wal instance lease — accidental dual-serve topologies will NOT be detected\n", envS3WALLeaseTTL)
+		} else {
+			lease, err := s3wal.AcquireInstanceLease(ctx, s3.ConditionalStore(), s3wal.LeaseConfig{TTL: cfg.s3walLeaseTTL})
+			if err != nil {
+				return err
 			}
-		}()
+			defer lease.Release(context.Background())
+			go func() {
+				if err := lease.Heartbeat(ctx); err != nil {
+					fatalf("codestorage serve: %v", err)
+				}
+			}()
+		}
 	}
 
 	bl, err := blob.Open(ctx, cfg.blobURL)

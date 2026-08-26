@@ -377,8 +377,9 @@ type serveConfig struct {
 	secretsCodec *secrets.Codec
 
 	// s3walLeaseTTL overrides the s3wal instance-lease TTL (issue #133,
-	// §2.11 dual-serve guard); 0 applies the lease default (2 minutes).
-	// Ignored outside s3wal mode.
+	// §2.11 dual-serve guard): 0 applies the lease default (2 minutes),
+	// negative disables the lease entirely (explicit env "0" — a test
+	// escape hatch, warned loudly). Ignored outside s3wal mode.
 	s3walLeaseTTL time.Duration
 }
 
@@ -861,22 +862,30 @@ func resolvePackReservationTTL(getenv func(string) string) (time.Duration, error
 }
 
 // resolveS3WALLeaseTTL parses CODESTORAGE_S3WAL_LEASE_TTL (issue #133,
-// §2.11): the s3wal instance-lease TTL. Unset defers to the lease default
-// (2 minutes); explicit values below one second are refused — the derived
-// heartbeat cadence (TTL/4) would fail-stop the node on ordinary S3
-// latency jitter.
+// §2.11): the s3wal instance-lease TTL. Unset returns 0 (the lease
+// default, 2 minutes, applies); an explicit "0" returns -1 — the lease is
+// DISABLED, a deliberate escape hatch for test suites that intentionally
+// run several processes against one bucket (serve warns loudly). Other
+// values below one second are refused: the derived heartbeat cadence
+// (TTL/4) would fail-stop the node on ordinary S3 latency jitter.
 func resolveS3WALLeaseTTL(getenv func(string) string) (time.Duration, error) {
 	assertf(getenv != nil, "resolveS3WALLeaseTTL: nil getenv")
 	raw := getenv(envS3WALLeaseTTL)
 	if raw == "" {
 		return 0, nil
 	}
+	if raw == "0" {
+		return -1, nil
+	}
 	d, err := time.ParseDuration(raw)
 	if err != nil {
 		return 0, fmt.Errorf("%s: %w", envS3WALLeaseTTL, err)
 	}
+	if d == 0 {
+		return -1, nil // "0s" spellings disable too
+	}
 	if d < time.Second {
-		return 0, fmt.Errorf("%s must be at least 1s, got %q", envS3WALLeaseTTL, raw)
+		return 0, fmt.Errorf("%s must be at least 1s (or exactly 0 to disable the dual-serve guard), got %q", envS3WALLeaseTTL, raw)
 	}
 	return d, nil
 }

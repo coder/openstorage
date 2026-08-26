@@ -18,9 +18,9 @@ import (
 // LISTEN/NOTIFY have no substrate on a bucket.
 func TestIsPGURLRoutesS3WALToLocalQueue(t *testing.T) {
 	for url, want := range map[string]bool{
-		"postgres://u@h/db":   true,
-		"postgresql://u@h/db": true,
-		"sqlite:///tmp/x.db":  false,
+		"postgres://u@h/db":                             true,
+		"postgresql://u@h/db":                           true,
+		"sqlite:///tmp/x.db":                            false,
 		"s3wal://bucket?endpoint=http://127.0.0.1:8333": false,
 	} {
 		if got := isPGURL(url); got != want {
