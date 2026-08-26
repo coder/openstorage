@@ -91,6 +91,20 @@ type S3WAL struct {
 
 	warnMu sync.Mutex
 	warned map[string]bool
+
+	// reapEpochMu mirrors PG's FOR SHARE pin on the destructive-sweep
+	// epoch row (Codex round 33 on PR #132): retirements hold the read
+	// side from their epoch read through the retire CAS and refund park,
+	// and BeginLFSReapEpoch's increment takes the write side — so a sweep
+	// with a strictly greater epoch provably began its listing after
+	// every retirement pinned below it finished. In-process locking is
+	// the sound substitute under the single-process decree (§2.10).
+	reapEpochMu sync.RWMutex
+	// absenceFenceMu mirrors PG's fleet-global admission-fence advisory
+	// lock pair (Codex round 35 on PR #132): finite admissions hold the
+	// read side across their fence check and admission CAS;
+	// ArmAbsenceAdmissionFence takes the write side.
+	absenceFenceMu sync.RWMutex
 }
 
 var _ Store = (*S3WAL)(nil)

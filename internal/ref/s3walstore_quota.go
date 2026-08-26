@@ -16,10 +16,29 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"math"
 	"time"
 
 	"github.com/coder/code-storage/internal/ref/s3wal"
 )
+
+// s3walLapseEvidence reports whether a doomed reservation map key is an
+// UN-FOLDED absence-cover row — physical lapse evidence the reconciler's
+// first-health-stamp probe arms on (Codex rounds 32-34 on PR #132).
+// Folded nonces decay deliberately; foreign spellings are never evidence.
+func s3walLapseEvidence(mapKey, owner string) bool {
+	_, ok := s3walCoverSynth(mapKey)
+	return ok && owner != AbsenceFoldedOwner
+}
+
+// s3walRecordLapse durably records the lapse-evidence marker for one
+// doomed cover row BEFORE the CAS that consumes it commits (the SQLite
+// twin's ordering): a marker without a consumed row is a conservative
+// residual the recovery rotation clears, while the reverse order could
+// destroy the only evidence. payload is the fleet-uniform raw spelling.
+func (s *S3WAL) s3walRecordLapse(ctx context.Context, mapKey string) error {
+	return s.scanPut(ctx, ScanJobAbsence, ScanScopeAbsenceLapse, s3walCoverRaw(mapKey), 0)
+}
 
 // s3walReservationLive reports whether a reservation stamp is inside ttl
 // under the §2.4 elapsed rule.
@@ -78,6 +97,14 @@ func (s *S3WAL) ReservePackBytes(ctx context.Context, group []string, packs []Pa
 	}
 	incoming := incomingBytes(packs)
 	opID := s3wal.NewOpID()
+	// Finite quota-gated admissions hold the read side of the fence lock
+	// across the fence check and the admission CAS (Codex rounds 26+35 on
+	// PR #132) — see absenceFenceMu and ArmAbsenceAdmissionFence.
+	finite := quotaBytes != math.MaxInt64
+	if finite {
+		s.absenceFenceMu.RLock()
+		defer s.absenceFenceMu.RUnlock()
+	}
 	var dec ReserveDecision
 	err := s.mutate(ctx, base, s3walMutation{
 		op:    "reserve pack bytes",
@@ -87,18 +114,46 @@ func (s *S3WAL) ReservePackBytes(ctx context.Context, group []string, packs []Pa
 			if m.PurgedAt != nil {
 				return false, fmt.Errorf("reserve pack bytes %s: %w", base, ErrRepoPurged)
 			}
+			// Cover-renewal degraded fence (Codex round 26 on PR #132,
+			// security): while the marker is armed, TTL'd absence covers
+			// may have lapsed un-renewed and this snapshot's strict-TTL
+			// reservation sum under-counts them — finite admissions fail
+			// closed; unbounded internal reservations proceed so recovery
+			// can re-cover. A §2.10 side-object read inside the CAS loop,
+			// re-checked on every lost-race re-run like the SQL twins
+			// re-check per transaction.
+			if finite {
+				if _, armed, err := s.scanGet(ctx, ScanJobAbsence, ScanScopeAbsenceAdmissionFence); err != nil {
+					return false, err
+				} else if armed {
+					dec = ReserveDecision{RenewalDegraded: true}
+					return false, nil
+				}
+			}
 			// Self-healing GC (Codex round 5 on #51): prune this group's
 			// expired non-claim rows inside the admission CAS, bounding
 			// physical rows with no sweeper required. Committed even on
-			// denial, like the SQL transaction.
+			// denial, like the SQL transaction. Consuming an expired
+			// UN-FOLDED absence-cover row records the durable
+			// lapse-evidence marker BEFORE this CAS commits (Codex round
+			// 33; ordering in s3walRecordLapse).
 			changed := false
+			doomedCover := ""
 			for key, r := range m.Reservations {
 				if s3walIsClaimKey(key) {
 					continue
 				}
 				if s.s3walExpiryAllowed(base, m, r.CreatedAt, ttl, "reservation prune") {
+					if doomedCover == "" && s3walLapseEvidence(key, r.Owner) {
+						doomedCover = key
+					}
 					delete(m.Reservations, key)
 					changed = true
+				}
+			}
+			if doomedCover != "" {
+				if err := s.s3walRecordLapse(ctx, doomedCover); err != nil {
+					return false, fmt.Errorf("reserve pack bytes lapse marker: %w", err)
 				}
 			}
 			// ONE snapshot: usage counter, live-reservation byte sum
@@ -240,7 +295,10 @@ func (s *S3WAL) RetirePackAttempts(ctx context.Context, group []string, gens map
 // SweepExpiredPackReservations prunes reservation rows fleet-wide: one
 // prefix walk, one CAS per group holding expired rows (L+M, idempotent).
 // Non-claim rows expire at olderThan (0 = everything — the test/recovery
-// hatch); claim leases expire only at AdoptionClaimTTL.
+// hatch); claim leases expire only at AdoptionClaimTTL. Like the SQL
+// twins (Codex round 34 on PR #132), consuming an expired UN-FOLDED
+// absence-cover row records the durable lapse-evidence marker before the
+// pruning CAS commits.
 func (s *S3WAL) SweepExpiredPackReservations(ctx context.Context, olderThan time.Duration) (int64, error) {
 	assertf(olderThan >= 0, "SweepExpiredPackReservations: negative age %v", olderThan)
 	var total int64
@@ -250,6 +308,7 @@ func (s *S3WAL) SweepExpiredPackReservations(ctx context.Context, olderThan time
 			op: "sweep reservations",
 			fn: func(m *s3wal.Manifest, clk time.Time) (bool, error) {
 				pruned = 0
+				doomedCover := ""
 				for key, r := range m.Reservations {
 					window := olderThan
 					what := "reservation sweep"
@@ -258,8 +317,16 @@ func (s *S3WAL) SweepExpiredPackReservations(ctx context.Context, olderThan time
 						what = "claim sweep"
 					}
 					if s.s3walExpiryAllowed(base, m, r.CreatedAt, window, what) {
+						if doomedCover == "" && s3walLapseEvidence(key, r.Owner) {
+							doomedCover = key
+						}
 						delete(m.Reservations, key)
 						pruned++
+					}
+				}
+				if doomedCover != "" {
+					if err := s.s3walRecordLapse(ctx, doomedCover); err != nil {
+						return false, fmt.Errorf("sweep reservations lapse marker: %w", err)
 					}
 				}
 				return pruned > 0, nil

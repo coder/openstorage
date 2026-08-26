@@ -7,7 +7,10 @@ package ref
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/coder/code-storage/internal/ref/s3wal"
@@ -204,6 +207,38 @@ func (s *S3WAL) PurgeRepoLedger(ctx context.Context, group []string) (int64, err
 	if err != nil {
 		return 0, err
 	}
+	// The reclaimer's per-base scan state dies with the ledger (Codex
+	// rounds 1+33 on PR #132): the parked settlement cursor would never
+	// be revisited, and a surviving refund bucket would decrement a
+	// resurrected-name counter it never charged. Side objects cannot
+	// join the manifest CAS; they are swept AFTER it, and a purge re-run
+	// repeats this cleanup idempotently (mirroring the SQL rows'
+	// same-transaction delete as closely as two objects allow).
+	base := baseRepoOf(group[0])
+	if _, ok, err := s.scanGet(ctx, ScanJobLFSReclaim, ScanScopeReclaimRepo(base)); err != nil {
+		return 0, err
+	} else if ok {
+		if err := s.scanDelete(ctx, ScanJobLFSReclaim, ScanScopeReclaimRepo(base)); err != nil {
+			return 0, err
+		}
+		total++
+	}
+	refundPrefix := ScanScopeReclaimRefundPrefix(base)
+	for {
+		scopes, err := s.ListJobScanStateScopes(ctx, ScanJobLFSReclaim, refundPrefix, refundPrefix, 512)
+		if err != nil {
+			return 0, err
+		}
+		if len(scopes) == 0 {
+			break
+		}
+		for _, scope := range scopes {
+			if err := s.scanDelete(ctx, ScanJobLFSReclaim, scope); err != nil {
+				return 0, err
+			}
+			total++
+		}
+	}
 	return total, nil
 }
 
@@ -343,28 +378,71 @@ func (s *S3WAL) ClearLFSObjectsUnreferenced(ctx context.Context, repo string, ke
 	return cleared, nil
 }
 
-// RetireUnreferencedLFSObject deletes one grace-expired marked row,
-// refunding count and bytes and bumping the adoption generation — all one
-// CAS with the fences evaluated on the same snapshot: purge fence, pinned
+// RetireUnreferencedLFSObject deletes one grace-expired marked row with
+// the fences evaluated on the retire CAS's snapshot: purge fence, pinned
 // member generations (a pointer push mid-scan lives in a bumped generation
-// by definition), and the live adoption-claim spare. Recovery class PRED:
-// re-applying on a fresh snapshot re-evaluates every fence and finds a
-// vanished row spared.
-func (s *S3WAL) RetireUnreferencedLFSObject(ctx context.Context, repo, key string, pinnedGens map[string]int64, grace time.Duration) (bool, error) {
+// by definition), and the live adoption-claim spare. The count/usage
+// refund is DEFERRED (Codex round 33 on PR #132): the deletion parks its
+// refund in the per-epoch bucket and only SettleLFSRefunds hands capacity
+// back, under a completion whose epoch strictly exceeds the pin.
+//
+// §2.10 substitute rule for the SQL twins' in-transaction reads: the
+// destructive-reap watermark, the legacy certification, and the epoch pin
+// are side-object reads immediately before the retire CAS — sweeper and
+// reclaimer share one process (the single-process decree), reapEpochMu
+// mirrors PG's FOR SHARE pin against BeginLFSReapEpoch, and the clocks at
+// both ends are the one process clock. The refund park is a second,
+// non-atomic write ORDERED AFTER the row deletion: a crash in between
+// leaks the parked slot (count/usage stay charged — strictly the
+// conservative direction, mirroring "orphan packs are tolerable"); the
+// reverse order could double-refund and is never used. Recovery class
+// OPS on the delete: the op-ID keeps an ambiguously-landed deletion's
+// retired=true so its refund still parks.
+func (s *S3WAL) RetireUnreferencedLFSObject(ctx context.Context, repo, key string, pinnedGens map[string]int64, grace, reapMaxAge time.Duration) (bool, error) {
 	assertf(repo != "" && key != "", "RetireUnreferencedLFSObject: empty repo/key")
 	assertf(len(pinnedGens) > 0, "RetireUnreferencedLFSObject: no pinned generations")
 	assertf(grace >= 0, "RetireUnreferencedLFSObject: negative grace %v", grace)
+	assertf(reapMaxAge > 0, "RetireUnreferencedLFSObject: non-positive reap watermark bound %v", reapMaxAge)
 	base := baseRepoOf(repo)
 	members := make([]string, 0, len(pinnedGens))
 	for member := range pinnedGens {
 		members = append(members, member)
 	}
 	sort.Strings(members)
+	s.reapEpochMu.RLock()
+	defer s.reapEpochMu.RUnlock()
+	// Refunding an object-cap slot is only sound while the physical reap
+	// is demonstrably completing (issue #120): absent or stale watermark
+	// refuses with the distinct sentinel, writing nothing.
+	wm, ok, err := s.scanGet(ctx, ScanJobSweep, ScanScopeLFSDestructiveReap)
+	if err != nil {
+		return false, fmt.Errorf("retire lfs object %s: %w", key, err)
+	}
+	if !ok || s.scanRowAge(wm) >= reapMaxAge {
+		return false, fmt.Errorf("retire lfs object %s: %w", key, ErrReapWatermarkStale)
+	}
+	// A legacy-spelled row's blob is only reaped by legacy-armed sweeps
+	// (Codex round 17): the fresh watermark must certify that class.
+	legacyRow := !strings.Contains(key, "/o2/")
+	if legacyRow && !DecodeReapWatermark(wm.Payload).Legacy {
+		return false, fmt.Errorf("retire lfs object %s: %w", key, ErrLegacyReapUnarmed)
+	}
+	// Pin the destructive-sweep epoch this retirement runs under (absent
+	// row = epoch 0; the first completion carries epoch >= 1). The held
+	// read lock keeps BeginLFSReapEpoch out until the park lands.
+	var reapEpoch int64
+	if epochRow, ok, err := s.scanGet(ctx, ScanJobSweep, ScanScopeLFSReapEpoch); err != nil {
+		return false, fmt.Errorf("retire lfs object %s: %w", key, err)
+	} else if ok {
+		reapEpoch = epochRow.Generation
+	}
+	opID := s3wal.NewOpID()
 	retired := false
-	err := s.mutate(ctx, base, s3walMutation{
+	var bytes int64
+	err = s.mutate(ctx, base, s3walMutation{
 		op: "retire lfs object",
 		fn: func(m *s3wal.Manifest, clk time.Time) (bool, error) {
-			retired = false
+			retired, bytes = false, 0
 			if m.PurgedAt != nil {
 				return false, nil // the purge pipeline owns fenced rows
 			}
@@ -390,18 +468,168 @@ func (s *S3WAL) RetireUnreferencedLFSObject(ctx context.Context, repo, key strin
 			if !s.s3walExpiryAllowed(base, m, *row.UnreferencedSince, grace, "lfs unreferenced grace") {
 				return false, nil // mark younger than grace (or skew demote)
 			}
+			// Delete the registry row ONLY: count, usage, and the
+			// adoption generation stay untouched until settlement.
 			delete(m.LFS.Objects, key)
-			m.LFS.Count = max(m.LFS.Count-1, 0)
-			m.UsageBytes = max(m.UsageBytes-row.Bytes, 0)
-			m.LFS.AdoptionGen++
+			m.RecordOp(opID)
+			bytes = row.Bytes
 			retired = true
 			return true, nil
+		},
+		recover: func(fresh *s3wal.Manifest) s3walVerdict {
+			if fresh.OpApplied(opID) {
+				return s3walApplied // our deletion landed: the park below still runs
+			}
+			return s3walFailClosed
 		},
 	})
 	if err != nil {
 		return false, err
 	}
-	return retired, nil
+	if !retired {
+		return false, nil
+	}
+	// Park the refund in the epoch bucket (see the doc comment for the
+	// ordering argument). The bucket is generic scan state so the
+	// reclaimer's rotation and the purge cleanup page it uniformly.
+	scope := ScanScopeReclaimRefund(repo, reapEpoch)
+	err = s.scanMutate(ctx, "park lfs refund", ScanJobLFSReclaim, scope,
+		func(prev *s3walScanRow, _ time.Time) (*s3walScanRow, error) {
+			var bucket LFSRefundBucket
+			gen := reapEpoch
+			if prev != nil {
+				if err := json.Unmarshal([]byte(prev.Payload), &bucket); err != nil {
+					// Undecodable bucket (never written by this binary):
+					// fail rather than drop or double-count refunds.
+					return nil, fmt.Errorf("undecodable refund bucket %s: %w", scope, err)
+				}
+				gen = prev.Generation // the SQL upsert leaves generation as-is
+			}
+			if legacyRow {
+				bucket.LegacyRows, bucket.LegacyBytes = bucket.LegacyRows+1, bucket.LegacyBytes+bytes
+			} else {
+				bucket.Rows, bucket.Bytes = bucket.Rows+1, bucket.Bytes+bytes
+			}
+			merged, mErr := json.Marshal(bucket)
+			assertf(mErr == nil, "retire lfs object: marshal refund bucket: %v", mErr)
+			return &s3walScanRow{Payload: string(merged), Generation: gen}, nil
+		})
+	if err != nil {
+		return false, fmt.Errorf("retire lfs object %s: %w", key, err)
+	}
+	return true, nil
+}
+
+// SettleLFSRefunds — see the PG twin for the settlement rules (epoch
+// strictly exceeded; legacy halves only under legacy-armed completions;
+// keyset-paged past stuck buckets). The s3wal split, ordered fail-closed:
+// bucket rewrites/drains happen FIRST as side-object CASes, then ONE
+// manifest CAS applies the accumulated count/usage refund and the
+// adoption-generation bump — a crash in between loses the drained refund
+// (capacity stays charged: conservative), while the reverse order could
+// refund twice. Watermark reads are §2.10 side-object reads; purge-fenced
+// repos settle nothing (checked before draining AND re-checked inside the
+// refund CAS — the purge drops buckets and counters wholesale).
+func (s *S3WAL) SettleLFSRefunds(ctx context.Context, repo string) (SettledLFSRefunds, error) {
+	assertf(repo != "", "SettleLFSRefunds: empty repo")
+	base := baseRepoOf(repo)
+	m, err := s.viewManifest(ctx, base)
+	if err != nil {
+		return SettledLFSRefunds{}, fmt.Errorf("settle lfs refunds %s: %w", repo, err)
+	}
+	if m.PurgedAt != nil {
+		return SettledLFSRefunds{}, nil // buckets die with the ledger
+	}
+	epochFor := func(scope string) (int64, error) {
+		row, ok, err := s.scanGet(ctx, ScanJobSweep, scope)
+		if err != nil || !ok {
+			return 0, err
+		}
+		return DecodeReapWatermark(row.Payload).Epoch, nil
+	}
+	canonEpoch, err := epochFor(ScanScopeLFSDestructiveReap)
+	if err != nil {
+		return SettledLFSRefunds{}, fmt.Errorf("settle lfs refunds %s: %w", repo, err)
+	}
+	legacyEpoch, err := epochFor(ScanScopeLFSDestructiveReapLegacy)
+	if err != nil {
+		return SettledLFSRefunds{}, fmt.Errorf("settle lfs refunds %s: %w", repo, err)
+	}
+	var out SettledLFSRefunds
+	var refundRows, refundBytes int64
+	prefix := ScanScopeReclaimRefundPrefix(repo)
+	for after := prefix; ; {
+		scopes, err := s.ListJobScanStateScopes(ctx, ScanJobLFSReclaim, prefix, after, lfsRefundBucketPage)
+		if err != nil {
+			return SettledLFSRefunds{}, fmt.Errorf("settle lfs refunds %s: %w", repo, err)
+		}
+		for _, scope := range scopes {
+			row, ok, err := s.scanGet(ctx, ScanJobLFSReclaim, scope)
+			if err != nil {
+				return SettledLFSRefunds{}, fmt.Errorf("settle lfs refunds %s: %w", repo, err)
+			}
+			if !ok {
+				continue // drained between the listing and the read
+			}
+			var bucket LFSRefundBucket
+			if err := json.Unmarshal([]byte(row.Payload), &bucket); err != nil {
+				return SettledLFSRefunds{}, fmt.Errorf("settle lfs refunds %s: undecodable refund bucket %s: %w", repo, scope, err)
+			}
+			settled := false
+			if row.Generation < canonEpoch && (bucket.Rows > 0 || bucket.Bytes > 0) {
+				refundRows, refundBytes = refundRows+bucket.Rows, refundBytes+bucket.Bytes
+				bucket.Rows, bucket.Bytes = 0, 0
+				settled = true
+			}
+			if row.Generation < legacyEpoch && (bucket.LegacyRows > 0 || bucket.LegacyBytes > 0) {
+				refundRows, refundBytes = refundRows+bucket.LegacyRows, refundBytes+bucket.LegacyBytes
+				bucket.LegacyRows, bucket.LegacyBytes = 0, 0
+				settled = true
+			}
+			switch {
+			case bucket == (LFSRefundBucket{}):
+				if err := s.scanDelete(ctx, ScanJobLFSReclaim, scope); err != nil {
+					return SettledLFSRefunds{}, fmt.Errorf("settle lfs refunds %s: %w", repo, err)
+				}
+			case settled:
+				merged, mErr := json.Marshal(bucket)
+				assertf(mErr == nil, "settle lfs refunds: marshal bucket: %v", mErr)
+				if err := s.scanPut(ctx, ScanJobLFSReclaim, scope, string(merged), row.Generation); err != nil {
+					return SettledLFSRefunds{}, fmt.Errorf("settle lfs refunds %s: %w", repo, err)
+				}
+				out.Pending++
+			default:
+				out.Pending++
+			}
+		}
+		if len(scopes) < lfsRefundBucketPage {
+			break
+		}
+		after = scopes[len(scopes)-1]
+	}
+	if refundRows > 0 || refundBytes > 0 {
+		err := s.mutate(ctx, base, s3walMutation{
+			op: "settle lfs refunds",
+			fn: func(m *s3wal.Manifest, clk time.Time) (bool, error) {
+				if m.PurgedAt != nil {
+					return false, nil // purge owns the counters now
+				}
+				m.LFS.Count = max(m.LFS.Count-refundRows, 0)
+				m.UsageBytes = max(m.UsageBytes-refundBytes, 0)
+				m.LFS.AdoptionGen++ // floor-cache invalidation, atomic with the debit
+				return true, nil
+			},
+			// ID within one settlement pass would be wrong (a re-applied
+			// debit double-refunds), so ambiguity resolves via the writer
+			// nonce inside mutate; an unresolved ambiguity fails closed.
+			recover: func(*s3wal.Manifest) s3walVerdict { return s3walFailClosed },
+		})
+		if err != nil {
+			return SettledLFSRefunds{}, fmt.Errorf("settle lfs refunds %s: %w", repo, err)
+		}
+	}
+	out.Rows, out.Bytes = refundRows, refundBytes
+	return out, nil
 }
 
 // ---------------------------------------------------------------------------
