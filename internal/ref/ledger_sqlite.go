@@ -733,6 +733,7 @@ func (s *SQLite) QuotaLedgerState(ctx context.Context, group []string, ttl time.
 	for _, r := range group {
 		args = append(args, r)
 	}
+	args = append(args, ScanJobAbsence, ScanScopeAbsenceAdmissionFence)
 	var st PackQuotaLedgerState
 	err := s.db.QueryRowContext(ctx, `
 SELECT
@@ -740,7 +741,8 @@ SELECT
   COALESCE((SELECT SUM(bytes) FROM pack_reservations
             WHERE repo = ? AND created_at > `+sqliteEpochMS+` - ?
               AND key NOT LIKE '%`+AdoptionClaimSuffix+`'`+exclude+`), 0),
-  COALESCE((SELECT SUM(bytes) FROM pack_retained WHERE repo IN (?`+placeholders(len(group)-1)+`)), 0)`,
-		args...).Scan(&st.UsageBytes, &st.ReservedBytes, &st.RetainedBytes)
+  COALESCE((SELECT SUM(bytes) FROM pack_retained WHERE repo IN (?`+placeholders(len(group)-1)+`)), 0),
+  EXISTS (SELECT 1 FROM job_scan_state WHERE job = ? AND scope = ?)`,
+		args...).Scan(&st.UsageBytes, &st.ReservedBytes, &st.RetainedBytes, &st.RenewalDegraded)
 	return st, err
 }

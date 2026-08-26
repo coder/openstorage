@@ -1317,6 +1317,15 @@ type PackQuotaLedgerState struct {
 	UsageBytes    int64 // SUM(pack_usage) over the group
 	ReservedBytes int64 // SUM(active reservations) for the base repo
 	RetainedBytes int64 // SUM(pack_retained) over the group
+	// RenewalDegraded mirrors ReservePackBytes' cover-renewal degraded
+	// fence (the absence reconciler's admission-fence marker): while
+	// set, every finite quota-gated admission WILL deny, so advisory
+	// preflights can fail hopeless work before spending on it (Codex
+	// round 36 on PR #132, security — the adoption preflight hashed
+	// whole legacy objects only to be denied post-hash). Advisory
+	// only: the authoritative check stays inside ReservePackBytes
+	// under the fence's shared advisory lock.
+	RenewalDegraded bool
 }
 
 // QuotaLedgerState reads the group's ledger state (see PackQuotaLedgerState).
@@ -1333,7 +1342,10 @@ SELECT
             WHERE repo = $2 AND created_at > now() - make_interval(secs => $3)
               AND key NOT LIKE '%`+AdoptionClaimSuffix+`'
               AND NOT (key = ANY($4))), 0),
-  COALESCE((SELECT SUM(bytes) FROM pack_retained WHERE repo = ANY($1)), 0)`,
-		group, group[0], ttl.Seconds(), excludeKeys).Scan(&st.UsageBytes, &st.ReservedBytes, &st.RetainedBytes)
+  COALESCE((SELECT SUM(bytes) FROM pack_retained WHERE repo = ANY($1)), 0),
+  EXISTS (SELECT 1 FROM job_scan_state WHERE job = $5 AND scope = $6)`,
+		group, group[0], ttl.Seconds(), excludeKeys,
+		ScanJobAbsence, ScanScopeAbsenceAdmissionFence,
+	).Scan(&st.UsageBytes, &st.ReservedBytes, &st.RetainedBytes, &st.RenewalDegraded)
 	return st, err
 }

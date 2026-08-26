@@ -1155,6 +1155,20 @@ func (s *Server) adoptStoredLFSObject(ctx context.Context, repoID, key, oid stri
 			if lerr != nil {
 				return fmt.Errorf("adoption preflight %s: ledger read: %w", key, lerr)
 			}
+			// Degraded-renewal fence preflight (Codex round 36 on PR
+			// #132, security): while the absence reconciler's admission
+			// fence is armed, the post-hash copy admission WILL deny
+			// with RenewalDegraded — but only after verifyStoredLFSObject
+			// streamed and hashed the entire legacy object, and the
+			// denial produces no canonical row and parks no progress,
+			// so every batch retry restarted the whole read from offset
+			// zero: the same repeatable, client-cost-free drain as the
+			// over-quota shape below. The advisory ledger read carries
+			// the fence bit; the authoritative check stays inside
+			// ReservePackBytes under the fence's shared advisory lock.
+			if ls.RenewalDegraded {
+				return fmt.Errorf("adoption preflight %s: %w", key, errLFSQuotaDegraded)
+			}
 			if used := ref.AddSat(ls.UsageBytes, floor); !ref.Admitted(used, ls.ReservedBytes, srcSize, s.PackQuotaBytes) {
 				return fmt.Errorf("adopt %s: %w (copy adds %d bytes to %d stored, +%d reserved, quota %d)",
 					key, errLFSAdoptQuotaExceeded, srcSize, used, ls.ReservedBytes, s.PackQuotaBytes)

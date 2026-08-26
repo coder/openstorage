@@ -2589,6 +2589,40 @@ func TestLFSAdopt_QuotaPreflightSkipsHash(t *testing.T) {
 	}
 }
 
+// TestLFSAdopt_DegradedRenewalPreflightSkipsHash (Codex round 36 on PR
+// #132, security): while the absence reconciler's admission fence is
+// armed, the copy admission denies with RenewalDegraded — but that check
+// ran AFTER the full-object verification hash, so every write-scoped
+// batch touch of a legacy object re-streamed and re-hashed it in full
+// (no canonical row, no parked progress) for the whole fence window. The
+// advisory preflight must carry the fence bit and fail before any ranged
+// read.
+func TestLFSAdopt_DegradedRenewalPreflightSkipsHash(t *testing.T) {
+	ctx := context.Background()
+	srv, st, _ := newLFSQuotaServer(t, 1<<20, time.Hour)
+	content := bytes.Repeat([]byte("x"), 50)
+	oid := sha256Hex(content)
+	key := blob.LFSKey(lfsTestRepoID, oid)
+	if err := srv.Blob.UploadFile(ctx, blob.LFSLegacyKey(lfsTestRepoID, oid), writeTempFile(t, content)); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.(interface {
+		ArmAbsenceAdmissionFence(context.Context, string) error
+	}).ArmAbsenceAdmissionFence(ctx, `{"lfs":0,"packs":0}`); err != nil {
+		t.Fatal(err)
+	}
+	rc := &readCountingBlob{BlobStore: srv.Blob}
+	srv.Blob = rc
+
+	aerr := srv.adoptLFSObject(ctx, lfsTestRepoID, key, oid)
+	if !errors.Is(aerr, errLFSQuotaDegraded) {
+		t.Fatalf("fenced adoption = %v, want errLFSQuotaDegraded", aerr)
+	}
+	if n := rc.reads.Load(); n != 0 {
+		t.Fatalf("fenced adoption performed %d ranged reads before denying — every retry re-reads the whole blob for free", n)
+	}
+}
+
 // TestLFSAdopt_UncoveredCleanupRetriesUntilProven (Codex round 108, P1):
 // accounting recovery cannot revoke an admission that already exploited
 // the uncovered gap — only deleting the bytes restores the quota
