@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"time"
+	"unicode/utf8"
 )
 
 // ManifestVersion is the only schema version this binary reads or writes.
@@ -191,6 +192,7 @@ func (m *Manifest) EncodeAdvance(clk time.Time) ([]byte, error) {
 	assertf(m.Seq >= 0, "EncodeAdvance: seq %d", m.Seq)
 	assertf(clk.After(m.Clk), "EncodeAdvance: clock %v does not advance past %v", clk, m.Clk)
 	assertf(len(m.Ops) <= OpsRingSize, "EncodeAdvance: ops ring overflow (%d > %d)", len(m.Ops), OpsRingSize)
+	m.assertKeysUTF8()
 	m.Seq++
 	m.Writer = newHexNonce()
 	m.Clk = clk
@@ -199,6 +201,43 @@ func (m *Manifest) EncodeAdvance(clk time.Time) ([]byte, error) {
 		return nil, fmt.Errorf("s3wal: manifest encode: %w", err)
 	}
 	return body, nil
+}
+
+// assertKeysUTF8 is the codec-boundary defense against key aliasing
+// (Codex round 4 on PR #156, security): encoding/json does not REJECT an
+// invalid-UTF-8 map key — it silently rewrites the invalid bytes to
+// U+FFFD on encode, so two distinct in-memory keys (a raw-0xff ref name
+// and its U+FFFD spelling) collapse into DUPLICATE JSON keys, and decode
+// keeps the LAST one: a silent overwrite of whichever row the spelling
+// collision targets. Every writer path must reject such keys before
+// mutating (CASRef does — ref names are the only caller-controlled raw
+// byte strings); this assert crashes-and-burns on any missed path
+// instead of ever encoding a lossy manifest.
+func (m *Manifest) assertKeysUTF8() {
+	check := func(kind, key string) {
+		assertf(utf8.ValidString(key), "EncodeAdvance: %s key %q is not valid UTF-8 — JSON encoding would alias it onto its U+FFFD spelling", kind, key)
+	}
+	for repo, mem := range m.Members {
+		check("member", repo)
+		for name := range mem.Refs {
+			check("ref", name)
+		}
+		for key := range mem.Retained {
+			check("retained", key)
+		}
+	}
+	for key := range m.Reservations {
+		check("reservation", key)
+	}
+	for key := range m.LFS.Objects {
+		check("lfs object", key)
+	}
+	for key := range m.LFS.Mismatches {
+		check("lfs mismatch", key)
+	}
+	for key := range m.DeleteLocks {
+		check("delete lock", key)
+	}
 }
 
 // RecordOp appends a non-idempotent mutation's op-ID to the bounded ring,

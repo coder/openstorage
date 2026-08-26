@@ -978,6 +978,52 @@ func TestS3WALRecoveryStaleReadPanics(t *testing.T) {
 	_, _ = a.ListRefs(ctx, base)
 }
 
+// TestS3WALRecoveryRefNameUTF8 (Codex round 4 on PR #156, security): git
+// accepts raw non-UTF-8 bytes in ref names, the update hook compares raw
+// bytes to policy (raw-0xff ≠ the U+FFFD-spelled protected ref, so policy
+// passes), and encoding/json would collapse the raw key onto the U+FFFD
+// spelling — duplicate JSON keys whose decode keeps the LAST: a
+// repo-scoped writer overwriting a protected ref's SHA. CASRef must
+// reject such names with the typed error BEFORE any manifest mutation.
+func TestS3WALRecoveryRefNameUTF8(t *testing.T) {
+	ctx := context.Background()
+	const base = "r-utf8"
+	_, a, _ := newRecoveryStores(t)
+
+	// The policy-protected ref, spelled with a REAL U+FFFD.
+	protected := "refs/heads/p\uFFFD"
+	sha := testSHA(0x11)
+	if won, err := a.CASRef(ctx, base, protected, ZeroSHA, sha); err != nil || !won {
+		t.Fatalf("seed protected ref = (%v, %v)", won, err)
+	}
+	seqBefore := mustManifest(t, a, base).Seq
+
+	// The attack spelling: raw 0xff, distinct bytes, same JSON encoding.
+	raw := "refs/heads/p\xff"
+	for _, tc := range []struct{ what, old, new string }{
+		{"create", ZeroSHA, testSHA(0x22)},
+		{"update", sha, testSHA(0x22)},
+		{"delete", sha, ZeroSHA},
+	} {
+		won, err := a.CASRef(ctx, base, raw, tc.old, tc.new)
+		if won || !errors.Is(err, ErrRefNameNotUTF8) {
+			t.Fatalf("raw-byte %s = (%v, %v), want ErrRefNameNotUTF8", tc.what, won, err)
+		}
+	}
+	m := mustManifest(t, a, base)
+	if m.Seq != seqBefore {
+		t.Fatalf("seq %d -> %d: the rejection must precede any mutation", seqBefore, m.Seq)
+	}
+	if got := m.Members[base].Refs[protected].SHA; got != sha {
+		t.Fatalf("protected ref = %s, want %s untouched", got, sha)
+	}
+	// Reads with raw-byte names are clean misses: no manifest can hold
+	// such a key (writers fail closed).
+	if _, err := a.GetRef(ctx, base, raw); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("GetRef(raw) = %v, want clean ErrNotFound", err)
+	}
+}
+
 // TestS3WALRecoveryBootClockGuard (Codex round 2 on PR #156): a process
 // that BOOTS with its wall clock already ahead reports ~zero
 // wall-vs-monotonic drift, and the manifest-ahead arm reads an old clk as

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -219,6 +220,27 @@ func TestSkewGuard(t *testing.T) {
 	if !DriftOK(time.Hour, time.Nanosecond) {
 		t.Fatal("a degenerate sub-4ns window disables the drift arm (noise-indistinguishable)")
 	}
+}
+
+// TestEncodeAdvanceRejectsNonUTF8Keys (Codex round 4 on PR #156,
+// security): encoding/json silently rewrites invalid-UTF-8 map keys to
+// their U+FFFD spelling, aliasing distinct in-memory keys onto duplicate
+// JSON keys (decode keeps the last). The encoder must crash-and-burn on
+// any such key instead of writing a lossy manifest.
+func TestEncodeAdvanceRejectsNonUTF8Keys(t *testing.T) {
+	m := NewManifest()
+	mem := m.EnsureMember("base")
+	mem.Refs = map[string]RefRecord{"refs/heads/p\xff": {SHA: "1111111111111111111111111111111111111111"}}
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("EncodeAdvance must panic on a non-UTF-8 ref key")
+		}
+		if msg := fmt.Sprint(r); !strings.Contains(msg, "not valid UTF-8") {
+			t.Fatalf("panic = %q, want the UTF-8 key assert", msg)
+		}
+	}()
+	_, _ = m.EncodeAdvance(time.Now())
 }
 
 // TestDateGuard pins the §2.4-3 store-Date witness arm: local-vs-store

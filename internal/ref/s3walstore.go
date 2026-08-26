@@ -32,9 +32,25 @@ import (
 	"sort"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/coder/code-storage/internal/ref/s3wal"
 )
+
+// ErrRefNameNotUTF8 rejects ref names carrying invalid UTF-8 (git accepts
+// arbitrary non-NUL bytes in ref names, e.g. a trailing 0xff). The s3wal
+// JSON codec cannot represent such keys losslessly — encoding/json
+// rewrites invalid bytes to U+FFFD, so a raw-0xff name that PASSED policy
+// (the update hook compares raw bytes, and raw-0xff ≠ the U+FFFD-spelled
+// protected ref) would encode onto the SAME manifest key as the protected
+// ref and overwrite its SHA on decode (duplicate JSON keys keep the last).
+// s3wal therefore fails closed BEFORE any manifest mutation. Pre-existing
+// cross-backend divergence, documented rather than unified: PostgreSQL
+// TEXT rejects invalid UTF-8 at the wire with its own encoding error,
+// while SQLite stores the raw bytes verbatim. Reads need no guard: no
+// manifest can contain such a key, so GetRef/hydration comparisons with
+// raw-byte arguments are clean misses.
+var ErrRefNameNotUTF8 = errors.New("s3wal: ref name is not valid UTF-8")
 
 // s3wal manifest size guards (plan §2.2): a documented boundary, not a
 // silent failure. Enforced only on mutations that ADD entries
@@ -520,6 +536,11 @@ func (s *S3WAL) CASRef(ctx context.Context, repo, name, old, new string) (won bo
 	assertf(ValidSHA(old), "CASRef: malformed old sha %q", old)
 	assertf(ValidSHA(new), "CASRef: malformed new sha %q", new)
 	assertf(old != ZeroSHA || new != ZeroSHA, "CASRef: zero -> zero update for %s/%s", repo, name)
+	// Typed rejection BEFORE any manifest read or mutation — see
+	// ErrRefNameNotUTF8 (Codex round 4 on PR #156, security).
+	if !utf8.ValidString(name) {
+		return false, fmt.Errorf("cas %s/%q: %w", repo, name, ErrRefNameNotUTF8)
+	}
 	fence, fenced := casFence(ctx, repo)
 	// matches reports whether the precondition holds on m — the shared
 	// text of the mutation and its ambiguity recovery predicate.
