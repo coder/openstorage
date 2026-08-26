@@ -279,7 +279,10 @@ func ClkNext(localNow, prev time.Time) time.Time {
 // min(localNow, clkCandidate) − stamp with clkCandidate = max(localNow,
 // clk+1ms) — a backward local-clock jump (localNow < clk) charges only the
 // local clock's smaller reading, so destruction is only ever DELAYED by
-// clock trouble, never accelerated.
+// clock trouble, never accelerated. Because clkCandidate >= localNow by
+// construction, the reduction always equals localNow − stamp: a FORWARD
+// local-clock jump inflates this reading, and it is SkewOK — not this
+// helper — that fails destructive verdicts closed against it.
 func Elapsed(localNow, clk, stamp time.Time) time.Duration {
 	assertf(!localNow.IsZero(), "Elapsed: zero local time")
 	cand := ClkNext(localNow, clk)
@@ -291,18 +294,58 @@ func Elapsed(localNow, clk, stamp time.Time) time.Duration {
 }
 
 // SkewOK is the §2.4 fail-closed skew guard for destructive/steal checks:
-// false when the manifest clock runs AHEAD of the local clock by more than
-// min(15min, ttl/4) — evidence some writer's clock (ours or a previous
-// one) is grossly wrong, so expiry verdicts demote to report-only (log
-// loudly, never expire early). The guard is one-sided by construction: a
-// manifest whose clock is merely OLD (quiet repo) is normal, not skew.
-func SkewOK(localNow, clk time.Time, ttl time.Duration) bool {
+// false — expiry verdicts demote to report-only (log loudly, never expire
+// early) — on either of two clock-trouble evidences, both bounded by
+// min(15min, ttl/4):
+//
+//   - the manifest clock runs AHEAD of the local clock by more than the
+//     bound: some writer's clock (ours or a previous one) is grossly
+//     wrong. This comparison stays one-sided: a manifest clock is
+//     last-WRITE time, so a merely OLD clock (quiet repo) is normal
+//     aging, not skew — §2.4's literal |localNow − clk| reading would
+//     demote every quiet-repo expiry forever (a deliberate, documented
+//     deviation from that wording).
+//   - the process wall clock has drifted from its monotonic clock by
+//     more than the bound (wallDrift, either sign): a local-clock jump
+//     during this process's lifetime — exactly the window in which a
+//     forward jump could otherwise expire the leases of live in-process
+//     holders (guarded deletes, adoption claims, reservations) early.
+//
+// Jumps within the bound are acceptable: the conservative grace floors
+// (§2.4-4) absorb them as noise. Wall jumps predating this process are
+// invisible to both arms; the §2.4-3 S3 Date cross-check is the designed
+// absolute witness for those, and a dead prior process's leases guard no
+// in-flight work under the single-writer decree.
+func SkewOK(localNow, clk time.Time, wallDrift, ttl time.Duration) bool {
 	assertf(ttl > 0, "SkewOK: non-positive ttl %v", ttl)
 	bound := ttl / 4
 	if bound > 15*time.Minute {
 		bound = 15 * time.Minute
 	}
-	return !clk.After(localNow.Add(bound))
+	return !clk.After(localNow.Add(bound)) && DriftOK(wallDrift, ttl)
+}
+
+// DriftOK is the wall-vs-monotonic drift arm of SkewOK, also consulted
+// alone by LIVENESS checks (which lean live under a jump): a manifest
+// clock merely AHEAD already leans live through the plain elapsed
+// arithmetic, so liveness needs only this arm. A degenerate bound of 0
+// (ttl < 4ns — the conformance suite's "window already elapsed" idiom)
+// disables the arm: at that scale measurement noise and jumps are
+// indistinguishable, and ttl <= 0 is the explicit waiver spelling
+// upstream.
+func DriftOK(wallDrift, ttl time.Duration) bool {
+	assertf(ttl > 0, "DriftOK: non-positive ttl %v", ttl)
+	bound := ttl / 4
+	if bound > 15*time.Minute {
+		bound = 15 * time.Minute
+	}
+	if bound == 0 {
+		return true
+	}
+	if wallDrift < 0 {
+		wallDrift = -wallDrift
+	}
+	return wallDrift <= bound
 }
 
 // ManifestKey builds the extension-free manifest object key for one BASE

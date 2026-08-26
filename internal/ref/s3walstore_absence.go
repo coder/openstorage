@@ -215,8 +215,10 @@ func (s *S3WAL) RenewAbsenceCovers(ctx context.Context, ttl time.Duration) (int6
 }
 
 // LapsedAbsenceCoverExists — see the PG twin: any physically present
-// un-folded cover row aged past ttl is lapse evidence. A report-only
-// probe, so it reads the plain elapsed rule with no skew demotion.
+// un-folded cover row aged past ttl is lapse evidence. Liveness leans
+// LIVE under the §2.4 skew guard (s3walReservationLive): a clock jump
+// must not mass-manufacture false lapse evidence, and rows persist, so
+// genuine evidence resurfaces once clocks agree.
 func (s *S3WAL) LapsedAbsenceCoverExists(ctx context.Context, ttl time.Duration) (bool, error) {
 	assertf(ttl > 0, "LapsedAbsenceCoverExists: non-positive ttl %v", ttl)
 	exists := false

@@ -852,6 +852,98 @@ func TestS3WALRecoverySkewGuard(t *testing.T) {
 	}
 }
 
+// TestS3WALRecoveryForwardJumpGuard (Codex on PR #156): a FORWARD local
+// clock jump past a lease window must not expire the lease early — the
+// §2.4 wall-vs-monotonic drift arm of the skew guard demotes destruction
+// and steal to report-only until the drift clears.
+func TestS3WALRecoveryForwardJumpGuard(t *testing.T) {
+	ctx := context.Background()
+	t0 := time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	t.Run("delete lease survives a jump past its fencing window", func(t *testing.T) {
+		const base = "r-jump-lease"
+		key := "lfs/" + base + "/" + strings.Repeat("ef", 32)
+		_, a, b := newRecoveryStores(t)
+		clock := newFakeClock(t0)
+		a.now, b.now = clock.now, clock.now
+
+		// An ACTIVE foreign delete lease renewed moments ago: its
+		// guarded DELETE may still be in flight.
+		recoveryEdit(t, b, base, func(m *s3wal.Manifest, clk time.Time) {
+			m.DeleteLocks = map[string]*s3wal.DeleteLock{key: {Owner: "deleter", OpID: "op-y", CreatedAt: clk}}
+		})
+
+		// The wall clock jumps forward past the WHOLE fencing window;
+		// the monotonic clock exposes the jump as drift. Registration
+		// must stay fenced — committing here could leave a registered
+		// row pointing at bytes the in-flight DELETE removes.
+		window := s3walDeleteLockTTL + s3walDeleteIOTimeout + s3walDeleteLockSafety
+		jump := window + time.Minute
+		clock.set(t0.Add(jump))
+		a.wallDrift = func() time.Duration { return jump }
+		blockedCtx, cancel := context.WithTimeout(ctx, 250*time.Millisecond)
+		defer cancel()
+		err := a.RegisterLFSObject(blockedCtx, base, key, 5)
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("register under a jumped clock = %v, want ctx deadline (still fenced)", err)
+		}
+		if lock := mustManifest(t, a, base).DeleteLocks[key]; lock == nil || lock.Owner != "deleter" {
+			t.Fatalf("lock = %+v, want untouched", lock)
+		}
+
+		// Drift cleared (the same reading is now a genuinely elapsed
+		// window): the stale lease expires and registration proceeds.
+		a.wallDrift = func() time.Duration { return 0 }
+		if err := a.RegisterLFSObject(ctx, base, key, 5); err != nil {
+			t.Fatalf("register after the drift cleared: %v", err)
+		}
+	})
+
+	t.Run("adoption claim survives a jump past its TTL", func(t *testing.T) {
+		const base = "r-jump-claim"
+		key := "lfs/" + base + "/" + strings.Repeat("ab", 32)
+		_, a, _ := newRecoveryStores(t)
+		clock := newFakeClock(t0)
+		a.now = clock.now
+
+		claimed, owner1, err := a.TryAdoptionClaim(ctx, base, key)
+		if err != nil || !claimed {
+			t.Fatalf("seed claim = (%v, %v)", claimed, err)
+		}
+
+		jump := AdoptionClaimTTL + time.Minute
+		clock.set(t0.Add(jump))
+		a.wallDrift = func() time.Duration { return jump }
+
+		seqBefore := mustManifest(t, a, base).Seq
+		claimed, _, err = a.TryAdoptionClaim(ctx, base, key)
+		if err != nil || claimed {
+			t.Fatalf("steal under a jumped clock = (%v, %v), want demoted to report-only", claimed, err)
+		}
+		m := mustManifest(t, a, base)
+		if m.Seq != seqBefore {
+			t.Fatalf("seq %d -> %d: a demoted verdict must write NOTHING", seqBefore, m.Seq)
+		}
+		if r := m.Reservations[key+AdoptionClaimSuffix]; r == nil || r.Owner != owner1 {
+			t.Fatalf("claim = %+v, want owner %q untouched", r, owner1)
+		}
+		// The live-leaning twin: the holder keeps its lease through the
+		// jump (owner fences still protect stolen claims).
+		if renewed, err := a.RenewAdoptionClaim(ctx, key, owner1); err != nil || !renewed {
+			t.Fatalf("renew under a jumped clock = (%v, %v), want renewed", renewed, err)
+		}
+
+		// Drift cleared and the renewed lease genuinely ages out: the
+		// steal proceeds normally.
+		a.wallDrift = func() time.Duration { return 0 }
+		clock.set(t0.Add(jump + AdoptionClaimTTL + time.Minute))
+		claimed, owner2, err := a.TryAdoptionClaim(ctx, base, key)
+		if err != nil || !claimed || owner2 == owner1 {
+			t.Fatalf("steal after the drift cleared = (%v, %q, %v), want fresh owner", claimed, owner2, err)
+		}
+	})
+}
+
 func TestS3WALRecoveryStaleReadPanics(t *testing.T) {
 	ctx := context.Background()
 	const base = "r-stale"

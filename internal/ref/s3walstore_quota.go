@@ -41,9 +41,21 @@ func (s *S3WAL) s3walRecordLapse(ctx context.Context, mapKey string) error {
 }
 
 // s3walReservationLive reports whether a reservation stamp is inside ttl
-// under the §2.4 elapsed rule.
+// under the §2.4 elapsed rule. Under the drift arm of the skew guard the
+// verdict leans LIVE: a forward clock jump must not vanish live rows
+// early from admission sums (quota would under-count), retire-sparing
+// (the adopter's mutual exclusion would lapse), or renewals (owner fences
+// still protect stolen claims). Rows persist, so a leaned verdict
+// re-resolves plainly once clocks agree. Only the drift arm applies: a
+// manifest clock AHEAD already leans live through the plain elapsed
+// arithmetic, and tiny conformance windows chain the manifest clock
+// milliseconds ahead via ClkNext — that must not resurrect deliberately
+// expired rows (the strict-TTL round-6 invariant).
 func (s *S3WAL) s3walReservationLive(m *s3wal.Manifest, stamp time.Time, ttl time.Duration) bool {
-	return s3wal.Elapsed(s.now(), m.Clk, stamp) < ttl
+	if s3wal.Elapsed(s.now(), m.Clk, stamp) < ttl {
+		return true
+	}
+	return ttl > 0 && !s3wal.DriftOK(s.wallDrift(), ttl)
 }
 
 // s3walExpiryAllowed gates DESTRUCTIVE expiry verdicts (prune, steal,
@@ -58,7 +70,7 @@ func (s *S3WAL) s3walExpiryAllowed(base string, m *s3wal.Manifest, stamp time.Ti
 	if s3wal.Elapsed(now, m.Clk, stamp) < ttl {
 		return false
 	}
-	if !s3wal.SkewOK(now, m.Clk, ttl) {
+	if !s3wal.SkewOK(now, m.Clk, s.wallDrift(), ttl) {
 		// Fail closed: over-retention is the only reachable failure
 		// direction. Loud, then report-only (plan §2.4).
 		s.warnSkew(base, m, ttl, what)
@@ -71,7 +83,8 @@ func (s *S3WAL) s3walExpiryAllowed(base string, m *s3wal.Manifest, stamp time.Ti
 // on their cadence, so verdicts stay report-only until clocks agree).
 func (s *S3WAL) warnSkew(base string, m *s3wal.Manifest, ttl time.Duration, what string) {
 	slog.Warn("s3wal clock skew guard tripped: demoting expiry verdict to report-only",
-		"base", base, "what", what, "manifest_clk", m.Clk, "local_now", s.now(), "ttl", ttl)
+		"base", base, "what", what, "manifest_clk", m.Clk, "local_now", s.now(),
+		"wall_drift", s.wallDrift(), "ttl", ttl)
 }
 
 // s3walIsClaimKey reports whether a reservation map key is an adoption

@@ -69,6 +69,13 @@ type S3WAL struct {
 	// stamp WRITTEN into a manifest uses the manifest logical clock
 	// derived from it (s3wal.ClkNext), never a bare now().
 	now func() time.Time
+	// wallDrift reports how far the process wall clock has diverged from
+	// its monotonic clock since the store was built (positive = the wall
+	// clock jumped forward) — the §2.4 drift arm of s3wal.SkewOK.
+	// Overridable by clock tests: fake now() funcs carry no monotonic
+	// reading, so the production default stays ~0 under them and jump
+	// tests inject the drift explicitly.
+	wallDrift func() time.Duration
 
 	// Lost-race retry budget (plan §2.3 risk note: raise attempts on the
 	// STORE if contention flakes appear, never in tests).
@@ -118,6 +125,7 @@ func newS3WALStore(cs s3wal.ConditionalStore, probe func(ctx context.Context) er
 		probe:         probe,
 		closeFn:       closeFn,
 		now:           time.Now,
+		wallDrift:     newWallDrift(),
 		casAttempts:   16,
 		backoffBase:   10 * time.Millisecond,
 		backoffCap:    2 * time.Second,
@@ -369,6 +377,23 @@ func (s *S3WAL) checkManifestSize(base string, mu s3walMutation, size int) error
 		}
 	}
 	return nil
+}
+
+// newWallDrift anchors the §2.4 wall-vs-monotonic drift detector: a wall
+// clock jump (settimeofday, an NTP step, a VM resume) moves the wall
+// reading without moving the monotonic one, so the difference between the
+// two elapsed readings since the anchor exposes the jump. The anchor is
+// process-lifetime by design — a legitimate wall step (e.g. host
+// suspend/resume, where the monotonic clock pauses too) keeps reporting
+// as drift until restart, which is over-retention, the only failure
+// direction §2.4 permits, and every demoted verdict logs loudly.
+func newWallDrift() func() time.Duration {
+	anchor := time.Now() // carries both wall and monotonic readings
+	return func() time.Duration {
+		n := time.Now()
+		wall := n.Round(0).Sub(anchor.Round(0)) // wall arithmetic (monotonic stripped)
+		return wall - n.Sub(anchor)             // minus monotonic elapsed
+	}
 }
 
 // sleepJitter blocks for the §2.3 full-jitter lost-race backoff:

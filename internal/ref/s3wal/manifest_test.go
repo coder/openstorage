@@ -184,21 +184,40 @@ func TestElapsedClockRules(t *testing.T) {
 }
 
 // TestSkewGuard pins the §2.4 fail-closed guard: a manifest clock ahead of
-// the local clock past min(15min, ttl/4) demotes destruction; an old
-// manifest clock (quiet repo) is normal.
+// the local clock past min(15min, ttl/4) demotes destruction, as does a
+// wall-vs-monotonic drift past the same bound (a local-clock jump during
+// this process's lifetime); an old manifest clock (quiet repo) is normal.
 func TestSkewGuard(t *testing.T) {
 	now := time.Now().UTC()
-	if !SkewOK(now, now.Add(-24*time.Hour), time.Hour) {
+	if !SkewOK(now, now.Add(-24*time.Hour), 0, time.Hour) {
 		t.Fatal("a quiet manifest (old clk) must not trip the skew guard")
 	}
-	if !SkewOK(now, now.Add(10*time.Second), time.Minute) {
+	if !SkewOK(now, now.Add(10*time.Second), 0, time.Minute) {
 		t.Fatal("clk 10s ahead within ttl/4=15s must pass")
 	}
-	if SkewOK(now, now.Add(20*time.Second), time.Minute) {
+	if SkewOK(now, now.Add(20*time.Second), 0, time.Minute) {
 		t.Fatal("clk 20s ahead of a 1m ttl (bound 15s) must trip the guard")
 	}
-	if SkewOK(now, now.Add(16*time.Minute), 24*time.Hour) {
+	if SkewOK(now, now.Add(16*time.Minute), 0, 24*time.Hour) {
 		t.Fatal("the guard must cap at 15m regardless of ttl")
+	}
+	if !SkewOK(now, now, 10*time.Second, time.Minute) {
+		t.Fatal("wall drift within ttl/4=15s must pass")
+	}
+	if SkewOK(now, now, 20*time.Second, time.Minute) {
+		t.Fatal("a 20s forward jump against a 1m ttl (bound 15s) must trip the guard")
+	}
+	if SkewOK(now, now, -20*time.Second, time.Minute) {
+		t.Fatal("the drift arm is symmetric: a backward jump must trip it too")
+	}
+	if SkewOK(now, now.Add(-24*time.Hour), 16*time.Minute, 24*time.Hour) {
+		t.Fatal("drift past the 15m cap must trip the guard even on a quiet manifest")
+	}
+	if DriftOK(20*time.Second, time.Minute) {
+		t.Fatal("DriftOK alone must trip past ttl/4")
+	}
+	if !DriftOK(time.Hour, time.Nanosecond) {
+		t.Fatal("a degenerate sub-4ns window disables the drift arm (noise-indistinguishable)")
 	}
 }
 
