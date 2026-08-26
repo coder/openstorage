@@ -1157,10 +1157,20 @@ func TestStoreDateWitnessSeaweedFS(t *testing.T) {
 		}
 	}
 	assertWitness("create")
-	if _, err := cas.Get(ctx, "_wal/repo/date-witness"); err != nil {
+	obj, err := cas.Get(ctx, "_wal/repo/date-witness")
+	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
 	assertWitness("get")
+	// The instance lease judges freshness by Last-Modified against the
+	// witness (lease.go storeAge) and FAILS CLOSED on a zero stamp — a
+	// real store must serve one agreeing with the local clock.
+	if obj.LastModified.IsZero() {
+		t.Fatal("get served no Last-Modified stamp")
+	}
+	if delta := time.Since(obj.LastModified); delta < -time.Minute || delta > time.Minute {
+		t.Fatalf("Last-Modified %v disagrees with the local clock by %v", obj.LastModified, delta)
+	}
 }
 
 // ---------------------------------------------------------------------------

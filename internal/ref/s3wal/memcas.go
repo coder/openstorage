@@ -61,8 +61,9 @@ type MemCASHooks struct {
 }
 
 type memVersion struct {
-	body []byte
-	etag string
+	body    []byte
+	etag    string
+	lastMod time.Time // store-clock write instant (Object.LastModified)
 }
 
 // MemCAS implements ConditionalStore in memory. The zero value is not
@@ -74,7 +75,8 @@ type MemCAS struct {
 	Hooks MemCASHooks
 
 	// Now, when set, is the fake STORE wall clock served as the §2.4-3
-	// Date witness: like the real store, every operation records an
+	// Date witness and stamped as every written version's LastModified:
+	// like the real store, every operation records an
 	// observation (StoreDate). Nil serves the real clock — correct for
 	// every real-clock test, while fake-clock tests wire Now to their
 	// local fake (agreeing clocks) or to a second clock to simulate
@@ -86,17 +88,22 @@ type MemCAS struct {
 	storeDateAt time.Time
 }
 
+// storeNow reads the fake store clock (Now, or the real clock when unset)
+// — the single clock source behind both the Date witness and every
+// version's LastModified stamp, exactly like a real store.
+func (m *MemCAS) storeNow() time.Time {
+	if m.Now != nil {
+		return m.Now()
+	}
+	return time.Now()
+}
+
 // observeDate records the fake Date witness for one operation, exactly
 // when the real client would (response processing time).
 func (m *MemCAS) observeDate() {
-	now := time.Now()
-	date := now
-	if m.Now != nil {
-		date = m.Now()
-	}
 	m.dateMu.Lock()
 	defer m.dateMu.Unlock()
-	m.storeDate, m.storeDateAt = date, now
+	m.storeDate, m.storeDateAt = m.storeNow(), time.Now()
 }
 
 // StoreDate — see ConditionalStore.
@@ -131,14 +138,19 @@ func (m *MemCAS) Get(_ context.Context, key string) (Object, error) {
 	defer m.mu.Unlock()
 	if m.Hooks.StaleGet != nil && m.Hooks.StaleGet(key) {
 		if v, ok := m.prev[key]; ok {
-			return Object{Body: append([]byte(nil), v.body...), ETag: v.etag}, nil
+			return v.object(), nil
 		}
 	}
 	v, ok := m.cur[key]
 	if !ok {
 		return Object{}, fmt.Errorf("memcas get %s: %w", key, ErrNotExist)
 	}
-	return Object{Body: append([]byte(nil), v.body...), ETag: v.etag}, nil
+	return v.object(), nil
+}
+
+// object copies a stored version into the caller-facing Object shape.
+func (v memVersion) object() Object {
+	return Object{Body: append([]byte(nil), v.body...), ETag: v.etag, LastModified: v.lastMod}
 }
 
 // GetIfChanged fetches key unless etag is still current.
@@ -239,7 +251,7 @@ func (m *MemCAS) apply(key string, body []byte) {
 		m.prev[key] = v
 	}
 	stored := append([]byte(nil), body...)
-	m.cur[key] = memVersion{body: stored, etag: memETag(stored)}
+	m.cur[key] = memVersion{body: stored, etag: memETag(stored), lastMod: m.storeNow()}
 }
 
 // Prev returns key's most recently superseded version, if one exists. The
@@ -254,7 +266,7 @@ func (m *MemCAS) Prev(key string) (Object, bool) {
 	if !ok {
 		return Object{}, false
 	}
-	return Object{Body: append([]byte(nil), v.body...), ETag: v.etag}, true
+	return v.object(), true
 }
 
 // Delete removes key unconditionally.

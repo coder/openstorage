@@ -7,11 +7,14 @@
 //
 // Correctness does NOT depend on this lease: every state change is
 // CAS-serialized by the manifest/meta objects regardless. It is purely a
-// detection device, and an honest one — freshness comparisons use local
-// wall clocks against a stamp another machine may have written, so
-// cross-machine skew can delay (never break) detection. The lease body
-// records the writer's TTL so a starting process judges freshness by the
-// HOLDER's contract, not its own (possibly reconfigured) one.
+// detection device. Freshness is judged on the STORE's clock alone — the
+// lease object's Last-Modified against the HTTP Date witness (§2.4-3) —
+// never by comparing two hosts' wall clocks: a starter whose clock runs
+// ≥ TTL ahead of the holder's would otherwise classify a freshly renewed
+// lease as expired and steal it, creating exactly the dual-serve topology
+// the guard exists to detect (PR #168). The lease body records the
+// writer's TTL so a starting process judges freshness by the HOLDER's
+// contract, not its own (possibly reconfigured) one.
 package s3wal
 
 import (
@@ -31,9 +34,18 @@ const LeaseKey = "_wal/instance-lease"
 // may steal.
 const DefaultLeaseTTL = 2 * time.Minute
 
+// leaseDateResolution is the store-clock witness resolution: HTTP Date and
+// Last-Modified are whole-second stamps, so a measured age carries up to
+// ±1s of truncation error. The fresh window extends by one resolution so
+// that error can never fabricate an expiry (fail toward refusal); a
+// legitimate steal is delayed at most 2s past the TTL — noise at the 2m
+// default and absorbed by the e2e drill's retry loop.
+const leaseDateResolution = time.Second
+
 // LeaseHeldError is the dual-serve refusal: a fresh foreign lease exists,
 // so another serve process is (or very recently was) running against this
-// bucket. errors.As-able so serve can surface it verbatim.
+// bucket. errors.As-able so serve can surface it verbatim. Age is the
+// store-clock age of the lease object (storeAge), not a wall-clock delta.
 type LeaseHeldError struct {
 	Holder string
 	Age    time.Duration
@@ -49,7 +61,7 @@ func (e *LeaseHeldError) Error() string {
 // therefore distinct ETags (the §5-R4 ABA argument needs no seq here).
 type leaseDoc struct {
 	Holder string    `json:"holder"` // 128-bit random nonce, fixed per process
-	Stamp  time.Time `json:"stamp"`  // holder's wall clock at the write
+	Stamp  time.Time `json:"stamp"`  // holder's wall clock at the write — DIAGNOSTICS ONLY, never an expiry input
 	TTL    string    `json:"ttl"`    // holder's TTL contract (time.Duration string)
 }
 
@@ -91,9 +103,10 @@ type InstanceLease struct {
 }
 
 // AcquireInstanceLease claims LeaseKey for a fresh holder nonce: create
-// when absent, steal when the recorded stamp has aged past the RECORDED
-// TTL, refuse with *LeaseHeldError while fresh. Exactly one contender wins
-// any create/steal race — both paths are conditional writes.
+// when absent, steal when the object's STORE-clock age has passed the
+// RECORDED TTL (plus the Date-resolution margin), refuse with
+// *LeaseHeldError while fresh. Exactly one contender wins any create/steal
+// race — both paths are conditional writes.
 func AcquireInstanceLease(ctx context.Context, cs ConditionalStore, cfg LeaseConfig) (*InstanceLease, error) {
 	assertf(cs != nil, "AcquireInstanceLease: nil conditional store")
 	ttl := cfg.TTL
@@ -145,8 +158,15 @@ func AcquireInstanceLease(ctx context.Context, cs ConditionalStore, cfg LeaseCon
 			// holder. The operator resolves it by deleting the key.
 			return nil, fmt.Errorf("s3wal instance lease: %s is corrupt (%v): refusing to start; delete the object after confirming no other serve process runs against this bucket", LeaseKey, derr)
 		}
-		age := now().Sub(doc.Stamp)
-		if heldTTL := doc.ttlOrDefault(); age < heldTTL {
+		age, aerr := storeAge(cs, obj)
+		if aerr != nil {
+			// Fail closed: without a store-clock verdict a live holder
+			// cannot be ruled out, and falling back to comparing our wall
+			// clock against the holder's stamp is the skew hazard this
+			// judgment exists to remove.
+			return nil, fmt.Errorf("s3wal instance lease: %s freshness cannot be judged on the store clock (%w): refusing to start; delete the object after confirming no other serve process runs against this bucket", LeaseKey, aerr)
+		}
+		if heldTTL := doc.ttlOrDefault(); age < heldTTL+leaseDateResolution {
 			return nil, &LeaseHeldError{Holder: doc.Holder, Age: age, TTL: heldTTL}
 		}
 		// Expired: steal. The If-Match CAS lets exactly one stealer win.
@@ -164,7 +184,10 @@ func AcquireInstanceLease(ctx context.Context, cs ConditionalStore, cfg LeaseCon
 
 // resolveAcquire classifies a failed create/steal write: a re-read showing
 // OUR holder proves an ambiguous write landed (win); a foreign holder is
-// the dual-serve refusal; anything else surfaces the original error.
+// the dual-serve refusal (its store-clock age is diagnostic — a foreign
+// winner of the race refuses regardless of freshness, and an unjudgeable
+// age still refuses, just without the age); anything else surfaces the
+// original error.
 func (l *InstanceLease) resolveAcquire(ctx context.Context, werr error) error {
 	obj, gerr := l.cs.Get(ctx, LeaseKey)
 	if gerr != nil {
@@ -176,9 +199,32 @@ func (l *InstanceLease) resolveAcquire(ctx context.Context, werr error) error {
 			l.etag, l.renewedAt = obj.ETag, l.now()
 			return nil // our ambiguous write landed — errors.Is(nil) at the caller
 		}
-		return &LeaseHeldError{Holder: doc.Holder, Age: l.now().Sub(doc.Stamp), TTL: doc.ttlOrDefault()}
+		age, aerr := storeAge(l.cs, obj)
+		if aerr != nil {
+			return fmt.Errorf("s3wal instance lease: %s is held by holder %.8s… and its freshness cannot be judged on the store clock (%w): refusing to start (acquire: %v)", LeaseKey, doc.Holder, aerr, werr)
+		}
+		return &LeaseHeldError{Holder: doc.Holder, Age: age, TTL: doc.ttlOrDefault()}
 	}
 	return fmt.Errorf("s3wal instance lease: acquire %s: %w", LeaseKey, werr)
+}
+
+// storeAge measures how long ago obj was written ON THE STORE'S CLOCK:
+// storeNow − LastModified, where storeNow is the freshest HTTP Date
+// witness (recorded by the very Get that fetched obj, or a fresher
+// response) advanced by the LOCAL MONOTONIC elapsed since its observation.
+// Both operands come from the store's clock, so cross-machine wall-clock
+// skew cannot fabricate an expiry; local wall-clock trouble cannot forge
+// the monotonic correction (§2.4-3). The error return means freshness
+// cannot be judged — callers fail closed.
+func storeAge(cs ConditionalStore, obj Object) (time.Duration, error) {
+	date, observedAt, ok := cs.StoreDate()
+	if !ok {
+		return 0, errors.New("no store Date witness observed")
+	}
+	if obj.LastModified.IsZero() {
+		return 0, errors.New("store returned no Last-Modified stamp")
+	}
+	return date.Add(time.Since(observedAt)).Sub(obj.LastModified), nil
 }
 
 func (l *InstanceLease) encode(stamp time.Time) []byte {

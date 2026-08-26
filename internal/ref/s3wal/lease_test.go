@@ -25,6 +25,7 @@ func TestInstanceLeaseFreshForeignRefusal(t *testing.T) {
 	ctx := context.Background()
 	cas := NewMemCAS()
 	clk := newLeaseClock()
+	cas.Now = clk.Now // store clock agrees with the lease clock
 	cfg := LeaseConfig{TTL: 2 * time.Minute, Now: clk.Now}
 
 	first, err := AcquireInstanceLease(ctx, cas, cfg)
@@ -42,8 +43,10 @@ func TestInstanceLeaseFreshForeignRefusal(t *testing.T) {
 	if !strings.HasPrefix(first.Holder(), held.Holder[:8]) {
 		t.Fatalf("refusal names holder %q, first lease is %q", held.Holder, first.Holder())
 	}
-	if held.Age != 90*time.Second || held.TTL != 2*time.Minute {
-		t.Fatalf("refusal age/ttl = %v/%v, want 90s/2m", held.Age, held.TTL)
+	// Age is store-clock (fake) plus the real monotonic elapsed since the
+	// Get's witness observation — microseconds here, bounded loosely.
+	if held.Age < 90*time.Second || held.Age > 91*time.Second || held.TTL != 2*time.Minute {
+		t.Fatalf("refusal age/ttl = %v/%v, want ~90s/2m", held.Age, held.TTL)
 	}
 }
 
@@ -51,13 +54,15 @@ func TestInstanceLeaseExpiredSteal(t *testing.T) {
 	ctx := context.Background()
 	cas := NewMemCAS()
 	clk := newLeaseClock()
+	cas.Now = clk.Now // store clock agrees with the lease clock
 	cfg := LeaseConfig{TTL: 2 * time.Minute, Now: clk.Now}
 
 	first, err := AcquireInstanceLease(ctx, cas, cfg)
 	if err != nil {
 		t.Fatalf("first acquire: %v", err)
 	}
-	clk.Advance(2 * time.Minute) // exactly the TTL: no longer fresh
+	// TTL plus the Date-resolution margin: no longer fresh.
+	clk.Advance(2*time.Minute + leaseDateResolution)
 	second, err := AcquireInstanceLease(ctx, cas, cfg)
 	if err != nil {
 		t.Fatalf("steal of an expired lease: %v", err)
@@ -69,6 +74,99 @@ func TestInstanceLeaseExpiredSteal(t *testing.T) {
 	// fail-stop.
 	if err := first.renew(ctx); err == nil || !strings.Contains(err.Error(), "stolen") {
 		t.Fatalf("stolen holder's renew: want a stolen fail-stop verdict, got %v", err)
+	}
+}
+
+// TestInstanceLeaseSkewedStarterRefusal is the PR #168 P2 regression: the
+// holder's wall clock runs ≥ TTL BEHIND the starter's while its lease is
+// freshly written. A wall-clock judgment (starter now − holder stamp)
+// reads ≥ TTL and steals — manufacturing exactly the dual-serve topology
+// the guard targets. The store-clock judgment must refuse.
+func TestInstanceLeaseSkewedStarterRefusal(t *testing.T) {
+	ctx := context.Background()
+	cas := NewMemCAS()
+	storeClk := newLeaseClock()
+	cas.Now = storeClk.Now
+	cfg := LeaseConfig{TTL: 2 * time.Minute}
+
+	// Holder: wall clock 3 minutes (> TTL) behind the store/starter clock.
+	holderCfg := cfg
+	holderCfg.Now = func() time.Time { return storeClk.Now().Add(-3 * time.Minute) }
+	first, err := AcquireInstanceLease(ctx, cas, holderCfg)
+	if err != nil {
+		t.Fatalf("skewed holder's acquire: %v", err)
+	}
+
+	// Starter: wall clock in sync with the store. Its local delta against
+	// the recorded stamp is 3m ≥ TTL, but the lease is seconds old on the
+	// store's clock — it must refuse, never steal.
+	starterCfg := cfg
+	starterCfg.Now = storeClk.Now
+	_, err = AcquireInstanceLease(ctx, cas, starterCfg)
+	var held *LeaseHeldError
+	if !errors.As(err, &held) {
+		t.Fatalf("starter ahead of the holder by > TTL: want *LeaseHeldError, got %v", err)
+	}
+	if held.Holder != first.Holder() {
+		t.Fatalf("refusal names holder %q, live lease is %q", held.Holder, first.Holder())
+	}
+	if held.Age >= time.Minute {
+		t.Fatalf("store-clock age = %v — a wall-clock comparison leaked into the verdict", held.Age)
+	}
+	// The live holder still owns the lease.
+	if err := first.renew(ctx); err != nil {
+		t.Fatalf("live holder's renew after the refused contender: %v", err)
+	}
+}
+
+// noWitnessStore serves objects but never a store Date witness — a
+// substrate whose §2.4-3 Date capture is broken.
+type noWitnessStore struct{ ConditionalStore }
+
+func (noWitnessStore) StoreDate() (date, observedAt time.Time, ok bool) {
+	return time.Time{}, time.Time{}, false
+}
+
+// noLastModifiedStore strips the Last-Modified stamp from every Get.
+type noLastModifiedStore struct{ ConditionalStore }
+
+func (s noLastModifiedStore) Get(ctx context.Context, key string) (Object, error) {
+	obj, err := s.ConditionalStore.Get(ctx, key)
+	obj.LastModified = time.Time{}
+	return obj, err
+}
+
+// TestInstanceLeaseStoreClockUnjudgeableFailsClosed: without a Date
+// witness or a Last-Modified stamp the store-clock age cannot be judged —
+// acquisition must refuse (never fall back to wall clocks, never steal),
+// even when the lease is long expired.
+func TestInstanceLeaseStoreClockUnjudgeableFailsClosed(t *testing.T) {
+	ctx := context.Background()
+	cas := NewMemCAS()
+	clk := newLeaseClock()
+	cas.Now = clk.Now
+	cfg := LeaseConfig{TTL: 2 * time.Minute, Now: clk.Now}
+
+	first, err := AcquireInstanceLease(ctx, cas, cfg)
+	if err != nil {
+		t.Fatalf("first acquire: %v", err)
+	}
+	clk.Advance(10 * time.Minute) // long past the TTL
+
+	for name, cs := range map[string]ConditionalStore{
+		"no Date witness":  noWitnessStore{cas},
+		"no Last-Modified": noLastModifiedStore{cas},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := AcquireInstanceLease(ctx, cs, cfg)
+			if err == nil || !strings.Contains(err.Error(), "cannot be judged") {
+				t.Fatalf("want the fail-closed refusal, got %v", err)
+			}
+		})
+	}
+	// No blind steal happened: the object still carries the first holder.
+	if err := first.renew(ctx); err != nil {
+		t.Fatalf("holder's renew after fail-closed contenders: %v", err)
 	}
 }
 

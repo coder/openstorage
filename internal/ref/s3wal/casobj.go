@@ -80,6 +80,13 @@ func (e *AmbiguousError) Unwrap() error { return e.Cause }
 type Object struct {
 	Body []byte
 	ETag string
+	// LastModified is the STORE's write instant for this version
+	// (Last-Modified header, 1s resolution). Paired with the Date witness
+	// (StoreDate) it lets freshness be judged entirely on the store's
+	// clock — the instance lease depends on it, because comparing two
+	// hosts' wall clocks is exactly what cross-machine skew breaks. Zero
+	// when the store omitted the header; consumers fail closed.
+	LastModified time.Time
 }
 
 // Contention backoff (§2.3): full-jitter exponential, 25ms → 2s cap, ≤16
@@ -249,7 +256,11 @@ func (c *Client) get(ctx context.Context, key, ifNoneMatch string) (Object, erro
 	etag := aws.ToString(out.ETag)
 	assertf(etag != "", "get %s: store returned no ETag", key)
 	c.checkSeq(key, body)
-	return Object{Body: body, ETag: etag}, nil
+	obj := Object{Body: body, ETag: etag}
+	if out.LastModified != nil {
+		obj.LastModified = *out.LastModified
+	}
+	return obj, nil
 }
 
 // checkSeq enforces the read-side seq-monotonicity assert when DecodeSeq
