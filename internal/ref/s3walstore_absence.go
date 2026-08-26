@@ -66,14 +66,89 @@ func s3walCoverBase(synth string) string {
 	return rest[:i]
 }
 
-// ListAbsenceCovers — see the PG twin for the contract. Cursor resume
-// derives the cursor row's base group from its own spelling (the
-// s3walFleetResume pattern), re-emits that group's rows past the cursor,
-// then continues the manifest walk strictly after it.
+// s3walCoverLowExtends reports whether base x extends base p with a byte
+// that sorts BELOW '/' — the §2.9 alphabet admits exactly ',' (0x2C),
+// '-' (0x2D), and '.' (0x2E) there — so x's DECORATED cover keys
+// (<base>/<tail>…) sort BEFORE p's own even though x sorts after p in
+// plain base order.
+func s3walCoverLowExtends(x, p string) bool {
+	return len(x) > len(p) && x[:len(p)] == p && x[len(p)] < '/'
+}
+
+// s3walCoverAncestors returns base's strict prefixes that base
+// low-extends, outermost first — exactly the hold-back stack
+// s3walEachBaseCoverOrder carries when it visits base, reconstructed from
+// the cursor base's own bytes. A resumed walk must seed these: they sort
+// AFTER base in decorated order but BEFORE it in the manifest listing,
+// so a plain startAfter walk would never revisit them.
+func s3walCoverAncestors(base string) []string {
+	var chain []string
+	for i := 1; i < len(base); i++ {
+		if base[i] < '/' {
+			chain = append(chain, base[:i])
+		}
+	}
+	return chain
+}
+
+// s3walEachBaseCoverOrder walks bases in DECORATED (<base>+"/") byte
+// order — the order cover RAW keys sort in — on top of the base-ordered
+// manifest listing (Codex round 3 on PR #156). The two orders diverge
+// exactly on prefix families: "abc-1" sorts AFTER "abc" as a base but its
+// decorated keys sort BEFORE "abc/…" ('-' 0x2D < '/' 0x2F), so the plain
+// walk would emit them too late and a raw-key cursor parked on an "abc"
+// row would skip them forever. The transform is a monotonic hold-back
+// stack: each listed base pops-and-emits every held base it does not
+// low-extend, then is held itself until its own low-byte family drains;
+// the stack at any base is exactly its low-extended prefix chain, each
+// entry low-extending the one below, so popping top-first emits in
+// strictly ascending decorated order. Bases nesting across a '/'
+// boundary ("abc" and "abc/x" — impossible under production's [0-9a-z-]
+// repo IDs, reachable only with conformance-test names) can interleave at
+// the ROW level, which no per-base traversal can serialize; the caller's
+// ascending-emission assert turns that into a loud failure instead of a
+// silent loss.
+func (s *S3WAL) s3walEachBaseCoverOrder(ctx context.Context, afterBase string, fn func(base string) error) error {
+	held := s3walCoverAncestors(afterBase)
+	flush := func(next string) error {
+		for len(held) > 0 {
+			top := held[len(held)-1]
+			if next != "" && s3walCoverLowExtends(next, top) {
+				return nil // next belongs to top's low family: keep holding
+			}
+			held = held[:len(held)-1]
+			if err := fn(top); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	err := s.s3walEachBase(ctx, afterBase, func(base string) error {
+		if err := flush(base); err != nil {
+			return err
+		}
+		held = append(held, base)
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	return flush("")
+}
+
+// ListAbsenceCovers — see the PG twin for the contract: rows ascend by
+// RAW key across pages (the consumer's rotating renewal cursor wraps on
+// that order). The manifest walk therefore runs in decorated cover-key
+// order (s3walEachBaseCoverOrder), and cursor resume derives the cursor
+// row's base group from its own spelling, re-emits that group's rows
+// past the cursor, seeds the held prefix chain, then continues strictly
+// after it. Every emitted row is asserted strictly above its
+// predecessor — the advertised order made a crash-and-burn invariant.
 func (s *S3WAL) ListAbsenceCovers(ctx context.Context, afterRaw string, limit int, ttl time.Duration) ([]AbsenceCoverRow, error) {
 	validateAbsencePage(limit)
 	assertf(ttl > 0, "ListAbsenceCovers: non-positive ttl %v", ttl)
 	var rows []AbsenceCoverRow
+	lastRaw := afterRaw
 	emit := func(base string) error {
 		if len(rows) == limit {
 			return errS3WALWalkDone
@@ -110,13 +185,15 @@ func (s *S3WAL) ListAbsenceCovers(ctx context.Context, afterRaw string, limit in
 			if len(rows) == limit {
 				return errS3WALWalkDone
 			}
+			assertf(row.RawKey > lastRaw, "list absence covers: emission order inverted (%q after %q) — decorated walk failed to serialize base %q", row.RawKey, lastRaw, base)
+			lastRaw = row.RawKey
 			rows = append(rows, row)
 		}
 		return nil
 	}
 	var err error
 	if afterRaw == "" {
-		err = s.s3walEachBase(ctx, "", emit)
+		err = s.s3walEachBaseCoverOrder(ctx, "", emit)
 	} else {
 		mapKey, ok := strings.CutSuffix(afterRaw, reservKeySuffix)
 		if !ok {
@@ -128,7 +205,7 @@ func (s *S3WAL) ListAbsenceCovers(ctx context.Context, afterRaw string, limit in
 		}
 		startBase := s3walCoverBase(synth)
 		if err = emit(startBase); err == nil {
-			err = s.s3walEachBase(ctx, startBase, emit)
+			err = s.s3walEachBaseCoverOrder(ctx, startBase, emit)
 		}
 	}
 	if err != nil && err != errS3WALWalkDone {

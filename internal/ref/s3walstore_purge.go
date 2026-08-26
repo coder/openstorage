@@ -727,6 +727,15 @@ func (s *S3WAL) ListFleetPacks(ctx context.Context, afterRepo, afterID string, l
 // s3walFleetResume implements the §2.9 cursor-resume procedure: derive the
 // cursor row's base group (strip the +suffix), re-emit that group's rows
 // past the cursor, then continue the prefix listing strictly after it.
+//
+// Ordering audit (Codex round 3 on PR #156): unlike absence-cover raw
+// keys, the (repo, key) listings built on this walk are SAFE in plain
+// base order — repos decorate the base with '+' (0x2B), which sorts
+// BELOW every byte the §2.9 alphabet admits, so "abc", its "abc+…"
+// members, and only then "abc-1" is BOTH the repo byte order and the
+// manifest walk order (the contiguity lemma's direction). Cover keys
+// decorate with '/' (0x2F), which sorts INSIDE the alphabet — that
+// listing needs s3walEachBaseCoverOrder instead.
 func (s *S3WAL) s3walFleetResume(ctx context.Context, afterRepo string, emit func(base string) error) error {
 	startBase := ""
 	if afterRepo != "" {

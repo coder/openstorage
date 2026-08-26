@@ -130,6 +130,64 @@ func TestJobScanState_ScopesIsolated(t *testing.T) {
 	})
 }
 
+// TestAbsenceCovers_PrefixFamilyPageBoundary (Codex round 3 on PR #156):
+// cover RAW keys decorate the base with a '/'-led tail, and '/' (0x2F)
+// sorts ABOVE '-' (0x2D) — so a prefix-family sibling base ("abc-1")
+// holds cover rows that sort BEFORE its head's ("abc/…") even though the
+// sibling sorts AFTER the head as a base. The listing must emit in raw
+// order with a page boundary exactly between the family members: a
+// base-ordered traversal would emit the head first, park the cursor on
+// its row, and then skip the sibling's rows forever (raw <= cursor) —
+// covers that are never again re-pinned, folded, or released.
+func TestAbsenceCovers_PrefixFamilyPageBoundary(t *testing.T) {
+	runRefBackends(t, func(t *testing.T, s Store) {
+		cs := coverStore(t, s)
+		ctx := context.Background()
+		head := t.Name()       // base-order FIRST
+		sibling := head + "-1" // raw-order FIRST ('-' < '/')
+		mint := func(base string, size int64) string {
+			t.Helper()
+			key := AbsenceCoverPrefix + base + "/lfs-e0000000000000000001"
+			if err := ReserveRestoreCover(ctx, s, []string{base}, key, size, time.Hour); err != nil {
+				t.Fatalf("cover %s: %v", key, err)
+			}
+			return key
+		}
+		keyHead := mint(head, 10)
+		keySibling := mint(sibling, 20)
+		// The cover listing is fleet-global: release both rows so later
+		// tests sharing this backend see only their own covers.
+		t.Cleanup(func() {
+			for _, key := range []string{keyHead, keySibling} {
+				if err := cs.DeleteAbsenceCover(ctx, key); err != nil {
+					t.Errorf("cleanup cover %s: %v", key, err)
+				}
+			}
+		})
+
+		// Page 1 (limit 1): raw order puts the SIBLING's row first.
+		p1, err := cs.ListAbsenceCovers(ctx, "", 1, time.Hour)
+		if err != nil || len(p1) != 1 || p1[0].Key != keySibling {
+			t.Fatalf("page 1 = (%+v, %v), want exactly the sibling row %q", p1, err, keySibling)
+		}
+		// Page 2 resumes across the family boundary: the head's row —
+		// which the manifest listing places BEFORE the cursor's base —
+		// must still be emitted, strictly above the cursor.
+		p2, err := cs.ListAbsenceCovers(ctx, p1[0].RawKey, 10, time.Hour)
+		if err != nil || len(p2) != 1 || p2[0].Key != keyHead {
+			t.Fatalf("page 2 = (%+v, %v), want exactly the head row %q (page-boundary cover lost?)", p2, err, keyHead)
+		}
+		if p2[0].RawKey <= p1[0].RawKey {
+			t.Fatalf("cursor order inverted: %q after %q", p2[0].RawKey, p1[0].RawKey)
+		}
+		// The cursor on the LAST row ends the scan.
+		p3, err := cs.ListAbsenceCovers(ctx, p2[0].RawKey, 10, time.Hour)
+		if err != nil || len(p3) != 0 {
+			t.Fatalf("page 3 = (%+v, %v), want empty", p3, err)
+		}
+	})
+}
+
 // TestAbsenceCovers_ListHeadDelete: the absence reconciler's durable cover
 // surface — prefix-ranged listing with an opaque keyset cursor, the
 // highest-incarnation head lookup (zero-padded byte order), and targeted
