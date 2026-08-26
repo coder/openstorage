@@ -725,7 +725,15 @@ func (s *sim) casAttempt(node *simNode, repoKey, refName, old, new string) (won 
 	recheckStarved := false
 	ambCommitted := false
 	for _, ev := range evs {
-		if ev.Op == OpRefGetRef {
+		// The recovery recheck can be starved at either injection layer:
+		// a ref.GetRef fault on the decorator, or — s3wal lane — a
+		// cas.Get clean fault on the transport BELOW the driver. The
+		// latter is unambiguous within this window: an inner CAS that
+		// committed (won=true) had every one of the driver's own reads
+		// succeed (mutate aborts on a failed read and returns straight
+		// after a successful PUT), so a cas.Get fault here can only have
+		// hit a read AFTER the CAS — the recheck's.
+		if ev.Op == OpRefGetRef || (ev.Op == OpCASGet && ev.Class == FaultClean) {
 			recheckStarved = true
 		}
 		if ev.Op == OpRefCASRef && ev.Class == FaultAmbiguous && strings.HasPrefix(ev.InnerOutcome, "won=true") {
