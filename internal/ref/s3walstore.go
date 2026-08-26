@@ -631,10 +631,17 @@ func (s *S3WAL) CASRef(ctx context.Context, repo, name, old, new string) (won bo
 // nothing, no double credit).
 func (s *S3WAL) RegisterPacks(ctx context.Context, repo string, packs []Pack) error {
 	assertf(len(packs) > 0, "RegisterPacks called with no packs")
+	inserted := false
 	return s.mutate(ctx, baseRepoOf(repo), s3walMutation{
-		op:    "register packs",
-		grows: s3walAlwaysGrows, // apply=true implies >=1 pack-row insert
+		op: "register packs",
+		// Growth is per-invocation (Codex round 5 on PR #156): when
+		// every pack row already exists, settlement only DELETES the
+		// keys' still-live reservations (e.g. one that raced an earlier
+		// registration) and must pass at the hard cap, or the
+		// already-accounted bytes stay reserved until TTL expiry.
+		grows: func() bool { return inserted },
 		fn: func(m *s3wal.Manifest, clk time.Time) (bool, error) {
+			inserted = false
 			if m.PurgedAt != nil {
 				return false, fmt.Errorf("register packs %s: %w", repo, ErrRepoPurged)
 			}
@@ -649,6 +656,7 @@ func (s *S3WAL) RegisterPacks(ctx context.Context, repo string, packs []Pack) er
 						mem = m.EnsureMember(repo)
 					}
 					mem.Packs = append(mem.Packs, s3wal.PackRecord{ID: p.ID, Key: p.Key, Bytes: p.Size, CreatedAt: clk})
+					inserted = true
 					mem.Gen++ // per inserted row, like the SQL triggers
 					c := s3walRegisterLedger(mem, p)
 					credit += c

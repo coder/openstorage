@@ -1530,6 +1530,33 @@ func TestS3WALRecoverySizeCap(t *testing.T) {
 		}
 	})
 
+	t.Run("reservation-only pack settlement passes the cap", func(t *testing.T) {
+		// Codex round 5 on PR #156: RegisterPacks growth is
+		// per-invocation too — when every pack row already exists,
+		// settlement only DELETES the keys' still-live reservations
+		// (e.g. a reservation that raced an earlier registration).
+		// Refusing that shrink at the hard cap would leave
+		// already-accounted bytes reserved until TTL expiry.
+		_, a, _ := newRecoveryStores(t)
+		if err := a.RegisterPacks(ctx, base, []Pack{{ID: "p1", Key: "k1", Size: 9}}); err != nil {
+			t.Fatalf("seed register: %v", err)
+		}
+		if dec, err := a.ReservePackBytes(ctx, []string{base}, []Pack{{Key: "k1", Size: 9}}, "o1", 0, ReserveNoFloorGen, math.MaxInt64, time.Hour); err != nil || !dec.OK {
+			t.Fatalf("re-mint reservation = (%+v, %v), want granted", dec, err)
+		}
+		a.hardCapBytes = 1
+
+		if err := a.RegisterPacks(ctx, base, []Pack{{ID: "p1", Key: "k1", Size: 9}}); err != nil {
+			t.Fatalf("idempotent settlement at the cap = %v, want accepted (non-growing)", err)
+		}
+		if r := mustManifest(t, a, base).Reservations["k1"]; r != nil {
+			t.Fatalf("reservation = %+v, want consumed by the settlement", r)
+		}
+		if err := a.RegisterPacks(ctx, base, []Pack{{ID: "p2", Key: "k2", Size: 9}}); err == nil || !strings.Contains(err.Error(), "refusing new registrations") {
+			t.Fatalf("NEW pack insert at the cap = %v, want the documented refusal", err)
+		}
+	})
+
 	t.Run("purge pipeline exempt from the hard cap", func(t *testing.T) {
 		// An oversized manifest must stay purgeable (Codex on PR #156):
 		// the purge pipeline is the machinery that shrinks it, so the
