@@ -78,11 +78,13 @@ func (s *SQLite) ListJobScanStateScopes(ctx context.Context, job, prefix, after 
 	if after < prefix {
 		after = prefix
 	}
+	// Exclusive-upper index bound, not a filter (Codex round 38); see
+	// the PG twin.
 	rows, err := s.db.QueryContext(ctx, `
 SELECT scope FROM job_scan_state
-WHERE job = ? AND scope > ? AND substr(scope, 1, length(?)) = ?
+WHERE job = ? AND scope > ? AND scope < ?
 ORDER BY scope ASC LIMIT ?`,
-		job, after, prefix, prefix, limit)
+		job, after, coverRangeEnd(prefix), limit)
 	if err != nil {
 		return nil, fmt.Errorf("list job scan state scopes %s/%s: %w", job, prefix, err)
 	}

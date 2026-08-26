@@ -219,10 +219,14 @@ func TestPGInitSchema_RepairsInvalidScanStateScopeIndex(t *testing.T) {
 	// EXPLAIN with generic-plan-defeating literals mirrors the production
 	// parameterized queries (ListJobScanStateScopes, SettleLFSRefunds)
 	// closely enough to catch a collation mismatch (a default-collation
-	// PK cannot serve this ORDER BY).
+	// PK cannot serve this ORDER BY). The prefix successor is an
+	// exclusive-upper INDEX bound (Codex round 38): a filter-shaped
+	// prefix check has no upper bound, so proving a short final page
+	// empty scanned every later scope of the job — the no-Filter
+	// assertion below pins the whole predicate into the index range.
 	rows, err := s.pool.Query(ctx, `EXPLAIN SELECT scope FROM job_scan_state
 		WHERE job = 'lfs_reclaim' AND scope COLLATE "C" > 'refund/'
-		AND left(scope, length('refund/')) = 'refund/'
+		AND scope COLLATE "C" < 'refund0'
 		ORDER BY scope COLLATE "C" ASC LIMIT 100`)
 	if err != nil {
 		t.Fatalf("explain: %v", err)
@@ -244,5 +248,8 @@ func TestPGInitSchema_RepairsInvalidScanStateScopeIndex(t *testing.T) {
 	}
 	if strings.Contains(plan, "Sort") {
 		t.Fatalf("scan-state scope page plans a sort (index should stream byte order):\n%s", plan)
+	}
+	if strings.Contains(plan, "Filter") {
+		t.Fatalf("scan-state scope page plans a filter (the whole predicate must be index range bounds):\n%s", plan)
 	}
 }

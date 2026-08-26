@@ -404,13 +404,18 @@ func (s *PG) SettleLFSRefunds(ctx context.Context, repo string) (SettledLFSRefun
 		// canonical-only buckets waited past the limit forever. Settled
 		// buckets vanish and stuck ones accumulate at most one per
 		// destructive-sweep epoch, so the walk stays operator-bounded.
+		// Both range ends are INDEX bounds (Codex round 38): a prefix
+		// FILTER has no upper bound, so proving a short final page empty
+		// scanned every later lfs_reclaim scope — early repos re-walked
+		// most of the fleet inside one settlement transaction.
+		end := coverRangeEnd(prefix)
 		for after := prefix; ; {
 			var buckets []bucketRow
 			rows, err := tx.Query(ctx, `
 SELECT scope, payload, generation FROM job_scan_state
-WHERE job = $1 AND left(scope, length($2)) = $2 AND scope COLLATE "C" > $3
+WHERE job = $1 AND scope COLLATE "C" > $2 AND scope COLLATE "C" < $3
 ORDER BY scope COLLATE "C" ASC LIMIT $4`,
-				ScanJobLFSReclaim, prefix, after, lfsRefundBucketPage)
+				ScanJobLFSReclaim, after, end, lfsRefundBucketPage)
 			if err != nil {
 				return err
 			}

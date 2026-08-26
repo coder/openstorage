@@ -328,11 +328,14 @@ func (s *PG) ListJobScanStateScopes(ctx context.Context, job, prefix, after stri
 	if after < prefix {
 		after = prefix
 	}
+	// The prefix is an exclusive-upper INDEX bound, not a filter (Codex
+	// round 38): a filter-shaped prefix check made every short final
+	// page scan the job's whole remaining scope set to prove emptiness.
 	rows, err := s.pool.Query(ctx, `
 SELECT scope FROM job_scan_state
-WHERE job = $1 AND scope COLLATE "C" > $2 AND left(scope, length($3)) = $3
+WHERE job = $1 AND scope COLLATE "C" > $2 AND scope COLLATE "C" < $3
 ORDER BY scope COLLATE "C" ASC LIMIT $4`,
-		job, after, prefix, limit)
+		job, after, coverRangeEnd(prefix), limit)
 	if err != nil {
 		return nil, fmt.Errorf("list job scan state scopes %s/%s: %w", job, prefix, err)
 	}

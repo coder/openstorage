@@ -288,15 +288,16 @@ func (s *SQLite) SettleLFSRefunds(ctx context.Context, repo string) (SettledLFSR
 	// Keyset-page the WHOLE per-repo bucket keyspace (Codex round 35):
 	// scopes are epoch-ordered, so a single fixed page could pin the scan
 	// on old buckets whose legacy halves cannot settle while newer
-	// canonical-only buckets waited past the limit forever. See the PG
-	// twin for the bounds argument.
+	// canonical-only buckets waited past the limit forever. Both range
+	// ends are INDEX bounds (Codex round 38); see the PG twin.
+	end := coverRangeEnd(prefix)
 	for after := prefix; ; {
 		var buckets []bucketRow
 		rows, err := tx.QueryContext(ctx, `
 SELECT scope, payload, generation FROM job_scan_state
-WHERE job = ? AND substr(scope, 1, length(?)) = ? AND scope > ?
+WHERE job = ? AND scope > ? AND scope < ?
 ORDER BY scope ASC LIMIT ?`,
-			ScanJobLFSReclaim, prefix, prefix, after, lfsRefundBucketPage)
+			ScanJobLFSReclaim, after, end, lfsRefundBucketPage)
 		if err != nil {
 			return out, err
 		}
