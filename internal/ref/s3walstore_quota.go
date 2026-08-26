@@ -36,8 +36,14 @@ func s3walLapseEvidence(mapKey, owner string) bool {
 // twin's ordering): a marker without a consumed row is a conservative
 // residual the recovery rotation clears, while the reverse order could
 // destroy the only evidence. payload is the fleet-uniform raw spelling.
+// The marker is fleet-global and legitimately upserted by CONCURRENT
+// receive-hook processes, so raced writes retry (scanMutateShared) —
+// the single-writer failure policy would reject a valid push.
 func (s *S3WAL) s3walRecordLapse(ctx context.Context, mapKey string) error {
-	return s.scanPut(ctx, ScanJobAbsence, ScanScopeAbsenceLapse, s3walCoverRaw(mapKey), 0)
+	payload := s3walCoverRaw(mapKey)
+	return s.scanMutateShared(ctx, "record lapse marker", ScanJobAbsence, ScanScopeAbsenceLapse, func(*s3walScanRow, time.Time) (*s3walScanRow, error) {
+		return &s3walScanRow{Payload: payload}, nil
+	})
 }
 
 // s3walReservationLive reports whether a reservation stamp is inside ttl
@@ -352,7 +358,17 @@ func (s *S3WAL) QuotaLedgerState(ctx context.Context, group []string, ttl time.D
 	for _, k := range excludeKeys {
 		excluded[k] = true
 	}
-	st := PackQuotaLedgerState{UsageBytes: m.UsageBytes}
+	// The admission-fence marker mirrors into the advisory bit exactly
+	// like the SQL twins' EXISTS subquery (see PackQuotaLedgerState):
+	// while armed, every finite admission WILL deny, and the adoption
+	// preflight must reject BEFORE streaming and hashing the legacy
+	// object (Codex round 8 on PR #156). Advisory only — the
+	// authoritative check stays inside ReservePackBytes.
+	_, armed, err := s.scanGet(ctx, ScanJobAbsence, ScanScopeAbsenceAdmissionFence)
+	if err != nil {
+		return PackQuotaLedgerState{}, err
+	}
+	st := PackQuotaLedgerState{UsageBytes: m.UsageBytes, RenewalDegraded: armed}
 	for key, r := range m.Reservations {
 		if s3walIsClaimKey(key) || excluded[key] {
 			continue

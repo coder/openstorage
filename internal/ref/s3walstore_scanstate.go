@@ -17,16 +17,20 @@
 //     decree every scan-state reader and writer shares ONE process clock,
 //     so the "database clock at both ends" contract collapses to the local
 //     clock honestly. Stamps are ClkNext-monotone per object (a backward
-//     local-clock jump can never regress updated_at), and ages clamp at
-//     zero rather than reporting a stamp "from the future" as negative.
+//     local-clock jump can never regress updated_at); ages inside a small
+//     future tolerance clamp to zero, and a stamp further ahead of the
+//     local clock is UNVERIFIABLE — it reads as stale (fail closed), never
+//     fresh (see scanRowAge).
 //   - Single-writer discipline (§2.10): River's unique periodic jobs — and
 //     here, the single-process decree — make each (job, scope) row
 //     single-writer. In-process writers of one key serialize on a per-key
-//     mutex (concurrent finite admissions all upsert the lapse-evidence
-//     marker), so a conditional-write conflict that still reaches the store
+//     mutex, so a conditional-write conflict that still reaches the store
 //     is evidence of a SECOND serving process: it fails loudly and is never
 //     retried. The §2.11 instance lease (Phase 3) upgrades the loud error
-//     to a process fail-stop.
+//     to a process fail-stop. ONE deliberate exception: fleet-global
+//     markers upserted by concurrent receive-hook processes (the
+//     lapse-evidence marker) are multi-writer by design and retry
+//     conflicts instead — see scanMutateShared.
 //   - There is no cross-delete seq watermark for side objects: unlike
 //     manifests, scan rows are legitimately deleted and re-created (bucket
 //     drains, watermark resets), which resets Seq to 1. The per-key lock
@@ -41,6 +45,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
+	"math"
 	"time"
 
 	"github.com/coder/code-storage/internal/ref/s3wal"
@@ -131,12 +137,34 @@ func (s *S3WAL) scanGet(ctx context.Context, job, scope string) (s3walScanRow, b
 	return row, ok, err
 }
 
+// s3walScanFutureTolerance bounds how far AHEAD of the local clock a
+// scan-state stamp may sit and still clamp to age-0 fresh: ClkNext chains
+// stamps milliseconds ahead of a busy writer's clock, and sub-second
+// offsets are noise against the freshness windows the gates use. A stamp
+// further ahead is evidence the local clock is behind the clock that
+// wrote the row — a restart after a backward step, or an at-boot-slow
+// clock.
+const s3walScanFutureTolerance = 2 * time.Second
+
+// s3walScanAgeUnverifiable poisons a freshness verdict: every ">= bound"
+// staleness gate reads it as stale.
+const s3walScanAgeUnverifiable = time.Duration(math.MaxInt64)
+
 // scanRowAge is the row's age on the local process clock (see the header's
-// clock story). Clamped at zero: a ClkNext-monotone stamp can sit ahead of
-// a jumped-back local clock, and a freshness gate must read that as "fresh
-// now", never as a negative age.
+// clock story). A stamp inside the future tolerance clamps to zero; one
+// beyond it is UNVERIFIABLE and reads as stale, never fresh (Codex round
+// 8 on PR #156, P1): the destructive-reap watermark gates registry
+// retirement, and clamping a genuinely future stamp to age-0 would accept
+// an actually-stale watermark as fresh, permitting retirement and
+// quota/count refunds without a recent successful physical reap.
+// Fail-closed direction only: over-retention until clocks agree.
 func (s *S3WAL) scanRowAge(row s3walScanRow) time.Duration {
 	age := s.now().Sub(row.UpdatedAt)
+	if age < -s3walScanFutureTolerance {
+		slog.Warn("s3wal scan-state stamp is ahead of the local clock: treating the row as unverifiable-stale",
+			"updated_at", row.UpdatedAt, "local_now", s.now(), "ahead_by", -age)
+		return s3walScanAgeUnverifiable
+	}
 	if age < 0 {
 		return 0
 	}
@@ -150,6 +178,22 @@ func (s *S3WAL) scanRowAge(row s3walScanRow) time.Duration {
 // loud error, no retry; an ambiguous PUT re-reads and resolves via the
 // writer nonce, retrying only when the object provably did not change.
 func (s *S3WAL) scanMutate(ctx context.Context, op, job, scope string, fn func(prev *s3walScanRow, stamp time.Time) (*s3walScanRow, error)) error {
+	return s.scanMutateWith(ctx, op, job, scope, false, fn)
+}
+
+// scanMutateShared is scanMutate for the ONE multi-writer side-object
+// family: fleet-global markers legitimately upserted by CONCURRENT
+// receive-hook processes, each a fresh S3WAL instance the per-key mutex
+// cannot serialize (Codex round 8 on PR #156: a raced lapse-marker upsert
+// read a definitive 412 as dual-serve evidence and rejected an otherwise
+// valid push). For these idempotent upserts a conditional conflict — or a
+// foreign write observed during ambiguity recovery — is contention:
+// re-read and re-apply under backoff, bounded by casAttempts.
+func (s *S3WAL) scanMutateShared(ctx context.Context, op, job, scope string, fn func(prev *s3walScanRow, stamp time.Time) (*s3walScanRow, error)) error {
+	return s.scanMutateWith(ctx, op, job, scope, true, fn)
+}
+
+func (s *S3WAL) scanMutateWith(ctx context.Context, op, job, scope string, shared bool, fn func(prev *s3walScanRow, stamp time.Time) (*s3walScanRow, error)) error {
 	assertf(op != "" && fn != nil, "scanMutate: incomplete mutation %q", op)
 	key := s3walScanKey(job, scope)
 	unlock := s.lockScan(key)
@@ -191,6 +235,14 @@ func (s *S3WAL) scanMutate(ctx context.Context, op, job, scope string, fn func(p
 		}
 		switch {
 		case errors.Is(werr, s3wal.ErrExists), errors.Is(werr, s3wal.ErrLostRace):
+			if shared {
+				// Multi-writer marker: a lost race is contention, not
+				// evidence — re-read and re-apply the idempotent upsert.
+				if err := s.sleepJitter(ctx, attempt); err != nil {
+					return fmt.Errorf("s3wal %s %s: %w", op, key, err)
+				}
+				continue
+			}
 			// A definitive conditional rejection: some OTHER writer
 			// advanced this single-writer object — dual-serve evidence
 			// (§2.10). Loud, permanent, never retried.
@@ -216,6 +268,14 @@ func (s *S3WAL) scanMutate(ctx context.Context, op, job, scope string, fn func(p
 			(ok && fok && fresh.Seq == prev.Seq && fresh.Writer == prev.Writer)
 		if unchanged {
 			continue // provably not landed: retry the same mutation
+		}
+		if shared {
+			// A concurrent upserter advanced the marker while our PUT was
+			// ambiguous: re-apply on the fresh state (idempotent).
+			if err := s.sleepJitter(ctx, attempt); err != nil {
+				return fmt.Errorf("s3wal %s %s: %w", op, key, err)
+			}
+			continue
 		}
 		return fmt.Errorf("s3wal %s %s: foreign write during ambiguity recovery is dual-serve evidence under the single-writer decree: %w", op, key, werr)
 	}

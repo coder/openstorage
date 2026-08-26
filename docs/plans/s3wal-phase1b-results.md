@@ -48,7 +48,7 @@ count is exact on the shared store).
 `internal/ref/s3walstore_recovery_test.go` — Docker-free, over the MemCAS
 fault fake; competing writers are a second `S3WAL` driver sharing the same
 MemCAS, interleaved between a faulted PUT and the recovery read via the
-`AfterPut` hook (§8). 57 passing cases + 1 justified skip (grown across
+`AfterPut` hook (§8). 61 passing cases + 1 justified skip (grown across
 review rounds; the class rows below list the load-bearing cases):
 
 | Appendix A class | Cases |
@@ -58,7 +58,7 @@ review rounds; the class rows below list the load-bearing cases):
 | OPS | 5 — `ReservePackBytes` ring hit (decision stands, attempts stay 1) and both-miss ⇒ fail-closed retryable error, entry never blindly re-applied; `RetirePackAttempts` ring hit (single decrement), entry-op-ID hit after FORCED ring eviction (>64 foreign ops; asserts the full ring), both-miss ⇒ fail closed with the row intact. |
 | LEASE (§2.5 W6) | 3 + 1 skip — registration blocked at `TTL + deleteIOTimeout + safety − 1ms` and unblocked at exactly the window (stale-lock expiry, no unconditional sleep); renewal loss while the DELETE is in flight refuses `deleted=true`; persistently dropped renewal PUTs are proven un-landed (stamp advancement, not owner match) and likewise refuse `deleted=true`; **skip**: renewal-loss-before-dispatch — the pre-dispatch check sits microseconds after lease acquisition with no seam the fake can reach without production-code scaffolding; the rule it double-checks is pinned by the in-flight case. |
 | Fences | 9 purge-fence cases (every row-creating method incl. a namespace member; `CASRef` rejection carries the not-executed marker; every rejection is write-free, asserted via unchanged manifest seq) + 3 sync-claim fence outcomes (no claim ⇒ fail closed, foreign holder ⇒ loss, matching holder ⇒ win). |
-| Protocol | 3 — §2.4 skew guard demotes an otherwise-due claim steal to report-only (write-free) and allows it once clocks agree, via the store's `now`-injection knob; §2.3 seq-monotonicity panic on an injected stale read; §2.2 hard-cap refusal on growing mutations with shrinking mutations passing, plus the once-per-base soft warn. |
+| Protocol | 6 — §2.4 skew guard demotes an otherwise-due claim steal to report-only (write-free) and allows it once clocks agree, via the store's `now`-injection knob; §2.3 seq-monotonicity panic on an injected stale read; §2.2 hard-cap refusal on growing mutations with shrinking mutations passing, plus the once-per-base soft warn; scan-state stamps ahead of the local clock beyond a ±2s tolerance are unverifiable-stale (a backward-stepped clock must not read a stale destructive-reap watermark as fresh — fail closed, sub-tolerance offsets stay fresh); `QuotaLedgerState` mirrors the armed admission-fence marker into `RenewalDegraded` like the SQL twins' EXISTS subquery; the fleet-global lapse-evidence marker retries raced multi-writer upserts instead of failing them as dual-serve evidence. |
 
 No store bugs were found: every class behaved exactly per the Appendix A
 contract, and the only non-test change was the MemCAS hook (§8).

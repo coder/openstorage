@@ -1754,3 +1754,132 @@ func TestS3WALRecoverySizeCap(t *testing.T) {
 		}
 	})
 }
+
+// TestS3WALRecoveryScanClockGuard (Codex round 8 on PR #156, P1): a
+// scan-state stamp AHEAD of the local clock (restart after a backward
+// clock step, or an at-boot-slow clock) must not read as age-0 fresh —
+// the destructive-reap watermark gates registry retirement, and a stale
+// watermark accepted as fresh permits refunds without a recent physical
+// reap. Beyond a small tolerance the age is unverifiable: fail closed.
+func TestS3WALRecoveryScanClockGuard(t *testing.T) {
+	ctx := context.Background()
+	t0 := time.Date(2026, 8, 26, 12, 0, 0, 0, time.UTC)
+
+	seed := func(t *testing.T, a *S3WAL, base, key string) {
+		t.Helper()
+		if err := a.RegisterLFSObject(ctx, base, key, 7); err != nil {
+			t.Fatalf("seed register: %v", err)
+		}
+		if n, err := a.MarkLFSObjectsUnreferenced(ctx, base, []string{key}); err != nil || n != 1 {
+			t.Fatalf("mark = (%d, %v)", n, err)
+		}
+		if err := a.RecordLFSReapComplete(ctx, 1, true); err != nil {
+			t.Fatalf("stamp reap watermark: %v", err)
+		}
+	}
+
+	t.Run("backward clock step demotes the destructive watermark", func(t *testing.T) {
+		const base = "r-scan-clock"
+		key := "lfs/" + base + "/" + strings.Repeat("aa", 32)
+		mc, a, _ := newRecoveryStores(t)
+		clock := newFakeClock(t0)
+		a.now = clock.now
+		mc.Now = clock.now // store clock agrees (§2.4-3 Date witness)
+		seed(t, a, base, key)
+		// Restart with the wall clock 10 minutes BEHIND the persisted
+		// stamp: the watermark is unverifiable, never "fresh now".
+		clock.set(t0.Add(-10 * time.Minute))
+		retired, err := a.RetireUnreferencedLFSObject(ctx, base, key, map[string]int64{base: 0}, 0, time.Hour)
+		if retired || !errors.Is(err, ErrReapWatermarkStale) {
+			t.Fatalf("retire under a future watermark = (%v, %v), want ErrReapWatermarkStale (fail closed)", retired, err)
+		}
+		if age, ok, err := a.JobScanStateAge(ctx, ScanJobSweep, ScanScopeLFSDestructiveReap); err != nil || !ok || age < time.Hour {
+			t.Fatalf("watermark age = (%v, %v, %v), want unverifiable-stale", age, ok, err)
+		}
+	})
+
+	t.Run("sub-tolerance future stamps stay fresh", func(t *testing.T) {
+		// ClkNext chains stamps milliseconds ahead of a busy writer's
+		// clock and 1s-granular steps are noise against the >=30s
+		// freshness windows: inside the tolerance the row reads fresh.
+		const base = "r-scan-clock-tol"
+		key := "lfs/" + base + "/" + strings.Repeat("bb", 32)
+		mc, a, _ := newRecoveryStores(t)
+		clock := newFakeClock(t0)
+		a.now = clock.now
+		mc.Now = clock.now
+		seed(t, a, base, key)
+		clock.set(t0.Add(-time.Second))
+		if retired, err := a.RetireUnreferencedLFSObject(ctx, base, key, map[string]int64{base: 0}, 0, time.Hour); err != nil || !retired {
+			t.Fatalf("retire inside the tolerance = (%v, %v), want retired", retired, err)
+		}
+	})
+}
+
+// TestS3WALRecoveryLedgerStateFence (Codex round 8 on PR #156): the
+// advisory ledger read mirrors the admission-fence marker into
+// RenewalDegraded exactly like the SQL twins' EXISTS subquery, so the LFS
+// adoption preflight rejects hopeless work BEFORE streaming and hashing
+// the legacy object.
+func TestS3WALRecoveryLedgerStateFence(t *testing.T) {
+	ctx := context.Background()
+	const base = "r-ledger-fence"
+	_, a, b := newRecoveryStores(t)
+
+	st, err := a.QuotaLedgerState(ctx, []string{base}, time.Hour)
+	if err != nil || st.RenewalDegraded {
+		t.Fatalf("unfenced ledger state = (%+v, %v), want RenewalDegraded=false", st, err)
+	}
+	if err := b.ArmAbsenceAdmissionFence(ctx, "lapse-evidence"); err != nil {
+		t.Fatalf("arm: %v", err)
+	}
+	st, err = a.QuotaLedgerState(ctx, []string{base}, time.Hour)
+	if err != nil || !st.RenewalDegraded {
+		t.Fatalf("fenced ledger state = (%+v, %v), want RenewalDegraded=true", st, err)
+	}
+	if err := a.DeleteJobScanState(ctx, ScanJobAbsence, ScanScopeAbsenceAdmissionFence); err != nil {
+		t.Fatalf("disarm: %v", err)
+	}
+	st, err = a.QuotaLedgerState(ctx, []string{base}, time.Hour)
+	if err != nil || st.RenewalDegraded {
+		t.Fatalf("disarmed ledger state = (%+v, %v), want RenewalDegraded=false", st, err)
+	}
+}
+
+// TestS3WALRecoveryLapseMarkerContention (Codex round 8 on PR #156): the
+// fleet-global lapse-evidence marker is legitimately upserted by
+// CONCURRENT receive-hook processes (each a fresh S3WAL instance — the
+// per-key mutex cannot serialize them), so a raced conditional write is
+// contention to retry, not dual-serve evidence: the single-writer failure
+// policy would propagate out of ReservePackBytes and reject a valid push.
+func TestS3WALRecoveryLapseMarkerContention(t *testing.T) {
+	ctx := context.Background()
+	mapKey := AbsenceCoverPrefix + "r-lapse-race/lfs-e0000000001" + RepairCoverSuffix
+
+	mc, a, b := newRecoveryStores(t)
+	// Two prior versions from a concurrent hook process give the
+	// stale-read hook history to serve — a's advance then carries a
+	// superseded ETag, the deterministic 412.
+	if err := b.PutJobScanState(ctx, ScanJobAbsence, ScanScopeAbsenceLapse, "absence-lost/other/lfs-e0000000001", 0); err != nil {
+		t.Fatalf("competitor upsert 1: %v", err)
+	}
+	if err := b.PutJobScanState(ctx, ScanJobAbsence, ScanScopeAbsenceLapse, "absence-lost/other/lfs-e0000000002", 0); err != nil {
+		t.Fatalf("competitor upsert 2: %v", err)
+	}
+	lapseKey := s3walScanKey(ScanJobAbsence, ScanScopeAbsenceLapse)
+	armed := true
+	mc.Hooks.StaleGet = func(key string) bool {
+		if armed && key == lapseKey {
+			armed = false
+			return true
+		}
+		return false
+	}
+	if err := a.s3walRecordLapse(ctx, mapKey); err != nil {
+		t.Fatalf("raced lapse upsert = %v, want retried success (idempotent multi-writer marker)", err)
+	}
+	st, ok, err := a.GetJobScanState(ctx, ScanJobAbsence, ScanScopeAbsenceLapse)
+	if err != nil || !ok || st.Payload != s3walCoverRaw(mapKey) {
+		t.Fatalf("marker = (%+v, %v, %v), want our cover's raw spelling", st, ok, err)
+	}
+}
