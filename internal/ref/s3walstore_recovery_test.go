@@ -1008,6 +1008,46 @@ func TestS3WALRecoverySizeCap(t *testing.T) {
 		}
 	})
 
+	t.Run("purge pipeline exempt from the hard cap", func(t *testing.T) {
+		// An oversized manifest must stay purgeable (Codex on PR #156):
+		// the purge pipeline is the machinery that shrinks it, so the
+		// cap refusing the fence would wedge the repo permanently.
+		_, a, _ := newRecoveryStores(t)
+		lfsKey := "lfs/" + base + "/" + strings.Repeat("aa", 32)
+		if won, err := a.CASRef(ctx, base, branch, ZeroSHA, sha1); err != nil || !won {
+			t.Fatalf("seed ref = (%v, %v)", won, err)
+		}
+		if err := a.RegisterPacks(ctx, base, []Pack{{ID: "p1", Key: "k1", Size: 9}}); err != nil {
+			t.Fatalf("seed pack: %v", err)
+		}
+		if err := a.RegisterLFSObject(ctx, base, lfsKey, 7); err != nil {
+			t.Fatalf("seed lfs: %v", err)
+		}
+		a.hardCapBytes = 1
+
+		if err := a.FenceRepoPurge(ctx, base); err != nil {
+			t.Fatalf("FenceRepoPurge at the cap: %v", err)
+		}
+		if n, err := a.DropRepoRefs(ctx, []string{base}); err != nil || n != 1 {
+			t.Fatalf("DropRepoRefs at the cap = (%d, %v), want 1 dropped", n, err)
+		}
+		if n, err := a.RetireRepoPacks(ctx, []string{base}); err != nil || n != 1 {
+			t.Fatalf("RetireRepoPacks at the cap = (%d, %v), want 1 retired", n, err)
+		}
+		if n, err := a.DropRepoLFSObjects(ctx, []string{base}); err != nil || n != 1 {
+			t.Fatalf("DropRepoLFSObjects at the cap = (%d, %v), want 1 dropped", n, err)
+		}
+		if _, err := a.PurgeRepoLedger(ctx, []string{base}); err != nil {
+			t.Fatalf("PurgeRepoLedger at the cap: %v", err)
+		}
+		if n, err := a.CountRepoRows(ctx, []string{base}); err != nil || n != 0 {
+			t.Fatalf("CountRepoRows after purge = (%d, %v), want 0", n, err)
+		}
+		if purged, err := a.IsRepoPurged(ctx, base); err != nil || !purged {
+			t.Fatalf("IsRepoPurged = (%v, %v), want fenced", purged, err)
+		}
+	})
+
 	t.Run("soft threshold warns without refusing", func(t *testing.T) {
 		_, a, _ := newRecoveryStores(t)
 		a.softWarnBytes = 1

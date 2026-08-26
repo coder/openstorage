@@ -23,8 +23,15 @@ func (s *S3WAL) FenceRepoPurge(ctx context.Context, base string) error {
 	assertf(base != "", "FenceRepoPurge: empty base repo")
 	assertf(baseRepoOf(base) == base, "FenceRepoPurge: %q is not a base repo", base)
 	return s.mutate(ctx, base, s3walMutation{
-		op:    "fence repo purge",
-		grows: true,
+		op: "fence repo purge",
+		// Deliberately NOT a grows mutation despite adding the purged_at
+		// field (Codex on PR #156): the fence is the entry gate of the
+		// pipeline that exists to SHRINK oversized manifests, so the
+		// §2.2 hard cap must never refuse it — refusing would make a repo
+		// unpurgeable precisely when it most needs purging, and the field
+		// itself is O(1) bytes. The later phases (DropRepoRefs,
+		// RetireRepoPacks, DropRepoLFSObjects, PurgeRepoLedger) shrink or
+		// tombstone and likewise carry no grows flag.
 		fn: func(m *s3wal.Manifest, clk time.Time) (bool, error) {
 			if m.PurgedAt != nil {
 				return false, nil // idempotent
