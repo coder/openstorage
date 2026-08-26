@@ -191,6 +191,18 @@ func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL, loopbackBaseU
 	// INDEPENDENTLY of the retention window: `codestorage purge-repo`
 	// mints fences on retention-less deployments too (PR #105 round 8).
 	sweepCfg.PurgedRepoProbe = purgeReg.IsRepoPurged
+	// Destructive-reap watermark (issue #120): LFS reclamation's slot
+	// refunds gate on OBSERVED destructive-sweep completion; every clean
+	// armed pass records it through the shared scan-state rows.
+	scanState, ok := refStore.(ref.ScanStateStore)
+	assertf(ok, "ref store %T lacks the scan-state seams", refStore)
+	// The epoch pins WHEN the certified sweep began (Codex round 33 on
+	// PR #132): retirement refunds settle only under completions with a
+	// strictly greater epoch. The payload certifies which delete classes
+	// the recorded sweep reaped: legacy-spelled registry rows may only
+	// be retired under a legacy-armed watermark (Codex round 17).
+	sweepCfg.BeginLFSReapEpoch = scanState.BeginLFSReapEpoch
+	sweepCfg.RecordLFSReapComplete = scanState.RecordLFSReapComplete
 	sweeper := jobs.NewSweeper(blobStore, refStore, sweepCfg, logger)
 	var schedule *jobs.SweepSchedule
 	var stopReconcile func()
@@ -270,7 +282,7 @@ func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL, loopbackBaseU
 				}
 				return r.DefaultBranch, true, nil
 			},
-			lfsGC.grace, lfsGC.objectBudget, reclaimDelete, logger)
+			lfsGC.grace, lfsGC.objectBudget, reclaimDelete, sweep.deleteLFSLegacy, logger)
 		lfsReclaimSchedule = &jobs.LFSReclaimSchedule{Reclaimer: reclaimer, Interval: lfsGC.interval}
 		mode := "report-only"
 		if reclaimDelete {
@@ -293,13 +305,25 @@ func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL, loopbackBaseU
 		assertf(ok, "ref store %T lacks the absence reconciliation seams", refStore)
 		// Cadence-vs-TTL safety is enforced at config resolution
 		// (interval ≤ TTL/2) and inside the constructor (pass wall-clock
-		// ≤ TTL/4), so covers renew before they can lapse.
+		// ≤ TTL/4), so covers renew before they can lapse. The interval
+		// also feeds the admission fence's lapse safety bound (Codex
+		// round 27 on PR #132): a renewal failure is harmless only while
+		// covers survive until the NEXT scheduled attempt.
 		reconciler := jobs.NewAbsenceReconciler(absenceReg, blobStore,
-			packQuotaBytes > 0, absence.budget, packReservationTTL, logger)
+			packQuotaBytes > 0, absence.budget, packReservationTTL, absence.interval, logger)
 		absenceSchedule = &jobs.AbsenceReconcileSchedule{Reconciler: reconciler, Interval: absence.interval}
 		logger.Info("registry-vs-storage absence reconciliation enabled",
 			"env", envAbsenceReconcileInterval, "interval", absence.interval,
 			"budget", absence.budget, "quota_enforced", packQuotaBytes > 0)
+		if packQuotaBytes > 0 {
+			// Mixed-fleet prerequisite (Codex round 40 on PR #132,
+			// ADR-43): the admission fence and its lapse-evidence
+			// markers run only in fence-aware binaries — pre-upgrade
+			// replicas neither honor an armed fence nor record
+			// evidence when their GC prunes expired covers.
+			logger.Warn("absence reconciliation admission-fence guarantees are fleet-wide only once every replica runs a fence-aware binary: complete rolling upgrades within one reservation TTL, and enable this job only after the whole fleet is upgraded (ADR-43)",
+				"env", envAbsenceReconcileInterval)
+		}
 	}
 
 	// Background repack (issue #1): the worker folds over the RAW ref

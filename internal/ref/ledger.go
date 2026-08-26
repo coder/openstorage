@@ -347,6 +347,16 @@ type ReserveDecision struct {
 	// failed tiny same-key upload pairs wedge the row cap). Set only when
 	// OK.
 	Gens map[string]string
+	// RenewalDegraded denies because the absence reconciler's cover
+	// renewal is in a degraded window (Codex round 26 on PR #132,
+	// security): the TTL'd compensation covers this admission counts in
+	// active_reservations may have lapsed un-renewed, deflating the
+	// quota floor, so finite quota-gated admissions fail closed until a
+	// complete recovery rotation re-covers every registered-but-missing
+	// byte. Unbounded internal reservations (restores, covers — quota
+	// math.MaxInt64) are exempt so recovery itself can proceed.
+	// Transient from the client's perspective: retry later.
+	RenewalDegraded bool
 	// KeyCapExceeded reports that the denial was the per-repo cap on
 	// ACTIVE reservation ROWS, not byte arithmetic (Codex security round
 	// on #51): declared bytes bound row count at nothing — 1-byte LFS
@@ -395,6 +405,22 @@ func lockBaseLedger(ctx context.Context, tx pgx.Tx, base string) error {
 	_, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1), $2)`, base, reserveLockClass)
 	return err
 }
+
+// absenceFenceLockName/-Class key the fleet-global advisory lock pair
+// serializing admission-fence ARMING with finite quota admissions (Codex
+// round 35 on PR #132, security): every finite ReservePackBytes holds the
+// SHARED side across its fence check and reservation sums, and
+// ArmAbsenceAdmissionFence takes the EXCLUSIVE side around its upsert —
+// so an admission either commits before the fence lands (its covers were
+// still inside the sums the arming pass saw) or observes the row and
+// fails closed. A dedicated class keeps the key disjoint from every
+// per-base reserveLockClass lock (a repo literally named like the key
+// cannot collide). SQLite needs no twin: BEGIN IMMEDIATE single-writer
+// transactions already serialize the pair.
+const (
+	absenceFenceLockName  = "absence-admission-fence"
+	absenceFenceLockClass = int32(0x41424643) // "ABFC"
+)
 
 // reserveLockClass namespaces the per-base advisory locks ReservePackBytes
 // takes ("PKQR"), in the two-int4 pg_advisory_xact_lock keyspace — disjoint
@@ -507,16 +533,61 @@ func (s *PG) ReservePackBytes(ctx context.Context, group []string, packs []Pack,
 		} else if fenced {
 			return fmt.Errorf("reserve pack bytes %s: %w", group[0], ErrRepoPurged)
 		}
+		// Cover-renewal degraded fence (Codex round 26 on PR #132,
+		// security): while armed, TTL'd absence covers may have lapsed
+		// un-renewed and this transaction's strict-TTL reservation SUM
+		// under-counts them — finite quota-gated admissions fail
+		// closed (see ReserveDecision.RenewalDegraded); unbounded
+		// internal reservations proceed so recovery can re-cover.
+		if quotaBytes != math.MaxInt64 {
+			// Hold the SHARED side of the fence lock across the check
+			// AND the admission sums below (Codex round 35, security):
+			// without it, an arming pass could land its upsert between
+			// this read and the commit, and the admission would spend
+			// the exact deflated headroom the fence exists to close.
+			if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock_shared(hashtext($1), $2)`,
+				absenceFenceLockName, absenceFenceLockClass); err != nil {
+				return err
+			}
+			var degraded bool
+			if err := tx.QueryRow(ctx,
+				`SELECT EXISTS (SELECT 1 FROM job_scan_state WHERE job = $1 AND scope = $2)`,
+				ScanJobAbsence, ScanScopeAbsenceAdmissionFence).Scan(&degraded); err != nil {
+				return err
+			}
+			if degraded {
+				dec = ReserveDecision{RenewalDegraded: true}
+				return nil
+			}
+		}
 		// Self-healing GC (Codex round 5 on #51): expired rows already
 		// stopped gating admission, but they occupy physical rows the
 		// sweeper may never prune (sweeping can be disabled). Pruning this
 		// base repo's expired rows inside the serialized admission
 		// transaction bounds the repo's PHYSICAL row population at the
 		// active-row cap plus one TTL of churn, with no sweeper required.
+		// Deleting an expired UN-FOLDED absence-cover row destroys the
+		// physical lapse evidence the reconciler's first-health-stamp
+		// probe arms on (Codex round 33 on PR #132) — the CTE records
+		// the durable lapse-evidence marker in the same statement, so
+		// the evidence survives its own consumption. Folded rows decay
+		// deliberately and are never evidence.
 		if _, err := tx.Exec(ctx, `
-DELETE FROM pack_reservations WHERE repo = $1 AND created_at <= now() - make_interval(secs => $2)
-  AND key NOT LIKE '%/adopt-claim'`,
-			group[0], ttl.Seconds()); err != nil {
+WITH doomed AS (
+  DELETE FROM pack_reservations WHERE repo = $1 AND created_at <= now() - make_interval(secs => $2)
+    AND key NOT LIKE '%/adopt-claim'
+  RETURNING key, owner
+)
+INSERT INTO job_scan_state (job, scope, payload, generation, updated_at)
+SELECT $3, $4, key, 0, now() FROM doomed
+WHERE key COLLATE "C" > $5 AND key COLLATE "C" < $6
+  AND right(key, $7) = $8 AND owner <> $9
+LIMIT 1
+ON CONFLICT (job, scope) DO UPDATE SET payload = EXCLUDED.payload, updated_at = now()`,
+			group[0], ttl.Seconds(),
+			ScanJobAbsence, ScanScopeAbsenceLapse,
+			AbsenceCoverPrefix, absenceCoverRangeEnd,
+			len(absenceCoverRawSuffix), absenceCoverRawSuffix, AbsenceFoldedOwner); err != nil {
 			return err
 		}
 		// ONE statement = one snapshot: a concurrent registration moves a
@@ -662,18 +733,40 @@ DELETE FROM pack_reservations WHERE repo = $1 AND key = $2 AND gen = $3 AND atte
 }
 
 // SweepExpiredPackReservations prunes reservation rows at least olderThan
-// old.
+// old. Deleting an expired UN-FOLDED absence-cover row destroys the
+// physical lapse evidence the reconciler's first-health-stamp probe arms
+// on — the scheduled sweep is a second consumer of that evidence beside
+// ReservePackBytes' admission-time GC (Codex rounds 33+34 on PR #132) —
+// so the statement records the durable lapse-evidence marker atomically.
+// The sweeper passes the admission TTL as olderThan, so every doomed
+// cover row is exactly a lapsed cover; folded rows decay deliberately
+// and never mark.
 func (s *PG) SweepExpiredPackReservations(ctx context.Context, olderThan time.Duration) (int64, error) {
 	assertf(olderThan >= 0, "SweepExpiredPackReservations: negative age %v", olderThan)
-	ct, err := s.pool.Exec(ctx, `
-DELETE FROM pack_reservations
-WHERE (key NOT LIKE '%/adopt-claim' AND created_at <= now() - make_interval(secs => $1))
-   OR (key LIKE '%/adopt-claim' AND created_at <= now() - make_interval(secs => $2))`,
-		olderThan.Seconds(), AdoptionClaimTTL.Seconds())
+	var n int64
+	err := s.pool.QueryRow(ctx, `
+WITH doomed AS (
+  DELETE FROM pack_reservations
+  WHERE (key NOT LIKE '%/adopt-claim' AND created_at <= now() - make_interval(secs => $1))
+     OR (key LIKE '%/adopt-claim' AND created_at <= now() - make_interval(secs => $2))
+  RETURNING key, owner
+), marked AS (
+  INSERT INTO job_scan_state (job, scope, payload, generation, updated_at)
+  SELECT $3, $4, key, 0, now() FROM doomed
+  WHERE key COLLATE "C" > $5 AND key COLLATE "C" < $6
+    AND right(key, $7) = $8 AND owner <> $9
+  LIMIT 1
+  ON CONFLICT (job, scope) DO UPDATE SET payload = EXCLUDED.payload, updated_at = now()
+)
+SELECT count(*) FROM doomed`,
+		olderThan.Seconds(), AdoptionClaimTTL.Seconds(),
+		ScanJobAbsence, ScanScopeAbsenceLapse,
+		AbsenceCoverPrefix, absenceCoverRangeEnd,
+		len(absenceCoverRawSuffix), absenceCoverRawSuffix, AbsenceFoldedOwner).Scan(&n)
 	if err != nil {
 		return 0, err
 	}
-	return ct.RowsAffected(), nil
+	return n, nil
 }
 
 // IsRetainedPack reports whether (repo, key) is a recorded superseded blob.
@@ -1224,6 +1317,15 @@ type PackQuotaLedgerState struct {
 	UsageBytes    int64 // SUM(pack_usage) over the group
 	ReservedBytes int64 // SUM(active reservations) for the base repo
 	RetainedBytes int64 // SUM(pack_retained) over the group
+	// RenewalDegraded mirrors ReservePackBytes' cover-renewal degraded
+	// fence (the absence reconciler's admission-fence marker): while
+	// set, every finite quota-gated admission WILL deny, so advisory
+	// preflights can fail hopeless work before spending on it (Codex
+	// round 36 on PR #132, security — the adoption preflight hashed
+	// whole legacy objects only to be denied post-hash). Advisory
+	// only: the authoritative check stays inside ReservePackBytes
+	// under the fence's shared advisory lock.
+	RenewalDegraded bool
 }
 
 // QuotaLedgerState reads the group's ledger state (see PackQuotaLedgerState).
@@ -1240,7 +1342,10 @@ SELECT
             WHERE repo = $2 AND created_at > now() - make_interval(secs => $3)
               AND key NOT LIKE '%`+AdoptionClaimSuffix+`'
               AND NOT (key = ANY($4))), 0),
-  COALESCE((SELECT SUM(bytes) FROM pack_retained WHERE repo = ANY($1)), 0)`,
-		group, group[0], ttl.Seconds(), excludeKeys).Scan(&st.UsageBytes, &st.ReservedBytes, &st.RetainedBytes)
+  COALESCE((SELECT SUM(bytes) FROM pack_retained WHERE repo = ANY($1)), 0),
+  EXISTS (SELECT 1 FROM job_scan_state WHERE job = $5 AND scope = $6)`,
+		group, group[0], ttl.Seconds(), excludeKeys,
+		ScanJobAbsence, ScanScopeAbsenceAdmissionFence,
+	).Scan(&st.UsageBytes, &st.ReservedBytes, &st.RetainedBytes, &st.RenewalDegraded)
 	return st, err
 }

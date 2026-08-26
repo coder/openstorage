@@ -262,6 +262,46 @@ func TestLFSAdopt_FailurePropagates(t *testing.T) {
 	}
 }
 
+// TestLFSAdopt_DegradedFenceMapsToRetryableResponse (Codex round 39 on PR
+// #132): with the admission fence armed, adopting a rowless legacy object
+// fails with errLFSQuotaDegraded — the batch and proxy-upload adoption
+// switches must map it to the transient 503 (+Retry-After on the HTTP
+// path, the round-26 PUT shape), not the generic 500: Git LFS clients
+// retry a 503 while the recovery rotation runs, but fail hard on 500.
+func TestLFSAdopt_DegradedFenceMapsToRetryableResponse(t *testing.T) {
+	ctx := context.Background()
+	srv, st, mint := newLFSQuotaServer(t, 1<<20, time.Hour)
+	tok := mint(auth.ScopeGitWrite)
+	content := []byte("legacy bytes under a fence")
+	oid := sha256Hex(content)
+	// Rowless LEGACY bytes (pre-#51 state): adoption is the only path.
+	if err := srv.Blob.UploadFile(ctx, blob.LFSLegacyKey(lfsTestRepoID, oid), writeTempFile(t, content)); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.(interface {
+		ArmAbsenceAdmissionFence(context.Context, string) error
+	}).ArmAbsenceAdmissionFence(ctx, `{"lfs":0,"packs":0}`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Batch upload naming the legacy object: per-object 503, not 500.
+	resp := decodeBatch(t, doLFS(t, srv, http.MethodPost, lfsBatchPath, "basic:"+tok,
+		batchBody("upload", oid, int64(len(content)))))
+	if resp.Objects[0].Error == nil || resp.Objects[0].Error.Code != http.StatusServiceUnavailable {
+		t.Fatalf("fenced batch adoption = %+v, want a per-object 503", resp.Objects[0])
+	}
+
+	// Proxy-upload PUT of the same object: 503 + Retry-After, not 500.
+	w := doLFS(t, srv, http.MethodPut, "/"+lfsTestRepoURL+".git/info/lfs/objects/"+oid,
+		"basic:"+tok, string(content))
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("fenced adoption PUT status = %d, body %s, want 503", w.Code, w.Body)
+	}
+	if w.Header().Get("Retry-After") == "" {
+		t.Fatal("fenced adoption PUT: missing Retry-After")
+	}
+}
+
 // reapOnRegister deletes the blob just before the registration commits,
 // deterministically reproducing Codex round 1's P2 race: a DeleteLFS sweep
 // reaps the still-rowless blob after the caller's Stat, with the sweep's
@@ -2586,6 +2626,40 @@ func TestLFSAdopt_QuotaPreflightSkipsHash(t *testing.T) {
 	}
 	if n := rc.reads.Load(); n != 0 {
 		t.Fatalf("over-quota adoption performed %d ranged reads before denying — every retry re-reads the whole blob for free", n)
+	}
+}
+
+// TestLFSAdopt_DegradedRenewalPreflightSkipsHash (Codex round 36 on PR
+// #132, security): while the absence reconciler's admission fence is
+// armed, the copy admission denies with RenewalDegraded — but that check
+// ran AFTER the full-object verification hash, so every write-scoped
+// batch touch of a legacy object re-streamed and re-hashed it in full
+// (no canonical row, no parked progress) for the whole fence window. The
+// advisory preflight must carry the fence bit and fail before any ranged
+// read.
+func TestLFSAdopt_DegradedRenewalPreflightSkipsHash(t *testing.T) {
+	ctx := context.Background()
+	srv, st, _ := newLFSQuotaServer(t, 1<<20, time.Hour)
+	content := bytes.Repeat([]byte("x"), 50)
+	oid := sha256Hex(content)
+	key := blob.LFSKey(lfsTestRepoID, oid)
+	if err := srv.Blob.UploadFile(ctx, blob.LFSLegacyKey(lfsTestRepoID, oid), writeTempFile(t, content)); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.(interface {
+		ArmAbsenceAdmissionFence(context.Context, string) error
+	}).ArmAbsenceAdmissionFence(ctx, `{"lfs":0,"packs":0}`); err != nil {
+		t.Fatal(err)
+	}
+	rc := &readCountingBlob{BlobStore: srv.Blob}
+	srv.Blob = rc
+
+	aerr := srv.adoptLFSObject(ctx, lfsTestRepoID, key, oid)
+	if !errors.Is(aerr, errLFSQuotaDegraded) {
+		t.Fatalf("fenced adoption = %v, want errLFSQuotaDegraded", aerr)
+	}
+	if n := rc.reads.Load(); n != 0 {
+		t.Fatalf("fenced adoption performed %d ranged reads before denying — every retry re-reads the whole blob for free", n)
 	}
 }
 

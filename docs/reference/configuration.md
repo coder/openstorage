@@ -772,7 +772,22 @@ until the eligible rows are the junk you expect, then opt in.
   schedule is live therefore requires that opt-in, plus a
   [grace](#codestorage_lfs_gc_grace) of at least the reap cadence, including
   the 1-hour quarantine retention floor every reap's backup copy is kept for
-  (startup errors otherwise). With the sweep schedule stopped
+  (startup errors otherwise). The coupling is also OBSERVED at runtime
+  ([#120](https://github.com/coder/code-storage/issues/120)): each
+  destructive LFS sweep pass that completes its keyspace with zero errors
+  records a durable fleet-wide watermark, and retirement refunds slots only
+  while that watermark is fresher than the grace window — armed-but-failing
+  sweeps, passes outrunning the reclamation cycle, and mid-flight guard
+  demotions all freeze refunds automatically (`reap_watermark_stale` /
+  `rows_deferred_reap_stale` in the run report). A fresh deployment stays
+  report-only until its first clean destructive LFS sweep completes.
+  Legacy-spelled rows (pre-ADR-41 `lfs/<repo>/<oid>` keys) are gated one
+  step further: their blobs are only reaped when
+  [`CODESTORAGE_SWEEP_DELETE_LFS_LEGACY`](#codestorage_sweep_delete_lfs_legacy)
+  is also armed, so they retire only while that flag is set AND the fresh
+  watermark records a legacy-armed sweep — otherwise they defer with
+  `rows_deferred_legacy_unarmed` in the run report. With
+  the sweep schedule stopped
   ([`CODESTORAGE_SWEEP_INTERVAL=0`](#codestorage_sweep_interval), the
   emergency stop), the process starts but demotes retirement to report-only
   with a warning — nothing would reap the blobs meanwhile.
@@ -829,6 +844,48 @@ integrity loss logged loudly: committed refs may reference it). See the
   enforcement disabled
   ([`CODESTORAGE_PACK_QUOTA_BYTES=0`](#codestorage_pack_quota_bytes)) it
   detects and reports without charging anything.
+- **Degraded-renewal admission fence** (quota enforcement on): every
+  successful pass stamps a renewal-health watermark. If a pass's cover
+  renewal FAILS while that watermark is absent or older than the
+  cover-lapse safety bound (the TTL minus this interval minus twice the
+  pass wall clock — a failure is harmless only while covers survive
+  until the NEXT attempt, and the watermark can trail the touch it
+  records by up to one more pass), covers may lapse un-renewed and quota
+  arithmetic would silently under-count them — the job then fails finite
+  quota-gated writes closed (pushes, LFS uploads, adoptions answer
+  "quota accounting temporarily degraded, retry later") until a healthy
+  pass completes one full recovery rotation of both registries.
+  Transient renewal blips within the safety bound never fence; internal
+  restore/cover reservations are always exempt so recovery can proceed.
+  A SUCCESSFUL renewal whose prior watermark exists but is a full TTL
+  old fences too — the strict-TTL touch cannot resurrect covers that
+  already lapsed — so a fleet paused past the TTL, or quota re-enabled
+  after an off period whose earlier passes had stamped, runs one fenced
+  recovery rotation before finite quota-gated writes resume. An ABSENT
+  watermark (the first pass after enabling the job, or after upgrading
+  to a version that stamps it) is not lapse evidence by itself: that
+  pass fences only on positive evidence — a durable lapse-evidence
+  marker (recorded whenever admission-time GC or the reservation sweep
+  deletes an expired cover), a physically present expired cover, or an
+  evidence check that itself fails — and otherwise stamps health with
+  admissions left open, so an ordinary first pass after enablement or
+  upgrade does NOT block writes.
+
+  **Upgrade ordering (mixed fleets).** The fence check and the
+  lapse-evidence markers run only in new binaries: during a rolling
+  upgrade, a write routed to a pre-upgrade replica reserves WITHOUT the
+  fence check (spending the deflated headroom an armed fence closes on
+  new replicas), and a pre-upgrade replica's expired-reservation GC
+  deletes a lapsed cover without recording evidence — silently
+  defeating the first health stamp's probe afterwards. Both guarantees
+  are fleet-wide only once every replica runs a fence-aware binary.
+  Enable this job only after the whole fleet is upgraded; when
+  upgrading a fleet that already runs it, complete the roll within one
+  [`CODESTORAGE_PACK_RESERVATION_TTL`](#codestorage_pack_reservation_ttl)
+  (healthy renewal re-TTLs covers every pass, so a prompt roll leaves
+  no expired cover for pre-upgrade GC to consume). The serve boot log
+  warns while reconciliation runs with quota enforcement as a reminder
+  of this prerequisite (see ADR-43).
 
 ### `CODESTORAGE_ABSENCE_RECONCILE_BUDGET`
 
@@ -846,29 +903,26 @@ stretches individual probes.
 - **Default:** `100000`. **Constraints:** an integer of at least `100`
   (one row can cost up to three units, so degenerate budgets cannot
   guarantee progress on both registries).
-- Tracked losses are covered by ONE aggregate reservation row per affected
-  repository, renewed every pass at one work unit per repository — and the
-  tracked-repository population is capped at HALF the renewal phase's
-  allocation (`budget/4`; 25,000 at the default), so every tracked
-  aggregate provably renews every pass with the other half left for
-  registry revalidation, and the per-repo reservation-row cap cannot bind.
-  Round-robin re-verification then shrinks aggregates as losses heal,
-  retire, or purge (a shrink re-mints the aggregate's reservation key so
-  the exact new total is charged; the old row expires within one TTL); a
-  re-verification backlog (`absent_refreshed` below `absent_tracked`) only
-  delays shrinking, never cover renewal. Losses beyond the repository
-  capacity or the 100,000-row memory cap aggregate into one pass-scoped
-  overflow cover per repository, renewed on rotation revisits
-  (`absent_untracked`), and a renewal aborted by the pass deadline drops
-  its unrenewed bases loudly (`absent_dropped`) for rotation rediscovery
-  rather than leaving covers to lapse silently.
-- **Multi-replica PostgreSQL fleets:** the refresh set and rotation
-  cursors are per-process, and the River periodic job may run on any
-  replica ([#125](https://github.com/coder/code-storage/issues/125) tracks
-  fleet persistence with [#121](https://github.com/coder/code-storage/issues/121)).
-  Size the budget at or above the fleet's total registered row count —
-  every pass is then a complete rotation and any replica re-covers every
-  loss fleet-wide.
+- Discovered losses are covered by ONE aggregate reservation row per
+  affected repository and registry class, and the cover rows themselves
+  are the durable tracking state
+  ([#125](https://github.com/coder/code-storage/issues/125)): the renewal
+  phase lists the live rows and re-charges each at one work unit per row,
+  entirely database-derived, so the per-repo reservation-row cap cannot
+  bind and any replica keeps every cover alive. Each full rotation over a
+  repository's rows re-derives its exact deficit total — growing the live
+  cover in place, re-minting the key with the exact smaller total when
+  heals shrink it (`covers_rotated`; the stale row is deleted), and
+  releasing it outright when everything healed (`covers_released`). Shrink
+  therefore lags by at most one rotation (conservative), never renewal.
+- **Sizing:** keep the budget above twice the live cover-row population.
+  Renewal never lapses on budget — it always offers the full cover
+  listing, squeezing discovery when it overruns its allocation
+  (`renewal_over_budget`) — but a squeezed rotation slows loss discovery
+  and heal shedding. Rotation cursors, traversal bookkeeping, and the
+  alternating-leader parity are all fleet-persistent (`job_scan_state`),
+  so multi-replica PostgreSQL fleets share one rotation regardless of
+  which replica River schedules.
 
 ### `CODESTORAGE_REPACK_THRESHOLD`
 

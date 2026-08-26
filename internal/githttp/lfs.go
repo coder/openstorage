@@ -372,6 +372,16 @@ func (s *Server) lfsBatchDownload(r *http.Request, repoElem string, target repoT
 		case errors.Is(aerr, errLFSBusy):
 			lfsObjectFail(&res, http.StatusTooManyRequests, "object recovery in progress; retry")
 			return res
+		case errors.Is(aerr, errLFSQuotaDegraded):
+			// The restore copy's admission is fenced while quota
+			// accounting is degraded (Codex round 39 on PR #132): the
+			// object EXISTS (registered, legacy copy retained), so a
+			// transient 503 beats the honest-404 fallthrough — the
+			// client retries after recovery instead of treating the
+			// object as gone.
+			lfsObjectFail(&res, http.StatusServiceUnavailable,
+				"storage quota accounting temporarily degraded, retry later")
+			return res
 		default:
 			log.Printf("lfs download restore %s: %v", key, aerr)
 		}
@@ -584,6 +594,15 @@ func (s *Server) lfsBatchUpload(r *http.Request, repoElem string, target repoTar
 				case errors.Is(aerr, errLFSBusy):
 					lfsObjectFail(&results[i], http.StatusTooManyRequests,
 						"a concurrent operation holds this object, retry")
+					continue
+				case errors.Is(aerr, errLFSQuotaDegraded):
+					// Fail-closed while quota accounting is degraded
+					// (Codex round 39 on PR #132): transient — the
+					// recovery rotation clears the fence, so a 503
+					// keeps the client retrying instead of failing
+					// hard on a generic 500 (the round-26 PUT shape).
+					lfsObjectFail(&results[i], http.StatusServiceUnavailable,
+						"storage quota accounting temporarily degraded, retry later")
 					continue
 				case errors.Is(aerr, errLFSContentMismatch):
 					// A mismatched legacy blob was removed: the object is
@@ -818,6 +837,11 @@ var errLFSContentMismatch = errors.New("stored LFS object does not match its con
 // resources (per-key slot, staging budget) this request needs. Callers
 // answer 429 + Retry-After.
 var errLFSBusy = errors.New("concurrent LFS operation in progress")
+
+// errLFSQuotaDegraded fails quota-gated LFS writes closed while the
+// absence reconciler's cover renewal is degraded (Codex round 26 on
+// PR #132, security): transient — the client retries after recovery.
+var errLFSQuotaDegraded = errors.New("storage quota accounting temporarily degraded, retry later")
 
 // errLFSCompatQuotaExceeded is the v0.2.0 bridge copy's quota denial
 // (Codex security round 84): the bridge doubles a fresh upload's physical
@@ -1149,6 +1173,20 @@ func (s *Server) adoptStoredLFSObject(ctx context.Context, repoID, key, oid stri
 			ls, lerr := s.Store.QuotaLedgerState(ctx, blob.QuotaRepoGroup(repoID), s.lfsReservationTTL(), key, key+lfsRepairCoverSuffix)
 			if lerr != nil {
 				return fmt.Errorf("adoption preflight %s: ledger read: %w", key, lerr)
+			}
+			// Degraded-renewal fence preflight (Codex round 36 on PR
+			// #132, security): while the absence reconciler's admission
+			// fence is armed, the post-hash copy admission WILL deny
+			// with RenewalDegraded — but only after verifyStoredLFSObject
+			// streamed and hashed the entire legacy object, and the
+			// denial produces no canonical row and parks no progress,
+			// so every batch retry restarted the whole read from offset
+			// zero: the same repeatable, client-cost-free drain as the
+			// over-quota shape below. The advisory ledger read carries
+			// the fence bit; the authoritative check stays inside
+			// ReservePackBytes under the fence's shared advisory lock.
+			if ls.RenewalDegraded {
+				return fmt.Errorf("adoption preflight %s: %w", key, errLFSQuotaDegraded)
 			}
 			if used := ref.AddSat(ls.UsageBytes, floor); !ref.Admitted(used, ls.ReservedBytes, srcSize, s.PackQuotaBytes) {
 				return fmt.Errorf("adopt %s: %w (copy adds %d bytes to %d stored, +%d reserved, quota %d)",
@@ -2042,6 +2080,9 @@ func (s *Server) publishVerifiedLFSObject(ctx context.Context, repoID, key, lega
 			if dec.KeyCapExceeded {
 				return fmt.Errorf("adoption admission %s: %w", key, errLFSBusy)
 			}
+			if dec.RenewalDegraded {
+				return fmt.Errorf("adoption admission %s: %w", key, errLFSQuotaDegraded)
+			}
 			if !dec.OK {
 				return fmt.Errorf("adopt %s: %w (copy adds %d bytes to %d stored, +%d reserved, quota %d)",
 					key, errLFSAdoptQuotaExceeded, size, dec.UsedBytes, dec.ReservedBytes, s.PackQuotaBytes)
@@ -2721,6 +2762,14 @@ func (s *Server) lfsProxyDownload(w http.ResponseWriter, r *http.Request, repoID
 		case errors.Is(aerr, errLFSBusy):
 			lfsError(w, http.StatusTooManyRequests, "object recovery in progress; retry")
 			return
+		case errors.Is(aerr, errLFSQuotaDegraded):
+			// See the batch restore twin (Codex round 39 on PR #132):
+			// the object exists — transient 503, not the honest-404
+			// fallthrough.
+			w.Header().Set("Retry-After", "60")
+			lfsError(w, http.StatusServiceUnavailable,
+				"storage quota accounting temporarily degraded, retry later")
+			return
 		default:
 			log.Printf("lfs download restore %s: %v", key, aerr)
 		}
@@ -2868,6 +2917,14 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target r
 			return
 		case errors.Is(aerr, errLFSBusy):
 			lfsError(w, http.StatusTooManyRequests, "server LFS staging budget exhausted, retry")
+			return
+		case errors.Is(aerr, errLFSQuotaDegraded):
+			// Fail-closed while quota accounting is degraded (Codex
+			// round 39 on PR #132): transient, retry — the round-26
+			// PUT shape, not the generic 500.
+			w.Header().Set("Retry-After", "60")
+			lfsError(w, http.StatusServiceUnavailable,
+				"storage quota accounting temporarily degraded, retry later")
 			return
 		case errors.Is(aerr, errLFSContentMismatch):
 			// The mismatched legacy blob was removed: proceed as a normal
@@ -3190,6 +3247,14 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target r
 		if dec.KeyCapExceeded {
 			lfsError(w, http.StatusTooManyRequests,
 				"too many in-flight uploads reserved for this repository, retry later")
+			return
+		}
+		if dec.RenewalDegraded {
+			// Fail-closed while quota accounting is degraded (Codex
+			// round 26 on PR #132, security): transient, retry.
+			w.Header().Set("Retry-After", "60")
+			lfsError(w, http.StatusServiceUnavailable,
+				"storage quota accounting temporarily degraded, retry later")
 			return
 		}
 		if !dec.OK {
@@ -3630,6 +3695,9 @@ func (s *Server) maybeLegacyCompatCopy(ctx context.Context, repoID, oid, key str
 			}
 			if dec.KeyCapExceeded {
 				return fmt.Errorf("compat admission %s: %w", legacyKey, errLFSBusy)
+			}
+			if dec.RenewalDegraded {
+				return fmt.Errorf("compat admission %s: %w", legacyKey, errLFSQuotaDegraded)
 			}
 			if !dec.OK {
 				return fmt.Errorf("compat copy %s: %w (bridge adds %d bytes to %d stored, +%d reserved, quota %d)",

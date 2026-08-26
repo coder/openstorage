@@ -11,8 +11,48 @@ package ref
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strings"
+	"time"
+
+	"github.com/jackc/pgx/v5"
 )
+
+// AbsenceCoverPrefix is the synthetic blob-key namespace the absence
+// reconciler's aggregate covers reserve under (jobs.AbsenceReconciler). No
+// real blob key can collide: pack keys live under "packs/", LFS keys under
+// "lfs/". The prefix is load-bearing for ListAbsenceCovers' range scan and
+// must not contain "\n" (reservRowKey rejects it).
+const AbsenceCoverPrefix = "absence-lost/"
+
+// AbsenceCoverRow is one absence-cover reservation row as the reconciler's
+// renewal phase sees it (issue #125): the durable record of a charged loss
+// aggregate, re-derived at pass start instead of persisting the tracking
+// set separately.
+type AbsenceCoverRow struct {
+	// RawKey is the reservation-row spelling — the opaque keyset cursor
+	// for the next page.
+	RawKey string
+	// Key is the synthetic cover key ReserveRestoreCover was charged
+	// with (reservation spellings stripped), the spelling a renewal
+	// re-charges.
+	Key string
+	// Base is the base repository the reservation charges.
+	Base string
+	// Bytes is the row's reserved size (GREATEST-pinned across charges).
+	Bytes int64
+	// Owner is the row's current owner column verbatim: a random
+	// reservation token or the AbsenceFoldedOwner sentinel (Codex
+	// rounds 18-19 on PR #132). Every re-charge overwrites it, so CAS
+	// on the listed value detects concurrent re-charges.
+	Owner string
+	// Folded reports the row carries the AbsenceFoldedOwner sentinel:
+	// both rotations proved the row redundant and no re-charge has
+	// arrived since (every re-charge overwrites owner).
+	// Meaningful for legacy nonce rows; deterministic rows read false.
+	Folded bool
+}
 
 // AbsenceLFSRow is one registered LFS object as the absence reconciler
 // sees it: the row key (canonical or v0.2.0 legacy spelling) and its
@@ -62,6 +102,241 @@ ORDER BY repo ASC, key ASC LIMIT $3`,
 		out = append(out, r)
 	}
 	return out, rows.Err()
+}
+
+// absenceCoverRangeEnd is the exclusive upper bound of the cover-key range
+// scan: the prefix with its final byte incremented ('/'+1).
+var absenceCoverRangeEnd = AbsenceCoverPrefix[:len(AbsenceCoverPrefix)-1] + "0"
+
+// absenceCoverRawSuffix is the reservation-row suffix every cover minted
+// through ReserveRestoreCover carries. The queries filter on it in SQL
+// (Codex round 3 on PR #132): a Go-side filter could return an EMPTY page
+// for a stretch of foreign spellings under the prefix, which callers
+// would misread as the end of the keyspace — silently skipping live
+// covers whose renewals then lapse.
+var absenceCoverRawSuffix = RepairCoverSuffix + reservKeySuffix
+
+// stripAbsenceCoverRow maps one pack_reservations row in the absence-cover
+// range back to the synthetic key it was charged under. The SQL filters
+// guarantee the shape; ok=false is a defensive residual for rows that
+// somehow carry the suffix without the prefix.
+func stripAbsenceCoverRow(rawKey string) (key string, ok bool) {
+	key, ok = strings.CutSuffix(rawKey, absenceCoverRawSuffix)
+	if !ok || !strings.HasPrefix(key, AbsenceCoverPrefix) {
+		return "", false
+	}
+	return key, true
+}
+
+// ListAbsenceCovers pages the live absence-cover reservation rows, keyset
+// on the raw reservation key ascending (afterRaw "" starts the scan). The
+// rows are the DURABLE tracking state of discovered losses: the renewal
+// phase re-derives its obligations from this listing every pass, so any
+// replica keeps every charged aggregate alive (issue #125). ttl is the
+// liveness window admission consults (PackReservationTTL): rows older than
+// it are EXPIRED — admission no longer counts them, so renewing or
+// migrating one would resurrect a stale reservation (Codex round 6 on
+// PR #132) — and are left to the ledger's expired-row cleanup.
+func (s *PG) ListAbsenceCovers(ctx context.Context, afterRaw string, limit int, ttl time.Duration) ([]AbsenceCoverRow, error) {
+	validateAbsencePage(limit)
+	assertf(ttl > 0, "ListAbsenceCovers: non-positive ttl %v", ttl)
+	if afterRaw == "" {
+		afterRaw = AbsenceCoverPrefix // no real row key sorts at the bare prefix
+	}
+	// COLLATE "C" pins the range scan and cursor order to BYTE order
+	// (reservation spellings embed "\n"; locale collations order it
+	// unpredictably), served by the pack_reservations_key_c index —
+	// the refs_repo_name_c pattern. Foreign spellings are excluded in
+	// SQL so a page can never filter to empty while covers remain.
+	rows, err := s.pool.Query(ctx, `
+SELECT key, repo, bytes, owner FROM pack_reservations
+WHERE key COLLATE "C" > $1 AND key COLLATE "C" < $2
+  AND right(key, $3) = $4
+  AND created_at > now() - make_interval(secs => $5)
+ORDER BY key COLLATE "C" ASC LIMIT $6`,
+		afterRaw, absenceCoverRangeEnd, len(absenceCoverRawSuffix), absenceCoverRawSuffix, ttl.Seconds(), limit)
+	if err != nil {
+		return nil, fmt.Errorf("list absence covers: %w", err)
+	}
+	defer rows.Close()
+	var out []AbsenceCoverRow
+	for rows.Next() {
+		var r AbsenceCoverRow
+		if err := rows.Scan(&r.RawKey, &r.Base, &r.Bytes, &r.Owner); err != nil {
+			return nil, err
+		}
+		r.Folded = r.Owner == AbsenceFoldedOwner
+		var ok bool
+		if r.Key, ok = stripAbsenceCoverRow(r.RawKey); !ok {
+			continue // foreign spelling: left to reservation expiry
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// coverRangeEnd is the exclusive upper bound matching every raw row whose
+// synthetic key starts with prefix (the appended reservation suffixes only
+// extend the key, so the prefix range covers them all).
+func coverRangeEnd(prefix string) string {
+	assertf(prefix != "" && prefix[len(prefix)-1] < 0xff, "coverRangeEnd(%q)", prefix)
+	return prefix[:len(prefix)-1] + string(prefix[len(prefix)-1]+1)
+}
+
+// AbsenceCoverHead returns the HIGHEST live cover row whose synthetic key
+// starts with prefix (byte order; the reconciler's zero-padded incarnation
+// spelling makes byte order numeric order). ok=false when none exists.
+// This is the reconciler's point lookup for a base's current aggregate
+// incarnation before charging into it (issue #125). ttl filters expired
+// rows exactly like ListAbsenceCovers: charging into an expired higher
+// incarnation would resurrect its stale GREATEST-pinned total.
+func (s *PG) AbsenceCoverHead(ctx context.Context, prefix string, ttl time.Duration) (AbsenceCoverRow, bool, error) {
+	assertf(strings.HasPrefix(prefix, AbsenceCoverPrefix), "AbsenceCoverHead(%q): not an absence cover prefix", prefix)
+	assertf(ttl > 0, "AbsenceCoverHead: non-positive ttl %v", ttl)
+	var r AbsenceCoverRow
+	err := s.pool.QueryRow(ctx, `
+SELECT key, repo, bytes FROM pack_reservations
+WHERE key COLLATE "C" >= $1 AND key COLLATE "C" < $2
+  AND right(key, $3) = $4
+  AND created_at > now() - make_interval(secs => $5)
+ORDER BY key COLLATE "C" DESC LIMIT 1`,
+		prefix, coverRangeEnd(prefix), len(absenceCoverRawSuffix), absenceCoverRawSuffix, ttl.Seconds()).Scan(&r.RawKey, &r.Base, &r.Bytes)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return AbsenceCoverRow{}, false, nil
+	}
+	if err != nil {
+		return AbsenceCoverRow{}, false, fmt.Errorf("absence cover head %s: %w", prefix, err)
+	}
+	var ok bool
+	if r.Key, ok = stripAbsenceCoverRow(r.RawKey); !ok {
+		return AbsenceCoverRow{}, false, nil // foreign spelling: not ours
+	}
+	return r, true, nil
+}
+
+// RenewAbsenceCovers re-stamps created_at on every LIVE absence-cover row
+// the reconciler is responsible for keeping alive, in DB-clock statements
+// (Codex round 9 on PR #132): cover protection must never depend on the
+// keyset renewal listing completing within the TTL — a large population
+// or degraded ledger latency turns that listing into a multi-pass round
+// robin, and a row aging past the TTL mid-cycle would be excluded as
+// expired and silently never renewed. The strict TTL predicate is the
+// round-6 invariant: already-expired rows stay dead. Two row classes are
+// touched: deterministic incarnation rows (`/<class>-e<19 digits>` tail),
+// and legacy nonce rows NOT yet marked folded (Codex round 15: an
+// un-folded nonce minted just behind the listing cursor must not lapse
+// before its first visit). A proven fold marks the nonce
+// (MarkAbsenceCoverFolded) which removes it from the touch so it decays
+// by TTL — and any old replica re-charging its nonce overwrites owner,
+// un-marking it, exactly matching "a re-charge is a new reliance".
+// Returns the number of rows re-stamped.
+func (s *PG) RenewAbsenceCovers(ctx context.Context, ttl time.Duration) (int64, error) {
+	assertf(ttl > 0, "RenewAbsenceCovers: non-positive ttl %v", ttl)
+	tag, err := s.pool.Exec(ctx, `
+UPDATE pack_reservations SET created_at = now()
+WHERE key COLLATE "C" > $1 AND key COLLATE "C" < $2
+  AND key ~ $3
+  AND created_at > now() - make_interval(secs => $4)`,
+		AbsenceCoverPrefix, absenceCoverRangeEnd, absenceIncarnationTailRegexp, ttl.Seconds())
+	if err != nil {
+		return 0, fmt.Errorf("renew absence covers: %w", err)
+	}
+	total := tag.RowsAffected()
+	tag, err = s.pool.Exec(ctx, `
+UPDATE pack_reservations SET created_at = now()
+WHERE key COLLATE "C" > $1 AND key COLLATE "C" < $2
+  AND right(key, $3) = $4
+  AND key !~ $5
+  AND owner <> $6
+  AND created_at > now() - make_interval(secs => $7)`,
+		AbsenceCoverPrefix, absenceCoverRangeEnd, len(absenceCoverRawSuffix), absenceCoverRawSuffix,
+		absenceIncarnationTailRegexp, AbsenceFoldedOwner, ttl.Seconds())
+	if err != nil {
+		return total, fmt.Errorf("renew legacy absence covers: %w", err)
+	}
+	return total + tag.RowsAffected(), nil
+}
+
+// LapsedAbsenceCoverExists reports whether any physically present
+// absence-cover row — deterministic incarnation or un-folded legacy
+// nonce — has aged past the ttl: positive evidence that cover
+// protection lapsed while no renewal was running (Codex round 32 on PR
+// #132, security). Folded nonces are excluded: their decay is
+// deliberate retirement, not a lapse. Consulted when the renewal-health
+// watermark is ABSENT — the upgrade/first-enable signature — where
+// arming the fleet-global admission fence without evidence would turn
+// every first pass under this feature into a cross-tenant write outage.
+// Rows GC'd before the probe (admission's per-base expired-row pruning)
+// are a best-effort residual: those bases' writers re-derive their own
+// floors at admission time.
+func (s *PG) LapsedAbsenceCoverExists(ctx context.Context, ttl time.Duration) (bool, error) {
+	assertf(ttl > 0, "LapsedAbsenceCoverExists: non-positive ttl %v", ttl)
+	var exists bool
+	err := s.pool.QueryRow(ctx, `
+SELECT EXISTS (
+  SELECT 1 FROM pack_reservations
+  WHERE key COLLATE "C" > $1 AND key COLLATE "C" < $2
+    AND right(key, $3) = $4
+    AND owner <> $5
+    AND created_at <= now() - make_interval(secs => $6))`,
+		AbsenceCoverPrefix, absenceCoverRangeEnd,
+		len(absenceCoverRawSuffix), absenceCoverRawSuffix,
+		AbsenceFoldedOwner, ttl.Seconds()).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("lapsed absence cover exists: %w", err)
+	}
+	return exists, nil
+}
+
+// AbsenceFoldedOwner is the sentinel owner the reconciler CASes onto a
+// legacy nonce cover once both registry rotations proved its base's true
+// deficits within one pass (the recomputed ground truth subsumes whatever
+// the nonce aggregated): marked rows leave the bulk touch and decay by
+// TTL. Reservation owners are 32 hex chars (NewReservationOwner), so the
+// sentinel cannot collide, and every ReserveRestoreCover re-charge
+// overwrites owner — an old replica re-charging its nonce un-marks it.
+const AbsenceFoldedOwner = "absence-folded"
+
+// CASAbsenceCoverOwner rewrites one legacy cover row's owner by its raw
+// reservation-row key, guarded on the (owner, bytes) the caller listed
+// (Codex rounds 18-19 on PR #132): every ReserveRestoreCover re-charge
+// overwrites owner and GREATEST-grows bytes, so a matched CAS proves no
+// re-charge landed between the listing and this write — the folded
+// sentinel must never clobber a newer reliance. ok=false when the row
+// vanished or drifted; nothing is written.
+func (s *PG) CASAbsenceCoverOwner(ctx context.Context, rawKey, expectedOwner string, expectedBytes int64, newOwner string) (bool, error) {
+	assertf(strings.HasPrefix(rawKey, AbsenceCoverPrefix), "CASAbsenceCoverOwner(%q)", rawKey)
+	assertf(newOwner != "", "CASAbsenceCoverOwner(%q): empty new owner", rawKey)
+	tag, err := s.pool.Exec(ctx,
+		`UPDATE pack_reservations SET owner = $1 WHERE key = $2 AND owner = $3 AND bytes = $4`,
+		newOwner, rawKey, expectedOwner, expectedBytes)
+	if err != nil {
+		return false, fmt.Errorf("cas absence cover owner %s: %w", rawKey, err)
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
+// absenceIncarnationTailRegexp matches the raw-row tail of a deterministic
+// incarnation key: /<class>-e<19 zero-padded digits> followed by the
+// repair-cover reservation suffix at end of string. The suffix contains no
+// regex metacharacters (a literal newline matches itself; PG's $ anchors
+// at end of string in default mode).
+var absenceIncarnationTailRegexp = "/(lfs|packs)-e[0-9]{19}" + absenceCoverRawSuffix + "$"
+
+// DeleteAbsenceCover removes one absence-cover reservation row by its
+// synthetic key; deleting an absent row is a no-op. Only the absence
+// reconciler mints and owns rows under AbsenceCoverPrefix, and River's
+// unique periodic jobs serialize its passes fleet-wide, so the delete
+// cannot race another writer of the row; an admission racing the delete
+// sees the same outcome as the row's TTL expiry.
+func (s *PG) DeleteAbsenceCover(ctx context.Context, key string) error {
+	assertf(strings.HasPrefix(key, AbsenceCoverPrefix), "DeleteAbsenceCover(%q): not an absence cover key", key)
+	_, err := s.pool.Exec(ctx,
+		`DELETE FROM pack_reservations WHERE key = $1`, reservRowKey(key+RepairCoverSuffix))
+	if err != nil {
+		return fmt.Errorf("delete absence cover %s: %w", key, err)
+	}
+	return nil
 }
 
 // ListFleetPacks pages registered pack rows fleet-wide, keyset on the

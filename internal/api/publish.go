@@ -128,6 +128,11 @@ func (s *server) publishPack(ctx context.Context, repoID, packID, packPath strin
 				// the write fits.
 				return errPackReservationsBusy
 			}
+			if dec.RenewalDegraded {
+				// Fail-closed while quota accounting is degraded (Codex
+				// round 26 on PR #132, security): transient, retry.
+				return fmt.Errorf("storage quota accounting temporarily degraded, retry later")
+			}
 			if !dec.OK {
 				return fmt.Errorf("%w: write adds %d bytes to %d bytes stored (+%d bytes reserved by in-flight writes), quota is %d bytes",
 					errPackQuotaExceeded, pack.Size, dec.UsedBytes, dec.ReservedBytes, s.packQuotaBytes)

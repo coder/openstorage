@@ -168,6 +168,32 @@ func (s *SQLite) PurgeRepoLedger(ctx context.Context, group []string) (int64, er
 		}
 		total += n
 	}
+	// The reclaimer's parked settlement cursor is per-BASE scan state
+	// (issue #121) — see the PG twin.
+	res, err := tx.ExecContext(ctx,
+		`DELETE FROM job_scan_state WHERE job = ? AND scope = ?`,
+		ScanJobLFSReclaim, ScanScopeReclaimRepo(purgeBaseOf(group)))
+	if err != nil {
+		return 0, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	total += n
+	// Pending refund buckets die with the ledger too — see the PG twin
+	// (Codex round 33).
+	res, err = tx.ExecContext(ctx,
+		`DELETE FROM job_scan_state WHERE job = ? AND substr(scope, 1, length(?)) = ?`,
+		ScanJobLFSReclaim, ScanScopeReclaimRefundPrefix(purgeBaseOf(group)), ScanScopeReclaimRefundPrefix(purgeBaseOf(group)))
+	if err != nil {
+		return 0, err
+	}
+	n, err = res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	total += n
 	if err := tx.Commit(); err != nil {
 		return 0, fmt.Errorf("purge repo ledger commit: %w", err)
 	}

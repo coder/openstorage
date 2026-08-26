@@ -553,6 +553,18 @@ CREATE TABLE IF NOT EXISTS lfs_mismatches (repo text NOT NULL, key text NOT NULL
 -- can strand registry rows behind a completed purge.
 CREATE TABLE IF NOT EXISTS purged_repos (repo text PRIMARY KEY,
                                          fenced_at timestamptz NOT NULL DEFAULT now());
+-- Fleet-persistent background-job scan state (issues #120/#121/#125): one
+-- small row per (job, scope) carrying a cursor/watermark payload, an
+-- optional invalidation generation, and the write time. River schedules
+-- each periodic job on any replica, so in-process cursors reset on every
+-- handoff; these rows make scan progress and the sweeper's destructive-reap
+-- watermark durable fleet-wide. Rows are bookkeeping, never authority:
+-- losing one only restarts a scan from the top.
+CREATE TABLE IF NOT EXISTS job_scan_state (job text NOT NULL, scope text NOT NULL,
+                                           payload text NOT NULL DEFAULT '',
+                                           generation bigint NOT NULL DEFAULT 0,
+                                           updated_at timestamptz NOT NULL DEFAULT now(),
+                                           PRIMARY KEY (job, scope));
 -- Idempotent additive migration for pre-p3 dev databases (backfills
 -- existing rows via the NOT NULL DEFAULT).
 ALTER TABLE refs ADD COLUMN IF NOT EXISTS created_at timestamptz NOT NULL DEFAULT now();
@@ -608,9 +620,21 @@ CREATE CONSTRAINT TRIGGER packs_bump_generation
 //     serve COLLATE "C" range scans — without this index every page would
 //     re-sort the repo's whole remaining ref set, turning an
 //     attacker-scaled ref fanout into quadratic server work.
+//   - pack_reservations_key_c serves the absence reconciler's byte-ordered
+//     cover-listing range scan (ListAbsenceCovers, issue #125), the same
+//     COLLATE "C" pattern as refs_repo_name_c.
+//   - job_scan_state_job_scope_c serves the byte-ordered scope keyset
+//     paging over job_scan_state (ListJobScanStateScopes and
+//     SettleLFSRefunds' bucket paging, issues #120/#121): the (job, scope)
+//     primary key is built with the database's default collation, so on a
+//     non-C database it cannot serve the COLLATE "C" range and ordering —
+//     refund buckets grow per base and sweep epoch, so every page would
+//     re-sort the job's whole remaining scope set.
 var concurrentIndexes = []struct{ name, create string }{
 	{"packs_repo_s3_key", `CREATE INDEX CONCURRENTLY IF NOT EXISTS packs_repo_s3_key ON packs (repo, s3_key)`},
 	{"refs_repo_name_c", `CREATE INDEX CONCURRENTLY IF NOT EXISTS refs_repo_name_c ON refs (repo, name COLLATE "C")`},
+	{"pack_reservations_key_c", `CREATE INDEX CONCURRENTLY IF NOT EXISTS pack_reservations_key_c ON pack_reservations (key COLLATE "C")`},
+	{"job_scan_state_job_scope_c", `CREATE INDEX CONCURRENTLY IF NOT EXISTS job_scan_state_job_scope_c ON job_scan_state (job, scope COLLATE "C")`},
 }
 
 // indexState reports whether the named index exists and is valid.

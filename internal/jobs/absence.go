@@ -17,16 +17,64 @@ package jobs
 //
 // The scan direction is the sweeper's inverse: the sweeper walks storage
 // listings and probes the registry; this walks registry rows and Stats
-// storage. Both cursors are the tables' primary keys, in-memory per
-// process like the LFS reclaimer's (issue #121 tracks fleet-persistent
-// cursors for multi-replica River fleets; a lost cursor only delays
-// convergence — covers re-charge on the next full rotation).
+// storage.
+//
+// FLEET PERSISTENCE (issue #125): River may run each pass on any replica,
+// so no correctness-bearing state lives in process memory. Two durable
+// sources carry everything across worker turnover:
+//
+//   - The rotation cursors (with per-class traversal bookkeeping) persist
+//     as job_scan_state rows, so any replica resumes the one fleet-shared
+//     scan instead of restarting its own.
+//   - The TTL'd cover reservations THEMSELVES are the tracking state for
+//     discovered losses. Every pass re-derives its renewal obligations by
+//     LISTING the live absence-cover rows (ref.ListAbsenceCovers) and
+//     re-charging them — no in-memory known-absent set to lose.
+//
+// Each base repository holds at most ONE live aggregate cover per registry
+// class, under a deterministic incarnation key
+// absence-lost/<base>/<class>-e<n> (zero-padded so byte order is numeric
+// order). The lifecycle keeps steady-state cover EXACT (1×):
+//
+//   - GROW: each traversal recomputes the base's running deficit total
+//     from scratch; whenever the running total exceeds the live row's
+//     bytes, the SAME key is re-charged with the new total (the ledger
+//     upsert keeps GREATEST, and a fresh total is never "live + delta", so
+//     crash replays can only transiently over-charge, never compound).
+//     Fresh incidents mint their first incarnation immediately, so a new
+//     loss is admission-visible at discovery.
+//   - SHRINK/RELEASE: when a traversal observed a base's ENTIRE row range
+//     with no stat/charge errors, its running total is exact. A smaller
+//     total mints incarnation n+1 charged exactly and deletes the old row
+//     (mint first — never a coverage gap); a zero total deletes the row
+//     outright. Deletes are safe because the reconciler is the only
+//     writer under the prefix and River's unique jobs serialize passes
+//     fleet-wide. The pending range PARKS WITH the durable cursor (base,
+//     started flag, dirty flag, running total — Codex round 2), so a
+//     range spanning any number of budget-limited passes accumulates and
+//     evaluates exactly; crash replays re-derive the same totals from the
+//     parked cursor (idempotent, never compounding).
+//   - RENEW: the renewal phase re-charges each (base, class)'s
+//     highest-incarnation live row from the durable listing — one unit per
+//     row, from ANY replica — deleting superseded lower incarnations left
+//     by crashes. Legacy nonce-keyed covers from pre-#125 workers renew
+//     until BOTH classes complete one clean traversal (by then every
+//     still-absent loss lives in incarnation keys), then are released.
+//
+// Deterministic keys are load-bearing (Codex round 6 on PR #123 banned
+// resettable-counter keys): incarnation numbers restart at 1 only after
+// the previous row was DELETED, so a stale GREATEST-pinned row can never
+// be silently re-adopted.
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/coder/code-storage/internal/blob"
@@ -42,20 +90,61 @@ type AbsenceRegistry interface {
 	// ListFleetPacks pages packs rows fleet-wide, keyset on the
 	// (repo, id) primary key ascending.
 	ListFleetPacks(ctx context.Context, afterRepo, afterID string, limit int) ([]ref.AbsencePackRow, error)
+	// RenewAbsenceCovers re-stamps the TTL of every LIVE deterministic
+	// cover row AND every un-folded legacy nonce row in DB-clock
+	// statements — the pass-start bulk touch that makes cover protection
+	// independent of the keyset listing completing within the TTL (Codex
+	// rounds 9+15). Strict TTL: expired rows stay dead; nonce rows
+	// marked folded decay.
+	RenewAbsenceCovers(ctx context.Context, ttl time.Duration) (int64, error)
+	// CASAbsenceCoverOwner rewrites one legacy nonce row's owner guarded
+	// on the listed (owner, bytes) — the seam the folded sentinel goes
+	// through (Codex rounds 15+18+19): a CAS miss proves a concurrent
+	// re-charge, which must win.
+	CASAbsenceCoverOwner(ctx context.Context, rawKey, expectedOwner string, expectedBytes int64, newOwner string) (bool, error)
+	// LapsedAbsenceCoverExists reports whether any physically present,
+	// un-folded cover row aged past the ttl — the positive lapse
+	// evidence required to arm the admission fence when the
+	// renewal-health watermark is absent (Codex round 32, security):
+	// an absent watermark alone is the upgrade/first-enable signature,
+	// not proof of a fleet-wide lapse.
+	LapsedAbsenceCoverExists(ctx context.Context, ttl time.Duration) (bool, error)
+	// ListAbsenceCovers pages the live absence-cover reservation rows —
+	// the durable tracking state the renewal phase re-derives its
+	// obligations from every pass (issue #125). ttl is the liveness
+	// window admission consults: expired rows are excluded (renewing or
+	// migrating one would resurrect a stale reservation, Codex round 6).
+	ListAbsenceCovers(ctx context.Context, afterRaw string, limit int, ttl time.Duration) ([]ref.AbsenceCoverRow, error)
+	// AbsenceCoverHead point-reads the highest LIVE incarnation under a
+	// synthetic-key prefix — the charge path's fallback when the renewal
+	// listing did not cover the base this pass. Same ttl semantics.
+	AbsenceCoverHead(ctx context.Context, prefix string, ttl time.Duration) (ref.AbsenceCoverRow, bool, error)
+	// DeleteAbsenceCover releases one cover row (healed loss, superseded
+	// incarnation, or retired legacy spelling).
+	DeleteAbsenceCover(ctx context.Context, key string) error
 	// IsRepoPurged probes the repository purge fence (issue #52): fenced
 	// repos' rows are on their way out and are never covered.
 	IsRepoPurged(ctx context.Context, base string) (bool, error)
-	// HasPack and HasLFSObject are the sweeper's point probes, reused by
-	// the known-absent refresh to drop tracked rows that were retired,
-	// folded away, or purged since their discovery.
-	HasPack(ctx context.Context, repo, key string) (bool, error)
-	HasLFSObject(ctx context.Context, repo, key string) (bool, error)
 	// BumpLFSAdoptionGen invalidates cached usage floors after a cover
 	// made absent bytes visible to admission.
 	BumpLFSAdoptionGen(ctx context.Context, repo string) error
+	// LFSAdoptionGen reads one repo's shared adoption generation — the
+	// mutation fence resumed ranges verify across park gaps (Codex
+	// round 20 on PR #132): summed over the base group, any bump while
+	// the cursor was parked taints the pending range's observation.
+	LFSAdoptionGen(ctx context.Context, repo string) (int64, error)
 	// ReservePackBytes is the ref.RestoreCoverStore seam
 	// ref.ReserveRestoreCover charges covers through.
 	ReservePackBytes(ctx context.Context, group []string, packs []ref.Pack, owner string, usageFloor, floorGen, quotaBytes int64, ttl time.Duration) (ref.ReserveDecision, error)
+	// ArmAbsenceAdmissionFence upserts the admission-fence marker
+	// serialized against in-flight finite quota admissions (Codex round
+	// 35, security): a plain scan-state upsert could land between an
+	// admission's fence check and its commit on PostgreSQL, letting it
+	// spend the deflated headroom the fence closes.
+	ArmAbsenceAdmissionFence(ctx context.Context, payload string) error
+	// ScanStateStore persists the rotation cursors and traversal
+	// bookkeeping (issue #125).
+	ref.ScanStateStore
 }
 
 // BlobStatter is the single blob-store probe the reconciler needs.
@@ -91,23 +180,51 @@ type AbsenceReport struct {
 	CoverErrors       int64 `json:"cover_errors"`
 	StatErrors        int64 `json:"stat_errors"`
 	RowsSkippedPurged int64 `json:"rows_skipped_purged"`
-	// AbsentTracked is the known-absent refresh set's size at pass end:
-	// discovered losses the round-robin refresh renews across passes.
-	AbsentTracked int64 `json:"absent_tracked"`
-	// AbsentRefreshed counts tracked losses the refresh re-settled this
-	// pass; when it stays below AbsentTracked, renewal spans multiple
-	// passes (raise the budget if that period approaches the TTL).
-	AbsentRefreshed int64 `json:"absent_refreshed"`
-	// AbsentUntracked counts absent rows seen while the refresh set was
-	// at its memory or base-capacity cap — covered on discovery,
-	// refreshed only by rotation revisits.
-	AbsentUntracked int64 `json:"absent_untracked"`
-	// AbsentDropped counts tracked rows dropped because their base's
-	// aggregate cover could not be renewed this pass (pass deadline or
-	// ledger failure): tracking must never outlive its renewal
-	// guarantee. The rotation rediscovers and re-covers them.
-	AbsentDropped int64 `json:"absent_dropped"`
-	QuotaEnforced bool  `json:"quota_enforced"`
+	// CoversRenewed counts live cover rows the renewal phase re-charged
+	// this pass (fresh TTL, same key and bytes) — the fleet-derived
+	// replacement for the per-process known-absent refresh (issue #125).
+	CoversRenewed int64 `json:"covers_renewed"`
+	// CoversRotated counts shrink re-mints: a base's exact re-derived
+	// total came in below its live row, so a fresh incarnation charged
+	// the exact total and the stale row was deleted.
+	CoversRotated int64 `json:"covers_rotated"`
+	// CoversReleased counts cover rows DELETED: fully healed bases and
+	// superseded incarnations left by crashes.
+	CoversReleased int64 `json:"covers_released"`
+	// CoversDecaying counts listed legacy (pre-#125 nonce-keyed) covers
+	// left to expire by TTL once both classes proved their base within
+	// one pass (foldRedundantLegacy): never deleted — a not-yet-upgraded
+	// replica may still depend on them mid-roll.
+	CoversDecaying int64 `json:"covers_decaying"`
+	// RowsVerified counts registry rows re-observed by verifyAndJudge —
+	// the fresh storage-visible evidence behind every verdict whose
+	// trigger spanned a pass boundary (Codex round 21).
+	RowsVerified int64 `json:"rows_verified"`
+	// CoversTouched counts live deterministic cover rows whose TTL the
+	// pass-start bulk touch re-stamped (Codex round 9): protection never
+	// depends on the keyset listing completing within the TTL, so a
+	// multi-pass listing round robin can delay lifecycle work
+	// (fold/shrink/release) but cannot lapse a live cover.
+	CoversTouched int64 `json:"covers_touched"`
+	// RenewalIncomplete reports the renewal listing was cut short by the
+	// pass deadline (never by budget): un-renewed rows resume first on
+	// the durable cursor next pass. Investigate the blob store or ledger
+	// if persistent — covers lapse if renewals cannot land within the
+	// TTL.
+	RenewalIncomplete bool `json:"renewal_incomplete"`
+	// RenewalOverBudget reports renewal charged more than its soft
+	// allocation (half the budget): every live cover still renewed —
+	// renewal is the correctness core and never lapses on budget — while
+	// discovery keeps its guaranteed half-budget allowance (Codex round
+	// 14: a zero-allowance clamp would be an absorbing state under the
+	// bulk touch). Raise the budget above twice the live cover
+	// population.
+	RenewalOverBudget bool `json:"renewal_over_budget"`
+	// LFSTraversals/PacksTraversals are the classes' completed rotation
+	// counts (durable bookkeeping, useful for tracking convergence).
+	LFSTraversals  int64 `json:"lfs_traversals"`
+	PackTraversals int64 `json:"pack_traversals"`
+	QuotaEnforced  bool  `json:"quota_enforced"`
 }
 
 const (
@@ -122,7 +239,7 @@ const (
 	// MinAbsenceReconcileBudget is the configuration floor (Codex round
 	// 1, P2): one row can cost up to three units (registration probe +
 	// stat + twin probe), so a degenerate budget cannot guarantee the
-	// refresh/rotation split makes progress on both registries. The
+	// renewal/rotation split makes progress on both registries. The
 	// floor keeps every configurable budget far above single-row
 	// overdraw territory.
 	MinAbsenceReconcileBudget = int64(100)
@@ -130,36 +247,33 @@ const (
 	// work units meter requests, but a degraded blob store can stretch
 	// each one — time, not just work, must bound the pass. The
 	// constructor tightens it to a quarter of the cover TTL (Codex round
-	// 3, security): tracked covers renew at pass STARTS, and River
-	// coalesces periodic ticks that fire while a pass runs, so the gap
-	// between one row's renewals is bounded by pass duration + interval
-	// + the next refresh phase — with the pass capped at TTL/4 and the
-	// interval validated at ≤ TTL/2 (config), that gap stays within the
-	// TTL and a long scan can never let live covers lapse. A timed-out
-	// pass parks its cursors and resumes, exactly like a budget-limited
-	// one.
+	// 3, security): live covers renew at pass STARTS (the renewal phase
+	// runs first), and River coalesces periodic ticks that fire while a
+	// pass runs, so the gap between one cover's renewals is bounded by
+	// pass duration + interval + the next renewal phase — with the pass
+	// capped at TTL/4 and the interval validated at ≤ TTL/2 (config),
+	// that gap stays within the TTL and a long scan can never let live
+	// covers lapse. A timed-out pass parks its cursors and resumes,
+	// exactly like a budget-limited one.
 	absencePassTimeout = time.Hour
-	// absentTrackedCap bounds the tracked-loss population as a MEMORY
-	// bound only (Codex rounds 2+3): losses are storage-incident-scaled,
-	// never attacker-mintable (every software deletion path quarantines
-	// first), so the cap exists to keep a catastrophic incident from
-	// growing the worker heap without bound — not to match the per-pass
-	// refresh capacity. One tracked row's worst-case refresh cost is 3
-	// units (registration probe + stat + twin probe), so tracked losses
-	// beyond one pass's refresh half-budget still renew deterministically
-	// via the round-robin ring, once per ceil(3×tracked/(budget/2))
-	// passes.
-	absentTrackedCap = 100_000
+	// Cover-key classes: each registry rotation maintains its own
+	// incarnation keys, because the two traversals complete
+	// independently.
+	absenceClassLFS   = "lfs"
+	absenceClassPacks = "packs"
 )
 
 // AbsenceReconciler runs the reconciliation scan. Construct with
 // NewAbsenceReconciler; Run executes one bounded pass per schedule tick.
+// All cross-pass state is durable (job_scan_state cursors + the cover rows
+// themselves); the struct carries only configuration and per-pass scratch.
 type AbsenceReconciler struct {
 	registry AbsenceRegistry
 	blobs    BlobStatter
-	// quotaEnforced gates cover charging and generation bumps: with quota
-	// admission disabled nothing consults floors or reservations (the
-	// sweep restore pattern, Codex round 73) — detection still reports.
+	// quotaEnforced gates cover charging, renewal, and generation bumps:
+	// with quota admission disabled nothing consults floors or
+	// reservations (the sweep restore pattern, Codex round 73) —
+	// detection still reports.
 	quotaEnforced bool
 	budget        int64
 	// coverTTL is the reservation TTL admission actually consults
@@ -171,128 +285,308 @@ type AbsenceReconciler struct {
 	coverTTL    time.Duration
 	logger      *slog.Logger
 	passTimeout time.Duration // whole-pass cap, shrinkable in tests
-	// Flat resume cursors, in-memory per process (issue #121 tracks
-	// fleet persistence). Empty = start of the keyspace.
-	lfsAfterRepo, lfsAfterKey  string
-	packAfterRepo, packAfterID string
-	// knownAbsent tracks rows a prior pass proved truly absent, keyed by
-	// the row's blob key (Codex round 1, P1): covers are TTL'd, and on a
-	// registry larger than one pass's budget the rotation returns to a
-	// row less often than its cover survives — the visibility window
-	// would silently reopen between visits. Every pass re-settles this
-	// set FIRST, independent of the rotation. In-memory per process like
-	// the cursors: a restart loses it and the rotation rediscovers —
-	// convergence delay, never corruption (issue #125 tracks fleet
-	// persistence with #121).
-	knownAbsent map[string]*absentRow
-	// refreshRing is knownAbsent's round-robin re-verification schedule
-	// (Codex rounds 3+4): re-settling a tracked row only SHRINKS covers
-	// (healed, retired, folded-away, purged rows drop out of their base
-	// aggregate), so a set larger than one pass's re-verification
-	// capacity merely delays shrinking — never a lapse. The persistent
-	// ring cursor still bounds every row's revisit deterministically
-	// (once per ceil(3×tracked/(budget/2)) passes) instead of leaving
-	// stragglers to map-iteration luck. Entries hold their ring index
-	// for O(1) removal.
-	refreshRing []*absentRow
-	refreshPos  int
-	// absentBases aggregates tracked lost bytes per BASE repository into
-	// ONE cover reservation row each (Codex round 4): per-row covers
-	// scale renewal work with the loss population and collide with the
-	// per-base active-reservation-row cap (10k rows), so a big enough
-	// incident either outruns the refresh budget's renewal cycle or gets
-	// denied outright. The aggregate makes renewal per-REPOSITORY — one
-	// work unit and one reservation row per affected base per pass —
-	// which the refresh half-budget covers for any realistic incident,
-	// and which the row cap cannot bind (one row per base).
-	absentBases map[string]*absentBase
-	baseRing    []*absentBase
-	basePos     int
-	// passes counts completed Run invocations to alternate phase order
-	// (Codex round 1, P2): a twin probe can overdraw the LFS allocation
-	// by one unit, and at degenerate budgets a fixed order would hand
-	// the pack phase zero units forever.
-	passes int64
+	// cursorStaleAge bounds how old a parked rotation cursor may be
+	// before loadState resets it to origin (Codex round 17, security):
+	// covers renew at pass START and cursors park at pass END, so a
+	// cursor older than coverTTL-passTimeout means some cover MAY have
+	// expired since the last renewal — the loss it covered is uncovered
+	// and must not wait for the resumed traversal to wrap. A false reset
+	// only costs a fresh traversal; a false resume is the bug, so the
+	// bound stays strictly conservative (no floor; SQLite's ±1s age
+	// over-read only resets earlier). Shrinkable in tests. The SAME
+	// bound is the success-path renewal-continuity limit (Codex round
+	// 32, P1): the health watermark stamps up to one pass wall clock
+	// after the bulk touch it records, so a watermark age at or past
+	// coverTTL-passTimeout no longer proves the touched covers are
+	// still alive.
+	cursorStaleAge time.Duration
+	// proofCap is the effective fold-candidacy cap (absenceProofCap in
+	// production; shrinkable in tests).
+	proofCap int
+	// renewalSafeAge bounds how old the renewal-health watermark may be
+	// for a renewal FAILURE to stay provably harmless: coverTTL minus
+	// the scheduling interval minus TWICE the pass wall clock — one
+	// pass for the wasted attempt until the next touch (Codex round
+	// 27), one for the stamp trailing the touch it records (Codex
+	// round 38, security). A failure past the bound arms the fence.
+	renewalSafeAge time.Duration
+
+	// Per-pass scratch, loaded from durable state at Run start and parked
+	// at Run end.
+	lfs, packs absenceCursorState
+	// renewCursor round-robins the cover-renewal listing across passes
+	// when it outruns its budget half; passes alternates the leading
+	// rotation (Codex round 1, P2: a twin probe can overdraw the leader's
+	// allocation by one unit, and at degenerate budgets a fixed order
+	// would starve the trailing table forever). Both persist in the
+	// renewal scan-state row.
+	renewCursor string
+	passes      int64
+	// liveCovers is this pass's harvest of the renewal listing: the
+	// highest live incarnation per (class, base). It spares the rotation
+	// a point lookup per touched base; renewalComplete records whether
+	// the harvest saw the WHOLE listing (when it did, a missing entry
+	// proves no live cover exists).
+	liveCovers      map[string]map[string]liveCover
+	renewalComplete bool
+	// lfsRange/packsRange track the base range each rotation is
+	// streaming through, in memory only: shrink/release verdicts are
+	// evaluated exclusively for ranges observed START to END within one
+	// pass, so partial in-memory totals can never under-shrink a cover.
+	lfsRange, packsRange rangeTracker
+	// legacyRows is this pass's harvest of live pre-#125 nonce covers
+	// still awaiting retirement (Codex round 19): the renewal listing
+	// records them as-listed, and the pass end folds exactly those whose
+	// base holds BOTH class proofs (cleanBases). legacyBases indexes
+	// their bases for the endRange verification relevance gate.
+	legacyRows  []ref.AbsenceCoverRow
+	legacyBases map[string]bool
+	// cleanBases[class][base] records that class holds SAME-PASS
+	// storage-visible evidence for base: a fence-continuous
+	// start-to-end range observation with no stat/charge errors —
+	// single-pass only (Codex rounds 19-20) — a row-less keyset gap,
+	// or a fresh verifyAndJudge re-observation completed THIS pass.
+	// Nothing persisted or resumed lands here directly: evidence older
+	// than this pass spans a park gap where out-of-band byte loss has
+	// no DB event, so no fence can vouch for it (Codex round 24).
+	// Retirement needs both classes in one map, same pass.
+	cleanBases map[string]map[string]bool
+	// proofGens[base][class] is the surviving persisted candidacy set
+	// loaded (and fence-validated) this pass. Entries are SCHEDULING
+	// HINTS only (Codex round 24): a hint nominates its class for
+	// commitment-time re-verification at fold, and is never itself
+	// evidence — verifyAndJudge deletes it via markCleanBase when the
+	// fresh re-observation succeeds. Also the retention source for
+	// saveState when an incomplete renewal listing leaves legacyRows
+	// non-authoritative.
+	proofGens map[string]map[string]absenceProofEntry
+	// verifyPool bounds the pass's total fresh-verification work (one
+	// budget's worth, shared by every verifyAndJudge): verification is
+	// per-verdict full-base work, so without a pool a pass completing
+	// many small ranges could multiply its row budget. Fold-phase
+	// verification may overshoot it by at most one base's combined
+	// class rows (run-to-completion, Codex rounds 23+24): an exhausted
+	// pool blocks further base starts but never abandons a started
+	// fold candidate mid-verification.
+	verifyPool int64
+	// foldAttempted dedupes fold-time re-stats per (base, class) across
+	// the pass's two foldRedundantLegacy invocations (round 25,
+	// security): a class re-statted dirty by the pre-rotation fold must
+	// not be re-statted again by the post-rotation one.
+	foldAttempted map[string]bool
+	// lfsLoaded/packsLoaded/fenceLoaded record whether loadState READ
+	// each durable row successfully this pass (absent rows load fine as
+	// zero values; only read ERRORS clear them, Codex round 33): arming
+	// the fence while a load failed must not snapshot in-memory zeros —
+	// the next healthy pass would reload large clean counters and
+	// settle immediately without any recovery rotation.
+	lfsLoaded, packsLoaded, fenceLoaded bool
+	// fenceArmed mirrors the durable admission-fence marker (Codex
+	// round 26, security; see ref.ScanScopeAbsenceAdmissionFence):
+	// while armed, finite quota-gated admissions fail closed because
+	// TTL'd covers may have lapsed un-renewed. fenceLFS/fencePacks are
+	// the marker's PERSISTED traversal snapshot at arming: the fence
+	// clears only after a healthy error-free pass advances BOTH class
+	// traversals past it — one complete recovery rotation re-covering
+	// every registered-but-missing byte the lapse may have uncovered.
+	fenceArmed           bool
+	fenceLFS, fencePacks int64
+	// touchFailed records that this pass's bulk cover renewal FAILED:
+	// the rotation cursors must not be re-stamped by saveState (Codex
+	// round 19, P1) — a cursor row's DB-clock freshness is the loadState
+	// proof that the covers behind it were renewed within passTimeout of
+	// the stamp, and a touch-failed pass would refresh the proof without
+	// refreshing the covers. Skipped saves leave the previous rows
+	// aging, so repeated failures trip the stale-age reset.
+	touchFailed bool
 }
 
-// absentBase is one base repository's tracked-loss aggregate: the single
-// cover reservation row that keeps ALL of its tracked lost bytes visible
-// to admission.
-type absentBase struct {
-	base  string
+// liveCover is one harvested live aggregate incarnation.
+type liveCover struct {
+	key   string // synthetic cover key
+	n     int64  // incarnation number
 	bytes int64
-	rows  int64
-	idx   int // position in baseRing, maintained by track/untrack
-	// coverKey is the aggregate's reservation-key incarnation, re-minted
-	// after bytes SHRINK (Codex round 5): ReservePackBytes' same-key
-	// upsert keeps GREATEST(old, new) and refreshes the TTL, so renewing
-	// a smaller aggregate under the old key would pin healed bytes
-	// reserved forever. A fresh key charges the exact total and the old
-	// row expires by TTL — at most one TTL of over-cover per shrink, the
-	// same deliberate tail every cover has. The incarnation is
-	// crypto-random, NEVER a resettable counter (Codex round 6): a
-	// counter restarts at zero when the aggregate empties and re-forms
-	// (or across process restarts) while the stale GREATEST-pinned row
-	// is still alive, silently re-adopting it. Rotation is COALESCED to
-	// at most once per base per pass, applied lazily at the next charge
-	// (Codex round 8): rotating eagerly on every heal interleaved with
-	// re-charges could mint row-cap many incarnations in one pass —
-	// shrunk marks the pending rotation instead.
-	coverKey string
-	shrunk   bool
 }
 
-// absenceCoverKey mints a fresh synthetic per-base aggregate key (used
-// with ref.RepairCoverSuffix). No real blob key can collide: pack keys
-// live under "packs/", LFS keys under "lfs/", and the suffix keeps the
-// row in the repair-cover class settlement never consumes — the TTL
-// collects it after its incarnation is abandoned.
-func absenceCoverKey(base string) string {
-	return "absence-lost/" + base + "/" + ref.NewReservationOwner()
+// absenceCursorState is one registry rotation's durable bookkeeping.
+type absenceCursorState struct {
+	AfterRepo string `json:"after_repo"`
+	// AfterKey is the second keyset component (lfs_objects.key or
+	// packs.id).
+	AfterKey string `json:"after_key"`
+	// Traversals counts completed origin-to-origin rotations.
+	Traversals int64 `json:"traversals"`
+	// CleanTraversals counts completed rotations that hit NO stat or
+	// cover error in ANY contributing pass and ran with quota
+	// enforcement on (Codex round 31, P1): the admission fence releases
+	// only on this counter — a dirty rotation proves nothing about the
+	// rows whose stat or cover charge failed, and a quota-off rotation
+	// performs no cover maintenance at all. Dirty persists with the
+	// cursor, so an early pass's error poisons the whole multi-pass
+	// rotation for fence purposes.
+	CleanTraversals int64 `json:"clean_traversals"`
+	// Dirty records that the CURRENT traversal hit a stat or cover error
+	// somewhere; a dirty traversal cannot flip HasClean.
+	Dirty bool `json:"dirty"`
+	// HasClean records that some traversal completed with no errors
+	// since the scan state was minted (observability; legacy-cover
+	// retirement gates on per-base fence-continuous proofs, not this
+	// flag — see foldRedundantLegacy).
+	HasClean bool `json:"has_clean"`
+	// The pending base range parks WITH the cursor (Codex round 2 on PR
+	// #132, P1): a base whose rows span multiple phase allocations must
+	// carry its partial deficit total across passes, or each resumed
+	// chunk would restart at zero and the grow charge (always the
+	// recomputed total, never additive) could never reach the true sum.
+	// Parking the whole tracker keeps multi-pass ranges EXACT for GROW
+	// charging; shrink, release, and legacy-retirement proofs
+	// additionally require FENCE CONTINUITY (Codex rounds 19-20):
+	// RangeGen snapshots the base group's summed adoption generation at
+	// park time — after every bump the parking pass itself made — and
+	// loadState re-reads it at the next pass start, before this job
+	// makes any. The job is fleet-unique, so a mismatch proves a
+	// FOREIGN mutation (restore, upload, adoption, delete) landed while
+	// the cursor was parked, and the range is TAINTED: still exact for
+	// grow charging, never a shrink/release/fold proof. A verified
+	// chain of segments is as trustworthy as a single-pass observation
+	// — without it, a base larger than one pass's class allowance could
+	// NEVER prove itself and its legacy covers would be bulk-renewed
+	// forever (round 20, P1). RangeGenOK distinguishes a real snapshot
+	// from a park whose fence read failed (conservatively tainted).
+	RangeBase    string `json:"range_base,omitempty"`
+	RangeStarted bool   `json:"range_started,omitempty"`
+	RangeDirty   bool   `json:"range_dirty,omitempty"`
+	RangeRunning int64  `json:"range_running,omitempty"`
+	RangeGen     int64  `json:"range_gen,omitempty"`
+	RangeGenOK   bool   `json:"range_gen_ok,omitempty"`
+	RangeTainted bool   `json:"range_tainted,omitempty"`
+	// Quota records whether quota enforcement was ON when the cursor
+	// parked (Codex round 17, security): quota-off passes advance the
+	// cursors but skip all cover maintenance, so a cursor parked under
+	// quota-off must not be resumed once enforcement turns on — losses
+	// its traversal already passed were never covered and would wait a
+	// full wrap. loadState resets such cursors to origin. Pre-upgrade
+	// payloads lack the field (reads false): one fresh traversal after
+	// the roll, conservative.
+	Quota bool `json:"quota,omitempty"`
 }
 
-// absentRow is one tracked truly-absent-or-short registry row: everything
-// the refresh needs to re-verify registration and re-settle it, plus its
-// position in the round-robin ring.
-type absentRow struct {
-	repo string
-	id   string // packs keyset component; empty for LFS rows
-	key  string // the row's blob key
-	// bytes is the row's COVERED DEFICIT — its contribution to the base
-	// aggregate: the full registered size for absence, the shortfall for
-	// truncation.
-	bytes int64
-	// registered is the row's authoritative registry size (Codex round
-	// 5, security): re-verification must compare a fresh Stat against
-	// THIS, never against the tracked deficit — a truncated row that
-	// partially heals would otherwise compare physical bytes to the old
-	// shortfall and untrack while bytes are still missing.
-	registered int64
-	pack       bool
-	idx        int // position in refreshRing, maintained by track/untrack
+// rangeTracker follows one rotation's current base range within a pass.
+type rangeTracker struct {
+	class string
+	base  string // "" = no pending range
+	// started: the transition INTO base was observed, so the running
+	// total spans the whole range once the range ends.
+	started bool
+	// dirty: a row of this range failed to settle or charge — the
+	// running total may under-count, so shrink/release must not fire.
+	dirty   bool
+	running int64
+	// resumed: the range was restored from a parked cursor, so segments
+	// of its observation predate this pass (Codex rounds 19-21): the
+	// accumulated total stays EXACT for grow charging, but verdicts
+	// (markCleanBase, shrink, release) never come from it directly —
+	// completion triggers verifyAndJudge, whose FRESH re-observation is
+	// the verdict authority (out-of-band byte loss in a park gap is
+	// invisible to any DB fence).
+	resumed bool
+	// tainted: the range's observation lost fence continuity across a
+	// park gap (Codex rounds 19-20): a foreign mutation bumped the base
+	// group's adoption generation while the cursor was parked, or the
+	// fence could not be read/written. Still exact for grow charging,
+	// but not even a verification trigger — the group demonstrably
+	// changed, so the next traversal re-observes from scratch.
+	tainted bool
 }
 
-// NewAbsenceReconciler wires the reconciliation job.
-func NewAbsenceReconciler(registry AbsenceRegistry, blobs BlobStatter, quotaEnforced bool, budget int64, coverTTL time.Duration, logger *slog.Logger) *AbsenceReconciler {
+// absenceIncarnationKey builds the deterministic aggregate cover key for
+// one (base, class) incarnation. The zero-padded number makes byte order
+// numeric order, so "highest live incarnation" is a suffix-ordered lookup.
+func absenceIncarnationKey(base, class string, n int64) string {
+	assertf(base != "" && (class == absenceClassLFS || class == absenceClassPacks) && n >= 1,
+		"absenceIncarnationKey(%q, %q, %d)", base, class, n)
+	return absenceIncarnationPrefix(base, class) + fmt.Sprintf("%019d", n)
+}
+
+// absenceIncarnationPrefix is the shared prefix of one (base, class)'s
+// incarnation keys.
+func absenceIncarnationPrefix(base, class string) string {
+	return ref.AbsenceCoverPrefix + base + "/" + class + "-e"
+}
+
+// parseAbsenceCoverKey classifies a listed synthetic cover key:
+// class/incarnation for this design's keys; legacy=true for any other
+// segment spelling under the prefix (pre-#125 nonce keys).
+func parseAbsenceCoverKey(key string) (base, class string, n int64, legacy, ok bool) {
+	rest, found := strings.CutPrefix(key, ref.AbsenceCoverPrefix)
+	if !found {
+		return "", "", 0, false, false
+	}
+	i := strings.LastIndexByte(rest, '/')
+	if i <= 0 || i == len(rest)-1 {
+		return "", "", 0, false, false
+	}
+	base, seg := rest[:i], rest[i+1:]
+	for _, c := range []string{absenceClassLFS, absenceClassPacks} {
+		if digits, found := strings.CutPrefix(seg, c+"-e"); found && len(digits) == 19 {
+			v, err := strconv.ParseInt(digits, 10, 64)
+			if err == nil && v >= 1 {
+				return base, c, v, false, true
+			}
+		}
+	}
+	return base, "", 0, true, true // legacy or foreign segment: renew-then-retire class
+}
+
+// NewAbsenceReconciler wires the reconciliation job. interval is the
+// scheduling cadence between passes: the admission fence's lapse safety
+// bound must cover the time until the NEXT renewal attempt (Codex round
+// 27 on PR #132), not just the current pass.
+func NewAbsenceReconciler(registry AbsenceRegistry, blobs BlobStatter, quotaEnforced bool, budget int64, coverTTL, interval time.Duration, logger *slog.Logger) *AbsenceReconciler {
 	assertf(registry != nil, "NewAbsenceReconciler: nil registry")
 	assertf(blobs != nil, "NewAbsenceReconciler: nil blob statter")
 	assertf(budget > 0, "NewAbsenceReconciler: non-positive budget %d", budget)
 	assertf(coverTTL > 0, "NewAbsenceReconciler: non-positive cover TTL %v", coverTTL)
+	assertf(interval > 0, "NewAbsenceReconciler: non-positive interval %v", interval)
 	assertf(logger != nil, "NewAbsenceReconciler: nil logger")
 	passTimeout := absencePassTimeout
 	if quarter := coverTTL / 4; quarter < passTimeout {
 		passTimeout = quarter // see absencePassTimeout: renewal gap ≤ TTL
 	}
+	staleAge := coverTTL - passTimeout
+	assertf(staleAge > 0, "NewAbsenceReconciler: non-positive cursor stale bound %v", staleAge)
+	// A renewal failure is provably harmless only while the last
+	// successful touch is fresh enough that covers survive until the
+	// NEXT attempt even if this one accomplished nothing: the next
+	// touch lands within interval (cadence) + passTimeout (a coalesced
+	// tick waiting out a running pass) of the failure (Codex round 27:
+	// bounding by the current pass alone left a gap — at the documented
+	// maximum interval of TTL/2 a failure at age TTL/2 stayed unfenced,
+	// and by the next attempt the covers were already past the TTL,
+	// where the strict-TTL bulk touch cannot resurrect them). The
+	// watermark additionally TRAILS the touch it records by up to one
+	// more pass (Codex round 38, security — the failure-path twin of
+	// the success path's cursorStaleAge, round 32: the touch and the
+	// stamp are separate statements under the pass deadline, so the
+	// observed age under-reports the covers' true age by up to
+	// passTimeout). The bound subtracts all three. At the documented
+	// configuration maximum (interval TTL/2, pass wall clock TTL/4) it
+	// collapses to zero and EVERY failure arms — the honest answer:
+	// no failure is provably harmless there.
+	renewalSafeAge := coverTTL - interval - 2*passTimeout
+	assertf(renewalSafeAge >= 0,
+		"NewAbsenceReconciler: interval %v + twice the pass timeout %v must not exceed cover TTL %v", interval, passTimeout, coverTTL)
 	return &AbsenceReconciler{
-		registry:      registry,
-		blobs:         blobs,
-		quotaEnforced: quotaEnforced,
-		budget:        budget,
-		coverTTL:      coverTTL,
-		logger:        logger,
-		passTimeout:   passTimeout,
-		knownAbsent:   make(map[string]*absentRow),
-		absentBases:   make(map[string]*absentBase),
+		registry:       registry,
+		blobs:          blobs,
+		quotaEnforced:  quotaEnforced,
+		budget:         budget,
+		coverTTL:       coverTTL,
+		logger:         logger,
+		passTimeout:    passTimeout,
+		cursorStaleAge: staleAge,
+		renewalSafeAge: renewalSafeAge,
+		proofCap:       absenceProofCap,
 	}
 }
 
@@ -303,53 +597,535 @@ type absencePassState struct {
 	purged      map[string]bool // memoized purge-fence probes
 	probeFailed map[string]bool // probe errored: reported once, fence deferred to the reserve
 	coverSkip   map[string]bool // one cover denial skips the base for the rest of the pass
-	settled     map[string]bool // rows settled this pass: the rotation skips refresh-visited rows
-	// baseCovered memoizes the aggregate (gen, bytes) charged per base
-	// this pass: renewal and every discovery re-charge would otherwise
-	// mint one upsert per absent row. A gen rotation or byte growth
-	// re-charges.
-	baseCovered map[string]coveredAggregate
-	// overflowKeys/overflowBytes aggregate UNTRACKED losses (beyond the
-	// base capacity or memory cap) into one pass-scoped cover row per
-	// base (Codex round 7, security): per-row one-shot covers would
-	// re-collide with the per-base reservation-row cap on a huge
-	// single-base loss. Pass-scoped keys are GREATEST-safe — a pass's
-	// running total only grows — and each expires by TTL, bounding the
-	// row population at TTL/interval rows per overflow base.
-	overflowKeys  map[string]string
-	overflowBytes map[string]int64
-	// rotated coalesces shrink-driven key rotations to one fresh
-	// incarnation per base per pass (Codex round 8).
-	rotated map[string]bool
-}
-
-// coveredAggregate is one pass's per-base charge memo.
-type coveredAggregate struct {
-	key   string
-	bytes int64
 }
 
 func newAbsencePassState() *absencePassState {
 	return &absencePassState{
-		purged:        make(map[string]bool),
-		probeFailed:   make(map[string]bool),
-		coverSkip:     make(map[string]bool),
-		settled:       make(map[string]bool),
-		baseCovered:   make(map[string]coveredAggregate),
-		overflowKeys:  make(map[string]string),
-		overflowBytes: make(map[string]int64),
-		rotated:       make(map[string]bool),
+		purged:      make(map[string]bool),
+		probeFailed: make(map[string]bool),
+		coverSkip:   make(map[string]bool),
 	}
 }
 
-// Run executes one bounded reconciliation pass. Order (Codex round 1):
-// the known-absent set is re-settled FIRST — keeping already-discovered
-// losses covered is the correctness core and must not wait on the
-// rotation — then the two registry rotations split the remaining budget.
-// The leading rotation alternates between passes: a twin probe can
-// overdraw the leader's allocation by one unit, and at degenerate budgets
-// a fixed order would starve the trailing table forever; alternation
-// guarantees each table leads every other pass.
+// loadState restores the durable cursors and renewal bookkeeping and
+// resets the per-pass scratch. A missing or undecodable row degrades to a
+// fresh scan — cursors are bookkeeping, never authority.
+func (r *AbsenceReconciler) loadState(ctx context.Context, errs *boundedErrs) {
+	r.lfs, r.packs = absenceCursorState{}, absenceCursorState{}
+	r.renewCursor, r.passes = "", 0
+	r.liveCovers = map[string]map[string]liveCover{
+		absenceClassLFS:   make(map[string]liveCover),
+		absenceClassPacks: make(map[string]liveCover),
+	}
+	r.renewalComplete = false
+	r.lfsRange = rangeTracker{class: absenceClassLFS}
+	r.packsRange = rangeTracker{class: absenceClassPacks}
+	r.legacyRows = nil
+	r.legacyBases = make(map[string]bool)
+	r.cleanBases = map[string]map[string]bool{
+		absenceClassLFS:   make(map[string]bool),
+		absenceClassPacks: make(map[string]bool),
+	}
+	r.proofGens = make(map[string]map[string]absenceProofEntry)
+	r.verifyPool = r.budget
+	r.foldAttempted = make(map[string]bool)
+	r.touchFailed = false
+	r.lfsLoaded, r.packsLoaded, r.fenceLoaded = true, true, true
+	for _, c := range []struct {
+		scope  string
+		into   *absenceCursorState
+		loaded *bool
+	}{{ref.ScanScopeAbsenceLFS, &r.lfs, &r.lfsLoaded}, {ref.ScanScopeAbsencePacks, &r.packs, &r.packsLoaded}} {
+		st, ok, err := r.registry.GetJobScanState(ctx, ref.ScanJobAbsence, c.scope)
+		if err != nil {
+			errs.add(fmt.Errorf("absence reconcile: read %s cursor: %w", c.scope, err))
+			*c.loaded = false
+			continue
+		}
+		if !ok {
+			continue
+		}
+		if err := json.Unmarshal([]byte(st.Payload), c.into); err != nil {
+			// Undecodable bookkeeping (never written by this binary):
+			// fresh scan, loudly.
+			*c.into = absenceCursorState{}
+			r.logger.Warn("absence reconcile: discarding undecodable cursor state", "scope", c.scope, "err", err)
+			continue
+		}
+		if !r.quotaEnforced {
+			continue // nothing consults covers: any resume point serves detection
+		}
+		// A resumed cursor must prove the covers it left behind are still
+		// standing (Codex round 17, security): a fleet pause longer than
+		// the cover TTL expires covers — the pass-start bulk touch
+		// rightly refuses to resurrect them — so the losses they
+		// compensated are uncovered, and resuming mid-keyspace would
+		// leave them undiscovered until the traversal wraps while
+		// admission spends the reopened headroom. Both staleness (the
+		// cursor row's DB-clock age outliving the renewal guarantee) and
+		// a quota-off parking (cover maintenance was skipped entirely)
+		// reset the rotation to origin: strictly a fairness cost.
+		reason := ""
+		if !c.into.Quota {
+			reason = "cursor parked while quota enforcement was off"
+		} else if age, live, err := r.registry.JobScanStateAge(ctx, ref.ScanJobAbsence, c.scope); err != nil {
+			errs.add(fmt.Errorf("absence reconcile: read %s cursor age: %w", c.scope, err))
+			reason = "cursor age unreadable"
+		} else if !live || age >= r.cursorStaleAge {
+			reason = "cursor outlived the cover-renewal guarantee"
+		}
+		if reason != "" {
+			// Restart the POSITION only: the lifetime traversal counters
+			// survive (Codex round 31, P1). An armed admission fence
+			// snapshots those counters at arming — discarding them here
+			// would leave settleAdmissionFence comparing a restart-at-zero
+			// count against the old snapshot, blocking finite quota
+			// admissions for as many extra rotations as the job ever
+			// completed. Preserving them is safe in the fail-closed
+			// direction: release still requires the CLEAN counter to
+			// advance past the snapshot, and advancing it takes a complete
+			// error-free rotation from the origin this reset parks at.
+			*c.into = absenceCursorState{
+				Traversals:      c.into.Traversals,
+				CleanTraversals: c.into.CleanTraversals,
+				HasClean:        c.into.HasClean,
+			}
+			r.logger.Warn("absence reconcile: restarting rotation from origin", "scope", c.scope, "reason", reason)
+			continue
+		}
+		// Fence continuity for the parked range (Codex round 20, P1):
+		// this runs BEFORE the pass makes any generation bump of its
+		// own, and the park snapshot ran AFTER the previous pass's last
+		// — the job is fleet-unique, so the window between them is
+		// exactly the parked gap, and a mismatch proves a FOREIGN
+		// mutation. A verified resume keeps the range proof-eligible:
+		// a base larger than one pass's class allowance can only ever
+		// complete resumed, and a blanket denial would bulk-renew its
+		// legacy covers forever. Taint is sticky until the range ends.
+		if c.into.RangeStarted && !c.into.RangeTainted {
+			reason := ""
+			if !c.into.RangeGenOK {
+				reason = "range parked without a fence snapshot"
+			} else if gen, err := r.rangeFence(ctx, c.into.RangeBase); err != nil {
+				errs.add(fmt.Errorf("absence reconcile: read %s range fence: %w", c.scope, err))
+				reason = "range fence unreadable"
+			} else if gen != c.into.RangeGen {
+				reason = "base group mutated while parked"
+			}
+			if reason != "" {
+				c.into.RangeTainted = true
+				r.logger.Info("absence reconcile: pending range tainted", "scope", c.scope, "base", c.into.RangeBase, "reason", reason)
+			}
+		}
+	}
+	if st, ok, err := r.registry.GetJobScanState(ctx, ref.ScanJobAbsence, ref.ScanScopeAbsenceRenewal); err != nil {
+		errs.add(fmt.Errorf("absence reconcile: read renewal cursor: %w", err))
+	} else if ok {
+		r.renewCursor, r.passes = st.Payload, st.Generation
+	}
+	// Mirror the durable admission-fence marker (Codex round 26,
+	// security): its payload is the traversal snapshot at arming. An
+	// unreadable or undecodable snapshot re-anchors at the CURRENT
+	// persisted counters — requiring a fresh full rotation from here,
+	// strictly the conservative direction.
+	r.fenceArmed, r.fenceLFS, r.fencePacks = false, 0, 0
+	if st, ok, err := r.registry.GetJobScanState(ctx, ref.ScanJobAbsence, ref.ScanScopeAbsenceAdmissionFence); err != nil {
+		errs.add(fmt.Errorf("absence reconcile: read admission fence: %w", err))
+		r.fenceLoaded = false
+	} else if ok {
+		r.fenceArmed = true
+		r.fenceLFS, r.fencePacks = r.lfs.CleanTraversals, r.packs.CleanTraversals
+		var snap map[string]int64
+		if err := json.Unmarshal([]byte(st.Payload), &snap); err == nil {
+			// Accept only a complete non-negative snapshot (Codex round
+			// 33): a fence armed while cursor reads were failing wrote
+			// the UNKNOWN sentinel (-1), and missing keys decode as
+			// zero — both would let stale-but-large reloaded counters
+			// settle instantly. The default above re-anchors at the
+			// counters just loaded: release requires a fresh clean
+			// rotation from here, strictly the conservative direction.
+			lfs, lok := snap["lfs"]
+			packs, pok := snap["packs"]
+			if lok && pok && lfs >= 0 && packs >= 0 {
+				r.fenceLFS, r.fencePacks = lfs, packs
+			}
+		}
+	}
+	r.loadProofs(ctx, errs)
+}
+
+// loadProofs restores persisted per-class fold candidacies (Codex rounds
+// 21+24): a class's fenced completion for a base waits durably until the
+// counterpart class completes — their rotations traverse independent
+// populations and can stay out of phase indefinitely, so requiring both
+// to land in one pass would leave both-class-large bases permanently
+// unprovable. Each entry re-validates against the CURRENT group
+// generation at pass start, before this pass makes any bump of its own:
+// the persisted gen was snapshotted at a previous pass's end, so a
+// mismatch proves a foreign mutation landed in between and the candidacy
+// is dropped (re-proven by a later traversal). Surviving entries are
+// scheduling hints ONLY — they never seed cleanBases, because the park
+// gap they span is invisible to any DB fence (out-of-band byte loss has
+// no DB event, and an old worker's nonce recharge lists as ordinary
+// liveness): fold re-stats every hinted class fresh before retiring
+// anything.
+func (r *AbsenceReconciler) loadProofs(ctx context.Context, errs *boundedErrs) {
+	if !r.quotaEnforced {
+		return
+	}
+	st, ok, err := r.registry.GetJobScanState(ctx, ref.ScanJobAbsence, ref.ScanScopeAbsenceProofs)
+	if err != nil {
+		errs.add(fmt.Errorf("absence reconcile: read proof state: %w", err))
+		return
+	}
+	if !ok || st.Payload == "" {
+		return
+	}
+	var stored map[string]map[string]absenceProofEntry
+	if err := json.Unmarshal([]byte(st.Payload), &stored); err != nil {
+		r.logger.Warn("absence reconcile: discarding undecodable proof state", "err", err)
+		return
+	}
+	for base, classes := range stored {
+		if base == "" {
+			continue
+		}
+		gen, err := r.rangeFence(ctx, base)
+		if err != nil {
+			// Unverifiable: dropped, re-proven by a later traversal.
+			errs.add(fmt.Errorf("absence reconcile: validate proof fence for %s: %w", base, err))
+			continue
+		}
+		for class, entry := range classes {
+			if class != absenceClassLFS && class != absenceClassPacks {
+				continue
+			}
+			if entry.Gen != gen {
+				r.logger.Info("absence reconcile: persisted proof invalidated",
+					"base", base, "class", class, "reason", "base group mutated since the proof")
+				continue
+			}
+			if r.proofGens[base] == nil {
+				r.proofGens[base] = make(map[string]absenceProofEntry)
+			}
+			r.proofGens[base][class] = absenceProofEntry{Gen: entry.Gen}
+		}
+	}
+}
+
+// absenceProofEntry is one persisted (base, class) fold candidacy: the
+// group generation the class's evidence was fenced at. It schedules a
+// commitment-time fresh re-verification and is never itself evidence
+// (Codex round 24) — the fence bounds retention (a mutated group evicts
+// the hint at load), not trust.
+type absenceProofEntry struct {
+	Gen int64 `json:"gen"`
+}
+
+// saveState parks the durable cursors on a bounded DETACHED context: the
+// pass regularly ends by burning its own deadline, and losing the park
+// replays this pass's segment (bounded transient over-cover: replayed
+// totals are recomputed from scratch, never compounded).
+func (r *AbsenceReconciler) saveState(ctx context.Context, errs *boundedErrs) {
+	sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), scanStateWriteTimeout)
+	defer cancel()
+	if r.touchFailed && r.quotaEnforced {
+		// The bulk cover renewal failed this pass (Codex round 19, P1):
+		// re-stamping the advanced rotation cursors would refresh the
+		// loadState freshness proof ("the covers behind this cursor were
+		// renewed within passTimeout of its stamp") without refreshing
+		// the covers. Leave the previous rows aging instead — a repeat
+		// failure trips the stale-age reset, and this pass's segment is
+		// merely re-examined (idempotent same-key charges).
+		r.logger.Warn("absence reconcile: bulk renewal failed; rotation cursors not re-stamped")
+	} else {
+		for _, c := range []struct {
+			scope  string
+			from   *absenceCursorState
+			loaded bool
+		}{{ref.ScanScopeAbsenceLFS, &r.lfs, r.lfsLoaded}, {ref.ScanScopeAbsencePacks, &r.packs, r.packsLoaded}} {
+			if !c.loaded {
+				// The load ERROR left this class's in-memory state at
+				// zero values (Codex round 33): stamping it would
+				// destroy the durable lifetime traversal counters an
+				// armed fence's snapshot is compared against —
+				// re-blocking admissions for as many extra rotations as
+				// the job ever completed. Leave the old row aging: this
+				// pass's segment was an idempotent re-examination, and
+				// repeated failures trip the stale-age reset, which
+				// preserves the counters.
+				r.logger.Warn("absence reconcile: cursor unreadable this pass; not re-stamped", "scope", c.scope)
+				continue
+			}
+			c.from.Quota = r.quotaEnforced // see absenceCursorState.Quota
+			// Snapshot the fence WITH the park (Codex round 20): read
+			// after every generation bump this pass made, so only a
+			// foreign mutation inside the parked gap can move it. An
+			// unreadable fence parks without one — the resume taints,
+			// strictly a deferral.
+			c.from.RangeGen, c.from.RangeGenOK = 0, false
+			if c.from.RangeStarted && !c.from.RangeTainted && r.quotaEnforced {
+				if gen, err := r.rangeFence(sctx, c.from.RangeBase); err != nil {
+					errs.add(fmt.Errorf("absence reconcile: snapshot %s range fence: %w", c.scope, err))
+				} else {
+					c.from.RangeGen, c.from.RangeGenOK = gen, true
+				}
+			}
+			payload, err := json.Marshal(c.from)
+			assertf(err == nil, "absence reconcile: marshal %s cursor: %v", c.scope, err)
+			if err := r.registry.PutJobScanState(sctx, ref.ScanJobAbsence, c.scope, string(payload), 0); err != nil {
+				errs.add(fmt.Errorf("absence reconcile: park %s cursor: %w", c.scope, err))
+			}
+		}
+	}
+	if err := r.registry.PutJobScanState(sctx, ref.ScanJobAbsence, ref.ScanScopeAbsenceRenewal, r.renewCursor, r.passes); err != nil {
+		errs.add(fmt.Errorf("absence reconcile: park renewal cursor: %w", err))
+	}
+	r.saveProofs(sctx, errs)
+}
+
+// absenceProofCap bounds the persisted half-proof payload: entries exist
+// only for bases with live legacy nonces awaiting retirement, a
+// population that shrinks to zero as folds proceed. Overflow drops the
+// byte-largest bases (loudly) — strictly a retirement deferral.
+const absenceProofCap = 512
+
+// saveProofs persists per-base fold candidacies for the next pass (Codex
+// rounds 21+24): every base with an un-folded legacy nonce recorded this
+// pass carries forward each class holding either FRESH same-pass
+// evidence or a surviving seeded hint. EVERY carried class is
+// re-snapshotted under a fence read here, after every bump this pass
+// made, so the next load-time validation covers exactly the parked gap —
+// seeded hints included (Codex round 25): the pass's own renewal
+// re-charge bumps the group generation every pass for bases holding live
+// deterministic covers (chargeCover pairs each charge with a generation
+// bump), so retaining a seeded entry's original fence would self-expire
+// the candidacy after one carry and out-of-phase completions more than
+// one pass apart could never converge. Re-snapshotting is sound because
+// a candidacy is scheduling-only (round 24): commitment evidence always
+// comes from the fold-time re-stat, never the fence. Candidacies only
+// schedule commitment-time re-verification — fold re-stats every hinted
+// class before retiring anything. Bases whose fold succeeded still
+// persist (the entry evicts next pass with the listing); a CAS miss
+// means a re-charge won and the re-stat repeats. Bases with no live
+// nonce need no candidacy. When the renewal listing did not complete,
+// this pass's legacyRows are not authoritative — previously persisted
+// bases are retained rather than dropped blind.
+func (r *AbsenceReconciler) saveProofs(sctx context.Context, errs *boundedErrs) {
+	if !r.quotaEnforced {
+		return
+	}
+	bases := make(map[string]bool, len(r.legacyRows))
+	for i := range r.legacyRows {
+		bases[r.legacyRows[i].Base] = true
+	}
+	if !r.renewalComplete {
+		for base := range r.proofGens {
+			bases[base] = true
+		}
+	}
+	// Deterministic seeded-first retention past the cap (Codex round 33,
+	// P2): a previously seeded candidacy survives until consumed or
+	// invalidated — every fold frees a slot, so waiting fresh bases
+	// eventually seed — and fresh candidacies fill the remainder in byte
+	// order. An unordered map walk gave no such guarantee: a base's
+	// half-proof could be evicted before its counterpart rotation
+	// completed, bulk-renewing its legacy nonce forever.
+	seededBases := make([]string, 0, len(bases))
+	freshBases := make([]string, 0, len(bases))
+	for base := range bases {
+		if len(r.proofGens[base]) > 0 {
+			seededBases = append(seededBases, base)
+		} else {
+			freshBases = append(freshBases, base)
+		}
+	}
+	sort.Strings(seededBases)
+	sort.Strings(freshBases)
+	keep := make(map[string]map[string]absenceProofEntry)
+	for _, base := range append(seededBases, freshBases...) {
+		carried := make([]string, 0, 2)
+		for _, class := range []string{absenceClassLFS, absenceClassPacks} {
+			if _, seeded := r.proofGens[base][class]; seeded || r.cleanBases[class][base] {
+				carried = append(carried, class)
+			}
+		}
+		if len(carried) == 0 {
+			continue // nothing to carry
+		}
+		if len(keep) >= r.proofCap {
+			// Deterministic order makes the first overflow final: every
+			// later base sorts past the cap too.
+			r.logger.Warn("absence reconcile: candidacy cap exceeded; excess FRESH entries deferred to later rotations",
+				"cap", r.proofCap)
+			break
+		}
+		gen, err := r.rangeFence(sctx, base)
+		if err != nil {
+			errs.add(fmt.Errorf("absence reconcile: snapshot proof fence for %s: %w", base, err))
+			continue
+		}
+		entry := make(map[string]absenceProofEntry, len(carried))
+		for _, class := range carried {
+			entry[class] = absenceProofEntry{Gen: gen}
+		}
+		keep[base] = entry
+	}
+	payload := ""
+	if len(keep) > 0 {
+		b, err := json.Marshal(keep)
+		assertf(err == nil, "absence reconcile: marshal proof state: %v", err)
+		payload = string(b)
+	}
+	if err := r.registry.PutJobScanState(sctx, ref.ScanJobAbsence, ref.ScanScopeAbsenceProofs, payload, 0); err != nil {
+		errs.add(fmt.Errorf("absence reconcile: park proof state: %w", err))
+	}
+}
+
+// armAdmissionFence writes the durable admission-fence marker when a
+// bulk-renewal failure can no longer be proven harmless (Codex round 26,
+// security): if the renewal-health watermark is absent or older than the
+// cover-lapse safety bound (renewalSafeAge — TTL minus the cadence to
+// the next attempt minus twice the pass wall clock: the wasted attempt,
+// Codex round 27, and the stamp trailing its touch, round 38),
+// live covers may lapse un-renewed before the next successful pass, and
+// strict-TTL admission queries would silently under-count them —
+// reopening the exact quota headroom the covers exist to close. The
+// marker fails finite quota-gated admissions closed (see
+// ReserveDecision.RenewalDegraded) until settleAdmissionFence proves a
+// complete recovery rotation. Its payload snapshots the PERSISTED class
+// CLEAN traversal counters — frozen during failing passes because
+// saveState suppresses cursor stamps, and never advanced by dirty or
+// quota-off rotations (Codex round 31) — so wraps completed while
+// renewal was still failing can never count as recovery. Writes run on
+// a bounded detached context: the failure being reacted to may already
+// have burned the pass deadline. An unreadable watermark age arms too —
+// the failure evidence at hand outranks an unprovable freshness claim.
+func (r *AbsenceReconciler) armAdmissionFence(ctx context.Context, errs *boundedErrs) {
+	if !r.quotaEnforced {
+		return
+	}
+	sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), scanStateWriteTimeout)
+	defer cancel()
+	age, ok, err := r.registry.JobScanStateAge(sctx, ref.ScanJobAbsence, ref.ScanScopeAbsenceRenewalHealth)
+	if err != nil {
+		errs.add(fmt.Errorf("absence reconcile: read renewal health: %w", err))
+	} else if ok && age < r.renewalSafeAge {
+		// Strictly less (Codex round 27, security): at age == bound the
+		// next attempt can land exactly at the TTL boundary, where the
+		// strict-TTL bulk update already excludes the row.
+		return // renewed recently: covers survive until the NEXT attempt
+	}
+	r.armFence(ctx, errs, "cover renewal degraded past the lapse safety bound")
+}
+
+// armFence durably arms the admission fence and reports whether the
+// write proved durable (see armAdmissionFence for the failure-path
+// judgment and renewCovers for the success-path continuity check, Codex
+// rounds 29-30). Idempotent: re-arming refreshes the traversal snapshot
+// to the current persisted counters, which only extends the required
+// recovery rotation — the conservative direction. Writes run on a
+// bounded detached context.
+func (r *AbsenceReconciler) armFence(ctx context.Context, errs *boundedErrs, why string) bool {
+	sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), scanStateWriteTimeout)
+	defer cancel()
+	lfsSnap, packsSnap := r.lfs.CleanTraversals, r.packs.CleanTraversals
+	switch {
+	case !r.lfsLoaded || !r.packsLoaded || !r.fenceLoaded:
+		// A failed cursor or fence-row read left the in-memory counters
+		// untrustworthy (Codex round 33, P1): snapshotting them — or
+		// overwriting an unreadable existing snapshot — could LOWER the
+		// baseline and let the next healthy pass settle instantly. Arm
+		// with the UNKNOWN sentinel instead; the next successful load
+		// re-anchors at its freshly loaded counters. Settlement this
+		// pass is impossible regardless: the failed read already made
+		// errs non-ok, which settleAdmissionFence requires.
+		assertf(!errs.ok(), "armFence: unknown snapshot without a recorded load error")
+		lfsSnap, packsSnap = -1, -1
+	case r.fenceArmed:
+		// Never lower an existing snapshot: re-arming only extends the
+		// required recovery rotation.
+		lfsSnap, packsSnap = max(lfsSnap, r.fenceLFS), max(packsSnap, r.fencePacks)
+	}
+	snap, mErr := json.Marshal(map[string]int64{"lfs": lfsSnap, "packs": packsSnap})
+	assertf(mErr == nil, "absence reconcile: marshal fence snapshot: %v", mErr)
+	// The dedicated arm seam serializes with in-flight finite admissions
+	// (Codex round 35, security) — see AbsenceRegistry.
+	if err := r.registry.ArmAbsenceAdmissionFence(sctx, string(snap)); err != nil {
+		errs.add(fmt.Errorf("absence reconcile: arm admission fence: %w", err))
+		return false
+	}
+	r.fenceArmed, r.fenceLFS, r.fencePacks = true, lfsSnap, packsSnap
+	r.logger.Warn("absence reconcile: "+why+" — finite quota admissions fenced until a complete recovery rotation",
+		"lfs_clean_traversals", lfsSnap, "packs_clean_traversals", packsSnap)
+	return true
+}
+
+// settleAdmissionFence clears the admission fence after one healthy,
+// error-free pass has advanced BOTH persisted class CLEAN traversal
+// counters past the marker's arming snapshot: a full origin-to-origin
+// rotation of each registry that hit no stat or cover error re-covered
+// every registered-but-missing byte the lapse may have uncovered (dirty
+// ranges charge deficits as they go), so strict-TTL admission arithmetic
+// is trustworthy again. A rotation any contributing pass dirtied never
+// counts (Codex round 31, P1): the failed row was neither verified nor
+// covered, and Dirty rides the persisted cursor across passes and
+// workers precisely so a later error-free pass cannot launder it. Runs
+// after saveState so the compared counters are the durably stamped ones.
+func (r *AbsenceReconciler) settleAdmissionFence(ctx context.Context, errs *boundedErrs) {
+	if !r.fenceArmed || !r.quotaEnforced || r.touchFailed || !errs.ok() {
+		return
+	}
+	if r.lfs.CleanTraversals <= r.fenceLFS || r.packs.CleanTraversals <= r.fencePacks {
+		return // clean recovery rotation not yet complete: stay fail-closed
+	}
+	sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), scanStateWriteTimeout)
+	defer cancel()
+	if err := r.registry.DeleteJobScanState(sctx, ref.ScanJobAbsence, ref.ScanScopeAbsenceAdmissionFence); err != nil {
+		errs.add(fmt.Errorf("absence reconcile: clear admission fence: %w", err))
+		return
+	}
+	// The recovery rotation consumed the lapse evidence too (Codex round
+	// 33): every loss the GC'd covers compensated was rediscovered and
+	// re-covered. A failed delete only leaves the marker for the next
+	// settle — first-stamp arming never fires again once health exists.
+	if err := r.registry.DeleteJobScanState(sctx, ref.ScanJobAbsence, ref.ScanScopeAbsenceLapse); err != nil {
+		errs.add(fmt.Errorf("absence reconcile: clear lapse-evidence marker: %w", err))
+	}
+	r.fenceArmed = false
+	r.logger.Info("absence reconcile: recovery rotation complete — admission fence cleared")
+}
+
+// rangeFence reads the mutation fence for one base's pending range: the
+// base group's summed shared adoption generation (the same group every
+// cover charge pins). Every DB-visible mutation that could change a
+// base's registered rows or their compensation — restores, uploads,
+// adoptions, retirements, cover lifecycle — bumps a member's generation,
+// so an unchanged sum across a park gap proves the group was quiescent
+// while no segment was watching (Codex round 20 on PR #132).
+// Out-of-band byte loss has no DB event and is invisible to ANY fence;
+// it carries the same accepted residual as a loss striking mid-pass
+// behind an in-pass cursor: rediscovered and re-covered by the next
+// traversal.
+func (r *AbsenceReconciler) rangeFence(ctx context.Context, base string) (int64, error) {
+	assertf(base != "", "rangeFence: empty base")
+	var sum int64
+	for _, repo := range blob.QuotaRepoGroup(base) {
+		gen, err := r.registry.LFSAdoptionGen(ctx, repo)
+		if err != nil {
+			return 0, err
+		}
+		assertf(gen >= 0, "rangeFence: negative generation %d for %s", gen, repo)
+		sum += gen
+	}
+	return sum, nil
+}
+
+// Run executes one bounded reconciliation pass. Order (Codex round 1 on
+// PR #123): cover RENEWAL first — keeping already-discovered losses
+// covered is the correctness core and must not wait on the rotation —
+// then the two registry rotations split the remaining budget, leading
+// class alternating between passes.
 func (r *AbsenceReconciler) Run(ctx context.Context) (AbsenceReport, error) {
 	report := AbsenceReport{QuotaEnforced: r.quotaEnforced}
 	assertf(r.passTimeout > 0, "Run: non-positive pass timeout %v", r.passTimeout)
@@ -357,13 +1133,38 @@ func (r *AbsenceReconciler) Run(ctx context.Context) (AbsenceReport, error) {
 	defer cancelPass()
 	var errs boundedErrs
 	st := newAbsencePassState()
-	// The refresh gets at most half the budget so a large tracked set
-	// cannot starve discovery entirely; while 3×tracked stays within that
-	// half every tracked cover refreshes every pass (map order randomizes
-	// which entries wait when it does not).
-	remaining := r.budget - r.refreshKnownAbsent(ctx, r.budget-r.budget/2, &report, st, &errs)
-	if remaining < 0 {
-		remaining = 0
+	r.loadState(ctx, &errs)
+	// The renewal is ALLOCATED half the budget but always offers the full
+	// listing (a bounded round-robin would lapse covers); discovery gets
+	// a GUARANTEED floor of the other half regardless of the overrun
+	// (Codex round 14, security): with the bulk touch keeping every live
+	// cover fresh, a cover population at or beyond the budget would
+	// otherwise clamp the rotation allowance to zero on every pass — an
+	// absorbing state where further losses stay uncovered indefinitely.
+	// The pass wall clock (TTL/4) bounds total work either way;
+	// RenewalOverBudget flags the sizing problem loudly.
+	remaining := r.budget - r.renewCovers(ctx, r.budget-r.budget/2, &report, st, &errs)
+	if floor := r.budget / 2; remaining < floor {
+		remaining = floor
+	}
+	// Hint-driven candidacies fold FIRST (Codex round 25, security):
+	// the fold-time re-stat is pool-unbounded but wall-clock-bounded
+	// and non-resumable — same-pass evidence only (round 24), so
+	// durable partial verification progress is not an option — and
+	// running it after the rotations would let them consume the pass
+	// deadline every pass, starving a large base's re-stat forever.
+	// Same-pass fresh completions fold in the second invocation below.
+	// EXCEPT while the admission fence is armed (Codex round 33,
+	// security): the run-to-completion re-stat can burn the whole pass
+	// deadline on one large base, and a rotation that never gets the
+	// clock never advances the CLEAN traversal counters the fence's
+	// settlement gates on — a fleet-global denial of finite quota-gated
+	// writes that outlives the pass. Folding is strictly a retirement
+	// deferral (hints persist seeded-first, nonces keep renewing), so
+	// fenced passes give recovery the entire deadline and fold again
+	// once the fence settles.
+	if !r.fenceArmed {
+		r.foldRedundantLegacy(ctx, &report, st, &errs)
 	}
 	half := remaining - remaining/2
 	if r.passes%2 == 0 {
@@ -373,8 +1174,20 @@ func (r *AbsenceReconciler) Run(ctx context.Context) (AbsenceReport, error) {
 		charged := r.packPhase(ctx, half, &report, st, &errs)
 		r.lfsPhase(ctx, remaining-charged, &report, st, &errs)
 	}
+	// Retire legacy nonce covers whose base both rotations' proofs
+	// completed THIS pass (Codex rounds 19-20) — after the phases, so
+	// every proof is in. (Second invocation: the pass-level attempted
+	// memo keeps the two from re-statting the same class twice.) Fenced
+	// passes skip this one too (round 33): its hint re-stats would burn
+	// deadline a fenced pass owes to nothing but recovery, and a fence
+	// armed mid-pass by renewCovers must not fold on the way out either.
+	if !r.fenceArmed {
+		r.foldRedundantLegacy(ctx, &report, st, &errs)
+	}
 	r.passes++
-	report.AbsentTracked = int64(len(r.knownAbsent))
+	r.saveState(ctx, &errs)
+	r.settleAdmissionFence(ctx, &errs)
+	report.LFSTraversals, report.PackTraversals = r.lfs.Traversals, r.packs.Traversals
 	r.logger.Info("absence reconcile pass finished",
 		"lfs_rows_examined", report.LFSRowsExamined,
 		"pack_rows_examined", report.PackRowsExamined,
@@ -389,225 +1202,437 @@ func (r *AbsenceReconciler) Run(ctx context.Context) (AbsenceReport, error) {
 		"cover_errors", report.CoverErrors,
 		"stat_errors", report.StatErrors,
 		"rows_skipped_purged", report.RowsSkippedPurged,
-		"absent_tracked", report.AbsentTracked,
-		"absent_refreshed", report.AbsentRefreshed,
-		"absent_untracked", report.AbsentUntracked,
-		"absent_dropped", report.AbsentDropped,
+		"covers_renewed", report.CoversRenewed,
+		"covers_rotated", report.CoversRotated,
+		"covers_released", report.CoversReleased,
+		"covers_decaying", report.CoversDecaying,
+		"covers_touched", report.CoversTouched,
+		"rows_verified", report.RowsVerified,
+		"renewal_incomplete", report.RenewalIncomplete,
+		"renewal_over_budget", report.RenewalOverBudget,
+		"lfs_traversals", report.LFSTraversals,
+		"pack_traversals", report.PackTraversals,
 		"quota_enforced", report.QuotaEnforced)
 	return report, errs.join()
 }
 
-// refreshKnownAbsent keeps every tracked loss visible within budget. Two
-// sub-phases, safety-critical first:
-//
-//  1. RENEWAL: re-charge each affected base's aggregate cover row — one
-//     work unit per REPOSITORY, round-robin — so covers renew every pass
-//     for any incident up to half-budget many affected bases, regardless
-//     of how many rows are lost (Codex round 4).
-//  2. RE-VERIFICATION: re-settle tracked rows round-robin (registration
-//     probe + stats) so healed, retired, folded-away, and purged rows
-//     drop out of their aggregates. This only SHRINKS covers, so budget
-//     exhaustion here delays convergence, never visibility.
-func (r *AbsenceReconciler) refreshKnownAbsent(ctx context.Context, budget int64, report *AbsenceReport, st *absencePassState, errs *boundedErrs) (charged int64) {
-	renewed := make(map[string]bool, len(r.baseRing))
-	complete := true
-	for visits := len(r.baseRing); visits > 0 && len(r.baseRing) > 0; visits-- {
-		if ctx.Err() != nil {
-			errs.add(ctx.Err())
-			complete = false
-			break
-		}
-		if charged >= budget {
-			complete = false // unreachable while baseCapacity ≤ budget/2, kept as a guard
-			break
-		}
-		if r.basePos >= len(r.baseRing) {
-			r.basePos = 0
-		}
-		base := r.baseRing[r.basePos].base
-		charged++
-		r.coverBase(ctx, base, report, st, errs)
-		if !st.coverSkip[base] {
-			renewed[base] = true
-		}
-		r.basePos++
+// renewCovers re-charges each (base, class)'s highest-incarnation live
+// cover row — one listing page plus one reserve per row, all derived from
+// durable state, so ANY replica keeps every aggregate alive (issue #125).
+// Superseded lower incarnations (crash leftovers) are deleted. Legacy
+// nonce-keyed covers from pre-#125 workers are RECORDED for retirement
+// (recordLegacyCover, Codex rounds 4+19): each nonce row is itself the
+// cover for whatever it aggregates, kept alive by the pass-start bulk
+// touch until both rotations prove it redundant (foldRedundantLegacy)
+// — an old replica can mint or re-charge nonces at
+// any point of a mixed roll, and deleting or aging them out early could
+// lapse them while the rotation is still far away. Renewal
+// is the correctness core (a lapsed cover silently reopens the admission
+// window), so it always offers the FULL listing: budget only sets the
+// soft allocation, and overrunning it — flagged loudly — starves the
+// discovery rotation for the pass rather than letting live covers lapse
+// (Codex round 1, P1). Only a context abort leaves the listing
+// incomplete, parked STRICTLY BEFORE any row whose renewal did not
+// happen (Codex round 4, P1: parking past an unrenewed held row would
+// skip it until the next full wrap). Returns the work charged: one unit
+// per listed row.
+func (r *AbsenceReconciler) renewCovers(ctx context.Context, budget int64, report *AbsenceReport, st *absencePassState, errs *boundedErrs) (charged int64) {
+	if !r.quotaEnforced {
+		r.renewalComplete = true // nothing consults reservations (Codex round 73)
+		return 0
 	}
-	// Tracked ⇒ renewed every pass, by construction (Codex round 6): a
-	// renewal the pass deadline or a ledger failure aborted must not
-	// leave silently-stale tracking whose covers lapse before the next
-	// tick. Unrenewed bases are dropped — their aggregate rows expire by
-	// TTL exactly as they would have anyway, the rotation rediscovers
-	// and re-covers the losses, and the drop is loud and counted.
-	if !complete || len(renewed) < len(r.baseRing) {
-		var dropKeys []string
-		for key, row := range r.knownAbsent {
-			if !renewed[baseOf(row.repo)] {
-				dropKeys = append(dropKeys, key)
+	// Bulk touch FIRST (Codex round 9): one DB-clock statement re-stamps
+	// every live deterministic cover's TTL, so protection never depends
+	// on the keyset listing below completing within the TTL — a large
+	// population or degraded ledger latency can turn that listing into a
+	// multi-pass round robin, and a row aging past the TTL mid-cycle
+	// would be excluded as expired and silently never renewed. The
+	// listing remains the precise mechanism for everything else: legacy
+	// folds, superseded-row cleanup, byte re-pinning, and the liveCovers
+	// harvest. On failure the cursor is untouched and the pass carries
+	// the renewal-incomplete flag.
+	touched, err := r.registry.RenewAbsenceCovers(ctx, r.coverTTL)
+	report.CoversTouched = touched
+	if err != nil {
+		errs.add(fmt.Errorf("absence reconcile: bulk-renew covers: %w", err))
+		report.RenewalIncomplete = true
+		r.touchFailed = true // saveState must not re-stamp rotation cursors
+		r.armAdmissionFence(ctx, errs)
+		return 0
+	}
+	if r.quotaEnforced {
+		// A successful touch proves covers stayed alive only when
+		// NOTHING could have lapsed before it ran (Codex round 29):
+		// the strict-TTL bulk update deliberately leaves already-dead
+		// rows dead, so a watermark EXISTING but a full TTL old — a
+		// fleet paused past the TTL, or quota enforcement re-enabled
+		// after an off period whose passes never stamped (nothing ever
+		// deletes the health row, so a prior on-era leaves it aging) —
+		// means RECOVERY, not health. The fence arms BEFORE the stamp
+		// (a crash in between leaves the fail-closed side) and outlives
+		// it until a full recovery rotation completes; an unreadable
+		// prior age arms too. Continuity needs the prior age strictly
+		// under the TTL MINUS one pass wall clock (Codex round 32, P1):
+		// the watermark stamps up to a pass after the touch it records
+		// — the touch and the stamp are separate statements under the
+		// pass deadline — so covers can be a full pass older than the
+		// watermark claims, and a pause landing in that gap expires
+		// them while the raw TTL bound still reads as proven. The
+		// bound is exactly the cursor-staleness one (same touch-to-
+		// stamp delay); this pass's own touch ran BEFORE this age
+		// read, so the measured age only overestimates — the
+		// conservative direction. Within it, every row was re-TTL'd
+		// then, and rows minted since carry their own fresh TTL. An
+		// ABSENT watermark is NOT
+		// lapse evidence by itself (Codex round 32, security): it is
+		// the upgrade/first-enable signature, and arming the
+		// fleet-global fence on it would turn every first pass under
+		// this feature into a multi-pass cross-tenant write outage.
+		// Instead the first stamp probes for positive evidence — a
+		// physically present un-folded cover row aged past the TTL —
+		// and arms only when a lapse provably happened (or the probe
+		// itself failed, where fail-closed is the only safe answer).
+		age, ok, hErr := r.registry.JobScanStateAge(ctx, ref.ScanJobAbsence, ref.ScanScopeAbsenceRenewalHealth)
+		arm, why := false, ""
+		switch {
+		case hErr != nil:
+			errs.add(fmt.Errorf("absence reconcile: read renewal health: %w", hErr))
+			arm, why = true, "renewal health unreadable at a successful touch"
+		case ok && age >= r.cursorStaleAge:
+			arm, why = true, "renewal continuity unprovable at a successful touch — covers may have lapsed while no pass was stamping"
+		case !ok:
+			// The physical probe alone is insufficient (Codex round 33,
+			// P1): ReservePackBytes GC-deletes a base's expired
+			// reservation rows at admission time — the very writers the
+			// fence should block destroy the evidence first. The GC now
+			// records a durable lapse-evidence marker in the same
+			// transaction whenever it deletes an expired un-folded
+			// cover row; consult it BEFORE the physical probe.
+			_, marked, mErr := r.registry.GetJobScanState(ctx, ref.ScanJobAbsence, ref.ScanScopeAbsenceLapse)
+			lapsed, pErr := false, error(nil)
+			if mErr == nil && !marked {
+				lapsed, pErr = r.registry.LapsedAbsenceCoverExists(ctx, r.coverTTL)
+				if pErr == nil && !lapsed {
+					// The marker read and the physical probe are not
+					// atomic (Codex round 34, security): a concurrent
+					// admission GC or reservation sweep can consume the
+					// expired row AND write the marker between them —
+					// the probe then sees no row while this branch holds
+					// a stale marker miss, and health would stamp
+					// unfenced. Every evidence consumer writes the
+					// marker in the same transaction as its delete, so
+					// re-reading the marker AFTER a clean probe closes
+					// the window: either the probe's snapshot still saw
+					// the row, or this re-read sees the marker.
+					_, marked, mErr = r.registry.GetJobScanState(ctx, ref.ScanJobAbsence, ref.ScanScopeAbsenceLapse)
+				}
+			}
+			switch {
+			case mErr != nil:
+				errs.add(fmt.Errorf("absence reconcile: read lapse-evidence marker: %w", mErr))
+				arm, why = true, "lapse evidence unreadable at the first health stamp"
+			case marked:
+				arm, why = true, "admission GC recorded expired covers — protection lapsed before this watermark regime began"
+			case pErr != nil:
+				errs.add(fmt.Errorf("absence reconcile: probe lapsed covers: %w", pErr))
+				arm, why = true, "lapse evidence unreadable at the first health stamp"
+			case lapsed:
+				arm, why = true, "expired covers present at the first health stamp — protection lapsed before this watermark regime began"
+			default:
+				r.logger.Info("absence reconcile: first renewal-health stamp — no lapsed covers found, admission stays open")
 			}
 		}
-		for _, key := range dropKeys {
-			r.untrackAbsent(key)
+		if arm {
+			if !r.armFence(ctx, errs, why) {
+				// The required fence write is NOT proven durable: do
+				// not stamp health over the stale watermark (Codex
+				// round 30) — a fresh stamp would make the next pass
+				// treat renewal as continuous and never retry arming.
+				// Leaving the watermark stale re-detects the
+				// unprovable continuity next pass and retries.
+				return 0
+			}
 		}
-		if len(dropKeys) > 0 {
-			report.AbsentDropped += int64(len(dropKeys))
-			r.logger.Warn("absence reconcile: dropped tracked losses whose aggregate covers could not be renewed this pass; the rotation will rediscover them",
-				"rows_dropped", len(dropKeys), "renewal_complete", complete)
+		// Stamp the DB-clock renewal-health watermark: the durable
+		// proof that every live cover was re-TTL'd just now (Codex
+		// round 26, security) — written only AFTER any required fence
+		// arm proved durable (round 30). A stamp failure leaves the
+		// watermark aging, which only moves the fleet TOWARD the
+		// fail-closed admission fence — the conservative direction.
+		if err := r.registry.PutJobScanState(ctx, ref.ScanJobAbsence, ref.ScanScopeAbsenceRenewalHealth, "", 0); err != nil {
+			errs.add(fmt.Errorf("absence reconcile: stamp renewal health: %w", err))
 		}
 	}
-	// Visit at most the ring's population at entry: untracks shrink the
-	// ring mid-loop, and without the visit bound a key that keeps
-	// re-settling could loop past every other entry.
-	for visits := len(r.refreshRing); visits > 0 && len(r.refreshRing) > 0; visits-- {
+	after := r.renewCursor
+	startRaw := after
+	startedAtZero := after == ""
+	wrapped := startedAtZero
+	defer func() { r.renewCursor = after }()
+	// held delays each epoch-keyed row one step: a following row with the
+	// same (base, class) supersedes it (higher incarnation, zero-padded
+	// byte order), so the held row is a crash leftover to delete.
+	// heldPrev remembers the cursor position strictly BEFORE the held
+	// row: abort paths park there, so a renewal the dead context skipped
+	// is re-offered first thing next pass (Codex round 4, P1).
+	var held *ref.AbsenceCoverRow
+	heldPrev := after
+	abort := func(err error) {
+		if held != nil {
+			after = heldPrev // the held row was never renewed: re-offer it
+			held = nil
+		}
+		errs.add(err)
+		report.RenewalIncomplete = true
+	}
+	flushHeld := func(supersededBy *ref.AbsenceCoverRow) {
+		if held == nil {
+			return
+		}
+		base, class, n, _, ok := parseAbsenceCoverKey(held.Key)
+		assertf(ok, "renewCovers: held unparseable key %q", held.Key)
+		if supersededBy != nil {
+			b2, c2, _, legacy2, ok2 := parseAbsenceCoverKey(supersededBy.Key)
+			if ok2 && !legacy2 && b2 == base && c2 == class {
+				// A higher incarnation exists: this row is a crash
+				// leftover (rotate minted the successor but the delete —
+				// or its floor invalidation — never landed) — release
+				// it, under the same proven bump-before-delete as every
+				// compensation-shrinking delete (Codex round 12). On
+				// bump failure, fall through to the normal renewal: the
+				// leftover stays alive and protective until a bump
+				// lands.
+				if err := r.registry.BumpLFSAdoptionGen(ctx, base); err != nil {
+					errs.add(fmt.Errorf("absence reconcile: invalidate floors before releasing superseded cover %s: %w", held.Key, err))
+				} else {
+					if err := r.registry.DeleteAbsenceCover(ctx, held.Key); err != nil {
+						errs.add(fmt.Errorf("absence reconcile: release superseded cover %s: %w", held.Key, err))
+					} else {
+						report.CoversReleased++
+					}
+					held = nil
+					return
+				}
+			}
+		}
+		if r.chargeCover(ctx, held.Base, held.Key, held.Bytes, true, report, st, errs) {
+			report.CoversRenewed++
+		}
+		if prev, seen := r.liveCovers[class][base]; !seen || n > prev.n {
+			r.liveCovers[class][base] = liveCover{key: held.Key, n: n, bytes: held.Bytes}
+		}
+		held = nil
+	}
+	overrun := func() {
+		if charged > budget && !report.RenewalOverBudget {
+			report.RenewalOverBudget = true
+			r.logger.Warn("absence reconcile: cover renewal overran its budget allocation (discovery keeps its guaranteed half-budget allowance) — raise CODESTORAGE_ABSENCE_RECONCILE_BUDGET above twice the live cover population",
+				"allocation", budget, "charged", charged)
+		}
+	}
+	for {
 		if ctx.Err() != nil {
-			errs.add(ctx.Err())
+			// The ONLY incomplete-renewal paths: parked on the durable
+			// cursor — before the held row, whose renewal did not
+			// happen — and resumed first thing next pass.
+			abort(ctx.Err())
 			return charged
 		}
-		if charged >= budget {
-			return charged
-		}
-		if r.refreshPos >= len(r.refreshRing) {
-			r.refreshPos = 0
-		}
-		row := r.refreshRing[r.refreshPos]
-		charged++ // the registration probe
-		var registered bool
-		var err error
-		if row.pack {
-			registered, err = r.registry.HasPack(ctx, row.repo, row.key)
-		} else {
-			registered, err = r.registry.HasLFSObject(ctx, row.repo, row.key)
-		}
+		rows, err := r.registry.ListAbsenceCovers(ctx, after, absencePageSize, r.coverTTL)
 		if err != nil {
-			errs.add(fmt.Errorf("absence reconcile: refresh registration probe %s: %w", row.key, err))
-			r.refreshPos++ // still tracked; retried on the next rotation
+			abort(fmt.Errorf("absence reconcile: list covers: %w", err))
+			return charged
+		}
+		if len(rows) == 0 {
+			flushHeld(nil)
+			if wrapped {
+				after = ""
+				r.renewalComplete = startedAtZero
+				overrun()
+				return charged
+			}
+			after, wrapped = "", true
 			continue
 		}
-		if !registered {
-			r.untrackAbsent(row.key)
-			continue // the swap-removed replacement now sits at refreshPos
-		}
-		report.AbsentRefreshed++
-		before := len(r.refreshRing)
-		if row.pack {
-			charged += r.settlePackRow(ctx, ref.AbsencePackRow{Repo: row.repo, ID: row.id, Key: row.key, Bytes: row.registered}, report, st, errs)
-		} else {
-			charged += r.settleLFSRow(ctx, ref.AbsenceLFSRow{Repo: row.repo, Key: row.key, Bytes: row.registered}, report, st, errs)
-		}
-		if len(r.refreshRing) == before {
-			r.refreshPos++ // entry survived (still absent): advance past it
+		for i := range rows {
+			row := &rows[i]
+			if wrapped && !startedAtZero && row.RawKey > startRaw {
+				flushHeld(nil)
+				after = ""
+				r.renewalComplete = true // full listing offered this pass
+				overrun()
+				return charged
+			}
+			if ctx.Err() != nil {
+				abort(ctx.Err())
+				return charged
+			}
+			charged++
+			prevAfter := after
+			after = row.RawKey
+			_, _, _, legacy, ok := parseAbsenceCoverKey(row.Key)
+			if !ok {
+				continue // unparseable spelling under the prefix: not ours
+			}
+			if legacy {
+				flushHeld(row)
+				r.recordLegacyCover(row, report)
+				continue
+			}
+			flushHeld(row)
+			held, heldPrev = row, prevAfter
 		}
 	}
-	return charged
 }
 
-// trackAbsent records a truly-absent row for aggregate cover renewal and
-// round-robin re-verification, and reports whether the row is tracked
-// (its bytes live in its base's aggregate). Only coverable rows are
-// tracked: with quota unenforced or an unknown size there is no cover to
-// keep alive, and the rotation's detection logging already covers
-// reporting.
-func (r *AbsenceReconciler) trackAbsent(row absentRow, report *AbsenceReport) bool {
-	if !r.quotaEnforced {
-		return false
-	}
-	if existing, ok := r.knownAbsent[row.key]; ok {
-		if existing.bytes == row.bytes {
-			return true // already aggregated; the caller renews the base cover
-		}
-		// The row's deficit CHANGED — e.g. a partial loss became total
-		// (Codex round 9, security): keeping the old entry would renew
-		// the stale smaller amount forever. Replace it so the base
-		// aggregate stays exact.
-		r.untrackAbsent(row.key)
-	}
-	if len(r.knownAbsent) >= absentTrackedCap {
-		report.AbsentUntracked++
-		r.logger.Warn("absence reconcile: known-absent set is at its memory cap; this loss gets a one-shot cover and refreshes only on rotation revisits",
-			"key", row.key, "cap", absentTrackedCap)
-		return false
-	}
-	base := baseOf(row.repo)
-	agg, ok := r.absentBases[base]
-	if !ok {
-		// One aggregate = one renewal work unit per pass, so the tracked
-		// BASE population must stay within the renewal phase's budget
-		// allocation (Codex round 5): beyond it, some aggregate would
-		// wait multiple passes and its cover could lapse. A new base past
-		// that capacity gets one-shot covers instead — reported, renewed
-		// on rotation revisits — while rows joining EXISTING aggregates
-		// add no renewal work and always track.
-		if int64(len(r.absentBases)) >= r.baseCapacity() {
-			report.AbsentUntracked++
-			r.logger.Warn("absence reconcile: tracked losses span more repositories than the per-pass renewal capacity; this repository's losses get one-shot covers — raise CODESTORAGE_ABSENCE_RECONCILE_BUDGET",
-				"repo", base, "capacity", r.baseCapacity())
-			return false
-		}
-		agg = &absentBase{base: base, idx: len(r.baseRing), coverKey: absenceCoverKey(base)}
-		r.baseRing = append(r.baseRing, agg)
-		r.absentBases[base] = agg
-	}
-	row.idx = len(r.refreshRing)
-	tracked := &row
-	r.refreshRing = append(r.refreshRing, tracked)
-	r.knownAbsent[row.key] = tracked
-	agg.bytes += row.bytes
-	agg.rows++
-	return true
-}
-
-// baseCapacity is the maximum tracked-base population whose aggregates
-// provably renew every pass: HALF the refresh allocation (a quarter of
-// the whole budget), so renewal at full capacity still leaves the other
-// half of the refresh phase for registry revalidation (Codex round 6) —
-// without it, a capacity-full renewal loop would consume the entire
-// refresh allocation and retired/folded rows would never untrack, their
-// aggregates renewing forever.
-func (r *AbsenceReconciler) baseCapacity() int64 {
-	return (r.budget - r.budget/2) / 2
-}
-
-// untrackAbsent drops a tracked row (healed, twin-present, retired, or
-// purged) with an O(1) ring swap-remove; the moved entry inherits the
-// vacated index. The row's bytes leave its base aggregate; the last row
-// of a base drops the aggregate entirely (its cover row expires by TTL).
-// assertf-checked consistency: the maps and rings must agree.
-func (r *AbsenceReconciler) untrackAbsent(key string) {
-	row, ok := r.knownAbsent[key]
-	if !ok {
+// recordLegacyCover notes one live pre-#125 nonce-keyed cover for this
+// pass (Codex rounds 4, 17, 18, 19). The nonce row ITSELF is its cover:
+// pre-#125 workers minted one random nonce per replica/pass aggregating
+// BOTH classes' deficits, several live nonces can compensate disjoint
+// deficits admission sums, and old replicas keep re-charging them mid-roll
+// — so no bytes are ever transferred into the deterministic incarnations
+// (rounds 17-18 tried GREATEST- and additive-transfer variants; every
+// transfer scheme re-interpreted an old worker's periodic same-key TTL
+// refresh, which overwrites owner, as new deficit and re-added it, round
+// 19 P1). Instead the row stays live — the pass-start bulk touch renews
+// every un-folded nonce (round 15) — until foldRedundantLegacy proves it
+// redundant. Already-folded rows (owner sentinel intact, so no re-charge
+// arrived since the proof) are left to decay by TTL.
+func (r *AbsenceReconciler) recordLegacyCover(row *ref.AbsenceCoverRow, report *AbsenceReport) {
+	if row.Folded {
+		report.CoversDecaying++ // no re-charge since the fold: decaying
 		return
 	}
-	assertf(row.idx >= 0 && row.idx < len(r.refreshRing) && r.refreshRing[row.idx] == row,
-		"untrackAbsent(%q): ring index %d inconsistent", key, row.idx)
-	last := len(r.refreshRing) - 1
-	moved := r.refreshRing[last]
-	r.refreshRing[row.idx] = moved
-	moved.idx = row.idx
-	r.refreshRing[last] = nil
-	r.refreshRing = r.refreshRing[:last]
-	delete(r.knownAbsent, key)
+	r.legacyRows = append(r.legacyRows, *row)
+	r.legacyBases[row.Base] = true
+}
 
-	base := baseOf(row.repo)
-	agg, ok := r.absentBases[base]
-	assertf(ok && agg.rows > 0 && agg.bytes >= row.bytes,
-		"untrackAbsent(%q): base aggregate %s inconsistent (%+v)", key, base, agg)
-	agg.bytes -= row.bytes
-	agg.rows--
-	// Bytes shrank: mark the pending key rotation (see
-	// absentBase.coverKey) — applied lazily, coalesced to once per pass,
-	// at the next charge.
-	agg.shrunk = true
-	if agg.rows == 0 {
-		assertf(agg.bytes == 0, "untrackAbsent(%q): empty base %s holds %d bytes", key, base, agg.bytes)
-		assertf(agg.idx >= 0 && agg.idx < len(r.baseRing) && r.baseRing[agg.idx] == agg,
-			"untrackAbsent(%q): base ring index %d inconsistent", key, agg.idx)
-		lastB := len(r.baseRing) - 1
-		movedB := r.baseRing[lastB]
-		r.baseRing[agg.idx] = movedB
-		movedB.idx = agg.idx
-		r.baseRing[lastB] = nil
-		r.baseRing = r.baseRing[:lastB]
-		delete(r.absentBases, base)
+// foldRedundantLegacy retires this pass's recorded legacy nonce covers
+// whose base BOTH rotations' proofs completed THIS PASS (Codex rounds
+// 19-20): a clean fence-continuous start-to-end range observation
+// recomputes the base's true current deficit from the registry itself and
+// charges it into the deterministic head — ground truth that subsumes
+// whatever the nonce once aggregated — and a row-less keyset gap proves a
+// zero deficit the same way. Only then is the nonce redundant and safe to
+// let decay. The fold is a CAS on the LISTED (owner, bytes): every
+// old-replica re-charge overwrites owner and GREATEST-grows bytes, so a
+// CAS miss proves a newer reliance arrived after the listing — it wins,
+// the row stays live (bulk-touched), and a later pass re-proves.
+// Both classes' evidence must be storage-visible from THIS pass (round
+// 24: a persisted or resumed total spans a park gap no DB fence can
+// vouch for) — a class completed in an earlier pass persists only a fold
+// CANDIDACY (round 21, P1; see loadProofs) that is re-statted fresh here
+// before anything retires, run-to-completion per started base so bases
+// whose combined class rows outgrow the verification pool still converge
+// (round 23, P1). Run invokes the fold twice per pass: once before the
+// rotations so hint-driven re-stats get first claim on the pass wall
+// clock (round 25, security), and once after so same-pass completions
+// retire without an extra pass; r.foldAttempted dedupes across the two.
+func (r *AbsenceReconciler) foldRedundantLegacy(ctx context.Context, report *AbsenceReport, st *absencePassState, errs *boundedErrs) {
+	attempted := r.foldAttempted
+	started := false
+	for i := range r.legacyRows {
+		row := &r.legacyRows[i]
+		// Candidacy: each class needs SAME-PASS storage-visible
+		// evidence (cleanBases) or a persisted scheduling hint. A hint
+		// is never evidence (Codex round 24): the park gap it spans is
+		// invisible to any DB fence — out-of-band byte loss has no DB
+		// event, and an old worker's nonce recharge before this pass's
+		// listing lists as ordinary liveness the fold CAS would match.
+		need := make([]string, 0, 2)
+		eligible := true
+		for _, class := range []string{absenceClassLFS, absenceClassPacks} {
+			if r.cleanBases[class][row.Base] {
+				continue
+			}
+			if _, hint := r.proofGens[row.Base][class]; !hint {
+				eligible = false
+				break
+			}
+			if !attempted[row.Base+"\x00"+class] {
+				need = append(need, class)
+			}
+		}
+		if !eligible {
+			continue // no complete candidacy yet: stays live, retried later
+		}
+		if st.purged[row.Base] {
+			continue // the purge pipeline owns the base's rows
+		}
+		// Commitment-time evidence: every hinted class is re-statted
+		// NOW, all-or-nothing per base and run-to-completion once
+		// started — an exhausted pool blocks further base STARTS but
+		// never abandons a started candidate, so each pass completes
+		// at least its first candidate even when the base's combined
+		// class rows outgrow the pool (Codex round 23) and rotation-
+		// triggered verification cannot starve the fold path. Success
+		// lands in cleanBases (markCleanBase); a dirty or failed
+		// re-stat leaves the nonce live for a later pass.
+		if len(need) > 0 {
+			if started && r.verifyPool <= 0 {
+				continue // pool exhausted: deferred, candidacy persists
+			}
+			started = true
+			for _, class := range need {
+				attempted[row.Base+"\x00"+class] = true
+				r.verifyAndJudge(ctx, row.Base, class, true, report, st, errs)
+			}
+		}
+		if !r.cleanBases[absenceClassLFS][row.Base] || !r.cleanBases[absenceClassPacks][row.Base] {
+			continue // re-stat dirty, failed, or deferred: stays live
+		}
+		cas, err := r.registry.CASAbsenceCoverOwner(ctx, row.RawKey, row.Owner, row.Bytes, ref.AbsenceFoldedOwner)
+		if err != nil {
+			errs.add(fmt.Errorf("absence reconcile: mark legacy cover folded %s: %w", row.Key, err))
+			continue
+		}
+		if cas {
+			report.CoversDecaying++
+		}
 	}
+}
+
+// markCleanBase records a completed FRESH clean proof for one
+// (class, base) — see cleanBases. A fresh proof supersedes a persisted
+// half-proof for the same pair: the trigger entry is dropped so fold
+// consumers know the class needs no re-verification this pass.
+func (r *AbsenceReconciler) markCleanBase(class, base string) {
+	if base == "" {
+		return
+	}
+	r.cleanBases[class][base] = true
+	if m := r.proofGens[base]; m != nil {
+		delete(m, class)
+		if len(m) == 0 {
+			delete(r.proofGens, base)
+		}
+	}
+}
+
+// foldIntoIncarnation grows one class's live incarnation to at least
+// bytes (the ledger's GREATEST merge — an ABSOLUTE total, so replays are
+// idempotent), minting incarnation 1 when the class has none. Reports
+// whether the grown total is proven durable in the ledger. bypassSkip
+// forces the charge past the pass-level coverSkip memo even for a mint
+// (the bounded endRange retry); same-key grows of an existing head always
+// bypass.
+func (r *AbsenceReconciler) foldIntoIncarnation(ctx context.Context, base, class string, bytes int64, bypassSkip bool, report *AbsenceReport, st *absencePassState, errs *boundedErrs) bool {
+	assertf(bytes >= 0, "foldIntoIncarnation: negative total %d for %s/%s", bytes, base, class)
+	head, ok := r.resolveHead(ctx, base, class, st, errs)
+	if !ok {
+		return false
+	}
+	target := head
+	if target.key == "" {
+		target = liveCover{key: absenceIncarnationKey(base, class, 1), n: 1}
+	}
+	if !r.chargeCover(ctx, base, target.key, bytes, head.key != "" || bypassSkip, report, st, errs) {
+		return false
+	}
+	if bytes > target.bytes {
+		target.bytes = bytes
+	}
+	r.liveCovers[class][base] = target
+	return true
 }
 
 // cursorAfter reports whether (repoB, keyB) sorts strictly after
@@ -619,41 +1644,76 @@ func cursorAfter(repoA, keyA, repoB, keyB string) bool {
 	return keyB > keyA
 }
 
-// lfsPhase pages lfs_objects rows from the resume cursor, wrapping once at
-// the end of the keyspace (the reclaimer's rotation), and settles each row
-// within the phase budget. Returns the work charged.
-func (r *AbsenceReconciler) lfsPhase(ctx context.Context, budget int64, report *AbsenceReport, st *absencePassState, errs *boundedErrs) (charged int64) {
-	afterRepo, afterKey := r.lfsAfterRepo, r.lfsAfterKey
-	startRepo, startKey := afterRepo, afterKey
-	startedAtZero := afterRepo == "" && afterKey == ""
+// rotationPhase pages one registry from its durable resume cursor and
+// settles each row within the phase budget, offering the keyspace at most
+// once per pass. An origin crossing completes the traversal (tick); the
+// scan then continues into the next traversal until it reaches this pass's
+// starting point. Base-range boundaries drive the cover lifecycle: see the
+// header comment. list returns one keyset page as (repo, cursorKey) pairs
+// with a settle callback per row — the two registries differ only there.
+func (r *AbsenceReconciler) rotationPhase(ctx context.Context, cur *absenceCursorState, tr *rangeTracker, budget int64, report *AbsenceReport, st *absencePassState, errs *boundedErrs,
+	list func(ctx context.Context, afterRepo, afterKey string, limit int) (repos, keys []string, settle []func() int64, err error)) (charged int64) {
+	startRepo, startKey := cur.AfterRepo, cur.AfterKey
+	startedAtZero := startRepo == "" && startKey == ""
 	wrapped := startedAtZero
-	defer func() { r.lfsAfterRepo, r.lfsAfterKey = afterRepo, afterKey }()
+	coverBases := r.sortedCoverBases(tr.class)
+	legacyBases := r.sortedLegacyBases()
+	// Restore the pending range parked with the cursor (Codex rounds
+	// 1+2, P1): resuming mid-range must neither read the first resumed
+	// row as a range transition (the suffix's total would masquerade as
+	// the whole range's and shrink covers protecting the skipped prefix)
+	// nor restart the running total at zero (each resumed chunk would
+	// under-accumulate and the cover could never grow to the true sum).
+	// The parked tracker carries base, started, dirty, and the running
+	// total, so ranges spanning any number of passes stay exact — for
+	// GROW charging unconditionally, and for shrink/release/fold proofs
+	// exactly when loadState verified fence continuity across every park
+	// gap (Codex rounds 19-20; see absenceCursorState.RangeGen).
+	*tr = rangeTracker{class: tr.class, base: cur.RangeBase, started: cur.RangeStarted, dirty: cur.RangeDirty, running: cur.RangeRunning, resumed: cur.RangeStarted, tainted: cur.RangeTainted}
+	if tr.base == "" && !startedAtZero {
+		// Legacy parked cursor without range state (rows written before
+		// this fix): treat the pending range as unstarted, never exact.
+		tr.base = baseOf(startRepo)
+	}
+	assertf(startedAtZero == (tr.base == "" && !tr.started), "rotationPhase(%s): cursor/range state disagree (%q vs %+v)", tr.class, startRepo, tr)
+	// Park the tracker back into the durable state on every exit; the
+	// end-of-pass saveState persists it (and snapshots the fence).
+	defer func() {
+		cur.RangeBase, cur.RangeStarted, cur.RangeDirty, cur.RangeRunning, cur.RangeTainted = tr.base, tr.started, tr.dirty, tr.running, tr.tainted
+		tr.abandon()
+	}()
 	for charged < budget {
 		if ctx.Err() != nil {
 			errs.add(ctx.Err())
 			return charged
 		}
-		limit := r.pageLimit(budget - charged)
-		rows, err := r.registry.ListFleetLFSObjects(ctx, afterRepo, afterKey, limit)
+		repos, keys, settle, err := list(ctx, cur.AfterRepo, cur.AfterKey, r.pageLimit(budget-charged))
 		if err != nil {
-			errs.add(fmt.Errorf("absence reconcile: list lfs objects: %w", err))
+			errs.add(fmt.Errorf("absence reconcile: list %s registry: %w", tr.class, err))
 			return charged
 		}
-		if len(rows) == 0 {
+		if len(repos) == 0 {
+			// Origin crossing: the traversal is complete. Every pending
+			// range ends AT the keyspace end, and the empty page proves
+			// no base after it holds any rows in this class.
+			prevBase := tr.base
+			r.endRange(ctx, tr, report, st, errs)
+			r.releaseZeroRowCovers(ctx, tr.class, coverBases, legacyBases, prevBase, "", report, errs)
+			r.tickTraversal(cur, tr.class, report)
+			cur.AfterRepo, cur.AfterKey = "", ""
 			if wrapped {
-				// The whole keyspace was offered this pass: the next
-				// pass starts a fresh rotation.
-				afterRepo, afterKey = "", ""
-				return charged
+				return charged // the whole keyspace was offered this pass
 			}
-			afterRepo, afterKey, wrapped = "", "", true
+			wrapped = true
 			continue
 		}
-		for _, row := range rows {
-			if wrapped && !startedAtZero && cursorAfter(startRepo, startKey, row.Repo, row.Key) {
+		for i := range repos {
+			if wrapped && !startedAtZero && cursorAfter(startRepo, startKey, repos[i], keys[i]) {
 				// Wrapped past this pass's own starting point: every
-				// remaining row was already offered above.
-				afterRepo, afterKey = "", ""
+				// remaining row was already offered above. The cursor
+				// PARKS on the last settled row (never resets); the
+				// pending range is mid-flight in the PREVIOUS
+				// traversal's tail and must not be evaluated.
 				return charged
 			}
 			if ctx.Err() != nil {
@@ -663,56 +1723,472 @@ func (r *AbsenceReconciler) lfsPhase(ctx context.Context, budget int64, report *
 			if charged >= budget {
 				return charged // the cursor rests on the previous row
 			}
-			charged += r.settleLFSRow(ctx, row, report, st, errs)
-			afterRepo, afterKey = row.Repo, row.Key
+			// Base-range boundary: rows are keyset-ordered by repo, and
+			// a base's namespace members (base, base+suffix) sort
+			// contiguously, so a base change ends the previous range —
+			// and the keyset adjacency proves every base BETWEEN the two
+			// holds no rows in this class at all.
+			if b := baseOf(repos[i]); b != tr.base {
+				prevBase := tr.base
+				r.endRange(ctx, tr, report, st, errs)
+				r.releaseZeroRowCovers(ctx, tr.class, coverBases, legacyBases, prevBase, b, report, errs)
+				tr.base, tr.started, tr.dirty, tr.running, tr.resumed, tr.tainted = b, true, false, 0, false, false
+			}
+			charged += settle[i]()
+			cur.AfterRepo, cur.AfterKey = repos[i], keys[i]
 		}
 	}
 	return charged
 }
 
-// packPhase mirrors lfsPhase over packs rows.
-func (r *AbsenceReconciler) packPhase(ctx context.Context, budget int64, report *AbsenceReport, st *absencePassState, errs *boundedErrs) (charged int64) {
-	afterRepo, afterID := r.packAfterRepo, r.packAfterID
-	startRepo, startID := afterRepo, afterID
-	startedAtZero := afterRepo == "" && afterID == ""
-	wrapped := startedAtZero
-	defer func() { r.packAfterRepo, r.packAfterID = afterRepo, afterID }()
-	for charged < budget {
-		if ctx.Err() != nil {
-			errs.add(ctx.Err())
-			return charged
-		}
-		limit := r.pageLimit(budget - charged)
-		rows, err := r.registry.ListFleetPacks(ctx, afterRepo, afterID, limit)
-		if err != nil {
-			errs.add(fmt.Errorf("absence reconcile: list packs: %w", err))
-			return charged
-		}
-		if len(rows) == 0 {
-			if wrapped {
-				afterRepo, afterID = "", ""
-				return charged
-			}
-			afterRepo, afterID, wrapped = "", "", true
-			continue
-		}
-		for _, row := range rows {
-			if wrapped && !startedAtZero && cursorAfter(startRepo, startID, row.Repo, row.ID) {
-				afterRepo, afterID = "", ""
-				return charged
-			}
-			if ctx.Err() != nil {
-				errs.add(ctx.Err())
-				return charged
-			}
-			if charged >= budget {
-				return charged
-			}
-			charged += r.settlePackRow(ctx, row, report, st, errs)
-			afterRepo, afterID = row.Repo, row.ID
+// sortedCoverBases snapshots one class's harvested cover bases in key
+// order — the rotation's O(log C) window index for releaseZeroRowCovers
+// (Codex round 14, P1: scanning the whole harvest map at every base
+// boundary made a pass O(C×R)). Covers folded in AFTER the snapshot are
+// only ever for bases the rotation is currently processing (which have
+// rows), so missing one merely defers its release to a later pass.
+func (r *AbsenceReconciler) sortedCoverBases(class string) []string {
+	bases := make([]string, 0, len(r.liveCovers[class]))
+	for base := range r.liveCovers[class] {
+		bases = append(bases, base)
+	}
+	sort.Strings(bases)
+	return bases
+}
+
+// sortedLegacyBases snapshots the bases of this pass's recorded legacy
+// nonce covers in key order — the gap window's index for same-pass
+// row-less clean proofs (Codex round 19). Renewal runs before the
+// rotations, so the snapshot is complete by phase start; rows the listing
+// missed are simply proven on a later pass.
+func (r *AbsenceReconciler) sortedLegacyBases() []string {
+	seen := make(map[string]bool, len(r.legacyRows))
+	bases := make([]string, 0, len(r.legacyRows))
+	for i := range r.legacyRows {
+		if base := r.legacyRows[i].Base; !seen[base] {
+			seen[base] = true
+			bases = append(bases, base)
 		}
 	}
-	return charged
+	sort.Strings(bases)
+	return bases
+}
+
+// releaseZeroRowCovers releases this class's covers for bases the rotation
+// just proved ROW-LESS: the keyset stream moved from base lo directly to
+// base hi (""=keyspace edge), so any live cover base strictly between them
+// has zero registered rows in this class — nothing left to protect, and no
+// range evaluation would ever visit it (a base emptied by retirement or
+// folds would otherwise pin its cover forever). The proof is the page
+// adjacency itself — a DB-fresh query answered THIS pass, so it also
+// counts as this class's same-pass clean proof (deficit zero) for legacy
+// bases inside the gap (Codex round 19). Covers this pass's harvest
+// missed are released on a later pass. Deletion is single-writer-safe
+// like every cover delete. bases is the phase's sorted harvest snapshot
+// and legacyBases the recorded nonce bases: only the (lo, hi) window is
+// examined (binary search), so a traversal's total release work is
+// O(R log C + C), not O(C×R); already-released entries skip via the map
+// membership check.
+func (r *AbsenceReconciler) releaseZeroRowCovers(ctx context.Context, class string, bases, legacyBases []string, lo, hi string, report *AbsenceReport, errs *boundedErrs) {
+	if !r.quotaEnforced {
+		return
+	}
+	for i := sort.SearchStrings(legacyBases, lo); i < len(legacyBases); i++ {
+		base := legacyBases[i]
+		if base <= lo && lo != "" {
+			continue
+		}
+		if hi != "" && base >= hi {
+			break
+		}
+		r.markCleanBase(class, base) // zero rows in this class: deficit 0
+	}
+	for i := sort.SearchStrings(bases, lo); i < len(bases); i++ {
+		base := bases[i]
+		if base <= lo && lo != "" {
+			continue // the boundary base itself: it has rows
+		}
+		if hi != "" && base >= hi {
+			return
+		}
+		cover, live := r.liveCovers[class][base]
+		if !live || cover.key == "" {
+			continue
+		}
+		// Same warm-floor invalidation before deletion as endRange's
+		// healed release: never delete a compensating reservation while
+		// a deflated floor may still validate.
+		if err := r.registry.BumpLFSAdoptionGen(ctx, base); err != nil {
+			errs.add(fmt.Errorf("absence reconcile: invalidate floors before releasing cover %s: %w", cover.key, err))
+			continue
+		}
+		if err := r.registry.DeleteAbsenceCover(ctx, cover.key); err != nil {
+			errs.add(fmt.Errorf("absence reconcile: release row-less cover %s: %w", cover.key, err))
+			continue
+		}
+		report.CoversReleased++
+		delete(r.liveCovers[class], base)
+	}
+}
+
+// classPage lists one keyset page of a registry class as (repo, cursorKey)
+// pairs plus a settle callback per row bound to tr — the shared adapter
+// under both the rotation phases and verifyAndJudge.
+func (r *AbsenceReconciler) classPage(ctx context.Context, class string, tr *rangeTracker, afterRepo, afterKey string, limit int, report *AbsenceReport, st *absencePassState, errs *boundedErrs) ([]string, []string, []func() int64, error) {
+	if class == absenceClassLFS {
+		rows, err := r.registry.ListFleetLFSObjects(ctx, afterRepo, afterKey, limit)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		repos := make([]string, len(rows))
+		keys := make([]string, len(rows))
+		settle := make([]func() int64, len(rows))
+		for i := range rows {
+			row := rows[i]
+			repos[i], keys[i] = row.Repo, row.Key
+			settle[i] = func() int64 { return r.settleLFSRow(ctx, row, tr, report, st, errs) }
+		}
+		return repos, keys, settle, nil
+	}
+	rows, err := r.registry.ListFleetPacks(ctx, afterRepo, afterKey, limit)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	repos := make([]string, len(rows))
+	keys := make([]string, len(rows))
+	settle := make([]func() int64, len(rows))
+	for i := range rows {
+		row := rows[i]
+		repos[i], keys[i] = row.Repo, row.ID
+		settle[i] = func() int64 { return r.settlePackRow(ctx, row, tr, report, st, errs) }
+	}
+	return repos, keys, settle, nil
+}
+
+// lfsPhase adapts the lfs_objects registry into rotationPhase.
+func (r *AbsenceReconciler) lfsPhase(ctx context.Context, budget int64, report *AbsenceReport, st *absencePassState, errs *boundedErrs) int64 {
+	return r.rotationPhase(ctx, &r.lfs, &r.lfsRange, budget, report, st, errs,
+		func(ctx context.Context, afterRepo, afterKey string, limit int) ([]string, []string, []func() int64, error) {
+			return r.classPage(ctx, absenceClassLFS, &r.lfsRange, afterRepo, afterKey, limit, report, st, errs)
+		})
+}
+
+// packPhase adapts the packs registry into rotationPhase.
+func (r *AbsenceReconciler) packPhase(ctx context.Context, budget int64, report *AbsenceReport, st *absencePassState, errs *boundedErrs) int64 {
+	return r.rotationPhase(ctx, &r.packs, &r.packsRange, budget, report, st, errs,
+		func(ctx context.Context, afterRepo, afterID string, limit int) ([]string, []string, []func() int64, error) {
+			return r.classPage(ctx, absenceClassPacks, &r.packsRange, afterRepo, afterID, limit, report, st, errs)
+		})
+}
+
+// verifyAndJudge re-observes one (base, class) FRESH — a bounded scoped
+// enumeration of the class's current registry rows with a storage stat
+// per row, exactly the evidence a single-pass range observation yields —
+// and applies the range verdicts (markCleanBase, shrink, release) from
+// that observation alone (Codex round 21, security). Resumed completions
+// and persisted fold candidacies are only TRIGGERS: their accumulated
+// totals span park gaps where out-of-band byte loss is invisible to any
+// DB fence, so compensation is never relaxed from them directly. The
+// work draws on the shared per-pass verification pool (one budget's
+// worth). Without runToCompletion (rotation-triggered), a class whose
+// base outgrows the pool defers its verdicts LOUDLY — the operator sizes
+// CODESTORAGE_ABSENCE_RECONCILE_BUDGET so the largest base's combined
+// class rows fit — and its covers stay protectively oversized meanwhile,
+// strictly the conservative direction. With runToCompletion (fold
+// commitment, Codex rounds 23+24), the verification still charges the
+// pool but never aborts on exhaustion: the caller bounds the overshoot
+// to one base by gating STARTS on a non-exhausted pool.
+func (r *AbsenceReconciler) verifyAndJudge(ctx context.Context, base, class string, runToCompletion bool, report *AbsenceReport, st *absencePassState, errs *boundedErrs) {
+	assertf(base != "" && (class == absenceClassLFS || class == absenceClassPacks),
+		"verifyAndJudge(%q, %q)", base, class)
+	vtr := rangeTracker{class: class, base: base, started: true}
+	// Keyset start strictly before the base group's first row: members
+	// are base plus suffixed namespaces, all sorting at or after
+	// (base, "").
+	afterRepo, afterKey := base, ""
+	for {
+		if ctx.Err() != nil {
+			r.warnVerifyDeadline(runToCompletion, base, class)
+			errs.add(ctx.Err())
+			return
+		}
+		remaining := int64(absencePageSize)
+		if !runToCompletion {
+			if r.verifyPool <= 0 {
+				r.logger.Warn("absence reconcile: verification pool exhausted — verdict deferred; raise CODESTORAGE_ABSENCE_RECONCILE_BUDGET above the largest base's combined class rows if persistent",
+					"base", base, "class", class)
+				return
+			}
+			remaining = r.verifyPool
+		}
+		repos, keys, settle, err := r.classPage(ctx, class, &vtr, afterRepo, afterKey, r.pageLimit(remaining), report, st, errs)
+		if err != nil {
+			errs.add(fmt.Errorf("absence reconcile: verify %s/%s: %w", base, class, err))
+			return
+		}
+		if len(repos) == 0 {
+			break // keyspace end: the whole base range was re-observed
+		}
+		done := false
+		for i := range repos {
+			if baseOf(repos[i]) != base {
+				done = true
+				break
+			}
+			if ctx.Err() != nil {
+				r.warnVerifyDeadline(runToCompletion, base, class)
+				errs.add(ctx.Err())
+				return
+			}
+			if !runToCompletion && r.verifyPool <= 0 {
+				r.logger.Warn("absence reconcile: verification pool exhausted — verdict deferred; raise CODESTORAGE_ABSENCE_RECONCILE_BUDGET above the largest base's combined class rows if persistent",
+					"base", base, "class", class)
+				return
+			}
+			charged := settle[i]()
+			r.verifyPool -= charged
+			report.RowsVerified += charged
+			afterRepo, afterKey = repos[i], keys[i]
+		}
+		if done {
+			break
+		}
+	}
+	// The fresh observation is a complete, error-free-or-dirty range in
+	// its own right: the normal fresh-range verdict path judges it.
+	r.endRange(ctx, &vtr, report, st, errs)
+}
+
+// warnVerifyDeadline reports a fold-commitment re-stat killed by the
+// pass deadline (Codex round 25, security): the candidacy survives and
+// the next pass's PRE-rotation fold retries it with first claim on the
+// wall clock, but a base whose single-class re-stat outgrows one whole
+// pass can never produce the same-pass evidence retirement requires —
+// the operator must raise the pass wall clock (a quarter of the cover
+// TTL, capped at an hour; see NewAbsenceReconciler). Covers stay
+// protectively oversized meanwhile.
+func (r *AbsenceReconciler) warnVerifyDeadline(runToCompletion bool, base, class string) {
+	if !runToCompletion {
+		return
+	}
+	r.logger.Warn("absence reconcile: fold verification hit the pass deadline — retried with wall-clock priority next pass; raise CODESTORAGE_PACK_RESERVATION_TTL (the pass wall clock is a quarter of it, capped at an hour) so one pass can re-stat the largest base if persistent",
+		"base", base, "class", class)
+}
+
+// tickTraversal records an origin crossing for one registry class.
+func (r *AbsenceReconciler) tickTraversal(cur *absenceCursorState, class string, report *AbsenceReport) {
+	clean := !cur.Dirty
+	if clean {
+		cur.HasClean = true
+		if r.quotaEnforced {
+			// Only quota-enforced clean rotations count toward fence
+			// release (Codex round 31): quota-off passes advance the
+			// cursor but perform no cover maintenance, so their wraps
+			// prove nothing about admission arithmetic.
+			cur.CleanTraversals++
+		}
+	}
+	r.logger.Info("absence reconcile: rotation traversal completed",
+		"class", class, "traversal", cur.Traversals, "clean", clean)
+	cur.Traversals++
+	cur.Dirty = false
+	if class == absenceClassLFS {
+		report.LFSTraversals = cur.Traversals
+	} else {
+		report.PackTraversals = cur.Traversals
+	}
+}
+
+// abandon discards the pending range without evaluation (pass boundary:
+// the running total is partial). Grow charges already made remain valid —
+// they only ever raise a cover toward the true total.
+func (tr *rangeTracker) abandon() {
+	tr.base, tr.started, tr.dirty, tr.running, tr.resumed, tr.tainted = "", false, false, 0, false, false
+}
+
+// endRange completes the pending base range: when the WHOLE range was
+// observed within this pass with no errors, the running total is exact and
+// the cover lifecycle may shrink or release the base's aggregate.
+func (r *AbsenceReconciler) endRange(ctx context.Context, tr *rangeTracker, report *AbsenceReport, st *absencePassState, errs *boundedErrs) {
+	base, class := tr.base, tr.class
+	started, dirty, running, resumed, tainted := tr.started, tr.dirty, tr.running, tr.resumed, tr.tainted
+	tr.abandon()
+	if base == "" || !started || !r.quotaEnforced {
+		return
+	}
+	if dirty {
+		// The total may under-count: never shrink on it. But it can
+		// still be UNCHARGED (Codex round 8, P1): a charge failure on
+		// the range's last deficits leaves running accumulated but not
+		// covered, and the next retry would otherwise wait a whole
+		// class traversal. One bounded grow-only retry per range —
+		// forced past the coverSkip memo — closes the transient case;
+		// an under-counted running only grows the cover less than the
+		// truth, never shrinks it.
+		if running > 0 && !st.purged[base] {
+			r.foldIntoIncarnation(ctx, base, class, running, true, report, st, errs)
+		}
+		return
+	}
+	if tainted {
+		// The observation lost fence continuity across a park gap
+		// (Codex rounds 19-20): a foreign mutation changed the base
+		// group while no segment was watching — exact for the grow
+		// charges already made, but not even a verification trigger.
+		// The next traversal re-observes from scratch.
+		return
+	}
+	if st.purged[base] || st.coverSkip[base] {
+		return // the total may under-count: never shrink on it
+	}
+	if resumed {
+		// A fence-continuous multi-pass completion (Codex rounds
+		// 20-21): the DB fence proves the group's ROWS did not change
+		// across the park gaps, but out-of-band byte loss has no DB
+		// event, so the accumulated total must not relax compensation
+		// directly. Completion is the TRIGGER; the verdict authority is
+		// a bounded fresh re-observation of the whole base range —
+		// spent only when something consumes the verdict (a live head
+		// that could shrink, or a legacy nonce awaiting retirement):
+		// healthy bases completing resumed ranges are common and must
+		// not drain the verification pool.
+		head, ok := r.resolveHead(ctx, base, class, st, errs)
+		if (ok && head.key != "") || r.legacyBases[base] {
+			r.verifyAndJudge(ctx, base, class, false, report, st, errs)
+		}
+		return
+	}
+	// A clean single-pass start-to-end observation: the base's true
+	// current deficit was recomputed from the registry and storage just
+	// now and is charged (chargeDeficit grows the head incrementally; a
+	// charge failure dirties the range) — this class's ground-truth
+	// proof for legacy retirement.
+	r.markCleanBase(class, base)
+	head, ok := r.resolveHead(ctx, base, class, st, errs)
+	if !ok || head.key == "" {
+		return // no live cover (or unresolved): nothing to shrink
+	}
+	switch {
+	case running == 0:
+		// Fully healed (or rows retired/folded away): release the row —
+		// but invalidate warm floors FIRST (Codex security round on
+		// PR #132): a usage floor measured while the bytes were absent
+		// can still be cached, and the cover is what compensated for its
+		// deflation. Application restores bump the generation themselves,
+		// but backend-side recovery (bytes reappearing out of band)
+		// bypasses them — deleting the compensation while the deflated
+		// floor still validates would let admission overshoot quota. If
+		// the bump fails, retain the cover; the next clean range retries.
+		if err := r.registry.BumpLFSAdoptionGen(ctx, base); err != nil {
+			errs.add(fmt.Errorf("absence reconcile: invalidate floors before releasing cover %s: %w", head.key, err))
+			return
+		}
+		if err := r.registry.DeleteAbsenceCover(ctx, head.key); err != nil {
+			errs.add(fmt.Errorf("absence reconcile: release healed cover %s: %w", head.key, err))
+			return
+		}
+		report.CoversReleased++
+		delete(r.liveCovers[class], base)
+	case running < head.bytes:
+		// Shrink: mint the next incarnation at the exact total FIRST
+		// (never a coverage gap), then delete the stale GREATEST-pinned
+		// row. A crash between the two leaves both; the next renewal
+		// deletes the superseded one.
+		next := liveCover{key: absenceIncarnationKey(base, class, head.n+1), n: head.n + 1, bytes: running}
+		if !r.chargeCover(ctx, base, next.key, running, false, report, st, errs) {
+			return // retried next traversal; the old row keeps covering
+		}
+		// Deleting the larger row SHRINKS compensation by the healed
+		// delta, so it needs a PROVEN floor invalidation first (Codex
+		// round 12): chargeCover's own bump is best-effort — sufficient
+		// for grows, where a stale floor is only over-compensated — but
+		// a cached floor measured during the larger absence stays
+		// deflated by bytes the smaller cover no longer compensates. On
+		// bump failure both rows stay; the next renewal's superseded
+		// cleanup retries under the same proven-bump rule.
+		if err := r.registry.BumpLFSAdoptionGen(ctx, base); err != nil {
+			errs.add(fmt.Errorf("absence reconcile: invalidate floors before rotating cover %s: %w", head.key, err))
+			r.liveCovers[class][base] = next
+			return
+		}
+		if err := r.registry.DeleteAbsenceCover(ctx, head.key); err != nil {
+			errs.add(fmt.Errorf("absence reconcile: release shrunk cover %s: %w", head.key, err))
+		} else {
+			report.CoversReleased++
+		}
+		report.CoversRotated++
+		r.liveCovers[class][base] = next
+	}
+}
+
+// resolveHead finds base's live incarnation for class: the renewal harvest
+// when it saw the whole listing this pass, a point lookup otherwise.
+// ok=false means the lookup failed (reported); key=="" means none exists.
+func (r *AbsenceReconciler) resolveHead(ctx context.Context, base, class string, st *absencePassState, errs *boundedErrs) (liveCover, bool) {
+	if head, seen := r.liveCovers[class][base]; seen {
+		return head, true
+	}
+	if r.renewalComplete {
+		return liveCover{}, true // the full harvest proves no live cover
+	}
+	row, found, err := r.registry.AbsenceCoverHead(ctx, absenceIncarnationPrefix(base, class), r.coverTTL)
+	if err != nil {
+		errs.add(fmt.Errorf("absence reconcile: cover head %s/%s: %w", base, class, err))
+		return liveCover{}, false
+	}
+	if !found {
+		r.liveCovers[class][base] = liveCover{}
+		return liveCover{}, true
+	}
+	_, c2, n, legacy, ok := parseAbsenceCoverKey(row.Key)
+	if !ok || legacy || c2 != class {
+		return liveCover{}, false // foreign spelling where ours belongs: leave it alone
+	}
+	head := liveCover{key: row.Key, n: n, bytes: row.Bytes}
+	r.liveCovers[class][base] = head
+	return head, true
+}
+
+// chargeDeficit folds one freshly settled deficit into the pending range's
+// running total and grows the base's live cover whenever the recomputed
+// total exceeds it — a fresh incident mints its first incarnation
+// immediately, so a new loss is admission-visible at discovery. The charge
+// is always the traversal's own running total (never "live + delta"), so
+// crash replays recompute rather than compound.
+func (r *AbsenceReconciler) chargeDeficit(ctx context.Context, tr *rangeTracker, deficit int64, report *AbsenceReport, st *absencePassState, errs *boundedErrs) {
+	assertf(deficit > 0, "chargeDeficit: non-positive deficit %d for %s", deficit, tr.base)
+	tr.running += deficit
+	if !r.quotaEnforced {
+		return // detection still reported; nothing consults reservations
+	}
+	head, ok := r.resolveHead(ctx, tr.base, tr.class, st, errs)
+	if !ok {
+		// Unaccounted deficit: never shrink on this range, and the
+		// traversal is not clean (Codex round 4, security P2: a cover
+		// failure must dirty the durable class cursor like a stat error,
+		// or the traversal-completed bookkeeping over-reports health).
+		tr.dirty, r.cursorFor(tr.class).Dirty = true, true
+		return
+	}
+	if tr.running <= head.bytes {
+		return // still within the live cover: renewal keeps it fresh
+	}
+	sameKey := head.key != ""
+	if head.key == "" {
+		// No LIVE incarnation (Codex round 6: expired rows are filtered
+		// as dead). Minting can collide with a lingering expired row of
+		// the same key: the upsert's GREATEST then transiently
+		// resurrects its stale total — bounded like a crash replay (the
+		// clean-range rotate right-sizes it, and the ledger's
+		// expired-row cleanup removes lingering rows).
+		head = liveCover{key: absenceIncarnationKey(tr.base, tr.class, 1), n: 1}
+	}
+	if !r.chargeCover(ctx, tr.base, head.key, tr.running, sameKey, report, st, errs) {
+		tr.dirty, r.cursorFor(tr.class).Dirty = true, true
+		return
+	}
+	head.bytes = tr.running
+	r.liveCovers[tr.class][tr.base] = head
 }
 
 func (r *AbsenceReconciler) pageLimit(remaining int64) int {
@@ -724,21 +2200,16 @@ func (r *AbsenceReconciler) pageLimit(remaining int64) int {
 	return limit
 }
 
-// settleLFSRow point-checks one lfs_objects row and covers a genuine loss.
-// Returns the work charged: one unit for the row plus one per extra
-// twin-spelling probe.
-func (r *AbsenceReconciler) settleLFSRow(ctx context.Context, row ref.AbsenceLFSRow, report *AbsenceReport, st *absencePassState, errs *boundedErrs) (charged int64) {
+// settleLFSRow point-checks one lfs_objects row and folds a genuine loss
+// into the pending range. Returns the work charged: one unit for the row
+// plus one per extra twin-spelling probe.
+func (r *AbsenceReconciler) settleLFSRow(ctx context.Context, row ref.AbsenceLFSRow, tr *rangeTracker, report *AbsenceReport, st *absencePassState, errs *boundedErrs) (charged int64) {
 	charged = 1
 	assertf(row.Repo != "" && row.Key != "" && row.Bytes >= 0, "settleLFSRow: bad row %+v", row)
-	if st.settled[row.Key] {
-		return charged // the refresh already settled this row this pass
-	}
-	st.settled[row.Key] = true
 	report.LFSRowsExamined++
 	base := baseOf(row.Repo)
 	if r.repoPurged(ctx, base, st, errs) {
 		report.RowsSkippedPurged++
-		r.untrackAbsent(row.Key)
 		return charged
 	}
 	if row.Bytes == 0 {
@@ -748,19 +2219,22 @@ func (r *AbsenceReconciler) settleLFSRow(ctx context.Context, row ref.AbsenceLFS
 		return charged
 	}
 	// The deficit is registered bytes minus EVERY physical copy across the
-	// ADR-41 spellings (Codex rounds 4+12): both copies are in the usage
-	// listing, so any surviving bytes — full or short, registered spelling
-	// or twin — compensate the floor and must not be re-covered (a
-	// tracked over-cover would renew indefinitely, not one TTL).
+	// ADR-41 spellings (Codex rounds 4+12 on PR #123): both copies are in
+	// the usage listing, so any surviving bytes — full or short,
+	// registered spelling or twin — compensate the floor and must not be
+	// re-covered.
 	physical := int64(0)
 	if size, err := r.blobs.Stat(ctx, row.Key); err == nil {
 		if size >= row.Bytes {
-			r.untrackAbsent(row.Key)
 			return charged // fully present under the registered spelling
 		}
 		physical = size
 	} else if !errors.Is(err, blob.ErrNotFound) {
 		report.StatErrors++
+		// An unverifiable row means the traversal's totals may
+		// under-count: the range must not shrink and the traversal is
+		// not clean.
+		tr.dirty, r.cursorFor(tr.class).Dirty = true, true
 		errs.add(fmt.Errorf("absence reconcile: stat %s: %w", row.Key, err))
 		return charged
 	}
@@ -776,6 +2250,7 @@ func (r *AbsenceReconciler) settleLFSRow(ctx context.Context, row ref.AbsenceLFS
 			twinPhysical = size
 		} else if !errors.Is(err, blob.ErrNotFound) {
 			report.StatErrors++
+			tr.dirty, r.cursorFor(tr.class).Dirty = true, true
 			errs.add(fmt.Errorf("absence reconcile: stat twin %s: %w", twin, err))
 			return charged
 		}
@@ -786,10 +2261,9 @@ func (r *AbsenceReconciler) settleLFSRow(ctx context.Context, row ref.AbsenceLFS
 		// The surviving copies compensate the whole registered size:
 		// physically listed, no floor deflation, nothing to charge. The
 		// CLASSIFICATION still depends on whether a complete copy exists
-		// (Codex round 13): only a full twin is restorable via
+		// (Codex round 13 on PR #123): only a full twin is restorable via
 		// download-time restore (PR #104) — split short copies are an
 		// integrity loss even though quota accounting is whole.
-		r.untrackAbsent(row.Key)
 		if twinPhysical >= row.Bytes {
 			report.LFSRowsTwinOnly++
 			r.logger.Warn("absence reconcile: registered lfs object compensated by its full twin spelling",
@@ -804,60 +2278,39 @@ func (r *AbsenceReconciler) settleLFSRow(ctx context.Context, row ref.AbsenceLFS
 		report.LFSRowsTruncated++
 		r.logger.Error("absence reconcile: registered lfs object is shorter than its registered size across all spellings",
 			"repo", row.Repo, "key", row.Key, "registered", row.Bytes, "physical", physical, "twin_physical", twinPhysical)
-		r.coverDeficit(ctx, base, absentRow{repo: row.Repo, key: row.Key, bytes: deficit, registered: row.Bytes}, report, st, errs)
+		r.chargeDeficit(ctx, tr, deficit, report, st, errs)
 		return charged
 	}
 	report.LFSRowsAbsent++
 	r.logger.Error("absence reconcile: registered lfs object bytes are missing from blob storage",
 		"repo", row.Repo, "key", row.Key, "bytes", row.Bytes)
-	if r.trackAbsent(absentRow{repo: row.Repo, key: row.Key, bytes: row.Bytes, registered: row.Bytes}, report) {
-		r.coverBase(ctx, base, report, st, errs)
-	} else {
-		r.coverOverflow(ctx, base, row.Bytes, report, st, errs)
-	}
+	r.chargeDeficit(ctx, tr, row.Bytes, report, st, errs)
 	return charged
 }
 
-// coverDeficit tracks and covers a PARTIAL loss (truncated or short-twin
-// bytes): the tracked entry's bytes are the deficit, re-derived on every
-// re-verification — trackAbsent replaces an existing entry whose deficit
-// changed so the base aggregate stays exact.
-func (r *AbsenceReconciler) coverDeficit(ctx context.Context, base string, row absentRow, report *AbsenceReport, st *absencePassState, errs *boundedErrs) {
-	assertf(row.bytes > 0, "coverDeficit: non-positive deficit %d for %s", row.bytes, row.key)
-	if r.trackAbsent(row, report) {
-		r.coverBase(ctx, base, report, st, errs)
-	} else {
-		r.coverOverflow(ctx, base, row.bytes, report, st, errs)
-	}
-}
-
-// settlePackRow point-checks one packs row and covers a genuine loss.
-func (r *AbsenceReconciler) settlePackRow(ctx context.Context, row ref.AbsencePackRow, report *AbsenceReport, st *absencePassState, errs *boundedErrs) (charged int64) {
+// settlePackRow point-checks one packs row and folds a genuine loss into
+// the pending range.
+func (r *AbsenceReconciler) settlePackRow(ctx context.Context, row ref.AbsencePackRow, tr *rangeTracker, report *AbsenceReport, st *absencePassState, errs *boundedErrs) (charged int64) {
 	charged = 1
 	assertf(row.Repo != "" && row.ID != "" && row.Key != "" && row.Bytes >= 0, "settlePackRow: bad row %+v", row)
-	if st.settled[row.Key] {
-		return charged // the refresh already settled this row this pass
-	}
-	st.settled[row.Key] = true
 	report.PackRowsExamined++
 	base := baseOf(row.Repo)
 	if r.repoPurged(ctx, base, st, errs) {
 		report.RowsSkippedPurged++
-		r.untrackAbsent(row.Key)
 		return charged
 	}
 	if size, err := r.blobs.Stat(ctx, row.Key); err == nil {
 		if row.Bytes == 0 || size >= row.Bytes {
-			r.untrackAbsent(row.Key)
 			return charged // fully present (or pre-#101 row: size unknown)
 		}
 		report.PackRowsTruncated++
 		r.logger.Error("absence reconcile: registered pack is shorter than its registered size — committed refs may reference this pack",
 			"repo", row.Repo, "key", row.Key, "registered", row.Bytes, "physical", size)
-		r.coverDeficit(ctx, base, absentRow{repo: row.Repo, id: row.ID, key: row.Key, bytes: row.Bytes - size, registered: row.Bytes, pack: true}, report, st, errs)
+		r.chargeDeficit(ctx, tr, row.Bytes-size, report, st, errs)
 		return charged
 	} else if !errors.Is(err, blob.ErrNotFound) {
 		report.StatErrors++
+		tr.dirty, r.cursorFor(tr.class).Dirty = true, true
 		errs.add(fmt.Errorf("absence reconcile: stat %s: %w", row.Key, err))
 		return charged
 	}
@@ -872,12 +2325,16 @@ func (r *AbsenceReconciler) settlePackRow(ctx context.Context, row ref.AbsencePa
 		report.PackRowsUnsized++
 		return charged
 	}
-	if r.trackAbsent(absentRow{repo: row.Repo, id: row.ID, key: row.Key, bytes: row.Bytes, registered: row.Bytes, pack: true}, report) {
-		r.coverBase(ctx, base, report, st, errs)
-	} else {
-		r.coverOverflow(ctx, base, row.Bytes, report, st, errs)
-	}
+	r.chargeDeficit(ctx, tr, row.Bytes, report, st, errs)
 	return charged
+}
+
+// cursorFor maps a class to its durable cursor state.
+func (r *AbsenceReconciler) cursorFor(class string) *absenceCursorState {
+	if class == absenceClassPacks {
+		return &r.packs
+	}
+	return &r.lfs
 }
 
 // repoPurged memoizes the purge-fence probe per base repo. A probe error
@@ -900,78 +2357,35 @@ func (r *AbsenceReconciler) repoPurged(ctx context.Context, base string, st *abs
 	return purged
 }
 
-// coverBase charges base's tracked-loss AGGREGATE as one TTL'd cover
-// reservation row and bumps the shared floor generation. Cover FIRST,
-// then bump (the round 57/58 order): an admission already holding a floor
-// scanned during the absence sees the cover in active_reservations, while
-// the bump only stops FUTURE serves of cached deflated floors. Charged at
-// most once per base per pass unless the aggregate grew since (discovery
-// mid-pass): the same-key upsert makes re-charges idempotent, but
-// skipping them keeps report counters and SQL round-trips honest.
-func (r *AbsenceReconciler) coverBase(ctx context.Context, base string, report *AbsenceReport, st *absencePassState, errs *boundedErrs) {
-	if !r.quotaEnforced {
-		return // nothing consults floors or reservations (Codex round 73)
-	}
-	agg, ok := r.absentBases[base]
-	if !ok {
-		return // nothing tracked for this base (untracked rows use coverRow)
-	}
-	assertf(agg.bytes > 0 && agg.rows > 0, "coverBase(%s): empty aggregate %+v", base, agg)
-	if agg.shrunk {
-		// Apply the pending shrink rotation, coalesced to at most one
-		// fresh incarnation per base per pass (Codex round 8): heals
-		// interleaved with re-charges could otherwise mint row-cap many
-		// keys in one pass. A shrink after this pass's rotation stays
-		// PENDING (Codex round 9: clearing it here would strand the
-		// smaller total on the GREATEST-pinned intermediate key forever)
-		// and rotates on the next pass — one pass of over-cover at this
-		// pass's GREATEST, then exact.
-		if !st.rotated[base] {
-			agg.coverKey = absenceCoverKey(base)
-			st.rotated[base] = true
-			agg.shrunk = false
-		}
-	}
-	if prev, done := st.baseCovered[base]; done && prev.key == agg.coverKey && agg.bytes <= prev.bytes {
-		return
-	}
-	r.chargeCover(ctx, base, agg.coverKey, agg.bytes, report, st, errs)
-	st.baseCovered[base] = coveredAggregate{key: agg.coverKey, bytes: agg.bytes}
-}
-
-// coverOverflow charges one UNTRACKED loss (beyond the base capacity or
-// memory cap) into its base's pass-scoped overflow aggregate: one bounded
-// reservation row per base per pass regardless of how many rows the base
-// lost (Codex round 7, security — per-row one-shot covers re-collided
-// with the reservation-row cap). It expires by TTL and renews only when
-// the rotation revisits the rows — the documented overflow residual.
-func (r *AbsenceReconciler) coverOverflow(ctx context.Context, base string, size int64, report *AbsenceReport, st *absencePassState, errs *boundedErrs) {
-	if !r.quotaEnforced {
-		return
-	}
-	assertf(size > 0, "coverOverflow: non-positive size %d for %s", size, base)
-	key, ok := st.overflowKeys[base]
-	if !ok {
-		key = absenceCoverKey(base)
-		st.overflowKeys[base] = key
-	}
-	st.overflowBytes[base] += size
-	r.chargeCover(ctx, base, key, st.overflowBytes[base], report, st, errs)
-}
-
 // chargeCover reserves size bytes under key's repair-cover spelling and
-// bumps the floor generation, with per-base error memoization.
-func (r *AbsenceReconciler) chargeCover(ctx context.Context, base, key string, size int64, report *AbsenceReport, st *absencePassState, errs *boundedErrs) {
-	if st.coverSkip[base] {
+// bumps the floor generation, with per-base error memoization. Cover
+// FIRST, then bump (the round 57/58 order): an admission already holding
+// a floor scanned during the absence sees the cover in
+// active_reservations, while the bump only stops FUTURE serves of cached
+// deflated floors. Returns whether the cover row was charged. bypassSkip
+// exempts this charge from the pass-level coverSkip memo, for exactly two
+// bounded justifications: (a) a same-key re-charge of a row KNOWN to
+// exist — renewal, fallback renewal, grow of a resolved head — succeeds
+// where the denial that set the memo was a fresh mint hitting the
+// active-row cap, because the ledger excludes the incoming key from that
+// count (Codex round 7, P1); (b) the once-per-range endRange retry of an
+// uncharged dirty total (Codex round 8, P1) — one forced attempt, not the
+// budget-many the memo exists to prevent. Denials still SET the memo in
+// every mode.
+func (r *AbsenceReconciler) chargeCover(ctx context.Context, base, key string, size int64, bypassSkip bool, report *AbsenceReport, st *absencePassState, errs *boundedErrs) bool {
+	if st.coverSkip[base] && !bypassSkip {
 		report.CoverErrors++
-		return
+		return false
+	}
+	if st.purged[base] {
+		return false // fenced mid-pass: the rows are on their way out
 	}
 	if err := ref.ReserveRestoreCover(ctx, r.registry, blob.QuotaRepoGroup(base), key, size, r.coverTTL); err != nil {
 		if errors.Is(err, ref.ErrRepoPurged) {
 			// Raced a purge fence minted after the probe: the rows are on
 			// their way out; treat like the probe verdict.
 			st.purged[base] = true
-			return
+			return false
 		}
 		// One denial (e.g. the active-reservation row cap) means further
 		// covers for this base would fail the same way this pass: skip
@@ -980,7 +2394,7 @@ func (r *AbsenceReconciler) chargeCover(ctx context.Context, base, key string, s
 		st.coverSkip[base] = true
 		report.CoverErrors++
 		errs.add(fmt.Errorf("absence reconcile: cover %s: %w", key, err))
-		return
+		return false
 	}
 	report.CoversCharged++
 	report.BytesCovered += size
@@ -989,6 +2403,7 @@ func (r *AbsenceReconciler) chargeCover(ctx context.Context, base, key string, s
 		// next pass re-charges and re-bumps.
 		errs.add(fmt.Errorf("absence reconcile: bump adoption gen %s: %w", base, err))
 	}
+	return true
 }
 
 // AbsenceReconcileSchedule pairs the reconciler with its cadence — its own

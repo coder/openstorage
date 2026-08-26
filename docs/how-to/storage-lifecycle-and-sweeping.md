@@ -396,9 +396,13 @@ naming its OID. Every
    [`CODESTORAGE_LFS_GC_DELETE_ENABLED`](../reference/configuration.md#codestorage_lfs_gc_delete_enabled) —
    retires rows whose stamp survived a full
    [`CODESTORAGE_LFS_GC_GRACE`](../reference/configuration.md#codestorage_lfs_gc_grace)
-   window, refunding the object count and quota bytes in the same
-   transaction. A previously `507`-wedged repository accepts new objects
-   again the moment enough junk rows retire.
+   window. The freed object count and quota bytes are refunded
+   separately: each retirement parks its refund durably, and a later run
+   settles it once a destructive LFS sweep that **started after** the
+   retirement completes cleanly — only then is the orphaned blob provably
+   reaped. A previously `507`-wedged repository accepts new objects again
+   once enough junk rows retire and a covering sweep settles their
+   refunds.
 
 Retirement is defended in depth: the delete re-checks the stamp and the
 pinned ref generations inside the same lock registrations take, and every
@@ -414,16 +418,36 @@ Two operational notes:
   blobs become ordinary rowless orphans that the [sweeper](#the-orphan-sweeper)
   reaps under its own aged, quarantine-first delete gates
   (`CODESTORAGE_SWEEP_DELETE_LFS`, plus the ADR-41 legacy gate for
-  v0.2.0-spelled keys). Startup enforces the coupling: arming
-  `CODESTORAGE_LFS_GC_DELETE_ENABLED` on a live sweep schedule requires the
-  LFS reap and a grace no shorter than the reap cadence
-  (max(`CODESTORAGE_SWEEP_AGE_THRESHOLD`, `CODESTORAGE_SWEEP_INTERVAL`, the
-  1-hour quarantine retention floor)) — refunded cap slots whose blobs (or
-  quarantine backups) nothing deletes in time would let upload → retire →
-  re-upload cycles grow the storage prefixes past the cap that quota floors
-  and sweep listings rely on. Under the sweep emergency stop
-  (`CODESTORAGE_SWEEP_INTERVAL=0`) retirement demotes to report-only with a
-  warning.
+  v0.2.0-spelled keys). The coupling is enforced twice. Startup validates
+  the CONFIGURED regime: arming `CODESTORAGE_LFS_GC_DELETE_ENABLED` on a
+  live sweep schedule requires the LFS reap and a grace no shorter than the
+  reap cadence (max(`CODESTORAGE_SWEEP_AGE_THRESHOLD`,
+  `CODESTORAGE_SWEEP_INTERVAL`, the 1-hour quarantine retention floor)) —
+  refunded cap slots whose blobs (or quarantine backups) nothing deletes in
+  time would let upload → retire → re-upload cycles grow the storage
+  prefixes past the cap that quota floors and sweep listings rely on. At
+  runtime the coupling is OBSERVED, not assumed: every destructive LFS
+  sweep pass that finishes its keyspace with zero errors records a durable
+  fleet-wide watermark, and retirement refuses to refund slots — demoting
+  to report-only, `reap_watermark_stale` in the run report — whenever no
+  such pass completed within the grace window. Sweeps that are armed but
+  failing (blob-store delete outages, passes outrunning the reclamation
+  cycle, the S3 versioning guard demoting a run to list-only, a backend
+  listing that reports no mod time for an offered candidate — its age is
+  unknowable, so it is skipped, not reaped) therefore
+  freeze refunds automatically until a clean destructive pass completes;
+  the sweep emergency stop (`CODESTORAGE_SWEEP_INTERVAL=0`) is just the
+  planned instance of the same demotion. A fresh deployment stays
+  report-only until its first clean destructive LFS sweep completes. The
+  same observed coupling gates each refund individually: a completion
+  watermark only proves a sweep that listed blobs *before* a given
+  retirement — that sweep saw the registry row and spared the blob — so
+  every retirement records the monotone sweep epoch it ran under and its
+  refund waits in a durable per-epoch bucket until a destructive pass
+  with a strictly greater epoch completes cleanly (legacy-spelled rows
+  additionally wait for a legacy-armed completion). Run reports surface
+  the flow as `refund_rows_settled` / `refund_bytes_settled` /
+  `refund_buckets_pending`.
 - **Hydration and walks are deadline-bounded.** Scanning a repository first
   materializes its git cache (downloading and indexing registered packs on a
   cold replica). Each namespace member's hydration AND its reachability walk
@@ -474,6 +498,19 @@ A reclamation run logs one `lfs reclaim pass finished` line:
 | `rows_eligible` / `rows_retired` / `rows_spared` | grace-expired rows; how many actually retired; how many the guarded delete declined at the last moment (concurrent touch, ref movement, purge fence) |
 | `bytes_retired` | quota bytes refunded |
 | `dry_run` | `true` while `CODESTORAGE_LFS_GC_DELETE_ENABLED` is off |
+| `reap_watermark_stale` / `rows_deferred_reap_stale` | `true` (and the eligible rows deferred) when no destructive LFS sweep completed cleanly within the grace window — refunds resume once one does |
+| `rows_deferred_legacy_unarmed` | eligible LEGACY-spelled rows deferred because legacy reaping is not armed end-to-end (`CODESTORAGE_SWEEP_DELETE_LFS_LEGACY` off, or the fresh watermark records a legacy-unarmed sweep) — their blobs would never be physically reaped, so the slot refund would be unbacked |
+
+Scan progress is fleet-durable: the rotation cursor and each repository's
+row-settlement resume point persist in the ref store (`job_scan_state`), so
+on multi-replica PostgreSQL fleets a pass scheduled on any replica — or
+after a rolling restart — resumes exactly where the previous pass parked
+instead of re-examining the same prefix forever. A settlement cursor is
+fenced by the repository's pinned generations: any ref movement invalidates
+it and settlement restarts from the top of that repository's keyspace.
+Cursor parking also consults the repository purge fence in the same
+transaction, so a purge racing a mid-settlement park can never resurrect a
+cursor row for a repository that will never be scanned again.
 
 ## Reconciling registered-but-missing bytes
 
@@ -515,29 +552,47 @@ cursors (budget-limited, resumable — the sweeper's inverse direction) and
 - **Truly absent** — logged loudly and, when quota is enforced, charged as a
   TTL'd restore cover (the same reservation row restore paths renew) plus a
   floor-generation bump, so every admission sees the missing bytes until
-  they are restored or their row is retired/purged. Discovered losses join
-  a per-process **known-absent set** whose bytes aggregate into one cover
-  reservation row per affected repository, renewed FIRST every pass (one
-  work unit per repository, with the tracked-repository population capped
-  at that renewal allocation — tracked ⇒ renewed every pass) — so the
-  per-repository reservation-row cap cannot bind regardless of how many
-  rows were lost. Round-robin re-verification then shrinks aggregates as
-  losses heal (rotating the reservation key so exact totals are charged);
-  a backlog there delays shrinking (conservative), never renewal. On
-  PostgreSQL the job runs on its own reserved single-worker River queue,
-  so tenant-scalable work (webhook deliveries to slow endpoints) cannot
-  delay a renewal past the cover TTL. Startup
-  enforces the cadence-vs-TTL coupling (interval ≤ TTL/2, pass wall clock
-  ≤ TTL/4), so renewals always land before live covers can lapse. The set
-  is in-memory per worker:
-  a restart loses it and the rotation rediscovers losses within one full
-  rotation — a convergence delay, never corruption. On multi-replica
-  PostgreSQL fleets the periodic job may run on any replica, so refresh
-  continuity is per-replica until
-  [#125](https://github.com/coder/code-storage/issues/125) lands fleet
-  persistence — size the budget at or above the fleet's total registered
-  row count there, making every pass a complete rotation on whichever
-  replica runs it.
+  they are restored or their row is retired/purged. Discovered losses
+  aggregate into ONE cover reservation row per affected repository and
+  registry class — so the per-repository reservation-row cap cannot bind
+  regardless of how many rows were lost — and the cover rows THEMSELVES are
+  the durable tracking state: every pass starts by re-stamping every live
+  cover's TTL in one database-clock statement (`covers_touched` — so
+  protection never depends on the per-row work completing within the TTL),
+  then lists the live cover rows and re-charges each one
+  (`covers_renewed`), one work unit per row, under half the pass budget.
+  Because renewal derives entirely from the
+  database, any replica of a multi-replica PostgreSQL fleet — or a freshly
+  restarted worker — keeps every discovered loss covered; nothing lives in
+  process memory. Aggregates stay EXACT: each full traversal of a
+  repository's rows recomputes its deficit total from scratch, growing the
+  live cover in place as losses appear, minting the next incarnation of
+  the key (and deleting the stale row — `covers_rotated`) when heals
+  shrink the total, and releasing the row outright (`covers_released`)
+  when everything healed. Renewal is the correctness core, so it always
+  offers the FULL cover listing: a population beyond its budget
+  allocation still renews every pass — flagged `renewal_over_budget`,
+  while discovery keeps a guaranteed half-budget allowance — rather than
+  round-robining past the TTL; raise
+  the budget above twice the live cover population. On PostgreSQL the job runs on its own reserved single-worker River
+  queue, so tenant-scalable work (webhook deliveries to slow endpoints)
+  cannot delay a renewal past the cover TTL, and the unique periodic job
+  serializes passes fleet-wide. Startup enforces the cadence-vs-TTL
+  coupling (interval ≤ TTL/2, pass wall clock ≤ TTL/4), so renewals always
+  land before live covers can lapse. Renewal is additionally guarded by a
+  fail-closed admission fence: each successful renewal stamps a
+  database-clock health watermark, and a renewal FAILURE that finds the
+  watermark absent or stale (covers could lapse before the next pass)
+  fences finite quota-gated writes — pushes, LFS uploads, adoptions
+  answer a transient "quota accounting temporarily degraded, retry
+  later" — until a healthy pass completes one full error-free recovery
+  rotation of both registries (a rotation any pass dirtied with a stat
+  or cover error never counts); internal restore and cover reservations
+  stay exempt so recovery can proceed. The fence and its lapse-evidence
+  trail are enforced only by fence-aware binaries: complete rolling
+  upgrades within one reservation TTL and enable the job only after the
+  whole fleet is upgraded (mixed-fleet prerequisite, ADR-43) — the boot
+  log warns while the job runs with quota enforcement.
 - **Absent pack rows registered before this feature** carry no recorded
   size (`pack_rows_unsized`): the loss is reported but cannot be charged
   until a repack fold rewrites the row with its size.
@@ -561,10 +616,13 @@ A reconciliation pass logs one `absence reconcile pass finished` line:
 | `covers_charged` / `bytes_covered` | restore covers charged/refreshed this pass and their total bytes |
 | `cover_errors` / `stat_errors` | covers that failed (e.g. the per-repo reservation-row cap) and probes that errored — both retried next pass |
 | `rows_skipped_purged` | rows of purge-fenced repositories skipped |
-| `absent_tracked` | known-absent set size at pass end: losses whose per-repository aggregate covers renew every pass |
-| `absent_refreshed` | tracked losses re-verified this pass — below `absent_tracked` means heal-detection (cover shrinking) spans multiple passes; renewal is unaffected |
-| `absent_untracked` | losses beyond the tracked-repository capacity (`budget/4`) or the 100,000-entry memory cap — aggregated into one pass-scoped overflow cover per repository, renewed only on rotation revisits. Renewal above capacity cannot fit ANY bounded budget by definition: size the budget at ≥ 4× the worst simultaneously-affected repository count you need continuous covers for (the 100,000 default covers 25,000 repositories) |
-| `absent_dropped` | tracked rows dropped because their repository's aggregate could not be renewed this pass (pass deadline / ledger failure) — rediscovered by rotation; investigate the ledger if persistent |
+| `covers_touched` | live deterministic cover rows whose TTL the pass-start bulk touch re-stamped in one database-clock statement (protection never waits on the per-row listing) |
+| `covers_renewed` | live cover rows re-charged by the renewal phase (fleet-derived from the durable cover listing — any replica renews every cover) |
+| `covers_rotated` / `covers_released` | shrink re-mints (heals reduced a repository's exact re-derived total; the stale row was deleted) and outright releases (fully healed, emptied of registry rows, or a superseded incarnation retired) |
+| `covers_decaying` | pre-upgrade nonce-keyed covers folded into deterministic incarnations and left to expire by TTL (never deleted — an old replica may still depend on them mid-roll) |
+| `renewal_over_budget` | the live cover population outran the renewal allocation — every cover still renewed, and discovery keeps its guaranteed half-budget allowance; raise the budget above twice the live cover population |
+| `renewal_incomplete` | the pass deadline cut the renewal listing short (resumed first next pass on the durable cursor) — investigate the store if persistent, covers lapse if renewals cannot land within the TTL |
+| `lfs_traversals` / `pack_traversals` | completed origin-to-origin rotations per registry (fleet-durable; heals shed within one clean traversal) |
 | `quota_enforced` | `false` means detection-only (no quota admission to protect) |
 
 Any nonzero `lfs_rows_absent` or `pack_rows_absent` means storage lost

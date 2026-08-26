@@ -11,6 +11,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"math"
 	"time"
 )
 
@@ -33,7 +34,39 @@ func (s *SQLite) ReservePackBytes(ctx context.Context, group []string, packs []P
 	} else if fenced {
 		return ReserveDecision{}, fmt.Errorf("reserve pack bytes %s: %w", group[0], ErrRepoPurged)
 	}
+	// Cover-renewal degraded fence — see the PG twin (Codex round 26 on
+	// PR #132, security): finite quota-gated admissions fail closed
+	// while armed; unbounded internal reservations proceed.
+	if quotaBytes != math.MaxInt64 {
+		var degraded bool
+		if err := tx.QueryRowContext(ctx,
+			`SELECT EXISTS (SELECT 1 FROM job_scan_state WHERE job = ? AND scope = ?)`,
+			ScanJobAbsence, ScanScopeAbsenceAdmissionFence).Scan(&degraded); err != nil {
+			return ReserveDecision{}, fmt.Errorf("reserve pack bytes degraded fence: %w", err)
+		}
+		if degraded {
+			return ReserveDecision{RenewalDegraded: true}, nil
+		}
+	}
 	// Self-healing GC for expired rows — see the PG twin's rationale.
+	// Record the lapse-evidence marker BEFORE the delete consumes the
+	// physical evidence (Codex round 33 on PR #132); the IMMEDIATE
+	// transaction makes the pair atomic.
+	if _, err := tx.ExecContext(ctx, `
+INSERT INTO job_scan_state (job, scope, payload, generation, updated_at)
+SELECT ?, ?, key, 0, `+sqliteEpochMS+` FROM pack_reservations
+WHERE repo = ? AND created_at <= `+sqliteEpochMS+` - ?
+  AND key > ? AND key < ?
+  AND substr(key, -?) = ?
+  AND owner <> ?
+LIMIT 1
+ON CONFLICT (job, scope) DO UPDATE SET payload = excluded.payload, updated_at = `+sqliteEpochMS+``,
+		ScanJobAbsence, ScanScopeAbsenceLapse,
+		group[0], ttl.Milliseconds(),
+		AbsenceCoverPrefix, absenceCoverRangeEnd,
+		len(absenceCoverRawSuffix), absenceCoverRawSuffix, AbsenceFoldedOwner); err != nil {
+		return ReserveDecision{}, fmt.Errorf("reserve pack bytes lapse marker: %w", err)
+	}
 	if _, err := tx.ExecContext(ctx,
 		`DELETE FROM pack_reservations WHERE repo = ? AND created_at <= `+sqliteEpochMS+` - ?
   AND key NOT LIKE '%/adopt-claim'`,
@@ -180,10 +213,36 @@ func (s *SQLite) RetirePackAttempts(ctx context.Context, group []string, gens ma
 }
 
 // SweepExpiredPackReservations prunes reservation rows at least olderThan
-// old.
+// old. The marker insert runs BEFORE the delete inside one IMMEDIATE
+// transaction: deleting an expired un-folded absence-cover row destroys
+// the physical lapse evidence the reconciler's first-health-stamp probe
+// arms on, and the scheduled sweep is a second consumer of that evidence
+// beside ReservePackBytes' admission-time GC (Codex rounds 33+34 on
+// PR #132). The sweeper passes the admission TTL as olderThan, so every
+// doomed cover row is exactly a lapsed cover; folded rows never mark.
 func (s *SQLite) SweepExpiredPackReservations(ctx context.Context, olderThan time.Duration) (int64, error) {
 	assertf(olderThan >= 0, "SweepExpiredPackReservations: negative age %v", olderThan)
-	res, err := s.db.ExecContext(ctx, `
+	tx, err := s.db.BeginTx(ctx, nil) // BEGIN IMMEDIATE via _txlock
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx, `
+INSERT INTO job_scan_state (job, scope, payload, generation, updated_at)
+SELECT ?, ?, key, 0, `+sqliteEpochMS+` FROM pack_reservations
+WHERE key NOT LIKE '%/adopt-claim' AND created_at <= `+sqliteEpochMS+` - ?
+  AND key > ? AND key < ?
+  AND substr(key, -?) = ?
+  AND owner <> ?
+LIMIT 1
+ON CONFLICT (job, scope) DO UPDATE SET payload = excluded.payload, updated_at = `+sqliteEpochMS+``,
+		ScanJobAbsence, ScanScopeAbsenceLapse,
+		olderThan.Milliseconds(),
+		AbsenceCoverPrefix, absenceCoverRangeEnd,
+		len(absenceCoverRawSuffix), absenceCoverRawSuffix, AbsenceFoldedOwner); err != nil {
+		return 0, fmt.Errorf("sweep reservations lapse marker: %w", err)
+	}
+	res, err := tx.ExecContext(ctx, `
 DELETE FROM pack_reservations
 WHERE (key NOT LIKE '%/adopt-claim' AND created_at <= `+sqliteEpochMS+` - ?)
    OR (key LIKE '%/adopt-claim' AND created_at <= `+sqliteEpochMS+` - ?)`,
@@ -191,7 +250,11 @@ WHERE (key NOT LIKE '%/adopt-claim' AND created_at <= `+sqliteEpochMS+` - ?)
 	if err != nil {
 		return 0, err
 	}
-	return res.RowsAffected()
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	return n, tx.Commit()
 }
 
 // IsRetainedPack reports whether (repo, key) is a recorded superseded blob.
@@ -670,6 +733,7 @@ func (s *SQLite) QuotaLedgerState(ctx context.Context, group []string, ttl time.
 	for _, r := range group {
 		args = append(args, r)
 	}
+	args = append(args, ScanJobAbsence, ScanScopeAbsenceAdmissionFence)
 	var st PackQuotaLedgerState
 	err := s.db.QueryRowContext(ctx, `
 SELECT
@@ -677,7 +741,8 @@ SELECT
   COALESCE((SELECT SUM(bytes) FROM pack_reservations
             WHERE repo = ? AND created_at > `+sqliteEpochMS+` - ?
               AND key NOT LIKE '%`+AdoptionClaimSuffix+`'`+exclude+`), 0),
-  COALESCE((SELECT SUM(bytes) FROM pack_retained WHERE repo IN (?`+placeholders(len(group)-1)+`)), 0)`,
-		args...).Scan(&st.UsageBytes, &st.ReservedBytes, &st.RetainedBytes)
+  COALESCE((SELECT SUM(bytes) FROM pack_retained WHERE repo IN (?`+placeholders(len(group)-1)+`)), 0),
+  EXISTS (SELECT 1 FROM job_scan_state WHERE job = ? AND scope = ?)`,
+		args...).Scan(&st.UsageBytes, &st.ReservedBytes, &st.RetainedBytes, &st.RenewalDegraded)
 	return st, err
 }
