@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.45.0] - 2026-08-25
+
+### Changed
+
+- Upgrade supported Go versions to 1.26 and 1.27. [PR #1356](https://github.com/riverqueue/river/pull/1356).
+
+### Fixed
+
+- Fixed periodic jobs advancing their durable next run time when job insertion fails. [PR #1359](https://github.com/riverqueue/river/pull/1359).
+- Improved SQLite queue count performance on large job tables by limiting counts to available and running jobs so the existing state and queue index can be used. [PR #1360](https://github.com/riverqueue/river/pull/1360).
+
+## [0.44.1] - 2026-08-21
+
+### Fixed
+
+- SQLite job completion, rescue, and full-update paths now serialize timestamps using River's standard millisecond format instead of relying on database driver serialization, preventing inconsistent timestamp representations from being persisted. [PR #1353](https://github.com/riverqueue/river/pull/1353)
+- SQLite drivers now return a non-nil empty `JobRow.Errors` slice for jobs without errors, matching the behavior of PostgreSQL drivers and ensuring the field serializes to `[]` instead of `null`. [PR #1354](https://github.com/riverqueue/river/pull/1354).
+
+## [0.44.0] - 2026-08-18
+
+### Added
+
+- Added `EventKindJobInterrupted`, emitted when a running job is interrupted because its client is shutting down, the job was cancelled, and has been made immediately available to be worked again. [PR #1290](https://github.com/riverqueue/river/pull/1290).
+
+### Changed
+
+- Jobs that didn't finish in time organically while a client was stopping and had to have their context cancelled no longer have this cancellation counted as an error. `attempt` is reset to the number it was before the job started working, `errors` is left unchanged, and `state` is made `available` so jobs are eligible to be retried immediately. [PR #1290](https://github.com/riverqueue/river/pull/1290)
+
+### Fixed
+
+- Write timestamps in SQLite to always include three digits after the second like `.000`. Previously, they may have been truncated down to just `.0` in the case of trailing zeroes. [PR #1349](https://github.com/riverqueue/river/pull/1349)
+- Job completion events now reflect the job's persisted outcome when it differs from the transition requested by the worker. For example, a job completed with `JobCompleteTx` before its worker returns an error emits `job_completed`, and a remotely cancelled job whose worker errors or snoozes emits `job_cancelled`. Applications subscribed only to `job_failed` or `job_snoozed` should note that these events may instead be delivered to `job_completed` or `job_cancelled` subscribers. [PR #1350](https://github.com/riverqueue/river/pull/1350)
+
 ## [0.43.0] - 2026-08-05
 
 ### Added

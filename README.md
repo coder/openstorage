@@ -42,7 +42,7 @@ Prebuilt binaries (`linux`/`darwin` × `amd64`/`arm64`, with `checksums.txt`) sh
 `./codestorage` — substitute accordingly:
 
 ```sh
-# Go toolchain (needs Go >= 1.26):
+# Go toolchain (needs Go >= 1.27):
 go install github.com/coder/code-storage/cmd/codestorage@latest
 
 # mise (downloads the release binary; verifies checksums + GitHub artifact attestations):
