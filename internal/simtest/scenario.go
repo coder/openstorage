@@ -96,11 +96,11 @@ type Result struct {
 	Transitions int // distinct committed ref transitions observed
 	Deliveries  int // webhook deliveries recorded
 	Faults      int // faults injected
-	// CASFaults is the subset of Faults injected at the s3wal
+	// CASFaults is the subset of Faults DELIVERED at the s3wal
 	// conditional-store transport layer (cas.* ops; zero on the SQLite
-	// backend) — the vacuity guard for the Phase 2 fault plan.
-	// CASFaultOps breaks it down per op so every advertised surface can
-	// be required to FIRE, not merely be called.
+	// backend; store-rejected attempts excluded) — the vacuity guard for
+	// the Phase 2 fault plan. CASFaultOps breaks it down per op so every
+	// advertised surface can be required to FIRE, not merely be called.
 	CASFaults   int
 	CASFaultOps map[string]int
 	Steals      int // expired sync claims stolen (issues #86/#88)
@@ -427,10 +427,20 @@ func (s *sim) result() Result {
 	casFaults := 0
 	casFaultOps := make(map[string]int)
 	for _, ev := range s.inj.Fired() {
-		if strings.HasPrefix(ev.Op, "cas.") {
-			casFaults++
-			casFaultOps[ev.Op]++
+		if !strings.HasPrefix(ev.Op, "cas.") {
+			continue
 		}
+		// A "rejected" inner outcome means the store's precondition
+		// failed before any failure could be delivered (SimCAS
+		// propagates the definitive 412/exists verdict): the attempt
+		// exercised normal lost-race handling, not the advertised fault
+		// path, so it must not satisfy the fired-fault guards (Codex
+		// round 4 on PR #159).
+		if strings.HasPrefix(ev.InnerOutcome, "rejected") {
+			continue
+		}
+		casFaults++
+		casFaultOps[ev.Op]++
 	}
 	return Result{
 		Seed:              s.cfg.Seed,

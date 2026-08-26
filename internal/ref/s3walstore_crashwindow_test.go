@@ -78,25 +78,43 @@ func (e *crashEnv) deleteBlob(base, key string) {
 }
 
 // assertPQ asserts P and Q over base's manifest (T is enforced at delete
-// time by deleteBlob; A by the explicit cover checks).
+// time by deleteBlob; A by the explicit cover checks). Q sums the MODELED
+// blob sizes for live pack/LFS rows — not the manifest's own recorded
+// bytes, which would make the equation self-referential and blind to a
+// registration recording wrong counts consistently (Codex round 4 on PR
+// #159). Retained tombstones keep manifest-recorded bytes: their blobs
+// are legally deleted under T.
 func (e *crashEnv) assertPQ(base string) {
 	e.t.Helper()
 	m := mustManifest(e.t, e.s, base)
 	var packs, retained int64
 	for repo, mem := range m.Members {
 		for _, p := range mem.Packs {
-			if _, ok := e.blobs[p.Key]; !ok {
+			size, ok := e.blobs[p.Key]
+			if !ok {
 				e.t.Errorf("P violated: %s registers pack %s (key %s) with no blob", repo, p.ID, p.Key)
+				continue
 			}
-			packs += p.Bytes
+			if p.Bytes != size {
+				e.t.Errorf("Q violated: %s pack %s records %d bytes, modeled blob is %d", repo, p.ID, p.Bytes, size)
+			}
+			packs += size
 		}
 		for _, r := range mem.Retained {
 			retained += r.Bytes
 		}
 	}
 	var lfs int64
-	for _, o := range m.LFS.Objects {
-		lfs += o.Bytes
+	for key, o := range m.LFS.Objects {
+		size, ok := e.blobs[key]
+		if !ok {
+			e.t.Errorf("P violated: registered LFS object %s has no blob", key)
+			continue
+		}
+		if o.Bytes != size {
+			e.t.Errorf("Q violated: LFS object %s records %d bytes, modeled blob is %d", key, o.Bytes, size)
+		}
+		lfs += size
 	}
 	if want := packs + retained + lfs; m.UsageBytes != want {
 		e.t.Errorf("Q violated: usage %d != packs %d + retained %d + lfs %d", m.UsageBytes, packs, retained, lfs)
