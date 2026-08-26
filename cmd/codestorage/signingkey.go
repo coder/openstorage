@@ -39,7 +39,7 @@ var sshPublicKeyTypes = map[string]bool{
 
 func cmdSigningKey(ctx context.Context, args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: codestorage signing-key <add|list|remove> --org <org> ...")
+		return errors.New("usage: codestorage signing-key <add|list|remove> --org <org> [flags]")
 	}
 	sub, rest := args[0], args[1:]
 

@@ -1,20 +1,49 @@
-# golangci-lint configuration (v1 schema; CI + local gate is `golangci-lint run`).
-# Keep this modest: the default linter set (errcheck, gosimple, govet,
-# ineffassign, staticcheck, unused) plus a few low-noise style linters.
-run:
-  timeout: 5m
-
+# golangci-lint configuration (v2 schema; CI + local gate is `golangci-lint run`).
+# Keep this modest: the default linter set (errcheck, govet, ineffassign,
+# staticcheck, unused) plus a few low-noise style linters, and gofmt/goimports
+# as formatters. The tool pin lives in mise.toml (single source of truth).
+version: "2"
 linters:
+  enable:
+    - misspell
+    - nolintlint
+    - unconvert
+  settings:
+    staticcheck:
+      # v2 defaults plus -QF*: quickfix refactoring suggestions are style
+      # noise, not correctness; the v1 gate (staticcheck+gosimple) never ran
+      # them and this keeps the migration behavior-preserving.
+      checks:
+        - all
+        - -ST1000
+        - -ST1003
+        - -ST1016
+        - -ST1020
+        - -ST1021
+        - -ST1022
+        - -QF*
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
+formatters:
   enable:
     - gofmt
     - goimports
-    - misspell
-    - unconvert
-    - nolintlint
-
-linters-settings:
-  goimports:
-    local-prefixes: github.com/coder/code-storage
-
-issues:
-  exclude-use-default: true
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/coder/code-storage
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$

@@ -9,6 +9,7 @@ linters:
 
     # disabled because we're not compliant, but which we should think about
     - exhaustruct # checks that properties in structs are exhaustively defined; may be a good idea
+    - exhaustruct_v5 # they actually did another one
     - testpackage # requires tests in test packages like `river_test`
 
     # disabled because it's deprecated, and `default: all` already enables its
@@ -51,6 +52,28 @@ linters:
               pkg: github.com/riverqueue/river/internal/dbadaptertest
             - desc: Don't use `riverinternaltest` package outside of test environments.
               pkg: github.com/riverqueue/river/internal/riverinternaltest
+
+        # The next two blocks have the same intent: don't allow testsignal,
+        # which is used in non-test code, to have non-stdlib dependencies.
+        # Previously, we ran into a problem where it was accidentally importing
+        # riversharedtest, which was importing Goleak, Testify, YAML (through
+        # Testify), etc. which added 10 kB overhead to all binaries built with
+        # River. testsignal does use testutil, so the second block makes sure
+        # that testutil has no stdlib dependencies so that testsignal doesn't
+        # pick one up transitively.
+        testsignal-no-test-deps:
+          files:
+            - "**/testsignal/*.go"
+            - "!$test"
+          allow:
+            - $gostd
+            - "github.com/riverqueue/river/rivershared/util/testutil$"
+        testutil-no-test-deps:
+          files:
+            - "**/util/testutil/*.go"
+            - "!$test"
+          allow:
+            - $gostd
 
     forbidigo:
       forbid:
