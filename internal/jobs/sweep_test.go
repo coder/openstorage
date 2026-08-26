@@ -827,6 +827,78 @@ func TestSweep_WatermarkWithheldOnGuardDrift(t *testing.T) {
 	}
 }
 
+// zeroModTime hides one key's mod time from listings, simulating a backend
+// entry whose age is unknowable.
+type zeroModTime struct {
+	blob.BlobStore
+	key string
+}
+
+func (b *zeroModTime) ListPages(ctx context.Context, prefix string, pageSize int, fn func([]blob.ListedObject) error) error {
+	return b.BlobStore.ListPages(ctx, prefix, pageSize, func(objs []blob.ListedObject) error {
+		for i := range objs {
+			if objs[i].Key == b.key {
+				objs[i].ModTime = time.Time{}
+			}
+		}
+		return fn(objs)
+	})
+}
+
+// TestSweep_WatermarkWithheldOnUnknownAgeLFS (Codex round 37 on PR #132): a
+// zero-ModTime backend listing makes an offered LFS candidate's age
+// unknowable, so classify skips it — but the pass stamped the reap epoch at
+// start, and certifying completion would settle refund buckets (refilling
+// object-cap slots and byte headroom) for a blob that was offered and NOT
+// reaped. An armed-class skip must withhold the completion watermark
+// exactly like guard drift. An UNARMED legacy-spelled skip must not: the
+// completion is not legacy-armed, legacy buckets stay pending regardless,
+// and blocking canonical settlement on it would starve settleable buckets.
+func TestSweep_WatermarkWithheldOnUnknownAgeLFS(t *testing.T) {
+	f := newSweepFixture(t)
+	oid := strings.Repeat("ab", 32)
+	key := blob.LFSKey("r1", oid)
+	f.upload(key, "orphan-lfs-bytes")
+	f.backdate(key, 25*time.Hour)
+
+	recorded := 0
+	cfg := SweepConfig{
+		Threshold:             24 * time.Hour,
+		DeleteLFS:             true,
+		RecordLFSReapComplete: func(context.Context, int64, bool) error { recorded++; return nil },
+	}
+	s := NewSweeper(&zeroModTime{BlobStore: f.blobs, key: key}, f.store, cfg, slog.New(slog.DiscardHandler))
+	if _, err := s.Sweep(context.Background()); err == nil {
+		t.Fatal("Sweep: want the unknowable-age armed skip surfaced in the error join")
+	}
+	if recorded != 0 {
+		t.Fatalf("recorded=%d, want the watermark withheld while the offered candidate was not reaped", recorded)
+	}
+
+	// Control: once the backend reports a real mod time again, the same
+	// pass shape reaps the orphan and certifies completion.
+	report, err := f.sweeper(cfg).Sweep(context.Background())
+	if err != nil {
+		t.Fatalf("Sweep with real mod times: %v", err)
+	}
+	if report.Deleted != 1 || recorded != 1 {
+		t.Fatalf("deleted=%d recorded=%d, want the orphan reaped and the watermark recorded", report.Deleted, recorded)
+	}
+
+	// An unarmed legacy-spelled skip stays warn-only.
+	legacyKey := blob.LFSLegacyKey("r1", oid)
+	f.upload(legacyKey, "legacy-lfs-bytes")
+	f.backdate(legacyKey, 25*time.Hour)
+	recorded = 0
+	s3 := NewSweeper(&zeroModTime{BlobStore: f.blobs, key: legacyKey}, f.store, cfg, slog.New(slog.DiscardHandler))
+	if _, err := s3.Sweep(context.Background()); err != nil {
+		t.Fatalf("Sweep with unarmed legacy skip: %v", err)
+	}
+	if recorded != 1 {
+		t.Fatalf("recorded=%d, want the watermark recorded despite the unarmed legacy skip", recorded)
+	}
+}
+
 // A tiny classification threshold must not shrink the quarantine purge
 // age below the handshake-lifetime floor: a backup older than the
 // threshold but younger than QuarantinePurgeFloor may still be an

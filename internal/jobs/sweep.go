@@ -586,6 +586,23 @@ func (s *Sweeper) classify(ctx context.Context, repo string, obj blob.ListedObje
 		// A backend that reports no mod time makes age unknowable; never
 		// treat unknowable as expired.
 		s.logger.Warn("orphan pack sweep: skipping key without mod time", "key", obj.Key)
+		// An armed-LFS-class skip poisons this pass's completion
+		// certification (Codex round 37 on PR #132): the reap epoch was
+		// stamped at pass start, and a recorded completion settles
+		// refund buckets — decrementing lfs_object_counts and refilling
+		// object-cap slots — for retirements this pass claims to have
+		// observed reaped. This candidate was OFFERED and not reaped,
+		// so fold the skip into deleteErrs, withholding the watermark
+		// exactly like guard drift (refunds defer, the conservative
+		// direction) while the sweep itself proceeds. An UNARMED
+		// legacy-spelled skip stays warn-only: without legacyMode the
+		// completion is not legacy-armed, legacy buckets stay pending
+		// regardless, and blocking canonical settlement on a key this
+		// pass never promised to reap would starve it indefinitely.
+		if lfsMode && strings.HasPrefix(obj.Key, blob.LFSRoot) &&
+			(strings.Contains(obj.Key, "/o2/") || legacyMode) {
+			deleteErrs.add(fmt.Errorf("lfs reap: offered candidate %s has no mod time — not reaped, completion watermark withheld", obj.Key))
+		}
 		return nil
 	}
 	age := s.now().Sub(obj.ModTime)

@@ -432,7 +432,9 @@ Two operational notes:
   to report-only, `reap_watermark_stale` in the run report — whenever no
   such pass completed within the grace window. Sweeps that are armed but
   failing (blob-store delete outages, passes outrunning the reclamation
-  cycle, the S3 versioning guard demoting a run to list-only) therefore
+  cycle, the S3 versioning guard demoting a run to list-only, a backend
+  listing that reports no mod time for an offered candidate — its age is
+  unknowable, so it is skipped, not reaped) therefore
   freeze refunds automatically until a clean destructive pass completes;
   the sweep emergency stop (`CODESTORAGE_SWEEP_INTERVAL=0`) is just the
   planned instance of the same demotion. A fresh deployment stays
