@@ -20,11 +20,13 @@ func main() {
 	seed := flag.Uint64("seed", 0, "simulation seed (DST_SEED)")
 	steps := flag.Int("steps", 0, "scheduler steps (0 = default)")
 	nodes := flag.Int("nodes", 0, "simulated nodes (0 = default)")
+	backend := flag.String("backend", "", "authority-store lane: sqlite or s3wal (DST_REF_BACKEND; empty = sqlite)")
 	verbose := flag.Bool("v", false, "print the trace while running")
 	keep := flag.Bool("keep", false, "keep the run directory for inspection (prints its path)")
 	flag.Parse()
 
-	cfg := simtest.Config{Seed: *seed, Steps: *steps, Nodes: *nodes, KeepDir: *keep}
+	cfg := simtest.Config{Seed: *seed, Steps: *steps, Nodes: *nodes, KeepDir: *keep,
+		RefBackend: simtest.RefBackend(*backend)}
 	if *verbose {
 		cfg.Trace = os.Stdout
 	}
@@ -43,8 +45,8 @@ func main() {
 		fmt.Fprintln(os.Stderr, "dst: infrastructure failure:", err)
 		os.Exit(2)
 	}
-	fmt.Printf("seed=%d steps=%d trace=%s transitions=%d deliveries=%d faults=%d steals=%d crash-steals=%d push-steals=%d push-crash-steals=%d push-forced-rescues=%d\n",
-		res.Seed, res.Steps, res.TraceHash, res.Transitions, res.Deliveries, res.Faults, res.Steals, res.CrashSteals,
+	fmt.Printf("seed=%d backend=%s steps=%d trace=%s transitions=%d deliveries=%d faults=%d cas-faults=%d steals=%d crash-steals=%d push-steals=%d push-crash-steals=%d push-forced-rescues=%d\n",
+		res.Seed, res.Backend, res.Steps, res.TraceHash, res.Transitions, res.Deliveries, res.Faults, res.CASFaults, res.Steals, res.CrashSteals,
 		res.PushSteals, res.PushCrashSteals, res.PushForcedRescues)
 	if len(res.Violations) > 0 {
 		for _, v := range res.Violations {

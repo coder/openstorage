@@ -2,8 +2,14 @@
 
 Deterministic, seeded simulation of a multi-node code-storage cluster with
 fault injection, ported from waltier's SimStore + DST design (issue #3).
-Everything runs in one process on the SQLite + fileblob backends: zero
-containers.
+Everything runs in one process — zero containers — on two authority-store
+lanes (`Config.RefBackend`): the shared SQLite file (default) and the
+s3wal manifest-CAS driver over one shared in-memory conditional store
+(`s3wal.MemCAS`), the plan §4 Phase 2 lane. The s3wal lane's multi-node
+shared-fake topology is deliberately stricter than that backend's
+single-node deployment decree: every PROTOCOL race between manifest
+writers is simulated. The meta store (sync/push claim lanes) and fileblob
+are backend-independent.
 
 ## What it exercises
 
@@ -48,6 +54,15 @@ Storage calls pass through `SimRefStore`/`SimBlobStore`, which inject:
   behind issue #2);
 - **transient not-found faults** — a pack download reports
   `blob.ErrNotFound` once (the vanished-pack class behind issue #6).
+
+On the s3wal lane a second injection layer sits BELOW the driver: each
+node's `SimCAS` transport view of the shared conditional store injects
+clean read/list failures, never-executed and ambiguous(applied|dropped)
+conditional PUTs — exercising the driver's own §2.3 mutate/recover
+machinery under the same run that exercises `ref.IdempotentCAS` above it —
+plus a targeted stale first read on half the node reboots (a stale read
+against a LIVE driver instance is process-fatal by design: the seq
+watermark treats it as store-fidelity violation).
 
 ## Invariant oracles
 
@@ -107,10 +122,10 @@ Checked from clean (never fault-injected) handles:
 
 | What | How |
 | --- | --- |
-| PR gate (fast) | `TestDSTFast`, `TestDSTDeterminism` — run in the normal `go test ./...` pipeline |
-| Reproduce a seed | `DST_SEED=<seed> [DST_STEPS=<n>] go test ./internal/simtest -run 'TestDSTSeed' -v` |
-| CLI repro | `go run ./cmd/dst -seed <seed> [-steps N] [-v] [-keep]` |
-| Nightly sweep | `.github/workflows/dst-nightly.yml` → `TestDSTSweep` (`DST_SWEEP_SEEDS`, `DST_SWEEP_BASE`, `DST_STEPS`) |
+| PR gate (fast) | `TestDSTFast`, `TestDSTDeterminism` — run in the normal `go test ./...` pipeline, one subtest per backend lane |
+| Reproduce a seed | `DST_SEED=<seed> [DST_STEPS=<n>] [DST_REF_BACKEND=s3wal] go test ./internal/simtest -run 'TestDSTSeed' -v` |
+| CLI repro | `go run ./cmd/dst -seed <seed> [-steps N] [-backend s3wal] [-v] [-keep]` |
+| Nightly sweep | `.github/workflows/dst-nightly.yml` → `TestDSTSweep` (`DST_SWEEP_SEEDS`, `DST_SWEEP_BASE`, `DST_STEPS`, `DST_REF_BACKEND` — one job per backend lane) |
 
 ## Triaging a failing seed
 
@@ -160,7 +175,15 @@ The harness must catch re-broken variants of the fixes it guards. Locally
 - break #136 marker monotonicity: make `RequestPush` overwrite instead of
   coalesce (`SET push_pending = ?` instead of `MAX(push_pending, ?)`) —
   the mirror reports a pending-level divergence at the first plain
-  request or rescue re-mark that lands on an unconsumed force marker.
+  request or rescue re-mark that lands on an unconsumed force marker;
+- break the s3wal ambiguous-PUT recovery: in `mutate`
+  (internal/ref/s3walstore.go) replace the `fresh.Writer == ourNonce`
+  identity check with `true` (and drop its seq assert) so every ambiguous
+  re-read is treated as an own-write — the s3wal lane reports a
+  `reported won but tip=` violation on the first ambiguous-DROPPED
+  conditional PUT under a CAS (detecting run:
+  `DST_SEED=3 DST_STEPS=200 DST_REF_BACKEND=s3wal`, violation at step
+  131).
 
 The first two were validated when this harness landed, the #86 one when
 the sync oracle landed, and the #136 ones when the push-lane oracle
