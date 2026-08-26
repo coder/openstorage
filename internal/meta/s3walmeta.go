@@ -1,0 +1,998 @@
+// S3 implementation of Backend for the s3wal zero-infrastructure mode
+// (issue #133, docs/plans/s3wal-plan.md §5-Q4): ALL metadata tables live in
+// ONE conditional JSON object, `_wal/meta.json`, advanced by CAS through
+// the same s3wal.ConditionalStore substrate the ref manifests use
+// (If-None-Match:* create, If-Match advance, seq + fresh writer nonce per
+// write for ambiguous-PUT recovery — plan §2.3, simplified for a single
+// low-write-rate object).
+//
+// Semantics mirror sqlite.go/sqlite_eventing.go 1:1 wherever a SQL twin
+// exists: same sentinels, soft delete with the 404/409 distinction,
+// (org_id, url) uniqueness spanning soft-deleted rows, the same opaque
+// cursors, and Go-side unixnano timestamps (WithNowFunc injects the
+// clock, so claim-lease expiry is a pure function of it — the DB-clock
+// stand-in, exactly like meta.SQLite). Cross-writer arbitration never
+// reads clocks: it is the object CAS itself, so the §2.4 manifest-clock
+// machinery is deliberately absent here.
+//
+// Concurrency: one object ⇒ one process-local mutex serializes every
+// operation (the meta twin of ref.S3WAL.lockBase); cross-process writers
+// serialize on the object CAS. Reads validate a process-local
+// (etag, body) cache via conditional GET (304) and decode fresh per use,
+// so no decoded state is ever aliased across operations.
+package meta
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	mrand "math/rand/v2"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+	"unicode/utf8"
+
+	"github.com/coder/code-storage/internal/ref/s3wal"
+	"github.com/coder/code-storage/internal/secrets"
+)
+
+// ErrValueNotUTF8 rejects caller-supplied strings carrying invalid UTF-8
+// before any document mutation (the ref.ErrRefNameNotUTF8 rationale):
+// encoding/json silently rewrites invalid bytes to U+FFFD, so two distinct
+// raw values (or map keys — org names key the orgs table) would collapse
+// onto one stored spelling, silently corrupting lookups and uniqueness.
+// The SQL twins diverge here exactly like the ref stores: PostgreSQL TEXT
+// rejects invalid UTF-8 at the wire, SQLite stores raw bytes verbatim.
+// Reads need no guard — no document can contain such a value, so raw-byte
+// lookups are clean misses.
+var ErrValueNotUTF8 = errors.New("s3walmeta: string value is not valid UTF-8")
+
+// s3walMetaKey is the single conditional object holding every meta table.
+// Unlike manifests it may carry an extension: it is a fixed key, never
+// part of an order-sensitive prefix listing (plan §2.1 applies to
+// `_wal/repo/` only), and the sweeper excludes the whole `_wal/` prefix.
+const s3walMetaKey = "_wal/meta.json"
+
+// s3walMetaVersion is the only document schema version this binary reads
+// or writes.
+const s3walMetaVersion = 1
+
+// s3walMetaDoc is the whole metadata state — every table of the SQL
+// schema as one JSON document. Timestamps are int64 unixnano written
+// Go-side (the sqlite.go storage convention, so rows round-trip exactly
+// and returned time.Time values byte-match later reads); zero means
+// NULL/cleared where the SQL column is nullable or an epoch lease.
+type s3walMetaDoc struct {
+	V int `json:"v"`
+	// Seq is strictly monotonic, bumped by every CAS; with the fresh
+	// Writer nonce it guarantees distinct bytes per version ⇒ distinct
+	// ETag (the §5-R4 ETag-ABA defense, same as manifests).
+	Seq    int64  `json:"seq"`
+	Writer string `json:"writer"`
+	// NextOrgID / NextKeyID replace the SQL AUTOINCREMENT columns; IDs
+	// stay monotonic so registration order survives deletes.
+	NextOrgID int64 `json:"next_org_id"`
+	NextKeyID int64 `json:"next_key_id"`
+
+	Orgs        map[string]*s3walMetaOrg        `json:"orgs,omitempty"`        // by org name
+	Repos       map[string]*s3walMetaRepo       `json:"repos,omitempty"`       // by repo_id
+	Webhooks    map[string]*s3walMetaWebhook    `json:"webhooks,omitempty"`    // by webhook id
+	Credentials map[string]*s3walMetaCredential `json:"credentials,omitempty"` // by credential id
+	Upstreams   map[string]*s3walMetaUpstream   `json:"upstreams,omitempty"`   // by repo_id
+}
+
+type s3walMetaOrg struct {
+	ID        int64 `json:"id"`
+	CreatedAt int64 `json:"created_at"`
+	// PublicKeys in registration order (replaced wholesale by upsert).
+	PublicKeys []string `json:"public_keys"`
+	// SigningKeys ordered by ID (append-only mint from NextKeyID).
+	SigningKeys []s3walMetaSigningKey `json:"signing_keys,omitempty"`
+}
+
+type s3walMetaSigningKey struct {
+	ID        int64  `json:"id"`
+	KeyText   string `json:"key_text"`
+	CreatedAt int64  `json:"created_at"`
+}
+
+type s3walMetaRepo struct {
+	OrgID         int64  `json:"org_id"`
+	URL           string `json:"url"`
+	DefaultBranch string `json:"default_branch"`
+	CreatedAt     int64  `json:"created_at"`
+	DeletedAt     int64  `json:"deleted_at,omitempty"` // 0 = live
+	PurgedAt      int64  `json:"purged_at,omitempty"`  // 0 = never purged
+}
+
+type s3walMetaWebhook struct {
+	OrgID     int64  `json:"org_id"`
+	URL       string `json:"url"`
+	Secret    string `json:"secret"` // stored form: plaintext or envelope (secrets.go)
+	CreatedAt int64  `json:"created_at"`
+}
+
+type s3walMetaCredential struct {
+	RepoID    string `json:"repo_id"`
+	Username  string `json:"username"`
+	Password  string `json:"password"` // stored form: plaintext or envelope (secrets.go)
+	CreatedAt int64  `json:"created_at"`
+}
+
+type s3walMetaUpstream struct {
+	Provider     string `json:"provider"`
+	Owner        string `json:"owner"`
+	Name         string `json:"name"`
+	UpstreamHost string `json:"upstream_host"`
+	RunCount     int    `json:"run_count"`
+	SuccessCount int    `json:"success_count"`
+	Syncing      bool   `json:"syncing"`
+	SyncPending  bool   `json:"sync_pending"`
+	// Claim leases: holder token plus absolute unixnano expiry (0 =
+	// cleared, the SQL epoch default) — compared against the injected
+	// clock exactly like sqlite_eventing.go.
+	SyncClaimHolder    string `json:"sync_claim_holder,omitempty"`
+	SyncClaimExpiresAt int64  `json:"sync_claim_expires_at,omitempty"`
+	ForwardOnPush      bool   `json:"forward_on_push,omitempty"`
+	PushPending        int    `json:"push_pending,omitempty"`
+	PushSyncing        bool   `json:"push_syncing,omitempty"`
+	PushClaimHolder    string `json:"push_claim_holder,omitempty"`
+	PushClaimExpiresAt int64  `json:"push_claim_expires_at,omitempty"`
+	PushClaimForce     bool   `json:"push_claim_force,omitempty"`
+	PushRunCount       int    `json:"push_run_count,omitempty"`
+	PushSuccessCount   int    `json:"push_success_count,omitempty"`
+	CreatedAt          int64  `json:"created_at"`
+}
+
+// toRepoUpstream renders the stored row as the interface type, converting
+// unixnano back to UTC time.Time per the RepoUpstream contract (cleared
+// leases read as the epoch instant, matching the SQL twins).
+func (u *s3walMetaUpstream) toRepoUpstream(repoID string) RepoUpstream {
+	return RepoUpstream{
+		RepoID:             repoID,
+		Provider:           u.Provider,
+		Owner:              u.Owner,
+		Name:               u.Name,
+		UpstreamHost:       u.UpstreamHost,
+		RunCount:           u.RunCount,
+		SuccessCount:       u.SuccessCount,
+		Syncing:            u.Syncing,
+		SyncPending:        u.SyncPending,
+		SyncClaimHolder:    u.SyncClaimHolder,
+		SyncClaimExpiresAt: time.Unix(0, u.SyncClaimExpiresAt).UTC(),
+		ForwardOnPush:      u.ForwardOnPush,
+		PushPending:        u.PushPending,
+		PushSyncing:        u.PushSyncing,
+		PushClaimHolder:    u.PushClaimHolder,
+		PushClaimExpiresAt: time.Unix(0, u.PushClaimExpiresAt).UTC(),
+		PushClaimForce:     u.PushClaimForce,
+		PushRunCount:       u.PushRunCount,
+		PushSuccessCount:   u.PushSuccessCount,
+		CreatedAt:          time.Unix(0, u.CreatedAt).UTC(),
+	}
+}
+
+// newS3WALMetaDoc is the empty (never-written) state: Seq 0, so the first
+// encodeAdvance writes seq 1 through the If-None-Match:* create path. A
+// missing object and this value are interchangeable.
+func newS3WALMetaDoc() *s3walMetaDoc {
+	return &s3walMetaDoc{V: s3walMetaVersion}
+}
+
+// decodeS3WALMetaDoc parses and validates one fetched document body.
+// Corruption is a crash-and-burn error, never a silent empty state.
+func decodeS3WALMetaDoc(body []byte) (*s3walMetaDoc, error) {
+	var doc s3walMetaDoc
+	if err := json.Unmarshal(body, &doc); err != nil {
+		return nil, fmt.Errorf("s3walmeta: document decode: %w", err)
+	}
+	if doc.V != s3walMetaVersion {
+		return nil, fmt.Errorf("s3walmeta: document version %d unsupported (want %d)", doc.V, s3walMetaVersion)
+	}
+	if doc.Seq < 1 {
+		return nil, fmt.Errorf("s3walmeta: document seq %d invalid (stored documents start at 1)", doc.Seq)
+	}
+	if doc.Writer == "" {
+		return nil, fmt.Errorf("s3walmeta: document seq %d has no writer nonce", doc.Seq)
+	}
+	assertf(doc.NextOrgID >= 0 && doc.NextKeyID >= 0,
+		"s3walmeta: document seq %d has negative id counters (%d, %d)", doc.Seq, doc.NextOrgID, doc.NextKeyID)
+	return &doc, nil
+}
+
+// encodeAdvance encodes the NEXT version of doc: seq+1 and a fresh 128-bit
+// writer nonce (distinct bytes per write ⇒ distinct ETag). doc is updated
+// in place so the caller can read the minted nonce for ambiguous-PUT
+// recovery. The org-name key assert is the codec-boundary backstop for
+// the U+FFFD aliasing hazard (see ErrValueNotUTF8): every public write
+// path rejects invalid UTF-8 first, so tripping it is a missed guard.
+func (doc *s3walMetaDoc) encodeAdvance() ([]byte, error) {
+	assertf(doc.V == s3walMetaVersion, "encodeAdvance: version %d", doc.V)
+	assertf(doc.Seq >= 0, "encodeAdvance: seq %d", doc.Seq)
+	for name := range doc.Orgs {
+		assertf(utf8.ValidString(name),
+			"encodeAdvance: org key %q is not valid UTF-8 — JSON encoding would alias it onto its U+FFFD spelling", name)
+	}
+	doc.Seq++
+	doc.Writer = newS3WALMetaNonce()
+	body, err := json.Marshal(doc)
+	if err != nil {
+		return nil, fmt.Errorf("s3walmeta: document encode: %w", err)
+	}
+	return body, nil
+}
+
+// newS3WALMetaNonce mints the 128-bit hex writer nonce.
+func newS3WALMetaNonce() string {
+	var buf [16]byte
+	_, err := rand.Read(buf[:])
+	assertf(err == nil, "s3walmeta: crypto/rand failed: %v", err)
+	return hex.EncodeToString(buf[:])
+}
+
+// S3WAL implements Backend (plus the purge seams) over one conditional
+// meta object. Construct via OpenS3WAL (production, real store + probe)
+// or NewS3WAL (tests/DST, injectable substrate).
+type S3WAL struct {
+	cas s3wal.ConditionalStore
+	// probe runs InitSchema's conditional-write fidelity check (§2.6);
+	// nil (test fakes) skips it.
+	probe   func(ctx context.Context) error
+	closeFn func()
+	// codec, when non-nil, envelope-encrypts the secret fields exactly
+	// like the SQL backends (secrets.go).
+	codec *secrets.Codec
+	// now, when non-nil, replaces time.Now for every stored timestamp
+	// AND the claim-lease expiry comparisons (WithNowFunc — the SQLite
+	// DB-clock twin).
+	now func() time.Time
+	// sink, when non-nil, mirrors inbound sync claims into the base repo
+	// group's ref manifest (§2.8 write-through; SyncClaimSink).
+	sink SyncClaimSink
+
+	// Lost-race retry budget (plan §2.3).
+	casAttempts int
+	backoffBase time.Duration
+	backoffCap  time.Duration
+
+	// mu serializes every operation in this process: one object ⇒ one
+	// lock (the meta twin of ref.S3WAL.lockBase).
+	mu sync.Mutex
+	// cacheETag/cacheBody is the 304-validated read cache; lastSeq is the
+	// per-object stale-read watermark (plan §2.3 — a store serving an
+	// older seq than this process observed is a fidelity violation).
+	cacheETag string
+	cacheBody []byte
+	lastSeq   int64
+}
+
+var _ Backend = (*S3WAL)(nil)
+
+// newS3WALStore wraps a conditional store; probe and closeFn may be nil.
+func newS3WALStore(cs s3wal.ConditionalStore, probe func(ctx context.Context) error, closeFn func(), o storeOptions) *S3WAL {
+	assertf(cs != nil, "newS3WALStore: nil conditional store")
+	return &S3WAL{
+		cas:         cs,
+		probe:       probe,
+		closeFn:     closeFn,
+		codec:       o.codec,
+		now:         o.now,
+		sink:        o.claimSink,
+		casAttempts: 16,
+		backoffBase: 10 * time.Millisecond,
+		backoffCap:  2 * time.Second,
+	}
+}
+
+// NewS3WAL wraps an injectable conditional store, probe-less: the
+// constructor unit tests and the DST harness build meta backends from
+// (mirroring ref.NewS3WAL). Production serving goes through OpenS3WAL.
+func NewS3WAL(cs s3wal.ConditionalStore, opts ...Option) *S3WAL {
+	return newS3WALStore(cs, nil, nil, resolveOptions(opts))
+}
+
+// OpenS3WAL opens s3wal://bucket?endpoint=…&region=… — the exact URL
+// grammar of the ref store (s3wal.Dial). Open performs no network I/O;
+// the conditional-write probe runs at InitSchema (ADR-12: Open never runs
+// DDL, and hooks reconstructing stores from env URLs must not probe).
+func OpenS3WAL(ctx context.Context, rawURL string, opts ...Option) (*S3WAL, error) {
+	c, err := s3wal.Dial(ctx, rawURL)
+	if err != nil {
+		return nil, fmt.Errorf("open s3wal meta store: %w", err)
+	}
+	return newS3WALStore(c, func(ctx context.Context) error { return s3wal.Probe(ctx, c) }, c.Close, resolveOptions(opts)), nil
+}
+
+// InitSchema proves the store's conditional-write fidelity before serving
+// (plan §2.6) — there is no DDL, the document is created lazily by the
+// first write. Unlike ref.S3WAL.InitSchema it does NOT require an HTTP
+// Date witness: this backend runs no §2.4 TTL expiry verdicts (claim
+// leases compare caller-written absolute stamps under the injected clock,
+// the SQLite twin's semantics), so no destructive verdict ever consults
+// the store clock. Idempotent.
+func (s *S3WAL) InitSchema(ctx context.Context) error {
+	if s.probe == nil {
+		return nil
+	}
+	if err := s.probe(ctx); err != nil {
+		return fmt.Errorf("s3walmeta init: %w", err)
+	}
+	return nil
+}
+
+func (s *S3WAL) Close() {
+	if s.closeFn != nil {
+		s.closeFn()
+	}
+}
+
+// nowNano mirrors SQLite.nowNano: the store's current instant as stored
+// (unixnano) plus its exact time.Time rendering, so returned rows
+// byte-match later reads (JSON stores the integer; decode reconstructs
+// the identical time.Unix(0, n).UTC()).
+func (s *S3WAL) nowNano() (int64, time.Time) {
+	now := time.Now()
+	if s.now != nil {
+		now = s.now()
+	}
+	nanos := now.UnixNano()
+	return nanos, time.Unix(0, nanos).UTC()
+}
+
+// utf8OK rejects caller-supplied write values that JSON would coerce.
+func utf8OK(what, v string) error {
+	if !utf8.ValidString(v) {
+		return fmt.Errorf("%s: %w", what, ErrValueNotUTF8)
+	}
+	return nil
+}
+
+// checkSeq enforces the stale-read watermark; caller holds mu.
+func (s *S3WAL) checkSeq(seq int64) {
+	assertf(seq >= s.lastSeq,
+		"s3walmeta stale read: store served seq %d after this process observed %d", seq, s.lastSeq)
+	if seq > s.lastSeq {
+		s.lastSeq = seq
+	}
+}
+
+// readDoc fetches the current document, validating the process-local
+// cache with a conditional GET (304 ⇒ decode the cached body — decoding
+// fresh per use keeps mutation snapshots from ever aliasing the cache).
+// A missing object is the empty state with etag "" (create path). Caller
+// holds mu.
+func (s *S3WAL) readDoc(ctx context.Context) (*s3walMetaDoc, string, error) {
+	if s.cacheETag == "" {
+		obj, err := s.cas.Get(ctx, s3walMetaKey)
+		if errors.Is(err, s3wal.ErrNotExist) {
+			return newS3WALMetaDoc(), "", nil
+		}
+		if err != nil {
+			return nil, "", fmt.Errorf("s3walmeta read: %w", err)
+		}
+		return s.adoptRead(obj)
+	}
+	obj, err := s.cas.GetIfChanged(ctx, s3walMetaKey, s.cacheETag)
+	if errors.Is(err, s3wal.ErrNotModified) {
+		doc, derr := decodeS3WALMetaDoc(s.cacheBody)
+		if derr != nil {
+			return nil, "", derr
+		}
+		return doc, s.cacheETag, nil
+	}
+	if errors.Is(err, s3wal.ErrNotExist) {
+		// The document is never deleted once created (purge stamps a
+		// tombstone field, exactly like manifests): a vanish after seq
+		// lastSeq was observed is store infidelity or operator surgery.
+		return nil, "", fmt.Errorf("s3walmeta read: %s vanished after seq %d was observed (the meta object is never deleted)", s3walMetaKey, s.lastSeq)
+	}
+	if err != nil {
+		return nil, "", fmt.Errorf("s3walmeta read: %w", err)
+	}
+	return s.adoptRead(obj)
+}
+
+// adoptRead decodes a freshly fetched body, checks the seq watermark, and
+// installs it as the new cache. Caller holds mu.
+func (s *S3WAL) adoptRead(obj s3wal.Object) (*s3walMetaDoc, string, error) {
+	doc, err := decodeS3WALMetaDoc(obj.Body)
+	if err != nil {
+		return nil, "", err
+	}
+	s.checkSeq(doc.Seq)
+	s.cacheBody, s.cacheETag = obj.Body, obj.ETag
+	return doc, obj.ETag, nil
+}
+
+// viewDoc is the read-only entry point: lock, fetch, return.
+func (s *S3WAL) viewDoc(ctx context.Context) (*s3walMetaDoc, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	doc, _, err := s.readDoc(ctx)
+	return doc, err
+}
+
+// s3walMetaVerdict is a recovery predicate's answer for an ambiguous PUT
+// whose writer nonce is not ours (plan §2.3): the write may still have
+// landed and been superseded.
+type s3walMetaVerdict int
+
+const (
+	// s3walMetaRerun re-evaluates the mutation on the fresh snapshot —
+	// legal where re-applying is provably harmless (ID) or where fn
+	// re-derives the correct outcome from the fresh state (PRED).
+	s3walMetaRerun s3walMetaVerdict = iota
+	// s3walMetaApplied concludes our write landed: fn's outputs stand.
+	s3walMetaApplied
+)
+
+// s3walMetaMutation drives one read-mutate-CAS operation.
+type s3walMetaMutation struct {
+	op string
+	// fn mutates doc in place, returning apply=false to finish without a
+	// CAS (read-only verdicts, no-op retries) or an error to abort
+	// (nothing was written). fn may run several times on fresh snapshots
+	// and must reset its output closure variables at the top of every
+	// run.
+	fn func(doc *s3walMetaDoc) (apply bool, err error)
+	// recover classifies a fresh post-ambiguity snapshot (nil =
+	// s3walMetaRerun, the idempotent-re-apply fallback). There is no
+	// fail-closed verdict here: unlike the ref quota ledger, every meta
+	// mutation is ID or PRED (plan Appendix A — "low-rate CRUD is
+	// ID/PRED"), so a rerun on the fresh snapshot is always sound.
+	recover func(doc *s3walMetaDoc) s3walMetaVerdict
+}
+
+// mutate runs one read-mutate-CAS loop with the §2.3 recovery discipline,
+// simplified from ref.S3WAL.mutate for a single object with no decorator
+// above it (no IdempotentCAS recheck consumes a not-executed marker, so
+// errors are returned plainly): 412 lost races re-read and re-evaluate
+// under a full-jitter backoff; ambiguous PUTs re-read and resolve via
+// writer nonce, then the per-method recovery class; provably-never-sent
+// attempts retry.
+func (s *S3WAL) mutate(ctx context.Context, mu s3walMetaMutation) error {
+	assertf(mu.fn != nil && mu.op != "", "mutate: incomplete mutation %+v", mu)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for attempt := 0; attempt < s.casAttempts; attempt++ {
+		doc, etag, err := s.readDoc(ctx)
+		if err != nil {
+			return err
+		}
+		apply, err := mu.fn(doc)
+		if err != nil {
+			return err
+		}
+		if !apply {
+			return nil
+		}
+		body, err := doc.encodeAdvance()
+		if err != nil {
+			return fmt.Errorf("s3walmeta %s: %w", mu.op, err)
+		}
+		ourNonce, ourSeq := doc.Writer, doc.Seq
+		var newETag string
+		var werr error
+		if etag == "" {
+			newETag, werr = s.cas.Create(ctx, s3walMetaKey, body)
+		} else {
+			newETag, werr = s.cas.Advance(ctx, s3walMetaKey, body, etag)
+		}
+		if werr == nil {
+			s.checkSeq(ourSeq)
+			s.cacheBody, s.cacheETag = body, newETag
+			return nil
+		}
+		switch {
+		case errors.Is(werr, s3wal.ErrExists), errors.Is(werr, s3wal.ErrLostRace):
+			// Definitively not executed: someone else advanced first.
+			if err := s.sleepJitter(ctx, attempt); err != nil {
+				return fmt.Errorf("s3walmeta %s: %w", mu.op, err)
+			}
+			continue
+		case errors.Is(werr, s3wal.ErrNotExecuted):
+			continue // provably never sent — plain retry
+		}
+		var amb *s3wal.AmbiguousError
+		if !errors.As(werr, &amb) {
+			// Definitive rejection (auth, bucket, exhausted contention):
+			// the write did not take effect.
+			return fmt.Errorf("s3walmeta %s: %w", mu.op, werr)
+		}
+		// Ambiguous: the write MAY have landed. Re-read and resolve.
+		fresh, _, rerr := s.readDoc(ctx)
+		if rerr != nil {
+			// Recovery read failed: stay ambiguous (fail closed).
+			return fmt.Errorf("s3walmeta %s: %w (recovery read failed: %v)", mu.op, werr, rerr)
+		}
+		if fresh.Writer == ourNonce {
+			assertf(fresh.Seq == ourSeq, "s3walmeta %s: our nonce at foreign seq %d (wrote %d)", mu.op, fresh.Seq, ourSeq)
+			return nil // our write landed and is the latest
+		}
+		verdict := s3walMetaRerun
+		if mu.recover != nil {
+			verdict = mu.recover(fresh)
+		}
+		if verdict == s3walMetaApplied {
+			return nil
+		}
+		// Re-run fn on a fresh snapshot.
+	}
+	return fmt.Errorf("s3walmeta %s: %d attempts: %w", mu.op, s.casAttempts, s3wal.ErrCASContention)
+}
+
+// sleepJitter blocks for the §2.3 full-jitter lost-race backoff.
+func (s *S3WAL) sleepJitter(ctx context.Context, attempt int) error {
+	assertf(attempt >= 0 && attempt < 63, "sleepJitter: attempt %d out of range", attempt)
+	ceiling := min(s.backoffCap, s.backoffBase<<uint(attempt))
+	assertf(ceiling > 0, "sleepJitter: non-positive backoff ceiling %v", ceiling)
+	timer := time.NewTimer(mrand.N(ceiling))
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+// lookupOrg resolves an org name to its row; ErrNotFound for unknown orgs
+// (invalid-UTF-8 names are clean misses — no document can contain them).
+func lookupOrg(doc *s3walMetaDoc, name string) (*s3walMetaOrg, error) {
+	assertf(name != "", "lookupOrg: empty org name")
+	org := doc.Orgs[name]
+	if org == nil {
+		return nil, fmt.Errorf("org %q: %w", name, ErrNotFound)
+	}
+	assertf(org.ID > 0, "org %q resolved to non-positive id %d", name, org.ID)
+	return org, nil
+}
+
+// toRepo renders a stored repo row as the interface type.
+func (r *s3walMetaRepo) toRepo(repoID string) Repo {
+	repo := Repo{
+		RepoID:        repoID,
+		OrgID:         r.OrgID,
+		URL:           r.URL,
+		DefaultBranch: r.DefaultBranch,
+		CreatedAt:     time.Unix(0, r.CreatedAt).UTC(),
+	}
+	if r.DeletedAt != 0 {
+		utc := time.Unix(0, r.DeletedAt).UTC()
+		repo.DeletedAt = &utc
+	}
+	return repo
+}
+
+// UpsertOrgWithKeys idempotently creates the org and replaces its
+// registered PEM public keys. Recovery class ID: a re-run on a fresh
+// snapshot re-applies the same terminal state, and the ID mint is
+// re-derived per run (an org our landed write created is found, never
+// re-minted).
+func (s *S3WAL) UpsertOrgWithKeys(ctx context.Context, name string, pemPublicKeys []string) (Org, error) {
+	assertf(name != "", "UpsertOrgWithKeys: empty org name")
+	assertf(len(pemPublicKeys) > 0, "UpsertOrgWithKeys: org %q needs at least one public key", name)
+	for i, pem := range pemPublicKeys {
+		assertf(strings.TrimSpace(pem) != "", "UpsertOrgWithKeys: blank PEM block %d for org %q", i, name)
+		if err := utf8OK("public key", pem); err != nil {
+			return Org{}, fmt.Errorf("upsert org %q: %w", name, err)
+		}
+	}
+	if err := utf8OK("org name", name); err != nil {
+		return Org{}, fmt.Errorf("upsert org: %w", err)
+	}
+	nanos, _ := s.nowNano()
+	var org Org
+	err := s.mutate(ctx, s3walMetaMutation{
+		op: "upsert org",
+		fn: func(doc *s3walMetaDoc) (bool, error) {
+			row := doc.Orgs[name]
+			if row == nil {
+				doc.NextOrgID++
+				row = &s3walMetaOrg{ID: doc.NextOrgID, CreatedAt: nanos}
+				if doc.Orgs == nil {
+					doc.Orgs = make(map[string]*s3walMetaOrg)
+				}
+				doc.Orgs[name] = row
+			}
+			row.PublicKeys = append([]string(nil), pemPublicKeys...)
+			org = Org{ID: row.ID, Name: name, CreatedAt: time.Unix(0, row.CreatedAt).UTC()}
+			return true, nil
+		},
+	})
+	if err != nil {
+		return Org{}, fmt.Errorf("upsert org %q: %w", name, err)
+	}
+	return org, nil
+}
+
+// PublicKeysForOrg returns the org's registered PEM public key blocks in
+// registration order.
+func (s *S3WAL) PublicKeysForOrg(ctx context.Context, name string) ([]string, error) {
+	doc, err := s.viewDoc(ctx)
+	if err != nil {
+		return nil, err
+	}
+	org, err := lookupOrg(doc, name)
+	if err != nil {
+		return nil, err
+	}
+	return append([]string(nil), org.PublicKeys...), nil
+}
+
+// OrgNames returns every org row's name, ordered by name.
+func (s *S3WAL) OrgNames(ctx context.Context) ([]string, error) {
+	doc, err := s.viewDoc(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var names []string
+	for name := range doc.Orgs {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names, nil
+}
+
+// CreateRepo inserts a live repo with a server-generated RepoID.
+// ErrAlreadyExists when (org, url) is taken — even by a soft-deleted or
+// purged row (the burned-name invariant). Recovery class PRED: the
+// per-run RepoID is random and never reused, so its presence on the fresh
+// snapshot proves OUR insert landed.
+func (s *S3WAL) CreateRepo(ctx context.Context, org, url, defaultBranch string) (Repo, error) {
+	assertf(url != "", "CreateRepo: empty url for org %q", org)
+	assertf(defaultBranch != "", "CreateRepo: empty default branch for %q (caller defaults to main)", url)
+	for what, v := range map[string]string{"url": url, "default branch": defaultBranch} {
+		if err := utf8OK(what, v); err != nil {
+			return Repo{}, fmt.Errorf("create repo %q in org %q: %w", url, org, err)
+		}
+	}
+	nanos, createdAt := s.nowNano()
+	var repo Repo
+	var repoID string
+	err := s.mutate(ctx, s3walMetaMutation{
+		op: "create repo",
+		fn: func(doc *s3walMetaDoc) (bool, error) {
+			orgRow, err := lookupOrg(doc, org)
+			if err != nil {
+				return false, err
+			}
+			for _, r := range doc.Repos {
+				if r.OrgID == orgRow.ID && r.URL == url {
+					return false, fmt.Errorf("repo %q in org %q: %w", url, org, ErrAlreadyExists)
+				}
+			}
+			repoID = newRepoID()
+			if doc.Repos == nil {
+				doc.Repos = make(map[string]*s3walMetaRepo)
+			}
+			doc.Repos[repoID] = &s3walMetaRepo{OrgID: orgRow.ID, URL: url, DefaultBranch: defaultBranch, CreatedAt: nanos}
+			repo = Repo{RepoID: repoID, OrgID: orgRow.ID, URL: url, DefaultBranch: defaultBranch, CreatedAt: createdAt}
+			return true, nil
+		},
+		recover: func(doc *s3walMetaDoc) s3walMetaVerdict {
+			if repoID != "" && doc.Repos[repoID] != nil {
+				return s3walMetaApplied
+			}
+			return s3walMetaRerun
+		},
+	})
+	if err != nil {
+		return Repo{}, err
+	}
+	return repo, nil
+}
+
+// liveRepo returns the live repo row for (orgID, url); nil when absent or
+// soft-deleted.
+func (doc *s3walMetaDoc) liveRepoByURL(orgID int64, url string) (string, *s3walMetaRepo) {
+	for id, r := range doc.Repos {
+		if r.OrgID == orgID && r.URL == url && r.DeletedAt == 0 {
+			return id, r
+		}
+	}
+	return "", nil
+}
+
+// GetRepoByURL returns the live repo with the given url; ErrNotFound when
+// absent or soft-deleted.
+func (s *S3WAL) GetRepoByURL(ctx context.Context, org, url string) (Repo, error) {
+	assertf(url != "", "GetRepoByURL: empty url for org %q", org)
+	doc, err := s.viewDoc(ctx)
+	if err != nil {
+		return Repo{}, err
+	}
+	orgRow, err := lookupOrg(doc, org)
+	if err != nil {
+		return Repo{}, err
+	}
+	id, r := doc.liveRepoByURL(orgRow.ID, url)
+	if r == nil {
+		return Repo{}, fmt.Errorf("repo %q in org %q: %w", url, org, ErrNotFound)
+	}
+	return r.toRepo(id), nil
+}
+
+// GetRepoByID returns the live repo with the given RepoID; ErrNotFound
+// when absent or soft-deleted.
+func (s *S3WAL) GetRepoByID(ctx context.Context, org, repoID string) (Repo, error) {
+	assertf(repoID != "", "GetRepoByID: empty repoID for org %q", org)
+	doc, err := s.viewDoc(ctx)
+	if err != nil {
+		return Repo{}, err
+	}
+	orgRow, err := lookupOrg(doc, org)
+	if err != nil {
+		return Repo{}, err
+	}
+	r := doc.Repos[repoID]
+	if r == nil || r.OrgID != orgRow.ID || r.DeletedAt != 0 {
+		return Repo{}, fmt.Errorf("repo id %q in org %q: %w", repoID, org, ErrNotFound)
+	}
+	return r.toRepo(repoID), nil
+}
+
+// UpdateRepoDefaultBranch CASes the live repo's default branch (Store
+// contract). Recovery class PRED on the semantic effect: branch == new
+// proves the swap holds (an ambiguous PUT superseded by a competitor that
+// wrote the SAME transition is reported won=true although SQL would grant
+// exactly one of the two — an accepted divergence: the terminal state is
+// identical and the corner requires a lost response).
+func (s *S3WAL) UpdateRepoDefaultBranch(ctx context.Context, org, url, oldBranch, newBranch string) (bool, error) {
+	assertf(url != "", "UpdateRepoDefaultBranch: empty url for org %q", org)
+	assertf(oldBranch != "" && newBranch != "",
+		"UpdateRepoDefaultBranch: empty branch for %q (old %q, new %q)", url, oldBranch, newBranch)
+	if err := utf8OK("default branch", newBranch); err != nil {
+		return false, fmt.Errorf("update default branch of %q in org %q: %w", url, org, err)
+	}
+	won := false
+	err := s.mutate(ctx, s3walMetaMutation{
+		op: "update default branch",
+		fn: func(doc *s3walMetaDoc) (bool, error) {
+			won = false
+			orgRow, err := lookupOrg(doc, org)
+			if err != nil {
+				return false, err
+			}
+			_, r := doc.liveRepoByURL(orgRow.ID, url)
+			if r == nil {
+				return false, fmt.Errorf("repo %q in org %q: %w", url, org, ErrNotFound)
+			}
+			if r.DefaultBranch != oldBranch {
+				return false, nil // changed concurrently: won=false, no error
+			}
+			r.DefaultBranch = newBranch
+			won = true
+			return true, nil
+		},
+		recover: func(doc *s3walMetaDoc) s3walMetaVerdict {
+			orgRow := doc.Orgs[org]
+			if orgRow == nil {
+				return s3walMetaRerun
+			}
+			if _, r := doc.liveRepoByURL(orgRow.ID, url); r != nil && r.DefaultBranch == newBranch {
+				won = true
+				return s3walMetaApplied
+			}
+			return s3walMetaRerun
+		},
+	})
+	if err != nil {
+		return false, err
+	}
+	return won, nil
+}
+
+// SoftDeleteRepo sets the deletion stamp and returns the affected repo.
+// ErrNotFound when no row exists; ErrAlreadyDeleted when already
+// soft-deleted. Recovery class PRED: the per-run stamp proves OUR delete
+// landed; a row deleted under a different stamp re-runs into the
+// ErrAlreadyDeleted classification.
+func (s *S3WAL) SoftDeleteRepo(ctx context.Context, org, url string) (Repo, error) {
+	assertf(url != "", "SoftDeleteRepo: empty url for org %q", org)
+	nanos, _ := s.nowNano()
+	var repo Repo
+	err := s.mutate(ctx, s3walMetaMutation{
+		op: "soft delete repo",
+		fn: func(doc *s3walMetaDoc) (bool, error) {
+			orgRow, err := lookupOrg(doc, org)
+			if err != nil {
+				return false, err
+			}
+			var id string
+			var row *s3walMetaRepo
+			for rid, r := range doc.Repos {
+				if r.OrgID == orgRow.ID && r.URL == url {
+					id, row = rid, r
+					break
+				}
+			}
+			if row == nil {
+				return false, fmt.Errorf("repo %q in org %q: %w", url, org, ErrNotFound)
+			}
+			if row.DeletedAt != 0 {
+				return false, fmt.Errorf("repo %q in org %q: %w", url, org, ErrAlreadyDeleted)
+			}
+			row.DeletedAt = nanos
+			repo = row.toRepo(id)
+			return true, nil
+		},
+		recover: func(doc *s3walMetaDoc) s3walMetaVerdict {
+			orgRow := doc.Orgs[org]
+			if orgRow == nil {
+				return s3walMetaRerun
+			}
+			for _, r := range doc.Repos {
+				if r.OrgID == orgRow.ID && r.URL == url && r.DeletedAt == nanos {
+					return s3walMetaApplied
+				}
+			}
+			return s3walMetaRerun
+		},
+	})
+	if err != nil {
+		return Repo{}, err
+	}
+	assertf(repo.DeletedAt != nil, "soft delete of %q returned nil deleted_at", repo.RepoID)
+	return repo, nil
+}
+
+// ListRepos pages live repos for the org, keyset-ordered by
+// (created_at DESC, repo_id DESC) with the shared opaque cursor
+// (cursor.go). The Q filter is a literal case-insensitive substring
+// match; folding is Unicode-wide here (strings.ToLower) where SQLite
+// folds ASCII only and PG folds per locale — an accepted divergence of
+// the same kind the SQL twins already document against each other.
+func (s *S3WAL) ListRepos(ctx context.Context, org string, params ListParams) (ListResult, error) {
+	assertf(params.Limit >= 1 && params.Limit <= 100,
+		"ListRepos: limit %d outside contract range [1,100]", params.Limit)
+	doc, err := s.viewDoc(ctx)
+	if err != nil {
+		return ListResult{}, err
+	}
+	orgRow, err := lookupOrg(doc, org)
+	if err != nil {
+		return ListResult{}, err
+	}
+	var cursorNanos int64
+	var cursorID string
+	if params.Cursor != "" {
+		createdAt, repoID, err := decodeCursor(params.Cursor)
+		if err != nil {
+			return ListResult{}, err
+		}
+		cursorNanos, cursorID = createdAt.UnixNano(), repoID
+	}
+	q := strings.ToLower(params.Q)
+	rows := make([]Repo, 0, params.Limit+1)
+	for id, r := range doc.Repos {
+		if r.OrgID != orgRow.ID || r.DeletedAt != 0 {
+			continue
+		}
+		if q != "" && !strings.Contains(strings.ToLower(r.URL), q) {
+			continue
+		}
+		if params.Cursor != "" {
+			// Keyset predicate: (created_at, repo_id) < (cursor).
+			if r.CreatedAt > cursorNanos || (r.CreatedAt == cursorNanos && id >= cursorID) {
+				continue
+			}
+		}
+		rows = append(rows, r.toRepo(id))
+	}
+	sort.Slice(rows, func(i, j int) bool {
+		if !rows[i].CreatedAt.Equal(rows[j].CreatedAt) {
+			return rows[i].CreatedAt.After(rows[j].CreatedAt)
+		}
+		return rows[i].RepoID > rows[j].RepoID
+	})
+	res := ListResult{Repos: rows}
+	if len(rows) > params.Limit {
+		res.Repos = rows[:params.Limit]
+		last := res.Repos[params.Limit-1]
+		res.NextCursor = encodeCursor(last.CreatedAt, last.RepoID)
+		res.HasMore = true
+	}
+	return res, nil
+}
+
+// AddSigningKey registers a commit-signing key for the org and returns
+// the stored row. Recovery class PRED: the per-run (ID, key text, stamp)
+// triple identifies OUR insert on the fresh snapshot (IDs are minted from
+// the monotonic counter and never reused).
+func (s *S3WAL) AddSigningKey(ctx context.Context, org, keyText string) (SigningKey, error) {
+	assertf(strings.TrimSpace(keyText) != "", "AddSigningKey: blank key text for org %q", org)
+	if err := utf8OK("key text", keyText); err != nil {
+		return SigningKey{}, fmt.Errorf("add signing key for org %q: %w", org, err)
+	}
+	nanos, createdAt := s.nowNano()
+	var key SigningKey
+	err := s.mutate(ctx, s3walMetaMutation{
+		op: "add signing key",
+		fn: func(doc *s3walMetaDoc) (bool, error) {
+			orgRow, err := lookupOrg(doc, org)
+			if err != nil {
+				return false, err
+			}
+			doc.NextKeyID++
+			orgRow.SigningKeys = append(orgRow.SigningKeys, s3walMetaSigningKey{ID: doc.NextKeyID, KeyText: keyText, CreatedAt: nanos})
+			key = SigningKey{ID: doc.NextKeyID, OrgID: orgRow.ID, KeyText: keyText, CreatedAt: createdAt}
+			return true, nil
+		},
+		recover: func(doc *s3walMetaDoc) s3walMetaVerdict {
+			orgRow := doc.Orgs[org]
+			if orgRow == nil {
+				return s3walMetaRerun
+			}
+			for _, k := range orgRow.SigningKeys {
+				if k.ID == key.ID && k.KeyText == keyText && k.CreatedAt == nanos {
+					return s3walMetaApplied
+				}
+			}
+			return s3walMetaRerun
+		},
+	})
+	if err != nil {
+		return SigningKey{}, err
+	}
+	assertf(key.ID > 0, "signing key insert returned non-positive id %d", key.ID)
+	return key, nil
+}
+
+// SigningKeysForOrg returns the org's registered signing keys in
+// registration order; empty slice when none are registered.
+func (s *S3WAL) SigningKeysForOrg(ctx context.Context, org string) ([]SigningKey, error) {
+	doc, err := s.viewDoc(ctx)
+	if err != nil {
+		return nil, err
+	}
+	orgRow, err := lookupOrg(doc, org)
+	if err != nil {
+		return nil, err
+	}
+	keys := []SigningKey{}
+	for _, k := range orgRow.SigningKeys {
+		keys = append(keys, SigningKey{ID: k.ID, OrgID: orgRow.ID, KeyText: k.KeyText, CreatedAt: time.Unix(0, k.CreatedAt).UTC()})
+	}
+	return keys, nil
+}
+
+// RemoveSigningKey deletes the signing key with the given ID. ErrNotFound
+// when the org is unknown or the ID does not belong to it. Recovery class
+// PRED on the semantic effect: IDs are never reused, so an absent ID
+// proves the deletion holds.
+func (s *S3WAL) RemoveSigningKey(ctx context.Context, org string, id int64) error {
+	assertf(id > 0, "RemoveSigningKey: non-positive id %d for org %q", id, org)
+	return s.mutate(ctx, s3walMetaMutation{
+		op: "remove signing key",
+		fn: func(doc *s3walMetaDoc) (bool, error) {
+			orgRow, err := lookupOrg(doc, org)
+			if err != nil {
+				return false, err
+			}
+			for i, k := range orgRow.SigningKeys {
+				if k.ID == id {
+					orgRow.SigningKeys = append(orgRow.SigningKeys[:i:i], orgRow.SigningKeys[i+1:]...)
+					return true, nil
+				}
+			}
+			return false, fmt.Errorf("signing key %d for org %q: %w", id, org, ErrNotFound)
+		},
+		recover: func(doc *s3walMetaDoc) s3walMetaVerdict {
+			orgRow := doc.Orgs[org]
+			if orgRow == nil {
+				return s3walMetaRerun
+			}
+			for _, k := range orgRow.SigningKeys {
+				if k.ID == id {
+					return s3walMetaRerun
+				}
+			}
+			return s3walMetaApplied
+		},
+	})
+}
