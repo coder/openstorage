@@ -112,11 +112,39 @@ func TestReadNotesGet(t *testing.T) {
 			coreRequireStatus(t, resp, body, 404)
 			requireEnvelope(t, resp, body)
 		})
-		t.Run("missing or short sha is 400", func(t *testing.T) {
-			for _, q := range []string{"", "sha=" + fx.c1[:8]} {
-				resp, body := get(t, q)
-				coreRequireStatus(t, resp, body, 400)
+		t.Run("missing object_ref is 400", func(t *testing.T) {
+			resp, body := get(t, "")
+			coreRequireStatus(t, resp, body, 400)
+		})
+		// Issue #161: object_ref accepts revisions — a branch, tag, short
+		// SHA, or full ref resolving to a commit — mirroring the write
+		// surface; responses echo the resolved id in `sha`.
+		t.Run("object_ref revisions", func(t *testing.T) {
+			for _, c := range []struct {
+				name, query string
+				want        rnotesGetResponse
+			}{
+				{"branch name", "object_ref=main&notes_ref=" + url.QueryEscape("reviews/session-b"),
+					rnotesGetResponse{SHA: fx.c2, Note: "session b", RefSHA: fx.sessionBTip}},
+				{"short sha", "object_ref=" + fx.c1[:8],
+					rnotesGetResponse{SHA: fx.c1, Note: "reviewed", RefSHA: fx.commitsTip}},
+				{"deprecated sha alias", "sha=" + fx.c1[:8],
+					rnotesGetResponse{SHA: fx.c1, Note: "reviewed", RefSHA: fx.commitsTip}},
+			} {
+				t.Run(c.name, func(t *testing.T) {
+					resp, body := get(t, c.query)
+					coreRequireStatus(t, resp, body, 200)
+					var got rnotesGetResponse
+					coreDecode(t, body, &got)
+					if got != c.want {
+						t.Fatalf("body = %+v, want %+v", got, c.want)
+					}
+				})
 			}
+			// A non-resolving revision is a clear 404.
+			resp, body := get(t, "object_ref=no-such-rev")
+			coreRequireStatus(t, resp, body, 404)
+			requireEnvelope(t, resp, body)
 		})
 		t.Run("non-notes ref is 400", func(t *testing.T) {
 			resp, body := get(t, "sha="+fx.c1+"&ref="+url.QueryEscape("refs/tags/v1"))
@@ -152,11 +180,6 @@ func TestReadNotesGet(t *testing.T) {
 			if got != want {
 				t.Fatalf("alias-conflict body = %+v, want %+v (current names win)", got, want)
 			}
-
-			// The effective object_ref value keeps the write surface's
-			// full-40-hex validation.
-			resp, body = get(t, "object_ref="+fx.c1[:8])
-			coreRequireStatus(t, resp, body, 400)
 		})
 	})
 }
