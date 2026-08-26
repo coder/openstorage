@@ -706,28 +706,13 @@ func (s *server) wrefHandleNote(w http.ResponseWriter, r *http.Request, deleteNo
 		oldOrZero = ref.ZeroSHA
 	}
 
-	// Invariant 1: expected_notes_ref_sha is the notes-ref CAS guard; the
-	// zero sha asserts the ref is unborn.
-	if expectedRefSHA != "" && expectedRefSHA != oldOrZero {
-		wrefNoteFail(w, http.StatusPreconditionFailed,
-			fmt.Sprintf("expected_notes_ref_sha %.8s does not match %s tip %.8s", expectedRefSHA, targetRef, oldOrZero),
-			objectSHA, targetRef, old, oldOrZero)
-		return
-	}
-
 	ctx := r.Context()
-	if ref.ValidSHA(objectSHA) {
-		// Full-40-hex fast path: the note target must exist (any object
-		// kind, per git notes).
-		if _, err := wrefGit(ctx, repoPath, nil, nil,
-			"rev-parse", "--verify", "--quiet", "--end-of-options", objectSHA+"^{object}"); err != nil {
-			wrefNoteFail(w, http.StatusNotFound, "object not found: "+objectSHA, objectSHA, targetRef, old, oldOrZero)
-			return
-		}
-	} else {
-		// openapi (issue #161): any other object_ref is a revision — a
+	if !ref.ValidSHA(objectSHA) {
+		// openapi (issue #161): a non-40-hex object_ref is a revision — a
 		// branch, tag, short SHA, or full ref — that must resolve to a
 		// commit; unresolvable input fails like an unknown object id.
+		// Resolution runs before the CAS guard below so every envelope
+		// (the 412 included) reports the resolved id in `sha`.
 		resolved, err := gitread.ResolveRef(ctx, repoPath, objectSHA, false)
 		if errors.Is(err, gitread.ErrNotFound) {
 			wrefNoteFail(w, http.StatusNotFound, "object_ref does not resolve to a commit: "+objectSHA, objectSHA, targetRef, old, oldOrZero)
@@ -737,6 +722,23 @@ func (s *server) wrefHandleNote(w http.ResponseWriter, r *http.Request, deleteNo
 			return
 		}
 		objectSHA = resolved
+	}
+
+	// Invariant 1: expected_notes_ref_sha is the notes-ref CAS guard; the
+	// zero sha asserts the ref is unborn.
+	if expectedRefSHA != "" && expectedRefSHA != oldOrZero {
+		wrefNoteFail(w, http.StatusPreconditionFailed,
+			fmt.Sprintf("expected_notes_ref_sha %.8s does not match %s tip %.8s", expectedRefSHA, targetRef, oldOrZero),
+			objectSHA, targetRef, old, oldOrZero)
+		return
+	}
+
+	// The note target must exist (any object kind, per git notes; a
+	// revision-resolved objectSHA re-verifies trivially).
+	if _, err := wrefGit(ctx, repoPath, nil, nil,
+		"rev-parse", "--verify", "--quiet", "--end-of-options", objectSHA+"^{object}"); err != nil {
+		wrefNoteFail(w, http.StatusNotFound, "object not found: "+objectSHA, objectSHA, targetRef, old, oldOrZero)
+		return
 	}
 	// Existence check drives add-vs-existing (409) and delete-missing (404).
 	// The cache repo's notes ref was just synced from the ref authority.

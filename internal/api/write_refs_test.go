@@ -879,6 +879,20 @@ func TestWriteRefsNotes(t *testing.T) {
 			if out, err := showNote(t, "refs/notes/rev-notes", fx.tagObj); err != nil || !strings.Contains(out, "on tag object") {
 				t.Fatalf("tag object note show = %q err %v", out, err)
 			}
+
+			// PR #163 review (P2): resolution precedes the CAS guard — a
+			// mismatched guard 412s with the RESOLVED id in the envelope,
+			// and an unresolvable revision 404s despite a stale guard.
+			resp, body = wrefDo(t, srv, "POST", "/api/v1/repos/notes", fx.token,
+				map[string]any{"object_ref": "feature", "note": "x", "notes_ref": "rev-notes", "expected_notes_ref_sha": fx.c2})
+			if resp.StatusCode != http.StatusPreconditionFailed || body["sha"] != fx.c1 {
+				t.Fatalf("guarded revision: status = %d sha %v, want 412 with resolved %s", resp.StatusCode, body["sha"], fx.c1)
+			}
+			resp, body = wrefDo(t, srv, "DELETE", "/api/v1/repos/notes", fx.token,
+				map[string]any{"object_ref": "no-such-rev", "notes_ref": "rev-notes", "expected_notes_ref_sha": fx.c2})
+			if resp.StatusCode != http.StatusNotFound {
+				t.Fatalf("unresolvable with stale guard: status = %d body %v, want 404", resp.StatusCode, body)
+			}
 		})
 	})
 }
