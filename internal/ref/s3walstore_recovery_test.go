@@ -454,6 +454,67 @@ func TestS3WALRecoveryTryAdoptionClaim(t *testing.T) {
 	})
 }
 
+func TestS3WALRecoveryRenewAdoptionClaim(t *testing.T) {
+	ctx := context.Background()
+	const base = "r-renew-claim"
+	key := "lfs/" + base + "/" + strings.Repeat("cd", 32)
+	claimKey := key + AdoptionClaimSuffix
+
+	t.Run("ambiguous dropped renewal reruns until the stamp advances", func(t *testing.T) {
+		// Codex round 6 on PR #156 (security): renewal changes only
+		// CreatedAt, so the recovery GET after a dropped PUT still shows
+		// the same owner. Owner match alone must not report success — the
+		// lease would not be extended, and a near-expiry claim could be
+		// stolen before the next renewal tick while the holder resumes a
+		// size-scaled copy believing the TTL restarted.
+		mc, a, _ := newRecoveryStores(t)
+		claimed, owner, err := a.TryAdoptionClaim(ctx, base, key)
+		if err != nil || !claimed {
+			t.Fatalf("TryAdoptionClaim = (%v, %v)", claimed, err)
+		}
+		before := mustManifest(t, a, base).Reservations[claimKey].CreatedAt
+		armPutFault(mc, s3wal.FaultAmbiguousDropped)
+		renewed, err := a.RenewAdoptionClaim(ctx, key, owner)
+		if err != nil || !renewed {
+			t.Fatalf("RenewAdoptionClaim = (%v, %v), want renewed", renewed, err)
+		}
+		after := mustManifest(t, a, base).Reservations[claimKey].CreatedAt
+		if !after.After(before) {
+			t.Fatalf("claim stamp = %v (was %v): renewal reported success without extending the lease", after, before)
+		}
+	})
+
+	t.Run("stolen while ambiguous = lease lost", func(t *testing.T) {
+		// Pins the predicate's owner arm: the thief's fresh stamp DOES
+		// advance past our attempt clock, so stamp advancement alone must
+		// never report a foreign renewal as ours.
+		mc, a, b := newRecoveryStores(t)
+		claimed, owner, err := a.TryAdoptionClaim(ctx, base, key)
+		if err != nil || !claimed {
+			t.Fatalf("TryAdoptionClaim = (%v, %v)", claimed, err)
+		}
+		armPutFault(mc, s3wal.FaultAmbiguousDropped)
+		armAfterPut(mc, func() {
+			recoveryEdit(t, b, base, func(m *s3wal.Manifest, clk time.Time) {
+				r := m.Reservations[claimKey]
+				if r == nil {
+					t.Error("no claim to steal")
+					return
+				}
+				r.Owner = "thief"
+				r.CreatedAt = clk
+			})
+		})
+		renewed, err := a.RenewAdoptionClaim(ctx, key, owner)
+		if err != nil || renewed {
+			t.Fatalf("RenewAdoptionClaim = (%v, %v), want clean lease-lost", renewed, err)
+		}
+		if got := mustManifest(t, a, base).Reservations[claimKey]; got == nil || got.Owner != "thief" {
+			t.Fatalf("claim entry = %+v, want the thief's", got)
+		}
+	})
+}
+
 // ---------------------------------------------------------------------------
 // OPS class (op-ID membership: ring + per-entry record; fail closed on
 // inconclusive — attempt counters are non-idempotent, never blindly
@@ -652,6 +713,48 @@ func TestS3WALRecoveryDeleteLease(t *testing.T) {
 		})
 		if deleted {
 			t.Fatal("lease lost in flight must refuse deleted=true")
+		}
+		if err == nil || !strings.Contains(err.Error(), "may not be treated as deleted") {
+			t.Fatalf("err = %v, want the in-flight lease-loss refusal", err)
+		}
+	})
+
+	t.Run("ambiguously dropped renewals must not report deleted", func(t *testing.T) {
+		// Codex round 6 on PR #156 (security), sibling of the
+		// adoption-claim finding: a renewal changes only CreatedAt, so an
+		// owner-only recovery predicate reports a dropped PUT as success
+		// and the loop keeps believing the lease is fresh while it
+		// silently expires under the in-flight DELETE — a registration
+		// could then reap the "leaked" lock and register over bytes being
+		// deleted. With every renewal PUT ambiguously dropped, the loop
+		// must prove the stamp advanced, observe the failure, and refuse
+		// deleted=true.
+		restore := func(ttl, io, safety, poll time.Duration) func() {
+			oldTTL, oldIO, oldSafety, oldPoll := s3walDeleteLockTTL, s3walDeleteIOTimeout, s3walDeleteLockSafety, s3walDeleteLockPoll
+			s3walDeleteLockTTL, s3walDeleteIOTimeout, s3walDeleteLockSafety, s3walDeleteLockPoll = ttl, io, safety, poll
+			return func() {
+				s3walDeleteLockTTL, s3walDeleteIOTimeout, s3walDeleteLockSafety, s3walDeleteLockPoll = oldTTL, oldIO, oldSafety, oldPoll
+			}
+		}
+		t.Cleanup(restore(60*time.Millisecond, 25*time.Millisecond, 10*time.Millisecond, 2*time.Millisecond))
+
+		mc, a, _ := newRecoveryStores(t)
+		// Armed BEFORE the call (a hook write during del would race the
+		// renewal goroutine's read): the lease acquisition on the fresh
+		// manifest is a create and passes; every later advance — the
+		// renewal loop's PUTs — drops ambiguously.
+		mc.Hooks.PutFault = func(op, k string) s3wal.PutFault {
+			if op == "advance" {
+				return s3wal.FaultAmbiguousDropped
+			}
+			return s3wal.FaultNone
+		}
+		deleted, err := a.GuardedLFSDelete(ctx, base, key, func(context.Context) error {
+			time.Sleep(150 * time.Millisecond) // several renewal periods
+			return nil
+		})
+		if deleted {
+			t.Fatal("persistently dropped renewals must refuse deleted=true")
 		}
 		if err == nil || !strings.Contains(err.Error(), "may not be treated as deleted") {
 			t.Fatalf("err = %v, want the in-flight lease-loss refusal", err)

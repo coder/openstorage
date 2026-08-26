@@ -479,10 +479,12 @@ func (s *S3WAL) GuardedLFSDelete(ctx context.Context, repo, key string, del func
 			case <-ticker.C:
 			}
 			renewed := false
+			var attemptClk time.Time
 			err := s.mutate(renewCtx, base, s3walMutation{
 				op: "lfs delete lease renew",
 				fn: func(m *s3wal.Manifest, clk time.Time) (bool, error) {
 					renewed = false
+					attemptClk = clk
 					lock := m.DeleteLocks[key]
 					if lock == nil || lock.Owner != owner {
 						return false, nil // lease lost
@@ -492,7 +494,13 @@ func (s *S3WAL) GuardedLFSDelete(ctx context.Context, repo, key string, del func
 					return true, nil
 				},
 				recover: func(fresh *s3wal.Manifest) s3walVerdict {
-					if lock := fresh.DeleteLocks[key]; lock != nil && lock.Owner == owner {
+					// Same proof as RenewAdoptionClaim (Codex round 6 on
+					// PR #156, security): a dropped renewal PUT leaves our
+					// owner with the OLD stamp, and believing it succeeded
+					// lets the lease silently expire under the in-flight
+					// DELETE. Applied only when the stamp advanced to this
+					// attempt's clock.
+					if lock := fresh.DeleteLocks[key]; lock != nil && lock.Owner == owner && !lock.CreatedAt.Before(attemptClk) {
 						renewed = true
 						return s3walApplied
 					}
@@ -629,10 +637,12 @@ func (s *S3WAL) RenewAdoptionClaim(ctx context.Context, key, owner string) (bool
 	claimKey := key + AdoptionClaimSuffix
 	base := s3walBaseOfLFSKey(key)
 	renewed := false
+	var attemptClk time.Time
 	err := s.mutate(ctx, base, s3walMutation{
 		op: "renew adoption claim",
 		fn: func(m *s3wal.Manifest, clk time.Time) (bool, error) {
 			renewed = false
+			attemptClk = clk
 			r := m.Reservations[claimKey]
 			if r == nil || r.Owner != owner || !s.s3walReservationLive(m, r.CreatedAt, AdoptionClaimTTL) {
 				return false, nil // lease lost: stop hashing
@@ -642,7 +652,16 @@ func (s *S3WAL) RenewAdoptionClaim(ctx context.Context, key, owner string) (bool
 			return true, nil
 		},
 		recover: func(fresh *s3wal.Manifest) s3walVerdict {
-			if r := fresh.Reservations[claimKey]; r != nil && r.Owner == owner {
+			// Owner match alone is NOT proof (Codex round 6 on PR #156,
+			// security): renewal changes only CreatedAt, so a dropped PUT
+			// leaves the same owner with the OLD stamp — reporting success
+			// would let a near-expiry claim be stolen before the next tick
+			// while the holder resumes work believing the TTL restarted.
+			// Applied only when the stamp provably advanced to this
+			// attempt's clock (only the token holder writes newer stamps
+			// under our owner); an older stamp reruns until the renewal is
+			// proven or fn reports the lease genuinely lost.
+			if r := fresh.Reservations[claimKey]; r != nil && r.Owner == owner && !r.CreatedAt.Before(attemptClk) {
 				renewed = true
 				return s3walApplied
 			}
