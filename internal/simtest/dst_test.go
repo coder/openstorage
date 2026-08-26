@@ -53,6 +53,7 @@ func TestDSTFast(t *testing.T) {
 	for _, backend := range dstBackends {
 		t.Run(string(backend), func(t *testing.T) {
 			crashSteals, pushCrashSteals, pushForcedRescues, casFaults := 0, 0, 0, 0
+			casCalls := make(map[string]int)
 			for _, seed := range []uint64{1, 2, 3} {
 				res, err := Run(Config{Seed: seed, Steps: 120, RefBackend: backend})
 				if err != nil {
@@ -68,6 +69,9 @@ func TestDSTFast(t *testing.T) {
 				pushCrashSteals += res.PushCrashSteals
 				pushForcedRescues += res.PushForcedRescues
 				casFaults += res.CASFaults
+				for op, n := range res.OpCounts {
+					casCalls[op] += n
+				}
 			}
 			// The sync claim-lease lane must not be vacuous either: across the
 			// fixed fast seeds, at least one claim whose holder actually CRASHED
@@ -95,6 +99,17 @@ func TestDSTFast(t *testing.T) {
 			}
 			if backend == RefBackendSQLite && casFaults != 0 {
 				t.Errorf("cas.* transport faults on the SQLite lane: %d", casFaults)
+			}
+			// Per-op coverage: every advertised cas.* fault-plan surface
+			// must actually be CALLED on the s3wal lane — cas.List in
+			// particular only flows through the node-routed reservation
+			// sweep (Codex round 2 on PR #159).
+			if backend == RefBackendS3WAL {
+				for _, op := range []string{OpCASGet, OpCASCreate, OpCASAdvance, OpCASList} {
+					if casCalls[op] == 0 {
+						t.Errorf("no %s calls across the fast seeds: that fault-plan surface is vacuous", op)
+					}
+				}
 			}
 		})
 	}

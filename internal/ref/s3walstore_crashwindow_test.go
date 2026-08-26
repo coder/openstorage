@@ -364,27 +364,39 @@ func TestS3WALCrashWindows(t *testing.T) {
 		}
 		e.assertPQ(base)
 
-		// (b) Killed BETWEEN the DELETE and the lock clear: bytes gone,
-		// key unregistered, stale lock left behind; the sweeper reaps it
-		// past the full window and registration proceeds. The target is
-		// an orphan (never-registered) key — the exclusion refuses to
-		// delete registered bytes at all, which W6 exists to guarantee.
+		// (b) Killed BETWEEN the DELETE and the lease clear: the modeled
+		// del removes the bytes and then reports the crash (the driver
+		// LEAVES the acquired lease on a failed delete — the blocking
+		// window must keep fencing the possibly-in-flight DELETE), so
+		// the REAL lease survives into the restart (Codex round 2 on PR
+		// #159: a synthetic re-planted lock would not catch a regression
+		// that clears the real one early). The target is an orphan
+		// (never-registered) key — the exclusion refuses to delete
+		// registered bytes at all, which W6 exists to guarantee.
 		const key2 = "lfs/w6repo/oid2"
 		e.upload(key2, 6)
 		deleted, err := e.s.GuardedLFSDelete(ctx, base, key2, func(context.Context) error {
 			e.deleteBlob("w6repo", key2)
-			return nil
+			return errors.New("process died mid-delete")
 		})
-		if err != nil || !deleted {
-			t.Fatalf("GuardedLFSDelete = (%v, %v)", deleted, err)
+		if err == nil || deleted {
+			t.Fatalf("GuardedLFSDelete = (%v, %v), want the crash surfaced", deleted, err)
 		}
-		recoveryEdit(t, e.s, base, func(m *s3wal.Manifest, clk time.Time) {
-			// Re-plant the lease the crashed process failed to clear.
-			m.DeleteLocks = map[string]*s3wal.DeleteLock{
-				key2: {Owner: "crashed-proc2", OpID: s3wal.NewOpID(), CreatedAt: clk.Add(-time.Hour)},
-			}
-		})
+		if m := mustManifest(t, e.s, base); m.DeleteLocks[key2] == nil {
+			t.Fatalf("crashed delete's lease missing: %+v", m.DeleteLocks)
+		}
 		e.restart()
+		// Within the blocking window the crashed delete's lease still
+		// fences registration.
+		blockedCtx2, cancel2 := context.WithTimeout(ctx, 15*time.Millisecond)
+		err = e.s.RegisterLFSObject(blockedCtx2, base, key2, 6)
+		cancel2()
+		if err == nil {
+			t.Fatal("registration ignored the crashed delete's live lease")
+		}
+		// Past the FULL window the sweeper reaps the leaked lease and
+		// registration proceeds.
+		time.Sleep(s3walDeleteLockTTL + s3walDeleteIOTimeout + s3walDeleteLockSafety + 10*time.Millisecond)
 		if _, err := e.s.SweepExpiredPackReservations(ctx, ttl); err != nil {
 			t.Fatalf("sweep: %v", err)
 		}

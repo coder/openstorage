@@ -6,6 +6,7 @@ package simtest
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"time"
@@ -83,9 +84,21 @@ func (s *sim) doReserveCrash(name string, node *simNode, repo *simRepo) error {
 // drains to zero.
 func (s *sim) doReserveSweep(name string, node *simNode) error {
 	ctx := context.Background()
-	n, err := s.cl.oracle.SweepExpiredPackReservations(ctx, 0)
+	// Through the NODE's stores, not the oracle: on the s3wal lane the
+	// sweep's fleet listing and per-base CAS then run over the faulted
+	// SimCAS transport — the only scheduled consumer of cas.List (Codex
+	// round 2 on PR #159). A fault-classed failure is a legal outcome
+	// (rows survive to a later sweep), so the zero-reserved check
+	// applies only to a completed sweep.
+	mark := s.inj.Seq()
+	n, err := node.simRef.SweepExpiredPackReservations(ctx, 0)
+	evs, _ := s.inj.FiredSince(mark)
 	if err != nil {
-		return fmt.Errorf("step %d: sweep reservations: %w", s.step, err)
+		if !errors.Is(err, ErrInjectedClean) && !errors.Is(err, ErrInjectedAmbiguous) {
+			return fmt.Errorf("step %d: sweep reservations: %w", s.step, err)
+		}
+		s.tracef("step=%04d op=%s node=%d out=%s faults=[%s]", s.step, name, node.id, errToken(err), faultToken(evs))
+		return nil
 	}
 	for _, repo := range s.repos {
 		st, err := s.cl.oracle.QuotaLedgerState(ctx, blob.QuotaRepoGroup(repo.key), simReservationTTL)
@@ -97,7 +110,7 @@ func (s *sim) doReserveSweep(name string, node *simNode) error {
 				s.step, repo.key, st.ReservedBytes)
 		}
 	}
-	s.tracef("step=%04d op=%s node=%d swept=%d", s.step, name, node.id, n)
+	s.tracef("step=%04d op=%s node=%d swept=%d faults=[%s]", s.step, name, node.id, n, faultToken(evs))
 	return nil
 }
 

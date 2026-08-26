@@ -127,8 +127,7 @@ func (c *SimCAS) put(op, kind, key string, exec func() (string, error)) (string,
 			c.inj.noteInnerOutcome(op, "dropped")
 			return "", &s3wal.AmbiguousError{Op: kind, Key: key, Cause: ErrInjectedAmbiguous}
 		}
-		etag, err := exec()
-		if err != nil {
+		if _, err := exec(); err != nil {
 			// A definitive store rejection (412 lost-race / exists) is a
 			// real verdict, not an ambiguity: nothing landed, and MemCAS
 			// evaluates preconditions before fault injection for the
@@ -139,7 +138,10 @@ func (c *SimCAS) put(op, kind, key string, exec func() (string, error)) (string,
 			c.inj.noteInnerOutcome(op, fmt.Sprintf("rejected err=%v", err))
 			return "", err
 		}
-		c.inj.noteInnerOutcome(op, fmt.Sprintf("applied etag=%.10s", etag))
+		// No ETag in the outcome: manifest bodies carry the crypto-random
+		// Writer nonce, so their ETags would poison TraceHash determinism
+		// (Codex round 2 on PR #159).
+		c.inj.noteInnerOutcome(op, "applied")
 		return "", &s3wal.AmbiguousError{Op: kind, Key: key, Cause: ErrInjectedAmbiguous}
 	default:
 		panic(fmt.Sprintf("simtest: invalid SimCAS put fault class %v", class))
