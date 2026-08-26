@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.13.0](https://github.com/coder/code-storage/compare/v0.12.0...v0.13.0) (2026-08-26)
+
+
+### Features
+
+* **api:** sync upstream drift — diff base_sha and notes object_ref revisions ([#163](https://github.com/coder/code-storage/issues/163)) ([f88cdf3](https://github.com/coder/code-storage/commit/f88cdf3c1db5fb6232f25dfca7dffda602e52f79))
+* **ref:** s3wal RefStore — full driver and conformance over single-manifest CAS ([#156](https://github.com/coder/code-storage/issues/156)) ([96c12e4](https://github.com/coder/code-storage/commit/96c12e4bcce3e66518d57165e3b53e147a2419d1))
+
 ## [0.12.0](https://github.com/coder/code-storage/compare/v0.11.1...v0.12.0) (2026-08-26)
 
 
