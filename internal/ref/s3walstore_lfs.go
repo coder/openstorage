@@ -62,11 +62,20 @@ func (s *S3WAL) RegisterAdoptedLFSObject(ctx context.Context, repo, key string, 
 
 func (s *S3WAL) registerLFSObject(ctx context.Context, repo, key string, bytes int64, adopted bool) error {
 	base := baseRepoOf(repo)
+	inserted := false
 	for {
 		err := s.mutate(ctx, base, s3walMutation{
-			op:    "register lfs object",
-			grows: true,
+			op: "register lfs object",
+			// Growth is dynamic (Codex round 4 on PR #156): only a NEW
+			// row insert grows the manifest. Re-registration of an
+			// existing object — the strongest liveness signal, clearing
+			// the unreferenced mark and consuming its reservation — and
+			// the in-place legacy migration must pass even at the hard
+			// cap, or the row stays reclamation-eligible while its
+			// refresh is refused.
+			grows: func() bool { return inserted },
 			fn: func(m *s3wal.Manifest, clk time.Time) (bool, error) {
+				inserted = false
 				if m.PurgedAt != nil {
 					return false, fmt.Errorf("register lfs object %s: %w", key, ErrRepoPurged)
 				}
@@ -101,7 +110,6 @@ func (s *S3WAL) registerLFSObject(ctx context.Context, repo, key string, bytes i
 					}
 				}
 				row := m.LFS.Objects[key]
-				inserted := false
 				if row == nil {
 					s3walEnsureLFSObjects(m)[key] = &s3wal.LFSObject{Bytes: bytes, CreatedAt: clk}
 					m.LFS.Count++
@@ -239,12 +247,19 @@ func (s *S3WAL) ReconcileLegacyLFSObjects(ctx context.Context) (int64, bool, err
 // purge-fenced repos silently no-op like every row-creating write.
 func (s *S3WAL) RecordLFSMismatch(ctx context.Context, repo, key, fingerprint string) error {
 	assertf(repo != "" && key != "" && fingerprint != "", "RecordLFSMismatch(%q, %q)", repo, key)
+	freshKey := false
 	return s.mutate(ctx, baseRepoOf(repo), s3walMutation{
-		op:    "record lfs mismatch",
-		grows: true,
+		op: "record lfs mismatch",
+		// Dynamic growth: overwriting an existing key's fingerprint is
+		// an in-place upsert, not an insert.
+		grows: func() bool { return freshKey },
 		fn: func(m *s3wal.Manifest, clk time.Time) (bool, error) {
+			freshKey = false
 			if m.PurgedAt != nil {
 				return false, nil
+			}
+			if _, exists := m.LFS.Mismatches[key]; !exists {
+				freshKey = true
 			}
 			if m.LFS.Mismatches[key] == fingerprint {
 				return false, nil
@@ -388,11 +403,15 @@ func (s *S3WAL) GuardedLFSDelete(ctx context.Context, repo, key string, del func
 	// Phase (i): acquire the delete lease.
 	for {
 		var fencedDirect, registered, blocked bool
+		leaseInsert := false
 		err := s.mutate(ctx, base, s3walMutation{
-			op:    "lfs delete lease",
-			grows: true,
+			op: "lfs delete lease",
+			// Dynamic growth: taking over an EXPIRED lease overwrites
+			// its entry in place — refusing that at the cap would block
+			// the deletion machinery an oversized manifest needs.
+			grows: func() bool { return leaseInsert },
 			fn: func(m *s3wal.Manifest, clk time.Time) (bool, error) {
-				fencedDirect, registered, blocked = false, false, false
+				fencedDirect, registered, blocked, leaseInsert = false, false, false, false
 				if m.PurgedAt != nil {
 					// Purge-fenced repos need no writer guard: fenced
 					// registrations can never commit, and lease rows would
@@ -411,6 +430,7 @@ func (s *S3WAL) GuardedLFSDelete(ctx context.Context, repo, key string, del func
 				if m.DeleteLocks == nil {
 					m.DeleteLocks = make(map[string]*s3wal.DeleteLock)
 				}
+				leaseInsert = m.DeleteLocks[key] == nil
 				m.DeleteLocks[key] = &s3wal.DeleteLock{Owner: owner, OpID: opID, CreatedAt: clk}
 				return true, nil
 			},
@@ -554,11 +574,16 @@ func (s *S3WAL) TryAdoptionClaim(ctx context.Context, repo, key string) (bool, s
 	owner := NewReservationOwner()
 	claimKey := key + AdoptionClaimSuffix
 	claimed := false
+	freshClaim := false
 	err := s.mutate(ctx, base, s3walMutation{
-		op:    "try adoption claim",
-		grows: true,
+		op: "try adoption claim",
+		// Dynamic growth: stealing an expired claim rewrites its entry
+		// in place — an over-cap manifest must not wedge the adoption
+		// mutual exclusion on dead holders.
+		grows: func() bool { return freshClaim },
 		fn: func(m *s3wal.Manifest, clk time.Time) (bool, error) {
 			claimed = false
+			freshClaim = false
 			if m.PurgedAt != nil {
 				return false, nil
 			}
@@ -575,6 +600,7 @@ func (s *S3WAL) TryAdoptionClaim(ctx context.Context, repo, key string) (bool, s
 			if m.Reservations == nil {
 				m.Reservations = make(map[string]*s3wal.Reservation)
 			}
+			freshClaim = true
 			m.Reservations[claimKey] = &s3wal.Reservation{Owner: owner, Bytes: 1, CreatedAt: clk}
 			claimed = true
 			return true, nil

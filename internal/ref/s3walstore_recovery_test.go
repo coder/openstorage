@@ -1394,6 +1394,35 @@ func TestS3WALRecoverySizeCap(t *testing.T) {
 		}
 	})
 
+	t.Run("existing-object re-registration passes the cap", func(t *testing.T) {
+		// Codex round 4 on PR #156: growth is per-invocation, not
+		// per-method — re-registering an EXISTING LFS object clears its
+		// unreferenced mark in place (the strongest liveness signal)
+		// and must never be size-refused while the row stays
+		// reclamation-eligible; only a NEW insert grows.
+		_, a, _ := newRecoveryStores(t)
+		existing := "lfs/" + base + "/" + strings.Repeat("aa", 32)
+		fresh := "lfs/" + base + "/" + strings.Repeat("bb", 32)
+		if err := a.RegisterLFSObject(ctx, base, existing, 5); err != nil {
+			t.Fatalf("seed register: %v", err)
+		}
+		if n, err := a.MarkLFSObjectsUnreferenced(ctx, base, []string{existing}); err != nil || n != 1 {
+			t.Fatalf("mark = (%d, %v)", n, err)
+		}
+		a.hardCapBytes = 1
+
+		if err := a.RegisterLFSObject(ctx, base, existing, 5); err != nil {
+			t.Fatalf("re-registration at the cap = %v, want accepted (non-growing)", err)
+		}
+		if row := mustManifest(t, a, base).LFS.Objects[existing]; row == nil || row.UnreferencedSince != nil {
+			t.Fatalf("row = %+v, want mark cleared by the re-registration", row)
+		}
+		err := a.RegisterLFSObject(ctx, base, fresh, 5)
+		if err == nil || !strings.Contains(err.Error(), "refusing new registrations") {
+			t.Fatalf("NEW insert at the cap = %v, want the documented refusal", err)
+		}
+	})
+
 	t.Run("purge pipeline exempt from the hard cap", func(t *testing.T) {
 		// An oversized manifest must stay purgeable (Codex on PR #156):
 		// the purge pipeline is the machinery that shrinks it, so the

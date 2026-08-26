@@ -283,9 +283,16 @@ type s3walMutation struct {
 	// several times (fresh snapshot each time) and must reset its output
 	// closure variables at the top of every run.
 	fn func(m *s3wal.Manifest, clk time.Time) (apply bool, err error)
-	// grows marks mutations that ADD entries: the manifest hard size cap
-	// refuses them (soft cap warns); shrinking mutations always pass.
-	grows bool
+	// grows reports whether THIS invocation added entries: the manifest
+	// hard size cap refuses growing writes (soft cap warns); shrinking
+	// and in-place mutations always pass. Evaluated AFTER fn ran on the
+	// snapshot it mutated, so closures over fn outputs decide
+	// dynamically — re-registrations, steals, refreshes, and takeovers
+	// of EXISTING entries are non-growing in practice and must not be
+	// size-refused (Codex round 4 on PR #156: an over-cap manifest was
+	// refusing the mark-clearing re-registration that keeps a row alive
+	// while it stayed reclamation-eligible). nil never grows.
+	grows func() bool
 	// recover classifies a fresh post-ambiguity snapshot (nil = s3walRerun,
 	// the idempotent-re-apply fallback).
 	recover func(m *s3wal.Manifest) s3walVerdict
@@ -381,7 +388,7 @@ func (s *S3WAL) mutate(ctx context.Context, base string, mu s3walMutation) error
 // mutations and soft-warns once per base past the warn threshold.
 func (s *S3WAL) checkManifestSize(base string, mu s3walMutation, size int) error {
 	assertf(size > 0, "checkManifestSize: non-positive size %d", size)
-	if !mu.grows {
+	if mu.grows == nil || !mu.grows() {
 		return nil
 	}
 	if size > s.hardCapBytes {
@@ -398,6 +405,10 @@ func (s *S3WAL) checkManifestSize(base string, mu s3walMutation, size int) error
 	}
 	return nil
 }
+
+// s3walAlwaysGrows is the static grows predicate for mutations whose
+// every applied invocation inserts entries.
+func s3walAlwaysGrows() bool { return true }
 
 // newWallDrift anchors the §2.4 wall-vs-monotonic drift detector: a wall
 // clock jump (settimeofday, an NTP step, a VM resume) moves the wall
@@ -562,7 +573,7 @@ func (s *S3WAL) CASRef(ctx context.Context, repo, name, old, new string) (won bo
 	}
 	err = s.mutate(ctx, baseRepoOf(repo), s3walMutation{
 		op:    "cas ref",
-		grows: old == ZeroSHA,
+		grows: func() bool { return old == ZeroSHA }, // only creates insert
 		fn: func(m *s3wal.Manifest, clk time.Time) (bool, error) {
 			won = false
 			if m.PurgedAt != nil {
@@ -622,7 +633,7 @@ func (s *S3WAL) RegisterPacks(ctx context.Context, repo string, packs []Pack) er
 	assertf(len(packs) > 0, "RegisterPacks called with no packs")
 	return s.mutate(ctx, baseRepoOf(repo), s3walMutation{
 		op:    "register packs",
-		grows: true,
+		grows: s3walAlwaysGrows, // apply=true implies >=1 pack-row insert
 		fn: func(m *s3wal.Manifest, clk time.Time) (bool, error) {
 			if m.PurgedAt != nil {
 				return false, fmt.Errorf("register packs %s: %w", repo, ErrRepoPurged)
@@ -778,7 +789,7 @@ func (s *S3WAL) ReplacePacks(ctx context.Context, repo string, old []Pack, newPa
 	}
 	err = s.mutate(ctx, baseRepoOf(repo), s3walMutation{
 		op:    "replace packs",
-		grows: true,
+		grows: s3walAlwaysGrows, // fold row + retained tombstones always insert
 		fn: func(m *s3wal.Manifest, clk time.Time) (bool, error) {
 			won = false
 			if !allOldPresent(m) {

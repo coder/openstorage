@@ -150,11 +150,16 @@ func (s *S3WAL) ReservePackBytes(ctx context.Context, group []string, packs []Pa
 		defer s.absenceFenceMu.RUnlock()
 	}
 	var dec ReserveDecision
+	minted := false
 	err := s.mutate(ctx, base, s3walMutation{
-		op:    "reserve pack bytes",
-		grows: true,
+		op: "reserve pack bytes",
+		// Growth is dynamic: only freshly MINTED rows add entries — a
+		// same-key refresh mutates an existing row in place, and the
+		// self-healing GC only shrinks.
+		grows: func() bool { return minted },
 		fn: func(m *s3wal.Manifest, clk time.Time) (bool, error) {
 			dec = ReserveDecision{}
+			minted = false
 			if m.PurgedAt != nil {
 				return false, fmt.Errorf("reserve pack bytes %s: %w", base, ErrRepoPurged)
 			}
@@ -238,6 +243,7 @@ func (s *S3WAL) ReservePackBytes(ctx context.Context, group []string, packs []Pa
 					// round 33).
 					r = &s3wal.Reservation{Bytes: p.Size, Gen: NewReservationOwner()}
 					m.Reservations[p.Key] = r
+					minted = true
 				} else {
 					// Same-key refresh: MAX bytes (Codex round 7), owner
 					// rotates, clock restarts, attempts refcount grows
