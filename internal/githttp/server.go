@@ -1016,8 +1016,22 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 		// round 17; a deadline error just resolves the push from whatever
 		// the counters saw) — so oversized bodies uniformly reach the 413
 		// path.
-		if err := http.NewResponseController(w).SetReadDeadline(time.Now().Add(pushDrainTimeout)); err != nil {
+		drainTimeout := pushDrainTimeout
+		if s.TestMode {
+			// Test knob: shrink the drain window below an injected hook
+			// delay (EnvHookDelay) so the e2e lane can prove hook phases
+			// outlive it (issue #141's receive-pack sibling).
+			if ms := os.Getenv(EnvPushDrainMS); ms != "" {
+				n, err := strconv.Atoi(ms)
+				assertf(err == nil && n > 0, "bad %s=%q", EnvPushDrainMS, ms)
+				drainTimeout = time.Duration(n) * time.Millisecond
+			}
+		}
+		drainDeadlineSet := false
+		if err := http.NewResponseController(w).SetReadDeadline(time.Now().Add(drainTimeout)); err != nil {
 			log.Printf("%s %s: set drain deadline: %v", service, repo, err)
+		} else {
+			drainDeadlineSet = true
 		}
 		if _, err := io.Copy(io.Discard, body); err != nil && !errors.Is(err, errPushTooLarge) {
 			log.Printf("%s %s: request body drain: %v", service, repo, err)
@@ -1029,6 +1043,19 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 		if wireCap != nil {
 			if _, err := io.Copy(io.Discard, wireCap); err != nil && !errors.Is(err, errPushTooLarge) {
 				log.Printf("%s %s: wire body drain: %v", service, repo, err)
+			}
+		}
+		// The drains are done: DISARM the deadline (issue #141's receive-pack
+		// sibling). The body has typically hit EOF by now, so net/http's
+		// background connection read is already blocked with this deadline
+		// armed; on expiry it cancels r.Context() (connReader.handleReadError),
+		// and CommandContext translates that into killing receive-pack
+		// mid-hook phase — which can legitimately outlive any fixed drain
+		// bound (the sideband-progress note above). Only server-side work
+		// remains; nothing reads the body after this point.
+		if drainDeadlineSet {
+			if err := http.NewResponseController(w).SetReadDeadline(time.Time{}); err != nil {
+				log.Printf("%s %s: clear drain deadline: %v", service, repo, err)
 			}
 		}
 		_ = stdin.Close()

@@ -3662,6 +3662,70 @@ func TestLFSUpload_StalledClientReleasesStaging(t *testing.T) {
 	<-stalled // the stalled request ends with a connection/HTTP error either way
 }
 
+// slowClaimStore delays TryAdoptionClaim well past the idle read deadline
+// the PUT armed while receiving its body — the post-EOF window issue
+// #141's CI failures hit. The explicit ctx check models what every real
+// store does (database/sql aborts calls on canceled contexts).
+type slowClaimStore struct {
+	ref.Store
+	delay time.Duration
+}
+
+func (s slowClaimStore) TryAdoptionClaim(ctx context.Context, repo, key string) (bool, string, error) {
+	time.Sleep(s.delay)
+	if err := ctx.Err(); err != nil {
+		return false, "", err
+	}
+	return s.Store.TryAdoptionClaim(ctx, repo, key)
+}
+
+// TestLFSUpload_FullyReceivedBodyOutlivesIdleDeadline (issue #141): once
+// the body has fully arrived, the idle read deadline's job is done and it
+// must be disarmed. net/http starts a background connection read the
+// moment a handler drains the request body to EOF, and that read hitting a
+// still-armed deadline cancels the REQUEST CONTEXT
+// (connReader.handleReadError) — so a post-body claim/registry/publish
+// chain slower than one idle window turned a healthy, fully-delivered
+// upload into `lfs claim <key>: context canceled` + 500. The slow store
+// stands in for a loaded CI runner or a slow production ref store. Runs
+// over a real HTTP server (httptest recorders do not support read
+// deadlines).
+func TestLFSUpload_FullyReceivedBodyOutlivesIdleDeadline(t *testing.T) {
+	oldIdle := lfsUploadIdleTimeout
+	lfsUploadIdleTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { lfsUploadIdleTimeout = oldIdle })
+
+	srv, st, mint := newLFSQuotaServer(t, 0, time.Hour)
+	srv.Store = slowClaimStore{Store: st, delay: 5 * lfsUploadIdleTimeout}
+	tok := mint(auth.ScopeGitWrite)
+	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(ts.Close)
+
+	content := []byte("slow post-body claim")
+	oid := sha256Hex(content)
+	req, err := http.NewRequest(http.MethodPut,
+		ts.URL+"/"+lfsTestRepoURL+".git/info/lfs/objects/"+oid, bytes.NewReader(content))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.SetBasicAuth("t", tok)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("PUT with slow post-body claim = %d, want 200\nbody: %s", resp.StatusCode, body)
+	}
+	if _, err := srv.Blob.Stat(context.Background(), blob.LFSKey(lfsTestRepoID, oid)); err != nil {
+		t.Fatalf("upload did not publish: %v", err)
+	}
+}
+
 // TestLFSQuota_ZeroGrowthRepairAtQuota (Codex round 5): a registered
 // object whose blob vanished re-admits without a fresh charge — an
 // at-quota repository must be able to repair itself. Since round 57 the

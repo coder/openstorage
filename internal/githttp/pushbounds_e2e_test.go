@@ -557,3 +557,29 @@ func TestVerifySig_BudgetFailsClosed(t *testing.T) {
 		t.Fatalf("budget rejection spawned %d verifiers (%v), want 0", len(spawns), spawns)
 	}
 }
+
+// TestPushCap_SlowHookPhaseOutlivesDrainDeadline (issue #141's receive-pack
+// sibling): the post-copy drain deadline must be DISARMED once the drains
+// finish. The push body has hit EOF by then, so net/http's background
+// connection read sits blocked with that deadline armed; on expiry it
+// cancels r.Context(), and exec.CommandContext translates the cancellation
+// into killing git receive-pack mid-hook phase — pre-receive/update hooks
+// can legitimately outlive any fixed drain bound. A drain window shrunk
+// below the update hook's injected delay makes the kill deterministic
+// without the fix.
+func TestPushCap_SlowHookPhaseOutlivesDrainDeadline(t *testing.T) {
+	node, err := startNode(t.TempDir(),
+		fmt.Sprintf("CODESTORAGE_MAX_PUSH_BYTES=%d", int64(1<<20)),
+		EnvHookDelay+"=1500",
+		EnvPushDrainMS+"=250",
+	)
+	if err != nil {
+		t.Fatalf("start node: %v", err)
+	}
+	t.Cleanup(node.stop)
+
+	repo := registerRepo(t, "t-slow-hook-drain")
+	token := mintTestToken(t, repo, "git:read,git:write", "")
+	work := initWorkRepo(t)
+	mustGit(t, work, "push", remoteURL(node, repo, token), "HEAD:refs/heads/main")
+}
