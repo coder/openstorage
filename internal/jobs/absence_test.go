@@ -1388,6 +1388,80 @@ func TestAbsenceReconcile_AdmissionGCDurableLapseMarker(t *testing.T) {
 	}
 }
 
+// gcDuringProbeRegistry interleaves a REAL admission-time GC between the
+// reconciler's marker read and its physical probe: the reserve consumes
+// the expired un-folded cover and records the marker atomically, then the
+// underlying probe truthfully reports no expired row.
+type gcDuringProbeRegistry struct {
+	AbsenceRegistry
+	t     *testing.T
+	res   ref.RestoreCoverStore
+	group []string
+	fired bool
+}
+
+func (g *gcDuringProbeRegistry) LapsedAbsenceCoverExists(ctx context.Context, ttl time.Duration) (bool, error) {
+	if !g.fired {
+		g.fired = true
+		dec, err := g.res.ReservePackBytes(ctx, g.group,
+			[]ref.Pack{{Key: blob.PackKey(g.group[0], "race"), Size: 1}}, ref.NewReservationOwner(),
+			0, ref.ReserveNoFloorGen, 10_000, time.Nanosecond)
+		if err != nil || !dec.OK {
+			g.t.Errorf("injected mid-probe GC = (%+v, %v), want admitted", dec, err)
+		}
+	}
+	return g.AbsenceRegistry.LapsedAbsenceCoverExists(ctx, ttl)
+}
+
+// TestAbsenceReconcile_MarkerRereadClosesProbeRace (Codex round 34, P2
+// security): the first-health-stamp evidence checks are two separate
+// reads — marker, then physical probe. An admission GC landing between
+// them consumes the expired cover AND writes the marker, so the probe
+// sees no row while the pass holds a stale marker miss: health would
+// stamp unfenced and the surviving marker would never be consulted
+// again. A clean probe must re-read the marker before declaring no
+// lapse.
+func TestAbsenceReconcile_MarkerRereadClosesProbeRace(t *testing.T) {
+	f := newSweepFixture(t)
+	ctx := context.Background()
+	reg := absenceRegistry(t, f)
+	// Multi-pass keyspace (the armed fence must be observable at pass
+	// end) plus one ABSENT row whose cover becomes the racing evidence.
+	for i := 0; i < 30; i++ {
+		key := blob.LFSKey("a-fill", strings.Repeat(fmt.Sprintf("%02x", i), 32))
+		registerLFS(t, f, "a-fill", key, 10)
+		f.upload(key, strings.Repeat("x", 10))
+	}
+	lost := blob.LFSKey("z-lost", absenceOID('d'))
+	registerLFS(t, f, "z-lost", lost, 10)
+	pinLFSLeader(t, f)
+	if _, err := testReconciler(t, f, true, 100).Run(ctx); err != nil {
+		t.Fatalf("pass 1: %v", err)
+	}
+	if err := reg.DeleteJobScanState(ctx, ref.ScanJobAbsence, ref.ScanScopeAbsenceRenewalHealth); err != nil {
+		t.Fatal(err)
+	}
+
+	// Pass 2: the marker read finds nothing, the injected GC consumes
+	// the expired cover mid-probe, the probe finds nothing — only the
+	// post-probe marker re-read can arm the fence.
+	res, ok := f.store.(ref.RestoreCoverStore)
+	if !ok {
+		t.Fatalf("store %T lacks ReservePackBytes", f.store)
+	}
+	gr := &gcDuringProbeRegistry{AbsenceRegistry: reg, t: t, res: res, group: blob.QuotaRepoGroup("z-lost")}
+	rec := NewAbsenceReconciler(gr, f.blobs, true, 12, time.Hour, time.Minute, slog.New(slog.DiscardHandler))
+	if _, err := rec.Run(ctx); err != nil {
+		t.Fatalf("pass 2: %v", err)
+	}
+	if !gr.fired {
+		t.Fatal("fixture defect: the mid-probe GC never ran")
+	}
+	if _, ok, err := reg.GetJobScanState(ctx, ref.ScanJobAbsence, ref.ScanScopeAbsenceAdmissionFence); err != nil || !ok {
+		t.Fatalf("fence after racing GC = (ok=%v, %v), want armed via the marker re-read", ok, err)
+	}
+}
+
 // TestAbsenceReconcile_ContinuityBoundCoversStampDelay (Codex round 32,
 // P1): the health watermark stamps up to one pass wall clock AFTER the
 // bulk touch it records, so a watermark age inside [coverTTL-passTimeout,

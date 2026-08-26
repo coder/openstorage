@@ -1294,6 +1294,20 @@ func (r *AbsenceReconciler) renewCovers(ctx context.Context, budget int64, repor
 			lapsed, pErr := false, error(nil)
 			if mErr == nil && !marked {
 				lapsed, pErr = r.registry.LapsedAbsenceCoverExists(ctx, r.coverTTL)
+				if pErr == nil && !lapsed {
+					// The marker read and the physical probe are not
+					// atomic (Codex round 34, security): a concurrent
+					// admission GC or reservation sweep can consume the
+					// expired row AND write the marker between them —
+					// the probe then sees no row while this branch holds
+					// a stale marker miss, and health would stamp
+					// unfenced. Every evidence consumer writes the
+					// marker in the same transaction as its delete, so
+					// re-reading the marker AFTER a clean probe closes
+					// the window: either the probe's snapshot still saw
+					// the row, or this re-read sees the marker.
+					_, marked, mErr = r.registry.GetJobScanState(ctx, ref.ScanJobAbsence, ref.ScanScopeAbsenceLapse)
+				}
 			}
 			switch {
 			case mErr != nil:

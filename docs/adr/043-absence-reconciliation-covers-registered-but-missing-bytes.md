@@ -228,9 +228,11 @@ reservation sweep (`SweepExpiredPackReservations`, round 34) is a second
 consumer of the same evidence. Both now record a durable lapse-evidence
 marker (`job_scan_state`) in the same transaction whenever they consume
 such a row (folded nonces decay deliberately and are never evidence);
-the first stamp consults the marker BEFORE the physical probe, and the
-settlement that proves a full recovery rotation deletes the marker with
-the fence. Arming is also safe
+the first stamp consults the marker BEFORE the physical probe — and
+RE-READS it after a clean probe, because the two reads are not atomic
+and a GC landing between them consumes the row and writes the marker
+where the pass holds a stale miss — and the settlement that proves a
+full recovery rotation deletes the marker with the fence. Arming is also safe
 against its own bookkeeping failing: a pass whose durable cursor or
 fence reads error holds untrustworthy in-memory counters, so it arms
 with an unknown sentinel (`-1`) instead of snapshotting them — the next
