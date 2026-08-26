@@ -4,7 +4,7 @@ package githttp
 // backend lanes selected by CODESTORAGE_TEST_BACKEND:
 //
 //   - "" / "pg" (default): real containers only (no fakes) — testcontainers-go
-//     boots Postgres + MinIO, exactly like production would.
+//     boots Postgres + SeaweedFS, exactly like production would.
 //   - "local": zero containers — sqlite:// + file:// URLs derived from a
 //     temp data dir, the way `serve --data-dir` derives them.
 //
@@ -31,8 +31,9 @@ import (
 	"testing"
 	"time"
 
-	tcminio "github.com/testcontainers/testcontainers-go/modules/minio"
+	"github.com/testcontainers/testcontainers-go"
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
+	"github.com/testcontainers/testcontainers-go/wait"
 
 	"github.com/coder/code-storage/internal/auth"
 	"github.com/coder/code-storage/internal/blob"
@@ -53,6 +54,13 @@ const (
 const (
 	backendPG    = "pg"
 	backendLocal = "local"
+)
+
+// Static dummy credentials for the pg lane's SeaweedFS S3 gateway (the
+// container is throwaway and unreachable beyond the mapped test port).
+const (
+	s3AccessKey = "codestorage-e2e"
+	s3SecretKey = "codestorage-e2e-secret"
 )
 
 var (
@@ -155,18 +163,44 @@ func testMainInner(m *testing.M) int {
 			panic(err)
 		}
 
-		minioC, err := tcminio.Run(ctx, "minio/minio:RELEASE.2024-01-16T16-07-38Z")
+		// Qualified SeaweedFS recipe (Gate 1a-A, PR #142): pinned image,
+		// one-process `weed server -s3`, S3 gateway on 8333.
+		// A static identity (s3.config) turns on SigV4 validation so the
+		// LFS round-trip's presigned download keeps failing on a bad or
+		// missing signature, exactly like the MinIO container it replaced
+		// — an anonymous gateway would serve unsigned requests too. The
+		// wait strategy only proves the gateway port accepts TCP — weed
+		// starts master/volume/filer/s3 asynchronously — so the
+		// EnsureBucket retry below is the actual readiness signal.
+		s3Config := fmt.Sprintf(`{"identities":[{"name":"e2e","credentials":[{"accessKey":%q,"secretKey":%q}],"actions":["Admin","Read","List","Tagging","Write"]}]}`,
+			s3AccessKey, s3SecretKey)
+		seaweedC, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
+			ContainerRequest: testcontainers.ContainerRequest{
+				Image:        "chrislusf/seaweedfs:4.42",
+				ExposedPorts: []string{"8333/tcp"},
+				Cmd:          []string{"server", "-s3", "-dir=/data", "-ip.bind=0.0.0.0", "-s3.config=/etc/seaweedfs/s3.json"},
+				Files: []testcontainers.ContainerFile{{
+					Reader:            strings.NewReader(s3Config),
+					ContainerFilePath: "/etc/seaweedfs/s3.json",
+					FileMode:          0o444,
+				}},
+				WaitingFor: wait.ForListeningPort("8333/tcp").WithStartupTimeout(2 * time.Minute),
+			},
+			Started: true,
+		})
 		if err != nil {
-			panic("start minio container: " + err.Error())
+			panic("start seaweedfs container: " + err.Error())
 		}
-		defer func() { _ = minioC.Terminate(ctx) }()
-		minioAddr, err := minioC.ConnectionString(ctx)
+		defer func() { _ = seaweedC.Terminate(ctx) }()
+		// PortEndpoint brackets IPv6 hosts (net.JoinHostPort), so the
+		// address stays a valid URL host under IPv6 Docker daemons.
+		s3Addr, err := seaweedC.PortEndpoint(ctx, "8333/tcp", "")
 		if err != nil {
 			panic(err)
 		}
-		blobURL = fmt.Sprintf("s3://githttp-test?endpoint=http://%s&s3ForcePathStyle=true&region=us-east-1", minioAddr)
-		os.Setenv("AWS_ACCESS_KEY_ID", minioC.Username)
-		os.Setenv("AWS_SECRET_ACCESS_KEY", minioC.Password)
+		blobURL = fmt.Sprintf("s3://githttp-test?endpoint=http://%s&s3ForcePathStyle=true&region=us-east-1", s3Addr)
+		os.Setenv("AWS_ACCESS_KEY_ID", s3AccessKey)
+		os.Setenv("AWS_SECRET_ACCESS_KEY", s3SecretKey)
 	case backendLocal:
 		testBackend = backendLocal
 		localDataDir = filepath.Join(scratch, "data")
@@ -203,8 +237,19 @@ func testMainInner(m *testing.M) int {
 		panic(err)
 	}
 	defer testBlob.Close()
-	if err := testBlob.EnsureBucket(ctx); err != nil {
-		panic(err)
+	// Doubles as the pg lane's S3 readiness poll: SeaweedFS accepts TCP on
+	// the gateway port before the filer chain can serve, so retry the
+	// bucket create until it succeeds (the local lane's fileblob mkdir
+	// succeeds on the first try).
+	for deadline := time.Now().Add(60 * time.Second); ; {
+		err := testBlob.EnsureBucket(ctx)
+		if err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			panic("EnsureBucket never succeeded (blob store not ready?): " + err.Error())
+		}
+		time.Sleep(250 * time.Millisecond)
 	}
 	testMeta, err = meta.Open(ctx, dbURL)
 	if err != nil {
@@ -489,18 +534,18 @@ func pgPacks(t *testing.T, repo string) []ref.Pack {
 	return packs
 }
 
-func minioPacks(t *testing.T, repo string) []blob.ListedObject {
+func s3Packs(t *testing.T, repo string) []blob.ListedObject {
 	t.Helper()
 	objs, err := testBlob.List(context.Background(), blob.PackPrefix(repo))
 	if err != nil {
-		t.Fatalf("list minio objects: %v", err)
+		t.Fatalf("list blob-store objects: %v", err)
 	}
 	return objs
 }
 
 // --- acceptance criterion 1 ------------------------------------------------
 
-func TestPush_RefsInPG_PacksInMinIO(t *testing.T) {
+func TestPush_RefsInPG_PacksInS3(t *testing.T) {
 	repo := registerRepo(t, "t1-push")
 	work := initWorkRepo(t)
 	token := mintTestToken(t, repo, "git:read,git:write", "")
@@ -513,8 +558,8 @@ func TestPush_RefsInPG_PacksInMinIO(t *testing.T) {
 	if got := refs["refs/heads/main"]; got != head {
 		t.Fatalf("PG refs/heads/main = %q, want client HEAD %q (refs: %v)", got, head, refs)
 	}
-	if objs := minioPacks(t, repo); len(objs) < 1 {
-		t.Fatalf("expected >=1 pack object in MinIO under %s, got %v", blob.PackPrefix(repo), objs)
+	if objs := s3Packs(t, repo); len(objs) < 1 {
+		t.Fatalf("expected >=1 pack object in the blob store under %s, got %v", blob.PackPrefix(repo), objs)
 	}
 	if packs := pgPacks(t, repo); len(packs) < 1 {
 		t.Fatalf("expected >=1 pack row in PG, got %v", packs)
@@ -621,7 +666,7 @@ func TestCrash_AfterS3_BeforePGCommit(t *testing.T) {
 
 	refsBefore := pgRefs(t, repo)
 	packsBefore := pgPacks(t, repo)
-	objsBefore := minioPacks(t, repo)
+	objsBefore := s3Packs(t, repo)
 
 	writeFile(t, work, "b.txt", "two\n")
 	mustGit(t, work, "add", ".")
@@ -638,9 +683,9 @@ func TestCrash_AfterS3_BeforePGCommit(t *testing.T) {
 	t.Logf("crashed push output:\n%s", out)
 
 	// Orphaned S3 pack only; PG refs + packs untouched.
-	objsAfter := minioPacks(t, repo)
+	objsAfter := s3Packs(t, repo)
 	if len(objsAfter) != len(objsBefore)+1 {
-		t.Fatalf("MinIO objects = %d, want %d (exactly one new orphan)", len(objsAfter), len(objsBefore)+1)
+		t.Fatalf("blob-store objects = %d, want %d (exactly one new orphan)", len(objsAfter), len(objsBefore)+1)
 	}
 	if got := pgRefs(t, repo); !mapsEqual(got, refsBefore) {
 		t.Fatalf("PG refs changed across crash: %v -> %v", refsBefore, got)
@@ -683,7 +728,7 @@ func TestCrash_AfterS3_BeforePGCommit(t *testing.T) {
 	if !foundOrphan {
 		t.Fatalf("list-only sweep did not report the crash orphan %q: %+v", orphanKey, report.Orphans)
 	}
-	if got := minioPacks(t, repo); len(got) != len(objsAfter) {
+	if got := s3Packs(t, repo); len(got) != len(objsAfter) {
 		t.Fatalf("list-only sweep deleted objects: %d -> %d", len(objsAfter), len(got))
 	}
 
@@ -691,7 +736,7 @@ func TestCrash_AfterS3_BeforePGCommit(t *testing.T) {
 	if _, err := jobs.NewSweeper(testBlob, testStore, jobs.SweepConfig{Threshold: threshold, Delete: true}, sweepLogger).Sweep(t.Context()); err != nil {
 		t.Fatalf("delete sweep: %v", err)
 	}
-	objsSwept := minioPacks(t, repo)
+	objsSwept := s3Packs(t, repo)
 	if len(objsSwept) != len(objsBefore) {
 		t.Fatalf("objects after delete sweep = %d, want %d (orphan reaped)", len(objsSwept), len(objsBefore))
 	}
@@ -733,7 +778,7 @@ func TestCrashHeader_RefusedOutsideTestMode(t *testing.T) {
 	prodNode := startNodeT(t, "CODESTORAGE_TEST_MODE=") // later duplicate wins
 	mustGit(t, work, "push", remoteURL(prodNode, repo, token), "HEAD:refs/heads/main")
 
-	objsBefore := minioPacks(t, repo)
+	objsBefore := s3Packs(t, repo)
 	refsBefore := pgRefs(t, repo)
 	writeFile(t, work, "b.txt", "two\n")
 	mustGit(t, work, "add", ".")
@@ -748,7 +793,7 @@ func TestCrashHeader_RefusedOutsideTestMode(t *testing.T) {
 	if !strings.Contains(out, "403") {
 		t.Fatalf("expected a 403 refusal, got:\n%s", out)
 	}
-	if got := minioPacks(t, repo); len(got) != len(objsBefore) {
+	if got := s3Packs(t, repo); len(got) != len(objsBefore) {
 		t.Fatalf("refused push still wrote to S3: %d -> %d objects", len(objsBefore), len(got))
 	}
 	if got := pgRefs(t, repo); !mapsEqual(got, refsBefore) {
@@ -1213,7 +1258,7 @@ func TestRepack_PushesFoldToOnePack(t *testing.T) {
 		time.Sleep(100 * time.Millisecond)
 	}
 	packs := pgPacks(t, repo)
-	objs := minioPacks(t, repo)
+	objs := s3Packs(t, repo)
 	if len(objs) <= 1 {
 		t.Fatalf("superseded pack blobs were deleted synchronously: %v", objs)
 	}
@@ -1263,10 +1308,10 @@ func TestRepoKeySplit_CrossSurface(t *testing.T) {
 	if refs := pgRefs(t, url); len(refs) != 0 {
 		t.Fatalf("raw url path element must not key ref storage, found: %v", refs)
 	}
-	if objs := minioPacks(t, url); len(objs) != 0 {
+	if objs := s3Packs(t, url); len(objs) != 0 {
 		t.Fatalf("raw url path element must not key pack storage, found: %v", objs)
 	}
-	if objs := minioPacks(t, repoID); len(objs) < 1 {
+	if objs := s3Packs(t, repoID); len(objs) < 1 {
 		t.Fatal("no pack objects under the RepoID key")
 	}
 

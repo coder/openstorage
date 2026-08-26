@@ -13,8 +13,8 @@ stack to try first, see the [Docker Compose how-to](deploy-docker-compose.md).
 ## Topology
 
 ```
-clients ──► reverse proxy (TLS) ──► N × codestorage serve ──► Postgres  (refs + metadata)
-                                                          └─► S3/MinIO  (immutable packs)
+clients ──► reverse proxy (TLS) ──► N × codestorage serve ──► Postgres   (refs + metadata)
+                                                          └─► S3 bucket  (immutable packs)
 ```
 
 - **Replicas are stateless and identical.** All durable state lives in Postgres and the
@@ -52,7 +52,11 @@ serve process still holds the key.
 
 **S3-compatible bucket** — dedicated to codestorage
 ([`CODESTORAGE_S3_URL`](../reference/configuration.md#codestorage_s3_url)); credentials come
-from the standard AWS chain (env vars, shared config, instance roles).
+from the standard AWS chain (env vars, shared config, instance roles). AWS S3 is the
+primary target; for self-hosting, [SeaweedFS](https://github.com/seaweedfs/seaweedfs) is
+the reference store the test suite runs against. Other S3-compatible stores (including
+MinIO) are supported on a best-effort basis — existing deployments keep working, but the
+test suites no longer run against them.
 
 - **Bucket permissions for the replica role.** With default settings the role needs all
   of:
@@ -87,8 +91,8 @@ from the standard AWS chain (env vars, shared config, instance roles).
   "Condition": { "StringEquals": { "aws:ResourceAccount": "<your-account-id>" } }
   ```
 
-  Self-hosted MinIO has no shared global namespace, so this applies to AWS (and
-  AWS-compatible multi-tenant) deployments.
+  Self-hosted stores like SeaweedFS have no shared global namespace, so this applies to
+  AWS (and AWS-compatible multi-tenant) deployments.
 
   For defense-in-depth — or when you cannot edit the role's IAM statements — additionally
   set
@@ -238,10 +242,10 @@ and bypasses every proxy-enforced limit. Then:
   or above the server cap and remember the proxy sees wire bytes while the server counts
   decoded (post-gzip) bytes. Request duration and concurrency limits remain the proxy's
   job.
-- **LFS downloads bypass the proxy on S3/MinIO; uploads do not**: for downloads the
+- **LFS downloads bypass the proxy on S3; uploads do not**: for downloads the
   batch API hands clients presigned bucket URLs whenever the backend can sign (the
   server-proxied transfer is only the fallback for backends that cannot, i.e. local file
-  mode), so Git LFS clients need direct network reach to the configured S3/MinIO
+  mode), so Git LFS clients need direct network reach to the configured S3
   endpoint — a VPC-internal bucket endpoint breaks LFS pulls for external clients even
   though the batch request itself succeeds. Uploads always go through the server's
   verified proxy transfer ([#51](https://github.com/coder/code-storage/issues/51)):

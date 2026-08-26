@@ -12,7 +12,7 @@ depth, see the [testing reference](docs/reference/testing.md).
 | Go ≥ 1.26 | `go.mod` toolchain; CI resolves the version from `go.mod` |
 | git | the server shells out to it; every test uses it |
 | git-lfs | the LFS end-to-end tests drive a real `git lfs` client (CI fails fast if it is missing) |
-| Docker | the default test lane boots real Postgres + MinIO via [testcontainers](https://golang.testcontainers.org/); also the compose stack |
+| Docker | the default test lane boots real Postgres + SeaweedFS via [testcontainers](https://golang.testcontainers.org/); also the compose stack |
 | gpg / ssh-keygen | only for `verify-sig` ref-policy tests and manual dogfooding of signature verification |
 
 ## Build and run
@@ -35,15 +35,15 @@ go build ./cmd/codestorage && ./codestorage version
   The [README quickstart](README.md#quickstart-local-mode-60-seconds) continues from
   here (minting tokens, creating a repo, pushing).
 
-- **Production topology (Postgres + MinIO)** — boot the backing services from the
+- **Production topology (Postgres + SeaweedFS)** — boot the backing services from the
   repo compose file and run `serve` on the host against them:
 
   ```sh
   docker compose up -d --wait
   CODESTORAGE_ORG=selfhost CODESTORAGE_ORG_PUBKEYS=/tmp/cs-key.pub.pem \
   CODESTORAGE_PG_URL="postgres://postgres:postgres@127.0.0.1:${PGPORT:-15432}/postgres" \
-  CODESTORAGE_S3_URL="s3://codestorage?endpoint=http://127.0.0.1:${MINIOPORT:-19000}&s3ForcePathStyle=true&region=us-east-1" \
-  AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin \
+  CODESTORAGE_S3_URL="s3://codestorage?endpoint=http://127.0.0.1:${S3PORT:-18333}&s3ForcePathStyle=true&region=us-east-1" \
+  AWS_ACCESS_KEY_ID=codestorage AWS_SECRET_ACCESS_KEY=codestorage \
     ./codestorage serve --listen 127.0.0.1:8080
   ```
 
@@ -59,7 +59,7 @@ and the conventions for writing new tests.
 
 ```sh
 # 1. Default lane — the full suite on the production backends.
-#    Needs Docker (testcontainers boots Postgres + MinIO) and git-lfs.
+#    Needs Docker (testcontainers boots Postgres + SeaweedFS) and git-lfs.
 go test ./... -count=1 -race -timeout=30m
 
 # 2. Local lane — the git e2e suite on the zero-container backends

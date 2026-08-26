@@ -37,7 +37,7 @@ every knob (rate limiting, quotas, sweeping, repack).
 # Local mode: SQLite + plain files under one directory, no other services.
 codestorage serve --listen 127.0.0.1:8080 --data-dir ~/cs-data
 
-# Production mode: Postgres + S3/MinIO via env URLs.
+# Production mode: Postgres + S3 via env URLs.
 CODESTORAGE_PG_URL='postgres://...' CODESTORAGE_S3_URL='s3://...' codestorage serve
 ```
 

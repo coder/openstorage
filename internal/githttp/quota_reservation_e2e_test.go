@@ -145,7 +145,7 @@ func TestPackQuota_ReservationCrashSweepRecovery(t *testing.T) {
 	if err == nil {
 		t.Fatalf("push should have failed under crash knob:\n%s", out)
 	}
-	if objs := minioPacks(t, repo); len(objs) != 0 {
+	if objs := s3Packs(t, repo); len(objs) != 0 {
 		t.Fatalf("after-reserve crash uploaded packs: %v", objs)
 	}
 	if packs := pgPacks(t, repo); len(packs) != 0 {

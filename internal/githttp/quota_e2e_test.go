@@ -80,7 +80,7 @@ func TestPackQuota_PreReceiveDeniesAndStoresNothing(t *testing.T) {
 	}
 	t.Logf("quota-denied push output:\n%s", out)
 
-	if objs := minioPacks(t, repo); len(objs) != 0 {
+	if objs := s3Packs(t, repo); len(objs) != 0 {
 		t.Fatalf("denied push left pack objects in the blob store: %v", objs)
 	}
 	if packs := pgPacks(t, repo); len(packs) != 0 {
@@ -102,7 +102,7 @@ func TestPackQuota_OverQuotaDeniedAtPreReceive(t *testing.T) {
 	work := initWorkRepo(t)
 	token := mintTestToken(t, repo, "git:read,git:write", "")
 	mustGit(t, work, "push", remoteURL(nodeA, repo, token), "HEAD:refs/heads/main")
-	if objs := minioPacks(t, repo); len(objs) == 0 {
+	if objs := s3Packs(t, repo); len(objs) == 0 {
 		t.Fatal("seed push stored no packs")
 	}
 	packsBefore := len(pgPacks(t, repo))
@@ -155,7 +155,7 @@ func TestPackQuota_RegisteredDuplicateRetryCompletes(t *testing.T) {
 	if err == nil {
 		t.Fatalf("push should have failed under crash knob:\n%s", out)
 	}
-	orphans := minioPacks(t, repo)
+	orphans := s3Packs(t, repo)
 	if len(orphans) == 0 {
 		t.Fatal("crash left no published pack; the knob did not fire")
 	}
@@ -214,7 +214,7 @@ func TestPackQuota_PolicyDeniedPushStoresNothing(t *testing.T) {
 	if !strings.Contains(out, "refusing pack publication") {
 		t.Fatalf("denial does not name the publication gate:\n%s", out)
 	}
-	if objs := minioPacks(t, repo); len(objs) != 0 {
+	if objs := s3Packs(t, repo); len(objs) != 0 {
 		t.Fatalf("policy-denied push left pack objects: %v", objs)
 	}
 	if packs := pgPacks(t, repo); len(packs) != 0 {
@@ -260,7 +260,7 @@ func TestPackQuota_CrashRetryNotDoubleCounted(t *testing.T) {
 	if err == nil {
 		t.Fatalf("push should have failed under crash knob:\n%s", out)
 	}
-	orphans := minioPacks(t, repo)
+	orphans := s3Packs(t, repo)
 	if len(orphans) == 0 {
 		t.Fatal("crash left no orphaned pack; the knob did not fire")
 	}
@@ -301,7 +301,7 @@ func TestPackQuota_OrphanInflatedRetryCompletes(t *testing.T) {
 		t.Fatalf("push should have failed under crash knob:\n%s", out)
 	}
 	var orphanBytes int64
-	for _, o := range minioPacks(t, repo) {
+	for _, o := range s3Packs(t, repo) {
 		orphanBytes += o.Size
 	}
 	if orphanBytes == 0 {
@@ -346,7 +346,7 @@ func TestPackQuota_DecoyMixedPushRefused(t *testing.T) {
 	// Seed commit1 on main so its objects are already stored.
 	mustGit(t, work, "push", remoteURL(nodeA, repo, full), "HEAD:refs/heads/main")
 	seedHead := revParse(t, work, "HEAD")
-	packsBefore := len(minioPacks(t, repo))
+	packsBefore := len(s3Packs(t, repo))
 
 	// commit2 carries new bytes; policy denies main, allows everything
 	// else. Push commit2->main (denied, needs the pack) + decoy create at
@@ -362,7 +362,7 @@ func TestPackQuota_DecoyMixedPushRefused(t *testing.T) {
 		t.Fatalf("denial does not name the publication gate:\n%s", out)
 	}
 	t.Logf("decoy mixed push output:\n%s", out)
-	if got := len(minioPacks(t, repo)); got != packsBefore {
+	if got := len(s3Packs(t, repo)); got != packsBefore {
 		t.Fatalf("decoy push grew pack storage: %d -> %d", packsBefore, got)
 	}
 	if _, exists := pgRefs(t, repo)["refs/heads/decoy"]; exists {
@@ -402,7 +402,7 @@ func TestPackDedup_NoOverwriteOnRepush(t *testing.T) {
 	// design (invariant 4), and the delete/re-create dance needs a
 	// deletable ref that is the sole referrer of the pushed objects.
 	mustGit(t, work, "push", remoteURL(nodeA, repo, token), "HEAD:refs/heads/scratch")
-	before := minioPacks(t, repo)
+	before := s3Packs(t, repo)
 	if len(before) != 1 {
 		t.Fatalf("seed push published %d packs, want 1", len(before))
 	}
@@ -414,7 +414,7 @@ func TestPackDedup_NoOverwriteOnRepush(t *testing.T) {
 	out := mustGit(t, work, "push", remoteURL(nodeA, repo, token), "HEAD:refs/heads/scratch")
 	t.Logf("re-create push output:\n%s", out)
 
-	after := minioPacks(t, repo)
+	after := s3Packs(t, repo)
 	if len(after) != 1 {
 		t.Fatalf("re-push left %d pack objects, want 1", len(after))
 	}
@@ -440,7 +440,7 @@ func TestPackQuota_NamespaceSharesQuota(t *testing.T) {
 
 	// Fill the base repo through nodeA (generous quota).
 	mustGit(t, work, "push", remoteURL(nodeA, repo, token), "HEAD:refs/heads/main")
-	if objs := minioPacks(t, repo); len(objs) == 0 {
+	if objs := s3Packs(t, repo); len(objs) == 0 {
 		t.Fatal("seed push stored no packs")
 	}
 

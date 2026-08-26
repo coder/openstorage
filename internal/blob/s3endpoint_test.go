@@ -1,15 +1,16 @@
-// Env-gated S3 endpoint tests (issue #112): unlike the MinIO container
-// tests in minio_test.go, these run against an externally provided S3
+// Env-gated S3 endpoint tests (issue #112): unlike the SeaweedFS container
+// tests in seaweedfs_test.go, these run against an externally provided S3
 // endpoint named by CODESTORAGE_TEST_S3_URL (a full s3:// blob URL;
 // credentials come from the standard AWS environment). The nightly Floci
 // lane (.github/workflows/floci-nightly.yml) points them at floci/floci
 // with FLOCI_SERVICES_S3_ENFORCE_AUTH=true and an IAM-provisioned (not
 // root) access key — a backend that enforces SigV4 on every request, so
-// presigned-URL accept/reject behavior is pinned end-to-end here: no other
-// lane covers corrupted-signature rejection (fileblob never issues
-// presigned URLs at all — ErrSignedURLUnsupported). With real AWS
-// credentials and an existing bucket the same tests run against real S3
-// unchanged.
+// presigned-URL accept/reject behavior is pinned end-to-end here against
+// a second, independent wire-protocol implementation (the per-PR
+// SeaweedFS expected-owner test also rejects a tampered presign, with a
+// static enforcing identity; fileblob never issues presigned URLs at all
+// — ErrSignedURLUnsupported). With real AWS credentials and an existing
+// bucket the same tests run against real S3 unchanged.
 //
 // Known Floci 1.7.0 gaps — do NOT add tests here that require IAM policy
 // evaluation on S3 actions (Deny policies are not enforced, issue #48

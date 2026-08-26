@@ -74,8 +74,10 @@ Database URL for the ref authority (CAS) and metadata store.
 
 Immutable pack storage URL, opened through [gocloud.dev](https://gocloud.dev/howto/blob/).
 
-- **Schemes:** `s3://bucket?region=...` (S3 or MinIO — add
-  `endpoint=http://...&s3ForcePathStyle=true` for MinIO) or `file://<absolute-dir>`
+- **Schemes:** `s3://bucket?region=...` (AWS S3, or an S3-compatible store such as
+  [SeaweedFS](https://github.com/seaweedfs/seaweedfs) — the tested self-hosted
+  reference — by adding `endpoint=http://...&s3ForcePathStyle=true`; other
+  S3-compatible stores, including MinIO, are best-effort) or `file://<absolute-dir>`
   (local mode).
 - **Legacy aliases:** `SPIKE_S3_URL`, `BLOB_URL`.
 - **Default:** none. Startup fails unless set explicitly or derived from the data dir
@@ -110,7 +112,8 @@ purge CLI all share that client seam), so operations against a re-owned bucket f
   `x-amz-expected-bucket-owner` query parameter — the spelling S3 enforces on presigned
   requests. The URL stays self-contained (clients send no extra header), and stripping or
   altering the parameter breaks the SigV4 signature.
-- **MinIO and S3 emulators ignore the condition** (no global bucket namespace); the
+- **Self-hosted stores (SeaweedFS, MinIO) and S3 emulators ignore the condition** (no
+  global bucket namespace); the
   parameter is harmless pass-through there, so the setting is only useful — and only
   meaningfully enforced — against AWS S3. Pair it with the `aws:ResourceAccount` IAM
   condition described in [Deploy to production](../how-to/deploy-production.md), which
@@ -968,6 +971,6 @@ Variables outside the operator surface, listed for completeness — never set th
   [testing reference](testing.md)) and the SDK-compatibility
   suite's vendor checkout location.
 
-The Docker Compose file has its own host-port overrides (`PGPORT`, `MINIOPORT`,
+The Docker Compose file has its own host-port overrides (`PGPORT`, `S3PORT`,
 `NODEA_PORT`, `NODEB_PORT`, `CS_KEYS_DIR`) — see the
 [`docker-compose.yml`](../../docker-compose.yml) header.
