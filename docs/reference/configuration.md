@@ -856,12 +856,19 @@ integrity loss logged loudly: committed refs may reference it). See the
   pass completes one full recovery rotation of both registries.
   Transient renewal blips within the safety bound never fence; internal
   restore/cover reservations are always exempt so recovery can proceed.
-  A SUCCESSFUL renewal whose prior watermark is missing or a full TTL
+  A SUCCESSFUL renewal whose prior watermark exists but is a full TTL
   old fences too — the strict-TTL touch cannot resurrect covers that
-  already lapsed, so a fleet paused past the TTL, the first pass after
-  enabling the job (or upgrading to it), and quota re-enabled after an
-  off period all run one fenced recovery rotation before finite
-  quota-gated writes resume.
+  already lapsed — so a fleet paused past the TTL, or quota re-enabled
+  after an off period whose earlier passes had stamped, runs one fenced
+  recovery rotation before finite quota-gated writes resume. An ABSENT
+  watermark (the first pass after enabling the job, or after upgrading
+  to a version that stamps it) is not lapse evidence by itself: that
+  pass fences only on positive evidence — a durable lapse-evidence
+  marker (recorded whenever admission-time GC or the reservation sweep
+  deletes an expired cover), a physically present expired cover, or an
+  evidence check that itself fails — and otherwise stamps health with
+  admissions left open, so an ordinary first pass after enablement or
+  upgrade does NOT block writes.
 
 ### `CODESTORAGE_ABSENCE_RECONCILE_BUDGET`
 

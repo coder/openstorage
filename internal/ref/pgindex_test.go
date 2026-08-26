@@ -186,3 +186,63 @@ func TestPGInitSchema_RepairsInvalidRefsNameIndex(t *testing.T) {
 		t.Fatalf("ListRefsAfter page plans a sort (index should stream byte order):\n%s", plan)
 	}
 }
+
+// TestPGInitSchema_RepairsInvalidScanStateScopeIndex covers the managed
+// job_scan_state scope index (job_scan_state_job_scope_c, issues #120/#121)
+// through the same detect-drop-rebuild path, and pins the property the
+// index exists for: the byte-ordered scope keyset page behind
+// ListJobScanStateScopes and SettleLFSRefunds' bucket paging must be an
+// index range scan, never a sort of the job's whole remaining scope set
+// (refund buckets grow per base and sweep epoch, so on a non-C default
+// collation the (job, scope) primary key cannot serve the page and every
+// settlement pass would re-sort everything it has not yet consumed).
+func TestPGInitSchema_RepairsInvalidScanStateScopeIndex(t *testing.T) {
+	s := pgTestStore(t)
+	ctx := context.Background()
+
+	if exists, valid := mustIndexState(t, s, "job_scan_state_job_scope_c"); !exists || !valid {
+		t.Fatalf("after boot: scan-state scope index exists=%v valid=%v, want a valid index", exists, valid)
+	}
+
+	if _, err := s.pool.Exec(ctx,
+		`UPDATE pg_index SET indisvalid = false WHERE indexrelid = to_regclass('job_scan_state_job_scope_c')`); err != nil {
+		t.Fatalf("inject invalid index: %v", err)
+	}
+	if err := s.InitSchema(ctx); err != nil {
+		t.Fatalf("InitSchema over invalid scan-state index: %v", err)
+	}
+	if exists, valid := mustIndexState(t, s, "job_scan_state_job_scope_c"); !exists || !valid {
+		t.Fatalf("after repair: exists=%v valid=%v, want a valid index", exists, valid)
+	}
+
+	// The planner must serve the COLLATE "C" keyset page from the index.
+	// EXPLAIN with generic-plan-defeating literals mirrors the production
+	// parameterized queries (ListJobScanStateScopes, SettleLFSRefunds)
+	// closely enough to catch a collation mismatch (a default-collation
+	// PK cannot serve this ORDER BY).
+	rows, err := s.pool.Query(ctx, `EXPLAIN SELECT scope FROM job_scan_state
+		WHERE job = 'lfs_reclaim' AND scope COLLATE "C" > 'refund/'
+		AND left(scope, length('refund/')) = 'refund/'
+		ORDER BY scope COLLATE "C" ASC LIMIT 100`)
+	if err != nil {
+		t.Fatalf("explain: %v", err)
+	}
+	defer rows.Close()
+	var plan string
+	for rows.Next() {
+		var line string
+		if err := rows.Scan(&line); err != nil {
+			t.Fatalf("scan plan: %v", err)
+		}
+		plan += line + "\n"
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("plan rows: %v", err)
+	}
+	if !strings.Contains(plan, "job_scan_state_job_scope_c") {
+		t.Fatalf("scan-state scope page not served by job_scan_state_job_scope_c:\n%s", plan)
+	}
+	if strings.Contains(plan, "Sort") {
+		t.Fatalf("scan-state scope page plans a sort (index should stream byte order):\n%s", plan)
+	}
+}
