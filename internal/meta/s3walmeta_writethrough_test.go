@@ -10,6 +10,7 @@ package meta
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -228,5 +229,180 @@ func TestS3WALMetaWriteThroughRevalidation(t *testing.T) {
 		if won, cerr := refStore.CASRef(ref.WithSyncClaimFence(ctx, repoID, holder), repoID, "refs/heads/main", ref.ZeroSHA, testSHA1); cerr != nil || won {
 			t.Fatalf("fenced CASRef for %s = (%v, %v), want clean loss", holder, won, cerr)
 		}
+	}
+}
+
+// TestS3WALMetaWriteThroughDetachRevokesFence: DeleteRepoUpstream with a
+// live claim must clear the manifest token, so the detached upstream's
+// in-flight worker (between its fence check and its CASRef) loses
+// cleanly AFTER the detach committed — the SQL twins' free guarantee.
+func TestS3WALMetaWriteThroughDetachRevokesFence(t *testing.T) {
+	ctx := context.Background()
+	cas, metaStore, refStore := newWriteThroughStores(t)
+	repoID := seedS3WALUpstream(t, metaStore)
+
+	if _, claimed, _, err := metaStore.TryBeginSync(ctx, repoID, "h1", time.Minute); err != nil || !claimed {
+		t.Fatalf("claim = (%v, %v), want claimed", claimed, err)
+	}
+	if got := manifestSyncClaim(t, cas, repoID); got != "h1" {
+		t.Fatalf("manifest token = %q, want h1", got)
+	}
+
+	if err := metaStore.DeleteRepoUpstream(ctx, repoID); err != nil {
+		t.Fatalf("detach: %v", err)
+	}
+	if got := manifestSyncClaim(t, cas, repoID); got != "" {
+		t.Fatalf("manifest token after detach = %q, want cleared", got)
+	}
+	if won, err := refStore.CASRef(ref.WithSyncClaimFence(ctx, repoID, "h1"), repoID, "refs/heads/main", ref.ZeroSHA, testSHA1); err != nil || won {
+		t.Fatalf("detached holder's fenced CASRef = (%v, %v), want clean loss", won, err)
+	}
+	if _, err := metaStore.GetRepoUpstream(ctx, repoID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("row after detach: %v, want ErrNotFound", err)
+	}
+}
+
+// refusingSink fails every call: wiring it proves the exercised path
+// makes no sink calls at all (any call would fail the operation).
+type refusingSink struct{}
+
+func (refusingSink) SetSyncClaim(context.Context, string, string) error {
+	return errors.New("unexpected SetSyncClaim")
+}
+
+func (refusingSink) ClearSyncClaim(context.Context, string, string) error {
+	return errors.New("unexpected ClearSyncClaim")
+}
+
+// TestS3WALMetaWriteThroughDetachNoClaim: a detach with no claim on the
+// row needs no sink calls at all — there is no token to revoke.
+func TestS3WALMetaWriteThroughDetachNoClaim(t *testing.T) {
+	ctx := context.Background()
+	cas := s3wal.NewMemCAS()
+	metaStore := NewS3WAL(cas, WithSyncClaimSink(refusingSink{}))
+	t.Cleanup(metaStore.Close)
+	repoID := seedS3WALUpstream(t, metaStore)
+
+	if err := metaStore.DeleteRepoUpstream(ctx, repoID); err != nil {
+		t.Fatalf("detach without claim: %v", err)
+	}
+	if _, err := metaStore.GetRepoUpstream(ctx, repoID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("row after detach: %v, want ErrNotFound", err)
+	}
+	// A repeat detach classifies as ErrNotFound on the pre-read too.
+	if err := metaStore.DeleteRepoUpstream(ctx, repoID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("repeat detach: %v, want ErrNotFound", err)
+	}
+}
+
+// TestS3WALMetaWriteThroughDetachPreClearFailure: when the fence clear
+// fails, the detach must abort with NOTHING consumed — the meta row and
+// its claim stay intact, the token stays fencing, and a retry after the
+// manifest heals completes the detach.
+func TestS3WALMetaWriteThroughDetachPreClearFailure(t *testing.T) {
+	ctx := context.Background()
+	cas, metaStore, _ := newWriteThroughStores(t)
+	repoID := seedS3WALUpstream(t, metaStore)
+
+	if _, claimed, _, err := metaStore.TryBeginSync(ctx, repoID, "h1", time.Minute); err != nil || !claimed {
+		t.Fatalf("claim = (%v, %v), want claimed", claimed, err)
+	}
+
+	// Every manifest PUT fails definitively; the meta object is untouched.
+	cas.Hooks.PutFault = func(op, key string) s3wal.PutFault {
+		if strings.HasPrefix(key, s3wal.RepoPrefix) {
+			return s3wal.FaultContention
+		}
+		return s3wal.FaultNone
+	}
+	t.Cleanup(func() { cas.Hooks = s3wal.MemCASHooks{} })
+
+	if err := metaStore.DeleteRepoUpstream(ctx, repoID); err == nil {
+		t.Fatal("detach with failing fence clear succeeded, want abort")
+	}
+	got, gerr := metaStore.GetRepoUpstream(ctx, repoID)
+	if gerr != nil || !got.Syncing || got.SyncClaimHolder != "h1" {
+		t.Fatalf("row after aborted detach = (%+v, %v), want the intact claim", got, gerr)
+	}
+	if tok := manifestSyncClaim(t, cas, repoID); tok != "h1" {
+		t.Fatalf("manifest token after aborted detach = %q, want the intact h1", tok)
+	}
+
+	// The aborted detach is plainly retryable once the manifest heals.
+	cas.Hooks = s3wal.MemCASHooks{}
+	if err := metaStore.DeleteRepoUpstream(ctx, repoID); err != nil {
+		t.Fatalf("retried detach: %v", err)
+	}
+	if tok := manifestSyncClaim(t, cas, repoID); tok != "" {
+		t.Fatalf("manifest token after retried detach = %q, want cleared", tok)
+	}
+}
+
+// TestS3WALMetaWriteThroughDetachStealRace reproduces the interleaving
+// the pre-clear alone cannot cover: between the detacher's pre-clear PUT
+// and its row delete, a thief steals the expired claim, installs its
+// fence, and REVALIDATES successfully (the row is still present, so it
+// does NOT self-revoke). The delete must capture the thief's holder from
+// the deleted snapshot and clear its token post-delete, leaving the
+// detached thief's in-flight fenced CASRef a clean loss.
+func TestS3WALMetaWriteThroughDetachStealRace(t *testing.T) {
+	ctx := context.Background()
+	cas, metaStore, refStore := newWriteThroughStores(t)
+	repoID := seedS3WALUpstream(t, metaStore)
+
+	// The thief is a second full stack over the same bucket (its own ref
+	// store, so the hook's re-entrant claim takes no in-process lock the
+	// detacher's pre-clear is still holding).
+	thiefRef := ref.NewS3WAL(cas, nil)
+	thiefStore := NewS3WAL(cas, WithSyncClaimSink(thiefRef))
+	t.Cleanup(func() { thiefStore.Close(); thiefRef.Close() })
+
+	// h-old's instantly-expired claim leaves a live token for the
+	// detacher's pre-clear to observe and remove.
+	if _, claimed, _, err := metaStore.TryBeginSync(ctx, repoID, "h-old", time.Nanosecond); err != nil || !claimed {
+		t.Fatalf("h-old claim = (%v, %v), want claimed", claimed, err)
+	}
+	if got := manifestSyncClaim(t, cas, repoID); got != "h-old" {
+		t.Fatalf("manifest token = %q, want h-old", got)
+	}
+
+	// The detacher's pre-clear PUT (the first manifest advance after
+	// arming) wakes the thief, whose full claim — meta steal, fence
+	// install, passing revalidation — lands before the row delete.
+	var thiefClaimed bool
+	stealing, stole := false, false
+	cas.Hooks.AfterPut = func(op, key string) {
+		if !strings.HasPrefix(key, s3wal.RepoPrefix) || stealing || stole {
+			return
+		}
+		stealing = true
+		defer func() { stealing = false }()
+		stole = true
+		_, claimed, stolenFrom, err := thiefStore.TryBeginSync(ctx, repoID, "h-thief", time.Minute)
+		if err != nil || !claimed || stolenFrom != "h-old" {
+			t.Errorf("thief steal = (%v, %q, %v), want steal from h-old", claimed, stolenFrom, err)
+		}
+		thiefClaimed = claimed
+	}
+	t.Cleanup(func() { cas.Hooks = s3wal.MemCASHooks{} })
+
+	if err := metaStore.DeleteRepoUpstream(ctx, repoID); err != nil {
+		t.Fatalf("detach: %v", err)
+	}
+	if !thiefClaimed {
+		t.Fatal("the interleaved thief never claimed — the race was not reproduced")
+	}
+	cas.Hooks = s3wal.MemCASHooks{}
+
+	// The captured-holder post-delete clear revoked the thief's token:
+	// the detached thief's in-flight fenced CASRef loses cleanly.
+	if got := manifestSyncClaim(t, cas, repoID); got != "" {
+		t.Fatalf("manifest token after detach = %q, want cleared", got)
+	}
+	if won, err := refStore.CASRef(ref.WithSyncClaimFence(ctx, repoID, "h-thief"), repoID, "refs/heads/main", ref.ZeroSHA, testSHA1); err != nil || won {
+		t.Fatalf("detached thief's fenced CASRef = (%v, %v), want clean loss", won, err)
+	}
+	if _, err := metaStore.GetRepoUpstream(ctx, repoID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("row after detach: %v, want ErrNotFound", err)
 	}
 }

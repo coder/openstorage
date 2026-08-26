@@ -25,6 +25,10 @@
 //     FinishSync clears the manifest token (owner-guarded, so a thief's
 //     token is never touched) BEFORE finalizing the meta row; a failure
 //     there aborts the finish (retryable; expiry recovers the lease).
+//     DeleteRepoUpstream revokes the token around the row delete
+//     (pre-clear plus a captured-holder post-delete clear; ordering
+//     proof on the method) so a detached upstream's in-flight worker
+//     can never publish after the detach committed.
 //     The push lane has no write-through: the outbound claim protects
 //     upstream refs, which no local CASRef fences.
 package meta
@@ -496,18 +500,58 @@ func (s *S3WAL) GetRepoUpstream(ctx context.Context, repoID string) (RepoUpstrea
 // detached. Recovery class PRED: the deleted row is identified by its
 // creation stamp, so a row re-linked after our landed delete is never
 // re-deleted by a recovery re-run.
+//
+// With a SyncClaimSink wired, detach also revokes the §2.8 manifest
+// fence. The SQL twins get that for free — their fence reads the very
+// repo_upstreams row this delete removes — but here the token lives in
+// the ref manifest, and a token outliving the detach would let the
+// detached upstream's in-flight sync worker publish AFTER the detach
+// committed. The ordering mirrors FinishSync: the observed holder's
+// token is cleared BEFORE the meta delete, so a clear failure aborts
+// the detach with nothing consumed (row intact, plainly retryable).
+// The pre-clear alone is not sufficient: a TryBeginSync that commits
+// its meta claim, installs its fence, and revalidates entirely between
+// our observation and our landed delete passes revalidation (the row
+// is still present) and leaves a live token the pre-clear never saw —
+// even the SAME holder's install can land after our pre-clear no-oped
+// on its not-yet-written token. The delete therefore captures the
+// holder recorded on the snapshot the landed CAS destroyed (inside fn:
+// mutate re-runs fn on conflicts, so only the landed run's capture
+// survives) and clears it again, owner-guarded, AFTER the delete.
+// Claimants whose revalidation runs after the delete self-revoke on
+// the missing row instead; one crashing between install and
+// revalidation leaves an inert token (its claim was never handed out,
+// and a fence token only fails OTHER holders closed). A post-delete
+// clear failure is surfaced as an error — a clean detach is never
+// reported over a possibly-live fence. A detach failing AFTER the
+// pre-clear may have revoked a live holder's fence: a liveness cost
+// only (that run's fenced writes lose cleanly), never a safety one.
 func (s *S3WAL) DeleteRepoUpstream(ctx context.Context, repoID string) error {
 	assertf(repoID != "", "DeleteRepoUpstream: empty repo id")
+	if s.sink != nil {
+		up, err := s.GetRepoUpstream(ctx, repoID)
+		if err != nil {
+			return err
+		}
+		if up.SyncClaimHolder != "" {
+			if cerr := s.sink.ClearSyncClaim(ctx, repoID, up.SyncClaimHolder); cerr != nil {
+				return fmt.Errorf("detach upstream for repo %q: clear sync-claim fence: %w", repoID, cerr)
+			}
+		}
+	}
 	var targetCreatedAt int64
 	targeted := false
-	return s.mutate(ctx, s3walMetaMutation{
+	deletedHolder := ""
+	err := s.mutate(ctx, s3walMetaMutation{
 		op: "delete upstream",
 		fn: func(doc *s3walMetaDoc) (bool, error) {
 			u := doc.Upstreams[repoID]
 			if u == nil || (targeted && u.CreatedAt != targetCreatedAt) {
 				return false, fmt.Errorf("upstream for repo %q: %w", repoID, ErrNotFound)
 			}
+			assertNoLegacyClaim(repoID, u)
 			targetCreatedAt, targeted = u.CreatedAt, true
+			deletedHolder = u.SyncClaimHolder
 			delete(doc.Upstreams, repoID)
 			return true, nil
 		},
@@ -518,6 +562,13 @@ func (s *S3WAL) DeleteRepoUpstream(ctx context.Context, repoID string) error {
 			return s3walMetaRerun
 		},
 	})
+	if err != nil || s.sink == nil || deletedHolder == "" {
+		return err
+	}
+	if cerr := s.sink.ClearSyncClaim(ctx, repoID, deletedHolder); cerr != nil {
+		return fmt.Errorf("detach upstream for repo %q: clear sync-claim fence after delete: %w", repoID, cerr)
+	}
+	return nil
 }
 
 // RequestSync marks a pending sync request (issue #79 protocol);
