@@ -406,10 +406,6 @@ func (s *S3WAL) checkManifestSize(base string, mu s3walMutation, size int) error
 	return nil
 }
 
-// s3walAlwaysGrows is the static grows predicate for mutations whose
-// every applied invocation inserts entries.
-func s3walAlwaysGrows() bool { return true }
-
 // newWallDrift anchors the §2.4 wall-vs-monotonic drift detector: a wall
 // clock jump (settimeofday, an NTP step, a VM resume) moves the wall
 // reading without moving the monotonic one, so the difference between the
@@ -795,11 +791,21 @@ func (s *S3WAL) ReplacePacks(ctx context.Context, repo string, old []Pack, newPa
 		}
 		return n == len(old)
 	}
+	netEntries := 0
 	err = s.mutate(ctx, baseRepoOf(repo), s3walMutation{
-		op:    "replace packs",
-		grows: s3walAlwaysGrows, // fold row + retained tombstones always insert
+		op: "replace packs",
+		// Growth is the NET entry delta (Codex round 7 on PR #156): a
+		// fold removes the old pack rows and converts them to retained
+		// tombstones (each strictly smaller than the row it replaces), so
+		// the only genuine addition is a fresh fold-row insert whose own
+		// retained key was not consumed. Registered-output folds,
+		// identity folds, and crash-retry re-folds net zero or shrink —
+		// refusing them at the hard cap would block exactly the
+		// consolidation an oversized manifest needs.
+		grows: func() bool { return netEntries > 0 },
 		fn: func(m *s3wal.Manifest, clk time.Time) (bool, error) {
 			won = false
+			netEntries = 0
 			if !allOldPresent(m) {
 				return false, nil // another fold got here first: clean loss
 			}
@@ -809,6 +815,7 @@ func (s *S3WAL) ReplacePacks(ctx context.Context, repo string, old []Pack, newPa
 			for _, p := range mem.Packs {
 				if oldByID[p.ID] {
 					mem.Gen++
+					netEntries--
 					continue
 				}
 				kept = append(kept, p)
@@ -821,6 +828,9 @@ func (s *S3WAL) ReplacePacks(ctx context.Context, repo string, old []Pack, newPa
 				mem.Retained = make(map[string]s3wal.RetainedPack)
 			}
 			for _, p := range old {
+				if _, ok := mem.Retained[p.Key]; !ok {
+					netEntries++
+				}
 				mem.Retained[p.Key] = s3wal.RetainedPack{Bytes: p.Size, SupersededAt: clk}
 			}
 			if s3walHasPackID(mem, newPack.ID) {
@@ -828,7 +838,11 @@ func (s *S3WAL) ReplacePacks(ctx context.Context, repo string, old []Pack, newPa
 				return true, nil // fold row already registered: bytes counted
 			}
 			mem.Packs = append(mem.Packs, s3wal.PackRecord{ID: newPack.ID, Key: newPack.Key, Bytes: newPack.Size, CreatedAt: clk})
+			netEntries++
 			mem.Gen++
+			if _, ok := mem.Retained[newPack.Key]; ok {
+				netEntries-- // the register ledger consumes it below
+			}
 			m.UsageBytes += s3walRegisterLedger(mem, newPack)
 			won = true
 			return true, nil

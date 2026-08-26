@@ -1660,6 +1660,49 @@ func TestS3WALRecoverySizeCap(t *testing.T) {
 		}
 	})
 
+	t.Run("zero-growth folds pass the cap", func(t *testing.T) {
+		// Codex round 7 on PR #156: a fold REMOVES the old pack rows and
+		// converts them to retained tombstones — the only genuinely new
+		// entry is a fresh fold row. Folds whose output is already
+		// registered and identity folds (which consume their own retained
+		// row) net zero or shrink, and refusing them at the hard cap
+		// would block exactly the consolidation an oversized manifest
+		// needs. Only a net entry ADDITION is growth.
+		_, a, _ := newRecoveryStores(t)
+		seed := []Pack{{ID: "p1", Key: "k1", Size: 4}, {ID: "p2", Key: "k2", Size: 5}, {ID: "pf", Key: "kf", Size: 9}}
+		if err := a.RegisterPacks(ctx, base, seed); err != nil {
+			t.Fatalf("seed register: %v", err)
+		}
+		a.hardCapBytes = 1
+
+		// Fold output already registered: −2 pack rows, +2 retained.
+		won, err := a.ReplacePacks(ctx, base, seed[:2], seed[2])
+		if err != nil || !won {
+			t.Fatalf("registered-output fold at the cap = (%v, %v), want win (non-growing)", won, err)
+		}
+		mem := mustManifest(t, a, base).Member(base)
+		if len(mem.Packs) != 1 || mem.Packs[0].ID != "pf" {
+			t.Fatalf("packs = %+v, want only the fold row", mem.Packs)
+		}
+		if len(mem.Retained) != 2 {
+			t.Fatalf("retained = %+v, want the two superseded keys", mem.Retained)
+		}
+
+		// Identity fold: the fold row replaces a same-key row and
+		// consumes its own retained tombstone — net zero.
+		won, err = a.ReplacePacks(ctx, base, []Pack{{ID: "pf", Key: "kf", Size: 9}}, Pack{ID: "pf2", Key: "kf", Size: 9})
+		if err != nil || !won {
+			t.Fatalf("identity fold at the cap = (%v, %v), want win (net zero)", won, err)
+		}
+
+		// A fresh fold row over a live old set is a genuine +1 insert:
+		// still refused at the cap.
+		_, err = a.ReplacePacks(ctx, base, []Pack{{ID: "pf2", Key: "kf", Size: 9}}, Pack{ID: "pn", Key: "kn", Size: 9})
+		if err == nil || !strings.Contains(err.Error(), "refusing new registrations") {
+			t.Fatalf("growing fold at the cap = %v, want the documented refusal", err)
+		}
+	})
+
 	t.Run("purge pipeline exempt from the hard cap", func(t *testing.T) {
 		// An oversized manifest must stay purgeable (Codex on PR #156):
 		// the purge pipeline is the machinery that shrinks it, so the
