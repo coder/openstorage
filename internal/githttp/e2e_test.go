@@ -40,6 +40,7 @@ import (
 	"github.com/coder/code-storage/internal/jobs"
 	"github.com/coder/code-storage/internal/meta"
 	"github.com/coder/code-storage/internal/ref"
+	"github.com/coder/code-storage/internal/ref/s3wal/s3waltest"
 )
 
 // testOrg is the org the serve nodes are configured for; secondOrg is
@@ -192,25 +193,17 @@ func testMainInner(m *testing.M) int {
 		os.Setenv("AWS_ACCESS_KEY_ID", s3AccessKey)
 		os.Setenv("AWS_SECRET_ACCESS_KEY", s3SecretKey)
 
-		// The bucket must exist BEFORE testStore.InitSchema below: the
-		// s3wal boot probe writes _wal/probe into it. This poll doubles
-		// as the lane's S3 readiness gate (same rationale as the shared
-		// EnsureBucket retry below, which then succeeds immediately).
-		b, err := blob.Open(ctx, blobURL)
-		if err != nil {
-			panic(err)
+		// The bucket must exist AND be writable BEFORE testStore.InitSchema
+		// below: the s3wal boot probe writes _wal/probe on a no-retry
+		// client, and SeaweedFS keeps 500ing object PUTs for a while after
+		// CreateBucket succeeds — bucket creation is filer-only, object
+		// writes need a volume assignment (issue #165). The shared harness
+		// gate retries bucket creation while the gateway chain boots and
+		// returns only once a scratch write roundtrip succeeds.
+		raw := s3waltest.RawS3Client("http://"+s3Addr, "us-east-1", s3AccessKey, s3SecretKey)
+		if err := s3waltest.EnsureBucket(ctx, raw, bucket); err != nil {
+			panic("SeaweedFS never became write-ready: " + err.Error())
 		}
-		for deadline := time.Now().Add(60 * time.Second); ; {
-			err := b.EnsureBucket(ctx)
-			if err == nil {
-				break
-			}
-			if time.Now().After(deadline) {
-				panic("EnsureBucket never succeeded (SeaweedFS not ready?): " + err.Error())
-			}
-			time.Sleep(250 * time.Millisecond)
-		}
-		b.Close()
 	default:
 		panic(fmt.Sprintf("CODESTORAGE_TEST_BACKEND=%q: unknown backend (want %q, %q, %q, or unset)", v, backendPG, backendLocal, backendS3WAL))
 	}
@@ -287,7 +280,9 @@ func testMainInner(m *testing.M) int {
 // gateway would serve unsigned requests too. The wait strategy only proves
 // the gateway port accepts TCP — weed starts master/volume/filer/s3
 // asynchronously — so the callers' EnsureBucket retry is the actual
-// readiness signal. Shared by the pg and s3wal lanes.
+// readiness signal (the s3wal lane additionally gates on a scratch write
+// roundtrip before its no-retry boot probe runs — issue #165). Shared by
+// the pg and s3wal lanes.
 func startSeaweedFS(ctx context.Context) (s3Addr string, terminate func()) {
 	s3Config := fmt.Sprintf(`{"identities":[{"name":"e2e","credentials":[{"accessKey":%q,"secretKey":%q}],"actions":["Admin","Read","List","Tagging","Write"]}]}`,
 		s3AccessKey, s3SecretKey)

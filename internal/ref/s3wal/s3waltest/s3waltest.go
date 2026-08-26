@@ -51,8 +51,9 @@ const (
 // -s3`: master + volume + filer + S3 gateway in one process; versioning
 // and object-lock never enabled — seaweedfs#8073 avoidance) and returns
 // the S3 endpoint URL plus a terminate func. The gateway components start
-// asynchronously after the port listens, so callers must treat the first
-// successful CreateBucket as the readiness signal (EnsureBucket retries).
+// asynchronously after the port listens — and a created bucket still has
+// no writable volume for a while (issue #165) — so callers must gate on
+// EnsureBucket, whose write-readiness roundtrip is the readiness signal.
 func StartSeaweedFSContainer(ctx context.Context) (endpoint string, terminate func(), err error) {
 	c, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
 		ContainerRequest: testcontainers.ContainerRequest{
@@ -139,8 +140,16 @@ func RawS3Client(endpoint, region, accessKey, secretKey string) *s3.Client {
 
 // EnsureBucket creates the bucket, retrying while the store boots (the
 // SeaweedFS S3 gateway accepts TCP before the filer is ready) and
-// tolerating already-owned rejections, then verifies it with HeadBucket —
-// the bucket bootstrap/health-check surface.
+// tolerating already-owned rejections, verifies it with HeadBucket, then
+// proves WRITE readiness with a scratch PutObject/DeleteObject roundtrip.
+// Bucket existence alone is not a write-readiness signal: SeaweedFS
+// serves CreateBucket from the filer while object PUTs need a writable
+// volume assignment from the master, which returns 500 InternalError
+// until the volume server has registered and volumes are grown (issue
+// #165). The qualification lanes issue their first object write on
+// deliberately no-retry CAS clients whose ambiguous post-send 5xx
+// outcome is fatal by design, so the harness must absorb the boot window
+// here instead of handing out a bucket that cannot yet be written.
 func EnsureBucket(ctx context.Context, client *s3.Client, bucket string) error {
 	deadline := time.Now().Add(60 * time.Second)
 	for {
@@ -161,7 +170,41 @@ func EnsureBucket(ctx context.Context, client *s3.Client, bucket string) error {
 	if _, err := client.HeadBucket(ctx, &s3.HeadBucketInput{Bucket: aws.String(bucket)}); err != nil {
 		return fmt.Errorf("HeadBucket(%s) after create: %w", bucket, err)
 	}
-	return nil
+	// Write-readiness gate. The scratch key lives outside every
+	// store-scanned prefix (`_wal/...`) and carries a fresh nonce so
+	// concurrent harnesses sharing an external emulator bucket never
+	// collide. The PUT/DELETE pair retries as a unit under the same
+	// deadline so a transient boot 500 on the delete cannot leak the key.
+	nonce := make([]byte, 16)
+	if _, err := rand.Read(nonce); err != nil {
+		return fmt.Errorf("readiness nonce: %w", err)
+	}
+	key := fmt.Sprintf("harness-readiness/%s", hex.EncodeToString(nonce))
+	for {
+		err := func() error {
+			if _, err := client.PutObject(ctx, &s3.PutObjectInput{
+				Bucket: aws.String(bucket),
+				Key:    aws.String(key),
+				Body:   strings.NewReader("s3waltest write-readiness probe"),
+			}); err != nil {
+				return fmt.Errorf("readiness PutObject(%s/%s): %w", bucket, key, err)
+			}
+			if _, err := client.DeleteObject(ctx, &s3.DeleteObjectInput{
+				Bucket: aws.String(bucket),
+				Key:    aws.String(key),
+			}); err != nil {
+				return fmt.Errorf("readiness DeleteObject(%s/%s): %w", bucket, key, err)
+			}
+			return nil
+		}()
+		if err == nil {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("write-readiness roundtrip never succeeded (no writable volume?): %w", err)
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
 }
 
 // MustEnsureBucket is EnsureBucket for tests.
