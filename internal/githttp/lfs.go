@@ -372,6 +372,16 @@ func (s *Server) lfsBatchDownload(r *http.Request, repoElem string, target repoT
 		case errors.Is(aerr, errLFSBusy):
 			lfsObjectFail(&res, http.StatusTooManyRequests, "object recovery in progress; retry")
 			return res
+		case errors.Is(aerr, errLFSQuotaDegraded):
+			// The restore copy's admission is fenced while quota
+			// accounting is degraded (Codex round 39 on PR #132): the
+			// object EXISTS (registered, legacy copy retained), so a
+			// transient 503 beats the honest-404 fallthrough — the
+			// client retries after recovery instead of treating the
+			// object as gone.
+			lfsObjectFail(&res, http.StatusServiceUnavailable,
+				"storage quota accounting temporarily degraded, retry later")
+			return res
 		default:
 			log.Printf("lfs download restore %s: %v", key, aerr)
 		}
@@ -584,6 +594,15 @@ func (s *Server) lfsBatchUpload(r *http.Request, repoElem string, target repoTar
 				case errors.Is(aerr, errLFSBusy):
 					lfsObjectFail(&results[i], http.StatusTooManyRequests,
 						"a concurrent operation holds this object, retry")
+					continue
+				case errors.Is(aerr, errLFSQuotaDegraded):
+					// Fail-closed while quota accounting is degraded
+					// (Codex round 39 on PR #132): transient — the
+					// recovery rotation clears the fence, so a 503
+					// keeps the client retrying instead of failing
+					// hard on a generic 500 (the round-26 PUT shape).
+					lfsObjectFail(&results[i], http.StatusServiceUnavailable,
+						"storage quota accounting temporarily degraded, retry later")
 					continue
 				case errors.Is(aerr, errLFSContentMismatch):
 					// A mismatched legacy blob was removed: the object is
@@ -2743,6 +2762,14 @@ func (s *Server) lfsProxyDownload(w http.ResponseWriter, r *http.Request, repoID
 		case errors.Is(aerr, errLFSBusy):
 			lfsError(w, http.StatusTooManyRequests, "object recovery in progress; retry")
 			return
+		case errors.Is(aerr, errLFSQuotaDegraded):
+			// See the batch restore twin (Codex round 39 on PR #132):
+			// the object exists — transient 503, not the honest-404
+			// fallthrough.
+			w.Header().Set("Retry-After", "60")
+			lfsError(w, http.StatusServiceUnavailable,
+				"storage quota accounting temporarily degraded, retry later")
+			return
 		default:
 			log.Printf("lfs download restore %s: %v", key, aerr)
 		}
@@ -2890,6 +2917,14 @@ func (s *Server) lfsProxyUpload(w http.ResponseWriter, r *http.Request, target r
 			return
 		case errors.Is(aerr, errLFSBusy):
 			lfsError(w, http.StatusTooManyRequests, "server LFS staging budget exhausted, retry")
+			return
+		case errors.Is(aerr, errLFSQuotaDegraded):
+			// Fail-closed while quota accounting is degraded (Codex
+			// round 39 on PR #132): transient, retry — the round-26
+			// PUT shape, not the generic 500.
+			w.Header().Set("Retry-After", "60")
+			lfsError(w, http.StatusServiceUnavailable,
+				"storage quota accounting temporarily degraded, retry later")
 			return
 		case errors.Is(aerr, errLFSContentMismatch):
 			// The mismatched legacy blob was removed: proceed as a normal
