@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.11.1](https://github.com/coder/code-storage/compare/v0.11.0...v0.11.1) (2026-08-26)
+
+
+### Bug Fixes
+
+* **githttp:** disarm LFS proxy-upload body read deadlines after body consumption ([#154](https://github.com/coder/code-storage/issues/154)) ([0f888e7](https://github.com/coder/code-storage/commit/0f888e76695545ea175aed46c90ed9a7dc7f3e17)), closes [#141](https://github.com/coder/code-storage/issues/141)
+
 ## [0.11.0](https://github.com/coder/code-storage/compare/v0.10.0...v0.11.0) (2026-08-26)
 
 
