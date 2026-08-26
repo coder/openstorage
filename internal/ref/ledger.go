@@ -406,6 +406,22 @@ func lockBaseLedger(ctx context.Context, tx pgx.Tx, base string) error {
 	return err
 }
 
+// absenceFenceLockName/-Class key the fleet-global advisory lock pair
+// serializing admission-fence ARMING with finite quota admissions (Codex
+// round 35 on PR #132, security): every finite ReservePackBytes holds the
+// SHARED side across its fence check and reservation sums, and
+// ArmAbsenceAdmissionFence takes the EXCLUSIVE side around its upsert —
+// so an admission either commits before the fence lands (its covers were
+// still inside the sums the arming pass saw) or observes the row and
+// fails closed. A dedicated class keeps the key disjoint from every
+// per-base reserveLockClass lock (a repo literally named like the key
+// cannot collide). SQLite needs no twin: BEGIN IMMEDIATE single-writer
+// transactions already serialize the pair.
+const (
+	absenceFenceLockName  = "absence-admission-fence"
+	absenceFenceLockClass = int32(0x41424643) // "ABFC"
+)
+
 // reserveLockClass namespaces the per-base advisory locks ReservePackBytes
 // takes ("PKQR"), in the two-int4 pg_advisory_xact_lock keyspace — disjoint
 // from the single-int8 keys the schema-init paths use (META, SPIKE, RIVER).
@@ -524,6 +540,15 @@ func (s *PG) ReservePackBytes(ctx context.Context, group []string, packs []Pack,
 		// closed (see ReserveDecision.RenewalDegraded); unbounded
 		// internal reservations proceed so recovery can re-cover.
 		if quotaBytes != math.MaxInt64 {
+			// Hold the SHARED side of the fence lock across the check
+			// AND the admission sums below (Codex round 35, security):
+			// without it, an arming pass could land its upsert between
+			// this read and the commit, and the admission would spend
+			// the exact deflated headroom the fence exists to close.
+			if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock_shared(hashtext($1), $2)`,
+				absenceFenceLockName, absenceFenceLockClass); err != nil {
+				return err
+			}
 			var degraded bool
 			if err := tx.QueryRow(ctx,
 				`SELECT EXISTS (SELECT 1 FROM job_scan_state WHERE job = $1 AND scope = $2)`,

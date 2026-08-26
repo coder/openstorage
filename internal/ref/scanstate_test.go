@@ -760,3 +760,84 @@ func testSweepRecordsLapseEvidence(t *testing.T, s Store) {
 		t.Fatalf("marker payload = %q, want the consumed cover's raw key", st.Payload)
 	}
 }
+
+// TestArmAbsenceAdmissionFence_SerializesWithFiniteAdmissions (Codex
+// round 35 on PR #132, P2 security; PostgreSQL-only — SQLite's single
+// IMMEDIATE writer is structurally serial): a finite admission holds the
+// SHARED fence lock across its fence check and reservation sums, and
+// arming takes the EXCLUSIVE side, so neither can slip between the
+// other's check and commit. Unbounded internal reservations stay exempt
+// so recovery can proceed under an armed fence.
+func TestArmAbsenceAdmissionFence_SerializesWithFiniteAdmissions(t *testing.T) {
+	s := pgTestStore(t)
+	ctx := context.Background()
+	k := newLedgerKit(t, s)
+	ss := scanStateStore(t, s)
+	clearFence := func() {
+		if err := ss.DeleteJobScanState(context.Background(), ScanJobAbsence, ScanScopeAbsenceAdmissionFence); err != nil {
+			t.Fatalf("clear fence: %v", err)
+		}
+	}
+	clearFence()
+	t.Cleanup(clearFence) // the marker is fleet-global on the shared lane
+
+	conn, err := pgx.Connect(ctx, pgTestURL) // the racing peer's session
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close(context.Background()) })
+
+	// Direction 1: an in-flight finite admission (shared side held)
+	// blocks arming until it commits.
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock_shared(hashtext($1), $2)`,
+		absenceFenceLockName, absenceFenceLockClass); err != nil {
+		t.Fatal(err)
+	}
+	armCtx, cancelArm := context.WithTimeout(ctx, 500*time.Millisecond)
+	err = s.ArmAbsenceAdmissionFence(armCtx, `{"lfs":0,"packs":0}`)
+	cancelArm()
+	if err == nil {
+		t.Fatal("arm under an in-flight finite admission = nil, want blocked until the admission ends")
+	}
+	if err := tx.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ArmAbsenceAdmissionFence(ctx, `{"lfs":0,"packs":0}`); err != nil {
+		t.Fatalf("arm after the admission ended: %v", err)
+	}
+	clearFence()
+
+	// Direction 2: an arming transaction (exclusive side held) blocks
+	// finite admissions — while unbounded internal reservations stay
+	// exempt.
+	tx, err = conn.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1), $2)`,
+		absenceFenceLockName, absenceFenceLockClass); err != nil {
+		t.Fatal(err)
+	}
+	rctx, cancelReserve := context.WithTimeout(ctx, 500*time.Millisecond)
+	_, err = s.ReservePackBytes(rctx, k.group, []Pack{k.pack(k.base(), "f1", 10)}, NewReservationOwner(), 0, ReserveNoFloorGen, 1_000, time.Hour)
+	cancelReserve()
+	if err == nil {
+		t.Fatal("finite reserve under an in-flight arm = nil, want blocked until the arm commits")
+	}
+	uctx, cancelUnbounded := context.WithTimeout(ctx, 2*time.Second)
+	dec, err := s.ReservePackBytes(uctx, k.group, []Pack{k.pack(k.base(), "f2", 10)}, NewReservationOwner(), 0, ReserveNoFloorGen, math.MaxInt64, time.Hour)
+	cancelUnbounded()
+	if err != nil || !dec.OK {
+		t.Fatalf("unbounded reserve under an in-flight arm = (%+v, %v), want exempt", dec, err)
+	}
+	if err := tx.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if dec, err := s.ReservePackBytes(ctx, k.group, []Pack{k.pack(k.base(), "f3", 10)}, NewReservationOwner(), 0, ReserveNoFloorGen, 1_000, time.Hour); err != nil || !dec.OK {
+		t.Fatalf("finite reserve after the arm ended = (%+v, %v), want admitted", dec, err)
+	}
+}

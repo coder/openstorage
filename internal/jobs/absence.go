@@ -136,6 +136,12 @@ type AbsenceRegistry interface {
 	// ReservePackBytes is the ref.RestoreCoverStore seam
 	// ref.ReserveRestoreCover charges covers through.
 	ReservePackBytes(ctx context.Context, group []string, packs []ref.Pack, owner string, usageFloor, floorGen, quotaBytes int64, ttl time.Duration) (ref.ReserveDecision, error)
+	// ArmAbsenceAdmissionFence upserts the admission-fence marker
+	// serialized against in-flight finite quota admissions (Codex round
+	// 35, security): a plain scan-state upsert could land between an
+	// admission's fence check and its commit on PostgreSQL, letting it
+	// spend the deflated headroom the fence closes.
+	ArmAbsenceAdmissionFence(ctx context.Context, payload string) error
 	// ScanStateStore persists the rotation cursors and traversal
 	// bookkeeping (issue #125).
 	ref.ScanStateStore
@@ -1033,7 +1039,9 @@ func (r *AbsenceReconciler) armFence(ctx context.Context, errs *boundedErrs, why
 	}
 	snap, mErr := json.Marshal(map[string]int64{"lfs": lfsSnap, "packs": packsSnap})
 	assertf(mErr == nil, "absence reconcile: marshal fence snapshot: %v", mErr)
-	if err := r.registry.PutJobScanState(sctx, ref.ScanJobAbsence, ref.ScanScopeAbsenceAdmissionFence, string(snap), 0); err != nil {
+	// The dedicated arm seam serializes with in-flight finite admissions
+	// (Codex round 35, security) — see AbsenceRegistry.
+	if err := r.registry.ArmAbsenceAdmissionFence(sctx, string(snap)); err != nil {
 		errs.add(fmt.Errorf("absence reconcile: arm admission fence: %w", err))
 		return false
 	}

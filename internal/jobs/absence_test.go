@@ -1526,12 +1526,12 @@ type failFenceArmRegistry struct {
 	fail bool
 }
 
-func (fr *failFenceArmRegistry) PutJobScanState(ctx context.Context, job, scope, payload string, generation int64) error {
-	if fr.fail && job == ref.ScanJobAbsence && scope == ref.ScanScopeAbsenceAdmissionFence {
+func (fr *failFenceArmRegistry) ArmAbsenceAdmissionFence(ctx context.Context, payload string) error {
+	if fr.fail {
 		fr.fail = false
 		return fmt.Errorf("flaky: injected fence-arm failure")
 	}
-	return fr.AbsenceRegistry.PutJobScanState(ctx, job, scope, payload, generation)
+	return fr.AbsenceRegistry.ArmAbsenceAdmissionFence(ctx, payload)
 }
 
 // TestAbsenceReconcile_FailedFenceArmSuppressesHealthStamp (Codex round

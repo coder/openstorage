@@ -240,7 +240,14 @@ healthy load ignores the sentinel and re-anchors the fence at its
 freshly loaded counters, still demanding one complete clean rotation —
 and it leaves the unreadable cursor rows un-stamped, so the lifetime
 traversal counters an armed fence compares against survive the failing
-pass. A fenced pass also defers ALL legacy folding: the fold-time
+pass. Arming is serialized with finite admissions on PostgreSQL (round
+35): every finite ReservePackBytes holds the shared side of a
+fleet-global advisory lock across its fence check and reservation sums,
+and the arm upsert takes the exclusive side — an in-flight admission
+either commits before the fence lands (its covers were still inside the
+sums the arming pass saw) or observes the row and fails closed; SQLite's
+single IMMEDIATE writer is structurally serial, and unbounded internal
+reservations stay exempt so recovery can proceed. A fenced pass also defers ALL legacy folding: the fold-time
 re-stat is run-to-completion and can burn the whole pass deadline on
 one large base, starving the recovery rotations whose clean-traversal
 advance is the only thing that settles the fence — and fold deferral is

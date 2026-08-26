@@ -295,6 +295,32 @@ ON CONFLICT (job, scope) DO UPDATE SET payload = EXCLUDED.payload,
 	return err
 }
 
+// ArmAbsenceAdmissionFence upserts the admission-fence marker under the
+// EXCLUSIVE side of the fleet-global fence lock (Codex round 35 on PR
+// #132, security): every finite quota admission holds the SHARED side
+// across its fence check and reservation sums, so arming waits out
+// in-flight admissions — whose covers were still inside the sums the
+// arming pass saw — and every admission starting afterwards observes the
+// row and fails closed. A plain PutJobScanState upsert had no such
+// ordering on PostgreSQL.
+func (s *PG) ArmAbsenceAdmissionFence(ctx context.Context, payload string) error {
+	assertf(payload != "", "ArmAbsenceAdmissionFence: empty payload")
+	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1), $2)`,
+			absenceFenceLockName, absenceFenceLockClass); err != nil {
+			return err
+		}
+		_, err := tx.Exec(ctx, `
+INSERT INTO job_scan_state (job, scope, payload, generation, updated_at)
+VALUES ($1, $2, $3, 0, now())
+ON CONFLICT (job, scope) DO UPDATE SET payload = EXCLUDED.payload,
+                                       generation = 0,
+                                       updated_at = now()`,
+			ScanJobAbsence, ScanScopeAbsenceAdmissionFence, payload)
+		return err
+	})
+}
+
 // ListJobScanStateScopes — see ScanStateStore.
 func (s *PG) ListJobScanStateScopes(ctx context.Context, job, prefix, after string, limit int) ([]string, error) {
 	assertf(job != "" && prefix != "", "ListJobScanStateScopes(%q, %q)", job, prefix)

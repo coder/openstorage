@@ -61,6 +61,15 @@ ON CONFLICT (job, scope) DO UPDATE SET payload = excluded.payload,
 	return err
 }
 
+// ArmAbsenceAdmissionFence — see the PG twin for the ordering contract.
+// SQLite needs no explicit lock: the upsert is one IMMEDIATE-mode write,
+// and ReservePackBytes' whole check-and-reserve runs in a single-writer
+// BEGIN IMMEDIATE transaction, so the pair cannot interleave.
+func (s *SQLite) ArmAbsenceAdmissionFence(ctx context.Context, payload string) error {
+	assertf(payload != "", "ArmAbsenceAdmissionFence: empty payload")
+	return s.PutJobScanState(ctx, ScanJobAbsence, ScanScopeAbsenceAdmissionFence, payload, 0)
+}
+
 // ListJobScanStateScopes — see ScanStateStore. SQLite TEXT compares by
 // byte order natively.
 func (s *SQLite) ListJobScanStateScopes(ctx context.Context, job, prefix, after string, limit int) ([]string, error) {
