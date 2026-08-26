@@ -123,12 +123,23 @@ func (c *SimCAS) put(op, kind, key string, exec func() (string, error)) (string,
 	case FaultClean:
 		return "", fmt.Errorf("%s %s: %w", op, key, s3wal.ErrNotExecuted)
 	case FaultAmbiguous:
-		if c.inj.coin() {
-			etag, err := exec()
-			c.inj.noteInnerOutcome(op, fmt.Sprintf("applied etag=%.10s err=%v", etag, err))
-		} else {
+		if !c.inj.coin() {
 			c.inj.noteInnerOutcome(op, "dropped")
+			return "", &s3wal.AmbiguousError{Op: kind, Key: key, Cause: ErrInjectedAmbiguous}
 		}
+		etag, err := exec()
+		if err != nil {
+			// A definitive store rejection (412 lost-race / exists) is a
+			// real verdict, not an ambiguity: nothing landed, and MemCAS
+			// evaluates preconditions before fault injection for the
+			// same reason. Propagate it so the driver exercises its
+			// lost-race retry path, not ambiguity recovery — the
+			// client-sees-error-nothing-landed class is the dropped
+			// arm's job (Codex on PR #159).
+			c.inj.noteInnerOutcome(op, fmt.Sprintf("rejected err=%v", err))
+			return "", err
+		}
+		c.inj.noteInnerOutcome(op, fmt.Sprintf("applied etag=%.10s", etag))
 		return "", &s3wal.AmbiguousError{Op: kind, Key: key, Cause: ErrInjectedAmbiguous}
 	default:
 		panic(fmt.Sprintf("simtest: invalid SimCAS put fault class %v", class))

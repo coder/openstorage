@@ -466,16 +466,25 @@ func TestS3WALCrashWindows(t *testing.T) {
 		if _, err := e.s.DropRepoLFSObjects(ctx, group); err != nil {
 			t.Fatalf("DropRepoLFSObjects: %v", err)
 		}
-		// Blob reap happens here (job-side); retained rows are dropped by
-		// the terminal ledger purge below, so the model deletes after it.
+		// Blob reap happens HERE, before the terminal ledger purge —
+		// jobs/purge.go phases 4 and 6 — so T is load-bearing: the pack
+		// blob is deleted strictly while its retained tombstone still
+		// exists (Codex on PR #159). Purge-retained tombstones carry
+		// bytes=0 by design: the terminal ledger purge zeroes the whole
+		// group's usage rather than debiting per row.
+		if m := mustManifest(t, e.s, base); m.Members[base] == nil || len(m.Members[base].Packs) != 0 {
+			t.Fatalf("packs not retired before blob reap: %+v", m.Members[base])
+		} else if _, ok := m.Members[base].Retained["packs/w8/k1"]; !ok {
+			t.Fatalf("pack not tombstoned before blob reap: %+v", m.Members[base].Retained)
+		}
+		e.deleteBlob(base, "packs/w8/k1")
+		e.deleteBlob(base, "lfs/w8repo/o1")
 		if n, err := e.s.CountRepoRows(ctx, group); err != nil || n != 0 {
 			t.Fatalf("CountRepoRows = (%d, %v), want 0", n, err)
 		}
 		if _, err := e.s.PurgeRepoLedger(ctx, group); err != nil {
 			t.Fatalf("PurgeRepoLedger: %v", err)
 		}
-		e.deleteBlob(base, "packs/w8/k1")
-		e.deleteBlob(base, "lfs/w8repo/o1")
 		m := mustManifest(t, e.s, base)
 		if m.PurgedAt == nil {
 			t.Fatal("terminal purge left no tombstone stamp")
