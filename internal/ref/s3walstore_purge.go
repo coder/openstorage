@@ -200,6 +200,13 @@ func (s *S3WAL) PurgeRepoLedger(ctx context.Context, group []string) (int64, err
 			}
 			total += int64(len(m.LFS.Mismatches))
 			m.LFS.Mismatches = nil
+			// Delete leases die with the ledger (Codex round 11 on PR
+			// #156): the purge fence makes them permanently unnecessary
+			// (fenced repos delete directly; registrations can never
+			// commit), and the burned-name tombstone must stay small
+			// instead of retaining stale lease state forever.
+			total += int64(len(m.DeleteLocks))
+			m.DeleteLocks = nil
 			if m.LFS.AdoptionGen != 0 { // the lfs_adoption_gens row
 				total++
 				m.LFS.AdoptionGen = 0

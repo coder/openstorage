@@ -103,7 +103,7 @@ type S3WAL struct {
 	hardCapBytes  int
 
 	mu    sync.Mutex
-	locks map[string]*sync.Mutex
+	locks map[string]*s3walKeyLock
 
 	// Driver-level per-manifest seq watermark: the same stale-read
 	// defense casobj.Client arms for the real store, kept here too so it
@@ -151,7 +151,7 @@ func newS3WALStore(cs s3wal.ConditionalStore, probe func(ctx context.Context) er
 		backoffCap:    2 * time.Second,
 		softWarnBytes: s3walSoftWarnBytes,
 		hardCapBytes:  s3walHardCapBytes,
-		locks:         make(map[string]*sync.Mutex),
+		locks:         make(map[string]*s3walKeyLock),
 		lastSeq:       make(map[string]int64),
 		warned:        make(map[string]bool),
 	}
@@ -177,6 +177,15 @@ func (s *S3WAL) InitSchema(ctx context.Context) error {
 	if err := s.probe(ctx); err != nil {
 		return fmt.Errorf("s3wal init: %w", err)
 	}
+	// The probe just exchanged several responses, so a compliant store
+	// left a fresh HTTP Date witness. Without one, every §2.4-3
+	// destructive expiry verdict fails closed FOREVER — crashed
+	// reservations stay charged, adoption claims and delete locks never
+	// expire, and LFS reclamation is permanently report-only — so refuse
+	// to serve such a store outright (Codex round 11 on PR #156).
+	if _, observedAt, ok := s.cas.StoreDate(); !ok || time.Since(observedAt) > s3walDateWitnessMaxAge {
+		return fmt.Errorf("s3wal init: store supplied no usable HTTP Date witness during the probe: refusing to serve (every expiry verdict would be permanently report-only)")
+	}
 	return nil
 }
 
@@ -186,6 +195,19 @@ func (s *S3WAL) Close() {
 	}
 }
 
+// s3walKeyLock is one refcounted per-key mutex table entry: refs counts
+// holders plus waiters, and the entry is retired at zero so the table is
+// bounded by CONCURRENT lock use, not by every key ever seen (Codex round
+// 11 on PR #156: rotating refund scopes and fleet traffic otherwise grow
+// the map for the server's lifetime). Refcounting — not striping —
+// because lock acquisitions nest (a manifest CAS holds its base lock
+// while writing scan-state side objects), and striped collisions across
+// those levels would self-deadlock.
+type s3walKeyLock struct {
+	mu   sync.Mutex
+	refs int
+}
+
 // lockBase serializes manifest operations for one base group within this
 // process (see the package comment). Returns the unlock func.
 func (s *S3WAL) lockBase(base string) func() {
@@ -193,12 +215,22 @@ func (s *S3WAL) lockBase(base string) func() {
 	s.mu.Lock()
 	l := s.locks[base]
 	if l == nil {
-		l = &sync.Mutex{}
+		l = &s3walKeyLock{}
 		s.locks[base] = l
 	}
+	l.refs++
 	s.mu.Unlock()
-	l.Lock()
-	return l.Unlock
+	l.mu.Lock()
+	return func() {
+		l.mu.Unlock()
+		s.mu.Lock()
+		l.refs--
+		assertf(l.refs >= 0, "lockBase %q: negative refcount %d", base, l.refs)
+		if l.refs == 0 {
+			delete(s.locks, base)
+		}
+		s.mu.Unlock()
+	}
 }
 
 // checkSeq enforces the driver-level per-manifest seq watermark: the store

@@ -196,7 +196,10 @@ func (s *S3WAL) ReconcileLegacyLFSObjects(ctx context.Context) (int64, bool, err
 		for {
 			if pages >= reconcileLegacyLFSMaxPages {
 				partial = true // clean partial success (security round 127)
-				return nil
+				// Stop the WALK too (Codex round 11 on PR #156): per-base
+				// nil returns keep the fleet listing running unbounded
+				// after the invocation cap was reached.
+				return errS3WALStopWalk
 			}
 			var reconciled int
 			err := s.mutate(ctx, base, s3walMutation{
@@ -403,15 +406,16 @@ func (s *S3WAL) GuardedLFSDelete(ctx context.Context, repo, key string, del func
 	// Phase (i): acquire the delete lease.
 	for {
 		var fencedDirect, registered, blocked bool
-		leaseInsert := false
 		err := s.mutate(ctx, base, s3walMutation{
 			op: "lfs delete lease",
-			// Dynamic growth: taking over an EXPIRED lease overwrites
-			// its entry in place — refusing that at the cap would block
-			// the deletion machinery an oversized manifest needs.
-			grows: func() bool { return leaseInsert },
+			// Deliberately cap-EXEMPT, fresh inserts included (Codex
+			// round 11 on PR #156): the transient lease is deletion
+			// machinery — an over-cap manifest (reachable through
+			// zero-growth mutations) must still reap unregistered LFS
+			// blobs, and the row is removed again by phase (iii) or
+			// expiry, so it never contributes durable growth.
 			fn: func(m *s3wal.Manifest, clk time.Time) (bool, error) {
-				fencedDirect, registered, blocked, leaseInsert = false, false, false, false
+				fencedDirect, registered, blocked = false, false, false
 				if m.PurgedAt != nil {
 					// Purge-fenced repos need no writer guard: fenced
 					// registrations can never commit, and lease rows would
@@ -430,7 +434,6 @@ func (s *S3WAL) GuardedLFSDelete(ctx context.Context, repo, key string, del func
 				if m.DeleteLocks == nil {
 					m.DeleteLocks = make(map[string]*s3wal.DeleteLock)
 				}
-				leaseInsert = m.DeleteLocks[key] == nil
 				m.DeleteLocks[key] = &s3wal.DeleteLock{Owner: owner, OpID: opID, CreatedAt: clk}
 				return true, nil
 			},

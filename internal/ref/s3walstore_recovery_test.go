@@ -1962,3 +1962,174 @@ func TestS3WALRecoveryDefinitiveErrorTaxonomy(t *testing.T) {
 		}
 	})
 }
+
+// TestS3WALRecoveryLockTableBounded (Codex round 11 on PR #156): the
+// per-key mutex table must not retain an entry per base/scan key forever —
+// LFS refund scopes embed a rotating reap epoch and manifests come and go,
+// so a long-lived server would grow the map without bound. Entries are
+// refcounted and retired on release.
+func TestS3WALRecoveryLockTableBounded(t *testing.T) {
+	_, a, _ := newRecoveryStores(t)
+	unlockA := a.lockBase("bounded-a")
+	unlockScan := a.lockScan("scan-key")
+	a.mu.Lock()
+	if n := len(a.locks); n != 2 {
+		a.mu.Unlock()
+		t.Fatalf("held locks = %d entries, want 2 (distinct keys stay distinct)", n)
+	}
+	a.mu.Unlock()
+	unlockA()
+	unlockScan()
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if n := len(a.locks); n != 0 {
+		t.Fatalf("released locks leave %d table entries, want 0 (unbounded growth)", n)
+	}
+}
+
+// listCountingStore wraps MemCAS and counts fleet-walk listing calls.
+type listCountingStore struct {
+	*s3wal.MemCAS
+	lists int
+}
+
+func (c *listCountingStore) List(ctx context.Context, prefix, after string, limit int) ([]string, error) {
+	c.lists++
+	return c.MemCAS.List(ctx, prefix, after, limit)
+}
+
+// TestS3WALRecoveryReconcileCapStopsWalk (Codex round 11 on PR #156):
+// once the reconcile invocation cap is reached, the fleet walk itself must
+// stop — returning nil per base keeps listing every remaining manifest
+// page, defeating the cap's bound on startup work.
+func TestS3WALRecoveryReconcileCapStopsWalk(t *testing.T) {
+	ctx := context.Background()
+	oldPages := reconcileLegacyLFSMaxPages
+	reconcileLegacyLFSMaxPages = 1
+	t.Cleanup(func() { reconcileLegacyLFSMaxPages = oldPages })
+
+	cs := &listCountingStore{MemCAS: s3wal.NewMemCAS()}
+	a := newS3WALStore(cs, nil, nil)
+	a.backoffBase, a.backoffCap = time.Microsecond, time.Millisecond
+
+	// One reconcilable twin pair on the byte-order-first base (raw rows:
+	// the public register canonicalizes legacy keys, so genuine twins
+	// only exist as pre-migration history), then enough manifests to
+	// force a second listing page (walk page size 512).
+	oid := strings.Repeat("cd", 32)
+	first := "recona000"
+	recoveryEdit(t, a, first, func(m *s3wal.Manifest, clk time.Time) {
+		m.LFS.Objects = map[string]*s3wal.LFSObject{
+			"lfs/" + first + "/" + oid:    {Bytes: 5, CreatedAt: clk},
+			"lfs/" + first + "/o2/" + oid: {Bytes: 5, CreatedAt: clk},
+		}
+		m.LFS.Count = 2
+		m.UsageBytes = 10
+	})
+	for i := 1; i <= 512; i++ {
+		base := fmt.Sprintf("recona%03d", i)
+		if won, err := a.CASRef(ctx, base, "refs/heads/main", ZeroSHA, testSHA(0x33)); err != nil || !won {
+			t.Fatalf("seed base %s = (%v, %v)", base, won, err)
+		}
+	}
+	cs.lists = 0
+	n, partial, err := a.ReconcileLegacyLFSObjects(ctx)
+	if err != nil || n != 1 || !partial {
+		t.Fatalf("reconcile = (%d, %v, %v), want (1, true, nil): capped partial success", n, partial, err)
+	}
+	if cs.lists != 1 {
+		t.Fatalf("fleet walk issued %d listing pages after the cap, want 1 (the cap must stop the walk)", cs.lists)
+	}
+}
+
+// TestS3WALRecoveryDeleteLeaseCapExempt (Codex round 11 on PR #156): the
+// transient delete lease is DELETION machinery — an over-cap manifest
+// (reachable through zero-growth mutations) must still be able to reap
+// unregistered LFS blobs, or reclamation wedges until an unrelated
+// mutation shrinks the manifest.
+func TestS3WALRecoveryDeleteLeaseCapExempt(t *testing.T) {
+	ctx := context.Background()
+	const base = "r-lease-cap"
+	key := "lfs/" + base + "/" + strings.Repeat("ee", 32)
+	_, a, _ := newRecoveryStores(t)
+	if won, err := a.CASRef(ctx, base, "refs/heads/main", ZeroSHA, testSHA(0x11)); err != nil || !won {
+		t.Fatalf("seed = (%v, %v)", won, err)
+	}
+	a.hardCapBytes = 1
+	deleted, err := a.GuardedLFSDelete(ctx, base, key, func(context.Context) error { return nil })
+	if err != nil || !deleted {
+		t.Fatalf("guarded delete at the cap = (%v, %v), want deleted (lease acquisition is cap-exempt)", deleted, err)
+	}
+	if locks := mustManifest(t, a, base).DeleteLocks; len(locks) != 0 {
+		t.Fatalf("delete locks = %+v, want cleared after the delete", locks)
+	}
+}
+
+// noDateStore hides MemCAS's Date witness: a compatible endpoint that
+// omits or mangles the HTTP Date header.
+type noDateStore struct{ *s3wal.MemCAS }
+
+func (noDateStore) StoreDate() (time.Time, time.Time, bool) {
+	return time.Time{}, time.Time{}, false
+}
+
+// TestS3WALRecoveryInitRequiresDateWitness (Codex round 11 on PR #156): a
+// store that passes the 5-step conditional probe but supplies no usable
+// Date header would leave every §2.4-3 destructive expiry verdict
+// permanently report-only (crashed reservations stay charged, claims and
+// delete locks never expire). Initialization must refuse to serve it.
+func TestS3WALRecoveryInitRequiresDateWitness(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("no witness = refuse to serve", func(t *testing.T) {
+		mc := s3wal.NewMemCAS()
+		a := newS3WALStore(noDateStore{mc}, func(context.Context) error { return nil }, nil)
+		if err := a.InitSchema(ctx); err == nil {
+			t.Fatal("InitSchema accepted a store with no Date witness: expiry verdicts would be permanently report-only")
+		}
+	})
+
+	t.Run("fresh witness = serve", func(t *testing.T) {
+		mc := s3wal.NewMemCAS()
+		probe := func(ctx context.Context) error {
+			_, err := mc.Get(ctx, "_wal/probe/witness")
+			if !errors.Is(err, s3wal.ErrNotExist) {
+				return err
+			}
+			return nil // the exchange observed a Date witness
+		}
+		a := newS3WALStore(mc, probe, nil)
+		if err := a.InitSchema(ctx); err != nil {
+			t.Fatalf("InitSchema with a fresh witness = %v, want nil", err)
+		}
+	})
+}
+
+// TestS3WALRecoveryPurgeClearsDeleteLeases (Codex round 11 on PR #156):
+// the purge fence makes delete leases permanently unnecessary (fenced
+// repos delete directly and registrations can never commit), so the
+// terminal ledger cleanup must clear them — the burned-name tombstone
+// stays small instead of retaining stale lease state forever.
+func TestS3WALRecoveryPurgeClearsDeleteLeases(t *testing.T) {
+	ctx := context.Background()
+	const base = "r-purge-leases"
+	key := "lfs/" + base + "/" + strings.Repeat("ff", 32)
+	_, a, _ := newRecoveryStores(t)
+	recoveryEdit(t, a, base, func(m *s3wal.Manifest, clk time.Time) {
+		m.DeleteLocks = map[string]*s3wal.DeleteLock{
+			key: {Owner: "crashed", OpID: s3wal.NewOpID(), CreatedAt: clk},
+		}
+	})
+	if err := a.FenceRepoPurge(ctx, base); err != nil {
+		t.Fatalf("fence: %v", err)
+	}
+	if n, err := a.PurgeRepoLedger(ctx, []string{base}); err != nil || n != 1 {
+		t.Fatalf("purge ledger = (%d, %v), want the leaked lease counted as 1 cleared row", n, err)
+	}
+	if locks := mustManifest(t, a, base).DeleteLocks; len(locks) != 0 {
+		t.Fatalf("delete locks = %+v, want cleared by the ledger purge", locks)
+	}
+	if n, err := a.PurgeRepoLedger(ctx, []string{base}); err != nil || n != 0 {
+		t.Fatalf("purge rerun = (%d, %v), want idempotent 0", n, err)
+	}
+}

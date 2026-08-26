@@ -14,6 +14,7 @@ package ref
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math"
@@ -496,9 +497,16 @@ func (s *S3WAL) SweepExpiredPackReservations(ctx context.Context, olderThan time
 	return total, nil
 }
 
+// errS3WALStopWalk halts a fleet walk early: a callback returns it when
+// its work budget is exhausted, and the walk stops issuing listing pages
+// instead of visiting every remaining manifest (Codex round 11 on PR
+// #156: a capped reconcile otherwise kept listing the whole fleet).
+var errS3WALStopWalk = errors.New("s3wal: stop fleet walk")
+
 // s3walEachBase walks every base group under the manifest prefix in byte
 // order, strictly after the given base ("" = from the start), invoking fn
-// per base. Listing pages are bounded; fn errors abort the walk.
+// per base. Listing pages are bounded; fn errors abort the walk, except
+// errS3WALStopWalk which ends it cleanly.
 func (s *S3WAL) s3walEachBase(ctx context.Context, afterBase string, fn func(base string) error) error {
 	after := ""
 	if afterBase != "" {
@@ -518,6 +526,9 @@ func (s *S3WAL) s3walEachBase(ctx context.Context, afterBase string, fn func(bas
 				return fmt.Errorf("s3wal fleet walk: foreign key %q under %s", key, s3wal.RepoPrefix)
 			}
 			if err := fn(base); err != nil {
+				if errors.Is(err, errS3WALStopWalk) {
+					return nil // budget exhausted: stop listing
+				}
 				return err
 			}
 		}
