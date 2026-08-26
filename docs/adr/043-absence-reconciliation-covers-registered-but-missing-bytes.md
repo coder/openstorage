@@ -312,3 +312,42 @@ plus per-pass re-verification is self-correcting); and folding the scan
 into the sweeper (its listing walk is storage-driven and unbudgeted — the
 registry-driven direction needs its own bounded cursor discipline, and the
 two jobs' cadences serve different goals).
+
+## Rolling upgrades: the mixed-version window (Codex round 40)
+
+The admission fence and its lapse-evidence trail are enforced by NEW
+code paths — the fence check inside `ReservePackBytes`, the
+marker-writing CTEs in admission GC and the reservation sweeper — and a
+pre-upgrade replica by definition runs none of them. During a
+mixed-version roll two windows exist, with the same preconditions:
+reconciliation enabled, quota enforcement on, a registered blob
+physically missing, AND its cover lapsed (a renewal failure or fleet
+pause overlapping the roll — healthy renewal re-TTLs covers every pass,
+leaving expired rows for nobody to consume):
+
+- **Fence bypass (bounded by the roll):** a write routed to a
+  pre-upgrade replica reserves without the fence check or its advisory
+  lock, spending the deflated strict-TTL headroom the fence exists to
+  close. The window closes the moment the last old replica stops
+  serving; exposure is bounded by the lapsed covers' bytes.
+- **Evidence loss (prevented by rolling within one TTL):** a
+  pre-upgrade replica's expired-row GC deletes a lapsed un-folded cover
+  with a plain DELETE — no `lapse-evidence` marker — and the first
+  health stamp afterwards sees neither row nor marker and takes the
+  open-admission default. Completing the roll within one cover TTL with
+  renewal healthy leaves no expired un-folded cover for old GC to
+  consume, so the evidence trail stays intact.
+
+Alternatives rejected: expressing the fence as data old replicas
+already honor would require enumerating every repository and minting
+(then renewing) a quota-sized blocking reservation per base — a
+fleet-wide write burst on exactly the failure path that armed the
+fence, partial-arm fragility, and a hole for repositories created after
+arming; a database trigger gating `pack_reservations` inserts is not
+this codebase's idiom and a defect there bricks every write on every
+replica. The two-phase activation shape (ADR-41 precedent, the same
+documentation-enforced prerequisite as `forward_pushes` and
+`CODESTORAGE_SWEEP_DELETE_ENABLED`) is the deliberate choice: the boot
+log warns whenever reconciliation is enabled with quota enforcement,
+and the operator contract is to complete rolls within one reservation
+TTL and finish the roll before first enabling the job.

@@ -1329,6 +1329,64 @@ func TestAbsenceReconcile_UpgradeFirstPassKeepsAdmissionOpen(t *testing.T) {
 	}
 }
 
+// TestAbsenceReconcile_PreUpgradeGCWindowStaysOpen (Codex round 40 on PR
+// #132, security) PINS the documented mixed-fleet window of ADR-43, it
+// does not fix one: a PRE-UPGRADE replica's expired-reservation GC
+// deletes a lapsed un-folded cover with a plain row delete — no
+// lapse-evidence marker — and the first health stamp afterwards sees
+// neither row nor marker and takes the deliberate open-admission
+// default (round 32: an absent watermark alone is the first-enable
+// signature, not fleet-wide lapse evidence). Destroyed evidence is
+// undetectable by construction, so the guarantee is operational: enable
+// the job only on a fully-upgraded fleet and complete rolls within one
+// reservation TTL (boot warning + configuration reference + ADR-43).
+// If a future mechanism makes marker-less deletions detectable, this
+// test documents the behavior it must change.
+func TestAbsenceReconcile_PreUpgradeGCWindowStaysOpen(t *testing.T) {
+	f := newSweepFixture(t)
+	ctx := context.Background()
+	reg := absenceRegistry(t, f)
+	lost := blob.LFSKey("z-lost", absenceOID('f'))
+	registerLFS(t, f, "z-lost", lost, 10)
+
+	// Pass 1: the full rotation charges the z-lost cover and stamps
+	// first health (no lapse anywhere).
+	pinLFSLeader(t, f)
+	if _, err := testReconciler(t, f, true, 100).Run(ctx); err != nil {
+		t.Fatalf("pass 1: %v", err)
+	}
+	covers, err := reg.ListAbsenceCovers(ctx, "", 10, time.Hour)
+	if err != nil || len(covers) != 1 || covers[0].Base != "z-lost" {
+		t.Fatalf("covers after pass 1 = (%+v, %v), want the z-lost cover", covers, err)
+	}
+
+	// Simulate the post-upgrade first stamp: no health row exists yet.
+	if err := reg.DeleteJobScanState(ctx, ref.ScanJobAbsence, ref.ScanScopeAbsenceRenewalHealth); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate the PRE-UPGRADE GC: a plain cover-row delete — the exact
+	// data state an old replica's marker-unaware expired-row pruning
+	// leaves behind (row gone, no ScanScopeAbsenceLapse marker).
+	if err := reg.DeleteAbsenceCover(ctx, covers[0].Key); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := reg.GetJobScanState(ctx, ref.ScanJobAbsence, ref.ScanScopeAbsenceLapse); err != nil || ok {
+		t.Fatalf("lapse marker after plain delete = (ok=%v, %v), want none — old GC writes no evidence", ok, err)
+	}
+
+	// The first stamp sees neither row nor marker: open-admission
+	// default — health stamps, no fence. This is the ADR-43 window.
+	if _, err := testReconciler(t, f, true, 100).Run(ctx); err != nil {
+		t.Fatalf("pass 2: %v", err)
+	}
+	if _, ok, err := reg.GetJobScanState(ctx, ref.ScanJobAbsence, ref.ScanScopeAbsenceAdmissionFence); err != nil || ok {
+		t.Fatalf("fence after evidence-destroyed first stamp = (ok=%v, %v), want open admission (the documented window)", ok, err)
+	}
+	if _, ok, err := reg.GetJobScanState(ctx, ref.ScanJobAbsence, ref.ScanScopeAbsenceRenewalHealth); err != nil || !ok {
+		t.Fatalf("health after first stamp = (ok=%v, %v), want stamped", ok, err)
+	}
+}
+
 // TestAbsenceReconcile_AdmissionGCDurableLapseMarker (Codex round 33 on
 // PR #132, P1): ReservePackBytes' self-healing GC deletes a base's
 // expired reservation rows at admission time — the very writers the

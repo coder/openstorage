@@ -315,6 +315,15 @@ func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL, loopbackBaseU
 		logger.Info("registry-vs-storage absence reconciliation enabled",
 			"env", envAbsenceReconcileInterval, "interval", absence.interval,
 			"budget", absence.budget, "quota_enforced", packQuotaBytes > 0)
+		if packQuotaBytes > 0 {
+			// Mixed-fleet prerequisite (Codex round 40 on PR #132,
+			// ADR-43): the admission fence and its lapse-evidence
+			// markers run only in fence-aware binaries — pre-upgrade
+			// replicas neither honor an armed fence nor record
+			// evidence when their GC prunes expired covers.
+			logger.Warn("absence reconciliation admission-fence guarantees are fleet-wide only once every replica runs a fence-aware binary: complete rolling upgrades within one reservation TTL, and enable this job only after the whole fleet is upgraded (ADR-43)",
+				"env", envAbsenceReconcileInterval)
+		}
 	}
 
 	// Background repack (issue #1): the worker folds over the RAW ref

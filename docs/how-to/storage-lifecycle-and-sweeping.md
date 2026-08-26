@@ -588,7 +588,11 @@ cursors (budget-limited, resumable — the sweeper's inverse direction) and
   later" — until a healthy pass completes one full error-free recovery
   rotation of both registries (a rotation any pass dirtied with a stat
   or cover error never counts); internal restore and cover reservations
-  stay exempt so recovery can proceed.
+  stay exempt so recovery can proceed. The fence and its lapse-evidence
+  trail are enforced only by fence-aware binaries: complete rolling
+  upgrades within one reservation TTL and enable the job only after the
+  whole fleet is upgraded (mixed-fleet prerequisite, ADR-43) — the boot
+  log warns while the job runs with quota enforcement.
 - **Absent pack rows registered before this feature** carry no recorded
   size (`pack_rows_unsized`): the loss is reported but cannot be charged
   until a repack fold rewrites the row with its size.

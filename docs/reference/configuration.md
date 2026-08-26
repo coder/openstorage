@@ -871,6 +871,22 @@ integrity loss logged loudly: committed refs may reference it). See the
   admissions left open, so an ordinary first pass after enablement or
   upgrade does NOT block writes.
 
+  **Upgrade ordering (mixed fleets).** The fence check and the
+  lapse-evidence markers run only in new binaries: during a rolling
+  upgrade, a write routed to a pre-upgrade replica reserves WITHOUT the
+  fence check (spending the deflated headroom an armed fence closes on
+  new replicas), and a pre-upgrade replica's expired-reservation GC
+  deletes a lapsed cover without recording evidence — silently
+  defeating the first health stamp's probe afterwards. Both guarantees
+  are fleet-wide only once every replica runs a fence-aware binary.
+  Enable this job only after the whole fleet is upgraded; when
+  upgrading a fleet that already runs it, complete the roll within one
+  [`CODESTORAGE_PACK_RESERVATION_TTL`](#codestorage_pack_reservation_ttl)
+  (healthy renewal re-TTLs covers every pass, so a prompt roll leaves
+  no expired cover for pre-upgrade GC to consume). The serve boot log
+  warns while reconciliation runs with quota enforcement as a reminder
+  of this prerequisite (see ADR-43).
+
 ### `CODESTORAGE_ABSENCE_RECONCILE_BUDGET`
 
 Caps the work units one reconciliation pass may charge: one per registry row
