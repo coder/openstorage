@@ -29,6 +29,13 @@ jobs:
   sweep:
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        # Authority-store lanes (plan §4 Phase 2): the shared SQLite file
+        # and the s3wal manifest-CAS driver over the shared in-memory
+        # conditional store.
+        backend: [sqlite, s3wal]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
@@ -42,8 +49,9 @@ jobs:
           fi
           SEEDS="${{ github.event.inputs.seeds }}"
           STEPS="${{ github.event.inputs.steps }}"
-          echo "sweep: base=$BASE seeds=${SEEDS:-48} steps=${STEPS:-300}"
+          echo "sweep: backend=${{ matrix.backend }} base=$BASE seeds=${SEEDS:-48} steps=${STEPS:-300}"
           DST_SWEEP_BASE="$BASE" \
           DST_SWEEP_SEEDS="${SEEDS:-48}" \
           DST_STEPS="${STEPS:-300}" \
+          DST_REF_BACKEND="${{ matrix.backend }}" \
             go test ./internal/simtest -count=1 -race -run 'TestDSTSweep' -v -timeout=110m

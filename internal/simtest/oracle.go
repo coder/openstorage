@@ -50,6 +50,22 @@ func (s *sim) doHydrate(name string, node *simNode, repo *simRepo, withNotFound 
 	mark := s.inj.Seq()
 	repoPath, refsErr, err := githttp.Hydrate(ctx, node.simRef, node.simBlob, node.cacheDir, repo.key, "main")
 	evs, _ := s.inj.FiredSince(mark)
+	// A consumed stale-first-read arm (s3wal lane) may have legally served
+	// this hydrate an older manifest — e.g. a warm-crashed node whose
+	// fresh hydration marker matches the STALE generation takes the no-op
+	// fast path without refreshing refs. The driver cannot detect the very
+	// first stale read of a fresh instance BY DESIGN (empty seq watermark;
+	// production rules the class out via the store's strong-consistency
+	// requirement), so the exact-state oracle applies to a rerun against
+	// the now-fresh store instead (Codex round 4 on PR #159).
+	for _, ev := range evs {
+		if ev.Class == FaultStale {
+			s.tracef("step=%04d op=%s node=%d repo=%s out=stale-retry", s.step, name, node.id, repo.key)
+			repoPath, refsErr, err = githttp.Hydrate(ctx, node.simRef, node.simBlob, node.cacheDir, repo.key, "main")
+			evs, _ = s.inj.FiredSince(mark)
+			break
+		}
+	}
 
 	outcome := "ok"
 	if err != nil || refsErr != nil {

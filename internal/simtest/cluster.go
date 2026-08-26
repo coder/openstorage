@@ -15,14 +15,16 @@ import (
 	"github.com/coder/code-storage/internal/events"
 	"github.com/coder/code-storage/internal/meta"
 	"github.com/coder/code-storage/internal/ref"
+	"github.com/coder/code-storage/internal/ref/s3wal"
 )
 
-// simNode is one simulated stateless server node: its own SQLite and
-// fileblob handles onto the SHARED database file and blob directory (like
-// separate processes on one host), plus a private cache dir. Handles are
-// wrapped in the fault-injecting decorators; CAS writes additionally flow
-// through the production events.RefStore → ref.IdempotentCAS chain, exactly
-// like the serve wiring.
+// simNode is one simulated stateless server node: its own authority-store
+// and fileblob handles onto the SHARED backing state (the SQLite database
+// file, or the s3wal in-memory conditional store — like separate processes
+// on one host), plus a private cache dir. Handles are wrapped in the
+// fault-injecting decorators; CAS writes additionally flow through the
+// production events.RefStore → ref.IdempotentCAS chain, exactly like the
+// serve wiring.
 type simNode struct {
 	id       int
 	cacheDir string
@@ -31,6 +33,7 @@ type simNode struct {
 	rawBlob  blob.BlobStore // lifecycle handle
 	simRef   *SimRefStore
 	simBlob  *SimBlobStore
+	simCAS   *SimCAS      // s3wal backend only: the node's faulted transport view
 	casStore ref.RefStore // events.RefStore(IdempotentCAS(simRef)) — the write seam
 	// metaStore is the node's own handle onto the shared meta DB (the
 	// upstream-sync claim/steal/finish surface, issue #88). It carries the
@@ -101,6 +104,7 @@ const simOrg = "dst-org"
 // cluster owns the shared backing state plus the oracle's clean handles.
 type cluster struct {
 	dir      string // run root: db, blobs, caches, scratch repos
+	backend  RefBackend
 	dbURL    string
 	blobURL  string
 	inj      *Injector
@@ -110,18 +114,27 @@ type cluster struct {
 	nodes    []*simNode
 	oracle   ref.Store      // clean, never fault-injected: ground truth
 	oracleBl blob.BlobStore // clean blob handle for invariant (c)
+	// mem is the SHARED in-memory conditional store behind every node's
+	// s3wal driver (RefBackendS3WAL only) — the durable "bucket" that
+	// survives node crashes, exactly like the SQLite file does. The
+	// oracle reads it through a clean driver directly on it; nodes go
+	// through their fault-injecting SimCAS views.
+	mem *s3wal.MemCAS
 	// oracleMeta is the clean meta handle the sync-claim oracle reads
 	// repo_upstreams ground truth through (issue #88).
 	oracleMeta *meta.SQLite
 }
 
-// newCluster boots the shared SQLite file + fileblob dir, the oracle
-// handles, and n nodes.
-func newCluster(dir string, n int, inj *Injector, now func() time.Time) (*cluster, error) {
+// newCluster boots the shared backing state (SQLite file or in-memory
+// conditional store) + fileblob dir, the oracle handles, and n nodes.
+func newCluster(dir string, n int, inj *Injector, now func() time.Time, backend RefBackend) (*cluster, error) {
 	assertf(n >= 1, "newCluster: need at least one node, got %d", n)
+	assertf(backend == RefBackendSQLite || backend == RefBackendS3WAL,
+		"newCluster: invalid ref backend %q", backend)
 	ctx := context.Background()
 	c := &cluster{
 		dir:     dir,
+		backend: backend,
 		dbURL:   "sqlite://" + filepath.Join(dir, "refs.sqlite"),
 		blobURL: "file://" + filepath.Join(dir, "blobs"),
 		metaURL: "sqlite://" + filepath.Join(dir, "meta.sqlite"),
@@ -129,9 +142,21 @@ func newCluster(dir string, n int, inj *Injector, now func() time.Time) (*cluste
 		rec:     &deliveryRecorder{},
 		now:     now,
 	}
-	oracle, err := ref.OpenSQLite(ctx, c.dbURL)
-	if err != nil {
-		return nil, fmt.Errorf("open oracle ref store: %w", err)
+	var oracle ref.Store
+	switch backend {
+	case RefBackendSQLite:
+		st, err := ref.OpenSQLite(ctx, c.dbURL)
+		if err != nil {
+			return nil, fmt.Errorf("open oracle ref store: %w", err)
+		}
+		oracle = st
+	case RefBackendS3WAL:
+		c.mem = s3wal.NewMemCAS()
+		// The store's Date witness must agree with the simulation clock
+		// (§2.4-3): destructive TTL verdicts cross-check local-vs-store
+		// time, and disagreeing clocks would fail them closed.
+		c.mem.Now = now
+		oracle = ref.NewS3WAL(c.mem, now)
 	}
 	if err := oracle.InitSchema(ctx); err != nil {
 		oracle.Close()
@@ -173,9 +198,21 @@ func newCluster(dir string, n int, inj *Injector, now func() time.Time) (*cluste
 // used at boot and after a simulated crash.
 func (c *cluster) openNodeHandles(n *simNode) error {
 	ctx := context.Background()
-	raw, err := ref.OpenSQLite(ctx, c.dbURL)
-	if err != nil {
-		return fmt.Errorf("node %d: open ref store: %w", n.id, err)
+	var raw ref.Store
+	switch c.backend {
+	case RefBackendSQLite:
+		st, err := ref.OpenSQLite(ctx, c.dbURL)
+		if err != nil {
+			return fmt.Errorf("node %d: open ref store: %w", n.id, err)
+		}
+		raw = st
+	case RefBackendS3WAL:
+		// A fresh SimCAS view and driver instance model process death:
+		// armed one-shots, per-base locks, and the driver's seq
+		// watermark die with the process; the shared MemCAS (the
+		// "bucket") survives.
+		n.simCAS = NewSimCAS(c.mem, c.inj)
+		raw = ref.NewS3WAL(n.simCAS, c.now)
 	}
 	rawBlob, err := blob.OpenFile(c.blobURL)
 	if err != nil {
@@ -213,7 +250,7 @@ func (c *cluster) crashNode(n *simNode, cold bool) error {
 		return fmt.Errorf("node %d: close blob store: %w", n.id, err)
 	}
 	n.metaStore.Close()
-	n.raw, n.rawBlob, n.simRef, n.simBlob, n.casStore, n.metaStore = nil, nil, nil, nil, nil, nil
+	n.raw, n.rawBlob, n.simRef, n.simBlob, n.simCAS, n.casStore, n.metaStore = nil, nil, nil, nil, nil, nil, nil
 	if cold {
 		if err := os.RemoveAll(n.cacheDir); err != nil {
 			return fmt.Errorf("node %d: wipe cache: %w", n.id, err)

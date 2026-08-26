@@ -157,6 +157,20 @@ func newS3WALStore(cs s3wal.ConditionalStore, probe func(ctx context.Context) er
 	}
 }
 
+// NewS3WAL wraps an injectable conditional store, probe-less: the
+// constructor the DST harness (internal/simtest) builds drivers from.
+// Production serving goes through ref.Open, which wires the real probe.
+// now overrides the driver's local clock source (nil keeps time.Now);
+// simulations pass their logical clock so manifest stamps and TTL
+// verdicts are a pure function of the seed, never wall time.
+func NewS3WAL(cs s3wal.ConditionalStore, now func() time.Time) *S3WAL {
+	s := newS3WALStore(cs, nil, nil)
+	if now != nil {
+		s.now = now
+	}
+	return s
+}
+
 // openS3WALStore opens s3wal://bucket?endpoint=…&region=… (ADR-12 factory
 // discipline: Open never runs the probe — InitSchema does).
 func openS3WALStore(ctx context.Context, rawURL string) (*S3WAL, error) {
