@@ -9,11 +9,15 @@ depth, see the [testing reference](docs/reference/testing.md).
 
 | Tool | Why |
 |---|---|
-| Go ≥ 1.26 | `go.mod` toolchain; CI resolves the version from `go.mod` |
+| Go ≥ 1.27 | `go.mod` toolchain; CI resolves the version from `go.mod` |
 | git | the server shells out to it; every test uses it |
 | git-lfs | the LFS end-to-end tests drive a real `git lfs` client (CI fails fast if it is missing) |
 | Docker | the default test lane boots real Postgres + SeaweedFS via [testcontainers](https://golang.testcontainers.org/); also the compose stack |
 | gpg / ssh-keygen | only for `verify-sig` ref-policy tests and manual dogfooding of signature verification |
+
+The Go and golangci-lint pins live in [`mise.toml`](mise.toml); with
+[mise](https://mise.jdx.dev/) installed, `mise install` fetches exactly the
+versions CI uses. Installing the same versions by hand works too.
 
 ## Build and run
 
@@ -85,18 +89,17 @@ and save the full matrix for the end.
 
 ## Lint
 
-CI pins the linter; use the same version locally so you and CI agree:
+The linter pin lives in [`mise.toml`](mise.toml) — CI installs from the same
+file, so `mise install` guarantees you and CI agree:
 
 ```sh
-go install github.com/golangci/golangci-lint/cmd/golangci-lint@v1.64.8
+mise install
 golangci-lint run
 ```
 
-The pin lives in [`.github/workflows/ci.yml`](.github/workflows/ci.yml) (the
-`lint` job) — check there if this document drifts. Config is
-[`.golangci.yml`](.golangci.yml): the default linter set plus `gofmt`,
-`goimports` (local prefix `github.com/coder/code-storage`), `misspell`,
-`unconvert`, `nolintlint`.
+Config is [`.golangci.yml`](.golangci.yml) (v2 schema): the default linter set
+plus `misspell`, `unconvert`, `nolintlint`, and the `gofmt`/`goimports`
+formatters (local prefix `github.com/coder/code-storage`).
 
 ## Commit and PR conventions
 

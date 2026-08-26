@@ -2,7 +2,7 @@
 # docker-compose.yml `replicas` profile). The runtime stage is alpine rather
 # than distroless because the server has a hard runtime dependency on external
 # git (smart-HTTP upload/receive-pack, merges, hook re-execs).
-FROM golang:1.26-alpine AS build
+FROM golang:1.27-alpine AS build
 WORKDIR /src
 # Dependencies come from the committed vendor/ tree (issue #114): Go auto-uses
 # -mod=vendor when vendor/modules.txt is consistent, so no `go mod download`
