@@ -9,6 +9,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strings"
 	"time"
@@ -523,6 +524,29 @@ func (s *S3WAL) RetireUnreferencedLFSObject(ctx context.Context, repo, key strin
 		})
 	if err != nil {
 		return false, fmt.Errorf("retire lfs object %s: %w", key, err)
+	}
+	// Purge-aware park (Codex round 4 on PR #156): the retirement CAS
+	// proved the repo unfenced on ITS snapshot, but FenceRepoPurge plus a
+	// complete PurgeRepoLedger — including the refund-prefix sweep — can
+	// land in the gap before this separate side-object write, recreating
+	// a bucket the purge already cleaned: settlement refuses purged
+	// repos, so the object would leak forever on a burned name. Post-park
+	// fence re-read, mirroring the admission fence's cross-process
+	// pattern: any fence completing before the park is visible to this
+	// read (strong read-after-write), and a fence landing after it is
+	// followed by the purge's own refund sweep, which then sees the
+	// parked bucket. Dropping the refund is quota over-count on a repo
+	// being purged anyway — the safe direction, loudly logged.
+	fenced, ferr := s.IsRepoPurged(ctx, base)
+	if ferr != nil {
+		return false, fmt.Errorf("retire lfs object %s: purge re-check: %w", key, ferr)
+	}
+	if fenced {
+		slog.Warn("s3wal: dropping lfs refund parked into a purge-fenced repo (retirement raced the purge; over-count is the safe direction)",
+			"repo", repo, "key", key, "scope", scope, "bytes", bytes)
+		if derr := s.scanDelete(ctx, ScanJobLFSReclaim, scope); derr != nil {
+			return false, fmt.Errorf("retire lfs object %s: drop fenced refund park: %w", key, derr)
+		}
 	}
 	return true, nil
 }

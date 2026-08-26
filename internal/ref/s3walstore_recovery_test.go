@@ -1214,6 +1214,113 @@ func TestS3WALRecoveryDeleteLeaseReap(t *testing.T) {
 	})
 }
 
+// TestS3WALRecoveryRefundParkPurgeRace (Codex round 4 on PR #156): the
+// retirement's manifest CAS and its refund park are two separate writes;
+// a purge fence plus a COMPLETE PurgeRepoLedger (including the
+// refund-prefix sweep) can land in the gap, so the park would recreate a
+// bucket the purge already cleaned — settlement refuses purged repos, so
+// the side object would leak forever. The park re-reads the fence after
+// landing and self-undoes when fenced; all three orderings must end with
+// an empty refund namespace.
+func TestS3WALRecoveryRefundParkPurgeRace(t *testing.T) {
+	ctx := context.Background()
+
+	// seedRetirable registers, marks, and watermark-arms one legacy LFS
+	// row so RetireUnreferencedLFSObject(grace=0) is decidable.
+	seedRetirable := func(t *testing.T, a *S3WAL, base, key string) {
+		t.Helper()
+		if err := a.RegisterLFSObject(ctx, base, key, 7); err != nil {
+			t.Fatalf("seed register: %v", err)
+		}
+		if n, err := a.MarkLFSObjectsUnreferenced(ctx, base, []string{key}); err != nil || n != 1 {
+			t.Fatalf("mark = (%d, %v)", n, err)
+		}
+		if err := a.RecordLFSReapComplete(ctx, 1, true); err != nil {
+			t.Fatalf("stamp reap watermark: %v", err)
+		}
+	}
+	wantNoRefunds := func(t *testing.T, a *S3WAL, base string) {
+		t.Helper()
+		prefix := ScanScopeReclaimRefundPrefix(base)
+		scopes, err := a.ListJobScanStateScopes(ctx, ScanJobLFSReclaim, prefix, prefix, 512)
+		if err != nil || len(scopes) != 0 {
+			t.Fatalf("refund scopes = (%v, %v), want none (leaked side object)", scopes, err)
+		}
+	}
+	gens := func(base string) map[string]int64 { return map[string]int64{base: 0} }
+
+	t.Run("fence lands in the park gap", func(t *testing.T) {
+		const base = "r-park-gap"
+		key := "lfs/" + base + "/" + strings.Repeat("aa", 32)
+		mc, a, b := newRecoveryStores(t)
+		seedRetirable(t, a, base, key)
+		// The purge pipeline (store b: its own process, its own locks)
+		// completes the instant the RETIREMENT's manifest CAS lands —
+		// strictly before the separate park PUT, so the purge's refund
+		// sweep finds nothing and only the post-park fence re-read can
+		// prevent the leak.
+		raced := false
+		mc.Hooks.AfterPut = func(op, putKey string) {
+			if raced || putKey != s3wal.ManifestKey(base) {
+				return
+			}
+			raced = true
+			if err := b.FenceRepoPurge(ctx, base); err != nil {
+				t.Errorf("fence during park: %v", err)
+			}
+			if _, err := b.PurgeRepoLedger(ctx, []string{base}); err != nil {
+				t.Errorf("purge ledger during park: %v", err)
+			}
+		}
+		defer func() { mc.Hooks.AfterPut = nil }()
+		retired, err := a.RetireUnreferencedLFSObject(ctx, base, key, gens(base), 0, time.Hour)
+		if err != nil || !retired {
+			t.Fatalf("retire = (%v, %v), want retired (the row deletion landed)", retired, err)
+		}
+		if !raced {
+			t.Fatal("the purge hook never fired: the park PUT was not observed")
+		}
+		mc.Hooks.AfterPut = nil
+		wantNoRefunds(t, a, base)
+	})
+
+	t.Run("retire then purge", func(t *testing.T) {
+		const base = "r-park-then-purge"
+		key := "lfs/" + base + "/" + strings.Repeat("bb", 32)
+		_, a, b := newRecoveryStores(t)
+		seedRetirable(t, a, base, key)
+		if retired, err := a.RetireUnreferencedLFSObject(ctx, base, key, gens(base), 0, time.Hour); err != nil || !retired {
+			t.Fatalf("retire = (%v, %v)", retired, err)
+		}
+		prefix := ScanScopeReclaimRefundPrefix(base)
+		if scopes, err := a.ListJobScanStateScopes(ctx, ScanJobLFSReclaim, prefix, prefix, 512); err != nil || len(scopes) != 1 {
+			t.Fatalf("parked refund scopes = (%v, %v), want exactly one", scopes, err)
+		}
+		if err := b.FenceRepoPurge(ctx, base); err != nil {
+			t.Fatalf("fence: %v", err)
+		}
+		if _, err := b.PurgeRepoLedger(ctx, []string{base}); err != nil {
+			t.Fatalf("purge ledger: %v", err)
+		}
+		wantNoRefunds(t, a, base)
+	})
+
+	t.Run("purge then retire", func(t *testing.T) {
+		const base = "r-purge-then-park"
+		key := "lfs/" + base + "/" + strings.Repeat("cd", 32)
+		_, a, b := newRecoveryStores(t)
+		seedRetirable(t, a, base, key)
+		if err := b.FenceRepoPurge(ctx, base); err != nil {
+			t.Fatalf("fence: %v", err)
+		}
+		retired, err := a.RetireUnreferencedLFSObject(ctx, base, key, gens(base), 0, time.Hour)
+		if err != nil || retired {
+			t.Fatalf("retire on a fenced repo = (%v, %v), want (false, nil): the purge pipeline owns fenced rows", retired, err)
+		}
+		wantNoRefunds(t, a, base)
+	})
+}
+
 // TestS3WALRecoveryCrossProcessFence (Codex on PR #156, security): the
 // in-process absenceFenceMu cannot serialize a receive-hook process
 // against the serve process's arming pass, so the finite reserve path
