@@ -355,6 +355,36 @@ func TestS3WALRecoveryReplacePacks(t *testing.T) {
 			t.Fatalf("packs = %+v, want the competitor's fold only", mem.Packs)
 		}
 	})
+
+	t.Run("overlapping subset fold with pre-registered output = fail closed", func(t *testing.T) {
+		// Codex round 10 on PR #156: with the fold OUTPUT already
+		// registered before the call, "output present + not all old
+		// present" is satisfiable by a competing overlapping fold that
+		// removed only a SUBSET of our old set — our invocation never
+		// landed and p2 stays registered, so reporting won would violate
+		// the atomic replacement contract. Applied requires the fold's
+		// FULL effect: output present and ZERO old rows remaining.
+		mc, a, b := seed(t)
+		if err := a.RegisterPacks(ctx, base, []Pack{fold}); err != nil {
+			t.Fatalf("pre-register fold output: %v", err)
+		}
+		armPutFault(mc, s3wal.FaultAmbiguousDropped)
+		armAfterPut(mc, func() {
+			// The competitor folds ONLY p1 into the same output.
+			if won, err := b.ReplacePacks(ctx, base, []Pack{p1}, fold); err != nil || !won {
+				t.Fatalf("competing subset fold = (%v, %v)", won, err)
+			}
+		})
+		won, err := a.ReplacePacks(ctx, base, []Pack{p1, p2}, fold)
+		wantAmbiguous(t, err)
+		if won {
+			t.Fatal("subset-fold state must not report won: p2 is still registered and our fold never landed")
+		}
+		mem := mustManifest(t, a, base).Members[base]
+		if !s3walHasPackID(mem, "p2") {
+			t.Fatal("p2 must remain registered (only the competitor's subset fold landed)")
+		}
+	})
 }
 
 func TestS3WALRecoveryReclaimRetainedPack(t *testing.T) {

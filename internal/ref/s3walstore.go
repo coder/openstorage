@@ -791,10 +791,10 @@ func (s *S3WAL) ReplacePacks(ctx context.Context, repo string, old []Pack, newPa
 	for _, p := range old {
 		oldByID[p.ID] = true
 	}
-	allOldPresent := func(m *s3wal.Manifest) bool {
+	oldCount := func(m *s3wal.Manifest) int {
 		mem := m.Member(repo)
 		if mem == nil {
-			return false
+			return 0
 		}
 		n := 0
 		for _, p := range mem.Packs {
@@ -802,8 +802,9 @@ func (s *S3WAL) ReplacePacks(ctx context.Context, repo string, old []Pack, newPa
 				n++
 			}
 		}
-		return n == len(old)
+		return n
 	}
+	allOldPresent := func(m *s3wal.Manifest) bool { return oldCount(m) == len(old) }
 	netEntries := 0
 	err = s.mutate(ctx, baseRepoOf(repo), s3walMutation{
 		op: "replace packs",
@@ -861,14 +862,21 @@ func (s *S3WAL) ReplacePacks(ctx context.Context, repo string, old []Pack, newPa
 			return true, nil
 		},
 		recover: func(fresh *s3wal.Manifest) s3walVerdict {
-			if mem := fresh.Member(repo); mem != nil && s3walHasPackID(mem, newPack.ID) && !allOldPresent(fresh) {
+			// Applied demands the fold's FULL effect — output present and
+			// ZERO old rows remaining (Codex round 10 on PR #156): with
+			// the output pre-registered, "not all old present" is also
+			// satisfied by a competing OVERLAPPING fold that consumed only
+			// a subset of our old set, and reporting won there would
+			// violate the atomic replacement contract while some
+			// requested rows stay registered.
+			if mem := fresh.Member(repo); mem != nil && s3walHasPackID(mem, newPack.ID) && oldCount(fresh) == 0 {
 				won = true
 				return s3walApplied
 			}
 			if allOldPresent(fresh) {
 				return s3walRerun // our write did not land: the fold retries
 			}
-			return s3walFailClosed
+			return s3walFailClosed // partial old set: neither landed nor re-runnable
 		},
 	})
 	if err != nil {
