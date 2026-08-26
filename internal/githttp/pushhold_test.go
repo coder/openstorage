@@ -1,0 +1,220 @@
+package githttp
+
+// Unit coverage for the push-hold machinery (issue #170): full syncs must
+// skip create/update/delete commands naming a held ref (in both the single
+// pass and the overflow second pass), ignore expired holds, and suppress
+// the generation marker whenever anything was skipped.
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"sort"
+	"testing"
+	"time"
+)
+
+// mintHold creates a hold file in repoPath naming the given refs.
+func mintHold(t *testing.T, repoPath string, names ...string) string {
+	t.Helper()
+	holdPath, err := mintPushHold(repoPath)
+	if err != nil {
+		t.Fatalf("mintPushHold: %v", err)
+	}
+	for _, name := range names {
+		if err := appendPushHold(holdPath, name); err != nil {
+			t.Fatalf("appendPushHold(%q): %v", name, err)
+		}
+	}
+	return holdPath
+}
+
+// TestSyncRefsStreamed_SkipsPushHeldRefs: held creations, updates, and
+// deletions are all left untouched while unheld refs in the same sync
+// apply; the sync reports skipped=true. Batch 1 forces the overflow second
+// pass and per-command delete flushes, so both passes are covered.
+func TestSyncRefsStreamed_SkipsPushHeldRefs(t *testing.T) {
+	for _, batch := range []int{1, 3, syncRefsBatch} {
+		dir := initWorkRepo(t)
+		head := revParse(t, dir, "HEAD")
+		writeFile(t, dir, "b.txt", "two\n")
+		mustGit(t, dir, "add", ".")
+		mustGit(t, dir, "commit", "-m", "two")
+		head2 := revParse(t, dir, "HEAD")
+		mustGit(t, dir, "branch", "stale", head)
+		mustGit(t, dir, "branch", "upd", head)
+
+		mintHold(t, dir, "refs/heads/stale", "refs/heads/upd", "refs/heads/new")
+
+		want := map[string]string{
+			"refs/heads/main": head2,
+			"refs/heads/upd":  head2, // held: must stay at head
+			"refs/heads/new":  head2, // held: must not be created
+			"refs/heads/free": head2, // unheld: must be created
+			// stale absent from want: held, must survive the deletion.
+		}
+		syncFromMapSkipped(t, dir, want, "refs/heads/main", batch, true)
+
+		got := localRefs(t, dir)
+		if got["refs/heads/stale"] != head {
+			t.Fatalf("batch %d: held stale ref = %q, want %q (deletion must be skipped)", batch, got["refs/heads/stale"], head)
+		}
+		if got["refs/heads/upd"] != head {
+			t.Fatalf("batch %d: held upd ref = %q, want %q (update must be skipped)", batch, got["refs/heads/upd"], head)
+		}
+		if _, ok := got["refs/heads/new"]; ok {
+			t.Fatalf("batch %d: held new ref was created: %v", batch, got)
+		}
+		if got["refs/heads/free"] != head2 {
+			t.Fatalf("batch %d: unheld free ref = %q, want %q", batch, got["refs/heads/free"], head2)
+		}
+	}
+}
+
+// syncFromMapSkipped is syncFromMap asserting the skipped verdict.
+func syncFromMapSkipped(t *testing.T, repoPath string, want map[string]string, headTarget string, batch int, wantSkipped bool) {
+	t.Helper()
+	names := make([]string, 0, len(want))
+	for name := range want {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	newStore := func() refSeq { return &sliceRefSeq{names: names, shas: want} }
+	skipped, err := syncRefsStreamed(context.Background(), repoPath, headTarget, newStore, batch)
+	if err != nil {
+		t.Fatalf("syncRefsStreamed(batch=%d): %v", batch, err)
+	}
+	if skipped != wantSkipped {
+		t.Fatalf("syncRefsStreamed(batch=%d) skipped = %v, want %v", batch, skipped, wantSkipped)
+	}
+}
+
+// TestSyncRefsStreamed_SkipsHeldDFRename: a D/F rename (refs/heads/a ->
+// refs/heads/a/b) travels through one push, so both names are held; the
+// sync must leave both sides untouched.
+func TestSyncRefsStreamed_SkipsHeldDFRename(t *testing.T) {
+	dir := initWorkRepo(t)
+	head := revParse(t, dir, "HEAD")
+	mustGit(t, dir, "branch", "a", head)
+
+	mintHold(t, dir, "refs/heads/a", "refs/heads/a/b")
+
+	want := map[string]string{
+		"refs/heads/main": head,
+		"refs/heads/a/b":  head, // held creation; refs/heads/a held deletion
+	}
+	syncFromMapSkipped(t, dir, want, "refs/heads/main", 1, true)
+
+	got := localRefs(t, dir)
+	if got["refs/heads/a"] != head {
+		t.Fatalf("held D/F source deleted: %v", got)
+	}
+	if _, ok := got["refs/heads/a/b"]; ok {
+		t.Fatalf("held D/F target created: %v", got)
+	}
+}
+
+// TestSyncRefsStreamed_IgnoresExpiredHold: readers enforce the TTL
+// themselves — a crash-leaked hold must not suppress syncs forever.
+func TestSyncRefsStreamed_IgnoresExpiredHold(t *testing.T) {
+	dir := initWorkRepo(t)
+	head := revParse(t, dir, "HEAD")
+
+	holdPath := mintHold(t, dir, "refs/heads/new")
+	expired := time.Now().Add(-pushHoldTTL - time.Minute)
+	if err := os.Chtimes(holdPath, expired, expired); err != nil {
+		t.Fatalf("Chtimes: %v", err)
+	}
+
+	want := map[string]string{"refs/heads/main": head, "refs/heads/new": head}
+	syncFromMapSkipped(t, dir, want, "refs/heads/main", syncRefsBatch, false)
+	if got := localRefs(t, dir)["refs/heads/new"]; got != head {
+		t.Fatalf("expired hold still suppressed the sync: refs/heads/new = %q, want %q", got, head)
+	}
+}
+
+// TestMintPushHold_SweepsExpiredLeaks: minting reaps crash-leaked expired
+// files and leaves live ones alone.
+func TestMintPushHold_SweepsExpiredLeaks(t *testing.T) {
+	dir := t.TempDir()
+	leaked := mintHold(t, dir, "refs/heads/leaked")
+	expired := time.Now().Add(-pushHoldTTL - time.Minute)
+	if err := os.Chtimes(leaked, expired, expired); err != nil {
+		t.Fatalf("Chtimes: %v", err)
+	}
+	live := mintHold(t, dir, "refs/heads/live")
+
+	if _, err := mintPushHold(dir); err != nil {
+		t.Fatalf("mintPushHold: %v", err)
+	}
+	if _, err := os.Stat(leaked); !os.IsNotExist(err) {
+		t.Fatalf("expired hold survived the mint sweep: %v", err)
+	}
+	if _, err := os.Stat(live); err != nil {
+		t.Fatalf("live hold reaped by the mint sweep: %v", err)
+	}
+}
+
+// TestAppendPushHold_RejectsMalformedInput: relative paths (the hook runs
+// with a different working directory than the server) and line-splitting
+// ref names must fail the push rather than mint a broken hold.
+func TestAppendPushHold_RejectsMalformedInput(t *testing.T) {
+	if err := appendPushHold("relative/hold", "refs/heads/x"); err == nil {
+		t.Fatal("relative hold path accepted")
+	}
+	abs := filepath.Join(t.TempDir(), "hold")
+	if err := appendPushHold(abs, "refs/heads/a\nrefs/heads/b"); err == nil {
+		t.Fatal("line-splitting ref name accepted")
+	}
+	if err := appendPushHold(abs, ""); err == nil {
+		t.Fatal("empty ref name accepted")
+	}
+}
+
+// TestHydrate_SkippedHeldRefSuppressesMarker: a full sync that skipped a
+// held ref must not advance the generation marker — otherwise a fresh
+// marker could vouch for a generation whose held ref the cache never
+// applied (fatal if the holding push dies before its local ref update).
+func TestHydrate_SkippedHeldRefSuppressesMarker(t *testing.T) {
+	st, bl, cacheDir := hydrateEnv(t)
+	repoPath := mustHydrate(t, st, bl, cacheDir, "r")
+	if gen, _, _, ok := readGenerationMarker(repoPath); !ok || gen != 7 {
+		t.Fatalf("baseline marker = (%d, %v), want (7, true)", gen, ok)
+	}
+
+	// A push is mid-flight: its ref is committed in the store and held.
+	// The SHA never needs to exist locally — the sync must skip it.
+	mintHold(t, repoPath, "refs/heads/held")
+	st.mu.Lock()
+	st.refs["refs/heads/held"] = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	st.mu.Unlock()
+	st.setGen(8)
+
+	if _, refsErr, err := Hydrate(context.Background(), st, bl, cacheDir, "r", "main"); refsErr != nil || err != nil {
+		t.Fatalf("Hydrate with held ref = (refsErr %v, err %v), want clean", refsErr, err)
+	}
+	if gen, _, _, ok := readGenerationMarker(repoPath); !ok || gen != 7 {
+		t.Fatalf("marker after skipped sync = (%d, %v), want unchanged (7, true)", gen, ok)
+	}
+
+	// The push finished (server removed the hold; here it also vanished
+	// from the store as if deleted): the next full sync converges and the
+	// marker advances again.
+	holds, err := os.ReadDir(filepath.Join(repoPath, pushHoldDir))
+	if err != nil {
+		t.Fatalf("read holds: %v", err)
+	}
+	for _, e := range holds {
+		if err := os.Remove(filepath.Join(repoPath, pushHoldDir, e.Name())); err != nil {
+			t.Fatalf("remove hold: %v", err)
+		}
+	}
+	st.mu.Lock()
+	delete(st.refs, "refs/heads/held")
+	st.mu.Unlock()
+	st.setGen(9)
+	mustHydrate(t, st, bl, cacheDir, "r")
+	if gen, _, _, ok := readGenerationMarker(repoPath); !ok || gen != 9 {
+		t.Fatalf("marker after hold cleared = (%d, %v), want (9, true)", gen, ok)
+	}
+}

@@ -876,7 +876,8 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 				!strings.HasPrefix(kv, EnvSyncClaim+"=") &&
 				!strings.HasPrefix(kv, EnvScopes+"=") &&
 				!strings.HasPrefix(kv, EnvRefsPolicy+"=") &&
-				!strings.HasPrefix(kv, EnvOps+"=") {
+				!strings.HasPrefix(kv, EnvOps+"=") &&
+				!strings.HasPrefix(kv, EnvPushHold+"=") {
 				env = append(env, kv)
 			}
 		}
@@ -975,6 +976,19 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 		if s.VerifySigBudget > 0 {
 			cmd.Env = append(cmd.Env, EnvVerifySigBudget+"="+strconv.Itoa(s.VerifySigBudget))
 		}
+		// Push hold (issue #170): the file this push's update hooks record
+		// their in-flight refs in, so concurrent full syncs skip those refs
+		// until receive-pack has performed its own local ref updates. The
+		// deferred remove runs strictly after cmd.Wait on every path below;
+		// the TTL machinery covers crash leaks.
+		holdPath, err := mintPushHold(repoPath)
+		if err != nil {
+			log.Printf("%s %s: push hold: %v", service, repo, err)
+			httpError(w, http.StatusInternalServerError, "push setup failed")
+			return
+		}
+		defer func() { _ = os.Remove(holdPath) }()
+		cmd.Env = append(cmd.Env, EnvPushHold+"="+holdPath)
 	}
 	cmd.Stderr = os.Stderr
 

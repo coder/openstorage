@@ -41,6 +41,14 @@ const (
 	// EnvOrg names the org whose signing keys verify-sig loads. Shared with
 	// the serve config on purpose: the server sets it explicitly for hooks.
 	EnvOrg = "CODESTORAGE_ORG"
+	// EnvPushHold carries the absolute path of this push's hold file
+	// (issue #170, hydrate.go push-hold machinery). The update hook appends
+	// each ref name to it immediately before the authority CAS; concurrent
+	// full syncs skip held refs so they cannot race receive-pack's own
+	// local update of a ref it just committed. Minted per request by the
+	// server and stripped from inherited env like the other per-push
+	// inputs.
+	EnvPushHold = "CODESTORAGE_GIT_PUSH_HOLD"
 	// EnvAtomic marks the push `--atomic` (issue #28). githooks(5) exposes
 	// no atomic indicator, so the HTTP layer sniffs the wire capability
 	// (atomic.go) and sets this; pre-receive then evaluates the policy
@@ -62,6 +70,14 @@ const (
 	// dead connection would. Later invocations pass through untouched.
 	EnvCASDrop     = "CODESTORAGE_TEST_CAS_DROP"
 	EnvCASDropHard = "CODESTORAGE_TEST_CAS_DROP_HARD"
+	// EnvUpdateBarrier holds a handshake-file path prefix; the first update
+	// hook to create <path>.ready pauses AFTER its authority CAS commits
+	// and before the hook exits — i.e. before receive-pack performs its own
+	// local ref update — until the test creates <path>.release (issue #170:
+	// this is exactly the window a concurrent hydrate can full-sync the
+	// just-committed ref into the shared cache repo). Later invocations
+	// pass through untouched.
+	EnvUpdateBarrier = "CODESTORAGE_TEST_UPDATE_BARRIER"
 	// CrashHeader lets tests request an EnvCrash injection per push; the
 	// server refuses it outside test mode.
 	CrashHeader = "X-Codestorage-Test-Crash"
@@ -606,6 +622,18 @@ func updateHook(ctx context.Context, args []string) error {
 		}
 	}
 
+	// Push hold (issue #170): record this ref BEFORE the CAS below can
+	// commit, so no concurrent full sync materializes the committed value
+	// in the shared cache repo before receive-pack's own local ref update
+	// (git would reject the push "reference already exists"/old-value
+	// mismatch). The server removes the hold once receive-pack exits.
+	// Fail closed: committing without a recorded hold reopens the race.
+	if holdPath := os.Getenv(EnvPushHold); holdPath != "" {
+		if err := appendPushHold(holdPath, refName); err != nil {
+			return fmt.Errorf("update: record push hold: %w", err)
+		}
+	}
+
 	st, err := ref.Open(ctx, mustEnv(envHookPGURL...))
 	if err != nil {
 		return err
@@ -624,7 +652,33 @@ func updateHook(ctx context.Context, args []string) error {
 	if !won {
 		return fmt.Errorf("CAS conflict: %s moved concurrently (expected %.8s)", refName, old)
 	}
+	// Test seam (issue #170): pause between the committed authority CAS and
+	// receive-pack's local ref update so the e2e lane can deterministically
+	// interleave a concurrent hydrate into that window.
+	if testMode() {
+		if p := os.Getenv(EnvUpdateBarrier); p != "" {
+			pauseAtUpdateBarrier(p)
+		}
+	}
 	return nil
+}
+
+// pauseAtUpdateBarrier implements the EnvUpdateBarrier handshake: the first
+// invocation to create <p>.ready owns the pause and polls for <p>.release;
+// later invocations pass through (O_EXCL one-shot, like injectCASDrop). The
+// wait is bounded so a broken test wedges nothing.
+func pauseAtUpdateBarrier(p string) {
+	f, err := os.OpenFile(p+".ready", os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+	if err != nil {
+		return // barrier already consumed
+	}
+	_ = f.Close()
+	for deadline := time.Now().Add(30 * time.Second); time.Now().Before(deadline); {
+		if _, err := os.Stat(p + ".release"); err == nil {
+			return
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
 }
 
 // enforceSyncClaimFence refuses a loopback sync push whose run no longer
