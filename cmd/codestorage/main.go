@@ -73,6 +73,11 @@ func fatalf(format string, args ...any) {
 	os.Exit(1)
 }
 
+// leaseReleaseTimeout bounds the shutdown-path instance-lease Release —
+// long enough for one Get + Delete round trip, short enough that a stalled
+// store never hangs an otherwise graceful shutdown.
+const leaseReleaseTimeout = 5 * time.Second
+
 func cmdServe(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	listen := fs.String("listen", "", "listen address (falls back to --addr, then $"+envListen+", then "+defaultListen+")")
@@ -129,7 +134,14 @@ func cmdServe(ctx context.Context, args []string) error {
 			if err != nil {
 				return err
 			}
-			defer lease.Release(context.Background())
+			defer func() {
+				// Release is best-effort by design (an abandoned lease
+				// expires on its TTL), so bound it: a stalled endpoint
+				// must not hang an otherwise graceful shutdown.
+				rctx, cancel := context.WithTimeout(context.Background(), leaseReleaseTimeout)
+				defer cancel()
+				lease.Release(rctx)
+			}()
 			go func() {
 				if err := lease.Heartbeat(ctx); err != nil {
 					fatalf("codestorage serve: %v", err)

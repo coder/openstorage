@@ -551,9 +551,14 @@ func resolveServeConfig(getenv func(string) string, flagListen, flagAddr, flagCa
 	if err != nil {
 		return serveConfig{}, err
 	}
-	cfg.s3walLeaseTTL, err = resolveS3WALLeaseTTL(getenv)
-	if err != nil {
-		return serveConfig{}, err
+	// s3wal-only knob: a PG/SQLite deployment inheriting the variable
+	// (even an invalid value) must ignore it, not refuse startup — serve
+	// never reads cfg.s3walLeaseTTL outside the s3wal backend.
+	if isS3WALURL(cfg.dbURL) {
+		cfg.s3walLeaseTTL, err = resolveS3WALLeaseTTL(getenv)
+		if err != nil {
+			return serveConfig{}, err
+		}
 	}
 	if raw := getenv(envLFSV020WriteCompat); raw != "" {
 		cfg.lfsV020WriteCompat, err = strconv.ParseBool(raw)
@@ -867,7 +872,9 @@ func resolvePackReservationTTL(getenv func(string) string) (time.Duration, error
 // DISABLED, a deliberate escape hatch for test suites that intentionally
 // run several processes against one bucket (serve warns loudly). Other
 // values below one second are refused: the derived heartbeat cadence
-// (TTL/4) would fail-stop the node on ordinary S3 latency jitter.
+// (TTL/4) would fail-stop the node on ordinary S3 latency jitter. Called
+// only when the dbURL selects s3wal — other backends must treat an
+// inherited (even invalid) value as inert.
 func resolveS3WALLeaseTTL(getenv func(string) string) (time.Duration, error) {
 	assertf(getenv != nil, "resolveS3WALLeaseTTL: nil getenv")
 	raw := getenv(envS3WALLeaseTTL)

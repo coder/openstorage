@@ -824,6 +824,65 @@ func TestResolveServeConfigPackReservationTTL(t *testing.T) {
 	}
 }
 
+// TestResolveServeConfigS3WALLeaseTTL (PR #168 P2): the lease-TTL env is
+// an s3wal-only knob. A PG/SQLite deployment inheriting the variable —
+// even an invalid value — must ignore it rather than refuse startup; the
+// s3wal backend still parses and validates it.
+func TestResolveServeConfigS3WALLeaseTTL(t *testing.T) {
+	resolve := func(t *testing.T, dbURL, blobURL, leaseTTL string) (serveConfig, error) {
+		t.Helper()
+		return resolveServeConfig(mapEnv(map[string]string{
+			"CODESTORAGE_PG_URL":      dbURL,
+			"CODESTORAGE_S3_URL":      blobURL,
+			"CODESTORAGE_ORG":         "org1",
+			"CODESTORAGE_ORG_PUBKEYS": "/tmp/org.pub.pem",
+			envS3WALLeaseTTL:          leaseTTL,
+		}), "", "", "/tmp/cache", "")
+	}
+	const s3walURL = "s3wal://bkt?endpoint=http://127.0.0.1:8333&region=us-east-1"
+
+	t.Run("postgres ignores a malformed value", func(t *testing.T) {
+		cfg, err := resolve(t, "postgres://x", "s3://x", "bogus")
+		if err != nil {
+			t.Fatalf("postgres backend must ignore the s3wal-only knob: %v", err)
+		}
+		if cfg.s3walLeaseTTL != 0 {
+			t.Fatalf("ignored knob left s3walLeaseTTL = %v, want 0", cfg.s3walLeaseTTL)
+		}
+	})
+	t.Run("sqlite ignores a below-floor value", func(t *testing.T) {
+		if _, err := resolve(t, "sqlite:///tmp/x.db", "file:///tmp/blobs", "500ms"); err != nil {
+			t.Fatalf("sqlite backend must ignore the s3wal-only knob: %v", err)
+		}
+	})
+	t.Run("s3wal still refuses invalid values", func(t *testing.T) {
+		for _, val := range []string{"bogus", "500ms"} {
+			_, err := resolve(t, s3walURL, "s3://bkt", val)
+			if err == nil || !strings.Contains(err.Error(), envS3WALLeaseTTL) {
+				t.Fatalf("%s=%q on s3wal: want an error naming the variable, got %v", envS3WALLeaseTTL, val, err)
+			}
+		}
+	})
+	t.Run("s3wal parses valid values", func(t *testing.T) {
+		cfg, err := resolve(t, s3walURL, "s3://bkt", "30s")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.s3walLeaseTTL != 30*time.Second {
+			t.Fatalf("resolved lease TTL %v, want 30s", cfg.s3walLeaseTTL)
+		}
+	})
+	t.Run("s3wal explicit 0 disables", func(t *testing.T) {
+		cfg, err := resolve(t, s3walURL, "s3://bkt", "0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.s3walLeaseTTL != -1 {
+			t.Fatalf("explicit 0 resolved to %v, want the -1 disable sentinel", cfg.s3walLeaseTTL)
+		}
+	})
+}
+
 func TestResolveServeConfigLFSStaging(t *testing.T) {
 	base := func(extra map[string]string) func(string) string {
 		env := map[string]string{
