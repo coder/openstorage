@@ -4,7 +4,10 @@
 // SeaweedFS is the repo's tested reference self-hosted S3 store (issue
 // #133, qualified in the Gate 1a-A campaign — PR #142, which adds
 // docs/plans/s3wal-phase1a-results.md); MinIO remains best-effort
-// compatible but is no longer exercised in CI.
+// compatible and no longer backs any blob test lane — its only CI
+// presence is the record-mode legacy qualification lane
+// (internal/ref/s3wal TestQualifyMinIOLegacy), which documents findings
+// without gating.
 package blob
 
 import (

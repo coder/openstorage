@@ -55,8 +55,8 @@ serve process still holds the key.
 from the standard AWS chain (env vars, shared config, instance roles). AWS S3 is the
 primary target; for self-hosting, [SeaweedFS](https://github.com/seaweedfs/seaweedfs) is
 the reference store the test suite runs against. Other S3-compatible stores (including
-MinIO) are supported on a best-effort basis — existing deployments keep working, but they
-are not exercised in CI.
+MinIO) are supported on a best-effort basis — existing deployments keep working, but the
+test suites no longer run against them.
 
 - **Bucket permissions for the replica role.** With default settings the role needs all
   of:
