@@ -708,7 +708,6 @@ func TestWriteRefsNotes(t *testing.T) {
 		t.Run("invalid input", func(t *testing.T) {
 			for name, req := range map[string]map[string]any{
 				"missing sha":        {"note": "x"},
-				"short sha":          {"sha": "abcd", "note": "x"},
 				"bad action":         {"sha": fx.c1, "action": "replace", "note": "x"},
 				"missing note":       {"sha": fx.c1, "action": "add"},
 				"non-notes full ref": {"sha": fx.c1, "note": "x", "ref": "refs/heads/main"},
@@ -815,6 +814,84 @@ func TestWriteRefsNotes(t *testing.T) {
 			}
 			if result := wrefNoteResultOf(t, body); result["status"] != "invalid" {
 				t.Fatalf("result = %v", result)
+			}
+		})
+
+		// Issue #161: object_ref accepts revisions — a branch, tag, short
+		// SHA, or full ref resolving to a commit — alongside the unchanged
+		// full-40-hex fast path (which still notes any object kind).
+		// Responses echo the resolved id in `sha`.
+		t.Run("object_ref revisions", func(t *testing.T) {
+			for _, c := range []struct {
+				name, objectRef, wantSHA string
+			}{
+				{"branch name", "feature", fx.c1},
+				{"annotated tag peels to its commit", "annot", fx.c2},
+				{"short sha", fx.c1[:8], fx.c1},
+				{"full ref", "refs/heads/feature", fx.c1},
+			} {
+				t.Run(c.name, func(t *testing.T) {
+					resp, body := wrefDo(t, srv, "POST", "/api/v1/repos/notes", fx.token,
+						map[string]any{"object_ref": c.objectRef, "note": "via " + c.name, "notes_ref": "rev-notes"})
+					if resp.StatusCode != http.StatusOK {
+						t.Fatalf("add: status = %d body %v", resp.StatusCode, body)
+					}
+					if body["sha"] != c.wantSHA {
+						t.Fatalf("add sha = %v, want resolved %s", body["sha"], c.wantSHA)
+					}
+					if out, err := showNote(t, "refs/notes/rev-notes", c.wantSHA); err != nil || !strings.Contains(out, "via "+c.name) {
+						t.Fatalf("note show = %q err %v", out, err)
+					}
+					resp, body = wrefDo(t, srv, "DELETE", "/api/v1/repos/notes", fx.token,
+						map[string]any{"object_ref": c.objectRef, "notes_ref": "rev-notes"})
+					if resp.StatusCode != http.StatusOK || body["sha"] != c.wantSHA {
+						t.Fatalf("delete: status = %d body %v, want 200 with sha %s", resp.StatusCode, body, c.wantSHA)
+					}
+					if out, err := showNote(t, "refs/notes/rev-notes", c.wantSHA); err == nil {
+						t.Fatalf("note still present after delete: %q", out)
+					}
+				})
+			}
+
+			// A non-resolving revision is a clear 404 in the note-write
+			// envelope, for POST and DELETE alike.
+			for _, method := range []string{"POST", "DELETE"} {
+				req := map[string]any{"object_ref": "no-such-rev", "notes_ref": "rev-notes"}
+				if method == "POST" {
+					req["note"] = "x"
+				}
+				resp, body := wrefDo(t, srv, method, "/api/v1/repos/notes", fx.token, req)
+				if resp.StatusCode != http.StatusNotFound {
+					t.Fatalf("%s no-such-rev: status = %d body %v, want 404", method, resp.StatusCode, body)
+				}
+				if result := wrefNoteResultOf(t, body); result["status"] != "not_found" {
+					t.Fatalf("%s no-such-rev: result = %v", method, result)
+				}
+			}
+
+			// Unchanged 40-hex fast path: the annotated tag OBJECT takes a
+			// note that the peeled tag revision above never touched.
+			resp, body := wrefDo(t, srv, "POST", "/api/v1/repos/notes", fx.token,
+				map[string]any{"object_ref": fx.tagObj, "note": "on tag object", "notes_ref": "rev-notes"})
+			if resp.StatusCode != http.StatusOK || body["sha"] != fx.tagObj {
+				t.Fatalf("tag object add: status = %d body %v", resp.StatusCode, body)
+			}
+			if out, err := showNote(t, "refs/notes/rev-notes", fx.tagObj); err != nil || !strings.Contains(out, "on tag object") {
+				t.Fatalf("tag object note show = %q err %v", out, err)
+			}
+
+			// PR #163 review (P2): resolution precedes the CAS guard — a
+			// mismatched guard 412s with the RESOLVED id in the envelope,
+			// and an unresolvable revision 404s despite a stale guard.
+			resp, body = wrefDo(t, srv, "POST", "/api/v1/repos/notes", fx.token,
+				map[string]any{"object_ref": "feature", "note": "x", "notes_ref": "rev-notes", "expected_notes_ref_sha": fx.c2})
+			if resp.StatusCode != http.StatusPreconditionFailed || body["sha"] != fx.c1 {
+				t.Fatalf("guarded revision: status = %d sha %v, want 412 with resolved %s", resp.StatusCode, body["sha"], fx.c1)
+			}
+			resp, body = wrefDo(t, srv, "DELETE", "/api/v1/repos/notes", fx.token,
+				map[string]any{"object_ref": "no-such-rev", "notes_ref": "rev-notes", "expected_notes_ref_sha": fx.c2})
+			if resp.StatusCode != http.StatusNotFound {
+				t.Fatalf("unresolvable with stale guard: status = %d body %v, want 404", resp.StatusCode, body)
 			}
 		})
 	})

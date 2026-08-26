@@ -10774,6 +10774,7 @@ paths:
           content:
             application/json:
               example:
+                base_sha: a2d127e6a4d54bb7390de828a99e36411f0c84df
                 files:
                   - bytes: 2048
                     is_eof: true
@@ -10798,6 +10799,11 @@ paths:
                 additionalProperties: false
                 description: Diff for a single commit, including merge base when applicable, aggregate stats, and per-file changes.
                 properties:
+                  base_sha:
+                    description: The commit that the base revision (base_ref) resolved to. Empty for a single-commit diff. Use it to record the exact base of the comparison.
+                    examples:
+                      - a2d127e6a4d54bb7390de828a99e36411f0c84df
+                    type: string
                   files:
                     description: Files returned with inline diff content.
                     items:
@@ -19026,7 +19032,7 @@ paths:
                     - refs/notes/commits
                   type: string
                 object_ref:
-                  description: Git object the note attaches to. A full object SHA today. Provide object_ref or the deprecated sha.
+                  description: "Git object the note attaches to: a full object SHA (a commit, tree, blob, or annotated tag), or a branch, tag, or other revision that resolves to a commit. Provide object_ref or the deprecated sha."
                   examples:
                     - b003fc78805954584e1ee364a4ad39d7c79e819a
                   type: string
@@ -20294,7 +20300,7 @@ paths:
                     - refs/notes/commits
                   type: string
                 object_ref:
-                  description: Git object the note attaches to. A full object SHA today. Provide object_ref or the deprecated sha.
+                  description: "Git object the note attaches to: a full object SHA (a commit, tree, blob, or annotated tag), or a branch, tag, or other revision that resolves to a commit. Provide object_ref or the deprecated sha."
                   examples:
                     - b003fc78805954584e1ee364a4ad39d7c79e819a
                   type: string
@@ -35339,6 +35345,7 @@ paths:
           content:
             application/json:
               example:
+                base_sha: a2d127e6a4d54bb7390de828a99e36411f0c84df
                 files:
                   - bytes: 2048
                     is_eof: true
@@ -35363,6 +35370,11 @@ paths:
                 additionalProperties: false
                 description: Diff for a single commit, including merge base when applicable, aggregate stats, and per-file changes.
                 properties:
+                  base_sha:
+                    description: The commit that the base revision (base_ref) resolved to. Empty for a single-commit diff. Use it to record the exact base of the comparison.
+                    examples:
+                      - a2d127e6a4d54bb7390de828a99e36411f0c84df
+                    type: string
                   files:
                     description: Files returned with inline diff content.
                     items:
@@ -43568,7 +43580,7 @@ paths:
                     - refs/notes/commits
                   type: string
                 object_ref:
-                  description: Git object the note attaches to. A full object SHA today. Provide object_ref or the deprecated sha.
+                  description: "Git object the note attaches to: a full object SHA (a commit, tree, blob, or annotated tag), or a branch, tag, or other revision that resolves to a commit. Provide object_ref or the deprecated sha."
                   examples:
                     - b003fc78805954584e1ee364a4ad39d7c79e819a
                   type: string
@@ -44829,7 +44841,7 @@ paths:
                     - refs/notes/commits
                   type: string
                 object_ref:
-                  description: Git object the note attaches to. A full object SHA today. Provide object_ref or the deprecated sha.
+                  description: "Git object the note attaches to: a full object SHA (a commit, tree, blob, or annotated tag), or a branch, tag, or other revision that resolves to a commit. Provide object_ref or the deprecated sha."
                   examples:
                     - b003fc78805954584e1ee364a4ad39d7c79e819a
                   type: string

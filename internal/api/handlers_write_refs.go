@@ -632,8 +632,10 @@ func (s *server) handleDeleteNote(w http.ResponseWriter, r *http.Request) {
 	s.wrefHandleNote(w, r, true)
 }
 
-// wrefHandleNote implements the shared POST/DELETE notes flow: validate,
-// CAS-guard on expected_notes_ref_sha (412), run the notes operation on a request-
+// wrefHandleNote implements the shared POST/DELETE notes flow: validate
+// (object_ref is a full object SHA or a revision resolving to a commit,
+// issue #161; success responses echo the resolved id in `sha`), CAS-guard
+// on expected_notes_ref_sha (412), run the notes operation on a request-
 // scoped temp ref with a scratch object directory, policy-check, publish the
 // new objects (pack → upload → register), and CAS the notes ref (409 on a
 // lost race). Domain failures answer with the note-write envelope.
@@ -657,8 +659,8 @@ func (s *server) wrefHandleNote(w http.ResponseWriter, r *http.Request, deleteNo
 		wrefNoteFail(w, http.StatusBadRequest, err.Error(), objectSHA, notesRefRaw, "", ref.ZeroSHA)
 		return
 	}
-	if !ref.ValidSHA(objectSHA) {
-		wrefNoteFail(w, http.StatusBadRequest, "object_ref must be a full 40-hex object id", objectSHA, targetRef, "", ref.ZeroSHA)
+	if objectSHA == "" {
+		wrefNoteFail(w, http.StatusBadRequest, "object_ref is required", objectSHA, targetRef, "", ref.ZeroSHA)
 		return
 	}
 	action := "remove"
@@ -704,6 +706,24 @@ func (s *server) wrefHandleNote(w http.ResponseWriter, r *http.Request, deleteNo
 		oldOrZero = ref.ZeroSHA
 	}
 
+	ctx := r.Context()
+	if !ref.ValidSHA(objectSHA) {
+		// openapi (issue #161): a non-40-hex object_ref is a revision — a
+		// branch, tag, short SHA, or full ref — that must resolve to a
+		// commit; unresolvable input fails like an unknown object id.
+		// Resolution runs before the CAS guard below so every envelope
+		// (the 412 included) reports the resolved id in `sha`.
+		resolved, err := gitread.ResolveRef(ctx, repoPath, objectSHA, false)
+		if errors.Is(err, gitread.ErrNotFound) {
+			wrefNoteFail(w, http.StatusNotFound, "object_ref does not resolve to a commit: "+objectSHA, objectSHA, targetRef, old, oldOrZero)
+			return
+		} else if err != nil {
+			s.internalErr(w, r, "resolve note object_ref", err)
+			return
+		}
+		objectSHA = resolved
+	}
+
 	// Invariant 1: expected_notes_ref_sha is the notes-ref CAS guard; the
 	// zero sha asserts the ref is unborn.
 	if expectedRefSHA != "" && expectedRefSHA != oldOrZero {
@@ -713,8 +733,8 @@ func (s *server) wrefHandleNote(w http.ResponseWriter, r *http.Request, deleteNo
 		return
 	}
 
-	ctx := r.Context()
-	// The note target must exist (any object kind, per git notes).
+	// The note target must exist (any object kind, per git notes; a
+	// revision-resolved objectSHA re-verifies trivially).
 	if _, err := wrefGit(ctx, repoPath, nil, nil,
 		"rev-parse", "--verify", "--quiet", "--end-of-options", objectSHA+"^{object}"); err != nil {
 		wrefNoteFail(w, http.StatusNotFound, "object not found: "+objectSHA, objectSHA, targetRef, old, oldOrZero)
@@ -818,8 +838,9 @@ func wrefScratchEnv(repoPath, scratch string) []string {
 // temp ref.
 func (s *server) wrefRunNotesOp(ctx context.Context, repoPath, old, action, sha, note string, author wrefNoteAuthor) (string, []string, func(), error) {
 	assertf(action == "add" || action == "append" || action == "remove", "wrefRunNotesOp: bad action %q", action)
-	// sha was validated with ref.ValidSHA upstream: it can never be parsed
-	// as a git option or rev expression below.
+	// sha was validated with ref.ValidSHA (or produced by
+	// gitread.ResolveRef) upstream: it can never be parsed as a git option
+	// or rev expression below.
 	assertf(ref.ValidSHA(sha), "wrefRunNotesOp: unvalidated sha %q", sha)
 	scratch, err := os.MkdirTemp("", "codestorage-notes-*")
 	if err != nil {

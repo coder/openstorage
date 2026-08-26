@@ -245,6 +245,7 @@ func buildDiffPayload(ctx context.Context, repoPath, base, target string, paths 
 
 type commitDiffResponse struct {
 	SHA           string              `json:"sha"`
+	BaseSHA       string              `json:"base_sha"`
 	MergeBaseSHA  string              `json:"merge_base_sha"`
 	Stats         diffStatsPayload    `json:"stats"`
 	Files         []fileDiffEntry     `json:"files"`
@@ -254,12 +255,14 @@ type commitDiffResponse struct {
 // handleDiff implements GET /api/v1/repos/diff: `ref` and `base_ref` accept
 // any revision (deprecated camelCase aliases `sha`/`baseSha` — the
 // endpoint's historical quirk; note `base_sha` was never a param and stays
-// an ignored unknown). `ref_is_ephemeral`/`base_is_ephemeral` resolve either
-// side in the ephemeral namespace. Explicit base_ref selects a three-dot
-// comparison: the diff runs from merge-base(base_ref, ref) to ref with
-// merge_base_sha set; without base_ref the diff is against the first parent
-// (root commits: empty tree) and merge_base_sha is empty (openapi: "Empty
-// for single-commit diffs").
+// an ignored unknown, though the response now carries a `base_sha` field).
+// `ref_is_ephemeral`/`base_is_ephemeral` resolve either side in the
+// ephemeral namespace. Explicit base_ref selects a three-dot comparison:
+// the diff runs from merge-base(base_ref, ref) to ref with merge_base_sha
+// set and base_sha reporting the commit base_ref resolved to (issue #160);
+// without base_ref the diff is against the first parent (root commits:
+// empty tree) and both merge_base_sha and base_sha are empty (openapi:
+// "Empty for single-commit diffs" / "Empty for a single-commit diff").
 func (s *server) handleDiff(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	refParam := strings.TrimSpace(coreAliasParam(q, "ref", "sha"))
@@ -305,6 +308,7 @@ func (s *server) handleDiff(w http.ResponseWriter, r *http.Request) {
 
 	base := gitread.EmptyTreeSHA
 	mergeBase := ""
+	baseSHA := ""
 	if baseParam := strings.TrimSpace(coreAliasParam(q, "base_ref", "baseSha")); baseParam != "" {
 		baseCommit, err := gitread.ResolveRef(r.Context(), repoPath, baseParam, baseEphemeral)
 		if errors.Is(err, gitread.ErrNotFound) {
@@ -314,6 +318,7 @@ func (s *server) handleDiff(w http.ResponseWriter, r *http.Request) {
 			s.internalErr(w, r, "resolve diff base_ref", err)
 			return
 		}
+		baseSHA = baseCommit
 		mb, found, err := mergeBaseSHA(r.Context(), repoPath, baseCommit, target)
 		if err != nil {
 			s.internalErr(w, r, "compute merge base", err)
@@ -343,6 +348,7 @@ func (s *server) handleDiff(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, commitDiffResponse{
 		SHA:           target,
+		BaseSHA:       baseSHA,
 		MergeBaseSHA:  mergeBase,
 		Stats:         payload.Stats,
 		Files:         payload.Files,

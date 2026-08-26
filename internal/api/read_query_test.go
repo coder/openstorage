@@ -463,6 +463,30 @@ func testQueryCommitDiff(t *testing.T, e *testEnv) {
 		rqExpectErr(t, resp, body, http.StatusBadRequest)
 	})
 
+	// Issue #160: the 200 payload gained base_sha — the commit base_ref
+	// resolved to — staying empty on single-commit (and root) diffs.
+	t.Run("base_sha reports the resolved base", func(t *testing.T) {
+		for _, c := range []struct {
+			name, query, want string
+		}{
+			{"base_ref sha", "ref=" + fx.c3 + "&base_ref=" + fx.c4, fx.c4},
+			{"base_ref branch name", "ref=" + fx.c3 + "&base_ref=main", fx.c4},
+			{"base_ref tag", "ref=" + fx.c3 + "&base_ref=v1", fx.c1},
+			{"deprecated baseSha alias", "ref=" + fx.c3 + "&baseSha=" + fx.c1, fx.c1},
+			{"single-commit diff", "ref=" + fx.c2, ""},
+			{"root commit", "ref=" + fx.c1, ""},
+		} {
+			t.Run(c.name, func(t *testing.T) {
+				resp, body := e.doReq(t, http.MethodGet, "/api/v1/repos/diff?"+c.query, tok, nil, "")
+				var out commitDiffResponse
+				rqDecode(t, resp, body, &out)
+				if out.BaseSHA != c.want {
+					t.Errorf("base_sha = %q, want %q", out.BaseSHA, c.want)
+				}
+			})
+		}
+	})
+
 	t.Run("gitApplyCompatible concatenation passes git apply", func(t *testing.T) {
 		resp, body := e.doReq(t, http.MethodGet, "/api/v1/repos/diff?sha="+fx.c2+"&gitApplyCompatible=true", tok, nil, "")
 		var out commitDiffResponse

@@ -26,11 +26,13 @@ type rnotesGetResponse struct {
 }
 
 // handleGetNote implements GET /api/v1/repos/notes: `object_ref` (required,
-// full object id today — same validation as the notes write surface;
-// deprecated alias `sha`) plus optional `notes_ref` (deprecated alias `ref`)
-// with the write path's resolution (default refs/notes/commits, bare names
-// under refs/notes/). ref_sha is the notes ref tip from the ref authority;
-// an unborn notes ref or an object without a note is a 404.
+// full object id or a revision resolving to a commit — same treatment as
+// the notes write surface, issue #161; deprecated alias `sha`) plus
+// optional `notes_ref` (deprecated alias `ref`) with the write path's
+// resolution (default refs/notes/commits, bare names under refs/notes/).
+// ref_sha is the notes ref tip from the ref authority; an unborn notes
+// ref, unresolvable object_ref, or an object without a note is a 404. The
+// response echoes the resolved object id in `sha`.
 func (s *server) handleGetNote(w http.ResponseWriter, r *http.Request) {
 	repo, ok := s.resolveReadRepo(w, r)
 	if !ok {
@@ -38,8 +40,8 @@ func (s *server) handleGetNote(w http.ResponseWriter, r *http.Request) {
 	}
 	q := r.URL.Query()
 	sha := coreAliasParam(q, "object_ref", "sha")
-	if !ref.ValidSHA(sha) {
-		writeErr(w, http.StatusBadRequest, "object_ref must be a full 40-hex object id")
+	if sha == "" {
+		writeErr(w, http.StatusBadRequest, "object_ref is required")
 		return
 	}
 	targetRef, err := wrefNotesRefName(coreAliasParam(q, "notes_ref", "ref"))
@@ -60,6 +62,20 @@ func (s *server) handleGetNote(w http.ResponseWriter, r *http.Request) {
 	repoPath, ok := s.materializeReadRepo(w, r, repo)
 	if !ok {
 		return
+	}
+	if !ref.ValidSHA(sha) {
+		// openapi (issue #161): a non-SHA object_ref is a revision — a
+		// branch, tag, short SHA, or full ref — that must resolve to a
+		// commit, mirroring the notes write surface.
+		resolved, err := gitread.ResolveRef(r.Context(), repoPath, sha, false)
+		if errors.Is(err, gitread.ErrNotFound) {
+			writeErr(w, http.StatusNotFound, "object_ref does not resolve to a commit: "+sha)
+			return
+		} else if err != nil {
+			s.internalErr(w, r, "resolve note object_ref", err)
+			return
+		}
+		sha = resolved
 	}
 	note, err := gitread.Note(r.Context(), repoPath, targetRef, sha)
 	switch {
