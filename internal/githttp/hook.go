@@ -629,9 +629,25 @@ func updateHook(ctx context.Context, args []string) error {
 	// mismatch). The server removes the hold once receive-pack exits.
 	// Fail closed: committing without a recorded hold reopens the race.
 	if holdPath := os.Getenv(EnvPushHold); holdPath != "" {
+		// A held STRICT D/F relative of this ref means another push's
+		// receive-pack still has the conflicting neighbor materialized
+		// locally (e.g. its committed deletion of refs/heads/a has not
+		// reached the cache repo yet while this push creates
+		// refs/heads/a/b — hydration skips held refs, so the neighbor
+		// won't vanish underneath it either). Wait for that hold to clear
+		// before committing; this push's own hold file is excluded so a
+		// multi-ref D/F rename cannot deadlock on itself (Codex P1 on
+		// #173).
+		waitForConflictingPushHolds(holdPath, refName)
 		if err := appendPushHold(holdPath, refName); err != nil {
 			return fmt.Errorf("update: record push hold: %w", err)
 		}
+		// Keep the hold fresh while this hook lives: post-CAS work inside
+		// the store decorators (webhook and sync-poke enqueues) has no
+		// fixed bound, and a hold must only ever expire when its owner is
+		// dead (Codex P2 on #173). Receive-pack's remaining window after
+		// the last hook exits is local-only and far inside one TTL.
+		defer startPushHoldRefresh(holdPath)()
 	}
 
 	st, err := ref.Open(ctx, mustEnv(envHookPGURL...))

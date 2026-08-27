@@ -834,33 +834,56 @@ func (l *localRefSeq) close() {
 	_ = l.cmd.Wait()
 }
 
+// refCmd is one update-ref --stdin command plus the ref name it targets,
+// kept structured so flush can filter push-held refs (issue #170).
+type refCmd struct{ name, line string }
+
 // refCmdBatch accumulates update-ref --stdin commands and flushes them in
-// syncRefsBatch-sized transactions.
+// syncRefsBatch-sized transactions. Each flush takes ONE fresh snapshot of
+// the repo's live push holds and drops commands whose ref a hold covers,
+// recording skipped: every command in the batch was produced by a store
+// read strictly before the flush, so a command carrying a push's committed
+// value has that push's hold — appended before its CAS — visible in the
+// snapshot unless the push already finished (then re-applying is a no-op).
+// One snapshot per flush keeps the hold cost O(flushes), not O(changed
+// refs) — a cold million-ref hydration must not rescan the hold directory
+// per ref (Codex P2 on #173).
 type refCmdBatch struct {
 	repoPath string
 	cap      int
-	cmds     strings.Builder
-	n        int
+	cmds     []refCmd
+	skipped  bool
 }
 
-func (b *refCmdBatch) add(cmd string) error {
+func (b *refCmdBatch) add(name, line string) error {
 	assertf(b.cap > 0, "refCmdBatch: non-positive cap %d", b.cap)
-	b.cmds.WriteString(cmd)
-	b.n++
-	if b.n < b.cap {
+	b.cmds = append(b.cmds, refCmd{name: name, line: line})
+	if len(b.cmds) < b.cap {
 		return nil
 	}
 	return b.flush()
 }
 
 func (b *refCmdBatch) flush() error {
-	if b.n == 0 {
+	if len(b.cmds) == 0 {
 		return nil
 	}
-	cmds := b.cmds.String()
-	b.cmds.Reset()
-	b.n = 0
-	return updateRefStdin(b.repoPath, cmds)
+	holds := loadPushHolds(b.repoPath)
+	var sb strings.Builder
+	kept := 0
+	for _, c := range b.cmds {
+		if holds.covers(c.name) {
+			b.skipped = true
+			continue
+		}
+		sb.WriteString(c.line)
+		kept++
+	}
+	b.cmds = b.cmds[:0]
+	if kept == 0 {
+		return nil
+	}
+	return updateRefStdin(b.repoPath, sb.String())
 }
 
 // syncRefsStreamed makes the local ref store match the given stream exactly
@@ -880,12 +903,12 @@ func (b *refCmdBatch) flush() error {
 // update-ref transactions; partial application is fine — the sync is
 // idempotent over a rebuildable cache and callers retry.
 //
-// Commands naming a push-held ref (issue #170, see pushHeldRef) are
+// Commands covered by a push hold (issue #170, see refCmdBatch.flush) are
 // skipped in both passes and reported as skipped=true: a receive-pack on
 // this node is mid-way between its committed authority CAS and its own
-// local update of that ref, and a sync touching it would make git reject
-// the push. Callers must not let any success marker vouch for a sync that
-// skipped a ref.
+// local update of that ref, and a sync touching it (or a D/F relative of
+// it) would make git reject the push. Callers must not let any success
+// marker vouch for a sync that skipped a ref.
 func syncRefsStreamed(ctx context.Context, repoPath, headTarget string, newStore func() refSeq, batch int) (skipped bool, err error) {
 	assertf(strings.HasPrefix(headTarget, "refs/"), "syncRefsStreamed: unqualified HEAD target %q", headTarget)
 	assertf(batch > 0, "syncRefsStreamed: non-positive batch %d", batch)
@@ -912,11 +935,10 @@ func syncRefsStreamed(ctx context.Context, repoPath, headTarget string, newStore
 // deletions flush in batches during the pass; updates spool up to one batch
 // and flush after every deletion has been applied. Returns overflow=true
 // when the spool capacity was exceeded — updates were then discarded and
-// the caller owns running syncRefsPassUpdates. Push-held refs are skipped
-// (skipped=true) at command-emission time, which is strictly after the
-// store read that produced the command — the ordering the push-hold proof
-// requires (see pushHeldRef; the spooled replay below needs no re-check
-// for the same reason).
+// the caller owns running syncRefsPassUpdates. Push-hold filtering happens
+// at flush time (refCmdBatch.flush), which is strictly after every store
+// read that produced a flushed command — the ordering the push-hold proof
+// requires.
 func syncRefsPassOne(ctx context.Context, repoPath string, store refSeq, batch int) (overflow, skipped bool, err error) {
 	local, err := startLocalRefSeq(ctx, repoPath)
 	if err != nil {
@@ -924,27 +946,16 @@ func syncRefsPassOne(ctx context.Context, repoPath string, store refSeq, batch i
 	}
 	defer local.close()
 	dels := &refCmdBatch{repoPath: repoPath, cap: batch}
-	var upds []string
+	var upds []refCmd
 	spool := func(name, sha string) {
 		if overflow {
-			return
-		}
-		if pushHeldRef(repoPath, name) {
-			skipped = true
 			return
 		}
 		if len(upds) == batch {
 			overflow, upds = true, nil
 			return
 		}
-		upds = append(upds, fmt.Sprintf("update %s %s\n", name, sha))
-	}
-	del := func(name string) error {
-		if pushHeldRef(repoPath, name) {
-			skipped = true
-			return nil
-		}
-		return dels.add(fmt.Sprintf("delete %s\n", name))
+		upds = append(upds, refCmd{name: name, line: fmt.Sprintf("update %s %s\n", name, sha)})
 	}
 	var ln, ls string
 	var lok bool
@@ -954,22 +965,22 @@ func syncRefsPassOne(ctx context.Context, repoPath string, store refSeq, batch i
 		return lerr == nil
 	}
 	if !advance() {
-		return false, skipped, lerr
+		return false, false, lerr
 	}
 	for {
 		sn, ss, sok, serr := store.next()
 		if serr != nil {
-			return false, skipped, serr
+			return false, dels.skipped, serr
 		}
 		if !sok {
 			break
 		}
 		for lok && ln < sn {
-			if err := del(ln); err != nil {
-				return false, skipped, err
+			if err := dels.add(ln, fmt.Sprintf("delete %s\n", ln)); err != nil {
+				return false, dels.skipped, err
 			}
 			if !advance() {
-				return false, skipped, lerr
+				return false, dels.skipped, lerr
 			}
 		}
 		if lok && ln == sn {
@@ -977,33 +988,34 @@ func syncRefsPassOne(ctx context.Context, repoPath string, store refSeq, batch i
 				spool(sn, ss)
 			}
 			if !advance() {
-				return false, skipped, lerr
+				return false, dels.skipped, lerr
 			}
 		} else {
 			spool(sn, ss)
 		}
 	}
 	for lok {
-		if err := del(ln); err != nil {
-			return false, skipped, err
+		if err := dels.add(ln, fmt.Sprintf("delete %s\n", ln)); err != nil {
+			return false, dels.skipped, err
 		}
 		if !advance() {
-			return false, skipped, lerr
+			return false, dels.skipped, lerr
 		}
 	}
 	if err := dels.flush(); err != nil {
-		return false, skipped, err
+		return false, dels.skipped, err
 	}
 	if overflow {
-		return true, skipped, nil
+		return true, dels.skipped, nil
 	}
 	for _, cmd := range upds {
 		// Under the spool cap by construction: one flush at the end.
-		if err := dels.add(cmd); err != nil {
-			return false, skipped, err
+		if err := dels.add(cmd.name, cmd.line); err != nil {
+			return false, dels.skipped, err
 		}
 	}
-	return false, skipped, dels.flush()
+	err = dels.flush()
+	return false, dels.skipped, err
 }
 
 // syncRefsPassUpdates applies store rows that are missing or changed
@@ -1012,7 +1024,7 @@ func syncRefsPassOne(ctx context.Context, repoPath string, store refSeq, batch i
 // delete and update batches would break the all-deletions-first ordering,
 // and a row deleted from the store between passes is healed by the next
 // full sync (its deletion bumped the generation past this sync's marker).
-// Push-held refs are skipped like in pass one (skipped=true).
+// Push-held refs are dropped at flush time like in pass one (skipped=true).
 func syncRefsPassUpdates(ctx context.Context, repoPath string, store refSeq, batch int) (skipped bool, err error) {
 	local, err := startLocalRefSeq(ctx, repoPath)
 	if err != nil {
@@ -1021,43 +1033,40 @@ func syncRefsPassUpdates(ctx context.Context, repoPath string, store refSeq, bat
 	defer local.close()
 	upds := &refCmdBatch{repoPath: repoPath, cap: batch}
 	add := func(name, sha string) error {
-		if pushHeldRef(repoPath, name) {
-			skipped = true
-			return nil
-		}
-		return upds.add(fmt.Sprintf("update %s %s\n", name, sha))
+		return upds.add(name, fmt.Sprintf("update %s %s\n", name, sha))
 	}
 	ln, ls, lok, lerr := local.next()
 	if lerr != nil {
-		return skipped, lerr
+		return false, lerr
 	}
 	for {
 		sn, ss, sok, serr := store.next()
 		if serr != nil {
-			return skipped, serr
+			return upds.skipped, serr
 		}
 		if !sok {
 			break
 		}
 		for lok && ln < sn {
 			if ln, ls, lok, lerr = local.next(); lerr != nil {
-				return skipped, lerr
+				return upds.skipped, lerr
 			}
 		}
 		if lok && ln == sn {
 			if ls != ss {
 				if err := add(sn, ss); err != nil {
-					return skipped, err
+					return upds.skipped, err
 				}
 			}
 			if ln, ls, lok, lerr = local.next(); lerr != nil {
-				return skipped, lerr
+				return upds.skipped, lerr
 			}
 		} else if err := add(sn, ss); err != nil {
-			return skipped, err
+			return upds.skipped, err
 		}
 	}
-	return skipped, upds.flush()
+	err = upds.flush()
+	return upds.skipped, err
 }
 
 // SyncRefs makes the local ref store match want exactly (the store wins):
@@ -1184,35 +1193,141 @@ func appendPushHold(holdPath, name string) error {
 	return f.Close()
 }
 
-// pushHeldRef reports whether name is named by a live push hold in
-// repoPath: a receive-pack on this node has committed (or is about to
-// commit) the ref to the authority and has not yet finished its own local
-// ref update. Expired files are ignored here regardless of sweeping — a
-// crashed server must not suppress syncs past the TTL. Fail-open on read
-// trouble: a missed hold only reopens the narrow spurious-rejection window
-// this machinery closes, never corrupts state.
-func pushHeldRef(repoPath, name string) bool {
-	dir := filepath.Join(repoPath, pushHoldDir)
+// touchPushHold refreshes the hold file's TTL clock. The update hook keeps
+// its hold fresh for as long as the hook process lives (startPushHoldRefresh)
+// because post-CAS work inside the store decorators — webhook and sync-poke
+// enqueues — has no fixed bound: a hold must expire only when its owner is
+// actually dead, or the race this machinery closes reopens after one TTL
+// and the mint sweep could reap a live hold (Codex P2 on #173).
+func touchPushHold(holdPath string) {
+	now := time.Now()
+	_ = os.Chtimes(holdPath, now, now)
+}
+
+// startPushHoldRefresh keeps holdPath fresh on a TTL/4 cadence until the
+// returned stop function runs (or the hook process dies — exactly the
+// condition the TTL is meant to detect).
+func startPushHoldRefresh(holdPath string) (stop func()) {
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		t := time.NewTicker(pushHoldTTL / 4)
+		defer t.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-t.C:
+				touchPushHold(holdPath)
+			}
+		}
+	}()
+	return func() {
+		close(done)
+		wg.Wait()
+	}
+}
+
+// pushHoldSet is one snapshot of the live (unexpired) holds in a repo.
+type pushHoldSet struct{ names []string }
+
+// loadPushHolds snapshots repoPath's live holds: one directory read plus
+// one read per live file. Expired files are ignored here regardless of
+// sweeping — a crashed server must not suppress syncs past the TTL.
+// Fail-open on read trouble: a missed hold only reopens the narrow
+// spurious-rejection window this machinery closes, never corrupts state.
+func loadPushHolds(repoPath string) pushHoldSet {
+	return loadPushHoldsExcept(filepath.Join(repoPath, pushHoldDir), "")
+}
+
+// loadPushHoldsExcept is loadPushHolds skipping one hold file — the update
+// hook's D/F wait must not block on its own push's holds.
+func loadPushHoldsExcept(dir, exceptPath string) pushHoldSet {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return false
+		return pushHoldSet{}
 	}
+	var s pushHoldSet
 	for _, e := range entries {
+		path := filepath.Join(dir, e.Name())
+		if exceptPath != "" && path == exceptPath {
+			continue
+		}
 		info, err := e.Info()
 		if err != nil || time.Since(info.ModTime()) > pushHoldTTL {
 			continue
 		}
-		b, err := os.ReadFile(filepath.Join(dir, e.Name()))
+		b, err := os.ReadFile(path)
 		if err != nil {
 			continue
 		}
 		for _, held := range strings.Split(string(b), "\n") {
-			if held == name {
-				return true
+			if held != "" {
+				s.names = append(s.names, held)
 			}
 		}
 	}
+	return s
+}
+
+// covers reports whether name is held — exactly, or as a D/F relative of a
+// held name (Codex P1 on #173): git's files backend cannot hold refs/heads/a
+// and refs/heads/a/b simultaneously, so while a push-in-flight owns one
+// side (say a committed deletion of `a` whose local deletion is pending), a
+// sync must not touch the other side either — applying `a/b` would fail the
+// whole update-ref transaction against the held survivor.
+func (s pushHoldSet) covers(name string) bool {
+	for _, held := range s.names {
+		if held == name || strings.HasPrefix(name, held+"/") || strings.HasPrefix(held, name+"/") {
+			return true
+		}
+	}
 	return false
+}
+
+// conflicts reports whether a STRICT D/F relative of name is held (equality
+// excluded: same-name races are already resolved cleanly by the authority
+// CAS itself). The update hook waits on this before committing a ref whose
+// local update cannot coexist with a held neighbor (see
+// waitForConflictingPushHolds).
+func (s pushHoldSet) conflicts(name string) bool {
+	for _, held := range s.names {
+		if strings.HasPrefix(name, held+"/") || strings.HasPrefix(held, name+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+// pushHoldWaitMax bounds the update hook's wait for a D/F-conflicting hold
+// from another push. Hold windows are server-controlled and normally
+// millisecond-scale; on timeout the hook proceeds — degrading to the
+// pre-hold behavior for that push — rather than wedging it.
+const pushHoldWaitMax = 10 * time.Second
+
+// waitForConflictingPushHolds parks the update hook until no OTHER push
+// holds a strict D/F relative of refName (Codex P1 on #173): if push A has
+// committed the deletion of refs/heads/a but not yet performed its local
+// deletion, hydration skips `a` (held), so push B creating refs/heads/a/b
+// would pass its authority CAS and then fail its local update against the
+// surviving loose ref. Waiting until A's hold clears means A's receive-pack
+// has performed the local deletion (or A crashed, bounded by the timeout —
+// B then fails as it would have pre-hold and a post-TTL retry converges).
+// ownHoldPath is excluded: a multi-ref push renaming a -> a/b holds both
+// sides itself and must not deadlock on its own file.
+func waitForConflictingPushHolds(ownHoldPath, refName string) {
+	dir := filepath.Dir(ownHoldPath)
+	for deadline := time.Now().Add(pushHoldWaitMax); ; {
+		if !loadPushHoldsExcept(dir, ownHoldPath).conflicts(refName) {
+			return
+		}
+		if time.Now().After(deadline) {
+			return
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
 }
 
 // Generation marker (issue #4): the store's per-repo mutation generation

@@ -89,19 +89,22 @@ func syncFromMapSkipped(t *testing.T, repoPath string, want map[string]string, h
 	}
 }
 
-// TestSyncRefsStreamed_SkipsHeldDFRename: a D/F rename (refs/heads/a ->
-// refs/heads/a/b) travels through one push, so both names are held; the
-// sync must leave both sides untouched.
-func TestSyncRefsStreamed_SkipsHeldDFRename(t *testing.T) {
+// TestSyncRefsStreamed_SkipsHeldDFRelatives: a hold covers strict D/F
+// relatives of the held name in BOTH directions — git's files backend
+// cannot hold refs/heads/a and refs/heads/a/b simultaneously, so while a
+// push owns one side a sync must not touch the other side either.
+func TestSyncRefsStreamed_SkipsHeldDFRelatives(t *testing.T) {
 	dir := initWorkRepo(t)
 	head := revParse(t, dir, "HEAD")
 	mustGit(t, dir, "branch", "a", head)
 
-	mintHold(t, dir, "refs/heads/a", "refs/heads/a/b")
+	// Hold ONLY refs/heads/a: both its deletion and the creation of its
+	// D/F child refs/heads/a/b must be skipped.
+	mintHold(t, dir, "refs/heads/a")
 
 	want := map[string]string{
 		"refs/heads/main": head,
-		"refs/heads/a/b":  head, // held creation; refs/heads/a held deletion
+		"refs/heads/a/b":  head,
 	}
 	syncFromMapSkipped(t, dir, want, "refs/heads/main", 1, true)
 
@@ -110,7 +113,48 @@ func TestSyncRefsStreamed_SkipsHeldDFRename(t *testing.T) {
 		t.Fatalf("held D/F source deleted: %v", got)
 	}
 	if _, ok := got["refs/heads/a/b"]; ok {
-		t.Fatalf("held D/F target created: %v", got)
+		t.Fatalf("D/F child of a held ref created: %v", got)
+	}
+}
+
+// TestPushHoldSet_CoversAndConflicts pins the D/F matching semantics:
+// covers is equality plus strict prefix relations in both directions;
+// conflicts excludes equality (same-name races are resolved cleanly by the
+// authority CAS itself).
+func TestPushHoldSet_CoversAndConflicts(t *testing.T) {
+	s := pushHoldSet{names: []string{"refs/heads/a"}}
+	for name, want := range map[string][2]bool{ // name -> {covers, conflicts}
+		"refs/heads/a":     {true, false},
+		"refs/heads/a/b":   {true, true},
+		"refs/heads/a/b/c": {true, true},
+		"refs/heads/ab":    {false, false},
+		"refs/heads":       {true, true}, // held name is its strict child
+		"refs/tags/a":      {false, false},
+	} {
+		if got := s.covers(name); got != want[0] {
+			t.Errorf("covers(%q) = %v, want %v", name, got, want[0])
+		}
+		if got := s.conflicts(name); got != want[1] {
+			t.Errorf("conflicts(%q) = %v, want %v", name, got, want[1])
+		}
+	}
+}
+
+// TestTouchPushHold_RestoresFreshness: the hook-side refresh keeps a hold
+// live past the TTL for as long as its owner runs.
+func TestTouchPushHold_RestoresFreshness(t *testing.T) {
+	dir := t.TempDir()
+	holdPath := mintHold(t, dir, "refs/heads/x")
+	expired := time.Now().Add(-pushHoldTTL - time.Minute)
+	if err := os.Chtimes(holdPath, expired, expired); err != nil {
+		t.Fatalf("Chtimes: %v", err)
+	}
+	if loadPushHolds(dir).covers("refs/heads/x") {
+		t.Fatal("expired hold still live")
+	}
+	touchPushHold(holdPath)
+	if !loadPushHolds(dir).covers("refs/heads/x") {
+		t.Fatal("touched hold not live again")
 	}
 }
 
