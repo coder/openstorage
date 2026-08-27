@@ -15,9 +15,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -141,15 +143,9 @@ func RawS3Client(endpoint, region, accessKey, secretKey string) *s3.Client {
 // EnsureBucket creates the bucket, retrying while the store boots (the
 // SeaweedFS S3 gateway accepts TCP before the filer is ready) and
 // tolerating already-owned rejections, verifies it with HeadBucket, then
-// proves WRITE readiness with a scratch PutObject/DeleteObject roundtrip.
-// Bucket existence alone is not a write-readiness signal: SeaweedFS
-// serves CreateBucket from the filer while object PUTs need a writable
-// volume assignment from the master, which returns 500 InternalError
-// until the volume server has registered and volumes are grown (issue
-// #165). The qualification lanes issue their first object write on
-// deliberately no-retry CAS clients whose ambiguous post-send 5xx
-// outcome is fatal by design, so the harness must absorb the boot window
-// here instead of handing out a bucket that cannot yet be written.
+// proves WRITE readiness via WaitWriteReady — the harness must absorb the
+// store's boot window instead of handing out a bucket that cannot yet be
+// written (issue #165).
 func EnsureBucket(ctx context.Context, client *s3.Client, bucket string) error {
 	deadline := time.Now().Add(60 * time.Second)
 	for {
@@ -170,11 +166,26 @@ func EnsureBucket(ctx context.Context, client *s3.Client, bucket string) error {
 	if _, err := client.HeadBucket(ctx, &s3.HeadBucketInput{Bucket: aws.String(bucket)}); err != nil {
 		return fmt.Errorf("HeadBucket(%s) after create: %w", bucket, err)
 	}
-	// Write-readiness gate. The scratch key lives outside every
-	// store-scanned prefix (`_wal/...`) and carries a fresh nonce so
-	// concurrent harnesses sharing an external emulator bucket never
-	// collide. The PUT/DELETE pair retries as a unit under the same
-	// deadline so a transient boot 500 on the delete cannot leak the key.
+	return WaitWriteReady(ctx, client, bucket)
+}
+
+// WaitWriteReady proves the bucket accepts OBJECT WRITES with a retried
+// scratch PutObject/DeleteObject roundtrip (60 s bound). Bucket existence
+// alone is not a write-readiness signal: SeaweedFS serves CreateBucket
+// from the filer while object PUTs need a writable volume assignment from
+// the master, which returns 500 InternalError until the volume server has
+// registered and volumes are grown (issues #165, #177). The scratch key
+// lives outside every store-scanned prefix (`_wal/...`, `packs/...`,
+// `lfs/...`) and carries a fresh nonce so concurrent harnesses sharing an
+// external emulator bucket never collide. The PUT/DELETE pair retries as
+// a unit so a transient boot 500 on the delete cannot leak the key.
+// Shared by every SeaweedFS-booting harness: the s3wal qualification
+// lanes (whose no-retry CAS clients turn one boot 500 into a fatal
+// ambiguous verdict), the internal/blob container tests (whose SDK
+// 3-attempt budget can be exhausted inside the boot window), and the
+// githttp e2e lanes.
+func WaitWriteReady(ctx context.Context, client *s3.Client, bucket string) error {
+	deadline := time.Now().Add(60 * time.Second)
 	nonce := make([]byte, 16)
 	if _, err := rand.Read(nonce); err != nil {
 		return fmt.Errorf("readiness nonce: %w", err)
@@ -297,6 +308,68 @@ func DeleteAllPrefix(tb testing.TB, client *s3.Client, bucket, prefix string) {
 			tb.Errorf("cleanup delete %s: %v", key, err)
 		}
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Deterministic boot-window fault injection.
+
+// BootingFakeS3 models the SeaweedFS boot window behind issues #165/#177
+// as a plain HTTP handler: bucket operations succeed immediately
+// (CreateBucket/HeadBucket run on the filer alone) while the first
+// PutFailures OBJECT PUTs fail with the store's literal 500 InternalError
+// (no writable volume assigned yet). The failure count is deterministic,
+// so the boot-window flake reproduces on every run instead of one CI run
+// in dozens. Zero value is ready to use; set PutFailures before serving.
+type BootingFakeS3 struct {
+	mu          sync.Mutex
+	PutFailures int // object PUTs left to fail with 500
+	objectPuts  int
+	deletes     int
+}
+
+// Handler serves the fake: bucket PUT/HEAD → 200, object PUT → 500 while
+// PutFailures remain (then 200 with an ETag), object DELETE → 204,
+// anything else → 400.
+func (f *BootingFakeS3) Handler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		bucketOnly := !strings.Contains(strings.TrimPrefix(r.URL.Path, "/"), "/")
+		switch {
+		case bucketOnly && (r.Method == http.MethodPut || r.Method == http.MethodHead):
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPut:
+			f.mu.Lock()
+			f.objectPuts++
+			failing := f.PutFailures > 0
+			if failing {
+				f.PutFailures--
+			}
+			f.mu.Unlock()
+			if failing {
+				w.Header().Set("Content-Type", "application/xml")
+				w.WriteHeader(http.StatusInternalServerError)
+				_, _ = io.WriteString(w, `<?xml version="1.0" encoding="UTF-8"?><Error><Code>InternalError</Code><Message>We encountered an internal error, please try again.</Message></Error>`)
+				return
+			}
+			w.Header().Set("ETag", `"fake-etag"`)
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodDelete:
+			f.mu.Lock()
+			f.deletes++
+			f.mu.Unlock()
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	})
+}
+
+// Snapshot returns (remaining put failures, object puts served, deletes
+// served) under the lock, so assertions never race late keep-alive
+// handler goroutines.
+func (f *BootingFakeS3) Snapshot() (putFailures, objectPuts, deletes int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.PutFailures, f.objectPuts, f.deletes
 }
 
 // ---------------------------------------------------------------------------

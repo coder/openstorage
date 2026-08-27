@@ -173,6 +173,18 @@ func testMainInner(m *testing.M) int {
 		blobURL = fmt.Sprintf("s3://githttp-test?endpoint=http://%s&s3ForcePathStyle=true&region=us-east-1", s3Addr)
 		os.Setenv("AWS_ACCESS_KEY_ID", s3AccessKey)
 		os.Setenv("AWS_SECRET_ACCESS_KEY", s3SecretKey)
+
+		// SeaweedFS keeps 500ing object PUTs for a while after CreateBucket
+		// succeeds — bucket creation is filer-only, object writes need a
+		// volume assignment (issues #165/#177) — so gate write readiness
+		// now instead of letting the suite's first pack upload draw a
+		// boot-window 500 through the SDK's bounded retries. Doubles as
+		// the lane's bucket bootstrap (the shared EnsureBucket retry below
+		// then succeeds immediately).
+		raw := s3waltest.RawS3Client("http://"+s3Addr, "us-east-1", s3AccessKey, s3SecretKey)
+		if err := s3waltest.EnsureBucket(ctx, raw, "githttp-test"); err != nil {
+			panic("SeaweedFS never became write-ready: " + err.Error())
+		}
 	case backendLocal:
 		testBackend = backendLocal
 		localDataDir = filepath.Join(scratch, "data")
