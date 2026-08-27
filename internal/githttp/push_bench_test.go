@@ -576,11 +576,18 @@ func runPushWindow(b *testing.B, writers int, window time.Duration) pushWindowRe
 			lastSuccess = start
 			for time.Now().Before(deadline) {
 				if k >= len(chain) {
-					// Generating more commits here would put a git
-					// subprocess back inside the timed window: end this
-					// writer's participation early and record it.
+					// Chain exhaustion INVALIDATES the cell: the writer
+					// stops pushing early, so the numbers would silently
+					// understate aggregate capacity exactly when a
+					// backend outruns the benchChainPushRate sizing
+					// assumption (i.e. right when an optimization lands).
+					// Sizing stays static — generating commits here would
+					// put git subprocesses back inside the timed window —
+					// so the honest behavior is a loud failure telling us
+					// to raise the constant. The exhausted-writers metric
+					// stays as belt and suspenders for output scraping.
 					exhausted = 1
-					b.Logf("writer %d exhausted its %d-commit chain before the deadline", i, len(chain))
+					b.Errorf("writer %d exhausted its %d-commit chain after %d pushes before the deadline — raise benchChainPushRate (currently assumes ≤ %d push/s per writer)", i, len(chain), k, benchChainPushRate)
 					break
 				}
 				// Bounded by the remaining window plus a grace margin: a
@@ -669,8 +676,14 @@ func runPushWindow(b *testing.B, writers int, window time.Duration) pushWindowRe
 	// Lost-update detector: every writer's branch on the server must hold
 	// one of that writer's accepted tips — no writer is ever skipped, and
 	// a value outside the set is always a violation.
+	lsOut, err := tryGitDeadline(seed, benchSetupPushTimeout, "ls-remote", url)
+	if err != nil {
+		// Bounded like the observer polls: a stalled serve node must fail
+		// the cell promptly, not eat the whole go-test timeout.
+		b.Fatalf("final ls-remote: %v\n%s", err, lsOut)
+	}
 	server := map[string]string{}
-	for line := range strings.Lines(benchGit(b, seed, "ls-remote", url)) {
+	for line := range strings.Lines(lsOut) {
 		if sha, ref, ok := strings.Cut(strings.TrimSpace(line), "\t"); ok {
 			server[ref] = sha
 		}
