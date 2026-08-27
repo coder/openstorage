@@ -1693,6 +1693,43 @@ func TestReservePushHolds_PeerScanWorkBounded(t *testing.T) {
 	}
 }
 
+// TestReservePushHolds_EmptySetSkipsPeerScan (Codex round-28 security P2
+// on #173): a push whose every command was denied, sidecar-diverted, or
+// JIT-deferred reserves NOTHING, yet the multi-name path parsed every
+// live peer hold under the reservation flock before consulting the empty
+// name list — repeated compact doomed pushes against a 100k-name hold
+// bought repository-scale parses per push, work the single-name scan
+// allowance never sees. A zero-name reservation conflicts with nothing:
+// it must return before touching the lock or any peer file.
+func TestReservePushHolds_EmptySetSkipsPeerScan(t *testing.T) {
+	repoDir := t.TempDir()
+	dir := filepath.Join(repoDir, pushHoldDir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	peer := filepath.Join(dir, "push-peer")
+	if err := os.WriteFile(peer, []byte("refs/heads/x\n"), 0o644); err != nil {
+		t.Fatalf("write peer hold: %v", err)
+	}
+	hold := filepath.Join(dir, "push-self")
+	if err := reservePushHolds(context.Background(), hold, nil); err != nil {
+		t.Fatalf("empty reservation must be a no-op success: %v", err)
+	}
+	// The reserve lock is created lazily by the first real reservation;
+	// an empty set must never get that far (nor scan a peer to charge the
+	// allowance counter).
+	if _, err := os.Stat(dir + ".reserve.lock"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("empty reservation took the reserve lock: %v", err)
+	}
+	if _, err := os.Stat(hold + pushHoldScanSuffix); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("empty reservation charged scan work: %v", err)
+	}
+	// A real reservation through the same path still works afterwards.
+	if err := reservePushHolds(context.Background(), hold, []string{"refs/heads/y"}); err != nil {
+		t.Fatalf("real reservation after the no-op: %v", err)
+	}
+}
+
 // TestPeerHoldCovers_StreamsWithoutParsing (Codex round-25 security P2 on
 // #173): every sidecar/JIT hook self-reservation runs in a fresh process,
 // so its peer-conflict check must stream the peer holds — building the

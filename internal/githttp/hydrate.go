@@ -1866,6 +1866,17 @@ func reservePushHolds(ctx context.Context, holdPath string, names []string) erro
 			return fmt.Errorf("push hold: malformed ref name %q", name)
 		}
 	}
+	if len(names) == 0 {
+		// Nothing to reserve — every command was denied, sidecar-diverted,
+		// or JIT-deferred (Codex round-28 security P2 on #173): a zero-name
+		// reservation can conflict with nothing, so skip the lock and the
+		// peer scan entirely. The multi-name path below parses EVERY live
+		// peer hold under the reservation flock before consulting names, so
+		// repeated compact doomed pushes against a large concurrent hold
+		// would otherwise buy repository-scale parses per push — work the
+		// single-name scan allowance never sees.
+		return nil
+	}
 	dir := filepath.Dir(holdPath)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
