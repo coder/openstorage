@@ -101,8 +101,14 @@ func startSeaweedFS(t *testing.T, enforceAuth bool) string {
 }
 
 // ensureBucketReady retries EnsureBucket until the gateway chain behind the
-// already-listening S3 port has finished booting. Port readiness alone is
-// not enough: the first CreateBucket calls fail while the filer warms up.
+// already-listening S3 port has finished booting, then proves WRITE
+// readiness through the shared s3wal harness gate. Port readiness alone is
+// not enough (the first CreateBucket calls fail while the filer warms up),
+// and bucket existence alone is not enough either: SeaweedFS 500s object
+// PUTs until the master assigns a writable volume, and a slow runner can
+// exhaust the SDK's 3-attempt budget inside that window (issue #177, the
+// blob-harness recurrence of #165). The gate rides b.client, so it carries
+// the same middleware (expected-bucket-owner) as the test traffic.
 func ensureBucketReady(t *testing.T, b *S3) {
 	t.Helper()
 	ctx := context.Background()
@@ -110,12 +116,15 @@ func ensureBucketReady(t *testing.T, b *S3) {
 	for {
 		err := b.EnsureBucket(ctx)
 		if err == nil {
-			return
+			break
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("EnsureBucket never succeeded (SeaweedFS not ready?): %v", err)
 		}
 		time.Sleep(250 * time.Millisecond)
+	}
+	if err := s3waltest.WaitWriteReady(ctx, b.client, b.name); err != nil {
+		t.Fatalf("write readiness: %v", err)
 	}
 }
 
