@@ -1021,6 +1021,14 @@ func runContentionWindow(tb testing.TB, cas *s3wal.Client, key string, writers i
 					}
 				case errors.Is(err, s3wal.ErrLostRace):
 					lostRaces++
+					// The window is over and the loop is about to exit:
+					// starting a backoff + re-read now would be off-window
+					// recovery work that cannot lead to another CAS, only
+					// inflating elapsed and the deferred starve reading by
+					// up to the 2 s cap (PR #184 review).
+					if !time.Now().Before(deadline) {
+						return
+					}
 					// §2.3: full-jitter backoff before the re-read +
 					// re-evaluate, exactly like the production mutate loop.
 					if !backoff() {
