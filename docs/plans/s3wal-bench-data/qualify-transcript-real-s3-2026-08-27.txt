@@ -1,0 +1,36 @@
+# Real-S3 qualification transcript — TestQualifyExternalEndpoint
+# AWS S3 eu-central-1, 2026-08-27, bucket codestorage-q1ab-s3wal-7715761f
+# (pre-provisioned; fresh and dedicated; deleted after the campaign).
+# Invocation (ambient AWS credentials; the harness refuses to create
+# buckets on real S3 and namespaces all keys under qualify/<hex>/):
+#
+#   CODESTORAGE_TEST_S3WAL_URL='s3://codestorage-q1ab-s3wal-7715761f?region=eu-central-1' \
+#     go test ./internal/ref/s3wal -run '^TestQualifyExternalEndpoint$' -v -count=1 -timeout 30m
+
+=== RUN   TestQualifyExternalEndpoint
+    qualify_test.go:843: VERDICT store=external surface=raw-roundtrip verdict=pass detail=""
+    qualify_test.go:843: VERDICT store=external surface=gocloud-write-small verdict=pass detail=""
+SDK 2026/08/27 07:53:44 WARN Skipped validation of multipart checksum.
+    qualify_test.go:843: VERDICT store=external surface=gocloud-write-multipart verdict=pass detail="forced multipart: 20 MiB body above the transfer manager's fixed 16 MiB threshold at 5 MiB part size (4 parts); stored ETag \"709c3a186527f3573c196a9f9d087e22-4\" carries the multipart part-count suffix (4 parts)"
+    qualify_test.go:843: VERDICT store=external surface=gocloud-ifnotexist verdict=pass detail=""
+    qualify_test.go:843: VERDICT store=external surface=conditional-create-fresh verdict=pass detail=""
+    qualify_test.go:843: VERDICT store=external surface=conditional-create-duplicate verdict=pass detail=""
+    qualify_test.go:843: VERDICT store=external surface=conditional-advance-matched verdict=pass detail=""
+    qualify_test.go:843: VERDICT store=external surface=conditional-advance-stale verdict=pass detail=""
+    qualify_test.go:843: VERDICT store=external surface=get-304-matched verdict=pass detail=""
+    qualify_test.go:843: VERDICT store=external surface=get-304-changed verdict=pass detail=""
+    qualify_test.go:843: VERDICT store=external surface=probe-step-1-create verdict=pass detail=""
+    qualify_test.go:843: VERDICT store=external surface=probe-step-2-duplicate-create-412 verdict=pass detail=""
+    qualify_test.go:843: VERDICT store=external surface=probe-step-3-matched-advance verdict=pass detail=""
+    qualify_test.go:843: VERDICT store=external surface=probe-step-4-stale-advance-412 verdict=pass detail=""
+    qualify_test.go:843: VERDICT store=external surface=probe-step-5-racing-advances verdict=pass detail=""
+    qualify_test.go:843: VERDICT store=external surface=list-pagination verdict=pass detail=""
+    qualify_test.go:843: VERDICT store=external surface=list-order verdict=pass detail=""
+    qualify_test.go:843: VERDICT store=external surface=list-prefix verdict=pass detail=""
+    qualify_test.go:843: VERDICT store=external surface=list-startafter verdict=pass detail=""
+    qualify_test.go:843: VERDICT store=external surface=member-contiguity verdict=pass detail=""
+    qualify_test.go:843: VERDICT store=external surface=presigned-get verdict=pass detail=""
+    qualify_test.go:843: VERDICT store=external surface=bucket-bootstrap verdict=pass detail=""
+--- PASS: TestQualifyExternalEndpoint (29.15s)
+PASS
+ok  	github.com/coder/code-storage/internal/ref/s3wal	29.186s
