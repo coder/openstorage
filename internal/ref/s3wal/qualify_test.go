@@ -1057,9 +1057,12 @@ func runContentionWindow(tb testing.TB, cas *s3wal.Client, key string, writers i
 					nextAttempt()
 				case errors.Is(err, s3wal.ErrCASContention):
 					// 409 exhaustion — the client already backed off
-					// through its full internal budget.
+					// through its full internal budget, and production
+					// mutate returns immediately here (the push fails),
+					// so the client's NEXT push starts a fresh schedule
+					// (PR #184 review round 4).
 					contentions++
-					nextAttempt()
+					attempt = 0
 				default:
 					var amb *s3wal.AmbiguousError
 					if !errors.As(err, &amb) {
