@@ -18,7 +18,11 @@ unversioned bucket created for the campaign and deleted afterward). Two
 method deviations are recorded in the notes below: a single-day run, and
 compute near but not inside the target region (~7 ms measured RTT). The
 qualification lane (`TestQualifyExternalEndpoint`) passed all 22 surfaces
-in require mode against the same bucket before any benchmark ran.
+in require mode against the same bucket before any benchmark ran — the
+full verdict transcript and its exact invocation
+(`CODESTORAGE_TEST_S3WAL_URL`, distinct from the bench lane's variable)
+are committed as
+[`qualify-transcript-real-s3-2026-08-27.txt`](./s3wal-bench-data/qualify-transcript-real-s3-2026-08-27.txt).
 Kill-threshold evaluation and the Gate 1a-B verdict are below; summary:
 thresholds (2) and (4) pass with wide margins and (3)'s throughput/scaling
 arms pass. (3)'s 30 s starvation arm **is recorded tripped as written**
@@ -154,8 +158,13 @@ production-shape probe against the same bucket — 8 concurrent real
 `git push` workers on one repo group for 60 s through a live serve node —
 showed every pusher progressing continuously: 16–24 wins each, worst
 per-worker gap **21.9 s** (accounting includes worker start → first
-success and last success → window end), 160 pushes total, 35 clean
-retryable rejections (the known #170 stale-advertisement family). The
+success and last success → window end), **160 successful pushes out of
+195 attempts**. All 35 rejections surfaced as clean git-native errors and
+every worker kept progressing afterward: 33 of the known #170
+stale-advertisement family (32 `incorrect old value provided`, 1
+`reference already exists`), 1 designed CAS retry-budget exhaustion
+(`16 attempts: conditional-write contention retries exhausted`), and 1
+transient client-side TLS handshake timeout surfaced as a hook decline. The
 probe script, per-worker raw results, and rejection taxonomy are
 committed as
 [`probe-fairness-real-s3-2026-08-27.txt`](./s3wal-bench-data/probe-fairness-real-s3-2026-08-27.txt).
@@ -367,8 +376,9 @@ the bench tolerates and counts these like any rejection.
     per-worker progress gap of **21.9 s** — gap accounting covering
     worker start → first success and last success → window end, so
     pre-first and post-last starvation are included — with every pusher
-    progressing and all conflicts surfacing as clean retryable
-    rejections. The probe is a different workload than the cell, so it
+    progressing (160 successful pushes of 195 attempts; all 35 rejections
+    clean git-native errors — see the cell 3 note for the class
+    breakdown). The probe is a different workload than the cell, so it
     supplements rather than replaces the recorded number; the
     authoritative re-measurement is the §2.3-conformant harness re-run
     tracked in [#181](https://github.com/coder/code-storage/issues/181).
@@ -474,7 +484,9 @@ signal.
   ([`probe-fairness-real-s3-2026-08-27.txt`](./s3wal-bench-data/probe-fairness-real-s3-2026-08-27.txt))
   — the probe script verbatim (its gap accounting is the definition),
   per-worker raw results, a recomputed summary, and the rejection
-  taxonomy.
+  taxonomy — and the 22-surface qualification verdict transcript with its
+  exact invocation
+  ([`qualify-transcript-real-s3-2026-08-27.txt`](./s3wal-bench-data/qualify-transcript-real-s3-2026-08-27.txt)).
 - Not checked in (~14 MiB): the SeaweedFS/SQLite cell-3 contention CSVs
   (up to ~335 k rows per SQLite cell). Regenerate with the cell-3 command
   above; per-cell summary statistics are in the table.
