@@ -333,7 +333,7 @@ func newS3WALStore(cs s3wal.ConditionalStore, probe func(ctx context.Context) er
 		now:             o.now,
 		sink:            o.claimSink,
 		casAttempts:     16,
-		backoffBase:     10 * time.Millisecond,
+		backoffBase:     25 * time.Millisecond, // §2.3: full-jitter 25ms→2s, ≤16 attempts — same pacing as the ref store (issue #181)
 		backoffCap:      2 * time.Second,
 		keyRefreshEvery: o.keyRefreshEvery,
 		refreshDone:     make(chan struct{}),

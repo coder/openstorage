@@ -187,7 +187,7 @@ func newStubbedS3(t *testing.T, transport *stubS3Transport, owner string) *S3 {
 	if err != nil {
 		t.Fatalf("open stub bucket: %v", err)
 	}
-	store := &S3{bucket: bucket, client: client, name: "owner-test", expectedOwner: owner}
+	store := &S3{bucket: bucket, client: client, name: "owner-test", region: "us-east-1", expectedOwner: owner}
 	t.Cleanup(func() { _ = store.Close() })
 	return store
 }
