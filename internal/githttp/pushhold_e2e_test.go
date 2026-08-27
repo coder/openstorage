@@ -13,6 +13,7 @@ import (
 	"context"
 	"crypto/sha1"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -23,6 +24,7 @@ import (
 	"time"
 
 	"github.com/coder/code-storage/internal/auth"
+	"github.com/coder/code-storage/internal/blob"
 	"github.com/coder/code-storage/internal/meta"
 	"github.com/coder/code-storage/internal/ref"
 )
@@ -999,12 +1001,13 @@ func TestServiceRPC_ReleasesPushHoldBeforeRepackTrigger(t *testing.T) {
 	repo := "t-hold-before-repack"
 	cacheDir := t.TempDir()
 	key, pemBlock := genKeyPEM(t, "ES256")
+	laneStore, laneBlob := openLaneStores(t)
 	// -1 = the trigger never ran.
 	var liveHolds atomic.Int64
 	liveHolds.Store(-1)
 	srv := &Server{
-		Store:    openTestRefStore(t),
-		Blob:     openTestBlob(t),
+		Store:    laneStore,
+		Blob:     laneBlob,
 		CacheDir: cacheDir,
 		Verifier: auth.NewVerifier(memKeys{testOrg: {pemBlock}}),
 		Org:      testOrg,
@@ -1096,5 +1099,135 @@ func TestPush_RefPathBudgetDeniesUnmaterializableName(t *testing.T) {
 	}
 	if !strings.Contains(out, "not updatable here") {
 		t.Fatalf("want the per-ref not-updatable denial, got:\n%.1500s", out)
+	}
+}
+
+// openLaneStores opens the SAME backend lane stores the TestMain-booted
+// environment (and therefore every hook subprocess, via
+// CODESTORAGE_PG_URL / CODESTORAGE_S3_URL) uses. In-process servers must
+// use these, NOT openTestRefStore/openTestBlob: those are per-test
+// isolated stores, and a server whose hydrate reads a different store
+// than its hooks write silently invalidates every cross-checking pin
+// (generation bumps, registered packs, and ref values would all diverge).
+func openLaneStores(t *testing.T) (ref.Store, blob.BlobStore) {
+	t.Helper()
+	st, err := ref.Open(context.Background(), dbURL)
+	if err != nil {
+		t.Fatalf("open lane ref store: %v", err)
+	}
+	t.Cleanup(st.Close)
+	bl, err := blob.Open(context.Background(), blobURL)
+	if err != nil {
+		t.Fatalf("open lane blob store: %v", err)
+	}
+	t.Cleanup(func() { _ = bl.Close() })
+	return st, bl
+}
+
+// countingRefStore counts paged ref scans; everything else forwards.
+// Wrapping deliberately hides optional capabilities (HydrateSnapshotter),
+// pinning hydration to the paged ListRefsAfter path on every lane.
+type countingRefStore struct {
+	ref.Store
+	listPages atomic.Int64
+}
+
+func (c *countingRefStore) ListRefsAfter(ctx context.Context, repo, after string, limit int) ([]ref.RefEntry, error) {
+	c.listPages.Add(1)
+	return c.Store.ListRefsAfter(ctx, repo, after, limit)
+}
+
+// TestHydrate_HeldSkipDoesNotRescanPerRequest (Codex round-22 security
+// P2 on #173): a sync that skipped a push-held ref publishes no
+// generation marker, so with a long hook-phase push holding a DIFFERING
+// ref (its CAS committed, its local update pending) every authenticated
+// advertisement re-ran the full paged authority scan — one no-pack push
+// plus advertisement spam sustained repository-scale store reads for the
+// push's whole duration. The held-generation marker coalesces them: the
+// scan's verdict is reusable until the generation, HEAD target, or the
+// live hold fingerprint changes, so each waiter no longer repeats the
+// scan while the held state is provably unchanged.
+func TestHydrate_HeldSkipDoesNotRescanPerRequest(t *testing.T) {
+	t.Setenv("CODESTORAGE_PG_URL", dbURL)
+	t.Setenv("CODESTORAGE_S3_URL", blobURL)
+	t.Setenv("CODESTORAGE_TEST_MODE", "1")
+	barrier := filepath.Join(t.TempDir(), "adv-barrier")
+	t.Setenv(EnvUpdateBarrier, barrier)
+
+	repo := "t-held-scan-coalesce"
+	cacheDir := t.TempDir()
+	key, pemBlock := genKeyPEM(t, "ES256")
+	laneStore, laneBlob := openLaneStores(t)
+	st := &countingRefStore{Store: laneStore}
+	srv := &Server{
+		Store:    st,
+		Blob:     laneBlob,
+		CacheDir: cacheDir,
+		Verifier: auth.NewVerifier(memKeys{testOrg: {pemBlock}}),
+		Org:      testOrg,
+		ResolveRepo: func(_ context.Context, base string) (meta.Repo, bool) {
+			if base != repo {
+				return meta.Repo{}, false
+			}
+			return meta.Repo{RepoID: repo, URL: repo, DefaultBranch: "main"}, true
+		},
+	}
+	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(ts.Close)
+
+	work := initWorkRepo(t)
+	token := mintUnitToken(t, key, "ES256", unitClaims(testOrg, repo, auth.ScopeGitRead, auth.ScopeGitWrite))
+	url := strings.Replace(ts.URL, "http://", "http://t:"+token+"@", 1) + "/" + repo + ".git"
+	adv := func() {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodGet, ts.URL+"/"+repo+".git/info/refs?service=git-upload-pack", nil)
+		if err != nil {
+			t.Fatalf("build advertisement request: %v", err)
+		}
+		req.SetBasicAuth("t", token)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("advertisement: %v", err)
+		}
+		defer resp.Body.Close()
+		if _, err := io.Copy(io.Discard, resp.Body); err != nil || resp.StatusCode != http.StatusOK {
+			t.Fatalf("advertisement: status %d, read err %v", resp.StatusCode, err)
+		}
+	}
+
+	// The push's held ref DIFFERS while paused: its hook committed the
+	// authority CAS (bumping the generation) and pauses at the barrier
+	// before git's local ref update.
+	done := make(chan error, 1)
+	go func() {
+		_, err := tryGit(work, "push", url, "HEAD:refs/heads/held")
+		done <- err
+	}()
+	waitForFile(t, barrier+".ready", 30*time.Second)
+
+	// First advertisement: full paged scan, skips the held ref.
+	adv()
+	first := st.listPages.Load()
+	if first == 0 {
+		t.Fatal("first advertisement ran no paged scan")
+	}
+	// Second advertisement: generation, HEAD, and holds unchanged — the
+	// held-skip verdict must be reused, not rescanned.
+	adv()
+	if got := st.listPages.Load(); got != first {
+		t.Fatalf("second advertisement rescanned (%d -> %d pages) with generation and holds unchanged", first, got)
+	}
+
+	if err := os.WriteFile(barrier+".release", nil, 0o644); err != nil {
+		t.Fatalf("release barrier: %v", err)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("push: %v", err)
+	}
+	// Holds released: the coalesced verdict is stale, the next
+	// advertisement rescans and heals into a normal marker.
+	adv()
+	if got := st.listPages.Load(); got == first {
+		t.Fatal("post-push advertisement must rescan once the hold is released")
 	}
 }

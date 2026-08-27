@@ -141,9 +141,10 @@ func EnsureCacheRepo(cacheDir, repo string) (string, error) {
 // non-executable hooks. Re-executed hook processes and restarted servers
 // start with an empty memo and always take the full pass.
 type cacheRepoMemo struct {
-	config     os.FileInfo
-	preReceive os.FileInfo
-	update     os.FileInfo
+	config      os.FileInfo
+	preReceive  os.FileInfo
+	update      os.FileInfo
+	postReceive os.FileInfo
 }
 
 // cacheRepoMemos maps cache repo paths to their verified fingerprints, one
@@ -153,17 +154,18 @@ type cacheRepoMemo struct {
 var cacheRepoMemos sync.Map // map[string]cacheRepoMemo
 
 // memoFiles pairs each fingerprint with the path it must still match.
-func (m cacheRepoMemo) memoFiles(repoPath string) [3]struct {
+func (m cacheRepoMemo) memoFiles(repoPath string) [4]struct {
 	fi   os.FileInfo
 	path string
 } {
-	return [3]struct {
+	return [4]struct {
 		fi   os.FileInfo
 		path string
 	}{
 		{m.config, filepath.Join(repoPath, "config")},
 		{m.preReceive, filepath.Join(repoPath, "hooks", "pre-receive")},
 		{m.update, filepath.Join(repoPath, "hooks", "update")},
+		{m.postReceive, filepath.Join(repoPath, "hooks", "post-receive")},
 	}
 }
 
@@ -380,6 +382,7 @@ func EnsureCacheRepoCtx(ctx context.Context, cacheDir, repo string) (string, err
 	}{
 		{"pre-receive", &memo.preReceive},
 		{"update", &memo.update},
+		{"post-receive", &memo.postReceive},
 	} {
 		script := fmt.Sprintf(hookScript, self, hook.name)
 		fi, err := ensureHook(filepath.Join(hooksDir, hook.name), script)
@@ -1281,26 +1284,16 @@ func mintPushHold(repoPath string) (string, error) {
 	return filepath.Abs(filepath.Join(dir, "push-"+hex.EncodeToString(buf[:])))
 }
 
-// pushHoldExpired reports whether a hold (or sidecar) mtime is outside
-// the live window. Past the TTL is the ordinary crash leak; a far-FUTURE
-// mtime is the same leak resurrected across a backward clock jump — a VM
-// snapshot restore of a crashed in-flight push (Codex round-21 P2 on
-// #173): a negative age would otherwise extend the lease until wall time
-// caught up and then advanced another full TTL, blocking same-name and
-// D/F-relative pushes far past the stated crash-leak bound. Live pushes
-// tolerate the symmetric bound: their refreshers re-touch with CURRENT
-// time every pushHoldTTL/4, so after a backward jump a live hold looks
-// future-dated for at most one refresh tick before its lease looks
-// ordinary again.
-func pushHoldExpired(mtime time.Time) bool {
-	age := time.Since(mtime)
-	return age > pushHoldTTL || age < -pushHoldTTL
-}
-
-// sweepExpiredPushHolds removes hold files outside the live window —
-// leaks from a crashed serve process (the normal cleanup is the request's
-// deferred remove). Best-effort: readers already ignore expired files;
-// this only bounds directory growth.
+// sweepExpiredPushHolds removes hold files past the TTL — leaks from a
+// crashed serve process (the normal cleanup is post-receive plus the
+// request's release). Best-effort: readers already ignore expired files;
+// this only bounds directory growth. Far-FUTURE mtimes (the wall clock
+// stepped backward beneath the file — under a LIVE push, or a crash leak
+// restored from a VM snapshot) are HEALED to now, never deleted (Codex
+// round-21 P2, round-22 P1): a live push's file must not be yanked out
+// from under its refresher, and from the clamp a leak ages out within
+// one TTL of first observation instead of waiting for wall time to
+// catch up.
 func sweepExpiredPushHolds(dir string) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -1308,9 +1301,16 @@ func sweepExpiredPushHolds(dir string) {
 	}
 	for _, e := range entries {
 		info, err := e.Info()
-		if err == nil && pushHoldExpired(info.ModTime()) {
+		if err != nil {
+			continue
+		}
+		switch age := time.Since(info.ModTime()); {
+		case age > pushHoldTTL:
 			// RemoveAll: unreserved sidecars are directories.
 			_ = os.RemoveAll(filepath.Join(dir, e.Name()))
+		case age < -pushHoldTTL:
+			now := time.Now()
+			_ = os.Chtimes(filepath.Join(dir, e.Name()), now, now)
 		}
 	}
 }
@@ -1477,9 +1477,19 @@ func (c *pushHoldDirCache) load() (pushHoldSet, error) {
 		}
 		// The TTL check runs on every load — expiry is time-driven, not
 		// change-driven — so an expired hold drops out of the set on the
-		// next poll even though its file never changed.
-		if pushHoldExpired(info.ModTime()) {
+		// next poll even though its file never changed. A far-FUTURE
+		// mtime means the wall clock stepped backward beneath the file —
+		// under a LIVE push, or a crash leak restored from a VM snapshot
+		// (Codex round-21 P2, round-22 P1): heal it to now and keep the
+		// hold LIVE — dropping a live push's reservation reopens the D/F
+		// pair race until its next refresher tick — so a leak still ages
+		// out within one TTL of first observation instead of waiting for
+		// wall time to catch up.
+		if age := time.Since(info.ModTime()); age > pushHoldTTL {
 			continue
+		} else if age < -pushHoldTTL {
+			now := time.Now()
+			_ = os.Chtimes(path, now, now)
 		}
 		parse, ok := c.files[path]
 		if !ok || parse.size != info.Size() || parse.mtime != info.ModTime().UnixNano() {
@@ -1728,6 +1738,92 @@ func readGenerationMarker(repoPath string) (gen int64, head string, fresh bool, 
 	return gen, head, time.Since(fi.ModTime()) < generationMarkerTTL, true
 }
 
+// heldGenerationMarker is the held-skip variant of the generation marker
+// (Codex round-22 security P2 on #173): a sync that skipped push-held
+// refs must not publish the NORMAL marker (its held refs were never
+// applied), but suppressing every marker made each subsequent
+// authenticated advertisement repeat the full paged authority scan for
+// the whole life of the push — one long hook-phase no-pack push plus
+// advertisement spam sustained repository-scale store reads. The held
+// marker records the scan's generation, HEAD target, and a fingerprint
+// of the exact live holds it skipped under; while all three are
+// unchanged a re-scan could only reproduce the same verdicts, so hydrate
+// serves the cache as-is. Any hold release, append, refresher touch, or
+// expiry changes the fingerprint and forces the healing re-scan the
+// suppression exists for.
+const heldGenerationMarker = "codestorage.generation.held"
+
+// livePushHoldsKey fingerprints the repo's live push holds (path, size,
+// mtime of every unexpired hold file, hashed). ok=false on a read error
+// — callers must then neither publish nor honor a held marker.
+func livePushHoldsKey(repoPath string) (string, bool) {
+	c := &pushHoldDirCache{dir: filepath.Join(repoPath, pushHoldDir)}
+	if _, err := c.load(); err != nil {
+		return "", false
+	}
+	sum := sha256.Sum256([]byte(c.setKey))
+	return hex.EncodeToString(sum[:]), true
+}
+
+// readHeldGenerationMarker mirrors readGenerationMarker for the held
+// variant, additionally returning the recorded hold fingerprint.
+func readHeldGenerationMarker(repoPath string) (gen int64, head, holdsKey string, fresh bool, ok bool) {
+	path := filepath.Join(repoPath, heldGenerationMarker)
+	fi, err := os.Stat(path)
+	if err != nil {
+		return 0, "", "", false, false
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return 0, "", "", false, false
+	}
+	fields := strings.Fields(strings.TrimSpace(string(b)))
+	if len(fields) != 3 {
+		return 0, "", "", false, false
+	}
+	gen, perr := strconv.ParseInt(fields[0], 10, 64)
+	head, holdsKey = fields[1], fields[2]
+	if perr != nil || gen < 0 || !strings.HasPrefix(head, "refs/") || holdsKey == "" {
+		return 0, "", "", false, false
+	}
+	return gen, head, holdsKey, time.Since(fi.ModTime()) < generationMarkerTTL, true
+}
+
+// heldMarkerValid reports whether a held-skip verdict covers the current
+// state: same generation, same HEAD target, fresh, and the live hold
+// fingerprint is exactly the one the recorded scan ran under — then
+// every skip verdict still stands and a re-scan could only reproduce it.
+func heldMarkerValid(repoPath string, gen int64, headTarget string) bool {
+	hgen, hhead, hkey, fresh, ok := readHeldGenerationMarker(repoPath)
+	if !ok || !fresh || hgen != gen || hhead != headTarget {
+		return false
+	}
+	key, kok := livePushHoldsKey(repoPath)
+	return kok && key == hkey
+}
+
+// writeHeldGenerationMarker persists the held-skip verdict via temp file
+// + rename, like writeGenerationMarker. Best-effort: a lost write only
+// costs the next hydrate a re-scan.
+func writeHeldGenerationMarker(repoPath string, gen int64, head, holdsKey string) {
+	assertf(gen >= 0, "writeHeldGenerationMarker: negative generation %d", gen)
+	assertf(strings.HasPrefix(head, "refs/"), "writeHeldGenerationMarker: unqualified HEAD target %q", head)
+	assertf(holdsKey != "", "writeHeldGenerationMarker: empty holds key")
+	tmp, err := os.CreateTemp(repoPath, heldGenerationMarker+".tmp-*")
+	if err != nil {
+		return
+	}
+	defer func() { _ = os.Remove(tmp.Name()) }() // no-op after a successful rename
+	if _, err := fmt.Fprintf(tmp, "%d %s %s\n", gen, head, holdsKey); err != nil {
+		_ = tmp.Close()
+		return
+	}
+	if err := tmp.Close(); err != nil {
+		return
+	}
+	_ = os.Rename(tmp.Name(), filepath.Join(repoPath, heldGenerationMarker))
+}
+
 // writeGenerationMarker persists gen via temp file + rename: concurrent
 // hydrators and re-exec'd hook processes share the cache dir, and a reader
 // must never see a torn write (a crash mid-write leaves only a temp file).
@@ -1749,7 +1845,10 @@ func writeGenerationMarker(repoPath string, gen int64, head string) {
 	if err := tmp.Close(); err != nil {
 		return
 	}
-	_ = os.Rename(tmp.Name(), filepath.Join(repoPath, generationMarker))
+	if err := os.Rename(tmp.Name(), filepath.Join(repoPath, generationMarker)); err == nil {
+		// A full success supersedes any held-skip verdict.
+		_ = os.Remove(filepath.Join(repoPath, heldGenerationMarker))
+	}
 }
 
 // Hydrate rebuilds the cache repo state for repo from PG + S3 (the stateless
@@ -1821,6 +1920,9 @@ func Hydrate(ctx context.Context, st ref.RefStore, bl blob.BlobStore, cacheDir, 
 	if markerGen, markerHead, fresh, ok := readGenerationMarker(repoPath); ok && fresh && markerGen == gen && markerHead == headTarget {
 		return repoPath, nil, nil
 	}
+	if heldMarkerValid(repoPath, gen, headTarget) {
+		return repoPath, nil, nil
+	}
 	// Full-sync critical section. The lock file is left in place, like the
 	// per-pack locks: removing it would race a concurrent locker onto a
 	// deleted inode. Lock order is repo hydrate lock -> per-pack locks;
@@ -1845,6 +1947,9 @@ func Hydrate(ctx context.Context, st ref.RefStore, bl blob.BlobStore, cacheDir, 
 		return "", nil, err
 	}
 	if markerGen, markerHead, fresh, ok := readGenerationMarker(repoPath); ok && fresh && markerGen == gen && markerHead == headTarget {
+		return repoPath, nil, nil
+	}
+	if heldMarkerValid(repoPath, gen, headTarget) {
 		return repoPath, nil, nil
 	}
 	if snap != nil {
@@ -1884,6 +1989,11 @@ func Hydrate(ctx context.Context, st ref.RefStore, bl blob.BlobStore, cacheDir, 
 	if snap != nil {
 		newStore = func() refSeq { return &entryRefSeq{refs: snap.Refs} }
 	}
+	// Fingerprint the live holds BEFORE the scan: a held-skip verdict is
+	// reusable only if the holds were stable across the WHOLE scan (an
+	// early flush's skip under a hold released mid-scan would otherwise
+	// be vouched for by a fingerprint that still matches).
+	preHoldsKey, preHoldsOK := livePushHoldsKey(repoPath)
 	for attempt := 0; attempt < 3; attempt++ {
 		if skippedHeld, refsErr = syncRefsStreamed(ctx, repoPath, headTarget, newStore, syncRefsBatch); refsErr == nil {
 			break
@@ -1911,6 +2021,16 @@ func Hydrate(ctx context.Context, st ref.RefStore, bl blob.BlobStore, cacheDir, 
 		// fresh marker for a whole TTL. No marker — the next hydrate
 		// full-syncs again and heals the ref once the hold clears.
 		writeGenerationMarker(repoPath, gen, headTarget)
+	} else if refsErr == nil && skippedHeld && preHoldsOK {
+		// Held-skip verdict (Codex round-22 security P2, see
+		// heldGenerationMarker): reusable by later hydrates while the
+		// generation, HEAD target, and the exact hold fingerprint are
+		// unchanged — but only when the holds were provably stable
+		// across the scan (pre == post), else fall back to the
+		// pre-existing no-marker behavior.
+		if postHoldsKey, ok := livePushHoldsKey(repoPath); ok && postHoldsKey == preHoldsKey {
+			writeHeldGenerationMarker(repoPath, gen, headTarget, postHoldsKey)
+		}
 	}
 	return repoPath, refsErr, nil
 }

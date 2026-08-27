@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -133,9 +134,36 @@ func RunHook(ctx context.Context, args []string) error {
 		return preReceive(ctx)
 	case "update":
 		return updateHook(ctx, args[1:])
+	case "post-receive":
+		return postReceiveHook()
 	default:
 		return fmt.Errorf("unknown hook %q", args[0])
 	}
+}
+
+// postReceiveHook releases the push's ref holds (Codex round-22 P2 on
+// #173): git runs post-receive exactly when the local ref transaction
+// has completed — the event the holds protect — and strictly BEFORE the
+// per-ref report-status writes, whose delivery a non-reading client can
+// stall indefinitely (production serves without a write timeout, and the
+// handler's cmd.Wait blocks on the response copy, so its release can be
+// deferred arbitrarily by the client). The handler's own release stays
+// as the fallback for pushes git never runs post-receive for (nothing
+// updated). Best-effort: a failed removal leaves the TTL machinery the
+// bound, and the hook never fails the push (git ignores post-receive's
+// exit status for the ref outcome anyway).
+func postReceiveHook() error {
+	// Drain the updated-ref list git feeds on stdin (unused): exiting
+	// with the pipe unread risks EPIPE noise on receive-pack's side.
+	_, _ = io.Copy(io.Discard, os.Stdin)
+	holdPath := os.Getenv(EnvPushHold)
+	if holdPath == "" {
+		return nil
+	}
+	_ = os.Remove(holdPath)
+	_ = os.RemoveAll(holdPath + pushHoldUnreservedSuffix)
+	_ = os.RemoveAll(holdPath + pushHoldVerifiedSuffix)
+	return nil
 }
 
 type refCommand struct{ old, new, ref string }

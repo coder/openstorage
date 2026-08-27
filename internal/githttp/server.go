@@ -994,15 +994,16 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 		// Push hold (issue #170): the file this push's update hooks record
 		// their in-flight refs in, so concurrent full syncs skip those refs
 		// until receive-pack has performed its own local ref updates. The
-		// explicit releasePushHold calls below run strictly after
-		// cmd.Wait/cmd.Run, BEFORE the synchronous repack trigger (Codex
-		// round-19 P2: the trigger may take seconds — a ListPacks against
-		// shared storage plus enqueue — the same order as
-		// pushHoldWaitMax, so a hold surviving into it times out
-		// concurrent same-name or D/F-relative pushes that no longer race
-		// anything); the deferred call is the early-return fallback
-		// (removal is idempotent), and the TTL machinery covers crash
-		// leaks.
+		// PRIMARY release is the post-receive hook (Codex round-22 P2:
+		// it runs the moment the local ref transaction completes,
+		// independent of response delivery — cmd.Wait below blocks on
+		// the stdout copy into the client, which a non-reading client
+		// can stall indefinitely). The explicit releasePushHold calls
+		// after cmd.Wait/cmd.Run stay as the fallback for pushes git
+		// never runs post-receive for (nothing updated), placed BEFORE
+		// the repack trigger (Codex round-19 P2); the deferred call
+		// covers early returns (removal is idempotent), and the TTL
+		// machinery covers crash leaks.
 		holdPath, err := mintPushHold(repoPath)
 		if err != nil {
 			log.Printf("%s %s: push hold: %v", service, repo, err)

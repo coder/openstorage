@@ -1060,18 +1060,17 @@ func TestPushRefPathTooLong(t *testing.T) {
 	}
 }
 
-// TestPushHolds_FutureDatedHoldExpires (Codex round-21 P2 on #173): a
-// hold file resurrected across a backward clock jump — a VM snapshot
-// restore of a crashed in-flight push — carries an mtime in the FUTURE.
-// A negative age must not extend the lease: readers would treat the leak
-// as live and the mint-time sweeper would never remove it, blocking every
-// same-name or D/F-relative push until wall time catches up and then
-// advances another full TTL — far past the stated crash-leak bound. Both
-// the reader and the sweeper must treat far-future mtimes as expired.
-// Live pushes tolerate the symmetric bound: their refreshers re-touch
-// with CURRENT time every pushHoldTTL/4, so after a backward jump a live
-// hold looks future-dated for at most one refresh tick.
-func TestPushHolds_FutureDatedHoldExpires(t *testing.T) {
+// TestPushHolds_FutureDatedHoldClampedLive (Codex round-21 P2 and
+// round-22 P1 on #173): a far-future hold mtime means the wall clock
+// stepped backward beneath it — under a LIVE push (whose reservation
+// must never lapse: dropping it reopens the D/F pair race until the next
+// refresher tick) or as a crash leak restored from a VM snapshot (whose
+// lease must not extend until wall time catches up). Readers and the
+// sweeper therefore CLAMP a far-future mtime to now and keep the hold
+// live: a live push loses nothing, and a leak ages out within one TTL of
+// first observation — the crash-leak bound, via the clamp instead of
+// instant expiry. Near-future mtimes (ordinary skew) stay live untouched.
+func TestPushHolds_FutureDatedHoldClampedLive(t *testing.T) {
 	repoDir := t.TempDir()
 	hold, err := mintPushHold(repoDir)
 	if err != nil {
@@ -1081,27 +1080,41 @@ func TestPushHolds_FutureDatedHoldExpires(t *testing.T) {
 		t.Fatalf("write hold: %v", err)
 	}
 	holdDir := filepath.Join(repoDir, pushHoldDir)
-	set, err := readPushHolds(holdDir, "")
-	if err != nil || !set.contains("refs/heads/x") {
-		t.Fatalf("fresh hold must be live: set=%v err=%v", set, err)
-	}
 	future := time.Now().Add(pushHoldTTL + time.Minute)
 	if err := os.Chtimes(hold, future, future); err != nil {
 		t.Fatalf("chtimes: %v", err)
 	}
-	set, err = readPushHolds(holdDir, "")
+	set, err := readPushHolds(holdDir, "")
 	if err != nil {
 		t.Fatalf("readPushHolds: %v", err)
 	}
-	if set.contains("refs/heads/x") {
-		t.Fatal("future-dated hold treated as live by the reader (negative age extends the lease)")
+	if !set.contains("refs/heads/x") {
+		t.Fatal("future-dated hold dropped by the reader: a live push's reservation lapsed on a backward clock step")
+	}
+	fi, err := os.Stat(hold)
+	if err != nil {
+		t.Fatalf("stat hold: %v", err)
+	}
+	if age := time.Since(fi.ModTime()); age < 0 || age > time.Minute {
+		t.Fatalf("future mtime not clamped to now (age %v): the leak's lease would outlive the TTL bound", age)
+	}
+	// From the clamp the hold ages NORMALLY: past the TTL it expires for
+	// readers and the sweeper alike (the round-21 crash-leak bound).
+	past := time.Now().Add(-pushHoldTTL - time.Minute)
+	if err := os.Chtimes(hold, past, past); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
+	set, err = readPushHolds(holdDir, "")
+	if err != nil || set.contains("refs/heads/x") {
+		t.Fatalf("expired hold still live: set=%v err=%v", set, err)
 	}
 	sweepExpiredPushHolds(holdDir)
 	if _, err := os.Stat(hold); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("future-dated hold survived the sweep: %v", err)
+		t.Fatalf("expired hold survived the sweep: %v", err)
 	}
-	// Just inside the future bound stays live: refresher touches from a
-	// marginally fast clock must not expire a running push's hold.
+	// The sweeper clamps future-dated files rather than deleting them: a
+	// crashed push's leak dies one TTL later; a live push's file is
+	// never yanked out from under its refresher.
 	hold2, err := mintPushHold(repoDir)
 	if err != nil {
 		t.Fatalf("mintPushHold: %v", err)
@@ -1109,6 +1122,18 @@ func TestPushHolds_FutureDatedHoldExpires(t *testing.T) {
 	if err := os.WriteFile(hold2, []byte("refs/heads/y\n"), 0o644); err != nil {
 		t.Fatalf("write hold: %v", err)
 	}
+	if err := os.Chtimes(hold2, future, future); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
+	sweepExpiredPushHolds(holdDir)
+	fi2, err := os.Stat(hold2)
+	if err != nil {
+		t.Fatalf("future-dated hold deleted by the sweep (must be clamped): %v", err)
+	}
+	if age := time.Since(fi2.ModTime()); age < 0 || age > time.Minute {
+		t.Fatalf("sweep did not clamp the future mtime (age %v)", age)
+	}
+	// Near-future skew (inside the TTL) is left untouched and live.
 	near := time.Now().Add(pushHoldTTL / 2)
 	if err := os.Chtimes(hold2, near, near); err != nil {
 		t.Fatalf("chtimes: %v", err)
@@ -1116,5 +1141,49 @@ func TestPushHolds_FutureDatedHoldExpires(t *testing.T) {
 	set, err = readPushHolds(holdDir, "")
 	if err != nil || !set.contains("refs/heads/y") {
 		t.Fatalf("near-future hold must stay live: set=%v err=%v", set, err)
+	}
+	fi2b, err := os.Stat(hold2)
+	if err != nil || !fi2b.ModTime().Equal(near) {
+		t.Fatalf("near-future mtime must stay untouched: %v (%v)", fi2b.ModTime(), err)
+	}
+}
+
+// TestRunHook_PostReceiveReleasesHold (Codex round-22 P2 on #173): the
+// push hold protects receive-pack's LOCAL ref transaction, and git's
+// post-receive hook runs exactly when that transaction has completed —
+// strictly before the per-ref report-status writes whose delivery a
+// non-reading client can stall indefinitely (no server write timeout).
+// Releasing in post-receive decouples the hold lifetime from
+// client-controlled response drainage; the handler's own release stays
+// as the fallback for pushes where git skips post-receive (no ref
+// updated).
+func TestRunHook_PostReceiveReleasesHold(t *testing.T) {
+	repoDir := t.TempDir()
+	hold, err := mintPushHold(repoDir)
+	if err != nil {
+		t.Fatalf("mintPushHold: %v", err)
+	}
+	if err := os.WriteFile(hold, []byte("refs/heads/x\n"), 0o644); err != nil {
+		t.Fatalf("write hold: %v", err)
+	}
+	if err := os.MkdirAll(hold+pushHoldUnreservedSuffix, 0o755); err != nil {
+		t.Fatalf("mkdir sidecar: %v", err)
+	}
+	if err := os.WriteFile(hold+pushHoldVerifiedSuffix, []byte("digest"), 0o600); err != nil {
+		t.Fatalf("write sidecar: %v", err)
+	}
+	t.Setenv(EnvPushHold, hold)
+	if err := RunHook(context.Background(), []string{"post-receive"}); err != nil {
+		t.Fatalf("post-receive hook: %v", err)
+	}
+	for _, p := range []string{hold, hold + pushHoldUnreservedSuffix, hold + pushHoldVerifiedSuffix} {
+		if _, err := os.Stat(p); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("post-receive left %s in place: %v", p, err)
+		}
+	}
+	// Hookless invocation (no hold env): a clean no-op.
+	t.Setenv(EnvPushHold, "")
+	if err := RunHook(context.Background(), []string{"post-receive"}); err != nil {
+		t.Fatalf("post-receive without a hold env: %v", err)
 	}
 }
