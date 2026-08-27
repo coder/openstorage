@@ -501,16 +501,19 @@ it is a deliberate single-node design:
 If any of these bind, use local mode (SQLite on a persistent volume) or the Postgres
 topology above. Small single-tenant deployments — the target — sit far below them.
 
-**Measured boundaries** — from the recorded benchmark campaign
-([full method and tables](../plans/s3wal-bench-results.md)). All numbers are
-**loopback SeaweedFS** on one host; real-S3 qualification is pending, and a real
-client adds its own network RTT to every number equally:
+**Measured boundaries** — from the recorded benchmark campaigns
+([full method and tables](../plans/s3wal-bench-results.md)): loopback SeaweedFS
+plus a real AWS S3 campaign (eu-central-1, near-same-region compute; the
+qualification suite passed all surfaces against real S3):
 
-- An uncontended small `git push` end-to-end costs ~26 ms (+23%) over local mode
-  (138 vs 112 ms p50) — the backend is a minority of the push path on both.
-- One hot repository saturates around 27 pushes/s at 32 concurrent writers, with a
-  seconds-long p99 tail (5.8 s vs local mode's 2.8 s) — the one-CAS-point-per-group
-  boundary in practice. Distinct repositories do not contend.
+- An uncontended small `git push` end-to-end costs ~26 ms (+23%) over local mode on
+  loopback (138 vs 112 ms p50). On **real S3** the same push costs ~1.1 s p50 vs
+  ~0.4 s for a Postgres+S3 node against the same bucket region — the zero-infra
+  tradeoff is ~2.8× per push at real RTT, dominated by sequential S3 round trips.
+- One hot repository group sustains ~27 successful manifest CAS advances/s on real
+  S3 regardless of writer count (the one-CAS-point-per-group ceiling; adding
+  writers adds lost races, not throughput), with seconds-long p99 push tails under
+  sustained multi-writer hammering. Distinct repositories do not contend.
 - Contention exhaustion surfaces to the client as a clean, git-native hook rejection
   naming the exhausted retry budget (`s3wal cas ref repo_…: 16 attempts: s3wal:
   conditional-write contention retries exhausted`), never a hang.

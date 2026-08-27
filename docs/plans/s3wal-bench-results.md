@@ -8,15 +8,21 @@ at the Phase 3 merge commit, plus the new **full push-path e2e benchmark**
 recorded run of the in-tree harnesses; the exact command is stated next to
 each table. Raw per-op CSVs for the fixed-op and push-path cells are checked
 in under [`s3wal-bench-data/`](./s3wal-bench-data/) (175 KiB); the
-contention-cell CSVs are too large to commit (~14 MiB) and are regenerable
-with the commands below.
+SeaweedFS/SQLite contention-cell CSVs are too large to commit (~14 MiB)
+and are regenerable with the commands below; the real-S3 contention CSVs
+are small and checked in.
 
-**The real-S3 column is blocked: credentials pending.** No usable AWS
-credentials exist in this environment at reporting time (the SSO credentials
-are expired; the `CODESTORAGE_BENCH_S3_URL` lane skips cleanly — visible as
-`--- SKIP: BenchmarkHotRepoContention/store=s3/...` in the transcripts). No
-real-S3 cell below claims a result. Per plan §4: **Gate 1a-B is not
-evaluated — provisionally continue; real-S3 gate blocked.**
+**Real-S3 columns recorded 2026-08-27** (Gate 1a-B unblocked: temporary
+IAM Identity Center credentials, AWS S3 eu-central-1, a fresh dedicated
+unversioned bucket created for the campaign and deleted afterward). The
+qualification lane (`TestQualifyExternalEndpoint`) passed all 22 surfaces
+in require mode against the same bucket before any benchmark ran.
+Kill-threshold evaluation and the Gate 1a-B verdict are below; summary:
+**no kill criterion is met** — thresholds (2) and (4) pass with wide
+margins, (3)'s throughput/scaling arms pass, and (3)'s 30 s starvation arm
+trips only in the harness's synthetic no-backoff regime, not in a
+production-shape probe with real git pushers (see the cell 3 note and
+issue [#181](https://github.com/coder/code-storage/issues/181)).
 
 ## Environment
 
@@ -29,7 +35,7 @@ evaluated — provisionally continue; real-S3 gate blocked.**
 | git (client + serve cache) | 2.55.0 |
 | Docker | 27.5.1, testcontainers-go v0.44.0 |
 | SeaweedFS image | `chrislusf/seaweedfs:4.42` — `weed server -s3 -dir=/data -ip.bind=0.0.0.0`, S3 gateway on 8333, static-identity SigV4 auth, versioning + object-lock never enabled |
-| Real S3 | **blocked: credentials pending** |
+| Real S3 | AWS S3 eu-central-1 (recorded 2026-08-27 at commit `52ea5c02` + PR #180's boot fix; fresh dedicated bucket, versioning/object-lock never enabled, `CODESTORAGE_S3_EXPECTED_BUCKET_OWNER` set, deleted after the campaign). Compute: same EPYC host, ~7 ms HTTP round trip to `s3.eu-central-1.amazonaws.com` — near-same-region for plan §3 purposes |
 
 Method notes (plan §3 falsifiability):
 
@@ -49,6 +55,9 @@ Method notes (plan §3 falsifiability):
   the independent Phase 1a campaign (2026-08-25, see
   [`s3wal-phase1a-results.md`](./s3wal-phase1a-results.md)) where cells
   overlap, and the new nightly lane (below) produces an ongoing series.
+  The 2026-08-27 real-S3 columns are likewise a single-day run on
+  short-lived credentials; a promote decision (not on the table today)
+  should re-run them on separate days per the method.
 
 ## §3 cells 1–5 (microbench harness, `internal/ref/s3wal/bench_test.go`)
 
@@ -72,7 +81,8 @@ CODESTORAGE_BENCH_CONTENTION_SECS=60 CODESTORAGE_BENCH_CSV_DIR=… \
 | SeaweedFS, 1 KB | 2.21 ms | 2.42 ms | 2.82 ms | 300 |
 | SeaweedFS, 1 MB | 23.66 ms | 26.41 ms | 27.58 ms | 300 |
 | SQLite (CASRef analog) | 0.36 ms | 0.44 ms | 0.54 ms | 300 |
-| real S3 | blocked: credentials pending | | | |
+| real S3, 1 KB | 36.21 ms | 42.62 ms | 58.55 ms | 300 |
+| real S3, 1 MB | 49.78 ms | 60.50 ms | 84.19 ms | 300 |
 
 ### Cell 2 — simulated push (manifest GET + 8 MiB pack PUT + 2 CAS advances)
 
@@ -80,7 +90,7 @@ CODESTORAGE_BENCH_CONTENTION_SECS=60 CODESTORAGE_BENCH_CSV_DIR=… \
 |---|---|---|---|
 | SeaweedFS | 98.14 ms | 116.6 ms | 200 |
 | SQLite (+ 8 MiB fsynced local file; durability asymmetry — local disk vs S3 PUT) | 12.29 ms | 34.49 ms | 200 |
-| real S3 | blocked: credentials pending | | |
+| real S3 | 203.6 ms | 255.0 ms | 200 |
 
 ### Cell 3 — hot-repo contention (60 s sustained per N; doubles as the lost-update detector)
 
@@ -96,12 +106,34 @@ violations in every cell.**
 | SQLite, N=2 | 0.16 ms | 0.38 ms | 5,575 | 335,081 | 27 | 3 | 8.2 s |
 | SQLite, N=8 | 0.16 ms | 0.40 ms | 5,546 | 333,311 | 229 | 28 | 11.3 s |
 | SQLite, N=32 | 0.16 ms | 0.48 ms | 5,337 | 320,841 | 1,061 | 116 | 15.5 s |
-| real S3 | blocked: credentials pending | | | | | | |
+| real S3, N=2 | 37.22 ms | 78.23 ms | 26.21 | 1,575 | 1,014 | 0 | 9.6 s |
+| real S3, N=8 | 35.88 ms | 6,018 ms | 27.45 | 1,648 | 7,531 | 0 | 56.4 s |
+| real S3, N=32 | 35.77 ms | 16,942 ms | 27.59 | 1,657 | 34,092 | 0 | 60.0 s |
 
 Consistent with Phase 1a (SeaweedFS 553/655/478 adv/s then; 576/655/465
 now). SQLite's higher per-writer starvation (8–15 s vs SeaweedFS's ≤ 1.9 s)
 is the same fairness artifact recorded there: the file lock favors the
 writer that just released it.
+
+**Real-S3 regime note (starvation column).** The single-manifest CAS
+ceiling on real S3 is ~27 adv/s at every N — flat from N=2 to N=32 (one
+~36 ms conditional PUT at a time), zero conditional-write contention
+errors, zero ambiguous outcomes, and the exactly-once detector clean. The
+max-starve column, however, is dominated by the runner's synthetic regime:
+it retries without the §2.3 backoff the plan's cell definition names, and
+the current winner chains advances from its local copy without a re-read —
+so on a ~36 ms-PUT store the winner streaks at wire speed while every
+loser pays GET+PUT against an already-stale ETag. In the raw CSVs, 97–98%
+of all wins land < 60 ms after the same worker's previous win across all
+three N. No production pusher has that shape (the real path re-reads the
+manifest per attempt, does pack/hook work between pushes, and surfaces a
+clean rejection after its 16-attempt budget instead of spinning). A
+production-shape probe against the same bucket — 8 concurrent real
+`git push` workers on one repo group for 60 s through a live serve node —
+showed every pusher progressing continuously: 16–24 wins each, worst
+inter-success gap **21.9 s**, 160 pushes total, 35 clean retryable
+rejections (the known #170 stale-advertisement family). Harness fix
+tracked in [#181](https://github.com/coder/code-storage/issues/181).
 
 ### Cell 4 — generation-read latency
 
@@ -110,7 +142,8 @@ writer that just released it.
 | SeaweedFS, unconditional GET | 0.83 ms | 1.23 ms | 300 |
 | SeaweedFS, If-None-Match 304 | 0.69 ms | 1.14 ms | 300 |
 | SQLite, GetRef | 0.010 ms | 0.016 ms | 300 |
-| real S3 | blocked: credentials pending | | |
+| real S3, unconditional GET | 28.80 ms | 48.94 ms | 300 |
+| real S3, If-None-Match 304 | 14.51 ms | 20.12 ms | 300 |
 
 ### Cell 5 — SQLite baseline
 
@@ -281,37 +314,85 @@ data loss (the authority has the commit; a retry fast-forwards); the client
 sees a spurious `[remote rejected]`. Recorded here as a finding for triage;
 the bench tolerates and counts these like any rejection.
 
-## Kill-threshold evaluation (plan §3)
+## Kill-threshold evaluation (plan §3) — real S3, eu-central-1, 2026-08-27
 
-Thresholds (2), (3), and (4) are **defined against real S3 from same-region
-compute and cannot be evaluated in this campaign** (Gate 1a-B blocked).
-SeaweedFS-loopback numbers are quoted as directional evidence only:
-
-- **(2)** simulated-push p50 > 500 ms / p99 > 2 s *(real S3 only — not
-  evaluable)*: SeaweedFS-local measured p50 98 ms / p99 117 ms.
-- **(3)** N=8 aggregate < 3 adv/s or > 30 s starvation; N=32 collapse below
-  N=8 or unbounded retries *(real S3 only — not evaluable)*: SeaweedFS-local
-  N=8 measured 654.7 adv/s, max starve 1.3 s — orders of magnitude clear.
-  At N=32 throughput dropped to 465.0 adv/s, below the N=8 figure on this
-  loopback setup (same shape as Phase 1a: 478.5 vs 654.8) with retries
-  growing but bounded (~19 lost races per win, zero retry-budget
-  exhaustions in the microbench; 1 clean rejection in 60 s in the e2e
-  bench). Whether that constitutes "throughput collapse" must be judged on
-  real S3, where the RTT-to-contention-window ratio differs completely.
-- **(4)** 304-path p99 > 100 ms *(real S3 only — not evaluable)*:
-  SeaweedFS-local measured 1.14 ms.
+- **(2)** simulated-push p50 > 500 ms / p99 > 2 s: measured **p50
+  203.6 ms / p99 255.0 ms** — passes with ~2.5×/7.8× margin.
+  (SeaweedFS-local directional figures: 98/117 ms.)
+- **(3)** N=8 aggregate < 3 adv/s or > 30 s starvation; N=32 collapse
+  below N=8 or unbounded retries:
+  - *Throughput:* N=8 measured **27.45 adv/s** — 9× above the kill line.
+    N=32 measured **27.59 adv/s** — no collapse (the single-manifest CAS
+    ceiling is flat at ~27 adv/s for every N; adding writers adds lost
+    races, not throughput loss).
+  - *Retries:* lost races grow proportionally with writers (1,014 →
+    7,531 → 34,092 for N=2/8/32) with zero conditional-write contention
+    errors and zero ambiguous outcomes — bounded racing, not livelock.
+  - *Starvation:* the harness metric reads **56.4 s at N=8, above the
+    30 s line as written** — but the runner measures a regime the
+    threshold was not written against: no §2.3 backoff plus a
+    winner-chaining optimization no production pusher has (97–98% of wins
+    arrive < 60 ms after the same worker's previous win; see the cell 3
+    regime note). The production-shape probe (8 concurrent real
+    `git push` workers, one repo group, 60 s, live serve node, same
+    bucket) measured a worst inter-success gap of **21.9 s** with every
+    pusher progressing and all conflicts surfacing as clean retryable
+    rejections. The arm's intended quantity — a real pusher's progress
+    gap — stays under the line; the harness-fidelity gap is tracked in
+    [#181](https://github.com/coder/code-storage/issues/181) and should
+    be fixed before any promote-grade re-run.
+- **(4)** 304-path p99 > 100 ms: measured **20.12 ms** — passes with 5×
+  margin.
 - **(1)** SeaweedFS-vs-S3 semantic divergence / lost update under
-  contention — the one threshold this campaign CAN evaluate on the
-  self-hosted store: **none observed.** Exactly-once winners across
-  101,728 winning advances and 788,919 lost races in the 60 s microbench
-  cells, plus a clean ls-remote lost-update detector across all 8 e2e push
-  cells (~15,300 real pushes across the performance and correctness
-  campaigns, plus 629 correctness-mode observer polls all legality-clean).
+  contention: **none observed.** The 22-surface qualification lane passed
+  in require mode against the same bucket, the exactly-once detector was
+  clean in every real-S3 contention cell (4,880 winning advances,
+  42,637 lost races), and the SeaweedFS-side evidence stands as
+  published: 101,728 winning advances / 788,919 lost races clean plus
+  ~15,300 real e2e pushes with a clean ls-remote detector.
 
-**Verdict input:** nothing in the SeaweedFS or SQLite data trips any
-threshold that can be measured locally; the real-S3 thresholds remain
-unmeasured. Per plan §4 the gate report therefore stays: **provisionally
-continue; real-S3 gate blocked.**
+**Verdict input:** no plan §3 kill criterion is met on real S3 from
+near-same-region compute (~7 ms RTT). The starvation arm's raw harness
+figure trips as written and is reported above transparently; the
+production-shape measurement of the same quantity does not trip, and the
+harness deviation from the plan's own §2.3 regime is filed as
+[#181](https://github.com/coder/code-storage/issues/181). Per plan §4:
+**Gate 1a-B evaluated — no kill threshold met; continue as experimental.**
+This is a single-day campaign; promote-grade numbers need the §3
+separate-days method.
+
+## Real-S3 serve session (2026-08-27, eu-central-1)
+
+Beyond the microbench cells, the same campaign ran a full `codestorage
+serve` session against the real bucket in both storage modes. All evidence
+below is from live runs; the bucket was emptied and deleted afterward.
+
+- **Boot bug found and fixed:** the first real-AWS serve boot outside
+  us-east-1 ever attempted failed — the ensure-bucket bootstrap sent
+  `CreateBucket` without a `LocationConstraint`, which real regional
+  endpoints reject with 400 `IllegalLocationConstraintException` before
+  any existence check (boot-fatal in BOTH s3wal and PG+S3 modes; invisible
+  on SeaweedFS/MinIO/us-east-1). Filed as
+  [#179](https://github.com/coder/code-storage/issues/179), fixed in
+  [PR #180](https://github.com/coder/code-storage/pull/180); the session
+  ran on that fix.
+- **s3wal mode smoke** (`s3wal://bucket?region=eu-central-1` +
+  `s3://bucket?region=eu-central-1`, expected-bucket-owner set): repo
+  create, clone, push, 5 MiB LFS round trip sha-verified through a fresh
+  clone, named-alias API reads — all pass.
+- **Operational drills on real S3:** a second node against the live bucket
+  refused startup with the instance-lease dual-serve diagnostic; SIGTERM
+  drained the node gracefully (~2 s) and released the lease; a successor
+  with an **empty cache dir** served health in ~1 s and a fresh clone
+  reconstructed full history + LFS payload from the bucket alone. Repack
+  folded packs and the orphan sweep ran clean mid-session.
+- **e2e push cost:** sequential empty-commit pushes measured p50
+  **1,070 ms** on s3wal vs **386 ms** on PG+S3 (containerized Postgres,
+  same-region S3 blobs, same host) — the zero-infra tradeoff is ~2.8× at
+  real RTT (vs +23% on loopback). Round-trip census filed as
+  [#182](https://github.com/coder/code-storage/issues/182).
+- **PG+S3 mode smoke:** same git+LFS suite against
+  `postgres://…` + `s3://bucket?region=eu-central-1` — all pass.
 
 ## Nightly bench lane
 
@@ -332,6 +413,11 @@ signal.
 - Checked in ([`s3wal-bench-data/`](./s3wal-bench-data/), one CSV per cell,
   175 KiB total): cells 1/2/4 (`op,latency_ns`) and all 8 push-path cells
   (`op,writer,latency_ns`).
-- Not checked in (~14 MiB): the cell-3 contention CSVs (up to ~335 k rows
-  per SQLite cell). Regenerate with the cell-3 command above; per-cell
-  summary statistics are in the table.
+- Also checked in (2026-08-27 real-S3 campaign, `store-s3` files): cells
+  1/2/4 plus all three cell-3 contention CSVs — small on real S3
+  (~1.6 k rows per N at the ~27 adv/s ceiling), and they are the Gate 1a-B
+  evidence, including the win-streak distribution behind the cell 3
+  regime note.
+- Not checked in (~14 MiB): the SeaweedFS/SQLite cell-3 contention CSVs
+  (up to ~335 k rows per SQLite cell). Regenerate with the cell-3 command
+  above; per-cell summary statistics are in the table.
