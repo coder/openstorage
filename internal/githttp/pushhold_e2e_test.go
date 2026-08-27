@@ -400,3 +400,115 @@ func TestPush_UnreservedSidecarBounded(t *testing.T) {
 		t.Fatalf("oversized unreserved sidecar was not denied whole:\n%s", resp)
 	}
 }
+
+// TestPush_WaitedCreationReprobesAuthority (Codex round-10 P1): pushes X
+// (create refs/heads/q) and Y (create refs/heads/q/c) race on one node.
+// Both pre-receive authority probes run before either CAS and see neither
+// name; Y's reservation then waits out X's hold, by which time X has
+// COMMITTED q. Without the post-wait re-probe Y becomes bulk-reserved, its
+// hook skips the commit-time check, and its CAS wedges the authority with
+// q + q/c. Fixed, Y is re-probed after the wait, diverted, and cleanly
+// declined per-ref. (If scheduling ever runs Y after X's CAS instead, the
+// FIRST probe dooms it — same assertions, so the test cannot flake red.)
+func TestPush_WaitedCreationReprobesAuthority(t *testing.T) {
+	repo := registerRepo(t, "t-waited-reprobe")
+	work := initWorkRepo(t)
+	token := mintTestToken(t, repo, "git:read,git:write", "")
+	mustGit(t, work, "push", remoteURL(nodeA, repo, token), "HEAD:refs/heads/main")
+	head := revParse(t, work, "HEAD")
+
+	// Every update hook on this node sleeps 3s BEFORE its CAS: X's hold
+	// stays live and uncommitted long enough for Y's pre-receive probe
+	// and reservation wait to begin.
+	node := startNodeT(t, EnvHookDelay+"=3000")
+
+	type pushResult struct {
+		out string
+		err error
+	}
+	doneX := make(chan pushResult, 1)
+	go func() {
+		out, err := tryGit(work, "push", remoteURL(node, repo, token), "HEAD:refs/heads/q")
+		doneX <- pushResult{out, err}
+	}()
+	time.Sleep(500 * time.Millisecond)
+	doneY := make(chan pushResult, 1)
+	go func() {
+		out, err := tryGit(work, "push", remoteURL(node, repo, token), "HEAD:refs/heads/q/c")
+		doneY <- pushResult{out, err}
+	}()
+
+	resX := <-doneX
+	t.Logf("push X (create q):\n%s", resX.out)
+	if resX.err != nil {
+		t.Fatalf("push X failed: %v\n%s", resX.err, resX.out)
+	}
+	resY := <-doneY
+	t.Logf("push Y (create q/c, expected clean decline):\n%s", resY.out)
+	if resY.err == nil {
+		t.Fatalf("push Y must be declined against committed q:\n%s", resY.out)
+	}
+	if !strings.Contains(resY.out, "directory/file") {
+		t.Fatalf("Y's rejection is not the clean D/F decline:\n%s", resY.out)
+	}
+	refs := pgRefs(t, repo)
+	if refs["refs/heads/q"] != head {
+		t.Fatalf("authority refs/heads/q = %q, want %q", refs["refs/heads/q"], head)
+	}
+	if _, ok := refs["refs/heads/q/c"]; ok {
+		t.Fatalf("authority accepted an unrepresentable D/F pair: %v", refs)
+	}
+	mustGit(t, "", "ls-remote", remoteURL(nodeA, repo, token))
+}
+
+// TestAtomicPush_WaitedCreationDeniedWhole (Codex round-10 P1, atomic
+// arm): when the waiter is ATOMIC, a per-ref hook decline would fire only
+// AFTER sibling hooks' CASes committed — the post-wait re-probe must deny
+// the WHOLE push in pre-receive instead, before any hook runs.
+func TestAtomicPush_WaitedCreationDeniedWhole(t *testing.T) {
+	repo := registerRepo(t, "t-waited-atomic")
+	work := initWorkRepo(t)
+	token := mintTestToken(t, repo, "git:read,git:write", "")
+	mustGit(t, work, "push", remoteURL(nodeA, repo, token), "HEAD:refs/heads/main")
+	head := revParse(t, work, "HEAD")
+
+	node := startNodeT(t, EnvHookDelay+"=3000")
+
+	type pushResult struct {
+		out string
+		err error
+	}
+	doneX := make(chan pushResult, 1)
+	go func() {
+		out, err := tryGit(work, "push", remoteURL(node, repo, token), "HEAD:refs/heads/q")
+		doneX <- pushResult{out, err}
+	}()
+	time.Sleep(500 * time.Millisecond)
+	doneY := make(chan pushResult, 1)
+	go func() {
+		out, err := tryGit(work, "push", "--atomic", remoteURL(node, repo, token),
+			"HEAD:refs/heads/good", "HEAD:refs/heads/q/c")
+		doneY <- pushResult{out, err}
+	}()
+
+	resX := <-doneX
+	t.Logf("push X (create q):\n%s", resX.out)
+	if resX.err != nil {
+		t.Fatalf("push X failed: %v\n%s", resX.err, resX.out)
+	}
+	resY := <-doneY
+	t.Logf("atomic push Y (expected whole-push denial):\n%s", resY.out)
+	if resY.err == nil {
+		t.Fatalf("atomic push with a doomed waited creation must be denied whole:\n%s", resY.out)
+	}
+	refs := pgRefs(t, repo)
+	if refs["refs/heads/q"] != head {
+		t.Fatalf("authority refs/heads/q = %q, want %q", refs["refs/heads/q"], head)
+	}
+	if _, ok := refs["refs/heads/good"]; ok {
+		t.Fatalf("authority moved refs/heads/good under a whole-push failure report: %v", refs)
+	}
+	if _, ok := refs["refs/heads/q/c"]; ok {
+		t.Fatalf("authority accepted the doomed waited creation: %v", refs)
+	}
+}

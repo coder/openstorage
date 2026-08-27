@@ -1287,15 +1287,48 @@ func loadPushHolds(repoPath string) pushHoldSet {
 // closed on it (Codex round-3 P1 on #173), while hydration deliberately
 // proceeds fail-open.
 func readPushHolds(dir, exceptPath string) (pushHoldSet, error) {
-	entries, err := os.ReadDir(dir)
+	return (&pushHoldDirCache{dir: dir, except: exceptPath}).load()
+}
+
+// pushHoldDirCache is readPushHolds with a per-file parse cache for
+// callers that re-read the same directory in a tight loop —
+// reservePushHolds' 25ms conflict poll (Codex round-10 P2: without it a
+// blocked reservation re-reads, re-splits, and re-sorts every peer hold on
+// every poll, hundreds of times per waiter). A hold file is re-parsed only
+// when its (size, mtime) changes — appends change the size, and the
+// refresher's touch only bumps the mtime a few times a minute — and the
+// combined sorted set is rebuilt only when the surviving file set or one
+// of its parses changed. Not goroutine-safe; one loop owns one cache.
+type pushHoldDirCache struct {
+	dir, except string
+
+	files  map[string]holdFileParse
+	set    pushHoldSet
+	setKey string // "path\x00size\x00mtime\x01..." fingerprint the set was built from
+
+	parses int // test seam: number of ReadFile+split parses performed
+}
+
+type holdFileParse struct {
+	size  int64
+	mtime int64 // UnixNano
+	names []string
+}
+
+func (c *pushHoldDirCache) load() (pushHoldSet, error) {
+	entries, err := os.ReadDir(c.dir)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return pushHoldSet{}, nil
 		}
 		return pushHoldSet{}, err
 	}
-	var names []string
+	if c.files == nil {
+		c.files = make(map[string]holdFileParse)
+	}
 	var firstErr error
+	live := make(map[string]holdFileParse, len(entries))
+	var key strings.Builder
 	for _, e := range entries {
 		// Sidecar directories mark a push's UNRESERVED names — never
 		// holds (the IsDir check is defensive: nothing else creates
@@ -1303,8 +1336,8 @@ func readPushHolds(dir, exceptPath string) (pushHoldSet, error) {
 		if strings.HasSuffix(e.Name(), pushHoldUnreservedSuffix) || e.IsDir() {
 			continue
 		}
-		path := filepath.Join(dir, e.Name())
-		if exceptPath != "" && path == exceptPath {
+		path := filepath.Join(c.dir, e.Name())
+		if c.except != "" && path == c.except {
 			continue
 		}
 		info, err := e.Info()
@@ -1314,23 +1347,42 @@ func readPushHolds(dir, exceptPath string) (pushHoldSet, error) {
 			}
 			continue
 		}
+		// The TTL check runs on every load — expiry is time-driven, not
+		// change-driven — so an expired hold drops out of the set on the
+		// next poll even though its file never changed.
 		if time.Since(info.ModTime()) > pushHoldTTL {
 			continue
 		}
-		b, err := os.ReadFile(path)
-		if err != nil {
-			if !errors.Is(err, os.ErrNotExist) && firstErr == nil {
-				firstErr = err
+		parse, ok := c.files[path]
+		if !ok || parse.size != info.Size() || parse.mtime != info.ModTime().UnixNano() {
+			b, err := os.ReadFile(path)
+			if err != nil {
+				if !errors.Is(err, os.ErrNotExist) && firstErr == nil {
+					firstErr = err
+				}
+				continue
 			}
-			continue
-		}
-		for _, held := range strings.Split(string(b), "\n") {
-			if held != "" {
-				names = append(names, held)
+			c.parses++
+			parse = holdFileParse{size: info.Size(), mtime: info.ModTime().UnixNano(), names: nil}
+			for _, held := range strings.Split(string(b), "\n") {
+				if held != "" {
+					parse.names = append(parse.names, held)
+				}
 			}
 		}
+		live[path] = parse
+		fmt.Fprintf(&key, "%s\x00%d\x00%d\x01", path, parse.size, parse.mtime)
 	}
-	return newPushHoldSet(names), firstErr
+	c.files = live
+	if key.String() != c.setKey {
+		var names []string
+		for _, parse := range live {
+			names = append(names, parse.names...)
+		}
+		c.set = newPushHoldSet(names)
+		c.setKey = key.String()
+	}
+	return c.set, firstErr
 }
 
 func (s pushHoldSet) contains(name string) bool {
@@ -1391,20 +1443,27 @@ var pushHoldWaitMax = 10 * time.Second
 // CLOSED (round-2 P1: proceeding would commit an authority update whose
 // local ref transaction is doomed while the conflicting neighbor
 // survives) — a clean, pre-publication, retryable denial.
-func reservePushHolds(ctx context.Context, holdPath string, names []string) error {
+//
+// The returned slice lists the names that had to WAIT for a conflicting
+// peer hold at least once (sorted; nil when none did): the caller's
+// pre-wait authority state is stale for exactly those names — the peer may
+// have committed the conflicting ref before releasing its hold — so
+// creations among them must be re-probed against the authority before
+// their commit-time checks are skipped (Codex round-10 P1 on #173).
+func reservePushHolds(ctx context.Context, holdPath string, names []string) ([]string, error) {
 	if !filepath.IsAbs(holdPath) {
-		return fmt.Errorf("push hold path %q is not absolute", holdPath)
+		return nil, fmt.Errorf("push hold path %q is not absolute", holdPath)
 	}
 	for _, name := range names {
 		// Git's check-ref-format rejects control characters long before
 		// hooks run; refuse rather than mint line-split holds.
 		if name == "" || strings.Contains(name, "\n") {
-			return fmt.Errorf("push hold: malformed ref name %q", name)
+			return nil, fmt.Errorf("push hold: malformed ref name %q", name)
 		}
 	}
 	dir := filepath.Dir(holdPath)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return err
+		return nil, err
 	}
 	// The reserve lock lives NEXT TO the hold directory, not inside it:
 	// readers treat every directory entry as a hold file, and the mint
@@ -1419,36 +1478,58 @@ func reservePushHolds(ctx context.Context, holdPath string, names []string) erro
 	deadline := time.Now().Add(pushHoldWaitMax)
 	ctx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
+	// One parse cache across the poll iterations (Codex round-10 P2): a
+	// large peer hold otherwise gets re-read, re-split, and re-sorted every
+	// 25ms for up to the full deadline — repo-scale bytes times hundreds of
+	// polls, multiplied by concurrent waiters. Unchanged files cost a stat.
+	cache := &pushHoldDirCache{dir: dir, except: holdPath}
+	var waited map[string]bool
 	for {
 		unlock, err := flockExclusiveCtx(ctx, lockPath)
 		if err != nil {
 			if ctx.Err() != nil {
-				return fmt.Errorf("timed out waiting for a concurrent push's hold reservation; retry shortly: %w", err)
+				return nil, fmt.Errorf("timed out waiting for a concurrent push's hold reservation; retry shortly: %w", err)
 			}
-			return err
+			return nil, err
 		}
-		peers, err := readPushHolds(dir, holdPath)
+		peers, err := cache.load()
 		if err != nil {
 			// Fail CLOSED: an unreadable peer hold is not proof of no
 			// conflict (Codex round-3 P1 on #173).
 			unlock()
-			return fmt.Errorf("push hold: reading peer holds: %w", err)
+			return nil, fmt.Errorf("push hold: reading peer holds: %w", err)
 		}
 		conflict := ""
 		for _, name := range names {
 			if peers.conflicts(name) {
-				conflict = name
-				break
+				if conflict == "" {
+					conflict = name
+				}
+				if waited == nil {
+					waited = make(map[string]bool)
+				}
+				waited[name] = true
 			}
 		}
 		if conflict == "" {
 			err := appendPushHolds(holdPath, names)
 			unlock()
-			return err
+			if err != nil {
+				return nil, err
+			}
+			waitedNames := make([]string, 0, len(waited))
+			for name := range waited {
+				waitedNames = append(waitedNames, name)
+			}
+			sort.Strings(waitedNames)
+			if len(waitedNames) == 0 {
+				return nil, nil
+			}
+			return waitedNames, nil
 		}
 		unlock()
 		if time.Now().After(deadline) || ctx.Err() != nil {
-			return fmt.Errorf("a concurrent push holds a ref conflicting with %s (directory/file); retry shortly", conflict)
+			return nil, fmt.Errorf("a concurrent push holds a ref conflicting with %s (directory/file); retry shortly", conflict)
 		}
 		select {
 		case <-ctx.Done():

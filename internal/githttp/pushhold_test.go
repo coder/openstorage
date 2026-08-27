@@ -27,7 +27,7 @@ func mintHold(t *testing.T, repoPath string, names ...string) string {
 	if err != nil {
 		t.Fatalf("mintPushHold: %v", err)
 	}
-	if err := reservePushHolds(context.Background(), holdPath, names); err != nil {
+	if _, err := reservePushHolds(context.Background(), holdPath, names); err != nil {
 		t.Fatalf("reservePushHolds(%v): %v", names, err)
 	}
 	return holdPath
@@ -208,14 +208,14 @@ func TestMintPushHold_SweepsExpiredLeaks(t *testing.T) {
 // line-splitting ref names must fail the push rather than mint a broken
 // hold.
 func TestReservePushHolds_RejectsMalformedInput(t *testing.T) {
-	if err := reservePushHolds(context.Background(), "relative/hold", []string{"refs/heads/x"}); err == nil {
+	if _, err := reservePushHolds(context.Background(), "relative/hold", []string{"refs/heads/x"}); err == nil {
 		t.Fatal("relative hold path accepted")
 	}
 	abs := filepath.Join(t.TempDir(), "holds", "hold")
-	if err := reservePushHolds(context.Background(), abs, []string{"refs/heads/a\nrefs/heads/b"}); err == nil {
+	if _, err := reservePushHolds(context.Background(), abs, []string{"refs/heads/a\nrefs/heads/b"}); err == nil {
 		t.Fatal("line-splitting ref name accepted")
 	}
-	if err := reservePushHolds(context.Background(), abs, []string{""}); err == nil {
+	if _, err := reservePushHolds(context.Background(), abs, []string{""}); err == nil {
 		t.Fatal("empty ref name accepted")
 	}
 }
@@ -237,13 +237,13 @@ func TestReservePushHolds_DeniesLiveConflictFailsClosed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("mintPushHold: %v", err)
 	}
-	if err := reservePushHolds(context.Background(), own, []string{"refs/heads/a/b"}); err == nil {
+	if _, err := reservePushHolds(context.Background(), own, []string{"refs/heads/a/b"}); err == nil {
 		t.Fatal("reservation past a live D/F-conflicting hold accepted")
 	} else if !strings.Contains(err.Error(), "conflicting") {
 		t.Fatalf("denial reason = %v, want a conflict message", err)
 	}
 	// Same-name and unrelated refs are NOT conflicts.
-	if err := reservePushHolds(context.Background(), own, []string{"refs/heads/a", "refs/heads/z"}); err != nil {
+	if _, err := reservePushHolds(context.Background(), own, []string{"refs/heads/a", "refs/heads/z"}); err != nil {
 		t.Fatalf("non-conflicting reservation denied: %v", err)
 	}
 	// An expired conflicting hold is a crash leak, not a conflict. (own
@@ -258,7 +258,7 @@ func TestReservePushHolds_DeniesLiveConflictFailsClosed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("mintPushHold: %v", err)
 	}
-	if err := reservePushHolds(context.Background(), own2, []string{"refs/heads/a/c"}); err != nil {
+	if _, err := reservePushHolds(context.Background(), own2, []string{"refs/heads/a/c"}); err != nil {
 		t.Fatalf("reservation blocked by an expired hold: %v", err)
 	}
 }
@@ -279,7 +279,7 @@ func TestReservePushHolds_FailsClosedOnUnreadableHolds(t *testing.T) {
 	t.Cleanup(func() { _ = os.Chmod(holdsDir, 0o755) })
 
 	own := filepath.Join(holdsDir, "push-own")
-	if err := reservePushHolds(context.Background(), own, []string{"refs/heads/x"}); err == nil {
+	if _, err := reservePushHolds(context.Background(), own, []string{"refs/heads/x"}); err == nil {
 		t.Fatal("reservation succeeded over an unreadable hold directory")
 	}
 }
@@ -333,7 +333,7 @@ func TestReservePushHolds_LockAcquisitionBounded(t *testing.T) {
 	defer func() { pushHoldWaitMax = prev }()
 
 	start := time.Now()
-	err = reservePushHolds(context.Background(), filepath.Join(holdsDir, "push-own"), []string{"refs/heads/x"})
+	_, err = reservePushHolds(context.Background(), filepath.Join(holdsDir, "push-own"), []string{"refs/heads/x"})
 	if err == nil {
 		t.Fatal("reservation succeeded while the reserve lock was held elsewhere")
 	}
@@ -436,7 +436,7 @@ func TestPushHoldReaders_SkipUnreservedSidecar(t *testing.T) {
 	if err != nil {
 		t.Fatalf("mintPushHold: %v", err)
 	}
-	if err := reservePushHolds(context.Background(), own, []string{"refs/heads/denied/x"}); err != nil {
+	if _, err := reservePushHolds(context.Background(), own, []string{"refs/heads/denied/x"}); err != nil {
 		t.Fatalf("sidecar name blocked a reservation: %v", err)
 	}
 }
@@ -589,5 +589,189 @@ func TestHydrate_SkippedHeldRefSuppressesMarker(t *testing.T) {
 	mustHydrate(t, st, bl, cacheDir, "r")
 	if gen, _, _, ok := readGenerationMarker(repoPath); !ok || gen != 9 {
 		t.Fatalf("marker after hold cleared = (%d, %v), want (9, true)", gen, ok)
+	}
+}
+
+// TestReservePushHolds_ReportsWaitedNames (Codex round-10 P1 substrate):
+// the reservation must tell its caller exactly which names sat out a
+// conflicting peer hold — pre-receive re-probes the authority for those
+// creations, because the peer may have committed the conflicting ref
+// before releasing.
+func TestReservePushHolds_ReportsWaitedNames(t *testing.T) {
+	dir := t.TempDir()
+	peer := mintHold(t, dir, "refs/heads/a")
+
+	own, err := mintPushHold(dir)
+	if err != nil {
+		t.Fatalf("mintPushHold: %v", err)
+	}
+	type result struct {
+		waited []string
+		err    error
+	}
+	done := make(chan result, 1)
+	go func() {
+		waited, err := reservePushHolds(context.Background(), own,
+			[]string{"refs/heads/a/b", "refs/heads/z"})
+		done <- result{waited, err}
+	}()
+	// Let the reservation hit the conflict at least once, then clear it.
+	time.Sleep(300 * time.Millisecond)
+	if err := os.Remove(peer); err != nil {
+		t.Fatalf("remove peer hold: %v", err)
+	}
+	res := <-done
+	if res.err != nil {
+		t.Fatalf("reservePushHolds after peer cleared: %v", res.err)
+	}
+	if len(res.waited) != 1 || res.waited[0] != "refs/heads/a/b" {
+		t.Fatalf("waited = %v, want exactly [refs/heads/a/b] (refs/heads/z never conflicted)", res.waited)
+	}
+
+	// The unconflicted fast path reports nothing.
+	own2, err := mintPushHold(dir)
+	if err != nil {
+		t.Fatalf("mintPushHold: %v", err)
+	}
+	waited, err := reservePushHolds(context.Background(), own2, []string{"refs/heads/free"})
+	if err != nil || waited != nil {
+		t.Fatalf("unconflicted reserve = (%v, %v), want (nil, nil)", waited, err)
+	}
+}
+
+// TestPushHoldDirCache_ReparsesOnlyOnChange (Codex round-10 P2): the
+// reservation conflict poll re-loads peer holds every 25ms for up to 10s;
+// unchanged hold files must cost a stat, not a re-read + re-split +
+// re-sort of potentially repo-scale name lists.
+func TestPushHoldDirCache_ReparsesOnlyOnChange(t *testing.T) {
+	dir := t.TempDir()
+	holdA := mintHold(t, dir, "refs/heads/a")
+	mintHold(t, dir, "refs/heads/b")
+
+	cache := &pushHoldDirCache{dir: filepath.Join(dir, pushHoldDir)}
+	set, err := cache.load()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if !set.contains("refs/heads/a") || !set.contains("refs/heads/b") {
+		t.Fatalf("first load missed holds: %v", set.names)
+	}
+	if cache.parses != 2 {
+		t.Fatalf("parses after first load = %d, want 2", cache.parses)
+	}
+	for i := 0; i < 5; i++ {
+		if _, err := cache.load(); err != nil {
+			t.Fatalf("steady-state load: %v", err)
+		}
+	}
+	if cache.parses != 2 {
+		t.Fatalf("parses after 5 unchanged loads = %d, want still 2", cache.parses)
+	}
+
+	// An append (size change) re-parses exactly the changed file.
+	if err := appendPushHolds(holdA, []string{"refs/heads/a2"}); err != nil {
+		t.Fatalf("appendPushHolds: %v", err)
+	}
+	set, err = cache.load()
+	if err != nil {
+		t.Fatalf("load after append: %v", err)
+	}
+	if cache.parses != 3 {
+		t.Fatalf("parses after one append = %d, want 3", cache.parses)
+	}
+	if !set.contains("refs/heads/a2") {
+		t.Fatalf("appended name missing: %v", set.names)
+	}
+
+	// A refresher touch (mtime change) re-parses that file once.
+	future := time.Now().Add(2 * time.Second)
+	if err := os.Chtimes(holdA, future, future); err != nil {
+		t.Fatalf("Chtimes: %v", err)
+	}
+	if _, err := cache.load(); err != nil {
+		t.Fatalf("load after touch: %v", err)
+	}
+	if cache.parses != 4 {
+		t.Fatalf("parses after touch = %d, want 4", cache.parses)
+	}
+
+	// A removed hold drops out without re-parsing survivors.
+	if err := os.Remove(holdA); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+	set, err = cache.load()
+	if err != nil {
+		t.Fatalf("load after remove: %v", err)
+	}
+	if set.contains("refs/heads/a") || !set.contains("refs/heads/b") {
+		t.Fatalf("set after remove = %v", set.names)
+	}
+	if cache.parses != 4 {
+		t.Fatalf("parses after remove = %d, want still 4", cache.parses)
+	}
+}
+
+// snapshotStore satisfies refNameSnapshotter; its embedded countingStore's
+// GetRef PANICS, proving the snapshot path never falls back to point reads.
+type snapshotStore struct {
+	*countingStore
+	snapshots int
+}
+
+func (s *snapshotStore) SnapshotRefNames(_ context.Context, _ string) ([]string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.snapshots++
+	names := make([]string, 0, len(s.refs))
+	for name := range s.refs {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names, nil
+}
+
+// TestAuthorityDoomedCreations_SnapshotStore (Codex round-10 security P2):
+// on stores where every read materializes the full ref table (s3wal
+// manifests), the probe must batch through ONE SnapshotRefNames call —
+// zero point reads, zero list pages — and reach the same verdicts.
+func TestAuthorityDoomedCreations_SnapshotStore(t *testing.T) {
+	refs := map[string]string{
+		"refs/heads/a":     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		"refs/heads/x/y":   "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		"refs/heads/plain": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+	}
+	// One existing child beneath each proposed parent — the round-10
+	// crafted shape that defeated the seek-merge's skip windows.
+	var creations []string
+	for i := 0; i < 50; i++ {
+		parent := fmt.Sprintf("refs/heads/p%03d", i)
+		refs[parent+"/held"] = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+		creations = append(creations, parent)
+	}
+	creations = append(creations,
+		"refs/heads/a/b",   // doomed: strict ancestor a exists
+		"refs/heads/x",     // doomed: strict descendant x/y exists
+		"refs/heads/plain", // exact name exists: NOT a D/F conflict
+		"refs/heads/new1",
+	)
+	st := &snapshotStore{countingStore: &countingStore{gen: 1, refs: refs}}
+	doomed, err := authorityDoomedCreations(context.Background(), st, "r", creations)
+	if err != nil {
+		t.Fatalf("authorityDoomedCreations: %v", err)
+	}
+	if len(doomed) != 52 {
+		t.Fatalf("doomed = %d names, want 52 (50 squatted parents + a/b + x): %v", len(doomed), doomed)
+	}
+	for _, want := range []string{"refs/heads/a/b", "refs/heads/x", "refs/heads/p000", "refs/heads/p049"} {
+		if _, ok := doomed[want]; !ok {
+			t.Errorf("%s not reported doomed", want)
+		}
+	}
+	if st.snapshots != 1 {
+		t.Errorf("snapshots = %d, want exactly 1", st.snapshots)
+	}
+	_, listCalls, _ := st.counts()
+	if listCalls != 0 {
+		t.Errorf("listRefsCalls = %d, want 0 — the snapshot path issued store reads", listCalls)
 	}
 }

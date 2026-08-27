@@ -203,13 +203,20 @@ func preReceive(ctx context.Context) error {
 	// name and aborting the local atomic transaction, so letting one
 	// through recreates the authority-accepted/client-rejected wedge.
 	if atomicPush {
-		evalVerdicts()
+		// Evaluated one command at a time, name check first, STOPPING at
+		// the first denial (Codex round-10 P2): a denied atomic push's
+		// outcome is already fixed, and each further evaluation can cost
+		// subprocess work (no-force-push runs git merge-base, verify-sig
+		// walks and verifies) — eager whole-slice evaluation let one
+		// doomed request scale that by its command count. A complete loop
+		// leaves verdicts fully populated (all nil) for the later gates.
+		verdicts = make([]error, len(commands))
 		for i, c := range commands {
-			if verdicts[i] != nil {
-				return atomicDenied(verdicts[i])
-			}
 			if !pushRefUpdatable(c.ref) {
 				return atomicDenied(fmt.Errorf("ref name %s is not updatable here (namespace root, git-invalid name, or deeper than %d segments)", c.ref, maxPushRefDepth))
+			}
+			if verdicts[i] = enforceRefPolicy(ctx, repo, c.ref, c.old, c.new); verdicts[i] != nil {
+				return atomicDenied(verdicts[i])
 			}
 		}
 		// The push's OWN command set must be representable in one git ref
@@ -332,6 +339,54 @@ func preReceive(ctx context.Context) error {
 			}
 			names = append(names, c.ref)
 		}
+		waited, err := reservePushHolds(ctx, holdPath, names)
+		if err != nil {
+			return fmt.Errorf("pre-receive: reserve push holds: %w", err)
+		}
+		// Creations whose reservation had to WAIT for a conflicting peer
+		// hold are re-probed against the authority (Codex round-10 P1):
+		// the batch probe above ran BEFORE a wait of up to pushHoldWaitMax,
+		// and the peer we waited out may have committed the conflicting
+		// ref before releasing — two concurrent pushes creating
+		// refs/heads/a and refs/heads/a/b both probe clean, the waiter
+		// then becomes bulk-reserved, and skipping its commit-time check
+		// would let its CAS wedge the authority. Doomed late losers are
+		// denied whole for atomic pushes and diverted to the sidecar for
+		// non-atomic ones — their names stay harmlessly in our hold file
+		// (we are allowed to write them; the hook's own probe declines).
+		if len(waited) > 0 {
+			waitedSet := make(map[string]bool, len(waited))
+			for _, name := range waited {
+				waitedSet[name] = true
+			}
+			var stale []string
+			for _, c := range eligible {
+				if c.old == ref.ZeroSHA && c.new != ref.ZeroSHA && waitedSet[c.ref] {
+					stale = append(stale, c.ref)
+				}
+			}
+			if len(stale) > 0 {
+				probeStore, err := ref.Open(ctx, mustEnv(envHookPGURL...))
+				if err != nil {
+					return fmt.Errorf("pre-receive: open ref store for post-wait probe: %w", err)
+				}
+				doomed2, err := authorityDoomedCreations(ctx, probeStore, repo, stale)
+				probeStore.Close()
+				if err != nil {
+					return fmt.Errorf("pre-receive: post-wait authority D/F probe: %w", err)
+				}
+				if atomicPush {
+					for _, c := range commands {
+						if derr, ok := doomed2[c.ref]; ok {
+							return atomicDenied(derr)
+						}
+					}
+				}
+				for name := range doomed2 {
+					unreserved = append(unreserved, name)
+				}
+			}
+		}
 		// The sidecar is bounded (Codex round-9 P2): unreserved membership
 		// is attacker-chosen — a crafted push can carry hundreds of
 		// thousands of tiny undeliverable commands under the byte cap, and
@@ -342,9 +397,6 @@ func preReceive(ctx context.Context) error {
 		// their reservable refs share the single hold file.
 		if len(unreserved) > maxPushUnreserved {
 			return fmt.Errorf("pre-receive: push carries %d commands that cannot be bulk-reserved (policy-denied, undeliverable, or D/F-conflicted names); the limit is %d — drop those commands or split the push", len(unreserved), maxPushUnreserved)
-		}
-		if err := reservePushHolds(ctx, holdPath, names); err != nil {
-			return fmt.Errorf("pre-receive: reserve push holds: %w", err)
 		}
 		// The (typically empty) remainder becomes one marker file per
 		// name in the sidecar directory, so an update hook's membership
@@ -742,6 +794,21 @@ func pushRefUpdatable(name string) bool {
 	return true
 }
 
+// refNameSnapshotter is implemented by ref stores where every read
+// materializes the repo's full ref table regardless of how little it
+// returns (s3wal: one manifest object per read). The per-push authority
+// D/F probe batches through it, paying that materialization exactly once
+// per push instead of once per point read. Names must come back in
+// ascending byte order.
+type refNameSnapshotter interface {
+	SnapshotRefNames(ctx context.Context, repo string) ([]string, error)
+}
+
+// Compile-time guarantee that the s3wal store keeps satisfying the probe's
+// batching seam — losing the method would silently regress every s3wal
+// push to per-read manifest materialization.
+var _ refNameSnapshotter = (*ref.S3WAL)(nil)
+
 // gitRefSegmentValid mirrors git's check_refname_component (refs.c) for one
 // slash-separated segment: no empty segments (this also rejects leading,
 // trailing, and doubled slashes), no segment starting with "." or ending
@@ -958,7 +1025,10 @@ func updateHook(ctx context.Context, args []string) error {
 		case err != nil:
 			return fmt.Errorf("update: check unreserved marker: %w", err)
 		default:
-			if err := reservePushHolds(ctx, holdPath, []string{refName}); err != nil {
+			// The waited-names return is deliberately ignored: sidecar
+			// refs run the commit-time authority probe below regardless,
+			// so a post-wait re-probe here would be redundant.
+			if _, err := reservePushHolds(ctx, holdPath, []string{refName}); err != nil {
 				return fmt.Errorf("update: reserve push hold: %w", err)
 			}
 		}
@@ -1092,12 +1162,46 @@ func pauseAtUpdateBarrier(p string) {
 // carried across them would silently skip a real conflict.
 //
 // Store errors fail the whole probe; callers fail closed.
+//
+// Stores whose EVERY read materializes the full ref table anyway
+// (refNameSnapshotter, i.e. s3wal manifests) are probed from ONE snapshot
+// instead (Codex round-10 security P2): the point-probe arms would pay one
+// full manifest fetch+decode PER read there — a push creating many refs,
+// or a repo with one child beneath each proposed parent, turns that into
+// per-creation full-manifest work. One snapshot is exactly one manifest
+// read, the same price as a single GetRef, and both arms run in memory.
 func authorityDoomedCreations(ctx context.Context, st ref.RefStore, repo string, names []string) (map[string]error, error) {
 	doomed := map[string]error{}
 	deny := func(created, existing string) {
 		if _, dup := doomed[created]; !dup {
 			doomed[created] = fmt.Errorf("%s conflicts with existing ref %s (directory/file); delete %s first", created, existing, existing)
 		}
+	}
+	if snap, ok := st.(refNameSnapshotter); ok {
+		existing, err := snap.SnapshotRefNames(ctx, repo)
+		if err != nil {
+			return nil, fmt.Errorf("directory/file snapshot probe: %w", err)
+		}
+		assertf(sort.StringsAreSorted(existing), "SnapshotRefNames returned unsorted names")
+		for _, name := range names {
+			// Ancestor arm: an existing ref is a strict prefix directory.
+			for i := 0; i < len(name); i++ {
+				if name[i] != '/' {
+					continue
+				}
+				anc := name[:i]
+				if j := sort.SearchStrings(existing, anc); j < len(existing) && existing[j] == anc {
+					deny(name, anc)
+					break
+				}
+			}
+			// Descendant arm: any existing ref strictly under name.
+			lo := name + "/"
+			if j := sort.SearchStrings(existing, lo); j < len(existing) && strings.HasPrefix(existing[j], lo) {
+				deny(name, existing[j])
+			}
+		}
+		return doomed, nil
 	}
 	// Ancestor arm, memoized across the set.
 	ancestor := map[string]bool{} // strict prefix -> exists in authority
