@@ -175,6 +175,43 @@ func TestPush_DFChildOfExistingRefCleanlyDeclined(t *testing.T) {
 	mustGit(t, "", "ls-remote", remoteURL(nodeA, repo, token))
 }
 
+// TestPush_DeniedParentAllowedChildLands (Codex round-7 P2): a non-atomic
+// push carrying a policy-DENIED creation of refs/heads/den and an allowed
+// creation of refs/heads/den/ok must keep git's per-ref semantics — the
+// denied parent never survives, so the allowed child lands; whole-push D/F
+// denial is only correct for atomic pushes, where an already-committed
+// authority CAS cannot be taken back when git aborts the local
+// transaction.
+func TestPush_DeniedParentAllowedChildLands(t *testing.T) {
+	repo := registerRepo(t, "t-df-denied-parent")
+	work := initWorkRepo(t)
+	full := mintTestToken(t, repo, "git:read,git:write", "")
+	mustGit(t, work, "push", remoteURL(nodeA, repo, full), "HEAD:refs/heads/main")
+	head := revParse(t, work, "HEAD")
+
+	// A fresh commit so the allowed child genuinely needs its pack — a
+	// stored-objects-only mixed push is refused whole by the deliberate
+	// publication gate (issue #21), which is not the semantics under test.
+	writeFile(t, work, "b.txt", "two\n")
+	mustGit(t, work, "add", ".")
+	mustGit(t, work, "commit", "-m", "two")
+	head2 := revParse(t, work, "HEAD")
+
+	restricted := mintTestToken(t, repo, "git:read,git:write", `[["refs/heads/den",["no-push"]],["*",[]]]`)
+	out, err := tryGit(work, "push", remoteURL(nodeA, repo, restricted), head+":refs/heads/den", "HEAD:refs/heads/den/ok")
+	if err == nil {
+		t.Fatalf("push must report the denied parent:\n%s", out)
+	}
+	t.Logf("mixed denied-parent push (child must land):\n%s", out)
+	refs := pgRefs(t, repo)
+	if _, ok := refs["refs/heads/den"]; ok {
+		t.Fatalf("denied parent committed: %v", refs)
+	}
+	if refs["refs/heads/den/ok"] != head2 {
+		t.Fatalf("allowed child rejected alongside its denied parent: %v", refs)
+	}
+}
+
 // TestPush_DeniedDeletionSurvivorBlocksDFChild (Codex round-4 P1, exact
 // scenario): one non-atomic push carries a policy-DENIED deletion of
 // refs/heads/a plus an allowed creation of refs/heads/a/b. The denied

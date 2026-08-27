@@ -282,32 +282,28 @@ func TestReservePushHolds_FailsClosedOnUnreadableHolds(t *testing.T) {
 	}
 }
 
-// TestIntraPushDFCheck pins the intra-push directory/file rules: a command
-// set whose end state cannot exist in one git ref store must be denied
-// before any authority CAS, while ordered non-atomic D/F renames stay
-// allowed.
-func TestIntraPushDFCheck(t *testing.T) {
+// TestAtomicPushDFCheck pins the atomic-only intra-push directory/file
+// rule: any strict-prefix pair is fatal unless both sides are deletions —
+// an atomic transaction can neither hold both nor reorder a delete+create
+// swap. Non-atomic pushes are deliberately unchecked (per-ref semantics;
+// the update hook's authority probe decides at commit time).
+func TestAtomicPushDFCheck(t *testing.T) {
 	const sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	del := func(name string) refCommand { return refCommand{old: sha, new: ref.ZeroSHA, ref: name} }
 	upd := func(name string) refCommand { return refCommand{old: ref.ZeroSHA, new: sha, ref: name} }
 	for _, tc := range []struct {
 		name     string
 		commands []refCommand
-		atomic   bool
 		wantErr  bool
 	}{
-		{"unrelated names", []refCommand{upd("refs/heads/a"), upd("refs/heads/ab"), upd("refs/tags/a")}, false, false},
-		{"both survive", []refCommand{upd("refs/heads/a"), upd("refs/heads/a/b")}, false, true},
-		{"both survive, deep", []refCommand{upd("refs/heads/a"), upd("refs/heads/a/b/c")}, false, true},
-		{"delete before create", []refCommand{del("refs/heads/a"), upd("refs/heads/a/b")}, false, false},
-		{"create before delete", []refCommand{upd("refs/heads/a/b"), del("refs/heads/a")}, false, true},
-		{"descendant delete before ancestor create", []refCommand{del("refs/heads/a/b"), upd("refs/heads/a")}, false, false},
-		{"ancestor create before descendant delete", []refCommand{upd("refs/heads/a"), del("refs/heads/a/b")}, false, true},
-		{"both deletions", []refCommand{del("refs/heads/a"), del("refs/heads/a/b")}, false, false},
-		{"atomic delete+create", []refCommand{del("refs/heads/a"), upd("refs/heads/a/b")}, true, true},
-		{"atomic both deletions", []refCommand{del("refs/heads/a"), del("refs/heads/a/b")}, true, false},
+		{"unrelated names", []refCommand{upd("refs/heads/a"), upd("refs/heads/ab"), upd("refs/tags/a")}, false},
+		{"both survive", []refCommand{upd("refs/heads/a"), upd("refs/heads/a/b")}, true},
+		{"both survive, deep", []refCommand{upd("refs/heads/a"), upd("refs/heads/a/b/c")}, true},
+		{"delete plus create", []refCommand{del("refs/heads/a"), upd("refs/heads/a/b")}, true},
+		{"create plus delete", []refCommand{upd("refs/heads/a/b"), del("refs/heads/a")}, true},
+		{"both deletions", []refCommand{del("refs/heads/a"), del("refs/heads/a/b")}, false},
 	} {
-		err := intraPushDFCheck(tc.commands, tc.atomic)
+		err := atomicPushDFCheck(tc.commands)
 		if (err != nil) != tc.wantErr {
 			t.Errorf("%s: err = %v, wantErr %v", tc.name, err, tc.wantErr)
 		}
@@ -379,7 +375,10 @@ func TestPushRefUpdatable(t *testing.T) {
 func TestPushHoldReaders_SkipUnreservedSidecar(t *testing.T) {
 	dir := t.TempDir()
 	holdPath := mintHold(t, dir, "refs/heads/held")
-	if err := os.WriteFile(holdPath+pushHoldUnreservedSuffix, []byte("refs/heads/denied\n"), 0o600); err != nil {
+	if err := os.MkdirAll(holdPath+pushHoldUnreservedSuffix, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(pushHoldUnreservedMarker(holdPath, "refs/heads/denied"), nil, 0o600); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
 	holds := loadPushHolds(dir)

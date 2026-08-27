@@ -9,7 +9,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -212,15 +211,19 @@ func preReceive(ctx context.Context) error {
 				return atomicDenied(fmt.Errorf("ref name %s is not updatable here (namespace root, malformed segment, or deeper than %d segments)", c.ref, maxPushRefDepth))
 			}
 		}
-	}
-	// The push's OWN command set must be representable in one git ref
-	// store (Codex round-3 P1 on #173) — checked on the RAW set: policy
-	// verdicts here are advisory, and the update hook's authority-side
-	// D/F probe (denyAuthorityDFConflict) is the guard that survives
-	// verdict divergence, e.g. a denied deletion whose ref then blocks
-	// its D/F child at commit time (Codex round-4 P1).
-	if err := intraPushDFCheck(commands, atomicPush); err != nil {
-		return err
+		// The push's OWN command set must be representable in one git ref
+		// transaction (Codex round-3 P1 on #173) — an ATOMIC-only gate:
+		// under --atomic, every update hook's authority CAS commits before
+		// git discovers the local D/F collision and aborts the whole
+		// transaction, so the denial must come first. Non-atomic pushes
+		// keep git's per-ref semantics instead (Codex round-7 P2: a
+		// denied parent never survives, so whole-push denial would
+		// reject its representable allowed child) — there the update
+		// hook's authority-side probe (denyAuthorityDFConflict) declines
+		// exactly the loser at commit time, whatever the verdicts did.
+		if err := atomicPushDFCheck(commands); err != nil {
+			return atomicDenied(err)
+		}
 	}
 	// Push holds (issue #170): reserve the refs this push may commit
 	// BEFORE any publication or update-hook CAS, in one atomic
@@ -240,6 +243,12 @@ func preReceive(ctx context.Context) error {
 	if holdPath := os.Getenv(EnvPushHold); holdPath != "" {
 		names := make([]string, 0, len(commands))
 		var unreserved []string
+		var probeStore ref.Store
+		defer func() {
+			if probeStore != nil {
+				probeStore.Close()
+			}
+		}()
 		for _, c := range commands {
 			// Reserve only names this server could ever commit (Codex
 			// round-5 security P2): git hands namespace roots like the
@@ -254,20 +263,51 @@ func preReceive(ctx context.Context) error {
 				unreserved = append(unreserved, c.ref)
 				continue
 			}
+			// Authority-doomed CREATIONS are not bulk-reserved either
+			// (Codex round-7 security P2): a syntactically valid,
+			// policy-allowed ancestor whose D/F children exist in the
+			// authority can never commit — its update hook's probe denies
+			// it — so reserving it would only squat on those children's
+			// namespace for the push window. Creations only, like the
+			// hook probe: updates and deletions cannot introduce a D/F
+			// pair. Fail closed on store trouble — an unprobeable
+			// authority is not proof of reservability. A legitimate
+			// delete-then-create D/F swap in ONE push still works: the
+			// creation lands in the sidecar and self-reserves at hook
+			// time, after the deletion's CAS.
+			if c.old == ref.ZeroSHA && c.new != ref.ZeroSHA {
+				if probeStore == nil {
+					var err error
+					if probeStore, err = ref.Open(ctx, mustEnv(envHookPGURL...)); err != nil {
+						return fmt.Errorf("pre-receive: open ref store for reservation probe: %w", err)
+					}
+				}
+				if denyAuthorityDFConflict(ctx, probeStore, repo, c.ref) != nil {
+					unreserved = append(unreserved, c.ref)
+					continue
+				}
+			}
 			names = append(names, c.ref)
 		}
 		if err := reservePushHolds(ctx, holdPath, names); err != nil {
 			return fmt.Errorf("pre-receive: reserve push holds: %w", err)
 		}
-		// The (typically empty) remainder goes into the sidecar the
-		// update hooks consult O(1)-when-absent, so a pre-receive-denied
-		// yet hook-allowed ref still self-reserves before its CAS while
-		// every ordinary hook skips peer scans entirely (Codex round-6
-		// P2 on #173). Suffix-excluded from hold readers; the server
-		// removes it with the hold file, the TTL sweep covers leaks.
+		// The (typically empty) remainder becomes one marker file per
+		// name in the sidecar directory, so an update hook's membership
+		// check is a single stat — absent means bulk-reserved, present
+		// means self-reserve before the CAS. Per-ref markers, not a
+		// listing file: allowed hooks re-reading a crafted push's large
+		// denied list would be O(allowed × denied) (Codex rounds 6+7
+		// P2s). Excluded from hold readers; the server removes it with
+		// the hold file, the TTL sweep covers leaks.
 		if len(unreserved) > 0 {
-			if err := os.WriteFile(holdPath+pushHoldUnreservedSuffix, []byte(strings.Join(unreserved, "\n")+"\n"), 0o600); err != nil {
+			if err := os.MkdirAll(holdPath+pushHoldUnreservedSuffix, 0o755); err != nil {
 				return fmt.Errorf("pre-receive: record unreserved refs: %w", err)
+			}
+			for _, name := range unreserved {
+				if err := os.WriteFile(pushHoldUnreservedMarker(holdPath, name), nil, 0o600); err != nil {
+					return fmt.Errorf("pre-receive: record unreserved ref: %w", err)
+				}
 			}
 		}
 		defer startPushHoldRefresh(holdPath)()
@@ -627,29 +667,23 @@ func pushRefUpdatable(name string) bool {
 	return true
 }
 
-// intraPushDFCheck denies a push whose OWN command set cannot land in one
-// git ref store (Codex round-3 P1 on #173): the authority CAS is keyed by
-// exact ref name, so a D/F-conflicting command set — refs/heads/a and
-// refs/heads/a/b both surviving — must be refused BEFORE any CAS runs, or
-// git accepts some local updates and rejects others after the authority
-// committed all of them, leaving the authority with a ref set the cache
-// cannot represent. Rules per strict-prefix pair:
-//   - both deletions: allowed (the end state has neither).
-//   - both non-deletions: denied (the end state is unrepresentable).
-//   - one deletion: git's files backend cannot reorder inside one atomic
-//     transaction (see syncRefsStreamed's D/F ordering note), so atomic
-//     pushes are denied; a non-atomic push is allowed only when the
-//     deletion PRECEDES the other command — git executes commands in
-//     order, so the doomed ref is gone before its D/F neighbor locks.
-func intraPushDFCheck(commands []refCommand, atomicPush bool) error {
-	type cmdInfo struct {
-		index    int
-		isDelete bool
-	}
-	byRef := make(map[string]cmdInfo, len(commands))
+// atomicPushDFCheck denies an ATOMIC push whose command set cannot land in
+// one git ref transaction (Codex round-3 P1 on #173): under --atomic every
+// update hook's authority CAS commits before git discovers the local D/F
+// collision and aborts the whole transaction, leaving the authority with
+// refs the client was told failed. Any strict-prefix pair is fatal unless
+// both sides are deletions (the end state has neither; git's files backend
+// cannot even reorder a delete+create D/F swap inside one transaction —
+// see syncRefsStreamed's D/F ordering note). Non-atomic pushes are NOT
+// checked: git's per-ref semantics apply, and the update hook's authority
+// probe declines exactly the losing ref at commit time (Codex round-7 P2:
+// a whole-push denial here would reject an allowed child whose denied
+// parent never survives).
+func atomicPushDFCheck(commands []refCommand) error {
+	isDelete := make(map[string]bool, len(commands))
 	names := make([]string, 0, len(commands))
-	for i, c := range commands {
-		byRef[c.ref] = cmdInfo{index: i, isDelete: c.new == ref.ZeroSHA}
+	for _, c := range commands {
+		isDelete[c.ref] = c.new == ref.ZeroSHA
 		names = append(names, c.ref)
 	}
 	set := newPushHoldSet(names)
@@ -661,26 +695,10 @@ func intraPushDFCheck(commands []refCommand, atomicPush bool) error {
 				continue
 			}
 			ancName := c.ref[:i]
-			anc, desc := byRef[ancName], byRef[c.ref]
-			if anc.isDelete && desc.isDelete {
+			if isDelete[ancName] && isDelete[c.ref] {
 				continue
 			}
-			deny := func(reason string) error {
-				return fmt.Errorf("pre-receive: refs %s and %s conflict (directory/file): %s", ancName, c.ref, reason)
-			}
-			switch {
-			case !anc.isDelete && !desc.isDelete:
-				return deny("both would exist after the push")
-			case atomicPush:
-				return deny("an atomic push cannot delete one and create the other in a single ref transaction; drop --atomic or split the push")
-			}
-			delIdx, otherIdx := anc.index, desc.index
-			if desc.isDelete {
-				delIdx, otherIdx = desc.index, anc.index
-			}
-			if delIdx > otherIdx {
-				return deny("the deletion must be ordered before the ref it unblocks; reorder the refspecs or split the push")
-			}
+			return fmt.Errorf("refs %s and %s conflict (directory/file) in one atomic transaction; drop --atomic or split the push", ancName, c.ref)
 		}
 	}
 	return nil
@@ -824,17 +842,17 @@ func updateHook(ctx context.Context, args []string) error {
 	// means this ref is already held, and only sidecar-listed refs (the
 	// rare divergence case) pay the full atomic check+reserve.
 	if holdPath != "" {
-		side, err := os.ReadFile(holdPath + pushHoldUnreservedSuffix)
-		switch {
+		switch _, err := os.Stat(pushHoldUnreservedMarker(holdPath, refName)); {
 		case errors.Is(err, os.ErrNotExist):
-			// Every command was bulk-reserved; verify the reservation
-			// actually happened (fail closed, one stat).
+			// Bulk-reserved (no sidecar, or this ref not marked); verify
+			// the reservation file actually exists (fail closed, one
+			// stat).
 			if _, err := os.Stat(holdPath); err != nil {
 				return fmt.Errorf("update: push hold reservation missing (pre-receive owns it): %w", err)
 			}
 		case err != nil:
-			return fmt.Errorf("update: read unreserved sidecar: %w", err)
-		case slices.Contains(strings.Split(string(side), "\n"), refName):
+			return fmt.Errorf("update: check unreserved marker: %w", err)
+		default:
 			if err := reservePushHolds(ctx, holdPath, []string{refName}); err != nil {
 				return fmt.Errorf("update: reserve push hold: %w", err)
 			}

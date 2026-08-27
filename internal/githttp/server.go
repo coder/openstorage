@@ -989,7 +989,7 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 		}
 		defer func() {
 			_ = os.Remove(holdPath)
-			_ = os.Remove(holdPath + pushHoldUnreservedSuffix)
+			_ = os.RemoveAll(holdPath + pushHoldUnreservedSuffix)
 		}()
 		cmd.Env = append(cmd.Env, EnvPushHold+"="+holdPath)
 	}

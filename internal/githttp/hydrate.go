@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -1132,13 +1133,23 @@ func updateRefStdin(repoPath, commands string) error {
 const (
 	pushHoldDir = "codestorage.push-holds"
 	pushHoldTTL = 5 * time.Minute
-	// pushHoldUnreservedSuffix marks a push's sidecar listing the commands
-	// pre-receive did NOT bulk-reserve (unupdatable names, policy-denied
-	// refs). Hold READERS must skip it — its names are exactly the ones
-	// that must not be treated as held — while update hooks consult it to
-	// self-reserve the rare pre-receive-denied-yet-hook-allowed ref.
+	// pushHoldUnreservedSuffix marks a push's sidecar DIRECTORY holding
+	// one empty marker file per command pre-receive did NOT bulk-reserve
+	// (unupdatable names, policy-denied refs, authority-doomed creations),
+	// keyed by the ref name's SHA-256 so an update hook's membership check
+	// is one O(1) stat — a listing file would be re-read once per allowed
+	// hook, O(allowed × denied) across a crafted mixed push (Codex round-7
+	// security P2 on #173). Hold READERS must skip it — its names are
+	// exactly the ones that must not be treated as held.
 	pushHoldUnreservedSuffix = ".unreserved"
 )
+
+// pushHoldUnreservedMarker is the sidecar marker path recording that name
+// was not bulk-reserved by pre-receive.
+func pushHoldUnreservedMarker(holdPath, name string) string {
+	sum := sha256.Sum256([]byte(name))
+	return holdPath + pushHoldUnreservedSuffix + "/" + hex.EncodeToString(sum[:])
+}
 
 // mintPushHold returns the absolute path a receive-pack request's update
 // hooks record their in-flight refs in, creating the hold directory and
@@ -1172,7 +1183,8 @@ func sweepExpiredPushHolds(dir string) {
 	for _, e := range entries {
 		info, err := e.Info()
 		if err == nil && time.Since(info.ModTime()) > pushHoldTTL {
-			_ = os.Remove(filepath.Join(dir, e.Name()))
+			// RemoveAll: unreserved sidecars are directories.
+			_ = os.RemoveAll(filepath.Join(dir, e.Name()))
 		}
 	}
 }
@@ -1210,6 +1222,10 @@ func appendPushHolds(holdPath string, names []string) error {
 func touchPushHold(holdPath string) {
 	now := time.Now()
 	_ = os.Chtimes(holdPath, now, now)
+	// The unreserved sidecar ages on the same clock: a live push longer
+	// than one TTL must not have another push's mint sweep reap its
+	// markers (Chtimes is a no-op ENOENT when no sidecar exists).
+	_ = os.Chtimes(holdPath+pushHoldUnreservedSuffix, now, now)
 }
 
 // startPushHoldRefresh keeps holdPath fresh on a TTL/4 cadence until the
@@ -1281,8 +1297,10 @@ func readPushHolds(dir, exceptPath string) (pushHoldSet, error) {
 	var names []string
 	var firstErr error
 	for _, e := range entries {
-		// Sidecars list a push's UNRESERVED names — never holds.
-		if strings.HasSuffix(e.Name(), pushHoldUnreservedSuffix) {
+		// Sidecar directories mark a push's UNRESERVED names — never
+		// holds (the IsDir check is defensive: nothing else creates
+		// directories here).
+		if strings.HasSuffix(e.Name(), pushHoldUnreservedSuffix) || e.IsDir() {
 			continue
 		}
 		path := filepath.Join(dir, e.Name())
