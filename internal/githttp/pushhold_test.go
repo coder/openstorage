@@ -910,6 +910,36 @@ func TestClassifyReservation(t *testing.T) {
 	}
 }
 
+// TestPushCommandUpdatable_DeletionsSkipMaterializationBounds (Codex
+// round-18 P2 on #173): a repository can already hold git-valid refs past
+// the depth/length caps (created before the caps, or imported by sync
+// from a permissive upstream). Deletions add no name and remove the disk
+// path instead of creating one, so they are gated on format validity
+// only — bounds still deny creations and updates of such names.
+func TestPushCommandUpdatable_DeletionsSkipMaterializationBounds(t *testing.T) {
+	sha := strings.Repeat("a", 40)
+	sha2 := strings.Repeat("b", 40)
+	zero := ref.ZeroSHA
+	deep := "refs/heads" + strings.Repeat("/x", maxPushRefDepth+5)
+	longSeg := "refs/heads/" + strings.Repeat("a", maxPushRefSegmentBytes+56)
+	for _, tc := range []struct {
+		name, old, new string
+		want           bool
+	}{
+		{deep, sha, zero, true},               // legacy over-depth deletion
+		{longSeg, sha, zero, true},            // legacy over-length deletion
+		{"refs/heads/fo~o", sha, zero, false}, // git-invalid name: git itself rejects
+		{"refs/heads", sha, zero, false},      // namespace root stays undeliverable
+		{deep, zero, sha, false},              // creation keeps the bounds
+		{longSeg, sha, sha2, false},           // update keeps the bounds
+	} {
+		if got := pushCommandUpdatable(tc.name, tc.old, tc.new); got != tc.want {
+			t.Errorf("pushCommandUpdatable(%.40s…, %.4s->%.4s) = %v, want %v",
+				tc.name, tc.old, tc.new, got, tc.want)
+		}
+	}
+}
+
 // TestReservationVerdicts_MixedPushStaysSelective (Codex round-15 P2 on
 // #173): one signature-gated command must not upgrade the WHOLE push to a
 // full policy evaluation — the ungated no-force-push update keeps its

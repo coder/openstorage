@@ -10,6 +10,7 @@ package githttp
 // with the EnvUpdateBarrier hook seam.
 
 import (
+	"context"
 	"crypto/sha1"
 	"fmt"
 	"net/http"
@@ -18,6 +19,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/coder/code-storage/internal/ref"
 )
 
 func waitForFile(t *testing.T, path string, timeout time.Duration) {
@@ -695,6 +698,42 @@ func TestPush_DoomedCreationReleasesHoldOnDenial(t *testing.T) {
 	}
 	if _, ok := refs["refs/heads/zzz"]; !ok {
 		t.Fatalf("B's valid creation zzz missing: %v", refs)
+	}
+}
+
+// TestPush_LegacyOverDepthRefDeletable (Codex round-18 P2): the authority
+// can hold a git-valid ref deeper than today's materialization caps —
+// created before the caps existed or imported by sync from a permissive
+// upstream. Its deletion adds no name and removes the on-disk path, so it
+// must pass the name gate; re-creating it stays denied.
+func TestPush_LegacyOverDepthRefDeletable(t *testing.T) {
+	repo := registerRepo(t, "t-legacy-deep-delete")
+	work := initWorkRepo(t)
+	token := mintTestToken(t, repo, "git:read,git:write", "")
+	mustGit(t, work, "push", remoteURL(nodeA, repo, token), "HEAD:refs/heads/main")
+	head := revParse(t, work, "HEAD")
+
+	// Seed the over-depth ref directly in the authority, as a pre-cap
+	// server (or permissive upstream sync) would have.
+	deep := "refs/heads" + strings.Repeat("/d", maxPushRefDepth)
+	if won, err := testStore.CASRef(context.Background(), repo, deep, ref.ZeroSHA, head); err != nil || !won {
+		t.Fatalf("seed legacy deep ref: won=%v err=%v", won, err)
+	}
+
+	out, err := tryGit(work, "push", remoteURL(nodeA, repo, token), ":"+deep)
+	if err != nil {
+		t.Fatalf("legacy over-depth ref must stay deletable: %v\n%s", err, out)
+	}
+	if _, ok := pgRefs(t, repo)[deep]; ok {
+		t.Fatalf("deletion accepted but the authority still holds %s", deep)
+	}
+	// The bounds still deny re-creating it.
+	out, err = tryGit(work, "push", remoteURL(nodeA, repo, token), "HEAD:"+deep)
+	if err == nil {
+		t.Fatalf("over-depth creation accepted:\n%s", out)
+	}
+	if !strings.Contains(out, "not updatable") {
+		t.Fatalf("over-depth creation denial reason:\n%s", out)
 	}
 }
 

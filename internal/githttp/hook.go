@@ -219,7 +219,7 @@ func preReceive(ctx context.Context) error {
 		// doomed request scale that by its command count. A complete loop
 		// leaves verdicts fully populated (all nil) for the later gates.
 		for i, c := range commands {
-			if !pushRefUpdatable(c.ref) {
+			if !pushCommandUpdatable(c.ref, c.old, c.new) {
 				return atomicDenied(fmt.Errorf("ref name %s is not updatable here (namespace root, git-invalid or unmaterializable name, or deeper than %d segments)", c.ref, maxPushRefDepth))
 			}
 			if err := evalOne(i); err != nil {
@@ -276,18 +276,26 @@ func preReceive(ctx context.Context) error {
 		// refs costs ~N+1 fee units here, and hooks re-charging another N
 		// pushed a fully compliant push past the walk allowance. Inputs
 		// are identical (same push, same policy env, same shas), so the
-		// hook-side verdict could only repeat this one. Marker count is
-		// bounded by the commands that actually PASSED verification.
-		for i, ok := range sigVerified {
-			if !ok {
-				continue
-			}
-			if err := os.MkdirAll(holdPath+pushHoldVerifiedSuffix, 0o755); err != nil {
-				return fmt.Errorf("pre-receive: record verified verdicts: %w", err)
-			}
-			c := commands[i]
-			if err := os.WriteFile(pushHoldVerifiedMarker(holdPath, c.ref, c.old, c.new), nil, 0o600); err != nil {
-				return fmt.Errorf("pre-receive: record verified verdict for %s: %w", c.ref, err)
+		// hook-side verdict could only repeat this one. Inode use is
+		// bounded (round-18 P2): an UNLIMITED budget (0) writes no
+		// markers at all — hook re-evaluation cannot exhaust a limitless
+		// allowance — and bounded budgets cap markers at
+		// maxPushVerifiedMarkers, overflow falling back to hook
+		// re-evaluation.
+		if budget, err := verifySigBudget(); err != nil || budget > 0 {
+			markers := 0
+			for i, ok := range sigVerified {
+				if !ok || markers >= maxPushVerifiedMarkers {
+					continue
+				}
+				markers++
+				if err := os.MkdirAll(holdPath+pushHoldVerifiedSuffix, 0o755); err != nil {
+					return fmt.Errorf("pre-receive: record verified verdicts: %w", err)
+				}
+				c := commands[i]
+				if err := os.WriteFile(pushHoldVerifiedMarker(holdPath, c.ref, c.old, c.new), nil, 0o600); err != nil {
+					return fmt.Errorf("pre-receive: record verified verdict for %s: %w", c.ref, err)
+				}
 			}
 		}
 		for i, c := range commands {
@@ -304,7 +312,7 @@ func preReceive(ctx context.Context) error {
 			if !atomicPush {
 				denied = classes[i] == reservationDenied
 			}
-			if !pushRefUpdatable(c.ref) || denied {
+			if !pushCommandUpdatable(c.ref, c.old, c.new) || denied {
 				unreserved = append(unreserved, c.ref)
 				continue
 			}
@@ -868,6 +876,18 @@ const (
 	maxPushRefNameBytes    = 900
 )
 
+// maxPushVerifiedMarkers bounds the ".verified" sidecar's inode count
+// (Codex round-18 P2 on #173): a same-tip signed fanout passes every
+// command via the shared range verdict, and unbounded per-command markers
+// let one compact no-pack push mint hundreds of thousands of files on the
+// shared cache volume. Overflowing commands simply skip their marker —
+// their hooks fall back to a real evaluation, whose budget fee only
+// matters when the verify budget is SMALL, and a small budget already
+// caps how many commands can pass verification in the first place (each
+// passing evaluation costs at least one fee unit of the 100×budget
+// allowance).
+const maxPushVerifiedMarkers = 4096
+
 // maxPushUnreserved caps how many of one push's commands may land in the
 // unreserved sidecar (one marker inode each — see preReceive). Membership
 // is attacker-chosen: policy-denied, unupdatable, or D/F-conflicted names
@@ -897,14 +917,10 @@ const maxPushUnreserved = 1024
 // (Stricter-than-git would instead deny representable pushes, so parity is
 // verified against `git check-ref-format` in the unit tests.)
 func pushRefUpdatable(name string) bool {
-	rest, ok := strings.CutPrefix(name, "refs/")
-	if !ok || !strings.Contains(rest, "/") {
+	if !pushRefDeletable(name) {
 		return false
 	}
 	if len(name) > maxPushRefNameBytes { // filesystem PATH_MAX headroom
-		return false
-	}
-	if strings.HasSuffix(name, ".") { // git: a refname cannot end with a dot
 		return false
 	}
 	segs := strings.Split(name, "/")
@@ -915,11 +931,42 @@ func pushRefUpdatable(name string) bool {
 		if len(seg) > maxPushRefSegmentBytes { // filesystem NAME_MAX headroom
 			return false
 		}
+	}
+	return true
+}
+
+// pushRefDeletable is the format-and-namespace half of pushRefUpdatable,
+// WITHOUT the materialization bounds (depth and byte lengths). Deletions
+// are gated on this weaker predicate (Codex round-18 P2 on #173): a
+// repository can already hold a git-valid ref past today's caps — created
+// before the caps existed, or imported by sync from a permissive upstream
+// — and a deletion adds no name, runs no authority D/F probe, and REMOVES
+// the on-disk path instead of creating one, so refusing it would make
+// exactly those legacy refs permanently undeletable through git.
+func pushRefDeletable(name string) bool {
+	rest, ok := strings.CutPrefix(name, "refs/")
+	if !ok || !strings.Contains(rest, "/") {
+		return false
+	}
+	if strings.HasSuffix(name, ".") { // git: a refname cannot end with a dot
+		return false
+	}
+	for _, seg := range strings.Split(name, "/") {
 		if !gitRefSegmentValid(seg) {
 			return false
 		}
 	}
 	return true
+}
+
+// pushCommandUpdatable applies the right name gate for one command:
+// deletions need only format validity, everything else also passes the
+// materialization bounds.
+func pushCommandUpdatable(refName, old, new string) bool {
+	if old != ref.ZeroSHA && new == ref.ZeroSHA {
+		return pushRefDeletable(refName)
+	}
+	return pushRefUpdatable(refName)
 }
 
 // dfConflictProber is the batched authority D/F probe seam (Codex
@@ -1147,8 +1194,10 @@ func updateHook(ctx context.Context, args []string) (retErr error) {
 	// bounds the authority D/F probe below to maxPushRefDepth point-reads
 	// per created ref — ref depth is attacker-chosen amplification against
 	// the shared store otherwise (Codex round-5 security P2 on #173).
-	if !pushRefUpdatable(refName) {
-		return fmt.Errorf("update: ref name %s is not updatable here (namespace root, git-invalid name, or deeper than %d segments)", refName, maxPushRefDepth)
+	// Deletions skip the materialization bounds (round-18 P2): legacy
+	// over-bound refs must stay deletable.
+	if !pushCommandUpdatable(refName, old, new) {
+		return fmt.Errorf("update: ref name %s is not updatable here (namespace root, git-invalid or unmaterializable name, or deeper than %d segments)", refName, maxPushRefDepth)
 	}
 	repo := mustEnv(EnvRepo)
 
