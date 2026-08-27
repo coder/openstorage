@@ -266,18 +266,26 @@ func benchGenerateChain(dir string, writer, n int) ([]string, error) {
 //     anything else is a foreign write;
 //  2. the tip's chain index must not exceed the writer's highest attempted
 //     push (the server cannot hold a commit never sent);
-//  3. once an ACKED tip has been observed, later observations must never
-//     fall below its index: chains are linear and pushes fast-forward
-//     only, so an acked index a ≥ i proves chain[i-1] is committed
-//     history, and any later observation < i is a lost acknowledged
-//     update even if the final state ends up legal.
+//  3. observations must never fall below the floor min(maxObserved,
+//     acked): every index that was OBSERVED on the server at any earlier
+//     poll — in-flight observations are retained, not discarded — and is
+//     acknowledged by now is committed history (chains are linear and
+//     pushes fast-forward only, so acked ≥ m proves chain[m-1] is an
+//     acknowledged ancestor, and a prior observation of m proves the
+//     server served it), so a later observation below it is a lost
+//     acknowledged update even if the final state ends up legal.
 type pushObserver struct {
-	idx   []map[string]int // per writer: sha → 1-based chain index
-	floor []int            // per writer: highest observed acked index
+	idx []map[string]int // per writer: sha → 1-based chain index
+	// maxObserved retains the highest chain index ever observed per
+	// writer, unconditionally: an in-flight tip observed before its ack
+	// is promoted into the rewind floor by the acked load of a LATER
+	// poll (discarding it would mask a rewind that happens after the ack
+	// arrives — Codex round 4).
+	maxObserved []int
 }
 
 func newPushObserver(chains [][]string) *pushObserver {
-	o := &pushObserver{idx: make([]map[string]int, len(chains)), floor: make([]int, len(chains))}
+	o := &pushObserver{idx: make([]map[string]int, len(chains)), maxObserved: make([]int, len(chains))}
 	for i, chain := range chains {
 		m := make(map[string]int, len(chain))
 		for j, sha := range chain {
@@ -289,10 +297,17 @@ func newPushObserver(chains [][]string) *pushObserver {
 }
 
 // observe validates one observation for writer i; sha is the server tip
-// ("" = branch absent). attempted must be loaded AFTER the ls-remote
-// completed (it can only overcount what the server could have seen) and
-// acked BEFORE it started (an ack landing mid-poll may not be visible yet
-// and must not raise the floor).
+// ("" = branch absent). Both attempted and acked must be loaded AFTER the
+// ls-remote completed; each side is safe on its own terms:
+//   - attempted can only OVERCOUNT what the server could have shown when
+//     the snapshot was taken, so the tip-beyond-attempted rule never
+//     false-positives (a genuine violation — a commit never sent — stays
+//     a violation under any larger attempted value);
+//   - acked only grows, and m ≤ acked is a true "push m was acknowledged"
+//     statement WHENEVER the load happens, so promoting retained
+//     observations with a later-loaded acked only adds independently-true
+//     facts to the floor. The floor can undercount (an ack landing after
+//     the load defers promotion to the next poll) but never overcount.
 func (o *pushObserver) observe(writer int, sha string, attempted, acked int) error {
 	idx := 0
 	if sha != "" {
@@ -304,12 +319,14 @@ func (o *pushObserver) observe(writer int, sha string, attempted, acked int) err
 	if idx > attempted {
 		return fmt.Errorf("writer %d: server tip %q is chain index %d, beyond the %d attempted pushes", writer, sha, idx, attempted)
 	}
-	if idx < o.floor[writer] {
-		return fmt.Errorf("writer %d: server tip rewound to chain index %d, below observed-acked index %d", writer, idx, o.floor[writer])
+	// The floor is evaluated per poll from the PRIOR maxObserved (this
+	// observation cannot vouch for itself) and the current acked: an
+	// index is floor-eligible once it has been observed at any time AND
+	// acked by now.
+	if floor := min(o.maxObserved[writer], acked); idx < floor {
+		return fmt.Errorf("writer %d: server tip rewound to chain index %d, below floor %d (observed max %d, acked %d)", writer, idx, floor, o.maxObserved[writer], acked)
 	}
-	if idx <= acked && idx > o.floor[writer] {
-		o.floor[writer] = idx
-	}
+	o.maxObserved[writer] = max(o.maxObserved[writer], idx)
 	return nil
 }
 
@@ -340,6 +357,30 @@ func TestPushObserverLegality(t *testing.T) {
 	}
 	for _, s := range steps {
 		if err := o.observe(0, s.sha, s.attempted, s.acked); (err != nil) != s.wantErr {
+			t.Errorf("%s: observe(%q, attempted=%d, acked=%d) = %v, wantErr=%v",
+				s.name, s.sha, s.attempted, s.acked, err, s.wantErr)
+		}
+	}
+
+	// Codex round-4 interleaving: a poll observes an in-flight tip k while
+	// acked is still k−1; the push acks before the next poll; the
+	// authority then rewinds to k−1. Discarding the in-flight observation
+	// (the pre-round-4 rule promoted only observations already acked at
+	// poll time) would accept the rewind — retention plus the later acked
+	// load must catch it.
+	o2 := newPushObserver([][]string{chain})
+	steps2 := []struct {
+		name             string
+		sha              string
+		attempted, acked int
+		wantErr          bool
+	}{
+		{"acked baseline observed", "aaa", 1, 1, false},
+		{"in-flight tip observed before its ack (retained)", "bbb", 2, 1, false},
+		{"rewind to the pre-ack tip after the ack arrived", "aaa", 2, 2, true},
+	}
+	for _, s := range steps2 {
+		if err := o2.observe(0, s.sha, s.attempted, s.acked); (err != nil) != s.wantErr {
 			t.Errorf("%s: observe(%q, attempted=%d, acked=%d) = %v, wantErr=%v",
 				s.name, s.sha, s.attempted, s.acked, err, s.wantErr)
 		}
@@ -544,14 +585,17 @@ func runPushWindow(b *testing.B, writers int, window time.Duration) pushWindowRe
 					return
 				case <-ticker.C:
 				}
-				ackedBefore := make([]int, writers)
-				for i := range writers {
-					ackedBefore[i] = int(acked[i].Load())
-				}
 				out, err := tryGit(seed, "ls-remote", url)
 				if err != nil {
-					b.Logf("observer ls-remote: %v\n%s", err, out)
-					continue
+					// A failed poll silently widens the observation gap,
+					// so the correctness verdict would be unreliable: the
+					// run is inconclusive, and in correctness mode
+					// inconclusive means FAILED. Loopback ls-remote
+					// failing is abnormal — tolerance is zero, the first
+					// error fails the bench (Errorf: FailNow is illegal
+					// off the benchmark goroutine) and stops observing.
+					b.Errorf("observer ls-remote failed — correctness run inconclusive: %v\n%s", err, out)
+					return
 				}
 				res.polls++
 				tips := map[string]string{}
@@ -560,9 +604,11 @@ func runPushWindow(b *testing.B, writers int, window time.Duration) pushWindowRe
 						tips[ref] = sha
 					}
 				}
+				// Both indices are loaded after the poll — see observe's
+				// load-ordering contract.
 				for i := range writers {
 					tip := tips[fmt.Sprintf("refs/heads/w%d", i)]
-					if err := obs.observe(i, tip, int(attempted[i].Load()), ackedBefore[i]); err != nil {
+					if err := obs.observe(i, tip, int(attempted[i].Load()), int(acked[i].Load())); err != nil {
 						b.Errorf("observer poll %d: %v", res.polls, err)
 					}
 				}

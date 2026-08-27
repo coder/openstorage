@@ -169,14 +169,21 @@ authority semantics the detector must witness):
   observer goroutine polls `ls-remote` every 250 ms (`observer-polls`
   counts the rounds) and validates each observation against the
   pre-generated chains: an observed tip must be on the writer's chain,
-  must not exceed the writer's attempted pushes, and — once an
-  acknowledged tip has been observed — must never fall below it. This
-  catches an acknowledged update transiently dropped and later restored by
-  a descendant push, which the final check alone cannot see (Codex
-  round-2). Honest limit: a rewind fully contained between two polls
-  remains undetectable. `TestPushObserverLegality` red-checks the legality
-  rules synthetically. Latency/throughput from correctness runs are NOT
-  performance results (see the separate subsection below).
+  must not exceed the writer's attempted pushes, and must never fall below
+  the rewind floor `min(maxObserved, acked)` — every index that was
+  observed at any earlier poll (in-flight observations are retained, not
+  discarded) and is acknowledged by now (Codex round-4: an in-flight tip
+  observed just before its ack, then rewound just after, is promoted into
+  the floor by the next poll's acked load and still caught). This catches
+  an acknowledged update transiently dropped and later restored by a
+  descendant push, which the final check alone cannot see (Codex
+  round-2). Any failed observer poll makes the run inconclusive, which
+  fails the bench — a silent poll gap would undermine the verdict, and a
+  loopback `ls-remote` failure is abnormal (tolerance: zero). Honest
+  limit: a rewind fully contained between two polls remains undetectable.
+  `TestPushObserverLegality` red-checks the legality rules synthetically,
+  including the round-4 interleaving. Latency/throughput from correctness
+  runs are NOT performance results (see the separate subsection below).
 
 **Zero violations from either detector in every cell of both campaigns.**
 
@@ -226,18 +233,19 @@ context for the correctness verdict:
 
 | Cell | observer polls | observer violations | rejected pushes | ambiguous final tips | pushes |
 |---|---|---|---|---|---|
-| s3wal, N=8 | 246 | 0 | 1 | 0 | 1,370 |
-| s3wal, N=32 | 161 | 0 | 3 | 0 | 1,696 |
-| SQLite, N=32 | 241 | 0 | 0 | 0 | 2,704 |
+| s3wal, N=8 | 242 | 0 | 0 | 0 | 1,384 |
+| s3wal, N=32 | 172 | 0 | 4 | 0 | 1,637 |
+| SQLite, N=32 | 242 | 0 | 0 | 0 | 2,666 |
 
-648 polls, all legality-clean: no foreign tips, no tips beyond attempted
-pushes, no rewind below an observed acknowledged tip. (The s3wal N=32
-observer completed fewer rounds in its 60 s because polls slow under
-peak load.)
+656 polls, all legality-clean: no foreign tips, no tips beyond attempted
+pushes, no rewind below the observed-and-acknowledged floor, and zero
+failed polls (a failed poll now fails the run as inconclusive). (The
+s3wal N=32 observer completed fewer rounds in its 60 s because polls slow
+under peak load.)
 
 ### Retry evidence (contention surfacing to the client)
 
-At N=32 on s3wal, 1 of 1,680 measured performance-mode pushes (and 3 in
+At N=32 on s3wal, 1 of 1,680 measured performance-mode pushes (and 4 in
 the correctness-mode re-run) was rejected when the hook's manifest CAS
 exhausted its bounded retry budget — a clean, git-native rejection, not a
 hang or a lost update (the accepted-tips detector accounts for every such
@@ -282,8 +290,8 @@ SeaweedFS-loopback numbers are quoted as directional evidence only:
   self-hosted store: **none observed.** Exactly-once winners across
   101,728 winning advances and 788,919 lost races in the 60 s microbench
   cells, plus a clean ls-remote lost-update detector across all 8 e2e push
-  cells (~15,500 real pushes across the performance and correctness
-  campaigns, plus 648 correctness-mode observer polls all legality-clean).
+  cells (~15,400 real pushes across the performance and correctness
+  campaigns, plus 656 correctness-mode observer polls all legality-clean).
 
 **Verdict input:** nothing in the SeaweedFS or SQLite data trips any
 threshold that can be measured locally; the real-S3 thresholds remain
