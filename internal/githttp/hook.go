@@ -253,22 +253,55 @@ func preReceive(ctx context.Context) error {
 		names := make([]string, 0, len(commands))
 		var unreserved []string
 		eligible := make([]refCommand, 0, len(commands))
-		for _, c := range commands {
+		// Non-atomic pushes classify each command with the budget-free
+		// evaluator first. Signature-GATED commands cannot be vouched for
+		// budget-free (round-12 security P2: assuming them allowed lets
+		// unsigned pushers squat D/F namespaces), but flatly diverting
+		// them breaks legitimate large SIGNED fanout pushes at the sidecar
+		// cap (Codex round-13 P2) — so when any command is
+		// signature-gated, the push's FULL verdicts (verify-sig included)
+		// are evaluated once, here, and reservations follow the REAL
+		// verdicts: valid signed refs bulk-reserve, invalid ones divert.
+		// This is the same single evaluation the atomic gate and the
+		// pack-path publication gate already perform (memoized: the later
+		// gates reuse it); verify WALKS stay single-charged because
+		// verifystate persists range verdicts across processes — the
+		// update hooks then cache-hit — matching the pack path's
+		// long-accepted "verified twice, an accepted redundancy" fee
+		// shape (rounds 4+6 kept the no-pack path evaluation-free; that
+		// stays true unless the push actually carries signature-gated
+		// commands, where the alternative is breaking them at the cap).
+		var classes []reservationClass
+		if !atomicPush {
+			classes = make([]reservationClass, len(commands))
+			needVerify := false
+			for i, c := range commands {
+				classes[i] = classifyReservation(repo, c.ref, c.old, c.new)
+				needVerify = needVerify || classes[i] == reservationNeedsVerify
+			}
+			if needVerify {
+				evalVerdicts()
+			}
+		}
+		for i, c := range commands {
 			// Reserve only names this server could ever commit (Codex
 			// round-5 security P2): git hands namespace roots like the
 			// literal refs/heads to pre-receive yet can never complete
 			// their local update, and reserving one would hold a D/F
 			// ancestor of the whole namespace. The update hook denies
 			// such names fail-closed, so skipping them here loses no
-			// protection. The policy filter is the budget-free evaluator,
-			// applied to NON-ATOMIC pushes only: the atomic gate above
-			// already evaluated full policy (verify-sig included) and
-			// denied the whole push on any failure, so its all-nil
-			// verdicts vouch for bulk reservation — routing atomic
-			// commands through the budget-free filter would needlessly
-			// divert signature-gated refs it cannot vouch for.
-			if !pushRefUpdatable(c.ref) ||
-				(!atomicPush && reservationRefPolicyDenied(repo, c.ref, c.old, c.new)) {
+			// protection. Atomic pushes reach here all-allowed (the gate
+			// above denied whole on any failure), so their verdicts vouch
+			// for the full set.
+			denied := false
+			if !atomicPush {
+				if verdicts != nil {
+					denied = verdicts[i] != nil
+				} else {
+					denied = classes[i] == reservationDenied
+				}
+			}
+			if !pushRefUpdatable(c.ref) || denied {
 				unreserved = append(unreserved, c.ref)
 				continue
 			}
@@ -303,6 +336,51 @@ func preReceive(ctx context.Context) error {
 				reservedCreations = append(reservedCreations, c.ref)
 			}
 		}
+		// Pre-reservation batch probe (Codex round-7 no-squat property,
+		// restored with the round-13/14 push-proportional batch seam):
+		// creations already doomed by the CURRENT authority never reserve
+		// at all — they divert straight to the sidecar (or deny the whole
+		// atomic push), so a crafted set of doomed parents holds nothing
+		// while it is probed. The post-reservation probe below stays the
+		// airtight racer catch; this one is the cheap common-case filter.
+		var probeStore ref.Store
+		if len(reservedCreations) > 0 {
+			var err error
+			probeStore, err = ref.Open(ctx, mustEnv(envHookPGURL...))
+			if err != nil {
+				return fmt.Errorf("pre-receive: open ref store for reservation probe: %w", err)
+			}
+			defer probeStore.Close()
+			doomed, err := authorityDoomedCreations(ctx, probeStore, repo, reservedCreations)
+			if err != nil {
+				return fmt.Errorf("pre-receive: authority D/F probe: %w", err)
+			}
+			if len(doomed) > 0 {
+				if atomicPush {
+					for _, c := range commands {
+						if derr, ok := doomed[c.ref]; ok {
+							return atomicDenied(derr)
+						}
+					}
+				}
+				keptNames := names[:0]
+				for _, name := range names {
+					if _, ok := doomed[name]; ok {
+						unreserved = append(unreserved, name)
+						continue
+					}
+					keptNames = append(keptNames, name)
+				}
+				names = keptNames
+				keptCreations := reservedCreations[:0]
+				for _, name := range reservedCreations {
+					if _, ok := doomed[name]; !ok {
+						keptCreations = append(keptCreations, name)
+					}
+				}
+				reservedCreations = keptCreations
+			}
+		}
 		// Early sidecar-cap check — see the full rationale at the second
 		// check below.
 		if len(unreserved) > maxPushUnreserved {
@@ -333,29 +411,24 @@ func preReceive(ctx context.Context) error {
 		// observes every conflicting commit, including a racer that
 		// reserved, committed, and released entirely inside our
 		// probe-to-reservation window, which any pre-reservation probe
-		// (with or without waited-name tracking) misses. Doomed creations:
-		// atomic pushes are denied WHOLE before any hook CAS (Codex
-		// round-8 P1); non-atomic ones are RELEASED from the hold file and
-		// diverted to the sidecar, so a doomed name squats on its existing
-		// D/F relatives' namespace only for the probe's round-trip, not
-		// the push window (the round-7 no-squat property), and its own
-		// hook's commit-time probe declines it. Creations only: updates
-		// and deletions cannot introduce a D/F pair. One push-proportional
-		// batch (rounds 8/9/10: deduped prefixes + decorated-order
-		// seek-merge, or ONE snapshot read on s3wal). Fail closed on store
-		// trouble. Cross-node racers remain the documented store-level
-		// TOCTOU residual. A delete-then-create D/F swap in ONE push still
-		// works: the creation is sidecar-diverted by the intra-push check
-		// above and self-reserves at hook time, after the deletion's CAS.
+		// (with or without waited-name tracking) misses. Doomed late
+		// losers: atomic pushes are denied WHOLE before any hook CAS
+		// (Codex round-8 P1); non-atomic ones are RELEASED from the hold
+		// file and diverted to the sidecar, so a doomed name squats on its
+		// existing D/F relatives' namespace only for the probe's
+		// round-trip, not the push window (the round-7 no-squat property),
+		// and its own hook's commit-time probe declines it. Creations
+		// only: updates and deletions cannot introduce a D/F pair. One
+		// push-proportional batch per probe (the dfConflictProber seam —
+		// rounds 8-14). Fail closed on store trouble. Cross-node racers
+		// remain the documented store-level TOCTOU residual. A
+		// delete-then-create D/F swap in ONE push still works: the
+		// creation is sidecar-diverted by the intra-push check above and
+		// self-reserves at hook time, after the deletion's CAS.
 		if len(reservedCreations) > 0 {
-			probeStore, err := ref.Open(ctx, mustEnv(envHookPGURL...))
-			if err != nil {
-				return fmt.Errorf("pre-receive: open ref store for reservation probe: %w", err)
-			}
 			doomed, err := authorityDoomedCreations(ctx, probeStore, repo, reservedCreations)
-			probeStore.Close()
 			if err != nil {
-				return fmt.Errorf("pre-receive: authority D/F probe: %w", err)
+				return fmt.Errorf("pre-receive: post-reservation authority D/F probe: %w", err)
 			}
 			if len(doomed) > 0 {
 				if atomicPush {
@@ -746,17 +819,6 @@ const maxPushRefDepth = 32
 // not counted — they share the single hold file.
 const maxPushUnreserved = 1024
 
-// bulkProbeCrossover is the creation count above which the post-reservation
-// authority D/F probe on point-read backends switches from per-name probes
-// to paging the repo's whole name set (Codex round-12 security P2): the
-// probe runs while this push's holds already block conflicting same-node
-// writers, so its duration must stay bounded whichever shape an attacker
-// picks — at most this many point probes, or max(1, repo refs/syncRefsBatch)
-// page reads. Below it, tiny pushes on huge repos keep the cheap indexed
-// probes (Codex rounds 9/10). Snapshot-capable stores (s3wal) always take
-// the one-read snapshot path regardless.
-const bulkProbeCrossover = 64
-
 // pushRefUpdatable reports whether receive-pack could ever commit name on
 // this server: a properly namespaced ref (refs/<ns>/<name>...) of bounded
 // depth that git itself considers well-formed. Namespace ROOTS (e.g. the
@@ -796,20 +858,23 @@ func pushRefUpdatable(name string) bool {
 	return true
 }
 
-// refNameSnapshotter is implemented by ref stores where every read
-// materializes the repo's full ref table regardless of how little it
-// returns (s3wal: one manifest object per read). The per-push authority
-// D/F probe batches through it, paying that materialization exactly once
-// per push instead of once per point read. Names must come back in
-// ascending byte order.
-type refNameSnapshotter interface {
-	SnapshotRefNames(ctx context.Context, repo string) ([]string, error)
+// dfConflictProber is the batched authority D/F probe seam (Codex
+// round-13 P2/security P2 on #173): probe work must be proportional to the
+// PUSH and indexed on the store, never repo-scaled — the probe runs while
+// the push's namespace holds block conflicting same-node writers. Every
+// production ref store implements it (PG: two round trips of indexed
+// seeks; SQLite: one call of local indexed seeks; s3wal: the single
+// manifest read every access pays anyway), compile-asserted so a store
+// change cannot silently regress pushes to the per-name fallback.
+type dfConflictProber interface {
+	DFConflicts(ctx context.Context, repo string, names []string) (map[string]string, error)
 }
 
-// Compile-time guarantee that the s3wal store keeps satisfying the probe's
-// batching seam — losing the method would silently regress every s3wal
-// push to per-read manifest materialization.
-var _ refNameSnapshotter = (*ref.S3WAL)(nil)
+var (
+	_ dfConflictProber = (*ref.PG)(nil)
+	_ dfConflictProber = (*ref.SQLite)(nil)
+	_ dfConflictProber = (*ref.S3WAL)(nil)
+)
 
 // gitRefSegmentValid mirrors git's check_refname_component (refs.c) for one
 // slash-separated segment: no empty segments (this also rejects leading,
@@ -1140,94 +1205,39 @@ func pauseAtUpdateBarrier(p string) {
 }
 
 // authorityDoomedCreations reports which of the created names are doomed
-// by a strict D/F relative existing in the authority. Probe cost is
-// proportional to the PUSH, never to the repository (Codex round-9
-// security P2 on #173: the previous full-repo paged scan let five tiny
-// creations page through EVERY authority ref — and on s3wal every page is
-// a manifest round-trip — while round-8's per-creation point probes paid
-// per-name manifest reads with no sharing):
+// by a strict D/F relative existing in the authority. Production stores
+// answer through the batched dfConflictProber seam — push-proportional,
+// indexed work in a fixed number of store calls (Codex rounds 8-13
+// lineage: per-name manifest fetches, repo-wide paged scans, and
+// per-creation seek storms were each rejected in turn; the batch probe is
+// the terminal shape). Stores without the seam (test fakes, foreign
+// decorators) fall back to deduped ancestor point-reads plus a
+// decorated-order seek-merge of single-row ListRefsAfter probes.
 //
-//   - ancestors: one GetRef point-read per UNIQUE strict prefix across the
-//     whole creation set — bulk creates share their namespace prefixes;
-//   - descendants: a seek-merge of single-row ListRefsAfter probes over
-//     the creations in DECORATED (name+"/") order. Each probe seeks
-//     straight to one creation's descendant key range, and the key it
-//     returns proves a whole span of the keyspace empty, letting every
-//     later creation whose range sits inside that span skip its probe.
-//
-// Decorated order is load-bearing (compare s3walEachBaseCoverOrder): bytes
-// like '.' sort below '/', so RAW-sorted creations ("refs/heads/a" before
-// "refs/heads/a.b") have NON-monotonic range starts, and a skip window
-// carried across them would silently skip a real conflict.
+// Decorated order in the fallback is load-bearing (compare
+// s3walEachBaseCoverOrder): bytes like '.' sort below '/', so RAW-sorted
+// creations ("refs/heads/a" before "refs/heads/a.b") have NON-monotonic
+// range starts, and a skip window carried across them would silently skip
+// a real conflict.
 //
 // Store errors fail the whole probe; callers fail closed.
-//
-// Stores whose EVERY read materializes the full ref table anyway
-// (refNameSnapshotter, i.e. s3wal manifests) are probed from ONE snapshot
-// instead (Codex round-10 security P2): the point-probe arms would pay one
-// full manifest fetch+decode PER read there — a push creating many refs,
-// or a repo with one child beneath each proposed parent, turns that into
-// per-creation full-manifest work. One snapshot is exactly one manifest
-// read, the same price as a single GetRef, and both arms run in memory.
 func authorityDoomedCreations(ctx context.Context, st ref.RefStore, repo string, names []string) (map[string]error, error) {
 	doomed := map[string]error{}
+	if len(names) == 0 {
+		return doomed, nil
+	}
 	deny := func(created, existing string) {
 		if _, dup := doomed[created]; !dup {
 			doomed[created] = fmt.Errorf("%s conflicts with existing ref %s (directory/file); delete %s first", created, existing, existing)
 		}
 	}
-	snap, isSnapshotter := st.(refNameSnapshotter)
-	if isSnapshotter || len(names) > bulkProbeCrossover {
-		var existing []string
-		if isSnapshotter {
-			var err error
-			existing, err = snap.SnapshotRefNames(ctx, repo)
-			if err != nil {
-				return nil, fmt.Errorf("directory/file snapshot probe: %w", err)
-			}
-			assertf(sort.StringsAreSorted(existing), "SnapshotRefNames returned unsorted names")
-		} else {
-			// Point-read backends above the crossover page the whole name
-			// set instead (Codex round-12 security P2): the probe runs
-			// while this push's holds already block conflicting same-node
-			// writers, so its DURATION is the attack surface — thousands
-			// of proposed parents must not cost thousands of sequential
-			// point reads. syncRefsBatch-sized pages keep that to
-			// max(1, repo refs/10k) round-trips; below the crossover,
-			// point probes keep tiny pushes on huge repos cheap (the
-			// round-9/10 requirement, unchanged).
-			after := ""
-			for {
-				page, err := st.ListRefsAfter(ctx, repo, after, syncRefsBatch)
-				if err != nil {
-					return nil, fmt.Errorf("directory/file snapshot probe: %w", err)
-				}
-				for _, e := range page {
-					existing = append(existing, e.Name)
-				}
-				if len(page) < syncRefsBatch {
-					break
-				}
-				after = page[len(page)-1].Name
-			}
+	if prober, ok := st.(dfConflictProber); ok {
+		conflicts, err := prober.DFConflicts(ctx, repo, names)
+		if err != nil {
+			return nil, fmt.Errorf("directory/file batch probe: %w", err)
 		}
-		for _, name := range names {
-			// Ancestor arm: an existing ref is a strict prefix directory.
-			for i := 0; i < len(name); i++ {
-				if name[i] != '/' {
-					continue
-				}
-				anc := name[:i]
-				if j := sort.SearchStrings(existing, anc); j < len(existing) && existing[j] == anc {
-					deny(name, anc)
-					break
-				}
-			}
-			// Descendant arm: any existing ref strictly under name.
-			lo := name + "/"
-			if j := sort.SearchStrings(existing, lo); j < len(existing) && strings.HasPrefix(existing[j], lo) {
-				deny(name, existing[j])
-			}
+		for created, existing := range conflicts {
+			deny(created, existing)
 		}
 		return doomed, nil
 	}
@@ -1401,20 +1411,36 @@ func enforceRefPolicy(ctx context.Context, repo, refName, old, new string) error
 	return evalRefPolicy(ctx, repo, refName, old, new, true)
 }
 
-// reservationRefPolicyDenied is the budget-free policy filter for hold
-// reservations (Codex round-6 P2 on #173): actually RUNNING verify-sig
-// here would charge the push's shared walk budget, which the update hooks
-// (and, on the pack path, the publication gate) bill again — a
-// double-billed budget rejects legitimate fanout pushes. Signature-GATED
-// creations and updates are therefore unreservable rather than assumed
-// allowed (Codex round-12 security P2: assuming them allowed let unsigned
-// pushers squat D/F namespaces for the push window); they reserve at hook
-// time, after the real check. no-push/no-force-push stay enforced.
-// Non-atomic only: the atomic gate evaluates FULL policy before
-// reservation, so its all-nil verdicts vouch for bulk reservation without
-// this filter's conservatism.
-func reservationRefPolicyDenied(repo, refName, old, new string) bool {
-	return evalRefPolicy(context.Background(), repo, refName, old, new, false) != nil
+// reservationClass is the budget-free reservation filter's verdict about
+// one command (Codex rounds 6, 12, 13 on #173): allowed and denied are
+// final without touching the shared verify budget; needs-verify means the
+// command is signature-gated, so vouching for its reservation requires the
+// push's REAL verdicts (pre-receive evaluates them once in that case —
+// see preReceive — because flatly diverting signature-gated commands
+// breaks legitimate large signed fanout pushes at the sidecar cap, while
+// flatly allowing them lets unsigned pushers squat D/F namespaces).
+type reservationClass int
+
+const (
+	reservationAllowed reservationClass = iota
+	reservationDenied
+	reservationNeedsVerify
+)
+
+// errReservationNeedsSig is evalRefPolicy's budget-free sentinel for
+// signature-gated non-deletion commands: not a denial, but not a verdict
+// the reservation filter may trust without real verification.
+var errReservationNeedsSig = errors.New("signature-gated command needs real verification")
+
+func classifyReservation(repo, refName, old, new string) reservationClass {
+	switch err := evalRefPolicy(context.Background(), repo, refName, old, new, false); {
+	case err == nil:
+		return reservationAllowed
+	case errors.Is(err, errReservationNeedsSig):
+		return reservationNeedsVerify
+	default:
+		return reservationDenied
+	}
 }
 
 // evalRefPolicy is the shared evaluator: evalVerifySig=false replaces
@@ -1485,16 +1511,13 @@ func evalRefPolicy(ctx context.Context, repo, refName, old, new string, evalVeri
 			} else if new != ref.ZeroSHA {
 				// Budget-free callers (the reservation filter) cannot
 				// vouch for a signature-gated creation or update without
-				// charging the shared verify budget an extra pass (Codex
-				// rounds 4+6), and treating it as allowed would let a
-				// pusher WITHOUT a valid signing key bulk-reserve the
-				// name — a D/F namespace squat for the push window (Codex
-				// round-12 security P2). Unreservable instead: the ref's
-				// hook self-reserves strictly AFTER its full policy check
-				// (verify-sig included) passes, so unsigned commands
-				// never hold anything. Deletions introduce no commits,
-				// always pass verify-sig, and stay reservable.
-				return fmt.Errorf("reservation cannot vouch for signature-gated update to %s", refName)
+				// real verification (Codex round-12 security P2: treating
+				// it as allowed would let a pusher WITHOUT a valid
+				// signing key bulk-reserve the name — a D/F namespace
+				// squat for the push window). The sentinel routes the
+				// caller to the push's REAL verdicts. Deletions introduce
+				// no commits, always pass verify-sig, and stay allowed.
+				return fmt.Errorf("%s: %w", refName, errReservationNeedsSig)
 			}
 		default:
 			// Unknown policy ops fail closed.

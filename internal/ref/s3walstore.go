@@ -575,29 +575,6 @@ func (s *S3WAL) ListRefsAfter(ctx context.Context, repo, after string, limit int
 	return refs, nil
 }
 
-// SnapshotRefNames returns every ref name of repo in ascending byte order
-// from ONE manifest read. Point-read callers pay a full viewManifest
-// materialization per call on this backend, so batch probes over many
-// names — the per-push authority D/F probe in githttp — go through this
-// seam instead, paying the manifest fetch and decode exactly once.
-func (s *S3WAL) SnapshotRefNames(ctx context.Context, repo string) ([]string, error) {
-	assertf(repo != "", "SnapshotRefNames: empty repo")
-	m, err := s.viewManifest(ctx, baseRepoOf(repo))
-	if err != nil {
-		return nil, err
-	}
-	mem := m.Member(repo)
-	if mem == nil {
-		return nil, nil
-	}
-	names := make([]string, 0, len(mem.Refs))
-	for name := range mem.Refs {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	return names, nil
-}
-
 // GetRef returns the current sha of one ref, or ErrNotFound.
 func (s *S3WAL) GetRef(ctx context.Context, repo, name string) (string, error) {
 	assertf(repo != "" && name != "", "GetRef: empty repo %q or name %q", repo, name)

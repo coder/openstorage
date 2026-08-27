@@ -544,3 +544,45 @@ func TestPush_ParentOfExistingChildCleanlyDeclined(t *testing.T) {
 	}
 	mustGit(t, "", "ls-remote", remoteURL(nodeA, repo, token))
 }
+
+// TestPush_LargeSignedFanoutNotCapped (Codex round-13 P2): a non-atomic
+// push of maxPushUnreserved+1 creations under a broad verify-sig policy,
+// all validly signed, must NOT die at the unreserved-sidecar cap:
+// pre-receive evaluates the push's REAL verdicts once (verifystate keeps
+// the walk single-charged) and bulk-reserves the verified refs, so nothing
+// signature-gated lands in the sidecar. Before the fix every gated command
+// was flatly diverted and 1,025 legitimate signed creations
+// deterministically died at the cap before any hook could verify them.
+func TestPush_LargeSignedFanoutNotCapped(t *testing.T) {
+	repo := registerRepo(t, "t-signed-fanout")
+	work := initWorkRepo(t)
+	priv, pub := genSSHKey(t)
+	key := registerSigningKey(t, pub)
+	defer removeSigningKey(t, key.ID)
+
+	// The whole history must be signed: creations introduce every commit
+	// reachable from the tip. Amend the unsigned seed commit signed, then
+	// add one more signed commit on top.
+	mustGit(t, work, append(sshSigningArgs(priv), "commit", "--amend", "--no-edit")...)
+	plain := mintTestToken(t, repo, "git:read,git:write", "")
+	mustGit(t, work, "push", remoteURL(nodeA, repo, plain), "HEAD:refs/heads/main")
+	writeFile(t, work, "s.txt", "signed\n")
+	mustGit(t, work, "add", "s.txt")
+	mustGit(t, work, append(sshSigningArgs(priv), "commit", "-m", "signed")...)
+	head := revParse(t, work, "HEAD")
+
+	vs := mintTestToken(t, repo, "git:read,git:write", `[["*",["verify-sig"]]]`)
+	args := []string{"push", remoteURL(nodeA, repo, vs)}
+	for i := 0; i <= maxPushUnreserved; i++ {
+		args = append(args, fmt.Sprintf("HEAD:refs/heads/f/%04d", i))
+	}
+	out, err := tryGit(work, args...)
+	if err != nil {
+		t.Fatalf("signed %d-ref fanout push must not be capped: %v\n%.2000s", maxPushUnreserved+1, err, out)
+	}
+	refs := pgRefs(t, repo)
+	first, last := "refs/heads/f/0000", fmt.Sprintf("refs/heads/f/%04d", maxPushUnreserved)
+	if refs[first] != head || refs[last] != head {
+		t.Fatalf("fanout refs missing: %s=%q %s=%q, want %q", first, refs[first], last, refs[last], head)
+	}
+}

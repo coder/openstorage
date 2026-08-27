@@ -32,6 +32,45 @@ func mustPacksIndexState(t *testing.T, s *PG) (exists, valid bool) {
 	return mustIndexState(t, s, "packs_repo_s3_key")
 }
 
+// explainSansSeqScan returns query's plan with seq scans priced out of
+// reach for just this transaction. The plan-shape assertions below pin
+// what the managed indexes exist FOR — the byte-ordered keyset page can be
+// served straight off the index, with no Sort — not the planner's cost
+// choice on a tiny table: the shared refs/job_scan_state tables hold a
+// handful of rows here, so whether a one-page seq scan beats the index
+// flips with autoanalyze timing (observed when TestDFConflicts_AcrossBackends
+// began seeding refs ahead of these tests). Forcing the index answers the
+// only question the assertions ask: CAN it stream this page in byte order.
+func explainSansSeqScan(t *testing.T, s *PG, query string) string {
+	t.Helper()
+	ctx := context.Background()
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin explain tx: %v", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `SET LOCAL enable_seqscan = off`); err != nil {
+		t.Fatalf("disable seqscan: %v", err)
+	}
+	rows, err := tx.Query(ctx, query)
+	if err != nil {
+		t.Fatalf("explain: %v", err)
+	}
+	defer rows.Close()
+	var plan string
+	for rows.Next() {
+		var line string
+		if err := rows.Scan(&line); err != nil {
+			t.Fatalf("scan plan: %v", err)
+		}
+		plan += line + "\n"
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("plan rows: %v", err)
+	}
+	return plan
+}
+
 func TestPGInitSchema_RepairsInvalidPacksIndex(t *testing.T) {
 	s := pgTestStore(t)
 	ctx := context.Background()
@@ -157,28 +196,13 @@ func TestPGInitSchema_RepairsInvalidRefsNameIndex(t *testing.T) {
 		t.Fatalf("after repair: exists=%v valid=%v, want a valid index", exists, valid)
 	}
 
-	// The planner must serve the COLLATE "C" keyset page from the index.
-	// EXPLAIN with generic-plan-defeating literals mirrors production
-	// parameterized queries closely enough to catch a collation mismatch
-	// (a default-collation PK cannot serve this ORDER BY).
-	rows, err := s.pool.Query(ctx, `EXPLAIN SELECT name, sha FROM refs
+	// The COLLATE "C" keyset page must be servable from the index. EXPLAIN
+	// with generic-plan-defeating literals mirrors production parameterized
+	// queries closely enough to catch a collation mismatch (a
+	// default-collation PK cannot serve this ORDER BY).
+	plan := explainSansSeqScan(t, s, `EXPLAIN SELECT name, sha FROM refs
 		WHERE repo = 'r' AND name COLLATE "C" > 'refs/heads/a'
 		ORDER BY name COLLATE "C" LIMIT 100`)
-	if err != nil {
-		t.Fatalf("explain: %v", err)
-	}
-	defer rows.Close()
-	var plan string
-	for rows.Next() {
-		var line string
-		if err := rows.Scan(&line); err != nil {
-			t.Fatalf("scan plan: %v", err)
-		}
-		plan += line + "\n"
-	}
-	if err := rows.Err(); err != nil {
-		t.Fatalf("plan rows: %v", err)
-	}
 	if !strings.Contains(plan, "refs_repo_name_c") {
 		t.Fatalf("ListRefsAfter page not served by refs_repo_name_c:\n%s", plan)
 	}
@@ -215,8 +239,8 @@ func TestPGInitSchema_RepairsInvalidScanStateScopeIndex(t *testing.T) {
 		t.Fatalf("after repair: exists=%v valid=%v, want a valid index", exists, valid)
 	}
 
-	// The planner must serve the COLLATE "C" keyset page from the index.
-	// EXPLAIN with generic-plan-defeating literals mirrors the production
+	// The COLLATE "C" keyset page must be servable from the index. EXPLAIN
+	// with generic-plan-defeating literals mirrors the production
 	// parameterized queries (ListJobScanStateScopes, SettleLFSRefunds)
 	// closely enough to catch a collation mismatch (a default-collation
 	// PK cannot serve this ORDER BY). The prefix successor is an
@@ -224,25 +248,10 @@ func TestPGInitSchema_RepairsInvalidScanStateScopeIndex(t *testing.T) {
 	// prefix check has no upper bound, so proving a short final page
 	// empty scanned every later scope of the job — the no-Filter
 	// assertion below pins the whole predicate into the index range.
-	rows, err := s.pool.Query(ctx, `EXPLAIN SELECT scope FROM job_scan_state
+	plan := explainSansSeqScan(t, s, `EXPLAIN SELECT scope FROM job_scan_state
 		WHERE job = 'lfs_reclaim' AND scope COLLATE "C" > 'refund/'
 		AND scope COLLATE "C" < 'refund0'
 		ORDER BY scope COLLATE "C" ASC LIMIT 100`)
-	if err != nil {
-		t.Fatalf("explain: %v", err)
-	}
-	defer rows.Close()
-	var plan string
-	for rows.Next() {
-		var line string
-		if err := rows.Scan(&line); err != nil {
-			t.Fatalf("scan plan: %v", err)
-		}
-		plan += line + "\n"
-	}
-	if err := rows.Err(); err != nil {
-		t.Fatalf("plan rows: %v", err)
-	}
 	if !strings.Contains(plan, "job_scan_state_job_scope_c") {
 		t.Fatalf("scan-state scope page not served by job_scan_state_job_scope_c:\n%s", plan)
 	}

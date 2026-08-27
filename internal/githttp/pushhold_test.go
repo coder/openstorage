@@ -665,39 +665,59 @@ func TestPushHoldDirCache_ReparsesOnlyOnChange(t *testing.T) {
 	}
 }
 
-// snapshotStore satisfies refNameSnapshotter; its embedded countingStore's
-// GetRef PANICS, proving the snapshot path never falls back to point reads.
-type snapshotStore struct {
+// proberStore satisfies dfConflictProber; its embedded countingStore's
+// GetRef PANICS and its ListRefsAfter count must stay zero, proving the
+// batch path never falls back to per-name reads.
+type proberStore struct {
 	*countingStore
-	snapshots int
+	probes int
 }
 
-func (s *snapshotStore) SnapshotRefNames(_ context.Context, _ string) ([]string, error) {
+func (s *proberStore) DFConflicts(_ context.Context, _ string, names []string) (map[string]string, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.snapshots++
-	names := make([]string, 0, len(s.refs))
+	existing := make([]string, 0, len(s.refs))
 	for name := range s.refs {
-		names = append(names, name)
+		existing = append(existing, name)
 	}
-	sort.Strings(names)
-	return names, nil
+	s.probes++
+	s.mu.Unlock()
+	sort.Strings(existing)
+	out := map[string]string{}
+	for _, name := range names {
+		for i := 0; i < len(name); i++ {
+			if name[i] == '/' {
+				if j := sort.SearchStrings(existing, name[:i]); j < len(existing) && existing[j] == name[:i] {
+					out[name] = name[:i]
+					break
+				}
+			}
+		}
+		if _, ok := out[name]; ok {
+			continue
+		}
+		lo := name + "/"
+		if j := sort.SearchStrings(existing, lo); j < len(existing) && strings.HasPrefix(existing[j], lo) {
+			out[name] = existing[j]
+		}
+	}
+	return out, nil
 }
 
-// TestAuthorityDoomedCreations_SnapshotStore (Codex round-10 security P2):
-// on stores where every read materializes the full ref table (s3wal
-// manifests), the probe must batch through ONE SnapshotRefNames call —
-// zero point reads, zero list pages — and reach the same verdicts.
-func TestAuthorityDoomedCreations_SnapshotStore(t *testing.T) {
+// TestAuthorityDoomedCreations_BatchProber (Codex rounds 10-13 on #173):
+// stores implementing the batched D/F seam must be probed through ONE
+// DFConflicts call — zero point reads, zero list pages — whatever the
+// creation count or authority shape (the store's GetRef panics and its
+// list counter must stay zero, so any fallback is loudly red). The shape
+// is the reviewers' crafted worst case: one existing child beneath each
+// proposed parent.
+func TestAuthorityDoomedCreations_BatchProber(t *testing.T) {
 	refs := map[string]string{
 		"refs/heads/a":     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 		"refs/heads/x/y":   "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 		"refs/heads/plain": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 	}
-	// One existing child beneath each proposed parent — the round-10
-	// crafted shape that defeated the seek-merge's skip windows.
 	var creations []string
-	for i := 0; i < 50; i++ {
+	for i := 0; i < 100; i++ {
 		parent := fmt.Sprintf("refs/heads/p%03d", i)
 		refs[parent+"/held"] = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 		creations = append(creations, parent)
@@ -708,25 +728,25 @@ func TestAuthorityDoomedCreations_SnapshotStore(t *testing.T) {
 		"refs/heads/plain", // exact name exists: NOT a D/F conflict
 		"refs/heads/new1",
 	)
-	st := &snapshotStore{countingStore: &countingStore{gen: 1, refs: refs}}
+	st := &proberStore{countingStore: &countingStore{gen: 1, refs: refs}}
 	doomed, err := authorityDoomedCreations(context.Background(), st, "r", creations)
 	if err != nil {
 		t.Fatalf("authorityDoomedCreations: %v", err)
 	}
-	if len(doomed) != 52 {
-		t.Fatalf("doomed = %d names, want 52 (50 squatted parents + a/b + x): %v", len(doomed), doomed)
+	if len(doomed) != 102 {
+		t.Fatalf("doomed = %d names, want 102 (100 squatted parents + a/b + x)", len(doomed))
 	}
-	for _, want := range []string{"refs/heads/a/b", "refs/heads/x", "refs/heads/p000", "refs/heads/p049"} {
+	for _, want := range []string{"refs/heads/a/b", "refs/heads/x", "refs/heads/p000", "refs/heads/p099"} {
 		if _, ok := doomed[want]; !ok {
 			t.Errorf("%s not reported doomed", want)
 		}
 	}
-	if st.snapshots != 1 {
-		t.Errorf("snapshots = %d, want exactly 1", st.snapshots)
+	if st.probes != 1 {
+		t.Errorf("DFConflicts calls = %d, want exactly 1", st.probes)
 	}
 	_, listCalls, _ := st.counts()
 	if listCalls != 0 {
-		t.Errorf("listRefsCalls = %d, want 0 — the snapshot path issued store reads", listCalls)
+		t.Errorf("listRefsCalls = %d, want 0 — the batch path issued per-name store reads", listCalls)
 	}
 }
 
@@ -776,70 +796,32 @@ func TestIsAncestor_Memoized(t *testing.T) {
 	}
 }
 
-// TestReservationFilter_SignatureGatedUnreservable (Codex round-12
-// security P2): the budget-free reservation filter must refuse to vouch
-// for signature-gated creations and updates — treating them as allowed
-// would let a pusher WITHOUT a valid signing key bulk-reserve (and
-// thereby D/F-squat) names its hooks can never commit. Deletions
-// introduce no commits and stay reservable, as do refs whose rules carry
-// no verify-sig.
-func TestReservationFilter_SignatureGatedUnreservable(t *testing.T) {
-	t.Setenv(EnvRefsPolicy, `[["refs/heads/sigx",["verify-sig"]],["refs/heads/plainx",[]]]`)
+// TestClassifyReservation (Codex rounds 12+13 on #173): the budget-free
+// reservation filter must return needs-verify for signature-gated
+// creations and updates — flatly allowing them lets unsigned pushers
+// D/F-squat namespaces, flatly denying them breaks legitimate signed
+// fanout pushes at the sidecar cap (pre-receive resolves needs-verify by
+// evaluating the push's REAL verdicts once). Deletions and rules without
+// verify-sig stay allowed; no-push stays denied.
+func TestClassifyReservation(t *testing.T) {
+	t.Setenv(EnvRefsPolicy, `[["refs/heads/sigx",["verify-sig"]],["refs/heads/plainx",[]],["refs/heads/nopush",["no-push"]]]`)
 	sha := strings.Repeat("a", 40)
 	sha2 := strings.Repeat("b", 40)
 	zero := strings.Repeat("0", 40)
 	for _, tc := range []struct {
 		ref, old, new string
-		want          bool
+		want          reservationClass
 	}{
-		{"refs/heads/sigx", zero, sha, true},    // gated creation
-		{"refs/heads/sigx", sha, sha2, true},    // gated update
-		{"refs/heads/sigx", sha, zero, false},   // deletion: vouchable
-		{"refs/heads/plainx", zero, sha, false}, // matched, no verify-sig
-		{"refs/heads/free", zero, sha, false},   // unpoliced
+		{"refs/heads/sigx", zero, sha, reservationNeedsVerify}, // gated creation
+		{"refs/heads/sigx", sha, sha2, reservationNeedsVerify}, // gated update
+		{"refs/heads/sigx", sha, zero, reservationAllowed},     // deletion: vouchable
+		{"refs/heads/plainx", zero, sha, reservationAllowed},   // matched, no verify-sig
+		{"refs/heads/free", zero, sha, reservationAllowed},     // unpoliced
+		{"refs/heads/nopush", zero, sha, reservationDenied},    // hard denial
 	} {
-		if got := reservationRefPolicyDenied("r", tc.ref, tc.old, tc.new); got != tc.want {
-			t.Errorf("reservationRefPolicyDenied(%s %.4s->%.4s) = %v, want %v",
+		if got := classifyReservation("r", tc.ref, tc.old, tc.new); got != tc.want {
+			t.Errorf("classifyReservation(%s %.4s->%.4s) = %v, want %v",
 				tc.ref, tc.old, tc.new, got, tc.want)
 		}
-	}
-}
-
-// TestAuthorityDoomedCreations_LargeSetBoundedProbes (Codex round-12
-// security P2): above bulkProbeCrossover creations, point-read backends
-// must page the repo's whole name set instead of issuing per-creation
-// probes — the probe runs while this push's holds already block
-// conflicting same-node writers, so its duration is the attack surface.
-// 100 proposed parents over existing children must cost one 10k-page read,
-// zero point reads, and still doom every conflicted name.
-func TestAuthorityDoomedCreations_LargeSetBoundedProbes(t *testing.T) {
-	refs := map[string]string{}
-	for i := 0; i < 2000; i++ {
-		refs[fmt.Sprintf("refs/zbulk/b%04d", i)] = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-	}
-	var creations []string
-	for i := 0; i < 100; i++ {
-		parent := fmt.Sprintf("refs/heads/p%03d", i)
-		refs[parent+"/held"] = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-		creations = append(creations, parent)
-	}
-	creations = append(creations, "refs/heads/clean")
-	st := &probeCountStore{countingStore: &countingStore{gen: 1, refs: refs}}
-	doomed, err := authorityDoomedCreations(context.Background(), st, "r", creations)
-	if err != nil {
-		t.Fatalf("authorityDoomedCreations: %v", err)
-	}
-	if len(doomed) != 100 {
-		t.Fatalf("doomed = %d names, want the 100 squatted parents", len(doomed))
-	}
-	if _, ok := doomed["refs/heads/clean"]; ok {
-		t.Fatal("unconflicted creation doomed")
-	}
-	if st.getRefCalls != 0 {
-		t.Errorf("getRefCalls = %d, want 0 — large sets must not point-probe", st.getRefCalls)
-	}
-	_, listCalls, _ := st.counts()
-	if listCalls > 2 {
-		t.Errorf("listRefsCalls = %d, want <= 2 (one full 10k page + terminator)", listCalls)
 	}
 }
