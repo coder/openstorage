@@ -1429,9 +1429,17 @@ func (s pushHoldSet) covers(name string) bool {
 	return s.contains(name) || s.holdsAncestorOf(name) || s.holdsDescendantOf(name)
 }
 
-// conflicts reports whether a STRICT D/F relative of name is held (equality
-// excluded: same-name races are resolved cleanly by the authority CAS
-// itself).
+// conflicts reports whether a STRICT D/F relative of name is held, equality
+// excluded. Its remaining caller is pre-receive's INTRA-push creation check,
+// where the probed set always contains the probed name itself; RESERVATION
+// against peer holds uses covers instead (Codex round-14 P1 on #173): a
+// held name's authority value may already differ from the git cache — the
+// hold exists precisely to keep hydration off it — so a same-name peer
+// reserving through would base its push on a stale value, and for an
+// ATOMIC push the resulting mid-sequence CAS loss strands earlier
+// commands' committed authority updates. Same-name races now serialize on
+// the hold; the loser then fails cleanly against the healed cache or the
+// atomic base check instead of half-committing.
 func (s pushHoldSet) conflicts(name string) bool {
 	return s.holdsAncestorOf(name) || s.holdsDescendantOf(name)
 }
@@ -1441,9 +1449,10 @@ func (s pushHoldSet) conflicts(name string) bool {
 // Hold windows are server-controlled and normally millisecond-scale.
 var pushHoldWaitMax = 10 * time.Second
 
-// reservePushHolds atomically verifies that no OTHER live push holds a
-// strict D/F relative of any of names, then appends all of names to this
-// push's hold file — ONE check+reserve per push, serialized against
+// reservePushHolds atomically verifies that no OTHER live push holds any
+// of names or a strict D/F relative of one (covers semantics — see
+// conflicts for why equality is a conflict here), then appends all of
+// names to this push's hold file — ONE check+reserve per push, serialized against
 // concurrent reservers by an exclusive lock file (Codex round-2 P1 on
 // #173: a non-atomic check-then-append lets two pushes creating
 // refs/heads/a and refs/heads/a/b both pass, and the authority CAS — keyed
@@ -1503,7 +1512,7 @@ func reservePushHolds(ctx context.Context, holdPath string, names []string) erro
 		}
 		conflict := ""
 		for _, name := range names {
-			if peers.conflicts(name) {
+			if peers.covers(name) {
 				conflict = name
 				break
 			}
@@ -1515,7 +1524,7 @@ func reservePushHolds(ctx context.Context, holdPath string, names []string) erro
 		}
 		unlock()
 		if time.Now().After(deadline) || ctx.Err() != nil {
-			return fmt.Errorf("a concurrent push holds a ref conflicting with %s (directory/file); retry shortly", conflict)
+			return fmt.Errorf("a concurrent push holds a ref conflicting with %s (same ref or directory/file relative); retry shortly", conflict)
 		}
 		select {
 		case <-ctx.Done():

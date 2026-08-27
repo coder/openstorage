@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -124,8 +125,10 @@ func TestSyncRefsStreamed_SkipsHeldDFRelatives(t *testing.T) {
 
 // TestPushHoldSet_CoversAndConflicts pins the D/F matching semantics:
 // covers is equality plus strict prefix relations in both directions;
-// conflicts excludes equality (same-name races are resolved cleanly by the
-// authority CAS itself).
+// conflicts excludes equality — it serves pre-receive's INTRA-push
+// creation check, where the probed set always contains the probed name
+// itself (peer-hold reservation uses covers: same-name holds are
+// exclusive, see the round-14 atomic base check).
 func TestPushHoldSet_CoversAndConflicts(t *testing.T) {
 	s := newPushHoldSet([]string{"refs/heads/a"})
 	for name, want := range map[string][2]bool{ // name -> {covers, conflicts}
@@ -222,10 +225,12 @@ func TestReservePushHolds_RejectsMalformedInput(t *testing.T) {
 }
 
 // TestReservePushHolds_DeniesLiveConflictFailsClosed: a reservation racing
-// a live D/F-conflicting hold from another push waits briefly and then
-// DENIES rather than committing past the conflict; same-name overlap and
-// unrelated names reserve immediately, and an expired conflicting hold is
-// ignored.
+// a live conflicting hold from another push — a strict D/F relative or the
+// SAME name (Codex round-14 P1: same-name exclusion is what freezes a held
+// name's authority value on this node and makes the atomic base check
+// sound) — waits briefly and then DENIES rather than committing past the
+// conflict; unrelated names reserve immediately, and an expired
+// conflicting hold is ignored.
 func TestReservePushHolds_DeniesLiveConflictFailsClosed(t *testing.T) {
 	dir := t.TempDir()
 	other := mintHold(t, dir, "refs/heads/a")
@@ -243,17 +248,17 @@ func TestReservePushHolds_DeniesLiveConflictFailsClosed(t *testing.T) {
 	} else if !strings.Contains(err.Error(), "conflicting") {
 		t.Fatalf("denial reason = %v, want a conflict message", err)
 	}
-	// Same-name and unrelated refs are NOT conflicts.
-	if err := reservePushHolds(context.Background(), own, []string{"refs/heads/a", "refs/heads/z"}); err != nil {
+	if err := reservePushHolds(context.Background(), own, []string{"refs/heads/a"}); err == nil {
+		t.Fatal("reservation past a live same-name hold accepted")
+	}
+	// Unrelated refs reserve immediately.
+	if err := reservePushHolds(context.Background(), own, []string{"refs/heads/z"}); err != nil {
 		t.Fatalf("non-conflicting reservation denied: %v", err)
 	}
-	// An expired conflicting hold is a crash leak, not a conflict. (own
-	// also holds refs/heads/a by now — expire both.)
+	// An expired conflicting hold is a crash leak, not a conflict.
 	expired := time.Now().Add(-pushHoldTTL - time.Minute)
-	for _, p := range []string{other, own} {
-		if err := os.Chtimes(p, expired, expired); err != nil {
-			t.Fatalf("Chtimes: %v", err)
-		}
+	if err := os.Chtimes(other, expired, expired); err != nil {
+		t.Fatalf("Chtimes: %v", err)
 	}
 	own2, err := mintPushHold(dir)
 	if err != nil {
@@ -750,6 +755,63 @@ func TestAuthorityDoomedCreations_BatchProber(t *testing.T) {
 	}
 }
 
+// valuesProberStore satisfies refValuesProber; its embedded countingStore's
+// GetRef PANICS, proving the batch path never falls back to per-name reads.
+type valuesProberStore struct {
+	*countingStore
+	probes int
+}
+
+func (s *valuesProberStore) RefValues(_ context.Context, _ string, names []string) (map[string]string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.probes++
+	out := map[string]string{}
+	for _, name := range names {
+		if sha, ok := s.refs[name]; ok {
+			out[name] = sha
+		}
+	}
+	return out, nil
+}
+
+// TestAuthorityRefValues_BatchProber (Codex round-14 P1 on #173): stores
+// implementing the batched exact-value seam answer the atomic base check
+// through ONE RefValues call — zero point reads whatever the command count
+// (the store's GetRef panics, so any fallback is loudly red); stores
+// without the seam fall back to per-name point-reads with absent names
+// omitted.
+func TestAuthorityRefValues_BatchProber(t *testing.T) {
+	const sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	refs := map[string]string{"refs/heads/a": sha, "refs/heads/b": sha}
+	names := []string{"refs/heads/a", "refs/heads/b", "refs/heads/absent"}
+	want := map[string]string{"refs/heads/a": sha, "refs/heads/b": sha}
+
+	st := &valuesProberStore{countingStore: &countingStore{gen: 1, refs: refs}}
+	got, err := authorityRefValues(context.Background(), st, "r", names)
+	if err != nil {
+		t.Fatalf("authorityRefValues: %v", err)
+	}
+	if !maps.Equal(got, want) {
+		t.Fatalf("prober path = %v, want %v", got, want)
+	}
+	if st.probes != 1 {
+		t.Errorf("RefValues calls = %d, want exactly 1", st.probes)
+	}
+
+	fb := &probeCountStore{countingStore: &countingStore{gen: 1, refs: refs}}
+	got, err = authorityRefValues(context.Background(), fb, "r", names)
+	if err != nil {
+		t.Fatalf("authorityRefValues fallback: %v", err)
+	}
+	if !maps.Equal(got, want) {
+		t.Fatalf("fallback path = %v, want %v", got, want)
+	}
+	if fb.getRefCalls != len(names) {
+		t.Errorf("fallback getRefCalls = %d, want %d (one per name)", fb.getRefCalls, len(names))
+	}
+}
+
 // TestRemovePushHolds: releasing a doomed reservation must drop exactly
 // the named refs, keep the rest, and leave no temp file behind (the
 // rewrite is temp+rename so readers never see a truncated hold).
@@ -804,7 +866,7 @@ func TestIsAncestor_Memoized(t *testing.T) {
 // evaluating the push's REAL verdicts once). Deletions and rules without
 // verify-sig stay allowed; no-push stays denied.
 func TestClassifyReservation(t *testing.T) {
-	t.Setenv(EnvRefsPolicy, `[["refs/heads/sigx",["verify-sig"]],["refs/heads/plainx",[]],["refs/heads/nopush",["no-push"]]]`)
+	t.Setenv(EnvRefsPolicy, `[["refs/heads/sigx",["verify-sig"]],["refs/heads/plainx",[]],["refs/heads/nopush",["no-push"]],["refs/heads/noff",["no-force-push"]]]`)
 	sha := strings.Repeat("a", 40)
 	sha2 := strings.Repeat("b", 40)
 	zero := strings.Repeat("0", 40)
@@ -818,6 +880,15 @@ func TestClassifyReservation(t *testing.T) {
 		{"refs/heads/plainx", zero, sha, reservationAllowed},   // matched, no verify-sig
 		{"refs/heads/free", zero, sha, reservationAllowed},     // unpoliced
 		{"refs/heads/nopush", zero, sha, reservationDenied},    // hard denial
+		// no-force-push updates classify WITHOUT the ancestry subprocess
+		// (Codex round-14 security P2: classification cost is
+		// attacker-chosen, so it must never launch git merge-base — the
+		// update hook performs the real check). These shas exist in no
+		// repository, so reservationAllowed is only reachable
+		// subprocess-free: a real ancestry evaluation would deny.
+		{"refs/heads/noff", sha, sha2, reservationAllowed}, // update: hook enforces
+		{"refs/heads/noff", sha, zero, reservationDenied},  // deletion: budget-free denial
+		{"refs/heads/noff", zero, sha, reservationAllowed}, // creation: no rewind possible
 	} {
 		if got := classifyReservation("r", tc.ref, tc.old, tc.new); got != tc.want {
 			t.Errorf("classifyReservation(%s %.4s->%.4s) = %v, want %v",

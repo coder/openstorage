@@ -344,13 +344,15 @@ func preReceive(ctx context.Context) error {
 		// while it is probed. The post-reservation probe below stays the
 		// airtight racer catch; this one is the cheap common-case filter.
 		var probeStore ref.Store
-		if len(reservedCreations) > 0 {
+		if len(reservedCreations) > 0 || atomicPush {
 			var err error
 			probeStore, err = ref.Open(ctx, mustEnv(envHookPGURL...))
 			if err != nil {
 				return fmt.Errorf("pre-receive: open ref store for reservation probe: %w", err)
 			}
 			defer probeStore.Close()
+		}
+		if len(reservedCreations) > 0 {
 			doomed, err := authorityDoomedCreations(ctx, probeStore, repo, reservedCreations)
 			if err != nil {
 				return fmt.Errorf("pre-receive: authority D/F probe: %w", err)
@@ -401,6 +403,42 @@ func preReceive(ctx context.Context) error {
 		// (Markers created below start fresh and are re-covered on the
 		// next tick; touchPushHold tolerates the sidecar not existing.)
 		defer startPushHoldRefresh(holdPath)()
+		// Atomic base check (Codex round-14 P1 on #173): every command's
+		// exact authority value must still match the client's declared old
+		// before ANY update hook can commit — under --atomic a
+		// mid-sequence CAS loss cannot retract the authority updates
+		// earlier hooks already committed, so git's abort of the local
+		// transaction would report the whole push failed while part of it
+		// stands in the authority. The check is sound HERE and only here:
+		// the reservation above now excludes same-name peer holds (covers
+		// semantics), so a held name's authority value is frozen against
+		// same-node writers from reservation until release — a stale base
+		// (say, a peer that committed while hydration deliberately left
+		// the git cache old) is caught before any CAS instead of
+		// mid-sequence. One push-proportional batch (refValuesProber);
+		// fail closed on store trouble. Cross-node racers remain the
+		// documented store-level TOCTOU residual. Non-atomic pushes keep
+		// git's per-ref semantics: an individual stale CAS loses alone.
+		if atomicPush {
+			refNames := make([]string, 0, len(commands))
+			for _, c := range commands {
+				refNames = append(refNames, c.ref)
+			}
+			values, err := authorityRefValues(ctx, probeStore, repo, refNames)
+			if err != nil {
+				return fmt.Errorf("pre-receive: atomic base check: %w", err)
+			}
+			for _, c := range commands {
+				switch got, exists := values[c.ref]; {
+				case c.old == ref.ZeroSHA && exists:
+					return atomicDenied(fmt.Errorf("%s already exists (created concurrently); fetch first", c.ref))
+				case c.old != ref.ZeroSHA && !exists:
+					return atomicDenied(fmt.Errorf("%s no longer exists (deleted concurrently); fetch first", c.ref))
+				case c.old != ref.ZeroSHA && got != c.old:
+					return atomicDenied(fmt.Errorf("%s moved concurrently (expected %.8s); fetch first", c.ref, c.old))
+				}
+			}
+		}
 		// Authority D/F probe for every bulk-reserved creation, run
 		// strictly AFTER the reservation landed — the only airtight probe
 		// point on this node (Codex rounds 7-11 lineage; round-11 P1
@@ -875,6 +913,46 @@ var (
 	_ dfConflictProber = (*ref.SQLite)(nil)
 	_ dfConflictProber = (*ref.S3WAL)(nil)
 )
+
+// refValuesProber is the batched authority exact-value probe seam for the
+// atomic-push base check (Codex round-14 P1 on #173) — the same
+// push-proportional contract as dfConflictProber. Every production ref
+// store implements it (PG/SQLite: indexed membership reads; s3wal: the
+// single manifest read every access pays anyway), compile-asserted so a
+// store change cannot silently regress atomic pushes to per-name reads.
+type refValuesProber interface {
+	RefValues(ctx context.Context, repo string, names []string) (map[string]string, error)
+}
+
+var (
+	_ refValuesProber = (*ref.PG)(nil)
+	_ refValuesProber = (*ref.SQLite)(nil)
+	_ refValuesProber = (*ref.S3WAL)(nil)
+)
+
+// authorityRefValues returns the authority's current sha for each of the
+// named refs, omitting absent ones. Production stores answer through the
+// batched refValuesProber seam; stores without it (test fakes, foreign
+// decorators) fall back to per-name GetRef point-reads — acceptable there
+// because atomic pushes bound names by the client's command list. Store
+// errors fail the whole probe; callers fail closed.
+func authorityRefValues(ctx context.Context, st ref.RefStore, repo string, names []string) (map[string]string, error) {
+	if prober, ok := st.(refValuesProber); ok {
+		return prober.RefValues(ctx, repo, names)
+	}
+	out := make(map[string]string, len(names))
+	for _, name := range names {
+		switch sha, err := st.GetRef(ctx, repo, name); {
+		case err == nil:
+			out[name] = sha
+		case errors.Is(err, ref.ErrNotFound):
+			// absent: omitted
+		default:
+			return nil, fmt.Errorf("authority value probe for %s: %w", name, err)
+		}
+	}
+	return out, nil
+}
 
 // gitRefSegmentValid mirrors git's check_refname_component (refs.c) for one
 // slash-separated segment: no empty segments (this also rejects leading,
@@ -1443,11 +1521,16 @@ func classifyReservation(repo, refName, old, new string) reservationClass {
 	}
 }
 
-// evalRefPolicy is the shared evaluator: evalVerifySig=false replaces
-// signature verification with a fail-unreservable verdict for non-deletion
-// commands, for callers that must not charge the shared verify-sig state
-// and walk budget.
-func evalRefPolicy(ctx context.Context, repo, refName, old, new string, evalVerifySig bool) error {
+// evalRefPolicy is the shared evaluator. fullEval=false is the budget-free
+// mode for the reservation classifier: it replaces signature verification
+// with a fail-unreservable verdict for non-deletion commands (callers must
+// not charge the shared verify-sig state and walk budget) and skips the
+// no-force-push ancestry subprocess (treating the update as reservable —
+// the ref's own update hook re-runs the full check before its CAS).
+// Classification must never launch subprocesses: its cost is
+// attacker-chosen via the push's command list (Codex round-14 security
+// P2).
+func evalRefPolicy(ctx context.Context, repo, refName, old, new string, fullEval bool) error {
 	policyJSON := os.Getenv(EnvRefsPolicy)
 	opsJSON := os.Getenv(EnvOps)
 	if policyJSON == "" && opsJSON == "" {
@@ -1499,12 +1582,26 @@ func evalRefPolicy(ctx context.Context, repo, refName, old, new string, evalVeri
 				if new == ref.ZeroSHA {
 					return fmt.Errorf("policy no-force-push denies deletion of %s", refName)
 				}
-				if !isAncestor(old, new) {
+				// Budget-free callers (the reservation classifier) skip
+				// the ancestry subprocess and treat the update as
+				// reservable (Codex round-14 security P2: a no-pack push
+				// advancing thousands of refs from DISTINCT old commits
+				// would otherwise launch one git merge-base per pair in
+				// pre-receive — the memo only dedupes identical pairs —
+				// on top of the one each update hook process pays
+				// anyway). Reserving a doomed non-fast-forward update
+				// squats nothing: its name already exists in the
+				// authority, which blocks D/F relatives regardless, and
+				// any git:write pusher could hold the same name with a
+				// valid update. The commit is still policed — the ref's
+				// own update hook re-runs this check with fullEval
+				// before its CAS.
+				if fullEval && !isAncestor(old, new) {
 					return fmt.Errorf("policy no-force-push denies non-fast-forward update to %s", refName)
 				}
 			}
 		case auth.OpVerifySig:
-			if evalVerifySig {
+			if fullEval {
 				if err := verifySig(ctx, refName, old, new); err != nil {
 					return err
 				}

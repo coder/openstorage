@@ -586,3 +586,124 @@ func TestPush_LargeSignedFanoutNotCapped(t *testing.T) {
 		t.Fatalf("fanout refs missing: %s=%q %s=%q, want %q", first, refs[first], last, refs[last], head)
 	}
 }
+
+// TestAtomicPush_StaleBaseDeniedBeforeAnyCAS (Codex round-14 P1 on #173):
+// while push A pauses between its committed authority CAS and its local
+// ref update, hydration deliberately leaves the held ref at its old cache
+// value — so a concurrent atomic push B is ADVERTISED the stale base and
+// declares it. Under --atomic, letting B reach its update hooks
+// half-commits: an unrelated command's CAS lands first, then the stale
+// ref's CAS loses, git aborts the whole local transaction, and the client
+// is told the atomic push failed while the unrelated update stands in the
+// authority. B must instead (1) wait out A's same-name hold at reservation
+// (covers semantics — the hold freezes the name's authority value on this
+// node) and then (2) be denied WHOLE by the pre-receive atomic base check,
+// before any update hook can run.
+func TestAtomicPush_StaleBaseDeniedBeforeAnyCAS(t *testing.T) {
+	repo := registerRepo(t, "t-atomic-stale-base")
+	work := initWorkRepo(t)
+	token := mintTestToken(t, repo, "git:read,git:write", "")
+	mustGit(t, work, "push", remoteURL(nodeA, repo, token),
+		"HEAD:refs/heads/main", "HEAD:refs/heads/race", "HEAD:refs/heads/early")
+	v1 := revParse(t, work, "HEAD")
+
+	// Clone at V1 for the atomic pusher, then advance work to V2 for A.
+	workB := filepath.Join(t.TempDir(), "clone-b")
+	mustGit(t, "", "clone", work, workB)
+	mustGit(t, work, "commit", "--allow-empty", "-m", "A: race to V2")
+	v2 := revParse(t, work, "HEAD")
+	mustGit(t, workB, "commit", "--allow-empty", "-m", "B: race to V3, never lands")
+
+	barrier := filepath.Join(t.TempDir(), "update-barrier")
+	cacheDir := filepath.Join(t.TempDir(), "cache")
+	node, err := startNode(cacheDir, EnvUpdateBarrier+"="+barrier)
+	if err != nil {
+		t.Fatalf("start node: %v", err)
+	}
+	t.Cleanup(node.stop)
+
+	type pushResult struct {
+		out string
+		err error
+	}
+	// Push A: race V1 -> V2; its update hook (the node's first) consumes
+	// the one-shot barrier and pauses post-CAS with its hold live.
+	doneA := make(chan pushResult, 1)
+	go func() {
+		out, err := tryGit(work, "push", remoteURL(node, repo, token), "HEAD:refs/heads/race")
+		doneA <- pushResult{out, err}
+	}()
+	waitForFile(t, barrier+".ready", 30*time.Second)
+
+	// Push B (atomic): its advertisement reads the cache, where hydration
+	// skipped the held race ref — B declares the STALE base for race —
+	// plus an update of the existing sibling refs/heads/early, whose
+	// update hook runs FIRST ("early" precedes "race" in receive-pack's
+	// command order) and would commit its authority CAS before the stale
+	// ref's hook can lose: the finding's half-commit shape.
+	doneB := make(chan pushResult, 1)
+	go func() {
+		out, err := tryGit(workB, "push", "--atomic", remoteURL(node, repo, token),
+			"HEAD:refs/heads/early", "HEAD:refs/heads/race")
+		doneB <- pushResult{out, err}
+	}()
+
+	// Release A only after B's receive-pack created its object quarantine
+	// (objects/tmp_objdir-*): git pushes advertise via GET strictly before
+	// the POST whose receive-pack quarantines the pack, so by then B's
+	// stale V1 advertisement is fixed — taken strictly before A's local
+	// update could heal the cache. Any quarantine seen here is B's: git
+	// migrates a push's quarantine when its PRE-RECEIVE approves, so A —
+	// paused inside an update hook since before B started — no longer has
+	// one. Whether B then waits out A's same-name hold or reserves just
+	// after A released, the base check reads race=V2 against B's declared
+	// V1 either way — no sleep-based timing.
+	objDir := filepath.Join(RepoPath(cacheDir, repo), "objects")
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		quarantines := 0
+		entries, _ := os.ReadDir(objDir)
+		for _, e := range entries {
+			if strings.HasPrefix(e.Name(), "tmp_objdir") {
+				quarantines++
+			}
+		}
+		if quarantines >= 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for push B's receive-pack quarantine")
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if err := os.WriteFile(barrier+".release", nil, 0o644); err != nil {
+		t.Fatalf("release barrier: %v", err)
+	}
+
+	resA := <-doneA
+	t.Logf("push A (race to V2):\n%s", resA.out)
+	if resA.err != nil {
+		t.Fatalf("push A failed: %v\n%s", resA.err, resA.out)
+	}
+	resB := <-doneB
+	t.Logf("push B (atomic, stale base):\n%s", resB.out)
+	if resB.err == nil {
+		t.Fatalf("atomic push with a stale base accepted:\n%s", resB.out)
+	}
+	refs := pgRefs(t, repo)
+	// The load-bearing assertion: nothing of B may stand in the authority
+	// after git told B's client the whole atomic push failed.
+	if refs["refs/heads/early"] != v1 {
+		t.Fatalf("PARTIAL atomic commit: refs/heads/early=%s stands in the authority while the client saw a whole-push failure (want untouched %s)", refs["refs/heads/early"], v1)
+	}
+	if refs["refs/heads/race"] != v2 {
+		t.Fatalf("authority refs/heads/race = %q, want A's %q", refs["refs/heads/race"], v2)
+	}
+	// "fetch first" is the pre-receive base check's marker: the denial
+	// must come before any update hook, not from a hook's own
+	// CAS-conflict message — by then sibling hooks may already have
+	// committed.
+	if !strings.Contains(resB.out, "fetch first") {
+		t.Fatalf("denial must come from the pre-receive atomic base check:\n%s", resB.out)
+	}
+}
