@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.14.0](https://github.com/coder/code-storage/compare/v0.13.0...v0.14.0) (2026-08-27)
+
+
+### Features
+
+* **bench:** s3wal push-path e2e benchmark + Phase 4 results publication ([#171](https://github.com/coder/code-storage/issues/171)) ([dea8da0](https://github.com/coder/code-storage/commit/dea8da04f5aa2ee26220cb54259f6fdec0de645b))
+* **s3wal:** Phase 3 — zero-infra serve mode with S3 meta backend, sync-claim write-through, and instance lease ([#168](https://github.com/coder/code-storage/issues/168)) ([7ea41d2](https://github.com/coder/code-storage/commit/7ea41d26da87ba76fd434231b1ebf69edd62d970))
+
+
+### Bug Fixes
+
+* **blob:** carry LocationConstraint on CreateBucket and probe on constraint rejection ([#180](https://github.com/coder/code-storage/issues/180)) ([520916d](https://github.com/coder/code-storage/commit/520916d6a80ec0ad9ce6fdb2c5ea43b260e15219))
+* **blob:** gate SeaweedFS test harness readiness on the shared write roundtrip ([#178](https://github.com/coder/code-storage/issues/178)) ([ceb0847](https://github.com/coder/code-storage/commit/ceb08470d7755c9436b548f40f4d6a548585c580))
+* **s3wal:** align lost-race backoff with §2.3 and make the contention runner faithful ([#181](https://github.com/coder/code-storage/issues/181)) ([#184](https://github.com/coder/code-storage/issues/184)) ([c230b79](https://github.com/coder/code-storage/commit/c230b79f978e776358cda65c2c5784ccaf16fdce))
+* **s3wal:** gate SeaweedFS harness readiness on a write roundtrip, hardening qualification against boot-window 5xx ([#172](https://github.com/coder/code-storage/issues/172)) ([d0b4f6b](https://github.com/coder/code-storage/commit/d0b4f6b9a3bd0a0ba1157cd7bdf722c8e4e3edfc))
+* **serve:** release s3wal instance lease on SIGTERM/SIGINT via graceful shutdown ([#176](https://github.com/coder/code-storage/issues/176)) ([74aa93b](https://github.com/coder/code-storage/commit/74aa93bf2719ebb48afaa018e9b14e67fd33297d))
+
+
+### Performance Improvements
+
+* **s3wal:** trim per-push S3 round trips ([#182](https://github.com/coder/code-storage/issues/182)) ([#185](https://github.com/coder/code-storage/issues/185)) ([6a55e45](https://github.com/coder/code-storage/commit/6a55e450ef8bd94a8c31b136cdaa678facbf4e3a))
+
 ## [0.13.0](https://github.com/coder/code-storage/compare/v0.12.0...v0.13.0) (2026-08-26)
 
 
