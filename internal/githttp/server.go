@@ -79,11 +79,13 @@ type Server struct {
 
 	// repackProbeMu guards the asynchronous post-push repack probe
 	// machinery (see dispatchRepackProbe): repackProbeQueued marks repos
-	// queued or running (per-repo coalescing), repackProbeAgain their
+	// queued or running (per-repo coalescing), repackProbeRunning the
+	// subset whose probe is executing right now, repackProbeAgain their
 	// one trailing re-run, repackProbeQueue feeds the fixed worker pool,
 	// and repackProbeWorkers starts that pool once.
 	repackProbeMu      sync.Mutex
 	repackProbeQueued  map[string]bool
+	repackProbeRunning map[string]bool
 	repackProbeAgain   map[string]bool
 	repackProbeQueue   chan string
 	repackProbeWorkers sync.Once
@@ -1189,11 +1191,20 @@ func (s *Server) dispatchRepackProbe(repo string) {
 	defer s.repackProbeMu.Unlock()
 	if s.repackProbeQueued == nil {
 		s.repackProbeQueued = make(map[string]bool)
+		s.repackProbeRunning = make(map[string]bool)
 		s.repackProbeAgain = make(map[string]bool)
 		s.repackProbeQueue = make(chan string, repackProbeQueueCap)
 	}
 	if s.repackProbeQueued[repo] {
-		s.repackProbeAgain[repo] = true
+		// A trailing re-run is needed only when the probe is already
+		// EXECUTING (it may have read state before this push's
+		// registration committed). A probe still parked in the queue
+		// starts strictly after this dispatch and observes the
+		// registration, so re-arming it would just burn a redundant
+		// queue pass (Codex round 7).
+		if s.repackProbeRunning[repo] {
+			s.repackProbeAgain[repo] = true
+		}
 		return
 	}
 	select {
@@ -1220,8 +1231,12 @@ func (s *Server) dispatchRepackProbe(repo string) {
 // full queue drops it — the same best-effort trade as dispatch.
 func (s *Server) repackProbeWorker() {
 	for repo := range s.repackProbeQueue {
+		s.repackProbeMu.Lock()
+		s.repackProbeRunning[repo] = true
+		s.repackProbeMu.Unlock()
 		s.MaybeRepack(context.Background(), repo)
 		s.repackProbeMu.Lock()
+		delete(s.repackProbeRunning, repo)
 		if s.repackProbeAgain[repo] {
 			delete(s.repackProbeAgain, repo)
 			select {
