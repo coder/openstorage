@@ -507,13 +507,23 @@ var ErrPackMissing = errors.New("githttp: registered pack missing from blob stor
 // errors keep failing fast; on bound exhaustion the hydrate fails with
 // ErrPackMissing rather than looping.
 func HydratePacks(ctx context.Context, st ref.RefStore, bl blob.BlobStore, repoPath, repo string) error {
+	return hydratePacksBy(ctx, bl, repoPath, repo, func(ctx context.Context) ([]ref.Pack, error) {
+		return st.ListPacks(ctx, repo)
+	})
+}
+
+// hydratePacksBy is HydratePacks over an injectable pack-listing source:
+// the portable path re-lists via ListPacks, the snapshot path (issue #182)
+// re-reads a whole hydrate snapshot so the retry stays bound to one
+// coherent state.
+func hydratePacksBy(ctx context.Context, bl blob.BlobStore, repoPath, repo string, list func(ctx context.Context) ([]ref.Pack, error)) error {
 	packDir := filepath.Join(repoPath, "objects", "pack")
 	if err := os.MkdirAll(packDir, 0o755); err != nil {
 		return err
 	}
 	var lastMissing error
 	for attempt := 0; attempt < maxHydrateRaces; attempt++ {
-		packs, err := st.ListPacks(ctx, repo)
+		packs, err := list(ctx)
 		if err != nil {
 			return err
 		}
@@ -726,6 +736,23 @@ type refScanError struct{ err error }
 
 func (e *refScanError) Error() string { return e.err.Error() }
 func (e *refScanError) Unwrap() error { return e.err }
+
+// entryRefSeq yields a hydrate snapshot's materialized ref entries —
+// already in the ascending byte order storeRefSeq pages in (the
+// ref.HydrateSnapshot contract).
+type entryRefSeq struct {
+	refs []ref.RefEntry
+	i    int
+}
+
+func (s *entryRefSeq) next() (string, string, bool, error) {
+	if s.i >= len(s.refs) {
+		return "", "", false, nil
+	}
+	e := s.refs[s.i]
+	s.i++
+	return e.Name, e.SHA, true, nil
+}
 
 func (s *storeRefSeq) next() (string, string, bool, error) {
 	if s.i >= len(s.page) {
@@ -1750,6 +1777,27 @@ func Hydrate(ctx context.Context, st ref.RefStore, bl blob.BlobStore, cacheDir, 
 	if err != nil {
 		return "", nil, err
 	}
+	// Snapshot-capable stores (issue #182) serve generation, packs, and
+	// refs from ONE read: on s3wal each portable call below re-fetched
+	// the whole base manifest — one WAN round trip per call on real S3.
+	// The freshness discipline is unchanged: both marker checks read
+	// live state, and the marker publishes exactly the state the sync
+	// consumed. The PRE-lock marker check stays on GetGeneration for
+	// every backend: it is the cache-hit hot path, needs only the
+	// generation, and materializing a snapshot there would sort and copy
+	// the full ref/pack sets per request without saving a round trip.
+	snapper, _ := st.(ref.HydrateSnapshotter)
+	readState := func() (int64, *ref.HydrateSnapshot, error) {
+		if snapper == nil {
+			gen, err := st.GetGeneration(ctx, repo)
+			return gen, nil, err
+		}
+		snap, err := snapper.HydrateSnapshot(ctx, repo)
+		if err != nil {
+			return 0, nil, err
+		}
+		return snap.Generation, &snap, nil
+	}
 	gen, err := st.GetGeneration(ctx, repo)
 	if err != nil {
 		return "", nil, err
@@ -1775,26 +1823,51 @@ func Hydrate(ctx context.Context, st ref.RefStore, bl blob.BlobStore, cacheDir, 
 	// it actually synced. Mutations landing after this read leave
 	// marker < generation, which just forces the next hydrate down the
 	// full path again.
-	gen, err = st.GetGeneration(ctx, repo)
+	var snap *ref.HydrateSnapshot
+	gen, snap, err = readState()
 	if err != nil {
 		return "", nil, err
 	}
 	if markerGen, markerHead, fresh, ok := readGenerationMarker(repoPath); ok && fresh && markerGen == gen && markerHead == headTarget {
 		return repoPath, nil, nil
 	}
-	if err := HydratePacks(ctx, st, bl, repoPath, repo); err != nil {
+	if snap != nil {
+		// One coherent state feeds packs, refs, AND the marker: the
+		// missing-blob retry re-snapshots wholesale (a concurrent fold
+		// replaced rows), so gen/refs advance in lockstep with the pack
+		// list actually materialized.
+		first := true
+		if err := hydratePacksBy(ctx, bl, repoPath, repo, func(ctx context.Context) ([]ref.Pack, error) {
+			if !first {
+				fresh, err := snapper.HydrateSnapshot(ctx, repo)
+				if err != nil {
+					return nil, err
+				}
+				*snap, gen = fresh, fresh.Generation
+			}
+			first = false
+			return snap.Packs, nil
+		}); err != nil {
+			return "", nil, err
+		}
+	} else if err := HydratePacks(ctx, st, bl, repoPath, repo); err != nil {
 		return "", nil, err
 	}
 	// Refs stream straight from the store in bounded pages (issue #119):
 	// ref fanout is attacker-scaled, so the serving path must never
-	// materialize a repo's whole ref set. The generation read above binds
-	// the paged scan: any ref minted or moved while pages stream bumps the
+	// materialize a repo's whole ref set — except through the snapshot
+	// capability, whose ref sets are bounded by construction (see
+	// ref.HydrateSnapshotter). The generation read above binds the paged
+	// scan: any ref minted or moved while pages stream bumps the
 	// generation past the marker this sync publishes, so the next hydrate
 	// takes the full path again and heals whatever the torn scan missed —
 	// the same staleness window a point-snapshot ListRefs already had
 	// between its read and the marker write.
 	newStore := func() refSeq { return &storeRefSeq{ctx: ctx, st: st, repo: repo, pageSize: syncRefsBatch} }
 	var skippedHeld bool
+	if snap != nil {
+		newStore = func() refSeq { return &entryRefSeq{refs: snap.Refs} }
+	}
 	for attempt := 0; attempt < 3; attempt++ {
 		if skippedHeld, refsErr = syncRefsStreamed(ctx, repoPath, headTarget, newStore, syncRefsBatch); refsErr == nil {
 			break

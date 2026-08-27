@@ -76,6 +76,19 @@ type Server struct {
 	// (a pack-count read plus at most one job enqueue) and must never
 	// block on the fold itself. Nil disables triggering.
 	MaybeRepack func(ctx context.Context, repo string)
+
+	// repackProbeMu guards the asynchronous post-push repack probe
+	// machinery (see dispatchRepackProbe): repackProbeQueued marks repos
+	// queued or running (per-repo coalescing), repackProbeRunning the
+	// subset whose probe is executing right now, repackProbeAgain their
+	// one trailing re-run, repackProbeQueue feeds the fixed worker pool,
+	// and repackProbeWorkers starts that pool once.
+	repackProbeMu      sync.Mutex
+	repackProbeQueued  map[string]bool
+	repackProbeRunning map[string]bool
+	repackProbeAgain   map[string]bool
+	repackProbeQueue   chan string
+	repackProbeWorkers sync.Once
 	// PackQuotaBytes is the per-repo pack-bytes quota (issue #21, see
 	// quota.go); <= 0 disables quota enforcement. Set by the serve wiring
 	// from the resolved config, like ResolveRepo.
@@ -1143,7 +1156,7 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 				// padding): the repack threshold trigger must still fire
 				// even though the response is a 413 (Codex round 4).
 				if s.MaybeRepack != nil {
-					s.MaybeRepack(context.WithoutCancel(r.Context()), target.key)
+					s.dispatchRepackProbe(target.key)
 				}
 			}
 			if gate.responseStarted() {
@@ -1175,7 +1188,103 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 		// Unconditionally on completion, not only on success: pre-receive
 		// may have registered packs even when a later per-ref update was
 		// denied. Cancel-free context — the client hanging up right after
-		// its push must not suppress the trigger.
-		s.MaybeRepack(context.WithoutCancel(r.Context()), target.key)
+		// its push must not suppress the trigger. Asynchronous (issue
+		// #182): the probe is a store round trip, and running it before
+		// the handler returns held the client's response open for it. A
+		// trigger lost to process exit mid-probe is the documented
+		// trade already — failures are logged, never propagated, and the
+		// pack count only grows until a fold lands, so the next push
+		// retries.
+		s.dispatchRepackProbe(target.key)
+	}
+}
+
+// repackProbeConcurrency is the fixed probe worker-pool size and
+// repackProbeQueueCap its admission bound: every resource the async
+// probe path holds — workers, queued repo names, coalescing map entries
+// — is capped by these two constants, so a writer pushing to arbitrarily
+// many distinct repos against a slow store cannot accumulate goroutines
+// or map entries (Codex security round on #182's PR: a per-goroutine
+// semaphore bounded executions but let admissions park unboundedly).
+const (
+	repackProbeConcurrency = 4
+	repackProbeQueueCap    = 1024
+)
+
+// dispatchRepackProbe schedules s.MaybeRepack(repo) on the bounded probe
+// worker pool. At most one probe is queued or running per repo; pushes
+// completing mid-probe mark ONE trailing re-run — skipping them outright
+// could leave a threshold crossing unprobed until the next push, while
+// the trailing run re-reads state that includes every registration the
+// mark coalesced. A FULL queue drops the probe instead of blocking or
+// spawning: the trigger is documented best-effort (failures are logged,
+// never propagated), the pack count only grows until a fold lands, and
+// the next push to that repo re-dispatches.
+func (s *Server) dispatchRepackProbe(repo string) {
+	assertf(s.MaybeRepack != nil, "dispatchRepackProbe: nil MaybeRepack")
+	assertf(repo != "", "dispatchRepackProbe: empty repo")
+	s.repackProbeMu.Lock()
+	defer s.repackProbeMu.Unlock()
+	if s.repackProbeQueued == nil {
+		s.repackProbeQueued = make(map[string]bool)
+		s.repackProbeRunning = make(map[string]bool)
+		s.repackProbeAgain = make(map[string]bool)
+		s.repackProbeQueue = make(chan string, repackProbeQueueCap)
+	}
+	if s.repackProbeQueued[repo] {
+		// A trailing re-run is needed only when the probe is already
+		// EXECUTING (it may have read state before this push's
+		// registration committed). A probe still parked in the queue
+		// starts strictly after this dispatch and observes the
+		// registration, so re-arming it would just burn a redundant
+		// queue pass (Codex round 7).
+		if s.repackProbeRunning[repo] {
+			s.repackProbeAgain[repo] = true
+		}
+		return
+	}
+	select {
+	case s.repackProbeQueue <- repo:
+		s.repackProbeQueued[repo] = true
+		s.repackProbeWorkers.Do(func() {
+			for range repackProbeConcurrency {
+				go s.repackProbeWorker()
+			}
+		})
+	default:
+		log.Printf("repack probe queue full (%d pending): dropping probe for %s (next push retries)", repackProbeQueueCap, repo)
+	}
+}
+
+// repackProbeWorker drains the probe queue for the server's lifetime,
+// probing on a cancel-free background context (the requests that queued
+// the work have long returned). A trailing re-run is REQUEUED at the
+// channel tail rather than run inline (Codex round 6): a repo hot enough
+// to re-arm its mark during every probe would otherwise pin its worker,
+// and a handful of such repos could occupy the whole pool and starve
+// every other queued repo. The repo stays marked queued across the
+// requeue, so later pushes keep coalescing onto the trailing entry; a
+// full queue drops it — the same best-effort trade as dispatch.
+func (s *Server) repackProbeWorker() {
+	for repo := range s.repackProbeQueue {
+		s.repackProbeMu.Lock()
+		s.repackProbeRunning[repo] = true
+		s.repackProbeMu.Unlock()
+		s.MaybeRepack(context.Background(), repo)
+		s.repackProbeMu.Lock()
+		delete(s.repackProbeRunning, repo)
+		if s.repackProbeAgain[repo] {
+			delete(s.repackProbeAgain, repo)
+			select {
+			case s.repackProbeQueue <- repo:
+				// Still marked queued: coalescing continues.
+			default:
+				delete(s.repackProbeQueued, repo)
+				log.Printf("repack probe queue full (%d pending): dropping trailing probe for %s (next push retries)", repackProbeQueueCap, repo)
+			}
+		} else {
+			delete(s.repackProbeQueued, repo)
+		}
+		s.repackProbeMu.Unlock()
 	}
 }

@@ -23,6 +23,8 @@ import (
 	smithyhttp "github.com/aws/smithy-go/transport/http"
 	gcblob "gocloud.dev/blob"
 	"gocloud.dev/blob/s3blob"
+
+	"github.com/coder/code-storage/internal/s3oplog"
 )
 
 // ErrSignedURLUnsupported is returned by SignedURL on backends without
@@ -753,6 +755,11 @@ func s3ClientOptions(endpoint, expectedOwner string) func(*s3.Options) {
 		o.UsePathStyle = true
 		if expectedOwner != "" {
 			o.APIOptions = append(o.APIOptions, expectedBucketOwnerAPIOption(expectedOwner))
+		}
+		// Round-trip census seam (issue #182): one line per S3 HTTP
+		// attempt when CODESTORAGE_S3_OP_LOG is set; inert otherwise.
+		if opt, ok := s3oplog.APIOption(); ok {
+			o.APIOptions = append(o.APIOptions, opt)
 		}
 	}
 }
