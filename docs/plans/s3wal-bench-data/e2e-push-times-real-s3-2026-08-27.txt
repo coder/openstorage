@@ -1,0 +1,123 @@
+# Sequential e2e git-push timings — real S3, eu-central-1, 2026-08-27
+# One serve process per mode on the same EPYC host (~7 ms RTT to the
+# regional endpoint; NOT in-region compute — see the results doc's
+# method deviations), fresh dedicated buckets, deleted after the run.
+#
+# s3wal mode:  CODESTORAGE_PG_URL='s3wal://codestorage-q1ab-s3wal-7715761f?region=eu-central-1'
+#              CODESTORAGE_S3_URL='s3://codestorage-q1ab-s3wal-7715761f?region=eu-central-1'
+# PG+S3 mode:  CODESTORAGE_PG_URL='postgres://…@127.0.0.1:5433/codestorage?sslmode=disable' (postgres:17-alpine container)
+#              CODESTORAGE_S3_URL='s3://codestorage-q1ab-pgs3-7715761f?region=eu-central-1'
+# Both: CODESTORAGE_S3_EXPECTED_BUCKET_OWNER set; binary 52ea5c02 + PR #180 fix.
+#
+# Measurement (from the smoke script, verbatim below): after the clone/push/LFS
+# smoke, 20 sequential empty-commit pushes per mode; each sample wraps exactly
+# one 'git push origin HEAD:main' in date +%s%N stamps (ms). n=20 per mode —
+# a smoke-scale sample for the operator-guidance comparison, not a §3 cell.
+
+## Smoke script (verbatim; the timed loop is the last section)
+#!/usr/bin/env bash
+# Usage: ws8-git-smoke.sh <port> <label> <repo>
+set -euo pipefail
+PORT=$1; LABEL=$2; REPO=$3
+BIN=/tmp/ws8-bin/codestorage
+KEY=/tmp/ws8-key
+unset GIT_ASKPASS GIT_SSH_COMMAND
+export GIT_TERMINAL_PROMPT=0
+WORK=$(mktemp -d "/tmp/ws8-smoke-$LABEL-XXXX")
+echo "== [$LABEL] work=$WORK repo=$REPO port=$PORT"
+
+TOK_W=$($BIN mint --key $KEY.pem --iss qual --repo "$REPO" --scopes repo:write)
+TOK_GIT=$($BIN mint --key $KEY.pem --iss qual --repo "$REPO" --scopes git:read,git:write)
+
+CREATE=$(curl -sf -X POST "http://127.0.0.1:$PORT/api/v1/repos" -H "Authorization: Bearer $TOK_W" -d '{"default_branch":"main"}')
+echo "== [$LABEL] created: $CREATE"
+
+git clone -q "http://t:${TOK_GIT}@127.0.0.1:$PORT/$REPO.git" "$WORK/w1"
+cd "$WORK/w1"
+echo "hello $LABEL" > hello.txt
+git add hello.txt
+git -c user.name=q -c user.email=q@example.com commit -qm "smoke: initial"
+git push -q origin HEAD:main
+PUSHED_SHA=$(git rev-parse HEAD)
+
+# LFS roundtrip: 5 MiB random payload.
+git lfs track "*.bin" >/dev/null
+head -c 5242880 /dev/urandom > payload.bin
+SUM_SRC=$(sha256sum payload.bin | cut -d' ' -f1)
+git add .gitattributes payload.bin
+git -c user.name=q -c user.email=q@example.com commit -qm "smoke: lfs payload"
+git push -q origin HEAD:main
+LFS_SHA=$(git rev-parse HEAD)
+
+# Fresh clone verification (content + LFS smudge).
+git clone -q "http://t:${TOK_GIT}@127.0.0.1:$PORT/$REPO.git" "$WORK/w2"
+cd "$WORK/w2"
+[ "$(git rev-parse HEAD)" = "$LFS_SHA" ] || { echo "FAIL: clone HEAD mismatch"; exit 1; }
+[ "$(cat hello.txt)" = "hello $LABEL" ] || { echo "FAIL: hello.txt content"; exit 1; }
+SUM_DST=$(sha256sum payload.bin | cut -d' ' -f1)
+[ "$SUM_SRC" = "$SUM_DST" ] || { echo "FAIL: LFS payload sha mismatch $SUM_SRC != $SUM_DST"; exit 1; }
+echo "== [$LABEL] clone+LFS verified (sha $SUM_DST)"
+
+# 20 timed sequential pushes (rough e2e p50 on this backend).
+cd "$WORK/w1"
+: > /tmp/ws8-push-times-$LABEL.txt
+for i in $(seq 1 20); do
+  git -c user.name=q -c user.email=q@example.com commit -q --allow-empty -m "timed $i"
+  S=$(date +%s%N)
+  git push -q origin HEAD:main
+  E=$(date +%s%N)
+  echo $(( (E - S) / 1000000 )) >> /tmp/ws8-push-times-$LABEL.txt
+done
+sort -n /tmp/ws8-push-times-$LABEL.txt | awk '{a[NR]=$1} END {printf "== ['"$LABEL"'] timed pushes n=%d p50=%dms p90=%dms max=%dms\n", NR, a[int(NR*0.5+0.5)], a[int(NR*0.9+0.5)], a[NR]}'
+
+# API read via named alias.
+curl -sf "http://127.0.0.1:$PORT/api/repos/$REPO" -H "Authorization: Bearer $TOK_GIT" >/dev/null && echo "== [$LABEL] API read ok"
+echo "== [$LABEL] SMOKE PASS"
+
+## Raw per-push milliseconds — s3wal mode (in run order)
+959
+1053
+1105
+1070
+1040
+1165
+1088
+1068
+1175
+1057
+1078
+1029
+1136
+1089
+1006
+1075
+1070
+1171
+1212
+1052
+
+## Raw per-push milliseconds — PG+S3 mode (in run order)
+384
+377
+388
+386
+416
+383
+387
+385
+366
+386
+407
+363
+387
+408
+396
+369
+393
+415
+453
+385
+
+## Recomputed summaries (sorted, nearest-rank)
+s3wal: n=20 p50=1070ms p90=1171ms max=1212ms
+pgs3: n=20 p50=386ms p90=415ms max=453ms

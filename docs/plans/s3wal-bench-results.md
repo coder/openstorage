@@ -442,7 +442,11 @@ below is from live runs; the bucket was emptied and deleted afterward.
 - **e2e push cost:** sequential empty-commit pushes measured p50
   **1,070 ms** on s3wal vs **386 ms** on PG+S3 (containerized Postgres,
   same-region S3 blobs, same host) — the zero-infra tradeoff is ~2.8× at
-  real RTT (vs +23% on loopback). Round-trip census filed as
+  real RTT (vs +23% on loopback). Smoke-scale samples (n=20 per mode);
+  the measurement loop, serve configuration, raw per-push timings, and
+  recomputed summaries are committed as
+  [`e2e-push-times-real-s3-2026-08-27.txt`](./s3wal-bench-data/e2e-push-times-real-s3-2026-08-27.txt).
+  Round-trip census filed as
   [#182](https://github.com/coder/code-storage/issues/182).
 - **PG+S3 mode smoke:** same git+LFS suite against
   `postgres://…` + `s3://bucket?region=eu-central-1` — all pass.
@@ -484,9 +488,11 @@ signal.
   ([`probe-fairness-real-s3-2026-08-27.txt`](./s3wal-bench-data/probe-fairness-real-s3-2026-08-27.txt))
   — the probe script verbatim (its gap accounting is the definition),
   per-worker raw results, a recomputed summary, and the rejection
-  taxonomy — and the 22-surface qualification verdict transcript with its
+  taxonomy — the 22-surface qualification verdict transcript with its
   exact invocation
-  ([`qualify-transcript-real-s3-2026-08-27.txt`](./s3wal-bench-data/qualify-transcript-real-s3-2026-08-27.txt)).
+  ([`qualify-transcript-real-s3-2026-08-27.txt`](./s3wal-bench-data/qualify-transcript-real-s3-2026-08-27.txt)),
+  and the serve-session e2e push-timing evidence
+  ([`e2e-push-times-real-s3-2026-08-27.txt`](./s3wal-bench-data/e2e-push-times-real-s3-2026-08-27.txt)).
 - Not checked in (~14 MiB): the SeaweedFS/SQLite cell-3 contention CSVs
   (up to ~335 k rows per SQLite cell). Regenerate with the cell-3 command
   above; per-cell summary statistics are in the table.

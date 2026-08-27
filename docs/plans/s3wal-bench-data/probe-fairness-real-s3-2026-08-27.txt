@@ -9,6 +9,24 @@
 #   last-success->window-end gap is folded into maxgap. Rejected pushes
 #   (non-zero git push exit) increment rejects, then fetch+reset and retry.
 
+## Method caveats (annotated post-hoc during review; raw sections below are verbatim)
+# 1. Window boundary: workers test the deadline BEFORE starting a push, so a
+#    push in flight at the deadline runs to completion unbounded — the nominal
+#    60 s window can stretch by up to one push per worker (pushes ran ~1 s
+#    here; the whole probe completed in ~64.6 s wall time), and a win landing
+#    after the deadline is still counted. Direction of error for the
+#    starvation evidence: conservative — the trailing gap is measured to the
+#    worker's ACTUAL end, which is at or after the fixed deadline, so
+#    reported gaps can only be equal or larger than deadline-clamped ones.
+#    The aggregate wins/s divides by the nominal 60 s and may overstate the
+#    rate by the overrun fraction; it is not used as gate evidence (the
+#    throughput arm is measured by the §3 microbench cell).
+# 2. No per-push timeout: a pathologically stalled push would have hung the
+#    probe rather than being cut at the deadline. None occurred (the one
+#    TLS-timeout rejection below was git's own client-side timeout). The
+#    §2.3-conformant harness re-run tracked in #181 supersedes this probe
+#    and should bound pushes to the remaining window.
+
 ## Probe script (verbatim)
 #!/usr/bin/env bash
 set -euo pipefail
