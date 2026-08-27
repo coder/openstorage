@@ -775,3 +775,71 @@ func TestIsAncestor_Memoized(t *testing.T) {
 		t.Fatal("memoized verdict not served")
 	}
 }
+
+// TestReservationFilter_SignatureGatedUnreservable (Codex round-12
+// security P2): the budget-free reservation filter must refuse to vouch
+// for signature-gated creations and updates — treating them as allowed
+// would let a pusher WITHOUT a valid signing key bulk-reserve (and
+// thereby D/F-squat) names its hooks can never commit. Deletions
+// introduce no commits and stay reservable, as do refs whose rules carry
+// no verify-sig.
+func TestReservationFilter_SignatureGatedUnreservable(t *testing.T) {
+	t.Setenv(EnvRefsPolicy, `[["refs/heads/sigx",["verify-sig"]],["refs/heads/plainx",[]]]`)
+	sha := strings.Repeat("a", 40)
+	sha2 := strings.Repeat("b", 40)
+	zero := strings.Repeat("0", 40)
+	for _, tc := range []struct {
+		ref, old, new string
+		want          bool
+	}{
+		{"refs/heads/sigx", zero, sha, true},    // gated creation
+		{"refs/heads/sigx", sha, sha2, true},    // gated update
+		{"refs/heads/sigx", sha, zero, false},   // deletion: vouchable
+		{"refs/heads/plainx", zero, sha, false}, // matched, no verify-sig
+		{"refs/heads/free", zero, sha, false},   // unpoliced
+	} {
+		if got := reservationRefPolicyDenied("r", tc.ref, tc.old, tc.new); got != tc.want {
+			t.Errorf("reservationRefPolicyDenied(%s %.4s->%.4s) = %v, want %v",
+				tc.ref, tc.old, tc.new, got, tc.want)
+		}
+	}
+}
+
+// TestAuthorityDoomedCreations_LargeSetBoundedProbes (Codex round-12
+// security P2): above bulkProbeCrossover creations, point-read backends
+// must page the repo's whole name set instead of issuing per-creation
+// probes — the probe runs while this push's holds already block
+// conflicting same-node writers, so its duration is the attack surface.
+// 100 proposed parents over existing children must cost one 10k-page read,
+// zero point reads, and still doom every conflicted name.
+func TestAuthorityDoomedCreations_LargeSetBoundedProbes(t *testing.T) {
+	refs := map[string]string{}
+	for i := 0; i < 2000; i++ {
+		refs[fmt.Sprintf("refs/zbulk/b%04d", i)] = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	}
+	var creations []string
+	for i := 0; i < 100; i++ {
+		parent := fmt.Sprintf("refs/heads/p%03d", i)
+		refs[parent+"/held"] = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+		creations = append(creations, parent)
+	}
+	creations = append(creations, "refs/heads/clean")
+	st := &probeCountStore{countingStore: &countingStore{gen: 1, refs: refs}}
+	doomed, err := authorityDoomedCreations(context.Background(), st, "r", creations)
+	if err != nil {
+		t.Fatalf("authorityDoomedCreations: %v", err)
+	}
+	if len(doomed) != 100 {
+		t.Fatalf("doomed = %d names, want the 100 squatted parents", len(doomed))
+	}
+	if _, ok := doomed["refs/heads/clean"]; ok {
+		t.Fatal("unconflicted creation doomed")
+	}
+	if st.getRefCalls != 0 {
+		t.Errorf("getRefCalls = %d, want 0 — large sets must not point-probe", st.getRefCalls)
+	}
+	_, listCalls, _ := st.counts()
+	if listCalls > 2 {
+		t.Errorf("listRefsCalls = %d, want <= 2 (one full 10k page + terminator)", listCalls)
+	}
+}

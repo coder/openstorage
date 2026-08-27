@@ -260,10 +260,15 @@ func preReceive(ctx context.Context) error {
 			// their local update, and reserving one would hold a D/F
 			// ancestor of the whole namespace. The update hook denies
 			// such names fail-closed, so skipping them here loses no
-			// protection. The policy filter is the budget-free evaluator
-			// (atomic pushes reach here all-allowed, but the cheap
-			// re-check is harmlessly identical).
-			if !pushRefUpdatable(c.ref) || reservationRefPolicyDenied(repo, c.ref, c.old, c.new) {
+			// protection. The policy filter is the budget-free evaluator,
+			// applied to NON-ATOMIC pushes only: the atomic gate above
+			// already evaluated full policy (verify-sig included) and
+			// denied the whole push on any failure, so its all-nil
+			// verdicts vouch for bulk reservation — routing atomic
+			// commands through the budget-free filter would needlessly
+			// divert signature-gated refs it cannot vouch for.
+			if !pushRefUpdatable(c.ref) ||
+				(!atomicPush && reservationRefPolicyDenied(repo, c.ref, c.old, c.new)) {
 				unreserved = append(unreserved, c.ref)
 				continue
 			}
@@ -298,9 +303,26 @@ func preReceive(ctx context.Context) error {
 				reservedCreations = append(reservedCreations, c.ref)
 			}
 		}
+		// Early sidecar-cap check — see the full rationale at the second
+		// check below.
+		if len(unreserved) > maxPushUnreserved {
+			return fmt.Errorf("pre-receive: push carries %d commands that cannot be bulk-reserved (policy-denied, undeliverable, or D/F-conflicted names); the limit is %d — drop those commands or split the push", len(unreserved), maxPushUnreserved)
+		}
 		if err := reservePushHolds(ctx, holdPath, names); err != nil {
 			return fmt.Errorf("pre-receive: reserve push holds: %w", err)
 		}
+		// The refresher starts the moment the reservation exists (Codex
+		// round-12 P1): the post-reservation probe below is sequential
+		// store I/O that can outlast pushHoldTTL on a huge creation push,
+		// and an EXPIRED hold is ignored by concurrent reservers — a
+		// conflicting push could commit against a name the probe already
+		// cleared, after which a late-started refresher would revive our
+		// hold and the bulk-reserved hook would skip its commit-time
+		// guard. The synchronous first touch also refreshes the age the
+		// file accrued between the server's mint and this reservation.
+		// (Markers created below start fresh and are re-covered on the
+		// next tick; touchPushHold tolerates the sidecar not existing.)
+		defer startPushHoldRefresh(holdPath)()
 		// Authority D/F probe for every bulk-reserved creation, run
 		// strictly AFTER the reservation landed — the only airtight probe
 		// point on this node (Codex rounds 7-11 lineage; round-11 P1
@@ -360,7 +382,11 @@ func preReceive(ctx context.Context) error {
 		// (plus crash-recovery sweep work). Real pushes carry at most a
 		// handful of denied or undeliverable commands, so a generous cap
 		// denies only crafted traffic; bulk mirror pushes are unaffected —
-		// their reservable refs share the single hold file.
+		// their reservable refs share the single hold file. Checked twice:
+		// once above, BEFORE reservation, so a push that is already over
+		// the cap on pre-computable grounds (policy-denied, unupdatable,
+		// intra-push D/F) never reserves or probes at all (Codex round-12
+		// security P2), and once here for the probe's late additions.
 		if len(unreserved) > maxPushUnreserved {
 			return fmt.Errorf("pre-receive: push carries %d commands that cannot be bulk-reserved (policy-denied, undeliverable, or D/F-conflicted names); the limit is %d — drop those commands or split the push", len(unreserved), maxPushUnreserved)
 		}
@@ -382,7 +408,6 @@ func preReceive(ctx context.Context) error {
 				}
 			}
 		}
-		defer startPushHoldRefresh(holdPath)()
 	}
 
 	var packFiles []string
@@ -720,6 +745,17 @@ const maxPushRefDepth = 32
 // push's denied-command count. Bulk-RESERVABLE refs (mirror pushes) are
 // not counted — they share the single hold file.
 const maxPushUnreserved = 1024
+
+// bulkProbeCrossover is the creation count above which the post-reservation
+// authority D/F probe on point-read backends switches from per-name probes
+// to paging the repo's whole name set (Codex round-12 security P2): the
+// probe runs while this push's holds already block conflicting same-node
+// writers, so its duration must stay bounded whichever shape an attacker
+// picks — at most this many point probes, or max(1, repo refs/syncRefsBatch)
+// page reads. Below it, tiny pushes on huge repos keep the cheap indexed
+// probes (Codex rounds 9/10). Snapshot-capable stores (s3wal) always take
+// the one-read snapshot path regardless.
+const bulkProbeCrossover = 64
 
 // pushRefUpdatable reports whether receive-pack could ever commit name on
 // this server: a properly namespaced ref (refs/<ns>/<name>...) of bounded
@@ -1140,12 +1176,41 @@ func authorityDoomedCreations(ctx context.Context, st ref.RefStore, repo string,
 			doomed[created] = fmt.Errorf("%s conflicts with existing ref %s (directory/file); delete %s first", created, existing, existing)
 		}
 	}
-	if snap, ok := st.(refNameSnapshotter); ok {
-		existing, err := snap.SnapshotRefNames(ctx, repo)
-		if err != nil {
-			return nil, fmt.Errorf("directory/file snapshot probe: %w", err)
+	snap, isSnapshotter := st.(refNameSnapshotter)
+	if isSnapshotter || len(names) > bulkProbeCrossover {
+		var existing []string
+		if isSnapshotter {
+			var err error
+			existing, err = snap.SnapshotRefNames(ctx, repo)
+			if err != nil {
+				return nil, fmt.Errorf("directory/file snapshot probe: %w", err)
+			}
+			assertf(sort.StringsAreSorted(existing), "SnapshotRefNames returned unsorted names")
+		} else {
+			// Point-read backends above the crossover page the whole name
+			// set instead (Codex round-12 security P2): the probe runs
+			// while this push's holds already block conflicting same-node
+			// writers, so its DURATION is the attack surface — thousands
+			// of proposed parents must not cost thousands of sequential
+			// point reads. syncRefsBatch-sized pages keep that to
+			// max(1, repo refs/10k) round-trips; below the crossover,
+			// point probes keep tiny pushes on huge repos cheap (the
+			// round-9/10 requirement, unchanged).
+			after := ""
+			for {
+				page, err := st.ListRefsAfter(ctx, repo, after, syncRefsBatch)
+				if err != nil {
+					return nil, fmt.Errorf("directory/file snapshot probe: %w", err)
+				}
+				for _, e := range page {
+					existing = append(existing, e.Name)
+				}
+				if len(page) < syncRefsBatch {
+					break
+				}
+				after = page[len(page)-1].Name
+			}
 		}
-		assertf(sort.StringsAreSorted(existing), "SnapshotRefNames returned unsorted names")
 		for _, name := range names {
 			// Ancestor arm: an existing ref is a strict prefix directory.
 			for i := 0; i < len(name); i++ {
@@ -1337,20 +1402,25 @@ func enforceRefPolicy(ctx context.Context, repo, refName, old, new string) error
 }
 
 // reservationRefPolicyDenied is the budget-free policy filter for hold
-// reservations (Codex round-6 P2 on #173): verify-sig is treated as
-// ALLOWED here because evaluating it charges the push's shared walk
-// budget, which the update hooks (and, on the pack path, the publication
-// gate) bill again — and an unverifiable ref that gets held for one push
-// window is harmless, while a double-billed budget rejects legitimate
-// fanout pushes. no-push/no-force-push stay enforced, so a restricted
-// token still cannot hold namespaces it cannot write.
+// reservations (Codex round-6 P2 on #173): actually RUNNING verify-sig
+// here would charge the push's shared walk budget, which the update hooks
+// (and, on the pack path, the publication gate) bill again — a
+// double-billed budget rejects legitimate fanout pushes. Signature-GATED
+// creations and updates are therefore unreservable rather than assumed
+// allowed (Codex round-12 security P2: assuming them allowed let unsigned
+// pushers squat D/F namespaces for the push window); they reserve at hook
+// time, after the real check. no-push/no-force-push stay enforced.
+// Non-atomic only: the atomic gate evaluates FULL policy before
+// reservation, so its all-nil verdicts vouch for bulk reservation without
+// this filter's conservatism.
 func reservationRefPolicyDenied(repo, refName, old, new string) bool {
 	return evalRefPolicy(context.Background(), repo, refName, old, new, false) != nil
 }
 
-// evalRefPolicy is the shared evaluator: evalVerifySig=false skips
-// signature verification (treating those refs as allowed) for callers that
-// must not charge the shared verify-sig state and walk budget.
+// evalRefPolicy is the shared evaluator: evalVerifySig=false replaces
+// signature verification with a fail-unreservable verdict for non-deletion
+// commands, for callers that must not charge the shared verify-sig state
+// and walk budget.
 func evalRefPolicy(ctx context.Context, repo, refName, old, new string, evalVerifySig bool) error {
 	policyJSON := os.Getenv(EnvRefsPolicy)
 	opsJSON := os.Getenv(EnvOps)
@@ -1412,6 +1482,19 @@ func evalRefPolicy(ctx context.Context, repo, refName, old, new string, evalVeri
 				if err := verifySig(ctx, refName, old, new); err != nil {
 					return err
 				}
+			} else if new != ref.ZeroSHA {
+				// Budget-free callers (the reservation filter) cannot
+				// vouch for a signature-gated creation or update without
+				// charging the shared verify budget an extra pass (Codex
+				// rounds 4+6), and treating it as allowed would let a
+				// pusher WITHOUT a valid signing key bulk-reserve the
+				// name — a D/F namespace squat for the push window (Codex
+				// round-12 security P2). Unreservable instead: the ref's
+				// hook self-reserves strictly AFTER its full policy check
+				// (verify-sig included) passes, so unsigned commands
+				// never hold anything. Deletions introduce no commits,
+				// always pass verify-sig, and stay reservable.
+				return fmt.Errorf("reservation cannot vouch for signature-gated update to %s", refName)
 			}
 		default:
 			// Unknown policy ops fail closed.
