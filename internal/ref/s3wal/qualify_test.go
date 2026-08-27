@@ -973,9 +973,26 @@ func runContentionWindow(tb testing.TB, cas *s3wal.Client, key string, writers i
 				res.maxStarve = max(res.maxStarve, maxStarve)
 				mu.Unlock()
 			}()
+			// Reads are bounded by the measurement deadline: a stalled
+			// endpoint must not let an in-flight GET run minutes past
+			// the window (the outer safety ctx allows window + 2 min)
+			// and inflate elapsed and the deferred starve reading.
+			// Advances deliberately keep the OUTER ctx: cancelling an
+			// in-flight conditional PUT would manufacture an ambiguous
+			// outcome and make the window inconclusive
+			// (verifyTransitions) — a CAS that began inside the window
+			// must be allowed to resolve (PR #184 review round 5).
+			readCtx, readCancel := context.WithDeadline(ctx, deadline)
+			defer readCancel()
 			reRead := func() (s3wal.Object, bool) {
-				obj, err := wcas.Get(ctx, key)
+				obj, err := wcas.Get(readCtx, key)
 				if err != nil {
+					if readCtx.Err() != nil && ctx.Err() == nil {
+						// The measurement deadline cut off the read:
+						// clean exit, not a failure — reads are
+						// side-effect free, so nothing is left ambiguous.
+						return s3wal.Object{}, false
+					}
 					tb.Errorf("contention: re-read %s: %v", key, err)
 					return s3wal.Object{}, false
 				}
@@ -993,6 +1010,12 @@ func runContentionWindow(tb testing.TB, cas *s3wal.Client, key string, writers i
 			nextAttempt := func() {
 				attempt++
 				if attempt >= contentionPushAttempts {
+					// Production mutate exhausts its budget here and
+					// fails the push with ErrCASContention: count it so
+					// the contention-errors metric reflects deployed
+					// behavior, then restart the schedule for the
+					// client's next push (PR #184 review round 5).
+					contentions++
 					attempt = 0
 				}
 			}
@@ -1023,6 +1046,13 @@ func runContentionWindow(tb testing.TB, cas *s3wal.Client, key string, writers i
 			for time.Now().Before(deadline) {
 				obj, ok := reRead()
 				if !ok {
+					return
+				}
+				// The window may have ended while the read was in
+				// flight: never START a CAS past the deadline — its
+				// resolution is allowed to land late (see above), but
+				// only for attempts that began inside the window.
+				if !time.Now().Before(deadline) {
 					return
 				}
 				p, decOK := decodePayload(obj.Body)
