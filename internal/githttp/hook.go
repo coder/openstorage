@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/coder/code-storage/internal/auth"
@@ -250,7 +251,7 @@ func preReceive(ctx context.Context) error {
 	// chains its own refresher for its runtime.
 	if holdPath := os.Getenv(EnvPushHold); holdPath != "" {
 		names := make([]string, 0, len(commands))
-		var unreserved, creations []string
+		var unreserved []string
 		eligible := make([]refCommand, 0, len(commands))
 		for _, c := range commands {
 			// Reserve only names this server could ever commit (Codex
@@ -267,123 +268,88 @@ func preReceive(ctx context.Context) error {
 				continue
 			}
 			eligible = append(eligible, c)
-			if c.old == ref.ZeroSHA && c.new != ref.ZeroSHA {
-				creations = append(creations, c.ref)
-			}
-		}
-		// Authority-doomed CREATIONS are not bulk-reserved (Codex round-7
-		// security P2): a syntactically valid, policy-allowed ancestor
-		// whose D/F children exist in the authority can never commit —
-		// its update hook's probe denies it — so reserving it would only
-		// squat on those children's namespace for the push window.
-		// Creations only: updates and deletions cannot introduce a D/F
-		// pair. Probed in ONE push-proportional batch per push
-		// (authorityDoomedCreations — Codex round-8/9 security P2s: the
-		// probe work must scale with the push, never with the repo, and
-		// shared reads must be paid once). Fail closed on store trouble.
-		// A legitimate delete-then-create D/F swap in ONE push still
-		// works: the creation lands in the sidecar and self-reserves at
-		// hook time, after the deletion's CAS.
-		var doomed map[string]error
-		if len(creations) > 0 {
-			probeStore, err := ref.Open(ctx, mustEnv(envHookPGURL...))
-			if err != nil {
-				return fmt.Errorf("pre-receive: open ref store for reservation probe: %w", err)
-			}
-			doomed, err = authorityDoomedCreations(ctx, probeStore, repo, creations)
-			probeStore.Close()
-			if err != nil {
-				return fmt.Errorf("pre-receive: authority D/F probe: %w", err)
-			}
-			// Atomic pushes: a doomed command dooms git's whole local
-			// transaction AFTER earlier hooks committed their CASes, so
-			// the denial must be whole-push and happen HERE, like the
-			// verdict and funny-name gates (Codex round-8 P1). Non-atomic
-			// pushes keep per-ref semantics: divert to the sidecar and
-			// let the ref's own hook decline (or commit, if the authority
-			// changed).
-			if atomicPush {
-				for _, c := range commands {
-					if derr, ok := doomed[c.ref]; ok {
-						return atomicDenied(derr)
-					}
-				}
-			}
 		}
 		// Creations whose strict D/F relative is ANOTHER command of this
-		// same push are not bulk-reserved either (Codex round-9 P1): a
+		// same push are not bulk-reserved (Codex round-9 P1): a
 		// non-atomic push creating both refs/heads/a and refs/heads/a/b
-		// passes the authority probe above (neither name exists yet), and
-		// bulk-reserving both would let both hooks skip the commit-time
-		// probe — both CASes commit before git's local per-ref update
-		// rejects one, leaving the authority unrepresentable. Diverted to
-		// the sidecar, each such creation re-probes the authority AT
-		// COMMIT TIME, sequenced by git after every earlier sibling's CAS,
-		// so exactly the losing relative is declined per-ref (and the
+		// would otherwise let both hooks skip the commit-time probe —
+		// both CASes commit before git's local per-ref update rejects
+		// one, leaving the authority unrepresentable. Diverted to the
+		// sidecar, each such creation re-probes the authority AT COMMIT
+		// TIME, sequenced by git after every earlier sibling's CAS, so
+		// exactly the losing relative is declined per-ref (and the
 		// delete-then-create swap still lands, deletion first). Checked
 		// against ALL command names, not just eligible ones: a command
 		// policy-denied here can still be allowed by its own hook's later
 		// evaluation (the round-5 divergence) and commit from the sidecar.
-		// Atomic pushes cannot reach this with a conflict — their
-		// non-delete/delete D/F pairs were denied whole above.
 		allNames := make([]string, 0, len(commands))
 		for _, c := range commands {
 			allNames = append(allNames, c.ref)
 		}
 		cmdSet := newPushHoldSet(allNames)
+		var reservedCreations []string
 		for _, c := range eligible {
-			if _, ok := doomed[c.ref]; ok ||
-				(c.old == ref.ZeroSHA && c.new != ref.ZeroSHA && cmdSet.conflicts(c.ref)) {
+			if c.old == ref.ZeroSHA && c.new != ref.ZeroSHA && cmdSet.conflicts(c.ref) {
 				unreserved = append(unreserved, c.ref)
 				continue
 			}
 			names = append(names, c.ref)
+			if c.old == ref.ZeroSHA && c.new != ref.ZeroSHA {
+				reservedCreations = append(reservedCreations, c.ref)
+			}
 		}
-		waited, err := reservePushHolds(ctx, holdPath, names)
-		if err != nil {
+		if err := reservePushHolds(ctx, holdPath, names); err != nil {
 			return fmt.Errorf("pre-receive: reserve push holds: %w", err)
 		}
-		// Creations whose reservation had to WAIT for a conflicting peer
-		// hold are re-probed against the authority (Codex round-10 P1):
-		// the batch probe above ran BEFORE a wait of up to pushHoldWaitMax,
-		// and the peer we waited out may have committed the conflicting
-		// ref before releasing — two concurrent pushes creating
-		// refs/heads/a and refs/heads/a/b both probe clean, the waiter
-		// then becomes bulk-reserved, and skipping its commit-time check
-		// would let its CAS wedge the authority. Doomed late losers are
-		// denied whole for atomic pushes and diverted to the sidecar for
-		// non-atomic ones — their names stay harmlessly in our hold file
-		// (we are allowed to write them; the hook's own probe declines).
-		if len(waited) > 0 {
-			waitedSet := make(map[string]bool, len(waited))
-			for _, name := range waited {
-				waitedSet[name] = true
+		// Authority D/F probe for every bulk-reserved creation, run
+		// strictly AFTER the reservation landed — the only airtight probe
+		// point on this node (Codex rounds 7-11 lineage; round-11 P1
+		// closed the last ordering hole): a same-node conflicting creation
+		// can only CAS while holding its own reservation, and that
+		// reservation must have been RELEASED before ours landed (else we
+		// would still be waiting on it) — so a probe after our reservation
+		// observes every conflicting commit, including a racer that
+		// reserved, committed, and released entirely inside our
+		// probe-to-reservation window, which any pre-reservation probe
+		// (with or without waited-name tracking) misses. Doomed creations:
+		// atomic pushes are denied WHOLE before any hook CAS (Codex
+		// round-8 P1); non-atomic ones are RELEASED from the hold file and
+		// diverted to the sidecar, so a doomed name squats on its existing
+		// D/F relatives' namespace only for the probe's round-trip, not
+		// the push window (the round-7 no-squat property), and its own
+		// hook's commit-time probe declines it. Creations only: updates
+		// and deletions cannot introduce a D/F pair. One push-proportional
+		// batch (rounds 8/9/10: deduped prefixes + decorated-order
+		// seek-merge, or ONE snapshot read on s3wal). Fail closed on store
+		// trouble. Cross-node racers remain the documented store-level
+		// TOCTOU residual. A delete-then-create D/F swap in ONE push still
+		// works: the creation is sidecar-diverted by the intra-push check
+		// above and self-reserves at hook time, after the deletion's CAS.
+		if len(reservedCreations) > 0 {
+			probeStore, err := ref.Open(ctx, mustEnv(envHookPGURL...))
+			if err != nil {
+				return fmt.Errorf("pre-receive: open ref store for reservation probe: %w", err)
 			}
-			var stale []string
-			for _, c := range eligible {
-				if c.old == ref.ZeroSHA && c.new != ref.ZeroSHA && waitedSet[c.ref] {
-					stale = append(stale, c.ref)
-				}
+			doomed, err := authorityDoomedCreations(ctx, probeStore, repo, reservedCreations)
+			probeStore.Close()
+			if err != nil {
+				return fmt.Errorf("pre-receive: authority D/F probe: %w", err)
 			}
-			if len(stale) > 0 {
-				probeStore, err := ref.Open(ctx, mustEnv(envHookPGURL...))
-				if err != nil {
-					return fmt.Errorf("pre-receive: open ref store for post-wait probe: %w", err)
-				}
-				doomed2, err := authorityDoomedCreations(ctx, probeStore, repo, stale)
-				probeStore.Close()
-				if err != nil {
-					return fmt.Errorf("pre-receive: post-wait authority D/F probe: %w", err)
-				}
+			if len(doomed) > 0 {
 				if atomicPush {
 					for _, c := range commands {
-						if derr, ok := doomed2[c.ref]; ok {
+						if derr, ok := doomed[c.ref]; ok {
 							return atomicDenied(derr)
 						}
 					}
 				}
-				for name := range doomed2 {
+				release := make([]string, 0, len(doomed))
+				for name := range doomed {
 					unreserved = append(unreserved, name)
+					release = append(release, name)
+				}
+				if err := removePushHolds(holdPath, release); err != nil {
+					return fmt.Errorf("pre-receive: release doomed reservations: %w", err)
 				}
 			}
 		}
@@ -1025,10 +991,7 @@ func updateHook(ctx context.Context, args []string) error {
 		case err != nil:
 			return fmt.Errorf("update: check unreserved marker: %w", err)
 		default:
-			// The waited-names return is deliberately ignored: sidecar
-			// refs run the commit-time authority probe below regardless,
-			// so a post-wait re-probe here would be redundant.
-			if _, err := reservePushHolds(ctx, holdPath, []string{refName}); err != nil {
+			if err := reservePushHolds(ctx, holdPath, []string{refName}); err != nil {
 				return fmt.Errorf("update: reserve push hold: %w", err)
 			}
 		}
@@ -1877,9 +1840,39 @@ func objectInMainStore(sha string) bool {
 	panic(fmt.Sprintf("githttp assertion failed: main-store cat-file -e %s: %v", sha, err))
 }
 
+// ancestryMemo caches isAncestor verdicts per (old, new) pair for this
+// process's lifetime (Codex round-11 security P2): pre-receive's policy
+// passes evaluate whole command lists, and a crafted non-atomic push
+// advancing thousands of refs between the SAME two commits under a
+// no-force-push policy would otherwise launch one git merge-base
+// subprocess per command — identical pairs now cost one. Never stale:
+// ancestry between two fixed SHAs is a property of the immutable,
+// content-addressed object graph, so no concurrent ref movement can
+// change a cached verdict. Update hooks are one process per ref and
+// evaluate a single pair, so they neither need nor abuse the memo.
+var (
+	ancestryMemoMu sync.Mutex
+	ancestryMemo   = map[[2]string]bool{}
+)
+
 // isAncestor reports whether old is an ancestor of new in the repo git put
 // us in (hooks run with cwd = bare repo root, GIT_DIR set by git).
 func isAncestor(old, new string) bool {
+	key := [2]string{old, new}
+	ancestryMemoMu.Lock()
+	got, ok := ancestryMemo[key]
+	ancestryMemoMu.Unlock()
+	if ok {
+		return got
+	}
+	got = isAncestorUncached(old, new)
+	ancestryMemoMu.Lock()
+	ancestryMemo[key] = got
+	ancestryMemoMu.Unlock()
+	return got
+}
+
+func isAncestorUncached(old, new string) bool {
 	cmd := exec.Command("git", "merge-base", "--is-ancestor", old, new)
 	err := cmd.Run()
 	if err == nil {

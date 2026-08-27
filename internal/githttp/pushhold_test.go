@@ -7,6 +7,7 @@ package githttp
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -27,7 +28,7 @@ func mintHold(t *testing.T, repoPath string, names ...string) string {
 	if err != nil {
 		t.Fatalf("mintPushHold: %v", err)
 	}
-	if _, err := reservePushHolds(context.Background(), holdPath, names); err != nil {
+	if err := reservePushHolds(context.Background(), holdPath, names); err != nil {
 		t.Fatalf("reservePushHolds(%v): %v", names, err)
 	}
 	return holdPath
@@ -208,14 +209,14 @@ func TestMintPushHold_SweepsExpiredLeaks(t *testing.T) {
 // line-splitting ref names must fail the push rather than mint a broken
 // hold.
 func TestReservePushHolds_RejectsMalformedInput(t *testing.T) {
-	if _, err := reservePushHolds(context.Background(), "relative/hold", []string{"refs/heads/x"}); err == nil {
+	if err := reservePushHolds(context.Background(), "relative/hold", []string{"refs/heads/x"}); err == nil {
 		t.Fatal("relative hold path accepted")
 	}
 	abs := filepath.Join(t.TempDir(), "holds", "hold")
-	if _, err := reservePushHolds(context.Background(), abs, []string{"refs/heads/a\nrefs/heads/b"}); err == nil {
+	if err := reservePushHolds(context.Background(), abs, []string{"refs/heads/a\nrefs/heads/b"}); err == nil {
 		t.Fatal("line-splitting ref name accepted")
 	}
-	if _, err := reservePushHolds(context.Background(), abs, []string{""}); err == nil {
+	if err := reservePushHolds(context.Background(), abs, []string{""}); err == nil {
 		t.Fatal("empty ref name accepted")
 	}
 }
@@ -237,13 +238,13 @@ func TestReservePushHolds_DeniesLiveConflictFailsClosed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("mintPushHold: %v", err)
 	}
-	if _, err := reservePushHolds(context.Background(), own, []string{"refs/heads/a/b"}); err == nil {
+	if err := reservePushHolds(context.Background(), own, []string{"refs/heads/a/b"}); err == nil {
 		t.Fatal("reservation past a live D/F-conflicting hold accepted")
 	} else if !strings.Contains(err.Error(), "conflicting") {
 		t.Fatalf("denial reason = %v, want a conflict message", err)
 	}
 	// Same-name and unrelated refs are NOT conflicts.
-	if _, err := reservePushHolds(context.Background(), own, []string{"refs/heads/a", "refs/heads/z"}); err != nil {
+	if err := reservePushHolds(context.Background(), own, []string{"refs/heads/a", "refs/heads/z"}); err != nil {
 		t.Fatalf("non-conflicting reservation denied: %v", err)
 	}
 	// An expired conflicting hold is a crash leak, not a conflict. (own
@@ -258,7 +259,7 @@ func TestReservePushHolds_DeniesLiveConflictFailsClosed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("mintPushHold: %v", err)
 	}
-	if _, err := reservePushHolds(context.Background(), own2, []string{"refs/heads/a/c"}); err != nil {
+	if err := reservePushHolds(context.Background(), own2, []string{"refs/heads/a/c"}); err != nil {
 		t.Fatalf("reservation blocked by an expired hold: %v", err)
 	}
 }
@@ -279,7 +280,7 @@ func TestReservePushHolds_FailsClosedOnUnreadableHolds(t *testing.T) {
 	t.Cleanup(func() { _ = os.Chmod(holdsDir, 0o755) })
 
 	own := filepath.Join(holdsDir, "push-own")
-	if _, err := reservePushHolds(context.Background(), own, []string{"refs/heads/x"}); err == nil {
+	if err := reservePushHolds(context.Background(), own, []string{"refs/heads/x"}); err == nil {
 		t.Fatal("reservation succeeded over an unreadable hold directory")
 	}
 }
@@ -333,7 +334,7 @@ func TestReservePushHolds_LockAcquisitionBounded(t *testing.T) {
 	defer func() { pushHoldWaitMax = prev }()
 
 	start := time.Now()
-	_, err = reservePushHolds(context.Background(), filepath.Join(holdsDir, "push-own"), []string{"refs/heads/x"})
+	err = reservePushHolds(context.Background(), filepath.Join(holdsDir, "push-own"), []string{"refs/heads/x"})
 	if err == nil {
 		t.Fatal("reservation succeeded while the reserve lock was held elsewhere")
 	}
@@ -436,7 +437,7 @@ func TestPushHoldReaders_SkipUnreservedSidecar(t *testing.T) {
 	if err != nil {
 		t.Fatalf("mintPushHold: %v", err)
 	}
-	if _, err := reservePushHolds(context.Background(), own, []string{"refs/heads/denied/x"}); err != nil {
+	if err := reservePushHolds(context.Background(), own, []string{"refs/heads/denied/x"}); err != nil {
 		t.Fatalf("sidecar name blocked a reservation: %v", err)
 	}
 }
@@ -592,53 +593,6 @@ func TestHydrate_SkippedHeldRefSuppressesMarker(t *testing.T) {
 	}
 }
 
-// TestReservePushHolds_ReportsWaitedNames (Codex round-10 P1 substrate):
-// the reservation must tell its caller exactly which names sat out a
-// conflicting peer hold — pre-receive re-probes the authority for those
-// creations, because the peer may have committed the conflicting ref
-// before releasing.
-func TestReservePushHolds_ReportsWaitedNames(t *testing.T) {
-	dir := t.TempDir()
-	peer := mintHold(t, dir, "refs/heads/a")
-
-	own, err := mintPushHold(dir)
-	if err != nil {
-		t.Fatalf("mintPushHold: %v", err)
-	}
-	type result struct {
-		waited []string
-		err    error
-	}
-	done := make(chan result, 1)
-	go func() {
-		waited, err := reservePushHolds(context.Background(), own,
-			[]string{"refs/heads/a/b", "refs/heads/z"})
-		done <- result{waited, err}
-	}()
-	// Let the reservation hit the conflict at least once, then clear it.
-	time.Sleep(300 * time.Millisecond)
-	if err := os.Remove(peer); err != nil {
-		t.Fatalf("remove peer hold: %v", err)
-	}
-	res := <-done
-	if res.err != nil {
-		t.Fatalf("reservePushHolds after peer cleared: %v", res.err)
-	}
-	if len(res.waited) != 1 || res.waited[0] != "refs/heads/a/b" {
-		t.Fatalf("waited = %v, want exactly [refs/heads/a/b] (refs/heads/z never conflicted)", res.waited)
-	}
-
-	// The unconflicted fast path reports nothing.
-	own2, err := mintPushHold(dir)
-	if err != nil {
-		t.Fatalf("mintPushHold: %v", err)
-	}
-	waited, err := reservePushHolds(context.Background(), own2, []string{"refs/heads/free"})
-	if err != nil || waited != nil {
-		t.Fatalf("unconflicted reserve = (%v, %v), want (nil, nil)", waited, err)
-	}
-}
-
 // TestPushHoldDirCache_ReparsesOnlyOnChange (Codex round-10 P2): the
 // reservation conflict poll re-loads peer holds every 25ms for up to 10s;
 // unchanged hold files must cost a stat, not a re-read + re-split +
@@ -773,5 +727,51 @@ func TestAuthorityDoomedCreations_SnapshotStore(t *testing.T) {
 	_, listCalls, _ := st.counts()
 	if listCalls != 0 {
 		t.Errorf("listRefsCalls = %d, want 0 — the snapshot path issued store reads", listCalls)
+	}
+}
+
+// TestRemovePushHolds: releasing a doomed reservation must drop exactly
+// the named refs, keep the rest, and leave no temp file behind (the
+// rewrite is temp+rename so readers never see a truncated hold).
+func TestRemovePushHolds(t *testing.T) {
+	dir := t.TempDir()
+	holdPath := mintHold(t, dir, "refs/heads/a", "refs/heads/b", "refs/heads/c")
+	if err := removePushHolds(holdPath, []string{"refs/heads/b"}); err != nil {
+		t.Fatalf("removePushHolds: %v", err)
+	}
+	holds := loadPushHolds(dir)
+	for name, want := range map[string]bool{
+		"refs/heads/a": true,
+		"refs/heads/b": false,
+		"refs/heads/c": true,
+	} {
+		if got := holds.contains(name); got != want {
+			t.Errorf("contains(%s) = %v, want %v", name, got, want)
+		}
+	}
+	if _, err := os.Stat(holdPath + ".release"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("rewrite temp left behind: %v", err)
+	}
+}
+
+// TestIsAncestor_Memoized (Codex round-11 security P2): the ancestry
+// verdict for a (old, new) pair must be served from the per-process memo
+// on repeat — the SHAs below name no real objects, so any fallthrough to
+// git merge-base panics, making a cache miss loudly red.
+func TestIsAncestor_Memoized(t *testing.T) {
+	key := [2]string{
+		strings.Repeat("d", 40),
+		strings.Repeat("c", 40),
+	}
+	ancestryMemoMu.Lock()
+	ancestryMemo[key] = true
+	ancestryMemoMu.Unlock()
+	defer func() {
+		ancestryMemoMu.Lock()
+		delete(ancestryMemo, key)
+		ancestryMemoMu.Unlock()
+	}()
+	if !isAncestor(key[0], key[1]) {
+		t.Fatal("memoized verdict not served")
 	}
 }

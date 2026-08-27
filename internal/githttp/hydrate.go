@@ -854,6 +854,7 @@ type refCmdBatch struct {
 	cap      int
 	cmds     []refCmd
 	skipped  bool
+	holds    *pushHoldDirCache // lazily built by flush, reused across flushes
 }
 
 func (b *refCmdBatch) add(name, line string) error {
@@ -869,7 +870,16 @@ func (b *refCmdBatch) flush() error {
 	if len(b.cmds) == 0 {
 		return nil
 	}
-	holds := loadPushHolds(b.repoPath)
+	// One parse cache per batch lifetime (Codex round-11 P2): a large full
+	// sync flushes every syncRefsBatch commands, and loading holds fresh
+	// per flush multiplies held-ref bytes by the flush count — a
+	// repo-scale hold overlapping a repo-scale sync re-parses gigabytes.
+	// The cache re-reads a hold file only when its (size, mtime) changes;
+	// hydration stays FAIL-OPEN on read errors, like loadPushHolds.
+	if b.holds == nil {
+		b.holds = &pushHoldDirCache{dir: filepath.Join(b.repoPath, pushHoldDir)}
+	}
+	holds, _ := b.holds.load()
 	var sb strings.Builder
 	kept := 0
 	for _, c := range b.cmds {
@@ -1443,27 +1453,20 @@ var pushHoldWaitMax = 10 * time.Second
 // CLOSED (round-2 P1: proceeding would commit an authority update whose
 // local ref transaction is doomed while the conflicting neighbor
 // survives) — a clean, pre-publication, retryable denial.
-//
-// The returned slice lists the names that had to WAIT for a conflicting
-// peer hold at least once (sorted; nil when none did): the caller's
-// pre-wait authority state is stale for exactly those names — the peer may
-// have committed the conflicting ref before releasing its hold — so
-// creations among them must be re-probed against the authority before
-// their commit-time checks are skipped (Codex round-10 P1 on #173).
-func reservePushHolds(ctx context.Context, holdPath string, names []string) ([]string, error) {
+func reservePushHolds(ctx context.Context, holdPath string, names []string) error {
 	if !filepath.IsAbs(holdPath) {
-		return nil, fmt.Errorf("push hold path %q is not absolute", holdPath)
+		return fmt.Errorf("push hold path %q is not absolute", holdPath)
 	}
 	for _, name := range names {
 		// Git's check-ref-format rejects control characters long before
 		// hooks run; refuse rather than mint line-split holds.
 		if name == "" || strings.Contains(name, "\n") {
-			return nil, fmt.Errorf("push hold: malformed ref name %q", name)
+			return fmt.Errorf("push hold: malformed ref name %q", name)
 		}
 	}
 	dir := filepath.Dir(holdPath)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return nil, err
+		return err
 	}
 	// The reserve lock lives NEXT TO the hold directory, not inside it:
 	// readers treat every directory entry as a hold file, and the mint
@@ -1483,59 +1486,76 @@ func reservePushHolds(ctx context.Context, holdPath string, names []string) ([]s
 	// 25ms for up to the full deadline — repo-scale bytes times hundreds of
 	// polls, multiplied by concurrent waiters. Unchanged files cost a stat.
 	cache := &pushHoldDirCache{dir: dir, except: holdPath}
-	var waited map[string]bool
 	for {
 		unlock, err := flockExclusiveCtx(ctx, lockPath)
 		if err != nil {
 			if ctx.Err() != nil {
-				return nil, fmt.Errorf("timed out waiting for a concurrent push's hold reservation; retry shortly: %w", err)
+				return fmt.Errorf("timed out waiting for a concurrent push's hold reservation; retry shortly: %w", err)
 			}
-			return nil, err
+			return err
 		}
 		peers, err := cache.load()
 		if err != nil {
 			// Fail CLOSED: an unreadable peer hold is not proof of no
 			// conflict (Codex round-3 P1 on #173).
 			unlock()
-			return nil, fmt.Errorf("push hold: reading peer holds: %w", err)
+			return fmt.Errorf("push hold: reading peer holds: %w", err)
 		}
 		conflict := ""
 		for _, name := range names {
 			if peers.conflicts(name) {
-				if conflict == "" {
-					conflict = name
-				}
-				if waited == nil {
-					waited = make(map[string]bool)
-				}
-				waited[name] = true
+				conflict = name
+				break
 			}
 		}
 		if conflict == "" {
 			err := appendPushHolds(holdPath, names)
 			unlock()
-			if err != nil {
-				return nil, err
-			}
-			waitedNames := make([]string, 0, len(waited))
-			for name := range waited {
-				waitedNames = append(waitedNames, name)
-			}
-			sort.Strings(waitedNames)
-			if len(waitedNames) == 0 {
-				return nil, nil
-			}
-			return waitedNames, nil
+			return err
 		}
 		unlock()
 		if time.Now().After(deadline) || ctx.Err() != nil {
-			return nil, fmt.Errorf("a concurrent push holds a ref conflicting with %s (directory/file); retry shortly", conflict)
+			return fmt.Errorf("a concurrent push holds a ref conflicting with %s (directory/file); retry shortly", conflict)
 		}
 		select {
 		case <-ctx.Done():
 		case <-time.After(25 * time.Millisecond):
 		}
 	}
+}
+
+// removePushHolds drops names from a push's OWN hold file, releasing
+// reservations pre-receive decided not to keep (authority-doomed creations
+// — see the post-reservation probe): leaving them held would squat on
+// their existing D/F relatives' namespace for the whole push window. The
+// rewrite is atomic (temp file + rename) so concurrent readers see the old
+// or the new set, never a truncated one; the temp lives in the hold
+// directory under a hold-like name, so a reader that catches it merely
+// double-counts our remaining names for one poll (over-holding, the safe
+// direction) and the TTL sweep collects it if we crash mid-rename. No lock
+// is needed: only this push's processes write this file, and git runs
+// pre-receive strictly before the update hooks that append to it.
+func removePushHolds(holdPath string, names []string) error {
+	drop := make(map[string]bool, len(names))
+	for _, name := range names {
+		drop[name] = true
+	}
+	b, err := os.ReadFile(holdPath)
+	if err != nil {
+		return err
+	}
+	var keep strings.Builder
+	for _, held := range strings.Split(string(b), "\n") {
+		if held != "" && !drop[held] {
+			keep.WriteString(held)
+			keep.WriteByte('\n')
+		}
+	}
+	tmp := holdPath + ".release"
+	if err := os.WriteFile(tmp, []byte(keep.String()), 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, holdPath)
 }
 
 // Generation marker (issue #4): the store's per-repo mutation generation

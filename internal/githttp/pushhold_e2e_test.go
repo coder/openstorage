@@ -512,3 +512,35 @@ func TestAtomicPush_WaitedCreationDeniedWhole(t *testing.T) {
 		t.Fatalf("authority accepted the doomed waited creation: %v", refs)
 	}
 }
+
+// TestPush_ParentOfExistingChildCleanlyDeclined (Codex round-11 P1
+// end-state): creating refs/heads/d while refs/heads/d/child exists must
+// be declined per-ref with the authority untouched. This exercises the
+// full post-RESERVATION probe path: the creation is bulk-reserved first,
+// the probe then dooms it against the existing child, pre-receive releases
+// its reservation (no namespace squat beyond the probe round-trip) and
+// diverts it to the sidecar, and the hook's commit-time probe declines.
+func TestPush_ParentOfExistingChildCleanlyDeclined(t *testing.T) {
+	repo := registerRepo(t, "t-df-existing-child")
+	work := initWorkRepo(t)
+	token := mintTestToken(t, repo, "git:read,git:write", "")
+	mustGit(t, work, "push", remoteURL(nodeA, repo, token), "HEAD:refs/heads/main", "HEAD:refs/heads/d/child")
+	head := revParse(t, work, "HEAD")
+
+	out, err := tryGit(work, "push", remoteURL(nodeA, repo, token), "HEAD:refs/heads/d")
+	if err == nil {
+		t.Fatalf("creating the parent of an existing child must be declined:\n%s", out)
+	}
+	t.Logf("parent-of-existing-child push (expected clean decline):\n%s", out)
+	if !strings.Contains(out, "directory/file") {
+		t.Fatalf("rejection is not the clean D/F decline:\n%s", out)
+	}
+	refs := pgRefs(t, repo)
+	if _, ok := refs["refs/heads/d"]; ok {
+		t.Fatalf("authority accepted an unrepresentable D/F pair: %v", refs)
+	}
+	if refs["refs/heads/d/child"] != head {
+		t.Fatalf("existing child disturbed: %v", refs)
+	}
+	mustGit(t, "", "ls-remote", remoteURL(nodeA, repo, token))
+}
