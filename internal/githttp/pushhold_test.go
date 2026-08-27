@@ -896,3 +896,30 @@ func TestClassifyReservation(t *testing.T) {
 		}
 	}
 }
+
+// TestReservationVerdicts_MixedPushStaysSelective (Codex round-15 P2 on
+// #173): one signature-gated command must not upgrade the WHOLE push to a
+// full policy evaluation — the ungated no-force-push update keeps its
+// budget-free reservationAllowed verdict. The shas exist in no repository,
+// so a full evaluation of the noff command would run git merge-base, fail
+// the ancestry check, and flip it to denied — reservationAllowed is only
+// reachable when the mixed push leaves ungated commands unevaluated. The
+// gated command itself pays a REAL evaluation: with no verify state
+// available here it fails closed to denied (in production, valid signed
+// refs bulk-reserve, invalid ones divert to the sidecar).
+func TestReservationVerdicts_MixedPushStaysSelective(t *testing.T) {
+	t.Setenv(EnvRefsPolicy, `[["refs/heads/sigx",["verify-sig"]],["refs/heads/noff",["no-force-push"]]]`)
+	sha := strings.Repeat("a", 40)
+	sha2 := strings.Repeat("b", 40)
+	classes := reservationVerdicts(context.Background(), "r", []refCommand{
+		{ref: "refs/heads/noff", old: sha, new: sha2},
+		{ref: "refs/heads/sigx", old: sha, new: sha2},
+		{ref: "refs/heads/free", old: sha, new: sha2},
+	})
+	want := []reservationClass{reservationAllowed, reservationDenied, reservationAllowed}
+	for i, cls := range classes {
+		if cls != want[i] {
+			t.Errorf("classes[%d] = %v, want %v", i, cls, want[i])
+		}
+	}
+}

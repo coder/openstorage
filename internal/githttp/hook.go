@@ -253,35 +253,12 @@ func preReceive(ctx context.Context) error {
 		names := make([]string, 0, len(commands))
 		var unreserved []string
 		eligible := make([]refCommand, 0, len(commands))
-		// Non-atomic pushes classify each command with the budget-free
-		// evaluator first. Signature-GATED commands cannot be vouched for
-		// budget-free (round-12 security P2: assuming them allowed lets
-		// unsigned pushers squat D/F namespaces), but flatly diverting
-		// them breaks legitimate large SIGNED fanout pushes at the sidecar
-		// cap (Codex round-13 P2) — so when any command is
-		// signature-gated, the push's FULL verdicts (verify-sig included)
-		// are evaluated once, here, and reservations follow the REAL
-		// verdicts: valid signed refs bulk-reserve, invalid ones divert.
-		// This is the same single evaluation the atomic gate and the
-		// pack-path publication gate already perform (memoized: the later
-		// gates reuse it); verify WALKS stay single-charged because
-		// verifystate persists range verdicts across processes — the
-		// update hooks then cache-hit — matching the pack path's
-		// long-accepted "verified twice, an accepted redundancy" fee
-		// shape (rounds 4+6 kept the no-pack path evaluation-free; that
-		// stays true unless the push actually carries signature-gated
-		// commands, where the alternative is breaking them at the cap).
+		// Non-atomic pushes resolve reservations budget-free, with only
+		// signature-gated commands paying a real per-command evaluation
+		// — see reservationVerdicts.
 		var classes []reservationClass
 		if !atomicPush {
-			classes = make([]reservationClass, len(commands))
-			needVerify := false
-			for i, c := range commands {
-				classes[i] = classifyReservation(repo, c.ref, c.old, c.new)
-				needVerify = needVerify || classes[i] == reservationNeedsVerify
-			}
-			if needVerify {
-				evalVerdicts()
-			}
+			classes = reservationVerdicts(ctx, repo, commands)
 		}
 		for i, c := range commands {
 			// Reserve only names this server could ever commit (Codex
@@ -295,11 +272,7 @@ func preReceive(ctx context.Context) error {
 			// for the full set.
 			denied := false
 			if !atomicPush {
-				if verdicts != nil {
-					denied = verdicts[i] != nil
-				} else {
-					denied = classes[i] == reservationDenied
-				}
+				denied = classes[i] == reservationDenied
 			}
 			if !pushRefUpdatable(c.ref) || denied {
 				unreserved = append(unreserved, c.ref)
@@ -1519,6 +1492,41 @@ func classifyReservation(repo, refName, old, new string) reservationClass {
 	default:
 		return reservationDenied
 	}
+}
+
+// reservationVerdicts resolves each NON-ATOMIC command to a final allowed
+// or denied reservation class. Every command is classified budget-free
+// first; only the signature-GATED remainder gets a real policy evaluation.
+// Gated commands cannot be vouched for budget-free (round-12 security P2:
+// assuming them allowed lets unsigned pushers squat D/F namespaces), but
+// flatly diverting them breaks legitimate large SIGNED fanout pushes at
+// the sidecar cap (round-13 P2) — so exactly they pay verification here:
+// valid signed refs bulk-reserve, invalid ones divert. Verify WALKS stay
+// single-charged because verifystate persists range verdicts across
+// processes — the update hooks then cache-hit — matching the pack path's
+// long-accepted "verified twice, an accepted redundancy" fee shape.
+// STRICTLY per-gated-command, never the push's full verdicts (Codex
+// round-15 P2): a mixed push carrying one gated ref plus thousands of
+// distinct no-force-push pairs must not launch one git merge-base per
+// ungated pair here — rounds 4+6 kept the no-pack path subprocess-free
+// for everything the budget-free classifier can already answer, and the
+// ungated commands' own update hooks enforce the real ancestry checks.
+func reservationVerdicts(ctx context.Context, repo string, commands []refCommand) []reservationClass {
+	classes := make([]reservationClass, len(commands))
+	for i, c := range commands {
+		classes[i] = classifyReservation(repo, c.ref, c.old, c.new)
+	}
+	for i, c := range commands {
+		if classes[i] != reservationNeedsVerify {
+			continue
+		}
+		if err := enforceRefPolicy(ctx, repo, c.ref, c.old, c.new); err != nil {
+			classes[i] = reservationDenied
+		} else {
+			classes[i] = reservationAllowed
+		}
+	}
+	return classes
 }
 
 // evalRefPolicy is the shared evaluator. fullEval=false is the budget-free
