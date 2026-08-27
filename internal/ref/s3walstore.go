@@ -115,6 +115,16 @@ type S3WAL struct {
 	warnMu sync.Mutex
 	warned map[string]bool
 
+	// snapMu guards snaps: the last manifest state this process read
+	// from — or wrote to — each base, kept ONLY to seed the first
+	// attempt of the next mutate loop on that base (issue #182). The
+	// conditional PUT's If-Match validates the seed atomically, so a
+	// stale entry costs one 412 into the existing fresh-read retry;
+	// reads NEVER serve from it (no reader can observe staler state
+	// than a fresh GET — the dual-serve safety line).
+	snapMu sync.Mutex
+	snaps  map[string]manifestSnap
+
 	// reapEpochMu mirrors PG's FOR SHARE pin on the destructive-sweep
 	// epoch row (Codex round 33 on PR #132): retirements hold the read
 	// side from their epoch read through the retire CAS and refund park,
@@ -154,6 +164,7 @@ func newS3WALStore(cs s3wal.ConditionalStore, probe func(ctx context.Context) er
 		locks:         make(map[string]*s3walKeyLock),
 		lastSeq:       make(map[string]int64),
 		warned:        make(map[string]bool),
+		snaps:         make(map[string]manifestSnap),
 	}
 }
 
@@ -277,6 +288,62 @@ func (s *S3WAL) raiseSeq(key string, seq int64) {
 	}
 }
 
+// manifestSnap is one base's last observed manifest state: the encoded
+// body plus the ETag the store returned FOR EXACTLY THOSE BYTES (a fetched
+// object or an acknowledged conditional write). The pairing is what makes
+// seeding sound — an If-Match on the etag commits a mutation of precisely
+// the state in body, or 412s.
+type manifestSnap struct {
+	body []byte
+	etag string
+}
+
+// maxManifestSnaps bounds the seed cache: bodies are up to the manifest
+// hard cap, so unlike the int64 seq watermark the map cannot grow with
+// every base this process ever touched. Eviction is arbitrary — it is a
+// cache of optimism, and a miss just re-reads like before issue #182.
+const maxManifestSnaps = 128
+
+// storeSnap records base's freshest (body, etag) pair. Caller must hold
+// the base lock (both call sites do), so per-base entries never interleave
+// with their own CAS loop; snapMu covers cross-base map access.
+func (s *S3WAL) storeSnap(base string, body []byte, etag string) {
+	assertf(etag != "", "storeSnap %s: empty etag", base)
+	assertf(len(body) > 0, "storeSnap %s: empty body", base)
+	s.snapMu.Lock()
+	defer s.snapMu.Unlock()
+	if _, ok := s.snaps[base]; !ok && len(s.snaps) >= maxManifestSnaps {
+		for k := range s.snaps {
+			delete(s.snaps, k)
+			break
+		}
+	}
+	s.snaps[base] = manifestSnap{body: body, etag: etag}
+}
+
+// dropSnap forgets base's seed (missing object, or a seeded verdict that
+// must be re-derived from fresh state).
+func (s *S3WAL) dropSnap(base string) {
+	s.snapMu.Lock()
+	defer s.snapMu.Unlock()
+	delete(s.snaps, base)
+}
+
+// seedManifest decodes base's cached snapshot for use as a mutate loop's
+// optimistic first read. The decode runs fresh per use so mutation
+// snapshots never alias the cache (the meta store's 304 cache discipline).
+func (s *S3WAL) seedManifest(base string) (*s3wal.Manifest, string, bool) {
+	s.snapMu.Lock()
+	snap, ok := s.snaps[base]
+	s.snapMu.Unlock()
+	if !ok {
+		return nil, "", false
+	}
+	m, err := s3wal.DecodeManifest(snap.body)
+	assertf(err == nil, "seedManifest %s: cached bytes undecodable: %v", base, err)
+	return m, snap.etag, true
+}
+
 // readManifest fetches base's manifest. A missing object is the empty
 // (virgin or never-mutated) state — manifests are created lazily by the
 // first mutation. etag "" reports the missing case to the CAS layer
@@ -285,6 +352,7 @@ func (s *S3WAL) readManifest(ctx context.Context, base string) (*s3wal.Manifest,
 	key := s3wal.ManifestKey(base)
 	obj, err := s.cas.Get(ctx, key)
 	if errors.Is(err, s3wal.ErrNotExist) {
+		s.dropSnap(base)
 		return s3wal.NewManifest(), "", nil
 	}
 	if err != nil {
@@ -295,6 +363,7 @@ func (s *S3WAL) readManifest(ctx context.Context, base string) (*s3wal.Manifest,
 		return nil, "", fmt.Errorf("s3wal read %s: %w", base, err)
 	}
 	s.checkSeq(key, m.Seq)
+	s.storeSnap(base, obj.Body, obj.ETag)
 	return m, obj.ETag, nil
 }
 
@@ -356,6 +425,15 @@ type s3walMutation struct {
 // contention retries live inside the conditional client; ambiguous PUTs
 // re-read and resolve via writer nonce, then the per-method recovery
 // class; ErrNotExecuted retries the same attempt.
+//
+// The FIRST attempt seeds from the base's cached (body, etag) snapshot
+// when one exists (issue #182), skipping the initial GET: the conditional
+// PUT's If-Match proves the seed current atomically with the write, and a
+// stale seed 412s into the ordinary fresh-read retry. Only the PUT can
+// validate a seed, so every OTHER first-attempt outcome — an fn error or
+// an apply=false verdict — is re-derived from a fresh read instead of
+// being returned: concluding "lost"/"no-op"/"refused" from unvalidated
+// state would break CAS linearizability.
 func (s *S3WAL) mutate(ctx context.Context, base string, mu s3walMutation) error {
 	assertf(mu.fn != nil && mu.op != "", "mutate: incomplete mutation %+v", mu)
 	unlock := s.lockBase(base)
@@ -371,16 +449,35 @@ func (s *S3WAL) mutate(ctx context.Context, base string, mu s3walMutation) error
 	// land (412, never-sent, or a rerun verdict), so pre-PUT failures are
 	// not-executed on every iteration, not just the first.
 	for attempt := 0; attempt < s.casAttempts; attempt++ {
-		m, etag, err := s.readManifest(ctx, base)
-		if err != nil {
-			return notExecuted(err) // pre-PUT read: nothing sent
+		var (
+			m      *s3wal.Manifest
+			etag   string
+			seeded bool
+		)
+		if attempt == 0 {
+			m, etag, seeded = s.seedManifest(base)
+		}
+		if !seeded {
+			var err error
+			m, etag, err = s.readManifest(ctx, base)
+			if err != nil {
+				return notExecuted(err) // pre-PUT read: nothing sent
+			}
 		}
 		clk := s3wal.ClkNext(s.now(), m.Clk)
 		apply, err := mu.fn(m, clk)
 		if err != nil {
+			if seeded {
+				s.dropSnap(base) // unvalidated verdict: re-derive fresh
+				continue
+			}
 			return err // fn owns its taxonomy (nothing was written)
 		}
 		if !apply {
+			if seeded {
+				s.dropSnap(base) // unvalidated verdict: re-derive fresh
+				continue
+			}
 			return nil
 		}
 		body, err := m.EncodeAdvance(clk)
@@ -391,22 +488,31 @@ func (s *S3WAL) mutate(ctx context.Context, base string, mu s3walMutation) error
 			return notExecuted(err) // size refusal: never sent
 		}
 		ourNonce, ourSeq := m.Writer, m.Seq
+		var newTag string
 		var werr error
 		if etag == "" {
-			_, werr = s.cas.Create(ctx, key, body)
+			newTag, werr = s.cas.Create(ctx, key, body)
 		} else {
-			_, werr = s.cas.Advance(ctx, key, body, etag)
+			newTag, werr = s.cas.Advance(ctx, key, body, etag)
 		}
 		if werr == nil {
 			s.raiseSeq(key, ourSeq)
+			// The store bound newTag to exactly these bytes: seed the
+			// next mutation on this base (issue #182).
+			s.storeSnap(base, body, newTag)
 			return nil
 		}
 		switch {
 		case errors.Is(werr, s3wal.ErrExists), errors.Is(werr, s3wal.ErrLostRace):
 			// Definitively not executed: someone else advanced first.
-			// Re-read and re-evaluate on the fresh snapshot.
-			if err := s.sleepJitter(ctx, attempt); err != nil {
-				return fmt.Errorf("s3wal %s %s: %w", mu.op, base, notExecuted(err))
+			// Re-read and re-evaluate on the fresh snapshot. A seeded
+			// loss skips the backoff: it evidences seed staleness, not
+			// live contention — the fresh-read retry is the first real
+			// attempt.
+			if !seeded {
+				if err := s.sleepJitter(ctx, attempt); err != nil {
+					return fmt.Errorf("s3wal %s %s: %w", mu.op, base, notExecuted(err))
+				}
 			}
 			continue
 		case errors.Is(werr, s3wal.ErrNotExecuted):
@@ -773,9 +879,14 @@ func (s *S3WAL) ListPacks(ctx context.Context, repo string) ([]Pack, error) {
 	if err != nil {
 		return nil, err
 	}
-	mem := m.Member(repo)
+	return s3walMemberPacks(m.Member(repo)), nil
+}
+
+// s3walMemberPacks lists mem's packs oldest first (byte order of id breaks
+// CreatedAt ties, mirroring ORDER BY created_at, id). nil mem = no packs.
+func s3walMemberPacks(mem *s3wal.Member) []Pack {
 	if mem == nil {
-		return nil, nil
+		return nil
 	}
 	recs := append([]s3wal.PackRecord(nil), mem.Packs...)
 	sort.Slice(recs, func(i, j int) bool {
@@ -789,7 +900,39 @@ func (s *S3WAL) ListPacks(ctx context.Context, repo string) ([]Pack, error) {
 		// Size is accounting input, not a listed column (see Pack).
 		packs = append(packs, Pack{ID: r.ID, Key: r.Key})
 	}
-	return packs, nil
+	return packs
+}
+
+// HydrateSnapshot serves the ref.HydrateSnapshotter capability from ONE
+// manifest read (issue #182): generation, packs, and the full ref set are
+// views of the same atom here, and a hydrate pass consuming them through
+// the portable RefStore methods paid one whole-manifest round trip per
+// call. Materializing the refs is bounded by the manifest hard cap —
+// exactly the eligibility condition the interface documents.
+func (s *S3WAL) HydrateSnapshot(ctx context.Context, repo string) (HydrateSnapshot, error) {
+	assertf(repo != "", "HydrateSnapshot: empty repo")
+	m, err := s.viewManifest(ctx, baseRepoOf(repo))
+	if err != nil {
+		return HydrateSnapshot{}, err
+	}
+	mem := m.Member(repo)
+	if mem == nil {
+		return HydrateSnapshot{}, nil
+	}
+	assertf(mem.Gen >= 0, "manifest holds negative generation %d for %s", mem.Gen, repo)
+	snap := HydrateSnapshot{Generation: mem.Gen, Packs: s3walMemberPacks(mem)}
+	names := make([]string, 0, len(mem.Refs))
+	for name := range mem.Refs {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	snap.Refs = make([]RefEntry, 0, len(names))
+	for _, name := range names {
+		sha := mem.Refs[name].SHA
+		assertf(ValidSHA(sha), "manifest holds malformed sha %q for %s/%s", sha, repo, name)
+		snap.Refs = append(snap.Refs, RefEntry{Name: name, SHA: sha})
+	}
+	return snap, nil
 }
 
 // HasPack reports whether repo has a registered pack with blob key.

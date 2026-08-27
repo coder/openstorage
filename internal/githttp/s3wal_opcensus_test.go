@@ -53,9 +53,11 @@ func parseOpLog(t *testing.T, raw string) []opLogLine {
 func opLogWindow(t *testing.T, path string, offset *int64) []opLogLine {
 	t.Helper()
 	// Hook subprocesses have exited by the time `git push` returns (git
-	// waits for them), and the serve-side post-push trigger runs before
-	// the response completes; a short settle covers OS buffering only.
-	time.Sleep(200 * time.Millisecond)
+	// waits for them). The serve-side repack probe is asynchronous
+	// (issue #182) — a single loopback GET dispatched before the
+	// response completes — so the settle need only cover its scheduling
+	// plus OS buffering.
+	time.Sleep(750 * time.Millisecond)
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("read op log: %v", err)
@@ -122,12 +124,12 @@ func TestS3WAL_PushOpCensus(t *testing.T) {
 	// Regression guard (issue #182): the per-shape budgets. Raising a
 	// bound requires justifying the new round trip against the census in
 	// that issue — on real S3 each one is user-visible push latency.
-	const steadyBudget = 23
+	const steadyBudget = 19
 	if len(steady) > steadyBudget {
 		t.Errorf("steady-state push cost %d S3 round trips, budget is %d:\n%s",
 			len(steady), steadyBudget, censusTable(steady))
 	}
-	const deleteBudget = 12
+	const deleteBudget = 10
 	if len(deleteOnly) > deleteBudget {
 		t.Errorf("delete-only push cost %d S3 round trips, budget is %d:\n%s",
 			len(deleteOnly), deleteBudget, censusTable(deleteOnly))

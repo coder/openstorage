@@ -1110,7 +1110,7 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 				// padding): the repack threshold trigger must still fire
 				// even though the response is a 413 (Codex round 4).
 				if s.MaybeRepack != nil {
-					s.MaybeRepack(context.WithoutCancel(r.Context()), target.key)
+					go s.MaybeRepack(context.WithoutCancel(r.Context()), target.key)
 				}
 			}
 			if gate.responseStarted() {
@@ -1139,7 +1139,13 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 		// Unconditionally on completion, not only on success: pre-receive
 		// may have registered packs even when a later per-ref update was
 		// denied. Cancel-free context — the client hanging up right after
-		// its push must not suppress the trigger.
-		s.MaybeRepack(context.WithoutCancel(r.Context()), target.key)
+		// its push must not suppress the trigger. Asynchronous (issue
+		// #182): the probe is a store round trip, and running it before
+		// the handler returns held the client's response open for it. A
+		// trigger lost to process exit mid-probe is the documented
+		// trade already — failures are logged, never propagated, and the
+		// pack count only grows until a fold lands, so the next push
+		// retries.
+		go s.MaybeRepack(context.WithoutCancel(r.Context()), target.key)
 	}
 }
