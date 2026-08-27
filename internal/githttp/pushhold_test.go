@@ -17,6 +17,7 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -1832,6 +1833,117 @@ func TestPushHoldRefresh_FollowsInodeAcrossRename(t *testing.T) {
 			t.Fatal("refresher touches do not follow the inode across a rename")
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TestReapExpiredPushHold_RestoresLockedHold (Codex round-32 P2 on
+// #173): the reaper must not unlink a quarantined hold whose owner is
+// still alive even when the mtime revalidation matches — a resumed
+// refresher's fd touch could land between the stat and the unlink. Every
+// live refresher holds a SHARED flock on the hold's inode, and the
+// reaper deletes only after winning an EXCLUSIVE non-blocking flock, so
+// the kernel arbitrates the race with no timing window at all.
+func TestReapExpiredPushHold_RestoresLockedHold(t *testing.T) {
+	dir := t.TempDir()
+	hold := filepath.Join(dir, "push-locked")
+	if err := os.WriteFile(hold, []byte("refs/heads/x\n"), 0o600); err != nil {
+		t.Fatalf("write hold: %v", err)
+	}
+	old := time.Now().Add(-2 * pushHoldTTL)
+	if err := os.Chtimes(hold, old, old); err != nil {
+		t.Fatalf("age hold: %v", err)
+	}
+	info, err := os.Stat(hold)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	f, err := os.OpenFile(hold, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer f.Close()
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_SH|syscall.LOCK_NB); err != nil {
+		t.Fatalf("flock: %v", err)
+	}
+	// mtime matches the observation exactly, yet the live owner's shared
+	// lock must veto the unlink.
+	reapExpiredPushHold(hold, info.ModTime())
+	if _, err := os.Stat(hold); err != nil {
+		t.Fatalf("locked hold must survive the reap at its original path: %v", err)
+	}
+	// Released lock: the same reap now completes.
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_UN); err != nil {
+		t.Fatalf("unlock: %v", err)
+	}
+	reapExpiredPushHold(hold, info.ModTime())
+	if _, err := os.Stat(hold); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("unlocked untouched leak must be unlinked")
+	}
+}
+
+// TestPushHoldRefresh_HoldsLivenessLock (Codex round-32 P2 on #173): the
+// refresher must hold the shared liveness flock the reaper's exclusive
+// lock checks against — without it the kernel gate above protects
+// nothing.
+func TestPushHoldRefresh_HoldsLivenessLock(t *testing.T) {
+	dir := t.TempDir()
+	hold := filepath.Join(dir, "push-lock-beacon")
+	if err := os.WriteFile(hold, []byte("refs/heads/x\n"), 0o600); err != nil {
+		t.Fatalf("write hold: %v", err)
+	}
+	stop := startPushHoldRefresh(hold)
+	f, err := os.OpenFile(hold, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer f.Close()
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err == nil {
+		t.Fatal("exclusive flock must fail while the refresher lives")
+	}
+	stop()
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		t.Fatalf("exclusive flock must succeed after the refresher stops: %v", err)
+	}
+}
+
+// TestLivePushHoldsKey_TransientHoldChangesKey (Codex round-32 P2 on
+// #173): equal per-entry endpoint snapshots are ABA-blind to a hold
+// reserved and released entirely between them — a sync that skipped that
+// transient hold's ref would publish a held marker vouching for a hold
+// set that was never stable. Every hold mutator rewrites the lifecycle
+// epoch file with fresh randomness (a directory mtime cannot serve: a
+// full lifecycle inside one coarse clock tick leaves it unchanged), so
+// the transient lifecycle changes the key.
+func TestLivePushHoldsKey_TransientHoldChangesKey(t *testing.T) {
+	repoDir := t.TempDir()
+	dir := filepath.Join(repoDir, pushHoldDir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "push-steady"), []byte("refs/heads/x\n"), 0o600); err != nil {
+		t.Fatalf("write hold: %v", err)
+	}
+	key1, ok := livePushHoldsKey(repoDir)
+	if !ok {
+		t.Fatal("livePushHoldsKey failed")
+	}
+	transient := filepath.Join(dir, "push-transient")
+	if err := reservePushHolds(context.Background(), transient, []string{"refs/heads/y"}); err != nil {
+		t.Fatalf("reserve transient hold: %v", err)
+	}
+	removePushHoldFiles(transient)
+	key2, ok := livePushHoldsKey(repoDir)
+	if !ok {
+		t.Fatal("livePushHoldsKey failed")
+	}
+	if key1 == key2 {
+		t.Fatal("a transient hold lifecycle between snapshots must change the key")
+	}
+	// With no further lifecycle transitions the key is stable — the
+	// marker machinery depends on unchanged sets fingerprinting equal.
+	key3, ok := livePushHoldsKey(repoDir)
+	if !ok || key3 != key2 {
+		t.Fatalf("key unstable without lifecycle transitions: %q vs %q", key3, key2)
 	}
 }
 
