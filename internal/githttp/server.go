@@ -845,6 +845,8 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 
 	cmd := exec.CommandContext(r.Context(), "git", service, "--stateless-rpc", repoPath)
 	cmd.Env = os.Environ()
+	// No-op for upload-pack; receive-pack assigns the real hold release.
+	releasePushHold := func() {}
 	if service == "receive-pack" {
 		// Never inherit per-push hook env from the serve process
 		// environment (Codex round 2): the hooks trust these as THIS
@@ -979,19 +981,27 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 		// Push hold (issue #170): the file this push's update hooks record
 		// their in-flight refs in, so concurrent full syncs skip those refs
 		// until receive-pack has performed its own local ref updates. The
-		// deferred remove runs strictly after cmd.Wait on every path below;
-		// the TTL machinery covers crash leaks.
+		// explicit releasePushHold calls below run strictly after
+		// cmd.Wait/cmd.Run, BEFORE the synchronous repack trigger (Codex
+		// round-19 P2: the trigger may take seconds — a ListPacks against
+		// shared storage plus enqueue — the same order as
+		// pushHoldWaitMax, so a hold surviving into it times out
+		// concurrent same-name or D/F-relative pushes that no longer race
+		// anything); the deferred call is the early-return fallback
+		// (removal is idempotent), and the TTL machinery covers crash
+		// leaks.
 		holdPath, err := mintPushHold(repoPath)
 		if err != nil {
 			log.Printf("%s %s: push hold: %v", service, repo, err)
 			httpError(w, http.StatusInternalServerError, "push setup failed")
 			return
 		}
-		defer func() {
+		releasePushHold = func() {
 			_ = os.Remove(holdPath)
 			_ = os.RemoveAll(holdPath + pushHoldUnreservedSuffix)
 			_ = os.RemoveAll(holdPath + pushHoldVerifiedSuffix)
-		}()
+		}
+		defer releasePushHold()
 		cmd.Env = append(cmd.Env, EnvPushHold+"="+holdPath)
 	}
 	cmd.Stderr = os.Stderr
@@ -1111,6 +1121,11 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 			log.Printf("%s %s: response: %v", service, repo, err)
 		}
 		runErr := cmd.Wait()
+		// receive-pack has exited: its local ref transaction is done and
+		// nothing the holds protect can still happen — release them
+		// before the repack trigger below (round-19 P2; the deferred
+		// release becomes a no-op).
+		releasePushHold()
 		if overflow {
 			// On the normal overflow path git saw the truncated stream
 			// during unpack — before any hook could run — and discarded
@@ -1152,6 +1167,9 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 			// errors to the client. Just log.
 			log.Printf("%s %s: %v", service, repo, err)
 		}
+		// As on the capped path: the process has exited, so release the
+		// push holds before the repack trigger below (round-19 P2).
+		releasePushHold()
 	}
 	if service == "receive-pack" && s.MaybeRepack != nil {
 		// Unconditionally on completion, not only on success: pre-receive

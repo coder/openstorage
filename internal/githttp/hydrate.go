@@ -1152,13 +1152,15 @@ const (
 	// security P2 on #173). Hold READERS must skip it — its names are
 	// exactly the ones that must not be treated as held.
 	pushHoldUnreservedSuffix = ".unreserved"
-	// pushHoldVerifiedSuffix marks a push's sidecar DIRECTORY holding one
-	// empty marker per signature-gated command whose full pre-receive
-	// evaluation PASSED, keyed by SHA-256 over (ref, old, new) — the
-	// update hook consumes the verdict with one stat instead of charging
-	// the shared verify-sig walk budget a second per-evaluation fee
-	// (Codex round-16 P2 on #173). Hold READERS must skip it (a
-	// directory, like the unreserved sidecar).
+	// pushHoldVerifiedSuffix marks a push's sidecar FILE of sorted
+	// SHA-256 digests, one per command whose full pre-receive evaluation
+	// PASSED, each keyed over (ref, old, new) — the update hook consumes
+	// the verdict with an O(log n) binary search instead of charging the
+	// shared verify-sig walk budget a second per-evaluation fee (Codex
+	// round-16 P2 on #173). One fixed-width file, not one marker inode
+	// per verdict (round-19 P2: the per-inode form needed a cap, and
+	// verdicts dropped at the cap re-charged exactly the pushes big
+	// enough to need them). Hold READERS must skip it.
 	pushHoldVerifiedSuffix = ".verified"
 )
 
@@ -1169,13 +1171,67 @@ func pushHoldUnreservedMarker(holdPath, name string) string {
 	return holdPath + pushHoldUnreservedSuffix + "/" + hex.EncodeToString(sum[:])
 }
 
-// pushHoldVerifiedMarker is the sidecar marker path recording that the
-// exact command (name, old, new) passed pre-receive's full policy
-// evaluation. Keyed over all three so a hook can only consume the verdict
-// for the identical update.
-func pushHoldVerifiedMarker(holdPath, name, old, new string) string {
-	sum := sha256.Sum256([]byte(name + "\x00" + old + "\x00" + new))
-	return holdPath + pushHoldVerifiedSuffix + "/" + hex.EncodeToString(sum[:])
+// pushVerifiedDigest keys one verified verdict: SHA-256 over the exact
+// command (name, old, new), so a hook can only consume the verdict for
+// the identical update.
+func pushVerifiedDigest(name, old, new string) [sha256.Size]byte {
+	return sha256.Sum256([]byte(name + "\x00" + old + "\x00" + new))
+}
+
+// writePushVerifiedVerdicts persists a push's passed evaluations as ONE
+// sorted fixed-width digest file. EVERY pass is kept (Codex round-19 P2
+// on #173: the former one-inode-per-verdict directory needed a marker
+// cap, and commands past the cap silently lost their verdicts — their
+// update hooks then re-charged the very walk allowance the verdicts exist
+// to protect, rejecting exactly the large compliant fanouts that need
+// them). Size is bounded by construction: 32 bytes per command, strictly
+// smaller than the wire request that carried the commands. Written once
+// by pre-receive, strictly before git runs any update hook, so readers
+// never race the write.
+func writePushVerifiedVerdicts(holdPath string, digests [][sha256.Size]byte) error {
+	if len(digests) == 0 {
+		return nil
+	}
+	sort.Slice(digests, func(i, j int) bool { return bytes.Compare(digests[i][:], digests[j][:]) < 0 })
+	buf := make([]byte, 0, len(digests)*sha256.Size)
+	for _, d := range digests {
+		buf = append(buf, d[:]...)
+	}
+	return os.WriteFile(holdPath+pushHoldVerifiedSuffix, buf, 0o600)
+}
+
+// pushVerifiedVerdict reports whether the exact command passed
+// pre-receive's full policy evaluation, by binary search over the sorted
+// digest file. Any trouble (no sidecar, torn size, read error) falls back
+// closed to false — the hook then just re-evaluates for real.
+func pushVerifiedVerdict(holdPath, name, old, new string) bool {
+	f, err := os.Open(holdPath + pushHoldVerifiedSuffix)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil || fi.Size()%sha256.Size != 0 {
+		return false
+	}
+	want := pushVerifiedDigest(name, old, new)
+	var rec [sha256.Size]byte
+	lo, hi := int64(0), fi.Size()/sha256.Size
+	for lo < hi {
+		mid := (lo + hi) / 2
+		if _, err := f.ReadAt(rec[:], mid*sha256.Size); err != nil {
+			return false
+		}
+		switch bytes.Compare(want[:], rec[:]) {
+		case 0:
+			return true
+		case -1:
+			hi = mid
+		default:
+			lo = mid + 1
+		}
+	}
+	return false
 }
 
 // mintPushHold returns the absolute path a receive-pack request's update

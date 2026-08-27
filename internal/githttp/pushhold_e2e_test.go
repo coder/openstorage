@@ -14,12 +14,16 @@ import (
 	"crypto/sha1"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/coder/code-storage/internal/auth"
+	"github.com/coder/code-storage/internal/meta"
 	"github.com/coder/code-storage/internal/ref"
 )
 
@@ -855,5 +859,195 @@ func TestAtomicPush_StaleBaseDeniedBeforeAnyCAS(t *testing.T) {
 	// committed.
 	if !strings.Contains(resB.out, "fetch first") {
 		t.Fatalf("denial must come from the pre-receive atomic base check:\n%s", resB.out)
+	}
+}
+
+// TestAtomicPush_SignedFanoutSurvivesSmallBudget (Codex round-19 P1 on
+// #173): the atomic gate fully evaluates every command pre-reservation —
+// those verdicts must be persisted exactly like the non-atomic
+// reservation evaluations, or every update hook re-charges the shared
+// walk allowance and a fully compliant atomic signed fanout dies
+// mid-transaction: earlier hooks' authority CASes have already committed
+// when the allowance runs out, while git aborts the whole local atomic
+// transaction — the half-commit shape under --atomic.
+func TestAtomicPush_SignedFanoutSurvivesSmallBudget(t *testing.T) {
+	repo := registerRepo(t, "t-atomic-signed-fanout-budget")
+	work := initWorkRepo(t)
+	priv, pub := genSSHKey(t)
+	key := registerSigningKey(t, pub)
+	defer removeSigningKey(t, key.ID)
+
+	mustGit(t, work, append(sshSigningArgs(priv), "commit", "--amend", "--no-edit")...)
+	plain := mintTestToken(t, repo, "git:read,git:write", "")
+	node := startNodeT(t, "CODESTORAGE_VERIFY_SIG_BUDGET=1")
+	// Store the whole (1-commit) history first, so the fanout push below
+	// carries no pack and its only budget pressure is the per-evaluation
+	// fees.
+	mustGit(t, work, "push", remoteURL(node, repo, plain), "HEAD:refs/heads/main")
+	head := revParse(t, work, "HEAD")
+
+	vs := mintTestToken(t, repo, "git:read,git:write", `[["*",["verify-sig"]]]`)
+	args := []string{"push", "--atomic", remoteURL(node, repo, vs)}
+	for i := 0; i < 60; i++ {
+		args = append(args, fmt.Sprintf("HEAD:refs/heads/b/%04d", i))
+	}
+	out, err := tryGit(work, args...)
+	if err != nil {
+		t.Fatalf("signed 60-ref atomic same-tip fanout must survive budget 1: %v\n%.2000s", err, out)
+	}
+	refs := pgRefs(t, repo)
+	if refs["refs/heads/b/0000"] != head || refs["refs/heads/b/0059"] != head {
+		t.Fatalf("fanout refs missing: %v", refs["refs/heads/b/0000"])
+	}
+}
+
+// TestPush_NoForcePushDenialReleasesHold (Codex round-19 P2 on #173):
+// pre-receive's reservation classifier deliberately reserves a
+// no-force-push UPDATE without the ancestry subprocess (classification
+// cost is attacker-chosen), so a non-fast-forward update bulk-reserves
+// and is only denied by its own update hook's real evaluation — pre-CAS.
+// That denial must release the name's reservation immediately: bundled
+// with slow allowed work, the doomed rewind otherwise keeps the protected
+// name held for the push's whole duration, timing out the concurrent
+// legitimate fast-forwards no-force-push exists to protect.
+func TestPush_NoForcePushDenialReleasesHold(t *testing.T) {
+	repo := registerRepo(t, "t-noff-denial-release")
+	work := initWorkRepo(t)
+	token := mintTestToken(t, repo, "git:read,git:write", "")
+	v1 := revParse(t, work, "HEAD")
+	mustGit(t, work, "commit", "--allow-empty", "-m", "advance protected to v2")
+	mustGit(t, work, "push", remoteURL(nodeA, repo, token),
+		"HEAD:refs/heads/main", "HEAD:refs/heads/protected")
+
+	// Concurrent pusher C: clone at v2, one commit ahead for its
+	// fast-forward of protected.
+	workC := filepath.Join(t.TempDir(), "clone-c")
+	mustGit(t, "", "clone", work, workC)
+	mustGit(t, workC, "commit", "--allow-empty", "-m", "C: fast-forward to v3")
+	headC := revParse(t, workC, "HEAD")
+
+	// B's zzz tip is a NEW commit: the push must carry a pack an ALLOWED
+	// command needs, or pre-receive's publication gate refuses the whole
+	// push once the rewind's shared verdict comes back denied (the
+	// round-7 decoy rule) and no update hook — the leak under test —
+	// ever runs.
+	mustGit(t, work, "commit", "--allow-empty", "-m", "B: new tip for zzz")
+
+	barrier := filepath.Join(t.TempDir(), "update-barrier")
+	node := startNodeT(t, EnvUpdateBarrier+"="+barrier)
+	noff := mintTestToken(t, repo, "git:read,git:write", `[["refs/heads/protected",["no-force-push"]]]`)
+
+	type pushResult struct {
+		out string
+		err error
+	}
+	// Push B: the protected rewind (v2 -> v1) bulk-reserves and is denied
+	// pre-CAS by its update hook's ancestry check; creation zzz, whose
+	// hook runs after protected's denial, consumes the one-shot barrier
+	// and pauses post-CAS, keeping B's receive-pack (and its hold file)
+	// alive.
+	doneB := make(chan pushResult, 1)
+	go func() {
+		out, err := tryGit(work, "push", "--force", remoteURL(node, repo, noff),
+			v1+":refs/heads/protected", "HEAD:refs/heads/zzz")
+		doneB <- pushResult{out, err}
+	}()
+	waitForFile(t, barrier+".ready", 30*time.Second)
+
+	// While B is paused: a legitimate fast-forward of protected must
+	// reserve immediately — B's denied rewind released its hold. Before
+	// the fix this push waited out the full 10s reservation deadline on
+	// the leaked hold and failed closed.
+	outC, errC := tryGit(workC, "push", remoteURL(node, repo, token), "HEAD:refs/heads/protected")
+	if errC != nil {
+		t.Fatalf("fast-forward blocked by the denied rewind's leaked hold: %v\n%s", errC, outC)
+	}
+
+	if err := os.WriteFile(barrier+".release", nil, 0o644); err != nil {
+		t.Fatalf("release barrier: %v", err)
+	}
+	resB := <-doneB
+	t.Logf("push B (doomed rewind + zzz):\n%s", resB.out)
+	if resB.err == nil {
+		t.Fatal("push B fully succeeded; the rewind was supposed to be denied per-ref")
+	}
+	refs := pgRefs(t, repo)
+	if refs["refs/heads/protected"] != headC {
+		t.Fatalf("authority protected = %q, want C's fast-forward %q", refs["refs/heads/protected"], headC)
+	}
+	if _, ok := refs["refs/heads/zzz"]; !ok {
+		t.Fatalf("B's valid creation zzz missing: %v", refs)
+	}
+}
+
+// TestServiceRPC_ReleasesPushHoldBeforeRepackTrigger (Codex round-19 P2
+// on #173): the push's ref reservations protect receive-pack's local ref
+// transaction — nothing after cmd.Wait needs them. The synchronous
+// MaybeRepack trigger that follows may take seconds (a ListPacks against
+// shared storage plus enqueue), the same order as pushHoldWaitMax, so a
+// hold surviving into the trigger times out concurrent same-name or
+// D/F-relative pushes that no longer race anything. The trigger must
+// observe the hold ALREADY released. Runs the push in-process (httptest +
+// TestMain's hook re-exec dispatch) because MaybeRepack is injectable
+// only on the Server struct.
+func TestServiceRPC_ReleasesPushHoldBeforeRepackTrigger(t *testing.T) {
+	// The in-process server plays the serve node, so the hook
+	// subprocesses inherit THIS process's environment.
+	t.Setenv("CODESTORAGE_PG_URL", dbURL)
+	t.Setenv("CODESTORAGE_S3_URL", blobURL)
+
+	repo := "t-hold-before-repack"
+	cacheDir := t.TempDir()
+	key, pemBlock := genKeyPEM(t, "ES256")
+	// -1 = the trigger never ran.
+	var liveHolds atomic.Int64
+	liveHolds.Store(-1)
+	srv := &Server{
+		Store:    openTestRefStore(t),
+		Blob:     openTestBlob(t),
+		CacheDir: cacheDir,
+		Verifier: auth.NewVerifier(memKeys{testOrg: {pemBlock}}),
+		Org:      testOrg,
+		ResolveRepo: func(_ context.Context, base string) (meta.Repo, bool) {
+			if base != repo {
+				return meta.Repo{}, false
+			}
+			return meta.Repo{RepoID: repo, URL: repo, DefaultBranch: "main"}, true
+		},
+		MaybeRepack: func(_ context.Context, _ string) {
+			entries, err := os.ReadDir(filepath.Join(RepoPath(cacheDir, repo), pushHoldDir))
+			if err != nil {
+				t.Errorf("read hold dir from the repack trigger: %v", err)
+				return
+			}
+			n := int64(0)
+			for _, e := range entries {
+				if strings.HasSuffix(e.Name(), pushHoldUnreservedSuffix) ||
+					strings.HasSuffix(e.Name(), pushHoldVerifiedSuffix) || e.IsDir() {
+					continue
+				}
+				n++
+			}
+			liveHolds.Store(n)
+		},
+	}
+	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(ts.Close)
+
+	work := initWorkRepo(t)
+	token := mintUnitToken(t, key, "ES256", unitClaims(testOrg, repo, auth.ScopeGitRead, auth.ScopeGitWrite))
+	url := strings.Replace(ts.URL, "http://", "http://t:"+token+"@", 1) + "/" + repo + ".git"
+	out, err := tryGit(work, "push", url, "HEAD:refs/heads/main")
+	if err != nil {
+		t.Fatalf("push through the in-process server: %v\n%s", err, out)
+	}
+	// The trigger runs synchronously in the handler AFTER the response
+	// streamed, so the client-side push can return first; wait out that
+	// small tail.
+	for deadline := time.Now().Add(10 * time.Second); liveHolds.Load() == -1 && time.Now().Before(deadline); {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := liveHolds.Load(); got != 0 {
+		t.Fatalf("repack trigger observed %d live push holds, want 0 (released before the trigger)", got)
 	}
 }

@@ -3,6 +3,7 @@ package githttp
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -284,36 +285,46 @@ func preReceive(ctx context.Context) error {
 		var sigVerified []bool
 		if !atomicPush {
 			classes, sigVerified = reservationVerdicts(repo, commands, updatable, evalOne)
+		} else {
+			// The atomic gate above fully evaluated EVERY command and
+			// denied the push whole on any failure, so each verdict here
+			// is a pass for the exact (ref, old, new) — persist them all
+			// (Codex round-19 P1): hooks otherwise re-charge the shared
+			// walk allowance per command, and an atomic signed fanout
+			// under a small budget dies mid-transaction AFTER earlier
+			// hooks' authority CASes committed — git aborts the whole
+			// local atomic transaction while those updates durably stand.
+			sigVerified = make([]bool, len(commands))
+			for i := range sigVerified {
+				sigVerified[i] = true
+			}
 		}
-		// Verified-verdict markers (Codex round-16 P2): each
-		// signature-gated command whose REAL evaluation just passed gets
-		// one marker keyed over (ref, old, new), so its update hook
-		// consumes the verdict with a single stat instead of charging the
-		// per-evaluation verify fee again — with a small
+		// Verified-verdict persistence (Codex round-16 P2): each command
+		// whose REAL evaluation just passed is recorded, so its update
+		// hook consumes the verdict with an O(log n) lookup instead of
+		// charging the per-evaluation verify fee again — with a small
 		// CODESTORAGE_VERIFY_SIG_BUDGET, a same-tip fanout of N gated
 		// refs costs ~N+1 fee units here, and hooks re-charging another N
 		// pushed a fully compliant push past the walk allowance. Inputs
 		// are identical (same push, same policy env, same shas), so the
-		// hook-side verdict could only repeat this one. Inode use is
-		// bounded (round-18 P2): an UNLIMITED budget (0) writes no
-		// markers at all — hook re-evaluation cannot exhaust a limitless
-		// allowance — and bounded budgets cap markers at
-		// maxPushVerifiedMarkers, overflow falling back to hook
-		// re-evaluation.
+		// hook-side verdict could only repeat this one. An UNLIMITED
+		// budget (0) writes no verdicts — hook re-evaluation cannot
+		// exhaust a limitless allowance. Bounded budgets persist EVERY
+		// pass in one sorted digest file (round-18 P2 bounded the former
+		// per-verdict inodes with a cap; round-19 P2: verdicts dropped at
+		// that cap re-charged exactly the fanouts big enough to need
+		// them).
 		if budget, err := verifySigBudget(); err != nil || budget > 0 {
-			markers := 0
+			var digests [][sha256.Size]byte
 			for i, ok := range sigVerified {
-				if !ok || markers >= maxPushVerifiedMarkers {
+				if !ok {
 					continue
 				}
-				markers++
-				if err := os.MkdirAll(holdPath+pushHoldVerifiedSuffix, 0o755); err != nil {
-					return fmt.Errorf("pre-receive: record verified verdicts: %w", err)
-				}
 				c := commands[i]
-				if err := os.WriteFile(pushHoldVerifiedMarker(holdPath, c.ref, c.old, c.new), nil, 0o600); err != nil {
-					return fmt.Errorf("pre-receive: record verified verdict for %s: %w", c.ref, err)
-				}
+				digests = append(digests, pushVerifiedDigest(c.ref, c.old, c.new))
+			}
+			if err := writePushVerifiedVerdicts(holdPath, digests); err != nil {
+				return fmt.Errorf("pre-receive: record verified verdicts: %w", err)
 			}
 		}
 		for i, c := range commands {
@@ -894,18 +905,6 @@ const (
 	maxPushRefNameBytes    = 900
 )
 
-// maxPushVerifiedMarkers bounds the ".verified" sidecar's inode count
-// (Codex round-18 P2 on #173): a same-tip signed fanout passes every
-// command via the shared range verdict, and unbounded per-command markers
-// let one compact no-pack push mint hundreds of thousands of files on the
-// shared cache volume. Overflowing commands simply skip their marker —
-// their hooks fall back to a real evaluation, whose budget fee only
-// matters when the verify budget is SMALL, and a small budget already
-// caps how many commands can pass verification in the first place (each
-// passing evaluation costs at least one fee unit of the 100×budget
-// allowance).
-const maxPushVerifiedMarkers = 4096
-
 // maxPushUnreserved caps how many of one push's commands may land in the
 // unreserved sidecar (one marker inode each — see preReceive). Membership
 // is attacker-chosen: policy-denied, unupdatable, or D/F-conflicted names
@@ -1228,20 +1227,38 @@ func updateHook(ctx context.Context, args []string) (retErr error) {
 	holdPath := os.Getenv(EnvPushHold)
 	if holdPath != "" {
 		defer startPushHoldRefresh(holdPath)()
+		// Release this hook's ref from the shared hold on ANY denial
+		// below (Codex round-16 P2 for sidecar self-reservations;
+		// round-19 P2 extends the release to bulk-reserved names: the
+		// reservation classifier deliberately reserves no-force-push
+		// updates without the ancestry subprocess, so a non-fast-forward
+		// update is denied only HERE, pre-CAS — bundled with slow allowed
+		// work it would otherwise keep the protected name held for the
+		// push's whole duration, timing out exactly the legitimate
+		// fast-forwards no-force-push exists to protect). Sound because a
+		// denied command commits nothing: every error return below
+		// precedes the CAS, whose only successful continuation is the
+		// test barrier and `return nil`. Best-effort: a failed release
+		// leaves the pre-fix until-exit hold, and the denial itself still
+		// stands. Removing a name the hold never listed (a sidecar
+		// command denied before its self-reservation) is a no-op rewrite.
+		defer func() {
+			if retErr != nil {
+				_ = removePushHolds(holdPath, []string{refName})
+			}
+		}()
 	}
 
-	// Verified-verdict marker (Codex round-16 P2): pre-receive already ran
-	// the FULL policy evaluation for this exact (ref, old, new) — same
-	// push, same policy env — and it passed; re-evaluating here could
-	// only repeat the verdict while charging the shared verify-sig walk
-	// budget another per-evaluation fee, failing large compliant same-tip
-	// fanouts under small budgets. Any stat trouble falls back closed to
-	// a real evaluation.
+	// Verified verdict (Codex round-16 P2): pre-receive already ran the
+	// FULL policy evaluation for this exact (ref, old, new) — same push,
+	// same policy env — and it passed; re-evaluating here could only
+	// repeat the verdict while charging the shared verify-sig walk budget
+	// another per-evaluation fee, failing large compliant same-tip
+	// fanouts under small budgets. Any lookup trouble falls back closed
+	// to a real evaluation.
 	sigVerified := false
 	if holdPath != "" {
-		if _, err := os.Stat(pushHoldVerifiedMarker(holdPath, refName, old, new)); err == nil {
-			sigVerified = true
-		}
+		sigVerified = pushVerifiedVerdict(holdPath, refName, old, new)
 	}
 	if !sigVerified {
 		if err := enforceRefPolicy(ctx, repo, refName, old, new); err != nil {
@@ -1278,25 +1295,19 @@ func updateHook(ctx context.Context, args []string) (retErr error) {
 		case err != nil:
 			return fmt.Errorf("update: check unreserved marker: %w", err)
 		default:
+			// A denial after this self-reservation releases it via the
+			// shared deferred release above (Codex round-16 P2): a
+			// sidecar-listed creation denied by the commit-time D/F probe
+			// (or fence, or CAS loss) commits nothing, yet its name would
+			// otherwise stay held until the whole receive-pack exits — a
+			// doomed parent bundled into a large push squats its existing
+			// relatives' namespace for the push's full duration, timing
+			// out their legitimate updates. On success the reservation is
+			// kept through the CAS, the local update, and receive-pack
+			// exit, exactly like bulk holds.
 			if err := reservePushHolds(ctx, holdPath, []string{refName}); err != nil {
 				return fmt.Errorf("update: reserve push hold: %w", err)
 			}
-			// Release the self-reservation on any denial below (Codex
-			// round-16 P2): a sidecar-listed creation denied by the
-			// commit-time D/F probe (or fence, or CAS loss) commits
-			// nothing, yet its name would otherwise stay held until the
-			// whole receive-pack exits — a doomed parent bundled into a
-			// large push squats its existing relatives' namespace for the
-			// push's full duration, timing out their legitimate updates.
-			// Best-effort: a failed release leaves the pre-fix
-			// until-exit hold, and the denial itself still stands. On
-			// success the reservation is kept through the CAS, the local
-			// update, and receive-pack exit, exactly like bulk holds.
-			defer func() {
-				if retErr != nil {
-					_ = removePushHolds(holdPath, []string{refName})
-				}
-			}()
 		}
 	}
 	// Sync claim fence (issue #86): a loopback sync push carries its

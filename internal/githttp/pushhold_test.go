@@ -7,6 +7,7 @@ package githttp
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"maps"
@@ -985,5 +986,57 @@ func TestReservationVerdicts_MixedPushStaysSelective(t *testing.T) {
 		if v {
 			t.Errorf("verified[%d] = true, want none (the gated evaluation fails closed here)", i)
 		}
+	}
+}
+
+// TestPushVerifiedVerdicts_EveryPassPreserved (Codex round-19 P2 on
+// #173): the consolidated verdict sidecar must preserve EVERY successful
+// evaluation — the former one-inode-per-verdict directory capped markers
+// at 4096 and silently dropped the rest, so exactly the fanouts big
+// enough to need the budget protection re-charged it. 5000 verdicts (past
+// the old cap) all stay consumable through the binary-search lookup, the
+// sidecar is ONE fixed-width file (32 bytes per verdict, no inode
+// amplification), and commands that never passed stay unverified.
+func TestPushVerifiedVerdicts_EveryPassPreserved(t *testing.T) {
+	hold, err := mintPushHold(t.TempDir())
+	if err != nil {
+		t.Fatalf("mintPushHold: %v", err)
+	}
+	sha := strings.Repeat("a", 40)
+	sha2 := strings.Repeat("b", 40)
+	const n = 5000
+	digests := make([][sha256.Size]byte, 0, n)
+	for i := 0; i < n; i++ {
+		digests = append(digests, pushVerifiedDigest(fmt.Sprintf("refs/heads/b/%04d", i), sha, sha2))
+	}
+	if err := writePushVerifiedVerdicts(hold, digests); err != nil {
+		t.Fatalf("writePushVerifiedVerdicts: %v", err)
+	}
+	fi, err := os.Stat(hold + pushHoldVerifiedSuffix)
+	if err != nil {
+		t.Fatalf("stat verdict sidecar: %v", err)
+	}
+	if fi.IsDir() || fi.Size() != int64(n*sha256.Size) {
+		t.Fatalf("sidecar = dir:%v size:%d, want one %d-byte file", fi.IsDir(), fi.Size(), n*sha256.Size)
+	}
+	for i := 0; i < n; i++ {
+		if !pushVerifiedVerdict(hold, fmt.Sprintf("refs/heads/b/%04d", i), sha, sha2) {
+			t.Fatalf("verdict %d dropped (the legacy inode cap was 4096)", i)
+		}
+	}
+	// Same name with different shas, and unseen names: never consumable.
+	if pushVerifiedVerdict(hold, "refs/heads/b/0000", sha2, sha) {
+		t.Fatal("verdict consumed for a command that never passed")
+	}
+	if pushVerifiedVerdict(hold, "refs/heads/unseen", sha, sha2) {
+		t.Fatal("verdict consumed for an unseen ref")
+	}
+	// No sidecar at all (unlimited budgets write none): plain fallback.
+	hold2, err := mintPushHold(t.TempDir())
+	if err != nil {
+		t.Fatalf("mintPushHold: %v", err)
+	}
+	if pushVerifiedVerdict(hold2, "refs/heads/b/0000", sha, sha2) {
+		t.Fatal("verdict consumed without a sidecar")
 	}
 }
