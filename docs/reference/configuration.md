@@ -81,8 +81,8 @@ Database URL for the ref authority (CAS) and metadata store.
   expected topology (the `packs/`, `lfs/`, and `_wal/` key prefixes coexist without
   overlap; the `_wal/` prefix is reserved). Credentials come from the standard AWS env
   chain; at startup a conditional-write probe refuses any store that does not implement
-  `If-Match`/`If-None-Match` PUTs faithfully (qualified: SeaweedFS; AWS S3 is expected
-  to work but awaits qualification). Jobs run
+  `If-Match`/`If-None-Match` PUTs faithfully (qualified: SeaweedFS and AWS S3 — see the
+  [benchmark results](../plans/s3wal-bench-results.md) for the AWS campaign). Jobs run
   on the in-process queue and tickers, exactly like local mode.
 
 ### `CODESTORAGE_S3_URL`

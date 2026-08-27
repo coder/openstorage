@@ -170,7 +170,7 @@ authority — no Postgres, no SQLite file, no durable disk. Refs and metadata li
 conditional-CAS objects under the bucket's `_wal/` prefix, next to the packs:
 
 ```sh
-# 1. An S3-compatible bucket as the sole authority — SeaweedFS, the qualified store (AWS S3: pending qualification).
+# 1. An S3-compatible bucket as the sole authority — SeaweedFS or AWS S3 (both qualified).
 docker run -d --name cs-s3 -p 127.0.0.1:8333:8333 -v cs-s3-data:/data chrislusf/seaweedfs:4.42 server -s3 -dir=/data -ip.bind=0.0.0.0
 until curl -sf http://127.0.0.1:8333/healthz; do sleep 1; done
 # The bucket must exist before serve boots. On a cold store both bucket creation and

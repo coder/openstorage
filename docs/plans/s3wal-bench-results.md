@@ -438,7 +438,10 @@ below is from live runs; the bucket was emptied and deleted afterward.
   drained the node gracefully (~2 s) and released the lease; a successor
   with an **empty cache dir** served health in ~1 s and a fresh clone
   reconstructed full history + LFS payload from the bucket alone. Repack
-  folded packs and the orphan sweep ran clean mid-session.
+  folded packs and the orphan sweep ran clean mid-session. Drill commands,
+  the verbatim refusal diagnostic, and the retained serve-log excerpts are
+  committed as
+  [`drills-transcript-real-s3-2026-08-27.txt`](./s3wal-bench-data/drills-transcript-real-s3-2026-08-27.txt).
 - **e2e push cost:** sequential empty-commit pushes measured p50
   **1,070 ms** on s3wal vs **386 ms** on PG+S3 (containerized Postgres,
   same-region S3 blobs, same host) — the zero-infra tradeoff is ~2.8× at
@@ -491,8 +494,10 @@ signal.
   taxonomy — the 22-surface qualification verdict transcript with its
   exact invocation
   ([`qualify-transcript-real-s3-2026-08-27.txt`](./s3wal-bench-data/qualify-transcript-real-s3-2026-08-27.txt)),
-  and the serve-session e2e push-timing evidence
-  ([`e2e-push-times-real-s3-2026-08-27.txt`](./s3wal-bench-data/e2e-push-times-real-s3-2026-08-27.txt)).
+  the serve-session e2e push-timing evidence
+  ([`e2e-push-times-real-s3-2026-08-27.txt`](./s3wal-bench-data/e2e-push-times-real-s3-2026-08-27.txt)),
+  and the operational-drill transcript
+  ([`drills-transcript-real-s3-2026-08-27.txt`](./s3wal-bench-data/drills-transcript-real-s3-2026-08-27.txt)).
 - Not checked in (~14 MiB): the SeaweedFS/SQLite cell-3 contention CSVs
   (up to ~335 k rows per SQLite cell). Regenerate with the cell-3 command
   above; per-cell summary statistics are in the table.
