@@ -1108,21 +1108,23 @@ func updateRefStdin(repoPath, commands string) error {
 // ref ... reference already exists" on creation, a failed old-value check
 // otherwise) even though the authority accepted it. The bridge across that
 // gap is a per-push hold file under <repoPath>/codestorage.push-holds/:
-// the server mints the path (EnvPushHold), the update hook appends each
-// ref name immediately BEFORE its CAS, and the server removes the file
-// once receive-pack exits. Full syncs skip commands naming a held ref and
-// suppress their generation marker, so no marker can vouch for a sync that
-// skipped a ref (the next full sync heals it).
+// the server mints the path (EnvPushHold), pre-receive reserves EVERY ref
+// of the push in it before any update-hook CAS can run
+// (reservePushHolds), and the server removes the file once receive-pack
+// exits. Full syncs skip commands naming a held ref and suppress their
+// generation marker, so no marker can vouch for a sync that skipped a ref
+// (the next full sync heals it).
 //
-// Safety: the hold is durably in the file before the CAS commits, so any
-// store page that can reveal the pushed value is read after the hold
-// exists — and every sync command is hold-checked after the page read that
-// produced it. A hold observed missing therefore means either the value
-// predates the push (safe to apply) or receive-pack already exited (its
-// local update landed; re-applying the store value is a no-op). Hold
-// windows are server-controlled — hooks only run after the client's
-// transfer completed — and the TTL bounds crash leaks: readers ignore
-// expired files and minting sweeps them. Tradeoff: while a ref is held,
+// Safety: the holds are durably in the file before any CAS commits, so any
+// store page that can reveal a pushed value is read after the hold
+// exists — and every sync command is hold-checked at batch flush, after
+// the page read that produced it. A hold observed missing therefore means
+// either the value predates the push (safe to apply) or receive-pack
+// already exited (its local update landed; re-applying the store value is
+// a no-op). Hold windows are server-controlled — hooks only run after the
+// client's transfer completed — and the TTL bounds crash leaks: readers
+// ignore expired files, minting sweeps them, and every live hook refreshes
+// the file so a live push never expires. Tradeoff: while a ref is held,
 // same-node advertisements omit its in-flight value, so a racing push of
 // the SAME ref sees a slightly stale base and fails with the ordinary CAS
 // conflict instead of fast-forwarding — the normal concurrent-writer path,
@@ -1169,36 +1171,36 @@ func sweepExpiredPushHolds(dir string) {
 	}
 }
 
-// appendPushHold records name in the push's hold file. The update hook
-// calls this immediately BEFORE the authority CAS — the ordering the skip
-// proof above depends on — and fails the push when the hold cannot be
-// recorded, because committing without it reopens the race.
-func appendPushHold(holdPath, name string) error {
-	if !filepath.IsAbs(holdPath) {
-		return fmt.Errorf("push hold path %q is not absolute", holdPath)
-	}
-	// Git's check-ref-format rejects control characters long before hooks
-	// run; refuse rather than let a forged name mint line-split holds.
-	if name == "" || strings.Contains(name, "\n") {
-		return fmt.Errorf("push hold: malformed ref name %q", name)
+// appendPushHolds records names in the push's hold file with one append
+// write. reservePushHolds calls this BEFORE any of the push's authority
+// CASes can run — the ordering the skip proof above depends on — and the
+// push is failed when the hold cannot be recorded, because committing
+// without it reopens the race.
+func appendPushHolds(holdPath string, names []string) error {
+	var sb strings.Builder
+	for _, name := range names {
+		sb.WriteString(name)
+		sb.WriteByte('\n')
 	}
 	f, err := os.OpenFile(holdPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
 		return err
 	}
-	if _, err := f.Write([]byte(name + "\n")); err != nil {
+	if _, err := f.WriteString(sb.String()); err != nil {
 		_ = f.Close()
 		return err
 	}
 	return f.Close()
 }
 
-// touchPushHold refreshes the hold file's TTL clock. The update hook keeps
-// its hold fresh for as long as the hook process lives (startPushHoldRefresh)
-// because post-CAS work inside the store decorators — webhook and sync-poke
-// enqueues — has no fixed bound: a hold must expire only when its owner is
-// actually dead, or the race this machinery closes reopens after one TTL
-// and the mint sweep could reap a live hold (Codex P2 on #173).
+// touchPushHold refreshes the hold file's TTL clock. Every hook of the
+// push — pre-receive through its publication work, each update hook across
+// its FULL runtime — keeps the shared hold file fresh while it lives
+// (startPushHoldRefresh): pack uploads, policy walks, and post-CAS
+// decorator work (webhook and sync-poke enqueues) all have no fixed bound,
+// and a hold must expire only when its owning receive-pack is actually
+// dead, or the race this machinery closes reopens after one TTL and the
+// mint sweep could reap a live hold (Codex P2s, rounds 1-2 on #173).
 func touchPushHold(holdPath string) {
 	now := time.Now()
 	_ = os.Chtimes(holdPath, now, now)
@@ -1230,8 +1232,15 @@ func startPushHoldRefresh(holdPath string) (stop func()) {
 	}
 }
 
-// pushHoldSet is one snapshot of the live (unexpired) holds in a repo.
-type pushHoldSet struct{ names []string }
+// pushHoldSet is one snapshot of live held ref names, sorted for O(log n)
+// D/F-aware lookups: matching must not go quadratic when two high-fanout
+// pushes overlap (Codex security P2 on #173).
+type pushHoldSet struct{ names []string } // sorted ascending
+
+func newPushHoldSet(names []string) pushHoldSet {
+	sort.Strings(names)
+	return pushHoldSet{names: names}
+}
 
 // loadPushHolds snapshots repoPath's live holds: one directory read plus
 // one read per live file. Expired files are ignored here regardless of
@@ -1242,14 +1251,14 @@ func loadPushHolds(repoPath string) pushHoldSet {
 	return loadPushHoldsExcept(filepath.Join(repoPath, pushHoldDir), "")
 }
 
-// loadPushHoldsExcept is loadPushHolds skipping one hold file — the update
-// hook's D/F wait must not block on its own push's holds.
+// loadPushHoldsExcept is loadPushHolds skipping one hold file — a push's
+// hold reservation must not conflict with its own earlier holds.
 func loadPushHoldsExcept(dir, exceptPath string) pushHoldSet {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return pushHoldSet{}
 	}
-	var s pushHoldSet
+	var names []string
 	for _, e := range entries {
 		path := filepath.Join(dir, e.Name())
 		if exceptPath != "" && path == exceptPath {
@@ -1265,11 +1274,35 @@ func loadPushHoldsExcept(dir, exceptPath string) pushHoldSet {
 		}
 		for _, held := range strings.Split(string(b), "\n") {
 			if held != "" {
-				s.names = append(s.names, held)
+				names = append(names, held)
 			}
 		}
 	}
-	return s
+	return newPushHoldSet(names)
+}
+
+func (s pushHoldSet) contains(name string) bool {
+	i := sort.SearchStrings(s.names, name)
+	return i < len(s.names) && s.names[i] == name
+}
+
+// holdsDescendantOf reports whether any held name lives strictly under
+// name's directory (name + "/...").
+func (s pushHoldSet) holdsDescendantOf(name string) bool {
+	prefix := name + "/"
+	i := sort.SearchStrings(s.names, prefix)
+	return i < len(s.names) && strings.HasPrefix(s.names[i], prefix)
+}
+
+// holdsAncestorOf reports whether any held name is a strict directory
+// ancestor of name. O(len(name) + segments·log n).
+func (s pushHoldSet) holdsAncestorOf(name string) bool {
+	for i := 0; i < len(name); i++ {
+		if name[i] == '/' && s.contains(name[:i]) {
+			return true
+		}
+	}
+	return false
 }
 
 // covers reports whether name is held — exactly, or as a D/F relative of a
@@ -1279,52 +1312,74 @@ func loadPushHoldsExcept(dir, exceptPath string) pushHoldSet {
 // sync must not touch the other side either — applying `a/b` would fail the
 // whole update-ref transaction against the held survivor.
 func (s pushHoldSet) covers(name string) bool {
-	for _, held := range s.names {
-		if held == name || strings.HasPrefix(name, held+"/") || strings.HasPrefix(held, name+"/") {
-			return true
-		}
-	}
-	return false
+	return s.contains(name) || s.holdsAncestorOf(name) || s.holdsDescendantOf(name)
 }
 
 // conflicts reports whether a STRICT D/F relative of name is held (equality
-// excluded: same-name races are already resolved cleanly by the authority
-// CAS itself). The update hook waits on this before committing a ref whose
-// local update cannot coexist with a held neighbor (see
-// waitForConflictingPushHolds).
+// excluded: same-name races are resolved cleanly by the authority CAS
+// itself).
 func (s pushHoldSet) conflicts(name string) bool {
-	for _, held := range s.names {
-		if strings.HasPrefix(name, held+"/") || strings.HasPrefix(held, name+"/") {
-			return true
-		}
-	}
-	return false
+	return s.holdsAncestorOf(name) || s.holdsDescendantOf(name)
 }
 
-// pushHoldWaitMax bounds the update hook's wait for a D/F-conflicting hold
-// from another push. Hold windows are server-controlled and normally
-// millisecond-scale; on timeout the hook proceeds — degrading to the
-// pre-hold behavior for that push — rather than wedging it.
-const pushHoldWaitMax = 10 * time.Second
+// pushHoldWaitMax bounds reservePushHolds' wait for D/F-conflicting holds
+// from other pushes; a var so tests can exercise the denial path quickly.
+// Hold windows are server-controlled and normally millisecond-scale.
+var pushHoldWaitMax = 10 * time.Second
 
-// waitForConflictingPushHolds parks the update hook until no OTHER push
-// holds a strict D/F relative of refName (Codex P1 on #173): if push A has
-// committed the deletion of refs/heads/a but not yet performed its local
-// deletion, hydration skips `a` (held), so push B creating refs/heads/a/b
-// would pass its authority CAS and then fail its local update against the
-// surviving loose ref. Waiting until A's hold clears means A's receive-pack
-// has performed the local deletion (or A crashed, bounded by the timeout —
-// B then fails as it would have pre-hold and a post-TTL retry converges).
-// ownHoldPath is excluded: a multi-ref push renaming a -> a/b holds both
-// sides itself and must not deadlock on its own file.
-func waitForConflictingPushHolds(ownHoldPath, refName string) {
-	dir := filepath.Dir(ownHoldPath)
-	for deadline := time.Now().Add(pushHoldWaitMax); ; {
-		if !loadPushHoldsExcept(dir, ownHoldPath).conflicts(refName) {
-			return
+// reservePushHolds atomically verifies that no OTHER live push holds a
+// strict D/F relative of any of names, then appends all of names to this
+// push's hold file — ONE check+reserve per push, serialized against
+// concurrent reservers by an exclusive lock file (Codex round-2 P1 on
+// #173: a non-atomic check-then-append lets two pushes creating
+// refs/heads/a and refs/heads/a/b both pass, and the authority CAS — keyed
+// by exact name — would accept both while the git cache can materialize
+// only one). pre-receive calls this before any publication or update-hook
+// CAS. Live conflicts are waited out briefly; on timeout the push FAILS
+// CLOSED (round-2 P1: proceeding would commit an authority update whose
+// local ref transaction is doomed while the conflicting neighbor
+// survives) — a clean, pre-publication, retryable denial.
+func reservePushHolds(holdPath string, names []string) error {
+	if !filepath.IsAbs(holdPath) {
+		return fmt.Errorf("push hold path %q is not absolute", holdPath)
+	}
+	for _, name := range names {
+		// Git's check-ref-format rejects control characters long before
+		// hooks run; refuse rather than mint line-split holds.
+		if name == "" || strings.Contains(name, "\n") {
+			return fmt.Errorf("push hold: malformed ref name %q", name)
 		}
+	}
+	dir := filepath.Dir(holdPath)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	// The reserve lock lives NEXT TO the hold directory, not inside it:
+	// readers treat every directory entry as a hold file, and the mint
+	// sweep may unlink stale entries — an unlinked lock inode would let
+	// two reservers "hold" different inodes of the same path.
+	lockPath := dir + ".reserve.lock"
+	for deadline := time.Now().Add(pushHoldWaitMax); ; {
+		unlock, err := flockExclusive(lockPath)
+		if err != nil {
+			return err
+		}
+		conflict := ""
+		peers := loadPushHoldsExcept(dir, holdPath)
+		for _, name := range names {
+			if peers.conflicts(name) {
+				conflict = name
+				break
+			}
+		}
+		if conflict == "" {
+			err := appendPushHolds(holdPath, names)
+			unlock()
+			return err
+		}
+		unlock()
 		if time.Now().After(deadline) {
-			return
+			return fmt.Errorf("a concurrent push holds a ref conflicting with %s (directory/file); retry shortly", conflict)
 		}
 		time.Sleep(25 * time.Millisecond)
 	}

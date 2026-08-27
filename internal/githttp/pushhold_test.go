@@ -10,21 +10,21 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 )
 
-// mintHold creates a hold file in repoPath naming the given refs.
+// mintHold creates a hold file in repoPath naming the given refs, through
+// the same atomic reservation pushes use.
 func mintHold(t *testing.T, repoPath string, names ...string) string {
 	t.Helper()
 	holdPath, err := mintPushHold(repoPath)
 	if err != nil {
 		t.Fatalf("mintPushHold: %v", err)
 	}
-	for _, name := range names {
-		if err := appendPushHold(holdPath, name); err != nil {
-			t.Fatalf("appendPushHold(%q): %v", name, err)
-		}
+	if err := reservePushHolds(holdPath, names); err != nil {
+		t.Fatalf("reservePushHolds(%v): %v", names, err)
 	}
 	return holdPath
 }
@@ -122,7 +122,7 @@ func TestSyncRefsStreamed_SkipsHeldDFRelatives(t *testing.T) {
 // conflicts excludes equality (same-name races are resolved cleanly by the
 // authority CAS itself).
 func TestPushHoldSet_CoversAndConflicts(t *testing.T) {
-	s := pushHoldSet{names: []string{"refs/heads/a"}}
+	s := newPushHoldSet([]string{"refs/heads/a"})
 	for name, want := range map[string][2]bool{ // name -> {covers, conflicts}
 		"refs/heads/a":     {true, false},
 		"refs/heads/a/b":   {true, true},
@@ -199,19 +199,63 @@ func TestMintPushHold_SweepsExpiredLeaks(t *testing.T) {
 	}
 }
 
-// TestAppendPushHold_RejectsMalformedInput: relative paths (the hook runs
-// with a different working directory than the server) and line-splitting
-// ref names must fail the push rather than mint a broken hold.
-func TestAppendPushHold_RejectsMalformedInput(t *testing.T) {
-	if err := appendPushHold("relative/hold", "refs/heads/x"); err == nil {
+// TestReservePushHolds_RejectsMalformedInput: relative paths (the hook
+// runs with a different working directory than the server) and
+// line-splitting ref names must fail the push rather than mint a broken
+// hold.
+func TestReservePushHolds_RejectsMalformedInput(t *testing.T) {
+	if err := reservePushHolds("relative/hold", []string{"refs/heads/x"}); err == nil {
 		t.Fatal("relative hold path accepted")
 	}
-	abs := filepath.Join(t.TempDir(), "hold")
-	if err := appendPushHold(abs, "refs/heads/a\nrefs/heads/b"); err == nil {
+	abs := filepath.Join(t.TempDir(), "holds", "hold")
+	if err := reservePushHolds(abs, []string{"refs/heads/a\nrefs/heads/b"}); err == nil {
 		t.Fatal("line-splitting ref name accepted")
 	}
-	if err := appendPushHold(abs, ""); err == nil {
+	if err := reservePushHolds(abs, []string{""}); err == nil {
 		t.Fatal("empty ref name accepted")
+	}
+}
+
+// TestReservePushHolds_DeniesLiveConflictFailsClosed: a reservation racing
+// a live D/F-conflicting hold from another push waits briefly and then
+// DENIES rather than committing past the conflict; same-name overlap and
+// unrelated names reserve immediately, and an expired conflicting hold is
+// ignored.
+func TestReservePushHolds_DeniesLiveConflictFailsClosed(t *testing.T) {
+	dir := t.TempDir()
+	other := mintHold(t, dir, "refs/heads/a")
+
+	prev := pushHoldWaitMax
+	pushHoldWaitMax = 100 * time.Millisecond
+	defer func() { pushHoldWaitMax = prev }()
+
+	own, err := mintPushHold(dir)
+	if err != nil {
+		t.Fatalf("mintPushHold: %v", err)
+	}
+	if err := reservePushHolds(own, []string{"refs/heads/a/b"}); err == nil {
+		t.Fatal("reservation past a live D/F-conflicting hold accepted")
+	} else if !strings.Contains(err.Error(), "conflicting") {
+		t.Fatalf("denial reason = %v, want a conflict message", err)
+	}
+	// Same-name and unrelated refs are NOT conflicts.
+	if err := reservePushHolds(own, []string{"refs/heads/a", "refs/heads/z"}); err != nil {
+		t.Fatalf("non-conflicting reservation denied: %v", err)
+	}
+	// An expired conflicting hold is a crash leak, not a conflict. (own
+	// also holds refs/heads/a by now — expire both.)
+	expired := time.Now().Add(-pushHoldTTL - time.Minute)
+	for _, p := range []string{other, own} {
+		if err := os.Chtimes(p, expired, expired); err != nil {
+			t.Fatalf("Chtimes: %v", err)
+		}
+	}
+	own2, err := mintPushHold(dir)
+	if err != nil {
+		t.Fatalf("mintPushHold: %v", err)
+	}
+	if err := reservePushHolds(own2, []string{"refs/heads/a/c"}); err != nil {
+		t.Fatalf("reservation blocked by an expired hold: %v", err)
 	}
 }
 

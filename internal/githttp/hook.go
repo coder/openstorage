@@ -42,12 +42,13 @@ const (
 	// the serve config on purpose: the server sets it explicitly for hooks.
 	EnvOrg = "CODESTORAGE_ORG"
 	// EnvPushHold carries the absolute path of this push's hold file
-	// (issue #170, hydrate.go push-hold machinery). The update hook appends
-	// each ref name to it immediately before the authority CAS; concurrent
-	// full syncs skip held refs so they cannot race receive-pack's own
-	// local update of a ref it just committed. Minted per request by the
-	// server and stripped from inherited env like the other per-push
-	// inputs.
+	// (issue #170, hydrate.go push-hold machinery). pre-receive reserves
+	// every ref of the push in it before any update-hook CAS can run;
+	// concurrent full syncs skip held refs so they cannot race
+	// receive-pack's own local update of a ref it just committed, and
+	// D/F-conflicting concurrent pushes serialize on the reservation.
+	// Minted per request by the server and stripped from inherited env
+	// like the other per-push inputs.
 	EnvPushHold = "CODESTORAGE_GIT_PUSH_HOLD"
 	// EnvAtomic marks the push `--atomic` (issue #28). githooks(5) exposes
 	// no atomic indicator, so the HTTP layer sniffs the wire capability
@@ -174,6 +175,27 @@ func preReceive(ctx context.Context) error {
 		return errors.New("pre-receive: git invoked hook with no commands")
 	}
 	atomicPush := os.Getenv(EnvAtomic) == "1"
+
+	// Push holds (issue #170): reserve every ref this push may commit
+	// BEFORE any publication or update-hook CAS, in one atomic
+	// check+append per push (reservePushHolds) — concurrent full syncs
+	// skip held refs so they cannot race receive-pack's own local ref
+	// updates, and a D/F-conflicting concurrent push is briefly waited out
+	// or cleanly denied HERE, pre-publication, instead of committing an
+	// authority update whose local ref transaction is doomed. The server
+	// removes the hold file when receive-pack exits; the refresher keeps
+	// it fresh through the unbounded publication work below, and each
+	// update hook chains its own refresher for its runtime.
+	if holdPath := os.Getenv(EnvPushHold); holdPath != "" {
+		names := make([]string, 0, len(commands))
+		for _, c := range commands {
+			names = append(names, c.ref)
+		}
+		if err := reservePushHolds(holdPath, names); err != nil {
+			return fmt.Errorf("pre-receive: reserve push holds: %w", err)
+		}
+		defer startPushHoldRefresh(holdPath)()
+	}
 
 	var packFiles []string
 	if quarantine != "" {
@@ -596,6 +618,24 @@ func updateHook(ctx context.Context, args []string) error {
 	}
 	repo := mustEnv(EnvRepo)
 
+	// Push hold (issue #170): pre-receive reserved holds for every ref of
+	// this push before any update hook could run (reservePushHolds), so
+	// this ref's hold precedes the CAS below. Two duties remain here:
+	// refresh the shared hold file across this hook's FULL runtime —
+	// pre-CAS policy/fence work and unbounded post-CAS decorator work
+	// alike, because in an atomic push an EARLIER hook's committed CAS
+	// relies on later hooks keeping the file fresh until git's final local
+	// transaction (Codex round-2 P2 on #173) — and fail closed if the
+	// reservation is somehow missing (an O(1) stat: per-ref content checks
+	// would re-read the growing file once per hook and go quadratic on
+	// high-fanout pushes).
+	if holdPath := os.Getenv(EnvPushHold); holdPath != "" {
+		defer startPushHoldRefresh(holdPath)()
+		if _, err := os.Stat(holdPath); err != nil {
+			return fmt.Errorf("update: push hold reservation missing (pre-receive owns it): %w", err)
+		}
+	}
+
 	if err := enforceRefPolicy(ctx, repo, refName, old, new); err != nil {
 		return err
 	}
@@ -620,34 +660,6 @@ func updateHook(ctx context.Context, args []string) error {
 			assertf(err == nil && n >= 0, "bad %s=%q", EnvHookDelay, ms)
 			time.Sleep(time.Duration(n) * time.Millisecond)
 		}
-	}
-
-	// Push hold (issue #170): record this ref BEFORE the CAS below can
-	// commit, so no concurrent full sync materializes the committed value
-	// in the shared cache repo before receive-pack's own local ref update
-	// (git would reject the push "reference already exists"/old-value
-	// mismatch). The server removes the hold once receive-pack exits.
-	// Fail closed: committing without a recorded hold reopens the race.
-	if holdPath := os.Getenv(EnvPushHold); holdPath != "" {
-		// A held STRICT D/F relative of this ref means another push's
-		// receive-pack still has the conflicting neighbor materialized
-		// locally (e.g. its committed deletion of refs/heads/a has not
-		// reached the cache repo yet while this push creates
-		// refs/heads/a/b — hydration skips held refs, so the neighbor
-		// won't vanish underneath it either). Wait for that hold to clear
-		// before committing; this push's own hold file is excluded so a
-		// multi-ref D/F rename cannot deadlock on itself (Codex P1 on
-		// #173).
-		waitForConflictingPushHolds(holdPath, refName)
-		if err := appendPushHold(holdPath, refName); err != nil {
-			return fmt.Errorf("update: record push hold: %w", err)
-		}
-		// Keep the hold fresh while this hook lives: post-CAS work inside
-		// the store decorators (webhook and sync-poke enqueues) has no
-		// fixed bound, and a hold must only ever expire when its owner is
-		// dead (Codex P2 on #173). Receive-pack's remaining window after
-		// the last hook exits is local-only and far inside one TTL.
-		defer startPushHoldRefresh(holdPath)()
 	}
 
 	st, err := ref.Open(ctx, mustEnv(envHookPGURL...))
