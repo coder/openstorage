@@ -222,7 +222,11 @@ wall clock drifts from the process's monotonic clock, each by more than
 `min(15 min, ttl/4)` — and destructive verdicts additionally cross-check the S3 HTTP
 `Date` response header, the only arm that catches a clock that was wrong at boot (a
 store supplying no usable `Date` witness is refused at startup). Over-retention and
-false-deny are the only reachable failure directions.
+false-deny are the only reachable failure directions. That guarantee covers the expiry
+paths judged against the manifest and store clocks — pack reservations, delete locks,
+grace windows, the instance lease. Metadata claim leases in `_wal/meta.json` (the
+sync/push claims) instead use plain wall-clock TTLs, mirroring the SQL backends' lease
+semantics.
 
 **No conditional DELETE, anywhere.** S3-compatible stores do not honor `If-Match` on
 DELETE uniformly — a guard that sometimes does not guard is worse than none. Deletion
@@ -248,5 +252,9 @@ dies, the disk burns, and a fresh node pointed at the bucket reconstructs full s
 The price is one CAS point per repository group: concurrent pushes to the *same*
 repository serialize on one object (hot-repo contention surfaces as CAS retries and,
 exhausted, as a clean push rejection), and every ref or metadata operation pays an S3
-round trip. Different repositories do not contend. If hot-repo write throughput or
-multi-node serving matter, use local mode or the Postgres topology.
+round trip. On the git data plane, distinct repositories do not contend — each group
+has its own manifest. Metadata is one further CAS point shared by *everything*: every
+repo, webhook, credential, org-key, and upstream-link mutation advances the single
+`_wal/meta.json` (metadata write rates are low, but they serialize globally). If
+hot-repo write throughput binds, local mode is the faster single-node alternative;
+multi-node serving means the Postgres topology.

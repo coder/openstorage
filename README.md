@@ -174,6 +174,9 @@ conditional-CAS objects under the bucket's `_wal/` prefix, next to the packs:
 docker run -d --name cs-s3 -p 8333:8333 chrislusf/seaweedfs:4.42 server -s3 -dir=/data -ip.bind=0.0.0.0
 until curl -sf http://127.0.0.1:8333/healthz; do sleep 1; done
 curl -sf -X PUT http://127.0.0.1:8333/codestorage    # the bucket must exist before serve boots
+# Cold start: bucket ops succeed before a writable volume exists, so gate on a real object write.
+until curl -sf -X PUT -d ready http://127.0.0.1:8333/codestorage/ready; do sleep 1; done
+curl -sf -X DELETE http://127.0.0.1:8333/codestorage/ready
 
 # 2. One node, refs + metadata + packs all in the bucket (this dev SeaweedFS is unauthenticated; any creds sign).
 codestorage keygen --out /tmp/cs-key

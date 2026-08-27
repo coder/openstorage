@@ -473,7 +473,9 @@ storage. Do not enable bucket versioning or object lock on the bucket.
 config, instance roles). The node needs only standard S3 object operations on the one
 bucket: object reads and writes (`s3:GetObject`, `s3:PutObject` — the conditional
 `If-Match`/`If-None-Match` writes are ordinary PutObject calls — and `s3:DeleteObject`;
-the quarantine handshake's server-side copies ride the same two), prefix listing
+the quarantine handshake's server-side copies ride the same two, plus
+`s3:AbortMultipartUpload` to clean up a failed multipart copy — as in the
+[general bucket permissions](#backing-services)), prefix listing
 (`s3:ListBucket`, which also covers the bucket reachability probes), and
 `s3:GetBucketVersioning` (the delete-mode and purge guards verify versioning is off).
 `s3:CreateBucket` is not required for a pre-provisioned bucket — a denied create falls
