@@ -441,18 +441,19 @@ type s3walMutation struct {
 	// recover classifies a fresh post-ambiguity snapshot (nil = s3walRerun,
 	// the idempotent-re-apply fallback).
 	recover func(m *s3wal.Manifest) s3walVerdict
-	// seedUnfit, when set, is evaluated against a candidate seed BEFORE
-	// the seeded first attempt (Codex P1 on PR #185): fn bodies that
-	// externalize a durable effect before their CAS — the absence-cover
-	// lapse-evidence marker — may derive that effect only from fresh
-	// state. A CURRENT seed would produce the identical verdict, but
-	// only the CAS proves currency and it proves it too late: the
-	// marker is already durable when a stale seed's PUT 412s, and a
-	// spurious fleet-global lapse marker arms the finite-admission
-	// fence with false evidence. Any seed that would trigger the
-	// externalized write is therefore refused and the mutation starts
-	// from a fresh read. nil = every seed is fit.
-	seedUnfit func(m *s3wal.Manifest) bool
+	// noSeed forces every attempt to start from a fresh read (Codex P1
+	// rounds 3+4 on PR #185): fn bodies that externalize a durable
+	// effect before their CAS — the absence-cover lapse-evidence marker
+	// in ReservePackBytes and SweepExpiredPackReservations — may derive
+	// that effect only from fresh state, because the marker is already
+	// durable when a stale seed's PUT 412s, and a spurious fleet-global
+	// lapse marker arms the finite-admission fence with false evidence.
+	// A seed-fitness predicate is NOT sufficient: expiry verdicts move
+	// with wall time and the Date witness (which fn's own in-CAS
+	// scanGet round trip refreshes), so a seed that looks harmless at
+	// check time can still doom a cover by the time fn's expiry pass
+	// runs. These mutations therefore never seed at all.
+	noSeed bool
 }
 
 // mutate runs one read-mutate-CAS loop with the §2.3 recovery discipline:
@@ -489,12 +490,13 @@ func (s *S3WAL) mutate(ctx context.Context, base string, mu s3walMutation) error
 	// schedule, so the loop budget grows by one and the jitter index is
 	// rebased onto fresh attempts below. The base lock is held, so the
 	// pre-loop peek cannot race this mutation's own snap updates.
-	seedM, seedTag, haveSeed := s.seedManifest(base)
-	if haveSeed && mu.seedUnfit != nil && mu.seedUnfit(seedM) {
-		// The seed stays cached — it is not known stale, just unusable
-		// for a mutation with pre-CAS external writes; this run reads
-		// fresh (which refreshes the snapshot anyway).
-		haveSeed = false
+	var (
+		seedM    *s3wal.Manifest
+		seedTag  string
+		haveSeed bool
+	)
+	if !mu.noSeed {
+		seedM, seedTag, haveSeed = s.seedManifest(base)
 	}
 	seedOffset := 0
 	if haveSeed {

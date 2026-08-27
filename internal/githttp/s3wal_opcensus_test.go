@@ -129,7 +129,9 @@ func TestS3WAL_PushOpCensus(t *testing.T) {
 	// Regression guard (issue #182): the per-shape budgets. Raising a
 	// bound requires justifying the new round trip against the census in
 	// that issue — on real S3 each one is user-visible push latency.
-	const steadyBudget = 18
+	// 19 = ReservePackBytes reads fresh by design (s3walMutation.noSeed:
+	// its lapse-evidence write must never derive from a seed).
+	const steadyBudget = 19
 	if len(steady) > steadyBudget {
 		t.Errorf("steady-state push cost %d S3 round trips, budget is %d:\n%s",
 			len(steady), steadyBudget, censusTable(steady))

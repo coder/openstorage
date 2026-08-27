@@ -3,6 +3,7 @@ package ref
 import (
 	"context"
 	"fmt"
+	"math"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -128,12 +129,12 @@ func TestS3WALMutateSeededVerdictRederivesFresh(t *testing.T) {
 	}
 }
 
-// TestS3WALMutateSeedUnfitReadsFresh pins the seedUnfit gate (Codex P1 on
-// PR #185): a mutation that declares its candidate seed unfit — because
-// its fn would externalize a durable effect (the lapse-evidence marker)
-// off unvalidated state — must start from a fresh read instead, while an
-// explicitly fit seed is consumed with zero reads.
-func TestS3WALMutateSeedUnfitReadsFresh(t *testing.T) {
+// TestS3WALMutateNoSeedReadsFresh pins the noSeed bypass (Codex P1 rounds
+// 3+4 on PR #185): a mutation whose fn externalizes a durable effect (the
+// lapse-evidence marker) must start every attempt from a fresh read even
+// when a warm seed exists, while an ordinary mutation consumes the seed
+// with zero reads.
+func TestS3WALMutateNoSeedReadsFresh(t *testing.T) {
 	ctx := context.Background()
 	cs, a, _ := newSeedStores(t)
 	const repo = "seedrepo"
@@ -143,27 +144,42 @@ func TestS3WALMutateSeedUnfitReadsFresh(t *testing.T) {
 		t.Fatalf("genesis CASRef = (%v, %v), want won", won, err)
 	}
 
-	edit := func(unfit bool) (gets, puts int64) {
+	edit := func(noSeed bool) (gets, puts int64) {
 		g, p := cs.gets.Load(), cs.puts.Load()
 		err := a.mutate(ctx, base, s3walMutation{
-			op:        "seed fitness test edit",
-			seedUnfit: func(*s3wal.Manifest) bool { return unfit },
+			op:     "seed bypass test edit",
+			noSeed: noSeed,
 			fn: func(m *s3wal.Manifest, clk time.Time) (bool, error) {
 				m.EnsureMember(repo).Gen++
 				return true, nil
 			},
 		})
 		if err != nil {
-			t.Fatalf("mutate(unfit=%v): %v", unfit, err)
+			t.Fatalf("mutate(noSeed=%v): %v", noSeed, err)
 		}
 		return cs.gets.Load() - g, cs.puts.Load() - p
 	}
 
 	if gets, puts := edit(false); gets != 0 || puts != 1 {
-		t.Fatalf("fit seed cost %d GETs + %d PUTs, want 0 + 1", gets, puts)
+		t.Fatalf("seeded mutation cost %d GETs + %d PUTs, want 0 + 1", gets, puts)
 	}
 	if gets, puts := edit(true); gets != 1 || puts != 1 {
-		t.Fatalf("unfit seed cost %d GETs + %d PUTs, want a fresh read: 1 + 1", gets, puts)
+		t.Fatalf("noSeed mutation cost %d GETs + %d PUTs, want a fresh read: 1 + 1", gets, puts)
+	}
+
+	// The lapse-recording mutations are the reason the bypass exists:
+	// assert they actually declare it, so a refactor cannot silently
+	// reintroduce seeded lapse evidence. ReservePackBytes must read the
+	// manifest fresh even with a warm seed (unbounded quota: the finite
+	// path's fence reads would blur the count).
+	gets := cs.gets.Load()
+	dec, err := a.ReservePackBytes(ctx, []string{base}, []Pack{{ID: "p1", Key: "packs/" + repo + "/p1.pack", Size: 1}},
+		NewReservationOwner(), 0, -1, math.MaxInt64, time.Minute)
+	if err != nil || !dec.OK {
+		t.Fatalf("ReservePackBytes = (%+v, %v), want granted", dec, err)
+	}
+	if dg := cs.gets.Load() - gets; dg != 1 {
+		t.Fatalf("ReservePackBytes performed %d GETs with a warm seed, want exactly the fresh manifest read (noSeed bypass)", dg)
 	}
 }
 
