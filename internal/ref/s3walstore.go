@@ -147,7 +147,7 @@ func newS3WALStore(cs s3wal.ConditionalStore, probe func(ctx context.Context) er
 		now:           time.Now,
 		wallDrift:     newWallDrift(),
 		casAttempts:   16,
-		backoffBase:   10 * time.Millisecond,
+		backoffBase:   25 * time.Millisecond, // §2.3: full-jitter 25ms→2s, ≤16 attempts — must match the spec the §3 bench measures under (issue #181)
 		backoffCap:    2 * time.Second,
 		softWarnBytes: s3walSoftWarnBytes,
 		hardCapBytes:  s3walHardCapBytes,

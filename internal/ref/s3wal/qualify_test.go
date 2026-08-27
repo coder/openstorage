@@ -975,16 +975,24 @@ func runContentionWindow(tb testing.TB, cas *s3wal.Client, key string, writers i
 			// cause, like the production mutate loop's iteration index)
 			// and resets on a win; only lost races sleep on it.
 			attempt := 0
+			// backoff sleeps the §2.3 full-jitter delay for the current
+			// attempt, bounded by the measurement window: recovery work
+			// past the deadline cannot lead to another CAS and would only
+			// inflate elapsed and the deferred starve reading by up to
+			// the 2 s cap (PR #184 review). It reports whether the worker
+			// should continue; false skips the re-read too.
 			backoff := func() bool {
-				timer := time.NewTimer(mrand.N(contentionBackoffCeiling(attempt)))
-				defer timer.Stop()
-				select {
-				case <-ctx.Done():
-					tb.Errorf("contention: backoff on %s: %v", key, ctx.Err())
-					return false
-				case <-timer.C:
-					return true
+				if d := min(mrand.N(contentionBackoffCeiling(attempt)), time.Until(deadline)); d > 0 {
+					timer := time.NewTimer(d)
+					defer timer.Stop()
+					select {
+					case <-ctx.Done():
+						tb.Errorf("contention: backoff on %s: %v", key, ctx.Err())
+						return false
+					case <-timer.C:
+					}
 				}
+				return time.Now().Before(deadline)
 			}
 			obj, ok := reRead()
 			if !ok {
@@ -1021,14 +1029,6 @@ func runContentionWindow(tb testing.TB, cas *s3wal.Client, key string, writers i
 					}
 				case errors.Is(err, s3wal.ErrLostRace):
 					lostRaces++
-					// The window is over and the loop is about to exit:
-					// starting a backoff + re-read now would be off-window
-					// recovery work that cannot lead to another CAS, only
-					// inflating elapsed and the deferred starve reading by
-					// up to the 2 s cap (PR #184 review).
-					if !time.Now().Before(deadline) {
-						return
-					}
 					// §2.3: full-jitter backoff before the re-read +
 					// re-evaluate, exactly like the production mutate loop.
 					if !backoff() {
