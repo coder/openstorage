@@ -877,14 +877,20 @@ type contentionResult struct {
 const (
 	contentionBackoffBase = 25 * time.Millisecond
 	contentionBackoffCap  = 2 * time.Second
+	// contentionPushAttempts mirrors production casAttempts (§2.3: ≤ 16
+	// attempts, then the push fails with ErrCASContention). The runner
+	// models the exhaustion/retry boundary by restarting the backoff
+	// schedule at that point — a retrying client's NEXT push begins a
+	// fresh mutate loop at the 25 ms base, it does not inherit the failed
+	// push's capped streak (PR #184 review round 3).
+	contentionPushAttempts = 16
 )
 
 // contentionBackoffCeiling returns the full-jitter ceiling for the
 // attempt'th retry within one push: min(cap, base·2^attempt). The shift is
-// clamped once the cap is reached so arbitrarily long losing streaks
-// cannot overflow — unlike production's 16-attempt budget, the runner
-// never abandons a push (its job is to keep offering load; a pusher pinned
-// at the 2 s cap is what an exhaust-and-retry client converges to anyway).
+// clamped once the cap is reached so the ceiling stays total and
+// overflow-free for any attempt index (defensive: callers reset the index
+// at the §2.3 exhaustion boundary, but the schedule must not depend on it).
 func contentionBackoffCeiling(attempt int) time.Duration {
 	assertf(attempt >= 0, "contentionBackoffCeiling: attempt %d", attempt)
 	const capShift = 7 // 25ms<<7 = 3.2s already exceeds the 2s cap
@@ -903,9 +909,13 @@ func contentionBackoffCeiling(attempt int) time.Duration {
 // EVERY advance — production pushers run read-mutate-CAS with no local
 // copy to chain from — and a lost race sleeps full-jitter
 // rand(0, min(2s, 25ms·2^attempt)) before its re-read, where attempt
-// counts the retries within the current push and resets on a win. The
-// starve metric therefore measures real §2.3 pusher wait, not
-// winner-pinning at PUT wire speed.
+// counts the retries within the current push, resets on a win, and
+// restarts at the §2.3 16-attempt exhaustion boundary (the retrying
+// client's next push begins a fresh schedule). Re-reads happen at the top
+// of the loop, gated by the window: work that cannot lead to another CAS
+// is never started, so off-window recovery cannot inflate elapsed or the
+// starve metric. The starve metric therefore measures real §2.3 pusher
+// wait, not winner-pinning at PUT wire speed.
 //
 // The measured window is preceded by an UNTIMED warmup on a separate
 // scratch key (warmupContention): connection setup, pool fill, and
@@ -973,14 +983,24 @@ func runContentionWindow(tb testing.TB, cas *s3wal.Client, key string, writers i
 			}
 			// attempt counts the retries within the current push (any
 			// cause, like the production mutate loop's iteration index)
-			// and resets on a win; only lost races sleep on it.
+			// and resets on a win; only lost races sleep on it. At the
+			// §2.3 exhaustion boundary (16 attempts) the schedule
+			// restarts: production mutate returns ErrCASContention there
+			// and the client's NEXT push begins a fresh loop at the 25 ms
+			// base — it does not inherit the failed push's capped streak
+			// (PR #184 review round 3).
 			attempt := 0
+			nextAttempt := func() {
+				attempt++
+				if attempt >= contentionPushAttempts {
+					attempt = 0
+				}
+			}
 			// backoff sleeps the §2.3 full-jitter delay for the current
-			// attempt, bounded by the measurement window: recovery work
-			// past the deadline cannot lead to another CAS and would only
-			// inflate elapsed and the deferred starve reading by up to
-			// the 2 s cap (PR #184 review). It reports whether the worker
-			// should continue; false skips the re-read too.
+			// attempt, truncated to the measurement deadline: sleeping
+			// past the window would only delay the loop-top exit check
+			// and inflate elapsed and the deferred starve reading (PR
+			// #184 review). False only on the ctx anomaly.
 			backoff := func() bool {
 				if d := min(mrand.N(contentionBackoffCeiling(attempt)), time.Until(deadline)); d > 0 {
 					timer := time.NewTimer(d)
@@ -992,13 +1012,19 @@ func runContentionWindow(tb testing.TB, cas *s3wal.Client, key string, writers i
 					case <-timer.C:
 					}
 				}
-				return time.Now().Before(deadline)
+				return true
 			}
-			obj, ok := reRead()
-			if !ok {
-				return
-			}
+			// The read half of every read-mutate-CAS attempt sits at the
+			// top of the loop, behind the window check: once the window
+			// is over, no re-read (winner's next push, lost-race
+			// recovery, or ambiguity resolution alike) is ever started,
+			// so a slow endpoint cannot append off-window work to elapsed
+			// or maxStarve (PR #184 review round 3).
 			for time.Now().Before(deadline) {
+				obj, ok := reRead()
+				if !ok {
+					return
+				}
 				p, decOK := decodePayload(obj.Body)
 				if !decOK {
 					tb.Errorf("contention: undecodable payload on %s", key)
@@ -1021,12 +1047,6 @@ func runContentionWindow(tb testing.TB, cas *s3wal.Client, key string, writers i
 					maxStarve = max(maxStarve, now.Sub(lastSuccess))
 					lastSuccess = now
 					attempt = 0
-					// No local-copy chaining (issue #181): the next push
-					// re-reads the object like every production pusher —
-					// the winner holds no privileged state.
-					if obj, ok = reRead(); !ok {
-						return
-					}
 				case errors.Is(err, s3wal.ErrLostRace):
 					lostRaces++
 					// §2.3: full-jitter backoff before the re-read +
@@ -1034,18 +1054,12 @@ func runContentionWindow(tb testing.TB, cas *s3wal.Client, key string, writers i
 					if !backoff() {
 						return
 					}
-					attempt++
-					if obj, ok = reRead(); !ok {
-						return
-					}
+					nextAttempt()
 				case errors.Is(err, s3wal.ErrCASContention):
 					// 409 exhaustion — the client already backed off
 					// through its full internal budget.
 					contentions++
-					attempt++
-					if obj, ok = reRead(); !ok {
-						return
-					}
+					nextAttempt()
 				default:
 					var amb *s3wal.AmbiguousError
 					if !errors.As(err, &amb) {
@@ -1053,10 +1067,7 @@ func runContentionWindow(tb testing.TB, cas *s3wal.Client, key string, writers i
 						return
 					}
 					ambiguous++
-					attempt++
-					if obj, ok = reRead(); !ok {
-						return
-					}
+					nextAttempt()
 				}
 			}
 		}()
