@@ -73,9 +73,15 @@ CODESTORAGE_BENCH_CSV_DIR=… go test ./internal/ref/s3wal/ -run '^$' \
   -bench 'BenchmarkCASAdvance|BenchmarkGenerationRead' -benchtime 300x
 CODESTORAGE_BENCH_CSV_DIR=… go test ./internal/ref/s3wal/ -run '^$' \
   -bench 'BenchmarkSimulatedPush' -benchtime 200x
-# cell 3 (60 s sustained per N; large CSVs — not committed):
+# cell 3 (60 s sustained per N; SeaweedFS/SQLite CSVs too large to commit):
 CODESTORAGE_BENCH_CONTENTION_SECS=60 CODESTORAGE_BENCH_CSV_DIR=… \
   go test ./internal/ref/s3wal/ -run '^$' -bench 'BenchmarkHotRepoContention' -benchtime 1x -v
+
+# real-S3 lane (the store=s3 rows): prepend to each command above. Unset,
+# the lane skips and only SeaweedFS/SQLite are recorded. The bucket must
+# be pre-provisioned (the harness refuses to create buckets on real S3)
+# and credentials come from the ambient AWS chain:
+CODESTORAGE_BENCH_S3_URL='s3://<bucket>?region=<region>' …
 ```
 
 ### Cell 1 — manifest CAS advance latency
@@ -433,9 +439,18 @@ signal.
   (`op,writer,latency_ns`).
 - Also checked in (2026-08-27 real-S3 campaign, `store-s3` files): cells
   1/2/4 plus all three cell-3 contention CSVs — small on real S3
-  (~1.6 k rows per N at the ~27 adv/s ceiling), and they are the Gate 1a-B
-  evidence, including the win-streak distribution behind the cell 3
-  regime note.
+  (~1.6 k rows per N at the ~27 adv/s ceiling). They carry the win-streak
+  distribution behind the cell 3 regime note, but **not** the max-starve
+  figures: the per-op CSVs record win-to-win latencies only, while
+  max-starve also folds each worker's final unfinished gap at the window
+  boundary (a worker that stops winning mid-window contributes its
+  trailing dry spell as a summary metric, never as a CSV row — which is
+  why the largest N=8 CSV sample is 23.8 s while the table reports
+  56.4 s). The starvation evidence is preserved verbatim in the committed
+  campaign transcript
+  ([`bench-transcript-real-s3-2026-08-27.txt`](./s3wal-bench-data/bench-transcript-real-s3-2026-08-27.txt)),
+  which contains every cell's full benchmark summary line
+  (`max-starve-ms` and all other reported metrics) for all three lanes.
 - Not checked in (~14 MiB): the SeaweedFS/SQLite cell-3 contention CSVs
   (up to ~335 k rows per SQLite cell). Regenerate with the cell-3 command
   above; per-cell summary statistics are in the table.
