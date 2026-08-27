@@ -171,7 +171,7 @@ conditional-CAS objects under the bucket's `_wal/` prefix, next to the packs:
 
 ```sh
 # 1. An S3-compatible bucket as the sole authority — SeaweedFS here (AWS S3 is the other qualified store).
-docker run -d --name cs-s3 -p 127.0.0.1:8333:8333 chrislusf/seaweedfs:4.42 server -s3 -dir=/data -ip.bind=0.0.0.0
+docker run -d --name cs-s3 -p 127.0.0.1:8333:8333 -v cs-s3-data:/data chrislusf/seaweedfs:4.42 server -s3 -dir=/data -ip.bind=0.0.0.0
 until curl -sf http://127.0.0.1:8333/healthz; do sleep 1; done
 # The bucket must exist before serve boots. On a cold store both bucket creation and
 # object writes can precede a writable volume, so retry create + a real write as one unit
@@ -199,10 +199,20 @@ git push origin HEAD:main
 ```
 
 Kill the process, delete the cache dir — a fresh node pointed at the same bucket
-reconstructs full service. The mode is deliberately single-node with honest scaling
-boundaries (one CAS point per repository; hot-repo pushes serialize on it):
-[deployment guide](docs/how-to/deploy-production.md#zero-infrastructure-mode-experimental-one-bucket-one-node),
-[how the engine changes](docs/explanation/storage-engine.md#the-zero-infrastructure-backend-s3-as-sole-authority-s3wal).
+reconstructs full service. One catch: the replacement refuses to start until the old
+node's instance lease expires (up to 2 minutes by default); after confirming the old
+process is dead, delete the lease to skip the wait:
+
+```sh
+curl -sf -X DELETE http://127.0.0.1:8333/codestorage/_wal/instance-lease
+```
+
+The mode is deliberately single-node with honest scaling boundaries (one CAS point per
+repository; hot-repo pushes serialize on it); the
+[deployment guide](docs/how-to/deploy-production.md#zero-infrastructure-mode-experimental-one-bucket-one-node)
+has the full lease and crash-recovery runbook, and
+[the storage engine](docs/explanation/storage-engine.md#the-zero-infrastructure-backend-s3-as-sole-authority-s3wal)
+explains what changes underneath.
 
 ## Features
 
