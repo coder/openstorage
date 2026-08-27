@@ -14,7 +14,9 @@ are small and checked in.
 
 **Real-S3 columns recorded 2026-08-27** (Gate 1a-B unblocked: temporary
 IAM Identity Center credentials, AWS S3 eu-central-1, a fresh dedicated
-unversioned bucket created for the campaign and deleted afterward). The
+unversioned bucket created for the campaign and deleted afterward). Two
+method deviations are recorded in the notes below: a single-day run, and
+compute near but not inside the target region (~7 ms measured RTT). The
 qualification lane (`TestQualifyExternalEndpoint`) passed all 22 surfaces
 in require mode against the same bucket before any benchmark ran.
 Kill-threshold evaluation and the Gate 1a-B verdict are below; summary:
@@ -39,7 +41,7 @@ criterion stands and the recommendation flips to closing #133.
 | git (client + serve cache) | 2.55.0 |
 | Docker | 27.5.1, testcontainers-go v0.44.0 |
 | SeaweedFS image | `chrislusf/seaweedfs:4.42` — `weed server -s3 -dir=/data -ip.bind=0.0.0.0`, S3 gateway on 8333, static-identity SigV4 auth, versioning + object-lock never enabled |
-| Real S3 | AWS S3 eu-central-1 (recorded 2026-08-27 at commit `52ea5c02` + PR #180's boot fix; fresh dedicated bucket, versioning/object-lock never enabled, `CODESTORAGE_S3_EXPECTED_BUCKET_OWNER` set, deleted after the campaign). Compute: same EPYC host, ~7 ms HTTP round trip to `s3.eu-central-1.amazonaws.com` — near-same-region for plan §3 purposes |
+| Real S3 | AWS S3 eu-central-1 (recorded 2026-08-27 at commit `52ea5c02` + PR #180's boot fix; fresh dedicated bucket, versioning/object-lock never enabled, deleted after the campaign). Owner pinning: `CODESTORAGE_S3_EXPECTED_BUCKET_OWNER` was enforced in the serve smokes only (production clients carry the owner middleware); the microbench/qualification harness client (`s3waltest.OpenExternalS3`) is not owner-pinned. Compute: same EPYC host — **not** in-region AWS compute; measured ~7 ms HTTP round trip to `s3.eu-central-1.amazonaws.com` (method deviation, see below) |
 
 Method notes (plan §3 falsifiability):
 
@@ -62,6 +64,16 @@ Method notes (plan §3 falsifiability):
   The 2026-08-27 real-S3 columns are likewise a single-day run on
   short-lived credentials; a promote decision (not on the table today)
   should re-run them on separate days per the method.
+- **Same-region deviation:** plan §3 prescribes real-S3 runs from
+  same-region compute. This campaign ran from a non-AWS host with a
+  measured ~7 ms HTTP round trip to the regional endpoint (recorded
+  above), not from compute inside eu-central-1. The added client-side
+  path inflates every real-S3 latency cell equally — conservative for
+  the latency thresholds, which pass with that overhead included — but
+  the contention cell's win-streak/starvation dynamics are RTT-sensitive
+  in both directions, and that arm is already recorded as
+  tripped-as-written/unresolved. A promote-grade re-run must use
+  in-region compute (e.g. EC2 in eu-central-1).
 
 ## §3 cells 1–5 (microbench harness, `internal/ref/s3wal/bench_test.go`)
 
@@ -141,9 +153,14 @@ clean rejection after its 16-attempt budget instead of spinning). A
 production-shape probe against the same bucket — 8 concurrent real
 `git push` workers on one repo group for 60 s through a live serve node —
 showed every pusher progressing continuously: 16–24 wins each, worst
-inter-success gap **21.9 s**, 160 pushes total, 35 clean retryable
-rejections (the known #170 stale-advertisement family). Harness fix
-tracked in [#181](https://github.com/coder/code-storage/issues/181).
+per-worker gap **21.9 s** (accounting includes worker start → first
+success and last success → window end), 160 pushes total, 35 clean
+retryable rejections (the known #170 stale-advertisement family). The
+probe script, per-worker raw results, and rejection taxonomy are
+committed as
+[`probe-fairness-real-s3-2026-08-27.txt`](./s3wal-bench-data/probe-fairness-real-s3-2026-08-27.txt).
+Harness fix tracked in
+[#181](https://github.com/coder/code-storage/issues/181).
 
 ### Cell 4 — generation-read latency
 
@@ -365,9 +382,10 @@ the bench tolerates and counts these like any rejection.
   published: 101,728 winning advances / 788,919 lost races clean plus
   ~15,300 real e2e pushes with a clean ls-remote detector.
 
-**Verdict input:** on real S3 from near-same-region compute (~7 ms RTT),
-thresholds (1), (2), (4) and the throughput/scaling arms of (3) pass
-cleanly. The starvation arm of (3) **trips as written** (56.4 s at N=8;
+**Verdict input:** on real S3 from compute with a measured ~7 ms RTT to
+the regional endpoint (not in-region — a recorded method deviation whose
+added path inflates the latency cells conservatively), thresholds (1),
+(2), (4) and the throughput/scaling arms of (3) pass cleanly. The starvation arm of (3) **trips as written** (56.4 s at N=8;
 60.0 s at N=32). The maintainer assessment is that this reading measures
 the harness's own deviation from the cell definition (no §2.3 backoff +
 winner-chaining; [#181](https://github.com/coder/code-storage/issues/181))
@@ -382,8 +400,9 @@ experimental** (no status upgrade), and the starvation arm is treated as
 §2.3, the cell must be re-run on real S3. If the arm trips again under
 the conformant regime, the criterion stands and the recommendation flips
 to closing #133; a clean conformant run is a precondition for any
-promote-grade claim, as are §3's separate-day repeats (this is a
-single-day campaign).
+promote-grade claim, as are §3's separate-day repeats and in-region
+compute (this single-day campaign ran near, not inside, the target
+region).
 
 ## Real-S3 serve session (2026-08-27, eu-central-1)
 
@@ -451,6 +470,11 @@ signal.
   ([`bench-transcript-real-s3-2026-08-27.txt`](./s3wal-bench-data/bench-transcript-real-s3-2026-08-27.txt)),
   which contains every cell's full benchmark summary line
   (`max-starve-ms` and all other reported metrics) for all three lanes.
+- Also committed: the production-shape probe evidence
+  ([`probe-fairness-real-s3-2026-08-27.txt`](./s3wal-bench-data/probe-fairness-real-s3-2026-08-27.txt))
+  — the probe script verbatim (its gap accounting is the definition),
+  per-worker raw results, a recomputed summary, and the rejection
+  taxonomy.
 - Not checked in (~14 MiB): the SeaweedFS/SQLite cell-3 contention CSVs
   (up to ~335 k rows per SQLite cell). Regenerate with the cell-3 command
   above; per-cell summary statistics are in the table.

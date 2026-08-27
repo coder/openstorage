@@ -1,0 +1,94 @@
+# Production-shape starvation probe — real S3, eu-central-1, 2026-08-27
+# Serve: codestorage 52ea5c02 + PR #180 fix; bucket codestorage-q1ab-s3wal-7715761f
+# (s3wal://…?region=eu-central-1 + s3://…?region=eu-central-1, expected-owner set)
+# Invocation: ws8-fairness.sh 8091 hot 60 8
+#   = 8 concurrent workers, one repo group ('hot'), 60 s window, each worker:
+#   clone once, then loop { commit --allow-empty; time git push origin w<i> }.
+#   Gap accounting per worker: last=worker start; on win, gap=now-last (so the
+#   window-start->first-success gap is included); after the window, the trailing
+#   last-success->window-end gap is folded into maxgap. Rejected pushes
+#   (non-zero git push exit) increment rejects, then fetch+reset and retry.
+
+## Probe script (verbatim)
+#!/usr/bin/env bash
+set -euo pipefail
+PORT=$1; REPO=$2; WINDOW=$3; WORKERS=$4
+BIN=/tmp/ws8-bin/codestorage
+unset GIT_ASKPASS GIT_SSH_COMMAND
+export GIT_TERMINAL_PROMPT=0
+TOK=$($BIN mint --key /tmp/ws8-key.pem --iss qual --repo "$REPO" --scopes git:read,git:write)
+WORK=$(mktemp -d /tmp/ws8-fair-XXXX)
+echo "work=$WORK"
+for i in $(seq 1 $WORKERS); do
+  git clone -q "http://t:${TOK}@127.0.0.1:$PORT/$REPO.git" "$WORK/w$i" 2>/dev/null
+done
+DEADLINE=$(( $(date +%s) + WINDOW ))
+for i in $(seq 1 $WORKERS); do
+(
+  cd "$WORK/w$i"
+  git checkout -qb "w$i"
+  last=$(date +%s%N); maxgap=0; wins=0; rejects=0
+  while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+    git -c user.name=q -c user.email=q@example.com commit -q --allow-empty -m "w$i $wins"
+    if git push -q origin "w$i" 2>>"$WORK/rej-$i.log"; then
+      now=$(date +%s%N); gap=$(( (now - last) / 1000000 ))
+      [ "$gap" -gt "$maxgap" ] && maxgap=$gap
+      last=$now; wins=$((wins+1))
+    else
+      rejects=$((rejects+1))
+      git fetch -q origin "w$i" 2>/dev/null || true
+      git reset -q --hard "origin/w$i" 2>/dev/null || true
+    fi
+  done
+  end=$(date +%s%N); tail=$(( (end - last) / 1000000 ))
+  [ "$tail" -gt "$maxgap" ] && maxgap=$tail
+  echo "$i wins=$wins rejects=$rejects maxgap_ms=$maxgap" >> "$WORK/results.txt"
+) &
+done
+wait
+sort -n "$WORK/results.txt"
+awk '{gsub(/wins=/,"",$2); gsub(/rejects=/,"",$3); gsub(/maxgap_ms=/,"",$4); w+=$2; r+=$3; if ($4+0>m) m=$4} END {printf "TOTAL wins=%d rejects=%d aggregate=%.1f/s worst_gap_ms=%d\n", w, r, w/'"$WINDOW"', m}' "$WORK/results.txt"
+
+## Per-worker results (results.txt, verbatim; authoritative)
+1 wins=16 rejects=4 maxgap_ms=15844
+2 wins=19 rejects=7 maxgap_ms=5947
+3 wins=24 rejects=5 maxgap_ms=8161
+4 wins=17 rejects=4 maxgap_ms=21882
+5 wins=24 rejects=2 maxgap_ms=5994
+6 wins=23 rejects=6 maxgap_ms=7308
+7 wins=21 rejects=3 maxgap_ms=6294
+8 wins=16 rejects=4 maxgap_ms=8307
+
+## Summary (recomputed from the per-worker lines)
+workers=8 window=60s total_wins=160 total_rejects=35 aggregate=2.67 wins/s worst_per_worker_gap_ms=21882
+# NOTE: the live run printed 'worst_gap_ms=8307' on its TOTAL line — an awk
+# string-vs-numeric max bug in the display only (m=$4 kept the value as a
+# string; 21882 lost a lexicographic compare to 8307). The per-worker lines
+# above are the raw data; the worst gap is w4's 21882 ms.
+
+## Rejection taxonomy (rej-*.log, uniq -c)
+     35 error: failed to push some refs to 'http://127.0.0.1:8091/hot.git'
+     35 To http://127.0.0.1:8091/hot.git
+      6 remote: error: cannot lock ref 'refs/heads/w6': is at <sha><sha> but expected <sha><sha>        
+      6 remote: error: cannot lock ref 'refs/heads/w2': is at <sha><sha> but expected <sha><sha>        
+      6  ! [remote rejected] w6 -> w6 (incorrect old value provided)
+      6  ! [remote rejected] w2 -> w2 (incorrect old value provided)
+      5 remote: error: cannot lock ref 'refs/heads/w3': is at <sha><sha> but expected <sha><sha>        
+      5  ! [remote rejected] w3 -> w3 (incorrect old value provided)
+      4 remote: error: cannot lock ref 'refs/heads/w8': is at <sha><sha> but expected <sha><sha>        
+      4  ! [remote rejected] w8 -> w8 (incorrect old value provided)
+      3 remote: error: cannot lock ref 'refs/heads/w7': is at <sha><sha> but expected <sha><sha>        
+      3 remote: error: cannot lock ref 'refs/heads/w4': is at <sha><sha> but expected <sha><sha>        
+      3 remote: error: cannot lock ref 'refs/heads/w1': is at <sha><sha> but expected <sha><sha>        
+      3  ! [remote rejected] w7 -> w7 (incorrect old value provided)
+      3  ! [remote rejected] w4 -> w4 (incorrect old value provided)
+      3  ! [remote rejected] w1 -> w1 (incorrect old value provided)
+      2 remote: error: cannot lock ref 'refs/heads/w5': is at <sha><sha> but expected <sha><sha>        
+      2  ! [remote rejected] w5 -> w5 (incorrect old value provided)
+      1 remote: error: hook declined to update refs/heads/w4        
+      1 remote: error: cannot lock ref 'refs/heads/w2': reference already exists        
+      1 remote: codestorage hook: s3wal read repo_0684059b595f: s3wal: get _wal/repo/repo_0684059b595f: operation error S3: GetObject, https response error StatusCode: 0, RequestID: , HostID: , request send failed, Get "https://s3.eu-central-1.amazonaws.com/codestorage-q1ab-s3wal-7715761f/_wal/repo/repo_0684059b595f?x-id=GetObject": net/http: TLS handshake timeout        
+      1 remote: codestorage hook: pre-receive: reserve pack bytes: s3wal reserve pack bytes repo_0684059b595f: 16 attempts: s3wal: conditional-write contention retries exhausted        
+      1  ! [remote rejected] w4 -> w4 (hook declined)
+      1  ! [remote rejected] w2 -> w2 (reference already exists)
+      1  ! [remote rejected] w1 -> w1 (pre-receive hook declined)
