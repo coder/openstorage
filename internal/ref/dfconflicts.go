@@ -31,6 +31,36 @@ func dfStrictPrefixes(name string, fn func(prefix string) bool) {
 	}
 }
 
+// dfProbeChunk bounds how many candidate names one DFConflicts round
+// materializes prefixes and query parameters for (Codex round-16 security
+// P2 on coder/code-storage#173): each name expands into up to depth-many
+// strict prefixes, so an unchunked 100k-command no-pack push inflated a
+// ~15 MB request into millions of retained prefix strings and a
+// comparably sized query array before the database saw a byte. Chunking
+// caps resident amplification at chunk×depth strings while total work
+// stays linear in the push. A var so tests can drive chunk boundaries
+// cheaply.
+var dfProbeChunk = 2048
+
+// dfConflictsChunked runs probe over names in dfProbeChunk-sized slices
+// and merges the per-chunk verdicts (candidates are independent, so
+// chunking cannot change any verdict; cross-chunk prefix dedup is the
+// only lost sharing — bounded rework, never a semantic difference).
+func dfConflictsChunked(names []string, probe func(chunk []string) (map[string]string, error)) (map[string]string, error) {
+	out := map[string]string{}
+	for start := 0; start < len(names); start += dfProbeChunk {
+		end := min(start+dfProbeChunk, len(names))
+		part, err := probe(names[start:end])
+		if err != nil {
+			return nil, err
+		}
+		for cand, witness := range part {
+			out[cand] = witness
+		}
+	}
+	return out, nil
+}
+
 // dfConflictsFromSorted computes the DFConflicts result from a sorted
 // (ascending byte order) snapshot of the repo's ref names.
 func dfConflictsFromSorted(existing, names []string) map[string]string {
@@ -60,10 +90,16 @@ func dfConflictsFromSorted(existing, names []string) map[string]string {
 // index work proportional to the candidate set, never to the repository.
 func (s *PG) DFConflicts(ctx context.Context, repo string, names []string) (map[string]string, error) {
 	assertf(repo != "", "DFConflicts: empty repo")
-	out := map[string]string{}
 	if len(names) == 0 {
-		return out, nil
+		return map[string]string{}, nil
 	}
+	return dfConflictsChunked(names, func(chunk []string) (map[string]string, error) {
+		return s.dfConflictsChunk(ctx, repo, chunk)
+	})
+}
+
+func (s *PG) dfConflictsChunk(ctx context.Context, repo string, names []string) (map[string]string, error) {
+	out := map[string]string{}
 	seen := map[string]bool{}
 	var prefixes []string
 	for _, name := range names {

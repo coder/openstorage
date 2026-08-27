@@ -13,10 +13,16 @@ import (
 // (SQLite's default BINARY collation already compares by byte order).
 func (s *SQLite) DFConflicts(ctx context.Context, repo string, names []string) (map[string]string, error) {
 	assertf(repo != "", "DFConflicts: empty repo")
-	out := map[string]string{}
 	if len(names) == 0 {
-		return out, nil
+		return map[string]string{}, nil
 	}
+	return dfConflictsChunked(names, func(chunk []string) (map[string]string, error) {
+		return s.dfConflictsChunk(ctx, repo, chunk)
+	})
+}
+
+func (s *SQLite) dfConflictsChunk(ctx context.Context, repo string, names []string) (map[string]string, error) {
+	out := map[string]string{}
 	seen := map[string]bool{}
 	var prefixes []string
 	for _, name := range names {

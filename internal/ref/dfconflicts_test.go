@@ -17,6 +17,18 @@ func TestDFConflicts_AcrossBackends(t *testing.T) {
 	runRefBackends(t, testDFConflictsVerdicts)
 }
 
+// TestDFConflicts_ChunkedProbeKeepsVerdicts (Codex round-16 security P2 on
+// #173): the PG/SQLite probes process candidates in bounded chunks so a
+// huge no-pack command list cannot amplify into millions of resident
+// prefix strings; verdicts must be identical across chunk boundaries. The
+// 7-candidate fixture spans three chunks at size 3.
+func TestDFConflicts_ChunkedProbeKeepsVerdicts(t *testing.T) {
+	prev := dfProbeChunk
+	dfProbeChunk = 3
+	t.Cleanup(func() { dfProbeChunk = prev })
+	runRefBackends(t, testDFConflictsVerdicts)
+}
+
 func testDFConflictsVerdicts(t *testing.T, s Store) {
 	prober, ok := s.(interface {
 		DFConflicts(ctx context.Context, repo string, names []string) (map[string]string, error)
