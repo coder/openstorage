@@ -465,8 +465,9 @@ detect exactly that mistake (startup refusal / fail-stop), best-effort.
 **Store requirements.** The mode depends on faithful conditional writes
 (`If-Match` / `If-None-Match: *`). A boot-time probe refuses stores that fail it.
 Qualified today: **SeaweedFS** (the tested self-hosted reference — the qualification
-lanes run against it). **AWS S3** documents the conditional-write semantics the design
-targets and is expected to work, but the lanes have not yet run against it. MinIO and
+lanes run against it in CI) and **AWS S3** (the full qualification lane passed in
+require mode against eu-central-1, 2026-08-27 — one campaign; see the
+[benchmark results](../plans/s3wal-bench-results.md)). MinIO and
 other S3-compatible stores are not qualified for `s3wal://` even where they work fine as
 plain [`CODESTORAGE_S3_URL`](../reference/configuration.md#codestorage_s3_url) blob
 storage. Do not enable bucket versioning or object lock on the bucket.
@@ -501,16 +502,27 @@ it is a deliberate single-node design:
 If any of these bind, use local mode (SQLite on a persistent volume) or the Postgres
 topology above. Small single-tenant deployments — the target — sit far below them.
 
-**Measured boundaries** — from the recorded benchmark campaign
-([full method and tables](../plans/s3wal-bench-results.md)). All numbers are
-**loopback SeaweedFS** on one host; real-S3 qualification is pending, and a real
-client adds its own network RTT to every number equally:
+**Measured boundaries** — from the recorded benchmark campaigns
+([full method and tables](../plans/s3wal-bench-results.md)): loopback SeaweedFS
+plus a real AWS S3 campaign (eu-central-1, near-same-region compute; the
+qualification suite passed all surfaces against real S3):
 
-- An uncontended small `git push` end-to-end costs ~26 ms (+23%) over local mode
-  (138 vs 112 ms p50) — the backend is a minority of the push path on both.
-- One hot repository saturates around 27 pushes/s at 32 concurrent writers, with a
-  seconds-long p99 tail (5.8 s vs local mode's 2.8 s) — the one-CAS-point-per-group
-  boundary in practice. Distinct repositories do not contend.
+- An uncontended small `git push` end-to-end costs ~26 ms (+23%) over local mode on
+  loopback (138 vs 112 ms p50). On **real S3** the same push measured ~1.1 s p50 vs
+  ~0.4 s for a Postgres+S3 node against the same bucket region — the zero-infra
+  tradeoff is ~2.8× per push at real RTT, dominated by sequential S3 round trips.
+  The real-S3 figures are **preliminary single-day observations** (the results
+  document's method wants ≥ 3 separate-day runs for headline numbers, still
+  pending) and were measured **before** the per-push round-trip trims that
+  landed later the same day; treat them as a directional upper bound, not
+  capacity guidance.
+- One hot repository group sustains ~27 successful manifest CAS advances/s on real
+  S3 regardless of writer count (the one-CAS-point-per-group ceiling; adding
+  writers adds lost races, not throughput). Under the harness's sustained synthetic
+  hammering the **CAS-success latency** tail reaches multiple seconds (p99 6.0 s at
+  N=8, 16.9 s at N=32 — microbench manifest advances, not full pushes); the
+  loopback e2e push bench measured real-push p99 of 5.8 s at N=32 vs local mode's
+  2.8 s. Distinct repositories do not contend.
 - Contention exhaustion surfaces to the client as a clean, git-native hook rejection
   naming the exhausted retry budget (`s3wal cas ref repo_…: 16 attempts: s3wal:
   conditional-write contention retries exhausted`), never a hang.

@@ -1,0 +1,71 @@
+# Operational drill evidence — s3wal on real S3, eu-central-1, 2026-08-27
+# Assembled post-hoc from the session's command outputs and the retained
+# serve logs (excerpted verbatim below). Serve binary 52ea5c02 + PR #180
+# fix; bucket codestorage-q1ab-s3wal-7715761f (deleted after the session).
+# Node env (all drills):
+#   CODESTORAGE_PG_URL='s3wal://codestorage-q1ab-s3wal-7715761f?region=eu-central-1'
+#   CODESTORAGE_S3_URL='s3://codestorage-q1ab-s3wal-7715761f?region=eu-central-1'
+#   CODESTORAGE_S3_EXPECTED_BUCKET_OWNER=805770710662 CODESTORAGE_ORG=qual
+
+## Drill 1 — dual-serve refusal (second node vs live node1's lease)
+# Command: codestorage serve --listen 127.0.0.1:8093 --cache-dir <fresh dir>
+# (node1 live on :8091). Output (verbatim):
+
+codestorage serve: s3wal instance lease _wal/instance-lease is held by another serve process (holder dc3e6a83…, renewed 24s ago, ttl 2m0s): refusing to start — running two nodes against one bucket is the dual-serve topology the zero-infra mode forbids; stop the other process or wait for its lease to expire
+
+## Drill 2 — graceful shutdown (SIGTERM to node1, pid via ss)
+# node1 exited 2 s after SIGTERM. Final lines of its serve log (verbatim):
+
+time=2026-08-27T08:20:33.367Z level=INFO msg="repack trigger: scheduled fold" repo=repo_0684059b595f packs=12 threshold=10
+time=2026-08-27T08:20:33.731Z level=INFO msg="repack: folded packs" repo=repo_0684059b595f folded=11 pack=b1f39e3e37d389feea933b9cc7dc6dcb1343db51
+time=2026-08-27T08:20:34.420Z level=INFO msg="repack: folded packs" repo=repo_0684059b595f folded=3 pack=fc0db6597eaf13239082597804e1c211bc0eff91
+codestorage serve: termination signal received; draining
+
+## Drill 3 — empty-cache restart from bucket only
+# Successor started with --cache-dir /tmp/ws8-cache-s3wal-fresh (EMPTY dir),
+# healthz OK 1 s after start (no lease TTL wait: drill 2's release freed it).
+# Fresh clone of repo 'demo' from the successor verified: HEAD sha matched
+# the last pre-restart push ('timed 20'), hello.txt content intact, and the
+# 5 MiB LFS payload sha256 (2f2632205f8b…) matched the original upload.
+# Successor serve log (verbatim, complete):
+
+time=2026-08-27T08:21:56.593Z level=WARN msg="sync egress guard transitional default: pull-upstream fetches may target loopback/private/link-local upstreams (0.6.x compatibility); a future release flips this default to deny — set the policy explicitly to keep internal-forge pulls (true) or adopt strict mode early (false)" env=CODESTORAGE_SYNC_ALLOW_PRIVATE
+listening on 127.0.0.1:8091
+time=2026-08-27T08:22:04.325Z level=INFO msg="orphan pack sweep finished" live=13 fresh=236 orphans=0 orphan_bytes=0 deleted=0 bytes_reclaimed=0 superseded_deleted=0 retained_bytes_reclaimed=0 reservations_expired=0 delete_enabled=false delete_superseded=true delete_lfs=false threshold=24h0m0s duration=7.652s
+codestorage serve: termination signal received; draining
+
+## Repack + orphan sweep (ran on node1 during the session, same bucket)
+# Excerpts from node1's serve log (verbatim):
+time=2026-08-27T08:17:40.741Z level=INFO msg="orphan pack sweep finished" live=0 fresh=0 orphans=0 orphan_bytes=0 deleted=0 bytes_reclaimed=0 superseded_deleted=0 retained_bytes_reclaimed=0 reservations_expired=0 delete_enabled=false delete_superseded=true delete_lfs=false threshold=24h0m0s duration=93ms
+time=2026-08-27T08:18:21.674Z level=INFO msg="repack: folded packs" repo=repo_440da49802d4 folded=10 pack=1a43ae444ec538042986b01ed483c980c001eff0
+time=2026-08-27T08:18:34.333Z level=INFO msg="repack: folded packs" repo=repo_440da49802d4 folded=10 pack=71ea93fac0d947e3ff2144b2c503ffde0829a289
+time=2026-08-27T08:19:37.873Z level=INFO msg="repack: folded packs" repo=repo_0684059b595f folded=10 pack=3924064dd091cab1bcc96d4b32c653e9e4dd403c
+time=2026-08-27T08:19:38.317Z level=INFO msg="repack: folded packs" repo=repo_0684059b595f folded=4 pack=9e65d8a098510cc27a78114493cbaca4fa7138dc
+time=2026-08-27T08:19:41.703Z level=INFO msg="repack: folded packs" repo=repo_0684059b595f folded=11 pack=97daf75e4818fa920d7b62a788beaba2e7244cb6
+time=2026-08-27T08:19:43.511Z level=INFO msg="repack: folded packs" repo=repo_0684059b595f folded=4 pack=947810dc455c4a7aeb310af1947f2968fe402eea
+time=2026-08-27T08:19:46.273Z level=INFO msg="repack: folded packs" repo=repo_0684059b595f folded=10 pack=9e2479d01208716d9eefff57c0b0aeeebb501f1a
+time=2026-08-27T08:19:46.710Z level=INFO msg="repack: folded packs" repo=repo_0684059b595f folded=3 pack=bede9fb00e9da54fdae11f4c0af9980ad799066b
+time=2026-08-27T08:19:50.149Z level=INFO msg="repack: folded packs" repo=repo_0684059b595f folded=11 pack=0f33e63a3cfe7f1334c19ee7efd5cae949b3c017
+time=2026-08-27T08:19:50.702Z level=INFO msg="repack: folded packs" repo=repo_0684059b595f folded=4 pack=3c369b4c3b18938b4908b4c5737e095d7e2ded26
+time=2026-08-27T08:19:54.791Z level=INFO msg="repack: folded packs" repo=repo_0684059b595f folded=12 pack=dc0c98ee1efcf9a9b411c22ff51a6a53979d0d0d
+time=2026-08-27T08:19:55.411Z level=INFO msg="repack: folded packs" repo=repo_0684059b595f folded=5 pack=8a631f359fa6e472786324911a72569d47e24ed5
+time=2026-08-27T08:19:58.919Z level=INFO msg="repack: folded packs" repo=repo_0684059b595f folded=12 pack=cc9c6f2570dc98e678b3442076f98019162bcdbf
+time=2026-08-27T08:19:59.389Z level=INFO msg="repack: folded packs" repo=repo_0684059b595f folded=3 pack=378b8e2f703962d987ed2943fe395069bc82a042
+time=2026-08-27T08:20:02.671Z level=INFO msg="repack: folded packs" repo=repo_0684059b595f folded=11 pack=049bbab46e4874f37372d8d0cce87c039fb531c7
+time=2026-08-27T08:20:03.248Z level=INFO msg="repack: folded packs" repo=repo_0684059b595f folded=3 pack=ba75a3517dd1535fb810f6cbc020c6a596cdf3a3
+time=2026-08-27T08:20:06.216Z level=INFO msg="repack: folded packs" repo=repo_0684059b595f folded=11 pack=38a0f952be7f0afe859440c75bd998bdfd043d88
+time=2026-08-27T08:20:06.613Z level=INFO msg="repack: folded packs" repo=repo_0684059b595f folded=3 pack=95fb3b8e7e36fc5f2e5493310decf427c72cd9ca
+time=2026-08-27T08:20:10.221Z level=INFO msg="repack: folded packs" repo=repo_0684059b595f folded=11 pack=c6e878033beb6ae88564bf97b80efd498a9b43f4
+time=2026-08-27T08:20:10.833Z level=INFO msg="repack: folded packs" repo=repo_0684059b595f folded=3 pack=324694add7e589218d1c50696b6c9a957d5e5833
+time=2026-08-27T08:20:13.902Z level=INFO msg="repack: folded packs" repo=repo_0684059b595f folded=10 pack=0f4eaaa4c5755c369fd43b830e53e17ce5a33cd2
+time=2026-08-27T08:20:14.403Z level=INFO msg="repack: folded packs" repo=repo_0684059b595f folded=3 pack=5cd00c503c929b91d64c8348dffba3c194c16136
+time=2026-08-27T08:20:18.058Z level=INFO msg="repack: folded packs" repo=repo_0684059b595f folded=11 pack=2bb5f4768b47aa2d4fce3abe4c8be24b0c905007
+time=2026-08-27T08:20:18.635Z level=INFO msg="repack: folded packs" repo=repo_0684059b595f folded=3 pack=6b2ca2a48127327c53d2a2c81697ddc6a21c0f5c
+time=2026-08-27T08:20:21.513Z level=INFO msg="repack: folded packs" repo=repo_0684059b595f folded=11 pack=efafdc54079ef9dc5ef48a6e349394f99a57085e
+time=2026-08-27T08:20:22.160Z level=INFO msg="repack: folded packs" repo=repo_0684059b595f folded=4 pack=f1b83f3897e3a987995ea91b5340878eb3364695
+time=2026-08-27T08:20:25.670Z level=INFO msg="repack: folded packs" repo=repo_0684059b595f folded=10 pack=45ed23c697403a31016666fb32e2ba0aa5340eb9
+time=2026-08-27T08:20:26.463Z level=INFO msg="repack: folded packs" repo=repo_0684059b595f folded=4 pack=eef2a59d90c2c687d8a5f21b041c11214f1910bf
+time=2026-08-27T08:20:29.653Z level=INFO msg="repack: folded packs" repo=repo_0684059b595f folded=11 pack=9b7af3c8447344619a9c62d7c2ae001a73bf94fe
+time=2026-08-27T08:20:30.252Z level=INFO msg="repack: folded packs" repo=repo_0684059b595f folded=4 pack=2f518688014ba089e852ba0c4e63e1f6d6fc3260
+time=2026-08-27T08:20:33.731Z level=INFO msg="repack: folded packs" repo=repo_0684059b595f folded=11 pack=b1f39e3e37d389feea933b9cc7dc6dcb1343db51
+time=2026-08-27T08:20:34.420Z level=INFO msg="repack: folded packs" repo=repo_0684059b595f folded=3 pack=fc0db6597eaf13239082597804e1c211bc0eff91
