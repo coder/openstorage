@@ -1195,7 +1195,10 @@ func Hydrate(ctx context.Context, st ref.RefStore, bl blob.BlobStore, cacheDir, 
 	// the whole base manifest — one WAN round trip per call on real S3.
 	// The freshness discipline is unchanged: both marker checks read
 	// live state, and the marker publishes exactly the state the sync
-	// consumed.
+	// consumed. The PRE-lock marker check stays on GetGeneration for
+	// every backend: it is the cache-hit hot path, needs only the
+	// generation, and materializing a snapshot there would sort and copy
+	// the full ref/pack sets per request without saving a round trip.
 	snapper, _ := st.(ref.HydrateSnapshotter)
 	readState := func() (int64, *ref.HydrateSnapshot, error) {
 		if snapper == nil {
@@ -1208,7 +1211,7 @@ func Hydrate(ctx context.Context, st ref.RefStore, bl blob.BlobStore, cacheDir, 
 		}
 		return snap.Generation, &snap, nil
 	}
-	gen, _, err := readState()
+	gen, err := st.GetGeneration(ctx, repo)
 	if err != nil {
 		return "", nil, err
 	}

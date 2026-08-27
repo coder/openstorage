@@ -2,6 +2,7 @@ package ref
 
 import (
 	"context"
+	"fmt"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -124,6 +125,61 @@ func TestS3WALMutateSeededVerdictRederivesFresh(t *testing.T) {
 	}
 	if sha, err := a.GetRef(ctx, repo, "refs/heads/main"); err != nil || sha != seedSHA3 {
 		t.Fatalf("GetRef = (%q, %v), want %s", sha, err, seedSHA3)
+	}
+}
+
+// TestS3WALManifestSnapBounds pins the seed cache's memory bounds (Codex
+// review on PR #185): entries, total retained bytes, and the per-entry
+// body cap — an outsized body must not only be skipped but also evict the
+// base's stale entry.
+func TestS3WALManifestSnapBounds(t *testing.T) {
+	_, a, _ := newSeedStores(t)
+	hasSnap := func(base string) bool {
+		a.snapMu.Lock()
+		defer a.snapMu.Unlock()
+		_, ok := a.snaps[base]
+		return ok
+	}
+
+	// Per-entry cap: an over-cap body drops the base's existing entry.
+	a.storeSnap("big", []byte("small"), "e1")
+	if !hasSnap("big") {
+		t.Fatal("small entry not cached")
+	}
+	a.storeSnap("big", make([]byte, maxManifestSnapBody+1), "e2")
+	if hasSnap("big") {
+		t.Fatal("over-cap body cached, want dropped (including the stale entry)")
+	}
+
+	// Byte budget: storing more at-cap bodies than the byte budget holds
+	// must evict down to the budget, never empty the cache.
+	body := make([]byte, maxManifestSnapBody)
+	const stored = maxManifestSnapBytes/maxManifestSnapBody + 4
+	for i := range stored {
+		a.storeSnap(fmt.Sprintf("base%d", i), body, "e")
+	}
+	a.snapMu.Lock()
+	entries, bytes := len(a.snaps), a.snapBytes
+	a.snapMu.Unlock()
+	if bytes > maxManifestSnapBytes {
+		t.Fatalf("retained %d bytes, budget %d", bytes, maxManifestSnapBytes)
+	}
+	if entries >= stored {
+		t.Fatalf("retained all %d entries, want byte-budget eviction", entries)
+	}
+	if entries == 0 {
+		t.Fatal("eviction emptied the cache entirely")
+	}
+
+	// Entry cap with tiny bodies.
+	for i := range maxManifestSnaps + 16 {
+		a.storeSnap(fmt.Sprintf("tiny%d", i), []byte("x"), "e")
+	}
+	a.snapMu.Lock()
+	entries = len(a.snaps)
+	a.snapMu.Unlock()
+	if entries > maxManifestSnaps {
+		t.Fatalf("retained %d entries, cap %d", entries, maxManifestSnaps)
 	}
 }
 

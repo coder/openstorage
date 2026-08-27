@@ -53,11 +53,11 @@ func parseOpLog(t *testing.T, raw string) []opLogLine {
 func opLogWindow(t *testing.T, path string, offset *int64) []opLogLine {
 	t.Helper()
 	// Hook subprocesses have exited by the time `git push` returns (git
-	// waits for them). The serve-side repack probe is asynchronous
-	// (issue #182) — a single loopback GET dispatched before the
-	// response completes — so the settle need only cover its scheduling
-	// plus OS buffering.
-	time.Sleep(750 * time.Millisecond)
+	// waits for them) and the census node disables the async repack
+	// probe (see the startNodeT env), so every op of a push has been
+	// logged by the time the push command exits; a short settle covers
+	// OS buffering only.
+	time.Sleep(200 * time.Millisecond)
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("read op log: %v", err)
@@ -87,8 +87,13 @@ func censusTable(lines []opLogLine) string {
 func TestS3WAL_PushOpCensus(t *testing.T) {
 	skipUnlessS3WAL(t)
 
+	// The repack threshold probe is disabled for determinism: it runs
+	// asynchronously since issue #182 (dispatchRepackProbe), so its
+	// single manifest GET could land in either push's log window and
+	// make exact budgets flaky. Its cost is documented in the issue #182
+	// census; the budgets here guard the synchronous push path.
 	opLog := filepath.Join(t.TempDir(), "s3ops.log")
-	node := startNodeT(t, "CODESTORAGE_S3_OP_LOG="+opLog)
+	node := startNodeT(t, "CODESTORAGE_S3_OP_LOG="+opLog, "CODESTORAGE_REPACK_THRESHOLD=0")
 
 	repo := registerRepo(t, "t-s3wal-op-census")
 	work := initWorkRepo(t)
@@ -124,12 +129,12 @@ func TestS3WAL_PushOpCensus(t *testing.T) {
 	// Regression guard (issue #182): the per-shape budgets. Raising a
 	// bound requires justifying the new round trip against the census in
 	// that issue — on real S3 each one is user-visible push latency.
-	const steadyBudget = 19
+	const steadyBudget = 18
 	if len(steady) > steadyBudget {
 		t.Errorf("steady-state push cost %d S3 round trips, budget is %d:\n%s",
 			len(steady), steadyBudget, censusTable(steady))
 	}
-	const deleteBudget = 10
+	const deleteBudget = 9
 	if len(deleteOnly) > deleteBudget {
 		t.Errorf("delete-only push cost %d S3 round trips, budget is %d:\n%s",
 			len(deleteOnly), deleteBudget, censusTable(deleteOnly))

@@ -122,8 +122,9 @@ type S3WAL struct {
 	// stale entry costs one 412 into the existing fresh-read retry;
 	// reads NEVER serve from it (no reader can observe staler state
 	// than a fresh GET — the dual-serve safety line).
-	snapMu sync.Mutex
-	snaps  map[string]manifestSnap
+	snapMu    sync.Mutex
+	snaps     map[string]manifestSnap
+	snapBytes int // total retained body bytes across snaps
 
 	// reapEpochMu mirrors PG's FOR SHARE pin on the destructive-sweep
 	// epoch row (Codex round 33 on PR #132): retirements hold the read
@@ -298,11 +299,17 @@ type manifestSnap struct {
 	etag string
 }
 
-// maxManifestSnaps bounds the seed cache: bodies are up to the manifest
-// hard cap, so unlike the int64 seq watermark the map cannot grow with
-// every base this process ever touched. Eviction is arbitrary — it is a
-// cache of optimism, and a miss just re-reads like before issue #182.
-const maxManifestSnaps = 128
+// Seed-cache bounds (Codex review on PR #185): entry count alone would
+// still retain up to 128 bodies of hard-cap size (~2 GiB), so the cache is
+// bounded three ways — per-entry (an outsized manifest is not worth
+// pinning; the soft-warn threshold already flags such bases), total
+// retained bytes, and entry count. Eviction is arbitrary — it is a cache
+// of optimism, and a miss just re-reads like before issue #182.
+const (
+	maxManifestSnaps     = 128
+	maxManifestSnapBody  = 4 << 20
+	maxManifestSnapBytes = 64 << 20
+)
 
 // storeSnap records base's freshest (body, etag) pair. Caller must hold
 // the base lock (both call sites do), so per-base entries never interleave
@@ -310,15 +317,28 @@ const maxManifestSnaps = 128
 func (s *S3WAL) storeSnap(base string, body []byte, etag string) {
 	assertf(etag != "", "storeSnap %s: empty etag", base)
 	assertf(len(body) > 0, "storeSnap %s: empty body", base)
+	if len(body) > maxManifestSnapBody {
+		// Do not pin outsized manifests; also drop any smaller stale
+		// entry so a later seed cannot resurrect it.
+		s.dropSnap(base)
+		return
+	}
 	s.snapMu.Lock()
 	defer s.snapMu.Unlock()
-	if _, ok := s.snaps[base]; !ok && len(s.snaps) >= maxManifestSnaps {
-		for k := range s.snaps {
-			delete(s.snaps, k)
+	if old, ok := s.snaps[base]; ok {
+		s.snapBytes -= len(old.body)
+		delete(s.snaps, base)
+	}
+	for k, v := range s.snaps {
+		if len(s.snaps) < maxManifestSnaps && s.snapBytes+len(body) <= maxManifestSnapBytes {
 			break
 		}
+		s.snapBytes -= len(v.body)
+		delete(s.snaps, k)
 	}
 	s.snaps[base] = manifestSnap{body: body, etag: etag}
+	s.snapBytes += len(body)
+	assertf(s.snapBytes >= 0, "storeSnap %s: negative retained bytes %d", base, s.snapBytes)
 }
 
 // dropSnap forgets base's seed (missing object, or a seeded verdict that
@@ -326,7 +346,10 @@ func (s *S3WAL) storeSnap(base string, body []byte, etag string) {
 func (s *S3WAL) dropSnap(base string) {
 	s.snapMu.Lock()
 	defer s.snapMu.Unlock()
-	delete(s.snaps, base)
+	if old, ok := s.snaps[base]; ok {
+		s.snapBytes -= len(old.body)
+		delete(s.snaps, base)
+	}
 }
 
 // seedManifest decodes base's cached snapshot for use as a mutate loop's
@@ -448,16 +471,24 @@ func (s *S3WAL) mutate(ctx context.Context, base string, mu s3walMutation) error
 	// unmarked. Entering iteration N+1 implies attempt N provably did not
 	// land (412, never-sent, or a rerun verdict), so pre-PUT failures are
 	// not-executed on every iteration, not just the first.
-	for attempt := 0; attempt < s.casAttempts; attempt++ {
-		var (
-			m      *s3wal.Manifest
-			etag   string
-			seeded bool
-		)
-		if attempt == 0 {
-			m, etag, seeded = s.seedManifest(base)
-		}
-		if !seeded {
+	// The seeded try is a BONUS attempt, not a budget consumer (Codex
+	// review on PR #185): rejecting a stale seed must neither cost one of
+	// the casAttempts live tries nor shift the contention jitter
+	// schedule, so the loop budget grows by one and the jitter index is
+	// rebased onto fresh attempts below. The base lock is held, so the
+	// pre-loop peek cannot race this mutation's own snap updates.
+	seedM, seedTag, haveSeed := s.seedManifest(base)
+	seedOffset := 0
+	if haveSeed {
+		seedOffset = 1
+	}
+	for attempt := 0; attempt < s.casAttempts+seedOffset; attempt++ {
+		seeded := haveSeed && attempt == 0
+		var m *s3wal.Manifest
+		var etag string
+		if seeded {
+			m, etag = seedM, seedTag
+		} else {
 			var err error
 			m, etag, err = s.readManifest(ctx, base)
 			if err != nil {
@@ -485,6 +516,10 @@ func (s *S3WAL) mutate(ctx context.Context, base string, mu s3walMutation) error
 			return fmt.Errorf("s3wal %s %s: %w", mu.op, base, notExecuted(err))
 		}
 		if err := s.checkManifestSize(base, mu, len(body)); err != nil {
+			if seeded {
+				s.dropSnap(base) // unvalidated refusal: re-derive fresh
+				continue
+			}
 			return notExecuted(err) // size refusal: never sent
 		}
 		ourNonce, ourSeq := m.Writer, m.Seq
@@ -508,9 +543,10 @@ func (s *S3WAL) mutate(ctx context.Context, base string, mu s3walMutation) error
 			// Re-read and re-evaluate on the fresh snapshot. A seeded
 			// loss skips the backoff: it evidences seed staleness, not
 			// live contention — the fresh-read retry is the first real
-			// attempt.
+			// attempt, so the jitter index is rebased onto fresh
+			// attempts (attempt-seedOffset).
 			if !seeded {
-				if err := s.sleepJitter(ctx, attempt); err != nil {
+				if err := s.sleepJitter(ctx, attempt-seedOffset); err != nil {
 					return fmt.Errorf("s3wal %s %s: %w", mu.op, base, notExecuted(err))
 				}
 			}

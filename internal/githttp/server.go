@@ -76,6 +76,13 @@ type Server struct {
 	// (a pack-count read plus at most one job enqueue) and must never
 	// block on the fold itself. Nil disables triggering.
 	MaybeRepack func(ctx context.Context, repo string)
+
+	// repackProbeMu coalesces the asynchronous post-push repack probes
+	// per repo (see dispatchRepackProbe): repackProbeActive marks the
+	// single in-flight probe, repackProbeAgain its one trailing re-run.
+	repackProbeMu     sync.Mutex
+	repackProbeActive map[string]bool
+	repackProbeAgain  map[string]bool
 	// PackQuotaBytes is the per-repo pack-bytes quota (issue #21, see
 	// quota.go); <= 0 disables quota enforcement. Set by the serve wiring
 	// from the resolved config, like ResolveRepo.
@@ -1110,7 +1117,7 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 				// padding): the repack threshold trigger must still fire
 				// even though the response is a 413 (Codex round 4).
 				if s.MaybeRepack != nil {
-					go s.MaybeRepack(context.WithoutCancel(r.Context()), target.key)
+					s.dispatchRepackProbe(context.WithoutCancel(r.Context()), target.key)
 				}
 			}
 			if gate.responseStarted() {
@@ -1146,6 +1153,44 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 		// trade already — failures are logged, never propagated, and the
 		// pack count only grows until a fold lands, so the next push
 		// retries.
-		go s.MaybeRepack(context.WithoutCancel(r.Context()), target.key)
+		s.dispatchRepackProbe(context.WithoutCancel(r.Context()), target.key)
 	}
+}
+
+// dispatchRepackProbe runs s.MaybeRepack asynchronously, coalesced per
+// repo (Codex review on #182's PR): a push burst must not stack
+// probe-timeout-bounded goroutines all listing the same repo's packs.
+// At most one probe runs per repo; pushes completing mid-probe mark ONE
+// trailing re-run — skipping them outright could leave a threshold
+// crossing unprobed until the next push, while the trailing run re-reads
+// state that includes every registration the marker coalesced.
+func (s *Server) dispatchRepackProbe(ctx context.Context, repo string) {
+	assertf(s.MaybeRepack != nil, "dispatchRepackProbe: nil MaybeRepack")
+	assertf(repo != "", "dispatchRepackProbe: empty repo")
+	s.repackProbeMu.Lock()
+	if s.repackProbeActive == nil {
+		s.repackProbeActive = make(map[string]bool)
+		s.repackProbeAgain = make(map[string]bool)
+	}
+	if s.repackProbeActive[repo] {
+		s.repackProbeAgain[repo] = true
+		s.repackProbeMu.Unlock()
+		return
+	}
+	s.repackProbeActive[repo] = true
+	s.repackProbeMu.Unlock()
+	go func() {
+		for {
+			s.MaybeRepack(ctx, repo)
+			s.repackProbeMu.Lock()
+			if s.repackProbeAgain[repo] {
+				delete(s.repackProbeAgain, repo)
+				s.repackProbeMu.Unlock()
+				continue
+			}
+			delete(s.repackProbeActive, repo)
+			s.repackProbeMu.Unlock()
+			return
+		}
+	}()
 }
