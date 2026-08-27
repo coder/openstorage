@@ -28,6 +28,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	mrand "math/rand/v2"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -868,6 +869,34 @@ type contentionResult struct {
 	elapsed        time.Duration // window start → last worker completion (throughput denominator)
 }
 
+// §2.3 lost-race backoff for the contention runner: full-jitter
+// exponential, 25 ms base → 2 s cap — the policy plan §3 cell 3 measures
+// under ("under the §2.3 backoff policy"), mirroring the production mutate
+// loop (s3walstore.go sleepJitter). Constants, not knobs: the bench must
+// always measure the specified policy (issue #181).
+const (
+	contentionBackoffBase = 25 * time.Millisecond
+	contentionBackoffCap  = 2 * time.Second
+	// contentionPushAttempts mirrors production casAttempts (§2.3: ≤ 16
+	// attempts, then the push fails with ErrCASContention). The runner
+	// models the exhaustion/retry boundary by restarting the backoff
+	// schedule at that point — a retrying client's NEXT push begins a
+	// fresh mutate loop at the 25 ms base, it does not inherit the failed
+	// push's capped streak (PR #184 review round 3).
+	contentionPushAttempts = 16
+)
+
+// contentionBackoffCeiling returns the full-jitter ceiling for the
+// attempt'th retry within one push: min(cap, base·2^attempt). The shift is
+// clamped once the cap is reached so the ceiling stays total and
+// overflow-free for any attempt index (defensive: callers reset the index
+// at the §2.3 exhaustion boundary, but the schedule must not depend on it).
+func contentionBackoffCeiling(attempt int) time.Duration {
+	assertf(attempt >= 0, "contentionBackoffCeiling: attempt %d", attempt)
+	const capShift = 7 // 25ms<<7 = 3.2s already exceeds the 2s cap
+	return min(contentionBackoffCap, contentionBackoffBase<<uint(min(attempt, capShift)))
+}
+
 // runContentionWindow races `writers` goroutines advancing ONE object for a
 // wall-clock window under the §2.3 backoff, then runs the lost-update
 // detector: every winning transition seq must have exactly one recorded
@@ -875,6 +904,18 @@ type contentionResult struct {
 // contiguous, and the final nonce must belong to the last recorded winner.
 // A window containing any ambiguous outcome (possible on real S3) is
 // INCONCLUSIVE and fails the run — see verifyTransitions.
+//
+// Loop fidelity (issue #181): every contender re-reads the object before
+// EVERY advance — production pushers run read-mutate-CAS with no local
+// copy to chain from — and a lost race sleeps full-jitter
+// rand(0, min(2s, 25ms·2^attempt)) before its re-read, where attempt
+// counts the retries within the current push, resets on a win, and
+// restarts at the §2.3 16-attempt exhaustion boundary (the retrying
+// client's next push begins a fresh schedule). Re-reads happen at the top
+// of the loop, gated by the window: work that cannot lead to another CAS
+// is never started, so off-window recovery cannot inflate elapsed or the
+// starve metric. The starve metric therefore measures real §2.3 pusher
+// wait, not winner-pinning at PUT wire speed.
 //
 // The measured window is preceded by an UNTIMED warmup on a separate
 // scratch key (warmupContention): connection setup, pool fill, and
@@ -932,19 +973,88 @@ func runContentionWindow(tb testing.TB, cas *s3wal.Client, key string, writers i
 				res.maxStarve = max(res.maxStarve, maxStarve)
 				mu.Unlock()
 			}()
+			// Reads are bounded by the measurement deadline: a stalled
+			// endpoint must not let an in-flight GET run minutes past
+			// the window (the outer safety ctx allows window + 2 min)
+			// and inflate elapsed and the deferred starve reading.
+			// Advances deliberately keep the OUTER ctx: cancelling an
+			// in-flight conditional PUT would manufacture an ambiguous
+			// outcome and make the window inconclusive
+			// (verifyTransitions) — a CAS that began inside the window
+			// must be allowed to resolve (PR #184 review round 5).
+			readCtx, readCancel := context.WithDeadline(ctx, deadline)
+			defer readCancel()
 			reRead := func() (s3wal.Object, bool) {
-				obj, err := wcas.Get(ctx, key)
+				obj, err := wcas.Get(readCtx, key)
 				if err != nil {
+					if readCtx.Err() != nil && ctx.Err() == nil {
+						// The measurement deadline cut off the read:
+						// clean exit, not a failure — reads are
+						// side-effect free, so nothing is left ambiguous.
+						return s3wal.Object{}, false
+					}
 					tb.Errorf("contention: re-read %s: %v", key, err)
 					return s3wal.Object{}, false
 				}
 				return obj, true
 			}
-			obj, ok := reRead()
-			if !ok {
-				return
+			// attempt counts the retries within the current push (any
+			// cause, like the production mutate loop's iteration index)
+			// and resets on a win; only lost races sleep on it. At the
+			// §2.3 exhaustion boundary (16 attempts) the schedule
+			// restarts: production mutate returns ErrCASContention there
+			// and the client's NEXT push begins a fresh loop at the 25 ms
+			// base — it does not inherit the failed push's capped streak
+			// (PR #184 review round 3).
+			attempt := 0
+			nextAttempt := func() {
+				attempt++
+				if attempt >= contentionPushAttempts {
+					// Production mutate exhausts its budget here and
+					// fails the push with ErrCASContention: count it so
+					// the contention-errors metric reflects deployed
+					// behavior, then restart the schedule for the
+					// client's next push (PR #184 review round 5).
+					contentions++
+					attempt = 0
+				}
 			}
+			// backoff sleeps the §2.3 full-jitter delay for the current
+			// attempt, truncated to the measurement deadline: sleeping
+			// past the window would only delay the loop-top exit check
+			// and inflate elapsed and the deferred starve reading (PR
+			// #184 review). False only on the ctx anomaly.
+			backoff := func() bool {
+				if d := min(mrand.N(contentionBackoffCeiling(attempt)), time.Until(deadline)); d > 0 {
+					timer := time.NewTimer(d)
+					defer timer.Stop()
+					select {
+					case <-ctx.Done():
+						tb.Errorf("contention: backoff on %s: %v", key, ctx.Err())
+						return false
+					case <-timer.C:
+					}
+				}
+				return true
+			}
+			// The read half of every read-mutate-CAS attempt sits at the
+			// top of the loop, behind the window check: once the window
+			// is over, no re-read (winner's next push, lost-race
+			// recovery, or ambiguity resolution alike) is ever started,
+			// so a slow endpoint cannot append off-window work to elapsed
+			// or maxStarve (PR #184 review round 3).
 			for time.Now().Before(deadline) {
+				obj, ok := reRead()
+				if !ok {
+					return
+				}
+				// The window may have ended while the read was in
+				// flight: never START a CAS past the deadline — its
+				// resolution is allowed to land late (see above), but
+				// only for attempts that began inside the window.
+				if !time.Now().Before(deadline) {
+					return
+				}
 				p, decOK := decodePayload(obj.Body)
 				if !decOK {
 					tb.Errorf("contention: undecodable payload on %s", key)
@@ -952,7 +1062,10 @@ func runContentionWindow(tb testing.TB, cas *s3wal.Client, key string, writers i
 				}
 				nonce := newNonce(tb)
 				next := encodePayloadNonce(tb, p.Seq+1, nonce, payloadSize)
-				newETag, err := wcas.Advance(ctx, key, next, obj.ETag)
+				// The returned ETag is deliberately discarded: chaining
+				// advances from it is an optimization no production
+				// pusher has (issue #181).
+				_, err := wcas.Advance(ctx, key, next, obj.ETag)
 				switch {
 				case err == nil:
 					now := time.Now()
@@ -963,19 +1076,23 @@ func runContentionWindow(tb testing.TB, cas *s3wal.Client, key string, writers i
 					localTrans = append(localTrans, seqTransition{to: p.Seq + 1, nonce: nonce})
 					maxStarve = max(maxStarve, now.Sub(lastSuccess))
 					lastSuccess = now
-					// The winner knows the new state: keep advancing from
-					// the local copy without a re-read.
-					obj = s3wal.Object{Body: next, ETag: newETag}
+					attempt = 0
 				case errors.Is(err, s3wal.ErrLostRace):
 					lostRaces++
-					if obj, ok = reRead(); !ok {
+					// §2.3: full-jitter backoff before the re-read +
+					// re-evaluate, exactly like the production mutate loop.
+					if !backoff() {
 						return
 					}
+					nextAttempt()
 				case errors.Is(err, s3wal.ErrCASContention):
+					// 409 exhaustion — the client already backed off
+					// through its full internal budget, and production
+					// mutate returns immediately here (the push fails),
+					// so the client's NEXT push starts a fresh schedule
+					// (PR #184 review round 4).
 					contentions++
-					if obj, ok = reRead(); !ok {
-						return
-					}
+					attempt = 0
 				default:
 					var amb *s3wal.AmbiguousError
 					if !errors.As(err, &amb) {
@@ -983,9 +1100,7 @@ func runContentionWindow(tb testing.TB, cas *s3wal.Client, key string, writers i
 						return
 					}
 					ambiguous++
-					if obj, ok = reRead(); !ok {
-						return
-					}
+					nextAttempt()
 				}
 			}
 		}()
@@ -1120,6 +1235,204 @@ func TestContentionLostUpdateDetectorSeaweedFS(t *testing.T) {
 	}
 	t.Logf("detector: wins=%d lostRaces=%d contention=%d ambiguous=%d maxStarve=%v",
 		res.wins, res.lostRaces, res.contentionErrs, res.ambiguous, res.maxStarve)
+}
+
+// ---------------------------------------------------------------------------
+// §2.3 runner-fidelity checks (issue #181): the contention runner must
+// follow the production read-mutate-CAS shape it claims to measure.
+
+// recordingStore is an HONEST in-memory path-style S3 for bucket "stub" —
+// GET serves the stored body and ETag, PUT enforces If-None-Match:* /
+// If-Match with versioned ETags — that records every object request in
+// order. Unlike fakeStore (defect injection for probe refusal), its only
+// twist is deterministic lost races: with rejectAlternate set, every ODD
+// If-Match PUT on rejectKey is 412-rejected, so a single writer exercises
+// the lost-race path on every other advance while the window still records
+// real wins (verifyTransitions needs the final nonce to name a winner).
+type recordingStore struct {
+	mu              sync.Mutex
+	objs            map[string]recordedObject
+	next            int
+	events          []storeEvent
+	rejectKey       string
+	rejectAlternate bool
+	advancePUTs     int // If-Match PUTs seen on rejectKey (alternation counter)
+}
+
+type recordedObject struct {
+	body []byte
+	etag string
+}
+
+type storeEvent struct {
+	method  string
+	key     string
+	ifMatch bool // PUT carried If-Match — a CAS advance attempt
+	status  int
+}
+
+func (s *recordingStore) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeS3Error(w, http.StatusBadRequest, "IncompleteBody")
+		return
+	}
+	key := strings.TrimPrefix(r.URL.Path, "/stub/")
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.objs == nil {
+		s.objs = map[string]recordedObject{}
+	}
+	record := func(ifMatch bool, status int) {
+		s.events = append(s.events, storeEvent{method: r.Method, key: key, ifMatch: ifMatch, status: status})
+	}
+	switch r.Method {
+	case http.MethodPut:
+		im := r.Header.Get("If-Match")
+		cur, exists := s.objs[key]
+		if r.Header.Get("If-None-Match") == "*" && exists {
+			record(false, http.StatusPreconditionFailed)
+			writeS3Error(w, http.StatusPreconditionFailed, "PreconditionFailed")
+			return
+		}
+		if im != "" {
+			if s.rejectAlternate && key == s.rejectKey {
+				s.advancePUTs++
+				if s.advancePUTs%2 == 1 {
+					record(true, http.StatusPreconditionFailed)
+					writeS3Error(w, http.StatusPreconditionFailed, "PreconditionFailed")
+					return
+				}
+			}
+			if !exists || im != cur.etag {
+				record(true, http.StatusPreconditionFailed)
+				writeS3Error(w, http.StatusPreconditionFailed, "PreconditionFailed")
+				return
+			}
+		}
+		s.next++
+		obj := recordedObject{body: body, etag: fmt.Sprintf("%q", fmt.Sprintf("v%d", s.next))}
+		s.objs[key] = obj
+		record(im != "", http.StatusOK)
+		w.Header().Set("ETag", obj.etag)
+		w.WriteHeader(http.StatusOK)
+	case http.MethodGet:
+		obj, exists := s.objs[key]
+		if !exists {
+			record(false, http.StatusNotFound)
+			writeS3Error(w, http.StatusNotFound, "NoSuchKey")
+			return
+		}
+		record(false, http.StatusOK)
+		w.Header().Set("ETag", obj.etag)
+		_, _ = w.Write(obj.body)
+	case http.MethodDelete:
+		delete(s.objs, key)
+		record(false, http.StatusNoContent)
+		w.WriteHeader(http.StatusNoContent)
+	default:
+		writeS3Error(w, http.StatusNotImplemented, "NotImplemented")
+	}
+}
+
+// snapshot returns a copy of the ordered request log (workers are joined
+// before tests read it; the copy keeps -race honest anyway).
+func (s *recordingStore) snapshot() []storeEvent {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]storeEvent(nil), s.events...)
+}
+
+// TestContentionRunnerCASDiscipline pins — deterministically, without
+// Docker — that runContentionWindow measures the §2.3 loop shape it claims
+// (issue #181): every contender re-reads the object before every advance
+// (production pushers never chain from a local copy), and a lost race
+// backs off full-jitter before its re-read instead of spinning at wire
+// speed.
+func TestContentionRunnerCASDiscipline(t *testing.T) {
+	const key = "_wal/repo/discipline"
+	newStubEnv := func(t *testing.T, store *recordingStore) *s3wal.Client {
+		t.Helper()
+		srv := httptest.NewServer(store)
+		t.Cleanup(srv.Close)
+		return stubClient(t, srv.URL)
+	}
+
+	t.Run("re-read-before-every-advance", func(t *testing.T) {
+		store := &recordingStore{}
+		c := newStubEnv(t, store)
+		res := runContentionWindow(t, c, key, 1, 150*time.Millisecond, 64)
+		if res.wins < 2 {
+			t.Fatalf("wins = %d, want >= 2 (local-copy chaining is only visible across consecutive wins)", res.wins)
+		}
+		// Every successful advance of the measured key must be preceded
+		// by a GET issued after the previous win: a winner chaining from
+		// its local copy emits back-to-back OK If-Match PUTs instead.
+		gets, wins := 0, 0
+		for _, ev := range store.snapshot() {
+			if ev.key != key || ev.status != http.StatusOK {
+				continue
+			}
+			switch {
+			case ev.method == http.MethodGet:
+				gets++
+			case ev.method == http.MethodPut && ev.ifMatch:
+				if gets == 0 {
+					t.Fatalf("advance #%d succeeded without a re-read since the previous win — the runner is chaining from its local copy", wins+1)
+				}
+				wins++
+				gets = 0
+			}
+		}
+		if wins != res.wins {
+			t.Fatalf("request log saw %d winning advances, runner recorded %d", wins, res.wins)
+		}
+	})
+
+	t.Run("lost-races-back-off", func(t *testing.T) {
+		store := &recordingStore{rejectKey: key, rejectAlternate: true}
+		c := newStubEnv(t, store)
+		const window = 300 * time.Millisecond
+		res := runContentionWindow(t, c, key, 1, window, 64)
+		if res.lostRaces < 2 {
+			t.Fatalf("lost races = %d, want >= 2 (the stub rejects every other advance)", res.lostRaces)
+		}
+		// Every lost race must sleep full-jitter with a 25 ms first-retry
+		// ceiling (~12.5 ms expected — the attempt counter resets on the
+		// win that follows each alternated rejection), so a 300 ms window
+		// fits ~24 rejected attempts (~48 total) in expectation. The
+		// bound leaves ~2.5x headroom for lucky jitter draws; the
+		// backoff-free tight loop lands in the thousands on loopback and
+		// cannot pass.
+		attempts := 0
+		for _, ev := range store.snapshot() {
+			if ev.key == key && ev.method == http.MethodPut && ev.ifMatch {
+				attempts++
+			}
+		}
+		if attempts > 120 {
+			t.Fatalf("%d advance attempts in a %v window — the lost-race path is not backing off per §2.3 (full jitter, 25 ms -> 2 s)", attempts, window)
+		}
+	})
+
+	t.Run("backoff-ceiling-schedule", func(t *testing.T) {
+		// §2.3: full-jitter exponential, 25 ms base doubling to a 2 s cap.
+		want := []time.Duration{
+			25 * time.Millisecond, 50 * time.Millisecond, 100 * time.Millisecond,
+			200 * time.Millisecond, 400 * time.Millisecond, 800 * time.Millisecond,
+			1600 * time.Millisecond, 2 * time.Second, 2 * time.Second,
+		}
+		for attempt, w := range want {
+			if got := contentionBackoffCeiling(attempt); got != w {
+				t.Errorf("ceiling(%d) = %v, want %v", attempt, got, w)
+			}
+		}
+		// The clamp keeps the shift in range for arbitrarily long losing
+		// streaks (the runner never abandons a push).
+		if got := contentionBackoffCeiling(400); got != 2*time.Second {
+			t.Errorf("ceiling(400) = %v, want the 2s cap", got)
+		}
+	})
 }
 
 // TestStoreDateWitnessSeaweedFS qualifies the §2.4-3 Date-capture
