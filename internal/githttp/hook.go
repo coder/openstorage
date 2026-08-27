@@ -209,7 +209,7 @@ func preReceive(ctx context.Context) error {
 				return atomicDenied(verdicts[i])
 			}
 			if !pushRefUpdatable(c.ref) {
-				return atomicDenied(fmt.Errorf("ref name %s is not updatable here (namespace root, malformed segment, or deeper than %d segments)", c.ref, maxPushRefDepth))
+				return atomicDenied(fmt.Errorf("ref name %s is not updatable here (namespace root, git-invalid name, or deeper than %d segments)", c.ref, maxPushRefDepth))
 			}
 		}
 		// The push's OWN command set must be representable in one git ref
@@ -270,9 +270,10 @@ func preReceive(ctx context.Context) error {
 		// its update hook's probe denies it — so reserving it would only
 		// squat on those children's namespace for the push window.
 		// Creations only: updates and deletions cannot introduce a D/F
-		// pair. Probed in ONE batch per push (authorityDoomedCreations —
-		// Codex round-8 security P2: per-creation point probes fetch the
-		// full manifest each on s3wal). Fail closed on store trouble.
+		// pair. Probed in ONE push-proportional batch per push
+		// (authorityDoomedCreations — Codex round-8/9 security P2s: the
+		// probe work must scale with the push, never with the repo, and
+		// shared reads must be paid once). Fail closed on store trouble.
 		// A legitimate delete-then-create D/F swap in ONE push still
 		// works: the creation lands in the sidecar and self-reserves at
 		// hook time, after the deletion's CAS.
@@ -302,12 +303,45 @@ func preReceive(ctx context.Context) error {
 				}
 			}
 		}
+		// Creations whose strict D/F relative is ANOTHER command of this
+		// same push are not bulk-reserved either (Codex round-9 P1): a
+		// non-atomic push creating both refs/heads/a and refs/heads/a/b
+		// passes the authority probe above (neither name exists yet), and
+		// bulk-reserving both would let both hooks skip the commit-time
+		// probe — both CASes commit before git's local per-ref update
+		// rejects one, leaving the authority unrepresentable. Diverted to
+		// the sidecar, each such creation re-probes the authority AT
+		// COMMIT TIME, sequenced by git after every earlier sibling's CAS,
+		// so exactly the losing relative is declined per-ref (and the
+		// delete-then-create swap still lands, deletion first). Checked
+		// against ALL command names, not just eligible ones: a command
+		// policy-denied here can still be allowed by its own hook's later
+		// evaluation (the round-5 divergence) and commit from the sidecar.
+		// Atomic pushes cannot reach this with a conflict — their
+		// non-delete/delete D/F pairs were denied whole above.
+		allNames := make([]string, 0, len(commands))
+		for _, c := range commands {
+			allNames = append(allNames, c.ref)
+		}
+		cmdSet := newPushHoldSet(allNames)
 		for _, c := range eligible {
-			if _, ok := doomed[c.ref]; ok {
+			if _, ok := doomed[c.ref]; ok ||
+				(c.old == ref.ZeroSHA && c.new != ref.ZeroSHA && cmdSet.conflicts(c.ref)) {
 				unreserved = append(unreserved, c.ref)
 				continue
 			}
 			names = append(names, c.ref)
+		}
+		// The sidecar is bounded (Codex round-9 P2): unreserved membership
+		// is attacker-chosen — a crafted push can carry hundreds of
+		// thousands of tiny undeliverable commands under the byte cap, and
+		// each marker below costs one inode on the shared cache volume
+		// (plus crash-recovery sweep work). Real pushes carry at most a
+		// handful of denied or undeliverable commands, so a generous cap
+		// denies only crafted traffic; bulk mirror pushes are unaffected —
+		// their reservable refs share the single hold file.
+		if len(unreserved) > maxPushUnreserved {
+			return fmt.Errorf("pre-receive: push carries %d commands that cannot be bulk-reserved (policy-denied, undeliverable, or D/F-conflicted names); the limit is %d — drop those commands or split the push", len(unreserved), maxPushUnreserved)
 		}
 		if err := reservePushHolds(ctx, holdPath, names); err != nil {
 			return fmt.Errorf("pre-receive: reserve push holds: %w", err)
@@ -660,19 +694,40 @@ func preReceive(ctx context.Context) error {
 // per tiny push command). Deny-with-message keeps the bound explicit.
 const maxPushRefDepth = 32
 
+// maxPushUnreserved caps how many of one push's commands may land in the
+// unreserved sidecar (one marker inode each — see preReceive). Membership
+// is attacker-chosen: policy-denied, unupdatable, or D/F-conflicted names
+// cost the client nothing but bound server-side inode and sweep work, so
+// the cap fails crafted pushes closed while staying far above any real
+// push's denied-command count. Bulk-RESERVABLE refs (mirror pushes) are
+// not counted — they share the single hold file.
+const maxPushUnreserved = 1024
+
 // pushRefUpdatable reports whether receive-pack could ever commit name on
 // this server: a properly namespaced ref (refs/<ns>/<name>...) of bounded
-// depth with sane path segments. Namespace ROOTS (e.g. the literal
-// refs/heads) matter for security (Codex round-5 security P2): git hands
-// them to pre-receive but can never complete their local update in a cache
-// repo (the namespace directory always exists), so reserving one would let
-// a restricted token hold a D/F ancestor of EVERY ref in that namespace
-// for the push window. Used to filter reservations and, fail-closed, to
-// deny such names in the update hook — where the depth cap also bounds the
-// authority D/F probe's per-ref work.
+// depth that git itself considers well-formed. Namespace ROOTS (e.g. the
+// literal refs/heads) matter for security (Codex round-5 security P2): git
+// hands them to pre-receive but can never complete their local update in a
+// cache repo (the namespace directory always exists), so reserving one
+// would let a restricted token hold a D/F ancestor of EVERY ref in that
+// namespace for the push window. Used to filter reservations and,
+// fail-closed, to deny such names in the update hook — where the depth cap
+// also bounds the authority D/F probe's per-ref work.
+//
+// The format rules mirror git's check_refname_format EXACTLY (Codex
+// round-9 P1): the atomic whole-push gate leans on this predicate being at
+// least as strict as receive-pack's own funny-refname check, which runs
+// per-command AFTER earlier commands' update hooks — and their authority
+// CASes — already committed. A name this predicate accepts but git later
+// rejects aborts the local atomic transaction with the authority moved.
+// (Stricter-than-git would instead deny representable pushes, so parity is
+// verified against `git check-ref-format` in the unit tests.)
 func pushRefUpdatable(name string) bool {
 	rest, ok := strings.CutPrefix(name, "refs/")
 	if !ok || !strings.Contains(rest, "/") {
+		return false
+	}
+	if strings.HasSuffix(name, ".") { // git: a refname cannot end with a dot
 		return false
 	}
 	segs := strings.Split(name, "/")
@@ -680,9 +735,37 @@ func pushRefUpdatable(name string) bool {
 		return false
 	}
 	for _, seg := range segs {
-		if seg == "" || seg == "." || seg == ".." || strings.HasSuffix(seg, ".lock") {
+		if !gitRefSegmentValid(seg) {
 			return false
 		}
+	}
+	return true
+}
+
+// gitRefSegmentValid mirrors git's check_refname_component (refs.c) for one
+// slash-separated segment: no empty segments (this also rejects leading,
+// trailing, and doubled slashes), no segment starting with "." or ending
+// with ".lock", no ".." or "@{" sequences, and none of git's forbidden
+// bytes — ASCII controls, DEL, space, "~^:?*[\". A trailing "." is legal
+// for a NON-final segment ("refs/heads/foo./bar" is git-valid); the final
+// segment's trailing dot is the whole-name rule checked by the caller.
+func gitRefSegmentValid(seg string) bool {
+	if seg == "" || seg[0] == '.' || strings.HasSuffix(seg, ".lock") {
+		return false
+	}
+	var last byte
+	for i := 0; i < len(seg); i++ {
+		c := seg[i]
+		switch {
+		case c < 0x20 || c == 0x7f || c == ' ' || c == '~' || c == '^' ||
+			c == ':' || c == '?' || c == '*' || c == '[' || c == '\\':
+			return false
+		case c == '.' && last == '.':
+			return false
+		case c == '{' && last == '@':
+			return false
+		}
+		last = c
 	}
 	return true
 }
@@ -827,7 +910,7 @@ func updateHook(ctx context.Context, args []string) error {
 	// per created ref — ref depth is attacker-chosen amplification against
 	// the shared store otherwise (Codex round-5 security P2 on #173).
 	if !pushRefUpdatable(refName) {
-		return fmt.Errorf("update: ref name %s is not updatable here (namespace root, malformed segment, or deeper than %d segments)", refName, maxPushRefDepth)
+		return fmt.Errorf("update: ref name %s is not updatable here (namespace root, git-invalid name, or deeper than %d segments)", refName, maxPushRefDepth)
 	}
 	repo := mustEnv(EnvRepo)
 
@@ -988,56 +1071,94 @@ func pauseAtUpdateBarrier(p string) {
 }
 
 // authorityDoomedCreations reports which of the created names are doomed
-// by a strict D/F relative existing in the authority. Small sets use the
-// per-name point probes; larger sets switch to ONE bounded paged scan of
-// the repo's refs merge-checked against the sorted creation set (Codex
-// round-8 security P2 on #173: per-creation probes on s3wal fetch the full
-// manifest each, so a thousand no-pack creations must not cost thousands
-// of manifest reads — the scan costs O(repo refs / page) round-trips per
-// PUSH instead). Store errors fail the whole probe; callers fail closed.
+// by a strict D/F relative existing in the authority. Probe cost is
+// proportional to the PUSH, never to the repository (Codex round-9
+// security P2 on #173: the previous full-repo paged scan let five tiny
+// creations page through EVERY authority ref — and on s3wal every page is
+// a manifest round-trip — while round-8's per-creation point probes paid
+// per-name manifest reads with no sharing):
+//
+//   - ancestors: one GetRef point-read per UNIQUE strict prefix across the
+//     whole creation set — bulk creates share their namespace prefixes;
+//   - descendants: a seek-merge of single-row ListRefsAfter probes over
+//     the creations in DECORATED (name+"/") order. Each probe seeks
+//     straight to one creation's descendant key range, and the key it
+//     returns proves a whole span of the keyspace empty, letting every
+//     later creation whose range sits inside that span skip its probe.
+//
+// Decorated order is load-bearing (compare s3walEachBaseCoverOrder): bytes
+// like '.' sort below '/', so RAW-sorted creations ("refs/heads/a" before
+// "refs/heads/a.b") have NON-monotonic range starts, and a skip window
+// carried across them would silently skip a real conflict.
+//
+// Store errors fail the whole probe; callers fail closed.
 func authorityDoomedCreations(ctx context.Context, st ref.RefStore, repo string, names []string) (map[string]error, error) {
 	doomed := map[string]error{}
-	// Crossover: a point probe costs ~depth+1 reads for ONE name; the scan
-	// costs one page read per syncRefsBatch refs in the repo. Tiny pushes
-	// on huge repos keep the point probes.
-	if len(names) <= 4 {
-		for _, name := range names {
-			if err := denyAuthorityDFConflict(ctx, st, repo, name); err != nil {
-				doomed[name] = err
-			}
-		}
-		return doomed, nil
-	}
-	set := newPushHoldSet(append([]string(nil), names...))
 	deny := func(created, existing string) {
 		if _, dup := doomed[created]; !dup {
 			doomed[created] = fmt.Errorf("%s conflicts with existing ref %s (directory/file); delete %s first", created, existing, existing)
 		}
 	}
-	after := ""
-	for {
-		page, err := st.ListRefsAfter(ctx, repo, after, syncRefsBatch)
-		if err != nil {
-			return nil, err
-		}
-		for _, e := range page {
-			// The authority ref is a strict ancestor of created names.
-			prefix := e.Name + "/"
-			for i := sort.SearchStrings(set.names, prefix); i < len(set.names) && strings.HasPrefix(set.names[i], prefix); i++ {
-				deny(set.names[i], e.Name)
+	// Ancestor arm, memoized across the set.
+	ancestor := map[string]bool{} // strict prefix -> exists in authority
+	for _, name := range names {
+		for i := 0; i < len(name); i++ {
+			if name[i] != '/' {
+				continue
 			}
-			// The authority ref is a strict descendant of a created name.
-			for j := 0; j < len(e.Name); j++ {
-				if e.Name[j] == '/' && set.contains(e.Name[:j]) {
-					deny(e.Name[:j], e.Name)
+			anc := name[:i]
+			exists, probed := ancestor[anc]
+			if !probed {
+				switch _, err := st.GetRef(ctx, repo, anc); {
+				case err == nil:
+					exists = true
+				case errors.Is(err, ref.ErrNotFound):
+					exists = false
+				default:
+					return nil, fmt.Errorf("directory/file probe for %s: %w", name, err)
 				}
+				ancestor[anc] = exists
+			}
+			if exists {
+				deny(name, anc)
+				break
 			}
 		}
-		if len(page) < syncRefsBatch {
-			return doomed, nil
-		}
-		after = page[len(page)-1].Name
 	}
+	// Descendant arm: at most one single-row probe per creation, walked in
+	// decorated order so lo only moves forward.
+	sorted := append([]string(nil), names...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i]+"/" < sorted[j]+"/" })
+	lastKey := "" // when haveProbe: the authority's first key at or after the last probed lo
+	haveProbe := false
+	for _, n := range sorted {
+		lo := n + "/"
+		if haveProbe {
+			if strings.HasPrefix(lastKey, lo) {
+				deny(n, lastKey) // the witness key itself is a descendant
+				continue
+			}
+			// Any descendant of n lives in [n+"/", n+"0") ('/'+1 == '0'),
+			// and the last probe proved [prev lo, lastKey) empty; lo only
+			// grows in decorated order, so lastKey beyond the range means
+			// no descendants without a fresh probe.
+			if lastKey >= n+"0" {
+				continue
+			}
+		}
+		page, err := st.ListRefsAfter(ctx, repo, lo, 1)
+		if err != nil {
+			return nil, fmt.Errorf("directory/file probe for %s: %w", n, err)
+		}
+		if len(page) == 0 {
+			break // nothing at or after lo; later creations sit even higher
+		}
+		lastKey, haveProbe = page[0].Name, true
+		if strings.HasPrefix(lastKey, lo) {
+			deny(n, lastKey)
+		}
+	}
+	return doomed, nil
 }
 
 // denyAuthorityDFConflict declines a non-deletion update of name when the

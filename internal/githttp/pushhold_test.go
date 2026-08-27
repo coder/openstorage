@@ -7,7 +7,9 @@ package githttp
 
 import (
 	"context"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -349,10 +351,14 @@ func TestReservePushHolds_LockAcquisitionBounded(t *testing.T) {
 func TestPushRefUpdatable(t *testing.T) {
 	deep := "refs/heads" + strings.Repeat("/x", maxPushRefDepth)
 	ok := "refs/heads" + strings.Repeat("/x", maxPushRefDepth-2)
-	for name, want := range map[string]bool{
+	cases := map[string]bool{
 		"refs/heads/main":        true,
 		"refs/tags/v1.0.0":       true,
 		"refs/heads/feat/deep/x": true,
+		"refs/heads/@":           true, // git bans "@" only as the WHOLE name
+		"refs/heads/foo@bar":     true,
+		"refs/heads/foo{bar":     true, // "{" is only banned after "@"
+		"refs/heads/foo./bar":    true, // only the FINAL trailing dot is banned
 		ok:                       true,
 		"refs/heads":             false, // namespace root
 		"refs":                   false,
@@ -361,10 +367,47 @@ func TestPushRefUpdatable(t *testing.T) {
 		"refs//x":                false,
 		"refs/heads/..":          false,
 		"refs/heads/x.lock":      false,
+		"refs/heads/x.lock/y":    false, // .lock bans every segment
 		deep:                     false, // depth cap
-	} {
+		// git check_refname_format parity (Codex round-9 P1): every name
+		// git's own funny-refname check rejects must be rejected here too,
+		// or an atomic push carrying it aborts only AFTER earlier hooks'
+		// authority CASes committed.
+		"refs/heads/foo.":    false, // trailing dot
+		"refs/heads/a..b":    false, // double dot
+		"refs/heads/.foo":    false, // segment starts with a dot
+		"refs/heads/f@{oo":   false, // "@{"
+		"refs/heads/fo o":    false, // space
+		"refs/heads/fo~o":    false,
+		"refs/heads/fo^o":    false,
+		"refs/heads/fo:o":    false,
+		"refs/heads/fo?o":    false,
+		"refs/heads/fo*o":    false,
+		"refs/heads/fo[o":    false,
+		"refs/heads/fo\\o":   false,
+		"refs/heads/fo\x01o": false, // control byte
+		"refs/heads/fo\x7fo": false, // DEL
+	}
+	for name, want := range cases {
 		if got := pushRefUpdatable(name); got != want {
 			t.Errorf("pushRefUpdatable(%q) = %v, want %v", name, got, want)
+		}
+	}
+	// Oracle for the load-bearing direction: every name this predicate
+	// ACCEPTS must be acceptable to git itself, or the atomic whole-push
+	// gate lets a doomed command reach the hooks. (The reverse is server
+	// policy: namespace roots and the depth cap are deliberately stricter
+	// than git.)
+	git, err := exec.LookPath("git")
+	if err != nil {
+		t.Skip("git not installed")
+	}
+	for name, want := range cases {
+		if !want {
+			continue
+		}
+		if out, err := exec.Command(git, "check-ref-format", name).CombinedOutput(); err != nil {
+			t.Errorf("pushRefUpdatable(%q) = true but git check-ref-format rejects it: %v %s", name, err, out)
 		}
 	}
 }
@@ -398,15 +441,51 @@ func TestPushHoldReaders_SkipUnreservedSidecar(t *testing.T) {
 	}
 }
 
-// TestAuthorityDoomedCreations_BatchScan drives the >4-name paged-scan
-// path: creations whose strict D/F relative exists in the authority are
-// doomed (both directions), unrelated and exact-name matches are not.
-func TestAuthorityDoomedCreations_BatchScan(t *testing.T) {
-	st := &countingStore{gen: 1, refs: map[string]string{
+// probeCountStore lets authorityDoomedCreations tests count exactly the
+// reads the probe performs: GetRef point-reads (countingStore's panics —
+// it guards Hydrate) and the ROWS ListRefsAfter returns, the number that
+// exposes a repo-sized scan hiding behind few calls.
+type probeCountStore struct {
+	*countingStore
+	getRefCalls int
+	listRows    int
+}
+
+func (s *probeCountStore) GetRef(_ context.Context, _ string, name string) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.getRefCalls++
+	if sha, ok := s.refs[name]; ok {
+		return sha, nil
+	}
+	return "", ref.ErrNotFound
+}
+
+func (s *probeCountStore) ListRefsAfter(ctx context.Context, repo, after string, limit int) ([]ref.RefEntry, error) {
+	page, err := s.countingStore.ListRefsAfter(ctx, repo, after, limit)
+	s.mu.Lock()
+	s.listRows += len(page)
+	s.mu.Unlock()
+	return page, err
+}
+
+// TestAuthorityDoomedCreations_PushProportionalProbes: creations whose
+// strict D/F relative exists in the authority are doomed (both
+// directions), unrelated and exact-name matches are not — and the probe
+// work must scale with the PUSH, never the repository (Codex round-9
+// security P2: the previous full-repo paged scan let five tiny creations
+// read every authority ref).
+func TestAuthorityDoomedCreations_PushProportionalProbes(t *testing.T) {
+	refs := map[string]string{
 		"refs/heads/a":     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 		"refs/heads/x/y":   "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 		"refs/heads/plain": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-	}}
+	}
+	// Repo-sized ballast the probe must never read.
+	for i := 0; i < 2000; i++ {
+		refs[fmt.Sprintf("refs/zbulk/b%04d", i)] = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	}
+	st := &probeCountStore{countingStore: &countingStore{gen: 1, refs: refs}}
 	creations := []string{
 		"refs/heads/a/b",   // doomed: strict ancestor a exists
 		"refs/heads/x",     // doomed: strict descendant x/y exists
@@ -426,6 +505,42 @@ func TestAuthorityDoomedCreations_BatchScan(t *testing.T) {
 	}
 	if len(doomed) != 2 {
 		t.Fatalf("doomed = %v, want exactly the two D/F conflicts", doomed)
+	}
+	// Proportionality: unique strict prefixes across the set are refs,
+	// refs/heads, refs/heads/a — three point reads; the seek-merge may
+	// list at most one single-row page per creation.
+	if st.getRefCalls != 3 {
+		t.Errorf("getRefCalls = %d, want 3 (deduped unique prefixes)", st.getRefCalls)
+	}
+	_, listCalls, _ := st.counts()
+	if listCalls > len(creations) {
+		t.Errorf("listRefsCalls = %d, want <= %d (one seek per creation)", listCalls, len(creations))
+	}
+	if st.listRows > len(creations) {
+		t.Errorf("listRows = %d, want <= %d — the probe read repo-sized pages", st.listRows, len(creations))
+	}
+}
+
+// TestAuthorityDoomedCreations_DecoratedOrderSeek: '.' (0x2E) sorts below
+// '/' (0x2F), so RAW-sorted creations ("refs/heads/a" before
+// "refs/heads/a.b") have NON-monotonic descendant-range starts
+// ("refs/heads/a.b/" < "refs/heads/a/"). A seek-merge walking raw order
+// would carry its skip window backwards over refs/heads/a.b and silently
+// miss its existing descendant. Both creations must be doomed.
+func TestAuthorityDoomedCreations_DecoratedOrderSeek(t *testing.T) {
+	st := &probeCountStore{countingStore: &countingStore{gen: 1, refs: map[string]string{
+		"refs/heads/a.b/c": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		"refs/heads/a/z":   "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+	}}}
+	doomed, err := authorityDoomedCreations(context.Background(), st, "r",
+		[]string{"refs/heads/a", "refs/heads/a.b"})
+	if err != nil {
+		t.Fatalf("authorityDoomedCreations: %v", err)
+	}
+	for _, want := range []string{"refs/heads/a", "refs/heads/a.b"} {
+		if _, ok := doomed[want]; !ok {
+			t.Errorf("%s not reported doomed: %v", want, doomed)
+		}
 	}
 }
 

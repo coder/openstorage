@@ -10,6 +10,9 @@ package githttp
 // with the EnvUpdateBarrier hook seam.
 
 import (
+	"crypto/sha1"
+	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -279,4 +282,121 @@ func TestPush_DeniedDeletionSurvivorBlocksDFChild(t *testing.T) {
 		t.Fatalf("authority accepted a/b although its denied-survivor parent remains: %v", refs)
 	}
 	mustGit(t, "", "ls-remote", remoteURL(nodeA, repo, full))
+}
+
+// TestPush_SiblingDFCreationsExactlyOneLands (Codex round-9 P1): a
+// non-atomic push creating BOTH refs/heads/n/a and refs/heads/n/a/b passes
+// the pre-receive authority probe (neither name exists yet); if both were
+// bulk-reserved, both hooks would skip the commit-time probe and both
+// authority CASes would commit before git's local per-ref update rejects
+// one — an unrepresentable authority. Exactly one may land: whichever
+// command git processes first commits, and the sibling's own hook declines
+// it against the authority at commit time.
+func TestPush_SiblingDFCreationsExactlyOneLands(t *testing.T) {
+	repo := registerRepo(t, "t-df-sibling-creations")
+	work := initWorkRepo(t)
+	token := mintTestToken(t, repo, "git:read,git:write", "")
+	mustGit(t, work, "push", remoteURL(nodeA, repo, token), "HEAD:refs/heads/main")
+	head := revParse(t, work, "HEAD")
+
+	out, err := tryGit(work, "push", remoteURL(nodeA, repo, token),
+		"HEAD:refs/heads/n/a", "HEAD:refs/heads/n/a/b")
+	if err == nil {
+		t.Fatalf("a push creating a D/F sibling pair must reject one side:\n%s", out)
+	}
+	t.Logf("sibling D/F creation push (exactly one must land):\n%s", out)
+	refs := pgRefs(t, repo)
+	_, hasA := refs["refs/heads/n/a"]
+	_, hasB := refs["refs/heads/n/a/b"]
+	if hasA && hasB {
+		t.Fatalf("authority accepted an unrepresentable D/F pair: %v", refs)
+	}
+	if !hasA && !hasB {
+		t.Fatalf("no sibling landed at all: %v\n%s", refs, out)
+	}
+	winner := "refs/heads/n/a"
+	if hasB {
+		winner = "refs/heads/n/a/b"
+	}
+	if refs[winner] != head {
+		t.Fatalf("winner %s = %q, want %q", winner, refs[winner], head)
+	}
+	// The repo still serves — the authority stayed representable.
+	mustGit(t, "", "ls-remote", remoteURL(nodeA, repo, token))
+}
+
+// emptyPack is a syntactically complete packfile with zero objects — what
+// a client effectively sends when every pushed ref points at objects the
+// server already has.
+func emptyPack() []byte {
+	hdr := []byte{'P', 'A', 'C', 'K', 0, 0, 0, 2, 0, 0, 0, 0}
+	sum := sha1.Sum(hdr)
+	return append(hdr, sum[:]...)
+}
+
+// TestAtomicPush_GitInvalidNameDeniedWhole (Codex round-9 P1): git's own
+// funny-refname check runs per-command INSIDE the atomic transaction —
+// AFTER earlier commands' update hooks, and therefore their authority
+// CASes, already ran. The pre-receive gate must be at least as strict as
+// git: a git-invalid name like "refs/heads/bad." must deny the WHOLE push
+// before any hook runs, or the client is told the push failed while the
+// authority moved. Crafted over raw pkt-lines — a git client refuses to
+// send such a destination itself.
+func TestAtomicPush_GitInvalidNameDeniedWhole(t *testing.T) {
+	repo := registerRepo(t, "t-atomic-funny-format")
+	work := initWorkRepo(t)
+	token := mintTestToken(t, repo, "git:read,git:write", "")
+	mustGit(t, work, "push", remoteURL(nodeA, repo, token), "HEAD:refs/heads/main")
+	head := revParse(t, work, "HEAD")
+
+	zero := strings.Repeat("0", 40)
+	body := pktLine(zero+" "+head+" refs/heads/ok\x00report-status side-band-64k atomic") +
+		pktLine(zero+" "+head+" refs/heads/bad.") +
+		"0000" + string(emptyPack())
+	status, resp := postReceivePack(t, nodeA, repo, token, strings.NewReader(body), false)
+	if status != http.StatusOK {
+		t.Fatalf("status = %d\n%s", status, resp)
+	}
+	t.Logf("atomic push with git-invalid name (expected whole-push denial):\n%s", resp)
+	refs := pgRefs(t, repo)
+	if _, ok := refs["refs/heads/ok"]; ok {
+		t.Fatalf("authority moved refs/heads/ok under a whole-push failure report: %v", refs)
+	}
+	if _, ok := refs["refs/heads/bad."]; ok {
+		t.Fatalf("authority accepted a git-invalid ref name: %v", refs)
+	}
+	if !strings.Contains(resp, "pre-receive hook declined") {
+		t.Fatalf("denial did not come from the pre-receive whole-push gate:\n%s", resp)
+	}
+}
+
+// TestPush_UnreservedSidecarBounded (Codex round-9 P2): every command
+// pre-receive cannot bulk-reserve becomes one marker inode in the sidecar,
+// and unreserved membership is attacker-chosen — a tiny crafted push can
+// carry hundreds of thousands of undeliverable commands under the byte
+// cap. Above maxPushUnreserved the push must be denied whole, before any
+// marker is created. Delete-only (no pack needed), raw pkt-lines: two-level
+// names like refs/x000001 are git-valid but never updatable here.
+func TestPush_UnreservedSidecarBounded(t *testing.T) {
+	repo := registerRepo(t, "t-sidecar-bounded")
+	token := mintTestToken(t, repo, "git:read,git:write", "")
+
+	fake := strings.Repeat("1", 40)
+	zero := strings.Repeat("0", 40)
+	var body strings.Builder
+	for i := 0; i <= maxPushUnreserved; i++ {
+		cmd := fmt.Sprintf("%s %s refs/x%06d", fake, zero, i)
+		if i == 0 {
+			cmd += "\x00report-status side-band-64k"
+		}
+		body.WriteString(pktLine(cmd))
+	}
+	body.WriteString("0000")
+	status, resp := postReceivePack(t, nodeA, repo, token, strings.NewReader(body.String()), false)
+	if status != http.StatusOK {
+		t.Fatalf("status = %d\n%s", status, resp)
+	}
+	if !strings.Contains(resp, "cannot be bulk-reserved") {
+		t.Fatalf("oversized unreserved sidecar was not denied whole:\n%s", resp)
+	}
 }
