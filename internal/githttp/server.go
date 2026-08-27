@@ -987,7 +987,10 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 			httpError(w, http.StatusInternalServerError, "push setup failed")
 			return
 		}
-		defer func() { _ = os.Remove(holdPath) }()
+		defer func() {
+			_ = os.Remove(holdPath)
+			_ = os.Remove(holdPath + pushHoldUnreservedSuffix)
+		}()
 		cmd.Env = append(cmd.Env, EnvPushHold+"="+holdPath)
 	}
 	cmd.Stderr = os.Stderr

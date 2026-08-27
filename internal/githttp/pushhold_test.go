@@ -373,6 +373,32 @@ func TestPushRefUpdatable(t *testing.T) {
 	}
 }
 
+// TestPushHoldReaders_SkipUnreservedSidecar: the sidecar lists a push's
+// NOT-reserved names — treating them as held would hand policy-denied refs
+// the very namespace hold the reservation filter exists to refuse.
+func TestPushHoldReaders_SkipUnreservedSidecar(t *testing.T) {
+	dir := t.TempDir()
+	holdPath := mintHold(t, dir, "refs/heads/held")
+	if err := os.WriteFile(holdPath+pushHoldUnreservedSuffix, []byte("refs/heads/denied\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	holds := loadPushHolds(dir)
+	if !holds.covers("refs/heads/held") {
+		t.Fatal("real hold not loaded")
+	}
+	if holds.covers("refs/heads/denied") {
+		t.Fatal("sidecar name treated as held")
+	}
+	// Reservation conflict checks must skip it too.
+	own, err := mintPushHold(dir)
+	if err != nil {
+		t.Fatalf("mintPushHold: %v", err)
+	}
+	if err := reservePushHolds(context.Background(), own, []string{"refs/heads/denied/x"}); err != nil {
+		t.Fatalf("sidecar name blocked a reservation: %v", err)
+	}
+}
+
 // TestHydrate_SkippedHeldRefSuppressesMarker: a full sync that skipped a
 // held ref must not advance the generation marker — otherwise a fresh
 // marker could vouch for a generation whose held ref the cache never

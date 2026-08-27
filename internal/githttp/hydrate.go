@@ -1132,6 +1132,12 @@ func updateRefStdin(repoPath, commands string) error {
 const (
 	pushHoldDir = "codestorage.push-holds"
 	pushHoldTTL = 5 * time.Minute
+	// pushHoldUnreservedSuffix marks a push's sidecar listing the commands
+	// pre-receive did NOT bulk-reserve (unupdatable names, policy-denied
+	// refs). Hold READERS must skip it — its names are exactly the ones
+	// that must not be treated as held — while update hooks consult it to
+	// self-reserve the rare pre-receive-denied-yet-hook-allowed ref.
+	pushHoldUnreservedSuffix = ".unreserved"
 )
 
 // mintPushHold returns the absolute path a receive-pack request's update
@@ -1275,6 +1281,10 @@ func readPushHolds(dir, exceptPath string) (pushHoldSet, error) {
 	var names []string
 	var firstErr error
 	for _, e := range entries {
+		// Sidecars list a push's UNRESERVED names — never holds.
+		if strings.HasSuffix(e.Name(), pushHoldUnreservedSuffix) {
+			continue
+		}
 		path := filepath.Join(dir, e.Name())
 		if exceptPath != "" && path == exceptPath {
 			continue

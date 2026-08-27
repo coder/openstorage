@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -176,25 +177,39 @@ func preReceive(ctx context.Context) error {
 	}
 	atomicPush := os.Getenv(EnvAtomic) == "1"
 
-	// ONE policy evaluation per command for all of pre-receive (Codex
-	// round-4 P2 on #173): enforceRefPolicy charges the push's shared
-	// verify-sig state and walk budget per evaluation, so the reservation
-	// filter, the atomic gate, and the publication gate below must share
-	// verdicts instead of re-evaluating. The update hook stays the per-ref
-	// policy authority and re-evaluates at commit time, exactly as before
-	// (the documented "verified twice" redundancy).
-	verdicts := make([]error, len(commands))
-	for i, c := range commands {
-		verdicts[i] = enforceRefPolicy(ctx, repo, c.ref, c.old, c.new)
+	// Full-policy verdicts are evaluated AT MOST once per push, and only
+	// on the paths that always paid them (the atomic whole-push gate and
+	// the pack publication gate): the no-pack non-atomic path historically
+	// ran zero pre-receive evaluations, and evaluating there would
+	// double-charge the shared verify-sig walk budget the update hooks
+	// bill again (Codex rounds 4+6 P2 on #173). The reservation filter
+	// below uses the budget-free evaluator instead.
+	var verdicts []error
+	evalVerdicts := func() {
+		if verdicts != nil {
+			return
+		}
+		verdicts = make([]error, len(commands))
+		for i, c := range commands {
+			verdicts[i] = enforceRefPolicy(ctx, repo, c.ref, c.old, c.new)
+		}
 	}
 	// Atomic pushes fail whole on any denial (issue #28 semantics), and
 	// doing so BEFORE the hold reservation means a restricted token's
 	// denied command can never hold a namespace it cannot write — atomic
-	// or not (Codex round-4 security P2 on #173).
+	// or not (Codex round-4 security P2 on #173). Unupdatable NAMES are
+	// whole-push denials too (Codex round-6 P1): git runs earlier update
+	// hooks — whose authority CASes commit — before rejecting the funny
+	// name and aborting the local atomic transaction, so letting one
+	// through recreates the authority-accepted/client-rejected wedge.
 	if atomicPush {
-		for _, v := range verdicts {
-			if v != nil {
-				return atomicDenied(v)
+		evalVerdicts()
+		for i, c := range commands {
+			if verdicts[i] != nil {
+				return atomicDenied(verdicts[i])
+			}
+			if !pushRefUpdatable(c.ref) {
+				return atomicDenied(fmt.Errorf("ref name %s is not updatable here (namespace root, malformed segment, or deeper than %d segments)", c.ref, maxPushRefDepth))
 			}
 		}
 	}
@@ -224,20 +239,36 @@ func preReceive(ctx context.Context) error {
 	// chains its own refresher for its runtime.
 	if holdPath := os.Getenv(EnvPushHold); holdPath != "" {
 		names := make([]string, 0, len(commands))
-		for i, c := range commands {
+		var unreserved []string
+		for _, c := range commands {
 			// Reserve only names this server could ever commit (Codex
 			// round-5 security P2): git hands namespace roots like the
 			// literal refs/heads to pre-receive yet can never complete
 			// their local update, and reserving one would hold a D/F
 			// ancestor of the whole namespace. The update hook denies
 			// such names fail-closed, so skipping them here loses no
-			// protection.
-			if verdicts[i] == nil && pushRefUpdatable(c.ref) {
-				names = append(names, c.ref)
+			// protection. The policy filter is the budget-free evaluator
+			// (atomic pushes reach here all-allowed, but the cheap
+			// re-check is harmlessly identical).
+			if !pushRefUpdatable(c.ref) || reservationRefPolicyDenied(repo, c.ref, c.old, c.new) {
+				unreserved = append(unreserved, c.ref)
+				continue
 			}
+			names = append(names, c.ref)
 		}
 		if err := reservePushHolds(ctx, holdPath, names); err != nil {
 			return fmt.Errorf("pre-receive: reserve push holds: %w", err)
+		}
+		// The (typically empty) remainder goes into the sidecar the
+		// update hooks consult O(1)-when-absent, so a pre-receive-denied
+		// yet hook-allowed ref still self-reserves before its CAS while
+		// every ordinary hook skips peer scans entirely (Codex round-6
+		// P2 on #173). Suffix-excluded from hold readers; the server
+		// removes it with the hold file, the TTL sweep covers leaks.
+		if len(unreserved) > 0 {
+			if err := os.WriteFile(holdPath+pushHoldUnreservedSuffix, []byte(strings.Join(unreserved, "\n")+"\n"), 0o600); err != nil {
+				return fmt.Errorf("pre-receive: record unreserved refs: %w", err)
+			}
 		}
 		defer startPushHoldRefresh(holdPath)()
 	}
@@ -277,6 +308,7 @@ func preReceive(ctx context.Context) error {
 	// the pack could only become a registered, unreachable,
 	// quota-consuming blob, so the whole push is refused before any
 	// upload. The update hook stays the per-ref policy authority.
+	evalVerdicts()
 	if err := preReceivePolicyGate(commands, verdicts, atomicPush); err != nil {
 		return err
 	}
@@ -783,13 +815,29 @@ func updateHook(ctx context.Context, args []string) error {
 	// above and would otherwise commit unheld, reopening the hydrate
 	// race). Placed strictly AFTER this hook's own policy check so a
 	// genuinely denied ref still cannot hold anything (the round-3
-	// namespace-squatting property). Duplicate lines from the pre-receive
-	// bulk reservation are harmless; the cost is one flock + peer-file
-	// read per ref, bounded by CONCURRENT pushes, not by this push's
-	// fanout.
+	// namespace-squatting property).
+	//
+	// O(1) in the common case (Codex round-6 P2: a per-ref peer scan goes
+	// quadratic across concurrent high-fanout pushes): pre-receive
+	// bulk-reserved every updatable, reservation-allowed ref before any
+	// hook ran and recorded the remainder in the sidecar — no sidecar
+	// means this ref is already held, and only sidecar-listed refs (the
+	// rare divergence case) pay the full atomic check+reserve.
 	if holdPath != "" {
-		if err := reservePushHolds(ctx, holdPath, []string{refName}); err != nil {
-			return fmt.Errorf("update: reserve push hold: %w", err)
+		side, err := os.ReadFile(holdPath + pushHoldUnreservedSuffix)
+		switch {
+		case errors.Is(err, os.ErrNotExist):
+			// Every command was bulk-reserved; verify the reservation
+			// actually happened (fail closed, one stat).
+			if _, err := os.Stat(holdPath); err != nil {
+				return fmt.Errorf("update: push hold reservation missing (pre-receive owns it): %w", err)
+			}
+		case err != nil:
+			return fmt.Errorf("update: read unreserved sidecar: %w", err)
+		case slices.Contains(strings.Split(string(side), "\n"), refName):
+			if err := reservePushHolds(ctx, holdPath, []string{refName}); err != nil {
+				return fmt.Errorf("update: reserve push hold: %w", err)
+			}
 		}
 	}
 	// Sync claim fence (issue #86): a loopback sync push carries its
@@ -997,6 +1045,25 @@ func injectCASDrop(st ref.RefStore) ref.RefStore {
 // branch-protection.md) for one ref update. The deprecated repo-wide `ops`
 // claim is folded in as a fallback exactly once, here at parse time.
 func enforceRefPolicy(ctx context.Context, repo, refName, old, new string) error {
+	return evalRefPolicy(ctx, repo, refName, old, new, true)
+}
+
+// reservationRefPolicyDenied is the budget-free policy filter for hold
+// reservations (Codex round-6 P2 on #173): verify-sig is treated as
+// ALLOWED here because evaluating it charges the push's shared walk
+// budget, which the update hooks (and, on the pack path, the publication
+// gate) bill again — and an unverifiable ref that gets held for one push
+// window is harmless, while a double-billed budget rejects legitimate
+// fanout pushes. no-push/no-force-push stay enforced, so a restricted
+// token still cannot hold namespaces it cannot write.
+func reservationRefPolicyDenied(repo, refName, old, new string) bool {
+	return evalRefPolicy(context.Background(), repo, refName, old, new, false) != nil
+}
+
+// evalRefPolicy is the shared evaluator: evalVerifySig=false skips
+// signature verification (treating those refs as allowed) for callers that
+// must not charge the shared verify-sig state and walk budget.
+func evalRefPolicy(ctx context.Context, repo, refName, old, new string, evalVerifySig bool) error {
 	policyJSON := os.Getenv(EnvRefsPolicy)
 	opsJSON := os.Getenv(EnvOps)
 	if policyJSON == "" && opsJSON == "" {
@@ -1053,8 +1120,10 @@ func enforceRefPolicy(ctx context.Context, repo, refName, old, new string) error
 				}
 			}
 		case auth.OpVerifySig:
-			if err := verifySig(ctx, refName, old, new); err != nil {
-				return err
+			if evalVerifySig {
+				if err := verifySig(ctx, refName, old, new); err != nil {
+					return err
+				}
 			}
 		default:
 			// Unknown policy ops fail closed.
