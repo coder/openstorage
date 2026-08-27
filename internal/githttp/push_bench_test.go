@@ -299,20 +299,22 @@ func benchGenerateChain(dir string, writer, n int) ([]string, error) {
 //  2. the tip's chain index must not exceed the writer's highest attempted
 //     push (the server cannot hold a commit never sent);
 //  3. observations must never fall below the floor min(maxObserved,
-//     acked): every index that was OBSERVED on the server at any earlier
-//     poll — in-flight observations are retained, not discarded — and is
-//     acknowledged by now is committed history (chains are linear and
+//     ackedBeforePoll): every index that was OBSERVED on the server at any
+//     earlier poll — in-flight observations are retained, not discarded —
+//     and whose acknowledgement completed BEFORE the current poll started
+//     is committed history predating the snapshot (chains are linear and
 //     pushes fast-forward only, so acked ≥ m proves chain[m-1] is an
 //     acknowledged ancestor, and a prior observation of m proves the
-//     server served it), so a later observation below it is a lost
+//     server served it), so an observation below it is a lost
 //     acknowledged update even if the final state ends up legal.
 type pushObserver struct {
 	idx []map[string]int // per writer: sha → 1-based chain index
 	// maxObserved retains the highest chain index ever observed per
 	// writer, unconditionally: an in-flight tip observed before its ack
-	// is promoted into the rewind floor by the acked load of a LATER
-	// poll (discarding it would mask a rewind that happens after the ack
-	// arrives — Codex round 4).
+	// is promoted into the rewind floor by the pre-poll acked snapshot of
+	// a LATER poll (discarding it would mask a rewind that happens after
+	// the ack arrives — Codex round 4), so detection of a rewind under a
+	// just-acked tip lags by at most one poll but never false-positives.
 	maxObserved []int
 }
 
@@ -329,17 +331,23 @@ func newPushObserver(chains [][]string) *pushObserver {
 }
 
 // observe validates one observation for writer i; sha is the server tip
-// ("" = branch absent). Both attempted and acked must be loaded AFTER the
-// ls-remote completed; each side is safe on its own terms:
-//   - attempted can only OVERCOUNT what the server could have shown when
-//     the snapshot was taken, so the tip-beyond-attempted rule never
-//     false-positives (a genuine violation — a commit never sent — stays
-//     a violation under any larger attempted value);
-//   - acked only grows, and m ≤ acked is a true "push m was acknowledged"
-//     statement WHENEVER the load happens, so promoting retained
-//     observations with a later-loaded acked only adds independently-true
-//     facts to the floor. The floor can undercount (an ack landing after
-//     the load defers promotion to the next poll) but never overcount.
+// ("" = branch absent). The two indices have OPPOSITE load-ordering
+// requirements, each safe on its own terms:
+//   - attempted must be loaded AFTER the ls-remote completed: it can only
+//     OVERCOUNT what the server could have shown when the snapshot was
+//     taken, so the tip-beyond-attempted rule never false-positives (a
+//     genuine violation — a commit never sent — stays a violation under
+//     any larger attempted value);
+//   - acked must be SNAPSHOTTED BEFORE the poll starts: only an ack that
+//     completed before the snapshot proves the server held that commit at
+//     snapshot time. A post-poll load would reject a legal pre-ack
+//     snapshot when the ack lands between the ls-remote and the load
+//     (Codex round 7) — bounded-stale hydrate reads make a pre-ack tip
+//     legal, and an ack being true at load time does not make it true at
+//     snapshot time. The pre-poll snapshot means the floor lags acks by
+//     at most one poll (a real rewind under a just-acked tip is caught by
+//     the NEXT poll, whose snapshot includes the ack), delaying detection
+//     but never false-positive.
 func (o *pushObserver) observe(writer int, sha string, attempted, acked int) error {
 	idx := 0
 	if sha != "" {
@@ -352,9 +360,9 @@ func (o *pushObserver) observe(writer int, sha string, attempted, acked int) err
 		return fmt.Errorf("writer %d: server tip %q is chain index %d, beyond the %d attempted pushes", writer, sha, idx, attempted)
 	}
 	// The floor is evaluated per poll from the PRIOR maxObserved (this
-	// observation cannot vouch for itself) and the current acked: an
-	// index is floor-eligible once it has been observed at any time AND
-	// acked by now.
+	// observation cannot vouch for itself) and the pre-poll acked
+	// snapshot: an index is floor-eligible once it has been observed at
+	// any time AND acknowledged before this poll began.
 	if floor := min(o.maxObserved[writer], acked); idx < floor {
 		return fmt.Errorf("writer %d: server tip rewound to chain index %d, below floor %d (observed max %d, acked %d)", writer, idx, floor, o.maxObserved[writer], acked)
 	}
@@ -394,22 +402,26 @@ func TestPushObserverLegality(t *testing.T) {
 		}
 	}
 
-	// Codex round-4 interleaving: a poll observes an in-flight tip k while
-	// acked is still k−1; the push acks before the next poll; the
-	// authority then rewinds to k−1. Discarding the in-flight observation
-	// (the pre-round-4 rule promoted only observations already acked at
-	// poll time) would accept the rewind — retention plus the later acked
-	// load must catch it.
+	// Codex round-4 retention + round-7 pre-poll snapshot interleaving:
+	// poll1 observes an in-flight tip k while acked is still k−1
+	// (retained into maxObserved); poll2 legitimately snapshots the
+	// pre-ack server state k−1 while the ack for k lands only after
+	// poll2's floor snapshot — LEGAL (a post-poll acked load would
+	// false-positive here, the round-7 finding); poll3's pre-poll
+	// snapshot includes the ack, so the still-rewound k−1 is now a
+	// violation — the real rewind is caught one poll later, never
+	// falsely.
 	o2 := newPushObserver([][]string{chain})
 	steps2 := []struct {
 		name             string
 		sha              string
-		attempted, acked int
+		attempted, acked int // acked = the PRE-POLL snapshot
 		wantErr          bool
 	}{
 		{"acked baseline observed", "aaa", 1, 1, false},
 		{"in-flight tip observed before its ack (retained)", "bbb", 2, 1, false},
-		{"rewind to the pre-ack tip after the ack arrived", "aaa", 2, 2, true},
+		{"pre-ack snapshot with the ack landing after the floor snapshot (legal)", "aaa", 2, 1, false},
+		{"rewind still visible once the ack precedes the poll (caught)", "aaa", 2, 2, true},
 	}
 	for _, s := range steps2 {
 		if err := o2.observe(0, s.sha, s.attempted, s.acked); (err != nil) != s.wantErr {
@@ -633,6 +645,14 @@ func runPushWindow(b *testing.B, writers int, window time.Duration) pushWindowRe
 					return
 				case <-ticker.C:
 				}
+				// The acked snapshot MUST precede the poll (observe's
+				// load-ordering contract): an ack landing mid-poll may
+				// postdate the ls-remote snapshot, and using it for the
+				// floor would reject a legal pre-ack observation.
+				ackedBefore := make([]int, writers)
+				for i := range writers {
+					ackedBefore[i] = int(acked[i].Load())
+				}
 				out, err := tryGitDeadline(seed, benchSetupPushTimeout, "ls-remote", url)
 				if err != nil {
 					// A failed poll silently widens the observation gap,
@@ -652,11 +672,12 @@ func runPushWindow(b *testing.B, writers int, window time.Duration) pushWindowRe
 						tips[ref] = sha
 					}
 				}
-				// Both indices are loaded after the poll — see observe's
-				// load-ordering contract.
+				// attempted is loaded after the poll, acked was
+				// snapshotted before it — see observe's load-ordering
+				// contract.
 				for i := range writers {
 					tip := tips[fmt.Sprintf("refs/heads/w%d", i)]
-					if err := obs.observe(i, tip, int(attempted[i].Load()), int(acked[i].Load())); err != nil {
+					if err := obs.observe(i, tip, int(attempted[i].Load()), ackedBefore[i]); err != nil {
 						b.Errorf("observer poll %d: %v", res.polls, err)
 					}
 				}

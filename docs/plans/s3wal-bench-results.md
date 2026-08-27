@@ -177,11 +177,15 @@ authority semantics the detector must witness):
   counts the rounds) and validates each observation against the
   pre-generated chains: an observed tip must be on the writer's chain,
   must not exceed the writer's attempted pushes, and must never fall below
-  the rewind floor `min(maxObserved, acked)` — every index that was
-  observed at any earlier poll (in-flight observations are retained, not
-  discarded) and is acknowledged by now (Codex round-4: an in-flight tip
-  observed just before its ack, then rewound just after, is promoted into
-  the floor by the next poll's acked load and still caught). This catches
+  the rewind floor `min(maxObserved, ackedBeforePoll)` — every index that
+  was observed at any earlier poll (in-flight observations are retained,
+  not discarded — Codex round-4) and whose acknowledgement completed
+  before the current poll started (the pre-poll snapshot, Codex round-7:
+  an ack landing mid-poll may postdate the ls-remote snapshot, and using
+  it would falsely reject a legal pre-ack observation under bounded-stale
+  hydrate reads; the floor therefore lags acks by at most one poll —
+  detection of a rewind under a just-acked tip is delayed one poll, never
+  false-positive). This catches
   an acknowledged update transiently dropped and later restored by a
   descendant push, which the final check alone cannot see (Codex
   round-2). Any failed observer poll makes the run inconclusive, which
@@ -240,19 +244,19 @@ context for the correctness verdict:
 
 | Cell | observer polls | observer violations | rejected pushes | ambiguous final tips | pushes |
 |---|---|---|---|---|---|
-| s3wal, N=8 | 242 | 0 | 0 | 0 | 1,384 |
-| s3wal, N=32 | 172 | 0 | 4 | 0 | 1,637 |
-| SQLite, N=32 | 242 | 0 | 0 | 0 | 2,666 |
+| s3wal, N=8 | 241 | 0 | 0 | 0 | 1,268 |
+| s3wal, N=32 | 151 | 0 | 3 | 0 | 1,689 |
+| SQLite, N=32 | 237 | 0 | 0 | 0 | 2,639 |
 
-656 polls, all legality-clean: no foreign tips, no tips beyond attempted
-pushes, no rewind below the observed-and-acknowledged floor, and zero
-failed polls (a failed poll now fails the run as inconclusive). (The
-s3wal N=32 observer completed fewer rounds in its 60 s because polls slow
-under peak load.)
+629 polls, all legality-clean: no foreign tips, no tips beyond attempted
+pushes, no rewind below the observed-and-acknowledged floor — zero
+violations and zero false-positives — and zero failed polls (a failed
+poll fails the run as inconclusive). (The s3wal N=32 observer completed
+fewer rounds in its 60 s because polls slow under peak load.)
 
 ### Retry evidence (contention surfacing to the client)
 
-At N=32 on s3wal, 1 of 1,680 measured performance-mode pushes (and 4 in
+At N=32 on s3wal, 1 of 1,680 measured performance-mode pushes (and 3 in
 the correctness-mode re-run) was rejected when the hook's manifest CAS
 exhausted its bounded retry budget — a clean, git-native rejection, not a
 hang or a lost update (the accepted-tips detector accounts for every such
@@ -297,8 +301,8 @@ SeaweedFS-loopback numbers are quoted as directional evidence only:
   self-hosted store: **none observed.** Exactly-once winners across
   101,728 winning advances and 788,919 lost races in the 60 s microbench
   cells, plus a clean ls-remote lost-update detector across all 8 e2e push
-  cells (~15,400 real pushes across the performance and correctness
-  campaigns, plus 656 correctness-mode observer polls all legality-clean).
+  cells (~15,300 real pushes across the performance and correctness
+  campaigns, plus 629 correctness-mode observer polls all legality-clean).
 
 **Verdict input:** nothing in the SeaweedFS or SQLite data trips any
 threshold that can be measured locally; the real-S3 thresholds remain
