@@ -18,11 +18,15 @@ unversioned bucket created for the campaign and deleted afterward). The
 qualification lane (`TestQualifyExternalEndpoint`) passed all 22 surfaces
 in require mode against the same bucket before any benchmark ran.
 Kill-threshold evaluation and the Gate 1a-B verdict are below; summary:
-**no kill criterion is met** — thresholds (2) and (4) pass with wide
-margins, (3)'s throughput/scaling arms pass, and (3)'s 30 s starvation arm
-trips only in the harness's synthetic no-backoff regime, not in a
-production-shape probe with real git pushers (see the cell 3 note and
-issue [#181](https://github.com/coder/code-storage/issues/181)).
+thresholds (2) and (4) pass with wide margins and (3)'s throughput/scaling
+arms pass. (3)'s 30 s starvation arm **is recorded tripped as written**
+(56.4 s at N=8) — the evaluation below assesses that reading as a
+measurement-regime artifact (the runner omits the §2.3 backoff the cell
+definition names; [#181](https://github.com/coder/code-storage/issues/181))
+and records the verdict consequence explicitly: s3wal stays experimental,
+the arm must be re-measured under the §2.3 regime once #181 lands before
+any promote-grade claim, and if it trips again with backoff in place the
+criterion stands and the recommendation flips to closing #133.
 
 ## Environment
 
@@ -328,19 +332,23 @@ the bench tolerates and counts these like any rejection.
   - *Retries:* lost races grow proportionally with writers (1,014 →
     7,531 → 34,092 for N=2/8/32) with zero conditional-write contention
     errors and zero ambiguous outcomes — bounded racing, not livelock.
-  - *Starvation:* the harness metric reads **56.4 s at N=8, above the
-    30 s line as written** — but the runner measures a regime the
-    threshold was not written against: no §2.3 backoff plus a
-    winner-chaining optimization no production pusher has (97–98% of wins
-    arrive < 60 ms after the same worker's previous win; see the cell 3
-    regime note). The production-shape probe (8 concurrent real
-    `git push` workers, one repo group, 60 s, live serve node, same
-    bucket) measured a worst inter-success gap of **21.9 s** with every
-    pusher progressing and all conflicts surfacing as clean retryable
-    rejections. The arm's intended quantity — a real pusher's progress
-    gap — stays under the line; the harness-fidelity gap is tracked in
-    [#181](https://github.com/coder/code-storage/issues/181) and should
-    be fixed before any promote-grade re-run.
+  - *Starvation:* the harness metric reads **56.4 s at N=8 — the
+    criterion trips as written.** The recorded regime, however, deviates
+    from the cell's own definition: plan §3 specifies this cell "under
+    the §2.3 backoff policy" (full-jitter 25 ms → 2 s), and the runner
+    retries with no backoff at all plus a winner-chaining optimization no
+    production pusher has (97–98% of wins arrive < 60 ms after the same
+    worker's previous win; see the cell 3 regime note). A
+    production-shape probe (8 concurrent real `git push` workers, one
+    repo group, 60 s, live serve node, same bucket) measured a worst
+    per-worker progress gap of **21.9 s** — gap accounting covering
+    worker start → first success and last success → window end, so
+    pre-first and post-last starvation are included — with every pusher
+    progressing and all conflicts surfacing as clean retryable
+    rejections. The probe is a different workload than the cell, so it
+    supplements rather than replaces the recorded number; the
+    authoritative re-measurement is the §2.3-conformant harness re-run
+    tracked in [#181](https://github.com/coder/code-storage/issues/181).
 - **(4)** 304-path p99 > 100 ms: measured **20.12 ms** — passes with 5×
   margin.
 - **(1)** SeaweedFS-vs-S3 semantic divergence / lost update under
@@ -351,15 +359,25 @@ the bench tolerates and counts these like any rejection.
   published: 101,728 winning advances / 788,919 lost races clean plus
   ~15,300 real e2e pushes with a clean ls-remote detector.
 
-**Verdict input:** no plan §3 kill criterion is met on real S3 from
-near-same-region compute (~7 ms RTT). The starvation arm's raw harness
-figure trips as written and is reported above transparently; the
-production-shape measurement of the same quantity does not trip, and the
-harness deviation from the plan's own §2.3 regime is filed as
-[#181](https://github.com/coder/code-storage/issues/181). Per plan §4:
-**Gate 1a-B evaluated — no kill threshold met; continue as experimental.**
-This is a single-day campaign; promote-grade numbers need the §3
-separate-days method.
+**Verdict input:** on real S3 from near-same-region compute (~7 ms RTT),
+thresholds (1), (2), (4) and the throughput/scaling arms of (3) pass
+cleanly. The starvation arm of (3) **trips as written** (56.4 s at N=8;
+60.0 s at N=32). The maintainer assessment is that this reading measures
+the harness's own deviation from the cell definition (no §2.3 backoff +
+winner-chaining; [#181](https://github.com/coder/code-storage/issues/181))
+rather than a store or design property, with the production-shape probe
+(21.9 s worst gap) as supporting — not overriding — evidence.
+
+**Gate 1a-B verdict:** the plan's kill consequence (recommend closing
+[#133](https://github.com/coder/code-storage/issues/133)) is **not**
+taken on the strength of the tripped reading alone; s3wal **stays
+experimental** (no status upgrade), and the starvation arm is treated as
+*unresolved pending re-measurement*: once #181 aligns the runner with
+§2.3, the cell must be re-run on real S3. If the arm trips again under
+the conformant regime, the criterion stands and the recommendation flips
+to closing #133; a clean conformant run is a precondition for any
+promote-grade claim, as are §3's separate-day repeats (this is a
+single-day campaign).
 
 ## Real-S3 serve session (2026-08-27, eu-central-1)
 
