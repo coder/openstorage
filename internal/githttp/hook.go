@@ -176,7 +176,7 @@ func preReceive(ctx context.Context) error {
 	}
 	atomicPush := os.Getenv(EnvAtomic) == "1"
 
-	// Push holds (issue #170): reserve every ref this push may commit
+	// Push holds (issue #170): reserve the refs this push may commit
 	// BEFORE any publication or update-hook CAS, in one atomic
 	// check+append per push (reservePushHolds) — concurrent full syncs
 	// skip held refs so they cannot race receive-pack's own local ref
@@ -187,8 +187,35 @@ func preReceive(ctx context.Context) error {
 	// it fresh through the unbounded publication work below, and each
 	// update hook chains its own refresher for its runtime.
 	if holdPath := os.Getenv(EnvPushHold); holdPath != "" {
-		names := make([]string, 0, len(commands))
-		for _, c := range commands {
+		// Reserve only refs that can actually reach an update-hook CAS
+		// (Codex round-3 security P2 on #173): a policy-denied command
+		// never commits, and reserving it would let a restricted token
+		// hold namespaces it cannot write — e.g. a tags-only token
+		// covering all of refs/heads/* for the push window and denying
+		// other pushers' reservations. Atomic pushes skip the filter: any
+		// denial fails the whole push in the gates below, so the full set
+		// is the effective set. Residual: the update hook stays the
+		// per-ref policy authority, so a command denied here by a
+		// transient evaluation error yet allowed by its hook commits
+		// unheld — degrading that one ref to the pre-hold
+		// spurious-rejection window, never to divergence-by-design.
+		allowed := commands
+		if !atomicPush {
+			allowed = make([]refCommand, 0, len(commands))
+			for _, c := range commands {
+				if enforceRefPolicy(ctx, repo, c.ref, c.old, c.new) == nil {
+					allowed = append(allowed, c)
+				}
+			}
+		}
+		// The push's OWN command set must land in one git ref store
+		// before any exact-name authority CAS may run (Codex round-3 P1
+		// on #173).
+		if err := intraPushDFCheck(allowed, atomicPush); err != nil {
+			return err
+		}
+		names := make([]string, 0, len(allowed))
+		for _, c := range allowed {
 			names = append(names, c.ref)
 		}
 		if err := reservePushHolds(holdPath, names); err != nil {
@@ -523,6 +550,65 @@ func preReceive(ctx context.Context) error {
 		}
 	}
 	return regErr
+}
+
+// intraPushDFCheck denies a push whose OWN command set cannot land in one
+// git ref store (Codex round-3 P1 on #173): the authority CAS is keyed by
+// exact ref name, so a D/F-conflicting command set — refs/heads/a and
+// refs/heads/a/b both surviving — must be refused BEFORE any CAS runs, or
+// git accepts some local updates and rejects others after the authority
+// committed all of them, leaving the authority with a ref set the cache
+// cannot represent. Rules per strict-prefix pair:
+//   - both deletions: allowed (the end state has neither).
+//   - both non-deletions: denied (the end state is unrepresentable).
+//   - one deletion: git's files backend cannot reorder inside one atomic
+//     transaction (see syncRefsStreamed's D/F ordering note), so atomic
+//     pushes are denied; a non-atomic push is allowed only when the
+//     deletion PRECEDES the other command — git executes commands in
+//     order, so the doomed ref is gone before its D/F neighbor locks.
+func intraPushDFCheck(commands []refCommand, atomicPush bool) error {
+	type cmdInfo struct {
+		index    int
+		isDelete bool
+	}
+	byRef := make(map[string]cmdInfo, len(commands))
+	names := make([]string, 0, len(commands))
+	for i, c := range commands {
+		byRef[c.ref] = cmdInfo{index: i, isDelete: c.new == ref.ZeroSHA}
+		names = append(names, c.ref)
+	}
+	set := newPushHoldSet(names)
+	for _, c := range commands {
+		// Strict directory ancestors of c.ref within the command set;
+		// checking ancestors alone visits every conflicting pair once.
+		for i := 0; i < len(c.ref); i++ {
+			if c.ref[i] != '/' || !set.contains(c.ref[:i]) {
+				continue
+			}
+			ancName := c.ref[:i]
+			anc, desc := byRef[ancName], byRef[c.ref]
+			if anc.isDelete && desc.isDelete {
+				continue
+			}
+			deny := func(reason string) error {
+				return fmt.Errorf("pre-receive: refs %s and %s conflict (directory/file): %s", ancName, c.ref, reason)
+			}
+			switch {
+			case !anc.isDelete && !desc.isDelete:
+				return deny("both would exist after the push")
+			case atomicPush:
+				return deny("an atomic push cannot delete one and create the other in a single ref transaction; drop --atomic or split the push")
+			}
+			delIdx, otherIdx := anc.index, desc.index
+			if desc.isDelete {
+				delIdx, otherIdx = desc.index, anc.index
+			}
+			if delIdx > otherIdx {
+				return deny("the deletion must be ordered before the ref it unblocks; reorder the refspecs or split the push")
+			}
+		}
+	}
+	return nil
 }
 
 // preReceivePolicyGate refuses pack publication unless it is justified:

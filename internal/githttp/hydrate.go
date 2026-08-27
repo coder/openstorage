@@ -1242,34 +1242,54 @@ func newPushHoldSet(names []string) pushHoldSet {
 	return pushHoldSet{names: names}
 }
 
-// loadPushHolds snapshots repoPath's live holds: one directory read plus
-// one read per live file. Expired files are ignored here regardless of
-// sweeping — a crashed server must not suppress syncs past the TTL.
-// Fail-open on read trouble: a missed hold only reopens the narrow
-// spurious-rejection window this machinery closes, never corrupts state.
+// loadPushHolds snapshots repoPath's live holds for hydration, FAIL-OPEN
+// on read trouble (partial set): a missed hold only reopens the narrow
+// spurious-rejection window this machinery closes, and a serving-path sync
+// must not fail on hold-read hiccups. Reservation uses readPushHolds
+// directly and fails closed instead.
 func loadPushHolds(repoPath string) pushHoldSet {
-	return loadPushHoldsExcept(filepath.Join(repoPath, pushHoldDir), "")
+	s, _ := readPushHolds(filepath.Join(repoPath, pushHoldDir), "")
+	return s
 }
 
-// loadPushHoldsExcept is loadPushHolds skipping one hold file — a push's
-// hold reservation must not conflict with its own earlier holds.
-func loadPushHoldsExcept(dir, exceptPath string) pushHoldSet {
+// readPushHolds snapshots the live (unexpired) holds in dir, skipping
+// exceptPath (a push's own file — its reservation must not conflict with
+// its own earlier holds). ENOENT anywhere is benign: the directory may not
+// exist yet, and a peer's file vanishes exactly when its push completes.
+// Any other error is reported alongside the partial set, because an
+// unreadable peer hold is NOT proof of no conflict — reservation must fail
+// closed on it (Codex round-3 P1 on #173), while hydration deliberately
+// proceeds fail-open.
+func readPushHolds(dir, exceptPath string) (pushHoldSet, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return pushHoldSet{}
+		if errors.Is(err, os.ErrNotExist) {
+			return pushHoldSet{}, nil
+		}
+		return pushHoldSet{}, err
 	}
 	var names []string
+	var firstErr error
 	for _, e := range entries {
 		path := filepath.Join(dir, e.Name())
 		if exceptPath != "" && path == exceptPath {
 			continue
 		}
 		info, err := e.Info()
-		if err != nil || time.Since(info.ModTime()) > pushHoldTTL {
+		if err != nil {
+			if !errors.Is(err, os.ErrNotExist) && firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		if time.Since(info.ModTime()) > pushHoldTTL {
 			continue
 		}
 		b, err := os.ReadFile(path)
 		if err != nil {
+			if !errors.Is(err, os.ErrNotExist) && firstErr == nil {
+				firstErr = err
+			}
 			continue
 		}
 		for _, held := range strings.Split(string(b), "\n") {
@@ -1278,7 +1298,7 @@ func loadPushHoldsExcept(dir, exceptPath string) pushHoldSet {
 			}
 		}
 	}
-	return newPushHoldSet(names)
+	return newPushHoldSet(names), firstErr
 }
 
 func (s pushHoldSet) contains(name string) bool {
@@ -1364,8 +1384,14 @@ func reservePushHolds(holdPath string, names []string) error {
 		if err != nil {
 			return err
 		}
+		peers, err := readPushHolds(dir, holdPath)
+		if err != nil {
+			// Fail CLOSED: an unreadable peer hold is not proof of no
+			// conflict (Codex round-3 P1 on #173).
+			unlock()
+			return fmt.Errorf("push hold: reading peer holds: %w", err)
+		}
 		conflict := ""
-		peers := loadPushHoldsExcept(dir, holdPath)
 		for _, name := range names {
 			if peers.conflicts(name) {
 				conflict = name
