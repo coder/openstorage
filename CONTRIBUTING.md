@@ -55,11 +55,31 @@ go build ./cmd/codestorage && ./codestorage version
   [compose guide](docs/how-to/deploy-docker-compose.md). Every `CODESTORAGE_*`
   variable is documented in the [configuration reference](docs/reference/configuration.md).
 
+- **Zero-infrastructure mode (experimental)** — one SeaweedFS bucket as the sole durable
+  authority (`s3wal://` refs + metadata and `s3://` blobs on the same bucket, which must
+  exist before boot):
+
+  ```sh
+  docker run -d --name cs-s3 -p 8333:8333 chrislusf/seaweedfs:4.42 server -s3 -dir=/data -ip.bind=0.0.0.0
+  until curl -sf http://127.0.0.1:8333/healthz; do sleep 1; done
+  curl -sf -X PUT http://127.0.0.1:8333/codestorage
+  CODESTORAGE_ORG=selfhost CODESTORAGE_ORG_PUBKEYS=/tmp/cs-key.pub.pem \
+  CODESTORAGE_PG_URL='s3wal://codestorage?endpoint=http://127.0.0.1:8333&region=us-east-1' \
+  CODESTORAGE_S3_URL='s3://codestorage?endpoint=http://127.0.0.1:8333&s3ForcePathStyle=true&region=us-east-1' \
+  AWS_ACCESS_KEY_ID=any AWS_SECRET_ACCESS_KEY=any \
+    ./codestorage serve --listen 127.0.0.1:8080
+  ```
+
+  (This standalone SeaweedFS runs unauthenticated, so any credentials sign.) The
+  [README quickstart](README.md#quickstart-zero-infrastructure-mode-one-bucket-experimental)
+  continues with the client flow; topology and boundaries are in the
+  [production guide](docs/how-to/deploy-production.md#zero-infrastructure-mode-experimental-one-bucket-one-node).
+
 ## Tests
 
-CI runs three lanes; run the same commands locally. The
-[testing reference](docs/reference/testing.md) explains what each lane covers
-and the conventions for writing new tests.
+CI gates every PR on the first two lane commands below; the s3wal lane is
+on-demand. The [testing reference](docs/reference/testing.md) explains what
+each lane covers and the conventions for writing new tests.
 
 ```sh
 # 1. Default lane — the full suite on the production backends.
@@ -69,11 +89,19 @@ go test ./... -count=1 -race -timeout=30m
 # 2. Local lane — the git e2e suite on the zero-container backends
 #    (SQLite + file blobs). No Docker needed.
 CODESTORAGE_TEST_BACKEND=local go test ./internal/githttp -count=1 -race -timeout=15m
+
+# 3. s3wal lane (on-demand, not a per-PR CI gate) — the same git e2e suite on
+#    the zero-infra topology: ONE SeaweedFS bucket carrying refs + metadata +
+#    blobs, plus lane-only drills (restart-from-bucket-only, dual-serve
+#    refusal). Needs Docker.
+CODESTORAGE_TEST_BACKEND=s3wal go test ./internal/githttp -count=1 -race -timeout=25m
 ```
 
-The third lane is inside the first: the `internal/api`, `internal/meta`, and
+A further lane hides inside the first: the `internal/api`, `internal/meta`, and
 `internal/ref` suites fan out into `/pg` + `/sqlite` subtests on their own, so
-the default lane already covers both backends for those packages.
+the default lane already covers both backends for those packages — and it also
+runs the s3wal store suites there (conformance over the in-memory CAS fake,
+qualification against a SeaweedFS container).
 
 Two flags are load-bearing:
 

@@ -443,7 +443,8 @@ local disk from the durability story: refs and metadata live in conditional-CAS 
 under the bucket's reserved `_wal/` prefix, next to the ordinary `packs/` and `lfs/`
 payloads. One S3-compatible bucket is the sole durable authority — kill the process,
 lose the machine, and a fresh node pointed at the bucket reconstructs full service (the
-cache dir stays a rebuildable cache, exactly like every other mode).
+cache dir stays a rebuildable cache, exactly like every other mode). Engine-level
+rationale: [the storage engine](../explanation/storage-engine.md#the-zero-infrastructure-backend-s3-as-sole-authority-s3wal).
 
 ```sh
 CODESTORAGE_PG_URL='s3wal://my-bucket?endpoint=https://s3.example.net&region=us-east-1' \
@@ -453,8 +454,11 @@ codestorage serve --listen 0.0.0.0:8080 --cache-dir /var/cache/codestorage
 ```
 
 The same bucket for both URLs is the expected layout; a `file://` blob URL is refused at
-startup ([pairing rule](../reference/configuration.md#codestorage_pg_url)). Never write
-to the `_wal/` prefix yourself, and never point two serve processes at one bucket — the
+startup ([pairing rule](../reference/configuration.md#codestorage_pg_url)). Create the
+bucket before the first boot: the startup conditional-write probe runs against it before
+the blob layer's create-if-missing bootstrap, so a missing bucket is boot-fatal. Never
+write to the `_wal/` prefix yourself, and never point two serve processes at one
+bucket — the
 [instance lease](../reference/configuration.md#codestorage_s3wal_lease_ttl) exists to
 detect exactly that mistake (startup refusal / fail-stop), best-effort.
 
@@ -464,6 +468,20 @@ Qualified: **AWS S3** and **SeaweedFS** (the tested self-hosted reference). MinI
 other S3-compatible stores are not qualified for `s3wal://` even where they work fine as
 plain [`CODESTORAGE_S3_URL`](../reference/configuration.md#codestorage_s3_url) blob
 storage. Do not enable bucket versioning or object lock on the bucket.
+
+**Credentials and IAM.** Credentials come from the standard AWS chain (env vars, shared
+config, instance roles). The node needs only standard S3 object operations on the one
+bucket: object reads and writes (`s3:GetObject`, `s3:PutObject` — the conditional
+`If-Match`/`If-None-Match` writes are ordinary PutObject calls — and `s3:DeleteObject`;
+the quarantine handshake's server-side copies ride the same two), prefix listing
+(`s3:ListBucket`, which also covers the bucket reachability probes), and
+`s3:GetBucketVersioning` (the delete-mode and purge guards verify versioning is off).
+`s3:CreateBucket` is not required for a pre-provisioned bucket — a denied create falls
+back to a reachability probe. Set
+[`CODESTORAGE_S3_EXPECTED_BUCKET_OWNER`](../reference/configuration.md#codestorage_s3_expected_bucket_owner):
+both S3 clients — the blob data plane *and* the `_wal/` conditional client — stamp the
+owner condition on every request, which matters doubly in this mode because the bucket
+carries the org's public keys and the ref authority, not just packs.
 
 **Honest scaling boundaries** — this mode trades throughput for zero infrastructure, and
 it is a deliberate single-node design:
@@ -478,3 +496,48 @@ it is a deliberate single-node design:
 
 If any of these bind, use local mode (SQLite on a persistent volume) or the Postgres
 topology above. Small single-tenant deployments — the target — sit far below them.
+
+**Measured boundaries** — from the recorded benchmark campaign
+([full method and tables](../plans/s3wal-bench-results.md)). All numbers are
+**loopback SeaweedFS** on one host; real-S3 qualification is pending, and a real
+client adds its own network RTT to every number equally:
+
+- An uncontended small `git push` end-to-end costs ~26 ms (+23%) over local mode
+  (138 vs 112 ms p50) — the backend is a minority of the push path on both.
+- One hot repository saturates around 27 pushes/s at 32 concurrent writers, with a
+  seconds-long p99 tail (5.8 s vs local mode's 2.8 s) — the one-CAS-point-per-group
+  boundary in practice. Distinct repositories do not contend.
+- Contention exhaustion surfaces to the client as a clean, git-native hook rejection
+  naming the exhausted retry budget (`s3wal cas ref repo_…: 16 attempts: s3wal:
+  conditional-write contention retries exhausted`), never a hang.
+- Zero lost updates observed: every acknowledged push was durable across ~15,300 real
+  pushes in the sustained multi-writer campaigns, plus ~790,000 lost-then-retried CAS
+  races in the microbench cells.
+
+**Crash recovery: restart from bucket only.** Node replacement and crash recovery are
+the same operation: start a fresh node — empty disk, empty cache dir — against the same
+two URLs. Refs, metadata, packs, and LFS objects reconstruct from the bucket alone, and
+the cache re-hydrates on demand. This is a designed-for, e2e-tested path (the
+`s3wal` [test lane](../reference/testing.md) drills exactly this).
+
+**The lease lifecycle in practice.** The `_wal/instance-lease` guard has one operational
+consequence for restarts: the current binary does not release the lease on shutdown
+(release-on-shutdown is tracked as a known issue), so after *any* stop — graceful or
+crash — a replacement started early refuses with `s3wal instance lease
+_wal/instance-lease is held by another serve process …` until the stale lease ages past
+[`CODESTORAGE_S3WAL_LEASE_TTL`](../reference/configuration.md#codestorage_s3wal_lease_ttl)
+(default 2 minutes), then boots normally by stealing it. To skip the wait, delete
+`_wal/instance-lease` — only after confirming the old process is actually dead: deleting
+it under a live node re-creates the undetected dual-serve topology the lease exists to
+catch. While running, the node heartbeats every TTL/4 and **fail-stops** (exits) if the
+lease is stolen or unrenewable — run serve under a supervisor that restarts it like any
+crash.
+
+**What to monitor in this mode** (besides the [general table](#what-to-monitor)):
+
+| Signal | Why |
+|---|---|
+| `s3wal instance lease` startup refusals / fail-stop exits | Dual-serve detection, or a stale lease after a crash (wait out the TTL); heartbeat-loss exits need the supervisor restart |
+| `codestorage hook: s3wal cas ref … contention retries exhausted` (client-visible) | Hot-repo CAS contention exceeded the retry budget — a retry usually lands; frequent occurrences mean the workload outgrew the one-CAS-point boundary |
+| `s3wal manifest approaching size cap` log line | A repository group's manifest passed the 4 MiB warning threshold; growing writes are refused at 16 MiB |
+| `s3wal clock skew guard tripped: demoting expiry verdict to report-only` log line | A skew guard failed closed — expiries defer (over-retention, never early deletion); persistent tripping means a wrong clock, so fix it and restart |

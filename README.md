@@ -5,8 +5,9 @@ Computer Company's git-native storage service — built from the specification i
 [`docs/`](docs/README.md). One Go binary serves the `/api/v1` HTTP API and the production
 git smart-HTTP path (clone/push, LFS) behind customer-signed JWTs; the official SDKs drop
 in via their `apiBaseUrl` / `storageBaseUrl` overrides without changing client code. Run it
-as a fleet of stateless nodes on Postgres + S3-compatible object storage, or as a single zero-dependency
-process on SQLite + plain files.
+as a fleet of stateless nodes on Postgres + S3-compatible object storage, as a single zero-dependency
+process on SQLite + plain files, or — experimentally — as a single node whose sole durable
+authority is one S3 bucket ([`s3wal`](docs/explanation/storage-engine.md#the-zero-infrastructure-backend-s3-as-sole-authority-s3wal)).
 
 ## Architecture at a glance
 
@@ -32,7 +33,11 @@ flowchart TB
 Refs advance only through compare-and-swap on the database; pack data is published to the
 blob store *before* any ref moves, so a committed ref never points at unavailable objects.
 Nodes keep no durable state — a push through one replica is immediately visible through
-every other.
+every other. An **experimental third backend** collapses both stores into one
+S3-compatible bucket: `s3wal://` keeps refs and metadata in conditional-CAS objects next
+to the packs, single node, zero other infrastructure
+([ADR-46](docs/adr/046-s3wal-refs-and-metadata-ride-one-conditional-cas-object-per-repo-group.md),
+[quickstart below](#quickstart-zero-infrastructure-mode-one-bucket-experimental)).
 
 ## Install
 
@@ -158,6 +163,42 @@ To run the server on the host against just the backing services, boot them with 
 `docker compose up -d --wait` and point `CODESTORAGE_PG_URL` / `CODESTORAGE_S3_URL` at the
 published ports ([configuration reference](docs/reference/configuration.md)).
 
+## Quickstart: zero-infrastructure mode, one bucket (experimental)
+
+The **experimental** `s3wal://` backend makes one S3-compatible bucket the *sole* durable
+authority — no Postgres, no SQLite file, no durable disk. Refs and metadata live in
+conditional-CAS objects under the bucket's `_wal/` prefix, next to the packs:
+
+```sh
+# 1. An S3-compatible bucket as the sole authority — SeaweedFS here (AWS S3 is the other qualified store).
+docker run -d --name cs-s3 -p 8333:8333 chrislusf/seaweedfs:4.42 server -s3 -dir=/data -ip.bind=0.0.0.0
+until curl -sf http://127.0.0.1:8333/healthz; do sleep 1; done
+curl -sf -X PUT http://127.0.0.1:8333/codestorage    # the bucket must exist before serve boots
+
+# 2. One node, refs + metadata + packs all in the bucket (this dev SeaweedFS is unauthenticated; any creds sign).
+codestorage keygen --out /tmp/cs-key
+CODESTORAGE_ORG=selfhost CODESTORAGE_ORG_PUBKEYS=/tmp/cs-key.pub.pem \
+CODESTORAGE_PG_URL='s3wal://codestorage?endpoint=http://127.0.0.1:8333&region=us-east-1' \
+CODESTORAGE_S3_URL='s3://codestorage?endpoint=http://127.0.0.1:8333&s3ForcePathStyle=true&region=us-east-1' \
+AWS_ACCESS_KEY_ID=any AWS_SECRET_ACCESS_KEY=any \
+  codestorage serve --listen 127.0.0.1:8080 --cache-dir /tmp/cs-cache &
+sleep 3 && curl -sf http://127.0.0.1:8080/healthz && kill -0 $!
+
+# 3. Same client flow as local mode — mint, create, clone, push.
+TOK=$(codestorage mint --key /tmp/cs-key.pem --iss selfhost --repo demo --scopes repo:write,git:read,git:write)
+curl -s -X POST http://127.0.0.1:8080/api/v1/repos -H "Authorization: Bearer $TOK" \
+  -d '{"default_branch":"main"}'
+git clone "http://t:${TOK}@127.0.0.1:8080/demo.git" && cd demo
+git -c user.name=demo -c user.email=demo@example.com commit --allow-empty -m init
+git push origin HEAD:main
+```
+
+Kill the process, delete the cache dir — a fresh node pointed at the same bucket
+reconstructs full service. The mode is deliberately single-node with honest scaling
+boundaries (one CAS point per repository; hot-repo pushes serialize on it):
+[deployment guide](docs/how-to/deploy-production.md#zero-infrastructure-mode-experimental-one-bucket-one-node),
+[how the engine changes](docs/explanation/storage-engine.md#the-zero-infrastructure-backend-s3-as-sole-authority-s3wal).
+
 ## Features
 
 - **Full read surface** (`git:read`): files, branches, tags, commits, diff, blame, grep,
@@ -193,7 +234,7 @@ published ports ([configuration reference](docs/reference/configuration.md)).
 |---|---|
 | `CODESTORAGE_ORG` | **Required.** Org name (JWT `iss` claim) |
 | `CODESTORAGE_ORG_PUBKEYS` | **Required.** PEM file with the org's public keys |
-| `CODESTORAGE_PG_URL` | Database URL for refs + metadata: `postgres://`/`postgresql://` or `sqlite://` |
+| `CODESTORAGE_PG_URL` | Database URL for refs + metadata: `postgres://`/`postgresql://`, `sqlite://`, or the experimental `s3wal://` |
 | `CODESTORAGE_S3_URL` | Pack storage URL: `s3://` bucket or `file://` directory |
 | `CODESTORAGE_DATA_DIR` | Local mode: one directory that derives the two storage URLs above (org settings are still required) |
 
@@ -206,7 +247,7 @@ legacy aliases — with defaults and validation constraints:
 
 | | Start here |
 |---|---|
-| **Tutorials** | The two quickstarts above |
+| **Tutorials** | The three quickstarts above |
 | **Reference** | [Configuration](docs/reference/configuration.md) · [CLI](docs/reference/cli.md) · [Testing](docs/reference/testing.md) · [HTTP API](docs/reference/http-api.md) · [Auth & JWT claims](docs/reference/authentication.md) · [Webhooks](docs/reference/webhooks.md) |
 | **Explanation** | [Wire compatibility with code.storage](docs/explanation/wire-compatibility.md) · [The storage engine](docs/explanation/storage-engine.md) · [Domain model](docs/explanation/domain-model.md) · [Git protocol & namespaces](docs/explanation/git-protocol-and-namespaces.md) · [Streaming commit protocols](docs/explanation/streaming-commit-protocols.md) · [Docs index](docs/README.md) · [Architecture decision records](docs/adr/README.md) |
 | **How-to** | [Deploy to production (multi-replica)](docs/how-to/deploy-production.md) · [Deploy a two-replica stack with Docker Compose](docs/how-to/deploy-docker-compose.md) · [Operate the storage lifecycle: repack, quotas, sweeping](docs/how-to/storage-lifecycle-and-sweeping.md) |
@@ -220,7 +261,9 @@ go test ./...   # needs Docker: boots real Postgres + SeaweedFS via testcontaine
 Zero-container lanes cover the same surfaces on the local backends: the api integration
 tests fan out into `/pg` + `/sqlite` subtests, and
 `CODESTORAGE_TEST_BACKEND=local go test ./internal/githttp` runs the full git e2e suite on
-`sqlite://` + `file://`. Setup, lanes, lint, commit conventions, and the review bar:
+`sqlite://` + `file://`. `CODESTORAGE_TEST_BACKEND=s3wal` runs the same e2e suite on the
+zero-infra topology (one SeaweedFS bucket for refs, metadata, *and* blobs — needs
+Docker), plus its lane-only drills. Setup, lanes, lint, commit conventions, and the review bar:
 **[CONTRIBUTING.md](CONTRIBUTING.md)**; test lanes and the DST simulation harness in
 depth: **[testing reference](docs/reference/testing.md)**.
 
@@ -232,14 +275,14 @@ depth: **[testing reference](docs/reference/testing.md)**.
 | `docs/` | Documentation, organized by [Diátaxis](https://diataxis.fr/) quadrant — start at the [index](docs/README.md) |
 | `docs/reference/` | Reference: configuration, CLI, testing, HTTP API, auth, webhooks |
 | `docs/explanation/` | Explanation: storage engine, wire compatibility, domain model, protocols |
-| `docs/adr/` | Standalone architecture decision records (ADR-1..40) |
+| `docs/adr/` | Standalone architecture decision records (ADR-1..46) |
 | `docs/archive/` | Historical roadmap + per-phase implementation notes |
 | `cmd/codestorage` | Service binary: `serve`, `hook`, `keygen`, `mint`, `signing-key`, `list-packs` |
 | `internal/api` | `/api/v1` HTTP handlers, JWT middleware, `{"error"}` envelope |
 | `internal/auth` | JWT verification contract (per-org public keys, allowed algorithms) |
 | `internal/meta` | Metadata store: orgs, org public keys, repos, webhooks, git credentials, upstream links |
 | `internal/blob` | `BlobStore` contract + S3 and local-file implementations (immutable packs) |
-| `internal/ref` | `RefStore` contract + Postgres and SQLite implementations (CAS ref authority) |
+| `internal/ref` | `RefStore` contract + Postgres, SQLite, and s3wal implementations (CAS ref authority) |
 | `internal/gitread` | Read-side git plumbing (ls-tree, log, diff, blame, grep, archive) over the hydrated cache repo |
 | `internal/githttp` | Git smart-HTTP server + LFS batch API, policy/verify-sig hooks, cache hydration, e2e suite |
 | `internal/events` | Outbound webhooks: HMAC-signed delivery + the push-event `RefStore` decorator |

@@ -110,7 +110,9 @@ s3wal mode only: the TTL of the `_wal/instance-lease` dual-serve guard
 bucket; while running, it heartbeats the lease every TTL/4 and **fail-stops** if the lease
 is stolen or unrenewable. A graceful shutdown (`SIGTERM`/`SIGINT`) releases the lease so a
 successor can start immediately; only a hard kill (`SIGKILL`, crash, power loss) leaves the
-lease behind, and that node's successor can start once the stale lease ages past the TTL.
+lease behind, and that node's successor can start once the stale lease ages past the TTL —
+the [production guide](../how-to/deploy-production.md#zero-infrastructure-mode-experimental-one-bucket-one-node)
+covers the recovery runbook.
 
 - **Default:** unset — 2 minutes (30-second heartbeats).
 - **Validation:** a [duration](https://pkg.go.dev/time#ParseDuration) of at least `1s` —
@@ -133,6 +135,11 @@ server issues carries `x-amz-expected-bucket-owner` via client middleware (the g
 data plane, multipart copies, the startup probe, sweeps, git-hook subprocesses, and the
 purge CLI all share that client seam), so operations against a re-owned bucket fail with
 `403 Access Denied` instead of silently reading from or writing to an attacker's bucket.
+The same env var is also enforced by the `s3wal://` mode's conditional client: every
+`_wal/` manifest/metadata CAS request — including the boot probe and the instance
+lease — carries the header via its own all-or-nothing middleware, so the ref and
+metadata authority objects (which include the org's public keys) get the same protection
+as the blob plane.
 
 - **Default:** unset — no condition parameters are sent; behavior is unchanged.
 - **Format:** exactly 12 digits. Anything else is boot-fatal (a typo'd ID would 403 every

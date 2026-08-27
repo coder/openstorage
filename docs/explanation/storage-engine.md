@@ -20,6 +20,9 @@ All durable state splits across two systems with very different guarantees:
   a billed noncurrent version
   ([lifecycle-rule guidance](../how-to/deploy-production.md#backing-services)).
 
+(An experimental third backend collapses both stores into one S3-compatible bucket —
+[below](#the-zero-infrastructure-backend-s3-as-sole-authority-s3wal).)
+
 The single invariant tying them together — **publish before CAS**:
 
 > Pack bytes are durably published to the blob store *before* any database row (pack
@@ -181,3 +184,69 @@ if refs change while pages stream, the mutation's generation bump outruns the ma
 sync writes, so the next read repeats the full sync and converges. That is the same
 staleness window a single-snapshot rebuild always had — bounded memory costs no
 additional semantics.
+
+## The zero-infrastructure backend: S3 as sole authority (s3wal)
+
+The **experimental** `s3wal://` backend
+([ADR-46](../adr/046-s3wal-refs-and-metadata-ride-one-conditional-cas-object-per-repo-group.md))
+removes the database entirely: one S3-compatible bucket is the *only* durable system.
+The two-store split above collapses — the bucket holds the immutable packs (`packs/`,
+`lfs/`, unchanged) *and* the authority, as conditional-CAS JSON objects under the
+reserved `_wal/` prefix. Deployment mechanics are in the
+[production guide](../how-to/deploy-production.md#zero-infrastructure-mode-experimental-one-bucket-one-node);
+this section explains what changes in the engine and what deliberately does not.
+
+**One manifest object per repository group is the ref authority.** The entire state of
+a base repository group `{base, +ephemeral, +import}` — refs, pack registry, quota
+ledger and reservations, delete locks, LFS registry, sync-claim fence — lives in one
+JSON object, `_wal/repo/<baseRepoID>`, advanced atomically with `PutObject + If-Match`
+(create: `If-None-Match: *`). Every multi-row transaction the SQL backends run becomes
+a single-object compare-and-swap: exactly one concurrent writer wins, losers re-read
+and retry with jittered backoff. All metadata tables (repos, webhooks, credentials,
+signing keys, org keys) share one further object, `_wal/meta.json`, with the same CAS
+discipline and a process-local cache revalidated through `If-None-Match` 304s.
+
+**Publish before CAS is preserved unchanged.** Pack and LFS bytes still upload through
+the ordinary blob path *before* the manifest CAS registers or references them — the
+crash asymmetry (orphans, never dangling refs) carries over verbatim. What changes is
+only who arbitrates the ref flip: an ETag condition on one object instead of a database
+row lock.
+
+**A manifest logical clock replaces the database clock.** PG/SQLite stamp every lease
+and grace window with the DB clock so node skew cannot corrupt expiry. s3wal has no
+server clock, so every CAS writes `clk = max(localNow, clk_prev + 1ms)` — monotone
+across restarts and backward local jumps — and all stamps use it. Verdicts that permit
+destruction or steal **fail closed** (demote to report-only, log, never expire early)
+behind three skew guards: when the manifest clock runs ahead of local time, when the
+wall clock drifts from the process's monotonic clock, each by more than
+`min(15 min, ttl/4)` — and destructive verdicts additionally cross-check the S3 HTTP
+`Date` response header, the only arm that catches a clock that was wrong at boot (a
+store supplying no usable `Date` witness is refused at startup). Over-retention and
+false-deny are the only reachable failure directions.
+
+**No conditional DELETE, anywhere.** S3-compatible stores do not honor `If-Match` on
+DELETE uniformly — a guard that sometimes does not guard is worse than none. Deletion
+safety comes from ordering instead: manifest purge tombstones are terminal and never
+deleted, and physical deletes are fenced by short-TTL delete locks recorded in the
+manifest via CAS plus the sweeper's quarantine-first handshake.
+
+**Single-writer serialization, detected — not enforced.** The mode is intentionally
+single-node. Correctness never depends on that (every state change is CAS-serialized
+regardless), but a second writer degrades the clock guards and cache behavior, so the
+`_wal/instance-lease` CAS-heartbeat turns accidental dual-serve into a *detected*
+condition: serve refuses to start over a fresh foreign lease, steals expired ones, and
+fail-stops on heartbeat loss. It is best-effort detection, never the correctness
+mechanism.
+
+**Manifest size is a documented boundary.** A repository group's whole registry is one
+JSON object: growing writes warn past 4 MiB and are refused past 16 MiB — shrinking
+writes and the purge pipeline always pass, so an oversized manifest stays cleanable.
+
+**When to choose it — and the honest cost.** The target is small, single-tenant,
+single-node deployments that want durability without operating a database: the process
+dies, the disk burns, and a fresh node pointed at the bucket reconstructs full service.
+The price is one CAS point per repository group: concurrent pushes to the *same*
+repository serialize on one object (hot-repo contention surfaces as CAS retries and,
+exhausted, as a clean push rejection), and every ref or metadata operation pays an S3
+round trip. Different repositories do not contend. If hot-repo write throughput or
+multi-node serving matter, use local mode or the Postgres topology.
