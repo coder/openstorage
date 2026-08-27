@@ -168,10 +168,7 @@ func postReceiveHook() error {
 	// attacker-scaled stream whose drain would keep same-name and
 	// D/F-relative pushes blocked into their reservation timeout.
 	if holdPath := os.Getenv(EnvPushHold); holdPath != "" {
-		_ = os.Remove(holdPath)
-		_ = os.RemoveAll(holdPath + pushHoldUnreservedSuffix)
-		_ = os.RemoveAll(holdPath + pushHoldVerifiedSuffix)
-		_ = os.Remove(holdPath + pushHoldReapSuffix)
+		removePushHoldFiles(holdPath)
 	}
 	// Then drain the updated-ref list git feeds on stdin (unused):
 	// exiting with the pipe unread risks EPIPE noise on receive-pack's
@@ -1397,10 +1394,30 @@ func updateHook(ctx context.Context, args []string) (retErr error) {
 		// leaves the pre-fix until-exit hold, and the denial itself still
 		// stands. Removing a name the hold never listed (a sidecar
 		// command denied before its self-reservation) is a no-op rewrite.
+		//
+		// Under --atomic one denial dooms the WHOLE push, so it releases
+		// the whole hold (Codex round-27 P2): git aborts the local
+		// transaction and never runs post-receive — the primary release —
+		// leaving only the handler's fallback, which fires after
+		// receive-pack's report drain, a write a non-reading client can
+		// stall indefinitely while the handler refresher keeps the hold
+		// fresh. Earlier hooks' committed authority CASes would then
+		// block every same-name and D/F-relative push until the client
+		// went away. Releasing here is safe on both sides: committed
+		// values are durable and hydration applying them can no longer
+		// collide with a local transaction git has abandoned, and
+		// not-yet-committed names have nothing to protect (their hooks
+		// never run — and if one somehow did, its bulk-reservation check
+		// fails closed on the missing hold file).
 		defer func() {
-			if retErr != nil {
-				_ = removePushHolds(holdPath, []string{refName})
+			if retErr == nil {
+				return
 			}
+			if os.Getenv(EnvAtomic) == "1" {
+				removePushHoldFiles(holdPath)
+				return
+			}
+			_ = removePushHolds(holdPath, []string{refName})
 		}()
 	}
 
@@ -1934,6 +1951,21 @@ func evalRefPolicy(ctx context.Context, repo, refName, old, new string, fullEval
 	if !ok {
 		return nil // unpoliced ref: allowed
 	}
+	// Budget-free sentinels are decided AFTER the loop, independent of the
+	// rule's op ORDER (Codex round-27 P2 on #173): a combined
+	// `["verify-sig", "no-force-push"]` rule used to return the signature
+	// sentinel first, classifying every update needs-verify — pre-receive
+	// then paid a REAL evaluation (signature walk plus the ancestry
+	// subprocess) for a whole crafted list of doomed rewinds before the
+	// sidecar cap could reject the push. The ancestry sentinel outranks
+	// the signature sentinel because a JIT command defers ALL of its
+	// evaluation to its own update hook (which runs the full check —
+	// signature included — before self-reserving), charging nothing in
+	// pre-receive and never touching the sidecar cap. Hard denials keep
+	// returning in op order; scanning the whole rule also means an op
+	// AFTER a would-be sentinel (an unknown op, a no-push) now denies
+	// budget-free instead of costing a doomed evaluation first.
+	var needsSig, needsAncestry bool
 	for _, op := range rule.Ops {
 		switch op {
 		case auth.OpNoPush:
@@ -1966,7 +1998,8 @@ func evalRefPolicy(ctx context.Context, repo, refName, old, new string, fullEval
 				// hook re-runs this check with fullEval before its CAS,
 				// and reserves only if it passes.
 				if !fullEval {
-					return fmt.Errorf("%s: %w", refName, errReservationNeedsAncestry)
+					needsAncestry = true
+					continue
 				}
 				if !isAncestor(old, new) {
 					return fmt.Errorf("policy no-force-push denies non-fast-forward update to %s", refName)
@@ -1986,12 +2019,18 @@ func evalRefPolicy(ctx context.Context, repo, refName, old, new string, fullEval
 				// squat for the push window). The sentinel routes the
 				// caller to the push's REAL verdicts. Deletions introduce
 				// no commits, always pass verify-sig, and stay allowed.
-				return fmt.Errorf("%s: %w", refName, errReservationNeedsSig)
+				needsSig = true
 			}
 		default:
 			// Unknown policy ops fail closed.
 			return fmt.Errorf("unknown policy op %q for %s", op, refName)
 		}
+	}
+	if needsAncestry {
+		return fmt.Errorf("%s: %w", refName, errReservationNeedsAncestry)
+	}
+	if needsSig {
+		return fmt.Errorf("%s: %w", refName, errReservationNeedsSig)
 	}
 	return nil
 }

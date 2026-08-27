@@ -1028,10 +1028,7 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 		releasePushHold = func() {
 			releaseOnce.Do(func() {
 				stopHoldRefresh()
-				_ = os.Remove(holdPath)
-				_ = os.RemoveAll(holdPath + pushHoldUnreservedSuffix)
-				_ = os.RemoveAll(holdPath + pushHoldVerifiedSuffix)
-				_ = os.Remove(holdPath + pushHoldReapSuffix)
+				removePushHoldFiles(holdPath)
 			})
 		}
 		defer releasePushHold()

@@ -889,7 +889,7 @@ func TestIsAncestor_Memoized(t *testing.T) {
 // evaluating the push's REAL verdicts once). Deletions and rules without
 // verify-sig stay allowed; no-push stays denied.
 func TestClassifyReservation(t *testing.T) {
-	t.Setenv(EnvRefsPolicy, `[["refs/heads/sigx",["verify-sig"]],["refs/heads/plainx",[]],["refs/heads/nopush",["no-push"]],["refs/heads/noff",["no-force-push"]]]`)
+	t.Setenv(EnvRefsPolicy, `[["refs/heads/sigx",["verify-sig"]],["refs/heads/plainx",[]],["refs/heads/nopush",["no-push"]],["refs/heads/noff",["no-force-push"]],["refs/heads/signoff",["verify-sig","no-force-push"]],["refs/heads/noffsig",["no-force-push","verify-sig"]]]`)
 	sha := strings.Repeat("a", 40)
 	sha2 := strings.Repeat("b", 40)
 	zero := strings.Repeat("0", 40)
@@ -915,6 +915,19 @@ func TestClassifyReservation(t *testing.T) {
 		{"refs/heads/noff", sha, sha2, reservationJIT},     // update: hook checks + reserves
 		{"refs/heads/noff", sha, zero, reservationDenied},  // deletion: budget-free denial
 		{"refs/heads/noff", zero, sha, reservationAllowed}, // creation: no rewind possible
+		// COMBINED rules classify independent of op ORDER, JIT outranking
+		// needs-verify (Codex round-27 P2): the documented
+		// ["verify-sig","no-force-push"] ordering used to hit the
+		// signature sentinel first, so pre-receive paid a REAL evaluation
+		// — signature walk plus ancestry subprocess — for a whole crafted
+		// list of doomed rewinds before the sidecar cap could reject the
+		// push. A JIT command instead charges nothing in pre-receive; its
+		// own hook runs the full check (signature included) and reserves
+		// only on a pass.
+		{"refs/heads/signoff", sha, sha2, reservationJIT},         // update: doc op order
+		{"refs/heads/noffsig", sha, sha2, reservationJIT},         // update: flipped op order
+		{"refs/heads/signoff", zero, sha, reservationNeedsVerify}, // creation: no rewind, sig still gates
+		{"refs/heads/signoff", sha, zero, reservationDenied},      // deletion: no-force-push denies
 	} {
 		if got := classifyReservation("r", tc.ref, tc.old, tc.new); got != tc.want {
 			t.Errorf("classifyReservation(%s %.4s->%.4s) = %v, want %v",
@@ -1526,6 +1539,160 @@ func TestPushHolds_LeakExpiresAfterReapGrace(t *testing.T) {
 	}
 }
 
+// TestPushHolds_FutureReapMarkerClampedNotPinned (Codex round-27 P2 on
+// #173): the backward-step clamp covered the hold FILE but not its reap
+// marker. A crash leak whose marker went far-future (the wall clock
+// stepped backward after the marker was armed — e.g. a VM snapshot
+// restore) made the grace subtraction negative, keeping the leak live —
+// skipping hydration and timing out same-name pushes — until wall time
+// caught up with the marker. The observation must clamp the marker to
+// now, restarting the grace at the anomaly's discovery, so the leak
+// still ages out on observed time.
+func TestPushHolds_FutureReapMarkerClampedNotPinned(t *testing.T) {
+	dir := t.TempDir()
+	hold := filepath.Join(dir, "push-future-marker")
+	if err := os.WriteFile(hold, []byte("refs/heads/x\n"), 0o600); err != nil {
+		t.Fatalf("write hold: %v", err)
+	}
+	past := time.Now().Add(-2 * pushHoldTTL)
+	if err := os.Chtimes(hold, past, past); err != nil {
+		t.Fatalf("chtimes hold: %v", err)
+	}
+	reap := hold + pushHoldReapSuffix
+	if err := os.WriteFile(reap, nil, 0o600); err != nil {
+		t.Fatalf("write reap marker: %v", err)
+	}
+	future := time.Now().Add(time.Hour)
+	if err := os.Chtimes(reap, future, future); err != nil {
+		t.Fatalf("chtimes marker: %v", err)
+	}
+	info, err := os.Stat(hold)
+	if err != nil {
+		t.Fatalf("stat hold: %v", err)
+	}
+	// The anomaly observation stays live (a single wall read is never
+	// trusted) but must clamp the marker back to now.
+	if !pushHoldLive(hold, info.ModTime()) {
+		t.Fatal("anomaly observation must keep the hold live")
+	}
+	ri, err := os.Stat(reap)
+	if err != nil {
+		t.Fatalf("stat marker: %v", err)
+	}
+	if ri.ModTime().After(time.Now().Add(time.Minute)) {
+		t.Fatalf("future reap marker was not clamped: %v", ri.ModTime())
+	}
+	// With the marker back on observed time, the untouched leak ages out
+	// after the grace like any other.
+	markerPast := time.Now().Add(-pushHoldTTL/2 - time.Minute)
+	if err := os.Chtimes(reap, markerPast, markerPast); err != nil {
+		t.Fatalf("chtimes marker: %v", err)
+	}
+	if pushHoldLive(hold, info.ModTime()) {
+		t.Fatal("aged leak must expire after the reap grace")
+	}
+}
+
+// TestRunHook_AtomicUpdateDenialReleasesWholeHold (Codex round-27 P2 on
+// #173): under --atomic one hook denial dooms the whole push — git aborts
+// the local ref transaction and never runs post-receive, the primary
+// release — so the denying hook must release the WHOLE hold. The handler
+// fallback fires only after receive-pack drains its report to the client,
+// a write a non-reading client can stall indefinitely while the handler
+// refresher keeps the hold fresh: earlier commands' committed names would
+// block every same-name and D/F-relative push until the client went away.
+// A non-atomic denial keeps releasing only its own ref.
+func TestRunHook_AtomicUpdateDenialReleasesWholeHold(t *testing.T) {
+	sha := strings.Repeat("a", 40)
+	sha2 := strings.Repeat("b", 40)
+	t.Setenv(EnvRepo, "t-atomic-release")
+	t.Setenv(EnvRefsPolicy, `[["refs/heads/b",["no-push"]]]`)
+	seed := func(t *testing.T) string {
+		holdPath := filepath.Join(t.TempDir(), pushHoldDir, "push-atomic")
+		if err := os.MkdirAll(filepath.Dir(holdPath), 0o755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		if err := os.WriteFile(holdPath, []byte("refs/heads/a\nrefs/heads/b\n"), 0o600); err != nil {
+			t.Fatalf("write hold: %v", err)
+		}
+		t.Setenv(EnvPushHold, holdPath)
+		return holdPath
+	}
+
+	t.Setenv(EnvAtomic, "1")
+	hold := seed(t)
+	if err := RunHook(context.Background(), []string{"update", "refs/heads/b", sha, sha2}); err == nil {
+		t.Fatal("no-push policy must deny the update")
+	}
+	if _, err := os.Stat(hold); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("atomic denial must release the whole hold: %v", err)
+	}
+
+	t.Setenv(EnvAtomic, "")
+	hold = seed(t)
+	if err := RunHook(context.Background(), []string{"update", "refs/heads/b", sha, sha2}); err == nil {
+		t.Fatal("no-push policy must deny the update")
+	}
+	b, err := os.ReadFile(hold)
+	if err != nil {
+		t.Fatalf("non-atomic denial must keep the peers' hold: %v", err)
+	}
+	if got := string(b); got != "refs/heads/a\n" {
+		t.Fatalf("non-atomic denial must release only its own ref: %q", got)
+	}
+}
+
+// TestReservePushHolds_PeerScanWorkBounded (Codex round-27 security P2 on
+// #173): sidecar/JIT self-reservations are fresh processes, each
+// streaming every live peer hold — without a push-wide allowance, two
+// overlapping crafted pushes reread repository-scale bytes once per hook
+// for the push's whole duration. The counter sidecar accrues each scan's
+// opened bytes; once over the allowance, later self-reservations are
+// denied retryably BEFORE scanning again, and every release site removes
+// the counter with the hold.
+func TestReservePushHolds_PeerScanWorkBounded(t *testing.T) {
+	repoDir := t.TempDir()
+	dir := filepath.Join(repoDir, pushHoldDir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	var sb strings.Builder
+	for i := 0; i < 100; i++ {
+		fmt.Fprintf(&sb, "refs/heads/peer/%03d\n", i)
+	}
+	peer := filepath.Join(dir, "push-peer")
+	if err := os.WriteFile(peer, []byte(sb.String()), 0o644); err != nil {
+		t.Fatalf("write peer hold: %v", err)
+	}
+	oldMax := maxPushPeerScanBytes
+	maxPushPeerScanBytes = int64(sb.Len()) - 1
+	t.Cleanup(func() { maxPushPeerScanBytes = oldMax })
+
+	hold := filepath.Join(dir, "push-self")
+	// The first self-reservation scans the peer once — the allowed
+	// trailing overshoot — and succeeds.
+	if err := reservePushHolds(context.Background(), hold, []string{"refs/heads/x"}); err != nil {
+		t.Fatalf("first self-reservation: %v", err)
+	}
+	// The accrued counter now denies further scans up front.
+	err := reservePushHolds(context.Background(), hold, []string{"refs/heads/y"})
+	if err == nil || !strings.Contains(err.Error(), "scan allowance") {
+		t.Fatalf("over-allowance self-reservation must be denied, got %v", err)
+	}
+	// The counter is a sidecar: hold readers must not treat it as a hold
+	// file, and releases must remove it with the hold.
+	if !isPushHoldSidecar("push-self" + pushHoldScanSuffix) {
+		t.Fatal("scan-work counter must be classified as a hold sidecar")
+	}
+	if base, ok := pushHoldSidecarBase("push-self" + pushHoldScanSuffix); !ok || base != "push-self" {
+		t.Fatalf("scan-work sidecar base = %q, %v", base, ok)
+	}
+	removePushHoldFiles(hold)
+	if _, statErr := os.Stat(hold + pushHoldScanSuffix); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("release must remove the scan-work counter: %v", statErr)
+	}
+}
+
 // TestPeerHoldCovers_StreamsWithoutParsing (Codex round-25 security P2 on
 // #173): every sidecar/JIT hook self-reservation runs in a fresh process,
 // so its peer-conflict check must stream the peer holds — building the
@@ -1557,7 +1724,7 @@ func TestPeerHoldCovers_StreamsWithoutParsing(t *testing.T) {
 		{"refs/heads/b/0001", false},    // sibling prefix, no '/' boundary
 		{"refs/heads/zzz", false},       // disjoint
 	} {
-		got, err := peerHoldCovers(dir, "", tc.name)
+		got, _, err := peerHoldCovers(dir, "", tc.name)
 		if err != nil {
 			t.Fatalf("peerHoldCovers(%s): %v", tc.name, err)
 		}
@@ -1565,16 +1732,17 @@ func TestPeerHoldCovers_StreamsWithoutParsing(t *testing.T) {
 			t.Errorf("peerHoldCovers(%s) = %v, want %v", tc.name, got, tc.want)
 		}
 	}
-	// The exceptPath (our own hold) never conflicts with itself.
-	if got, err := peerHoldCovers(dir, peer, "refs/heads/b/000123"); err != nil || got {
-		t.Fatalf("except-path hold treated as a peer: got=%v err=%v", got, err)
+	// The exceptPath (our own hold) never conflicts with itself — and an
+	// excluded self costs no scan work.
+	if got, n, err := peerHoldCovers(dir, peer, "refs/heads/b/000123"); err != nil || got || n != 0 {
+		t.Fatalf("except-path hold treated as a peer: got=%v scanned=%d err=%v", got, n, err)
 	}
 	// Allocation bound: scanning may not scale with the peer's NAME
 	// count. TotalAlloc is monotonic, so the delta is exact.
 	var before, after runtime.MemStats
 	runtime.ReadMemStats(&before)
 	for i := 0; i < 10; i++ {
-		if _, err := peerHoldCovers(dir, "", "refs/heads/zzz"); err != nil {
+		if _, _, err := peerHoldCovers(dir, "", "refs/heads/zzz"); err != nil {
 			t.Fatalf("peerHoldCovers: %v", err)
 		}
 	}

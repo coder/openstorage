@@ -1191,6 +1191,9 @@ const (
 	// verdicts dropped at the cap re-charged exactly the pushes big
 	// enough to need them). Hold READERS must skip it.
 	pushHoldVerifiedSuffix = ".verified"
+	// pushHoldScanSuffix names the sidecar accruing the push's cumulative
+	// peer-hold scan bytes (see maxPushPeerScanBytes).
+	pushHoldScanSuffix = ".scanwork"
 	// pushHoldReapSuffix marks a hold file OBSERVED past its wall-clock
 	// TTL: expiry needs a second, later observation (see pushHoldLive),
 	// and the marker's own mtime is the clock that separates the two.
@@ -1202,7 +1205,22 @@ const (
 func isPushHoldSidecar(name string) bool {
 	return strings.HasSuffix(name, pushHoldUnreservedSuffix) ||
 		strings.HasSuffix(name, pushHoldVerifiedSuffix) ||
+		strings.HasSuffix(name, pushHoldScanSuffix) ||
 		strings.HasSuffix(name, pushHoldReapSuffix)
+}
+
+// removePushHoldFiles releases a push's hold file together with every
+// sidecar artifact — the ONE list every release site shares (post-receive,
+// the handler fallback, the mint sweep's expired branch, and an atomic
+// denial), so a newly added sidecar cannot silently leak from one of them.
+// Best-effort like every caller: a failed removal leaves the TTL machinery
+// the bound.
+func removePushHoldFiles(holdPath string) {
+	_ = os.Remove(holdPath)
+	_ = os.RemoveAll(holdPath + pushHoldUnreservedSuffix)
+	_ = os.RemoveAll(holdPath + pushHoldVerifiedSuffix)
+	_ = os.Remove(holdPath + pushHoldScanSuffix)
+	_ = os.Remove(holdPath + pushHoldReapSuffix)
 }
 
 // pushHoldLive reports whether one hold-file observation counts as live,
@@ -1242,6 +1260,19 @@ func pushHoldLive(path string, mtime time.Time) bool {
 		if f, cerr := os.OpenFile(reap, os.O_CREATE|os.O_WRONLY, 0o600); cerr == nil {
 			_ = f.Close()
 		}
+		_ = os.Chtimes(reap, now, now)
+		return true
+	}
+	if ri.ModTime().After(now) {
+		// Future-dated marker (the wall clock stepped backward after the
+		// marker was armed — e.g. a VM snapshot restore): clamp it to now
+		// and keep the hold live, the exact mirror of the hold-file clamp
+		// above (Codex round-27 P2 on #173: the subtraction below goes
+		// NEGATIVE for a future marker, so a crash leak would stay
+		// "within grace" — live, skipping hydration, timing out same-name
+		// pushes — until wall time caught up with the marker). The clamp
+		// restarts the grace at the anomaly's discovery, so the leak
+		// still ages out within TTL/2 of this observation.
 		_ = os.Chtimes(reap, now, now)
 		return true
 	}
@@ -1398,10 +1429,7 @@ func sweepExpiredPushHolds(dir string) {
 			// forward clock step, round-25), and take its sidecars
 			// with it so nothing orphans.
 			if !pushHoldLive(path, info.ModTime()) {
-				_ = os.Remove(path)
-				_ = os.RemoveAll(path + pushHoldUnreservedSuffix)
-				_ = os.RemoveAll(path + pushHoldVerifiedSuffix)
-				_ = os.Remove(path + pushHoldReapSuffix)
+				removePushHoldFiles(path)
 			}
 			continue
 		}
@@ -1430,7 +1458,7 @@ func sweepExpiredPushHolds(dir string) {
 
 // pushHoldSidecarBase maps a sidecar entry name to its hold file's name.
 func pushHoldSidecarBase(name string) (string, bool) {
-	for _, suffix := range []string{pushHoldUnreservedSuffix, pushHoldVerifiedSuffix, pushHoldReapSuffix} {
+	for _, suffix := range []string{pushHoldUnreservedSuffix, pushHoldVerifiedSuffix, pushHoldScanSuffix, pushHoldReapSuffix} {
 		if base, ok := strings.CutSuffix(name, suffix); ok {
 			return base, true
 		}
@@ -1476,6 +1504,7 @@ func touchPushHold(holdPath string) {
 	// is a no-op ENOENT when no sidecar exists).
 	_ = os.Chtimes(holdPath+pushHoldUnreservedSuffix, now, now)
 	_ = os.Chtimes(holdPath+pushHoldVerifiedSuffix, now, now)
+	_ = os.Chtimes(holdPath+pushHoldScanSuffix, now, now)
 }
 
 // startPushHoldRefresh keeps holdPath fresh on a TTL/4 cadence until the
@@ -1714,15 +1743,19 @@ func holdLineCovers(held []byte, name string) bool {
 // under the reservation lock. The scan allocates one fixed scanner
 // buffer, short-circuits on the first conflict, and costs one buffered
 // read of each live peer file. Fail CLOSED on read trouble, exactly like
-// the set-based path.
-func peerHoldCovers(dir, exceptPath, name string) (bool, error) {
+// the set-based path. The second return is the scan's work in bytes —
+// the size of every peer file it opened (a deliberate overcount on a
+// short-circuit) — which the caller charges against the push's
+// maxPushPeerScanBytes allowance.
+func peerHoldCovers(dir, exceptPath, name string) (bool, int64, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return false, nil
+			return false, 0, nil
 		}
-		return false, err
+		return false, 0, err
 	}
+	var scanned int64
 	for _, e := range entries {
 		if isPushHoldSidecar(e.Name()) || e.IsDir() {
 			continue
@@ -1736,7 +1769,7 @@ func peerHoldCovers(dir, exceptPath, name string) (bool, error) {
 			if errors.Is(err, os.ErrNotExist) {
 				continue // released between the listing and the stat
 			}
-			return false, err
+			return false, scanned, err
 		}
 		if !pushHoldLive(path, info.ModTime()) {
 			continue
@@ -1746,22 +1779,62 @@ func peerHoldCovers(dir, exceptPath, name string) (bool, error) {
 			if errors.Is(err, os.ErrNotExist) {
 				continue
 			}
-			return false, err
+			return false, scanned, err
 		}
+		scanned += info.Size()
 		sc := bufio.NewScanner(f)
 		for sc.Scan() {
 			if holdLineCovers(sc.Bytes(), name) {
 				_ = f.Close()
-				return true, nil
+				return true, scanned, nil
 			}
 		}
 		err = sc.Err()
 		_ = f.Close()
 		if err != nil {
-			return false, err
+			return false, scanned, err
 		}
 	}
-	return false, nil
+	return false, scanned, nil
+}
+
+// maxPushPeerScanBytes bounds ONE push's aggregate peer-hold scan work
+// (Codex round-27 security P2 on #173): each sidecar or JIT update hook is
+// a fresh process whose single-name self-reservation streams every live
+// peer hold, so two overlapping crafted pushes — thousands of no-force
+// updates racing a 100k-name reservation — could otherwise reread
+// repository-scale bytes once per hook for the push's whole duration,
+// unbounded. Every scan's opened bytes accrue in the push's counter
+// sidecar; once the total exceeds this allowance the push's remaining
+// self-reserving hooks are denied with a retryable message BEFORE
+// scanning again, so aggregate work is capped at one allowance plus one
+// trailing scan. Generous by design: a full 1,024-command sidecar each
+// streaming a 100k-name (≈6.4MB) peer set totals ≈6.6GB and stays
+// admitted, while the round-27 attack figure (≈200GB) dies two orders of
+// magnitude earlier. A var so tests can shrink it.
+var maxPushPeerScanBytes = int64(8) << 30
+
+// readPushScanWork and writePushScanWork maintain the counter. Both run
+// only under the reservation flock, so plain read/overwrite is race-free;
+// absent means zero. Callers fail CLOSED on counter trouble — a bound
+// that cannot be maintained is not a bound.
+func readPushScanWork(holdPath string) (int64, error) {
+	b, err := os.ReadFile(holdPath + pushHoldScanSuffix)
+	if errors.Is(err, os.ErrNotExist) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(string(b)), 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("malformed scan-work counter: %w", err)
+	}
+	return n, nil
+}
+
+func writePushScanWork(holdPath string, n int64) error {
+	return os.WriteFile(holdPath+pushHoldScanSuffix, []byte(strconv.FormatInt(n, 10)), 0o600)
 }
 
 // pushHoldWaitMax bounds reservePushHolds' wait for D/F-conflicting holds
@@ -1829,13 +1902,32 @@ func reservePushHolds(ctx context.Context, holdPath string, names []string) erro
 			// self-reservation — a fresh process each, so the parse
 			// cache below cannot amortize for it (Codex round-25
 			// security P2): stream the peers instead of building the
-			// combined sorted set.
-			covered, err := peerHoldCovers(dir, holdPath, names[0])
+			// combined sorted set. The push-wide scan-work allowance
+			// (Codex round-27 security P2) bounds what those fresh
+			// processes can spend in aggregate: over-allowance hooks are
+			// denied before scanning again, and conflict-poll rescans
+			// charge the same counter.
+			used, err := readPushScanWork(holdPath)
+			if err != nil {
+				unlock()
+				return fmt.Errorf("push hold: scan-work counter: %w", err)
+			}
+			if used > maxPushPeerScanBytes {
+				unlock()
+				return fmt.Errorf("push hold: push exceeded its peer-hold scan allowance against unusually large concurrent push holds; retry shortly or split the push")
+			}
+			covered, n, err := peerHoldCovers(dir, holdPath, names[0])
 			if err != nil {
 				// Fail CLOSED: an unreadable peer hold is not proof of
 				// no conflict (Codex round-3 P1 on #173).
 				unlock()
 				return fmt.Errorf("push hold: reading peer holds: %w", err)
+			}
+			if n > 0 {
+				if err := writePushScanWork(holdPath, used+n); err != nil {
+					unlock()
+					return fmt.Errorf("push hold: scan-work counter: %w", err)
+				}
 			}
 			if covered {
 				conflict = names[0]
