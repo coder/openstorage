@@ -18,8 +18,10 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/coder/code-storage/internal/api"
@@ -78,7 +80,25 @@ func fatalf(format string, args ...any) {
 // store never hangs an otherwise graceful shutdown.
 const leaseReleaseTimeout = 5 * time.Second
 
+// shutdownDrainTimeout bounds the graceful HTTP drain after a termination
+// signal: long enough for ordinary requests to finish, short enough that a
+// long-running push cannot hold the process past a typical supervisor kill
+// grace window. Cutting a drain short is safe by construction — pack data
+// publishes before any ref CAS, so an interrupted push loses the client's
+// attempt, never data (docs/how-to/deploy-production.md).
+const shutdownDrainTimeout = 10 * time.Second
+
 func cmdServe(ctx context.Context, args []string) error {
+	// A termination signal cancels the serve context (issue #174): the
+	// select at the bottom then drains HTTP and RETURNS, letting every
+	// deferred cleanup run — most visibly the s3wal instance-lease
+	// Release, without which each restart makes the successor wait out
+	// the full lease TTL. Portable: syscall.SIGTERM is defined on every
+	// platform Go supports (a no-op signal value on Windows, where
+	// os.Interrupt still covers Ctrl+C).
+	ctx, stopSignals := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
+	defer stopSignals()
+
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	listen := fs.String("listen", "", "listen address (falls back to --addr, then $"+envListen+", then "+defaultListen+")")
 	addr := fs.String("addr", "", "spike-compat alias for --listen")
@@ -273,7 +293,31 @@ func cmdServe(ctx context.Context, args []string) error {
 	})
 
 	fmt.Printf("listening on %s\n", ln.Addr())
-	return http.Serve(ln, mux)
+	// Serve on an http.Server rather than bare http.Serve: only Shutdown
+	// gives the termination signal a drain seam. In-flight requests keep
+	// their own request contexts (and the stores hold no long-lived
+	// context), so work admitted before the signal completes normally
+	// within the bounded drain.
+	httpSrv := &http.Server{Handler: mux}
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- httpSrv.Serve(ln) }()
+	select {
+	case err := <-serveErr:
+		return err
+	case <-ctx.Done():
+		// Restore default signal disposition first: a second signal
+		// during the drain kills immediately (operator escape hatch).
+		stopSignals()
+		fmt.Fprintln(os.Stderr, "codestorage serve: termination signal received; draining")
+		dctx, cancel := context.WithTimeout(context.Background(), shutdownDrainTimeout)
+		defer cancel()
+		if err := httpSrv.Shutdown(dctx); err != nil {
+			fmt.Fprintf(os.Stderr, "codestorage serve: drain incomplete after %v: %v\n", shutdownDrainTimeout, err)
+		}
+		// Orderly signal shutdown exits 0; the deferred teardown above
+		// (workers, stores, instance lease) runs on this return.
+		return nil
+	}
 }
 
 // selfLoopbackURL derives the sync worker's push target from this process's
