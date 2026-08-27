@@ -25,7 +25,7 @@ func mintHold(t *testing.T, repoPath string, names ...string) string {
 	if err != nil {
 		t.Fatalf("mintPushHold: %v", err)
 	}
-	if err := reservePushHolds(holdPath, names); err != nil {
+	if err := reservePushHolds(context.Background(), holdPath, names); err != nil {
 		t.Fatalf("reservePushHolds(%v): %v", names, err)
 	}
 	return holdPath
@@ -206,14 +206,14 @@ func TestMintPushHold_SweepsExpiredLeaks(t *testing.T) {
 // line-splitting ref names must fail the push rather than mint a broken
 // hold.
 func TestReservePushHolds_RejectsMalformedInput(t *testing.T) {
-	if err := reservePushHolds("relative/hold", []string{"refs/heads/x"}); err == nil {
+	if err := reservePushHolds(context.Background(), "relative/hold", []string{"refs/heads/x"}); err == nil {
 		t.Fatal("relative hold path accepted")
 	}
 	abs := filepath.Join(t.TempDir(), "holds", "hold")
-	if err := reservePushHolds(abs, []string{"refs/heads/a\nrefs/heads/b"}); err == nil {
+	if err := reservePushHolds(context.Background(), abs, []string{"refs/heads/a\nrefs/heads/b"}); err == nil {
 		t.Fatal("line-splitting ref name accepted")
 	}
-	if err := reservePushHolds(abs, []string{""}); err == nil {
+	if err := reservePushHolds(context.Background(), abs, []string{""}); err == nil {
 		t.Fatal("empty ref name accepted")
 	}
 }
@@ -235,13 +235,13 @@ func TestReservePushHolds_DeniesLiveConflictFailsClosed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("mintPushHold: %v", err)
 	}
-	if err := reservePushHolds(own, []string{"refs/heads/a/b"}); err == nil {
+	if err := reservePushHolds(context.Background(), own, []string{"refs/heads/a/b"}); err == nil {
 		t.Fatal("reservation past a live D/F-conflicting hold accepted")
 	} else if !strings.Contains(err.Error(), "conflicting") {
 		t.Fatalf("denial reason = %v, want a conflict message", err)
 	}
 	// Same-name and unrelated refs are NOT conflicts.
-	if err := reservePushHolds(own, []string{"refs/heads/a", "refs/heads/z"}); err != nil {
+	if err := reservePushHolds(context.Background(), own, []string{"refs/heads/a", "refs/heads/z"}); err != nil {
 		t.Fatalf("non-conflicting reservation denied: %v", err)
 	}
 	// An expired conflicting hold is a crash leak, not a conflict. (own
@@ -256,7 +256,7 @@ func TestReservePushHolds_DeniesLiveConflictFailsClosed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("mintPushHold: %v", err)
 	}
-	if err := reservePushHolds(own2, []string{"refs/heads/a/c"}); err != nil {
+	if err := reservePushHolds(context.Background(), own2, []string{"refs/heads/a/c"}); err != nil {
 		t.Fatalf("reservation blocked by an expired hold: %v", err)
 	}
 }
@@ -277,7 +277,7 @@ func TestReservePushHolds_FailsClosedOnUnreadableHolds(t *testing.T) {
 	t.Cleanup(func() { _ = os.Chmod(holdsDir, 0o755) })
 
 	own := filepath.Join(holdsDir, "push-own")
-	if err := reservePushHolds(own, []string{"refs/heads/x"}); err == nil {
+	if err := reservePushHolds(context.Background(), own, []string{"refs/heads/x"}); err == nil {
 		t.Fatal("reservation succeeded over an unreadable hold directory")
 	}
 }
@@ -311,6 +311,39 @@ func TestIntraPushDFCheck(t *testing.T) {
 		if (err != nil) != tc.wantErr {
 			t.Errorf("%s: err = %v, wantErr %v", tc.name, err, tc.wantErr)
 		}
+	}
+}
+
+// TestReservePushHolds_LockAcquisitionBounded: a reserver stalled while
+// holding the reserve lock must not hang pushes queued behind it — the
+// wait deadline covers lock acquisition too, yielding the retryable
+// denial.
+func TestReservePushHolds_LockAcquisitionBounded(t *testing.T) {
+	dir := t.TempDir()
+	holdsDir := filepath.Join(dir, pushHoldDir)
+	if err := os.MkdirAll(holdsDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	unlock, err := flockExclusive(holdsDir + ".reserve.lock")
+	if err != nil {
+		t.Fatalf("flockExclusive: %v", err)
+	}
+	defer unlock()
+
+	prev := pushHoldWaitMax
+	pushHoldWaitMax = 150 * time.Millisecond
+	defer func() { pushHoldWaitMax = prev }()
+
+	start := time.Now()
+	err = reservePushHolds(context.Background(), filepath.Join(holdsDir, "push-own"), []string{"refs/heads/x"})
+	if err == nil {
+		t.Fatal("reservation succeeded while the reserve lock was held elsewhere")
+	}
+	if !strings.Contains(err.Error(), "retry shortly") {
+		t.Fatalf("denial = %v, want a retryable timeout", err)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("reservation blocked %v, want the ~150ms deadline", elapsed)
 	}
 }
 

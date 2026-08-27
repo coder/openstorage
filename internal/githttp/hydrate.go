@@ -1359,7 +1359,7 @@ var pushHoldWaitMax = 10 * time.Second
 // CLOSED (round-2 P1: proceeding would commit an authority update whose
 // local ref transaction is doomed while the conflicting neighbor
 // survives) — a clean, pre-publication, retryable denial.
-func reservePushHolds(holdPath string, names []string) error {
+func reservePushHolds(ctx context.Context, holdPath string, names []string) error {
 	if !filepath.IsAbs(holdPath) {
 		return fmt.Errorf("push hold path %q is not absolute", holdPath)
 	}
@@ -1378,10 +1378,21 @@ func reservePushHolds(holdPath string, names []string) error {
 	// readers treat every directory entry as a hold file, and the mint
 	// sweep may unlink stale entries — an unlinked lock inode would let
 	// two reservers "hold" different inodes of the same path.
+	//
+	// One deadline covers BOTH the lock acquisition and the conflict
+	// polling (Codex round-4 P2 on #173): a reserver stalled while
+	// holding the lock must produce the documented retryable denial for
+	// the pushes queued behind it, not an unbounded hang.
 	lockPath := dir + ".reserve.lock"
-	for deadline := time.Now().Add(pushHoldWaitMax); ; {
-		unlock, err := flockExclusive(lockPath)
+	deadline := time.Now().Add(pushHoldWaitMax)
+	ctx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
+	for {
+		unlock, err := flockExclusiveCtx(ctx, lockPath)
 		if err != nil {
+			if ctx.Err() != nil {
+				return fmt.Errorf("timed out waiting for a concurrent push's hold reservation; retry shortly: %w", err)
+			}
 			return err
 		}
 		peers, err := readPushHolds(dir, holdPath)
@@ -1404,10 +1415,13 @@ func reservePushHolds(holdPath string, names []string) error {
 			return err
 		}
 		unlock()
-		if time.Now().After(deadline) {
+		if time.Now().After(deadline) || ctx.Err() != nil {
 			return fmt.Errorf("a concurrent push holds a ref conflicting with %s (directory/file); retry shortly", conflict)
 		}
-		time.Sleep(25 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+		case <-time.After(25 * time.Millisecond):
+		}
 	}
 }
 

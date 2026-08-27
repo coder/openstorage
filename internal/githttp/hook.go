@@ -176,49 +176,60 @@ func preReceive(ctx context.Context) error {
 	}
 	atomicPush := os.Getenv(EnvAtomic) == "1"
 
+	// ONE policy evaluation per command for all of pre-receive (Codex
+	// round-4 P2 on #173): enforceRefPolicy charges the push's shared
+	// verify-sig state and walk budget per evaluation, so the reservation
+	// filter, the atomic gate, and the publication gate below must share
+	// verdicts instead of re-evaluating. The update hook stays the per-ref
+	// policy authority and re-evaluates at commit time, exactly as before
+	// (the documented "verified twice" redundancy).
+	verdicts := make([]error, len(commands))
+	for i, c := range commands {
+		verdicts[i] = enforceRefPolicy(ctx, repo, c.ref, c.old, c.new)
+	}
+	// Atomic pushes fail whole on any denial (issue #28 semantics), and
+	// doing so BEFORE the hold reservation means a restricted token's
+	// denied command can never hold a namespace it cannot write — atomic
+	// or not (Codex round-4 security P2 on #173).
+	if atomicPush {
+		for _, v := range verdicts {
+			if v != nil {
+				return atomicDenied(v)
+			}
+		}
+	}
+	// The push's OWN command set must be representable in one git ref
+	// store (Codex round-3 P1 on #173) — checked on the RAW set: policy
+	// verdicts here are advisory, and the update hook's authority-side
+	// D/F probe (denyAuthorityDFConflict) is the guard that survives
+	// verdict divergence, e.g. a denied deletion whose ref then blocks
+	// its D/F child at commit time (Codex round-4 P1).
+	if err := intraPushDFCheck(commands, atomicPush); err != nil {
+		return err
+	}
 	// Push holds (issue #170): reserve the refs this push may commit
 	// BEFORE any publication or update-hook CAS, in one atomic
 	// check+append per push (reservePushHolds) — concurrent full syncs
 	// skip held refs so they cannot race receive-pack's own local ref
 	// updates, and a D/F-conflicting concurrent push is briefly waited out
 	// or cleanly denied HERE, pre-publication, instead of committing an
-	// authority update whose local ref transaction is doomed. The server
-	// removes the hold file when receive-pack exits; the refresher keeps
-	// it fresh through the unbounded publication work below, and each
-	// update hook chains its own refresher for its runtime.
+	// authority update whose local ref transaction is doomed. Only
+	// policy-allowed commands are reserved (Codex round-3 security P2): a
+	// denied command never commits, and reserving it would let a
+	// restricted token hold namespaces it cannot write for the push
+	// window. For atomic pushes every verdict is nil by this point, so
+	// the filter naturally reserves the full set. The server removes the
+	// hold file when receive-pack exits; the refresher keeps it fresh
+	// through the unbounded publication work below, and each update hook
+	// chains its own refresher for its runtime.
 	if holdPath := os.Getenv(EnvPushHold); holdPath != "" {
-		// Reserve only refs that can actually reach an update-hook CAS
-		// (Codex round-3 security P2 on #173): a policy-denied command
-		// never commits, and reserving it would let a restricted token
-		// hold namespaces it cannot write — e.g. a tags-only token
-		// covering all of refs/heads/* for the push window and denying
-		// other pushers' reservations. Atomic pushes skip the filter: any
-		// denial fails the whole push in the gates below, so the full set
-		// is the effective set. Residual: the update hook stays the
-		// per-ref policy authority, so a command denied here by a
-		// transient evaluation error yet allowed by its hook commits
-		// unheld — degrading that one ref to the pre-hold
-		// spurious-rejection window, never to divergence-by-design.
-		allowed := commands
-		if !atomicPush {
-			allowed = make([]refCommand, 0, len(commands))
-			for _, c := range commands {
-				if enforceRefPolicy(ctx, repo, c.ref, c.old, c.new) == nil {
-					allowed = append(allowed, c)
-				}
+		names := make([]string, 0, len(commands))
+		for i, c := range commands {
+			if verdicts[i] == nil {
+				names = append(names, c.ref)
 			}
 		}
-		// The push's OWN command set must land in one git ref store
-		// before any exact-name authority CAS may run (Codex round-3 P1
-		// on #173).
-		if err := intraPushDFCheck(allowed, atomicPush); err != nil {
-			return err
-		}
-		names := make([]string, 0, len(allowed))
-		for _, c := range allowed {
-			names = append(names, c.ref)
-		}
-		if err := reservePushHolds(holdPath, names); err != nil {
+		if err := reservePushHolds(ctx, holdPath, names); err != nil {
 			return fmt.Errorf("pre-receive: reserve push holds: %w", err)
 		}
 		defer startPushHoldRefresh(holdPath)()
@@ -245,19 +256,9 @@ func preReceive(ctx context.Context) error {
 				return fmt.Errorf("pre-receive: no quarantined pack and unknown object %s for %s", c.new, c.ref)
 			}
 		}
-		// No pack means nothing can leak, but an atomic push still
-		// evaluates policy as a unit: git aborts every ref on the first
-		// update-hook denial anyway, and denying here keeps an allowed
-		// command's already-committed PG CAS (e.g. a delete that ran
-		// before the denied one) from durably surviving a push git
-		// reports as wholly failed — the issue #28 durable-CAS twist.
-		if atomicPush {
-			for _, c := range commands {
-				if err := enforceRefPolicy(ctx, repo, c.ref, c.old, c.new); err != nil {
-					return atomicDenied(err)
-				}
-			}
-		}
+		// No pack means nothing can leak. The atomic whole-push policy
+		// denial (issue #28's durable-CAS twist) already happened above,
+		// before the hold reservation, from the shared verdicts.
 		return nil
 	}
 
@@ -269,7 +270,7 @@ func preReceive(ctx context.Context) error {
 	// the pack could only become a registered, unreachable,
 	// quota-consuming blob, so the whole push is refused before any
 	// upload. The update hook stays the per-ref policy authority.
-	if err := preReceivePolicyGate(ctx, repo, commands, atomicPush); err != nil {
+	if err := preReceivePolicyGate(commands, verdicts, atomicPush); err != nil {
 		return err
 	}
 
@@ -653,13 +654,19 @@ func intraPushDFCheck(commands []refCommand, atomicPush bool) error {
 //     branch). The quota bounds per-repo growth; it cannot police
 //     intra-repo goodwill among authorized writers. Retained-byte
 //     reclamation is issue #31's accounting work.
-func preReceivePolicyGate(ctx context.Context, repo string, commands []refCommand, atomicPush bool) error {
+func preReceivePolicyGate(commands []refCommand, verdicts []error, atomicPush bool) error {
 	assertf(len(commands) > 0, "preReceivePolicyGate: no commands")
+	assertf(len(verdicts) == len(commands), "preReceivePolicyGate: %d verdicts for %d commands", len(verdicts), len(commands))
 	var firstErr error
 	needsPack := false
-	for _, c := range commands {
-		if err := enforceRefPolicy(ctx, repo, c.ref, c.old, c.new); err != nil {
+	for i, c := range commands {
+		// Verdicts are the caller's single shared policy evaluation
+		// (Codex round-4 P2 on #173: re-evaluating here double-charged
+		// the push's verify-sig walk budget).
+		if err := verdicts[i]; err != nil {
 			if atomicPush {
+				// Defensive: preReceive already denied atomic pushes
+				// carrying any denial before reserving holds.
 				return atomicDenied(err)
 			}
 			if firstErr == nil {
@@ -753,6 +760,26 @@ func updateHook(ctx context.Context, args []string) error {
 		return err
 	}
 	defer st.Close()
+	// Authority-side directory/file guard (Codex round-4 P1 on #173, and
+	// the pre-existing divergence class beneath it): the CAS below is
+	// keyed by the exact ref name, so nothing in the store itself stops
+	// refs/heads/a and refs/heads/a/b from coexisting in the authority —
+	// a state no git ref store can materialize, which wedges every future
+	// hydration of the repo. Pre-receive's checks are advisory (policy
+	// verdicts there cannot perfectly predict this hook's), so the commit
+	// point itself verifies against the AUTHORITY's current refs: a
+	// non-deletion whose strict D/F relative exists is declined per-ref,
+	// exactly like a policy denial. Probed on the raw store: the test
+	// fault decorators below must keep scoping to the CAS itself. TOCTOU
+	// residual: two conflicting creations racing on different nodes can
+	// still cross inside the probe-to-CAS window (same-node pushes are
+	// serialized by the hold reservation); closing that needs store-level
+	// transactional enforcement and is tracked outside this fix.
+	if new != ref.ZeroSHA {
+		if err := denyAuthorityDFConflict(ctx, st, repo, refName); err != nil {
+			return err
+		}
+	}
 	var inner ref.RefStore = st
 	if testMode() {
 		inner = injectCASDrop(inner)
@@ -793,6 +820,35 @@ func pauseAtUpdateBarrier(p string) {
 		}
 		time.Sleep(25 * time.Millisecond)
 	}
+}
+
+// denyAuthorityDFConflict declines a non-deletion update of name when the
+// authority currently contains a strict directory/file relative of it — a
+// strict ancestor (one GetRef point-read per path segment) or any
+// descendant (one single-row ListRefsAfter page at name+"/", the smallest
+// key any descendant can exceed). Store errors fail CLOSED: an unprobeable
+// authority is not proof of representability, and the denial is retryable.
+func denyAuthorityDFConflict(ctx context.Context, st ref.RefStore, repo, name string) error {
+	for i := 0; i < len(name); i++ {
+		if name[i] != '/' {
+			continue
+		}
+		anc := name[:i]
+		switch _, err := st.GetRef(ctx, repo, anc); {
+		case err == nil:
+			return fmt.Errorf("update: %s conflicts with existing ref %s (directory/file); delete %s first", name, anc, anc)
+		case !errors.Is(err, ref.ErrNotFound):
+			return fmt.Errorf("update: directory/file probe for %s: %w", name, err)
+		}
+	}
+	page, err := st.ListRefsAfter(ctx, repo, name+"/", 1)
+	if err != nil {
+		return fmt.Errorf("update: directory/file probe for %s: %w", name, err)
+	}
+	if len(page) > 0 && strings.HasPrefix(page[0].Name, name+"/") {
+		return fmt.Errorf("update: %s conflicts with existing ref %s (directory/file); delete %s first", name, page[0].Name, page[0].Name)
+	}
+	return nil
 }
 
 // enforceSyncClaimFence refuses a loopback sync push whose run no longer

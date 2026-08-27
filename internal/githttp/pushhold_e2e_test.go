@@ -144,3 +144,70 @@ func TestPush_DFCreateWaitsForHeldNeighborDeletion(t *testing.T) {
 		t.Fatalf("authority refs/heads/a/b = %q, want %q", refs["refs/heads/a/b"], head)
 	}
 }
+
+// TestPush_DFChildOfExistingRefCleanlyDeclined (Codex round-4 P1 family):
+// the authority CAS is name-keyed, so without the update hook's
+// authority-side D/F probe a push creating refs/heads/a/b while
+// refs/heads/a exists commits a/b into the authority even though no git
+// ref store can hold both — permanently wedging every future hydration of
+// the repo. The hook must decline the update per-ref BEFORE the CAS,
+// keeping the authority representable and the repo serving.
+func TestPush_DFChildOfExistingRefCleanlyDeclined(t *testing.T) {
+	repo := registerRepo(t, "t-df-existing")
+	work := initWorkRepo(t)
+	token := mintTestToken(t, repo, "git:read,git:write", "")
+	mustGit(t, work, "push", remoteURL(nodeA, repo, token), "HEAD:refs/heads/main", "HEAD:refs/heads/a")
+
+	out, err := tryGit(work, "push", remoteURL(nodeA, repo, token), "HEAD:refs/heads/a/b")
+	if err == nil {
+		t.Fatalf("D/F-conflicting creation must be rejected:\n%s", out)
+	}
+	t.Logf("D/F-conflicting push (expected clean decline):\n%s", out)
+	if !strings.Contains(out, "directory/file") {
+		t.Fatalf("rejection is not the hook's clean D/F decline:\n%s", out)
+	}
+	refs := pgRefs(t, repo)
+	if _, ok := refs["refs/heads/a/b"]; ok {
+		t.Fatalf("authority accepted an unrepresentable D/F pair: %v", refs)
+	}
+	// The repo still serves: no committed-but-unmaterializable ref is
+	// wedging hydration.
+	mustGit(t, "", "ls-remote", remoteURL(nodeA, repo, token))
+}
+
+// TestPush_DeniedDeletionSurvivorBlocksDFChild (Codex round-4 P1, exact
+// scenario): one non-atomic push carries a policy-DENIED deletion of
+// refs/heads/a plus an allowed creation of refs/heads/a/b. The denied
+// deletion means `a` survives, so the update hook's authority probe must
+// decline a/b at commit time — pre-receive verdicts are advisory and must
+// not be trusted to predict survivors.
+func TestPush_DeniedDeletionSurvivorBlocksDFChild(t *testing.T) {
+	repo := registerRepo(t, "t-df-denied-survivor")
+	work := initWorkRepo(t)
+	full := mintTestToken(t, repo, "git:read,git:write", "")
+	mustGit(t, work, "push", remoteURL(nodeA, repo, full), "HEAD:refs/heads/main", "HEAD:refs/heads/a")
+
+	// A fresh commit so the allowed a/b creation genuinely needs its pack
+	// (otherwise the publication gate already refuses the mixed push
+	// before any hook runs — a valid but different denial).
+	writeFile(t, work, "b.txt", "two\n")
+	mustGit(t, work, "add", ".")
+	mustGit(t, work, "commit", "-m", "two")
+
+	// no-push on exactly refs/heads/a denies its deletion; everything
+	// else is allowed by the catch-all.
+	restricted := mintTestToken(t, repo, "git:read,git:write", `[["refs/heads/a",["no-push"]],["*",[]]]`)
+	out, err := tryGit(work, "push", remoteURL(nodeA, repo, restricted), ":refs/heads/a", "HEAD:refs/heads/a/b")
+	if err == nil {
+		t.Fatalf("push with a denied-survivor D/F conflict must be rejected:\n%s", out)
+	}
+	t.Logf("denied-survivor push (expected per-ref declines):\n%s", out)
+	refs := pgRefs(t, repo)
+	if _, ok := refs["refs/heads/a"]; !ok {
+		t.Fatalf("policy-denied deletion still removed refs/heads/a: %v", refs)
+	}
+	if _, ok := refs["refs/heads/a/b"]; ok {
+		t.Fatalf("authority accepted a/b although its denied-survivor parent remains: %v", refs)
+	}
+	mustGit(t, "", "ls-remote", remoteURL(nodeA, repo, full))
+}
