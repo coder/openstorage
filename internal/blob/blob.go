@@ -668,6 +668,12 @@ type S3 struct {
 	bucket *gcblob.Bucket
 	client *s3.Client
 	name   string
+	// region is the client's resolved AWS region (never empty; OpenS3
+	// defaults it to us-east-1). EnsureBucket needs it: CreateBucket
+	// against a regional endpoint outside us-east-1 must carry the
+	// region as its LocationConstraint or real S3 rejects the request
+	// with 400 IllegalLocationConstraintException.
+	region string
 	// expectedOwner is the optional 12-digit AWS account ID every S3
 	// request asserts as the bucket owner (issue #58). Empty = disabled.
 	expectedOwner string
@@ -789,7 +795,7 @@ func OpenS3(ctx context.Context, blobURL string) (*S3, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open bucket %q: %w", bucketName, err)
 	}
-	return &S3{bucket: bucket, client: client, name: bucketName, expectedOwner: expectedOwner}, nil
+	return &S3{bucket: bucket, client: client, name: bucketName, region: region, expectedOwner: expectedOwner}, nil
 }
 
 func (b *S3) Close() error { return b.bucket.Close() }
@@ -813,18 +819,33 @@ type bucketLifecycleClient interface {
 // credential/account drift fail boot instead of 403ing data operations.
 func (b *S3) EnsureBucket(ctx context.Context) error {
 	assertf(b.client != nil, "EnsureBucket: S3 opened without a client")
-	return ensureBucket(ctx, b.client, b.name, b.expectedOwner)
+	return ensureBucket(ctx, b.client, b.name, b.region, b.expectedOwner)
 }
 
-func ensureBucket(ctx context.Context, client bucketLifecycleClient, name, expectedOwner string) error {
+func ensureBucket(ctx context.Context, client bucketLifecycleClient, name, region, expectedOwner string) error {
 	assertf(name != "", "ensureBucket: empty bucket name")
+	assertf(region != "", "ensureBucket: empty region (OpenS3 defaults it)")
 	// The probe's HeadBucket carries x-amz-expected-bucket-owner via the
 	// client middleware whenever an owner is configured.
 	probe := func() error {
 		_, err := client.HeadBucket(ctx, &s3.HeadBucketInput{Bucket: aws.String(name)})
 		return err
 	}
-	_, err := client.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(name)})
+	in := &s3.CreateBucketInput{Bucket: aws.String(name)}
+	// Real S3 routes CreateBucket by LocationConstraint: a regional
+	// endpoint outside us-east-1 rejects a request without one (400
+	// IllegalLocationConstraintException) BEFORE any existence or
+	// authorization check, so even an already-owned bucket would fail
+	// boot. us-east-1 is the opposite: it is not a valid constraint
+	// value and must stay omitted (the empty constraint means
+	// us-east-1). S3-compatible stores (SeaweedFS, MinIO) accept both
+	// spellings.
+	if region != "us-east-1" {
+		in.CreateBucketConfiguration = &s3types.CreateBucketConfiguration{
+			LocationConstraint: s3types.BucketLocationConstraint(region),
+		}
+	}
+	_, err := client.CreateBucket(ctx, in)
 	if err == nil {
 		// Created — but S3 ignores the owner condition on CreateBucket
 		// itself, and the new bucket's owner is the CREDENTIALS' account,
@@ -860,12 +881,16 @@ func ensureBucket(ctx context.Context, client bucketLifecycleClient, name, expec
 					name, expectedOwner, headErr)
 			}
 			return nil
-		case "AccessDenied":
+		case "AccessDenied", "IllegalLocationConstraintException":
 			// Least-privilege roles may lack s3:CreateBucket; the denial
 			// is not proof the bucket is missing. The reachability probe
 			// doubles as the owner check when one is configured.
+			// IllegalLocationConstraintException gets the same treatment:
+			// endpoint-level constraint validation runs before existence
+			// checks, so a rejected create says nothing about whether the
+			// (possibly pre-provisioned) bucket exists — the probe decides.
 			if headErr := probe(); headErr != nil {
-				return fmt.Errorf("create bucket %q denied (%v) and probe failed: %w", name, err, headErr)
+				return fmt.Errorf("create bucket %q rejected (%v) and probe failed: %w", name, err, headErr)
 			}
 			return nil
 		}
