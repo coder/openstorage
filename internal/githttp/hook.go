@@ -153,16 +153,20 @@ func RunHook(ctx context.Context, args []string) error {
 // bound, and the hook never fails the push (git ignores post-receive's
 // exit status for the ref outcome anyway).
 func postReceiveHook() error {
-	// Drain the updated-ref list git feeds on stdin (unused): exiting
-	// with the pipe unread risks EPIPE noise on receive-pack's side.
-	_, _ = io.Copy(io.Discard, os.Stdin)
-	holdPath := os.Getenv(EnvPushHold)
-	if holdPath == "" {
-		return nil
+	// Release FIRST (Codex round-23 P2): post-receive runs after all refs
+	// have been updated, so local transaction safety no longer needs the
+	// reservation — while stdin carries one record per updated ref, an
+	// attacker-scaled stream whose drain would keep same-name and
+	// D/F-relative pushes blocked into their reservation timeout.
+	if holdPath := os.Getenv(EnvPushHold); holdPath != "" {
+		_ = os.Remove(holdPath)
+		_ = os.RemoveAll(holdPath + pushHoldUnreservedSuffix)
+		_ = os.RemoveAll(holdPath + pushHoldVerifiedSuffix)
 	}
-	_ = os.Remove(holdPath)
-	_ = os.RemoveAll(holdPath + pushHoldUnreservedSuffix)
-	_ = os.RemoveAll(holdPath + pushHoldVerifiedSuffix)
+	// Then drain the updated-ref list git feeds on stdin (unused):
+	// exiting with the pipe unread risks EPIPE noise on receive-pack's
+	// side.
+	_, _ = io.Copy(io.Discard, os.Stdin)
 	return nil
 }
 
@@ -327,34 +331,6 @@ func preReceive(ctx context.Context) error {
 				sigVerified[i] = true
 			}
 		}
-		// Verified-verdict persistence (Codex round-16 P2): each command
-		// whose REAL evaluation just passed is recorded, so its update
-		// hook consumes the verdict with an O(log n) lookup instead of
-		// charging the per-evaluation verify fee again — with a small
-		// CODESTORAGE_VERIFY_SIG_BUDGET, a same-tip fanout of N gated
-		// refs costs ~N+1 fee units here, and hooks re-charging another N
-		// pushed a fully compliant push past the walk allowance. Inputs
-		// are identical (same push, same policy env, same shas), so the
-		// hook-side verdict could only repeat this one. An UNLIMITED
-		// budget (0) writes no verdicts — hook re-evaluation cannot
-		// exhaust a limitless allowance. Bounded budgets persist EVERY
-		// pass in one sorted digest file (round-18 P2 bounded the former
-		// per-verdict inodes with a cap; round-19 P2: verdicts dropped at
-		// that cap re-charged exactly the fanouts big enough to need
-		// them).
-		if budget, err := verifySigBudget(); err != nil || budget > 0 {
-			var digests [][sha256.Size]byte
-			for i, ok := range sigVerified {
-				if !ok {
-					continue
-				}
-				c := commands[i]
-				digests = append(digests, pushVerifiedDigest(c.ref, c.old, c.new))
-			}
-			if err := writePushVerifiedVerdicts(holdPath, digests); err != nil {
-				return fmt.Errorf("pre-receive: record verified verdicts: %w", err)
-			}
-		}
 		for i, c := range commands {
 			// Reserve only names this server could ever commit (Codex
 			// round-5 security P2): git hands namespace roots like the
@@ -471,6 +447,40 @@ func preReceive(ctx context.Context) error {
 		// (Markers created below start fresh and are re-covered on the
 		// next tick; touchPushHold tolerates the sidecar not existing.)
 		defer startPushHoldRefresh(holdPath)()
+		// Verified-verdict persistence (Codex round-16 P2): each command
+		// whose REAL evaluation just passed is recorded, so its update
+		// hook consumes the verdict with an O(log n) lookup instead of
+		// charging the per-evaluation verify fee again — with a small
+		// CODESTORAGE_VERIFY_SIG_BUDGET, a same-tip fanout of N gated
+		// refs costs ~N+1 fee units here, and hooks re-charging another N
+		// pushed a fully compliant push past the walk allowance. Inputs
+		// are identical (same push, same policy env, same shas), so the
+		// hook-side verdict could only repeat this one. An UNLIMITED
+		// budget (0) writes no verdicts — hook re-evaluation cannot
+		// exhaust a limitless allowance. Bounded budgets persist EVERY
+		// pass in one sorted digest file (round-18 P2 bounded the former
+		// per-verdict inodes with a cap; round-19 P2: verdicts dropped at
+		// that cap re-charged exactly the fanouts big enough to need
+		// them). Written HERE, after the reservation exists and its
+		// refresher is running (Codex round-23 P2): the sidecar ages on
+		// the hold's clock only once the refresher covers it, and the
+		// pre-reservation authority probe above can outlast the TTL on a
+		// huge push — a sidecar written before it could be swept as
+		// expired by a concurrent push's mint before the first hook ever
+		// consumed a verdict.
+		if budget, err := verifySigBudget(); err != nil || budget > 0 {
+			var digests [][sha256.Size]byte
+			for i, ok := range sigVerified {
+				if !ok {
+					continue
+				}
+				c := commands[i]
+				digests = append(digests, pushVerifiedDigest(c.ref, c.old, c.new))
+			}
+			if err := writePushVerifiedVerdicts(holdPath, digests); err != nil {
+				return fmt.Errorf("pre-receive: record verified verdicts: %w", err)
+			}
+		}
 		// Atomic base check (Codex round-14 P1 on #173): every command's
 		// exact authority value must still match the client's declared old
 		// before ANY update hook can commit — under --atomic a
@@ -934,6 +944,13 @@ const (
 	maxPushRefNameBytes    = 900
 )
 
+// pushRefSegmentNameMax is the HARD per-component limit (Linux NAME_MAX):
+// the boundary at which the git files backend cannot represent the path
+// at all, as opposed to the conservative policy caps above. Deletions are
+// held only to this (see pushRefDeletable) so legacy refs between the
+// policy caps and the hard limit stay deletable.
+const pushRefSegmentNameMax = 255
+
 // pushRefPathMax is a conservative Linux PATH_MAX budget for the deepest
 // path git materializes for a pushed ref: the loose lock file
 // `<repository dir>/<ref>.lock`. git resolves its git dir to an ABSOLUTE
@@ -998,10 +1015,10 @@ func pushRefUpdatable(name string) bool {
 	if !pushRefDeletable(name) {
 		return false
 	}
+	// (pushRefDeletable already enforced the HARD limits: NAME_MAX per
+	// component, ".lock" headroom on the final one, and the whole-lock-
+	// path PATH_MAX budget against the actual repository directory.)
 	if len(name) > maxPushRefNameBytes { // static PATH_MAX headroom
-		return false
-	}
-	if pushRefPathTooLong(pushRepoDirLen(), len(name)) { // actual-path budget
 		return false
 	}
 	segs := strings.Split(name, "/")
@@ -1017,13 +1034,25 @@ func pushRefUpdatable(name string) bool {
 }
 
 // pushRefDeletable is the format-and-namespace half of pushRefUpdatable,
-// WITHOUT the materialization bounds (depth and byte lengths). Deletions
-// are gated on this weaker predicate (Codex round-18 P2 on #173): a
-// repository can already hold a git-valid ref past today's caps — created
-// before the caps existed, or imported by sync from a permissive upstream
-// — and a deletion adds no name, runs no authority D/F probe, and REMOVES
-// the on-disk path instead of creating one, so refusing it would make
-// exactly those legacy refs permanently undeletable through git.
+// WITHOUT the POLICY bounds (the depth cap and the conservative byte
+// caps). Deletions are gated on this weaker predicate (Codex round-18 P2
+// on #173): a repository can already hold a git-valid ref past today's
+// caps — created before the caps existed, or imported by sync from a
+// permissive upstream — and a deletion adds no name and runs no authority
+// D/F probe, so refusing it would make exactly those legacy refs
+// permanently undeletable through git.
+//
+// The HARD filesystem lock-path limits still apply (Codex round-23 P2):
+// git deletes through <name>.lock too — update-ref -d creates the lock
+// before unlinking, so a ref whose loose path fits but whose lock path
+// does not (a 251-byte final component, or PATH_MAX overflow under a deep
+// cache root) passes check-ref-format yet can NEVER be locally deleted by
+// git (verified against real git: "File name too long"). Letting its
+// update hook commit the authority deletion would tell the client the
+// deletion failed while the authority durably dropped it — and no later
+// hydration could remove the stale cache ref either, for the same lock
+// reason. Such refs were never git-deletable anywhere; denying them
+// pre-CAS loses nothing.
 func pushRefDeletable(name string) bool {
 	rest, ok := strings.CutPrefix(name, "refs/")
 	if !ok || !strings.Contains(rest, "/") {
@@ -1032,12 +1061,24 @@ func pushRefDeletable(name string) bool {
 	if strings.HasSuffix(name, ".") { // git: a refname cannot end with a dot
 		return false
 	}
-	for _, seg := range strings.Split(name, "/") {
+	segs := strings.Split(name, "/")
+	for i, seg := range segs {
 		if !gitRefSegmentValid(seg) {
 			return false
 		}
+		// Filesystem NAME_MAX (255): intermediate segments are directory
+		// names; the final segment must also carry the ".lock" suffix.
+		limit := pushRefSegmentNameMax
+		if i == len(segs)-1 {
+			limit -= len(".lock")
+		}
+		if len(seg) > limit {
+			return false
+		}
 	}
-	return true
+	// The whole lock path must fit PATH_MAX against the ACTUAL repository
+	// directory (round-21 P2 established the budget for creations).
+	return !pushRefPathTooLong(pushRepoDirLen(), len(name))
 }
 
 // pushCommandUpdatable applies the right name gate for one command:

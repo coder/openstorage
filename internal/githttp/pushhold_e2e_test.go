@@ -1055,6 +1055,147 @@ func TestServiceRPC_ReleasesPushHoldBeforeRepackTrigger(t *testing.T) {
 	}
 }
 
+// TestPush_HoldStaysFreshThroughLocalRefTransaction (Codex round-23 P1
+// on #173): per githooks(5), update runs BEFORE git updates the ref and
+// post-receive AFTER all of them — so git's local ref transaction runs
+// with every hook-owned refresher already stopped. A high-fanout atomic
+// transaction outlasting pushHoldTTL would lose its hold mid-transaction:
+// readers expire it, a concurrent hydrate materializes the already-CASed
+// authority value under receive-pack, and the local transaction aborts
+// even though every authority CAS committed. The HANDLER therefore owns a
+// refresher across receive-pack's whole lifetime. Pinned by parking a
+// push INSIDE the transaction (a blocking reference-transaction hook —
+// no server hook runs there) for several shrunk TTLs and asserting the
+// hold is still live for readers.
+func TestPush_HoldStaysFreshThroughLocalRefTransaction(t *testing.T) {
+	// The in-process server plays the serve node, so the hook
+	// subprocesses inherit THIS process's environment.
+	t.Setenv("CODESTORAGE_PG_URL", dbURL)
+	t.Setenv("CODESTORAGE_S3_URL", blobURL)
+	// Shrunk so the reader-expiry gap is observable on test timescales.
+	// The hook subprocesses keep the production TTL (fresh re-exec), but
+	// hook-owned refreshers are exactly what is ABSENT in the gap under
+	// test; the serve-side reader, sweeper, and handler refresher all
+	// honor the shrunk value.
+	prevTTL := pushHoldTTL
+	pushHoldTTL = 2 * time.Second // refresher cadence TTL/4 = 500ms
+	t.Cleanup(func() { pushHoldTTL = prevTTL })
+
+	repo := "t-hold-txn-gap"
+	cacheDir := t.TempDir()
+	key, pemBlock := genKeyPEM(t, "ES256")
+	laneStore, laneBlob := openLaneStores(t)
+	srv := &Server{
+		Store:    laneStore,
+		Blob:     laneBlob,
+		CacheDir: cacheDir,
+		Verifier: auth.NewVerifier(memKeys{testOrg: {pemBlock}}),
+		Org:      testOrg,
+		ResolveRepo: func(_ context.Context, base string) (meta.Repo, bool) {
+			if base != repo {
+				return meta.Repo{}, false
+			}
+			return meta.Repo{RepoID: repo, URL: repo, DefaultBranch: "main"}, true
+		},
+	}
+	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(ts.Close)
+
+	work := initWorkRepo(t)
+	token := mintUnitToken(t, key, "ES256", unitClaims(testOrg, repo, auth.ScopeGitRead, auth.ScopeGitWrite))
+	url := strings.Replace(ts.URL, "http://", "http://t:"+token+"@", 1) + "/" + repo + ".git"
+	if out, err := tryGit(work, "push", url, "HEAD:refs/heads/main"); err != nil {
+		t.Fatalf("seed push: %v\n%s", err, out)
+	}
+
+	// Park the NEXT push inside its local ref transaction: git runs the
+	// reference-transaction hook at "prepared" — after the update hook
+	// exited, before the commit — the exact gap under test.
+	ctl := t.TempDir()
+	sentinel := filepath.Join(ctl, "in-transaction")
+	barrier := filepath.Join(ctl, "release")
+	script := fmt.Sprintf(`#!/bin/sh
+in=$(cat)
+[ "$1" = "prepared" ] || exit 0
+case "$in" in
+*refs/heads/gap*)
+	: > %q
+	while [ ! -e %q ]; do sleep 0.05; done
+	;;
+esac
+exit 0
+`, sentinel, barrier)
+	hookPath := filepath.Join(RepoPath(cacheDir, repo), "hooks", "reference-transaction")
+	if err := os.WriteFile(hookPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("install reference-transaction hook: %v", err)
+	}
+
+	mustGit(t, work, "commit", "--allow-empty", "-m", "tip for gap")
+	type pushResult struct {
+		out string
+		err error
+	}
+	done := make(chan pushResult, 1)
+	go func() {
+		out, err := tryGit(work, "push", url, "HEAD:refs/heads/gap")
+		done <- pushResult{out, err}
+	}()
+	t.Cleanup(func() { _ = os.WriteFile(barrier, nil, 0o644) }) // never leave the push parked
+
+	for deadline := time.Now().Add(30 * time.Second); ; {
+		if _, err := os.Stat(sentinel); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("push never reached its local ref transaction")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	// All hooks' refreshers are gone (update exited; post-receive hasn't
+	// run). Sit in the transaction well past the TTL: only the handler's
+	// refresher can keep the hold live for readers.
+	time.Sleep(2*pushHoldTTL + pushHoldTTL/2)
+	set, err := readPushHolds(filepath.Join(RepoPath(cacheDir, repo), pushHoldDir), "")
+	if err != nil {
+		t.Fatalf("readPushHolds: %v", err)
+	}
+	if !set.contains("refs/heads/gap") {
+		t.Fatal("hold expired mid-transaction: a concurrent hydrate would materialize the already-CASed authority value under receive-pack and abort its local transaction")
+	}
+
+	if err := os.WriteFile(barrier, nil, 0o644); err != nil {
+		t.Fatalf("release barrier: %v", err)
+	}
+	res := <-done
+	if res.err != nil {
+		t.Fatalf("parked push failed: %v\n%s", res.err, res.out)
+	}
+	// And the hold still dies promptly with the push (post-receive, with
+	// the handler release as fallback) — the handler refresher must not
+	// have turned it into a leak.
+	for deadline := time.Now().Add(10 * time.Second); ; {
+		entries, err := os.ReadDir(filepath.Join(RepoPath(cacheDir, repo), pushHoldDir))
+		if err != nil {
+			t.Fatalf("read hold dir: %v", err)
+		}
+		live := 0
+		for _, e := range entries {
+			if strings.HasSuffix(e.Name(), pushHoldUnreservedSuffix) ||
+				strings.HasSuffix(e.Name(), pushHoldVerifiedSuffix) || e.IsDir() {
+				continue
+			}
+			live++
+		}
+		if live == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%d hold file(s) survived the push", live)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 // TestPush_RefPathBudgetDeniesUnmaterializableName (Codex round-21 P2 on
 // #173): the static 900-byte name cap cannot see the operator-chosen
 // --cache-dir depth. git resolves the git dir ABSOLUTE at startup, so

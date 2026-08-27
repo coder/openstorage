@@ -1010,10 +1010,28 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 			httpError(w, http.StatusInternalServerError, "push setup failed")
 			return
 		}
+		// The handler owns a refresher across receive-pack's WHOLE
+		// lifetime (Codex round-23 P1): the hooks' own refreshers cover
+		// only their runtimes, and git's final local ref transaction runs
+		// AFTER the last update hook exited — per githooks(5), update
+		// fires before updating the ref, post-receive after all of them —
+		// so a high-fanout atomic transaction outlasting the TTL would
+		// otherwise lose its hold mid-transaction and a concurrent
+		// hydrate could materialize an already-CASed authority value
+		// under it, aborting the local transaction. Touches after
+		// post-receive's release are ENOENT no-ops, so the client's
+		// response drainage cannot extend a released hold; only a push
+		// git updates NO refs for keeps its hold (normally already empty
+		// — every denied command self-releases) until the request ends.
+		stopHoldRefresh := startPushHoldRefresh(holdPath)
+		var releaseOnce sync.Once
 		releasePushHold = func() {
-			_ = os.Remove(holdPath)
-			_ = os.RemoveAll(holdPath + pushHoldUnreservedSuffix)
-			_ = os.RemoveAll(holdPath + pushHoldVerifiedSuffix)
+			releaseOnce.Do(func() {
+				stopHoldRefresh()
+				_ = os.Remove(holdPath)
+				_ = os.RemoveAll(holdPath + pushHoldUnreservedSuffix)
+				_ = os.RemoveAll(holdPath + pushHoldVerifiedSuffix)
+			})
 		}
 		defer releasePushHold()
 		cmd.Env = append(cmd.Env, EnvPushHold+"="+holdPath)

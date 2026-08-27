@@ -1172,7 +1172,6 @@ func updateRefStdin(repoPath, commands string) error {
 // clean and retryable, unlike the spurious rejection this prevents.
 const (
 	pushHoldDir = "codestorage.push-holds"
-	pushHoldTTL = 5 * time.Minute
 	// pushHoldUnreservedSuffix marks a push's sidecar DIRECTORY holding
 	// one empty marker file per command pre-receive did NOT bulk-reserve
 	// (unupdatable names, policy-denied refs, authority-doomed creations),
@@ -1193,6 +1192,11 @@ const (
 	// enough to need them). Hold READERS must skip it.
 	pushHoldVerifiedSuffix = ".verified"
 )
+
+// pushHoldTTL bounds a crash-leaked hold's life. A variable only so tests
+// can shrink it to observe the refresh machinery on test timescales;
+// production never mutates it.
+var pushHoldTTL = 5 * time.Minute
 
 // pushHoldUnreservedMarker is the sidecar marker path recording that name
 // was not bulk-reserved by pre-receive.

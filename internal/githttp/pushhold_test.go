@@ -922,7 +922,11 @@ func TestPushCommandUpdatable_DeletionsSkipMaterializationBounds(t *testing.T) {
 	sha2 := strings.Repeat("b", 40)
 	zero := ref.ZeroSHA
 	deep := "refs/heads" + strings.Repeat("/x", maxPushRefDepth+5)
-	longSeg := "refs/heads/" + strings.Repeat("a", maxPushRefSegmentBytes+56)
+	// Over the POLICY cap (200) but within the HARD lock-path limit
+	// (NAME_MAX minus ".lock" = 250): still deletable. Segments past the
+	// hard limit are not — git itself cannot lock them for deletion
+	// (round-23 P2; see TestPushRefDeletable_LockPathBounds).
+	longSeg := "refs/heads/" + strings.Repeat("a", maxPushRefSegmentBytes+40)
 	for _, tc := range []struct {
 		name, old, new string
 		want           bool
@@ -1185,5 +1189,109 @@ func TestRunHook_PostReceiveReleasesHold(t *testing.T) {
 	t.Setenv(EnvPushHold, "")
 	if err := RunHook(context.Background(), []string{"post-receive"}); err != nil {
 		t.Fatalf("post-receive without a hold env: %v", err)
+	}
+}
+
+// TestRunHook_PostReceiveReleasesHoldBeforeDrainingStdin (Codex round-23
+// P2 on #173): post-receive's stdin carries one record per updated ref —
+// attacker-scaled — and per githooks(5) the local ref transaction is
+// already complete when the hook starts, so nothing the hold protects is
+// still pending. Releasing only AFTER the drain would keep same-name and
+// D/F-relative pushes blocked into their reservation timeout for the
+// stream's whole duration. The hold must be gone while stdin is still
+// open.
+func TestRunHook_PostReceiveReleasesHoldBeforeDrainingStdin(t *testing.T) {
+	repoDir := t.TempDir()
+	hold, err := mintPushHold(repoDir)
+	if err != nil {
+		t.Fatalf("mintPushHold: %v", err)
+	}
+	if err := os.WriteFile(hold, []byte("refs/heads/x\n"), 0o644); err != nil {
+		t.Fatalf("write hold: %v", err)
+	}
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	oldStdin := os.Stdin
+	os.Stdin = r
+	t.Setenv(EnvPushHold, hold)
+	finished := make(chan struct{})
+	var hookErr error
+	go func() {
+		hookErr = RunHook(context.Background(), []string{"post-receive"})
+		close(finished)
+	}()
+	t.Cleanup(func() {
+		// Unblock the drain (idempotent), wait the hook out, THEN swap
+		// os.Stdin back — restoring while the hook still reads it would
+		// be a race.
+		_ = w.Close()
+		<-finished
+		os.Stdin = oldStdin
+		_ = r.Close()
+	})
+	// The hold must vanish while the updated-ref stream is still OPEN.
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if _, statErr := os.Stat(hold); errors.Is(statErr, os.ErrNotExist) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("hold still present while post-receive's stdin is open: the release is blocked behind the client-scaled drain")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("close stdin pipe: %v", err)
+	}
+	<-finished
+	if hookErr != nil {
+		t.Fatalf("post-receive: %v", hookErr)
+	}
+}
+
+// TestPushRefDeletable_LockPathBounds (Codex round-23 P2 on #173): git
+// DELETES through <name>.lock too — update-ref -d creates the lock before
+// unlinking (verified against real git: a manually materialized ref with
+// a 251-byte final component is visible to for-each-ref, but update-ref
+// -d fails "File name too long", while a 250-byte one deletes fine) — so
+// the deletion gate must enforce the HARD filesystem lock-path limits
+// even while waiving the conservative policy caps for legacy refs.
+// Otherwise the update hook commits the authority deletion, git fails
+// the local delete, the client is told the deletion failed while the
+// authority durably dropped it, and later hydration cannot remove the
+// stale cache ref either (same lock).
+func TestPushRefDeletable_LockPathBounds(t *testing.T) {
+	seg := func(n int) string { return strings.Repeat("a", n) }
+	// Final component: NAME_MAX minus the ".lock" suffix = 250.
+	if !pushRefDeletable("refs/heads/" + seg(250)) {
+		t.Fatal("250-byte final component locks within NAME_MAX; must stay deletable")
+	}
+	if pushRefDeletable("refs/heads/" + seg(251)) {
+		t.Fatal("251-byte final component's .lock exceeds NAME_MAX; git cannot delete it locally")
+	}
+	// Intermediate components are directory names: the full NAME_MAX.
+	if !pushRefDeletable("refs/heads/" + seg(255) + "/x") {
+		t.Fatal("255-byte intermediate directory fits NAME_MAX; must stay deletable")
+	}
+	if pushRefDeletable("refs/heads/" + seg(256) + "/x") {
+		t.Fatal("256-byte intermediate directory exceeds NAME_MAX; git cannot create the lock's parent")
+	}
+	// The whole lock path budgets against PATH_MAX (round-21 P2's budget,
+	// applied to deletions too). Long enough to overflow under ANY cwd.
+	deep := "refs/heads/" + strings.Repeat(seg(200)+"/", 25) + "x"
+	if pushRefDeletable(deep) {
+		t.Fatal("a lock path past PATH_MAX must not be deletable")
+	}
+	// Legacy refs past the POLICY caps (depth 32, 200-byte segments,
+	// 900-byte names) stay deletable — the round-18 P2 exemption the
+	// hard limits must not reintroduce.
+	legacy := "refs/heads/" + strings.Repeat("d/", 40) + seg(240)
+	if !pushRefDeletable(legacy) {
+		t.Fatal("legacy over-policy-cap ref must stay deletable")
+	}
+	if pushRefUpdatable(legacy) {
+		t.Fatal("the policy caps must still gate creations and updates")
 	}
 }
