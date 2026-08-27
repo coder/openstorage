@@ -18,6 +18,7 @@ never a silently-applied default.
 | [`CODESTORAGE_S3_URL`](#codestorage_s3_url) | — (required*) | Pack storage URL (`s3://` or `file://`) |
 | [`CODESTORAGE_S3WAL_LEASE_TTL`](#codestorage_s3wal_lease_ttl) | `2m` | s3wal mode only: instance-lease TTL for the dual-serve guard (`0` disables) |
 | [`CODESTORAGE_S3_EXPECTED_BUCKET_OWNER`](#codestorage_s3_expected_bucket_owner) | unset (disabled) | Assert the bucket-owner AWS account ID on every S3 request |
+| [`CODESTORAGE_S3_OP_LOG`](#codestorage_s3_op_log) | unset (disabled) | Diagnostics: append one line per S3 HTTP round trip to this file |
 | [`CODESTORAGE_DATA_DIR`](#codestorage_data_dir) | — | Local-mode data directory; derives the two URLs above |
 | [`CODESTORAGE_LISTEN`](#codestorage_listen) | `127.0.0.1:0` | Listen address |
 | [`CODESTORAGE_ORG`](#codestorage_org) | — (required) | Org name (JWT `iss` claim) |
@@ -161,6 +162,29 @@ as the blob plane.
   meaningfully enforced — against AWS S3. Pair it with the `aws:ResourceAccount` IAM
   condition described in [Deploy to production](../how-to/deploy-production.md), which
   remains the primary control; this application-level check is defense-in-depth.
+
+### `CODESTORAGE_S3_OP_LOG`
+
+Diagnostics seam (issue #182): when set to a file path, every S3 HTTP round trip issued
+through the server's SDK clients — the blob client and the `s3wal://` conditional
+client, in the serve process and in the git-hook subprocesses alike — appends one
+whitespace-separated line:
+
+```
+<unixnano> <pid> <role> <operation> <status> <duration_us> <request-path>
+```
+
+`role` is derived from the process argv (`codestorage:serve`,
+`codestorage:hook:pre-receive`, …), so a shared log attributes each round trip to the
+process that issued it. Use it to census the per-operation S3 round-trip cost of a
+request (each round trip is a WAN round trip on real S3). Writes are `O_APPEND`
+one-line syscalls, safe for concurrent processes sharing one file.
+
+- **Default:** unset — no middleware is installed; zero overhead.
+- An unopenable path logs a warning to stderr and disables the seam; it never fails the
+  process (diagnostics must not take down serving).
+- The log grows without bound and includes object keys; treat it like a debug log
+  (temporary use, not permanent telemetry).
 
 ### `CODESTORAGE_DATA_DIR`
 
