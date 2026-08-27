@@ -464,7 +464,9 @@ detect exactly that mistake (startup refusal / fail-stop), best-effort.
 
 **Store requirements.** The mode depends on faithful conditional writes
 (`If-Match` / `If-None-Match: *`). A boot-time probe refuses stores that fail it.
-Qualified: **AWS S3** and **SeaweedFS** (the tested self-hosted reference). MinIO and
+Qualified today: **SeaweedFS** (the tested self-hosted reference — the qualification
+lanes run against it). **AWS S3** documents the conditional-write semantics the design
+targets and is expected to work, but the lanes have not yet run against it. MinIO and
 other S3-compatible stores are not qualified for `s3wal://` even where they work fine as
 plain [`CODESTORAGE_S3_URL`](../reference/configuration.md#codestorage_s3_url) blob
 storage. Do not enable bucket versioning or object lock on the bucket.
