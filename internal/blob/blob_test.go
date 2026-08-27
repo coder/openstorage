@@ -141,12 +141,14 @@ func TestOpenSchemeDispatch(t *testing.T) {
 // fakeBucketClient fakes the CreateBucket/HeadBucket seam so EnsureBucket's
 // error handling is unit-testable without a live store.
 type fakeBucketClient struct {
-	createErr error
-	headErr   error
-	headCalls int
+	createErr  error
+	headErr    error
+	headCalls  int
+	lastCreate *s3.CreateBucketInput
 }
 
-func (f *fakeBucketClient) CreateBucket(context.Context, *s3.CreateBucketInput, ...func(*s3.Options)) (*s3.CreateBucketOutput, error) {
+func (f *fakeBucketClient) CreateBucket(_ context.Context, in *s3.CreateBucketInput, _ ...func(*s3.Options)) (*s3.CreateBucketOutput, error) {
+	f.lastCreate = in
 	return &s3.CreateBucketOutput{}, f.createErr
 }
 
@@ -224,7 +226,21 @@ func TestEnsureBucket(t *testing.T) {
 		},
 		"access denied, probe fails": {
 			client:        &fakeBucketClient{createErr: apiErr("AccessDenied"), headErr: apiErr("NotFound")},
-			wantErr:       []string{"AccessDenied", "NotFound", `create bucket "b" denied`},
+			wantErr:       []string{"AccessDenied", "NotFound", `create bucket "b" rejected`},
+			wantHeadCalls: 1,
+		},
+		// Real S3 regional endpoints validate the LocationConstraint
+		// before existence/authz checks, so a constraint-rejected create
+		// is not proof the bucket is missing: a pre-provisioned bucket
+		// must stay bootable via the probe (found booting serve against
+		// AWS eu-central-1).
+		"illegal location constraint, bucket reachable": {
+			client:        &fakeBucketClient{createErr: apiErr("IllegalLocationConstraintException")},
+			wantHeadCalls: 1,
+		},
+		"illegal location constraint, probe fails": {
+			client:        &fakeBucketClient{createErr: apiErr("IllegalLocationConstraintException"), headErr: apiErr("NotFound")},
+			wantErr:       []string{"IllegalLocationConstraintException", "NotFound", `create bucket "b" rejected`},
 			wantHeadCalls: 1,
 		},
 		"other api error stays fatal without probe": {
@@ -238,7 +254,7 @@ func TestEnsureBucket(t *testing.T) {
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			err := ensureBucket(ctx, tc.client, "b", tc.expectedOwner)
+			err := ensureBucket(ctx, tc.client, "b", "us-east-1", tc.expectedOwner)
 			if len(tc.wantErr) == 0 {
 				if err != nil {
 					t.Fatalf("ensureBucket: %v", err)
@@ -258,4 +274,33 @@ func TestEnsureBucket(t *testing.T) {
 			}
 		})
 	}
+}
+
+// CreateBucket must carry the client's region as LocationConstraint outside
+// us-east-1 (real S3 regional endpoints reject the request without it,
+// 400 IllegalLocationConstraintException) and must OMIT the configuration
+// for us-east-1, which is not a valid constraint value.
+func TestEnsureBucketLocationConstraint(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("non-us-east-1 stamps the region", func(t *testing.T) {
+		client := &fakeBucketClient{}
+		if err := ensureBucket(ctx, client, "b", "eu-central-1", ""); err != nil {
+			t.Fatalf("ensureBucket: %v", err)
+		}
+		cfg := client.lastCreate.CreateBucketConfiguration
+		if cfg == nil || string(cfg.LocationConstraint) != "eu-central-1" {
+			t.Fatalf("CreateBucketConfiguration = %+v, want LocationConstraint eu-central-1", cfg)
+		}
+	})
+
+	t.Run("us-east-1 omits the configuration", func(t *testing.T) {
+		client := &fakeBucketClient{}
+		if err := ensureBucket(ctx, client, "b", "us-east-1", ""); err != nil {
+			t.Fatalf("ensureBucket: %v", err)
+		}
+		if cfg := client.lastCreate.CreateBucketConfiguration; cfg != nil {
+			t.Fatalf("CreateBucketConfiguration = %+v, want nil for us-east-1", cfg)
+		}
+	})
 }
