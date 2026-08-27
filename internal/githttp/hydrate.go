@@ -1760,12 +1760,45 @@ const heldGenerationMarker = "codestorage.generation.held"
 // livePushHoldsKey fingerprints the repo's live push holds (path, size,
 // mtime of every unexpired hold file, hashed). ok=false on a read error
 // — callers must then neither publish nor honor a held marker.
+//
+// Stat-only, never reading hold CONTENTS (Codex round-23 security P2):
+// this runs once per authenticated advertisement while a held marker is
+// being validated, and the fingerprint the marker semantics need is
+// exactly the (path, size, mtime) set — every release, append, refresher
+// touch, or expiry changes it, and no content change can happen without
+// one of those. Parsing would re-read and re-split a 100k-name hold file
+// on EVERY advertisement against a paused push, per request, for work
+// whose answer the stats already carry. TTL handling mirrors the hold
+// readers: expired files drop out, far-future mtimes are clamped live.
 func livePushHoldsKey(repoPath string) (string, bool) {
-	c := &pushHoldDirCache{dir: filepath.Join(repoPath, pushHoldDir)}
-	if _, err := c.load(); err != nil {
+	dir := filepath.Join(repoPath, pushHoldDir)
+	entries, err := os.ReadDir(dir)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return "", false
 	}
-	sum := sha256.Sum256([]byte(c.setKey))
+	var key strings.Builder
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), pushHoldUnreservedSuffix) ||
+			strings.HasSuffix(e.Name(), pushHoldVerifiedSuffix) || e.IsDir() {
+			continue
+		}
+		path := filepath.Join(dir, e.Name())
+		info, err := e.Info()
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue // released between the listing and the stat
+			}
+			return "", false
+		}
+		if age := time.Since(info.ModTime()); age > pushHoldTTL {
+			continue
+		} else if age < -pushHoldTTL {
+			now := time.Now()
+			_ = os.Chtimes(path, now, now)
+		}
+		fmt.Fprintf(&key, "%s\x00%d\x00%d\x01", path, info.Size(), info.ModTime().UnixNano())
+	}
+	sum := sha256.Sum256([]byte(key.String()))
 	return hex.EncodeToString(sum[:]), true
 }
 

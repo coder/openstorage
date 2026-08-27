@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"testing"
@@ -1293,5 +1294,88 @@ func TestPushRefDeletable_LockPathBounds(t *testing.T) {
 	}
 	if pushRefUpdatable(legacy) {
 		t.Fatal("the policy caps must still gate creations and updates")
+	}
+}
+
+// TestLivePushHoldsKey_StatOnly (Codex round-23 security P2 on #173): the
+// held-marker fingerprint runs once per authenticated advertisement while
+// a push is paused, so it must be answerable from directory STATS alone —
+// the pre-fix implementation re-read and re-split every held name per
+// request. Pins both halves: computing the key does not scale with hold
+// content (a 100k-name hold costs a handful of allocations), and the key
+// still tracks exactly the lifecycle events that must invalidate a held
+// marker — touch, append, release, expiry.
+func TestLivePushHoldsKey_StatOnly(t *testing.T) {
+	repoDir := t.TempDir()
+	hold, err := mintPushHold(repoDir)
+	if err != nil {
+		t.Fatalf("mintPushHold: %v", err)
+	}
+	var sb strings.Builder
+	for i := 0; i < 100_000; i++ {
+		fmt.Fprintf(&sb, "refs/heads/b/%06d\n", i)
+	}
+	if err := os.WriteFile(hold, []byte(sb.String()), 0o644); err != nil {
+		t.Fatalf("write hold: %v", err)
+	}
+	key1, ok := livePushHoldsKey(repoDir)
+	if !ok || key1 == "" {
+		t.Fatalf("livePushHoldsKey: ok=%v", ok)
+	}
+	if key2, ok := livePushHoldsKey(repoDir); !ok || key2 != key1 {
+		t.Fatalf("fingerprint unstable across unchanged holds: %q vs %q (ok=%v)", key2, key1, ok)
+	}
+	// Content-size independence: reading the ~1.7MB hold body costs at
+	// least its length in allocated bytes per call; statting costs a few
+	// KB. TotalAlloc is monotonic, so the delta is exact regardless of
+	// GC.
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	for i := 0; i < 10; i++ {
+		if _, ok := livePushHoldsKey(repoDir); !ok {
+			t.Fatal("livePushHoldsKey failed")
+		}
+	}
+	runtime.ReadMemStats(&after)
+	if delta := after.TotalAlloc - before.TotalAlloc; delta > 1<<20 {
+		t.Fatalf("livePushHoldsKey allocated %d bytes across 10 calls over a 100k-name hold: it is reading content, not statting", delta)
+	}
+	// A refresher touch invalidates (mtime moves; near-future is live).
+	touched := time.Now().Add(time.Second)
+	if err := os.Chtimes(hold, touched, touched); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
+	key3, ok := livePushHoldsKey(repoDir)
+	if !ok || key3 == key1 {
+		t.Fatal("refresher touch must change the fingerprint")
+	}
+	// An append invalidates (size moves).
+	f, err := os.OpenFile(hold, os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatalf("open for append: %v", err)
+	}
+	if _, err := f.WriteString("refs/heads/late\n"); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	_ = f.Close()
+	key4, ok := livePushHoldsKey(repoDir)
+	if !ok || key4 == key3 {
+		t.Fatal("hold append must change the fingerprint")
+	}
+	// Expiry drops the hold out — same key as no holds at all.
+	past := time.Now().Add(-pushHoldTTL - time.Minute)
+	if err := os.Chtimes(hold, past, past); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
+	keyExpired, ok := livePushHoldsKey(repoDir)
+	if !ok || keyExpired == key4 {
+		t.Fatal("expiry must change the fingerprint")
+	}
+	// A release lands on the same fingerprint as expiry (no live holds).
+	if err := os.Remove(hold); err != nil {
+		t.Fatalf("remove hold: %v", err)
+	}
+	if keyGone, ok := livePushHoldsKey(repoDir); !ok || keyGone != keyExpired {
+		t.Fatalf("released fingerprint %q != no-live-holds fingerprint %q (ok=%v)", keyGone, keyExpired, ok)
 	}
 }

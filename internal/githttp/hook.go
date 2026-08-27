@@ -83,6 +83,13 @@ const (
 	// just-committed ref into the shared cache repo). Later invocations
 	// pass through untouched.
 	EnvUpdateBarrier = "CODESTORAGE_TEST_UPDATE_BARRIER"
+	// EnvPreReceiveBarrier holds a handshake-file path prefix; the first
+	// pre-receive to create <path>.ready pauses AFTER pack publication
+	// and BEFORE the deferred hold reservation (Codex round-23 security
+	// P2: exactly the window in which a concurrent same-name or
+	// D/F-relative push must be able to proceed) until the test creates
+	// <path>.release. Later invocations pass through untouched.
+	EnvPreReceiveBarrier = "CODESTORAGE_TEST_PRERECEIVE_BARRIER"
 	// CrashHeader lets tests request an EnvCrash injection per push; the
 	// server refuses it outside test mode.
 	CrashHeader = "X-Codestorage-Test-Crash"
@@ -274,21 +281,33 @@ func preReceive(ctx context.Context) error {
 		}
 	}
 	// Push holds (issue #170): reserve the refs this push may commit
-	// BEFORE any publication or update-hook CAS, in one atomic
-	// check+append per push (reservePushHolds) — concurrent full syncs
-	// skip held refs so they cannot race receive-pack's own local ref
-	// updates, and a D/F-conflicting concurrent push is briefly waited out
-	// or cleanly denied HERE, pre-publication, instead of committing an
-	// authority update whose local ref transaction is doomed. Only
-	// policy-allowed commands are reserved (Codex round-3 security P2): a
-	// denied command never commits, and reserving it would let a
-	// restricted token hold namespaces it cannot write for the push
-	// window. For atomic pushes every verdict is nil by this point, so
-	// the filter naturally reserves the full set. The server removes the
-	// hold file when receive-pack exits; the refresher keeps it fresh
-	// through the unbounded publication work below, and each update hook
-	// chains its own refresher for its runtime.
-	if holdPath := os.Getenv(EnvPushHold); holdPath != "" {
+	// BEFORE any update-hook CAS but AFTER pack publication (Codex
+	// round-23 security P2: publication is unbounded backend time under
+	// a bounded byte cap, and a reservation taken before it blocked
+	// every concurrent same-name or D/F-relative push into its 10-second
+	// reservation timeout while no CAS could happen yet). The eligible
+	// set is computed HERE — classification, the intra-push D/F filter,
+	// the advisory authority probe, and the crafted-push sidecar cap all
+	// run pre-publication, so a push that cannot possibly proceed is
+	// denied before its upload — but the reservation itself, in one
+	// atomic check+append per push (reservePushHolds), plus the airtight
+	// post-reservation probes, run inside reserveHoldsAndProbe after
+	// publication finished: concurrent full syncs skip held refs so they
+	// cannot race receive-pack's own local ref updates, and a
+	// D/F-conflicting concurrent push is briefly waited out or cleanly
+	// denied there, still before any authority CAS whose local ref
+	// transaction is doomed. Only policy-allowed commands are reserved
+	// (Codex round-3 security P2): a denied command never commits, and
+	// reserving it would let a restricted token hold namespaces it
+	// cannot write for the push window. For atomic pushes every verdict
+	// is nil by this point, so the filter naturally reserves the full
+	// set. The server removes the hold file when receive-pack exits.
+	holdPath := os.Getenv(EnvPushHold)
+	// Every return path after publication must run this (both the
+	// quarantined-pack path and the no-pack path): a push that skipped
+	// it would run update hooks with no reservation at all.
+	reserveHoldsAndProbe := func() error { return nil }
+	if holdPath != "" {
 		names := make([]string, 0, len(commands))
 		var unreserved []string
 		eligible := make([]refCommand, 0, len(commands))
@@ -432,170 +451,173 @@ func preReceive(ctx context.Context) error {
 		if len(unreserved) > maxPushUnreserved {
 			return fmt.Errorf("pre-receive: push carries %d commands that cannot be bulk-reserved (policy-denied, undeliverable, or D/F-conflicted names); the limit is %d — drop those commands or split the push", len(unreserved), maxPushUnreserved)
 		}
-		if err := reservePushHolds(ctx, holdPath, names); err != nil {
-			return fmt.Errorf("pre-receive: reserve push holds: %w", err)
-		}
-		// The refresher starts the moment the reservation exists (Codex
-		// round-12 P1): the post-reservation probe below is sequential
-		// store I/O that can outlast pushHoldTTL on a huge creation push,
-		// and an EXPIRED hold is ignored by concurrent reservers — a
-		// conflicting push could commit against a name the probe already
-		// cleared, after which a late-started refresher would revive our
-		// hold and the bulk-reserved hook would skip its commit-time
-		// guard. The synchronous first touch also refreshes the age the
-		// file accrued between the server's mint and this reservation.
-		// (Markers created below start fresh and are re-covered on the
-		// next tick; touchPushHold tolerates the sidecar not existing.)
-		defer startPushHoldRefresh(holdPath)()
-		// Verified-verdict persistence (Codex round-16 P2): each command
-		// whose REAL evaluation just passed is recorded, so its update
-		// hook consumes the verdict with an O(log n) lookup instead of
-		// charging the per-evaluation verify fee again — with a small
-		// CODESTORAGE_VERIFY_SIG_BUDGET, a same-tip fanout of N gated
-		// refs costs ~N+1 fee units here, and hooks re-charging another N
-		// pushed a fully compliant push past the walk allowance. Inputs
-		// are identical (same push, same policy env, same shas), so the
-		// hook-side verdict could only repeat this one. An UNLIMITED
-		// budget (0) writes no verdicts — hook re-evaluation cannot
-		// exhaust a limitless allowance. Bounded budgets persist EVERY
-		// pass in one sorted digest file (round-18 P2 bounded the former
-		// per-verdict inodes with a cap; round-19 P2: verdicts dropped at
-		// that cap re-charged exactly the fanouts big enough to need
-		// them). Written HERE, after the reservation exists and its
-		// refresher is running (Codex round-23 P2): the sidecar ages on
-		// the hold's clock only once the refresher covers it, and the
-		// pre-reservation authority probe above can outlast the TTL on a
-		// huge push — a sidecar written before it could be swept as
-		// expired by a concurrent push's mint before the first hook ever
-		// consumed a verdict.
-		if budget, err := verifySigBudget(); err != nil || budget > 0 {
-			var digests [][sha256.Size]byte
-			for i, ok := range sigVerified {
-				if !ok {
-					continue
+		reserveHoldsAndProbe = func() error {
+			if err := reservePushHolds(ctx, holdPath, names); err != nil {
+				return fmt.Errorf("pre-receive: reserve push holds: %w", err)
+			}
+			// The refresher starts the moment the reservation exists (Codex
+			// round-12 P1): the post-reservation probe below is sequential
+			// store I/O that can outlast pushHoldTTL on a huge creation push,
+			// and an EXPIRED hold is ignored by concurrent reservers — a
+			// conflicting push could commit against a name the probe already
+			// cleared, after which a late-started refresher would revive our
+			// hold and the bulk-reserved hook would skip its commit-time
+			// guard. The synchronous first touch also refreshes the age the
+			// file accrued between the server's mint and this reservation.
+			// (Markers created below start fresh and are re-covered on the
+			// next tick; touchPushHold tolerates the sidecar not existing.)
+			defer startPushHoldRefresh(holdPath)()
+			// Verified-verdict persistence (Codex round-16 P2): each command
+			// whose REAL evaluation just passed is recorded, so its update
+			// hook consumes the verdict with an O(log n) lookup instead of
+			// charging the per-evaluation verify fee again — with a small
+			// CODESTORAGE_VERIFY_SIG_BUDGET, a same-tip fanout of N gated
+			// refs costs ~N+1 fee units here, and hooks re-charging another N
+			// pushed a fully compliant push past the walk allowance. Inputs
+			// are identical (same push, same policy env, same shas), so the
+			// hook-side verdict could only repeat this one. An UNLIMITED
+			// budget (0) writes no verdicts — hook re-evaluation cannot
+			// exhaust a limitless allowance. Bounded budgets persist EVERY
+			// pass in one sorted digest file (round-18 P2 bounded the former
+			// per-verdict inodes with a cap; round-19 P2: verdicts dropped at
+			// that cap re-charged exactly the fanouts big enough to need
+			// them). Written HERE, after the reservation exists and its
+			// refresher is running (Codex round-23 P2): the sidecar ages on
+			// the hold's clock only once the refresher covers it, and the
+			// pre-reservation authority probe above can outlast the TTL on a
+			// huge push — a sidecar written before it could be swept as
+			// expired by a concurrent push's mint before the first hook ever
+			// consumed a verdict.
+			if budget, err := verifySigBudget(); err != nil || budget > 0 {
+				var digests [][sha256.Size]byte
+				for i, ok := range sigVerified {
+					if !ok {
+						continue
+					}
+					c := commands[i]
+					digests = append(digests, pushVerifiedDigest(c.ref, c.old, c.new))
 				}
-				c := commands[i]
-				digests = append(digests, pushVerifiedDigest(c.ref, c.old, c.new))
-			}
-			if err := writePushVerifiedVerdicts(holdPath, digests); err != nil {
-				return fmt.Errorf("pre-receive: record verified verdicts: %w", err)
-			}
-		}
-		// Atomic base check (Codex round-14 P1 on #173): every command's
-		// exact authority value must still match the client's declared old
-		// before ANY update hook can commit — under --atomic a
-		// mid-sequence CAS loss cannot retract the authority updates
-		// earlier hooks already committed, so git's abort of the local
-		// transaction would report the whole push failed while part of it
-		// stands in the authority. The check is sound HERE and only here:
-		// the reservation above now excludes same-name peer holds (covers
-		// semantics), so a held name's authority value is frozen against
-		// same-node writers from reservation until release — a stale base
-		// (say, a peer that committed while hydration deliberately left
-		// the git cache old) is caught before any CAS instead of
-		// mid-sequence. One push-proportional batch (refValuesProber);
-		// fail closed on store trouble. Cross-node racers remain the
-		// documented store-level TOCTOU residual. Non-atomic pushes keep
-		// git's per-ref semantics: an individual stale CAS loses alone.
-		if atomicPush {
-			refNames := make([]string, 0, len(commands))
-			for _, c := range commands {
-				refNames = append(refNames, c.ref)
-			}
-			values, err := authorityRefValues(ctx, probeStore, repo, refNames)
-			if err != nil {
-				return fmt.Errorf("pre-receive: atomic base check: %w", err)
-			}
-			for _, c := range commands {
-				switch got, exists := values[c.ref]; {
-				case c.old == ref.ZeroSHA && exists:
-					return atomicDenied(fmt.Errorf("%s already exists (created concurrently); fetch first", c.ref))
-				case c.old != ref.ZeroSHA && !exists:
-					return atomicDenied(fmt.Errorf("%s no longer exists (deleted concurrently); fetch first", c.ref))
-				case c.old != ref.ZeroSHA && got != c.old:
-					return atomicDenied(fmt.Errorf("%s moved concurrently (expected %.8s); fetch first", c.ref, c.old))
+				if err := writePushVerifiedVerdicts(holdPath, digests); err != nil {
+					return fmt.Errorf("pre-receive: record verified verdicts: %w", err)
 				}
 			}
-		}
-		// Authority D/F probe for every bulk-reserved creation, run
-		// strictly AFTER the reservation landed — the only airtight probe
-		// point on this node (Codex rounds 7-11 lineage; round-11 P1
-		// closed the last ordering hole): a same-node conflicting creation
-		// can only CAS while holding its own reservation, and that
-		// reservation must have been RELEASED before ours landed (else we
-		// would still be waiting on it) — so a probe after our reservation
-		// observes every conflicting commit, including a racer that
-		// reserved, committed, and released entirely inside our
-		// probe-to-reservation window, which any pre-reservation probe
-		// (with or without waited-name tracking) misses. Doomed late
-		// losers: atomic pushes are denied WHOLE before any hook CAS
-		// (Codex round-8 P1); non-atomic ones are RELEASED from the hold
-		// file and diverted to the sidecar, so a doomed name squats on its
-		// existing D/F relatives' namespace only for the probe's
-		// round-trip, not the push window (the round-7 no-squat property),
-		// and its own hook's commit-time probe declines it. Creations
-		// only: updates and deletions cannot introduce a D/F pair. One
-		// push-proportional batch per probe (the dfConflictProber seam —
-		// rounds 8-14). Fail closed on store trouble. Cross-node racers
-		// remain the documented store-level TOCTOU residual. A
-		// delete-then-create D/F swap in ONE push still works: the
-		// creation is sidecar-diverted by the intra-push check above and
-		// self-reserves at hook time, after the deletion's CAS.
-		if len(reservedCreations) > 0 {
-			doomed, err := authorityDoomedCreations(ctx, probeStore, repo, reservedCreations)
-			if err != nil {
-				return fmt.Errorf("pre-receive: post-reservation authority D/F probe: %w", err)
-			}
-			if len(doomed) > 0 {
-				if atomicPush {
-					for _, c := range commands {
-						if derr, ok := doomed[c.ref]; ok {
-							return atomicDenied(derr)
-						}
+			// Atomic base check (Codex round-14 P1 on #173): every command's
+			// exact authority value must still match the client's declared old
+			// before ANY update hook can commit — under --atomic a
+			// mid-sequence CAS loss cannot retract the authority updates
+			// earlier hooks already committed, so git's abort of the local
+			// transaction would report the whole push failed while part of it
+			// stands in the authority. The check is sound HERE and only here:
+			// the reservation above now excludes same-name peer holds (covers
+			// semantics), so a held name's authority value is frozen against
+			// same-node writers from reservation until release — a stale base
+			// (say, a peer that committed while hydration deliberately left
+			// the git cache old) is caught before any CAS instead of
+			// mid-sequence. One push-proportional batch (refValuesProber);
+			// fail closed on store trouble. Cross-node racers remain the
+			// documented store-level TOCTOU residual. Non-atomic pushes keep
+			// git's per-ref semantics: an individual stale CAS loses alone.
+			if atomicPush {
+				refNames := make([]string, 0, len(commands))
+				for _, c := range commands {
+					refNames = append(refNames, c.ref)
+				}
+				values, err := authorityRefValues(ctx, probeStore, repo, refNames)
+				if err != nil {
+					return fmt.Errorf("pre-receive: atomic base check: %w", err)
+				}
+				for _, c := range commands {
+					switch got, exists := values[c.ref]; {
+					case c.old == ref.ZeroSHA && exists:
+						return atomicDenied(fmt.Errorf("%s already exists (created concurrently); fetch first", c.ref))
+					case c.old != ref.ZeroSHA && !exists:
+						return atomicDenied(fmt.Errorf("%s no longer exists (deleted concurrently); fetch first", c.ref))
+					case c.old != ref.ZeroSHA && got != c.old:
+						return atomicDenied(fmt.Errorf("%s moved concurrently (expected %.8s); fetch first", c.ref, c.old))
 					}
 				}
-				release := make([]string, 0, len(doomed))
-				for name := range doomed {
-					unreserved = append(unreserved, name)
-					release = append(release, name)
+			}
+			// Authority D/F probe for every bulk-reserved creation, run
+			// strictly AFTER the reservation landed — the only airtight probe
+			// point on this node (Codex rounds 7-11 lineage; round-11 P1
+			// closed the last ordering hole): a same-node conflicting creation
+			// can only CAS while holding its own reservation, and that
+			// reservation must have been RELEASED before ours landed (else we
+			// would still be waiting on it) — so a probe after our reservation
+			// observes every conflicting commit, including a racer that
+			// reserved, committed, and released entirely inside our
+			// probe-to-reservation window, which any pre-reservation probe
+			// (with or without waited-name tracking) misses. Doomed late
+			// losers: atomic pushes are denied WHOLE before any hook CAS
+			// (Codex round-8 P1); non-atomic ones are RELEASED from the hold
+			// file and diverted to the sidecar, so a doomed name squats on its
+			// existing D/F relatives' namespace only for the probe's
+			// round-trip, not the push window (the round-7 no-squat property),
+			// and its own hook's commit-time probe declines it. Creations
+			// only: updates and deletions cannot introduce a D/F pair. One
+			// push-proportional batch per probe (the dfConflictProber seam —
+			// rounds 8-14). Fail closed on store trouble. Cross-node racers
+			// remain the documented store-level TOCTOU residual. A
+			// delete-then-create D/F swap in ONE push still works: the
+			// creation is sidecar-diverted by the intra-push check above and
+			// self-reserves at hook time, after the deletion's CAS.
+			if len(reservedCreations) > 0 {
+				doomed, err := authorityDoomedCreations(ctx, probeStore, repo, reservedCreations)
+				if err != nil {
+					return fmt.Errorf("pre-receive: post-reservation authority D/F probe: %w", err)
 				}
-				if err := removePushHolds(holdPath, release); err != nil {
-					return fmt.Errorf("pre-receive: release doomed reservations: %w", err)
+				if len(doomed) > 0 {
+					if atomicPush {
+						for _, c := range commands {
+							if derr, ok := doomed[c.ref]; ok {
+								return atomicDenied(derr)
+							}
+						}
+					}
+					release := make([]string, 0, len(doomed))
+					for name := range doomed {
+						unreserved = append(unreserved, name)
+						release = append(release, name)
+					}
+					if err := removePushHolds(holdPath, release); err != nil {
+						return fmt.Errorf("pre-receive: release doomed reservations: %w", err)
+					}
 				}
 			}
-		}
-		// The sidecar is bounded (Codex round-9 P2): unreserved membership
-		// is attacker-chosen — a crafted push can carry hundreds of
-		// thousands of tiny undeliverable commands under the byte cap, and
-		// each marker below costs one inode on the shared cache volume
-		// (plus crash-recovery sweep work). Real pushes carry at most a
-		// handful of denied or undeliverable commands, so a generous cap
-		// denies only crafted traffic; bulk mirror pushes are unaffected —
-		// their reservable refs share the single hold file. Checked twice:
-		// once above, BEFORE reservation, so a push that is already over
-		// the cap on pre-computable grounds (policy-denied, unupdatable,
-		// intra-push D/F) never reserves or probes at all (Codex round-12
-		// security P2), and once here for the probe's late additions.
-		if len(unreserved) > maxPushUnreserved {
-			return fmt.Errorf("pre-receive: push carries %d commands that cannot be bulk-reserved (policy-denied, undeliverable, or D/F-conflicted names); the limit is %d — drop those commands or split the push", len(unreserved), maxPushUnreserved)
-		}
-		// The (typically empty) remainder becomes one marker file per
-		// name in the sidecar directory, so an update hook's membership
-		// check is a single stat — absent means bulk-reserved, present
-		// means self-reserve before the CAS. Per-ref markers, not a
-		// listing file: allowed hooks re-reading a crafted push's large
-		// denied list would be O(allowed × denied) (Codex rounds 6+7
-		// P2s). Excluded from hold readers; the server removes it with
-		// the hold file, the TTL sweep covers leaks.
-		if len(unreserved) > 0 {
-			if err := os.MkdirAll(holdPath+pushHoldUnreservedSuffix, 0o755); err != nil {
-				return fmt.Errorf("pre-receive: record unreserved refs: %w", err)
+			// The sidecar is bounded (Codex round-9 P2): unreserved membership
+			// is attacker-chosen — a crafted push can carry hundreds of
+			// thousands of tiny undeliverable commands under the byte cap, and
+			// each marker below costs one inode on the shared cache volume
+			// (plus crash-recovery sweep work). Real pushes carry at most a
+			// handful of denied or undeliverable commands, so a generous cap
+			// denies only crafted traffic; bulk mirror pushes are unaffected —
+			// their reservable refs share the single hold file. Checked twice:
+			// once above, BEFORE reservation, so a push that is already over
+			// the cap on pre-computable grounds (policy-denied, unupdatable,
+			// intra-push D/F) never reserves or probes at all (Codex round-12
+			// security P2), and once here for the probe's late additions.
+			if len(unreserved) > maxPushUnreserved {
+				return fmt.Errorf("pre-receive: push carries %d commands that cannot be bulk-reserved (policy-denied, undeliverable, or D/F-conflicted names); the limit is %d — drop those commands or split the push", len(unreserved), maxPushUnreserved)
 			}
-			for _, name := range unreserved {
-				if err := os.WriteFile(pushHoldUnreservedMarker(holdPath, name), nil, 0o600); err != nil {
-					return fmt.Errorf("pre-receive: record unreserved ref: %w", err)
+			// The (typically empty) remainder becomes one marker file per
+			// name in the sidecar directory, so an update hook's membership
+			// check is a single stat — absent means bulk-reserved, present
+			// means self-reserve before the CAS. Per-ref markers, not a
+			// listing file: allowed hooks re-reading a crafted push's large
+			// denied list would be O(allowed × denied) (Codex rounds 6+7
+			// P2s). Excluded from hold readers; the server removes it with
+			// the hold file, the TTL sweep covers leaks.
+			if len(unreserved) > 0 {
+				if err := os.MkdirAll(holdPath+pushHoldUnreservedSuffix, 0o755); err != nil {
+					return fmt.Errorf("pre-receive: record unreserved refs: %w", err)
+				}
+				for _, name := range unreserved {
+					if err := os.WriteFile(pushHoldUnreservedMarker(holdPath, name), nil, 0o600); err != nil {
+						return fmt.Errorf("pre-receive: record unreserved ref: %w", err)
+					}
 				}
 			}
+			return nil
 		}
 	}
 
@@ -622,8 +644,10 @@ func preReceive(ctx context.Context) error {
 		}
 		// No pack means nothing can leak. The atomic whole-push policy
 		// denial (issue #28's durable-CAS twist) already happened above,
-		// before the hold reservation, from the shared verdicts.
-		return nil
+		// before the hold reservation, from the shared verdicts. The
+		// reservation still must happen — delete-only and stored-object
+		// pushes run update hooks like any other.
+		return reserveHoldsAndProbe()
 	}
 
 	// Publication policy gate (issue #21, Codex security rounds): a pack
@@ -915,7 +939,19 @@ func preReceive(ctx context.Context) error {
 			return errors.Join(regErr, fmt.Errorf("pre-receive: verify %s: %w", p.Key, err))
 		}
 	}
-	return regErr
+	if regErr != nil {
+		return regErr
+	}
+	// Test seam (Codex round-23 security P2): pause between publication
+	// and the deferred hold reservation so the e2e lane can prove a
+	// concurrent push proceeds while this one is published but not yet
+	// reserved.
+	if testMode() {
+		if p := os.Getenv(EnvPreReceiveBarrier); p != "" {
+			pauseAtUpdateBarrier(p)
+		}
+	}
+	return reserveHoldsAndProbe()
 }
 
 // maxPushRefDepth caps the path depth of refs this server will commit.

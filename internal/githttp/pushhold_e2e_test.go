@@ -1055,6 +1055,71 @@ func TestServiceRPC_ReleasesPushHoldBeforeRepackTrigger(t *testing.T) {
 	}
 }
 
+// TestPush_ConcurrentPushProceedsDuringPublication (Codex round-23
+// security P2 on #173): the hold reservation must not span pack
+// publication — upload/registration/verification is unbounded backend
+// time under a bounded byte cap, and a reservation taken before it
+// turned every concurrent same-name or D/F-relative push into a
+// 10-second wait plus denial while no CAS could occur yet. Push A parks
+// between its publication and its DEFERRED reservation; push B to the
+// same ref must land normally in that window (red with the pre-fix
+// order: A already holds the name through publication, so B times out).
+// Released, A reserves and re-probes: its now-stale creation dies as the
+// ordinary CAS conflict, never a spurious local rejection, and the
+// authority keeps B's value.
+func TestPush_ConcurrentPushProceedsDuringPublication(t *testing.T) {
+	repo := registerRepo(t, "t-deferred-reserve")
+	barrier := filepath.Join(t.TempDir(), "prereceive-barrier")
+	node := startNodeT(t, EnvPreReceiveBarrier+"="+barrier)
+	token := mintTestToken(t, repo, "git:read,git:write", "")
+
+	workA := initWorkRepo(t)
+	mustGit(t, workA, "commit", "--allow-empty", "-m", "A tip")
+	workB := initWorkRepo(t)
+	mustGit(t, workB, "commit", "--allow-empty", "-m", "B tip")
+	headB := revParse(t, workB, "HEAD")
+
+	type pushResult struct {
+		out string
+		err error
+	}
+	done := make(chan pushResult, 1)
+	go func() {
+		out, err := tryGit(workA, "push", remoteURL(node, repo, token), "HEAD:refs/heads/race")
+		done <- pushResult{out, err}
+	}()
+	t.Cleanup(func() { _ = os.WriteFile(barrier+".release", nil, 0o644) }) // never leave A parked
+	for deadline := time.Now().Add(30 * time.Second); ; {
+		if _, err := os.Stat(barrier + ".ready"); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("push A never reached the post-publication barrier")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// A is published but UNRESERVED: B's push of the same ref must land
+	// while A is parked, not wait out a reservation A does not need yet.
+	if out, err := tryGit(workB, "push", remoteURL(node, repo, token), "HEAD:refs/heads/race"); err != nil {
+		t.Fatalf("concurrent push blocked during A's publication window: %v\n%.1500s", err, out)
+	}
+	if got := pgRefs(t, repo)["refs/heads/race"]; got != headB {
+		t.Fatalf("authority refs/heads/race = %.8s, want B's %.8s", got, headB)
+	}
+
+	if err := os.WriteFile(barrier+".release", nil, 0o644); err != nil {
+		t.Fatalf("release barrier: %v", err)
+	}
+	res := <-done
+	if res.err == nil {
+		t.Fatalf("A's stale creation succeeded against B's committed ref:\n%.1500s", res.out)
+	}
+	if got := pgRefs(t, repo)["refs/heads/race"]; got != headB {
+		t.Fatalf("authority moved to %.8s after A's denial, want B's %.8s", got, headB)
+	}
+}
+
 // TestPush_HoldStaysFreshThroughLocalRefTransaction (Codex round-23 P1
 // on #173): per githooks(5), update runs BEFORE git updates the ref and
 // post-receive AFTER all of them — so git's local ref transaction runs
