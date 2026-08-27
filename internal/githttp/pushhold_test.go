@@ -958,24 +958,28 @@ func TestReservationVerdicts_MixedPushStaysSelective(t *testing.T) {
 		{ref: "refs/heads/noff", old: sha, new: sha2},
 		{ref: "refs/heads/sigx", old: sha, new: sha2},
 		{ref: "refs/heads/free", old: sha, new: sha2},
+		// Gated but undeliverable (round-18 security P2): must be denied
+		// WITHOUT an evaluation — it diverts to the sidecar regardless.
+		{ref: "refs/heads/sigx", old: sha2, new: sha},
 	}
+	updatable := []bool{true, true, true, false}
 	evaluated := make([]bool, len(commands))
 	evalOne := func(i int) error {
 		evaluated[i] = true
 		c := commands[i]
 		return enforceRefPolicy(context.Background(), "r", c.ref, c.old, c.new)
 	}
-	classes, verified := reservationVerdicts("r", commands, evalOne)
-	want := []reservationClass{reservationAllowed, reservationDenied, reservationAllowed}
+	classes, verified := reservationVerdicts("r", commands, updatable, evalOne)
+	want := []reservationClass{reservationAllowed, reservationDenied, reservationAllowed, reservationDenied}
 	for i, cls := range classes {
 		if cls != want[i] {
 			t.Errorf("classes[%d] = %v, want %v", i, cls, want[i])
 		}
 	}
-	// Only the gated command may pay a real evaluation, and a FAILED
-	// evaluation must not mark the command verified.
-	if evaluated[0] || !evaluated[1] || evaluated[2] {
-		t.Errorf("evaluated = %v, want only the signature-gated command", evaluated)
+	// Only the gated UPDATABLE command may pay a real evaluation, and a
+	// FAILED evaluation must not mark the command verified.
+	if evaluated[0] || !evaluated[1] || evaluated[2] || evaluated[3] {
+		t.Errorf("evaluated = %v, want only the deliverable signature-gated command", evaluated)
 	}
 	for i, v := range verified {
 		if v {

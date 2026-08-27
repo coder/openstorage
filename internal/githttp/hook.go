@@ -259,13 +259,31 @@ func preReceive(ctx context.Context) error {
 		names := make([]string, 0, len(commands))
 		var unreserved []string
 		eligible := make([]refCommand, 0, len(commands))
+		// Undeliverable names are settled FIRST, before any evaluation
+		// (Codex round-18 security P2): an unupdatable command diverts to
+		// the sidecar whatever its policy verdict says, so evaluating it
+		// — a signature walk, a verified-marker inode, walked-counter
+		// churn — is attacker-purchasable work with no decision value. A
+		// push already over the sidecar cap on name grounds alone is
+		// denied here, before its first signature evaluation.
+		updatable := make([]bool, len(commands))
+		preUnreserved := 0
+		for i, c := range commands {
+			updatable[i] = pushCommandUpdatable(c.ref, c.old, c.new)
+			if !updatable[i] {
+				preUnreserved++
+			}
+		}
+		if preUnreserved > maxPushUnreserved {
+			return fmt.Errorf("pre-receive: push carries %d commands that cannot be bulk-reserved (policy-denied, undeliverable, or D/F-conflicted names); the limit is %d — drop those commands or split the push", preUnreserved, maxPushUnreserved)
+		}
 		// Non-atomic pushes resolve reservations budget-free, with only
 		// signature-gated commands paying a real per-command evaluation
 		// — see reservationVerdicts.
 		var classes []reservationClass
 		var sigVerified []bool
 		if !atomicPush {
-			classes, sigVerified = reservationVerdicts(repo, commands, evalOne)
+			classes, sigVerified = reservationVerdicts(repo, commands, updatable, evalOne)
 		}
 		// Verified-verdict markers (Codex round-16 P2): each
 		// signature-gated command whose REAL evaluation just passed gets
@@ -312,7 +330,7 @@ func preReceive(ctx context.Context) error {
 			if !atomicPush {
 				denied = classes[i] == reservationDenied
 			}
-			if !pushCommandUpdatable(c.ref, c.old, c.new) || denied {
+			if !updatable[i] || denied {
 				unreserved = append(unreserved, c.ref)
 				continue
 			}
@@ -1645,11 +1663,20 @@ func classifyReservation(repo, refName, old, new string) reservationClass {
 // the pack-path publication gate never re-fees them, and the returned
 // verified flags mark gated commands whose evaluation PASSED — the caller
 // persists those as verdict markers the update hooks consume without
-// charging the verify budget again (Codex round-16 P2).
-func reservationVerdicts(repo string, commands []refCommand, evalOne func(int) error) (classes []reservationClass, verified []bool) {
+// charging the verify budget again (Codex round-16 P2). Commands the
+// caller already knows are undeliverable (updatable[i] == false) are
+// classified denied WITHOUT any evaluation (round-18 security P2: they
+// divert to the sidecar whatever the verdict, so a signature walk for
+// them is attacker-purchasable dead work).
+func reservationVerdicts(repo string, commands []refCommand, updatable []bool, evalOne func(int) error) (classes []reservationClass, verified []bool) {
+	assertf(len(updatable) == len(commands), "reservationVerdicts: %d updatable flags for %d commands", len(updatable), len(commands))
 	classes = make([]reservationClass, len(commands))
 	verified = make([]bool, len(commands))
 	for i, c := range commands {
+		if !updatable[i] {
+			classes[i] = reservationDenied
+			continue
+		}
 		classes[i] = classifyReservation(repo, c.ref, c.old, c.new)
 	}
 	for i := range commands {
