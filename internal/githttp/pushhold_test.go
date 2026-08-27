@@ -37,6 +37,26 @@ func mintHold(t *testing.T, repoPath string, names ...string) string {
 	return holdPath
 }
 
+// expireHold ages holdPath past BOTH observations of the round-25
+// two-phase expiry: the hold itself past the wall TTL and its reap marker
+// past the grace, exactly the state a genuine crash leak reaches after
+// its first expired-looking observation plus the grace.
+func expireHold(t *testing.T, holdPath string) {
+	t.Helper()
+	past := time.Now().Add(-2 * pushHoldTTL)
+	if err := os.Chtimes(holdPath, past, past); err != nil {
+		t.Fatalf("chtimes hold: %v", err)
+	}
+	reap := holdPath + pushHoldReapSuffix
+	if err := os.WriteFile(reap, nil, 0o600); err != nil {
+		t.Fatalf("write reap marker: %v", err)
+	}
+	markerPast := time.Now().Add(-pushHoldTTL/2 - time.Minute)
+	if err := os.Chtimes(reap, markerPast, markerPast); err != nil {
+		t.Fatalf("chtimes marker: %v", err)
+	}
+}
+
 // TestSyncRefsStreamed_SkipsPushHeldRefs: held creations, updates, and
 // deletions are all left untouched while unheld refs in the same sync
 // apply; the sync reports skipped=true. Batch 1 forces the overflow second
@@ -155,10 +175,7 @@ func TestPushHoldSet_CoversAndConflicts(t *testing.T) {
 func TestTouchPushHold_RestoresFreshness(t *testing.T) {
 	dir := t.TempDir()
 	holdPath := mintHold(t, dir, "refs/heads/x")
-	expired := time.Now().Add(-pushHoldTTL - time.Minute)
-	if err := os.Chtimes(holdPath, expired, expired); err != nil {
-		t.Fatalf("Chtimes: %v", err)
-	}
+	expireHold(t, holdPath)
 	if loadPushHolds(dir).covers("refs/heads/x") {
 		t.Fatal("expired hold still live")
 	}
@@ -175,10 +192,7 @@ func TestSyncRefsStreamed_IgnoresExpiredHold(t *testing.T) {
 	head := revParse(t, dir, "HEAD")
 
 	holdPath := mintHold(t, dir, "refs/heads/new")
-	expired := time.Now().Add(-pushHoldTTL - time.Minute)
-	if err := os.Chtimes(holdPath, expired, expired); err != nil {
-		t.Fatalf("Chtimes: %v", err)
-	}
+	expireHold(t, holdPath)
 
 	want := map[string]string{"refs/heads/main": head, "refs/heads/new": head}
 	syncFromMapSkipped(t, dir, want, "refs/heads/main", syncRefsBatch, false)
@@ -192,10 +206,7 @@ func TestSyncRefsStreamed_IgnoresExpiredHold(t *testing.T) {
 func TestMintPushHold_SweepsExpiredLeaks(t *testing.T) {
 	dir := t.TempDir()
 	leaked := mintHold(t, dir, "refs/heads/leaked")
-	expired := time.Now().Add(-pushHoldTTL - time.Minute)
-	if err := os.Chtimes(leaked, expired, expired); err != nil {
-		t.Fatalf("Chtimes: %v", err)
-	}
+	expireHold(t, leaked)
 	live := mintHold(t, dir, "refs/heads/live")
 
 	if _, err := mintPushHold(dir); err != nil {
@@ -258,10 +269,7 @@ func TestReservePushHolds_DeniesLiveConflictFailsClosed(t *testing.T) {
 		t.Fatalf("non-conflicting reservation denied: %v", err)
 	}
 	// An expired conflicting hold is a crash leak, not a conflict.
-	expired := time.Now().Add(-pushHoldTTL - time.Minute)
-	if err := os.Chtimes(other, expired, expired); err != nil {
-		t.Fatalf("Chtimes: %v", err)
-	}
+	expireHold(t, other)
 	own2, err := mintPushHold(dir)
 	if err != nil {
 		t.Fatalf("mintPushHold: %v", err)
@@ -897,11 +905,14 @@ func TestClassifyReservation(t *testing.T) {
 		{"refs/heads/nopush", zero, sha, reservationDenied},    // hard denial
 		// no-force-push updates classify WITHOUT the ancestry subprocess
 		// (Codex round-14 security P2: classification cost is
-		// attacker-chosen, so it must never launch git merge-base — the
-		// update hook performs the real check). These shas exist in no
-		// repository, so reservationAllowed is only reachable
-		// subprocess-free: a real ancestry evaluation would deny.
-		{"refs/heads/noff", sha, sha2, reservationAllowed}, // update: hook enforces
+		// attacker-chosen, so it must never launch git merge-base) to a
+		// JUST-IN-TIME reservation: the ref's own hook runs the real
+		// check and reserves only on a pass (round-25 P2 — bulk-reserving
+		// on faith let a doomed trailing rewind squat the protected name
+		// through every earlier hook). These shas exist in no repository,
+		// so reservationJIT is only reachable subprocess-free: a real
+		// ancestry evaluation would deny.
+		{"refs/heads/noff", sha, sha2, reservationJIT},     // update: hook checks + reserves
 		{"refs/heads/noff", sha, zero, reservationDenied},  // deletion: budget-free denial
 		{"refs/heads/noff", zero, sha, reservationAllowed}, // creation: no rewind possible
 	} {
@@ -949,9 +960,9 @@ func TestPushCommandUpdatable_DeletionsSkipMaterializationBounds(t *testing.T) {
 // TestReservationVerdicts_MixedPushStaysSelective (Codex round-15 P2 on
 // #173): one signature-gated command must not upgrade the WHOLE push to a
 // full policy evaluation — the ungated no-force-push update keeps its
-// budget-free reservationAllowed verdict. The shas exist in no repository,
+// budget-free reservationJIT verdict. The shas exist in no repository,
 // so a full evaluation of the noff command would run git merge-base, fail
-// the ancestry check, and flip it to denied — reservationAllowed is only
+// the ancestry check, and flip it to denied — reservationJIT is only
 // reachable when the mixed push leaves ungated commands unevaluated. The
 // gated command itself pays a REAL evaluation: with no verify state
 // available here it fails closed to denied (in production, valid signed
@@ -976,7 +987,7 @@ func TestReservationVerdicts_MixedPushStaysSelective(t *testing.T) {
 		return enforceRefPolicy(context.Background(), "r", c.ref, c.old, c.new)
 	}
 	classes, verified := reservationVerdicts("r", commands, updatable, evalOne)
-	want := []reservationClass{reservationAllowed, reservationDenied, reservationAllowed, reservationDenied}
+	want := []reservationClass{reservationJIT, reservationDenied, reservationAllowed, reservationDenied}
 	for i, cls := range classes {
 		if cls != want[i] {
 			t.Errorf("classes[%d] = %v, want %v", i, cls, want[i])
@@ -1110,10 +1121,21 @@ func TestPushHolds_FutureDatedHoldClampedLive(t *testing.T) {
 		t.Fatalf("future mtime not clamped to now (age %v): the leak's lease would outlive the TTL bound", age)
 	}
 	// From the clamp the hold ages NORMALLY: past the TTL it expires for
-	// readers and the sweeper alike (the round-21 crash-leak bound).
+	// readers and the sweeper alike (the round-21 crash-leak bound),
+	// through the round-25 two-observation rule — the first
+	// expired-looking pass arms the reap marker and stays live; once the
+	// marker outlives the grace with no owner touch, the hold is gone.
 	past := time.Now().Add(-pushHoldTTL - time.Minute)
 	if err := os.Chtimes(hold, past, past); err != nil {
 		t.Fatalf("chtimes: %v", err)
+	}
+	set, err = readPushHolds(holdDir, "")
+	if err != nil || !set.contains("refs/heads/x") {
+		t.Fatalf("first expired-looking observation must stay live (forward-jump safety): set=%v err=%v", set, err)
+	}
+	markerPast := time.Now().Add(-pushHoldTTL/2 - time.Minute)
+	if err := os.Chtimes(hold+pushHoldReapSuffix, markerPast, markerPast); err != nil {
+		t.Fatalf("chtimes marker: %v", err)
 	}
 	set, err = readPushHolds(holdDir, "")
 	if err != nil || set.contains("refs/heads/x") {
@@ -1368,13 +1390,22 @@ func TestLivePushHoldsKey_StatOnly(t *testing.T) {
 	if !ok || key4 == key3 {
 		t.Fatal("hold append must change the fingerprint")
 	}
-	// Expiry drops the hold out — same key as no holds at all.
+	// Expiry (past the round-25 two-observation grace) drops the hold
+	// out — same key as no holds at all.
 	past := time.Now().Add(-pushHoldTTL - time.Minute)
 	if err := os.Chtimes(hold, past, past); err != nil {
 		t.Fatalf("chtimes: %v", err)
 	}
+	keySuspect, ok := livePushHoldsKey(repoDir)
+	if !ok || keySuspect == key4 {
+		t.Fatal("the expired-looking observation must still change the fingerprint (mtime moved)")
+	}
+	markerPast := time.Now().Add(-pushHoldTTL/2 - time.Minute)
+	if err := os.Chtimes(hold+pushHoldReapSuffix, markerPast, markerPast); err != nil {
+		t.Fatalf("chtimes marker: %v", err)
+	}
 	keyExpired, ok := livePushHoldsKey(repoDir)
-	if !ok || keyExpired == key4 {
+	if !ok || keyExpired == keySuspect {
 		t.Fatal("expiry must change the fingerprint")
 	}
 	// A release lands on the same fingerprint as expiry (no live holds).
@@ -1383,5 +1414,186 @@ func TestLivePushHoldsKey_StatOnly(t *testing.T) {
 	}
 	if keyGone, ok := livePushHoldsKey(repoDir); !ok || keyGone != keyExpired {
 		t.Fatalf("released fingerprint %q != no-live-holds fingerprint %q (ok=%v)", keyGone, keyExpired, ok)
+	}
+}
+
+// TestPushHolds_ForwardJumpKeepsHoldLive (Codex round-25 P2 on #173): a
+// FORWARD wall-clock step or host suspend/resume makes a LIVE push's hold
+// look ancient the instant the clock lands — but no real time passed for
+// the push, its refresher can only Chtimes an existing file, and dropping
+// or deleting the hold reopens the authority-CAS-to-local-transaction
+// window this machinery exists to close. Expiry therefore needs a second
+// observation: the first one past the wall TTL arms a reap marker and
+// keeps the hold fully live for readers, reservers, and the mint sweep.
+func TestPushHolds_ForwardJumpKeepsHoldLive(t *testing.T) {
+	repoDir := t.TempDir()
+	hold, err := mintPushHold(repoDir)
+	if err != nil {
+		t.Fatalf("mintPushHold: %v", err)
+	}
+	if err := os.WriteFile(hold, []byte("refs/heads/x\n"), 0o644); err != nil {
+		t.Fatalf("write hold: %v", err)
+	}
+	// As the resumed clock sees it, the hold was last touched >TTL ago.
+	old := time.Now().Add(-pushHoldTTL - time.Minute)
+	if err := os.Chtimes(hold, old, old); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
+	dir := filepath.Join(repoDir, pushHoldDir)
+	// Readers must keep it live on this first post-jump observation.
+	set, err := readPushHolds(dir, "")
+	if err != nil {
+		t.Fatalf("readPushHolds: %v", err)
+	}
+	if !set.contains("refs/heads/x") {
+		t.Fatal("forward clock jump dropped a live hold from readers: hydrate would materialize its in-flight ref mid-push")
+	}
+	// The mint sweep must not delete it either.
+	if _, err := mintPushHold(repoDir); err != nil {
+		t.Fatalf("second mint: %v", err)
+	}
+	if _, err := os.Stat(hold); err != nil {
+		t.Fatal("mint sweep deleted a live hold on its first expired-looking observation")
+	}
+	// Reservers must still honor the conflict.
+	prevWait := pushHoldWaitMax
+	pushHoldWaitMax = 200 * time.Millisecond
+	t.Cleanup(func() { pushHoldWaitMax = prevWait })
+	peer := filepath.Join(dir, "push-peer")
+	if err := reservePushHolds(context.Background(), peer, []string{"refs/heads/x"}); err == nil {
+		t.Fatal("a conflicting reservation went through against a live (suspended) hold")
+	}
+	// The owner's next refresher tick supersedes the suspicion.
+	touchPushHold(hold)
+	set, err = readPushHolds(dir, "")
+	if err != nil {
+		t.Fatalf("readPushHolds after revive: %v", err)
+	}
+	if !set.contains("refs/heads/x") {
+		t.Fatal("revived hold missing")
+	}
+}
+
+// TestPushHolds_LeakExpiresAfterReapGrace: the two-observation expiry
+// must still reap genuine crash leaks — once the reap marker (armed at
+// first observation) is older than the grace with no owner touch after
+// it, readers skip the hold and the sweep deletes it with its sidecars.
+func TestPushHolds_LeakExpiresAfterReapGrace(t *testing.T) {
+	repoDir := t.TempDir()
+	hold, err := mintPushHold(repoDir)
+	if err != nil {
+		t.Fatalf("mintPushHold: %v", err)
+	}
+	if err := os.WriteFile(hold, []byte("refs/heads/x\n"), 0o644); err != nil {
+		t.Fatalf("write hold: %v", err)
+	}
+	old := time.Now().Add(-2 * pushHoldTTL)
+	if err := os.Chtimes(hold, old, old); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
+	dir := filepath.Join(repoDir, pushHoldDir)
+	// First observation: live, and the reap marker is armed.
+	set, err := readPushHolds(dir, "")
+	if err != nil {
+		t.Fatalf("readPushHolds: %v", err)
+	}
+	if !set.contains("refs/heads/x") {
+		t.Fatal("first observation must keep the hold live")
+	}
+	reap := hold + pushHoldReapSuffix
+	if _, err := os.Stat(reap); err != nil {
+		t.Fatalf("first expired-looking observation did not arm the reap marker: %v", err)
+	}
+	// Age the MARKER past the grace: real observed time has now passed
+	// between two observations with no owner touch.
+	past := time.Now().Add(-pushHoldTTL/2 - time.Minute)
+	if err := os.Chtimes(reap, past, past); err != nil {
+		t.Fatalf("chtimes marker: %v", err)
+	}
+	set, err = readPushHolds(dir, "")
+	if err != nil {
+		t.Fatalf("readPushHolds: %v", err)
+	}
+	if set.contains("refs/heads/x") {
+		t.Fatal("leaked hold still live after the reap grace")
+	}
+	sweepExpiredPushHolds(dir)
+	if _, err := os.Stat(hold); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("sweep left the leaked hold: %v", err)
+	}
+	if _, err := os.Stat(reap); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("sweep left the reap marker: %v", err)
+	}
+}
+
+// TestPeerHoldCovers_StreamsWithoutParsing (Codex round-25 security P2 on
+// #173): every sidecar/JIT hook self-reservation runs in a fresh process,
+// so its peer-conflict check must stream the peer holds — building the
+// combined split+sorted set per hook turned a 1,024-command sidecar
+// against a 100k-name peer hold into ~1,000 repository-scale parses under
+// the reservation lock. Pins coverage-semantics parity with the set-based
+// path and the allocation bound that proves no per-name parsing.
+func TestPeerHoldCovers_StreamsWithoutParsing(t *testing.T) {
+	repoDir := t.TempDir()
+	dir := filepath.Join(repoDir, pushHoldDir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	var sb strings.Builder
+	for i := 0; i < 100_000; i++ {
+		fmt.Fprintf(&sb, "refs/heads/b/%06d\n", i)
+	}
+	peer := filepath.Join(dir, "push-peer")
+	if err := os.WriteFile(peer, []byte(sb.String()), 0o644); err != nil {
+		t.Fatalf("write peer hold: %v", err)
+	}
+	for _, tc := range []struct {
+		name string
+		want bool
+	}{
+		{"refs/heads/b/000123", true},   // exact
+		{"refs/heads/b", true},          // ancestor of held names
+		{"refs/heads/b/000123/x", true}, // descendant of a held name
+		{"refs/heads/b/0001", false},    // sibling prefix, no '/' boundary
+		{"refs/heads/zzz", false},       // disjoint
+	} {
+		got, err := peerHoldCovers(dir, "", tc.name)
+		if err != nil {
+			t.Fatalf("peerHoldCovers(%s): %v", tc.name, err)
+		}
+		if got != tc.want {
+			t.Errorf("peerHoldCovers(%s) = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+	// The exceptPath (our own hold) never conflicts with itself.
+	if got, err := peerHoldCovers(dir, peer, "refs/heads/b/000123"); err != nil || got {
+		t.Fatalf("except-path hold treated as a peer: got=%v err=%v", got, err)
+	}
+	// Allocation bound: scanning may not scale with the peer's NAME
+	// count. TotalAlloc is monotonic, so the delta is exact.
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	for i := 0; i < 10; i++ {
+		if _, err := peerHoldCovers(dir, "", "refs/heads/zzz"); err != nil {
+			t.Fatalf("peerHoldCovers: %v", err)
+		}
+	}
+	runtime.ReadMemStats(&after)
+	if delta := after.TotalAlloc - before.TotalAlloc; delta > 4<<20 {
+		t.Fatalf("peerHoldCovers allocated %d bytes across 10 scans of a 100k-name hold: it is parsing, not streaming", delta)
+	}
+}
+
+// TestValidateCacheDir (Codex round-25 P2 on #173): a cache root deep
+// enough that push-hold bookkeeping paths exceed the OS PATH_MAX must be
+// rejected when the operator's choice is accepted, not discovered as an
+// opaque mid-push failure.
+func TestValidateCacheDir(t *testing.T) {
+	if err := ValidateCacheDir(t.TempDir()); err != nil {
+		t.Fatalf("typical cache dir rejected: %v", err)
+	}
+	deep := "/" + strings.Repeat("d/", pushRefPathMax/2) + "x"
+	if err := ValidateCacheDir(deep); err == nil {
+		t.Fatal("a cache dir past the PATH_MAX budget must be rejected at acceptance time")
 	}
 }

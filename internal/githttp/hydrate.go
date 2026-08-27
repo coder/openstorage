@@ -1191,7 +1191,62 @@ const (
 	// verdicts dropped at the cap re-charged exactly the pushes big
 	// enough to need them). Hold READERS must skip it.
 	pushHoldVerifiedSuffix = ".verified"
+	// pushHoldReapSuffix marks a hold file OBSERVED past its wall-clock
+	// TTL: expiry needs a second, later observation (see pushHoldLive),
+	// and the marker's own mtime is the clock that separates the two.
+	pushHoldReapSuffix = ".reap"
 )
+
+// isPushHoldSidecar reports whether a hold-directory entry name is one of
+// a hold's sidecar artifacts rather than a hold file itself.
+func isPushHoldSidecar(name string) bool {
+	return strings.HasSuffix(name, pushHoldUnreservedSuffix) ||
+		strings.HasSuffix(name, pushHoldVerifiedSuffix) ||
+		strings.HasSuffix(name, pushHoldReapSuffix)
+}
+
+// pushHoldLive reports whether one hold-file observation counts as live,
+// deciding expiry across TWO observations instead of one wall-clock read
+// (Codex round-25 P2 on #173): after a FORWARD clock step or a host
+// suspend/resume, a LIVE push's hold looks ancient the moment the clock
+// lands — readers would expose its in-flight refs to hydration and the
+// next mint sweep would delete a file its refresher can only Chtimes,
+// never recreate — even though no real time passed for the push. A
+// wall-expired hold therefore first gains a reap marker stamped with the
+// CURRENT observation time and stays fully live; it expires only when a
+// later observation finds the marker itself older than TTL/2 with no
+// owner touch after it. The marker's clock starts at the anomaly's
+// discovery, so the grace measures real observed time: a suspended live
+// push is revived by its refresher (TTL/4 cadence, well inside the
+// grace), which advances the hold past the marker and re-arms suspicion
+// afresh, while a genuine crash leak — whose refresher is gone — ages out
+// within ~1.5 TTLs of its first observation, the same bound the
+// backward-step clamp below already accepts. Far-FUTURE mtimes (backward
+// steps, round-21/22) are still clamped to now and kept live.
+func pushHoldLive(path string, mtime time.Time) bool {
+	now := time.Now()
+	age := now.Sub(mtime)
+	if age < -pushHoldTTL {
+		_ = os.Chtimes(path, now, now)
+		return true
+	}
+	if age <= pushHoldTTL {
+		return true
+	}
+	reap := path + pushHoldReapSuffix
+	ri, err := os.Stat(reap)
+	if err != nil || !ri.ModTime().After(mtime) {
+		// No usable marker (none yet, or the owner touched the hold
+		// after the last suspicion): (re)arm one and keep the hold
+		// live. Concurrent observers racing here all stamp ~now.
+		if f, cerr := os.OpenFile(reap, os.O_CREATE|os.O_WRONLY, 0o600); cerr == nil {
+			_ = f.Close()
+		}
+		_ = os.Chtimes(reap, now, now)
+		return true
+	}
+	return now.Sub(ri.ModTime()) <= pushHoldTTL/2
+}
 
 // pushHoldTTL bounds a crash-leaked hold's life. A variable only so tests
 // can shrink it to observe the refresh machinery on test timescales;
@@ -1268,6 +1323,34 @@ func pushVerifiedVerdict(holdPath, name, old, new string) bool {
 	return false
 }
 
+// ValidateCacheDir rejects cache locations too deep for the push-hold
+// bookkeeping this package materializes beside each repository (Codex
+// round-25 P2): the deepest auxiliary path — a hold's unreserved-marker
+// sidecar entry — needs more room than git's own files, so a cache root
+// that leaves hydration and git ref locking working can still fail every
+// push with an opaque mid-push error. Validated once, where the operator's
+// choice is accepted (serve boot), against the target OS PATH_MAX with a
+// generous repo-component budget (repo directory names are
+// server-generated and short); the per-request mint stays the defensive
+// backstop for anything that slips through.
+func ValidateCacheDir(cacheDir string) error {
+	abs, err := filepath.Abs(cacheDir)
+	if err != nil {
+		return fmt.Errorf("cache dir %q: %w", cacheDir, err)
+	}
+	// <cacheDir>/<repo>.git/<hold dir>/push-<32 hex><.unreserved>/<64 hex> + NUL
+	const repoComponentBudget = 128 // server-generated IDs plus suffixes are ~30 bytes
+	deepest := len(abs) + 1 + repoComponentBudget + len(".git") +
+		1 + len(pushHoldDir) +
+		1 + len("push-") + 32 + len(pushHoldUnreservedSuffix) +
+		1 + 2*sha256.Size +
+		1 // NUL
+	if deepest > pushRefPathMax {
+		return fmt.Errorf("cache dir %q is too deep: push-hold bookkeeping paths would exceed the OS PATH_MAX budget (%d bytes); configure a shorter cache directory", abs, pushRefPathMax)
+	}
+	return nil
+}
+
 // mintPushHold returns the absolute path a receive-pack request's update
 // hooks record their in-flight refs in, creating the hold directory and
 // sweeping crash-leaked expired files. The file itself is created by the
@@ -1308,15 +1391,51 @@ func sweepExpiredPushHolds(dir string) {
 		if err != nil {
 			continue
 		}
+		path := filepath.Join(dir, e.Name())
+		if !isPushHoldSidecar(e.Name()) && !e.IsDir() {
+			// A hold file: reap only on the two-observation verdict
+			// (pushHoldLive — a single wall read misfires after a
+			// forward clock step, round-25), and take its sidecars
+			// with it so nothing orphans.
+			if !pushHoldLive(path, info.ModTime()) {
+				_ = os.Remove(path)
+				_ = os.RemoveAll(path + pushHoldUnreservedSuffix)
+				_ = os.RemoveAll(path + pushHoldVerifiedSuffix)
+				_ = os.Remove(path + pushHoldReapSuffix)
+			}
+			continue
+		}
+		// Sidecars live and die with their hold: while the hold FILE
+		// exists, its own verdict above owns their cleanup (sweeping a
+		// suspended live push's sidecar by wall age alone would strip
+		// its unreserved markers and let sidecar hooks skip their
+		// self-reservation). Only ORPHANS — crash windows between the
+		// hold's removal and its sidecars' — age out here, on the same
+		// clamped clock as before.
+		if base, ok := pushHoldSidecarBase(e.Name()); ok {
+			if _, err := os.Stat(filepath.Join(dir, base)); err == nil {
+				continue
+			}
+		}
 		switch age := time.Since(info.ModTime()); {
 		case age > pushHoldTTL:
 			// RemoveAll: unreserved sidecars are directories.
-			_ = os.RemoveAll(filepath.Join(dir, e.Name()))
+			_ = os.RemoveAll(path)
 		case age < -pushHoldTTL:
 			now := time.Now()
-			_ = os.Chtimes(filepath.Join(dir, e.Name()), now, now)
+			_ = os.Chtimes(path, now, now)
 		}
 	}
+}
+
+// pushHoldSidecarBase maps a sidecar entry name to its hold file's name.
+func pushHoldSidecarBase(name string) (string, bool) {
+	for _, suffix := range []string{pushHoldUnreservedSuffix, pushHoldVerifiedSuffix, pushHoldReapSuffix} {
+		if base, ok := strings.CutSuffix(name, suffix); ok {
+			return base, true
+		}
+	}
+	return "", false
 }
 
 // appendPushHolds records names in the push's hold file with one append
@@ -1461,11 +1580,10 @@ func (c *pushHoldDirCache) load() (pushHoldSet, error) {
 	live := make(map[string]holdFileParse, len(entries))
 	var key strings.Builder
 	for _, e := range entries {
-		// Sidecar directories mark a push's UNRESERVED names or verified
-		// verdicts — never holds (the IsDir check is defensive: nothing
-		// else creates directories here).
-		if strings.HasSuffix(e.Name(), pushHoldUnreservedSuffix) ||
-			strings.HasSuffix(e.Name(), pushHoldVerifiedSuffix) || e.IsDir() {
+		// Sidecar artifacts mark a push's UNRESERVED names, verified
+		// verdicts, or reap suspicion — never holds (the IsDir check is
+		// defensive: nothing else creates directories here).
+		if isPushHoldSidecar(e.Name()) || e.IsDir() {
 			continue
 		}
 		path := filepath.Join(c.dir, e.Name())
@@ -1479,21 +1597,16 @@ func (c *pushHoldDirCache) load() (pushHoldSet, error) {
 			}
 			continue
 		}
-		// The TTL check runs on every load — expiry is time-driven, not
-		// change-driven — so an expired hold drops out of the set on the
-		// next poll even though its file never changed. A far-FUTURE
-		// mtime means the wall clock stepped backward beneath the file —
-		// under a LIVE push, or a crash leak restored from a VM snapshot
-		// (Codex round-21 P2, round-22 P1): heal it to now and keep the
-		// hold LIVE — dropping a live push's reservation reopens the D/F
-		// pair race until its next refresher tick — so a leak still ages
-		// out within one TTL of first observation instead of waiting for
-		// wall time to catch up.
-		if age := time.Since(info.ModTime()); age > pushHoldTTL {
+		// The liveness check runs on every load — expiry is time-driven,
+		// not change-driven — so an expired hold drops out of the set on
+		// the next poll even though its file never changed. Clock
+		// anomalies in EITHER direction must not drop a live push's
+		// reservation (that reopens the D/F pair race until its next
+		// refresher tick): pushHoldLive clamps far-future mtimes
+		// (backward steps, round-21/22) and requires a second aged
+		// observation for far-past ones (forward steps, round-25).
+		if !pushHoldLive(path, info.ModTime()) {
 			continue
-		} else if age < -pushHoldTTL {
-			now := time.Now()
-			_ = os.Chtimes(path, now, now)
 		}
 		parse, ok := c.files[path]
 		if !ok || parse.size != info.Size() || parse.mtime != info.ModTime().UnixNano() {
@@ -1576,6 +1689,81 @@ func (s pushHoldSet) conflicts(name string) bool {
 	return s.holdsAncestorOf(name) || s.holdsDescendantOf(name)
 }
 
+// holdLineCovers reports whether scanned held line and candidate name
+// collide as exact names or strict directory/file relatives — the
+// allocation-free scalar twin of pushHoldSet.covers ([]byte-to-string
+// comparisons compile without conversions).
+func holdLineCovers(held []byte, name string) bool {
+	switch {
+	case len(held) == len(name):
+		return string(held) == name
+	case len(held) < len(name):
+		return len(held) > 0 && name[len(held)] == '/' && string(held) == name[:len(held)]
+	default:
+		return held[len(name)] == '/' && string(held[:len(name)]) == name
+	}
+}
+
+// peerHoldCovers reports whether any LIVE peer hold covers name,
+// streaming each peer file line by line instead of building the combined
+// sorted set (Codex round-25 security P2 on #173): every sidecar/JIT
+// update hook runs in its own PROCESS, so reservePushHolds' cross-poll
+// parse cache cannot amortize across them — a push carrying the full
+// 1,024-command sidecar bundled against a concurrent 100k-name hold
+// would otherwise pay ~1,000 repository-scale split+merge+sort parses
+// under the reservation lock. The scan allocates one fixed scanner
+// buffer, short-circuits on the first conflict, and costs one buffered
+// read of each live peer file. Fail CLOSED on read trouble, exactly like
+// the set-based path.
+func peerHoldCovers(dir, exceptPath, name string) (bool, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
+	}
+	for _, e := range entries {
+		if isPushHoldSidecar(e.Name()) || e.IsDir() {
+			continue
+		}
+		path := filepath.Join(dir, e.Name())
+		if path == exceptPath {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue // released between the listing and the stat
+			}
+			return false, err
+		}
+		if !pushHoldLive(path, info.ModTime()) {
+			continue
+		}
+		f, err := os.Open(path)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return false, err
+		}
+		sc := bufio.NewScanner(f)
+		for sc.Scan() {
+			if holdLineCovers(sc.Bytes(), name) {
+				_ = f.Close()
+				return true, nil
+			}
+		}
+		err = sc.Err()
+		_ = f.Close()
+		if err != nil {
+			return false, err
+		}
+	}
+	return false, nil
+}
+
 // pushHoldWaitMax bounds reservePushHolds' wait for D/F-conflicting holds
 // from other pushes; a var so tests can exercise the denial path quickly.
 // Hold windows are server-controlled and normally millisecond-scale.
@@ -1635,18 +1823,35 @@ func reservePushHolds(ctx context.Context, holdPath string, names []string) erro
 			}
 			return err
 		}
-		peers, err := cache.load()
-		if err != nil {
-			// Fail CLOSED: an unreadable peer hold is not proof of no
-			// conflict (Codex round-3 P1 on #173).
-			unlock()
-			return fmt.Errorf("push hold: reading peer holds: %w", err)
-		}
 		conflict := ""
-		for _, name := range names {
-			if peers.covers(name) {
-				conflict = name
-				break
+		if len(names) == 1 {
+			// The single-name case is every sidecar/JIT hook's
+			// self-reservation — a fresh process each, so the parse
+			// cache below cannot amortize for it (Codex round-25
+			// security P2): stream the peers instead of building the
+			// combined sorted set.
+			covered, err := peerHoldCovers(dir, holdPath, names[0])
+			if err != nil {
+				// Fail CLOSED: an unreadable peer hold is not proof of
+				// no conflict (Codex round-3 P1 on #173).
+				unlock()
+				return fmt.Errorf("push hold: reading peer holds: %w", err)
+			}
+			if covered {
+				conflict = names[0]
+			}
+		} else {
+			peers, err := cache.load()
+			if err != nil {
+				// Fail CLOSED (round-3 P1), as above.
+				unlock()
+				return fmt.Errorf("push hold: reading peer holds: %w", err)
+			}
+			for _, name := range names {
+				if peers.covers(name) {
+					conflict = name
+					break
+				}
 			}
 		}
 		if conflict == "" {
@@ -1778,8 +1983,7 @@ func livePushHoldsKey(repoPath string) (string, bool) {
 	}
 	var key strings.Builder
 	for _, e := range entries {
-		if strings.HasSuffix(e.Name(), pushHoldUnreservedSuffix) ||
-			strings.HasSuffix(e.Name(), pushHoldVerifiedSuffix) || e.IsDir() {
+		if isPushHoldSidecar(e.Name()) || e.IsDir() {
 			continue
 		}
 		path := filepath.Join(dir, e.Name())
@@ -1790,11 +1994,8 @@ func livePushHoldsKey(repoPath string) (string, bool) {
 			}
 			return "", false
 		}
-		if age := time.Since(info.ModTime()); age > pushHoldTTL {
+		if !pushHoldLive(path, info.ModTime()) {
 			continue
-		} else if age < -pushHoldTTL {
-			now := time.Now()
-			_ = os.Chtimes(path, now, now)
 		}
 		fmt.Fprintf(&key, "%s\x00%d\x00%d\x01", path, info.Size(), info.ModTime().UnixNano())
 	}

@@ -171,6 +171,7 @@ func postReceiveHook() error {
 		_ = os.Remove(holdPath)
 		_ = os.RemoveAll(holdPath + pushHoldUnreservedSuffix)
 		_ = os.RemoveAll(holdPath + pushHoldVerifiedSuffix)
+		_ = os.Remove(holdPath + pushHoldReapSuffix)
 	}
 	// Then drain the updated-ref list git feeds on stdin (unused):
 	// exiting with the pipe unread risks EPIPE noise on receive-pack's
@@ -365,6 +366,14 @@ func preReceive(ctx context.Context) error {
 			denied := false
 			if !atomicPush {
 				denied = classes[i] == reservationDenied
+				if classes[i] == reservationJIT {
+					// Neither bulk-reserved nor sidecar-diverted (no
+					// marker, no cap charge): the ref's own hook
+					// re-derives this class and reserves just-in-time
+					// after its real ancestry check passes (Codex
+					// round-25 P2 — see reservationJIT).
+					continue
+				}
 			}
 			if !updatable[i] || denied {
 				unreserved = append(unreserved, c.ref)
@@ -1429,8 +1438,15 @@ func updateHook(ctx context.Context, args []string) (retErr error) {
 	// rare divergence case) pay the full atomic check+reserve.
 	bulkReserved := false
 	if holdPath != "" {
+		// Just-in-time reservations (Codex round-25 P2): a no-force-push
+		// UPDATE was deliberately neither bulk-reserved nor
+		// sidecar-marked — its reservability needed the ancestry check
+		// that just passed above. Re-derived budget-free from the same
+		// policy env pre-receive classified with (no subprocess), so the
+		// two verdicts cannot diverge.
+		jit := errors.Is(evalRefPolicy(ctx, repo, refName, old, new, false), errReservationNeedsAncestry)
 		switch _, err := os.Stat(pushHoldUnreservedMarker(holdPath, refName)); {
-		case errors.Is(err, os.ErrNotExist):
+		case errors.Is(err, os.ErrNotExist) && !jit:
 			// Bulk-reserved (no sidecar, or this ref not marked); verify
 			// the reservation file actually exists (fail closed, one
 			// stat).
@@ -1438,9 +1454,10 @@ func updateHook(ctx context.Context, args []string) (retErr error) {
 				return fmt.Errorf("update: push hold reservation missing (pre-receive owns it): %w", err)
 			}
 			bulkReserved = true
-		case err != nil:
+		case err != nil && !errors.Is(err, os.ErrNotExist):
 			return fmt.Errorf("update: check unreserved marker: %w", err)
 		default:
+			// Sidecar-marked, or a just-in-time no-force reservation.
 			// A denial after this self-reservation releases it via the
 			// shared deferred release above (Codex round-16 P2): a
 			// sidecar-listed creation denied by the commit-time D/F probe
@@ -1784,6 +1801,21 @@ const (
 	reservationAllowed reservationClass = iota
 	reservationDenied
 	reservationNeedsVerify
+	// reservationJIT defers the reservation to the command's own update
+	// hook (Codex round-25 P2): a no-force-push UPDATE's verdict needs
+	// the ancestry subprocess, which classification must never launch
+	// (round-14 security P2) — but bulk-reserving it on faith let a
+	// crafted push sort one doomed rewind of a protected name AFTER
+	// thousands of slow commands and keep the name held until its own
+	// hook finally ran the check, timing out exactly the legitimate
+	// fast-forwards no-force-push exists to protect. Such commands are
+	// neither bulk-reserved nor sidecar-diverted (no marker inode, no
+	// cap charge): their hooks re-derive this class from the same policy
+	// env and self-reserve just-in-time, strictly AFTER their own full
+	// policy check passed — a denied rewind never holds anything, and
+	// the reserve→CAS→local-update ordering the skip proof needs is
+	// exactly the sidecar path's.
+	reservationJIT
 )
 
 // errReservationNeedsSig is evalRefPolicy's budget-free sentinel for
@@ -1791,12 +1823,19 @@ const (
 // the reservation filter may trust without real verification.
 var errReservationNeedsSig = errors.New("signature-gated command needs real verification")
 
+// errReservationNeedsAncestry is the budget-free sentinel for
+// no-force-push UPDATES: reservable only just-in-time by the ref's own
+// hook, after the real ancestry check (see reservationJIT).
+var errReservationNeedsAncestry = errors.New("no-force-push update needs the ancestry check")
+
 func classifyReservation(repo, refName, old, new string) reservationClass {
 	switch err := evalRefPolicy(context.Background(), repo, refName, old, new, false); {
 	case err == nil:
 		return reservationAllowed
 	case errors.Is(err, errReservationNeedsSig):
 		return reservationNeedsVerify
+	case errors.Is(err, errReservationNeedsAncestry):
+		return reservationJIT
 	default:
 		return reservationDenied
 	}
@@ -1912,20 +1951,24 @@ func evalRefPolicy(ctx context.Context, repo, refName, old, new string, fullEval
 					return fmt.Errorf("policy no-force-push denies deletion of %s", refName)
 				}
 				// Budget-free callers (the reservation classifier) skip
-				// the ancestry subprocess and treat the update as
-				// reservable (Codex round-14 security P2: a no-pack push
-				// advancing thousands of refs from DISTINCT old commits
-				// would otherwise launch one git merge-base per pair in
-				// pre-receive — the memo only dedupes identical pairs —
-				// on top of the one each update hook process pays
-				// anyway). Reserving a doomed non-fast-forward update
-				// squats nothing: its name already exists in the
-				// authority, which blocks D/F relatives regardless, and
-				// any git:write pusher could hold the same name with a
-				// valid update. The commit is still policed — the ref's
-				// own update hook re-runs this check with fullEval
-				// before its CAS.
-				if fullEval && !isAncestor(old, new) {
+				// the ancestry subprocess (Codex round-14 security P2: a
+				// no-pack push advancing thousands of refs from DISTINCT
+				// old commits would otherwise launch one git merge-base
+				// per pair in pre-receive — the memo only dedupes
+				// identical pairs — on top of the one each update hook
+				// process pays anyway) and route the update to a
+				// JUST-IN-TIME reservation by its own hook (Codex
+				// round-25 P2: bulk-reserving it on faith let a doomed
+				// rewind, sorted last in a crafted push, squat the
+				// protected name through every earlier hook's runtime —
+				// its denial-release only fires once its own hook runs).
+				// The commit is still policed — the ref's own update
+				// hook re-runs this check with fullEval before its CAS,
+				// and reserves only if it passes.
+				if !fullEval {
+					return fmt.Errorf("%s: %w", refName, errReservationNeedsAncestry)
+				}
+				if !isAncestor(old, new) {
 					return fmt.Errorf("policy no-force-push denies non-fast-forward update to %s", refName)
 				}
 			}

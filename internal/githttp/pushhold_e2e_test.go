@@ -1055,6 +1055,112 @@ func TestServiceRPC_ReleasesPushHoldBeforeRepackTrigger(t *testing.T) {
 	}
 }
 
+// TestPush_TrailingDoomedRewindDoesNotHoldProtectedName (Codex round-25
+// P2 on #173): the budget-free classifier cannot know a no-force-push
+// UPDATE's ancestry verdict, and bulk-reserving it on faith let a crafted
+// push sort one doomed rewind of a protected name AFTER other slow
+// commands — the denial release only fires when the rewind's own hook
+// runs, so the name stayed held through every earlier hook, timing out
+// exactly the legitimate fast-forwards the policy protects. Such updates
+// now reserve JUST-IN-TIME in their own hook, after the real ancestry
+// check passes. Pinned by pausing an EARLIER command's hook (one-shot
+// barrier) while the trailing rewind has not run: the protected name must
+// not be held (a legitimate fast-forward push lands immediately), and a
+// fast-forward under the same policy must still commit through the JIT
+// reserve→CAS path afterwards.
+func TestPush_TrailingDoomedRewindDoesNotHoldProtectedName(t *testing.T) {
+	repo := registerRepo(t, "t-jit-trailing-rewind")
+	work := initWorkRepo(t)
+	token := mintTestToken(t, repo, "git:read,git:write", "")
+	v1 := revParse(t, work, "HEAD")
+	mustGit(t, work, "commit", "--allow-empty", "-m", "advance protected to v2")
+	mustGit(t, work, "push", remoteURL(nodeA, repo, token),
+		"HEAD:refs/heads/main", "HEAD:refs/heads/protected")
+
+	// Concurrent pusher C: clone at v2, one commit ahead for its
+	// fast-forward of protected.
+	workC := filepath.Join(t.TempDir(), "clone-c")
+	mustGit(t, "", "clone", work, workC)
+	mustGit(t, workC, "commit", "--allow-empty", "-m", "C: fast-forward to v3")
+	headC := revParse(t, workC, "HEAD")
+
+	// B's main tip is a NEW commit so the push carries a pack an allowed
+	// command needs (publication-gate requirement).
+	mustGit(t, work, "commit", "--allow-empty", "-m", "B: new tip for main")
+	headB := revParse(t, work, "HEAD")
+
+	barrier := filepath.Join(t.TempDir(), "update-barrier")
+	nodeCache := t.TempDir()
+	node, err := startNode(nodeCache, EnvUpdateBarrier+"="+barrier)
+	if err != nil {
+		t.Fatalf("start node: %v", err)
+	}
+	t.Cleanup(node.stop)
+	noff := mintTestToken(t, repo, "git:read,git:write", `[["refs/heads/protected",["no-force-push"]]]`)
+
+	type pushResult struct {
+		out string
+		err error
+	}
+	// Push B: the fast-forward of main runs FIRST — git orders updates
+	// of advertised refs before other commands, in advertisement order,
+	// and "main" precedes "protected" (verified against this server: a
+	// bundled CREATION's hook ran after the rewind's regardless of the
+	// client's argument order). Its hook consumes the one-shot barrier
+	// and pauses post-CAS; the doomed protected rewind (v2 -> v1) runs
+	// LAST, so its hook has not executed while the barrier holds — which
+	// was exactly the pre-fix squat window.
+	doneB := make(chan pushResult, 1)
+	go func() {
+		out, err := tryGit(work, "push", "--force", remoteURL(node, repo, noff),
+			"HEAD:refs/heads/main", v1+":refs/heads/protected")
+		doneB <- pushResult{out, err}
+	}()
+	t.Cleanup(func() { _ = os.WriteFile(barrier+".release", nil, 0o644) })
+	waitForFile(t, barrier+".ready", 30*time.Second)
+
+	// The trailing rewind must not be holding the protected name.
+	holds, err := readPushHolds(filepath.Join(RepoPath(nodeCache, repo), pushHoldDir), "")
+	if err != nil {
+		t.Fatalf("readPushHolds: %v", err)
+	}
+	if holds.covers("refs/heads/protected") {
+		t.Fatal("the trailing unevaluated rewind bulk-reserved the protected name")
+	}
+	// And a legitimate fast-forward lands immediately while B is paused.
+	outC, errC := tryGit(workC, "push", remoteURL(node, repo, token), "HEAD:refs/heads/protected")
+	if errC != nil {
+		t.Fatalf("fast-forward blocked by the trailing rewind's reservation: %v\n%.1500s", errC, outC)
+	}
+
+	if err := os.WriteFile(barrier+".release", nil, 0o644); err != nil {
+		t.Fatalf("release barrier: %v", err)
+	}
+	resB := <-doneB
+	if resB.err == nil {
+		t.Fatal("push B fully succeeded; the trailing rewind was supposed to be denied per-ref")
+	}
+	refs := pgRefs(t, repo)
+	if refs["refs/heads/protected"] != headC {
+		t.Fatalf("authority protected = %.8s, want C's fast-forward %.8s", refs["refs/heads/protected"], headC)
+	}
+	if got := refs["refs/heads/main"]; got != headB {
+		t.Fatalf("B's valid fast-forward of main = %.8s, want %.8s", got, headB)
+	}
+
+	// The JIT reserve→CAS path itself: a fast-forward of the protected
+	// name under the SAME policy reserves in its own hook and commits
+	// (workC's HEAD is headC — exactly the authority's current value).
+	mustGit(t, workC, "commit", "--allow-empty", "-m", "C: v4 fast-forward under policy")
+	headD := revParse(t, workC, "HEAD")
+	if out, err := tryGit(workC, "push", remoteURL(node, repo, noff), "HEAD:refs/heads/protected"); err != nil {
+		t.Fatalf("fast-forward under no-force-push failed through the JIT reservation: %v\n%.1500s", err, out)
+	}
+	if got := pgRefs(t, repo)["refs/heads/protected"]; got != headD {
+		t.Fatalf("authority protected = %.8s, want %.8s", got, headD)
+	}
+}
+
 // TestPush_ConcurrentPushProceedsDuringPublication (Codex round-23
 // security P2 on #173): the hold reservation must not span pack
 // publication — upload/registration/verification is unbounded backend
