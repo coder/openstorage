@@ -185,7 +185,27 @@ type refCommand struct{ old, new, ref string }
 //   - die after PG commit, before ref CAS    => registered-but-unreferenced pack
 //
 // Refs are never touched here, so a broken ref is impossible.
-func preReceive(ctx context.Context) error {
+func preReceive(ctx context.Context) (retErr error) {
+	// A pre-receive error rejects the WHOLE push: git runs no update hook
+	// and no post-receive — the primary release — so nothing this process
+	// reserved can ever commit, and the only remaining release would be
+	// the handler fallback, which fires after receive-pack drains its
+	// per-ref report to the client, a write a non-reading client can
+	// stall indefinitely while the handler refresher keeps the hold fresh
+	// (Codex round-29 P2 on #173: the post-reservation base-check and D/F
+	// probe error paths returned with every reserved name still held,
+	// blocking same-name and D/F-relative pushes into their reservation
+	// timeouts). Release the whole hold on any error — the same reasoning
+	// as the atomic update-hook denial release, and a no-op for errors
+	// before the reservation existed.
+	defer func() {
+		if retErr == nil {
+			return
+		}
+		if holdPath := os.Getenv(EnvPushHold); holdPath != "" {
+			removePushHoldFiles(holdPath)
+		}
+	}()
 	repo := mustEnv(EnvRepo)
 	// git sets GIT_QUARANTINE_PATH only when the client transfers objects;
 	// delete-only pushes invoke pre-receive without it.

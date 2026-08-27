@@ -12,6 +12,7 @@ package githttp
 import (
 	"context"
 	"crypto/sha1"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -1447,6 +1448,64 @@ type countingRefStore struct {
 func (c *countingRefStore) ListRefsAfter(ctx context.Context, repo, after string, limit int) ([]ref.RefEntry, error) {
 	c.listPages.Add(1)
 	return c.Store.ListRefsAfter(ctx, repo, after, limit)
+}
+
+// TestPreReceive_PostReservationDenialReleasesHold (Codex round-29 P2 on
+// #173): a pre-receive error AFTER the hold reservation — here the atomic
+// base check catching a stale advertised base — rejects the whole push:
+// git runs no update hook and no post-receive, so the only remaining
+// release was the handler fallback behind receive-pack's client-stallable
+// report drain, with the handler refresher keeping every reserved name
+// held into concurrent pushes' reservation timeouts. Pre-receive must
+// release the whole hold on any error return.
+func TestPreReceive_PostReservationDenialReleasesHold(t *testing.T) {
+	t.Setenv("CODESTORAGE_PG_URL", dbURL)
+	laneStore, _ := openLaneStores(t)
+	repo := "t-prereceive-denial-release"
+	shaA := strings.Repeat("a", 40)
+	shaB := strings.Repeat("b", 40)
+	if _, err := laneStore.CASRef(context.Background(), repo, "refs/heads/main", ref.ZeroSHA, shaA); err != nil {
+		t.Fatalf("seed authority ref: %v", err)
+	}
+	// The no-pack path verifies the pushed object exists in the cwd repo
+	// before reserving; run the hook from a work repo that has a commit.
+	work := initWorkRepo(t)
+	newSHA := revParse(t, work, "HEAD")
+	t.Chdir(work)
+
+	holdPath := filepath.Join(t.TempDir(), pushHoldDir, "push-prereceive")
+	if err := os.MkdirAll(filepath.Dir(holdPath), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	t.Setenv(EnvRepo, repo)
+	t.Setenv(EnvPushHold, holdPath)
+	t.Setenv(EnvAtomic, "1")
+
+	// stdin claims the ref sits at shaB while the authority holds shaA: the
+	// atomic base check inside reserveHoldsAndProbe denies AFTER the
+	// reservation landed.
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	oldStdin := os.Stdin
+	os.Stdin = r
+	t.Cleanup(func() { os.Stdin = oldStdin; _ = r.Close() })
+	if _, err := fmt.Fprintf(w, "%s %s refs/heads/main\n", shaB, newSHA); err != nil {
+		t.Fatalf("write stdin: %v", err)
+	}
+	_ = w.Close()
+
+	hookErr := RunHook(context.Background(), []string{"pre-receive"})
+	if hookErr == nil || !strings.Contains(hookErr.Error(), "moved concurrently") {
+		t.Fatalf("stale atomic base must deny the push, got %v", hookErr)
+	}
+	if _, statErr := os.Stat(holdPath); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("pre-receive denial after reservation must release the whole hold: %v", statErr)
+	}
+	if _, statErr := os.Stat(holdPath + pushHoldVerifiedSuffix); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("denial must release the verified-verdict sidecar too: %v", statErr)
+	}
 }
 
 // TestHydrate_HeldSkipDoesNotRescanPerRequest (Codex round-22 security

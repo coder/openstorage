@@ -1691,6 +1691,18 @@ func TestReservePushHolds_PeerScanWorkBounded(t *testing.T) {
 	if _, statErr := os.Stat(hold + pushHoldScanSuffix); !errors.Is(statErr, os.ErrNotExist) {
 		t.Fatalf("release must remove the scan-work counter: %v", statErr)
 	}
+	// The MULTI-name path (every compact ≥2-command push is a fresh
+	// pre-receive process whose first load parses the whole peer set)
+	// charges the same allowance (Codex round-29 security P2) — it was
+	// initially budgeted only for len(names)==1.
+	hold2 := filepath.Join(dir, "push-self2")
+	if err := reservePushHolds(context.Background(), hold2, []string{"refs/heads/m1", "refs/heads/m2"}); err != nil {
+		t.Fatalf("first multi-name reservation: %v", err)
+	}
+	err = reservePushHolds(context.Background(), hold2, []string{"refs/heads/m3", "refs/heads/m4"})
+	if err == nil || !strings.Contains(err.Error(), "scan allowance") {
+		t.Fatalf("over-allowance multi-name reservation must be denied, got %v", err)
+	}
 }
 
 // TestReservePushHolds_EmptySetSkipsPeerScan (Codex round-28 security P2

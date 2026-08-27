@@ -1585,7 +1585,8 @@ type pushHoldDirCache struct {
 	set    pushHoldSet
 	setKey string // "path\x00size\x00mtime\x01..." fingerprint the set was built from
 
-	parses int // test seam: number of ReadFile+split parses performed
+	parses      int   // test seam: number of ReadFile+split parses performed
+	parsedBytes int64 // bytes actually re-read across loads (unchanged files cost a stat)
 }
 
 type holdFileParse struct {
@@ -1647,6 +1648,7 @@ func (c *pushHoldDirCache) load() (pushHoldSet, error) {
 				continue
 			}
 			c.parses++
+			c.parsedBytes += int64(len(b))
 			parse = holdFileParse{size: info.Size(), mtime: info.ModTime().UnixNano(), names: nil}
 			for _, held := range strings.Split(string(b), "\n") {
 				if held != "" {
@@ -1944,11 +1946,35 @@ func reservePushHolds(ctx context.Context, holdPath string, names []string) erro
 				conflict = names[0]
 			}
 		} else {
+			// The multi-name path charges the same push-wide allowance as
+			// the single-name one (Codex round-29 security P2): the parse
+			// cache amortizes only WITHIN this call's poll iterations —
+			// every compact doomed push is a fresh pre-receive process
+			// whose first load parses the entire peer set under the
+			// reservation flock. Charged by bytes actually re-read
+			// (unchanged files cost a stat), so one waiting reserver's
+			// polls do not re-bill an unchanged repository-scale peer.
+			used, err := readPushScanWork(holdPath)
+			if err != nil {
+				unlock()
+				return fmt.Errorf("push hold: scan-work counter: %w", err)
+			}
+			if used > maxPushPeerScanBytes {
+				unlock()
+				return fmt.Errorf("push hold: push exceeded its peer-hold scan allowance against unusually large concurrent push holds; retry shortly or split the push")
+			}
+			before := cache.parsedBytes
 			peers, err := cache.load()
 			if err != nil {
 				// Fail CLOSED (round-3 P1), as above.
 				unlock()
 				return fmt.Errorf("push hold: reading peer holds: %w", err)
+			}
+			if n := cache.parsedBytes - before; n > 0 {
+				if err := writePushScanWork(holdPath, used+n); err != nil {
+					unlock()
+					return fmt.Errorf("push hold: scan-work counter: %w", err)
+				}
 			}
 			for _, name := range names {
 				if peers.covers(name) {
