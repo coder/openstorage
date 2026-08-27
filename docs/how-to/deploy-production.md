@@ -529,13 +529,14 @@ its own disk, and the same `CODESTORAGE_SECRETS_KEY` if one encrypts the metadat
 store's secret columns — provisioned from your config/secret store like any other
 deployment.
 
-**The lease lifecycle in practice.** The `_wal/instance-lease` guard has one operational
-consequence for restarts: the current binary does not release the lease on shutdown
-(release-on-shutdown is tracked as a known issue), so after *any* stop — graceful or
-crash — a replacement started early refuses with `s3wal instance lease
-_wal/instance-lease is held by another serve process …` until the stale lease ages past
+**The lease lifecycle in practice.** A [graceful shutdown](#rolling-upgrades-and-restarts)
+(`SIGTERM`/`SIGINT`) releases `_wal/instance-lease` on the way out (a bounded best-effort
+delete — 5 seconds — after the bounded HTTP drain), so a successor starts immediately.
+After a **hard stop** (`SIGKILL`, crash, power loss) the lease stays behind: a replacement
+started early refuses with `s3wal instance lease _wal/instance-lease is held by another
+serve process …` until the stale lease ages past
 [`CODESTORAGE_S3WAL_LEASE_TTL`](../reference/configuration.md#codestorage_s3wal_lease_ttl)
-(default 2 minutes), then boots normally by stealing it. To skip the wait, delete
+(default 2 minutes), then boots normally by stealing it. To skip that wait, delete
 `_wal/instance-lease` — only after confirming the old process is actually dead: deleting
 it under a live node re-creates the undetected dual-serve topology the lease exists to
 catch. While running, the node heartbeats every TTL/4 and **fail-stops** (exits) if the

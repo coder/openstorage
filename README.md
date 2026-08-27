@@ -198,10 +198,11 @@ git -c user.name=demo -c user.email=demo@example.com commit --allow-empty -m ini
 git push origin HEAD:main
 ```
 
-Kill the process, delete the cache dir — a fresh node pointed at the same bucket
-reconstructs full service. One catch: the replacement refuses to start until the old
-node's instance lease expires (up to 2 minutes by default); after confirming the old
-process is dead, delete the lease to skip the wait:
+Kill the process (plain `kill` — graceful shutdown releases the instance lease), delete
+the cache dir — a fresh node pointed at the same bucket reconstructs full service. After
+a *hard* stop (`kill -9`, machine loss) the replacement instead waits for the old lease
+to expire (up to 2 minutes by default); once the old process is confirmed dead, delete
+the lease to skip the wait:
 
 ```sh
 curl -sf -X DELETE http://127.0.0.1:8333/codestorage/_wal/instance-lease
