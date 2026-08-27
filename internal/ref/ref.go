@@ -81,6 +81,30 @@ type RefEntry struct {
 	SHA  string
 }
 
+// HydrateSnapshot is one coherent point-in-time view of a repo's
+// hydration inputs: its generation, its registered packs (oldest first,
+// the ListPacks order), and its FULL ref set (ascending byte order of
+// name, the ListRefsAfter order).
+type HydrateSnapshot struct {
+	Generation int64
+	Packs      []Pack
+	Refs       []RefEntry
+}
+
+// HydrateSnapshotter is an optional RefStore capability (issue #182) for
+// backends whose GetGeneration/ListPacks/ListRefsAfter reads each cost a
+// full round trip over the SAME underlying object: s3wal re-fetches the
+// whole base manifest per call, so a hydrate pass that consumed them
+// separately paid three-plus round trips for one object's state. Backends
+// implement this ONLY when (a) the three views can be served from one
+// atomic read and (b) the full ref set is inherently bounded (the s3wal
+// manifest hard cap) — SQL backends keep the issue-#119 paged scan, whose
+// per-page cost is a cheap query, and never materialize unbounded ref
+// tables.
+type HydrateSnapshotter interface {
+	HydrateSnapshot(ctx context.Context, repo string) (HydrateSnapshot, error)
+}
+
 // RefStore is the ref-authority contract: refs only ever change through
 // CASRef, and packs are registered strictly after their bytes are durable
 // in blob storage.

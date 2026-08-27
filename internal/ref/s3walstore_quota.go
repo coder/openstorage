@@ -160,6 +160,12 @@ func (s *S3WAL) ReservePackBytes(ctx context.Context, group []string, packs []Pa
 	minted := false
 	err := s.mutate(ctx, base, s3walMutation{
 		op: "reserve pack bytes",
+		// The self-healing GC below records the fleet-global lapse
+		// marker BEFORE this CAS commits — an externalized write that
+		// must never fire off an unvalidated seed (see
+		// s3walMutation.noSeed for why no fitness predicate can make a
+		// seed safe here).
+		noSeed: true,
 		// Growth is dynamic: only freshly MINTED rows add entries — a
 		// same-key refresh mutates an existing row in place, and the
 		// self-healing GC only shrinks.
@@ -450,6 +456,9 @@ func (s *S3WAL) SweepExpiredPackReservations(ctx context.Context, olderThan time
 		var pruned int64
 		err := s.mutate(ctx, base, s3walMutation{
 			op: "sweep reservations",
+			// Same externalized lapse marker as ReservePackBytes: never
+			// derived from a seed (see s3walMutation.noSeed).
+			noSeed: true,
 			fn: func(m *s3wal.Manifest, clk time.Time) (bool, error) {
 				pruned = 0
 				doomedCover := ""
