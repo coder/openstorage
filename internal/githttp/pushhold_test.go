@@ -347,6 +347,32 @@ func TestReservePushHolds_LockAcquisitionBounded(t *testing.T) {
 	}
 }
 
+// TestPushRefUpdatable pins the committable-name rules: namespaced refs of
+// bounded depth pass; namespace roots, non-refs names, malformed segments,
+// and attacker-chosen depth amplification are refused.
+func TestPushRefUpdatable(t *testing.T) {
+	deep := "refs/heads" + strings.Repeat("/x", maxPushRefDepth)
+	ok := "refs/heads" + strings.Repeat("/x", maxPushRefDepth-2)
+	for name, want := range map[string]bool{
+		"refs/heads/main":        true,
+		"refs/tags/v1.0.0":       true,
+		"refs/heads/feat/deep/x": true,
+		ok:                       true,
+		"refs/heads":             false, // namespace root
+		"refs":                   false,
+		"HEAD":                   false,
+		"refs/heads/":            false, // empty segment
+		"refs//x":                false,
+		"refs/heads/..":          false,
+		"refs/heads/x.lock":      false,
+		deep:                     false, // depth cap
+	} {
+		if got := pushRefUpdatable(name); got != want {
+			t.Errorf("pushRefUpdatable(%q) = %v, want %v", name, got, want)
+		}
+	}
+}
+
 // TestHydrate_SkippedHeldRefSuppressesMarker: a full sync that skipped a
 // held ref must not advance the generation marker — otherwise a fresh
 // marker could vouch for a generation whose held ref the cache never

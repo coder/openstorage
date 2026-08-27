@@ -1208,8 +1208,12 @@ func touchPushHold(holdPath string) {
 
 // startPushHoldRefresh keeps holdPath fresh on a TTL/4 cadence until the
 // returned stop function runs (or the hook process dies — exactly the
-// condition the TTL is meant to detect).
+// condition the TTL is meant to detect). The first touch is synchronous
+// (Codex round-5 P2 on #173): a sequence of hooks each shorter than one
+// ticker period would otherwise never touch the file at all, and a push
+// whose hook phase outlives the TTL would lose its hold mid-flight.
 func startPushHoldRefresh(holdPath string) (stop func()) {
+	touchPushHold(holdPath)
 	done := make(chan struct{})
 	var wg sync.WaitGroup
 	wg.Add(1)

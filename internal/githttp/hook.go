@@ -225,7 +225,14 @@ func preReceive(ctx context.Context) error {
 	if holdPath := os.Getenv(EnvPushHold); holdPath != "" {
 		names := make([]string, 0, len(commands))
 		for i, c := range commands {
-			if verdicts[i] == nil {
+			// Reserve only names this server could ever commit (Codex
+			// round-5 security P2): git hands namespace roots like the
+			// literal refs/heads to pre-receive yet can never complete
+			// their local update, and reserving one would hold a D/F
+			// ancestor of the whole namespace. The update hook denies
+			// such names fail-closed, so skipping them here loses no
+			// protection.
+			if verdicts[i] == nil && pushRefUpdatable(c.ref) {
 				names = append(names, c.ref)
 			}
 		}
@@ -553,6 +560,41 @@ func preReceive(ctx context.Context) error {
 	return regErr
 }
 
+// maxPushRefDepth caps the path depth of refs this server will commit.
+// Git imposes no limit, but no legitimate layout nests remotely this deep,
+// and depth is attacker-chosen amplification: the authority D/F probe
+// costs one point-read per ancestor segment (Codex round-5 security P2 on
+// #173 demonstrated a 3KB ref name with 1,502 segments = 1,502 store reads
+// per tiny push command). Deny-with-message keeps the bound explicit.
+const maxPushRefDepth = 32
+
+// pushRefUpdatable reports whether receive-pack could ever commit name on
+// this server: a properly namespaced ref (refs/<ns>/<name>...) of bounded
+// depth with sane path segments. Namespace ROOTS (e.g. the literal
+// refs/heads) matter for security (Codex round-5 security P2): git hands
+// them to pre-receive but can never complete their local update in a cache
+// repo (the namespace directory always exists), so reserving one would let
+// a restricted token hold a D/F ancestor of EVERY ref in that namespace
+// for the push window. Used to filter reservations and, fail-closed, to
+// deny such names in the update hook — where the depth cap also bounds the
+// authority D/F probe's per-ref work.
+func pushRefUpdatable(name string) bool {
+	rest, ok := strings.CutPrefix(name, "refs/")
+	if !ok || !strings.Contains(rest, "/") {
+		return false
+	}
+	segs := strings.Split(name, "/")
+	if len(segs) > maxPushRefDepth {
+		return false
+	}
+	for _, seg := range segs {
+		if seg == "" || seg == "." || seg == ".." || strings.HasSuffix(seg, ".lock") {
+			return false
+		}
+	}
+	return true
+}
+
 // intraPushDFCheck denies a push whose OWN command set cannot land in one
 // git ref store (Codex round-3 P1 on #173): the authority CAS is keyed by
 // exact ref name, so a D/F-conflicting command set — refs/heads/a and
@@ -709,28 +751,46 @@ func updateHook(ctx context.Context, args []string) error {
 	if !ref.ValidSHA(old) || !ref.ValidSHA(new) {
 		return fmt.Errorf("update: malformed sha for %s", refName)
 	}
+	// Names this server will never commit are denied outright: namespace
+	// roots cannot complete their local update anyway, and the depth cap
+	// bounds the authority D/F probe below to maxPushRefDepth point-reads
+	// per created ref — ref depth is attacker-chosen amplification against
+	// the shared store otherwise (Codex round-5 security P2 on #173).
+	if !pushRefUpdatable(refName) {
+		return fmt.Errorf("update: ref name %s is not updatable here (namespace root, malformed segment, or deeper than %d segments)", refName, maxPushRefDepth)
+	}
 	repo := mustEnv(EnvRepo)
 
-	// Push hold (issue #170): pre-receive reserved holds for every ref of
-	// this push before any update hook could run (reservePushHolds), so
-	// this ref's hold precedes the CAS below. Two duties remain here:
-	// refresh the shared hold file across this hook's FULL runtime —
-	// pre-CAS policy/fence work and unbounded post-CAS decorator work
-	// alike, because in an atomic push an EARLIER hook's committed CAS
-	// relies on later hooks keeping the file fresh until git's final local
-	// transaction (Codex round-2 P2 on #173) — and fail closed if the
-	// reservation is somehow missing (an O(1) stat: per-ref content checks
-	// would re-read the growing file once per hook and go quadratic on
-	// high-fanout pushes).
-	if holdPath := os.Getenv(EnvPushHold); holdPath != "" {
+	// Push hold, refresher half (issue #170): keep the shared hold file
+	// fresh across this hook's FULL runtime — pre-CAS policy/fence work
+	// and unbounded post-CAS decorator work alike, because in an atomic
+	// push an EARLIER hook's committed CAS relies on later hooks keeping
+	// the file fresh until git's final local transaction (Codex round-2
+	// P2 on #173).
+	holdPath := os.Getenv(EnvPushHold)
+	if holdPath != "" {
 		defer startPushHoldRefresh(holdPath)()
-		if _, err := os.Stat(holdPath); err != nil {
-			return fmt.Errorf("update: push hold reservation missing (pre-receive owns it): %w", err)
-		}
 	}
 
 	if err := enforceRefPolicy(ctx, repo, refName, old, new); err != nil {
 		return err
+	}
+
+	// Push hold, reservation half: ensure THIS ref is held before its CAS
+	// can commit, independent of pre-receive's verdicts (Codex round-5 P2
+	// on #173: a command transiently policy-denied in pre-receive — and
+	// therefore not bulk-reserved — can still be allowed by the check
+	// above and would otherwise commit unheld, reopening the hydrate
+	// race). Placed strictly AFTER this hook's own policy check so a
+	// genuinely denied ref still cannot hold anything (the round-3
+	// namespace-squatting property). Duplicate lines from the pre-receive
+	// bulk reservation are harmless; the cost is one flock + peer-file
+	// read per ref, bounded by CONCURRENT pushes, not by this push's
+	// fanout.
+	if holdPath != "" {
+		if err := reservePushHolds(ctx, holdPath, []string{refName}); err != nil {
+			return fmt.Errorf("update: reserve push hold: %w", err)
+		}
 	}
 	// Sync claim fence (issue #86): a loopback sync push carries its
 	// run's claim-holder token. The precheck refuses obviously-stale
@@ -768,14 +828,24 @@ func updateHook(ctx context.Context, args []string) error {
 	// hydration of the repo. Pre-receive's checks are advisory (policy
 	// verdicts there cannot perfectly predict this hook's), so the commit
 	// point itself verifies against the AUTHORITY's current refs: a
-	// non-deletion whose strict D/F relative exists is declined per-ref,
-	// exactly like a policy denial. Probed on the raw store: the test
-	// fault decorators below must keep scoping to the CAS itself. TOCTOU
-	// residual: two conflicting creations racing on different nodes can
-	// still cross inside the probe-to-CAS window (same-node pushes are
-	// serialized by the hold reservation); closing that needs store-level
-	// transactional enforcement and is tracked outside this fix.
-	if new != ref.ZeroSHA {
+	// CREATION whose strict D/F relative exists is declined per-ref,
+	// exactly like a policy denial.
+	//
+	// Creations only (Codex round-5 P1: on s3wal every probe read is a
+	// manifest fetch, so update-heavy fanout pushes must not pay it):
+	// updates and deletions never change the authority's NAME SET, so if
+	// the no-strict-D/F-pair invariant held before them it holds after —
+	// only a creation adds a name and needs the probe. Probing costs the
+	// created ref O(path depth) point-reads; its own CAS chain already
+	// pays manifest round-trips of the same order on s3wal.
+	//
+	// Probed on the raw store: the test fault decorators below must keep
+	// scoping to the CAS itself. TOCTOU residual: two conflicting
+	// creations racing on different NODES can still cross inside the
+	// probe-to-CAS window (same-node pushes are serialized by the hold
+	// reservation); closing that needs store-level transactional
+	// enforcement and is tracked outside this fix.
+	if old == ref.ZeroSHA && new != ref.ZeroSHA {
 		if err := denyAuthorityDFConflict(ctx, st, repo, refName); err != nil {
 			return err
 		}
