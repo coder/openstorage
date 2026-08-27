@@ -108,8 +108,9 @@ s3wal mode only: the TTL of the `_wal/instance-lease` dual-serve guard
 ([ADR-46](../adr/046-s3wal-refs-and-metadata-ride-one-conditional-cas-object-per-repo-group.md)
 §2.11). At startup, serve refuses to run while another process holds a fresh lease on the
 bucket; while running, it heartbeats the lease every TTL/4 and **fail-stops** if the lease
-is stolen or unrenewable — a crashed node's successor can start once the stale lease ages
-past the TTL.
+is stolen or unrenewable. A graceful shutdown (`SIGTERM`/`SIGINT`) releases the lease so a
+successor can start immediately; only a hard kill (`SIGKILL`, crash, power loss) leaves the
+lease behind, and that node's successor can start once the stale lease ages past the TTL.
 
 - **Default:** unset — 2 minutes (30-second heartbeats).
 - **Validation:** a [duration](https://pkg.go.dev/time#ParseDuration) of at least `1s` —

@@ -327,10 +327,14 @@ identity or network policy.
 
 ## Rolling upgrades and restarts
 
-There is **no in-process connection draining**: the server handles no signals and exits
-immediately on `SIGTERM`, dropping in-flight requests (including in-flight pushes — safe
-for data, see below, but visible to the client as a failed push). Zero-downtime rolls
-therefore lean on the proxy plus statelessness:
+On `SIGTERM`/`SIGINT` the server shuts down gracefully: it stops accepting connections,
+drains in-flight requests for a **bounded 10 seconds**, then runs its orderly teardown —
+stopping background workers and, in [zero-infra mode](#zero-infrastructure-mode-experimental-one-bucket-one-node),
+releasing the instance lease so a successor can start immediately instead of waiting out
+the lease TTL. A second signal during the drain kills the process immediately. Requests
+still running when the drain window closes are dropped (in-flight pushes included — safe
+for data, see below, but visible to the client as a failed push), so zero-downtime rolls
+still lean on the proxy plus statelessness:
 
 1. Deregister the replica from the load balancer / stop routing to it.
 2. Wait for in-flight requests to finish (git pushes can be long; give them a generous

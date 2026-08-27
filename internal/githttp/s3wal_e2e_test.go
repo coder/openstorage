@@ -7,12 +7,16 @@ package githttp
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
+
+	"github.com/coder/code-storage/internal/blob"
 )
 
 // skipUnlessS3WAL gates the drills to the zero-infra lane.
@@ -93,6 +97,43 @@ func TestS3WAL_RestartFromBucketOnly(t *testing.T) {
 	// The manifest agrees with what the client pushed.
 	if got := pgRefs(t, repo)["refs/heads/main"]; got != head {
 		t.Fatalf("manifest refs/heads/main = %q, want %q", got, head)
+	}
+}
+
+// TestS3WAL_SigtermReleasesInstanceLease (issue #174): a termination
+// signal must run serve's deferred lease Release so a successor can start
+// immediately, instead of leaving the lease to age out its full TTL. The
+// deliberately LONG TTL (1m) makes the assertion unambiguous: the lease
+// object disappearing within the bounded wait proves Release ran — expiry
+// could not clear it that fast.
+func TestS3WAL_SigtermReleasesInstanceLease(t *testing.T) {
+	skipUnlessS3WAL(t)
+
+	const leaseEnv = "CODESTORAGE_S3WAL_LEASE_TTL=1m"
+	// Whatever happens, clear the lease object afterwards so reruns and
+	// later drills see a clean slate (regular nodes never read it).
+	t.Cleanup(func() { _ = testBlob.Delete(context.Background(), "_wal/instance-lease") })
+
+	node, err := startNode(filepath.Join(t.TempDir(), "cache"), leaseEnv)
+	if err != nil {
+		t.Fatalf("start leased node: %v", err)
+	}
+	defer node.stop()
+
+	// The lease is acquired strictly before the node announces its
+	// address, so it must exist now.
+	if _, err := testBlob.Stat(context.Background(), "_wal/instance-lease"); err != nil {
+		t.Fatalf("instance lease missing while the node runs: %v", err)
+	}
+
+	if err := node.cmd.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatalf("signal: %v", err)
+	}
+	if err := waitNodeExit(t, node, 30*time.Second); err != nil {
+		t.Fatalf("serve did not exit cleanly on SIGTERM: %v", err)
+	}
+	if _, err := testBlob.Stat(context.Background(), "_wal/instance-lease"); !errors.Is(err, blob.ErrNotFound) {
+		t.Fatalf("instance lease survived SIGTERM (stat err = %v): shutdown did not release it, successors must wait out the TTL", err)
 	}
 }
 
