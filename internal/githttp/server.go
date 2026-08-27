@@ -1211,21 +1211,29 @@ func (s *Server) dispatchRepackProbe(repo string) {
 
 // repackProbeWorker drains the probe queue for the server's lifetime,
 // probing on a cancel-free background context (the requests that queued
-// the work have long returned); trailing re-runs execute inline so they
-// occupy the worker slot they were coalesced under.
+// the work have long returned). A trailing re-run is REQUEUED at the
+// channel tail rather than run inline (Codex round 6): a repo hot enough
+// to re-arm its mark during every probe would otherwise pin its worker,
+// and a handful of such repos could occupy the whole pool and starve
+// every other queued repo. The repo stays marked queued across the
+// requeue, so later pushes keep coalescing onto the trailing entry; a
+// full queue drops it — the same best-effort trade as dispatch.
 func (s *Server) repackProbeWorker() {
 	for repo := range s.repackProbeQueue {
-		for {
-			s.MaybeRepack(context.Background(), repo)
-			s.repackProbeMu.Lock()
-			if s.repackProbeAgain[repo] {
-				delete(s.repackProbeAgain, repo)
-				s.repackProbeMu.Unlock()
-				continue
+		s.MaybeRepack(context.Background(), repo)
+		s.repackProbeMu.Lock()
+		if s.repackProbeAgain[repo] {
+			delete(s.repackProbeAgain, repo)
+			select {
+			case s.repackProbeQueue <- repo:
+				// Still marked queued: coalescing continues.
+			default:
+				delete(s.repackProbeQueued, repo)
+				log.Printf("repack probe queue full (%d pending): dropping trailing probe for %s (next push retries)", repackProbeQueueCap, repo)
 			}
+		} else {
 			delete(s.repackProbeQueued, repo)
-			s.repackProbeMu.Unlock()
-			break
 		}
+		s.repackProbeMu.Unlock()
 	}
 }
