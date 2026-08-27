@@ -24,8 +24,9 @@
 # 2. No per-push timeout: a pathologically stalled push would have hung the
 #    probe rather than being cut at the deadline. None occurred (the one
 #    TLS-timeout rejection below was git's own client-side timeout). The
-#    §2.3-conformant harness re-run tracked in #181 supersedes this probe
-#    and should bound pushes to the remaining window.
+#    §2.3-conformant harness (landed as PR #184, closing #181, after this
+#    probe was recorded) supersedes this probe; its real-S3 re-run should
+#    bound pushes to the remaining window.
 
 ## Probe script (verbatim)
 #!/usr/bin/env bash

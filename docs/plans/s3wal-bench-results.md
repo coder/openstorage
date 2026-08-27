@@ -27,11 +27,15 @@ Kill-threshold evaluation and the Gate 1a-B verdict are below; summary:
 thresholds (2) and (4) pass with wide margins and (3)'s throughput/scaling
 arms pass. (3)'s 30 s starvation arm **is recorded tripped as written**
 (56.4 s at N=8) — the evaluation below assesses that reading as a
-measurement-regime artifact (the runner omits the §2.3 backoff the cell
-definition names; [#181](https://github.com/coder/code-storage/issues/181))
+measurement-regime artifact (the campaign's runner omitted the §2.3
+backoff the cell definition names —
+[#181](https://github.com/coder/code-storage/issues/181), since fixed by
+[PR #184](https://github.com/coder/code-storage/pull/184))
 and records the verdict consequence explicitly: s3wal stays experimental,
-the arm must be re-measured under the §2.3 regime once #181 lands before
-any promote-grade claim, and if it trips again with backoff in place the
+the arm must be re-measured on real S3 under the §2.3-conformant runner
+([PR #184](https://github.com/coder/code-storage/pull/184) landed it
+after this campaign; the re-run awaits fresh credentials) before any
+promote-grade claim, and if it trips again with backoff in place the
 criterion stands and the recommendation flips to closing #133.
 
 ## Environment
@@ -168,8 +172,13 @@ transient client-side TLS handshake timeout surfaced as a hook decline. The
 probe script, per-worker raw results, and rejection taxonomy are
 committed as
 [`probe-fairness-real-s3-2026-08-27.txt`](./s3wal-bench-data/probe-fairness-real-s3-2026-08-27.txt).
-Harness fix tracked in
-[#181](https://github.com/coder/code-storage/issues/181).
+The harness fix ([#181](https://github.com/coder/code-storage/issues/181))
+**landed after this campaign was recorded**:
+[PR #184](https://github.com/coder/code-storage/pull/184) (merged
+2026-08-27, after the campaign commit) adds the §2.3 full-jitter backoff
+and removes winner-chaining. The real-S3 columns above are from the
+pre-#184 runner; the conformant real-S3 re-run of this cell is pending
+fresh credentials (the campaign's temporary credentials expired).
 
 ### Cell 4 — generation-read latency
 
@@ -380,8 +389,11 @@ the bench tolerates and counts these like any rejection.
     clean git-native errors — see the cell 3 note for the class
     breakdown). The probe is a different workload than the cell, so it
     supplements rather than replaces the recorded number; the
-    authoritative re-measurement is the §2.3-conformant harness re-run
-    tracked in [#181](https://github.com/coder/code-storage/issues/181).
+    authoritative re-measurement is a real-S3 re-run of this cell under
+    the §2.3-conformant runner
+    ([PR #184](https://github.com/coder/code-storage/pull/184), which
+    closed #181 after this campaign was recorded) — pending fresh
+    credentials.
 - **(4)** 304-path p99 > 100 ms: measured **20.12 ms** — passes with 5×
   margin.
 - **(1)** SeaweedFS-vs-S3 semantic divergence / lost update under
@@ -398,7 +410,9 @@ added path inflates the latency cells conservatively), thresholds (1),
 (2), (4) and the throughput/scaling arms of (3) pass cleanly. The starvation arm of (3) **trips as written** (56.4 s at N=8;
 60.0 s at N=32). The maintainer assessment is that this reading measures
 the harness's own deviation from the cell definition (no §2.3 backoff +
-winner-chaining; [#181](https://github.com/coder/code-storage/issues/181))
+winner-chaining in the campaign's runner —
+[#181](https://github.com/coder/code-storage/issues/181), since fixed by
+[PR #184](https://github.com/coder/code-storage/pull/184))
 rather than a store or design property, with the production-shape probe
 (21.9 s worst gap) as supporting — not overriding — evidence.
 
@@ -406,8 +420,10 @@ rather than a store or design property, with the production-shape probe
 [#133](https://github.com/coder/code-storage/issues/133)) is **not**
 taken on the strength of the tripped reading alone; s3wal **stays
 experimental** (no status upgrade), and the starvation arm is treated as
-*unresolved pending re-measurement*: once #181 aligns the runner with
-§2.3, the cell must be re-run on real S3. If the arm trips again under
+*unresolved pending re-measurement*: the runner is now §2.3-conformant
+([PR #184](https://github.com/coder/code-storage/pull/184), merged after
+this campaign was recorded), so the cell must be re-run on real S3 with
+fresh credentials (the campaign's expired). If the arm trips again under
 the conformant regime, the criterion stands and the recommendation flips
 to closing #133; a clean conformant run is a precondition for any
 promote-grade claim, as are §3's separate-day repeats and in-region
