@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -242,13 +243,8 @@ func preReceive(ctx context.Context) error {
 	// chains its own refresher for its runtime.
 	if holdPath := os.Getenv(EnvPushHold); holdPath != "" {
 		names := make([]string, 0, len(commands))
-		var unreserved []string
-		var probeStore ref.Store
-		defer func() {
-			if probeStore != nil {
-				probeStore.Close()
-			}
-		}()
+		var unreserved, creations []string
+		eligible := make([]refCommand, 0, len(commands))
 		for _, c := range commands {
 			// Reserve only names this server could ever commit (Codex
 			// round-5 security P2): git hands namespace roots like the
@@ -263,29 +259,53 @@ func preReceive(ctx context.Context) error {
 				unreserved = append(unreserved, c.ref)
 				continue
 			}
-			// Authority-doomed CREATIONS are not bulk-reserved either
-			// (Codex round-7 security P2): a syntactically valid,
-			// policy-allowed ancestor whose D/F children exist in the
-			// authority can never commit — its update hook's probe denies
-			// it — so reserving it would only squat on those children's
-			// namespace for the push window. Creations only, like the
-			// hook probe: updates and deletions cannot introduce a D/F
-			// pair. Fail closed on store trouble — an unprobeable
-			// authority is not proof of reservability. A legitimate
-			// delete-then-create D/F swap in ONE push still works: the
-			// creation lands in the sidecar and self-reserves at hook
-			// time, after the deletion's CAS.
+			eligible = append(eligible, c)
 			if c.old == ref.ZeroSHA && c.new != ref.ZeroSHA {
-				if probeStore == nil {
-					var err error
-					if probeStore, err = ref.Open(ctx, mustEnv(envHookPGURL...)); err != nil {
-						return fmt.Errorf("pre-receive: open ref store for reservation probe: %w", err)
+				creations = append(creations, c.ref)
+			}
+		}
+		// Authority-doomed CREATIONS are not bulk-reserved (Codex round-7
+		// security P2): a syntactically valid, policy-allowed ancestor
+		// whose D/F children exist in the authority can never commit —
+		// its update hook's probe denies it — so reserving it would only
+		// squat on those children's namespace for the push window.
+		// Creations only: updates and deletions cannot introduce a D/F
+		// pair. Probed in ONE batch per push (authorityDoomedCreations —
+		// Codex round-8 security P2: per-creation point probes fetch the
+		// full manifest each on s3wal). Fail closed on store trouble.
+		// A legitimate delete-then-create D/F swap in ONE push still
+		// works: the creation lands in the sidecar and self-reserves at
+		// hook time, after the deletion's CAS.
+		var doomed map[string]error
+		if len(creations) > 0 {
+			probeStore, err := ref.Open(ctx, mustEnv(envHookPGURL...))
+			if err != nil {
+				return fmt.Errorf("pre-receive: open ref store for reservation probe: %w", err)
+			}
+			doomed, err = authorityDoomedCreations(ctx, probeStore, repo, creations)
+			probeStore.Close()
+			if err != nil {
+				return fmt.Errorf("pre-receive: authority D/F probe: %w", err)
+			}
+			// Atomic pushes: a doomed command dooms git's whole local
+			// transaction AFTER earlier hooks committed their CASes, so
+			// the denial must be whole-push and happen HERE, like the
+			// verdict and funny-name gates (Codex round-8 P1). Non-atomic
+			// pushes keep per-ref semantics: divert to the sidecar and
+			// let the ref's own hook decline (or commit, if the authority
+			// changed).
+			if atomicPush {
+				for _, c := range commands {
+					if derr, ok := doomed[c.ref]; ok {
+						return atomicDenied(derr)
 					}
 				}
-				if denyAuthorityDFConflict(ctx, probeStore, repo, c.ref) != nil {
-					unreserved = append(unreserved, c.ref)
-					continue
-				}
+			}
+		}
+		for _, c := range eligible {
+			if _, ok := doomed[c.ref]; ok {
+				unreserved = append(unreserved, c.ref)
+				continue
 			}
 			names = append(names, c.ref)
 		}
@@ -841,6 +861,7 @@ func updateHook(ctx context.Context, args []string) error {
 	// hook ran and recorded the remainder in the sidecar — no sidecar
 	// means this ref is already held, and only sidecar-listed refs (the
 	// rare divergence case) pay the full atomic check+reserve.
+	bulkReserved := false
 	if holdPath != "" {
 		switch _, err := os.Stat(pushHoldUnreservedMarker(holdPath, refName)); {
 		case errors.Is(err, os.ErrNotExist):
@@ -850,6 +871,7 @@ func updateHook(ctx context.Context, args []string) error {
 			if _, err := os.Stat(holdPath); err != nil {
 				return fmt.Errorf("update: push hold reservation missing (pre-receive owns it): %w", err)
 			}
+			bulkReserved = true
 		case err != nil:
 			return fmt.Errorf("update: check unreserved marker: %w", err)
 		default:
@@ -905,13 +927,20 @@ func updateHook(ctx context.Context, args []string) error {
 	// created ref O(path depth) point-reads; its own CAS chain already
 	// pays manifest round-trips of the same order on s3wal.
 	//
+	// Skipped for bulk-reserved refs (Codex round-8 security P2): those
+	// already passed pre-receive's batch authority probe, the hold has
+	// serialized same-node D/F writers ever since, and re-probing here
+	// would re-pay per-creation manifest reads on s3wal. Sidecar refs
+	// (pre-receive could not vouch) and hookless invocations keep the
+	// commit-time probe.
+	//
 	// Probed on the raw store: the test fault decorators below must keep
-	// scoping to the CAS itself. TOCTOU residual: two conflicting
-	// creations racing on different NODES can still cross inside the
-	// probe-to-CAS window (same-node pushes are serialized by the hold
-	// reservation); closing that needs store-level transactional
-	// enforcement and is tracked outside this fix.
-	if old == ref.ZeroSHA && new != ref.ZeroSHA {
+	// scoping to the CAS itself. TOCTOU residual: conflicting creations
+	// racing from different NODES (or API ref writes) can still cross
+	// inside the probe-to-CAS window — for bulk-reserved refs that window
+	// is pre-receive-probe-to-CAS; closing it needs store-level
+	// transactional enforcement and is tracked outside this fix.
+	if old == ref.ZeroSHA && new != ref.ZeroSHA && !bulkReserved {
 		if err := denyAuthorityDFConflict(ctx, st, repo, refName); err != nil {
 			return err
 		}
@@ -955,6 +984,59 @@ func pauseAtUpdateBarrier(p string) {
 			return
 		}
 		time.Sleep(25 * time.Millisecond)
+	}
+}
+
+// authorityDoomedCreations reports which of the created names are doomed
+// by a strict D/F relative existing in the authority. Small sets use the
+// per-name point probes; larger sets switch to ONE bounded paged scan of
+// the repo's refs merge-checked against the sorted creation set (Codex
+// round-8 security P2 on #173: per-creation probes on s3wal fetch the full
+// manifest each, so a thousand no-pack creations must not cost thousands
+// of manifest reads — the scan costs O(repo refs / page) round-trips per
+// PUSH instead). Store errors fail the whole probe; callers fail closed.
+func authorityDoomedCreations(ctx context.Context, st ref.RefStore, repo string, names []string) (map[string]error, error) {
+	doomed := map[string]error{}
+	// Crossover: a point probe costs ~depth+1 reads for ONE name; the scan
+	// costs one page read per syncRefsBatch refs in the repo. Tiny pushes
+	// on huge repos keep the point probes.
+	if len(names) <= 4 {
+		for _, name := range names {
+			if err := denyAuthorityDFConflict(ctx, st, repo, name); err != nil {
+				doomed[name] = err
+			}
+		}
+		return doomed, nil
+	}
+	set := newPushHoldSet(append([]string(nil), names...))
+	deny := func(created, existing string) {
+		if _, dup := doomed[created]; !dup {
+			doomed[created] = fmt.Errorf("%s conflicts with existing ref %s (directory/file); delete %s first", created, existing, existing)
+		}
+	}
+	after := ""
+	for {
+		page, err := st.ListRefsAfter(ctx, repo, after, syncRefsBatch)
+		if err != nil {
+			return nil, err
+		}
+		for _, e := range page {
+			// The authority ref is a strict ancestor of created names.
+			prefix := e.Name + "/"
+			for i := sort.SearchStrings(set.names, prefix); i < len(set.names) && strings.HasPrefix(set.names[i], prefix); i++ {
+				deny(set.names[i], e.Name)
+			}
+			// The authority ref is a strict descendant of a created name.
+			for j := 0; j < len(e.Name); j++ {
+				if e.Name[j] == '/' && set.contains(e.Name[:j]) {
+					deny(e.Name[:j], e.Name)
+				}
+			}
+		}
+		if len(page) < syncRefsBatch {
+			return doomed, nil
+		}
+		after = page[len(page)-1].Name
 	}
 }
 

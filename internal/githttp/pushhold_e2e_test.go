@@ -212,6 +212,38 @@ func TestPush_DeniedParentAllowedChildLands(t *testing.T) {
 	}
 }
 
+// TestAtomicPush_DeniedWhenCreationDoomedByAuthorityDF (Codex round-8 P1):
+// an atomic push mixing a healthy update with a creation whose D/F
+// relative exists in the authority must be denied WHOLE in pre-receive —
+// otherwise the healthy command's authority CAS commits before the doomed
+// creation's hook declines, git aborts the local atomic transaction, and
+// the client is told the whole push failed while the authority moved.
+func TestAtomicPush_DeniedWhenCreationDoomedByAuthorityDF(t *testing.T) {
+	repo := registerRepo(t, "t-df-atomic-doomed")
+	work := initWorkRepo(t)
+	token := mintTestToken(t, repo, "git:read,git:write", "")
+	mustGit(t, work, "push", remoteURL(nodeA, repo, token), "HEAD:refs/heads/main", "HEAD:refs/heads/good", "HEAD:refs/heads/z")
+	head := revParse(t, work, "HEAD")
+
+	writeFile(t, work, "b.txt", "two\n")
+	mustGit(t, work, "add", ".")
+	mustGit(t, work, "commit", "-m", "two")
+
+	out, err := tryGit(work, "push", "--atomic", remoteURL(nodeA, repo, token),
+		"HEAD:refs/heads/good", "HEAD:refs/heads/z/child")
+	if err == nil {
+		t.Fatalf("atomic push with an authority-doomed creation must be denied:\n%s", out)
+	}
+	t.Logf("atomic doomed push (expected whole-push denial):\n%s", out)
+	refs := pgRefs(t, repo)
+	if refs["refs/heads/good"] != head {
+		t.Fatalf("authority moved refs/heads/good under a whole-push failure report: %v", refs)
+	}
+	if _, ok := refs["refs/heads/z/child"]; ok {
+		t.Fatalf("authority accepted the doomed creation: %v", refs)
+	}
+}
+
 // TestPush_DeniedDeletionSurvivorBlocksDFChild (Codex round-4 P1, exact
 // scenario): one non-atomic push carries a policy-DENIED deletion of
 // refs/heads/a plus an allowed creation of refs/heads/a/b. The denied

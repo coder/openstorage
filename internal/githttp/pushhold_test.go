@@ -398,6 +398,37 @@ func TestPushHoldReaders_SkipUnreservedSidecar(t *testing.T) {
 	}
 }
 
+// TestAuthorityDoomedCreations_BatchScan drives the >4-name paged-scan
+// path: creations whose strict D/F relative exists in the authority are
+// doomed (both directions), unrelated and exact-name matches are not.
+func TestAuthorityDoomedCreations_BatchScan(t *testing.T) {
+	st := &countingStore{gen: 1, refs: map[string]string{
+		"refs/heads/a":     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		"refs/heads/x/y":   "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		"refs/heads/plain": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+	}}
+	creations := []string{
+		"refs/heads/a/b",   // doomed: strict ancestor a exists
+		"refs/heads/x",     // doomed: strict descendant x/y exists
+		"refs/heads/plain", // exact name exists: NOT a D/F conflict
+		"refs/heads/new1",
+		"refs/heads/new2",
+		"refs/heads/ab", // sibling of a: not a conflict
+	}
+	doomed, err := authorityDoomedCreations(context.Background(), st, "r", creations)
+	if err != nil {
+		t.Fatalf("authorityDoomedCreations: %v", err)
+	}
+	for _, want := range []string{"refs/heads/a/b", "refs/heads/x"} {
+		if _, ok := doomed[want]; !ok {
+			t.Errorf("%s not reported doomed: %v", want, doomed)
+		}
+	}
+	if len(doomed) != 2 {
+		t.Fatalf("doomed = %v, want exactly the two D/F conflicts", doomed)
+	}
+}
+
 // TestHydrate_SkippedHeldRefSuppressesMarker: a full sync that skipped a
 // held ref must not advance the generation marker — otherwise a fresh
 // marker could vouch for a generation whose held ref the cache never
