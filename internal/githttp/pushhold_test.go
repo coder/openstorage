@@ -357,6 +357,10 @@ func TestReservePushHolds_LockAcquisitionBounded(t *testing.T) {
 func TestPushRefUpdatable(t *testing.T) {
 	deep := "refs/heads" + strings.Repeat("/x", maxPushRefDepth)
 	ok := "refs/heads" + strings.Repeat("/x", maxPushRefDepth-2)
+	// Just under the total-length bound (4 segments of 179 plus the root
+	// and leaf stay <= maxPushRefNameBytes) — every segment also within
+	// the segment bound.
+	longOK := "refs/" + strings.Repeat(strings.Repeat("b", 179)+"/", 4) + "x"
 	cases := map[string]bool{
 		"refs/heads/main":        true,
 		"refs/tags/v1.0.0":       true,
@@ -393,6 +397,15 @@ func TestPushRefUpdatable(t *testing.T) {
 		"refs/heads/fo\\o":   false,
 		"refs/heads/fo\x01o": false, // control byte
 		"refs/heads/fo\x7fo": false, // DEL
+		// Filesystem materializability (Codex round-16 P1): git's format
+		// check accepts a 256-byte component, but the files backend then
+		// fails ENAMETOOLONG on the .lock file AFTER the authority CAS —
+		// bound segment and total name length before any CAS.
+		"refs/heads/" + strings.Repeat("a", maxPushRefSegmentBytes):     true,
+		"refs/heads/" + strings.Repeat("a", maxPushRefSegmentBytes+1):   false,
+		"refs/heads/" + strings.Repeat("a", 256):                        false, // the observed git-accepted, fs-rejected shape
+		longOK:                                                          true,
+		"refs/" + strings.Repeat(strings.Repeat("b", 179)+"/", 5) + "x": false, // total length over maxPushRefNameBytes
 	}
 	for name, want := range cases {
 		if got := pushRefUpdatable(name); got != want {
@@ -911,15 +924,32 @@ func TestReservationVerdicts_MixedPushStaysSelective(t *testing.T) {
 	t.Setenv(EnvRefsPolicy, `[["refs/heads/sigx",["verify-sig"]],["refs/heads/noff",["no-force-push"]]]`)
 	sha := strings.Repeat("a", 40)
 	sha2 := strings.Repeat("b", 40)
-	classes := reservationVerdicts(context.Background(), "r", []refCommand{
+	commands := []refCommand{
 		{ref: "refs/heads/noff", old: sha, new: sha2},
 		{ref: "refs/heads/sigx", old: sha, new: sha2},
 		{ref: "refs/heads/free", old: sha, new: sha2},
-	})
+	}
+	evaluated := make([]bool, len(commands))
+	evalOne := func(i int) error {
+		evaluated[i] = true
+		c := commands[i]
+		return enforceRefPolicy(context.Background(), "r", c.ref, c.old, c.new)
+	}
+	classes, verified := reservationVerdicts("r", commands, evalOne)
 	want := []reservationClass{reservationAllowed, reservationDenied, reservationAllowed}
 	for i, cls := range classes {
 		if cls != want[i] {
 			t.Errorf("classes[%d] = %v, want %v", i, cls, want[i])
+		}
+	}
+	// Only the gated command may pay a real evaluation, and a FAILED
+	// evaluation must not mark the command verified.
+	if evaluated[0] || !evaluated[1] || evaluated[2] {
+		t.Errorf("evaluated = %v, want only the signature-gated command", evaluated)
+	}
+	for i, v := range verified {
+		if v {
+			t.Errorf("verified[%d] = true, want none (the gated evaluation fails closed here)", i)
 		}
 	}
 }

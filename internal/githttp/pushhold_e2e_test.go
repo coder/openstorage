@@ -587,6 +587,117 @@ func TestPush_LargeSignedFanoutNotCapped(t *testing.T) {
 	}
 }
 
+// TestPush_SignedFanoutSurvivesSmallBudget (Codex round-16 P2): a no-pack
+// push of 60 signed refs at one already-stored tip under
+// CODESTORAGE_VERIFY_SIG_BUDGET=1 must succeed. Pre-receive's reservation
+// evaluation charges the per-evaluation verify fee once per command
+// (~61 of the 100 allowed units); before the fix each update hook charged
+// another unit — reading the SAME persisted range verdict — so the
+// accumulated fees pushed a fully compliant push past the walk allowance.
+// The hooks now consume pre-receive's verified-verdict markers without
+// re-charging.
+func TestPush_SignedFanoutSurvivesSmallBudget(t *testing.T) {
+	repo := registerRepo(t, "t-signed-fanout-budget")
+	work := initWorkRepo(t)
+	priv, pub := genSSHKey(t)
+	key := registerSigningKey(t, pub)
+	defer removeSigningKey(t, key.ID)
+
+	mustGit(t, work, append(sshSigningArgs(priv), "commit", "--amend", "--no-edit")...)
+	plain := mintTestToken(t, repo, "git:read,git:write", "")
+	node := startNodeT(t, "CODESTORAGE_VERIFY_SIG_BUDGET=1")
+	// Store the whole (1-commit) history first, so the fanout push below
+	// carries no pack and its only budget pressure is the per-evaluation
+	// fees.
+	mustGit(t, work, "push", remoteURL(node, repo, plain), "HEAD:refs/heads/main")
+	head := revParse(t, work, "HEAD")
+
+	vs := mintTestToken(t, repo, "git:read,git:write", `[["*",["verify-sig"]]]`)
+	args := []string{"push", remoteURL(node, repo, vs)}
+	for i := 0; i < 60; i++ {
+		args = append(args, fmt.Sprintf("HEAD:refs/heads/b/%04d", i))
+	}
+	out, err := tryGit(work, args...)
+	if err != nil {
+		t.Fatalf("signed 60-ref same-tip fanout must survive budget 1: %v\n%.2000s", err, out)
+	}
+	refs := pgRefs(t, repo)
+	if refs["refs/heads/b/0000"] != head || refs["refs/heads/b/0059"] != head {
+		t.Fatalf("fanout refs missing: %v", refs["refs/heads/b/0000"])
+	}
+}
+
+// TestPush_DoomedCreationReleasesHoldOnDenial (Codex round-16 P2): a
+// sidecar-diverted creation that the update hook's commit-time D/F probe
+// denies must release its self-reservation immediately — before the fix
+// the doomed name stayed held until the whole receive-pack exited, so a
+// push bundling a doomed parent with slow work blocked every concurrent
+// legitimate update under that namespace for the push's full duration
+// (10s reservation timeout, then denial).
+func TestPush_DoomedCreationReleasesHoldOnDenial(t *testing.T) {
+	repo := registerRepo(t, "t-doomed-hold-release")
+	work := initWorkRepo(t)
+	token := mintTestToken(t, repo, "git:read,git:write", "")
+	mustGit(t, work, "push", remoteURL(nodeA, repo, token), "HEAD:refs/heads/main", "HEAD:refs/heads/a/x")
+
+	// Concurrent pusher C's clone, advanced one commit for its a/x update.
+	workC := filepath.Join(t.TempDir(), "clone-c")
+	mustGit(t, "", "clone", work, workC)
+	mustGit(t, workC, "commit", "--allow-empty", "-m", "C: advance a/x")
+	headC := revParse(t, workC, "HEAD")
+
+	barrier := filepath.Join(t.TempDir(), "update-barrier")
+	node := startNodeT(t, EnvUpdateBarrier+"="+barrier)
+
+	type pushResult struct {
+		out string
+		err error
+	}
+	// Push B: doomed creation a (its D/F child a/x exists, so pre-receive
+	// diverts it to the sidecar and its hook is denied pre-CAS) plus
+	// creation zzz, whose hook — the push's first COMMITTED one, running
+	// after a's denial — consumes the one-shot barrier and pauses
+	// post-CAS, keeping B's receive-pack alive with its holds.
+	doneB := make(chan pushResult, 1)
+	go func() {
+		out, err := tryGit(work, "push", remoteURL(node, repo, token),
+			"HEAD:refs/heads/a", "HEAD:refs/heads/zzz")
+		doneB <- pushResult{out, err}
+	}()
+	waitForFile(t, barrier+".ready", 30*time.Second)
+
+	// While B is paused: a legitimate a/x update must reserve immediately
+	// — B's denied creation a released its hold, so nothing covers a/x.
+	// Before the fix this push waited out the full 10s reservation
+	// deadline on the leaked hold and failed closed.
+	outC, errC := tryGit(workC, "push", remoteURL(node, repo, token), "HEAD:refs/heads/a/x")
+	if errC != nil {
+		t.Fatalf("a/x update blocked by a denied creation's leaked hold: %v\n%s", errC, outC)
+	}
+
+	if err := os.WriteFile(barrier+".release", nil, 0o644); err != nil {
+		t.Fatalf("release barrier: %v", err)
+	}
+	resB := <-doneB
+	t.Logf("push B (doomed a + zzz):\n%s", resB.out)
+	if resB.err == nil {
+		t.Fatal("push B fully succeeded; the doomed creation was supposed to be denied per-ref")
+	}
+	if !strings.Contains(resB.out, "directory/file") {
+		t.Fatalf("creation a must be denied by the D/F probe:\n%s", resB.out)
+	}
+	refs := pgRefs(t, repo)
+	if _, ok := refs["refs/heads/a"]; ok {
+		t.Fatalf("doomed creation committed: %v", refs)
+	}
+	if refs["refs/heads/a/x"] != headC {
+		t.Fatalf("authority a/x = %q, want C's %q", refs["refs/heads/a/x"], headC)
+	}
+	if _, ok := refs["refs/heads/zzz"]; !ok {
+		t.Fatalf("B's valid creation zzz missing: %v", refs)
+	}
+}
+
 // TestAtomicPush_StaleBaseDeniedBeforeAnyCAS (Codex round-14 P1 on #173):
 // while push A pauses between its committed authority CAS and its local
 // ref update, hydration deliberately leaves the held ref at its old cache

@@ -178,21 +178,28 @@ func preReceive(ctx context.Context) error {
 	}
 	atomicPush := os.Getenv(EnvAtomic) == "1"
 
-	// Full-policy verdicts are evaluated AT MOST once per push, and only
-	// on the paths that always paid them (the atomic whole-push gate and
-	// the pack publication gate): the no-pack non-atomic path historically
-	// ran zero pre-receive evaluations, and evaluating there would
-	// double-charge the shared verify-sig walk budget the update hooks
-	// bill again (Codex rounds 4+6 P2 on #173). The reservation filter
-	// below uses the budget-free evaluator instead.
-	var verdicts []error
-	evalVerdicts := func() {
-		if verdicts != nil {
-			return
-		}
-		verdicts = make([]error, len(commands))
-		for i, c := range commands {
+	// Full-policy verdicts are evaluated AT MOST once per command per push
+	// — memoized per index so every pre-receive consumer (the atomic
+	// whole-push gate, the reservation filter's signature-gated
+	// evaluations, and the pack publication gate) shares ONE evaluation
+	// (Codex rounds 4+6 P2, round-16 P2 on #173: each evaluation charges
+	// the shared verify-sig walk budget a per-evaluation fee, so
+	// re-evaluating the same command in two pre-receive gates double-fees
+	// the push). The no-pack non-atomic path still evaluates nothing
+	// beyond its signature-gated commands.
+	verdicts := make([]error, len(commands))
+	verdictDone := make([]bool, len(commands))
+	evalOne := func(i int) error {
+		if !verdictDone[i] {
+			c := commands[i]
 			verdicts[i] = enforceRefPolicy(ctx, repo, c.ref, c.old, c.new)
+			verdictDone[i] = true
+		}
+		return verdicts[i]
+	}
+	evalVerdicts := func() {
+		for i := range commands {
+			_ = evalOne(i)
 		}
 	}
 	// Atomic pushes fail whole on any denial (issue #28 semantics), and
@@ -211,13 +218,12 @@ func preReceive(ctx context.Context) error {
 		// walks and verifies) — eager whole-slice evaluation let one
 		// doomed request scale that by its command count. A complete loop
 		// leaves verdicts fully populated (all nil) for the later gates.
-		verdicts = make([]error, len(commands))
 		for i, c := range commands {
 			if !pushRefUpdatable(c.ref) {
-				return atomicDenied(fmt.Errorf("ref name %s is not updatable here (namespace root, git-invalid name, or deeper than %d segments)", c.ref, maxPushRefDepth))
+				return atomicDenied(fmt.Errorf("ref name %s is not updatable here (namespace root, git-invalid or unmaterializable name, or deeper than %d segments)", c.ref, maxPushRefDepth))
 			}
-			if verdicts[i] = enforceRefPolicy(ctx, repo, c.ref, c.old, c.new); verdicts[i] != nil {
-				return atomicDenied(verdicts[i])
+			if err := evalOne(i); err != nil {
+				return atomicDenied(err)
 			}
 		}
 		// The push's OWN command set must be representable in one git ref
@@ -257,8 +263,32 @@ func preReceive(ctx context.Context) error {
 		// signature-gated commands paying a real per-command evaluation
 		// — see reservationVerdicts.
 		var classes []reservationClass
+		var sigVerified []bool
 		if !atomicPush {
-			classes = reservationVerdicts(ctx, repo, commands)
+			classes, sigVerified = reservationVerdicts(repo, commands, evalOne)
+		}
+		// Verified-verdict markers (Codex round-16 P2): each
+		// signature-gated command whose REAL evaluation just passed gets
+		// one marker keyed over (ref, old, new), so its update hook
+		// consumes the verdict with a single stat instead of charging the
+		// per-evaluation verify fee again — with a small
+		// CODESTORAGE_VERIFY_SIG_BUDGET, a same-tip fanout of N gated
+		// refs costs ~N+1 fee units here, and hooks re-charging another N
+		// pushed a fully compliant push past the walk allowance. Inputs
+		// are identical (same push, same policy env, same shas), so the
+		// hook-side verdict could only repeat this one. Marker count is
+		// bounded by the commands that actually PASSED verification.
+		for i, ok := range sigVerified {
+			if !ok {
+				continue
+			}
+			if err := os.MkdirAll(holdPath+pushHoldVerifiedSuffix, 0o755); err != nil {
+				return fmt.Errorf("pre-receive: record verified verdicts: %w", err)
+			}
+			c := commands[i]
+			if err := os.WriteFile(pushHoldVerifiedMarker(holdPath, c.ref, c.old, c.new), nil, 0o600); err != nil {
+				return fmt.Errorf("pre-receive: record verified verdict for %s: %w", c.ref, err)
+			}
 		}
 		for i, c := range commands {
 			// Reserve only names this server could ever commit (Codex
@@ -821,6 +851,23 @@ func preReceive(ctx context.Context) error {
 // per tiny push command). Deny-with-message keeps the bound explicit.
 const maxPushRefDepth = 32
 
+// maxPushRefSegmentBytes and maxPushRefNameBytes bound what the git files
+// backend can MATERIALIZE (Codex round-16 P1 on #173): git's own
+// check-ref-format accepts a 256-byte path component, but creating the
+// loose ref's ".lock" file then fails ENAMETOOLONG (NAME_MAX 255) only
+// AFTER the update hook's authority CAS committed — one non-atomic push
+// leaves an authority-only ref that every later hydration also fails to
+// write, wedging the repo. 200 leaves headroom under NAME_MAX for the
+// lock suffix; 900 keeps the whole loose-ref path comfortably inside
+// PATH_MAX for any sane cache root. Stricter than git's format rules by
+// design: names past these bounds are unrepresentable in the cache, so
+// denying them loses nothing (the parity oracle only requires accepted
+// names to be git-valid).
+const (
+	maxPushRefSegmentBytes = 200
+	maxPushRefNameBytes    = 900
+)
+
 // maxPushUnreserved caps how many of one push's commands may land in the
 // unreserved sidecar (one marker inode each — see preReceive). Membership
 // is attacker-chosen: policy-denied, unupdatable, or D/F-conflicted names
@@ -854,6 +901,9 @@ func pushRefUpdatable(name string) bool {
 	if !ok || !strings.Contains(rest, "/") {
 		return false
 	}
+	if len(name) > maxPushRefNameBytes { // filesystem PATH_MAX headroom
+		return false
+	}
 	if strings.HasSuffix(name, ".") { // git: a refname cannot end with a dot
 		return false
 	}
@@ -862,6 +912,9 @@ func pushRefUpdatable(name string) bool {
 		return false
 	}
 	for _, seg := range segs {
+		if len(seg) > maxPushRefSegmentBytes { // filesystem NAME_MAX headroom
+			return false
+		}
 		if !gitRefSegmentValid(seg) {
 			return false
 		}
@@ -1075,7 +1128,7 @@ func atomicDenied(err error) error {
 // updateHook enforces the JWT ref policy (first-match-wins), then performs
 // the PG CAS. Exit != 0 makes git report a per-ref `ng` with our stderr
 // message; git only updates the local cache ref for winners.
-func updateHook(ctx context.Context, args []string) error {
+func updateHook(ctx context.Context, args []string) (retErr error) {
 	// Hook args are handed over by git per ref update; validate instead of
 	// asserting so a malformed invocation denies the update, never panics
 	// (CASRef below asserts well-formed SHAs).
@@ -1110,8 +1163,23 @@ func updateHook(ctx context.Context, args []string) error {
 		defer startPushHoldRefresh(holdPath)()
 	}
 
-	if err := enforceRefPolicy(ctx, repo, refName, old, new); err != nil {
-		return err
+	// Verified-verdict marker (Codex round-16 P2): pre-receive already ran
+	// the FULL policy evaluation for this exact (ref, old, new) — same
+	// push, same policy env — and it passed; re-evaluating here could
+	// only repeat the verdict while charging the shared verify-sig walk
+	// budget another per-evaluation fee, failing large compliant same-tip
+	// fanouts under small budgets. Any stat trouble falls back closed to
+	// a real evaluation.
+	sigVerified := false
+	if holdPath != "" {
+		if _, err := os.Stat(pushHoldVerifiedMarker(holdPath, refName, old, new)); err == nil {
+			sigVerified = true
+		}
+	}
+	if !sigVerified {
+		if err := enforceRefPolicy(ctx, repo, refName, old, new); err != nil {
+			return err
+		}
 	}
 
 	// Push hold, reservation half: ensure THIS ref is held before its CAS
@@ -1146,6 +1214,22 @@ func updateHook(ctx context.Context, args []string) error {
 			if err := reservePushHolds(ctx, holdPath, []string{refName}); err != nil {
 				return fmt.Errorf("update: reserve push hold: %w", err)
 			}
+			// Release the self-reservation on any denial below (Codex
+			// round-16 P2): a sidecar-listed creation denied by the
+			// commit-time D/F probe (or fence, or CAS loss) commits
+			// nothing, yet its name would otherwise stay held until the
+			// whole receive-pack exits — a doomed parent bundled into a
+			// large push squats its existing relatives' namespace for the
+			// push's full duration, timing out their legitimate updates.
+			// Best-effort: a failed release leaves the pre-fix
+			// until-exit hold, and the denial itself still stands. On
+			// success the reservation is kept through the CAS, the local
+			// update, and receive-pack exit, exactly like bulk holds.
+			defer func() {
+				if retErr != nil {
+					_ = removePushHolds(holdPath, []string{refName})
+				}
+			}()
 		}
 	}
 	// Sync claim fence (issue #86): a loopback sync push carries its
@@ -1501,32 +1585,36 @@ func classifyReservation(repo, refName, old, new string) reservationClass {
 // assuming them allowed lets unsigned pushers squat D/F namespaces), but
 // flatly diverting them breaks legitimate large SIGNED fanout pushes at
 // the sidecar cap (round-13 P2) — so exactly they pay verification here:
-// valid signed refs bulk-reserve, invalid ones divert. Verify WALKS stay
-// single-charged because verifystate persists range verdicts across
-// processes — the update hooks then cache-hit — matching the pack path's
-// long-accepted "verified twice, an accepted redundancy" fee shape.
+// valid signed refs bulk-reserve, invalid ones divert.
 // STRICTLY per-gated-command, never the push's full verdicts (Codex
 // round-15 P2): a mixed push carrying one gated ref plus thousands of
 // distinct no-force-push pairs must not launch one git merge-base per
 // ungated pair here — rounds 4+6 kept the no-pack path subprocess-free
 // for everything the budget-free classifier can already answer, and the
 // ungated commands' own update hooks enforce the real ancestry checks.
-func reservationVerdicts(ctx context.Context, repo string, commands []refCommand) []reservationClass {
-	classes := make([]reservationClass, len(commands))
+// Real evaluations go through the caller's per-index memo (evalOne), so
+// the pack-path publication gate never re-fees them, and the returned
+// verified flags mark gated commands whose evaluation PASSED — the caller
+// persists those as verdict markers the update hooks consume without
+// charging the verify budget again (Codex round-16 P2).
+func reservationVerdicts(repo string, commands []refCommand, evalOne func(int) error) (classes []reservationClass, verified []bool) {
+	classes = make([]reservationClass, len(commands))
+	verified = make([]bool, len(commands))
 	for i, c := range commands {
 		classes[i] = classifyReservation(repo, c.ref, c.old, c.new)
 	}
-	for i, c := range commands {
+	for i := range commands {
 		if classes[i] != reservationNeedsVerify {
 			continue
 		}
-		if err := enforceRefPolicy(ctx, repo, c.ref, c.old, c.new); err != nil {
+		if evalOne(i) != nil {
 			classes[i] = reservationDenied
 		} else {
 			classes[i] = reservationAllowed
+			verified[i] = true
 		}
 	}
-	return classes
+	return classes, verified
 }
 
 // evalRefPolicy is the shared evaluator. fullEval=false is the budget-free

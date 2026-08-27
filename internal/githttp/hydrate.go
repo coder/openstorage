@@ -1152,6 +1152,14 @@ const (
 	// security P2 on #173). Hold READERS must skip it — its names are
 	// exactly the ones that must not be treated as held.
 	pushHoldUnreservedSuffix = ".unreserved"
+	// pushHoldVerifiedSuffix marks a push's sidecar DIRECTORY holding one
+	// empty marker per signature-gated command whose full pre-receive
+	// evaluation PASSED, keyed by SHA-256 over (ref, old, new) — the
+	// update hook consumes the verdict with one stat instead of charging
+	// the shared verify-sig walk budget a second per-evaluation fee
+	// (Codex round-16 P2 on #173). Hold READERS must skip it (a
+	// directory, like the unreserved sidecar).
+	pushHoldVerifiedSuffix = ".verified"
 )
 
 // pushHoldUnreservedMarker is the sidecar marker path recording that name
@@ -1159,6 +1167,15 @@ const (
 func pushHoldUnreservedMarker(holdPath, name string) string {
 	sum := sha256.Sum256([]byte(name))
 	return holdPath + pushHoldUnreservedSuffix + "/" + hex.EncodeToString(sum[:])
+}
+
+// pushHoldVerifiedMarker is the sidecar marker path recording that the
+// exact command (name, old, new) passed pre-receive's full policy
+// evaluation. Keyed over all three so a hook can only consume the verdict
+// for the identical update.
+func pushHoldVerifiedMarker(holdPath, name, old, new string) string {
+	sum := sha256.Sum256([]byte(name + "\x00" + old + "\x00" + new))
+	return holdPath + pushHoldVerifiedSuffix + "/" + hex.EncodeToString(sum[:])
 }
 
 // mintPushHold returns the absolute path a receive-pack request's update
@@ -1232,10 +1249,11 @@ func appendPushHolds(holdPath string, names []string) error {
 func touchPushHold(holdPath string) {
 	now := time.Now()
 	_ = os.Chtimes(holdPath, now, now)
-	// The unreserved sidecar ages on the same clock: a live push longer
-	// than one TTL must not have another push's mint sweep reap its
-	// markers (Chtimes is a no-op ENOENT when no sidecar exists).
+	// The sidecars age on the same clock: a live push longer than one TTL
+	// must not have another push's mint sweep reap its markers (Chtimes
+	// is a no-op ENOENT when no sidecar exists).
 	_ = os.Chtimes(holdPath+pushHoldUnreservedSuffix, now, now)
+	_ = os.Chtimes(holdPath+pushHoldVerifiedSuffix, now, now)
 }
 
 // startPushHoldRefresh keeps holdPath fresh on a TTL/4 cadence until the
@@ -1340,10 +1358,11 @@ func (c *pushHoldDirCache) load() (pushHoldSet, error) {
 	live := make(map[string]holdFileParse, len(entries))
 	var key strings.Builder
 	for _, e := range entries {
-		// Sidecar directories mark a push's UNRESERVED names — never
-		// holds (the IsDir check is defensive: nothing else creates
-		// directories here).
-		if strings.HasSuffix(e.Name(), pushHoldUnreservedSuffix) || e.IsDir() {
+		// Sidecar directories mark a push's UNRESERVED names or verified
+		// verdicts — never holds (the IsDir check is defensive: nothing
+		// else creates directories here).
+		if strings.HasSuffix(e.Name(), pushHoldUnreservedSuffix) ||
+			strings.HasSuffix(e.Name(), pushHoldVerifiedSuffix) || e.IsDir() {
 			continue
 		}
 		path := filepath.Join(c.dir, e.Name())
