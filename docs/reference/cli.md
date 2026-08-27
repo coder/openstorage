@@ -12,7 +12,12 @@ variables are documented in the [configuration reference](configuration.md).
 
 Subcommands that open the stores (`serve`, `signing-key`, `list-packs`, `purge-repo`)
 share one storage resolution: explicit env URLs win, then `--data-dir` /
-`$CODESTORAGE_DATA_DIR` (local mode) derives the missing slots.
+`$CODESTORAGE_DATA_DIR` (local mode) derives the missing slots. Every backend scheme
+works through those env URLs, including the experimental
+[`s3wal://`](configuration.md#codestorage_pg_url) zero-infra pair: `signing-key` and
+`purge-repo` open the bucket-backed metadata/ref stores from the database URL, and
+`list-packs` reads the blob side through the `s3://` URL (it never opens the database
+URL).
 
 ## `codestorage serve`
 
@@ -39,6 +44,9 @@ codestorage serve --listen 127.0.0.1:8080 --data-dir ~/cs-data
 
 # Production mode: Postgres + S3 via env URLs.
 CODESTORAGE_PG_URL='postgres://...' CODESTORAGE_S3_URL='s3://...' codestorage serve
+
+# Zero-infra mode (experimental): refs + metadata + packs in one pre-created bucket.
+CODESTORAGE_PG_URL='s3wal://bucket?endpoint=...' CODESTORAGE_S3_URL='s3://bucket?endpoint=...&s3ForcePathStyle=true' codestorage serve
 ```
 
 ## `codestorage hook`
