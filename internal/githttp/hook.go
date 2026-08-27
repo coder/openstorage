@@ -895,15 +895,48 @@ const maxPushRefDepth = 32
 // AFTER the update hook's authority CAS committed — one non-atomic push
 // leaves an authority-only ref that every later hydration also fails to
 // write, wedging the repo. 200 leaves headroom under NAME_MAX for the
-// lock suffix; 900 keeps the whole loose-ref path comfortably inside
-// PATH_MAX for any sane cache root. Stricter than git's format rules by
-// design: names past these bounds are unrepresentable in the cache, so
-// denying them loses nothing (the parity oracle only requires accepted
-// names to be git-valid).
+// lock suffix; 900 bounds the name itself, and pushRefPathTooLong below
+// additionally bounds the WHOLE lock path against the actual repository
+// directory. Stricter than git's format rules by design: names past
+// these bounds are unrepresentable in the cache, so denying them loses
+// nothing (the parity oracle only requires accepted names to be
+// git-valid).
 const (
 	maxPushRefSegmentBytes = 200
 	maxPushRefNameBytes    = 900
 )
+
+// pushRefPathMax is a conservative Linux PATH_MAX budget for the deepest
+// path git materializes for a pushed ref: the loose lock file
+// `<repository dir>/<ref>.lock`. git resolves its git dir to an ABSOLUTE
+// path at startup, so the operator-chosen --cache-dir depth counts
+// against this budget (Codex round-21 P2 on #173: a fixed name cap alone
+// cannot see the cache root — under a deep root a name inside the static
+// caps still wedges: the authority CAS commits, then receive-pack's
+// local update fails "cannot lock ref", leaving an authority-only ref;
+// reproduced against real git in the e2e pin).
+const pushRefPathMax = 4096
+
+// pushRefPathTooLong reports whether materializing name under a
+// repository directory of repoDirLen bytes could exceed pushRefPathMax:
+// `<repoDir>/<name>.lock` plus the terminating NUL.
+func pushRefPathTooLong(repoDirLen, nameLen int) bool {
+	return repoDirLen+1+nameLen+len(".lock")+1 > pushRefPathMax
+}
+
+// pushRepoDirLen is the hook process's repository directory length: git
+// runs hooks with the (absolute) git dir as working directory. Cached —
+// hooks never chdir. Unavailable (0) fails OPEN to the static caps
+// alone; the hook environment always has a working directory in
+// practice, and failing closed here would deny every push on a Getwd
+// hiccup.
+var pushRepoDirLen = sync.OnceValue(func() int {
+	wd, err := os.Getwd()
+	if err != nil {
+		return 0
+	}
+	return len(wd)
+})
 
 // maxPushUnreserved caps how many of one push's commands may land in the
 // unreserved sidecar (one marker inode each — see preReceive). Membership
@@ -937,7 +970,10 @@ func pushRefUpdatable(name string) bool {
 	if !pushRefDeletable(name) {
 		return false
 	}
-	if len(name) > maxPushRefNameBytes { // filesystem PATH_MAX headroom
+	if len(name) > maxPushRefNameBytes { // static PATH_MAX headroom
+		return false
+	}
+	if pushRefPathTooLong(pushRepoDirLen(), len(name)) { // actual-path budget
 		return false
 	}
 	segs := strings.Split(name, "/")

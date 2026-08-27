@@ -12,32 +12,43 @@ import "context"
 // command on s3wal, and repo-scale reads are off the table while the push
 // holds its namespaces.
 //
-// PG answers in one indexed membership read, SQLite in one call of chunked
-// indexed membership reads, and s3wal from the single manifest read every
-// access pays anyway.
+// PG and SQLite answer in bounded chunks of indexed membership reads, and
+// s3wal from the single manifest read every access pays anyway.
 
-// RefValues implements the batched exact-value probe for PostgreSQL: one
-// indexed membership read over the candidate names.
+// RefValues implements the batched exact-value probe for PostgreSQL:
+// indexed membership reads in bounded dfProbeChunk-sized batches (Codex
+// round-21 P2 on #173: the push cap admits pushes of hundreds of
+// thousands of commands, and encoding ALL their names as one array
+// parameter sends one correspondingly oversized query to the shared
+// database while the push holds those refs — the same reason the D/F
+// probe chunks).
 func (s *PG) RefValues(ctx context.Context, repo string, names []string) (map[string]string, error) {
 	assertf(repo != "", "RefValues: empty repo")
 	out := map[string]string{}
-	if len(names) == 0 {
-		return out, nil
+	for start := 0; start < len(names); start += dfProbeChunk {
+		chunk := names[start:min(start+dfProbeChunk, len(names))]
+		if err := s.refValuesChunk(ctx, repo, chunk, out); err != nil {
+			return nil, err
+		}
 	}
+	return out, nil
+}
+
+func (s *PG) refValuesChunk(ctx context.Context, repo string, names []string, out map[string]string) error {
 	rows, err := s.pool.Query(ctx,
 		`SELECT name, sha FROM refs WHERE repo = $1 AND name = ANY($2)`, repo, names)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	defer rows.Close()
 	for rows.Next() {
 		var name, sha string
 		if err := rows.Scan(&name, &sha); err != nil {
-			return nil, err
+			return err
 		}
 		out[name] = sha
 	}
-	return out, rows.Err()
+	return rows.Err()
 }
 
 // RefValues implements the batched exact-value probe for s3wal from ONE

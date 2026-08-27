@@ -1051,3 +1051,50 @@ func TestServiceRPC_ReleasesPushHoldBeforeRepackTrigger(t *testing.T) {
 		t.Fatalf("repack trigger observed %d live push holds, want 0 (released before the trigger)", got)
 	}
 }
+
+// TestPush_RefPathBudgetDeniesUnmaterializableName (Codex round-21 P2 on
+// #173): the static 900-byte name cap cannot see the operator-chosen
+// --cache-dir depth. git resolves the git dir ABSOLUTE at startup, so
+// under a deep cache root a name inside the static caps still exceeds
+// PATH_MAX on the loose lock path — the authority CAS commits, then
+// receive-pack's local update fails ("cannot lock ref", verified against
+// real git with the update hook already exited 0): an authority-only ref
+// every later hydration also fails to materialize. The name gate must
+// deny such refs against the ACTUAL repository path before any CAS.
+func TestPush_RefPathBudgetDeniesUnmaterializableName(t *testing.T) {
+	repo := registerRepo(t, "t-ref-path-budget")
+	work := initWorkRepo(t)
+	token := mintTestToken(t, repo, "git:read,git:write", "")
+
+	// A cache root deep enough that root+repo+longRef crosses PATH_MAX
+	// (4096) while longRef stays inside the static 900/200/32 caps.
+	deep := t.TempDir()
+	seg := strings.Repeat("d", 180)
+	for len(deep) < 3400 {
+		deep = filepath.Join(deep, seg)
+	}
+	if err := os.MkdirAll(deep, 0o755); err != nil {
+		t.Fatalf("mkdir deep cache root: %v", err)
+	}
+	node, err := startNode(deep)
+	if err != nil {
+		t.Fatalf("start node on deep cache root: %v", err)
+	}
+	t.Cleanup(node.stop)
+
+	longRef := "refs/heads/" + strings.Repeat(strings.Repeat("r", 174)+"/", 3) + strings.Repeat("r", 174)
+	out, err := tryGit(work, "push", remoteURL(node, repo, token), "HEAD:"+longRef, "HEAD:refs/heads/ok")
+	if err == nil {
+		t.Fatalf("push fully succeeded; the unmaterializable name was supposed to be denied:\n%.1500s", out)
+	}
+	refs := pgRefs(t, repo)
+	if _, wedged := refs[longRef]; wedged {
+		t.Fatal("authority holds the locally unmaterializable ref — the authority-only wedge under test")
+	}
+	if _, ok := refs["refs/heads/ok"]; !ok {
+		t.Fatalf("materializable sibling did not land: %v", refs)
+	}
+	if !strings.Contains(out, "not updatable here") {
+		t.Fatalf("want the per-ref not-updatable denial, got:\n%.1500s", out)
+	}
+}

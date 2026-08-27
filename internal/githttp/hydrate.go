@@ -1281,10 +1281,26 @@ func mintPushHold(repoPath string) (string, error) {
 	return filepath.Abs(filepath.Join(dir, "push-"+hex.EncodeToString(buf[:])))
 }
 
-// sweepExpiredPushHolds removes hold files past the TTL — leaks from a
-// crashed serve process (the normal cleanup is the request's deferred
-// remove). Best-effort: readers already ignore expired files; this only
-// bounds directory growth.
+// pushHoldExpired reports whether a hold (or sidecar) mtime is outside
+// the live window. Past the TTL is the ordinary crash leak; a far-FUTURE
+// mtime is the same leak resurrected across a backward clock jump — a VM
+// snapshot restore of a crashed in-flight push (Codex round-21 P2 on
+// #173): a negative age would otherwise extend the lease until wall time
+// caught up and then advanced another full TTL, blocking same-name and
+// D/F-relative pushes far past the stated crash-leak bound. Live pushes
+// tolerate the symmetric bound: their refreshers re-touch with CURRENT
+// time every pushHoldTTL/4, so after a backward jump a live hold looks
+// future-dated for at most one refresh tick before its lease looks
+// ordinary again.
+func pushHoldExpired(mtime time.Time) bool {
+	age := time.Since(mtime)
+	return age > pushHoldTTL || age < -pushHoldTTL
+}
+
+// sweepExpiredPushHolds removes hold files outside the live window —
+// leaks from a crashed serve process (the normal cleanup is the request's
+// deferred remove). Best-effort: readers already ignore expired files;
+// this only bounds directory growth.
 func sweepExpiredPushHolds(dir string) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -1292,7 +1308,7 @@ func sweepExpiredPushHolds(dir string) {
 	}
 	for _, e := range entries {
 		info, err := e.Info()
-		if err == nil && time.Since(info.ModTime()) > pushHoldTTL {
+		if err == nil && pushHoldExpired(info.ModTime()) {
 			// RemoveAll: unreserved sidecars are directories.
 			_ = os.RemoveAll(filepath.Join(dir, e.Name()))
 		}
@@ -1462,7 +1478,7 @@ func (c *pushHoldDirCache) load() (pushHoldSet, error) {
 		// The TTL check runs on every load — expiry is time-driven, not
 		// change-driven — so an expired hold drops out of the set on the
 		// next poll even though its file never changed.
-		if time.Since(info.ModTime()) > pushHoldTTL {
+		if pushHoldExpired(info.ModTime()) {
 			continue
 		}
 		parse, ok := c.files[path]

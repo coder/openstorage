@@ -1040,3 +1040,81 @@ func TestPushVerifiedVerdicts_EveryPassPreserved(t *testing.T) {
 		t.Fatal("verdict consumed without a sidecar")
 	}
 }
+
+// TestPushRefPathTooLong (Codex round-21 P2 on #173) pins the whole-path
+// budget arithmetic: `<repoDir>/<name>.lock` plus NUL against PATH_MAX
+// (4096). The e2e deep-cache-root test proves the end-to-end denial; this
+// pins the boundary itself.
+func TestPushRefPathTooLong(t *testing.T) {
+	// 4096 = repoDirLen + 1 (slash) + nameLen + 5 (".lock") + 1 (NUL):
+	// the largest fitting name under a 3400-byte repo dir is 689 bytes.
+	if pushRefPathTooLong(3400, 689) {
+		t.Fatal("689-byte name under a 3400-byte repo dir fits PATH_MAX; must be allowed")
+	}
+	if !pushRefPathTooLong(3400, 690) {
+		t.Fatal("690-byte name under a 3400-byte repo dir exceeds PATH_MAX; must be denied")
+	}
+	// Typical roots leave the static 900-byte cap authoritative.
+	if pushRefPathTooLong(100, maxPushRefNameBytes) {
+		t.Fatal("the full static name cap must fit under a typical cache root")
+	}
+}
+
+// TestPushHolds_FutureDatedHoldExpires (Codex round-21 P2 on #173): a
+// hold file resurrected across a backward clock jump — a VM snapshot
+// restore of a crashed in-flight push — carries an mtime in the FUTURE.
+// A negative age must not extend the lease: readers would treat the leak
+// as live and the mint-time sweeper would never remove it, blocking every
+// same-name or D/F-relative push until wall time catches up and then
+// advances another full TTL — far past the stated crash-leak bound. Both
+// the reader and the sweeper must treat far-future mtimes as expired.
+// Live pushes tolerate the symmetric bound: their refreshers re-touch
+// with CURRENT time every pushHoldTTL/4, so after a backward jump a live
+// hold looks future-dated for at most one refresh tick.
+func TestPushHolds_FutureDatedHoldExpires(t *testing.T) {
+	repoDir := t.TempDir()
+	hold, err := mintPushHold(repoDir)
+	if err != nil {
+		t.Fatalf("mintPushHold: %v", err)
+	}
+	if err := os.WriteFile(hold, []byte("refs/heads/x\n"), 0o644); err != nil {
+		t.Fatalf("write hold: %v", err)
+	}
+	holdDir := filepath.Join(repoDir, pushHoldDir)
+	set, err := readPushHolds(holdDir, "")
+	if err != nil || !set.contains("refs/heads/x") {
+		t.Fatalf("fresh hold must be live: set=%v err=%v", set, err)
+	}
+	future := time.Now().Add(pushHoldTTL + time.Minute)
+	if err := os.Chtimes(hold, future, future); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
+	set, err = readPushHolds(holdDir, "")
+	if err != nil {
+		t.Fatalf("readPushHolds: %v", err)
+	}
+	if set.contains("refs/heads/x") {
+		t.Fatal("future-dated hold treated as live by the reader (negative age extends the lease)")
+	}
+	sweepExpiredPushHolds(holdDir)
+	if _, err := os.Stat(hold); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("future-dated hold survived the sweep: %v", err)
+	}
+	// Just inside the future bound stays live: refresher touches from a
+	// marginally fast clock must not expire a running push's hold.
+	hold2, err := mintPushHold(repoDir)
+	if err != nil {
+		t.Fatalf("mintPushHold: %v", err)
+	}
+	if err := os.WriteFile(hold2, []byte("refs/heads/y\n"), 0o644); err != nil {
+		t.Fatalf("write hold: %v", err)
+	}
+	near := time.Now().Add(pushHoldTTL / 2)
+	if err := os.Chtimes(hold2, near, near); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
+	set, err = readPushHolds(holdDir, "")
+	if err != nil || !set.contains("refs/heads/y") {
+		t.Fatalf("near-future hold must stay live: set=%v err=%v", set, err)
+	}
+}

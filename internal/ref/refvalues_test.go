@@ -15,6 +15,17 @@ func TestRefValues_AcrossBackends(t *testing.T) {
 	runRefBackends(t, testRefValues)
 }
 
+// TestRefValues_ChunkedProbeKeepsValues re-runs the conformance suite
+// with a tiny chunk so the multi-chunk path (Codex round-21 P2 on #173:
+// PG must not encode an unbounded push's every name into one array
+// parameter) provably returns the same values as the single-chunk path.
+func TestRefValues_ChunkedProbeKeepsValues(t *testing.T) {
+	prev := dfProbeChunk
+	dfProbeChunk = 2
+	t.Cleanup(func() { dfProbeChunk = prev })
+	runRefBackends(t, testRefValues)
+}
+
 func testRefValues(t *testing.T, s Store) {
 	prober, ok := s.(interface {
 		RefValues(ctx context.Context, repo string, names []string) (map[string]string, error)
