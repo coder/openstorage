@@ -1732,19 +1732,39 @@ func TestReservePushHolds_PeerScanWorkBounded(t *testing.T) {
 		t.Fatalf("write peer hold: %v", err)
 	}
 	oldMax := maxPushPeerScanBytes
-	maxPushPeerScanBytes = int64(sb.Len()) - 1
 	t.Cleanup(func() { maxPushPeerScanBytes = oldMax })
 
+	// ZERO overshoot (Codex round-31 P2): a peer set larger than the
+	// remaining allowance is denied from stats alone, BEFORE any read —
+	// the previous check ran only against previously charged work, so
+	// one scan could exceed the limit by the full peer set (parsed and
+	// sorted under the reservation flock) before the budget had any
+	// effect. Both the single-name and multi-name paths deny up front,
+	// and neither charges the counter.
+	maxPushPeerScanBytes = int64(sb.Len()) - 1
 	hold := filepath.Join(dir, "push-self")
-	// The first self-reservation scans the peer once — the allowed
-	// trailing overshoot — and succeeds.
+	err := reservePushHolds(context.Background(), hold, []string{"refs/heads/x"})
+	if err == nil || !strings.Contains(err.Error(), "scan allowance") {
+		t.Fatalf("over-allowance single-name scan must be denied up front, got %v", err)
+	}
+	err = reservePushHolds(context.Background(), hold, []string{"refs/heads/m1", "refs/heads/m2"})
+	if err == nil || !strings.Contains(err.Error(), "scan allowance") {
+		t.Fatalf("over-allowance multi-name scan must be denied up front, got %v", err)
+	}
+	if _, statErr := os.Stat(hold + pushHoldScanSuffix); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("denied-up-front reservations must charge nothing: %v", statErr)
+	}
+
+	// Within the allowance, scans run and ACCRUE: once the counter plus
+	// the (unchanged) peer set exceed the budget, later self-reservations
+	// are denied without reading the peers again.
+	maxPushPeerScanBytes = int64(sb.Len()) + 8
 	if err := reservePushHolds(context.Background(), hold, []string{"refs/heads/x"}); err != nil {
 		t.Fatalf("first self-reservation: %v", err)
 	}
-	// The accrued counter now denies further scans up front.
-	err := reservePushHolds(context.Background(), hold, []string{"refs/heads/y"})
+	err = reservePushHolds(context.Background(), hold, []string{"refs/heads/y"})
 	if err == nil || !strings.Contains(err.Error(), "scan allowance") {
-		t.Fatalf("over-allowance self-reservation must be denied, got %v", err)
+		t.Fatalf("accrued-over-allowance reservation must be denied, got %v", err)
 	}
 	// The counter is a sidecar: hold readers must not treat it as a hold
 	// file, and releases must remove it with the hold.
@@ -1763,12 +1783,100 @@ func TestReservePushHolds_PeerScanWorkBounded(t *testing.T) {
 	// charges the same allowance (Codex round-29 security P2) — it was
 	// initially budgeted only for len(names)==1.
 	hold2 := filepath.Join(dir, "push-self2")
+	maxPushPeerScanBytes = 4 * int64(sb.Len())
 	if err := reservePushHolds(context.Background(), hold2, []string{"refs/heads/m1", "refs/heads/m2"}); err != nil {
 		t.Fatalf("first multi-name reservation: %v", err)
 	}
+	maxPushPeerScanBytes = int64(sb.Len()) + 8
 	err = reservePushHolds(context.Background(), hold2, []string{"refs/heads/m3", "refs/heads/m4"})
 	if err == nil || !strings.Contains(err.Error(), "scan allowance") {
 		t.Fatalf("over-allowance multi-name reservation must be denied, got %v", err)
+	}
+}
+
+// TestPushHoldRefresh_FollowsInodeAcrossRename (Codex round-31 P2 on
+// #173): the expiry reaper quarantines an expired-verdict hold by RENAME
+// and revalidates the quarantined INODE before unlinking, so a live
+// push's refresher must touch the inode, not the path — a path-based
+// Chtimes hits ENOENT during quarantine, the touch is lost, and the
+// reaper deletes a live hold its refresher can never recreate.
+func TestPushHoldRefresh_FollowsInodeAcrossRename(t *testing.T) {
+	oldTTL := pushHoldTTL
+	pushHoldTTL = 200 * time.Millisecond
+	t.Cleanup(func() { pushHoldTTL = oldTTL })
+	dir := t.TempDir()
+	hold := filepath.Join(dir, "push-fd")
+	if err := os.WriteFile(hold, []byte("refs/heads/x\n"), 0o600); err != nil {
+		t.Fatalf("write hold: %v", err)
+	}
+	stop := startPushHoldRefresh(hold)
+	defer stop()
+	quarantine := hold + ".reaping"
+	if err := os.Rename(hold, quarantine); err != nil {
+		t.Fatalf("rename: %v", err)
+	}
+	past := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(quarantine, past, past); err != nil {
+		t.Fatalf("age quarantine: %v", err)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		qi, err := os.Stat(quarantine)
+		if err != nil {
+			t.Fatalf("stat quarantine: %v", err)
+		}
+		if qi.ModTime().After(past.Add(time.Minute)) {
+			return // a refresher touch landed on the renamed inode
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("refresher touches do not follow the inode across a rename")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TestReapExpiredPushHold_RestoresTouchedHold (Codex round-31 P2 on
+// #173): the expiry verdict and the removal linearize at the quarantine
+// rename — an owner touch that preceded it is observed on the quarantined
+// inode and restores the hold untouched; only a verifiably untouched leak
+// is unlinked, together with its sidecars.
+func TestReapExpiredPushHold_RestoresTouchedHold(t *testing.T) {
+	dir := t.TempDir()
+	hold := filepath.Join(dir, "push-reap-lin")
+	if err := os.WriteFile(hold, []byte("refs/heads/x\n"), 0o600); err != nil {
+		t.Fatalf("write hold: %v", err)
+	}
+	old := time.Now().Add(-2 * pushHoldTTL)
+	// A refresher touch lands AFTER the sweep's expiry observation (old)
+	// but before the reap: the hold must survive at its original path.
+	now := time.Now()
+	if err := os.Chtimes(hold, now, now); err != nil {
+		t.Fatalf("touch hold: %v", err)
+	}
+	reapExpiredPushHold(hold, old)
+	if _, err := os.Stat(hold); err != nil {
+		t.Fatalf("touched hold must be restored at its original path: %v", err)
+	}
+	if _, err := os.Stat(hold + ".reaping"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("quarantine must not linger after a restore")
+	}
+	// An untouched leak is unlinked with its sidecars.
+	if err := os.Chtimes(hold, old, old); err != nil {
+		t.Fatalf("age hold: %v", err)
+	}
+	info, err := os.Stat(hold)
+	if err != nil {
+		t.Fatalf("stat hold: %v", err)
+	}
+	if err := os.WriteFile(hold+pushHoldScanSuffix, []byte("7"), 0o600); err != nil {
+		t.Fatalf("write sidecar: %v", err)
+	}
+	reapExpiredPushHold(hold, info.ModTime())
+	if _, err := os.Stat(hold); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("untouched leak must be unlinked")
+	}
+	if _, err := os.Stat(hold + pushHoldScanSuffix); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("reap must remove the leak's sidecars")
 	}
 }
 

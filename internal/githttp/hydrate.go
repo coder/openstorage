@@ -1444,7 +1444,7 @@ func sweepExpiredPushHolds(dir string) {
 			// forward clock step, round-25), and take its sidecars
 			// with it so nothing orphans.
 			if !pushHoldLive(path, info.ModTime()) {
-				removePushHoldFiles(path)
+				reapExpiredPushHold(path, info.ModTime())
 			}
 			continue
 		}
@@ -1469,6 +1469,38 @@ func sweepExpiredPushHolds(dir string) {
 			_ = os.Chtimes(path, now, now)
 		}
 	}
+}
+
+// reapExpiredPushHold removes an expiry-verdict hold with the verdict and
+// the removal LINEARIZED at one rename (Codex round-31 P2 on #173): the
+// two-observation verdict and the unlink used to be separate filesystem
+// operations, so a refresher resuming between them could touch the hold
+// and still lose it to the sweep — and refreshers can only Chtimes, never
+// recreate a reservation. The hold is renamed (atomically; mtimes travel
+// with the inode) to a quarantine name that readers still treat as a HOLD
+// file, so its names stay covered throughout; the verdict is then
+// revalidated on the quarantined inode itself. Any owner touch that
+// preceded the rename is visible there — refreshers touch through an open
+// fd, following the inode into quarantine — and restores the hold
+// untouched. Only a verifiably untouched leak is unlinked, together with
+// its sidecars. Crash leftovers behave as ordinary leaked holds and age
+// out through the same two-observation expiry.
+func reapExpiredPushHold(path string, observed time.Time) {
+	quarantine := path + ".reaping"
+	if err := os.Rename(path, quarantine); err != nil {
+		return // released or already quarantined by a concurrent sweep
+	}
+	if qi, err := os.Stat(quarantine); err != nil || !qi.ModTime().Equal(observed) {
+		// An owner touch raced the verdict (or the stat failed — fail
+		// LIVE): put the hold back untouched.
+		_ = os.Rename(quarantine, path)
+		return
+	}
+	_ = os.Remove(quarantine)
+	_ = os.RemoveAll(path + pushHoldUnreservedSuffix)
+	_ = os.RemoveAll(path + pushHoldVerifiedSuffix)
+	_ = os.Remove(path + pushHoldScanSuffix)
+	_ = os.Remove(path + pushHoldReapSuffix)
 }
 
 // pushHoldSidecarBase maps a sidecar entry name to its hold file's name.
@@ -1529,7 +1561,31 @@ func touchPushHold(holdPath string) {
 // ticker period would otherwise never touch the file at all, and a push
 // whose hook phase outlives the TTL would lose its hold mid-flight.
 func startPushHoldRefresh(holdPath string) (stop func()) {
-	touchPushHold(holdPath)
+	// Touches land on the INODE, not just the path (Codex round-31 P2 on
+	// #173): the expiry reaper quarantines an expired-verdict hold by
+	// RENAME before revalidating and unlinking it, and a path-based
+	// Chtimes from a refresher that resumed exactly then would hit ENOENT
+	// and be lost — the reaper would see an untouched inode and delete a
+	// live push's hold, which Chtimes can never recreate. An fd-based
+	// touch follows the inode through the rename, so the reaper's
+	// post-rename revalidation observes every touch that preceded its
+	// unlink and restores the hold. The fd is opened lazily: the server's
+	// refresher starts before the reservation creates the file.
+	var f *os.File
+	touch := func() {
+		if f == nil {
+			f, _ = os.OpenFile(holdPath, os.O_WRONLY, 0)
+		}
+		if f != nil {
+			now := syscall.NsecToTimeval(time.Now().UnixNano())
+			_ = syscall.Futimes(int(f.Fd()), []syscall.Timeval{now, now})
+		}
+		// Path-based touches still cover the sidecars (and the hold when
+		// the fd has not opened yet); after release they are ENOENT
+		// no-ops, exactly as before.
+		touchPushHold(holdPath)
+	}
+	touch()
 	done := make(chan struct{})
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -1542,13 +1598,16 @@ func startPushHoldRefresh(holdPath string) (stop func()) {
 			case <-done:
 				return
 			case <-t.C:
-				touchPushHold(holdPath)
+				touch()
 			}
 		}
 	}()
 	return func() {
 		close(done)
 		wg.Wait()
+		if f != nil {
+			_ = f.Close()
+		}
 	}
 }
 
@@ -1854,6 +1913,45 @@ func writePushScanWork(holdPath string, n int64) error {
 	return os.WriteFile(holdPath+pushHoldScanSuffix, []byte(strconv.FormatInt(n, 10)), 0o600)
 }
 
+// pushHoldPendingBytes reports, STAT-ONLY, the peer-hold bytes a scan
+// would read right now: every non-sidecar file except exceptPath whose
+// (size, mtime) is not already covered by cached (nil for the uncached
+// single-name scans). The allowance check runs on used+pending BEFORE any
+// parse (Codex round-31 P2 on #173): checking only previously charged
+// work let one scan overshoot the limit by an entire peer set — read,
+// split, and sorted under the reservation flock before the budget had any
+// effect. Expired files inflate the estimate slightly (no liveness
+// probing here — the estimate must stay pure stats); the mint sweep
+// bounds that skew.
+func pushHoldPendingBytes(dir, exceptPath string, cached map[string]holdFileParse) (int64, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	var pending int64
+	for _, e := range entries {
+		if isPushHoldSidecar(e.Name()) || e.IsDir() {
+			continue
+		}
+		path := filepath.Join(dir, e.Name())
+		if exceptPath != "" && path == exceptPath {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue // released between the listing and the stat
+		}
+		if parse, ok := cached[path]; ok && parse.size == info.Size() && parse.mtime == info.ModTime().UnixNano() {
+			continue
+		}
+		pending += info.Size()
+	}
+	return pending, nil
+}
+
 // pushHoldWaitMax bounds reservePushHolds' wait for D/F-conflicting holds
 // from other pushes; a var so tests can exercise the denial path quickly.
 // Hold windows are server-controlled and normally millisecond-scale.
@@ -1940,7 +2038,12 @@ func reservePushHolds(ctx context.Context, holdPath string, names []string) erro
 				unlock()
 				return fmt.Errorf("push hold: scan-work counter: %w", err)
 			}
-			if used > maxPushPeerScanBytes {
+			pending, err := pushHoldPendingBytes(dir, holdPath, nil)
+			if err != nil {
+				unlock()
+				return fmt.Errorf("push hold: reading peer holds: %w", err)
+			}
+			if used+pending > maxPushPeerScanBytes {
 				unlock()
 				return fmt.Errorf("push hold: push exceeded its peer-hold scan allowance against unusually large concurrent push holds; retry shortly or split the push")
 			}
@@ -1974,7 +2077,12 @@ func reservePushHolds(ctx context.Context, holdPath string, names []string) erro
 				unlock()
 				return fmt.Errorf("push hold: scan-work counter: %w", err)
 			}
-			if used > maxPushPeerScanBytes {
+			pending, err := pushHoldPendingBytes(dir, holdPath, cache.files)
+			if err != nil {
+				unlock()
+				return fmt.Errorf("push hold: reading peer holds: %w", err)
+			}
+			if used+pending > maxPushPeerScanBytes {
 				unlock()
 				return fmt.Errorf("push hold: push exceeded its peer-hold scan allowance against unusually large concurrent push holds; retry shortly or split the push")
 			}
