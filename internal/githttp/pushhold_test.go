@@ -1047,20 +1047,26 @@ func TestPushVerifiedVerdicts_EveryPassPreserved(t *testing.T) {
 }
 
 // TestPushRefPathTooLong (Codex round-21 P2 on #173) pins the whole-path
-// budget arithmetic: `<repoDir>/<name>.lock` plus NUL against PATH_MAX
-// (4096). The e2e deep-cache-root test proves the end-to-end denial; this
-// pins the boundary itself.
+// budget arithmetic: `<repoDir>/<name>.lock` plus NUL against the target
+// OS's PATH_MAX (round-24 security P2: derived per-OS — Linux 4096,
+// Darwin 1024 — so the boundary is computed from the constant, not
+// hard-coded). The e2e deep-cache-root test proves the end-to-end denial;
+// this pins the boundary itself.
 func TestPushRefPathTooLong(t *testing.T) {
-	// 4096 = repoDirLen + 1 (slash) + nameLen + 5 (".lock") + 1 (NUL):
-	// the largest fitting name under a 3400-byte repo dir is 689 bytes.
-	if pushRefPathTooLong(3400, 689) {
-		t.Fatal("689-byte name under a 3400-byte repo dir fits PATH_MAX; must be allowed")
+	// PATH_MAX = repoDirLen + 1 (slash) + nameLen + 5 (".lock") + 1
+	// (NUL): compute the largest fitting name under a repo dir that
+	// leaves 700 bytes of headroom on any supported OS.
+	repoDirLen := pushRefPathMax - 700
+	fit := pushRefPathMax - repoDirLen - 1 - len(".lock") - 1 // 693
+	if pushRefPathTooLong(repoDirLen, fit) {
+		t.Fatalf("%d-byte name under a %d-byte repo dir fits PATH_MAX (%d); must be allowed", fit, repoDirLen, pushRefPathMax)
 	}
-	if !pushRefPathTooLong(3400, 690) {
-		t.Fatal("690-byte name under a 3400-byte repo dir exceeds PATH_MAX; must be denied")
+	if !pushRefPathTooLong(repoDirLen, fit+1) {
+		t.Fatalf("%d-byte name under a %d-byte repo dir exceeds PATH_MAX (%d); must be denied", fit+1, repoDirLen, pushRefPathMax)
 	}
-	// Typical roots leave the static 900-byte cap authoritative.
-	if pushRefPathTooLong(100, maxPushRefNameBytes) {
+	// Typical roots leave the static 900-byte cap authoritative (Linux;
+	// tighter-PATH_MAX targets lean on the dynamic budget instead).
+	if pushRefPathMax >= 4096 && pushRefPathTooLong(100, maxPushRefNameBytes) {
 		t.Fatal("the full static name cap must fit under a typical cache root")
 	}
 }

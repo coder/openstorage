@@ -17,6 +17,8 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/coder/code-storage/internal/auth"
 	"github.com/coder/code-storage/internal/blob"
 	"github.com/coder/code-storage/internal/meta"
@@ -987,16 +989,19 @@ const (
 // policy caps and the hard limit stay deletable.
 const pushRefSegmentNameMax = 255
 
-// pushRefPathMax is a conservative Linux PATH_MAX budget for the deepest
-// path git materializes for a pushed ref: the loose lock file
+// pushRefPathMax is the TARGET OS's PATH_MAX budget for the deepest path
+// git materializes for a pushed ref: the loose lock file
 // `<repository dir>/<ref>.lock`. git resolves its git dir to an ABSOLUTE
 // path at startup, so the operator-chosen --cache-dir depth counts
 // against this budget (Codex round-21 P2 on #173: a fixed name cap alone
 // cannot see the cache root — under a deep root a name inside the static
 // caps still wedges: the authority CAS commits, then receive-pack's
 // local update fails "cannot lock ref", leaving an authority-only ref;
-// reproduced against real git in the e2e pin).
-const pushRefPathMax = 4096
+// reproduced against real git in the e2e pin). Derived from the compiled
+// OS ABI, not hard-coded to Linux's 4096 (Codex round-24 security P2):
+// Darwin's PATH_MAX is 1024, so a name accepted under the Linux budget
+// could still wedge a macOS local-mode deployment the same way.
+const pushRefPathMax = unix.PathMax
 
 // pushRefPathTooLong reports whether materializing name under a
 // repository directory of repoDirLen bytes could exceed pushRefPathMax:
