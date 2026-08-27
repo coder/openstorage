@@ -3,8 +3,12 @@
 # on. This job produces a nightly data point (uploaded as an artifact) so
 # regressions and optimizations (e.g. issue #93) can be compared across runs
 # with benchstat. `-run '^$'` skips ordinary tests; CODESTORAGE_TEST_BACKEND=
-# local keeps the internal/githttp TestMain boot container-free — the
-# benchmarks themselves never touch the booted e2e environment.
+# local keeps the internal/githttp TestMain boot container-free — the sweep's
+# only bench that touches the booted e2e environment (BenchmarkPushE2E,
+# issue #133 Phase 4) therefore measures the container-free SQLite lane
+# there; a second step re-runs it on the s3wal lane (SeaweedFS container,
+# same Docker dependency the internal/ref/s3wal benches in the sweep
+# already have).
 name: bench-nightly
 
 on:
@@ -46,6 +50,27 @@ jobs:
           # benchmark packages would contend for CPU and disk, making ns/op
           # depend on package scheduling instead of the benched code.
           go test -p 1 ./... -run '^$' -bench . -benchmem -benchtime "$BENCHTIME" -count "$COUNT" -timeout 50m | tee bench-results.txt
+      - name: push-path bench (s3wal lane)
+        # The push-path e2e bench (issue #133 Phase 4) already ran on the
+        # SQLite lane in the sweep above; this re-runs it against the s3wal
+        # zero-infra backend (TestMain boots a SeaweedFS container). Kept
+        # at the default 5 s window per cell — the plan §3 60 s campaign
+        # windows are an on-demand run, not a nightly cost. Nightly runs
+        # performance mode only (CODESTORAGE_BENCH_OBSERVE unset): the
+        # mid-window correctness observer would contend with the measured
+        # pushes; correctness campaigns are on-demand (see
+        # docs/plans/s3wal-bench-results.md). BenchmarkPushE2E overrides
+        # ns/op to per-push time and neutralizes B/op / allocs/op to zero:
+        # -benchmem would divide whole-window harness allocations by the
+        # window-iteration count, an invalid memory series for a
+        # git-subprocess harness.
+        shell: bash
+        env:
+          CODESTORAGE_TEST_BACKEND: s3wal
+        run: |
+          COUNT="${{ github.event.inputs.count }}"
+          COUNT="${COUNT:-1}"
+          go test ./internal/githttp/ -run '^$' -bench 'BenchmarkPushE2E' -benchtime 1x -count "$COUNT" -timeout 50m | tee -a bench-results.txt
       - name: upload results
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
