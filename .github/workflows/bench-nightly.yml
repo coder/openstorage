@@ -59,7 +59,11 @@ jobs:
         # performance mode only (CODESTORAGE_BENCH_OBSERVE unset): the
         # mid-window correctness observer would contend with the measured
         # pushes; correctness campaigns are on-demand (see
-        # docs/plans/s3wal-bench-results.md).
+        # docs/plans/s3wal-bench-results.md). BenchmarkPushE2E overrides
+        # ns/op to per-push time and neutralizes B/op / allocs/op to zero:
+        # -benchmem would divide whole-window harness allocations by the
+        # window-iteration count, an invalid memory series for a
+        # git-subprocess harness.
         shell: bash
         env:
           CODESTORAGE_TEST_BACKEND: s3wal

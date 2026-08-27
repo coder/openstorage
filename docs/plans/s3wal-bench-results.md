@@ -140,7 +140,14 @@ exhausts its chain ends participation early and is counted in
 `exhausted-writers`, zero in every cell). The standard benchmark timer
 covers only the sustained windows, and the published ns/op is overridden
 to timed-window wall time per successful push (the reciprocal of push/s)
-so benchstat tracks throughput. Windows are 60 s sustained per cell after
+so benchstat tracks throughput; B/op and allocs/op are neutralized to
+zero because under `-benchmem` they would report the harness's
+whole-window client-side allocations per window iteration — meaningless
+for the server push path. Every push subprocess is deadline-bounded
+(window remainder + 30 s grace inside the window; 2 min for seed/warmup
+pushes and observer polls) with a process-group kill, so a stalled serve
+response cannot hang the bench — a killed push records as an ordinary
+ambiguous failure. Windows are 60 s sustained per cell after
 a ≥ 20-push collective warmup. Serve-side background jobs (e.g. the
 10-pack repack fold) run during the windows — deliberately: that is the
 production push path.

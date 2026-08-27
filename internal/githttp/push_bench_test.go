@@ -61,6 +61,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -87,6 +88,15 @@ const (
 	// benchObserverInterval is the mid-window ls-remote poll cadence
 	// (correctness mode only).
 	benchObserverInterval = 250 * time.Millisecond
+	// benchSetupPushTimeout bounds git subprocesses outside the sustained
+	// window (seed push, warmup pushes, observer polls): generous, but a
+	// stalled serve node must never hang the bench.
+	benchSetupPushTimeout = 2 * time.Minute
+	// benchPushGrace bounds a window push past the window end. The window
+	// deadline is only checked between pushes, so without a per-subprocess
+	// deadline one stalled response would block the writer forever; a push
+	// killed at the deadline records as an ordinary ambiguous failure.
+	benchPushGrace = 30 * time.Second
 	// envBenchObserve selects correctness mode: "1" runs the mid-window
 	// pushObserver, anything else keeps the window observer-free (the
 	// performance mode; see the package comment).
@@ -143,6 +153,28 @@ func pushPercentile(b *testing.B, sorted []time.Duration, p float64) time.Durati
 	idx := int(float64(len(sorted))*p/100+0.999999) - 1
 	idx = max(0, min(idx, len(sorted)-1))
 	return sorted[idx]
+}
+
+// tryGitDeadline runs git like tryGit but kills the WHOLE process group
+// once the timeout expires: `git push` forks helpers (pack-objects, the
+// transport) that a bare CommandContext kill would orphan, leaving them
+// holding client-repo locks. Production git callers use plain
+// CommandContext; the group kill is bench-specific because the harness
+// owns its client repos outright. A killed push surfaces as an ordinary
+// error to the caller (plus the context cause).
+func tryGitDeadline(dir string, timeout time.Duration, args ...string) (string, error) {
+	full := append(append([]string{}, gitIdentity...), args...)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "git", full...)
+	cmd.Dir = dir
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
+	out, err := cmd.CombinedOutput()
+	if err != nil && ctx.Err() != nil {
+		err = fmt.Errorf("%w (process group killed at the %s deadline)", ctx.Err(), timeout)
+	}
+	return string(out), err
 }
 
 // benchGit runs git (with the shared test identity) and fails the benchmark
@@ -418,7 +450,9 @@ func runPushWindow(b *testing.B, writers int, window time.Duration) pushWindowRe
 	url := remoteURL(nodeA, repo, token)
 
 	seed := benchSeedRepo(b)
-	benchGit(b, seed, "push", url, "HEAD:refs/heads/main")
+	if out, err := tryGitDeadline(seed, benchSetupPushTimeout, "push", url, "HEAD:refs/heads/main"); err != nil {
+		b.Fatalf("seed push: %v\n%s", err, out)
+	}
 
 	perWriter := (benchPushWarmup + writers - 1) / writers
 	chainLen := int(window.Seconds()*benchChainPushRate) + perWriter + 5
@@ -505,13 +539,17 @@ func runPushWindow(b *testing.B, writers int, window time.Duration) pushWindowRe
 			}()
 			// pushNext sends the next pre-generated commit, publishing the
 			// attempt index BEFORE contacting the server so the observer
-			// can bound what it may legally see there.
-			pushNext := func() (time.Duration, string, error) {
+			// can bound what it may legally see there. timeout bounds the
+			// push subprocess (a kill records as an ordinary ambiguous
+			// failure: the attempted tip stays in the accepted set and
+			// the published attempt index stays pending for the observer,
+			// exactly like any other failed push).
+			pushNext := func(timeout time.Duration) (time.Duration, string, error) {
 				sha := chain[k]
 				k++
 				attempted[i].Store(int64(k))
 				t0 := time.Now()
-				out, err := tryGit(dir, "push", url, sha+":"+branch)
+				out, err := tryGitDeadline(dir, timeout, "push", url, sha+":"+branch)
 				d := time.Since(t0)
 				if err != nil {
 					// The attempted tip stays accepted: the rejection may
@@ -527,7 +565,7 @@ func runPushWindow(b *testing.B, writers int, window time.Duration) pushWindowRe
 				return d, out, nil
 			}
 			for range perWriter {
-				if _, out, err := pushNext(); err != nil {
+				if _, out, err := pushNext(benchSetupPushTimeout); err != nil {
 					// Tolerated like the measured loop (see pushNext).
 					b.Logf("writer %d warmup push rejected (op %d): %v\n%s", i, k, err, out)
 				}
@@ -545,7 +583,10 @@ func runPushWindow(b *testing.B, writers int, window time.Duration) pushWindowRe
 					b.Logf("writer %d exhausted its %d-commit chain before the deadline", i, len(chain))
 					break
 				}
-				d, out, err := pushNext()
+				// Bounded by the remaining window plus a grace margin: a
+				// stalled serve response must not hang the writer past
+				// the window end.
+				d, out, err := pushNext(max(time.Until(deadline), 0) + benchPushGrace)
 				if err != nil {
 					// A rejected push is a real result under sustained
 					// contention (e.g. SQLITE_BUSY surfacing through the
@@ -585,7 +626,7 @@ func runPushWindow(b *testing.B, writers int, window time.Duration) pushWindowRe
 					return
 				case <-ticker.C:
 				}
-				out, err := tryGit(seed, "ls-remote", url)
+				out, err := tryGitDeadline(seed, benchSetupPushTimeout, "ls-remote", url)
 				if err != nil {
 					// A failed poll silently widens the observation gap,
 					// so the correctness verdict would be unreliable: the
@@ -720,6 +761,15 @@ func BenchmarkPushE2E(b *testing.B) {
 			// window-iteration it would report the window duration —
 			// per-push time is the benchstat-meaningful unit.
 			b.ReportMetric(float64(elapsed.Nanoseconds())/float64(len(all)), "ns/op")
+			// Neutralize the memory series: under -benchmem (the nightly
+			// sweep) testing.B would divide the whole window's
+			// client+harness allocations by b.N (window iterations) and
+			// label that one "push" — an invalid benchstat series. The
+			// harness's client-side allocations are meaningless for the
+			// server push path anyway, so both built-ins are overridden
+			// to zero rather than published.
+			b.ReportMetric(0, "B/op")
+			b.ReportMetric(0, "allocs/op")
 			b.ReportMetric(float64(len(all))/elapsed.Seconds(), "push/s")
 			b.ReportMetric(elapsed.Seconds(), "elapsed-s")
 			b.ReportMetric(float64(failures), "push-failures")
