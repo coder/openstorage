@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -30,6 +31,8 @@ import (
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
+
+	"github.com/coder/code-storage/internal/ref/s3wal/s3waltest"
 )
 
 // Qualified SeaweedFS recipe (Gate 1a-A, PR #142): pinned image,
@@ -113,6 +116,49 @@ func ensureBucketReady(t *testing.T, b *S3) {
 			t.Fatalf("EnsureBucket never succeeded (SeaweedFS not ready?): %v", err)
 		}
 		time.Sleep(250 * time.Millisecond)
+	}
+}
+
+// TestEnsureBucketReadyGatesWriteReadiness pins the issue #177 contract
+// (the internal/blob recurrence of #165): ensureBucketReady must not hand
+// the store to a test before an object-write roundtrip has succeeded.
+// SeaweedFS serves bucket operations from the filer while object PUTs 500
+// until a writable volume is assigned, and a slow runner can exhaust the
+// SDK's default 3-attempt budget inside that window — exactly how
+// TestS3_ExpectedBucketOwnerHarmlessOnSeaweedFS failed on PR #176 run
+// 33047829563. The deterministic fake fails one more PUT than the SDK
+// budget, so against a pre-gate ensureBucketReady the first upload fails
+// on every run instead of one CI run in dozens. No Docker required.
+func TestEnsureBucketReadyGatesWriteReadiness(t *testing.T) {
+	fake := &s3waltest.BootingFakeS3{PutFailures: 4}
+	srv := httptest.NewServer(fake.Handler())
+	defer srv.Close()
+	t.Setenv("AWS_ACCESS_KEY_ID", "test")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "test")
+
+	ctx := context.Background()
+	b, err := OpenS3(ctx, fmt.Sprintf("s3://gate-bucket?endpoint=%s&s3ForcePathStyle=true&region=us-east-1", srv.URL))
+	if err != nil {
+		t.Fatalf("OpenS3: %v", err)
+	}
+	defer b.Close()
+	ensureBucketReady(t, b)
+
+	// The suite's first real write after the harness declares readiness.
+	src := filepath.Join(t.TempDir(), "src.pack")
+	if err := os.WriteFile(src, []byte("boot-window readiness probe"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.UploadFile(ctx, PackKey("r1", "gate"), src); err != nil {
+		t.Fatalf("first upload after ensureBucketReady failed — write readiness was not gated: %v", err)
+	}
+
+	remaining, _, deletes := fake.Snapshot()
+	if remaining != 0 {
+		t.Errorf("gate returned with %d boot-window PUT failures unconsumed", remaining)
+	}
+	if deletes == 0 {
+		t.Error("readiness scratch key was never deleted")
 	}
 }
 
