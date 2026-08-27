@@ -190,7 +190,11 @@ authority semantics the detector must witness):
   descendant push, which the final check alone cannot see (Codex
   round-2). Any failed observer poll makes the run inconclusive, which
   fails the bench — a silent poll gap would undermine the verdict, and a
-  loopback `ls-remote` failure is abnormal (tolerance: zero). Honest
+  loopback `ls-remote` failure is abnormal (tolerance: zero). The run is
+  likewise inconclusive unless at least half the cadence-expected polls
+  COMPLETE inside the window (`observer-polls-in-window`; floor ~120 of
+  ~240 for a 60 s window): zero violations from polls that all finished
+  after the window would be vacuous. Honest
   limit: a rewind fully contained between two polls remains undetectable.
   `TestPushObserverLegality` red-checks the legality rules synthetically,
   including the round-4 interleaving. Latency/throughput from correctness

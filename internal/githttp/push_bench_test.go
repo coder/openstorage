@@ -140,6 +140,12 @@ type pushWindowResult struct {
 	ambiguous int64
 	exhausted int64
 	polls     int64
+	// pollsInWindow counts polls whose ls-remote COMPLETED before the
+	// window deadline: only those can witness in-window transients, so
+	// correctness runs require a coverage floor of them (a stalled node
+	// whose polls all finish after the window would otherwise "pass"
+	// having observed nothing).
+	pollsInWindow int64
 }
 
 func benchMS(d time.Duration) float64 { return float64(d) / float64(time.Millisecond) }
@@ -637,6 +643,10 @@ func runPushWindow(b *testing.B, writers int, window time.Duration) pushWindowRe
 		obsDone.Add(1)
 		go func() {
 			defer obsDone.Done()
+			// The window start/deadline are read after startCh closes
+			// (same happens-before pattern as the writers).
+			<-startCh
+			windowDeadline := start.Add(window)
 			ticker := time.NewTicker(benchObserverInterval)
 			defer ticker.Stop()
 			for {
@@ -666,6 +676,9 @@ func runPushWindow(b *testing.B, writers int, window time.Duration) pushWindowRe
 					return
 				}
 				res.polls++
+				if time.Now().Before(windowDeadline) {
+					res.pollsInWindow++
+				}
 				tips := map[string]string{}
 				for line := range strings.Lines(out) {
 					if sha, ref, ok := strings.Cut(strings.TrimSpace(line), "\t"); ok {
@@ -691,8 +704,32 @@ func runPushWindow(b *testing.B, writers int, window time.Duration) pushWindowRe
 	done.Wait()
 	b.StopTimer()
 	res.elapsed = time.Since(start)
+	// A poll still in flight here completes, is legality-checked, and
+	// counts in polls (not pollsInWindow) before the goroutine exits.
+	// That is sound: the writers have already joined, so every ack
+	// precedes the straggler's pre-poll snapshot, its floor is maximal
+	// and correct, and any tip it can observe is one the final
+	// accepted-tips check independently admits. It cannot race the final
+	// ls-remote or teardown because obsDone.Wait() precedes both.
 	close(obsStop)
 	obsDone.Wait()
+	if benchObserveMode() {
+		// Coverage floor (Codex round 8): a stalled or overloaded node can
+		// make every ls-remote outlast the window, in which case the run
+		// observed NOTHING in-window and zero violations would be
+		// vacuous. Correctness therefore requires that a meaningful
+		// fraction of the cadence-expected polls — half, minimum one —
+		// complete inside the window: 60 s campaigns expect ~240 and
+		// tolerate genuine slow-poll loss down to 120 (the recorded
+		// campaigns completed ≥ 151), while a 2 s smoke window expects 8
+		// and requires 4. Below that the run is inconclusive, which in
+		// correctness mode means FAILED.
+		expected := int64(window / benchObserverInterval)
+		if floor := max(int64(1), expected/2); res.pollsInWindow < floor {
+			b.Errorf("correctness run inconclusive: only %d observer polls completed inside the %s window (%d total; floor %d of %d expected at the %s cadence)",
+				res.pollsInWindow, window, res.polls, floor, expected, benchObserverInterval)
+		}
+	}
 
 	// Lost-update detector: every writer's branch on the server must hold
 	// one of that writer's accepted tips — no writer is ever skipped, and
@@ -754,14 +791,15 @@ func BenchmarkPushE2E(b *testing.B) {
 	for _, writers := range []int{1, 2, 8, 32} {
 		b.Run(fmt.Sprintf("backend=%s/writers=%d", testBackend, writers), func(b *testing.B) {
 			var (
-				all       []pushSample
-				failures  int64
-				maxStarve time.Duration
-				elapsed   time.Duration
-				packBytes int
-				ambiguous int64
-				exhausted int64
-				polls     int64
+				all           []pushSample
+				failures      int64
+				maxStarve     time.Duration
+				elapsed       time.Duration
+				packBytes     int
+				ambiguous     int64
+				exhausted     int64
+				polls         int64
+				pollsInWindow int64
 			)
 			for b.Loop() {
 				res := runPushWindow(b, writers, window)
@@ -773,6 +811,7 @@ func BenchmarkPushE2E(b *testing.B) {
 				ambiguous += res.ambiguous
 				exhausted += res.exhausted
 				polls += res.polls
+				pollsInWindow += res.pollsInWindow
 			}
 			if len(all) == 0 {
 				b.Fatal("no successful pushes recorded")
@@ -810,6 +849,7 @@ func BenchmarkPushE2E(b *testing.B) {
 			b.ReportMetric(float64(ambiguous), "ambiguous-final-tips")
 			b.ReportMetric(float64(exhausted), "exhausted-writers")
 			b.ReportMetric(float64(polls), "observer-polls")
+			b.ReportMetric(float64(pollsInWindow), "observer-polls-in-window")
 			b.ReportMetric(benchMS(maxStarve), "max-starve-ms")
 			b.ReportMetric(float64(packBytes), "pack-bytes")
 			pushCSVDump(b, all)
