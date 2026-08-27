@@ -1,0 +1,183 @@
+=== CELL 1: CASAdvance + GenerationRead (300x) ===
+2026/08/27 07:55:19 github.com/testcontainers/testcontainers-go - Connected to docker: 
+  Server Version: 27.5.1
+  API Version: 1.47
+  Operating System: Ubuntu 26.04 LTS
+  Total Memory: 128480 MB
+  Testcontainers for Go Version: v0.44.0
+  Resolved Docker Host: unix:///var/run/docker.sock
+  Resolved Docker Socket Path: /var/run/docker.sock
+  Test SessionID: fa3ccd7aabc9af4eb2df6249340b728c68eca6ad879585cbcf08e6075505417c
+  Test ProcessID: 38695237-614f-41fc-91b3-1394d6520b5b
+2026/08/27 07:55:19 🐳 Creating container for image chrislusf/seaweedfs:4.42
+2026/08/27 07:55:19 🐳 Creating container for image testcontainers/ryuk:0.14.0
+2026/08/27 07:55:19 ✅ Container created: 062fb33a4d95
+2026/08/27 07:55:19 🐳 Starting container: 062fb33a4d95
+2026/08/27 07:55:20 ✅ Container started: 062fb33a4d95
+2026/08/27 07:55:20 ⏳ Waiting for container id 062fb33a4d95 image: testcontainers/ryuk:0.14.0. Waiting for: all of: [log message "Started", port 8080/tcp to be listening]
+2026/08/27 07:55:20 Shell not executable in container, only external port validated
+2026/08/27 07:55:20 🔔 Container is ready: 062fb33a4d95
+2026/08/27 07:55:20 ✅ Container created: b8f0abcbb3b3
+2026/08/27 07:55:20 🐳 Starting container: b8f0abcbb3b3
+2026/08/27 07:55:20 ✅ Container started: b8f0abcbb3b3
+2026/08/27 07:55:20 ⏳ Waiting for container id b8f0abcbb3b3 image: chrislusf/seaweedfs:4.42. Waiting for: port 8333/tcp to be listening
+2026/08/27 07:55:30 🔔 Container is ready: b8f0abcbb3b3
+goos: linux
+goarch: amd64
+pkg: github.com/coder/code-storage/internal/ref/s3wal
+cpu: AMD EPYC 9454P 48-Core Processor               
+BenchmarkCASAdvance/store=seaweedfs/size=1KB-96         	     300	   1721478 ns/op	   0.59 MB/s	         1.629 p50-ms	         3.064 p95-ms	         3.225 p99-ms	       300.0 samples	   43968 B/op	     514 allocs/op
+--- BENCH: BenchmarkCASAdvance/store=seaweedfs/size=1KB-96
+    bench_test.go:254: raw per-op CSV: /tmp/ws8-bench-csv/BenchmarkCASAdvance__store-seaweedfs__size-1KB.csv (300 samples)
+BenchmarkCASAdvance/store=seaweedfs/size=1MB-96         	     300	  22345526 ns/op	  46.93 MB/s	        20.26 p50-ms	        25.46 p95-ms	        27.64 p99-ms	       300.0 samples	 4054183 B/op	     533 allocs/op
+--- BENCH: BenchmarkCASAdvance/store=seaweedfs/size=1MB-96
+    bench_test.go:254: raw per-op CSV: /tmp/ws8-bench-csv/BenchmarkCASAdvance__store-seaweedfs__size-1MB.csv (300 samples)
+BenchmarkCASAdvance/store=s3/size=1KB-96                	     300	  36783464 ns/op	   0.03 MB/s	        36.21 p50-ms	        42.62 p95-ms	        58.55 p99-ms	       300.0 samples	   57105 B/op	     595 allocs/op
+--- BENCH: BenchmarkCASAdvance/store=s3/size=1KB-96
+    bench_test.go:254: raw per-op CSV: /tmp/ws8-bench-csv/BenchmarkCASAdvance__store-s3__size-1KB.csv (300 samples)
+BenchmarkCASAdvance/store=s3/size=1MB-96                	     300	  54160904 ns/op	  19.36 MB/s	        49.78 p50-ms	        60.50 p95-ms	        84.19 p99-ms	       300.0 samples	 4161561 B/op	     620 allocs/op
+--- BENCH: BenchmarkCASAdvance/store=s3/size=1MB-96
+    bench_test.go:254: raw per-op CSV: /tmp/ws8-bench-csv/BenchmarkCASAdvance__store-s3__size-1MB.csv (300 samples)
+BenchmarkCASAdvance/store=sqlite-96                     	     300	    380911 ns/op	         0.3739 p50-ms	         0.5320 p95-ms	         0.6028 p99-ms	       300.0 samples	    2772 B/op	      76 allocs/op
+--- BENCH: BenchmarkCASAdvance/store=sqlite-96
+    bench_test.go:288: raw per-op CSV: /tmp/ws8-bench-csv/BenchmarkCASAdvance__store-sqlite.csv (300 samples)
+2026/08/27 07:56:07 🐳 Stopping container: b8f0abcbb3b3
+2026/08/27 07:56:17 ✅ Container stopped: b8f0abcbb3b3
+2026/08/27 07:56:17 🐳 Terminating container: b8f0abcbb3b3
+2026/08/27 07:56:17 🚫 Container terminated: b8f0abcbb3b3
+2026/08/27 07:56:17 🐳 Creating container for image chrislusf/seaweedfs:4.42
+2026/08/27 07:56:17 ✅ Container created: dee89d59379f
+2026/08/27 07:56:17 🐳 Starting container: dee89d59379f
+2026/08/27 07:56:18 ✅ Container started: dee89d59379f
+2026/08/27 07:56:18 ⏳ Waiting for container id dee89d59379f image: chrislusf/seaweedfs:4.42. Waiting for: port 8333/tcp to be listening
+2026/08/27 07:56:21 🔔 Container is ready: dee89d59379f
+BenchmarkGenerationRead/store=seaweedfs/mode=get-96     	     300	    708270 ns/op	         0.7656 p50-ms	         1.369 p99-ms	       300.0 samples	   37320 B/op	     481 allocs/op
+--- BENCH: BenchmarkGenerationRead/store=seaweedfs/mode=get-96
+    bench_test.go:705: raw per-op CSV: /tmp/ws8-bench-csv/BenchmarkGenerationRead__store-seaweedfs__mode-get.csv (300 samples)
+BenchmarkGenerationRead/store=seaweedfs/mode=304-96     	     300	    690226 ns/op	         0.7193 p50-ms	         1.295 p99-ms	       300.0 samples	   33079 B/op	     455 allocs/op
+--- BENCH: BenchmarkGenerationRead/store=seaweedfs/mode=304-96
+    bench_test.go:705: raw per-op CSV: /tmp/ws8-bench-csv/BenchmarkGenerationRead__store-seaweedfs__mode-304.csv (300 samples)
+BenchmarkGenerationRead/store=s3/mode=get-96            	     300	  29214591 ns/op	        28.80 p50-ms	        48.94 p99-ms	       300.0 samples	   47290 B/op	     537 allocs/op
+--- BENCH: BenchmarkGenerationRead/store=s3/mode=get-96
+    bench_test.go:705: raw per-op CSV: /tmp/ws8-bench-csv/BenchmarkGenerationRead__store-s3__mode-get.csv (300 samples)
+BenchmarkGenerationRead/store=s3/mode=304-96            	     300	  14848776 ns/op	        14.51 p50-ms	        20.12 p99-ms	       300.0 samples	   43162 B/op	     492 allocs/op
+--- BENCH: BenchmarkGenerationRead/store=s3/mode=304-96
+    bench_test.go:705: raw per-op CSV: /tmp/ws8-bench-csv/BenchmarkGenerationRead__store-s3__mode-304.csv (300 samples)
+BenchmarkGenerationRead/store=sqlite/mode=get-96        	     300	      9848 ns/op	         0.009580 p50-ms	         0.01405 p99-ms	       300.0 samples	     763 B/op	      26 allocs/op
+--- BENCH: BenchmarkGenerationRead/store=sqlite/mode=get-96
+    bench_test.go:734: raw per-op CSV: /tmp/ws8-bench-csv/BenchmarkGenerationRead__store-sqlite__mode-get.csv (300 samples)
+2026/08/27 07:56:36 🐳 Stopping container: dee89d59379f
+2026/08/27 07:56:46 ✅ Container stopped: dee89d59379f
+2026/08/27 07:56:46 🐳 Terminating container: dee89d59379f
+2026/08/27 07:56:46 🚫 Container terminated: dee89d59379f
+PASS
+ok  	github.com/coder/code-storage/internal/ref/s3wal	87.628s
+CELL1_EXIT=0
+=== CELL 2: SimulatedPush (200x) ===
+2026/08/27 07:56:48 github.com/testcontainers/testcontainers-go - Connected to docker: 
+  Server Version: 27.5.1
+  API Version: 1.47
+  Operating System: Ubuntu 26.04 LTS
+  Total Memory: 128480 MB
+  Testcontainers for Go Version: v0.44.0
+  Resolved Docker Host: unix:///var/run/docker.sock
+  Resolved Docker Socket Path: /var/run/docker.sock
+  Test SessionID: 2b5dca32d9817a3a9d7559978a113e8f8a33dd60f2eccd8f298d96bc8fa2330f
+  Test ProcessID: 51591d8b-5e76-43e6-a8cb-21c839f1c3ff
+2026/08/27 07:56:48 🐳 Creating container for image chrislusf/seaweedfs:4.42
+2026/08/27 07:56:48 🐳 Creating container for image testcontainers/ryuk:0.14.0
+2026/08/27 07:56:48 ✅ Container created: 2a88e81a522a
+2026/08/27 07:56:48 🐳 Starting container: 2a88e81a522a
+2026/08/27 07:56:48 ✅ Container started: 2a88e81a522a
+2026/08/27 07:56:48 ⏳ Waiting for container id 2a88e81a522a image: testcontainers/ryuk:0.14.0. Waiting for: all of: [log message "Started", port 8080/tcp to be listening]
+2026/08/27 07:56:48 Shell not executable in container, only external port validated
+2026/08/27 07:56:48 🔔 Container is ready: 2a88e81a522a
+2026/08/27 07:56:48 ✅ Container created: a708683a688f
+2026/08/27 07:56:48 🐳 Starting container: a708683a688f
+2026/08/27 07:56:49 ✅ Container started: a708683a688f
+2026/08/27 07:56:49 ⏳ Waiting for container id a708683a688f image: chrislusf/seaweedfs:4.42. Waiting for: port 8333/tcp to be listening
+2026/08/27 07:56:58 🔔 Container is ready: a708683a688f
+goos: linux
+goarch: amd64
+pkg: github.com/coder/code-storage/internal/ref/s3wal
+cpu: AMD EPYC 9454P 48-Core Processor               
+BenchmarkSimulatedPush/store=seaweedfs-96         	     200	  95272203 ns/op	  88.05 MB/s	        97.70 p50-ms	       114.0 p99-ms	       200.0 samples	  221903 B/op	    2421 allocs/op
+--- BENCH: BenchmarkSimulatedPush/store=seaweedfs-96
+    bench_test.go:355: raw per-op CSV: /tmp/ws8-bench-csv/BenchmarkSimulatedPush__store-seaweedfs.csv (200 samples)
+BenchmarkSimulatedPush/store=s3-96                	     200	 230070903 ns/op	  36.46 MB/s	       203.6 p50-ms	       255.0 p99-ms	       200.0 samples	  281462 B/op	    2744 allocs/op
+--- BENCH: BenchmarkSimulatedPush/store=s3-96
+    bench_test.go:355: raw per-op CSV: /tmp/ws8-bench-csv/BenchmarkSimulatedPush__store-s3.csv (200 samples)
+BenchmarkSimulatedPush/store=sqlite-96            	     200	  14024049 ns/op	 598.16 MB/s	        12.40 p50-ms	        19.68 p99-ms	       200.0 samples	    5052 B/op	     137 allocs/op
+--- BENCH: BenchmarkSimulatedPush/store=sqlite-96
+    bench_test.go:416: raw per-op CSV: /tmp/ws8-bench-csv/BenchmarkSimulatedPush__store-sqlite.csv (200 samples)
+2026/08/27 07:58:13 🐳 Stopping container: a708683a688f
+2026/08/27 07:58:23 ✅ Container stopped: a708683a688f
+2026/08/27 07:58:23 🐳 Terminating container: a708683a688f
+2026/08/27 07:58:24 🚫 Container terminated: a708683a688f
+PASS
+ok  	github.com/coder/code-storage/internal/ref/s3wal	96.219s
+CELL2_EXIT=0
+=== CELL 3: HotRepoContention (60s windows) ===
+goos: linux
+goarch: amd64
+pkg: github.com/coder/code-storage/internal/ref/s3wal
+cpu: AMD EPYC 9454P 48-Core Processor               
+BenchmarkHotRepoContention
+2026/08/27 07:58:25 github.com/testcontainers/testcontainers-go - Connected to docker: 
+  Server Version: 27.5.1
+  API Version: 1.47
+  Operating System: Ubuntu 26.04 LTS
+  Total Memory: 128480 MB
+  Testcontainers for Go Version: v0.44.0
+  Resolved Docker Host: unix:///var/run/docker.sock
+  Resolved Docker Socket Path: /var/run/docker.sock
+  Test SessionID: c92379ca2275601c9b1efd150fead79e5aab5dbcd0d4eccef618586e6512742f
+  Test ProcessID: 7f1d88af-9356-4995-bc01-cd0ac86b9f2d
+2026/08/27 07:58:25 🐳 Creating container for image chrislusf/seaweedfs:4.42
+2026/08/27 07:58:25 🐳 Creating container for image testcontainers/ryuk:0.14.0
+2026/08/27 07:58:25 ✅ Container created: f8bf3c59d824
+2026/08/27 07:58:25 🐳 Starting container: f8bf3c59d824
+2026/08/27 07:58:25 ✅ Container started: f8bf3c59d824
+2026/08/27 07:58:25 ⏳ Waiting for container id f8bf3c59d824 image: testcontainers/ryuk:0.14.0. Waiting for: all of: [log message "Started", port 8080/tcp to be listening]
+2026/08/27 07:58:26 Shell not executable in container, only external port validated
+2026/08/27 07:58:26 🔔 Container is ready: f8bf3c59d824
+2026/08/27 07:58:26 ✅ Container created: 233430b153af
+2026/08/27 07:58:26 🐳 Starting container: 233430b153af
+2026/08/27 07:58:26 ✅ Container started: 233430b153af
+2026/08/27 07:58:26 ⏳ Waiting for container id 233430b153af image: chrislusf/seaweedfs:4.42. Waiting for: port 8333/tcp to be listening
+2026/08/27 07:58:28 🔔 Container is ready: 233430b153af
+BenchmarkHotRepoContention/store=seaweedfs/writers=2
+    bench_test.go:462: raw per-op CSV: /tmp/ws8-bench-csv/BenchmarkHotRepoContention__store-seaweedfs__writers-2.csv (30618 samples)
+BenchmarkHotRepoContention/store=seaweedfs/writers=2-96         	       1	60041579898 ns/op	       510.3 adv/s	         0 contention-errors	        60.00 elapsed-s	     27481 lost-races	      2876 max-starve-ms	         2.046 p50-ms	         3.235 p99-ms	     30618 samples	     30618 wins
+BenchmarkHotRepoContention/store=seaweedfs/writers=8
+    bench_test.go:462: raw per-op CSV: /tmp/ws8-bench-csv/BenchmarkHotRepoContention__store-seaweedfs__writers-8.csv (40664 samples)
+BenchmarkHotRepoContention/store=seaweedfs/writers=8-96         	       1	60032834244 ns/op	       677.6 adv/s	         0 contention-errors	        60.01 elapsed-s	    227311 lost-races	      1614 max-starve-ms	         1.412 p50-ms	       296.4 p99-ms	     40664 samples	     40664 wins
+BenchmarkHotRepoContention/store=seaweedfs/writers=32
+    bench_test.go:462: raw per-op CSV: /tmp/ws8-bench-csv/BenchmarkHotRepoContention__store-seaweedfs__writers-32.csv (29420 samples)
+BenchmarkHotRepoContention/store=seaweedfs/writers=32-96        	       1	60025739861 ns/op	       490.3 adv/s	         0 contention-errors	        60.01 elapsed-s	    569904 lost-races	      1830 max-starve-ms	         2.201 p50-ms	       687.7 p99-ms	     29420 samples	     29420 wins
+BenchmarkHotRepoContention/store=s3/writers=2
+    bench_test.go:462: raw per-op CSV: /tmp/ws8-bench-csv/BenchmarkHotRepoContention__store-s3__writers-2.csv (1575 samples)
+BenchmarkHotRepoContention/store=s3/writers=2-96                	       1	60801779316 ns/op	        26.21 adv/s	         0 contention-errors	        60.10 elapsed-s	      1014 lost-races	      9589 max-starve-ms	        37.22 p50-ms	        78.23 p99-ms	      1575 samples	      1575 wins
+BenchmarkHotRepoContention/store=s3/writers=8
+    bench_test.go:462: raw per-op CSV: /tmp/ws8-bench-csv/BenchmarkHotRepoContention__store-s3__writers-8.csv (1648 samples)
+BenchmarkHotRepoContention/store=s3/writers=8-96                	       1	60450784100 ns/op	        27.45 adv/s	         0 contention-errors	        60.05 elapsed-s	      7531 lost-races	     56445 max-starve-ms	        35.88 p50-ms	      6018 p99-ms	      1648 samples	      1648 wins
+BenchmarkHotRepoContention/store=s3/writers=32
+    bench_test.go:462: raw per-op CSV: /tmp/ws8-bench-csv/BenchmarkHotRepoContention__store-s3__writers-32.csv (1657 samples)
+BenchmarkHotRepoContention/store=s3/writers=32-96               	       1	60356814044 ns/op	        27.59 adv/s	         0 contention-errors	        60.06 elapsed-s	     34092 lost-races	     60044 max-starve-ms	        35.77 p50-ms	     16942 p99-ms	      1657 samples	      1657 wins
+BenchmarkHotRepoContention/store=sqlite/writers=2
+    bench_test.go:492: raw per-op CSV: /tmp/ws8-bench-csv/BenchmarkHotRepoContention__store-sqlite__writers-2.csv (323676 samples)
+BenchmarkHotRepoContention/store=sqlite/writers=2-96            	       1	60108970319 ns/op	      5390 adv/s	         4.000 busy-retries	        60.06 elapsed-s	        31.00 lost-races	      7139 max-starve-ms	         0.1562 p50-ms	         0.5070 p99-ms	    323676 samples	    323676 wins
+BenchmarkHotRepoContention/store=sqlite/writers=8
+    bench_test.go:492: raw per-op CSV: /tmp/ws8-bench-csv/BenchmarkHotRepoContention__store-sqlite__writers-8.csv (338865 samples)
+BenchmarkHotRepoContention/store=sqlite/writers=8-96            	       1	60159374619 ns/op	      5640 adv/s	        32.00 busy-retries	        60.08 elapsed-s	       199.0 lost-races	     14845 max-starve-ms	         0.1564 p50-ms	         0.3928 p99-ms	    338865 samples	    338865 wins
+BenchmarkHotRepoContention/store=sqlite/writers=32
+    bench_test.go:492: raw per-op CSV: /tmp/ws8-bench-csv/BenchmarkHotRepoContention__store-sqlite__writers-32.csv (328827 samples)
+BenchmarkHotRepoContention/store=sqlite/writers=32-96           	       1	60387774820 ns/op	      5454 adv/s	       113.0 busy-retries	        60.29 elapsed-s	      1060 lost-races	     15806 max-starve-ms	         0.1580 p50-ms	         0.4427 p99-ms	    328827 samples	    328827 wins
+2026/08/27 08:07:32 🐳 Stopping container: 233430b153af
+2026/08/27 08:07:43 ✅ Container stopped: 233430b153af
+2026/08/27 08:07:43 🐳 Terminating container: 233430b153af
+2026/08/27 08:07:43 🚫 Container terminated: 233430b153af
+PASS
+ok  	github.com/coder/code-storage/internal/ref/s3wal	557.782s
+CELL3_EXIT=0
+=== CAMPAIGN DONE ===
