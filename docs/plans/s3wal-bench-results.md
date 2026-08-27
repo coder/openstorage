@@ -466,7 +466,12 @@ below is from live runs; the bucket was emptied and deleted afterward.
   recomputed summaries are committed as
   [`e2e-push-times-real-s3-2026-08-27.txt`](./s3wal-bench-data/e2e-push-times-real-s3-2026-08-27.txt).
   Round-trip census filed as
-  [#182](https://github.com/coder/code-storage/issues/182).
+  [#182](https://github.com/coder/code-storage/issues/182);
+  [PR #185](https://github.com/coder/code-storage/pull/185) landed a
+  first round of per-push round-trip trims **after this campaign was
+  recorded**, so the figures above predate it (treat them as the
+  pre-#185 upper bound; the post-#185 cost needs a re-measurement with
+  fresh credentials).
 - **PG+S3 mode smoke:** same git+LFS suite against
   `postgres://…` + `s3://bucket?region=eu-central-1` — all pass.
 

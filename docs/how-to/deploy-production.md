@@ -513,7 +513,9 @@ qualification suite passed all surfaces against real S3):
   tradeoff is ~2.8× per push at real RTT, dominated by sequential S3 round trips.
   The real-S3 figures are **preliminary single-day observations** (the results
   document's method wants ≥ 3 separate-day runs for headline numbers, still
-  pending); treat them as directional, not capacity guidance.
+  pending) and were measured **before** the per-push round-trip trims that
+  landed later the same day; treat them as a directional upper bound, not
+  capacity guidance.
 - One hot repository group sustains ~27 successful manifest CAS advances/s on real
   S3 regardless of writer count (the one-CAS-point-per-group ceiling; adding
   writers adds lost races, not throughput). Under the harness's sustained synthetic
