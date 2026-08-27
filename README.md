@@ -171,12 +171,14 @@ conditional-CAS objects under the bucket's `_wal/` prefix, next to the packs:
 
 ```sh
 # 1. An S3-compatible bucket as the sole authority — SeaweedFS here (AWS S3 is the other qualified store).
-docker run -d --name cs-s3 -p 8333:8333 chrislusf/seaweedfs:4.42 server -s3 -dir=/data -ip.bind=0.0.0.0
+docker run -d --name cs-s3 -p 127.0.0.1:8333:8333 chrislusf/seaweedfs:4.42 server -s3 -dir=/data -ip.bind=0.0.0.0
 until curl -sf http://127.0.0.1:8333/healthz; do sleep 1; done
-curl -sf -X PUT http://127.0.0.1:8333/codestorage    # the bucket must exist before serve boots
-# Cold start: bucket ops succeed before a writable volume exists, so gate on a real object write.
-until curl -sf -X PUT -d ready http://127.0.0.1:8333/codestorage/ready; do sleep 1; done
-curl -sf -X DELETE http://127.0.0.1:8333/codestorage/ready
+# The bucket must exist before serve boots. On a cold store both bucket creation and
+# object writes can precede a writable volume, so retry create + a real write as one unit
+# (the create tolerates already-exists; readiness is the object roundtrip).
+until curl -s -X PUT http://127.0.0.1:8333/codestorage >/dev/null &&
+      curl -sf -X PUT -d ready http://127.0.0.1:8333/codestorage/ready &&
+      curl -sf -X DELETE http://127.0.0.1:8333/codestorage/ready; do sleep 1; done
 
 # 2. One node, refs + metadata + packs all in the bucket (this dev SeaweedFS is unauthenticated; any creds sign).
 codestorage keygen --out /tmp/cs-key

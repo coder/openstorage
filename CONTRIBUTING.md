@@ -60,12 +60,13 @@ go build ./cmd/codestorage && ./codestorage version
   exist before boot):
 
   ```sh
-  docker run -d --name cs-s3 -p 8333:8333 chrislusf/seaweedfs:4.42 server -s3 -dir=/data -ip.bind=0.0.0.0
+  docker run -d --name cs-s3 -p 127.0.0.1:8333:8333 chrislusf/seaweedfs:4.42 server -s3 -dir=/data -ip.bind=0.0.0.0
   until curl -sf http://127.0.0.1:8333/healthz; do sleep 1; done
-  curl -sf -X PUT http://127.0.0.1:8333/codestorage
-  # Cold start: bucket ops succeed before a writable volume exists — gate on a real write.
-  until curl -sf -X PUT -d ready http://127.0.0.1:8333/codestorage/ready; do sleep 1; done
-  curl -sf -X DELETE http://127.0.0.1:8333/codestorage/ready
+  # Cold start: bucket creation and object writes can both precede a writable volume,
+  # so retry create + a real write roundtrip as one unit (create tolerates already-exists).
+  until curl -s -X PUT http://127.0.0.1:8333/codestorage >/dev/null &&
+        curl -sf -X PUT -d ready http://127.0.0.1:8333/codestorage/ready &&
+        curl -sf -X DELETE http://127.0.0.1:8333/codestorage/ready; do sleep 1; done
   CODESTORAGE_ORG=selfhost CODESTORAGE_ORG_PUBKEYS=/tmp/cs-key.pub.pem \
   CODESTORAGE_PG_URL='s3wal://codestorage?endpoint=http://127.0.0.1:8333&region=us-east-1' \
   CODESTORAGE_S3_URL='s3://codestorage?endpoint=http://127.0.0.1:8333&s3ForcePathStyle=true&region=us-east-1' \

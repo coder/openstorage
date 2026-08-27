@@ -470,14 +470,14 @@ plain [`CODESTORAGE_S3_URL`](../reference/configuration.md#codestorage_s3_url) b
 storage. Do not enable bucket versioning or object lock on the bucket.
 
 **Credentials and IAM.** Credentials come from the standard AWS chain (env vars, shared
-config, instance roles). The node needs only standard S3 object operations on the one
-bucket: object reads and writes (`s3:GetObject`, `s3:PutObject` — the conditional
-`If-Match`/`If-None-Match` writes are ordinary PutObject calls — and `s3:DeleteObject`;
-the quarantine handshake's server-side copies ride the same two, plus
-`s3:AbortMultipartUpload` to clean up a failed multipart copy — as in the
-[general bucket permissions](#backing-services)), prefix listing
-(`s3:ListBucket`, which also covers the bucket reachability probes), and
-`s3:GetBucketVersioning` (the delete-mode and purge guards verify versioning is off).
+config, instance roles). The node's permission set on the one bucket matches the
+[general bucket permissions](#backing-services): object reads and writes
+(`s3:GetObject`, `s3:PutObject` — the conditional `If-Match`/`If-None-Match` writes are
+ordinary PutObject calls — and `s3:DeleteObject`; the quarantine handshake's
+server-side copies ride the same two), `s3:AbortMultipartUpload` (cleanup of a failed
+multipart quarantine copy), prefix listing (`s3:ListBucket`, which also covers the
+bucket reachability probes), and `s3:GetBucketVersioning` (the delete-mode and purge
+guards verify versioning is off).
 `s3:CreateBucket` is not required for a pre-provisioned bucket — a denied create falls
 back to a reachability probe. Set
 [`CODESTORAGE_S3_EXPECTED_BUCKET_OWNER`](../reference/configuration.md#codestorage_s3_expected_bucket_owner):
@@ -516,11 +516,16 @@ client adds its own network RTT to every number equally:
   pushes in the sustained multi-writer campaigns, plus ~790,000 lost-then-retried CAS
   races in the microbench cells.
 
-**Crash recovery: restart from bucket only.** Node replacement and crash recovery are
-the same operation: start a fresh node — empty disk, empty cache dir — against the same
-two URLs. Refs, metadata, packs, and LFS objects reconstruct from the bucket alone, and
-the cache re-hydrates on demand. This is a designed-for, e2e-tested path (the
-`s3wal` [test lane](../reference/testing.md) drills exactly this).
+**Crash recovery: repository state restarts from the bucket.** Node replacement and
+crash recovery are the same operation: start a fresh node — empty disk, empty cache
+dir — against the same two URLs. Refs, metadata, packs, and LFS objects reconstruct
+from the bucket, and the cache re-hydrates on demand; this is a designed-for,
+e2e-tested path (the `s3wal` [test lane](../reference/testing.md) drills exactly
+this). The node's *configuration* is not in the bucket: a replacement needs the same
+environment — the two storage URLs, `CODESTORAGE_ORG`, the org public-key PEM file on
+its own disk, and the same `CODESTORAGE_SECRETS_KEY` if one encrypts the metadata
+store's secret columns — provisioned from your config/secret store like any other
+deployment.
 
 **The lease lifecycle in practice.** The `_wal/instance-lease` guard has one operational
 consequence for restarts: the current binary does not release the lease on shutdown
