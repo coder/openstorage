@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -1926,6 +1927,49 @@ func reservationVerdicts(repo string, commands []refCommand, updatable []bool, e
 	return classes, verified
 }
 
+// refPolicyMemo caches the parsed and folded policy for one exact
+// (policyJSON, opsJSON) env pair (Codex round-30 P2 on #173): the
+// budget-free classifier runs once per command, and reparsing an
+// attacker-sized policy claim per command multiplies its size by the
+// push's command count in CPU and allocations before any update hook
+// runs. Hook processes see immutable env, so one entry suffices; keyed on
+// the raw strings so in-process tests that vary the env stay correct.
+// Callers only read the cached slice (auth.MatchPolicy), never mutate it.
+type refPolicyMemo struct {
+	policyJSON, opsJSON string
+	policies            []auth.RefPolicy
+	err                 error
+}
+
+var (
+	refPolicyCache  atomic.Pointer[refPolicyMemo]
+	refPolicyParses atomic.Int64 // test seam: real parse+fold computations
+)
+
+func loadRefPolicies(policyJSON, opsJSON string) ([]auth.RefPolicy, error) {
+	if m := refPolicyCache.Load(); m != nil && m.policyJSON == policyJSON && m.opsJSON == opsJSON {
+		return m.policies, m.err
+	}
+	refPolicyParses.Add(1)
+	m := &refPolicyMemo{policyJSON: policyJSON, opsJSON: opsJSON}
+	if policyJSON != "" {
+		m.policies, m.err = auth.ParseRefPolicies(policyJSON)
+		if m.err != nil {
+			m.err = fmt.Errorf("update: %w", m.err)
+		}
+	}
+	if m.err == nil && opsJSON != "" {
+		var ops []string
+		if err := json.Unmarshal([]byte(opsJSON), &ops); err != nil {
+			m.err = fmt.Errorf("update: parse ops claim %q: %w", opsJSON, err)
+		} else {
+			m.policies = auth.FoldOps(m.policies, ops)
+		}
+	}
+	refPolicyCache.Store(m)
+	return m.policies, m.err
+}
+
 // evalRefPolicy is the shared evaluator. fullEval=false is the budget-free
 // mode for the reservation classifier: it replaces signature verification
 // with a fail-unreservable verdict for non-deletion commands (callers must
@@ -1941,20 +1985,9 @@ func evalRefPolicy(ctx context.Context, repo, refName, old, new string, fullEval
 	if policyJSON == "" && opsJSON == "" {
 		return nil
 	}
-	var policies []auth.RefPolicy
-	if policyJSON != "" {
-		var err error
-		policies, err = auth.ParseRefPolicies(policyJSON)
-		if err != nil {
-			return fmt.Errorf("update: %w", err)
-		}
-	}
-	if opsJSON != "" {
-		var ops []string
-		if err := json.Unmarshal([]byte(opsJSON), &ops); err != nil {
-			return fmt.Errorf("update: parse ops claim %q: %w", opsJSON, err)
-		}
-		policies = auth.FoldOps(policies, ops)
+	policies, err := loadRefPolicies(policyJSON, opsJSON)
+	if err != nil {
+		return err
 	}
 
 	// Ephemeral namespace quirk (branch-protection.md): a push through the

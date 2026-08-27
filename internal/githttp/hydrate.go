@@ -1276,7 +1276,22 @@ func pushHoldLive(path string, mtime time.Time) bool {
 		_ = os.Chtimes(reap, now, now)
 		return true
 	}
-	return now.Sub(ri.ModTime()) <= pushHoldTTL/2
+	if now.Sub(ri.ModTime()) <= pushHoldTTL/2 {
+		return true
+	}
+	// Final re-stat before the expiry verdict (Codex round-30 P2 on
+	// #173): mtime came from the caller's earlier observation — a delayed
+	// refresher (a second suspend, a long scheduler pause) may have
+	// touched the hold between that stat and this verdict, and expiring a
+	// NOW-fresh hold would let hydration touch its in-flight refs and the
+	// mint sweep delete a file the refresher can only Chtimes, never
+	// recreate. Expire only when a fresh stat still shows no owner touch;
+	// a hold that vanished meanwhile was already released and stays
+	// expired.
+	if hi, err := os.Stat(path); err == nil && !hi.ModTime().Equal(mtime) {
+		return true
+	}
+	return false
 }
 
 // pushHoldTTL bounds a crash-leaked hold's life. A variable only so tests

@@ -1593,6 +1593,73 @@ func TestPushHolds_FutureReapMarkerClampedNotPinned(t *testing.T) {
 	}
 }
 
+// TestPushHolds_RefresherTouchDuringVerdictKeepsHoldLive (Codex round-30
+// P2 on #173): pushHoldLive's mtime argument comes from the caller's
+// earlier stat. A delayed refresher (a second suspend, a long scheduler
+// pause) can touch the hold between that observation and the expiry
+// verdict; expiring the now-fresh hold would let hydration touch its
+// in-flight refs and the mint sweep delete a file the refresher can only
+// Chtimes. The verdict must re-stat and stay live on any owner touch.
+func TestPushHolds_RefresherTouchDuringVerdictKeepsHoldLive(t *testing.T) {
+	dir := t.TempDir()
+	hold := filepath.Join(dir, "push-stale-observation")
+	if err := os.WriteFile(hold, []byte("refs/heads/x\n"), 0o600); err != nil {
+		t.Fatalf("write hold: %v", err)
+	}
+	stale := time.Now().Add(-2 * pushHoldTTL)
+	if err := os.Chtimes(hold, stale, stale); err != nil {
+		t.Fatalf("chtimes hold: %v", err)
+	}
+	reap := hold + pushHoldReapSuffix
+	if err := os.WriteFile(reap, nil, 0o600); err != nil {
+		t.Fatalf("write reap marker: %v", err)
+	}
+	markerPast := time.Now().Add(-pushHoldTTL/2 - time.Minute)
+	if err := os.Chtimes(reap, markerPast, markerPast); err != nil {
+		t.Fatalf("chtimes marker: %v", err)
+	}
+	// The owner's refresher touches the hold AFTER the caller's stat but
+	// BEFORE the verdict.
+	now := time.Now()
+	if err := os.Chtimes(hold, now, now); err != nil {
+		t.Fatalf("refresher touch: %v", err)
+	}
+	if !pushHoldLive(hold, stale) {
+		t.Fatal("a hold touched after the caller's observation must stay live")
+	}
+	// Same stale observation with NO owner touch still expires.
+	if err := os.Chtimes(hold, stale, stale); err != nil {
+		t.Fatalf("re-age hold: %v", err)
+	}
+	if pushHoldLive(hold, stale) {
+		t.Fatal("an untouched leak must still expire")
+	}
+}
+
+// TestClassifyReservation_ParsesPolicyOnce (Codex round-30 P2 on #173):
+// budget-free classification runs once per command, and reparsing the
+// policy claim per command multiplies an attacker-sized policy by the
+// push's command count in CPU and allocations before any update hook
+// runs. One (policyJSON, opsJSON) pair must cost one parse per process,
+// not one per command.
+func TestClassifyReservation_ParsesPolicyOnce(t *testing.T) {
+	t.Setenv(EnvRefsPolicy, `[["refs/heads/noff",["no-force-push"]]]`)
+	t.Setenv(EnvOps, "")
+	sha := strings.Repeat("a", 40)
+	sha2 := strings.Repeat("b", 40)
+	refPolicyParses.Store(0)
+	for i := 0; i < 100; i++ {
+		if got := classifyReservation("r", "refs/heads/noff", sha, sha2); got != reservationJIT {
+			t.Fatalf("classifyReservation = %v, want %v", got, reservationJIT)
+		}
+	}
+	// At most one real parse: zero when an earlier test already cached
+	// this exact env pair, one otherwise — never per-command.
+	if got := refPolicyParses.Load(); got > 1 {
+		t.Fatalf("policy parsed %d times across 100 classifications; want at most 1", got)
+	}
+}
+
 // TestRunHook_AtomicUpdateDenialReleasesWholeHold (Codex round-27 P2 on
 // #173): under --atomic one hook denial dooms the whole push — git aborts
 // the local ref transaction and never runs post-receive, the primary
