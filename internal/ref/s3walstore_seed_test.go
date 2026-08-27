@@ -128,6 +128,45 @@ func TestS3WALMutateSeededVerdictRederivesFresh(t *testing.T) {
 	}
 }
 
+// TestS3WALMutateSeedUnfitReadsFresh pins the seedUnfit gate (Codex P1 on
+// PR #185): a mutation that declares its candidate seed unfit — because
+// its fn would externalize a durable effect (the lapse-evidence marker)
+// off unvalidated state — must start from a fresh read instead, while an
+// explicitly fit seed is consumed with zero reads.
+func TestS3WALMutateSeedUnfitReadsFresh(t *testing.T) {
+	ctx := context.Background()
+	cs, a, _ := newSeedStores(t)
+	const repo = "seedrepo"
+	base := baseRepoOf(repo)
+
+	if won, err := a.CASRef(ctx, repo, "refs/heads/main", ZeroSHA, seedSHA1); err != nil || !won {
+		t.Fatalf("genesis CASRef = (%v, %v), want won", won, err)
+	}
+
+	edit := func(unfit bool) (gets, puts int64) {
+		g, p := cs.gets.Load(), cs.puts.Load()
+		err := a.mutate(ctx, base, s3walMutation{
+			op:        "seed fitness test edit",
+			seedUnfit: func(*s3wal.Manifest) bool { return unfit },
+			fn: func(m *s3wal.Manifest, clk time.Time) (bool, error) {
+				m.EnsureMember(repo).Gen++
+				return true, nil
+			},
+		})
+		if err != nil {
+			t.Fatalf("mutate(unfit=%v): %v", unfit, err)
+		}
+		return cs.gets.Load() - g, cs.puts.Load() - p
+	}
+
+	if gets, puts := edit(false); gets != 0 || puts != 1 {
+		t.Fatalf("fit seed cost %d GETs + %d PUTs, want 0 + 1", gets, puts)
+	}
+	if gets, puts := edit(true); gets != 1 || puts != 1 {
+		t.Fatalf("unfit seed cost %d GETs + %d PUTs, want a fresh read: 1 + 1", gets, puts)
+	}
+}
+
 // TestS3WALManifestSnapBounds pins the seed cache's memory bounds (Codex
 // review on PR #185): entries, total retained bytes, and the per-entry
 // body cap — an outsized body must not only be skipped but also evict the

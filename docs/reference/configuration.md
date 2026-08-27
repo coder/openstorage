@@ -181,6 +181,9 @@ request (each round trip is a WAN round trip on real S3). Writes are `O_APPEND`
 one-line syscalls, safe for concurrent processes sharing one file.
 
 - **Default:** unset — no middleware is installed; zero overhead.
+- **The path must be absolute.** Hook subprocesses inherit the variable but run from the
+  cache repository, not the server's working directory, so a relative path would silently
+  split the log across per-process files; it is rejected (with a stderr warning).
 - An unopenable path logs a warning to stderr and disables the seam; it never fails the
   process (diagnostics must not take down serving).
 - The log grows without bound and includes object keys; treat it like a debug log

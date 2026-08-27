@@ -50,6 +50,14 @@ func setup() {
 	if path == "" {
 		return
 	}
+	if !filepath.IsAbs(path) {
+		// The env is inherited by hook subprocesses whose working
+		// directory is the cache repo, not the serve process's cwd: a
+		// relative path would silently split the census across
+		// per-process files. Refuse it outright.
+		fmt.Fprintf(os.Stderr, "s3oplog: %s=%q is not an absolute path (op logging disabled)\n", Env, path)
+		return
+	}
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "s3oplog: open %s: %v (op logging disabled)\n", path, err)

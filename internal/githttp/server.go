@@ -79,10 +79,14 @@ type Server struct {
 
 	// repackProbeMu coalesces the asynchronous post-push repack probes
 	// per repo (see dispatchRepackProbe): repackProbeActive marks the
-	// single in-flight probe, repackProbeAgain its one trailing re-run.
+	// single in-flight probe, repackProbeAgain its one trailing re-run,
+	// and repackProbeSem globally bounds concurrent probe executions —
+	// per-repo coalescing alone would still admit one timeout-bounded
+	// store listing per distinct pushed repo during a slow-store window.
 	repackProbeMu     sync.Mutex
 	repackProbeActive map[string]bool
 	repackProbeAgain  map[string]bool
+	repackProbeSem    chan struct{}
 	// PackQuotaBytes is the per-repo pack-bytes quota (issue #21, see
 	// quota.go); <= 0 disables quota enforcement. Set by the serve wiring
 	// from the resolved config, like ResolveRepo.
@@ -1157,9 +1161,16 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 	}
 }
 
+// repackProbeConcurrency bounds simultaneous MaybeRepack executions
+// across ALL repos: each probe is one bounded store listing, and a slow
+// store must see at most this many at once. Waiters park as one
+// goroutine per repo (the per-repo coalescing bounds that), holding only
+// memory.
+const repackProbeConcurrency = 4
+
 // dispatchRepackProbe runs s.MaybeRepack asynchronously, coalesced per
-// repo (Codex review on #182's PR): a push burst must not stack
-// probe-timeout-bounded goroutines all listing the same repo's packs.
+// repo and bounded globally (Codex review on #182's PR): a push burst
+// must not stack probe-timeout-bounded goroutines all listing packs.
 // At most one probe runs per repo; pushes completing mid-probe mark ONE
 // trailing re-run — skipping them outright could leave a threshold
 // crossing unprobed until the next push, while the trailing run re-reads
@@ -1171,6 +1182,7 @@ func (s *Server) dispatchRepackProbe(ctx context.Context, repo string) {
 	if s.repackProbeActive == nil {
 		s.repackProbeActive = make(map[string]bool)
 		s.repackProbeAgain = make(map[string]bool)
+		s.repackProbeSem = make(chan struct{}, repackProbeConcurrency)
 	}
 	if s.repackProbeActive[repo] {
 		s.repackProbeAgain[repo] = true
@@ -1178,10 +1190,13 @@ func (s *Server) dispatchRepackProbe(ctx context.Context, repo string) {
 		return
 	}
 	s.repackProbeActive[repo] = true
+	sem := s.repackProbeSem
 	s.repackProbeMu.Unlock()
 	go func() {
 		for {
+			sem <- struct{}{}
 			s.MaybeRepack(ctx, repo)
+			<-sem
 			s.repackProbeMu.Lock()
 			if s.repackProbeAgain[repo] {
 				delete(s.repackProbeAgain, repo)

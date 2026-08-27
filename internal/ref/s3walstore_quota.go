@@ -32,6 +32,22 @@ func s3walLapseEvidence(mapKey, owner string) bool {
 	return ok && owner != AbsenceFoldedOwner
 }
 
+// s3walSeedDoomsCover reports whether snapshot m holds a reservation row
+// the caller's expiry pass would BOTH prune and record the fleet-global
+// lapse-evidence marker for — the pre-CAS externalized write that makes a
+// seed unfit (s3walMutation.seedUnfit). window is the caller's non-claim
+// expiry window (covers are never claim rows, so the claim window is
+// irrelevant here); the lapse-evidence shape check runs first so
+// irrelevant rows never consult the skew-guarded clock arms.
+func (s *S3WAL) s3walSeedDoomsCover(base string, m *s3wal.Manifest, window time.Duration) bool {
+	for key, r := range m.Reservations {
+		if s3walLapseEvidence(key, r.Owner) && s.s3walExpiryAllowed(base, m, r.CreatedAt, window, "seed fitness") {
+			return true
+		}
+	}
+	return false
+}
+
 // s3walRecordLapse durably records the lapse-evidence marker for one
 // doomed cover row BEFORE the CAS that consumes it commits (the SQLite
 // twin's ordering): a marker without a consumed row is a conservative
@@ -160,6 +176,10 @@ func (s *S3WAL) ReservePackBytes(ctx context.Context, group []string, packs []Pa
 	minted := false
 	err := s.mutate(ctx, base, s3walMutation{
 		op: "reserve pack bytes",
+		// The self-healing GC below records the fleet-global lapse
+		// marker BEFORE this CAS commits — an externalized write that
+		// must never fire off an unvalidated seed (see s3walMutation).
+		seedUnfit: func(m *s3wal.Manifest) bool { return s.s3walSeedDoomsCover(base, m, ttl) },
 		// Growth is dynamic: only freshly MINTED rows add entries — a
 		// same-key refresh mutates an existing row in place, and the
 		// self-healing GC only shrinks.
@@ -450,6 +470,9 @@ func (s *S3WAL) SweepExpiredPackReservations(ctx context.Context, olderThan time
 		var pruned int64
 		err := s.mutate(ctx, base, s3walMutation{
 			op: "sweep reservations",
+			// Same externalized lapse marker as ReservePackBytes: never
+			// derived from a seed (see s3walMutation.seedUnfit).
+			seedUnfit: func(m *s3wal.Manifest) bool { return s.s3walSeedDoomsCover(base, m, olderThan) },
 			fn: func(m *s3wal.Manifest, clk time.Time) (bool, error) {
 				pruned = 0
 				doomedCover := ""

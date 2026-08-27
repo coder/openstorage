@@ -441,6 +441,18 @@ type s3walMutation struct {
 	// recover classifies a fresh post-ambiguity snapshot (nil = s3walRerun,
 	// the idempotent-re-apply fallback).
 	recover func(m *s3wal.Manifest) s3walVerdict
+	// seedUnfit, when set, is evaluated against a candidate seed BEFORE
+	// the seeded first attempt (Codex P1 on PR #185): fn bodies that
+	// externalize a durable effect before their CAS — the absence-cover
+	// lapse-evidence marker — may derive that effect only from fresh
+	// state. A CURRENT seed would produce the identical verdict, but
+	// only the CAS proves currency and it proves it too late: the
+	// marker is already durable when a stale seed's PUT 412s, and a
+	// spurious fleet-global lapse marker arms the finite-admission
+	// fence with false evidence. Any seed that would trigger the
+	// externalized write is therefore refused and the mutation starts
+	// from a fresh read. nil = every seed is fit.
+	seedUnfit func(m *s3wal.Manifest) bool
 }
 
 // mutate runs one read-mutate-CAS loop with the §2.3 recovery discipline:
@@ -478,6 +490,12 @@ func (s *S3WAL) mutate(ctx context.Context, base string, mu s3walMutation) error
 	// rebased onto fresh attempts below. The base lock is held, so the
 	// pre-loop peek cannot race this mutation's own snap updates.
 	seedM, seedTag, haveSeed := s.seedManifest(base)
+	if haveSeed && mu.seedUnfit != nil && mu.seedUnfit(seedM) {
+		// The seed stays cached — it is not known stale, just unusable
+		// for a mutation with pre-CAS external writes; this run reads
+		// fresh (which refreshes the snapshot anyway).
+		haveSeed = false
+	}
 	seedOffset := 0
 	if haveSeed {
 		seedOffset = 1
