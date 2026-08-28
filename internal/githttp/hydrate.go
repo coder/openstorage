@@ -584,8 +584,6 @@ func ensureRefTxHook(path, script string) (os.FileInfo, error) {
 		_ = tmp.Close()
 		return nil, err
 	}
-	// The fingerprint of the fully written temp — rename preserves inode,
-	// mtime, and mode, so this is the installed state's identity.
 	fi, err := tmp.Stat()
 	if err != nil {
 		_ = tmp.Close()
@@ -597,27 +595,57 @@ func ensureRefTxHook(path, script string) (os.FileInfo, error) {
 	if testHookRefTxPreInstall != nil {
 		testHookRefTxPreInstall()
 	}
-	// Revalidate the displaced target immediately before the rename (PR
-	// #195 round-9 P2): the install/replace decision above described an
-	// earlier read, and a foreign hook landing in between must not be
-	// clobbered — abort and let the next full pass re-decide. The
-	// residual stat-to-rename window is microseconds against an operator
-	// action; a loss there is repaired the same way an operator's install
-	// racing a deployment always is (reinstall wins on the next write).
-	current, cerr := os.ReadFile(path)
-	switch {
-	case errors.Is(cerr, os.ErrNotExist):
-		// Still absent, or the stale managed script vanished — either
-		// way the rename creates without displacing foreign content.
-	case cerr != nil:
-		return nil, cerr
-	case !bytes.Equal(current, existing):
-		return nil, nil
+	// No-clobber installation (PR #195 rounds 9 and 12): link(2) fails
+	// EEXIST instead of displacing whatever occupies the path, so a
+	// concurrent install always survives — there is no read-to-rename
+	// window at all. The install links the temp's inode into place and
+	// re-stats the DESTINATION for the memo fingerprint (round-12 P3:
+	// link updates ctime, which fileUnchanged compares — a pre-install
+	// fingerprint would reject every memo immediately and re-run the
+	// full verification per request).
+	install := func() (os.FileInfo, error) {
+		if err := os.Link(tmp.Name(), path); err != nil {
+			if errors.Is(err, os.ErrExist) {
+				return nil, nil // a concurrent install won; next pass re-decides
+			}
+			return nil, err
+		}
+		dfi, err := os.Stat(path)
+		if err != nil || !os.SameFile(fi, dfi) {
+			return nil, nil
+		}
+		return dfi, nil
 	}
-	if err := os.Rename(tmp.Name(), path); err != nil {
+	if existing == nil {
+		return install()
+	}
+	// The replace path takes the target ASIDE atomically and inspects the
+	// inode it actually displaced: only content byte-equal to the stale
+	// managed script the decision described is discarded; anything else —
+	// a foreign hook landing at any point since the decision read — is
+	// restored, again without clobbering an even newer install. The hook
+	// may be briefly absent mid-replace; it is optional by contract
+	// (release falls back to post-receive), unlike the enforcement hooks.
+	quarantine := tmp.Name() + ".displaced"
+	if err := os.Rename(path, quarantine); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return install() // vanished underfoot; a plain no-clobber create
+		}
 		return nil, err
 	}
-	return fi, nil
+	displaced, derr := os.ReadFile(quarantine)
+	if derr == nil && bytes.Equal(displaced, existing) {
+		dfi, ierr := install()
+		_ = os.Remove(quarantine)
+		return dfi, ierr
+	}
+	// Foreign (or unverifiable) content was displaced: restore it. EEXIST
+	// means an even newer install took the slot — the operator's latest
+	// wins over the mid-window one, exactly as consecutive operator
+	// writes always resolve.
+	_ = os.Link(quarantine, path)
+	_ = os.Remove(quarantine)
+	return nil, nil
 }
 
 // ensureHook installs the hook script unless it is already current and
@@ -2081,6 +2109,14 @@ func loadPushHolds(repoPath string) pushHoldSet {
 	return s
 }
 
+// errPushScanBudget marks a peer scan denied MID-SCAN because reading the
+// next file would exceed the push's remaining allowance (PR #195 round-12
+// P2): the precheck's size snapshot cannot bind flock-less tombstone
+// growth, so the budget is enforced against each file's CURRENT size
+// immediately before its bytes are read — zero overshoot by construction,
+// independent of when the growth lands.
+var errPushScanBudget = errors.New("push hold: push exceeded its peer-hold scan allowance against unusually large concurrent push holds; retry shortly or split the push")
+
 // readFileLimit reads at most limit bytes of path — os.ReadFile with a
 // hard cap for files that can grow under the reader (PR #195 round-11
 // P2: the scan-work allowance charges sampled sizes, so reads must not
@@ -2117,6 +2153,14 @@ func readPushHolds(dir, exceptPath string) (pushHoldSet, error) {
 // of its parses changed. Not goroutine-safe; one loop owns one cache.
 type pushHoldDirCache struct {
 	dir, except string
+
+	// remaining, when positive, bounds the bytes a single load may read:
+	// each stale entry's CURRENT listed sizes are checked against it
+	// before any read (round-12 P2 — the reservation path's precheck
+	// snapshot cannot bind flock-less sidecar growth), failing closed
+	// with errPushScanBudget. Zero means unlimited (hydration's fail-open
+	// reader charges no allowance).
+	remaining int64
 
 	files  map[string]holdFileParse
 	set    pushHoldSet
@@ -2202,6 +2246,12 @@ func (c *pushHoldDirCache) load() (pushHoldSet, error) {
 			parse.relSize != relSize || parse.relMtime != relMtime {
 			if testHookDirCachePreParse != nil {
 				testHookDirCachePreParse()
+			}
+			if c.remaining > 0 && c.parsedBytes+info.Size()+max(relSize, 0) > c.remaining {
+				if firstErr == nil {
+					firstErr = errPushScanBudget
+				}
+				continue
 			}
 			b, err := os.ReadFile(path)
 			if err != nil {
@@ -2350,7 +2400,11 @@ func holdLineCovers(held []byte, name string) bool {
 // the size of every peer file it opened (a deliberate overcount on a
 // short-circuit) — which the caller charges against the push's
 // maxPushPeerScanBytes allowance.
-func peerHoldCovers(dir, exceptPath, name string) (bool, int64, error) {
+// remaining is the push's unspent scan allowance, enforced against each
+// file's CURRENT size before its bytes are read (round-12 P2 — the
+// caller's precheck snapshot cannot bind flock-less sidecar growth);
+// exceeding it returns errPushScanBudget with zero overshoot.
+func peerHoldCovers(dir, exceptPath, name string, remaining int64) (bool, int64, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -2376,6 +2430,9 @@ func peerHoldCovers(dir, exceptPath, name string) (bool, int64, error) {
 		}
 		if !pushHoldLive(path, info.ModTime()) {
 			continue
+		}
+		if scanned+info.Size() > remaining {
+			return false, scanned, errPushScanBudget
 		}
 		f, err := os.Open(path)
 		if err != nil {
@@ -2415,8 +2472,12 @@ func peerHoldCovers(dir, exceptPath, name string) (bool, int64, error) {
 			var sampled int64
 			if ri, err := rf.Stat(); err == nil {
 				sampled = ri.Size()
-				scanned += sampled
 			}
+			if scanned+sampled > remaining {
+				_ = rf.Close()
+				return false, scanned, errPushScanBudget
+			}
+			scanned += sampled
 			if testHookPeerScanPostStat != nil {
 				testHookPeerScanPostStat()
 			}
@@ -2642,11 +2703,17 @@ func reservePushHolds(ctx context.Context, holdPath string, names []string) erro
 				unlock()
 				return fmt.Errorf("push hold: push exceeded its peer-hold scan allowance against unusually large concurrent push holds; retry shortly or split the push")
 			}
-			covered, n, err := peerHoldCovers(dir, holdPath, names[0])
+			covered, n, err := peerHoldCovers(dir, holdPath, names[0], maxPushPeerScanBytes-used)
 			if err != nil {
+				unlock()
+				if errors.Is(err, errPushScanBudget) {
+					// Mid-scan denial (round-12 P2): sidecar growth after
+					// the precheck busted the allowance — same retryable
+					// verdict, zero overshoot.
+					return err
+				}
 				// Fail CLOSED: an unreadable peer hold is not proof of
 				// no conflict (Codex round-3 P1 on #173).
-				unlock()
 				return fmt.Errorf("push hold: reading peer holds: %w", err)
 			}
 			if n > 0 {
@@ -2682,10 +2749,17 @@ func reservePushHolds(ctx context.Context, holdPath string, names []string) erro
 				return fmt.Errorf("push hold: push exceeded its peer-hold scan allowance against unusually large concurrent push holds; retry shortly or split the push")
 			}
 			before := cache.parsedBytes
+			// The in-load budget (round-12 P2): allowance still unspent
+			// plus what this cache already read (parsedBytes is cumulative
+			// across polls while `used` already charges completed polls).
+			cache.remaining = maxPushPeerScanBytes - used + before
 			peers, err := cache.load()
 			if err != nil {
-				// Fail CLOSED (round-3 P1), as above.
 				unlock()
+				if errors.Is(err, errPushScanBudget) {
+					return err
+				}
+				// Fail CLOSED (round-3 P1), as above.
 				return fmt.Errorf("push hold: reading peer holds: %w", err)
 			}
 			if n := cache.parsedBytes - before; n > 0 {

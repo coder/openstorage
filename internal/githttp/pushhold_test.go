@@ -2716,7 +2716,7 @@ func TestPushHoldReaders_SubtractTombstones(t *testing.T) {
 		{"refs/heads/busy/sub", true},  // held D/F ancestor
 		{"refs/heads", true},           // held D/F descendant (busy)
 	} {
-		covered, _, err := peerHoldCovers(dir, "", tc.name)
+		covered, _, err := peerHoldCovers(dir, "", tc.name, maxPushPeerScanBytes)
 		if err != nil {
 			t.Fatalf("peerHoldCovers(%s): %v", tc.name, err)
 		}
@@ -2737,7 +2737,7 @@ func TestPushHoldReaders_SubtractTombstones(t *testing.T) {
 	if err := os.Rename(hold, hold+".reaping"); err != nil {
 		t.Fatalf("quarantine: %v", err)
 	}
-	covered, _, err := peerHoldCovers(dir, "", "refs/heads/done")
+	covered, _, err := peerHoldCovers(dir, "", "refs/heads/done", maxPushPeerScanBytes)
 	if err != nil {
 		t.Fatalf("peerHoldCovers quarantined: %v", err)
 	}
@@ -2873,7 +2873,7 @@ func TestReleaseDeniedPushHold_BumpsEpochBeforeVisibility(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = os.Chmod(repoDir, 0o755) })
 	_ = releaseDeniedPushHold(hold2, "refs/heads/y") // best-effort caller
-	covered, _, err := peerHoldCovers(dir, "", "refs/heads/y")
+	covered, _, err := peerHoldCovers(dir, "", "refs/heads/y", maxPushPeerScanBytes)
 	if err != nil {
 		t.Fatalf("peerHoldCovers: %v", err)
 	}
@@ -2909,7 +2909,7 @@ func TestPushHoldReaders_IgnoreTornTombstoneTail(t *testing.T) {
 		"refs/heads/foobar": true,  // its release append never completed
 		"refs/heads/done":   false, // terminated tombstone applies
 	} {
-		covered, _, err := peerHoldCovers(dir, "", name)
+		covered, _, err := peerHoldCovers(dir, "", name, maxPushPeerScanBytes)
 		if err != nil {
 			t.Fatalf("peerHoldCovers(%s): %v", name, err)
 		}
@@ -2952,7 +2952,7 @@ func TestAppendPushReleased_FailsClosedOnTornTail(t *testing.T) {
 	if err := appendPushReleased(hold, []string{"refs/heads/bar"}); err == nil {
 		t.Fatal("appending after an unterminated tail must fail closed")
 	}
-	covered, _, err := peerHoldCovers(dir, "", victim)
+	covered, _, err := peerHoldCovers(dir, "", victim, maxPushPeerScanBytes)
 	if err != nil {
 		t.Fatalf("peerHoldCovers: %v", err)
 	}
@@ -3536,7 +3536,7 @@ func TestRunHook_PartiallyFailedReservationReleased(t *testing.T) {
 	if err := RunHook(context.Background(), []string{"update", "refs/heads/b", sha, sha2}); err == nil {
 		t.Fatal("the partially failed reservation must fail the update")
 	}
-	covered, _, err := peerHoldCovers(filepath.Dir(holdPath), "", "refs/heads/b")
+	covered, _, err := peerHoldCovers(filepath.Dir(holdPath), "", "refs/heads/b", maxPushPeerScanBytes)
 	if err != nil {
 		t.Fatalf("peerHoldCovers: %v", err)
 	}
@@ -3635,7 +3635,7 @@ func TestPeerHoldCovers_BoundsTombstoneReadToChargedSize(t *testing.T) {
 		_ = f.Close()
 	}
 	defer func() { testHookPeerScanPostStat = nil }()
-	covered, _, err := peerHoldCovers(dir, "", "refs/heads/x")
+	covered, _, err := peerHoldCovers(dir, "", "refs/heads/x", maxPushPeerScanBytes)
 	testHookPeerScanPostStat = nil
 	if err != nil {
 		t.Fatalf("peerHoldCovers: %v", err)
@@ -3644,7 +3644,7 @@ func TestPeerHoldCovers_BoundsTombstoneReadToChargedSize(t *testing.T) {
 		t.Fatal("bytes beyond the charged sample must stay unread this scan")
 	}
 	// The next scan charges the fresh stat and applies the tombstone.
-	covered, _, err = peerHoldCovers(dir, "", "refs/heads/x")
+	covered, _, err = peerHoldCovers(dir, "", "refs/heads/x", maxPushPeerScanBytes)
 	if err != nil {
 		t.Fatalf("peerHoldCovers second scan: %v", err)
 	}
@@ -3766,6 +3766,131 @@ func TestEnsureCacheRepo_ToleratesUnwritableHooksDir(t *testing.T) {
 	}
 }
 
+// TestReservePushHolds_MidScanGrowthDenied (PR #195 round-12 P2): the
+// allowance precheck's size snapshot cannot bind flock-less tombstone
+// growth — a batched append landing after the precheck must be denied
+// MID-SCAN against each file's current size, not read first and charged
+// later (overshoot by the whole delta otherwise).
+func TestReservePushHolds_MidScanGrowthDenied(t *testing.T) {
+	oldMax := maxPushPeerScanBytes
+	maxPushPeerScanBytes = 256
+	t.Cleanup(func() { maxPushPeerScanBytes = oldMax })
+	repoDir := t.TempDir()
+	dir := filepath.Join(repoDir, pushHoldDir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	peer := filepath.Join(dir, "push-peer")
+	if err := os.WriteFile(peer, []byte("refs/heads/x\n"), 0o600); err != nil {
+		t.Fatalf("write peer: %v", err)
+	}
+	if err := appendPushReleased(peer, []string{"refs/heads/other"}); err != nil {
+		t.Fatalf("seed sidecar: %v", err)
+	}
+	// The growth lands after the reservation's precheck (inside the
+	// flock, before the sidecar read): a tombstone block far past the
+	// allowance.
+	grown := false
+	testHookPeerScanPostStat = nil
+	testHookDirCachePreParse = nil
+	grow := func() {
+		if grown {
+			return
+		}
+		grown = true
+		f, err := os.OpenFile(peer+pushHoldReleasedSuffix, os.O_APPEND|os.O_WRONLY, 0)
+		if err != nil {
+			t.Errorf("open sidecar: %v", err)
+			return
+		}
+		if _, err := f.WriteString(strings.Repeat("refs/heads/waste\n", 64)); err != nil {
+			t.Errorf("grow sidecar: %v", err)
+		}
+		_ = f.Close()
+	}
+	// Grow past any budget the legs below allow.
+	grow()
+	// Single-name path: the in-scan check compares each file's CURRENT
+	// size against the remaining allowance before reading it — growth
+	// landing after the caller's precheck is denied, never consumed
+	// (growth landing after the in-scan stat is separately bounded by
+	// the LimitReader and denied by the NEXT poll's precheck).
+	if _, _, err := peerHoldCovers(dir, "", "refs/heads/x/sub", 64); !errors.Is(err, errPushScanBudget) {
+		t.Fatalf("single-name over-budget scan must deny before reading, got %v", err)
+	}
+	// Multi-name path: the in-load check denies any entry whose CURRENT
+	// listed sizes exceed the remaining budget, before reading a byte.
+	cache := &pushHoldDirCache{dir: dir, remaining: 64}
+	if _, err := cache.load(); !errors.Is(err, errPushScanBudget) {
+		t.Fatalf("multi-name over-budget entry must deny before reading, got %v", err)
+	}
+	// And end to end, an over-allowance reservation still gets the
+	// retryable denial rather than unbudgeted work.
+	oldWait := pushHoldWaitMax
+	pushHoldWaitMax = 200 * time.Millisecond
+	t.Cleanup(func() { pushHoldWaitMax = oldWait })
+	err := reservePushHolds(context.Background(), filepath.Join(dir, "push-me"), []string{"refs/heads/x/sub"})
+	if err == nil || !strings.Contains(err.Error(), "scan allowance") {
+		t.Fatalf("over-allowance reservation must deny retryably, got %v", err)
+	}
+}
+
+// TestEnsureCacheRepo_MemoSurvivesInstall (PR #195 round-12 P3, and the
+// CI-red on cae54eaa): the memoized fingerprint must describe the
+// INSTALLED inode after its link into place — a pre-install fingerprint
+// differs in ctime, rejecting the memo on every request and re-running
+// the full verification pass (git subprocesses included) that the memo
+// exists to avoid.
+func TestEnsureCacheRepo_MemoSurvivesInstall(t *testing.T) {
+	cacheDir := t.TempDir()
+	repoPath, err := EnsureCacheRepo(cacheDir, "t-reftx-memokeep")
+	if err != nil {
+		t.Fatalf("EnsureCacheRepo: %v", err)
+	}
+	m, ok := cacheRepoMemos.Load(repoPath)
+	if !ok {
+		t.Fatal("first pass must memoize")
+	}
+	if !cacheRepoUnchanged(repoPath, m.(cacheRepoMemo)) {
+		t.Fatal("a fresh install's memo must verify on the very next call")
+	}
+}
+
+// TestEnsureCacheRepo_NoClobberCreateRace (PR #195 round-12 P2): the
+// create path installs via link(2), which fails EEXIST instead of
+// displacing a hook that landed since the ENOENT decision — no
+// read-to-rename window exists at all.
+func TestEnsureCacheRepo_NoClobberCreateRace(t *testing.T) {
+	cacheDir := t.TempDir()
+	repoPath, err := EnsureCacheRepo(cacheDir, "t-reftx-noclobber")
+	if err != nil {
+		t.Fatalf("EnsureCacheRepo: %v", err)
+	}
+	hookPath := filepath.Join(repoPath, "hooks", "reference-transaction")
+	if err := os.Remove(hookPath); err != nil {
+		t.Fatalf("remove hook: %v", err)
+	}
+	foreign := "#!/bin/sh\n# operator hook landing mid-install\nexit 0\n"
+	testHookRefTxPreInstall = func() {
+		if err := os.WriteFile(hookPath, []byte(foreign), 0o755); err != nil {
+			t.Errorf("install foreign hook: %v", err)
+		}
+	}
+	defer func() { testHookRefTxPreInstall = nil }()
+	cacheRepoMemos.Delete(repoPath)
+	if _, err := EnsureCacheRepo(cacheDir, "t-reftx-noclobber"); err != nil {
+		t.Fatalf("EnsureCacheRepo second pass: %v", err)
+	}
+	testHookRefTxPreInstall = nil
+	b, err := os.ReadFile(hookPath)
+	if err != nil {
+		t.Fatalf("read hook: %v", err)
+	}
+	if string(b) != foreign {
+		t.Fatalf("a foreign hook landing after the ENOENT decision must survive, got:\n%s", b)
+	}
+}
+
 // TestReapExpiredPushHold_RestoresTouchedHold (Codex round-31 P2 on
 // #173): the expiry verdict and the removal linearize at the quarantine
 // rename — an owner touch that preceded it is observed on the quarantined
@@ -3879,7 +4004,7 @@ func TestPeerHoldCovers_StreamsWithoutParsing(t *testing.T) {
 		{"refs/heads/b/0001", false},    // sibling prefix, no '/' boundary
 		{"refs/heads/zzz", false},       // disjoint
 	} {
-		got, _, err := peerHoldCovers(dir, "", tc.name)
+		got, _, err := peerHoldCovers(dir, "", tc.name, maxPushPeerScanBytes)
 		if err != nil {
 			t.Fatalf("peerHoldCovers(%s): %v", tc.name, err)
 		}
@@ -3889,7 +4014,7 @@ func TestPeerHoldCovers_StreamsWithoutParsing(t *testing.T) {
 	}
 	// The exceptPath (our own hold) never conflicts with itself — and an
 	// excluded self costs no scan work.
-	if got, n, err := peerHoldCovers(dir, peer, "refs/heads/b/000123"); err != nil || got || n != 0 {
+	if got, n, err := peerHoldCovers(dir, peer, "refs/heads/b/000123", maxPushPeerScanBytes); err != nil || got || n != 0 {
 		t.Fatalf("except-path hold treated as a peer: got=%v scanned=%d err=%v", got, n, err)
 	}
 	// Allocation bound: scanning may not scale with the peer's NAME
@@ -3897,7 +4022,7 @@ func TestPeerHoldCovers_StreamsWithoutParsing(t *testing.T) {
 	var before, after runtime.MemStats
 	runtime.ReadMemStats(&before)
 	for i := 0; i < 10; i++ {
-		if _, _, err := peerHoldCovers(dir, "", "refs/heads/zzz"); err != nil {
+		if _, _, err := peerHoldCovers(dir, "", "refs/heads/zzz", maxPushPeerScanBytes); err != nil {
 			t.Fatalf("peerHoldCovers: %v", err)
 		}
 	}
