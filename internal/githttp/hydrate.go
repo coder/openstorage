@@ -443,11 +443,23 @@ const refTxHookGate = `#!/bin/sh
 `
 
 // isManagedRefTxHook reports whether content is one of OUR generated
-// reference-transaction scripts (any embedded binary path, any managed
-// generation) as opposed to a foreign/operator hook.
+// reference-transaction scripts — the COMPLETE template shape (the gate
+// plus exactly one delegated-invocation line, any embedded binary path,
+// exec-style historical generations included), nothing more (PR #195
+// round-3 P2): an operator wrapper that keeps the gate and the delegated
+// invocation but ADDS logic must classify as foreign, or the refresh
+// pass would silently strip the additions.
 func isManagedRefTxHook(content []byte) bool {
-	return strings.HasPrefix(string(content), refTxHookGate) &&
-		strings.Contains(string(content), ` hook reference-transaction "$@"`)
+	rest, ok := strings.CutPrefix(string(content), refTxHookGate)
+	if !ok {
+		return false
+	}
+	line, rest, ok := strings.Cut(rest, "\n")
+	if !ok || rest != "" {
+		return false
+	}
+	return strings.HasSuffix(line, ` hook reference-transaction "$@" || exit 0`) ||
+		strings.HasSuffix(line, ` hook reference-transaction "$@"`)
 }
 
 // ensureRefTxHook installs script at path when nothing exists there, and

@@ -2988,6 +2988,40 @@ func TestEnsureCacheRepo_RestoresRefTxHookExecBit(t *testing.T) {
 	}
 }
 
+// TestEnsureCacheRepo_PreservesWrappedManagedHook (PR #195 round-3 P2):
+// an operator can EXTEND the generated hook while keeping its gate and
+// delegated invocation — a prefix+substring managed check would classify
+// that wrapper as managed and clobber the operator's additions on the
+// next full pass. Managed means the COMPLETE generated shape (gate plus
+// exactly one delegated invocation line), nothing more.
+func TestEnsureCacheRepo_PreservesWrappedManagedHook(t *testing.T) {
+	cacheDir := t.TempDir()
+	repoPath, err := EnsureCacheRepo(cacheDir, "t-reftx-wrapper")
+	if err != nil {
+		t.Fatalf("EnsureCacheRepo: %v", err)
+	}
+	hookPath := filepath.Join(repoPath, "hooks", "reference-transaction")
+	// A customized wrapper: managed gate + delegation retained, operator
+	// logic added.
+	wrapper := refTxHookGate +
+		"logger -t codestorage-reftx \"$1\"\n" +
+		"/usr/local/bin/codestorage hook reference-transaction \"$@\" || exit 0\n"
+	if err := os.WriteFile(hookPath, []byte(wrapper), 0o755); err != nil {
+		t.Fatalf("write wrapper: %v", err)
+	}
+	cacheRepoMemos.Delete(repoPath)
+	if _, err := EnsureCacheRepo(cacheDir, "t-reftx-wrapper"); err != nil {
+		t.Fatalf("EnsureCacheRepo second pass: %v", err)
+	}
+	b, err := os.ReadFile(hookPath)
+	if err != nil {
+		t.Fatalf("read hook: %v", err)
+	}
+	if string(b) != wrapper {
+		t.Fatalf("customized wrapper must be preserved, got:\n%s", b)
+	}
+}
+
 // TestReapExpiredPushHold_RestoresTouchedHold (Codex round-31 P2 on
 // #173): the expiry verdict and the removal linearize at the quarantine
 // rename — an owner touch that preceded it is observed on the quarantined
