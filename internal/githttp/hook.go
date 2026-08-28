@@ -3,15 +3,22 @@ package githttp
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/coder/code-storage/internal/auth"
 	"github.com/coder/code-storage/internal/blob"
@@ -41,6 +48,15 @@ const (
 	// EnvOrg names the org whose signing keys verify-sig loads. Shared with
 	// the serve config on purpose: the server sets it explicitly for hooks.
 	EnvOrg = "CODESTORAGE_ORG"
+	// EnvPushHold carries the absolute path of this push's hold file
+	// (issue #170, hydrate.go push-hold machinery). pre-receive reserves
+	// every ref of the push in it before any update-hook CAS can run;
+	// concurrent full syncs skip held refs so they cannot race
+	// receive-pack's own local update of a ref it just committed, and
+	// D/F-conflicting concurrent pushes serialize on the reservation.
+	// Minted per request by the server and stripped from inherited env
+	// like the other per-push inputs.
+	EnvPushHold = "CODESTORAGE_GIT_PUSH_HOLD"
 	// EnvAtomic marks the push `--atomic` (issue #28). githooks(5) exposes
 	// no atomic indicator, so the HTTP layer sniffs the wire capability
 	// (atomic.go) and sets this; pre-receive then evaluates the policy
@@ -62,6 +78,21 @@ const (
 	// dead connection would. Later invocations pass through untouched.
 	EnvCASDrop     = "CODESTORAGE_TEST_CAS_DROP"
 	EnvCASDropHard = "CODESTORAGE_TEST_CAS_DROP_HARD"
+	// EnvUpdateBarrier holds a handshake-file path prefix; the first update
+	// hook to create <path>.ready pauses AFTER its authority CAS commits
+	// and before the hook exits — i.e. before receive-pack performs its own
+	// local ref update — until the test creates <path>.release (issue #170:
+	// this is exactly the window a concurrent hydrate can full-sync the
+	// just-committed ref into the shared cache repo). Later invocations
+	// pass through untouched.
+	EnvUpdateBarrier = "CODESTORAGE_TEST_UPDATE_BARRIER"
+	// EnvPreReceiveBarrier holds a handshake-file path prefix; the first
+	// pre-receive to create <path>.ready pauses AFTER pack publication
+	// and BEFORE the deferred hold reservation (Codex round-23 security
+	// P2: exactly the window in which a concurrent same-name or
+	// D/F-relative push must be able to proceed) until the test creates
+	// <path>.release. Later invocations pass through untouched.
+	EnvPreReceiveBarrier = "CODESTORAGE_TEST_PRERECEIVE_BARRIER"
 	// CrashHeader lets tests request an EnvCrash injection per push; the
 	// server refuses it outside test mode.
 	CrashHeader = "X-Codestorage-Test-Crash"
@@ -113,9 +144,38 @@ func RunHook(ctx context.Context, args []string) error {
 		return preReceive(ctx)
 	case "update":
 		return updateHook(ctx, args[1:])
+	case "post-receive":
+		return postReceiveHook()
 	default:
 		return fmt.Errorf("unknown hook %q", args[0])
 	}
+}
+
+// postReceiveHook releases the push's ref holds (Codex round-22 P2 on
+// #173): git runs post-receive exactly when the local ref transaction
+// has completed — the event the holds protect — and strictly BEFORE the
+// per-ref report-status writes, whose delivery a non-reading client can
+// stall indefinitely (production serves without a write timeout, and the
+// handler's cmd.Wait blocks on the response copy, so its release can be
+// deferred arbitrarily by the client). The handler's own release stays
+// as the fallback for pushes git never runs post-receive for (nothing
+// updated). Best-effort: a failed removal leaves the TTL machinery the
+// bound, and the hook never fails the push (git ignores post-receive's
+// exit status for the ref outcome anyway).
+func postReceiveHook() error {
+	// Release FIRST (Codex round-23 P2): post-receive runs after all refs
+	// have been updated, so local transaction safety no longer needs the
+	// reservation — while stdin carries one record per updated ref, an
+	// attacker-scaled stream whose drain would keep same-name and
+	// D/F-relative pushes blocked into their reservation timeout.
+	if holdPath := os.Getenv(EnvPushHold); holdPath != "" {
+		removePushHoldFiles(holdPath)
+	}
+	// Then drain the updated-ref list git feeds on stdin (unused):
+	// exiting with the pipe unread risks EPIPE noise on receive-pack's
+	// side.
+	_, _ = io.Copy(io.Discard, os.Stdin)
+	return nil
 }
 
 type refCommand struct{ old, new, ref string }
@@ -126,7 +186,27 @@ type refCommand struct{ old, new, ref string }
 //   - die after PG commit, before ref CAS    => registered-but-unreferenced pack
 //
 // Refs are never touched here, so a broken ref is impossible.
-func preReceive(ctx context.Context) error {
+func preReceive(ctx context.Context) (retErr error) {
+	// A pre-receive error rejects the WHOLE push: git runs no update hook
+	// and no post-receive — the primary release — so nothing this process
+	// reserved can ever commit, and the only remaining release would be
+	// the handler fallback, which fires after receive-pack drains its
+	// per-ref report to the client, a write a non-reading client can
+	// stall indefinitely while the handler refresher keeps the hold fresh
+	// (Codex round-29 P2 on #173: the post-reservation base-check and D/F
+	// probe error paths returned with every reserved name still held,
+	// blocking same-name and D/F-relative pushes into their reservation
+	// timeouts). Release the whole hold on any error — the same reasoning
+	// as the atomic update-hook denial release, and a no-op for errors
+	// before the reservation existed.
+	defer func() {
+		if retErr == nil {
+			return
+		}
+		if holdPath := os.Getenv(EnvPushHold); holdPath != "" {
+			removePushHoldFiles(holdPath)
+		}
+	}()
 	repo := mustEnv(EnvRepo)
 	// git sets GIT_QUARANTINE_PATH only when the client transfers objects;
 	// delete-only pushes invoke pre-receive without it.
@@ -159,6 +239,417 @@ func preReceive(ctx context.Context) error {
 	}
 	atomicPush := os.Getenv(EnvAtomic) == "1"
 
+	// Full-policy verdicts are evaluated AT MOST once per command per push
+	// — memoized per index so every pre-receive consumer (the atomic
+	// whole-push gate, the reservation filter's signature-gated
+	// evaluations, and the pack publication gate) shares ONE evaluation
+	// (Codex rounds 4+6 P2, round-16 P2 on #173: each evaluation charges
+	// the shared verify-sig walk budget a per-evaluation fee, so
+	// re-evaluating the same command in two pre-receive gates double-fees
+	// the push). The no-pack non-atomic path still evaluates nothing
+	// beyond its signature-gated commands.
+	verdicts := make([]error, len(commands))
+	verdictDone := make([]bool, len(commands))
+	evalOne := func(i int) error {
+		if !verdictDone[i] {
+			c := commands[i]
+			verdicts[i] = enforceRefPolicy(ctx, repo, c.ref, c.old, c.new)
+			verdictDone[i] = true
+		}
+		return verdicts[i]
+	}
+	evalVerdicts := func() {
+		for i := range commands {
+			_ = evalOne(i)
+		}
+	}
+	// Atomic pushes fail whole on any denial (issue #28 semantics), and
+	// doing so BEFORE the hold reservation means a restricted token's
+	// denied command can never hold a namespace it cannot write — atomic
+	// or not (Codex round-4 security P2 on #173). Unupdatable NAMES are
+	// whole-push denials too (Codex round-6 P1): git runs earlier update
+	// hooks — whose authority CASes commit — before rejecting the funny
+	// name and aborting the local atomic transaction, so letting one
+	// through recreates the authority-accepted/client-rejected wedge.
+	if atomicPush {
+		// Evaluated one command at a time, name check first, STOPPING at
+		// the first denial (Codex round-10 P2): a denied atomic push's
+		// outcome is already fixed, and each further evaluation can cost
+		// subprocess work (no-force-push runs git merge-base, verify-sig
+		// walks and verifies) — eager whole-slice evaluation let one
+		// doomed request scale that by its command count. A complete loop
+		// leaves verdicts fully populated (all nil) for the later gates.
+		for i, c := range commands {
+			if !pushCommandUpdatable(c.ref, c.old, c.new) {
+				return atomicDenied(fmt.Errorf("ref name %s is not updatable here (namespace root, git-invalid or unmaterializable name, or deeper than %d segments)", c.ref, maxPushRefDepth))
+			}
+			if err := evalOne(i); err != nil {
+				return atomicDenied(err)
+			}
+		}
+		// The push's OWN command set must be representable in one git ref
+		// transaction (Codex round-3 P1 on #173) — an ATOMIC-only gate:
+		// under --atomic, every update hook's authority CAS commits before
+		// git discovers the local D/F collision and aborts the whole
+		// transaction, so the denial must come first. Non-atomic pushes
+		// keep git's per-ref semantics instead (Codex round-7 P2: a
+		// denied parent never survives, so whole-push denial would
+		// reject its representable allowed child) — there the update
+		// hook's authority-side probe (denyAuthorityDFConflict) declines
+		// exactly the loser at commit time, whatever the verdicts did.
+		if err := atomicPushDFCheck(commands); err != nil {
+			return atomicDenied(err)
+		}
+	}
+	// Push holds (issue #170): reserve the refs this push may commit
+	// BEFORE any update-hook CAS but AFTER pack publication (Codex
+	// round-23 security P2: publication is unbounded backend time under
+	// a bounded byte cap, and a reservation taken before it blocked
+	// every concurrent same-name or D/F-relative push into its 10-second
+	// reservation timeout while no CAS could happen yet). The eligible
+	// set is computed HERE — classification, the intra-push D/F filter,
+	// the advisory authority probe, and the crafted-push sidecar cap all
+	// run pre-publication, so a push that cannot possibly proceed is
+	// denied before its upload — but the reservation itself, in one
+	// atomic check+append per push (reservePushHolds), plus the airtight
+	// post-reservation probes, run inside reserveHoldsAndProbe after
+	// publication finished: concurrent full syncs skip held refs so they
+	// cannot race receive-pack's own local ref updates, and a
+	// D/F-conflicting concurrent push is briefly waited out or cleanly
+	// denied there, still before any authority CAS whose local ref
+	// transaction is doomed. Only policy-allowed commands are reserved
+	// (Codex round-3 security P2): a denied command never commits, and
+	// reserving it would let a restricted token hold namespaces it
+	// cannot write for the push window. For atomic pushes every verdict
+	// is nil by this point, so the filter naturally reserves the full
+	// set. The server removes the hold file when receive-pack exits.
+	holdPath := os.Getenv(EnvPushHold)
+	// Every return path after publication must run this (both the
+	// quarantined-pack path and the no-pack path): a push that skipped
+	// it would run update hooks with no reservation at all.
+	reserveHoldsAndProbe := func() error { return nil }
+	if holdPath != "" {
+		names := make([]string, 0, len(commands))
+		var unreserved []string
+		eligible := make([]refCommand, 0, len(commands))
+		// Undeliverable names are settled FIRST, before any evaluation
+		// (Codex round-18 security P2): an unupdatable command diverts to
+		// the sidecar whatever its policy verdict says, so evaluating it
+		// — a signature walk, a verified-marker inode, walked-counter
+		// churn — is attacker-purchasable work with no decision value. A
+		// push already over the sidecar cap on name grounds alone is
+		// denied here, before its first signature evaluation.
+		updatable := make([]bool, len(commands))
+		preUnreserved := 0
+		for i, c := range commands {
+			updatable[i] = pushCommandUpdatable(c.ref, c.old, c.new)
+			if !updatable[i] {
+				preUnreserved++
+			}
+		}
+		if preUnreserved > maxPushUnreserved {
+			return fmt.Errorf("pre-receive: push carries %d commands that cannot be bulk-reserved (policy-denied, undeliverable, or D/F-conflicted names); the limit is %d — drop those commands or split the push", preUnreserved, maxPushUnreserved)
+		}
+		// Non-atomic pushes resolve reservations budget-free, with only
+		// signature-gated commands paying a real per-command evaluation
+		// — see reservationVerdicts.
+		var classes []reservationClass
+		var sigVerified []bool
+		if !atomicPush {
+			classes, sigVerified = reservationVerdicts(repo, commands, updatable, evalOne)
+		} else {
+			// The atomic gate above fully evaluated EVERY command and
+			// denied the push whole on any failure, so each verdict here
+			// is a pass for the exact (ref, old, new) — persist them all
+			// (Codex round-19 P1): hooks otherwise re-charge the shared
+			// walk allowance per command, and an atomic signed fanout
+			// under a small budget dies mid-transaction AFTER earlier
+			// hooks' authority CASes committed — git aborts the whole
+			// local atomic transaction while those updates durably stand.
+			sigVerified = make([]bool, len(commands))
+			for i := range sigVerified {
+				sigVerified[i] = true
+			}
+		}
+		for i, c := range commands {
+			// Reserve only names this server could ever commit (Codex
+			// round-5 security P2): git hands namespace roots like the
+			// literal refs/heads to pre-receive yet can never complete
+			// their local update, and reserving one would hold a D/F
+			// ancestor of the whole namespace. The update hook denies
+			// such names fail-closed, so skipping them here loses no
+			// protection. Atomic pushes reach here all-allowed (the gate
+			// above denied whole on any failure), so their verdicts vouch
+			// for the full set.
+			denied := false
+			if !atomicPush {
+				denied = classes[i] == reservationDenied
+				if classes[i] == reservationJIT {
+					// Neither bulk-reserved nor sidecar-diverted (no
+					// marker, no cap charge): the ref's own hook
+					// re-derives this class and reserves just-in-time
+					// after its real ancestry check passes (Codex
+					// round-25 P2 — see reservationJIT).
+					continue
+				}
+			}
+			if !updatable[i] || denied {
+				unreserved = append(unreserved, c.ref)
+				continue
+			}
+			eligible = append(eligible, c)
+		}
+		// Creations whose strict D/F relative is ANOTHER command of this
+		// same push are not bulk-reserved (Codex round-9 P1): a
+		// non-atomic push creating both refs/heads/a and refs/heads/a/b
+		// would otherwise let both hooks skip the commit-time probe —
+		// both CASes commit before git's local per-ref update rejects
+		// one, leaving the authority unrepresentable. Diverted to the
+		// sidecar, each such creation re-probes the authority AT COMMIT
+		// TIME, sequenced by git after every earlier sibling's CAS, so
+		// exactly the losing relative is declined per-ref (and the
+		// delete-then-create swap still lands, deletion first). Checked
+		// against ALL command names, not just eligible ones: a command
+		// policy-denied here can still be allowed by its own hook's later
+		// evaluation (the round-5 divergence) and commit from the sidecar.
+		allNames := make([]string, 0, len(commands))
+		for _, c := range commands {
+			allNames = append(allNames, c.ref)
+		}
+		cmdSet := newPushHoldSet(allNames)
+		var reservedCreations []string
+		for _, c := range eligible {
+			if c.old == ref.ZeroSHA && c.new != ref.ZeroSHA && cmdSet.conflicts(c.ref) {
+				unreserved = append(unreserved, c.ref)
+				continue
+			}
+			names = append(names, c.ref)
+			if c.old == ref.ZeroSHA && c.new != ref.ZeroSHA {
+				reservedCreations = append(reservedCreations, c.ref)
+			}
+		}
+		// Pre-reservation batch probe (Codex round-7 no-squat property,
+		// restored with the round-13/14 push-proportional batch seam):
+		// creations already doomed by the CURRENT authority never reserve
+		// at all — they divert straight to the sidecar (or deny the whole
+		// atomic push), so a crafted set of doomed parents holds nothing
+		// while it is probed. The post-reservation probe below stays the
+		// airtight racer catch; this one is the cheap common-case filter.
+		var probeStore ref.Store
+		if len(reservedCreations) > 0 || atomicPush {
+			var err error
+			probeStore, err = ref.Open(ctx, mustEnv(envHookPGURL...))
+			if err != nil {
+				return fmt.Errorf("pre-receive: open ref store for reservation probe: %w", err)
+			}
+			defer probeStore.Close()
+		}
+		if len(reservedCreations) > 0 {
+			doomed, err := authorityDoomedCreations(ctx, probeStore, repo, reservedCreations)
+			if err != nil {
+				return fmt.Errorf("pre-receive: authority D/F probe: %w", err)
+			}
+			if len(doomed) > 0 {
+				if atomicPush {
+					for _, c := range commands {
+						if derr, ok := doomed[c.ref]; ok {
+							return atomicDenied(derr)
+						}
+					}
+				}
+				keptNames := names[:0]
+				for _, name := range names {
+					if _, ok := doomed[name]; ok {
+						unreserved = append(unreserved, name)
+						continue
+					}
+					keptNames = append(keptNames, name)
+				}
+				names = keptNames
+				keptCreations := reservedCreations[:0]
+				for _, name := range reservedCreations {
+					if _, ok := doomed[name]; !ok {
+						keptCreations = append(keptCreations, name)
+					}
+				}
+				reservedCreations = keptCreations
+			}
+		}
+		// Early sidecar-cap check — see the full rationale at the second
+		// check below.
+		if len(unreserved) > maxPushUnreserved {
+			return fmt.Errorf("pre-receive: push carries %d commands that cannot be bulk-reserved (policy-denied, undeliverable, or D/F-conflicted names); the limit is %d — drop those commands or split the push", len(unreserved), maxPushUnreserved)
+		}
+		reserveHoldsAndProbe = func() error {
+			if err := reservePushHolds(ctx, holdPath, names); err != nil {
+				return fmt.Errorf("pre-receive: reserve push holds: %w", err)
+			}
+			// The refresher starts the moment the reservation exists (Codex
+			// round-12 P1): the post-reservation probe below is sequential
+			// store I/O that can outlast pushHoldTTL on a huge creation push,
+			// and an EXPIRED hold is ignored by concurrent reservers — a
+			// conflicting push could commit against a name the probe already
+			// cleared, after which a late-started refresher would revive our
+			// hold and the bulk-reserved hook would skip its commit-time
+			// guard. The synchronous first touch also refreshes the age the
+			// file accrued between the server's mint and this reservation.
+			// (Markers created below start fresh and are re-covered on the
+			// next tick; touchPushHold tolerates the sidecar not existing.)
+			defer startPushHoldRefresh(holdPath)()
+			// Verified-verdict persistence (Codex round-16 P2): each command
+			// whose REAL evaluation just passed is recorded, so its update
+			// hook consumes the verdict with an O(log n) lookup instead of
+			// charging the per-evaluation verify fee again — with a small
+			// CODESTORAGE_VERIFY_SIG_BUDGET, a same-tip fanout of N gated
+			// refs costs ~N+1 fee units here, and hooks re-charging another N
+			// pushed a fully compliant push past the walk allowance. Inputs
+			// are identical (same push, same policy env, same shas), so the
+			// hook-side verdict could only repeat this one. An UNLIMITED
+			// budget (0) writes no verdicts — hook re-evaluation cannot
+			// exhaust a limitless allowance. Bounded budgets persist EVERY
+			// pass in one sorted digest file (round-18 P2 bounded the former
+			// per-verdict inodes with a cap; round-19 P2: verdicts dropped at
+			// that cap re-charged exactly the fanouts big enough to need
+			// them). Written HERE, after the reservation exists and its
+			// refresher is running (Codex round-23 P2): the sidecar ages on
+			// the hold's clock only once the refresher covers it, and the
+			// pre-reservation authority probe above can outlast the TTL on a
+			// huge push — a sidecar written before it could be swept as
+			// expired by a concurrent push's mint before the first hook ever
+			// consumed a verdict.
+			if budget, err := verifySigBudget(); err != nil || budget > 0 {
+				var digests [][sha256.Size]byte
+				for i, ok := range sigVerified {
+					if !ok {
+						continue
+					}
+					c := commands[i]
+					digests = append(digests, pushVerifiedDigest(c.ref, c.old, c.new))
+				}
+				if err := writePushVerifiedVerdicts(holdPath, digests); err != nil {
+					return fmt.Errorf("pre-receive: record verified verdicts: %w", err)
+				}
+			}
+			// Atomic base check (Codex round-14 P1 on #173): every command's
+			// exact authority value must still match the client's declared old
+			// before ANY update hook can commit — under --atomic a
+			// mid-sequence CAS loss cannot retract the authority updates
+			// earlier hooks already committed, so git's abort of the local
+			// transaction would report the whole push failed while part of it
+			// stands in the authority. The check is sound HERE and only here:
+			// the reservation above now excludes same-name peer holds (covers
+			// semantics), so a held name's authority value is frozen against
+			// same-node writers from reservation until release — a stale base
+			// (say, a peer that committed while hydration deliberately left
+			// the git cache old) is caught before any CAS instead of
+			// mid-sequence. One push-proportional batch (refValuesProber);
+			// fail closed on store trouble. Cross-node racers remain the
+			// documented store-level TOCTOU residual. Non-atomic pushes keep
+			// git's per-ref semantics: an individual stale CAS loses alone.
+			if atomicPush {
+				refNames := make([]string, 0, len(commands))
+				for _, c := range commands {
+					refNames = append(refNames, c.ref)
+				}
+				values, err := authorityRefValues(ctx, probeStore, repo, refNames)
+				if err != nil {
+					return fmt.Errorf("pre-receive: atomic base check: %w", err)
+				}
+				for _, c := range commands {
+					switch got, exists := values[c.ref]; {
+					case c.old == ref.ZeroSHA && exists:
+						return atomicDenied(fmt.Errorf("%s already exists (created concurrently); fetch first", c.ref))
+					case c.old != ref.ZeroSHA && !exists:
+						return atomicDenied(fmt.Errorf("%s no longer exists (deleted concurrently); fetch first", c.ref))
+					case c.old != ref.ZeroSHA && got != c.old:
+						return atomicDenied(fmt.Errorf("%s moved concurrently (expected %.8s); fetch first", c.ref, c.old))
+					}
+				}
+			}
+			// Authority D/F probe for every bulk-reserved creation, run
+			// strictly AFTER the reservation landed — the only airtight probe
+			// point on this node (Codex rounds 7-11 lineage; round-11 P1
+			// closed the last ordering hole): a same-node conflicting creation
+			// can only CAS while holding its own reservation, and that
+			// reservation must have been RELEASED before ours landed (else we
+			// would still be waiting on it) — so a probe after our reservation
+			// observes every conflicting commit, including a racer that
+			// reserved, committed, and released entirely inside our
+			// probe-to-reservation window, which any pre-reservation probe
+			// (with or without waited-name tracking) misses. Doomed late
+			// losers: atomic pushes are denied WHOLE before any hook CAS
+			// (Codex round-8 P1); non-atomic ones are RELEASED from the hold
+			// file and diverted to the sidecar, so a doomed name squats on its
+			// existing D/F relatives' namespace only for the probe's
+			// round-trip, not the push window (the round-7 no-squat property),
+			// and its own hook's commit-time probe declines it. Creations
+			// only: updates and deletions cannot introduce a D/F pair. One
+			// push-proportional batch per probe (the dfConflictProber seam —
+			// rounds 8-14). Fail closed on store trouble. Cross-node racers
+			// remain the documented store-level TOCTOU residual. A
+			// delete-then-create D/F swap in ONE push still works: the
+			// creation is sidecar-diverted by the intra-push check above and
+			// self-reserves at hook time, after the deletion's CAS.
+			if len(reservedCreations) > 0 {
+				doomed, err := authorityDoomedCreations(ctx, probeStore, repo, reservedCreations)
+				if err != nil {
+					return fmt.Errorf("pre-receive: post-reservation authority D/F probe: %w", err)
+				}
+				if len(doomed) > 0 {
+					if atomicPush {
+						for _, c := range commands {
+							if derr, ok := doomed[c.ref]; ok {
+								return atomicDenied(derr)
+							}
+						}
+					}
+					release := make([]string, 0, len(doomed))
+					for name := range doomed {
+						unreserved = append(unreserved, name)
+						release = append(release, name)
+					}
+					if err := removePushHolds(holdPath, release); err != nil {
+						return fmt.Errorf("pre-receive: release doomed reservations: %w", err)
+					}
+				}
+			}
+			// The sidecar is bounded (Codex round-9 P2): unreserved membership
+			// is attacker-chosen — a crafted push can carry hundreds of
+			// thousands of tiny undeliverable commands under the byte cap, and
+			// each marker below costs one inode on the shared cache volume
+			// (plus crash-recovery sweep work). Real pushes carry at most a
+			// handful of denied or undeliverable commands, so a generous cap
+			// denies only crafted traffic; bulk mirror pushes are unaffected —
+			// their reservable refs share the single hold file. Checked twice:
+			// once above, BEFORE reservation, so a push that is already over
+			// the cap on pre-computable grounds (policy-denied, unupdatable,
+			// intra-push D/F) never reserves or probes at all (Codex round-12
+			// security P2), and once here for the probe's late additions.
+			if len(unreserved) > maxPushUnreserved {
+				return fmt.Errorf("pre-receive: push carries %d commands that cannot be bulk-reserved (policy-denied, undeliverable, or D/F-conflicted names); the limit is %d — drop those commands or split the push", len(unreserved), maxPushUnreserved)
+			}
+			// The (typically empty) remainder becomes one marker file per
+			// name in the sidecar directory, so an update hook's membership
+			// check is a single stat — absent means bulk-reserved, present
+			// means self-reserve before the CAS. Per-ref markers, not a
+			// listing file: allowed hooks re-reading a crafted push's large
+			// denied list would be O(allowed × denied) (Codex rounds 6+7
+			// P2s). Excluded from hold readers; the server removes it with
+			// the hold file, the TTL sweep covers leaks.
+			if len(unreserved) > 0 {
+				if err := os.MkdirAll(holdPath+pushHoldUnreservedSuffix, 0o755); err != nil {
+					return fmt.Errorf("pre-receive: record unreserved refs: %w", err)
+				}
+				for _, name := range unreserved {
+					if err := os.WriteFile(pushHoldUnreservedMarker(holdPath, name), nil, 0o600); err != nil {
+						return fmt.Errorf("pre-receive: record unreserved ref: %w", err)
+					}
+				}
+			}
+			return nil
+		}
+	}
+
 	var packFiles []string
 	if quarantine != "" {
 		var err error
@@ -180,20 +671,12 @@ func preReceive(ctx context.Context) error {
 				return fmt.Errorf("pre-receive: no quarantined pack and unknown object %s for %s", c.new, c.ref)
 			}
 		}
-		// No pack means nothing can leak, but an atomic push still
-		// evaluates policy as a unit: git aborts every ref on the first
-		// update-hook denial anyway, and denying here keeps an allowed
-		// command's already-committed PG CAS (e.g. a delete that ran
-		// before the denied one) from durably surviving a push git
-		// reports as wholly failed — the issue #28 durable-CAS twist.
-		if atomicPush {
-			for _, c := range commands {
-				if err := enforceRefPolicy(ctx, repo, c.ref, c.old, c.new); err != nil {
-					return atomicDenied(err)
-				}
-			}
-		}
-		return nil
+		// No pack means nothing can leak. The atomic whole-push policy
+		// denial (issue #28's durable-CAS twist) already happened above,
+		// before the hold reservation, from the shared verdicts. The
+		// reservation still must happen — delete-only and stored-object
+		// pushes run update hooks like any other.
+		return reserveHoldsAndProbe()
 	}
 
 	// Publication policy gate (issue #21, Codex security rounds): a pack
@@ -204,7 +687,8 @@ func preReceive(ctx context.Context) error {
 	// the pack could only become a registered, unreachable,
 	// quota-consuming blob, so the whole push is refused before any
 	// upload. The update hook stays the per-ref policy authority.
-	if err := preReceivePolicyGate(ctx, repo, commands, atomicPush); err != nil {
+	evalVerdicts()
+	if err := preReceivePolicyGate(commands, verdicts, atomicPush); err != nil {
 		return err
 	}
 
@@ -484,7 +968,318 @@ func preReceive(ctx context.Context) error {
 			return errors.Join(regErr, fmt.Errorf("pre-receive: verify %s: %w", p.Key, err))
 		}
 	}
-	return regErr
+	if regErr != nil {
+		return regErr
+	}
+	// Test seam (Codex round-23 security P2): pause between publication
+	// and the deferred hold reservation so the e2e lane can prove a
+	// concurrent push proceeds while this one is published but not yet
+	// reserved.
+	if testMode() {
+		if p := os.Getenv(EnvPreReceiveBarrier); p != "" {
+			pauseAtUpdateBarrier(p)
+		}
+	}
+	return reserveHoldsAndProbe()
+}
+
+// maxPushRefDepth caps the path depth of refs this server will commit.
+// Git imposes no limit, but no legitimate layout nests remotely this deep,
+// and depth is attacker-chosen amplification: the authority D/F probe
+// costs one point-read per ancestor segment (Codex round-5 security P2 on
+// #173 demonstrated a 3KB ref name with 1,502 segments = 1,502 store reads
+// per tiny push command). Deny-with-message keeps the bound explicit.
+const maxPushRefDepth = 32
+
+// maxPushRefSegmentBytes and maxPushRefNameBytes bound what the git files
+// backend can MATERIALIZE (Codex round-16 P1 on #173): git's own
+// check-ref-format accepts a 256-byte path component, but creating the
+// loose ref's ".lock" file then fails ENAMETOOLONG (NAME_MAX 255) only
+// AFTER the update hook's authority CAS committed — one non-atomic push
+// leaves an authority-only ref that every later hydration also fails to
+// write, wedging the repo. 200 leaves headroom under NAME_MAX for the
+// lock suffix; 900 bounds the name itself, and pushRefPathTooLong below
+// additionally bounds the WHOLE lock path against the actual repository
+// directory. Stricter than git's format rules by design: names past
+// these bounds are unrepresentable in the cache, so denying them loses
+// nothing (the parity oracle only requires accepted names to be
+// git-valid).
+const (
+	maxPushRefSegmentBytes = 200
+	maxPushRefNameBytes    = 900
+)
+
+// pushRefSegmentNameMax is the HARD per-component limit (Linux NAME_MAX):
+// the boundary at which the git files backend cannot represent the path
+// at all, as opposed to the conservative policy caps above. Deletions are
+// held only to this (see pushRefDeletable) so legacy refs between the
+// policy caps and the hard limit stay deletable.
+const pushRefSegmentNameMax = 255
+
+// pushRefPathMax is the TARGET OS's PATH_MAX budget for the deepest path
+// git materializes for a pushed ref: the loose lock file
+// `<repository dir>/<ref>.lock`. git resolves its git dir to an ABSOLUTE
+// path at startup, so the operator-chosen --cache-dir depth counts
+// against this budget (Codex round-21 P2 on #173: a fixed name cap alone
+// cannot see the cache root — under a deep root a name inside the static
+// caps still wedges: the authority CAS commits, then receive-pack's
+// local update fails "cannot lock ref", leaving an authority-only ref;
+// reproduced against real git in the e2e pin). Derived from the compiled
+// OS ABI, not hard-coded to Linux's 4096 (Codex round-24 security P2):
+// Darwin's PATH_MAX is 1024, so a name accepted under the Linux budget
+// could still wedge a macOS local-mode deployment the same way.
+const pushRefPathMax = unix.PathMax
+
+// pushRefPathTooLong reports whether materializing name under a
+// repository directory of repoDirLen bytes could exceed pushRefPathMax:
+// `<repoDir>/<name>.lock` plus the terminating NUL.
+func pushRefPathTooLong(repoDirLen, nameLen int) bool {
+	return repoDirLen+1+nameLen+len(".lock")+1 > pushRefPathMax
+}
+
+// pushRepoDirLen is the hook process's repository directory length: git
+// runs hooks with the (absolute) git dir as working directory. Cached —
+// hooks never chdir. Unavailable (0) fails OPEN to the static caps
+// alone; the hook environment always has a working directory in
+// practice, and failing closed here would deny every push on a Getwd
+// hiccup.
+var pushRepoDirLen = sync.OnceValue(func() int {
+	wd, err := os.Getwd()
+	if err != nil {
+		return 0
+	}
+	return len(wd)
+})
+
+// maxPushUnreserved caps how many of one push's commands may land in the
+// unreserved sidecar (one marker inode each — see preReceive). Membership
+// is attacker-chosen: policy-denied, unupdatable, or D/F-conflicted names
+// cost the client nothing but bound server-side inode and sweep work, so
+// the cap fails crafted pushes closed while staying far above any real
+// push's denied-command count. Bulk-RESERVABLE refs (mirror pushes) are
+// not counted — they share the single hold file.
+const maxPushUnreserved = 1024
+
+// pushRefUpdatable reports whether receive-pack could ever commit name on
+// this server: a properly namespaced ref (refs/<ns>/<name>...) of bounded
+// depth that git itself considers well-formed. Namespace ROOTS (e.g. the
+// literal refs/heads) matter for security (Codex round-5 security P2): git
+// hands them to pre-receive but can never complete their local update in a
+// cache repo (the namespace directory always exists), so reserving one
+// would let a restricted token hold a D/F ancestor of EVERY ref in that
+// namespace for the push window. Used to filter reservations and,
+// fail-closed, to deny such names in the update hook — where the depth cap
+// also bounds the authority D/F probe's per-ref work.
+//
+// The format rules mirror git's check_refname_format EXACTLY (Codex
+// round-9 P1): the atomic whole-push gate leans on this predicate being at
+// least as strict as receive-pack's own funny-refname check, which runs
+// per-command AFTER earlier commands' update hooks — and their authority
+// CASes — already committed. A name this predicate accepts but git later
+// rejects aborts the local atomic transaction with the authority moved.
+// (Stricter-than-git would instead deny representable pushes, so parity is
+// verified against `git check-ref-format` in the unit tests.)
+func pushRefUpdatable(name string) bool {
+	if !pushRefDeletable(name) {
+		return false
+	}
+	// (pushRefDeletable already enforced the HARD limits: NAME_MAX per
+	// component, ".lock" headroom on the final one, and the whole-lock-
+	// path PATH_MAX budget against the actual repository directory.)
+	if len(name) > maxPushRefNameBytes { // static PATH_MAX headroom
+		return false
+	}
+	segs := strings.Split(name, "/")
+	if len(segs) > maxPushRefDepth {
+		return false
+	}
+	for _, seg := range segs {
+		if len(seg) > maxPushRefSegmentBytes { // filesystem NAME_MAX headroom
+			return false
+		}
+	}
+	return true
+}
+
+// pushRefDeletable is the format-and-namespace half of pushRefUpdatable,
+// WITHOUT the POLICY bounds (the depth cap and the conservative byte
+// caps). Deletions are gated on this weaker predicate (Codex round-18 P2
+// on #173): a repository can already hold a git-valid ref past today's
+// caps — created before the caps existed, or imported by sync from a
+// permissive upstream — and a deletion adds no name and runs no authority
+// D/F probe, so refusing it would make exactly those legacy refs
+// permanently undeletable through git.
+//
+// The HARD filesystem lock-path limits still apply (Codex round-23 P2):
+// git deletes through <name>.lock too — update-ref -d creates the lock
+// before unlinking, so a ref whose loose path fits but whose lock path
+// does not (a 251-byte final component, or PATH_MAX overflow under a deep
+// cache root) passes check-ref-format yet can NEVER be locally deleted by
+// git (verified against real git: "File name too long"). Letting its
+// update hook commit the authority deletion would tell the client the
+// deletion failed while the authority durably dropped it — and no later
+// hydration could remove the stale cache ref either, for the same lock
+// reason. Such refs were never git-deletable anywhere; denying them
+// pre-CAS loses nothing.
+func pushRefDeletable(name string) bool {
+	rest, ok := strings.CutPrefix(name, "refs/")
+	if !ok || !strings.Contains(rest, "/") {
+		return false
+	}
+	if strings.HasSuffix(name, ".") { // git: a refname cannot end with a dot
+		return false
+	}
+	segs := strings.Split(name, "/")
+	for i, seg := range segs {
+		if !gitRefSegmentValid(seg) {
+			return false
+		}
+		// Filesystem NAME_MAX (255): intermediate segments are directory
+		// names; the final segment must also carry the ".lock" suffix.
+		limit := pushRefSegmentNameMax
+		if i == len(segs)-1 {
+			limit -= len(".lock")
+		}
+		if len(seg) > limit {
+			return false
+		}
+	}
+	// The whole lock path must fit PATH_MAX against the ACTUAL repository
+	// directory (round-21 P2 established the budget for creations).
+	return !pushRefPathTooLong(pushRepoDirLen(), len(name))
+}
+
+// pushCommandUpdatable applies the right name gate for one command:
+// deletions need only format validity, everything else also passes the
+// materialization bounds.
+func pushCommandUpdatable(refName, old, new string) bool {
+	if old != ref.ZeroSHA && new == ref.ZeroSHA {
+		return pushRefDeletable(refName)
+	}
+	return pushRefUpdatable(refName)
+}
+
+// dfConflictProber is the batched authority D/F probe seam (Codex
+// round-13 P2/security P2 on #173): probe work must be proportional to the
+// PUSH and indexed on the store, never repo-scaled — the probe runs while
+// the push's namespace holds block conflicting same-node writers. Every
+// production ref store implements it (PG: two round trips of indexed
+// seeks; SQLite: one call of local indexed seeks; s3wal: the single
+// manifest read every access pays anyway), compile-asserted so a store
+// change cannot silently regress pushes to the per-name fallback.
+type dfConflictProber interface {
+	DFConflicts(ctx context.Context, repo string, names []string) (map[string]string, error)
+}
+
+var (
+	_ dfConflictProber = (*ref.PG)(nil)
+	_ dfConflictProber = (*ref.SQLite)(nil)
+	_ dfConflictProber = (*ref.S3WAL)(nil)
+)
+
+// refValuesProber is the batched authority exact-value probe seam for the
+// atomic-push base check (Codex round-14 P1 on #173) — the same
+// push-proportional contract as dfConflictProber. Every production ref
+// store implements it (PG/SQLite: indexed membership reads; s3wal: the
+// single manifest read every access pays anyway), compile-asserted so a
+// store change cannot silently regress atomic pushes to per-name reads.
+type refValuesProber interface {
+	RefValues(ctx context.Context, repo string, names []string) (map[string]string, error)
+}
+
+var (
+	_ refValuesProber = (*ref.PG)(nil)
+	_ refValuesProber = (*ref.SQLite)(nil)
+	_ refValuesProber = (*ref.S3WAL)(nil)
+)
+
+// authorityRefValues returns the authority's current sha for each of the
+// named refs, omitting absent ones. Production stores answer through the
+// batched refValuesProber seam; stores without it (test fakes, foreign
+// decorators) fall back to per-name GetRef point-reads — acceptable there
+// because atomic pushes bound names by the client's command list. Store
+// errors fail the whole probe; callers fail closed.
+func authorityRefValues(ctx context.Context, st ref.RefStore, repo string, names []string) (map[string]string, error) {
+	if prober, ok := st.(refValuesProber); ok {
+		return prober.RefValues(ctx, repo, names)
+	}
+	out := make(map[string]string, len(names))
+	for _, name := range names {
+		switch sha, err := st.GetRef(ctx, repo, name); {
+		case err == nil:
+			out[name] = sha
+		case errors.Is(err, ref.ErrNotFound):
+			// absent: omitted
+		default:
+			return nil, fmt.Errorf("authority value probe for %s: %w", name, err)
+		}
+	}
+	return out, nil
+}
+
+// gitRefSegmentValid mirrors git's check_refname_component (refs.c) for one
+// slash-separated segment: no empty segments (this also rejects leading,
+// trailing, and doubled slashes), no segment starting with "." or ending
+// with ".lock", no ".." or "@{" sequences, and none of git's forbidden
+// bytes — ASCII controls, DEL, space, "~^:?*[\". A trailing "." is legal
+// for a NON-final segment ("refs/heads/foo./bar" is git-valid); the final
+// segment's trailing dot is the whole-name rule checked by the caller.
+func gitRefSegmentValid(seg string) bool {
+	if seg == "" || seg[0] == '.' || strings.HasSuffix(seg, ".lock") {
+		return false
+	}
+	var last byte
+	for i := 0; i < len(seg); i++ {
+		c := seg[i]
+		switch {
+		case c < 0x20 || c == 0x7f || c == ' ' || c == '~' || c == '^' ||
+			c == ':' || c == '?' || c == '*' || c == '[' || c == '\\':
+			return false
+		case c == '.' && last == '.':
+			return false
+		case c == '{' && last == '@':
+			return false
+		}
+		last = c
+	}
+	return true
+}
+
+// atomicPushDFCheck denies an ATOMIC push whose command set cannot land in
+// one git ref transaction (Codex round-3 P1 on #173): under --atomic every
+// update hook's authority CAS commits before git discovers the local D/F
+// collision and aborts the whole transaction, leaving the authority with
+// refs the client was told failed. Any strict-prefix pair is fatal unless
+// both sides are deletions (the end state has neither; git's files backend
+// cannot even reorder a delete+create D/F swap inside one transaction —
+// see syncRefsStreamed's D/F ordering note). Non-atomic pushes are NOT
+// checked: git's per-ref semantics apply, and the update hook's authority
+// probe declines exactly the losing ref at commit time (Codex round-7 P2:
+// a whole-push denial here would reject an allowed child whose denied
+// parent never survives).
+func atomicPushDFCheck(commands []refCommand) error {
+	isDelete := make(map[string]bool, len(commands))
+	names := make([]string, 0, len(commands))
+	for _, c := range commands {
+		isDelete[c.ref] = c.new == ref.ZeroSHA
+		names = append(names, c.ref)
+	}
+	set := newPushHoldSet(names)
+	for _, c := range commands {
+		// Strict directory ancestors of c.ref within the command set;
+		// checking ancestors alone visits every conflicting pair once.
+		for i := 0; i < len(c.ref); i++ {
+			if c.ref[i] != '/' || !set.contains(c.ref[:i]) {
+				continue
+			}
+			ancName := c.ref[:i]
+			if isDelete[ancName] && isDelete[c.ref] {
+				continue
+			}
+			return fmt.Errorf("refs %s and %s conflict (directory/file) in one atomic transaction; drop --atomic or split the push", ancName, c.ref)
+		}
+	}
+	return nil
 }
 
 // preReceivePolicyGate refuses pack publication unless it is justified:
@@ -529,13 +1324,19 @@ func preReceive(ctx context.Context) error {
 //     branch). The quota bounds per-repo growth; it cannot police
 //     intra-repo goodwill among authorized writers. Retained-byte
 //     reclamation is issue #31's accounting work.
-func preReceivePolicyGate(ctx context.Context, repo string, commands []refCommand, atomicPush bool) error {
+func preReceivePolicyGate(commands []refCommand, verdicts []error, atomicPush bool) error {
 	assertf(len(commands) > 0, "preReceivePolicyGate: no commands")
+	assertf(len(verdicts) == len(commands), "preReceivePolicyGate: %d verdicts for %d commands", len(verdicts), len(commands))
 	var firstErr error
 	needsPack := false
-	for _, c := range commands {
-		if err := enforceRefPolicy(ctx, repo, c.ref, c.old, c.new); err != nil {
+	for i, c := range commands {
+		// Verdicts are the caller's single shared policy evaluation
+		// (Codex round-4 P2 on #173: re-evaluating here double-charged
+		// the push's verify-sig walk budget).
+		if err := verdicts[i]; err != nil {
 			if atomicPush {
+				// Defensive: preReceive already denied atomic pushes
+				// carrying any denial before reserving holds.
 				return atomicDenied(err)
 			}
 			if firstErr == nil {
@@ -564,7 +1365,7 @@ func atomicDenied(err error) error {
 // updateHook enforces the JWT ref policy (first-match-wins), then performs
 // the PG CAS. Exit != 0 makes git report a per-ref `ng` with our stderr
 // message; git only updates the local cache ref for winners.
-func updateHook(ctx context.Context, args []string) error {
+func updateHook(ctx context.Context, args []string) (retErr error) {
 	// Hook args are handed over by git per ref update; validate instead of
 	// asserting so a malformed invocation denies the update, never panics
 	// (CASRef below asserts well-formed SHAs).
@@ -578,10 +1379,137 @@ func updateHook(ctx context.Context, args []string) error {
 	if !ref.ValidSHA(old) || !ref.ValidSHA(new) {
 		return fmt.Errorf("update: malformed sha for %s", refName)
 	}
+	// Names this server will never commit are denied outright: namespace
+	// roots cannot complete their local update anyway, and the depth cap
+	// bounds the authority D/F probe below to maxPushRefDepth point-reads
+	// per created ref — ref depth is attacker-chosen amplification against
+	// the shared store otherwise (Codex round-5 security P2 on #173).
+	// Deletions skip the materialization bounds (round-18 P2): legacy
+	// over-bound refs must stay deletable.
+	if !pushCommandUpdatable(refName, old, new) {
+		return fmt.Errorf("update: ref name %s is not updatable here (namespace root, git-invalid or unmaterializable name, or deeper than %d segments)", refName, maxPushRefDepth)
+	}
 	repo := mustEnv(EnvRepo)
 
-	if err := enforceRefPolicy(ctx, repo, refName, old, new); err != nil {
-		return err
+	// Push hold, refresher half (issue #170): keep the shared hold file
+	// fresh across this hook's FULL runtime — pre-CAS policy/fence work
+	// and unbounded post-CAS decorator work alike, because in an atomic
+	// push an EARLIER hook's committed CAS relies on later hooks keeping
+	// the file fresh until git's final local transaction (Codex round-2
+	// P2 on #173).
+	holdPath := os.Getenv(EnvPushHold)
+	if holdPath != "" {
+		defer startPushHoldRefresh(holdPath)()
+		// Release this hook's ref from the shared hold on ANY denial
+		// below (Codex round-16 P2 for sidecar self-reservations;
+		// round-19 P2 extends the release to bulk-reserved names: the
+		// reservation classifier deliberately reserves no-force-push
+		// updates without the ancestry subprocess, so a non-fast-forward
+		// update is denied only HERE, pre-CAS — bundled with slow allowed
+		// work it would otherwise keep the protected name held for the
+		// push's whole duration, timing out exactly the legitimate
+		// fast-forwards no-force-push exists to protect). Sound because a
+		// denied command commits nothing: every error return below
+		// precedes the CAS, whose only successful continuation is the
+		// test barrier and `return nil`. Best-effort: a failed release
+		// leaves the pre-fix until-exit hold, and the denial itself still
+		// stands. Removing a name the hold never listed (a sidecar
+		// command denied before its self-reservation) is a no-op rewrite.
+		//
+		// Under --atomic one denial dooms the WHOLE push, so it releases
+		// the whole hold (Codex round-27 P2): git aborts the local
+		// transaction and never runs post-receive — the primary release —
+		// leaving only the handler's fallback, which fires after
+		// receive-pack's report drain, a write a non-reading client can
+		// stall indefinitely while the handler refresher keeps the hold
+		// fresh. Earlier hooks' committed authority CASes would then
+		// block every same-name and D/F-relative push until the client
+		// went away. Releasing here is safe on both sides: committed
+		// values are durable and hydration applying them can no longer
+		// collide with a local transaction git has abandoned, and
+		// not-yet-committed names have nothing to protect (their hooks
+		// never run — and if one somehow did, its bulk-reservation check
+		// fails closed on the missing hold file).
+		defer func() {
+			if retErr == nil {
+				return
+			}
+			if os.Getenv(EnvAtomic) == "1" {
+				removePushHoldFiles(holdPath)
+				return
+			}
+			_ = removePushHolds(holdPath, []string{refName})
+		}()
+	}
+
+	// Verified verdict (Codex round-16 P2): pre-receive already ran the
+	// FULL policy evaluation for this exact (ref, old, new) — same push,
+	// same policy env — and it passed; re-evaluating here could only
+	// repeat the verdict while charging the shared verify-sig walk budget
+	// another per-evaluation fee, failing large compliant same-tip
+	// fanouts under small budgets. Any lookup trouble falls back closed
+	// to a real evaluation.
+	sigVerified := false
+	if holdPath != "" {
+		sigVerified = pushVerifiedVerdict(holdPath, refName, old, new)
+	}
+	if !sigVerified {
+		if err := enforceRefPolicy(ctx, repo, refName, old, new); err != nil {
+			return err
+		}
+	}
+
+	// Push hold, reservation half: ensure THIS ref is held before its CAS
+	// can commit, independent of pre-receive's verdicts (Codex round-5 P2
+	// on #173: a command transiently policy-denied in pre-receive — and
+	// therefore not bulk-reserved — can still be allowed by the check
+	// above and would otherwise commit unheld, reopening the hydrate
+	// race). Placed strictly AFTER this hook's own policy check so a
+	// genuinely denied ref still cannot hold anything (the round-3
+	// namespace-squatting property).
+	//
+	// O(1) in the common case (Codex round-6 P2: a per-ref peer scan goes
+	// quadratic across concurrent high-fanout pushes): pre-receive
+	// bulk-reserved every updatable, reservation-allowed ref before any
+	// hook ran and recorded the remainder in the sidecar — no sidecar
+	// means this ref is already held, and only sidecar-listed refs (the
+	// rare divergence case) pay the full atomic check+reserve.
+	bulkReserved := false
+	if holdPath != "" {
+		// Just-in-time reservations (Codex round-25 P2): a no-force-push
+		// UPDATE was deliberately neither bulk-reserved nor
+		// sidecar-marked — its reservability needed the ancestry check
+		// that just passed above. Re-derived budget-free from the same
+		// policy env pre-receive classified with (no subprocess), so the
+		// two verdicts cannot diverge.
+		jit := errors.Is(evalRefPolicy(ctx, repo, refName, old, new, false), errReservationNeedsAncestry)
+		switch _, err := os.Stat(pushHoldUnreservedMarker(holdPath, refName)); {
+		case errors.Is(err, os.ErrNotExist) && !jit:
+			// Bulk-reserved (no sidecar, or this ref not marked); verify
+			// the reservation file actually exists (fail closed, one
+			// stat).
+			if _, err := os.Stat(holdPath); err != nil {
+				return fmt.Errorf("update: push hold reservation missing (pre-receive owns it): %w", err)
+			}
+			bulkReserved = true
+		case err != nil && !errors.Is(err, os.ErrNotExist):
+			return fmt.Errorf("update: check unreserved marker: %w", err)
+		default:
+			// Sidecar-marked, or a just-in-time no-force reservation.
+			// A denial after this self-reservation releases it via the
+			// shared deferred release above (Codex round-16 P2): a
+			// sidecar-listed creation denied by the commit-time D/F probe
+			// (or fence, or CAS loss) commits nothing, yet its name would
+			// otherwise stay held until the whole receive-pack exits — a
+			// doomed parent bundled into a large push squats its existing
+			// relatives' namespace for the push's full duration, timing
+			// out their legitimate updates. On success the reservation is
+			// kept through the CAS, the local update, and receive-pack
+			// exit, exactly like bulk holds.
+			if err := reservePushHolds(ctx, holdPath, []string{refName}); err != nil {
+				return fmt.Errorf("update: reserve push hold: %w", err)
+			}
+		}
 	}
 	// Sync claim fence (issue #86): a loopback sync push carries its
 	// run's claim-holder token. The precheck refuses obviously-stale
@@ -611,6 +1539,43 @@ func updateHook(ctx context.Context, args []string) error {
 		return err
 	}
 	defer st.Close()
+	// Authority-side directory/file guard (Codex round-4 P1 on #173, and
+	// the pre-existing divergence class beneath it): the CAS below is
+	// keyed by the exact ref name, so nothing in the store itself stops
+	// refs/heads/a and refs/heads/a/b from coexisting in the authority —
+	// a state no git ref store can materialize, which wedges every future
+	// hydration of the repo. Pre-receive's checks are advisory (policy
+	// verdicts there cannot perfectly predict this hook's), so the commit
+	// point itself verifies against the AUTHORITY's current refs: a
+	// CREATION whose strict D/F relative exists is declined per-ref,
+	// exactly like a policy denial.
+	//
+	// Creations only (Codex round-5 P1: on s3wal every probe read is a
+	// manifest fetch, so update-heavy fanout pushes must not pay it):
+	// updates and deletions never change the authority's NAME SET, so if
+	// the no-strict-D/F-pair invariant held before them it holds after —
+	// only a creation adds a name and needs the probe. Probing costs the
+	// created ref O(path depth) point-reads; its own CAS chain already
+	// pays manifest round-trips of the same order on s3wal.
+	//
+	// Skipped for bulk-reserved refs (Codex round-8 security P2): those
+	// already passed pre-receive's batch authority probe, the hold has
+	// serialized same-node D/F writers ever since, and re-probing here
+	// would re-pay per-creation manifest reads on s3wal. Sidecar refs
+	// (pre-receive could not vouch) and hookless invocations keep the
+	// commit-time probe.
+	//
+	// Probed on the raw store: the test fault decorators below must keep
+	// scoping to the CAS itself. TOCTOU residual: conflicting creations
+	// racing from different NODES (or API ref writes) can still cross
+	// inside the probe-to-CAS window — for bulk-reserved refs that window
+	// is pre-receive-probe-to-CAS; closing it needs store-level
+	// transactional enforcement and is tracked outside this fix.
+	if old == ref.ZeroSHA && new != ref.ZeroSHA && !bulkReserved {
+		if err := denyAuthorityDFConflict(ctx, st, repo, refName); err != nil {
+			return err
+		}
+	}
 	var inner ref.RefStore = st
 	if testMode() {
 		inner = injectCASDrop(inner)
@@ -623,6 +1588,160 @@ func updateHook(ctx context.Context, args []string) error {
 	}
 	if !won {
 		return fmt.Errorf("CAS conflict: %s moved concurrently (expected %.8s)", refName, old)
+	}
+	// Test seam (issue #170): pause between the committed authority CAS and
+	// receive-pack's local ref update so the e2e lane can deterministically
+	// interleave a concurrent hydrate into that window.
+	if testMode() {
+		if p := os.Getenv(EnvUpdateBarrier); p != "" {
+			pauseAtUpdateBarrier(p)
+		}
+	}
+	return nil
+}
+
+// pauseAtUpdateBarrier implements the EnvUpdateBarrier handshake: the first
+// invocation to create <p>.ready owns the pause and polls for <p>.release;
+// later invocations pass through (O_EXCL one-shot, like injectCASDrop). The
+// wait is bounded so a broken test wedges nothing.
+func pauseAtUpdateBarrier(p string) {
+	f, err := os.OpenFile(p+".ready", os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+	if err != nil {
+		return // barrier already consumed
+	}
+	_ = f.Close()
+	for deadline := time.Now().Add(30 * time.Second); time.Now().Before(deadline); {
+		if _, err := os.Stat(p + ".release"); err == nil {
+			return
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+}
+
+// authorityDoomedCreations reports which of the created names are doomed
+// by a strict D/F relative existing in the authority. Production stores
+// answer through the batched dfConflictProber seam — push-proportional,
+// indexed work in a fixed number of store calls (Codex rounds 8-13
+// lineage: per-name manifest fetches, repo-wide paged scans, and
+// per-creation seek storms were each rejected in turn; the batch probe is
+// the terminal shape). Stores without the seam (test fakes, foreign
+// decorators) fall back to deduped ancestor point-reads plus a
+// decorated-order seek-merge of single-row ListRefsAfter probes.
+//
+// Decorated order in the fallback is load-bearing (compare
+// s3walEachBaseCoverOrder): bytes like '.' sort below '/', so RAW-sorted
+// creations ("refs/heads/a" before "refs/heads/a.b") have NON-monotonic
+// range starts, and a skip window carried across them would silently skip
+// a real conflict.
+//
+// Store errors fail the whole probe; callers fail closed.
+func authorityDoomedCreations(ctx context.Context, st ref.RefStore, repo string, names []string) (map[string]error, error) {
+	doomed := map[string]error{}
+	if len(names) == 0 {
+		return doomed, nil
+	}
+	deny := func(created, existing string) {
+		if _, dup := doomed[created]; !dup {
+			doomed[created] = fmt.Errorf("%s conflicts with existing ref %s (directory/file); delete %s first", created, existing, existing)
+		}
+	}
+	if prober, ok := st.(dfConflictProber); ok {
+		conflicts, err := prober.DFConflicts(ctx, repo, names)
+		if err != nil {
+			return nil, fmt.Errorf("directory/file batch probe: %w", err)
+		}
+		for created, existing := range conflicts {
+			deny(created, existing)
+		}
+		return doomed, nil
+	}
+	// Ancestor arm, memoized across the set.
+	ancestor := map[string]bool{} // strict prefix -> exists in authority
+	for _, name := range names {
+		for i := 0; i < len(name); i++ {
+			if name[i] != '/' {
+				continue
+			}
+			anc := name[:i]
+			exists, probed := ancestor[anc]
+			if !probed {
+				switch _, err := st.GetRef(ctx, repo, anc); {
+				case err == nil:
+					exists = true
+				case errors.Is(err, ref.ErrNotFound):
+					exists = false
+				default:
+					return nil, fmt.Errorf("directory/file probe for %s: %w", name, err)
+				}
+				ancestor[anc] = exists
+			}
+			if exists {
+				deny(name, anc)
+				break
+			}
+		}
+	}
+	// Descendant arm: at most one single-row probe per creation, walked in
+	// decorated order so lo only moves forward.
+	sorted := append([]string(nil), names...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i]+"/" < sorted[j]+"/" })
+	lastKey := "" // when haveProbe: the authority's first key at or after the last probed lo
+	haveProbe := false
+	for _, n := range sorted {
+		lo := n + "/"
+		if haveProbe {
+			if strings.HasPrefix(lastKey, lo) {
+				deny(n, lastKey) // the witness key itself is a descendant
+				continue
+			}
+			// Any descendant of n lives in [n+"/", n+"0") ('/'+1 == '0'),
+			// and the last probe proved [prev lo, lastKey) empty; lo only
+			// grows in decorated order, so lastKey beyond the range means
+			// no descendants without a fresh probe.
+			if lastKey >= n+"0" {
+				continue
+			}
+		}
+		page, err := st.ListRefsAfter(ctx, repo, lo, 1)
+		if err != nil {
+			return nil, fmt.Errorf("directory/file probe for %s: %w", n, err)
+		}
+		if len(page) == 0 {
+			break // nothing at or after lo; later creations sit even higher
+		}
+		lastKey, haveProbe = page[0].Name, true
+		if strings.HasPrefix(lastKey, lo) {
+			deny(n, lastKey)
+		}
+	}
+	return doomed, nil
+}
+
+// denyAuthorityDFConflict declines a non-deletion update of name when the
+// authority currently contains a strict directory/file relative of it — a
+// strict ancestor (one GetRef point-read per path segment) or any
+// descendant (one single-row ListRefsAfter page at name+"/", the smallest
+// key any descendant can exceed). Store errors fail CLOSED: an unprobeable
+// authority is not proof of representability, and the denial is retryable.
+func denyAuthorityDFConflict(ctx context.Context, st ref.RefStore, repo, name string) error {
+	for i := 0; i < len(name); i++ {
+		if name[i] != '/' {
+			continue
+		}
+		anc := name[:i]
+		switch _, err := st.GetRef(ctx, repo, anc); {
+		case err == nil:
+			return fmt.Errorf("update: %s conflicts with existing ref %s (directory/file); delete %s first", name, anc, anc)
+		case !errors.Is(err, ref.ErrNotFound):
+			return fmt.Errorf("update: directory/file probe for %s: %w", name, err)
+		}
+	}
+	page, err := st.ListRefsAfter(ctx, repo, name+"/", 1)
+	if err != nil {
+		return fmt.Errorf("update: directory/file probe for %s: %w", name, err)
+	}
+	if len(page) > 0 && strings.HasPrefix(page[0].Name, name+"/") {
+		return fmt.Errorf("update: %s conflicts with existing ref %s (directory/file); delete %s first", name, page[0].Name, page[0].Name)
 	}
 	return nil
 }
@@ -703,25 +1822,172 @@ func injectCASDrop(st ref.RefStore) ref.RefStore {
 // branch-protection.md) for one ref update. The deprecated repo-wide `ops`
 // claim is folded in as a fallback exactly once, here at parse time.
 func enforceRefPolicy(ctx context.Context, repo, refName, old, new string) error {
+	return evalRefPolicy(ctx, repo, refName, old, new, true)
+}
+
+// reservationClass is the budget-free reservation filter's verdict about
+// one command (Codex rounds 6, 12, 13 on #173): allowed and denied are
+// final without touching the shared verify budget; needs-verify means the
+// command is signature-gated, so vouching for its reservation requires the
+// push's REAL verdicts (pre-receive evaluates them once in that case —
+// see preReceive — because flatly diverting signature-gated commands
+// breaks legitimate large signed fanout pushes at the sidecar cap, while
+// flatly allowing them lets unsigned pushers squat D/F namespaces).
+type reservationClass int
+
+const (
+	reservationAllowed reservationClass = iota
+	reservationDenied
+	reservationNeedsVerify
+	// reservationJIT defers the reservation to the command's own update
+	// hook (Codex round-25 P2): a no-force-push UPDATE's verdict needs
+	// the ancestry subprocess, which classification must never launch
+	// (round-14 security P2) — but bulk-reserving it on faith let a
+	// crafted push sort one doomed rewind of a protected name AFTER
+	// thousands of slow commands and keep the name held until its own
+	// hook finally ran the check, timing out exactly the legitimate
+	// fast-forwards no-force-push exists to protect. Such commands are
+	// neither bulk-reserved nor sidecar-diverted (no marker inode, no
+	// cap charge): their hooks re-derive this class from the same policy
+	// env and self-reserve just-in-time, strictly AFTER their own full
+	// policy check passed — a denied rewind never holds anything, and
+	// the reserve→CAS→local-update ordering the skip proof needs is
+	// exactly the sidecar path's.
+	reservationJIT
+)
+
+// errReservationNeedsSig is evalRefPolicy's budget-free sentinel for
+// signature-gated non-deletion commands: not a denial, but not a verdict
+// the reservation filter may trust without real verification.
+var errReservationNeedsSig = errors.New("signature-gated command needs real verification")
+
+// errReservationNeedsAncestry is the budget-free sentinel for
+// no-force-push UPDATES: reservable only just-in-time by the ref's own
+// hook, after the real ancestry check (see reservationJIT).
+var errReservationNeedsAncestry = errors.New("no-force-push update needs the ancestry check")
+
+func classifyReservation(repo, refName, old, new string) reservationClass {
+	switch err := evalRefPolicy(context.Background(), repo, refName, old, new, false); {
+	case err == nil:
+		return reservationAllowed
+	case errors.Is(err, errReservationNeedsSig):
+		return reservationNeedsVerify
+	case errors.Is(err, errReservationNeedsAncestry):
+		return reservationJIT
+	default:
+		return reservationDenied
+	}
+}
+
+// reservationVerdicts resolves each NON-ATOMIC command to a final allowed
+// or denied reservation class. Every command is classified budget-free
+// first; only the signature-GATED remainder gets a real policy evaluation.
+// Gated commands cannot be vouched for budget-free (round-12 security P2:
+// assuming them allowed lets unsigned pushers squat D/F namespaces), but
+// flatly diverting them breaks legitimate large SIGNED fanout pushes at
+// the sidecar cap (round-13 P2) — so exactly they pay verification here:
+// valid signed refs bulk-reserve, invalid ones divert.
+// STRICTLY per-gated-command, never the push's full verdicts (Codex
+// round-15 P2): a mixed push carrying one gated ref plus thousands of
+// distinct no-force-push pairs must not launch one git merge-base per
+// ungated pair here — rounds 4+6 kept the no-pack path subprocess-free
+// for everything the budget-free classifier can already answer, and the
+// ungated commands' own update hooks enforce the real ancestry checks.
+// Real evaluations go through the caller's per-index memo (evalOne), so
+// the pack-path publication gate never re-fees them, and the returned
+// verified flags mark gated commands whose evaluation PASSED — the caller
+// persists those as verdict markers the update hooks consume without
+// charging the verify budget again (Codex round-16 P2). Commands the
+// caller already knows are undeliverable (updatable[i] == false) are
+// classified denied WITHOUT any evaluation (round-18 security P2: they
+// divert to the sidecar whatever the verdict, so a signature walk for
+// them is attacker-purchasable dead work).
+func reservationVerdicts(repo string, commands []refCommand, updatable []bool, evalOne func(int) error) (classes []reservationClass, verified []bool) {
+	assertf(len(updatable) == len(commands), "reservationVerdicts: %d updatable flags for %d commands", len(updatable), len(commands))
+	classes = make([]reservationClass, len(commands))
+	verified = make([]bool, len(commands))
+	for i, c := range commands {
+		if !updatable[i] {
+			classes[i] = reservationDenied
+			continue
+		}
+		classes[i] = classifyReservation(repo, c.ref, c.old, c.new)
+	}
+	for i := range commands {
+		if classes[i] != reservationNeedsVerify {
+			continue
+		}
+		if evalOne(i) != nil {
+			classes[i] = reservationDenied
+		} else {
+			classes[i] = reservationAllowed
+			verified[i] = true
+		}
+	}
+	return classes, verified
+}
+
+// refPolicyMemo caches the parsed and folded policy for one exact
+// (policyJSON, opsJSON) env pair (Codex round-30 P2 on #173): the
+// budget-free classifier runs once per command, and reparsing an
+// attacker-sized policy claim per command multiplies its size by the
+// push's command count in CPU and allocations before any update hook
+// runs. Hook processes see immutable env, so one entry suffices; keyed on
+// the raw strings so in-process tests that vary the env stay correct.
+// Callers only read the cached slice (auth.MatchPolicy), never mutate it.
+type refPolicyMemo struct {
+	policyJSON, opsJSON string
+	policies            []auth.RefPolicy
+	err                 error
+}
+
+var (
+	refPolicyCache  atomic.Pointer[refPolicyMemo]
+	refPolicyParses atomic.Int64 // test seam: real parse+fold computations
+)
+
+func loadRefPolicies(policyJSON, opsJSON string) ([]auth.RefPolicy, error) {
+	if m := refPolicyCache.Load(); m != nil && m.policyJSON == policyJSON && m.opsJSON == opsJSON {
+		return m.policies, m.err
+	}
+	refPolicyParses.Add(1)
+	m := &refPolicyMemo{policyJSON: policyJSON, opsJSON: opsJSON}
+	if policyJSON != "" {
+		m.policies, m.err = auth.ParseRefPolicies(policyJSON)
+		if m.err != nil {
+			m.err = fmt.Errorf("update: %w", m.err)
+		}
+	}
+	if m.err == nil && opsJSON != "" {
+		var ops []string
+		if err := json.Unmarshal([]byte(opsJSON), &ops); err != nil {
+			m.err = fmt.Errorf("update: parse ops claim %q: %w", opsJSON, err)
+		} else {
+			m.policies = auth.FoldOps(m.policies, ops)
+		}
+	}
+	refPolicyCache.Store(m)
+	return m.policies, m.err
+}
+
+// evalRefPolicy is the shared evaluator. fullEval=false is the budget-free
+// mode for the reservation classifier: it replaces signature verification
+// with a fail-unreservable verdict for non-deletion commands (callers must
+// not charge the shared verify-sig state and walk budget) and skips the
+// no-force-push ancestry subprocess (treating the update as reservable —
+// the ref's own update hook re-runs the full check before its CAS).
+// Classification must never launch subprocesses: its cost is
+// attacker-chosen via the push's command list (Codex round-14 security
+// P2).
+func evalRefPolicy(ctx context.Context, repo, refName, old, new string, fullEval bool) error {
 	policyJSON := os.Getenv(EnvRefsPolicy)
 	opsJSON := os.Getenv(EnvOps)
 	if policyJSON == "" && opsJSON == "" {
 		return nil
 	}
-	var policies []auth.RefPolicy
-	if policyJSON != "" {
-		var err error
-		policies, err = auth.ParseRefPolicies(policyJSON)
-		if err != nil {
-			return fmt.Errorf("update: %w", err)
-		}
-	}
-	if opsJSON != "" {
-		var ops []string
-		if err := json.Unmarshal([]byte(opsJSON), &ops); err != nil {
-			return fmt.Errorf("update: parse ops claim %q: %w", opsJSON, err)
-		}
-		policies = auth.FoldOps(policies, ops)
+	policies, err := loadRefPolicies(policyJSON, opsJSON)
+	if err != nil {
+		return err
 	}
 
 	// Ephemeral namespace quirk (branch-protection.md): a push through the
@@ -738,6 +2004,21 @@ func enforceRefPolicy(ctx context.Context, repo, refName, old, new string) error
 	if !ok {
 		return nil // unpoliced ref: allowed
 	}
+	// Budget-free sentinels are decided AFTER the loop, independent of the
+	// rule's op ORDER (Codex round-27 P2 on #173): a combined
+	// `["verify-sig", "no-force-push"]` rule used to return the signature
+	// sentinel first, classifying every update needs-verify — pre-receive
+	// then paid a REAL evaluation (signature walk plus the ancestry
+	// subprocess) for a whole crafted list of doomed rewinds before the
+	// sidecar cap could reject the push. The ancestry sentinel outranks
+	// the signature sentinel because a JIT command defers ALL of its
+	// evaluation to its own update hook (which runs the full check —
+	// signature included — before self-reserving), charging nothing in
+	// pre-receive and never touching the sidecar cap. Hard denials keep
+	// returning in op order; scanning the whole rule also means an op
+	// AFTER a would-be sentinel (an unknown op, a no-push) now denies
+	// budget-free instead of costing a doomed evaluation first.
+	var needsSig, needsAncestry bool
 	for _, op := range rule.Ops {
 		switch op {
 		case auth.OpNoPush:
@@ -754,18 +2035,55 @@ func enforceRefPolicy(ctx context.Context, repo, refName, old, new string) error
 				if new == ref.ZeroSHA {
 					return fmt.Errorf("policy no-force-push denies deletion of %s", refName)
 				}
+				// Budget-free callers (the reservation classifier) skip
+				// the ancestry subprocess (Codex round-14 security P2: a
+				// no-pack push advancing thousands of refs from DISTINCT
+				// old commits would otherwise launch one git merge-base
+				// per pair in pre-receive — the memo only dedupes
+				// identical pairs — on top of the one each update hook
+				// process pays anyway) and route the update to a
+				// JUST-IN-TIME reservation by its own hook (Codex
+				// round-25 P2: bulk-reserving it on faith let a doomed
+				// rewind, sorted last in a crafted push, squat the
+				// protected name through every earlier hook's runtime —
+				// its denial-release only fires once its own hook runs).
+				// The commit is still policed — the ref's own update
+				// hook re-runs this check with fullEval before its CAS,
+				// and reserves only if it passes.
+				if !fullEval {
+					needsAncestry = true
+					continue
+				}
 				if !isAncestor(old, new) {
 					return fmt.Errorf("policy no-force-push denies non-fast-forward update to %s", refName)
 				}
 			}
 		case auth.OpVerifySig:
-			if err := verifySig(ctx, refName, old, new); err != nil {
-				return err
+			if fullEval {
+				if err := verifySig(ctx, refName, old, new); err != nil {
+					return err
+				}
+			} else if new != ref.ZeroSHA {
+				// Budget-free callers (the reservation filter) cannot
+				// vouch for a signature-gated creation or update without
+				// real verification (Codex round-12 security P2: treating
+				// it as allowed would let a pusher WITHOUT a valid
+				// signing key bulk-reserve the name — a D/F namespace
+				// squat for the push window). The sentinel routes the
+				// caller to the push's REAL verdicts. Deletions introduce
+				// no commits, always pass verify-sig, and stay allowed.
+				needsSig = true
 			}
 		default:
 			// Unknown policy ops fail closed.
 			return fmt.Errorf("unknown policy op %q for %s", op, refName)
 		}
+	}
+	if needsAncestry {
+		return fmt.Errorf("%s: %w", refName, errReservationNeedsAncestry)
+	}
+	if needsSig {
+		return fmt.Errorf("%s: %w", refName, errReservationNeedsSig)
 	}
 	return nil
 }
@@ -1189,9 +2507,39 @@ func objectInMainStore(sha string) bool {
 	panic(fmt.Sprintf("githttp assertion failed: main-store cat-file -e %s: %v", sha, err))
 }
 
+// ancestryMemo caches isAncestor verdicts per (old, new) pair for this
+// process's lifetime (Codex round-11 security P2): pre-receive's policy
+// passes evaluate whole command lists, and a crafted non-atomic push
+// advancing thousands of refs between the SAME two commits under a
+// no-force-push policy would otherwise launch one git merge-base
+// subprocess per command — identical pairs now cost one. Never stale:
+// ancestry between two fixed SHAs is a property of the immutable,
+// content-addressed object graph, so no concurrent ref movement can
+// change a cached verdict. Update hooks are one process per ref and
+// evaluate a single pair, so they neither need nor abuse the memo.
+var (
+	ancestryMemoMu sync.Mutex
+	ancestryMemo   = map[[2]string]bool{}
+)
+
 // isAncestor reports whether old is an ancestor of new in the repo git put
 // us in (hooks run with cwd = bare repo root, GIT_DIR set by git).
 func isAncestor(old, new string) bool {
+	key := [2]string{old, new}
+	ancestryMemoMu.Lock()
+	got, ok := ancestryMemo[key]
+	ancestryMemoMu.Unlock()
+	if ok {
+		return got
+	}
+	got = isAncestorUncached(old, new)
+	ancestryMemoMu.Lock()
+	ancestryMemo[key] = got
+	ancestryMemoMu.Unlock()
+	return got
+}
+
+func isAncestorUncached(old, new string) bool {
 	cmd := exec.Command("git", "merge-base", "--is-ancestor", old, new)
 	err := cmd.Run()
 	if err == nil {

@@ -216,6 +216,12 @@ func cmdServe(ctx context.Context, args []string) error {
 	if err := os.MkdirAll(cfg.cacheDir, 0o755); err != nil {
 		return err
 	}
+	// Fail at boot, not mid-push (Codex round-25 P2 on #173): a cache
+	// root deep enough that push-hold bookkeeping paths would exceed the
+	// OS PATH_MAX must be an operator-visible configuration error.
+	if err := githttp.ValidateCacheDir(cfg.cacheDir); err != nil {
+		return err
+	}
 
 	// HTTP API (single-org self-host mode). The read endpoints share the
 	// ref/blob stores and cache dir with the githttp fallback below.

@@ -27,7 +27,7 @@ func syncFromMap(t *testing.T, repoPath string, want map[string]string, headTarg
 	}
 	sort.Strings(names)
 	newStore := func() refSeq { return &sliceRefSeq{names: names, shas: want} }
-	if err := syncRefsStreamed(context.Background(), repoPath, headTarget, newStore, batch); err != nil {
+	if _, err := syncRefsStreamed(context.Background(), repoPath, headTarget, newStore, batch); err != nil {
 		t.Fatalf("syncRefsStreamed(batch=%d): %v", batch, err)
 	}
 }

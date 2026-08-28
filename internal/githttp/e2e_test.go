@@ -85,6 +85,18 @@ var (
 )
 
 func TestMain(m *testing.M) {
+	// Hook re-exec dispatch: an in-process httptest server (see
+	// TestServiceRPC_ReleasesPushHoldBeforeRepackTrigger) hydrates cache
+	// repos whose hook scripts embed THIS test binary's path — route
+	// those invocations to the real hook entrypoint instead of the test
+	// runner (mirrors cmd/codestorage's "hook" dispatch).
+	if len(os.Args) > 1 && os.Args[1] == "hook" {
+		if err := RunHook(context.Background(), os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
 	if fuzzSkipEnvBoot(os.Args[1:]) {
 		os.Exit(m.Run())
 	}
