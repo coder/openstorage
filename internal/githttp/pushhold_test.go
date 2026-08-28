@@ -3022,6 +3022,78 @@ func TestEnsureCacheRepo_PreservesWrappedManagedHook(t *testing.T) {
 	}
 }
 
+// TestEnsureCacheRepo_PreservesSameLineWrapperAdditions (PR #195 round-4
+// P2): a wrapper can put its logic on the SAME line as the delegation
+// (`logger ...; /usr/bin/codestorage hook reference-transaction "$@" ||
+// exit 0`) — a suffix-only line check still classified that as managed
+// and clobbered it. The whole invocation line must be exactly the
+// optional historical `exec` plus one quoted executable plus the
+// delegation, nothing else.
+func TestEnsureCacheRepo_PreservesSameLineWrapperAdditions(t *testing.T) {
+	cacheDir := t.TempDir()
+	repoPath, err := EnsureCacheRepo(cacheDir, "t-reftx-sameline")
+	if err != nil {
+		t.Fatalf("EnsureCacheRepo: %v", err)
+	}
+	hookPath := filepath.Join(repoPath, "hooks", "reference-transaction")
+	wrapper := refTxHookGate +
+		`logger -t reftx "$1"; "/usr/local/bin/codestorage" hook reference-transaction "$@" || exit 0` + "\n"
+	if err := os.WriteFile(hookPath, []byte(wrapper), 0o755); err != nil {
+		t.Fatalf("write wrapper: %v", err)
+	}
+	cacheRepoMemos.Delete(repoPath)
+	if _, err := EnsureCacheRepo(cacheDir, "t-reftx-sameline"); err != nil {
+		t.Fatalf("EnsureCacheRepo second pass: %v", err)
+	}
+	b, err := os.ReadFile(hookPath)
+	if err != nil {
+		t.Fatalf("read hook: %v", err)
+	}
+	if string(b) != wrapper {
+		t.Fatalf("same-line wrapper additions must be preserved, got:\n%s", b)
+	}
+}
+
+// TestLivePushHoldsKey_SeesTombstones (PR #195 round-4 P2 ×2): tombstone
+// state must be part of the hold fingerprint. Two independent traces
+// demanded it: a denial's bump-then-append is two operations, so a
+// hydrate's pre-scan key could land between them and the append alone
+// left both bracketing keys equal; and a committed DELETION's tombstone
+// releases D/F coverage over a child another node validly created in the
+// authority the moment the deletion CASed — a stable marker would keep
+// suppressing the rescan that must materialize that child. The sidecar's
+// (size, mtime) now folds into the key — stat-only, from the same
+// directory listing — so any tombstone append invalidates held markers.
+func TestLivePushHoldsKey_SeesTombstones(t *testing.T) {
+	repoDir := t.TempDir()
+	dir := filepath.Join(repoDir, pushHoldDir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := bumpPushHoldEpoch(dir); err != nil {
+		t.Fatalf("seed epoch: %v", err)
+	}
+	hold := filepath.Join(dir, "push-del")
+	if err := os.WriteFile(hold, []byte("refs/heads/a\n"), 0o600); err != nil {
+		t.Fatalf("write hold: %v", err)
+	}
+	key1, ok := livePushHoldsKey(repoDir)
+	if !ok {
+		t.Fatal("livePushHoldsKey failed")
+	}
+	// The committed path: tombstone append with NO epoch bump.
+	if err := appendPushReleased(hold, []string{"refs/heads/a"}); err != nil {
+		t.Fatalf("append released: %v", err)
+	}
+	key2, ok := livePushHoldsKey(repoDir)
+	if !ok {
+		t.Fatal("livePushHoldsKey failed")
+	}
+	if key1 == key2 {
+		t.Fatal("a tombstone append must change the hold fingerprint")
+	}
+}
+
 // TestReapExpiredPushHold_RestoresTouchedHold (Codex round-31 P2 on
 // #173): the expiry verdict and the removal linearize at the quarantine
 // rename — an owner touch that preceded it is observed on the quarantined

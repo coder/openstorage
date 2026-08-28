@@ -458,8 +458,23 @@ func isManagedRefTxHook(content []byte) bool {
 	if !ok || rest != "" {
 		return false
 	}
-	return strings.HasSuffix(line, ` hook reference-transaction "$@" || exit 0`) ||
-		strings.HasSuffix(line, ` hook reference-transaction "$@"`)
+	// The invocation line must consist SOLELY of the optional historical
+	// `exec`, one quoted executable, and the delegation (PR #195 round-4
+	// P2): a suffix-only check classified same-line wrapper additions
+	// (`logger ...; "/usr/bin/codestorage" hook ...`) as managed and
+	// clobbered them.
+	line, cut := strings.CutSuffix(line, ` hook reference-transaction "$@" || exit 0`)
+	if !cut {
+		if line, cut = strings.CutSuffix(line, ` hook reference-transaction "$@"`); !cut {
+			return false
+		}
+	}
+	line = strings.TrimPrefix(line, "exec ")
+	if len(line) < 2 || line[0] != '"' {
+		return false
+	}
+	path, err := strconv.Unquote(line) // errors on any trailing bytes
+	return err == nil && path != ""
 }
 
 // ensureRefTxHook installs script at path when nothing exists there, and
@@ -2648,10 +2663,11 @@ func removePushHolds(holdPath string, names []string) error {
 // the flock may observe a mid-append subset — tombstones only ever grow,
 // so a missed suffix over-holds, the safe direction. The single write
 // keeps torn tails line-shaped at worst; a torn line matches no exact
-// name and over-holds. No epoch bump: the fingerprint is deliberately
-// blind to tombstones (design comment on #186) — committed names are
-// locally durable already, and a denied name's winning peer bumped the
-// store generation, which invalidates held markers on its own.
+// name and over-holds. No epoch bump here: the append itself is
+// fingerprint-VISIBLE — livePushHoldsKey folds the sidecar's (size,
+// mtime) into the key (PR #195 round-4 P2, revising the design comment's
+// original blindness plan) — so the one-write append is also the one
+// atomic visibility transition held markers need.
 func appendPushReleased(holdPath string, names []string) error {
 	var sb strings.Builder
 	for _, name := range names {
@@ -2823,6 +2839,21 @@ func livePushHoldsKey(repoPath string) (string, bool) {
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return "", false
 	}
+	// Tombstone sidecar stats fold into the key (PR #195 round-4 P2 ×2):
+	// a tombstone append IS a coverage change — a denial released between
+	// the two scans of one hydrate, or a committed DELETION whose hold
+	// was suppressing a newly authoritative D/F child — and a marker that
+	// cannot see it would keep vouching for skip verdicts the release
+	// invalidated. Same stat-only cost contract, same single listing as
+	// the holds themselves.
+	released := make(map[string]os.FileInfo)
+	for _, e := range entries {
+		if base, ok := strings.CutSuffix(e.Name(), pushHoldReleasedSuffix); ok && !e.IsDir() {
+			if info, err := e.Info(); err == nil {
+				released[filepath.Join(dir, base)] = info
+			}
+		}
+	}
 	for _, e := range entries {
 		if isPushHoldSidecar(e.Name()) || e.IsDir() {
 			continue
@@ -2838,7 +2869,11 @@ func livePushHoldsKey(repoPath string) (string, bool) {
 		if !pushHoldLive(path, info.ModTime()) {
 			continue
 		}
-		fmt.Fprintf(&key, "%s\x00%d\x00%d\x01", path, info.Size(), info.ModTime().UnixNano())
+		relSize, relMtime := int64(-1), int64(-1)
+		if ri, ok := released[path]; ok {
+			relSize, relMtime = ri.Size(), ri.ModTime().UnixNano()
+		}
+		fmt.Fprintf(&key, "%s\x00%d\x00%d\x00%d\x00%d\x01", path, info.Size(), info.ModTime().UnixNano(), relSize, relMtime)
 	}
 	// The closing seqlock read (round-35 P2, see above): any epoch bump
 	// that landed between the two reads means the listing may belong to
