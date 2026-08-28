@@ -484,9 +484,18 @@ func isManagedRefTxHook(content []byte) bool {
 	rest, ok := strings.CutPrefix(string(content), refTxHookGate)
 	if !ok {
 		rest, ok = strings.CutPrefix(string(content), refTxHookGateV1)
-		if !ok {
-			return false
-		}
+	}
+	if !ok {
+		// The original, ungated generation (the plain enforcement-hook
+		// template): shebang plus one delegated-invocation line, nothing
+		// else (PR #195 round-13 P1). An operator script of this exact
+		// shape is indistinguishable by construction — and refreshing it
+		// preserves its whole observable behavior (it already delegated
+		// everything to the binary) while adding the cost gates.
+		rest, ok = strings.CutPrefix(string(content), "#!/bin/sh\n")
+	}
+	if !ok {
+		return false
 	}
 	line, rest, ok := strings.Cut(rest, "\n")
 	if !ok || rest != "" {
@@ -610,6 +619,13 @@ func ensureRefTxHook(path, script string) (os.FileInfo, error) {
 			}
 			return nil, err
 		}
+		// Drop the temp NAME before fingerprinting: unlinking it later
+		// updates the shared inode's ctime (link count is inode
+		// metadata), which fileUnchanged compares — a fingerprint taken
+		// with the temp name still present is invalidated the moment the
+		// deferred cleanup runs, rejecting the memo on every subsequent
+		// call (the second test-lane CI red on this PR).
+		_ = os.Remove(tmp.Name())
 		dfi, err := os.Stat(path)
 		if err != nil || !os.SameFile(fi, dfi) {
 			return nil, nil

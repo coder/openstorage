@@ -3408,6 +3408,9 @@ func TestEnsureCacheRepo_RefreshesPreGateGenerations(t *testing.T) {
 	for name, legacy := range map[string]string{
 		"exec-gen":    refTxHookGateV1 + `exec "/opt/old/codestorage" hook reference-transaction "$@"` + "\n",
 		"guarded-gen": refTxHookGateV1 + `"/opt/old/codestorage" hook reference-transaction "$@" || exit 0` + "\n",
+		// The ORIGINAL, ungated generation — the plain enforcement-hook
+		// template (PR #195 round-13 P1).
+		"ungated-gen": "#!/bin/sh\n" + `exec "/opt/old/codestorage" hook reference-transaction "$@"` + "\n",
 	} {
 		t.Run(name, func(t *testing.T) {
 			cacheDir := t.TempDir()
