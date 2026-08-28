@@ -398,7 +398,7 @@ func EnsureCacheRepoCtx(ctx context.Context, cacheDir, repo string) (string, err
 	// missing or foreign script only defers hold release to post-receive,
 	// the pre-existing bound — and tests (or operators) may legitimately
 	// wrap it, which content verification would clobber on the next pass.
-	if err := ensureHookIfAbsent(filepath.Join(hooksDir, "reference-transaction"),
+	if err := ensureRefTxHook(filepath.Join(hooksDir, "reference-transaction"),
 		fmt.Sprintf(refTxHookScript, self)); err != nil {
 		return "", err
 	}
@@ -424,20 +424,54 @@ func EnsureCacheRepoCtx(ctx context.Context, cacheDir, repo string) (string, err
 // binaries do not dispatch hook args, not a recursive test run — the
 // enforcement hooks never fire outside receive-pack, so only this hook
 // needs the script-level gate).
-const refTxHookScript = `#!/bin/sh
-[ -n "$CODESTORAGE_GIT_PUSH_HOLD" ] || exit 0
-exec %q hook reference-transaction "$@"
+//
+// The binary runs WITHOUT exec, guarded by `|| exit 0` (PR #195 round-1
+// P1): a failed exec exits a non-interactive POSIX shell with the exec's
+// own status, and a nonzero exit at the "prepared" state ABORTS git's
+// ref transaction — a vanished binary (mid-rolling-deploy) would fail a
+// valid push whose authority CASes already committed, the exact
+// wrong-way failure this machinery exists to prevent. The hook is
+// best-effort by contract; every failure mode must degrade to
+// "release deferred to post-receive", never to an aborted transaction.
+const refTxHookScript = refTxHookGate + `%q hook reference-transaction "$@" || exit 0
 `
 
-// ensureHookIfAbsent installs script at path only when nothing exists
-// there yet (temp + rename, so a concurrent receive-pack never execs a
+// refTxHookGate is the script's managed-identity prefix, shared by the
+// generator above and the refresh detector below.
+const refTxHookGate = `#!/bin/sh
+[ -n "$CODESTORAGE_GIT_PUSH_HOLD" ] || exit 0
+`
+
+// isManagedRefTxHook reports whether content is one of OUR generated
+// reference-transaction scripts (any embedded binary path, any managed
+// generation) as opposed to a foreign/operator hook.
+func isManagedRefTxHook(content []byte) bool {
+	return strings.HasPrefix(string(content), refTxHookGate) &&
+		strings.Contains(string(content), ` hook reference-transaction "$@"`)
+}
+
+// ensureRefTxHook installs script at path when nothing exists there, and
+// REFRESHES it when the existing content is a stale managed script (PR
+// #195 round-1 P1): cache repos survive deployments while the script
+// embeds a version-specific binary path — install-if-absent alone would
+// preserve a dead path forever, and its failure at "prepared" aborts
+// valid pushes after an upgrade. Foreign/operator content is preserved:
+// this hook is a best-effort release optimization whose replacement only
+// defers release to post-receive, and tests legitimately wrap it. Writes
+// go through temp + rename (a concurrent receive-pack never execs a
 // partial script; concurrent installers write identical content and the
-// last rename wins). Existing content — any content — is left alone; see
-// the reference-transaction caller for why.
-func ensureHookIfAbsent(path, script string) error {
-	if _, err := os.Lstat(path); err == nil {
-		return nil
-	} else if !errors.Is(err, os.ErrNotExist) {
+// last rename wins).
+func ensureRefTxHook(path, script string) error {
+	existing, err := os.ReadFile(path)
+	switch {
+	case err == nil:
+		if string(existing) == script {
+			return nil
+		}
+		if !isManagedRefTxHook(existing) {
+			return nil
+		}
+	case !errors.Is(err, os.ErrNotExist):
 		return err
 	}
 	tmp, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".tmp-*")
@@ -2040,6 +2074,18 @@ func (c *pushHoldDirCache) load() (pushHoldSet, error) {
 			if relSize >= 0 {
 				if rb, err := os.ReadFile(path + pushHoldReleasedSuffix); err == nil {
 					c.parsedBytes += int64(len(rb))
+					// Trust only newline-TERMINATED records (PR #195
+					// round-1 P2): a short append (ENOSPC, EIO) strands a
+					// PREFIX of the released name as the last record, and
+					// that prefix can itself be a different still-reserved
+					// name — releasing refs/heads/foobar must never free
+					// refs/heads/foo. An unterminated tail is dropped
+					// (over-holding, the safe direction).
+					if i := bytes.LastIndexByte(rb, '\n'); i >= 0 {
+						rb = rb[:i+1]
+					} else {
+						rb = nil
+					}
 					tombstoned = make(map[string]bool)
 					for _, name := range strings.Split(string(rb), "\n") {
 						if name != "" {
@@ -2214,10 +2260,20 @@ func peerHoldCovers(dir, exceptPath, name string) (bool, int64, error) {
 			if ri, err := rf.Stat(); err == nil {
 				scanned += ri.Size()
 			}
-			rsc := bufio.NewScanner(rf)
-			for len(covering) > 0 && rsc.Scan() {
-				if covering[string(rsc.Bytes())] {
-					delete(covering, string(rsc.Bytes()))
+			// Trust only newline-TERMINATED records (PR #195 round-1 P2):
+			// ReadString returns the unterminated tail WITH an error, so a
+			// torn append's stranded prefix — possibly a different live
+			// name — is never applied. Allocation is bounded by the file's
+			// already-charged size.
+			rr := bufio.NewReader(rf)
+			for len(covering) > 0 {
+				line, err := rr.ReadString('\n')
+				if err != nil {
+					break
+				}
+				line = line[:len(line)-1]
+				if covering[line] {
+					delete(covering, line)
 				}
 			}
 			_ = rf.Close()
@@ -2599,7 +2655,20 @@ func appendPushReleased(holdPath string, names []string) error {
 // #186 finding 6): the former per-denial removePushHolds rewrite read and
 // rewrote the entire remaining hold, O(N²) I/O across an all-denied
 // fanout whose bases a concurrent writer moved.
+//
+// The epoch bump comes FIRST, and a failed bump suppresses the tombstone
+// (PR #195 round-1 P2): unlike a committed release, a denial can precede
+// the CAS (policy or fence errors), so no competing writer necessarily
+// bumped the store generation — a hydration that skipped this ref under
+// the hold would otherwise see identical pre/post fingerprints and
+// publish a held marker vouching for a ref its scan never synchronized.
+// This is the same bump-before-visibility invariant every hold REMOVAL
+// enforces; a suppressed tombstone merely over-holds until post-receive
+// or the TTL, the safe direction.
 func releaseDeniedPushHold(holdPath, refName string) error {
+	if err := bumpPushHoldEpoch(filepath.Dir(holdPath)); err != nil {
+		return err
+	}
 	return appendPushReleased(holdPath, []string{refName})
 }
 

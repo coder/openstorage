@@ -2781,6 +2781,151 @@ func TestEnsureCacheRepo_ReferenceTransactionHookIfAbsent(t *testing.T) {
 	}
 }
 
+// TestEnsureCacheRepo_RefreshesManagedReferenceTransactionHook (PR #195
+// round-1 P1): cache repos outlive deployments while the managed script
+// embeds a version-specific binary path — leaving every existing file
+// untouched preserves a dead path forever, and a failing script at the
+// "prepared" state aborts otherwise valid pushes after an upgrade. A
+// MANAGED script (current template shape, any embedded path) is
+// refreshed in place; foreign/operator content is still preserved
+// (TestEnsureCacheRepo_ReferenceTransactionHookIfAbsent).
+func TestEnsureCacheRepo_RefreshesManagedReferenceTransactionHook(t *testing.T) {
+	cacheDir := t.TempDir()
+	repoPath, err := EnsureCacheRepo(cacheDir, "t-reftx-refresh")
+	if err != nil {
+		t.Fatalf("EnsureCacheRepo: %v", err)
+	}
+	hookPath := filepath.Join(repoPath, "hooks", "reference-transaction")
+	current, err := os.ReadFile(hookPath)
+	if err != nil {
+		t.Fatalf("read hook: %v", err)
+	}
+	stale := fmt.Sprintf(refTxHookScript, "/opt/old-deployment/codestorage")
+	if stale == string(current) {
+		t.Fatal("test setup: stale script must differ from current")
+	}
+	if err := os.WriteFile(hookPath, []byte(stale), 0o755); err != nil {
+		t.Fatalf("write stale hook: %v", err)
+	}
+	// A redeployment is a NEW process: its empty memo forces the full
+	// verification pass. Simulate that here — the stale-path scenario
+	// cannot arise within one process, whose os.Executable is stable.
+	cacheRepoMemos.Delete(repoPath)
+	if _, err := EnsureCacheRepo(cacheDir, "t-reftx-refresh"); err != nil {
+		t.Fatalf("EnsureCacheRepo second pass: %v", err)
+	}
+	b, err := os.ReadFile(hookPath)
+	if err != nil {
+		t.Fatalf("read hook: %v", err)
+	}
+	if string(b) != string(current) {
+		t.Fatalf("managed script with a stale binary path must be refreshed:\n%s", b)
+	}
+}
+
+// TestReleaseDeniedPushHold_BumpsEpochBeforeVisibility (PR #195 round-1
+// P2): a policy/fence denial returns BEFORE the CAS, so no competing
+// writer necessarily bumped the store generation — if a concurrent
+// hydration skipped this ref under the hold, a tombstone that changes
+// neither the hold's stats nor the epoch lets pre/post fingerprints
+// match and a held marker vouch for a never-synchronized ref until its
+// TTL. Denial releases must bump the epoch BEFORE the tombstone becomes
+// visible, and must not publish the tombstone when the bump fails
+// (over-holding, the safe direction) — exactly the removal invariant the
+// former removePushHolds path enforced.
+func TestReleaseDeniedPushHold_BumpsEpochBeforeVisibility(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("directory write permissions do not bind root")
+	}
+	repoDir := t.TempDir()
+	dir := filepath.Join(repoDir, pushHoldDir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := bumpPushHoldEpoch(dir); err != nil {
+		t.Fatalf("seed epoch: %v", err)
+	}
+	hold := filepath.Join(dir, "push-denied")
+	if err := os.WriteFile(hold, []byte("refs/heads/x\n"), 0o600); err != nil {
+		t.Fatalf("write hold: %v", err)
+	}
+	key1, ok := livePushHoldsKey(repoDir)
+	if !ok {
+		t.Fatal("livePushHoldsKey failed")
+	}
+	if err := releaseDeniedPushHold(hold, "refs/heads/x"); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	key2, ok := livePushHoldsKey(repoDir)
+	if !ok {
+		t.Fatal("livePushHoldsKey failed")
+	}
+	if key1 == key2 {
+		t.Fatal("a denial release must invalidate the hold fingerprint")
+	}
+	// Bump failure: the tombstone must not become visible.
+	hold2 := filepath.Join(dir, "push-denied-bumpless")
+	if err := os.WriteFile(hold2, []byte("refs/heads/y\n"), 0o600); err != nil {
+		t.Fatalf("write hold: %v", err)
+	}
+	if err := os.Chmod(repoDir, 0o555); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(repoDir, 0o755) })
+	_ = releaseDeniedPushHold(hold2, "refs/heads/y") // best-effort caller
+	covered, _, err := peerHoldCovers(dir, "", "refs/heads/y")
+	if err != nil {
+		t.Fatalf("peerHoldCovers: %v", err)
+	}
+	if !covered {
+		t.Fatal("a denial tombstone must not be visible without a successful epoch bump")
+	}
+}
+
+// TestPushHoldReaders_IgnoreTornTombstoneTail (PR #195 round-1 P2): a
+// short append (ENOSPC, EIO) can strand a PREFIX of a released name as
+// the sidecar's unterminated last record — and that prefix can itself be
+// a different, still-reserved name (releasing refs/heads/foobar can
+// strand "refs/heads/foo"). Both readers must ignore a final record
+// without its newline terminator; only the terminated prefix of the
+// sidecar is trusted.
+func TestPushHoldReaders_IgnoreTornTombstoneTail(t *testing.T) {
+	repoDir := t.TempDir()
+	dir := filepath.Join(repoDir, pushHoldDir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	hold := filepath.Join(dir, "push-torn")
+	if err := os.WriteFile(hold, []byte("refs/heads/foo\nrefs/heads/foobar\nrefs/heads/done\n"), 0o600); err != nil {
+		t.Fatalf("write hold: %v", err)
+	}
+	// One complete tombstone (done), then a torn append of foobar's
+	// release stranding exactly the bytes of the shorter live name.
+	if err := os.WriteFile(hold+pushHoldReleasedSuffix, []byte("refs/heads/done\nrefs/heads/foo"), 0o600); err != nil {
+		t.Fatalf("write torn sidecar: %v", err)
+	}
+	for name, want := range map[string]bool{
+		"refs/heads/foo":    true,  // torn tail must not release it
+		"refs/heads/foobar": true,  // its release append never completed
+		"refs/heads/done":   false, // terminated tombstone applies
+	} {
+		covered, _, err := peerHoldCovers(dir, "", name)
+		if err != nil {
+			t.Fatalf("peerHoldCovers(%s): %v", name, err)
+		}
+		if covered != want {
+			t.Fatalf("peerHoldCovers(%s) = %v, want %v", name, covered, want)
+		}
+	}
+	set, err := readPushHolds(dir, "")
+	if err != nil {
+		t.Fatalf("readPushHolds: %v", err)
+	}
+	if !set.contains("refs/heads/foo") || !set.contains("refs/heads/foobar") || set.contains("refs/heads/done") {
+		t.Fatalf("parsed set mishandled the torn tail: %v", set.names)
+	}
+}
+
 // TestReapExpiredPushHold_RestoresTouchedHold (Codex round-31 P2 on
 // #173): the expiry verdict and the removal linearize at the quarantine
 // rename — an owner touch that preceded it is observed on the quarantined
