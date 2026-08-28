@@ -3236,7 +3236,10 @@ var absentHoldFile = holdFileID{size: -1}
 func holdFileIdentity(fi os.FileInfo) holdFileID {
 	st, ok := fi.Sys().(*syscall.Stat_t)
 	assertf(ok, "holdFileIdentity: non-syscall stat %T", fi.Sys())
-	return holdFileID{size: fi.Size(), dev: st.Dev, ino: st.Ino}
+	// Explicit conversions: Stat_t.Dev/Ino widths differ across platforms
+	// (e.g. Dev is int32 on darwin, uint64 on linux). The fold only needs a
+	// stable identity, not the numeric value.
+	return holdFileID{size: fi.Size(), dev: uint64(st.Dev), ino: uint64(st.Ino)}
 }
 
 // livePushHoldsKey fingerprints the repo's live push holds (path, size,

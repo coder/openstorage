@@ -43,6 +43,17 @@ jobs:
       # installed so the suite cannot quietly lose coverage.
       - run: git lfs version
       - run: go build ./...
+      # Cross-compile every release target so platform-specific syscall
+      # types (e.g. Stat_t.Dev: int32 on darwin, uint64 on linux) break PR
+      # CI instead of the tag-time release asset build (v0.14.4 incident).
+      - name: Cross-compile release targets
+        run: |
+          for os in darwin linux; do
+            for arch in amd64 arm64; do
+              echo "building $os/$arch"
+              GOOS=$os GOARCH=$arch CGO_ENABLED=0 go build -o /dev/null ./...
+            done
+          done
       - run: go test ./... -count=1 -race -timeout=30m
 
   # Build-only image smoke test (no push, no registry): verify-sig ref
