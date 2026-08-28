@@ -1216,24 +1216,37 @@ func isPushHoldSidecar(name string) bool {
 // Best-effort like every caller: a failed removal leaves the TTL machinery
 // the bound.
 func removePushHoldFiles(holdPath string) {
-	err := os.Remove(holdPath)
+	if _, err := os.Lstat(holdPath); err == nil {
+		// Bump only when a hold FILE is actually being removed (Codex
+		// round-33 security P2): every receive-pack mints a hold PATH,
+		// but rejected or malformed RPCs may never create the file, and
+		// this release still runs for them — an unconditional bump would
+		// let each tiny denied push invalidate the held-generation fast
+		// path and re-buy the full pack listing and ref paging under the
+		// hydrate lock for a live hold set that never changed. A
+		// never-created hold was never in any fingerprint listing, and
+		// sidecars are excluded from it.
+		//
+		// And bump BEFORE removing (Codex round-34 P2): a hold whose
+		// fail-closed create bump failed is visible with an UNCHANGED
+		// epoch, so letting this cleanup remove it with its own bump
+		// failing for the same cause would complete a transient lifecycle
+		// both fingerprint components are blind to — a hydration spanning
+		// it could publish a held marker for a set that changed mid-scan.
+		// A hold file therefore never transitions visible→absent without
+		// a successful epoch bump: on failure everything stays (the file
+		// keeps marking the fingerprint), and the TTL reap — which
+		// enforces the same bump-first rule — retires it once the epoch
+		// is writable again.
+		if bumpPushHoldEpoch(filepath.Dir(holdPath)) != nil {
+			return
+		}
+		_ = os.Remove(holdPath)
+	}
 	_ = os.RemoveAll(holdPath + pushHoldUnreservedSuffix)
 	_ = os.RemoveAll(holdPath + pushHoldVerifiedSuffix)
 	_ = os.Remove(holdPath + pushHoldScanSuffix)
 	_ = os.Remove(holdPath + pushHoldReapSuffix)
-	if err == nil {
-		// Bump only when a hold file was ACTUALLY removed (Codex round-33
-		// security P2): every receive-pack mints a hold PATH, but rejected
-		// or malformed RPCs may never create the FILE, and this release
-		// still runs for them — an unconditional bump would let each tiny
-		// denied push invalidate the held-generation fast path and re-buy
-		// the full pack listing and ref paging under the hydrate lock for
-		// a live hold set that never changed. A never-created hold was
-		// never in any fingerprint listing, and sidecars are excluded
-		// from it. Best-effort (round-32 P2): the fail-closed create bump
-		// already marks any net-zero lifecycle.
-		_ = bumpPushHoldEpoch(filepath.Dir(holdPath))
-	}
 }
 
 // pushHoldLive reports whether one hold-file observation counts as live,
@@ -1556,12 +1569,21 @@ func reapExpiredPushHold(path string, observed time.Time) {
 		restore()
 		return
 	}
+	// Bump BEFORE the unlink (Codex round-34 P2, mirroring
+	// removePushHoldFiles): a hold file never transitions visible→absent
+	// without a successful epoch bump, or a transient lifecycle whose
+	// create bump also failed becomes invisible to the fingerprint. When
+	// the epoch cannot record the transition, restore the hold — it keeps
+	// marking the fingerprint by presence, and a later sweep retries.
+	if bumpPushHoldEpoch(filepath.Dir(path)) != nil {
+		restore()
+		return
+	}
 	_ = os.Remove(quarantine)
 	_ = os.RemoveAll(path + pushHoldUnreservedSuffix)
 	_ = os.RemoveAll(path + pushHoldVerifiedSuffix)
 	_ = os.Remove(path + pushHoldScanSuffix)
 	_ = os.Remove(path + pushHoldReapSuffix)
-	_ = bumpPushHoldEpoch(filepath.Dir(path)) // round-32 P2, best-effort
 }
 
 // pushHoldSidecarBase maps a sidecar entry name to its hold file's name.
@@ -1691,10 +1713,18 @@ func startPushHoldRefresh(holdPath string) (stop func()) {
 				// hold only after WINNING an exclusive flock on its
 				// inode, so as long as this fd lives, no interleaving of
 				// stats, touches, and renames can discard the hold —
-				// kernel-arbitrated, no timing anywhere. Best-effort
-				// (never blocks a touch); fd-less owners keep the mtime
-				// revalidation as their bound.
-				_ = syscall.Flock(int(f.Fd()), syscall.LOCK_SH|syscall.LOCK_NB)
+				// kernel-arbitrated, no timing anywhere. A LOST attempt
+				// must close and retry on a later touch (Codex round-34
+				// P2): a reaper's exclusive lock can win against a
+				// freshly opened fd, and keeping that fd unlocked would
+				// leave the refresher permanently unprotected — exactly
+				// the stat-vs-Futimes timing the lock exists to close.
+				// Until a retry wins, path-based touches below keep the
+				// mtime revalidation as the (fd-less owner) bound.
+				if syscall.Flock(int(f.Fd()), syscall.LOCK_SH|syscall.LOCK_NB) != nil {
+					_ = f.Close()
+					f = nil
+				}
 			}
 		}
 		if f != nil {
