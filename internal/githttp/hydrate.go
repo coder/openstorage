@@ -145,6 +145,7 @@ type cacheRepoMemo struct {
 	preReceive  os.FileInfo
 	update      os.FileInfo
 	postReceive os.FileInfo
+	refTx       os.FileInfo
 }
 
 // cacheRepoMemos maps cache repo paths to their verified fingerprints, one
@@ -154,11 +155,11 @@ type cacheRepoMemo struct {
 var cacheRepoMemos sync.Map // map[string]cacheRepoMemo
 
 // memoFiles pairs each fingerprint with the path it must still match.
-func (m cacheRepoMemo) memoFiles(repoPath string) [4]struct {
+func (m cacheRepoMemo) memoFiles(repoPath string) [5]struct {
 	fi   os.FileInfo
 	path string
 } {
-	return [4]struct {
+	return [5]struct {
 		fi   os.FileInfo
 		path string
 	}{
@@ -166,6 +167,11 @@ func (m cacheRepoMemo) memoFiles(repoPath string) [4]struct {
 		{m.preReceive, filepath.Join(repoPath, "hooks", "pre-receive")},
 		{m.update, filepath.Join(repoPath, "hooks", "update")},
 		{m.postReceive, filepath.Join(repoPath, "hooks", "post-receive")},
+		// The reference-transaction hook joins the memo (PR #195 round-11
+		// P2): excluded, a memo hit skipped its exec-bit and staleness
+		// repairs for the process's whole lifetime — the mode flip alone
+		// invalidates this fingerprint and forces the full pass.
+		{m.refTx, filepath.Join(repoPath, "hooks", "reference-transaction")},
 	}
 }
 
@@ -398,18 +404,23 @@ func EnsureCacheRepoCtx(ctx context.Context, cacheDir, repo string) (string, err
 	// missing or foreign script only defers hold release to post-receive,
 	// the pre-existing bound — and tests (or operators) may legitimately
 	// wrap it, which content verification would clobber on the next pass.
-	if err := ensureRefTxHook(filepath.Join(hooksDir, "reference-transaction"),
-		fmt.Sprintf(refTxHookScript, self)); err != nil {
-		return "", err
-	}
+	// Failure here is NONFATAL (PR #195 round-11 P2): this hook is a
+	// best-effort release optimization whose absence falls back to
+	// post-receive — an unwritable hooks directory in an otherwise
+	// serviceable repo must not take it offline while the enforcement
+	// hooks above verified fine. An unverified state is simply never
+	// memoized, so every call retries the install until it heals.
+	refTxFI, refTxErr := ensureRefTxHook(filepath.Join(hooksDir, "reference-transaction"),
+		fmt.Sprintf(refTxHookScript, self))
 	// Memoize only a config state some verifyLocalConfig pass proved: the
 	// fingerprint identifies the exact unchanged file the reads covered
 	// (PR #98 round-3 review). A raced rewrite leaves configErr set and
 	// skips memoization entirely — hooks included, so the whole memo only
 	// ever vouches for verified state.
-	if configErr == nil {
+	if configErr == nil && refTxErr == nil && refTxFI != nil {
 		assertf(configFI != nil, "verifyLocalConfig returned no FileInfo for %s", configPath)
 		memo.config = configFI
+		memo.refTx = refTxFI
 		cacheRepoMemos.Store(path, memo)
 	}
 	return path, nil
@@ -520,7 +531,12 @@ func isManagedRefTxHook(content []byte) bool {
 // go through temp + rename (a concurrent receive-pack never execs a
 // partial script; concurrent installers write identical content and the
 // last rename wins).
-func ensureRefTxHook(path, script string) error {
+// It returns the FileInfo of the exact state it verified, installed, or
+// preserved — memoized like the enforcement hooks' (PR #195 round-11 P2:
+// a memo excluding this hook skipped its repairs for the process's whole
+// lifetime) — or nil when no verified state exists (a raced install
+// aborted; the next full pass re-decides).
+func ensureRefTxHook(path, script string) (os.FileInfo, error) {
 	existing, err := os.ReadFile(path)
 	switch {
 	case err == nil:
@@ -532,32 +548,51 @@ func ensureRefTxHook(path, script string) error {
 			// the file's owner, and POSIX resolves exactly one permission
 			// class — group/other execute bits do nothing for it. The
 			// in-place chmod is atomic on the inode; content never tears.
-			if fi, err := os.Stat(path); err == nil && fi.Mode()&0o100 == 0 {
-				return os.Chmod(path, 0o755)
+			fi, err := os.Stat(path)
+			if err != nil {
+				return nil, err
 			}
-			return nil
+			if fi.Mode()&0o100 == 0 {
+				if err := os.Chmod(path, 0o755); err != nil {
+					return nil, err
+				}
+				fi, err = os.Stat(path)
+				if err != nil {
+					return nil, err
+				}
+			}
+			return fi, nil
 		}
 		if !isManagedRefTxHook(existing) {
-			return nil
+			// Foreign content is preserved — and fingerprinted, so a memo
+			// hit vouches for exactly this preserved state.
+			return os.Stat(path)
 		}
 	case !errors.Is(err, os.ErrNotExist):
-		return err
+		return nil, err
 	}
 	tmp, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".tmp-*")
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer func() { _ = os.Remove(tmp.Name()) }() // no-op after a successful rename
 	if _, err := tmp.WriteString(script); err != nil {
 		_ = tmp.Close()
-		return err
+		return nil, err
 	}
 	if err := tmp.Chmod(0o755); err != nil {
 		_ = tmp.Close()
-		return err
+		return nil, err
+	}
+	// The fingerprint of the fully written temp — rename preserves inode,
+	// mtime, and mode, so this is the installed state's identity.
+	fi, err := tmp.Stat()
+	if err != nil {
+		_ = tmp.Close()
+		return nil, err
 	}
 	if err := tmp.Close(); err != nil {
-		return err
+		return nil, err
 	}
 	if testHookRefTxPreInstall != nil {
 		testHookRefTxPreInstall()
@@ -575,11 +610,14 @@ func ensureRefTxHook(path, script string) error {
 		// Still absent, or the stale managed script vanished — either
 		// way the rename creates without displacing foreign content.
 	case cerr != nil:
-		return cerr
+		return nil, cerr
 	case !bytes.Equal(current, existing):
-		return nil
+		return nil, nil
 	}
-	return os.Rename(tmp.Name(), path)
+	if err := os.Rename(tmp.Name(), path); err != nil {
+		return nil, err
+	}
+	return fi, nil
 }
 
 // ensureHook installs the hook script unless it is already current and
@@ -1727,6 +1765,7 @@ var (
 	testHookRefreshBeforeLock    func()
 	testHookRefTxPreInstall      func()
 	testHookPeerScanPostStat     func()
+	testHookDirCachePreParse     func()
 )
 
 // reapExpiredPushHold removes an expiry-verdict hold with the verdict and
@@ -2042,6 +2081,19 @@ func loadPushHolds(repoPath string) pushHoldSet {
 	return s
 }
 
+// readFileLimit reads at most limit bytes of path — os.ReadFile with a
+// hard cap for files that can grow under the reader (PR #195 round-11
+// P2: the scan-work allowance charges sampled sizes, so reads must not
+// exceed them).
+func readFileLimit(path string, limit int64) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = f.Close() }()
+	return io.ReadAll(io.LimitReader(f, limit))
+}
+
 // readPushHolds snapshots the live (unexpired) holds in dir, skipping
 // exceptPath (a push's own file — its reservation must not conflict with
 // its own earlier holds). ENOENT anywhere is benign: the directory may not
@@ -2148,6 +2200,9 @@ func (c *pushHoldDirCache) load() (pushHoldSet, error) {
 		parse, ok := c.files[path]
 		if !ok || parse.size != info.Size() || parse.mtime != info.ModTime().UnixNano() ||
 			parse.relSize != relSize || parse.relMtime != relMtime {
+			if testHookDirCachePreParse != nil {
+				testHookDirCachePreParse()
+			}
 			b, err := os.ReadFile(path)
 			if err != nil {
 				if !errors.Is(err, os.ErrNotExist) && firstErr == nil {
@@ -2162,10 +2217,17 @@ func (c *pushHoldDirCache) load() (pushHoldSet, error) {
 			// names drop out of coverage. An unreadable sidecar subtracts
 			// NOTHING (over-holding, the safe direction — unlike a hold
 			// file, whose unreadability must fail reservations closed)
-			// and re-probes on the next load via the -2 sentinel.
+			// and re-probes on the next load via the -2 sentinel. The
+			// read is BOUNDED to the sampled size (round-11 P2, the
+			// multi-name twin of the single-name LimitReader): flock-less
+			// appends can grow the sidecar between the listing's stat and
+			// this read, and unbounded reading would parse bytes the
+			// pre-read allowance check never charged. A boundary-cut
+			// record is an unterminated tail, dropped below; the growth
+			// re-parses on the next load via the fresh stat.
 			var tombstoned map[string]bool
 			if relSize >= 0 {
-				if rb, err := os.ReadFile(path + pushHoldReleasedSuffix); err == nil {
+				if rb, err := readFileLimit(path+pushHoldReleasedSuffix, relSize); err == nil {
 					c.parsedBytes += int64(len(rb))
 					// Trust only newline-TERMINATED records (PR #195
 					// round-1 P2): a short append (ENOSPC, EIO) strands a

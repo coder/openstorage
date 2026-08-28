@@ -3653,6 +3653,119 @@ func TestPeerHoldCovers_BoundsTombstoneReadToChargedSize(t *testing.T) {
 	}
 }
 
+// TestEnsureCacheRepo_MemoSeesRefTxHookMode (PR #195 round-11 P2): the
+// cache-repo memo excluded the reference-transaction hook, so a memo hit
+// skipped its exec-bit and staleness repairs for the process's whole
+// lifetime. The hook's fingerprint joins the memo: a mode flip alone
+// must invalidate it and reach the repair on the NEXT setup call — no
+// manual memo eviction.
+func TestEnsureCacheRepo_MemoSeesRefTxHookMode(t *testing.T) {
+	cacheDir := t.TempDir()
+	repoPath, err := EnsureCacheRepo(cacheDir, "t-reftx-memo")
+	if err != nil {
+		t.Fatalf("EnsureCacheRepo: %v", err)
+	}
+	hookPath := filepath.Join(repoPath, "hooks", "reference-transaction")
+	if err := os.Chmod(hookPath, 0o644); err != nil {
+		t.Fatalf("strip exec bit: %v", err)
+	}
+	// NO memo eviction: the memoized fast path itself must notice.
+	if _, err := EnsureCacheRepo(cacheDir, "t-reftx-memo"); err != nil {
+		t.Fatalf("EnsureCacheRepo second pass: %v", err)
+	}
+	fi, err := os.Stat(hookPath)
+	if err != nil {
+		t.Fatalf("stat hook: %v", err)
+	}
+	if fi.Mode()&0o100 == 0 {
+		t.Fatal("a memoized setup call must still notice and repair the hook's mode")
+	}
+}
+
+// TestReadPushHolds_BoundsTombstoneReadToChargedSize (PR #195 round-11
+// P2, the multi-name twin of the single-name LimitReader): the parsed
+// set's sidecar read must not exceed the listing's sampled size — the
+// pre-read allowance check charged only that, and flock-less appends can
+// grow the file before the read. Uncharged growth stays unread this
+// load and applies on the next (fresh stat, fresh charge).
+func TestReadPushHolds_BoundsTombstoneReadToChargedSize(t *testing.T) {
+	repoDir := t.TempDir()
+	dir := filepath.Join(repoDir, pushHoldDir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	hold := filepath.Join(dir, "push-growing-multi")
+	if err := os.WriteFile(hold, []byte("refs/heads/x\nrefs/heads/y\n"), 0o600); err != nil {
+		t.Fatalf("write hold: %v", err)
+	}
+	if err := appendPushReleased(hold, []string{"refs/heads/x"}); err != nil {
+		t.Fatalf("seed sidecar: %v", err)
+	}
+	grown := false
+	testHookDirCachePreParse = func() {
+		if grown {
+			return
+		}
+		grown = true
+		f, err := os.OpenFile(hold+pushHoldReleasedSuffix, os.O_APPEND|os.O_WRONLY, 0)
+		if err != nil {
+			t.Errorf("open sidecar: %v", err)
+			return
+		}
+		if _, err := f.WriteString("refs/heads/y\n"); err != nil {
+			t.Errorf("grow sidecar: %v", err)
+		}
+		_ = f.Close()
+	}
+	defer func() { testHookDirCachePreParse = nil }()
+	set, err := readPushHolds(dir, "")
+	testHookDirCachePreParse = nil
+	if err != nil {
+		t.Fatalf("readPushHolds: %v", err)
+	}
+	if set.contains("refs/heads/x") {
+		t.Fatal("the charged tombstone must apply")
+	}
+	if !set.contains("refs/heads/y") {
+		t.Fatal("uncharged growth must stay unread this load")
+	}
+	set, err = readPushHolds(dir, "")
+	if err != nil {
+		t.Fatalf("readPushHolds second load: %v", err)
+	}
+	if set.contains("refs/heads/y") {
+		t.Fatal("the grown sidecar must apply once its bytes are charged")
+	}
+}
+
+// TestEnsureCacheRepo_ToleratesUnwritableHooksDir (PR #195 round-11 P2):
+// the reference-transaction hook is a best-effort optimization — failing
+// to INSTALL it (unwritable hooks dir on an otherwise serviceable repo)
+// must not take the repository offline while the enforcement hooks
+// verify fine. The unverified state is simply never memoized.
+func TestEnsureCacheRepo_ToleratesUnwritableHooksDir(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("directory write permissions do not bind root")
+	}
+	cacheDir := t.TempDir()
+	repoPath, err := EnsureCacheRepo(cacheDir, "t-reftx-nofatal")
+	if err != nil {
+		t.Fatalf("EnsureCacheRepo: %v", err)
+	}
+	hooksDir := filepath.Join(repoPath, "hooks")
+	if err := os.Remove(filepath.Join(hooksDir, "reference-transaction")); err != nil {
+		t.Fatalf("remove hook: %v", err)
+	}
+	if err := os.Chmod(hooksDir, 0o555); err != nil {
+		t.Fatalf("chmod hooks dir: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(hooksDir, 0o755) })
+	cacheRepoMemos.Delete(repoPath)
+	if _, err := EnsureCacheRepo(cacheDir, "t-reftx-nofatal"); err != nil {
+		t.Fatalf("a failed optional-hook install must not fail the repo: %v", err)
+	}
+}
+
 // TestReapExpiredPushHold_RestoresTouchedHold (Codex round-31 P2 on
 // #173): the expiry verdict and the removal linearize at the quarantine
 // rename — an owner touch that preceded it is observed on the quarantined
