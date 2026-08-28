@@ -1518,8 +1518,10 @@ func sweepExpiredPushHolds(dir string) {
 // Test seams: called (when non-nil) at interleaving points concurrency
 // tests cannot otherwise reach deterministically. Nil in production.
 var (
-	testHookReapAfterQuarantine func()
-	testHookHoldsKeyMidSnapshot func()
+	testHookReapAfterQuarantine  func()
+	testHookHoldsKeyMidSnapshot  func()
+	testHookRemoveHoldsPreRename func()
+	testHookRefreshBeforeLock    func()
 )
 
 // reapExpiredPushHold removes an expiry-verdict hold with the verdict and
@@ -1736,25 +1738,46 @@ func startPushHoldRefresh(holdPath string) (stop func()) {
 			}
 		}
 		if f == nil {
-			f, _ = os.OpenFile(holdPath, os.O_WRONLY, 0)
-			if f != nil {
-				// The shared flock is the owner-liveness beacon (Codex
-				// round-32 P2): the expiry reaper unlinks a quarantined
-				// hold only after WINNING an exclusive flock on its
-				// inode, so as long as this fd lives, no interleaving of
-				// stats, touches, and renames can discard the hold —
-				// kernel-arbitrated, no timing anywhere. A LOST attempt
-				// must close and retry on a later touch (Codex round-34
-				// P2): a reaper's exclusive lock can win against a
-				// freshly opened fd, and keeping that fd unlocked would
-				// leave the refresher permanently unprotected — exactly
-				// the stat-vs-Futimes timing the lock exists to close.
-				// Until a retry wins, path-based touches below keep the
-				// mtime revalidation as the (fd-less owner) bound.
-				if syscall.Flock(int(f.Fd()), syscall.LOCK_SH|syscall.LOCK_NB) != nil {
-					_ = f.Close()
-					f = nil
+			// Establish the fd and its shared lock ATOMICALLY with
+			// respect to reapers, under the reservation flock (Codex
+			// round-36 P2): merely retrying a lost LOCK_SH (round 34)
+			// still left the CURRENT reap unopposed — a reaper could
+			// quarantine and win its exclusive lock between this open
+			// and the LOCK_SH below, then unlink a live reservation
+			// while the only fallback was an ENOENT path touch. The reap
+			// window holds the same lock, so an open that succeeds here
+			// is always followed by a LOCK_SH no reaper can interleave.
+			// Try-lock only: a busy lock (a peer's reservation scan, a
+			// reap on another hold) skips to the next tick — the path
+			// touches below keep the mtime fresh, which alone keeps
+			// expiry ineligible on a sane clock; fd-less owners keep the
+			// mtime revalidation as their bound.
+			if lock, lerr := os.OpenFile(filepath.Dir(holdPath)+".reserve.lock", os.O_CREATE|os.O_RDWR, 0o644); lerr == nil {
+				if syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB) == nil {
+					f, _ = os.OpenFile(holdPath, os.O_WRONLY, 0)
+					if testHookRefreshBeforeLock != nil {
+						testHookRefreshBeforeLock()
+					}
+					if f != nil {
+						// The shared flock is the owner-liveness beacon
+						// (Codex round-32 P2): the expiry reaper unlinks
+						// a quarantined hold only after WINNING an
+						// exclusive flock on its inode, so as long as
+						// this fd lives, no interleaving of stats,
+						// touches, and renames can discard the hold —
+						// kernel-arbitrated, no timing anywhere. Losing
+						// it here is impossible for a reaper (it needs
+						// the reservation lock this tick holds); close
+						// and retry against anything more exotic (Codex
+						// round-34 P2: an unlocked fd must never
+						// persist).
+						if syscall.Flock(int(f.Fd()), syscall.LOCK_SH|syscall.LOCK_NB) != nil {
+							_ = f.Close()
+							f = nil
+						}
+					}
 				}
+				_ = lock.Close() // close releases the flock when held
 			}
 		}
 		if f != nil {
@@ -2311,14 +2334,24 @@ func reservePushHolds(ctx context.Context, holdPath string, names []string) erro
 // or the new set, never a truncated one; the temp lives in the hold
 // directory under a hold-like name, so a reader that catches it merely
 // double-counts our remaining names for one poll (over-holding, the safe
-// direction) and the TTL sweep collects it if we crash mid-rename. No lock
-// is needed: only this push's processes write this file, and git runs
-// pre-receive strictly before the update hooks that append to it.
+// direction) and the TTL sweep collects it if we crash mid-rename. Only
+// this push's processes write this file (git runs pre-receive strictly
+// before the update hooks that append to it), but the rewrite runs under
+// the reservation flock anyway (Codex round-36 P2): the expiry reaper's
+// quarantine window holds that lock, and an unserialized read → rename
+// straddling the window would let the reaper's restore rename the OLD
+// full file over the reduced replacement, silently resurrecting every
+// released name for the rest of the push.
 func removePushHolds(holdPath string, names []string) error {
 	drop := make(map[string]bool, len(names))
 	for _, name := range names {
 		drop[name] = true
 	}
+	unlock, err := flockExclusive(filepath.Dir(holdPath) + ".reserve.lock")
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	b, err := os.ReadFile(holdPath)
 	if err != nil {
 		return err
@@ -2334,13 +2367,23 @@ func removePushHolds(holdPath string, names []string) error {
 	if err := os.WriteFile(tmp, []byte(keep.String()), 0o644); err != nil {
 		return err
 	}
+	if testHookRemoveHoldsPreRename != nil {
+		testHookRemoveHoldsPreRename()
+	}
+	// Bump BEFORE the replacement lands (Codex round-36 P2, mirroring the
+	// removal invariant of removePushHoldFiles): the partial rewrite is a
+	// hold-set mutation like any other, and replacing the contents with
+	// the bump lost lets bracketing snapshots fingerprint identically
+	// under coarse timestamp granularity. When the epoch cannot record
+	// the transition, retain the old contents — over-holding, the safe
+	// direction, bounded by the TTL machinery.
+	if err := bumpPushHoldEpoch(filepath.Dir(holdPath)); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
 	if err := os.Rename(tmp, holdPath); err != nil {
 		return err
 	}
-	// Best-effort epoch bump (round-32 P2 — see bumpPushHoldEpoch): the
-	// safe direction, since the fail-closed create bump already marks any
-	// net-zero lifecycle.
-	_ = bumpPushHoldEpoch(filepath.Dir(holdPath))
 	return nil
 }
 

@@ -17,6 +17,7 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -2394,6 +2395,173 @@ func TestWritePushVerifiedVerdicts_SurvivesSweepWithoutReservations(t *testing.T
 	sweepExpiredPushHolds(dir) // another push's mint sweep
 	if !pushVerifiedVerdict(hold, "refs/heads/a", oldSHA, newSHA) {
 		t.Fatal("verified verdicts must survive one sweep observation after a clock anomaly")
+	}
+}
+
+// TestRemovePushHolds_SurvivesConcurrentReapRestore (Codex round-36 P2
+// on #173/#186): the partial rewrite (read → reduced temp → rename into
+// holdPath) can straddle a reaper's quarantine window — the read lands
+// before the quarantine rename, the replacement rename lands during it,
+// and the reaper's restore (a live refresher's shared flock vetoed the
+// unlink) then renames the OLD full file over the replacement, silently
+// resurrecting every released name until receive-pack exits. The rewrite
+// must run under the same reservation flock as the reaper's window.
+func TestRemovePushHolds_SurvivesConcurrentReapRestore(t *testing.T) {
+	repoDir := t.TempDir()
+	dir := filepath.Join(repoDir, pushHoldDir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	hold := filepath.Join(dir, "push-rewrite-race")
+	if err := os.WriteFile(hold, []byte("refs/heads/a\nrefs/heads/b\n"), 0o600); err != nil {
+		t.Fatalf("write hold: %v", err)
+	}
+	expireHold(t, hold)
+	info, err := os.Stat(hold)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	// The live refresher whose shared flock forces the reaper's restore.
+	f, err := os.OpenFile(hold, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer f.Close()
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_SH|syscall.LOCK_NB); err != nil {
+		t.Fatalf("flock: %v", err)
+	}
+	// Orchestration: mid-rewrite (after the read, before the replacement
+	// rename), a sweep quarantines the hold and pauses; the rewrite's
+	// rename lands during quarantine; the reaper then restores. Fixed,
+	// the rewrite holds the reservation flock, so the reap cannot even
+	// quarantine until the rewrite completes.
+	gate := make(chan struct{})
+	reapDone := make(chan struct{})
+	var closeGate sync.Once
+	testHookReapAfterQuarantine = func() { <-gate }
+	testHookRemoveHoldsPreRename = func() {
+		go func() {
+			defer close(reapDone)
+			reapExpiredPushHold(hold, info.ModTime())
+		}()
+		deadline := time.Now().Add(500 * time.Millisecond)
+		for {
+			if _, err := os.Stat(hold + ".reaping"); err == nil || time.Now().After(deadline) {
+				return // quarantined (unfixed) or reap was excluded (fixed)
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
+	defer func() {
+		testHookRemoveHoldsPreRename = nil
+		testHookReapAfterQuarantine = nil
+		closeGate.Do(func() { close(gate) })
+	}()
+	if err := removePushHolds(hold, []string{"refs/heads/a"}); err != nil {
+		t.Fatalf("removePushHolds: %v", err)
+	}
+	closeGate.Do(func() { close(gate) })
+	<-reapDone
+	b, err := os.ReadFile(hold)
+	if err != nil {
+		t.Fatalf("read hold: %v", err)
+	}
+	if strings.Contains(string(b), "refs/heads/a") {
+		t.Fatalf("reap restore resurrected a released name: %q", b)
+	}
+	if !strings.Contains(string(b), "refs/heads/b") {
+		t.Fatalf("kept name lost: %q", b)
+	}
+}
+
+// TestRemovePushHolds_RetainsContentsWhenBumpFails (Codex round-36 P2 on
+// #173/#186): the partial rewrite is a hold-set mutation like any other —
+// replacing the contents with the epoch bump failing (and ignored) lets
+// a JIT append + error-path rewrite-back fingerprint identically under
+// coarse timestamp granularity. Mirror the removal invariant: bump
+// BEFORE the replacement rename, retain the old contents when the epoch
+// cannot record the transition.
+func TestRemovePushHolds_RetainsContentsWhenBumpFails(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("directory write permissions do not bind root")
+	}
+	repoDir := t.TempDir()
+	dir := filepath.Join(repoDir, pushHoldDir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := bumpPushHoldEpoch(dir); err != nil {
+		t.Fatalf("seed epoch: %v", err)
+	}
+	if f, err := os.Create(dir + ".reserve.lock"); err != nil {
+		t.Fatalf("create reserve lock: %v", err)
+	} else {
+		_ = f.Close()
+	}
+	hold := filepath.Join(dir, "push-bumpless-rewrite")
+	want := "refs/heads/a\nrefs/heads/b\n"
+	if err := os.WriteFile(hold, []byte(want), 0o600); err != nil {
+		t.Fatalf("write hold: %v", err)
+	}
+	if err := os.Chmod(repoDir, 0o555); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(repoDir, 0o755) })
+	if err := removePushHolds(hold, []string{"refs/heads/a"}); err == nil {
+		t.Fatal("removePushHolds must fail when the epoch bump fails")
+	}
+	b, err := os.ReadFile(hold)
+	if err != nil {
+		t.Fatalf("read hold: %v", err)
+	}
+	if string(b) != want {
+		t.Fatalf("contents must be retained when the bump fails: %q", b)
+	}
+}
+
+// TestPushHoldRefresh_OpposesConcurrentReap (Codex round-36 P2 on
+// #173/#186): closing the descriptor on a lost shared-lock attempt
+// (round 34) still leaves the CURRENT reap unopposed — a reaper can
+// quarantine and win LOCK_EX between the refresher's open and its
+// LOCK_SH, and the refresher's fallback path touch then hits ENOENT
+// while the reaper unlinks a live reservation. Establishing the fd and
+// the shared lock must be atomic with respect to reapers: it runs under
+// the same reservation flock as the reap window, so a reap either
+// finished before the refresher's open or cannot start until the shared
+// lock is held.
+func TestPushHoldRefresh_OpposesConcurrentReap(t *testing.T) {
+	oldTTL := pushHoldTTL
+	pushHoldTTL = 200 * time.Millisecond
+	t.Cleanup(func() { pushHoldTTL = oldTTL })
+	repoDir := t.TempDir()
+	dir := filepath.Join(repoDir, pushHoldDir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	hold := filepath.Join(dir, "push-establish-race")
+	if err := os.WriteFile(hold, []byte("refs/heads/x\n"), 0o600); err != nil {
+		t.Fatalf("write hold: %v", err)
+	}
+	expireHold(t, hold)
+	info, err := os.Stat(hold)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	fired := false
+	testHookRefreshBeforeLock = func() {
+		if fired {
+			return
+		}
+		fired = true
+		// The expiry sweep runs exactly between the refresher's open and
+		// its LOCK_SH.
+		reapExpiredPushHold(hold, info.ModTime())
+	}
+	defer func() { testHookRefreshBeforeLock = nil }()
+	stop := startPushHoldRefresh(hold) // first touch is synchronous
+	defer stop()
+	if _, err := os.Stat(hold); err != nil {
+		t.Fatalf("an actively refreshed hold was reaped mid-establishment: %v", err)
 	}
 }
 
