@@ -1702,12 +1702,21 @@ func TestRunHook_AtomicUpdateDenialReleasesWholeHold(t *testing.T) {
 	if err := RunHook(context.Background(), []string{"update", "refs/heads/b", sha, sha2}); err == nil {
 		t.Fatal("no-push policy must deny the update")
 	}
-	b, err := os.ReadFile(hold)
-	if err != nil {
+	if _, err := os.Stat(hold); err != nil {
 		t.Fatalf("non-atomic denial must keep the peers' hold: %v", err)
 	}
-	if got := string(b); got != "refs/heads/a\n" {
-		t.Fatalf("non-atomic denial must release only its own ref: %q", got)
+	// The denied ref leaves COVERAGE while its peer stays held — since
+	// issue #186 finding 6 via an O(1) tombstone append, not the former
+	// whole-file rewrite (readers subtract `.released` names).
+	set, err := readPushHolds(filepath.Dir(hold), "")
+	if err != nil {
+		t.Fatalf("readPushHolds: %v", err)
+	}
+	if set.contains("refs/heads/b") {
+		t.Fatal("non-atomic denial must release its own ref from coverage")
+	}
+	if !set.contains("refs/heads/a") {
+		t.Fatal("non-atomic denial must keep its peers' refs covered")
 	}
 }
 
