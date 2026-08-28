@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.14.2](https://github.com/coder/code-storage/compare/v0.14.1...v0.14.2) (2026-08-28)
+
+
+### Bug Fixes
+
+* **githttp:** make identical concurrent pack publication idempotent ([#187](https://github.com/coder/code-storage/issues/187)) ([#190](https://github.com/coder/code-storage/issues/190)) ([c878adb](https://github.com/coder/code-storage/commit/c878adb59016c2f1830e9d54eb9336cc065210b0))
+* **githttp:** persist pack-path JIT verdicts, kernel-lock hold reaping, ABA-safe hold fingerprints ([#189](https://github.com/coder/code-storage/issues/189)) ([71f514b](https://github.com/coder/code-storage/commit/71f514b87eccf2d6583cbb129490fc0c1acd3cc7))
+
 ## [0.14.1](https://github.com/coder/code-storage/compare/v0.14.0...v0.14.1) (2026-08-28)
 
 
