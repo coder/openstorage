@@ -99,6 +99,24 @@ func (s *SimRefStore) CASRef(ctx context.Context, repo, name, old, new string) (
 	}
 }
 
+// CASRefGen mirrors CASRef's fault split; the generation attribution is
+// lost with the outcome on ambiguous faults (gen == 0, the unattributed
+// contract), exactly as a real lost response loses it.
+func (s *SimRefStore) CASRefGen(ctx context.Context, repo, name, old, new string) (bool, int64, error) {
+	switch class := s.inj.begin(OpRefCASRef); class {
+	case FaultClean:
+		return false, 0, cleanFaultError{op: OpRefCASRef}
+	case FaultAmbiguous:
+		won, gen, err := s.inner.CASRefGen(ctx, repo, name, old, new)
+		s.inj.noteInnerOutcome(OpRefCASRef, fmt.Sprintf("won=%v gen=%d err=%v", won, gen, err))
+		return false, 0, ambiguousFaultError{op: OpRefCASRef}
+	case FaultNone:
+		return s.inner.CASRefGen(ctx, repo, name, old, new)
+	default:
+		panic(fmt.Sprintf("simtest: fault class %v invalid for %s", class, OpRefCASRef))
+	}
+}
+
 // RegisterPacks supports the same clean/ambiguous split as CASRef: an
 // ambiguous fault registers the packs (idempotently) and then loses the
 // result.

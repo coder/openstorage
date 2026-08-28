@@ -85,6 +85,29 @@ func (s IdempotentCAS) CASRef(ctx context.Context, repo, name, old, new string) 
 	if won {
 		return true, nil
 	}
+	return s.reconcileLoss(ctx, repo, name, old, new, err)
+}
+
+// CASRefGen applies the same recovery matrix as CASRef. A recovered win
+// forwards gen == 0 — unattributed by contract: the swap committed and
+// bumped the generation, but WHICH value it produced is unknowable after
+// the fact (the point-read recheck observes current state, not the commit
+// that made it), and guessing via GetGeneration could blend in a
+// concurrent writer's bump. Consumers coalescing generation ranges treat
+// 0 as an unclaimed mutation — the fail-safe rescan direction.
+func (s IdempotentCAS) CASRefGen(ctx context.Context, repo, name, old, new string) (bool, int64, error) {
+	won, gen, err := s.RefStore.CASRefGen(ctx, repo, name, old, new)
+	assertf(!won || err == nil, "CASRefGen returned won=true with error: %v", err)
+	if won {
+		return true, gen, nil
+	}
+	recovered, rerr := s.reconcileLoss(ctx, repo, name, old, new, err)
+	return recovered, 0, rerr
+}
+
+// reconcileLoss applies the non-win recovery matrix shared by CASRef and
+// CASRefGen (see the CASRef doc comment for the full rationale per case).
+func (s IdempotentCAS) reconcileLoss(ctx context.Context, repo, name, old, new string, err error) (bool, error) {
 	if new == ZeroSHA {
 		return false, err
 	}

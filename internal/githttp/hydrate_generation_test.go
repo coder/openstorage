@@ -202,6 +202,10 @@ func (s *countingStore) CASRef(context.Context, string, string, string, string) 
 	panic("countingStore: Hydrate must not call CASRef")
 }
 
+func (s *countingStore) CASRefGen(context.Context, string, string, string, string) (bool, int64, error) {
+	panic("countingStore: Hydrate must not call CASRefGen")
+}
+
 func (s *countingStore) RegisterPacks(context.Context, string, []ref.Pack) error {
 	panic("countingStore: Hydrate must not call RegisterPacks")
 }
