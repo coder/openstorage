@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.1](https://github.com/coder/code-storage/compare/v0.14.0...v0.14.1) (2026-08-28)
+
+
+### Bug Fixes
+
+* **githttp:** skip in-flight push refs during hydration to stop spurious receive-pack rejections ([#170](https://github.com/coder/code-storage/issues/170)) ([#173](https://github.com/coder/code-storage/issues/173)) ([c7c291b](https://github.com/coder/code-storage/commit/c7c291bc48572fe4224bf0e4363d13a8f4f1e67c))
+
 ## [0.14.0](https://github.com/coder/code-storage/compare/v0.13.0...v0.14.0) (2026-08-27)
 
 
