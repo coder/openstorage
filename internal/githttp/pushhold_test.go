@@ -3094,6 +3094,91 @@ func TestLivePushHoldsKey_SeesTombstones(t *testing.T) {
 	}
 }
 
+// TestLivePushHoldsKey_MidSnapshotTombstoneDetected (PR #195 round-5
+// P2): folding sidecar stats into the key (round 4) sampled them ONCE —
+// an append landing after the sidecar's stat but before the closing
+// epoch read left the snapshot on the old stats with an unchanged epoch,
+// so a hydrate's bracketing keys could still match across a mid-scan
+// release. Tombstone appends now bump the epoch themselves, putting them
+// under the same seqlock as every other coverage mutation: a mid-bracket
+// append refuses the snapshot.
+func TestLivePushHoldsKey_MidSnapshotTombstoneDetected(t *testing.T) {
+	repoDir := t.TempDir()
+	dir := filepath.Join(repoDir, pushHoldDir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := bumpPushHoldEpoch(dir); err != nil {
+		t.Fatalf("seed epoch: %v", err)
+	}
+	hold := filepath.Join(dir, "push-race")
+	if err := os.WriteFile(hold, []byte("refs/heads/a\nrefs/heads/b\n"), 0o600); err != nil {
+		t.Fatalf("write hold: %v", err)
+	}
+	if err := appendPushReleased(hold, []string{"refs/heads/a"}); err != nil {
+		t.Fatalf("seed sidecar: %v", err)
+	}
+	key1, ok := livePushHoldsKey(repoDir)
+	if !ok {
+		t.Fatal("livePushHoldsKey failed")
+	}
+	// The racing append lands after the stats were sampled, before the
+	// closing epoch read.
+	testHookHoldsKeyPreClose = func() {
+		if err := appendPushReleased(hold, []string{"refs/heads/b"}); err != nil {
+			t.Errorf("racing append: %v", err)
+		}
+	}
+	key2, ok2 := livePushHoldsKey(repoDir)
+	testHookHoldsKeyPreClose = nil
+	if ok2 && key2 == key1 {
+		t.Fatal("a tombstone landing inside the snapshot bracket must refuse or change the key")
+	}
+	if _, ok := livePushHoldsKey(repoDir); !ok {
+		t.Fatal("livePushHoldsKey must succeed on a quiet set")
+	}
+}
+
+// TestReleaseDeniedPushHold_NoopWithoutHoldFile (PR #195 round-5 P2): a
+// no-pack policy-denied push reserves nothing and creates no hold file —
+// its denial release must be a FULL no-op: no epoch bump (cheap denied
+// pushes could otherwise invalidate a live push's held marker per
+// request, the amplification the no-hold cleanup rule exists to prevent)
+// and no orphan `.released` sidecar.
+func TestReleaseDeniedPushHold_NoopWithoutHoldFile(t *testing.T) {
+	repoDir := t.TempDir()
+	dir := filepath.Join(repoDir, pushHoldDir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := bumpPushHoldEpoch(dir); err != nil {
+		t.Fatalf("seed epoch: %v", err)
+	}
+	// A live peer whose held marker the denied push must not disturb.
+	peer := filepath.Join(dir, "push-live-peer")
+	if err := os.WriteFile(peer, []byte("refs/heads/x\n"), 0o600); err != nil {
+		t.Fatalf("write peer hold: %v", err)
+	}
+	key1, ok := livePushHoldsKey(repoDir)
+	if !ok {
+		t.Fatal("livePushHoldsKey failed")
+	}
+	never := filepath.Join(dir, "push-never-created")
+	if err := releaseDeniedPushHold(never, "refs/heads/denied"); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	if _, err := os.Stat(never + pushHoldReleasedSuffix); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("no orphan sidecar may be created for a never-reserved push: %v", err)
+	}
+	key2, ok := livePushHoldsKey(repoDir)
+	if !ok {
+		t.Fatal("livePushHoldsKey failed")
+	}
+	if key1 != key2 {
+		t.Fatal("a never-reserved push's denial must not invalidate live holds' fingerprint")
+	}
+}
+
 // TestReapExpiredPushHold_RestoresTouchedHold (Codex round-31 P2 on
 // #173): the expiry verdict and the removal linearize at the quarantine
 // rename — an owner touch that preceded it is observed on the quarantined

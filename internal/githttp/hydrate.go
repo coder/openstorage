@@ -1666,6 +1666,7 @@ func sweepExpiredPushHolds(dir string) {
 var (
 	testHookReapAfterQuarantine  func()
 	testHookHoldsKeyMidSnapshot  func()
+	testHookHoldsKeyPreClose     func()
 	testHookRemoveHoldsPreRename func()
 	testHookRefreshBeforeLock    func()
 )
@@ -2663,12 +2664,31 @@ func removePushHolds(holdPath string, names []string) error {
 // the flock may observe a mid-append subset — tombstones only ever grow,
 // so a missed suffix over-holds, the safe direction. The single write
 // keeps torn tails line-shaped at worst; a torn line matches no exact
-// name and over-holds. No epoch bump here: the append itself is
-// fingerprint-VISIBLE — livePushHoldsKey folds the sidecar's (size,
-// mtime) into the key (PR #195 round-4 P2, revising the design comment's
-// original blindness plan) — so the one-write append is also the one
-// atomic visibility transition held markers need.
+// name and over-holds.
+//
+// A release for a push that never created its hold file is a FULL no-op
+// (PR #195 round-5 P2): a no-pack policy-denied push reserves nothing,
+// and letting its cheap denial mint orphan sidecars or invalidate live
+// peers' held markers per request is the amplification the no-hold
+// cleanup rule (round-33 security P2 on #189) exists to prevent.
+//
+// The epoch bump comes BEFORE the append becomes visible and fails
+// CLOSED (PR #195 rounds 1, 4, 5 — the blindness plan in the original
+// design comment proved unsound twice): a tombstone is a coverage
+// mutation like any other and must sit under the fingerprint seqlock,
+// or an append racing a hydrate's bracketed snapshots leaves both keys
+// equal while the scan skipped the released ref. On failure the names
+// simply stay held; post-receive and the TTL remain the bound.
 func appendPushReleased(holdPath string, names []string) error {
+	if _, err := os.Lstat(holdPath); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	if err := bumpPushHoldEpoch(filepath.Dir(holdPath)); err != nil {
+		return err
+	}
 	var sb strings.Builder
 	for _, name := range names {
 		sb.WriteString(name)
@@ -2710,21 +2730,12 @@ func appendPushReleased(holdPath string, names []string) error {
 // non-atomic update-hook denial — an O(name) tombstone append (issue
 // #186 finding 6): the former per-denial removePushHolds rewrite read and
 // rewrote the entire remaining hold, O(N²) I/O across an all-denied
-// fanout whose bases a concurrent writer moved.
-//
-// The epoch bump comes FIRST, and a failed bump suppresses the tombstone
-// (PR #195 round-1 P2): unlike a committed release, a denial can precede
-// the CAS (policy or fence errors), so no competing writer necessarily
-// bumped the store generation — a hydration that skipped this ref under
-// the hold would otherwise see identical pre/post fingerprints and
-// publish a held marker vouching for a ref its scan never synchronized.
-// This is the same bump-before-visibility invariant every hold REMOVAL
-// enforces; a suppressed tombstone merely over-holds until post-receive
-// or the TTL, the safe direction.
+// fanout whose bases a concurrent writer moved. The bump-before-
+// visibility invariant (PR #195 round-1 P2 — a denial can precede the
+// CAS, so no competing writer necessarily invalidates held markers) and
+// the never-reserved no-op rule (round-5 P2) live inside the append,
+// shared with the committed-release path.
 func releaseDeniedPushHold(holdPath, refName string) error {
-	if err := bumpPushHoldEpoch(filepath.Dir(holdPath)); err != nil {
-		return err
-	}
 	return appendPushReleased(holdPath, []string{refName})
 }
 
@@ -2874,6 +2885,9 @@ func livePushHoldsKey(repoPath string) (string, bool) {
 			relSize, relMtime = ri.Size(), ri.ModTime().UnixNano()
 		}
 		fmt.Fprintf(&key, "%s\x00%d\x00%d\x00%d\x00%d\x01", path, info.Size(), info.ModTime().UnixNano(), relSize, relMtime)
+	}
+	if testHookHoldsKeyPreClose != nil {
+		testHookHoldsKeyPreClose()
 	}
 	// The closing seqlock read (round-35 P2, see above): any epoch bump
 	// that landed between the two reads means the listing may belong to
