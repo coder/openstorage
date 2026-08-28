@@ -466,6 +466,13 @@ func ensureRefTxHook(path, script string) error {
 	switch {
 	case err == nil:
 		if string(existing) == script {
+			// Verify the mode too (PR #195 round-2 P2): a restored cache
+			// volume can strip the execute bit while the bytes stay
+			// current, and git SILENTLY skips non-executable hooks. The
+			// in-place chmod is atomic on the inode; content never tears.
+			if fi, err := os.Stat(path); err == nil && fi.Mode()&0o111 == 0 {
+				return os.Chmod(path, 0o755)
+			}
 			return nil
 		}
 		if !isManagedRefTxHook(existing) {
@@ -2639,9 +2646,30 @@ func appendPushReleased(holdPath string, names []string) error {
 		sb.WriteString(name)
 		sb.WriteByte('\n')
 	}
-	f, err := os.OpenFile(holdPath+pushHoldReleasedSuffix, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	f, err := os.OpenFile(holdPath+pushHoldReleasedSuffix, os.O_CREATE|os.O_APPEND|os.O_RDWR, 0o600)
 	if err != nil {
 		return err
+	}
+	// Fail CLOSED on an unterminated existing tail (PR #195 round-2 P2):
+	// readers drop a torn final record, but a further O_APPEND would fuse
+	// its first name onto that prefix plus a newline — one complete
+	// record whose combined bytes can equal a DIFFERENT still-held ref,
+	// releasing it prematurely. Only this push's serialized processes
+	// write here, so the check cannot race another appender; failing
+	// merely keeps the names held until post-receive.
+	if fi, err := f.Stat(); err != nil {
+		_ = f.Close()
+		return err
+	} else if fi.Size() > 0 {
+		var tail [1]byte
+		if _, err := f.ReadAt(tail[:], fi.Size()-1); err != nil {
+			_ = f.Close()
+			return err
+		}
+		if tail[0] != '\n' {
+			_ = f.Close()
+			return fmt.Errorf("push hold: released sidecar ends in an unterminated record; retaining reservations")
+		}
 	}
 	if _, err := f.WriteString(sb.String()); err != nil {
 		_ = f.Close()

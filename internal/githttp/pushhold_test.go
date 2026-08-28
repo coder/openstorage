@@ -2926,6 +2926,68 @@ func TestPushHoldReaders_IgnoreTornTombstoneTail(t *testing.T) {
 	}
 }
 
+// TestAppendPushReleased_FailsClosedOnTornTail (PR #195 round-2 P2): a
+// short append strands an unterminated prefix, and a LATER successful
+// O_APPEND would concatenate its first name directly onto that prefix
+// plus a newline — a complete record whose combined bytes can equal a
+// different still-held ref (refs/heads/foo ++ refs/heads/bar is the
+// valid name refs/heads/foorefs/heads/bar), releasing it prematurely.
+// Appends must fail closed when the existing tail is unterminated;
+// callers are best-effort, so the names simply stay held.
+func TestAppendPushReleased_FailsClosedOnTornTail(t *testing.T) {
+	repoDir := t.TempDir()
+	dir := filepath.Join(repoDir, pushHoldDir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	hold := filepath.Join(dir, "push-concat")
+	victim := "refs/heads/foorefs/heads/bar"
+	if err := os.WriteFile(hold, []byte(victim+"\n"), 0o600); err != nil {
+		t.Fatalf("write hold: %v", err)
+	}
+	// A torn earlier release stranded this prefix (no terminator).
+	if err := os.WriteFile(hold+pushHoldReleasedSuffix, []byte("refs/heads/foo"), 0o600); err != nil {
+		t.Fatalf("write torn sidecar: %v", err)
+	}
+	if err := appendPushReleased(hold, []string{"refs/heads/bar"}); err == nil {
+		t.Fatal("appending after an unterminated tail must fail closed")
+	}
+	covered, _, err := peerHoldCovers(dir, "", victim)
+	if err != nil {
+		t.Fatalf("peerHoldCovers: %v", err)
+	}
+	if !covered {
+		t.Fatal("concatenated torn records released a still-held ref")
+	}
+}
+
+// TestEnsureCacheRepo_RestoresRefTxHookExecBit (PR #195 round-2 P2): a
+// restored cache volume can strip the managed script's execute bit while
+// its bytes stay current — git then SILENTLY skips non-executable hooks,
+// so the byte-equality early return must also verify mode and repair it.
+func TestEnsureCacheRepo_RestoresRefTxHookExecBit(t *testing.T) {
+	cacheDir := t.TempDir()
+	repoPath, err := EnsureCacheRepo(cacheDir, "t-reftx-execbit")
+	if err != nil {
+		t.Fatalf("EnsureCacheRepo: %v", err)
+	}
+	hookPath := filepath.Join(repoPath, "hooks", "reference-transaction")
+	if err := os.Chmod(hookPath, 0o644); err != nil {
+		t.Fatalf("strip exec bit: %v", err)
+	}
+	cacheRepoMemos.Delete(repoPath) // a fresh process's full pass
+	if _, err := EnsureCacheRepo(cacheDir, "t-reftx-execbit"); err != nil {
+		t.Fatalf("EnsureCacheRepo second pass: %v", err)
+	}
+	fi, err := os.Stat(hookPath)
+	if err != nil {
+		t.Fatalf("stat hook: %v", err)
+	}
+	if fi.Mode()&0o111 == 0 {
+		t.Fatal("an unchanged managed script must get its execute bit restored")
+	}
+}
+
 // TestReapExpiredPushHold_RestoresTouchedHold (Codex round-31 P2 on
 // #173): the expiry verdict and the removal linearize at the quarantine
 // rename — an owner touch that preceded it is observed on the quarantined
