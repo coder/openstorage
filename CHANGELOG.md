@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.3](https://github.com/coder/code-storage/compare/v0.14.2...v0.14.3) (2026-08-28)
+
+
+### Bug Fixes
+
+* **githttp:** release committed and denied push-hold refs via append-only tombstones ([#195](https://github.com/coder/code-storage/issues/195)) ([aa24498](https://github.com/coder/code-storage/commit/aa2449882400ccc3ceac1d38dc7b7d1e97cfea63))
+
 ## [0.14.2](https://github.com/coder/code-storage/compare/v0.14.1...v0.14.2) (2026-08-28)
 
 
