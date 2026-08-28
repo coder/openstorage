@@ -111,6 +111,19 @@ func (s *RefStore) CASRef(ctx context.Context, repo, name, old, new string) (boo
 	return true, nil
 }
 
+// CASRefGen mirrors CASRef exactly (an explicit override: interface
+// embedding would silently forward past the push-event emission): a won
+// swap emits the push event + sync poke, and the inner store's generation
+// attribution passes through untouched.
+func (s *RefStore) CASRefGen(ctx context.Context, repo, name, old, new string) (bool, int64, error) {
+	won, gen, err := s.RefStore.CASRefGen(ctx, repo, name, old, new)
+	if err != nil || !won {
+		return won, gen, err
+	}
+	s.emitPush(context.WithoutCancel(ctx), repo, name, old, new)
+	return true, gen, nil
+}
+
 // emitPush fans one push event out to the org's webhooks and pokes the
 // sync seam. Never returns an error: the ref flip is already durable.
 func (s *RefStore) emitPush(ctx context.Context, repoKey, refName, before, after string) {

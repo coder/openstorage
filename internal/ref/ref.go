@@ -134,6 +134,20 @@ type RefStore interface {
 	// create/delete). Returns won=false (no error) when the precondition
 	// failed, i.e. someone else won the race.
 	CASRef(ctx context.Context, repo, name, old, new string) (won bool, err error)
+
+	// CASRefGen is CASRef additionally reporting the repository's
+	// post-CAS mutation generation ATOMICALLY with the win: gen is the
+	// exact value GetGeneration observes once this swap's commit — and
+	// no later mutation — is visible (issue #186 finding 5: push-hold
+	// generation-range coalescing needs each won hook CAS attributed to
+	// the exact generation it produced; a post-hoc GetGeneration could
+	// blend in a concurrent writer's bump and over-claim). gen > 0 only
+	// on won; a won outcome with gen == 0 means the attribution is
+	// unknown (a decorator recovered an ambiguous outcome by point-read,
+	// where the committed generation is unknowable after the fact) and
+	// callers must treat the mutation as unattributed — the fail-safe
+	// direction for range coalescing.
+	CASRefGen(ctx context.Context, repo, name, old, new string) (won bool, gen int64, err error)
 	// RegisterPacks records packs for repo atomically; idempotent on retry.
 	RegisterPacks(ctx context.Context, repo string, packs []Pack) error
 	// ListPacks returns all registered packs for repo, oldest first.
@@ -904,7 +918,18 @@ func casFence(ctx context.Context, repo string) (syncClaimFence, bool) {
 // repo_upstreams row: a concurrent claim steal serializes against the CAS
 // instead of racing its snapshot, so a stolen run's update can never
 // commit after the thief's claim (issue #86).
-func (s *PG) CASRef(ctx context.Context, repo, name, old, new string) (won bool, err error) {
+func (s *PG) CASRef(ctx context.Context, repo, name, old, new string) (bool, error) {
+	won, _, err := s.casRef(ctx, repo, name, old, new, false)
+	return won, err
+}
+
+// CASRefGen implements the RefStore contract: exact win attribution. See
+// casRef for how the read composes with the deferred bump trigger.
+func (s *PG) CASRefGen(ctx context.Context, repo, name, old, new string) (bool, int64, error) {
+	return s.casRef(ctx, repo, name, old, new, true)
+}
+
+func (s *PG) casRef(ctx context.Context, repo, name, old, new string, wantGen bool) (won bool, gen int64, err error) {
 	assertf(ValidSHA(old), "CASRef: malformed old sha %q", old)
 	assertf(ValidSHA(new), "CASRef: malformed new sha %q", new)
 	assertf(old != ZeroSHA || new != ZeroSHA, "CASRef: zero -> zero update for %s/%s", repo, name)
@@ -915,7 +940,7 @@ func (s *PG) CASRef(ctx context.Context, repo, name, old, new string) (won bool,
 	// recover such errors (see notExecuted).
 	conn, err := s.pool.Acquire(ctx)
 	if err != nil {
-		return false, fmt.Errorf("cas acquire %s/%s: %w", repo, name, notExecuted(err))
+		return false, 0, fmt.Errorf("cas acquire %s/%s: %w", repo, name, notExecuted(err))
 	}
 	defer conn.Release()
 	// Pre-dispatch guard: a context canceled after acquire but before Exec
@@ -924,25 +949,25 @@ func (s *PG) CASRef(ctx context.Context, repo, name, old, new string) (won bool,
 	// covered by pgconn itself, whose pre-send check returns a
 	// SafeToRetry-tagged contextAlreadyDoneError.)
 	if cerr := ctx.Err(); cerr != nil {
-		return false, fmt.Errorf("cas %s/%s: %w", repo, name, notExecuted(cerr))
+		return false, 0, fmt.Errorf("cas %s/%s: %w", repo, name, notExecuted(cerr))
 	}
 
 	// Everything up to (but excluding) the CAS statement is provably
 	// non-executing: an error here means the mutation was never sent.
 	tx, err := conn.Begin(ctx)
 	if err != nil {
-		return false, fmt.Errorf("cas begin %s/%s: %w", repo, name, notExecuted(err))
+		return false, 0, fmt.Errorf("cas begin %s/%s: %w", repo, name, notExecuted(err))
 	}
 	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
 	if err := lockBaseLedger(ctx, tx, baseRepoOf(repo)); err != nil {
-		return false, fmt.Errorf("cas %s/%s: %w", repo, name, notExecuted(err))
+		return false, 0, fmt.Errorf("cas %s/%s: %w", repo, name, notExecuted(err))
 	}
 	purged, err := repoPurgeFencedPG(ctx, tx, repo)
 	if err != nil {
-		return false, fmt.Errorf("cas %s/%s: purge fence: %w", repo, name, notExecuted(err))
+		return false, 0, fmt.Errorf("cas %s/%s: purge fence: %w", repo, name, notExecuted(err))
 	}
 	if purged {
-		return false, fmt.Errorf("cas %s/%s: %w", repo, name, notExecuted(ErrRepoPurged))
+		return false, 0, fmt.Errorf("cas %s/%s: %w", repo, name, notExecuted(ErrRepoPurged))
 	}
 
 	fence, fenced := casFence(ctx, repo)
@@ -987,17 +1012,43 @@ func (s *PG) CASRef(ctx context.Context, repo, name, old, new string) (won bool,
 		ct, err, tag = c, cerr, "fenced update"
 	}
 	if err != nil {
-		return false, fmt.Errorf("cas %s %s/%s: %w", tag, repo, name, err)
+		return false, 0, fmt.Errorf("cas %s %s/%s: %w", tag, repo, name, err)
+	}
+	n := ct.RowsAffected()
+	assertf(n == 0 || n == 1, "cas %s %s/%s affected %d rows", tag, repo, name, n)
+	if wantGen && n == 1 {
+		// Exact attribution under the deferred bump trigger: the
+		// generation row is locked HERE (created first if virgin, the
+		// trigger's own upsert dance), pinning its value G0 until commit
+		// — no other transaction's commit-time bump can interleave — and
+		// this transaction's own trigger then adds exactly one (one
+		// changed row) at COMMIT, so the post-commit value is G0+1.
+		// Lock order matches the deferred design: refs/packs rows first,
+		// generation row strictly last, so the multi-row-registration
+		// deadlock the deferral exists for cannot re-form. Failures here
+		// roll the whole transaction back — the swap never commits — so
+		// they carry the not-executed marker like every pre-commit step:
+		// IdempotentCAS must not recover them as wins.
+		if _, gerr := tx.Exec(ctx,
+			`INSERT INTO repo_generations (repo, generation) VALUES ($1, 0) ON CONFLICT DO NOTHING`,
+			repo); gerr != nil {
+			return false, 0, fmt.Errorf("cas %s %s/%s: generation row: %w", tag, repo, name, notExecuted(gerr))
+		}
+		var g0 int64
+		if gerr := tx.QueryRow(ctx,
+			`SELECT generation FROM repo_generations WHERE repo = $1 FOR UPDATE`,
+			repo).Scan(&g0); gerr != nil {
+			return false, 0, fmt.Errorf("cas %s %s/%s: generation read: %w", tag, repo, name, notExecuted(gerr))
+		}
+		gen = g0 + 1
 	}
 	// A commit failure is NOT notExecuted: the response may have been
 	// lost after the backend committed — exactly the ambiguity class the
 	// IdempotentCAS recovery recheck exists for.
 	if err := tx.Commit(ctx); err != nil {
-		return false, fmt.Errorf("cas %s %s/%s: commit: %w", tag, repo, name, err)
+		return false, 0, fmt.Errorf("cas %s %s/%s: commit: %w", tag, repo, name, err)
 	}
-	n := ct.RowsAffected()
-	assertf(n == 0 || n == 1, "cas %s %s/%s affected %d rows", tag, repo, name, n)
-	return n == 1, nil
+	return n == 1, gen, nil
 }
 
 // RegisterPacks inserts pack rows in ONE transaction (crash-ordering: this

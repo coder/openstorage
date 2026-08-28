@@ -367,3 +367,110 @@ func TestGenerationRecoveredWinBumpsExactlyOnce(t *testing.T) {
 		t.Fatalf("generation after recovered win = %d, want exactly %d (one bump, from the committed statement)", after, before+1)
 	}
 }
+
+// TestCASRefGenAttributesWonGeneration (issue #186 finding 5): a winning
+// CASRefGen must report the EXACT generation its own commit produced —
+// not a post-hoc read that can blend in concurrent writers — on every
+// backend, so push-hold range coalescing can attribute each bump to the
+// hold that caused it. Losses report gen 0.
+func TestCASRefGenAttributesWonGeneration(t *testing.T) {
+	runRefBackends(t, testCASRefGenAttributesWonGeneration)
+}
+
+func testCASRefGenAttributesWonGeneration(t *testing.T, s Store) {
+	ctx := context.Background()
+	repo := t.Name()
+	const branch = "refs/heads/main"
+
+	gen := func() int64 {
+		t.Helper()
+		g, err := s.GetGeneration(ctx, repo)
+		if err != nil {
+			t.Fatalf("GetGeneration: %v", err)
+		}
+		return g
+	}
+	casGen := func(name, old, new string, wantWon bool) int64 {
+		t.Helper()
+		won, g, err := s.CASRefGen(ctx, repo, name, old, new)
+		if err != nil {
+			t.Fatalf("CASRefGen(%s, %s -> %s): %v", name, old, new, err)
+		}
+		if won != wantWon {
+			t.Fatalf("CASRefGen(%s, %s -> %s) won = %v, want %v", name, old, new, won, wantWon)
+		}
+		return g
+	}
+
+	// Create on a virgin repo: the first mutation is generation 1 exactly.
+	if g := casGen(branch, ZeroSHA, testSHA(0x11), true); g != 1 {
+		t.Fatalf("create attribution = %d, want 1", g)
+	}
+	if g := gen(); g != 1 {
+		t.Fatalf("GetGeneration after create = %d, want 1", g)
+	}
+	// A lost race attributes nothing.
+	if g := casGen(branch, ZeroSHA, testSHA(0x22), false); g != 0 {
+		t.Fatalf("lost create attribution = %d, want 0", g)
+	}
+	if g := casGen(branch, testSHA(0x33), testSHA(0x22), false); g != 0 {
+		t.Fatalf("lost update attribution = %d, want 0", g)
+	}
+	if g := gen(); g != 1 {
+		t.Fatalf("GetGeneration after losses = %d, want 1 (no bump)", g)
+	}
+	// Update and delete attribute their own +1.
+	if g := casGen(branch, testSHA(0x11), testSHA(0x22), true); g != 2 {
+		t.Fatalf("update attribution = %d, want 2", g)
+	}
+	// A non-CAS mutation in between (pack registration bumps via the same
+	// machinery): the next win must attribute the value AFTER it.
+	if err := s.RegisterPacks(ctx, repo, []Pack{{ID: "p1", Key: "k1"}}); err != nil {
+		t.Fatalf("RegisterPacks: %v", err)
+	}
+	if g := casGen(branch, testSHA(0x22), ZeroSHA, true); g != 4 {
+		t.Fatalf("delete attribution = %d, want 4 (after the pack bump)", g)
+	}
+	if g := gen(); g != 4 {
+		t.Fatalf("GetGeneration after delete = %d, want 4", g)
+	}
+
+	// The attribution property under contention (the reason a post-hoc
+	// GetGeneration cannot substitute): N concurrent winning swaps must
+	// attribute N DISTINCT consecutive generations — every bump owned by
+	// exactly one winner, none blended or double-counted.
+	const writers = 8
+	base := gen()
+	gens := make([]int64, writers)
+	var wg sync.WaitGroup
+	for i := 0; i < writers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			name := fmt.Sprintf("refs/heads/w%d", i)
+			won, g, err := s.CASRefGen(ctx, repo, name, ZeroSHA, testSHA(byte(0x40+i)))
+			if err != nil || !won {
+				t.Errorf("concurrent CASRefGen(%s) = (%v, %v), want win", name, won, err)
+				return
+			}
+			gens[i] = g
+		}(i)
+	}
+	wg.Wait()
+	if t.Failed() {
+		t.FailNow()
+	}
+	seen := make(map[int64]bool, writers)
+	for i, g := range gens {
+		if g <= base || g > base+writers {
+			t.Fatalf("writer %d attributed generation %d outside (%d, %d]", i, g, base, base+writers)
+		}
+		if seen[g] {
+			t.Fatalf("generation %d attributed to two writers", g)
+		}
+		seen[g] = true
+	}
+	if g := gen(); g != base+writers {
+		t.Fatalf("GetGeneration after %d wins = %d, want %d", writers, g, base+writers)
+	}
+}

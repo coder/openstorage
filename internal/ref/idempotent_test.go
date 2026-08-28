@@ -322,3 +322,44 @@ func TestIdempotentCASDeleteNeverRecovers(t *testing.T) {
 		t.Fatalf("retried delete = (%v, %v), want (false, nil)", won, err)
 	}
 }
+
+// CASRefGen on commitThenFail mirrors its CASRef fault: the inner swap
+// commits (and attributes a generation), then the response is lost — so
+// the attribution is lost with it, exactly like a real dead connection.
+func (s *commitThenFail) CASRefGen(ctx context.Context, repo, name, old, new string) (bool, int64, error) {
+	if _, _, err := s.RefStore.CASRefGen(ctx, repo, name, old, new); err != nil {
+		return false, 0, err
+	}
+	return false, 0, errDrop
+}
+
+// TestIdempotentCASRefGenRecoveredWinUnattributed (issue #186 finding 5):
+// a recovered win must forward gen == 0 — the committed generation is
+// unknowable after the fact, and guessing via GetGeneration could blend
+// in a concurrent writer's bump, over-claiming a range for the push-hold
+// coalescer. Clean wins forward the inner attribution untouched.
+func TestIdempotentCASRefGenRecoveredWinUnattributed(t *testing.T) {
+	ctx := context.Background()
+	raw, _ := openTestSQLite(t)
+	seedRef(t, raw, "r-gen", "refs/heads/main", idemSHA1)
+
+	// Clean win: exact attribution passes through.
+	clean := IdempotentCAS{RefStore: raw}
+	won, gen, err := clean.CASRefGen(ctx, "r-gen", "refs/heads/main", idemSHA1, idemSHA2)
+	if !won || err != nil || gen <= 0 {
+		t.Fatalf("clean CASRefGen = (%v, %d, %v), want (true, >0, nil)", won, gen, err)
+	}
+	if g, err := raw.GetGeneration(ctx, "r-gen"); err != nil || g != gen {
+		t.Fatalf("GetGeneration = (%d, %v), want (%d, nil)", g, err, gen)
+	}
+
+	// Recovered win: the swap committed, the attribution is gone.
+	st := IdempotentCAS{RefStore: &commitThenFail{RefStore: raw}}
+	won, gen, err = st.CASRefGen(ctx, "r-gen", "refs/heads/main", idemSHA2, idemSHA1)
+	if !won || err != nil {
+		t.Fatalf("CASRefGen = (%v, %v), want recovered (true, nil)", won, err)
+	}
+	if gen != 0 {
+		t.Fatalf("recovered win attribution = %d, want 0 (unattributed, fail-safe)", gen)
+	}
+}

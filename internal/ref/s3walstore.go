@@ -767,14 +767,28 @@ func (s *S3WAL) GetRef(ctx context.Context, repo, name string) (string, error) {
 // fresh snapshot no longer satisfies the precondition surfaces the
 // ambiguity as an error: exactly like a lost-commit-response on SQL, the
 // IdempotentCAS decorator's recheck (current == new) recovers the win.
-func (s *S3WAL) CASRef(ctx context.Context, repo, name, old, new string) (won bool, err error) {
+func (s *S3WAL) CASRef(ctx context.Context, repo, name, old, new string) (bool, error) {
+	won, _, err := s.casRef(ctx, repo, name, old, new)
+	return won, err
+}
+
+// CASRefGen implements the RefStore contract: exact win attribution. The
+// mutation closure bumps mem.Gen itself, so the post-CAS value is known by
+// construction on the attempt whose manifest swap actually lands (mutate
+// re-runs the closure per retry; the captured value is the last — winning
+// — attempt's).
+func (s *S3WAL) CASRefGen(ctx context.Context, repo, name, old, new string) (bool, int64, error) {
+	return s.casRef(ctx, repo, name, old, new)
+}
+
+func (s *S3WAL) casRef(ctx context.Context, repo, name, old, new string) (won bool, gen int64, err error) {
 	assertf(ValidSHA(old), "CASRef: malformed old sha %q", old)
 	assertf(ValidSHA(new), "CASRef: malformed new sha %q", new)
 	assertf(old != ZeroSHA || new != ZeroSHA, "CASRef: zero -> zero update for %s/%s", repo, name)
 	// Typed rejection BEFORE any manifest read or mutation — see
 	// ErrRefNameNotUTF8 (Codex round 4 on PR #156, security).
 	if !utf8.ValidString(name) {
-		return false, fmt.Errorf("cas %s/%q: %w", repo, name, ErrRefNameNotUTF8)
+		return false, 0, fmt.Errorf("cas %s/%q: %w", repo, name, ErrRefNameNotUTF8)
 	}
 	fence, fenced := casFence(ctx, repo)
 	// matches reports whether the precondition holds on m — the shared
@@ -799,7 +813,7 @@ func (s *S3WAL) CASRef(ctx context.Context, repo, name, old, new string) (won bo
 		op:    "cas ref",
 		grows: func() bool { return old == ZeroSHA }, // only creates insert
 		fn: func(m *s3wal.Manifest, clk time.Time) (bool, error) {
-			won = false
+			won, gen = false, 0
 			if m.PurgedAt != nil {
 				// Same taxonomy as SQL (issue #52): the statement
 				// provably never executed, so IdempotentCAS must not
@@ -825,7 +839,7 @@ func (s *S3WAL) CASRef(ctx context.Context, repo, name, old, new string) (won bo
 				mem.Refs[name] = r
 			}
 			mem.Gen++ // one changed row = one bump (the trigger contract)
-			won = true
+			won, gen = true, mem.Gen
 			return true, nil
 		},
 		recover: func(fresh *s3wal.Manifest) s3walVerdict {
@@ -839,9 +853,9 @@ func (s *S3WAL) CASRef(ctx context.Context, repo, name, old, new string) (won bo
 		},
 	})
 	if err != nil {
-		return false, err
+		return false, 0, err
 	}
-	return won, nil
+	return won, gen, nil
 }
 
 // ---------------------------------------------------------------------------

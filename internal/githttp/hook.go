@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -86,6 +87,13 @@ const (
 	// just-committed ref into the shared cache repo). Later invocations
 	// pass through untouched.
 	EnvUpdateBarrier = "CODESTORAGE_TEST_UPDATE_BARRIER"
+	// EnvUpdateBarrierEach is EnvUpdateBarrier's per-command variant: a
+	// handshake-path PREFIX at which EVERY update hook pauses after its
+	// committed authority CAS, each under a ref-derived suffix (issue
+	// #186 finding 5: the coalescing e2e lane interleaves advertisements
+	// BETWEEN a fanout's hook CASes, which the one-shot barrier cannot
+	// stage).
+	EnvUpdateBarrierEach = "CODESTORAGE_TEST_UPDATE_BARRIER_EACH"
 	// EnvPreReceiveBarrier holds a handshake-file path prefix; the first
 	// pre-receive to create <path>.ready pauses AFTER pack publication
 	// and BEFORE the deferred hold reservation (Codex round-23 security
@@ -1763,12 +1771,21 @@ func updateHook(ctx context.Context, args []string) (retErr error) {
 	}
 	store := WrapHookRefStore(ctx, inner)
 	assertf(store != nil, "WrapHookRefStore returned nil")
-	won, err := store.CASRef(ctx, repo, refName, old, new)
+	won, casGen, err := store.CASRefGen(ctx, repo, refName, old, new)
 	if err != nil {
 		return err
 	}
 	if !won {
 		return fmt.Errorf("CAS conflict: %s moved concurrently (expected %.8s)", refName, old)
+	}
+	// Claim the attribution under this push's hold (issue #186 finding 5):
+	// best-effort — a lost claim only narrows what a held marker can
+	// coalesce (a rescan, never staleness). gen == 0 (a recovered
+	// ambiguous win) claims nothing: the committed generation is
+	// unknowable after the fact, and guessing could claim an external
+	// writer's bump.
+	if holdPath != "" && casGen > 0 {
+		_ = appendPushHoldGen(holdPath, casGen)
 	}
 	// Test seam (issue #170): pause between the committed authority CAS and
 	// receive-pack's local ref update so the e2e lane can deterministically
@@ -1777,8 +1794,18 @@ func updateHook(ctx context.Context, args []string) (retErr error) {
 		if p := os.Getenv(EnvUpdateBarrier); p != "" {
 			pauseAtUpdateBarrier(p)
 		}
+		if p := os.Getenv(EnvUpdateBarrierEach); p != "" {
+			pauseAtUpdateBarrier(updateBarrierEachPath(p, refName))
+		}
 	}
 	return nil
+}
+
+// updateBarrierEachPath derives one ref's EnvUpdateBarrierEach handshake
+// path (hashed: ref names contain separators no flat handshake file can).
+func updateBarrierEachPath(prefix, refName string) string {
+	sum := sha256.Sum256([]byte(refName))
+	return prefix + "-" + hex.EncodeToString(sum[:8])
 }
 
 // pauseAtUpdateBarrier implements the EnvUpdateBarrier handshake: the first
@@ -1971,6 +1998,16 @@ func (s casDropStore) CASRef(ctx context.Context, repo, name, old, new string) (
 		return false, err
 	}
 	return false, errCASDrop
+}
+
+// CASRefGen mirrors CASRef's fault (an explicit override: interface
+// embedding would silently forward past the drop): the inner swap
+// executes, then the outcome — attribution included — is lost.
+func (s casDropStore) CASRefGen(ctx context.Context, repo, name, old, new string) (bool, int64, error) {
+	if _, _, err := s.RefStore.CASRefGen(ctx, repo, name, old, new); err != nil {
+		return false, 0, err
+	}
+	return false, 0, errCASDrop
 }
 
 func (s casDropStore) GetRef(ctx context.Context, repo, name string) (string, error) {

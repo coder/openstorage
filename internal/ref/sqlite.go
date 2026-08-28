@@ -343,7 +343,20 @@ func (s *SQLite) GetRef(ctx context.Context, repo, name string) (string, error) 
 // steal, so a stolen run's update can never commit after the thief's
 // claim (issue #86). Requires the shared local database (meta + ref in
 // one --data-dir file).
-func (s *SQLite) CASRef(ctx context.Context, repo, name, old, new string) (won bool, err error) {
+func (s *SQLite) CASRef(ctx context.Context, repo, name, old, new string) (bool, error) {
+	won, _, err := s.casRef(ctx, repo, name, old, new, false)
+	return won, err
+}
+
+// CASRefGen implements the RefStore contract: exact win attribution. The
+// schema triggers fire immediately (unlike PG's deferred constraint
+// triggers), so the post-bump value is readable inside the transaction,
+// and BEGIN IMMEDIATE's single-writer property makes it exact.
+func (s *SQLite) CASRefGen(ctx context.Context, repo, name, old, new string) (bool, int64, error) {
+	return s.casRef(ctx, repo, name, old, new, true)
+}
+
+func (s *SQLite) casRef(ctx context.Context, repo, name, old, new string, wantGen bool) (won bool, gen int64, err error) {
 	assertf(ValidSHA(old), "CASRef: malformed old sha %q", old)
 	assertf(ValidSHA(new), "CASRef: malformed new sha %q", new)
 	assertf(old != ZeroSHA || new != ZeroSHA, "CASRef: zero -> zero update for %s/%s", repo, name)
@@ -353,7 +366,7 @@ func (s *SQLite) CASRef(ctx context.Context, repo, name, old, new string) (won b
 	// IdempotentCAS must not recover such errors (see notExecuted).
 	conn, err := s.db.Conn(ctx)
 	if err != nil {
-		return false, fmt.Errorf("cas acquire %s/%s: %w", repo, name, notExecuted(err))
+		return false, 0, fmt.Errorf("cas acquire %s/%s: %w", repo, name, notExecuted(err))
 	}
 	defer func() { _ = conn.Close() }()
 	// Pre-dispatch guard: a context canceled after acquire but before
@@ -362,22 +375,22 @@ func (s *SQLite) CASRef(ctx context.Context, repo, name, old, new string) (won b
 	// surfaces as a *sqlite.Error interrupt, which the ambiguity classifier
 	// already treats as a definitive backend rejection.)
 	if cerr := ctx.Err(); cerr != nil {
-		return false, fmt.Errorf("cas %s/%s: %w", repo, name, notExecuted(cerr))
+		return false, 0, fmt.Errorf("cas %s/%s: %w", repo, name, notExecuted(cerr))
 	}
 
 	// Everything up to (but excluding) the CAS statement is provably
 	// non-executing: an error here means the mutation was never sent.
 	tx, err := conn.BeginTx(ctx, nil) // BEGIN IMMEDIATE via _txlock
 	if err != nil {
-		return false, fmt.Errorf("cas begin %s/%s: %w", repo, name, notExecuted(err))
+		return false, 0, fmt.Errorf("cas begin %s/%s: %w", repo, name, notExecuted(err))
 	}
 	defer func() { _ = tx.Rollback() }()
 	purged, err := repoPurgeFencedSQLite(ctx, tx, repo)
 	if err != nil {
-		return false, fmt.Errorf("cas %s/%s: purge fence: %w", repo, name, notExecuted(err))
+		return false, 0, fmt.Errorf("cas %s/%s: purge fence: %w", repo, name, notExecuted(err))
 	}
 	if purged {
-		return false, fmt.Errorf("cas %s/%s: %w", repo, name, notExecuted(ErrRepoPurged))
+		return false, 0, fmt.Errorf("cas %s/%s: %w", repo, name, notExecuted(ErrRepoPurged))
 	}
 
 	fence, fenced := casFence(ctx, repo)
@@ -424,20 +437,32 @@ func (s *SQLite) CASRef(ctx context.Context, repo, name, old, new string) (won b
 		tag = "fenced update"
 	}
 	if err != nil {
-		return false, fmt.Errorf("cas %s %s/%s: %w", tag, repo, name, err)
+		return false, 0, fmt.Errorf("cas %s %s/%s: %w", tag, repo, name, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, 0, fmt.Errorf("cas %s %s/%s rows: %w", tag, repo, name, err)
+	}
+	assertf(n == 0 || n == 1, "cas %s %s/%s affected %d rows", tag, repo, name, n)
+	if wantGen && n == 1 {
+		// The immediate trigger already bumped inside this transaction,
+		// and BEGIN IMMEDIATE excludes every other writer until commit,
+		// so this read IS the exact post-CAS value. A failure here rolls
+		// the transaction back — the swap never commits — so it carries
+		// the not-executed marker like every pre-commit step.
+		if gerr := tx.QueryRowContext(ctx,
+			`SELECT generation FROM repo_generations WHERE repo = ?`,
+			repo).Scan(&gen); gerr != nil {
+			return false, 0, fmt.Errorf("cas %s %s/%s: generation read: %w", tag, repo, name, notExecuted(gerr))
+		}
 	}
 	// A commit failure is NOT notExecuted: the response may have been
 	// lost after the backend committed — exactly the ambiguity class the
 	// IdempotentCAS recovery recheck exists for.
 	if err := tx.Commit(); err != nil {
-		return false, fmt.Errorf("cas %s %s/%s: commit: %w", tag, repo, name, err)
+		return false, 0, fmt.Errorf("cas %s %s/%s: commit: %w", tag, repo, name, err)
 	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return false, fmt.Errorf("cas %s %s/%s rows: %w", tag, repo, name, err)
-	}
-	assertf(n == 0 || n == 1, "cas %s %s/%s affected %d rows", tag, repo, name, n)
-	return n == 1, nil
+	return n == 1, gen, nil
 }
 
 // RegisterPacks inserts pack rows in ONE transaction (crash-ordering: this

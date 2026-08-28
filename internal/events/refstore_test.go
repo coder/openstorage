@@ -51,6 +51,13 @@ func (f *fakeInner) GetRef(context.Context, string, string) (string, error) {
 func (f *fakeInner) CASRef(_ context.Context, _, _, _, _ string) (bool, error) {
 	return f.won, f.err
 }
+func (f *fakeInner) CASRefGen(_ context.Context, _, _, _, _ string) (bool, int64, error) {
+	gen := int64(0)
+	if f.won {
+		gen = 1
+	}
+	return f.won, gen, f.err
+}
 func (f *fakeInner) RegisterPacks(context.Context, string, []ref.Pack) error { return nil }
 func (f *fakeInner) ReplacePacks(context.Context, string, []ref.Pack, ref.Pack) (bool, error) {
 	return false, nil

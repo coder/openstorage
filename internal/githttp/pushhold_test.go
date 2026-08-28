@@ -1383,14 +1383,19 @@ func TestLivePushHoldsKey_StatOnly(t *testing.T) {
 	if delta := after.TotalAlloc - before.TotalAlloc; delta > 1<<20 {
 		t.Fatalf("livePushHoldsKey allocated %d bytes across 10 calls over a 100k-name hold: it is reading content, not statting", delta)
 	}
-	// A refresher touch invalidates (mtime moves; near-future is live).
+	// A refresher touch must NOT invalidate (issue #186 finding 5):
+	// every hook of a fanout synchronously touches its hold's mtime, so
+	// a touch-sensitive key changed once per hook and no held marker
+	// could survive the very window range coalescing exists for. Touches
+	// are liveness maintenance; coverage changes are appends (size),
+	// rewrites (inode), and unlinks (absence + epoch), all still folded.
 	touched := time.Now().Add(time.Second)
 	if err := os.Chtimes(hold, touched, touched); err != nil {
 		t.Fatalf("chtimes: %v", err)
 	}
 	key3, ok := livePushHoldsKey(repoDir)
-	if !ok || key3 == key1 {
-		t.Fatal("refresher touch must change the fingerprint")
+	if !ok || key3 != key1 {
+		t.Fatal("a refresher touch is not a coverage change; the fingerprint must hold")
 	}
 	// An append invalidates (size moves).
 	f, err := os.OpenFile(hold, os.O_APPEND|os.O_WRONLY, 0o644)
@@ -1406,14 +1411,16 @@ func TestLivePushHoldsKey_StatOnly(t *testing.T) {
 		t.Fatal("hold append must change the fingerprint")
 	}
 	// Expiry (past the round-25 two-observation grace) drops the hold
-	// out — same key as no holds at all.
+	// out — same key as no holds at all. The first suspicious
+	// observation arms the reap marker but the hold stays LIVE, and a
+	// live hold's mtime is not folded: the key must hold steady.
 	past := time.Now().Add(-pushHoldTTL - time.Minute)
 	if err := os.Chtimes(hold, past, past); err != nil {
 		t.Fatalf("chtimes: %v", err)
 	}
 	keySuspect, ok := livePushHoldsKey(repoDir)
-	if !ok || keySuspect == key4 {
-		t.Fatal("the expired-looking observation must still change the fingerprint (mtime moved)")
+	if !ok || keySuspect != key4 {
+		t.Fatal("a still-live suspicious observation is not a coverage change; the fingerprint must hold")
 	}
 	markerPast := time.Now().Add(-pushHoldTTL/2 - time.Minute)
 	if err := os.Chtimes(hold+pushHoldReapSuffix, markerPast, markerPast); err != nil {
@@ -4561,5 +4568,205 @@ func TestRunHook_PreAppendReservationFailureReleasesNothing(t *testing.T) {
 	}
 	if string(epochBefore) != string(epochAfter) {
 		t.Fatal("a release of a never-covered name must not invalidate held markers")
+	}
+}
+
+// seedHeldMarkerFixture builds a hold dir with one live hold, seeds the
+// epoch, and publishes a held marker at hgen under the current live-holds
+// fingerprint. Returns the hold path.
+func seedHeldMarkerFixture(t *testing.T, repoPath string, hgen int64) string {
+	t.Helper()
+	dir := filepath.Join(repoPath, pushHoldDir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := bumpPushHoldEpoch(dir); err != nil {
+		t.Fatalf("seed epoch: %v", err)
+	}
+	hold := filepath.Join(dir, "push-claims")
+	if err := os.WriteFile(hold, []byte("refs/heads/x\n"), 0o600); err != nil {
+		t.Fatalf("write hold: %v", err)
+	}
+	key, ok := livePushHoldsKey(repoPath)
+	if !ok {
+		t.Fatal("livePushHoldsKey failed")
+	}
+	writeHeldGenerationMarker(repoPath, hgen, "refs/heads/main", key)
+	return hold
+}
+
+// TestHeldMarkerValid_CoversClaimedGenerationRange (issue #186 finding 5):
+// an atomic high-fanout push bumps the store generation once per committed
+// hook CAS while its hold stays live and untouched — a marker recording
+// one exact generation misses every advertisement during that window and
+// pays a full pack listing + ref paging each time. With every generation
+// in (hgen, gen] claimed by a LIVE hold's .gens sidecar (each claim the
+// exact CASRefGen attribution of a ref that hold covers), the marked
+// scan's skip verdicts still stand — the mutated refs were all held then
+// and still are — so the marker must vouch for gen too. Any unclaimed
+// generation is external work and must force the healing rescan.
+func TestHeldMarkerValid_CoversClaimedGenerationRange(t *testing.T) {
+	repoPath := t.TempDir()
+	hold := seedHeldMarkerFixture(t, repoPath, 5)
+	if err := os.WriteFile(hold+pushHoldGensSuffix, []byte("6\n7\n8\n"), 0o600); err != nil {
+		t.Fatalf("write claims: %v", err)
+	}
+	if !heldMarkerValid(repoPath, 5, "refs/heads/main") {
+		t.Fatal("exact-generation validation must keep working")
+	}
+	if !heldMarkerValid(repoPath, 8, "refs/heads/main") {
+		t.Fatal("a fully claimed range (5,8] must extend the marker's coverage")
+	}
+	if heldMarkerValid(repoPath, 9, "refs/heads/main") {
+		t.Fatal("generation 9 is unclaimed; the marker must not cover it")
+	}
+}
+
+// TestHeldMarkerValid_UnclaimedGapForcesRescan: a hole INSIDE the claimed
+// range — a REST write, another replica, a completed push interleaved
+// with the fanout — means the marked scan's verdicts may not reproduce;
+// the validation must fail even though later generations are claimed.
+func TestHeldMarkerValid_UnclaimedGapForcesRescan(t *testing.T) {
+	repoPath := t.TempDir()
+	hold := seedHeldMarkerFixture(t, repoPath, 5)
+	if err := os.WriteFile(hold+pushHoldGensSuffix, []byte("7\n8\n"), 0o600); err != nil {
+		t.Fatalf("write claims: %v", err)
+	}
+	if heldMarkerValid(repoPath, 8, "refs/heads/main") {
+		t.Fatal("generation 6 is unclaimed; the gap must force the rescan")
+	}
+}
+
+// TestHeldMarkerValid_NonLiveHoldClaimsIgnored (fail-safe): claims vanish
+// with their hold — an expired hold's sidecar may still sit on disk until
+// the sweep, but its push is gone and nothing vouches for its refs
+// anymore. Only LIVE holds' claims may extend a marker; a dead hold's
+// range must read as unclaimed and rescan.
+func TestHeldMarkerValid_NonLiveHoldClaimsIgnored(t *testing.T) {
+	repoPath := t.TempDir()
+	seedHeldMarkerFixture(t, repoPath, 5)
+	// A second hold, already expired BEFORE the marker was published, so
+	// the fingerprint excludes it from both snapshots: (a) passes and the
+	// range rule alone decides.
+	dir := filepath.Join(repoPath, pushHoldDir)
+	dead := filepath.Join(dir, "push-dead")
+	if err := os.WriteFile(dead, []byte("refs/heads/y\n"), 0o600); err != nil {
+		t.Fatalf("write dead hold: %v", err)
+	}
+	if err := os.WriteFile(dead+pushHoldGensSuffix, []byte("6\n"), 0o600); err != nil {
+		t.Fatalf("write dead claims: %v", err)
+	}
+	expireHold(t, dead)
+	key, ok := livePushHoldsKey(repoPath)
+	if !ok {
+		t.Fatal("livePushHoldsKey failed")
+	}
+	writeHeldGenerationMarker(repoPath, 5, "refs/heads/main", key)
+	if heldMarkerValid(repoPath, 6, "refs/heads/main") {
+		t.Fatal("an expired hold's claims must not extend the marker")
+	}
+}
+
+// TestHeldMarkerValid_QuarantinedHoldClaimsCount: a live hold riding at
+// its quarantine name mid-reap-window keeps its sidecars at the BASE name
+// (the reap renames only the hold file). The range rule must read claims
+// through holdSidecarOwner exactly like every other sidecar consumer
+// (PR #195 round-18 lesson: the fingerprint reader missed this mapping a
+// round after the coverage readers gained it).
+func TestHeldMarkerValid_QuarantinedHoldClaimsCount(t *testing.T) {
+	repoPath := t.TempDir()
+	dir := filepath.Join(repoPath, pushHoldDir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := bumpPushHoldEpoch(dir); err != nil {
+		t.Fatalf("seed epoch: %v", err)
+	}
+	hold := filepath.Join(dir, "push-q")
+	if err := os.WriteFile(hold+".reaping", []byte("refs/heads/x\n"), 0o600); err != nil {
+		t.Fatalf("write quarantined hold: %v", err)
+	}
+	if err := os.WriteFile(hold+pushHoldGensSuffix, []byte("6\n"), 0o600); err != nil {
+		t.Fatalf("write claims: %v", err)
+	}
+	key, ok := livePushHoldsKey(repoPath)
+	if !ok {
+		t.Fatal("livePushHoldsKey failed")
+	}
+	writeHeldGenerationMarker(repoPath, 5, "refs/heads/main", key)
+	if !heldMarkerValid(repoPath, 6, "refs/heads/main") {
+		t.Fatal("a quarantined live hold's claims must count (owner-path mapping)")
+	}
+}
+
+// TestHeldMarkerValid_OversizedClaimsFailSafe: a claims sidecar past the
+// hard read cap is treated as unclaimed — bounded validation cost, and
+// the failure direction is a rescan, never a stale skip.
+func TestHeldMarkerValid_OversizedClaimsFailSafe(t *testing.T) {
+	repoPath := t.TempDir()
+	hold := seedHeldMarkerFixture(t, repoPath, 5)
+	var sb strings.Builder
+	sb.WriteString("6\n")
+	for int64(sb.Len()) <= maxPushHoldGensBytes {
+		sb.WriteString("999999999\n")
+	}
+	if err := os.WriteFile(hold+pushHoldGensSuffix, []byte(sb.String()), 0o600); err != nil {
+		t.Fatalf("write claims: %v", err)
+	}
+	if heldMarkerValid(repoPath, 6, "refs/heads/main") {
+		t.Fatal("an over-cap claims sidecar must fail safe to a rescan")
+	}
+}
+
+// TestHeldMarkerValid_ForwardRewriteShortensNextValidation: a successful
+// range validation rewrites the marker forward (best-effort) so later
+// validations verify a shorter suffix instead of re-walking the whole
+// claimed range every time.
+func TestHeldMarkerValid_ForwardRewriteShortensNextValidation(t *testing.T) {
+	repoPath := t.TempDir()
+	hold := seedHeldMarkerFixture(t, repoPath, 5)
+	if err := os.WriteFile(hold+pushHoldGensSuffix, []byte("6\n7\n"), 0o600); err != nil {
+		t.Fatalf("write claims: %v", err)
+	}
+	if !heldMarkerValid(repoPath, 7, "refs/heads/main") {
+		t.Fatal("claimed range (5,7] must validate")
+	}
+	hgen, _, _, _, ok := readHeldGenerationMarker(repoPath)
+	if !ok {
+		t.Fatal("marker must survive the forward rewrite")
+	}
+	if hgen != 7 {
+		t.Fatalf("marker generation after validation = %d, want 7 (forward rewrite)", hgen)
+	}
+}
+
+// TestHeldMarkerValid_ReapedHoldForcesRescan (issue #186 finding 5, the
+// fail-safe direction): a crash-leaked hold's reap unlinks the hold AND
+// its claims sidecar under an epoch bump — the vanished claims can never
+// extend any marker again, and the changed fingerprint fails the
+// validation outright, forcing the healing rescan that re-applies the
+// dead push's skipped refs.
+func TestHeldMarkerValid_ReapedHoldForcesRescan(t *testing.T) {
+	repoPath := t.TempDir()
+	hold := seedHeldMarkerFixture(t, repoPath, 5)
+	if err := os.WriteFile(hold+pushHoldGensSuffix, []byte("6\n"), 0o600); err != nil {
+		t.Fatalf("write claims: %v", err)
+	}
+	if !heldMarkerValid(repoPath, 6, "refs/heads/main") {
+		t.Fatal("claimed range (5,6] must validate while the hold lives")
+	}
+	// The forward rewrite moved the marker to 6; the reap must invalidate
+	// even the exact-generation check.
+	expireHold(t, hold)
+	info, err := os.Stat(hold)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	reapExpiredPushHold(hold, info.ModTime())
+	if _, err := os.Stat(hold + pushHoldGensSuffix); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("reap must unlink the claims sidecar: %v", err)
+	}
+	if heldMarkerValid(repoPath, 6, "refs/heads/main") {
+		t.Fatal("a reaped hold's marker must fail validation (fingerprint + vanished claims)")
 	}
 }
