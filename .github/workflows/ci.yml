@@ -3,7 +3,9 @@
 # githttp e2e pg lane) boot their own postgres/seaweedfs containers via
 # testcontainers, so they only need Docker on the runner — no service
 # containers. The local lane covers the zero-container sqlite+fileblob e2e
-# tests that are skipped in the default pg lane.
+# tests that are skipped in the default pg lane; the s3wal lane covers the
+# zero-infra serve path (bucket-only authority) that was nightly-only before
+# issue #193.
 name: ci
 
 on:
@@ -69,3 +71,30 @@ jobs:
       - run: go test ./internal/githttp -count=1 -race -timeout=15m
         env:
           CODESTORAGE_TEST_BACKEND: local
+
+  # The s3wal serve/e2e lane (issue #193; promotion tracking #192, item B1):
+  # internal/githttp's TestMain boots the zero-infra topology — one SeaweedFS
+  # bucket (testcontainer) carrying the s3wal ref+meta authority (_wal/) AND
+  # the packs/LFS blobs — and drives real `git` against child serve
+  # processes: the full shared e2e suite plus the lane-only drills
+  # (restart-from-bucket, SIGTERM lease release, dual-serve refusal).
+  # Scoped to ./internal/githttp deliberately: that TestMain is the only
+  # consumer of CODESTORAGE_TEST_BACKEND, so a full ./... run under this
+  # lane would replay every other package byte-identically with the `test`
+  # job above (the s3wal CAS/qualification suites in internal/ref/s3wal and
+  # the MemCAS-backed s3wal meta suite in internal/meta already run there
+  # unconditionally). The harness itself exports CODESTORAGE_S3WAL_LEASE_TTL=0
+  # to its serve children (many serve processes legitimately share the one
+  # lane bucket); the job only selects the lane.
+  test-s3wal:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - run: git lfs version
+      - run: go test ./internal/githttp -count=1 -race -timeout=25m
+        env:
+          CODESTORAGE_TEST_BACKEND: s3wal
