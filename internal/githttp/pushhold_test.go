@@ -2731,9 +2731,12 @@ func TestPushHoldReaders_SubtractTombstones(t *testing.T) {
 	if set.contains("refs/heads/done") || set.contains("refs/heads/dir") || !set.contains("refs/heads/busy") {
 		t.Fatalf("parsed set subtraction wrong: %v", set.names)
 	}
-	// Quarantine window: the hold file rides at its .reaping name, whose
-	// released-sidecar path does not exist — tombstones are ignored and
-	// everything the hold lists is covered again until restore/unlink.
+	// Quarantine window (PR #195 round-16 security P2): the hold file
+	// rides at its .reaping name while its sidecars stay at the BASE
+	// name — readers must keep the association, or the quarantine/restore
+	// lifecycle (net-zero renames, invisible to the fingerprint) lets a
+	// mid-window scan over-hold released coverage that the bracketing
+	// keys then certify as reproducible until the TTL.
 	if err := os.Rename(hold, hold+".reaping"); err != nil {
 		t.Fatalf("quarantine: %v", err)
 	}
@@ -2741,8 +2744,22 @@ func TestPushHoldReaders_SubtractTombstones(t *testing.T) {
 	if err != nil {
 		t.Fatalf("peerHoldCovers quarantined: %v", err)
 	}
+	if covered {
+		t.Fatal("a quarantined hold's tombstones must keep applying through the reap window")
+	}
+	covered, _, err = peerHoldCovers(dir, "", "refs/heads/busy", maxPushPeerScanBytes)
+	if err != nil {
+		t.Fatalf("peerHoldCovers quarantined busy: %v", err)
+	}
 	if !covered {
-		t.Fatal("a quarantined peer's tombstones must be ignored for the reap window")
+		t.Fatal("a quarantined hold's unreleased names must stay covered")
+	}
+	set, err = readPushHolds(dir, "")
+	if err != nil {
+		t.Fatalf("readPushHolds quarantined: %v", err)
+	}
+	if set.contains("refs/heads/done") || !set.contains("refs/heads/busy") {
+		t.Fatalf("parsed-set subtraction must follow the hold into quarantine: %v", set.names)
 	}
 }
 

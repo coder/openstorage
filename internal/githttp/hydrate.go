@@ -2207,6 +2207,21 @@ var linkFile = os.Link
 // orphan sweep's confirmed-absence rule needs deterministic EIO).
 var statFile = os.Stat
 
+// holdSidecarOwner maps a hold FILE path to the path its sidecars are
+// named under: a quarantined hold (`push-X.reaping`) keeps its sidecars
+// at the BASE name — the reap renames only the hold file (PR #195
+// round-16 security P2: readers that sought `push-X.reaping.released`
+// lost the tombstone association for the quarantine window, letting a
+// scan over-hold released coverage while the bracketing fingerprints —
+// blind to the net-zero quarantine/restore renames — still matched and
+// certified its skips until the TTL).
+func holdSidecarOwner(path string) string {
+	if base, ok := strings.CutSuffix(path, ".reaping"); ok {
+		return base
+	}
+	return path
+}
+
 // errPushScanBudget marks a peer scan denied MID-SCAN because reading the
 // next file would exceed the push's remaining allowance (PR #195 round-12
 // P2): the precheck's size snapshot cannot bind flock-less tombstone
@@ -2336,7 +2351,7 @@ func (c *pushHoldDirCache) load() (pushHoldSet, error) {
 			continue
 		}
 		relSize, relMtime := int64(-1), int64(-1)
-		if ri, ok := released[path]; ok {
+		if ri, ok := released[holdSidecarOwner(path)]; ok {
 			relSize, relMtime = ri.Size(), ri.ModTime().UnixNano()
 		}
 		parse, ok := c.files[path]
@@ -2375,7 +2390,7 @@ func (c *pushHoldDirCache) load() (pushHoldSet, error) {
 			// re-parses on the next load via the fresh stat.
 			var tombstoned map[string]bool
 			if relSize >= 0 {
-				if rb, err := readFileLimit(path+pushHoldReleasedSuffix, relSize); err == nil {
+				if rb, err := readFileLimit(holdSidecarOwner(path)+pushHoldReleasedSuffix, relSize); err == nil {
 					c.parsedBytes += int64(len(rb))
 					// Trust only newline-TERMINATED records (PR #195
 					// round-1 P2): a short append (ENOSPC, EIO) strands a
@@ -2566,7 +2581,7 @@ func peerHoldCovers(dir, exceptPath, name string, remaining int64) (bool, int64,
 		// direction (a hold file's unreadability above stays fail-closed,
 		// because there a missed line would UNDER-hold). Bytes charged
 		// like the hold's own.
-		if rf, err := os.Open(path + pushHoldReleasedSuffix); err == nil {
+		if rf, err := os.Open(holdSidecarOwner(path) + pushHoldReleasedSuffix); err == nil {
 			var sampled int64
 			if ri, err := rf.Stat(); err == nil {
 				sampled = ri.Size()
@@ -2691,7 +2706,7 @@ func pushHoldPendingBytes(dir, exceptPath string, cached map[string]holdFilePars
 			continue // released between the listing and the stat
 		}
 		relSize, relMtime := int64(-1), int64(-1)
-		if ri, ok := released[path]; ok {
+		if ri, ok := released[holdSidecarOwner(path)]; ok {
 			relSize, relMtime = ri.Size(), ri.ModTime().UnixNano()
 		}
 		if parse, ok := cached[path]; ok && parse.size == info.Size() && parse.mtime == info.ModTime().UnixNano() &&
