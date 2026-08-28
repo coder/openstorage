@@ -1881,6 +1881,76 @@ func TestReapExpiredPushHold_RestoresLockedHold(t *testing.T) {
 	}
 }
 
+// TestReapExpiredPushHold_ReservationDuringQuarantineSurvives (Codex
+// round-33 P1 on #173/#186): while a live hold sits in quarantine, a JIT
+// or sidecar hook's reservePushHolds can recreate the hold path and
+// append a NEW reservation — and the reaper's restore rename would
+// silently replace that file, discarding a reservation whose hook then
+// commits its CAS believing the ref is held, reopening the hydration
+// race. The reap must run under the same reservation flock the append
+// path serializes on, so a mid-quarantine reservation lands strictly
+// before the quarantine or strictly after the restore — never underneath
+// it.
+func TestReapExpiredPushHold_ReservationDuringQuarantineSurvives(t *testing.T) {
+	repoDir := t.TempDir()
+	dir := filepath.Join(repoDir, pushHoldDir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	hold := filepath.Join(dir, "push-quarantine-race")
+	if err := os.WriteFile(hold, []byte("refs/heads/x\n"), 0o600); err != nil {
+		t.Fatalf("write hold: %v", err)
+	}
+	old := time.Now().Add(-2 * pushHoldTTL)
+	if err := os.Chtimes(hold, old, old); err != nil {
+		t.Fatalf("age hold: %v", err)
+	}
+	info, err := os.Stat(hold)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	// A live owner: the refresher's shared liveness flock vetoes the
+	// unlink, forcing the reaper down the RESTORE path.
+	f, err := os.OpenFile(hold, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer f.Close()
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_SH|syscall.LOCK_NB); err != nil {
+		t.Fatalf("flock: %v", err)
+	}
+	// Mid-quarantine, the push's own hook reserves an additional name.
+	// Unfixed, the reservation recreates the hold path and completes
+	// immediately; fixed, it blocks on the reservation flock until the
+	// reap finishes (the 200ms timeout lets the reaper proceed).
+	done := make(chan error, 1)
+	testHookReapAfterQuarantine = func() {
+		go func() { done <- reservePushHolds(context.Background(), hold, []string{"refs/heads/new"}) }()
+		select {
+		case err := <-done:
+			done <- err
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+	defer func() { testHookReapAfterQuarantine = nil }()
+	reapExpiredPushHold(hold, info.ModTime())
+	if err := <-done; err != nil {
+		t.Fatalf("mid-quarantine reservation: %v", err)
+	}
+	b, err := os.ReadFile(hold)
+	if err != nil {
+		t.Fatalf("read hold: %v", err)
+	}
+	for _, name := range []string{"refs/heads/x\n", "refs/heads/new\n"} {
+		if !strings.Contains(string(b), name) {
+			t.Fatalf("restore discarded a reservation: hold = %q, want %q", b, name)
+		}
+	}
+	if _, err := os.Stat(hold + ".reaping"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("quarantine must not linger after a restore")
+	}
+}
+
 // TestPushHoldRefresh_HoldsLivenessLock (Codex round-32 P2 on #173): the
 // refresher must hold the shared liveness flock the reaper's exclusive
 // lock checks against — without it the kernel gate above protects
@@ -1944,6 +2014,51 @@ func TestLivePushHoldsKey_TransientHoldChangesKey(t *testing.T) {
 	key3, ok := livePushHoldsKey(repoDir)
 	if !ok || key3 != key2 {
 		t.Fatalf("key unstable without lifecycle transitions: %q vs %q", key3, key2)
+	}
+}
+
+// TestLivePushHoldsKey_MidSnapshotTransientChangesKey (Codex round-33 P2
+// on #173/#186): one snapshot's directory listing and epoch read are two
+// reads with a gap. Listing FIRST let a transient hold slip between them
+// — the pre-scan lists the old set yet reads the post-create epoch, and
+// when the release's explicitly best-effort bump is lost, the post-scan
+// reproduces exactly that mixed-generation key: a held marker publishes
+// for a hold set that changed mid-scan. Reading the epoch BEFORE the
+// listing closes it — the fail-closed create bump then lands strictly
+// after the pre-scan's epoch read, so the bracketing keys differ even
+// with the release bump lost.
+func TestLivePushHoldsKey_MidSnapshotTransientChangesKey(t *testing.T) {
+	repoDir := t.TempDir()
+	dir := filepath.Join(repoDir, pushHoldDir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := bumpPushHoldEpoch(dir); err != nil {
+		t.Fatalf("seed epoch: %v", err)
+	}
+	testHookHoldsKeyMidSnapshot = func() {
+		transient := filepath.Join(dir, "push-transient")
+		if err := reservePushHolds(context.Background(), transient, []string{"refs/heads/y"}); err != nil {
+			t.Errorf("reserve transient hold: %v", err)
+		}
+		// Release with the best-effort epoch bump LOST (delayed past the
+		// post-scan or failed): a raw unlink, exactly what the reviewer's
+		// trace requires.
+		if err := os.Remove(transient); err != nil {
+			t.Errorf("remove transient hold: %v", err)
+		}
+	}
+	key1, ok := livePushHoldsKey(repoDir)
+	testHookHoldsKeyMidSnapshot = nil
+	if !ok {
+		t.Fatal("livePushHoldsKey failed")
+	}
+	key2, ok := livePushHoldsKey(repoDir)
+	if !ok {
+		t.Fatal("livePushHoldsKey failed")
+	}
+	if key1 == key2 {
+		t.Fatal("a transient lifecycle inside one snapshot must change the key")
 	}
 }
 

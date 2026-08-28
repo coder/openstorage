@@ -1472,6 +1472,13 @@ func sweepExpiredPushHolds(dir string) {
 	}
 }
 
+// Test seams: called (when non-nil) at interleaving points concurrency
+// tests cannot otherwise reach deterministically. Nil in production.
+var (
+	testHookReapAfterQuarantine func()
+	testHookHoldsKeyMidSnapshot func()
+)
+
 // reapExpiredPushHold removes an expiry-verdict hold with the verdict and
 // the removal LINEARIZED at one rename (Codex round-31 P2 on #173): the
 // two-observation verdict and the unlink used to be separate filesystem
@@ -1487,9 +1494,29 @@ func sweepExpiredPushHolds(dir string) {
 // its sidecars. Crash leftovers behave as ordinary leaked holds and age
 // out through the same two-observation expiry.
 func reapExpiredPushHold(path string, observed time.Time) {
+	// The whole quarantine→verdict→restore/unlink window runs under the
+	// reservation flock that appendPushHolds' callers serialize on (Codex
+	// round-33 P1 on #173/#186): the quarantine rename removes the hold
+	// PATH, so a JIT or sidecar hook's reservePushHolds could otherwise
+	// recreate it with a NEW reservation that the restore rename below
+	// silently replaces — the hook then commits its CAS believing the ref
+	// is held, reopening the exact race this machinery closes. Try-lock
+	// only: a busy lock means reservations are in flight, so skip — the
+	// reap is best-effort and the next mint sweep retries.
+	lock, err := os.OpenFile(filepath.Dir(path)+".reserve.lock", os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return
+	}
+	defer func() { _ = lock.Close() }() // close releases the flock
+	if syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB) != nil {
+		return
+	}
 	quarantine := path + ".reaping"
 	if err := os.Rename(path, quarantine); err != nil {
 		return // released or already quarantined by a concurrent sweep
+	}
+	if testHookReapAfterQuarantine != nil {
+		testHookReapAfterQuarantine()
 	}
 	restore := func() { _ = os.Rename(quarantine, path) }
 	q, err := os.OpenFile(quarantine, os.O_WRONLY, 0)
@@ -2318,10 +2345,6 @@ const heldGenerationMarker = "codestorage.generation.held"
 // readers: expired files drop out, far-future mtimes are clamped live.
 func livePushHoldsKey(repoPath string) (string, bool) {
 	dir := filepath.Join(repoPath, pushHoldDir)
-	entries, err := os.ReadDir(dir)
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return "", false
-	}
 	var key strings.Builder
 	// The lifecycle epoch makes equal endpoint snapshots proof of a
 	// STABLE hold set (Codex round-32 P2): per-entry stats alone are
@@ -2333,10 +2356,26 @@ func livePushHoldsKey(repoPath string) (string, bool) {
 	// transition inside the bracket changes the key — clock-granularity
 	// independent, unlike a directory mtime. The tiny read stays within
 	// the stat-only cost contract.
+	//
+	// Read BEFORE the directory listing (Codex round-33 P2): listing
+	// first let a transient hold slip between the two reads — the listing
+	// carries the old set while the epoch already carries the create
+	// bump, and with the release's best-effort bump lost, the post-scan
+	// reproduces that same mixed-generation key. Epoch-first, any
+	// reservation completing after this read leaves its fail-closed
+	// create bump for the POST snapshot's epoch read, so the bracketing
+	// keys cannot fingerprint equal.
 	if b, err := os.ReadFile(dir + pushHoldEpochSuffix); err == nil {
 		key.Write(b)
 		key.WriteByte('\x01')
 	} else if !errors.Is(err, os.ErrNotExist) {
+		return "", false
+	}
+	if testHookHoldsKeyMidSnapshot != nil {
+		testHookHoldsKeyMidSnapshot()
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return "", false
 	}
 	for _, e := range entries {
