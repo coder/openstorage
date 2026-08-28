@@ -2048,16 +2048,16 @@ func TestLivePushHoldsKey_MidSnapshotTransientChangesKey(t *testing.T) {
 			t.Errorf("remove transient hold: %v", err)
 		}
 	}
-	key1, ok := livePushHoldsKey(repoDir)
+	key1, ok1 := livePushHoldsKey(repoDir)
 	testHookHoldsKeyMidSnapshot = nil
-	if !ok {
-		t.Fatal("livePushHoldsKey failed")
+	key2, ok2 := livePushHoldsKey(repoDir)
+	if !ok2 {
+		t.Fatal("livePushHoldsKey must succeed on a quiet hold set")
 	}
-	key2, ok := livePushHoldsKey(repoDir)
-	if !ok {
-		t.Fatal("livePushHoldsKey failed")
-	}
-	if key1 == key2 {
+	// Safe outcomes for the straddled snapshot: refused outright (the
+	// round-35 seqlock detects the mid-snapshot bump) or a key that can
+	// never equal the stable one. Equal keys are the bug.
+	if ok1 && key1 == key2 {
 		t.Fatal("a transient lifecycle inside one snapshot must change the key")
 	}
 }
@@ -2273,6 +2273,93 @@ func TestPushHoldRefresh_RetriesLostLivenessLock(t *testing.T) {
 			t.Fatal("refresher never re-acquired its liveness lock after losing the race")
 		}
 		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// TestLivePushHoldsKey_MidSnapshotLifecycleDetectedAfterListing (Codex
+// round-35 P2 on #173/#186): reading the epoch only BEFORE the listing
+// still lets the post-scan mix generations — a reservation can write its
+// hold after this key's epoch read (its create bump still pending), the
+// ref sync skips the held ref, and by the time this key lists the
+// directory the push has failed its CAS and cleanup has bumped and
+// removed the hold: the listing is empty and the already-read epoch is
+// the OLD one, reproducing the pre-scan key. The key must re-read the
+// epoch after the listing and refuse the snapshot (ok=false) when the
+// two reads differ — callers treat that as "neither publish nor honor",
+// the conservative direction.
+func TestLivePushHoldsKey_MidSnapshotLifecycleDetectedAfterListing(t *testing.T) {
+	repoDir := t.TempDir()
+	dir := filepath.Join(repoDir, pushHoldDir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := bumpPushHoldEpoch(dir); err != nil {
+		t.Fatalf("seed epoch: %v", err)
+	}
+	key1, ok := livePushHoldsKey(repoDir)
+	if !ok {
+		t.Fatal("livePushHoldsKey failed")
+	}
+	// Between the post-scan's epoch read and its listing: the transient
+	// hold's full lifecycle completes, late create bump and cleanup bump
+	// included.
+	testHookHoldsKeyMidSnapshot = func() {
+		hold := filepath.Join(dir, "push-transient-late-bump")
+		if err := os.WriteFile(hold, []byte("refs/heads/y\n"), 0o600); err != nil {
+			t.Errorf("write hold: %v", err)
+		}
+		if err := bumpPushHoldEpoch(dir); err != nil {
+			t.Errorf("late create bump: %v", err)
+		}
+		if err := os.Remove(hold); err != nil {
+			t.Errorf("remove hold: %v", err)
+		}
+		if err := bumpPushHoldEpoch(dir); err != nil {
+			t.Errorf("cleanup bump: %v", err)
+		}
+	}
+	key2, ok := livePushHoldsKey(repoDir)
+	testHookHoldsKeyMidSnapshot = nil
+	if ok && key2 == key1 {
+		t.Fatal("a lifecycle between the epoch read and the listing must not reproduce the old key")
+	}
+	// And once the set is quiet again, the key must be obtainable.
+	if _, ok := livePushHoldsKey(repoDir); !ok {
+		t.Fatal("livePushHoldsKey must succeed on a quiet hold set")
+	}
+}
+
+// TestBumpPushHoldEpoch_RemovesTempOnWriteFailure (Codex round-35 P2 on
+// #173/#186): the epoch temporaries are SIBLINGS of the hold directory,
+// invisible to every sweep, and each attempt picks a fresh random name —
+// a temp left behind by a failed write (ENOSPC/EIO mid-write or close)
+// would accumulate forever, worsening the very storage condition that
+// stranded it. Every error path must remove the temp it created.
+func TestBumpPushHoldEpoch_RemovesTempOnWriteFailure(t *testing.T) {
+	repoDir := t.TempDir()
+	dir := filepath.Join(repoDir, pushHoldDir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	oldWrite := writeEpochFile
+	writeEpochFile = func(name string, data []byte, perm os.FileMode) error {
+		// A partial write followed by the error — what a full volume
+		// leaves behind.
+		_ = os.WriteFile(name, data[:4], perm)
+		return errors.New("injected: no space left on device")
+	}
+	t.Cleanup(func() { writeEpochFile = oldWrite })
+	if err := bumpPushHoldEpoch(dir); err == nil {
+		t.Fatal("bump must fail when the temp write fails")
+	}
+	entries, err := os.ReadDir(repoDir)
+	if err != nil {
+		t.Fatalf("readdir: %v", err)
+	}
+	for _, e := range entries {
+		if strings.Contains(e.Name(), pushHoldEpochSuffix+".tmp-") {
+			t.Fatalf("failed bump left temp file behind: %s", e.Name())
+		}
 	}
 }
 

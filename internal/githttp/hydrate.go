@@ -1605,6 +1605,10 @@ func pushHoldSidecarBase(name string) (string, bool) {
 // lifecycles inside one coarse clock tick).
 const pushHoldEpochSuffix = ".epoch"
 
+// writeEpochFile is os.WriteFile behind a test seam: fault injection for
+// mid-write failures (round-35 P2) needs to be deterministic.
+var writeEpochFile = os.WriteFile
+
 // bumpPushHoldEpoch atomically rewrites dir's epoch file with fresh
 // randomness (temp + rename; concurrent bumps each land whole, last one
 // wins — only inequality with the previous value matters). Reservations
@@ -1619,7 +1623,15 @@ func bumpPushHoldEpoch(dir string) error {
 		return err
 	}
 	tmp := dir + pushHoldEpochSuffix + ".tmp-" + hex.EncodeToString(buf[:8])
-	if err := os.WriteFile(tmp, []byte(hex.EncodeToString(buf[:])), 0o600); err != nil {
+	if err := writeEpochFile(tmp, []byte(hex.EncodeToString(buf[:])), 0o600); err != nil {
+		// Remove the temp on write failure too (Codex round-35 P2): these
+		// are SIBLINGS of the hold directory — no sweep ever visits them —
+		// and every retry picks a fresh random name, so a temp stranded by
+		// ENOSPC/EIO would accumulate forever, worsening the very storage
+		// condition that stranded it. Best-effort: an open() failure left
+		// nothing behind, and removal under the same fault at worst leaves
+		// what it found.
+		_ = os.Remove(tmp)
 		return err
 	}
 	if err := os.Rename(tmp, dir+pushHoldEpochSuffix); err != nil {
@@ -2399,20 +2411,25 @@ func livePushHoldsKey(repoPath string) (string, bool) {
 	// independent, unlike a directory mtime. The tiny read stays within
 	// the stat-only cost contract.
 	//
-	// Read BEFORE the directory listing (Codex round-33 P2): listing
-	// first let a transient hold slip between the two reads — the listing
-	// carries the old set while the epoch already carries the create
-	// bump, and with the release's best-effort bump lost, the post-scan
-	// reproduces that same mixed-generation key. Epoch-first, any
-	// reservation completing after this read leaves its fail-closed
-	// create bump for the POST snapshot's epoch read, so the bracketing
-	// keys cannot fingerprint equal.
-	if b, err := os.ReadFile(dir + pushHoldEpochSuffix); err == nil {
-		key.Write(b)
-		key.WriteByte('\x01')
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return "", false
+	// Read BEFORE the directory listing (Codex round-33 P2) and AGAIN
+	// after it (round-35 P2), seqlock-style: with a single read on either
+	// side of the listing, a transient lifecycle straddling the gap can
+	// hand this snapshot a mixed generation — an epoch from before the
+	// lifecycle with a listing from after it (or vice versa) reproduces a
+	// bracketing key despite the hold set having changed mid-scan. Equal
+	// bracketing reads prove the epoch was stable across the whole
+	// snapshot; inequality refuses it (ok=false), which every caller
+	// treats as "neither publish nor honor a held marker" — the
+	// conservative direction, costing one extra revalidation.
+	epoch, err := os.ReadFile(dir + pushHoldEpochSuffix)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return "", false
+		}
+		epoch = nil
 	}
+	key.Write(epoch)
+	key.WriteByte('\x01')
 	if testHookHoldsKeyMidSnapshot != nil {
 		testHookHoldsKeyMidSnapshot()
 	}
@@ -2436,6 +2453,19 @@ func livePushHoldsKey(repoPath string) (string, bool) {
 			continue
 		}
 		fmt.Fprintf(&key, "%s\x00%d\x00%d\x01", path, info.Size(), info.ModTime().UnixNano())
+	}
+	// The closing seqlock read (round-35 P2, see above): any epoch bump
+	// that landed between the two reads means the listing may belong to
+	// neither generation — refuse the snapshot.
+	epoch2, err := os.ReadFile(dir + pushHoldEpochSuffix)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return "", false
+		}
+		epoch2 = nil
+	}
+	if !bytes.Equal(epoch, epoch2) {
+		return "", false
 	}
 	sum := sha256.Sum256([]byte(key.String()))
 	return hex.EncodeToString(sum[:]), true
