@@ -2062,6 +2062,58 @@ func TestLivePushHoldsKey_MidSnapshotTransientChangesKey(t *testing.T) {
 	}
 }
 
+// TestRemovePushHoldFiles_NoopReleaseKeepsKey (Codex round-33 security
+// P2 on #173/#186): every receive-pack mints a hold PATH, but rejected or
+// malformed RPCs may never create the FILE — and every such request still
+// runs the release. An unconditional epoch bump there let each tiny
+// denied push invalidate the held-generation fast path, re-buying the
+// full pack listing and ref paging under the hydrate lock for a live
+// hold set that never changed: repository-scale work amplification from
+// requests that did no work. A never-created hold was never in any
+// fingerprint listing (and sidecars are excluded from it), so a no-op
+// release must leave the key untouched; a REAL removal must keep
+// changing it.
+func TestRemovePushHoldFiles_NoopReleaseKeepsKey(t *testing.T) {
+	repoDir := t.TempDir()
+	dir := filepath.Join(repoDir, pushHoldDir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := bumpPushHoldEpoch(dir); err != nil {
+		t.Fatalf("seed epoch: %v", err)
+	}
+	key1, ok := livePushHoldsKey(repoDir)
+	if !ok {
+		t.Fatal("livePushHoldsKey failed")
+	}
+	removePushHoldFiles(filepath.Join(dir, "push-never-created"))
+	key2, ok := livePushHoldsKey(repoDir)
+	if !ok {
+		t.Fatal("livePushHoldsKey failed")
+	}
+	if key1 != key2 {
+		t.Fatal("releasing a never-created hold must not change the holds key")
+	}
+	// Non-vacuity: an actual removal still bumps — the ABA property the
+	// epoch exists for (see TestLivePushHoldsKey_TransientHoldChangesKey).
+	hold := filepath.Join(dir, "push-real")
+	if err := os.WriteFile(hold, []byte("refs/heads/x\n"), 0o600); err != nil {
+		t.Fatalf("write hold: %v", err)
+	}
+	epochBefore, err := os.ReadFile(dir + pushHoldEpochSuffix)
+	if err != nil {
+		t.Fatalf("read epoch: %v", err)
+	}
+	removePushHoldFiles(hold)
+	epochAfter, err := os.ReadFile(dir + pushHoldEpochSuffix)
+	if err != nil {
+		t.Fatalf("read epoch: %v", err)
+	}
+	if string(epochBefore) == string(epochAfter) {
+		t.Fatal("removing an existing hold must bump the epoch")
+	}
+}
+
 // TestReapExpiredPushHold_RestoresTouchedHold (Codex round-31 P2 on
 // #173): the expiry verdict and the removal linearize at the quarantine
 // rename — an owner touch that preceded it is observed on the quarantined

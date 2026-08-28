@@ -1216,12 +1216,24 @@ func isPushHoldSidecar(name string) bool {
 // Best-effort like every caller: a failed removal leaves the TTL machinery
 // the bound.
 func removePushHoldFiles(holdPath string) {
-	_ = os.Remove(holdPath)
+	err := os.Remove(holdPath)
 	_ = os.RemoveAll(holdPath + pushHoldUnreservedSuffix)
 	_ = os.RemoveAll(holdPath + pushHoldVerifiedSuffix)
 	_ = os.Remove(holdPath + pushHoldScanSuffix)
 	_ = os.Remove(holdPath + pushHoldReapSuffix)
-	_ = bumpPushHoldEpoch(filepath.Dir(holdPath)) // round-32 P2, best-effort
+	if err == nil {
+		// Bump only when a hold file was ACTUALLY removed (Codex round-33
+		// security P2): every receive-pack mints a hold PATH, but rejected
+		// or malformed RPCs may never create the FILE, and this release
+		// still runs for them — an unconditional bump would let each tiny
+		// denied push invalidate the held-generation fast path and re-buy
+		// the full pack listing and ref paging under the hydrate lock for
+		// a live hold set that never changed. A never-created hold was
+		// never in any fingerprint listing, and sidecars are excluded
+		// from it. Best-effort (round-32 P2): the fail-closed create bump
+		// already marks any net-zero lifecycle.
+		_ = bumpPushHoldEpoch(filepath.Dir(holdPath))
+	}
 }
 
 // pushHoldLive reports whether one hold-file observation counts as live,
