@@ -4739,3 +4739,34 @@ func TestHeldMarkerValid_ForwardRewriteShortensNextValidation(t *testing.T) {
 		t.Fatalf("marker generation after validation = %d, want 7 (forward rewrite)", hgen)
 	}
 }
+
+// TestHeldMarkerValid_ReapedHoldForcesRescan (issue #186 finding 5, the
+// fail-safe direction): a crash-leaked hold's reap unlinks the hold AND
+// its claims sidecar under an epoch bump — the vanished claims can never
+// extend any marker again, and the changed fingerprint fails the
+// validation outright, forcing the healing rescan that re-applies the
+// dead push's skipped refs.
+func TestHeldMarkerValid_ReapedHoldForcesRescan(t *testing.T) {
+	repoPath := t.TempDir()
+	hold := seedHeldMarkerFixture(t, repoPath, 5)
+	if err := os.WriteFile(hold+pushHoldGensSuffix, []byte("6\n"), 0o600); err != nil {
+		t.Fatalf("write claims: %v", err)
+	}
+	if !heldMarkerValid(repoPath, 6, "refs/heads/main") {
+		t.Fatal("claimed range (5,6] must validate while the hold lives")
+	}
+	// The forward rewrite moved the marker to 6; the reap must invalidate
+	// even the exact-generation check.
+	expireHold(t, hold)
+	info, err := os.Stat(hold)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	reapExpiredPushHold(hold, info.ModTime())
+	if _, err := os.Stat(hold + pushHoldGensSuffix); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("reap must unlink the claims sidecar: %v", err)
+	}
+	if heldMarkerValid(repoPath, 6, "refs/heads/main") {
+		t.Fatal("a reaped hold's marker must fail validation (fingerprint + vanished claims)")
+	}
+}
