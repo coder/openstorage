@@ -45,7 +45,7 @@ After the next push to main, release-please opens (or updates) the rolling relea
 **Known caveat** (verified empirically on the first release PR, #74): the PR is created
 by `github-actions[bot]`, so GitHub creates the `pull_request` CI run but holds it at
 **"action required"** — nothing executes until a maintainer approves it, while branch
-protection requires `lint` / `test` / `test-local`. Approve via the **Approve and run**
+protection requires `lint` / `test` / `test-local` / `test-s3wal`. Approve via the **Approve and run**
 button on the PR's Actions run, or:
 
 ```sh
@@ -56,7 +56,7 @@ gh api --method POST repos/coder/code-storage/actions/runs/<run-id>/approve
 
 (`--workflow ci` matters: the branch also gets a held run from the optional
 `pr-title` workflow, and without the filter `--limit 1` can return that one —
-approving it would leave the required `lint`/`test`/`test-local` checks blocked.)
+approving it would leave the required `lint`/`test`/`test-local`/`test-s3wal` checks blocked.)
 
 Each release-please refresh of the branch (any push to main while the release PR is
 open) creates a fresh held run needing the same approval. The separate `pr-title`
