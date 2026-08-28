@@ -167,8 +167,9 @@ counts.
 
 A PR merges when all of the following hold:
 
-1. **CI is green** — all four jobs: `lint`, `test` (default lane), `test-local`,
-   and `image` (Docker build + runtime-dependency smoke test).
+1. **CI is green** — all five jobs: `lint`, `test` (default lane), `test-local`,
+   `test-s3wal` (zero-infra serve lane, issue #193), and `image` (Docker build +
+   runtime-dependency smoke test).
 2. **A clean automated review round** — comment `@codex review` on the PR and
    address what comes back: fix genuine errors; when a finding is out of scope,
    say why and resolve the thread. Every push invalidates the round — re-request
