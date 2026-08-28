@@ -1216,6 +1216,19 @@ func isPushHoldSidecar(name string) bool {
 // Best-effort like every caller: a failed removal leaves the TTL machinery
 // the bound.
 func removePushHoldFiles(holdPath string) {
+	// Serialize with the reaper's quarantine window (Codex round-36
+	// security P2): a release racing it sees the hold path ABSENT,
+	// removes only sidecars, and the reaper's restore then resurrects a
+	// hold post-receive already released — kept alive indefinitely by
+	// the handler refresher while a non-reading client stalls the
+	// response copy. Under the reservation flock the release runs
+	// strictly before the window (normal removal) or strictly after it
+	// (removing the restored hold, or a no-op if the reaper unlinked).
+	// Best-effort like the removals below: without the lock the TTL
+	// machinery remains the bound.
+	if lock, err := flockExclusive(filepath.Dir(holdPath) + ".reserve.lock"); err == nil {
+		defer lock()
+	}
 	if _, err := os.Lstat(holdPath); err == nil {
 		// Bump only when a hold FILE is actually being removed (Codex
 		// round-33 security P2): every receive-pack mints a hold PATH,

@@ -2565,6 +2565,66 @@ func TestPushHoldRefresh_OpposesConcurrentReap(t *testing.T) {
 	}
 }
 
+// TestRemovePushHoldFiles_SerializesWithQuarantine (Codex round-36
+// security P2 on #173/#186): a release racing a reaper's quarantine
+// window sees the hold path ABSENT, removes only the sidecars, and
+// returns having released nothing — the reaper then restores the hold
+// (the handler refresher's shared flock vetoed the unlink), resurrecting
+// it AFTER post-receive completed. The handler refresher keeps touching
+// it while a non-reading client stalls the response copy, blocking
+// same-name and D/F-relative pushes indefinitely. Releases must
+// serialize with the quarantine window on the reservation flock: they
+// then run strictly before it (normal removal) or strictly after it
+// (removal of the restored hold, or a no-op if the reaper unlinked).
+func TestRemovePushHoldFiles_SerializesWithQuarantine(t *testing.T) {
+	repoDir := t.TempDir()
+	dir := filepath.Join(repoDir, pushHoldDir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	hold := filepath.Join(dir, "push-release-race")
+	if err := os.WriteFile(hold, []byte("refs/heads/x\n"), 0o600); err != nil {
+		t.Fatalf("write hold: %v", err)
+	}
+	expireHold(t, hold)
+	info, err := os.Stat(hold)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	// The handler refresher whose shared flock forces the restore path.
+	f, err := os.OpenFile(hold, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer f.Close()
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_SH|syscall.LOCK_NB); err != nil {
+		t.Fatalf("flock: %v", err)
+	}
+	// Post-receive's release fires mid-quarantine. Unfixed it completes
+	// immediately (sidecars only); fixed it blocks on the reservation
+	// flock until the reap window ends, then removes the restored hold.
+	released := make(chan struct{})
+	testHookReapAfterQuarantine = func() {
+		go func() {
+			defer close(released)
+			removePushHoldFiles(hold)
+		}()
+		select {
+		case <-released:
+		case <-time.After(300 * time.Millisecond):
+		}
+	}
+	defer func() { testHookReapAfterQuarantine = nil }()
+	reapExpiredPushHold(hold, info.ModTime())
+	<-released
+	if _, err := os.Stat(hold); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("a hold released during a quarantine window must stay released: %v", err)
+	}
+	if _, err := os.Stat(hold + ".reaping"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("quarantine must not linger")
+	}
+}
+
 // TestReapExpiredPushHold_RestoresTouchedHold (Codex round-31 P2 on
 // #173): the expiry verdict and the removal linearize at the quarantine
 // rename — an owner touch that preceded it is observed on the quarantined
