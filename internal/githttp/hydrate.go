@@ -3239,6 +3239,7 @@ func holdFileIdentity(fi os.FileInfo) holdFileID {
 	// Explicit conversions: Stat_t.Dev/Ino widths differ across platforms
 	// (e.g. Dev is int32 on darwin, uint64 on linux). The fold only needs a
 	// stable identity, not the numeric value.
+	//nolint:unconvert // identity on linux, required on darwin (v0.14.4 incident)
 	return holdFileID{size: fi.Size(), dev: uint64(st.Dev), ino: uint64(st.Ino)}
 }
 
