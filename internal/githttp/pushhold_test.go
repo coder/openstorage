@@ -4366,3 +4366,200 @@ func TestValidateCacheDir(t *testing.T) {
 		t.Fatal("a cache dir past the PATH_MAX budget must be rejected at acceptance time")
 	}
 }
+
+// TestAppendPushReleased_SerializesWithQuarantineRestore (PR #195
+// round-18 P2): recognizing BOTH names (round 17) still left the
+// two-Lstat existence gate racing the reaper — a restore rename landing
+// between the base stat (ENOENT: quarantined) and the quarantine stat
+// (ENOENT: already restored) makes both report absence, silently
+// dropping the tombstone while the hold lives on at its base name. For
+// an all-denied push behind a stalled report tail those names stay
+// re-reserved with no post-receive to release them, blocking conflicting
+// pushes until the TTL. The gate must serialize with the reaper's
+// quarantine window on the reservation flock: the release then lands
+// strictly before the window or strictly after its outcome, never inside
+// it.
+func TestAppendPushReleased_SerializesWithQuarantineRestore(t *testing.T) {
+	repoDir := t.TempDir()
+	dir := filepath.Join(repoDir, pushHoldDir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	hold := filepath.Join(dir, "push-append-race")
+	if err := os.WriteFile(hold, []byte("refs/heads/x\n"), 0o600); err != nil {
+		t.Fatalf("write hold: %v", err)
+	}
+	expireHold(t, hold)
+	info, err := os.Stat(hold)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	// The live refresher whose shared flock forces the reaper's restore.
+	f, err := os.OpenFile(hold, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer f.Close()
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_SH|syscall.LOCK_NB); err != nil {
+		t.Fatalf("flock: %v", err)
+	}
+	// The denial release fires mid-quarantine. If its gate reaches the
+	// base stat inside the window (unserialized), the mid-gate seam
+	// parks it until the restore completed — the exact interleave under
+	// review. Serialized, the release blocks on the flock until the
+	// window ends and the seam never fires (the restored base satisfies
+	// the first stat).
+	reapDone := make(chan struct{})
+	appended := make(chan error, 1)
+	testHookAppendReleasedMidGate = func() { <-reapDone }
+	testHookReapAfterQuarantine = func() {
+		go func() { appended <- appendPushReleased(hold, []string{"refs/heads/x"}) }()
+		select {
+		case err := <-appended:
+			appended <- err
+		case <-time.After(300 * time.Millisecond):
+		}
+	}
+	defer func() {
+		testHookAppendReleasedMidGate = nil
+		testHookReapAfterQuarantine = nil
+	}()
+	reapExpiredPushHold(hold, info.ModTime())
+	close(reapDone)
+	if err := <-appended; err != nil {
+		t.Fatalf("mid-quarantine release: %v", err)
+	}
+	if _, err := os.Stat(hold); err != nil {
+		t.Fatalf("hold must be restored: %v", err)
+	}
+	// The tombstone itself is the assertion (liveness-independent): the
+	// restored hold keeps its name reserved until the TTL, and only the
+	// sidecar record ends that coverage early.
+	b, err := os.ReadFile(hold + pushHoldReleasedSuffix)
+	if err != nil {
+		t.Fatalf("a release racing the quarantine restore was silently dropped: %v", err)
+	}
+	if !strings.Contains(string(b), "refs/heads/x\n") {
+		t.Fatalf("tombstone missing its name: %q", b)
+	}
+}
+
+// TestLivePushHoldsKey_QuarantinedHoldsTombstonesFold (PR #195 round-18
+// P2): a quarantined hold rides at `push-X.reaping` while its tombstone
+// sidecar stays at the BASE name — the coverage readers keep that
+// association (holdSidecarOwner, round 16) but the fingerprint looked up
+// and re-statted `push-X.reaping.released`, a path no writer uses, so it
+// stayed blind to the real sidecar for the whole window. A release whose
+// epoch bump is masked by a cross-push overwrite then leaves both
+// bracketing keys equal while coverage changed mid-scan, certifying a
+// stale held marker until the restore. The fingerprint must fold AND
+// reverify the sidecar at its owner path, exactly like the readers.
+func TestLivePushHoldsKey_QuarantinedHoldsTombstonesFold(t *testing.T) {
+	repoDir := t.TempDir()
+	dir := filepath.Join(repoDir, pushHoldDir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := bumpPushHoldEpoch(dir); err != nil {
+		t.Fatalf("seed epoch: %v", err)
+	}
+	hold := filepath.Join(dir, "push-q")
+	if err := os.WriteFile(hold+".reaping", []byte("refs/heads/a\n"), 0o600); err != nil {
+		t.Fatalf("write quarantined hold: %v", err)
+	}
+	key1, ok := livePushHoldsKey(repoDir)
+	if !ok {
+		t.Fatal("livePushHoldsKey failed")
+	}
+	// A tombstone whose own epoch bump was masked (a cross-push bump
+	// overwrote it before this snapshot): raw sidecar bytes at the BASE
+	// name, where every writer and reader keeps them.
+	if err := os.WriteFile(hold+pushHoldReleasedSuffix, []byte("refs/heads/a\n"), 0o600); err != nil {
+		t.Fatalf("write sidecar: %v", err)
+	}
+	key2, ok := livePushHoldsKey(repoDir)
+	if !ok {
+		t.Fatal("livePushHoldsKey failed")
+	}
+	if key1 == key2 {
+		t.Fatal("a quarantined hold's tombstone must change the hold fingerprint")
+	}
+	// The closing re-stat must watch the same owner path: an append
+	// landing after the closing epoch read must refuse the snapshot.
+	testHookHoldsKeyPostVerify = func() {
+		sf, err := os.OpenFile(hold+pushHoldReleasedSuffix, os.O_APPEND|os.O_WRONLY, 0o600)
+		if err != nil {
+			t.Errorf("open sidecar: %v", err)
+			return
+		}
+		if _, err := sf.WriteString("refs/heads/b\n"); err != nil {
+			t.Errorf("append sidecar: %v", err)
+		}
+		_ = sf.Close()
+	}
+	defer func() { testHookHoldsKeyPostVerify = nil }()
+	if _, ok := livePushHoldsKey(repoDir); ok {
+		t.Fatal("a tombstone landing after the closing epoch read must refuse the snapshot")
+	}
+}
+
+// TestRunHook_PreAppendReservationFailureReleasesNothing (PR #195
+// round-18 P2): covering the ATTEMPT (round 9) must mean the APPEND
+// attempt, not the reservePushHolds call — that function has pre-append
+// exits (scan-allowance denials, lock deadlines, peer-conflict timeouts)
+// where the name provably never had coverage. With an allowed sibling's
+// shared hold file present, a denial release for such a name passes the
+// existence gate, bumps the repository epoch, and tombstones a
+// never-covered ref — a fanout of doomed commands could invalidate
+// held-generation markers once per failure without ever changing
+// coverage. A pre-append failure must release nothing: no tombstone, no
+// bump.
+func TestRunHook_PreAppendReservationFailureReleasesNothing(t *testing.T) {
+	sha := strings.Repeat("a", 40)
+	sha2 := strings.Repeat("b", 40)
+	t.Setenv(EnvRepo, "t-preappend-reservation")
+	t.Setenv(EnvAtomic, "")
+	os.Unsetenv(EnvRefsPolicy)
+	repoDir := t.TempDir()
+	holdPath := filepath.Join(repoDir, pushHoldDir, "push-preappend")
+	if err := os.MkdirAll(filepath.Dir(holdPath), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := bumpPushHoldEpoch(filepath.Dir(holdPath)); err != nil {
+		t.Fatalf("seed epoch: %v", err)
+	}
+	// The allowed sibling's shared hold: the release existence gate
+	// accepts tombstones against it.
+	if err := os.WriteFile(holdPath, []byte("refs/heads/a\n"), 0o600); err != nil {
+		t.Fatalf("write hold: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(pushHoldUnreservedMarker(holdPath, "refs/heads/b")), 0o755); err != nil {
+		t.Fatalf("mkdir unreserved: %v", err)
+	}
+	if err := os.WriteFile(pushHoldUnreservedMarker(holdPath, "refs/heads/b"), nil, 0o600); err != nil {
+		t.Fatalf("write unreserved marker: %v", err)
+	}
+	t.Setenv(EnvPushHold, holdPath)
+	// An exhausted scan allowance: the reservation denies BEFORE its
+	// append can run — this ref never had coverage.
+	if err := writePushScanWork(holdPath, maxPushPeerScanBytes+1); err != nil {
+		t.Fatalf("poison scan allowance: %v", err)
+	}
+	epochBefore, err := os.ReadFile(filepath.Dir(holdPath) + pushHoldEpochSuffix)
+	if err != nil {
+		t.Fatalf("read epoch: %v", err)
+	}
+	if err := RunHook(context.Background(), []string{"update", "refs/heads/b", sha, sha2}); err == nil {
+		t.Fatal("the pre-append reservation failure must fail the update")
+	}
+	if _, err := os.Stat(holdPath + pushHoldReleasedSuffix); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("a never-covered name must not be tombstoned: %v", err)
+	}
+	epochAfter, err := os.ReadFile(filepath.Dir(holdPath) + pushHoldEpochSuffix)
+	if err != nil {
+		t.Fatalf("read epoch: %v", err)
+	}
+	if string(epochBefore) != string(epochAfter) {
+		t.Fatal("a release of a never-covered name must not invalidate held markers")
+	}
+}

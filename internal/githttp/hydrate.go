@@ -1874,16 +1874,17 @@ func sweepExpiredPushHolds(dir string) {
 // Test seams: called (when non-nil) at interleaving points concurrency
 // tests cannot otherwise reach deterministically. Nil in production.
 var (
-	testHookReapAfterQuarantine  func()
-	testHookHoldsKeyMidSnapshot  func()
-	testHookHoldsKeyPreClose     func()
-	testHookHoldsKeyPostVerify   func()
-	testHookRemoveHoldsPreRename func()
-	testHookRefreshBeforeLock    func()
-	testHookRefTxPreInstall      func()
-	testHookRefTxMidVerify       func()
-	testHookPeerScanPostStat     func()
-	testHookDirCachePreParse     func()
+	testHookReapAfterQuarantine   func()
+	testHookAppendReleasedMidGate func()
+	testHookHoldsKeyMidSnapshot   func()
+	testHookHoldsKeyPreClose      func()
+	testHookHoldsKeyPostVerify    func()
+	testHookRemoveHoldsPreRename  func()
+	testHookRefreshBeforeLock     func()
+	testHookRefTxPreInstall       func()
+	testHookRefTxMidVerify        func()
+	testHookPeerScanPostStat      func()
+	testHookDirCachePreParse      func()
 )
 
 // reapExpiredPushHold removes an expiry-verdict hold with the verdict and
@@ -2740,6 +2741,20 @@ var pushHoldWaitMax = 10 * time.Second
 // local ref transaction is doomed while the conflicting neighbor
 // survives) — a clean, pre-publication, retryable denial.
 func reservePushHolds(ctx context.Context, holdPath string, names []string) error {
+	return reservePushHoldsCovering(ctx, holdPath, names, nil)
+}
+
+// reservePushHoldsCovering is reservePushHolds reporting COVERAGE to the
+// caller: *covered flips exactly at the append boundary — after every
+// pre-append exit (scan-allowance denials, lock deadlines, peer-conflict
+// timeouts, where the name provably never touched the hold file) and
+// strictly before appendPushHolds can first write it (PR #195 round-18
+// P2, refining round 9's cover-the-attempt: the append can fail AFTER its
+// bytes landed, so waiting for success would leak a physically held name,
+// while flipping before the reservation call tombstoned never-covered
+// names — each such release bumping the repository epoch and invalidating
+// the allowed siblings' held markers once per doomed command).
+func reservePushHoldsCovering(ctx context.Context, holdPath string, names []string, covered *bool) error {
 	if !filepath.IsAbs(holdPath) {
 		return fmt.Errorf("push hold path %q is not absolute", holdPath)
 	}
@@ -2889,6 +2904,9 @@ func reservePushHolds(ctx context.Context, holdPath string, names []string) erro
 			}
 		}
 		if conflict == "" {
+			if covered != nil {
+				*covered = true
+			}
 			err := appendPushHolds(holdPath, names)
 			unlock()
 			return err
@@ -3003,9 +3021,27 @@ func appendPushReleased(holdPath string, names []string) error {
 	// stalled report tail then blocks conflicting pushes until the TTL.
 	// The sidecar stays at the BASE name either way (readers map the
 	// quarantine name to it).
+	//
+	// The two-name observation runs under the reservation flock (round-18
+	// P2): the reaper holds that lock across its whole quarantine →
+	// verdict → restore/unlink window, so an unserialized gate could stat
+	// the base name before the restore rename and the quarantine name
+	// after it — both absent, the release silently dropped while the hold
+	// lives on at its base name. Serialized, the gate sees the hold
+	// strictly before the window or strictly after its outcome; a
+	// crash-stranded quarantine (its flock died with its process) still
+	// satisfies the second stat.
+	unlock, err := flockExclusive(filepath.Dir(holdPath) + ".reserve.lock")
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	if _, err := os.Lstat(holdPath); err != nil {
 		if !errors.Is(err, os.ErrNotExist) {
 			return err
+		}
+		if testHookAppendReleasedMidGate != nil {
+			testHookAppendReleasedMidGate()
 		}
 		if _, rerr := os.Lstat(holdPath + ".reaping"); rerr != nil {
 			if errors.Is(rerr, os.ErrNotExist) {
@@ -3210,12 +3246,20 @@ func livePushHoldsKey(repoPath string) (string, bool) {
 		if !pushHoldLive(path, info.ModTime()) {
 			continue
 		}
+		// The sidecar association follows the OWNER path (PR #195
+		// round-18 P2): a quarantined hold rides at `push-X.reaping`
+		// while its tombstones stay at the base name — every writer and
+		// coverage reader uses holdSidecarOwner, and a fingerprint keyed
+		// on `push-X.reaping.released` (a path nothing writes) would stay
+		// blind to releases landing during the reap window, letting
+		// bracketing keys certify a scan whose coverage changed mid-way.
+		owner := holdSidecarOwner(path)
 		rel := relStat{-1, -1}
-		if ri, ok := released[path]; ok {
+		if ri, ok := released[owner]; ok {
 			rel = relStat{ri.Size(), ri.ModTime().UnixNano()}
 		}
 		reverify[path] = relStat{info.Size(), info.ModTime().UnixNano()}
-		reverify[path+pushHoldReleasedSuffix] = rel
+		reverify[owner+pushHoldReleasedSuffix] = rel
 		fmt.Fprintf(&key, "%s\x00%d\x00%d\x00%d\x00%d\x01", path, info.Size(), info.ModTime().UnixNano(), rel.size, rel.mtime)
 	}
 	if testHookHoldsKeyPreClose != nil {
