@@ -2996,11 +2996,23 @@ func removePushHolds(holdPath string, names []string) error {
 // equal while the scan skipped the released ref. On failure the names
 // simply stay held; post-receive and the TTL remain the bound.
 func appendPushReleased(holdPath string, names []string) error {
+	// A hold riding at its quarantine name is still an existing
+	// reservation (PR #195 round-17 P2): the reap's restore path can
+	// bring it back, and a dropped tombstone would leave an all-denied
+	// push's names re-reserved with no post-receive to release them — a
+	// stalled report tail then blocks conflicting pushes until the TTL.
+	// The sidecar stays at the BASE name either way (readers map the
+	// quarantine name to it).
 	if _, err := os.Lstat(holdPath); err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil
+		if !errors.Is(err, os.ErrNotExist) {
+			return err
 		}
-		return err
+		if _, rerr := os.Lstat(holdPath + ".reaping"); rerr != nil {
+			if errors.Is(rerr, os.ErrNotExist) {
+				return nil
+			}
+			return rerr
+		}
 	}
 	if err := bumpPushHoldEpoch(filepath.Dir(holdPath)); err != nil {
 		return err

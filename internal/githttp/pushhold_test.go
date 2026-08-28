@@ -4171,6 +4171,47 @@ func TestSweepExpiredPushHolds_KeepsSidecarOnStatError(t *testing.T) {
 	}
 }
 
+// TestAppendPushReleased_CoversQuarantinedHold (PR #195 round-17 P2):
+// the writer's never-reserved gate must recognize a hold riding at its
+// quarantine name — the reap's restore can bring it back, and a dropped
+// denial tombstone would re-reserve the name with no post-receive left
+// to release it.
+func TestAppendPushReleased_CoversQuarantinedHold(t *testing.T) {
+	repoDir := t.TempDir()
+	dir := filepath.Join(repoDir, pushHoldDir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := bumpPushHoldEpoch(dir); err != nil {
+		t.Fatalf("seed epoch: %v", err)
+	}
+	hold := filepath.Join(dir, "push-quarantined-denial")
+	if err := os.WriteFile(hold+".reaping", []byte("refs/heads/x\n"), 0o600); err != nil {
+		t.Fatalf("write quarantined hold: %v", err)
+	}
+	if err := releaseDeniedPushHold(hold, "refs/heads/x"); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	covered, _, err := peerHoldCovers(dir, "", "refs/heads/x", maxPushPeerScanBytes)
+	if err != nil {
+		t.Fatalf("peerHoldCovers: %v", err)
+	}
+	if covered {
+		t.Fatal("a denial tombstone must apply to a quarantined hold")
+	}
+	// After the restore, the tombstone keeps applying at the base name.
+	if err := os.Rename(hold+".reaping", hold); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	covered, _, err = peerHoldCovers(dir, "", "refs/heads/x", maxPushPeerScanBytes)
+	if err != nil {
+		t.Fatalf("peerHoldCovers restored: %v", err)
+	}
+	if covered {
+		t.Fatal("the tombstone must survive the restore")
+	}
+}
+
 // TestReapExpiredPushHold_RestoresTouchedHold (Codex round-31 P2 on
 // #173): the expiry verdict and the removal linearize at the quarantine
 // rename — an owner touch that preceded it is observed on the quarantined
