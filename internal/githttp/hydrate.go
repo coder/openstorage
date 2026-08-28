@@ -546,9 +546,39 @@ func isManagedRefTxHook(content []byte) bool {
 // lifetime) — or nil when no verified state exists (a raced install
 // aborted; the next full pass re-decides).
 func ensureRefTxHook(path, script string) (os.FileInfo, error) {
-	existing, err := os.ReadFile(path)
+	// Content, mode, and fingerprint come from ONE descriptor (PR #195
+	// round-14 P2, mirroring ensureHook): a re-read or path-stat could
+	// pair one inode's bytes with a concurrent replacement's metadata —
+	// memoizing a fingerprint the content check never covered. The final
+	// path re-stat confirms the verified inode still names the path.
+	var existing []byte
+	f, err := os.Open(path)
 	switch {
 	case err == nil:
+		// Stat–read–stat: the fingerprint is taken BEFORE the bytes and
+		// re-verified unchanged after them, so it can only ever describe
+		// the exact content the checks below examined — an in-place
+		// rewrite mid-read (which keeps the inode, defeating SameFile
+		// alone) changes mtime/ctime and refuses the pass.
+		fi, err := f.Stat()
+		if err == nil {
+			existing, err = io.ReadAll(f)
+		}
+		if testHookRefTxMidVerify != nil {
+			testHookRefTxMidVerify()
+		}
+		var fi2 os.FileInfo
+		if err == nil {
+			fi2, err = f.Stat()
+		}
+		if err != nil {
+			_ = f.Close()
+			return nil, err
+		}
+		if !fileUnchanged(fi, fi2) {
+			_ = f.Close()
+			return nil, nil // rewritten underfoot; next pass re-decides
+		}
 		if string(existing) == script {
 			// Verify the mode too (PR #195 round-2 P2): a restored cache
 			// volume can strip the execute bit while the bytes stay
@@ -556,26 +586,33 @@ func ensureRefTxHook(path, script string) (os.FileInfo, error) {
 			// OWNER bit specifically (round-8 P2): the serving process is
 			// the file's owner, and POSIX resolves exactly one permission
 			// class — group/other execute bits do nothing for it. The
-			// in-place chmod is atomic on the inode; content never tears.
-			fi, err := os.Stat(path)
-			if err != nil {
-				return nil, err
-			}
+			// descriptor chmod is atomic on the VERIFIED inode.
 			if fi.Mode()&0o100 == 0 {
-				if err := os.Chmod(path, 0o755); err != nil {
+				if err := f.Chmod(0o755); err != nil {
+					_ = f.Close()
 					return nil, err
 				}
-				fi, err = os.Stat(path)
-				if err != nil {
+				if fi, err = f.Stat(); err != nil {
+					_ = f.Close()
 					return nil, err
 				}
+			}
+			_ = f.Close()
+			psi, err := os.Stat(path)
+			if err != nil || !os.SameFile(fi, psi) {
+				return nil, nil // replaced underfoot; next pass re-decides
 			}
 			return fi, nil
 		}
+		_ = f.Close()
 		if !isManagedRefTxHook(existing) {
-			// Foreign content is preserved — and fingerprinted, so a memo
-			// hit vouches for exactly this preserved state.
-			return os.Stat(path)
+			// Foreign content is preserved — fingerprinted only while the
+			// verified inode still names the path.
+			psi, err := os.Stat(path)
+			if err != nil || !os.SameFile(fi, psi) {
+				return nil, nil
+			}
+			return psi, nil
 		}
 	case !errors.Is(err, os.ErrNotExist):
 		return nil, err
@@ -658,9 +695,14 @@ func ensureRefTxHook(path, script string) (os.FileInfo, error) {
 	// Foreign (or unverifiable) content was displaced: restore it. EEXIST
 	// means an even newer install took the slot — the operator's latest
 	// wins over the mid-window one, exactly as consecutive operator
-	// writes always resolve.
-	_ = os.Link(quarantine, path)
-	_ = os.Remove(quarantine)
+	// writes always resolve. On any OTHER restore failure (ENOSPC,
+	// EMLINK, no-hardlink fs) the quarantined inode is RETAINED at its
+	// .displaced name for operator recovery instead of silently deleted
+	// (PR #195 round-14 P2) — the promise is preservation, and a leaked
+	// recovery file beats a lost hook.
+	if lerr := linkFile(quarantine, path); lerr == nil || errors.Is(lerr, os.ErrExist) {
+		_ = os.Remove(quarantine)
+	}
 	return nil, nil
 }
 
@@ -1789,7 +1831,33 @@ func sweepExpiredPushHolds(dir string) {
 		}
 		switch age := time.Since(info.ModTime()); {
 		case age > pushHoldTTL:
-			// RemoveAll: unreserved sidecars are directories.
+			// Orphan deletion runs under the reservation flock with the
+			// parent re-checked at BOTH names (PR #195 round-14 P2): a
+			// concurrent sweep's reap window renames the hold to
+			// .reaping, and an unserialized age check would delete a
+			// LIVE hold's tombstone sidecar as an orphan — a restore
+			// then resurrects every released name until the push exits.
+			// Reaps and restores hold this same lock, so under it the
+			// parent's two names are stable; busy means a reap window is
+			// active — skip, the next sweep retries.
+			if base, ok := pushHoldSidecarBase(e.Name()); ok {
+				lock, err := os.OpenFile(dir+".reserve.lock", os.O_CREATE|os.O_RDWR, 0o644)
+				if err != nil {
+					continue
+				}
+				if syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB) != nil {
+					_ = lock.Close()
+					continue
+				}
+				_, baseErr := os.Stat(filepath.Join(dir, base))
+				_, reapErr := os.Stat(filepath.Join(dir, base) + ".reaping")
+				if baseErr != nil && reapErr != nil {
+					// RemoveAll: unreserved sidecars are directories.
+					_ = os.RemoveAll(path)
+				}
+				_ = lock.Close()
+				continue
+			}
 			_ = os.RemoveAll(path)
 		case age < -pushHoldTTL:
 			now := time.Now()
@@ -1808,6 +1876,7 @@ var (
 	testHookRemoveHoldsPreRename func()
 	testHookRefreshBeforeLock    func()
 	testHookRefTxPreInstall      func()
+	testHookRefTxMidVerify       func()
 	testHookPeerScanPostStat     func()
 	testHookDirCachePreParse     func()
 )
@@ -2124,6 +2193,10 @@ func loadPushHolds(repoPath string) pushHoldSet {
 	s, _ := readPushHolds(filepath.Join(repoPath, pushHoldDir), "")
 	return s
 }
+
+// linkFile is os.Link behind a test seam (PR #195 round-14 P2: restore-
+// failure handling needs deterministic fault injection).
+var linkFile = os.Link
 
 // errPushScanBudget marks a peer scan denied MID-SCAN because reading the
 // next file would exceed the push's remaining allowance (PR #195 round-12

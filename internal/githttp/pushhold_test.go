@@ -3894,6 +3894,157 @@ func TestEnsureCacheRepo_NoClobberCreateRace(t *testing.T) {
 	}
 }
 
+// TestSweepExpiredPushHolds_KeepsQuarantinedHoldsSidecars (PR #195
+// round-14 P2): overlapping mint sweeps after a clock anomaly — one
+// sweep quarantines a live hold to .reaping while another sees its aged
+// `.released` sidecar with no base path and deletes it as an orphan; the
+// restore then resurrects every released name. The orphan check treats
+// the quarantine name as a live parent, and deletions run under the
+// reservation flock (which reaps hold), so the window is closed on both
+// sides.
+func TestSweepExpiredPushHolds_KeepsQuarantinedHoldsSidecars(t *testing.T) {
+	repoDir := t.TempDir()
+	dir := filepath.Join(repoDir, pushHoldDir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	hold := filepath.Join(dir, "push-quarantined")
+	if err := os.WriteFile(hold, []byte("refs/heads/live\n"), 0o600); err != nil {
+		t.Fatalf("write hold: %v", err)
+	}
+	if err := appendPushReleased(hold, []string{"refs/heads/live"}); err != nil {
+		t.Fatalf("seed sidecar: %v", err)
+	}
+	old := time.Now().Add(-2 * pushHoldTTL)
+	if err := os.Chtimes(hold+pushHoldReleasedSuffix, old, old); err != nil {
+		t.Fatalf("age sidecar: %v", err)
+	}
+	// Sweep A holds the hold in quarantine.
+	if err := os.Rename(hold, hold+".reaping"); err != nil {
+		t.Fatalf("quarantine: %v", err)
+	}
+	sweepExpiredPushHolds(dir) // sweep B
+	if _, err := os.Stat(hold + pushHoldReleasedSuffix); err != nil {
+		t.Fatalf("a quarantined hold's tombstone sidecar must survive the orphan sweep: %v", err)
+	}
+	// And with a reap window ACTIVE (reservation flock held), even a
+	// truly parentless sidecar must be left for the next sweep.
+	if err := os.Rename(hold+".reaping", hold+".gone-elsewhere"); err != nil {
+		t.Fatalf("drop parent: %v", err)
+	}
+	lock, err := os.OpenFile(dir+".reserve.lock", os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatalf("open lock: %v", err)
+	}
+	defer lock.Close()
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
+		t.Fatalf("flock: %v", err)
+	}
+	sweepExpiredPushHolds(dir)
+	if _, err := os.Stat(hold + pushHoldReleasedSuffix); err != nil {
+		t.Fatalf("orphan cleanup must not run while a reap window holds the lock: %v", err)
+	}
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_UN); err != nil {
+		t.Fatalf("unlock: %v", err)
+	}
+	sweepExpiredPushHolds(dir)
+	if _, err := os.Stat(hold + pushHoldReleasedSuffix); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("a genuinely parentless aged sidecar must age out once unlocked: %v", err)
+	}
+}
+
+// TestEnsureRefTxHook_RetainsDisplacedOnRestoreFailure (PR #195 round-14
+// P2): when the no-clobber restore of a displaced foreign hook fails for
+// any reason other than EEXIST, the quarantined inode must be RETAINED
+// (a leaked .displaced recovery file) rather than silently deleted.
+func TestEnsureRefTxHook_RetainsDisplacedOnRestoreFailure(t *testing.T) {
+	cacheDir := t.TempDir()
+	repoPath, err := EnsureCacheRepo(cacheDir, "t-reftx-retain")
+	if err != nil {
+		t.Fatalf("EnsureCacheRepo: %v", err)
+	}
+	hookPath := filepath.Join(repoPath, "hooks", "reference-transaction")
+	stale := refTxHookGateV1 + `exec "/opt/old/codestorage" hook reference-transaction "$@"` + "\n"
+	if err := os.WriteFile(hookPath, []byte(stale), 0o755); err != nil {
+		t.Fatalf("write stale hook: %v", err)
+	}
+	foreign := "#!/bin/sh\n# operator hook\nexit 0\n"
+	testHookRefTxPreInstall = func() {
+		if err := os.WriteFile(hookPath, []byte(foreign), 0o755); err != nil {
+			t.Errorf("install foreign hook: %v", err)
+		}
+	}
+	defer func() { testHookRefTxPreInstall = nil }()
+	oldLink := linkFile
+	linkFile = func(oldname, newname string) error { return errors.New("injected: no space left on device") }
+	t.Cleanup(func() { linkFile = oldLink })
+	cacheRepoMemos.Delete(repoPath)
+	if _, err := EnsureCacheRepo(cacheDir, "t-reftx-retain"); err != nil {
+		t.Fatalf("EnsureCacheRepo second pass: %v", err)
+	}
+	testHookRefTxPreInstall = nil
+	linkFile = oldLink
+	matches, err := filepath.Glob(filepath.Join(repoPath, "hooks", "*.displaced"))
+	if err != nil || len(matches) != 1 {
+		t.Fatalf("the displaced foreign hook must be retained for recovery, got %v (%v)", matches, err)
+	}
+	b, err := os.ReadFile(matches[0])
+	if err != nil || string(b) != foreign {
+		t.Fatalf("retained recovery file must hold the foreign content: %q (%v)", b, err)
+	}
+}
+
+// TestEnsureRefTxHook_FingerprintsVerifiedInode (PR #195 round-14 P2):
+// the memoized fingerprint must describe the inode whose CONTENT was
+// verified — a replacement racing between the read and a path-stat would
+// otherwise be vouched for sight-unseen (a stale managed generation
+// bypassing refresh for the process lifetime). Content, mode, and
+// fingerprint come from one descriptor, and the path is confirmed to
+// still name that inode; on a lost race nothing is memoized and the next
+// pass re-decides — pinned here by requiring the racing stale script to
+// be refreshed by the SECOND pass.
+func TestEnsureRefTxHook_FingerprintsVerifiedInode(t *testing.T) {
+	cacheDir := t.TempDir()
+	repoPath, err := EnsureCacheRepo(cacheDir, "t-reftx-inode")
+	if err != nil {
+		t.Fatalf("EnsureCacheRepo: %v", err)
+	}
+	hookPath := filepath.Join(repoPath, "hooks", "reference-transaction")
+	current, err := os.ReadFile(hookPath)
+	if err != nil {
+		t.Fatalf("read hook: %v", err)
+	}
+	// Mid-verify, a stale managed script replaces the byte-equal current
+	// one. The fingerprint must not vouch for it.
+	stale := refTxHookGateV1 + `exec "/opt/old/codestorage" hook reference-transaction "$@"` + "\n"
+	raced := false
+	testHookRefTxMidVerify = func() {
+		if raced {
+			return
+		}
+		raced = true
+		if err := os.WriteFile(hookPath, []byte(stale), 0o755); err != nil {
+			t.Errorf("replace hook: %v", err)
+		}
+	}
+	defer func() { testHookRefTxMidVerify = nil }()
+	cacheRepoMemos.Delete(repoPath)
+	if _, err := EnsureCacheRepo(cacheDir, "t-reftx-inode"); err != nil {
+		t.Fatalf("EnsureCacheRepo racing pass: %v", err)
+	}
+	testHookRefTxMidVerify = nil
+	if _, err := EnsureCacheRepo(cacheDir, "t-reftx-inode"); err != nil {
+		t.Fatalf("EnsureCacheRepo follow-up pass: %v", err)
+	}
+	b, err := os.ReadFile(hookPath)
+	if err != nil {
+		t.Fatalf("read hook: %v", err)
+	}
+	if string(b) != string(current) {
+		t.Fatalf("a replacement racing the verify must not be memo-vouched; the follow-up pass must refresh it, got:\n%s", b)
+	}
+}
+
 // TestReapExpiredPushHold_RestoresTouchedHold (Codex round-31 P2 on
 // #173): the expiry verdict and the removal linearize at the quarantine
 // rename — an owner touch that preceded it is observed on the quarantined
