@@ -146,9 +146,88 @@ func RunHook(ctx context.Context, args []string) error {
 		return updateHook(ctx, args[1:])
 	case "post-receive":
 		return postReceiveHook()
+	case "reference-transaction":
+		return referenceTransactionHook(args[1:])
 	default:
 		return fmt.Errorf("unknown hook %q", args[0])
 	}
+}
+
+// referenceTransactionHook tombstones a push's committed ref names in its
+// `.released` hold sidecar (issue #186 finding 1): a committed callback
+// lists exactly the refs whose LOCAL updates git made durable — the event
+// each hold entry protects — so those names can stop blocking same-name
+// and D/F-relative pushes immediately instead of waiting for post-receive
+// behind a slow tail or a client-stalled report drain. Release-at-
+// committed is sound across git's transaction shapes: per-command
+// receive-packs release each name as it lands, batched ones (git ≥2.55
+// observed) release the whole set the instant the batch commits.
+//
+// Gated to receive-pack pushes (hold env present) outside --atomic
+// (whole-push holds retained there — post-receive and the atomic denial
+// path release them). Every other invocation — hydrate's update-ref
+// batches, maintenance, prepared/aborted states — drains stdin and
+// no-ops. Best-effort throughout: git ignores this hook's exit status
+// for committed transactions, and a lost append only defers release to
+// post-receive, the pre-existing bound.
+func referenceTransactionHook(args []string) error {
+	holdPath := os.Getenv(EnvPushHold)
+	act := len(args) >= 1 && args[0] == "committed" &&
+		holdPath != "" && os.Getenv(EnvAtomic) != "1"
+	// Drain stdin fully even when gated off (EPIPE noise on the writer
+	// otherwise — same reasoning as post-receive). Names flush in BOUNDED
+	// batches (PR #195 round-15 P2): a batched committed callback lists
+	// every ref of an allowed high-fanout push, and accumulating them all
+	// before one append would let an authenticated writer size this hook
+	// subprocess's memory by its push. Each flushed batch's names had
+	// their local updates committed, so earlier flushes stay correct even
+	// when a later read or append fails — the remainder just stays held
+	// for post-receive, the usual bound.
+	batch := make([]string, 0, refTxFlushAt)
+	appendFailed := false
+	err := parseRefTxCommitted(os.Stdin, act, func(name string) {
+		if appendFailed {
+			return
+		}
+		batch = append(batch, name)
+		if len(batch) >= refTxFlushAt {
+			appendFailed = appendPushReleased(holdPath, batch) != nil
+			batch = batch[:0]
+		}
+	})
+	if err == nil && act && !appendFailed && len(batch) > 0 {
+		_ = appendPushReleased(holdPath, batch)
+	}
+	return nil
+}
+
+// refTxFlushAt bounds the committed-callback batch: memory stays O(batch)
+// regardless of push fanout. A var so tests can shrink it.
+var refTxFlushAt = 4096
+
+// parseRefTxCommitted reads reference-transaction stdin records
+// ("<old-sha> <new-sha> <refname>"), STREAMING each refname to emit and
+// draining the reader even when parse=false. The two separators are
+// single ASCII spaces per the protocol; everything after the second is
+// the refname BYTE-FOR-BYTE (PR #195 round-7 P2 — strings.Fields split on
+// Unicode whitespace, silently discarding Git-valid names like
+// "refs/heads/a\u00a0b" and leaving them held until post-receive).
+// Scanner token limits bound hostile lines; a scan error abandons the
+// unflushed tombstones (over-holding, the safe direction).
+func parseRefTxCommitted(r io.Reader, parse bool, emit func(string)) error {
+	sc := bufio.NewScanner(r)
+	for sc.Scan() {
+		if !parse {
+			continue
+		}
+		_, rest, ok1 := strings.Cut(sc.Text(), " ")
+		_, name, ok2 := strings.Cut(rest, " ")
+		if !ok1 || !ok2 || name == "" {
+			continue
+		}
+		emit(name)
+	}
+	return sc.Err()
 }
 
 // postReceiveHook releases the push's ref holds (Codex round-22 P2 on
@@ -1458,6 +1537,14 @@ func updateHook(ctx context.Context, args []string) (retErr error) {
 	// the file fresh until git's final local transaction (Codex round-2
 	// P2 on #173).
 	holdPath := os.Getenv(EnvPushHold)
+	// Whether THIS ref is actually covered by the push's hold — set when
+	// the bulk reservation is confirmed or the JIT/sidecar
+	// self-reservation succeeds below (PR #195 round-8 P2): a mixed
+	// push's policy-denied sidecar-marked refs error out BEFORE any
+	// reservation, and releasing a never-covered name would bump the
+	// epoch and invalidate the allowed siblings' held markers once per
+	// cheap denial.
+	refHeld := false
 	if holdPath != "" {
 		defer startPushHoldRefresh(holdPath)()
 		// Release this hook's ref from the shared hold on ANY denial
@@ -1495,11 +1582,33 @@ func updateHook(ctx context.Context, args []string) (retErr error) {
 				return
 			}
 			if os.Getenv(EnvAtomic) == "1" {
+				// A whole-push release regardless of THIS ref's coverage:
+				// one atomic denial dooms every sibling's reservation.
 				removePushHoldFiles(holdPath)
 				return
 			}
-			_ = removePushHolds(holdPath, []string{refName})
+			if refHeld {
+				_ = releaseDeniedPushHold(holdPath, refName)
+			}
 		}()
+	}
+
+	// Coverage determination for the denial release above, BEFORE the
+	// policy check (PR #195 round-8 P2, preserving round-19): a
+	// bulk-reserved name (no sidecar marker, not JIT-classified) is held
+	// the moment this hook runs — a no-push or ancestry denial below must
+	// release it — while a sidecar-marked or JIT name is held only once
+	// its self-reservation succeeds, and releasing it earlier would bump
+	// the epoch for a name that never had coverage, letting a mixed
+	// push's cheap policy-denied refs invalidate the allowed siblings'
+	// held markers once per denial. Marker-stat trouble stays refHeld =
+	// false: under-releasing over-holds, the safe direction (and the
+	// reservation block below re-stats with real error handling).
+	if holdPath != "" {
+		jit := errors.Is(evalRefPolicy(ctx, repo, refName, old, new, false), errReservationNeedsAncestry)
+		if _, err := os.Stat(pushHoldUnreservedMarker(holdPath, refName)); errors.Is(err, os.ErrNotExist) && !jit {
+			refHeld = true
+		}
 	}
 
 	// Verified verdict (Codex round-16 P2): pre-receive already ran the
@@ -1566,7 +1675,19 @@ func updateHook(ctx context.Context, args []string) (retErr error) {
 			// out their legitimate updates. On success the reservation is
 			// kept through the CAS, the local update, and receive-pack
 			// exit, exactly like bulk holds.
-			if err := reservePushHolds(ctx, holdPath, []string{refName}); err != nil {
+			// Cover the APPEND attempt, not the call (PR #195 rounds 9
+			// and 18): appendPushHolds can fail after its append landed
+			// (close or epoch-bump trouble), leaving the ref physically
+			// held while this hook errors out — the deferred release must
+			// then free it, or a stalled client keeps it covered
+			// indefinitely. But the reservation also denies BEFORE any
+			// append (scan-allowance, lock deadlines, peer conflicts),
+			// where the name provably never had coverage — flipping the
+			// flag on the call would tombstone it against the siblings'
+			// shared hold and bump the repository epoch once per doomed
+			// command. The flag flips exactly at the append boundary,
+			// inside the reservation flock.
+			if err := reservePushHoldsCovering(ctx, holdPath, []string{refName}, &refHeld); err != nil {
 				return fmt.Errorf("update: reserve push hold: %w", err)
 			}
 		}

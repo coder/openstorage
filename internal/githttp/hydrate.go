@@ -145,6 +145,7 @@ type cacheRepoMemo struct {
 	preReceive  os.FileInfo
 	update      os.FileInfo
 	postReceive os.FileInfo
+	refTx       os.FileInfo
 }
 
 // cacheRepoMemos maps cache repo paths to their verified fingerprints, one
@@ -154,11 +155,11 @@ type cacheRepoMemo struct {
 var cacheRepoMemos sync.Map // map[string]cacheRepoMemo
 
 // memoFiles pairs each fingerprint with the path it must still match.
-func (m cacheRepoMemo) memoFiles(repoPath string) [4]struct {
+func (m cacheRepoMemo) memoFiles(repoPath string) [5]struct {
 	fi   os.FileInfo
 	path string
 } {
-	return [4]struct {
+	return [5]struct {
 		fi   os.FileInfo
 		path string
 	}{
@@ -166,6 +167,11 @@ func (m cacheRepoMemo) memoFiles(repoPath string) [4]struct {
 		{m.preReceive, filepath.Join(repoPath, "hooks", "pre-receive")},
 		{m.update, filepath.Join(repoPath, "hooks", "update")},
 		{m.postReceive, filepath.Join(repoPath, "hooks", "post-receive")},
+		// The reference-transaction hook joins the memo (PR #195 round-11
+		// P2): excluded, a memo hit skipped its exec-bit and staleness
+		// repairs for the process's whole lifetime — the mode flip alone
+		// invalidates this fingerprint and forces the full pass.
+		{m.refTx, filepath.Join(repoPath, "hooks", "reference-transaction")},
 	}
 }
 
@@ -392,17 +398,312 @@ func EnsureCacheRepoCtx(ctx context.Context, cacheDir, repo string) (string, err
 		assertf(fi != nil, "ensureHook returned no FileInfo for %s", hook.name)
 		*hook.fi = fi
 	}
+	// The reference-transaction hook is installed IF ABSENT only, and
+	// deliberately outside the verified memo (issue #186 finding 1): it
+	// is a best-effort release optimization, not an enforcement hook — a
+	// missing or foreign script only defers hold release to post-receive,
+	// the pre-existing bound — and tests (or operators) may legitimately
+	// wrap it, which content verification would clobber on the next pass.
+	// Failure here is NONFATAL (PR #195 round-11 P2): this hook is a
+	// best-effort release optimization whose absence falls back to
+	// post-receive — an unwritable hooks directory in an otherwise
+	// serviceable repo must not take it offline while the enforcement
+	// hooks above verified fine. An unverified state is simply never
+	// memoized, so every call retries the install until it heals.
+	refTxFI, refTxErr := ensureRefTxHook(filepath.Join(hooksDir, "reference-transaction"),
+		fmt.Sprintf(refTxHookScript, self))
 	// Memoize only a config state some verifyLocalConfig pass proved: the
 	// fingerprint identifies the exact unchanged file the reads covered
 	// (PR #98 round-3 review). A raced rewrite leaves configErr set and
 	// skips memoization entirely — hooks included, so the whole memo only
 	// ever vouches for verified state.
-	if configErr == nil {
+	if configErr == nil && refTxErr == nil && refTxFI != nil {
 		assertf(configFI != nil, "verifyLocalConfig returned no FileInfo for %s", configPath)
 		memo.config = configFI
+		memo.refTx = refTxFI
 		cacheRepoMemos.Store(path, memo)
 	}
 	return path, nil
+}
+
+// refTxHookScript gates on the hold env INSIDE the script, unlike the
+// enforcement hooks: reference-transaction fires on EVERY ref transaction
+// in the cache repo — hydration's update-ref batches, maintenance,
+// read-path fixture setup — and only receive-pack pushes export the hold
+// env. Non-push transactions must cost one /bin/sh exit, not a
+// server-binary exec per transaction (and, in packages whose test
+// binaries do not dispatch hook args, not a recursive test run — the
+// enforcement hooks never fire outside receive-pack, so only this hook
+// needs the script-level gate).
+//
+// The binary runs WITHOUT exec, guarded by `|| exit 0` (PR #195 round-1
+// P1): a failed exec exits a non-interactive POSIX shell with the exec's
+// own status, and a nonzero exit at the "prepared" state ABORTS git's
+// ref transaction — a vanished binary (mid-rolling-deploy) would fail a
+// valid push whose authority CASes already committed, the exact
+// wrong-way failure this machinery exists to prevent. The hook is
+// best-effort by contract; every failure mode must degrade to
+// "release deferred to post-receive", never to an aborted transaction.
+const refTxHookScript = refTxHookGate + `%q hook reference-transaction "$@" || exit 0
+`
+
+// refTxHookGate is the script's managed-identity prefix, shared by the
+// generator above and the refresh detector below. The committed-state
+// check lives in the SHELL too (PR #195 round-6 security P2): git
+// versions with per-ref reference transactions invoke the hook at both
+// prepared and committed for every ref, and a Go-side gate alone would
+// exec the full binary twice per ref on an allowed high-fanout push —
+// node-wide process amplification under concurrent pushes. Every
+// non-committed callback costs one /bin/sh exit; per-ref gits then pay
+// one binary exec per committed ref, the same order as their own
+// per-command update hooks, and batched gits pay one per push.
+const refTxHookGate = refTxHookGateV1 + `[ "$1" = committed ] || exit 0
+`
+
+// refTxHookGateV1 is the first managed generation's gate (no committed
+// line) — still recognized by the refresh detector so pre-gate installs
+// are upgraded rather than orphaned as foreign.
+const refTxHookGateV1 = `#!/bin/sh
+[ -n "$CODESTORAGE_GIT_PUSH_HOLD" ] || exit 0
+`
+
+// isManagedRefTxHook reports whether content is one of OUR generated
+// reference-transaction scripts — the COMPLETE template shape (the gate
+// plus exactly one delegated-invocation line, any embedded binary path,
+// exec-style historical generations included), nothing more (PR #195
+// round-3 P2): an operator wrapper that keeps the gate and the delegated
+// invocation but ADDS logic must classify as foreign, or the refresh
+// pass would silently strip the additions.
+func isManagedRefTxHook(content []byte) bool {
+	// Every generation this PR's iterations produced is recognized (PR
+	// #195 round-8 P1): the committed-state gate line was added late, and
+	// matching only the current gate would orphan scripts installed by
+	// earlier snapshots — unrefreshable stale binary paths whose failing
+	// prepared callbacks abort valid pushes. Longest gate first: the
+	// older gate is a prefix of the newer.
+	rest, ok := strings.CutPrefix(string(content), refTxHookGate)
+	if !ok {
+		rest, ok = strings.CutPrefix(string(content), refTxHookGateV1)
+	}
+	if !ok {
+		// The original, ungated generation (the plain enforcement-hook
+		// template): shebang plus one delegated-invocation line, nothing
+		// else (PR #195 round-13 P1). An operator script of this exact
+		// shape is indistinguishable by construction — and refreshing it
+		// preserves its whole observable behavior (it already delegated
+		// everything to the binary) while adding the cost gates.
+		rest, ok = strings.CutPrefix(string(content), "#!/bin/sh\n")
+	}
+	if !ok {
+		return false
+	}
+	line, rest, ok := strings.Cut(rest, "\n")
+	if !ok || rest != "" {
+		return false
+	}
+	// The invocation line must consist SOLELY of the optional historical
+	// `exec`, one quoted executable, and the delegation (PR #195 round-4
+	// P2): a suffix-only check classified same-line wrapper additions
+	// (`logger ...; "/usr/bin/codestorage" hook ...`) as managed and
+	// clobbered them.
+	line, cut := strings.CutSuffix(line, ` hook reference-transaction "$@" || exit 0`)
+	if !cut {
+		if line, cut = strings.CutSuffix(line, ` hook reference-transaction "$@"`); !cut {
+			return false
+		}
+	}
+	line = strings.TrimPrefix(line, "exec ")
+	if len(line) < 2 || line[0] != '"' {
+		return false
+	}
+	path, err := strconv.Unquote(line) // errors on any trailing bytes
+	if err != nil || !filepath.IsAbs(path) {
+		return false
+	}
+	// Literal executables only (PR #195 round-9 P2): $, backquote, and
+	// backslash keep their meaning inside shell double quotes, so a
+	// quoted `"$CODESTORAGE_BIN"` passes Unquote while being an
+	// operator's dynamic selection — the generator only ever emits
+	// literal absolute paths, and anything else must classify as foreign
+	// and be preserved.
+	return !strings.ContainsAny(path, "$`\\")
+}
+
+// ensureRefTxHook installs script at path when nothing exists there, and
+// REFRESHES it when the existing content is a stale managed script (PR
+// #195 round-1 P1): cache repos survive deployments while the script
+// embeds a version-specific binary path — install-if-absent alone would
+// preserve a dead path forever, and its failure at "prepared" aborts
+// valid pushes after an upgrade. Foreign/operator content is preserved:
+// this hook is a best-effort release optimization whose replacement only
+// defers release to post-receive, and tests legitimately wrap it. Writes
+// go through temp + rename (a concurrent receive-pack never execs a
+// partial script; concurrent installers write identical content and the
+// last rename wins).
+// It returns the FileInfo of the exact state it verified, installed, or
+// preserved — memoized like the enforcement hooks' (PR #195 round-11 P2:
+// a memo excluding this hook skipped its repairs for the process's whole
+// lifetime) — or nil when no verified state exists (a raced install
+// aborted; the next full pass re-decides).
+func ensureRefTxHook(path, script string) (os.FileInfo, error) {
+	// Content, mode, and fingerprint come from ONE descriptor (PR #195
+	// round-14 P2, mirroring ensureHook): a re-read or path-stat could
+	// pair one inode's bytes with a concurrent replacement's metadata —
+	// memoizing a fingerprint the content check never covered. The final
+	// path re-stat confirms the verified inode still names the path.
+	var existing []byte
+	f, err := os.Open(path)
+	switch {
+	case err == nil:
+		// Stat–read–stat: the fingerprint is taken BEFORE the bytes and
+		// re-verified unchanged after them, so it can only ever describe
+		// the exact content the checks below examined — an in-place
+		// rewrite mid-read (which keeps the inode, defeating SameFile
+		// alone) changes mtime/ctime and refuses the pass.
+		fi, err := f.Stat()
+		if err == nil {
+			existing, err = io.ReadAll(f)
+		}
+		if testHookRefTxMidVerify != nil {
+			testHookRefTxMidVerify()
+		}
+		var fi2 os.FileInfo
+		if err == nil {
+			fi2, err = f.Stat()
+		}
+		if err != nil {
+			_ = f.Close()
+			return nil, err
+		}
+		if !fileUnchanged(fi, fi2) {
+			_ = f.Close()
+			return nil, nil // rewritten underfoot; next pass re-decides
+		}
+		if string(existing) == script {
+			// Verify the mode too (PR #195 round-2 P2): a restored cache
+			// volume can strip the execute bit while the bytes stay
+			// current, and git SILENTLY skips non-executable hooks. The
+			// OWNER bit specifically (round-8 P2): the serving process is
+			// the file's owner, and POSIX resolves exactly one permission
+			// class — group/other execute bits do nothing for it. The
+			// descriptor chmod is atomic on the VERIFIED inode.
+			if fi.Mode()&0o100 == 0 {
+				if err := f.Chmod(0o755); err != nil {
+					_ = f.Close()
+					return nil, err
+				}
+				if fi, err = f.Stat(); err != nil {
+					_ = f.Close()
+					return nil, err
+				}
+			}
+			_ = f.Close()
+			psi, err := os.Stat(path)
+			if err != nil || !os.SameFile(fi, psi) {
+				return nil, nil // replaced underfoot; next pass re-decides
+			}
+			return fi, nil
+		}
+		_ = f.Close()
+		if !isManagedRefTxHook(existing) {
+			// Foreign content is preserved — fingerprinted only while the
+			// verified inode still names the path.
+			psi, err := os.Stat(path)
+			if err != nil || !os.SameFile(fi, psi) {
+				return nil, nil
+			}
+			return psi, nil
+		}
+	case !errors.Is(err, os.ErrNotExist):
+		return nil, err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = os.Remove(tmp.Name()) }() // no-op after a successful rename
+	if _, err := tmp.WriteString(script); err != nil {
+		_ = tmp.Close()
+		return nil, err
+	}
+	if err := tmp.Chmod(0o755); err != nil {
+		_ = tmp.Close()
+		return nil, err
+	}
+	fi, err := tmp.Stat()
+	if err != nil {
+		_ = tmp.Close()
+		return nil, err
+	}
+	if err := tmp.Close(); err != nil {
+		return nil, err
+	}
+	if testHookRefTxPreInstall != nil {
+		testHookRefTxPreInstall()
+	}
+	// No-clobber installation (PR #195 rounds 9 and 12): link(2) fails
+	// EEXIST instead of displacing whatever occupies the path, so a
+	// concurrent install always survives — there is no read-to-rename
+	// window at all. The install links the temp's inode into place and
+	// re-stats the DESTINATION for the memo fingerprint (round-12 P3:
+	// link updates ctime, which fileUnchanged compares — a pre-install
+	// fingerprint would reject every memo immediately and re-run the
+	// full verification per request).
+	install := func() (os.FileInfo, error) {
+		if err := os.Link(tmp.Name(), path); err != nil {
+			if errors.Is(err, os.ErrExist) {
+				return nil, nil // a concurrent install won; next pass re-decides
+			}
+			return nil, err
+		}
+		// Drop the temp NAME before fingerprinting: unlinking it later
+		// updates the shared inode's ctime (link count is inode
+		// metadata), which fileUnchanged compares — a fingerprint taken
+		// with the temp name still present is invalidated the moment the
+		// deferred cleanup runs, rejecting the memo on every subsequent
+		// call (the second test-lane CI red on this PR).
+		_ = os.Remove(tmp.Name())
+		dfi, err := os.Stat(path)
+		if err != nil || !os.SameFile(fi, dfi) {
+			return nil, nil
+		}
+		return dfi, nil
+	}
+	if existing == nil {
+		return install()
+	}
+	// The replace path takes the target ASIDE atomically and inspects the
+	// inode it actually displaced: only content byte-equal to the stale
+	// managed script the decision described is discarded; anything else —
+	// a foreign hook landing at any point since the decision read — is
+	// restored, again without clobbering an even newer install. The hook
+	// may be briefly absent mid-replace; it is optional by contract
+	// (release falls back to post-receive), unlike the enforcement hooks.
+	quarantine := tmp.Name() + ".displaced"
+	if err := os.Rename(path, quarantine); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return install() // vanished underfoot; a plain no-clobber create
+		}
+		return nil, err
+	}
+	displaced, derr := os.ReadFile(quarantine)
+	if derr == nil && bytes.Equal(displaced, existing) {
+		dfi, ierr := install()
+		_ = os.Remove(quarantine)
+		return dfi, ierr
+	}
+	// Foreign (or unverifiable) content was displaced: restore it. EEXIST
+	// means an even newer install took the slot — the operator's latest
+	// wins over the mid-window one, exactly as consecutive operator
+	// writes always resolve. On any OTHER restore failure (ENOSPC,
+	// EMLINK, no-hardlink fs) the quarantined inode is RETAINED at its
+	// .displaced name for operator recovery instead of silently deleted
+	// (PR #195 round-14 P2) — the promise is preservation, and a leaked
+	// recovery file beats a lost hook.
+	if lerr := linkFile(quarantine, path); lerr == nil || errors.Is(lerr, os.ErrExist) {
+		_ = os.Remove(quarantine)
+	}
+	return nil, nil
 }
 
 // ensureHook installs the hook script unless it is already current and
@@ -1198,6 +1499,15 @@ const (
 	// TTL: expiry needs a second, later observation (see pushHoldLive),
 	// and the marker's own mtime is the clock that separates the two.
 	pushHoldReapSuffix = ".reap"
+	// pushHoldReleasedSuffix names a hold's tombstone sidecar (issue #186
+	// findings 1+6): an append-only list of exact ref names this push no
+	// longer reserves — committed non-atomic refs (released by the
+	// reference-transaction hook the moment git's per-command local
+	// transaction commits) and denied refs (released by their own update
+	// hook). Readers subtract these names from the hold's coverage;
+	// appends are O(1), replacing the whole-file rewrite that made an
+	// all-denied fanout O(N²) in disk I/O.
+	pushHoldReleasedSuffix = ".released"
 )
 
 // isPushHoldSidecar reports whether a hold-directory entry name is one of
@@ -1206,7 +1516,8 @@ func isPushHoldSidecar(name string) bool {
 	return strings.HasSuffix(name, pushHoldUnreservedSuffix) ||
 		strings.HasSuffix(name, pushHoldVerifiedSuffix) ||
 		strings.HasSuffix(name, pushHoldScanSuffix) ||
-		strings.HasSuffix(name, pushHoldReapSuffix)
+		strings.HasSuffix(name, pushHoldReapSuffix) ||
+		strings.HasSuffix(name, pushHoldReleasedSuffix)
 }
 
 // removePushHoldFiles releases a push's hold file together with every
@@ -1260,6 +1571,7 @@ func removePushHoldFiles(holdPath string) {
 	_ = os.RemoveAll(holdPath + pushHoldVerifiedSuffix)
 	_ = os.Remove(holdPath + pushHoldScanSuffix)
 	_ = os.Remove(holdPath + pushHoldReapSuffix)
+	_ = os.Remove(holdPath + pushHoldReleasedSuffix)
 }
 
 // pushHoldLive reports whether one hold-file observation counts as live,
@@ -1519,7 +1831,38 @@ func sweepExpiredPushHolds(dir string) {
 		}
 		switch age := time.Since(info.ModTime()); {
 		case age > pushHoldTTL:
-			// RemoveAll: unreserved sidecars are directories.
+			// Orphan deletion runs under the reservation flock with the
+			// parent re-checked at BOTH names (PR #195 round-14 P2): a
+			// concurrent sweep's reap window renames the hold to
+			// .reaping, and an unserialized age check would delete a
+			// LIVE hold's tombstone sidecar as an orphan — a restore
+			// then resurrects every released name until the push exits.
+			// Reaps and restores hold this same lock, so under it the
+			// parent's two names are stable; busy means a reap window is
+			// active — skip, the next sweep retries.
+			if base, ok := pushHoldSidecarBase(e.Name()); ok {
+				lock, err := os.OpenFile(dir+".reserve.lock", os.O_CREATE|os.O_RDWR, 0o644)
+				if err != nil {
+					continue
+				}
+				if syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB) != nil {
+					_ = lock.Close()
+					continue
+				}
+				// Confirmed ABSENCE only (PR #195 round-15 P2): a
+				// transient stat error (EIO) is not proof the parent is
+				// gone, and deleting a live hold's sidecar resurrects its
+				// released names. Any non-ENOENT outcome preserves the
+				// sidecar for the next sweep.
+				_, baseErr := statFile(filepath.Join(dir, base))
+				_, reapErr := statFile(filepath.Join(dir, base) + ".reaping")
+				if errors.Is(baseErr, os.ErrNotExist) && errors.Is(reapErr, os.ErrNotExist) {
+					// RemoveAll: unreserved sidecars are directories.
+					_ = os.RemoveAll(path)
+				}
+				_ = lock.Close()
+				continue
+			}
 			_ = os.RemoveAll(path)
 		case age < -pushHoldTTL:
 			now := time.Now()
@@ -1531,10 +1874,17 @@ func sweepExpiredPushHolds(dir string) {
 // Test seams: called (when non-nil) at interleaving points concurrency
 // tests cannot otherwise reach deterministically. Nil in production.
 var (
-	testHookReapAfterQuarantine  func()
-	testHookHoldsKeyMidSnapshot  func()
-	testHookRemoveHoldsPreRename func()
-	testHookRefreshBeforeLock    func()
+	testHookReapAfterQuarantine   func()
+	testHookAppendReleasedMidGate func()
+	testHookHoldsKeyMidSnapshot   func()
+	testHookHoldsKeyPreClose      func()
+	testHookHoldsKeyPostVerify    func()
+	testHookRemoveHoldsPreRename  func()
+	testHookRefreshBeforeLock     func()
+	testHookRefTxPreInstall       func()
+	testHookRefTxMidVerify        func()
+	testHookPeerScanPostStat      func()
+	testHookDirCachePreParse      func()
 )
 
 // reapExpiredPushHold removes an expiry-verdict hold with the verdict and
@@ -1617,11 +1967,12 @@ func reapExpiredPushHold(path string, observed time.Time) {
 	_ = os.RemoveAll(path + pushHoldVerifiedSuffix)
 	_ = os.Remove(path + pushHoldScanSuffix)
 	_ = os.Remove(path + pushHoldReapSuffix)
+	_ = os.Remove(path + pushHoldReleasedSuffix)
 }
 
 // pushHoldSidecarBase maps a sidecar entry name to its hold file's name.
 func pushHoldSidecarBase(name string) (string, bool) {
-	for _, suffix := range []string{pushHoldUnreservedSuffix, pushHoldVerifiedSuffix, pushHoldScanSuffix, pushHoldReapSuffix} {
+	for _, suffix := range []string{pushHoldUnreservedSuffix, pushHoldVerifiedSuffix, pushHoldScanSuffix, pushHoldReapSuffix, pushHoldReleasedSuffix} {
 		if base, ok := strings.CutSuffix(name, suffix); ok {
 			return base, true
 		}
@@ -1719,6 +2070,7 @@ func touchPushHold(holdPath string) {
 	_ = os.Chtimes(holdPath+pushHoldUnreservedSuffix, now, now)
 	_ = os.Chtimes(holdPath+pushHoldVerifiedSuffix, now, now)
 	_ = os.Chtimes(holdPath+pushHoldScanSuffix, now, now)
+	_ = os.Chtimes(holdPath+pushHoldReleasedSuffix, now, now)
 }
 
 // startPushHoldRefresh keeps holdPath fresh on a TTL/4 cadence until the
@@ -1848,6 +2200,50 @@ func loadPushHolds(repoPath string) pushHoldSet {
 	return s
 }
 
+// linkFile is os.Link behind a test seam (PR #195 round-14 P2: restore-
+// failure handling needs deterministic fault injection).
+var linkFile = os.Link
+
+// statFile is os.Stat behind a test seam (PR #195 round-15 P2: the
+// orphan sweep's confirmed-absence rule needs deterministic EIO).
+var statFile = os.Stat
+
+// holdSidecarOwner maps a hold FILE path to the path its sidecars are
+// named under: a quarantined hold (`push-X.reaping`) keeps its sidecars
+// at the BASE name — the reap renames only the hold file (PR #195
+// round-16 security P2: readers that sought `push-X.reaping.released`
+// lost the tombstone association for the quarantine window, letting a
+// scan over-hold released coverage while the bracketing fingerprints —
+// blind to the net-zero quarantine/restore renames — still matched and
+// certified its skips until the TTL).
+func holdSidecarOwner(path string) string {
+	if base, ok := strings.CutSuffix(path, ".reaping"); ok {
+		return base
+	}
+	return path
+}
+
+// errPushScanBudget marks a peer scan denied MID-SCAN because reading the
+// next file would exceed the push's remaining allowance (PR #195 round-12
+// P2): the precheck's size snapshot cannot bind flock-less tombstone
+// growth, so the budget is enforced against each file's CURRENT size
+// immediately before its bytes are read — zero overshoot by construction,
+// independent of when the growth lands.
+var errPushScanBudget = errors.New("push hold: push exceeded its peer-hold scan allowance against unusually large concurrent push holds; retry shortly or split the push")
+
+// readFileLimit reads at most limit bytes of path — os.ReadFile with a
+// hard cap for files that can grow under the reader (PR #195 round-11
+// P2: the scan-work allowance charges sampled sizes, so reads must not
+// exceed them).
+func readFileLimit(path string, limit int64) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = f.Close() }()
+	return io.ReadAll(io.LimitReader(f, limit))
+}
+
 // readPushHolds snapshots the live (unexpired) holds in dir, skipping
 // exceptPath (a push's own file — its reservation must not conflict with
 // its own earlier holds). ENOENT anywhere is benign: the directory may not
@@ -1872,6 +2268,14 @@ func readPushHolds(dir, exceptPath string) (pushHoldSet, error) {
 type pushHoldDirCache struct {
 	dir, except string
 
+	// remaining, when positive, bounds the bytes a single load may read:
+	// each stale entry's CURRENT listed sizes are checked against it
+	// before any read (round-12 P2 — the reservation path's precheck
+	// snapshot cannot bind flock-less sidecar growth), failing closed
+	// with errPushScanBudget. Zero means unlimited (hydration's fail-open
+	// reader charges no allowance).
+	remaining int64
+
 	files  map[string]holdFileParse
 	set    pushHoldSet
 	setKey string // "path\x00size\x00mtime\x01..." fingerprint the set was built from
@@ -1883,7 +2287,13 @@ type pushHoldDirCache struct {
 type holdFileParse struct {
 	size  int64
 	mtime int64 // UnixNano
-	names []string
+	// The `.released` tombstone sidecar's fingerprint (issue #186): -1
+	// when absent, -2 after a failed read so the next poll re-probes.
+	// Tombstoned names are subtracted from names at parse time, so a
+	// tombstone append re-parses this peer on the next load.
+	relSize  int64
+	relMtime int64
+	names    []string // held minus tombstoned
 }
 
 func (c *pushHoldDirCache) load() (pushHoldSet, error) {
@@ -1896,6 +2306,18 @@ func (c *pushHoldDirCache) load() (pushHoldSet, error) {
 	}
 	if c.files == nil {
 		c.files = make(map[string]holdFileParse)
+	}
+	// Pre-pass: tombstone sidecar stats, keyed by their hold file's path
+	// (issue #186). Same ReadDir snapshot as the holds below; a tombstone
+	// landing after the listing is seen as a subset, which over-holds —
+	// the safe direction.
+	released := make(map[string]os.FileInfo)
+	for _, e := range entries {
+		if base, ok := strings.CutSuffix(e.Name(), pushHoldReleasedSuffix); ok && !e.IsDir() {
+			if info, err := e.Info(); err == nil {
+				released[filepath.Join(c.dir, base)] = info
+			}
+		}
 	}
 	var firstErr error
 	live := make(map[string]holdFileParse, len(entries))
@@ -1929,8 +2351,22 @@ func (c *pushHoldDirCache) load() (pushHoldSet, error) {
 		if !pushHoldLive(path, info.ModTime()) {
 			continue
 		}
+		relSize, relMtime := int64(-1), int64(-1)
+		if ri, ok := released[holdSidecarOwner(path)]; ok {
+			relSize, relMtime = ri.Size(), ri.ModTime().UnixNano()
+		}
 		parse, ok := c.files[path]
-		if !ok || parse.size != info.Size() || parse.mtime != info.ModTime().UnixNano() {
+		if !ok || parse.size != info.Size() || parse.mtime != info.ModTime().UnixNano() ||
+			parse.relSize != relSize || parse.relMtime != relMtime {
+			if testHookDirCachePreParse != nil {
+				testHookDirCachePreParse()
+			}
+			if c.remaining > 0 && c.parsedBytes+info.Size()+max(relSize, 0) > c.remaining {
+				if firstErr == nil {
+					firstErr = errPushScanBudget
+				}
+				continue
+			}
 			b, err := os.ReadFile(path)
 			if err != nil {
 				if !errors.Is(err, os.ErrNotExist) && firstErr == nil {
@@ -1940,15 +2376,53 @@ func (c *pushHoldDirCache) load() (pushHoldSet, error) {
 			}
 			c.parses++
 			c.parsedBytes += int64(len(b))
-			parse = holdFileParse{size: info.Size(), mtime: info.ModTime().UnixNano(), names: nil}
+			parse = holdFileParse{size: info.Size(), mtime: info.ModTime().UnixNano(), relSize: relSize, relMtime: relMtime}
+			// Subtract the peer's tombstones (issue #186): exact released
+			// names drop out of coverage. An unreadable sidecar subtracts
+			// NOTHING (over-holding, the safe direction — unlike a hold
+			// file, whose unreadability must fail reservations closed)
+			// and re-probes on the next load via the -2 sentinel. The
+			// read is BOUNDED to the sampled size (round-11 P2, the
+			// multi-name twin of the single-name LimitReader): flock-less
+			// appends can grow the sidecar between the listing's stat and
+			// this read, and unbounded reading would parse bytes the
+			// pre-read allowance check never charged. A boundary-cut
+			// record is an unterminated tail, dropped below; the growth
+			// re-parses on the next load via the fresh stat.
+			var tombstoned map[string]bool
+			if relSize >= 0 {
+				if rb, err := readFileLimit(holdSidecarOwner(path)+pushHoldReleasedSuffix, relSize); err == nil {
+					c.parsedBytes += int64(len(rb))
+					// Trust only newline-TERMINATED records (PR #195
+					// round-1 P2): a short append (ENOSPC, EIO) strands a
+					// PREFIX of the released name as the last record, and
+					// that prefix can itself be a different still-reserved
+					// name — releasing refs/heads/foobar must never free
+					// refs/heads/foo. An unterminated tail is dropped
+					// (over-holding, the safe direction).
+					if i := bytes.LastIndexByte(rb, '\n'); i >= 0 {
+						rb = rb[:i+1]
+					} else {
+						rb = nil
+					}
+					tombstoned = make(map[string]bool)
+					for _, name := range strings.Split(string(rb), "\n") {
+						if name != "" {
+							tombstoned[name] = true
+						}
+					}
+				} else {
+					parse.relSize, parse.relMtime = -2, -2
+				}
+			}
 			for _, held := range strings.Split(string(b), "\n") {
-				if held != "" {
+				if held != "" && !tombstoned[held] {
 					parse.names = append(parse.names, held)
 				}
 			}
 		}
 		live[path] = parse
-		fmt.Fprintf(&key, "%s\x00%d\x00%d\x01", path, parse.size, parse.mtime)
+		fmt.Fprintf(&key, "%s\x00%d\x00%d\x00%d\x00%d\x01", path, parse.size, parse.mtime, parse.relSize, parse.relMtime)
 	}
 	c.files = live
 	if key.String() != c.setKey {
@@ -2040,7 +2514,11 @@ func holdLineCovers(held []byte, name string) bool {
 // the size of every peer file it opened (a deliberate overcount on a
 // short-circuit) — which the caller charges against the push's
 // maxPushPeerScanBytes allowance.
-func peerHoldCovers(dir, exceptPath, name string) (bool, int64, error) {
+// remaining is the push's unspent scan allowance, enforced against each
+// file's CURRENT size before its bytes are read (round-12 P2 — the
+// caller's precheck snapshot cannot bind flock-less sidecar growth);
+// exceeding it returns errPushScanBudget with zero overshoot.
+func peerHoldCovers(dir, exceptPath, name string, remaining int64) (bool, int64, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -2067,6 +2545,9 @@ func peerHoldCovers(dir, exceptPath, name string) (bool, int64, error) {
 		if !pushHoldLive(path, info.ModTime()) {
 			continue
 		}
+		if scanned+info.Size() > remaining {
+			return false, scanned, errPushScanBudget
+		}
 		f, err := os.Open(path)
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
@@ -2075,17 +2556,69 @@ func peerHoldCovers(dir, exceptPath, name string) (bool, int64, error) {
 			return false, scanned, err
 		}
 		scanned += info.Size()
+		// Collect the covering held lines (normally none, at most a
+		// handful — exact name plus D/F relatives), then subtract the
+		// peer's tombstones before declaring a conflict (issue #186).
+		var covering map[string]bool
 		sc := bufio.NewScanner(f)
 		for sc.Scan() {
 			if holdLineCovers(sc.Bytes(), name) {
-				_ = f.Close()
-				return true, scanned, nil
+				if covering == nil {
+					covering = make(map[string]bool)
+				}
+				covering[string(sc.Bytes())] = true
 			}
 		}
 		err = sc.Err()
 		_ = f.Close()
 		if err != nil {
 			return false, scanned, err
+		}
+		if len(covering) == 0 {
+			continue
+		}
+		// Stream the tombstones, deleting exact matches. Absent or
+		// unreadable sidecars subtract nothing — over-holding, the safe
+		// direction (a hold file's unreadability above stays fail-closed,
+		// because there a missed line would UNDER-hold). Bytes charged
+		// like the hold's own.
+		if rf, err := os.Open(holdSidecarOwner(path) + pushHoldReleasedSuffix); err == nil {
+			var sampled int64
+			if ri, err := rf.Stat(); err == nil {
+				sampled = ri.Size()
+			}
+			if scanned+sampled > remaining {
+				_ = rf.Close()
+				return false, scanned, errPushScanBudget
+			}
+			scanned += sampled
+			if testHookPeerScanPostStat != nil {
+				testHookPeerScanPostStat()
+			}
+			// Trust only newline-TERMINATED records (PR #195 round-1 P2):
+			// ReadString returns the unterminated tail WITH an error, so a
+			// torn append's stranded prefix — possibly a different live
+			// name — is never applied. The read is LIMITED to the sampled,
+			// charged size (round-10 P2): appends take no flock, so the
+			// sidecar can grow under this stream, and unbounded reading
+			// would bypass the scan-work allowance byte-for-byte; a record
+			// cut at the boundary is an unterminated tail, dropped like
+			// any other (unread tombstones over-hold, the safe direction).
+			rr := bufio.NewReader(io.LimitReader(rf, sampled))
+			for len(covering) > 0 {
+				line, err := rr.ReadString('\n')
+				if err != nil {
+					break
+				}
+				line = line[:len(line)-1]
+				if covering[line] {
+					delete(covering, line)
+				}
+			}
+			_ = rf.Close()
+		}
+		if len(covering) > 0 {
+			return true, scanned, nil
 		}
 	}
 	return false, scanned, nil
@@ -2148,6 +2681,18 @@ func pushHoldPendingBytes(dir, exceptPath string, cached map[string]holdFilePars
 		}
 		return 0, err
 	}
+	// Tombstone sidecars are read alongside their holds (issue #186), so
+	// their bytes join the estimate under the same staleness test — a
+	// tombstone append alone re-parses its peer, and skipping its size
+	// here would reopen the overshoot this function closes.
+	released := make(map[string]os.FileInfo)
+	for _, e := range entries {
+		if base, ok := strings.CutSuffix(e.Name(), pushHoldReleasedSuffix); ok && !e.IsDir() {
+			if info, err := e.Info(); err == nil {
+				released[filepath.Join(dir, base)] = info
+			}
+		}
+	}
 	var pending int64
 	for _, e := range entries {
 		if isPushHoldSidecar(e.Name()) || e.IsDir() {
@@ -2161,10 +2706,18 @@ func pushHoldPendingBytes(dir, exceptPath string, cached map[string]holdFilePars
 		if err != nil {
 			continue // released between the listing and the stat
 		}
-		if parse, ok := cached[path]; ok && parse.size == info.Size() && parse.mtime == info.ModTime().UnixNano() {
+		relSize, relMtime := int64(-1), int64(-1)
+		if ri, ok := released[holdSidecarOwner(path)]; ok {
+			relSize, relMtime = ri.Size(), ri.ModTime().UnixNano()
+		}
+		if parse, ok := cached[path]; ok && parse.size == info.Size() && parse.mtime == info.ModTime().UnixNano() &&
+			parse.relSize == relSize && parse.relMtime == relMtime {
 			continue
 		}
 		pending += info.Size()
+		if relSize > 0 {
+			pending += relSize
+		}
 	}
 	return pending, nil
 }
@@ -2188,6 +2741,20 @@ var pushHoldWaitMax = 10 * time.Second
 // local ref transaction is doomed while the conflicting neighbor
 // survives) — a clean, pre-publication, retryable denial.
 func reservePushHolds(ctx context.Context, holdPath string, names []string) error {
+	return reservePushHoldsCovering(ctx, holdPath, names, nil)
+}
+
+// reservePushHoldsCovering is reservePushHolds reporting COVERAGE to the
+// caller: *covered flips exactly at the append boundary — after every
+// pre-append exit (scan-allowance denials, lock deadlines, peer-conflict
+// timeouts, where the name provably never touched the hold file) and
+// strictly before appendPushHolds can first write it (PR #195 round-18
+// P2, refining round 9's cover-the-attempt: the append can fail AFTER its
+// bytes landed, so waiting for success would leak a physically held name,
+// while flipping before the reservation call tombstoned never-covered
+// names — each such release bumping the repository epoch and invalidating
+// the allowed siblings' held markers once per doomed command).
+func reservePushHoldsCovering(ctx context.Context, holdPath string, names []string, covered *bool) error {
 	if !filepath.IsAbs(holdPath) {
 		return fmt.Errorf("push hold path %q is not absolute", holdPath)
 	}
@@ -2264,11 +2831,17 @@ func reservePushHolds(ctx context.Context, holdPath string, names []string) erro
 				unlock()
 				return fmt.Errorf("push hold: push exceeded its peer-hold scan allowance against unusually large concurrent push holds; retry shortly or split the push")
 			}
-			covered, n, err := peerHoldCovers(dir, holdPath, names[0])
+			covered, n, err := peerHoldCovers(dir, holdPath, names[0], maxPushPeerScanBytes-used)
 			if err != nil {
+				unlock()
+				if errors.Is(err, errPushScanBudget) {
+					// Mid-scan denial (round-12 P2): sidecar growth after
+					// the precheck busted the allowance — same retryable
+					// verdict, zero overshoot.
+					return err
+				}
 				// Fail CLOSED: an unreadable peer hold is not proof of
 				// no conflict (Codex round-3 P1 on #173).
-				unlock()
 				return fmt.Errorf("push hold: reading peer holds: %w", err)
 			}
 			if n > 0 {
@@ -2304,10 +2877,17 @@ func reservePushHolds(ctx context.Context, holdPath string, names []string) erro
 				return fmt.Errorf("push hold: push exceeded its peer-hold scan allowance against unusually large concurrent push holds; retry shortly or split the push")
 			}
 			before := cache.parsedBytes
+			// The in-load budget (round-12 P2): allowance still unspent
+			// plus what this cache already read (parsedBytes is cumulative
+			// across polls while `used` already charges completed polls).
+			cache.remaining = maxPushPeerScanBytes - used + before
 			peers, err := cache.load()
 			if err != nil {
-				// Fail CLOSED (round-3 P1), as above.
 				unlock()
+				if errors.Is(err, errPushScanBudget) {
+					return err
+				}
+				// Fail CLOSED (round-3 P1), as above.
 				return fmt.Errorf("push hold: reading peer holds: %w", err)
 			}
 			if n := cache.parsedBytes - before; n > 0 {
@@ -2324,6 +2904,9 @@ func reservePushHolds(ctx context.Context, holdPath string, names []string) erro
 			}
 		}
 		if conflict == "" {
+			if covered != nil {
+				*covered = true
+			}
 			err := appendPushHolds(holdPath, names)
 			unlock()
 			return err
@@ -2398,6 +2981,126 @@ func removePushHolds(holdPath string, names []string) error {
 		return err
 	}
 	return nil
+}
+
+// appendPushReleased tombstones names in the push's `.released` sidecar
+// with ONE append write (issue #186 findings 1+6): readers subtract these
+// exact names from the hold's coverage, so a release costs O(names)
+// instead of the whole-file rewrite that made an all-denied fanout O(N²).
+//
+// Deliberately NOT under the reservation flock, validated against the
+// #189 invariants: only the owning push's git-serialized processes write
+// this file (update hooks and reference-transaction callbacks run one at
+// a time, strictly before post-receive's release); the reaper's
+// quarantine window renames only the HOLD file, never the sidecar, so a
+// racing append lands in the same sidecar either way, and an append after
+// an unlink merely recreates an orphan the sweep ages out. Readers under
+// the flock may observe a mid-append subset — tombstones only ever grow,
+// so a missed suffix over-holds, the safe direction. The single write
+// keeps torn tails line-shaped at worst; a torn line matches no exact
+// name and over-holds.
+//
+// A release for a push that never created its hold file is a FULL no-op
+// (PR #195 round-5 P2): a no-pack policy-denied push reserves nothing,
+// and letting its cheap denial mint orphan sidecars or invalidate live
+// peers' held markers per request is the amplification the no-hold
+// cleanup rule (round-33 security P2 on #189) exists to prevent.
+//
+// The epoch bump comes BEFORE the append becomes visible and fails
+// CLOSED (PR #195 rounds 1, 4, 5 — the blindness plan in the original
+// design comment proved unsound twice): a tombstone is a coverage
+// mutation like any other and must sit under the fingerprint seqlock,
+// or an append racing a hydrate's bracketed snapshots leaves both keys
+// equal while the scan skipped the released ref. On failure the names
+// simply stay held; post-receive and the TTL remain the bound.
+func appendPushReleased(holdPath string, names []string) error {
+	// A hold riding at its quarantine name is still an existing
+	// reservation (PR #195 round-17 P2): the reap's restore path can
+	// bring it back, and a dropped tombstone would leave an all-denied
+	// push's names re-reserved with no post-receive to release them — a
+	// stalled report tail then blocks conflicting pushes until the TTL.
+	// The sidecar stays at the BASE name either way (readers map the
+	// quarantine name to it).
+	//
+	// The two-name observation runs under the reservation flock (round-18
+	// P2): the reaper holds that lock across its whole quarantine →
+	// verdict → restore/unlink window, so an unserialized gate could stat
+	// the base name before the restore rename and the quarantine name
+	// after it — both absent, the release silently dropped while the hold
+	// lives on at its base name. Serialized, the gate sees the hold
+	// strictly before the window or strictly after its outcome; a
+	// crash-stranded quarantine (its flock died with its process) still
+	// satisfies the second stat.
+	unlock, err := flockExclusive(filepath.Dir(holdPath) + ".reserve.lock")
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	if _, err := os.Lstat(holdPath); err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		if testHookAppendReleasedMidGate != nil {
+			testHookAppendReleasedMidGate()
+		}
+		if _, rerr := os.Lstat(holdPath + ".reaping"); rerr != nil {
+			if errors.Is(rerr, os.ErrNotExist) {
+				return nil
+			}
+			return rerr
+		}
+	}
+	if err := bumpPushHoldEpoch(filepath.Dir(holdPath)); err != nil {
+		return err
+	}
+	var sb strings.Builder
+	for _, name := range names {
+		sb.WriteString(name)
+		sb.WriteByte('\n')
+	}
+	f, err := os.OpenFile(holdPath+pushHoldReleasedSuffix, os.O_CREATE|os.O_APPEND|os.O_RDWR, 0o600)
+	if err != nil {
+		return err
+	}
+	// Fail CLOSED on an unterminated existing tail (PR #195 round-2 P2):
+	// readers drop a torn final record, but a further O_APPEND would fuse
+	// its first name onto that prefix plus a newline — one complete
+	// record whose combined bytes can equal a DIFFERENT still-held ref,
+	// releasing it prematurely. Only this push's serialized processes
+	// write here, so the check cannot race another appender; failing
+	// merely keeps the names held until post-receive.
+	if fi, err := f.Stat(); err != nil {
+		_ = f.Close()
+		return err
+	} else if fi.Size() > 0 {
+		var tail [1]byte
+		if _, err := f.ReadAt(tail[:], fi.Size()-1); err != nil {
+			_ = f.Close()
+			return err
+		}
+		if tail[0] != '\n' {
+			_ = f.Close()
+			return fmt.Errorf("push hold: released sidecar ends in an unterminated record; retaining reservations")
+		}
+	}
+	if _, err := f.WriteString(sb.String()); err != nil {
+		_ = f.Close()
+		return err
+	}
+	return f.Close()
+}
+
+// releaseDeniedPushHold releases ONE ref from a push's hold on a
+// non-atomic update-hook denial — an O(name) tombstone append (issue
+// #186 finding 6): the former per-denial removePushHolds rewrite read and
+// rewrote the entire remaining hold, O(N²) I/O across an all-denied
+// fanout whose bases a concurrent writer moved. The bump-before-
+// visibility invariant (PR #195 round-1 P2 — a denial can precede the
+// CAS, so no competing writer necessarily invalidates held markers) and
+// the never-reserved no-op rule (round-5 P2) live inside the append,
+// shared with the committed-release path.
+func releaseDeniedPushHold(holdPath, refName string) error {
+	return appendPushReleased(holdPath, []string{refName})
 }
 
 // Generation marker (issue #4): the store's per-repo mutation generation
@@ -2511,6 +3214,23 @@ func livePushHoldsKey(repoPath string) (string, bool) {
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return "", false
 	}
+	// Tombstone sidecar stats fold into the key (PR #195 round-4 P2 ×2):
+	// a tombstone append IS a coverage change — a denial released between
+	// the two scans of one hydrate, or a committed DELETION whose hold
+	// was suppressing a newly authoritative D/F child — and a marker that
+	// cannot see it would keep vouching for skip verdicts the release
+	// invalidated. Same stat-only cost contract, same single listing as
+	// the holds themselves.
+	released := make(map[string]os.FileInfo)
+	for _, e := range entries {
+		if base, ok := strings.CutSuffix(e.Name(), pushHoldReleasedSuffix); ok && !e.IsDir() {
+			if info, err := e.Info(); err == nil {
+				released[filepath.Join(dir, base)] = info
+			}
+		}
+	}
+	type relStat struct{ size, mtime int64 }
+	reverify := make(map[string]relStat)
 	for _, e := range entries {
 		if isPushHoldSidecar(e.Name()) || e.IsDir() {
 			continue
@@ -2526,7 +3246,24 @@ func livePushHoldsKey(repoPath string) (string, bool) {
 		if !pushHoldLive(path, info.ModTime()) {
 			continue
 		}
-		fmt.Fprintf(&key, "%s\x00%d\x00%d\x01", path, info.Size(), info.ModTime().UnixNano())
+		// The sidecar association follows the OWNER path (PR #195
+		// round-18 P2): a quarantined hold rides at `push-X.reaping`
+		// while its tombstones stay at the base name — every writer and
+		// coverage reader uses holdSidecarOwner, and a fingerprint keyed
+		// on `push-X.reaping.released` (a path nothing writes) would stay
+		// blind to releases landing during the reap window, letting
+		// bracketing keys certify a scan whose coverage changed mid-way.
+		owner := holdSidecarOwner(path)
+		rel := relStat{-1, -1}
+		if ri, ok := released[owner]; ok {
+			rel = relStat{ri.Size(), ri.ModTime().UnixNano()}
+		}
+		reverify[path] = relStat{info.Size(), info.ModTime().UnixNano()}
+		reverify[owner+pushHoldReleasedSuffix] = rel
+		fmt.Fprintf(&key, "%s\x00%d\x00%d\x00%d\x00%d\x01", path, info.Size(), info.ModTime().UnixNano(), rel.size, rel.mtime)
+	}
+	if testHookHoldsKeyPreClose != nil {
+		testHookHoldsKeyPreClose()
 	}
 	// The closing seqlock read (round-35 P2, see above): any epoch bump
 	// that landed between the two reads means the listing may belong to
@@ -2540,6 +3277,32 @@ func livePushHoldsKey(repoPath string) (string, bool) {
 	}
 	if !bytes.Equal(epoch, epoch2) {
 		return "", false
+	}
+	if testHookHoldsKeyPostVerify != nil {
+		testHookHoldsKeyPostVerify()
+	}
+	// The FINAL observation: re-stat every folded path — hold files AND
+	// tombstone sidecars — and refuse the snapshot on any change (PR #195
+	// rounds 7–8, both loops). The epoch seqlock alone cannot order a
+	// lock-free reader against multi-operation writers (a cross-push
+	// bump can mask a mutation's own), and a re-stat placed BEFORE the
+	// closing epoch read left the gap between them. Placed last, every
+	// mutation visible before the snapshot completes refuses it; one
+	// landing after post-dates the snapshot entirely — the key is true
+	// at publication, and the very next validation recomputes over the
+	// changed (size, mtime), so a published marker cannot outlive the
+	// mutation it missed. Spurious refreshes (a refresher touch mid-
+	// snapshot) cost one conservative rescan.
+	for spath, want := range reverify {
+		got := relStat{-1, -1}
+		if fi, err := os.Lstat(spath); err == nil {
+			got = relStat{fi.Size(), fi.ModTime().UnixNano()}
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return "", false
+		}
+		if got != want {
+			return "", false
+		}
 	}
 	sum := sha256.Sum256([]byte(key.String()))
 	return hex.EncodeToString(sum[:]), true

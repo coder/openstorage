@@ -1702,12 +1702,21 @@ func TestRunHook_AtomicUpdateDenialReleasesWholeHold(t *testing.T) {
 	if err := RunHook(context.Background(), []string{"update", "refs/heads/b", sha, sha2}); err == nil {
 		t.Fatal("no-push policy must deny the update")
 	}
-	b, err := os.ReadFile(hold)
-	if err != nil {
+	if _, err := os.Stat(hold); err != nil {
 		t.Fatalf("non-atomic denial must keep the peers' hold: %v", err)
 	}
-	if got := string(b); got != "refs/heads/a\n" {
-		t.Fatalf("non-atomic denial must release only its own ref: %q", got)
+	// The denied ref leaves COVERAGE while its peer stays held — since
+	// issue #186 finding 6 via an O(1) tombstone append, not the former
+	// whole-file rewrite (readers subtract `.released` names).
+	set, err := readPushHolds(filepath.Dir(hold), "")
+	if err != nil {
+		t.Fatalf("readPushHolds: %v", err)
+	}
+	if set.contains("refs/heads/b") {
+		t.Fatal("non-atomic denial must release its own ref from coverage")
+	}
+	if !set.contains("refs/heads/a") {
+		t.Fatal("non-atomic denial must keep its peers' refs covered")
 	}
 }
 
@@ -2625,6 +2634,1584 @@ func TestRemovePushHoldFiles_SerializesWithQuarantine(t *testing.T) {
 	}
 }
 
+// TestReleaseDeniedPushHold_LinearWork (issue #186 finding 6): a
+// non-atomic high-fanout push whose advertised bases all went stale has
+// every update hook deny post-CAS-loss, and each denial used to rewrite
+// the ENTIRE remaining hold file — O(N²) bytes of read+write I/O and
+// allocation from an O(N) request, unbounded by the rate limiter or the
+// push cap. Tombstone appends make each release O(name). Pinned by
+// TotalAlloc delta (NOT AllocsPerRun — split-based parsing shares backing
+// buffers and undercounts): 2000 releases over a 2000-name hold cost
+// ~80MB quadratic, low single-digit MB linear. Coverage semantics are
+// pinned alongside: released names must vanish from the readers' view.
+func TestReleaseDeniedPushHold_LinearWork(t *testing.T) {
+	repoDir := t.TempDir()
+	dir := filepath.Join(repoDir, pushHoldDir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	hold := filepath.Join(dir, "push-fanout")
+	const n = 2000
+	names := make([]string, n)
+	var sb strings.Builder
+	for i := range names {
+		names[i] = fmt.Sprintf("refs/heads/fanout-%04d", i)
+		sb.WriteString(names[i])
+		sb.WriteByte('\n')
+	}
+	if err := os.WriteFile(hold, []byte(sb.String()), 0o600); err != nil {
+		t.Fatalf("write hold: %v", err)
+	}
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	for _, name := range names {
+		if err := releaseDeniedPushHold(hold, name); err != nil {
+			t.Fatalf("release %s: %v", name, err)
+		}
+	}
+	runtime.ReadMemStats(&after)
+	if delta := after.TotalAlloc - before.TotalAlloc; delta > 32<<20 {
+		t.Fatalf("all-denied fanout release allocated %d bytes — quadratic rewrite behavior (want O(N) appends, < 32MiB)", delta)
+	}
+	// Non-vacuity + reader semantics: every released name is out of the
+	// combined coverage view.
+	set, err := readPushHolds(dir, "")
+	if err != nil {
+		t.Fatalf("readPushHolds: %v", err)
+	}
+	for _, name := range []string{names[0], names[n/2], names[n-1]} {
+		if set.contains(name) {
+			t.Fatalf("released name %s still covered", name)
+		}
+	}
+}
+
+// TestPushHoldReaders_SubtractTombstones (issue #186): both reservation
+// readers — the single-name stream and the multi-name parsed set — drop
+// EXACTLY the tombstoned names from a peer's coverage: released names
+// stop conflicting (same-name and D/F alike) while unreleased names in
+// the same hold keep blocking, and a quarantined peer's tombstones are
+// ignored for the reap window (over-holding, the safe direction).
+func TestPushHoldReaders_SubtractTombstones(t *testing.T) {
+	repoDir := t.TempDir()
+	dir := filepath.Join(repoDir, pushHoldDir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	hold := filepath.Join(dir, "push-peer")
+	if err := os.WriteFile(hold, []byte("refs/heads/done\nrefs/heads/busy\nrefs/heads/dir\n"), 0o600); err != nil {
+		t.Fatalf("write hold: %v", err)
+	}
+	if err := appendPushReleased(hold, []string{"refs/heads/done", "refs/heads/dir"}); err != nil {
+		t.Fatalf("append released: %v", err)
+	}
+	for _, tc := range []struct {
+		name    string
+		covered bool
+	}{
+		{"refs/heads/done", false},     // tombstoned exact
+		{"refs/heads/done/sub", false}, // tombstoned D/F ancestor
+		{"refs/heads/dir/x", false},    // tombstoned D/F ancestor
+		{"refs/heads/busy", true},      // still held
+		{"refs/heads/busy/sub", true},  // held D/F ancestor
+		{"refs/heads", true},           // held D/F descendant (busy)
+	} {
+		covered, _, err := peerHoldCovers(dir, "", tc.name, maxPushPeerScanBytes)
+		if err != nil {
+			t.Fatalf("peerHoldCovers(%s): %v", tc.name, err)
+		}
+		if covered != tc.covered {
+			t.Fatalf("peerHoldCovers(%s) = %v, want %v", tc.name, covered, tc.covered)
+		}
+	}
+	set, err := readPushHolds(dir, "")
+	if err != nil {
+		t.Fatalf("readPushHolds: %v", err)
+	}
+	if set.contains("refs/heads/done") || set.contains("refs/heads/dir") || !set.contains("refs/heads/busy") {
+		t.Fatalf("parsed set subtraction wrong: %v", set.names)
+	}
+	// Quarantine window (PR #195 round-16 security P2): the hold file
+	// rides at its .reaping name while its sidecars stay at the BASE
+	// name — readers must keep the association, or the quarantine/restore
+	// lifecycle (net-zero renames, invisible to the fingerprint) lets a
+	// mid-window scan over-hold released coverage that the bracketing
+	// keys then certify as reproducible until the TTL.
+	if err := os.Rename(hold, hold+".reaping"); err != nil {
+		t.Fatalf("quarantine: %v", err)
+	}
+	covered, _, err := peerHoldCovers(dir, "", "refs/heads/done", maxPushPeerScanBytes)
+	if err != nil {
+		t.Fatalf("peerHoldCovers quarantined: %v", err)
+	}
+	if covered {
+		t.Fatal("a quarantined hold's tombstones must keep applying through the reap window")
+	}
+	covered, _, err = peerHoldCovers(dir, "", "refs/heads/busy", maxPushPeerScanBytes)
+	if err != nil {
+		t.Fatalf("peerHoldCovers quarantined busy: %v", err)
+	}
+	if !covered {
+		t.Fatal("a quarantined hold's unreleased names must stay covered")
+	}
+	set, err = readPushHolds(dir, "")
+	if err != nil {
+		t.Fatalf("readPushHolds quarantined: %v", err)
+	}
+	if set.contains("refs/heads/done") || !set.contains("refs/heads/busy") {
+		t.Fatalf("parsed-set subtraction must follow the hold into quarantine: %v", set.names)
+	}
+}
+
+// TestEnsureCacheRepo_ReferenceTransactionHookIfAbsent (issue #186
+// finding 1): the reference-transaction hook is installed when missing
+// but NEVER overwritten — it is a best-effort release optimization whose
+// absence or replacement only defers hold release to post-receive, and
+// tests legitimately wrap it.
+func TestEnsureCacheRepo_ReferenceTransactionHookIfAbsent(t *testing.T) {
+	cacheDir := t.TempDir()
+	repoPath, err := EnsureCacheRepo(cacheDir, "t-reftx-install")
+	if err != nil {
+		t.Fatalf("EnsureCacheRepo: %v", err)
+	}
+	hookPath := filepath.Join(repoPath, "hooks", "reference-transaction")
+	fi, err := os.Stat(hookPath)
+	if err != nil {
+		t.Fatalf("reference-transaction hook not installed: %v", err)
+	}
+	if fi.Mode()&0o100 == 0 {
+		t.Fatal("reference-transaction hook not executable")
+	}
+	custom := []byte("#!/bin/sh\nexit 0\n")
+	if err := os.WriteFile(hookPath, custom, 0o755); err != nil {
+		t.Fatalf("write custom hook: %v", err)
+	}
+	if _, err := EnsureCacheRepo(cacheDir, "t-reftx-install"); err != nil {
+		t.Fatalf("EnsureCacheRepo second pass: %v", err)
+	}
+	b, err := os.ReadFile(hookPath)
+	if err != nil {
+		t.Fatalf("read hook: %v", err)
+	}
+	if string(b) != string(custom) {
+		t.Fatal("existing reference-transaction hook content must be preserved")
+	}
+}
+
+// TestEnsureCacheRepo_RefreshesManagedReferenceTransactionHook (PR #195
+// round-1 P1): cache repos outlive deployments while the managed script
+// embeds a version-specific binary path — leaving every existing file
+// untouched preserves a dead path forever, and a failing script at the
+// "prepared" state aborts otherwise valid pushes after an upgrade. A
+// MANAGED script (current template shape, any embedded path) is
+// refreshed in place; foreign/operator content is still preserved
+// (TestEnsureCacheRepo_ReferenceTransactionHookIfAbsent).
+func TestEnsureCacheRepo_RefreshesManagedReferenceTransactionHook(t *testing.T) {
+	cacheDir := t.TempDir()
+	repoPath, err := EnsureCacheRepo(cacheDir, "t-reftx-refresh")
+	if err != nil {
+		t.Fatalf("EnsureCacheRepo: %v", err)
+	}
+	hookPath := filepath.Join(repoPath, "hooks", "reference-transaction")
+	current, err := os.ReadFile(hookPath)
+	if err != nil {
+		t.Fatalf("read hook: %v", err)
+	}
+	stale := fmt.Sprintf(refTxHookScript, "/opt/old-deployment/codestorage")
+	if stale == string(current) {
+		t.Fatal("test setup: stale script must differ from current")
+	}
+	if err := os.WriteFile(hookPath, []byte(stale), 0o755); err != nil {
+		t.Fatalf("write stale hook: %v", err)
+	}
+	// A redeployment is a NEW process: its empty memo forces the full
+	// verification pass. Simulate that here — the stale-path scenario
+	// cannot arise within one process, whose os.Executable is stable.
+	cacheRepoMemos.Delete(repoPath)
+	if _, err := EnsureCacheRepo(cacheDir, "t-reftx-refresh"); err != nil {
+		t.Fatalf("EnsureCacheRepo second pass: %v", err)
+	}
+	b, err := os.ReadFile(hookPath)
+	if err != nil {
+		t.Fatalf("read hook: %v", err)
+	}
+	if string(b) != string(current) {
+		t.Fatalf("managed script with a stale binary path must be refreshed:\n%s", b)
+	}
+}
+
+// TestReleaseDeniedPushHold_BumpsEpochBeforeVisibility (PR #195 round-1
+// P2): a policy/fence denial returns BEFORE the CAS, so no competing
+// writer necessarily bumped the store generation — if a concurrent
+// hydration skipped this ref under the hold, a tombstone that changes
+// neither the hold's stats nor the epoch lets pre/post fingerprints
+// match and a held marker vouch for a never-synchronized ref until its
+// TTL. Denial releases must bump the epoch BEFORE the tombstone becomes
+// visible, and must not publish the tombstone when the bump fails
+// (over-holding, the safe direction) — exactly the removal invariant the
+// former removePushHolds path enforced.
+func TestReleaseDeniedPushHold_BumpsEpochBeforeVisibility(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("directory write permissions do not bind root")
+	}
+	repoDir := t.TempDir()
+	dir := filepath.Join(repoDir, pushHoldDir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := bumpPushHoldEpoch(dir); err != nil {
+		t.Fatalf("seed epoch: %v", err)
+	}
+	hold := filepath.Join(dir, "push-denied")
+	if err := os.WriteFile(hold, []byte("refs/heads/x\n"), 0o600); err != nil {
+		t.Fatalf("write hold: %v", err)
+	}
+	key1, ok := livePushHoldsKey(repoDir)
+	if !ok {
+		t.Fatal("livePushHoldsKey failed")
+	}
+	if err := releaseDeniedPushHold(hold, "refs/heads/x"); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	key2, ok := livePushHoldsKey(repoDir)
+	if !ok {
+		t.Fatal("livePushHoldsKey failed")
+	}
+	if key1 == key2 {
+		t.Fatal("a denial release must invalidate the hold fingerprint")
+	}
+	// Bump failure: the tombstone must not become visible.
+	hold2 := filepath.Join(dir, "push-denied-bumpless")
+	if err := os.WriteFile(hold2, []byte("refs/heads/y\n"), 0o600); err != nil {
+		t.Fatalf("write hold: %v", err)
+	}
+	if err := os.Chmod(repoDir, 0o555); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(repoDir, 0o755) })
+	_ = releaseDeniedPushHold(hold2, "refs/heads/y") // best-effort caller
+	covered, _, err := peerHoldCovers(dir, "", "refs/heads/y", maxPushPeerScanBytes)
+	if err != nil {
+		t.Fatalf("peerHoldCovers: %v", err)
+	}
+	if !covered {
+		t.Fatal("a denial tombstone must not be visible without a successful epoch bump")
+	}
+}
+
+// TestPushHoldReaders_IgnoreTornTombstoneTail (PR #195 round-1 P2): a
+// short append (ENOSPC, EIO) can strand a PREFIX of a released name as
+// the sidecar's unterminated last record — and that prefix can itself be
+// a different, still-reserved name (releasing refs/heads/foobar can
+// strand "refs/heads/foo"). Both readers must ignore a final record
+// without its newline terminator; only the terminated prefix of the
+// sidecar is trusted.
+func TestPushHoldReaders_IgnoreTornTombstoneTail(t *testing.T) {
+	repoDir := t.TempDir()
+	dir := filepath.Join(repoDir, pushHoldDir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	hold := filepath.Join(dir, "push-torn")
+	if err := os.WriteFile(hold, []byte("refs/heads/foo\nrefs/heads/foobar\nrefs/heads/done\n"), 0o600); err != nil {
+		t.Fatalf("write hold: %v", err)
+	}
+	// One complete tombstone (done), then a torn append of foobar's
+	// release stranding exactly the bytes of the shorter live name.
+	if err := os.WriteFile(hold+pushHoldReleasedSuffix, []byte("refs/heads/done\nrefs/heads/foo"), 0o600); err != nil {
+		t.Fatalf("write torn sidecar: %v", err)
+	}
+	for name, want := range map[string]bool{
+		"refs/heads/foo":    true,  // torn tail must not release it
+		"refs/heads/foobar": true,  // its release append never completed
+		"refs/heads/done":   false, // terminated tombstone applies
+	} {
+		covered, _, err := peerHoldCovers(dir, "", name, maxPushPeerScanBytes)
+		if err != nil {
+			t.Fatalf("peerHoldCovers(%s): %v", name, err)
+		}
+		if covered != want {
+			t.Fatalf("peerHoldCovers(%s) = %v, want %v", name, covered, want)
+		}
+	}
+	set, err := readPushHolds(dir, "")
+	if err != nil {
+		t.Fatalf("readPushHolds: %v", err)
+	}
+	if !set.contains("refs/heads/foo") || !set.contains("refs/heads/foobar") || set.contains("refs/heads/done") {
+		t.Fatalf("parsed set mishandled the torn tail: %v", set.names)
+	}
+}
+
+// TestAppendPushReleased_FailsClosedOnTornTail (PR #195 round-2 P2): a
+// short append strands an unterminated prefix, and a LATER successful
+// O_APPEND would concatenate its first name directly onto that prefix
+// plus a newline — a complete record whose combined bytes can equal a
+// different still-held ref (refs/heads/foo ++ refs/heads/bar is the
+// valid name refs/heads/foorefs/heads/bar), releasing it prematurely.
+// Appends must fail closed when the existing tail is unterminated;
+// callers are best-effort, so the names simply stay held.
+func TestAppendPushReleased_FailsClosedOnTornTail(t *testing.T) {
+	repoDir := t.TempDir()
+	dir := filepath.Join(repoDir, pushHoldDir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	hold := filepath.Join(dir, "push-concat")
+	victim := "refs/heads/foorefs/heads/bar"
+	if err := os.WriteFile(hold, []byte(victim+"\n"), 0o600); err != nil {
+		t.Fatalf("write hold: %v", err)
+	}
+	// A torn earlier release stranded this prefix (no terminator).
+	if err := os.WriteFile(hold+pushHoldReleasedSuffix, []byte("refs/heads/foo"), 0o600); err != nil {
+		t.Fatalf("write torn sidecar: %v", err)
+	}
+	if err := appendPushReleased(hold, []string{"refs/heads/bar"}); err == nil {
+		t.Fatal("appending after an unterminated tail must fail closed")
+	}
+	covered, _, err := peerHoldCovers(dir, "", victim, maxPushPeerScanBytes)
+	if err != nil {
+		t.Fatalf("peerHoldCovers: %v", err)
+	}
+	if !covered {
+		t.Fatal("concatenated torn records released a still-held ref")
+	}
+}
+
+// TestEnsureCacheRepo_RestoresRefTxHookExecBit (PR #195 round-2 P2): a
+// restored cache volume can strip the managed script's execute bit while
+// its bytes stay current — git then SILENTLY skips non-executable hooks,
+// so the byte-equality early return must also verify mode and repair it.
+func TestEnsureCacheRepo_RestoresRefTxHookExecBit(t *testing.T) {
+	cacheDir := t.TempDir()
+	repoPath, err := EnsureCacheRepo(cacheDir, "t-reftx-execbit")
+	if err != nil {
+		t.Fatalf("EnsureCacheRepo: %v", err)
+	}
+	hookPath := filepath.Join(repoPath, "hooks", "reference-transaction")
+	if err := os.Chmod(hookPath, 0o644); err != nil {
+		t.Fatalf("strip exec bit: %v", err)
+	}
+	cacheRepoMemos.Delete(repoPath) // a fresh process's full pass
+	if _, err := EnsureCacheRepo(cacheDir, "t-reftx-execbit"); err != nil {
+		t.Fatalf("EnsureCacheRepo second pass: %v", err)
+	}
+	fi, err := os.Stat(hookPath)
+	if err != nil {
+		t.Fatalf("stat hook: %v", err)
+	}
+	if fi.Mode()&0o111 == 0 {
+		t.Fatal("an unchanged managed script must get its execute bit restored")
+	}
+}
+
+// TestEnsureCacheRepo_PreservesWrappedManagedHook (PR #195 round-3 P2):
+// an operator can EXTEND the generated hook while keeping its gate and
+// delegated invocation — a prefix+substring managed check would classify
+// that wrapper as managed and clobber the operator's additions on the
+// next full pass. Managed means the COMPLETE generated shape (gate plus
+// exactly one delegated invocation line), nothing more.
+func TestEnsureCacheRepo_PreservesWrappedManagedHook(t *testing.T) {
+	cacheDir := t.TempDir()
+	repoPath, err := EnsureCacheRepo(cacheDir, "t-reftx-wrapper")
+	if err != nil {
+		t.Fatalf("EnsureCacheRepo: %v", err)
+	}
+	hookPath := filepath.Join(repoPath, "hooks", "reference-transaction")
+	// A customized wrapper: managed gate + delegation retained, operator
+	// logic added.
+	wrapper := refTxHookGate +
+		"logger -t codestorage-reftx \"$1\"\n" +
+		"/usr/local/bin/codestorage hook reference-transaction \"$@\" || exit 0\n"
+	if err := os.WriteFile(hookPath, []byte(wrapper), 0o755); err != nil {
+		t.Fatalf("write wrapper: %v", err)
+	}
+	cacheRepoMemos.Delete(repoPath)
+	if _, err := EnsureCacheRepo(cacheDir, "t-reftx-wrapper"); err != nil {
+		t.Fatalf("EnsureCacheRepo second pass: %v", err)
+	}
+	b, err := os.ReadFile(hookPath)
+	if err != nil {
+		t.Fatalf("read hook: %v", err)
+	}
+	if string(b) != wrapper {
+		t.Fatalf("customized wrapper must be preserved, got:\n%s", b)
+	}
+}
+
+// TestEnsureCacheRepo_PreservesSameLineWrapperAdditions (PR #195 round-4
+// P2): a wrapper can put its logic on the SAME line as the delegation
+// (`logger ...; /usr/bin/codestorage hook reference-transaction "$@" ||
+// exit 0`) — a suffix-only line check still classified that as managed
+// and clobbered it. The whole invocation line must be exactly the
+// optional historical `exec` plus one quoted executable plus the
+// delegation, nothing else.
+func TestEnsureCacheRepo_PreservesSameLineWrapperAdditions(t *testing.T) {
+	cacheDir := t.TempDir()
+	repoPath, err := EnsureCacheRepo(cacheDir, "t-reftx-sameline")
+	if err != nil {
+		t.Fatalf("EnsureCacheRepo: %v", err)
+	}
+	hookPath := filepath.Join(repoPath, "hooks", "reference-transaction")
+	wrapper := refTxHookGate +
+		`logger -t reftx "$1"; "/usr/local/bin/codestorage" hook reference-transaction "$@" || exit 0` + "\n"
+	if err := os.WriteFile(hookPath, []byte(wrapper), 0o755); err != nil {
+		t.Fatalf("write wrapper: %v", err)
+	}
+	cacheRepoMemos.Delete(repoPath)
+	if _, err := EnsureCacheRepo(cacheDir, "t-reftx-sameline"); err != nil {
+		t.Fatalf("EnsureCacheRepo second pass: %v", err)
+	}
+	b, err := os.ReadFile(hookPath)
+	if err != nil {
+		t.Fatalf("read hook: %v", err)
+	}
+	if string(b) != wrapper {
+		t.Fatalf("same-line wrapper additions must be preserved, got:\n%s", b)
+	}
+}
+
+// TestLivePushHoldsKey_SeesTombstones (PR #195 round-4 P2 ×2): tombstone
+// state must be part of the hold fingerprint. Two independent traces
+// demanded it: a denial's bump-then-append is two operations, so a
+// hydrate's pre-scan key could land between them and the append alone
+// left both bracketing keys equal; and a committed DELETION's tombstone
+// releases D/F coverage over a child another node validly created in the
+// authority the moment the deletion CASed — a stable marker would keep
+// suppressing the rescan that must materialize that child. The sidecar's
+// (size, mtime) now folds into the key — stat-only, from the same
+// directory listing — so any tombstone append invalidates held markers.
+func TestLivePushHoldsKey_SeesTombstones(t *testing.T) {
+	repoDir := t.TempDir()
+	dir := filepath.Join(repoDir, pushHoldDir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := bumpPushHoldEpoch(dir); err != nil {
+		t.Fatalf("seed epoch: %v", err)
+	}
+	hold := filepath.Join(dir, "push-del")
+	if err := os.WriteFile(hold, []byte("refs/heads/a\n"), 0o600); err != nil {
+		t.Fatalf("write hold: %v", err)
+	}
+	key1, ok := livePushHoldsKey(repoDir)
+	if !ok {
+		t.Fatal("livePushHoldsKey failed")
+	}
+	// The committed path: tombstone append with NO epoch bump.
+	if err := appendPushReleased(hold, []string{"refs/heads/a"}); err != nil {
+		t.Fatalf("append released: %v", err)
+	}
+	key2, ok := livePushHoldsKey(repoDir)
+	if !ok {
+		t.Fatal("livePushHoldsKey failed")
+	}
+	if key1 == key2 {
+		t.Fatal("a tombstone append must change the hold fingerprint")
+	}
+}
+
+// TestLivePushHoldsKey_MidSnapshotTombstoneDetected (PR #195 round-5
+// P2): folding sidecar stats into the key (round 4) sampled them ONCE —
+// an append landing after the sidecar's stat but before the closing
+// epoch read left the snapshot on the old stats with an unchanged epoch,
+// so a hydrate's bracketing keys could still match across a mid-scan
+// release. Tombstone appends now bump the epoch themselves, putting them
+// under the same seqlock as every other coverage mutation: a mid-bracket
+// append refuses the snapshot.
+func TestLivePushHoldsKey_MidSnapshotTombstoneDetected(t *testing.T) {
+	repoDir := t.TempDir()
+	dir := filepath.Join(repoDir, pushHoldDir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := bumpPushHoldEpoch(dir); err != nil {
+		t.Fatalf("seed epoch: %v", err)
+	}
+	hold := filepath.Join(dir, "push-race")
+	if err := os.WriteFile(hold, []byte("refs/heads/a\nrefs/heads/b\n"), 0o600); err != nil {
+		t.Fatalf("write hold: %v", err)
+	}
+	if err := appendPushReleased(hold, []string{"refs/heads/a"}); err != nil {
+		t.Fatalf("seed sidecar: %v", err)
+	}
+	key1, ok := livePushHoldsKey(repoDir)
+	if !ok {
+		t.Fatal("livePushHoldsKey failed")
+	}
+	// The racing append lands after the stats were sampled, before the
+	// closing epoch read.
+	testHookHoldsKeyPreClose = func() {
+		if err := appendPushReleased(hold, []string{"refs/heads/b"}); err != nil {
+			t.Errorf("racing append: %v", err)
+		}
+	}
+	key2, ok2 := livePushHoldsKey(repoDir)
+	testHookHoldsKeyPreClose = nil
+	if ok2 && key2 == key1 {
+		t.Fatal("a tombstone landing inside the snapshot bracket must refuse or change the key")
+	}
+	if _, ok := livePushHoldsKey(repoDir); !ok {
+		t.Fatal("livePushHoldsKey must succeed on a quiet set")
+	}
+}
+
+// TestReleaseDeniedPushHold_NoopWithoutHoldFile (PR #195 round-5 P2): a
+// no-pack policy-denied push reserves nothing and creates no hold file —
+// its denial release must be a FULL no-op: no epoch bump (cheap denied
+// pushes could otherwise invalidate a live push's held marker per
+// request, the amplification the no-hold cleanup rule exists to prevent)
+// and no orphan `.released` sidecar.
+func TestReleaseDeniedPushHold_NoopWithoutHoldFile(t *testing.T) {
+	repoDir := t.TempDir()
+	dir := filepath.Join(repoDir, pushHoldDir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := bumpPushHoldEpoch(dir); err != nil {
+		t.Fatalf("seed epoch: %v", err)
+	}
+	// A live peer whose held marker the denied push must not disturb.
+	peer := filepath.Join(dir, "push-live-peer")
+	if err := os.WriteFile(peer, []byte("refs/heads/x\n"), 0o600); err != nil {
+		t.Fatalf("write peer hold: %v", err)
+	}
+	key1, ok := livePushHoldsKey(repoDir)
+	if !ok {
+		t.Fatal("livePushHoldsKey failed")
+	}
+	never := filepath.Join(dir, "push-never-created")
+	if err := releaseDeniedPushHold(never, "refs/heads/denied"); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	if _, err := os.Stat(never + pushHoldReleasedSuffix); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("no orphan sidecar may be created for a never-reserved push: %v", err)
+	}
+	key2, ok := livePushHoldsKey(repoDir)
+	if !ok {
+		t.Fatal("livePushHoldsKey failed")
+	}
+	if key1 != key2 {
+		t.Fatal("a never-reserved push's denial must not invalidate live holds' fingerprint")
+	}
+}
+
+// TestRefTxHookScript_ShellGatesCommittedState (PR #195 round-6 security
+// P2): git versions with per-ref reference transactions invoke the hook
+// at BOTH prepared and committed per ref — gating the state only inside
+// the Go binary meant two full binary execs per ref on an allowed
+// high-fanout push (no command-count cap, ~20GiB byte cap, rate limiting
+// off by default). Non-committed states must cost one /bin/sh exit, the
+// binary exec reserved for the committed callback that does the work.
+func TestRefTxHookScript_ShellGatesCommittedState(t *testing.T) {
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "executed")
+	fake := filepath.Join(dir, "fake-binary")
+	if err := os.WriteFile(fake, []byte("#!/bin/sh\n: > \""+marker+"\"\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("write fake binary: %v", err)
+	}
+	hook := filepath.Join(dir, "reference-transaction")
+	if err := os.WriteFile(hook, []byte(fmt.Sprintf(refTxHookScript, fake)), 0o755); err != nil {
+		t.Fatalf("write hook: %v", err)
+	}
+	run := func(state string) {
+		t.Helper()
+		cmd := exec.Command(hook, state)
+		cmd.Env = append(os.Environ(), EnvPushHold+"="+filepath.Join(dir, "push-x"))
+		cmd.Stdin = strings.NewReader("")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("hook %s: %v\n%s", state, err, out)
+		}
+	}
+	run("prepared")
+	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("a prepared callback must not exec the binary")
+	}
+	run("committed")
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("the committed callback must exec the binary: %v", err)
+	}
+}
+
+// TestLivePushHoldsKey_CrossPushSidecarAppendDetected (PR #195 round-7
+// P2): the epoch seqlock cannot order a lock-free reader against the
+// two-part bump-then-append — another push's bump can land between a
+// writer's bump and its append, so a bracket's two epoch reads match
+// while the append slipped past the single sidecar stats sample. The
+// closing sidecar re-stat refuses any snapshot whose folded sidecar
+// changed (simulated here by a raw epoch-less append, the net
+// interleaving the reader observes).
+func TestLivePushHoldsKey_CrossPushSidecarAppendDetected(t *testing.T) {
+	repoDir := t.TempDir()
+	dir := filepath.Join(repoDir, pushHoldDir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := bumpPushHoldEpoch(dir); err != nil {
+		t.Fatalf("seed epoch: %v", err)
+	}
+	hold := filepath.Join(dir, "push-crosspush")
+	if err := os.WriteFile(hold, []byte("refs/heads/a\nrefs/heads/b\n"), 0o600); err != nil {
+		t.Fatalf("write hold: %v", err)
+	}
+	if err := appendPushReleased(hold, []string{"refs/heads/a"}); err != nil {
+		t.Fatalf("seed sidecar: %v", err)
+	}
+	key1, ok := livePushHoldsKey(repoDir)
+	if !ok {
+		t.Fatal("livePushHoldsKey failed")
+	}
+	testHookHoldsKeyPreClose = func() {
+		f, err := os.OpenFile(hold+pushHoldReleasedSuffix, os.O_APPEND|os.O_WRONLY, 0)
+		if err != nil {
+			t.Errorf("open sidecar: %v", err)
+			return
+		}
+		if _, err := f.WriteString("refs/heads/b\n"); err != nil {
+			t.Errorf("raw append: %v", err)
+		}
+		_ = f.Close()
+	}
+	key2, ok2 := livePushHoldsKey(repoDir)
+	testHookHoldsKeyPreClose = nil
+	if ok2 && key2 == key1 {
+		t.Fatal("a sidecar append inside the bracket with equal epochs must refuse or change the key")
+	}
+	if _, ok := livePushHoldsKey(repoDir); !ok {
+		t.Fatal("livePushHoldsKey must succeed on a quiet set")
+	}
+}
+
+// TestParseRefTxCommitted_PreservesNonASCIIWhitespaceNames (PR #195
+// round-7 P2): the reference-transaction protocol separates records with
+// single ASCII spaces, but Git-valid refnames may contain non-ASCII
+// whitespace — a Fields-based parser split them, silently discarding the
+// record and leaving the committed name held until post-receive.
+func TestParseRefTxCommitted_PreservesNonASCIIWhitespaceNames(t *testing.T) {
+	zeros, ones := strings.Repeat("0", 40), strings.Repeat("1", 40)
+	in := zeros + " " + ones + " refs/heads/a\u00a0b\n" +
+		zeros + " " + ones + " refs/heads/plain\n"
+	var names []string
+	if err := parseRefTxCommitted(strings.NewReader(in), true, func(name string) {
+		names = append(names, name)
+	}); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	want := []string{"refs/heads/a\u00a0b", "refs/heads/plain"}
+	if len(names) != len(want) || names[0] != want[0] || names[1] != want[1] {
+		t.Fatalf("parsed %q, want %q", names, want)
+	}
+}
+
+// TestLivePushHoldsKey_MidSnapshotHoldRewriteDetected (PR #195 round-8
+// P2): the closing reverification must cover HOLD files, not only their
+// sidecars — a cross-push epoch overwrite can mask a hold mutation's own
+// bump exactly as it can a tombstone's, and a snapshot built from the
+// stale hold stats would equal its bracket partner despite coverage
+// having changed mid-scan.
+func TestLivePushHoldsKey_MidSnapshotHoldRewriteDetected(t *testing.T) {
+	repoDir := t.TempDir()
+	dir := filepath.Join(repoDir, pushHoldDir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := bumpPushHoldEpoch(dir); err != nil {
+		t.Fatalf("seed epoch: %v", err)
+	}
+	hold := filepath.Join(dir, "push-holdrewrite")
+	if err := os.WriteFile(hold, []byte("refs/heads/a\nrefs/heads/b\n"), 0o600); err != nil {
+		t.Fatalf("write hold: %v", err)
+	}
+	key1, ok := livePushHoldsKey(repoDir)
+	if !ok {
+		t.Fatal("livePushHoldsKey failed")
+	}
+	testHookHoldsKeyPreClose = func() {
+		// A masked-epoch partial rewrite's rename landing mid-snapshot.
+		if err := os.WriteFile(hold, []byte("refs/heads/b\n"), 0o600); err != nil {
+			t.Errorf("raw rewrite: %v", err)
+		}
+	}
+	key2, ok2 := livePushHoldsKey(repoDir)
+	testHookHoldsKeyPreClose = nil
+	if ok2 && key2 == key1 {
+		t.Fatal("a hold mutation inside the bracket with equal epochs must refuse or change the key")
+	}
+	if _, ok := livePushHoldsKey(repoDir); !ok {
+		t.Fatal("livePushHoldsKey must succeed on a quiet set")
+	}
+}
+
+// TestLivePushHoldsKey_AppendAfterEpochCloseDetected (PR #195 round-8
+// security P2): with the reverification placed BEFORE the closing epoch
+// read, an append landing between them was accepted with stale stats.
+// The full re-stat is now the snapshot's FINAL observation, so every
+// mutation visible before completion refuses it — and one landing after
+// post-dates the snapshot, which the very next validation catches via
+// the changed stats.
+func TestLivePushHoldsKey_AppendAfterEpochCloseDetected(t *testing.T) {
+	repoDir := t.TempDir()
+	dir := filepath.Join(repoDir, pushHoldDir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := bumpPushHoldEpoch(dir); err != nil {
+		t.Fatalf("seed epoch: %v", err)
+	}
+	hold := filepath.Join(dir, "push-lateappend")
+	if err := os.WriteFile(hold, []byte("refs/heads/a\nrefs/heads/b\n"), 0o600); err != nil {
+		t.Fatalf("write hold: %v", err)
+	}
+	if err := appendPushReleased(hold, []string{"refs/heads/a"}); err != nil {
+		t.Fatalf("seed sidecar: %v", err)
+	}
+	key1, ok := livePushHoldsKey(repoDir)
+	if !ok {
+		t.Fatal("livePushHoldsKey failed")
+	}
+	testHookHoldsKeyPostVerify = func() {
+		f, err := os.OpenFile(hold+pushHoldReleasedSuffix, os.O_APPEND|os.O_WRONLY, 0)
+		if err != nil {
+			t.Errorf("open sidecar: %v", err)
+			return
+		}
+		if _, err := f.WriteString("refs/heads/b\n"); err != nil {
+			t.Errorf("raw append: %v", err)
+		}
+		_ = f.Close()
+	}
+	key2, ok2 := livePushHoldsKey(repoDir)
+	testHookHoldsKeyPostVerify = nil
+	if ok2 && key2 == key1 {
+		t.Fatal("an append landing before the snapshot's final observation must refuse or change the key")
+	}
+	if _, ok := livePushHoldsKey(repoDir); !ok {
+		t.Fatal("livePushHoldsKey must succeed on a quiet set")
+	}
+}
+
+// TestEnsureCacheRepo_RestoresOwnerExecBit (PR #195 round-8 P2): POSIX
+// resolves exactly ONE permission class — the serving process owns the
+// file, so group/other execute bits do nothing for it. A 0645 managed
+// script must be repaired, not accepted.
+func TestEnsureCacheRepo_RestoresOwnerExecBit(t *testing.T) {
+	cacheDir := t.TempDir()
+	repoPath, err := EnsureCacheRepo(cacheDir, "t-reftx-ownerbit")
+	if err != nil {
+		t.Fatalf("EnsureCacheRepo: %v", err)
+	}
+	hookPath := filepath.Join(repoPath, "hooks", "reference-transaction")
+	if err := os.Chmod(hookPath, 0o645); err != nil {
+		t.Fatalf("strip owner exec bit: %v", err)
+	}
+	cacheRepoMemos.Delete(repoPath)
+	if _, err := EnsureCacheRepo(cacheDir, "t-reftx-ownerbit"); err != nil {
+		t.Fatalf("EnsureCacheRepo second pass: %v", err)
+	}
+	fi, err := os.Stat(hookPath)
+	if err != nil {
+		t.Fatalf("stat hook: %v", err)
+	}
+	if fi.Mode()&0o100 == 0 {
+		t.Fatal("a managed script without the OWNER execute bit must be repaired")
+	}
+}
+
+// TestEnsureCacheRepo_RefreshesPreGateGenerations (PR #195 round-8 P1):
+// the committed-state gate line was added mid-iteration — scripts from
+// the earlier generations (V1 gate + exec invocation; V1 gate + guarded
+// invocation) must still classify as MANAGED and be refreshed, or their
+// stale binary paths become unrefreshable and the exec generation's
+// failing prepared callback aborts valid pushes after an upgrade.
+func TestEnsureCacheRepo_RefreshesPreGateGenerations(t *testing.T) {
+	for name, legacy := range map[string]string{
+		"exec-gen":    refTxHookGateV1 + `exec "/opt/old/codestorage" hook reference-transaction "$@"` + "\n",
+		"guarded-gen": refTxHookGateV1 + `"/opt/old/codestorage" hook reference-transaction "$@" || exit 0` + "\n",
+		// The ORIGINAL, ungated generation — the plain enforcement-hook
+		// template (PR #195 round-13 P1).
+		"ungated-gen": "#!/bin/sh\n" + `exec "/opt/old/codestorage" hook reference-transaction "$@"` + "\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			cacheDir := t.TempDir()
+			repoPath, err := EnsureCacheRepo(cacheDir, "t-reftx-gen")
+			if err != nil {
+				t.Fatalf("EnsureCacheRepo: %v", err)
+			}
+			hookPath := filepath.Join(repoPath, "hooks", "reference-transaction")
+			current, err := os.ReadFile(hookPath)
+			if err != nil {
+				t.Fatalf("read hook: %v", err)
+			}
+			if err := os.WriteFile(hookPath, []byte(legacy), 0o755); err != nil {
+				t.Fatalf("write legacy hook: %v", err)
+			}
+			cacheRepoMemos.Delete(repoPath)
+			if _, err := EnsureCacheRepo(cacheDir, "t-reftx-gen"); err != nil {
+				t.Fatalf("EnsureCacheRepo second pass: %v", err)
+			}
+			b, err := os.ReadFile(hookPath)
+			if err != nil {
+				t.Fatalf("read hook: %v", err)
+			}
+			if string(b) != string(current) {
+				t.Fatalf("a pre-gate managed generation must be refreshed:\n%s", b)
+			}
+		})
+	}
+}
+
+// TestRunHook_DeniedUnreservedRefReleasesNothing (PR #195 round-8 P2): a
+// mixed push's sidecar-marked, policy-denied ref errors out BEFORE any
+// self-reservation — its deferred release must be a no-op, or every
+// cheap denial bumps the epoch for a never-covered name and invalidates
+// the allowed siblings' held markers.
+func TestRunHook_DeniedUnreservedRefReleasesNothing(t *testing.T) {
+	sha := strings.Repeat("a", 40)
+	sha2 := strings.Repeat("b", 40)
+	t.Setenv(EnvRepo, "t-unreserved-denial")
+	t.Setenv(EnvRefsPolicy, `[["refs/heads/b",["no-push"]]]`)
+	t.Setenv(EnvAtomic, "")
+	repoDir := t.TempDir()
+	holdPath := filepath.Join(repoDir, pushHoldDir, "push-mixed")
+	if err := os.MkdirAll(filepath.Dir(holdPath), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := bumpPushHoldEpoch(filepath.Dir(holdPath)); err != nil {
+		t.Fatalf("seed epoch: %v", err)
+	}
+	// The allowed sibling's reservation; the denied ref b is
+	// sidecar-marked (never bulk-reserved).
+	if err := os.WriteFile(holdPath, []byte("refs/heads/a\n"), 0o600); err != nil {
+		t.Fatalf("write hold: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(pushHoldUnreservedMarker(holdPath, "refs/heads/b")), 0o755); err != nil {
+		t.Fatalf("mkdir unreserved: %v", err)
+	}
+	if err := os.WriteFile(pushHoldUnreservedMarker(holdPath, "refs/heads/b"), nil, 0o600); err != nil {
+		t.Fatalf("write unreserved marker: %v", err)
+	}
+	t.Setenv(EnvPushHold, holdPath)
+	// The epoch content is the release-visibility signal; the refresher's
+	// mtime touch is a separate, pre-existing invalidation lane.
+	epoch1, err := os.ReadFile(filepath.Dir(holdPath) + pushHoldEpochSuffix)
+	if err != nil {
+		t.Fatalf("read epoch: %v", err)
+	}
+	if err := RunHook(context.Background(), []string{"update", "refs/heads/b", sha, sha2}); err == nil {
+		t.Fatal("no-push policy must deny the update")
+	}
+	if _, err := os.Stat(holdPath + pushHoldReleasedSuffix); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("a never-reserved ref's denial must not mint a tombstone: %v", err)
+	}
+	epoch2, err := os.ReadFile(filepath.Dir(holdPath) + pushHoldEpochSuffix)
+	if err != nil {
+		t.Fatalf("read epoch: %v", err)
+	}
+	if string(epoch1) != string(epoch2) {
+		t.Fatal("a never-reserved ref's denial must not bump the hold epoch")
+	}
+}
+
+// TestRunHook_PartiallyFailedReservationReleased (PR #195 round-9 P2):
+// appendPushHolds can fail AFTER its append landed (close or epoch-bump
+// failure), so the ref is physically held while the hook errors out —
+// the deferred release must cover it, or a stalled client keeps the
+// reservation live indefinitely after the transient error clears. The
+// tombstone release of a name whose append never landed is an exact-name
+// subtraction no-op, so covering the attempt is safe on both sides.
+func TestRunHook_PartiallyFailedReservationReleased(t *testing.T) {
+	sha := strings.Repeat("a", 40)
+	sha2 := strings.Repeat("b", 40)
+	t.Setenv(EnvRepo, "t-partial-reservation")
+	t.Setenv(EnvAtomic, "")
+	os.Unsetenv(EnvRefsPolicy)
+	repoDir := t.TempDir()
+	holdPath := filepath.Join(repoDir, pushHoldDir, "push-partial")
+	if err := os.MkdirAll(filepath.Dir(holdPath), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := bumpPushHoldEpoch(filepath.Dir(holdPath)); err != nil {
+		t.Fatalf("seed epoch: %v", err)
+	}
+	if err := os.WriteFile(holdPath, []byte("refs/heads/a\n"), 0o600); err != nil {
+		t.Fatalf("write hold: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(pushHoldUnreservedMarker(holdPath, "refs/heads/b")), 0o755); err != nil {
+		t.Fatalf("mkdir unreserved: %v", err)
+	}
+	if err := os.WriteFile(pushHoldUnreservedMarker(holdPath, "refs/heads/b"), nil, 0o600); err != nil {
+		t.Fatalf("write unreserved marker: %v", err)
+	}
+	t.Setenv(EnvPushHold, holdPath)
+	// The reservation's append lands, its epoch bump fails once, and the
+	// transient condition clears before the deferred release runs.
+	oldWrite := writeEpochFile
+	fails := 1
+	writeEpochFile = func(name string, data []byte, perm os.FileMode) error {
+		if fails > 0 {
+			fails--
+			return errors.New("injected: transient epoch failure")
+		}
+		return oldWrite(name, data, perm)
+	}
+	t.Cleanup(func() { writeEpochFile = oldWrite })
+	if err := RunHook(context.Background(), []string{"update", "refs/heads/b", sha, sha2}); err == nil {
+		t.Fatal("the partially failed reservation must fail the update")
+	}
+	covered, _, err := peerHoldCovers(filepath.Dir(holdPath), "", "refs/heads/b", maxPushPeerScanBytes)
+	if err != nil {
+		t.Fatalf("peerHoldCovers: %v", err)
+	}
+	if covered {
+		t.Fatal("a partially reserved ref must not stay covered after its hook's denial")
+	}
+}
+
+// TestEnsureCacheRepo_PreservesRacingForeignHook (PR #195 round-9 P2):
+// the replace/install decision is made from an earlier read — a foreign
+// hook landing between that read and the rename must not be clobbered.
+// The install re-validates the target immediately before renaming and
+// aborts when it no longer matches the state the decision described.
+func TestEnsureCacheRepo_PreservesRacingForeignHook(t *testing.T) {
+	cacheDir := t.TempDir()
+	repoPath, err := EnsureCacheRepo(cacheDir, "t-reftx-race")
+	if err != nil {
+		t.Fatalf("EnsureCacheRepo: %v", err)
+	}
+	hookPath := filepath.Join(repoPath, "hooks", "reference-transaction")
+	// A stale managed script triggers the refresh path.
+	stale := refTxHookGateV1 + `exec "/opt/old/codestorage" hook reference-transaction "$@"` + "\n"
+	if err := os.WriteFile(hookPath, []byte(stale), 0o755); err != nil {
+		t.Fatalf("write stale hook: %v", err)
+	}
+	foreign := "#!/bin/sh\n# operator hook installed mid-refresh\nexit 0\n"
+	testHookRefTxPreInstall = func() {
+		if err := os.WriteFile(hookPath, []byte(foreign), 0o755); err != nil {
+			t.Errorf("install foreign hook: %v", err)
+		}
+	}
+	defer func() { testHookRefTxPreInstall = nil }()
+	cacheRepoMemos.Delete(repoPath)
+	if _, err := EnsureCacheRepo(cacheDir, "t-reftx-race"); err != nil {
+		t.Fatalf("EnsureCacheRepo second pass: %v", err)
+	}
+	testHookRefTxPreInstall = nil
+	b, err := os.ReadFile(hookPath)
+	if err != nil {
+		t.Fatalf("read hook: %v", err)
+	}
+	if string(b) != foreign {
+		t.Fatalf("a foreign hook racing the refresh must be preserved, got:\n%s", b)
+	}
+}
+
+// TestIsManagedRefTxHook_RejectsShellExpansions (PR #195 round-9 P2):
+// strconv.Unquote accepts shell expressions inside the quotes, so an
+// operator's `"$CODESTORAGE_BIN" hook ...` had the exact managed shape
+// and was clobbered. Managed paths are the literal absolute executables
+// the generator can emit — no parameter or command substitution.
+func TestIsManagedRefTxHook_RejectsShellExpansions(t *testing.T) {
+	for content, want := range map[string]bool{
+		refTxHookGate + `"/usr/local/bin/codestorage" hook reference-transaction "$@" || exit 0` + "\n": true,
+		refTxHookGate + `"$CODESTORAGE_BIN" hook reference-transaction "$@" || exit 0` + "\n":           false,
+		refTxHookGate + "\"`pick-binary`\" hook reference-transaction \"$@\" || exit 0\n":               false,
+		refTxHookGate + `"/opt/$DEPLOY/codestorage" hook reference-transaction "$@" || exit 0` + "\n":   false,
+		refTxHookGate + `"relative/codestorage" hook reference-transaction "$@" || exit 0` + "\n":       false,
+		refTxHookGateV1 + `exec "/opt/old/codestorage" hook reference-transaction "$@"` + "\n":          true,
+	} {
+		if got := isManagedRefTxHook([]byte(content)); got != want {
+			t.Errorf("isManagedRefTxHook(%q) = %v, want %v", content, got, want)
+		}
+	}
+}
+
+// TestPeerHoldCovers_BoundsTombstoneReadToChargedSize (PR #195 round-10
+// P2): tombstone appends take no flock, so a peer's sidecar can grow
+// between the charged Stat and the stream — unbounded reading would
+// consume attacker-batched bytes the scan-work counter never charged,
+// bypassing maxPushPeerScanBytes. The stream is limited to the sampled
+// size; records beyond it stay unread (over-holding, the safe
+// direction) and are charged by the NEXT scan's fresh stat.
+func TestPeerHoldCovers_BoundsTombstoneReadToChargedSize(t *testing.T) {
+	repoDir := t.TempDir()
+	dir := filepath.Join(repoDir, pushHoldDir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	hold := filepath.Join(dir, "push-growing")
+	if err := os.WriteFile(hold, []byte("refs/heads/x\n"), 0o600); err != nil {
+		t.Fatalf("write hold: %v", err)
+	}
+	if err := appendPushReleased(hold, []string{"refs/heads/other"}); err != nil {
+		t.Fatalf("seed sidecar: %v", err)
+	}
+	testHookPeerScanPostStat = func() {
+		f, err := os.OpenFile(hold+pushHoldReleasedSuffix, os.O_APPEND|os.O_WRONLY, 0)
+		if err != nil {
+			t.Errorf("open sidecar: %v", err)
+			return
+		}
+		if _, err := f.WriteString("refs/heads/x\n"); err != nil {
+			t.Errorf("grow sidecar: %v", err)
+		}
+		_ = f.Close()
+	}
+	defer func() { testHookPeerScanPostStat = nil }()
+	covered, _, err := peerHoldCovers(dir, "", "refs/heads/x", maxPushPeerScanBytes)
+	testHookPeerScanPostStat = nil
+	if err != nil {
+		t.Fatalf("peerHoldCovers: %v", err)
+	}
+	if !covered {
+		t.Fatal("bytes beyond the charged sample must stay unread this scan")
+	}
+	// The next scan charges the fresh stat and applies the tombstone.
+	covered, _, err = peerHoldCovers(dir, "", "refs/heads/x", maxPushPeerScanBytes)
+	if err != nil {
+		t.Fatalf("peerHoldCovers second scan: %v", err)
+	}
+	if covered {
+		t.Fatal("the grown sidecar must apply once its bytes are charged")
+	}
+}
+
+// TestEnsureCacheRepo_MemoSeesRefTxHookMode (PR #195 round-11 P2): the
+// cache-repo memo excluded the reference-transaction hook, so a memo hit
+// skipped its exec-bit and staleness repairs for the process's whole
+// lifetime. The hook's fingerprint joins the memo: a mode flip alone
+// must invalidate it and reach the repair on the NEXT setup call — no
+// manual memo eviction.
+func TestEnsureCacheRepo_MemoSeesRefTxHookMode(t *testing.T) {
+	cacheDir := t.TempDir()
+	repoPath, err := EnsureCacheRepo(cacheDir, "t-reftx-memo")
+	if err != nil {
+		t.Fatalf("EnsureCacheRepo: %v", err)
+	}
+	hookPath := filepath.Join(repoPath, "hooks", "reference-transaction")
+	if err := os.Chmod(hookPath, 0o644); err != nil {
+		t.Fatalf("strip exec bit: %v", err)
+	}
+	// NO memo eviction: the memoized fast path itself must notice.
+	if _, err := EnsureCacheRepo(cacheDir, "t-reftx-memo"); err != nil {
+		t.Fatalf("EnsureCacheRepo second pass: %v", err)
+	}
+	fi, err := os.Stat(hookPath)
+	if err != nil {
+		t.Fatalf("stat hook: %v", err)
+	}
+	if fi.Mode()&0o100 == 0 {
+		t.Fatal("a memoized setup call must still notice and repair the hook's mode")
+	}
+}
+
+// TestReadPushHolds_BoundsTombstoneReadToChargedSize (PR #195 round-11
+// P2, the multi-name twin of the single-name LimitReader): the parsed
+// set's sidecar read must not exceed the listing's sampled size — the
+// pre-read allowance check charged only that, and flock-less appends can
+// grow the file before the read. Uncharged growth stays unread this
+// load and applies on the next (fresh stat, fresh charge).
+func TestReadPushHolds_BoundsTombstoneReadToChargedSize(t *testing.T) {
+	repoDir := t.TempDir()
+	dir := filepath.Join(repoDir, pushHoldDir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	hold := filepath.Join(dir, "push-growing-multi")
+	if err := os.WriteFile(hold, []byte("refs/heads/x\nrefs/heads/y\n"), 0o600); err != nil {
+		t.Fatalf("write hold: %v", err)
+	}
+	if err := appendPushReleased(hold, []string{"refs/heads/x"}); err != nil {
+		t.Fatalf("seed sidecar: %v", err)
+	}
+	grown := false
+	testHookDirCachePreParse = func() {
+		if grown {
+			return
+		}
+		grown = true
+		f, err := os.OpenFile(hold+pushHoldReleasedSuffix, os.O_APPEND|os.O_WRONLY, 0)
+		if err != nil {
+			t.Errorf("open sidecar: %v", err)
+			return
+		}
+		if _, err := f.WriteString("refs/heads/y\n"); err != nil {
+			t.Errorf("grow sidecar: %v", err)
+		}
+		_ = f.Close()
+	}
+	defer func() { testHookDirCachePreParse = nil }()
+	set, err := readPushHolds(dir, "")
+	testHookDirCachePreParse = nil
+	if err != nil {
+		t.Fatalf("readPushHolds: %v", err)
+	}
+	if set.contains("refs/heads/x") {
+		t.Fatal("the charged tombstone must apply")
+	}
+	if !set.contains("refs/heads/y") {
+		t.Fatal("uncharged growth must stay unread this load")
+	}
+	set, err = readPushHolds(dir, "")
+	if err != nil {
+		t.Fatalf("readPushHolds second load: %v", err)
+	}
+	if set.contains("refs/heads/y") {
+		t.Fatal("the grown sidecar must apply once its bytes are charged")
+	}
+}
+
+// TestEnsureCacheRepo_ToleratesUnwritableHooksDir (PR #195 round-11 P2):
+// the reference-transaction hook is a best-effort optimization — failing
+// to INSTALL it (unwritable hooks dir on an otherwise serviceable repo)
+// must not take the repository offline while the enforcement hooks
+// verify fine. The unverified state is simply never memoized.
+func TestEnsureCacheRepo_ToleratesUnwritableHooksDir(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("directory write permissions do not bind root")
+	}
+	cacheDir := t.TempDir()
+	repoPath, err := EnsureCacheRepo(cacheDir, "t-reftx-nofatal")
+	if err != nil {
+		t.Fatalf("EnsureCacheRepo: %v", err)
+	}
+	hooksDir := filepath.Join(repoPath, "hooks")
+	if err := os.Remove(filepath.Join(hooksDir, "reference-transaction")); err != nil {
+		t.Fatalf("remove hook: %v", err)
+	}
+	if err := os.Chmod(hooksDir, 0o555); err != nil {
+		t.Fatalf("chmod hooks dir: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(hooksDir, 0o755) })
+	cacheRepoMemos.Delete(repoPath)
+	if _, err := EnsureCacheRepo(cacheDir, "t-reftx-nofatal"); err != nil {
+		t.Fatalf("a failed optional-hook install must not fail the repo: %v", err)
+	}
+}
+
+// TestReservePushHolds_MidScanGrowthDenied (PR #195 round-12 P2): the
+// allowance precheck's size snapshot cannot bind flock-less tombstone
+// growth — a batched append landing after the precheck must be denied
+// MID-SCAN against each file's current size, not read first and charged
+// later (overshoot by the whole delta otherwise).
+func TestReservePushHolds_MidScanGrowthDenied(t *testing.T) {
+	oldMax := maxPushPeerScanBytes
+	maxPushPeerScanBytes = 256
+	t.Cleanup(func() { maxPushPeerScanBytes = oldMax })
+	repoDir := t.TempDir()
+	dir := filepath.Join(repoDir, pushHoldDir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	peer := filepath.Join(dir, "push-peer")
+	if err := os.WriteFile(peer, []byte("refs/heads/x\n"), 0o600); err != nil {
+		t.Fatalf("write peer: %v", err)
+	}
+	if err := appendPushReleased(peer, []string{"refs/heads/other"}); err != nil {
+		t.Fatalf("seed sidecar: %v", err)
+	}
+	// The growth lands after the reservation's precheck (inside the
+	// flock, before the sidecar read): a tombstone block far past the
+	// allowance.
+	grown := false
+	testHookPeerScanPostStat = nil
+	testHookDirCachePreParse = nil
+	grow := func() {
+		if grown {
+			return
+		}
+		grown = true
+		f, err := os.OpenFile(peer+pushHoldReleasedSuffix, os.O_APPEND|os.O_WRONLY, 0)
+		if err != nil {
+			t.Errorf("open sidecar: %v", err)
+			return
+		}
+		if _, err := f.WriteString(strings.Repeat("refs/heads/waste\n", 64)); err != nil {
+			t.Errorf("grow sidecar: %v", err)
+		}
+		_ = f.Close()
+	}
+	// Grow past any budget the legs below allow.
+	grow()
+	// Single-name path: the in-scan check compares each file's CURRENT
+	// size against the remaining allowance before reading it — growth
+	// landing after the caller's precheck is denied, never consumed
+	// (growth landing after the in-scan stat is separately bounded by
+	// the LimitReader and denied by the NEXT poll's precheck).
+	if _, _, err := peerHoldCovers(dir, "", "refs/heads/x/sub", 64); !errors.Is(err, errPushScanBudget) {
+		t.Fatalf("single-name over-budget scan must deny before reading, got %v", err)
+	}
+	// Multi-name path: the in-load check denies any entry whose CURRENT
+	// listed sizes exceed the remaining budget, before reading a byte.
+	cache := &pushHoldDirCache{dir: dir, remaining: 64}
+	if _, err := cache.load(); !errors.Is(err, errPushScanBudget) {
+		t.Fatalf("multi-name over-budget entry must deny before reading, got %v", err)
+	}
+	// And end to end, an over-allowance reservation still gets the
+	// retryable denial rather than unbudgeted work.
+	oldWait := pushHoldWaitMax
+	pushHoldWaitMax = 200 * time.Millisecond
+	t.Cleanup(func() { pushHoldWaitMax = oldWait })
+	err := reservePushHolds(context.Background(), filepath.Join(dir, "push-me"), []string{"refs/heads/x/sub"})
+	if err == nil || !strings.Contains(err.Error(), "scan allowance") {
+		t.Fatalf("over-allowance reservation must deny retryably, got %v", err)
+	}
+}
+
+// TestEnsureCacheRepo_MemoSurvivesInstall (PR #195 round-12 P3, and the
+// CI-red on cae54eaa): the memoized fingerprint must describe the
+// INSTALLED inode after its link into place — a pre-install fingerprint
+// differs in ctime, rejecting the memo on every request and re-running
+// the full verification pass (git subprocesses included) that the memo
+// exists to avoid.
+func TestEnsureCacheRepo_MemoSurvivesInstall(t *testing.T) {
+	cacheDir := t.TempDir()
+	repoPath, err := EnsureCacheRepo(cacheDir, "t-reftx-memokeep")
+	if err != nil {
+		t.Fatalf("EnsureCacheRepo: %v", err)
+	}
+	m, ok := cacheRepoMemos.Load(repoPath)
+	if !ok {
+		t.Fatal("first pass must memoize")
+	}
+	if !cacheRepoUnchanged(repoPath, m.(cacheRepoMemo)) {
+		t.Fatal("a fresh install's memo must verify on the very next call")
+	}
+}
+
+// TestEnsureCacheRepo_NoClobberCreateRace (PR #195 round-12 P2): the
+// create path installs via link(2), which fails EEXIST instead of
+// displacing a hook that landed since the ENOENT decision — no
+// read-to-rename window exists at all.
+func TestEnsureCacheRepo_NoClobberCreateRace(t *testing.T) {
+	cacheDir := t.TempDir()
+	repoPath, err := EnsureCacheRepo(cacheDir, "t-reftx-noclobber")
+	if err != nil {
+		t.Fatalf("EnsureCacheRepo: %v", err)
+	}
+	hookPath := filepath.Join(repoPath, "hooks", "reference-transaction")
+	if err := os.Remove(hookPath); err != nil {
+		t.Fatalf("remove hook: %v", err)
+	}
+	foreign := "#!/bin/sh\n# operator hook landing mid-install\nexit 0\n"
+	testHookRefTxPreInstall = func() {
+		if err := os.WriteFile(hookPath, []byte(foreign), 0o755); err != nil {
+			t.Errorf("install foreign hook: %v", err)
+		}
+	}
+	defer func() { testHookRefTxPreInstall = nil }()
+	cacheRepoMemos.Delete(repoPath)
+	if _, err := EnsureCacheRepo(cacheDir, "t-reftx-noclobber"); err != nil {
+		t.Fatalf("EnsureCacheRepo second pass: %v", err)
+	}
+	testHookRefTxPreInstall = nil
+	b, err := os.ReadFile(hookPath)
+	if err != nil {
+		t.Fatalf("read hook: %v", err)
+	}
+	if string(b) != foreign {
+		t.Fatalf("a foreign hook landing after the ENOENT decision must survive, got:\n%s", b)
+	}
+}
+
+// TestSweepExpiredPushHolds_KeepsQuarantinedHoldsSidecars (PR #195
+// round-14 P2): overlapping mint sweeps after a clock anomaly — one
+// sweep quarantines a live hold to .reaping while another sees its aged
+// `.released` sidecar with no base path and deletes it as an orphan; the
+// restore then resurrects every released name. The orphan check treats
+// the quarantine name as a live parent, and deletions run under the
+// reservation flock (which reaps hold), so the window is closed on both
+// sides.
+func TestSweepExpiredPushHolds_KeepsQuarantinedHoldsSidecars(t *testing.T) {
+	repoDir := t.TempDir()
+	dir := filepath.Join(repoDir, pushHoldDir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	hold := filepath.Join(dir, "push-quarantined")
+	if err := os.WriteFile(hold, []byte("refs/heads/live\n"), 0o600); err != nil {
+		t.Fatalf("write hold: %v", err)
+	}
+	if err := appendPushReleased(hold, []string{"refs/heads/live"}); err != nil {
+		t.Fatalf("seed sidecar: %v", err)
+	}
+	old := time.Now().Add(-2 * pushHoldTTL)
+	if err := os.Chtimes(hold+pushHoldReleasedSuffix, old, old); err != nil {
+		t.Fatalf("age sidecar: %v", err)
+	}
+	// Sweep A holds the hold in quarantine.
+	if err := os.Rename(hold, hold+".reaping"); err != nil {
+		t.Fatalf("quarantine: %v", err)
+	}
+	sweepExpiredPushHolds(dir) // sweep B
+	if _, err := os.Stat(hold + pushHoldReleasedSuffix); err != nil {
+		t.Fatalf("a quarantined hold's tombstone sidecar must survive the orphan sweep: %v", err)
+	}
+	// And with a reap window ACTIVE (reservation flock held), even a
+	// truly parentless sidecar must be left for the next sweep.
+	if err := os.Rename(hold+".reaping", hold+".gone-elsewhere"); err != nil {
+		t.Fatalf("drop parent: %v", err)
+	}
+	lock, err := os.OpenFile(dir+".reserve.lock", os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatalf("open lock: %v", err)
+	}
+	defer lock.Close()
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
+		t.Fatalf("flock: %v", err)
+	}
+	sweepExpiredPushHolds(dir)
+	if _, err := os.Stat(hold + pushHoldReleasedSuffix); err != nil {
+		t.Fatalf("orphan cleanup must not run while a reap window holds the lock: %v", err)
+	}
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_UN); err != nil {
+		t.Fatalf("unlock: %v", err)
+	}
+	sweepExpiredPushHolds(dir)
+	if _, err := os.Stat(hold + pushHoldReleasedSuffix); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("a genuinely parentless aged sidecar must age out once unlocked: %v", err)
+	}
+}
+
+// TestEnsureRefTxHook_RetainsDisplacedOnRestoreFailure (PR #195 round-14
+// P2): when the no-clobber restore of a displaced foreign hook fails for
+// any reason other than EEXIST, the quarantined inode must be RETAINED
+// (a leaked .displaced recovery file) rather than silently deleted.
+func TestEnsureRefTxHook_RetainsDisplacedOnRestoreFailure(t *testing.T) {
+	cacheDir := t.TempDir()
+	repoPath, err := EnsureCacheRepo(cacheDir, "t-reftx-retain")
+	if err != nil {
+		t.Fatalf("EnsureCacheRepo: %v", err)
+	}
+	hookPath := filepath.Join(repoPath, "hooks", "reference-transaction")
+	stale := refTxHookGateV1 + `exec "/opt/old/codestorage" hook reference-transaction "$@"` + "\n"
+	if err := os.WriteFile(hookPath, []byte(stale), 0o755); err != nil {
+		t.Fatalf("write stale hook: %v", err)
+	}
+	foreign := "#!/bin/sh\n# operator hook\nexit 0\n"
+	testHookRefTxPreInstall = func() {
+		if err := os.WriteFile(hookPath, []byte(foreign), 0o755); err != nil {
+			t.Errorf("install foreign hook: %v", err)
+		}
+	}
+	defer func() { testHookRefTxPreInstall = nil }()
+	oldLink := linkFile
+	linkFile = func(oldname, newname string) error { return errors.New("injected: no space left on device") }
+	t.Cleanup(func() { linkFile = oldLink })
+	cacheRepoMemos.Delete(repoPath)
+	if _, err := EnsureCacheRepo(cacheDir, "t-reftx-retain"); err != nil {
+		t.Fatalf("EnsureCacheRepo second pass: %v", err)
+	}
+	testHookRefTxPreInstall = nil
+	linkFile = oldLink
+	matches, err := filepath.Glob(filepath.Join(repoPath, "hooks", "*.displaced"))
+	if err != nil || len(matches) != 1 {
+		t.Fatalf("the displaced foreign hook must be retained for recovery, got %v (%v)", matches, err)
+	}
+	b, err := os.ReadFile(matches[0])
+	if err != nil || string(b) != foreign {
+		t.Fatalf("retained recovery file must hold the foreign content: %q (%v)", b, err)
+	}
+}
+
+// TestEnsureRefTxHook_FingerprintsVerifiedInode (PR #195 round-14 P2):
+// the memoized fingerprint must describe the inode whose CONTENT was
+// verified — a replacement racing between the read and a path-stat would
+// otherwise be vouched for sight-unseen (a stale managed generation
+// bypassing refresh for the process lifetime). Content, mode, and
+// fingerprint come from one descriptor, and the path is confirmed to
+// still name that inode; on a lost race nothing is memoized and the next
+// pass re-decides — pinned here by requiring the racing stale script to
+// be refreshed by the SECOND pass.
+func TestEnsureRefTxHook_FingerprintsVerifiedInode(t *testing.T) {
+	cacheDir := t.TempDir()
+	repoPath, err := EnsureCacheRepo(cacheDir, "t-reftx-inode")
+	if err != nil {
+		t.Fatalf("EnsureCacheRepo: %v", err)
+	}
+	hookPath := filepath.Join(repoPath, "hooks", "reference-transaction")
+	current, err := os.ReadFile(hookPath)
+	if err != nil {
+		t.Fatalf("read hook: %v", err)
+	}
+	// Mid-verify, a stale managed script replaces the byte-equal current
+	// one. The fingerprint must not vouch for it.
+	stale := refTxHookGateV1 + `exec "/opt/old/codestorage" hook reference-transaction "$@"` + "\n"
+	raced := false
+	testHookRefTxMidVerify = func() {
+		if raced {
+			return
+		}
+		raced = true
+		if err := os.WriteFile(hookPath, []byte(stale), 0o755); err != nil {
+			t.Errorf("replace hook: %v", err)
+		}
+	}
+	defer func() { testHookRefTxMidVerify = nil }()
+	cacheRepoMemos.Delete(repoPath)
+	if _, err := EnsureCacheRepo(cacheDir, "t-reftx-inode"); err != nil {
+		t.Fatalf("EnsureCacheRepo racing pass: %v", err)
+	}
+	testHookRefTxMidVerify = nil
+	if _, err := EnsureCacheRepo(cacheDir, "t-reftx-inode"); err != nil {
+		t.Fatalf("EnsureCacheRepo follow-up pass: %v", err)
+	}
+	b, err := os.ReadFile(hookPath)
+	if err != nil {
+		t.Fatalf("read hook: %v", err)
+	}
+	if string(b) != string(current) {
+		t.Fatalf("a replacement racing the verify must not be memo-vouched; the follow-up pass must refresh it, got:\n%s", b)
+	}
+}
+
+// TestReferenceTransactionHook_FlushesBoundedBatches (PR #195 round-15
+// P2): a batched committed callback must not accumulate a high-fanout
+// push's whole name set in memory — releases flush in refTxFlushAt-sized
+// batches (each its own epoch-bumping append), with every name still
+// landing.
+func TestReferenceTransactionHook_FlushesBoundedBatches(t *testing.T) {
+	oldFlush := refTxFlushAt
+	refTxFlushAt = 8
+	t.Cleanup(func() { refTxFlushAt = oldFlush })
+	repoDir := t.TempDir()
+	dir := filepath.Join(repoDir, pushHoldDir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	hold := filepath.Join(dir, "push-fanout-commit")
+	const n = 20 // 2 full batches + remainder
+	var holdNames, stdin strings.Builder
+	zeros, ones := strings.Repeat("0", 40), strings.Repeat("1", 40)
+	for i := 0; i < n; i++ {
+		name := fmt.Sprintf("refs/heads/f-%03d", i)
+		holdNames.WriteString(name + "\n")
+		stdin.WriteString(zeros + " " + ones + " " + name + "\n")
+	}
+	if err := os.WriteFile(hold, []byte(holdNames.String()), 0o600); err != nil {
+		t.Fatalf("write hold: %v", err)
+	}
+	appends := 0
+	oldWrite := writeEpochFile
+	writeEpochFile = func(name string, data []byte, perm os.FileMode) error {
+		appends++ // every appendPushReleased bumps exactly once
+		return oldWrite(name, data, perm)
+	}
+	t.Cleanup(func() { writeEpochFile = oldWrite })
+	t.Setenv(EnvPushHold, hold)
+	t.Setenv(EnvAtomic, "")
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	oldStdin := os.Stdin
+	os.Stdin = r
+	t.Cleanup(func() { os.Stdin = oldStdin })
+	go func() {
+		_, _ = w.WriteString(stdin.String())
+		_ = w.Close()
+	}()
+	if err := referenceTransactionHook([]string{"committed"}); err != nil {
+		t.Fatalf("hook: %v", err)
+	}
+	os.Stdin = oldStdin
+	if appends < 3 {
+		t.Fatalf("a %d-name callback at flush size 8 must append in >= 3 bounded batches, got %d", n, appends)
+	}
+	set, err := readPushHolds(dir, "")
+	if err != nil {
+		t.Fatalf("readPushHolds: %v", err)
+	}
+	for i := 0; i < n; i++ {
+		if set.contains(fmt.Sprintf("refs/heads/f-%03d", i)) {
+			t.Fatalf("name %d not released", i)
+		}
+	}
+}
+
+// TestSweepExpiredPushHolds_KeepsSidecarOnStatError (PR #195 round-15
+// P2): a transient stat error on the live base hold is not proof of
+// absence — deleting a live hold's `.released` sidecar resurrects its
+// released names. Only confirmed double-ENOENT deletes.
+func TestSweepExpiredPushHolds_KeepsSidecarOnStatError(t *testing.T) {
+	repoDir := t.TempDir()
+	dir := filepath.Join(repoDir, pushHoldDir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	hold := filepath.Join(dir, "push-eio")
+	if err := os.WriteFile(hold, []byte("refs/heads/x\n"), 0o600); err != nil {
+		t.Fatalf("write hold: %v", err)
+	}
+	if err := appendPushReleased(hold, []string{"refs/heads/x"}); err != nil {
+		t.Fatalf("seed sidecar: %v", err)
+	}
+	if err := os.Remove(hold); err != nil { // parent gone; sidecar aged
+		t.Fatalf("remove hold: %v", err)
+	}
+	old := time.Now().Add(-2 * pushHoldTTL)
+	if err := os.Chtimes(hold+pushHoldReleasedSuffix, old, old); err != nil {
+		t.Fatalf("age sidecar: %v", err)
+	}
+	oldStat := statFile
+	statFile = func(name string) (os.FileInfo, error) {
+		if name == hold {
+			return nil, errors.New("injected: input/output error")
+		}
+		return oldStat(name)
+	}
+	t.Cleanup(func() { statFile = oldStat })
+	sweepExpiredPushHolds(dir)
+	if _, err := os.Stat(hold + pushHoldReleasedSuffix); err != nil {
+		t.Fatalf("a sidecar must survive a transient parent stat error: %v", err)
+	}
+	statFile = oldStat
+	sweepExpiredPushHolds(dir)
+	if _, err := os.Stat(hold + pushHoldReleasedSuffix); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("confirmed double-ENOENT must delete the orphan: %v", err)
+	}
+}
+
+// TestAppendPushReleased_CoversQuarantinedHold (PR #195 round-17 P2):
+// the writer's never-reserved gate must recognize a hold riding at its
+// quarantine name — the reap's restore can bring it back, and a dropped
+// denial tombstone would re-reserve the name with no post-receive left
+// to release it.
+func TestAppendPushReleased_CoversQuarantinedHold(t *testing.T) {
+	repoDir := t.TempDir()
+	dir := filepath.Join(repoDir, pushHoldDir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := bumpPushHoldEpoch(dir); err != nil {
+		t.Fatalf("seed epoch: %v", err)
+	}
+	hold := filepath.Join(dir, "push-quarantined-denial")
+	if err := os.WriteFile(hold+".reaping", []byte("refs/heads/x\n"), 0o600); err != nil {
+		t.Fatalf("write quarantined hold: %v", err)
+	}
+	if err := releaseDeniedPushHold(hold, "refs/heads/x"); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	covered, _, err := peerHoldCovers(dir, "", "refs/heads/x", maxPushPeerScanBytes)
+	if err != nil {
+		t.Fatalf("peerHoldCovers: %v", err)
+	}
+	if covered {
+		t.Fatal("a denial tombstone must apply to a quarantined hold")
+	}
+	// After the restore, the tombstone keeps applying at the base name.
+	if err := os.Rename(hold+".reaping", hold); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	covered, _, err = peerHoldCovers(dir, "", "refs/heads/x", maxPushPeerScanBytes)
+	if err != nil {
+		t.Fatalf("peerHoldCovers restored: %v", err)
+	}
+	if covered {
+		t.Fatal("the tombstone must survive the restore")
+	}
+}
+
 // TestReapExpiredPushHold_RestoresTouchedHold (Codex round-31 P2 on
 // #173): the expiry verdict and the removal linearize at the quarantine
 // rename — an owner touch that preceded it is observed on the quarantined
@@ -2738,7 +4325,7 @@ func TestPeerHoldCovers_StreamsWithoutParsing(t *testing.T) {
 		{"refs/heads/b/0001", false},    // sibling prefix, no '/' boundary
 		{"refs/heads/zzz", false},       // disjoint
 	} {
-		got, _, err := peerHoldCovers(dir, "", tc.name)
+		got, _, err := peerHoldCovers(dir, "", tc.name, maxPushPeerScanBytes)
 		if err != nil {
 			t.Fatalf("peerHoldCovers(%s): %v", tc.name, err)
 		}
@@ -2748,7 +4335,7 @@ func TestPeerHoldCovers_StreamsWithoutParsing(t *testing.T) {
 	}
 	// The exceptPath (our own hold) never conflicts with itself — and an
 	// excluded self costs no scan work.
-	if got, n, err := peerHoldCovers(dir, peer, "refs/heads/b/000123"); err != nil || got || n != 0 {
+	if got, n, err := peerHoldCovers(dir, peer, "refs/heads/b/000123", maxPushPeerScanBytes); err != nil || got || n != 0 {
 		t.Fatalf("except-path hold treated as a peer: got=%v scanned=%d err=%v", got, n, err)
 	}
 	// Allocation bound: scanning may not scale with the peer's NAME
@@ -2756,7 +4343,7 @@ func TestPeerHoldCovers_StreamsWithoutParsing(t *testing.T) {
 	var before, after runtime.MemStats
 	runtime.ReadMemStats(&before)
 	for i := 0; i < 10; i++ {
-		if _, _, err := peerHoldCovers(dir, "", "refs/heads/zzz"); err != nil {
+		if _, _, err := peerHoldCovers(dir, "", "refs/heads/zzz", maxPushPeerScanBytes); err != nil {
 			t.Fatalf("peerHoldCovers: %v", err)
 		}
 	}
@@ -2777,5 +4364,202 @@ func TestValidateCacheDir(t *testing.T) {
 	deep := "/" + strings.Repeat("d/", pushRefPathMax/2) + "x"
 	if err := ValidateCacheDir(deep); err == nil {
 		t.Fatal("a cache dir past the PATH_MAX budget must be rejected at acceptance time")
+	}
+}
+
+// TestAppendPushReleased_SerializesWithQuarantineRestore (PR #195
+// round-18 P2): recognizing BOTH names (round 17) still left the
+// two-Lstat existence gate racing the reaper — a restore rename landing
+// between the base stat (ENOENT: quarantined) and the quarantine stat
+// (ENOENT: already restored) makes both report absence, silently
+// dropping the tombstone while the hold lives on at its base name. For
+// an all-denied push behind a stalled report tail those names stay
+// re-reserved with no post-receive to release them, blocking conflicting
+// pushes until the TTL. The gate must serialize with the reaper's
+// quarantine window on the reservation flock: the release then lands
+// strictly before the window or strictly after its outcome, never inside
+// it.
+func TestAppendPushReleased_SerializesWithQuarantineRestore(t *testing.T) {
+	repoDir := t.TempDir()
+	dir := filepath.Join(repoDir, pushHoldDir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	hold := filepath.Join(dir, "push-append-race")
+	if err := os.WriteFile(hold, []byte("refs/heads/x\n"), 0o600); err != nil {
+		t.Fatalf("write hold: %v", err)
+	}
+	expireHold(t, hold)
+	info, err := os.Stat(hold)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	// The live refresher whose shared flock forces the reaper's restore.
+	f, err := os.OpenFile(hold, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer f.Close()
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_SH|syscall.LOCK_NB); err != nil {
+		t.Fatalf("flock: %v", err)
+	}
+	// The denial release fires mid-quarantine. If its gate reaches the
+	// base stat inside the window (unserialized), the mid-gate seam
+	// parks it until the restore completed — the exact interleave under
+	// review. Serialized, the release blocks on the flock until the
+	// window ends and the seam never fires (the restored base satisfies
+	// the first stat).
+	reapDone := make(chan struct{})
+	appended := make(chan error, 1)
+	testHookAppendReleasedMidGate = func() { <-reapDone }
+	testHookReapAfterQuarantine = func() {
+		go func() { appended <- appendPushReleased(hold, []string{"refs/heads/x"}) }()
+		select {
+		case err := <-appended:
+			appended <- err
+		case <-time.After(300 * time.Millisecond):
+		}
+	}
+	defer func() {
+		testHookAppendReleasedMidGate = nil
+		testHookReapAfterQuarantine = nil
+	}()
+	reapExpiredPushHold(hold, info.ModTime())
+	close(reapDone)
+	if err := <-appended; err != nil {
+		t.Fatalf("mid-quarantine release: %v", err)
+	}
+	if _, err := os.Stat(hold); err != nil {
+		t.Fatalf("hold must be restored: %v", err)
+	}
+	// The tombstone itself is the assertion (liveness-independent): the
+	// restored hold keeps its name reserved until the TTL, and only the
+	// sidecar record ends that coverage early.
+	b, err := os.ReadFile(hold + pushHoldReleasedSuffix)
+	if err != nil {
+		t.Fatalf("a release racing the quarantine restore was silently dropped: %v", err)
+	}
+	if !strings.Contains(string(b), "refs/heads/x\n") {
+		t.Fatalf("tombstone missing its name: %q", b)
+	}
+}
+
+// TestLivePushHoldsKey_QuarantinedHoldsTombstonesFold (PR #195 round-18
+// P2): a quarantined hold rides at `push-X.reaping` while its tombstone
+// sidecar stays at the BASE name — the coverage readers keep that
+// association (holdSidecarOwner, round 16) but the fingerprint looked up
+// and re-statted `push-X.reaping.released`, a path no writer uses, so it
+// stayed blind to the real sidecar for the whole window. A release whose
+// epoch bump is masked by a cross-push overwrite then leaves both
+// bracketing keys equal while coverage changed mid-scan, certifying a
+// stale held marker until the restore. The fingerprint must fold AND
+// reverify the sidecar at its owner path, exactly like the readers.
+func TestLivePushHoldsKey_QuarantinedHoldsTombstonesFold(t *testing.T) {
+	repoDir := t.TempDir()
+	dir := filepath.Join(repoDir, pushHoldDir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := bumpPushHoldEpoch(dir); err != nil {
+		t.Fatalf("seed epoch: %v", err)
+	}
+	hold := filepath.Join(dir, "push-q")
+	if err := os.WriteFile(hold+".reaping", []byte("refs/heads/a\n"), 0o600); err != nil {
+		t.Fatalf("write quarantined hold: %v", err)
+	}
+	key1, ok := livePushHoldsKey(repoDir)
+	if !ok {
+		t.Fatal("livePushHoldsKey failed")
+	}
+	// A tombstone whose own epoch bump was masked (a cross-push bump
+	// overwrote it before this snapshot): raw sidecar bytes at the BASE
+	// name, where every writer and reader keeps them.
+	if err := os.WriteFile(hold+pushHoldReleasedSuffix, []byte("refs/heads/a\n"), 0o600); err != nil {
+		t.Fatalf("write sidecar: %v", err)
+	}
+	key2, ok := livePushHoldsKey(repoDir)
+	if !ok {
+		t.Fatal("livePushHoldsKey failed")
+	}
+	if key1 == key2 {
+		t.Fatal("a quarantined hold's tombstone must change the hold fingerprint")
+	}
+	// The closing re-stat must watch the same owner path: an append
+	// landing after the closing epoch read must refuse the snapshot.
+	testHookHoldsKeyPostVerify = func() {
+		sf, err := os.OpenFile(hold+pushHoldReleasedSuffix, os.O_APPEND|os.O_WRONLY, 0o600)
+		if err != nil {
+			t.Errorf("open sidecar: %v", err)
+			return
+		}
+		if _, err := sf.WriteString("refs/heads/b\n"); err != nil {
+			t.Errorf("append sidecar: %v", err)
+		}
+		_ = sf.Close()
+	}
+	defer func() { testHookHoldsKeyPostVerify = nil }()
+	if _, ok := livePushHoldsKey(repoDir); ok {
+		t.Fatal("a tombstone landing after the closing epoch read must refuse the snapshot")
+	}
+}
+
+// TestRunHook_PreAppendReservationFailureReleasesNothing (PR #195
+// round-18 P2): covering the ATTEMPT (round 9) must mean the APPEND
+// attempt, not the reservePushHolds call — that function has pre-append
+// exits (scan-allowance denials, lock deadlines, peer-conflict timeouts)
+// where the name provably never had coverage. With an allowed sibling's
+// shared hold file present, a denial release for such a name passes the
+// existence gate, bumps the repository epoch, and tombstones a
+// never-covered ref — a fanout of doomed commands could invalidate
+// held-generation markers once per failure without ever changing
+// coverage. A pre-append failure must release nothing: no tombstone, no
+// bump.
+func TestRunHook_PreAppendReservationFailureReleasesNothing(t *testing.T) {
+	sha := strings.Repeat("a", 40)
+	sha2 := strings.Repeat("b", 40)
+	t.Setenv(EnvRepo, "t-preappend-reservation")
+	t.Setenv(EnvAtomic, "")
+	os.Unsetenv(EnvRefsPolicy)
+	repoDir := t.TempDir()
+	holdPath := filepath.Join(repoDir, pushHoldDir, "push-preappend")
+	if err := os.MkdirAll(filepath.Dir(holdPath), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := bumpPushHoldEpoch(filepath.Dir(holdPath)); err != nil {
+		t.Fatalf("seed epoch: %v", err)
+	}
+	// The allowed sibling's shared hold: the release existence gate
+	// accepts tombstones against it.
+	if err := os.WriteFile(holdPath, []byte("refs/heads/a\n"), 0o600); err != nil {
+		t.Fatalf("write hold: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(pushHoldUnreservedMarker(holdPath, "refs/heads/b")), 0o755); err != nil {
+		t.Fatalf("mkdir unreserved: %v", err)
+	}
+	if err := os.WriteFile(pushHoldUnreservedMarker(holdPath, "refs/heads/b"), nil, 0o600); err != nil {
+		t.Fatalf("write unreserved marker: %v", err)
+	}
+	t.Setenv(EnvPushHold, holdPath)
+	// An exhausted scan allowance: the reservation denies BEFORE its
+	// append can run — this ref never had coverage.
+	if err := writePushScanWork(holdPath, maxPushPeerScanBytes+1); err != nil {
+		t.Fatalf("poison scan allowance: %v", err)
+	}
+	epochBefore, err := os.ReadFile(filepath.Dir(holdPath) + pushHoldEpochSuffix)
+	if err != nil {
+		t.Fatalf("read epoch: %v", err)
+	}
+	if err := RunHook(context.Background(), []string{"update", "refs/heads/b", sha, sha2}); err == nil {
+		t.Fatal("the pre-append reservation failure must fail the update")
+	}
+	if _, err := os.Stat(holdPath + pushHoldReleasedSuffix); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("a never-covered name must not be tombstoned: %v", err)
+	}
+	epochAfter, err := os.ReadFile(filepath.Dir(holdPath) + pushHoldEpochSuffix)
+	if err != nil {
+		t.Fatalf("read epoch: %v", err)
+	}
+	if string(epochBefore) != string(epochAfter) {
+		t.Fatal("a release of a never-covered name must not invalidate held markers")
 	}
 }
