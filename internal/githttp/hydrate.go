@@ -1508,7 +1508,23 @@ const (
 	// appends are O(1), replacing the whole-file rewrite that made an
 	// all-denied fanout O(N²) in disk I/O.
 	pushHoldReleasedSuffix = ".released"
+	// pushHoldGensSuffix names a hold's claimed-generation sidecar (issue
+	// #186 finding 5): an append-only list of the exact store generations
+	// this push's won authority CASes produced (CASRefGen attribution).
+	// heldMarkerValid's range rule consults the LIVE holds' claims to let
+	// a held marker also vouch for later generations fully attributed to
+	// still-pending pushes; any unclaimed generation — a REST writer,
+	// another replica, a completed push — forces the healing rescan.
+	// Appends are best-effort O(1): a lost claim only costs coalescing.
+	pushHoldGensSuffix = ".gens"
 )
+
+// maxPushHoldGensBytes hard-caps one hold's claimed-generation sidecar
+// read during held-marker validation (issue #186 finding 5): ~50k claims
+// per hold at 1 MiB. Over the cap the hold's range reads as unclaimed —
+// bounded cost, and the failure direction is a healing rescan, never a
+// stale skip.
+const maxPushHoldGensBytes = 1 << 20
 
 // isPushHoldSidecar reports whether a hold-directory entry name is one of
 // a hold's sidecar artifacts rather than a hold file itself.
@@ -1517,7 +1533,8 @@ func isPushHoldSidecar(name string) bool {
 		strings.HasSuffix(name, pushHoldVerifiedSuffix) ||
 		strings.HasSuffix(name, pushHoldScanSuffix) ||
 		strings.HasSuffix(name, pushHoldReapSuffix) ||
-		strings.HasSuffix(name, pushHoldReleasedSuffix)
+		strings.HasSuffix(name, pushHoldReleasedSuffix) ||
+		strings.HasSuffix(name, pushHoldGensSuffix)
 }
 
 // removePushHoldFiles releases a push's hold file together with every
@@ -1572,6 +1589,7 @@ func removePushHoldFiles(holdPath string) {
 	_ = os.Remove(holdPath + pushHoldScanSuffix)
 	_ = os.Remove(holdPath + pushHoldReapSuffix)
 	_ = os.Remove(holdPath + pushHoldReleasedSuffix)
+	_ = os.Remove(holdPath + pushHoldGensSuffix)
 }
 
 // pushHoldLive reports whether one hold-file observation counts as live,
@@ -1968,11 +1986,12 @@ func reapExpiredPushHold(path string, observed time.Time) {
 	_ = os.Remove(path + pushHoldScanSuffix)
 	_ = os.Remove(path + pushHoldReapSuffix)
 	_ = os.Remove(path + pushHoldReleasedSuffix)
+	_ = os.Remove(path + pushHoldGensSuffix)
 }
 
 // pushHoldSidecarBase maps a sidecar entry name to its hold file's name.
 func pushHoldSidecarBase(name string) (string, bool) {
-	for _, suffix := range []string{pushHoldUnreservedSuffix, pushHoldVerifiedSuffix, pushHoldScanSuffix, pushHoldReapSuffix, pushHoldReleasedSuffix} {
+	for _, suffix := range []string{pushHoldUnreservedSuffix, pushHoldVerifiedSuffix, pushHoldScanSuffix, pushHoldReapSuffix, pushHoldReleasedSuffix, pushHoldGensSuffix} {
 		if base, ok := strings.CutSuffix(name, suffix); ok {
 			return base, true
 		}
@@ -2071,6 +2090,7 @@ func touchPushHold(holdPath string) {
 	_ = os.Chtimes(holdPath+pushHoldVerifiedSuffix, now, now)
 	_ = os.Chtimes(holdPath+pushHoldScanSuffix, now, now)
 	_ = os.Chtimes(holdPath+pushHoldReleasedSuffix, now, now)
+	_ = os.Chtimes(holdPath+pushHoldGensSuffix, now, now)
 }
 
 // startPushHoldRefresh keeps holdPath fresh on a TTL/4 cadence until the
@@ -3090,6 +3110,45 @@ func appendPushReleased(holdPath string, names []string) error {
 	return f.Close()
 }
 
+// appendPushHoldGen records one won CAS's generation attribution under
+// the push's hold (issue #186 finding 5). Best-effort O(1): claims only
+// ever widen what a held marker may coalesce, so a lost append costs a
+// rescan, never correctness — the caller ignores the error. Lock-free
+// like the tombstone append: only this push's git-serialized hook
+// processes write it, and the reaper renames only the hold file, never
+// sidecars. The unterminated-tail check mirrors appendPushReleased
+// (PR #195 round-2 P2): readers drop a torn final record, but a further
+// O_APPEND would fuse this claim's digits onto the torn prefix — one
+// complete record claiming a generation NOBODY attributed, exactly what
+// the range rule must never accept; skipping the claim merely costs
+// coalescing.
+func appendPushHoldGen(holdPath string, gen int64) error {
+	assertf(gen > 0, "appendPushHoldGen: non-positive generation %d", gen)
+	f, err := os.OpenFile(holdPath+pushHoldGensSuffix, os.O_CREATE|os.O_APPEND|os.O_RDWR, 0o600)
+	if err != nil {
+		return err
+	}
+	if fi, err := f.Stat(); err != nil {
+		_ = f.Close()
+		return err
+	} else if fi.Size() > 0 {
+		var tail [1]byte
+		if _, err := f.ReadAt(tail[:], fi.Size()-1); err != nil {
+			_ = f.Close()
+			return err
+		}
+		if tail[0] != '\n' {
+			_ = f.Close()
+			return fmt.Errorf("push hold: claims sidecar ends in an unterminated record; skipping claim")
+		}
+	}
+	if _, err := fmt.Fprintf(f, "%d\n", gen); err != nil {
+		_ = f.Close()
+		return err
+	}
+	return f.Close()
+}
+
 // releaseDeniedPushHold releases ONE ref from a push's hold on a
 // non-atomic update-hook denial — an O(name) tombstone append (issue
 // #186 finding 6): the former per-denial removePushHolds rewrite read and
@@ -3333,16 +3392,117 @@ func readHeldGenerationMarker(repoPath string) (gen int64, head, holdsKey string
 }
 
 // heldMarkerValid reports whether a held-skip verdict covers the current
-// state: same generation, same HEAD target, fresh, and the live hold
-// fingerprint is exactly the one the recorded scan ran under — then
+// state: same HEAD target, fresh, the live hold fingerprint is exactly
+// the one the recorded scan ran under, and the generation either matches
+// exactly or every later one is claimed (issue #186 finding 5) — then
 // every skip verdict still stands and a re-scan could only reproduce it.
+//
+// The range rule: a marker at hgen also covers gen > hgen iff every
+// generation in (hgen, gen] is claimed by some LIVE hold's .gens sidecar.
+// Each claim is a CASRefGen attribution — that exact generation was
+// produced by a won hook CAS on a ref its (still live, fingerprint-
+// pinned) hold covers, so the marked scan skipped that ref then and a
+// rescan would skip it now: the advertisement cannot have changed. Any
+// unclaimed generation — a REST writer, another replica, a completed
+// push, a pack registration — forces the healing rescan exactly as
+// before. The claims read runs strictly AFTER the fingerprint check:
+// claims only ever accrue under a live hold (append-only, removed with
+// the hold in lifecycle transitions the epoch fingerprint detects), and
+// any hold reserved after the marker was published is visible to the key
+// comparison — its reservation strictly precedes its first CAS, so a
+// claim inside (hgen, gen] can only belong to a hold both snapshots
+// already pinned. A concurrent removal between the two reads costs a
+// spurious rescan, never a stale skip.
 func heldMarkerValid(repoPath string, gen int64, headTarget string) bool {
 	hgen, hhead, hkey, fresh, ok := readHeldGenerationMarker(repoPath)
-	if !ok || !fresh || hgen != gen || hhead != headTarget {
+	if !ok || !fresh || hgen > gen || hhead != headTarget {
 		return false
 	}
 	key, kok := livePushHoldsKey(repoPath)
-	return kok && key == hkey
+	if !kok || key != hkey {
+		return false
+	}
+	if hgen == gen {
+		return true
+	}
+	if !liveHoldsClaimRange(repoPath, hgen, gen) {
+		return false
+	}
+	// Best-effort forward rewrite: later validations then verify only the
+	// suffix past gen instead of re-walking this whole range. Sound
+	// because this validation IS a fresh full observation (fingerprint +
+	// claims) — semantically a re-publication of the same scan verdict at
+	// the newer generation; a racing hydrate's own marker write simply
+	// wins or loses the rename, and the next validation re-derives.
+	writeHeldGenerationMarker(repoPath, gen, headTarget, hkey)
+	return true
+}
+
+// liveHoldsClaimRange reports whether every generation in (hgen, gen] is
+// claimed by some LIVE hold's claimed-generation sidecar. Fail-safe by
+// construction: unreadable, over-cap, or torn claims read as unclaimed;
+// non-live holds' claims are ignored (their pushes are gone and nothing
+// vouches for their refs anymore); the sidecar is read at the OWNER path
+// so a quarantined hold's claims stay visible through the reap window,
+// like every other sidecar consumer (holdSidecarOwner).
+func liveHoldsClaimRange(repoPath string, hgen, gen int64) bool {
+	assertf(hgen < gen, "liveHoldsClaimRange: empty range (%d, %d]", hgen, gen)
+	dir := filepath.Join(repoPath, pushHoldDir)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return false
+	}
+	span := gen - hgen
+	claimed := make(map[int64]bool, min(span, 4096))
+	for _, e := range entries {
+		if isPushHoldSidecar(e.Name()) || e.IsDir() {
+			continue
+		}
+		path := filepath.Join(dir, e.Name())
+		info, err := e.Info()
+		if err != nil || !pushHoldLive(path, info.ModTime()) {
+			// Vanished or expired between listing and stat: its claims
+			// no longer vouch — skipping only shrinks the claimed set,
+			// the rescan direction.
+			continue
+		}
+		// One extra byte past the cap distinguishes at-cap from over-cap
+		// (readFileLimit truncates silently); a truncated final record is
+		// dropped by the newline framing either way.
+		b, rerr := readFileLimit(holdSidecarOwner(path)+pushHoldGensSuffix, maxPushHoldGensBytes+1)
+		if rerr != nil {
+			if errors.Is(rerr, os.ErrNotExist) {
+				continue // a hold with no won CAS yet claims nothing
+			}
+			return false
+		}
+		if int64(len(b)) > maxPushHoldGensBytes {
+			return false // over the cap: unclaimed, bounded cost
+		}
+		for len(b) > 0 {
+			nl := bytes.IndexByte(b, '\n')
+			if nl < 0 {
+				break // torn final record: not a claim
+			}
+			g, perr := strconv.ParseInt(string(b[:nl]), 10, 64)
+			b = b[nl+1:]
+			if perr != nil || g <= 0 {
+				return false // corrupt sidecar: fail safe to a rescan
+			}
+			if g > hgen && g <= gen {
+				claimed[g] = true
+			}
+		}
+	}
+	if int64(len(claimed)) < span {
+		return false
+	}
+	for g := hgen + 1; g <= gen; g++ {
+		if !claimed[g] {
+			return false
+		}
+	}
+	return true
 }
 
 // writeHeldGenerationMarker persists the held-skip verdict via temp file
