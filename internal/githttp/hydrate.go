@@ -1849,9 +1849,14 @@ func sweepExpiredPushHolds(dir string) {
 					_ = lock.Close()
 					continue
 				}
-				_, baseErr := os.Stat(filepath.Join(dir, base))
-				_, reapErr := os.Stat(filepath.Join(dir, base) + ".reaping")
-				if baseErr != nil && reapErr != nil {
+				// Confirmed ABSENCE only (PR #195 round-15 P2): a
+				// transient stat error (EIO) is not proof the parent is
+				// gone, and deleting a live hold's sidecar resurrects its
+				// released names. Any non-ENOENT outcome preserves the
+				// sidecar for the next sweep.
+				_, baseErr := statFile(filepath.Join(dir, base))
+				_, reapErr := statFile(filepath.Join(dir, base) + ".reaping")
+				if errors.Is(baseErr, os.ErrNotExist) && errors.Is(reapErr, os.ErrNotExist) {
 					// RemoveAll: unreserved sidecars are directories.
 					_ = os.RemoveAll(path)
 				}
@@ -2197,6 +2202,10 @@ func loadPushHolds(repoPath string) pushHoldSet {
 // linkFile is os.Link behind a test seam (PR #195 round-14 P2: restore-
 // failure handling needs deterministic fault injection).
 var linkFile = os.Link
+
+// statFile is os.Stat behind a test seam (PR #195 round-15 P2: the
+// orphan sweep's confirmed-absence rule needs deterministic EIO).
+var statFile = os.Stat
 
 // errPushScanBudget marks a peer scan denied MID-SCAN because reading the
 // next file would exceed the push's remaining allowance (PR #195 round-12

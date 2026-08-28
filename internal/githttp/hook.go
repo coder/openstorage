@@ -175,26 +175,46 @@ func referenceTransactionHook(args []string) error {
 	act := len(args) >= 1 && args[0] == "committed" &&
 		holdPath != "" && os.Getenv(EnvAtomic) != "1"
 	// Drain stdin fully even when gated off (EPIPE noise on the writer
-	// otherwise — same reasoning as post-receive).
-	names, err := parseRefTxCommitted(os.Stdin, act)
-	if err != nil || !act || len(names) == 0 {
-		return nil
+	// otherwise — same reasoning as post-receive). Names flush in BOUNDED
+	// batches (PR #195 round-15 P2): a batched committed callback lists
+	// every ref of an allowed high-fanout push, and accumulating them all
+	// before one append would let an authenticated writer size this hook
+	// subprocess's memory by its push. Each flushed batch's names had
+	// their local updates committed, so earlier flushes stay correct even
+	// when a later read or append fails — the remainder just stays held
+	// for post-receive, the usual bound.
+	batch := make([]string, 0, refTxFlushAt)
+	appendFailed := false
+	err := parseRefTxCommitted(os.Stdin, act, func(name string) {
+		if appendFailed {
+			return
+		}
+		batch = append(batch, name)
+		if len(batch) >= refTxFlushAt {
+			appendFailed = appendPushReleased(holdPath, batch) != nil
+			batch = batch[:0]
+		}
+	})
+	if err == nil && act && !appendFailed && len(batch) > 0 {
+		_ = appendPushReleased(holdPath, batch)
 	}
-	_ = appendPushReleased(holdPath, names)
 	return nil
 }
 
+// refTxFlushAt bounds the committed-callback batch: memory stays O(batch)
+// regardless of push fanout. A var so tests can shrink it.
+var refTxFlushAt = 4096
+
 // parseRefTxCommitted reads reference-transaction stdin records
-// ("<old-sha> <new-sha> <refname>") and returns the refnames, draining
-// the reader even when parse=false. The two separators are single ASCII
-// spaces per the protocol; everything after the second is the refname
-// BYTE-FOR-BYTE (PR #195 round-7 P2 — strings.Fields split on Unicode
-// whitespace, silently discarding Git-valid names like
+// ("<old-sha> <new-sha> <refname>"), STREAMING each refname to emit and
+// draining the reader even when parse=false. The two separators are
+// single ASCII spaces per the protocol; everything after the second is
+// the refname BYTE-FOR-BYTE (PR #195 round-7 P2 — strings.Fields split on
+// Unicode whitespace, silently discarding Git-valid names like
 // "refs/heads/a\u00a0b" and leaving them held until post-receive).
 // Scanner token limits bound hostile lines; a scan error abandons the
-// tombstones (over-holding, the safe direction).
-func parseRefTxCommitted(r io.Reader, parse bool) ([]string, error) {
-	var names []string
+// unflushed tombstones (over-holding, the safe direction).
+func parseRefTxCommitted(r io.Reader, parse bool, emit func(string)) error {
 	sc := bufio.NewScanner(r)
 	for sc.Scan() {
 		if !parse {
@@ -205,9 +225,9 @@ func parseRefTxCommitted(r io.Reader, parse bool) ([]string, error) {
 		if !ok1 || !ok2 || name == "" {
 			continue
 		}
-		names = append(names, name)
+		emit(name)
 	}
-	return names, sc.Err()
+	return sc.Err()
 }
 
 // postReceiveHook releases the push's ref holds (Codex round-22 P2 on

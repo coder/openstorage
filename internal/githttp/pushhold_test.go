@@ -3274,8 +3274,10 @@ func TestParseRefTxCommitted_PreservesNonASCIIWhitespaceNames(t *testing.T) {
 	zeros, ones := strings.Repeat("0", 40), strings.Repeat("1", 40)
 	in := zeros + " " + ones + " refs/heads/a\u00a0b\n" +
 		zeros + " " + ones + " refs/heads/plain\n"
-	names, err := parseRefTxCommitted(strings.NewReader(in), true)
-	if err != nil {
+	var names []string
+	if err := parseRefTxCommitted(strings.NewReader(in), true, func(name string) {
+		names = append(names, name)
+	}); err != nil {
 		t.Fatalf("parse: %v", err)
 	}
 	want := []string{"refs/heads/a\u00a0b", "refs/heads/plain"}
@@ -4042,6 +4044,113 @@ func TestEnsureRefTxHook_FingerprintsVerifiedInode(t *testing.T) {
 	}
 	if string(b) != string(current) {
 		t.Fatalf("a replacement racing the verify must not be memo-vouched; the follow-up pass must refresh it, got:\n%s", b)
+	}
+}
+
+// TestReferenceTransactionHook_FlushesBoundedBatches (PR #195 round-15
+// P2): a batched committed callback must not accumulate a high-fanout
+// push's whole name set in memory — releases flush in refTxFlushAt-sized
+// batches (each its own epoch-bumping append), with every name still
+// landing.
+func TestReferenceTransactionHook_FlushesBoundedBatches(t *testing.T) {
+	oldFlush := refTxFlushAt
+	refTxFlushAt = 8
+	t.Cleanup(func() { refTxFlushAt = oldFlush })
+	repoDir := t.TempDir()
+	dir := filepath.Join(repoDir, pushHoldDir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	hold := filepath.Join(dir, "push-fanout-commit")
+	const n = 20 // 2 full batches + remainder
+	var holdNames, stdin strings.Builder
+	zeros, ones := strings.Repeat("0", 40), strings.Repeat("1", 40)
+	for i := 0; i < n; i++ {
+		name := fmt.Sprintf("refs/heads/f-%03d", i)
+		holdNames.WriteString(name + "\n")
+		stdin.WriteString(zeros + " " + ones + " " + name + "\n")
+	}
+	if err := os.WriteFile(hold, []byte(holdNames.String()), 0o600); err != nil {
+		t.Fatalf("write hold: %v", err)
+	}
+	appends := 0
+	oldWrite := writeEpochFile
+	writeEpochFile = func(name string, data []byte, perm os.FileMode) error {
+		appends++ // every appendPushReleased bumps exactly once
+		return oldWrite(name, data, perm)
+	}
+	t.Cleanup(func() { writeEpochFile = oldWrite })
+	t.Setenv(EnvPushHold, hold)
+	t.Setenv(EnvAtomic, "")
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	oldStdin := os.Stdin
+	os.Stdin = r
+	t.Cleanup(func() { os.Stdin = oldStdin })
+	go func() {
+		_, _ = w.WriteString(stdin.String())
+		_ = w.Close()
+	}()
+	if err := referenceTransactionHook([]string{"committed"}); err != nil {
+		t.Fatalf("hook: %v", err)
+	}
+	os.Stdin = oldStdin
+	if appends < 3 {
+		t.Fatalf("a %d-name callback at flush size 8 must append in >= 3 bounded batches, got %d", n, appends)
+	}
+	set, err := readPushHolds(dir, "")
+	if err != nil {
+		t.Fatalf("readPushHolds: %v", err)
+	}
+	for i := 0; i < n; i++ {
+		if set.contains(fmt.Sprintf("refs/heads/f-%03d", i)) {
+			t.Fatalf("name %d not released", i)
+		}
+	}
+}
+
+// TestSweepExpiredPushHolds_KeepsSidecarOnStatError (PR #195 round-15
+// P2): a transient stat error on the live base hold is not proof of
+// absence — deleting a live hold's `.released` sidecar resurrects its
+// released names. Only confirmed double-ENOENT deletes.
+func TestSweepExpiredPushHolds_KeepsSidecarOnStatError(t *testing.T) {
+	repoDir := t.TempDir()
+	dir := filepath.Join(repoDir, pushHoldDir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	hold := filepath.Join(dir, "push-eio")
+	if err := os.WriteFile(hold, []byte("refs/heads/x\n"), 0o600); err != nil {
+		t.Fatalf("write hold: %v", err)
+	}
+	if err := appendPushReleased(hold, []string{"refs/heads/x"}); err != nil {
+		t.Fatalf("seed sidecar: %v", err)
+	}
+	if err := os.Remove(hold); err != nil { // parent gone; sidecar aged
+		t.Fatalf("remove hold: %v", err)
+	}
+	old := time.Now().Add(-2 * pushHoldTTL)
+	if err := os.Chtimes(hold+pushHoldReleasedSuffix, old, old); err != nil {
+		t.Fatalf("age sidecar: %v", err)
+	}
+	oldStat := statFile
+	statFile = func(name string) (os.FileInfo, error) {
+		if name == hold {
+			return nil, errors.New("injected: input/output error")
+		}
+		return oldStat(name)
+	}
+	t.Cleanup(func() { statFile = oldStat })
+	sweepExpiredPushHolds(dir)
+	if _, err := os.Stat(hold + pushHoldReleasedSuffix); err != nil {
+		t.Fatalf("a sidecar must survive a transient parent stat error: %v", err)
+	}
+	statFile = oldStat
+	sweepExpiredPushHolds(dir)
+	if _, err := os.Stat(hold + pushHoldReleasedSuffix); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("confirmed double-ENOENT must delete the orphan: %v", err)
 	}
 }
 
