@@ -3603,6 +3603,56 @@ func TestIsManagedRefTxHook_RejectsShellExpansions(t *testing.T) {
 	}
 }
 
+// TestPeerHoldCovers_BoundsTombstoneReadToChargedSize (PR #195 round-10
+// P2): tombstone appends take no flock, so a peer's sidecar can grow
+// between the charged Stat and the stream — unbounded reading would
+// consume attacker-batched bytes the scan-work counter never charged,
+// bypassing maxPushPeerScanBytes. The stream is limited to the sampled
+// size; records beyond it stay unread (over-holding, the safe
+// direction) and are charged by the NEXT scan's fresh stat.
+func TestPeerHoldCovers_BoundsTombstoneReadToChargedSize(t *testing.T) {
+	repoDir := t.TempDir()
+	dir := filepath.Join(repoDir, pushHoldDir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	hold := filepath.Join(dir, "push-growing")
+	if err := os.WriteFile(hold, []byte("refs/heads/x\n"), 0o600); err != nil {
+		t.Fatalf("write hold: %v", err)
+	}
+	if err := appendPushReleased(hold, []string{"refs/heads/other"}); err != nil {
+		t.Fatalf("seed sidecar: %v", err)
+	}
+	testHookPeerScanPostStat = func() {
+		f, err := os.OpenFile(hold+pushHoldReleasedSuffix, os.O_APPEND|os.O_WRONLY, 0)
+		if err != nil {
+			t.Errorf("open sidecar: %v", err)
+			return
+		}
+		if _, err := f.WriteString("refs/heads/x\n"); err != nil {
+			t.Errorf("grow sidecar: %v", err)
+		}
+		_ = f.Close()
+	}
+	defer func() { testHookPeerScanPostStat = nil }()
+	covered, _, err := peerHoldCovers(dir, "", "refs/heads/x")
+	testHookPeerScanPostStat = nil
+	if err != nil {
+		t.Fatalf("peerHoldCovers: %v", err)
+	}
+	if !covered {
+		t.Fatal("bytes beyond the charged sample must stay unread this scan")
+	}
+	// The next scan charges the fresh stat and applies the tombstone.
+	covered, _, err = peerHoldCovers(dir, "", "refs/heads/x")
+	if err != nil {
+		t.Fatalf("peerHoldCovers second scan: %v", err)
+	}
+	if covered {
+		t.Fatal("the grown sidecar must apply once its bytes are charged")
+	}
+}
+
 // TestReapExpiredPushHold_RestoresTouchedHold (Codex round-31 P2 on
 // #173): the expiry verdict and the removal linearize at the quarantine
 // rename — an owner touch that preceded it is observed on the quarantined

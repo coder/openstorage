@@ -1726,6 +1726,7 @@ var (
 	testHookRemoveHoldsPreRename func()
 	testHookRefreshBeforeLock    func()
 	testHookRefTxPreInstall      func()
+	testHookPeerScanPostStat     func()
 )
 
 // reapExpiredPushHold removes an expiry-verdict hold with the verdict and
@@ -2349,15 +2350,24 @@ func peerHoldCovers(dir, exceptPath, name string) (bool, int64, error) {
 		// because there a missed line would UNDER-hold). Bytes charged
 		// like the hold's own.
 		if rf, err := os.Open(path + pushHoldReleasedSuffix); err == nil {
+			var sampled int64
 			if ri, err := rf.Stat(); err == nil {
-				scanned += ri.Size()
+				sampled = ri.Size()
+				scanned += sampled
+			}
+			if testHookPeerScanPostStat != nil {
+				testHookPeerScanPostStat()
 			}
 			// Trust only newline-TERMINATED records (PR #195 round-1 P2):
 			// ReadString returns the unterminated tail WITH an error, so a
 			// torn append's stranded prefix — possibly a different live
-			// name — is never applied. Allocation is bounded by the file's
-			// already-charged size.
-			rr := bufio.NewReader(rf)
+			// name — is never applied. The read is LIMITED to the sampled,
+			// charged size (round-10 P2): appends take no flock, so the
+			// sidecar can grow under this stream, and unbounded reading
+			// would bypass the scan-work allowance byte-for-byte; a record
+			// cut at the boundary is an unterminated tail, dropped like
+			// any other (unread tombstones over-hold, the safe direction).
+			rr := bufio.NewReader(io.LimitReader(rf, sampled))
 			for len(covering) > 0 {
 				line, err := rr.ReadString('\n')
 				if err != nil {
