@@ -1498,7 +1498,7 @@ func updateHook(ctx context.Context, args []string) (retErr error) {
 				removePushHoldFiles(holdPath)
 				return
 			}
-			_ = removePushHolds(holdPath, []string{refName})
+			_ = releaseDeniedPushHold(holdPath, refName)
 		}()
 	}
 

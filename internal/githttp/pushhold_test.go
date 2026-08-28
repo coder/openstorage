@@ -2625,6 +2625,58 @@ func TestRemovePushHoldFiles_SerializesWithQuarantine(t *testing.T) {
 	}
 }
 
+// TestReleaseDeniedPushHold_LinearWork (issue #186 finding 6): a
+// non-atomic high-fanout push whose advertised bases all went stale has
+// every update hook deny post-CAS-loss, and each denial used to rewrite
+// the ENTIRE remaining hold file — O(N²) bytes of read+write I/O and
+// allocation from an O(N) request, unbounded by the rate limiter or the
+// push cap. Tombstone appends make each release O(name). Pinned by
+// TotalAlloc delta (NOT AllocsPerRun — split-based parsing shares backing
+// buffers and undercounts): 2000 releases over a 2000-name hold cost
+// ~80MB quadratic, low single-digit MB linear. Coverage semantics are
+// pinned alongside: released names must vanish from the readers' view.
+func TestReleaseDeniedPushHold_LinearWork(t *testing.T) {
+	repoDir := t.TempDir()
+	dir := filepath.Join(repoDir, pushHoldDir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	hold := filepath.Join(dir, "push-fanout")
+	const n = 2000
+	names := make([]string, n)
+	var sb strings.Builder
+	for i := range names {
+		names[i] = fmt.Sprintf("refs/heads/fanout-%04d", i)
+		sb.WriteString(names[i])
+		sb.WriteByte('\n')
+	}
+	if err := os.WriteFile(hold, []byte(sb.String()), 0o600); err != nil {
+		t.Fatalf("write hold: %v", err)
+	}
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	for _, name := range names {
+		if err := releaseDeniedPushHold(hold, name); err != nil {
+			t.Fatalf("release %s: %v", name, err)
+		}
+	}
+	runtime.ReadMemStats(&after)
+	if delta := after.TotalAlloc - before.TotalAlloc; delta > 32<<20 {
+		t.Fatalf("all-denied fanout release allocated %d bytes — quadratic rewrite behavior (want O(N) appends, < 32MiB)", delta)
+	}
+	// Non-vacuity + reader semantics: every released name is out of the
+	// combined coverage view.
+	set, err := readPushHolds(dir, "")
+	if err != nil {
+		t.Fatalf("readPushHolds: %v", err)
+	}
+	for _, name := range []string{names[0], names[n/2], names[n-1]} {
+		if set.contains(name) {
+			t.Fatalf("released name %s still covered", name)
+		}
+	}
+}
+
 // TestReapExpiredPushHold_RestoresTouchedHold (Codex round-31 P2 on
 // #173): the expiry verdict and the removal linearize at the quarantine
 // rename — an owner touch that preceded it is observed on the quarantined

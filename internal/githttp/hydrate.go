@@ -1198,6 +1198,15 @@ const (
 	// TTL: expiry needs a second, later observation (see pushHoldLive),
 	// and the marker's own mtime is the clock that separates the two.
 	pushHoldReapSuffix = ".reap"
+	// pushHoldReleasedSuffix names a hold's tombstone sidecar (issue #186
+	// findings 1+6): an append-only list of exact ref names this push no
+	// longer reserves — committed non-atomic refs (released by the
+	// reference-transaction hook the moment git's per-command local
+	// transaction commits) and denied refs (released by their own update
+	// hook). Readers subtract these names from the hold's coverage;
+	// appends are O(1), replacing the whole-file rewrite that made an
+	// all-denied fanout O(N²) in disk I/O.
+	pushHoldReleasedSuffix = ".released"
 )
 
 // isPushHoldSidecar reports whether a hold-directory entry name is one of
@@ -2398,6 +2407,12 @@ func removePushHolds(holdPath string, names []string) error {
 		return err
 	}
 	return nil
+}
+
+// releaseDeniedPushHold releases ONE ref from a push's hold on a
+// non-atomic update-hook denial.
+func releaseDeniedPushHold(holdPath, refName string) error {
+	return removePushHolds(holdPath, []string{refName})
 }
 
 // Generation marker (issue #4): the store's per-repo mutation generation

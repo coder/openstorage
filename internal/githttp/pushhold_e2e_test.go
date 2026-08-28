@@ -1647,3 +1647,140 @@ func TestHydrate_HeldSkipDoesNotRescanPerRequest(t *testing.T) {
 		t.Fatal("post-push advertisement must rescan once the hold is released")
 	}
 }
+
+// TestPush_CommittedNonAtomicRefReleasedBeforeTail (issue #186 findings
+// 1+6, design comment on #186): committed refs must stop blocking
+// same-name pushes the moment git reports their LOCAL updates durable —
+// the reference-transaction hook (committed state) appends exactly the
+// refs each committed callback lists to the push's `.released` tombstone
+// sidecar, and reservation readers subtract tombstones. The premise pin
+// in this test surfaced that modern git (2.55 probed empirically)
+// BATCHES a non-atomic push's local ref updates into ONE transaction
+// after every update hook has run — finding 1's original per-command
+// trace assumed older per-command transactions — so releasing any name
+// before its committed callback would reopen the hydrate/receive-pack
+// race this machinery closes. Release-at-committed is sound on both
+// shapes: per-command gits release each name as it lands, batched gits
+// release the whole set the instant the batch commits, strictly before
+// post-receive and the client-stallable report phase this test parks in.
+func TestPush_CommittedNonAtomicRefReleasedBeforeTail(t *testing.T) {
+	t.Setenv("CODESTORAGE_PG_URL", dbURL)
+	t.Setenv("CODESTORAGE_S3_URL", blobURL)
+	repo := "t-tombstone-committed"
+	cacheDir := t.TempDir()
+	key, pemBlock := genKeyPEM(t, "ES256")
+	laneStore, laneBlob := openLaneStores(t)
+	srv := &Server{
+		Store:    laneStore,
+		Blob:     laneBlob,
+		CacheDir: cacheDir,
+		Verifier: auth.NewVerifier(memKeys{testOrg: {pemBlock}}),
+		Org:      testOrg,
+		ResolveRepo: func(_ context.Context, base string) (meta.Repo, bool) {
+			if base != repo {
+				return meta.Repo{}, false
+			}
+			return meta.Repo{RepoID: repo, URL: repo, DefaultBranch: "main"}, true
+		},
+	}
+	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(ts.Close)
+
+	work := initWorkRepo(t)
+	token := mintUnitToken(t, key, "ES256", unitClaims(testOrg, repo, auth.ScopeGitRead, auth.ScopeGitWrite))
+	url := strings.Replace(ts.URL, "http://", "http://t:"+token+"@", 1) + "/" + repo + ".git"
+	if out, err := tryGit(work, "push", url, "HEAD:refs/heads/main"); err != nil {
+		t.Fatalf("seed push: %v\n%s", err, out)
+	}
+
+	// Park the push at the COMMITTED callback that lists the tail ref —
+	// after chaining to the server binary so the production tombstone
+	// path under test has run, before git proceeds toward post-receive.
+	// This simulates any stall between the local commits and the
+	// post-receive release (the report phase a non-reading client can
+	// stall indefinitely).
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatalf("executable: %v", err)
+	}
+	ctl := t.TempDir()
+	sentinel := filepath.Join(ctl, "committed-parked")
+	barrier := filepath.Join(ctl, "release")
+	script := fmt.Sprintf(`#!/bin/sh
+in=$(cat)
+[ "$1" = committed ] || exit 0
+printf '%%s\n' "$in" | %q hook reference-transaction "$1"
+case "$in" in
+*refs/heads/tail*)
+	: > %q
+	while [ ! -e %q ]; do sleep 0.05; done
+	;;
+esac
+exit 0
+`, self, sentinel, barrier)
+	hookPath := filepath.Join(RepoPath(cacheDir, repo), "hooks", "reference-transaction")
+	if err := os.WriteFile(hookPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("install reference-transaction hook: %v", err)
+	}
+
+	mustGit(t, work, "commit", "--allow-empty", "-m", "tip two")
+	tipTwo := strings.TrimSpace(mustGit(t, work, "rev-parse", "HEAD"))
+	done := make(chan error, 1)
+	go func() {
+		_, err := tryGit(work, "push", url, "HEAD:refs/heads/main", "HEAD:refs/heads/tail")
+		done <- err
+	}()
+	t.Cleanup(func() { _ = os.WriteFile(barrier, nil, 0o644) })
+	for deadline := time.Now().Add(30 * time.Second); ; {
+		if _, err := os.Stat(sentinel); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("push never parked at its committed callback")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Premise pin: a ref listed by a COMMITTED callback has its local
+	// update durably applied — the fact release-at-committed stands on,
+	// version-agnostic across per-command and batched receive-packs.
+	if got := strings.TrimSpace(mustGit(t, RepoPath(cacheDir, repo), "rev-parse", "refs/heads/main")); got != tipTwo {
+		t.Fatalf("premise broken: local refs/heads/main = %s at its committed callback, want %s", got, tipTwo)
+	}
+
+	// Finding 1, writer half: the committed names are tombstoned in the
+	// push's `.released` sidecar while post-receive is still parked away.
+	holdDir := filepath.Join(RepoPath(cacheDir, repo), pushHoldDir)
+	entries, err := os.ReadDir(holdDir)
+	if err != nil {
+		t.Fatalf("read hold dir: %v", err)
+	}
+	released := ""
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), pushHoldReleasedSuffix) {
+			b, err := os.ReadFile(filepath.Join(holdDir, e.Name()))
+			if err != nil {
+				t.Fatalf("read released sidecar: %v", err)
+			}
+			released = string(b)
+		}
+	}
+	if !strings.Contains(released, "refs/heads/main\n") {
+		t.Fatalf("committed ref not tombstoned while post-receive is parked away: released = %q", released)
+	}
+
+	// Finding 1, reader half: a concurrent push to the committed name
+	// must succeed BEFORE post-receive — its reservation subtracts the
+	// tombstone instead of timing out against the parked push's hold.
+	mustGit(t, work, "commit", "--allow-empty", "-m", "tip three")
+	if out, err := tryGit(work, "push", url, "HEAD:refs/heads/main"); err != nil {
+		t.Fatalf("concurrent same-name push must succeed against a tombstoned hold: %v\n%s", err, out)
+	}
+
+	if err := os.WriteFile(barrier, nil, 0o644); err != nil {
+		t.Fatalf("release barrier: %v", err)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("parked push failed: %v", err)
+	}
+}
