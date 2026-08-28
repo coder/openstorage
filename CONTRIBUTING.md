@@ -81,9 +81,10 @@ go build ./cmd/codestorage && ./codestorage version
 
 ## Tests
 
-CI gates every PR on the first two lane commands below; the s3wal lane is
-on-demand. The [testing reference](docs/reference/testing.md) explains what
-each lane covers and the conventions for writing new tests.
+CI gates every PR on all three lane commands below (issue #193 promoted the
+s3wal lane from nightly-only). The
+[testing reference](docs/reference/testing.md) explains what each lane covers
+and the conventions for writing new tests.
 
 ```sh
 # 1. Default lane — the full suite on the production backends.
@@ -94,10 +95,9 @@ go test ./... -count=1 -race -timeout=30m
 #    (SQLite + file blobs). No Docker needed.
 CODESTORAGE_TEST_BACKEND=local go test ./internal/githttp -count=1 -race -timeout=15m
 
-# 3. s3wal lane (on-demand, not a per-PR CI gate) — the same git e2e suite on
-#    the zero-infra topology: ONE SeaweedFS bucket carrying refs + metadata +
-#    blobs, plus lane-only drills (restart-from-bucket-only, dual-serve
-#    refusal). Needs Docker.
+# 3. s3wal lane — the same git e2e suite on the zero-infra topology: ONE
+#    SeaweedFS bucket carrying refs + metadata + blobs, plus lane-only drills
+#    (restart-from-bucket-only, dual-serve refusal). Needs Docker.
 CODESTORAGE_TEST_BACKEND=s3wal go test ./internal/githttp -count=1 -race -timeout=25m
 ```
 
