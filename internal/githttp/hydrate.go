@@ -392,6 +392,16 @@ func EnsureCacheRepoCtx(ctx context.Context, cacheDir, repo string) (string, err
 		assertf(fi != nil, "ensureHook returned no FileInfo for %s", hook.name)
 		*hook.fi = fi
 	}
+	// The reference-transaction hook is installed IF ABSENT only, and
+	// deliberately outside the verified memo (issue #186 finding 1): it
+	// is a best-effort release optimization, not an enforcement hook — a
+	// missing or foreign script only defers hold release to post-receive,
+	// the pre-existing bound — and tests (or operators) may legitimately
+	// wrap it, which content verification would clobber on the next pass.
+	if err := ensureHookIfAbsent(filepath.Join(hooksDir, "reference-transaction"),
+		fmt.Sprintf(hookScript, self, "reference-transaction")); err != nil {
+		return "", err
+	}
 	// Memoize only a config state some verifyLocalConfig pass proved: the
 	// fingerprint identifies the exact unchanged file the reads covered
 	// (PR #98 round-3 review). A raced rewrite leaves configErr set and
@@ -403,6 +413,36 @@ func EnsureCacheRepoCtx(ctx context.Context, cacheDir, repo string) (string, err
 		cacheRepoMemos.Store(path, memo)
 	}
 	return path, nil
+}
+
+// ensureHookIfAbsent installs script at path only when nothing exists
+// there yet (temp + rename, so a concurrent receive-pack never execs a
+// partial script; concurrent installers write identical content and the
+// last rename wins). Existing content — any content — is left alone; see
+// the reference-transaction caller for why.
+func ensureHookIfAbsent(path, script string) error {
+	if _, err := os.Lstat(path); err == nil {
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	defer func() { _ = os.Remove(tmp.Name()) }() // no-op after a successful rename
+	if _, err := tmp.WriteString(script); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Chmod(0o755); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp.Name(), path)
 }
 
 // ensureHook installs the hook script unless it is already current and
@@ -1215,7 +1255,8 @@ func isPushHoldSidecar(name string) bool {
 	return strings.HasSuffix(name, pushHoldUnreservedSuffix) ||
 		strings.HasSuffix(name, pushHoldVerifiedSuffix) ||
 		strings.HasSuffix(name, pushHoldScanSuffix) ||
-		strings.HasSuffix(name, pushHoldReapSuffix)
+		strings.HasSuffix(name, pushHoldReapSuffix) ||
+		strings.HasSuffix(name, pushHoldReleasedSuffix)
 }
 
 // removePushHoldFiles releases a push's hold file together with every
@@ -1269,6 +1310,7 @@ func removePushHoldFiles(holdPath string) {
 	_ = os.RemoveAll(holdPath + pushHoldVerifiedSuffix)
 	_ = os.Remove(holdPath + pushHoldScanSuffix)
 	_ = os.Remove(holdPath + pushHoldReapSuffix)
+	_ = os.Remove(holdPath + pushHoldReleasedSuffix)
 }
 
 // pushHoldLive reports whether one hold-file observation counts as live,
@@ -1626,11 +1668,12 @@ func reapExpiredPushHold(path string, observed time.Time) {
 	_ = os.RemoveAll(path + pushHoldVerifiedSuffix)
 	_ = os.Remove(path + pushHoldScanSuffix)
 	_ = os.Remove(path + pushHoldReapSuffix)
+	_ = os.Remove(path + pushHoldReleasedSuffix)
 }
 
 // pushHoldSidecarBase maps a sidecar entry name to its hold file's name.
 func pushHoldSidecarBase(name string) (string, bool) {
-	for _, suffix := range []string{pushHoldUnreservedSuffix, pushHoldVerifiedSuffix, pushHoldScanSuffix, pushHoldReapSuffix} {
+	for _, suffix := range []string{pushHoldUnreservedSuffix, pushHoldVerifiedSuffix, pushHoldScanSuffix, pushHoldReapSuffix, pushHoldReleasedSuffix} {
 		if base, ok := strings.CutSuffix(name, suffix); ok {
 			return base, true
 		}
@@ -1728,6 +1771,7 @@ func touchPushHold(holdPath string) {
 	_ = os.Chtimes(holdPath+pushHoldUnreservedSuffix, now, now)
 	_ = os.Chtimes(holdPath+pushHoldVerifiedSuffix, now, now)
 	_ = os.Chtimes(holdPath+pushHoldScanSuffix, now, now)
+	_ = os.Chtimes(holdPath+pushHoldReleasedSuffix, now, now)
 }
 
 // startPushHoldRefresh keeps holdPath fresh on a TTL/4 cadence until the
@@ -1892,7 +1936,13 @@ type pushHoldDirCache struct {
 type holdFileParse struct {
 	size  int64
 	mtime int64 // UnixNano
-	names []string
+	// The `.released` tombstone sidecar's fingerprint (issue #186): -1
+	// when absent, -2 after a failed read so the next poll re-probes.
+	// Tombstoned names are subtracted from names at parse time, so a
+	// tombstone append re-parses this peer on the next load.
+	relSize  int64
+	relMtime int64
+	names    []string // held minus tombstoned
 }
 
 func (c *pushHoldDirCache) load() (pushHoldSet, error) {
@@ -1905,6 +1955,18 @@ func (c *pushHoldDirCache) load() (pushHoldSet, error) {
 	}
 	if c.files == nil {
 		c.files = make(map[string]holdFileParse)
+	}
+	// Pre-pass: tombstone sidecar stats, keyed by their hold file's path
+	// (issue #186). Same ReadDir snapshot as the holds below; a tombstone
+	// landing after the listing is seen as a subset, which over-holds —
+	// the safe direction.
+	released := make(map[string]os.FileInfo)
+	for _, e := range entries {
+		if base, ok := strings.CutSuffix(e.Name(), pushHoldReleasedSuffix); ok && !e.IsDir() {
+			if info, err := e.Info(); err == nil {
+				released[filepath.Join(c.dir, base)] = info
+			}
+		}
 	}
 	var firstErr error
 	live := make(map[string]holdFileParse, len(entries))
@@ -1938,8 +2000,13 @@ func (c *pushHoldDirCache) load() (pushHoldSet, error) {
 		if !pushHoldLive(path, info.ModTime()) {
 			continue
 		}
+		relSize, relMtime := int64(-1), int64(-1)
+		if ri, ok := released[path]; ok {
+			relSize, relMtime = ri.Size(), ri.ModTime().UnixNano()
+		}
 		parse, ok := c.files[path]
-		if !ok || parse.size != info.Size() || parse.mtime != info.ModTime().UnixNano() {
+		if !ok || parse.size != info.Size() || parse.mtime != info.ModTime().UnixNano() ||
+			parse.relSize != relSize || parse.relMtime != relMtime {
 			b, err := os.ReadFile(path)
 			if err != nil {
 				if !errors.Is(err, os.ErrNotExist) && firstErr == nil {
@@ -1949,15 +2016,34 @@ func (c *pushHoldDirCache) load() (pushHoldSet, error) {
 			}
 			c.parses++
 			c.parsedBytes += int64(len(b))
-			parse = holdFileParse{size: info.Size(), mtime: info.ModTime().UnixNano(), names: nil}
+			parse = holdFileParse{size: info.Size(), mtime: info.ModTime().UnixNano(), relSize: relSize, relMtime: relMtime}
+			// Subtract the peer's tombstones (issue #186): exact released
+			// names drop out of coverage. An unreadable sidecar subtracts
+			// NOTHING (over-holding, the safe direction — unlike a hold
+			// file, whose unreadability must fail reservations closed)
+			// and re-probes on the next load via the -2 sentinel.
+			var tombstoned map[string]bool
+			if relSize >= 0 {
+				if rb, err := os.ReadFile(path + pushHoldReleasedSuffix); err == nil {
+					c.parsedBytes += int64(len(rb))
+					tombstoned = make(map[string]bool)
+					for _, name := range strings.Split(string(rb), "\n") {
+						if name != "" {
+							tombstoned[name] = true
+						}
+					}
+				} else {
+					parse.relSize, parse.relMtime = -2, -2
+				}
+			}
 			for _, held := range strings.Split(string(b), "\n") {
-				if held != "" {
+				if held != "" && !tombstoned[held] {
 					parse.names = append(parse.names, held)
 				}
 			}
 		}
 		live[path] = parse
-		fmt.Fprintf(&key, "%s\x00%d\x00%d\x01", path, parse.size, parse.mtime)
+		fmt.Fprintf(&key, "%s\x00%d\x00%d\x00%d\x00%d\x01", path, parse.size, parse.mtime, parse.relSize, parse.relMtime)
 	}
 	c.files = live
 	if key.String() != c.setKey {
@@ -2084,17 +2170,46 @@ func peerHoldCovers(dir, exceptPath, name string) (bool, int64, error) {
 			return false, scanned, err
 		}
 		scanned += info.Size()
+		// Collect the covering held lines (normally none, at most a
+		// handful — exact name plus D/F relatives), then subtract the
+		// peer's tombstones before declaring a conflict (issue #186).
+		var covering map[string]bool
 		sc := bufio.NewScanner(f)
 		for sc.Scan() {
 			if holdLineCovers(sc.Bytes(), name) {
-				_ = f.Close()
-				return true, scanned, nil
+				if covering == nil {
+					covering = make(map[string]bool)
+				}
+				covering[string(sc.Bytes())] = true
 			}
 		}
 		err = sc.Err()
 		_ = f.Close()
 		if err != nil {
 			return false, scanned, err
+		}
+		if len(covering) == 0 {
+			continue
+		}
+		// Stream the tombstones, deleting exact matches. Absent or
+		// unreadable sidecars subtract nothing — over-holding, the safe
+		// direction (a hold file's unreadability above stays fail-closed,
+		// because there a missed line would UNDER-hold). Bytes charged
+		// like the hold's own.
+		if rf, err := os.Open(path + pushHoldReleasedSuffix); err == nil {
+			if ri, err := rf.Stat(); err == nil {
+				scanned += ri.Size()
+			}
+			rsc := bufio.NewScanner(rf)
+			for len(covering) > 0 && rsc.Scan() {
+				if covering[string(rsc.Bytes())] {
+					delete(covering, string(rsc.Bytes()))
+				}
+			}
+			_ = rf.Close()
+		}
+		if len(covering) > 0 {
+			return true, scanned, nil
 		}
 	}
 	return false, scanned, nil
@@ -2157,6 +2272,18 @@ func pushHoldPendingBytes(dir, exceptPath string, cached map[string]holdFilePars
 		}
 		return 0, err
 	}
+	// Tombstone sidecars are read alongside their holds (issue #186), so
+	// their bytes join the estimate under the same staleness test — a
+	// tombstone append alone re-parses its peer, and skipping its size
+	// here would reopen the overshoot this function closes.
+	released := make(map[string]os.FileInfo)
+	for _, e := range entries {
+		if base, ok := strings.CutSuffix(e.Name(), pushHoldReleasedSuffix); ok && !e.IsDir() {
+			if info, err := e.Info(); err == nil {
+				released[filepath.Join(dir, base)] = info
+			}
+		}
+	}
 	var pending int64
 	for _, e := range entries {
 		if isPushHoldSidecar(e.Name()) || e.IsDir() {
@@ -2170,10 +2297,18 @@ func pushHoldPendingBytes(dir, exceptPath string, cached map[string]holdFilePars
 		if err != nil {
 			continue // released between the listing and the stat
 		}
-		if parse, ok := cached[path]; ok && parse.size == info.Size() && parse.mtime == info.ModTime().UnixNano() {
+		relSize, relMtime := int64(-1), int64(-1)
+		if ri, ok := released[path]; ok {
+			relSize, relMtime = ri.Size(), ri.ModTime().UnixNano()
+		}
+		if parse, ok := cached[path]; ok && parse.size == info.Size() && parse.mtime == info.ModTime().UnixNano() &&
+			parse.relSize == relSize && parse.relMtime == relMtime {
 			continue
 		}
 		pending += info.Size()
+		if relSize > 0 {
+			pending += relSize
+		}
 	}
 	return pending, nil
 }
@@ -2409,10 +2544,49 @@ func removePushHolds(holdPath string, names []string) error {
 	return nil
 }
 
+// appendPushReleased tombstones names in the push's `.released` sidecar
+// with ONE append write (issue #186 findings 1+6): readers subtract these
+// exact names from the hold's coverage, so a release costs O(names)
+// instead of the whole-file rewrite that made an all-denied fanout O(N²).
+//
+// Deliberately NOT under the reservation flock, validated against the
+// #189 invariants: only the owning push's git-serialized processes write
+// this file (update hooks and reference-transaction callbacks run one at
+// a time, strictly before post-receive's release); the reaper's
+// quarantine window renames only the HOLD file, never the sidecar, so a
+// racing append lands in the same sidecar either way, and an append after
+// an unlink merely recreates an orphan the sweep ages out. Readers under
+// the flock may observe a mid-append subset — tombstones only ever grow,
+// so a missed suffix over-holds, the safe direction. The single write
+// keeps torn tails line-shaped at worst; a torn line matches no exact
+// name and over-holds. No epoch bump: the fingerprint is deliberately
+// blind to tombstones (design comment on #186) — committed names are
+// locally durable already, and a denied name's winning peer bumped the
+// store generation, which invalidates held markers on its own.
+func appendPushReleased(holdPath string, names []string) error {
+	var sb strings.Builder
+	for _, name := range names {
+		sb.WriteString(name)
+		sb.WriteByte('\n')
+	}
+	f, err := os.OpenFile(holdPath+pushHoldReleasedSuffix, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := f.WriteString(sb.String()); err != nil {
+		_ = f.Close()
+		return err
+	}
+	return f.Close()
+}
+
 // releaseDeniedPushHold releases ONE ref from a push's hold on a
-// non-atomic update-hook denial.
+// non-atomic update-hook denial — an O(name) tombstone append (issue
+// #186 finding 6): the former per-denial removePushHolds rewrite read and
+// rewrote the entire remaining hold, O(N²) I/O across an all-denied
+// fanout whose bases a concurrent writer moved.
 func releaseDeniedPushHold(holdPath, refName string) error {
-	return removePushHolds(holdPath, []string{refName})
+	return appendPushReleased(holdPath, []string{refName})
 }
 
 // Generation marker (issue #4): the store's per-repo mutation generation

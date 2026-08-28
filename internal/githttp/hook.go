@@ -146,9 +146,56 @@ func RunHook(ctx context.Context, args []string) error {
 		return updateHook(ctx, args[1:])
 	case "post-receive":
 		return postReceiveHook()
+	case "reference-transaction":
+		return referenceTransactionHook(args[1:])
 	default:
 		return fmt.Errorf("unknown hook %q", args[0])
 	}
+}
+
+// referenceTransactionHook tombstones a push's committed ref names in its
+// `.released` hold sidecar (issue #186 finding 1): a committed callback
+// lists exactly the refs whose LOCAL updates git made durable — the event
+// each hold entry protects — so those names can stop blocking same-name
+// and D/F-relative pushes immediately instead of waiting for post-receive
+// behind a slow tail or a client-stalled report drain. Release-at-
+// committed is sound across git's transaction shapes: per-command
+// receive-packs release each name as it lands, batched ones (git ≥2.55
+// observed) release the whole set the instant the batch commits.
+//
+// Gated to receive-pack pushes (hold env present) outside --atomic
+// (whole-push holds retained there — post-receive and the atomic denial
+// path release them). Every other invocation — hydrate's update-ref
+// batches, maintenance, prepared/aborted states — drains stdin and
+// no-ops. Best-effort throughout: git ignores this hook's exit status
+// for committed transactions, and a lost append only defers release to
+// post-receive, the pre-existing bound.
+func referenceTransactionHook(args []string) error {
+	holdPath := os.Getenv(EnvPushHold)
+	act := len(args) >= 1 && args[0] == "committed" &&
+		holdPath != "" && os.Getenv(EnvAtomic) != "1"
+	var names []string
+	// Drain stdin fully even when gated off (EPIPE noise on the writer
+	// otherwise — same reasoning as post-receive). Lines are
+	// "<old> <new> <refname>"; refnames cannot contain whitespace.
+	// Scanner token limits bound hostile lines; a scan error abandons
+	// the tombstones (over-holding, the safe direction).
+	sc := bufio.NewScanner(os.Stdin)
+	for sc.Scan() {
+		if !act {
+			continue
+		}
+		fields := strings.Fields(sc.Text())
+		if len(fields) != 3 || fields[2] == "" {
+			continue
+		}
+		names = append(names, fields[2])
+	}
+	if sc.Err() != nil || !act || len(names) == 0 {
+		return nil
+	}
+	_ = appendPushReleased(holdPath, names)
+	return nil
 }
 
 // postReceiveHook releases the push's ref holds (Codex round-22 P2 on

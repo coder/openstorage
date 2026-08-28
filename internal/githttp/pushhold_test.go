@@ -2677,6 +2677,101 @@ func TestReleaseDeniedPushHold_LinearWork(t *testing.T) {
 	}
 }
 
+// TestPushHoldReaders_SubtractTombstones (issue #186): both reservation
+// readers — the single-name stream and the multi-name parsed set — drop
+// EXACTLY the tombstoned names from a peer's coverage: released names
+// stop conflicting (same-name and D/F alike) while unreleased names in
+// the same hold keep blocking, and a quarantined peer's tombstones are
+// ignored for the reap window (over-holding, the safe direction).
+func TestPushHoldReaders_SubtractTombstones(t *testing.T) {
+	repoDir := t.TempDir()
+	dir := filepath.Join(repoDir, pushHoldDir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	hold := filepath.Join(dir, "push-peer")
+	if err := os.WriteFile(hold, []byte("refs/heads/done\nrefs/heads/busy\nrefs/heads/dir\n"), 0o600); err != nil {
+		t.Fatalf("write hold: %v", err)
+	}
+	if err := appendPushReleased(hold, []string{"refs/heads/done", "refs/heads/dir"}); err != nil {
+		t.Fatalf("append released: %v", err)
+	}
+	for _, tc := range []struct {
+		name    string
+		covered bool
+	}{
+		{"refs/heads/done", false},     // tombstoned exact
+		{"refs/heads/done/sub", false}, // tombstoned D/F ancestor
+		{"refs/heads/dir/x", false},    // tombstoned D/F ancestor
+		{"refs/heads/busy", true},      // still held
+		{"refs/heads/busy/sub", true},  // held D/F ancestor
+		{"refs/heads", true},           // held D/F descendant (busy)
+	} {
+		covered, _, err := peerHoldCovers(dir, "", tc.name)
+		if err != nil {
+			t.Fatalf("peerHoldCovers(%s): %v", tc.name, err)
+		}
+		if covered != tc.covered {
+			t.Fatalf("peerHoldCovers(%s) = %v, want %v", tc.name, covered, tc.covered)
+		}
+	}
+	set, err := readPushHolds(dir, "")
+	if err != nil {
+		t.Fatalf("readPushHolds: %v", err)
+	}
+	if set.contains("refs/heads/done") || set.contains("refs/heads/dir") || !set.contains("refs/heads/busy") {
+		t.Fatalf("parsed set subtraction wrong: %v", set.names)
+	}
+	// Quarantine window: the hold file rides at its .reaping name, whose
+	// released-sidecar path does not exist — tombstones are ignored and
+	// everything the hold lists is covered again until restore/unlink.
+	if err := os.Rename(hold, hold+".reaping"); err != nil {
+		t.Fatalf("quarantine: %v", err)
+	}
+	covered, _, err := peerHoldCovers(dir, "", "refs/heads/done")
+	if err != nil {
+		t.Fatalf("peerHoldCovers quarantined: %v", err)
+	}
+	if !covered {
+		t.Fatal("a quarantined peer's tombstones must be ignored for the reap window")
+	}
+}
+
+// TestEnsureCacheRepo_ReferenceTransactionHookIfAbsent (issue #186
+// finding 1): the reference-transaction hook is installed when missing
+// but NEVER overwritten — it is a best-effort release optimization whose
+// absence or replacement only defers hold release to post-receive, and
+// tests legitimately wrap it.
+func TestEnsureCacheRepo_ReferenceTransactionHookIfAbsent(t *testing.T) {
+	cacheDir := t.TempDir()
+	repoPath, err := EnsureCacheRepo(cacheDir, "t-reftx-install")
+	if err != nil {
+		t.Fatalf("EnsureCacheRepo: %v", err)
+	}
+	hookPath := filepath.Join(repoPath, "hooks", "reference-transaction")
+	fi, err := os.Stat(hookPath)
+	if err != nil {
+		t.Fatalf("reference-transaction hook not installed: %v", err)
+	}
+	if fi.Mode()&0o100 == 0 {
+		t.Fatal("reference-transaction hook not executable")
+	}
+	custom := []byte("#!/bin/sh\nexit 0\n")
+	if err := os.WriteFile(hookPath, custom, 0o755); err != nil {
+		t.Fatalf("write custom hook: %v", err)
+	}
+	if _, err := EnsureCacheRepo(cacheDir, "t-reftx-install"); err != nil {
+		t.Fatalf("EnsureCacheRepo second pass: %v", err)
+	}
+	b, err := os.ReadFile(hookPath)
+	if err != nil {
+		t.Fatalf("read hook: %v", err)
+	}
+	if string(b) != string(custom) {
+		t.Fatal("existing reference-transaction hook content must be preserved")
+	}
+}
+
 // TestReapExpiredPushHold_RestoresTouchedHold (Codex round-31 P2 on
 // #173): the expiry verdict and the removal linearize at the quarantine
 // rename — an owner touch that preceded it is observed on the quarantined
