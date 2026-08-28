@@ -399,7 +399,7 @@ func EnsureCacheRepoCtx(ctx context.Context, cacheDir, repo string) (string, err
 	// the pre-existing bound — and tests (or operators) may legitimately
 	// wrap it, which content verification would clobber on the next pass.
 	if err := ensureHookIfAbsent(filepath.Join(hooksDir, "reference-transaction"),
-		fmt.Sprintf(hookScript, self, "reference-transaction")); err != nil {
+		fmt.Sprintf(refTxHookScript, self)); err != nil {
 		return "", err
 	}
 	// Memoize only a config state some verifyLocalConfig pass proved: the
@@ -414,6 +414,20 @@ func EnsureCacheRepoCtx(ctx context.Context, cacheDir, repo string) (string, err
 	}
 	return path, nil
 }
+
+// refTxHookScript gates on the hold env INSIDE the script, unlike the
+// enforcement hooks: reference-transaction fires on EVERY ref transaction
+// in the cache repo — hydration's update-ref batches, maintenance,
+// read-path fixture setup — and only receive-pack pushes export the hold
+// env. Non-push transactions must cost one /bin/sh exit, not a
+// server-binary exec per transaction (and, in packages whose test
+// binaries do not dispatch hook args, not a recursive test run — the
+// enforcement hooks never fire outside receive-pack, so only this hook
+// needs the script-level gate).
+const refTxHookScript = `#!/bin/sh
+[ -n "$CODESTORAGE_GIT_PUSH_HOLD" ] || exit 0
+exec %q hook reference-transaction "$@"
+`
 
 // ensureHookIfAbsent installs script at path only when nothing exists
 // there yet (temp + rename, so a concurrent receive-pack never execs a
