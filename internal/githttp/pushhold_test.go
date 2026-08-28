@@ -3490,6 +3490,119 @@ func TestRunHook_DeniedUnreservedRefReleasesNothing(t *testing.T) {
 	}
 }
 
+// TestRunHook_PartiallyFailedReservationReleased (PR #195 round-9 P2):
+// appendPushHolds can fail AFTER its append landed (close or epoch-bump
+// failure), so the ref is physically held while the hook errors out —
+// the deferred release must cover it, or a stalled client keeps the
+// reservation live indefinitely after the transient error clears. The
+// tombstone release of a name whose append never landed is an exact-name
+// subtraction no-op, so covering the attempt is safe on both sides.
+func TestRunHook_PartiallyFailedReservationReleased(t *testing.T) {
+	sha := strings.Repeat("a", 40)
+	sha2 := strings.Repeat("b", 40)
+	t.Setenv(EnvRepo, "t-partial-reservation")
+	t.Setenv(EnvAtomic, "")
+	os.Unsetenv(EnvRefsPolicy)
+	repoDir := t.TempDir()
+	holdPath := filepath.Join(repoDir, pushHoldDir, "push-partial")
+	if err := os.MkdirAll(filepath.Dir(holdPath), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := bumpPushHoldEpoch(filepath.Dir(holdPath)); err != nil {
+		t.Fatalf("seed epoch: %v", err)
+	}
+	if err := os.WriteFile(holdPath, []byte("refs/heads/a\n"), 0o600); err != nil {
+		t.Fatalf("write hold: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(pushHoldUnreservedMarker(holdPath, "refs/heads/b")), 0o755); err != nil {
+		t.Fatalf("mkdir unreserved: %v", err)
+	}
+	if err := os.WriteFile(pushHoldUnreservedMarker(holdPath, "refs/heads/b"), nil, 0o600); err != nil {
+		t.Fatalf("write unreserved marker: %v", err)
+	}
+	t.Setenv(EnvPushHold, holdPath)
+	// The reservation's append lands, its epoch bump fails once, and the
+	// transient condition clears before the deferred release runs.
+	oldWrite := writeEpochFile
+	fails := 1
+	writeEpochFile = func(name string, data []byte, perm os.FileMode) error {
+		if fails > 0 {
+			fails--
+			return errors.New("injected: transient epoch failure")
+		}
+		return oldWrite(name, data, perm)
+	}
+	t.Cleanup(func() { writeEpochFile = oldWrite })
+	if err := RunHook(context.Background(), []string{"update", "refs/heads/b", sha, sha2}); err == nil {
+		t.Fatal("the partially failed reservation must fail the update")
+	}
+	covered, _, err := peerHoldCovers(filepath.Dir(holdPath), "", "refs/heads/b")
+	if err != nil {
+		t.Fatalf("peerHoldCovers: %v", err)
+	}
+	if covered {
+		t.Fatal("a partially reserved ref must not stay covered after its hook's denial")
+	}
+}
+
+// TestEnsureCacheRepo_PreservesRacingForeignHook (PR #195 round-9 P2):
+// the replace/install decision is made from an earlier read — a foreign
+// hook landing between that read and the rename must not be clobbered.
+// The install re-validates the target immediately before renaming and
+// aborts when it no longer matches the state the decision described.
+func TestEnsureCacheRepo_PreservesRacingForeignHook(t *testing.T) {
+	cacheDir := t.TempDir()
+	repoPath, err := EnsureCacheRepo(cacheDir, "t-reftx-race")
+	if err != nil {
+		t.Fatalf("EnsureCacheRepo: %v", err)
+	}
+	hookPath := filepath.Join(repoPath, "hooks", "reference-transaction")
+	// A stale managed script triggers the refresh path.
+	stale := refTxHookGateV1 + `exec "/opt/old/codestorage" hook reference-transaction "$@"` + "\n"
+	if err := os.WriteFile(hookPath, []byte(stale), 0o755); err != nil {
+		t.Fatalf("write stale hook: %v", err)
+	}
+	foreign := "#!/bin/sh\n# operator hook installed mid-refresh\nexit 0\n"
+	testHookRefTxPreInstall = func() {
+		if err := os.WriteFile(hookPath, []byte(foreign), 0o755); err != nil {
+			t.Errorf("install foreign hook: %v", err)
+		}
+	}
+	defer func() { testHookRefTxPreInstall = nil }()
+	cacheRepoMemos.Delete(repoPath)
+	if _, err := EnsureCacheRepo(cacheDir, "t-reftx-race"); err != nil {
+		t.Fatalf("EnsureCacheRepo second pass: %v", err)
+	}
+	testHookRefTxPreInstall = nil
+	b, err := os.ReadFile(hookPath)
+	if err != nil {
+		t.Fatalf("read hook: %v", err)
+	}
+	if string(b) != foreign {
+		t.Fatalf("a foreign hook racing the refresh must be preserved, got:\n%s", b)
+	}
+}
+
+// TestIsManagedRefTxHook_RejectsShellExpansions (PR #195 round-9 P2):
+// strconv.Unquote accepts shell expressions inside the quotes, so an
+// operator's `"$CODESTORAGE_BIN" hook ...` had the exact managed shape
+// and was clobbered. Managed paths are the literal absolute executables
+// the generator can emit — no parameter or command substitution.
+func TestIsManagedRefTxHook_RejectsShellExpansions(t *testing.T) {
+	for content, want := range map[string]bool{
+		refTxHookGate + `"/usr/local/bin/codestorage" hook reference-transaction "$@" || exit 0` + "\n": true,
+		refTxHookGate + `"$CODESTORAGE_BIN" hook reference-transaction "$@" || exit 0` + "\n":           false,
+		refTxHookGate + "\"`pick-binary`\" hook reference-transaction \"$@\" || exit 0\n":               false,
+		refTxHookGate + `"/opt/$DEPLOY/codestorage" hook reference-transaction "$@" || exit 0` + "\n":   false,
+		refTxHookGate + `"relative/codestorage" hook reference-transaction "$@" || exit 0` + "\n":       false,
+		refTxHookGateV1 + `exec "/opt/old/codestorage" hook reference-transaction "$@"` + "\n":          true,
+	} {
+		if got := isManagedRefTxHook([]byte(content)); got != want {
+			t.Errorf("isManagedRefTxHook(%q) = %v, want %v", content, got, want)
+		}
+	}
+}
+
 // TestReapExpiredPushHold_RestoresTouchedHold (Codex round-31 P2 on
 // #173): the expiry verdict and the removal linearize at the quarantine
 // rename — an owner touch that preceded it is observed on the quarantined

@@ -1655,10 +1655,18 @@ func updateHook(ctx context.Context, args []string) (retErr error) {
 			// out their legitimate updates. On success the reservation is
 			// kept through the CAS, the local update, and receive-pack
 			// exit, exactly like bulk holds.
+			// Cover the ATTEMPT, not just the success (PR #195 round-9
+			// P2): appendPushHolds can fail after its append landed
+			// (close or epoch-bump trouble), leaving the ref physically
+			// held while this hook errors out — the deferred release must
+			// then free it, or a stalled client keeps it covered
+			// indefinitely. Releasing a name whose append never landed is
+			// an exact-name subtraction no-op against this push's hold,
+			// so covering the attempt is safe on both sides.
+			refHeld = true
 			if err := reservePushHolds(ctx, holdPath, []string{refName}); err != nil {
 				return fmt.Errorf("update: reserve push hold: %w", err)
 			}
-			refHeld = true
 		}
 	}
 	// Sync claim fence (issue #86): a loopback sync push carries its

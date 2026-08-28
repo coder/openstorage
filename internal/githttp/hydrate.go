@@ -497,7 +497,16 @@ func isManagedRefTxHook(content []byte) bool {
 		return false
 	}
 	path, err := strconv.Unquote(line) // errors on any trailing bytes
-	return err == nil && path != ""
+	if err != nil || !filepath.IsAbs(path) {
+		return false
+	}
+	// Literal executables only (PR #195 round-9 P2): $, backquote, and
+	// backslash keep their meaning inside shell double quotes, so a
+	// quoted `"$CODESTORAGE_BIN"` passes Unquote while being an
+	// operator's dynamic selection — the generator only ever emits
+	// literal absolute paths, and anything else must classify as foreign
+	// and be preserved.
+	return !strings.ContainsAny(path, "$`\\")
 }
 
 // ensureRefTxHook installs script at path when nothing exists there, and
@@ -549,6 +558,26 @@ func ensureRefTxHook(path, script string) error {
 	}
 	if err := tmp.Close(); err != nil {
 		return err
+	}
+	if testHookRefTxPreInstall != nil {
+		testHookRefTxPreInstall()
+	}
+	// Revalidate the displaced target immediately before the rename (PR
+	// #195 round-9 P2): the install/replace decision above described an
+	// earlier read, and a foreign hook landing in between must not be
+	// clobbered — abort and let the next full pass re-decide. The
+	// residual stat-to-rename window is microseconds against an operator
+	// action; a loss there is repaired the same way an operator's install
+	// racing a deployment always is (reinstall wins on the next write).
+	current, cerr := os.ReadFile(path)
+	switch {
+	case errors.Is(cerr, os.ErrNotExist):
+		// Still absent, or the stale managed script vanished — either
+		// way the rename creates without displacing foreign content.
+	case cerr != nil:
+		return cerr
+	case !bytes.Equal(current, existing):
+		return nil
 	}
 	return os.Rename(tmp.Name(), path)
 }
@@ -1696,6 +1725,7 @@ var (
 	testHookHoldsKeyPostVerify   func()
 	testHookRemoveHoldsPreRename func()
 	testHookRefreshBeforeLock    func()
+	testHookRefTxPreInstall      func()
 )
 
 // reapExpiredPushHold removes an expiry-verdict hold with the verdict and
