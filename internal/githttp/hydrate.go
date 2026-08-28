@@ -446,9 +446,14 @@ const refTxHookScript = refTxHookGate + `%q hook reference-transaction "$@" || e
 // non-committed callback costs one /bin/sh exit; per-ref gits then pay
 // one binary exec per committed ref, the same order as their own
 // per-command update hooks, and batched gits pay one per push.
-const refTxHookGate = `#!/bin/sh
+const refTxHookGate = refTxHookGateV1 + `[ "$1" = committed ] || exit 0
+`
+
+// refTxHookGateV1 is the first managed generation's gate (no committed
+// line) — still recognized by the refresh detector so pre-gate installs
+// are upgraded rather than orphaned as foreign.
+const refTxHookGateV1 = `#!/bin/sh
 [ -n "$CODESTORAGE_GIT_PUSH_HOLD" ] || exit 0
-[ "$1" = committed ] || exit 0
 `
 
 // isManagedRefTxHook reports whether content is one of OUR generated
@@ -459,9 +464,18 @@ const refTxHookGate = `#!/bin/sh
 // invocation but ADDS logic must classify as foreign, or the refresh
 // pass would silently strip the additions.
 func isManagedRefTxHook(content []byte) bool {
+	// Every generation this PR's iterations produced is recognized (PR
+	// #195 round-8 P1): the committed-state gate line was added late, and
+	// matching only the current gate would orphan scripts installed by
+	// earlier snapshots — unrefreshable stale binary paths whose failing
+	// prepared callbacks abort valid pushes. Longest gate first: the
+	// older gate is a prefix of the newer.
 	rest, ok := strings.CutPrefix(string(content), refTxHookGate)
 	if !ok {
-		return false
+		rest, ok = strings.CutPrefix(string(content), refTxHookGateV1)
+		if !ok {
+			return false
+		}
 	}
 	line, rest, ok := strings.Cut(rest, "\n")
 	if !ok || rest != "" {
@@ -505,8 +519,11 @@ func ensureRefTxHook(path, script string) error {
 			// Verify the mode too (PR #195 round-2 P2): a restored cache
 			// volume can strip the execute bit while the bytes stay
 			// current, and git SILENTLY skips non-executable hooks. The
+			// OWNER bit specifically (round-8 P2): the serving process is
+			// the file's owner, and POSIX resolves exactly one permission
+			// class — group/other execute bits do nothing for it. The
 			// in-place chmod is atomic on the inode; content never tears.
-			if fi, err := os.Stat(path); err == nil && fi.Mode()&0o111 == 0 {
+			if fi, err := os.Stat(path); err == nil && fi.Mode()&0o100 == 0 {
 				return os.Chmod(path, 0o755)
 			}
 			return nil
@@ -1676,6 +1693,7 @@ var (
 	testHookReapAfterQuarantine  func()
 	testHookHoldsKeyMidSnapshot  func()
 	testHookHoldsKeyPreClose     func()
+	testHookHoldsKeyPostVerify   func()
 	testHookRemoveHoldsPreRename func()
 	testHookRefreshBeforeLock    func()
 )
@@ -2895,34 +2913,12 @@ func livePushHoldsKey(repoPath string) (string, bool) {
 		if ri, ok := released[path]; ok {
 			rel = relStat{ri.Size(), ri.ModTime().UnixNano()}
 		}
+		reverify[path] = relStat{info.Size(), info.ModTime().UnixNano()}
 		reverify[path+pushHoldReleasedSuffix] = rel
 		fmt.Fprintf(&key, "%s\x00%d\x00%d\x00%d\x00%d\x01", path, info.Size(), info.ModTime().UnixNano(), rel.size, rel.mtime)
 	}
 	if testHookHoldsKeyPreClose != nil {
 		testHookHoldsKeyPreClose()
-	}
-	// Closing sidecar re-stat (PR #195 round-7 P2): the epoch seqlock
-	// alone cannot order a lock-free reader against the two-part
-	// bump-then-append — with concurrent pushes, another push's bump can
-	// land between them, so this bracket's two epoch reads can match
-	// while a tombstone append slipped past the single stats sample
-	// above. Coverage-SHRINK mutations are exactly where a stale equal
-	// key would let a held marker vouch for a released-but-unsynced ref,
-	// so every folded sidecar is re-stated here and any change (or
-	// appearance) refuses the snapshot. Hold-file mutations don't need
-	// this: growth is the safe direction, and removals bump the epoch
-	// strictly BEFORE the transition (round 34), which the epoch reads
-	// see.
-	for spath, want := range reverify {
-		got := relStat{-1, -1}
-		if fi, err := os.Lstat(spath); err == nil {
-			got = relStat{fi.Size(), fi.ModTime().UnixNano()}
-		} else if !errors.Is(err, os.ErrNotExist) {
-			return "", false
-		}
-		if got != want {
-			return "", false
-		}
 	}
 	// The closing seqlock read (round-35 P2, see above): any epoch bump
 	// that landed between the two reads means the listing may belong to
@@ -2936,6 +2932,32 @@ func livePushHoldsKey(repoPath string) (string, bool) {
 	}
 	if !bytes.Equal(epoch, epoch2) {
 		return "", false
+	}
+	if testHookHoldsKeyPostVerify != nil {
+		testHookHoldsKeyPostVerify()
+	}
+	// The FINAL observation: re-stat every folded path — hold files AND
+	// tombstone sidecars — and refuse the snapshot on any change (PR #195
+	// rounds 7–8, both loops). The epoch seqlock alone cannot order a
+	// lock-free reader against multi-operation writers (a cross-push
+	// bump can mask a mutation's own), and a re-stat placed BEFORE the
+	// closing epoch read left the gap between them. Placed last, every
+	// mutation visible before the snapshot completes refuses it; one
+	// landing after post-dates the snapshot entirely — the key is true
+	// at publication, and the very next validation recomputes over the
+	// changed (size, mtime), so a published marker cannot outlive the
+	// mutation it missed. Spurious refreshes (a refresher touch mid-
+	// snapshot) cost one conservative rescan.
+	for spath, want := range reverify {
+		got := relStat{-1, -1}
+		if fi, err := os.Lstat(spath); err == nil {
+			got = relStat{fi.Size(), fi.ModTime().UnixNano()}
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return "", false
+		}
+		if got != want {
+			return "", false
+		}
 	}
 	sum := sha256.Sum256([]byte(key.String()))
 	return hex.EncodeToString(sum[:]), true

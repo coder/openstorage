@@ -1517,6 +1517,14 @@ func updateHook(ctx context.Context, args []string) (retErr error) {
 	// the file fresh until git's final local transaction (Codex round-2
 	// P2 on #173).
 	holdPath := os.Getenv(EnvPushHold)
+	// Whether THIS ref is actually covered by the push's hold — set when
+	// the bulk reservation is confirmed or the JIT/sidecar
+	// self-reservation succeeds below (PR #195 round-8 P2): a mixed
+	// push's policy-denied sidecar-marked refs error out BEFORE any
+	// reservation, and releasing a never-covered name would bump the
+	// epoch and invalidate the allowed siblings' held markers once per
+	// cheap denial.
+	refHeld := false
 	if holdPath != "" {
 		defer startPushHoldRefresh(holdPath)()
 		// Release this hook's ref from the shared hold on ANY denial
@@ -1554,11 +1562,33 @@ func updateHook(ctx context.Context, args []string) (retErr error) {
 				return
 			}
 			if os.Getenv(EnvAtomic) == "1" {
+				// A whole-push release regardless of THIS ref's coverage:
+				// one atomic denial dooms every sibling's reservation.
 				removePushHoldFiles(holdPath)
 				return
 			}
-			_ = releaseDeniedPushHold(holdPath, refName)
+			if refHeld {
+				_ = releaseDeniedPushHold(holdPath, refName)
+			}
 		}()
+	}
+
+	// Coverage determination for the denial release above, BEFORE the
+	// policy check (PR #195 round-8 P2, preserving round-19): a
+	// bulk-reserved name (no sidecar marker, not JIT-classified) is held
+	// the moment this hook runs — a no-push or ancestry denial below must
+	// release it — while a sidecar-marked or JIT name is held only once
+	// its self-reservation succeeds, and releasing it earlier would bump
+	// the epoch for a name that never had coverage, letting a mixed
+	// push's cheap policy-denied refs invalidate the allowed siblings'
+	// held markers once per denial. Marker-stat trouble stays refHeld =
+	// false: under-releasing over-holds, the safe direction (and the
+	// reservation block below re-stats with real error handling).
+	if holdPath != "" {
+		jit := errors.Is(evalRefPolicy(ctx, repo, refName, old, new, false), errReservationNeedsAncestry)
+		if _, err := os.Stat(pushHoldUnreservedMarker(holdPath, refName)); errors.Is(err, os.ErrNotExist) && !jit {
+			refHeld = true
+		}
 	}
 
 	// Verified verdict (Codex round-16 P2): pre-receive already ran the
@@ -1628,6 +1658,7 @@ func updateHook(ctx context.Context, args []string) (retErr error) {
 			if err := reservePushHolds(ctx, holdPath, []string{refName}); err != nil {
 				return fmt.Errorf("update: reserve push hold: %w", err)
 			}
+			refHeld = true
 		}
 	}
 	// Sync claim fence (issue #86): a loopback sync push carries its
