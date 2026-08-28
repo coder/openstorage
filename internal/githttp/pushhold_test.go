@@ -3216,6 +3216,74 @@ func TestRefTxHookScript_ShellGatesCommittedState(t *testing.T) {
 	}
 }
 
+// TestLivePushHoldsKey_CrossPushSidecarAppendDetected (PR #195 round-7
+// P2): the epoch seqlock cannot order a lock-free reader against the
+// two-part bump-then-append — another push's bump can land between a
+// writer's bump and its append, so a bracket's two epoch reads match
+// while the append slipped past the single sidecar stats sample. The
+// closing sidecar re-stat refuses any snapshot whose folded sidecar
+// changed (simulated here by a raw epoch-less append, the net
+// interleaving the reader observes).
+func TestLivePushHoldsKey_CrossPushSidecarAppendDetected(t *testing.T) {
+	repoDir := t.TempDir()
+	dir := filepath.Join(repoDir, pushHoldDir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := bumpPushHoldEpoch(dir); err != nil {
+		t.Fatalf("seed epoch: %v", err)
+	}
+	hold := filepath.Join(dir, "push-crosspush")
+	if err := os.WriteFile(hold, []byte("refs/heads/a\nrefs/heads/b\n"), 0o600); err != nil {
+		t.Fatalf("write hold: %v", err)
+	}
+	if err := appendPushReleased(hold, []string{"refs/heads/a"}); err != nil {
+		t.Fatalf("seed sidecar: %v", err)
+	}
+	key1, ok := livePushHoldsKey(repoDir)
+	if !ok {
+		t.Fatal("livePushHoldsKey failed")
+	}
+	testHookHoldsKeyPreClose = func() {
+		f, err := os.OpenFile(hold+pushHoldReleasedSuffix, os.O_APPEND|os.O_WRONLY, 0)
+		if err != nil {
+			t.Errorf("open sidecar: %v", err)
+			return
+		}
+		if _, err := f.WriteString("refs/heads/b\n"); err != nil {
+			t.Errorf("raw append: %v", err)
+		}
+		_ = f.Close()
+	}
+	key2, ok2 := livePushHoldsKey(repoDir)
+	testHookHoldsKeyPreClose = nil
+	if ok2 && key2 == key1 {
+		t.Fatal("a sidecar append inside the bracket with equal epochs must refuse or change the key")
+	}
+	if _, ok := livePushHoldsKey(repoDir); !ok {
+		t.Fatal("livePushHoldsKey must succeed on a quiet set")
+	}
+}
+
+// TestParseRefTxCommitted_PreservesNonASCIIWhitespaceNames (PR #195
+// round-7 P2): the reference-transaction protocol separates records with
+// single ASCII spaces, but Git-valid refnames may contain non-ASCII
+// whitespace — a Fields-based parser split them, silently discarding the
+// record and leaving the committed name held until post-receive.
+func TestParseRefTxCommitted_PreservesNonASCIIWhitespaceNames(t *testing.T) {
+	zeros, ones := strings.Repeat("0", 40), strings.Repeat("1", 40)
+	in := zeros + " " + ones + " refs/heads/a\u00a0b\n" +
+		zeros + " " + ones + " refs/heads/plain\n"
+	names, err := parseRefTxCommitted(strings.NewReader(in), true)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	want := []string{"refs/heads/a\u00a0b", "refs/heads/plain"}
+	if len(names) != len(want) || names[0] != want[0] || names[1] != want[1] {
+		t.Fatalf("parsed %q, want %q", names, want)
+	}
+}
+
 // TestReapExpiredPushHold_RestoresTouchedHold (Codex round-31 P2 on
 // #173): the expiry verdict and the removal linearize at the quarantine
 // rename — an owner touch that preceded it is observed on the quarantined

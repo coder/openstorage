@@ -174,28 +174,40 @@ func referenceTransactionHook(args []string) error {
 	holdPath := os.Getenv(EnvPushHold)
 	act := len(args) >= 1 && args[0] == "committed" &&
 		holdPath != "" && os.Getenv(EnvAtomic) != "1"
-	var names []string
 	// Drain stdin fully even when gated off (EPIPE noise on the writer
-	// otherwise — same reasoning as post-receive). Lines are
-	// "<old> <new> <refname>"; refnames cannot contain whitespace.
-	// Scanner token limits bound hostile lines; a scan error abandons
-	// the tombstones (over-holding, the safe direction).
-	sc := bufio.NewScanner(os.Stdin)
-	for sc.Scan() {
-		if !act {
-			continue
-		}
-		fields := strings.Fields(sc.Text())
-		if len(fields) != 3 || fields[2] == "" {
-			continue
-		}
-		names = append(names, fields[2])
-	}
-	if sc.Err() != nil || !act || len(names) == 0 {
+	// otherwise — same reasoning as post-receive).
+	names, err := parseRefTxCommitted(os.Stdin, act)
+	if err != nil || !act || len(names) == 0 {
 		return nil
 	}
 	_ = appendPushReleased(holdPath, names)
 	return nil
+}
+
+// parseRefTxCommitted reads reference-transaction stdin records
+// ("<old-sha> <new-sha> <refname>") and returns the refnames, draining
+// the reader even when parse=false. The two separators are single ASCII
+// spaces per the protocol; everything after the second is the refname
+// BYTE-FOR-BYTE (PR #195 round-7 P2 — strings.Fields split on Unicode
+// whitespace, silently discarding Git-valid names like
+// "refs/heads/a\u00a0b" and leaving them held until post-receive).
+// Scanner token limits bound hostile lines; a scan error abandons the
+// tombstones (over-holding, the safe direction).
+func parseRefTxCommitted(r io.Reader, parse bool) ([]string, error) {
+	var names []string
+	sc := bufio.NewScanner(r)
+	for sc.Scan() {
+		if !parse {
+			continue
+		}
+		_, rest, ok1 := strings.Cut(sc.Text(), " ")
+		_, name, ok2 := strings.Cut(rest, " ")
+		if !ok1 || !ok2 || name == "" {
+			continue
+		}
+		names = append(names, name)
+	}
+	return names, sc.Err()
 }
 
 // postReceiveHook releases the push's ref holds (Codex round-22 P2 on

@@ -2874,6 +2874,8 @@ func livePushHoldsKey(repoPath string) (string, bool) {
 			}
 		}
 	}
+	type relStat struct{ size, mtime int64 }
+	reverify := make(map[string]relStat)
 	for _, e := range entries {
 		if isPushHoldSidecar(e.Name()) || e.IsDir() {
 			continue
@@ -2889,14 +2891,38 @@ func livePushHoldsKey(repoPath string) (string, bool) {
 		if !pushHoldLive(path, info.ModTime()) {
 			continue
 		}
-		relSize, relMtime := int64(-1), int64(-1)
+		rel := relStat{-1, -1}
 		if ri, ok := released[path]; ok {
-			relSize, relMtime = ri.Size(), ri.ModTime().UnixNano()
+			rel = relStat{ri.Size(), ri.ModTime().UnixNano()}
 		}
-		fmt.Fprintf(&key, "%s\x00%d\x00%d\x00%d\x00%d\x01", path, info.Size(), info.ModTime().UnixNano(), relSize, relMtime)
+		reverify[path+pushHoldReleasedSuffix] = rel
+		fmt.Fprintf(&key, "%s\x00%d\x00%d\x00%d\x00%d\x01", path, info.Size(), info.ModTime().UnixNano(), rel.size, rel.mtime)
 	}
 	if testHookHoldsKeyPreClose != nil {
 		testHookHoldsKeyPreClose()
+	}
+	// Closing sidecar re-stat (PR #195 round-7 P2): the epoch seqlock
+	// alone cannot order a lock-free reader against the two-part
+	// bump-then-append — with concurrent pushes, another push's bump can
+	// land between them, so this bracket's two epoch reads can match
+	// while a tombstone append slipped past the single stats sample
+	// above. Coverage-SHRINK mutations are exactly where a stale equal
+	// key would let a held marker vouch for a released-but-unsynced ref,
+	// so every folded sidecar is re-stated here and any change (or
+	// appearance) refuses the snapshot. Hold-file mutations don't need
+	// this: growth is the safe direction, and removals bump the epoch
+	// strictly BEFORE the transition (round 34), which the epoch reads
+	// see.
+	for spath, want := range reverify {
+		got := relStat{-1, -1}
+		if fi, err := os.Lstat(spath); err == nil {
+			got = relStat{fi.Size(), fi.ModTime().UnixNano()}
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return "", false
+		}
+		if got != want {
+			return "", false
+		}
 	}
 	// The closing seqlock read (round-35 P2, see above): any epoch bump
 	// that landed between the two reads means the listing may belong to
