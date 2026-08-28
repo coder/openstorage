@@ -18,9 +18,10 @@ One test suite, two storage stacks. Which stack a test run uses is decided in
 
 These are exactly the CI jobs in
 [`.github/workflows/ci.yml`](../../.github/workflows/ci.yml): `test` runs the
-default lane, `test-local` runs the local lane, and `lint` / `image` complete
-the required set. CI asserts `git lfs version` up front so a missing LFS client
-fails the job instead of silently skipping LFS coverage.
+default lane, `test-local` runs the local lane, `test-s3wal` runs the s3wal
+lane (issue #193), and `lint` / `image` complete the required set. CI asserts
+`git lfs version` up front so a missing LFS client fails the job instead of
+silently skipping LFS coverage.
 
 `CODESTORAGE_TEST_BACKEND` accepts `pg` (or unset), `local`, and `s3wal`; anything
 else panics in `TestMain` (`internal/githttp/e2e_test.go`). On the s3wal lane the
