@@ -180,6 +180,42 @@ func postReceiveHook() error {
 
 type refCommand struct{ old, new, ref string }
 
+// quarantineKeepContents replaces index-pack's process-unique .keep
+// sidecar contents ("receive-pack <pid> on <host>") in the push quarantine
+// (issue #187). Concurrent pushes of byte-identical packs migrate the same
+// content-addressed pack/idx/rev trio into the shared cache repo, and git's
+// finalize_object_file tolerates an existing destination file only when the
+// bytes match — so the pid-bearing keep failed the LOSER's whole migration
+// ("unable to migrate objects to permanent storage") even though every
+// other file is identical by construction. With the contents fixed, the
+// loser's migration is the byte-identical no-op the rest of the publication
+// path already treats it as (idempotent blob upload + RegisterPacks). The
+// keep's protection is its existence, not its contents (git only unlinks it
+// after the ref transaction; cache repos pin gc.auto=0 besides), so the
+// rewrite changes no lifecycle.
+const quarantineKeepContents = "codestorage receive-pack\n"
+
+// normalizeQuarantineKeep rewrites the .keep sidecar of one quarantined
+// pack to quarantineKeepContents. The quarantine is private to this push
+// until git migrates it after pre-receive succeeds, so a plain truncating
+// write is race-free. A missing keep means nothing can collide at
+// migration (older gits, delete-only pushes never reach here); any other
+// failure fails the push closed — a quarantine this hook cannot write to
+// would break the migration anyway.
+func normalizeQuarantineKeep(packFile string) error {
+	keep := strings.TrimSuffix(packFile, ".pack") + ".keep"
+	if _, err := os.Stat(keep); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("pre-receive: stat quarantined pack keep: %w", err)
+	}
+	if err := os.WriteFile(keep, []byte(quarantineKeepContents), 0o600); err != nil {
+		return fmt.Errorf("pre-receive: normalize quarantined pack keep: %w", err)
+	}
+	return nil
+}
+
 // preReceive uploads the quarantined pack(s) to S3 FIRST, then registers
 // them in PG in one transaction. Crash windows (validated by tests):
 //   - die after S3 upload, before PG commit  => orphaned S3 object only
@@ -715,6 +751,13 @@ func preReceive(ctx context.Context) (retErr error) {
 		}
 		if fi.Size() <= 0 {
 			return fmt.Errorf("pre-receive: quarantined pack %q is empty", base)
+		}
+		// Identical concurrent packs (issue #187): normalize the pack's
+		// process-unique .keep sidecar while the quarantine is still
+		// private, so a concurrent identical push's migration stays
+		// byte-identical — see normalizeQuarantineKeep.
+		if err := normalizeQuarantineKeep(pf); err != nil {
+			return err
 		}
 		packs = append(packs, ref.Pack{ID: id, Key: blob.PackKey(repo, id), Size: fi.Size()})
 	}
