@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.4](https://github.com/coder/code-storage/compare/v0.14.3...v0.14.4) (2026-08-28)
+
+
+### Bug Fixes
+
+* **githttp:** coalesce held-marker validation across claimed push generations ([#197](https://github.com/coder/code-storage/issues/197)) ([950995d](https://github.com/coder/code-storage/commit/950995dcbd4485c1e9620c4329177d751382f2e7))
+
 ## [0.14.3](https://github.com/coder/code-storage/compare/v0.14.2...v0.14.3) (2026-08-28)
 
 
