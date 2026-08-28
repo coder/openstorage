@@ -1353,6 +1353,24 @@ func writePushVerifiedVerdicts(holdPath string, digests [][sha256.Size]byte) err
 	if len(digests) == 0 {
 		return nil
 	}
+	// Anchor the sidecar to a live base hold (Codex round-35 P2): an
+	// all-JIT push reserves no names, so no hold file exists yet — and a
+	// PARENTLESS sidecar ages out on a single wall observation, letting a
+	// suspend/clock step plus any concurrent mint sweep delete the
+	// verdicts before the first hook consumed one. The empty hold covers
+	// no names (no peer conflicts, no skip verdicts — no epoch bump
+	// needed; its listing presence alone can only force conservative
+	// revalidation) but it lives on the refresher's clock with the
+	// two-observation expiry, and every release path already removes it
+	// together with its sidecars. O_CREATE without O_TRUNC: a reserved
+	// hold passes through untouched.
+	f, err := os.OpenFile(holdPath, os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
 	sort.Slice(digests, func(i, j int) bool { return bytes.Compare(digests[i][:], digests[j][:]) < 0 })
 	buf := make([]byte, 0, len(digests)*sha256.Size)
 	for _, d := range digests {

@@ -2363,6 +2363,40 @@ func TestBumpPushHoldEpoch_RemovesTempOnWriteFailure(t *testing.T) {
 	}
 }
 
+// TestWritePushVerifiedVerdicts_SurvivesSweepWithoutReservations (Codex
+// round-35 P2 on #173/#186): an all-JIT push reserves no names, so no
+// hold file exists — persisting its pack-path verdicts used to write a
+// PARENTLESS `.verified` sidecar. Orphan sidecars age out on a single
+// wall observation, so a host suspend or forward clock step followed by
+// any other push's mint sweep deleted the verdicts before the first
+// update hook consumed them — re-charging the walk budget for every
+// evaluation, the exact exhaustion the persistence exists to prevent.
+// The sidecar must be anchored to a base hold file that lives on the
+// refresher's clock with two-observation expiry.
+func TestWritePushVerifiedVerdicts_SurvivesSweepWithoutReservations(t *testing.T) {
+	repoDir := t.TempDir()
+	dir := filepath.Join(repoDir, pushHoldDir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	hold := filepath.Join(dir, "push-jit-only")
+	oldSHA, newSHA := strings.Repeat("0", 40), strings.Repeat("1", 40)
+	digests := [][sha256.Size]byte{pushVerifiedDigest("refs/heads/a", oldSHA, newSHA)}
+	if err := writePushVerifiedVerdicts(hold, digests); err != nil {
+		t.Fatalf("write verdicts: %v", err)
+	}
+	// A suspend/forward clock step: every file of the push looks ancient
+	// at once (ENOENT Chtimes are no-ops for whichever files each
+	// implementation maintains).
+	old := time.Now().Add(-2 * pushHoldTTL)
+	_ = os.Chtimes(hold, old, old)
+	_ = os.Chtimes(hold+pushHoldVerifiedSuffix, old, old)
+	sweepExpiredPushHolds(dir) // another push's mint sweep
+	if !pushVerifiedVerdict(hold, "refs/heads/a", oldSHA, newSHA) {
+		t.Fatal("verified verdicts must survive one sweep observation after a clock anomaly")
+	}
+}
+
 // TestReapExpiredPushHold_RestoresTouchedHold (Codex round-31 P2 on
 // #173): the expiry verdict and the removal linearize at the quarantine
 // rename — an owner touch that preceded it is observed on the quarantined
