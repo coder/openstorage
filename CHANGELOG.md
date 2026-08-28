@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.5](https://github.com/coder/code-storage/compare/v0.14.4...v0.14.5) (2026-08-28)
+
+
+### Bug Fixes
+
+* **githttp:** make holdFileID stat folding portable across platforms ([#199](https://github.com/coder/code-storage/issues/199)) ([fb29408](https://github.com/coder/code-storage/commit/fb29408cfceb28fc7d2ef3f467277e2694c3cd38))
+
 ## [0.14.4](https://github.com/coder/code-storage/compare/v0.14.3...v0.14.4) (2026-08-28)
 
 
