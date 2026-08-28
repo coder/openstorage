@@ -437,9 +437,18 @@ const refTxHookScript = refTxHookGate + `%q hook reference-transaction "$@" || e
 `
 
 // refTxHookGate is the script's managed-identity prefix, shared by the
-// generator above and the refresh detector below.
+// generator above and the refresh detector below. The committed-state
+// check lives in the SHELL too (PR #195 round-6 security P2): git
+// versions with per-ref reference transactions invoke the hook at both
+// prepared and committed for every ref, and a Go-side gate alone would
+// exec the full binary twice per ref on an allowed high-fanout push —
+// node-wide process amplification under concurrent pushes. Every
+// non-committed callback costs one /bin/sh exit; per-ref gits then pay
+// one binary exec per committed ref, the same order as their own
+// per-command update hooks, and batched gits pay one per push.
 const refTxHookGate = `#!/bin/sh
 [ -n "$CODESTORAGE_GIT_PUSH_HOLD" ] || exit 0
+[ "$1" = committed ] || exit 0
 `
 
 // isManagedRefTxHook reports whether content is one of OUR generated

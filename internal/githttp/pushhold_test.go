@@ -3179,6 +3179,43 @@ func TestReleaseDeniedPushHold_NoopWithoutHoldFile(t *testing.T) {
 	}
 }
 
+// TestRefTxHookScript_ShellGatesCommittedState (PR #195 round-6 security
+// P2): git versions with per-ref reference transactions invoke the hook
+// at BOTH prepared and committed per ref — gating the state only inside
+// the Go binary meant two full binary execs per ref on an allowed
+// high-fanout push (no command-count cap, ~20GiB byte cap, rate limiting
+// off by default). Non-committed states must cost one /bin/sh exit, the
+// binary exec reserved for the committed callback that does the work.
+func TestRefTxHookScript_ShellGatesCommittedState(t *testing.T) {
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "executed")
+	fake := filepath.Join(dir, "fake-binary")
+	if err := os.WriteFile(fake, []byte("#!/bin/sh\n: > \""+marker+"\"\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("write fake binary: %v", err)
+	}
+	hook := filepath.Join(dir, "reference-transaction")
+	if err := os.WriteFile(hook, []byte(fmt.Sprintf(refTxHookScript, fake)), 0o755); err != nil {
+		t.Fatalf("write hook: %v", err)
+	}
+	run := func(state string) {
+		t.Helper()
+		cmd := exec.Command(hook, state)
+		cmd.Env = append(os.Environ(), EnvPushHold+"="+filepath.Join(dir, "push-x"))
+		cmd.Stdin = strings.NewReader("")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("hook %s: %v\n%s", state, err, out)
+		}
+	}
+	run("prepared")
+	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("a prepared callback must not exec the binary")
+	}
+	run("committed")
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("the committed callback must exec the binary: %v", err)
+	}
+}
+
 // TestReapExpiredPushHold_RestoresTouchedHold (Codex round-31 P2 on
 // #173): the expiry verdict and the removal linearize at the quarantine
 // rename — an owner touch that preceded it is observed on the quarantined
