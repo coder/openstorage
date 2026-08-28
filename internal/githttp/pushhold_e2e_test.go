@@ -1784,3 +1784,214 @@ exit 0
 		t.Fatalf("parked push failed: %v", err)
 	}
 }
+
+// TestPush_AtomicFanoutHookPhaseAdvertisementsCoalesce (issue #186
+// finding 5): an atomic fanout bumps the store generation once per
+// committed hook CAS while the local ref transaction waits for the last
+// hook — a held marker recording one exact generation therefore missed
+// EVERY advertisement inside that window and re-paid a full pack listing
+// + paged ref scan per request. With each won CAS's exact attribution
+// claimed under the push's live hold, the marker must coalesce: one paged
+// scan for the whole hook phase, however many CASes land between
+// advertisements.
+func TestPush_AtomicFanoutHookPhaseAdvertisementsCoalesce(t *testing.T) {
+	t.Setenv("CODESTORAGE_PG_URL", dbURL)
+	t.Setenv("CODESTORAGE_S3_URL", blobURL)
+	t.Setenv("CODESTORAGE_TEST_MODE", "1")
+	barrier := filepath.Join(t.TempDir(), "fanout-barrier")
+	t.Setenv(EnvUpdateBarrierEach, barrier)
+
+	repo := "t-fanout-adv-coalesce"
+	cacheDir := t.TempDir()
+	key, pemBlock := genKeyPEM(t, "ES256")
+	laneStore, laneBlob := openLaneStores(t)
+	st := &countingRefStore{Store: laneStore}
+	srv := &Server{
+		Store:    st,
+		Blob:     laneBlob,
+		CacheDir: cacheDir,
+		Verifier: auth.NewVerifier(memKeys{testOrg: {pemBlock}}),
+		Org:      testOrg,
+		ResolveRepo: func(_ context.Context, base string) (meta.Repo, bool) {
+			if base != repo {
+				return meta.Repo{}, false
+			}
+			return meta.Repo{RepoID: repo, URL: repo, DefaultBranch: "main"}, true
+		},
+	}
+	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(ts.Close)
+
+	work := initWorkRepo(t)
+	token := mintUnitToken(t, key, "ES256", unitClaims(testOrg, repo, auth.ScopeGitRead, auth.ScopeGitWrite))
+	url := strings.Replace(ts.URL, "http://", "http://t:"+token+"@", 1) + "/" + repo + ".git"
+	adv := func() {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodGet, ts.URL+"/"+repo+".git/info/refs?service=git-upload-pack", nil)
+		if err != nil {
+			t.Fatalf("build advertisement request: %v", err)
+		}
+		req.SetBasicAuth("t", token)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("advertisement: %v", err)
+		}
+		defer resp.Body.Close()
+		if _, err := io.Copy(io.Discard, resp.Body); err != nil || resp.StatusCode != http.StatusOK {
+			t.Fatalf("advertisement: status %d, read err %v", resp.StatusCode, err)
+		}
+	}
+
+	refs := []string{"refs/heads/f0", "refs/heads/f1", "refs/heads/f2", "refs/heads/f3"}
+	t.Cleanup(func() {
+		// Unwedge any still-parked hook if an assertion failed mid-loop.
+		for _, name := range refs {
+			_ = os.WriteFile(updateBarrierEachPath(barrier, name)+".release", nil, 0o644)
+		}
+	})
+	args := []string{"push", "--atomic", url}
+	for _, name := range refs {
+		args = append(args, "HEAD:"+name)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := tryGit(work, args...)
+		done <- err
+	}()
+
+	// git runs the update hooks strictly sequentially; each parks after
+	// its committed CAS (generation moved, claim appended). Advertise in
+	// every window: the first pays the one full scan and publishes the
+	// held marker, every later one must coalesce across the claimed
+	// range instead of rescanning.
+	var first int64
+	released := 0
+	for remaining := append([]string(nil), refs...); len(remaining) > 0; {
+		idx := -1
+		deadline := time.Now().Add(30 * time.Second)
+		for idx < 0 && time.Now().Before(deadline) {
+			for i, name := range remaining {
+				if _, err := os.Stat(updateBarrierEachPath(barrier, name) + ".ready"); err == nil {
+					idx = i
+					break
+				}
+			}
+			if idx < 0 {
+				time.Sleep(10 * time.Millisecond)
+			}
+		}
+		if idx < 0 {
+			t.Fatalf("no update hook parked (released %d of %d)", released, len(refs))
+		}
+		adv()
+		if released == 0 {
+			first = st.listPages.Load()
+			if first == 0 {
+				t.Fatal("first advertisement ran no paged scan")
+			}
+		} else if got := st.listPages.Load(); got != first {
+			t.Fatalf("advertisement between fanout CASes rescanned (%d -> %d pages); the claimed range must coalesce", first, got)
+		}
+		if err := os.WriteFile(updateBarrierEachPath(barrier, remaining[idx])+".release", nil, 0o644); err != nil {
+			t.Fatalf("release barrier: %v", err)
+		}
+		remaining = append(remaining[:idx], remaining[idx+1:]...)
+		released++
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("push: %v", err)
+	}
+	// Holds released by post-receive: the coalesced verdict is stale and
+	// the next advertisement heals with a fresh scan.
+	adv()
+	if got := st.listPages.Load(); got == first {
+		t.Fatal("post-push advertisement must rescan once the hold is released")
+	}
+}
+
+// TestHydrate_ExternalWriteDuringHookPhaseForcesRescan (issue #186
+// finding 5, the gap rule's e2e half): a generation bump NOBODY's live
+// hold claims — here a REST-style direct store write landing mid-push —
+// must force the healing rescan even though the fingerprint still
+// matches; the marker may never vouch for work it cannot attribute.
+func TestHydrate_ExternalWriteDuringHookPhaseForcesRescan(t *testing.T) {
+	t.Setenv("CODESTORAGE_PG_URL", dbURL)
+	t.Setenv("CODESTORAGE_S3_URL", blobURL)
+	t.Setenv("CODESTORAGE_TEST_MODE", "1")
+	barrier := filepath.Join(t.TempDir(), "gap-barrier")
+	t.Setenv(EnvUpdateBarrier, barrier)
+
+	repo := "t-external-gap-rescan"
+	cacheDir := t.TempDir()
+	key, pemBlock := genKeyPEM(t, "ES256")
+	laneStore, laneBlob := openLaneStores(t)
+	st := &countingRefStore{Store: laneStore}
+	srv := &Server{
+		Store:    st,
+		Blob:     laneBlob,
+		CacheDir: cacheDir,
+		Verifier: auth.NewVerifier(memKeys{testOrg: {pemBlock}}),
+		Org:      testOrg,
+		ResolveRepo: func(_ context.Context, base string) (meta.Repo, bool) {
+			if base != repo {
+				return meta.Repo{}, false
+			}
+			return meta.Repo{RepoID: repo, URL: repo, DefaultBranch: "main"}, true
+		},
+	}
+	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(ts.Close)
+
+	work := initWorkRepo(t)
+	token := mintUnitToken(t, key, "ES256", unitClaims(testOrg, repo, auth.ScopeGitRead, auth.ScopeGitWrite))
+	url := strings.Replace(ts.URL, "http://", "http://t:"+token+"@", 1) + "/" + repo + ".git"
+	adv := func() {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodGet, ts.URL+"/"+repo+".git/info/refs?service=git-upload-pack", nil)
+		if err != nil {
+			t.Fatalf("build advertisement request: %v", err)
+		}
+		req.SetBasicAuth("t", token)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("advertisement: %v", err)
+		}
+		defer resp.Body.Close()
+		body, err := io.ReadAll(resp.Body)
+		if err != nil || resp.StatusCode != http.StatusOK {
+			t.Fatalf("advertisement: status %d, read err %v, body %.500q", resp.StatusCode, err, string(body))
+		}
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := tryGit(work, "push", url, "HEAD:refs/heads/held")
+		done <- err
+	}()
+	waitForFile(t, barrier+".ready", 30*time.Second)
+
+	adv()
+	first := st.listPages.Load()
+	if first == 0 {
+		t.Fatal("first advertisement ran no paged scan")
+	}
+	// The unclaimed bump: a direct store write no live hold vouches for.
+	// The target object is the pushed commit — published and registered
+	// by pre-receive before any hook ran — so the healing sync can
+	// materialize the ref.
+	sha := revParse(t, work, "HEAD")
+	if _, err := laneStore.CASRef(context.Background(), repo, "refs/heads/external", ref.ZeroSHA, sha); err != nil {
+		t.Fatalf("external CASRef: %v", err)
+	}
+	adv()
+	if got := st.listPages.Load(); got == first {
+		t.Fatal("an unclaimed external write must force the healing rescan")
+	}
+
+	if err := os.WriteFile(barrier+".release", nil, 0o644); err != nil {
+		t.Fatalf("release barrier: %v", err)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("push: %v", err)
+	}
+}

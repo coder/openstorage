@@ -1383,14 +1383,19 @@ func TestLivePushHoldsKey_StatOnly(t *testing.T) {
 	if delta := after.TotalAlloc - before.TotalAlloc; delta > 1<<20 {
 		t.Fatalf("livePushHoldsKey allocated %d bytes across 10 calls over a 100k-name hold: it is reading content, not statting", delta)
 	}
-	// A refresher touch invalidates (mtime moves; near-future is live).
+	// A refresher touch must NOT invalidate (issue #186 finding 5):
+	// every hook of a fanout synchronously touches its hold's mtime, so
+	// a touch-sensitive key changed once per hook and no held marker
+	// could survive the very window range coalescing exists for. Touches
+	// are liveness maintenance; coverage changes are appends (size),
+	// rewrites (inode), and unlinks (absence + epoch), all still folded.
 	touched := time.Now().Add(time.Second)
 	if err := os.Chtimes(hold, touched, touched); err != nil {
 		t.Fatalf("chtimes: %v", err)
 	}
 	key3, ok := livePushHoldsKey(repoDir)
-	if !ok || key3 == key1 {
-		t.Fatal("refresher touch must change the fingerprint")
+	if !ok || key3 != key1 {
+		t.Fatal("a refresher touch is not a coverage change; the fingerprint must hold")
 	}
 	// An append invalidates (size moves).
 	f, err := os.OpenFile(hold, os.O_APPEND|os.O_WRONLY, 0o644)
@@ -1406,14 +1411,16 @@ func TestLivePushHoldsKey_StatOnly(t *testing.T) {
 		t.Fatal("hold append must change the fingerprint")
 	}
 	// Expiry (past the round-25 two-observation grace) drops the hold
-	// out — same key as no holds at all.
+	// out — same key as no holds at all. The first suspicious
+	// observation arms the reap marker but the hold stays LIVE, and a
+	// live hold's mtime is not folded: the key must hold steady.
 	past := time.Now().Add(-pushHoldTTL - time.Minute)
 	if err := os.Chtimes(hold, past, past); err != nil {
 		t.Fatalf("chtimes: %v", err)
 	}
 	keySuspect, ok := livePushHoldsKey(repoDir)
-	if !ok || keySuspect == key4 {
-		t.Fatal("the expired-looking observation must still change the fingerprint (mtime moved)")
+	if !ok || keySuspect != key4 {
+		t.Fatal("a still-live suspicious observation is not a coverage change; the fingerprint must hold")
 	}
 	markerPast := time.Now().Add(-pushHoldTTL/2 - time.Minute)
 	if err := os.Chtimes(hold+pushHoldReapSuffix, markerPast, markerPast); err != nil {

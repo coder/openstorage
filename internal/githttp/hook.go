@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -86,6 +87,13 @@ const (
 	// just-committed ref into the shared cache repo). Later invocations
 	// pass through untouched.
 	EnvUpdateBarrier = "CODESTORAGE_TEST_UPDATE_BARRIER"
+	// EnvUpdateBarrierEach is EnvUpdateBarrier's per-command variant: a
+	// handshake-path PREFIX at which EVERY update hook pauses after its
+	// committed authority CAS, each under a ref-derived suffix (issue
+	// #186 finding 5: the coalescing e2e lane interleaves advertisements
+	// BETWEEN a fanout's hook CASes, which the one-shot barrier cannot
+	// stage).
+	EnvUpdateBarrierEach = "CODESTORAGE_TEST_UPDATE_BARRIER_EACH"
 	// EnvPreReceiveBarrier holds a handshake-file path prefix; the first
 	// pre-receive to create <path>.ready pauses AFTER pack publication
 	// and BEFORE the deferred hold reservation (Codex round-23 security
@@ -1786,8 +1794,18 @@ func updateHook(ctx context.Context, args []string) (retErr error) {
 		if p := os.Getenv(EnvUpdateBarrier); p != "" {
 			pauseAtUpdateBarrier(p)
 		}
+		if p := os.Getenv(EnvUpdateBarrierEach); p != "" {
+			pauseAtUpdateBarrier(updateBarrierEachPath(p, refName))
+		}
 	}
 	return nil
+}
+
+// updateBarrierEachPath derives one ref's EnvUpdateBarrierEach handshake
+// path (hashed: ref names contain separators no flat handshake file can).
+func updateBarrierEachPath(prefix, refName string) string {
+	sum := sha256.Sum256([]byte(refName))
+	return prefix + "-" + hex.EncodeToString(sum[:8])
 }
 
 // pauseAtUpdateBarrier implements the EnvUpdateBarrier handshake: the first

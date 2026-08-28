@@ -3214,25 +3214,47 @@ func readGenerationMarker(repoPath string) (gen int64, head string, fresh bool, 
 // advertisement spam sustained repository-scale store reads. The held
 // marker records the scan's generation, HEAD target, and a fingerprint
 // of the exact live holds it skipped under; while all three are
-// unchanged a re-scan could only reproduce the same verdicts, so hydrate
-// serves the cache as-is. Any hold release, append, refresher touch, or
-// expiry changes the fingerprint and forces the healing re-scan the
-// suppression exists for.
+// unchanged — or the generation moved only through claimed, still-held
+// CASes (the range rule, issue #186 finding 5) — a re-scan could only
+// reproduce the same verdicts, so hydrate serves the cache as-is. Any
+// hold release, append, rewrite, or expiry changes the fingerprint and
+// forces the healing re-scan the suppression exists for.
 const heldGenerationMarker = "codestorage.generation.held"
 
+// holdFileID is one fingerprint-folded file observation: size plus the
+// (dev, inode) identity. Deliberately mtime-free — see the fold comment
+// in livePushHoldsKey (issue #186 finding 5).
+type holdFileID struct {
+	size     int64
+	dev, ino uint64
+}
+
+// absentHoldFile is the folded observation of a path with no file.
+var absentHoldFile = holdFileID{size: -1}
+
+// holdFileIdentity extracts the folded observation from a stat.
+func holdFileIdentity(fi os.FileInfo) holdFileID {
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	assertf(ok, "holdFileIdentity: non-syscall stat %T", fi.Sys())
+	return holdFileID{size: fi.Size(), dev: uint64(st.Dev), ino: uint64(st.Ino)}
+}
+
 // livePushHoldsKey fingerprints the repo's live push holds (path, size,
-// mtime of every unexpired hold file, hashed). ok=false on a read error
-// — callers must then neither publish nor honor a held marker.
+// dev+inode identity of every unexpired hold file and its tombstone
+// sidecar, hashed). ok=false on a read error — callers must then neither
+// publish nor honor a held marker.
 //
 // Stat-only, never reading hold CONTENTS (Codex round-23 security P2):
 // this runs once per authenticated advertisement while a held marker is
 // being validated, and the fingerprint the marker semantics need is
-// exactly the (path, size, mtime) set — every release, append, refresher
-// touch, or expiry changes it, and no content change can happen without
-// one of those. Parsing would re-read and re-split a 100k-name hold file
-// on EVERY advertisement against a paused push, per request, for work
-// whose answer the stats already carry. TTL handling mirrors the hold
-// readers: expired files drop out, far-future mtimes are clamped live.
+// exactly the (path, size, identity) set — every release, append,
+// rewrite, or expiry changes it, and no coverage change can happen
+// without one of those (refresher touches deliberately do NOT change it;
+// see the fold comment below, issue #186 finding 5). Parsing would
+// re-read and re-split a 100k-name hold file on EVERY advertisement
+// against a paused push, per request, for work whose answer the stats
+// already carry. TTL handling mirrors the hold readers: expired files
+// drop out, far-future mtimes are clamped live.
 func livePushHoldsKey(repoPath string) (string, bool) {
 	dir := filepath.Join(repoPath, pushHoldDir)
 	var key strings.Builder
@@ -3280,6 +3302,18 @@ func livePushHoldsKey(repoPath string) (string, bool) {
 	// cannot see it would keep vouching for skip verdicts the release
 	// invalidated. Same stat-only cost contract, same single listing as
 	// the holds themselves.
+	//
+	// The per-file fold is (size, dev, inode) IDENTITY, deliberately not
+	// mtime (issue #186 finding 5): every hook of a fanout synchronously
+	// touches its hold's mtime (refresher liveness, round-5 on #173), so
+	// an mtime-folding key changed once per hook and no held marker could
+	// survive the very window range coalescing exists for. Touches are
+	// liveness maintenance, never coverage changes; every actual coverage
+	// mutation is an append (size grows), a temp+rename rewrite (inode
+	// changes), or an unlink (absence — and a lifecycle epoch bump), so
+	// identity+size captures them all while staying touch-blind. mtime
+	// still gates LIVENESS (pushHoldLive above): an expiring hold leaves
+	// the key by omission, not by timestamp.
 	released := make(map[string]os.FileInfo)
 	for _, e := range entries {
 		if base, ok := strings.CutSuffix(e.Name(), pushHoldReleasedSuffix); ok && !e.IsDir() {
@@ -3288,8 +3322,7 @@ func livePushHoldsKey(repoPath string) (string, bool) {
 			}
 		}
 	}
-	type relStat struct{ size, mtime int64 }
-	reverify := make(map[string]relStat)
+	reverify := make(map[string]holdFileID)
 	for _, e := range entries {
 		if isPushHoldSidecar(e.Name()) || e.IsDir() {
 			continue
@@ -3313,13 +3346,14 @@ func livePushHoldsKey(repoPath string) (string, bool) {
 		// blind to releases landing during the reap window, letting
 		// bracketing keys certify a scan whose coverage changed mid-way.
 		owner := holdSidecarOwner(path)
-		rel := relStat{-1, -1}
+		rel := absentHoldFile
 		if ri, ok := released[owner]; ok {
-			rel = relStat{ri.Size(), ri.ModTime().UnixNano()}
+			rel = holdFileIdentity(ri)
 		}
-		reverify[path] = relStat{info.Size(), info.ModTime().UnixNano()}
+		id := holdFileIdentity(info)
+		reverify[path] = id
 		reverify[owner+pushHoldReleasedSuffix] = rel
-		fmt.Fprintf(&key, "%s\x00%d\x00%d\x00%d\x00%d\x01", path, info.Size(), info.ModTime().UnixNano(), rel.size, rel.mtime)
+		fmt.Fprintf(&key, "%s\x00%d\x00%d\x00%d\x00%d\x00%d\x00%d\x01", path, id.size, id.dev, id.ino, rel.size, rel.dev, rel.ino)
 	}
 	if testHookHoldsKeyPreClose != nil {
 		testHookHoldsKeyPreClose()
@@ -3349,13 +3383,12 @@ func livePushHoldsKey(repoPath string) (string, bool) {
 	// mutation visible before the snapshot completes refuses it; one
 	// landing after post-dates the snapshot entirely — the key is true
 	// at publication, and the very next validation recomputes over the
-	// changed (size, mtime), so a published marker cannot outlive the
-	// mutation it missed. Spurious refreshes (a refresher touch mid-
-	// snapshot) cost one conservative rescan.
+	// changed (size, dev, inode) identity, so a published marker cannot
+	// outlive the mutation it missed.
 	for spath, want := range reverify {
-		got := relStat{-1, -1}
+		got := absentHoldFile
 		if fi, err := os.Lstat(spath); err == nil {
-			got = relStat{fi.Size(), fi.ModTime().UnixNano()}
+			got = holdFileIdentity(fi)
 		} else if !errors.Is(err, os.ErrNotExist) {
 			return "", false
 		}
