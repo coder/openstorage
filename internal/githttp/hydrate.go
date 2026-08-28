@@ -1216,7 +1216,46 @@ func isPushHoldSidecar(name string) bool {
 // Best-effort like every caller: a failed removal leaves the TTL machinery
 // the bound.
 func removePushHoldFiles(holdPath string) {
-	_ = os.Remove(holdPath)
+	// Serialize with the reaper's quarantine window (Codex round-36
+	// security P2): a release racing it sees the hold path ABSENT,
+	// removes only sidecars, and the reaper's restore then resurrects a
+	// hold post-receive already released — kept alive indefinitely by
+	// the handler refresher while a non-reading client stalls the
+	// response copy. Under the reservation flock the release runs
+	// strictly before the window (normal removal) or strictly after it
+	// (removing the restored hold, or a no-op if the reaper unlinked).
+	// Best-effort like the removals below: without the lock the TTL
+	// machinery remains the bound.
+	if lock, err := flockExclusive(filepath.Dir(holdPath) + ".reserve.lock"); err == nil {
+		defer lock()
+	}
+	if _, err := os.Lstat(holdPath); err == nil {
+		// Bump only when a hold FILE is actually being removed (Codex
+		// round-33 security P2): every receive-pack mints a hold PATH,
+		// but rejected or malformed RPCs may never create the file, and
+		// this release still runs for them — an unconditional bump would
+		// let each tiny denied push invalidate the held-generation fast
+		// path and re-buy the full pack listing and ref paging under the
+		// hydrate lock for a live hold set that never changed. A
+		// never-created hold was never in any fingerprint listing, and
+		// sidecars are excluded from it.
+		//
+		// And bump BEFORE removing (Codex round-34 P2): a hold whose
+		// fail-closed create bump failed is visible with an UNCHANGED
+		// epoch, so letting this cleanup remove it with its own bump
+		// failing for the same cause would complete a transient lifecycle
+		// both fingerprint components are blind to — a hydration spanning
+		// it could publish a held marker for a set that changed mid-scan.
+		// A hold file therefore never transitions visible→absent without
+		// a successful epoch bump: on failure everything stays (the file
+		// keeps marking the fingerprint), and the TTL reap — which
+		// enforces the same bump-first rule — retires it once the epoch
+		// is writable again.
+		if bumpPushHoldEpoch(filepath.Dir(holdPath)) != nil {
+			return
+		}
+		_ = os.Remove(holdPath)
+	}
 	_ = os.RemoveAll(holdPath + pushHoldUnreservedSuffix)
 	_ = os.RemoveAll(holdPath + pushHoldVerifiedSuffix)
 	_ = os.Remove(holdPath + pushHoldScanSuffix)
@@ -1326,6 +1365,24 @@ func pushVerifiedDigest(name, old, new string) [sha256.Size]byte {
 func writePushVerifiedVerdicts(holdPath string, digests [][sha256.Size]byte) error {
 	if len(digests) == 0 {
 		return nil
+	}
+	// Anchor the sidecar to a live base hold (Codex round-35 P2): an
+	// all-JIT push reserves no names, so no hold file exists yet — and a
+	// PARENTLESS sidecar ages out on a single wall observation, letting a
+	// suspend/clock step plus any concurrent mint sweep delete the
+	// verdicts before the first hook consumed one. The empty hold covers
+	// no names (no peer conflicts, no skip verdicts — no epoch bump
+	// needed; its listing presence alone can only force conservative
+	// revalidation) but it lives on the refresher's clock with the
+	// two-observation expiry, and every release path already removes it
+	// together with its sidecars. O_CREATE without O_TRUNC: a reserved
+	// hold passes through untouched.
+	f, err := os.OpenFile(holdPath, os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
 	}
 	sort.Slice(digests, func(i, j int) bool { return bytes.Compare(digests[i][:], digests[j][:]) < 0 })
 	buf := make([]byte, 0, len(digests)*sha256.Size)
@@ -1471,6 +1528,15 @@ func sweepExpiredPushHolds(dir string) {
 	}
 }
 
+// Test seams: called (when non-nil) at interleaving points concurrency
+// tests cannot otherwise reach deterministically. Nil in production.
+var (
+	testHookReapAfterQuarantine  func()
+	testHookHoldsKeyMidSnapshot  func()
+	testHookRemoveHoldsPreRename func()
+	testHookRefreshBeforeLock    func()
+)
+
 // reapExpiredPushHold removes an expiry-verdict hold with the verdict and
 // the removal LINEARIZED at one rename (Codex round-31 P2 on #173): the
 // two-observation verdict and the unlink used to be separate filesystem
@@ -1486,14 +1552,64 @@ func sweepExpiredPushHolds(dir string) {
 // its sidecars. Crash leftovers behave as ordinary leaked holds and age
 // out through the same two-observation expiry.
 func reapExpiredPushHold(path string, observed time.Time) {
+	// The whole quarantine→verdict→restore/unlink window runs under the
+	// reservation flock that appendPushHolds' callers serialize on (Codex
+	// round-33 P1 on #173/#186): the quarantine rename removes the hold
+	// PATH, so a JIT or sidecar hook's reservePushHolds could otherwise
+	// recreate it with a NEW reservation that the restore rename below
+	// silently replaces — the hook then commits its CAS believing the ref
+	// is held, reopening the exact race this machinery closes. Try-lock
+	// only: a busy lock means reservations are in flight, so skip — the
+	// reap is best-effort and the next mint sweep retries.
+	lock, err := os.OpenFile(filepath.Dir(path)+".reserve.lock", os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return
+	}
+	defer func() { _ = lock.Close() }() // close releases the flock
+	if syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB) != nil {
+		return
+	}
 	quarantine := path + ".reaping"
 	if err := os.Rename(path, quarantine); err != nil {
 		return // released or already quarantined by a concurrent sweep
 	}
-	if qi, err := os.Stat(quarantine); err != nil || !qi.ModTime().Equal(observed) {
-		// An owner touch raced the verdict (or the stat failed — fail
-		// LIVE): put the hold back untouched.
-		_ = os.Rename(quarantine, path)
+	if testHookReapAfterQuarantine != nil {
+		testHookReapAfterQuarantine()
+	}
+	restore := func() { _ = os.Rename(quarantine, path) }
+	q, err := os.OpenFile(quarantine, os.O_WRONLY, 0)
+	if err != nil {
+		restore()
+		return
+	}
+	defer func() { _ = q.Close() }()
+	// Owner-liveness gate (Codex round-32 P2): every live refresher holds
+	// a SHARED flock on its hold's inode, so winning an exclusive
+	// non-blocking flock here proves no fd-owning refresher exists at
+	// this instant — kernel-arbitrated, closing the residual stat-to-
+	// unlink interval in which a resumed refresher's fd touch could
+	// still be discarded. Failing the lock means the owner is alive:
+	// restore, fail LIVE.
+	if err := syscall.Flock(int(q.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		restore()
+		return
+	}
+	// With the exclusive lock held, revalidate on the locked inode: any
+	// owner touch that landed before the lock left a newer mtime (fd
+	// touches follow the inode through the rename; path touches can only
+	// precede it) and restores the hold.
+	if qi, err := q.Stat(); err != nil || !qi.ModTime().Equal(observed) {
+		restore()
+		return
+	}
+	// Bump BEFORE the unlink (Codex round-34 P2, mirroring
+	// removePushHoldFiles): a hold file never transitions visible→absent
+	// without a successful epoch bump, or a transient lifecycle whose
+	// create bump also failed becomes invisible to the fingerprint. When
+	// the epoch cannot record the transition, restore the hold — it keeps
+	// marking the fingerprint by presence, and a later sweep retries.
+	if bumpPushHoldEpoch(filepath.Dir(path)) != nil {
+		restore()
 		return
 	}
 	_ = os.Remove(quarantine)
@@ -1511,6 +1627,51 @@ func pushHoldSidecarBase(name string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// pushHoldEpochSuffix names the hold-lifecycle epoch file, a SIBLING of
+// the hold directory (like the reserve lock) so hold readers never see it
+// as an entry. Every mutation of the live hold set rewrites it with fresh
+// randomness; livePushHoldsKey folds its content into the fingerprint so
+// equal bracketing snapshots prove no transient hold appeared and
+// vanished in between (Codex round-32 P2 — a directory mtime is blind to
+// lifecycles inside one coarse clock tick).
+const pushHoldEpochSuffix = ".epoch"
+
+// writeEpochFile is os.WriteFile behind a test seam: fault injection for
+// mid-write failures (round-35 P2) needs to be deterministic.
+var writeEpochFile = os.WriteFile
+
+// bumpPushHoldEpoch atomically rewrites dir's epoch file with fresh
+// randomness (temp + rename; concurrent bumps each land whole, last one
+// wins — only inequality with the previous value matters). Reservations
+// FAIL CLOSED on a failed bump: an unbumped create is exactly the
+// transition that would let a marker vouch for a set that was never
+// stable. Release-side callers stay best-effort — a net-zero lifecycle
+// always contains the fail-closed create bump, so a missed release bump
+// can only cause a conservative extra revalidation.
+func bumpPushHoldEpoch(dir string) error {
+	var buf [16]byte
+	if _, err := rand.Read(buf[:]); err != nil {
+		return err
+	}
+	tmp := dir + pushHoldEpochSuffix + ".tmp-" + hex.EncodeToString(buf[:8])
+	if err := writeEpochFile(tmp, []byte(hex.EncodeToString(buf[:])), 0o600); err != nil {
+		// Remove the temp on write failure too (Codex round-35 P2): these
+		// are SIBLINGS of the hold directory — no sweep ever visits them —
+		// and every retry picks a fresh random name, so a temp stranded by
+		// ENOSPC/EIO would accumulate forever, worsening the very storage
+		// condition that stranded it. Best-effort: an open() failure left
+		// nothing behind, and removal under the same fault at worst leaves
+		// what it found.
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, dir+pushHoldEpochSuffix); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
 }
 
 // appendPushHolds records names in the push's hold file with one append
@@ -1532,7 +1693,13 @@ func appendPushHolds(holdPath string, names []string) error {
 		_ = f.Close()
 		return err
 	}
-	return f.Close()
+	if err := f.Close(); err != nil {
+		return err
+	}
+	// Fail CLOSED on the epoch bump (round-32 P2): committing against an
+	// unbumped reservation is the one transition the ABA fingerprint
+	// cannot see.
+	return bumpPushHoldEpoch(filepath.Dir(holdPath))
 }
 
 // touchPushHold refreshes the hold file's TTL clock. Every hook of the
@@ -1573,8 +1740,58 @@ func startPushHoldRefresh(holdPath string) (stop func()) {
 	// refresher starts before the reservation creates the file.
 	var f *os.File
 	touch := func() {
+		if f != nil {
+			// A removePushHolds rewrite replaces the inode (temp +
+			// rename): detect the orphan and re-point at the current
+			// file so both the touches and the liveness lock (below)
+			// keep covering the visible hold.
+			if fi, err := f.Stat(); err != nil || fi.Sys().(*syscall.Stat_t).Nlink == 0 {
+				_ = f.Close()
+				f = nil
+			}
+		}
 		if f == nil {
-			f, _ = os.OpenFile(holdPath, os.O_WRONLY, 0)
+			// Establish the fd and its shared lock ATOMICALLY with
+			// respect to reapers, under the reservation flock (Codex
+			// round-36 P2): merely retrying a lost LOCK_SH (round 34)
+			// still left the CURRENT reap unopposed — a reaper could
+			// quarantine and win its exclusive lock between this open
+			// and the LOCK_SH below, then unlink a live reservation
+			// while the only fallback was an ENOENT path touch. The reap
+			// window holds the same lock, so an open that succeeds here
+			// is always followed by a LOCK_SH no reaper can interleave.
+			// Try-lock only: a busy lock (a peer's reservation scan, a
+			// reap on another hold) skips to the next tick — the path
+			// touches below keep the mtime fresh, which alone keeps
+			// expiry ineligible on a sane clock; fd-less owners keep the
+			// mtime revalidation as their bound.
+			if lock, lerr := os.OpenFile(filepath.Dir(holdPath)+".reserve.lock", os.O_CREATE|os.O_RDWR, 0o644); lerr == nil {
+				if syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB) == nil {
+					f, _ = os.OpenFile(holdPath, os.O_WRONLY, 0)
+					if testHookRefreshBeforeLock != nil {
+						testHookRefreshBeforeLock()
+					}
+					if f != nil {
+						// The shared flock is the owner-liveness beacon
+						// (Codex round-32 P2): the expiry reaper unlinks
+						// a quarantined hold only after WINNING an
+						// exclusive flock on its inode, so as long as
+						// this fd lives, no interleaving of stats,
+						// touches, and renames can discard the hold —
+						// kernel-arbitrated, no timing anywhere. Losing
+						// it here is impossible for a reaper (it needs
+						// the reservation lock this tick holds); close
+						// and retry against anything more exotic (Codex
+						// round-34 P2: an unlocked fd must never
+						// persist).
+						if syscall.Flock(int(f.Fd()), syscall.LOCK_SH|syscall.LOCK_NB) != nil {
+							_ = f.Close()
+							f = nil
+						}
+					}
+				}
+				_ = lock.Close() // close releases the flock when held
+			}
 		}
 		if f != nil {
 			now := syscall.NsecToTimeval(time.Now().UnixNano())
@@ -2130,14 +2347,24 @@ func reservePushHolds(ctx context.Context, holdPath string, names []string) erro
 // or the new set, never a truncated one; the temp lives in the hold
 // directory under a hold-like name, so a reader that catches it merely
 // double-counts our remaining names for one poll (over-holding, the safe
-// direction) and the TTL sweep collects it if we crash mid-rename. No lock
-// is needed: only this push's processes write this file, and git runs
-// pre-receive strictly before the update hooks that append to it.
+// direction) and the TTL sweep collects it if we crash mid-rename. Only
+// this push's processes write this file (git runs pre-receive strictly
+// before the update hooks that append to it), but the rewrite runs under
+// the reservation flock anyway (Codex round-36 P2): the expiry reaper's
+// quarantine window holds that lock, and an unserialized read → rename
+// straddling the window would let the reaper's restore rename the OLD
+// full file over the reduced replacement, silently resurrecting every
+// released name for the rest of the push.
 func removePushHolds(holdPath string, names []string) error {
 	drop := make(map[string]bool, len(names))
 	for _, name := range names {
 		drop[name] = true
 	}
+	unlock, err := flockExclusive(filepath.Dir(holdPath) + ".reserve.lock")
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	b, err := os.ReadFile(holdPath)
 	if err != nil {
 		return err
@@ -2153,7 +2380,24 @@ func removePushHolds(holdPath string, names []string) error {
 	if err := os.WriteFile(tmp, []byte(keep.String()), 0o644); err != nil {
 		return err
 	}
-	return os.Rename(tmp, holdPath)
+	if testHookRemoveHoldsPreRename != nil {
+		testHookRemoveHoldsPreRename()
+	}
+	// Bump BEFORE the replacement lands (Codex round-36 P2, mirroring the
+	// removal invariant of removePushHoldFiles): the partial rewrite is a
+	// hold-set mutation like any other, and replacing the contents with
+	// the bump lost lets bracketing snapshots fingerprint identically
+	// under coarse timestamp granularity. When the epoch cannot record
+	// the transition, retain the old contents — over-holding, the safe
+	// direction, bounded by the TTL machinery.
+	if err := bumpPushHoldEpoch(filepath.Dir(holdPath)); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, holdPath); err != nil {
+		return err
+	}
+	return nil
 }
 
 // Generation marker (issue #4): the store's per-repo mutation generation
@@ -2229,11 +2473,44 @@ const heldGenerationMarker = "codestorage.generation.held"
 // readers: expired files drop out, far-future mtimes are clamped live.
 func livePushHoldsKey(repoPath string) (string, bool) {
 	dir := filepath.Join(repoPath, pushHoldDir)
+	var key strings.Builder
+	// The lifecycle epoch makes equal endpoint snapshots proof of a
+	// STABLE hold set (Codex round-32 P2): per-entry stats alone are
+	// ABA-blind — a hold created and released entirely between the
+	// bracketing scans (a transient stale-base push) would let a sync
+	// that skipped its ref publish a held marker vouching for a hold set
+	// that was never stable. Every hold mutator rewrites the epoch file
+	// with fresh randomness (bumpPushHoldEpoch), so any lifecycle
+	// transition inside the bracket changes the key — clock-granularity
+	// independent, unlike a directory mtime. The tiny read stays within
+	// the stat-only cost contract.
+	//
+	// Read BEFORE the directory listing (Codex round-33 P2) and AGAIN
+	// after it (round-35 P2), seqlock-style: with a single read on either
+	// side of the listing, a transient lifecycle straddling the gap can
+	// hand this snapshot a mixed generation — an epoch from before the
+	// lifecycle with a listing from after it (or vice versa) reproduces a
+	// bracketing key despite the hold set having changed mid-scan. Equal
+	// bracketing reads prove the epoch was stable across the whole
+	// snapshot; inequality refuses it (ok=false), which every caller
+	// treats as "neither publish nor honor a held marker" — the
+	// conservative direction, costing one extra revalidation.
+	epoch, err := os.ReadFile(dir + pushHoldEpochSuffix)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return "", false
+		}
+		epoch = nil
+	}
+	key.Write(epoch)
+	key.WriteByte('\x01')
+	if testHookHoldsKeyMidSnapshot != nil {
+		testHookHoldsKeyMidSnapshot()
+	}
 	entries, err := os.ReadDir(dir)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return "", false
 	}
-	var key strings.Builder
 	for _, e := range entries {
 		if isPushHoldSidecar(e.Name()) || e.IsDir() {
 			continue
@@ -2250,6 +2527,19 @@ func livePushHoldsKey(repoPath string) (string, bool) {
 			continue
 		}
 		fmt.Fprintf(&key, "%s\x00%d\x00%d\x01", path, info.Size(), info.ModTime().UnixNano())
+	}
+	// The closing seqlock read (round-35 P2, see above): any epoch bump
+	// that landed between the two reads means the listing may belong to
+	// neither generation — refuse the snapshot.
+	epoch2, err := os.ReadFile(dir + pushHoldEpochSuffix)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return "", false
+		}
+		epoch2 = nil
+	}
+	if !bytes.Equal(epoch, epoch2) {
+		return "", false
 	}
 	sum := sha256.Sum256([]byte(key.String()))
 	return hex.EncodeToString(sum[:]), true

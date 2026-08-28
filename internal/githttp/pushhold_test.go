@@ -17,6 +17,8 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -1832,6 +1834,794 @@ func TestPushHoldRefresh_FollowsInodeAcrossRename(t *testing.T) {
 			t.Fatal("refresher touches do not follow the inode across a rename")
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TestReapExpiredPushHold_RestoresLockedHold (Codex round-32 P2 on
+// #173): the reaper must not unlink a quarantined hold whose owner is
+// still alive even when the mtime revalidation matches — a resumed
+// refresher's fd touch could land between the stat and the unlink. Every
+// live refresher holds a SHARED flock on the hold's inode, and the
+// reaper deletes only after winning an EXCLUSIVE non-blocking flock, so
+// the kernel arbitrates the race with no timing window at all.
+func TestReapExpiredPushHold_RestoresLockedHold(t *testing.T) {
+	dir := t.TempDir()
+	hold := filepath.Join(dir, "push-locked")
+	if err := os.WriteFile(hold, []byte("refs/heads/x\n"), 0o600); err != nil {
+		t.Fatalf("write hold: %v", err)
+	}
+	old := time.Now().Add(-2 * pushHoldTTL)
+	if err := os.Chtimes(hold, old, old); err != nil {
+		t.Fatalf("age hold: %v", err)
+	}
+	info, err := os.Stat(hold)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	f, err := os.OpenFile(hold, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer f.Close()
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_SH|syscall.LOCK_NB); err != nil {
+		t.Fatalf("flock: %v", err)
+	}
+	// mtime matches the observation exactly, yet the live owner's shared
+	// lock must veto the unlink.
+	reapExpiredPushHold(hold, info.ModTime())
+	if _, err := os.Stat(hold); err != nil {
+		t.Fatalf("locked hold must survive the reap at its original path: %v", err)
+	}
+	// Released lock: the same reap now completes.
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_UN); err != nil {
+		t.Fatalf("unlock: %v", err)
+	}
+	reapExpiredPushHold(hold, info.ModTime())
+	if _, err := os.Stat(hold); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("unlocked untouched leak must be unlinked")
+	}
+}
+
+// TestReapExpiredPushHold_ReservationDuringQuarantineSurvives (Codex
+// round-33 P1 on #173/#186): while a live hold sits in quarantine, a JIT
+// or sidecar hook's reservePushHolds can recreate the hold path and
+// append a NEW reservation — and the reaper's restore rename would
+// silently replace that file, discarding a reservation whose hook then
+// commits its CAS believing the ref is held, reopening the hydration
+// race. The reap must run under the same reservation flock the append
+// path serializes on, so a mid-quarantine reservation lands strictly
+// before the quarantine or strictly after the restore — never underneath
+// it.
+func TestReapExpiredPushHold_ReservationDuringQuarantineSurvives(t *testing.T) {
+	repoDir := t.TempDir()
+	dir := filepath.Join(repoDir, pushHoldDir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	hold := filepath.Join(dir, "push-quarantine-race")
+	if err := os.WriteFile(hold, []byte("refs/heads/x\n"), 0o600); err != nil {
+		t.Fatalf("write hold: %v", err)
+	}
+	old := time.Now().Add(-2 * pushHoldTTL)
+	if err := os.Chtimes(hold, old, old); err != nil {
+		t.Fatalf("age hold: %v", err)
+	}
+	info, err := os.Stat(hold)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	// A live owner: the refresher's shared liveness flock vetoes the
+	// unlink, forcing the reaper down the RESTORE path.
+	f, err := os.OpenFile(hold, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer f.Close()
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_SH|syscall.LOCK_NB); err != nil {
+		t.Fatalf("flock: %v", err)
+	}
+	// Mid-quarantine, the push's own hook reserves an additional name.
+	// Unfixed, the reservation recreates the hold path and completes
+	// immediately; fixed, it blocks on the reservation flock until the
+	// reap finishes (the 200ms timeout lets the reaper proceed).
+	done := make(chan error, 1)
+	testHookReapAfterQuarantine = func() {
+		go func() { done <- reservePushHolds(context.Background(), hold, []string{"refs/heads/new"}) }()
+		select {
+		case err := <-done:
+			done <- err
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+	defer func() { testHookReapAfterQuarantine = nil }()
+	reapExpiredPushHold(hold, info.ModTime())
+	if err := <-done; err != nil {
+		t.Fatalf("mid-quarantine reservation: %v", err)
+	}
+	b, err := os.ReadFile(hold)
+	if err != nil {
+		t.Fatalf("read hold: %v", err)
+	}
+	for _, name := range []string{"refs/heads/x\n", "refs/heads/new\n"} {
+		if !strings.Contains(string(b), name) {
+			t.Fatalf("restore discarded a reservation: hold = %q, want %q", b, name)
+		}
+	}
+	if _, err := os.Stat(hold + ".reaping"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("quarantine must not linger after a restore")
+	}
+}
+
+// TestPushHoldRefresh_HoldsLivenessLock (Codex round-32 P2 on #173): the
+// refresher must hold the shared liveness flock the reaper's exclusive
+// lock checks against — without it the kernel gate above protects
+// nothing.
+func TestPushHoldRefresh_HoldsLivenessLock(t *testing.T) {
+	dir := t.TempDir()
+	hold := filepath.Join(dir, "push-lock-beacon")
+	if err := os.WriteFile(hold, []byte("refs/heads/x\n"), 0o600); err != nil {
+		t.Fatalf("write hold: %v", err)
+	}
+	stop := startPushHoldRefresh(hold)
+	f, err := os.OpenFile(hold, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer f.Close()
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err == nil {
+		t.Fatal("exclusive flock must fail while the refresher lives")
+	}
+	stop()
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		t.Fatalf("exclusive flock must succeed after the refresher stops: %v", err)
+	}
+}
+
+// TestLivePushHoldsKey_TransientHoldChangesKey (Codex round-32 P2 on
+// #173): equal per-entry endpoint snapshots are ABA-blind to a hold
+// reserved and released entirely between them — a sync that skipped that
+// transient hold's ref would publish a held marker vouching for a hold
+// set that was never stable. Every hold mutator rewrites the lifecycle
+// epoch file with fresh randomness (a directory mtime cannot serve: a
+// full lifecycle inside one coarse clock tick leaves it unchanged), so
+// the transient lifecycle changes the key.
+func TestLivePushHoldsKey_TransientHoldChangesKey(t *testing.T) {
+	repoDir := t.TempDir()
+	dir := filepath.Join(repoDir, pushHoldDir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "push-steady"), []byte("refs/heads/x\n"), 0o600); err != nil {
+		t.Fatalf("write hold: %v", err)
+	}
+	key1, ok := livePushHoldsKey(repoDir)
+	if !ok {
+		t.Fatal("livePushHoldsKey failed")
+	}
+	transient := filepath.Join(dir, "push-transient")
+	if err := reservePushHolds(context.Background(), transient, []string{"refs/heads/y"}); err != nil {
+		t.Fatalf("reserve transient hold: %v", err)
+	}
+	removePushHoldFiles(transient)
+	key2, ok := livePushHoldsKey(repoDir)
+	if !ok {
+		t.Fatal("livePushHoldsKey failed")
+	}
+	if key1 == key2 {
+		t.Fatal("a transient hold lifecycle between snapshots must change the key")
+	}
+	// With no further lifecycle transitions the key is stable — the
+	// marker machinery depends on unchanged sets fingerprinting equal.
+	key3, ok := livePushHoldsKey(repoDir)
+	if !ok || key3 != key2 {
+		t.Fatalf("key unstable without lifecycle transitions: %q vs %q", key3, key2)
+	}
+}
+
+// TestLivePushHoldsKey_MidSnapshotTransientChangesKey (Codex round-33 P2
+// on #173/#186): one snapshot's directory listing and epoch read are two
+// reads with a gap. Listing FIRST let a transient hold slip between them
+// — the pre-scan lists the old set yet reads the post-create epoch, and
+// when the release's explicitly best-effort bump is lost, the post-scan
+// reproduces exactly that mixed-generation key: a held marker publishes
+// for a hold set that changed mid-scan. Reading the epoch BEFORE the
+// listing closes it — the fail-closed create bump then lands strictly
+// after the pre-scan's epoch read, so the bracketing keys differ even
+// with the release bump lost.
+func TestLivePushHoldsKey_MidSnapshotTransientChangesKey(t *testing.T) {
+	repoDir := t.TempDir()
+	dir := filepath.Join(repoDir, pushHoldDir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := bumpPushHoldEpoch(dir); err != nil {
+		t.Fatalf("seed epoch: %v", err)
+	}
+	testHookHoldsKeyMidSnapshot = func() {
+		transient := filepath.Join(dir, "push-transient")
+		if err := reservePushHolds(context.Background(), transient, []string{"refs/heads/y"}); err != nil {
+			t.Errorf("reserve transient hold: %v", err)
+		}
+		// Release with the best-effort epoch bump LOST (delayed past the
+		// post-scan or failed): a raw unlink, exactly what the reviewer's
+		// trace requires.
+		if err := os.Remove(transient); err != nil {
+			t.Errorf("remove transient hold: %v", err)
+		}
+	}
+	key1, ok1 := livePushHoldsKey(repoDir)
+	testHookHoldsKeyMidSnapshot = nil
+	key2, ok2 := livePushHoldsKey(repoDir)
+	if !ok2 {
+		t.Fatal("livePushHoldsKey must succeed on a quiet hold set")
+	}
+	// Safe outcomes for the straddled snapshot: refused outright (the
+	// round-35 seqlock detects the mid-snapshot bump) or a key that can
+	// never equal the stable one. Equal keys are the bug.
+	if ok1 && key1 == key2 {
+		t.Fatal("a transient lifecycle inside one snapshot must change the key")
+	}
+}
+
+// TestRemovePushHoldFiles_NoopReleaseKeepsKey (Codex round-33 security
+// P2 on #173/#186): every receive-pack mints a hold PATH, but rejected or
+// malformed RPCs may never create the FILE — and every such request still
+// runs the release. An unconditional epoch bump there let each tiny
+// denied push invalidate the held-generation fast path, re-buying the
+// full pack listing and ref paging under the hydrate lock for a live
+// hold set that never changed: repository-scale work amplification from
+// requests that did no work. A never-created hold was never in any
+// fingerprint listing (and sidecars are excluded from it), so a no-op
+// release must leave the key untouched; a REAL removal must keep
+// changing it.
+func TestRemovePushHoldFiles_NoopReleaseKeepsKey(t *testing.T) {
+	repoDir := t.TempDir()
+	dir := filepath.Join(repoDir, pushHoldDir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := bumpPushHoldEpoch(dir); err != nil {
+		t.Fatalf("seed epoch: %v", err)
+	}
+	key1, ok := livePushHoldsKey(repoDir)
+	if !ok {
+		t.Fatal("livePushHoldsKey failed")
+	}
+	removePushHoldFiles(filepath.Join(dir, "push-never-created"))
+	key2, ok := livePushHoldsKey(repoDir)
+	if !ok {
+		t.Fatal("livePushHoldsKey failed")
+	}
+	if key1 != key2 {
+		t.Fatal("releasing a never-created hold must not change the holds key")
+	}
+	// Non-vacuity: an actual removal still bumps — the ABA property the
+	// epoch exists for (see TestLivePushHoldsKey_TransientHoldChangesKey).
+	hold := filepath.Join(dir, "push-real")
+	if err := os.WriteFile(hold, []byte("refs/heads/x\n"), 0o600); err != nil {
+		t.Fatalf("write hold: %v", err)
+	}
+	epochBefore, err := os.ReadFile(dir + pushHoldEpochSuffix)
+	if err != nil {
+		t.Fatalf("read epoch: %v", err)
+	}
+	removePushHoldFiles(hold)
+	epochAfter, err := os.ReadFile(dir + pushHoldEpochSuffix)
+	if err != nil {
+		t.Fatalf("read epoch: %v", err)
+	}
+	if string(epochBefore) == string(epochAfter) {
+		t.Fatal("removing an existing hold must bump the epoch")
+	}
+}
+
+// TestRemovePushHoldFiles_NoRemovalWithoutEpochBump (Codex round-34 P2 on
+// #173/#186): appendPushHolds fails a push closed when its epoch bump
+// fails, but the hold FILE is already visible by then — and the error
+// cleanup used to remove it with its own bump failing for the same
+// cause. A hydration bracketing that transient lifecycle would see
+// identical pre/post keys (same epoch, same empty listing) despite
+// having skipped the held ref mid-scan, publishing a stale held marker.
+// The invariant: a hold file never transitions visible→absent without a
+// SUCCESSFUL epoch bump — on failure the file stays, and while it lives
+// it is part of every fingerprint listing.
+func TestRemovePushHoldFiles_NoRemovalWithoutEpochBump(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("directory write permissions do not bind root")
+	}
+	repoDir := t.TempDir()
+	dir := filepath.Join(repoDir, pushHoldDir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := bumpPushHoldEpoch(dir); err != nil {
+		t.Fatalf("seed epoch: %v", err)
+	}
+	key1, ok := livePushHoldsKey(repoDir)
+	if !ok {
+		t.Fatal("livePushHoldsKey failed")
+	}
+	// The epoch is a SIBLING of the hold directory: an unwritable repo
+	// root with a writable hold directory is exactly the split the
+	// reviewer's trace needs (bump fails, hold write succeeds).
+	if err := os.Chmod(repoDir, 0o555); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(repoDir, 0o755) })
+	hold := filepath.Join(dir, "push-bumpless")
+	if err := appendPushHolds(hold, []string{"refs/heads/x"}); err == nil {
+		t.Fatal("appendPushHolds must fail closed when the epoch bump fails")
+	}
+	if _, err := os.Stat(hold); err != nil {
+		t.Fatalf("hold must be visible after the failed reservation: %v", err)
+	}
+	removePushHoldFiles(hold) // the pre-receive error cleanup
+	if _, err := os.Stat(hold); err != nil {
+		t.Fatalf("a hold must not vanish without a successful epoch bump: %v", err)
+	}
+	key2, ok := livePushHoldsKey(repoDir)
+	if !ok {
+		t.Fatal("livePushHoldsKey failed")
+	}
+	if key1 == key2 {
+		t.Fatal("the transient lifecycle must be visible in the fingerprint")
+	}
+	// Once the epoch can record the transition again, the release goes
+	// through and changes the key once more.
+	if err := os.Chmod(repoDir, 0o755); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	removePushHoldFiles(hold)
+	if _, err := os.Stat(hold); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("release must remove the hold once the bump succeeds: %v", err)
+	}
+	key3, ok := livePushHoldsKey(repoDir)
+	if !ok {
+		t.Fatal("livePushHoldsKey failed")
+	}
+	if key3 == key2 {
+		t.Fatal("the successful release must change the key")
+	}
+}
+
+// TestReapExpiredPushHold_NoUnlinkWithoutEpochBump (Codex round-34 P2 on
+// #173/#186): the expiry reap enforces the same rule as the release —
+// bump BEFORE unlink, restore the quarantined hold when the epoch cannot
+// record the transition. A later sweep retries once the epoch is
+// writable again.
+func TestReapExpiredPushHold_NoUnlinkWithoutEpochBump(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("directory write permissions do not bind root")
+	}
+	repoDir := t.TempDir()
+	dir := filepath.Join(repoDir, pushHoldDir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := bumpPushHoldEpoch(dir); err != nil {
+		t.Fatalf("seed epoch: %v", err)
+	}
+	// Pre-create the reserve lock: the reaper serializes with reservers
+	// (round-33 P1), and O_CREATE under a read-only repo root would
+	// otherwise short-circuit the reap before the behavior under test.
+	if f, err := os.Create(dir + ".reserve.lock"); err != nil {
+		t.Fatalf("create reserve lock: %v", err)
+	} else {
+		_ = f.Close()
+	}
+	hold := filepath.Join(dir, "push-bumpless-reap")
+	if err := os.WriteFile(hold, []byte("refs/heads/x\n"), 0o600); err != nil {
+		t.Fatalf("write hold: %v", err)
+	}
+	expireHold(t, hold)
+	info, err := os.Stat(hold)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if err := os.Chmod(repoDir, 0o555); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(repoDir, 0o755) })
+	reapExpiredPushHold(hold, info.ModTime())
+	if _, err := os.Stat(hold); err != nil {
+		t.Fatalf("an expired hold must survive a reap whose epoch bump fails: %v", err)
+	}
+}
+
+// TestPushHoldRefresh_RetriesLostLivenessLock (Codex round-34 P2 on
+// #173/#186): the refresher's shared flock is best-effort per ATTEMPT but
+// must not be best-effort per LIFETIME. If the reaper's exclusive lock
+// wins the race against a freshly opened refresher fd, ignoring the
+// failed LOCK_SH would leave the refresher touching an unprotected fd
+// forever — the reaper's stat can then precede the Futimes and unlink a
+// live hold. A failed shared lock must close the descriptor and retry on
+// a later touch, re-establishing the liveness beacon.
+func TestPushHoldRefresh_RetriesLostLivenessLock(t *testing.T) {
+	oldTTL := pushHoldTTL
+	pushHoldTTL = 200 * time.Millisecond
+	t.Cleanup(func() { pushHoldTTL = oldTTL })
+	dir := t.TempDir()
+	hold := filepath.Join(dir, "push-lock-retry")
+	if err := os.WriteFile(hold, []byte("refs/heads/x\n"), 0o600); err != nil {
+		t.Fatalf("write hold: %v", err)
+	}
+	// A reaper mid-verdict: exclusive lock held while the refresher's
+	// first touch opens its fd, so the refresher's LOCK_SH loses.
+	blocker, err := os.OpenFile(hold, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := syscall.Flock(int(blocker.Fd()), syscall.LOCK_EX); err != nil {
+		t.Fatalf("flock: %v", err)
+	}
+	stop := startPushHoldRefresh(hold)
+	defer stop()
+	_ = blocker.Close() // reaper done (hold restored); lock released
+	// The refresher must re-acquire the shared lock on a later touch:
+	// an exclusive probe then fails while the refresher lives.
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		probe, err := os.OpenFile(hold, os.O_WRONLY, 0)
+		if err != nil {
+			t.Fatalf("open probe: %v", err)
+		}
+		lockErr := syscall.Flock(int(probe.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		_ = probe.Close()
+		if lockErr != nil {
+			return // shared lock re-established — refresher is protected
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("refresher never re-acquired its liveness lock after losing the race")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// TestLivePushHoldsKey_MidSnapshotLifecycleDetectedAfterListing (Codex
+// round-35 P2 on #173/#186): reading the epoch only BEFORE the listing
+// still lets the post-scan mix generations — a reservation can write its
+// hold after this key's epoch read (its create bump still pending), the
+// ref sync skips the held ref, and by the time this key lists the
+// directory the push has failed its CAS and cleanup has bumped and
+// removed the hold: the listing is empty and the already-read epoch is
+// the OLD one, reproducing the pre-scan key. The key must re-read the
+// epoch after the listing and refuse the snapshot (ok=false) when the
+// two reads differ — callers treat that as "neither publish nor honor",
+// the conservative direction.
+func TestLivePushHoldsKey_MidSnapshotLifecycleDetectedAfterListing(t *testing.T) {
+	repoDir := t.TempDir()
+	dir := filepath.Join(repoDir, pushHoldDir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := bumpPushHoldEpoch(dir); err != nil {
+		t.Fatalf("seed epoch: %v", err)
+	}
+	key1, ok := livePushHoldsKey(repoDir)
+	if !ok {
+		t.Fatal("livePushHoldsKey failed")
+	}
+	// Between the post-scan's epoch read and its listing: the transient
+	// hold's full lifecycle completes, late create bump and cleanup bump
+	// included.
+	testHookHoldsKeyMidSnapshot = func() {
+		hold := filepath.Join(dir, "push-transient-late-bump")
+		if err := os.WriteFile(hold, []byte("refs/heads/y\n"), 0o600); err != nil {
+			t.Errorf("write hold: %v", err)
+		}
+		if err := bumpPushHoldEpoch(dir); err != nil {
+			t.Errorf("late create bump: %v", err)
+		}
+		if err := os.Remove(hold); err != nil {
+			t.Errorf("remove hold: %v", err)
+		}
+		if err := bumpPushHoldEpoch(dir); err != nil {
+			t.Errorf("cleanup bump: %v", err)
+		}
+	}
+	key2, ok := livePushHoldsKey(repoDir)
+	testHookHoldsKeyMidSnapshot = nil
+	if ok && key2 == key1 {
+		t.Fatal("a lifecycle between the epoch read and the listing must not reproduce the old key")
+	}
+	// And once the set is quiet again, the key must be obtainable.
+	if _, ok := livePushHoldsKey(repoDir); !ok {
+		t.Fatal("livePushHoldsKey must succeed on a quiet hold set")
+	}
+}
+
+// TestBumpPushHoldEpoch_RemovesTempOnWriteFailure (Codex round-35 P2 on
+// #173/#186): the epoch temporaries are SIBLINGS of the hold directory,
+// invisible to every sweep, and each attempt picks a fresh random name —
+// a temp left behind by a failed write (ENOSPC/EIO mid-write or close)
+// would accumulate forever, worsening the very storage condition that
+// stranded it. Every error path must remove the temp it created.
+func TestBumpPushHoldEpoch_RemovesTempOnWriteFailure(t *testing.T) {
+	repoDir := t.TempDir()
+	dir := filepath.Join(repoDir, pushHoldDir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	oldWrite := writeEpochFile
+	writeEpochFile = func(name string, data []byte, perm os.FileMode) error {
+		// A partial write followed by the error — what a full volume
+		// leaves behind.
+		_ = os.WriteFile(name, data[:4], perm)
+		return errors.New("injected: no space left on device")
+	}
+	t.Cleanup(func() { writeEpochFile = oldWrite })
+	if err := bumpPushHoldEpoch(dir); err == nil {
+		t.Fatal("bump must fail when the temp write fails")
+	}
+	entries, err := os.ReadDir(repoDir)
+	if err != nil {
+		t.Fatalf("readdir: %v", err)
+	}
+	for _, e := range entries {
+		if strings.Contains(e.Name(), pushHoldEpochSuffix+".tmp-") {
+			t.Fatalf("failed bump left temp file behind: %s", e.Name())
+		}
+	}
+}
+
+// TestWritePushVerifiedVerdicts_SurvivesSweepWithoutReservations (Codex
+// round-35 P2 on #173/#186): an all-JIT push reserves no names, so no
+// hold file exists — persisting its pack-path verdicts used to write a
+// PARENTLESS `.verified` sidecar. Orphan sidecars age out on a single
+// wall observation, so a host suspend or forward clock step followed by
+// any other push's mint sweep deleted the verdicts before the first
+// update hook consumed them — re-charging the walk budget for every
+// evaluation, the exact exhaustion the persistence exists to prevent.
+// The sidecar must be anchored to a base hold file that lives on the
+// refresher's clock with two-observation expiry.
+func TestWritePushVerifiedVerdicts_SurvivesSweepWithoutReservations(t *testing.T) {
+	repoDir := t.TempDir()
+	dir := filepath.Join(repoDir, pushHoldDir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	hold := filepath.Join(dir, "push-jit-only")
+	oldSHA, newSHA := strings.Repeat("0", 40), strings.Repeat("1", 40)
+	digests := [][sha256.Size]byte{pushVerifiedDigest("refs/heads/a", oldSHA, newSHA)}
+	if err := writePushVerifiedVerdicts(hold, digests); err != nil {
+		t.Fatalf("write verdicts: %v", err)
+	}
+	// A suspend/forward clock step: every file of the push looks ancient
+	// at once (ENOENT Chtimes are no-ops for whichever files each
+	// implementation maintains).
+	old := time.Now().Add(-2 * pushHoldTTL)
+	_ = os.Chtimes(hold, old, old)
+	_ = os.Chtimes(hold+pushHoldVerifiedSuffix, old, old)
+	sweepExpiredPushHolds(dir) // another push's mint sweep
+	if !pushVerifiedVerdict(hold, "refs/heads/a", oldSHA, newSHA) {
+		t.Fatal("verified verdicts must survive one sweep observation after a clock anomaly")
+	}
+}
+
+// TestRemovePushHolds_SurvivesConcurrentReapRestore (Codex round-36 P2
+// on #173/#186): the partial rewrite (read → reduced temp → rename into
+// holdPath) can straddle a reaper's quarantine window — the read lands
+// before the quarantine rename, the replacement rename lands during it,
+// and the reaper's restore (a live refresher's shared flock vetoed the
+// unlink) then renames the OLD full file over the replacement, silently
+// resurrecting every released name until receive-pack exits. The rewrite
+// must run under the same reservation flock as the reaper's window.
+func TestRemovePushHolds_SurvivesConcurrentReapRestore(t *testing.T) {
+	repoDir := t.TempDir()
+	dir := filepath.Join(repoDir, pushHoldDir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	hold := filepath.Join(dir, "push-rewrite-race")
+	if err := os.WriteFile(hold, []byte("refs/heads/a\nrefs/heads/b\n"), 0o600); err != nil {
+		t.Fatalf("write hold: %v", err)
+	}
+	expireHold(t, hold)
+	info, err := os.Stat(hold)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	// The live refresher whose shared flock forces the reaper's restore.
+	f, err := os.OpenFile(hold, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer f.Close()
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_SH|syscall.LOCK_NB); err != nil {
+		t.Fatalf("flock: %v", err)
+	}
+	// Orchestration: mid-rewrite (after the read, before the replacement
+	// rename), a sweep quarantines the hold and pauses; the rewrite's
+	// rename lands during quarantine; the reaper then restores. Fixed,
+	// the rewrite holds the reservation flock, so the reap cannot even
+	// quarantine until the rewrite completes.
+	gate := make(chan struct{})
+	reapDone := make(chan struct{})
+	var closeGate sync.Once
+	testHookReapAfterQuarantine = func() { <-gate }
+	testHookRemoveHoldsPreRename = func() {
+		go func() {
+			defer close(reapDone)
+			reapExpiredPushHold(hold, info.ModTime())
+		}()
+		deadline := time.Now().Add(500 * time.Millisecond)
+		for {
+			if _, err := os.Stat(hold + ".reaping"); err == nil || time.Now().After(deadline) {
+				return // quarantined (unfixed) or reap was excluded (fixed)
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
+	defer func() {
+		testHookRemoveHoldsPreRename = nil
+		testHookReapAfterQuarantine = nil
+		closeGate.Do(func() { close(gate) })
+	}()
+	if err := removePushHolds(hold, []string{"refs/heads/a"}); err != nil {
+		t.Fatalf("removePushHolds: %v", err)
+	}
+	closeGate.Do(func() { close(gate) })
+	<-reapDone
+	b, err := os.ReadFile(hold)
+	if err != nil {
+		t.Fatalf("read hold: %v", err)
+	}
+	if strings.Contains(string(b), "refs/heads/a") {
+		t.Fatalf("reap restore resurrected a released name: %q", b)
+	}
+	if !strings.Contains(string(b), "refs/heads/b") {
+		t.Fatalf("kept name lost: %q", b)
+	}
+}
+
+// TestRemovePushHolds_RetainsContentsWhenBumpFails (Codex round-36 P2 on
+// #173/#186): the partial rewrite is a hold-set mutation like any other —
+// replacing the contents with the epoch bump failing (and ignored) lets
+// a JIT append + error-path rewrite-back fingerprint identically under
+// coarse timestamp granularity. Mirror the removal invariant: bump
+// BEFORE the replacement rename, retain the old contents when the epoch
+// cannot record the transition.
+func TestRemovePushHolds_RetainsContentsWhenBumpFails(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("directory write permissions do not bind root")
+	}
+	repoDir := t.TempDir()
+	dir := filepath.Join(repoDir, pushHoldDir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := bumpPushHoldEpoch(dir); err != nil {
+		t.Fatalf("seed epoch: %v", err)
+	}
+	if f, err := os.Create(dir + ".reserve.lock"); err != nil {
+		t.Fatalf("create reserve lock: %v", err)
+	} else {
+		_ = f.Close()
+	}
+	hold := filepath.Join(dir, "push-bumpless-rewrite")
+	want := "refs/heads/a\nrefs/heads/b\n"
+	if err := os.WriteFile(hold, []byte(want), 0o600); err != nil {
+		t.Fatalf("write hold: %v", err)
+	}
+	if err := os.Chmod(repoDir, 0o555); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(repoDir, 0o755) })
+	if err := removePushHolds(hold, []string{"refs/heads/a"}); err == nil {
+		t.Fatal("removePushHolds must fail when the epoch bump fails")
+	}
+	b, err := os.ReadFile(hold)
+	if err != nil {
+		t.Fatalf("read hold: %v", err)
+	}
+	if string(b) != want {
+		t.Fatalf("contents must be retained when the bump fails: %q", b)
+	}
+}
+
+// TestPushHoldRefresh_OpposesConcurrentReap (Codex round-36 P2 on
+// #173/#186): closing the descriptor on a lost shared-lock attempt
+// (round 34) still leaves the CURRENT reap unopposed — a reaper can
+// quarantine and win LOCK_EX between the refresher's open and its
+// LOCK_SH, and the refresher's fallback path touch then hits ENOENT
+// while the reaper unlinks a live reservation. Establishing the fd and
+// the shared lock must be atomic with respect to reapers: it runs under
+// the same reservation flock as the reap window, so a reap either
+// finished before the refresher's open or cannot start until the shared
+// lock is held.
+func TestPushHoldRefresh_OpposesConcurrentReap(t *testing.T) {
+	oldTTL := pushHoldTTL
+	pushHoldTTL = 200 * time.Millisecond
+	t.Cleanup(func() { pushHoldTTL = oldTTL })
+	repoDir := t.TempDir()
+	dir := filepath.Join(repoDir, pushHoldDir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	hold := filepath.Join(dir, "push-establish-race")
+	if err := os.WriteFile(hold, []byte("refs/heads/x\n"), 0o600); err != nil {
+		t.Fatalf("write hold: %v", err)
+	}
+	expireHold(t, hold)
+	info, err := os.Stat(hold)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	fired := false
+	testHookRefreshBeforeLock = func() {
+		if fired {
+			return
+		}
+		fired = true
+		// The expiry sweep runs exactly between the refresher's open and
+		// its LOCK_SH.
+		reapExpiredPushHold(hold, info.ModTime())
+	}
+	defer func() { testHookRefreshBeforeLock = nil }()
+	stop := startPushHoldRefresh(hold) // first touch is synchronous
+	defer stop()
+	if _, err := os.Stat(hold); err != nil {
+		t.Fatalf("an actively refreshed hold was reaped mid-establishment: %v", err)
+	}
+}
+
+// TestRemovePushHoldFiles_SerializesWithQuarantine (Codex round-36
+// security P2 on #173/#186): a release racing a reaper's quarantine
+// window sees the hold path ABSENT, removes only the sidecars, and
+// returns having released nothing — the reaper then restores the hold
+// (the handler refresher's shared flock vetoed the unlink), resurrecting
+// it AFTER post-receive completed. The handler refresher keeps touching
+// it while a non-reading client stalls the response copy, blocking
+// same-name and D/F-relative pushes indefinitely. Releases must
+// serialize with the quarantine window on the reservation flock: they
+// then run strictly before it (normal removal) or strictly after it
+// (removal of the restored hold, or a no-op if the reaper unlinked).
+func TestRemovePushHoldFiles_SerializesWithQuarantine(t *testing.T) {
+	repoDir := t.TempDir()
+	dir := filepath.Join(repoDir, pushHoldDir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	hold := filepath.Join(dir, "push-release-race")
+	if err := os.WriteFile(hold, []byte("refs/heads/x\n"), 0o600); err != nil {
+		t.Fatalf("write hold: %v", err)
+	}
+	expireHold(t, hold)
+	info, err := os.Stat(hold)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	// The handler refresher whose shared flock forces the restore path.
+	f, err := os.OpenFile(hold, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer f.Close()
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_SH|syscall.LOCK_NB); err != nil {
+		t.Fatalf("flock: %v", err)
+	}
+	// Post-receive's release fires mid-quarantine. Unfixed it completes
+	// immediately (sidecars only); fixed it blocks on the reservation
+	// flock until the reap window ends, then removes the restored hold.
+	released := make(chan struct{})
+	testHookReapAfterQuarantine = func() {
+		go func() {
+			defer close(released)
+			removePushHoldFiles(hold)
+		}()
+		select {
+		case <-released:
+		case <-time.After(300 * time.Millisecond):
+		}
+	}
+	defer func() { testHookReapAfterQuarantine = nil }()
+	reapExpiredPushHold(hold, info.ModTime())
+	<-released
+	if _, err := os.Stat(hold); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("a hold released during a quarantine window must stay released: %v", err)
+	}
+	if _, err := os.Stat(hold + ".reaping"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("quarantine must not linger")
 	}
 }
 

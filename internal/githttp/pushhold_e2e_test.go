@@ -637,6 +637,51 @@ func TestPush_SignedFanoutSurvivesSmallBudget(t *testing.T) {
 	}
 }
 
+// TestPush_PackPathJITFanoutSurvivesSmallBudget (Codex round-32 P2 on
+// #173): under a combined ["verify-sig","no-force-push"] rule the
+// budget-free classifier defers every update to a JIT reservation, and on
+// the PACK path pre-receive's publication gate performs the real
+// evaluations — but their successful verdicts were not persisted, so each
+// update hook re-evaluated the same command and re-charged the shared
+// walk allowance, failing a large compliant SIGNED fast-forward fanout
+// after its pack was already published. The gate's passed JIT verdicts
+// now persist like needs-verify ones; hooks consume the digest without a
+// second fee.
+func TestPush_PackPathJITFanoutSurvivesSmallBudget(t *testing.T) {
+	repo := registerRepo(t, "t-jit-pack-fanout-budget")
+	work := initWorkRepo(t)
+	priv, pub := genSSHKey(t)
+	key := registerSigningKey(t, pub)
+	defer removeSigningKey(t, key.ID)
+
+	mustGit(t, work, append(sshSigningArgs(priv), "commit", "--amend", "--no-edit")...)
+	plain := mintTestToken(t, repo, "git:read,git:write", "")
+	node := startNodeT(t, "CODESTORAGE_VERIFY_SIG_BUDGET=1")
+	// Seed main plus the 60-ref fanout at v1.
+	args := []string{"push", remoteURL(node, repo, plain), "HEAD:refs/heads/main"}
+	for i := 0; i < 60; i++ {
+		args = append(args, fmt.Sprintf("HEAD:refs/heads/b/%04d", i))
+	}
+	mustGit(t, work, args...)
+	// One new SIGNED commit so the fanout update push carries a pack.
+	mustGit(t, work, append(sshSigningArgs(priv), "commit", "--allow-empty", "-m", "v2")...)
+	head := revParse(t, work, "HEAD")
+
+	combined := mintTestToken(t, repo, "git:read,git:write", `[["*",["verify-sig","no-force-push"]]]`)
+	args = []string{"push", remoteURL(node, repo, combined)}
+	for i := 0; i < 60; i++ {
+		args = append(args, fmt.Sprintf("HEAD:refs/heads/b/%04d", i))
+	}
+	out, err := tryGit(work, args...)
+	if err != nil {
+		t.Fatalf("signed 60-ref JIT fast-forward pack fanout must survive budget 1: %v\n%.2000s", err, out)
+	}
+	refs := pgRefs(t, repo)
+	if refs["refs/heads/b/0000"] != head || refs["refs/heads/b/0059"] != head {
+		t.Fatalf("fanout refs missing: %v", refs["refs/heads/b/0000"])
+	}
+}
+
 // TestPush_DoomedCreationReleasesHoldOnDenial (Codex round-16 P2): a
 // sidecar-diverted creation that the update hook's commit-time D/F probe
 // denies must release its self-reservation immediately — before the fix

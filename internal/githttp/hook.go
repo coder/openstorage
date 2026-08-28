@@ -553,6 +553,23 @@ func preReceive(ctx context.Context) (retErr error) {
 			// huge push — a sidecar written before it could be swept as
 			// expired by a concurrent push's mint before the first hook ever
 			// consumed a verdict.
+			// Successful pack-path JIT verdicts persist too (Codex
+			// round-32 P2): on the pack path the publication gate just
+			// evaluated every command for real — signature walk included —
+			// and a JIT command's hook would otherwise repeat that
+			// evaluation and double-fee the shared walk budget, failing
+			// large compliant signed no-force fanouts after their pack was
+			// already published. Checked via verdictDone so the no-pack
+			// path (which deliberately evaluates nothing here) never
+			// triggers an evaluation; its JIT hooks keep paying exactly
+			// one.
+			if !atomicPush {
+				for i := range commands {
+					if classes[i] == reservationJIT && verdictDone[i] && verdicts[i] == nil {
+						sigVerified[i] = true
+					}
+				}
+			}
 			if budget, err := verifySigBudget(); err != nil || budget > 0 {
 				var digests [][sha256.Size]byte
 				for i, ok := range sigVerified {
