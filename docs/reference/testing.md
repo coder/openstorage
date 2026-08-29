@@ -317,7 +317,9 @@ use an unversioned scratch bucket, not a production one.
 ## The Floci githttp E2E lane
 
 [`floci-nightly-githttp.yml`](../../.github/workflows/floci-nightly-githttp.yml)
-runs daily (04:53 UTC): it boots a pinned Floci image with S3 auth
+runs daily (04:53 UTC): it boots a pinned Floci image (the same release
+`s3waltest.FlociImage` pins for the qualification matrix — bump both
+together) with S3 auth
 enforcement on, provisions an IAM user and access key, assumes a role via
 STS, and reruns the full PG-mode `internal/githttp` E2E suite with the blob
 store pointed at Floci and the STS **session credentials** in the

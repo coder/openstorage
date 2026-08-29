@@ -41,7 +41,9 @@ jobs:
         # Pinned tag, not :latest — this lane exports credentials parsed from
         # the image's API responses, so keep the image bytes as stable as a
         # mutable registry allows. 1.7.0 is the spike-qualified version
-        # (nightly-08282026 behaved identically).
+        # (nightly-08282026 behaved identically). Keep in sync with
+        # s3waltest.FlociImage (the s3wal qualification-matrix pin, issue
+        # #205) so every Floci lane probes the same release.
         run: |
           docker run -d --name floci -p 4566:4566 \
             -e FLOCI_SERVICES_S3_ENFORCE_AUTH=true \
