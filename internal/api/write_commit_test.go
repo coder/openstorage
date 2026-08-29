@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -138,9 +139,7 @@ func wctMeta(target, message string, files []map[string]any, extra map[string]an
 	if files != nil {
 		md["files"] = files
 	}
-	for k, v := range extra {
-		md[k] = v
-	}
+	maps.Copy(md, extra)
 	return map[string]any{"metadata": md}
 }
 

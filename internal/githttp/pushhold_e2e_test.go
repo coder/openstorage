@@ -624,7 +624,7 @@ func TestPush_SignedFanoutSurvivesSmallBudget(t *testing.T) {
 
 	vs := mintTestToken(t, repo, "git:read,git:write", `[["*",["verify-sig"]]]`)
 	args := []string{"push", remoteURL(node, repo, vs)}
-	for i := 0; i < 60; i++ {
+	for i := range 60 {
 		args = append(args, fmt.Sprintf("HEAD:refs/heads/b/%04d", i))
 	}
 	out, err := tryGit(work, args...)
@@ -659,7 +659,7 @@ func TestPush_PackPathJITFanoutSurvivesSmallBudget(t *testing.T) {
 	node := startNodeT(t, "CODESTORAGE_VERIFY_SIG_BUDGET=1")
 	// Seed main plus the 60-ref fanout at v1.
 	args := []string{"push", remoteURL(node, repo, plain), "HEAD:refs/heads/main"}
-	for i := 0; i < 60; i++ {
+	for i := range 60 {
 		args = append(args, fmt.Sprintf("HEAD:refs/heads/b/%04d", i))
 	}
 	mustGit(t, work, args...)
@@ -669,7 +669,7 @@ func TestPush_PackPathJITFanoutSurvivesSmallBudget(t *testing.T) {
 
 	combined := mintTestToken(t, repo, "git:read,git:write", `[["*",["verify-sig","no-force-push"]]]`)
 	args = []string{"push", remoteURL(node, repo, combined)}
-	for i := 0; i < 60; i++ {
+	for i := range 60 {
 		args = append(args, fmt.Sprintf("HEAD:refs/heads/b/%04d", i))
 	}
 	out, err := tryGit(work, args...)
@@ -936,7 +936,7 @@ func TestAtomicPush_SignedFanoutSurvivesSmallBudget(t *testing.T) {
 
 	vs := mintTestToken(t, repo, "git:read,git:write", `[["*",["verify-sig"]]]`)
 	args := []string{"push", "--atomic", remoteURL(node, repo, vs)}
-	for i := 0; i < 60; i++ {
+	for i := range 60 {
 		args = append(args, fmt.Sprintf("HEAD:refs/heads/b/%04d", i))
 	}
 	out, err := tryGit(work, args...)

@@ -748,7 +748,7 @@ func TestLFSReclaim_RefFanoutChargesBudget(t *testing.T) {
 	if err := store.RegisterLFSObject(ctx, base, key, 10); err != nil {
 		t.Fatal(err)
 	}
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		if won, err := store.CASRef(ctx, base, fmt.Sprintf("refs/heads/b%02d", i), ref.ZeroSHA, strings.Repeat("77", 20)); err != nil || !won {
 			t.Fatalf("CASRef = (%v, %v)", won, err)
 		}
@@ -790,7 +790,7 @@ func TestLFSReclaim_MaxBudgetRefCountCap(t *testing.T) {
 	if err := store.RegisterLFSObject(ctx, base, key, 10); err != nil {
 		t.Fatal(err)
 	}
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		if won, err := store.CASRef(ctx, base, fmt.Sprintf("refs/heads/b%02d", i), ref.ZeroSHA, strings.Repeat("77", 20)); err != nil || !won {
 			t.Fatalf("CASRef = (%v, %v)", won, err)
 		}
@@ -937,7 +937,7 @@ func TestLFSReclaim_SettlementHandoffResumes(t *testing.T) {
 	ctx := context.Background()
 	store, reg := newReclaimStore(t)
 	base := "handoff-repo"
-	for i := 0; i < 6; i++ {
+	for i := range 6 {
 		key := "lfs/" + base + "/o2/" + strings.Repeat(string(rune('a'+i)), 64)
 		if err := store.RegisterLFSObject(ctx, base, key, 10); err != nil {
 			t.Fatal(err)
@@ -999,7 +999,7 @@ func TestLFSReclaim_RowCursorGenerationFence(t *testing.T) {
 	ctx := context.Background()
 	store, reg := newReclaimStore(t)
 	base := "fence-repo"
-	for i := 0; i < 4; i++ {
+	for i := range 4 {
 		key := "lfs/" + base + "/o2/" + strings.Repeat(string(rune('a'+i)), 64)
 		if err := store.RegisterLFSObject(ctx, base, key, 10); err != nil {
 			t.Fatal(err)

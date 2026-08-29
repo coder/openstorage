@@ -17,6 +17,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -118,9 +119,7 @@ func wmMergeBody(source, target, strategy string, extra map[string]any) map[stri
 		"target_branch": target,
 		"strategy":      strategy,
 	}
-	for k, v := range extra {
-		body[k] = v
-	}
+	maps.Copy(body, extra)
 	return body
 }
 

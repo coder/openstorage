@@ -78,12 +78,10 @@ func (q *Local) EnqueueWebhookDelivery(_ context.Context, d events.Delivery) err
 	if q.closed {
 		return errors.New("jobs queue is closed")
 	}
-	q.wg.Add(1)
-	go func() {
-		defer q.wg.Done()
+	q.wg.Go(func() {
 		// Deliver logs retries and the final discard itself.
 		_ = q.deliverer.Deliver(context.Background(), d)
-	}()
+	})
 	return nil
 }
 

@@ -131,8 +131,7 @@ func wantAmbiguous(t *testing.T, err error) {
 	if err == nil {
 		t.Fatal("want fail-closed ambiguous error, got nil")
 	}
-	var amb *s3wal.AmbiguousError
-	if !errors.As(err, &amb) {
+	if _, ok := errors.AsType[*s3wal.AmbiguousError](err); !ok {
 		t.Fatalf("fail-closed error must surface the ambiguity, got %v", err)
 	}
 }

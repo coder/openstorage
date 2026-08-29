@@ -34,7 +34,7 @@ func PeeledTags(ctx context.Context, repoPath string) ([]Tag, error) {
 		return nil, err
 	}
 	tags := []Tag{}
-	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+	for line := range strings.SplitSeq(strings.TrimSpace(out), "\n") {
 		if line == "" {
 			continue
 		}

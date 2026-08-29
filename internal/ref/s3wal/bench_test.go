@@ -509,9 +509,7 @@ func warmupSQLiteContention(tb testing.TB, st *ref.SQLite, repo, name string, wr
 	perWorker := (benchWarmupOps + writers - 1) / writers
 	var wg sync.WaitGroup
 	for range writers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			cur := seqSHA(1)
 			for range perWorker {
 				next := parseSeqSHA(tb, cur) + 1
@@ -535,7 +533,7 @@ func warmupSQLiteContention(tb testing.TB, st *ref.SQLite, repo, name string, wr
 					return
 				}
 			}
-		}()
+		})
 	}
 	wg.Wait()
 }
@@ -576,9 +574,7 @@ func runSQLiteContentionWindow(tb testing.TB, st *ref.SQLite, repo, name string,
 	deadline := start.Add(window)
 	var wg sync.WaitGroup
 	for range writers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			var (
 				localLat    []time.Duration
 				localTrans  []seqTransition
@@ -649,7 +645,7 @@ func runSQLiteContentionWindow(tb testing.TB, st *ref.SQLite, repo, name string,
 					cur = reread
 				}
 			}
-		}()
+		})
 	}
 	wg.Wait()
 	res.elapsed = time.Since(start)

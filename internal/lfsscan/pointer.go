@@ -48,7 +48,7 @@ func ParseLFSPointer(data []byte) (oid string, ok bool) {
 		return "", false
 	}
 	versioned := false
-	for _, raw := range strings.Split(string(data), "\n") {
+	for raw := range strings.SplitSeq(string(data), "\n") {
 		line := strings.TrimSpace(raw)
 		if !versioned {
 			for _, p := range lfsPointerVersionPrefixes {

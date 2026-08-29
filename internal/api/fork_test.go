@@ -18,6 +18,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -112,9 +113,7 @@ func forkBody(srcToken string, extra map[string]any) map[string]any {
 		"operation": "fork",
 		"auth":      map[string]any{"token": srcToken},
 	}
-	for k, v := range extra {
-		base[k] = v
-	}
+	maps.Copy(base, extra)
 	return map[string]any{"base_repo": base}
 }
 

@@ -57,7 +57,7 @@ func Log(ctx context.Context, repoPath, rev string, opts LogOptions) ([]Commit, 
 		return nil, err
 	}
 	commits := []Commit{}
-	for _, rec := range strings.Split(out, "\x00") {
+	for rec := range strings.SplitSeq(out, "\x00") {
 		if rec == "" {
 			continue // trailing record separator
 		}
@@ -89,7 +89,7 @@ func parseLogRecord(rec string) (Commit, error) {
 	if !ref.ValidSHA(c.SHA) || !ref.ValidSHA(c.TreeSHA) {
 		return Commit{}, fmt.Errorf("log emitted malformed sha in %.80q", rec)
 	}
-	for _, p := range strings.Fields(fields[2]) {
+	for p := range strings.FieldsSeq(fields[2]) {
 		if !ref.ValidSHA(p) {
 			return Commit{}, fmt.Errorf("log emitted malformed parent %q", p)
 		}
@@ -143,7 +143,7 @@ func splitCommitSignature(raw string) (signature, payload string) {
 	}
 	var sigLines, keptLines []string
 	inSig := false
-	for _, line := range strings.Split(headers, "\n") {
+	for line := range strings.SplitSeq(headers, "\n") {
 		switch {
 		case strings.HasPrefix(line, "gpgsig ") || strings.HasPrefix(line, "gpgsig-sha256 "):
 			inSig = true

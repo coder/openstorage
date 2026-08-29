@@ -157,7 +157,7 @@ func ValidArchivePrefix(prefix string) bool {
 	if strings.ContainsAny(prefix, "\x00\\") || strings.HasPrefix(prefix, "/") {
 		return false
 	}
-	for _, seg := range strings.Split(prefix, "/") {
+	for seg := range strings.SplitSeq(prefix, "/") {
 		if seg == "." || seg == ".." {
 			return false
 		}

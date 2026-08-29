@@ -75,7 +75,7 @@ func TestParseKeysMalformed(t *testing.T) {
 			continue
 		}
 		// Errors must never echo key material.
-		for _, entry := range strings.Split(raw, ",") {
+		for entry := range strings.SplitSeq(raw, ",") {
 			entry = strings.TrimSpace(entry)
 			if len(entry) >= 8 && strings.Contains(err.Error(), entry) {
 				t.Errorf("%s: error %q echoes a key entry", name, err)

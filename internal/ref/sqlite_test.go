@@ -97,11 +97,9 @@ func TestSQLiteInitSchemaIdempotent(t *testing.T) {
 	var wg sync.WaitGroup
 	errs := make(chan error, 4)
 	for _, h := range []*SQLite{s, s2, s, s2} {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			errs <- h.InitSchema(ctx)
-		}()
+		})
 	}
 	wg.Wait()
 	close(errs)
@@ -229,7 +227,7 @@ func TestSQLiteRegisterPacksIdempotent(t *testing.T) {
 	const repo = "org/repo"
 	packs := []Pack{{ID: "p1", Key: "org/repo/p1.pack"}, {ID: "p2", Key: "org/repo/p2.pack"}}
 
-	for i := 0; i < 2; i++ {
+	for i := range 2 {
 		if err := s.RegisterPacks(ctx, repo, packs); err != nil {
 			t.Fatalf("RegisterPacks round %d: %v", i, err)
 		}
@@ -312,7 +310,7 @@ func TestSQLiteConcurrentCAS(t *testing.T) {
 		const workers = 8
 		var wg sync.WaitGroup
 		winners := make(chan string, workers)
-		for i := 0; i < workers; i++ {
+		for i := range workers {
 			wg.Add(1)
 			go func(i int) {
 				defer wg.Done()

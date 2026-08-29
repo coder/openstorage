@@ -232,7 +232,7 @@ func TestInstanceLeaseHeartbeatLossDetection(t *testing.T) {
 		// Every renewal write LANDS (then loses its response): the
 		// re-read adopts the fresh stamp, so no tick ever exhausts the
 		// headroom no matter how long this goes on.
-		for i := 0; i < 8; i++ {
+		for i := range 8 {
 			clk.Advance(30 * time.Second)
 			if err := l.renew(ctx); err != nil {
 				t.Fatalf("renew %d (ambiguous but landed): %v", i, err)

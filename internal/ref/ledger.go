@@ -1056,7 +1056,7 @@ func (s *PG) ReconcileLegacyLFSObjects(ctx context.Context) (int64, bool, error)
 	// spinning. The invocation is page-capped (security round 127) so a
 	// live twin-minting old replica cannot hold startup hostage.
 	var n int64
-	for page := 0; page < reconcileLegacyLFSMaxPages; page++ {
+	for range reconcileLegacyLFSMaxPages {
 		rows, err := s.pool.Query(ctx, `
 SELECT l.repo, l.key FROM lfs_objects l
 WHERE strpos(l.key, '/o2/') = 0

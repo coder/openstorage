@@ -57,7 +57,7 @@ func benchFanoutEnv(b *testing.B, repo string, n int) (ref.RefStore, blob.BlobSt
 		b.Fatalf("commit-tree: %v", err)
 	}
 	sha := strings.TrimSpace(tip)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		name := fmt.Sprintf("refs/heads/load-%07d", i)
 		if won, err := st.CASRef(ctx, repo, name, ref.ZeroSHA, sha); err != nil || !won {
 			b.Fatalf("CASRef %s = (%v, %v), want win", name, won, err)

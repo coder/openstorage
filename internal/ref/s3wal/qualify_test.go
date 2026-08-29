@@ -33,6 +33,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -201,8 +202,7 @@ func vPass(surface string) verdict { return verdict{surface, verdictPass, ""} }
 // behavioral finding it never observed.
 func rejectVerdict(err error) string {
 	assertf(err != nil, "rejectVerdict: nil error")
-	var amb *s3wal.AmbiguousError
-	if errors.As(err, &amb) {
+	if _, ok := errors.AsType[*s3wal.AmbiguousError](err); ok {
 		return verdictError
 	}
 	for _, definitive := range []error{s3wal.ErrExists, s3wal.ErrLostRace, s3wal.ErrCASContention, s3wal.ErrNotExist, s3wal.ErrNotModified} {
@@ -716,11 +716,11 @@ func surfaceMemberContiguity(t *testing.T, e *qualEnv) []verdict {
 		fam + "abc0",
 	}
 	// Insert in reverse so listing order cannot ride insertion order.
-	for i := len(expected) - 1; i >= 0; i-- {
+	for _, e0 := range slices.Backward(expected) {
 		if _, err := e.raw.PutObject(ctx, &s3.PutObjectInput{
-			Bucket: aws.String(e.bucket), Key: aws.String(expected[i]), Body: bytes.NewReader([]byte("m")),
+			Bucket: aws.String(e.bucket), Key: aws.String(e0), Body: bytes.NewReader([]byte("m")),
 		}); err != nil {
-			return []verdict{{name, verdictError, fmt.Sprintf("seed %s: %v", expected[i], err)}}
+			return []verdict{{name, verdictError, fmt.Sprintf("seed %s: %v", e0, err)}}
 		}
 	}
 	t.Cleanup(func() { deleteAllPrefix(t, e.raw, e.bucket, fam) })
@@ -1094,8 +1094,7 @@ func runContentionWindow(tb testing.TB, cas *s3wal.Client, key string, writers i
 					contentions++
 					attempt = 0
 				default:
-					var amb *s3wal.AmbiguousError
-					if !errors.As(err, &amb) {
+					if _, ok := errors.AsType[*s3wal.AmbiguousError](err); !ok {
 						tb.Errorf("contention: advance %s: %v", key, err)
 						return
 					}
@@ -1802,8 +1801,7 @@ func TestCASTaxonomy(t *testing.T) {
 	t.Run("server-5xx-ambiguous-single-attempt", func(t *testing.T) {
 		s, c := newScripted(t, scriptedResponse{status: 500, code: "InternalError"})
 		_, err := c.Advance(ctx, "k", []byte("b"), `"e1"`)
-		var amb *s3wal.AmbiguousError
-		if !errors.As(err, &amb) {
+		if _, ok := errors.AsType[*s3wal.AmbiguousError](err); !ok {
 			t.Fatalf("Advance = %v, want s3wal.AmbiguousError", err)
 		}
 		// One wire attempt proves SDK auto-retry is disabled by

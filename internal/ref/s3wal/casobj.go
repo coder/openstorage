@@ -427,12 +427,10 @@ func classifyTransport(op, key string, err error) error {
 // error. status 0 means no HTTP response was observed (transport-level
 // failure).
 func errorStatus(err error) (status int, code string) {
-	var re *awshttp.ResponseError
-	if errors.As(err, &re) {
+	if re, ok := errors.AsType[*awshttp.ResponseError](err); ok {
 		status = re.HTTPStatusCode()
 	}
-	var ae smithy.APIError
-	if errors.As(err, &ae) {
+	if ae, ok := errors.AsType[smithy.APIError](err); ok {
 		code = ae.ErrorCode()
 	}
 	return status, code

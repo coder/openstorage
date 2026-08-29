@@ -108,7 +108,7 @@ func TestFile_EnsureBucketIdempotent(t *testing.T) {
 
 	// Twice on an existing dir (idempotence), then again after the dir
 	// vanished (recreation, mirroring EnsureBucket on a fresh backend).
-	for i := 0; i < 2; i++ {
+	for i := range 2 {
 		if err := b.EnsureBucket(ctx); err != nil {
 			t.Fatalf("EnsureBucket #%d: %v", i+1, err)
 		}

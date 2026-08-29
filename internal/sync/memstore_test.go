@@ -116,15 +116,13 @@ func TestMemStoreBeginSyncClaimIsExclusive(t *testing.T) {
 	var mu stdsync.Mutex
 	claims := 0
 	for range n {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			if _, _, err := m.BeginSync(ctx, "repo_c", "test-holder", time.Minute); err == nil {
 				mu.Lock()
 				claims++
 				mu.Unlock()
 			}
-		}()
+		})
 	}
 	wg.Wait()
 	if claims != 1 {

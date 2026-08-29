@@ -12,6 +12,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -78,20 +79,15 @@ func refSniffAtomic(in []byte) bool {
 		if bytes.HasPrefix(payload, []byte("shallow ")) {
 			continue
 		}
-		nul := bytes.IndexByte(payload, 0)
-		if nul < 0 {
+		_, after, ok := bytes.Cut(payload, []byte{0})
+		if !ok {
 			return false
 		}
-		caps := payload[nul+1:]
+		caps := after
 		if next := bytes.IndexByte(caps, 0); next >= 0 {
 			caps = caps[:next]
 		}
-		for _, tok := range strings.Fields(string(caps)) {
-			if tok == "atomic" {
-				return true
-			}
-		}
-		return false
+		return slices.Contains(strings.Fields(string(caps)), "atomic")
 	}
 	return true // budget exhausted inside the shallow prefix: fail closed
 }

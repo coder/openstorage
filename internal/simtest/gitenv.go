@@ -142,7 +142,7 @@ func forEachRef(repoPath string) (map[string]string, error) {
 		return nil, err
 	}
 	refs := make(map[string]string)
-	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+	for line := range strings.SplitSeq(strings.TrimSpace(out), "\n") {
 		if line == "" {
 			continue
 		}

@@ -16,6 +16,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
+	"slices"
 )
 
 // SubjectLiteral is the fixed `sub` claim used by all vendor SDKs (docs/reference/authentication.md).
@@ -58,12 +59,7 @@ type Claims struct {
 
 // HasScope reports whether claims grant exactly the given scope.
 func (c *Claims) HasScope(scope string) bool {
-	for _, s := range c.Scopes {
-		if s == scope {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(c.Scopes, scope)
 }
 
 // Verifier authenticates a compact JWT. Implementations must verify the

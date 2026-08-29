@@ -255,7 +255,7 @@ func TestHydrate_ShortCircuitsOnUnchangedGeneration(t *testing.T) {
 
 	// Idle repo, back-to-back reads: one generation point-read each, zero
 	// ListPacks/ListRefsAfter (and no ref-sync subprocesses).
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		if again := mustHydrate(t, st, bl, cacheDir, repo); again != repoPath {
 			t.Fatalf("repoPath changed on short-circuit: %q != %q", again, repoPath)
 		}
@@ -301,7 +301,7 @@ func TestHydrate_FastPathSpawnsNoGitSubprocess(t *testing.T) {
 	gitSpawnObserver.Store(&obs)
 	defer gitSpawnObserver.Store(nil)
 
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		if again := mustHydrate(t, st, bl, cacheDir, repo); again != repoPath {
 			t.Fatalf("repoPath changed on fast path: %q != %q", again, repoPath)
 		}
@@ -474,7 +474,7 @@ func TestHydrate_LockWaitHonorsCancellation(t *testing.T) {
 // waitFor polls cond until it holds (test-scoped; fails after ~5s).
 func waitFor(t *testing.T, cond func() bool) {
 	t.Helper()
-	for i := 0; i < 500; i++ {
+	for range 500 {
 		if cond() {
 			return
 		}

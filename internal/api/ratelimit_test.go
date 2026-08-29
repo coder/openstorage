@@ -74,7 +74,7 @@ func TestRateLimitDisabledPassthrough(t *testing.T) {
 		t.Fatalf("newRateLimiter(zero) = (%v, %v), want (nil, nil) (disabled)", rl, err)
 	}
 	h := rl.limit(routeRead)(okHandler())
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		if w := rlRequest(t, h, "10.0.0.1:1234"); w.Code != http.StatusOK {
 			t.Fatalf("request %d through disabled limiter = %d, want 200", i, w.Code)
 		}
@@ -182,7 +182,7 @@ func TestRateLimitDeterministicRefill(t *testing.T) {
 	const addr = "10.0.0.1:1"
 
 	// Drain the burst.
-	for i := 0; i < 2; i++ {
+	for i := range 2 {
 		if w := rlRequest(t, h, addr); w.Code != http.StatusOK {
 			t.Fatalf("burst request %d = %d, want 200", i, w.Code)
 		}
@@ -392,7 +392,7 @@ func TestGitRateLimitDisabledPassthrough(t *testing.T) {
 		t.Fatal(err)
 	}
 	h := mw(okHandler())
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		if w := rlRequest(t, h, "10.0.0.1:1234"); w.Code != http.StatusOK {
 			t.Fatalf("request %d through disabled git limiter = %d, want 200", i, w.Code)
 		}
@@ -421,7 +421,7 @@ func TestGitRateLimit429Envelope(t *testing.T) {
 		t.Fatal(err)
 	}
 	h := mw(okHandler())
-	for i := 0; i < gitMinBurst; i++ {
+	for i := range gitMinBurst {
 		if w := rlRequest(t, h, "10.0.0.9:1"); w.Code != http.StatusOK {
 			t.Fatalf("burst request %d = %d, want 200", i, w.Code)
 		}
@@ -453,7 +453,7 @@ func TestGitRateLimitEmptyRemoteAddr(t *testing.T) {
 		t.Fatal(err)
 	}
 	h := mw(okHandler())
-	for i := 0; i < gitMinBurst; i++ {
+	for i := range gitMinBurst {
 		if w := rlRequest(t, h, ""); w.Code != http.StatusOK {
 			t.Fatalf("empty-RemoteAddr request %d = %d, want 200", i, w.Code)
 		}
@@ -476,7 +476,7 @@ func TestGitRateLimitMinimumBurst(t *testing.T) {
 		t.Fatal(err)
 	}
 	git := mw(okHandler())
-	for i := 0; i < gitMinBurst; i++ {
+	for i := range gitMinBurst {
 		if w := rlRequest(t, git, "10.0.0.8:1"); w.Code != http.StatusOK {
 			t.Fatalf("git request %d = %d, want 200 (burst floor not applied)", i, w.Code)
 		}
@@ -517,7 +517,7 @@ func TestGitRateLimitSeparateBucketState(t *testing.T) {
 	rest := restRL.limit(routeRead)(okHandler())
 
 	// Drain the git bucket (raised to the gitMinBurst floor).
-	for i := 0; i < gitMinBurst; i++ {
+	for i := range gitMinBurst {
 		if w := rlRequest(t, git, "10.0.0.7:1"); w.Code != http.StatusOK {
 			t.Fatalf("git request %d = %d, want 200", i, w.Code)
 		}
@@ -542,7 +542,7 @@ func TestGitRateLimitExchangeHysteresis(t *testing.T) {
 	const key = "10.0.0.42"
 
 	// Drain the full burst, then latch.
-	for i := 0; i < gitMinBurst; i++ {
+	for i := range gitMinBurst {
 		if ok, _ := rl.admitReserve(key, gitMinBurst); !ok {
 			t.Fatalf("burst request %d denied", i)
 		}
@@ -563,7 +563,7 @@ func TestGitRateLimitExchangeHysteresis(t *testing.T) {
 
 	// After the full reserve wait, an entire exchange completes.
 	*now = now.Add(time.Duration(gitMinBurst) * 100 * time.Second)
-	for i := 0; i < gitMinBurst; i++ {
+	for i := range gitMinBurst {
 		if ok, _ := rl.admitReserve(key, gitMinBurst); !ok {
 			t.Fatalf("post-reserve exchange request %d denied", i)
 		}
@@ -714,7 +714,7 @@ func TestGitRateLimitTrustedProxyIdentity(t *testing.T) {
 	const proxy = "10.0.0.5:1234"
 
 	// Drain client A's bucket (raised to the gitMinBurst floor).
-	for i := 0; i < gitMinBurst; i++ {
+	for i := range gitMinBurst {
 		if w := rlRequestXFF(t, h, proxy, "203.0.113.9"); w.Code != http.StatusOK {
 			t.Fatalf("client A request %d = %d, want 200", i, w.Code)
 		}
@@ -728,7 +728,7 @@ func TestGitRateLimitTrustedProxyIdentity(t *testing.T) {
 	}
 
 	// An unlisted peer's XFF is ignored: all spoofs drain one bucket.
-	for i := 0; i < gitMinBurst; i++ {
+	for i := range gitMinBurst {
 		w := rlRequestXFF(t, h, "192.0.2.1:1", fmt.Sprintf("203.0.113.%d", 100+i))
 		if w.Code != http.StatusOK {
 			t.Fatalf("untrusted peer request %d = %d, want 200", i, w.Code)

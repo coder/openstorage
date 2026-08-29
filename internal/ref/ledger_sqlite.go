@@ -479,7 +479,7 @@ ON CONFLICT (repo) DO UPDATE SET gen = lfs_adoption_gens.gen + 1`, repo); err !=
 func (s *SQLite) ReconcileLegacyLFSObjects(ctx context.Context) (int64, bool, error) {
 	var n int64
 	// Page-capped per invocation like the PG twin (security round 127).
-	for i := 0; i < reconcileLegacyLFSMaxPages; i++ {
+	for range reconcileLegacyLFSMaxPages {
 		page, progress, err := s.reconcileLegacyLFSPage(ctx)
 		n += progress
 		if err != nil {

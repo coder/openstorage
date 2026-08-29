@@ -18,6 +18,7 @@ package githttp
 import (
 	"bytes"
 	"io"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -80,8 +81,8 @@ func sniffAtomicPush(r io.Reader) (bool, io.Reader) {
 		}
 		// First command line (or `push-cert`): capabilities follow the
 		// NUL, space-separated. Absent NUL means no capabilities.
-		nul := bytes.IndexByte(payload, 0)
-		if nul < 0 {
+		_, after, ok := bytes.Cut(payload, []byte{0})
+		if !ok {
 			return false, replay()
 		}
 		// Match git's C-string parsing exactly (Codex security round): the
@@ -90,14 +91,12 @@ func sniffAtomicPush(r io.Reader) (bool, io.Reader) {
 		// to git and `junk\0atomic` is NOT. Tokenizing across the second
 		// NUL would diverge in both directions; the first direction is a
 		// gate bypass (sniffer says non-atomic, git behaves atomic).
-		caps := payload[nul+1:]
+		caps := after
 		if next := bytes.IndexByte(caps, 0); next >= 0 {
 			caps = caps[:next]
 		}
-		for _, tok := range strings.Fields(string(caps)) {
-			if tok == "atomic" {
-				return true, replay()
-			}
+		if slices.Contains(strings.Fields(string(caps)), "atomic") {
+			return true, replay()
 		}
 		return false, replay()
 	}

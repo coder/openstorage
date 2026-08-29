@@ -22,6 +22,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -240,10 +241,7 @@ func (l *rateLimiter) admitReserve(key string, reserve float64) (ok bool, retryA
 	}
 	if b.blocked || b.tokens < 1 {
 		b.blocked = true
-		secs := int(math.Ceil((reserve - b.tokens) / l.cfg.RPS))
-		if secs < 1 {
-			secs = 1
-		}
+		secs := max(int(math.Ceil((reserve-b.tokens)/l.cfg.RPS)), 1)
 		return false, secs
 	}
 	b.tokens--
@@ -321,8 +319,8 @@ func (l *rateLimiter) clientKey(r *http.Request) string {
 	if total > maxForwardedForBytes {
 		return host // oversized chain: fail closed to the peer key
 	}
-	for vi := len(values) - 1; vi >= 0; vi-- {
-		v := values[vi]
+	for _, v := range slices.Backward(values) {
+
 		if strings.TrimSpace(v) == "" {
 			return host // empty header copy: malformed, fail closed
 		}

@@ -90,12 +90,10 @@ func TestPackQuota_ConcurrentOvershootOneLoses(t *testing.T) {
 	results := make([]result, 2)
 	var wg sync.WaitGroup
 	for i, w := range []struct{ work, branch string }{{workB1, "b1"}, {workB2, "b2"}} {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			out, err := tryGit(w.work, "push", remoteURL(node, repo, token), "HEAD:refs/heads/"+w.branch)
 			results[i] = result{out, err}
-		}()
+		})
 	}
 	wg.Wait()
 

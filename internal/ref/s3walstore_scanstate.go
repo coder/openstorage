@@ -250,8 +250,7 @@ func (s *S3WAL) scanMutateWith(ctx context.Context, op, job, scope string, share
 		case errors.Is(werr, s3wal.ErrNotExecuted):
 			continue // provably never sent — plain retry
 		}
-		var amb *s3wal.AmbiguousError
-		if !errors.As(werr, &amb) {
+		if _, ok := errors.AsType[*s3wal.AmbiguousError](werr); !ok {
 			return fmt.Errorf("s3wal %s %s: %w", op, key, werr)
 		}
 		// Ambiguous: the write MAY have landed. Re-read and resolve via

@@ -1,5 +1,7 @@
 package ref
 
+import "strings"
+
 import "context"
 
 // RefValues implements the batched exact-value probe for SQLite: chunked
@@ -16,16 +18,17 @@ func (s *SQLite) RefValues(ctx context.Context, repo string, names []string) (ma
 		end := min(start+chunk, len(names))
 		args := make([]any, 0, end-start+1)
 		args = append(args, repo)
-		q := `SELECT name, sha FROM refs WHERE repo = ? AND name IN (`
+		var q strings.Builder
+		q.WriteString(`SELECT name, sha FROM refs WHERE repo = ? AND name IN (`)
 		for i := start; i < end; i++ {
 			if i > start {
-				q += ","
+				q.WriteString(",")
 			}
-			q += "?"
+			q.WriteString("?")
 			args = append(args, names[i])
 		}
-		q += ")"
-		rows, err := s.db.QueryContext(ctx, q, args...)
+		q.WriteString(")")
+		rows, err := s.db.QueryContext(ctx, q.String(), args...)
 		if err != nil {
 			return nil, err
 		}

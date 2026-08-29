@@ -116,7 +116,7 @@ func TestPackUsageCacheBoundsListings(t *testing.T) {
 	if got := awaitPeek(t, srv, "repo_c"); got != 10 {
 		t.Fatalf("refreshed usage = %d, want 10", got)
 	}
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		if usage, ok := srv.peekUsage("repo_c"); !ok || usage != 10 {
 			t.Fatalf("cached peek %d: (%d, %v), want (10, true)", i, usage, ok)
 		}
@@ -185,7 +185,7 @@ func TestPackUsageRefreshConcurrencyBounded(t *testing.T) {
 	srv := &Server{Blob: bb}
 
 	// Fill every slot with distinct repos; their flights park in ListPages.
-	for i := 0; i < slots; i++ {
+	for i := range slots {
 		srv.peekUsage(fmt.Sprintf("repo_slot_%d", i))
 	}
 	deadline := time.Now().Add(5 * time.Second)
@@ -197,7 +197,7 @@ func TestPackUsageRefreshConcurrencyBounded(t *testing.T) {
 	}
 
 	// With the pool exhausted, an extra repo's peeks start nothing.
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		if _, ok := srv.peekUsage("repo_extra"); ok {
 			t.Fatal("cold peek returned a value")
 		}
@@ -705,7 +705,7 @@ func TestHookFloorScansAreSlotBoundedAcrossProcesses(t *testing.T) {
 
 	// Hold every slot, as concurrent hook processes would.
 	var unlocks []func()
-	for i := 0; i < hookFloorScanSlots; i++ {
+	for range hookFloorScanSlots {
 		u, err := acquireHookFloorScanSlot(context.Background())
 		if err != nil {
 			t.Fatal(err)
@@ -837,7 +837,7 @@ func TestPackUsageCachePruneIsTimeBounded(t *testing.T) {
 	c := &usageCache{now: func() time.Time { return now }}
 
 	c.mu.Lock()
-	for i := 0; i < 2000; i++ {
+	for i := range 2000 {
 		c.putLocked(fmt.Sprintf("repo_%04d", i), 1, 0, 0, now)
 	}
 	if got := len(c.entries); got != 2000 {
@@ -876,12 +876,10 @@ func TestPackUsageCacheCoalescesMisses(t *testing.T) {
 
 	const goroutines = 16
 	var wg sync.WaitGroup
-	for i := 0; i < goroutines; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range goroutines {
+		wg.Go(func() {
 			srv.peekUsage("repo_e") // cold: returns !ok, may start the one flight
-		}()
+		})
 	}
 	wg.Wait()
 	if got := awaitPeek(t, srv, "repo_e"); got != 10 {

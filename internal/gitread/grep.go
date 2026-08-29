@@ -127,7 +127,7 @@ func runGrep(ctx context.Context, repoPath, commit string, opts GrepOptions, ext
 func parseGrepOutput(out, commit string) ([]GrepFile, error) {
 	files := []GrepFile{}
 	index := map[string]int{} // path -> files idx
-	for _, line := range strings.Split(out, "\n") {
+	for line := range strings.SplitSeq(out, "\n") {
 		if line == "" || line == "--" {
 			continue
 		}

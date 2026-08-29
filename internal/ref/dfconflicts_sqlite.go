@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"strings"
 )
 
 // DFConflicts implements the batched authority D/F probe for SQLite: one
@@ -40,16 +41,17 @@ func (s *SQLite) dfConflictsChunk(ctx context.Context, repo string, names []stri
 		end := min(start+chunk, len(prefixes))
 		args := make([]any, 0, end-start+1)
 		args = append(args, repo)
-		q := `SELECT name FROM refs WHERE repo = ? AND name IN (`
+		var q strings.Builder
+		q.WriteString(`SELECT name FROM refs WHERE repo = ? AND name IN (`)
 		for i := start; i < end; i++ {
 			if i > start {
-				q += ","
+				q.WriteString(",")
 			}
-			q += "?"
+			q.WriteString("?")
 			args = append(args, prefixes[i])
 		}
-		q += ")"
-		rows, err := s.db.QueryContext(ctx, q, args...)
+		q.WriteString(")")
+		rows, err := s.db.QueryContext(ctx, q.String(), args...)
 		if err != nil {
 			return nil, err
 		}

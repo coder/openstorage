@@ -132,7 +132,7 @@ func TestManifestDecodeRejectsCorruption(t *testing.T) {
 // beyond the ring survive only via per-entry records.
 func TestOpsRingEviction(t *testing.T) {
 	m := NewManifest()
-	for i := 0; i < OpsRingSize+8; i++ {
+	for range OpsRingSize + 8 {
 		m.RecordOp(NewOpID())
 	}
 	if len(m.Ops) != OpsRingSize {
@@ -141,7 +141,7 @@ func TestOpsRingEviction(t *testing.T) {
 	evicted := NewOpID()
 	m2 := NewManifest()
 	m2.RecordOp(evicted)
-	for i := 0; i < OpsRingSize; i++ {
+	for range OpsRingSize {
 		m2.RecordOp(NewOpID())
 	}
 	if m2.OpApplied(evicted) {

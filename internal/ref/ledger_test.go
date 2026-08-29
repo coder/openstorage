@@ -121,9 +121,7 @@ func TestReserveConcurrentRace(t *testing.T) {
 		decs := make([]ReserveDecision, len(packs))
 		var wg sync.WaitGroup
 		for i := range packs {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
+			wg.Go(func() {
 				dec, err := s.ReservePackBytes(context.Background(), k.group,
 					[]Pack{packs[i]}, fmt.Sprintf("owner-%d", i), 0, ReserveNoFloorGen, quota, ledgerTTL)
 				if err != nil {
@@ -131,7 +129,7 @@ func TestReserveConcurrentRace(t *testing.T) {
 					return
 				}
 				decs[i] = dec
-			}()
+			})
 		}
 		wg.Wait()
 		wins := 0

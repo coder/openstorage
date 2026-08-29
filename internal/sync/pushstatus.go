@@ -21,7 +21,7 @@ const (
 // knows the push failed from the exit code; this only enriches the event.
 func parsePushRejections(porcelain string) []RejectedRef {
 	var rejected []RejectedRef
-	for _, line := range strings.Split(porcelain, "\n") {
+	for line := range strings.SplitSeq(porcelain, "\n") {
 		if !strings.HasPrefix(line, "!\t") {
 			continue
 		}

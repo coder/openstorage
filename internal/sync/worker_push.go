@@ -330,10 +330,7 @@ func (w *Worker) deferPendingPushRetry(ctx context.Context, job Job) {
 	w.deferredRetry[key] = true
 	w.deferMu.Unlock()
 
-	delay := time.Until(up.PushClaimExpiresAt) + deferRetrySlack
-	if delay < deferRetrySlack {
-		delay = deferRetrySlack
-	}
+	delay := max(time.Until(up.PushClaimExpiresAt)+deferRetrySlack, deferRetrySlack)
 	time.AfterFunc(delay, func() {
 		w.deferMu.Lock()
 		delete(w.deferredRetry, key)

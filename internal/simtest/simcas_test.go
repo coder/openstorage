@@ -13,7 +13,7 @@ import (
 // coin is the first draw).
 func coinSeed(t *testing.T, applied bool) uint64 {
 	t.Helper()
-	for seed := uint64(0); seed < 100; seed++ {
+	for seed := range uint64(100) {
 		if NewInjector(seed).coin() == applied {
 			return seed
 		}

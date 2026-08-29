@@ -27,7 +27,9 @@ package simtest
 import (
 	"errors"
 	"fmt"
+	"maps"
 	"math/rand/v2"
+	"slices"
 	"sync"
 )
 
@@ -227,9 +229,7 @@ func (in *Injector) Counts() map[string]int {
 	in.mu.Lock()
 	defer in.mu.Unlock()
 	out := make(map[string]int, len(in.counts))
-	for op, n := range in.counts {
-		out[op] = n
-	}
+	maps.Copy(out, in.counts)
 	return out
 }
 
@@ -337,9 +337,9 @@ func (in *Injector) coin() bool {
 func (in *Injector) noteInnerOutcome(op, outcome string) {
 	in.mu.Lock()
 	defer in.mu.Unlock()
-	for i := len(in.fired) - 1; i >= 0; i-- {
-		if in.fired[i].Op == op {
-			in.fired[i].InnerOutcome = outcome
+	for _, v := range slices.Backward(in.fired) {
+		if v.Op == op {
+			v.InnerOutcome = outcome
 			return
 		}
 	}

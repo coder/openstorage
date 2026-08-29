@@ -328,7 +328,7 @@ func wcValidPath(p string) error {
 			return fmt.Errorf("control character in path %q", p)
 		}
 	}
-	for _, seg := range strings.Split(p, "/") {
+	for seg := range strings.SplitSeq(p, "/") {
 		switch {
 		case seg == "" || seg == "." || seg == "..":
 			return fmt.Errorf("invalid path segment in %q", p)
@@ -1092,7 +1092,7 @@ func (s *server) handleDiffCommit(w http.ResponseWriter, r *http.Request) {
 			s.wcInternal(w, r, "numstat patch", err)
 			return
 		}
-		for _, ln := range strings.Split(numstat, "\n") {
+		for ln := range strings.SplitSeq(numstat, "\n") {
 			if strings.TrimSpace(ln) != "" {
 				blobCount++
 			}

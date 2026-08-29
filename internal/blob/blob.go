@@ -493,9 +493,7 @@ func WithRenewedCover(ctx context.Context, renew func(context.Context) error, op
 	// handling in the callback.
 	done := make(chan struct{})
 	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		t := time.NewTicker(coverRenewInterval)
 		defer t.Stop()
 		for {
@@ -522,7 +520,7 @@ func WithRenewedCover(ctx context.Context, renew func(context.Context) error, op
 				// still lives, the next tick retries.
 			}
 		}
-	}()
+	})
 	opErr = op(opCtx)
 	close(done)
 	wg.Wait()
@@ -868,8 +866,7 @@ func ensureBucket(ctx context.Context, client bucketLifecycleClient, name, regio
 		}
 		return nil
 	}
-	var apiErr smithy.APIError
-	if errors.As(err, &apiErr) {
+	if apiErr, ok := errors.AsType[smithy.APIError](err); ok {
 		switch apiErr.ErrorCode() {
 		case "BucketAlreadyOwnedByYou", "BucketAlreadyExists":
 			// AlreadyOwnedByYou proves the CREDENTIALS' account owns the

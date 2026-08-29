@@ -170,7 +170,7 @@ func TestProbabilisticFaultsAreSeedDeterministic(t *testing.T) {
 		inj.SetProbs(OpRefCASRef, Probs{Clean: 0.2, Ambiguous: 0.2})
 		st := NewSimRefStore(inner, inj)
 		sha := shaA
-		for i := 0; i < 40; i++ {
+		for i := range 40 {
 			_, _ = st.CASRef(ctx, "r", fmt.Sprintf("refs/heads/b%02d", i), ref.ZeroSHA, sha)
 		}
 		return inj.Fired()

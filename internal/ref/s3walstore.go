@@ -575,8 +575,7 @@ func (s *S3WAL) mutate(ctx context.Context, base string, mu s3walMutation) error
 			// Provably never sent — plain retry.
 			continue
 		}
-		var amb *s3wal.AmbiguousError
-		if !errors.As(werr, &amb) {
+		if _, ok := errors.AsType[*s3wal.AmbiguousError](werr); !ok {
 			// Definitive non-conditional failure (auth, bucket, …) or
 			// exhausted 409 contention: the store responded with a
 			// rejection, so the write did not take effect (5xx and

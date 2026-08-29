@@ -513,7 +513,7 @@ func TestAuthorityDoomedCreations_PushProportionalProbes(t *testing.T) {
 		"refs/heads/plain": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 	}
 	// Repo-sized ballast the probe must never read.
-	for i := 0; i < 2000; i++ {
+	for i := range 2000 {
 		refs[fmt.Sprintf("refs/zbulk/b%04d", i)] = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	}
 	st := &probeCountStore{countingStore: &countingStore{gen: 1, refs: refs}}
@@ -643,7 +643,7 @@ func TestPushHoldDirCache_ReparsesOnlyOnChange(t *testing.T) {
 	if cache.parses != 2 {
 		t.Fatalf("parses after first load = %d, want 2", cache.parses)
 	}
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		if _, err := cache.load(); err != nil {
 			t.Fatalf("steady-state load: %v", err)
 		}
@@ -747,7 +747,7 @@ func TestAuthorityDoomedCreations_BatchProber(t *testing.T) {
 		"refs/heads/plain": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 	}
 	var creations []string
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		parent := fmt.Sprintf("refs/heads/p%03d", i)
 		refs[parent+"/held"] = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 		creations = append(creations, parent)
@@ -1037,7 +1037,7 @@ func TestPushVerifiedVerdicts_EveryPassPreserved(t *testing.T) {
 	sha2 := strings.Repeat("b", 40)
 	const n = 5000
 	digests := make([][sha256.Size]byte, 0, n)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		digests = append(digests, pushVerifiedDigest(fmt.Sprintf("refs/heads/b/%04d", i), sha, sha2))
 	}
 	if err := writePushVerifiedVerdicts(hold, digests); err != nil {
@@ -1050,7 +1050,7 @@ func TestPushVerifiedVerdicts_EveryPassPreserved(t *testing.T) {
 	if fi.IsDir() || fi.Size() != int64(n*sha256.Size) {
 		t.Fatalf("sidecar = dir:%v size:%d, want one %d-byte file", fi.IsDir(), fi.Size(), n*sha256.Size)
 	}
-	for i := 0; i < n; i++ {
+	for i := range n {
 		if !pushVerifiedVerdict(hold, fmt.Sprintf("refs/heads/b/%04d", i), sha, sha2) {
 			t.Fatalf("verdict %d dropped (the legacy inode cap was 4096)", i)
 		}
@@ -1355,7 +1355,7 @@ func TestLivePushHoldsKey_StatOnly(t *testing.T) {
 		t.Fatalf("mintPushHold: %v", err)
 	}
 	var sb strings.Builder
-	for i := 0; i < 100_000; i++ {
+	for i := range 100_000 {
 		fmt.Fprintf(&sb, "refs/heads/b/%06d\n", i)
 	}
 	if err := os.WriteFile(hold, []byte(sb.String()), 0o644); err != nil {
@@ -1374,7 +1374,7 @@ func TestLivePushHoldsKey_StatOnly(t *testing.T) {
 	// GC.
 	var before, after runtime.MemStats
 	runtime.ReadMemStats(&before)
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		if _, ok := livePushHoldsKey(repoDir); !ok {
 			t.Fatal("livePushHoldsKey failed")
 		}
@@ -1657,7 +1657,7 @@ func TestClassifyReservation_ParsesPolicyOnce(t *testing.T) {
 	sha := strings.Repeat("a", 40)
 	sha2 := strings.Repeat("b", 40)
 	refPolicyParses.Store(0)
-	for i := 0; i < 100; i++ {
+	for range 100 {
 		if got := classifyReservation("r", "refs/heads/noff", sha, sha2); got != reservationJIT {
 			t.Fatalf("classifyReservation = %v, want %v", got, reservationJIT)
 		}
@@ -1742,7 +1742,7 @@ func TestReservePushHolds_PeerScanWorkBounded(t *testing.T) {
 		t.Fatalf("mkdir: %v", err)
 	}
 	var sb strings.Builder
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		fmt.Fprintf(&sb, "refs/heads/peer/%03d\n", i)
 	}
 	peer := filepath.Join(dir, "push-peer")
@@ -4089,7 +4089,7 @@ func TestReferenceTransactionHook_FlushesBoundedBatches(t *testing.T) {
 	const n = 20 // 2 full batches + remainder
 	var holdNames, stdin strings.Builder
 	zeros, ones := strings.Repeat("0", 40), strings.Repeat("1", 40)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		name := fmt.Sprintf("refs/heads/f-%03d", i)
 		holdNames.WriteString(name + "\n")
 		stdin.WriteString(zeros + " " + ones + " " + name + "\n")
@@ -4128,7 +4128,7 @@ func TestReferenceTransactionHook_FlushesBoundedBatches(t *testing.T) {
 	if err != nil {
 		t.Fatalf("readPushHolds: %v", err)
 	}
-	for i := 0; i < n; i++ {
+	for i := range n {
 		if set.contains(fmt.Sprintf("refs/heads/f-%03d", i)) {
 			t.Fatalf("name %d not released", i)
 		}
@@ -4315,7 +4315,7 @@ func TestPeerHoldCovers_StreamsWithoutParsing(t *testing.T) {
 		t.Fatalf("mkdir: %v", err)
 	}
 	var sb strings.Builder
-	for i := 0; i < 100_000; i++ {
+	for i := range 100_000 {
 		fmt.Fprintf(&sb, "refs/heads/b/%06d\n", i)
 	}
 	peer := filepath.Join(dir, "push-peer")
@@ -4349,7 +4349,7 @@ func TestPeerHoldCovers_StreamsWithoutParsing(t *testing.T) {
 	// count. TotalAlloc is monotonic, so the delta is exact.
 	var before, after runtime.MemStats
 	runtime.ReadMemStats(&before)
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		if _, _, err := peerHoldCovers(dir, "", "refs/heads/zzz", maxPushPeerScanBytes); err != nil {
 			t.Fatalf("peerHoldCovers: %v", err)
 		}

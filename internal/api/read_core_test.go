@@ -223,7 +223,7 @@ func coreSeedFixture(t *testing.T, e *testEnv, org string) coreFixture {
 	if !ok {
 		t.Fatalf("malformed commit object %q", rawSigned)
 	}
-	for _, line := range strings.Split(headers, "\n") {
+	for line := range strings.SplitSeq(headers, "\n") {
 		signedRaw.WriteString(line + "\n")
 		if strings.HasPrefix(line, "committer ") {
 			for i, sigLine := range strings.Split(coreFakeSignature, "\n") {

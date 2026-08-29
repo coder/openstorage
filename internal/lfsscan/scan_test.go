@@ -189,7 +189,7 @@ func TestReachableLFSOIDs_LargeBlobsChargeBudget(t *testing.T) {
 	dir := t.TempDir()
 	mustGit(t, dir, "init", "-q", "--initial-branch=main")
 	writeFile(t, dir, "a.bin", lfsPointer(oidA, 100), 0o644)
-	for i := 0; i < 8; i++ {
+	for i := range 8 {
 		writeFile(t, dir, fmt.Sprintf("big-%d.dat", i), strings.Repeat("x", 5000)+fmt.Sprint(i), 0o644)
 	}
 	mustGit(t, dir, "add", "-A")
@@ -235,7 +235,7 @@ func TestReachableLFSOIDs_WideTreesChargeBudget(t *testing.T) {
 	// on a second branch: one ~480KB raw tree, no new unique blobs.
 	junkSHA := strings.TrimSpace(mustGit(t, dir, "rev-parse", "HEAD:junk.dat"))
 	var entries strings.Builder
-	for i := 0; i < 12_000; i++ {
+	for i := range 12_000 {
 		fmt.Fprintf(&entries, "100644 %s\twide/entry-%06d\n", junkSHA, i)
 	}
 	mustGitStdin(t, dir, entries.String(), "update-index", "--add", "--index-info")

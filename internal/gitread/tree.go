@@ -51,7 +51,7 @@ func LsTree(ctx context.Context, repoPath, commit, path string, recursive bool) 
 		return nil, err
 	}
 	entries := []TreeEntry{}
-	for _, rec := range strings.Split(out, "\x00") {
+	for rec := range strings.SplitSeq(out, "\x00") {
 		if rec == "" {
 			continue
 		}

@@ -427,7 +427,7 @@ func TestAbsenceReconcile_FoldedAwayRowReleasesCover(t *testing.T) {
 // loudly instead of letting covers round-robin past their TTL.
 func TestAbsenceReconcile_RenewalNeverLapsesOnBudget(t *testing.T) {
 	f := newSweepFixture(t)
-	for i := 0; i < 60; i++ {
+	for i := range 60 {
 		base := fmt.Sprintf("repo-rr-%02d", i)
 		registerLFS(t, f, base, blob.LFSKey(base, absenceOID('a')), 10)
 	}
@@ -537,7 +537,7 @@ func TestAbsenceReconcile_MultiPassBaseRetiresLegacy(t *testing.T) {
 	ctx := context.Background()
 	base := "repo-multipass"
 	// Six present rows: more than pass 1's LFS allocation can settle.
-	for i := byte(0); i < 6; i++ {
+	for i := range byte(6) {
 		key := blob.LFSKey(base, absenceOID('a'+i))
 		registerLFS(t, f, base, key, 10)
 		f.upload(key, strings.Repeat("x", 10))
@@ -587,12 +587,12 @@ func TestAbsenceReconcile_OutOfPhaseClassProofsRetireLegacy(t *testing.T) {
 	f := newSweepFixture(t)
 	ctx := context.Background()
 	base := "m-target"
-	for i := byte(0); i < 6; i++ {
+	for i := range byte(6) {
 		key := blob.LFSKey(base, absenceOID('a'+i))
 		registerLFS(t, f, base, key, 10)
 		f.upload(key, strings.Repeat("x", 10))
 	}
-	for i := byte(0); i < 9; i++ {
+	for i := range byte(9) {
 		id := fmt.Sprintf("p%02d", i)
 		key := blob.PackKey(base, id)
 		size := f.upload(key, strings.Repeat("y", 10))
@@ -603,12 +603,12 @@ func TestAbsenceReconcile_OutOfPhaseClassProofsRetireLegacy(t *testing.T) {
 	// Fleet filler surrounding the target in keyset order: the class
 	// rotations spend their per-pass allocations here, so the target's
 	// two class ranges complete in DIFFERENT passes.
-	for i := byte(0); i < 20; i++ {
+	for i := range byte(20) {
 		key := blob.LFSKey("a-filler", absenceOID('a'+i))
 		registerLFS(t, f, "a-filler", key, 10)
 		f.upload(key, strings.Repeat("x", 10))
 	}
-	for i := byte(0); i < 20; i++ {
+	for i := range byte(20) {
 		id := fmt.Sprintf("zp%02d", i)
 		key := blob.PackKey("z-filler", id)
 		size := f.upload(key, strings.Repeat("y", 10))
@@ -670,7 +670,7 @@ func TestAbsenceReconcile_PersistedProofRetiresWithFreshVerification(t *testing.
 	ctx := context.Background()
 	base := "repo-persisted-proof"
 	reg := absenceRegistry(t, f)
-	for i := byte(0); i < 6; i++ {
+	for i := range byte(6) {
 		key := blob.LFSKey(base, absenceOID('a'+i))
 		registerLFS(t, f, base, key, 10)
 		f.upload(key, strings.Repeat("x", 10))
@@ -725,12 +725,12 @@ func TestAbsenceReconcile_GapLossCaughtByVerification(t *testing.T) {
 	base := "m-gap-loss"
 	// Filler sorting BEFORE the target keeps pass 2's wrapped tail away
 	// from the lost row: only the verification may observe it.
-	for i := byte(0); i < 10; i++ {
+	for i := range byte(10) {
 		key := blob.LFSKey("a-filler", absenceOID('a'+i))
 		registerLFS(t, f, "a-filler", key, 10)
 		f.upload(key, strings.Repeat("x", 10))
 	}
-	for i := byte(0); i < 6; i++ {
+	for i := range byte(6) {
 		key := blob.LFSKey(base, absenceOID('a'+i))
 		registerLFS(t, f, base, key, 10)
 		f.upload(key, strings.Repeat("x", 10))
@@ -785,12 +785,12 @@ func TestAbsenceReconcile_CombinedClassesExceedingPoolConverge(t *testing.T) {
 	base := "repo-combined"
 	// 12 LFS rows + 16 pack rows: each class fits the pool (budget 20)
 	// alone, never together (12+16 > 20).
-	for i := byte(0); i < 12; i++ {
+	for i := range byte(12) {
 		key := blob.LFSKey(base, absenceOID('a'+i))
 		registerLFS(t, f, base, key, 10)
 		f.upload(key, strings.Repeat("x", 10))
 	}
-	for i := byte(0); i < 16; i++ {
+	for i := range byte(16) {
 		id := fmt.Sprintf("p%02d", i)
 		key := blob.PackKey(base, id)
 		size := f.upload(key, strings.Repeat("y", 10))
@@ -845,12 +845,12 @@ func TestAbsenceReconcile_StaleHintLossRechargeReverifiedAtFold(t *testing.T) {
 	// Filler sorting BEFORE the target: the pass's LFS rotation spends
 	// its whole allocation there and parks, so only the fold-time
 	// re-stat can observe the target this pass.
-	for i := byte(0); i < 10; i++ {
+	for i := range byte(10) {
 		key := blob.LFSKey("a-filler", absenceOID('a'+i))
 		registerLFS(t, f, "a-filler", key, 10)
 		f.upload(key, strings.Repeat("x", 10))
 	}
-	for i := byte(0); i < 6; i++ {
+	for i := range byte(6) {
 		key := blob.LFSKey(base, absenceOID('a'+i))
 		registerLFS(t, f, base, key, 10)
 		f.upload(key, strings.Repeat("x", 10))
@@ -920,7 +920,7 @@ func TestAbsenceReconcile_CandidacySurvivesSelfRenewalBumps(t *testing.T) {
 	reg := absenceRegistry(t, f)
 	// LFS filler large enough that the LFS rotation NEVER reaches the
 	// target: only the candidacy can ever complete the LFS side.
-	for i := 0; i < 60; i++ {
+	for i := range 60 {
 		key := blob.LFSKey("a-fill", strings.Repeat(fmt.Sprintf("%02x", i), 32))
 		registerLFS(t, f, "a-fill", key, 10)
 		f.upload(key, strings.Repeat("x", 10))
@@ -928,7 +928,7 @@ func TestAbsenceReconcile_CandidacySurvivesSelfRenewalBumps(t *testing.T) {
 	// Pack filler the packs rotation needs multiple passes to cross;
 	// the target has NO pack rows, so its packs proof is the row-less
 	// window of the traversal that finally wraps.
-	for i := byte(0); i < 10; i++ {
+	for i := range byte(10) {
 		id := fmt.Sprintf("fp%02d", i)
 		key := blob.PackKey("a-fill", id)
 		size := f.upload(key, strings.Repeat("y", 10))
@@ -936,7 +936,7 @@ func TestAbsenceReconcile_CandidacySurvivesSelfRenewalBumps(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	for i := byte(0); i < 6; i++ {
+	for i := range byte(6) {
 		key := blob.LFSKey(base, absenceOID('a'+i))
 		registerLFS(t, f, base, key, 10)
 		f.upload(key, strings.Repeat("x", 10))
@@ -1030,7 +1030,7 @@ func TestAbsenceReconcile_HintFoldPrecedesRotations(t *testing.T) {
 	defer cancel()
 	base := "m-priority"
 	reg := absenceRegistry(t, f)
-	for i := byte(0); i < 6; i++ {
+	for i := range byte(6) {
 		key := blob.LFSKey(base, absenceOID('a'+i))
 		registerLFS(t, f, base, key, 10)
 		f.upload(key, strings.Repeat("x", 10))
@@ -1231,7 +1231,7 @@ func TestAbsenceReconcile_UnprovableContinuitySuccessArmsFence(t *testing.T) {
 	reg := absenceRegistry(t, f)
 	// Multi-pass LFS keyspace: 30 rows, budget 12 — the first pass
 	// parks mid-rotation, so the armed fence is observable at pass end.
-	for i := 0; i < 30; i++ {
+	for i := range 30 {
 		key := blob.LFSKey("a-fill", strings.Repeat(fmt.Sprintf("%02x", i), 32))
 		registerLFS(t, f, "a-fill", key, 10)
 		f.upload(key, strings.Repeat("x", 10))
@@ -1301,7 +1301,7 @@ func TestAbsenceReconcile_UpgradeFirstPassKeepsAdmissionOpen(t *testing.T) {
 	ctx := context.Background()
 	reg := absenceRegistry(t, f)
 	// Multi-pass keyspace: an armed fence would outlive this pass.
-	for i := 0; i < 30; i++ {
+	for i := range 30 {
 		key := blob.LFSKey("a-fill", strings.Repeat(fmt.Sprintf("%02x", i), 32))
 		registerLFS(t, f, "a-fill", key, 10)
 		f.upload(key, strings.Repeat("x", 10))
@@ -1401,7 +1401,7 @@ func TestAbsenceReconcile_AdmissionGCDurableLapseMarker(t *testing.T) {
 	reg := absenceRegistry(t, f)
 	// Multi-pass keyspace (an armed fence must outlive one pass) plus one
 	// ABSENT row whose cover is the future lapse evidence.
-	for i := 0; i < 30; i++ {
+	for i := range 30 {
 		key := blob.LFSKey("a-fill", strings.Repeat(fmt.Sprintf("%02x", i), 32))
 		registerLFS(t, f, "a-fill", key, 10)
 		f.upload(key, strings.Repeat("x", 10))
@@ -1518,7 +1518,7 @@ func TestAbsenceReconcile_MarkerRereadClosesProbeRace(t *testing.T) {
 	reg := absenceRegistry(t, f)
 	// Multi-pass keyspace (the armed fence must be observable at pass
 	// end) plus one ABSENT row whose cover becomes the racing evidence.
-	for i := 0; i < 30; i++ {
+	for i := range 30 {
 		key := blob.LFSKey("a-fill", strings.Repeat(fmt.Sprintf("%02x", i), 32))
 		registerLFS(t, f, "a-fill", key, 10)
 		f.upload(key, strings.Repeat("x", 10))
@@ -1566,7 +1566,7 @@ func TestAbsenceReconcile_ContinuityBoundCoversStampDelay(t *testing.T) {
 	ctx := context.Background()
 	reg := absenceRegistry(t, f)
 	base := "repo-stamp-delay"
-	for i := byte(0); i < 6; i++ {
+	for i := range byte(6) {
 		key := blob.LFSKey(base, absenceOID('a'+i))
 		registerLFS(t, f, base, key, 10)
 		f.upload(key, strings.Repeat("x", 10))
@@ -1702,7 +1702,7 @@ func TestAbsenceReconcile_TransientCursorReadErrorSnapshotSentinel(t *testing.T)
 	reg := absenceRegistry(t, f)
 	// Multi-pass keyspace: 30 present rows, so a budget-12 pass cannot
 	// complete the recovery rotation the sentinel demands.
-	for i := 0; i < 30; i++ {
+	for i := range 30 {
 		key := blob.LFSKey("a-fill", strings.Repeat(fmt.Sprintf("%02x", i), 32))
 		registerLFS(t, f, "a-fill", key, 10)
 		f.upload(key, strings.Repeat("x", 10))
@@ -1787,13 +1787,13 @@ func TestAbsenceReconcile_SeededCandidaciesRetainedPastCap(t *testing.T) {
 	reg := absenceRegistry(t, f)
 	rec := testReconciler(t, f, true, 100)
 	rec.proofCap = 1
-	for iter := 0; iter < 10; iter++ {
+	for iter := range 10 {
 		rec.legacyRows = nil
 		rec.proofGens = map[string]map[string]absenceProofEntry{}
 		rec.cleanBases = map[string]map[string]bool{absenceClassLFS: {}, absenceClassPacks: {}}
 		rec.renewalComplete = true
 		// 40 fresh candidacies, every one sorting BEFORE the seeded base.
-		for i := 0; i < 40; i++ {
+		for i := range 40 {
 			base := fmt.Sprintf("a-fresh-%02d", i)
 			rec.legacyRows = append(rec.legacyRows, ref.AbsenceCoverRow{Base: base})
 			rec.cleanBases[absenceClassLFS][base] = true
@@ -1860,7 +1860,7 @@ func TestAbsenceReconcile_FencedPassDefersFoldsToRecovery(t *testing.T) {
 	// Budget-starved keyspace: 30 a-fill rows sort BEFORE zz-legacy's,
 	// so any zz-legacy Stat in the fenced pass can only come from a fold
 	// re-stat.
-	for i := 0; i < 30; i++ {
+	for i := range 30 {
 		key := blob.LFSKey("a-fill", strings.Repeat(fmt.Sprintf("%02x", i), 32))
 		registerLFS(t, f, "a-fill", key, 10)
 		f.upload(key, strings.Repeat("x", 10))
@@ -1973,7 +1973,7 @@ func TestAbsenceReconcile_DirtyRecoveryRotationKeepsFenceArmed(t *testing.T) {
 	// Multi-pass LFS keyspace: 30 rows, budget 12. Row 0 sorts first
 	// and is registered but MISSING — its deficit charge is the error
 	// injection target for the rotation's first pass.
-	for i := 0; i < 30; i++ {
+	for i := range 30 {
 		key := blob.LFSKey("a-fill", strings.Repeat(fmt.Sprintf("%02x", i), 32))
 		registerLFS(t, f, "a-fill", key, 10)
 		if i != 0 {
@@ -2047,7 +2047,7 @@ func TestAbsenceReconcile_StaleCursorRestartPreservesFenceCounters(t *testing.T)
 	ctx := context.Background()
 	reg := absenceRegistry(t, f)
 	base := "repo-stale-fence"
-	for i := byte(0); i < 6; i++ {
+	for i := range byte(6) {
 		key := blob.LFSKey(base, absenceOID('a'+i))
 		registerLFS(t, f, base, key, 10)
 		f.upload(key, strings.Repeat("x", 10))
@@ -2110,7 +2110,7 @@ func TestAbsenceReconcile_GapMutationDefersLegacyRetirement(t *testing.T) {
 	f := newSweepFixture(t)
 	ctx := context.Background()
 	base := "repo-gap-mutation"
-	for i := byte(0); i < 6; i++ {
+	for i := range byte(6) {
 		key := blob.LFSKey(base, absenceOID('a'+i))
 		registerLFS(t, f, base, key, 10)
 		f.upload(key, strings.Repeat("x", 10))
@@ -2582,7 +2582,7 @@ func TestAbsenceReconcile_DiscoveryRunsWhenCoversExceedBudget(t *testing.T) {
 	f := newSweepFixture(t)
 	ctx := context.Background()
 	// 8 live deterministic covers = the whole budget.
-	for i := 0; i < 8; i++ {
+	for i := range 8 {
 		base := fmt.Sprintf("repo-crowd-%d", i)
 		if err := ref.ReserveRestoreCover(ctx, absenceRegistry(t, f), blob.QuotaRepoGroup(base), absenceIncarnationKey(base, absenceClassLFS, 1), 10, time.Hour); err != nil {
 			t.Fatalf("seed cover %d: %v", i, err)
@@ -2830,7 +2830,7 @@ func TestAbsenceReconcile_StaleCursorRestartsFromOrigin(t *testing.T) {
 	f := newSweepFixture(t)
 	ctx := context.Background()
 	base := "repo-stale-cursor"
-	for i := byte(0); i < 6; i++ {
+	for i := range byte(6) {
 		key := blob.LFSKey(base, absenceOID('a'+i))
 		registerLFS(t, f, base, key, 10)
 		f.upload(key, strings.Repeat("x", 10))
@@ -2876,7 +2876,7 @@ func TestAbsenceReconcile_QuotaFlipRestartsFromOrigin(t *testing.T) {
 	f := newSweepFixture(t)
 	ctx := context.Background()
 	base := "repo-quota-flip"
-	for i := byte(0); i < 6; i++ {
+	for i := range byte(6) {
 		key := blob.LFSKey(base, absenceOID('a'+i))
 		registerLFS(t, f, base, key, 10)
 		f.upload(key, strings.Repeat("x", 10))
@@ -3059,7 +3059,7 @@ func TestAbsenceReconcile_TouchFailureSkipsCursorStamp(t *testing.T) {
 	f := newSweepFixture(t)
 	ctx := context.Background()
 	base := "repo-touch-skip"
-	for i := byte(0); i < 6; i++ {
+	for i := range byte(6) {
 		key := blob.LFSKey(base, absenceOID('a'+i))
 		registerLFS(t, f, base, key, 10)
 		f.upload(key, strings.Repeat("x", 10))

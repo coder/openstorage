@@ -244,8 +244,7 @@ var errClaimStolen = errors.New("sync claim stolen during run")
 // failureCode maps a run error onto the documented repo.sync.failed string.
 func failureCode(err error) string {
 	assertf(err != nil, "failureCode: nil error")
-	var f *syncFailure
-	if errors.As(err, &f) {
+	if f, ok := errors.AsType[*syncFailure](err); ok {
 		return f.code
 	}
 	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
@@ -399,10 +398,7 @@ const deferRetrySlack = time.Second
 // stays alive for the moment the operator enables the opt-in (or the old
 // replica finishes) without burning queue and store work every second.
 func deferredRetryDelay(up Upstream) time.Duration {
-	delay := time.Until(up.SyncClaimExpiresAt) + deferRetrySlack
-	if delay < deferRetrySlack {
-		delay = deferRetrySlack
-	}
+	delay := max(time.Until(up.SyncClaimExpiresAt)+deferRetrySlack, deferRetrySlack)
 	if up.SyncClaimHolder == LegacyClaimHolder && delay < claimLeaseSlack {
 		delay = claimLeaseSlack
 	}

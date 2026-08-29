@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"sort"
 	"strings"
 
@@ -92,9 +93,7 @@ func (s *sim) oraclePackSet(repoKey string) (map[string]string, error) {
 // foldOutcome computes the row set a won fold of old into newPack yields.
 func foldOutcome(pre map[string]string, old []ref.Pack, newPack ref.Pack) map[string]string {
 	out := make(map[string]string, len(pre))
-	for id, key := range pre {
-		out[id] = key
-	}
+	maps.Copy(out, pre)
 	for _, p := range old {
 		delete(out, p.ID)
 	}

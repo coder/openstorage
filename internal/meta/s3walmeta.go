@@ -611,8 +611,7 @@ func (s *S3WAL) mutate(ctx context.Context, mu s3walMetaMutation) error {
 		case errors.Is(werr, s3wal.ErrNotExecuted):
 			continue // provably never sent — plain retry
 		}
-		var amb *s3wal.AmbiguousError
-		if !errors.As(werr, &amb) {
+		if _, ok := errors.AsType[*s3wal.AmbiguousError](werr); !ok {
 			// Definitive rejection (auth, bucket, exhausted contention):
 			// the write did not take effect.
 			return fmt.Errorf("s3walmeta %s: %w", mu.op, werr)

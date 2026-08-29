@@ -12,6 +12,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"time"
 	"unicode/utf8"
 )
@@ -257,10 +258,8 @@ func (m *Manifest) RecordOp(opID string) {
 // both inconclusive.
 func (m *Manifest) OpApplied(opID string) bool {
 	assertf(opID != "", "OpApplied: empty op id")
-	for _, id := range m.Ops {
-		if id == opID {
-			return true
-		}
+	if slices.Contains(m.Ops, opID) {
+		return true
 	}
 	for _, r := range m.Reservations {
 		if r != nil && r.OpID == opID {
@@ -359,10 +358,7 @@ func Elapsed(localNow, clk, stamp time.Time) time.Duration {
 // trouble can forge.
 func SkewOK(localNow, clk time.Time, wallDrift, ttl time.Duration) bool {
 	assertf(ttl > 0, "SkewOK: non-positive ttl %v", ttl)
-	bound := ttl / 4
-	if bound > 15*time.Minute {
-		bound = 15 * time.Minute
-	}
+	bound := min(ttl/4, 15*time.Minute)
 	return !clk.After(localNow.Add(bound)) && DriftOK(wallDrift, ttl)
 }
 
@@ -376,10 +372,7 @@ func SkewOK(localNow, clk time.Time, wallDrift, ttl time.Duration) bool {
 // upstream.
 func DriftOK(wallDrift, ttl time.Duration) bool {
 	assertf(ttl > 0, "DriftOK: non-positive ttl %v", ttl)
-	bound := ttl / 4
-	if bound > 15*time.Minute {
-		bound = 15 * time.Minute
-	}
+	bound := min(ttl/4, 15*time.Minute)
 	if bound == 0 {
 		return true
 	}
@@ -403,10 +396,7 @@ const DateTolerance = 2 * time.Second
 // locks ~2.75m, claims 30m, graces ≥1h) sits far above it.
 func DateSkewBound(ttl time.Duration) time.Duration {
 	assertf(ttl > 0, "DateSkewBound: non-positive ttl %v", ttl)
-	bound := ttl / 4
-	if bound > 15*time.Minute {
-		bound = 15 * time.Minute
-	}
+	bound := min(ttl/4, 15*time.Minute)
 	if bound < DateTolerance {
 		return 0
 	}

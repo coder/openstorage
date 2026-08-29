@@ -37,7 +37,7 @@ func localRefs(t *testing.T, repoPath string) map[string]string {
 	t.Helper()
 	out := mustGit(t, repoPath, "for-each-ref", "--format=%(refname) %(objectname)")
 	refs := map[string]string{}
-	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+	for line := range strings.SplitSeq(strings.TrimSpace(out), "\n") {
 		if line == "" {
 			continue
 		}
@@ -82,7 +82,7 @@ func TestSyncRefsStreamed_BatchesAndOverflow(t *testing.T) {
 	head := revParse(t, dir, "HEAD")
 
 	want := map[string]string{"refs/heads/main": head}
-	for i := 0; i < 7; i++ {
+	for i := range 7 {
 		want[fmt.Sprintf("refs/heads/load-%02d", i)] = head
 	}
 

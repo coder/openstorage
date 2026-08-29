@@ -527,8 +527,7 @@ func TestEndToEndPushDelivery(t *testing.T) {
 		Repos:    &fakeRepos{repo: meta.Repo{RepoID: "repo_e2e", OrgID: 42, URL: "acme/e2e"}},
 		Webhooks: &fakeLister{hooks: []Webhook{hook}},
 		EnqueueDelivery: func(ctx context.Context, d Delivery) error {
-			wg.Add(1)
-			go func() { defer wg.Done(); _ = deliverer.Deliver(ctx, d) }()
+			wg.Go(func() { ; _ = deliverer.Deliver(ctx, d) })
 			return nil
 		},
 		Logger: testLogger(),

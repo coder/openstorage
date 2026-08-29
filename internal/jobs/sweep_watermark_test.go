@@ -152,10 +152,10 @@ func TestSweepReapWatermark_NotRecordedOnDeleteFailure(t *testing.T) {
 // is a sweep error (loud), and the watermark simply does not advance.
 func TestSweepReapWatermark_RecorderFailureReported(t *testing.T) {
 	f := newSweepFixture(t)
-	cfg := SweepConfig{Threshold: 24 * time.Hour, DeleteLFS: true}
-	cfg.RecordLFSReapComplete = func(context.Context, int64, bool) error {
-		return fmt.Errorf("scan-state write refused")
-	}
+	cfg := SweepConfig{Threshold: 24 * time.Hour, DeleteLFS: true,
+		RecordLFSReapComplete: func(context.Context, int64, bool) error {
+			return fmt.Errorf("scan-state write refused")
+		}}
 	if _, err := f.sweeper(cfg).Sweep(context.Background()); err == nil || !strings.Contains(err.Error(), "record lfs reap watermark") {
 		t.Fatalf("Sweep err = %v, want the recording failure joined", err)
 	}

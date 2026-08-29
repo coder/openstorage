@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/pem"
 	"log/slog"
+	"maps"
 	"math"
 	"os"
 	"path/filepath"
@@ -62,9 +63,7 @@ func TestResolveServeConfigZeroInfraPairing(t *testing.T) {
 	}
 	t.Run("file blob refused", func(t *testing.T) {
 		env := map[string]string{"CODESTORAGE_S3_URL": "file:///var/blobs"}
-		for k, v := range base {
-			env[k] = v
-		}
+		maps.Copy(env, base)
 		_, err := resolveServeConfig(mapEnv(env), "", "127.0.0.1:0", "/tmp/cache", "")
 		if err == nil || !strings.Contains(err.Error(), "s3://") {
 			t.Fatalf("s3wal + file:// blob store must refuse with the zero-infra pairing error, got %v", err)
@@ -72,9 +71,7 @@ func TestResolveServeConfigZeroInfraPairing(t *testing.T) {
 	})
 	t.Run("data-dir derived file blob refused", func(t *testing.T) {
 		env := map[string]string{}
-		for k, v := range base {
-			env[k] = v
-		}
+		maps.Copy(env, base)
 		// --data-dir fills the empty blob slot with file://…/blobs; the
 		// pairing rule must catch the derived URL too.
 		if _, err := resolveServeConfig(mapEnv(env), "", "127.0.0.1:0", "/tmp/cache", t.TempDir()); err == nil {
@@ -83,9 +80,7 @@ func TestResolveServeConfigZeroInfraPairing(t *testing.T) {
 	})
 	t.Run("s3 blob accepted", func(t *testing.T) {
 		env := map[string]string{"CODESTORAGE_S3_URL": "s3://bkt?endpoint=http://127.0.0.1:8333"}
-		for k, v := range base {
-			env[k] = v
-		}
+		maps.Copy(env, base)
 		cfg, err := resolveServeConfig(mapEnv(env), "", "127.0.0.1:0", "/tmp/cache", "")
 		if err != nil {
 			t.Fatalf("s3wal + s3:// (same bucket) must resolve: %v", err)
@@ -121,9 +116,7 @@ func TestResolveServeConfigCompatForbidsDestructiveLFSSweep(t *testing.T) {
 		"CODESTORAGE_LFS_V020_WRITE_COMPAT": "true",
 		"CODESTORAGE_SWEEP_DELETE_LFS":      "true",
 	}
-	for k, v := range spikeEnv {
-		env[k] = v
-	}
+	maps.Copy(env, spikeEnv)
 	if _, err := resolveServeConfig(mapEnv(env), "", "127.0.0.1:0", "/tmp/cache", ""); err == nil {
 		t.Fatal("write-compat + destructive LFS sweeping resolved — the combination breaks v0.2.0 replicas mid-roll and must fail startup")
 	}
@@ -160,9 +153,7 @@ func TestResolveServeConfigLFSGCDeleteRequiresLFSReap(t *testing.T) {
 		"CODESTORAGE_LFS_GC_INTERVAL":       "1h",
 		"CODESTORAGE_LFS_GC_DELETE_ENABLED": "true",
 	}
-	for k, v := range spikeEnv {
-		env[k] = v
-	}
+	maps.Copy(env, spikeEnv)
 	if _, err := resolveServeConfig(mapEnv(env), "", "127.0.0.1:0", "/tmp/cache", ""); err == nil {
 		t.Fatal("delete-mode reclamation without the LFS reap resolved — retirement would refund cap slots while stranding their blobs")
 	}
@@ -209,9 +200,7 @@ func TestResolveServeConfigLegacyEnvCompat(t *testing.T) {
 		"CODESTORAGE_ORG":         "org1",
 		"CODESTORAGE_ORG_PUBKEYS": "/tmp/org.pub.pem",
 	}
-	for k, v := range spikeEnv {
-		env[k] = v
-	}
+	maps.Copy(env, spikeEnv)
 	cfg, err := resolveServeConfig(mapEnv(env), "", "127.0.0.1:0", "/tmp/cache", "")
 	if err != nil {
 		t.Fatal(err)
@@ -287,12 +276,8 @@ func TestResolveServeConfigDataDir(t *testing.T) {
 	}
 	withOrg := func(extra map[string]string) func(string) string {
 		m := map[string]string{}
-		for k, v := range orgEnv {
-			m[k] = v
-		}
-		for k, v := range extra {
-			m[k] = v
-		}
+		maps.Copy(m, orgEnv)
+		maps.Copy(m, extra)
 		return mapEnv(m)
 	}
 
@@ -468,9 +453,7 @@ func TestResolveServeConfigBaseURL(t *testing.T) {
 	}
 	env := func(baseURL string) func(string) string {
 		m := map[string]string{"CODESTORAGE_BASE_URL": baseURL}
-		for k, v := range base {
-			m[k] = v
-		}
+		maps.Copy(m, base)
 		return mapEnv(m)
 	}
 
@@ -564,9 +547,7 @@ func TestResolveServeConfigRateLimit(t *testing.T) {
 			"CODESTORAGE_ORG":         "org1",
 			"CODESTORAGE_ORG_PUBKEYS": "/tmp/org.pub.pem",
 		}
-		for k, v := range extra {
-			env[k] = v
-		}
+		maps.Copy(env, extra)
 		return mapEnv(env)
 	}
 
@@ -641,9 +622,7 @@ func TestResolveServeConfigTrustedProxies(t *testing.T) {
 			"CODESTORAGE_ORG":         "org1",
 			"CODESTORAGE_ORG_PUBKEYS": "/tmp/org.pub.pem",
 		}
-		for k, v := range extra {
-			env[k] = v
-		}
+		maps.Copy(env, extra)
 		return mapEnv(env)
 	}
 
@@ -710,9 +689,7 @@ func TestResolveServeConfigPackQuota(t *testing.T) {
 			"CODESTORAGE_ORG":         "org1",
 			"CODESTORAGE_ORG_PUBKEYS": "/tmp/org.pub.pem",
 		}
-		for k, v := range extra {
-			env[k] = v
-		}
+		maps.Copy(env, extra)
 		return mapEnv(env)
 	}
 
@@ -777,9 +754,7 @@ func TestResolveServeConfigPackReservationTTL(t *testing.T) {
 			"CODESTORAGE_ORG":         "org1",
 			"CODESTORAGE_ORG_PUBKEYS": "/tmp/org.pub.pem",
 		}
-		for k, v := range extra {
-			env[k] = v
-		}
+		maps.Copy(env, extra)
 		return mapEnv(env)
 	}
 
@@ -905,9 +880,7 @@ func TestResolveServeConfigLFSStaging(t *testing.T) {
 			"CODESTORAGE_ORG":         "org1",
 			"CODESTORAGE_ORG_PUBKEYS": "/tmp/org.pub.pem",
 		}
-		for k, v := range extra {
-			env[k] = v
-		}
+		maps.Copy(env, extra)
 		return mapEnv(env)
 	}
 
@@ -965,9 +938,7 @@ func TestResolveServeConfigMaxPushBytes(t *testing.T) {
 			"CODESTORAGE_ORG":         "org1",
 			"CODESTORAGE_ORG_PUBKEYS": "/tmp/org.pub.pem",
 		}
-		for k, v := range extra {
-			env[k] = v
-		}
+		maps.Copy(env, extra)
 		return mapEnv(env)
 	}
 
@@ -1071,9 +1042,7 @@ func TestResolveServeConfigVerifySigBudget(t *testing.T) {
 			"CODESTORAGE_ORG":         "org1",
 			"CODESTORAGE_ORG_PUBKEYS": "/tmp/org.pub.pem",
 		}
-		for k, v := range extra {
-			env[k] = v
-		}
+		maps.Copy(env, extra)
 		return mapEnv(env)
 	}
 
@@ -1131,9 +1100,7 @@ func TestResolveServeConfigSweep(t *testing.T) {
 			"CODESTORAGE_ORG":         "org1",
 			"CODESTORAGE_ORG_PUBKEYS": "/tmp/org.pub.pem",
 		}
-		for k, v := range extra {
-			env[k] = v
-		}
+		maps.Copy(env, extra)
 		return mapEnv(env)
 	}
 
@@ -1229,9 +1196,7 @@ func TestResolveServeConfigRepackThreshold(t *testing.T) {
 			"CODESTORAGE_ORG":         "org1",
 			"CODESTORAGE_ORG_PUBKEYS": "/tmp/org.pub.pem",
 		}
-		for k, v := range extra {
-			env[k] = v
-		}
+		maps.Copy(env, extra)
 		return mapEnv(env)
 	}
 
@@ -1533,9 +1498,7 @@ func TestResolveServeConfigAbsenceIntervalTTLCoupling(t *testing.T) {
 		"CODESTORAGE_PACK_RESERVATION_TTL":       "90s",
 		"CODESTORAGE_ABSENCE_RECONCILE_INTERVAL": "60s",
 	}
-	for k, v := range spikeEnv {
-		env[k] = v
-	}
+	maps.Copy(env, spikeEnv)
 	if _, err := resolveServeConfig(mapEnv(env), "", "127.0.0.1:0", "/tmp/cache", ""); err == nil {
 		t.Fatal("interval > TTL/2 resolved — covers would lapse between renewals")
 	}

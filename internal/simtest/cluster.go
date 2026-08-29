@@ -179,7 +179,7 @@ func newCluster(dir string, n int, inj *Injector, now func() time.Time, backend 
 		c.close()
 		return nil, fmt.Errorf("init meta schema: %w", err)
 	}
-	for i := 0; i < n; i++ {
+	for i := range n {
 		node := &simNode{
 			id:           i,
 			cacheDir:     filepath.Join(dir, fmt.Sprintf("cache-node%d", i)),
