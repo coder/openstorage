@@ -12,6 +12,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"slices"
 	"sync"
 	"testing"
 
@@ -127,11 +128,11 @@ func s3walTestStore(t *testing.T) *S3WAL {
 
 func TestMain(m *testing.M) {
 	code := m.Run()
-	for i := len(pgCleanup) - 1; i >= 0; i-- {
-		pgCleanup[i]()
+	for _, p := range slices.Backward(pgCleanup) {
+		p()
 	}
-	for i := len(s3walCleanup) - 1; i >= 0; i-- {
-		s3walCleanup[i]()
+	for _, s := range slices.Backward(s3walCleanup) {
+		s()
 	}
 	os.Exit(code)
 }
@@ -443,7 +444,7 @@ func testCASRefGenAttributesWonGeneration(t *testing.T, s Store) {
 	base := gen()
 	gens := make([]int64, writers)
 	var wg sync.WaitGroup
-	for i := 0; i < writers; i++ {
+	for i := range writers {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()

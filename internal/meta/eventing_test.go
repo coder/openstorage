@@ -372,13 +372,11 @@ func testTryBeginSyncConcurrent(t *testing.T, s Backend) {
 	claims := make(chan bool, claimers)
 	errs := make(chan error, claimers)
 	for range claimers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			_, claimed, _, err := s.TryBeginSync(ctx, repoID, testClaimHolder, time.Minute)
 			claims <- claimed
 			errs <- err
-		}()
+		})
 	}
 	wg.Wait()
 	close(claims)

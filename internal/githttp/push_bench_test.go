@@ -640,9 +640,7 @@ func runPushWindow(b *testing.B, writers int, window time.Duration) pushWindowRe
 	var obsDone sync.WaitGroup
 	if benchObserveMode() {
 		obs := newPushObserver(chains)
-		obsDone.Add(1)
-		go func() {
-			defer obsDone.Done()
+		obsDone.Go(func() {
 			// The window start/deadline are read after startCh closes
 			// (same happens-before pattern as the writers).
 			<-startCh
@@ -695,7 +693,7 @@ func runPushWindow(b *testing.B, writers int, window time.Duration) pushWindowRe
 					}
 				}
 			}
-		}()
+		})
 	}
 
 	start = time.Now()

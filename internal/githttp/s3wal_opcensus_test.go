@@ -27,7 +27,7 @@ type opLogLine struct {
 func parseOpLog(t *testing.T, raw string) []opLogLine {
 	t.Helper()
 	var out []opLogLine
-	for _, line := range strings.Split(raw, "\n") {
+	for line := range strings.SplitSeq(raw, "\n") {
 		if strings.TrimSpace(line) == "" {
 			continue
 		}

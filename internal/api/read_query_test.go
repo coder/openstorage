@@ -155,7 +155,7 @@ func buildQueryFixture(t *testing.T, e *testEnv) *queryFixture {
 	if err := e.refStore.RegisterPacks(ctx, fx.repoID, []ref.Pack{{ID: packID, Key: key}}); err != nil {
 		t.Fatalf("register seed pack: %v", err)
 	}
-	for _, line := range strings.Split(strings.TrimSpace(rqGit(t, dir, "for-each-ref", "--format=%(refname) %(objectname)")), "\n") {
+	for line := range strings.SplitSeq(strings.TrimSpace(rqGit(t, dir, "for-each-ref", "--format=%(refname) %(objectname)")), "\n") {
 		name, sha, found := strings.Cut(line, " ")
 		if !found {
 			t.Fatalf("for-each-ref emitted %q", line)

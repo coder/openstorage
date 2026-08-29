@@ -737,7 +737,7 @@ func resolveTrustedProxies(getenv func(string) string) ([]netip.Prefix, error) {
 		return nil, nil
 	}
 	var prefixes []netip.Prefix
-	for _, entry := range strings.Split(raw, ",") {
+	for entry := range strings.SplitSeq(raw, ",") {
 		entry = strings.TrimSpace(entry)
 		if entry == "" {
 			return nil, fmt.Errorf("%s: empty entry in %q", envTrustedProxies, raw)

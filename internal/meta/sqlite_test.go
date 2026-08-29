@@ -77,11 +77,9 @@ func TestSQLiteInitSchemaConcurrent(t *testing.T) {
 	var wg sync.WaitGroup
 	errs := make(chan error, 4)
 	for _, h := range []*SQLite{s, s2, s, s2} {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			errs <- h.InitSchema(ctx)
-		}()
+		})
 	}
 	wg.Wait()
 	close(errs)

@@ -420,10 +420,7 @@ func Run(cfg Config) (Result, error) {
 }
 
 func (s *sim) result() Result {
-	executed := s.step
-	if executed > s.cfg.Steps {
-		executed = s.cfg.Steps
-	}
+	executed := min(s.step, s.cfg.Steps)
 	casFaults := 0
 	casFaultOps := make(map[string]int)
 	for _, ev := range s.inj.Fired() {

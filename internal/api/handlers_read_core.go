@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -161,10 +162,8 @@ func coreCursorDecode(kind, cursor string, nFields int) ([]string, error) {
 	if len(parts) != nFields+1 || parts[0] != kind {
 		return nil, fmt.Errorf("invalid cursor")
 	}
-	for _, p := range parts[1:] {
-		if p == "" {
-			return nil, fmt.Errorf("invalid cursor")
-		}
+	if slices.Contains(parts[1:], "") {
+		return nil, fmt.Errorf("invalid cursor")
 	}
 	return parts[1:], nil
 }
@@ -849,10 +848,9 @@ func (s *server) handleFilesMetadata(w http.ResponseWriter, r *http.Request) {
 			s.internalErr(w, r, "last commit for path", fmt.Errorf("no commit touches %q at %s", e.Path, commit))
 			return
 		}
-		size := e.Size
-		if size < 0 {
-			size = 0 // submodules: ls-tree reports no blob size
-		}
+		size := max(e.Size,
+			// submodules: ls-tree reports no blob size
+			0)
 		files = append(files, fileMetaEntry{
 			Path:          e.Path,
 			Mode:          e.Mode,

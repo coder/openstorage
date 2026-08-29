@@ -150,14 +150,12 @@ func (s IdempotentCAS) reconcileLoss(ctx context.Context, repo, name, old, new s
 // cancellation mid-flight after the request was sent — is ambiguous: the
 // statement may have committed with the result lost on the way back.
 func ambiguousError(err error) bool {
-	var pgErr *pgconn.PgError
-	if errors.As(err, &pgErr) {
+	if pgErr, ok := errors.AsType[*pgconn.PgError](err); ok {
 		// These SQLSTATEs are the backend SAYING the outcome is unknown:
 		// the statement/transaction may have committed.
 		return pgErr.Code == "40003" || pgErr.Code == "08007"
 	}
-	var sqErr *sqlite.Error
-	if errors.As(err, &sqErr) {
+	if _, ok := errors.AsType[*sqlite.Error](err); ok {
 		return false
 	}
 	return !pgconn.SafeToRetry(err)

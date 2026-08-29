@@ -372,7 +372,7 @@ func testListPaginationAndQ(t *testing.T, e *testEnv) {
 
 	const total = 25
 	urls := make(map[string]bool, total)
-	for i := 0; i < total; i++ {
+	for i := range total {
 		// Mixed case to exercise the case-insensitive q filter.
 		u := fmt.Sprintf("PgN-%02d-%s", i, randomHex(t, 3))
 		createRepo(t, e, org, u, nil, http.StatusOK)

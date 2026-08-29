@@ -264,7 +264,7 @@ func verifyLocalConfig(ctx context.Context, repoPath, configPath string) (os.Fil
 		return nil, err
 	}
 	hasIncludes := false
-	for _, name := range strings.Split(names, "\n") {
+	for name := range strings.SplitSeq(names, "\n") {
 		key := strings.ToLower(strings.TrimSpace(name))
 		if strings.HasPrefix(key, "include.") || strings.HasPrefix(key, "includeif.") {
 			hasIncludes = true
@@ -826,7 +826,7 @@ func hydratePacksBy(ctx context.Context, bl blob.BlobStore, repoPath, repo strin
 		return err
 	}
 	var lastMissing error
-	for attempt := 0; attempt < maxHydrateRaces; attempt++ {
+	for range maxHydrateRaces {
 		packs, err := list(ctx)
 		if err != nil {
 			return err
@@ -2177,9 +2177,7 @@ func startPushHoldRefresh(holdPath string) (stop func()) {
 	touch()
 	done := make(chan struct{})
 	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		t := time.NewTicker(pushHoldTTL / 4)
 		defer t.Stop()
 		for {
@@ -2190,7 +2188,7 @@ func startPushHoldRefresh(holdPath string) (stop func()) {
 				touch()
 			}
 		}
-	}()
+	})
 	return func() {
 		close(done)
 		wg.Wait()
@@ -2426,7 +2424,7 @@ func (c *pushHoldDirCache) load() (pushHoldSet, error) {
 						rb = nil
 					}
 					tombstoned = make(map[string]bool)
-					for _, name := range strings.Split(string(rb), "\n") {
+					for name := range strings.SplitSeq(string(rb), "\n") {
 						if name != "" {
 							tombstoned[name] = true
 						}
@@ -2435,7 +2433,7 @@ func (c *pushHoldDirCache) load() (pushHoldSet, error) {
 					parse.relSize, parse.relMtime = -2, -2
 				}
 			}
-			for _, held := range strings.Split(string(b), "\n") {
+			for held := range strings.SplitSeq(string(b), "\n") {
 				if held != "" && !tombstoned[held] {
 					parse.names = append(parse.names, held)
 				}
@@ -2973,7 +2971,7 @@ func removePushHolds(holdPath string, names []string) error {
 		return err
 	}
 	var keep strings.Builder
-	for _, held := range strings.Split(string(b), "\n") {
+	for held := range strings.SplitSeq(string(b), "\n") {
 		if held != "" && !drop[held] {
 			keep.WriteString(held)
 			keep.WriteByte('\n')
@@ -3734,15 +3732,14 @@ func Hydrate(ctx context.Context, st ref.RefStore, bl blob.BlobStore, cacheDir, 
 	// early flush's skip under a hold released mid-scan would otherwise
 	// be vouched for by a fingerprint that still matches).
 	preHoldsKey, preHoldsOK := livePushHoldsKey(repoPath)
-	for attempt := 0; attempt < 3; attempt++ {
+	for range 3 {
 		if skippedHeld, refsErr = syncRefsStreamed(ctx, repoPath, headTarget, newStore, syncRefsBatch); refsErr == nil {
 			break
 		}
 		// A store-side scan failure is an infrastructure error, not local
 		// ref staleness: surface it like the pre-#119 ListRefs error (no
 		// marker, no retries — the store is down, not the cache racing).
-		var scan *refScanError
-		if errors.As(refsErr, &scan) {
+		if scan, ok := errors.AsType[*refScanError](refsErr); ok {
 			return "", nil, scan.Unwrap()
 		}
 		time.Sleep(50 * time.Millisecond)

@@ -2,6 +2,7 @@ package ref
 
 import (
 	"context"
+	"maps"
 	"sort"
 	"strings"
 )
@@ -54,9 +55,7 @@ func dfConflictsChunked(names []string, probe func(chunk []string) (map[string]s
 		if err != nil {
 			return nil, err
 		}
-		for cand, witness := range part {
-			out[cand] = witness
-		}
+		maps.Copy(out, part)
 	}
 	return out, nil
 }

@@ -202,8 +202,7 @@ func probeAtKey(ctx context.Context, c *Client, keyPrefix string) error {
 // ProbeRejected (loud-but-wrong); any other definitive divergence is
 // ProbeMishandled.
 func probeStepError(step int, surface string, err error, want string) *ProbeError {
-	var amb *AmbiguousError
-	if errors.As(err, &amb) {
+	if _, ok := errors.AsType[*AmbiguousError](err); ok {
 		return &ProbeError{Step: step, Surface: surface, Class: ProbeInconclusive,
 			Diagnosis: fmt.Sprintf("ambiguous outcome — the write may have landed without a definitive store response: %v", err)}
 	}

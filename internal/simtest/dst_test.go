@@ -208,7 +208,7 @@ func TestDSTSweep(t *testing.T) {
 		}
 	}
 	backend := envRefBackend(t)
-	for i := 0; i < count; i++ {
+	for i := range count {
 		seed := base + uint64(i)
 		res, err := Run(Config{Seed: seed, Steps: steps, RefBackend: backend})
 		if err != nil {

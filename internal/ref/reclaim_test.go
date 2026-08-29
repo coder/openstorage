@@ -289,13 +289,13 @@ func TestLFSReclaim_SettleRefundsPagesPastStuckBuckets(t *testing.T) {
 		// completion, which never advances again), sorting BEFORE one
 		// newer canonical-only bucket. Page size 2: the old scan would
 		// only ever see the first two stuck buckets.
-		for i := int64(0); i < 3; i++ {
+		for i := range int64(3) {
 			seedRefundBucket(t, rs, k.base(), e+i, LFSRefundBucket{LegacyRows: 1, LegacyBytes: 10})
 		}
 		seedRefundBucket(t, rs, k.base(), e+3, LFSRefundBucket{Rows: 2, Bytes: 200})
 		// Four canonical-only sweeps: canon reaches e+4 > e+3, legacy
 		// stays at e.
-		for i := 0; i < 4; i++ {
+		for range 4 {
 			advanceReapEpochAndComplete(t, rs, false)
 		}
 
@@ -392,7 +392,7 @@ func TestLFSReclaim_CountRefs(t *testing.T) {
 		if n, err := rs.CountRefs(ctx, k.base(), 10); err != nil || n != 0 {
 			t.Fatalf("CountRefs empty = (%d, %v), want 0", n, err)
 		}
-		for i := 0; i < 3; i++ {
+		for i := range 3 {
 			if won, err := s.CASRef(ctx, k.base(), fmt.Sprintf("refs/heads/b%d", i), ZeroSHA, strings.Repeat("22", 20)); err != nil || !won {
 				t.Fatalf("CASRef = (%v, %v)", won, err)
 			}

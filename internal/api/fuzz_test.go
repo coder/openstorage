@@ -99,7 +99,7 @@ func FuzzClientKey(f *testing.F) {
 		}
 		found := false
 		for _, v := range []string{xff1, xff2} {
-			for _, hop := range strings.Split(v, ",") {
+			for hop := range strings.SplitSeq(v, ",") {
 				if a, ok := parseForwardedAddr(hop); ok && a.String() == key {
 					found = true
 				}

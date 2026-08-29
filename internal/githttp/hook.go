@@ -2687,8 +2687,7 @@ func objectExists(sha string) bool {
 	if err == nil {
 		return true
 	}
-	var exitErr *exec.ExitError
-	if errors.As(err, &exitErr) {
+	if _, ok := errors.AsType[*exec.ExitError](err); ok {
 		return false
 	}
 	// Not an exit status (git missing, spawn failure): a bug, fail fast.
@@ -2717,8 +2716,7 @@ func objectInMainStore(sha string) bool {
 	if err == nil {
 		return true
 	}
-	var exitErr *exec.ExitError
-	if errors.As(err, &exitErr) {
+	if _, ok := errors.AsType[*exec.ExitError](err); ok {
 		return false
 	}
 	// Not an exit status (git missing, spawn failure): a bug, fail fast.

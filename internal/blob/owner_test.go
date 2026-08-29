@@ -14,6 +14,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/url"
 	"os"
@@ -149,9 +150,7 @@ func (t *stubS3Transport) Do(r *http.Request) (*http.Response, error) {
 			}
 		}
 		resp := xmlResponse(status, body)
-		for k, v := range header {
-			resp.Header[k] = v
-		}
+		maps.Copy(resp.Header, header)
 		resp.Header.Set("Content-Length", fmt.Sprint(len(body)))
 		resp.Header.Set("ETag", `"stub-etag"`)
 		resp.Header.Set("Last-Modified", "Mon, 02 Jan 2006 15:04:05 GMT")

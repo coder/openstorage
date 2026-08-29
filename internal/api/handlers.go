@@ -154,7 +154,7 @@ func validBranchName(name string) bool {
 	if name == "" || len(name) > 255 || strings.Contains(name, "..") {
 		return false
 	}
-	for _, comp := range strings.Split(name, "/") {
+	for comp := range strings.SplitSeq(name, "/") {
 		if !branchComponentRe.MatchString(comp) ||
 			strings.HasSuffix(comp, ".lock") || strings.HasSuffix(comp, ".") {
 			return false

@@ -311,18 +311,16 @@ func startSeaweedFS(ctx context.Context) (s3Addr string, terminate func()) {
 	s3Config := fmt.Sprintf(`{"identities":[{"name":"e2e","credentials":[{"accessKey":%q,"secretKey":%q}],"actions":["Admin","Read","List","Tagging","Write"]}]}`,
 		s3AccessKey, s3SecretKey)
 	seaweedC, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
-		ContainerRequest: testcontainers.ContainerRequest{
-			Image:        "chrislusf/seaweedfs:4.42",
-			ExposedPorts: []string{"8333/tcp"},
-			Cmd:          []string{"server", "-s3", "-dir=/data", "-ip.bind=0.0.0.0", "-s3.config=/etc/seaweedfs/s3.json"},
-			Files: []testcontainers.ContainerFile{{
-				Reader:            strings.NewReader(s3Config),
-				ContainerFilePath: "/etc/seaweedfs/s3.json",
-				FileMode:          0o444,
-			}},
-			WaitingFor: wait.ForListeningPort("8333/tcp").WithStartupTimeout(2 * time.Minute),
-		},
-		Started: true,
+		Image:        "chrislusf/seaweedfs:4.42",
+		ExposedPorts: []string{"8333/tcp"},
+		Cmd:          []string{"server", "-s3", "-dir=/data", "-ip.bind=0.0.0.0", "-s3.config=/etc/seaweedfs/s3.json"},
+		Files: []testcontainers.ContainerFile{{
+			Reader:            strings.NewReader(s3Config),
+			ContainerFilePath: "/etc/seaweedfs/s3.json",
+			FileMode:          0o444,
+		}},
+		WaitingFor: wait.ForListeningPort("8333/tcp").WithStartupTimeout(2 * time.Minute),
+		Started:    true,
 	})
 	if err != nil {
 		panic("start seaweedfs container: " + err.Error())

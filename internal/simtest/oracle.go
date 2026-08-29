@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 
 	"github.com/coder/code-storage/internal/githttp"
 )
@@ -132,13 +133,13 @@ func refsDiff(have, want map[string]string) string {
 		sorted = append(sorted, n)
 	}
 	sort.Strings(sorted)
-	out := ""
+	var out strings.Builder
 	for _, n := range sorted {
 		if have[n] != want[n] {
-			out += fmt.Sprintf(" %s: have=%.8s want=%.8s", n, have[n], want[n])
+			out.WriteString(fmt.Sprintf(" %s: have=%.8s want=%.8s", n, have[n], want[n]))
 		}
 	}
-	return "diff:" + out
+	return "diff:" + out.String()
 }
 
 // checkPackBlobs enforces invariant (c) after every step: no packs row may

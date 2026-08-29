@@ -247,7 +247,7 @@ func TestIntroducedPending_WalkAllowance(t *testing.T) {
 		return strings.TrimSpace(string(out))
 	}
 	run("init", "-b", "main", ".")
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		run("commit", "--allow-empty", "-m", fmt.Sprintf("c%d", i))
 	}
 	tip := run("rev-parse", "HEAD")
@@ -262,7 +262,7 @@ func TestIntroducedPending_WalkAllowance(t *testing.T) {
 		// budget 1 ⇒ allowance 100; pre-charge 99 examined commits, and
 		// mark the whole history verified so the spawn budget cannot trip
 		// first: only the walk allowance can reject.
-		for _, sha := range strings.Fields(run("rev-list", tip)) {
+		for sha := range strings.FieldsSeq(run("rev-list", tip)) {
 			st.ok[sha] = true
 		}
 		if err := st.markWalked(99); err != nil {
@@ -282,7 +282,7 @@ func TestIntroducedPending_WalkAllowance(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		for _, sha := range strings.Fields(run("rev-list", tip)) {
+		for sha := range strings.FieldsSeq(run("rev-list", tip)) {
 			st.ok[sha] = true
 		}
 		pending, examined, err := introducedPending(t.Context(), st, "refs/heads/x", ref.ZeroSHA, tip, 1000)

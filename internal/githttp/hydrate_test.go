@@ -630,12 +630,12 @@ func TestHydratePacks_ConcurrentHydratorsSerialize(t *testing.T) {
 
 	const n = 4
 	errs := make(chan error, n)
-	for i := 0; i < n; i++ {
+	for range n {
 		go func() {
 			errs <- HydratePacks(ctx, testStore, testBlob, repoPath, repo)
 		}()
 	}
-	for i := 0; i < n; i++ {
+	for range n {
 		if err := <-errs; err != nil {
 			t.Fatalf("concurrent hydrate failed: %v", err)
 		}

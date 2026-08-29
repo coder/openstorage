@@ -384,7 +384,7 @@ func TestVerifySig_CreationWalkDedupAcrossRefs(t *testing.T) {
 	mustGit(t, work, "init", "-b", "main", ".")
 	commits := 20
 	want := make(map[string]bool)
-	for i := 0; i < commits; i++ {
+	for i := range commits {
 		sha := commitFile(t, work, "f.txt", fmt.Sprintf("v%d\n", i), fmt.Sprintf("signed %d", i), nil, sshSigningArgs(privPath)...)
 		want[sha] = true
 	}
@@ -394,13 +394,13 @@ func TestVerifySig_CreationWalkDedupAcrossRefs(t *testing.T) {
 
 	vsAll := mintTestToken(t, repo, "git:read,git:write", `[["*",["verify-sig"]]]`)
 	refspecs := []string{"push", remoteURL(node, repo, vsAll)}
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		refspecs = append(refspecs, fmt.Sprintf("HEAD:refs/heads/copy%d", i))
 	}
 	mustGit(t, work, refspecs...)
 
 	refs := pgRefs(t, repo)
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		if got := refs[fmt.Sprintf("refs/heads/copy%d", i)]; got != tip {
 			t.Fatalf("copy%d = %q, want %q", i, got, tip)
 		}
@@ -480,7 +480,7 @@ func TestVerifySig_VerdictCacheAcrossRefs(t *testing.T) {
 	// Seed all 10 refs at the unsigned base with the unpoliced token, so
 	// the verify-sig push below is 10 UPDATES sharing one (old,new) range.
 	refspecs := []string{"push", remoteURL(node, repo, plain), "HEAD:refs/heads/main"}
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		refspecs = append(refspecs, fmt.Sprintf("HEAD:refs/heads/r%d", i))
 	}
 	mustGit(t, work, refspecs...)
@@ -490,14 +490,14 @@ func TestVerifySig_VerdictCacheAcrossRefs(t *testing.T) {
 	t.Cleanup(func() { removeSigningKey(t, key.ID) })
 
 	want := make(map[string]bool)
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		sha := commitFile(t, work, "s.txt", fmt.Sprintf("s%d\n", i), fmt.Sprintf("signed %d", i), nil, sshSigningArgs(privPath)...)
 		want[sha] = true
 	}
 
 	vsAll := mintTestToken(t, repo, "git:read,git:write", `[["*",["verify-sig"]]]`)
 	refspecs = []string{"push", remoteURL(node, repo, vsAll)}
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		refspecs = append(refspecs, fmt.Sprintf("HEAD:refs/heads/r%d", i))
 	}
 	mustGit(t, work, refspecs...)
@@ -536,7 +536,7 @@ func TestVerifySig_BudgetFailsClosed(t *testing.T) {
 	privPath, pubLine := genSSHKey(t)
 	key := registerSigningKey(t, pubLine)
 	t.Cleanup(func() { removeSigningKey(t, key.ID) })
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		commitFile(t, work, "s.txt", fmt.Sprintf("s%d\n", i), fmt.Sprintf("signed %d", i), nil, sshSigningArgs(privPath)...)
 	}
 

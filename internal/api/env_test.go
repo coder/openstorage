@@ -30,6 +30,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -282,8 +283,8 @@ func runBackends(t *testing.T, fn func(t *testing.T, e *testEnv)) {
 
 func TestMain(m *testing.M) {
 	code := m.Run()
-	for i := len(envCleanup) - 1; i >= 0; i-- {
-		envCleanup[i]()
+	for _, e := range slices.Backward(envCleanup) {
+		e()
 	}
 	os.Exit(code)
 }

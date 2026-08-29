@@ -30,7 +30,7 @@ func TestLimitGitHeap(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := fmt.Sprintf("%d", int64(lfsScanGitHeapLimit))
-	for _, line := range strings.Split(string(limits), "\n") {
+	for line := range strings.SplitSeq(string(limits), "\n") {
 		if !strings.HasPrefix(line, "Max data size") {
 			continue
 		}

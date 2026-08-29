@@ -68,16 +68,14 @@ func (q *InProcessQueue) enqueue(lane string, run func(ctx context.Context, job 
 		return nil // coalesced with the queued run
 	}
 	q.pending[key] = true
-	q.wg.Add(1)
-	go func() {
-		defer q.wg.Done()
+	q.wg.Go(func() {
 		q.mu.Lock()
 		delete(q.pending, key)
 		q.mu.Unlock()
 		if err := run(context.Background(), job); err != nil {
 			q.logger.Warn(failMsg, "org", job.Org, "repo", job.RepoID, "err", err)
 		}
-	}()
+	})
 	return nil
 }
 

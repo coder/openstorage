@@ -133,6 +133,26 @@ Config is [`.golangci.yml`](.golangci.yml) (v2 schema): the default linter set
 plus `misspell`, `unconvert`, `nolintlint`, and the `gofmt`/`goimports`
 formatters (local prefix `github.com/coder/code-storage`).
 
+## Go style: modern idioms
+
+Write modern Go (the go.mod version pins what is available). The repo vendors
+JetBrains' [Modern Go Guidelines](https://github.com/JetBrains/go-modern-guidelines)
+as an agent skill at
+[`.agents/skills/use-modern-go/`](.agents/skills/use-modern-go/SKILL.md) —
+coding agents pick it up automatically; humans can run the same CLI:
+
+```sh
+sh .agents/skills/use-modern-go/scripts/run-tool.sh list --file-path path/to/file.go
+```
+
+Existing code is kept modern with the official
+[`modernize`](https://pkg.go.dev/golang.org/x/tools/gopls/internal/analysis/modernize)
+analyzer; new code should not reintroduce patterns it would rewrite:
+
+```sh
+go run golang.org/x/tools/gopls/internal/analysis/modernize/cmd/modernize@latest -fix -test ./...
+```
+
 ## Commit and PR conventions
 
 PRs are **squash-merged**, and [release-please derives versions and the

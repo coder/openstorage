@@ -58,13 +58,11 @@ const (
 // EnsureBucket, whose write-readiness roundtrip is the readiness signal.
 func StartSeaweedFSContainer(ctx context.Context) (endpoint string, terminate func(), err error) {
 	c, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
-		ContainerRequest: testcontainers.ContainerRequest{
-			Image:        SeaweedFSImage,
-			ExposedPorts: []string{"8333/tcp"},
-			Cmd:          []string{"server", "-s3", "-dir=/data", "-ip.bind=0.0.0.0"},
-			WaitingFor:   wait.ForListeningPort("8333/tcp").WithStartupTimeout(2 * time.Minute),
-		},
-		Started: true,
+		Image:        SeaweedFSImage,
+		ExposedPorts: []string{"8333/tcp"},
+		Cmd:          []string{"server", "-s3", "-dir=/data", "-ip.bind=0.0.0.0"},
+		WaitingFor:   wait.ForListeningPort("8333/tcp").WithStartupTimeout(2 * time.Minute),
+		Started:      true,
 	})
 	if err != nil {
 		return "", nil, fmt.Errorf("start seaweedfs container: %w", err)

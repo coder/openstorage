@@ -64,7 +64,6 @@ func TestTargetGuardRejectsDeniedDialTargets(t *testing.T) {
 		"::ffff:10.2.3.4",        // mapped RFC 1918
 		"::ffff:169.254.169.254", // mapped cloud metadata
 	} {
-		raw := raw
 		t.Run(strings.ReplaceAll(raw, ":", "_"), func(t *testing.T) {
 			t.Parallel()
 			var dialed atomic.Int32
@@ -104,7 +103,6 @@ func TestTargetGuardFailsClosedOnResolutionProblems(t *testing.T) {
 		},
 	}
 	for name, lookup := range cases {
-		lookup := lookup
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 			var dialed atomic.Int32
@@ -328,7 +326,6 @@ func TestTargetGuardRefusesRedirectsEvenWhenPrivateAllowed(t *testing.T) {
 		http.StatusTemporaryRedirect,
 		http.StatusPermanentRedirect,
 	} {
-		status := status
 		t.Run(strconv.Itoa(status), func(t *testing.T) {
 			var frontRequests atomic.Int32
 			var targetRequests atomic.Int32
@@ -373,7 +370,6 @@ func TestTargetGuardAllowPrivateScope(t *testing.T) {
 		"::ffff:10.0.0.1",
 	}
 	for _, raw := range admitted {
-		raw := raw
 		t.Run("admits_"+strings.ReplaceAll(raw, ":", "_"), func(t *testing.T) {
 			t.Parallel()
 			wantDial := errors.New("dial observed")
@@ -411,7 +407,6 @@ func TestTargetGuardAllowPrivateScope(t *testing.T) {
 		"::2",
 		"4000::1",
 	} {
-		raw := raw
 		t.Run("still_denies_"+strings.ReplaceAll(raw, ":", "_"), func(t *testing.T) {
 			t.Parallel()
 			var dialed atomic.Int32

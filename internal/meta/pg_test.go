@@ -84,8 +84,8 @@ func pgBackend(t *testing.T) Backend {
 
 func TestMain(m *testing.M) {
 	code := m.Run()
-	for i := len(pgCleanup) - 1; i >= 0; i-- {
-		pgCleanup[i]()
+	for _, p := range slices.Backward(pgCleanup) {
+		p()
 	}
 	os.Exit(code)
 }
@@ -179,15 +179,13 @@ func testUpsertOrgWithKeysConcurrent(t *testing.T, s Backend) {
 	var wg sync.WaitGroup
 	errs := make(chan error, workers*rounds)
 	for w := range workers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for range rounds {
 				if _, err := s.UpsertOrgWithKeys(ctx, t.Name(), keysFor(w)); err != nil {
 					errs <- fmt.Errorf("worker %d: %w", w, err)
 				}
 			}
-		}()
+		})
 	}
 
 	done := make(chan struct{})
