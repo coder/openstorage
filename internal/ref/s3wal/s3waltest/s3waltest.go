@@ -127,9 +127,18 @@ var HTTPClient = awshttp.NewBuildableClient().WithTransportOptions(func(t *http.
 // the same wiring shape as internal/blob's s3ClientOptions, but with
 // explicit credentials so container lanes never depend on process env.
 func RawS3Client(endpoint, region, accessKey, secretKey string) *s3.Client {
+	return RawS3ClientSession(endpoint, region, accessKey, secretKey, "")
+}
+
+// RawS3ClientSession is RawS3Client for STS session credentials: temporary
+// keys must send their session token (X-Amz-Security-Token) alongside the
+// SigV4 signature or an enforcing endpoint rejects the request. Used by the
+// nightly Floci githttp lane, whose credentials come from IAM
+// CreateAccessKey → STS AssumeRole rather than a static emulator identity.
+func RawS3ClientSession(endpoint, region, accessKey, secretKey, sessionToken string) *s3.Client {
 	cfg := aws.Config{
 		Region:      region,
-		Credentials: credentials.NewStaticCredentialsProvider(accessKey, secretKey, ""),
+		Credentials: credentials.NewStaticCredentialsProvider(accessKey, secretKey, sessionToken),
 		HTTPClient:  HTTPClient,
 	}
 	return s3.NewFromConfig(cfg, func(o *s3.Options) {
