@@ -187,6 +187,11 @@ func surfaceGetUnderOverwrite(t *testing.T, e *qualEnv) []verdict {
 	opts := e.raw.Options()
 	opts.HTTPClient = awshttp.NewBuildableClient()
 	opts.ResponseChecksumValidation = aws.ResponseChecksumValidationWhenRequired
+	// No SDK retries, like the production CAS client (casobj.go): a silent
+	// retry of a conditional PUT whose first attempt landed would turn a
+	// successful overwrite into a stale-ETag 412, and a retried GET could
+	// mask the exact framing corruption this surface exists to observe.
+	opts.Retryer = aws.NopRetryer{}
 	client := s3.New(opts)
 
 	key := e.prefix + "get-under-overwrite-" + randomHexTB(t, 4)
@@ -206,6 +211,12 @@ func surfaceGetUnderOverwrite(t *testing.T, e *qualEnv) []verdict {
 		if err != nil {
 			return "", err
 		}
+		// A success without an ETag cannot count as a conditional
+		// overwrite: the writer would carry curETag="" and silently
+		// degrade every later PUT to unconditional.
+		if aws.ToString(out.ETag) == "" {
+			return "", fmt.Errorf("PutObject succeeded without an ETag")
+		}
 		return aws.ToString(out.ETag), nil
 	}
 	headETag := func(ctx context.Context) (string, error) {
@@ -214,6 +225,9 @@ func surfaceGetUnderOverwrite(t *testing.T, e *qualEnv) []verdict {
 		out, err := client.HeadObject(opCtx, &s3.HeadObjectInput{Bucket: aws.String(e.bucket), Key: aws.String(key)})
 		if err != nil {
 			return "", err
+		}
+		if aws.ToString(out.ETag) == "" {
+			return "", fmt.Errorf("HeadObject returned no ETag")
 		}
 		return aws.ToString(out.ETag), nil
 	}
@@ -310,6 +324,13 @@ func surfaceGetUnderOverwrite(t *testing.T, e *qualEnv) []verdict {
 		return []verdict{{name, verdictMishandles, "torn body: a racing GET returned bytes of neither whole version — " + detail}}
 	case tornMeta.Load() > 0:
 		return []verdict{{name, verdictMishandles, "torn metadata: a racing GET returned one whole version with the other version's ETag — " + detail}}
+	case readErrs.Load() > 0:
+		// Framing corruption can surface as failed reads rather than a
+		// classifiable torn body (a short-for-Content-Length response
+		// blocks until the op deadline; a poisoned keep-alive breaks the
+		// next request). Without a classified tear those failures make the
+		// probe inconclusive — never a clean pass.
+		return []verdict{{name, verdictError, "racing GETs failed without a classifiable torn read — inconclusive (possible framing corruption) — " + detail}}
 	case reads.Load() < minReads || writeOKs.Load() < minWrites:
 		return []verdict{{name, verdictError, "too few successful reads/overwrites to have exercised the race — " + detail}}
 	default:
