@@ -282,6 +282,13 @@ full 22-surface s3wal qualification suite (`TestQualifyExternalEndpoint` in
 SeaweedFS 4.42 honors conditional DELETE (412 and the object survives on a
 mismatched `If-Match`), unlike both Floci and the legacy MinIO pin.
 
+The same workflow also records the Floci row of the s3wal qualification
+matrix: `TestQualifyFloci` (`internal/ref/s3wal/qualify_floci_test.go`) runs
+the qualification surfaces plus the `delete-if-match` and
+`get-under-overwrite` (torn-read) gap surfaces in record mode against the
+pinned `s3waltest.FlociImage`, so a Floci release that closes a gap surfaces
+in the VERDICT transcript on the next pin bump — nothing gates on Floci.
+
 Run it locally (Docker + the `aws` CLI):
 
 ```sh
