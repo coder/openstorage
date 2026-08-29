@@ -92,8 +92,22 @@ func TestS3WAL_PushOpCensus(t *testing.T) {
 	// single manifest GET could land in either push's log window and
 	// make exact budgets flaky. Its cost is documented in the issue #182
 	// census; the budgets here guard the synchronous push path.
+	//
+	// The periodic sweep is disabled for the same reason (issue #209):
+	// the local-mode ticker runs its first pass immediately at boot on a
+	// background goroutine (StartSweepTicker's run-on-start), and that
+	// pass scans the WHOLE shared lane bucket — a fleet walk reading
+	// every other test's `_wal/repo/<name>` manifest plus `lfs/` prefix
+	// listings — so its ops race into whichever census window they land
+	// in. Interval 0 swaps the schedule for a strictly synchronous
+	// startup Heal that finishes before the node announces its address,
+	// i.e. before the offset snapshot below. The remaining background
+	// scanners are already off by default: LFS reclamation and absence
+	// reconciliation ship interval 0, and the reconcile ticker needs the
+	// non-default v0.2.0 write-compat flag (or a partial Heal) to start.
 	opLog := filepath.Join(t.TempDir(), "s3ops.log")
-	node := startNodeT(t, "CODESTORAGE_S3_OP_LOG="+opLog, "CODESTORAGE_REPACK_THRESHOLD=0")
+	node := startNodeT(t, "CODESTORAGE_S3_OP_LOG="+opLog, "CODESTORAGE_REPACK_THRESHOLD=0",
+		"CODESTORAGE_SWEEP_INTERVAL=0")
 
 	repo := registerRepo(t, "t-s3wal-op-census")
 	work := initWorkRepo(t)
