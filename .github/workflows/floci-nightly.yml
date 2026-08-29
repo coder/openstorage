@@ -6,10 +6,14 @@
 # with CODESTORAGE_TEST_S3_URL pointed at it. That gates the env-gated
 # endpoint tests (internal/blob/s3endpoint_test.go), which pin real SigV4
 # verification on presigned URLs: valid signature ⇒ 200 + exact bytes,
-# corrupted signature ⇒ 403 SignatureDoesNotMatch. Known Floci 1.7.0 gaps
-# (no IAM policy evaluation on S3 actions, x-amz-expected-bucket-owner
-# ignored) are documented in that test file — do not extend this lane to
-# cover them. Local repro: docs/reference/testing.md (The Floci S3 lane).
+# corrupted signature ⇒ 403 SignatureDoesNotMatch. Known Floci gaps, so this
+# lane must not be extended into them (all verified on 1.7.0 and
+# nightly-08282026): no IAM policy evaluation on S3 actions and
+# x-amz-expected-bucket-owner ignored (both documented in that test file),
+# torn reads under same-key overwrite, DeleteObject+If-Match silently
+# ignored, and header-auth SigV4 signatures not validated (key-ID existence
+# only — presigned-URL validation IS enforced, the property this lane pins).
+# Full gap list + local repro: docs/reference/testing.md (The Floci S3 lane).
 name: floci-nightly
 
 on:
