@@ -1,8 +1,9 @@
 package ref
 
-import "strings"
-
-import "context"
+import (
+	"context"
+	"strings"
+)
 
 // RefValues implements the batched exact-value probe for SQLite: chunked
 // indexed membership reads over the candidate names (see refvalues.go for
