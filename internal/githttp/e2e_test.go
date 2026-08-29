@@ -4,7 +4,10 @@ package githttp
 // backend lanes selected by CODESTORAGE_TEST_BACKEND:
 //
 //   - "" / "pg" (default): real containers only (no fakes) — testcontainers-go
-//     boots Postgres + SeaweedFS, exactly like production would.
+//     boots Postgres + SeaweedFS, exactly like production would. The nightly
+//     Floci lane (floci-nightly-githttp.yml) reuses this lane with
+//     CODESTORAGE_TEST_S3_ENDPOINT pointing the blob store at an externally
+//     booted auth-enforcing S3 endpoint instead of the managed SeaweedFS.
 //   - "local": zero containers — sqlite:// + file:// URLs derived from a
 //     temp data dir, the way `serve --data-dir` derives them.
 //
@@ -159,6 +162,27 @@ func testMainInner(m *testing.M) int {
 		panic(fmt.Sprintf("go build: %v: %s", err, out))
 	}
 
+	// CODESTORAGE_TEST_S3_ENDPOINT (the nightly Floci lane,
+	// floci-nightly-githttp.yml) swaps the pg lane's managed SeaweedFS
+	// container for an externally booted S3 endpoint. It is honored ONLY
+	// on the pg lane; on any other lane it would be silently ignored, and
+	// a green run against the wrong store is exactly the failure mode the
+	// nightly lane exists to catch — so refuse the combination loudly.
+	extS3Endpoint := os.Getenv("CODESTORAGE_TEST_S3_ENDPOINT")
+	if extS3Endpoint != "" {
+		if v := os.Getenv("CODESTORAGE_TEST_BACKEND"); v != "" && v != backendPG {
+			panic(fmt.Sprintf("CODESTORAGE_TEST_S3_ENDPOINT is a pg-lane-only override; unset it or drop CODESTORAGE_TEST_BACKEND=%q", v))
+		}
+		// Credentials stay in the environment — the workflow mints them via
+		// IAM CreateAccessKey → STS AssumeRole — so the serve children and
+		// the SDK pick them up the production way (env → LoadDefaultConfig,
+		// including AWS_SESSION_TOKEN). Require them before any container
+		// boots instead of failing later with opaque signing errors.
+		if os.Getenv("AWS_ACCESS_KEY_ID") == "" || os.Getenv("AWS_SECRET_ACCESS_KEY") == "" {
+			panic("CODESTORAGE_TEST_S3_ENDPOINT requires AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY in the environment")
+		}
+	}
+
 	// Backend lane: pg (default) boots real containers; local derives
 	// sqlite:// + file:// URLs from a temp data dir (zero containers).
 	switch v := os.Getenv("CODESTORAGE_TEST_BACKEND"); v {
@@ -180,22 +204,37 @@ func testMainInner(m *testing.M) int {
 			panic(err)
 		}
 
-		s3Addr, terminate := startSeaweedFS(ctx)
-		defer terminate()
-		blobURL = fmt.Sprintf("s3://githttp-test?endpoint=http://%s&s3ForcePathStyle=true&region=us-east-1", s3Addr)
-		os.Setenv("AWS_ACCESS_KEY_ID", s3AccessKey)
-		os.Setenv("AWS_SECRET_ACCESS_KEY", s3SecretKey)
+		if extS3Endpoint != "" {
+			// Nightly Floci lane (issue #203): same pg lane, but the blob
+			// store is an external, auth-enforcing S3 endpoint, with the
+			// env-guaranteed credentials from the pre-switch guard above.
+			// The readiness probe signs with the session token when one is
+			// present — SigV4 with temporary keys requires the
+			// X-Amz-Security-Token to accompany the signature.
+			blobURL = fmt.Sprintf("s3://githttp-test?endpoint=%s&s3ForcePathStyle=true&region=us-east-1", extS3Endpoint)
+			raw := s3waltest.RawS3ClientSession(extS3Endpoint, "us-east-1",
+				os.Getenv("AWS_ACCESS_KEY_ID"), os.Getenv("AWS_SECRET_ACCESS_KEY"), os.Getenv("AWS_SESSION_TOKEN"))
+			if err := s3waltest.EnsureBucket(ctx, raw, "githttp-test"); err != nil {
+				panic("external S3 endpoint never became write-ready: " + err.Error())
+			}
+		} else {
+			s3Addr, terminate := startSeaweedFS(ctx)
+			defer terminate()
+			blobURL = fmt.Sprintf("s3://githttp-test?endpoint=http://%s&s3ForcePathStyle=true&region=us-east-1", s3Addr)
+			os.Setenv("AWS_ACCESS_KEY_ID", s3AccessKey)
+			os.Setenv("AWS_SECRET_ACCESS_KEY", s3SecretKey)
 
-		// SeaweedFS keeps 500ing object PUTs for a while after CreateBucket
-		// succeeds — bucket creation is filer-only, object writes need a
-		// volume assignment (issues #165/#177) — so gate write readiness
-		// now instead of letting the suite's first pack upload draw a
-		// boot-window 500 through the SDK's bounded retries. Doubles as
-		// the lane's bucket bootstrap (the shared EnsureBucket retry below
-		// then succeeds immediately).
-		raw := s3waltest.RawS3Client("http://"+s3Addr, "us-east-1", s3AccessKey, s3SecretKey)
-		if err := s3waltest.EnsureBucket(ctx, raw, "githttp-test"); err != nil {
-			panic("SeaweedFS never became write-ready: " + err.Error())
+			// SeaweedFS keeps 500ing object PUTs for a while after CreateBucket
+			// succeeds — bucket creation is filer-only, object writes need a
+			// volume assignment (issues #165/#177) — so gate write readiness
+			// now instead of letting the suite's first pack upload draw a
+			// boot-window 500 through the SDK's bounded retries. Doubles as
+			// the lane's bucket bootstrap (the shared EnsureBucket retry below
+			// then succeeds immediately).
+			raw := s3waltest.RawS3Client("http://"+s3Addr, "us-east-1", s3AccessKey, s3SecretKey)
+			if err := s3waltest.EnsureBucket(ctx, raw, "githttp-test"); err != nil {
+				panic("SeaweedFS never became write-ready: " + err.Error())
+			}
 		}
 	case backendLocal:
 		testBackend = backendLocal

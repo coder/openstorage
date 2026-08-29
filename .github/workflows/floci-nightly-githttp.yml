@@ -1,0 +1,122 @@
+# Nightly full-service githttp E2E lane against Floci (issue #203). The
+# per-PR `test` job runs the internal/githttp suite against SeaweedFS; this
+# workflow reruns the same full PG-mode suite with the blob store pointed at
+# floci/floci — booted with FLOCI_SERVICES_S3_ENFORCE_AUTH=true — through the
+# test-only CODESTORAGE_TEST_S3_ENDPOINT override in the suite's TestMain.
+# Credentials come from a real chain no other lane exercises: IAM
+# CreateAccessKey → STS AssumeRole → session credentials. Scope note: Floci
+# only honors IAM/STS-minted access-key IDs but does not validate
+# header-auth signatures or session tokens (gap list in
+# docs/reference/testing.md), so this proves the suite runs end-to-end on
+# freshly minted temporary keys while exercising — not asserting —
+# AWS_SESSION_TOKEN plumbing (env → SDK → serve children). Value:
+# second-implementation wire-drift armor under the whole git/LFS surface.
+# The per-PR blob store stays SeaweedFS deliberately — Floci does not
+# validate header-auth SigV4 signatures, tears reads racing same-key
+# overwrites, and ignores conditional DELETE (issue #201 spike findings).
+# Local repro: docs/reference/testing.md (The Floci githttp E2E lane).
+name: floci-nightly-githttp
+
+on:
+  schedule:
+    - cron: "53 4 * * *" # daily, 04:53 UTC (after bench-nightly)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  githttp-lane:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      # The LFS e2e tests silently skip when git-lfs is missing; assert it is
+      # installed so the lane cannot quietly lose coverage (mirrors ci.yml).
+      - run: git lfs version
+      - name: boot floci
+        # Pinned tag, not :latest — this lane exports credentials parsed from
+        # the image's API responses, so keep the image bytes as stable as a
+        # mutable registry allows. 1.7.0 is the spike-qualified version
+        # (nightly-08282026 behaved identically). Keep in sync with
+        # s3waltest.FlociImage (the s3wal qualification-matrix pin, issue
+        # #205) so every Floci lane probes the same release.
+        run: |
+          docker run -d --name floci -p 4566:4566 \
+            -e FLOCI_SERVICES_S3_ENFORCE_AUTH=true \
+            floci/floci:1.7.0
+          for i in $(seq 1 60); do
+            if curl -s -o /dev/null http://127.0.0.1:4566/; then
+              echo "floci ready after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::floci did not become ready"
+          docker logs floci
+          exit 1
+      - name: provision IAM user + role, assume role via STS
+        # The IAM/STS control plane accepts any credentials; only the S3 data
+        # plane enforces auth, and it only honors keys minted through
+        # IAM/STS. The suite runs on the SESSION credentials from AssumeRole,
+        # not the long-lived user key.
+        env:
+          AWS_ACCESS_KEY_ID: root
+          AWS_SECRET_ACCESS_KEY: root
+          AWS_DEFAULT_REGION: us-east-1
+        run: |
+          aws --endpoint-url http://127.0.0.1:4566 iam create-user --user-name githttp-nightly
+          key_json=$(aws --endpoint-url http://127.0.0.1:4566 iam create-access-key \
+            --user-name githttp-nightly --output json)
+          access_key_id=$(jq -r '.AccessKey.AccessKeyId // empty' <<<"$key_json")
+          secret_key=$(jq -r '.AccessKey.SecretAccessKey // empty' <<<"$key_json")
+          # The image tag is pinned but the registry copy is still mutable,
+          # so returned JSON stays untrusted: full-string-validate every
+          # value before use — for the GITHUB_ENV writes below, an embedded
+          # newline would otherwise inject extra variables (e.g. GOCACHEPROG)
+          # into every later step. Bash [[ =~ ]] anchors span the whole
+          # string, so newlines cannot hide inside.
+          if [[ ! "$access_key_id" =~ ^[A-Z0-9]{16,32}$ ]] || [[ ! "$secret_key" =~ ^[A-Za-z0-9/+=]{20,64}$ ]]; then
+            echo "::error::IAM CreateAccessKey returned missing or malformed credentials"
+            exit 1
+          fi
+          aws --endpoint-url http://127.0.0.1:4566 iam create-role \
+            --role-name githttp-nightly-role \
+            --assume-role-policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::000000000000:user/githttp-nightly"},"Action":"sts:AssumeRole"}]}'
+          sts_json=$(AWS_ACCESS_KEY_ID="$access_key_id" AWS_SECRET_ACCESS_KEY="$secret_key" \
+            aws --endpoint-url http://127.0.0.1:4566 sts assume-role \
+            --role-arn arn:aws:iam::000000000000:role/githttp-nightly-role \
+            --role-session-name githttp-nightly --output json)
+          session_key_id=$(jq -r '.Credentials.AccessKeyId // empty' <<<"$sts_json")
+          session_secret=$(jq -r '.Credentials.SecretAccessKey // empty' <<<"$sts_json")
+          session_token=$(jq -r '.Credentials.SessionToken // empty' <<<"$sts_json")
+          if [[ ! "$session_key_id" =~ ^[A-Z0-9]{16,32}$ ]] \
+            || [[ ! "$session_secret" =~ ^[A-Za-z0-9/+=]{20,64}$ ]] \
+            || [[ ! "$session_token" =~ ^[A-Za-z0-9/+=._-]{16,4096}$ ]]; then
+            echo "::error::STS AssumeRole returned missing or malformed session credentials"
+            exit 1
+          fi
+          {
+            echo "AWS_ACCESS_KEY_ID=$session_key_id"
+            echo "AWS_SECRET_ACCESS_KEY=$session_secret"
+            echo "AWS_SESSION_TOKEN=$session_token"
+          } >> "$GITHUB_ENV"
+      - name: githttp E2E suite (pg lane, blob store on floci, session creds)
+        env:
+          AWS_REGION: us-east-1
+          CODESTORAGE_TEST_S3_ENDPOINT: http://127.0.0.1:4566
+        run: go test ./internal/githttp -count=1 -race -timeout=25m
+      - name: assert the suite ran against floci (not a silent SeaweedFS fallback)
+        # Only the external-endpoint TestMain path creates this bucket on
+        # floci; if the override plumbing breaks (renamed variable, dropped
+        # env), the suite would pass green against the managed SeaweedFS
+        # container instead.
+        env:
+          AWS_DEFAULT_REGION: us-east-1
+        run: aws --endpoint-url http://127.0.0.1:4566 s3api head-bucket --bucket githttp-test
+      - name: floci logs
+        if: failure()
+        run: docker logs floci

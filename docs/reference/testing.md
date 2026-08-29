@@ -314,3 +314,66 @@ cleanup relies on `DeleteObject` actually reclaiming the test keys rather
 than writing delete markers. Keys are uniquely suffixed and cleaned up, but
 use an unversioned scratch bucket, not a production one.
 
+## The Floci githttp E2E lane
+
+[`floci-nightly-githttp.yml`](../../.github/workflows/floci-nightly-githttp.yml)
+runs daily (04:53 UTC): it boots a pinned Floci image (the same release
+`s3waltest.FlociImage` pins for the qualification matrix — bump both
+together) with S3 auth
+enforcement on, provisions an IAM user and access key, assumes a role via
+STS, and reruns the full PG-mode `internal/githttp` E2E suite with the blob
+store pointed at Floci and the STS **session credentials** in the
+environment. `CODESTORAGE_TEST_S3_ENDPOINT` is the seam: a test-only
+override read by the suite's `TestMain` (like `CODESTORAGE_TEST_BACKEND`,
+it never touches production config parsing) that swaps the managed
+SeaweedFS container for the external endpoint on the pg lane — and panics
+on any other lane, where it would otherwise be silently ignored. The
+workflow's last step asserts the suite's bucket exists on Floci, so broken
+override plumbing fails the lane instead of passing green against a
+quietly booted SeaweedFS.
+
+What the nightly adds over the per-PR `test` job: a second, independent S3
+wire-protocol implementation under the whole git/LFS surface (wire-drift
+armor), and the only lane anywhere that *runs* on IAM/STS-minted session
+credentials — every other lane signs with long-lived static keys. Be
+precise about what that buys: Floci only honors access-key IDs minted
+through IAM/STS, so the lane proves the suite operates end-to-end on
+freshly minted temporary keys — but its header-auth gap (see the gap list
+above: only the key ID's existence is checked) means a dropped or forged
+`AWS_SESSION_TOKEN` on header-auth requests would **not** fail the lane.
+Verifying token integrity end-to-end needs an endpoint that authenticates
+temporary credentials; until then this lane exercises, without asserting,
+the session-token plumbing (env → SDK → serve subprocesses). Floci's
+default in-memory storage mode is exactly right for a fresh-per-run lane;
+persistent mode (`FLOCI_STORAGE_MODE=persistent` plus a volume) was verified
+working during the issue #201 spike if the lane ever needs restart survival.
+
+The per-PR blob store deliberately stays SeaweedFS: Floci is not strictly
+better — header-auth SigV4 signatures are not validated, reads racing a
+same-key overwrite can tear, and conditional DELETE is ignored. The
+authoritative gap list, with details, is in
+[the Floci S3 lane](#the-floci-s3-lane) section above. The lane is
+nightly-only and **not** part of the required PR check set.
+
+Run it locally (Docker + the `aws` CLI):
+
+```sh
+docker run -d --name floci -p 4566:4566 \
+  -e FLOCI_SERVICES_S3_ENFORCE_AUTH=true floci/floci:1.7.0
+
+# IAM/STS accept any credentials; only the S3 data plane enforces auth.
+export AWS_ACCESS_KEY_ID=root AWS_SECRET_ACCESS_KEY=root AWS_DEFAULT_REGION=us-east-1
+aws --endpoint-url http://127.0.0.1:4566 iam create-user --user-name githttp-lane
+aws --endpoint-url http://127.0.0.1:4566 iam create-access-key --user-name githttp-lane
+aws --endpoint-url http://127.0.0.1:4566 iam create-role --role-name githttp-lane-role \
+  --assume-role-policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::000000000000:user/githttp-lane"},"Action":"sts:AssumeRole"}]}'
+# With the create-access-key pair exported:
+aws --endpoint-url http://127.0.0.1:4566 sts assume-role \
+  --role-arn arn:aws:iam::000000000000:role/githttp-lane-role \
+  --role-session-name githttp-lane
+# Export the returned session AccessKeyId / SecretAccessKey / SessionToken
+# (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_SESSION_TOKEN), then:
+
+AWS_REGION=us-east-1 CODESTORAGE_TEST_S3_ENDPOINT=http://127.0.0.1:4566 \
+  go test ./internal/githttp -count=1 -race -timeout=25m
+```
