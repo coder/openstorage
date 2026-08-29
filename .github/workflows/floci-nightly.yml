@@ -13,7 +13,9 @@
 # torn reads under same-key overwrite, DeleteObject+If-Match silently
 # ignored, and header-auth SigV4 signatures not validated (key-ID existence
 # only — presigned-URL validation IS enforced, the property this lane pins).
-# Full gap list + local repro: docs/reference/testing.md (The Floci S3 lane).
+# A second job records the Floci row of the s3wal qualification matrix
+# (issue #205) — see the s3wal-qualify job below. Full gap list + local
+# repro: docs/reference/testing.md (The Floci S3 lane).
 name: floci-nightly
 
 on:
@@ -92,3 +94,36 @@ jobs:
       - name: floci logs
         if: failure()
         run: docker logs floci
+
+  # Record-mode Floci row of the s3wal qualification matrix (issue #205):
+  # TestQualifyFloci boots the PINNED s3waltest.FlociImage via
+  # testcontainers and logs one VERDICT line per surface — the standard
+  # qualification set plus the gap surfaces the #201 spike found Floci
+  # violating (delete-if-match, get-under-overwrite torn reads) — without
+  # gating on behavior, so a Floci release that closes a gap surfaces here
+  # on the next pin bump. Require mode stays SeaweedFS-only (per-PR CI);
+  # nothing gates on Floci.
+  s3wal-qualify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: record-mode Floci qualification row
+        shell: bash # explicit: pipefail so the tee cannot mask go test's exit code
+        run: |
+          go test ./internal/ref/s3wal -run 'TestQualifyFloci$' -count=1 -v -timeout=25m 2>&1 | tee /tmp/s3wal-qualify-floci.log
+      - name: assert the row is complete (a skip or renamed surface means broken plumbing)
+        run: |
+          if ! grep -q "^--- PASS: TestQualifyFloci" /tmp/s3wal-qualify-floci.log; then
+            echo "::error::TestQualifyFloci did not run to a PASS (renamed gate or broken plumbing?)"
+            exit 1
+          fi
+          for surface in delete-if-match get-under-overwrite; do
+            if ! grep -q "surface=$surface verdict=" /tmp/s3wal-qualify-floci.log; then
+              echo "::error::no VERDICT line for $surface — the record row is incomplete"
+              exit 1
+            fi
+          done
