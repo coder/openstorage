@@ -333,11 +333,11 @@ default in-memory storage mode is exactly right for a fresh-per-run lane;
 persistent mode (`FLOCI_STORAGE_MODE=persistent` plus a volume) was verified
 working during the issue #201 spike if the lane ever needs restart survival.
 
-The per-PR blob store deliberately stays SeaweedFS. Floci is not strictly
-better (issue #201 spike findings): it does not validate header-auth SigV4
-signatures (a wrong secret is accepted; presigned-URL signatures *are*
-validated), reads racing a same-key overwrite can return torn bodies, and
-`DeleteObject` + `If-Match` is ignored rather than enforced. The lane is
+The per-PR blob store deliberately stays SeaweedFS: Floci is not strictly
+better — header-auth SigV4 signatures are not validated, reads racing a
+same-key overwrite can tear, and conditional DELETE is ignored. The
+authoritative gap list, with details, is in
+[the Floci S3 lane](#the-floci-s3-lane) section above. The lane is
 nightly-only and **not** part of the required PR check set.
 
 Run it locally (Docker + the `aws` CLI):
