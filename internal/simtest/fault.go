@@ -337,9 +337,9 @@ func (in *Injector) coin() bool {
 func (in *Injector) noteInnerOutcome(op, outcome string) {
 	in.mu.Lock()
 	defer in.mu.Unlock()
-	for _, v := range slices.Backward(in.fired) {
+	for i, v := range slices.Backward(in.fired) {
 		if v.Op == op {
-			v.InnerOutcome = outcome
+			in.fired[i].InnerOutcome = outcome
 			return
 		}
 	}
