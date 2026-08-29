@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.6](https://github.com/coder/code-storage/compare/v0.14.5...v0.14.6) (2026-08-29)
+
+
+### Bug Fixes
+
+* **githttp:** stop the boot sweep from contaminating the s3wal push op census ([#210](https://github.com/coder/code-storage/issues/210)) ([8325954](https://github.com/coder/code-storage/commit/8325954f159d929476913c37fc16ffca6eb28159))
+
 ## [0.14.5](https://github.com/coder/code-storage/compare/v0.14.4...v0.14.5) (2026-08-28)
 
 
