@@ -112,13 +112,35 @@ func surfaceDeleteIfMatch(t *testing.T, e *qualEnv) []verdict {
 		}
 		// AWS-compliant so far; fall through to step 2.
 	default:
-		return []verdict{{name, rejectVerdict(err), fmt.Sprintf("mismatched If-Match: %v", err)}}
+		class := rejectVerdict(err)
+		if class == verdictError {
+			return []verdict{{name, verdictError, fmt.Sprintf("mismatched If-Match: %v", err)}}
+		}
+		// A definitive non-412 rejection still needs the survival check:
+		// a store could destroy the object AND reject the request, which
+		// would otherwise hide the corruption behind a wrong-status
+		// verdict.
+		alive, herr := exists()
+		if herr != nil {
+			return []verdict{{name, verdictError, fmt.Sprintf("HeadObject after rejected mismatched delete: %v", herr)}}
+		}
+		if !alive {
+			return []verdict{{name, verdictMishandles, fmt.Sprintf("mismatched If-Match deleted the object despite a non-412 rejection: %v", err)}}
+		}
+		return []verdict{{name, class, fmt.Sprintf("mismatched If-Match: %v (object survives, want 412)", err)}}
 	}
 
 	// Step 2: matched If-Match must delete.
 	if _, err := e.raw.DeleteObject(ctx, &s3.DeleteObjectInput{
 		Bucket: aws.String(e.bucket), Key: aws.String(key), IfMatch: aws.String(etag),
 	}); err != nil {
+		// Only a DEFINITIVE store rejection is a behavioral finding; a
+		// timeout/5xx/transport failure produced no verdict on whether a
+		// matched condition deletes, so it must fail the row instead of
+		// recording a finding that was never observed.
+		if rejectVerdict(err) == verdictError {
+			return []verdict{{name, verdictError, fmt.Sprintf("matched If-Match delete produced no store verdict: %v", err)}}
+		}
 		return []verdict{{name, verdictMishandles, fmt.Sprintf("matched If-Match rejected: %v", err)}}
 	}
 	alive, herr := exists()
@@ -141,14 +163,17 @@ func surfaceDeleteIfMatch(t *testing.T, e *qualEnv) []verdict {
 // — manifest GETs race If-Match overwrites of the same key — hence the
 // torn-read bug is the single gate on any require-mode Floci lane.
 //
-// The probe hammers one key with alternating distinct-length PUTs while
-// readers classify every GET body (SDK response-checksum validation off so
-// a mismatch is classified instead of aborting the read). It exits early
-// on the first torn observation; a clean run needs the full window plus a
-// minimum read count before recording pass. All ops run on a dedicated
-// HTTP transport with short per-op deadlines: torn framing poisons
-// keep-alive connections, and the quarantine keeps that damage away from
-// the shared fixture pool (and other surfaces).
+// The probe hammers one key with alternating distinct-length CONDITIONAL
+// PUTs — each overwrite carries If-Match with the previous write's ETag,
+// mirroring the production read-mutate-CAS loop — while readers classify
+// every GET body (SDK response-checksum validation off so a mismatch is
+// classified instead of aborting the read). It exits early on the first
+// torn observation; a clean run needs the full window plus minimum read
+// AND successful-overwrite counts before recording pass (readers alone
+// could otherwise exceed the floor against a never-changing seed object).
+// All ops run on a dedicated HTTP transport with short per-op deadlines:
+// torn framing poisons keep-alive connections, and the quarantine keeps
+// that damage away from the shared fixture pool (and other surfaces).
 func surfaceGetUnderOverwrite(t *testing.T, e *qualEnv) []verdict {
 	t.Helper()
 	const name = "get-under-overwrite"
@@ -157,6 +182,7 @@ func surfaceGetUnderOverwrite(t *testing.T, e *qualEnv) []verdict {
 		opTimeout  = 2 * time.Second
 		readers    = 2
 		minReads   = 50 // below this a "pass" would be too weak to record
+		minWrites  = 50 // successful racing overwrites needed to have exercised the race at all
 	)
 	opts := e.raw.Options()
 	opts.HTTPClient = awshttp.NewBuildableClient()
@@ -167,47 +193,77 @@ func surfaceGetUnderOverwrite(t *testing.T, e *qualEnv) []verdict {
 	bodyA := bytes.Repeat([]byte("a"), 256)
 	bodyB := bytes.Repeat([]byte("b"), 300) // distinct length: a torn body can never alias a whole version
 
-	put := func(ctx context.Context, body []byte) (string, error) {
+	put := func(ctx context.Context, body []byte, ifMatch string) (string, error) {
 		opCtx, cancel := context.WithTimeout(ctx, opTimeout)
 		defer cancel()
-		out, err := client.PutObject(opCtx, &s3.PutObjectInput{
+		in := &s3.PutObjectInput{
 			Bucket: aws.String(e.bucket), Key: aws.String(key), Body: bytes.NewReader(body),
-		})
+		}
+		if ifMatch != "" {
+			in.IfMatch = aws.String(ifMatch)
+		}
+		out, err := client.PutObject(opCtx, in)
+		if err != nil {
+			return "", err
+		}
+		return aws.ToString(out.ETag), nil
+	}
+	headETag := func(ctx context.Context) (string, error) {
+		opCtx, cancel := context.WithTimeout(ctx, opTimeout)
+		defer cancel()
+		out, err := client.HeadObject(opCtx, &s3.HeadObjectInput{Bucket: aws.String(e.bucket), Key: aws.String(key)})
 		if err != nil {
 			return "", err
 		}
 		return aws.ToString(out.ETag), nil
 	}
 
-	// Establish per-version ETags AND their stability: torn-metadata
-	// classification compares a read's ETag against the ETag of the whole
-	// version it returned, which is meaningful only if re-PUTting the same
-	// bytes reproduces the same ETag (content-addressed, MD5 on every
-	// probed store) and the two versions' ETags differ.
+	// Establish per-version ETags AND their stability for BOTH versions:
+	// torn-metadata classification compares a read's ETag against the ETag
+	// of the whole version it returned, which is meaningful only if
+	// re-PUTting the same bytes reproduces the same ETag (content-
+	// addressed, MD5 on every probed store) and the two versions' ETags
+	// differ. A version whose ETag varies per PUT would otherwise turn its
+	// own legitimate reads into false torn-metadata findings.
 	ctx := t.Context()
-	etagA, errA := put(ctx, bodyA)
-	etagB, errB := put(ctx, bodyB)
-	etagA2, errA2 := put(ctx, bodyA)
-	if errA != nil || errB != nil || errA2 != nil {
-		return []verdict{{name, verdictError, fmt.Sprintf("seed PUTs: %v / %v / %v", errA, errB, errA2)}}
+	etagA, errA := put(ctx, bodyA, "")
+	etagB, errB := put(ctx, bodyB, "")
+	etagA2, errA2 := put(ctx, bodyA, "")
+	etagB2, errB2 := put(ctx, bodyB, "")
+	if errA != nil || errB != nil || errA2 != nil || errB2 != nil {
+		return []verdict{{name, verdictError, fmt.Sprintf("seed PUTs: %v / %v / %v / %v", errA, errB, errA2, errB2)}}
 	}
-	metaCheck := etagA != "" && etagB != "" && etagA != etagB && etagA == etagA2
+	metaCheck := etagA != "" && etagB != "" && etagA != etagB && etagA == etagA2 && etagB == etagB2
 	etagOf := map[string]string{string(bodyA): etagA, string(bodyB): etagB}
 
 	raceCtx, stopRace := context.WithCancel(ctx)
 	defer stopRace()
-	var reads, tornBody, tornMeta, readErrs, writeErrs atomic.Int64
+	var reads, tornBody, tornMeta, readErrs, writeOKs, writeErrs atomic.Int64
 	writerDone := make(chan struct{})
 	go func() {
 		defer close(writerDone)
+		curETag := etagB2 // the last seed write
 		for i := 0; raceCtx.Err() == nil; i++ {
 			body := bodyA
 			if i%2 == 1 {
 				body = bodyB
 			}
-			if _, err := put(raceCtx, body); err != nil && raceCtx.Err() == nil {
-				writeErrs.Add(1)
+			etag, err := put(raceCtx, body, curETag)
+			if err != nil {
+				if raceCtx.Err() == nil {
+					writeErrs.Add(1)
+				}
+				// Re-resolve the current ETag: an ambiguous outcome (a
+				// timeout after the write landed) would otherwise wedge
+				// every later If-Match on a stale tag. Best effort — on
+				// Head failure the next iteration retries.
+				if cur, herr := headETag(raceCtx); herr == nil {
+					curETag = cur
+				}
+				continue
 			}
+			curETag = etag
+			writeOKs.Add(1)
 		}
 	}()
 	readersDone := make(chan struct{}, readers)
@@ -247,15 +303,15 @@ func surfaceGetUnderOverwrite(t *testing.T, e *qualEnv) []verdict {
 		<-readersDone
 	}
 
-	detail := fmt.Sprintf("reads=%d tornBody=%d tornMeta=%d readErrs=%d writeErrs=%d metaCheck=%t window=%s",
-		reads.Load(), tornBody.Load(), tornMeta.Load(), readErrs.Load(), writeErrs.Load(), metaCheck, raceWindow)
+	detail := fmt.Sprintf("reads=%d tornBody=%d tornMeta=%d readErrs=%d writeOKs=%d writeErrs=%d metaCheck=%t window=%s",
+		reads.Load(), tornBody.Load(), tornMeta.Load(), readErrs.Load(), writeOKs.Load(), writeErrs.Load(), metaCheck, raceWindow)
 	switch {
 	case tornBody.Load() > 0:
 		return []verdict{{name, verdictMishandles, "torn body: a racing GET returned bytes of neither whole version — " + detail}}
 	case tornMeta.Load() > 0:
 		return []verdict{{name, verdictMishandles, "torn metadata: a racing GET returned one whole version with the other version's ETag — " + detail}}
-	case reads.Load() < minReads:
-		return []verdict{{name, verdictError, "too few successful reads to classify atomicity — " + detail}}
+	case reads.Load() < minReads || writeOKs.Load() < minWrites:
+		return []verdict{{name, verdictError, "too few successful reads/overwrites to have exercised the race — " + detail}}
 	default:
 		return []verdict{{name, verdictPass, "every racing GET returned one whole version with its own ETag — " + detail}}
 	}
