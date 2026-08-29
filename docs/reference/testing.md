@@ -325,10 +325,16 @@ quietly booted SeaweedFS.
 
 What the nightly adds over the per-PR `test` job: a second, independent S3
 wire-protocol implementation under the whole git/LFS surface (wire-drift
-armor), and the only CI coverage of the STS session-token credential
-chain — every other lane signs with long-lived static keys, so
-`AWS_SESSION_TOKEN` plumbing (env → SDK → serve subprocesses) is exercised
-in no other lane. Floci's
+armor), and the only lane anywhere that *runs* on IAM/STS-minted session
+credentials — every other lane signs with long-lived static keys. Be
+precise about what that buys: Floci only honors access-key IDs minted
+through IAM/STS, so the lane proves the suite operates end-to-end on
+freshly minted temporary keys — but its header-auth gap (see the gap list
+above: only the key ID's existence is checked) means a dropped or forged
+`AWS_SESSION_TOKEN` on header-auth requests would **not** fail the lane.
+Verifying token integrity end-to-end needs an endpoint that authenticates
+temporary credentials; until then this lane exercises, without asserting,
+the session-token plumbing (env → SDK → serve subprocesses). Floci's
 default in-memory storage mode is exactly right for a fresh-per-run lane;
 persistent mode (`FLOCI_STORAGE_MODE=persistent` plus a volume) was verified
 working during the issue #201 spike if the lane ever needs restart survival.

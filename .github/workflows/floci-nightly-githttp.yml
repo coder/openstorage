@@ -4,8 +4,12 @@
 # floci/floci — booted with FLOCI_SERVICES_S3_ENFORCE_AUTH=true — through the
 # test-only CODESTORAGE_TEST_S3_ENDPOINT override in the suite's TestMain.
 # Credentials come from a real chain no other lane exercises: IAM
-# CreateAccessKey → STS AssumeRole → session credentials (the only CI
-# coverage of AWS_SESSION_TOKEN plumbing, env → SDK → serve children). Value:
+# CreateAccessKey → STS AssumeRole → session credentials. Scope note: Floci
+# only honors IAM/STS-minted access-key IDs but does not validate
+# header-auth signatures or session tokens (gap list in
+# docs/reference/testing.md), so this proves the suite runs end-to-end on
+# freshly minted temporary keys while exercising — not asserting —
+# AWS_SESSION_TOKEN plumbing (env → SDK → serve children). Value:
 # second-implementation wire-drift armor under the whole git/LFS surface.
 # The per-PR blob store stays SeaweedFS deliberately — Floci does not
 # validate header-auth SigV4 signatures, tears reads racing same-key
