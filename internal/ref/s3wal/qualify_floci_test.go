@@ -169,8 +169,9 @@ func surfaceDeleteIfMatch(t *testing.T, e *qualEnv) []verdict {
 // every GET body (SDK response-checksum validation off so a mismatch is
 // classified instead of aborting the read). It exits early on the first
 // torn observation; a clean run needs the full window plus minimum read
-// AND successful-overwrite counts before recording pass (readers alone
-// could otherwise exceed the floor against a never-changing seed object).
+// AND verified version-transition counts before recording pass (readers
+// alone — or same-body re-writes when one version's PUTs selectively
+// fail — could otherwise exceed the floor against unchanging content).
 // All ops run on a dedicated HTTP transport with short per-op deadlines:
 // torn framing poisons keep-alive connections, and the quarantine keeps
 // that damage away from the shared fixture pool (and other surfaces).
@@ -182,7 +183,7 @@ func surfaceGetUnderOverwrite(t *testing.T, e *qualEnv) []verdict {
 		opTimeout  = 2 * time.Second
 		readers    = 2
 		minReads   = 50 // below this a "pass" would be too weak to record
-		minWrites  = 50 // successful racing overwrites needed to have exercised the race at all
+		minWrites  = 50 // verified A↔B version transitions needed to have exercised the race at all
 	)
 	opts := e.raw.Options()
 	opts.HTTPClient = awshttp.NewBuildableClient()
@@ -257,12 +258,9 @@ func surfaceGetUnderOverwrite(t *testing.T, e *qualEnv) []verdict {
 	go func() {
 		defer close(writerDone)
 		curETag := etagB2 // the last seed write
-		for i := 0; raceCtx.Err() == nil; i++ {
-			body := bodyA
-			if i%2 == 1 {
-				body = bodyB
-			}
-			etag, err := put(raceCtx, body, curETag)
+		next := bodyA     // always the version OPPOSITE the last known content
+		for raceCtx.Err() == nil {
+			etag, err := put(raceCtx, next, curETag)
 			if err != nil {
 				if raceCtx.Err() == nil {
 					writeErrs.Add(1)
@@ -270,14 +268,31 @@ func surfaceGetUnderOverwrite(t *testing.T, e *qualEnv) []verdict {
 				// Re-resolve the current ETag: an ambiguous outcome (a
 				// timeout after the write landed) would otherwise wedge
 				// every later If-Match on a stale tag. Best effort — on
-				// Head failure the next iteration retries.
+				// Head failure the next iteration retries. The target
+				// version is NOT flipped on failure, so a store that
+				// selectively rejects one version keeps being asked for
+				// the version transition instead of racking up
+				// same-body overwrites.
 				if cur, herr := headETag(raceCtx); herr == nil {
 					curETag = cur
 				}
 				continue
 			}
+			// Count only VERIFIED version transitions: on the content-
+			// addressed ETags the seed stability check establishes, a
+			// same-body overwrite (possible when an ambiguous failure
+			// actually landed and the retry re-wrote the same version)
+			// returns the tag it matched against and must not reach the
+			// minWrites floor.
+			if etag != curETag {
+				writeOKs.Add(1)
+			}
 			curETag = etag
-			writeOKs.Add(1)
+			if bytes.Equal(next, bodyA) {
+				next = bodyB
+			} else {
+				next = bodyA
+			}
 		}
 	}()
 	readersDone := make(chan struct{}, readers)
