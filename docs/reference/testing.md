@@ -257,9 +257,30 @@ a static enforcing identity); this nightly lane adds the external-endpoint
 path with a key provisioned through a real IAM API rather than a static
 config, against a second, independent wire-protocol implementation.
 
-Known Floci 1.7.0 gaps, so nobody extends this lane into them: it does not
-evaluate IAM policies on S3 actions (a `Deny` still succeeds) and it ignores
-`x-amz-expected-bucket-owner` — both stay covered by unit-test seams.
+Known Floci gaps, so nobody extends this lane into them (all verified open on
+both `1.7.0` and `nightly-08282026` by the #201 spike):
+
+- No IAM policy evaluation on S3 actions (a `Deny` still succeeds), and
+  `x-amz-expected-bucket-owner` is ignored — both stay covered by unit-test
+  seams.
+- Torn reads under same-key overwrite: a GET racing a PUT on the same key can
+  return a body that is neither version, with broken HTTP framing (Go logs
+  "Unsolicited response received on idle HTTP channel") that poisons
+  keep-alive connections. This disqualifies any s3wal-shaped lane — whose
+  production shape is manifest reads racing CAS overwrites — until fixed
+  upstream.
+- `DeleteObject` with `If-Match` is silently ignored: a mismatched `If-Match`
+  deletes the object anyway, with no 412 (MinIO-class behavior).
+- Header-auth SigV4 signatures are not validated — only that the access-key
+  ID exists, so a wrong secret or a forged session token is accepted.
+  Presigned-URL signature validation IS enforced, and that is the SigV4
+  property this lane pins.
+
+Two positives from the same spike, for future lane design: Floci passes the
+full 22-surface s3wal qualification suite (`TestQualifyExternalEndpoint` in
+`internal/ref/s3wal`) — the only emulator besides SeaweedFS to do so — and
+SeaweedFS 4.42 honors conditional DELETE (412 and the object survives on a
+mismatched `If-Match`), unlike both Floci and the legacy MinIO pin.
 
 Run it locally (Docker + the `aws` CLI):
 
