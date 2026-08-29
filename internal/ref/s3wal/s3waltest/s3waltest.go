@@ -40,6 +40,12 @@ import (
 const (
 	SeaweedFSImage   = "chrislusf/seaweedfs:4.42"
 	MinIOLegacyImage = "minio/minio:RELEASE.2024-01-16T16-07-38Z"
+	// FlociImage pins the Floci release row of the qualification matrix
+	// (issue #205): the nightly record-mode lane documents this release's
+	// conditional-write behavior, so bumping the pin is how a new Floci
+	// release gets re-probed for the documented gaps (torn reads under
+	// same-key overwrite, DeleteObject+If-Match ignored — issue #201).
+	FlociImage = "floci/floci:1.7.0"
 )
 
 // SeaweedFS's `weed server -s3` anonymous mode accepts any static
@@ -91,6 +97,39 @@ func StartSeaweedFS(tb testing.TB) string {
 	}
 	tb.Cleanup(terminate)
 	return endpoint
+}
+
+// StartFloci runs the pinned Floci image with the S3 service in its
+// default non-enforcing auth mode: the data plane then accepts any static
+// SigV4 credential pair, so the lane needs no IAM provisioning (the only
+// vendored AWS service clients are s3 and sts). That is the right shape
+// for the qualification matrix, which probes data-plane semantics —
+// Floci's header-auth enforcement validates only key-ID existence anyway
+// (issue #201), and the SigV4/IAM enforcement path already has its own
+// nightly lane (floci-nightly.yml's blob job). Callers must still gate on
+// EnsureBucket for write readiness.
+func StartFloci(tb testing.TB) string {
+	tb.Helper()
+	ctx := context.Background()
+	c, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
+		Image:        FlociImage,
+		ExposedPorts: []string{"4566/tcp"},
+		WaitingFor:   wait.ForListeningPort("4566/tcp").WithStartupTimeout(2 * time.Minute),
+		Started:      true,
+	})
+	if err != nil {
+		tb.Fatalf("start floci container: %v", err)
+	}
+	tb.Cleanup(func() { _ = c.Terminate(context.Background()) })
+	host, err := c.Host(ctx)
+	if err != nil {
+		tb.Fatalf("floci host: %v", err)
+	}
+	port, err := c.MappedPort(ctx, "4566/tcp")
+	if err != nil {
+		tb.Fatalf("floci mapped port: %v", err)
+	}
+	return fmt.Sprintf("http://%s:%s", host, port.Port())
 }
 
 // StartMinIOLegacy runs the repo's legacy MinIO CI pin exactly like

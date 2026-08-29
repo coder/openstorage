@@ -265,10 +265,7 @@ func newQualEnv(t *testing.T, label string, raw *s3.Client, bucket, prefix, prob
 // incomplete qualification run.
 func runQualification(t *testing.T, e *qualEnv, require bool) {
 	t.Helper()
-	surfaces := []struct {
-		name string
-		run  func(t *testing.T, e *qualEnv) []verdict
-	}{
+	surfaces := []qualSurface{
 		{"raw-roundtrip", surfaceRawRoundTrip},
 		{"gocloud-write-small", surfaceGocloudSmall},
 		{"gocloud-write-multipart", surfaceGocloudMultipart},
@@ -282,6 +279,19 @@ func runQualification(t *testing.T, e *qualEnv, require bool) {
 		{"presigned-get", surfacePresignedGet},
 		{"bucket-bootstrap", surfaceBucketBootstrap},
 	}
+	runSurfaces(t, e, require, surfaces)
+}
+
+type qualSurface struct {
+	name string
+	run  func(t *testing.T, e *qualEnv) []verdict
+}
+
+// runSurfaces executes the given surfaces under runQualification's
+// verdict-handling contract (see above); the Floci lane reuses it for its
+// extra record-only surfaces (qualify_floci_test.go).
+func runSurfaces(t *testing.T, e *qualEnv, require bool, surfaces []qualSurface) {
+	t.Helper()
 	for _, s := range surfaces {
 		for _, v := range s.run(t, e) {
 			t.Logf("VERDICT store=%s surface=%s verdict=%s detail=%q", e.label, v.surface, v.class, v.detail)
