@@ -289,7 +289,7 @@ type qualSurface struct {
 
 // runSurfaces executes the given surfaces under runQualification's
 // verdict-handling contract (see above); the Floci lane reuses it for its
-// extra record-only surfaces (qualify_floci_test.go).
+// extra gap surfaces (qualify_floci_test.go).
 func runSurfaces(t *testing.T, e *qualEnv, require bool, surfaces []qualSurface) {
 	t.Helper()
 	for _, s := range surfaces {

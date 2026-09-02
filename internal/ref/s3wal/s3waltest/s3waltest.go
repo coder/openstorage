@@ -40,12 +40,19 @@ import (
 const (
 	SeaweedFSImage   = "chrislusf/seaweedfs:4.42"
 	MinIOLegacyImage = "minio/minio:RELEASE.2024-01-16T16-07-38Z"
-	// FlociImage pins the Floci release row of the qualification matrix
-	// (issue #205): the nightly record-mode lane documents this release's
-	// conditional-write behavior, so bumping the pin is how a new Floci
-	// release gets re-probed for the documented gaps (torn reads under
-	// same-key overwrite, DeleteObject+If-Match ignored — issue #201).
-	FlociImage = "floci/floci:1.7.0"
+	// FlociImage pins the Floci row of the qualification matrix (issues
+	// #205, #212): the nightly lane runs the 22 qualification surfaces plus
+	// get-under-overwrite in REQUIRE mode against this build, so bumping
+	// the pin is how a new Floci build gets re-qualified and re-probed for
+	// the remaining documented gap (DeleteObject+If-Match ignored — issue
+	// #201). nightly-09012026 (image sha256:3d415bb82d47…, upstream
+	// revision f2b4c084) is the first published build carrying the
+	// GetObject torn-read fix floci-io/floci#2874 (plus its follow-up
+	// #2901); no release tag contains that fix yet — 2.0.1 was cut 25 min
+	// before it merged.
+	// TODO(#212): move to the first release tag after 2.0.1 once upstream
+	// cuts one (verify `git tag --contains b4aab999` in a floci clone).
+	FlociImage = "floci/floci:nightly-09012026"
 )
 
 // SeaweedFS's `weed server -s3` anonymous mode accepts any static
