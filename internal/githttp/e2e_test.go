@@ -350,7 +350,7 @@ func startSeaweedFS(ctx context.Context) (s3Addr string, terminate func()) {
 	s3Config := fmt.Sprintf(`{"identities":[{"name":"e2e","credentials":[{"accessKey":%q,"secretKey":%q}],"actions":["Admin","Read","List","Tagging","Write"]}]}`,
 		s3AccessKey, s3SecretKey)
 	seaweedC, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
-		Image:        "chrislusf/seaweedfs:4.42",
+		Image:        "chrislusf/seaweedfs:4.45",
 		ExposedPorts: []string{"8333/tcp"},
 		Cmd:          []string{"server", "-s3", "-dir=/data", "-ip.bind=0.0.0.0", "-s3.config=/etc/seaweedfs/s3.json"},
 		Files: []testcontainers.ContainerFile{{
