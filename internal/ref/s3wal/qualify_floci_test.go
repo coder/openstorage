@@ -1,12 +1,20 @@
-// The Floci row of the s3wal qualification matrix (issue #205): a
-// RECORD-mode lane — behavioral findings are the deliverable, never a
-// test failure — over the standard qualification surfaces plus the two
-// gap surfaces the #201 spike found Floci violating: DeleteObject +
-// If-Match fidelity and GET atomicity under same-key overwrite. The lane
-// runs nightly (floci-nightly.yml) against the pinned s3waltest.FlociImage
-// so an upstream gap closure surfaces automatically when the pin is bumped
-// to a new Floci release. Require mode stays SeaweedFS-only: nothing gates
-// on Floci.
+// The Floci row of the s3wal qualification matrix (issues #205, #212) over
+// the standard qualification surfaces plus the two gap surfaces the #201
+// spike found Floci violating: DeleteObject + If-Match fidelity and GET
+// atomicity under same-key overwrite. The lane runs nightly
+// (floci-nightly.yml) against the pinned s3waltest.FlociImage.
+//
+// Modes: the 22 standard surfaces and get-under-overwrite run in REQUIRE
+// mode — the pinned build passes them all now that upstream fixed the
+// torn-read bug (floci-io/floci#2874), so a regression in either Floci or
+// s3wal's own S3 usage fails the test. delete-if-match stays a RECORD-mode
+// finding: the pin still ignores the condition (issue #201), and s3wal
+// never depends on it (ADR-46). Like the SeaweedFS and MinIO lanes, this
+// test is gated only by -short, so it runs wherever `go test ./...` runs —
+// the per-PR `test` job included, as the record-mode row already did.
+// This is second-implementation regression armor only; it is not
+// promotion evidence for the s3wal backend (#192), whose gates
+// (docs/how-to/deploy-production.md) are unchanged by anything here.
 package s3wal_test
 
 import (
@@ -29,9 +37,10 @@ import (
 	"github.com/coder/code-storage/internal/ref/s3wal/s3waltest"
 )
 
-// TestQualifyFloci runs the full qualification surface set plus the Floci
-// gap surfaces in record mode. Infrastructure/harness errors
-// (verdictError) still fail — an incomplete matrix row is not a finding.
+// TestQualifyFloci runs the full qualification surface set and
+// get-under-overwrite in require mode, then delete-if-match in record
+// mode. Infrastructure/harness errors (verdictError) fail in every mode —
+// an incomplete matrix row is not a finding.
 func TestQualifyFloci(t *testing.T) {
 	if testing.Short() {
 		t.Skip("floci qualification needs docker")
@@ -44,20 +53,18 @@ func TestQualifyFloci(t *testing.T) {
 	tag, ok := strings.CutPrefix(s3waltest.FlociImage, "floci/floci:")
 	assertf(ok && tag != "", "FlociImage %q does not carry the floci/floci: prefix", s3waltest.FlociImage)
 	e := newQualEnv(t, "floci-"+tag, raw, "s3wal-qualify", "", s3wal.ProbeKey)
-	runQualification(t, e, false)
-	runSurfaces(t, e, false, []qualSurface{
-		{"delete-if-match", surfaceDeleteIfMatch},
-		{"get-under-overwrite", surfaceGetUnderOverwrite},
-	})
+	runQualification(t, e, true)
+	runSurfaces(t, e, true, []qualSurface{{"get-under-overwrite", surfaceGetUnderOverwrite}})
+	runSurfaces(t, e, false, []qualSurface{{"delete-if-match", surfaceDeleteIfMatch}})
 }
 
 // surfaceDeleteIfMatch records a store's DeleteObject+If-Match fidelity.
 // AWS honors the condition on general-purpose buckets: mismatched If-Match
 // ⇒ 412 and the object survives; matched If-Match ⇒ deleted. The
 // corruption-class divergence is silently deleting on a mismatch (legacy
-// MinIO, Floci ≤ 1.7.0 — issue #201). s3wal deliberately never uses
-// conditional DELETE as a guard (ADR-46), so this surface is a matrix row,
-// not a design dependency.
+// MinIO; Floci through 2.0.1 and nightly-09012026 — issue #201). s3wal
+// deliberately never uses conditional DELETE as a guard (ADR-46), so this
+// surface is a matrix row, not a design dependency.
 func surfaceDeleteIfMatch(t *testing.T, e *qualEnv) []verdict {
 	t.Helper()
 	const name = "delete-if-match"
@@ -153,15 +160,17 @@ func surfaceDeleteIfMatch(t *testing.T, e *qualEnv) []verdict {
 	return []verdict{{name, verdictPass, "mismatch → 412 + object survives; match → deleted"}}
 }
 
-// surfaceGetUnderOverwrite records whether GETs racing same-key overwrites
+// surfaceGetUnderOverwrite checks whether GETs racing same-key overwrites
 // stay atomic. AWS GETs return one consistent version — body, ETag, and
 // checksum all from the same version. Two violation shapes: a torn BODY
-// (bytes from neither whole version — on Floci ≤ 1.7.0 also corrupted HTTP
-// framing: surplus bytes past Content-Length that poison the pooled
-// keep-alive connection, issue #201) and torn METADATA (an intact body
-// paired with the other version's ETag). This is s3wal's production shape
-// — manifest GETs race If-Match overwrites of the same key — hence the
-// torn-read bug is the single gate on any require-mode Floci lane.
+// (bytes from neither whole version — on Floci through 2.0.1 also
+// corrupted HTTP framing: surplus bytes past Content-Length that poison
+// the pooled keep-alive connection, issue #201) and torn METADATA (an
+// intact body paired with the other version's ETag). This is s3wal's
+// production shape — manifest GETs race If-Match overwrites of the same
+// key — hence the torn-read bug was the single gate on any require-mode
+// Floci lane until upstream fixed it (floci-io/floci#2874, first shipped
+// in nightly-09012026); on the pinned build this surface is required.
 //
 // The probe hammers one key with alternating distinct-length CONDITIONAL
 // PUTs — each overwrite carries If-Match with the previous write's ETag,

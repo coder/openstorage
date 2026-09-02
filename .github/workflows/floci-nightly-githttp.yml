@@ -12,8 +12,9 @@
 # AWS_SESSION_TOKEN plumbing (env → SDK → serve children). Value:
 # second-implementation wire-drift armor under the whole git/LFS surface.
 # The per-PR blob store stays SeaweedFS deliberately — Floci does not
-# validate header-auth SigV4 signatures, tears reads racing same-key
-# overwrites, and ignores conditional DELETE (issue #201 spike findings).
+# validate header-auth SigV4 signatures and ignores conditional DELETE
+# (issue #201 spike findings, re-verified on the pin below — issue #212;
+# its torn-read bug is fixed as of floci-io/floci#2874).
 # Local repro: docs/reference/testing.md (The Floci githttp E2E lane).
 name: floci-nightly-githttp
 
@@ -40,14 +41,17 @@ jobs:
       - name: boot floci
         # Pinned tag, not :latest — this lane exports credentials parsed from
         # the image's API responses, so keep the image bytes as stable as a
-        # mutable registry allows. 1.7.0 is the spike-qualified version
-        # (nightly-08282026 behaved identically). Keep in sync with
-        # s3waltest.FlociImage (the s3wal qualification-matrix pin, issue
-        # #205) so every Floci lane probes the same release.
+        # mutable registry allows. nightly-09012026 is the first published
+        # build with the GetObject torn-read fix (floci-io/floci#2874); no
+        # release tag contains it yet. Keep in sync with s3waltest.FlociImage
+        # (the s3wal qualification-matrix pin, issues #205/#212) so every
+        # pinned Floci lane probes the same build.
+        # TODO(#212): move to the first release tag after 2.0.1 together
+        # with s3waltest.FlociImage.
         run: |
           docker run -d --name floci -p 4566:4566 \
             -e FLOCI_SERVICES_S3_ENFORCE_AUTH=true \
-            floci/floci:1.7.0
+            floci/floci:nightly-09012026
           for i in $(seq 1 60); do
             if curl -s -o /dev/null http://127.0.0.1:4566/; then
               echo "floci ready after ${i}s"

@@ -257,37 +257,57 @@ a static enforcing identity); this nightly lane adds the external-endpoint
 path with a key provisioned through a real IAM API rather than a static
 config, against a second, independent wire-protocol implementation.
 
-Known Floci gaps, so nobody extends this lane into them (all verified open on
-both `1.7.0` and `nightly-08282026` by the #201 spike):
+Known Floci gaps, so nobody extends this lane into them (found open on
+`1.7.0` and `nightly-08282026` by the #201 spike; every one re-verified
+still open on `nightly-09012026` — the pinned `s3waltest.FlociImage` — by
+#212, with `FLOCI_SERVICES_S3_ENFORCE_AUTH=true` and an IAM-minted key):
 
-- No IAM policy evaluation on S3 actions (a `Deny` still succeeds), and
-  `x-amz-expected-bucket-owner` is ignored — both stay covered by unit-test
-  seams.
-- Torn reads under same-key overwrite: a GET racing a PUT on the same key can
-  return a body that is neither version, with broken HTTP framing (Go logs
-  "Unsolicited response received on idle HTTP channel") that poisons
-  keep-alive connections. This disqualifies any s3wal-shaped lane — whose
-  production shape is manifest reads racing CAS overwrites — until fixed
-  upstream.
+- No IAM policy evaluation on S3 actions (an attached explicit
+  `Deny s3:GetObject` still lets `GetObject` succeed), and
+  `x-amz-expected-bucket-owner` is ignored (a wrong 12-digit owner is
+  accepted on `GetObject` and `HeadBucket`; AWS returns 403) — both stay
+  covered by unit-test seams.
 - `DeleteObject` with `If-Match` is silently ignored: a mismatched `If-Match`
   deletes the object anyway, with no 412 (MinIO-class behavior).
 - Header-auth SigV4 signatures are not validated — only that the access-key
-  ID exists, so a wrong secret or a forged session token is accepted.
-  Presigned-URL signature validation IS enforced, and that is the SigV4
-  property this lane pins.
+  ID exists (an unknown key ID gets `InvalidAccessKeyId`), so a wrong secret
+  or a forged session token is accepted. Presigned-URL signature validation
+  IS enforced (a tampered presigned GET or PUT gets
+  `403 SignatureDoesNotMatch`), and that is the SigV4 property this lane pins.
+
+Fixed upstream — torn reads under same-key overwrite: through `2.0.1`, a GET
+racing a PUT on the same key could return a body that was neither version,
+with broken HTTP framing (Go logs "Unsolicited response received on idle
+HTTP channel") that poisoned keep-alive connections — the sole disqualifier
+for any s3wal-shaped lane, whose production shape is manifest reads racing
+CAS overwrites. [floci-io/floci#2874](https://github.com/floci-io/floci/pull/2874)
+(merged 2026-09-01, refined by
+[#2901](https://github.com/floci-io/floci/pull/2901)) fixes it;
+`nightly-09012026` is the first published build carrying the fix, and no
+release tag contains it yet (`2.0.1` was cut 25 minutes before it merged),
+so that dated tag is the pin until upstream cuts the next release (TODO in
+`s3waltest.go`). The `get-under-overwrite` qualification surface below now
+guards it in require mode.
 
 Two positives from the same spike, for future lane design: Floci passes the
 full 22-surface s3wal qualification suite (`TestQualifyExternalEndpoint` in
-`internal/ref/s3wal`) — the only emulator besides SeaweedFS to do so — and
-SeaweedFS 4.42 honors conditional DELETE (412 and the object survives on a
-mismatched `If-Match`), unlike both Floci and the legacy MinIO pin.
+`internal/ref/s3wal`; re-confirmed 22/22 on the pin by `TestQualifyFloci`)
+— the only emulator besides SeaweedFS to do so — and SeaweedFS 4.42 honors
+conditional DELETE (412 and the object survives on a mismatched `If-Match`),
+unlike both Floci and the legacy MinIO pin.
 
-The same workflow also records the Floci row of the s3wal qualification
-matrix: `TestQualifyFloci` (`internal/ref/s3wal/qualify_floci_test.go`) runs
-the qualification surfaces plus the `delete-if-match` and
-`get-under-overwrite` (torn-read) gap surfaces in record mode against the
-pinned `s3waltest.FlociImage`, so a Floci release that closes a gap surfaces
-in the VERDICT transcript on the next pin bump — nothing gates on Floci.
+The same workflow also runs the Floci row of the s3wal qualification matrix:
+`TestQualifyFloci` (`internal/ref/s3wal/qualify_floci_test.go`) runs the 22
+qualification surfaces plus the `get-under-overwrite` (torn-read) surface in
+**require mode** against the pinned `s3waltest.FlociImage`, and the
+`delete-if-match` surface in record mode (the pin still ignores the
+condition; s3wal never relies on it — ADR-46). This is second-implementation
+regression armor for s3wal's S3 usage — it is **not** promotion evidence for
+the s3wal backend (#192): the store requirements in
+[the production guide](../how-to/deploy-production.md) are unchanged, and
+Floci is not a qualified `s3wal://` store. Like the SeaweedFS lane, the test
+is gated only by `-short`, so it also runs in the per-PR `test` job; the
+nightly job additionally asserts the VERDICT transcript is complete.
 
 Run it locally (Docker + the `aws` CLI):
 
@@ -317,7 +337,7 @@ use an unversioned scratch bucket, not a production one.
 ## The Floci githttp E2E lane
 
 [`floci-nightly-githttp.yml`](../../.github/workflows/floci-nightly-githttp.yml)
-runs daily (04:53 UTC): it boots a pinned Floci image (the same release
+runs daily (04:53 UTC): it boots a pinned Floci image (the same build
 `s3waltest.FlociImage` pins for the qualification matrix — bump both
 together) with S3 auth
 enforcement on, provisions an IAM user and access key, assumes a role via
@@ -349,17 +369,17 @@ persistent mode (`FLOCI_STORAGE_MODE=persistent` plus a volume) was verified
 working during the issue #201 spike if the lane ever needs restart survival.
 
 The per-PR blob store deliberately stays SeaweedFS: Floci is not strictly
-better — header-auth SigV4 signatures are not validated, reads racing a
-same-key overwrite can tear, and conditional DELETE is ignored. The
+better — header-auth SigV4 signatures are not validated and conditional
+DELETE is ignored (its torn-read bug is fixed as of the pinned build). The
 authoritative gap list, with details, is in
 [the Floci S3 lane](#the-floci-s3-lane) section above. The lane is
 nightly-only and **not** part of the required PR check set.
 
-Run it locally (Docker + the `aws` CLI):
+Run it locally (Docker + the `aws` CLI; the tag is `s3waltest.FlociImage`):
 
 ```sh
 docker run -d --name floci -p 4566:4566 \
-  -e FLOCI_SERVICES_S3_ENFORCE_AUTH=true floci/floci:1.7.0
+  -e FLOCI_SERVICES_S3_ENFORCE_AUTH=true floci/floci:nightly-09012026
 
 # IAM/STS accept any credentials; only the S3 data plane enforces auth.
 export AWS_ACCESS_KEY_ID=root AWS_SECRET_ACCESS_KEY=root AWS_DEFAULT_REGION=us-east-1
