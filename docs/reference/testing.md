@@ -292,7 +292,7 @@ guards it in require mode.
 Two positives from the same spike, for future lane design: Floci passes the
 full 22-surface s3wal qualification suite (`TestQualifyExternalEndpoint` in
 `internal/ref/s3wal`; re-confirmed 22/22 on the pin by `TestQualifyFloci`)
-— the only emulator besides SeaweedFS to do so — and SeaweedFS 4.42 honors
+— the only emulator besides SeaweedFS to do so — and SeaweedFS 4.45 honors
 conditional DELETE (412 and the object survives on a mismatched `If-Match`),
 unlike both Floci and the legacy MinIO pin.
 
