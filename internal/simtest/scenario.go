@@ -809,21 +809,6 @@ func (s *sim) doCrash(name string, node *simNode, cold bool) error {
 	if err := s.cl.crashNode(node, cold); err != nil {
 		return fmt.Errorf("step %d: crash node %d: %w", s.step, node.id, err)
 	}
-	stale := 0
-	if s.cl.backend == RefBackendS3WAL {
-		// Half the reboots arm one stale first read on the fresh driver
-		// instance — the only point a stale read is legal (a live
-		// instance's seq watermark makes it process-fatal by design;
-		// see SimCAS). The draw is unconditional in this lane so the
-		// scheduler stream stays aligned across seeds.
-		if s.rng.IntN(2) == 0 {
-			node.simCAS.armStaleGet()
-			stale = 1
-		}
-		s.tracef("step=%04d op=%s node=%d sync-killed=%d push-killed=%d stale-armed=%d",
-			s.step, name, node.id, killed, pushKilled, stale)
-		return nil
-	}
 	s.tracef("step=%04d op=%s node=%d sync-killed=%d push-killed=%d", s.step, name, node.id, killed, pushKilled)
 	return nil
 }

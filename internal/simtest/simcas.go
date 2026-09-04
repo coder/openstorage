@@ -3,7 +3,6 @@ package simtest
 import (
 	"context"
 	"fmt"
-	"sync"
 	"time"
 
 	"github.com/coder/code-storage/internal/ref/s3wal"
@@ -15,7 +14,7 @@ import (
 // exercise the driver's own mutate/recover machinery (§2.3), while the
 // SimRefStore decorator above the driver keeps exercising
 // ref.IdempotentCAS — both recovery layers run in one simulation. Rebuilt
-// on node crash (process death drops armed one-shots with the process).
+// on node crash, like the process it stands for.
 //
 // Fault classes per op (drawn from the shared Injector, so decisions are
 // deterministic under the serialized scheduler):
@@ -28,13 +27,20 @@ import (
 //   - cas.Get / cas.List: FaultClean fails the read without executing.
 //     Reads are idempotent, so a lost response is indistinguishable from
 //     a failed request — one class covers both.
-//   - Stale reads are TARGETED, not probabilistic: armStaleGet serves the
-//     previous manifest version on this node's next Get. Only doCrash
-//     arms it, immediately after the node's handles were rebuilt, because
-//     a stale read served to a live driver instance trips its
-//     seq-watermark fidelity assert BY DESIGN (plan §2.3) — only a fresh
-//     instance (empty watermark) can legally observe one, exactly like a
-//     freshly booted node reading a laggy replica.
+//
+// Stale reads are NOT injected (issue #216). The s3wal store contract
+// requires strong read-after-write consistency (plan §1/§2.6), the driver
+// trusts every unconditional read by construction, and its seq watermark
+// only catches a read that regresses below this process's own last
+// observation — so a served-stale manifest yields a silently wrong
+// read-only verdict (a sweep that "finds nothing to prune", a CAS that
+// "lost") with no conditional PUT to expose it. Modelling that class makes
+// the exact-state oracles unsatisfiable by any read-only path; the
+// retired one-shot arm (PR #159) drove precisely that violation on seed
+// 833534285 (pinned in dstRegressions). The 412 lost-race recovery the arm
+// was meant to trigger is exercised dozens of times per run through the
+// multi-node seed cache (issue #182): every cross-node write leaves the
+// other nodes' cached snapshots stale, and their next seeded PUT 412s.
 //
 // 409-exhaustion (s3wal.ErrCASContention) is deliberately not injected:
 // genuine CAS contention arises naturally from the multi-node shared-fake
@@ -44,9 +50,6 @@ import (
 type SimCAS struct {
 	mem *s3wal.MemCAS
 	inj *Injector
-
-	mu    sync.Mutex
-	stale bool // serve the previous version on the next Get
 }
 
 var _ s3wal.ConditionalStore = (*SimCAS)(nil)
@@ -58,41 +61,15 @@ func NewSimCAS(mem *s3wal.MemCAS, inj *Injector) *SimCAS {
 	return &SimCAS{mem: mem, inj: inj}
 }
 
-// armStaleGet directs this node's next Get to serve the key's previous
-// version when one exists (see the package comment for why only fresh
-// driver instances may observe one).
-func (c *SimCAS) armStaleGet() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.stale = true
-}
-
-// takeStale consumes the one-shot stale arm.
-func (c *SimCAS) takeStale() bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	s := c.stale
-	c.stale = false
-	return s
-}
-
-// Get fetches key, possibly failing clean or serving the armed stale
-// version.
+// Get fetches key, possibly failing clean.
 func (c *SimCAS) Get(ctx context.Context, key string) (s3wal.Object, error) {
 	if c.inj.begin(OpCASGet) == FaultClean {
 		return s3wal.Object{}, cleanFaultError{op: OpCASGet}
 	}
-	if c.takeStale() {
-		if v, ok := c.mem.Prev(key); ok {
-			c.inj.noteInjected(OpCASGet, FaultStale)
-			return v, nil
-		}
-	}
 	return c.mem.Get(ctx, key)
 }
 
-// GetIfChanged fetches key unless etag is current (no stale injection:
-// the armed stale read targets the driver's unconditional manifest read).
+// GetIfChanged fetches key unless etag is current, possibly failing clean.
 func (c *SimCAS) GetIfChanged(ctx context.Context, key, etag string) (s3wal.Object, error) {
 	if c.inj.begin(OpCASGet) == FaultClean {
 		return s3wal.Object{}, cleanFaultError{op: OpCASGet}

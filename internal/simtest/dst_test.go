@@ -2,6 +2,7 @@ package simtest
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -178,6 +179,47 @@ func TestDSTSeed(t *testing.T) {
 		t.Fatalf("infra error: %v", err)
 	}
 	reportRun(t, res)
+}
+
+// dstRegressions is the pinned-seed corpus: every entry is a seed that once
+// violated an oracle (found by the nightly sweep), replayed at its recorded
+// step count on its lane by TestDSTRegressions inside the PR gate
+// (`go test ./...`). An entry is regression armor for the harness+driver
+// pair that produced it: a harness change that legitimately re-schedules
+// the PRNG stream must re-validate the entry against its issue, never drop
+// it silently.
+var dstRegressions = []struct {
+	seed    uint64
+	steps   int
+	backend RefBackend
+	issue   string // the violation the seed reproduced
+}{
+	// A rebooted node's first manifest read served a superseded version
+	// (the since-retired SimCAS stale-read arm), so its
+	// SweepExpiredPackReservations concluded "nothing to prune" from a
+	// snapshot that predated a competitor's reservation — a read-only
+	// verdict no conditional PUT could catch. The s3wal store contract
+	// requires strong read-after-write consistency; the arm modelled a
+	// store the design excludes.
+	{833534285, 103, RefBackendS3WAL, "#216 reserved bytes survive a full reservation sweep"},
+}
+
+// TestDSTRegressions replays the pinned-seed corpus (see dstRegressions).
+func TestDSTRegressions(t *testing.T) {
+	for _, tc := range dstRegressions {
+		t.Run(fmt.Sprintf("%s/%d", tc.backend, tc.seed), func(t *testing.T) {
+			res, err := Run(Config{Seed: tc.seed, Steps: tc.steps, RefBackend: tc.backend})
+			if err != nil {
+				t.Fatalf("infra error: %v", err)
+			}
+			reportRun(t, res)
+			// Only a violation stops a run early; an early stop without
+			// one is a harness bug, not a passing replay.
+			if res.Steps != tc.steps && len(res.Violations) == 0 {
+				t.Errorf("%s: ran %d of %d steps without a violation", tc.issue, res.Steps, tc.steps)
+			}
+		})
+	}
 }
 
 // TestDSTSweep is the extended seed sweep (nightly CI):

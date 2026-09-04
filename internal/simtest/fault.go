@@ -47,11 +47,6 @@ const (
 	// executing it (transient missing-object; only valid on
 	// OpBlobDownloadFile, OpBlobStat, OpBlobDelete, and OpBlobCopy).
 	FaultNotFound
-	// FaultStale serves an older version of the object on a read (only
-	// valid on OpCASGet, and only via SimCAS.armStaleGet — never through
-	// the per-op plans, because a stale read is process-fatal for a live
-	// s3wal driver instance by design and must target a fresh one).
-	FaultStale
 )
 
 // String returns the fault class name for traces.
@@ -65,8 +60,6 @@ func (c FaultClass) String() string {
 		return "ambiguous"
 	case FaultNotFound:
 		return "notfound"
-	case FaultStale:
-		return "stale"
 	}
 	return fmt.Sprintf("FaultClass(%d)", int(c))
 }
@@ -307,16 +300,6 @@ func (in *Injector) begin(op string) FaultClass {
 // record appends a FaultEvent for the current seq. Callers hold in.mu.
 func (in *Injector) record(op string, class FaultClass) {
 	in.fired = append(in.fired, FaultEvent{Seq: in.seq, Op: op, Class: class})
-}
-
-// noteInjected records one externally-armed fault against the CURRENT call
-// (the caller has just begun it): SimCAS's targeted stale reads bypass the
-// per-op plan/probability machinery because they must hit one specific
-// node, but still belong in the fired log for traces and vacuity guards.
-func (in *Injector) noteInjected(op string, class FaultClass) {
-	in.mu.Lock()
-	defer in.mu.Unlock()
-	in.record(op, class)
 }
 
 // coin draws one deterministic boolean from the injector's stream (SimCAS
