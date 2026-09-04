@@ -110,7 +110,7 @@ determinism rules; this section covers how to run and triage it.
 
 | What | How |
 |---|---|
-| PR gate (runs inside `go test ./...`) | `TestDSTFast`, `TestDSTDeterminism` |
+| PR gate (runs inside `go test ./...`) | `TestDSTFast`, `TestDSTDeterminism`, `TestDSTRegressions` (the pinned-seed corpus) |
 | Reproduce a seed (test) | `DST_SEED=<seed> [DST_STEPS=<n>] go test ./internal/simtest -run 'TestDSTSeed' -v -count=1` |
 | Reproduce a seed (CLI) | `go run ./cmd/dst -seed <seed> [-steps N] [-nodes N] [-v] [-keep]` |
 | Nightly sweep | [`dst-nightly.yml`](../../.github/workflows/dst-nightly.yml) → `TestDSTSweep` |
@@ -152,14 +152,16 @@ Defaults: 150 steps, 3 nodes. Exit codes: `0` clean, `1` invariant violation,
    *pre-fix* reproduction (the `VIOLATION` line is hashed and stops the run);
    the fixed run produces a different hash — what determinism guarantees is
    that repeated runs of the same binary print the *same* one.
-5. **Pin it in a committed test.** The reproduction command guards nothing
-   after it scrolls by — `TestDSTSeed` skips when `DST_SEED` is unset, and the
-   nightly sweep derives fresh seeds from each run id. Commit a regression
-   that replays the exact failing configuration in the PR gate: a
-   `Run(Config{Seed: <seed>, Steps: <steps>})` call in
-   `internal/simtest/dst_test.go`, next to `TestDSTFast` — as a dedicated
-   test or a table entry that carries the step count (`TestDSTFast`'s own
-   seed-only list runs everything at 120 steps).
+5. **Pin it in the regression corpus.** The reproduction command guards
+   nothing after it scrolls by — `TestDSTSeed` skips when `DST_SEED` is unset,
+   and the nightly sweep derives fresh seeds from each run id. Add the exact
+   failing configuration (seed, step count, backend lane, the issue it
+   reproduced) to the `dstRegressions` table in
+   `internal/simtest/dst_test.go`; `TestDSTRegressions` replays every entry in
+   the PR gate. Prove it red before the fix and green after. An entry is
+   armor for the harness+driver pair that produced it — a later harness
+   change that legitimately re-schedules the PRNG stream must re-validate
+   the entry against its issue rather than drop it silently.
 
 ### The nightly sweep
 

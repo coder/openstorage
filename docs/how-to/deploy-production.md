@@ -463,7 +463,18 @@ bucket — the
 detect exactly that mistake (startup refusal / fail-stop), best-effort.
 
 **Store requirements.** The mode depends on faithful conditional writes
-(`If-Match` / `If-None-Match: *`). A boot-time probe refuses stores that fail it.
+(`If-Match` / `If-None-Match: *`) **and on strong read-after-write and
+list-after-write consistency**: after a successful PUT, every subsequent GET or
+LIST from any client must observe it. Conditional writes are verified by a
+boot-time probe that refuses stores failing it; consistency cannot be probed and
+is a deployment prerequisite you must satisfy — the engine trusts every
+unconditional read of its `_wal/` objects, so a store (or a caching proxy in
+front of one) that can serve a superseded object version silently produces wrong
+read-only verdicts, such as a reservation sweep or a hydration generation check that
+misses a competitor's write. AWS S3 has provided this guarantee for all
+regions [since December 2020](https://aws.amazon.com/blogs/aws/amazon-s3-update-strong-read-after-write-consistency/)
+([consistency model](https://docs.aws.amazon.com/AmazonS3/latest/userguide/Welcome.html#ConsistencyModel));
+verify it for any other store, and never front the bucket with a cache.
 Qualified today: **SeaweedFS** (the tested self-hosted reference — the qualification
 lanes run against it in CI) and **AWS S3** (the full qualification lane passed in
 require mode against eu-central-1, 2026-08-27 — one campaign; see the
