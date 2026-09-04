@@ -59,10 +59,26 @@ On the s3wal lane a second injection layer sits BELOW the driver: each
 node's `SimCAS` transport view of the shared conditional store injects
 clean read/list failures, never-executed and ambiguous(applied|dropped)
 conditional PUTs — exercising the driver's own §2.3 mutate/recover
-machinery under the same run that exercises `ref.IdempotentCAS` above it —
-plus a targeted stale first read on half the node reboots (a stale read
-against a LIVE driver instance is process-fatal by design: the seq
-watermark treats it as store-fidelity violation).
+machinery under the same run that exercises `ref.IdempotentCAS` above it.
+
+Stale reads are deliberately **not** in the fault plan. The s3wal driver is
+written against a store with strong read-after-write consistency (plan
+§1/§2.6; a documented deployment prerequisite — AWS S3 guarantees it since
+December 2020), so it trusts every unconditional read; its seq watermark
+only catches a read that regresses
+below the process's own last observation. A stale manifest therefore
+yields a silently wrong *read-only* verdict — a sweep that "finds nothing
+to prune", a CAS that "lost" — with no conditional PUT to expose it, and
+under such a fault the exact-state oracles are unsatisfiable by any
+read-only path. PR #159's one-shot stale first read on half the node
+reboots modelled exactly that store class and drove the issue-#216
+violation (seed 833534285, pinned in `TestDSTRegressions`); it was retired.
+The 412 lost-race recovery it was meant to trigger needs no injection: the
+multi-node seed cache (issue #182) leaves every other node's cached
+snapshot stale after each cross-node write, so their next seeded PUT 412s
+and re-reads — measured at 34–59 real 412s per 300-step seed with the arm
+gone, versus 7–69 with it (the arm added a handful of unseeded 412s that
+walk the same `mutate` path).
 
 ## Invariant oracles
 

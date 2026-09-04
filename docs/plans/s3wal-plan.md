@@ -522,6 +522,17 @@ the repo-wide container swap lands.**
 - **Gate: DST green over ≥ the nightly seed budget; crash matrix reviewed.**
 - Dogfooding: seed corpus + failure-replay instructions in the PR; one recorded
   kill-9-mid-push drill against SeaweedFS showing clean recovery.
+- *Amendment (issue #216, 2026-09):* the stale-read GET class listed above was
+  retired from the DST fault plan. It contradicts the §1/§2.6 hard requirement
+  the driver is written against — every unconditional read is trusted, and the
+  §2.3 seq watermark only catches a read regressing below the process's own last
+  observation — so a served-stale manifest yields a silently wrong *read-only*
+  verdict (a reservation sweep that "finds nothing to prune", a CAS that "lost")
+  with no conditional PUT to expose it; under that fault the exact-state oracles
+  are unsatisfiable by any read-only path. Seed 833534285 is pinned in
+  `TestDSTRegressions`. The 412 lost-race path the arm targeted is exercised
+  34–59× per 300-step seed by the multi-node seed cache (issue #182) alone; the
+  in-package `armStaleGet` recovery tests and the seq-watermark panic test remain.
 
 **Phase 3 — zero-infra serve mode + docs.**
 - Files: `cmd/codestorage/config.go` (resolve `s3wal://` ref URL; refuse `file://` blob

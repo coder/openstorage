@@ -82,8 +82,11 @@ Database URL for the ref authority (CAS) and metadata store.
   overlap; the `_wal/` prefix is reserved). Credentials come from the standard AWS env
   chain; at startup a conditional-write probe refuses any store that does not implement
   `If-Match`/`If-None-Match` PUTs faithfully (qualified: SeaweedFS and AWS S3 — see the
-  [benchmark results](../plans/s3wal-bench-results.md) for the AWS campaign). Jobs run
-  on the in-process queue and tickers, exactly like local mode.
+  [benchmark results](../plans/s3wal-bench-results.md) for the AWS campaign). The store
+  must also provide strong read-after-write and list-after-write consistency — an
+  unprobed deployment prerequisite, see the
+  [store requirements](../how-to/deploy-production.md#zero-infrastructure-mode-experimental-one-bucket-one-node).
+  Jobs run on the in-process queue and tickers, exactly like local mode.
 
 ### `CODESTORAGE_S3_URL`
 

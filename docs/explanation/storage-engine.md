@@ -206,6 +206,18 @@ and retry with jittered backoff. All metadata tables (repos, webhooks, credentia
 signing keys, org keys) share one further object, `_wal/meta.json`, with the same CAS
 discipline and a process-local cache revalidated through `If-None-Match` 304s.
 
+**Writes are validated by the CAS; reads are trusted.** Only the conditional PUT
+proves a snapshot current: a manifest read that turned out stale surfaces as a 412
+and is re-read, but a read that ends in a *negative* verdict — a sweep finding
+nothing expired, a CAS whose precondition no longer holds, a generation check that
+sees no change — is never followed by a write and is taken at face value. A
+per-process sequence watermark crashes the node if the store ever serves a version
+older than one this process already observed, but a fresh process, or a version
+merely one behind, is undetectable. The design therefore makes **strong
+read-after-write and list-after-write consistency a hard requirement of the
+store** (see the [deployment prerequisites](../how-to/deploy-production.md#zero-infrastructure-mode-experimental-one-bucket-one-node))
+rather than paying a validating write on every read-only verdict.
+
 **Publish before CAS is preserved unchanged.** Pack and LFS bytes still upload through
 the ordinary blob path *before* the manifest CAS registers or references them — the
 crash asymmetry (orphans, never dangling refs) carries over verbatim. What changes is
