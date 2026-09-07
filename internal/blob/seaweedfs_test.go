@@ -45,14 +45,14 @@ const seaweedFSImage = "chrislusf/seaweedfs:4.45"
 // presigned-URL tamper probe needs. Dummy values — the container is
 // throwaway and unreachable beyond the mapped test port.
 const (
-	seaweedFSAccessKey = "codestorage-test"
-	seaweedFSSecretKey = "codestorage-test-secret"
+	seaweedFSAccessKey = "openstorage-test"
+	seaweedFSSecretKey = "openstorage-test-secret"
 )
 
 const seaweedFSS3Config = `{
   "identities": [
     {
-      "name": "codestorage-test",
+      "name": "openstorage-test",
       "credentials": [{"accessKey": "` + seaweedFSAccessKey + `", "secretKey": "` + seaweedFSSecretKey + `"}],
       "actions": ["Admin", "Read", "List", "Tagging", "Write"]
     }

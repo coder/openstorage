@@ -74,7 +74,7 @@ func opLogWindow(t *testing.T, path string, offset *int64) []opLogLine {
 func censusTable(lines []opLogLine) string {
 	var b strings.Builder
 	for i, l := range lines {
-		role := strings.TrimPrefix(l.role, "codestorage:")
+		role := strings.TrimPrefix(l.role, "openstorage:")
 		fmt.Fprintf(&b, "%2d. %-22s %-16s %3d %6dus %s\n", i+1, role, l.op, l.status, l.durUS, l.key)
 	}
 	return b.String()

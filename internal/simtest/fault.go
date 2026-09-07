@@ -3,7 +3,7 @@
 // decorators for blob.BlobStore and ref.RefStore plus a seeded, serialized
 // multi-node simulation with invariant oracles.
 //
-// The package is test-only by convention: nothing under cmd/codestorage or
+// The package is test-only by convention: nothing under cmd/openstorage or
 // the serve wiring imports it. It ships as regular (non _test.go) files so
 // the seed-reproduction CLI (cmd/dst) and the go-test entry points share one
 // implementation.

@@ -214,9 +214,14 @@ func TestLFS_AuthMapping(t *testing.T) {
 			if w.Code != c.want {
 				t.Fatalf("status = %d, want %d (body %s)", w.Code, c.want, w.Body)
 			}
-			if c.want == http.StatusUnauthorized && c.path == lfsBatchPath {
-				if w.Header().Get("LFS-Authenticate") == "" {
-					t.Fatal("401 batch response missing LFS-Authenticate header")
+			if c.want == http.StatusUnauthorized {
+				if got := w.Header().Get("WWW-Authenticate"); got != `Basic realm="open.storage"` {
+					t.Fatalf("WWW-Authenticate = %q", got)
+				}
+				if c.path == lfsBatchPath {
+					if got := w.Header().Get("LFS-Authenticate"); got != `Basic realm="open.storage"` {
+						t.Fatalf("LFS-Authenticate = %q", got)
+					}
 				}
 			}
 		})

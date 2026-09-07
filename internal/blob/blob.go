@@ -729,7 +729,7 @@ func expectedBucketOwnerFromEnv() (string, error) {
 func expectedBucketOwnerAPIOption(owner string) func(*middleware.Stack) error {
 	assertf(awsAccountIDPattern.MatchString(owner), "expectedBucketOwnerAPIOption(%q)", owner)
 	return func(stack *middleware.Stack) error {
-		return stack.Build.Add(middleware.BuildMiddlewareFunc("codestorageExpectedBucketOwner",
+		return stack.Build.Add(middleware.BuildMiddlewareFunc("openstorageExpectedBucketOwner",
 			func(ctx context.Context, in middleware.BuildInput, next middleware.BuildHandler) (middleware.BuildOutput, middleware.Metadata, error) {
 				req, ok := in.Request.(*smithyhttp.Request)
 				assertf(ok, "expected-bucket-owner middleware: request type %T", in.Request)

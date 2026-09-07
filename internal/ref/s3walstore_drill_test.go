@@ -3,7 +3,7 @@
 // runs the driver-level pipeline (reserve → pack blob PUT → RegisterPacks
 // → CASRef) in a re-executed child of this test binary; the parent
 // SIGKILLs it at the announced window and then proves the §2.5 recovery
-// story over the surviving bucket. The full `codestorage serve` + real
+// story over the surviving bucket. The full `openstorage serve` + real
 // `git push` + restart-from-bucket-only drill belongs to Phase 3, when
 // serve-mode s3wal wiring exists.
 //

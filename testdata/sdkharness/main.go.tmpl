@@ -1,7 +1,7 @@
 // SDK compatibility harness: driven by internal/api/sdkcompat_test.go, which
 // copies this file into a temporary module whose go.mod `replace`s the vendor
 // Go SDK (github.com/pierrecomputer/sdk/packages/code-storage-go, unmodified
-// copy) and runs it against the in-process codestorage API server.
+// copy) and runs it against the in-process openstorage API server.
 //
 // Exit code 0 + final "SDKCOMPAT OK" line means the vendor SDK performed
 // CreateRepo -> FindOne -> ListRepos -> DeleteRepo -> FindOne(nil) ->
@@ -25,7 +25,7 @@ func fatalf(format string, args ...any) {
 }
 
 func main() {
-	apiBase := flag.String("api", "", "API base URL of the codestorage server")
+	apiBase := flag.String("api", "", "API base URL of the openstorage server")
 	org := flag.String("org", "", "organization name (JWT iss)")
 	keyPath := flag.String("key", "", "path to the ES256 private key PEM")
 	flag.Parse()

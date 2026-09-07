@@ -15,7 +15,7 @@ import (
 // graph a pure function of the seed.
 const (
 	simGitName  = "dst-sim"
-	simGitEmail = "dst-sim@codestorage.invalid"
+	simGitEmail = "dst-sim@openstorage.invalid"
 	// simEpoch is the logical time base: step N happens at simEpoch+N.
 	simEpoch = 1700000000
 )

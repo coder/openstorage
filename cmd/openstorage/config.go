@@ -117,7 +117,7 @@ const (
 	// soft-delete a repository's registry rows and blobs are permanently
 	// reclaimed by a purge pass on the sweep cadence. Unset/0 disables the
 	// background purge (soft-deleted repos are kept forever; the
-	// `codestorage purge-repo` command still reclaims individually). When
+	// `openstorage purge-repo` command still reclaims individually). When
 	// set it must be at least jobs.MinRepoPurgeAge and sweeping must be
 	// enabled (the purge rides the sweep schedule). Purged repositories
 	// cannot be restored, and the purge releases the deleted repository's
@@ -442,6 +442,8 @@ func resolveStorageURLs(getenv func(string) string, flagDataDir string) (storage
 		}
 		u.dataDir = abs
 		if u.dbURL == "" {
+			// Keep the on-disk name across product renames: changing it would
+			// silently create an empty database for an existing data directory.
 			u.dbURL = "sqlite://" + filepath.Join(abs, "codestorage.db")
 		}
 		if u.blobURL == "" {
@@ -510,6 +512,8 @@ func resolveServeConfig(getenv func(string) string, flagListen, flagAddr, flagCa
 		orgKeysPath: getenv(envOrgPubKeys),
 	}
 	if cfg.cacheDir == "" {
+		// Preserve the default cache location across product renames so
+		// rolling deployments continue sharing cache coordination files.
 		cfg.cacheDir = filepath.Join(os.TempDir(), "codestorage-cache")
 	}
 	if cfg.dbURL == "" {
@@ -1275,6 +1279,6 @@ func splitPEMBlocks(data []byte) ([]string, error) {
 // crash-and-burn style). Only for impossible conditions, never input errors.
 func assertf(cond bool, format string, args ...any) {
 	if !cond {
-		panic(fmt.Sprintf("codestorage assertion failed: "+format, args...))
+		panic(fmt.Sprintf("openstorage assertion failed: "+format, args...))
 	}
 }

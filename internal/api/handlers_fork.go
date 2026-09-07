@@ -213,7 +213,7 @@ func (s *server) handleForkRepo(w http.ResponseWriter, r *http.Request, verifier
 	// failure must not leave a shell repo behind. The full reachability
 	// closure of forkSHA is the fork's entire object set — no negatives —
 	// so the fork shares nothing with the source's storage keys.
-	packDir, err := os.MkdirTemp("", "codestorage-fork-pack-*")
+	packDir, err := os.MkdirTemp("", "openstorage-fork-pack-*")
 	if err != nil {
 		s.internalErr(w, r, "create fork pack dir", err)
 		return

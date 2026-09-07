@@ -3,7 +3,7 @@
 // blob (docs/explanation/domain-model.md), so without a follow-up story a
 // deleted repository's storage lives forever. The RepoPurger permanently
 // reclaims it — on the sweep cadence once CODESTORAGE_REPO_RETENTION
-// expires, or synchronously via `codestorage purge-repo`.
+// expires, or synchronously via `openstorage purge-repo`.
 //
 // The purge is TOMBSTONE-THEN-DELETE, the inverse of publish-before-CAS:
 // registry rows are dropped (packs rows becoming pack_retained tombstones)
@@ -244,7 +244,7 @@ func (p *RepoPurger) PurgeExpired(ctx context.Context) (PurgeRunReport, error) {
 }
 
 // PurgeRepo purges one soft-deleted repository synchronously (the
-// `codestorage purge-repo` primitive). The repo must be a BASE repo ID and
+// `openstorage purge-repo` primitive). The repo must be a BASE repo ID and
 // must have been soft-deleted at least MinRepoPurgeAge ago; the retention
 // window does NOT apply — invoking the command is the operator's consent.
 func (p *RepoPurger) PurgeRepo(ctx context.Context, repoID string) (RepoPurgeReport, error) {

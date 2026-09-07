@@ -382,7 +382,7 @@ func (w *Worker) transferPush(ctx context.Context, job Job, repo RepoInfo, up Up
 			"incomplete upstream row: owner=%q name=%q host=%q", up.Owner, up.Name, up.UpstreamHost)}
 	}
 
-	tmp, err := os.MkdirTemp("", "codestorage-push-*")
+	tmp, err := os.MkdirTemp("", "openstorage-push-*")
 	if err != nil {
 		return nil, &syncFailure{code: FailInternal, cause: err}
 	}

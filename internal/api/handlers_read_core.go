@@ -919,7 +919,7 @@ func (s *server) handleGetFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tmp, err := os.CreateTemp("", "codestorage-file-*")
+	tmp, err := os.CreateTemp("", "openstorage-file-*")
 	if err != nil {
 		s.internalErr(w, r, "stage blob", err)
 		return

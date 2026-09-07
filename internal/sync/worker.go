@@ -517,7 +517,7 @@ func (w *Worker) transfer(ctx context.Context, job Job, repo RepoInfo, up Upstre
 			"incomplete upstream row: owner=%q name=%q host=%q", up.Owner, up.Name, up.UpstreamHost)}
 	}
 
-	tmp, err := os.MkdirTemp("", "codestorage-sync-*")
+	tmp, err := os.MkdirTemp("", "openstorage-sync-*")
 	if err != nil {
 		return &syncFailure{code: FailInternal, cause: err}
 	}

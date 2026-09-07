@@ -77,7 +77,7 @@ func buildQueryFixture(t *testing.T, e *testEnv) *queryFixture {
 	}
 	fx.repoID = createRepo(t, e, fx.org, fx.repoURL, nil, http.StatusOK).RepoID
 
-	dir, err := os.MkdirTemp("", "codestorage-query-fixture-*")
+	dir, err := os.MkdirTemp("", "openstorage-query-fixture-*")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -131,7 +131,7 @@ func buildQueryFixture(t *testing.T, e *testEnv) *queryFixture {
 	rqGit(t, dir, "update-ref", auth.EphemeralRefName("eph"), fx.c3)
 
 	// Seed the stores: one pack holding every object, then the ref rows.
-	packFile, err := os.CreateTemp("", "codestorage-query-seed-*.pack")
+	packFile, err := os.CreateTemp("", "openstorage-query-seed-*.pack")
 	if err != nil {
 		t.Fatal(err)
 	}

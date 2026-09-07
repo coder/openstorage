@@ -602,6 +602,14 @@ func TestWriteRefsNotes(t *testing.T) {
 			if err != nil || !strings.Contains(out, "reviewed") {
 				t.Fatalf("note show = %q err %v", out, err)
 			}
+			repoPath, err := gitread.Materialize(ctx, e.refStore, e.blobStore, e.cacheDir, fx.repoID, "main")
+			if err != nil {
+				t.Fatal(err)
+			}
+			out, err = wrefGit(ctx, repoPath, nil, nil, "log", "-1", "--format=%an <%ae>", "refs/notes/commits")
+			if err != nil || strings.TrimSpace(out) != "open.storage <notes@openstorage.invalid>" {
+				t.Fatalf("default notes commit author = %q err %v", out, err)
+			}
 		})
 
 		t.Run("add on existing note conflicts", func(t *testing.T) {

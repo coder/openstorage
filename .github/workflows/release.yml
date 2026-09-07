@@ -1,6 +1,6 @@
-# Release binaries (issue #66): cross-compiles ./cmd/codestorage for
+# Release binaries (issue #66): cross-compiles ./cmd/openstorage for
 # linux/darwin × amd64/arm64 (pure Go, CGO off), packages
-# codestorage_<version>_<os>_<arch>.tar.gz + checksums.txt, verifies the
+# openstorage_<version>_<os>_<arch>.tar.gz + checksums.txt, verifies the
 # native archive on both a linux and a macOS runner, and only then uploads
 # everything as assets on the GitHub release for the tag.
 #
@@ -49,8 +49,8 @@ jobs:
         run: |
           cd dist
           sha256sum -c checksums.txt
-          tar -xzf "codestorage_${TAG#v}_linux_amd64.tar.gz"
-          out="$(./codestorage --version)"
+          tar -xzf "openstorage_${TAG#v}_linux_amd64.tar.gz"
+          out="$(./openstorage --version)"
           echo "$out"
           grep -F "$TAG" <<<"$out"
           grep -F "$(git -C .. rev-parse HEAD)" <<<"$out"
@@ -58,7 +58,7 @@ jobs:
         with:
           name: release-archives
           path: |
-            dist/codestorage_*.tar.gz
+            dist/openstorage_*.tar.gz
             dist/checksums.txt
           if-no-files-found: error
 
@@ -87,8 +87,8 @@ jobs:
           esac
           cd dist
           shasum -a 256 -c checksums.txt
-          tar -xzf "codestorage_${TAG#v}_darwin_${arch}.tar.gz"
-          ./codestorage --version | grep -F "$TAG"
+          tar -xzf "openstorage_${TAG#v}_darwin_${arch}.tar.gz"
+          ./openstorage --version | grep -F "$TAG"
 
   publish:
     needs: [build, verify-macos]
@@ -107,4 +107,4 @@ jobs:
           GH_REPO: ${{ github.repository }}
           TAG: ${{ inputs.tag }}
         # --clobber so a workflow_dispatch rebuild replaces existing assets.
-        run: gh release upload "$TAG" dist/codestorage_*.tar.gz dist/checksums.txt --clobber
+        run: gh release upload "$TAG" dist/openstorage_*.tar.gz dist/checksums.txt --clobber

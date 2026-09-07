@@ -25,7 +25,7 @@ import (
 	"testing"
 )
 
-const defaultSDKDir = "/home/coder/codestorage/sdk/packages/code-storage-go"
+const defaultSDKDir = "/home/coder/openstorage/sdk/packages/code-storage-go"
 
 // copyTree copies a directory tree (regular files + dirs only) so the
 // read-only vendor checkout is never touched.

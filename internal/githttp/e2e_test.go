@@ -11,7 +11,7 @@ package githttp
 //   - "local": zero containers — sqlite:// + file:// URLs derived from a
 //     temp data dir, the way `serve --data-dir` derives them.
 //
-// Either way TestMain builds the codestorage binary once and runs nodes as
+// Either way TestMain builds the openstorage binary once and runs nodes as
 // separate OS processes, so the hook re-exec path crosses a real process
 // boundary on both lanes. All keys (JWT org keys, SSH and PGP signing keys)
 // are generated at runtime and never committed.
@@ -67,8 +67,8 @@ const (
 // Static dummy credentials for the SeaweedFS S3 gateway lanes (the
 // container is throwaway and unreachable beyond the mapped test port).
 const (
-	s3AccessKey = "codestorage-e2e"
-	s3SecretKey = "codestorage-e2e-secret"
+	s3AccessKey = "openstorage-e2e"
+	s3SecretKey = "openstorage-e2e-secret"
 )
 
 var (
@@ -92,7 +92,7 @@ func TestMain(m *testing.M) {
 	// TestServiceRPC_ReleasesPushHoldBeforeRepackTrigger) hydrates cache
 	// repos whose hook scripts embed THIS test binary's path — route
 	// those invocations to the real hook entrypoint instead of the test
-	// runner (mirrors cmd/codestorage's "hook" dispatch).
+	// runner (mirrors cmd/openstorage's "hook" dispatch).
 	if len(os.Args) > 1 && os.Args[1] == "hook" {
 		if err := RunHook(context.Background(), os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
@@ -155,8 +155,8 @@ func testMainInner(m *testing.M) int {
 	defer os.RemoveAll(scratch)
 
 	// Build the binary once.
-	binPath = filepath.Join(scratch, "codestorage")
-	build := exec.Command("go", "build", "-o", binPath, "./cmd/codestorage")
+	binPath = filepath.Join(scratch, "openstorage")
+	build := exec.Command("go", "build", "-o", binPath, "./cmd/openstorage")
 	build.Dir = "../.."
 	if out, err := build.CombinedOutput(); err != nil {
 		panic(fmt.Sprintf("go build: %v: %s", err, out))
@@ -401,7 +401,7 @@ func (n *testNode) stop() {
 	}
 }
 
-// startNode runs `codestorage serve` in single-org mode. Later duplicate
+// startNode runs `openstorage serve` in single-org mode. Later duplicate
 // env entries win (os/exec dedups), so tests can override the defaults —
 // e.g. `CODESTORAGE_TEST_MODE=` to prove knobs are refused in production.
 func startNode(cacheDir string, extraEnv ...string) (*testNode, error) {

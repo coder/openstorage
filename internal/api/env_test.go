@@ -46,7 +46,7 @@ import (
 	upsync "github.com/coder/open-storage/internal/sync"
 )
 
-const testHTTPBaseURL = "https://selfhost.code.storage"
+const testHTTPBaseURL = "https://selfhost.open.storage"
 
 // envSyncQueue satisfies the required Config.SyncQueue by dropping enqueued
 // syncs: shared-env tests never run sync workers (the sync lifecycle is
@@ -129,7 +129,7 @@ func backendMetaURL(ctx context.Context, backend string) (string, error) {
 		envCleanup = append(envCleanup, func() { _ = pgC.Terminate(ctx) })
 		return pgC.ConnectionString(ctx, "sslmode=disable")
 	case "sqlite":
-		dir, err := os.MkdirTemp("", "codestorage-api-sqlite-*")
+		dir, err := os.MkdirTemp("", "openstorage-api-sqlite-*")
 		if err != nil {
 			return "", err
 		}
@@ -215,7 +215,7 @@ func testEnvironment(t *testing.T, backend string) *testEnv {
 			state.err = err
 			return
 		}
-		blobDir, err := os.MkdirTemp("", "codestorage-api-blobs-*")
+		blobDir, err := os.MkdirTemp("", "openstorage-api-blobs-*")
 		if err != nil {
 			state.err = err
 			return
@@ -231,7 +231,7 @@ func testEnvironment(t *testing.T, backend string) *testEnv {
 			state.err = err
 			return
 		}
-		cacheDir, err := os.MkdirTemp("", "codestorage-api-cache-*")
+		cacheDir, err := os.MkdirTemp("", "openstorage-api-cache-*")
 		if err != nil {
 			state.err = err
 			return

@@ -167,7 +167,7 @@ func (g *pushGate) Write(p []byte) (int, error) {
 		return g.buf.Write(p)
 	}
 	if g.spill == nil {
-		f, err := os.CreateTemp("", "codestorage-push-gate-*")
+		f, err := os.CreateTemp("", "openstorage-push-gate-*")
 		if err != nil {
 			return 0, fmt.Errorf("push gate spill: %w", err)
 		}

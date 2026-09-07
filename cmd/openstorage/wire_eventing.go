@@ -2,7 +2,7 @@
 // eventing/sync stack (docs/reference/webhooks.md, docs/archive/phases/07-implementation-roadmap.md p5) from the slice-owned packages —
 // jobs queue (River on pg / in-process in local mode), webhook deliverer,
 // upstream-sync worker with loopback push, and the events.RefStore CASRef
-// decorator — for both the serve process and the `codestorage hook`
+// decorator — for both the serve process and the `openstorage hook`
 // subprocess git re-execs.
 package main
 
@@ -469,7 +469,7 @@ func hookWebhookAllowPrivate(logger *slog.Logger) bool {
 }
 
 // wireHookEventing points githttp.WrapHookRefStore at the events.RefStore
-// decorator for the `codestorage hook` subprocess, so git pushes emit push
+// decorator for the `openstorage hook` subprocess, so git pushes emit push
 // events exactly like API writes (docs/reference/webhooks.md). It reads the same env the hook
 // itself uses (serve exports PG_URL; CODESTORAGE_ORG is inherited). The
 // returned cleanup must run after the hook finishes: in local mode it waits

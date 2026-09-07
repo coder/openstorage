@@ -1,4 +1,4 @@
-# Merge gate for coder/code-storage (issue #7): lint, build, and the full
+# Merge gate for coder/open-storage (issue #7): lint, build, and the full
 # uncached race test suite. Postgres-dependent tests (river jobs, pg ref CAS,
 # githttp e2e pg lane) boot their own postgres/seaweedfs containers via
 # testcontainers, so they only need Docker on the runner — no service
@@ -67,8 +67,8 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - run: docker build -t codestorage-smoke .
-      - run: docker run --rm --entrypoint /bin/sh codestorage-smoke -c 'command -v git && command -v gpg && command -v ssh-keygen'
+      - run: docker build -t openstorage-smoke .
+      - run: docker run --rm --entrypoint /bin/sh openstorage-smoke -c 'command -v git && command -v gpg && command -v ssh-keygen'
 
   test-local:
     runs-on: ubuntu-latest
@@ -81,7 +81,7 @@ jobs:
       - run: git lfs version
       - run: go test ./internal/githttp -count=1 -race -timeout=15m
         env:
-          CODESTORAGE_TEST_BACKEND: local
+          OPENSTORAGE_TEST_BACKEND: local
 
   # The s3wal serve/e2e lane (issue #193; promotion tracking #192, item B1):
   # internal/githttp's TestMain boots the zero-infra topology — one SeaweedFS
@@ -90,11 +90,11 @@ jobs:
   # processes: the full shared e2e suite plus the lane-only drills
   # (restart-from-bucket, SIGTERM lease release, dual-serve refusal).
   # Scoped to ./internal/githttp deliberately: that TestMain is the only
-  # consumer of CODESTORAGE_TEST_BACKEND, so a full ./... run under this
+  # consumer of OPENSTORAGE_TEST_BACKEND, so a full ./... run under this
   # lane would replay every other package byte-identically with the `test`
   # job above (the s3wal CAS/qualification suites in internal/ref/s3wal and
   # the MemCAS-backed s3wal meta suite in internal/meta already run there
-  # unconditionally). The harness itself exports CODESTORAGE_S3WAL_LEASE_TTL=0
+  # unconditionally). The harness itself exports OPENSTORAGE_S3WAL_LEASE_TTL=0
   # to its serve children (many serve processes legitimately share the one
   # lane bucket); the job only selects the lane.
   test-s3wal:
@@ -108,4 +108,4 @@ jobs:
       - run: git lfs version
       - run: go test ./internal/githttp -count=1 -race -timeout=25m
         env:
-          CODESTORAGE_TEST_BACKEND: s3wal
+          OPENSTORAGE_TEST_BACKEND: s3wal

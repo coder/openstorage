@@ -36,7 +36,7 @@ func sanitizeTerm(s string) string {
 func cmdPurgeRepo(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("purge-repo", flag.ExitOnError)
 	fs.Usage = func() {
-		fmt.Fprintf(fs.Output(), `usage: codestorage purge-repo [flags] <repo-id>
+		fmt.Fprintf(fs.Output(), `usage: openstorage purge-repo [flags] <repo-id>
 
 Permanently reclaims a soft-deleted repository: drops its registry rows
 (refs, packs, LFS objects, credentials, upstream links) and deletes its

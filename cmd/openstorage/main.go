@@ -1,4 +1,4 @@
-// codestorage is the service binary: `serve` runs a stateless node exposing
+// openstorage is the service binary: `serve` runs a stateless node exposing
 // the /api/v1 HTTP API (single-org self-host mode) and the git smart-HTTP
 // path; `hook` is re-exec'd by git as pre-receive/update hooks;
 // `signing-key` manages the org's commit-signing key registry (docs/reference/authentication.md
@@ -36,7 +36,7 @@ import (
 
 func main() {
 	if len(os.Args) < 2 {
-		fatalf("usage: codestorage <serve|hook|keygen|mint|signing-key|list-packs|purge-repo|version> ...")
+		fatalf("usage: openstorage <serve|hook|keygen|mint|signing-key|list-packs|purge-repo|version> ...")
 	}
 	ctx := context.Background()
 	var err error
@@ -66,7 +66,7 @@ func main() {
 		err = fmt.Errorf("unknown subcommand %q", os.Args[1])
 	}
 	if err != nil {
-		fatalf("codestorage %s: %v", os.Args[1], err)
+		fatalf("openstorage %s: %v", os.Args[1], err)
 	}
 }
 
@@ -164,7 +164,7 @@ func cmdServe(ctx context.Context, args []string) error {
 			}()
 			go func() {
 				if err := lease.Heartbeat(ctx); err != nil {
-					fatalf("codestorage serve: %v", err)
+					fatalf("openstorage serve: %v", err)
 				}
 			}()
 		}
@@ -314,11 +314,11 @@ func cmdServe(ctx context.Context, args []string) error {
 		// Restore default signal disposition first: a second signal
 		// during the drain kills immediately (operator escape hatch).
 		stopSignals()
-		fmt.Fprintln(os.Stderr, "codestorage serve: termination signal received; draining")
+		fmt.Fprintln(os.Stderr, "openstorage serve: termination signal received; draining")
 		dctx, cancel := context.WithTimeout(context.Background(), shutdownDrainTimeout)
 		defer cancel()
 		if err := httpSrv.Shutdown(dctx); err != nil {
-			fmt.Fprintf(os.Stderr, "codestorage serve: drain incomplete after %v: %v\n", shutdownDrainTimeout, err)
+			fmt.Fprintf(os.Stderr, "openstorage serve: drain incomplete after %v: %v\n", shutdownDrainTimeout, err)
 		}
 		// Orderly signal shutdown exits 0; the deferred teardown above
 		// (workers, stores, instance lease) runs on this return.

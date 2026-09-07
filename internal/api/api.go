@@ -47,7 +47,7 @@ type Config struct {
 	Org string
 	// HTTPBaseURL is the externally reachable git base URL (scheme://host),
 	// used to build the `http_url` in the POST /repos response, e.g.
-	// "https://selfhost.code.storage".
+	// "https://selfhost.open.storage".
 	HTTPBaseURL string
 	Fallback    http.Handler
 

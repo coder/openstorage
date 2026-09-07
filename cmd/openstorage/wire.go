@@ -1,4 +1,4 @@
-//go:build !codestorage_stub
+//go:build !openstorage_stub
 
 // wire.go is the single integration seam between the CLI and the phase-1
 // implementation slices. It is the ONLY file referencing the constructors
@@ -9,7 +9,7 @@
 //   - api.New(api.Config{Store, Verifier, HTTPBaseURL})     (internal/api)
 //
 // If a slice landed different names/signatures, fix the drift HERE only.
-// The `codestorage_stub` build tag (constraint above) used to swap in a
+// The `openstorage_stub` build tag (constraint above) used to swap in a
 // wire_stub.go stub so the CLI could build in isolation before the slices
 // landed; the stub was deleted once they did.
 package main
@@ -202,7 +202,7 @@ func buildAPIHandler(ctx context.Context, dbURL, org, httpBaseURL, loopbackBaseU
 	// Purge-aware sweeps reap straggler blobs published into purge-fenced
 	// repos after their purge's own prefix scan (uploads precede the
 	// fenced registration and cannot be fenced themselves). Wired
-	// INDEPENDENTLY of the retention window: `codestorage purge-repo`
+	// INDEPENDENTLY of the retention window: `openstorage purge-repo`
 	// mints fences on retention-less deployments too (PR #105 round 8).
 	sweepCfg.PurgedRepoProbe = purgeReg.IsRepoPurged
 	// Destructive-reap watermark (issue #120): LFS reclamation's slot

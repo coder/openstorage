@@ -2,7 +2,7 @@
 # NOT a per-PR gate: shared-runner deltas are far too noisy to block merges
 # on. This job produces a nightly data point (uploaded as an artifact) so
 # regressions and optimizations (e.g. issue #93) can be compared across runs
-# with benchstat. `-run '^$'` skips ordinary tests; CODESTORAGE_TEST_BACKEND=
+# with benchstat. `-run '^$'` skips ordinary tests; OPENSTORAGE_TEST_BACKEND=
 # local keeps the internal/githttp TestMain boot container-free — the sweep's
 # only bench that touches the booted e2e environment (BenchmarkPushE2E,
 # issue #133 Phase 4) therefore measures the container-free SQLite lane
@@ -39,7 +39,7 @@ jobs:
         # Explicit bash => pipefail: the tee must not mask a failing go test.
         shell: bash
         env:
-          CODESTORAGE_TEST_BACKEND: local
+          OPENSTORAGE_TEST_BACKEND: local
         run: |
           BENCHTIME="${{ github.event.inputs.benchtime }}"
           COUNT="${{ github.event.inputs.count }}"
@@ -56,7 +56,7 @@ jobs:
         # zero-infra backend (TestMain boots a SeaweedFS container). Kept
         # at the default 5 s window per cell — the plan §3 60 s campaign
         # windows are an on-demand run, not a nightly cost. Nightly runs
-        # performance mode only (CODESTORAGE_BENCH_OBSERVE unset): the
+        # performance mode only (OPENSTORAGE_BENCH_OBSERVE unset): the
         # mid-window correctness observer would contend with the measured
         # pushes; correctness campaigns are on-demand (see
         # docs/plans/s3wal-bench-results.md). BenchmarkPushE2E overrides
@@ -66,7 +66,7 @@ jobs:
         # git-subprocess harness.
         shell: bash
         env:
-          CODESTORAGE_TEST_BACKEND: s3wal
+          OPENSTORAGE_TEST_BACKEND: s3wal
         run: |
           COUNT="${{ github.event.inputs.count }}"
           COUNT="${COUNT:-1}"

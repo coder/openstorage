@@ -27,7 +27,7 @@ func skipUnlessS3WAL(t *testing.T) {
 	}
 }
 
-// tryServeExpectExit runs `codestorage serve` with the lane env expecting
+// tryServeExpectExit runs `openstorage serve` with the lane env expecting
 // it to exit on its own (startup refusal), returning combined output and
 // the exit error. A process that unexpectedly keeps serving is killed by
 // the context after 30s and still reports an error.

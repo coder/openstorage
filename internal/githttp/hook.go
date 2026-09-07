@@ -103,7 +103,7 @@ const (
 	EnvPreReceiveBarrier = "CODESTORAGE_TEST_PRERECEIVE_BARRIER"
 	// CrashHeader lets tests request an EnvCrash injection per push; the
 	// server refuses it outside test mode.
-	CrashHeader = "X-Codestorage-Test-Crash"
+	CrashHeader = "X-Openstorage-Test-Crash"
 )
 
 // PG/S3 connection env for hooks, inherited from the serve process.
@@ -117,7 +117,7 @@ var (
 func testMode() bool { return os.Getenv(EnvTestMode) == "1" }
 
 // WrapHookRefStore decorates the ref store the update hook opens for its
-// CAS. Hooks run in a fresh `codestorage hook` subprocess (git execs the
+// CAS. Hooks run in a fresh `openstorage hook` subprocess (git execs the
 // installed hook script), so the serve process's wired store cannot reach
 // them; instead the cmd wiring seam — which runs in the hook subprocess
 // too, it is the same binary — replaces this variable at startup with the
@@ -139,7 +139,7 @@ func mustEnv(names ...string) string {
 	panic(fmt.Sprintf("githttp assertion failed: hook: required env %s is empty", names[0]))
 }
 
-// RunHook dispatches `codestorage hook <pre-receive|update> [args...]`,
+// RunHook dispatches `openstorage hook <pre-receive|update> [args...]`,
 // invoked by git via the scripts EnsureCacheRepo installs. Arguments and
 // stdin come from outside this process, so malformed input must produce an
 // error (stderr message + non-zero exit denies the push), never a panic.
@@ -279,7 +279,8 @@ type refCommand struct{ old, new, ref string }
 // path already treats it as (idempotent blob upload + RegisterPacks). The
 // keep's protection is its existence, not its contents (git only unlinks it
 // after the ref transaction; cache repos pin gc.auto=0 besides), so the
-// rewrite changes no lifecycle.
+// rewrite changes no lifecycle. Keep these bytes across product renames so
+// old and new binaries publish identical sidecars into a shared cache.
 const quarantineKeepContents = "codestorage receive-pack\n"
 
 // normalizeQuarantineKeep rewrites the .keep sidecar of one quarantined
@@ -1025,7 +1026,7 @@ func preReceive(ctx context.Context) (retErr error) {
 			// upload — the reservation deliberately leaks (issue #29's
 			// reserve → crash → sweep recovery window).
 			if testMode() && os.Getenv(EnvCrash) == "after-reserve" {
-				fmt.Fprintln(os.Stderr, "codestorage: crashing after reservation, before upload (test knob)")
+				fmt.Fprintln(os.Stderr, "openstorage: crashing after reservation, before upload (test knob)")
 				os.Exit(42)
 			}
 		}
@@ -1056,7 +1057,7 @@ func preReceive(ctx context.Context) (retErr error) {
 				}
 				if len(proven) > 0 {
 					if rerr := st.RetirePackAttempts(ctx, blob.QuotaRepoGroup(repo), proven); rerr != nil {
-						fmt.Fprintf(os.Stderr, "codestorage: retire reservations: %v\n", rerr)
+						fmt.Fprintf(os.Stderr, "openstorage: retire reservations: %v\n", rerr)
 					}
 				}
 			}
@@ -1067,7 +1068,7 @@ func preReceive(ctx context.Context) (retErr error) {
 	// Test knob: crash between S3 upload and PG commit. The reservation
 	// deliberately leaks here — TTL expiry plus the sweeper reclaim it.
 	if testMode() && os.Getenv(EnvCrash) == "after-s3" {
-		fmt.Fprintln(os.Stderr, "codestorage: crashing after S3 upload, before PG commit (test knob)")
+		fmt.Fprintln(os.Stderr, "openstorage: crashing after S3 upload, before PG commit (test knob)")
 		os.Exit(42)
 	}
 	// Writer half of the orphan-sweep coordination (issue #5): a sweeper
@@ -2556,7 +2557,7 @@ type sigVerifier struct {
 // PGP support only: SSH verification still works and PGP-signed commits
 // then fail with a clear reason.
 func newSigVerifier(keys []meta.SigningKey) (*sigVerifier, func(), error) {
-	dir, err := os.MkdirTemp("", "codestorage-verify-sig-*")
+	dir, err := os.MkdirTemp("", "openstorage-verify-sig-*")
 	if err != nil {
 		return nil, func() {}, err
 	}

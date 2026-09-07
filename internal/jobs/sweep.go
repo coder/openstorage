@@ -172,7 +172,7 @@ type SweepConfig struct {
 	// purge's own prefix scan, and fenced repos never register again, so
 	// such blobs are provably permanent garbage. Wired whenever the ref
 	// store carries the purge seams, independent of the retention window:
-	// `codestorage purge-repo` mints fences on retention-less deployments
+	// `openstorage purge-repo` mints fences on retention-less deployments
 	// too (PR #105 round 8). One extra point read per aged candidate not
 	// already covered by another mode, mirroring IsRetainedPack.
 	//

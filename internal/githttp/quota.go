@@ -413,7 +413,8 @@ var hookFloorFreshness = usageCacheTTL
 const hookFloorScanSlots = 4
 
 // acquireHookFloorScanSlot polls the slot files with non-blocking flocks
-// until one is taken or ctx expires (the attempt deadline).
+// until one is taken or ctx expires (the attempt deadline). Keep the lock
+// prefix across product renames so mixed-version hooks share the same bound.
 func acquireHookFloorScanSlot(ctx context.Context) (unlock func(), err error) {
 	for {
 		for i := range hookFloorScanSlots {

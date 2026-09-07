@@ -514,7 +514,7 @@ type wcScratch struct {
 
 func wcNewScratch(repoPath string) (*wcScratch, error) {
 	assertf(repoPath != "", "wcNewScratch: empty repoPath")
-	dir, err := os.MkdirTemp("", "codestorage-write-*")
+	dir, err := os.MkdirTemp("", "openstorage-write-*")
 	if err != nil {
 		return nil, err
 	}

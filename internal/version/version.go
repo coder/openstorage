@@ -1,4 +1,4 @@
-// Package version reports the build version of the codestorage binary.
+// Package version reports the build version of the openstorage binary.
 //
 // Release builds stamp the package variables below via -ldflags -X (see
 // scripts/release-archives.sh and .github/workflows/release.yml). Unstamped
@@ -23,7 +23,7 @@ var (
 
 // String returns a single-line human-readable description like
 //
-//	codestorage v0.1.0 (commit 4594422de478…, built 2026-08-23T00:00:00Z, go1.26.0)
+//	openstorage v0.1.0 (commit 4594422de478…, built 2026-08-23T00:00:00Z, go1.26.0)
 //
 // omitting the commit/built fields when neither the linker nor the build
 // info supplies them.
@@ -50,5 +50,5 @@ func String() string {
 		details = append(details, "built "+d)
 	}
 	details = append(details, runtime.Version())
-	return fmt.Sprintf("codestorage %s (%s)", v, strings.Join(details, ", "))
+	return fmt.Sprintf("openstorage %s (%s)", v, strings.Join(details, ", "))
 }

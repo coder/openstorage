@@ -622,7 +622,7 @@ func (s *Server) handleInfoRefs(w http.ResponseWriter, r *http.Request, repo str
 		// RFC 9110 §11.6.1: the challenge belongs to 401 only; a 403 means
 		// the presented credentials were understood but denied.
 		if status == http.StatusUnauthorized {
-			w.Header().Set("WWW-Authenticate", `Basic realm="codestorage"`)
+			w.Header().Set("WWW-Authenticate", `Basic realm="open.storage"`)
 		}
 		httpError(w, status, err.Error())
 		return
@@ -658,7 +658,7 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 	if err != nil {
 		// RFC 9110 §11.6.1: challenge on 401 only (see handleInfoRefs).
 		if status == http.StatusUnauthorized {
-			w.Header().Set("WWW-Authenticate", `Basic realm="codestorage"`)
+			w.Header().Set("WWW-Authenticate", `Basic realm="open.storage"`)
 		}
 		httpError(w, status, err.Error())
 		return
@@ -974,7 +974,7 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 		// shared temp dir admits other local users, predictable siblings
 		// next to a visible random name could otherwise be pre-created
 		// with forged verdicts (Codex round 13).
-		stateDir, err := os.MkdirTemp("", "codestorage-verify-sig-*")
+		stateDir, err := os.MkdirTemp("", "openstorage-verify-sig-*")
 		if err != nil {
 			log.Printf("%s %s: verify state: %v", service, repo, err)
 			httpError(w, http.StatusInternalServerError, "push setup failed")

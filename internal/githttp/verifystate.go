@@ -396,7 +396,7 @@ func (st *verifyState) markWalked(n int64) error {
 	if st.path == "" {
 		return nil
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(st.path), ".codestorage-verify-walked-*")
+	tmp, err := os.CreateTemp(filepath.Dir(st.path), ".openstorage-verify-walked-*")
 	if err != nil {
 		return fmt.Errorf("write walked counter: %w", err)
 	}

@@ -162,7 +162,7 @@ func TestInternalErrorsAreSanitized(t *testing.T) {
 			var logBuf bytes.Buffer
 			s := &server{
 				store:       failingStore{err: errors.New(secret)},
-				httpBaseURL: "https://selfhost.code.storage",
+				httpBaseURL: "https://selfhost.open.storage",
 				logger:      slog.New(slog.NewTextHandler(&logBuf, nil)),
 			}
 			req := httptest.NewRequest(tc.method, tc.path, nil)
