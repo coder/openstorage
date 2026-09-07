@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.15.0](https://github.com/coder/open-storage/compare/v0.14.6...v0.15.0) (2026-09-07)
+
+
+### ⚠ BREAKING CHANGES
+
+* rename project to open.storage ([#220](https://github.com/coder/open-storage/issues/220))
+
+### Features
+
+* rename project to open.storage ([#220](https://github.com/coder/open-storage/issues/220)) ([9ce88d2](https://github.com/coder/open-storage/commit/9ce88d2056775c8e169fbe4405a53cf1a79e8e4c))
+
 ## [0.14.6](https://github.com/coder/open-storage/compare/v0.14.5...v0.14.6) (2026-08-29)
 
 
