@@ -8,7 +8,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/coder/code-storage/internal/githttp"
+	"github.com/coder/open-storage/internal/githttp"
 )
 
 // countMissingPacks reports how many registered packs the node has not yet

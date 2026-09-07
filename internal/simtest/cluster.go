@@ -11,11 +11,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/coder/code-storage/internal/blob"
-	"github.com/coder/code-storage/internal/events"
-	"github.com/coder/code-storage/internal/meta"
-	"github.com/coder/code-storage/internal/ref"
-	"github.com/coder/code-storage/internal/ref/s3wal"
+	"github.com/coder/open-storage/internal/blob"
+	"github.com/coder/open-storage/internal/events"
+	"github.com/coder/open-storage/internal/meta"
+	"github.com/coder/open-storage/internal/ref"
+	"github.com/coder/open-storage/internal/ref/s3wal"
 )
 
 // simNode is one simulated stateless server node: its own authority-store

@@ -21,10 +21,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/coder/code-storage/internal/auth"
-	"github.com/coder/code-storage/internal/blob"
-	"github.com/coder/code-storage/internal/meta"
-	"github.com/coder/code-storage/internal/ref"
+	"github.com/coder/open-storage/internal/auth"
+	"github.com/coder/open-storage/internal/blob"
+	"github.com/coder/open-storage/internal/meta"
+	"github.com/coder/open-storage/internal/ref"
 )
 
 // seedPack publishes size bytes at repo's pack key with the given id.

@@ -27,7 +27,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/coder/code-storage/internal/ref/s3wal"
+	"github.com/coder/open-storage/internal/ref/s3wal"
 )
 
 // crashEnv is one crash-window fixture: the shared "bucket" (MemCAS), the

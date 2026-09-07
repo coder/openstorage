@@ -40,7 +40,7 @@ formatters:
   settings:
     goimports:
       local-prefixes:
-        - github.com/coder/code-storage
+        - github.com/coder/open-storage
   exclusions:
     generated: lax
     paths:

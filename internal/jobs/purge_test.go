@@ -14,9 +14,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/coder/code-storage/internal/blob"
-	"github.com/coder/code-storage/internal/meta"
-	"github.com/coder/code-storage/internal/ref"
+	"github.com/coder/open-storage/internal/blob"
+	"github.com/coder/open-storage/internal/meta"
+	"github.com/coder/open-storage/internal/ref"
 )
 
 // purgeFixture extends the sweep fixture with a sqlite meta store and an

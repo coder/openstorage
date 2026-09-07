@@ -15,9 +15,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/coder/code-storage/internal/blob"
-	"github.com/coder/code-storage/internal/jobs"
-	"github.com/coder/code-storage/internal/ref"
+	"github.com/coder/open-storage/internal/blob"
+	"github.com/coder/open-storage/internal/jobs"
+	"github.com/coder/open-storage/internal/ref"
 )
 
 // sanitizeTerm replaces control characters (C0, DEL, C1 — the bytes

@@ -24,9 +24,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/coder/code-storage/internal/auth"
-	"github.com/coder/code-storage/internal/blob"
-	"github.com/coder/code-storage/internal/ref"
+	"github.com/coder/open-storage/internal/auth"
+	"github.com/coder/open-storage/internal/blob"
+	"github.com/coder/open-storage/internal/ref"
 )
 
 // newLFSQuotaServer wires newLFSServer plus a SQLite ref store and a quota.

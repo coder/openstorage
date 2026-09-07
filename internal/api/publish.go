@@ -17,9 +17,9 @@ import (
 	"os"
 	"time"
 
-	"github.com/coder/code-storage/internal/blob"
-	"github.com/coder/code-storage/internal/githttp"
-	"github.com/coder/code-storage/internal/ref"
+	"github.com/coder/open-storage/internal/blob"
+	"github.com/coder/open-storage/internal/githttp"
+	"github.com/coder/open-storage/internal/ref"
 )
 
 // errPackQuotaExceeded marks a publishPack denial for a write that would

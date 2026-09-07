@@ -22,8 +22,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/coder/code-storage/internal/blob"
-	"github.com/coder/code-storage/internal/ref"
+	"github.com/coder/open-storage/internal/blob"
+	"github.com/coder/open-storage/internal/ref"
 )
 
 // A repo URL element is a base repo name optionally followed by one

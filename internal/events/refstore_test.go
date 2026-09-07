@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/coder/code-storage/internal/meta"
-	"github.com/coder/code-storage/internal/ref"
+	"github.com/coder/open-storage/internal/meta"
+	"github.com/coder/open-storage/internal/ref"
 )
 
 const (

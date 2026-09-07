@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/coder/code-storage/internal/meta"
+	"github.com/coder/open-storage/internal/meta"
 )
 
 func TestEnforceSyncClaimFence(t *testing.T) {

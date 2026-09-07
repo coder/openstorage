@@ -24,14 +24,14 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/coder/code-storage/internal/api"
-	"github.com/coder/code-storage/internal/auth"
-	"github.com/coder/code-storage/internal/blob"
-	"github.com/coder/code-storage/internal/githttp"
-	"github.com/coder/code-storage/internal/meta"
-	"github.com/coder/code-storage/internal/ref"
-	"github.com/coder/code-storage/internal/ref/s3wal"
-	"github.com/coder/code-storage/internal/version"
+	"github.com/coder/open-storage/internal/api"
+	"github.com/coder/open-storage/internal/auth"
+	"github.com/coder/open-storage/internal/blob"
+	"github.com/coder/open-storage/internal/githttp"
+	"github.com/coder/open-storage/internal/meta"
+	"github.com/coder/open-storage/internal/ref"
+	"github.com/coder/open-storage/internal/ref/s3wal"
+	"github.com/coder/open-storage/internal/version"
 )
 
 func main() {

@@ -38,12 +38,12 @@ import (
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 	"github.com/testcontainers/testcontainers-go/wait"
 
-	"github.com/coder/code-storage/internal/auth"
-	"github.com/coder/code-storage/internal/blob"
-	"github.com/coder/code-storage/internal/jobs"
-	"github.com/coder/code-storage/internal/meta"
-	"github.com/coder/code-storage/internal/ref"
-	"github.com/coder/code-storage/internal/ref/s3wal/s3waltest"
+	"github.com/coder/open-storage/internal/auth"
+	"github.com/coder/open-storage/internal/blob"
+	"github.com/coder/open-storage/internal/jobs"
+	"github.com/coder/open-storage/internal/meta"
+	"github.com/coder/open-storage/internal/ref"
+	"github.com/coder/open-storage/internal/ref/s3wal/s3waltest"
 )
 
 // testOrg is the org the serve nodes are configured for; secondOrg is

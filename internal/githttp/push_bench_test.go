@@ -65,7 +65,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/coder/code-storage/internal/auth"
+	"github.com/coder/open-storage/internal/auth"
 )
 
 const (

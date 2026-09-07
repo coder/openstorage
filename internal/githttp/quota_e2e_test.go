@@ -16,8 +16,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/coder/code-storage/internal/blob"
-	"github.com/coder/code-storage/internal/ref"
+	"github.com/coder/open-storage/internal/blob"
+	"github.com/coder/open-storage/internal/ref"
 )
 
 // TestGitSurfaceRateLimit: with the rate limit enabled, a push loop from one

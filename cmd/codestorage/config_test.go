@@ -17,9 +17,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/coder/code-storage/internal/auth"
-	"github.com/coder/code-storage/internal/jobs"
-	"github.com/coder/code-storage/internal/ref"
+	"github.com/coder/open-storage/internal/auth"
+	"github.com/coder/open-storage/internal/jobs"
+	"github.com/coder/open-storage/internal/ref"
 )
 
 // mapEnv builds a getenv func from a fixed map (no process env mutation).

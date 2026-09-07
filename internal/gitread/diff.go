@@ -6,7 +6,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/coder/code-storage/internal/ref"
+	"github.com/coder/open-storage/internal/ref"
 )
 
 // FileDiff is one changed file between two trees. Status is git's raw

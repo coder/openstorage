@@ -9,7 +9,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 
-	"github.com/coder/code-storage/internal/ref/s3wal/s3waltest"
+	"github.com/coder/open-storage/internal/ref/s3wal/s3waltest"
 )
 
 // TestEnsureBucketGatesWriteReadiness pins the issue #165 contract:

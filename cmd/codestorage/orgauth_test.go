@@ -23,9 +23,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/coder/code-storage/internal/auth"
-	"github.com/coder/code-storage/internal/meta"
-	upsync "github.com/coder/code-storage/internal/sync"
+	"github.com/coder/open-storage/internal/auth"
+	"github.com/coder/open-storage/internal/meta"
+	upsync "github.com/coder/open-storage/internal/sync"
 )
 
 func TestBootstrapOrgAuth_TwoBootsKeepBothLoopbackKeys(t *testing.T) {

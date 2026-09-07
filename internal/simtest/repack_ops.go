@@ -22,10 +22,10 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/coder/code-storage/internal/blob"
-	"github.com/coder/code-storage/internal/githttp"
-	"github.com/coder/code-storage/internal/jobs"
-	"github.com/coder/code-storage/internal/ref"
+	"github.com/coder/open-storage/internal/blob"
+	"github.com/coder/open-storage/internal/githttp"
+	"github.com/coder/open-storage/internal/jobs"
+	"github.com/coder/open-storage/internal/ref"
 )
 
 // discardLogger silences the Repacker inside simulations (its slog output

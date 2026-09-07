@@ -23,16 +23,16 @@ import (
 	"os"
 	"time"
 
-	"github.com/coder/code-storage/internal/api"
-	"github.com/coder/code-storage/internal/auth"
-	"github.com/coder/code-storage/internal/blob"
-	"github.com/coder/code-storage/internal/githttp"
-	"github.com/coder/code-storage/internal/gitread"
-	"github.com/coder/code-storage/internal/jobs"
-	"github.com/coder/code-storage/internal/lfsscan"
-	"github.com/coder/code-storage/internal/meta"
-	"github.com/coder/code-storage/internal/ref"
-	"github.com/coder/code-storage/internal/secrets"
+	"github.com/coder/open-storage/internal/api"
+	"github.com/coder/open-storage/internal/auth"
+	"github.com/coder/open-storage/internal/blob"
+	"github.com/coder/open-storage/internal/githttp"
+	"github.com/coder/open-storage/internal/gitread"
+	"github.com/coder/open-storage/internal/jobs"
+	"github.com/coder/open-storage/internal/lfsscan"
+	"github.com/coder/open-storage/internal/meta"
+	"github.com/coder/open-storage/internal/ref"
+	"github.com/coder/open-storage/internal/secrets"
 )
 
 // logSyncEgressWarnings emits the boot-time sync egress policy notices

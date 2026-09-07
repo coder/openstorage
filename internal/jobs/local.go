@@ -6,8 +6,8 @@ import (
 	"log/slog"
 	stdsync "sync"
 
-	"github.com/coder/code-storage/internal/events"
-	"github.com/coder/code-storage/internal/sync"
+	"github.com/coder/open-storage/internal/events"
+	"github.com/coder/open-storage/internal/sync"
 )
 
 // Local is the in-process queue for local/sqlite mode. Deliveries run on

@@ -27,7 +27,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/coder/code-storage/internal/githttp"
+	"github.com/coder/open-storage/internal/githttp"
 )
 
 // rateLimited stamps the Retry-After + RateLimit header pair on a throttled

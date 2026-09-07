@@ -14,7 +14,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/coder/code-storage/internal/meta"
+	"github.com/coder/open-storage/internal/meta"
 )
 
 const verifySigMainRefs = `[["refs/heads/main",["verify-sig"]],["*",[]]]`

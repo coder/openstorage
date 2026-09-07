@@ -14,8 +14,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/coder/code-storage/internal/blob"
-	"github.com/coder/code-storage/internal/ref"
+	"github.com/coder/open-storage/internal/blob"
+	"github.com/coder/open-storage/internal/ref"
 )
 
 func TestMaterialize(t *testing.T) {

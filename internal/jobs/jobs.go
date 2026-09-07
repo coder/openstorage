@@ -16,8 +16,8 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/coder/code-storage/internal/events"
-	"github.com/coder/code-storage/internal/sync"
+	"github.com/coder/open-storage/internal/events"
+	"github.com/coder/open-storage/internal/sync"
 )
 
 // assertf is a fail-fast invariant check (crash-and-burn style). Never used

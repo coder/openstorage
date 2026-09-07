@@ -19,13 +19,13 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/coder/code-storage/internal/auth"
-	"github.com/coder/code-storage/internal/events"
-	"github.com/coder/code-storage/internal/githttp"
-	"github.com/coder/code-storage/internal/jobs"
-	"github.com/coder/code-storage/internal/meta"
-	"github.com/coder/code-storage/internal/ref"
-	upsync "github.com/coder/code-storage/internal/sync"
+	"github.com/coder/open-storage/internal/auth"
+	"github.com/coder/open-storage/internal/events"
+	"github.com/coder/open-storage/internal/githttp"
+	"github.com/coder/open-storage/internal/jobs"
+	"github.com/coder/open-storage/internal/meta"
+	"github.com/coder/open-storage/internal/ref"
+	upsync "github.com/coder/open-storage/internal/sync"
 )
 
 // pendingSyncRecoveryDelay defers the local-mode boot recovery scan until

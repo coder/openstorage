@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/coder/code-storage/internal/auth"
+	"github.com/coder/open-storage/internal/auth"
 )
 
 // middleware is a plain http.Handler decorator.

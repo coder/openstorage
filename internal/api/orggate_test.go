@@ -14,7 +14,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/coder/code-storage/internal/auth"
+	"github.com/coder/open-storage/internal/auth"
 )
 
 // newOrgGateServer builds a full production handler (api.New) serving

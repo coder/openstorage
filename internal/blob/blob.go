@@ -24,7 +24,7 @@ import (
 	gcblob "gocloud.dev/blob"
 	"gocloud.dev/blob/s3blob"
 
-	"github.com/coder/code-storage/internal/s3oplog"
+	"github.com/coder/open-storage/internal/s3oplog"
 )
 
 // ErrSignedURLUnsupported is returned by SignedURL on backends without

@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/coder/code-storage/internal/ref/s3wal"
+	"github.com/coder/open-storage/internal/ref/s3wal"
 )
 
 // opCountingStore counts Get/Create/Advance round trips through a MemCAS —

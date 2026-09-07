@@ -9,7 +9,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/coder/code-storage/internal/ref"
+	"github.com/coder/open-storage/internal/ref"
 )
 
 // TreeEntry types (docs/reference/http-api.md GET /repos/files entry `type`): symlinks and

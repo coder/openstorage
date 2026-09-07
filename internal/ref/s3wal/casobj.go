@@ -25,7 +25,7 @@ import (
 	"github.com/aws/smithy-go/middleware"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
 
-	"github.com/coder/code-storage/internal/s3oplog"
+	"github.com/coder/open-storage/internal/s3oplog"
 )
 
 // assertf is a fail-fast invariant check (crash-and-burn style).

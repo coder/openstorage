@@ -45,8 +45,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/coder/code-storage/internal/blob"
-	"github.com/coder/code-storage/internal/ref"
+	"github.com/coder/open-storage/internal/blob"
+	"github.com/coder/open-storage/internal/ref"
 )
 
 // EnvPackQuota carries the resolved per-repo pack-bytes quota from the serve

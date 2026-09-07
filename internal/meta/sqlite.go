@@ -27,7 +27,7 @@ import (
 	"modernc.org/sqlite"
 	sqlite3 "modernc.org/sqlite/lib"
 
-	"github.com/coder/code-storage/internal/secrets"
+	"github.com/coder/open-storage/internal/secrets"
 )
 
 // sqliteDSN builds the modernc.org/sqlite DSN for a DB file path. The

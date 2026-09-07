@@ -35,9 +35,9 @@ import (
 	"modernc.org/sqlite"
 	sqlite3 "modernc.org/sqlite/lib"
 
-	"github.com/coder/code-storage/internal/ref"
-	"github.com/coder/code-storage/internal/ref/s3wal"
-	"github.com/coder/code-storage/internal/ref/s3wal/s3waltest"
+	"github.com/coder/open-storage/internal/ref"
+	"github.com/coder/open-storage/internal/ref/s3wal"
+	"github.com/coder/open-storage/internal/ref/s3wal/s3waltest"
 )
 
 // assertf is the local fail-fast invariant check (the package-internal

@@ -48,7 +48,7 @@ import (
 	"sort"
 	"time"
 
-	"github.com/coder/code-storage/internal/meta"
+	"github.com/coder/open-storage/internal/meta"
 )
 
 const (

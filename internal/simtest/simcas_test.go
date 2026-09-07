@@ -5,7 +5,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/coder/code-storage/internal/ref/s3wal"
+	"github.com/coder/open-storage/internal/ref/s3wal"
 )
 
 // coinSeed finds an injector seed whose FIRST rng draw puts an ambiguous

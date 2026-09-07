@@ -17,9 +17,9 @@ import (
 
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 
-	"github.com/coder/code-storage/internal/events"
-	"github.com/coder/code-storage/internal/meta"
-	"github.com/coder/code-storage/internal/sync"
+	"github.com/coder/open-storage/internal/events"
+	"github.com/coder/open-storage/internal/meta"
+	"github.com/coder/open-storage/internal/sync"
 )
 
 // stubWebhooks is a fixed-registration events.WebhookLookup.

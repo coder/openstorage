@@ -22,7 +22,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/coder/code-storage/internal/ref"
+	"github.com/coder/open-storage/internal/ref"
 )
 
 // mintHold creates a hold file in repoPath naming the given refs, through

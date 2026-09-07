@@ -47,9 +47,9 @@ import (
 	"gocloud.dev/gcerrors"
 	"golang.org/x/sync/errgroup"
 
-	"github.com/coder/code-storage/internal/ref/s3wal"
+	"github.com/coder/open-storage/internal/ref/s3wal"
 
-	"github.com/coder/code-storage/internal/ref/s3wal/s3waltest"
+	"github.com/coder/open-storage/internal/ref/s3wal/s3waltest"
 )
 
 // EnvTestS3WALURL names an external S3 endpoint the qualification lane runs
