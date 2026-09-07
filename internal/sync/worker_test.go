@@ -21,6 +21,43 @@ import (
 	"time"
 )
 
+func TestAuthGitEnvOverridesInheritedCredentials(t *testing.T) {
+	for _, name := range []string{
+		"OPENSTORAGE_ASKPASS_USERNAME", "CODESTORAGE_ASKPASS_USERNAME",
+		"OPENSTORAGE_ASKPASS_PASSWORD", "CODESTORAGE_ASKPASS_PASSWORD",
+	} {
+		t.Setenv(name, "inherited")
+	}
+	for _, password := range []string{"", "trusted-password"} {
+		script := filepath.Join(t.TempDir(), "askpass")
+		env, err := authGitEnv(script, "trusted-user", password, "https")
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, entry := range env {
+			if strings.Contains(entry, "STORAGE_ASKPASS_") && strings.HasSuffix(entry, "=inherited") {
+				t.Fatal("inherited credential alias survived")
+			}
+		}
+		if password == "" {
+			for _, entry := range env {
+				if strings.HasPrefix(entry, "GIT_ASKPASS=") || strings.HasPrefix(entry, "OPENSTORAGE_ASKPASS_") || strings.HasPrefix(entry, "CODESTORAGE_ASKPASS_") {
+					t.Fatal("public upstream inherited an askpass helper or credential")
+				}
+			}
+			continue
+		}
+		for prompt, want := range map[string]string{"Username": "trusted-user", "Password": password} {
+			cmd := exec.CommandContext(t.Context(), script, prompt)
+			cmd.Env = env
+			out, err := cmd.CombinedOutput()
+			if err != nil || string(out) != want+"\n" {
+				t.Fatalf("askpass %s did not return the trusted value (err=%v)", prompt, err)
+			}
+		}
+	}
+}
+
 func discardTestLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
@@ -476,7 +513,7 @@ func TestWorkerUnreachableUpstream(t *testing.T) {
 
 // TestWorkerPrivateUpstreamDeniedInStrictMode: with the strict sync egress
 // policy (PullEgressAllowPrivate off — today's explicit
-// CODESTORAGE_SYNC_ALLOW_PRIVATE=false, the announced future default), a
+// OPENSTORAGE_SYNC_ALLOW_PRIVATE=false, the announced future default), a
 // loopback/private upstream_host is refused at dial time by the vetting
 // proxy — the upstream is NEVER contacted — and the run fails as
 // configuration: upstream_host is caller-linked data, so unguarded fetch

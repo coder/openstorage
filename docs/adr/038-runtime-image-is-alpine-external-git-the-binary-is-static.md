@@ -6,7 +6,7 @@
 
 Decision: **multi-stage build — `golang:1.26-alpine` with `CGO_ENABLED=0 -trimpath` and
 module/build cache mounts, then an `alpine:3.21` runtime stage with `git` and
-`ca-certificates`, a non-root user, `ENTRYPOINT ["codestorage"]` / `CMD ["serve"]`.**
+`ca-certificates`, a non-root user, `ENTRYPOINT ["openstorage"]` / `CMD ["serve"]`.**
 
 - **Alpine, not distroless/scratch.** The server has a hard runtime dependency on
   external `git` (smart-HTTP upload/receive-pack, merges, hook re-execs); a

@@ -36,8 +36,8 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/coder/code-storage/internal/ref/s3wal"
-	"github.com/coder/code-storage/internal/secrets"
+	"github.com/coder/open-storage/internal/ref/s3wal"
+	"github.com/coder/open-storage/internal/secrets"
 )
 
 // ErrValueNotUTF8 rejects caller-supplied strings carrying invalid UTF-8

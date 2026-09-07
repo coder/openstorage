@@ -16,8 +16,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/coder/code-storage/internal/blob"
-	"github.com/coder/code-storage/internal/ref"
+	"github.com/coder/open-storage/internal/blob"
+	"github.com/coder/open-storage/internal/ref"
 )
 
 // TestGitSurfaceRateLimit: with the rate limit enabled, a push loop from one
@@ -25,7 +25,7 @@ import (
 // requests), while the first push — and the REST surface with its separate
 // bucket — keep working.
 func TestGitSurfaceRateLimit(t *testing.T) {
-	node := startNodeT(t, "CODESTORAGE_RATE_RPS=0.01", "CODESTORAGE_RATE_BURST=20")
+	node := startNodeT(t, "OPENSTORAGE_RATE_RPS=0.01", "OPENSTORAGE_RATE_BURST=20")
 	repo := registerRepo(t, "quota-ratelimit")
 	work := initWorkRepo(t)
 	token := mintTestToken(t, repo, "git:read,git:write", "")
@@ -63,10 +63,10 @@ func TestGitSurfaceRateLimit(t *testing.T) {
 // reaches the blob store nor the pack registry (the issue #21 growth vector:
 // even rejected pushes used to grow packs/ durably).
 func TestPackQuota_PreReceiveDeniesAndStoresNothing(t *testing.T) {
-	// Cap off (CODESTORAGE_MAX_PUSH_BYTES=0): byte-scale quotas would trip
+	// Cap off (OPENSTORAGE_MAX_PUSH_BYTES=0): byte-scale quotas would trip
 	// the quota-derived ingress cap (#55) before pre-receive, and these
 	// tests pin QUOTA semantics.
-	node := startNodeT(t, "CODESTORAGE_PACK_QUOTA_BYTES=100", "CODESTORAGE_MAX_PUSH_BYTES=0")
+	node := startNodeT(t, "OPENSTORAGE_PACK_QUOTA_BYTES=100", "OPENSTORAGE_MAX_PUSH_BYTES=0")
 	repo := registerRepo(t, "quota-denied")
 	work := initWorkRepo(t)
 	token := mintTestToken(t, repo, "git:read,git:write", "")
@@ -109,7 +109,7 @@ func TestPackQuota_OverQuotaDeniedAtPreReceive(t *testing.T) {
 
 	// A 1-byte-quota node now sees the repo over quota: new bytes are
 	// denied inside pre-receive, before anything is stored.
-	node := startNodeT(t, "CODESTORAGE_PACK_QUOTA_BYTES=1", "CODESTORAGE_MAX_PUSH_BYTES=0") // cap off, see TestPackQuota_PreReceiveDeniesAndStoresNothing
+	node := startNodeT(t, "OPENSTORAGE_PACK_QUOTA_BYTES=1", "OPENSTORAGE_MAX_PUSH_BYTES=0") // cap off, see TestPackQuota_PreReceiveDeniesAndStoresNothing
 	commitFile(t, work, "b.txt", "two\n", "two", nil)
 	out, err := tryGit(work, "push", remoteURL(node, repo, token), "HEAD:refs/heads/main")
 	if err == nil {
@@ -175,7 +175,7 @@ func TestPackQuota_RegisteredDuplicateRetryCompletes(t *testing.T) {
 
 	// Registered bytes == quota: the identical retry must still complete
 	// (pre-receive dedups incoming to zero; the CAS then lands).
-	node := startNodeT(t, fmt.Sprintf("CODESTORAGE_PACK_QUOTA_BYTES=%d", packBytes), "CODESTORAGE_MAX_PUSH_BYTES=0") // cap off, see TestPackQuota_PreReceiveDeniesAndStoresNothing
+	node := startNodeT(t, fmt.Sprintf("OPENSTORAGE_PACK_QUOTA_BYTES=%d", packBytes), "OPENSTORAGE_MAX_PUSH_BYTES=0") // cap off, see TestPackQuota_PreReceiveDeniesAndStoresNothing
 	out = mustGit(t, work, "push", remoteURL(node, repo, token), "HEAD:refs/heads/main")
 	t.Logf("registered-duplicate retry output:\n%s", out)
 	head := revParse(t, work, "HEAD")
@@ -271,7 +271,7 @@ func TestPackQuota_CrashRetryNotDoubleCounted(t *testing.T) {
 
 	// Quota admits the pack once but NOT twice: naive double-counting
 	// (usage=P + incoming=P > P+16) rejects; deduped (incoming=0) passes.
-	node := startNodeT(t, fmt.Sprintf("CODESTORAGE_PACK_QUOTA_BYTES=%d", orphanBytes+16), "CODESTORAGE_MAX_PUSH_BYTES=0") // cap off, see TestPackQuota_PreReceiveDeniesAndStoresNothing
+	node := startNodeT(t, fmt.Sprintf("OPENSTORAGE_PACK_QUOTA_BYTES=%d", orphanBytes+16), "OPENSTORAGE_MAX_PUSH_BYTES=0") // cap off, see TestPackQuota_PreReceiveDeniesAndStoresNothing
 	out = mustGit(t, work, "push", remoteURL(node, repo, token), "HEAD:refs/heads/main")
 	t.Logf("retry push output:\n%s", out)
 
@@ -310,7 +310,7 @@ func TestPackQuota_OrphanInflatedRetryCompletes(t *testing.T) {
 
 	// Quota exactly at the orphan bytes: pre-receive dedups the re-sent
 	// orphan to zero incoming and completes publication.
-	node := startNodeT(t, fmt.Sprintf("CODESTORAGE_PACK_QUOTA_BYTES=%d", orphanBytes), "CODESTORAGE_MAX_PUSH_BYTES=0") // cap off, see TestPackQuota_PreReceiveDeniesAndStoresNothing
+	node := startNodeT(t, fmt.Sprintf("OPENSTORAGE_PACK_QUOTA_BYTES=%d", orphanBytes), "OPENSTORAGE_MAX_PUSH_BYTES=0") // cap off, see TestPackQuota_PreReceiveDeniesAndStoresNothing
 	out = mustGit(t, work, "push", remoteURL(node, repo, token), "HEAD:refs/heads/main")
 	t.Logf("orphan-inflated retry output:\n%s", out)
 	head := revParse(t, work, "HEAD")
@@ -447,7 +447,7 @@ func TestPackQuota_NamespaceSharesQuota(t *testing.T) {
 	// A 1-byte-quota node must deny a namespace push: base usage already
 	// exceeds the shared quota, and the ephemeral prefix being empty must
 	// not grant a fresh allowance.
-	node := startNodeT(t, "CODESTORAGE_PACK_QUOTA_BYTES=1", "CODESTORAGE_MAX_PUSH_BYTES=0") // cap off, see TestPackQuota_PreReceiveDeniesAndStoresNothing
+	node := startNodeT(t, "OPENSTORAGE_PACK_QUOTA_BYTES=1", "OPENSTORAGE_MAX_PUSH_BYTES=0") // cap off, see TestPackQuota_PreReceiveDeniesAndStoresNothing
 	commitFile(t, work, "ns.txt", "ns\n", "ns", nil)
 	out, err := tryGit(work, "push", remoteURL(node, repo+"+ephemeral", token), "HEAD:refs/heads/scratch")
 	if err == nil {
@@ -466,7 +466,7 @@ func TestPackQuota_NamespaceSharesQuota(t *testing.T) {
 // repo's footprint, pushes pass through the pre-receive gate untouched —
 // including a second push on non-zero existing usage.
 func TestPackQuota_UnderThresholdPasses(t *testing.T) {
-	node := startNodeT(t, "CODESTORAGE_PACK_QUOTA_BYTES=10485760") // 10 MiB
+	node := startNodeT(t, "OPENSTORAGE_PACK_QUOTA_BYTES=10485760") // 10 MiB
 	repo := registerRepo(t, "quota-under")
 	work := initWorkRepo(t)
 	token := mintTestToken(t, repo, "git:read,git:write", "")

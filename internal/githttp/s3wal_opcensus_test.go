@@ -1,6 +1,6 @@
 // Per-push S3 round-trip census + regression guard for the s3wal
 // zero-infra lane (issue #182): the op-log seam (internal/s3oplog,
-// CODESTORAGE_S3_OP_LOG) records one line per S3 HTTP attempt across the
+// OPENSTORAGE_S3_OP_LOG) records one line per S3 HTTP attempt across the
 // serve process AND the hook subprocesses, so this drill can count — and
 // bound — the sequential round trips one `git push` costs. On real S3
 // every op is a WAN round trip, so the count is the latency model:
@@ -74,7 +74,7 @@ func opLogWindow(t *testing.T, path string, offset *int64) []opLogLine {
 func censusTable(lines []opLogLine) string {
 	var b strings.Builder
 	for i, l := range lines {
-		role := strings.TrimPrefix(l.role, "codestorage:")
+		role := strings.TrimPrefix(l.role, "openstorage:")
 		fmt.Fprintf(&b, "%2d. %-22s %-16s %3d %6dus %s\n", i+1, role, l.op, l.status, l.durUS, l.key)
 	}
 	return b.String()
@@ -106,8 +106,8 @@ func TestS3WAL_PushOpCensus(t *testing.T) {
 	// reconciliation ship interval 0, and the reconcile ticker needs the
 	// non-default v0.2.0 write-compat flag (or a partial Heal) to start.
 	opLog := filepath.Join(t.TempDir(), "s3ops.log")
-	node := startNodeT(t, "CODESTORAGE_S3_OP_LOG="+opLog, "CODESTORAGE_REPACK_THRESHOLD=0",
-		"CODESTORAGE_SWEEP_INTERVAL=0")
+	node := startNodeT(t, "OPENSTORAGE_S3_OP_LOG="+opLog, "OPENSTORAGE_REPACK_THRESHOLD=0",
+		"OPENSTORAGE_SWEEP_INTERVAL=0")
 
 	repo := registerRepo(t, "t-s3wal-op-census")
 	work := initWorkRepo(t)

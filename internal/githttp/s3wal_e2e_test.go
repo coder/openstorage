@@ -2,7 +2,7 @@
 // mode's two lane-specific proofs on top of the shared e2e suite —
 // restart-from-bucket-only (the bucket is the SOLE durable authority) and
 // the §2.11 instance lease's dual-serve refusal. Both skip outside
-// CODESTORAGE_TEST_BACKEND=s3wal.
+// OPENSTORAGE_TEST_BACKEND=s3wal.
 package githttp
 
 import (
@@ -16,18 +16,18 @@ import (
 	"testing"
 	"time"
 
-	"github.com/coder/code-storage/internal/blob"
+	"github.com/coder/open-storage/internal/blob"
 )
 
 // skipUnlessS3WAL gates the drills to the zero-infra lane.
 func skipUnlessS3WAL(t *testing.T) {
 	t.Helper()
 	if testBackend != backendS3WAL {
-		t.Skipf("s3wal-lane drill (running the %s lane; set CODESTORAGE_TEST_BACKEND=s3wal)", testBackend)
+		t.Skipf("s3wal-lane drill (running the %s lane; set OPENSTORAGE_TEST_BACKEND=s3wal)", testBackend)
 	}
 }
 
-// tryServeExpectExit runs `codestorage serve` with the lane env expecting
+// tryServeExpectExit runs `openstorage serve` with the lane env expecting
 // it to exit on its own (startup refusal), returning combined output and
 // the exit error. A process that unexpectedly keeps serving is killed by
 // the context after 30s and still reports an error.
@@ -40,11 +40,11 @@ func tryServeExpectExit(t *testing.T, cacheDir string, extraEnv ...string) (stri
 		"--cache-dir", cacheDir,
 	)
 	cmd.Env = append(os.Environ(),
-		"CODESTORAGE_PG_URL="+dbURL,
-		"CODESTORAGE_S3_URL="+blobURL,
-		"CODESTORAGE_ORG="+testOrg,
-		"CODESTORAGE_ORG_PUBKEYS="+orgKeysPath,
-		"CODESTORAGE_TEST_MODE=1",
+		"OPENSTORAGE_PG_URL="+dbURL,
+		"OPENSTORAGE_S3_URL="+blobURL,
+		"OPENSTORAGE_ORG="+testOrg,
+		"OPENSTORAGE_ORG_PUBKEYS="+orgKeysPath,
+		"OPENSTORAGE_TEST_MODE=1",
 	)
 	cmd.Env = append(cmd.Env, extraEnv...)
 	out, err := cmd.CombinedOutput()
@@ -109,7 +109,7 @@ func TestS3WAL_RestartFromBucketOnly(t *testing.T) {
 func TestS3WAL_SigtermReleasesInstanceLease(t *testing.T) {
 	skipUnlessS3WAL(t)
 
-	const leaseEnv = "CODESTORAGE_S3WAL_LEASE_TTL=1m"
+	const leaseEnv = "OPENSTORAGE_S3WAL_LEASE_TTL=1m"
 	// Whatever happens, clear the lease object afterwards so reruns and
 	// later drills see a clean slate (regular nodes never read it).
 	t.Cleanup(func() { _ = testBlob.Delete(context.Background(), "_wal/instance-lease") })
@@ -146,7 +146,7 @@ func TestS3WAL_SigtermReleasesInstanceLease(t *testing.T) {
 func TestS3WAL_DualServeRefusal(t *testing.T) {
 	skipUnlessS3WAL(t)
 
-	const leaseEnv = "CODESTORAGE_S3WAL_LEASE_TTL=2s"
+	const leaseEnv = "OPENSTORAGE_S3WAL_LEASE_TTL=2s"
 	// Whatever happens, clear the lease object afterwards so reruns and
 	// later drills see a clean slate (regular nodes never read it).
 	t.Cleanup(func() { _ = testBlob.Delete(context.Background(), "_wal/instance-lease") })

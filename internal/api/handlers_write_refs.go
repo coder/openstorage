@@ -37,10 +37,10 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/coder/code-storage/internal/auth"
-	"github.com/coder/code-storage/internal/githttp"
-	"github.com/coder/code-storage/internal/gitread"
-	"github.com/coder/code-storage/internal/ref"
+	"github.com/coder/open-storage/internal/auth"
+	"github.com/coder/open-storage/internal/githttp"
+	"github.com/coder/open-storage/internal/gitread"
+	"github.com/coder/open-storage/internal/ref"
 )
 
 // registerWriteRefRoutes registers the W3 write endpoints on mux with the
@@ -683,7 +683,7 @@ func (s *server) wrefHandleNote(w http.ResponseWriter, r *http.Request, deleteNo
 		wrefNoteFail(w, http.StatusBadRequest, "expected_notes_ref_sha must be a full 40-hex object id", objectSHA, targetRef, "", ref.ZeroSHA)
 		return
 	}
-	author := wrefNoteAuthor{Name: "codestorage", Email: "notes@codestorage.invalid"}
+	author := wrefNoteAuthor{Name: "open.storage", Email: "notes@openstorage.invalid"}
 	if req.Author != nil {
 		if req.Author.Name == "" || req.Author.Email == "" {
 			wrefNoteFail(w, http.StatusBadRequest, "author name and email are required when author is provided", objectSHA, targetRef, "", ref.ZeroSHA)
@@ -842,7 +842,7 @@ func (s *server) wrefRunNotesOp(ctx context.Context, repoPath, old, action, sha,
 	// gitread.ResolveRef) upstream: it can never be parsed as a git option
 	// or rev expression below.
 	assertf(ref.ValidSHA(sha), "wrefRunNotesOp: unvalidated sha %q", sha)
-	scratch, err := os.MkdirTemp("", "codestorage-notes-*")
+	scratch, err := os.MkdirTemp("", "openstorage-notes-*")
 	if err != nil {
 		return "", nil, nil, err
 	}
@@ -918,7 +918,7 @@ func (s *server) wrefPublish(ctx context.Context, repoPath, repoID string, scrat
 	assertf(ref.ValidSHA(oldSHA) && ref.ValidSHA(newSHA), "wrefPublish: malformed shas")
 	assertf(newSHA != ref.ZeroSHA, "wrefPublish: zero new sha")
 	assertf(len(scratchEnv) > 0, "wrefPublish: missing scratch env")
-	packDir, err := os.MkdirTemp("", "codestorage-notes-pack-*")
+	packDir, err := os.MkdirTemp("", "openstorage-notes-pack-*")
 	if err != nil {
 		return err
 	}

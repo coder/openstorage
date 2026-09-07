@@ -13,7 +13,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/coder/code-storage/internal/secrets"
+	"github.com/coder/open-storage/internal/secrets"
 )
 
 // ErrReservedSecret: CreateWebhook/CreateGitCredential/UpdateGitCredential
@@ -72,7 +72,7 @@ func resolveOptions(opts []Option) storeOptions {
 
 // encodeSecret maps a plaintext secret to its stored column value:
 // the reserved-prefix rejection, then encryption when the codec is set.
-// A decrypt-only codec (CODESTORAGE_SECRETS_MODE=decrypt-only staging)
+// A decrypt-only codec (OPENSTORAGE_SECRETS_MODE=decrypt-only staging)
 // writes plaintext like a nil codec — no envelope may exist before every
 // replica can decrypt it; staged rows are re-encrypted lazily once the
 // fleet flips to encrypt mode.
@@ -99,12 +99,12 @@ func encodeSecret(c *secrets.Codec, plaintext string) (string, error) {
 // legacy plaintext (see the internal/secrets package comment for the
 // collision argument). Fail-closed cases (never silent ciphertext
 // passthrough): envelope + nil codec (the operator unset
-// CODESTORAGE_SECRETS_KEY while encrypted rows remain), and unknown key id
+// OPENSTORAGE_SECRETS_KEY while encrypted rows remain), and unknown key id
 // / GCM failure (secrets.ErrUnknownKey / ErrDecrypt).
 func decodeSecret(c *secrets.Codec, stored, what string) (plaintext string, rewrite bool, err error) {
 	if secrets.IsEncrypted(stored) {
 		if c == nil {
-			return "", false, fmt.Errorf("%s is encrypted but CODESTORAGE_SECRETS_KEY is not set", what)
+			return "", false, fmt.Errorf("%s is encrypted but OPENSTORAGE_SECRETS_KEY is not set", what)
 		}
 		pt, stale, err := c.Decrypt(stored)
 		if err != nil {

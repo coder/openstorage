@@ -4,15 +4,15 @@
 // SeaweedFS container, an optional real-S3 endpoint, and the existing
 // SQLite RefStore as the zero-infra cost baseline.
 //
-// The real-S3 lane is gated on CODESTORAGE_BENCH_S3_URL and skips cleanly
+// The real-S3 lane is gated on OPENSTORAGE_BENCH_S3_URL and skips cleanly
 // when unset; SeaweedFS-local numbers are directional only and are NOT the
 // Gate 1a-B verdict (the §3 kill thresholds are defined against real S3
-// from same-region compute). Per-op CSVs land in CODESTORAGE_BENCH_CSV_DIR
+// from same-region compute). Per-op CSVs land in OPENSTORAGE_BENCH_CSV_DIR
 // when set — the results campaign requires them (plan §3 method).
 //
 // Benches follow the nightly conventions (bench-nightly.yml): heavy lanes
 // skip under -short/no Docker; the contention window defaults to 5 s per N
-// (CODESTORAGE_BENCH_CONTENTION_SECS=60 for the plan §3 sustained runs).
+// (OPENSTORAGE_BENCH_CONTENTION_SECS=60 for the plan §3 sustained runs).
 package s3wal_test
 
 import (
@@ -35,9 +35,10 @@ import (
 	"modernc.org/sqlite"
 	sqlite3 "modernc.org/sqlite/lib"
 
-	"github.com/coder/code-storage/internal/ref"
-	"github.com/coder/code-storage/internal/ref/s3wal"
-	"github.com/coder/code-storage/internal/ref/s3wal/s3waltest"
+	"github.com/coder/open-storage/internal/envconfig"
+	"github.com/coder/open-storage/internal/ref"
+	"github.com/coder/open-storage/internal/ref/s3wal"
+	"github.com/coder/open-storage/internal/ref/s3wal/s3waltest"
 )
 
 // assertf is the local fail-fast invariant check (the package-internal
@@ -52,13 +53,13 @@ const (
 	// EnvBenchS3URL names the real-S3 endpoint for the §3 Gate 1a-B lane
 	// (same URL grammar as s3waltest.EnvTestS3WALURL). Unset skips — results are
 	// never fabricated.
-	EnvBenchS3URL = "CODESTORAGE_BENCH_S3_URL"
+	EnvBenchS3URL = "OPENSTORAGE_BENCH_S3_URL"
 	// EnvBenchCSVDir, when set, receives one raw per-op CSV per bench cell
 	// (plan §3: raw CSVs published alongside the summary tables).
-	EnvBenchCSVDir = "CODESTORAGE_BENCH_CSV_DIR"
+	EnvBenchCSVDir = "OPENSTORAGE_BENCH_CSV_DIR"
 	// EnvBenchContentionSecs overrides the per-N contention window (default
 	// 5 s to keep nightly runs bounded; the §3 campaign uses 60).
-	EnvBenchContentionSecs = "CODESTORAGE_BENCH_CONTENTION_SECS"
+	EnvBenchContentionSecs = "OPENSTORAGE_BENCH_CONTENTION_SECS"
 
 	// benchWarmupOps is the untimed warmup before recording (plan §3
 	// method: ≥ 20 samples discarded per cell).
@@ -99,7 +100,7 @@ func (r *latencyRecorder) report(b *testing.B, ps ...float64) {
 // EnvBenchCSVDir is set.
 func (r *latencyRecorder) csvDump(b *testing.B) {
 	b.Helper()
-	dir := os.Getenv(EnvBenchCSVDir)
+	dir := envconfig.Getenv(EnvBenchCSVDir)
 	if dir == "" {
 		return
 	}
@@ -150,7 +151,7 @@ func benchS3Lanes(b *testing.B) []*s3BenchLane {
 		cas.DecodeSeq = s3waltest.DecodeSeq
 		lanes = append(lanes, &s3BenchLane{name: "seaweedfs", cas: cas, raw: raw, bucket: "s3wal-bench"})
 	}
-	if blobURL := os.Getenv(EnvBenchS3URL); blobURL == "" {
+	if blobURL := envconfig.Getenv(EnvBenchS3URL); blobURL == "" {
 		lanes = append(lanes, &s3BenchLane{
 			name: "s3",
 			skip: fmt.Sprintf("set %s (s3://bucket?region=…) plus AWS credentials to run the real-S3 gate lane — results are never fabricated", EnvBenchS3URL),
@@ -199,7 +200,7 @@ func parseSeqSHA(tb testing.TB, sha string) int64 {
 
 func contentionWindow(b *testing.B) time.Duration {
 	b.Helper()
-	v := os.Getenv(EnvBenchContentionSecs)
+	v := envconfig.Getenv(EnvBenchContentionSecs)
 	if v == "" {
 		return 5 * time.Second
 	}

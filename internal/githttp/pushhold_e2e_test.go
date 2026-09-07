@@ -24,10 +24,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/coder/code-storage/internal/auth"
-	"github.com/coder/code-storage/internal/blob"
-	"github.com/coder/code-storage/internal/meta"
-	"github.com/coder/code-storage/internal/ref"
+	"github.com/coder/open-storage/internal/auth"
+	"github.com/coder/open-storage/internal/blob"
+	"github.com/coder/open-storage/internal/meta"
+	"github.com/coder/open-storage/internal/ref"
 )
 
 func waitForFile(t *testing.T, path string, timeout time.Duration) {
@@ -599,7 +599,7 @@ func TestPush_LargeSignedFanoutNotCapped(t *testing.T) {
 
 // TestPush_SignedFanoutSurvivesSmallBudget (Codex round-16 P2): a no-pack
 // push of 60 signed refs at one already-stored tip under
-// CODESTORAGE_VERIFY_SIG_BUDGET=1 must succeed. Pre-receive's reservation
+// OPENSTORAGE_VERIFY_SIG_BUDGET=1 must succeed. Pre-receive's reservation
 // evaluation charges the per-evaluation verify fee once per command
 // (~61 of the 100 allowed units); before the fix each update hook charged
 // another unit — reading the SAME persisted range verdict — so the
@@ -615,7 +615,7 @@ func TestPush_SignedFanoutSurvivesSmallBudget(t *testing.T) {
 
 	mustGit(t, work, append(sshSigningArgs(priv), "commit", "--amend", "--no-edit")...)
 	plain := mintTestToken(t, repo, "git:read,git:write", "")
-	node := startNodeT(t, "CODESTORAGE_VERIFY_SIG_BUDGET=1")
+	node := startNodeT(t, "OPENSTORAGE_VERIFY_SIG_BUDGET=1")
 	// Store the whole (1-commit) history first, so the fanout push below
 	// carries no pack and its only budget pressure is the per-evaluation
 	// fees.
@@ -656,7 +656,7 @@ func TestPush_PackPathJITFanoutSurvivesSmallBudget(t *testing.T) {
 
 	mustGit(t, work, append(sshSigningArgs(priv), "commit", "--amend", "--no-edit")...)
 	plain := mintTestToken(t, repo, "git:read,git:write", "")
-	node := startNodeT(t, "CODESTORAGE_VERIFY_SIG_BUDGET=1")
+	node := startNodeT(t, "OPENSTORAGE_VERIFY_SIG_BUDGET=1")
 	// Seed main plus the 60-ref fanout at v1.
 	args := []string{"push", remoteURL(node, repo, plain), "HEAD:refs/heads/main"}
 	for i := range 60 {
@@ -927,7 +927,7 @@ func TestAtomicPush_SignedFanoutSurvivesSmallBudget(t *testing.T) {
 
 	mustGit(t, work, append(sshSigningArgs(priv), "commit", "--amend", "--no-edit")...)
 	plain := mintTestToken(t, repo, "git:read,git:write", "")
-	node := startNodeT(t, "CODESTORAGE_VERIFY_SIG_BUDGET=1")
+	node := startNodeT(t, "OPENSTORAGE_VERIFY_SIG_BUDGET=1")
 	// Store the whole (1-commit) history first, so the fanout push below
 	// carries no pack and its only budget pressure is the per-evaluation
 	// fees.
@@ -1041,8 +1041,8 @@ func TestPush_NoForcePushDenialReleasesHold(t *testing.T) {
 func TestServiceRPC_ReleasesPushHoldBeforeRepackTrigger(t *testing.T) {
 	// The in-process server plays the serve node, so the hook
 	// subprocesses inherit THIS process's environment.
-	t.Setenv("CODESTORAGE_PG_URL", dbURL)
-	t.Setenv("CODESTORAGE_S3_URL", blobURL)
+	t.Setenv("OPENSTORAGE_PG_URL", dbURL)
+	t.Setenv("OPENSTORAGE_S3_URL", blobURL)
 
 	repo := "t-hold-before-repack"
 	cacheDir := t.TempDir()
@@ -1287,8 +1287,8 @@ func TestPush_ConcurrentPushProceedsDuringPublication(t *testing.T) {
 func TestPush_HoldStaysFreshThroughLocalRefTransaction(t *testing.T) {
 	// The in-process server plays the serve node, so the hook
 	// subprocesses inherit THIS process's environment.
-	t.Setenv("CODESTORAGE_PG_URL", dbURL)
-	t.Setenv("CODESTORAGE_S3_URL", blobURL)
+	t.Setenv("OPENSTORAGE_PG_URL", dbURL)
+	t.Setenv("OPENSTORAGE_S3_URL", blobURL)
 	// Shrunk so the reader-expiry gap is observable on test timescales.
 	// The hook subprocesses keep the production TTL (fresh re-exec), but
 	// hook-owned refreshers are exactly what is ABSENT in the gap under
@@ -1462,7 +1462,7 @@ func TestPush_RefPathBudgetDeniesUnmaterializableName(t *testing.T) {
 
 // openLaneStores opens the SAME backend lane stores the TestMain-booted
 // environment (and therefore every hook subprocess, via
-// CODESTORAGE_PG_URL / CODESTORAGE_S3_URL) uses. In-process servers must
+// OPENSTORAGE_PG_URL / OPENSTORAGE_S3_URL) uses. In-process servers must
 // use these, NOT openTestRefStore/openTestBlob: those are per-test
 // isolated stores, and a server whose hydrate reads a different store
 // than its hooks write silently invalidates every cross-checking pin
@@ -1504,7 +1504,7 @@ func (c *countingRefStore) ListRefsAfter(ctx context.Context, repo, after string
 // held into concurrent pushes' reservation timeouts. Pre-receive must
 // release the whole hold on any error return.
 func TestPreReceive_PostReservationDenialReleasesHold(t *testing.T) {
-	t.Setenv("CODESTORAGE_PG_URL", dbURL)
+	t.Setenv("OPENSTORAGE_PG_URL", dbURL)
 	laneStore, _ := openLaneStores(t)
 	repo := "t-prereceive-denial-release"
 	shaA := strings.Repeat("a", 40)
@@ -1564,9 +1564,9 @@ func TestPreReceive_PostReservationDenialReleasesHold(t *testing.T) {
 // live hold fingerprint changes, so each waiter no longer repeats the
 // scan while the held state is provably unchanged.
 func TestHydrate_HeldSkipDoesNotRescanPerRequest(t *testing.T) {
-	t.Setenv("CODESTORAGE_PG_URL", dbURL)
-	t.Setenv("CODESTORAGE_S3_URL", blobURL)
-	t.Setenv("CODESTORAGE_TEST_MODE", "1")
+	t.Setenv("OPENSTORAGE_PG_URL", dbURL)
+	t.Setenv("OPENSTORAGE_S3_URL", blobURL)
+	t.Setenv("OPENSTORAGE_TEST_MODE", "1")
 	barrier := filepath.Join(t.TempDir(), "adv-barrier")
 	t.Setenv(EnvUpdateBarrier, barrier)
 
@@ -1664,8 +1664,8 @@ func TestHydrate_HeldSkipDoesNotRescanPerRequest(t *testing.T) {
 // release the whole set the instant the batch commits, strictly before
 // post-receive and the client-stallable report phase this test parks in.
 func TestPush_CommittedNonAtomicRefReleasedBeforeTail(t *testing.T) {
-	t.Setenv("CODESTORAGE_PG_URL", dbURL)
-	t.Setenv("CODESTORAGE_S3_URL", blobURL)
+	t.Setenv("OPENSTORAGE_PG_URL", dbURL)
+	t.Setenv("OPENSTORAGE_S3_URL", blobURL)
 	repo := "t-tombstone-committed"
 	cacheDir := t.TempDir()
 	key, pemBlock := genKeyPEM(t, "ES256")
@@ -1795,9 +1795,9 @@ exit 0
 // scan for the whole hook phase, however many CASes land between
 // advertisements.
 func TestPush_AtomicFanoutHookPhaseAdvertisementsCoalesce(t *testing.T) {
-	t.Setenv("CODESTORAGE_PG_URL", dbURL)
-	t.Setenv("CODESTORAGE_S3_URL", blobURL)
-	t.Setenv("CODESTORAGE_TEST_MODE", "1")
+	t.Setenv("OPENSTORAGE_PG_URL", dbURL)
+	t.Setenv("OPENSTORAGE_S3_URL", blobURL)
+	t.Setenv("OPENSTORAGE_TEST_MODE", "1")
 	barrier := filepath.Join(t.TempDir(), "fanout-barrier")
 	t.Setenv(EnvUpdateBarrierEach, barrier)
 
@@ -1915,9 +1915,9 @@ func TestPush_AtomicFanoutHookPhaseAdvertisementsCoalesce(t *testing.T) {
 // must force the healing rescan even though the fingerprint still
 // matches; the marker may never vouch for work it cannot attribute.
 func TestHydrate_ExternalWriteDuringHookPhaseForcesRescan(t *testing.T) {
-	t.Setenv("CODESTORAGE_PG_URL", dbURL)
-	t.Setenv("CODESTORAGE_S3_URL", blobURL)
-	t.Setenv("CODESTORAGE_TEST_MODE", "1")
+	t.Setenv("OPENSTORAGE_PG_URL", dbURL)
+	t.Setenv("OPENSTORAGE_S3_URL", blobURL)
+	t.Setenv("OPENSTORAGE_TEST_MODE", "1")
 	barrier := filepath.Join(t.TempDir(), "gap-barrier")
 	t.Setenv(EnvUpdateBarrier, barrier)
 

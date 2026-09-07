@@ -9,7 +9,7 @@ against the live upstream service is tracked.
 ## The contract
 
 The official code.storage SDKs (TypeScript, Python, Go) accept `apiBaseUrl` /
-`storageBaseUrl` overrides. Point them at a codestorage deployment and client code runs
+`storageBaseUrl` overrides. Point them at a open.storage deployment and client code runs
 unchanged: same endpoints, same request/response shapes, same JWT claims and scopes, same
 NDJSON streaming protocols, same webhook signatures, same git smart-HTTP and LFS
 behavior. Plain `git` and `curl` work identically. The backend was built from a
@@ -91,17 +91,17 @@ Beyond serving the smart-HTTP wire format, the semantics clients depend on match
   concurrent-conflict window is not. Without the flag, refs succeed and fail
   independently, as in git.
 - **Signed pushes**: `verify-sig` validates SSH/PGP commit signatures against keys
-  registered via [`codestorage signing-key`](../reference/cli.md#codestorage-signing-key).
+  registered via [`openstorage signing-key`](../reference/cli.md#openstorage-signing-key).
   Verification shells out through git — `ssh-keygen` for SSH, `gpg` for PGP — and fails
   closed per ref when the binary is absent. The repository's supplied container image
-  ships both ([#50](https://github.com/coder/code-storage/issues/50)); install them
+  ships both ([#50](https://github.com/coder/open-storage/issues/50)); install them
   yourself if you build a custom image and protect refs with `verify-sig`.
 
 ### Git LFS transfer semantics
 
 The batch API speaks the standard LFS `basic` adapter, so any git-lfs client works
 unchanged — but the transfer hrefs it hands out are asymmetric by design
-([#51](https://github.com/coder/code-storage/issues/51)):
+([#51](https://github.com/coder/open-storage/issues/51)):
 
 - **Downloads** get presigned S3 URLs when the backend can sign (server-proxied
   fallback otherwise, e.g. local file mode). Reads are never quota-gated.
@@ -120,14 +120,14 @@ unchanged — but the transfer hrefs it hands out are asymmetric by design
 
 Upstream code.storage is a multi-tenant service; this backend deliberately is not. One
 deployment serves **one organization**, configured at boot
-([`CODESTORAGE_ORG`](../reference/configuration.md#codestorage_org) +
-[`CODESTORAGE_ORG_PUBKEYS`](../reference/configuration.md#codestorage_org_pubkeys)).
+([`OPENSTORAGE_ORG`](../reference/configuration.md#openstorage_org) +
+[`OPENSTORAGE_ORG_PUBKEYS`](../reference/configuration.md#openstorage_org_pubkeys)).
 
 For clients this is invisible — tokens carry the same `iss`/`repo`/`scopes` claims either
 way. Both surfaces reject any verified token whose `iss` is not the served org with
 `403` (the REST surface historically accepted tokens for retained org rows —
-[#47](https://github.com/coder/code-storage/issues/47)). Org rows retained from an
-earlier `CODESTORAGE_ORG` value stay in the database and each boot logs a warning naming
+[#47](https://github.com/coder/open-storage/issues/47)). Org rows retained from an
+earlier `OPENSTORAGE_ORG` value stay in the database and each boot logs a warning naming
 them, but their tokens are rejected on both surfaces. What changes is operations: org
 onboarding and signing-key registration are your deployment configuration (env + CLI)
 rather than a vendor control plane, and serving multiple orgs means multiple
@@ -177,15 +177,15 @@ tracked as ordinary, visible project work:
 - **Recurring diff:** the live upstream spec and docs are periodically re-fetched and
   diffed against the snapshot and the implemented surface. Every new, changed, or
   deprecated upstream endpoint becomes a GitHub issue labeled
-  [**`upstream-compat`**](https://github.com/coder/code-storage/issues?q=label%3Aupstream-compat) —
+  [**`upstream-compat`**](https://github.com/coder/open-storage/issues?q=label%3Aupstream-compat) —
   that label query is the live drift status.
 - **Compatibility gates:** the merge-gate CI runs the full e2e suites (API, git
   protocol, LFS) that pin the documented wire behavior, and an opt-in SDK-compatibility
   suite drives the real vendored Go SDK against a live server
-  (`CODESTORAGE_SDK_DIR`, see `internal/api/sdkcompat_test.go`) — so a regression against
+  (`OPENSTORAGE_SDK_DIR`, see `internal/api/sdkcompat_test.go`) — so a regression against
   the wire contract fails a test, not a customer.
 
 To evaluate SDK compatibility for a specific integration: check the
 [surface matrix](#implemented-surface) for the feature groups you use, then the open
-[`upstream-compat` issues](https://github.com/coder/code-storage/issues?q=label%3Aupstream-compat)
+[`upstream-compat` issues](https://github.com/coder/open-storage/issues?q=label%3Aupstream-compat)
 for anything upstream shipped that has not landed here yet.

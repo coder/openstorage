@@ -110,7 +110,7 @@ var ErrReapWatermarkStale = errors.New("destructive LFS sweep watermark is stale
 // sweep START — refund settlement requires a completion whose epoch
 // strictly exceeds a retirement's recorded epoch (Codex round 33 on PR
 // #132). Legacy certifies the sweep also had the LEGACY LFS delete class
-// armed (CODESTORAGE_SWEEP_DELETE_LFS_LEGACY): legacy-spelled registry
+// armed (OPENSTORAGE_SWEEP_DELETE_LFS_LEGACY): legacy-spelled registry
 // rows may only be retired, and their refunds settled, under legacy-armed
 // certification (Codex round 17) — with the legacy class off, the sweeper
 // deliberately spares legacy-spelled orphan blobs, so refunding their

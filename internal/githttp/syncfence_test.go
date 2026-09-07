@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/coder/code-storage/internal/meta"
+	"github.com/coder/open-storage/internal/meta"
 )
 
 func TestEnforceSyncClaimFence(t *testing.T) {
@@ -28,7 +28,7 @@ func TestEnforceSyncClaimFence(t *testing.T) {
 	if err := ms.InitSchema(ctx); err != nil {
 		t.Fatalf("init schema: %v", err)
 	}
-	t.Setenv("CODESTORAGE_PG_URL", dbURL)
+	t.Setenv("OPENSTORAGE_PG_URL", dbURL)
 
 	// SetRepoUpstream is guarded on a live repos row (issue #52).
 	if _, err := ms.UpsertOrgWithKeys(ctx, "fence-org", []string{"-----BEGIN PUBLIC KEY-----\ndummy\n-----END PUBLIC KEY-----\n"}); err != nil {

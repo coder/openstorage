@@ -22,18 +22,18 @@ versions CI uses. Installing the same versions by hand works too.
 ## Build and run
 
 ```sh
-go build ./cmd/codestorage && ./codestorage version
-./codestorage keygen --out /tmp/cs-key   # org keypair, used by both serve modes below
+go build ./cmd/openstorage && ./openstorage version
+./openstorage keygen --out /tmp/cs-key   # org keypair, used by both serve modes below
 ```
 
-(A source build lands at `./codestorage` without touching `PATH` — spell the
+(A source build lands at `./openstorage` without touching `PATH` — spell the
 `./` out, or `go install` it.) Two ways to run what you built:
 
 - **Zero-dependency local mode** — SQLite + plain-file blobs, one flag:
 
   ```sh
-  CODESTORAGE_ORG=selfhost CODESTORAGE_ORG_PUBKEYS=/tmp/cs-key.pub.pem \
-    ./codestorage serve --listen 127.0.0.1:8080 --data-dir /tmp/cs-data
+  OPENSTORAGE_ORG=selfhost OPENSTORAGE_ORG_PUBKEYS=/tmp/cs-key.pub.pem \
+    ./openstorage serve --listen 127.0.0.1:8080 --data-dir /tmp/cs-data
   ```
 
   The [README quickstart](README.md#quickstart-local-mode-60-seconds) continues from
@@ -44,15 +44,15 @@ go build ./cmd/codestorage && ./codestorage version
 
   ```sh
   docker compose up -d --wait
-  CODESTORAGE_ORG=selfhost CODESTORAGE_ORG_PUBKEYS=/tmp/cs-key.pub.pem \
-  CODESTORAGE_PG_URL="postgres://postgres:postgres@127.0.0.1:${PGPORT:-15432}/postgres" \
-  CODESTORAGE_S3_URL="s3://codestorage?endpoint=http://127.0.0.1:${S3PORT:-18333}&s3ForcePathStyle=true&region=us-east-1" \
+  OPENSTORAGE_ORG=selfhost OPENSTORAGE_ORG_PUBKEYS=/tmp/cs-key.pub.pem \
+  OPENSTORAGE_PG_URL="postgres://postgres:postgres@127.0.0.1:${PGPORT:-15432}/postgres" \
+  OPENSTORAGE_S3_URL="s3://codestorage?endpoint=http://127.0.0.1:${S3PORT:-18333}&s3ForcePathStyle=true&region=us-east-1" \
   AWS_ACCESS_KEY_ID=codestorage AWS_SECRET_ACCESS_KEY=codestorage \
-    ./codestorage serve --listen 127.0.0.1:8080
+    ./openstorage serve --listen 127.0.0.1:8080
   ```
 
   The opt-in `replicas` profile adds two containerized server nodes — see the
-  [compose guide](docs/how-to/deploy-docker-compose.md). Every `CODESTORAGE_*`
+  [compose guide](docs/how-to/deploy-docker-compose.md). Every `OPENSTORAGE_*`
   variable is documented in the [configuration reference](docs/reference/configuration.md).
 
 - **Zero-infrastructure mode (experimental)** — one SeaweedFS bucket as the sole durable
@@ -64,14 +64,14 @@ go build ./cmd/codestorage && ./codestorage version
   until curl -sf http://127.0.0.1:8333/healthz; do sleep 1; done
   # Cold start: bucket creation and object writes can both precede a writable volume,
   # so retry create + a real write roundtrip as one unit (create tolerates already-exists).
-  until curl -s -X PUT http://127.0.0.1:8333/codestorage >/dev/null &&
-        curl -sf -X PUT -d ready http://127.0.0.1:8333/codestorage/ready &&
-        curl -sf -X DELETE http://127.0.0.1:8333/codestorage/ready; do sleep 1; done
-  CODESTORAGE_ORG=selfhost CODESTORAGE_ORG_PUBKEYS=/tmp/cs-key.pub.pem \
-  CODESTORAGE_PG_URL='s3wal://codestorage?endpoint=http://127.0.0.1:8333&region=us-east-1' \
-  CODESTORAGE_S3_URL='s3://codestorage?endpoint=http://127.0.0.1:8333&s3ForcePathStyle=true&region=us-east-1' \
+  until curl -s -X PUT http://127.0.0.1:8333/openstorage >/dev/null &&
+        curl -sf -X PUT -d ready http://127.0.0.1:8333/openstorage/ready &&
+        curl -sf -X DELETE http://127.0.0.1:8333/openstorage/ready; do sleep 1; done
+  OPENSTORAGE_ORG=selfhost OPENSTORAGE_ORG_PUBKEYS=/tmp/cs-key.pub.pem \
+  OPENSTORAGE_PG_URL='s3wal://openstorage?endpoint=http://127.0.0.1:8333&region=us-east-1' \
+  OPENSTORAGE_S3_URL='s3://openstorage?endpoint=http://127.0.0.1:8333&s3ForcePathStyle=true&region=us-east-1' \
   AWS_ACCESS_KEY_ID=any AWS_SECRET_ACCESS_KEY=any \
-    ./codestorage serve --listen 127.0.0.1:8080
+    ./openstorage serve --listen 127.0.0.1:8080
   ```
 
   (This standalone SeaweedFS runs unauthenticated, so any credentials sign.) The
@@ -93,12 +93,12 @@ go test ./... -count=1 -race -timeout=30m
 
 # 2. Local lane — the git e2e suite on the zero-container backends
 #    (SQLite + file blobs). No Docker needed.
-CODESTORAGE_TEST_BACKEND=local go test ./internal/githttp -count=1 -race -timeout=15m
+OPENSTORAGE_TEST_BACKEND=local go test ./internal/githttp -count=1 -race -timeout=15m
 
 # 3. s3wal lane — the same git e2e suite on the zero-infra topology: ONE
 #    SeaweedFS bucket carrying refs + metadata + blobs, plus lane-only drills
 #    (restart-from-bucket-only, dual-serve refusal). Needs Docker.
-CODESTORAGE_TEST_BACKEND=s3wal go test ./internal/githttp -count=1 -race -timeout=25m
+OPENSTORAGE_TEST_BACKEND=s3wal go test ./internal/githttp -count=1 -race -timeout=25m
 ```
 
 A further lane hides inside the first: the `internal/api`, `internal/meta`, and
@@ -131,7 +131,7 @@ golangci-lint run
 
 Config is [`.golangci.yml`](.golangci.yml) (v2 schema): the default linter set
 plus `misspell`, `unconvert`, `nolintlint`, and the `gofmt`/`goimports`
-formatters (local prefix `github.com/coder/code-storage`).
+formatters (local prefix `github.com/coder/open-storage`).
 
 ## Go style: modern idioms
 

@@ -32,7 +32,7 @@ import (
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
 
-	"github.com/coder/code-storage/internal/ref/s3wal/s3waltest"
+	"github.com/coder/open-storage/internal/ref/s3wal/s3waltest"
 )
 
 // Qualified SeaweedFS recipe (Gate 1a-A, PR #142): pinned image,
@@ -45,14 +45,14 @@ const seaweedFSImage = "chrislusf/seaweedfs:4.45"
 // presigned-URL tamper probe needs. Dummy values — the container is
 // throwaway and unreachable beyond the mapped test port.
 const (
-	seaweedFSAccessKey = "codestorage-test"
-	seaweedFSSecretKey = "codestorage-test-secret"
+	seaweedFSAccessKey = "openstorage-test"
+	seaweedFSSecretKey = "openstorage-test-secret"
 )
 
 const seaweedFSS3Config = `{
   "identities": [
     {
-      "name": "codestorage-test",
+      "name": "openstorage-test",
       "credentials": [{"accessKey": "` + seaweedFSAccessKey + `", "secretKey": "` + seaweedFSSecretKey + `"}],
       "actions": ["Admin", "Read", "List", "Tagging", "Write"]
     }

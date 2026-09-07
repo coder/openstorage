@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Builds the codestorage release archives: cross-compiles ./cmd/codestorage
+# Builds the openstorage release archives: cross-compiles ./cmd/openstorage
 # for every supported platform, packages each binary at the root of
-# codestorage_<version>_<os>_<arch>.tar.gz, and writes a sha256 checksums.txt
+# openstorage_<version>_<os>_<arch>.tar.gz, and writes a sha256 checksums.txt
 # next to them. Used by .github/workflows/release.yml and runnable locally so
 # the tested path is the shipped path.
 #
 # Usage: scripts/release-archives.sh <tag> <outdir>
-#   tag     release tag, e.g. v0.1.0 (stamped into `codestorage --version`)
+#   tag     release tag, e.g. v0.1.0 (stamped into `openstorage --version`)
 #   outdir  directory to write archives + checksums.txt into (created)
 set -euo pipefail
 
@@ -27,7 +27,7 @@ date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 # cross-compiles below instead of silently linking against host libc.
 export CGO_ENABLED=0
 
-module=github.com/coder/code-storage
+module=github.com/coder/open-storage
 ldflags="-s -w
 	-X ${module}/internal/version.version=${tag}
 	-X ${module}/internal/version.commit=${commit}
@@ -40,14 +40,14 @@ for platform in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
 	goarch="${platform#*/}"
 	workdir="$(mktemp -d)"
 	GOOS="$goos" GOARCH="$goarch" go build -trimpath -ldflags "$ldflags" \
-		-o "$workdir/codestorage" ./cmd/codestorage
-	archive="codestorage_${version}_${goos}_${goarch}.tar.gz"
-	tar -czf "$outdir/$archive" -C "$workdir" codestorage
+		-o "$workdir/openstorage" ./cmd/openstorage
+	archive="openstorage_${version}_${goos}_${goarch}.tar.gz"
+	tar -czf "$outdir/$archive" -C "$workdir" openstorage
 	rm -rf "$workdir"
 	# Layout assertion: exactly one entry, the binary at the archive root
 	# (mise/ubi-style installers rely on this).
 	entries="$(tar -tzf "$outdir/$archive")"
-	[ "$entries" = "codestorage" ] || {
+	[ "$entries" = "openstorage" ] || {
 		echo "release-archives.sh: unexpected layout in $archive: $entries" >&2
 		exit 1
 	}
@@ -56,5 +56,5 @@ done
 
 # GNU sha256sum format; verifiable with `sha256sum -c` (linux) and
 # `shasum -a 256 -c` (macOS).
-(cd "$outdir" && sha256sum codestorage_"${version}"_*.tar.gz >checksums.txt)
+(cd "$outdir" && sha256sum openstorage_"${version}"_*.tar.gz >checksums.txt)
 echo "wrote checksums.txt"

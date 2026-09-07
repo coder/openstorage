@@ -31,10 +31,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/coder/code-storage/internal/auth"
-	"github.com/coder/code-storage/internal/gitread"
-	"github.com/coder/code-storage/internal/meta"
-	"github.com/coder/code-storage/internal/ref"
+	"github.com/coder/open-storage/internal/auth"
+	"github.com/coder/open-storage/internal/gitread"
+	"github.com/coder/open-storage/internal/meta"
+	"github.com/coder/open-storage/internal/ref"
 )
 
 // forkAwareCreateRepo dispatches POST /api/v1/repos: bodies carrying a
@@ -213,7 +213,7 @@ func (s *server) handleForkRepo(w http.ResponseWriter, r *http.Request, verifier
 	// failure must not leave a shell repo behind. The full reachability
 	// closure of forkSHA is the fork's entire object set — no negatives —
 	// so the fork shares nothing with the source's storage keys.
-	packDir, err := os.MkdirTemp("", "codestorage-fork-pack-*")
+	packDir, err := os.MkdirTemp("", "openstorage-fork-pack-*")
 	if err != nil {
 		s.internalErr(w, r, "create fork pack dir", err)
 		return

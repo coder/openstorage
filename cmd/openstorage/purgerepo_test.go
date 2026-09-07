@@ -14,10 +14,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/coder/code-storage/internal/blob"
-	"github.com/coder/code-storage/internal/jobs"
-	"github.com/coder/code-storage/internal/meta"
-	"github.com/coder/code-storage/internal/ref"
+	"github.com/coder/open-storage/internal/blob"
+	"github.com/coder/open-storage/internal/jobs"
+	"github.com/coder/open-storage/internal/meta"
+	"github.com/coder/open-storage/internal/ref"
 )
 
 // seedPurgeDataDir builds a local-mode data dir holding one live repo and
@@ -84,8 +84,8 @@ func seedPurgeDataDir(t *testing.T, dir string) (deleted, live meta.Repo) {
 func TestCmdPurgeRepo(t *testing.T) {
 	// Isolate from ambient storage env: local mode only.
 	for _, env := range []string{
-		"CODESTORAGE_PG_URL", "SPIKE_PG_URL", "PG_URL",
-		"CODESTORAGE_S3_URL", "SPIKE_S3_URL", "BLOB_URL",
+		"OPENSTORAGE_PG_URL", "SPIKE_PG_URL", "PG_URL",
+		"OPENSTORAGE_S3_URL", "SPIKE_S3_URL", "BLOB_URL",
 		envDataDir, envSecretsKey, envPackQuota, envPackReservationTTL,
 	} {
 		t.Setenv(env, "")
@@ -176,8 +176,8 @@ func TestCmdPurgeRepo_InitializesRefSchema(t *testing.T) {
 	// must run ref InitSchema itself (operator commands own DDL like
 	// serve) or the very first purge fails on the missing table.
 	for _, env := range []string{
-		"CODESTORAGE_PG_URL", "SPIKE_PG_URL", "PG_URL",
-		"CODESTORAGE_S3_URL", "SPIKE_S3_URL", "BLOB_URL",
+		"OPENSTORAGE_PG_URL", "SPIKE_PG_URL", "PG_URL",
+		"OPENSTORAGE_S3_URL", "SPIKE_S3_URL", "BLOB_URL",
 		envDataDir, envSecretsKey, envPackQuota, envPackReservationTTL,
 	} {
 		t.Setenv(env, "")

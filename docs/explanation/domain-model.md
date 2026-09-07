@@ -74,8 +74,8 @@ Derived from SDK behavior and the real consumer (`just-code-storage`):
 8. **Deletion is soft-first.** `DELETE /repos/delete` performs a soft delete, then async
    hot/cold storage cleanup; repeat deletion returns 409 ("already deleted"). In this
    implementation the async cleanup is the retention purge
-   ([`CODESTORAGE_REPO_RETENTION`](../reference/configuration.md#codestorage_repo_retention)
-   / [`codestorage purge-repo`](../reference/cli.md#codestorage-purge-repo)): it removes
+   ([`OPENSTORAGE_REPO_RETENTION`](../reference/configuration.md#openstorage_repo_retention)
+   / [`openstorage purge-repo`](../reference/cli.md#openstorage-purge-repo)): it removes
    the repository's storage permanently — no restore — while the name burn persists
    (URL-scoped tokens may outlive any retention, so the `(org, url)` pair is never
    released).

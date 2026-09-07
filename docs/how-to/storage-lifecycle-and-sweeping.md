@@ -18,10 +18,10 @@ of these classes:
 | Class | Created by | Reclaimed by |
 |---|---|---|
 | **Registered packs** | Every push and REST write publishes a pack and registers it | [Repack](#background-repack) folds many into one (the originals become *retained*) |
-| **Retained (superseded) packs** | A repack fold replaced their registry rows; the blobs linger | Sweeper's superseded reap ([`CODESTORAGE_SWEEP_DELETE_SUPERSEDED`](../reference/configuration.md#codestorage_sweep_delete_superseded), on by default) after the age threshold |
-| **Orphan packs** | Crashed/interrupted writers (pack published, registration never committed), lost repack races | Sweeper — **list-only by default**; deletion is the explicit [`CODESTORAGE_SWEEP_DELETE_ENABLED`](../reference/configuration.md#codestorage_sweep_delete_enabled) opt-in |
+| **Retained (superseded) packs** | A repack fold replaced their registry rows; the blobs linger | Sweeper's superseded reap ([`OPENSTORAGE_SWEEP_DELETE_SUPERSEDED`](../reference/configuration.md#openstorage_sweep_delete_superseded), on by default) after the age threshold |
+| **Orphan packs** | Crashed/interrupted writers (pack published, registration never committed), lost repack races | Sweeper — **list-only by default**; deletion is the explicit [`OPENSTORAGE_SWEEP_DELETE_ENABLED`](../reference/configuration.md#openstorage_sweep_delete_enabled) opt-in |
 | **LFS objects** (`lfs/<repo_id>/o2/<oid>` canonical keys; `lfs/<repo_id>/<oid>` legacy pre-adoption keys, ADR-41) | Verified LFS uploads publish the object and register it in the LFS registry | Like registered packs, permanent while the repository lives; the [repository purge](#reclaiming-deleted-repositories) reclaims them with the rest of a deleted repository |
-| **Orphan LFS objects** | Crashed uploads (published, registration never committed) and objects uploaded before the LFS registry existed | Sweeper — **list-only by default**; deletion is the separate [`CODESTORAGE_SWEEP_DELETE_LFS`](../reference/configuration.md#codestorage_sweep_delete_lfs) opt-in (see [the caveat](#lfs-orphans-and-pre-registry-objects)) |
+| **Orphan LFS objects** | Crashed uploads (published, registration never committed) and objects uploaded before the LFS registry existed | Sweeper — **list-only by default**; deletion is the separate [`OPENSTORAGE_SWEEP_DELETE_LFS`](../reference/configuration.md#openstorage_sweep_delete_lfs) opt-in (see [the caveat](#lfs-orphans-and-pre-registry-objects)) |
 | **Quarantine copies** (`sweep/quarantine/<nonce>/…` keys) | Delete-mode sweeps copy every blob aside before deleting it | The sweep itself purges backups older than the purge window — `max(age threshold, 1h)` — while a destructive mode is on |
 
 One more growth source sits outside this lifecycle: on versioned S3 buckets, **old
@@ -50,7 +50,7 @@ keeps counting them live. Reclamation is the separate, explicitly-enabled
 List a repository's blobs under `packs/` straight from the blob store:
 
 ```sh
-codestorage list-packs --repo repo_01k5abc...   # takes the server-generated RepoID
+openstorage list-packs --repo repo_01k5abc...   # takes the server-generated RepoID
 ```
 
 `--repo` takes the **RepoID** (`repo_...`, returned by repo creation and
@@ -58,8 +58,8 @@ codestorage list-packs --repo repo_01k5abc...   # takes the server-generated Rep
 prefixes — list them by suffixing the key (`--repo repo_01k5abc...+ephemeral`); a
 quota denial's `stored` bytes cover the base **and** all namespace prefixes. The command
 reads
-`CODESTORAGE_S3_URL`/`CODESTORAGE_PG_URL` (or `--data-dir` in local mode) from the
-environment — see the [CLI reference](../reference/cli.md#codestorage-list-packs).
+`OPENSTORAGE_S3_URL`/`OPENSTORAGE_PG_URL` (or `--data-dir` in local mode) from the
+environment — see the [CLI reference](../reference/cli.md#openstorage-list-packs).
 
 Fleet-wide, the periodic [sweep report](#reading-a-sweep-report) counts live vs. orphan
 blobs per run — but totals bytes for orphan candidates only. `list-packs` reports
@@ -76,12 +76,12 @@ credentials, upstream link) and its blobs (base packs, namespace packs, LFS obje
 only the repository row itself is retained, stamped as a purge tombstone:
 
 - **Retention window:** set
-  [`CODESTORAGE_REPO_RETENTION`](../reference/configuration.md#codestorage_repo_retention)
+  [`OPENSTORAGE_REPO_RETENTION`](../reference/configuration.md#openstorage_repo_retention)
   (for example `720h` for 30 days) and a purge pass on the
   [sweep](#the-orphan-sweeper) cadence reclaims every repository soft-deleted longer
   than that.
 - **Operator command:**
-  [`codestorage purge-repo --yes <repo-id>`](../reference/cli.md#codestorage-purge-repo)
+  [`openstorage purge-repo --yes <repo-id>`](../reference/cli.md#openstorage-purge-repo)
   purges one repository immediately (it must have been soft-deleted at least an hour
   earlier).
 
@@ -92,7 +92,7 @@ authorize against a new repository created at that URL. (In s3wal mode the tombs
 the repository group's `_wal/repo/<id>` manifest with its terminal `purged_at` fence —
 equally permanent; deleting the object by hand would un-burn the name and reopen exactly
 those races.) Both also share the
-[fleet-upgrade prerequisite](../reference/configuration.md#codestorage_repo_retention):
+[fleet-upgrade prerequisite](../reference/configuration.md#openstorage_repo_retention):
 every serve replica and hook-running git node must run a fence-aware build before the
 first purge.
 
@@ -122,7 +122,7 @@ flags are off).
 ## Background repack
 
 Small pushes accumulate one pack each. When a repository's registered-pack count reaches
-[`CODESTORAGE_REPACK_THRESHOLD`](../reference/configuration.md#codestorage_repack_threshold)
+[`OPENSTORAGE_REPACK_THRESHOLD`](../reference/configuration.md#openstorage_repack_threshold)
 (default 10), a background job folds registered packs into one consolidated pack. It runs
 as a durable [River](https://riverqueue.com) job on Postgres (in-process in local mode) —
 in a fleet, any replica may execute it.
@@ -161,16 +161,16 @@ Tuning: raise the threshold to fold less often (bigger, rarer folds), lower it (
 ## Pack quotas
 
 Every repository has a storage-bytes quota
-([`CODESTORAGE_PACK_QUOTA_BYTES`](../reference/configuration.md#codestorage_pack_quota_bytes),
+([`OPENSTORAGE_PACK_QUOTA_BYTES`](../reference/configuration.md#openstorage_pack_quota_bytes),
 default 10 GiB, `0` disables) covering its packs **and its LFS objects**
-([#51](https://github.com/coder/code-storage/issues/51)). A repository and its
+([#51](https://github.com/coder/open-storage/issues/51)). A repository and its
 `+ephemeral` / `+import` namespaces share one quota, accounted against the base
 repository — including LFS, whose object space the namespaces share outright.
 
 What a denial looks like — over git:
 
 ```
-remote: codestorage hook: pre-receive: repository pack quota exceeded: push adds <n> bytes
+remote: openstorage hook: pre-receive: repository pack quota exceeded: push adds <n> bytes
 to <n> bytes stored (+<n> bytes reserved by in-flight pushes), quota is <n> bytes
 ```
 
@@ -190,7 +190,7 @@ URLs, but reserves nothing durable — batch-time holds proved renewable-for-fre
 the **durable** reservation is charged per object at the verified upload itself, right
 before its bytes are published, then settled into the usage counter when registration
 completes — expiring after the same
-[`CODESTORAGE_PACK_RESERVATION_TTL`](../reference/configuration.md#codestorage_pack_reservation_ttl)
+[`OPENSTORAGE_PACK_RESERVATION_TTL`](../reference/configuration.md#openstorage_pack_reservation_ttl)
 if registration never lands. Between those stages nothing is held, so two near-quota
 clients can both receive upload URLs and one can transfer its whole object before the
 durable admission rejects it — wasted transfer, never quota overshoot. Downloads are
@@ -207,7 +207,7 @@ Reading the numbers: admission is `stored + reserved + incoming ≤ quota`, wher
   [enabling delete mode](#before-enabling-delete-mode-fleet-prerequisite) resolves;
 - **reserved** counts other writers' in-flight admissions. A crashed writer's
   reservation keeps gating only until its
-  [`CODESTORAGE_PACK_RESERVATION_TTL`](../reference/configuration.md#codestorage_pack_reservation_ttl)
+  [`OPENSTORAGE_PACK_RESERVATION_TTL`](../reference/configuration.md#openstorage_pack_reservation_ttl)
   (default 1h) elapses — admission ignores expired rows immediately; the sweeper's
   `reservations_expired` pruning is just garbage collection of those rows, not what
   unblocks pushes. A retry of the *same* push is never double-charged (the same content
@@ -230,12 +230,12 @@ quota: receive-pack for <repo> at/over quota (<n> pack bytes stored >= <n>): enf
 
 ## The orphan sweeper
 
-Every [`CODESTORAGE_SWEEP_INTERVAL`](../reference/configuration.md#codestorage_sweep_interval)
+Every [`OPENSTORAGE_SWEEP_INTERVAL`](../reference/configuration.md#openstorage_sweep_interval)
 (default 1h), a sweep job: heals the quarantine, prunes expired quota reservations, then
 streams the bucket's `packs/` and `lfs/` listings and classifies every blob against its
 registry (pack rows for pack keys, LFS rows for LFS keys). Blobs with no registry row
 that are older than
-[`CODESTORAGE_SWEEP_AGE_THRESHOLD`](../reference/configuration.md#codestorage_sweep_age_threshold)
+[`OPENSTORAGE_SWEEP_AGE_THRESHOLD`](../reference/configuration.md#openstorage_sweep_age_threshold)
 (default 24h) are orphan candidates.
 
 Four independent knobs control what a sweep may *do*:
@@ -243,29 +243,29 @@ Four independent knobs control what a sweep may *do*:
 | Mode | Default | Acts on |
 |---|---|---|
 | List-only (no flag) | **active** | Reports orphans of every class, deletes nothing |
-| [`CODESTORAGE_SWEEP_DELETE_SUPERSEDED`](../reference/configuration.md#codestorage_sweep_delete_superseded) | `true` | Only blobs a repack fold provably superseded (durable `pack_retained` records); reclaims their quota bytes |
-| [`CODESTORAGE_SWEEP_DELETE_ENABLED`](../reference/configuration.md#codestorage_sweep_delete_enabled) | `false` | General pack orphans (crashed pushes, lost races) — the risky class, hence opt-in |
-| [`CODESTORAGE_SWEEP_DELETE_LFS`](../reference/configuration.md#codestorage_sweep_delete_lfs) | `false` | LFS orphans — separate from the pack opt-in because of the [pre-registry caveat](#lfs-orphans-and-pre-registry-objects); legacy-spelled keys additionally need the flag below |
-| [`CODESTORAGE_SWEEP_DELETE_LFS_LEGACY`](../reference/configuration.md#codestorage_sweep_delete_lfs_legacy) | `false` | Legacy-spelled LFS keys (ADR-41): the post-roll cleanup opt-in — off, no sweep mode deletes them (retained adoption sources feed old replicas' reads mid-roll) |
+| [`OPENSTORAGE_SWEEP_DELETE_SUPERSEDED`](../reference/configuration.md#openstorage_sweep_delete_superseded) | `true` | Only blobs a repack fold provably superseded (durable `pack_retained` records); reclaims their quota bytes |
+| [`OPENSTORAGE_SWEEP_DELETE_ENABLED`](../reference/configuration.md#openstorage_sweep_delete_enabled) | `false` | General pack orphans (crashed pushes, lost races) — the risky class, hence opt-in |
+| [`OPENSTORAGE_SWEEP_DELETE_LFS`](../reference/configuration.md#openstorage_sweep_delete_lfs) | `false` | LFS orphans — separate from the pack opt-in because of the [pre-registry caveat](#lfs-orphans-and-pre-registry-objects); legacy-spelled keys additionally need the flag below |
+| [`OPENSTORAGE_SWEEP_DELETE_LFS_LEGACY`](../reference/configuration.md#openstorage_sweep_delete_lfs_legacy) | `false` | Legacy-spelled LFS keys (ADR-41): the post-roll cleanup opt-in — off, no sweep mode deletes them (retained adoption sources feed old replicas' reads mid-roll) |
 
 ### LFS orphans and pre-registry objects
 
 The LFS registry (which upload settlement writes) was introduced with
-[#51](https://github.com/coder/code-storage/issues/51): **every LFS object uploaded by
+[#51](https://github.com/coder/open-storage/issues/51): **every LFS object uploaded by
 an older build has no registry row** and therefore shows up as an orphan candidate,
 however live its pointers are. That is why LFS deletion is a separate opt-in and is not
-covered by `CODESTORAGE_SWEEP_DELETE_ENABLED`. Stored objects are adopted into the
+covered by `OPENSTORAGE_SWEEP_DELETE_ENABLED`. Stored objects are adopted into the
 registry whenever a write-scoped touch sees them (an upload batch naming the object, or
 a re-upload of the same content) — after a one-time sha256 verification, since
 presigned-era uploads never proved their content: a mismatched legacy blob is removed
 and re-uploaded through the verified path instead of adopted. With a
-[storage quota](../reference/configuration.md#codestorage_pack_quota_bytes) enforced,
+[storage quota](../reference/configuration.md#openstorage_pack_quota_bytes) enforced,
 the migration copy passes real quota admission — the retained legacy source keeps
 counting until this sweeper reclaims it, so adopting an object needs headroom for a
 second copy and answers `507` at the quota edge (free space, raise the quota, or run
 the post-roll cleanup to migrate it). Active repositories
 therefore converge on their own. Before
-setting `CODESTORAGE_SWEEP_DELETE_LFS=true`, run list-only until the candidate lines
+setting `OPENSTORAGE_SWEEP_DELETE_LFS=true`, run list-only until the candidate lines
 stop naming objects that should live; re-pushing a repository's LFS content (batch
 adoption skips re-transfers of stored objects) is the fastest way to backfill a
 repository you cannot afford to lose objects from.
@@ -333,7 +333,7 @@ worker holds the object's claim) keeps its backup for the next sweep to re-exami
 On a bucket with versioning enabled (or suspended), deletes only write delete markers —
 every version stays stored and billed, so "reclaimed" bytes would be a lie:
 
-- `CODESTORAGE_SWEEP_DELETE_ENABLED=true` and `CODESTORAGE_SWEEP_DELETE_LFS=true`
+- `OPENSTORAGE_SWEEP_DELETE_ENABLED=true` and `OPENSTORAGE_SWEEP_DELETE_LFS=true`
   **fail startup** against such a bucket (or when versioning state cannot be verified —
   grant `s3:GetBucketVersioning` or stay list-only).
 - The default superseded reap does not fail startup; each run re-checks and **downgrades
@@ -353,22 +353,23 @@ every version stays stored and billed, so "reclaimed" bytes would be a lie:
 > whose blob was just reaped and not notice, leaving that pack unavailable (failed
 > clones/hydrations for that repo) until the next sweep's heal pass restores it.
 > **List-only mode is safe on any fleet**, and if you must run pre-`EnsurePublished`
-> nodes, set `CODESTORAGE_SWEEP_DELETE_SUPERSEDED=false` as well — the safety argument is
-> the same for both destructive classes.
+> nodes, set `OPENSTORAGE_SWEEP_DELETE_SUPERSEDED=false` as well — the safety argument is
+> the same for both destructive classes. On pre-0.15 replicas, use the old spelling,
+> `CODESTORAGE_SWEEP_DELETE_SUPERSEDED=false`; those binaries do not recognize the new prefix.
 
 A conservative enablement sequence:
 
-1. Audit first: leave `CODESTORAGE_SWEEP_DELETE_ENABLED=false` (the default) for at
+1. Audit first: leave `OPENSTORAGE_SWEEP_DELETE_ENABLED=false` (the default) for at
    least one age-threshold window; watch [sweep reports](#reading-a-sweep-report) and
    audit the candidate lines. Note the out-of-the-box default is list-only for *general*
    orphans only — superseded reaping is already on. If the audit window must be fully
-   non-destructive, set `CODESTORAGE_SWEEP_DELETE_SUPERSEDED=false` for its duration and
+   non-destructive, set `OPENSTORAGE_SWEEP_DELETE_SUPERSEDED=false` for its duration and
    restore it afterward.
 2. Confirm the whole fleet — including any node that executes git hooks — is on a current
    build (see the prerequisite above).
-3. Leave `CODESTORAGE_SWEEP_DELETE_SUPERSEDED=true` (the default) so repack-superseded
+3. Leave `OPENSTORAGE_SWEEP_DELETE_SUPERSEDED=true` (the default) so repack-superseded
    bytes are reclaimed and quota headroom returns.
-4. Opt into `CODESTORAGE_SWEEP_DELETE_ENABLED=true` only if orphan bytes materially
+4. Opt into `OPENSTORAGE_SWEEP_DELETE_ENABLED=true` only if orphan bytes materially
    accumulate — crashed pushes are rare, so for many deployments list-only is a fine
    permanent state.
 5. After the first delete-enabled sweeps, check `deleted` matches the candidates you
@@ -381,9 +382,9 @@ A conservative enablement sequence:
 Registered LFS objects are permanent by default: the sweeper treats every
 registered row as live, and nothing in the normal lifecycle deletes one. That
 permanence has a failure mode
-([#73](https://github.com/coder/code-storage/issues/73)): a `git:write` holder
+([#73](https://github.com/coder/open-storage/issues/73)): a `git:write` holder
 can direct-PUT up to the per-repo object cap
-([`CODESTORAGE_LFS_MAX_OBJECTS_PER_REPO`](../reference/configuration.md#codestorage_lfs_max_objects_per_repo),
+([`OPENSTORAGE_LFS_MAX_OBJECTS_PER_REPO`](../reference/configuration.md#openstorage_lfs_max_objects_per_repo),
 default 100,000) in *tiny* objects nobody references — a few hundred kilobytes
 of actual bytes — after which every **new** LFS object answers `507` for every
 collaborator, indefinitely.
@@ -393,20 +394,20 @@ The reclamation job
 closes the loop with reachability: an LFS object is *referenced* when some
 reachable ref in the repository's namespace group carries a pointer file
 naming its OID. Every
-[`CODESTORAGE_LFS_GC_INTERVAL`](../reference/configuration.md#codestorage_lfs_gc_interval)
+[`OPENSTORAGE_LFS_GC_INTERVAL`](../reference/configuration.md#openstorage_lfs_gc_interval)
 (unset by default — the job is opt-in), a run:
 
 1. pages repositories holding LFS objects from a rotating cursor, pinning each
    namespace group's ref generations;
 2. hydrates their git caches and walks `git rev-list --objects` across all
    reachable refs, decoding pointer-sized blobs, within
-   [`CODESTORAGE_LFS_GC_OBJECT_BUDGET`](../reference/configuration.md#codestorage_lfs_gc_object_budget)
+   [`OPENSTORAGE_LFS_GC_OBJECT_BUDGET`](../reference/configuration.md#openstorage_lfs_gc_object_budget)
    for the whole run (a partial walk never marks or retires anything);
 3. clears the *unreferenced-since* stamp on rows whose OIDs the walk found,
    stamps rows it did not, and — only with
-   [`CODESTORAGE_LFS_GC_DELETE_ENABLED`](../reference/configuration.md#codestorage_lfs_gc_delete_enabled) —
+   [`OPENSTORAGE_LFS_GC_DELETE_ENABLED`](../reference/configuration.md#openstorage_lfs_gc_delete_enabled) —
    retires rows whose stamp survived a full
-   [`CODESTORAGE_LFS_GC_GRACE`](../reference/configuration.md#codestorage_lfs_gc_grace)
+   [`OPENSTORAGE_LFS_GC_GRACE`](../reference/configuration.md#openstorage_lfs_gc_grace)
    window. The freed object count and quota bytes are refunded
    separately: each retirement parks its refund durably, and a later run
    settles it once a destructive LFS sweep that **started after** the
@@ -428,12 +429,12 @@ Two operational notes:
 - **Rows and bytes retire together.** Retirement deletes registry rows; the
   blobs become ordinary rowless orphans that the [sweeper](#the-orphan-sweeper)
   reaps under its own aged, quarantine-first delete gates
-  (`CODESTORAGE_SWEEP_DELETE_LFS`, plus the ADR-41 legacy gate for
+  (`OPENSTORAGE_SWEEP_DELETE_LFS`, plus the ADR-41 legacy gate for
   v0.2.0-spelled keys). The coupling is enforced twice. Startup validates
-  the CONFIGURED regime: arming `CODESTORAGE_LFS_GC_DELETE_ENABLED` on a
+  the CONFIGURED regime: arming `OPENSTORAGE_LFS_GC_DELETE_ENABLED` on a
   live sweep schedule requires the LFS reap and a grace no shorter than the
-  reap cadence (max(`CODESTORAGE_SWEEP_AGE_THRESHOLD`,
-  `CODESTORAGE_SWEEP_INTERVAL`, the 1-hour quarantine retention floor)) —
+  reap cadence (max(`OPENSTORAGE_SWEEP_AGE_THRESHOLD`,
+  `OPENSTORAGE_SWEEP_INTERVAL`, the 1-hour quarantine retention floor)) —
   refunded cap slots whose blobs (or quarantine backups) nothing deletes in
   time would let upload → retire → re-upload cycles grow the storage
   prefixes past the cap that quota floors and sweep listings rely on. At
@@ -447,7 +448,7 @@ Two operational notes:
   listing that reports no mod time for an offered candidate — its age is
   unknowable, so it is skipped, not reaped) therefore
   freeze refunds automatically until a clean destructive pass completes;
-  the sweep emergency stop (`CODESTORAGE_SWEEP_INTERVAL=0`) is just the
+  the sweep emergency stop (`OPENSTORAGE_SWEEP_INTERVAL=0`) is just the
   planned instance of the same demotion. A fresh deployment stays
   report-only until its first clean destructive LFS sweep completes. The
   same observed coupling gates each refund individually: a completion
@@ -477,25 +478,25 @@ Two operational notes:
   stored" on the batch/PUT surfaces. A pre-reclamation replica answers
   without clearing, so a client it just told "stored" can lose the row to a
   retirement racing its pointer push — and report-only mode on the workers
-  does not close that race. Do not set `CODESTORAGE_LFS_GC_DELETE_ENABLED`
+  does not close that race. Do not set `OPENSTORAGE_LFS_GC_DELETE_ENABLED`
   until every replica serving LFS requests runs a build with this feature
   (mixed-fleet staging, same as the
   [sweep delete flags](#the-orphan-sweeper)). If report-only scans ran
   **during** the roll, the marks they stamped may already be grace-expired
   when the roll finishes, while the last pre-touch replica's final "stored"
   answers revoke nothing at shutdown: wait one full
-  `CODESTORAGE_LFS_GC_GRACE` after the last pre-touch replica stops before
+  `OPENSTORAGE_LFS_GC_GRACE` after the last pre-touch replica stops before
   arming deletes, so every promise an old replica issued has had its full
-  window to become a pushed pointer. Leaving `CODESTORAGE_LFS_GC_INTERVAL`
+  window to become a pushed pointer. Leaving `OPENSTORAGE_LFS_GC_INTERVAL`
   unset until the fleet is upgraded avoids the drain step entirely — no
   scan, no marks.
-- **Stage the rollout.** Leave `CODESTORAGE_LFS_GC_DELETE_ENABLED` off first
+- **Stage the rollout.** Leave `OPENSTORAGE_LFS_GC_DELETE_ENABLED` off first
   and watch the run reports: `rows_eligible` is what a delete-enabled run
   would have retired. An actively abusive writer can keep re-uploading junk
   to reset its grace clocks — reclamation converges the moment the abuse
   stops; revoke the token to stop it now. For an immediate unwedge without
   waiting for any grace window, raise
-  [`CODESTORAGE_LFS_MAX_OBJECTS_PER_REPO`](../reference/configuration.md#codestorage_lfs_max_objects_per_repo).
+  [`OPENSTORAGE_LFS_MAX_OBJECTS_PER_REPO`](../reference/configuration.md#openstorage_lfs_max_objects_per_repo).
 
 A reclamation run logs one `lfs reclaim pass finished` line:
 
@@ -508,9 +509,9 @@ A reclamation run logs one `lfs reclaim pass finished` line:
 | `rows_in_grace` | unreferenced rows still inside the grace window |
 | `rows_eligible` / `rows_retired` / `rows_spared` | grace-expired rows; how many actually retired; how many the guarded delete declined at the last moment (concurrent touch, ref movement, purge fence) |
 | `bytes_retired` | quota bytes refunded |
-| `dry_run` | `true` while `CODESTORAGE_LFS_GC_DELETE_ENABLED` is off |
+| `dry_run` | `true` while `OPENSTORAGE_LFS_GC_DELETE_ENABLED` is off |
 | `reap_watermark_stale` / `rows_deferred_reap_stale` | `true` (and the eligible rows deferred) when no destructive LFS sweep completed cleanly within the grace window — refunds resume once one does |
-| `rows_deferred_legacy_unarmed` | eligible LEGACY-spelled rows deferred because legacy reaping is not armed end-to-end (`CODESTORAGE_SWEEP_DELETE_LFS_LEGACY` off, or the fresh watermark records a legacy-unarmed sweep) — their blobs would never be physically reaped, so the slot refund would be unbacked |
+| `rows_deferred_legacy_unarmed` | eligible LEGACY-spelled rows deferred because legacy reaping is not armed end-to-end (`OPENSTORAGE_SWEEP_DELETE_LFS_LEGACY` off, or the fresh watermark records a legacy-unarmed sweep) — their blobs would never be physically reaped, so the slot refund would be unbacked |
 
 Scan progress is fleet-durable: the rotation cursor and each repository's
 row-settlement resume point persist in the ref store (`job_scan_state`), so
@@ -525,7 +526,7 @@ cursor row for a repository that will never be scanned again.
 
 ## Reconciling registered-but-missing bytes
 
-Every deletion path in codestorage quarantines before it deletes and heals
+Every deletion path in open.storage quarantines before it deletes and heals
 through digest-verified restores, so the registry and blob storage normally
 never disagree. Storage-layer data loss — a bucket lifecycle rule, an
 operator `rm`, a storage incident — can still leave a **registered row whose
@@ -534,7 +535,7 @@ bytes are physically absent**. That state is doubly bad:
 - **Integrity:** a missing registered pack may be referenced by committed
   refs (clones fail); a missing LFS object 404s until a restore source
   appears.
-- **Quota visibility** ([#101](https://github.com/coder/code-storage/issues/101)):
+- **Quota visibility** ([#101](https://github.com/coder/open-storage/issues/101)):
   the admission floor is `max(0, listing − counter)`, and the counter still
   includes the absent bytes the listing lacks — the floor deflates by the
   missing size, hiding up to that many rowless legacy bytes from admission.
@@ -545,7 +546,7 @@ bytes are physically absent**. That state is doubly bad:
 The absence reconciliation job
 ([ADR-43](../adr/043-absence-reconciliation-covers-registered-but-missing-bytes.md))
 closes that window to one pass. Enable it with
-[`CODESTORAGE_ABSENCE_RECONCILE_INTERVAL`](../reference/configuration.md#codestorage_absence_reconcile_interval);
+[`OPENSTORAGE_ABSENCE_RECONCILE_INTERVAL`](../reference/configuration.md#openstorage_absence_reconcile_interval);
 each pass pages `lfs_objects` and `packs` rows from persistent-shape keyset
 cursors (budget-limited, resumable — the sweeper's inverse direction) and
 `HEAD`s each row's blob:

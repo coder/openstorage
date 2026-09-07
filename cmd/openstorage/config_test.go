@@ -17,14 +17,18 @@ import (
 	"testing"
 	"time"
 
-	"github.com/coder/code-storage/internal/auth"
-	"github.com/coder/code-storage/internal/jobs"
-	"github.com/coder/code-storage/internal/ref"
+	"github.com/coder/open-storage/internal/auth"
+	"github.com/coder/open-storage/internal/jobs"
+	"github.com/coder/open-storage/internal/ref"
 )
 
-// mapEnv builds a getenv func from a fixed map (no process env mutation).
-func mapEnv(m map[string]string) func(string) string {
-	return func(k string) string { return m[k] }
+// mapEnv builds a presence-aware lookup from a fixed map (no process env
+// mutation); keys absent from the map read as unset.
+func mapEnv(m map[string]string) envLookup {
+	return func(k string) (string, bool) {
+		v, ok := m[k]
+		return v, ok
+	}
 }
 
 // spikeEnv is the minimal legacy environment the phase-0 spike used.
@@ -35,7 +39,7 @@ var spikeEnv = map[string]string{
 
 func TestEnvFirstPrecedence(t *testing.T) {
 	env := mapEnv(map[string]string{
-		"CODESTORAGE_PG_URL": "postgres://new",
+		"OPENSTORAGE_PG_URL": "postgres://new",
 		"PG_URL":             "postgres://legacy",
 	})
 	if got := envFirst(env, envPGURL...); got != "postgres://new" {
@@ -47,6 +51,44 @@ func TestEnvFirstPrecedence(t *testing.T) {
 	if got := envFirst(mapEnv(nil), envPGURL...); got != "" {
 		t.Fatalf("unset env should be empty, got %q", got)
 	}
+	// Present-but-empty canonical stops the chain: no silent legacy database.
+	env = mapEnv(map[string]string{
+		"OPENSTORAGE_PG_URL": "",
+		"SPIKE_PG_URL":       "postgres://spike",
+		"PG_URL":             "postgres://legacy",
+	})
+	if got := envFirst(env, envPGURL...); got != "" {
+		t.Fatalf("explicitly empty canonical name must win, got %q", got)
+	}
+	if got := envFirst(mapEnv(map[string]string{"SPIKE_PG_URL": "", "PG_URL": "postgres://legacy"}), envPGURL...); got != "" {
+		t.Fatalf("explicitly empty alias must stop the scan, got %q", got)
+	}
+}
+
+func TestResolveStorageURLsEmptyCanonicalStopsFallback(t *testing.T) {
+	env := map[string]string{
+		"OPENSTORAGE_PG_URL": "", "SPIKE_PG_URL": "postgres://spike", "PG_URL": "postgres://legacy",
+		"OPENSTORAGE_S3_URL": "", "SPIKE_S3_URL": "s3://spike", "BLOB_URL": "s3://legacy",
+	}
+	u, err := resolveStorageURLs(mapEnv(env), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u.dbURL != "" || u.blobURL != "" {
+		t.Fatalf("empty canonical URLs must not fall back to aliases: %+v", u)
+	}
+	// Without --data-dir the empty result fails startup instead of connecting elsewhere.
+	if _, err := resolveServeConfig(mapEnv(env), "", "", "/tmp/cache", ""); err == nil || !strings.Contains(err.Error(), "OPENSTORAGE_PG_URL") {
+		t.Fatalf("expected missing PG URL error, got %v", err)
+	}
+	// With --data-dir the empty canonical values derive local storage as documented.
+	u, err = resolveStorageURLs(mapEnv(env), t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(u.dbURL, "sqlite://") || !strings.HasPrefix(u.blobURL, "file://") {
+		t.Fatalf("data-dir derivation expected: %+v", u)
+	}
 }
 
 // TestResolveServeConfigZeroInfraPairing (issue #133 Phase 3): an s3wal
@@ -57,12 +99,12 @@ func TestEnvFirstPrecedence(t *testing.T) {
 // both URLs is the expected topology (packs/, lfs/, _wal/ coexist).
 func TestResolveServeConfigZeroInfraPairing(t *testing.T) {
 	base := map[string]string{
-		"CODESTORAGE_ORG":         "org1",
-		"CODESTORAGE_ORG_PUBKEYS": "/tmp/org.pub.pem",
-		"CODESTORAGE_PG_URL":      "s3wal://bkt?endpoint=http://127.0.0.1:8333&region=us-east-1",
+		"OPENSTORAGE_ORG":         "org1",
+		"OPENSTORAGE_ORG_PUBKEYS": "/tmp/org.pub.pem",
+		"OPENSTORAGE_PG_URL":      "s3wal://bkt?endpoint=http://127.0.0.1:8333&region=us-east-1",
 	}
 	t.Run("file blob refused", func(t *testing.T) {
-		env := map[string]string{"CODESTORAGE_S3_URL": "file:///var/blobs"}
+		env := map[string]string{"OPENSTORAGE_S3_URL": "file:///var/blobs"}
 		maps.Copy(env, base)
 		_, err := resolveServeConfig(mapEnv(env), "", "127.0.0.1:0", "/tmp/cache", "")
 		if err == nil || !strings.Contains(err.Error(), "s3://") {
@@ -79,7 +121,7 @@ func TestResolveServeConfigZeroInfraPairing(t *testing.T) {
 		}
 	})
 	t.Run("s3 blob accepted", func(t *testing.T) {
-		env := map[string]string{"CODESTORAGE_S3_URL": "s3://bkt?endpoint=http://127.0.0.1:8333"}
+		env := map[string]string{"OPENSTORAGE_S3_URL": "s3://bkt?endpoint=http://127.0.0.1:8333"}
 		maps.Copy(env, base)
 		cfg, err := resolveServeConfig(mapEnv(env), "", "127.0.0.1:0", "/tmp/cache", "")
 		if err != nil {
@@ -91,8 +133,8 @@ func TestResolveServeConfigZeroInfraPairing(t *testing.T) {
 	})
 	t.Run("non-s3wal untouched", func(t *testing.T) {
 		env := map[string]string{
-			"CODESTORAGE_ORG":         "org1",
-			"CODESTORAGE_ORG_PUBKEYS": "/tmp/org.pub.pem",
+			"OPENSTORAGE_ORG":         "org1",
+			"OPENSTORAGE_ORG_PUBKEYS": "/tmp/org.pub.pem",
 		}
 		if _, err := resolveServeConfig(mapEnv(env), "", "127.0.0.1:0", "/tmp/cache", t.TempDir()); err != nil {
 			t.Fatalf("local mode (sqlite + file) must keep resolving: %v", err)
@@ -111,10 +153,10 @@ func TestResolveServeConfigZeroInfraPairing(t *testing.T) {
 // stage the flags correctly.
 func TestResolveServeConfigCompatForbidsDestructiveLFSSweep(t *testing.T) {
 	env := map[string]string{
-		"CODESTORAGE_ORG":                   "org1",
-		"CODESTORAGE_ORG_PUBKEYS":           "/tmp/org.pub.pem",
-		"CODESTORAGE_LFS_V020_WRITE_COMPAT": "true",
-		"CODESTORAGE_SWEEP_DELETE_LFS":      "true",
+		"OPENSTORAGE_ORG":                   "org1",
+		"OPENSTORAGE_ORG_PUBKEYS":           "/tmp/org.pub.pem",
+		"OPENSTORAGE_LFS_V020_WRITE_COMPAT": "true",
+		"OPENSTORAGE_SWEEP_DELETE_LFS":      "true",
 	}
 	maps.Copy(env, spikeEnv)
 	if _, err := resolveServeConfig(mapEnv(env), "", "127.0.0.1:0", "/tmp/cache", ""); err == nil {
@@ -126,13 +168,13 @@ func TestResolveServeConfigCompatForbidsDestructiveLFSSweep(t *testing.T) {
 	// re-runs this validation — rejecting the combination would block
 	// the documented v0.2.0 rollout for operators who stop sweeping
 	// without also unsetting the stale delete preference.
-	env["CODESTORAGE_SWEEP_INTERVAL"] = "0"
+	env["OPENSTORAGE_SWEEP_INTERVAL"] = "0"
 	if _, err := resolveServeConfig(mapEnv(env), "", "127.0.0.1:0", "/tmp/cache", ""); err != nil {
 		t.Fatalf("write-compat + inert delete flag under the sweep emergency stop: %v", err)
 	}
-	delete(env, "CODESTORAGE_SWEEP_INTERVAL")
+	delete(env, "OPENSTORAGE_SWEEP_INTERVAL")
 	// Compat with list-only sweeping stays valid.
-	delete(env, "CODESTORAGE_SWEEP_DELETE_LFS")
+	delete(env, "OPENSTORAGE_SWEEP_DELETE_LFS")
 	if _, err := resolveServeConfig(mapEnv(env), "", "127.0.0.1:0", "/tmp/cache", ""); err != nil {
 		t.Fatalf("write-compat with list-only sweeping: %v", err)
 	}
@@ -148,46 +190,46 @@ func TestResolveServeConfigCompatForbidsDestructiveLFSSweep(t *testing.T) {
 // than the reap cadence.
 func TestResolveServeConfigLFSGCDeleteRequiresLFSReap(t *testing.T) {
 	env := map[string]string{
-		"CODESTORAGE_ORG":                   "org1",
-		"CODESTORAGE_ORG_PUBKEYS":           "/tmp/org.pub.pem",
-		"CODESTORAGE_LFS_GC_INTERVAL":       "1h",
-		"CODESTORAGE_LFS_GC_DELETE_ENABLED": "true",
+		"OPENSTORAGE_ORG":                   "org1",
+		"OPENSTORAGE_ORG_PUBKEYS":           "/tmp/org.pub.pem",
+		"OPENSTORAGE_LFS_GC_INTERVAL":       "1h",
+		"OPENSTORAGE_LFS_GC_DELETE_ENABLED": "true",
 	}
 	maps.Copy(env, spikeEnv)
 	if _, err := resolveServeConfig(mapEnv(env), "", "127.0.0.1:0", "/tmp/cache", ""); err == nil {
 		t.Fatal("delete-mode reclamation without the LFS reap resolved — retirement would refund cap slots while stranding their blobs")
 	}
-	env["CODESTORAGE_SWEEP_DELETE_LFS"] = "true"
+	env["OPENSTORAGE_SWEEP_DELETE_LFS"] = "true"
 	if _, err := resolveServeConfig(mapEnv(env), "", "127.0.0.1:0", "/tmp/cache", ""); err != nil {
 		t.Fatalf("delete-mode reclamation with the LFS reap armed: %v", err)
 	}
 	// A grace below the reap cadence retires slots faster than the reap
 	// frees their blobs — the same growth, restated as a transient.
-	env["CODESTORAGE_LFS_GC_GRACE"] = "1h" // < the 24h default age threshold
+	env["OPENSTORAGE_LFS_GC_GRACE"] = "1h" // < the 24h default age threshold
 	if _, err := resolveServeConfig(mapEnv(env), "", "127.0.0.1:0", "/tmp/cache", ""); err == nil {
 		t.Fatal("grace below the reap cadence resolved — refunds would outrun physical deletion")
 	}
-	env["CODESTORAGE_SWEEP_AGE_THRESHOLD"] = "30m" // floor becomes the 1h sweep interval
-	env["CODESTORAGE_LFS_GC_GRACE"] = "1h"
+	env["OPENSTORAGE_SWEEP_AGE_THRESHOLD"] = "30m" // floor becomes the 1h sweep interval
+	env["OPENSTORAGE_LFS_GC_GRACE"] = "1h"
 	if _, err := resolveServeConfig(mapEnv(env), "", "127.0.0.1:0", "/tmp/cache", ""); err != nil {
 		t.Fatalf("grace at the reap cadence: %v", err)
 	}
 	// Quarantine retention binds the floor even when both configured
 	// cadences sit below it (security round 14): every reap strands a
 	// quarantine copy for at least jobs.QuarantinePurgeFloor (1h).
-	env["CODESTORAGE_SWEEP_INTERVAL"] = "20m"
-	env["CODESTORAGE_LFS_GC_GRACE"] = "45m" // ≥ max(30m, 20m), < 1h quarantine floor
+	env["OPENSTORAGE_SWEEP_INTERVAL"] = "20m"
+	env["OPENSTORAGE_LFS_GC_GRACE"] = "45m" // ≥ max(30m, 20m), < 1h quarantine floor
 	if _, err := resolveServeConfig(mapEnv(env), "", "127.0.0.1:0", "/tmp/cache", ""); err == nil {
 		t.Fatal("grace below the quarantine retention floor resolved — reaps would strand quarantine generations faster than purging frees them")
 	}
-	env["CODESTORAGE_LFS_GC_GRACE"] = "1h"
+	env["OPENSTORAGE_LFS_GC_GRACE"] = "1h"
 	if _, err := resolveServeConfig(mapEnv(env), "", "127.0.0.1:0", "/tmp/cache", ""); err != nil {
 		t.Fatalf("grace at the quarantine floor: %v", err)
 	}
 	// The fleet-wide sweep emergency stop stays available: with the
 	// schedule stopped the delete flag demotes to report-only at wiring
 	// instead of failing startup.
-	env["CODESTORAGE_SWEEP_INTERVAL"] = "0"
+	env["OPENSTORAGE_SWEEP_INTERVAL"] = "0"
 	if _, err := resolveServeConfig(mapEnv(env), "", "127.0.0.1:0", "/tmp/cache", ""); err != nil {
 		t.Fatalf("sweep emergency stop with armed reclamation delete: %v", err)
 	}
@@ -197,8 +239,8 @@ func TestResolveServeConfigLegacyEnvCompat(t *testing.T) {
 	// Legacy PG_URL/BLOB_URL names and the --addr alias still resolve; the
 	// org config is mandatory since ADR-8 dropped git-only serve mode.
 	env := map[string]string{
-		"CODESTORAGE_ORG":         "org1",
-		"CODESTORAGE_ORG_PUBKEYS": "/tmp/org.pub.pem",
+		"OPENSTORAGE_ORG":         "org1",
+		"OPENSTORAGE_ORG_PUBKEYS": "/tmp/org.pub.pem",
 	}
 	maps.Copy(env, spikeEnv)
 	cfg, err := resolveServeConfig(mapEnv(env), "", "127.0.0.1:0", "/tmp/cache", "")
@@ -215,11 +257,11 @@ func TestResolveServeConfigLegacyEnvCompat(t *testing.T) {
 
 func TestResolveServeConfigCanonicalEnv(t *testing.T) {
 	env := mapEnv(map[string]string{
-		"CODESTORAGE_PG_URL":      "postgres://new",
-		"CODESTORAGE_S3_URL":      "s3://new",
-		"CODESTORAGE_LISTEN":      "127.0.0.1:8199",
-		"CODESTORAGE_ORG":         "selfhost",
-		"CODESTORAGE_ORG_PUBKEYS": "/tmp/org.pub.pem",
+		"OPENSTORAGE_PG_URL":      "postgres://new",
+		"OPENSTORAGE_S3_URL":      "s3://new",
+		"OPENSTORAGE_LISTEN":      "127.0.0.1:8199",
+		"OPENSTORAGE_ORG":         "selfhost",
+		"OPENSTORAGE_ORG_PUBKEYS": "/tmp/org.pub.pem",
 		"PG_URL":                  "postgres://legacy",
 		"BLOB_URL":                "s3://legacy",
 	})
@@ -228,7 +270,7 @@ func TestResolveServeConfigCanonicalEnv(t *testing.T) {
 		t.Fatal(err)
 	}
 	if cfg.dbURL != "postgres://new" || cfg.blobURL != "s3://new" {
-		t.Fatalf("CODESTORAGE_* must beat legacy names: %+v", cfg)
+		t.Fatalf("OPENSTORAGE_* must beat legacy names: %+v", cfg)
 	}
 	if cfg.listen != "127.0.0.1:8199" {
 		t.Fatalf("env listen not honored: %+v", cfg)
@@ -243,8 +285,8 @@ func TestResolveServeConfigCanonicalEnv(t *testing.T) {
 
 func TestResolveServeConfigListenPrecedence(t *testing.T) {
 	env := map[string]string{
-		"PG_URL": "p", "BLOB_URL": "b", "CODESTORAGE_LISTEN": "env:1",
-		"CODESTORAGE_ORG": "o", "CODESTORAGE_ORG_PUBKEYS": "/k",
+		"PG_URL": "p", "BLOB_URL": "b", "OPENSTORAGE_LISTEN": "env:1",
+		"OPENSTORAGE_ORG": "o", "OPENSTORAGE_ORG_PUBKEYS": "/k",
 	}
 	cfg, err := resolveServeConfig(mapEnv(env), "flag:1", "addr:1", "", "")
 	if err != nil {
@@ -260,7 +302,7 @@ func TestResolveServeConfigListenPrecedence(t *testing.T) {
 	if cfg.listen != "addr:1" {
 		t.Fatalf("--addr must beat env, got %q", cfg.listen)
 	}
-	delete(env, "CODESTORAGE_LISTEN")
+	delete(env, "OPENSTORAGE_LISTEN")
 	cfg, err = resolveServeConfig(mapEnv(env), "", "", "", "")
 	if err != nil {
 		t.Fatal(err)
@@ -272,9 +314,9 @@ func TestResolveServeConfigListenPrecedence(t *testing.T) {
 
 func TestResolveServeConfigDataDir(t *testing.T) {
 	orgEnv := map[string]string{
-		"CODESTORAGE_ORG": "o", "CODESTORAGE_ORG_PUBKEYS": "/k",
+		"OPENSTORAGE_ORG": "o", "OPENSTORAGE_ORG_PUBKEYS": "/k",
 	}
-	withOrg := func(extra map[string]string) func(string) string {
+	withOrg := func(extra map[string]string) envLookup {
 		m := map[string]string{}
 		maps.Copy(m, orgEnv)
 		maps.Copy(m, extra)
@@ -301,7 +343,7 @@ func TestResolveServeConfigDataDir(t *testing.T) {
 	})
 
 	t.Run("env sets the data dir", func(t *testing.T) {
-		cfg, err := resolveServeConfig(withOrg(map[string]string{"CODESTORAGE_DATA_DIR": "/envdata"}), "", "", "", "")
+		cfg, err := resolveServeConfig(withOrg(map[string]string{"OPENSTORAGE_DATA_DIR": "/envdata"}), "", "", "", "")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -314,7 +356,7 @@ func TestResolveServeConfigDataDir(t *testing.T) {
 	})
 
 	t.Run("flag beats env", func(t *testing.T) {
-		cfg, err := resolveServeConfig(withOrg(map[string]string{"CODESTORAGE_DATA_DIR": "/envdata"}), "", "", "", "/flagdata")
+		cfg, err := resolveServeConfig(withOrg(map[string]string{"OPENSTORAGE_DATA_DIR": "/envdata"}), "", "", "", "/flagdata")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -325,8 +367,8 @@ func TestResolveServeConfigDataDir(t *testing.T) {
 
 	t.Run("explicit slots win over derivation", func(t *testing.T) {
 		cfg, err := resolveServeConfig(withOrg(map[string]string{
-			"CODESTORAGE_PG_URL": "postgres://explicit",
-			"CODESTORAGE_S3_URL": "s3://explicit",
+			"OPENSTORAGE_PG_URL": "postgres://explicit",
+			"OPENSTORAGE_S3_URL": "s3://explicit",
 		}), "", "", "/explicit-cache", "/data")
 		if err != nil {
 			t.Fatal(err)
@@ -354,8 +396,8 @@ func TestResolveServeConfigDataDir(t *testing.T) {
 
 	t.Run("no urls and no data dir errors mentioning --data-dir", func(t *testing.T) {
 		_, err := resolveServeConfig(withOrg(nil), "", "", "", "")
-		if err == nil || !strings.Contains(err.Error(), "--data-dir") || !strings.Contains(err.Error(), "CODESTORAGE_DATA_DIR") {
-			t.Fatalf("want error naming --data-dir/CODESTORAGE_DATA_DIR as the local-mode alternative, got %v", err)
+		if err == nil || !strings.Contains(err.Error(), "--data-dir") || !strings.Contains(err.Error(), "OPENSTORAGE_DATA_DIR") {
+			t.Fatalf("want error naming --data-dir/OPENSTORAGE_DATA_DIR as the local-mode alternative, got %v", err)
 		}
 	})
 }
@@ -382,8 +424,8 @@ func TestResolveStorageURLs(t *testing.T) {
 
 	t.Run("env urls beat derivation", func(t *testing.T) {
 		u, err := resolveStorageURLs(mapEnv(map[string]string{
-			"CODESTORAGE_PG_URL": "postgres://explicit",
-			"CODESTORAGE_S3_URL": "s3://explicit",
+			"OPENSTORAGE_PG_URL": "postgres://explicit",
+			"OPENSTORAGE_S3_URL": "s3://explicit",
 		}), "/data")
 		if err != nil {
 			t.Fatal(err)
@@ -394,7 +436,7 @@ func TestResolveStorageURLs(t *testing.T) {
 	})
 
 	t.Run("env data dir honored without flag", func(t *testing.T) {
-		u, err := resolveStorageURLs(mapEnv(map[string]string{"CODESTORAGE_DATA_DIR": "/envdata"}), "")
+		u, err := resolveStorageURLs(mapEnv(map[string]string{"OPENSTORAGE_DATA_DIR": "/envdata"}), "")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -430,10 +472,10 @@ func TestResolveServeConfigErrors(t *testing.T) {
 		env     map[string]string
 		wantSub string
 	}{
-		{"missing pg", map[string]string{"BLOB_URL": "b"}, "CODESTORAGE_PG_URL"},
-		{"missing blob", map[string]string{"PG_URL": "p"}, "CODESTORAGE_S3_URL"},
-		{"org without keys", map[string]string{"PG_URL": "p", "BLOB_URL": "b", "CODESTORAGE_ORG": "o"}, "must both be set"},
-		{"keys without org", map[string]string{"PG_URL": "p", "BLOB_URL": "b", "CODESTORAGE_ORG_PUBKEYS": "/o"}, "must both be set"},
+		{"missing pg", map[string]string{"BLOB_URL": "b"}, "OPENSTORAGE_PG_URL"},
+		{"missing blob", map[string]string{"PG_URL": "p"}, "OPENSTORAGE_S3_URL"},
+		{"org without keys", map[string]string{"PG_URL": "p", "BLOB_URL": "b", "OPENSTORAGE_ORG": "o"}, "must both be set"},
+		{"keys without org", map[string]string{"PG_URL": "p", "BLOB_URL": "b", "OPENSTORAGE_ORG_PUBKEYS": "/o"}, "must both be set"},
 		{"no org config at all", map[string]string{"PG_URL": "p", "BLOB_URL": "b"}, "must both be set"},
 	}
 	for _, tc := range cases {
@@ -449,10 +491,10 @@ func TestResolveServeConfigErrors(t *testing.T) {
 func TestResolveServeConfigBaseURL(t *testing.T) {
 	base := map[string]string{
 		"PG_URL": "p", "BLOB_URL": "b",
-		"CODESTORAGE_ORG": "o", "CODESTORAGE_ORG_PUBKEYS": "/k",
+		"OPENSTORAGE_ORG": "o", "OPENSTORAGE_ORG_PUBKEYS": "/k",
 	}
-	env := func(baseURL string) func(string) string {
-		m := map[string]string{"CODESTORAGE_BASE_URL": baseURL}
+	env := func(baseURL string) envLookup {
+		m := map[string]string{"OPENSTORAGE_BASE_URL": baseURL}
 		maps.Copy(m, base)
 		return mapEnv(m)
 	}
@@ -483,8 +525,8 @@ func TestResolveServeConfigBaseURL(t *testing.T) {
 
 	// Invalid values fail fast at startup, naming the env var.
 	for _, raw := range []string{"not-a-url", "ftp://x", "http://", "http://h?x=1", "http://h#frag"} {
-		if _, err := resolveServeConfig(env(raw), "", "", "", ""); err == nil || !strings.Contains(err.Error(), "CODESTORAGE_BASE_URL") {
-			t.Fatalf("%q: want CODESTORAGE_BASE_URL error, got %v", raw, err)
+		if _, err := resolveServeConfig(env(raw), "", "", "", ""); err == nil || !strings.Contains(err.Error(), "OPENSTORAGE_BASE_URL") {
+			t.Fatalf("%q: want OPENSTORAGE_BASE_URL error, got %v", raw, err)
 		}
 	}
 }
@@ -540,12 +582,12 @@ func TestSplitPEMBlocks(t *testing.T) {
 }
 
 func TestResolveServeConfigRateLimit(t *testing.T) {
-	base := func(extra map[string]string) func(string) string {
+	base := func(extra map[string]string) envLookup {
 		env := map[string]string{
-			"CODESTORAGE_PG_URL":      "postgres://x",
-			"CODESTORAGE_S3_URL":      "s3://x",
-			"CODESTORAGE_ORG":         "org1",
-			"CODESTORAGE_ORG_PUBKEYS": "/tmp/org.pub.pem",
+			"OPENSTORAGE_PG_URL":      "postgres://x",
+			"OPENSTORAGE_S3_URL":      "s3://x",
+			"OPENSTORAGE_ORG":         "org1",
+			"OPENSTORAGE_ORG_PUBKEYS": "/tmp/org.pub.pem",
 		}
 		maps.Copy(env, extra)
 		return mapEnv(env)
@@ -615,12 +657,12 @@ func TestResolveServeConfigRateLimit(t *testing.T) {
 }
 
 func TestResolveServeConfigTrustedProxies(t *testing.T) {
-	base := func(extra map[string]string) func(string) string {
+	base := func(extra map[string]string) envLookup {
 		env := map[string]string{
-			"CODESTORAGE_PG_URL":      "postgres://x",
-			"CODESTORAGE_S3_URL":      "s3://x",
-			"CODESTORAGE_ORG":         "org1",
-			"CODESTORAGE_ORG_PUBKEYS": "/tmp/org.pub.pem",
+			"OPENSTORAGE_PG_URL":      "postgres://x",
+			"OPENSTORAGE_S3_URL":      "s3://x",
+			"OPENSTORAGE_ORG":         "org1",
+			"OPENSTORAGE_ORG_PUBKEYS": "/tmp/org.pub.pem",
 		}
 		maps.Copy(env, extra)
 		return mapEnv(env)
@@ -657,7 +699,7 @@ func TestResolveServeConfigTrustedProxies(t *testing.T) {
 		}
 	})
 
-	// Validated even without CODESTORAGE_RATE_* set: a typo must surface at
+	// Validated even without OPENSTORAGE_RATE_* set: a typo must surface at
 	// startup, not when limits are later enabled.
 	for name, val := range map[string]string{
 		"malformed-cidr": "10.0.0.0/33",
@@ -682,12 +724,12 @@ func TestResolveServeConfigTrustedProxies(t *testing.T) {
 }
 
 func TestResolveServeConfigPackQuota(t *testing.T) {
-	base := func(extra map[string]string) func(string) string {
+	base := func(extra map[string]string) envLookup {
 		env := map[string]string{
-			"CODESTORAGE_PG_URL":      "postgres://x",
-			"CODESTORAGE_S3_URL":      "s3://x",
-			"CODESTORAGE_ORG":         "org1",
-			"CODESTORAGE_ORG_PUBKEYS": "/tmp/org.pub.pem",
+			"OPENSTORAGE_PG_URL":      "postgres://x",
+			"OPENSTORAGE_S3_URL":      "s3://x",
+			"OPENSTORAGE_ORG":         "org1",
+			"OPENSTORAGE_ORG_PUBKEYS": "/tmp/org.pub.pem",
 		}
 		maps.Copy(env, extra)
 		return mapEnv(env)
@@ -747,12 +789,12 @@ func TestResolveServeConfigPackQuota(t *testing.T) {
 // covering objects published after that listing, and a subsequent writer
 // sees neither the orphaned bytes nor a live reservation.
 func TestResolveServeConfigPackReservationTTL(t *testing.T) {
-	base := func(extra map[string]string) func(string) string {
+	base := func(extra map[string]string) envLookup {
 		env := map[string]string{
-			"CODESTORAGE_PG_URL":      "postgres://x",
-			"CODESTORAGE_S3_URL":      "s3://x",
-			"CODESTORAGE_ORG":         "org1",
-			"CODESTORAGE_ORG_PUBKEYS": "/tmp/org.pub.pem",
+			"OPENSTORAGE_PG_URL":      "postgres://x",
+			"OPENSTORAGE_S3_URL":      "s3://x",
+			"OPENSTORAGE_ORG":         "org1",
+			"OPENSTORAGE_ORG_PUBKEYS": "/tmp/org.pub.pem",
 		}
 		maps.Copy(env, extra)
 		return mapEnv(env)
@@ -807,10 +849,10 @@ func TestResolveServeConfigS3WALLeaseTTL(t *testing.T) {
 	resolve := func(t *testing.T, dbURL, blobURL, leaseTTL string) (serveConfig, error) {
 		t.Helper()
 		return resolveServeConfig(mapEnv(map[string]string{
-			"CODESTORAGE_PG_URL":      dbURL,
-			"CODESTORAGE_S3_URL":      blobURL,
-			"CODESTORAGE_ORG":         "org1",
-			"CODESTORAGE_ORG_PUBKEYS": "/tmp/org.pub.pem",
+			"OPENSTORAGE_PG_URL":      dbURL,
+			"OPENSTORAGE_S3_URL":      blobURL,
+			"OPENSTORAGE_ORG":         "org1",
+			"OPENSTORAGE_ORG_PUBKEYS": "/tmp/org.pub.pem",
 			envS3WALLeaseTTL:          leaseTTL,
 		}), "", "", "/tmp/cache", "")
 	}
@@ -873,12 +915,12 @@ func TestResolveServeConfigS3WALLeaseTTL(t *testing.T) {
 }
 
 func TestResolveServeConfigLFSStaging(t *testing.T) {
-	base := func(extra map[string]string) func(string) string {
+	base := func(extra map[string]string) envLookup {
 		env := map[string]string{
-			"CODESTORAGE_PG_URL":      "postgres://x",
-			"CODESTORAGE_S3_URL":      "s3://x",
-			"CODESTORAGE_ORG":         "org1",
-			"CODESTORAGE_ORG_PUBKEYS": "/tmp/org.pub.pem",
+			"OPENSTORAGE_PG_URL":      "postgres://x",
+			"OPENSTORAGE_S3_URL":      "s3://x",
+			"OPENSTORAGE_ORG":         "org1",
+			"OPENSTORAGE_ORG_PUBKEYS": "/tmp/org.pub.pem",
 		}
 		maps.Copy(env, extra)
 		return mapEnv(env)
@@ -931,12 +973,12 @@ func TestResolveServeConfigLFSStaging(t *testing.T) {
 }
 
 func TestResolveServeConfigMaxPushBytes(t *testing.T) {
-	base := func(extra map[string]string) func(string) string {
+	base := func(extra map[string]string) envLookup {
 		env := map[string]string{
-			"CODESTORAGE_PG_URL":      "postgres://x",
-			"CODESTORAGE_S3_URL":      "s3://x",
-			"CODESTORAGE_ORG":         "org1",
-			"CODESTORAGE_ORG_PUBKEYS": "/tmp/org.pub.pem",
+			"OPENSTORAGE_PG_URL":      "postgres://x",
+			"OPENSTORAGE_S3_URL":      "s3://x",
+			"OPENSTORAGE_ORG":         "org1",
+			"OPENSTORAGE_ORG_PUBKEYS": "/tmp/org.pub.pem",
 		}
 		maps.Copy(env, extra)
 		return mapEnv(env)
@@ -1035,12 +1077,12 @@ func TestResolveServeConfigMaxPushBytes(t *testing.T) {
 }
 
 func TestResolveServeConfigVerifySigBudget(t *testing.T) {
-	base := func(extra map[string]string) func(string) string {
+	base := func(extra map[string]string) envLookup {
 		env := map[string]string{
-			"CODESTORAGE_PG_URL":      "postgres://x",
-			"CODESTORAGE_S3_URL":      "s3://x",
-			"CODESTORAGE_ORG":         "org1",
-			"CODESTORAGE_ORG_PUBKEYS": "/tmp/org.pub.pem",
+			"OPENSTORAGE_PG_URL":      "postgres://x",
+			"OPENSTORAGE_S3_URL":      "s3://x",
+			"OPENSTORAGE_ORG":         "org1",
+			"OPENSTORAGE_ORG_PUBKEYS": "/tmp/org.pub.pem",
 		}
 		maps.Copy(env, extra)
 		return mapEnv(env)
@@ -1093,12 +1135,12 @@ func TestResolveServeConfigVerifySigBudget(t *testing.T) {
 }
 
 func TestResolveServeConfigSweep(t *testing.T) {
-	base := func(extra map[string]string) func(string) string {
+	base := func(extra map[string]string) envLookup {
 		env := map[string]string{
-			"CODESTORAGE_PG_URL":      "postgres://x",
-			"CODESTORAGE_S3_URL":      "s3://x",
-			"CODESTORAGE_ORG":         "org1",
-			"CODESTORAGE_ORG_PUBKEYS": "/tmp/org.pub.pem",
+			"OPENSTORAGE_PG_URL":      "postgres://x",
+			"OPENSTORAGE_S3_URL":      "s3://x",
+			"OPENSTORAGE_ORG":         "org1",
+			"OPENSTORAGE_ORG_PUBKEYS": "/tmp/org.pub.pem",
 		}
 		maps.Copy(env, extra)
 		return mapEnv(env)
@@ -1189,12 +1231,12 @@ func TestResolveServeConfigSweep(t *testing.T) {
 }
 
 func TestResolveServeConfigRepackThreshold(t *testing.T) {
-	base := func(extra map[string]string) func(string) string {
+	base := func(extra map[string]string) envLookup {
 		env := map[string]string{
-			"CODESTORAGE_PG_URL":      "postgres://x",
-			"CODESTORAGE_S3_URL":      "s3://x",
-			"CODESTORAGE_ORG":         "org1",
-			"CODESTORAGE_ORG_PUBKEYS": "/tmp/org.pub.pem",
+			"OPENSTORAGE_PG_URL":      "postgres://x",
+			"OPENSTORAGE_S3_URL":      "s3://x",
+			"OPENSTORAGE_ORG":         "org1",
+			"OPENSTORAGE_ORG_PUBKEYS": "/tmp/org.pub.pem",
 		}
 		maps.Copy(env, extra)
 		return mapEnv(env)
@@ -1257,7 +1299,7 @@ func TestResolveWebhookAllowPrivate(t *testing.T) {
 		"malformed":             {raw: "sometimes", wantErr: true},
 	} {
 		t.Run(name, func(t *testing.T) {
-			got, err := resolveWebhookAllowPrivate(mapEnv(map[string]string{envWebhookAllowPrivate: tc.raw}))
+			got, err := resolveWebhookAllowPrivate(mapEnv(map[string]string{envWebhookAllowPrivate: tc.raw}).get)
 			if tc.wantErr {
 				if err == nil || !strings.Contains(err.Error(), envWebhookAllowPrivate) {
 					t.Fatalf("error = %v, want one naming %s", err, envWebhookAllowPrivate)
@@ -1318,7 +1360,7 @@ func TestResolveSyncEgress(t *testing.T) {
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
-			got, err := resolveSyncEgress(mapEnv(tc.env))
+			got, err := resolveSyncEgress(mapEnv(tc.env).get)
 			if tc.wantErr != "" {
 				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
 					t.Fatalf("error = %v, want one naming %s", err, tc.wantErr)
@@ -1356,7 +1398,7 @@ func TestResolveSecretsCodec(t *testing.T) {
 		"mode alone still rejected": {mode: "encrypt", wantNil: true},
 	} {
 		t.Run(name, func(t *testing.T) {
-			codec, err := resolveSecretsCodec(mapEnv(map[string]string{envSecretsKey: tc.key, envSecretsMode: tc.mode}))
+			codec, err := resolveSecretsCodec(mapEnv(map[string]string{envSecretsKey: tc.key, envSecretsMode: tc.mode}).get)
 			if tc.wantErrNaming != "" {
 				if err == nil || !strings.Contains(err.Error(), tc.wantErrNaming) {
 					t.Fatalf("error = %v, want one naming %s", err, tc.wantErrNaming)
@@ -1493,27 +1535,27 @@ func TestResolveAbsenceSettings(t *testing.T) {
 // covers lapse between renewals, reopening the window the job closes.
 func TestResolveServeConfigAbsenceIntervalTTLCoupling(t *testing.T) {
 	env := map[string]string{
-		"CODESTORAGE_ORG":                        "org1",
-		"CODESTORAGE_ORG_PUBKEYS":                "/tmp/org.pub.pem",
-		"CODESTORAGE_PACK_RESERVATION_TTL":       "90s",
-		"CODESTORAGE_ABSENCE_RECONCILE_INTERVAL": "60s",
+		"OPENSTORAGE_ORG":                        "org1",
+		"OPENSTORAGE_ORG_PUBKEYS":                "/tmp/org.pub.pem",
+		"OPENSTORAGE_PACK_RESERVATION_TTL":       "90s",
+		"OPENSTORAGE_ABSENCE_RECONCILE_INTERVAL": "60s",
 	}
 	maps.Copy(env, spikeEnv)
 	if _, err := resolveServeConfig(mapEnv(env), "", "127.0.0.1:0", "/tmp/cache", ""); err == nil {
 		t.Fatal("interval > TTL/2 resolved — covers would lapse between renewals")
 	}
-	env["CODESTORAGE_ABSENCE_RECONCILE_INTERVAL"] = "45s"
+	env["OPENSTORAGE_ABSENCE_RECONCILE_INTERVAL"] = "45s"
 	if _, err := resolveServeConfig(mapEnv(env), "", "127.0.0.1:0", "/tmp/cache", ""); err != nil {
 		t.Fatalf("interval = TTL/2 must resolve: %v", err)
 	}
 	// Overflow guard (Codex round 7): interval*2 on an absurd duration
 	// wraps negative; the division form must still reject it.
-	env["CODESTORAGE_ABSENCE_RECONCILE_INTERVAL"] = "2000000h"
+	env["OPENSTORAGE_ABSENCE_RECONCILE_INTERVAL"] = "2000000h"
 	if _, err := resolveServeConfig(mapEnv(env), "", "127.0.0.1:0", "/tmp/cache", ""); err == nil {
 		t.Fatal("overflow-scale interval resolved — the cadence bound must reject it")
 	}
 	// Disabled reconciliation never couples to the TTL.
-	env["CODESTORAGE_ABSENCE_RECONCILE_INTERVAL"] = "0"
+	env["OPENSTORAGE_ABSENCE_RECONCILE_INTERVAL"] = "0"
 	if _, err := resolveServeConfig(mapEnv(env), "", "127.0.0.1:0", "/tmp/cache", ""); err != nil {
 		t.Fatalf("disabled reconciliation must not couple to the TTL: %v", err)
 	}

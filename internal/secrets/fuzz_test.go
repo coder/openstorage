@@ -1,7 +1,7 @@
 // Fuzz targets for package secrets' untrusted-input surfaces (issue #91):
 // Decrypt consumes envelope strings read back from database columns (which
 // legacy plaintext rows can shape arbitrarily), and ParseKeys consumes the
-// operator-supplied CODESTORAGE_SECRETS_KEY value. Both must degrade to the
+// operator-supplied OPENSTORAGE_SECRETS_KEY value. Both must degrade to the
 // documented sentinel errors — never a panic, and never a fabricated
 // plaintext.
 package secrets

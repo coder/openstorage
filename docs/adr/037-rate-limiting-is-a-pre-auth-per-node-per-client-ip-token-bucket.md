@@ -16,7 +16,7 @@ in-memory token bucket per client IP, applied at every REST route registration s
 - **Key = `RemoteAddr` host.** `X-Forwarded-For` is deliberately not trusted — a
   spoofable header as the limit key would let any client mint fresh buckets at will.
   Deployments behind a trusted proxy terminate client identity there. *(Issue #30
-  later added an opt-in `CODESTORAGE_TRUSTED_PROXIES` CIDR allowlist: when the peer
+  later added an opt-in `OPENSTORAGE_TRUSTED_PROXIES` CIDR allowlist: when the peer
   is a listed proxy, the key becomes the rightmost untrusted `X-Forwarded-For` hop;
   the default stays `RemoteAddr`-only.)*
 - **Per node, in memory.** Nodes are stateless (no shared limiter state to operate), and
@@ -26,7 +26,7 @@ in-memory token bucket per client IP, applied at every REST route registration s
   read routes answer the `{"error"}` envelope, write routes the docs/04 result envelope
   with status `"unavailable"` — `statusForHTTP` in errors.go gained the 429 row, so the
   mapping stays centralized.
-- **Config is fail-fast.** `CODESTORAGE_RATE_RPS` / `CODESTORAGE_RATE_BURST` must be set
+- **Config is fail-fast.** `OPENSTORAGE_RATE_RPS` / `OPENSTORAGE_RATE_BURST` must be set
   as a pair (`RPS > 0` requires `BURST >= 1`); malformed, negative, NaN, or infinite
   values abort startup naming the variable. Unset (or explicit zero) disables limiting —
   the middleware becomes the identity.

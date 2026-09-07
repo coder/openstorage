@@ -47,7 +47,7 @@ var errPushTooLarge = errors.New("push body exceeds the decoded-byte cap")
 // allowance without reaching the decoded cap (Codex round 17).
 func pushTooLargeMsg(limit int64) string {
 	assertf(limit > 0, "pushTooLargeMsg(%d)", limit)
-	return fmt.Sprintf("push body exceeds the server's push-size cap of %d decoded bytes (or its compressed-stream allowance; CODESTORAGE_MAX_PUSH_BYTES)", limit)
+	return fmt.Sprintf("push body exceeds the server's push-size cap of %d decoded bytes (or its compressed-stream allowance; OPENSTORAGE_MAX_PUSH_BYTES)", limit)
 }
 
 // wirePushLimit bounds the COMPRESSED stream of a gzip push whose decoded
@@ -167,7 +167,7 @@ func (g *pushGate) Write(p []byte) (int, error) {
 		return g.buf.Write(p)
 	}
 	if g.spill == nil {
-		f, err := os.CreateTemp("", "codestorage-push-gate-*")
+		f, err := os.CreateTemp("", "openstorage-push-gate-*")
 		if err != nil {
 			return 0, fmt.Errorf("push gate spill: %w", err)
 		}

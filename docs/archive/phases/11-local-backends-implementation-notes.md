@@ -1,7 +1,7 @@
 # Local-Backends Implementation Notes & ADRs
 
-> **Archived.** Historical implementation notes, kept verbatim as the project's build
-> history; decisions here may have been superseded by later work. For current
+> **Archived.** Historical implementation workflow, with current project naming.
+> Decisions here may have been superseded by later work. For current
 > behavior, start at the [docs index](../../README.md); the ADRs recorded below are
 > individually addressable under [`docs/adr/`](../../adr/README.md).
 
@@ -32,7 +32,7 @@ Two same-shape decisions ride along:
 - **`Pack.S3Key` → `Pack.Key`.** The field names the blob-store object key, which is no
   longer necessarily S3. The backing SQL column stays `s3_key` on **both** backends so the
   pack SQL is byte-comparable across them and existing PG deployments need no migration.
-- **`modernc.org/sqlite`** (pure Go) over `mattn/go-sqlite3` (cgo): codestorage ships as a
+- **`modernc.org/sqlite`** (pure Go) over `mattn/go-sqlite3` (cgo): open.storage ships as a
   cross-compiled single binary, and the hook path re-execs that binary — a cgo toolchain
   requirement per target platform would poison exactly the deployment story local mode
   exists for. The dependency is large, accepted deliberately.
@@ -60,10 +60,10 @@ a node from mixing (PG + `file://`) but nothing optimizes for it either.
   WAL to checkpoint, and one obvious artifact for "hand me your data dir" debugging. The
   tables are disjoint, so the shared file changes no SQL. Split remains possible later by
   passing different URLs; the derivation just doesn't.
-- **Derivation precedence.** `--data-dir <dir>` (or `CODESTORAGE_DATA_DIR`; flag wins)
+- **Derivation precedence.** `--data-dir <dir>` (or `OPENSTORAGE_DATA_DIR`; flag wins)
   fills only the slots not set explicitly: `sqlite://<dir>/codestorage.db`,
-  `file://<dir>/blobs`, cache `<dir>/cache`. Explicit `CODESTORAGE_PG_URL` /
-  `CODESTORAGE_S3_URL` (and legacy aliases) and an explicit `--cache-dir` always win; the
+  `file://<dir>/blobs`, cache `<dir>/cache`. Explicit `OPENSTORAGE_PG_URL` /
+  `OPENSTORAGE_S3_URL` (and legacy aliases) and an explicit `--cache-dir` always win; the
   dir is made absolute up front because hooks re-exec from the cache repo's working
   directory, where a relative path would silently resolve elsewhere.
 
@@ -81,9 +81,9 @@ backend rides the same suites through a lane switch instead of a parallel test t
 | Lane | How to run | Containers |
 |---|---|---|
 | api integration matrix (`/sqlite` subtests) | `go test ./internal/api` — every integration test fans out `t.Run("pg")` / `t.Run("sqlite")` via `runBackends`; the sqlite lane opens a temp-dir DB | pg lane only |
-| githttp e2e, local lane | `CODESTORAGE_TEST_BACKEND=local go test ./internal/githttp` — TestMain derives `sqlite://`+`file://` URLs from a temp data dir; whole suite incl. hook re-exec, plus the local-only on-disk/stateless-cache test | none |
+| githttp e2e, local lane | `OPENSTORAGE_TEST_BACKEND=local go test ./internal/githttp` — TestMain derives `sqlite://`+`file://` URLs from a temp data dir; whole suite incl. hook re-exec, plus the local-only on-disk/stateless-cache test | none |
 | githttp e2e, pg lane | `go test ./internal/githttp` (default) | PG + MinIO |
 | ref/blob/meta unit lanes | `go test ./internal/ref ./internal/blob ./internal/meta` — sqlite store, fileblob, and sqlite meta tests run on temp dirs; PG-specific tests keep their lazy container | PG tests only |
 
-Selecting only zero-container lanes (e.g. `-run '/sqlite'`, `CODESTORAGE_TEST_BACKEND=local`)
+Selecting only zero-container lanes (e.g. `-run '/sqlite'`, `OPENSTORAGE_TEST_BACKEND=local`)
 runs with `docker ps` empty — the distribution story local mode exists for, applied to CI.

@@ -13,7 +13,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/coder/code-storage/internal/secrets"
+	"github.com/coder/open-storage/internal/secrets"
 )
 
 // assertf is a fail-fast invariant check (crash-and-burn style).

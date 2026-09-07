@@ -30,10 +30,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/coder/code-storage/internal/auth"
-	"github.com/coder/code-storage/internal/events"
-	"github.com/coder/code-storage/internal/meta"
-	upsync "github.com/coder/code-storage/internal/sync"
+	"github.com/coder/open-storage/internal/auth"
+	"github.com/coder/open-storage/internal/events"
+	"github.com/coder/open-storage/internal/meta"
+	upsync "github.com/coder/open-storage/internal/sync"
 )
 
 // usyncGit runs one git command hermetically (host config masked, fixed

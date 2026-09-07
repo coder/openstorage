@@ -63,7 +63,7 @@ no such window.
 
 Retirement deletes rows, never bytes. The now-rowless blobs — canonical and
 legacy spellings alike — become ordinary orphans for the EXISTING sweep
-machinery and its gates (`CODESTORAGE_SWEEP_DELETE_LFS`, ADR-41's legacy
+machinery and its gates (`OPENSTORAGE_SWEEP_DELETE_LFS`, ADR-41's legacy
 transition gate); #104's download-time restore is registered-row-gated, so a
 retired row is not restorable through download paths, while never-migrated
 legacy bytes simply return to the pre-registry read-compat class they came
@@ -71,7 +71,7 @@ from. That split makes the coupling load-bearing (Codex security round 13):
 the refunded cap slot is the only bound on the `lfs/<repo>/` prefix that
 quota floors and sweep listings walk, so retirement without a running reap
 would let upload → grace → retire → re-upload cycles grow the prefix without
-bound. Startup therefore rejects `CODESTORAGE_LFS_GC_DELETE_ENABLED` on a
+bound. Startup therefore rejects `OPENSTORAGE_LFS_GC_DELETE_ENABLED` on a
 live sweep schedule unless the LFS reap is armed and the grace is at least
 the reap cadence (max of the sweep age threshold, the sweep interval, and
 the quarantine retention floor — every reap strands one quarantine backup
@@ -88,14 +88,14 @@ The sweep emergency stop (interval 0) is the planned instance of the same
 demotion: the watermark stales and reclamation reports instead of
 crash-looping the fleet. The watermark's payload also records whether the
 certified sweep had the LEGACY delete class armed
-(`CODESTORAGE_SWEEP_DELETE_LFS_LEGACY`): legacy-spelled registry rows
+(`OPENSTORAGE_SWEEP_DELETE_LFS_LEGACY`): legacy-spelled registry rows
 retire only under a legacy-armed watermark AND a replica whose own config
 arms the flag — an unarmed sweep deliberately spares legacy orphan blobs,
 so refunding their slots would let upload/retire cycles grow storage past
 the object cap (deferred distinctly as `rows_deferred_legacy_unarmed`).
 The job ships dark (interval 0) with report-only marking as the second
-gate (`CODESTORAGE_LFS_GC_DELETE_ENABLED`), mirroring the sweep flags'
-staged rollout; `CODESTORAGE_LFS_MAX_OBJECTS_PER_REPO` is the orthogonal
+gate (`OPENSTORAGE_LFS_GC_DELETE_ENABLED`), mirroring the sweep flags'
+staged rollout; `OPENSTORAGE_LFS_MAX_OBJECTS_PER_REPO` is the orthogonal
 operator escape hatch that unwedges a repository immediately. An actively
 abusive writer can re-upload junk to reset its grace clocks — reclamation
 guarantees convergence after abuse stops, not defense against a live token,

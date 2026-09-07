@@ -18,8 +18,8 @@ import (
 
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 
-	"github.com/coder/code-storage/internal/ref/s3wal"
-	"github.com/coder/code-storage/internal/ref/s3wal/s3waltest"
+	"github.com/coder/open-storage/internal/ref/s3wal"
+	"github.com/coder/open-storage/internal/ref/s3wal/s3waltest"
 )
 
 var (

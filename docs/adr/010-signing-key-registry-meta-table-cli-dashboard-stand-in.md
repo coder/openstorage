@@ -9,8 +9,8 @@ endpoint exists in the spec, so wire compatibility imposes nothing here.
 
 **Decision.** The OSS equivalent is a metadata table plus an operator CLI:
 `org_signing_keys` in `internal/meta` (`AddSigningKey` / `SigningKeysForOrg` /
-`RemoveSigningKey`) and `codestorage signing-key add|list|remove --org <org>`, which talks
-to Postgres directly via `CODESTORAGE_PG_URL` — deliberately not an HTTP endpoint. Key
+`RemoveSigningKey`) and `openstorage signing-key add|list|remove --org <org>`, which talks
+to Postgres directly via `OPENSTORAGE_PG_URL` — deliberately not an HTTP endpoint. Key
 material is validated at add time (a single SSH public key line with an allow-listed type
 whose base64 blob echoes the declared algorithm, or an ASCII-armored PGP public key
 block); the hook trusts registry contents verbatim and reads the keyring **fresh from

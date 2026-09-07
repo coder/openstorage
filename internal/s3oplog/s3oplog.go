@@ -1,6 +1,6 @@
 // Package s3oplog is the per-request S3 round-trip log seam (issue #182):
-// when CODESTORAGE_S3_OP_LOG names a file, every S3 HTTP attempt made
-// through the codestorage SDK clients — the s3wal conditional client (ref
+// when OPENSTORAGE_S3_OP_LOG names a file, every S3 HTTP attempt made
+// through the openstorage SDK clients — the s3wal conditional client (ref
 // and meta authority) and the blob client — appends one whitespace-
 // separated line:
 //
@@ -30,10 +30,12 @@ import (
 	awsmiddleware "github.com/aws/aws-sdk-go-v2/aws/middleware"
 	"github.com/aws/smithy-go/middleware"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
+
+	"github.com/coder/open-storage/internal/envconfig"
 )
 
 // Env names the op-log file. Empty (the default) disables the seam.
-const Env = "CODESTORAGE_S3_OP_LOG"
+const Env = "OPENSTORAGE_S3_OP_LOG"
 
 var (
 	once    sync.Once
@@ -46,7 +48,7 @@ var (
 // diagnostics knob must never take down serving (unlike boot-validated
 // configuration such as the expected-bucket-owner).
 func setup() {
-	path := os.Getenv(Env)
+	path := envconfig.Getenv(Env)
 	if path == "" {
 		return
 	}
@@ -68,8 +70,8 @@ func setup() {
 }
 
 // procRole renders this process's identity from argv: the binary base name
-// plus up to two leading non-flag arguments — "codestorage:serve",
-// "codestorage:hook:pre-receive", "codestorage:hook:update". Whitespace is
+// plus up to two leading non-flag arguments — "openstorage:serve",
+// "openstorage:hook:pre-receive", "openstorage:hook:update". Whitespace is
 // squashed so the line stays field-splittable.
 func procRole() string {
 	parts := []string{filepath.Base(os.Args[0])}
@@ -91,7 +93,7 @@ func APIOption() (func(*middleware.Stack) error, bool) {
 		return nil, false
 	}
 	return func(stack *middleware.Stack) error {
-		return stack.Deserialize.Add(middleware.DeserializeMiddlewareFunc("codestorageS3OpLog", logOp), middleware.Before)
+		return stack.Deserialize.Add(middleware.DeserializeMiddlewareFunc("openstorageS3OpLog", logOp), middleware.Before)
 	}, true
 }
 

@@ -19,7 +19,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/coder/code-storage/internal/blob"
+	"github.com/coder/open-storage/internal/blob"
 )
 
 func TestLFS_GitLFSRoundTrip(t *testing.T) {
@@ -84,7 +84,7 @@ func TestLFSQuota_GitLFSPushDenied(t *testing.T) {
 	}
 	// 16 KiB: enough for the tiny commit's pack, far below the 1 MiB
 	// LFS object the pre-push hook tries to upload first.
-	node := startNodeT(t, "CODESTORAGE_PACK_QUOTA_BYTES=16384")
+	node := startNodeT(t, "OPENSTORAGE_PACK_QUOTA_BYTES=16384")
 	repo := registerRepo(t, "t-lfs-quota")
 	token := mintTestToken(t, repo, "git:read,git:write", "")
 	remote := remoteURL(node, repo, token)

@@ -5,8 +5,8 @@
 # Local key material for the compose `replicas` profile (README quickstart)
 /compose-keys/
 
-# Service binary built by the README quickstart (`go build ./cmd/codestorage`)
-/codestorage
+# Service binary built by the README quickstart (`go build ./cmd/openstorage`)
+/openstorage
 
 # Local quickstart scratch (cloned demo repo, serve --data-dir state)
 /demo/

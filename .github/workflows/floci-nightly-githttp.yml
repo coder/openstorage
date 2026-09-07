@@ -2,7 +2,7 @@
 # per-PR `test` job runs the internal/githttp suite against SeaweedFS; this
 # workflow reruns the same full PG-mode suite with the blob store pointed at
 # floci/floci — booted with FLOCI_SERVICES_S3_ENFORCE_AUTH=true — through the
-# test-only CODESTORAGE_TEST_S3_ENDPOINT override in the suite's TestMain.
+# test-only OPENSTORAGE_TEST_S3_ENDPOINT override in the suite's TestMain.
 # Credentials come from a real chain no other lane exercises: IAM
 # CreateAccessKey → STS AssumeRole → session credentials. Scope note: Floci
 # only honors IAM/STS-minted access-key IDs but does not validate
@@ -111,7 +111,7 @@ jobs:
       - name: githttp E2E suite (pg lane, blob store on floci, session creds)
         env:
           AWS_REGION: us-east-1
-          CODESTORAGE_TEST_S3_ENDPOINT: http://127.0.0.1:4566
+          OPENSTORAGE_TEST_S3_ENDPOINT: http://127.0.0.1:4566
         run: go test ./internal/githttp -count=1 -race -timeout=25m
       - name: assert the suite ran against floci (not a silent SeaweedFS fallback)
         # Only the external-endpoint TestMain path creates this bucket on

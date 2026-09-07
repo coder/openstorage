@@ -22,7 +22,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/coder/code-storage/internal/ref"
+	"github.com/coder/open-storage/internal/ref"
 )
 
 // mintHold creates a hold file in repoPath naming the given refs, through
@@ -3432,8 +3432,10 @@ func TestEnsureCacheRepo_RestoresOwnerExecBit(t *testing.T) {
 // failing prepared callback aborts valid pushes after an upgrade.
 func TestEnsureCacheRepo_RefreshesPreGateGenerations(t *testing.T) {
 	for name, legacy := range map[string]string{
-		"exec-gen":    refTxHookGateV1 + `exec "/opt/old/codestorage" hook reference-transaction "$@"` + "\n",
-		"guarded-gen": refTxHookGateV1 + `"/opt/old/codestorage" hook reference-transaction "$@" || exit 0` + "\n",
+		"committed-gen":      refTxHookGateLegacy + `"/opt/old/codestorage" hook reference-transaction "$@" || exit 0` + "\n",
+		"committed-exec-gen": refTxHookGateLegacy + `exec "/opt/old/codestorage" hook reference-transaction "$@"` + "\n",
+		"exec-gen":           refTxHookGateV1 + `exec "/opt/old/codestorage" hook reference-transaction "$@"` + "\n",
+		"guarded-gen":        refTxHookGateV1 + `"/opt/old/codestorage" hook reference-transaction "$@" || exit 0` + "\n",
 		// The ORIGINAL, ungated generation — the plain enforcement-hook
 		// template (PR #195 round-13 P1).
 		"ungated-gen": "#!/bin/sh\n" + `exec "/opt/old/codestorage" hook reference-transaction "$@"` + "\n",
@@ -3614,13 +3616,13 @@ func TestEnsureCacheRepo_PreservesRacingForeignHook(t *testing.T) {
 
 // TestIsManagedRefTxHook_RejectsShellExpansions (PR #195 round-9 P2):
 // strconv.Unquote accepts shell expressions inside the quotes, so an
-// operator's `"$CODESTORAGE_BIN" hook ...` had the exact managed shape
+// operator's `"$OPENSTORAGE_BIN" hook ...` had the exact managed shape
 // and was clobbered. Managed paths are the literal absolute executables
 // the generator can emit — no parameter or command substitution.
 func TestIsManagedRefTxHook_RejectsShellExpansions(t *testing.T) {
 	for content, want := range map[string]bool{
 		refTxHookGate + `"/usr/local/bin/codestorage" hook reference-transaction "$@" || exit 0` + "\n": true,
-		refTxHookGate + `"$CODESTORAGE_BIN" hook reference-transaction "$@" || exit 0` + "\n":           false,
+		refTxHookGate + `"$OPENSTORAGE_BIN" hook reference-transaction "$@" || exit 0` + "\n":           false,
 		refTxHookGate + "\"`pick-binary`\" hook reference-transaction \"$@\" || exit 0\n":               false,
 		refTxHookGate + `"/opt/$DEPLOY/codestorage" hook reference-transaction "$@" || exit 0` + "\n":   false,
 		refTxHookGate + `"relative/codestorage" hook reference-transaction "$@" || exit 0` + "\n":       false,

@@ -5,10 +5,10 @@ import (
 	"encoding/json"
 	"testing"
 
-	"github.com/coder/code-storage/internal/auth"
-	"github.com/coder/code-storage/internal/githttp"
-	"github.com/coder/code-storage/internal/meta"
-	upsync "github.com/coder/code-storage/internal/sync"
+	"github.com/coder/open-storage/internal/auth"
+	"github.com/coder/open-storage/internal/githttp"
+	"github.com/coder/open-storage/internal/meta"
+	upsync "github.com/coder/open-storage/internal/sync"
 )
 
 // TestIsPGURLRoutesS3WALToLocalQueue pins the jobs routing contract for

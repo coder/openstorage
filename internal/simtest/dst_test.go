@@ -8,9 +8,9 @@ import (
 	"strconv"
 	"testing"
 
-	"github.com/coder/code-storage/internal/blob"
-	"github.com/coder/code-storage/internal/githttp"
-	"github.com/coder/code-storage/internal/ref"
+	"github.com/coder/open-storage/internal/blob"
+	"github.com/coder/open-storage/internal/githttp"
+	"github.com/coder/open-storage/internal/ref"
 )
 
 // reportRun logs a run's summary and fails the test on violations with

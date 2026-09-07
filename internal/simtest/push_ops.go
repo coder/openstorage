@@ -48,7 +48,7 @@ import (
 	"sort"
 	"time"
 
-	"github.com/coder/code-storage/internal/meta"
+	"github.com/coder/open-storage/internal/meta"
 )
 
 const (
@@ -295,7 +295,7 @@ func (s *sim) checkPushRow(ctx context.Context, repoKey string, now time.Time, o
 	return s.checkUpstreamMirror(ctx, repoKey, op)
 }
 
-// doPushRescue mimics local-mode boot recovery (cmd/codestorage
+// doPushRescue mimics local-mode boot recovery (cmd/openstorage
 // wire_eventing.go, issue #90): PendingPushRepoIDs lists repos owing an
 // outbound run — pending marker set OR an in-flight claim — and each gets
 // re-marked at the PLAIN level. This is the documented once-per-rescue

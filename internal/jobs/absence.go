@@ -77,8 +77,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/coder/code-storage/internal/blob"
-	"github.com/coder/code-storage/internal/ref"
+	"github.com/coder/open-storage/internal/blob"
+	"github.com/coder/open-storage/internal/ref"
 )
 
 // AbsenceRegistry is the ref-store surface the absence reconciler drives.
@@ -231,7 +231,7 @@ const (
 	// absencePageSize bounds one registry page.
 	absencePageSize = 1_000
 	// DefaultAbsenceReconcileBudget bounds the work units one pass may
-	// charge (CODESTORAGE_ABSENCE_RECONCILE_BUDGET overrides): one unit
+	// charge (OPENSTORAGE_ABSENCE_RECONCILE_BUDGET overrides): one unit
 	// per row examined plus one per extra twin-spelling probe. Sized for
 	// point Stats — remote HEAD requests, not row reads — so a default
 	// pass stays minutes, not hours.
@@ -1425,7 +1425,7 @@ func (r *AbsenceReconciler) renewCovers(ctx context.Context, budget int64, repor
 	overrun := func() {
 		if charged > budget && !report.RenewalOverBudget {
 			report.RenewalOverBudget = true
-			r.logger.Warn("absence reconcile: cover renewal overran its budget allocation (discovery keeps its guaranteed half-budget allowance) — raise CODESTORAGE_ABSENCE_RECONCILE_BUDGET above twice the live cover population",
+			r.logger.Warn("absence reconcile: cover renewal overran its budget allocation (discovery keeps its guaranteed half-budget allowance) — raise OPENSTORAGE_ABSENCE_RECONCILE_BUDGET above twice the live cover population",
 				"allocation", budget, "charged", charged)
 		}
 	}
@@ -1892,7 +1892,7 @@ func (r *AbsenceReconciler) packPhase(ctx context.Context, budget int64, report 
 // work draws on the shared per-pass verification pool (one budget's
 // worth). Without runToCompletion (rotation-triggered), a class whose
 // base outgrows the pool defers its verdicts LOUDLY — the operator sizes
-// CODESTORAGE_ABSENCE_RECONCILE_BUDGET so the largest base's combined
+// OPENSTORAGE_ABSENCE_RECONCILE_BUDGET so the largest base's combined
 // class rows fit — and its covers stay protectively oversized meanwhile,
 // strictly the conservative direction. With runToCompletion (fold
 // commitment, Codex rounds 23+24), the verification still charges the
@@ -1915,7 +1915,7 @@ func (r *AbsenceReconciler) verifyAndJudge(ctx context.Context, base, class stri
 		remaining := int64(absencePageSize)
 		if !runToCompletion {
 			if r.verifyPool <= 0 {
-				r.logger.Warn("absence reconcile: verification pool exhausted — verdict deferred; raise CODESTORAGE_ABSENCE_RECONCILE_BUDGET above the largest base's combined class rows if persistent",
+				r.logger.Warn("absence reconcile: verification pool exhausted — verdict deferred; raise OPENSTORAGE_ABSENCE_RECONCILE_BUDGET above the largest base's combined class rows if persistent",
 					"base", base, "class", class)
 				return
 			}
@@ -1941,7 +1941,7 @@ func (r *AbsenceReconciler) verifyAndJudge(ctx context.Context, base, class stri
 				return
 			}
 			if !runToCompletion && r.verifyPool <= 0 {
-				r.logger.Warn("absence reconcile: verification pool exhausted — verdict deferred; raise CODESTORAGE_ABSENCE_RECONCILE_BUDGET above the largest base's combined class rows if persistent",
+				r.logger.Warn("absence reconcile: verification pool exhausted — verdict deferred; raise OPENSTORAGE_ABSENCE_RECONCILE_BUDGET above the largest base's combined class rows if persistent",
 					"base", base, "class", class)
 				return
 			}
@@ -1971,7 +1971,7 @@ func (r *AbsenceReconciler) warnVerifyDeadline(runToCompletion bool, base, class
 	if !runToCompletion {
 		return
 	}
-	r.logger.Warn("absence reconcile: fold verification hit the pass deadline — retried with wall-clock priority next pass; raise CODESTORAGE_PACK_RESERVATION_TTL (the pass wall clock is a quarter of it, capped at an hour) so one pass can re-stat the largest base if persistent",
+	r.logger.Warn("absence reconcile: fold verification hit the pass deadline — retried with wall-clock priority next pass; raise OPENSTORAGE_PACK_RESERVATION_TTL (the pass wall clock is a quarter of it, capped at an hour) so one pass can re-stat the largest base if persistent",
 		"base", base, "class", class)
 }
 

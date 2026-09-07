@@ -23,9 +23,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/coder/code-storage/internal/auth"
-	"github.com/coder/code-storage/internal/meta"
-	upsync "github.com/coder/code-storage/internal/sync"
+	"github.com/coder/open-storage/internal/auth"
+	"github.com/coder/open-storage/internal/meta"
+	upsync "github.com/coder/open-storage/internal/sync"
 )
 
 func TestBootstrapOrgAuth_TwoBootsKeepBothLoopbackKeys(t *testing.T) {
@@ -138,7 +138,7 @@ func TestBootstrapOrgAuth_WarnsAboutRetainedOrgRows(t *testing.T) {
 	}
 	fileBlocks := []string{string(filePEM)}
 
-	// A row retained from a previous CODESTORAGE_ORG value.
+	// A row retained from a previous OPENSTORAGE_ORG value.
 	if _, err := ms.UpsertOrgWithKeys(ctx, "old-org", fileBlocks); err != nil {
 		t.Fatal(err)
 	}

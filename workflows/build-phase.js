@@ -1,4 +1,4 @@
-// Durable conductor: builds ONE phase of the open-source code.storage backend.
+// Durable conductor: builds ONE phase of the open.storage backend.
 // The human gate lives BETWEEN runs: each run ends with a go/no-go gate report;
 // the operator reviews it and launches the next phase (optionally with a `brief`).
 //
@@ -300,7 +300,7 @@ export default function workflow({ args, phase, log, agent, parallel, applyPatch
   // ---- Plan ----
   phase("plan", { phase: phaseId, title: spec.title });
   const plan = agent(
-    `Plan this phase of the open-source code.storage backend (Go, Postgres, S3/MinIO).\n\n` +
+    `Plan this phase of the open.storage backend (Go, Postgres, S3/MinIO).\n\n` +
       `Phase: ${spec.title}\nSpec references (read them): ${spec.specRefs}\n${SPEC_POINTER}\n\n` +
       `Deliverables: ${spec.deliverables}\n\nAcceptance criteria the plan MUST cover:\n- ${spec.acceptance.join("\n- ")}\n\n` +
       `The plan must include a dedicated dogfooding section (environment setup + exact commands + evidence capture): ${spec.dogfood}\n` +
@@ -466,7 +466,7 @@ export default function workflow({ args, phase, log, agent, parallel, applyPatch
     `Dogfood this phase end-to-end as a real user. ${spec.dogfood}\n` +
       `Bring up the environment (docker compose with Postgres + MinIO), run the real flows, and capture evidence: ` +
       `terminal recordings/transcripts via agent-tty (mise use npm:agent-tty) or util-linux script; save evidence under ` +
-      `/tmp/codestorage-evidence/${phaseId}/ and report the paths. Evaluate each acceptance criterion:\n- ${spec.acceptance.join("\n- ")}\n` +
+      `/tmp/openstorage-evidence/${phaseId}/ and report the paths. Evaluate each acceptance criterion:\n- ${spec.acceptance.join("\n- ")}\n` +
       `Report honestly; a criterion without captured evidence counts as failed.`,
     {
       id: "dogfood",

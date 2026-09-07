@@ -22,8 +22,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/coder/code-storage/internal/blob"
-	"github.com/coder/code-storage/internal/ref"
+	"github.com/coder/open-storage/internal/blob"
+	"github.com/coder/open-storage/internal/ref"
 )
 
 // A repo URL element is a base repo name optionally followed by one
@@ -457,12 +457,18 @@ const refTxHookScript = refTxHookGate + `%q hook reference-transaction "$@" || e
 // non-committed callback costs one /bin/sh exit; per-ref gits then pay
 // one binary exec per committed ref, the same order as their own
 // per-command update hooks, and batched gits pay one per push.
-const refTxHookGate = refTxHookGateV1 + `[ "$1" = committed ] || exit 0
+const refTxHookGate = `#!/bin/sh
+[ -n "${OPENSTORAGE_GIT_PUSH_HOLD-${CODESTORAGE_GIT_PUSH_HOLD}}" ] || exit 0
+[ "$1" = committed ] || exit 0
 `
 
-// refTxHookGateV1 is the first managed generation's gate (no committed
-// line) — still recognized by the refresh detector so pre-gate installs
-// are upgraded rather than orphaned as foreign.
+// Keep the exact historical CODESTORAGE gates: cache repos survive upgrades,
+// including old binary paths. The current shell gate falls back only when the
+// canonical name is UNSET, not when it is explicitly empty.
+const refTxHookGateLegacy = refTxHookGateV1 + `[ "$1" = committed ] || exit 0
+`
+
+// refTxHookGateV1 is the first managed generation's gate (no committed line).
 const refTxHookGateV1 = `#!/bin/sh
 [ -n "$CODESTORAGE_GIT_PUSH_HOLD" ] || exit 0
 `
@@ -482,6 +488,9 @@ func isManagedRefTxHook(content []byte) bool {
 	// prepared callbacks abort valid pushes. Longest gate first: the
 	// older gate is a prefix of the newer.
 	rest, ok := strings.CutPrefix(string(content), refTxHookGate)
+	if !ok {
+		rest, ok = strings.CutPrefix(string(content), refTxHookGateLegacy)
+	}
 	if !ok {
 		rest, ok = strings.CutPrefix(string(content), refTxHookGateV1)
 	}
@@ -504,7 +513,7 @@ func isManagedRefTxHook(content []byte) bool {
 	// The invocation line must consist SOLELY of the optional historical
 	// `exec`, one quoted executable, and the delegation (PR #195 round-4
 	// P2): a suffix-only check classified same-line wrapper additions
-	// (`logger ...; "/usr/bin/codestorage" hook ...`) as managed and
+	// (`logger ...; "/usr/bin/openstorage" hook ...`) as managed and
 	// clobbered them.
 	line, cut := strings.CutSuffix(line, ` hook reference-transaction "$@" || exit 0`)
 	if !cut {
@@ -522,7 +531,7 @@ func isManagedRefTxHook(content []byte) bool {
 	}
 	// Literal executables only (PR #195 round-9 P2): $, backquote, and
 	// backslash keep their meaning inside shell double quotes, so a
-	// quoted `"$CODESTORAGE_BIN"` passes Unquote while being an
+	// quoted `"$OPENSTORAGE_BIN"` passes Unquote while being an
 	// operator's dynamic selection — the generator only ever emits
 	// literal absolute paths, and anything else must classify as foreign
 	// and be preserved.
@@ -1472,6 +1481,8 @@ func updateRefStdin(repoPath, commands string) error {
 // conflict instead of fast-forwarding — the normal concurrent-writer path,
 // clean and retryable, unlike the spurious rejection this prevents.
 const (
+	// Shared-cache protocol name, not branding: rolling deployments must
+	// observe the same holds rather than hydrate over another binary's push.
 	pushHoldDir = "codestorage.push-holds"
 	// pushHoldUnreservedSuffix marks a push's sidecar DIRECTORY holding
 	// one empty marker file per command pre-receive did NOT bulk-reserve
@@ -3176,6 +3187,8 @@ func releaseDeniedPushHold(holdPath, refName string) error {
 // default branch against the marker. Markers written by binaries that
 // predate the field fail parsing (ok=false) and cost exactly one full sync.
 const (
+	// Keep marker names across product renames: all shared-cache users
+	// must invalidate and read the same generation evidence.
 	generationMarker    = "codestorage.generation"
 	generationMarkerTTL = 5 * time.Minute
 )
@@ -3216,7 +3229,8 @@ func readGenerationMarker(repoPath string) (gen int64, head string, fresh bool, 
 // CASes (the range rule, issue #186 finding 5) — a re-scan could only
 // reproduce the same verdicts, so hydrate serves the cache as-is. Any
 // hold release, append, rewrite, or expiry changes the fingerprint and
-// forces the healing re-scan the suppression exists for.
+// forces the healing re-scan the suppression exists for. Like generationMarker,
+// its physical name is shared-cache protocol, not product branding.
 const heldGenerationMarker = "codestorage.generation.held"
 
 // holdFileID is one fingerprint-folded file observation: size plus the
@@ -3666,7 +3680,8 @@ func Hydrate(ctx context.Context, st ref.RefStore, bl blob.BlobStore, cacheDir, 
 	// deleted inode. Lock order is repo hydrate lock -> per-pack locks;
 	// nothing acquires them in the opposite order. The wait is cancelable:
 	// a request whose client hung up must not stay parked behind a slow
-	// hydrate holding the repo-wide lock.
+	// hydrate holding the repo-wide lock. Keep the physical name across
+	// product renames so old and new binaries still serialize together.
 	unlock, err := flockExclusiveCtx(ctx, filepath.Join(repoPath, "codestorage.hydrate.lock"))
 	if err != nil {
 		return "", nil, fmt.Errorf("lock hydrate %s: %w", repo, err)

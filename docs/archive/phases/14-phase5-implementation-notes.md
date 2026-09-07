@@ -1,7 +1,7 @@
 # Phase-5 Implementation Notes & ADRs (eventing, upstream sync, credentials, fork)
 
-> **Archived.** Historical implementation notes, kept verbatim as the project's build
-> history; decisions here may have been superseded by later work. For current
+> **Archived.** Historical implementation workflow, with current project naming.
+> Decisions here may have been superseded by later work. For current
 > behavior, start at the [docs index](../../README.md); the ADRs recorded below are
 > individually addressable under [`docs/adr/`](../../adr/README.md).
 
@@ -143,9 +143,9 @@ are never logged (worker and delivery code paths keep them out of errors and slo
 fields), webhook secrets are shown exactly once at registration (ADR-29), and credential
 reads are scoped to the sync worker. Revisit when a KMS/keystore seam exists.
 
-**Amended by [#54](https://github.com/coder/code-storage/issues/54):** the environment is
+**Amended by [#54](https://github.com/coder/open-storage/issues/54):** the environment is
 now that seam. Optional
-[`CODESTORAGE_SECRETS_KEY`](../../reference/configuration.md#codestorage_secrets_key)
+[`OPENSTORAGE_SECRETS_KEY`](../../reference/configuration.md#openstorage_secrets_key)
 envelope-encrypts both columns (AES-256-GCM, `enc:v1:` marker, comma-separated key list
 with first-key-encrypts rotation) inside `internal/meta` — encrypt-on-write, fail-closed
 decrypt-on-read, lazy re-encryption of legacy plaintext rows. Unset preserves this ADR's
@@ -153,7 +153,7 @@ plaintext behavior; the never-log and show-once rules stand.
 
 ## ADR-33: Git-push eventing crosses processes — durable River inserts on pg, synchronous deliveries in local mode
 
-Git pushes mutate refs in the `codestorage hook` subprocess (the pre-receive/update
+Git pushes mutate refs in the `openstorage hook` subprocess (the pre-receive/update
 re-exec), not in the serve process, so ADR-28's CASRef decorator needs a queue reachable
 *across processes* there. Decision: **queue construction dispatches on the metadata DB
 URL scheme** (the same dispatch as `meta.Open`/`ref.Open`), with asymmetric semantics:
@@ -196,7 +196,7 @@ Supporting pieces outside `internal/api`:
   embedded into `meta.Store`. The thin adapters `events.MetaWebhookStore` and
   `sync.MetaStores` map it onto the slice-owned store contracts (type and sentinel
   drift stays at the boundary; the frozen packages did not change).
-- **Serve assembly** (cmd/codestorage/wire.go + wire_eventing.go):
+- **Serve assembly** (cmd/openstorage/wire.go + wire_eventing.go):
   `buildServeEventing` picks the queue by DB scheme (ADR-27/33), builds the webhook
   deliverer and sync worker, and returns the `events.NewRefStore` decorate func that
   wraps the API's `RefStore` — so API ref writes emit push events. The hook subprocess

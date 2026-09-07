@@ -1,65 +1,73 @@
 # Configuration Reference
 
-Every `CODESTORAGE_*` environment variable the `codestorage` binary reads, with defaults,
+Every `OPENSTORAGE_*` environment variable the `openstorage` binary reads, with defaults,
 validation constraints, and interaction notes. Source of truth:
-[`cmd/codestorage/config.go`](../../cmd/codestorage/config.go). Flags are documented in the
+[`cmd/openstorage/config.go`](../../cmd/openstorage/config.go). Flags are documented in the
 [CLI reference](cli.md).
 
-Resolution precedence per setting: **explicit flag > canonical `CODESTORAGE_*` env var >
-legacy alias > `--data-dir` derivation (local mode) > built-in default**. Every value is
-validated at startup — a malformed value is a fail-fast startup error naming the variable,
-never a silently-applied default.
+Resolution precedence per setting: **explicit flag > canonical `OPENSTORAGE_*` env var >
+`CODESTORAGE_*` fallback > older legacy alias > `--data-dir` derivation (local mode) >
+built-in default**. The old prefix is supported for one minor release, **0.15.x**.
+An explicitly set `OPENSTORAGE_*` variable wins even when its value is empty: neither
+the old prefix nor any older alias can fill it back in. The selected value then follows
+that setting's normal validation and default rules (an empty storage URL derives from
+`--data-dir` or fails startup; it never falls back to a legacy alias). `serve` emits a boot-time deprecation warning for each
+legacy-prefix fallback, without logging the value. Migrate before upgrading to 0.16.0;
+see the [migration guide](../how-to/migrate-to-openstorage.md).
+
+Malformed values are fail-fast startup errors naming the variable, never silently
+replaced by a value from the old prefix.
 
 ## Summary
 
 | Variable | Default | Purpose |
 |---|---|---|
-| [`CODESTORAGE_PG_URL`](#codestorage_pg_url) | — (required*) | Database URL: refs + metadata (`postgres://`, `postgresql://`, `sqlite://`, or the experimental `s3wal://`) |
-| [`CODESTORAGE_S3_URL`](#codestorage_s3_url) | — (required*) | Pack storage URL (`s3://` or `file://`) |
-| [`CODESTORAGE_S3WAL_LEASE_TTL`](#codestorage_s3wal_lease_ttl) | `2m` | s3wal mode only: instance-lease TTL for the dual-serve guard (`0` disables) |
-| [`CODESTORAGE_S3_EXPECTED_BUCKET_OWNER`](#codestorage_s3_expected_bucket_owner) | unset (disabled) | Assert the bucket-owner AWS account ID on every S3 request |
-| [`CODESTORAGE_S3_OP_LOG`](#codestorage_s3_op_log) | unset (disabled) | Diagnostics: append one line per S3 HTTP round trip to this file |
-| [`CODESTORAGE_DATA_DIR`](#codestorage_data_dir) | — | Local-mode data directory; derives the two URLs above |
-| [`CODESTORAGE_LISTEN`](#codestorage_listen) | `127.0.0.1:0` | Listen address |
-| [`CODESTORAGE_ORG`](#codestorage_org) | — (required) | Org name (JWT `iss` claim) |
-| [`CODESTORAGE_ORG_PUBKEYS`](#codestorage_org_pubkeys) | — (required) | PEM file with the org's public keys |
-| [`CODESTORAGE_BASE_URL`](#codestorage_base_url) | derived from listener | External base URL for `http_url` values |
-| [`CODESTORAGE_RATE_RPS`](#codestorage_rate_rps--codestorage_rate_burst) | unset (disabled) | Per-client-IP rate limit: sustained requests/second |
-| [`CODESTORAGE_RATE_BURST`](#codestorage_rate_rps--codestorage_rate_burst) | unset (disabled) | Rate-limit token-bucket depth |
-| [`CODESTORAGE_TRUSTED_PROXIES`](#codestorage_trusted_proxies) | unset | CIDR allowlist of reverse proxies for rate-limit client identity |
-| [`CODESTORAGE_WEBHOOK_ALLOW_PRIVATE`](#codestorage_webhook_allow_private) | `false` | Permit private-network webhook receivers (metadata and redirects stay blocked) |
-| [`CODESTORAGE_SYNC_ALLOW_PRIVATE`](#codestorage_sync_allow_private) | unset (transitional) | Unified sync egress policy: permit private-network upstreams for pull and push (metadata stays blocked) |
-| [`CODESTORAGE_SYNC_PUSH_ALLOW_PRIVATE`](#codestorage_sync_push_allow_private) | `false` | **Deprecated** push-only spelling of the sync egress policy |
-| [`CODESTORAGE_SECRETS_KEY`](#codestorage_secrets_key) | unset (plaintext) | AES-256 key list for at-rest encryption of stored webhook secrets and upstream credentials |
-| [`CODESTORAGE_SECRETS_MODE`](#codestorage_secrets_mode) | `encrypt` | `decrypt-only` stages the key fleet-wide before encrypted writes begin |
-| [`CODESTORAGE_PACK_QUOTA_BYTES`](#codestorage_pack_quota_bytes) | 10 GiB | Per-repo storage quota, packs + LFS (`0` disables) |
-| [`CODESTORAGE_LFS_STAGING_BYTES`](#codestorage_lfs_staging_bytes) | 32 GiB | Per-replica cap on in-flight LFS upload staging (`0` disables) |
-| [`CODESTORAGE_LFS_V020_WRITE_COMPAT`](#codestorage_lfs_v020_write_compat) | `false` | Dual-publish LFS objects to the legacy v0.2.0 key during a rolling upgrade |
-| [`CODESTORAGE_PACK_RESERVATION_TTL`](#codestorage_pack_reservation_ttl) | `1h` | Lifetime of a crashed writer's quota reservation |
-| [`CODESTORAGE_MAX_PUSH_BYTES`](#codestorage_max_push_bytes) | 2 × pack quota (min 2 MiB) | Decoded-byte cap on one git push (`0` disables) |
-| [`CODESTORAGE_VERIFY_SIG_BUDGET`](#codestorage_verify_sig_budget) | `10000` | Per-push `verify-sig` verified-commit budget (`0` disables) |
-| [`CODESTORAGE_SWEEP_INTERVAL`](#codestorage_sweep_interval) | `1h` | Orphan-pack sweep cadence (`0` disables sweeping) |
-| [`CODESTORAGE_SWEEP_AGE_THRESHOLD`](#codestorage_sweep_age_threshold) | `24h` | Minimum blob age before an unregistered pack counts as an orphan |
-| [`CODESTORAGE_SWEEP_DELETE_ENABLED`](#codestorage_sweep_delete_enabled) | `false` | Opt-in: actually delete general orphans (list-only otherwise) |
-| [`CODESTORAGE_SWEEP_DELETE_SUPERSEDED`](#codestorage_sweep_delete_superseded) | `true` | Reap blobs a repack fold provably superseded |
-| [`CODESTORAGE_SWEEP_DELETE_LFS`](#codestorage_sweep_delete_lfs) | `false` | Opt-in: actually delete orphan LFS objects (list-only otherwise) |
-| [`CODESTORAGE_SWEEP_DELETE_LFS_LEGACY`](#codestorage_sweep_delete_lfs_legacy) | `false` | Post-roll opt-in: admit legacy-spelled LFS keys to the LFS reap (ADR-41 transition gate) |
-| [`CODESTORAGE_REPO_RETENTION`](#codestorage_repo_retention) | unset | Purge repositories soft-deleted longer than this (unset/`0` keeps them forever) |
-| [`CODESTORAGE_LFS_GC_INTERVAL`](#codestorage_lfs_gc_interval) | unset | Unreferenced-LFS-object reclamation cadence (unset/`0` disables the job) |
-| [`CODESTORAGE_LFS_GC_GRACE`](#codestorage_lfs_gc_grace) | `24h` | How long an object must stay observed-unreferenced before retirement |
-| [`CODESTORAGE_LFS_GC_OBJECT_BUDGET`](#codestorage_lfs_gc_object_budget) | `1000000` | Git objects one reclamation run may walk |
-| [`CODESTORAGE_LFS_GC_DELETE_ENABLED`](#codestorage_lfs_gc_delete_enabled) | `false` | Opt-in: actually retire unreferenced LFS registry rows (report-only otherwise) |
-| [`CODESTORAGE_LFS_MAX_OBJECTS_PER_REPO`](#codestorage_lfs_max_objects_per_repo) | `100000` | Per-repo LFS object-count cap override |
-| [`CODESTORAGE_ABSENCE_RECONCILE_INTERVAL`](#codestorage_absence_reconcile_interval) | unset | Registry-vs-storage absence reconciliation cadence (unset/`0` disables the job) |
-| [`CODESTORAGE_ABSENCE_RECONCILE_BUDGET`](#codestorage_absence_reconcile_budget) | `100000` | Work units one reconciliation pass may charge |
-| [`CODESTORAGE_REPACK_THRESHOLD`](#codestorage_repack_threshold) | `10` | Registered-pack count that triggers a background repack (`0` disables) |
-| [`CODESTORAGE_SYNC_STEAL_LEGACY`](#codestorage_sync_steal_legacy) | `false` | Opt-in: steal pre-lease sync claims after their adoption grace lapses |
+| [`OPENSTORAGE_PG_URL`](#openstorage_pg_url) | — (required*) | Database URL: refs + metadata (`postgres://`, `postgresql://`, `sqlite://`, or the experimental `s3wal://`) |
+| [`OPENSTORAGE_S3_URL`](#openstorage_s3_url) | — (required*) | Pack storage URL (`s3://` or `file://`) |
+| [`OPENSTORAGE_S3WAL_LEASE_TTL`](#openstorage_s3wal_lease_ttl) | `2m` | s3wal mode only: instance-lease TTL for the dual-serve guard (`0` disables) |
+| [`OPENSTORAGE_S3_EXPECTED_BUCKET_OWNER`](#openstorage_s3_expected_bucket_owner) | unset (disabled) | Assert the bucket-owner AWS account ID on every S3 request |
+| [`OPENSTORAGE_S3_OP_LOG`](#openstorage_s3_op_log) | unset (disabled) | Diagnostics: append one line per S3 HTTP round trip to this file |
+| [`OPENSTORAGE_DATA_DIR`](#openstorage_data_dir) | — | Local-mode data directory; derives the two URLs above |
+| [`OPENSTORAGE_LISTEN`](#openstorage_listen) | `127.0.0.1:0` | Listen address |
+| [`OPENSTORAGE_ORG`](#openstorage_org) | — (required) | Org name (JWT `iss` claim) |
+| [`OPENSTORAGE_ORG_PUBKEYS`](#openstorage_org_pubkeys) | — (required) | PEM file with the org's public keys |
+| [`OPENSTORAGE_BASE_URL`](#openstorage_base_url) | derived from listener | External base URL for `http_url` values |
+| [`OPENSTORAGE_RATE_RPS`](#openstorage_rate_rps--openstorage_rate_burst) | unset (disabled) | Per-client-IP rate limit: sustained requests/second |
+| [`OPENSTORAGE_RATE_BURST`](#openstorage_rate_rps--openstorage_rate_burst) | unset (disabled) | Rate-limit token-bucket depth |
+| [`OPENSTORAGE_TRUSTED_PROXIES`](#openstorage_trusted_proxies) | unset | CIDR allowlist of reverse proxies for rate-limit client identity |
+| [`OPENSTORAGE_WEBHOOK_ALLOW_PRIVATE`](#openstorage_webhook_allow_private) | `false` | Permit private-network webhook receivers (metadata and redirects stay blocked) |
+| [`OPENSTORAGE_SYNC_ALLOW_PRIVATE`](#openstorage_sync_allow_private) | unset (transitional) | Unified sync egress policy: permit private-network upstreams for pull and push (metadata stays blocked) |
+| [`OPENSTORAGE_SYNC_PUSH_ALLOW_PRIVATE`](#openstorage_sync_push_allow_private) | `false` | **Deprecated** push-only spelling of the sync egress policy |
+| [`OPENSTORAGE_SECRETS_KEY`](#openstorage_secrets_key) | unset (plaintext) | AES-256 key list for at-rest encryption of stored webhook secrets and upstream credentials |
+| [`OPENSTORAGE_SECRETS_MODE`](#openstorage_secrets_mode) | `encrypt` | `decrypt-only` stages the key fleet-wide before encrypted writes begin |
+| [`OPENSTORAGE_PACK_QUOTA_BYTES`](#openstorage_pack_quota_bytes) | 10 GiB | Per-repo storage quota, packs + LFS (`0` disables) |
+| [`OPENSTORAGE_LFS_STAGING_BYTES`](#openstorage_lfs_staging_bytes) | 32 GiB | Per-replica cap on in-flight LFS upload staging (`0` disables) |
+| [`OPENSTORAGE_LFS_V020_WRITE_COMPAT`](#openstorage_lfs_v020_write_compat) | `false` | Dual-publish LFS objects to the legacy v0.2.0 key during a rolling upgrade |
+| [`OPENSTORAGE_PACK_RESERVATION_TTL`](#openstorage_pack_reservation_ttl) | `1h` | Lifetime of a crashed writer's quota reservation |
+| [`OPENSTORAGE_MAX_PUSH_BYTES`](#openstorage_max_push_bytes) | 2 × pack quota (min 2 MiB) | Decoded-byte cap on one git push (`0` disables) |
+| [`OPENSTORAGE_VERIFY_SIG_BUDGET`](#openstorage_verify_sig_budget) | `10000` | Per-push `verify-sig` verified-commit budget (`0` disables) |
+| [`OPENSTORAGE_SWEEP_INTERVAL`](#openstorage_sweep_interval) | `1h` | Orphan-pack sweep cadence (`0` disables sweeping) |
+| [`OPENSTORAGE_SWEEP_AGE_THRESHOLD`](#openstorage_sweep_age_threshold) | `24h` | Minimum blob age before an unregistered pack counts as an orphan |
+| [`OPENSTORAGE_SWEEP_DELETE_ENABLED`](#openstorage_sweep_delete_enabled) | `false` | Opt-in: actually delete general orphans (list-only otherwise) |
+| [`OPENSTORAGE_SWEEP_DELETE_SUPERSEDED`](#openstorage_sweep_delete_superseded) | `true` | Reap blobs a repack fold provably superseded |
+| [`OPENSTORAGE_SWEEP_DELETE_LFS`](#openstorage_sweep_delete_lfs) | `false` | Opt-in: actually delete orphan LFS objects (list-only otherwise) |
+| [`OPENSTORAGE_SWEEP_DELETE_LFS_LEGACY`](#openstorage_sweep_delete_lfs_legacy) | `false` | Post-roll opt-in: admit legacy-spelled LFS keys to the LFS reap (ADR-41 transition gate) |
+| [`OPENSTORAGE_REPO_RETENTION`](#openstorage_repo_retention) | unset | Purge repositories soft-deleted longer than this (unset/`0` keeps them forever) |
+| [`OPENSTORAGE_LFS_GC_INTERVAL`](#openstorage_lfs_gc_interval) | unset | Unreferenced-LFS-object reclamation cadence (unset/`0` disables the job) |
+| [`OPENSTORAGE_LFS_GC_GRACE`](#openstorage_lfs_gc_grace) | `24h` | How long an object must stay observed-unreferenced before retirement |
+| [`OPENSTORAGE_LFS_GC_OBJECT_BUDGET`](#openstorage_lfs_gc_object_budget) | `1000000` | Git objects one reclamation run may walk |
+| [`OPENSTORAGE_LFS_GC_DELETE_ENABLED`](#openstorage_lfs_gc_delete_enabled) | `false` | Opt-in: actually retire unreferenced LFS registry rows (report-only otherwise) |
+| [`OPENSTORAGE_LFS_MAX_OBJECTS_PER_REPO`](#openstorage_lfs_max_objects_per_repo) | `100000` | Per-repo LFS object-count cap override |
+| [`OPENSTORAGE_ABSENCE_RECONCILE_INTERVAL`](#openstorage_absence_reconcile_interval) | unset | Registry-vs-storage absence reconciliation cadence (unset/`0` disables the job) |
+| [`OPENSTORAGE_ABSENCE_RECONCILE_BUDGET`](#openstorage_absence_reconcile_budget) | `100000` | Work units one reconciliation pass may charge |
+| [`OPENSTORAGE_REPACK_THRESHOLD`](#openstorage_repack_threshold) | `10` | Registered-pack count that triggers a background repack (`0` disables) |
+| [`OPENSTORAGE_SYNC_STEAL_LEGACY`](#openstorage_sync_steal_legacy) | `false` | Opt-in: steal pre-lease sync claims after their adoption grace lapses |
 
-\* Required unless derived from `CODESTORAGE_DATA_DIR` / `--data-dir` (local mode).
+\* Required unless derived from `OPENSTORAGE_DATA_DIR` / `--data-dir` (local mode).
 
 ## Storage
 
-### `CODESTORAGE_PG_URL`
+### `OPENSTORAGE_PG_URL`
 
 Database URL for the ref authority (CAS) and metadata store.
 
@@ -68,14 +76,14 @@ Database URL for the ref authority (CAS) and metadata store.
   `s3wal://bucket?endpoint=…&region=…` (**experimental** zero-infra mode, single node:
   refs and metadata live in conditional-CAS objects under the bucket's `_wal/` prefix —
   [ADR-46](../adr/046-s3wal-refs-and-metadata-ride-one-conditional-cas-object-per-repo-group.md)).
-- **Legacy aliases** (scanned left to right, first non-empty wins): `SPIKE_PG_URL`, `PG_URL`.
+- **Legacy aliases** (scanned left to right, the first *set* name wins, even when empty): `SPIKE_PG_URL`, `PG_URL`.
 - **Default:** none. Startup fails unless set explicitly or derived from the data dir
   (`sqlite://<dir>/codestorage.db`).
 - On Postgres, schema setup (including the durable [River](https://riverqueue.com) job
   tables) runs automatically at startup and is advisory-lock-serialized, so concurrently
   booting replicas are safe.
 - **`s3wal://` pairing rule:** the scheme requires an `s3://`
-  [`CODESTORAGE_S3_URL`](#codestorage_s3_url) — `file://` (including the data-dir
+  [`OPENSTORAGE_S3_URL`](#openstorage_s3_url) — `file://` (including the data-dir
   derivation) is refused at startup, because the mode's whole premise is that the bucket
   is the *sole* durable authority. Pointing both URLs at the **same bucket** is the
   expected topology (the `packs/`, `lfs/`, and `_wal/` key prefixes coexist without
@@ -88,7 +96,7 @@ Database URL for the ref authority (CAS) and metadata store.
   [store requirements](../how-to/deploy-production.md#zero-infrastructure-mode-experimental-one-bucket-one-node).
   Jobs run on the in-process queue and tickers, exactly like local mode.
 
-### `CODESTORAGE_S3_URL`
+### `OPENSTORAGE_S3_URL`
 
 Immutable pack storage URL, opened through [gocloud.dev](https://gocloud.dev/howto/blob/).
 
@@ -97,17 +105,17 @@ Immutable pack storage URL, opened through [gocloud.dev](https://gocloud.dev/how
   reference — by adding `endpoint=http://...&s3ForcePathStyle=true`; other
   S3-compatible stores, including MinIO, are best-effort) or `file://<absolute-dir>`
   (local mode).
-- **Legacy aliases:** `SPIKE_S3_URL`, `BLOB_URL`.
+- **Legacy aliases** (same presence rule as `OPENSTORAGE_PG_URL`): `SPIKE_S3_URL`, `BLOB_URL`.
 - **Default:** none. Startup fails unless set explicitly or derived from the data dir
   (`file://<dir>/blobs`).
 - S3 credentials come from the standard AWS chain (`AWS_ACCESS_KEY_ID`,
   `AWS_SECRET_ACCESS_KEY`, shared config, instance roles).
 - Delete-mode sweeping interacts with bucket versioning — see
-  [`CODESTORAGE_SWEEP_DELETE_ENABLED`](#codestorage_sweep_delete_enabled).
+  [`OPENSTORAGE_SWEEP_DELETE_ENABLED`](#openstorage_sweep_delete_enabled).
 - With an `s3wal://` database URL this **must** be `s3://` — see the
-  [pairing rule](#codestorage_pg_url); the same bucket is the expected target.
+  [pairing rule](#openstorage_pg_url); the same bucket is the expected target.
 
-### `CODESTORAGE_S3WAL_LEASE_TTL`
+### `OPENSTORAGE_S3WAL_LEASE_TTL`
 
 s3wal mode only: the TTL of the `_wal/instance-lease` dual-serve guard
 ([ADR-46](../adr/046-s3wal-refs-and-metadata-ride-one-conditional-cas-object-per-repo-group.md)
@@ -129,11 +137,11 @@ covers the recovery runbook.
   change is CAS-serialized regardless), so tuning it can only change how quickly an
   accidental second writer is noticed. Ignored outside s3wal mode.
 
-### `CODESTORAGE_S3_EXPECTED_BUCKET_OWNER`
+### `OPENSTORAGE_S3_EXPECTED_BUCKET_OWNER`
 
 Optional [bucket owner
 condition](https://docs.aws.amazon.com/AmazonS3/latest/userguide/bucket-owner-condition.html):
-the 12-digit AWS account ID that must own the `CODESTORAGE_S3_URL` bucket. AWS bucket
+the 12-digit AWS account ID that must own the `OPENSTORAGE_S3_URL` bucket. AWS bucket
 names are global — a deleted bucket name can be re-registered by a third party — and the
 blob layer otherwise trusts whatever the name resolves to. When set, every S3 request the
 server issues carries `x-amz-expected-bucket-owner` via client middleware (the gocloud
@@ -166,7 +174,7 @@ as the blob plane.
   condition described in [Deploy to production](../how-to/deploy-production.md), which
   remains the primary control; this application-level check is defense-in-depth.
 
-### `CODESTORAGE_S3_OP_LOG`
+### `OPENSTORAGE_S3_OP_LOG`
 
 Diagnostics seam (issue #182): when set to a file path, every S3 HTTP round trip issued
 through the server's SDK clients — the blob client and the `s3wal://` conditional
@@ -177,8 +185,8 @@ whitespace-separated line:
 <unixnano> <pid> <role> <operation> <status> <duration_us> <request-path>
 ```
 
-`role` is derived from the process argv (`codestorage:serve`,
-`codestorage:hook:pre-receive`, …), so a shared log attributes each round trip to the
+`role` is derived from the process argv (`openstorage:serve`,
+`openstorage:hook:pre-receive`, …), so a shared log attributes each round trip to the
 process that issued it. Use it to census the per-operation S3 round-trip cost of a
 request (each round trip is a WAN round trip on real S3). Writes are `O_APPEND`
 one-line syscalls, safe for concurrent processes sharing one file.
@@ -192,7 +200,7 @@ one-line syscalls, safe for concurrent processes sharing one file.
 - The log grows without bound and includes object keys; treat it like a debug log
   (temporary use, not permanent telemetry).
 
-### `CODESTORAGE_DATA_DIR`
+### `OPENSTORAGE_DATA_DIR`
 
 Local-mode data directory (the `--data-dir` flag wins over the env var). Setting it derives
 every storage slot **not set explicitly**:
@@ -201,27 +209,31 @@ every storage slot **not set explicitly**:
 - packs: `file://<dir>/blobs`
 - cache: `<dir>/cache`
 
-Explicit `CODESTORAGE_PG_URL` / `CODESTORAGE_S3_URL` / `--cache-dir` always win over the
+The database filename is retained for on-disk compatibility: the renamed binary reopens
+the same database, without a file rename or data migration. See the
+[migration guide](../how-to/migrate-to-openstorage.md#3-keep-persistent-data-locations-unchanged).
+
+Explicit `OPENSTORAGE_PG_URL` / `OPENSTORAGE_S3_URL` / `--cache-dir` always win over the
 derivation. The path is made absolute at startup (git hooks re-exec the binary from a
 different working directory). Local mode is intentionally single-node — see ADR-13 in
 [local-backends notes](../archive/phases/11-local-backends-implementation-notes.md).
 
 ## Server identity and network
 
-### `CODESTORAGE_LISTEN`
+### `OPENSTORAGE_LISTEN`
 
 Listen address for the single HTTP listener (REST API + git smart-HTTP + `/healthz`).
 The `--listen` flag (or its legacy alias `--addr`) wins. **Default:** `127.0.0.1:0`
 (an ephemeral port, printed as `listening on ...` at startup).
 
-### `CODESTORAGE_ORG`
+### `OPENSTORAGE_ORG`
 
 **Required.** The organization name — the JWT `iss` claim every token must carry
 ([auth spec](authentication.md)). `serve` always runs single-org mode: the REST API and
 the git smart-HTTP path authenticate against the same org-key verifier, and the org row is
 bootstrapped from this value at startup.
 
-### `CODESTORAGE_ORG_PUBKEYS`
+### `OPENSTORAGE_ORG_PUBKEYS`
 
 **Required.** Path to a PEM file with one or more public key blocks (PKIX) that verify the
 org's JWTs. Every block that PEM-decodes is validated at startup (must be a `PUBLIC KEY`
@@ -229,11 +241,11 @@ block of a supported family) — but parsing stops silently at the first undecod
 a truncated block appended after a valid key is dropped rather than rejected. After a key
 rotation, verify a token signed with the newly added key is accepted instead of trusting
 startup success.
-Generate a keypair with [`codestorage keygen`](cli.md#codestorage-keygen); allowed JWS
+Generate a keypair with [`openstorage keygen`](cli.md#openstorage-keygen); allowed JWS
 algorithms are `ES256`, `RS256`, `EdDSA`, `PS256`, `ES384`, `ES512` (`none` and `HS*` are
 always rejected).
 
-### `CODESTORAGE_BASE_URL`
+### `OPENSTORAGE_BASE_URL`
 
 Externally reachable base URL (`http(s)://host[:port]`, no query/fragment; a trailing slash
 is stripped) used for the `http_url` values in API responses. **Default:** derived from the
@@ -242,7 +254,7 @@ real deployment or reverse proxy.
 
 ## Rate limiting
 
-### `CODESTORAGE_RATE_RPS` / `CODESTORAGE_RATE_BURST`
+### `OPENSTORAGE_RATE_RPS` / `OPENSTORAGE_RATE_BURST`
 
 Per-client-IP token-bucket rate limit applied to the REST surface **and** — with separate
 bucket state — the git smart-HTTP surface. Exceeding it yields `429` with `Retry-After`
@@ -257,10 +269,10 @@ documented upstream on every 429.
   smart-HTTP requests, and a burst too small for a complete exchange would make every
   clone/fetch/push permanently fail.
 - Client identity defaults to the TCP `RemoteAddr`; forwarded headers are **not** trusted
-  unless `CODESTORAGE_TRUSTED_PROXIES` is set. Behind a proxy that pools backend
+  unless `OPENSTORAGE_TRUSTED_PROXIES` is set. Behind a proxy that pools backend
   connections, all clients otherwise share one bucket.
 
-### `CODESTORAGE_TRUSTED_PROXIES`
+### `OPENSTORAGE_TRUSTED_PROXIES`
 
 Comma-separated CIDR allowlist (bare IPs accepted as single-address entries) of reverse
 proxies whose forwarded client identity the rate limiters may trust.
@@ -276,7 +288,7 @@ proxies whose forwarded client identity the rate limiters may trust.
   that forwards client-supplied values verbatim lets any client mint fresh rate-limit
   buckets.
 
-### `CODESTORAGE_SYNC_ALLOW_PRIVATE`
+### `OPENSTORAGE_SYNC_ALLOW_PRIVATE`
 
 Unified sync egress policy for BOTH git transfer directions (ADR-45). `upstream_host` is
 caller-linked data, so every http(s) sync transfer — inbound pull-upstream fetches
@@ -295,7 +307,7 @@ dial-time enforcement stays authoritative.
   denied either way.
 - `false` — strict in both directions: only public upstreams are dialable.
 - **Unset (the transitional default):** pushes stay strict (the deprecated
-  [`CODESTORAGE_SYNC_PUSH_ALLOW_PRIVATE`](#codestorage_sync_push_allow_private) may relax
+  [`OPENSTORAGE_SYNC_PUSH_ALLOW_PRIVATE`](#openstorage_sync_push_allow_private) may relax
   them), while pulls ALLOW private upstreams and `serve` logs a boot warning. Syncing
   from internal forges is a mainstream released 0.6.x deployment shape, so this release
   does not break it; **a future release flips the unset pull default to deny.** Set the
@@ -310,16 +322,16 @@ Operators that require proxied egress must enforce an equivalent destination pol
 that proxy; there is no supported way to chain the guard through an external proxy.
 Malformed boolean values are startup errors.
 
-### `CODESTORAGE_SYNC_PUSH_ALLOW_PRIVATE`
+### `OPENSTORAGE_SYNC_PUSH_ALLOW_PRIVATE`
 
 **Deprecated** push-only spelling of the sync egress policy, kept for released 0.6.x
 deployments. **Default: `false`.** When
-[`CODESTORAGE_SYNC_ALLOW_PRIVATE`](#codestorage_sync_allow_private) is unset, `true`
+[`OPENSTORAGE_SYNC_ALLOW_PRIVATE`](#openstorage_sync_allow_private) is unset, `true`
 relaxes the private receiver classes for outbound push forwards only (its historical
 meaning); when the unified variable is set, this one is ignored. Either state logs a
 boot-time deprecation notice naming the replacement.
 
-### `CODESTORAGE_WEBHOOK_ALLOW_PRIVATE`
+### `OPENSTORAGE_WEBHOOK_ALLOW_PRIVATE`
 
 Controls the native webhook SSRF guard. **Default: `false`.** By default, webhook delivery
 rejects IANA special-purpose ranges, including loopback, RFC 1918, RFC 6598 shared,
@@ -349,7 +361,7 @@ are startup errors.
 
 ## Secrets at rest
 
-### `CODESTORAGE_SECRETS_KEY`
+### `OPENSTORAGE_SECRETS_KEY`
 
 Enables application-level envelope encryption of the metadata database's secret columns:
 webhook HMAC signing secrets (`webhooks.secret`) and upstream-sync credential passwords
@@ -381,14 +393,14 @@ every process can decrypt it (a single-replica deployment, e.g. local mode, can 
 straight to step 3):
 
 1. **Binary first:** deploy an envelope-aware binary to *every* node — serve replicas and
-   hook-running git nodes — with `CODESTORAGE_SECRETS_KEY` unset. Plaintext behavior is
+   hook-running git nodes — with `OPENSTORAGE_SECRETS_KEY` unset. Plaintext behavior is
    unchanged (see the upgrade-ordering note below for why this must come first).
-2. **Stage the key, decrypt-only:** set `CODESTORAGE_SECRETS_KEY` together with
-   [`CODESTORAGE_SECRETS_MODE=decrypt-only`](#codestorage_secrets_mode) fleet-wide. Every
+2. **Stage the key, decrypt-only:** set `OPENSTORAGE_SECRETS_KEY` together with
+   [`OPENSTORAGE_SECRETS_MODE=decrypt-only`](#openstorage_secrets_mode) fleet-wide. Every
    process loads the key for reading but keeps writing plaintext and performs no rewrites,
    so replicas restarted earlier never produce a value the rest cannot read.
 3. **Switch to encrypt:** once every replica runs with the staged key, drop
-   `CODESTORAGE_SECRETS_MODE` (or set it to `encrypt`) fleet-wide. Encrypted writes and
+   `OPENSTORAGE_SECRETS_MODE` (or set it to `encrypt`) fleet-wide. Encrypted writes and
    lazy re-encryption begin; replicas restarted earlier in this rollout write envelopes
    the not-yet-restarted ones already decrypt, courtesy of step 2.
 
@@ -399,10 +411,10 @@ steps 2–3.
 ever encounter a key it cannot decrypt:
 
 1. **Stage the new key fleet-wide, as a decrypt-only list entry:**
-   `CODESTORAGE_SECRETS_KEY="<old-key>,<new-key>"`. Writes still use the old key, but
+   `OPENSTORAGE_SECRETS_KEY="<old-key>,<new-key>"`. Writes still use the old key, but
    every restarted process can already decrypt both, so ordering within the rollout does
    not matter.
-2. **Promote, fleet-wide:** `CODESTORAGE_SECRETS_KEY="<new-key>,<old-key>"`. Replicas
+2. **Promote, fleet-wide:** `OPENSTORAGE_SECRETS_KEY="<new-key>,<old-key>"`. Replicas
    restarted earlier keep decrypting new-key rows because step 1 listed it everywhere.
 3. **Rewrite and verify, then drop the old key** (below).
 
@@ -446,24 +458,24 @@ run an envelope-aware binary before the key is set anywhere. The same constraint
 in reverse: rolling back to a pre-envelope binary while encrypted rows exist silently
 misuses them — decrypt requirements do not roll back with the binary.
 
-### `CODESTORAGE_SECRETS_MODE`
+### `OPENSTORAGE_SECRETS_MODE`
 
-Staging switch for [`CODESTORAGE_SECRETS_KEY`](#codestorage_secrets_key). **Default:
+Staging switch for [`OPENSTORAGE_SECRETS_KEY`](#openstorage_secrets_key). **Default:
 `encrypt`** (normal operation). `decrypt-only` loads the key list for reading but keeps
 writing plaintext and performs no lazy rewrites — the first-enable staging mode described
 above, used while a rolling restart distributes the key so that no envelope exists before
-every replica can decrypt it. Setting `decrypt-only` without `CODESTORAGE_SECRETS_KEY`,
+every replica can decrypt it. Setting `decrypt-only` without `OPENSTORAGE_SECRETS_KEY`,
 or any other value, is a startup error. Do not run `decrypt-only` indefinitely: it stores
 new secrets plaintext.
 
 ## Pack quota
 
-### `CODESTORAGE_PACK_QUOTA_BYTES`
+### `OPENSTORAGE_PACK_QUOTA_BYTES`
 
 Per-repository storage-bytes quota enforced at every external storage writer: git pushes
 that would grow a repo's `packs/` usage past the quota are refused at pre-receive before
 anything is stored, REST pack writes (commit-pack, merge, notes, fork) are refused with
-a `403` envelope, and Git LFS uploads ([#51](https://github.com/coder/code-storage/issues/51))
+a `403` envelope, and Git LFS uploads ([#51](https://github.com/coder/open-storage/issues/51))
 are refused with per-object `507` batch errors before any transfer URL is issued (the
 verified upload transfer re-checks the actual `Content-Length`, so under-declared batch
 sizes cannot bypass the gate).
@@ -489,11 +501,11 @@ sizes cannot bypass the gate).
   compact itself otherwise), and repack preserves the registered object set — it does not
   reclaim unreachable objects. LFS downloads are never quota-gated.
 
-### `CODESTORAGE_LFS_STAGING_BYTES`
+### `OPENSTORAGE_LFS_STAGING_BYTES`
 
 Node-wide cap on the aggregate bytes of Git LFS uploads staging on one replica at a
 time. LFS uploads go through the verified proxy transfer
-([#51](https://github.com/coder/code-storage/issues/51)) and stage their full body
+([#51](https://github.com/coder/open-storage/issues/51)) and stage their full body
 under the replica's `$TMPDIR` before verification and publication — the
 per-repository quota above bounds neither the node (it is per repo) nor anything when
 disabled, so this is the replica's disk-protection bound. The budget is charged
@@ -516,11 +528,11 @@ answers `413`.
 - Each object additionally allows only one in-flight upload per replica (concurrent
   identical PUTs answer `429`), and an upload body is aborted — releasing its capacity —
   when it delivers no bytes for a full minute **or** outlives the
-  [reservation TTL](#codestorage_pack_reservation_ttl) in total (an upload slower than
+  [reservation TTL](#openstorage_pack_reservation_ttl) in total (an upload slower than
   the TTL's implied floor — ~3 MB/s for 10 GiB at the defaults — cannot finish before
   its admission reservation expires anyway).
 
-### `CODESTORAGE_LFS_V020_WRITE_COMPAT`
+### `OPENSTORAGE_LFS_V020_WRITE_COMPAT`
 
 Registered LFS objects live at a canonical key old presigned upload URLs cannot
 address ([ADR-41](../adr/041-registered-lfs-objects-live-at-a-canonical-key-legacy-presigned-urls-cannot-address.md));
@@ -539,23 +551,24 @@ reclaims them under its LFS opt-in.
 - **Default:** `false`. The canonical spelling is the secure one — the compat
   copies are exactly as exposed to still-valid legacy upload URLs as everything
   v0.2.0 served — so compat is opt-in and meant to be temporary.
-- **Cannot be combined with [`CODESTORAGE_SWEEP_DELETE_LFS`](#codestorage_sweep_delete_lfs)
-  while a sweep schedule is active** (`CODESTORAGE_SWEEP_INTERVAL` > 0 — a
+- **Cannot be combined with [`OPENSTORAGE_SWEEP_DELETE_LFS`](#openstorage_sweep_delete_lfs)
+  while a sweep schedule is active** (`OPENSTORAGE_SWEEP_INTERVAL` > 0 — a
   fail-fast startup error; with the interval at `0` no schedule is built, the
   delete flag is inert, and the fleet-wide sweep emergency stop stays
   available): the flag declares a mixed v0.2.0 fleet, and during
   that roll destructive LFS sweeping must be off **fleet-wide** — the in-place row
   migration makes a touched object's legacy blob rowless to an old binary's
   sweeper, which has no legacy gate and reaps it immediately, breaking
-  old-replica reads. The tripwire covers upgraded nodes; disable the flag on the
-  old nodes yourself before rolling.
-- With a [storage quota](#codestorage_pack_quota_bytes) enforced, the bridge copy
+  old-replica reads. The tripwire covers upgraded nodes; set
+  `CODESTORAGE_SWEEP_DELETE_LFS=false` on pre-0.15 nodes yourself before rolling
+  (those binaries do not recognize the new prefix).
+- With a [storage quota](#openstorage_pack_quota_bytes) enforced, the bridge copy
   passes real quota admission: each fresh upload effectively costs twice its size
   for the roll's duration, and an upload whose bridge would exceed the quota
   answers `507` instead of overshooting (the canonical object stays registered;
   freeing space lets a retry repair the bridge).
 
-### `CODESTORAGE_PACK_RESERVATION_TTL`
+### `OPENSTORAGE_PACK_RESERVATION_TTL`
 
 How long a crashed writer's quota reservation keeps gating admission (Go duration, e.g.
 `30m`, `2h`). Admission ignores rows older than the TTL immediately; the sweeper's
@@ -576,7 +589,7 @@ periodic pruning of expired rows is garbage collection, not what re-opens headro
 
 ## Push work bounds
 
-### `CODESTORAGE_MAX_PUSH_BYTES`
+### `OPENSTORAGE_MAX_PUSH_BYTES`
 
 Decoded-byte cap on one git push: a `git-receive-pack` request whose body — after any
 `Content-Encoding: gzip` decode, so compressed streams cannot smuggle a larger payload —
@@ -585,12 +598,12 @@ exceeds this many bytes is rejected with `413` and a JSON error envelope. Only b
 without reading at all), so per-push disk and decode work is bounded by the cap: git
 discards the truncated partial quarantine when the stream is cut, and nothing is
 published or registered on the overflow path. This is the native pre-storage push bound
-([#55](https://github.com/coder/code-storage/issues/55)); the pack quota above bounds
+([#55](https://github.com/coder/open-storage/issues/55)); the pack quota above bounds
 *retained* storage and runs only after a push has fully streamed to the replica's disk.
 (Degenerate exception: a *complete, valid* push padded with trailing junk past the cap
 still answers `413`, but its hooks already ran under the normal quota admission.)
 
-- **Default:** 2 × [`CODESTORAGE_PACK_QUOTA_BYTES`](#codestorage_pack_quota_bytes), with
+- **Default:** 2 × [`OPENSTORAGE_PACK_QUOTA_BYTES`](#openstorage_pack_quota_bytes), with
   a 2 MiB minimum — a push cannot legitimately need more than quota admission would
   accept plus protocol overhead, and the floor keeps delete-only/zero-growth pushes (the
   over-quota recovery path) working under byte-scale quotas. Disabling the quota (`0`)
@@ -604,10 +617,10 @@ still answers `413`, but its hooks already ran under the normal quota admission.
   cannot otherwise be bounded by a decoded count). Single-member streams — what git
   clients send — never approach it; the 413 envelope names both bounds.
 
-### `CODESTORAGE_VERIFY_SIG_BUDGET`
+### `OPENSTORAGE_VERIFY_SIG_BUDGET`
 
 Per-push budget for `verify-sig` signature verifications
-([#59](https://github.com/coder/code-storage/issues/59)): the maximum number of commits
+([#59](https://github.com/coder/open-storage/issues/59)): the maximum number of commits
 one push may verify — each verification spawns a `git verify-commit` subprocess — across
 all its refs, pre-receive evaluation and update hooks combined. A ref update that would
 exceed the remaining budget is rejected fail-closed **before** the excess verifications
@@ -638,7 +651,7 @@ while `git push --atomic` rejects the whole push on the first denial.
 Background jobs run through a queue seam: durable [River](https://riverqueue.com) jobs on
 Postgres, in-process in local mode.
 
-### `CODESTORAGE_SWEEP_INTERVAL`
+### `OPENSTORAGE_SWEEP_INTERVAL`
 
 Interval between orphan-pack sweeps (Go duration). The sweeper diffs the blob store's
 `packs/` and `lfs/` listings against their authoritative registries and reports — and
@@ -651,7 +664,7 @@ It also prunes expired quota reservations on the same cadence.
   startup — without it a duplicate row would double-charge usage and the object cap
   indefinitely); negative values are startup errors.
 
-### `CODESTORAGE_SWEEP_AGE_THRESHOLD`
+### `OPENSTORAGE_SWEEP_AGE_THRESHOLD`
 
 Minimum blob age before an unregistered pack counts as an orphan (Go duration). The
 threshold is the only concurrency guard needed: in-flight pushes register their packs
@@ -659,7 +672,7 @@ within a request timeout, far below any sane threshold.
 
 - **Default:** `24h`. **Constraints:** must be positive.
 
-### `CODESTORAGE_SWEEP_DELETE_ENABLED`
+### `OPENSTORAGE_SWEEP_DELETE_ENABLED`
 
 Opt-in delete mode for **general** orphans. `false` (the default) is list-only: candidates
 are logged, nothing is deleted. Deletes copy each blob to a quarantine key first, and every
@@ -679,7 +692,7 @@ quarantine — so a rollback to list-only still repairs a delete-enabled crash.
   `s3:GetBucketVersioning` or stay list-only), and every delete-mode sweep re-checks at
   runtime, downgrading itself to list-only on drift.
 
-### `CODESTORAGE_SWEEP_DELETE_SUPERSEDED`
+### `OPENSTORAGE_SWEEP_DELETE_SUPERSEDED`
 
 Delete mode for the **narrow superseded-by-repack** class: blobs whose registry rows a
 repack fold provably removed (durable `pack_retained` records) are reaped after the age
@@ -689,11 +702,11 @@ threshold and their retained bytes returned to the repo's quota headroom.
 - Unlike the general delete opt-in above, a versioned S3 bucket does not fail startup —
   each sweep run downgrades to list-only instead (the heal pass still runs).
 
-### `CODESTORAGE_SWEEP_DELETE_LFS`
+### `OPENSTORAGE_SWEEP_DELETE_LFS`
 
 Delete mode for **LFS orphans**: `lfs/` blobs with no LFS registry row, older than the
-age threshold. Deliberately separate from `CODESTORAGE_SWEEP_DELETE_ENABLED`: the LFS
-registry ships with [#51](https://github.com/coder/code-storage/issues/51), so **every
+age threshold. Deliberately separate from `OPENSTORAGE_SWEEP_DELETE_ENABLED`: the LFS
+registry ships with [#51](https://github.com/coder/open-storage/issues/51), so **every
 LFS object uploaded by an older build has no row** and would classify as an orphan —
 a fleet already running general deletes must not reap its pre-existing LFS population
 on upgrade. Stored objects are adopted into the registry by write-scoped touches
@@ -705,10 +718,10 @@ on upgrade. Stored objects are adopted into the registry by write-scoped touches
 - Same quarantine-first disposal and heal pass as the pack classes; on versioned S3
   buckets it fails startup exactly like the general delete opt-in.
 - Legacy-spelled keys (`lfs/<repo_id>/<oid>`, ADR-41) are **excluded** from this reap
-  until [`CODESTORAGE_SWEEP_DELETE_LFS_LEGACY`](#codestorage_sweep_delete_lfs_legacy)
+  until [`OPENSTORAGE_SWEEP_DELETE_LFS_LEGACY`](#openstorage_sweep_delete_lfs_legacy)
   is also set.
 
-### `CODESTORAGE_SWEEP_DELETE_LFS_LEGACY`
+### `OPENSTORAGE_SWEEP_DELETE_LFS_LEGACY`
 
 Post-roll cleanup opt-in for **legacy-spelled** LFS keys (`lfs/<repo_id>/<oid>` — the
 v0.2.0-and-older spelling,
@@ -716,31 +729,31 @@ v0.2.0-and-older spelling,
 Adoption migrates objects to canonical keys but **retains** the legacy source: old
 replicas derive only that spelling, and a just-issued presigned GET must survive its
 lifetime — so during a rolling upgrade the retained sources are aged rowless orphans
-that [`CODESTORAGE_SWEEP_DELETE_LFS`](#codestorage_sweep_delete_lfs) alone must not
+that [`OPENSTORAGE_SWEEP_DELETE_LFS`](#openstorage_sweep_delete_lfs) alone must not
 touch. This flag is the operator's assertion that the transition is over: every
 replica runs the new binary and the last old replica exited more than 15 minutes ago
 (the presign expiry). The transition gate dominates every other flag combination —
 without this flag no sweep mode deletes a legacy-spelled key.
 
 - **Default:** `false` (legacy keys are never deleted). **Constraints:** must parse
-  as a boolean; only meaningful together with `CODESTORAGE_SWEEP_DELETE_LFS`.
+  as a boolean; only meaningful together with `OPENSTORAGE_SWEEP_DELETE_LFS`.
 - Same quarantine-first disposal as every destructive class.
 
-### `CODESTORAGE_REPO_RETENTION`
+### `OPENSTORAGE_REPO_RETENTION`
 
 Retention window for soft-deleted repositories: once a repository has been deleted
 longer than this, a purge pass on the sweep cadence **permanently** removes its
 registry and eventing rows (refs, packs, LFS objects, credentials, upstream link) and
 deletes its blobs through the same quarantine-first discipline as every other sweep
 class. Only the repository row itself is retained, stamped as a purge tombstone — see
-the name-burn note below. The [`codestorage purge-repo`](cli.md#codestorage-purge-repo)
+the name-burn note below. The [`openstorage purge-repo`](cli.md#openstorage-purge-repo)
 command runs the same primitive synchronously for one repository.
 
 - **Default:** unset (`0`) — soft-deleted repositories are kept forever.
 - **Constraints:** a Go duration of at least `1h` (shorter values are startup errors:
   the purge always waits at least an hour after deletion so no in-flight pre-delete
   push can race it), and sweeping must be enabled
-  ([`CODESTORAGE_SWEEP_INTERVAL`](#codestorage_sweep_interval) > 0) — the purge rides
+  ([`OPENSTORAGE_SWEEP_INTERVAL`](#openstorage_sweep_interval) > 0) — the purge rides
   the sweep schedule.
 - **Fleet-upgrade prerequisite:** enable only once **every** node — serve replicas *and*
   hook-running git nodes — runs a build with the purge write fence (ref updates and
@@ -748,7 +761,7 @@ command runs the same primitive synchronously for one repository.
   fence, so on a mixed fleet a write accepted by an old node can commit after the
   purge's verification and be stranded behind the completed purge while reporting
   success. The same prerequisite applies to running
-  [`codestorage purge-repo`](cli.md#codestorage-purge-repo). Leaving retention unset is
+  [`openstorage purge-repo`](cli.md#openstorage-purge-repo). Leaving retention unset is
   safe on any fleet.
 - **Purged repositories cannot be restored.** The repository row is kept as a permanent
   tombstone, so the burned `(org, url)` name is never released: JWT repo claims are
@@ -761,10 +774,10 @@ command runs the same primitive synchronously for one repository.
   the repository before touching anything, so a still-in-flight pre-delete push fails
   instead of racing the reclamation.
 
-### `CODESTORAGE_LFS_GC_INTERVAL`
+### `OPENSTORAGE_LFS_GC_INTERVAL`
 
 Cadence of the unreferenced-LFS-object reclamation job
-([#73](https://github.com/coder/code-storage/issues/73),
+([#73](https://github.com/coder/open-storage/issues/73),
 [ADR-42](../adr/042-lfs-reclamation-is-mark-and-sweep-over-reachable-pointer-files.md)).
 Registered LFS objects are otherwise permanent, so a `git:write` holder
 direct-PUTting tiny objects nobody references can exhaust the per-repo
@@ -772,9 +785,9 @@ object-count cap for everyone (`507` on every new object). Each run walks the
 reachable pointer files of repositories holding LFS objects (bounded, resumable
 — see the [operations guide](../how-to/storage-lifecycle-and-sweeping.md#reclaiming-unreferenced-lfs-objects)),
 stamps rows no reachable pointer references, and — only with
-[`CODESTORAGE_LFS_GC_DELETE_ENABLED`](#codestorage_lfs_gc_delete_enabled) —
+[`OPENSTORAGE_LFS_GC_DELETE_ENABLED`](#openstorage_lfs_gc_delete_enabled) —
 retires rows whose stamp survived a full
-[grace window](#codestorage_lfs_gc_grace), refunding their object count and
+[grace window](#openstorage_lfs_gc_grace), refunding their object count and
 quota bytes.
 
 - **Default:** unset (`0`) — the job never runs. `0` is also the fleet-wide
@@ -782,12 +795,12 @@ quota bytes.
 - **Constraints:** a non-negative Go duration.
 - Retirement removes registry rows only; the blobs become ordinary rowless
   orphans reaped by the
-  [sweeper's LFS delete opt-in](#codestorage_sweep_delete_lfs). Arming
+  [sweeper's LFS delete opt-in](#openstorage_sweep_delete_lfs). Arming
   retirement therefore
-  [requires that opt-in](#codestorage_lfs_gc_delete_enabled) — refunded cap
+  [requires that opt-in](#openstorage_lfs_gc_delete_enabled) — refunded cap
   slots must never outrun physical deletion.
 
-### `CODESTORAGE_LFS_GC_GRACE`
+### `OPENSTORAGE_LFS_GC_GRACE`
 
 How long an LFS object must stay **continuously** observed as unreferenced
 before reclamation may retire its registry row. The clock starts when a scan
@@ -801,10 +814,10 @@ take, so no signal can lose the race silently.
   comfortably above your longest expected upload→push gap — a pointer pushed
   through the normal git-lfs flow always touches the object first, but raw-git
   pointer pushes only get the reachability scan's protection.
-- With [`CODESTORAGE_LFS_GC_DELETE_ENABLED`](#codestorage_lfs_gc_delete_enabled)
+- With [`OPENSTORAGE_LFS_GC_DELETE_ENABLED`](#openstorage_lfs_gc_delete_enabled)
   set, the grace must also be at least the physical reap cadence —
-  max([`CODESTORAGE_SWEEP_AGE_THRESHOLD`](#codestorage_sweep_age_threshold),
-  [`CODESTORAGE_SWEEP_INTERVAL`](#codestorage_sweep_interval), the 1-hour
+  max([`OPENSTORAGE_SWEEP_AGE_THRESHOLD`](#openstorage_sweep_age_threshold),
+  [`OPENSTORAGE_SWEEP_INTERVAL`](#openstorage_sweep_interval), the 1-hour
   quarantine retention floor) — a startup error otherwise: cap slots
   refunded faster than the reap (and its quarantine purge) frees their
   blobs would let one repository's upload→retire cycles grow the shared
@@ -814,7 +827,7 @@ take, so no signal can lose the race silently.
   to two seconds longer than configured. The window is never shorter than the
   configured grace on either backend.
 
-### `CODESTORAGE_LFS_GC_OBJECT_BUDGET`
+### `OPENSTORAGE_LFS_GC_OBJECT_BUDGET`
 
 Caps the work units one reclamation run may spend — each git object a
 reachability walk lists charges one unit plus one more per 4 KiB of its raw
@@ -829,27 +842,27 @@ is ever marked or retired from a partial walk.
 
 - **Default:** `1000000`. **Constraints:** a positive integer.
 
-### `CODESTORAGE_LFS_GC_DELETE_ENABLED`
+### `OPENSTORAGE_LFS_GC_DELETE_ENABLED`
 
 Arms retirement. Off, the job still scans, stamps, and reports what it *would*
 retire (`rows_eligible` in the run report) — the same staged rollout as the
-[sweep delete flags](#codestorage_sweep_delete_enabled): watch report-only runs
+[sweep delete flags](#openstorage_sweep_delete_enabled): watch report-only runs
 until the eligible rows are the junk you expect, then opt in.
 
 - **Default:** `false`. **Constraints:** must parse as a boolean; requires
-  [`CODESTORAGE_LFS_GC_INTERVAL`](#codestorage_lfs_gc_interval) > 0 (arming a
+  [`OPENSTORAGE_LFS_GC_INTERVAL`](#openstorage_lfs_gc_interval) > 0 (arming a
   disabled job is a startup error).
 - **Physical-deletion coupling** (security): retirement refunds the
   object-cap slot, but only the
-  [`CODESTORAGE_SWEEP_DELETE_LFS`](#codestorage_sweep_delete_lfs) reap deletes
+  [`OPENSTORAGE_SWEEP_DELETE_LFS`](#openstorage_sweep_delete_lfs) reap deletes
   the stranded blob — decoupled, upload → grace → retire → re-upload cycles
   would grow `lfs/<repo>/` far past the cap that quota floors and sweep
   listings rely on to stay bounded. Arming retirement while the sweep
   schedule is live therefore requires that opt-in, plus a
-  [grace](#codestorage_lfs_gc_grace) of at least the reap cadence, including
+  [grace](#openstorage_lfs_gc_grace) of at least the reap cadence, including
   the 1-hour quarantine retention floor every reap's backup copy is kept for
   (startup errors otherwise). The coupling is also OBSERVED at runtime
-  ([#120](https://github.com/coder/code-storage/issues/120)): each
+  ([#120](https://github.com/coder/open-storage/issues/120)): each
   destructive LFS sweep pass that completes its keyspace with zero errors
   records a durable fleet-wide watermark, and retirement refunds slots only
   while that watermark is fresher than the grace window — armed-but-failing
@@ -859,12 +872,12 @@ until the eligible rows are the junk you expect, then opt in.
   report-only until its first clean destructive LFS sweep completes.
   Legacy-spelled rows (pre-ADR-41 `lfs/<repo>/<oid>` keys) are gated one
   step further: their blobs are only reaped when
-  [`CODESTORAGE_SWEEP_DELETE_LFS_LEGACY`](#codestorage_sweep_delete_lfs_legacy)
+  [`OPENSTORAGE_SWEEP_DELETE_LFS_LEGACY`](#openstorage_sweep_delete_lfs_legacy)
   is also armed, so they retire only while that flag is set AND the fresh
   watermark records a legacy-armed sweep — otherwise they defer with
   `rows_deferred_legacy_unarmed` in the run report. With
   the sweep schedule stopped
-  ([`CODESTORAGE_SWEEP_INTERVAL=0`](#codestorage_sweep_interval), the
+  ([`OPENSTORAGE_SWEEP_INTERVAL=0`](#openstorage_sweep_interval), the
   emergency stop), the process starts but demotes retirement to report-only
   with a warning — nothing would reap the blobs meanwhile.
 - **Mixed-fleet prerequisite:** every replica serving LFS requests must run a
@@ -872,18 +885,18 @@ until the eligible rows are the junk you expect, then opt in.
   "already stored" without clearing the reclamation stamp, so a grace-expired
   row could retire before that client pushes its pointer. If report-only
   scans ran during the roll, also wait one full
-  [grace](#codestorage_lfs_gc_grace) after the last pre-touch replica stops
+  [grace](#openstorage_lfs_gc_grace) after the last pre-touch replica stops
   before arming deletes: marks stamped mid-roll may already be grace-expired,
   and shutdown revokes none of the old replica's outstanding "stored"
   promises. See
   [the rollout guidance](../how-to/storage-lifecycle-and-sweeping.md#reclaiming-unreferenced-lfs-objects).
 
-### `CODESTORAGE_LFS_MAX_OBJECTS_PER_REPO`
+### `OPENSTORAGE_LFS_MAX_OBJECTS_PER_REPO`
 
 Per-repository LFS object-count cap (issue
-[#51](https://github.com/coder/code-storage/issues/51)): bytes bound row count
+[#51](https://github.com/coder/open-storage/issues/51)): bytes bound row count
 at nothing, so the registry's population needs its own bound. This override is
-the operator escape hatch of [#73](https://github.com/coder/code-storage/issues/73):
+the operator escape hatch of [#73](https://github.com/coder/open-storage/issues/73):
 a repository wedged at the cap by unreferenced junk can be unwedged immediately
 by raising the cap, without waiting for a reclamation grace window.
 
@@ -891,10 +904,10 @@ by raising the cap, without waiting for a reclamation grace window.
   enforced at registration inside the serve process, so set it identically on
   every replica.
 
-### `CODESTORAGE_ABSENCE_RECONCILE_INTERVAL`
+### `OPENSTORAGE_ABSENCE_RECONCILE_INTERVAL`
 
 Cadence of the registry-vs-storage absence reconciliation job
-([#101](https://github.com/coder/code-storage/issues/101),
+([#101](https://github.com/coder/open-storage/issues/101),
 [ADR-43](../adr/043-absence-reconciliation-covers-registered-but-missing-bytes.md)).
 Each pass pages registered rows — `lfs_objects` and `packs` — and
 point-checks their bytes still physically exist in blob storage. While a
@@ -909,7 +922,7 @@ integrity loss logged loudly: committed refs may reference it). See the
 
 - **Default:** unset (`0`) — the job never runs.
 - **Constraints:** a non-negative Go duration, at most half of
-  [`CODESTORAGE_PACK_RESERVATION_TTL`](#codestorage_pack_reservation_ttl)
+  [`OPENSTORAGE_PACK_RESERVATION_TTL`](#openstorage_pack_reservation_ttl)
   (a startup error otherwise): covers are ordinary TTL'd reservations
   renewed once per pass, a pass's wall clock is capped at a quarter of the
   TTL, and periodic ticks that fire mid-pass coalesce — together those
@@ -918,7 +931,7 @@ integrity loss logged loudly: committed refs may reference it). See the
 - The job is non-destructive on every path: it only inserts/refreshes
   reservation rows and bumps the shared floor generation. With quota
   enforcement disabled
-  ([`CODESTORAGE_PACK_QUOTA_BYTES=0`](#codestorage_pack_quota_bytes)) it
+  ([`OPENSTORAGE_PACK_QUOTA_BYTES=0`](#openstorage_pack_quota_bytes)) it
   detects and reports without charging anything.
 - **Degraded-renewal admission fence** (quota enforcement on): every
   successful pass stamps a renewal-health watermark. If a pass's cover
@@ -957,13 +970,13 @@ integrity loss logged loudly: committed refs may reference it). See the
   are fleet-wide only once every replica runs a fence-aware binary.
   Enable this job only after the whole fleet is upgraded; when
   upgrading a fleet that already runs it, complete the roll within one
-  [`CODESTORAGE_PACK_RESERVATION_TTL`](#codestorage_pack_reservation_ttl)
+  [`OPENSTORAGE_PACK_RESERVATION_TTL`](#openstorage_pack_reservation_ttl)
   (healthy renewal re-TTLs covers every pass, so a prompt roll leaves
   no expired cover for pre-upgrade GC to consume). The serve boot log
   warns while reconciliation runs with quota enforcement as a reminder
   of this prerequisite (see ADR-43).
 
-### `CODESTORAGE_ABSENCE_RECONCILE_BUDGET`
+### `OPENSTORAGE_ABSENCE_RECONCILE_BUDGET`
 
 Caps the work units one reconciliation pass may charge: one per registry row
 examined plus one per extra registration or twin-spelling probe — each unit
@@ -982,7 +995,7 @@ stretches individual probes.
 - Discovered losses are covered by ONE aggregate reservation row per
   affected repository and registry class, and the cover rows themselves
   are the durable tracking state
-  ([#125](https://github.com/coder/code-storage/issues/125)): the renewal
+  ([#125](https://github.com/coder/open-storage/issues/125)): the renewal
   phase lists the live rows and re-charges each at one work unit per row,
   entirely database-derived, so the per-repo reservation-row cap cannot
   bind and any replica keeps every cover alive. Each full rotation over a
@@ -1000,7 +1013,7 @@ stretches individual probes.
   so multi-replica PostgreSQL fleets share one rotation regardless of
   which replica River schedules.
 
-### `CODESTORAGE_REPACK_THRESHOLD`
+### `OPENSTORAGE_REPACK_THRESHOLD`
 
 Registered-pack count at which a post-write trigger schedules a background repack fold for
 that repository. Repack packs the union of the snapshotted packs' objects into one
@@ -1011,7 +1024,7 @@ consolidated pack — the registered object set never shrinks.
   trigger); negative or malformed values are startup errors.
 - Pack counts converge below the threshold, not necessarily to a single pack.
 
-### `CODESTORAGE_SYNC_STEAL_LEGACY`
+### `OPENSTORAGE_SYNC_STEAL_LEGACY`
 
 Upstream-sync claims are leased: a run that dies mid-sync leaves a claim the next run
 steals automatically once the lease expires. Claims written by **pre-lease builds** carry
@@ -1021,7 +1034,7 @@ under one grace period but will not steal them without this opt-in.
 - **Default:** `false` (adopted legacy claims are never stolen). Malformed values stay
   disabled.
 - **Enable only after the whole fleet runs a lease-aware build** (same fleet prerequisite
-  as [`CODESTORAGE_SWEEP_DELETE_ENABLED`](#codestorage_sweep_delete_enabled)): from then
+  as [`OPENSTORAGE_SWEEP_DELETE_ENABLED`](#openstorage_sweep_delete_enabled)): from then
   on, legacy claims can only be pre-upgrade crash leftovers, and stealing them heals those
   wedges without operator row-surgery. Safe to leave enabled permanently afterwards.
 
@@ -1029,18 +1042,18 @@ under one grace period but will not steal them without this opt-in.
 
 Variables outside the operator surface, listed for completeness — never set these manually:
 
-- `CODESTORAGE_GIT_REPO`, `CODESTORAGE_GIT_REFS_POLICY`, `CODESTORAGE_GIT_OPS`,
-  `CODESTORAGE_GIT_ATOMIC`, `CODESTORAGE_GIT_PACK_QUOTA`,
-  `CODESTORAGE_GIT_PACK_RESERVATION_TTL`, `CODESTORAGE_GIT_VERIFY_STATE`,
-  `CODESTORAGE_GIT_VERIFY_SIG_BUDGET` — per-request plumbing the server sets for the
-  `codestorage hook` subprocess git re-execs.
-- `CODESTORAGE_ASKPASS_USERNAME`, `CODESTORAGE_ASKPASS_PASSWORD` — set by the upstream-sync
+- `OPENSTORAGE_GIT_REPO`, `OPENSTORAGE_GIT_REFS_POLICY`, `OPENSTORAGE_GIT_OPS`,
+  `OPENSTORAGE_GIT_ATOMIC`, `OPENSTORAGE_GIT_PACK_QUOTA`,
+  `OPENSTORAGE_GIT_PACK_RESERVATION_TTL`, `OPENSTORAGE_GIT_VERIFY_STATE`,
+  `OPENSTORAGE_GIT_VERIFY_SIG_BUDGET` — per-request plumbing the server sets for the
+  `openstorage hook` subprocess git re-execs.
+- `OPENSTORAGE_ASKPASS_USERNAME`, `OPENSTORAGE_ASKPASS_PASSWORD` — set by the upstream-sync
   worker for its own git credential-askpass subprocess.
-- `CODESTORAGE_TEST_MODE`, `CODESTORAGE_TEST_CRASH`, `CODESTORAGE_TEST_CAS_DROP`,
-  `CODESTORAGE_TEST_CAS_DROP_HARD`, `CODESTORAGE_TEST_HOOK_DELAY_MS`,
-  `CODESTORAGE_TEST_VERIFY_SPAWN_LOG` — crash/fault injection and observability knobs
+- `OPENSTORAGE_TEST_MODE`, `OPENSTORAGE_TEST_CRASH`, `OPENSTORAGE_TEST_CAS_DROP`,
+  `OPENSTORAGE_TEST_CAS_DROP_HARD`, `OPENSTORAGE_TEST_HOOK_DELAY_MS`,
+  `OPENSTORAGE_TEST_VERIFY_SPAWN_LOG` — crash/fault injection and observability knobs
   for the e2e suites; the server refuses test-mode requests outside test mode.
-- `CODESTORAGE_TEST_BACKEND`, `CODESTORAGE_SDK_DIR` — test-lane selection (see the
+- `OPENSTORAGE_TEST_BACKEND`, `OPENSTORAGE_SDK_DIR` — test-lane selection (see the
   [testing reference](testing.md)) and the SDK-compatibility
   suite's vendor checkout location.
 

@@ -1,11 +1,11 @@
-# Local infra for codestorage: Postgres (ref authority + metadata) and
+# Local infra for open.storage: Postgres (ref authority + metadata) and
 # SeaweedFS (immutable pack storage via its S3 gateway; the tested reference
 # self-hosted store — issue #133). The service itself runs on the host:
-#   go run ./cmd/codestorage serve   (see README.md quickstart)
+#   go run ./cmd/openstorage serve   (see README.md quickstart)
 #
 # Host ports are env-overridable because sibling checkouts/agents may share
 # the docker daemon; pick a unique compose project name too:
-#   PGPORT=15499 S3PORT=18499 docker compose -p codestorage-$(whoami) up -d --wait
+#   PGPORT=15499 S3PORT=18499 docker compose -p openstorage-$(whoami) up -d --wait
 services:
   postgres:
     image: postgres:17-alpine
@@ -47,7 +47,7 @@ services:
   # `docker compose up` still boots only the backing services above. The
   # nodes are identical except the host port mapping (and the base URL that
   # embeds it). Keys come from the host
-  # (`./codestorage keygen --out ./compose-keys/cs-key`, see README).
+  # (`./openstorage keygen --out ./compose-keys/cs-key`, see README).
   node-a: &node
     build: .
     profiles: ["replicas"]
@@ -58,15 +58,16 @@ services:
       seaweedfs:
         condition: service_healthy
     environment: &node-env
-      CODESTORAGE_PG_URL: postgres://postgres:postgres@postgres:5432/postgres
-      CODESTORAGE_S3_URL: "s3://codestorage?endpoint=http://seaweedfs:8333&s3ForcePathStyle=true&region=us-east-1"
+      OPENSTORAGE_PG_URL: postgres://postgres:postgres@postgres:5432/postgres
+      # Preserve the existing bucket and dev credentials across the product rename.
+      OPENSTORAGE_S3_URL: "s3://codestorage?endpoint=http://seaweedfs:8333&s3ForcePathStyle=true&region=us-east-1"
       # Must match the static identity in the seaweedfs-s3 config below.
       AWS_ACCESS_KEY_ID: codestorage
       AWS_SECRET_ACCESS_KEY: codestorage
-      CODESTORAGE_ORG: selfhost
-      CODESTORAGE_ORG_PUBKEYS: /keys/cs-key.pub.pem
-      CODESTORAGE_LISTEN: 0.0.0.0:8080
-      CODESTORAGE_BASE_URL: http://127.0.0.1:${NODEA_PORT:-8081}
+      OPENSTORAGE_ORG: selfhost
+      OPENSTORAGE_ORG_PUBKEYS: /keys/cs-key.pub.pem
+      OPENSTORAGE_LISTEN: 0.0.0.0:8080
+      OPENSTORAGE_BASE_URL: http://127.0.0.1:${NODEA_PORT:-8081}
     ports:
       - "${NODEA_PORT:-8081}:8080"
     volumes:
@@ -83,7 +84,7 @@ services:
     <<: *node
     environment:
       <<: *node-env
-      CODESTORAGE_BASE_URL: http://127.0.0.1:${NODEB_PORT:-8082}
+      OPENSTORAGE_BASE_URL: http://127.0.0.1:${NODEB_PORT:-8082}
     ports:
       - "${NODEB_PORT:-8082}:8080"
 

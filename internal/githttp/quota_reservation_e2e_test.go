@@ -13,7 +13,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/coder/code-storage/internal/blob"
+	"github.com/coder/open-storage/internal/blob"
 )
 
 // measureBranchPack pushes work's HEAD to a throwaway branch of measureRepo
@@ -76,7 +76,7 @@ func eitherAloneQuota(t *testing.T, s1, s2 int64) int64 {
 // after the winner registered).
 func TestPackQuota_ConcurrentOvershootOneLoses(t *testing.T) {
 	repo, workB1, workB2, token, s1, s2 := twoBranchWorlds(t, "quota-concurrent")
-	node := startNodeT(t, fmt.Sprintf("CODESTORAGE_PACK_QUOTA_BYTES=%d", eitherAloneQuota(t, s1, s2)), "CODESTORAGE_MAX_PUSH_BYTES=0") // cap off: byte-scale quota, see quota_e2e_test.go
+	node := startNodeT(t, fmt.Sprintf("OPENSTORAGE_PACK_QUOTA_BYTES=%d", eitherAloneQuota(t, s1, s2)), "OPENSTORAGE_MAX_PUSH_BYTES=0") // cap off: byte-scale quota, see quota_e2e_test.go
 
 	// Warm the node's cache repo before racing: concurrent FIRST contacts
 	// race the bare-init (a pre-existing hydration wart outside this
@@ -134,7 +134,7 @@ func TestPackQuota_ConcurrentOvershootOneLoses(t *testing.T) {
 func TestPackQuota_ReservationCrashSweepRecovery(t *testing.T) {
 	ctx := context.Background()
 	repo, workB1, workB2, token, s1, s2 := twoBranchWorlds(t, "quota-reserve-crash")
-	node := startNodeT(t, fmt.Sprintf("CODESTORAGE_PACK_QUOTA_BYTES=%d", eitherAloneQuota(t, s1, s2)), "CODESTORAGE_MAX_PUSH_BYTES=0") // cap off: byte-scale quota, see quota_e2e_test.go
+	node := startNodeT(t, fmt.Sprintf("OPENSTORAGE_PACK_QUOTA_BYTES=%d", eitherAloneQuota(t, s1, s2)), "OPENSTORAGE_MAX_PUSH_BYTES=0") // cap off: byte-scale quota, see quota_e2e_test.go
 
 	// Crash push 1 right after its reservation commits.
 	out, err := tryGit(workB1,
@@ -181,7 +181,7 @@ func TestPackQuota_CrashRetrySameKeyNotWedged(t *testing.T) {
 	repo := registerRepo(t, "quota-reserve-retry")
 	work := initWorkRepo(t)
 	token := mintTestToken(t, repo, "git:read,git:write", "")
-	node := startNodeT(t, "CODESTORAGE_PACK_QUOTA_BYTES=1048576")
+	node := startNodeT(t, "OPENSTORAGE_PACK_QUOTA_BYTES=1048576")
 
 	out, err := tryGit(work,
 		"-c", "http.extraHeader="+CrashHeader+": after-reserve",

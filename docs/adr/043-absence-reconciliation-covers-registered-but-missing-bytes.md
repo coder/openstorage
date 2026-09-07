@@ -347,7 +347,7 @@ arming; a database trigger gating `pack_reservations` inserts is not
 this codebase's idiom and a defect there bricks every write on every
 replica. The two-phase activation shape (ADR-41 precedent, the same
 documentation-enforced prerequisite as `forward_pushes` and
-`CODESTORAGE_SWEEP_DELETE_ENABLED`) is the deliberate choice: the boot
+`OPENSTORAGE_SWEEP_DELETE_ENABLED`) is the deliberate choice: the boot
 log warns whenever reconciliation is enabled with quota enforcement,
 and the operator contract is to complete rolls within one reservation
 TTL and finish the roll before first enabling the job.

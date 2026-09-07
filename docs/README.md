@@ -1,14 +1,15 @@
-# codestorage documentation
+# open.storage documentation
 
-Documentation for the open-source, wire-compatible [code.storage](https://code.storage)
-backend, organized by [Diátaxis](https://diataxis.fr/) quadrant.
+Documentation for open.storage, the open-source backend wire-compatible with
+[code.storage](https://code.storage) (Pierre Computer Company), organized by
+[Diátaxis](https://diataxis.fr/) quadrant.
 
 ## Navigation
 
 | Quadrant | Start here |
 |---|---|
 | **Tutorials** | The [README quickstarts](../README.md#quickstart-local-mode-60-seconds): local mode in 60 seconds, multi-node with Docker Compose, zero-infrastructure mode on one bucket (experimental) |
-| **How-to guides** | [Deploy to production](how-to/deploy-production.md) · [Run the zero-infrastructure mode (s3wal)](how-to/deploy-production.md#zero-infrastructure-mode-experimental-one-bucket-one-node) · [Deploy a two-replica stack with Docker Compose](how-to/deploy-docker-compose.md) · [Operate the storage lifecycle](how-to/storage-lifecycle-and-sweeping.md) · [Cut a release](how-to/release.md) |
+| **How-to guides** | [Migrate to open.storage](how-to/migrate-to-openstorage.md) · [Deploy to production](how-to/deploy-production.md) · [Run the zero-infrastructure mode (s3wal)](how-to/deploy-production.md#zero-infrastructure-mode-experimental-one-bucket-one-node) · [Deploy a two-replica stack with Docker Compose](how-to/deploy-docker-compose.md) · [Operate the storage lifecycle](how-to/storage-lifecycle-and-sweeping.md) · [Cut a release](how-to/release.md) |
 | **Reference** | [Configuration](reference/configuration.md) · [CLI](reference/cli.md) · [Testing](reference/testing.md) · [HTTP API](reference/http-api.md) · [Authentication & JWT claims](reference/authentication.md) · [Webhooks](reference/webhooks.md) |
 | **Explanation** | [Wire compatibility](explanation/wire-compatibility.md) · [The storage engine](explanation/storage-engine.md) · [Domain model](explanation/domain-model.md) · [Git protocol & namespaces](explanation/git-protocol-and-namespaces.md) · [Streaming commit protocols](explanation/streaming-commit-protocols.md) |
 
@@ -18,9 +19,10 @@ Two further directories sit outside the quadrants:
   extracted from the phase notes; historical, individually addressable.
 - **[`archive/`](archive/phases/07-implementation-roadmap.md)** — the original
   [implementation roadmap](archive/phases/07-implementation-roadmap.md) and the per-phase
-  implementation notes (`archive/phases/08` … `16`), kept verbatim as the project's
-  build history. **Historical material**: for current behavior, prefer the reference and
-  explanation pages above.
+  implementation notes (`archive/phases/08` … `16`), preserving historical workflows
+  with current project naming. Recorded evidence paths and upstream names are unchanged.
+  **Historical material**: for current behavior, prefer the reference and explanation
+  pages above.
 - **`upstream/`** — verbatim copies of the vendor's official OpenAPI spec and doc pages,
   kept for wire-compatibility auditing.
 

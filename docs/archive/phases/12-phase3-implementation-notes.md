@@ -1,7 +1,7 @@
 # Phase-3 Implementation Notes & ADRs (read API)
 
-> **Archived.** Historical implementation notes, kept verbatim as the project's build
-> history; decisions here may have been superseded by later work. For current
+> **Archived.** Historical implementation workflow, with current project naming.
+> Decisions here may have been superseded by later work. For current
 > behavior, start at the [docs index](../../README.md); the ADRs recorded below are
 > individually addressable under [`docs/adr/`](../../adr/README.md).
 
@@ -93,7 +93,7 @@ on 401 only (RFC 9110 §11.6.1) on both the API and githttp surfaces.
   subprocess output → stderr message + non-zero exit, never a panic) and in
   `internal/auth/policy.go` (empty ref → explicit no-match, not a crash). Asserts remain
   only for internally-produced impossible states.
-- `signing-key` and `list-packs` honor `--data-dir` / `CODESTORAGE_DATA_DIR` via the same
+- `signing-key` and `list-packs` honor `--data-dir` / `OPENSTORAGE_DATA_DIR` via the same
   URL-derivation helper `serve` uses (`resolveStorageURLs`), so local mode works for all
   subcommands (verified live in the Lane-B transcript below).
 - Relative paths can no longer silently split sqlite state between `serve` and re-exec'd

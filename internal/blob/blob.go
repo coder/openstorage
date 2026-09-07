@@ -24,7 +24,8 @@ import (
 	gcblob "gocloud.dev/blob"
 	"gocloud.dev/blob/s3blob"
 
-	"github.com/coder/code-storage/internal/s3oplog"
+	"github.com/coder/open-storage/internal/envconfig"
+	"github.com/coder/open-storage/internal/s3oplog"
 )
 
 // ErrSignedURLUnsupported is returned by SignedURL on backends without
@@ -691,7 +692,7 @@ var _ BlobStore = (*S3)(nil)
 // — enforces it uniformly; a probe-only or serve-only check would leave
 // the rest of the data plane owner-blind. Empty (the default) attaches no
 // middleware and changes no behavior.
-const EnvExpectedBucketOwner = "CODESTORAGE_S3_EXPECTED_BUCKET_OWNER"
+const EnvExpectedBucketOwner = "OPENSTORAGE_S3_EXPECTED_BUCKET_OWNER"
 
 // Bucket-owner condition headers (AWS S3 REST). The source spelling
 // asserts the owner of the bucket named in x-amz-copy-source on
@@ -708,7 +709,7 @@ var awsAccountIDPattern = regexp.MustCompile(`^[0-9]{12}$`)
 
 // expectedBucketOwnerFromEnv reads and validates EnvExpectedBucketOwner.
 func expectedBucketOwnerFromEnv() (string, error) {
-	owner := strings.TrimSpace(os.Getenv(EnvExpectedBucketOwner))
+	owner := strings.TrimSpace(envconfig.Getenv(EnvExpectedBucketOwner))
 	if owner != "" && !awsAccountIDPattern.MatchString(owner) {
 		return "", fmt.Errorf("%s must be a 12-digit AWS account ID, got %q", EnvExpectedBucketOwner, owner)
 	}
@@ -729,7 +730,7 @@ func expectedBucketOwnerFromEnv() (string, error) {
 func expectedBucketOwnerAPIOption(owner string) func(*middleware.Stack) error {
 	assertf(awsAccountIDPattern.MatchString(owner), "expectedBucketOwnerAPIOption(%q)", owner)
 	return func(stack *middleware.Stack) error {
-		return stack.Build.Add(middleware.BuildMiddlewareFunc("codestorageExpectedBucketOwner",
+		return stack.Build.Add(middleware.BuildMiddlewareFunc("openstorageExpectedBucketOwner",
 			func(ctx context.Context, in middleware.BuildInput, next middleware.BuildHandler) (middleware.BuildOutput, middleware.Metadata, error) {
 				req, ok := in.Request.(*smithyhttp.Request)
 				assertf(ok, "expected-bucket-owner middleware: request type %T", in.Request)
@@ -755,7 +756,7 @@ func s3ClientOptions(endpoint, expectedOwner string) func(*s3.Options) {
 			o.APIOptions = append(o.APIOptions, expectedBucketOwnerAPIOption(expectedOwner))
 		}
 		// Round-trip census seam (issue #182): one line per S3 HTTP
-		// attempt when CODESTORAGE_S3_OP_LOG is set; inert otherwise.
+		// attempt when OPENSTORAGE_S3_OP_LOG is set; inert otherwise.
 		if opt, ok := s3oplog.APIOption(); ok {
 			o.APIOptions = append(o.APIOptions, opt)
 		}

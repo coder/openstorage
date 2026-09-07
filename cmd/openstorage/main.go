@@ -1,10 +1,10 @@
-// codestorage is the service binary: `serve` runs a stateless node exposing
+// openstorage is the service binary: `serve` runs a stateless node exposing
 // the /api/v1 HTTP API (single-org self-host mode) and the git smart-HTTP
 // path; `hook` is re-exec'd by git as pre-receive/update hooks;
 // `signing-key` manages the org's commit-signing key registry (docs/reference/authentication.md
 // verify-sig); keygen/mint/list-packs are local dogfooding helpers.
 //
-// Configuration comes from CODESTORAGE_* environment variables, with the
+// Configuration comes from OPENSTORAGE_* environment variables, with the
 // phase-0 spike names (SPIKE_*, PG_URL, BLOB_URL) kept as fallback aliases —
 // see config.go.
 package main
@@ -24,19 +24,20 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/coder/code-storage/internal/api"
-	"github.com/coder/code-storage/internal/auth"
-	"github.com/coder/code-storage/internal/blob"
-	"github.com/coder/code-storage/internal/githttp"
-	"github.com/coder/code-storage/internal/meta"
-	"github.com/coder/code-storage/internal/ref"
-	"github.com/coder/code-storage/internal/ref/s3wal"
-	"github.com/coder/code-storage/internal/version"
+	"github.com/coder/open-storage/internal/api"
+	"github.com/coder/open-storage/internal/auth"
+	"github.com/coder/open-storage/internal/blob"
+	"github.com/coder/open-storage/internal/envconfig"
+	"github.com/coder/open-storage/internal/githttp"
+	"github.com/coder/open-storage/internal/meta"
+	"github.com/coder/open-storage/internal/ref"
+	"github.com/coder/open-storage/internal/ref/s3wal"
+	"github.com/coder/open-storage/internal/version"
 )
 
 func main() {
 	if len(os.Args) < 2 {
-		fatalf("usage: codestorage <serve|hook|keygen|mint|signing-key|list-packs|purge-repo|version> ...")
+		fatalf("usage: openstorage <serve|hook|keygen|mint|signing-key|list-packs|purge-repo|version> ...")
 	}
 	ctx := context.Background()
 	var err error
@@ -66,7 +67,7 @@ func main() {
 		err = fmt.Errorf("unknown subcommand %q", os.Args[1])
 	}
 	if err != nil {
-		fatalf("codestorage %s: %v", os.Args[1], err)
+		fatalf("openstorage %s: %v", os.Args[1], err)
 	}
 }
 
@@ -107,14 +108,22 @@ func cmdServe(ctx context.Context, args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	cfg, err := resolveServeConfig(os.Getenv, *listen, *addr, *cacheDir, *dataDir)
+	envconfig.WarnDeprecated(func(format string, args ...any) {
+		fmt.Fprintf(os.Stderr, format+"\n", args...)
+	})
+	cfg, err := resolveServeConfig(envconfig.LookupEnv, *listen, *addr, *cacheDir, *dataDir)
 	if err != nil {
 		return err
 	}
 	// The pre-receive/update hooks re-exec this binary with the server's
-	// inherited environment and read the legacy names (internal/githttp/hook.go),
-	// so propagate the resolved values regardless of which alias set them.
-	for _, kv := range [][2]string{{"PG_URL", cfg.dbURL}, {"BLOB_URL", cfg.blobURL}} {
+	// inherited environment (internal/githttp/hook.go), so propagate the
+	// resolved values under the canonical names regardless of which alias or
+	// --data-dir derivation set them; the bare names keep older hook binaries
+	// sharing this cache working.
+	for _, kv := range [][2]string{
+		{"OPENSTORAGE_PG_URL", cfg.dbURL}, {"OPENSTORAGE_S3_URL", cfg.blobURL},
+		{"PG_URL", cfg.dbURL}, {"BLOB_URL", cfg.blobURL},
+	} {
 		if err := os.Setenv(kv[0], kv[1]); err != nil {
 			return err
 		}
@@ -164,7 +173,7 @@ func cmdServe(ctx context.Context, args []string) error {
 			}()
 			go func() {
 				if err := lease.Heartbeat(ctx); err != nil {
-					fatalf("codestorage serve: %v", err)
+					fatalf("openstorage serve: %v", err)
 				}
 			}()
 		}
@@ -181,7 +190,7 @@ func cmdServe(ctx context.Context, args []string) error {
 
 	// Listen before building handlers: the default listen address uses an
 	// ephemeral port (127.0.0.1:0), and the API needs the bound address to
-	// build the `http_url` values it returns. $CODESTORAGE_BASE_URL
+	// build the `http_url` values it returns. $OPENSTORAGE_BASE_URL
 	// overrides the derived base, which is unroutable when binding 0.0.0.0.
 	ln, err := net.Listen("tcp", cfg.listen)
 	if err != nil {
@@ -314,11 +323,11 @@ func cmdServe(ctx context.Context, args []string) error {
 		// Restore default signal disposition first: a second signal
 		// during the drain kills immediately (operator escape hatch).
 		stopSignals()
-		fmt.Fprintln(os.Stderr, "codestorage serve: termination signal received; draining")
+		fmt.Fprintln(os.Stderr, "openstorage serve: termination signal received; draining")
 		dctx, cancel := context.WithTimeout(context.Background(), shutdownDrainTimeout)
 		defer cancel()
 		if err := httpSrv.Shutdown(dctx); err != nil {
-			fmt.Fprintf(os.Stderr, "codestorage serve: drain incomplete after %v: %v\n", shutdownDrainTimeout, err)
+			fmt.Fprintf(os.Stderr, "openstorage serve: drain incomplete after %v: %v\n", shutdownDrainTimeout, err)
 		}
 		// Orderly signal shutdown exits 0; the deferred teardown above
 		// (workers, stores, instance lease) runs on this return.
@@ -328,7 +337,7 @@ func cmdServe(ctx context.Context, args []string) error {
 
 // selfLoopbackURL derives the sync worker's push target from this process's
 // bound listener (issue #45): loopback pushes must terminate in the minting
-// process, so the external CODESTORAGE_BASE_URL — typically a load balancer
+// process, so the external OPENSTORAGE_BASE_URL — typically a load balancer
 // that may route to any replica — is unusable. An unspecified bind address
 // is rewritten to the matching loopback address; a concrete one is dialable
 // as-is.
@@ -480,8 +489,8 @@ func cmdListPacks(ctx context.Context, args []string) error {
 		return fmt.Errorf("--repo is required")
 	}
 	// Shared derivation with serve/signing-key: env URLs win, local mode
-	// (--data-dir / $CODESTORAGE_DATA_DIR) derives the fileblob location.
-	urls, err := resolveStorageURLs(os.Getenv, *dataDir)
+	// (--data-dir / $OPENSTORAGE_DATA_DIR) derives the fileblob location.
+	urls, err := resolveStorageURLs(envconfig.LookupEnv, *dataDir)
 	if err != nil {
 		return err
 	}

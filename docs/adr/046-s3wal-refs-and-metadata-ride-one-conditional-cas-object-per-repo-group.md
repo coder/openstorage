@@ -87,7 +87,7 @@ fresh foreign lease, steals expired ones, and fail-stops (crash, not limp)
 on heartbeat loss. It is explicitly **best-effort**: freshness compares
 local clocks against a stamp another machine wrote, so pathological skew
 delays detection — it never weakens the CAS serialization that correctness
-actually rests on. `CODESTORAGE_S3WAL_LEASE_TTL=0` disables it (test
+actually rests on. `OPENSTORAGE_S3WAL_LEASE_TTL=0` disables it (test
 suites that deliberately run several processes against one bucket), with a
 loud warning.
 

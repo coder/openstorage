@@ -1,6 +1,6 @@
 // purge-repo permanently reclaims one soft-deleted repository's registry
 // rows and blobs (issue #52) — the synchronous operator twin of the
-// CODESTORAGE_REPO_RETENTION background purge, running the exact same
+// OPENSTORAGE_REPO_RETENTION background purge, running the exact same
 // jobs.RepoPurger primitive. Purged repositories CANNOT be restored, and
 // the burned (org, url) name is never released (see meta/purge.go).
 package main
@@ -15,9 +15,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/coder/code-storage/internal/blob"
-	"github.com/coder/code-storage/internal/jobs"
-	"github.com/coder/code-storage/internal/ref"
+	"github.com/coder/open-storage/internal/blob"
+	"github.com/coder/open-storage/internal/envconfig"
+	"github.com/coder/open-storage/internal/jobs"
+	"github.com/coder/open-storage/internal/ref"
 )
 
 // sanitizeTerm replaces control characters (C0, DEL, C1 — the bytes
@@ -36,7 +37,7 @@ func sanitizeTerm(s string) string {
 func cmdPurgeRepo(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("purge-repo", flag.ExitOnError)
 	fs.Usage = func() {
-		fmt.Fprintf(fs.Output(), `usage: codestorage purge-repo [flags] <repo-id>
+		fmt.Fprintf(fs.Output(), `usage: openstorage purge-repo [flags] <repo-id>
 
 Permanently reclaims a soft-deleted repository: drops its registry rows
 (refs, packs, LFS objects, credentials, upstream links) and deletes its
@@ -62,8 +63,8 @@ Flags:
 	repoID := fs.Arg(0)
 
 	// Shared derivation with serve/signing-key/list-packs: env URLs win,
-	// local mode (--data-dir / $CODESTORAGE_DATA_DIR) fills the rest.
-	urls, err := resolveStorageURLs(os.Getenv, *dataDir)
+	// local mode (--data-dir / $OPENSTORAGE_DATA_DIR) fills the rest.
+	urls, err := resolveStorageURLs(envconfig.LookupEnv, *dataDir)
 	if err != nil {
 		return err
 	}
@@ -73,18 +74,18 @@ Flags:
 	if urls.blobURL == "" {
 		return errBlobURLRequired()
 	}
-	secretsCodec, err := resolveSecretsCodec(os.Getenv)
+	secretsCodec, err := resolveSecretsCodec(envconfig.Getenv)
 	if err != nil {
 		return err
 	}
 	// The purge consults the same quota/reservation knobs as serve: a
 	// defensive quarantine restore must take cover reservations exactly
 	// when admission would consult them.
-	quotaBytes, err := resolvePackQuota(os.Getenv)
+	quotaBytes, err := resolvePackQuota(envconfig.Getenv)
 	if err != nil {
 		return err
 	}
-	reservationTTL, err := resolvePackReservationTTL(os.Getenv)
+	reservationTTL, err := resolvePackReservationTTL(envconfig.Getenv)
 	if err != nil {
 		return err
 	}

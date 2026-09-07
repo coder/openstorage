@@ -16,7 +16,7 @@ package githttp
 //     the pre-receive policy gate plus every update hook run sequentially
 //     within one push, so an append-only file needs no locking).
 //  2. A per-push verified-commit budget (EnvVerifySigBudget, resolved from
-//     CODESTORAGE_VERIFY_SIG_BUDGET by the serve process) that fails CLOSED:
+//     OPENSTORAGE_VERIFY_SIG_BUDGET by the serve process) that fails CLOSED:
 //     a ref needing more verifier spawns than the remaining budget is
 //     rejected before any of them run.
 //
@@ -35,7 +35,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/coder/code-storage/internal/ref"
+	"github.com/coder/open-storage/internal/envconfig"
+	"github.com/coder/open-storage/internal/ref"
 )
 
 // EnvVerifyState carries the per-push verify-sig state file path from the
@@ -45,18 +46,18 @@ import (
 // issue #59, or a bare hook invocation) the hooks fall back to an
 // in-process cache — correctness is unchanged, only cross-process reuse is
 // lost.
-const EnvVerifyState = "CODESTORAGE_GIT_VERIFY_STATE"
+const EnvVerifyState = "OPENSTORAGE_GIT_VERIFY_STATE"
 
 // EnvVerifySigBudget carries the resolved per-push verified-commit budget
 // (issue #59) from the serve process into the hooks. Set only when the
 // budget is enabled (> 0); malformed values fail closed like EnvPackQuota.
-const EnvVerifySigBudget = "CODESTORAGE_GIT_VERIFY_SIG_BUDGET"
+const EnvVerifySigBudget = "OPENSTORAGE_GIT_VERIFY_SIG_BUDGET"
 
 // EnvVerifySpawnLog is a test-mode-only knob (EnvCASDrop pattern): when set,
 // every actual `git verify-commit` spawn appends its sha to the named file,
 // so tests can assert exact spawn counts across the pre-receive gate and
 // every update hook of one push.
-const EnvVerifySpawnLog = "CODESTORAGE_TEST_VERIFY_SPAWN_LOG"
+const EnvVerifySpawnLog = "OPENSTORAGE_TEST_VERIFY_SPAWN_LOG"
 
 // State directives. The state is split across THREE files so that the cost
 // a hook pays scales with the work its ref actually causes, not with the
@@ -132,7 +133,7 @@ func (st *verifyState) chargeWalk(n int64, maxWalk int64, refName string) error 
 		return nil
 	}
 	if maxWalk > 0 && st.walked+n > maxWalk {
-		return st.exhaust(fmt.Sprintf("verify-sig: push exceeds the per-push history-walk allowance: %s pushed the total past %d examined commits (%d× CODESTORAGE_VERIFY_SIG_BUDGET; raise the budget or split the push)",
+		return st.exhaust(fmt.Sprintf("verify-sig: push exceeds the per-push history-walk allowance: %s pushed the total past %d examined commits (%d× OPENSTORAGE_VERIFY_SIG_BUDGET; raise the budget or split the push)",
 			refName, maxWalk, verifyWalkBudgetMultiplier))
 	}
 	if err := st.markWalked(n); err != nil {
@@ -158,7 +159,7 @@ func openVerifyState() (*verifyState, error) {
 		deny:   make(map[string]string),
 		ranges: make(map[string]bool),
 	}
-	path := os.Getenv(EnvVerifyState)
+	path := envconfig.Getenv(EnvVerifyState)
 	if path == "" {
 		st.verdictsLoaded = true
 		return st, nil
@@ -396,7 +397,7 @@ func (st *verifyState) markWalked(n int64) error {
 	if st.path == "" {
 		return nil
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(st.path), ".codestorage-verify-walked-*")
+	tmp, err := os.CreateTemp(filepath.Dir(st.path), ".openstorage-verify-walked-*")
 	if err != nil {
 		return fmt.Errorf("write walked counter: %w", err)
 	}
@@ -433,7 +434,7 @@ func walkBudget(budget int) int64 {
 // hook env. 0 (or unset) means unlimited; the env is set by our own server,
 // so nonsense fails closed like a malformed EnvPackQuota.
 func verifySigBudget() (int, error) {
-	raw := os.Getenv(EnvVerifySigBudget)
+	raw := envconfig.Getenv(EnvVerifySigBudget)
 	if raw == "" {
 		return 0, nil
 	}
@@ -451,7 +452,7 @@ func logVerifySpawn(sha string) {
 	if !testMode() {
 		return
 	}
-	path := os.Getenv(EnvVerifySpawnLog)
+	path := envconfig.Getenv(EnvVerifySpawnLog)
 	if path == "" {
 		return
 	}

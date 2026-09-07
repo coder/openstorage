@@ -18,8 +18,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/coder/code-storage/internal/auth"
-	"github.com/coder/code-storage/internal/meta"
+	"github.com/coder/open-storage/internal/auth"
+	"github.com/coder/open-storage/internal/meta"
 )
 
 // memKeys is an in-memory auth.KeySource: org name -> PEM public key blocks.
@@ -279,7 +279,7 @@ func TestServiceRPC_CrashHeaderRefusedOutsideTestMode(t *testing.T) {
 	token := mintUnitToken(t, key, "ES256", unitClaims("org1", "crash-refuse", auth.ScopeGitWrite))
 	req := httptest.NewRequest(http.MethodPost, "/crash-refuse.git/git-receive-pack", nil)
 	req.SetBasicAuth("t", token)
-	req.Header.Set(CrashHeader, "after-s3")
+	req.Header.Set("X-Openstorage-Test-Crash", "after-s3")
 	rec := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rec, req)
 	if rec.Code != http.StatusForbidden {

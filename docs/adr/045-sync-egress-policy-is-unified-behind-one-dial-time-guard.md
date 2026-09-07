@@ -22,14 +22,14 @@ policy denial classifies as permanent configuration
 push), a non-policy dial failure as the transient
 `upstream repository unreachable`.
 
-**One knob, tri-state, compatibility-first.** `CODESTORAGE_SYNC_ALLOW_PRIVATE`
+**One knob, tri-state, compatibility-first.** `OPENSTORAGE_SYNC_ALLOW_PRIVATE`
 governs BOTH directions: `true` admits the private receiver classes
 (internal forges), `false` is strict, and **unset is the transitional
 default** — pushes stay strict while pulls ALLOW private upstreams with a
 boot warning announcing the future flip of that default to deny. Syncing
 from internal RFC 1918 gitea/forgejo/GitLab forges is a mainstream released
 0.6.x deployment shape; default-denying it is a breaking change that gets a
-deprecation window, not a surprise. `CODESTORAGE_SYNC_PUSH_ALLOW_PRIVATE`
+deprecation window, not a surprise. `OPENSTORAGE_SYNC_PUSH_ALLOW_PRIVATE`
 becomes the deprecated push-only spelling: still honored (its historical
 meaning, push only) when the unified knob is unset, ignored with a boot
 notice when it is set. One knob was chosen over per-direction flags because
@@ -59,7 +59,7 @@ targets while admitting private forges.
 
 **Migration plan (release-notes language).** This release: pull fetches
 gain the dial-time guard with private targets still allowed by default;
-`serve` warns at boot until `CODESTORAGE_SYNC_ALLOW_PRIVATE` is set
+`serve` warns at boot until `OPENSTORAGE_SYNC_ALLOW_PRIVATE` is set
 explicitly. Set `true` to keep internal-forge sync across the future flip,
 `false` to adopt strict mode early. A future minor release flips the unset
 pull default to deny; the deprecated push-only spelling is removed no

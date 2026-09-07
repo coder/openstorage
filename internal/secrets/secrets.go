@@ -12,7 +12,7 @@
 // (`... WHERE secret NOT LIKE 'enc:v1:<keyid>:%'`) and lets decrypt failures
 // name the missing key without exposing material.
 //
-// Keys come from CODESTORAGE_SECRETS_KEY: a comma-separated list of base64
+// Keys come from OPENSTORAGE_SECRETS_KEY: a comma-separated list of base64
 // 32-byte keys. The first key encrypts every write; the rest are
 // decrypt-only, supporting rotation (put the new key first, keep old keys
 // listed until every row has been rewritten). An empty value disables
@@ -61,13 +61,13 @@ const (
 )
 
 // Sentinel errors; callers match with errors.Is. Both are operational
-// (wrong CODESTORAGE_SECRETS_KEY for the data at hand), never programming
+// (wrong OPENSTORAGE_SECRETS_KEY for the data at hand), never programming
 // errors.
 var (
 	// ErrUnknownKey: the envelope names a key id absent from the configured
 	// list — the operator removed a still-needed key (or points the server
 	// at another deployment's database).
-	ErrUnknownKey = errors.New("value is encrypted with a key not listed in CODESTORAGE_SECRETS_KEY")
+	ErrUnknownKey = errors.New("value is encrypted with a key not listed in OPENSTORAGE_SECRETS_KEY")
 	// ErrDecrypt: the envelope is malformed or GCM authentication failed —
 	// corrupt row, or a different key with a colliding fingerprint.
 	ErrDecrypt = errors.New("decrypt failed: ciphertext corrupt or key mismatch")
@@ -91,7 +91,7 @@ type codecKey struct {
 type Codec struct {
 	keys []codecKey
 
-	// DecryptOnly is the CODESTORAGE_SECRETS_MODE=decrypt-only staging mode
+	// DecryptOnly is the OPENSTORAGE_SECRETS_MODE=decrypt-only staging mode
 	// for first enablement on multi-replica fleets: every listed key
 	// decrypts, but nothing is encrypted or rewritten, so no envelope is
 	// written until every replica can already read it. Callers (the meta
@@ -99,7 +99,7 @@ type Codec struct {
 	DecryptOnly bool
 }
 
-// ParseKeys parses the CODESTORAGE_SECRETS_KEY format: comma-separated
+// ParseKeys parses the OPENSTORAGE_SECRETS_KEY format: comma-separated
 // base64 (standard, padded) 32-byte keys, first = active. Returns (nil, nil)
 // for an empty value (encryption disabled). Error messages name entry
 // positions, never material.

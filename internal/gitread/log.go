@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/coder/code-storage/internal/ref"
+	"github.com/coder/open-storage/internal/ref"
 )
 
 // Commit is one parsed commit — the docs/reference/http-api.md CommitInfo source data

@@ -44,9 +44,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/coder/code-storage/internal/auth"
-	"github.com/coder/code-storage/internal/blob"
-	"github.com/coder/code-storage/internal/ref"
+	"github.com/coder/open-storage/internal/auth"
+	"github.com/coder/open-storage/internal/blob"
+	"github.com/coder/open-storage/internal/ref"
 )
 
 const (
@@ -256,8 +256,8 @@ func (s *Server) handleLFSBatch(w http.ResponseWriter, r *http.Request, repo str
 	if _, status, err := s.authenticateLFS(r, repo, scope); err != nil {
 		if status == http.StatusUnauthorized {
 			// LFS-spec discovery header alongside the standard challenge.
-			w.Header().Set("LFS-Authenticate", `Basic realm="codestorage"`)
-			w.Header().Set("WWW-Authenticate", `Basic realm="codestorage"`)
+			w.Header().Set("LFS-Authenticate", `Basic realm="open.storage"`)
+			w.Header().Set("WWW-Authenticate", `Basic realm="open.storage"`)
 		}
 		lfsError(w, status, err.Error())
 		return
@@ -2711,7 +2711,7 @@ func (s *Server) handleLFSObject(w http.ResponseWriter, r *http.Request, repo, o
 	}
 	if _, status, err := s.authenticateLFS(r, repo, scope); err != nil {
 		if status == http.StatusUnauthorized {
-			w.Header().Set("WWW-Authenticate", `Basic realm="codestorage"`)
+			w.Header().Set("WWW-Authenticate", `Basic realm="open.storage"`)
 		}
 		lfsError(w, status, err.Error())
 		return

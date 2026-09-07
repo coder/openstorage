@@ -14,12 +14,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/coder/code-storage/internal/auth"
-	"github.com/coder/code-storage/internal/blob"
-	"github.com/coder/code-storage/internal/events"
-	"github.com/coder/code-storage/internal/meta"
-	"github.com/coder/code-storage/internal/ref"
-	upsync "github.com/coder/code-storage/internal/sync"
+	"github.com/coder/open-storage/internal/auth"
+	"github.com/coder/open-storage/internal/blob"
+	"github.com/coder/open-storage/internal/events"
+	"github.com/coder/open-storage/internal/meta"
+	"github.com/coder/open-storage/internal/ref"
+	upsync "github.com/coder/open-storage/internal/sync"
 )
 
 // assertf is a fail-fast invariant check (crash-and-burn style).
@@ -47,7 +47,7 @@ type Config struct {
 	Org string
 	// HTTPBaseURL is the externally reachable git base URL (scheme://host),
 	// used to build the `http_url` in the POST /repos response, e.g.
-	// "https://selfhost.code.storage".
+	// "https://selfhost.open.storage".
 	HTTPBaseURL string
 	Fallback    http.Handler
 
@@ -68,7 +68,7 @@ type Config struct {
 	// RateLimit enables the pre-auth per-client-IP token bucket on every
 	// REST route (docs/reference/http-api.md gateway-level 429; see ratelimit.go). The zero
 	// value disables limiting. The serve command plumbs it from
-	// CODESTORAGE_RATE_RPS / CODESTORAGE_RATE_BURST.
+	// OPENSTORAGE_RATE_RPS / OPENSTORAGE_RATE_BURST.
 	RateLimit RateLimitConfig
 
 	// MaybeRepack, when set, runs after every successful RegisterPacks on
@@ -82,13 +82,13 @@ type Config struct {
 	// value the git surface enforces at pre-receive: REST pack writers
 	// (commit-pack, merge, notes, fork via publishPack) publish under the
 	// same packs/ prefix and must not bypass it. <= 0 disables enforcement.
-	// The serve command plumbs it from CODESTORAGE_PACK_QUOTA_BYTES.
+	// The serve command plumbs it from OPENSTORAGE_PACK_QUOTA_BYTES.
 	PackQuotaBytes int64
 
 	// PackReservationTTL bounds how long a crashed writer's quota
 	// reservation gates admission (issue #29, ref/ledger.go). <= 0 falls
 	// back to a safe one-hour default. The serve command plumbs it from
-	// CODESTORAGE_PACK_RESERVATION_TTL.
+	// OPENSTORAGE_PACK_RESERVATION_TTL.
 	PackReservationTTL time.Duration
 
 	// UsageFloor, when set, resolves the pack-admission usage floor for a
@@ -107,14 +107,14 @@ type Config struct {
 	// here and — plumbed separately into the delivery workers — the
 	// authoritative dial-time enforcement. The zero value keeps the guard
 	// strict (the safe default). The serve command plumbs it from
-	// CODESTORAGE_WEBHOOK_ALLOW_PRIVATE.
+	// OPENSTORAGE_WEBHOOK_ALLOW_PRIVATE.
 	WebhookAllowPrivate bool
 
 	// SyncPullAllowPrivate mirrors the resolved pull-lane sync egress
 	// policy (issue #139) for the registration-time courtesy check on
 	// base_repo upstream_host; the authoritative dial-time enforcement is
 	// the sync worker's vetting proxy, plumbed separately. The serve
-	// command resolves it from CODESTORAGE_SYNC_ALLOW_PRIVATE, whose
+	// command resolves it from OPENSTORAGE_SYNC_ALLOW_PRIVATE, whose
 	// transitional unset default keeps it TRUE (0.6.x compatibility), so
 	// unlike the webhook knob the zero value here is the STRICT policy.
 	SyncPullAllowPrivate bool

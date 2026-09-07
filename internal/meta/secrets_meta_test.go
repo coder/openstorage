@@ -2,7 +2,7 @@
 // fanned out over both backends like the rest of the suite. Every test
 // works on two-plus handles of the SAME database — a plaintext handle and
 // codec-equipped handles — simulating serve/hook process pairs and restarts
-// that enable, rotate, or lose CODESTORAGE_SECRETS_KEY.
+// that enable, rotate, or lose OPENSTORAGE_SECRETS_KEY.
 package meta
 
 import (
@@ -13,10 +13,10 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/coder/code-storage/internal/secrets"
+	"github.com/coder/open-storage/internal/secrets"
 )
 
-// newTestKey returns a fresh random base64 CODESTORAGE_SECRETS_KEY entry.
+// newTestKey returns a fresh random base64 OPENSTORAGE_SECRETS_KEY entry.
 func newTestKey(t *testing.T) string {
 	t.Helper()
 	var b [secrets.KeySize]byte
@@ -126,8 +126,8 @@ func TestSecretsEncryptedRoundtrip(t *testing.T) {
 
 		// Missing key on encrypted rows fails closed with an operational
 		// error — never silent ciphertext passthrough.
-		if _, err := plain.GetWebhook(ctx, wh.ID); err == nil || !strings.Contains(err.Error(), "CODESTORAGE_SECRETS_KEY") {
-			t.Errorf("plaintext-handle read of encrypted row: err = %v, want CODESTORAGE_SECRETS_KEY guidance", err)
+		if _, err := plain.GetWebhook(ctx, wh.ID); err == nil || !strings.Contains(err.Error(), "OPENSTORAGE_SECRETS_KEY") {
+			t.Errorf("plaintext-handle read of encrypted row: err = %v, want OPENSTORAGE_SECRETS_KEY guidance", err)
 		}
 
 		const password = "upstream-token"
@@ -470,7 +470,7 @@ func forgeWebhookSecret(t *testing.T, s Backend, id, value string) {
 	}
 }
 
-// TestSecretsDecryptOnlyStaging covers CODESTORAGE_SECRETS_MODE=decrypt-only
+// TestSecretsDecryptOnlyStaging covers OPENSTORAGE_SECRETS_MODE=decrypt-only
 // (first-enable staging on multi-replica fleets): keys decrypt existing
 // envelopes, but no envelope is ever written — new secrets store plaintext
 // and no lazy rewrite happens — so replicas still running without the key

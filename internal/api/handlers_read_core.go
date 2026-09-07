@@ -18,10 +18,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/coder/code-storage/internal/auth"
-	"github.com/coder/code-storage/internal/gitread"
-	"github.com/coder/code-storage/internal/meta"
-	"github.com/coder/code-storage/internal/ref"
+	"github.com/coder/open-storage/internal/auth"
+	"github.com/coder/open-storage/internal/gitread"
+	"github.com/coder/open-storage/internal/meta"
+	"github.com/coder/open-storage/internal/ref"
 )
 
 // ---------------------------------------------------------------------------
@@ -919,7 +919,7 @@ func (s *server) handleGetFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tmp, err := os.CreateTemp("", "codestorage-file-*")
+	tmp, err := os.CreateTemp("", "openstorage-file-*")
 	if err != nil {
 		s.internalErr(w, r, "stage blob", err)
 		return

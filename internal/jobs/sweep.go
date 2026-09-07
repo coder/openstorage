@@ -32,8 +32,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/coder/code-storage/internal/blob"
-	"github.com/coder/code-storage/internal/ref"
+	"github.com/coder/open-storage/internal/blob"
+	"github.com/coder/open-storage/internal/ref"
 )
 
 // PackRegistry is the slice of ref.RefStore the sweeper needs: point
@@ -128,7 +128,7 @@ type SweepConfig struct {
 	// DeleteSuperseded reaps aged candidates in the RETAINED class —
 	// blobs a ReplacePacks fold provably removed from the registry
 	// (issue #31) — even when Delete is off. ON by default (the serve
-	// config's CODESTORAGE_SWEEP_DELETE_SUPERSEDED=false disables it):
+	// config's OPENSTORAGE_SWEEP_DELETE_SUPERSEDED=false disables it):
 	// unlike general orphans, whose registration status the sweeper infers
 	// by diffing, this class carries a durable DB record written in the
 	// fold's own transaction, and without deletion a drip-writer turns the
@@ -172,7 +172,7 @@ type SweepConfig struct {
 	// purge's own prefix scan, and fenced repos never register again, so
 	// such blobs are provably permanent garbage. Wired whenever the ref
 	// store carries the purge seams, independent of the retention window:
-	// `codestorage purge-repo` mints fences on retention-less deployments
+	// `openstorage purge-repo` mints fences on retention-less deployments
 	// too (PR #105 round 8). One extra point read per aged candidate not
 	// already covered by another mode, mirroring IsRetainedPack.
 	//
@@ -183,7 +183,7 @@ type SweepConfig struct {
 	// downgrades purge-aware reaping alongside the delete modes.
 	PurgedRepoProbe func(ctx context.Context, base string) (bool, error)
 	// QuotaEnforced reports that pack-quota admission is enabled
-	// (CODESTORAGE_PACK_QUOTA_BYTES > 0). Quarantine restores take cover
+	// (OPENSTORAGE_PACK_QUOTA_BYTES > 0). Quarantine restores take cover
 	// reservations and hand off floor-generation bumps ONLY then (Codex
 	// round 73): with enforcement off no admission consults floors or
 	// covers, and the rows would only burn the per-repo reservation cap —
@@ -1022,7 +1022,7 @@ const ReconcileTickInterval = time.Hour
 
 // StartReconcileTicker runs the legacy/canonical LFS row-twin janitor on a
 // background goroutine (Codex round 88 + security twin): with
-// CODESTORAGE_SWEEP_INTERVAL=0 the startup Heal was the ONLY
+// OPENSTORAGE_SWEEP_INTERVAL=0 the startup Heal was the ONLY
 // reconciliation, but during a mixed-version rollout an old replica can
 // insert a legacy row beside an existing canonical one at any time after
 // startup — registered fast paths never re-register, so the duplicate
@@ -1650,7 +1650,7 @@ func (s *Sweeper) freshModTime(ctx context.Context, key string) (mod time.Time, 
 
 // Heal runs one standalone, strictly restorative quarantine pass. Serve
 // calls it at startup when periodic sweeping is disabled
-// (CODESTORAGE_SWEEP_INTERVAL=0): a delete-enabled process that crashed
+// (OPENSTORAGE_SWEEP_INTERVAL=0): a delete-enabled process that crashed
 // mid-handshake may have left a registered pack's only copy in quarantine,
 // and disabling the schedule must not strand it. Purging is forced off
 // regardless of SweepConfig.Delete — interval zero documents "no sweeping",
@@ -1691,7 +1691,7 @@ type SweepSchedule struct {
 	Interval time.Duration
 	// Purger, when non-nil, runs a repo-retention purge pass after each
 	// sweep on the same cadence (issue #52; nil when
-	// CODESTORAGE_REPO_RETENTION is unset).
+	// OPENSTORAGE_REPO_RETENTION is unset).
 	Purger *RepoPurger
 }
 

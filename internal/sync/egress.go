@@ -10,8 +10,8 @@ package sync
 // pioneered (issue #53) cannot be applied in-process; instead every
 // http(s) transfer runs through a short-lived loopback forward proxy
 // whose dials go through TargetGuard.DialContext. The operator escape
-// hatch (CODESTORAGE_SYNC_ALLOW_PRIVATE; deprecated push-only spelling
-// CODESTORAGE_SYNC_PUSH_ALLOW_PRIVATE) relaxes only the private receiver
+// hatch (OPENSTORAGE_SYNC_ALLOW_PRIVATE; deprecated push-only spelling
+// OPENSTORAGE_SYNC_PUSH_ALLOW_PRIVATE) relaxes only the private receiver
 // classes, exactly like the webhook hatch: metadata, broadcast, and the
 // special-purpose registry stay denied.
 
@@ -27,7 +27,7 @@ import (
 	stdsync "sync"
 	"time"
 
-	"github.com/coder/code-storage/internal/events"
+	"github.com/coder/open-storage/internal/events"
 )
 
 // egressProxy fronts exactly one git transfer (an outbound `git push` or

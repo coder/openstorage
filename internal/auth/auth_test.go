@@ -37,7 +37,7 @@ func TestParsePublicKeysPEM_AllKeyFamilies(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// One file, three concatenated blocks (the CODESTORAGE_ORG_PUBKEYS shape).
+	// One file, three concatenated blocks (the OPENSTORAGE_ORG_PUBKEYS shape).
 	var data []byte
 	data = append(data, pemPublicKey(t, &ecKey.PublicKey)...)
 	data = append(data, pemPublicKey(t, &rsaKey.PublicKey)...)

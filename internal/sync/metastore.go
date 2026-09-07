@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/coder/code-storage/internal/meta"
+	"github.com/coder/open-storage/internal/meta"
 )
 
 // MetaStores adapts the durable meta.EventingStore rows to this package's

@@ -1,6 +1,9 @@
 # Deploy to production (multi-replica)
 
-**Goal:** a hardened codestorage deployment — N stateless `codestorage serve` replicas
+Upgrading an existing installation? Follow the [rename migration guide](migrate-to-openstorage.md)
+first; the examples below use the new binary and environment names.
+
+**Goal:** a hardened open.storage deployment — N stateless `openstorage serve` replicas
 behind a TLS-terminating reverse proxy, backed by Postgres (ref CAS + metadata) and an
 S3-compatible bucket (immutable packs).
 
@@ -13,7 +16,7 @@ stack to try first, see the [Docker Compose how-to](deploy-docker-compose.md).
 ## Topology
 
 ```
-clients ──► reverse proxy (TLS) ──► N × codestorage serve ──► Postgres   (refs + metadata)
+clients ──► reverse proxy (TLS) ──► N × openstorage serve ──► Postgres   (refs + metadata)
                                                           └─► S3 bucket  (immutable packs)
 ```
 
@@ -27,20 +30,20 @@ clients ──► reverse proxy (TLS) ──► N × codestorage serve ──►
 - The container image (repo [`Dockerfile`](../../Dockerfile)) runs as a non-root user and
   needs the `git` binary at runtime, plus `gpg` and `ssh-keygen` if you protect refs with
   `verify-sig` policies — signature verification shells out to them and fails closed
-  ([#50](https://github.com/coder/code-storage/issues/50)). The supplied image includes
+  ([#50](https://github.com/coder/open-storage/issues/50)). The supplied image includes
   all three (CI asserts this); remember them if you build your own image.
 
 ## Backing services
 
 **Postgres** — one database, reachable from every replica
-([`CODESTORAGE_PG_URL`](../reference/configuration.md#codestorage_pg_url)). There is no
+([`OPENSTORAGE_PG_URL`](../reference/configuration.md#openstorage_pg_url)). There is no
 separate migration step or job to run: each replica creates/upgrades the schema at boot,
 serialized by advisory locks (see [concurrent boot](#concurrent-boot-schema-setup-and-migrations)).
 The database is the authority for refs, metadata, quota accounting, and the durable
 [River](https://riverqueue.com) job queue — and it stores **webhook HMAC secrets and
 upstream-sync credentials**, plaintext by default
-([#54](https://github.com/coder/code-storage/issues/54)). Set
-[`CODESTORAGE_SECRETS_KEY`](../reference/configuration.md#codestorage_secrets_key) (the
+([#54](https://github.com/coder/open-storage/issues/54)). Set
+[`OPENSTORAGE_SECRETS_KEY`](../reference/configuration.md#openstorage_secrets_key) (the
 same value on every replica) to envelope-encrypt those columns with AES-256-GCM; the
 reference documents the key format, rotation procedure, failure modes, and the required
 **staged enablement on multi-replica fleets** (binary rollout first, then the key in
@@ -50,8 +53,8 @@ scope database access tightly and encrypt the database and its backups at rest �
 application-level encryption narrows what a database read or backup leak exposes, but the
 serve process still holds the key.
 
-**S3-compatible bucket** — dedicated to codestorage
-([`CODESTORAGE_S3_URL`](../reference/configuration.md#codestorage_s3_url)); credentials come
+**S3-compatible bucket** — dedicated to open.storage
+([`OPENSTORAGE_S3_URL`](../reference/configuration.md#openstorage_s3_url)); credentials come
 from the standard AWS chain (env vars, shared config, instance roles). AWS S3 is the
 primary target; for self-hosting, [SeaweedFS](https://github.com/seaweedfs/seaweedfs) is
 the reference store the test suite runs against. Other S3-compatible stores (including
@@ -96,7 +99,7 @@ test suites no longer run against them.
 
   For defense-in-depth — or when you cannot edit the role's IAM statements — additionally
   set
-  [`CODESTORAGE_S3_EXPECTED_BUCKET_OWNER`](../reference/configuration.md#codestorage_s3_expected_bucket_owner)
+  [`OPENSTORAGE_S3_EXPECTED_BUCKET_OWNER`](../reference/configuration.md#openstorage_s3_expected_bucket_owner)
   to the bucket-owning account ID: the server then sends the S3 bucket owner condition on
   every operation it issues (including the startup probe and presigned LFS URLs), failing
   closed with `403` if the bucket's owner ever changes. The IAM condition remains the
@@ -113,10 +116,10 @@ test suites no longer run against them.
 - **Decide on bucket versioning up front.** Destructive sweeping and versioning don't
   mix: deletes only write delete markers while every version stays stored and billed.
   The general-orphan delete opt-in
-  ([`CODESTORAGE_SWEEP_DELETE_ENABLED`](../reference/configuration.md#codestorage_sweep_delete_enabled))
+  ([`OPENSTORAGE_SWEEP_DELETE_ENABLED`](../reference/configuration.md#openstorage_sweep_delete_enabled))
   therefore refuses to start against a versioned or versioning-suspended bucket, and the
   **default-on** superseded reaping
-  ([`CODESTORAGE_SWEEP_DELETE_SUPERSEDED`](../reference/configuration.md#codestorage_sweep_delete_superseded))
+  ([`OPENSTORAGE_SWEEP_DELETE_SUPERSEDED`](../reference/configuration.md#openstorage_sweep_delete_superseded))
   — which does delete repack-superseded blobs — downgrades itself to list-only per run
   via a runtime guard. On a versioned bucket, either disable both modes or accept
   report-only sweeps. See the [storage lifecycle guide](storage-lifecycle-and-sweeping.md).
@@ -127,22 +130,22 @@ The minimum per replica:
 
 | Variable | Production value |
 |---|---|
-| [`CODESTORAGE_ORG`](../reference/configuration.md#codestorage_org) | Your org name — the `iss` claim your JWTs carry |
-| [`CODESTORAGE_ORG_PUBKEYS`](../reference/configuration.md#codestorage_org_pubkeys) | Path to the org public-key PEM file — **identical contents on every replica** ([why](#jwt-keys-across-the-fleet)) |
-| [`CODESTORAGE_PG_URL`](../reference/configuration.md#codestorage_pg_url) | `postgres://…` (or `postgresql://…`) |
-| [`CODESTORAGE_S3_URL`](../reference/configuration.md#codestorage_s3_url) | `s3://<bucket>?region=…` |
-| [`CODESTORAGE_LISTEN`](../reference/configuration.md#codestorage_listen) | `0.0.0.0:<port>` — the default binds localhost on an ephemeral port |
-| [`CODESTORAGE_BASE_URL`](../reference/configuration.md#codestorage_base_url) | The **external** `https://` URL clients use — API responses embed it in `http_url` values; the default (derived from the listener) is wrong behind any proxy |
+| [`OPENSTORAGE_ORG`](../reference/configuration.md#openstorage_org) | Your org name — the `iss` claim your JWTs carry |
+| [`OPENSTORAGE_ORG_PUBKEYS`](../reference/configuration.md#openstorage_org_pubkeys) | Path to the org public-key PEM file — **identical contents on every replica** ([why](#jwt-keys-across-the-fleet)) |
+| [`OPENSTORAGE_PG_URL`](../reference/configuration.md#openstorage_pg_url) | `postgres://…` (or `postgresql://…`) |
+| [`OPENSTORAGE_S3_URL`](../reference/configuration.md#openstorage_s3_url) | `s3://<bucket>?region=…` |
+| [`OPENSTORAGE_LISTEN`](../reference/configuration.md#openstorage_listen) | `0.0.0.0:<port>` — the default binds localhost on an ephemeral port |
+| [`OPENSTORAGE_BASE_URL`](../reference/configuration.md#openstorage_base_url) | The **external** `https://` URL clients use — API responses embed it in `http_url` values; the default (derived from the listener) is wrong behind any proxy |
 
-Do **not** set `CODESTORAGE_DATA_DIR` in production — it exists to derive a single-node
+Do **not** set `OPENSTORAGE_DATA_DIR` in production — it exists to derive a single-node
 SQLite + file-blob stack for [local mode](../../README.md#quickstart-local-mode-60-seconds).
 
 Everything else — pack quotas, sweep/repack tuning — has production-safe defaults and is
 covered by the [configuration reference](../reference/configuration.md). The exception is
 **rate limiting, which is disabled by default**: an Internet-facing deployment should
 either set
-[`CODESTORAGE_RATE_RPS` / `CODESTORAGE_RATE_BURST`](../reference/configuration.md#codestorage_rate_rps--codestorage_rate_burst)
-(plus [trusted proxies](#client-identity-behind-the-proxy-codestorage_trusted_proxies))
+[`OPENSTORAGE_RATE_RPS` / `OPENSTORAGE_RATE_BURST`](../reference/configuration.md#openstorage_rate_rps--openstorage_rate_burst)
+(plus [trusted proxies](#client-identity-behind-the-proxy-openstorage_trusted_proxies))
 or enforce an equivalent per-client limit at the edge — the limiter wraps
 authentication, so nothing else bounds unauthenticated traffic per client. Startup
 validation is fail-fast:
@@ -153,7 +156,7 @@ default.
 
 Replicas keep no *durable* state on local disk, but they use it in two ways. The main
 one is a rebuildable cache of bare git repositories that read endpoints and git
-smart-HTTP serve from, set with the `--cache-dir` flag (there is no `CODESTORAGE_*` env
+smart-HTTP serve from, set with the `--cache-dir` flag (there is no `OPENSTORAGE_*` env
 var for it) and defaulting to `<os temp dir>/codestorage-cache`. Separately, several
 operations stage potentially large short-lived data in the **OS temp dir** itself
 (fork-closure packs, upstream-sync clones, pack assembly) — so when you point
@@ -218,26 +221,26 @@ security group / network policy allowlisting only the proxy and health-check sou
 the listener binds `0.0.0.0`, and a client that can reach it directly talks plain HTTP
 and bypasses every proxy-enforced limit. Then:
 
-- Set [`CODESTORAGE_BASE_URL`](../reference/configuration.md#codestorage_base_url) to the
+- Set [`OPENSTORAGE_BASE_URL`](../reference/configuration.md#openstorage_base_url) to the
   external `https://` URL so clone URLs and other `http_url` values in API responses are
   routable. It is only embedded in responses — internal traffic (the upstream-sync
   worker's loopback pushes) targets each replica's own listener directly, so the
   replicas do not need to reach the external URL themselves
-  ([#45](https://github.com/coder/code-storage/issues/45)).
+  ([#45](https://github.com/coder/open-storage/issues/45)).
 - Both the REST API and git smart-HTTP (clone/push, LFS *batch*) ride the same
   listener — proxy everything. Response bodies (clones, archives) can be very large;
   stream rather than buffer them. Push ingress is bounded natively: the server rejects
   any push whose decoded body exceeds
-  [`CODESTORAGE_MAX_PUSH_BYTES`](../reference/configuration.md#codestorage_max_push_bytes)
+  [`OPENSTORAGE_MAX_PUSH_BYTES`](../reference/configuration.md#openstorage_max_push_bytes)
   (default 2 × the pack quota, 2 MiB minimum) with a `413`, feeding git at most the cap's worth of
-  bytes ([#55](https://github.com/coder/code-storage/issues/55)) — so size temporary
+  bytes ([#55](https://github.com/coder/open-storage/issues/55)) — so size temporary
   disk for up to one cap per concurrent push (git discards the truncated quarantine on
   rejection; a declared oversize is rejected without reading at all). Fetch-side
   negotiation bodies are bounded too: a gzip-encoded `git-upload-pack` request is capped
   at a fixed 4 MiB decoded — plus a small compressed-stream allowance, so
   decode-to-nothing gzip streams cannot hold a connection open — and must finish within
   30 seconds. Oversize requests are rejected with a `413` before git runs
-  ([#70](https://github.com/coder/code-storage/issues/70)). A proxy
+  ([#70](https://github.com/coder/open-storage/issues/70)). A proxy
   request-body cap is therefore optional defense-in-depth — if you set one, size it at
   or above the server cap and remember the proxy sees wire bytes while the server counts
   decoded (post-gzip) bytes. Request duration and concurrency limits remain the proxy's
@@ -248,14 +251,14 @@ and bypasses every proxy-enforced limit. Then:
   mode), so Git LFS clients need direct network reach to the configured S3
   endpoint — a VPC-internal bucket endpoint breaks LFS pulls for external clients even
   though the batch request itself succeeds. Uploads always go through the server's
-  verified proxy transfer ([#51](https://github.com/coder/code-storage/issues/51)):
+  verified proxy transfer ([#51](https://github.com/coder/open-storage/issues/51)):
   a presigned PUT cannot bind content length or checksum, so the server receives, size-
   and sha256-verifies, and meters every upload against the repository
-  [storage quota](../reference/configuration.md#codestorage_pack_quota_bytes) before
+  [storage quota](../reference/configuration.md#openstorage_pack_quota_bytes) before
   publishing it. Size the proxy's request-body cap and timeouts with the largest LFS
   object you intend to accept in mind, and note upload bytes are staged under the
   server's `$TMPDIR` before publication. Per-replica staging is bounded by
-  [`CODESTORAGE_LFS_STAGING_BYTES`](../reference/configuration.md#codestorage_lfs_staging_bytes)
+  [`OPENSTORAGE_LFS_STAGING_BYTES`](../reference/configuration.md#openstorage_lfs_staging_bytes)
   (default 32 GiB; over-budget uploads answer `429`/`413`, and each object allows one
   in-flight upload per replica). Any single repository's staged bytes are held to at
   most a third of the budget — the budget is a working set sized at roughly `3 ×` the
@@ -268,18 +271,18 @@ and bypasses every proxy-enforced limit. Then:
   15 minutes after the last old replica exits. Complete the roll promptly; LFS objects
   a client uploaded around the roll window are re-verified on their next write-scoped
   touch only while unregistered, so treat uploads from that window with the same trust
-  you gave v0.1.0's presigned path ([#78](https://github.com/coder/code-storage/issues/78)
+  you gave v0.1.0's presigned path ([#78](https://github.com/coder/open-storage/issues/78)
   tracks closing this window with object-version fencing).
 
-### Client identity behind the proxy (`CODESTORAGE_TRUSTED_PROXIES`)
+### Client identity behind the proxy (`OPENSTORAGE_TRUSTED_PROXIES`)
 
-Rate limiting ([`CODESTORAGE_RATE_RPS` / `CODESTORAGE_RATE_BURST`](../reference/configuration.md#codestorage_rate_rps--codestorage_rate_burst))
+Rate limiting ([`OPENSTORAGE_RATE_RPS` / `OPENSTORAGE_RATE_BURST`](../reference/configuration.md#openstorage_rate_rps--openstorage_rate_burst))
 keys token buckets by client IP. Buckets are **per replica and per surface** (REST and
 git each keep their own in-process state): a client spread across N replicas can consume
 roughly N× the configured REST budget plus N separate git budgets. Size the values as
 per-replica limits, and enforce at the edge when you need one global per-client ceiling. Behind a proxy the TCP peer is the proxy itself, so all
 clients would share one bucket — unless you tell the server which peers are proxies via
-[`CODESTORAGE_TRUSTED_PROXIES`](../reference/configuration.md#codestorage_trusted_proxies),
+[`OPENSTORAGE_TRUSTED_PROXIES`](../reference/configuration.md#openstorage_trusted_proxies),
 a comma-separated CIDR allowlist. The resolution rules (matching the merged behavior
 exactly):
 
@@ -318,7 +321,7 @@ unavailable or change later; the dial-time check is authoritative, and resolutio
 empty answers, or mixed allowed/denied answer sets fail closed.
 
 For deployments that intentionally deliver to internal receivers, set
-`CODESTORAGE_WEBHOOK_ALLOW_PRIVATE=true`. This admits loopback, RFC 1918, RFC 6598
+`OPENSTORAGE_WEBHOOK_ALLOW_PRIVATE=true`. This admits loopback, RFC 1918, RFC 6598
 shared, link-local, and ULA targets and emits a startup warning. Cloud metadata
 (`169.254.169.254` and `fd00:ec2::254`), other IANA special-purpose ranges,
 malformed/non-routable targets, and redirects remain blocked. Keep network
@@ -358,14 +361,15 @@ so a mixed-version fleet mid-roll is expected and fine, with two deliberate exce
 > for the exact prerequisite and why list-only mode is safe on any fleet.
 
 > **Upgrading from v0.2.0 or older with Git LFS in use: set
-> [`CODESTORAGE_LFS_V020_WRITE_COMPAT`](../reference/configuration.md#codestorage_lfs_v020_write_compat)
+> [`OPENSTORAGE_LFS_V020_WRITE_COMPAT`](../reference/configuration.md#openstorage_lfs_v020_write_compat)
 > on the upgraded replicas for the duration of the roll, then drop it.** Registered
 > LFS objects now live at a canonical key old replicas cannot derive (ADR-41); the
 > compat flag dual-publishes to the legacy key so old replicas keep serving LFS
 > reads until the fleet is fully rolled. **Disable
-> [`CODESTORAGE_SWEEP_DELETE_LFS`](../reference/configuration.md#codestorage_sweep_delete_lfs)
-> on EVERY replica — the not-yet-upgraded v0.2.0 ones included — for the duration
-> of the roll**: the upgrade migrates registry rows to the canonical spelling in
+> [`OPENSTORAGE_SWEEP_DELETE_LFS`](../reference/configuration.md#openstorage_sweep_delete_lfs)
+> on EVERY replica — use `CODESTORAGE_SWEEP_DELETE_LFS=false` on pre-0.15 binaries,
+> including the not-yet-upgraded v0.2.0 ones — for the duration of the roll**:
+> the upgrade migrates registry rows to the canonical spelling in
 > place, which makes a touched object's legacy blob look rowless to an old
 > binary's sweeper, and old binaries have no legacy gate — a reap-enabled v0.2.0
 > sweeper deletes it immediately and breaks old-replica reads mid-roll (upgraded
@@ -373,7 +377,7 @@ so a mixed-version fleet mid-roll is expected and fine, with two deliberate exce
 > are the hazard, so stage the flags before rolling). After the roll, re-enable
 > LFS sweeping if desired; legacy-spelled keys (adoption sources, compat copies)
 > are reclaimed only by the separate post-roll
-> [`CODESTORAGE_SWEEP_DELETE_LFS_LEGACY`](../reference/configuration.md#codestorage_sweep_delete_lfs_legacy)
+> [`OPENSTORAGE_SWEEP_DELETE_LFS_LEGACY`](../reference/configuration.md#openstorage_sweep_delete_lfs_legacy)
 > opt-in, whose transition gate dominates every sweep flag on upgraded binaries.
 > Enable it only once the last old replica has been gone ≥ 15 minutes.
 
@@ -383,14 +387,14 @@ permanently stop syncing. Claims written by pre-lease replicas (rolling upgrades
 older builds, or wedges left by crashes before the upgrade) carry no lease and none of
 the holder guards that make stealing safe; new replicas adopt them under a grace period
 and — mirroring the sweep-delete fleet prerequisite above — will not steal them until
-[`CODESTORAGE_SYNC_STEAL_LEGACY`](../reference/configuration.md#codestorage_sync_steal_legacy)
+[`OPENSTORAGE_SYNC_STEAL_LEGACY`](../reference/configuration.md#openstorage_sync_steal_legacy)
 asserts the fleet is drained of pre-lease builds. A live old-version run therefore always
 finishes undisturbed; pre-upgrade wedges heal automatically once the opt-in is set.
 
 ## JWT keys across the fleet
 
 Tokens are verified against the org's public keys in the database, and each replica
-**rewrites** that key set at boot from its `CODESTORAGE_ORG_PUBKEYS` file (last boot
+**rewrites** that key set at boot from its `OPENSTORAGE_ORG_PUBKEYS` file (last boot
 wins). Hence: identical file contents everywhere, distributed via your secret store.
 
 Rotation without downtime:
@@ -413,7 +417,7 @@ Two sharp edges:
   `pull-upstream` runs and the database's org key set stays exactly the configured file
   keys. (Historically the loopback key was persisted last-writer-wins, breaking sync on
   every replica but the most recently booted one —
-  [#45](https://github.com/coder/code-storage/issues/45).)
+  [#45](https://github.com/coder/open-storage/issues/45).)
 
 ## Background maintenance in a fleet
 
@@ -430,7 +434,7 @@ the [storage lifecycle guide](storage-lifecycle-and-sweeping.md).
 | API/git `5xx` rates per replica | Real serving health — `/healthz` won't catch a lost database |
 | `orphan pack sweep finished` log line | Per-sweep report: orphan counts/bytes, deletions, reclaimed bytes ([field reference](storage-lifecycle-and-sweeping.md#reading-a-sweep-report)) |
 | `repack: folded packs` / `repack trigger: scheduled fold` log lines | Repack progress; a repo that triggers but never folds warrants a look |
-| `codestorage hook: pre-receive: repository pack quota exceeded` (client-visible) / `quota: receive-pack … at/over quota` (server log) | Tenants hitting the [pack quota](../reference/configuration.md#codestorage_pack_quota_bytes) |
+| `openstorage hook: pre-receive: repository pack quota exceeded` (client-visible) / `quota: receive-pack … at/over quota` (server log) | Tenants hitting the [pack quota](../reference/configuration.md#openstorage_pack_quota_bytes) |
 | Postgres availability + advisory-lock waits at boot | The database is the single authority; boot hangs show in `pg_locks` |
 
 ## Zero-infrastructure mode (experimental): one bucket, one node
@@ -438,7 +442,7 @@ the [storage lifecycle guide](storage-lifecycle-and-sweeping.md).
 Everything above assumes the production topology: Postgres plus a bucket. The
 **experimental** `s3wal://` mode
 ([ADR-46](../adr/046-s3wal-refs-and-metadata-ride-one-conditional-cas-object-per-repo-group.md),
-issue [#133](https://github.com/coder/code-storage/issues/133)) removes Postgres *and*
+issue [#133](https://github.com/coder/open-storage/issues/133)) removes Postgres *and*
 local disk from the durability story: refs and metadata live in conditional-CAS objects
 under the bucket's reserved `_wal/` prefix, next to the ordinary `packs/` and `lfs/`
 payloads. One S3-compatible bucket is the sole durable authority — kill the process,
@@ -447,19 +451,19 @@ cache dir stays a rebuildable cache, exactly like every other mode). Engine-leve
 rationale: [the storage engine](../explanation/storage-engine.md#the-zero-infrastructure-backend-s3-as-sole-authority-s3wal).
 
 ```sh
-CODESTORAGE_PG_URL='s3wal://my-bucket?endpoint=https://s3.example.net&region=us-east-1' \
-CODESTORAGE_S3_URL='s3://my-bucket?endpoint=https://s3.example.net&s3ForcePathStyle=true&region=us-east-1' \
-CODESTORAGE_ORG=org1 CODESTORAGE_ORG_PUBKEYS=/etc/codestorage/org.pub.pem \
-codestorage serve --listen 0.0.0.0:8080 --cache-dir /var/cache/codestorage
+OPENSTORAGE_PG_URL='s3wal://my-bucket?endpoint=https://s3.example.net&region=us-east-1' \
+OPENSTORAGE_S3_URL='s3://my-bucket?endpoint=https://s3.example.net&s3ForcePathStyle=true&region=us-east-1' \
+OPENSTORAGE_ORG=org1 OPENSTORAGE_ORG_PUBKEYS=/etc/openstorage/org.pub.pem \
+openstorage serve --listen 0.0.0.0:8080 --cache-dir /var/cache/openstorage
 ```
 
 The same bucket for both URLs is the expected layout; a `file://` blob URL is refused at
-startup ([pairing rule](../reference/configuration.md#codestorage_pg_url)). Create the
+startup ([pairing rule](../reference/configuration.md#openstorage_pg_url)). Create the
 bucket before the first boot: the startup conditional-write probe runs against it before
 the blob layer's create-if-missing bootstrap, so a missing bucket is boot-fatal. Never
 write to the `_wal/` prefix yourself, and never point two serve processes at one
 bucket — the
-[instance lease](../reference/configuration.md#codestorage_s3wal_lease_ttl) exists to
+[instance lease](../reference/configuration.md#openstorage_s3wal_lease_ttl) exists to
 detect exactly that mistake (startup refusal / fail-stop), best-effort.
 
 **Store requirements.** The mode depends on faithful conditional writes
@@ -480,7 +484,7 @@ lanes run against it in CI) and **AWS S3** (the full qualification lane passed i
 require mode against eu-central-1, 2026-08-27 — one campaign; see the
 [benchmark results](../plans/s3wal-bench-results.md)). MinIO and
 other S3-compatible stores are not qualified for `s3wal://` even where they work fine as
-plain [`CODESTORAGE_S3_URL`](../reference/configuration.md#codestorage_s3_url) blob
+plain [`OPENSTORAGE_S3_URL`](../reference/configuration.md#openstorage_s3_url) blob
 storage. Do not enable bucket versioning or object lock on the bucket.
 
 **Credentials and IAM.** Credentials come from the standard AWS chain (env vars, shared
@@ -494,7 +498,7 @@ bucket reachability probes), and `s3:GetBucketVersioning` (the delete-mode and p
 guards verify versioning is off).
 `s3:CreateBucket` is not required for a pre-provisioned bucket — a denied create falls
 back to a reachability probe. Set
-[`CODESTORAGE_S3_EXPECTED_BUCKET_OWNER`](../reference/configuration.md#codestorage_s3_expected_bucket_owner):
+[`OPENSTORAGE_S3_EXPECTED_BUCKET_OWNER`](../reference/configuration.md#openstorage_s3_expected_bucket_owner):
 both S3 clients — the blob data plane *and* the `_wal/` conditional client — stamp the
 owner condition on every request, which matters doubly in this mode because the bucket
 carries the org's public keys and the ref authority, not just packs.
@@ -547,8 +551,8 @@ dir — against the same two URLs. Refs, metadata, packs, and LFS objects recons
 from the bucket, and the cache re-hydrates on demand; this is a designed-for,
 e2e-tested path (the `s3wal` [test lane](../reference/testing.md) drills exactly
 this). The node's *configuration* is not in the bucket: a replacement needs the same
-environment — the two storage URLs, `CODESTORAGE_ORG`, the org public-key PEM file on
-its own disk, and the same `CODESTORAGE_SECRETS_KEY` if one encrypts the metadata
+environment — the two storage URLs, `OPENSTORAGE_ORG`, the org public-key PEM file on
+its own disk, and the same `OPENSTORAGE_SECRETS_KEY` if one encrypts the metadata
 store's secret columns — provisioned from your config/secret store like any other
 deployment.
 
@@ -558,7 +562,7 @@ delete — 5 seconds — after the bounded HTTP drain), so a successor starts im
 After a **hard stop** (`SIGKILL`, crash, power loss) the lease stays behind: a replacement
 started early refuses with `s3wal instance lease _wal/instance-lease is held by another
 serve process …` until the stale lease ages past
-[`CODESTORAGE_S3WAL_LEASE_TTL`](../reference/configuration.md#codestorage_s3wal_lease_ttl)
+[`OPENSTORAGE_S3WAL_LEASE_TTL`](../reference/configuration.md#openstorage_s3wal_lease_ttl)
 (default 2 minutes), then boots normally by stealing it. To skip that wait, delete
 `_wal/instance-lease` — only after confirming the old process is actually dead: deleting
 it under a live node re-creates the undetected dual-serve topology the lease exists to
@@ -571,6 +575,6 @@ crash.
 | Signal | Why |
 |---|---|
 | `s3wal instance lease` startup refusals / fail-stop exits | Dual-serve detection, or a stale lease after a crash (wait out the TTL); heartbeat-loss exits need the supervisor restart |
-| `codestorage hook: s3wal cas ref … contention retries exhausted` (client-visible) | Hot-repo CAS contention exceeded the retry budget — a retry usually lands; frequent occurrences mean the workload outgrew the one-CAS-point boundary |
+| `openstorage hook: s3wal cas ref … contention retries exhausted` (client-visible) | Hot-repo CAS contention exceeded the retry budget — a retry usually lands; frequent occurrences mean the workload outgrew the one-CAS-point boundary |
 | `s3wal manifest approaching size cap` log line | A repository group's manifest passed the 4 MiB warning threshold; growing writes are refused at 16 MiB |
 | `s3wal clock skew guard tripped: demoting expiry verdict to report-only` log line | A skew guard failed closed — expiries defer (over-retention, never early deletion); persistent tripping means a wrong clock, so fix it and restart |

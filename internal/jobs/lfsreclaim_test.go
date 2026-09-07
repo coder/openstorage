@@ -13,9 +13,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/coder/code-storage/internal/blob"
-	"github.com/coder/code-storage/internal/lfsscan"
-	"github.com/coder/code-storage/internal/ref"
+	"github.com/coder/open-storage/internal/blob"
+	"github.com/coder/open-storage/internal/lfsscan"
+	"github.com/coder/open-storage/internal/ref"
 )
 
 // lfsReclaimGitEnv pins identity and neuters host config so fixture commits
@@ -845,7 +845,7 @@ func TestLFSReclaim_SkippedReposChargeBudget(t *testing.T) {
 
 // TestLFSReclaim_LegacyRowsDeferredWhenUnarmed (Codex round 17 on PR
 // #132): legacy-spelled registry rows retire only when legacy reaping is
-// armed END-TO-END — this replica's CODESTORAGE_SWEEP_DELETE_LFS_LEGACY
+// armed END-TO-END — this replica's OPENSTORAGE_SWEEP_DELETE_LFS_LEGACY
 // AND a watermark payload certifying a legacy-armed sweep. Either half
 // missing defers the row with the distinct counter: its blob would never
 // be physically reaped, so the slot refund would be unbacked.
